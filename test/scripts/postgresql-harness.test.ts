@@ -837,7 +837,7 @@ describe("PostgreSQL harness utilities", () => {
 
   it("uses exact digest-pinned images and a namespaced label", () => {
     expect(POSTGRES_IMAGE).toMatch(/^postgres:18\.4-bookworm@sha256:[0-9a-f]{64}$/u);
-    expect(NODE_IMAGE).toMatch(/^node:22\.20\.0-bookworm-slim@sha256:[0-9a-f]{64}$/u);
+    expect(NODE_IMAGE).toMatch(/^node:25\.0\.0-bookworm-slim@sha256:[0-9a-f]{64}$/u);
     expect(RUN_LABEL).toBe("com.donadiosolutions.lcm.postgresql-test-run");
     expect(OWNER_SCHEMA_VERSION).toBe("2");
     expect(new Set([

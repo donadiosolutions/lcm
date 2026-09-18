@@ -99,7 +99,7 @@ The refusal uses a fixed error and does not include the memory text, ID, path,
 or query. NUL characters in JSON-escaped tags remain supported.
 
 New promoted content containing `U+0000` is rejected before the database write.
-For a legacy row, use the offline procedure below with **Node.js 24 or newer**
+For a legacy row, use the offline procedure below with **Node.js 25 or newer**
 (the built-in `node:sqlite` module supplies everything; no npm dependencies or
 LCM internal imports are needed). LCM does not strip bytes, truncate rows, or
 run an automatic migration. If no intended replacement is known, preserve the

@@ -150,7 +150,7 @@ describe("update-patterns workflow", () => {
     });
     expect(step("Setup Node")).toMatchObject({
       uses: expect.stringMatching(/^actions\/setup-node@[0-9a-f]{40}$/u),
-      with: { "node-version": "22.20.0" },
+      with: { "node-version": "25.0.0" },
     });
   });
 
@@ -167,7 +167,7 @@ describe("update-patterns workflow", () => {
       uses: expect.stringMatching(/^actions\/cache@[0-9a-f]{40}$/u),
       with: {
         path: "${{ steps.pnpm-store.outputs.path }}",
-        key: "pnpm-store-v1-${{ runner.os }}-${{ runner.arch }}-node-22.20.0-${{ hashFiles('package.json', 'pnpm-lock.yaml', '.npmrc', 'pnpm-workspace.yaml', 'scripts/bootstrap-pnpm.mjs') }}",
+        key: "pnpm-store-v1-${{ runner.os }}-${{ runner.arch }}-node-25.0.0-${{ hashFiles('package.json', 'pnpm-lock.yaml', '.npmrc', 'pnpm-workspace.yaml', 'scripts/bootstrap-pnpm.mjs') }}",
       },
     });
     expect(step("Cache pnpm store").with).not.toHaveProperty("restore-keys");

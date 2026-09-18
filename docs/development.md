@@ -1,7 +1,7 @@
 # Developing LCM
 
 LCM development uses pnpm for dependency installation and scripts. Node.js
-22.12.0 or newer remains the runtime. npm remains responsible for consumer
+25.0.0 or newer remains the runtime. npm remains responsible for consumer
 installation, tarball creation, registry checks, and publication.
 
 ## Bootstrap the verified package manager
@@ -185,10 +185,10 @@ invoke `node dist/lcm.mjs ...`.
 
 Source checkouts run the SQLite diagnostic child from its TypeScript asset with
 explicit type-stripping and SQLite runtime flags. Built packages run the
-compiled JavaScript asset with the SQLite flag required by the minimum supported
-Node.js 22.12 runtime. Both launch forms use an empty child environment and do
-not inherit parent preload arguments. Current Node releases may no longer
-require these compatibility flags, but continue to accept them.
+compiled JavaScript asset with the same SQLite flag. Supported Node.js
+runtimes expose `node:sqlite` without it, so the flag is retained only because
+those runtimes still accept it. Both launch forms use an empty child
+environment and do not inherit parent preload arguments.
 
 To install the built package, use an exact tarball rather than a global link:
 

@@ -2095,7 +2095,7 @@ describe("worktree reconciliation", () => {
     },
   );
 
-  it("#1316 uses the Node 22.12 statement surface for byte admission", () => {
+  it("#1316 admits stored message bytes through the projection statements", () => {
     const fixture = makeProjectReconciliation(home);
     const sessionId = "message-node-22-12-surface";
     makeDatabase(fixture.targetPath, "message-node-22-12-target", "target", fixture.targetHash);

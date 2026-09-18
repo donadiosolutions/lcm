@@ -210,7 +210,7 @@ describe("CI workflow", () => {
       new URL("../.github/actions/setup-ci/action.yml", import.meta.url), "utf8",
     )) as { runs: { steps: WorkflowStep[] } };
     for (const [steps, nodeVersion] of [
-      [setup.runs.steps, "22.20.0"],
+      [setup.runs.steps, "25.0.0"],
       [workflow.jobs["linux-systemd"].steps, "25.9.0"],
       [workflow.jobs["macos-launchd"].steps, "25.9.0"],
     ] as const) {
