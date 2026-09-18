@@ -356,7 +356,10 @@ function findUrlPathStarts(chars: readonly string[]): UrlPathStarts {
         : -1;
     if ((separator >= 0 || restartedPathlessFile) && nestedFileSchemeStart >= 0) {
       activeNestedFileUrlParentOwnerBracketDepth = pathlessFileQueryOwnerBracketDepth;
-      if (pathlessFileQueryOwnerBracketDepth > 0) urlSeenInsidePathlessWrapper = true;
+      if (pathlessFileQueryOwnerBracketDepth > 0) {
+        urlSeenInsidePathlessWrapper = true;
+        suspendedPathlessFileQueryOwnerDepths.clear();
+      }
       if (activeNestedFileUrlParentOwnerBracketDepth > 0) {
         nestedFileUrlParentOwnerBracketDepths.add(activeNestedFileUrlParentOwnerBracketDepth);
         restartedNestedFileUrlParentOwnerBracketDepths.delete(activeNestedFileUrlParentOwnerBracketDepth);
@@ -805,6 +808,13 @@ function findUrlPathStarts(chars: readonly string[]): UrlPathStarts {
       file[index] = 1;
       continue;
     }
+    if (char === ":" && schemeLength > 0 && pathlessFileQueryOwnerBracketDepth > 0) {
+      // Any scheme colon marks this wrapper as carrying URL-like syntax, not
+      // plain literal values. Single-slash and opaque schemes reach none of
+      // the URL branches below, so the ownership flag is set here.
+      urlSeenInsidePathlessWrapper = true;
+      suspendedPathlessFileQueryOwnerDepths.clear();
+    }
     if (char === ":" && schemeLength > 0 && chars[index + 1] === "/" && chars[index + 2] === "/") {
       const enclosingPathlessBracketDepth = restartedPathlessFile
         ? restartedPathlessBrackets
@@ -825,7 +835,13 @@ function findUrlPathStarts(chars: readonly string[]): UrlPathStarts {
       authority[index + 1] = 1;
       authority[index + 2] = 1;
       exactFileScheme = schemeLength === FILE_SCHEME.length && fileSchemeLength === FILE_SCHEME.length;
-      if (pathlessFileQueryOwnerBracketDepth > 0) urlSeenInsidePathlessWrapper = true;
+      if (pathlessFileQueryOwnerBracketDepth > 0) {
+        // A URL appearing later in the wrapper establishes ownership for the
+        // whole wrapper, so it also lifts a suspension an earlier delimiter
+        // recorded while the wrapper still looked literal-only.
+        urlSeenInsidePathlessWrapper = true;
+        suspendedPathlessFileQueryOwnerDepths.clear();
+      }
       if (exactFileScheme && pathlessFileQueryOwnerBracketDepth > 0) {
         activeNestedFileUrlParentOwnerBracketDepth = pathlessFileQueryOwnerBracketDepth;
         nestedFileUrlParentOwnerBracketDepths.add(activeNestedFileUrlParentOwnerBracketDepth);

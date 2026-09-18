@@ -4521,6 +4521,62 @@ describe("sanitizeError", () => {
     expect(sanitizeError(sanitizeError(first))).toBe(first);
   });
 
+  // A URL appearing after a sibling delimiter still establishes ownership for
+  // the whole wrapper, and opaque or single-slash schemes count as URL syntax.
+  it.each([
+    [
+      "public URL after the delimiter",
+      "file://h?x=[value|https://e.test/t|name=\\Users\\SECRET\\x]",
+      "file://h?x=[value|https://e.test/t|name=<path>]",
+    ],
+    [
+      "non-http scheme after the delimiter",
+      "file://h?x=[value|ftp://host/x|name=\\Users\\SECRET\\x]",
+      "file://h?x=[value|ftp://host/x|name=<path>]",
+    ],
+    [
+      "two literal values before the URL",
+      "file://h?x=[a|b|https://e.test/t|name=\\Users\\SECRET\\x]",
+      "file://h?x=[a|b|https://e.test/t|name=<path>]",
+    ],
+    [
+      "bracketed nested file child after the delimiter",
+      "file://h?x=[value|[[[file://host?key=/public]]]|name=\\Users\\SECRET\\x]",
+      "file://h?x=[value|[[[file://host?key=<path>]]]|name=<path>]",
+    ],
+    [
+      "single-slash file scheme",
+      "file://h?x=[file:/x|name=\\Users\\SECRET\\x]",
+      "file://h?x=[file:<path>|name=<path>]",
+    ],
+    [
+      "opaque mailto scheme",
+      "file://h?x=[mailto:a@b|name=\\Users\\SECRET\\x]",
+      "file://h?x=[mailto:a@b|name=<path>]",
+    ],
+    [
+      "opaque about scheme",
+      "file://h?x=[about:blank|name=\\Users\\SECRET\\x]",
+      "file://h?x=[about:blank|name=<path>]",
+    ],
+  ] as const)("restores wrapper ownership when a URL follows a delimiter: %s", (_name, input, expected) => {
+    const first = sanitizeError(input);
+
+    expect(first).toBe(expected);
+    expect(first).not.toContain("SECRET");
+    expect(sanitizeError(first)).toBe(first);
+    expect(sanitizeError(sanitizeError(first))).toBe(first);
+  });
+
+  it.each([
+    "file://h?x=[value||name=\\Users\\SECRET\\x]",
+    "file://h?x=[value|&name=\\Users\\SECRET\\x]",
+  ] as const)("keeps a literal-only wrapper suspended after repeated delimiters: %s", (input) => {
+    expect(sanitizeError(input)).toBe(input);
+    expect(sanitizeError(sanitizeError(input))).toBe(input);
+    expect(sanitizeError(sanitizeError(sanitizeError(input)))).toBe(input);
+  });
+
   it("replaces SQLite constraint details with generic message", () => {
     const result = sanitizeError("SQLITE_CONSTRAINT: UNIQUE constraint failed: messages.conversation_id");
     expect(result).not.toContain("messages.conversation_id");
