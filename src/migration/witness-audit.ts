@@ -143,6 +143,27 @@ export const MIGRATION_WITNESS_AUDIT: readonly MigrationWitnessAuditEntry[] = Ob
     mismatchClasses: ["relation"],
   },
   {
+    id: "ledger-transfer-run", bodyField: "classCoverage",
+    description: "lcm.transfer_runs, read fresh inside the window: state must be completed, and run_id/target_generation/manifest_sha256 (against the source stream's own describe().manifestSha256) must match the bound values. project_sha256 is compared against probePostgreSqlPortableDestination's identityFingerprintSha256, obtained via the existing canonicalisation path at step 2 rather than re-derived here.",
+    comparison: "compared-live",
+    onDifference: "records a ledger-class mismatch on the ledger pseudo-domain when the run is missing, not completed, or any bound value disagrees",
+    mismatchClasses: ["ledger"],
+  },
+  {
+    id: "ledger-transfer-batches", bodyField: "classCoverage",
+    description: "lcm.transfer_batches, read fresh inside the window: each of the 22 domains' terminal (highest next_ordinal) batch must carry a checkpoint_sha256 and next_ordinal matching the caller-supplied manifest's own checkpoints array, consumed directly rather than restated.",
+    comparison: "compared-live",
+    onDifference: "records a ledger-class mismatch naming the domain whose terminal batch is missing or disagrees with the manifest",
+    mismatchClasses: ["ledger"],
+  },
+  {
+    id: "ledger-transfer-identities", bodyField: "classCoverage",
+    description: "lcm.transfer_identities, read fresh inside the window: row count for the run must equal the census total record count, and the native_key-to-identity_sha256 mapping must be injective per domain. A non-injective mapping is the storage-level signature of the same wrong-parent defect the relation class catches at the edge level.",
+    comparison: "compared-live",
+    onDifference: "records a ledger-class mismatch (cardinality on the ledger pseudo-domain, or per domain for a non-injective mapping)",
+    mismatchClasses: ["ledger"],
+  },
+  {
     id: "public-listing-probe", bodyField: "publicProbeSha256",
     description: "The destination's ordered-listing repository read, compared against the source's own canonical createdAt ordering captured during step 1.",
     comparison: "compared-live",

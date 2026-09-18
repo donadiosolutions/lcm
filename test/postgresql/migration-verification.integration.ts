@@ -1,3 +1,4 @@
+import { createHash } from "node:crypto";
 import { mkdtempSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -6,9 +7,13 @@ import { beforeAll, expect, it } from "vitest";
 import { assertHarnessReady, settings, withPostgreSqlTestDatabase } from "./harness.js";
 import { grantPortablePostgreSql, seedPortablePostgreSql } from "./portable-fixture.js";
 import { PostgreSqlRuntime } from "../../src/storage/postgresql/runtime.js";
+import { probePostgreSqlPortableDestination } from "../../src/storage/postgresql/portable-destination.js";
 import {
   assertPermanentReadOnlyGuard,
   readFencedDestinationCensus,
+  readLedgerMismatches,
+  readRelationDanglingReferenceMismatches,
+  reconcileDependencyEdges,
   readSequenceSelfConsistencyMismatches,
   readSequenceStoredState,
   SEQUENCE_BACKED_IDENTITY_COLUMN,
@@ -278,5 +283,107 @@ it("maps exactly the identity-sequence-backed columns pg_catalog reports under s
       .map((target) => `${target!.table.replace("lcm.", "")}.${target!.column}`)
       .sort();
     expect(actual).toEqual(expected);
+  });
+}, 60000);
+
+/**
+ * Live PostgreSQL 18 proof that the relation and ledger classes execute
+ * real SQL correctly, not merely that a fake dispatcher agrees with
+ * itself. The wrong-parent edge-set logic and the ledger mismatch logic
+ * are both already proven at the unit level with fixtures constructed to
+ * fail; this test proves the queries themselves -- readDomainPage-based
+ * edge collection, and three-table SQL against transfer_runs/
+ * transfer_batches/transfer_identities -- run outside a fake and agree
+ * on a sound fixture, the same class of defect the sequence fix in this
+ * file was for: a fake cannot see a query that throws or a column that
+ * does not exist.
+ */
+it("relation and ledger read real SQL against a sound fixture and produce no mismatches", async () => {
+  await withPostgreSqlTestDatabase("migration-verification-relation-ledger", async (db) => {
+    const seeded = await seedPortablePostgreSql(db.migrator);
+    await grantPortablePostgreSql(db);
+    const runtime = new PostgreSqlRuntime(settings(db.runtimeUrl));
+    const scratchParent = mkdtempSync(join(tmpdir(), "lcm-pg-relation-ledger-"));
+    try {
+      const probe = await probePostgreSqlPortableDestination({
+        settings: settings(db.runtimeUrl), expectedOwner: "lcm_test_migrator", expectedIdentity: seeded.expectedIdentity,
+      });
+
+      // Warm-up read: learn the real total record count so the ledger
+      // fixture below can be seeded to match it exactly. A second,
+      // authoritative read happens after seeding, inside a fresh
+      // snapshot, which is the one this test actually asserts against.
+      const warmupSession = await runtime.openReadOnlySnapshot({ projectId: seeded.expectedIdentity.id });
+      let totalRecordCount = 0;
+      try {
+        const warmupRead = await readFencedDestinationCensus(warmupSession, {
+          settings: settings(db.runtimeUrl), expectedOwner: "lcm_test_migrator",
+          expectedIdentity: seeded.expectedIdentity, scratchParent,
+        });
+        totalRecordCount = warmupRead.census.reduce((sum, entry) => sum + entry.recordCount, 0);
+      } finally {
+        await warmupSession.close();
+      }
+
+      const runId = "live-relation-ledger-run";
+      const targetGenerationId = "live-relation-ledger-target";
+      const manifestSha256 = "c".repeat(64);
+      await db.migrator.query({
+        text: "INSERT INTO lcm.transfer_runs "
+          + "(run_id, target_generation, project_id, manifest_bytes, manifest_sha256, schema_sha256, project_sha256, source_sha256, source_witness_sha256, state) "
+          + "VALUES ($1, $2, $3, $4, $5, $5, $6, $5, $5, 'completed')",
+        values: [runId, targetGenerationId, seeded.expectedIdentity.id, Buffer.from("{}"), manifestSha256, probe.identityFingerprintSha256],
+      }, { domain: "factory", operation: "seedLiveLedgerRun" });
+
+      const manifestCheckpoints = PORTABLE_RECORD_DOMAIN_ORDER.map((domain, index) => ({
+        domain, ordinal: 0, recordCount: 0,
+        sourceCheckpointSha256: createHash("sha256").update("live-checkpoint-" + domain).digest("hex"),
+        destinationCommitSha256: createHash("sha256").update("live-commit-" + domain).digest("hex"),
+      }));
+      await db.migrator.query({
+        text: "INSERT INTO lcm.transfer_batches "
+          + "(run_id, domain, prior_checkpoint_sha256, batch_sha256, checkpoint_bytes, checkpoint_sha256, first_ordinal, next_ordinal) "
+          + "SELECT $1, d.domain, $2, $2, '{}'::bytea, d.checkpoint_sha256, 0, 0 "
+          + "FROM unnest($3::text[], $4::text[]) AS d(domain, checkpoint_sha256)",
+        values: [
+          runId, "0".repeat(64),
+          manifestCheckpoints.map((entry) => entry.domain),
+          manifestCheckpoints.map((entry) => entry.sourceCheckpointSha256),
+        ],
+      }, { domain: "factory", operation: "seedLiveLedgerBatches" });
+      await db.migrator.query({
+        text: "INSERT INTO lcm.transfer_identities (run_id, domain, identity_sha256, ordinal, native_key, record_sha256) "
+          + "SELECT $1, 'machines', encode(digest('live-identity-' || g, 'sha256'), 'hex'), g, "
+          + "'live-native-key-' || g, encode(digest('live-record-' || g, 'sha256'), 'hex') "
+          + "FROM generate_series(0, $2::int - 1) AS g",
+        values: [runId, totalRecordCount],
+      }, { domain: "factory", operation: "seedLiveLedgerIdentities" });
+
+      const session = await runtime.openReadOnlySnapshot({ projectId: seeded.expectedIdentity.id });
+      try {
+        const destinationRead = await readFencedDestinationCensus(session, {
+          settings: settings(db.runtimeUrl), expectedOwner: "lcm_test_migrator",
+          expectedIdentity: seeded.expectedIdentity, scratchParent,
+        });
+        // The real destination compared against itself: proves the
+        // readDomainPage-based edge walk executes real SQL successfully.
+        // The wrong-parent case itself is proven red-first at the unit
+        // level, which a fake can honestly establish since it is pure
+        // data-structure logic, not a claim about live PostgreSQL.
+        expect(reconcileDependencyEdges(destinationRead.dependencyEdges, destinationRead.dependencyEdges)).toEqual([]);
+        expect(readRelationDanglingReferenceMismatches(destinationRead.dependencyEdges, destinationRead.recordIdentities)).toEqual([]);
+
+        const ledgerMismatches = await readLedgerMismatches(session, {
+          projectId: seeded.expectedIdentity.id, targetGenerationId,
+          manifestSha256, identityFingerprintSha256: probe.identityFingerprintSha256,
+          manifestCheckpoints, census: destinationRead.census,
+        });
+        expect(ledgerMismatches).toEqual([]);
+      } finally {
+        await session.close();
+      }
+    } finally {
+      await runtime.close();
+    }
   });
 }, 60000);

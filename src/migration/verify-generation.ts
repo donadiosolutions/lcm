@@ -9,6 +9,7 @@ import {
   readPostgreSqlPortableWitness,
 } from "../storage/postgresql/portable-source.js";
 import { PostgreSqlConversationRepository } from "../storage/postgresql/conversation-repository.js";
+import { probePostgreSqlPortableDestination } from "../storage/postgresql/portable-destination.js";
 import type { PostgreSqlSnapshotSession } from "../storage/postgresql/snapshot-session.js";
 import type { PostgreSqlConnectionSettings, PostgreSqlQueryExecutor } from "../storage/postgresql/contracts.js";
 import {
@@ -21,6 +22,8 @@ import type {
 } from "../storage/portable-record-stream.js";
 import { aggregateContentSha256 } from "../storage/portable-record-stream.js";
 import { openMigrationCopySource, type MigrationCopySourceInput } from "./copy-source.js";
+import { MigrationManifestStore } from "./manifest-store.js";
+import type { MigrationCheckpoint } from "./protocol.js";
 import type { StorageIdentityContext } from "../storage/contracts.js";
 import {
   migrationWitnessSha256,
@@ -53,7 +56,7 @@ import { MigrationVerificationReportStore } from "./verification-store.js";
  * not an oversight to fix later in this same item.
  */
 export const DRIVER_IMPLEMENTED_MISMATCH_CLASSES: ReadonlySet<MigrationMismatchClass> = new Set([
-  "count", "digest", "identity", "sequence", "schema", "sample", "relation",
+  "count", "digest", "identity", "sequence", "schema", "sample", "relation", "ledger",
 ]);
 
 function buildClassCoverageVector(): MigrationClassCoverageVector {
@@ -398,6 +401,104 @@ export function readRelationDanglingReferenceMismatches(
       });
     }
   }
+  return mismatches;
+}
+
+export interface MigrationLedgerReconciliationInput {
+  readonly projectId: string;
+  readonly targetGenerationId: string;
+  readonly manifestSha256: string;
+  readonly identityFingerprintSha256: string;
+  readonly manifestCheckpoints: readonly MigrationCheckpoint[];
+  readonly census: readonly MigrationVerificationDomainCensus[];
+  readonly signal?: AbortSignal;
+}
+
+/**
+ * Ledger class: lcm.transfer_runs / transfer_batches / transfer_identities,
+ * all read inside the step 6 snapshot, nothing read after it. The run row
+ * itself is read fresh here, never taken from the pre-window
+ * probePostgreSqlPortableDestination call, since that call happens before
+ * the window opens and could be stale by the time it closes; only its
+ * identityFingerprintSha256 -- a re-derived project identity, not part of
+ * transfer_runs -- is consumed as the comparison operand, per the same
+ * canonicalisation the ledger row's own project_sha256 was written from.
+ * The manifest's checkpoints are consumed directly, never restated: the
+ * caller-supplied array from protocol.ts's own MigrationManifest, not a
+ * second description of the same structure.
+ */
+export async function readLedgerMismatches(
+  session: PostgreSqlSnapshotSession, input: MigrationLedgerReconciliationInput,
+): Promise<MigrationVerificationMismatch[]> {
+  const mismatches: MigrationVerificationMismatch[] = [];
+  const queryOptions = { domain: "factory" as const, projectId: input.projectId, signal: input.signal };
+  const runResult = await session.query<{
+    run_id: string; state: string; manifest_sha256: string; project_sha256: string;
+  }>({
+    text: "SELECT run_id, state, manifest_sha256, project_sha256 FROM lcm.transfer_runs "
+      + "WHERE project_id = $1::uuid AND target_generation = $2",
+    values: [input.projectId, input.targetGenerationId],
+  }, { ...queryOptions, operation: "verifyGenerationLedgerRun" });
+  const run = runResult.rows[0];
+  if (run === undefined || run.state !== "completed" || run.manifest_sha256 !== input.manifestSha256
+    || run.project_sha256 !== input.identityFingerprintSha256) {
+    mismatches.push({
+      domain: "ledger", class: "ledger",
+      identitySha256: migrationWitnessSha256(["ledger-run-mismatch-v1", input.targetGenerationId]),
+    });
+    // Nothing else in this class can be meaningfully checked without a
+    // valid run row to scope transfer_batches/transfer_identities to.
+    return mismatches;
+  }
+
+  const batchResult = await session.query<{ domain: string; checkpoint_sha256: string; next_ordinal: string }>({
+    text: "SELECT DISTINCT ON (domain) domain, checkpoint_sha256, next_ordinal FROM lcm.transfer_batches "
+      + "WHERE run_id = $1 ORDER BY domain, next_ordinal DESC",
+    values: [run.run_id],
+  }, { ...queryOptions, operation: "verifyGenerationLedgerBatches" });
+  const terminalBatchByDomain = new Map(batchResult.rows.map((row) => [row.domain, row] as const));
+  for (const domain of PORTABLE_RECORD_DOMAIN_ORDER) {
+    const expected = input.manifestCheckpoints.find((checkpoint) => checkpoint.domain === domain);
+    const actual = terminalBatchByDomain.get(domain);
+    if (expected === undefined || actual === undefined
+      || actual.checkpoint_sha256 !== expected.sourceCheckpointSha256
+      || Number(actual.next_ordinal) !== expected.ordinal) {
+      mismatches.push({
+        domain, class: "ledger",
+        identitySha256: migrationWitnessSha256(["ledger-batch-mismatch-v1", domain]),
+      });
+    }
+  }
+
+  const totalCensusCount = input.census.reduce((sum, entry) => sum + entry.recordCount, 0);
+  const identityCountResult = await session.query<{ count: string }>({
+    text: "SELECT count(*)::text AS count FROM lcm.transfer_identities WHERE run_id = $1",
+    values: [run.run_id],
+  }, { ...queryOptions, operation: "verifyGenerationLedgerIdentityCount" });
+  if (Number(identityCountResult.rows[0]?.count ?? "-1") !== totalCensusCount) {
+    mismatches.push({
+      domain: "ledger", class: "ledger",
+      identitySha256: migrationWitnessSha256(["ledger-identity-cardinality-mismatch-v1", input.targetGenerationId]),
+    });
+  }
+
+  // Non-injective mapping is the storage-level signature of the same
+  // wrong-parent defect the relation class catches at the edge level: two
+  // different destination identities recorded against the same source
+  // native key means the copy assigned one source row two destination
+  // identities, or conflated two source rows into ambiguous evidence.
+  const nonInjectiveResult = await session.query<{ domain: string; native_key: string }>({
+    text: "SELECT domain, native_key FROM lcm.transfer_identities WHERE run_id = $1 "
+      + "GROUP BY domain, native_key HAVING count(DISTINCT identity_sha256) > 1",
+    values: [run.run_id],
+  }, { ...queryOptions, operation: "verifyGenerationLedgerInjectivity" });
+  for (const row of nonInjectiveResult.rows) {
+    mismatches.push({
+      domain: row.domain as PortableDomain, class: "ledger",
+      identitySha256: migrationWitnessSha256(["ledger-non-injective-mapping-v1", row.domain, row.native_key]),
+    });
+  }
+
   return mismatches;
 }
 
@@ -860,6 +961,22 @@ export async function verifyMigrationGeneration(
       driverError("destination-drift", "destination system identifier does not match the expected value");
     }
 
+    // Ledger operand, obtained rather than reimplemented: the same
+    // canonicalisation identityFingerprintSha256 was written from by
+    // portable-destination.ts's writer, consumed here as the "expected"
+    // side of the ledger's project_sha256 comparison. This probe runs
+    // before the window and is never itself the ledger's transfer_runs
+    // read; that read happens fresh inside the window below.
+    const destinationProbe = await probePostgreSqlPortableDestination({
+      settings: input.destinationSettings, expectedOwner: input.expectedOwner,
+      expectedIdentity: input.expectedIdentity, signal: input.signal,
+    });
+    // The manifest's own checkpoints, consumed directly rather than
+    // restated: reading a second, independently derived description of
+    // "what the copy phase finished at" would be exactly the parallel
+    // structure this design avoids elsewhere.
+    const manifest = new MigrationManifestStore({ homeDir: input.homeDir }).read(input.generationId);
+
     const coordinator = new PostgreSqlWorkCoordinator(runtime, input.expectedIdentity.id, input.expectedIdentity.machineId!);
     const resource = {
       resourceType: "migration-verification", resourceKey: input.generationId,
@@ -875,6 +992,7 @@ export async function verifyMigrationGeneration(
       const session = await runtime.openReadOnlySnapshot({ projectId: input.expectedIdentity.id, signal: input.signal });
       let destinationRead: MigrationFencedDestinationRead;
       let sequenceMismatches: MigrationVerificationMismatch[];
+      let ledgerMismatches: MigrationVerificationMismatch[];
       try {
         await assertPermanentReadOnlyGuard(session, input.signal);
         destinationRead = await readFencedDestinationCensus(session, {
@@ -882,6 +1000,12 @@ export async function verifyMigrationGeneration(
           expectedIdentity: input.expectedIdentity, scratchParent: input.scratchParent, signal: input.signal,
         });
         sequenceMismatches = await readSequenceSelfConsistencyMismatches(session, input.expectedIdentity.id, input.signal);
+        ledgerMismatches = await readLedgerMismatches(session, {
+          projectId: input.expectedIdentity.id, targetGenerationId: input.targetGenerationId,
+          manifestSha256: copySource.stream.describe().manifestSha256,
+          identityFingerprintSha256: destinationProbe.identityFingerprintSha256,
+          manifestCheckpoints: manifest.checkpoints, census: destinationRead.census, signal: input.signal,
+        });
       } finally {
         await session.close();
       }
@@ -897,7 +1021,7 @@ export async function verifyMigrationGeneration(
       const domainOrder = [...PORTABLE_RECORD_DOMAIN_ORDER, "schema", "ledger", "public-listing", "public-search"] as const;
       const allMismatches = [
         ...countMismatches, ...sequenceMismatches, ...relationEdgeMismatches, ...relationDanglingMismatches,
-        ...(publicListingMismatch ? [publicListingMismatch] : []),
+        ...ledgerMismatches, ...(publicListingMismatch ? [publicListingMismatch] : []),
       ];
       const fullMismatches = sortMismatches(allMismatches, domainOrder);
       // Totals must reflect the full (untruncated) evidence: truncation is

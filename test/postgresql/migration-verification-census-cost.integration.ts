@@ -1,3 +1,4 @@
+import { createHash } from "node:crypto";
 import { mkdirSync, mkdtempSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -7,9 +8,12 @@ import { assertHarnessReady, settings, withPostgreSqlTestDatabase } from "./harn
 import { grantPortablePostgreSql, seedPortablePostgreSql } from "./portable-fixture.js";
 import { PostgreSqlRuntime } from "../../src/storage/postgresql/runtime.js";
 import { PostgreSqlConversationRepository } from "../../src/storage/postgresql/conversation-repository.js";
+import { probePostgreSqlPortableDestination } from "../../src/storage/postgresql/portable-destination.js";
+import { PORTABLE_RECORD_DOMAIN_ORDER } from "../../src/storage/portable-record.js";
 import {
   assertPermanentReadOnlyGuard,
   readFencedDestinationCensus,
+  readLedgerMismatches,
   readSequenceSelfConsistencyMismatches,
 } from "../../src/migration/verify-generation.js";
 
@@ -49,8 +53,18 @@ function formatMs(value: number): string {
  * measured numbers from a real PostgreSQL 18 instance and write them to
  * .superpowers/624/impl/census-cost.md verbatim, so the lease TTL proposal
  * in that file is derived from an actual run rather than an assumption.
+ *
+ * Covers the full in-window read as it actually runs today: the census
+ * (readFencedDestinationCensus, which now also collects relation-class
+ * dependency edges via a second readDomainPage walk over the same open
+ * source), the sequence self-consistency check, and the ledger class
+ * (three-table SQL against transfer_runs/transfer_batches/
+ * transfer_identities). The file name says "census cost" for historical
+ * continuity with earlier measurements; the numbers below are the whole
+ * window, not the census alone, and are labelled per-phase so a reader
+ * does not have to guess which figure is which.
  */
-it("measures the live census pass against a realistic destination and records the numbers", async () => {
+it("measures the full live in-window read against a realistic destination and records the numbers", async () => {
   await withPostgreSqlTestDatabase("migration-verification-census-cost", async (db) => {
     const seeded = await seedPortablePostgreSql(db.migrator);
     const bulkStart = performance.now();
@@ -85,14 +99,72 @@ it("measures the live census pass against a realistic destination and records th
       const publicRows = await repository.listConversations();
       const probeMs = performance.now() - probeStart;
 
-      // Phase 2: the fenced window -- guard, census, sequence check --
-      // all under one borrowed read-only snapshot session, exactly as
+      // Also before the window, per plan-v4 step 2: the destination probe
+      // whose identityFingerprintSha256 the ledger class consumes.
+      const destinationProbeStart = performance.now();
+      const destinationProbe = await probePostgreSqlPortableDestination({
+        settings: settings(db.runtimeUrl), expectedOwner: "lcm_test_migrator", expectedIdentity: seeded.expectedIdentity,
+      });
+      const destinationProbeMs = performance.now() - destinationProbeStart;
+
+      // A real, populated ledger fixture, seeded to match the row count
+      // this destination will actually census below, so the ledger
+      // phase measures real three-table SQL against real cardinality
+      // rather than a fast-fail empty-run short circuit.
+      const warmupSession = await runtime.openReadOnlySnapshot({ projectId: seeded.expectedIdentity.id });
+      let totalRecordCount = 0;
+      try {
+        const warmupRead = await readFencedDestinationCensus(warmupSession, {
+          settings: settings(db.runtimeUrl), expectedOwner: "lcm_test_migrator",
+          expectedIdentity: seeded.expectedIdentity, scratchParent,
+        });
+        totalRecordCount = warmupRead.census.reduce((sum, entry) => sum + entry.recordCount, 0);
+      } finally {
+        await warmupSession.close();
+      }
+      const runId = "census-cost-ledger-run";
+      const targetGenerationId = "census-cost-ledger-target";
+      const manifestSha256 = "d".repeat(64);
+      await db.migrator.query({
+        text: "INSERT INTO lcm.transfer_runs "
+          + "(run_id, target_generation, project_id, manifest_bytes, manifest_sha256, schema_sha256, project_sha256, source_sha256, source_witness_sha256, state) "
+          + "VALUES ($1, $2, $3, $4, $5, $5, $6, $5, $5, 'completed')",
+        values: [runId, targetGenerationId, seeded.expectedIdentity.id, Buffer.from("{}"), manifestSha256, destinationProbe.identityFingerprintSha256],
+      }, { domain: "factory", operation: "seedCensusCostLedgerRun" });
+      const manifestCheckpoints = PORTABLE_RECORD_DOMAIN_ORDER.map((domain) => ({
+        domain, ordinal: 0, recordCount: 0,
+        sourceCheckpointSha256: createHash("sha256").update("census-cost-checkpoint-" + domain).digest("hex"),
+        destinationCommitSha256: createHash("sha256").update("census-cost-commit-" + domain).digest("hex"),
+      }));
+      await db.migrator.query({
+        text: "INSERT INTO lcm.transfer_batches "
+          + "(run_id, domain, prior_checkpoint_sha256, batch_sha256, checkpoint_bytes, checkpoint_sha256, first_ordinal, next_ordinal) "
+          + "SELECT $1, d.domain, $2, $2, '{}'::bytea, d.checkpoint_sha256, 0, 0 "
+          + "FROM unnest($3::text[], $4::text[]) AS d(domain, checkpoint_sha256)",
+        values: [
+          runId, "0".repeat(64),
+          manifestCheckpoints.map((entry) => entry.domain),
+          manifestCheckpoints.map((entry) => entry.sourceCheckpointSha256),
+        ],
+      }, { domain: "factory", operation: "seedCensusCostLedgerBatches" });
+      await db.migrator.query({
+        text: "INSERT INTO lcm.transfer_identities (run_id, domain, identity_sha256, ordinal, native_key, record_sha256) "
+          + "SELECT $1, 'machines', encode(digest('census-cost-identity-' || g, 'sha256'), 'hex'), g, "
+          + "'census-cost-native-key-' || g, encode(digest('census-cost-record-' || g, 'sha256'), 'hex') "
+          + "FROM generate_series(0, $2::int - 1) AS g",
+        values: [runId, totalRecordCount],
+      }, { domain: "factory", operation: "seedCensusCostLedgerIdentities" });
+
+      // Phase 2: the fenced window -- guard, census (plus its relation
+      // edge walk), sequence check, ledger check -- all under one
+      // borrowed read-only snapshot session, exactly as
       // verifyMigrationGeneration runs it.
       const session = await runtime.openReadOnlySnapshot({ projectId: seeded.expectedIdentity.id });
       let destinationRead: Awaited<ReturnType<typeof readFencedDestinationCensus>>;
       let guardMs: number;
       let censusMs: number;
       let sequenceMs: number;
+      let ledgerMs: number;
       try {
         const guardStart = performance.now();
         await assertPermanentReadOnlyGuard(session);
@@ -108,13 +180,21 @@ it("measures the live census pass against a realistic destination and records th
         const sequenceStart = performance.now();
         await readSequenceSelfConsistencyMismatches(session, seeded.expectedIdentity.id);
         sequenceMs = performance.now() - sequenceStart;
+
+        const ledgerStart = performance.now();
+        await readLedgerMismatches(session, {
+          projectId: seeded.expectedIdentity.id, targetGenerationId,
+          manifestSha256, identityFingerprintSha256: destinationProbe.identityFingerprintSha256,
+          manifestCheckpoints, census: destinationRead.census,
+        });
+        ledgerMs = performance.now() - ledgerStart;
       } finally {
         await session.close();
       }
       const census = destinationRead.census;
 
-      const windowMs = guardMs + censusMs + sequenceMs;
-      const totalMs = probeMs + windowMs;
+      const windowMs = guardMs + censusMs + sequenceMs + ledgerMs;
+      const totalMs = probeMs + destinationProbeMs + windowMs;
       const censusFraction = censusMs / totalMs;
       // Margin rationale: 3x covers a destination roughly three times this
       // fixture's size, or equivalent disk/network degradation, without
@@ -136,14 +216,14 @@ it("measures the live census pass against a realistic destination and records th
         "Not a regression gate: these numbers are environment-dependent and",
         "this file is regenerated by running that test, not hand-edited.",
         "",
-        "STALE as of the relation class landing: readFencedDestinationCensus",
-        "now also walks every record a second time via readDomainPage to",
-        "collect dependency edges for the relation class (edge-set equality",
-        "plus the dangling-reference guard), so the census figure below",
-        "measures census-plus-relation combined, not census alone, and is",
-        "higher than a figure measured before relation existed. Re-run this",
-        "test after ledger also lands for a figure that reflects the full,",
-        "final window rather than a partial one.",
+        "The file name is historical. The numbers below cover the whole",
+        "in-window read as it runs today -- census (which now also collects",
+        "relation-class dependency edges via a second readDomainPage walk",
+        "over the same open source), sequence self-consistency, and the",
+        "ledger class (three-table SQL against transfer_runs/",
+        "transfer_batches/transfer_identities) -- not the census alone.",
+        "Each phase is broken out below so a reader does not have to guess",
+        "which figure is which.",
         "",
         "A first attempt at ten times this scale (" + FIRST_ATTEMPT_DID_NOT_COMPLETE + ") "
           + "was tried first and is recorded here rather than discarded: the",
@@ -166,7 +246,11 @@ it("measures the live census pass against a realistic destination and records th
         "other 21 domains were not bulk-scaled and keep the base fixture's",
         "row counts. Bulk insert itself (not part of the measured window)",
         "took " + formatMs(bulkSeedMs) + " ms via one server-side CTE, not",
-        "per-row round trips.",
+        "per-row round trips. A matching lcm.transfer_runs/transfer_batches/",
+        "transfer_identities ledger fixture was also seeded, with",
+        String(totalRecordCount) + " transfer_identities rows to match the",
+        "real census total, so the ledger phase below measures real SQL",
+        "against real cardinality rather than a fast-fail empty run.",
         "",
         "## Row counts per domain (from the census itself)",
         "",
@@ -179,20 +263,22 @@ it("measures the live census pass against a realistic destination and records th
         "| phase | ms | in lease window? |",
         "| --- | --- | --- |",
         "| public probe (repository read, " + String(publicRows.length) + " rows) | " + formatMs(probeMs) + " | before window |",
+        "| destination probe (probePostgreSqlPortableDestination) | " + formatMs(destinationProbeMs) + " | before window |",
         "| read-only guard assertion | " + formatMs(guardMs) + " | inside window |",
-        "| **census (readFencedDestinationCensus, all 22 domains)** | **"
+        "| **census + relation edges (readFencedDestinationCensus, all 22 domains)** | **"
           + formatMs(censusMs) + "** | inside window |",
         "| sequence self-consistency check | " + formatMs(sequenceMs) + " | inside window |",
-        "| window total (guard + census + sequence) | " + formatMs(windowMs) + " | -- |",
-        "| measured total (probe + window) | " + formatMs(totalMs) + " | -- |",
+        "| ledger check (transfer_runs/transfer_batches/transfer_identities) | " + formatMs(ledgerMs) + " | inside window |",
+        "| window total (guard + census/relation + sequence + ledger) | " + formatMs(windowMs) + " | -- |",
+        "| measured total (both pre-window probes + window) | " + formatMs(totalMs) + " | -- |",
         "",
-        "Census fraction of measured total: " + (censusFraction * 100).toFixed(1) + "%.",
+        "Census+relation fraction of measured total: " + (censusFraction * 100).toFixed(1) + "%.",
         "",
         "Persistence (the atomic content-addressed write in",
         "verification-store.ts) is a local file write after the lease is",
         "held and is not separately measured here; it is not read-scaling",
-        "with destination size the way the census is, so it is not the",
-        "cost this measurement exists to bound.",
+        "with destination size the way the in-window reads above are, so",
+        "it is not the cost this measurement exists to bound.",
         "",
         "## Proposed lease TTL",
         "",
@@ -208,6 +294,7 @@ it("measures the live census pass against a realistic destination and records th
       expect(census).toHaveLength(22);
       expect(rowCountsByDomain.conversations).toBeGreaterThanOrEqual(BULK_CONVERSATION_COUNT);
       expect(censusMs).toBeGreaterThan(0);
+      expect(ledgerMs).toBeGreaterThan(0);
       expect(totalMs).toBeGreaterThan(0);
     } finally {
       await runtime.close();

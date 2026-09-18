@@ -6,6 +6,8 @@ import * as coordination from "../../src/storage/postgresql/coordination.js";
 import * as searchConfiguration from "../../src/storage/postgresql/search-configuration.js";
 import * as migrations from "../../src/storage/postgresql/migrations.js";
 import * as portableSource from "../../src/storage/postgresql/portable-source.js";
+import * as portableDestination from "../../src/storage/postgresql/portable-destination.js";
+import * as manifestStoreModule from "../../src/migration/manifest-store.js";
 import * as copySourceModule from "../../src/migration/copy-source.js";
 import * as runtimeReadiness from "../../src/storage/postgresql/runtime-readiness.js";
 import { PORTABLE_RECORD_DOMAIN_ORDER, canonicalJson, type PortableDomain } from "../../src/storage/portable-record.js";
@@ -15,6 +17,7 @@ import {
   MigrationVerificationDriverError,
   assertPermanentReadOnlyGuard,
   readFencedDestinationCensus,
+  readLedgerMismatches,
   readRelationDanglingReferenceMismatches,
   reconcileDependencyEdges,
   readSequenceSelfConsistencyMismatches,
@@ -36,6 +39,23 @@ const EXPECTED_MIGRATIONS_SHA256 = createHash("sha256")
 
 function fakeHash(label: string): string {
   return createHash("sha256").update(label, "utf8").digest("hex");
+}
+
+const LEDGER_TOTAL_RECORD_COUNT_DEFAULT = PORTABLE_RECORD_DOMAIN_ORDER.reduce(
+  (sum, _domain, index) => sum + index, 0,
+);
+
+/** Shared by the default fake manifest and the default fake session's
+ * transfer_batches response, so the two agree on a "clean" ledger by
+ * construction rather than by two independently hand-maintained lists. */
+function defaultLedgerCheckpoint(domain: PortableDomain): {
+  domain: PortableDomain; ordinal: number; recordCount: number;
+  sourceCheckpointSha256: string; destinationCommitSha256: string;
+} {
+  return {
+    domain, ordinal: PORTABLE_RECORD_DOMAIN_ORDER.indexOf(domain), recordCount: PORTABLE_RECORD_DOMAIN_ORDER.indexOf(domain),
+    sourceCheckpointSha256: fakeHash("ledger-checkpoint-" + domain), destinationCommitSha256: fakeHash("ledger-commit-" + domain),
+  };
 }
 const projectId = "01990000-0000-7000-8000-000000000001";
 const machineId = "01990000-0000-7000-8000-000000000002";
@@ -82,6 +102,7 @@ function fakeStream(
       };
     }),
     verify: vi.fn(),
+    describe: vi.fn(() => ({ manifestSha256: HASH_A })),
     close: vi.fn(async () => { /* fake */ }),
   };
 }
@@ -116,13 +137,38 @@ function fakeSession(overrides: {
     maxValue: string | null; lastValue: string | null; isCalled?: boolean; incrementBy?: string;
     startValue?: string; privilegeDenied?: boolean;
   }>>;
+  ledgerIdentityTotal?: number | null;
+  ledgerRun?: { state?: string; manifestSha256?: string; projectSha256?: string } | null;
+  ledgerCheckpoints?: readonly ReturnType<typeof defaultLedgerCheckpoint>[];
+  ledgerNonInjective?: ReadonlyArray<{ domain: string; nativeKey: string }>;
 } = {}) {
   const sequenceState = overrides.sequenceState ?? {};
+  const ledgerRun = overrides.ledgerRun === undefined
+    ? { state: "completed", manifestSha256: HASH_A, projectSha256: HASH_A }
+    : overrides.ledgerRun;
+  const ledgerCheckpoints = overrides.ledgerCheckpoints
+    ?? PORTABLE_RECORD_DOMAIN_ORDER.map((domain) => defaultLedgerCheckpoint(domain));
+  const ledgerIdentityTotal = overrides.ledgerIdentityTotal ?? LEDGER_TOTAL_RECORD_COUNT_DEFAULT;
+  const ledgerNonInjective = overrides.ledgerNonInjective ?? [];
   const seqNameFor = (domain: string) => `lcm.fake_${domain}_seq`;
   return {
     identity: { sessionId: "window-session", backendPid: 999, projectId },
     query: vi.fn(async (config: { text: string; values?: readonly unknown[] }) => {
       if (config.text.includes("pg_current_xact_id_if_assigned")) return { rows: [{ xid: overrides.xid ?? null }] };
+      if (config.text.includes("lcm.transfer_runs")) {
+        if (ledgerRun === null) return { rows: [] };
+        return { rows: [{ run_id: "fake-run-id", state: ledgerRun.state, manifest_sha256: ledgerRun.manifestSha256, project_sha256: ledgerRun.projectSha256 }] };
+      }
+      if (config.text.includes("lcm.transfer_batches")) {
+        return { rows: ledgerCheckpoints.map((entry) => ({ domain: entry.domain, checkpoint_sha256: entry.sourceCheckpointSha256, next_ordinal: String(entry.ordinal) })) };
+      }
+      if (config.text.includes("GROUP BY domain, native_key")) {
+        return { rows: ledgerNonInjective.map((entry) => ({ domain: entry.domain, native_key: entry.nativeKey })) };
+      }
+      if (config.text.includes("lcm.transfer_identities")) {
+        if (overrides.ledgerIdentityTotal === null) return { rows: [] };
+        return { rows: [{ count: String(ledgerIdentityTotal) }] };
+      }
       if (config.text.includes("MAX(")) {
         const domain = Object.entries(SEQUENCE_BACKED_TABLES).find(([, table]) => config.text.includes(table))?.[0];
         const state = domain ? sequenceState[domain] : undefined;
@@ -193,6 +239,8 @@ function baseInput(overrides: Partial<VerifyMigrationGenerationInput> = {}): Ver
 function stubDestinationPrimitives(options: {
   domainCensus?: (domain: PortableDomain) => { domain: PortableDomain; recordCount: number; prefixSha256: string; terminalIdentitySha256: string | null };
   readDomainPage?: (domain: PortableDomain) => { predecessor: null; records: unknown[]; complete: boolean };
+  identityFingerprintSha256?: string;
+  manifestCheckpoints?: readonly ReturnType<typeof defaultLedgerCheckpoint>[];
 } = {}) {
   vi.spyOn(coordination, "PostgreSqlWorkCoordinator").mockImplementation(function () { return ({
     acquireLease: vi.fn(async () => ({ fencingToken: 1n } as never)),
@@ -201,6 +249,15 @@ function stubDestinationPrimitives(options: {
   vi.spyOn(migrations, "loadPostgreSqlMigrations").mockReturnValue(FAKE_MIGRATIONS as never);
   vi.spyOn(searchConfiguration, "inspectPostgreSqlSearchConfiguration").mockResolvedValue({ actualSha256: HASH_A } as never);
   vi.spyOn(portableSource, "readPostgreSqlPortableWitness").mockResolvedValue(HASH_A);
+  vi.spyOn(portableDestination, "probePostgreSqlPortableDestination").mockResolvedValue({
+    destinationWitnessSha256: HASH_A, identityFingerprintSha256: options.identityFingerprintSha256 ?? HASH_A,
+    nonIdentityDomainsEmpty: true, existingRun: null,
+  } as never);
+  const manifestCheckpoints = options.manifestCheckpoints
+    ?? PORTABLE_RECORD_DOMAIN_ORDER.map((domain) => defaultLedgerCheckpoint(domain));
+  vi.spyOn(manifestStoreModule, "MigrationManifestStore").mockImplementation(function () { return ({
+    read: vi.fn(() => ({ checkpoints: manifestCheckpoints })),
+  } as never); });
   const defaultReadDomainPage = () => ({ predecessor: null, records: [], complete: true });
   vi.spyOn(portableSource, "createPostgreSqlPortableSource").mockResolvedValue({
     close: vi.fn(async () => { /* fake */ }),
@@ -415,6 +472,100 @@ describe("reconcileDependencyEdges / readRelationDanglingReferenceMismatches", (
   });
 });
 
+describe("readLedgerMismatches", () => {
+  function ledgerCensus() {
+    return PORTABLE_RECORD_DOMAIN_ORDER.map((domain) => ({
+      domain, recordCount: PORTABLE_RECORD_DOMAIN_ORDER.indexOf(domain), prefixSha256: fakeHash("p-" + domain), terminalIdentitySha256: null,
+    }));
+  }
+  function ledgerInput(overrides: {
+    manifestCheckpoints?: readonly ReturnType<typeof defaultLedgerCheckpoint>[];
+    census?: ReturnType<typeof ledgerCensus>;
+  } = {}) {
+    return {
+      projectId, targetGenerationId: "generation-1-postgresql",
+      manifestSha256: HASH_A, identityFingerprintSha256: HASH_A,
+      manifestCheckpoints: overrides.manifestCheckpoints ?? PORTABLE_RECORD_DOMAIN_ORDER.map((domain) => defaultLedgerCheckpoint(domain)),
+      census: overrides.census ?? ledgerCensus(),
+    };
+  }
+  it("passes when the run, batches and identities all agree with the manifest and census", async () => {
+    const session = fakeSession();
+    const mismatches = await readLedgerMismatches(session as never, ledgerInput());
+    expect(mismatches).toEqual([]);
+  });
+  it("flags a missing run row", async () => {
+    const session = fakeSession({ ledgerRun: null });
+    const mismatches = await readLedgerMismatches(session as never, ledgerInput());
+    expect(mismatches).toEqual([{
+      domain: "ledger", class: "ledger",
+      identitySha256: migrationWitnessSha256(["ledger-run-mismatch-v1", "generation-1-postgresql"]),
+    }]);
+  });
+  it("flags a run row whose state is not completed", async () => {
+    const session = fakeSession({ ledgerRun: { state: "active", manifestSha256: HASH_A, projectSha256: HASH_A } });
+    const mismatches = await readLedgerMismatches(session as never, ledgerInput());
+    expect(mismatches).toEqual([{
+      domain: "ledger", class: "ledger",
+      identitySha256: migrationWitnessSha256(["ledger-run-mismatch-v1", "generation-1-postgresql"]),
+    }]);
+  });
+  it("flags a run row whose project_sha256 disagrees with the destination probe identity fingerprint", async () => {
+    const session = fakeSession({ ledgerRun: { state: "completed", manifestSha256: HASH_A, projectSha256: fakeHash("wrong-project") } });
+    const mismatches = await readLedgerMismatches(session as never, ledgerInput());
+    expect(mismatches).toEqual([{
+      domain: "ledger", class: "ledger",
+      identitySha256: migrationWitnessSha256(["ledger-run-mismatch-v1", "generation-1-postgresql"]),
+    }]);
+  });
+  it("flags one domain whose terminal batch checkpoint does not match the manifest, without recomputing the checkpoint structure itself", async () => {
+    const wrongCheckpoints = PORTABLE_RECORD_DOMAIN_ORDER.map((domain) => (
+      domain === "messages" ? { ...defaultLedgerCheckpoint(domain), sourceCheckpointSha256: fakeHash("stale-messages-checkpoint") } : defaultLedgerCheckpoint(domain)
+    ));
+    const session = fakeSession({ ledgerCheckpoints: wrongCheckpoints });
+    const mismatches = await readLedgerMismatches(session as never, ledgerInput());
+    expect(mismatches).toEqual([{
+      domain: "messages", class: "ledger",
+      identitySha256: migrationWitnessSha256(["ledger-batch-mismatch-v1", "messages"]),
+    }]);
+  });
+  it("flags a domain missing its terminal batch entirely", async () => {
+    const missingOneDomain = PORTABLE_RECORD_DOMAIN_ORDER
+      .filter((domain) => domain !== "summaries")
+      .map((domain) => defaultLedgerCheckpoint(domain));
+    const session = fakeSession({ ledgerCheckpoints: missingOneDomain });
+    const mismatches = await readLedgerMismatches(session as never, ledgerInput());
+    expect(mismatches).toEqual([{
+      domain: "summaries", class: "ledger",
+      identitySha256: migrationWitnessSha256(["ledger-batch-mismatch-v1", "summaries"]),
+    }]);
+  });
+  it("flags an identity cardinality mismatch against the census total", async () => {
+    const session = fakeSession({ ledgerIdentityTotal: LEDGER_TOTAL_RECORD_COUNT_DEFAULT + 1 });
+    const mismatches = await readLedgerMismatches(session as never, ledgerInput());
+    expect(mismatches).toEqual([{
+      domain: "ledger", class: "ledger",
+      identitySha256: migrationWitnessSha256(["ledger-identity-cardinality-mismatch-v1", "generation-1-postgresql"]),
+    }]);
+  });
+  it("fails closed when the identity count query returns no row at all", async () => {
+    const session = fakeSession({ ledgerIdentityTotal: null });
+    const mismatches = await readLedgerMismatches(session as never, ledgerInput());
+    expect(mismatches).toEqual([{
+      domain: "ledger", class: "ledger",
+      identitySha256: migrationWitnessSha256(["ledger-identity-cardinality-mismatch-v1", "generation-1-postgresql"]),
+    }]);
+  });
+  it("flags a non-injective native-key-to-identity mapping, the storage-level signature of the same defect the relation class catches", async () => {
+    const session = fakeSession({ ledgerNonInjective: [{ domain: "messages", nativeKey: "native-key-a" }] });
+    const mismatches = await readLedgerMismatches(session as never, ledgerInput());
+    expect(mismatches).toEqual([{
+      domain: "messages", class: "ledger",
+      identitySha256: migrationWitnessSha256(["ledger-non-injective-mapping-v1", "messages", "native-key-a"]),
+    }]);
+  });
+});
+
 describe("streamSourceCheckpoints: dependency edge capture", () => {
   it("captures every record's declared dependencies without a second source read", async () => {
     const dependentRecord = {
@@ -601,10 +752,12 @@ describe("verifyMigrationGeneration", () => {
     const result = await verifyMigrationGeneration(baseInput({ homeDir: "/tmp/lcm-verify-clean" }), dependencies);
     expect(result.outcome).toBe("clean");
     expect(result.report.mismatches).toEqual([]);
-    // V2's replacement for census-alone gating: ledger reconciliation is
-    // not implemented anywhere in this driver, so even a fully clean
-    // report must never claim activation eligibility until it lands.
-    expect(result.report.activationEligible).toBe(false);
+    // Every reconciliation class this driver defines is now implemented
+    // (relation and ledger were the last two), so a genuinely clean report
+    // against a sound fixture is activation-eligible for the first time --
+    // this is the milestone the class-coverage gate existed to protect
+    // until it was actually reached, not a relaxation of the gate itself.
+    expect(result.report.activationEligible).toBe(true);
     expect(result.report.body.classCoverage).toEqual([
       { class: "count", ran: true },
       { class: "digest", ran: true },
@@ -612,7 +765,7 @@ describe("verifyMigrationGeneration", () => {
       { class: "relation", ran: true },
       { class: "sequence", ran: true },
       { class: "schema", ran: true },
-      { class: "ledger", ran: false },
+      { class: "ledger", ran: true },
       { class: "sample", ran: true },
     ]);
     expect(runtime.close).toHaveBeenCalledTimes(1);
@@ -625,7 +778,7 @@ describe("verifyMigrationGeneration", () => {
     });
     const recordCounts = Object.fromEntries(PORTABLE_RECORD_DOMAIN_ORDER.map((domain) => [domain, 3])) as Partial<Record<PortableDomain, number>>;
     const copySource = fakeCopySource({ recordCounts });
-    const runtime = fakeRuntime();
+    const runtime = fakeRuntime({ session: fakeSession({ ledgerIdentityTotal: 3 * PORTABLE_RECORD_DOMAIN_ORDER.length }) });
     const dependencies = dependenciesFor(copySource, runtime);
     const result = await verifyMigrationGeneration(baseInput({ homeDir: "/tmp/lcm-verify-digest" }), dependencies);
     expect(result.outcome).toBe("mismatches");
@@ -638,7 +791,7 @@ describe("verifyMigrationGeneration", () => {
     });
     const recordCounts = Object.fromEntries(PORTABLE_RECORD_DOMAIN_ORDER.map((domain) => [domain, 1])) as Partial<Record<PortableDomain, number>>;
     const copySource = fakeCopySource({ recordCounts });
-    const runtime = fakeRuntime();
+    const runtime = fakeRuntime({ session: fakeSession({ ledgerIdentityTotal: 99 * PORTABLE_RECORD_DOMAIN_ORDER.length }) });
     const dependencies = dependenciesFor(copySource, runtime);
     const result = await verifyMigrationGeneration(baseInput({ homeDir: "/tmp/lcm-verify-dirty" }), dependencies);
     expect(result.outcome).toBe("mismatches");
@@ -667,6 +820,12 @@ describe("verifyMigrationGeneration", () => {
     vi.spyOn(migrations, "loadPostgreSqlMigrations").mockReturnValue(FAKE_MIGRATIONS as never);
     vi.spyOn(searchConfiguration, "inspectPostgreSqlSearchConfiguration").mockResolvedValue({ actualSha256: HASH_A } as never);
     vi.spyOn(portableSource, "readPostgreSqlPortableWitness").mockResolvedValue(HASH_A);
+    vi.spyOn(portableDestination, "probePostgreSqlPortableDestination").mockResolvedValue({
+      destinationWitnessSha256: HASH_A, identityFingerprintSha256: HASH_A, nonIdentityDomainsEmpty: true, existingRun: null,
+    } as never);
+    vi.spyOn(manifestStoreModule, "MigrationManifestStore").mockImplementation(function () { return ({
+      read: vi.fn(() => ({ checkpoints: PORTABLE_RECORD_DOMAIN_ORDER.map((domain) => defaultLedgerCheckpoint(domain)) })),
+    } as never); });
     const copySource = fakeCopySource();
     const runtime = fakeRuntime();
     const dependencies = dependenciesFor(copySource, runtime);
