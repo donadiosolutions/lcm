@@ -4487,6 +4487,40 @@ describe("sanitizeError", () => {
     expect(sanitizeError(sanitizeError(first))).toBe(first);
   });
 
+  // Regression coverage for the SYNTHESIS_REVIEWER finding on candidate
+  // 03c05350. A wrapper that contains any URL has observable ownership, so a
+  // sibling delimiter after a closed child group separates parameters rather
+  // than ending the query. Only a wrapper of plain literal values suspends.
+  it.each([
+    [
+      "named value after two closes",
+      "file://h?x=[[[https://e.test/t|file://host?key=/public]]|name=\\Users\\SECRET\\x]",
+      "file://h?x=[[[https://e.test/t|file://host?key=<path>]]|name=<path>]",
+    ],
+    [
+      "ampersand parity after two closes",
+      "file://h?x=[[[https://e.test/t|file://host?key=/public]]&name=\\Users\\SECRET\\x]",
+      "file://h?x=[[[https://e.test/t|file://host?key=<path>]]&name=<path>]",
+    ],
+    [
+      "named value after one close of a public child",
+      "file://h?x=[[https://e.test/t|/Users/a/one]|name=\\Users\\SECRET\\y",
+      "file://h?x=[[https://e.test/t|<path>]|name=<path>",
+    ],
+    [
+      "named value after a literal-only inner group",
+      "file://h?x=[[https://e.test/t|value]|name=\\Users\\SECRET\\y",
+      "file://h?x=[[https://e.test/t|value]|name=<path>",
+    ],
+  ] as const)("keeps named ownership in a URL-bearing wrapper: %s", (_name, input, expected) => {
+    const first = sanitizeError(input);
+
+    expect(first).toBe(expected);
+    expect(first).not.toContain("SECRET");
+    expect(sanitizeError(first)).toBe(first);
+    expect(sanitizeError(sanitizeError(first))).toBe(first);
+  });
+
   it("replaces SQLite constraint details with generic message", () => {
     const result = sanitizeError("SQLITE_CONSTRAINT: UNIQUE constraint failed: messages.conversation_id");
     expect(result).not.toContain("messages.conversation_id");

@@ -109,6 +109,7 @@ function findUrlPathStarts(chars: readonly string[]): UrlPathStarts {
   const suspendedPathlessFileQueryOwnerDepths = new Set<number>();
   const closedChildGroupRootedOwnerDepths = new Set<number>();
   let pathlessFileQueryScopeActive = false;
+  let urlSeenInsidePathlessWrapper = false;
   let schemeLength = 0;
   let fileSchemeLength = 0;
   let schemeQuote = 0;
@@ -162,6 +163,7 @@ function findUrlPathStarts(chars: readonly string[]): UrlPathStarts {
       suspendedPathlessFileQueryOwnerDepths.clear();
       closedChildGroupRootedOwnerDepths.clear();
       pathlessFileQueryScopeActive = false;
+      urlSeenInsidePathlessWrapper = false;
       activeNestedFileUrlParentOwnerBracketDepth = 0;
       queryOrFragment = false;
       nestedPublicUrlBracketDepth = 0;
@@ -186,11 +188,13 @@ function findUrlPathStarts(chars: readonly string[]): UrlPathStarts {
     } else if (pathlessFileQueryOwnerBracketDepth > 0 && char === "]") {
       suspendedPathlessFileQueryOwnerDepths.delete(pathlessFileQueryOwnerBracketDepth);
       pathlessFileQueryOwnerBracketDepth -= 1;
+      if (pathlessFileQueryOwnerBracketDepth === 0) urlSeenInsidePathlessWrapper = false;
       // A private tail or a closed sibling group ends the restarted scanner
       // but not the enclosing file query, so a later sibling wrapper still
       // belongs to that query and must own its own bracket depth.
     } else if ((restartedPathlessFile || pathlessFileQueryScopeActive) && char === "[") {
       pathlessFileQueryOwnerBracketDepth = 1;
+      urlSeenInsidePathlessWrapper = false;
     }
     if (
       closingPathlessFileQueryOwnerDepth > 0 &&
@@ -352,6 +356,7 @@ function findUrlPathStarts(chars: readonly string[]): UrlPathStarts {
         : -1;
     if ((separator >= 0 || restartedPathlessFile) && nestedFileSchemeStart >= 0) {
       activeNestedFileUrlParentOwnerBracketDepth = pathlessFileQueryOwnerBracketDepth;
+      if (pathlessFileQueryOwnerBracketDepth > 0) urlSeenInsidePathlessWrapper = true;
       if (activeNestedFileUrlParentOwnerBracketDepth > 0) {
         nestedFileUrlParentOwnerBracketDepths.add(activeNestedFileUrlParentOwnerBracketDepth);
         restartedNestedFileUrlParentOwnerBracketDepths.delete(activeNestedFileUrlParentOwnerBracketDepth);
@@ -643,8 +648,11 @@ function findUrlPathStarts(chars: readonly string[]): UrlPathStarts {
       // A nested public URL span inside this wrapper is observable ownership
       // too, so a delimiter after it separates parameters rather than ending
       // the query.
-      pathlessFileQueryBracketDepth === 0 &&
-      !nestedFileUrlParentOwnerBracketDepths.has(pathlessFileQueryOwnerBracketDepth)
+      // Any URL seen anywhere inside this wrapper, at this depth or deeper, is
+      // observable ownership, so a delimiter after it separates parameters
+      // rather than ending the query. Only a wrapper of plain literal values
+      // has nothing to own, which is exactly the Bug #1332 shape.
+      !urlSeenInsidePathlessWrapper
     ) {
       suspendedPathlessFileQueryOwnerDepths.add(pathlessFileQueryOwnerBracketDepth);
     }
@@ -817,6 +825,7 @@ function findUrlPathStarts(chars: readonly string[]): UrlPathStarts {
       authority[index + 1] = 1;
       authority[index + 2] = 1;
       exactFileScheme = schemeLength === FILE_SCHEME.length && fileSchemeLength === FILE_SCHEME.length;
+      if (pathlessFileQueryOwnerBracketDepth > 0) urlSeenInsidePathlessWrapper = true;
       if (exactFileScheme && pathlessFileQueryOwnerBracketDepth > 0) {
         activeNestedFileUrlParentOwnerBracketDepth = pathlessFileQueryOwnerBracketDepth;
         nestedFileUrlParentOwnerBracketDepths.add(activeNestedFileUrlParentOwnerBracketDepth);
