@@ -124,7 +124,7 @@ client for each read:
 | `lcm search <query>` | Search episodic and promoted memory |
 | `lcm grep <query>` | Search messages and summaries by exact text or regular expression; optional inclusive `--since` accepts `YYYY-MM-DDTHH:mm:ss[.S{1,3}](Z|+/-HH:mm)` with normalized UTC years 0001-9999, and malformed or out-of-range values return HTTP 400 |
 | `lcm describe <nodeId>` | Read summary or stored-memory metadata |
-| `lcm expand <nodeId>` | Expand a summary into source detail |
+| `lcm expand <nodeId>` | Traverse a summary's DAG links and list its child summaries as short snippets |
 
 When `--since` is supplied, its value is forwarded to the daemon exactly as
 provided. An empty or whitespace-only value is therefore invalid and returns
