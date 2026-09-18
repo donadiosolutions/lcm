@@ -15,6 +15,8 @@ import {
   MigrationVerificationDriverError,
   assertPermanentReadOnlyGuard,
   readFencedDestinationCensus,
+  readRelationDanglingReferenceMismatches,
+  reconcileDependencyEdges,
   readSequenceSelfConsistencyMismatches,
   reconcileCounts,
   sortMismatches,
@@ -190,6 +192,7 @@ function baseInput(overrides: Partial<VerifyMigrationGenerationInput> = {}): Ver
 
 function stubDestinationPrimitives(options: {
   domainCensus?: (domain: PortableDomain) => { domain: PortableDomain; recordCount: number; prefixSha256: string; terminalIdentitySha256: string | null };
+  readDomainPage?: (domain: PortableDomain) => { predecessor: null; records: unknown[]; complete: boolean };
 } = {}) {
   vi.spyOn(coordination, "PostgreSqlWorkCoordinator").mockImplementation(function () { return ({
     acquireLease: vi.fn(async () => ({ fencingToken: 1n } as never)),
@@ -198,7 +201,11 @@ function stubDestinationPrimitives(options: {
   vi.spyOn(migrations, "loadPostgreSqlMigrations").mockReturnValue(FAKE_MIGRATIONS as never);
   vi.spyOn(searchConfiguration, "inspectPostgreSqlSearchConfiguration").mockResolvedValue({ actualSha256: HASH_A } as never);
   vi.spyOn(portableSource, "readPostgreSqlPortableWitness").mockResolvedValue(HASH_A);
-  vi.spyOn(portableSource, "createPostgreSqlPortableSource").mockResolvedValue({ close: vi.fn(async () => { /* fake */ }) } as never);
+  const defaultReadDomainPage = () => ({ predecessor: null, records: [], complete: true });
+  vi.spyOn(portableSource, "createPostgreSqlPortableSource").mockResolvedValue({
+    close: vi.fn(async () => { /* fake */ }),
+    readDomainPage: vi.fn(async (request: { domain: PortableDomain }) => (options.readDomainPage ?? defaultReadDomainPage)(request.domain)),
+  } as never);
   const defaultCensus = (domain: PortableDomain) => ({
     domain, recordCount: PORTABLE_RECORD_DOMAIN_ORDER.indexOf(domain), prefixSha256: fakeHash(`prefix-${domain}-${PORTABLE_RECORD_DOMAIN_ORDER.indexOf(domain)}`),
     terminalIdentitySha256: PORTABLE_RECORD_DOMAIN_ORDER.indexOf(domain) === 0 ? null : HASH_A,
@@ -235,7 +242,9 @@ describe("readFencedDestinationCensus", () => {
     const result = await readFencedDestinationCensus(session as never, {
       settings: baseInput().destinationSettings, expectedOwner: "owner", expectedIdentity: identity(), scratchParent: "/scratch",
     });
-    expect(result).toHaveLength(PORTABLE_RECORD_DOMAIN_ORDER.length);
+    expect(result.census).toHaveLength(PORTABLE_RECORD_DOMAIN_ORDER.length);
+    expect(result.dependencyEdges.size).toBe(PORTABLE_RECORD_DOMAIN_ORDER.length);
+    expect(result.recordIdentities.size).toBe(PORTABLE_RECORD_DOMAIN_ORDER.length);
     expect(session.close).not.toHaveBeenCalled();
   });
   it("closes the created portable source even when a domain read fails, without closing the borrowed session", async () => {
@@ -246,6 +255,184 @@ describe("readFencedDestinationCensus", () => {
       settings: baseInput().destinationSettings, expectedOwner: "owner", expectedIdentity: identity(), scratchParent: "/scratch",
     })).rejects.toThrow("read-failure");
     expect(session.close).not.toHaveBeenCalled();
+  });
+  it("collects destination record identities and dependency edges from readDomainPage", async () => {
+    const destinationRecord = {
+      identitySha256: fakeHash("destination-child"),
+      dependencies: [{ domain: "project", identitySha256: fakeHash("destination-parent") }],
+    };
+    stubDestinationPrimitives({
+      readDomainPage: (domain) => ({
+        predecessor: null,
+        records: domain === "conversations" ? [destinationRecord] : [],
+        complete: true,
+      }),
+    });
+    const session = fakeSession();
+    const result = await readFencedDestinationCensus(session as never, {
+      settings: baseInput().destinationSettings, expectedOwner: "owner", expectedIdentity: identity(), scratchParent: "/scratch",
+    });
+    expect(result.recordIdentities.get("conversations")).toEqual(new Set([fakeHash("destination-child")]));
+    expect(result.dependencyEdges.get("conversations")).toEqual(new Set([
+      fakeHash("destination-child") + "|project|" + fakeHash("destination-parent"),
+    ]));
+  });
+  it("pages through readDomainPage until complete, rather than stopping after the first page", async () => {
+    let conversationsCalls = 0;
+    vi.spyOn(coordination, "PostgreSqlWorkCoordinator").mockImplementation(function () { return ({
+      acquireLease: vi.fn(async () => ({ fencingToken: 1n } as never)), releaseLease: vi.fn(async () => null),
+    } as never); });
+    vi.spyOn(migrations, "loadPostgreSqlMigrations").mockReturnValue(FAKE_MIGRATIONS as never);
+    vi.spyOn(searchConfiguration, "inspectPostgreSqlSearchConfiguration").mockResolvedValue({ actualSha256: HASH_A } as never);
+    vi.spyOn(portableSource, "readPostgreSqlPortableWitness").mockResolvedValue(HASH_A);
+    vi.spyOn(portableSource, "readPostgreSqlPortableSourceDomainCensus").mockImplementation(((_s: unknown, domain: PortableDomain) => ({
+      domain, recordCount: 2, prefixSha256: fakeHash("prefix-" + domain), terminalIdentitySha256: HASH_A,
+    })) as never);
+    vi.spyOn(portableSource, "createPostgreSqlPortableSource").mockResolvedValue({
+      close: vi.fn(async () => { /* fake */ }),
+      readDomainPage: vi.fn(async ({ domain, afterOrdinal }: { domain: PortableDomain; afterOrdinal: number }) => {
+        if (domain !== "conversations") return { predecessor: null, records: [], complete: true };
+        conversationsCalls += 1;
+        if (afterOrdinal === 0) {
+          return {
+            predecessor: null,
+            records: [{ identitySha256: fakeHash("page-1-child"), dependencies: [] }],
+            complete: false,
+          };
+        }
+        return {
+          predecessor: null,
+          records: [{ identitySha256: fakeHash("page-2-child"), dependencies: [] }],
+          complete: true,
+        };
+      }),
+    } as never);
+    const session = fakeSession();
+    const result = await readFencedDestinationCensus(session as never, {
+      settings: baseInput().destinationSettings, expectedOwner: "owner", expectedIdentity: identity(), scratchParent: "/scratch",
+    });
+    expect(conversationsCalls).toBe(2);
+    expect(result.recordIdentities.get("conversations")).toEqual(
+      new Set([fakeHash("page-1-child"), fakeHash("page-2-child")]),
+    );
+  });
+});
+
+describe("reconcileDependencyEdges / readRelationDanglingReferenceMismatches", () => {
+  it("catches a child remapped to a valid but wrong parent, which the dangling-reference guard alone cannot see", () => {
+    // The #623 P1 shape: identity remapping points a child at a
+    // different, otherwise perfectly valid, real parent record. Every
+    // foreign-key constraint is satisfied and the parent genuinely
+    // exists, so the cheap dangling check finds nothing here -- this is
+    // exactly why edge-set equality, not dangling detection, has to be
+    // the substantive half of the relation class.
+    const sourceEdges = new Map<PortableDomain, ReadonlySet<string>>([
+      ["messages", new Set(["msg-a|conversations|conv-correct"])],
+    ]);
+    const destinationEdges = new Map<PortableDomain, ReadonlySet<string>>([
+      ["messages", new Set(["msg-a|conversations|conv-wrong"])],
+    ]);
+    const destinationIdentities = new Map<PortableDomain, ReadonlySet<string>>([
+      ["conversations", new Set(["conv-correct", "conv-wrong"])],
+    ]);
+
+    const danglingOnly = readRelationDanglingReferenceMismatches(destinationEdges, destinationIdentities);
+    expect(danglingOnly).toEqual([]);
+
+    const edgeMismatches = reconcileDependencyEdges(sourceEdges, destinationEdges);
+    expect(edgeMismatches).toEqual([{
+      domain: "messages", class: "relation",
+      identitySha256: migrationWitnessSha256(["relation-edge-mismatch-v1", "messages", "msg-a"]),
+    }]);
+  });
+  it("passes when source and destination edge sets agree exactly", () => {
+    const edges = new Map<PortableDomain, ReadonlySet<string>>([
+      ["messages", new Set(["msg-a|conversations|conv-a", "msg-b|conversations|conv-a"])],
+    ]);
+    expect(reconcileDependencyEdges(edges, edges)).toEqual([]);
+  });
+  it("deduplicates two bad edges from the same child into a single mismatch", () => {
+    const sourceEdges = new Map<PortableDomain, ReadonlySet<string>>([
+      ["context-items", new Set(["ci-a|conversations|conv-x", "ci-a|messages|msg-x"])],
+    ]);
+    const destinationEdges = new Map<PortableDomain, ReadonlySet<string>>([
+      ["context-items", new Set(["ci-a|conversations|conv-y", "ci-a|messages|msg-y"])],
+    ]);
+    const mismatches = reconcileDependencyEdges(sourceEdges, destinationEdges);
+    expect(mismatches).toEqual([{
+      domain: "context-items", class: "relation",
+      identitySha256: migrationWitnessSha256(["relation-edge-mismatch-v1", "context-items", "ci-a"]),
+    }]);
+  });
+  it("flags a destination edge whose referenced parent identity does not exist in the destination at all", () => {
+    const destinationEdges = new Map<PortableDomain, ReadonlySet<string>>([
+      ["messages", new Set(["msg-a|conversations|conv-missing"])],
+    ]);
+    const destinationIdentities = new Map<PortableDomain, ReadonlySet<string>>([
+      ["conversations", new Set()],
+    ]);
+    const mismatches = readRelationDanglingReferenceMismatches(destinationEdges, destinationIdentities);
+    expect(mismatches).toEqual([{
+      domain: "messages", class: "relation",
+      identitySha256: migrationWitnessSha256(["relation-dangling-reference-v1", "messages", "msg-a"]),
+    }]);
+  });
+  it("passes the dangling guard when every referenced parent identity is present", () => {
+    const destinationEdges = new Map<PortableDomain, ReadonlySet<string>>([
+      ["messages", new Set(["msg-a|conversations|conv-a"])],
+    ]);
+    const destinationIdentities = new Map<PortableDomain, ReadonlySet<string>>([
+      ["conversations", new Set(["conv-a"])],
+    ]);
+    expect(readRelationDanglingReferenceMismatches(destinationEdges, destinationIdentities)).toEqual([]);
+  });
+  it("deduplicates two dangling edges from the same child into a single mismatch", () => {
+    const destinationEdges = new Map<PortableDomain, ReadonlySet<string>>([
+      ["context-items", new Set(["ci-a|conversations|conv-missing", "ci-a|messages|msg-missing"])],
+    ]);
+    const destinationIdentities = new Map<PortableDomain, ReadonlySet<string>>([
+      ["conversations", new Set()], ["messages", new Set()],
+    ]);
+    const mismatches = readRelationDanglingReferenceMismatches(destinationEdges, destinationIdentities);
+    expect(mismatches).toEqual([{
+      domain: "context-items", class: "relation",
+      identitySha256: migrationWitnessSha256(["relation-dangling-reference-v1", "context-items", "ci-a"]),
+    }]);
+  });
+  it("flags a dangling reference whose parent domain has no identity set at all, not only an empty one", () => {
+    const destinationEdges = new Map<PortableDomain, ReadonlySet<string>>([
+      ["messages", new Set(["msg-a|conversations|conv-a"])],
+    ]);
+    // "conversations" is entirely absent from the map, not present with
+    // an empty set: proves the optional-chained lookup handles a missing
+    // domain key the same as an empty one, rather than throwing.
+    const destinationIdentities = new Map<PortableDomain, ReadonlySet<string>>();
+    const mismatches = readRelationDanglingReferenceMismatches(destinationEdges, destinationIdentities);
+    expect(mismatches).toEqual([{
+      domain: "messages", class: "relation",
+      identitySha256: migrationWitnessSha256(["relation-dangling-reference-v1", "messages", "msg-a"]),
+    }]);
+  });
+});
+
+describe("streamSourceCheckpoints: dependency edge capture", () => {
+  it("captures every record's declared dependencies without a second source read", async () => {
+    const dependentRecord = {
+      ...fakeConversationRecord("2026-01-01T00:00:00.000Z", "edge-capture-source"),
+      dependencies: [{ domain: "project" as const, identitySha256: fakeHash("edge-capture-parent") }],
+    };
+    const stream = fakeStream({ conversations: 1 }, [dependentRecord]);
+    const result = await streamSourceCheckpoints(stream as never);
+    expect(result.dependencyEdges.size).toBe(PORTABLE_RECORD_DOMAIN_ORDER.length);
+    expect(result.dependencyEdges.get("conversations")).toEqual(new Set([
+      dependentRecord.identitySha256 + "|project|" + fakeHash("edge-capture-parent"),
+    ]));
+    // Every other domain's fake batch returns zero records (see
+    // fakeStream), so their edge sets must stay empty without throwing.
+    for (const domain of PORTABLE_RECORD_DOMAIN_ORDER) {
+      if (domain === "conversations") continue;
+      expect(result.dependencyEdges.get(domain)).toEqual(new Set());
+    }
   });
 });
 
@@ -414,15 +601,15 @@ describe("verifyMigrationGeneration", () => {
     const result = await verifyMigrationGeneration(baseInput({ homeDir: "/tmp/lcm-verify-clean" }), dependencies);
     expect(result.outcome).toBe("clean");
     expect(result.report.mismatches).toEqual([]);
-    // V2's replacement for census-alone gating: relation/FK closure and
-    // ledger reconciliation are not implemented anywhere in this driver,
-    // so even a fully clean report must never claim activation eligibility.
+    // V2's replacement for census-alone gating: ledger reconciliation is
+    // not implemented anywhere in this driver, so even a fully clean
+    // report must never claim activation eligibility until it lands.
     expect(result.report.activationEligible).toBe(false);
     expect(result.report.body.classCoverage).toEqual([
       { class: "count", ran: true },
       { class: "digest", ran: true },
       { class: "identity", ran: true },
-      { class: "relation", ran: false },
+      { class: "relation", ran: true },
       { class: "sequence", ran: true },
       { class: "schema", ran: true },
       { class: "ledger", ran: false },

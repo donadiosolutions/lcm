@@ -77,7 +77,7 @@ it("a write committed by a second connection during the fenced window is invisib
           settings: settings(db.runtimeUrl), expectedOwner: "lcm_test_migrator",
           expectedIdentity: seeded.expectedIdentity, scratchParent,
         });
-        const duringConversations = during.find((entry) => entry.domain === "conversations");
+        const duringConversations = during.census.find((entry) => entry.domain === "conversations");
         expect(duringConversations?.recordCount).toBe(2);
       } finally {
         await session.close();
@@ -88,7 +88,7 @@ it("a write committed by a second connection during the fenced window is invisib
           settings: settings(db.runtimeUrl), expectedOwner: "lcm_test_migrator",
           expectedIdentity: seeded.expectedIdentity, scratchParent,
         });
-        const afterConversations = afterCensus.find((entry) => entry.domain === "conversations");
+        const afterConversations = afterCensus.census.find((entry) => entry.domain === "conversations");
         expect(afterConversations?.recordCount).toBe(3);
       } finally {
         await after.close();

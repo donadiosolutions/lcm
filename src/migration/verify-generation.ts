@@ -14,10 +14,10 @@ import type { PostgreSqlConnectionSettings, PostgreSqlQueryExecutor } from "../s
 import {
   PORTABLE_RECORD_DOMAIN_ORDER, PORTABLE_LIMITS, canonicalJson as portableCanonicalJson,
   PORTABLE_RECORD_SCHEMA_SHA256,
-  type PortableDomain,
+  type PortableDomain, type PortableRecord,
 } from "../storage/portable-record.js";
 import type {
-  PortableCheckpoint, PortableRecordStream, PortableRecordValueByDomain,
+  PortableCheckpoint, PortableRecordSource, PortableRecordStream, PortableRecordValueByDomain,
 } from "../storage/portable-record-stream.js";
 import { aggregateContentSha256 } from "../storage/portable-record-stream.js";
 import { openMigrationCopySource, type MigrationCopySourceInput } from "./copy-source.js";
@@ -53,7 +53,7 @@ import { MigrationVerificationReportStore } from "./verification-store.js";
  * not an oversight to fix later in this same item.
  */
 export const DRIVER_IMPLEMENTED_MISMATCH_CLASSES: ReadonlySet<MigrationMismatchClass> = new Set([
-  "count", "digest", "identity", "sequence", "schema", "sample",
+  "count", "digest", "identity", "sequence", "schema", "sample", "relation",
 ]);
 
 function buildClassCoverageVector(): MigrationClassCoverageVector {
@@ -250,6 +250,25 @@ export type MigrationVerificationDomainCensus = Readonly<{
   terminalIdentitySha256: string | null;
 }>;
 
+function dependencyEdgeKey(childIdentitySha256: string, parentDomain: string, parentIdentitySha256: string): string {
+  return childIdentitySha256 + "|" + parentDomain + "|" + parentIdentitySha256;
+}
+
+/** Shared by the source stream pass and the destination page walk: both read
+ * PortableRecord.dependencies, already computed by the existing
+ * canonicalisation path on both sides, never recomputed here. */
+function collectDependencyEdges(record: PortableRecord, into: Set<string>): void {
+  for (const dependency of record.dependencies) {
+    into.add(dependencyEdgeKey(record.identitySha256, dependency.domain, dependency.identitySha256));
+  }
+}
+
+export interface MigrationFencedDestinationRead {
+  readonly census: readonly MigrationVerificationDomainCensus[];
+  readonly dependencyEdges: ReadonlyMap<PortableDomain, ReadonlySet<string>>;
+  readonly recordIdentities: ReadonlyMap<PortableDomain, ReadonlySet<string>>;
+}
+
 /**
  * Runs entirely inside the caller's borrowed read-only snapshot session.
  * This function receives only that session: it has no lexical access to a
@@ -257,6 +276,15 @@ export type MigrationVerificationDomainCensus = Readonly<{
  * executor, so calling a lease method or opening a read-committed-read-write
  * transaction from here is not a code-review question but a compile error.
  * Nothing here may call session.close(); the caller owns that lifetime.
+ *
+ * Also walks every record of every domain a second time through
+ * readDomainPage -- an existing, approved read on the already-open
+ * PortableRecordSource, never new digest logic -- to collect each record's
+ * already-computed dependencies for the relation class. This is real
+ * additional cost inside the same window and the same already-open
+ * source, not a second createPostgreSqlPortableSource open (which would
+ * double the eager per-domain boundary computation that already happened
+ * when this source was constructed).
  */
 export async function readFencedDestinationCensus(
   session: PostgreSqlSnapshotSession,
@@ -264,19 +292,113 @@ export async function readFencedDestinationCensus(
     settings: PostgreSqlConnectionSettings; expectedOwner: string; expectedIdentity: StorageIdentityContext;
     scratchParent: string; signal?: AbortSignal;
   }>,
-): Promise<readonly MigrationVerificationDomainCensus[]> {
+): Promise<MigrationFencedDestinationRead> {
   const destinationSource = await createPostgreSqlPortableSource({
     settings: input.settings, expectedOwner: input.expectedOwner, expectedIdentity: input.expectedIdentity,
     scratchParent: input.scratchParent, signal: input.signal, session,
   });
   try {
-    return PORTABLE_RECORD_DOMAIN_ORDER.map((domain) => readPostgreSqlPortableSourceDomainCensus(destinationSource, domain));
+    const census = PORTABLE_RECORD_DOMAIN_ORDER.map((domain) => readPostgreSqlPortableSourceDomainCensus(destinationSource, domain));
+    const { dependencyEdges, recordIdentities } = await readDestinationDependencyEdges(destinationSource, input.signal);
+    return { census, dependencyEdges, recordIdentities };
   } finally {
     // Borrowed session: this must never close it. Verified by
     // test/storage/postgresql-portable-source-borrowed-session.test.ts and
     // by this module's own crash/error-path tests.
     await destinationSource.close();
   }
+}
+
+async function readDestinationDependencyEdges(
+  destinationSource: PortableRecordSource, signal?: AbortSignal,
+): Promise<{ dependencyEdges: Map<PortableDomain, Set<string>>; recordIdentities: Map<PortableDomain, Set<string>> }> {
+  const dependencyEdges = new Map<PortableDomain, Set<string>>();
+  const recordIdentities = new Map<PortableDomain, Set<string>>();
+  for (const domain of PORTABLE_RECORD_DOMAIN_ORDER) {
+    const edgeSet = new Set<string>(); dependencyEdges.set(domain, edgeSet);
+    const identitySet = new Set<string>(); recordIdentities.set(domain, identitySet);
+    let afterOrdinal = 0;
+    for (;;) {
+      const page = await destinationSource.readDomainPage({
+        domain, afterOrdinal, includePredecessor: false,
+        maxRecords: 500, maxBytes: PORTABLE_LIMITS.maxBatchBytes as 150994944, signal,
+      });
+      for (const record of page.records) {
+        identitySet.add(record.identitySha256);
+        collectDependencyEdges(record, edgeSet);
+      }
+      afterOrdinal += page.records.length;
+      if (page.complete) break;
+    }
+  }
+  return { dependencyEdges, recordIdentities };
+}
+
+/**
+ * Relation class, substantive half: edge-set equality between source and
+ * destination in canonical identity terms. A foreign-key constraint
+ * cannot see a child remapped to a valid but wrong parent -- the row
+ * still satisfies every constraint -- so this compares the destination's
+ * recorded dependency edges against the source's directly, per domain.
+ * Reports the child's identity digest, never the parent's, per plan.
+ */
+export function reconcileDependencyEdges(
+  sourceEdges: ReadonlyMap<PortableDomain, ReadonlySet<string>>,
+  destinationEdges: ReadonlyMap<PortableDomain, ReadonlySet<string>>,
+): MigrationVerificationMismatch[] {
+  const mismatches: MigrationVerificationMismatch[] = [];
+  for (const domain of PORTABLE_RECORD_DOMAIN_ORDER) {
+    const source = sourceEdges.get(domain) ?? new Set<string>();
+    const destination = destinationEdges.get(domain) ?? new Set<string>();
+    const reported = new Set<string>();
+    const report = (edge: string): void => {
+      const childIdentitySha256 = edge.split("|")[0]!;
+      if (reported.has(childIdentitySha256)) return;
+      reported.add(childIdentitySha256);
+      mismatches.push({
+        domain, class: "relation",
+        identitySha256: migrationWitnessSha256(["relation-edge-mismatch-v1", domain, childIdentitySha256]),
+      });
+    };
+    for (const edge of source) if (!destination.has(edge)) report(edge);
+    for (const edge of destination) if (!source.has(edge)) report(edge);
+  }
+  return mismatches;
+}
+
+/**
+ * Relation class, cheap additional guard: every dependency edge the
+ * destination itself recorded must resolve to a record that actually
+ * exists in the destination. Ordinary PostgreSQL foreign-key constraints
+ * already make this structurally impossible for normal writes, so this
+ * only fires against a constraint bypass (disabled triggers, an
+ * unvalidated FK) -- defense in depth, not the primary check, and it
+ * costs nothing extra: it reads the same data the edge-set comparison
+ * already collected.
+ */
+export function readRelationDanglingReferenceMismatches(
+  destinationEdges: ReadonlyMap<PortableDomain, ReadonlySet<string>>,
+  destinationIdentities: ReadonlyMap<PortableDomain, ReadonlySet<string>>,
+): MigrationVerificationMismatch[] {
+  const mismatches: MigrationVerificationMismatch[] = [];
+  for (const domain of PORTABLE_RECORD_DOMAIN_ORDER) {
+    const edgeSet = destinationEdges.get(domain);
+    if (edgeSet === undefined) continue;
+    const reported = new Set<string>();
+    for (const edge of edgeSet) {
+      const parts = edge.split("|");
+      const childIdentitySha256 = parts[0]!; const parentDomain = parts[1]!; const parentIdentitySha256 = parts[2]!;
+      const parentIdentities = destinationIdentities.get(parentDomain as PortableDomain);
+      if (parentIdentities?.has(parentIdentitySha256) === true) continue;
+      if (reported.has(childIdentitySha256)) continue;
+      reported.add(childIdentitySha256);
+      mismatches.push({
+        domain, class: "relation",
+        identitySha256: migrationWitnessSha256(["relation-dangling-reference-v1", domain, childIdentitySha256]),
+      });
+    }
+  }
+  return mismatches;
 }
 
 // --- Step 6 (in-window): sequence self-consistency ---------------------------
@@ -491,6 +613,20 @@ export interface StreamedSourceCheckpoints {
    * record per schema v3.3 section 6.1, rather than only an aggregate.
    */
   readonly conversationsPublicOrder: readonly MigrationPublicListingSourceEntry[];
+  /**
+   * Per-domain sets of dependency edges, one entry per
+   * "child|parentDomain|parentIdentitySha256" for every record and every
+   * declared dependency in its own PortableRecord.dependencies -- already
+   * computed by the existing canonicalisation path, never recomputed
+   * here. Captured during this same forward pass (no second source read)
+   * and compared against the destination's own edges inside the window
+   * by reconcileDependencyEdges, for the relation class: edge-set
+   * equality in canonical identity terms, which catches a child remapped
+   * to a valid but wrong parent -- the #623 P1 shape a foreign-key
+   * constraint cannot see, because the remapped reference still points
+   * at a real row.
+   */
+  readonly dependencyEdges: ReadonlyMap<PortableDomain, ReadonlySet<string>>;
 }
 
 export async function streamSourceCheckpoints(
@@ -498,7 +634,10 @@ export async function streamSourceCheckpoints(
 ): Promise<StreamedSourceCheckpoints> {
   const checkpoints = new Map<PortableDomain, PortableCheckpoint>();
   const conversationEntries: Array<{ createdAt: string; identitySha256: string }> = [];
+  const dependencyEdges = new Map<PortableDomain, Set<string>>();
   for (const domain of PORTABLE_RECORD_DOMAIN_ORDER) {
+    const edgeSet = new Set<string>();
+    dependencyEdges.set(domain, edgeSet);
     let after: PortableCheckpoint | undefined;
     for (;;) {
       const batch = await stream.readBatch({ domain, after, maxRecords: 500, maxBytes: PORTABLE_LIMITS.maxBatchBytes, signal });
@@ -510,6 +649,7 @@ export async function streamSourceCheckpoints(
           });
         }
       }
+      for (const record of batch.records) collectDependencyEdges(record, edgeSet);
       after = batch.checkpoint;
       if (batch.complete) break;
     }
@@ -522,6 +662,7 @@ export async function streamSourceCheckpoints(
   return {
     checkpoints,
     conversationsPublicOrder: conversationEntries,
+    dependencyEdges,
   };
 }
 
@@ -696,7 +837,9 @@ export async function verifyMigrationGeneration(
   let runtime: PostgreSqlRuntime | undefined;
   try {
     await copySource.reauthenticate();
-    const { checkpoints: sourceCheckpoints, conversationsPublicOrder } = await streamSourceCheckpoints(copySource.stream, input.signal);
+    const {
+      checkpoints: sourceCheckpoints, conversationsPublicOrder, dependencyEdges: sourceDependencyEdges,
+    } = await streamSourceCheckpoints(copySource.stream, input.signal);
     await dependencies._afterSourceCheckpointsForTesting?.();
     await copySource.reauthenticate();
 
@@ -730,11 +873,11 @@ export async function verifyMigrationGeneration(
       );
 
       const session = await runtime.openReadOnlySnapshot({ projectId: input.expectedIdentity.id, signal: input.signal });
-      let destinationCensus: readonly MigrationVerificationDomainCensus[];
+      let destinationRead: MigrationFencedDestinationRead;
       let sequenceMismatches: MigrationVerificationMismatch[];
       try {
         await assertPermanentReadOnlyGuard(session, input.signal);
-        destinationCensus = await readFencedDestinationCensus(session, {
+        destinationRead = await readFencedDestinationCensus(session, {
           settings: input.destinationSettings, expectedOwner: input.expectedOwner,
           expectedIdentity: input.expectedIdentity, scratchParent: input.scratchParent, signal: input.signal,
         });
@@ -743,12 +886,18 @@ export async function verifyMigrationGeneration(
         await session.close();
       }
 
+      const destinationCensus = destinationRead.census;
       const censusVector = buildCensusVector(destinationCensus);
       const canonicalDelta = buildCanonicalDelta(destinationCensus);
       const countMismatches = reconcileCounts(sourceCheckpoints, destinationCensus);
+      const relationEdgeMismatches = reconcileDependencyEdges(sourceDependencyEdges, destinationRead.dependencyEdges);
+      const relationDanglingMismatches = readRelationDanglingReferenceMismatches(
+        destinationRead.dependencyEdges, destinationRead.recordIdentities,
+      );
       const domainOrder = [...PORTABLE_RECORD_DOMAIN_ORDER, "schema", "ledger", "public-listing", "public-search"] as const;
       const allMismatches = [
-        ...countMismatches, ...sequenceMismatches, ...(publicListingMismatch ? [publicListingMismatch] : []),
+        ...countMismatches, ...sequenceMismatches, ...relationEdgeMismatches, ...relationDanglingMismatches,
+        ...(publicListingMismatch ? [publicListingMismatch] : []),
       ];
       const fullMismatches = sortMismatches(allMismatches, domainOrder);
       // Totals must reflect the full (untruncated) evidence: truncation is

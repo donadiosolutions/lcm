@@ -129,6 +129,20 @@ export const MIGRATION_WITNESS_AUDIT: readonly MigrationWitnessAuditEntry[] = Ob
     mismatchClasses: ["sequence"],
   },
   {
+    id: "relation-edge-set", bodyField: "classCoverage",
+    description: "Per-domain dependency-edge-set equality between source and destination in canonical identity terms (PortableRecord.dependencies, already computed by the existing canonicalisation path on both sides), read fresh inside the window every pass; no witness value persists in the body, only the outcome. Catches a child remapped to a valid but wrong parent -- the #623 P1 shape -- which a foreign-key constraint cannot see because the remapped reference still points at a real row.",
+    comparison: "compared-live",
+    onDifference: "records a relation-class mismatch per domain naming the child's identity digest, never the parent's",
+    mismatchClasses: ["relation"],
+  },
+  {
+    id: "relation-dangling-reference", bodyField: "classCoverage",
+    description: "Cheap additional guard, read from the same data the edge-set comparison already collected: every dependency edge the destination itself recorded must resolve to a record that actually exists there. Defense in depth against a foreign-key constraint bypass (disabled triggers, an unvalidated FK); ordinary PostgreSQL writes make this structurally unreachable, which is why it is the secondary check and edge-set equality is the substantive one.",
+    comparison: "compared-live",
+    onDifference: "records a relation-class mismatch per domain naming the child's identity digest",
+    mismatchClasses: ["relation"],
+  },
+  {
     id: "public-listing-probe", bodyField: "publicProbeSha256",
     description: "The destination's ordered-listing repository read, compared against the source's own canonical createdAt ordering captured during step 1.",
     comparison: "compared-live",
