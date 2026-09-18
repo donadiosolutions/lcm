@@ -8,6 +8,7 @@ import type {
   JsonObject,
   PromotedMemoryRecord,
   PromotedMemoryRepository,
+  PromotedContentSerializer,
   RecallRepository,
   RedactionAdminRepository,
   RedactionCounts,
@@ -591,6 +592,44 @@ class RepositoryAccess {
     const execute = state.tail.then(() => callback(executor));
     state.tail = execute.then(() => undefined, () => undefined);
     return execute;
+  }
+}
+
+/** Advisory-lock namespace for the promoted-content deduplication decision. */
+const PROMOTED_CONTENT_DEDUP_NAMESPACE = "promoted-content-dedup";
+
+/**
+ * Serializes deduplication of one exact promoted content within one project
+ * by holding a transaction-scoped advisory lock until the caller's
+ * transaction commits or rolls back.
+ *
+ * The key deliberately covers only the project and the content, not the
+ * source project, so that owner-scoped and source-scoped deduplication of the
+ * same content contend with each other. The lock serializes the decision; it
+ * never changes which candidates a scope considers.
+ */
+export class PostgreSqlPromotedContentSerializer
+implements PromotedContentSerializer {
+  constructor(
+    private readonly executor: PostgreSqlTransactionScopeExecutor,
+    private readonly projectId: string,
+  ) {}
+
+  async serializeContentDecision(content: string): Promise<void> {
+    await this.executor.query({
+      text: `SELECT pg_catalog.pg_advisory_xact_lock(
+                      pg_catalog.hashtextextended($1::pg_catalog.text, 0)
+                    )`,
+      values: [derivePostgreSqlAdvisoryLockName(
+        this.projectId,
+        PROMOTED_CONTENT_DEDUP_NAMESPACE,
+        content,
+      )],
+    }, {
+      domain: "promoted-memory",
+      operation: "serializeContentDecision",
+      projectId: this.projectId,
+    });
   }
 }
 

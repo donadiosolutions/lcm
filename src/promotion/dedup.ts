@@ -77,8 +77,10 @@ export async function deduplicateAndInsert(params: DedupParams): Promise<string>
   const insertConfidence = newEntryConfidence ?? confidence;
 
   if (!("store" in params)) {
-    // Search and mutation share one backend transaction so two concurrent
-    // promotions cannot both observe an empty candidate set and insert.
+    // Search and mutation share one backend transaction. That alone does not
+    // serialize the decision under READ COMMITTED, so the run below asks the
+    // backend to serialize this exact content first, on backends that supply
+    // a serializer.
     const run = (repositories: TransactionRepositories) => deduplicateAndInsertInRepositories(repositories, {
       content,
       tags,
@@ -141,6 +143,14 @@ export async function deduplicateAndInsertInRepositories(
   repositories: TransactionRepositories,
   input: DedupInsertInput,
 ): Promise<string> {
+  // Hold this content's decision for the rest of the caller's transaction
+  // before reading candidates. Without it two concurrent transactions each
+  // read an empty candidate set, each take the insert branch below, and both
+  // commit a separate active memory for identical content. Backends whose
+  // root transactions already run on one connection supply no serializer.
+  await repositories.promotedContentSerializer?.serializeContentDecision(
+    input.content,
+  );
   const candidateSourceProjectId = input.candidateScope === "owner"
     && input.backend === "postgresql"
     ? undefined

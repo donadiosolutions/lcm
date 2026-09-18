@@ -28,6 +28,7 @@ import {
 } from "./lexical-search-repository.js";
 import {
   PostgreSqlCoordinationRepository,
+  PostgreSqlPromotedContentSerializer,
   PostgreSqlPromotedMemoryRepository,
   PostgreSqlRecallRepository,
   PostgreSqlRedactionAdminRepository,
@@ -385,10 +386,17 @@ export class PostgreSqlProjectStorage implements ProjectStorage {
         this.machineId,
         this.abortController.signal,
       );
+      const transactionRepositories: TransactionRepositories = {
+        ...repositories,
+        promotedContentSerializer: new PostgreSqlPromotedContentSerializer(
+          scoped,
+          this.projectId,
+        ),
+      };
       try {
         return await transactionContext.run(
           { storage: this },
-          () => callback(repositories),
+          () => callback(transactionRepositories),
         );
       } finally {
         scoped.revoke();

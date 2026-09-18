@@ -1,3 +1,4 @@
+import { createHash } from "node:crypto";
 import type { QueryConfig, QueryResult, QueryResultRow } from "pg";
 import { describe, expect, it, vi } from "vitest";
 import type { PostgreSqlQueryOptions } from "../../src/storage/postgresql/contracts.js";
@@ -10,6 +11,7 @@ import {
   type PostgreSqlMemoryExecutor,
   type PostgreSqlMemoryScopedExecutor,
   PostgreSqlPromotedMemoryRepository,
+  PostgreSqlPromotedContentSerializer,
   PostgreSqlRecallRepository,
   PostgreSqlRedactionAdminRepository,
 } from "../../src/storage/postgresql/memory-repositories.js";
@@ -1027,5 +1029,58 @@ describe("PostgreSQL memory repositories", () => {
       field: "scope_hash",
       operation: "upsertSessionInstructions",
     });
+  });
+});
+
+
+describe("PostgreSQL promoted-content serializer", () => {
+  it("takes one transaction-scoped advisory lock per project and content", async () => {
+    const scoped = scopedExecutor(() => result([{ pg_advisory_xact_lock: "" }]));
+    const serializer = new PostgreSqlPromotedContentSerializer(scoped, projectId);
+
+    await serializer.serializeContentDecision("durable content");
+
+    expect(scoped.query).toHaveBeenCalledTimes(1);
+    const [config, options] = scoped.query.mock.calls[0] as [
+      QueryConfig<unknown[]>,
+      PostgreSqlQueryOptions,
+    ];
+    expect(config.text).toContain("pg_catalog.pg_advisory_xact_lock");
+    expect(config.text).toContain("pg_catalog.hashtextextended");
+    expect(options).toEqual({
+      domain: "promoted-memory",
+      operation: "serializeContentDecision",
+      projectId,
+    });
+    expect(config.values).toEqual([
+      `${projectId}:promoted-content-dedup:${
+        createHash("sha256").update("durable content", "utf8").digest("hex")
+      }`,
+    ]);
+  });
+
+  it("separates distinct content and separates projects holding identical content", async () => {
+    const keys: unknown[] = [];
+    const capture = () => {
+      const scoped = scopedExecutor((config) => {
+        keys.push(config.values?.[0]);
+        return result([{ pg_advisory_xact_lock: "" }]);
+      });
+      return scoped;
+    };
+    const otherProjectId = "018f22c4-6d2a-7f10-8a4c-6b8d3e5f9021";
+
+    await new PostgreSqlPromotedContentSerializer(capture(), projectId)
+      .serializeContentDecision("first");
+    await new PostgreSqlPromotedContentSerializer(capture(), projectId)
+      .serializeContentDecision("second");
+    await new PostgreSqlPromotedContentSerializer(capture(), projectId)
+      .serializeContentDecision("first");
+    await new PostgreSqlPromotedContentSerializer(capture(), otherProjectId)
+      .serializeContentDecision("first");
+
+    expect(keys[0]).not.toBe(keys[1]);
+    expect(keys[0]).toBe(keys[2]);
+    expect(keys[0]).not.toBe(keys[3]);
   });
 });

@@ -3,7 +3,11 @@ import { readFileSync } from "node:fs";
 import { join } from "node:path";
 import type { QueryConfig, QueryResultRow } from "pg";
 import { beforeAll, describe, expect, it } from "vitest";
-import { deduplicateAndInsert } from "../../src/promotion/dedup.js";
+import {
+  deduplicateAndInsert,
+  deduplicateAndInsertInRepositories,
+} from "../../src/promotion/dedup.js";
+import type { TransactionRepositories } from "../../src/storage/contracts.js";
 import type {
   PostgreSqlQueryExecutor,
   PostgreSqlQueryOptions,
@@ -534,6 +538,126 @@ describe("PostgreSQL exact promoted-content digest index", { timeout: 120_000 },
           expect(scanNode(batchMiss.plan)["Actual Rows"]).toBe(0);
         }
       }, { domain: "promoted-memory", operation: "explainExactContentTransaction", projectId });
+    });
+  });
+});
+
+
+describe("PostgreSQL concurrent promoted-content deduplication", { timeout: 120_000 }, () => {
+  it("serializes two concurrent lookup-and-insert decisions for identical content", async () => {
+    await withPostgreSqlTestDatabase("promotion-concurrent-dedup", async (database) => {
+      await grantRuntime(database);
+      const projectId = await createProject(database, "concurrent dedup owner");
+      const machineId = "018f22c4-6d2a-7f10-8a4c-6b8d3e5f9012";
+      const firstRuntime = new PostgreSqlRuntime(settings(database.runtimeUrl));
+      const secondRuntime = new PostgreSqlRuntime(settings(database.runtimeUrl));
+      const first = new PostgreSqlProjectStorage(
+        firstRuntime,
+        projectId,
+        machineId,
+        () => undefined,
+      );
+      const second = new PostgreSqlProjectStorage(
+        secondRuntime,
+        projectId,
+        machineId,
+        () => undefined,
+      );
+      const content = "Two concurrent imports of one new promoted memory";
+      const input = {
+        content,
+        tags: ["concurrent"],
+        sourceProjectId: "a".repeat(64),
+        candidateScope: "source" as const,
+        backend: "postgresql" as const,
+        depth: 0,
+        confidence: 0.9,
+        thresholds: { dedupBm25Threshold: 0.5, dedupCandidateLimit: 10 },
+      };
+
+      // Deterministic seam: hold the first transaction between the real
+      // candidate read and the real insert, start the second transaction,
+      // observe it waiting on the serialized decision, then release the
+      // first. Without serialization the second reads an empty candidate
+      // set, never waits, and inserts a second row.
+      let releaseFirstInsert!: () => void;
+      const firstInsertReleased = new Promise<void>((resolve) => {
+        releaseFirstInsert = resolve;
+      });
+      let reportFirstDecided!: () => void;
+      const firstDecided = new Promise<void>((resolve) => {
+        reportFirstDecided = resolve;
+      });
+
+      try {
+        const firstPromise = first.transaction(async (repositories) => {
+          const paused: TransactionRepositories = {
+            ...repositories,
+            promotedMemory: {
+              ...repositories.promotedMemory,
+              insert: async (value) => {
+                reportFirstDecided();
+                await firstInsertReleased;
+                return repositories.promotedMemory.insert(value);
+              },
+            },
+          };
+          return await deduplicateAndInsertInRepositories(paused, input);
+        });
+
+        await firstDecided;
+        let secondSettled = false;
+        const secondPromise = second
+          .transaction(async (repositories) =>
+            await deduplicateAndInsertInRepositories(repositories, input))
+          .finally(() => {
+            secondSettled = true;
+          });
+
+        // Observe the block directly in pg_locks rather than sleeping for a
+        // fixed interval. An ungranted advisory lock in this test's own
+        // database proves the second transaction is waiting on the first
+        // transaction's serialized decision, not merely slow to start.
+        let observedWait = false;
+        for (let attempt = 0; attempt < 200 && !observedWait; attempt++) {
+          const waiting = await database.migrator.query<{ waiting: number }>({
+            text: `SELECT count(*)::pg_catalog.int4 AS waiting
+                   FROM pg_catalog.pg_locks
+                   WHERE locktype OPERATOR(pg_catalog.=) 'advisory'
+                     AND NOT granted
+                     AND database OPERATOR(pg_catalog.=) (
+                       SELECT oid FROM pg_catalog.pg_database
+                       WHERE datname OPERATOR(pg_catalog.=) pg_catalog.current_database()
+                     )`,
+          }, { domain: "promoted-memory", operation: "observeConcurrentDedupWait" });
+          observedWait = waiting.rows[0].waiting > 0;
+          if (!observedWait) {
+            await new Promise((resolve) => {
+              setTimeout(resolve, 25);
+            });
+          }
+        }
+        expect(observedWait).toBe(true);
+        expect(secondSettled).toBe(false);
+
+        releaseFirstInsert();
+        const firstId = await firstPromise;
+        const secondId = await secondPromise;
+        expect(secondId).toBe(firstId);
+
+        const rows = await database.migrator.query<{ memory_id: string }>({
+          text: `SELECT memory_id FROM lcm.promoted_memories
+                 WHERE project_id = $1 AND archived_at IS NULL`,
+          values: [projectId],
+        }, { domain: "promoted-memory", operation: "countConcurrentDedupRows" });
+        expect(rows.rows).toEqual([{ memory_id: firstId }]);
+      } finally {
+        releaseFirstInsert();
+        await first.close();
+        await second.close();
+        await firstRuntime.close();
+        await secondRuntime.close();
+      }
     });
   });
 });
