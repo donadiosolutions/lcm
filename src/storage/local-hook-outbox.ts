@@ -202,7 +202,7 @@ export interface LocalHookOutboxOpenOptions {
   /** @internal Refuse schema changes while migration maintenance is held. */
   _requireCurrentSchema?: boolean;
   /** @internal Bind the authenticated private-copy schema preflight. */
-  _expectedFileIdentity?: Readonly<{ device: number; inode: number }>;
+  _expectedFileIdentity?: Readonly<{ device: string; inode: string }>;
 }
 
 /**

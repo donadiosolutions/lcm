@@ -157,11 +157,14 @@ describe("persistent SQLite leaf initialization admission", () => {
     };
     armTrackedOpen();
 
-    expect(() => open(dbPath)).toThrow("database path changed while opening");
+    // The retained-leaf check refuses before the handle is constructed, so the
+    // swap is rejected earlier than the post-open pathname comparison.
+    expect(() => open(dbPath))
+      .toThrow("database handle is not bound to the authenticated database file");
 
     expect(fsState.targetChmods).toBe(0);
     expect(sqliteState.trackedExecs).toBe(0);
-    expect(sqliteState.trackedCloses).toBe(1);
+    expect(sqliteState.trackedCloses).toBe(0);
     expect(isLcmConnectionOpen(dbPath)).toBe(false);
     expect(statSync(dbPath).mode & 0o777).toBe(0o644);
     expect(statSync(originalPath).ino).toBe(originalIdentity.ino);

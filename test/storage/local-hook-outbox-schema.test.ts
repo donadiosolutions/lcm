@@ -49,7 +49,8 @@ describe("local outbox schema admission", () => {
     const before = evidence(value.path);
     try {
       expect(readCurrentLocalHookOutboxIdentity(value.path, 5)).toEqual({
-        device: fs.statSync(value.path).dev, inode: fs.statSync(value.path).ino,
+        device: fs.statSync(value.path, { bigint: true }).dev.toString(10),
+        inode: fs.statSync(value.path, { bigint: true }).ino.toString(10),
       });
       expect(evidence(value.path)).toEqual(before);
     } finally { if (wal) value.db.close(); }
@@ -83,7 +84,10 @@ describe("local outbox schema admission", () => {
     fs.chmodSync(value.path, 0o400);
     const descriptor = Object.getOwnPropertyDescriptor(process, "getuid")!;
     Object.defineProperty(process, "getuid", { ...descriptor, value: undefined });
-    try { expect(readCurrentLocalHookOutboxIdentity(value.path, 5)).toMatchObject({ inode: fs.statSync(value.path).ino }); }
+    try {
+      expect(readCurrentLocalHookOutboxIdentity(value.path, 5)?.inode)
+        .toBe(fs.statSync(value.path, { bigint: true }).ino.toString(10));
+    }
     finally { Object.defineProperty(process, "getuid", descriptor); }
   });
   it("refuses a rollback journal without touching it", () => {

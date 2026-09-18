@@ -1774,29 +1774,40 @@ open, permission, initialization, and pooling boundaries; these checks are not
 a kernel-atomic guarantee against another process substituting a path through
 a writable ancestor between system calls.
 
-On Linux, LCM additionally checks which inode the handle actually retained,
-using the `/proc/self/fd` descriptor namespace. Every descriptor that names the
-database must hold the authenticated identity, at least one such descriptor must
-exist, and the open must not have left the process holding any other regular
-file that is neither the database nor its authenticated inode. Replacing the
-database leaf for the constructor call and restoring it before the post-open
-path check always leaves such a descriptor behind, wherever the substituted file
-is parked, including under a name such as the rollback journal, so it is refused
-before LCM changes permissions, initializes pragmas, or pools the handle.
-SQLite can satisfy an open from a descriptor it already holds for the same
-inode, so LCM does not require the open to add one. A descriptor counts as
-retained by the open when its number is new or when a number the process
-already held now refers to a different target or inode, so reusing a freed
-descriptor number does not hide a substituted file.
+LCM also proves that the database SQLite opened is the one it authenticated.
+It retains a descriptor on the admitted database leaf and keeps the admitted
+parent directory descriptor open across the SQLite open, then compares the
+identity and change timestamps of both immediately before and immediately after.
+Substituting the leaf requires renaming entries in that directory, and the
+kernel records a rename on the directory and on the file that moved, so
+replacing the database for the constructor call and restoring it before the
+post-open path check is refused, wherever the substituted file is parked. The
+refusal happens before LCM changes permissions, initializes pragmas, or pools
+the handle. A create-capable open creates the database file itself, with an
+exclusive create under the admitted parent, so the same evidence covers it
+rather than letting SQLite adopt whatever appears at the pathname. When another
+writer wins that creation, LCM authenticates the database that writer created.
 
-These rules describe what the process holds rather than which descriptor SQLite
-uses, because nothing observable identifies that descriptor. An uncached open
-can therefore be refused when unrelated work in the same process opens another
-regular file or recycles a descriptor while SQLite is opening the database.
-That refusal is deliberate, and retrying the open once that work finishes
-resolves it; LCM does not retry on its own. Platforms without the descriptor
-namespace keep the pathname evidence described above and do not gain this
-guarantee.
+This evidence is ordinary filesystem metadata rather than a Linux-specific
+interface, so it applies on every supported platform. Its limit is timestamp
+resolution: a filesystem that records change times coarsely could in principle
+admit a substitution whose renames both land within a single tick.
+
+Because the evidence is metadata on the database and its directory, an open can
+also be refused when something else changes them while SQLite is opening. A
+concurrent writer to the same database updates the database file's timestamps,
+and a writer that creates the write-ahead log, or anything else that adds or
+removes an entry in the database directory, changes the directory's. Running
+the daemon and a CLI command against one project at the same moment can
+therefore produce this refusal on a healthy database. It is fail-closed and
+retrying the open resolves it.
+
+When two processes create a project database at once, the one that loses the
+exclusive create authenticates and adopts the database the winner created,
+exactly as it would have adopted a database that already existed. What the
+evidence establishes is that the handle SQLite returns is bound to the file LCM
+authenticated at that pathname; it does not decide which of two racing writers
+should own a new database.
 
 Database paths retain normal filesystem semantics when an ancestor alias is
 followed by `..`: LCM authenticates and opens the directory reached by the

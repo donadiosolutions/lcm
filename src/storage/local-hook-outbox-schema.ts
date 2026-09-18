@@ -5,7 +5,7 @@ import { dirname, join } from "node:path";
 import { DatabaseSync } from "node:sqlite";
 import { assertPrivateDirectory, copyRegularFilePrivateExclusive, openPrivateDirectory, openPrivateDirectoryIfExists } from "../security-files.js";
 
-type FileWitness = Readonly<{ device: number; inode: number; metadata: string; sha256: string }>;
+type FileWitness = Readonly<{ device: string; inode: string; metadata: string; sha256: string }>;
 
 function witness(path: string): FileWitness | null {
   let fd: number;
@@ -31,7 +31,7 @@ function witness(path: string): FileWitness | null {
       || metadata(before) !== metadata(lstatSync(path, { bigint: true }))) {
       throw new Error("outbox schema source changed");
     }
-    return { device: Number(before.dev), inode: Number(before.ino), metadata: metadata(before), sha256: hash.digest("hex") };
+    return { device: before.dev.toString(10), inode: before.ino.toString(10), metadata: metadata(before), sha256: hash.digest("hex") };
   } finally { closeSync(fd); }
 }
 
@@ -39,7 +39,7 @@ function witness(path: string): FileWitness | null {
 export function readCurrentLocalHookOutboxIdentity(
   dbPath: string,
   schemaVersion: number,
-): Readonly<{ device: number; inode: number }> | null {
+): Readonly<{ device: string; inode: string }> | null {
   const parent = openPrivateDirectoryIfExists(dirname(dbPath));
   if (parent === undefined) return null;
   try {

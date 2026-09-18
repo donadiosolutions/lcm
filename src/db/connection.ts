@@ -26,14 +26,11 @@ import {
   PRIVATE_FILE_MODE,
   requireSupportedProcessUid,
   retainedDirectoryDescriptorPath,
-  retainedDescriptorIdentities,
-  UnsupportedPlatformCapabilityError,
-  type DescriptorCapabilityOperations,
   type PrivateDirectoryHandle,
-  type RetainedDescriptorIdentity,
 } from "../security-files.js";
 import {
   admitDatabaseParent,
+  sameDatabaseParentWitness,
   type DatabaseParentIdentity,
   type DatabaseParentTestingOptions,
 } from "./database-parent.js";
@@ -45,9 +42,14 @@ type ConnectionEntry = {
   parentIdentity: DatabaseParentIdentity | null;
 };
 
+// Decimal strings rather than numbers: a device or inode beyond
+// Number.MAX_SAFE_INTEGER would round, and two distinct rounded values
+// comparing equal is a silent admission. Strings also match the identity shape
+// the database parent already publishes, and survive the JSON journals that
+// carry these identities.
 type DatabaseFileIdentity = {
-  device: number;
-  inode: number;
+  device: string;
+  inode: string;
 };
 
 function sameDatabaseFileIdentity(
@@ -170,14 +172,14 @@ function getPooledLcmConnection(dbPath: string): DatabaseSync | undefined {
 /** Inspect an existing database leaf without following symlinks. */
 export function inspectExistingLcmDatabasePath(dbPath: string): DatabaseFileIdentity | null {
   try {
-    const stat = lstatSync(dbPath);
+    const stat = lstatSync(dbPath, { bigint: true });
     if (stat.isSymbolicLink()) {
       throw new Error(`refusing to open a symlink database path: ${dbPath}`);
     }
     if (!stat.isFile()) {
       throw new Error(`database path is not a regular file: ${dbPath}`);
     }
-    return { device: stat.dev, inode: stat.ino };
+    return { device: stat.dev.toString(10), inode: stat.ino.toString(10) };
   } catch (error) {
     if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error;
     return null;
@@ -187,13 +189,11 @@ export function inspectExistingLcmDatabasePath(dbPath: string): DatabaseFileIden
 export type LcmConnectionOptions = Readonly<{
   /** @internal Deterministic database-parent admission seams for tests. */
   _databaseParentForTesting?: DatabaseParentTestingOptions;
-  /** @internal Deterministic descriptor-capability seams for tests. */
-  _descriptorsForTesting?: Partial<DescriptorCapabilityOperations>;
 }>;
 
 export type ExistingLcmConnectionOptions = LcmConnectionOptions & Readonly<{
   /** Bind a completed read-only preflight before any writable connection setup. */
-  expectedFileIdentity?: Readonly<{ device: number; inode: number }>;
+  expectedFileIdentity?: Readonly<{ device: string; inode: string }>;
   /** Safely repair the authenticated existing parent to mode 0700. */
   tightenDatabaseParent?: boolean;
 }>;
@@ -202,79 +202,112 @@ export type ExistingLcmConnectionOptions = LcmConnectionOptions & Readonly<{
 const DATABASE_HANDLE_BINDING_ERROR =
   "database handle is not bound to the authenticated database file";
 
-type RetainedDescriptorSnapshot = ReadonlyMap<number, RetainedDescriptorIdentity>;
+/**
+ * Identity and change timestamps of one authenticated object. Two observations
+ * that match prove the kernel recorded no rename, creation, or removal of that
+ * object between them.
+ */
+type AuthenticatedFileWitness = Readonly<{
+  device: bigint;
+  inode: bigint;
+  modifiedNs: bigint;
+  changedNs: bigint;
+}>;
 
-/** Every retained descriptor with its target and identity, or null off Linux. */
-function retainedDescriptorSnapshot(
-  operations: Partial<DescriptorCapabilityOperations> | undefined,
-): RetainedDescriptorSnapshot | null {
+function fileWitness(fd: number): AuthenticatedFileWitness {
+  const descriptor = fstatSync(fd, { bigint: true });
+  return {
+    device: descriptor.dev,
+    inode: descriptor.ino,
+    modifiedNs: descriptor.mtimeNs,
+    changedNs: descriptor.ctimeNs,
+  };
+}
+
+function sameFileWitness(
+  left: AuthenticatedFileWitness,
+  right: AuthenticatedFileWitness,
+): boolean {
+  return left.device === right.device && left.inode === right.inode
+    && left.modifiedNs === right.modifiedNs && left.changedNs === right.changedNs;
+}
+
+/**
+ * Retain the authenticated database leaf itself for the duration of an open.
+ * The descriptor pins the inode that the pathname named when it was admitted,
+ * so later evidence is about that object rather than about whatever the name
+ * resolves to next.
+ */
+function retainAuthenticatedLeaf(
+  dbPath: string,
+  expected: DatabaseFileIdentity,
+): Readonly<{ fd: number; witness: AuthenticatedFileWitness }> {
+  const fd = openSync(
+    dbPath,
+    constants.O_RDONLY | constants.O_NOFOLLOW | constants.O_NONBLOCK,
+  );
   try {
-    return new Map(retainedDescriptorIdentities(operations ?? {})
-      .map(descriptor => [descriptor.fd, descriptor]));
+    const witness = fileWitness(fd);
+    if (witness.device.toString(10) !== expected.device
+      || witness.inode.toString(10) !== expected.inode) {
+      throw new Error(DATABASE_HANDLE_BINDING_ERROR);
+    }
+    return { fd, witness };
   } catch (error) {
-    if (error instanceof UnsupportedPlatformCapabilityError) return null;
+    closeSync(fd);
     throw error;
   }
 }
 
 /**
- * Prove the opened handle retained the authenticated inode. Substituting the
- * leaf for the constructor call and restoring it before the post-open check
- * leaves both pathname observations intact, so the descriptor the open actually
- * retained is the only admissible evidence. Platforms without an authenticated
- * descriptor namespace cannot offer this guarantee and keep pathname evidence.
- *
- * SQLite can satisfy an open from a descriptor it already retains for the same
- * inode, so demanding a newly added descriptor would refuse ordinary opens.
- * Admission therefore requires every descriptor naming the database to hold the
- * authenticated identity, at least one such descriptor to exist, and the open to
- * have left the process holding no regular file that is neither the database nor
- * its authenticated inode. A restored substitution always leaves exactly that
- * descriptor behind, wherever the substituted file is parked.
- *
- * A descriptor number alone proves nothing about provenance: a number that was
- * live before the open can be closed and reused by it. A descriptor therefore
- * counts as retained by this open whenever its number is new or its target or
- * identity differs from what that number held before.
- *
- * The evidence deliberately says nothing about which descriptor SQLite itself
- * holds, because nothing observable does. A descriptor naming the database can
- * be opened by unrelated work in the same process, so treating one as proof
- * would let a concurrent reopen bless a handle bound elsewhere. The cost is a
- * fail-closed refusal when unrelated work opens another regular file or
- * recycles a descriptor while the constructor runs; that refusal is intended,
- * and a caller may retry the open once that work finishes.
+ * Create the database leaf under the admitted parent before SQLite opens it.
+ * Letting SQLite be the first creator would leave nothing to authenticate: a
+ * file planted at the pathname during the constructor would be adopted, and an
+ * absent leaf cannot be pinned. Creating it here makes every open, including a
+ * create-capable one, take the retained-leaf and directory evidence.
  */
-function assertOpenedDatabaseIdentity(
-  path: string,
-  openedIdentity: DatabaseFileIdentity,
-  beforeOpen: RetainedDescriptorSnapshot | null,
-  operations: Partial<DescriptorCapabilityOperations> | undefined,
-): void {
-  if (beforeOpen === null) return;
-  const afterOpen = retainedDescriptorSnapshot(operations);
-  if (afterOpen === null) throw new Error(DATABASE_HANDLE_BINDING_ERROR);
-  const expectedDevice = BigInt(openedIdentity.device);
-  const expectedInode = BigInt(openedIdentity.inode);
-  let boundToDatabase = false;
-  let retainedForeignFile = false;
-  for (const descriptor of afterOpen.values()) {
-    const authentic = descriptor.dev === expectedDevice && descriptor.ino === expectedInode;
-    const previous = beforeOpen.get(descriptor.fd);
-    const recycled = previous !== undefined
-      && (previous.link !== descriptor.link
-        || previous.dev !== descriptor.dev
-        || previous.ino !== descriptor.ino);
-    if (descriptor.link === path) {
-      if (!authentic) throw new Error(DATABASE_HANDLE_BINDING_ERROR);
-      boundToDatabase = true;
-      continue;
-    }
-    if ((previous === undefined || recycled) && descriptor.isFile && !authentic) {
-      retainedForeignFile = true;
-    }
+function createAuthenticatedLeaf(dbPath: string): DatabaseFileIdentity | null {
+  let fd: number;
+  try {
+    fd = openSync(
+      dbPath,
+      constants.O_RDWR | constants.O_CREAT | constants.O_EXCL | constants.O_NOFOLLOW,
+      PRIVATE_FILE_MODE,
+    );
+  } catch (error) {
+    // Another writer created the database first. Its leaf is authenticated by
+    // the ordinary existing-file path on the next inspection.
+    if ((error as NodeJS.ErrnoException).code === "EEXIST") return null;
+    throw error;
   }
-  if (!boundToDatabase || retainedForeignFile) throw new Error(DATABASE_HANDLE_BINDING_ERROR);
+  try {
+    const witness = fileWitness(fd);
+    return { device: witness.device.toString(10), inode: witness.inode.toString(10) };
+  } finally {
+    closeSync(fd);
+  }
+}
+
+const DATABASE_LEAF_ADMISSION_ATTEMPTS = 3;
+
+/**
+ * Identify the leaf this open will authenticate. A create-capable open creates
+ * it when absent, and yields to a writer that wins the exclusive create. Either
+ * the leaf is identified or the open refuses: constructing a handle with nothing
+ * retained is what let a planted database be adopted.
+ */
+function admitDatabaseLeafIdentity(
+  dbPath: string,
+  expectedIdentity: DatabaseFileIdentity | null,
+): DatabaseFileIdentity {
+  if (expectedIdentity !== null) return expectedIdentity;
+  for (let attempt = 0; attempt < DATABASE_LEAF_ADMISSION_ATTEMPTS; attempt += 1) {
+    const created = createAuthenticatedLeaf(dbPath);
+    if (created !== null) return created;
+    const existing = inspectExistingLcmDatabasePath(dbPath);
+    if (existing !== null) return existing;
+  }
+  throw new Error(DATABASE_HANDLE_BINDING_ERROR);
 }
 
 function openLcmConnection(
@@ -322,6 +355,7 @@ function openLcmConnection(
   let primaryError: unknown;
   let db: DatabaseSync | undefined;
   let fileIdentity: DatabaseFileIdentity | null = null;
+  let retainedLeaf: Readonly<{ fd: number; witness: AuthenticatedFileWitness }> | null = null;
 
   const releaseParent = (): void => {
     parent.assertCurrent();
@@ -366,10 +400,6 @@ function openLcmConnection(
 
     // SQLite's URI mode=rw opens an existing database read/write but atomically
     // refuses to create it if another process removes it after the lstat above.
-    // The authenticated leaf never resolves through a leaf symlink, so the
-    // admitted parent's resolved path names the same file the open will use.
-    const resolvedPath = join(realpathSync.native(dirname(dbPath)), basename(dbPath));
-    const descriptorsBeforeOpen = retainedDescriptorSnapshot(options._descriptorsForTesting);
     const location = createIfMissing
       ? dbPath
       : (() => {
@@ -380,6 +410,16 @@ function openLcmConnection(
         url.searchParams.set("mode", "rw");
         return url;
       })();
+    // Retain the admitted leaf and directory across the open. Substituting the
+    // leaf requires renaming entries in this directory, which the kernel records
+    // on the directory and on the moved inode, so a substitution that is
+    // restored before the pathname recheck still leaves evidence behind.
+    // A create-capable open creates the leaf itself rather than letting SQLite
+    // adopt whatever appears at the pathname, so the same evidence applies and
+    // no constructor runs without a retained leaf.
+    const admittedIdentity = admitDatabaseLeafIdentity(dbPath, expectedIdentity);
+    retainedLeaf = retainAuthenticatedLeaf(dbPath, admittedIdentity);
+    const parentBeforeOpen = parent.witness();
     parent.assertCurrent();
     db = new DatabaseSync(location);
     parent.assertCurrent();
@@ -387,15 +427,13 @@ function openLcmConnection(
     if (!openedIdentity) {
       throw new Error("database path disappeared while opening");
     }
-    if (expectedIdentity && !sameDatabaseFileIdentity(expectedIdentity, openedIdentity)) {
+    if (!sameDatabaseFileIdentity(admittedIdentity, openedIdentity)) {
       throw new Error("database path changed while opening");
     }
-    assertOpenedDatabaseIdentity(
-      resolvedPath,
-      openedIdentity,
-      descriptorsBeforeOpen,
-      options._descriptorsForTesting,
-    );
+    if (!sameDatabaseParentWitness(parentBeforeOpen, parent.witness())
+      || !sameFileWitness(retainedLeaf.witness, fileWitness(retainedLeaf.fd))) {
+      throw new Error(DATABASE_HANDLE_BINDING_ERROR);
+    }
     chmodSync(dbPath, PRIVATE_FILE_MODE);
     // Enable WAL mode for better concurrent read performance
     parent.assertCurrent();
@@ -438,6 +476,13 @@ function openLcmConnection(
     }
     throw error;
   } finally {
+    if (retainedLeaf !== null) {
+      try {
+        closeSync(retainedLeaf.fd);
+      } catch (closeError) {
+        if (primaryError === undefined) throw closeError;
+      }
+    }
     if (!parentClosed) {
       try {
         parent.close();

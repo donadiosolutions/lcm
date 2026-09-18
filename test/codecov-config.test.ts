@@ -674,6 +674,8 @@ describe("Codecov configuration", () => {
       ["src/runtime-paths.ts", "unit-configuration-security"],
       // #1195 strict module-relative asset resolution retains this owner.
       ["src/runtime-root.ts", "unit-configuration-security"],
+      // #1330 removes the retained-descriptor enumeration from this file; its
+      // remaining descriptor and private-file authentication keeps this owner.
       ["src/security-files.ts", "unit-configuration-security"],
       ["src/sensitive.ts", "unit-configuration-security"],
       // #1049 keeps project metadata owner and single-link admission here.
@@ -767,6 +769,8 @@ describe("Codecov configuration", () => {
       // participants stays storage-abstractions-owned.
       ["src/storage/backend-publication.ts", "unit-storage-abstractions"],
       // #1229 local outbox diagnostic admission stays local-event-storage-owned.
+      // #1330 carries the outbox preflight identity as an exact decimal string;
+      // both files keep their local-event-storage owner.
       ["src/storage/local-hook-outbox.ts", "unit-local-event-storage"],
       ["src/storage/local-hook-outbox-schema.ts", "unit-local-event-storage"],
       ["src/migration/manifest-store.ts", "unit-migration-cutover"],
@@ -800,6 +804,8 @@ describe("Codecov configuration", () => {
       ["src/storage/postgresql/diagnostics.ts", "unit-diagnostics"],
       // #992 keeps pre-initialization SQLite leaf admission and final
       // opened-identity fencing local-persistence-owned.
+      // #1330 retains the admitted leaf and parent across the SQLite open and
+      // carries file identity exactly; both stay local-persistence-owned.
       ["src/db/connection.ts", "unit-local-persistence"],
       ["src/db/database-parent.ts", "unit-local-persistence"],
       // Retained-handle token scopes and fresh factory health remain local persistence.

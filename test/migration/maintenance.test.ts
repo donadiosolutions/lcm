@@ -341,7 +341,7 @@ describe("backend publication maintenance journal v3", () => {
     }
     const snapshot = await capture;
     expect(opening).toHaveBeenCalledWith(outboxPath, { tightenDatabaseParent: true,
-      expectedFileIdentity: { device: expect.any(Number), inode: expect.any(Number) } });
+      expectedFileIdentity: { device: expect.any(String), inode: expect.any(String) } });
     expect(snapshot.receiptReference.queueCutoff).toBe("0000000000000000000");
   });
   it.each([false, true])("captures legal held appends with fresh cutoff after restart=%s", async (restart) => {

@@ -1,11 +1,10 @@
 import {
   chmodSync,
   closeSync,
-  lstatSync,
+  existsSync,
   mkdtempSync,
   openSync,
   readdirSync,
-  readlinkSync,
   renameSync,
   rmSync,
   statSync,
@@ -24,13 +23,56 @@ const fsState = vi.hoisted(() => ({
 }));
 
 const sqliteState = vi.hoisted(() => ({
+  beforeOpen: undefined as (() => void) | undefined,
   afterOpen: undefined as (() => void) | undefined,
+}));
+
+const fdState = vi.hoisted(() => ({
+  leafDescriptor: undefined as number | undefined,
+  failLeafClose: false,
+  failLeafCreate: false,
+  loseLeafCreateRace: false,
+  starveLeafCreate: 0,
 }));
 
 vi.mock("node:fs", async (importOriginal) => {
   const actual = await importOriginal<typeof import("node:fs")>();
   return {
     ...actual,
+    openSync: (...args: Parameters<typeof actual.openSync>) => {
+      if (fdState.failLeafCreate && String(args[0]) === fsState.targetPath) {
+        fdState.failLeafCreate = false;
+        throw Object.assign(new Error("injected leaf creation failure"), { code: "EACCES" });
+      }
+      if (fdState.loseLeafCreateRace && String(args[0]) === fsState.targetPath) {
+        fdState.loseLeafCreateRace = false;
+        // Another writer creates the database first, so the exclusive create
+        // below fails with EEXIST exactly as it would under a real race.
+        actual.closeSync(actual.openSync(
+          args[0],
+          actual.constants.O_RDWR | actual.constants.O_CREAT | actual.constants.O_EXCL,
+          0o600,
+        ));
+      }
+      if (fdState.starveLeafCreate > 0 && String(args[0]) === fsState.targetPath
+        && (Number(args[1]) & actual.constants.O_CREAT) !== 0) {
+        // The exclusive create keeps losing to a writer whose database is gone
+        // again by the time the fallback inspection runs.
+        fdState.starveLeafCreate -= 1;
+        throw Object.assign(new Error("injected EEXIST"), { code: "EEXIST" });
+      }
+      const fd = actual.openSync(...args);
+      if (String(args[0]) === fsState.targetPath) fdState.leafDescriptor = fd;
+      return fd;
+    },
+    closeSync: (fd: number) => {
+      if (fdState.failLeafClose && fd === fdState.leafDescriptor) {
+        fdState.failLeafClose = false;
+        actual.closeSync(fd);
+        throw Object.assign(new Error("injected retained leaf close failure"), { code: "EIO" });
+      }
+      actual.closeSync(fd);
+    },
     realpathSync: Object.assign(
       (...args: Parameters<typeof actual.realpathSync>) => actual.realpathSync(...args),
       {
@@ -64,6 +106,11 @@ vi.mock("node:sqlite", async (importOriginal) => {
 
   class HookedDatabaseSync extends actual.DatabaseSync {
     constructor(...args: ConstructorParameters<typeof actual.DatabaseSync>) {
+      const before = sqliteState.beforeOpen;
+      if (before !== undefined) {
+        sqliteState.beforeOpen = undefined;
+        before();
+      }
       super(...args);
       const action = sqliteState.afterOpen;
       if (action !== undefined) {
@@ -84,6 +131,8 @@ import {
   isLcmConnectionOpen,
 } from "../../src/db/connection.js";
 
+const BINDING_ERROR = "database handle is not bound to the authenticated database file";
+
 const tempDirs: string[] = [];
 const tempDescriptors: number[] = [];
 
@@ -95,365 +144,220 @@ function createMarkedDatabase(path: string, marker: string, journalMode = "WAL")
   db.close();
 }
 
-function expectMarkerAndJournalMode(path: string, marker: string, journalMode: string): void {
+function expectMarker(path: string, marker: string): void {
   const db = new DatabaseSync(path);
   try {
     expect(db.prepare("SELECT value FROM marker").get()).toEqual({ value: marker });
-    expect(db.prepare("PRAGMA journal_mode").get()).toEqual({ journal_mode: journalMode });
   } finally {
     db.close();
   }
 }
 
-function createSubstitutionFixture(): Readonly<{
+type SubstitutionFixture = Readonly<{
   dbPath: string;
   substitutePath: string;
   stashPath: string;
-}> {
+  swap: () => void;
+  restore: () => void;
+  settle: () => void;
+}>;
+
+function createSubstitutionFixture(substituteJournalMode = "WAL"): SubstitutionFixture {
   const tempDir = mkdtempSync(join(tmpdir(), "lcm-opened-inode-test-"));
   tempDirs.push(tempDir);
   const dbPath = join(tempDir, "authentic.sqlite");
   const substitutePath = join(tempDir, "substitute.sqlite");
   const stashPath = join(tempDir, "stash.sqlite");
   createMarkedDatabase(dbPath, "authentic");
-  createMarkedDatabase(substitutePath, "substitute");
+  createMarkedDatabase(substitutePath, "substitute", substituteJournalMode);
   for (const leaf of readdirSync(tempDir)) {
     if (leaf.endsWith("-wal") || leaf.endsWith("-shm")) unlinkSync(join(tempDir, leaf));
   }
   fsState.targetPath = dbPath;
-  return { dbPath, substitutePath, stashPath };
+  const swap = (): void => {
+    renameSync(dbPath, stashPath);
+    renameSync(substitutePath, dbPath);
+  };
+  const restore = (): void => {
+    renameSync(dbPath, substitutePath);
+    renameSync(stashPath, dbPath);
+  };
+  // A refusal can land before or after the attack's own restore step, so the
+  // assertions settle the fixture rather than assuming which one ran.
+  const settle = (): void => {
+    // Disarm the hooks first: assertions open databases too, and a stale hook
+    // would replay the attack against the assertion's own handle.
+    fsState.beforeLeafResolve = undefined;
+    fsState.actionsByLstat.clear();
+    sqliteState.beforeOpen = undefined;
+    sqliteState.afterOpen = undefined;
+    if (existsSync(stashPath)) restore();
+  };
+  return { dbPath, substitutePath, stashPath, swap, restore, settle };
 }
 
 afterEach(() => {
   closeLcmConnection();
-  for (const descriptor of tempDescriptors.splice(0)) closeSync(descriptor);
+  for (const descriptor of tempDescriptors.splice(0)) {
+    try {
+      closeSync(descriptor);
+    } catch {
+      // The test closed it deliberately as part of the attack it reproduced.
+    }
+  }
   fsState.targetPath = "";
   fsState.targetLstats = 0;
   fsState.actionsByLstat.clear();
   fsState.beforeLeafResolve = undefined;
+  sqliteState.beforeOpen = undefined;
   sqliteState.afterOpen = undefined;
+  fdState.leafDescriptor = undefined;
+  fdState.failLeafClose = false;
+  fdState.failLeafCreate = false;
+  fdState.loseLeafCreateRace = false;
+  fdState.starveLeafCreate = 0;
   for (const tempDir of tempDirs.splice(0)) {
     rmSync(tempDir, { recursive: true, force: true });
   }
 });
 
 describe("existing-only opened-inode authentication", () => {
-  it("refuses a handle opened on a swapped-in inode restored before the path recheck", () => {
-    const { dbPath, substitutePath, stashPath } = createSubstitutionFixture();
-    fsState.actionsByLstat.set(1, () => {
-      renameSync(dbPath, stashPath);
-      renameSync(substitutePath, dbPath);
-    });
+  it("refuses a substitution swapped in before the database is retained", () => {
+    const fixture = createSubstitutionFixture();
+    fsState.actionsByLstat.set(1, fixture.swap);
+    sqliteState.afterOpen = fixture.restore;
+
+    expect(() => getExistingLcmConnection(fixture.dbPath)).toThrow(BINDING_ERROR);
+
+    expect(isLcmConnectionOpen(fixture.dbPath)).toBe(false);
+    fixture.settle();
+    expectMarker(fixture.dbPath, "authentic");
+  });
+
+  it("refuses a substitution swapped in after the database is retained", () => {
+    const fixture = createSubstitutionFixture();
+    fsState.beforeLeafResolve = fixture.swap;
+    sqliteState.afterOpen = fixture.restore;
+
+    expect(() => getExistingLcmConnection(fixture.dbPath)).toThrow(BINDING_ERROR);
+
+    expect(isLcmConnectionOpen(fixture.dbPath)).toBe(false);
+    fixture.settle();
+    expectMarker(fixture.dbPath, "authentic");
+  });
+
+  it("refuses a substitution parked under the rollback journal name", () => {
+    const fixture = createSubstitutionFixture();
+    const journalPath = `${fixture.dbPath}-journal`;
+    tempDescriptors.push(openSync(fixture.dbPath, "r+"));
+    fsState.beforeLeafResolve = fixture.swap;
     sqliteState.afterOpen = () => {
-      renameSync(dbPath, substitutePath);
-      renameSync(stashPath, dbPath);
+      renameSync(fixture.dbPath, journalPath);
+      renameSync(fixture.stashPath, fixture.dbPath);
     };
 
-    expect(() => getExistingLcmConnection(dbPath))
-      .toThrow("database handle is not bound to the authenticated database file");
-    expect(isLcmConnectionOpen(dbPath)).toBe(false);
+    expect(() => getExistingLcmConnection(fixture.dbPath)).toThrow(BINDING_ERROR);
+
+    expect(isLcmConnectionOpen(fixture.dbPath)).toBe(false);
+    fixture.settle();
+    expectMarker(fixture.dbPath, "authentic");
   });
 
-  it("refuses a handle whose authenticated leaf is replaced after the path recheck", () => {
-    const { dbPath, substitutePath, stashPath } = createSubstitutionFixture();
-    fsState.actionsByLstat.set(1, () => {
-      renameSync(dbPath, stashPath);
-      renameSync(substitutePath, dbPath);
-    });
+  it("refuses a substitution laundered by reopening the database in the window", () => {
+    const fixture = createSubstitutionFixture();
+    tempDescriptors.push(openSync(fixture.dbPath, "r+"));
+    fsState.beforeLeafResolve = fixture.swap;
     sqliteState.afterOpen = () => {
-      renameSync(dbPath, substitutePath);
-      renameSync(stashPath, dbPath);
+      fixture.restore();
+      tempDescriptors.push(openSync(fixture.dbPath, "r+"));
     };
-    fsState.actionsByLstat.set(2, () => {
-      renameSync(dbPath, stashPath);
-      renameSync(substitutePath, dbPath);
-    });
 
-    expect(() => getExistingLcmConnection(dbPath))
-      .toThrow("database handle is not bound to the authenticated database file");
-    expect(isLcmConnectionOpen(dbPath)).toBe(false);
+    expect(() => getExistingLcmConnection(fixture.dbPath)).toThrow(BINDING_ERROR);
+
+    expect(isLcmConnectionOpen(fixture.dbPath)).toBe(false);
+    fixture.settle();
+    expectMarker(fixture.dbPath, "authentic");
   });
 
-  it("opens an unsubstituted database and binds the pooled handle to its inode", () => {
-    const { dbPath } = createSubstitutionFixture();
+  it("refuses a substitution that reuses a descriptor number freed in the window", () => {
+    const fixture = createSubstitutionFixture();
+    tempDescriptors.push(openSync(fixture.dbPath, "r+"));
+    const padPath = join(dirname(fixture.dbPath), "pad.bin");
+    writeFileSync(padPath, "pad");
+    const padFd = openSync(padPath, "r+");
+    fsState.beforeLeafResolve = () => {
+      closeSync(padFd);
+      fixture.swap();
+    };
+    sqliteState.afterOpen = fixture.restore;
 
-    const db = getExistingLcmConnection(dbPath);
+    expect(() => getExistingLcmConnection(fixture.dbPath)).toThrow(BINDING_ERROR);
 
-    expect(db).not.toBeNull();
-    expect(db!.prepare("SELECT value FROM marker").get()).toEqual({ value: "authentic" });
-    expect(isLcmConnectionOpen(dbPath)).toBe(true);
+    expect(isLcmConnectionOpen(fixture.dbPath)).toBe(false);
+    fixture.settle();
+    expectMarker(fixture.dbPath, "authentic");
   });
 
-  it("keeps pathname evidence when the descriptor namespace is unavailable", () => {
-    const { dbPath } = createSubstitutionFixture();
+  it("refuses a substitution whose retained descriptor is unchanged across the open", () => {
+    const fixture = createSubstitutionFixture();
+    tempDescriptors.push(openSync(fixture.dbPath, "r+"));
+    const substituteFd = openSync(fixture.substitutePath, "r+");
+    fsState.beforeLeafResolve = () => {
+      closeSync(substituteFd);
+      fixture.swap();
+    };
+    sqliteState.afterOpen = fixture.restore;
 
-    const db = getExistingLcmConnection(dbPath, {
-      _descriptorsForTesting: {
-        readdir: () => {
-          throw Object.assign(new Error("injected ENOENT"), { code: "ENOENT" });
-        },
-      },
-    });
+    expect(() => getExistingLcmConnection(fixture.dbPath)).toThrow(BINDING_ERROR);
 
-    expect(db).not.toBeNull();
-    expect(db!.prepare("SELECT value FROM marker").get()).toEqual({ value: "authentic" });
-    expect(isLcmConnectionOpen(dbPath)).toBe(true);
-  });
-
-  it("refuses when the descriptor namespace disappears before the handle is proven", () => {
-    const { dbPath } = createSubstitutionFixture();
-    let listings = 0;
-
-    expect(() => getExistingLcmConnection(dbPath, {
-      _descriptorsForTesting: {
-        readdir: (path: string) => {
-          listings += 1;
-          if (listings > 1) {
-            throw Object.assign(new Error("injected ENOENT"), { code: "ENOENT" });
-          }
-          return readdirSync(path);
-        },
-      },
-    })).toThrow("database handle is not bound to the authenticated database file");
-    expect(listings).toBe(2);
-    expect(isLcmConnectionOpen(dbPath)).toBe(false);
-  });
-});
-
-type DescriptorSnapshot = readonly Readonly<{
-  fd: number;
-  link: string;
-  dev: bigint;
-  ino: bigint;
-  mode?: bigint;
-}>[];
-
-function snapshotOperations(snapshots: readonly DescriptorSnapshot[]) {
-  let taken = -1;
-  const current = (): DescriptorSnapshot => snapshots[Math.min(taken, snapshots.length - 1)]!;
-  const find = (path: string) => {
-    const fd = Number(path.slice("/proc/self/fd/".length));
-    const descriptor = current().find(entry => entry.fd === fd);
-    if (descriptor === undefined) {
-      throw Object.assign(new Error("injected ENOENT"), { code: "ENOENT" });
-    }
-    return descriptor;
-  };
-  return {
-    readdir: () => {
-      taken += 1;
-      return current().map(descriptor => String(descriptor.fd));
-    },
-    readlink: (path: string) => find(path).link,
-    stat: (path: string) => {
-      const descriptor = find(path);
-      const mode = descriptor.mode ?? 0o100600n;
-      return {
-        isDirectory: () => (mode & 0o170000n) === 0o040000n,
-        mode,
-        uid: 0n,
-        gid: 0n,
-        nlink: 1n,
-        dev: descriptor.dev,
-        ino: descriptor.ino,
-      };
-    },
-  };
-}
-
-function authenticIdentity(path: string): Readonly<{ dev: bigint; ino: bigint }> {
-  const stat = lstatSync(path, { bigint: true });
-  return { dev: stat.dev, ino: stat.ino };
-}
-
-describe("opened-inode descriptor admission", () => {
-  it("admits an open that SQLite satisfied from a descriptor it already retained", () => {
-    const { dbPath } = createSubstitutionFixture();
-    const authentic = authenticIdentity(dbPath);
-    const retained: DescriptorSnapshot = [{ fd: 20, link: dbPath, ...authentic }];
-
-    const db = getExistingLcmConnection(dbPath, {
-      _descriptorsForTesting: snapshotOperations([retained, retained]),
-    });
-
-    expect(db!.prepare("SELECT value FROM marker").get()).toEqual({ value: "authentic" });
-    expect(isLcmConnectionOpen(dbPath)).toBe(true);
-  });
-
-  it.each([
-    [
-      "a descriptor that is not a regular file",
-      (dbPath: string, authentic: Readonly<{ dev: bigint; ino: bigint }>): DescriptorSnapshot => [
-        { fd: 20, link: dbPath, ...authentic },
-        { fd: 21, link: "socket:[992]", dev: 0n, ino: 992n, mode: 0o140777n },
-      ],
-    ],
-    [
-      "a second descriptor naming the authenticated database",
-      (dbPath: string, authentic: Readonly<{ dev: bigint; ino: bigint }>): DescriptorSnapshot => [
-        { fd: 20, link: dbPath, ...authentic },
-        { fd: 21, link: dbPath, ...authentic },
-      ],
-    ],
-  ])("admits an open that also retained %s", (_label, after) => {
-    const { dbPath } = createSubstitutionFixture();
-    const authentic = authenticIdentity(dbPath);
-
-    const db = getExistingLcmConnection(dbPath, {
-      _descriptorsForTesting: snapshotOperations([
-        [{ fd: 20, link: dbPath, ...authentic }],
-        after(dbPath, authentic),
-      ]),
-    });
-
-    expect(db!.prepare("SELECT value FROM marker").get()).toEqual({ value: "authentic" });
-    expect(isLcmConnectionOpen(dbPath)).toBe(true);
-  });
-
-  it("admits an unrelated regular file the process already held open", () => {
-    const { dbPath, substitutePath } = createSubstitutionFixture();
-    const authentic = authenticIdentity(dbPath);
-    const unrelated = { fd: 21, link: substitutePath, ...authenticIdentity(substitutePath) };
-
-    const db = getExistingLcmConnection(dbPath, {
-      _descriptorsForTesting: snapshotOperations([
-        [{ fd: 20, link: dbPath, ...authentic }, unrelated],
-        [{ fd: 20, link: dbPath, ...authentic }, unrelated],
-      ]),
-    });
-
-    expect(db!.prepare("SELECT value FROM marker").get()).toEqual({ value: "authentic" });
-    expect(isLcmConnectionOpen(dbPath)).toBe(true);
-  });
-
-  it.each([
-    [
-      "the open retained a foreign regular file",
-      (dbPath: string, substitutePath: string, authentic: Readonly<{ dev: bigint; ino: bigint }>):
-        DescriptorSnapshot => [
-          { fd: 20, link: dbPath, ...authentic },
-          { fd: 21, link: `${dbPath}-journal`, dev: authentic.dev, ino: authentic.ino + 7n },
-        ],
-    ],
-    [
-      "a descriptor naming the database holds another inode",
-      (dbPath: string, _substitutePath: string, authentic: Readonly<{ dev: bigint; ino: bigint }>):
-        DescriptorSnapshot => [
-          { fd: 20, link: dbPath, dev: authentic.dev, ino: authentic.ino + 7n },
-        ],
-    ],
-    [
-      "no descriptor names the database",
-      (): DescriptorSnapshot => [],
-    ],
-    [
-      "a descriptor number reused by the open now names another file",
-      (dbPath: string, substitutePath: string, authentic: Readonly<{ dev: bigint; ino: bigint }>):
-        DescriptorSnapshot => [
-          { fd: 20, link: dbPath, ...authentic },
-          { fd: 21, link: substitutePath, dev: authentic.dev, ino: authentic.ino + 7n },
-        ],
-    ],
-    [
-      "a descriptor number reused by the open holds another inode at the same name",
-      (_dbPath: string, _substitutePath: string, authentic: Readonly<{ dev: bigint; ino: bigint }>):
-        DescriptorSnapshot => [
-          { fd: 20, link: _dbPath, ...authentic },
-          { fd: 21, link: "/var/tmp/pad.bin", dev: authentic.dev, ino: authentic.ino + 7n },
-        ],
-    ],
-    [
-      "a foreign regular file is retained beside a newly opened database descriptor",
-      (dbPath: string, substitutePath: string, authentic: Readonly<{ dev: bigint; ino: bigint }>):
-        DescriptorSnapshot => [
-          { fd: 20, link: dbPath, ...authentic },
-          { fd: 22, link: dbPath, ...authentic },
-          { fd: 23, link: substitutePath, dev: authentic.dev, ino: authentic.ino + 9n },
-        ],
-    ],
-  ])("refuses when %s", (_label, after) => {
-    const { dbPath, substitutePath } = createSubstitutionFixture();
-    const authentic = authenticIdentity(dbPath);
-
-    expect(() => getExistingLcmConnection(dbPath, {
-      _descriptorsForTesting: snapshotOperations([
-        [
-          { fd: 20, link: dbPath, ...authentic },
-          { fd: 21, link: "/var/tmp/pad.bin", dev: authentic.dev, ino: authentic.ino + 21n },
-        ],
-        after(dbPath, substitutePath, authentic),
-      ]),
-    })).toThrow("database handle is not bound to the authenticated database file");
-    expect(isLcmConnectionOpen(dbPath)).toBe(false);
-  });
-
-  it("propagates a descriptor failure that is not a capability refusal", () => {
-    const { dbPath } = createSubstitutionFixture();
-
-    expect(() => getExistingLcmConnection(dbPath, {
-      _descriptorsForTesting: {
-        readlink: () => {
-          throw Object.assign(new Error("injected EACCES"), { code: "EACCES" });
-        },
-      },
-    })).toThrow("injected EACCES");
-    expect(isLcmConnectionOpen(dbPath)).toBe(false);
-  });
-
-  it("propagates a descriptor failure raised only after the handle is open", () => {
-    const { dbPath } = createSubstitutionFixture();
-    let listings = 0;
-
-    expect(() => getExistingLcmConnection(dbPath, {
-      _descriptorsForTesting: {
-        readdir: (path: string) => {
-          listings += 1;
-          return readdirSync(path);
-        },
-        readlink: (path: string) => {
-          if (listings > 1) {
-            throw Object.assign(new Error("injected EACCES"), { code: "EACCES" });
-          }
-          return readlinkSync(path);
-        },
-      },
-    })).toThrow("injected EACCES");
-    expect(listings).toBe(2);
-    expect(isLcmConnectionOpen(dbPath)).toBe(false);
+    expect(isLcmConnectionOpen(fixture.dbPath)).toBe(false);
+    fixture.settle();
+    expectMarker(fixture.dbPath, "authentic");
   });
 
   it("refuses a substitution before changing permissions or running pragmas", () => {
-    const tempDir = mkdtempSync(join(tmpdir(), "lcm-opened-inode-ordering-"));
-    tempDirs.push(tempDir);
-    const dbPath = join(tempDir, "authentic.sqlite");
-    const substitutePath = join(tempDir, "substitute.sqlite");
-    const stashPath = join(tempDir, "stash.sqlite");
-    createMarkedDatabase(dbPath, "authentic");
-    // A rollback-journal substitute proves the WAL pragma never reached the
-    // substituted handle: running it would persist "wal" in that file.
-    createMarkedDatabase(substitutePath, "substitute", "DELETE");
-    for (const leaf of readdirSync(tempDir)) {
-      if (leaf.endsWith("-wal") || leaf.endsWith("-shm")) unlinkSync(join(tempDir, leaf));
+    const fixture = createSubstitutionFixture("DELETE");
+    chmodSync(fixture.dbPath, 0o644);
+    chmodSync(fixture.substitutePath, 0o644);
+    fsState.beforeLeafResolve = fixture.swap;
+    sqliteState.afterOpen = fixture.restore;
+
+    expect(() => getExistingLcmConnection(fixture.dbPath)).toThrow(BINDING_ERROR);
+
+    fixture.settle();
+    expect(statSync(fixture.dbPath).mode & 0o777).toBe(0o644);
+    expect(statSync(fixture.substitutePath).mode & 0o777).toBe(0o644);
+    const substitute = new DatabaseSync(fixture.substitutePath);
+    try {
+      // A leaked "PRAGMA journal_mode = WAL" would have persisted in this file.
+      expect(substitute.prepare("PRAGMA journal_mode").get()).toEqual({ journal_mode: "delete" });
+    } finally {
+      substitute.close();
     }
-    fsState.targetPath = dbPath;
-    chmodSync(dbPath, 0o644);
-    chmodSync(substitutePath, 0o644);
-    fsState.actionsByLstat.set(1, () => {
-      renameSync(dbPath, stashPath);
-      renameSync(substitutePath, dbPath);
-    });
+  });
+
+  it("opens an unsubstituted database and pools the authenticated handle", () => {
+    const fixture = createSubstitutionFixture();
+
+    const db = getExistingLcmConnection(fixture.dbPath);
+
+    expect(db).not.toBeNull();
+    expect(db!.prepare("SELECT value FROM marker").get()).toEqual({ value: "authentic" });
+    expect(isLcmConnectionOpen(fixture.dbPath)).toBe(true);
+  });
+
+  it("admits an open while unrelated work opens another file in the same window", () => {
+    const fixture = createSubstitutionFixture();
+    const unrelatedPath = join(dirname(fixture.dbPath), "unrelated.bin");
+    writeFileSync(unrelatedPath, "unrelated");
     sqliteState.afterOpen = () => {
-      renameSync(dbPath, substitutePath);
-      renameSync(stashPath, dbPath);
+      tempDescriptors.push(openSync(unrelatedPath, "r+"));
     };
 
-    expect(() => getExistingLcmConnection(dbPath))
-      .toThrow("database handle is not bound to the authenticated database file");
+    const db = getExistingLcmConnection(fixture.dbPath);
 
-    expect(statSync(dbPath).mode & 0o777).toBe(0o644);
-    expect(statSync(substitutePath).mode & 0o777).toBe(0o644);
-    expectMarkerAndJournalMode(dbPath, "authentic", "wal");
-    expectMarkerAndJournalMode(substitutePath, "substitute", "delete");
+    expect(db!.prepare("SELECT value FROM marker").get()).toEqual({ value: "authentic" });
+    expect(isLcmConnectionOpen(fixture.dbPath)).toBe(true);
   });
 
   it("creates and binds a missing database in create-capable mode", () => {
@@ -468,85 +372,175 @@ describe("opened-inode descriptor admission", () => {
     expect(isLcmConnectionOpen(dbPath)).toBe(true);
     expect(statSync(dbPath).mode & 0o777).toBe(0o600);
   });
-});
 
-describe("opened-inode substitution parked under a database sidecar name", () => {
-  it("refuses a restored substitution parked at the rollback journal name", () => {
-    const { dbPath, substitutePath, stashPath } = createSubstitutionFixture();
-    const journalPath = `${dbPath}-journal`;
-    // A descriptor the process already holds on the authentic database, which is
-    // an ordinary condition: reconciliation flows hold several while opening.
-    const retainedFd = openSync(dbPath, "r+");
-    tempDescriptors.push(retainedFd);
-    fsState.actionsByLstat.set(1, () => {
-      renameSync(dbPath, stashPath);
-      renameSync(substitutePath, dbPath);
-    });
-    sqliteState.afterOpen = () => {
-      // Park the substituted database under a name WAL mode never reclaims, so
-      // the handle keeps reading it while the authenticated leaf is restored.
-      renameSync(dbPath, journalPath);
-      renameSync(stashPath, dbPath);
-    };
+  it("refuses a substitution of an existing database in create-capable mode", () => {
+    const fixture = createSubstitutionFixture();
+    // A create-capable open resolves no leaf pathname, so the substitution is
+    // timed on the admission lstat instead.
+    fsState.actionsByLstat.set(1, fixture.swap);
+    sqliteState.afterOpen = fixture.restore;
 
-    expect(() => getExistingLcmConnection(dbPath))
-      .toThrow("database handle is not bound to the authenticated database file");
-    expect(isLcmConnectionOpen(dbPath)).toBe(false);
-    expectMarkerAndJournalMode(dbPath, "authentic", "wal");
-    // The refusal precedes the permission change, so the authenticated leaf
-    // keeps the mode the fixture created it with.
-    expect(statSync(dbPath).mode & 0o777).toBe(0o644);
+    expect(() => getLcmConnection(fixture.dbPath)).toThrow(BINDING_ERROR);
+
+    expect(isLcmConnectionOpen(fixture.dbPath)).toBe(false);
+    fixture.settle();
+    expectMarker(fixture.dbPath, "authentic");
   });
 });
 
-describe("opened-inode substitution on a recycled descriptor number", () => {
-  it("refuses a restored substitution that reuses a descriptor freed after the listing", () => {
-    const { dbPath, substitutePath, stashPath } = createSubstitutionFixture();
-    const padPath = join(dirname(dbPath), "pad.bin");
-    writeFileSync(padPath, "pad");
-    // An authentic descriptor the process already holds, and a second descriptor
-    // that is live when the pre-open listing runs but is closed before the
-    // constructor, freeing its number for SQLite to reuse.
-    const retainedFd = openSync(dbPath, "r+");
-    tempDescriptors.push(retainedFd);
-    const padFd = openSync(padPath, "r+");
-    fsState.actionsByLstat.set(1, () => {
-      renameSync(dbPath, stashPath);
-      renameSync(substitutePath, dbPath);
-    });
-    fsState.beforeLeafResolve = () => closeSync(padFd);
-    sqliteState.afterOpen = () => {
-      renameSync(dbPath, substitutePath);
-      renameSync(stashPath, dbPath);
-    };
+describe("opened-inode substitution inside the retained window", () => {
+  it("refuses a substitution staged and restored while SQLite opens", () => {
+    const fixture = createSubstitutionFixture();
+    // The swap lands after the leaf is retained and the restore lands before
+    // the post-open pathname check, so only the retained witnesses can refuse.
+    sqliteState.beforeOpen = fixture.swap;
+    sqliteState.afterOpen = fixture.restore;
 
-    expect(() => getExistingLcmConnection(dbPath))
-      .toThrow("database handle is not bound to the authenticated database file");
-    expect(isLcmConnectionOpen(dbPath)).toBe(false);
-    expectMarkerAndJournalMode(dbPath, "authentic", "wal");
+    expect(() => getExistingLcmConnection(fixture.dbPath)).toThrow(BINDING_ERROR);
+
+    expect(isLcmConnectionOpen(fixture.dbPath)).toBe(false);
+    fixture.settle();
+    expectMarker(fixture.dbPath, "authentic");
+  });
+
+  it("refuses a substitution left in place while SQLite opens", () => {
+    const fixture = createSubstitutionFixture();
+    sqliteState.beforeOpen = fixture.swap;
+
+    expect(() => getExistingLcmConnection(fixture.dbPath))
+      .toThrow("database path changed while opening");
+
+    expect(isLcmConnectionOpen(fixture.dbPath)).toBe(false);
+    fixture.settle();
+    expectMarker(fixture.dbPath, "authentic");
+  });
+
+  it("propagates a retained leaf close failure from an otherwise successful open", () => {
+    const fixture = createSubstitutionFixture();
+    fdState.failLeafClose = true;
+
+    expect(() => getExistingLcmConnection(fixture.dbPath))
+      .toThrow("injected retained leaf close failure");
+
+    expect(isLcmConnectionOpen(fixture.dbPath)).toBe(true);
+    closeLcmConnection(fixture.dbPath);
+  });
+
+  it("keeps the substitution refusal when the retained leaf also fails to close", () => {
+    const fixture = createSubstitutionFixture();
+    sqliteState.beforeOpen = () => {
+      fixture.swap();
+      fdState.failLeafClose = true;
+    };
+    sqliteState.afterOpen = fixture.restore;
+
+    expect(() => getExistingLcmConnection(fixture.dbPath)).toThrow(BINDING_ERROR);
+
+    expect(isLcmConnectionOpen(fixture.dbPath)).toBe(false);
+    fixture.settle();
+    expectMarker(fixture.dbPath, "authentic");
   });
 });
 
-describe("opened-inode substitution laundered by a concurrent database open", () => {
-  it("refuses a restored substitution even when the database is reopened in the window", () => {
-    const { dbPath, substitutePath, stashPath } = createSubstitutionFixture();
-    const retainedFd = openSync(dbPath, "r+");
-    tempDescriptors.push(retainedFd);
-    fsState.actionsByLstat.set(1, () => {
-      renameSync(dbPath, stashPath);
-      renameSync(substitutePath, dbPath);
-    });
-    sqliteState.afterOpen = () => {
-      renameSync(dbPath, substitutePath);
-      renameSync(stashPath, dbPath);
-      // Unrelated work in this process reopens the authenticated database on a
-      // new descriptor. It must not stand in as evidence for another handle.
-      tempDescriptors.push(openSync(dbPath, "r+"));
-    };
 
-    expect(() => getExistingLcmConnection(dbPath))
-      .toThrow("database handle is not bound to the authenticated database file");
+describe("create-capable opens of a missing database", () => {
+  it("refuses a substitute planted at the pathname while SQLite opens", () => {
+    const tempDir = mkdtempSync(join(tmpdir(), "lcm-opened-inode-plant-"));
+    tempDirs.push(tempDir);
+    const dbPath = join(tempDir, "created.sqlite");
+    const plantPath = join(tempDir, "plant.sqlite");
+    createMarkedDatabase(plantPath, "substitute", "DELETE");
+    fsState.targetPath = dbPath;
+    sqliteState.beforeOpen = () => renameSync(plantPath, dbPath);
+
+    // The planted file replaces the leaf LCM created and retained, so the
+    // pathname recheck names it before the witnesses are compared.
+    expect(() => getLcmConnection(dbPath)).toThrow("database path changed while opening");
+
     expect(isLcmConnectionOpen(dbPath)).toBe(false);
-    expectMarkerAndJournalMode(dbPath, "authentic", "wal");
+    sqliteState.beforeOpen = undefined;
+    // The planted database is never adopted, initialized, or pooled.
+    expectMarker(dbPath, "substitute");
+    const planted = new DatabaseSync(dbPath);
+    try {
+      expect(planted.prepare("PRAGMA journal_mode").get()).toEqual({ journal_mode: "delete" });
+    } finally {
+      planted.close();
+    }
+  });
+
+  it("adopts the database another writer created first", () => {
+    const tempDir = mkdtempSync(join(tmpdir(), "lcm-opened-inode-race-"));
+    tempDirs.push(tempDir);
+    const dbPath = join(tempDir, "created.sqlite");
+    fsState.targetPath = dbPath;
+    // The exclusive create loses the race, so LCM authenticates and retains the
+    // database the winner created rather than creating its own.
+    fdState.loseLeafCreateRace = true;
+
+    const db = getLcmConnection(dbPath);
+
+    expect(db.prepare("PRAGMA journal_mode").get()).toEqual({ journal_mode: "wal" });
+    expect(isLcmConnectionOpen(dbPath)).toBe(true);
+    expect(statSync(dbPath).mode & 0o777).toBe(0o600);
   });
 });
+
+
+describe("create-capable reopen of an existing database", () => {
+  it("admits a reopen that nothing else touches", () => {
+    const tempDir = mkdtempSync(join(tmpdir(), "lcm-opened-inode-reopen-"));
+    tempDirs.push(tempDir);
+    const dbPath = join(tempDir, "existing.sqlite");
+    createMarkedDatabase(dbPath, "existing");
+    fsState.targetPath = dbPath;
+
+    const db = getLcmConnection(dbPath);
+
+    expect(db.prepare("SELECT value FROM marker").get()).toEqual({ value: "existing" });
+  });
+});
+
+describe("create-capable leaf creation failures", () => {
+  it("propagates a creation failure that is not a lost race", () => {
+    const tempDir = mkdtempSync(join(tmpdir(), "lcm-opened-inode-create-fail-"));
+    tempDirs.push(tempDir);
+    const dbPath = join(tempDir, "created.sqlite");
+    fsState.targetPath = dbPath;
+    fdState.failLeafCreate = true;
+
+    expect(() => getLcmConnection(dbPath)).toThrow("injected leaf creation failure");
+
+    expect(isLcmConnectionOpen(dbPath)).toBe(false);
+    expect(existsSync(dbPath)).toBe(false);
+  });
+});
+
+describe("create-capable leaf admission exhaustion", () => {
+  it("refuses when the leaf can be neither created nor inspected", () => {
+    const tempDir = mkdtempSync(join(tmpdir(), "lcm-opened-inode-starve-"));
+    tempDirs.push(tempDir);
+    const dbPath = join(tempDir, "created.sqlite");
+    fsState.targetPath = dbPath;
+    fdState.starveLeafCreate = 3;
+
+    expect(() => getLcmConnection(dbPath)).toThrow(BINDING_ERROR);
+
+    expect(isLcmConnectionOpen(dbPath)).toBe(false);
+    expect(existsSync(dbPath)).toBe(false);
+  });
+
+  it("creates the leaf on a later attempt when an earlier race is lost", () => {
+    const tempDir = mkdtempSync(join(tmpdir(), "lcm-opened-inode-retry-"));
+    tempDirs.push(tempDir);
+    const dbPath = join(tempDir, "created.sqlite");
+    fsState.targetPath = dbPath;
+    fdState.starveLeafCreate = 1;
+
+    const db = getLcmConnection(dbPath);
+
+    expect(db.prepare("PRAGMA journal_mode").get()).toEqual({ journal_mode: "wal" });
+    expect(isLcmConnectionOpen(dbPath)).toBe(true);
+  });
+});
+

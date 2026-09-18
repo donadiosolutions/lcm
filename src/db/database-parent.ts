@@ -19,6 +19,26 @@ export type DatabaseParentIdentity = Readonly<{
   inode: string;
 }>;
 
+/**
+ * Directory identity plus the timestamps the kernel updates whenever an entry
+ * in it is created, removed, or renamed. Two observations that match prove the
+ * directory's entries did not change between them.
+ */
+export type DatabaseParentWitness = Readonly<{
+  device: string;
+  inode: string;
+  modifiedNs: string;
+  changedNs: string;
+}>;
+
+export function sameDatabaseParentWitness(
+  left: DatabaseParentWitness,
+  right: DatabaseParentWitness,
+): boolean {
+  return left.device === right.device && left.inode === right.inode
+    && left.modifiedNs === right.modifiedNs && left.changedNs === right.changedNs;
+}
+
 type DatabaseParentOperations = Readonly<{
   open: (path: string, flags: number) => number;
   close: (fd: number) => void;
@@ -51,6 +71,7 @@ export type DatabaseParentHandle = Readonly<{
   path: string;
   identity: DatabaseParentIdentity;
   assertCurrent: () => void;
+  witness: () => DatabaseParentWitness;
   close: () => void;
 }>;
 
@@ -221,6 +242,15 @@ function openExistingDatabaseParent(
           options.tighten,
           operations,
         );
+      },
+      witness: () => {
+        const descriptor = operations.fstat(fd);
+        return {
+          device: descriptor.dev.toString(10),
+          inode: descriptor.ino.toString(10),
+          modifiedNs: descriptor.mtimeNs.toString(10),
+          changedNs: descriptor.ctimeNs.toString(10),
+        };
       },
       close,
     };
