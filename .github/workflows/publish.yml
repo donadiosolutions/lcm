@@ -549,7 +549,7 @@ jobs:
             }
           }
 
-          assertAtLeast('Node', process.version, '22.14.0');
+          assertAtLeast('Node', process.version, '25.0.0');
           assertAtLeast('npm', cp.execFileSync('npm', ['--version'], { encoding: 'utf8' }).trim(), '11.5.1');
           NODE
 
@@ -898,7 +898,7 @@ jobs:
               }
             }
           }
-          assertAtLeast('Node', process.version, '22.14.0');
+          assertAtLeast('Node', process.version, '25.0.0');
           assertAtLeast('npm', cp.execFileSync('npm', ['--version'], { encoding: 'utf8' }).trim(), '11.5.1');
           NODE
 
