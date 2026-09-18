@@ -1595,4 +1595,33 @@ describe("verifyMigrationGeneration: public listing probe", () => {
       },
     ]);
   }, 15000);
+
+  it("round-1 P1 red case: an empty source conversations listing against a non-empty destination records a sample mismatch instead of crashing", async () => {
+    // Math.min(0, expectedOrder.length - 1) was Math.min(0, -1) = -1 when
+    // the source listing was legitimately empty, and expectedOrder[-1] is
+    // undefined -- reading .identitySha256 off it threw before the report
+    // was ever built. A legitimately empty domain must produce evidence,
+    // not a crash.
+    stubDestinationPrimitives({
+      domainCensus: (domain) => (domain === "conversations"
+        ? { domain, recordCount: 0, prefixSha256: fakeHash("prefix-conversations-0"), terminalIdentitySha256: null }
+        : { domain, recordCount: PORTABLE_RECORD_DOMAIN_ORDER.indexOf(domain), prefixSha256: fakeHash(`prefix-${domain}-${PORTABLE_RECORD_DOMAIN_ORDER.indexOf(domain)}`), terminalIdentitySha256: PORTABLE_RECORD_DOMAIN_ORDER.indexOf(domain) === 0 ? null : HASH_A }),
+    });
+    const recordCounts = Object.fromEntries(PORTABLE_RECORD_DOMAIN_ORDER.map((domain) => [domain, domain === "conversations" ? 0 : PORTABLE_RECORD_DOMAIN_ORDER.indexOf(domain)])) as Partial<Record<PortableDomain, number>>;
+    const copySource = fakeCopySource({ recordCounts, conversationsRecords: [] });
+    const runtime = fakeRuntime({
+      conversationsRows: [
+        { conversation_id: "1", session_id: "orphan", title: null, bootstrapped_at: null, created_at: "2026-01-01T00:00:00.111Z", updated_at: "2026-01-01T00:00:00.111Z" },
+      ],
+    });
+    const result = await verifyMigrationGeneration(
+      baseInput({ homeDir: "/tmp/lcm-verify-probe-empty-source" }),
+      dependenciesFor(copySource, runtime),
+    );
+    expect(result.outcome).toBe("mismatches");
+    expect(result.report.mismatches).toContainEqual({
+      domain: "public-listing", class: "sample",
+      identitySha256: migrationWitnessSha256(["sample-empty-source", 1]),
+    });
+  }, 15000);
 });

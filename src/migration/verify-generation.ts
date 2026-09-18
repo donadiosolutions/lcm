@@ -261,6 +261,24 @@ async function runOrderedListingProbe(
   const expectedCreatedAt = expectedOrder.map((entry) => entry.createdAt);
   const expectedSha256 = sha256Hex(portableCanonicalJson(["lcm-migration-verification-public-listing-v1", expectedCreatedAt]));
   if (expectedSha256 === publicListingSha256) return { mismatch: null, publicListingSha256 };
+  // An empty expected (source) order can only reach here when the actual
+  // (destination) order disagrees, since two empty arrays hash equal and
+  // return above -- so this is a real mismatch: a legitimately empty
+  // source domain against a non-empty destination listing. Round-1 P1:
+  // Math.min(ordinal, expectedOrder.length - 1) was Math.min(0, -1) = -1
+  // here, and expectedOrder[-1] is undefined, so reading
+  // sampledRecord.identitySha256 threw before the report was ever built --
+  // a crash instead of a refusal or a report, for exactly the kind of
+  // legitimately empty domain this driver must be able to report on.
+  if (expectedOrder.length === 0) {
+    return {
+      publicListingSha256,
+      mismatch: {
+        domain: "public-listing", class: "sample",
+        identitySha256: migrationWitnessSha256(["sample-empty-source", actualOrder.length]),
+      },
+    };
+  }
   // The first position where the two orders diverge, clamped so a length
   // difference still names a real source record rather than indexing
   // past the end of whichever side ran out first.
