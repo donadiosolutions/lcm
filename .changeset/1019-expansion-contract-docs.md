@@ -8,7 +8,8 @@ cap and full source content that the registered tool never provides: the daemon
 expansion route passes no token cap and does not request raw source messages, so
 a response carries no message content, a child summary longer than 200
 characters appears as its first 200 characters followed by an ellipsis, and
-expanding a leaf summary returns nothing. The
+expanding a leaf summary yields an expansion entry whose children and messages
+are both empty. The
 `LCM_MAX_EXPAND_TOKENS` entry now names the unregistered
 `buildExpansionToolDefinition` helper it actually reaches, and the MCP tool
 description no longer promises full source content. The `lcm expand` command
