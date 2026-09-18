@@ -9,6 +9,29 @@ import { inspectSqliteMigrationCopy, runSqliteMigrationCopy } from '../../src/mi
 import { canonicalSha256 } from '../../src/storage/portable-record.js';
 import type { PortableBatch } from '../../src/storage/portable-record-stream.js';
 
+// #623 W1 (owner-adjudicated correction to plan-v2 section 2, recorded in
+// .superpowers/623/impl/phase-attribution-measurement.md): a full fenced copy
+// in this file legitimately spends ~59% of its own wall time inside
+// reauthenticateHeld's per-publish full snapshot re-inspection (~20-30ms per
+// call, ~44% of a whole test's time), which is the fence re-proving source
+// authority under the held publication token before every checkpoint
+// publish. That cost is pre-existing, #622/maintenance-owned fencing
+// behavior, not a #623 defect: every step inside reauthenticateHeld,
+// including the "doubled" authenticate, was traced line-by-line and serves a
+// distinct purpose (the second authenticate/journal read closes a TOCTOU gap
+// around the awaited async re-inspection), so none of it was touched. Fixture
+// sharing was evaluated and intentionally not attempted: eliminating all
+// 466ms of prepared()'s fixture cost would only take the lightest test from
+// 2.95s to ~2.48s isolated, which under the measured ~1.93x pool-contention
+// multiplier (5694ms vs 2950ms for the identical test, zero code change --
+// the independently filed main-wide at-edge condition, Bug #1366) is still
+// ~4.8s against a 5000ms deadline, i.e. not a fix. The worst pool-contended
+// duration observed for this file was 5957ms; 15000ms clears roughly 2x that
+// (~11914ms) with real headroom while still catching a genuine hang. See
+// docs/migration-cutover.md's "Copy cost and the publication fence" section
+// for the documented boundedness characteristic (#623 W8).
+vi.setConfig({ testTimeout: 15000 });
+
 const remote=vi.hoisted(()=>({run:null as null|{runId:string;targetGenerationId:string;manifestSha256:string;projectFingerprintSha256:string;state:'active'|'completed'},receipts:new Map<string,{checkpoint:PortableBatch['checkpoint'];batchSha256:string}>(),empty:true}));
 vi.mock('../../src/storage/postgresql/portable-destination.js',async original=>({
  ...await original<typeof import('../../src/storage/postgresql/portable-destination.js')>(),
