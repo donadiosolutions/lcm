@@ -1452,7 +1452,7 @@ export function registerMemoryCommands(
 
   program
     .command("expand <nodeId>")
-    .description("Expand a summary node back into source detail")
+    .description("Traverse a summary node's DAG links and list its child summaries")
     .option("--depth <n>", "Traversal depth", "1")
     .helpOption(false)
     .option("-h, --help", "Show help")

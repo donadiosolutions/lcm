@@ -124,7 +124,7 @@ client for each read:
 | `lcm search <query>` | Search episodic and promoted memory |
 | `lcm grep <query>` | Search messages and summaries by exact text or regular expression; optional inclusive `--since` accepts `YYYY-MM-DDTHH:mm:ss[.S{1,3}](Z|+/-HH:mm)` with normalized UTC years 0001-9999, and malformed or out-of-range values return HTTP 400 |
 | `lcm describe <nodeId>` | Read summary or stored-memory metadata |
-| `lcm expand <nodeId>` | Expand a summary into source detail |
+| `lcm expand <nodeId>` | Traverse a summary's DAG links and list its child summaries as short snippets |
 
 When `--since` is supplied, its value is forwarded to the daemon exactly as
 provided. An empty or whitespace-only value is therefore invalid and returns
@@ -535,7 +535,14 @@ does not renew, remove a fence, create storage, or otherwise mutate identity.
 Compact progress and final results preserve a sanitized, width-bounded project,
 session ID, and conversation ID. When exactly one native transcript matches the
 session, its source locator is included; ambiguous or unavailable provenance is
-omitted. Native TTY, verbose TTY, non-TTY, and captured ANSI output use the same
+omitted. Discovery resolves these locators for the whole project in bounded
+batches rather than one query per conversation, so a large project does not pay
+a per-conversation lookup. Provenance failures are isolated to the session that
+caused them: if one session's transcript metadata cannot be read, every other
+session in the same run still shows its own source locator, and only the
+unreadable session has its locator omitted. A corrupted locator that is not
+text is omitted the same way. Compaction itself never fails because provenance
+could not be read. Native TTY, verbose TTY, non-TTY, and captured ANSI output use the same
 identity formatter. Each append-only terminal line describes only that item's
 `done`, `unchanged`, `skipped`, `failed`, or `dry-run` outcome. Invocation-wide
 failures are labeled separately as `failure total`, and every mode prints a

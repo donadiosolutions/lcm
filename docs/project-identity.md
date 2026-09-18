@@ -381,9 +381,13 @@ the normalized source bytes before copying.
 Take a verified backup, stop writers, and inspect the refused source or target
 offline with `typeof(content)`, `hex(content)`, and
 `instr(content, char(0))`. Correct the unsupported value in place, then rerun
-reconciliation to continue from its durable fence and marker state. See the
-[offline promoted-memory repair procedure](privacy.md#embedded-nul-in-promoted-memory)
-for promoted rows only; it is not a shipped message-repair command. Empty text,
+reconciliation to continue from its durable fence and marker state. A source
+whose write fence has already committed is retired and rejects that in-place
+correction. See
+[Embedded NUL in promoted memory](privacy.md#embedded-nul-in-promoted-memory)
+for that retired-source state, for why no in-place source repair is supported
+there, and for the offline repair procedure, which covers promoted rows only
+and is not a shipped message-repair command. Empty text,
 valid multi-byte Unicode, a genuine `U+FFFD` replacement character encoded as
 UTF-8 `EF BF BD`, and literal JSON-escaped `\\u0000` text remain valid. A
 malformed byte that a driver would display as `U+FFFD` remains unsupported.
