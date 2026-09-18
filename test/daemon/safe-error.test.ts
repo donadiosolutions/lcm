@@ -4508,7 +4508,7 @@ describe("sanitizeError", () => {
       "file://h?x=[[https://e.test/t|<path>]|name=<path>",
     ],
     [
-      "named value after a literal-only inner group",
+      "named value after an inner group ending in a literal",
       "file://h?x=[[https://e.test/t|value]|name=\\Users\\SECRET\\y",
       "file://h?x=[[https://e.test/t|value]|name=<path>",
     ],
