@@ -387,6 +387,19 @@ const activePublicationLockTokens = new WeakMap<BackendPublicationLockToken, {
   readonly rootPath: string;
   active: boolean;
 }>();
+/**
+ * Whether this token is a live publication-lock authority for this root.
+ * Holding it means the caller owns the publication flock that any queued
+ * tokenless append must acquire before it can release the append tail.
+ */
+function holdsActivePublicationLock(
+  token: BackendPublicationLockToken,
+  homeDir: string | undefined,
+): boolean {
+  const state = activePublicationLockTokens.get(token);
+  return state !== undefined && state.active && state.rootPath === rootPath(homeDir);
+}
+
 const activeAppendBarrierTokens = new WeakSet<BackendPublicationLockToken>();
 const activeAppendBarrierContext = new AsyncLocalStorage<Readonly<{
   rootPath: string;
@@ -1657,8 +1670,7 @@ function assertLockToken(
   token: BackendPublicationLockToken,
   homeDir: string | undefined,
 ): void {
-  const state = activePublicationLockTokens.get(token);
-  if (state === undefined || !state.active || state.rootPath !== rootPath(homeDir)) {
+  if (!holdsActivePublicationLock(token, homeDir)) {
     return fail("permit-mismatch", "backend publication lock token is not active");
   }
 }
@@ -2105,6 +2117,8 @@ export async function withBackendPublicationAppendBarrierAsync<T>(
   }
   const timing = appendBarrierTiming(options);
   const deadline = timing.now() + timing.contentionWaitMs;
+  const holdsPublicationAdmission = contextualToken !== undefined
+    && holdsActivePublicationLock(contextualToken, homeDir);
   const previous = appendBarrierTails.get(key) ?? Promise.resolve();
   let release!: () => void;
   const current = new Promise<void>((resolve): void => { release = resolve; });
@@ -2117,7 +2131,14 @@ export async function withBackendPublicationAppendBarrierAsync<T>(
     let previousSettled = false;
     void previous.then(() => { previousSettled = true; });
     await Promise.resolve();
-    if (!previousSettled) {
+    // The tail stays installed so later entrants still queue behind this
+    // frame, but a caller that already holds publication admission never
+    // waits on it: a queued tokenless predecessor cannot reach the append
+    // lock until this caller releases the publication flock it is holding.
+    // A same-token sibling predecessor can still proceed concurrently, which
+    // is why the tail is fairness only; .local-hook-append.lock below is what
+    // actually serializes the mutations.
+    if (!previousSettled && !holdsPublicationAdmission) {
       if (!timing.bounded) {
         await previous;
       } else {
@@ -2205,6 +2226,8 @@ export async function withBackendPublicationRetainedAppendAdmissionAsync<T>(
     }
   }
 
+  const holdsPublicationAdmission = lockToken !== undefined
+    && holdsActivePublicationLock(lockToken, homeDir);
   const key = rootPath(homeDir);
   const previous = appendBarrierTails.get(key) ?? Promise.resolve();
   let release!: () => void;
@@ -2218,7 +2241,11 @@ export async function withBackendPublicationRetainedAppendAdmissionAsync<T>(
     let previousSettled = false;
     void previous.then(() => { previousSettled = true; });
     await Promise.resolve();
-    if (!previousSettled) {
+    // The tail stays installed so later entrants still queue behind this
+    // frame, but a caller that already holds publication admission never
+    // waits on it: a queued tokenless predecessor cannot reach the append
+    // lock until this caller releases the publication flock it is holding.
+    if (!previousSettled && !holdsPublicationAdmission) {
       const predecessor = await waitForAppendPredecessor(
         previous,
         timing,

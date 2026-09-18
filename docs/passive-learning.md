@@ -321,7 +321,21 @@ reads and cleanup without contending with itself.
 That orphan cleanup also enters the local append order before it takes
 publication admission. If another local append has already started, the sweep
 waits for it to finish and then scans, so a queued append completes and its
-events stay durable instead of timing out behind the sweep. The sweep holds one
+events stay durable instead of timing out behind the sweep. A sweep whose
+caller already holds publication admission is the one exception: it enters the
+append order without waiting for a queued append, because that append cannot
+acquire publication until the caller releases it, so waiting would only burn
+the sweep deadline. Such a sweep still takes the local append lock and still
+runs the append-admission phase check, and appends that arrive after it still
+queue behind it. Be precise about what that phase check is: it is not the
+consumer gate, because a live caller token short-circuits the consumer lock,
+and the phase check itself permits maintenance-held as the narrow append
+capability. The exception path therefore does not refuse on its own account.
+Maintenance is still protected, but by admission exclusion rather than by this
+path: entering maintenance takes the same publication flock the caller holds,
+so a live consumer token cannot be minted while maintenance holds publication.
+The refusal described below is the one that applies to a sweep owning no
+caller admission. The sweep holds one
 retained admission from the diagnostic snapshot through the real close, the
 final eligibility check, and deletion. That admission grants no implicit append
 authority: an append started underneath the scan, such as one triggered during

@@ -6306,6 +6306,105 @@ describe("revocable mutation permits", () => {
     await expect(withBackendPublicationAppendBarrierAsync(home, async () => "appended"))
       .resolves.toBe("appended");
   });
+
+  it("admits a held consumer token past a queued tokenless append", async () => {
+    const home = makeHome();
+    let queuedEntered = false;
+    let queued!: Promise<void>;
+    const admitted = vi.fn();
+    const elapsed = await withBackendPublicationConsumerLockAsync(home, async token => {
+      queued = withBackendPublicationAppendBarrierAsync(home, () => {
+        queuedEntered = true;
+      }, undefined, { contentionWaitMs: 3_000, retryDelayMs: 25 });
+      await Promise.resolve();
+      const started = performance.now();
+      await expect(withBackendPublicationAppendBarrierAsync(home, () => {
+        admitted();
+        return "admitted";
+      }, token, { contentionWaitMs: 600, retryDelayMs: 25 })).resolves.toBe("admitted");
+      expect(queuedEntered).toBe(false);
+      return performance.now() - started;
+    });
+
+    expect(admitted).toHaveBeenCalledTimes(1);
+    expect(elapsed).toBeLessThan(300);
+    await expect(queued).resolves.toBeUndefined();
+    expect(queuedEntered).toBe(true);
+  });
+
+  it("admits retained append admission past a queued tokenless append", async () => {
+    const home = makeHome();
+    let queuedEntered = false;
+    let queued!: Promise<void>;
+    const admitted = vi.fn();
+    const elapsed = await withBackendPublicationConsumerLockAsync(home, async token => {
+      queued = withBackendPublicationAppendBarrierAsync(home, () => {
+        queuedEntered = true;
+      }, undefined, { contentionWaitMs: 3_000, retryDelayMs: 25 });
+      await Promise.resolve();
+      const started = performance.now();
+      await expect(withBackendPublicationRetainedAppendAdmissionAsync(home, () => {
+        admitted();
+        return "retained";
+      }, token, { contentionWaitMs: 600, externalLockAttempts: 1 })).resolves.toBe("retained");
+      expect(queuedEntered).toBe(false);
+      return performance.now() - started;
+    });
+
+    expect(admitted).toHaveBeenCalledTimes(1);
+    expect(elapsed).toBeLessThan(300);
+    await expect(queued).resolves.toBeUndefined();
+    expect(queuedEntered).toBe(true);
+  });
+
+  it("keeps queuing later entrants behind an admitted token holder", async () => {
+    const home = makeHome();
+    const order: string[] = [];
+    let releaseAdmitted!: () => void;
+    let admittedEntered!: () => void;
+    const entered = new Promise<void>(resolve => { admittedEntered = resolve; });
+    let follower!: Promise<void>;
+    await withBackendPublicationConsumerLockAsync(home, async token => {
+      const admitted = withBackendPublicationAppendBarrierAsync(home, async () => {
+        order.push("token");
+        admittedEntered();
+        await new Promise<void>(resolve => { releaseAdmitted = resolve; });
+      }, token, { contentionWaitMs: 600, retryDelayMs: 25 });
+      await entered;
+      follower = withBackendPublicationAppendBarrierAsync(home, () => {
+        order.push("follower");
+      }, undefined, { contentionWaitMs: 5_000, retryDelayMs: 25 });
+      for (let turn = 0; turn < 20; turn += 1) await Promise.resolve();
+      expect(order).toEqual(["token"]);
+      releaseAdmitted();
+      await admitted;
+    });
+
+    await expect(follower).resolves.toBeUndefined();
+    expect(order).toEqual(["token", "follower"]);
+  });
+
+  it("still refuses a tokenless append that exceeds its admission deadline", async () => {
+    const home = makeHome();
+    let release!: () => void;
+    let enter!: () => void;
+    const entered = new Promise<void>(resolve => { enter = resolve; });
+    const owner = withBackendPublicationAppendBarrierAsync(home, async () => {
+      enter();
+      await new Promise<void>(resolve => { release = resolve; });
+    });
+    await entered;
+    const effect = vi.fn();
+
+    await expect(withBackendPublicationAppendBarrierAsync(home, effect, undefined, {
+      contentionWaitMs: 10,
+      retryDelayMs: 5,
+    })).rejects.toBeInstanceOf(BackendPublicationAppendBarrierTimeoutError);
+
+    expect(effect).not.toHaveBeenCalled();
+    release();
+    await expect(owner).resolves.toBeUndefined();
+  });
 });
 
 describe("backend publication directory link-count policy", () => {
