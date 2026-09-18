@@ -725,7 +725,7 @@ The `Security` section of the doctor output shows:
 - Sidecar scans return a single aggregate truncation record when their time or database limit is reached, so diagnostic responses remain bounded even if the events directory contains many files.
 - A rooted path following a nested public URL inside a bracketed `file://` query wrapper is redacted in more shapes. This now includes URLs carrying brackets, such as an IPv6 authority or a bracketed path segment, and a Windows drive root such as `C:\` as the value that arms the handoff. Repeated separators inside one wrapper each redact their successor rather than only the first. Values that are not path roots, such as a bare relative value, still do not arm it.
 - Comma and semicolon are not sibling handoff separators in that wrapper, so a single-leading-backslash Windows value after them stays visible. POSIX paths and Windows drive roots after a comma or semicolon still become `<path>`.
-- Bounded terminal fields count supplementary-plane CJK ideographs, `U+20000` through `U+3FFFD`, as two columns rather than one. Live-frame and append-only output containing these characters keeps the column budget it promises instead of overrunning it by one column per character.
+- Bounded terminal fields count supplementary-plane CJK ideographs as two columns rather than one, across `U+20000`-`U+2FFFD` and `U+30000`-`U+3FFFD`. Code points outside those two ranges, including `U+2FFFE` and `U+3FFFE`, remain one column. Live-frame and append-only output containing these characters keeps the column budget it promises instead of overrunning it by one column per character.
 
 ## Summary
 
