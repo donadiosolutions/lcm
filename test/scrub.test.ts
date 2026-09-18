@@ -752,6 +752,78 @@ describe("Gitleaks generated pattern runtime bounds", () => {
     expect(failures).toEqual([]);
   });
 
+  it("executes a prefiltered rule only when its keyword is present", () => {
+    const pattern = GITLEAKS_PATTERNS.find(({ id }) => id === "twilio-api-key");
+    expect(pattern).toBeDefined();
+    const engine = new ScrubEngine([], []);
+    const internals = engine as unknown as {
+      spanningPatterns: Array<{ source: string; regex: RegExp }>;
+    };
+    const compiled = internals.spanningPatterns.find(
+      ({ source }) => source === pattern!.regex,
+    );
+    expect(compiled).toBeDefined();
+    const execSpy = vi.spyOn(compiled!.regex, "exec");
+
+    const absent = "opaque input without the required marker";
+    expect(engine.scrubWithCounts(absent)).toEqual({
+      text: absent,
+      gitleaks: 0,
+      builtIn: 0,
+      global: 0,
+      project: 0,
+    });
+    expect(execSpy.mock.calls).toEqual([]);
+
+    const present = "sk is present without a matching Twilio key";
+    expect(engine.scrubWithCounts(present)).toEqual({
+      text: present,
+      gitleaks: 0,
+      builtIn: 0,
+      global: 0,
+      project: 0,
+    });
+    expect(execSpy.mock.calls).toEqual([[present]]);
+    execSpy.mockRestore();
+  });
+
+  it("requires every prefiltered witness to depend on an intact keyword", () => {
+    const failures: Array<{ id: string; reason: string }> = [];
+
+    for (const pattern of GITLEAKS_PATTERNS.filter(({ prefilter }) => prefilter)) {
+      const sample = createRegexWitness(pattern.regex, pattern.flags);
+      const regex = new RegExp(pattern.regex, pattern.flags);
+      if (sample === null || !regex.test(sample)) {
+        failures.push({ id: pattern.id, reason: "no matching witness" });
+        continue;
+      }
+
+      const matchedKeywords = pattern.keywords
+        .filter((keyword) => sample.toLowerCase().includes(keyword.toLowerCase()))
+        .sort((left, right) => right.length - left.length);
+      if (matchedKeywords.length === 0) {
+        failures.push({ id: pattern.id, reason: "witness contains no keyword" });
+        continue;
+      }
+
+      let corrupted = sample;
+      for (const keyword of matchedKeywords) {
+        let offset = corrupted.toLowerCase().indexOf(keyword.toLowerCase());
+        while (offset >= 0) {
+          corrupted = corrupted.slice(0, offset)
+            + "\0".repeat(keyword.length)
+            + corrupted.slice(offset + keyword.length);
+          offset = corrupted.toLowerCase().indexOf(keyword.toLowerCase());
+        }
+      }
+      if (regex.test(corrupted)) {
+        failures.push({ id: pattern.id, reason: "corrupted keyword still matches" });
+      }
+    }
+
+    expect(failures).toEqual([]);
+  });
+
   it("keeps prefiltered and unconditional engine output byte-identical", () => {
     const samples = GITLEAKS_PATTERNS.map((pattern) =>
       createRegexWitness(pattern.regex, pattern.flags)
