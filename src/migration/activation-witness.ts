@@ -700,6 +700,7 @@ export function createMigrationActivationWitness(
     witnessError("invalid-input", "rollback witness is missing required evidence");
   } else if (
     classifyMigrationRollbackMode({
+      epoch: input.epoch,
       attempt: input.attempt,
       postEpochDelta: input.postEpochDelta,
       postEpochCensus: input.postEpochCensus,
@@ -763,6 +764,7 @@ export function parseMigrationActivationWitness(value: unknown): MigrationActiva
 // --- v2 section 9 (in force, corrected field path per v3.1) ----------------
 
 export type ClassifyMigrationRollbackModeInput = Readonly<{
+  epoch: MigrationActivationEpoch;
   attempt: MigrationActivationAttempt;
   postEpochDelta: MigrationCanonicalDelta;
   postEpochCensus: MigrationCensusVector | null;
@@ -772,10 +774,16 @@ export type ClassifyMigrationRollbackModeInput = Readonly<{
  * 1. A changed canonical delta against the attempt's baseline is sound,
  *    cheap evidence of a write: returns "post-write".
  * 2. Equality is inconclusive; the only legal successor is the census.
- * 3. With a supplied census: equality with the epoch's frozen census (via
- *    the attempt's activationRecomputedCensus, which the caller must have
- *    already matched to the epoch) returns "pre-write"; inequality returns
- *    "post-write".
+ * 3. With a supplied census: equality with the epoch's own frozen
+ *    `censusVector` -- never the attempt's `activationRecomputedCensus`,
+ *    which measures agreement with what this same attempt just observed,
+ *    not drift since the epoch -- returns "pre-write"; inequality returns
+ *    "post-write". Comparing against the attempt's own recomputed census
+ *    instead of the epoch's was a real defect (round-1 P0): epoch C0,
+ *    attempt C1, post-epoch C1 minted a valid-checksum "pre-write" even
+ *    though `censusMatchVerdict` (epoch C0 vs attempt C1) was false,
+ *    which would let a destructive rollback discard a destination the
+ *    epoch itself never actually matched.
  * 4. No difference and no census: refuse. Never default.
  *
  * The permission-granting answer always costs a census: "pre-write"
@@ -790,7 +798,7 @@ export function classifyMigrationRollbackMode(
   if (input.postEpochCensus === null) {
     witnessError("unexpected-state", "rollback classification requires a census once the delta is inconclusive");
   }
-  return migrationCensusVectorsEqual(input.postEpochCensus, input.attempt.activationRecomputedCensus)
+  return migrationCensusVectorsEqual(input.postEpochCensus, input.epoch.censusVector)
     ? "pre-write"
     : "post-write";
 }

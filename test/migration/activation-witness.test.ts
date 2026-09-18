@@ -517,14 +517,14 @@ describe("classifyMigrationRollbackMode", () => {
     const e = epoch(0);
     const a = attempt({ epochId: e.epochId, deltaSeed: 0 });
     expect(classifyMigrationRollbackMode({
-      attempt: a, postEpochDelta: canonicalDelta(1), postEpochCensus: null,
+      epoch: e, attempt: a, postEpochDelta: canonicalDelta(1), postEpochCensus: null,
     })).toBe("post-write");
   });
   it("refuses to answer when the delta is equal and no census is supplied", () => {
     const e = epoch(0);
     const a = attempt({ epochId: e.epochId, deltaSeed: 0 });
     expectWitnessError(
-      () => classifyMigrationRollbackMode({ attempt: a, postEpochDelta: canonicalDelta(0), postEpochCensus: null }),
+      () => classifyMigrationRollbackMode({ epoch: e, attempt: a, postEpochDelta: canonicalDelta(0), postEpochCensus: null }),
       "unexpected-state",
     );
   });
@@ -532,15 +532,31 @@ describe("classifyMigrationRollbackMode", () => {
     const e = epoch(0);
     const a = attempt({ epochId: e.epochId, deltaSeed: 0, censusSeed: 0 });
     expect(classifyMigrationRollbackMode({
-      attempt: a, postEpochDelta: canonicalDelta(0), postEpochCensus: censusVector(0),
+      epoch: e, attempt: a, postEpochDelta: canonicalDelta(0), postEpochCensus: censusVector(0),
     })).toBe("pre-write");
   });
   it("returns post-write when the delta is equal but the census diverges", () => {
     const e = epoch(0);
     const a = attempt({ epochId: e.epochId, deltaSeed: 0, censusSeed: 0 });
     expect(classifyMigrationRollbackMode({
-      attempt: a, postEpochDelta: canonicalDelta(0), postEpochCensus: censusVector(9),
+      epoch: e, attempt: a, postEpochDelta: canonicalDelta(0), postEpochCensus: censusVector(9),
     })).toBe("post-write");
+  });
+  it("round-1 P0 red case: compares postEpochCensus against the epoch's own censusVector, never the attempt's activationRecomputedCensus -- epoch C0, attempt C1, post-epoch C1 must be post-write, not pre-write", () => {
+    // Before the fix, this compared postEpochCensus to
+    // attempt.activationRecomputedCensus: C1 === C1 minted a valid-checksum
+    // "pre-write" even though the epoch itself is C0, a destination the
+    // epoch never actually matched. That is precisely the destructive-path
+    // contract break #626 depends on this function to prevent.
+    const e = epoch(0);
+    const a = attempt({ epochId: e.epochId, deltaSeed: 0, censusSeed: 1 });
+    expect(classifyMigrationRollbackMode({
+      epoch: e, attempt: a, postEpochDelta: canonicalDelta(0), postEpochCensus: censusVector(1),
+    })).toBe("post-write");
+    // The census-match verdict recorded in the same witness agrees with the
+    // fixed classification: both say "this attempt does not match the
+    // epoch", so a caller reading either field gets the same answer.
+    expect(migrationActivationCensusMatchVerdict(e, a)).toBe(false);
   });
 });
 
