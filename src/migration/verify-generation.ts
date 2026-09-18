@@ -48,13 +48,15 @@ import { MigrationVerificationReportStore } from "./verification-store.js";
  * V2's replacement for census-alone gating: classes this driver actually
  * checks this pass (either as a recordable mismatch, or as a hard refuse
  * that must have already passed by the time a report is built at all --
- * schema's migrations-chain check and destination-identity's sealed-
- * witness check are both the latter shape) are marked ran; classes with
- * no implementation anywhere in this driver (relation/FK closure, ledger,
- * a distinct record-level identity class) are marked not-run. A report
- * built from this vector can never claim activation eligibility while a
- * required class is unimplemented, by construction -- that is deliberate,
- * not an oversight to fix later in this same item.
+ * destination-identity's sealed-witness check, and schema's migrations-
+ * chain plus its round-1 search-configuration/collation live-to-live
+ * checks, are all the latter shape) are marked ran. Every class this
+ * driver defines has an implementation as of round 1 (relation and
+ * ledger, plus schema's search-configuration/collation comparisons,
+ * were the last additions); a class only ever moves back to not-run if
+ * a future change removes its comparator, in which case this set --
+ * not the report body, not a comment -- is what stops
+ * `activationEligible` from being true while that gap exists.
  */
 export const DRIVER_IMPLEMENTED_MISMATCH_CLASSES: ReadonlySet<MigrationMismatchClass> = new Set([
   "count", "digest", "identity", "sequence", "schema", "sample", "relation", "ledger",
@@ -181,6 +183,37 @@ async function captureDestinationSchemaWitness(
 }
 
 // --- Step 5: public reads outside the window --------------------------------
+
+/**
+ * Frozen witness-schema v3.2's audit table row: searchConfigurationSha256
+ * and collationSha256 are "compared against the live destination values,
+ * live-to-live", refusing because "the census cannot see this drift". No
+ * caller-supplied expected value exists for either -- unlike migrations,
+ * neither has a manifest-sealed baseline from copy time -- so "live-to-
+ * live" here means what it says literally: the value captured once before
+ * the window (captureDestinationSchemaWitness, step 2) compared against a
+ * second live read taken from inside the fenced window itself, on the
+ * borrowed read-only session. A destination whose search configuration or
+ * collation changed between those two reads -- exactly the drift the
+ * census's row-level comparison cannot see -- refuses here instead of
+ * silently publishing a clean report against a schema the window never
+ * actually held constant.
+ */
+async function assertSchemaWitnessLiveToLive(
+  session: PostgreSqlSnapshotSession, expected: MigrationSchemaWitness, signal?: AbortSignal,
+): Promise<void> {
+  const [searchStatus, collationSha256] = await Promise.all([
+    inspectPostgreSqlSearchConfiguration(session, { signal }),
+    captureCollationSha256(session, signal),
+  ]);
+  if (searchStatus.actualSha256 === null) driverError("invalid-input", "destination search configuration is absent");
+  if (searchStatus.actualSha256 !== expected.searchConfigurationSha256) {
+    driverError("destination-drift", "destination search configuration changed inside the fenced verification window");
+  }
+  if (collationSha256 !== expected.collationSha256) {
+    driverError("destination-drift", "destination collation changed inside the fenced verification window");
+  }
+}
 
 /**
  * Millisecond-precision ISO-8601 UTC, matching what `pg` gives back for a
@@ -1025,6 +1058,7 @@ async function computeVerificationReport(
       let ledgerMismatches: MigrationVerificationMismatch[];
       try {
         await assertPermanentReadOnlyGuard(session, input.signal);
+        await assertSchemaWitnessLiveToLive(session, destinationSchemaWitness, input.signal);
         destinationRead = await readFencedDestinationCensus(session, {
           settings: input.destinationSettings, expectedOwner: input.expectedOwner,
           expectedIdentity: input.expectedIdentity, scratchParent: input.scratchParent, signal: input.signal,

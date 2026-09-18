@@ -53,6 +53,21 @@ import type { MigrationMismatchClass, MigrationVerificationReportBody } from "./
  * Anything that cannot honestly claim one of these four, with its kind's
  * required fields genuinely filled in, is the exact defect this file
  * exists to make impossible to add silently.
+ *
+ * Reconciliation (round-1 W4): plan-v4 step 2 described search-
+ * configuration and collation as an "additional report witness" outside
+ * the migrations-only comparison, without naming a live-to-live check.
+ * witness-schema-FROZEN-v3.2.md's audit table, frozen later, names both
+ * "compared against the live destination values, live-to-live" with
+ * refusal. Per this item's standing rule that a later frozen document
+ * corrects an earlier one where they disagree, v3.2 governs: both are
+ * now compared-live in this inventory (assertSchemaWitnessLiveToLive in
+ * verify-generation.ts), and plan-v4 step 2's carve-out language is
+ * superseded for these two fields specifically. sequenceStateSha256
+ * keeps its recorded-only-per-plan classification, since v3.2's own row
+ * for that field names self-consistency -- the separate
+ * sequence-self-consistency entry below -- not a live-to-live digest
+ * comparison of this raw descriptive field.
  */
 export type MigrationWitnessComparisonKind =
   | "compared-live"
@@ -140,16 +155,16 @@ export const MIGRATION_WITNESS_AUDIT: readonly MigrationWitnessAuditEntry[] = Ob
   {
     id: "destination-schema-search-configuration", bodyField: "destinationSchemaWitness",
     description: "The destination's text-search configuration digest.",
-    comparison: "recorded-only-per-plan",
-    missingComparison: "no live-to-live comparison against an expected search-configuration digest; only the digest's absence (null) refuses, never drift from an expected value",
-    owningItem: "plan-v4 step 2's additional-report-witness carve-out (round-1 W4 flags this against the stricter v3.2 audit row; see the coverage-vector entries below for how classCoverage now discloses this)",
+    comparison: "compared-live",
+    consequence: "refuses destination-drift (round-1 W4 fix): compared against a second live read from inside the fenced window, on the same borrowed read-only session as the census -- witness-schema-FROZEN-v3.2.md's audit row names this comparison live-to-live, since a manifest-sealed baseline from copy time does not exist for this value the way it does for migrations",
+    mismatchClasses: ["schema"],
   },
   {
     id: "destination-schema-collation", bodyField: "destinationSchemaWitness",
     description: "The destination's collation-sensitive column digest.",
-    comparison: "recorded-only-per-plan",
-    missingComparison: "no live-to-live comparison against an expected collation digest; only the digest's absence refuses",
-    owningItem: "plan-v4 step 2's additional-report-witness carve-out, same as search configuration",
+    comparison: "compared-live",
+    consequence: "refuses destination-drift (round-1 W4 fix), same live-to-live mechanism as search configuration",
+    mismatchClasses: ["schema"],
   },
   {
     id: "destination-schema-sequence-state-digest", bodyField: "destinationSchemaWitness",

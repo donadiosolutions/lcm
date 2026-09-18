@@ -286,6 +286,15 @@ function fakeSession(overrides: {
           increment_by: state.incrementBy ?? "1",
         }] };
       }
+      if (config.text.includes("pg_collation")) {
+        // Fixed canned rows shared with fakeRuntime's own pg_collation
+        // branch below, so the pre-window capture and the in-window
+        // live-to-live re-read produce byte-identical digests by
+        // construction on the default fixture -- overriding runtime.query
+        // alone (or session.query alone) is how a test simulates real
+        // window-drift.
+        return { rows: [{ collname: "default", collcollate: "C", collctype: "C", collprovider: "c" }] };
+      }
       return { rows: [{ admitted: true }] };
     }),
     close: vi.fn(async () => { /* fake */ }),
@@ -299,9 +308,13 @@ function fakeRuntime(overrides: {
   const session = overrides.session ?? fakeSession();
   return {
     health: vi.fn(async () => ({ status: "healthy", backend: "postgresql", tls: true, serverMajorVersion: 18, serverEncoding: "UTF8" })),
-    query: vi.fn(async (config: { text: string }) => (config.text.includes("lcm.conversations")
-      ? { rows: overrides.conversationsRows ?? [] }
-      : { rows: [{ system_identifier: "7123456789" }] })),
+    query: vi.fn(async (config: { text: string }) => {
+      if (config.text.includes("lcm.conversations")) return { rows: overrides.conversationsRows ?? [] };
+      if (config.text.includes("pg_collation")) {
+        return { rows: [{ collname: "default", collcollate: "C", collctype: "C", collprovider: "c" }] };
+      }
+      return { rows: [{ system_identifier: "7123456789" }] };
+    }),
     transaction: vi.fn(async (callback: (executor: unknown) => Promise<unknown>) => callback({
       query: vi.fn(async () => ({ rows: [] })),
     })),
@@ -961,6 +974,60 @@ describe("verifyMigrationGeneration", () => {
     expect(runtime.close).toHaveBeenCalledTimes(1);
     expect(copySource.stream.close).toHaveBeenCalledTimes(1);
   });
+
+  it("round-1 P1 red case: refuses when the destination search configuration changes inside the fenced window (v3.2 live-to-live)", async () => {
+    // W4: search-configuration/collation were previously captured once
+    // and never compared to anything -- recorded, not evidence. Frozen
+    // witness-schema v3.2's audit table requires them compared live-to-
+    // live; there is no manifest-sealed baseline the way there is for
+    // migrations, so the comparison is the value captured before the
+    // window against a second read taken from inside it.
+    stubDestinationPrimitives();
+    vi.spyOn(searchConfiguration, "inspectPostgreSqlSearchConfiguration")
+      .mockResolvedValueOnce({ actualSha256: HASH_A } as never)
+      .mockResolvedValueOnce({ actualSha256: fakeHash("drifted-search-configuration") } as never);
+    const copySource = fakeCopySource();
+    const runtime = fakeRuntime();
+    const dependencies = dependenciesFor(copySource, runtime);
+    await expect(verifyMigrationGeneration(
+      baseInput({ homeDir: "/tmp/lcm-verify-search-config-window-drift" }), dependencies,
+    )).rejects.toMatchObject({ reason: "destination-drift" });
+  }, 15000);
+
+  it("refuses when the destination search configuration becomes absent inside the fenced window", async () => {
+    stubDestinationPrimitives();
+    vi.spyOn(searchConfiguration, "inspectPostgreSqlSearchConfiguration")
+      .mockResolvedValueOnce({ actualSha256: HASH_A } as never)
+      .mockResolvedValueOnce({ actualSha256: null } as never);
+    const copySource = fakeCopySource();
+    const runtime = fakeRuntime();
+    const dependencies = dependenciesFor(copySource, runtime);
+    await expect(verifyMigrationGeneration(
+      baseInput({ homeDir: "/tmp/lcm-verify-search-config-window-absent" }), dependencies,
+    )).rejects.toThrow(MigrationVerificationDriverError);
+  }, 15000);
+
+  it("round-1 P1 red case: refuses when the destination collation changes inside the fenced window (v3.2 live-to-live)", async () => {
+    stubDestinationPrimitives();
+    const copySource = fakeCopySource();
+    // Pre-window capture (via runtime.query) and the in-window re-read
+    // (via session.query) deliberately disagree on collation, simulating
+    // an admin changing it mid-verification -- exactly the drift the
+    // census's row-level comparison cannot see.
+    const driftedSession = fakeSession();
+    const originalSessionQuery = driftedSession.query;
+    driftedSession.query = vi.fn(async (config: { text: string; values?: readonly unknown[] }) => {
+      if (config.text.includes("pg_collation")) {
+        return { rows: [{ collname: "drifted", collcollate: "en_US.UTF-8", collctype: "en_US.UTF-8", collprovider: "c" }] };
+      }
+      return originalSessionQuery(config);
+    }) as never;
+    const runtime = fakeRuntime({ session: driftedSession });
+    const dependencies = dependenciesFor(copySource, runtime);
+    await expect(verifyMigrationGeneration(
+      baseInput({ homeDir: "/tmp/lcm-verify-collation-window-drift" }), dependencies,
+    )).rejects.toMatchObject({ reason: "destination-drift" });
+  }, 15000);
 
   it("refuses when the verification lease is already held", async () => {
     vi.spyOn(coordination, "PostgreSqlWorkCoordinator").mockImplementation(function () { return ({
