@@ -1,7 +1,7 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
-import { chmodSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { chmodSync, mkdirSync, mkdtempSync, readFileSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
-import { join } from "node:path";
+import { join, resolve } from "node:path";
 import {
   UnauthenticatedProjectIdentityError,
   addProjectAlias,
@@ -168,6 +168,34 @@ describe("project-map identity authentication", () => {
 
       expect(() => resolveExistingProjectIdentity(canonical))
         .toThrow(UnauthenticatedProjectIdentityError);
+    });
+
+    it("refuses a symlinked canonical whose key is the lexical path hash", () => {
+      // An entry reached through an alias carries its canonical path verbatim,
+      // so without normalization the lexical symlink hash authenticates while
+      // the hook side derives the real target's hash: the identity split this
+      // change exists to prevent. Reported by exact-SHA review of PR #1379.
+      const real = makeProject("symlink-real");
+      const link = join(home, "symlink-link");
+      symlinkSync(real, link, "dir");
+      const aliasDir = makeProject("symlink-alias");
+      const lexicalHash = hashProjectPath(resolve(link));
+      expect(lexicalHash).not.toBe(hashProjectPath(real));
+      writeMap({ [lexicalHash]: { canonical: link, aliases: [aliasDir] } });
+
+      expect(() => resolveExistingProjectIdentity(aliasDir))
+        .toThrow(UnauthenticatedProjectIdentityError);
+    });
+
+    it("resolves a symlinked canonical whose key is the real path hash", () => {
+      const real = makeProject("symlink-real-authentic");
+      const link = join(home, "symlink-link-authentic");
+      symlinkSync(real, link, "dir");
+      const aliasDir = makeProject("symlink-alias-authentic");
+      const id = hashProjectPath(real);
+      writeMap({ [id]: { canonical: link, aliases: [aliasDir] } });
+
+      expect(resolveExistingProjectIdentity(aliasDir)).toEqual({ id, canonical: resolve(link) });
     });
 
     it("resolves a project whose map key is its canonical path hash", () => {

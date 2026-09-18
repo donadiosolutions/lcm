@@ -625,7 +625,7 @@ describe("Codecov configuration", () => {
     expect(ownershipCounts.size).toBe(243);
   });
 
-  test("keeps response-fence and #681/#700/#701/#703/#705/#709/#710/#713/#756/#726/#734/#737/#742/#760/#763/#804/#805/#824/#825/#833/#888/#864/#866/#722/#786/#952/#814/#882/#930/#969/#989/#1003/#1049/#964/#1106/#1191/#1196/#1229/#1338 files in their intended components", () => {
+  test("keeps response-fence and #681/#700/#701/#703/#705/#709/#710/#713/#756/#726/#734/#737/#742/#760/#763/#804/#805/#824/#825/#833/#888/#864/#866/#722/#786/#952/#814/#882/#930/#969/#989/#1003/#1049/#964/#1106/#1191/#1196/#1229/#1338/#1356/#1357 files in their intended components", () => {
     const config = readCodecovConfig();
     expect(config).toBeDefined();
     if (config === undefined) {
@@ -681,6 +681,14 @@ describe("Codecov configuration", () => {
       ["src/terminal-sanitize.ts", "unit-configuration-security"],
       // #1049 keeps project metadata owner and single-link admission here.
       ["src/project-map.ts", "unit-project-worktrees"],
+      // #1356/#1357 authenticate the project-map key before it becomes a
+      // storage identity, and stop enumeration and preview presenting an
+      // identity storage refuses. The change is confined to existing files and
+      // adds no component, so every touched file keeps its established owner;
+      // these pins record that decision for materially changed files.
+      ["src/cli-storage.ts", "unit-cli"],
+      ["src/db/events-path.ts", "unit-local-persistence"],
+      ["src/identity-service.ts", "integration-postgresql-identity"],
       // #889 keeps private import metadata publication in this owner.
       // #1308 keeps import metadata convergence in this existing owner;
       // canonical and collapsed metadata are now read live after the write

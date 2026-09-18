@@ -1454,12 +1454,22 @@ export function isAuthenticatedProjectIdentity(
   canonical: string,
   homeDir?: string,
 ): boolean {
-  const retiredId = hashProjectPath(canonical);
+  // Resolve symlinks before deriving anything. An entry reached through an
+  // alias carries its canonical path verbatim, so a symlinked canonical would
+  // otherwise authenticate the lexical path hash while the hook side derives
+  // the real target's hash.
+  //
+  // Deliberately realpath only, not the Git anchor. A legacy entry keyed by a
+  // linked worktree's own path hash is a supported shape that reconciliation
+  // still has to migrate, and anchoring here would refuse it before the
+  // legacy-storage path ever reports it.
+  const normalized = normalizeProjectPath(canonical);
+  const retiredId = hashProjectPath(normalized);
   if (id === retiredId) return true;
-  if (isRetiredProjectIdentitySuccessor(id, retiredId, canonical)) {
-    return isAuthenticatedRetiredProjectIdentitySuccessor(id, retiredId, canonical, homeDir);
+  if (isRetiredProjectIdentitySuccessor(id, retiredId, normalized)) {
+    return isAuthenticatedRetiredProjectIdentitySuccessor(id, retiredId, normalized, homeDir);
   }
-  return projectMetadataBindsCanonical(id, canonical, homeDir);
+  return projectMetadataBindsCanonical(id, normalized, homeDir);
 }
 
 /**
@@ -1505,10 +1515,11 @@ function projectMetadataBindsCanonical(
  * predicate instead, so no surface presents a successor it cannot open.
  */
 function assertDerivableProjectIdentity(id: string, canonical: string): void {
-  const pathHash = hashProjectPath(canonical);
+  const normalized = normalizeProjectPath(canonical);
+  const pathHash = hashProjectPath(normalized);
   if (id === pathHash) return;
-  if (isRetiredProjectIdentitySuccessor(id, pathHash, canonical)) return;
-  if (projectMetadataBindsCanonical(id, canonical)) return;
+  if (isRetiredProjectIdentitySuccessor(id, pathHash, normalized)) return;
+  if (projectMetadataBindsCanonical(id, normalized)) return;
   throw new UnauthenticatedProjectIdentityError(id, canonical);
 }
 
