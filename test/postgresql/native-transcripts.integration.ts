@@ -566,6 +566,85 @@ describe("PostgreSQL 18 native transcript repository", () => {
     });
   });
 
+  it("resolves unambiguous source locators per native session", async () => {
+    await withPostgreSqlTestDatabase("native-transcript-source-locators", async (database) => {
+      await grantTranscriptRuntimePrivileges(database);
+      const scope = await createScope(database, "Native transcript source locators");
+      const repository = new PostgreSqlNativeTranscriptRepository(
+        database.runtime,
+        scope.projectId,
+      );
+      const payload = { type: "message", content: "locator" };
+      const digest = nativePayloadDigest(payload);
+      // One session with a single source, one session whose two transcripts
+      // disagree, and one requested session with no transcript at all.
+      await database.migrator.query({
+        text: `INSERT INTO lcm.native_transcripts (
+                 project_id, machine_id, client_name, format_name,
+                 format_version, native_session_id, source_locator,
+                 source_ordinal, observed_at, scrubber_version,
+                 content_sha256, ingest_key, native_payload
+               )
+               VALUES
+                 (
+                   $1, $2, 'codex', 'codex-jsonl', 'v1',
+                   'single-source-session', 'sessions/single.jsonl',
+                   1, '2026-01-01T00:00:00.000Z', 'scrubber-v1',
+                   $3, $4, $5::pg_catalog.jsonb
+                 ),
+                 (
+                   $1, $2, 'codex', 'codex-jsonl', 'v1',
+                   'single-source-session', 'sessions/single.jsonl',
+                   2, '2026-01-01T00:00:01.000Z', 'scrubber-v1',
+                   $3, $6, $5::pg_catalog.jsonb
+                 ),
+                 (
+                   $1, $2, 'codex', 'codex-jsonl', 'v1',
+                   'ambiguous-source-session', 'sessions/ambiguous-a.jsonl',
+                   1, '2026-01-01T00:00:02.000Z', 'scrubber-v1',
+                   $3, $7, $5::pg_catalog.jsonb
+                 ),
+                 (
+                   $1, $2, 'codex', 'codex-jsonl', 'v1',
+                   'ambiguous-source-session', 'sessions/ambiguous-b.jsonl',
+                   2, '2026-01-01T00:00:03.000Z', 'scrubber-v1',
+                   $3, $8, $5::pg_catalog.jsonb
+                 )`,
+        values: [
+          scope.projectId,
+          scope.machineId,
+          digest,
+          "c".repeat(64),
+          JSON.stringify(payload),
+          "d".repeat(64),
+          "e".repeat(64),
+          "f".repeat(64),
+        ],
+      }, {
+        domain: "native-transcripts",
+        operation: "createSourceLocatorTestTranscripts",
+      });
+
+      // Two transcripts sharing one locator stay unambiguous; a session with
+      // two distinct locators and a session with none are both omitted. This
+      // is the same rule the SQLite backend applies.
+      await expect(repository.listUnambiguousSourceLocators({
+        nativeSessionIds: [
+          "single-source-session",
+          "ambiguous-source-session",
+          "absent-source-session",
+          "single-source-session",
+        ],
+      })).resolves.toEqual(new Map([
+        ["single-source-session", "sessions/single.jsonl"],
+      ]));
+
+      await expect(repository.listUnambiguousSourceLocators({
+        nativeSessionIds: [],
+      })).resolves.toEqual(new Map());
+    });
+  });
+
   it("aggregates ordered links once without multiplying transcript rows", async () => {
     await withPostgreSqlTestDatabase("native-transcript-link-aggregate", async (database) => {
       await grantTranscriptRuntimePrivileges(database);

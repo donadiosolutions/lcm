@@ -16,7 +16,7 @@ import { assertStorageBackendPublication, selectStorageBackendForConfig } from "
 import { withBackendPublicationConsumerLockAsync } from "./storage/backend-publication.js";
 import { projectPathsForIdentity } from "./daemon/project.js";
 import { CliProjectStorageMissingError, listCliProjects, withCliProjectStorage } from "./cli-storage.js";
-import type { ProjectRepositories } from "./storage/contracts.js";
+import { NATIVE_SOURCE_LOCATOR_BATCH_SIZE, type ProjectRepositories } from "./storage/contracts.js";
 import { createSqliteRepositories, createSqliteRepositoryStores } from "./storage/sqlite/repositories.js";
 import {
   RetiredProjectIdentityError,
@@ -230,6 +230,11 @@ function hasReplayCondensationCandidate(items: readonly ReplayContextRow[]): boo
   return false;
 }
 
+/** Batched project-level lookup of unambiguous native source locators. */
+type SourceLocatorResolver = (
+  sessionIds: readonly string[],
+) => Promise<ReadonlyMap<string, string>>;
+
 type CompactRepositories = Pick<ProjectRepositories, "conversations" | "summaries" | "context"> & {
   readonly nativeTranscripts?: ProjectStorage["nativeTranscripts"];
 };
@@ -239,7 +244,7 @@ async function discoverProject(
   project: { canonical: string; dir: string },
   minTokens: number,
   replay: boolean,
-  sourceLocatorForSession?: (sessionId: string) => Promise<string | undefined>,
+  resolveSourceLocators?: SourceLocatorResolver,
 ): Promise<UncompactedConversation[]> {
   const candidates: UncompactedConversation[] = [];
   for (const conversation of await storage.conversations.listConversations()) {
@@ -276,20 +281,6 @@ async function discoverProject(
       });
       if (!hasReplayCondensationCandidate(items)) continue;
     }
-    let sourceLocator: string | undefined;
-    try {
-      if (sourceLocatorForSession !== undefined) {
-        sourceLocator = await sourceLocatorForSession(conversation.sessionId);
-      } else {
-        const transcripts = await storage.nativeTranscripts?.repository.listByNativeSession({
-          nativeSessionId: conversation.sessionId,
-        });
-        const locators = [...new Set(transcripts?.map(transcript => transcript.sourceLocator) ?? [])];
-        if (locators.length === 1) sourceLocator = locators[0];
-      }
-    } catch {
-      // Optional provenance is omitted when it cannot be read unambiguously.
-    }
     candidates.push({
       projectDir: project.dir,
       cwd: project.canonical,
@@ -297,10 +288,66 @@ async function discoverProject(
       sessionId: conversation.sessionId,
       messages,
       tokens,
-      ...(sourceLocator === undefined ? {} : { sourceLocator }),
     });
   }
-  return candidates.sort((left, right) => right.tokens - left.tokens || left.conversationId - right.conversationId);
+  const locators = await discoverySourceLocators(storage, candidates, resolveSourceLocators);
+  return candidates
+    .map(candidate => {
+      const sourceLocator = locators.get(candidate.sessionId);
+      return sourceLocator === undefined ? candidate : { ...candidate, sourceLocator };
+    })
+    .sort((left, right) => right.tokens - left.tokens || left.conversationId - right.conversationId);
+}
+
+/**
+ * Resolve every eligible conversation's optional source locator in one bounded
+ * project-level lookup.
+ *
+ * Discovery used to issue one native-transcript query per eligible
+ * conversation and materialize every matching row, so both query count and
+ * resident memory grew with the project's transcript history. The batched
+ * seam answers the same question — is there exactly one distinct source
+ * locator for this native session — with server-side aggregation that returns
+ * at most one row per requested session.
+ */
+async function discoverySourceLocators(
+  storage: CompactRepositories,
+  candidates: readonly { readonly sessionId: string }[],
+  resolveSourceLocators?: SourceLocatorResolver,
+): Promise<ReadonlyMap<string, string>> {
+  const sessionIds = [...new Set(candidates.map(candidate => candidate.sessionId))];
+  if (sessionIds.length === 0) return new Map();
+  const repository = storage.nativeTranscripts?.repository;
+  const resolve = resolveSourceLocators
+    ?? (repository === undefined
+      ? undefined
+      : (nativeSessionIds: readonly string[]) =>
+        repository.listUnambiguousSourceLocators({ nativeSessionIds }));
+  if (resolve === undefined) return new Map();
+  const locators = new Map<string, string>();
+  for (
+    let offset = 0;
+    offset < sessionIds.length;
+    offset += NATIVE_SOURCE_LOCATOR_BATCH_SIZE
+  ) {
+    const chunk = sessionIds.slice(offset, offset + NATIVE_SOURCE_LOCATOR_BATCH_SIZE);
+    try {
+      for (const [sessionId, locator] of await resolve(chunk)) locators.set(sessionId, locator);
+    } catch {
+      // One unreadable session must not hide provenance for every other
+      // session, so a failed batch degrades to per-session resolution. A
+      // failed batch therefore costs its own statement plus one bounded
+      // statement per session in that batch, and only on the error path.
+      for (const sessionId of chunk) {
+        try {
+          for (const [id, locator] of await resolve([sessionId])) locators.set(id, locator);
+        } catch {
+          // Optional provenance is omitted for this session alone.
+        }
+      }
+    }
+  }
+  return locators;
 }
 
 /** Preview repository composition deliberately bypasses factory migrations. */
@@ -331,21 +378,38 @@ async function discoverSqlitePreview(
         paths,
         minTokens,
         replay,
-        async (sessionId) => {
-          try {
+        async (sessionIds) => {
+          const locators = new Map<string, string>();
+          for (
+            let offset = 0;
+            offset < sessionIds.length;
+            offset += NATIVE_SOURCE_LOCATOR_BATCH_SIZE
+          ) {
+            const chunk = sessionIds.slice(offset, offset + NATIVE_SOURCE_LOCATOR_BATCH_SIZE);
             const rows = db.prepare(
-              `SELECT DISTINCT source_locator
+              `SELECT native_session_id, MIN(source_locator) AS source_locator, COUNT(DISTINCT source_locator) AS locator_count
                  FROM runtime_native_transcripts
-                WHERE project_id = ? AND native_session_id = ?
-                ORDER BY source_locator
-                LIMIT 2`,
-            ).all(identity.id, sessionId) as Array<{ source_locator: unknown }>;
-            return rows.length === 1 && typeof rows[0]?.source_locator === "string"
-              ? rows[0].source_locator
-              : undefined;
-          } catch {
-            return undefined;
+                WHERE project_id = ? AND native_session_id IN (${chunk.map(() => "?").join(",")})
+                GROUP BY native_session_id`,
+            ).all(identity.id, ...chunk) as Array<{
+              native_session_id: string;
+              source_locator: unknown;
+              locator_count: number;
+            }>;
+            for (const row of rows) {
+              if (row.locator_count !== 1) continue;
+              // The runtime table is not STRICT, so a corrupted row can hold a
+              // non-text locator that no production writer creates. Rendering
+              // one throws, so omit it exactly as the direct path does, where
+              // repository validation rejects the same value. native_session_id
+              // needs no such guard: the row matched an equality bind against a
+              // text session id, and SQLite never compares a blob equal to
+              // text, so a returned row's session id is always text.
+              if (typeof row.source_locator !== "string") continue;
+              locators.set(row.native_session_id, row.source_locator);
+            }
           }
+          return locators;
         },
       );
     } finally {

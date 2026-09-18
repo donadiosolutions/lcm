@@ -625,7 +625,7 @@ describe("Codecov configuration", () => {
     expect(ownershipCounts.size).toBe(243);
   });
 
-  test("keeps response-fence and #681/#700/#701/#703/#705/#709/#710/#713/#756/#726/#734/#737/#742/#760/#763/#804/#805/#824/#825/#833/#888/#864/#866/#722/#786/#952/#814/#882/#930/#969/#989/#1003/#1049/#964/#1106/#1191/#1196/#1229 files in their intended components", () => {
+  test("keeps response-fence and #681/#700/#701/#703/#705/#709/#710/#713/#756/#726/#734/#737/#742/#760/#763/#804/#805/#824/#825/#833/#888/#864/#866/#722/#786/#952/#814/#882/#930/#969/#989/#1003/#1049/#964/#1106/#1191/#1196/#1229/#1338 files in their intended components", () => {
     const config = readCodecovConfig();
     expect(config).toBeDefined();
     if (config === undefined) {
@@ -732,7 +732,14 @@ describe("Codecov configuration", () => {
       // #1106/#618 keep discovery-related files in their established owners.
       ["src/daemon/server.ts", "unit-daemon-core"],
       ["src/import.ts", "unit-transcripts-import"],
+      // #1338 replaces compact discovery's per-conversation native-transcript
+      // query with a batched project-level lookup and adds the contract member
+      // both backends implement. The change is confined to existing files, so
+      // every touched file keeps its established owner and the component
+      // topology is unchanged; these pins record that decision.
       ["src/batch-compact.ts", "unit-compaction-summarization"],
+      ["src/storage/sqlite/native-transcript-repository.ts", "unit-local-persistence"],
+      ["src/storage/postgresql/native-transcript-repository.ts", "integration-postgresql-transcripts"],
       ["src/daemon/version.ts", "unit-daemon-core"],
       // #885 keeps the shared missing-Codex diagnostic and its resolver
       // identity handling within the existing LLM component. #934 keeps

@@ -2,6 +2,7 @@ import type { QueryConfig, QueryResult, QueryResultRow } from "pg";
 import { createHash } from "node:crypto";
 import { describe, expect, it, vi } from "vitest";
 import {
+  NATIVE_SOURCE_LOCATOR_BATCH_SIZE,
   NATIVE_TRANSCRIPT_MAX_JSON_DEPTH,
   type JsonObject,
   type JsonValue,
@@ -331,6 +332,102 @@ describe("PostgreSQL native transcript repository", () => {
       values: [projectId, 41, 51],
     }), expect.any(Object));
     expect(JSON.stringify(db.query.mock.calls)).not.toContain("unsafe-session");
+  });
+
+  it("resolves unambiguous source locators in bounded batched statements", async () => {
+    const ambiguousSession = (nativeSessionId: string): boolean =>
+      Number(nativeSessionId.slice("session-".length)) % 3 === 0;
+    const sessionIds = Array.from(
+      { length: NATIVE_SOURCE_LOCATOR_BATCH_SIZE + 2 },
+      (_value, index) => "session-" + index,
+    );
+    const db = executor((config) => {
+      const values = config.values as [string, string[]];
+      return result(values[1].map((nativeSessionId) => ({
+        native_session_id: nativeSessionId,
+        source_locator: "sessions/" + nativeSessionId + ".jsonl",
+        // Every third session carries two distinct locators and is ambiguous.
+        locator_count: ambiguousSession(nativeSessionId) ? "2" : "1",
+      })));
+    });
+    const repository = new PostgreSqlNativeTranscriptRepository(db, projectId);
+
+    const locators = await repository.listUnambiguousSourceLocators({
+      nativeSessionIds: [...sessionIds, sessionIds[0]!],
+    });
+
+    const statements = db.query.mock.calls
+      .map(([config]) => config as QueryConfig<unknown[]>)
+      .filter(({ text }) => text.includes("COUNT(DISTINCT transcript.source_locator)"));
+    expect(statements).toHaveLength(2);
+    expect((statements[0]!.values as [string, string[]])[1])
+      .toHaveLength(NATIVE_SOURCE_LOCATOR_BATCH_SIZE);
+    expect((statements[1]!.values as [string, string[]])[1]).toHaveLength(2);
+    for (const statement of statements) {
+      expect(statement.values![0]).toBe(projectId);
+      expect(statement.text).toContain("unnest($2::text[])");
+      expect(statement.text).toContain(
+        "transcript.native_session_id_sha256 =",
+      );
+      expect(statement.text).toContain("GROUP BY transcript.native_session_id");
+    }
+    const expected = new Map(sessionIds
+      .filter(nativeSessionId => !ambiguousSession(nativeSessionId))
+      .map(nativeSessionId => [
+        nativeSessionId,
+        "sessions/" + nativeSessionId + ".jsonl",
+      ]));
+    expect(new Map(locators)).toEqual(expected);
+  });
+
+  it("reads no source-locator statement for an empty session request", async () => {
+    const db = executor(successfulQuery);
+    const repository = new PostgreSqlNativeTranscriptRepository(db, projectId);
+
+    await expect(repository.listUnambiguousSourceLocators({ nativeSessionIds: [] }))
+      .resolves.toEqual(new Map());
+    expect(db.query).not.toHaveBeenCalled();
+  });
+
+  it("refuses malformed source-locator session requests before executor access", async () => {
+    const db = executor(successfulQuery);
+    const repository = new PostgreSqlNativeTranscriptRepository(db, projectId);
+
+    await expect(repository.listUnambiguousSourceLocators({
+      nativeSessionIds: "session-a" as unknown as readonly string[],
+    })).rejects.toBeInstanceOf(TypeError);
+    await expect(repository.listUnambiguousSourceLocators({
+      nativeSessionIds: [" "],
+    })).rejects.toBeInstanceOf(PostgreSqlNativeTranscriptDataError);
+    expect(db.query).not.toHaveBeenCalled();
+  });
+
+  it("keeps a stored whitespace source locator that ingest admits", async () => {
+    // transcriptFromRow accepts this locator, so the batched read must not be
+    // stricter than the row read or a legally stored locator disappears.
+    const db = executor(() => result([{
+      native_session_id: "session-a",
+      source_locator: " ",
+      locator_count: "1",
+    }]));
+    const repository = new PostgreSqlNativeTranscriptRepository(db, projectId);
+
+    await expect(repository.listUnambiguousSourceLocators({
+      nativeSessionIds: ["session-a"],
+    })).resolves.toEqual(new Map([["session-a", " "]]));
+  });
+
+  it("refuses malformed source-locator rows returned by the backend", async () => {
+    const db = executor(() => result([{
+      native_session_id: "session-a",
+      source_locator: "",
+      locator_count: "1",
+    }]));
+    const repository = new PostgreSqlNativeTranscriptRepository(db, projectId);
+
+    await expect(repository.listUnambiguousSourceLocators({
+      nativeSessionIds: ["session-a"],
+    })).rejects.toBeInstanceOf(PostgreSqlNativeTranscriptDataError);
   });
 
   it("aggregates message links set-wise across every transcript read", async () => {
