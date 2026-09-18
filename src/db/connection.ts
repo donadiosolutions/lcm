@@ -4,6 +4,7 @@ import {
   chmodSync,
   closeSync,
   constants,
+  fchmodSync,
   fstatSync,
   fsyncSync,
   lstatSync,
@@ -398,18 +399,6 @@ function openLcmConnection(
       _connections.delete(dbPath);
     }
 
-    // SQLite's URI mode=rw opens an existing database read/write but atomically
-    // refuses to create it if another process removes it after the lstat above.
-    const location = createIfMissing
-      ? dbPath
-      : (() => {
-        // URL parsing removes dot segments lexically. Resolve the admitted,
-        // existing leaf through the filesystem first so an interior symlink
-        // followed by `..` keeps the same kernel path semantics as admission.
-        const url = pathToFileURL(realpathSync.native(dbPath));
-        url.searchParams.set("mode", "rw");
-        return url;
-      })();
     // Retain the admitted leaf and directory across the open. Substituting the
     // leaf requires renaming entries in this directory, which the kernel records
     // on the directory and on the moved inode, so a substitution that is
@@ -420,6 +409,23 @@ function openLcmConnection(
     const admittedIdentity = admitDatabaseLeafIdentity(dbPath, expectedIdentity);
     retainedLeaf = retainAuthenticatedLeaf(dbPath, admittedIdentity);
     const parentBeforeOpen = parent.witness();
+    // SQLite's URI mode=rw opens an existing database read/write but atomically
+    // refuses to create it if another process removes it after the lstat above.
+    // Resolving the pathname is itself part of the open: a symlink that exists
+    // only across the resolution sends the constructor to another file while
+    // every pathname recheck afterwards still describes the authentic leaf.
+    // The resolution therefore happens after the leaf and directory evidence
+    // is in hand, so planting and removing that symlink lands in the window.
+    const location = createIfMissing
+      ? dbPath
+      : (() => {
+        // URL parsing removes dot segments lexically. Resolve the admitted,
+        // existing leaf through the filesystem first so an interior symlink
+        // followed by `..` keeps the same kernel path semantics as admission.
+        const url = pathToFileURL(realpathSync.native(dbPath));
+        url.searchParams.set("mode", "rw");
+        return url;
+      })();
     parent.assertCurrent();
     db = new DatabaseSync(location);
     parent.assertCurrent();
@@ -434,7 +440,11 @@ function openLcmConnection(
       || !sameFileWitness(retainedLeaf.witness, fileWitness(retainedLeaf.fd))) {
       throw new Error(DATABASE_HANDLE_BINDING_ERROR);
     }
-    chmodSync(dbPath, PRIVATE_FILE_MODE);
+    // Tighten the mode through the retained descriptor. The pathname is the
+    // one thing an attacker can still redirect inside this window, and the
+    // descriptor is the inode the handle was just proven to be bound to, so
+    // the permission change cannot land on anything else.
+    fchmodSync(retainedLeaf.fd, PRIVATE_FILE_MODE);
     // Enable WAL mode for better concurrent read performance
     parent.assertCurrent();
     db.exec("PRAGMA journal_mode = WAL");
@@ -450,6 +460,12 @@ function openLcmConnection(
     if (!sameDatabaseFileIdentity(openedIdentity, fileIdentity)) {
       throw new Error("database path changed while opening");
     }
+    // Close the retained leaf before pooling. A close failure is then an open
+    // failure like any other, handled by the catch below, instead of a throw
+    // that replaces the return and strands a pooled reference no caller holds.
+    const retained = retainedLeaf;
+    retainedLeaf = null;
+    closeSync(retained.fd);
     releaseParent();
     _connections.set(dbPath, {
       db,
@@ -479,14 +495,8 @@ function openLcmConnection(
     if (retainedLeaf !== null) {
       try {
         closeSync(retainedLeaf.fd);
-      } catch (closeError) {
-        if (primaryError === undefined) {
-          // The open already pooled this handle, and the caller will never
-          // receive it, so evict and close it rather than leaking a reference
-          // that no later caller can balance.
-          if (db !== undefined) invalidateLcmConnection(dbPath, db);
-          throw closeError;
-        }
+      } catch {
+        // The open is already failing; keep that error rather than this one.
       }
     }
     if (!parentClosed) {

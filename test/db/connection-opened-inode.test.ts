@@ -9,6 +9,7 @@ import {
   renameSync,
   rmSync,
   statSync,
+  symlinkSync,
   unlinkSync,
   writeFileSync,
 } from "node:fs";
@@ -21,6 +22,7 @@ const fsState = vi.hoisted(() => ({
   targetLstats: 0,
   actionsByLstat: new Map<number, () => void>(),
   beforeLeafResolve: undefined as (() => void) | undefined,
+  afterLeafResolve: undefined as (() => void) | undefined,
 }));
 
 const sqliteState = vi.hoisted(() => ({
@@ -83,7 +85,13 @@ vi.mock("node:fs", async (importOriginal) => {
             fsState.beforeLeafResolve = undefined;
             action?.();
           }
-          return actual.realpathSync.native(...args);
+          const resolved = actual.realpathSync.native(...args);
+          if (String(args[0]) === fsState.targetPath) {
+            const action = fsState.afterLeafResolve;
+            fsState.afterLeafResolve = undefined;
+            action?.();
+          }
+          return resolved;
         },
       },
     ),
@@ -189,6 +197,7 @@ function createSubstitutionFixture(substituteJournalMode = "WAL"): SubstitutionF
     // Disarm the hooks first: assertions open databases too, and a stale hook
     // would replay the attack against the assertion's own handle.
     fsState.beforeLeafResolve = undefined;
+    fsState.afterLeafResolve = undefined;
     fsState.actionsByLstat.clear();
     sqliteState.beforeOpen = undefined;
     sqliteState.afterOpen = undefined;
@@ -210,6 +219,7 @@ afterEach(() => {
   fsState.targetLstats = 0;
   fsState.actionsByLstat.clear();
   fsState.beforeLeafResolve = undefined;
+  fsState.afterLeafResolve = undefined;
   sqliteState.beforeOpen = undefined;
   sqliteState.afterOpen = undefined;
   fdState.leafDescriptor = undefined;
@@ -239,6 +249,29 @@ describe("existing-only opened-inode authentication", () => {
     const fixture = createSubstitutionFixture();
     fsState.beforeLeafResolve = fixture.swap;
     sqliteState.afterOpen = fixture.restore;
+
+    expect(() => getExistingLcmConnection(fixture.dbPath)).toThrow(BINDING_ERROR);
+
+    expect(isLcmConnectionOpen(fixture.dbPath)).toBe(false);
+    fixture.settle();
+    expectMarker(fixture.dbPath, "authentic");
+  });
+
+  it("refuses a leaf resolved through a symlink planted during resolution", () => {
+    const fixture = createSubstitutionFixture();
+    // The existing-only open resolves the pathname before handing it to
+    // SQLite. A symlink that exists only across that resolution sends the
+    // constructor to another file while every later pathname check, the
+    // retained leaf and the parent directory all still describe the authentic
+    // database, so the resolution has to happen inside the evidence window.
+    fsState.beforeLeafResolve = () => {
+      renameSync(fixture.dbPath, fixture.stashPath);
+      symlinkSync(fixture.substitutePath, fixture.dbPath);
+    };
+    fsState.afterLeafResolve = () => {
+      unlinkSync(fixture.dbPath);
+      renameSync(fixture.stashPath, fixture.dbPath);
+    };
 
     expect(() => getExistingLcmConnection(fixture.dbPath)).toThrow(BINDING_ERROR);
 
