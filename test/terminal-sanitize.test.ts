@@ -99,6 +99,53 @@ describe("boundedTerminalText", () => {
     expect(boundedTerminalText(String.fromCodePoint(0xa4d0), 1)).toBe(String.fromCodePoint(0xa4d0));
   });
 
+  it.each([
+    ["CJK Extension B start", 0x20000],
+    ["CJK Compatibility Supplement", 0x2f800],
+    ["plane 2 top", 0x2fffd],
+    ["CJK Extension G start", 0x30000],
+    ["plane 3 top", 0x3fffd],
+  ])("counts supplementary CJK %s as two terminal columns", (_name, code) => {
+    const wide = String.fromCodePoint(code);
+
+    expect(boundedTerminalText(wide, 2)).toBe(wide);
+    expect(boundedTerminalText(wide, 1)).toBe("…");
+  });
+
+  it.each([
+    ["below plane 2 wide range", 0x1fffd],
+    ["between plane 2 and plane 3", 0x2fffe],
+    ["above plane 3 wide range", 0x3fffe],
+  ])("treats supplementary %s as narrow", (_name, code) => {
+    const narrow = String.fromCodePoint(code);
+
+    expect(boundedTerminalText(narrow, 1)).toBe(narrow);
+    expect(boundedTerminalText(`${narrow}${narrow}`, 1)).toBe("…");
+  });
+
+  it("truncates a supplementary CJK ideograph that crosses the budget", () => {
+    const wide = String.fromCodePoint(0x20000);
+
+    expect(boundedTerminalText(`${wide}a`, 2)).toBe("…");
+    expect(boundedTerminalText(`${wide}a`, 3)).toBe(`${wide}a`);
+    expect(boundedTerminalText(`a${wide}`, 2)).toBe("a…");
+  });
+
+  it("measures supplementary CJK with combining marks and the ellipsis", () => {
+    const wide = String.fromCodePoint(0x20000);
+
+    expect(boundedTerminalText(`${wide}\u0301`, 2)).toBe(`${wide}\u0301`);
+    expect(boundedTerminalText(`${wide}\u0301b`, 2)).toBe("…");
+    expect(boundedTerminalText(`${wide}${wide}`, 4)).toBe(`${wide}${wide}`);
+    expect(boundedTerminalText(`${wide}${wide}`, 3)).toBe(`${wide}…`);
+  });
+
+  it("sanitizes before measuring supplementary CJK width", () => {
+    const wide = String.fromCodePoint(0x20000);
+
+    expect(boundedTerminalText(`\u001b[31m${wide}\u001b[0m`, 2)).toBe(wide);
+  });
+
   it.each([0, -1, 1.5, Number.NaN, Number.MAX_SAFE_INTEGER + 1])(
     "rejects invalid maxWidth %s",
     (maxWidth) => {
