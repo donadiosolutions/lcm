@@ -114,6 +114,14 @@ This serialization is a PostgreSQL behavior. The SQLite backend runs its root
 transactions on a single connection, which already orders one import's
 decision after another's.
 
+Two PostgreSQL imports that each carry several matching entries can instead
+fail rather than wait. Each import holds its decisions until it commits, so
+two imports that reach the same entries in opposite orders can each end up
+waiting on the other. PostgreSQL detects that and fails one of the two
+imports instead of leaving either waiting indefinitely. The failed import
+stores none of its entries, so nothing is partially applied, and rerunning
+it completes normally once the other import has finished.
+
 Successful commands exit zero. Operational failures, including failed projects
 in `export --all`, exit one. JSON output contains the requested payload; progress
 and warnings go to stderr. A failed export does not emit a partial JSON document
