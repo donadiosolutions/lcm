@@ -4292,6 +4292,56 @@ describe("sanitizeError", () => {
     expect(sanitizeError(sanitizeError(first))).toBe(first);
   });
 
+  it.each([
+    [
+      "pipe handoff in the second sibling group",
+      "file://h?x=[file://a?key=/pub&\\Users\\S1\\x]&[file://b?key2=/pub2|\\Users\\S2\\y]",
+      "file://h?x=[file://a?key=<path>&<path>]&[file://b?key2=<path>|<path>]",
+    ],
+    [
+      "ampersand handoff in the second sibling group",
+      "file://h?x=[file://a?key=/pub&\\Users\\S1\\x]&[file://b?key2=/pub2&\\Users\\S2\\y]",
+      "file://h?x=[file://a?key=<path>&<path>]&[file://b?key2=<path>&<path>]",
+    ],
+    [
+      "first group without a private tail",
+      "file://h?x=[file://a?key=/pub]&[file://b?key2=/pub2|\\Users\\S2\\y]",
+      "file://h?x=[file://a?key=<path>]&[file://b?key2=<path>|<path>]",
+    ],
+    [
+      "second group with a nested public URL",
+      "file://h?x=[file://a?key=/pub&\\Users\\S1\\x]&[https://e.test/t|\\Users\\S2\\y]",
+      "file://h?x=[file://a?key=<path>&<path>]&[https://e.test/t|<path>]",
+    ],
+  ] as const)("owns a sibling wrapper after a closed group (Bug #1346 shape 1): %s", (_name, input, expected) => {
+    const first = sanitizeError(input);
+
+    expect(first).toBe(expected);
+    expect(first).not.toContain("S2");
+    expect(sanitizeError(first)).toBe(first);
+    expect(sanitizeError(sanitizeError(first))).toBe(first);
+  });
+
+  it("keeps a sibling wrapper relative value intact after a closed group", () => {
+    const input = "file://h?x=[file://a?key=/pub&\\Users\\S1\\x]&[relative/path]";
+    const expected = "file://h?x=[file://a?key=<path>&<path>]&[relative/path]";
+    const first = sanitizeError(input);
+
+    expect(first).toBe(expected);
+    expect(sanitizeError(first)).toBe(first);
+    expect(sanitizeError(sanitizeError(first))).toBe(first);
+  });
+
+  it("ends sibling wrapper scope at whitespace", () => {
+    const input = "file://h?x=[file://a?key=/pub&\\Users\\S1\\x] &[file://b?key2=/pub2|\\Users\\S2\\y]";
+    const expected = "file://h?x=[file://a?key=<path>&<path>] &[file://b?key2=<path>|\\Users\\S2\\y]";
+    const first = sanitizeError(input);
+
+    expect(first).toBe(expected);
+    expect(sanitizeError(first)).toBe(first);
+    expect(sanitizeError(sanitizeError(first))).toBe(first);
+  });
+
   it("replaces SQLite constraint details with generic message", () => {
     const result = sanitizeError("SQLITE_CONSTRAINT: UNIQUE constraint failed: messages.conversation_id");
     expect(result).not.toContain("messages.conversation_id");

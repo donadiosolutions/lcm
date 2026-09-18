@@ -107,6 +107,7 @@ function findUrlPathStarts(chars: readonly string[]): UrlPathStarts {
   const nestedFileUrlParentOwnerBracketDepths = new Set<number>();
   const restartedNestedFileUrlParentOwnerBracketDepths = new Set<number>();
   const suspendedPathlessFileQueryOwnerDepths = new Set<number>();
+  let pathlessFileQueryScopeActive = false;
   let schemeLength = 0;
   let fileSchemeLength = 0;
   let schemeQuote = 0;
@@ -158,6 +159,7 @@ function findUrlPathStarts(chars: readonly string[]): UrlPathStarts {
       nestedFileUrlParentOwnerBracketDepths.clear();
       restartedNestedFileUrlParentOwnerBracketDepths.clear();
       suspendedPathlessFileQueryOwnerDepths.clear();
+      pathlessFileQueryScopeActive = false;
       activeNestedFileUrlParentOwnerBracketDepth = 0;
       queryOrFragment = false;
       nestedPublicUrlBracketDepth = 0;
@@ -182,7 +184,10 @@ function findUrlPathStarts(chars: readonly string[]): UrlPathStarts {
     } else if (pathlessFileQueryOwnerBracketDepth > 0 && char === "]") {
       suspendedPathlessFileQueryOwnerDepths.delete(pathlessFileQueryOwnerBracketDepth);
       pathlessFileQueryOwnerBracketDepth -= 1;
-    } else if (restartedPathlessFile && char === "[") {
+      // A private tail or a closed sibling group ends the restarted scanner
+      // but not the enclosing file query, so a later sibling wrapper still
+      // belongs to that query and must own its own bracket depth.
+    } else if ((restartedPathlessFile || pathlessFileQueryScopeActive) && char === "[") {
       pathlessFileQueryOwnerBracketDepth = 1;
     }
     if (
@@ -500,6 +505,7 @@ function findUrlPathStarts(chars: readonly string[]): UrlPathStarts {
       quotedPathEnded = false;
       quotedPathEndedSeparator = -1;
       restartedPathlessBrackets = 0;
+      pathlessFileQueryScopeActive = true;
       pipePathHandoffWrapperDepths.clear();
       repeatedPipeHandoffWrapperDepths.clear();
       activeNestedFileUrlParentOwnerBracketDepth = 0;
