@@ -316,53 +316,77 @@ export const SEQUENCE_BACKED_IDENTITY_COLUMN: Readonly<Partial<Record<PortableDo
  */
 
 /**
- * Reads the sequence's own stored, on-disk state -- never
- * pg_sequence_last_value(), which is scoped to the calling session and
- * reports NULL until that same session has called nextval() itself (S1: a
- * fresh read-only snapshot session never has, so that formula always read
- * NULL here and every non-empty sequence-backed domain would mismatch,
- * even a perfectly healthy one). SELECT last_value, is_called directly
- * from the sequence relation reads the persisted state regardless of what
- * this session has done, exactly like psql's \d on a sequence. The
- * sequence name is resolved server-side via pg_get_serial_sequence and is
- * never caller input, so splicing it into the second query's FROM clause
- * (PostgreSQL forbids parameterising a relation name) admits nothing an
- * attacker controls.
+ * Reads the sequence's own stored, on-disk state through
+ * pg_catalog.pg_sequences -- never pg_sequence_last_value(). An earlier
+ * round characterised that function as session-local; the documented
+ * failure mode for it and for pg_sequences.last_value is actually
+ * privilege and never-called state, not which session is asking. Two
+ * distinct NULL-producing cases exist and this function tells them apart
+ * instead of collapsing them: a role lacking USAGE/SELECT on the
+ * sequence, and a sequence genuinely never advanced (is_called = false).
+ * Collapsing them would let a privilege gap present as "never called",
+ * which reads as sound for an empty domain -- an unattributed NULL is
+ * not evidence.
+ *
+ * pg_sequences.last_value is read rather than a bare
+ * "SELECT last_value, is_called FROM <sequence>", because that direct
+ * read needs actual SELECT on the sequence, while pg_sequences gates
+ * last_value on has_sequence_privilege(oid, 'SELECT') OR (..., 'USAGE'),
+ * so the least-privilege runtime role -- granted USAGE but never SELECT
+ * on every identity sequence -- reads a real value through the view
+ * where the direct read would fail on a permission error instead. The
+ * privilege is still checked explicitly up front, so a role with
+ * neither USAGE nor SELECT is refused for its own reason rather than
+ * silently read as "never called". start_value is read alongside
+ * last_value: when is_called is false the *next* nextval() call returns
+ * start_value itself, not last_value plus the increment, and
+ * pg_sequences exposes start_value directly so no second catalog join
+ * is needed for it. The sequence name is resolved server-side via
+ * pg_get_serial_sequence and is never caller input, so casting it to
+ * regclass (PostgreSQL forbids parameterising a relation name) admits
+ * nothing an attacker controls.
  */
-async function readSequenceStoredState(
+export type MigrationSequenceStoredState =
+  | Readonly<{ kind: "no-sequence" }>
+  | Readonly<{ kind: "privilege-denied" }>
+  | Readonly<{ kind: "never-called"; startValue: bigint }>
+  | Readonly<{ kind: "called"; lastValue: bigint; incrementBy: bigint }>;
+
+export async function readSequenceStoredState(
   session: PostgreSqlSnapshotSession, table: string, column: string, signal?: AbortSignal,
-): Promise<{ lastValue: bigint; isCalled: boolean; incrementBy: bigint } | null> {
+): Promise<MigrationSequenceStoredState> {
   const nameResult = await session.query<{ seq_name: string | null }>({
     text: "SELECT pg_catalog.pg_get_serial_sequence($1, $2) AS seq_name",
     values: [table, column],
   }, { domain: "factory", operation: "verifyGenerationSequenceName", signal });
   const seqName = nameResult.rows[0]?.seq_name ?? null;
-  if (seqName === null) return null;
-  // pg_catalog.pg_sequences (the view, not pg_sequence the catalog table)
-  // is deliberately used for last_value/is_called: its definition gates
-  // last_value on has_sequence_privilege(oid, 'SELECT') OR (..., 'USAGE'),
-  // so the least-privilege runtime role -- granted USAGE on every
-  // identity sequence but never SELECT -- still reads a real value here,
-  // unlike a direct "SELECT last_value FROM <sequence>", which requires
-  // SELECT specifically and would silently reintroduce the same fail-
-  // closed defect this replaces. increment_by is ordinary catalog
-  // metadata (pg_sequence), publicly readable regardless of sequence-
-  // level ACLs, joined by oid via ::regclass rather than by name-string
-  // matching so a quoting-sensitive identifier cannot desync the join.
-  const result = await session.query<{ last_value: string | null; is_called: boolean | null; increment_by: string }>({
-    text: "SELECT ps.last_value::text AS last_value, ps.is_called, pc.increment_by::text AS increment_by "
+  if (seqName === null) return { kind: "no-sequence" };
+  // has_sequence_privilege is an introspection function callable
+  // regardless of ACL on the target: it reports what the role could do,
+  // never requires SELECT to run. A comma-separated privilege list
+  // returns true if either is held, matching the two readable paths
+  // above (the direct read needs SELECT, the view accepts either).
+  const privilegeResult = await session.query<{ has_privilege: boolean | null }>({
+    text: "SELECT pg_catalog.has_sequence_privilege($1::regclass, 'SELECT,USAGE') AS has_privilege",
+    values: [seqName],
+  }, { domain: "factory", operation: "verifyGenerationSequencePrivilege", signal });
+  if (privilegeResult.rows[0]?.has_privilege !== true) return { kind: "privilege-denied" };
+  const result = await session.query<{ last_value: string | null; start_value: string; increment_by: string }>({
+    text: "SELECT ps.last_value::text AS last_value, ps.start_value::text AS start_value, "
+      + "ps.increment_by::text AS increment_by "
       + "FROM pg_catalog.pg_sequences ps "
       + "JOIN pg_catalog.pg_namespace n ON n.nspname OPERATOR(pg_catalog.=) ps.schemaname "
       + "JOIN pg_catalog.pg_class c ON c.relnamespace OPERATOR(pg_catalog.=) n.oid "
       + "AND c.relname OPERATOR(pg_catalog.=) ps.sequencename "
-      + "JOIN pg_catalog.pg_sequence pc ON pc.seqrelid OPERATOR(pg_catalog.=) c.oid "
       + "WHERE c.oid OPERATOR(pg_catalog.=) $1::regclass",
     values: [seqName],
   }, { domain: "factory", operation: "verifyGenerationSequenceLastValue", signal });
   const row = result.rows[0];
-  if (row === undefined || row.last_value === null || row.is_called === null) return null;
-  return { lastValue: BigInt(row.last_value), isCalled: row.is_called, incrementBy: BigInt(row.increment_by) };
+  if (row === undefined) return { kind: "no-sequence" };
+  if (row.last_value === null) return { kind: "never-called", startValue: BigInt(row.start_value) };
+  return { kind: "called", lastValue: BigInt(row.last_value), incrementBy: BigInt(row.increment_by) };
 }
+
 export async function readSequenceSelfConsistencyMismatches(
   session: PostgreSqlSnapshotSession, projectId: string, signal?: AbortSignal,
 ): Promise<MigrationVerificationMismatch[]> {
@@ -373,15 +397,30 @@ export async function readSequenceSelfConsistencyMismatches(
       values: [projectId],
     }, { domain: "factory", operation: "verifyGenerationSequenceSelfConsistencyMax", projectId, signal });
     const maxValue = maxResult.rows[0]?.max_value ?? null;
-    if (maxValue === null) continue; // domain is empty for this project: nothing to bound.
+    // Empty domain: nothing exists to collide with, so the bound holds
+    // vacuously regardless of sequence state or privilege. Reading the
+    // sequence is only meaningful once there is a row to protect.
+    if (maxValue === null) continue;
     const state = await readSequenceStoredState(session, target.table, target.column, signal);
+    if (state.kind === "privilege-denied") {
+      // A privilege gap is a refusal in its own right, never evidence
+      // about sequence state: collapsing it into "never called" would
+      // let an environment misconfiguration read as healthy whenever the
+      // domain happens to be non-empty in the wrong way.
+      mismatches.push({
+        domain: domain as PortableDomain, class: "sequence",
+        identitySha256: migrationWitnessSha256(["sequence-self-consistency-privilege-denied-v1", domain]),
+      });
+      continue;
+    }
     // is_called=false means nextval() has never run: the *next* call
-    // returns last_value itself (the start value), not last_value plus
-    // the increment. Getting this boundary backwards is exactly the S1
-    // defect this replaces: a never-called sequence whose start value
-    // collides with an already-copied row must still be caught.
-    const nextAllocatedValue = state === null ? null
-      : state.isCalled ? state.lastValue + state.incrementBy : state.lastValue;
+    // returns start_value itself, not last_value plus the increment.
+    // Getting this boundary backwards is exactly the S1 defect this
+    // replaces: a never-called sequence whose start value collides with
+    // an already-copied row must still be caught.
+    const nextAllocatedValue = state.kind === "no-sequence" ? null
+      : state.kind === "never-called" ? state.startValue
+      : state.lastValue + state.incrementBy;
     if (nextAllocatedValue === null || nextAllocatedValue <= BigInt(maxValue)) {
       mismatches.push({
         domain: domain as PortableDomain, class: "sequence",

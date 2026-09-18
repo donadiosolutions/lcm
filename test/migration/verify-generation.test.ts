@@ -112,6 +112,7 @@ function fakeSession(overrides: {
   xid?: string | null;
   sequenceState?: Partial<Record<string, {
     maxValue: string | null; lastValue: string | null; isCalled?: boolean; incrementBy?: string;
+    startValue?: string; privilegeDenied?: boolean;
   }>>;
 } = {}) {
   const sequenceState = overrides.sequenceState ?? {};
@@ -130,12 +131,22 @@ function fakeSession(overrides: {
         const domain = Object.entries(SEQUENCE_BACKED_TABLES).find(([, value]) => value === table)?.[0];
         return { rows: [{ seq_name: domain ? seqNameFor(domain) : null }] };
       }
+      if (config.text.includes("has_sequence_privilege")) {
+        const seqName = config.values?.[0] as string | undefined;
+        const domain = Object.keys(SEQUENCE_BACKED_TABLES).find((candidate) => seqNameFor(candidate) === seqName);
+        const state = domain ? sequenceState[domain] : undefined;
+        return { rows: [{ has_privilege: state?.privilegeDenied === true ? false : true }] };
+      }
       if (config.text.includes("pg_catalog.pg_sequences")) {
         const seqName = config.values?.[0] as string | undefined;
         const domain = Object.keys(SEQUENCE_BACKED_TABLES).find((candidate) => seqNameFor(candidate) === seqName);
         const state = domain ? sequenceState[domain] : undefined;
         if (state === undefined || state.lastValue === null) return { rows: [] };
-        return { rows: [{ last_value: state.lastValue, is_called: state.isCalled ?? true, increment_by: state.incrementBy ?? "1" }] };
+        return { rows: [{
+          last_value: state.isCalled === false ? null : state.lastValue,
+          start_value: state.startValue ?? state.lastValue,
+          increment_by: state.incrementBy ?? "1",
+        }] };
       }
       return { rows: [{ admitted: true }] };
     }),
@@ -656,6 +667,30 @@ describe("readSequenceSelfConsistencyMismatches", () => {
     const mismatches = await readSequenceSelfConsistencyMismatches(session as never, projectId);
     expect(mismatches.length).toBeGreaterThan(0);
     expect(mismatches.every((mismatch) => mismatch.class === "sequence")).toBe(true);
+  });
+  it("refuses with a privilege-denied marker, never the generic violation marker, when the querying role lacks USAGE/SELECT on a non-empty domain's sequence", async () => {
+    // A privilege gap and a genuinely never-called sequence both surface
+    // as NULL from pg_sequences.last_value, and collapsing them would let
+    // a misconfigured role read as a healthy "never called, start value
+    // ahead" sequence. has_sequence_privilege must be consulted first so
+    // this refuses for its own distinct, attributable reason.
+    const session = fakeSession({ sequenceState: {
+      conversations: { maxValue: "5", lastValue: "5", privilegeDenied: true },
+    } });
+    const mismatches = await readSequenceSelfConsistencyMismatches(session as never, projectId);
+    expect(mismatches).toEqual([{
+      domain: "conversations", class: "sequence",
+      identitySha256: expect.any(String),
+    }]);
+    expect(mismatches[0]?.identitySha256).not.toBe(
+      // The generic violation marker this must not be confused with.
+      await import("../../src/migration/activation-witness.js")
+        .then((module) => module.migrationWitnessSha256(["sequence-self-consistency-violation-v1", "conversations"])),
+    );
+    expect(mismatches[0]?.identitySha256).toBe(
+      await import("../../src/migration/activation-witness.js")
+        .then((module) => module.migrationWitnessSha256(["sequence-self-consistency-privilege-denied-v1", "conversations"])),
+    );
   });
 });
 
