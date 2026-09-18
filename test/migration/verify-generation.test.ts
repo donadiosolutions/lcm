@@ -1,4 +1,5 @@
 import { createHash } from "node:crypto";
+import { rmSync } from "node:fs";
 import { fileURLToPath } from "node:url";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { migrationWitnessSha256 } from "../../src/migration/activation-witness.js";
@@ -20,6 +21,7 @@ import {
 import {
   MigrationVerificationDriverError,
   assertPermanentReadOnlyGuard,
+  inspectMigrationVerification,
   readFencedDestinationCensus,
   readLedgerMismatches,
   readRelationDanglingReferenceMismatches,
@@ -34,6 +36,7 @@ import {
   type VerifyMigrationGenerationDependencies,
   type VerifyMigrationGenerationInput,
 } from "../../src/migration/verify-generation.js";
+import { MigrationVerificationReportStore } from "../../src/migration/verification-store.js";
 
 const HASH_A = "a".repeat(64);
 const FAKE_MIGRATIONS = [{ id: "0001", filename: "0001.sql", sql: "", sha256: HASH_A }];
@@ -1149,6 +1152,57 @@ describe("verifyMigrationGeneration", () => {
     const dependencies = dependenciesFor(copySource, runtime);
     await expect(verifyMigrationGeneration(baseInput({ homeDir: "/tmp/lcm-verify-conflicting-pending-effect" }), dependencies))
       .rejects.toMatchObject({ reason: "report-identity-conflict" });
+  }, 15000);
+});
+
+describe("inspectMigrationVerification", () => {
+  it("produces a report identical to what verifyMigrationGeneration would produce, and never touches the manifest or persists anything", async () => {
+    const manifest = stubDestinationPrimitives();
+    const beforeManifest = manifest.current;
+    const recordCounts = Object.fromEntries(PORTABLE_RECORD_DOMAIN_ORDER.map((domain, index) => [domain, index])) as Partial<Record<PortableDomain, number>>;
+    const homeDir = "/tmp/lcm-verify-inspect-parity";
+    // Self-contained regardless of any earlier run's leftover state: the
+    // "not yet persisted" assertion below is only meaningful against a
+    // clean store.
+    rmSync(homeDir, { recursive: true, force: true });
+    const inspected = await inspectMigrationVerification(
+      baseInput({ homeDir }), dependenciesFor(fakeCopySource({ recordCounts }), fakeRuntime()),
+    );
+    // Reference equality, not just deep equality: nothing in
+    // inspectMigrationVerification's call graph can reach
+    // MigrationManifestStore.update at all, so the fake's closure-held
+    // manifest object is never even reassigned, let alone changed.
+    expect(manifest.current).toBe(beforeManifest);
+    // No report artifact exists on disk under this report's identity.
+    const store = new MigrationVerificationReportStore({ homeDir });
+    expect(store.has("generation-1", inspected.reportSha256)).toBe(false);
+
+    // A publishing run against the identical, still-unpersisted fixture
+    // produces a byte-identical report: the report body carries no live
+    // timestamp of its own, so recomputation is deterministic.
+    const published = await verifyMigrationGeneration(
+      baseInput({ homeDir }), dependenciesFor(fakeCopySource({ recordCounts }), fakeRuntime()),
+    );
+    expect(published.report).toEqual(inspected);
+    expect(store.has("generation-1", inspected.reportSha256)).toBe(true);
+    expect(manifest.current.phase).toBe("verified");
+  }, 15000);
+
+  it("also returns the same report shape for an ineligible destination, without ever persisting it", async () => {
+    stubDestinationPrimitives({
+      domainCensus: (domain) => ({ domain, recordCount: 99, prefixSha256: fakeHash(`inspect-mismatch-${domain}`), terminalIdentitySha256: HASH_A }),
+    });
+    const recordCounts = Object.fromEntries(PORTABLE_RECORD_DOMAIN_ORDER.map((domain) => [domain, 1])) as Partial<Record<PortableDomain, number>>;
+    const homeDir = "/tmp/lcm-verify-inspect-ineligible";
+    rmSync(homeDir, { recursive: true, force: true });
+    const runtime = fakeRuntime({ session: fakeSession({ ledgerIdentityTotal: 99 * PORTABLE_RECORD_DOMAIN_ORDER.length }) });
+    const inspected = await inspectMigrationVerification(
+      baseInput({ homeDir }), dependenciesFor(fakeCopySource({ recordCounts }), runtime),
+    );
+    expect(inspected.activationEligible).toBe(false);
+    expect(inspected.mismatches.length).toBeGreaterThan(0);
+    const store = new MigrationVerificationReportStore({ homeDir });
+    expect(store.has("generation-1", inspected.reportSha256)).toBe(false);
   }, 15000);
 });
 

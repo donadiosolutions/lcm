@@ -15,6 +15,7 @@ import {
   MigrationVerificationReportStore,
   migrationVerificationReportFilename,
   verifyMigrationGeneration,
+  inspectMigrationVerification,
   migrationVerificationEffectId,
   MigrationVerificationDriverError,
 } from "../../src/migration/index.js";
@@ -39,6 +40,7 @@ describe("migration package surface", () => {
     expect(MigrationVerificationReportStore).toBeTypeOf("function");
     expect(migrationVerificationReportFilename).toBeTypeOf("function");
     expect(verifyMigrationGeneration).toBeTypeOf("function");
+    expect(inspectMigrationVerification).toBeTypeOf("function");
     expect(migrationVerificationEffectId).toBeTypeOf("function");
     expect(MigrationVerificationDriverError).toBeTypeOf("function");
   });

@@ -143,12 +143,14 @@ export type {
 // input/output/error contract are curated surface.
 //
 // plan-v4's scope also names a second, read-only "inspect" entry point
-// that never publishes. That entry point does not exist in this codebase
-// as of this commit -- only the one full driver below does. This is
-// recorded here rather than silently worked around so the gap is visible
-// at the export surface, not just in a report.
+// that never publishes -- inspectMigrationVerification, below. It shares
+// computeVerificationReport with the publishing driver but has no
+// reference anywhere in its own body to persistence or manifest-effect
+// mutation, so it cannot publish structurally, not merely by choosing
+// not to.
 export {
   MigrationVerificationDriverError,
+  inspectMigrationVerification,
   migrationVerificationEffectId,
   verifyMigrationGeneration,
 } from "./verify-generation.js";
