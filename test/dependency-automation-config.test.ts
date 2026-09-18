@@ -151,14 +151,34 @@ function matchingManagers(fileName: string): string[] {
   ];
 }
 
+// Renovate matches `includePaths` with minimatch. This helper implements only
+// the two pattern shapes the repository actually uses: a literal path, and a
+// literal directory followed by `/**`. Any other shape refuses loudly rather
+// than silently reporting no owner, because a quiet wrong answer here is the
+// exact failure this test was fixed to remove.
+const GLOB_METACHARACTERS = /[*?[\]{}()!+@|]/u;
+
 /** Whether `includePaths` admits `fileName` before any manager can claim it. */
-function includedByPaths(fileName: string): boolean {
-  const paths = renovate.includePaths;
+function includedByPaths(
+  fileName: string,
+  paths: unknown = renovate.includePaths,
+): boolean {
   if (!Array.isArray(paths)) return false;
-  return paths.some((pattern) =>
-    typeof pattern === "string"
-      && (pattern.endsWith("/**") ? fileName.startsWith(pattern.slice(0, -2)) : fileName === pattern),
-  );
+  return paths.some((pattern) => {
+    if (typeof pattern !== "string") {
+      throw new Error(`Expected a Renovate includePaths string, received ${String(pattern)}`);
+    }
+    const directoryPrefix = pattern.endsWith("/**") ? pattern.slice(0, -3) : undefined;
+    if (GLOB_METACHARACTERS.test(directoryPrefix ?? pattern)) {
+      throw new Error(
+        `Unmodelled Renovate includePaths pattern ${pattern}: this helper implements `
+          + "only a literal path or a literal directory followed by /**",
+      );
+    }
+    return directoryPrefix === undefined
+      ? fileName === pattern
+      : fileName.startsWith(`${directoryPrefix}/`);
+  });
 }
 
 /** Managers hosted Renovate effectively assigns, after `includePaths` filtering. */
@@ -296,6 +316,22 @@ describe("dependency automation configuration", () => {
     expect(matchingManagers(".github/workflows/ci.yml")).toEqual(["github-actions"]);
     expect(includedByPaths(".github/workflows/ci.yml")).toBe(false);
     expect(effectiveOwners(".github/workflows/ci.yml")).toEqual([]);
+  });
+
+  it("refuses an includePaths pattern shape it does not model", () => {
+    // A future entry such as scripts/*.mjs must break the build rather than
+    // quietly report no owner for a file hosted Renovate would include.
+    expect(() => includedByPaths("scripts/postgresql-images.mjs", ["scripts/*.mjs"]))
+      .toThrow(/Unmodelled Renovate includePaths pattern/u);
+    expect(() => includedByPaths(".github/actions/setup/action.yml", [".github/actions/*/**"]))
+      .toThrow(/Unmodelled Renovate includePaths pattern/u);
+    expect(() => includedByPaths(".github/actions/action.yml", [42]))
+      .toThrow(/Expected a Renovate includePaths string/u);
+    // The two shapes the repository does use stay supported.
+    expect(includedByPaths(".github/actions/setup-ci/action.yml", [".github/actions/**"])).toBe(true);
+    expect(includedByPaths("scripts/postgresql-images.mjs", ["scripts/postgresql-images.mjs"]))
+      .toBe(true);
+    expect(includedByPaths(".github/workflows/ci.yml", [".github/actions/**"])).toBe(false);
   });
 
   it("recognizes both fully pinned PostgreSQL harness images and rejects partial tuples", () => {
