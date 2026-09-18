@@ -14,10 +14,12 @@ import {
   MigrationVerificationDriverError,
   assertPermanentReadOnlyGuard,
   readFencedDestinationCensus,
+  readSequenceSelfConsistencyMismatches,
   reconcileCounts,
   sortMismatches,
   streamSourceCheckpoints,
   totalsFor,
+  truncateMismatchesPerClass,
   verifyMigrationGeneration,
   type VerifyMigrationGenerationDependencies,
   type VerifyMigrationGenerationInput,
@@ -50,12 +52,29 @@ function checkpoint(domain: PortableDomain, recordCount: number, prefixSha256: s
   } as PortableCheckpoint;
 }
 
-function fakeStream(recordCounts: Partial<Record<PortableDomain, number>> = {}) {
+function fakeConversationRecord(createdAt: string, identitySeed: string) {
+  return {
+    version: 1, domain: "conversations" as const, domainVersion: 1, ordinal: 0, order: [],
+    identitySha256: fakeHash(`identity-${identitySeed}`),
+    dependencies: [],
+    value: {
+      conversationFingerprint: fakeHash(`fingerprint-${identitySeed}`), occurrenceOrdinal: 0,
+      sessionId: identitySeed, createdAt, title: null, bootstrappedAt: null, updatedAt: createdAt,
+    },
+    recordSha256: fakeHash(`record-${identitySeed}`),
+  };
+}
+
+function fakeStream(
+  recordCounts: Partial<Record<PortableDomain, number>> = {},
+  conversationsRecords: ReadonlyArray<ReturnType<typeof fakeConversationRecord>> = [],
+) {
   return {
     readBatch: vi.fn(async ({ domain }: { domain: PortableDomain }) => {
+      const records = domain === "conversations" ? conversationsRecords : [];
       const recordCount = recordCounts[domain] ?? 0;
       return {
-        version: 1, manifestSha256: HASH_A, domain, records: [], framedBytes: 0, complete: true,
+        version: 1, manifestSha256: HASH_A, domain, records, framedBytes: 0, complete: true,
         priorCheckpointSha256: null, checkpoint: checkpoint(domain, recordCount, fakeHash(`prefix-${domain}-${recordCount}`)),
       };
     }),
@@ -64,8 +83,12 @@ function fakeStream(recordCounts: Partial<Record<PortableDomain, number>> = {}) 
   };
 }
 
-function fakeCopySource(overrides: { recordCounts?: Partial<Record<PortableDomain, number>>; reauthenticate?: () => Promise<void> } = {}) {
-  const stream = fakeStream(overrides.recordCounts);
+function fakeCopySource(overrides: {
+  recordCounts?: Partial<Record<PortableDomain, number>>;
+  conversationsRecords?: ReadonlyArray<ReturnType<typeof fakeConversationRecord>>;
+  reauthenticate?: () => Promise<void>;
+} = {}) {
+  const stream = fakeStream(overrides.recordCounts, overrides.conversationsRecords);
   return {
     homeDir: "/home", stream, snapshot: {}, sourceWitness: {
       version: 1, backend: "sqlite", identitySha256: HASH_A, schemaSha256: HASH_A, contentSha256: HASH_A, capturedAt: timestamp,
@@ -76,22 +99,50 @@ function fakeCopySource(overrides: { recordCounts?: Partial<Record<PortableDomai
   };
 }
 
-function fakeSession(overrides: { xid?: string | null } = {}) {
+const SEQUENCE_BACKED_TABLES: Record<string, string> = {
+  conversations: "lcm.conversations",
+  messages: "lcm.messages",
+  "recall-surfacings": "lcm.recall_surfacing",
+  "session-instructions": "lcm.session_instructions",
+  "passive-events": "lcm.passive_event_inbox",
+};
+
+function fakeSession(overrides: {
+  xid?: string | null;
+  sequenceState?: Partial<Record<string, { maxValue: string | null; lastValue: string | null }>>;
+} = {}) {
+  const sequenceState = overrides.sequenceState ?? {};
   return {
     identity: { sessionId: "window-session", backendPid: 999, projectId },
-    query: vi.fn(async (config: { text: string }) => {
+    query: vi.fn(async (config: { text: string; values?: readonly unknown[] }) => {
       if (config.text.includes("pg_current_xact_id_if_assigned")) return { rows: [{ xid: overrides.xid ?? null }] };
+      if (config.text.includes("MAX(")) {
+        const domain = Object.entries(SEQUENCE_BACKED_TABLES).find(([, table]) => config.text.includes(table))?.[0];
+        const state = domain ? sequenceState[domain] : undefined;
+        return { rows: [{ max_value: state?.maxValue ?? null }] };
+      }
+      if (config.text.includes("pg_sequence_last_value")) {
+        const table = config.values?.[0];
+        const domain = Object.entries(SEQUENCE_BACKED_TABLES).find(([, value]) => value === table)?.[0];
+        const state = domain ? sequenceState[domain] : undefined;
+        return { rows: [{ last_value: state?.lastValue ?? null }] };
+      }
       return { rows: [{ admitted: true }] };
     }),
     close: vi.fn(async () => { /* fake */ }),
   };
 }
 
-function fakeRuntime(overrides: { session?: ReturnType<typeof fakeSession> } = {}) {
+function fakeRuntime(overrides: {
+  session?: ReturnType<typeof fakeSession>;
+  conversationsRows?: ReadonlyArray<Record<string, unknown>>;
+} = {}) {
   const session = overrides.session ?? fakeSession();
   return {
     health: vi.fn(async () => ({ status: "healthy", backend: "postgresql", tls: true, serverMajorVersion: 18, serverEncoding: "UTF8" })),
-    query: vi.fn(async () => ({ rows: [{ system_identifier: "7123456789" }] })),
+    query: vi.fn(async (config: { text: string }) => (config.text.includes("lcm.conversations")
+      ? { rows: overrides.conversationsRows ?? [] }
+      : { rows: [{ system_identifier: "7123456789" }] })),
     transaction: vi.fn(async (callback: (executor: unknown) => Promise<unknown>) => callback({
       query: vi.fn(async () => ({ rows: [] })),
     })),
@@ -107,6 +158,7 @@ function baseInput(overrides: Partial<VerifyMigrationGenerationInput> = {}): Ver
     destinationSettings: { url: "postgresql://runtime:secret@localhost/dest", caFile: "/ca.pem", poolMax: 2, connectionTimeoutMs: 1000, idleTimeoutMs: 1000, statementTimeoutMs: 1000 },
     expectedOwner: "lcm_test_migrator", ownerProcessId: "worker-1", scratchParent: "/scratch", leaseTtlMs: 60000,
     manifestRevision: 3, manifestChecksumSha256: HASH_A, destinationMigrationsSha256: EXPECTED_MIGRATIONS_SHA256,
+    expectedDestinationIdentitySha256: HASH_A,
     projectMapWitnessSha256: HASH_A,
     queueClassificationWitness: { version: 1, queueCutoff: null, queueSetSha256: HASH_A, receiptSetSha256: HASH_A, epochChecksumSha256: HASH_A },
     sampleParameters: { version: 1, strideOrdinal: 97, sampleCount: 32, seedBasisSha256: HASH_A },
@@ -198,9 +250,69 @@ describe("sortMismatches", () => {
       }),
       verify: vi.fn(), close: vi.fn(),
     };
-    const checkpoints = await streamSourceCheckpoints(stream as never);
+    const { checkpoints } = await streamSourceCheckpoints(stream as never);
     expect(checkpoints.get("machines")?.recordCount).toBe(2);
     expect(stream.readBatch).toHaveBeenCalledTimes(PORTABLE_RECORD_DOMAIN_ORDER.length + 1);
+  });
+
+  it("streamSourceCheckpoints breaks a conversations createdAt tie by ascending identitySha256", async () => {
+    const tiedRecord = (identitySha256: string) => ({
+      ...fakeConversationRecord("2026-01-01T00:00:00.000000Z", identitySha256),
+      identitySha256,
+    });
+    const low = tiedRecord("a".repeat(64));
+    const high = tiedRecord("b".repeat(64));
+    // Deliberately supplied out of the expected final order, so a passing
+    // assertion proves the sort ran rather than merely preserved input order.
+    const stream = fakeStream({}, [high, low]);
+    const { conversationsPublicOrder } = await streamSourceCheckpoints(stream as never);
+    expect(conversationsPublicOrder).toEqual([
+      "2026-01-01T00:00:00.000Z", "2026-01-01T00:00:00.000Z",
+    ]);
+  });
+
+  it("streamSourceCheckpoints sorts conversations with distinct createdAt values that arrive out of order", async () => {
+    const first = fakeConversationRecord("2026-01-01T00:00:00.000000Z", "first");
+    const second = fakeConversationRecord("2026-01-02T00:00:00.000000Z", "second");
+    const third = fakeConversationRecord("2026-01-03T00:00:00.000000Z", "third");
+    // Reversed input forces the sort to actually reorder rather than confirm
+    // an already-ascending array, exercising the createdAt "<" branch too.
+    const stream = fakeStream({}, [third, second, first]);
+    const { conversationsPublicOrder } = await streamSourceCheckpoints(stream as never);
+    expect(conversationsPublicOrder).toEqual([
+      "2026-01-01T00:00:00.000Z", "2026-01-02T00:00:00.000Z", "2026-01-03T00:00:00.000Z",
+    ]);
+  });
+
+  it("streamSourceCheckpoints breaks a createdAt tie by descending identitySha256 comparison order too", async () => {
+    const tiedRecord = (identitySha256: string) => ({
+      ...fakeConversationRecord("2026-01-01T00:00:00.000000Z", identitySha256),
+      identitySha256,
+    });
+    const low = tiedRecord("a".repeat(64));
+    const high = tiedRecord("b".repeat(64));
+    // Already identity-ascending input: the comparator is invoked with the
+    // higher identity first, exercising the ">" branch instead of "<".
+    const stream = fakeStream({}, [low, high]);
+    const { conversationsPublicOrder } = await streamSourceCheckpoints(stream as never);
+    expect(conversationsPublicOrder).toEqual([
+      "2026-01-01T00:00:00.000Z", "2026-01-01T00:00:00.000Z",
+    ]);
+  });
+
+  it("streamSourceCheckpoints treats two records with fully identical tie-break keys as equal", async () => {
+    // Synthetic: real portable records never truly collide on identitySha256,
+    // but the comparator must still return a total order for equal keys
+    // (JS Array#sort requires a comparator, not merely a partial order).
+    const duplicate = () => ({
+      ...fakeConversationRecord("2026-01-01T00:00:00.000000Z", "same"),
+      identitySha256: "c".repeat(64),
+    });
+    const stream = fakeStream({}, [duplicate(), duplicate()]);
+    const { conversationsPublicOrder } = await streamSourceCheckpoints(stream as never);
+    expect(conversationsPublicOrder).toEqual([
+      "2026-01-01T00:00:00.000Z", "2026-01-01T00:00:00.000Z",
+    ]);
   });
 
   it("aggregates repeated (domain, class) mismatches into one total", async () => {
@@ -459,5 +571,156 @@ describe("verifyMigrationGeneration", () => {
         poolMax: 1, connectionTimeoutMs: 200, idleTimeoutMs: 200, statementTimeoutMs: 200,
       },
     }))).rejects.toThrow();
+  }, 15000);
+});
+
+describe("readSequenceSelfConsistencyMismatches", () => {
+  it("skips a domain whose sequence has never been called and the max identity is null (empty domain)", async () => {
+    const session = fakeSession();
+    const mismatches = await readSequenceSelfConsistencyMismatches(session as never, projectId);
+    expect(mismatches).toEqual([]);
+  });
+  it("flags a domain whose sequence last_value is null even though rows exist (never called despite copied data)", async () => {
+    const session = fakeSession({ sequenceState: { conversations: { maxValue: "500", lastValue: null } } });
+    const mismatches = await readSequenceSelfConsistencyMismatches(session as never, projectId);
+    expect(mismatches).toEqual([{ domain: "conversations", class: "sequence", identitySha256: expect.any(String) }]);
+  });
+  it("flags a domain whose sequence last_value is strictly below the copied maximum identity", async () => {
+    const session = fakeSession({ sequenceState: { messages: { maxValue: "1000", lastValue: "999" } } });
+    const mismatches = await readSequenceSelfConsistencyMismatches(session as never, projectId);
+    expect(mismatches).toEqual([{ domain: "messages", class: "sequence", identitySha256: expect.any(String) }]);
+  });
+  it("passes when the sequence last_value is at or above the copied maximum identity", async () => {
+    const session = fakeSession({ sequenceState: {
+      conversations: { maxValue: "500", lastValue: "500" },
+      "recall-surfacings": { maxValue: "10", lastValue: "11" },
+    } });
+    const mismatches = await readSequenceSelfConsistencyMismatches(session as never, projectId);
+    expect(mismatches).toEqual([]);
+  });
+});
+
+describe("truncateMismatchesPerClass", () => {
+  it("retains only the frozen per-class limit while leaving other classes untouched", () => {
+    const overLimit = Array.from({ length: 150 }, (_, index) => ({
+      domain: "machines" as const, class: "count" as const,
+      identitySha256: fakeHash(`bound-${String(index).padStart(4, "0")}`),
+    })).sort((left, right) => (left.identitySha256 < right.identitySha256 ? -1 : 1));
+    const untouchedClass = [{ domain: "project" as const, class: "digest" as const, identitySha256: fakeHash("untouched") }];
+    const totals = totalsFor([...overLimit, ...untouchedClass]);
+    expect(totals).toEqual(expect.arrayContaining([
+      { domain: "machines", class: "count", count: 150 },
+      { domain: "project", class: "digest", count: 1 },
+    ]));
+    const truncated = truncateMismatchesPerClass([...overLimit, ...untouchedClass]);
+    const retainedCount = truncated.filter((mismatch) => mismatch.class === "count").length;
+    expect(retainedCount).toBe(100);
+    expect(truncated.filter((mismatch) => mismatch.class === "digest")).toEqual(untouchedClass);
+    // The retained subset preserves the original relative order: filtering
+    // a sorted sequence can never reorder it.
+    expect(truncated.filter((mismatch) => mismatch.class === "count")).toEqual(overLimit.slice(0, 100));
+  });
+});
+
+describe("verifyMigrationGeneration: destination identity comparison", () => {
+  it("refuses a same-data, different-identity destination (wrong database / restored clone)", async () => {
+    stubDestinationPrimitives();
+    const copySource = fakeCopySource();
+    const runtime = fakeRuntime();
+    const dependencies = dependenciesFor(copySource, runtime);
+    await expect(verifyMigrationGeneration(
+      baseInput({ homeDir: "/tmp/lcm-verify-identity-drift", expectedDestinationIdentitySha256: "b".repeat(64) }),
+      dependencies,
+    )).rejects.toMatchObject({ reason: "destination-drift" });
+    expect(runtime.close).toHaveBeenCalledTimes(1);
+  });
+});
+
+describe("verifyMigrationGeneration: sequence self-consistency (P0)", () => {
+  it("catches a reset sequence even though the census and every canonical digest are identical to a healthy fixture", async () => {
+    stubDestinationPrimitives();
+    const recordCounts = Object.fromEntries(PORTABLE_RECORD_DOMAIN_ORDER.map((domain, index) => [domain, index])) as Partial<Record<PortableDomain, number>>;
+
+    const healthySession = fakeSession({ sequenceState: { conversations: { maxValue: "500", lastValue: "500" } } });
+    const healthyRuntime = fakeRuntime({ session: healthySession });
+    const healthyResult = await verifyMigrationGeneration(
+      baseInput({ homeDir: "/tmp/lcm-verify-sequence-healthy" }),
+      dependenciesFor(fakeCopySource({ recordCounts }), healthyRuntime),
+    );
+    expect(healthyResult.outcome).toBe("clean");
+
+    const resetSession = fakeSession({ sequenceState: { conversations: { maxValue: "500", lastValue: "10" } } });
+    const resetRuntime = fakeRuntime({ session: resetSession });
+    const resetResult = await verifyMigrationGeneration(
+      baseInput({ homeDir: "/tmp/lcm-verify-sequence-reset" }),
+      dependenciesFor(fakeCopySource({ recordCounts }), resetRuntime),
+    );
+    expect(resetResult.outcome).toBe("mismatches");
+    expect(resetResult.report.mismatches).toEqual([
+      { domain: "conversations", class: "sequence", identitySha256: expect.any(String) },
+    ]);
+    // The census vector -- the count/digest equality class -- is byte
+    // identical between the healthy and reset runs: only the sequence
+    // self-consistency bound differs. This is the pairing that proves the
+    // class catches what census equality structurally cannot.
+    expect(resetResult.report.body.censusVector).toEqual(healthyResult.report.body.censusVector);
+    expect(resetResult.report.body.canonicalDelta).toEqual(healthyResult.report.body.canonicalDelta);
+  }, 15000);
+});
+
+describe("verifyMigrationGeneration: public listing probe", () => {
+  it("produces no mismatch when the repository's real read path agrees with the source's canonical order", async () => {
+    stubDestinationPrimitives();
+    // conversations is domain-order index 3, so three records keep this
+    // domain's census in step with stubDestinationPrimitives' default
+    // recordCount-equals-index census, leaving the report clean except for
+    // whatever the probe itself decides.
+    const conversationsRecords = [
+      fakeConversationRecord("2026-01-01T00:00:00.111000Z", "first"),
+      fakeConversationRecord("2026-01-02T00:00:00.222000Z", "second"),
+      fakeConversationRecord("2026-01-03T00:00:00.333000Z", "third"),
+    ];
+    const recordCounts = Object.fromEntries(PORTABLE_RECORD_DOMAIN_ORDER.map((domain, index) => [domain, index])) as Partial<Record<PortableDomain, number>>;
+    const copySource = fakeCopySource({ recordCounts, conversationsRecords });
+    const runtime = fakeRuntime({
+      conversationsRows: [
+        { conversation_id: "1", session_id: "first", title: null, bootstrapped_at: null, created_at: "2026-01-01T00:00:00.111Z", updated_at: "2026-01-01T00:00:00.111Z" },
+        { conversation_id: "2", session_id: "second", title: null, bootstrapped_at: null, created_at: "2026-01-02T00:00:00.222Z", updated_at: "2026-01-02T00:00:00.222Z" },
+        { conversation_id: "3", session_id: "third", title: null, bootstrapped_at: null, created_at: "2026-01-03T00:00:00.333Z", updated_at: "2026-01-03T00:00:00.333Z" },
+      ],
+    });
+    const result = await verifyMigrationGeneration(
+      baseInput({ homeDir: "/tmp/lcm-verify-probe-clean" }),
+      dependenciesFor(copySource, runtime),
+    );
+    expect(result.outcome).toBe("clean");
+    expect(result.report.mismatches.some((mismatch) => mismatch.domain === "public-listing")).toBe(false);
+  }, 15000);
+
+  it("records a sample-class mismatch through the real repository path when the destination listing diverges from the source", async () => {
+    stubDestinationPrimitives();
+    const conversationsRecords = [
+      fakeConversationRecord("2026-01-01T00:00:00.111000Z", "first"),
+      fakeConversationRecord("2026-01-02T00:00:00.222000Z", "second"),
+      fakeConversationRecord("2026-01-03T00:00:00.333000Z", "third"),
+    ];
+    const recordCounts = Object.fromEntries(PORTABLE_RECORD_DOMAIN_ORDER.map((domain, index) => [domain, index])) as Partial<Record<PortableDomain, number>>;
+    const copySource = fakeCopySource({ recordCounts, conversationsRecords });
+    // The repository returns only one conversation instead of two: this is
+    // the class of bug a hand-rolled SQL re-implementation of the same
+    // ORDER BY could never catch, since it would share the same bug.
+    const runtime = fakeRuntime({
+      conversationsRows: [
+        { conversation_id: "1", session_id: "first", title: null, bootstrapped_at: null, created_at: "2026-01-01T00:00:00.111Z", updated_at: "2026-01-01T00:00:00.111Z" },
+      ],
+    });
+    const result = await verifyMigrationGeneration(
+      baseInput({ homeDir: "/tmp/lcm-verify-probe-divergent" }),
+      dependenciesFor(copySource, runtime),
+    );
+    expect(result.outcome).toBe("mismatches");
+    expect(result.report.mismatches).toEqual([
+      { domain: "public-listing", class: "sample", identitySha256: expect.any(String) },
+    ]);
   }, 15000);
 });

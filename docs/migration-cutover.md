@@ -567,3 +567,92 @@ held publication token, authority bytes, maintenance journal bytes and phase,
 and snapshot bytes all provably unchanged -- is an open question tracked in
 [issue #1369](https://github.com/donadiosolutions/lcm/issues/1369). It is not
 part of this API's current contract.
+
+## Migration verification and canonical reconciliation evidence
+
+A copied generation is not activation-eligible on its own. Verification reads
+the immutable source snapshot and the live PostgreSQL destination once more,
+independently of the copy worker's own evidence, and produces a durable,
+content-addressed report before any activation step may consider the
+generation. The report is bound to the exact source, destination, manifest,
+schema and project-map witnesses in play, plus the sealed queue-classification
+witness; changing any of those mints a different report identity rather than
+silently reusing an unrelated one.
+
+A **clean** report -- one with no recorded mismatches -- is the only report
+that ever begins a `verify-generation` effect. A report **with** mismatches is
+still persisted in full as operator evidence, but no effect is begun for it,
+and it does not become activation-eligible. Recovering from a report with
+mismatches means explicit `abort` followed by a new generation, the same
+pattern used throughout this journal for a phase that cannot be resumed in
+place: verification does not retry itself, patch the destination, or narrow
+the report to a smaller domain and try again. The mismatch evidence exists so
+an operator can diagnose what diverged before starting over, not so the same
+generation can be coerced into passing.
+
+### What a refusal means
+
+Verification refuses outright, before any report is written, when:
+
+- the destination's live migrations chain does not match the manifest's
+  sealed schema witness (`destination-drift`, migrations);
+- the destination's live five-field identity witness does not match the
+  manifest's recorded destination identity (`destination-drift`, identity) --
+  this is what catches a same-data verification run pointed at the wrong
+  database, such as a misconfigured connection string or a restored clone;
+- the destination's search configuration is absent or malformed;
+- the verification lease is already held by another worker
+  (`lease-unavailable`).
+
+A refusal writes nothing. It is not the same outcome as a persisted report
+with mismatches: a refusal means verification could not even take a coherent
+reading of the destination, while a report with mismatches means it could,
+and the reading disagreed with the source.
+
+### Reconciliation classes recorded in a mismatch
+
+Every mismatch names a domain, a closed class (`count`, `digest`, `identity`,
+`relation`, `sequence`, `schema`, `ledger`, `sample`) and an opaque identity
+digest -- never the differing values themselves, a diff, or a query string.
+Two classes are worth calling out because they exist specifically to catch
+failures that byte-for-byte content equality cannot see:
+
+- **`sequence`**: every PostgreSQL identity column backing a copied domain
+  (conversations, messages, recall surfacings, session instructions, passive
+  events) must have its sequence's `last_value` at or above the maximum
+  identity value actually present in that domain's copied rows. A sequence
+  that was reset or never advanced collides with the very next insert after
+  activation, even though every canonical digest for that domain is
+  identical to a correctly migrated destination -- this is why the check
+  exists as its own class rather than folding into the census.
+- **`sample`**: the step-5 public-read probe runs the ordered-listing query
+  through the real `PostgreSqlConversationRepository` production read path,
+  not a hand-written re-implementation of it, and compares the result
+  against the source's own canonical `createdAt` ordering captured while
+  streaming the source. A repository bug in filtering, ordering, or row
+  count shows up here even when the underlying copied bytes are correct.
+
+### The public-probe sampling skew
+
+The ordered-listing probe always runs before the fenced census window opens,
+never inside it or after it: PostgreSQL's read surface has no read-only
+transaction mode, so a repository read (which is read-write by construction)
+cannot run inside the window at all. This means the probe describes an
+instant **at or before** the census, never after it. A write committed
+between the probe and the census can only make the probe look stale in the
+conservative direction -- optimistic, not pessimistic -- because the census
+itself is the authoritative, final read and is what publication actually
+gates on. The report binds a versioned ordering marker together with the
+probe's own digest specifically so this ordering fact travels with the
+report rather than depending on prose alone.
+
+### Mismatch evidence is truncated per class, never the exact count
+
+A single mismatch class is capped at 100 retained entries in the persisted
+report, regardless of how many domains it spans. This exists so a badly
+diverged destination -- the case where operator evidence matters most --
+still produces a persisted report instead of an in-process failure with no
+evidence at all. The **exact** total for each (domain, class) pair is always
+recorded separately from the retained entries and is never itself truncated;
+an operator reading a report with a truncated class sees both the 100 (or
+fewer) example entries and the true total.

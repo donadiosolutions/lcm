@@ -8,13 +8,16 @@ import {
   createPostgreSqlPortableSource, readPostgreSqlPortableSourceDomainCensus,
   readPostgreSqlPortableWitness,
 } from "../storage/postgresql/portable-source.js";
+import { PostgreSqlConversationRepository } from "../storage/postgresql/conversation-repository.js";
 import type { PostgreSqlSnapshotSession } from "../storage/postgresql/snapshot-session.js";
 import type { PostgreSqlConnectionSettings, PostgreSqlQueryExecutor } from "../storage/postgresql/contracts.js";
 import {
   PORTABLE_RECORD_DOMAIN_ORDER, PORTABLE_LIMITS, canonicalJson as portableCanonicalJson,
   type PortableDomain,
 } from "../storage/portable-record.js";
-import type { PortableCheckpoint, PortableRecordStream } from "../storage/portable-record-stream.js";
+import type {
+  PortableCheckpoint, PortableRecordStream, PortableRecordValueByDomain,
+} from "../storage/portable-record-stream.js";
 import { openMigrationCopySource, type MigrationCopySourceInput } from "./copy-source.js";
 import type { StorageIdentityContext } from "../storage/contracts.js";
 import {
@@ -26,6 +29,7 @@ import {
 } from "./activation-witness.js";
 import {
   createMigrationVerificationReport,
+  MIGRATION_MISMATCH_CLASS_TRUNCATION_LIMIT, MIGRATION_PUBLIC_PROBE_ORDERING_SHA256,
   type CreateMigrationVerificationReportInput, type MigrationMismatchClass, type MigrationQueueClassificationWitness,
   type MigrationReconciliationDomain, type MigrationSourceWitnessDigests, type MigrationVerificationMismatch,
   type MigrationVerificationMismatchTotal, type MigrationVerificationReport, type MigrationVerificationSampleParameters,
@@ -145,19 +149,49 @@ async function captureDestinationSchemaWitness(
 
 // --- Step 5: public reads outside the window --------------------------------
 
+/**
+ * Millisecond-precision ISO-8601 UTC, matching what `pg` gives back for a
+ * `timestamptz` column via `Date#toISOString()`. Source timestamps are
+ * six-digit microsecond strings; comparing at millisecond precision is the
+ * honest ceiling, since the real repository path returns a JS `Date` and
+ * can carry no more precision than that -- the probe's job is to catch a
+ * broken read path, not to out-resolve what that path can express.
+ */
+function truncateToMillisecondIso(value: string): string {
+  return value.slice(0, 23) + "Z";
+}
+
+/**
+ * The step 5 ordered-listing probe now runs through the real repository
+ * (PostgreSqlConversationRepository.listConversations, the exact production
+ * read path -- not hand-written SQL that would only re-test a copy of the
+ * ordering logic) and is compared against expectedOrder, derived from the
+ * source's own canonical records during step 1 rather than assumed. A
+ * mismatch is recorded as a sample-class mismatch on the public-listing
+ * pseudo-domain; a clean probe contributes nothing (equality is not itself
+ * evidence worth persisting). Full parity with every public repository
+ * read remains out of scope for this pass (see the module-level scope
+ * note); this establishes the pattern for the one probe plan-v4 names.
+ */
 async function runOrderedListingProbe(
-  executor: PostgreSqlQueryExecutor, projectId: string, signal?: AbortSignal,
-): Promise<string> {
-  // A representative ordered-listing probe through a real read path. Full
-  // parity with every public repository read is out of scope for this pass
-  // (see the module-level scope note); this establishes the pattern and the
-  // report's "public-listing" pseudo-domain slot for a future extension.
-  const result = await executor.query<{ conversation_id: string; created_at: string }>({
-    text: "SELECT conversation_id::text, to_char(created_at AT TIME ZONE 'UTC', 'YYYY-MM-DD\"T\"HH24:MI:SS.US\"Z\"') AS created_at "
-      + "FROM lcm.conversations WHERE project_id = $1::uuid ORDER BY created_at, conversation_id",
-    values: [projectId],
-  }, { domain: "factory", operation: "verifyGenerationPublicListingProbe", projectId, signal });
-  return sha256Hex(portableCanonicalJson(["lcm-migration-verification-public-listing-v1", result.rows]));
+  executor: PostgreSqlRuntime, projectId: string, expectedOrder: readonly string[], signal?: AbortSignal,
+): Promise<{ mismatch: MigrationVerificationMismatch | null; publicListingSha256: string }> {
+  const repository = new PostgreSqlConversationRepository(executor, projectId);
+  const rows = await repository.listConversations();
+  const actualOrder = rows.map((row) => truncateToMillisecondIso(row.createdAt.toISOString()));
+  const publicListingSha256 = sha256Hex(portableCanonicalJson(["lcm-migration-verification-public-listing-v1", actualOrder]));
+  const expectedSha256 = sha256Hex(portableCanonicalJson(["lcm-migration-verification-public-listing-v1", expectedOrder]));
+  if (expectedSha256 === publicListingSha256) return { mismatch: null, publicListingSha256 };
+  return {
+    publicListingSha256,
+    mismatch: {
+      domain: "public-listing", class: "sample",
+      // A constant-shaped marker binding the two probe digests, never the
+      // underlying rows: both operands are already hashes, so this cannot
+      // leak the raw timestamps or any other compared value.
+      identitySha256: migrationWitnessSha256(["public-listing-probe-divergence-v1", expectedSha256, publicListingSha256]),
+    },
+  };
 }
 
 // --- Steps 6-7: the single fenced census window ------------------------------
@@ -196,6 +230,64 @@ export async function readFencedDestinationCensus(
     // by this module's own crash/error-path tests.
     await destinationSource.close();
   }
+}
+
+// --- Step 6 (in-window): sequence self-consistency ---------------------------
+
+/**
+ * Identity-sequence-backed domains and the physical table/column a
+ * PostgreSQL "GENERATED ... AS IDENTITY" sequence allocates for them, per
+ * migrations/0002_schema_baseline.sql. Every other portable domain uses a
+ * non-sequence primary key (UUID or a composite key) and has no sequence
+ * to bound.
+ */
+const SEQUENCE_BACKED_IDENTITY_COLUMN: Readonly<Partial<Record<PortableDomain, Readonly<{ table: string; column: string }>>>> = Object.freeze({
+  conversations: { table: "lcm.conversations", column: "conversation_id" },
+  messages: { table: "lcm.messages", column: "message_id" },
+  "recall-surfacings": { table: "lcm.recall_surfacing", column: "surfacing_id" },
+  "session-instructions": { table: "lcm.session_instructions", column: "instruction_id" },
+  "passive-events": { table: "lcm.passive_event_inbox", column: "inbox_id" },
+});
+
+/**
+ * The P0 self-consistency bound: no source-side expected sequence value
+ * exists anywhere (no artifact records a per-domain identity seed), and a
+ * cluster-global watermark is unsatisfiable (the verifier's own lease
+ * commit advances it). Instead this checks, entirely within the destination
+ * snapshot, that each identity sequence's last_value is at least the
+ * maximum identity value actually present in its copied domain -- the
+ * necessary condition for the next allocation not to collide with a copied
+ * row. A reset or diverged sequence is caught here even when every
+ * canonical digest is identical, which is exactly the failure this class
+ * exists to catch (see witness-schema-FROZEN-v2.md's own named blind spot).
+ */
+export async function readSequenceSelfConsistencyMismatches(
+  session: PostgreSqlSnapshotSession, projectId: string, signal?: AbortSignal,
+): Promise<MigrationVerificationMismatch[]> {
+  const mismatches: MigrationVerificationMismatch[] = [];
+  for (const [domain, target] of Object.entries(SEQUENCE_BACKED_IDENTITY_COLUMN)) {
+    const maxResult = await session.query<{ max_value: string | null }>({
+      text: "SELECT MAX(" + target.column + ")::text AS max_value FROM " + target.table + " WHERE project_id = $1::uuid",
+      values: [projectId],
+    }, { domain: "factory", operation: "verifyGenerationSequenceSelfConsistencyMax", projectId, signal });
+    const maxValue = maxResult.rows[0]?.max_value ?? null;
+    if (maxValue === null) continue; // domain is empty for this project: nothing to bound.
+    const sequenceResult = await session.query<{ last_value: string | null }>({
+      text: "SELECT pg_catalog.pg_sequence_last_value(pg_catalog.pg_get_serial_sequence($1, $2)::regclass)::text AS last_value",
+      values: [target.table, target.column],
+    }, { domain: "factory", operation: "verifyGenerationSequenceSelfConsistencyLastValue", signal });
+    const lastValue = sequenceResult.rows[0]?.last_value ?? null;
+    if (lastValue === null || BigInt(lastValue) < BigInt(maxValue)) {
+      mismatches.push({
+        domain: domain as PortableDomain, class: "sequence",
+        // A constant marker, never the compared values: the sequence bound
+        // is a boolean pass/fail per domain, and there is no per-record
+        // identity to reference here (unlike a sampled-record mismatch).
+        identitySha256: migrationWitnessSha256(["sequence-self-consistency-violation-v1", domain]),
+      });
+    }
+  }
+  return mismatches;
 }
 
 function buildCensusVector(domains: readonly MigrationVerificationDomainCensus[]): MigrationCensusVector {
@@ -239,20 +331,48 @@ export async function assertPermanentReadOnlyGuard(
 
 // --- Step 1 (source side): stream the re-authenticated source to completion -
 
+export interface StreamedSourceCheckpoints {
+  readonly checkpoints: ReadonlyMap<PortableDomain, PortableCheckpoint>;
+  /**
+   * Millisecond-truncated createdAt values for every source "conversations"
+   * record, sorted ascending by (createdAt, identitySha256). This is the
+   * step 5 ordered-listing probe's comparison target, captured during this
+   * same forward pass rather than a second read of an already-exhausted
+   * stream.
+   */
+  readonly conversationsPublicOrder: readonly string[];
+}
+
 export async function streamSourceCheckpoints(
   stream: PortableRecordStream, signal?: AbortSignal,
-): Promise<ReadonlyMap<PortableDomain, PortableCheckpoint>> {
+): Promise<StreamedSourceCheckpoints> {
   const checkpoints = new Map<PortableDomain, PortableCheckpoint>();
+  const conversationEntries: Array<{ createdAt: string; identitySha256: string }> = [];
   for (const domain of PORTABLE_RECORD_DOMAIN_ORDER) {
     let after: PortableCheckpoint | undefined;
     for (;;) {
       const batch = await stream.readBatch({ domain, after, maxRecords: 500, maxBytes: PORTABLE_LIMITS.maxBatchBytes, signal });
+      if (domain === "conversations") {
+        for (const record of batch.records) {
+          const value = record.value as PortableRecordValueByDomain["conversations"];
+          conversationEntries.push({
+            createdAt: truncateToMillisecondIso(value.createdAt), identitySha256: record.identitySha256,
+          });
+        }
+      }
       after = batch.checkpoint;
       if (batch.complete) break;
     }
     checkpoints.set(domain, after);
   }
-  return checkpoints;
+  conversationEntries.sort((left, right) => {
+    if (left.createdAt !== right.createdAt) return left.createdAt < right.createdAt ? -1 : 1;
+    return left.identitySha256 < right.identitySha256 ? -1 : left.identitySha256 > right.identitySha256 ? 1 : 0;
+  });
+  return {
+    checkpoints,
+    conversationsPublicOrder: conversationEntries.map((entry) => entry.createdAt),
+  };
 }
 
 // --- Reconciliation: source checkpoints versus the destination census ------
@@ -311,6 +431,26 @@ export function totalsFor(mismatches: readonly MigrationVerificationMismatch[]):
   return [...counts.values()];
 }
 
+/**
+ * The report body rejects more than MIGRATION_MISMATCH_CLASS_TRUNCATION_LIMIT
+ * recorded entries in one class; it does not truncate for the driver. This
+ * is the truncation itself: called on the full, already-sorted mismatch
+ * list, it keeps the first LIMIT entries per class (in the frozen sort
+ * order) and drops the rest. Exact totals must be computed from the full
+ * list *before* calling this, never from its return value, or the operator
+ * loses the one number truncation exists to preserve.
+ */
+export function truncateMismatchesPerClass(
+  mismatches: readonly MigrationVerificationMismatch[],
+): MigrationVerificationMismatch[] {
+  const perClassRetained = new Map<MigrationMismatchClass, number>();
+  return mismatches.filter((mismatch) => {
+    const retained = perClassRetained.get(mismatch.class) ?? 0;
+    perClassRetained.set(mismatch.class, retained + 1);
+    return retained < MIGRATION_MISMATCH_CLASS_TRUNCATION_LIMIT;
+  });
+}
+
 export interface VerifyMigrationGenerationInput {
   readonly generationId: string;
   readonly targetGenerationId: string;
@@ -324,6 +464,15 @@ export interface VerifyMigrationGenerationInput {
   readonly manifestRevision: number;
   readonly manifestChecksumSha256: string;
   readonly destinationMigrationsSha256: string;
+  /**
+   * manifest.destination.identitySha256: the sealed five-field witness
+   * copy-time recorded for this destination. Compared in full against the
+   * re-derived destinationIdentity.sealedWitnessSha256 -- unlike the
+   * schema witness, which is migrations-only -- so a wrong-database or
+   * failover-since-copy destination refuses instead of publishing a clean
+   * report bound to the wrong destination.
+   */
+  readonly expectedDestinationIdentitySha256: string;
   readonly projectMapWitnessSha256: string;
   readonly queueClassificationWitness: MigrationQueueClassificationWitness;
   readonly sampleParameters: MigrationVerificationSampleParameters;
@@ -371,7 +520,7 @@ export async function verifyMigrationGeneration(
   let runtime: PostgreSqlRuntime | undefined;
   try {
     await copySource.reauthenticate();
-    const sourceCheckpoints = await streamSourceCheckpoints(copySource.stream, input.signal);
+    const { checkpoints: sourceCheckpoints, conversationsPublicOrder } = await streamSourceCheckpoints(copySource.stream, input.signal);
     await dependencies._afterSourceCheckpointsForTesting?.();
     await copySource.reauthenticate();
 
@@ -382,6 +531,12 @@ export async function verifyMigrationGeneration(
     if (destinationSchemaWitness.migrationsSha256 !== input.destinationMigrationsSha256) {
       driverError("destination-drift", "destination migrations chain does not match the expected witness");
     }
+    // Unlike the schema witness (migrations-only per #623), the identity
+    // witness is compared in full: a same-data wrong-database destination
+    // must refuse, not publish a clean report bound to the wrong target.
+    if (destinationIdentity.sealedWitnessSha256 !== input.expectedDestinationIdentitySha256) {
+      driverError("destination-drift", "destination identity does not match the expected witness");
+    }
 
     const coordinator = new PostgreSqlWorkCoordinator(runtime, input.expectedIdentity.id, input.expectedIdentity.machineId!);
     const resource = {
@@ -391,16 +546,20 @@ export async function verifyMigrationGeneration(
     const lease = await coordinator.acquireLease({ ...resource, ttlMs: input.leaseTtlMs, signal: input.signal });
     if (lease === null) driverError("lease-unavailable", "migration verification lease is held by another worker");
     try {
-      const publicListingSha256 = await runOrderedListingProbe(runtime, input.expectedIdentity.id, input.signal);
+      const { mismatch: publicListingMismatch, publicListingSha256 } = await runOrderedListingProbe(
+        runtime, input.expectedIdentity.id, conversationsPublicOrder, input.signal,
+      );
 
       const session = await runtime.openReadOnlySnapshot({ projectId: input.expectedIdentity.id, signal: input.signal });
       let destinationCensus: readonly MigrationVerificationDomainCensus[];
+      let sequenceMismatches: MigrationVerificationMismatch[];
       try {
         await assertPermanentReadOnlyGuard(session, input.signal);
         destinationCensus = await readFencedDestinationCensus(session, {
           settings: input.destinationSettings, expectedOwner: input.expectedOwner,
           expectedIdentity: input.expectedIdentity, scratchParent: input.scratchParent, signal: input.signal,
         });
+        sequenceMismatches = await readSequenceSelfConsistencyMismatches(session, input.expectedIdentity.id, input.signal);
       } finally {
         await session.close();
       }
@@ -409,11 +568,22 @@ export async function verifyMigrationGeneration(
       const canonicalDelta = buildCanonicalDelta(destinationCensus);
       const countMismatches = reconcileCounts(sourceCheckpoints, destinationCensus);
       const domainOrder = [...PORTABLE_RECORD_DOMAIN_ORDER, "schema", "ledger", "public-listing", "public-search"] as const;
-      const mismatches = sortMismatches(countMismatches, domainOrder);
+      const allMismatches = [
+        ...countMismatches, ...sequenceMismatches, ...(publicListingMismatch ? [publicListingMismatch] : []),
+      ];
+      const fullMismatches = sortMismatches(allMismatches, domainOrder);
+      // Totals must reflect the full (untruncated) evidence: truncation is
+      // an operator-facing display bound on retained entries, never on the
+      // exact count the operator is told about.
       const mismatchTotals = sortMismatches(
-        totalsFor(mismatches) as unknown as MigrationVerificationMismatch[],
+        totalsFor(fullMismatches) as unknown as MigrationVerificationMismatch[],
         domainOrder,
       ) as unknown as MigrationVerificationMismatchTotal[];
+      // The report body rejects more than the frozen per-class limit among
+      // *retained* entries; a badly diverged destination -- the exact case
+      // operator evidence matters most for -- must still produce a report,
+      // so the driver truncates here rather than letting construction throw.
+      const mismatches = truncateMismatchesPerClass(fullMismatches);
 
       const sourceWitness: MigrationSourceWitnessDigests = {
         version: 1, identitySha256: copySource.sourceWitness.identitySha256,
@@ -422,18 +592,17 @@ export async function verifyMigrationGeneration(
       const bindingSha256 = migrationWitnessSha256([
         "lcm-migration-verification-binding-v1", input.generationId, input.targetGenerationId, sourceWitness, destinationIdentity,
       ]);
+      const publicProbeSha256 = migrationWitnessSha256([
+        "lcm-migration-verification-public-probe-v1", MIGRATION_PUBLIC_PROBE_ORDERING_SHA256, publicListingSha256,
+      ]);
       const reportInput: CreateMigrationVerificationReportInput = {
         generationId: input.generationId, targetGenerationId: input.targetGenerationId, bindingSha256,
         manifestRevision: input.manifestRevision, manifestChecksumSha256: input.manifestChecksumSha256,
         sourceWitness, destinationIdentity, destinationSchemaWitness,
         projectMapWitnessSha256: input.projectMapWitnessSha256, queueClassificationWitness: input.queueClassificationWitness,
-        censusVector, canonicalDelta, sampleParameters: input.sampleParameters,
+        censusVector, canonicalDelta, publicProbeSha256, sampleParameters: input.sampleParameters,
         mismatches, mismatchTotals,
       };
-      // publicListingSha256 is recorded via the report's public-listing pseudo-domain
-      // once a mismatch there is detected; a clean probe contributes no mismatch entry
-      // by design (equality is not itself evidence worth persisting per-run).
-      void publicListingSha256;
       const report = createMigrationVerificationReport(reportInput);
       const store = new MigrationVerificationReportStore({ homeDir: input.homeDir });
       const persisted = store.persist(input.generationId, report);

@@ -118,6 +118,18 @@ const MISMATCH_CLASS_ORDINAL = new Map<MigrationMismatchClass, number>(
 /** Frozen per-class bound on the number of retained mismatch entries; exact totals are retained separately. */
 export const MIGRATION_MISMATCH_CLASS_TRUNCATION_LIMIT = 100;
 
+/**
+ * Frozen ordering marker for the step 5 public probes: they always run
+ * before the step 6 census window opens, and only ever describe an
+ * instant at or before the census. The report body carries no wall clock,
+ * so this versioned constant is how the skew is disclosed structurally
+ * rather than through prose the body cannot express. See
+ * docs/migration-verification.md for the operator-facing explanation.
+ */
+export const MIGRATION_PUBLIC_PROBE_ORDERING_SHA256 = migrationWitnessSha256([
+  "lcm-migration-verification-public-probe-ordering-v1", "probe-before-census",
+]);
+
 function isReconciliationDomain(value: unknown): value is MigrationReconciliationDomain {
   return typeof value === "string" && RECONCILIATION_DOMAIN_ORDINAL.has(value as MigrationReconciliationDomain);
 }
@@ -336,6 +348,14 @@ export type MigrationVerificationReportBody = Readonly<{
   queueClassificationWitness: MigrationQueueClassificationWitness;
   censusVector: MigrationCensusVector;
   canonicalDelta: MigrationCanonicalDelta;
+  /**
+   * Binds the step 5 public-read probe outcome into the identity so it can
+   * never again be recorded and discarded. The driver derives this from
+   * MIGRATION_PUBLIC_PROBE_ORDERING_SHA256 plus the expected (source) and
+   * actual (destination repository) probe digests; this module validates
+   * only that it is a hash, the same way it treats bindingSha256.
+   */
+  publicProbeSha256: string;
   reconciliationOutcomeDigestSha256: string;
   sampleParameters: MigrationVerificationSampleParameters;
 }>;
@@ -353,6 +373,7 @@ export type CreateMigrationVerificationReportBodyInput = Readonly<{
   queueClassificationWitness: MigrationQueueClassificationWitness;
   censusVector: MigrationCensusVector;
   canonicalDelta: MigrationCanonicalDelta;
+  publicProbeSha256: string;
   sampleParameters: MigrationVerificationSampleParameters;
   mismatches: readonly MigrationVerificationMismatch[];
   mismatchTotals: readonly MigrationVerificationMismatchTotal[];
@@ -380,6 +401,7 @@ export function createMigrationVerificationReportBody(
     || !isSafeNonNegativeInteger(input.manifestRevision)
     || !isHash(input.manifestChecksumSha256)
     || !isHash(input.projectMapWitnessSha256)
+    || !isHash(input.publicProbeSha256)
   ) {
     reportError("invalid-input", "verification report body input is invalid");
   }
@@ -414,6 +436,7 @@ export function createMigrationVerificationReportBody(
     queueClassificationWitness,
     censusVector,
     canonicalDelta,
+    publicProbeSha256: input.publicProbeSha256,
     reconciliationOutcomeDigestSha256: migrationReconciliationOutcomeDigest(mismatches, mismatchTotals),
     sampleParameters,
   });
@@ -494,6 +517,7 @@ export function parseMigrationVerificationReport(value: unknown): MigrationVerif
     queueClassificationWitness: (record.body as RecordValue).queueClassificationWitness as MigrationQueueClassificationWitness,
     censusVector: (record.body as RecordValue).censusVector as MigrationCensusVector,
     canonicalDelta: (record.body as RecordValue).canonicalDelta as MigrationCanonicalDelta,
+    publicProbeSha256: (record.body as RecordValue).publicProbeSha256 as string,
     sampleParameters: (record.body as RecordValue).sampleParameters as MigrationVerificationSampleParameters,
     mismatches: Array.isArray(record.mismatches) ? record.mismatches : [],
     mismatchTotals: Array.isArray(record.mismatchTotals) ? record.mismatchTotals : [],

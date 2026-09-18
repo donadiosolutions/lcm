@@ -85,6 +85,7 @@ function baseInput(overrides: Partial<CreateMigrationVerificationReportInput> = 
       version: 1,
       domains: domainVector((domain, index) => ({ domain, recordCount: index, terminalIdentitySha256: migrationWitnessSha256(["d", domain]) })),
     },
+    publicProbeSha256: migrationWitnessSha256(["public-probe"]),
     sampleParameters: sampleParameters(),
     mismatches: [],
     mismatchTotals: [],
