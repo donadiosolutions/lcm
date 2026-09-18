@@ -650,3 +650,29 @@ describe("ScrubEngine.loadProjectPatterns", () => {
     await expect(ScrubEngine.loadProjectPatterns("/")).rejects.toThrow();
   });
 });
+
+describe("Gitleaks generated pattern runtime bounds", () => {
+  // A nested same-class bounded lazy prefix multiplies the prefix attempts at
+  // every start position (51 * 51 instead of 51), which made
+  // cisco-meraki-api-key and four sibling rules roughly 25x slower than an
+  // equivalent single prefix on long opaque no-match input. The two prefixes
+  // are redundant: only the total consumed length is observable because both
+  // span the same character class.
+  const NESTED_LAZY_PREFIX = /(\[(?:[^\]\\]|\\.)*\])\{0,\d+\}\?\(\?:\1\{0,\d+\}\?/;
+
+  it("compiles no rule with a redundant nested same-class lazy prefix", () => {
+    const offenders = GITLEAKS_PATTERNS
+      .filter((pattern) => NESTED_LAZY_PREFIX.test(pattern.regex))
+      .map((pattern) => pattern.id);
+    expect(offenders).toEqual([]);
+  });
+
+  it("keeps the previously nested rules detecting their secrets", () => {
+    expect("meraki_api_key = 0123456789abcdef0123456789abcdef01234567 ")
+      .toMatch(compiledGitleaksRule("cisco-meraki-api-key"));
+    expect("cohere_api_key = " + "A".repeat(40) + " ")
+      .toMatch(compiledGitleaksRule("cohere-api-token"));
+    expect("okta.com token: " + "0".repeat(42) + " ")
+      .toMatch(compiledGitleaksRule("okta-access-token"));
+  });
+});

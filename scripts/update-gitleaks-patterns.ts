@@ -171,6 +171,34 @@ export function normalizeGitleaksHostnameLiterals(
   );
 }
 
+/**
+ * Collapse a redundant nested bounded lazy prefix over the same character
+ * class into a single quantifier.
+ *
+ * Gitleaks writes several rules as `X{0,50}?(?i:X{0,50}?LITERAL…)`. Go has
+ * scoped flag groups and JavaScript does not, so the converter above flattens
+ * `(?i:` to `(?:` and leaves two adjacent lazy prefixes over the identical
+ * class. Only the total length they consume is observable, because every
+ * split of a given total consumes the same characters and lazy expansion
+ * reaches every total 0..B before any larger total. So `X{0,A}?(?:X{0,B}?R)`
+ * and `X{0,A+B}?(?:R)` match identically.
+ *
+ * The nested form costs (A+1)*(B+1) prefix attempts at every start position
+ * instead of A+B+1. At A=B=50 that is 2601 against 101, and it made five
+ * rules — cisco-meraki-api-key, cohere-api-token, okta-access-token,
+ * privateai-api-token and sumologic-access-id — about 25x slower than an
+ * equivalent single prefix, together 70% of the whole 220-rule scan cost on
+ * long opaque input. That is what monopolized the daemon event loop during
+ * native transcript backfill (#1358).
+ */
+export function collapseRedundantLazyPrefixes(regex: string): string {
+  return regex.replace(
+    /(\[(?:[^\]\\]|\\.)*\])\{0,(\d+)\}\?\(\?:\1\{0,(\d+)\}\?/g,
+    (_match, characterClass: string, outer: string, inner: string) =>
+      `${characterClass}{0,${Number(outer) + Number(inner)}}?(?:`,
+  );
+}
+
 // ─── Smoke Tests ──────────────────────────────────────────────────────────────
 
 const COMMON_ENGLISH_WORDS = [
@@ -226,7 +254,9 @@ async function main(): Promise<void> {
 
   for (const rule of rawRules) {
     const { regex: convertedRegex, flags } = convertGoRegex(rule.regex);
-    const regex = normalizeGitleaksHostnameLiterals(rule.id, convertedRegex);
+    const regex = collapseRedundantLazyPrefixes(
+      normalizeGitleaksHostnameLiterals(rule.id, convertedRegex),
+    );
 
     // Test compilability
     let compiled: RegExp;

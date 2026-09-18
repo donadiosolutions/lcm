@@ -1,6 +1,7 @@
 import { createHash } from "node:crypto";
 import { describe, expect, it } from "vitest";
 import {
+  collapseRedundantLazyPrefixes,
   normalizeGitleaksHostnameLiterals,
   verifyGitleaksSource,
 } from "../../scripts/update-gitleaks-patterns.js";
@@ -67,5 +68,28 @@ describe("Gitleaks hostname normalization", () => {
       .toBe(mailchimp);
     expect(normalizeGitleaksHostnameLiterals("sidekiq-sensitive-url", conversions))
       .toBe(conversions);
+  });
+});
+
+describe("Gitleaks redundant lazy prefix collapse", () => {
+  it("collapses a nested same-class lazy prefix into one bounded quantifier", () => {
+    expect(collapseRedundantLazyPrefixes(
+      "[\\w.-]{0,50}?(?:[\\w.-]{0,50}?(?:meraki)(?:[ \\t\\w.-]{0,20}))(?:=)([0-9a-f]{40})",
+    )).toBe("[\\w.-]{0,100}?(?:(?:meraki)(?:[ \\t\\w.-]{0,20}))(?:=)([0-9a-f]{40})");
+  });
+
+  it("leaves a single lazy prefix byte-identical", () => {
+    const single = "[\\w.-]{0,50}?(?:cloudflare)(?:[ \\t\\w.-]{0,20})[\\s'\"]{0,3}";
+    expect(collapseRedundantLazyPrefixes(single)).toBe(single);
+  });
+
+  it("leaves nested prefixes over different character classes byte-identical", () => {
+    const mixed = "[\\w.-]{0,50}?(?:[ \\t\\w.-]{0,50}?(?:okta))";
+    expect(collapseRedundantLazyPrefixes(mixed)).toBe(mixed);
+  });
+
+  it("leaves greedy nested prefixes byte-identical", () => {
+    const greedy = "[\\w.-]{0,50}(?:[\\w.-]{0,50}(?:okta))";
+    expect(collapseRedundantLazyPrefixes(greedy)).toBe(greedy);
   });
 });
