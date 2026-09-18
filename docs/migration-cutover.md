@@ -676,37 +676,63 @@ fewer) example entries and the true total.
 
 ### Verification cost scales with the rows in scope
 
-The census -- the fenced read of every row in every portable domain, used
-to build the per-domain record count and content digest the report compares
-against the source -- does not have a fixed cost. Its dominant cost is one
-round trip per record: the destination's canonicalisation path reads and
-re-hashes each row individually rather than in batches, so census wall time
-is roughly linear in the number of rows in scope, not a flat per-domain
-overhead. Measured against a live PostgreSQL 18 instance with roughly 9,300
-rows across the copied domains (dominated by conversations, messages and
-message-parts), the census alone took about 78.5 seconds -- effectively
-100% of measured verification wall time, since the read-only guard, the
-sequence self-consistency check and the public-listing probe are each under
-20 milliseconds by comparison. That works out to roughly 8 milliseconds per
-record; a project with substantially more rows in scope should expect
-verification time to extrapolate from that figure roughly linearly, not to
-stay flat.
+The in-window read -- the fenced census (which also collects `relation`-
+class dependency edges via a second `readDomainPage` walk over the same
+open destination source), the sequence self-consistency check, and the
+`ledger` class's three-table SQL against `transfer_runs`/`transfer_batches`/
+`transfer_identities` -- does not have a fixed cost. Its dominant cost is
+the census: the destination's canonicalisation path reads and re-hashes
+each row individually rather than in batches, and the `relation` class
+re-reads every row a second time through that same per-record path to
+collect dependency edges, so wall time is roughly linear in the number of
+rows in scope, not a flat per-domain overhead. Measured against a live
+PostgreSQL 18 instance with 9,345 rows across the copied domains
+(dominated by conversations, messages and message-parts), the
+census-plus-relation phase took about 95.8 seconds and the ledger phase
+took about 79 milliseconds; together with the read-only guard and the
+sequence check, the whole in-window read took about 95.9 seconds, and the
+two pre-window probes (the public-listing repository read and the
+destination probe) added a further 222 milliseconds outside the lease
+window, for a measured total of about 96.2 seconds. Census-plus-relation
+alone is 99.7% of that total; the ledger, sequence-check and read-only
+guard phases are each under 100 milliseconds and do not materially move
+the figure. This section's name is historical -- the number below covers
+the whole in-window read, not the census alone -- because once `relation`
+and `ledger` existed, splitting the figure back apart would have told an
+operator less, not more, about what `leaseTtlMs` actually needs to cover.
 
-This matters because the census, the sequence check and the read-only guard
-all run inside one fenced window held by a single verification lease, and
-the lease has a caller-supplied `leaseTtlMs`. Verification does not renew a
-lease that is about to expire mid-window; if the window does not finish
-inside the lease term, verification fails rather than extending it, exactly
-like the rest of this journal's refuse-and-restart pattern rather than a
-retry loop. An operator sizing `leaseTtlMs` for a large project should
-measure census cost against a realistic copy of that project's own row
-counts before a cutover, not discover the lease was too short during one.
-As a starting point rather than a promise, this repository's own measured
-figure above scaled to a stated safety margin over the measured total --
-not a second measurement -- rather than an unexamined guess; the same
-approach (measure, then apply a stated margin, then let the arithmetic be
-checked) is what an operator should repeat against their own data before
-relying on any specific `leaseTtlMs` value.
+The extra `relation`-class read pass is structural, not an oversight left
+for a later item. The only surface this driver is permitted to read
+per-domain dependency data from is `readDomainPage`, an existing read
+already approved for this driver, and that method necessarily re-reads
+each record through the same `checkedRecordAt`/`recordAt`/`readCanonicalRow`
+path the census itself uses during construction. There is no cheaper
+approved surface: the census aggregate accessor exposes only
+`{recordCount, prefixSha256, terminalIdentitySha256}` per domain, never
+per-record dependency data, and widening it would mean touching
+`portable-source.ts` beyond its two approved additive changes, which is
+outside this item's scope. Construction of the destination source already
+performs two full per-record reads before this driver's own code runs at
+all -- once to build the canonical index, once more to compute the
+terminal content digest -- so `relation`'s own contribution is one
+additional pass over data already read twice, not the sole source of read
+cost.
 
+This matters because the census, the sequence check, the `relation` and
+`ledger` reads, and the read-only guard all run inside one fenced window
+held by a single verification lease, and the lease has a caller-supplied
+`leaseTtlMs`. Verification does not renew a lease that is about to expire
+mid-window; if the window does not finish inside the lease term,
+verification fails rather than extending it, exactly like the rest of this
+journal's refuse-and-restart pattern rather than a retry loop. An operator
+sizing `leaseTtlMs` for a large project should measure the whole in-window
+read against a realistic copy of that project's own row counts before a
+cutover, not discover the lease was too short during one. As a starting
+point rather than a promise, this repository's own measured total above
+(about 96.2 seconds) scaled by a stated 3x safety margin -- not a second
+measurement -- yields `leaseTtlMs = 288,472`; the same approach (measure,
+then apply a stated margin, then let the arithmetic be checked) is what an
+operator should repeat against their own data before relying on any
+specific `leaseTtlMs` value.
 
 
