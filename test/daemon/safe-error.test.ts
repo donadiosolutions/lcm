@@ -621,14 +621,59 @@ describe("sanitizeError", () => {
     expect(sanitizeError(sanitizeError(first))).toBe(expected);
   });
 
-  it("expires an IPv6 bracket handoff after its generated marker", () => {
+  it("repeats an IPv6 bracket handoff for every rooted successor", () => {
     const input = "file://h?x=[https://[::1]/p|\\Users\\first.db|\\Users\\second.db";
-    const expected = "file://h?x=[https://[::1]/p|<path>|\\Users\\second.db";
+    const expected = "file://h?x=[https://[::1]/p|<path>|<path>";
     const first = sanitizeError(input);
 
     expect(first).toBe(expected);
+    expect(first).not.toContain("second.db");
     expect(sanitizeError(first)).toBe(expected);
     expect(sanitizeError(sanitizeError(first))).toBe(expected);
+  });
+
+  it.each([
+    [
+      "IPv6 authority",
+      "file://h?x=[https://[::1]/t|/Users/a/one&\\Users\\SECRET\\x]",
+      "file://h?x=[https://[::1]/t|<path>&<path>]",
+    ],
+    [
+      "bracketed path segment",
+      "file://h?x=[https://e.test/t[/seg]|/Users/a/one&\\Users\\SECRET\\x]",
+      "file://h?x=[https://e.test/t[/seg]|<path>&<path>]",
+    ],
+    [
+      "repeated pipe after a bracketed segment",
+      "file://h?x=[https://e.test/t[/seg]|\\Users\\S1|\\Users\\S2]",
+      "file://h?x=[https://e.test/t[/seg]|<path>|<path>]",
+    ],
+    [
+      "unbracketed parity control",
+      "file://h?x=[https://e.test/t|\\Users\\alice\\one.db|\\Users\\bob\\secret.db]",
+      "file://h?x=[https://e.test/t|<path>|<path>]",
+    ],
+    [
+      "ampersand successor control",
+      "file://h?x=[https://[::1]/t&\\Users\\SECRET\\x]",
+      "file://h?x=[https://[::1]/t&<path>]",
+    ],
+  ] as const)("keeps handoff ownership across a bracketed nested public URL (Bug #1343): %s", (_name, input, expected) => {
+    const first = sanitizeError(input);
+
+    expect(first).toBe(expected);
+    expect(first).not.toContain("SECRET");
+    expect(sanitizeError(first)).toBe(first);
+    expect(sanitizeError(sanitizeError(first))).toBe(first);
+  });
+
+  it.each([
+    "file://h?x=[https://[::1]prose]\\Users\\fictional.db",
+    "file://h?x=[https://[::1]/t|relative/path&\\Users\\SECRET\\x]",
+  ] as const)("does not arm the Bug #1343 handoff without a path root: %s", (input) => {
+    expect(sanitizeError(input)).toBe(input);
+    expect(sanitizeError(sanitizeError(input))).toBe(input);
+    expect(sanitizeError(sanitizeError(sanitizeError(input)))).toBe(input);
   });
 
   it.each([
@@ -3743,7 +3788,7 @@ describe("sanitizeError", () => {
     [
       "IPv6",
       "file://h?x=[https://[::1]/p|\\Users\\first.db|\\Users\\second.db",
-      "file://h?x=[https://[::1]/p|<path>|\\Users\\second.db",
+      "file://h?x=[https://[::1]/p|<path>|<path>",
     ],
     [
       "Bug #1332 delimiter boundary",
