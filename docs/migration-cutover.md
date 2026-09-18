@@ -6,10 +6,10 @@ which external effect is pending, and which immutable evidence was accepted at
 each step. A private durable journal makes an interrupted protocol run
 recoverable without guessing from timestamps or partially changed data.
 
-This foundation does **not** copy data, activate PostgreSQL, change the current
-storage backend, or execute rollback by itself. The immutable SQLite snapshot
-capability adds the authenticated source artifact used by those later steps;
-it still does not copy records into PostgreSQL or select a destination.
+The journal and immutable capture do not copy data or change the selected
+backend by themselves. The internal bounded copy API described below consumes
+those artifacts. Copy completion does not activate PostgreSQL or execute
+rollback.
 
 Compaction releases publication admission while waiting for a model and revalidates
 it for each subsequent storage operation. A project handle uses that operation's
@@ -440,3 +440,130 @@ reconciliation, activation, rollback, CLI/operator commands, and end-to-end
 recovery. Until those features land, normal installations continue using their
 existing storage selection and should not manually create or mutate this
 journal.
+
+## Bounded migration copy and resume
+
+The internal migration API copies one authenticated SQLite generation into an
+explicit, separately provisioned PostgreSQL project. It requires the existing
+journal to be `dry-run-verified`, `copying`, or `copied`; it does not prepare a
+machine, create a project, generate a dry-run report, or select PostgreSQL.
+Only the acknowledged local machine roster is supported. Shared source
+identities, legacy receipt history, additional instruction databases, and
+archive layouts that cannot preserve the local physical identity are refused.
+The current single-project database includes its `session_instruction_cache`
+rows. The absence witness describes only additional instruction databases.
+
+The internal `src/migration/index.ts` entry point provides
+`inspectSqliteMigrationCopy` and `runSqliteMigrationCopy` for the migration
+composition root. These are not new CLI commands or package exports. Inspection
+returns the source and destination witnesses needed by an independently verified
+dry-run journal; it does not attest that a dry-run passed.
+
+```typescript
+const result = await runSqliteMigrationCopy({
+  generationId: preparedGenerationId,
+  homeDir,
+  settings: explicitTargetSettings,
+  expectedOwner: targetMigrationRole,
+  expectedIdentity: enrolledTargetIdentity,
+  ownerProcessId: workerProcessIdentity,
+  maxRecords: 100,
+  maxBytes: 8 * 1024 * 1024,
+  leaseTtlMs: 300_000,
+  maximumTransactionAttempts: 3,
+  signal: cancellationSignal,
+});
+// result.phase === "copied"; separate verification and activation still follow.
+```
+
+The generation must already have authenticated capture/receipt evidence and a
+verified dry-run journal. `expectedIdentity` includes the target UUID as both
+`id` and `remoteProjectId`, captured physical `localProjectId`, enrolled
+`machineId`, and the captured `canonical` and `selectedPath`. The returned result
+contains generation/run IDs, immutable evidence hashes and domain counts, with
+no source payloads or connection credentials.
+
+Callers supply the generation and home directory, explicit target connection
+settings and expected schema owner, enrolled target identity, process owner,
+and batch limits. A batch contains 1–500 records and at most 150,994,944 framed
+bytes. Empty domains still receive a terminal checkpoint. Lease TTL is an
+integer from 1,000 through 86,400,000 milliseconds, defaulting to 300,000.
+The per-operation transaction/recovery budget is 1–10, defaulting to 3.
+Use the same batch limits when resuming a pending effect: its exact batch and
+predecessor are immutable, and a different batch is a conflict.
+
+The copy worker takes the project-wide `migration-copy` / `copy` lease.
+PostgreSQL checks its database-clock fence at both ends of each data transaction.
+An unresolved storage-publication lease blocks copy through normal project
+admission, including when that publication lease has expired. A copy lease
+never grants selection or activation authority.
+
+Each local pending effect is durable before its destination mutation. Even a
+successful COMMIT response must be followed by exact durable receipt readback
+before the local checkpoint advances. A lost response keeps the effect pending;
+recovery serializes with the original transaction and accepts only the exact
+run, immutable batch receipt, and checkpoint. Unavailable or conflicting proof
+cannot advance progress. Cancellation likewise leaves recoverable evidence;
+retry the same generation after resolving the reported condition.
+
+An ordinary destination-probe failure -- connection refusal, TLS negotiation,
+or schema mismatch -- is collapsed into an evidence-free `MigrationCopyError`
+with a fixed message and no attached cause, reason code, or payload. Only
+`PostgreSqlCommitOutcomeUnknownError` (an uncertain commit) is rethrown
+unsanitized so its own authoritative-readback recovery path can run. "Retry
+the same generation after resolving the reported condition" therefore means
+resolving the condition through the caller's own outer logging or destination
+diagnostics, not through any detail carried on `MigrationCopyError` itself;
+the error intentionally carries none, to avoid leaking destination-connection
+detail into the migration journal or its callers.
+
+`copied` means all 22 domains have terminal checkpoints and the destination's
+actual canonical content was compared before durable transfer completion.
+It does not mean the separate migration verification or activation steps have
+run. SQLite remains selected, maintenance stays held, and retained or newly
+appended post-cutoff events remain available for the later workflow. Keep the
+private snapshot, receipt/queue evidence, migration journal and destination
+transfer receipts until the full cutover lifecycle authorizes their removal.
+
+Witness recipe version 1 is shared with preparation and later verification.
+It binds the physical source, normalized paths, participant roster, immutable
+capture and queue/receipt roots, portable manifest, and explicit destination
+identity/schema/location. Changing that recipe invalidates an existing dry-run
+journal; a caller must not substitute new witnesses into a partially copied run.
+
+For recipe version 1, `checkpointBytes` in a batch-commit witness is the exact
+UTF-8 text returned by decoding `serializePortableCheckpoint(checkpoint)`.
+Its UTF-8 encoding must reproduce those canonical bytes exactly. It is not a
+parsed checkpoint object or an additional hash. This encoding clarification
+makes the byte witness representable by the canonical JSON hash function,
+which intentionally refuses typed arrays.
+
+### Copy cost and the publication fence
+
+Every checkpoint publish re-proves source authority under the held
+publication token before the local journal advances: the copy worker
+re-authenticates the source path, re-reads the maintenance journal, and fully
+re-inspects and re-hashes the authenticated snapshot artifact, then repeats
+the authenticate and journal read once more to close the window opened by
+that awaited re-inspection. This is deliberate fencing behavior, not an
+optimization gap left to be tidied up later: it is what lets a checkpoint
+publish trust that the source has not changed since it was captured, and
+removing any part of it would reopen a real window for the artifact to be
+tampered with or replaced between the check and the publish.
+
+Because of this, copy cost scales with the number of checkpoint publishes
+times the authenticated artifact's size, not with domain count alone: a
+22-domain copy with `maxRecords: 1` measured 46 of these full re-proofs in a
+single run, and they alone accounted for roughly 59% of that run's own wall
+time. That figure is a floor, not a ceiling. It came from a minimal
+`maxRecords: 1` fixture; the re-hash term grows with the artifact's actual
+byte size while the rest of the copy loop does not, so a realistically sized
+source database will spend a larger share of its copy time here, not a
+smaller one.
+
+Whether that re-proof can be made cheaper without weakening the fence -- for
+example an incremental or generation-scoped witness that still leaves the
+held publication token, authority bytes, maintenance journal bytes and phase,
+and snapshot bytes all provably unchanged -- is an open question tracked in
+[issue #1369](https://github.com/donadiosolutions/lcm/issues/1369). It is not
+part of this API's current contract.

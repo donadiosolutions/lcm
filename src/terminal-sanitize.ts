@@ -23,6 +23,10 @@ function terminalCodePointWidth(value: string): number {
     || (code >= 0xff00 && code <= 0xff60)
     || (code >= 0xffe0 && code <= 0xffe6)
     || (code >= 0x1f300 && code <= 0x1faff)
+    // Supplementary-plane CJK ideographs are East Asian Wide in UAX #11, so
+    // terminals render them at two columns like their BMP counterparts.
+    || (code >= 0x20000 && code <= 0x2fffd)
+    || (code >= 0x30000 && code <= 0x3fffd)
   ) ? 2 : 1;
 }
 

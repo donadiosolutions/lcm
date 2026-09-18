@@ -10972,6 +10972,87 @@ describe("worktree reconciliation", () => {
     expect(reconcileWorktrees(fixture.main)).toMatchObject({ status: "completed" });
   }, FULL_SUITE_SOURCE_STORE_REFENCING_TEST_TIMEOUT_MS);
 
+  it("blocks in-place source repair after durable completed-marker loss", () => {
+    const fixture = makeProjectReconciliation(home);
+    makeDatabase(fixture.targetPath, "durable-marker-target", "target", fixture.targetHash);
+    makeDatabase(fixture.sourcePath, "durable-marker-source", "source", fixture.sourceHash);
+    const source = new DatabaseSync(fixture.sourcePath);
+    source.exec(`
+      UPDATE promoted
+      SET content = CAST(X'6D656D6F727900736F75726365' AS TEXT)
+    `);
+    source.close();
+    const target = new DatabaseSync(fixture.targetPath);
+    target.exec(`
+      CREATE TABLE worktree_reconciliation_sources (
+        source_hash TEXT PRIMARY KEY,
+        merged_at TEXT NOT NULL DEFAULT (datetime('now'))
+      )
+    `);
+    target.prepare(
+      "INSERT INTO worktree_reconciliation_sources(source_hash) VALUES(?)",
+    ).run(fixture.sourceHash);
+    target.exec(`
+      UPDATE promoted
+      SET id = 'memory-durable-marker-source',
+          content = 'memory',
+          source_summary_id = 'summary-durable-marker-source',
+          project_id = '${fixture.targetHash}',
+          session_id = 'durable-marker-source'
+    `);
+    target.close();
+
+    const instrumentation = instrumentTargetReconciliationCommit(
+      () => undefined,
+      {
+        onBegin: (openedTarget) => {
+          openedTarget.prepare(
+            "DELETE FROM worktree_reconciliation_sources WHERE source_hash = ?",
+          ).run(fixture.sourceHash);
+        },
+      },
+    );
+    try {
+      expect(() => reconcileWorktrees(fixture.main)).toThrow(
+        "stored promoted content is unsupported",
+      );
+    } finally {
+      instrumentation.restore();
+    }
+
+    // The in-transaction deletion is restored by the target rollback, so model
+    // durable marker loss by removing it after the refusal instead.
+    const targetAfterRefusal = new DatabaseSync(fixture.targetPath);
+    targetAfterRefusal.prepare(
+      "DELETE FROM worktree_reconciliation_sources WHERE source_hash = ?",
+    ).run(fixture.sourceHash);
+    targetAfterRefusal.close();
+
+    // The source fence was committed before the target transaction, so the
+    // offline in-place repair documented in docs/privacy.md cannot run.
+    const retiredSource = new DatabaseSync(fixture.sourcePath);
+    try {
+      expect(() => retiredSource.exec("UPDATE promoted SET content = 'memory'")).toThrow(
+        "LCM source retired by worktree reconciliation",
+      );
+    } finally {
+      retiredSource.close();
+    }
+
+    // With the marker durably absent, a later run refuses at the source guard.
+    expect(() => reconcileWorktrees(fixture.main)).toThrow(
+      "stored promoted content is unsupported",
+    );
+    const preservedSource = new DatabaseSync(fixture.sourcePath, { readOnly: true });
+    expect(preservedSource.prepare("SELECT hex(content) AS content FROM promoted").get())
+      .toEqual({ content: "6D656D6F727900736F75726365" });
+    preservedSource.close();
+    const preservedTarget = new DatabaseSync(fixture.targetPath, { readOnly: true });
+    expect(preservedTarget.prepare("SELECT hex(content) AS content FROM promoted").get())
+      .toEqual({ content: "6D656D6F7279" });
+    preservedTarget.close();
+  }, FULL_SUITE_SOURCE_STORE_REFENCING_TEST_TIMEOUT_MS);
+
   it("refuses unsupported source message content if its completed marker disappears", () => {
     const fixture = makeProjectReconciliation(home);
     makeDatabase(fixture.targetPath, "message-marker-race-target", "target", fixture.targetHash);

@@ -644,6 +644,35 @@ describe("restart publication assertion convergence", () => {
     expect(scenario.stopAndStart).not.toHaveBeenCalled();
   });
 
+  // The live-clock variant above can short-circuit on the remaining-time check
+  // before the quarter-budget guard is ever consulted, so it only kills the
+  // `timeoutMs < 1` mutant when the machine happens to be fast enough. A stable
+  // monotonic clock pins the total deadline at three milliseconds, which makes
+  // the quarter budget round to zero deterministically on every host.
+  it("refuses a recovery birth probe whose budget rounds to zero", async () => {
+    const f = fixture();
+    const birthBudgets: Array<number | undefined> = [];
+    const scenario = managedRecovery(f, {
+      now: () => 1_000,
+      birth: (pid, _call, timeoutMs) => {
+        birthBudgets.push(timeoutMs);
+        return `birth-${pid}`;
+      },
+    });
+    scenario.restartOptions.spawnTimeoutMs = 3;
+
+    await expect(restartDaemon(scenario.restartOptions)).rejects.toBe(scenario.contention);
+
+    // Only the earlier publication-evidence capture, which runs on its own
+    // convergence deadline, may probe. The recovery path must refuse before
+    // spending a zero-millisecond birth budget.
+    expect(birthBudgets).toEqual([100]);
+    expect(scenario.stopAndStart).not.toHaveBeenCalled();
+    expect(scenario.ensure).not.toHaveBeenCalled();
+    expect(f.seams.killProcess).not.toHaveBeenCalled();
+    expect(f.seams.spawn).not.toHaveBeenCalled();
+  });
+
   it("bounds every recovery birth proof by the remaining lifecycle deadline", async () => {
     const f = fixture();
     const timeouts: Array<number | undefined> = [];
@@ -894,20 +923,37 @@ describe("restart publication assertion convergence", () => {
     expect(scenario.stopAndStart).not.toHaveBeenCalled();
   });
 
-  it("preserves contention for a generic health-fetch programming rejection", async () => {
-    const f = fixture();
-    const scenario = managedRecovery(f, {
-      fetch: vi.fn(async () => {
+  // A generic programming TypeError is not a daemon transport failure in either
+  // delivery form. An `async` seam only ever produces the rejected-promise
+  // form, so the synchronous throw needs its own control to prove the wrapper
+  // classifies both identically and authorizes no mutation.
+  it.each([
+    [
+      "a synchronous throw",
+      (): typeof globalThis.fetch => vi.fn((): never => {
         throw new TypeError("Cannot read properties of undefined");
       }) as never,
-    });
+    ],
+    [
+      "a rejected promise",
+      (): typeof globalThis.fetch => vi.fn(async (): Promise<never> => {
+        throw new TypeError("Cannot read properties of undefined");
+      }) as never,
+    ],
+  ] as const)(
+    "preserves contention for a generic health-fetch TypeError from %s",
+    async (_name, makeFetch) => {
+      const f = fixture();
+      const scenario = managedRecovery(f, { fetch: makeFetch() });
 
-    await expect(restartDaemon(scenario.restartOptions)).rejects.toBe(scenario.contention);
+      await expect(restartDaemon(scenario.restartOptions)).rejects.toBe(scenario.contention);
 
-    expect(scenario.stopAndStart).not.toHaveBeenCalled();
-    expect(scenario.ensure).not.toHaveBeenCalled();
-    expect(f.seams.killProcess).not.toHaveBeenCalled();
-  });
+      expect(scenario.stopAndStart).not.toHaveBeenCalled();
+      expect(scenario.ensure).not.toHaveBeenCalled();
+      expect(f.seams.killProcess).not.toHaveBeenCalled();
+      expect(f.seams.spawn).not.toHaveBeenCalled();
+    },
+  );
 
   it("preserves contention after response headers when the body times out", async () => {
     const f = fixture();
