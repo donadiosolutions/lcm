@@ -237,6 +237,9 @@ component_management:
         # in local persistence; this change does not alter component ownership.
         # #1084/#1085/#1092 keep SQLite UTC timestamp parsing in this owner.
         # #1203 keeps selected SQLite recall evidence and its owned query tokenizer here.
+        # #1330 retains the admitted database leaf and its parent directory
+        # across the SQLite open and carries file identity as exact decimal
+        # strings; both files keep this existing local-persistence owner.
         - "src/db/"
         # Captured UTF-8 decoding and immutable-file authority remain local-persistence-owned.
         # #618 optional receipt schema admission stays local-persistence-owned.
@@ -307,6 +310,8 @@ component_management:
         # #1247 keeps explicit promotion queue admission in this component.
         # #1229 admits local outbox health, recent-error, and delivery
         # diagnostics through an optional live publication token here.
+        # #1330 carries the outbox preflight identity as an exact decimal
+        # string rather than a rounded number; ownership is unchanged.
         - "^src/storage/local-hook-event-sequence\\.ts$"
         - "^src/storage/local-hook-outbox\\.ts$"
         - "^src/storage/local-hook-outbox-schema\\.ts$"
