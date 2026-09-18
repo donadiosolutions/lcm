@@ -743,6 +743,37 @@ describe("verifyMigrationGeneration: system-identifier comparison", () => {
   });
 });
 
+describe("verifyMigrationGeneration: source reauthentication (witness-audit source-witness comparator)", () => {
+  it("refuses when reauthenticate detects the source changed between the two calls", async () => {
+    // copySource.reauthenticate() is called twice: once right after the
+    // source opens, once after streaming completes. The witness audit
+    // names copy-source.ts's refuse() as sourceWitness's refusal and
+    // reauthenticateHeld's canonicalJson equality as its comparator; this
+    // proves the driver actually propagates that refusal rather than
+    // swallowing it or only checking once. A fixture where the second
+    // call, not the first, throws is the one that can actually fail: a
+    // driver that dropped the second reauthenticate() call entirely would
+    // still pass a fixture where only the first call is made to throw.
+    let calls = 0;
+    const copySource = fakeCopySource({
+      reauthenticate: async () => {
+        calls += 1;
+        if (calls === 2) throw new Error("migration copy source authority does not match");
+      },
+    });
+    const runtime = fakeRuntime();
+    const dependencies = dependenciesFor(copySource, runtime);
+    await expect(verifyMigrationGeneration(
+      baseInput({ homeDir: "/tmp/lcm-verify-source-reauthentication-drift" }),
+      dependencies,
+    )).rejects.toThrow("migration copy source authority does not match");
+    expect(calls).toBe(2);
+    // Never reached runtime creation, since the second reauthenticate()
+    // call sits before it in the driver's own ordering.
+    expect(runtime.close).not.toHaveBeenCalled();
+  });
+});
+
 describe("verifyMigrationGeneration: sequence self-consistency (P0)", () => {
   it("catches a reset sequence even though the census and every canonical digest are identical to a healthy fixture", async () => {
     stubDestinationPrimitives();

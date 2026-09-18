@@ -67,7 +67,7 @@ export const MIGRATION_WITNESS_AUDIT: readonly MigrationWitnessAuditEntry[] = Ob
     id: "source-witness", bodyField: "sourceWitness",
     description: "Source identity/schema/content witnesses, re-derived from the immutable snapshot artifact per step 1, never from the manifest.",
     comparison: "structurally-protected",
-    onDifference: "n/a: identitySha256 is artifact.sourceSelectionSha256, and reauthenticate() re-proves the artifact unchanged under the publication barrier immediately around the read. A caller cannot substitute different bytes without a different generationId/homeDir, which opens a different generation entirely rather than producing drift within this one.",
+    onDifference: "n/a: identitySha256 is artifact.sourceSelectionSha256. Named comparator: copy-source.ts's reauthenticateHeld compares canonicalJson(authenticateSqliteMigrationSource(...)) against canonicalJson(authority) and canonicalJson(observed) against canonicalJson(snapshot), both re-derived fresh under the publication append barrier immediately around the read (once before streaming, once after, per verify-generation.ts's two copySource.reauthenticate() calls). Named refusal: copy-source.ts's refuse(), which throws synchronously and propagates out of the driver uncaught -- proven live by test/migration/copy-source.test.ts's symlink-swap case and by verify-generation.test.ts's 'refuses when reauthenticate detects the source changed between the two calls' case. A caller cannot substitute different bytes without a different generationId/homeDir, which opens a different generation entirely rather than producing drift within this one.",
   },
   {
     id: "destination-identity-sealed-witness", bodyField: "destinationIdentity",
