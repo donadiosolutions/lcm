@@ -107,6 +107,7 @@ function findUrlPathStarts(chars: readonly string[]): UrlPathStarts {
   const nestedFileUrlParentOwnerBracketDepths = new Set<number>();
   const restartedNestedFileUrlParentOwnerBracketDepths = new Set<number>();
   const suspendedPathlessFileQueryOwnerDepths = new Set<number>();
+  const closedChildGroupRootedOwnerDepths = new Set<number>();
   let pathlessFileQueryScopeActive = false;
   let schemeLength = 0;
   let fileSchemeLength = 0;
@@ -159,6 +160,7 @@ function findUrlPathStarts(chars: readonly string[]): UrlPathStarts {
       nestedFileUrlParentOwnerBracketDepths.clear();
       restartedNestedFileUrlParentOwnerBracketDepths.clear();
       suspendedPathlessFileQueryOwnerDepths.clear();
+      closedChildGroupRootedOwnerDepths.clear();
       pathlessFileQueryScopeActive = false;
       activeNestedFileUrlParentOwnerBracketDepth = 0;
       queryOrFragment = false;
@@ -201,7 +203,15 @@ function findUrlPathStarts(chars: readonly string[]): UrlPathStarts {
       }
     }
     if (closingPathlessFileQueryOwnerDepth > 0) {
-      nestedFileUrlParentOwnerBracketDepths.delete(closingPathlessFileQueryOwnerDepth);
+      if (nestedFileUrlParentOwnerBracketDepths.delete(closingPathlessFileQueryOwnerDepth)) {
+        // A closed child group takes its word-bearing ownership with it, but a
+        // rooted successor is still private text belonging to the enclosing
+        // scope. Hand that narrower ownership outward instead of dropping it.
+        closedChildGroupRootedOwnerDepths.add(closingPathlessFileQueryOwnerDepth - 1);
+        if (chars[index + 1] === "/" || chars[index + 1] === "\\") {
+          forcedPath[index + 1] = 1;
+        }
+      }
       restartedNestedFileUrlParentOwnerBracketDepths.delete(closingPathlessFileQueryOwnerDepth);
       if (closingPathlessFileQueryOwnerDepth === activeNestedFileUrlParentOwnerBracketDepth) {
         activeNestedFileUrlParentOwnerBracketDepth = 0;
@@ -402,7 +412,8 @@ function findUrlPathStarts(chars: readonly string[]): UrlPathStarts {
       }
     }
     if (
-      nestedFileUrlParentOwnerBracketDepths.size > 0 &&
+      (nestedFileUrlParentOwnerBracketDepths.size > 0 ||
+        closedChildGroupRootedOwnerDepths.has(pathlessFileQueryOwnerBracketDepth)) &&
       !exactFileScheme &&
       separator < 0 &&
       (char === "&" || char === "|")
@@ -410,6 +421,7 @@ function findUrlPathStarts(chars: readonly string[]): UrlPathStarts {
       if (chars[index + 1] === "/" || chars[index + 1] === "\\") {
         forcedPath[index + 1] = 1;
       } else if (
+        nestedFileUrlParentOwnerBracketDepths.size > 0 &&
         !restartedNestedFileUrlParentOwnerBracketDepths.has(pathlessFileQueryOwnerBracketDepth)
       ) {
         // Returning from a nested file child does not make every relative

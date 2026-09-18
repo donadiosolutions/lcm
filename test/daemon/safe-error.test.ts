@@ -4129,17 +4129,21 @@ describe("sanitizeError", () => {
     [
       "ampersand nested child",
       "file://h?x=[[https://e.test/t&file://host?key=/public]\\Users\\SECRET\\x]",
-      "file://h?x=[[https://e.test/t&file://host?key=<path>]\\Users\\SECRET\\x]",
+      "file://h?x=[[https://e.test/t&file://host?key=<path>]<path>]",
     ],
     [
       "pipe nested child",
       "file://h?x=[[https://e.test/t|file://host?key=/public]\\Users\\SECRET\\x]",
-      "file://h?x=[[https://e.test/t|file://host?key=<path>]\\Users\\SECRET\\x]",
+      "file://h?x=[[https://e.test/t|file://host?key=<path>]<path>]",
     ],
-  ] as const)("keeps the query-only nested-file handoff scoped inside its own bracket for %s", (_name, input, expected) => {
+    // Renamed from "keeps the query-only nested-file handoff scoped inside its
+    // own bracket". That name asserted a scoping boundary that Bug #1346 showed
+    // to be a disclosure, and the name must describe what is pinned now.
+  ] as const)("redacts a rooted tail after a closed nested-file child group for %s", (_name, input, expected) => {
     const first = sanitizeError(input);
 
     expect(first).toBe(expected);
+    expect(first).not.toContain("SECRET");
     expect(sanitizeError(first)).toBe(first);
     expect(sanitizeError(sanitizeError(first))).toBe(first);
   });
@@ -4335,6 +4339,55 @@ describe("sanitizeError", () => {
   it("ends sibling wrapper scope at whitespace", () => {
     const input = "file://h?x=[file://a?key=/pub&\\Users\\S1\\x] &[file://b?key2=/pub2|\\Users\\S2\\y]";
     const expected = "file://h?x=[file://a?key=<path>&<path>] &[file://b?key2=<path>|\\Users\\S2\\y]";
+    const first = sanitizeError(input);
+
+    expect(first).toBe(expected);
+    expect(sanitizeError(first)).toBe(first);
+    expect(sanitizeError(sanitizeError(first))).toBe(first);
+  });
+
+  it.each([
+    [
+      "bare rooted tail after a deeper child group",
+      "file://h?x=[[https://e.test/t|file://host?key=/public]\\Users\\SECRET\\x]",
+      "file://h?x=[[https://e.test/t|file://host?key=<path>]<path>]",
+    ],
+    [
+      "pipe delimiter after the wrapper closes",
+      "file://h?x=[file://host?key=/Users/a/private]|\\Users\\SECRET\\x",
+      "file://h?x=[file://host?key=<path>]|<path>",
+    ],
+    [
+      "ampersand delimiter after the wrapper closes",
+      "file://h?x=[file://host?key=/Users/a/private]&\\Users\\SECRET\\x",
+      "file://h?x=[file://host?key=<path>]&<path>",
+    ],
+    [
+      "POSIX root after the wrapper closes",
+      "file://h?x=[file://host?key=/Users/a/private]|/Users/SECRET/x",
+      "file://h?x=[file://host?key=<path>]|<path>",
+    ],
+  ] as const)("hands rooted ownership outward at a bracket close (Bug #1346 shape 2): %s", (_name, input, expected) => {
+    const first = sanitizeError(input);
+
+    expect(first).toBe(expected);
+    expect(first).not.toContain("SECRET");
+    expect(sanitizeError(first)).toBe(first);
+    expect(sanitizeError(sanitizeError(first))).toBe(first);
+  });
+
+  it.each([
+    [
+      "word-bearing relative still expires at the close",
+      "file://h?x=[file:///Users/a/one?key=/public&later/Users/tail/secret]&later/Users/outside",
+      "file://h?x=[file://<path>?key=<path>&later<path>]&later/Users/outside",
+    ],
+    [
+      "whitespace still ends outward ownership",
+      "file://h?x=[file://host?key=/Users/a/private] |\\Users\\SECRET\\x",
+      "file://h?x=[file://host?key=<path>] |\\Users\\SECRET\\x",
+    ],
+  ] as const)("bounds Bug #1346 outward ownership: %s", (_name, input, expected) => {
     const first = sanitizeError(input);
 
     expect(first).toBe(expected);
