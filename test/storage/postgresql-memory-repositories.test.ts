@@ -244,7 +244,9 @@ describe("PostgreSQL memory repositories", () => {
 
     expect(db.query.mock.calls).toHaveLength(1);
     const [config] = db.query.mock.calls[0]!;
-    expect(config.text).toContain("WHERE memory.project_id = $1");
+    expect(config.text.replace(/\s+/g, " ")).toContain(
+      "WHERE memory.project_id OPERATOR(pg_catalog.=) $1::pg_catalog.uuid",
+    );
     expect(config.text).toContain("AND memory.archived_at IS NULL");
     expect(config.text).toContain(
       "AND memory.content_sha256 OPERATOR(pg_catalog.=)",
@@ -1027,5 +1029,326 @@ describe("PostgreSQL memory repositories", () => {
       field: "scope_hash",
       operation: "upsertSessionInstructions",
     });
+  });
+
+  it("qualifies every identity predicate and bind type against pg_catalog", async () => {
+    const identityColumns = [
+      "project_id",
+      "memory_id",
+      "source_project_id",
+      "session_id",
+      "session_id_sha256",
+      "ingest_key",
+      "machine_id",
+      "scope_hash",
+      "client_name",
+      "worktree_path",
+      "cwd_path",
+    ];
+    const unqualifiedIdentityEquality = new RegExp(
+      "\\b(?:" + identityColumns.join("|") + ")\\b"
+        + "(?:::pg_catalog\\.[a-z0-9_]+)?\\s*=(?!=)",
+    );
+    const db = executor((config) => {
+      if (config.text.includes("INSERT INTO lcm.promoted_memories")) {
+        return result([{ memory_id: memoryId }]);
+      }
+      if (config.text.includes("UPDATE lcm.promoted_memories")
+          && config.text.includes("RETURNING memory_id")) {
+        return result([{ memory_id: memoryId }]);
+      }
+      if (config.text.includes("days_since_created")) {
+        return result([{
+          ...memoryRow,
+          surfacing_count: "2",
+          usage_count: "0",
+          days_since_created: "120",
+        }]);
+      }
+      if (config.text.includes("SELECT content")) {
+        return result([{ content: "durable" }]);
+      }
+      if (config.text.includes("last_surfaced_at")) {
+        return result([{
+          memory_id: "memory-a",
+          usage_count: "1",
+          surfacing_count: "2",
+          last_surfaced_at: "2026-01-03T00:00:00.000Z",
+        }]);
+      }
+      if (config.text.includes("top_recalled")) {
+        return result([{
+          memories_surfaced: "2",
+          memories_acted_upon: "1",
+          top_recalled: [],
+        }]);
+      }
+      if (config.text.includes("AS gitleaks")) {
+        return result([{
+          gitleaks: "1",
+          built_in: "2",
+          global: "3",
+          project: "4",
+        }]);
+      }
+      if (config.text.includes("WITH deleted AS")) {
+        return result([{ count: "1" }]);
+      }
+      if (config.text.includes("FROM lcm.session_ingest_log")) {
+        return result([ingestRow]);
+      }
+      if (config.text.includes("FROM lcm.session_instructions")) {
+        return result([{
+          client_name: instructionScope.clientName,
+          session_id: instructionScope.sessionId,
+          worktree_path: instructionScope.worktreePath,
+          cwd_path: instructionScope.cwdPath,
+          content: "rules",
+          content_hash: "hash",
+          updated_at: "2026-01-04T00:00:00.000Z",
+        }]);
+      }
+      if (config.text.includes("INSERT INTO lcm.session_instructions")) {
+        return result([{ instruction_id: "1" }]);
+      }
+      if (config.text.includes("SELECT memory.memory_id")) {
+        return result([memoryRow]);
+      }
+      return result([]);
+    });
+    const memories = new PostgreSqlPromotedMemoryRepository(db, projectId);
+    const recall = new PostgreSqlRecallRepository(db, projectId);
+    const redaction = new PostgreSqlRedactionAdminRepository(db, projectId);
+    const coordination = new PostgreSqlCoordinationRepository(
+      db,
+      projectId,
+      machineId,
+    );
+
+    await memories.insert({ content: "durable", tags: ["architecture"] });
+    await memories.getById(memoryId);
+    await memories.findExactContent("durable", "source-a");
+    await memories.getAll({ sourceProjectId: "source-a", tags: ["Mixed"] });
+    await memories.listContentPrefixes(2);
+    await memories.update(memoryId, { content: "updated", tags: ["updated"] });
+    await memories.archive(memoryId);
+    await memories.revive(memoryId);
+    await memories.deleteById(memoryId);
+    await memories.findStale({
+      staleAfterDays: 1,
+      staleSurfacingWithoutUseLimit: 2,
+      sourceProjectId: "source-a",
+    });
+    await recall.logSurfacing(["memory-a"], "session-a");
+    await recall.getFeedback(["memory-a"]);
+    await recall.getStats();
+    await redaction.upsertCounts({
+      gitleaks: 1,
+      builtIn: 0,
+      global: 0,
+      project: 0,
+    });
+    await redaction.getCounts();
+    await redaction.purgeProjectState();
+    await coordination.getSessionIngest("session-a");
+    await coordination.recordSessionIngest("session-a", 4);
+    await coordination.getSessionInstructions(instructionScope);
+    await coordination.upsertSessionInstructions(
+      instructionScope,
+      "rules",
+      "hash",
+    );
+    await coordination.deleteSessionInstructions(instructionScope);
+
+    const statements = db.query.mock.calls
+      .map(([config]) => (config as QueryConfig<unknown[]>).text);
+    expect(statements.length).toBeGreaterThan(20);
+    expect(statements.filter((statement) =>
+      unqualifiedIdentityEquality.test(statement))).toEqual([]);
+
+    const flat = (statement: string): string =>
+      statement.replace(/\s+/g, " ").trim();
+    const find = (...needles: string[]): string => {
+      const match = statements.find((statement) =>
+        needles.every((needle) => statement.includes(needle)));
+      expect(match).toBeDefined();
+      return flat(match!);
+    };
+
+    const byId = find(
+      "FROM lcm.promoted_memories AS memory",
+      "AND memory.memory_id OPERATOR",
+    );
+    expect(byId).toContain(
+      "WHERE tag.project_id OPERATOR(pg_catalog.=) memory.project_id"
+        + " AND tag.memory_id OPERATOR(pg_catalog.=) memory.memory_id",
+    );
+    expect(byId).toContain(
+      "WHERE memory.project_id OPERATOR(pg_catalog.=) $1::pg_catalog.uuid"
+        + " AND memory.memory_id OPERATOR(pg_catalog.=) $2::pg_catalog.uuid",
+    );
+    expect(find("content_sha256")).toContain(
+      "WHERE memory.project_id OPERATOR(pg_catalog.=) $1::pg_catalog.uuid"
+        + " AND memory.archived_at IS NULL",
+    );
+    const all = find("AS requested(tag)");
+    expect(all).toContain(
+      "WHERE memory.project_id OPERATOR(pg_catalog.=) $1::pg_catalog.uuid",
+    );
+    expect(all).toContain(
+      "OR memory.source_project_id OPERATOR(pg_catalog.=) $2::pg_catalog.text)",
+    );
+    expect(all).toContain(
+      "WHERE stored.project_id OPERATOR(pg_catalog.=) memory.project_id"
+        + " AND stored.memory_id OPERATOR(pg_catalog.=) memory.memory_id"
+        + " AND stored.tag = requested.tag",
+    );
+    expect(find("SELECT content")).toContain(
+      "WHERE project_id OPERATOR(pg_catalog.=) $1::pg_catalog.uuid"
+        + " AND archived_at IS NULL",
+    );
+    expect(find("UPDATE lcm.promoted_memories", "RETURNING memory_id"))
+      .toContain(
+        "WHERE project_id OPERATOR(pg_catalog.=) $1::pg_catalog.uuid"
+          + " AND memory_id OPERATOR(pg_catalog.=) $2::pg_catalog.uuid"
+          + " RETURNING memory_id",
+      );
+    expect(find("DELETE FROM lcm.promoted_memory_tags", "AND memory_id OPERATOR"))
+      .toContain(
+        "WHERE project_id OPERATOR(pg_catalog.=) $1::pg_catalog.uuid"
+          + " AND memory_id OPERATOR(pg_catalog.=) $2::pg_catalog.uuid",
+      );
+    expect(find("SET archived_at")).toContain(
+      "WHERE project_id OPERATOR(pg_catalog.=) $1::pg_catalog.uuid"
+        + " AND memory_id OPERATOR(pg_catalog.=) $2::pg_catalog.uuid",
+    );
+    expect(find("DELETE FROM lcm.promoted_memories", "AND memory_id OPERATOR"))
+      .toContain(
+        "WHERE project_id OPERATOR(pg_catalog.=) $1::pg_catalog.uuid"
+          + " AND memory_id OPERATOR(pg_catalog.=) $2::pg_catalog.uuid",
+      );
+
+    const stale = find("days_since_created");
+    expect(stale).toContain(
+      "WHERE candidate.project_id OPERATOR(pg_catalog.=) signal.project_id"
+        + " AND candidate.memory_id OPERATOR(pg_catalog.=) signal.memory_id",
+    );
+    expect(stale).toContain(
+      "WHERE signal.project_id OPERATOR(pg_catalog.=) $1::pg_catalog.uuid",
+    );
+    expect(stale).toContain(
+      "WHERE marker.project_id OPERATOR(pg_catalog.=) signal.project_id"
+        + " AND marker.memory_id OPERATOR(pg_catalog.=) signal.memory_id",
+    );
+    expect(stale).toContain(
+      "WHERE surfaced.project_id OPERATOR(pg_catalog.=) memory.project_id"
+        + " AND surfaced.memory_id OPERATOR(pg_catalog.=)"
+        + " memory.memory_id::pg_catalog.text",
+    );
+    expect(stale).toContain(
+      "ON usage.memory_id OPERATOR(pg_catalog.=)"
+        + " memory.memory_id::pg_catalog.text",
+    );
+    expect(stale).toContain(
+      "WHERE memory.project_id OPERATOR(pg_catalog.=) $1::pg_catalog.uuid",
+    );
+    expect(stale).toContain(
+      "OR memory.source_project_id OPERATOR(pg_catalog.=) $3::pg_catalog.text)",
+    );
+
+    const feedback = find("last_surfaced_at");
+    expect(feedback).toContain(
+      "ON requested.memory_id OPERATOR(pg_catalog.=) surfacing.memory_id"
+        + " WHERE surfacing.project_id OPERATOR(pg_catalog.=)"
+        + " $1::pg_catalog.uuid",
+    );
+    expect(feedback).toContain(
+      "ON requested.memory_id OPERATOR(pg_catalog.=)"
+        + " pg_catalog.substr(reference.tag, 11)",
+    );
+    expect(feedback).toContain(
+      "WHERE candidate.project_id OPERATOR(pg_catalog.=) signal.project_id"
+        + " AND candidate.memory_id OPERATOR(pg_catalog.=) signal.memory_id",
+    );
+
+    const stats = find("top_recalled");
+    expect(stats).toContain(
+      "ON memory.project_id OPERATOR(pg_catalog.=) $1::pg_catalog.uuid"
+        + " AND memory.memory_id::pg_catalog.text OPERATOR(pg_catalog.=)"
+        + " usage.memory_id",
+    );
+    expect(stats).toContain(
+      "WHERE surfacing.project_id OPERATOR(pg_catalog.=) $1::pg_catalog.uuid",
+    );
+    expect(stats).toContain(
+      "WHERE marker.project_id OPERATOR(pg_catalog.=) signal.project_id"
+        + " AND marker.memory_id OPERATOR(pg_catalog.=) signal.memory_id",
+    );
+
+    expect(find("AS gitleaks")).toContain(
+      "FROM lcm.redaction_counters"
+        + " WHERE project_id OPERATOR(pg_catalog.=) $1::pg_catalog.uuid",
+    );
+    for (const table of [
+      "lcm.promoted_memory_tags",
+      "lcm.recall_surfacing",
+      "lcm.redaction_counters",
+      "lcm.session_ingest_log",
+      "lcm.session_instructions",
+      "lcm.promoted_memories",
+    ]) {
+      expect(find("DELETE FROM " + table, "RETURNING 1")).toContain(
+        "DELETE FROM " + table
+          + " WHERE project_id OPERATOR(pg_catalog.=) $1::pg_catalog.uuid"
+          + " RETURNING 1",
+      );
+    }
+
+    const ingestReads = statements.filter((statement) =>
+      statement.includes("SELECT ingest_key, session_id"));
+    const ingestIdentity = "WHERE project_id OPERATOR(pg_catalog.=)"
+      + " $1::pg_catalog.uuid"
+      + " AND session_id_sha256 OPERATOR(pg_catalog.=)"
+      + " public.digest($2, 'sha256')"
+      + " AND session_id OPERATOR(pg_catalog.=) $2::pg_catalog.text"
+      + " ORDER BY ingest_key LIMIT 1";
+    const plainRead = ingestReads.find((statement) =>
+      !statement.includes("FOR UPDATE"));
+    const lockedRead = ingestReads.find((statement) =>
+      statement.includes("FOR UPDATE"));
+    expect(plainRead).toBeDefined();
+    expect(lockedRead).toBeDefined();
+    expect(flat(plainRead!)).toContain(ingestIdentity);
+    expect(flat(lockedRead!)).toContain(ingestIdentity + " FOR UPDATE");
+    expect(plainRead).not.toContain("public.digest($2::");
+    expect(lockedRead).not.toContain("public.digest($2::");
+    expect(find("UPDATE lcm.session_ingest_log")).toContain(
+      "WHERE project_id OPERATOR(pg_catalog.=) $1::pg_catalog.uuid"
+        + " AND ingest_key OPERATOR(pg_catalog.=) $2::pg_catalog.uuid",
+    );
+
+    const instructionScopeIdentity =
+      "WHERE project_id OPERATOR(pg_catalog.=) $1::pg_catalog.uuid"
+        + " AND machine_id OPERATOR(pg_catalog.=) $2::pg_catalog.uuid"
+        + " AND scope_hash OPERATOR(pg_catalog.=) $3::pg_catalog.text"
+        + " AND client_name OPERATOR(pg_catalog.=) $4::pg_catalog.text"
+        + " AND session_id OPERATOR(pg_catalog.=) $5::pg_catalog.text"
+        + " AND worktree_path OPERATOR(pg_catalog.=) $6::pg_catalog.text"
+        + " AND cwd_path OPERATOR(pg_catalog.=) $7::pg_catalog.text";
+    expect(find("SELECT client_name, session_id")).toContain(
+      instructionScopeIdentity + " LIMIT 1",
+    );
+    expect(find("DELETE FROM lcm.session_instructions", "AND cwd_path OPERATOR"))
+      .toContain(instructionScopeIdentity);
+    expect(find("INSERT INTO lcm.session_instructions")).toContain(
+      "WHERE lcm.session_instructions.client_name OPERATOR(pg_catalog.=)"
+        + " EXCLUDED.client_name"
+        + " AND lcm.session_instructions.session_id OPERATOR(pg_catalog.=)"
+        + " EXCLUDED.session_id"
+        + " AND lcm.session_instructions.worktree_path OPERATOR(pg_catalog.=)"
+        + " EXCLUDED.worktree_path"
+        + " AND lcm.session_instructions.cwd_path OPERATOR(pg_catalog.=)"
+        + " EXCLUDED.cwd_path",
+    );
   });
 });

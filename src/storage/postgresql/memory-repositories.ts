@@ -145,8 +145,8 @@ const MEMORY_COLUMNS = `
     (
       SELECT pg_catalog.jsonb_agg(tag.tag ORDER BY tag.ordinal)
       FROM lcm.promoted_memory_tags AS tag
-      WHERE tag.project_id = memory.project_id
-        AND tag.memory_id = memory.memory_id
+      WHERE tag.project_id OPERATOR(pg_catalog.=) memory.project_id
+        AND tag.memory_id OPERATOR(pg_catalog.=) memory.memory_id
     ),
     '[]'::pg_catalog.jsonb
   ) AS tags,
@@ -726,8 +726,10 @@ implements PromotedMemoryRepository {
       const result = await executor.query<MemoryRow>({
         text: `SELECT ${MEMORY_COLUMNS}
                FROM lcm.promoted_memories AS memory
-               WHERE memory.project_id = $1
-                 AND memory.memory_id = $2`,
+               WHERE memory.project_id OPERATOR(pg_catalog.=)
+                   $1::pg_catalog.uuid
+                 AND memory.memory_id OPERATOR(pg_catalog.=)
+                   $2::pg_catalog.uuid`,
         values: [this.access.projectId, memoryId],
       }, this.access.context(operation));
       const row = result.rows[0];
@@ -762,7 +764,8 @@ implements PromotedMemoryRepository {
       const result = await executor.query<MemoryRow>({
         text: `SELECT ${MEMORY_COLUMNS}
                FROM lcm.promoted_memories AS memory
-               WHERE memory.project_id = $1
+               WHERE memory.project_id OPERATOR(pg_catalog.=)
+                   $1::pg_catalog.uuid
                  AND memory.archived_at IS NULL
                  AND memory.content_sha256 OPERATOR(pg_catalog.=)
                    public.digest($2, 'sha256')
@@ -809,10 +812,12 @@ implements PromotedMemoryRepository {
       const result = await executor.query<MemoryRow>({
         text: `SELECT ${MEMORY_COLUMNS}
                FROM lcm.promoted_memories AS memory
-               WHERE memory.project_id = $1
+               WHERE memory.project_id OPERATOR(pg_catalog.=)
+                   $1::pg_catalog.uuid
                  AND memory.archived_at IS NULL
                  AND ($2::pg_catalog.text IS NULL
-                      OR memory.source_project_id = $2)
+                      OR memory.source_project_id OPERATOR(pg_catalog.=)
+                        $2::pg_catalog.text)
                  AND ($3::pg_catalog.timestamptz IS NULL
                       OR memory.created_at >= $3)
                  AND NOT EXISTS (
@@ -823,8 +828,10 @@ implements PromotedMemoryRepository {
                    WHERE NOT EXISTS (
                      SELECT 1
                      FROM lcm.promoted_memory_tags AS stored
-                     WHERE stored.project_id = memory.project_id
-                       AND stored.memory_id = memory.memory_id
+                     WHERE stored.project_id OPERATOR(pg_catalog.=)
+                         memory.project_id
+                       AND stored.memory_id OPERATOR(pg_catalog.=)
+                         memory.memory_id
                        AND stored.tag = requested.tag
                    )
                  )
@@ -856,7 +863,7 @@ implements PromotedMemoryRepository {
       const result = await executor.query<{ content: unknown }>({
         text: `SELECT content
                FROM lcm.promoted_memories
-               WHERE project_id = $1
+               WHERE project_id OPERATOR(pg_catalog.=) $1::pg_catalog.uuid
                  AND archived_at IS NULL
                ORDER BY created_at, memory_id
                LIMIT $2`,
@@ -884,8 +891,8 @@ implements PromotedMemoryRepository {
     await this.access.atomic(operation, async (executor) => {
       await executor.query({
         text: `DELETE FROM lcm.promoted_memories
-               WHERE project_id = $1
-                 AND memory_id = $2`,
+               WHERE project_id OPERATOR(pg_catalog.=) $1::pg_catalog.uuid
+                 AND memory_id OPERATOR(pg_catalog.=) $2::pg_catalog.uuid`,
         values: [this.access.projectId, memoryId],
       }, this.access.context(operation));
     });
@@ -955,8 +962,8 @@ implements PromotedMemoryRepository {
                      WHEN $7 THEN $8::pg_catalog.jsonb
                      ELSE metadata
                    END
-               WHERE project_id = $1
-                 AND memory_id = $2
+               WHERE project_id OPERATOR(pg_catalog.=) $1::pg_catalog.uuid
+                 AND memory_id OPERATOR(pg_catalog.=) $2::pg_catalog.uuid
                RETURNING memory_id`,
         values: [
           this.access.projectId,
@@ -972,8 +979,8 @@ implements PromotedMemoryRepository {
       if (updated.rows.length === 0 || !hasTags) return;
       await executor.query({
         text: `DELETE FROM lcm.promoted_memory_tags
-               WHERE project_id = $1
-                 AND memory_id = $2`,
+               WHERE project_id OPERATOR(pg_catalog.=) $1::pg_catalog.uuid
+                 AND memory_id OPERATOR(pg_catalog.=) $2::pg_catalog.uuid`,
         values: [this.access.projectId, memoryId],
       }, this.access.context(operation));
       if (inputTags.length > 0) {
@@ -1030,22 +1037,27 @@ implements PromotedMemoryRepository {
                  INNER JOIN LATERAL (
                    SELECT candidate.tag
                    FROM lcm.promoted_memory_tags AS candidate
-                   WHERE candidate.project_id = signal.project_id
-                     AND candidate.memory_id = signal.memory_id
+                   WHERE candidate.project_id OPERATOR(pg_catalog.=)
+                       signal.project_id
+                     AND candidate.memory_id OPERATOR(pg_catalog.=)
+                       signal.memory_id
                      AND pg_catalog.substr(candidate.tag, 1, 10)
                        = 'memory_id:'
                    ORDER BY candidate.ordinal
                    LIMIT 1
                  ) AS reference ON TRUE
-                 WHERE signal.project_id = $1
+                 WHERE signal.project_id OPERATOR(pg_catalog.=)
+                     $1::pg_catalog.uuid
                    AND signal.archived_at IS NULL
                    AND EXISTS (
                      SELECT 1
                      FROM lcm.promoted_memory_tags AS marker
-                     WHERE marker.project_id = signal.project_id
-                       AND marker.memory_id = signal.memory_id
+                     WHERE marker.project_id OPERATOR(pg_catalog.=)
+                         signal.project_id
+                       AND marker.memory_id OPERATOR(pg_catalog.=)
+                         signal.memory_id
                        AND marker.tag = 'signal:memory_used'
-                   )
+                     )
                  GROUP BY pg_catalog.substr(reference.tag, 11)
                ),
                candidates AS (
@@ -1063,18 +1075,23 @@ implements PromotedMemoryRepository {
                  LEFT JOIN LATERAL (
                    SELECT pg_catalog.count(*) AS surfacing_count
                    FROM lcm.recall_surfacing AS surfaced
-                   WHERE surfaced.project_id = memory.project_id
-                     AND surfaced.memory_id = memory.memory_id::pg_catalog.text
+                   WHERE surfaced.project_id OPERATOR(pg_catalog.=)
+                       memory.project_id
+                     AND surfaced.memory_id OPERATOR(pg_catalog.=)
+                       memory.memory_id::pg_catalog.text
                  ) AS surfacing ON TRUE
                  LEFT JOIN usage_counts AS usage
-                   ON usage.memory_id = memory.memory_id::pg_catalog.text
-                 WHERE memory.project_id = $1
+                   ON usage.memory_id OPERATOR(pg_catalog.=)
+                     memory.memory_id::pg_catalog.text
+                 WHERE memory.project_id OPERATOR(pg_catalog.=)
+                     $1::pg_catalog.uuid
                    AND memory.archived_at IS NULL
                    AND memory.created_at
                      < statement_timestamp()
                        - (INTERVAL '1 day' * $2::pg_catalog.float8)
                    AND ($3::pg_catalog.text IS NULL
-                        OR memory.source_project_id = $3)
+                        OR memory.source_project_id OPERATOR(pg_catalog.=)
+                          $3::pg_catalog.text)
                )
                SELECT ${MEMORY_COLUMNS},
                       memory.surfacing_count,
@@ -1166,8 +1183,8 @@ implements PromotedMemoryRepository {
                  WHEN $3 THEN NULL
                  ELSE GREATEST(statement_timestamp(), created_at)
                END
-               WHERE project_id = $1
-                 AND memory_id = $2`,
+               WHERE project_id OPERATOR(pg_catalog.=) $1::pg_catalog.uuid
+                 AND memory_id OPERATOR(pg_catalog.=) $2::pg_catalog.uuid`,
         values: [this.access.projectId, memoryId, active],
       }, this.access.context(operation));
     });
@@ -1255,8 +1272,10 @@ export class PostgreSqlRecallRepository implements RecallRepository {
                           AS last_surfaced_at
                  FROM lcm.recall_surfacing AS surfacing
                  INNER JOIN requested
-                   ON requested.memory_id = surfacing.memory_id
-                 WHERE surfacing.project_id = $1
+                   ON requested.memory_id OPERATOR(pg_catalog.=)
+                     surfacing.memory_id
+                 WHERE surfacing.project_id OPERATOR(pg_catalog.=)
+                     $1::pg_catalog.uuid
                  GROUP BY surfacing.memory_id
                ),
                used AS (
@@ -1267,25 +1286,30 @@ export class PostgreSqlRecallRepository implements RecallRepository {
                  INNER JOIN LATERAL (
                    SELECT candidate.tag
                    FROM lcm.promoted_memory_tags AS candidate
-                   WHERE candidate.project_id = signal.project_id
-                     AND candidate.memory_id = signal.memory_id
+                   WHERE candidate.project_id OPERATOR(pg_catalog.=)
+                       signal.project_id
+                     AND candidate.memory_id OPERATOR(pg_catalog.=)
+                       signal.memory_id
                      AND pg_catalog.substr(candidate.tag, 1, 10)
                        = 'memory_id:'
                    ORDER BY candidate.ordinal
                    LIMIT 1
                  ) AS reference ON TRUE
                  INNER JOIN requested
-                   ON requested.memory_id
-                     = pg_catalog.substr(reference.tag, 11)
-                 WHERE signal.project_id = $1
+                   ON requested.memory_id OPERATOR(pg_catalog.=)
+                     pg_catalog.substr(reference.tag, 11)
+                 WHERE signal.project_id OPERATOR(pg_catalog.=)
+                     $1::pg_catalog.uuid
                    AND signal.archived_at IS NULL
                    AND EXISTS (
                      SELECT 1
                      FROM lcm.promoted_memory_tags AS marker
-                     WHERE marker.project_id = signal.project_id
-                       AND marker.memory_id = signal.memory_id
+                     WHERE marker.project_id OPERATOR(pg_catalog.=)
+                         signal.project_id
+                       AND marker.memory_id OPERATOR(pg_catalog.=)
+                         signal.memory_id
                        AND marker.tag = 'signal:memory_used'
-                   )
+                     )
                  GROUP BY pg_catalog.substr(reference.tag, 11)
                )
                SELECT requested.memory_id,
@@ -1356,22 +1380,27 @@ export class PostgreSqlRecallRepository implements RecallRepository {
                  INNER JOIN LATERAL (
                    SELECT candidate.tag
                    FROM lcm.promoted_memory_tags AS candidate
-                   WHERE candidate.project_id = signal.project_id
-                     AND candidate.memory_id = signal.memory_id
+                   WHERE candidate.project_id OPERATOR(pg_catalog.=)
+                       signal.project_id
+                     AND candidate.memory_id OPERATOR(pg_catalog.=)
+                       signal.memory_id
                      AND pg_catalog.substr(candidate.tag, 1, 10)
                        = 'memory_id:'
                    ORDER BY candidate.ordinal
                    LIMIT 1
                  ) AS reference ON TRUE
-                 WHERE signal.project_id = $1
+                 WHERE signal.project_id OPERATOR(pg_catalog.=)
+                     $1::pg_catalog.uuid
                    AND signal.archived_at IS NULL
                    AND EXISTS (
                      SELECT 1
                      FROM lcm.promoted_memory_tags AS marker
-                     WHERE marker.project_id = signal.project_id
-                       AND marker.memory_id = signal.memory_id
+                     WHERE marker.project_id OPERATOR(pg_catalog.=)
+                         signal.project_id
+                       AND marker.memory_id OPERATOR(pg_catalog.=)
+                         signal.memory_id
                        AND marker.tag = 'signal:memory_used'
-                   )
+                     )
                  GROUP BY pg_catalog.substr(reference.tag, 11)
                ),
                ranked AS (
@@ -1380,15 +1409,18 @@ export class PostgreSqlRecallRepository implements RecallRepository {
                         usage.act_count
                  FROM usage_counts AS usage
                  LEFT JOIN lcm.promoted_memories AS memory
-                   ON memory.project_id = $1
-                  AND memory.memory_id::pg_catalog.text = usage.memory_id
+                   ON memory.project_id OPERATOR(pg_catalog.=)
+                       $1::pg_catalog.uuid
+                  AND memory.memory_id::pg_catalog.text
+                        OPERATOR(pg_catalog.=) usage.memory_id
                  ORDER BY usage.act_count DESC, usage.memory_id
                  LIMIT 5
                )
                SELECT (
                         SELECT pg_catalog.count(DISTINCT surfacing.memory_id)
                         FROM lcm.recall_surfacing AS surfacing
-                        WHERE surfacing.project_id = $1
+                        WHERE surfacing.project_id OPERATOR(pg_catalog.=)
+                          $1::pg_catalog.uuid
                       ) AS memories_surfaced,
                       (SELECT pg_catalog.count(*) FROM usage_counts)
                         AS memories_acted_upon,
@@ -1647,7 +1679,7 @@ implements RedactionAdminRepository {
                  0
                ) AS project
              FROM lcm.redaction_counters
-             WHERE project_id = $1`,
+             WHERE project_id OPERATOR(pg_catalog.=) $1::pg_catalog.uuid`,
       values: [this.access.projectId],
     }, this.access.context(operation));
     const row = result.rows[0];
@@ -1719,7 +1751,7 @@ implements RedactionAdminRepository {
         promoted_tags: await deleteCount(
           `WITH deleted AS (
              DELETE FROM lcm.promoted_memory_tags
-             WHERE project_id = $1
+             WHERE project_id OPERATOR(pg_catalog.=) $1::pg_catalog.uuid
              RETURNING 1
            )
            SELECT pg_catalog.count(*) AS count FROM deleted`,
@@ -1727,7 +1759,7 @@ implements RedactionAdminRepository {
         recall_surfacings: await deleteCount(
           `WITH deleted AS (
              DELETE FROM lcm.recall_surfacing
-             WHERE project_id = $1
+             WHERE project_id OPERATOR(pg_catalog.=) $1::pg_catalog.uuid
              RETURNING 1
            )
            SELECT pg_catalog.count(*) AS count FROM deleted`,
@@ -1735,7 +1767,7 @@ implements RedactionAdminRepository {
         redaction_counters: await deleteCount(
           `WITH deleted AS (
              DELETE FROM lcm.redaction_counters
-             WHERE project_id = $1
+             WHERE project_id OPERATOR(pg_catalog.=) $1::pg_catalog.uuid
              RETURNING 1
            )
            SELECT pg_catalog.count(*) AS count FROM deleted`,
@@ -1743,7 +1775,7 @@ implements RedactionAdminRepository {
         session_ingest_logs: await deleteCount(
           `WITH deleted AS (
              DELETE FROM lcm.session_ingest_log
-             WHERE project_id = $1
+             WHERE project_id OPERATOR(pg_catalog.=) $1::pg_catalog.uuid
              RETURNING 1
            )
            SELECT pg_catalog.count(*) AS count FROM deleted`,
@@ -1751,7 +1783,7 @@ implements RedactionAdminRepository {
         session_instructions: await deleteCount(
           `WITH deleted AS (
              DELETE FROM lcm.session_instructions
-             WHERE project_id = $1
+             WHERE project_id OPERATOR(pg_catalog.=) $1::pg_catalog.uuid
              RETURNING 1
            )
            SELECT pg_catalog.count(*) AS count FROM deleted`,
@@ -1760,7 +1792,7 @@ implements RedactionAdminRepository {
       row.promoted_memories = await deleteCount(
         `WITH deleted AS (
            DELETE FROM lcm.promoted_memories
-           WHERE project_id = $1
+           WHERE project_id OPERATOR(pg_catalog.=) $1::pg_catalog.uuid
            RETURNING 1
          )
          SELECT pg_catalog.count(*) AS count FROM deleted`,
@@ -1846,10 +1878,11 @@ implements CoordinationRepository {
     return this.access.read(operation, async (executor) => {
       const result = await executor.query<SessionIngestRow>({
         text: `SELECT ingest_key, session_id, message_count, completed_at
-               FROM lcm.session_ingest_log
-               WHERE project_id = $1
-                 AND session_id_sha256 = public.digest($2, 'sha256')
-                 AND session_id = $2
+                FROM lcm.session_ingest_log
+               WHERE project_id OPERATOR(pg_catalog.=) $1::pg_catalog.uuid
+                 AND session_id_sha256 OPERATOR(pg_catalog.=)
+                   public.digest($2, 'sha256')
+                 AND session_id OPERATOR(pg_catalog.=) $2::pg_catalog.text
                ORDER BY ingest_key
                LIMIT 1`,
         values: [this.access.projectId, normalizedSessionId],
@@ -1896,10 +1929,11 @@ implements CoordinationRepository {
       }, this.access.context(operation));
       const existing = await executor.query<SessionIngestRow>({
         text: `SELECT ingest_key, session_id, message_count, completed_at
-               FROM lcm.session_ingest_log
-               WHERE project_id = $1
-                 AND session_id_sha256 = public.digest($2, 'sha256')
-                 AND session_id = $2
+                FROM lcm.session_ingest_log
+               WHERE project_id OPERATOR(pg_catalog.=) $1::pg_catalog.uuid
+                 AND session_id_sha256 OPERATOR(pg_catalog.=)
+                   public.digest($2, 'sha256')
+                 AND session_id OPERATOR(pg_catalog.=) $2::pg_catalog.text
                ORDER BY ingest_key
                LIMIT 1
                FOR UPDATE`,
@@ -1918,8 +1952,8 @@ implements CoordinationRepository {
           text: `UPDATE lcm.session_ingest_log
                  SET message_count = $3,
                      completed_at = statement_timestamp()
-                 WHERE project_id = $1
-                   AND ingest_key = $2`,
+                 WHERE project_id OPERATOR(pg_catalog.=) $1::pg_catalog.uuid
+                   AND ingest_key OPERATOR(pg_catalog.=) $2::pg_catalog.uuid`,
           values: [
             this.access.projectId,
             ingestKey,
@@ -1952,14 +1986,14 @@ implements CoordinationRepository {
       const result = await executor.query<SessionInstructionsRow>({
         text: `SELECT client_name, session_id, worktree_path, cwd_path,
                       content, content_hash, updated_at
-               FROM lcm.session_instructions
-               WHERE project_id = $1
-                 AND machine_id = $2
-                 AND scope_hash = $3
-                 AND client_name = $4
-                 AND session_id = $5
-                 AND worktree_path = $6
-                 AND cwd_path = $7
+                FROM lcm.session_instructions
+               WHERE project_id OPERATOR(pg_catalog.=) $1::pg_catalog.uuid
+                 AND machine_id OPERATOR(pg_catalog.=) $2::pg_catalog.uuid
+                 AND scope_hash OPERATOR(pg_catalog.=) $3::pg_catalog.text
+                 AND client_name OPERATOR(pg_catalog.=) $4::pg_catalog.text
+                 AND session_id OPERATOR(pg_catalog.=) $5::pg_catalog.text
+                 AND worktree_path OPERATOR(pg_catalog.=) $6::pg_catalog.text
+                 AND cwd_path OPERATOR(pg_catalog.=) $7::pg_catalog.text
                LIMIT 1`,
         values: [
           this.access.projectId,
@@ -2009,10 +2043,14 @@ implements CoordinationRepository {
                SET content = EXCLUDED.content,
                    content_hash = EXCLUDED.content_hash,
                    updated_at = statement_timestamp()
-               WHERE lcm.session_instructions.client_name = EXCLUDED.client_name
-                 AND lcm.session_instructions.session_id = EXCLUDED.session_id
-                 AND lcm.session_instructions.worktree_path = EXCLUDED.worktree_path
-                 AND lcm.session_instructions.cwd_path = EXCLUDED.cwd_path
+               WHERE lcm.session_instructions.client_name
+                       OPERATOR(pg_catalog.=) EXCLUDED.client_name
+                 AND lcm.session_instructions.session_id
+                       OPERATOR(pg_catalog.=) EXCLUDED.session_id
+                 AND lcm.session_instructions.worktree_path
+                       OPERATOR(pg_catalog.=) EXCLUDED.worktree_path
+                 AND lcm.session_instructions.cwd_path
+                       OPERATOR(pg_catalog.=) EXCLUDED.cwd_path
                RETURNING instruction_id`,
         values: [
           this.access.projectId,
@@ -2044,13 +2082,13 @@ implements CoordinationRepository {
     await this.access.atomic(operation, async (executor) => {
       await executor.query({
         text: `DELETE FROM lcm.session_instructions
-               WHERE project_id = $1
-                 AND machine_id = $2
-                 AND scope_hash = $3
-                 AND client_name = $4
-                 AND session_id = $5
-                 AND worktree_path = $6
-                 AND cwd_path = $7`,
+               WHERE project_id OPERATOR(pg_catalog.=) $1::pg_catalog.uuid
+                 AND machine_id OPERATOR(pg_catalog.=) $2::pg_catalog.uuid
+                 AND scope_hash OPERATOR(pg_catalog.=) $3::pg_catalog.text
+                 AND client_name OPERATOR(pg_catalog.=) $4::pg_catalog.text
+                 AND session_id OPERATOR(pg_catalog.=) $5::pg_catalog.text
+                 AND worktree_path OPERATOR(pg_catalog.=) $6::pg_catalog.text
+                 AND cwd_path OPERATOR(pg_catalog.=) $7::pg_catalog.text`,
         values: [
           this.access.projectId,
           this.machineId,
