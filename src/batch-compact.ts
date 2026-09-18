@@ -317,15 +317,37 @@ async function discoverySourceLocators(
 ): Promise<ReadonlyMap<string, string>> {
   const sessionIds = [...new Set(candidates.map(candidate => candidate.sessionId))];
   if (sessionIds.length === 0) return new Map();
-  try {
-    if (resolveSourceLocators !== undefined) return await resolveSourceLocators(sessionIds);
-    const repository = storage.nativeTranscripts?.repository;
-    if (repository === undefined) return new Map();
-    return await repository.listUnambiguousSourceLocators({ nativeSessionIds: sessionIds });
-  } catch {
-    // Optional provenance is omitted when it cannot be read unambiguously.
-    return new Map();
+  const repository = storage.nativeTranscripts?.repository;
+  const resolve = resolveSourceLocators
+    ?? (repository === undefined
+      ? undefined
+      : (nativeSessionIds: readonly string[]) =>
+        repository.listUnambiguousSourceLocators({ nativeSessionIds }));
+  if (resolve === undefined) return new Map();
+  const locators = new Map<string, string>();
+  for (
+    let offset = 0;
+    offset < sessionIds.length;
+    offset += NATIVE_SOURCE_LOCATOR_BATCH_SIZE
+  ) {
+    const chunk = sessionIds.slice(offset, offset + NATIVE_SOURCE_LOCATOR_BATCH_SIZE);
+    try {
+      for (const [sessionId, locator] of await resolve(chunk)) locators.set(sessionId, locator);
+    } catch {
+      // One unreadable session must not hide provenance for every other
+      // session, so a failed batch degrades to per-session resolution. That
+      // costs at most one bounded statement per session in the failed batch,
+      // and only on the error path.
+      for (const sessionId of chunk) {
+        try {
+          for (const [id, locator] of await resolve([sessionId])) locators.set(id, locator);
+        } catch {
+          // Optional provenance is omitted for this session alone.
+        }
+      }
+    }
   }
+  return locators;
 }
 
 /** Preview repository composition deliberately bypasses factory migrations. */

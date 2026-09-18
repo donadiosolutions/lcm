@@ -1544,11 +1544,70 @@ describe("batch compaction discovery", () => {
 
     expect(run.value).toHaveLength(ids.length);
     expect(run.perSessionCalls).toEqual([]);
-    expect(run.locatorCalls).toHaveLength(1);
-    expect(run.locatorCalls[0]).toHaveLength(ids.length);
+    // Every statement stays bounded by the batch size rather than by the
+    // project, so the request is split instead of growing without limit.
+    expect(run.locatorCalls.map(call => call.length))
+      .toEqual([NATIVE_SOURCE_LOCATOR_BATCH_SIZE, 3]);
+    expect(run.locatorCalls.flat()).toEqual(ids.map(id => "session-" + id));
     for (const candidate of run.value) {
       expect(candidate.sourceLocator).toBe("sessions/" + candidate.sessionId + ".jsonl");
     }
+  }, FULL_SUITE_DISCOVERY_TEST_TIMEOUT_MS);
+
+  it("keeps healthy source locators when one session cannot be read", async () => {
+    const cwd = makeDir("compact-locator-partial-failure");
+    const paths = projectPaths(cwd);
+    ensureProjectDir(cwd);
+    seedDiscoveryFixture(paths.dbPath, paths.id, [1, 2, 3], sessionId => [
+      { locator: "sessions/" + sessionId + ".jsonl", key: "ik-" + sessionId },
+    ]);
+
+    const attempted: string[][] = [];
+    const realWithCliProjectStorage = cliStorage.withCliProjectStorage;
+    vi.spyOn(cliStorage, "withCliProjectStorage").mockImplementation((targetCwd, options, callback) =>
+      realWithCliProjectStorage(targetCwd, options, context => {
+        const native = context.storage.nativeTranscripts!;
+        const repository = new Proxy(native.repository, {
+          get(target, property, receiver) {
+            if (property === "listUnambiguousSourceLocators") {
+              return async (input: { nativeSessionIds: readonly string[] }) => {
+                attempted.push([...input.nativeSessionIds]);
+                // Exactly one session is unreadable, in whatever request it
+                // appears, including its isolated retry.
+                if (input.nativeSessionIds.includes("session-2")) {
+                  throw new Error("native transcript read failed");
+                }
+                return target.listUnambiguousSourceLocators(input);
+              };
+            }
+            return Reflect.get(target, property, receiver) as unknown;
+          },
+        });
+        return callback({
+          ...context,
+          storage: { ...context.storage, nativeTranscripts: { ...native, repository } },
+        });
+      }));
+
+    const discovered = await findUncompacted(100, false, cwd);
+
+    // The failed batch degrades to one isolated request per session, so only
+    // the unreadable session loses its provenance.
+    expect(attempted).toEqual([
+      ["session-1", "session-2", "session-3"],
+      ["session-1"],
+      ["session-2"],
+      ["session-3"],
+    ]);
+    expect(discovered.map(candidate => ({
+      sessionId: candidate.sessionId,
+      sourceLocator: candidate.sourceLocator,
+    }))).toEqual([
+      { sessionId: "session-1", sourceLocator: "sessions/session-1.jsonl" },
+      { sessionId: "session-2", sourceLocator: undefined },
+      { sessionId: "session-3", sourceLocator: "sessions/session-3.jsonl" },
+    ]);
+    expect(discovered[1]).not.toHaveProperty("sourceLocator");
   }, FULL_SUITE_DISCOVERY_TEST_TIMEOUT_MS);
 
   it("matches per-conversation source-locator resolution for present, ambiguous, and absent sources", async () => {
