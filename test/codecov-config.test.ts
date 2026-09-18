@@ -676,6 +676,9 @@ describe("Codecov configuration", () => {
       ["src/runtime-root.ts", "unit-configuration-security"],
       ["src/security-files.ts", "unit-configuration-security"],
       ["src/sensitive.ts", "unit-configuration-security"],
+      // #1335 supplementary-plane CJK column widths are a material change to
+      // terminal bounding that retains this owner, as in #1195 and #1203.
+      ["src/terminal-sanitize.ts", "unit-configuration-security"],
       // #1049 keeps project metadata owner and single-link admission here.
       ["src/project-map.ts", "unit-project-worktrees"],
       // #889 keeps private import metadata publication in this owner.
@@ -731,6 +734,10 @@ describe("Codecov configuration", () => {
       ["src/promotion/dedup.ts", "unit-promotion"],
       // #1106/#618 keep discovery-related files in their established owners.
       ["src/daemon/server.ts", "unit-daemon-core"],
+      // #1343 and #1348 widen nested-public handoff ownership in the error
+      // sanitizer. This is a material change that retains its existing owner,
+      // as in #1195 and #1203.
+      ["src/daemon/safe-error.ts", "unit-daemon-core"],
       ["src/import.ts", "unit-transcripts-import"],
       // #1338 replaces compact discovery's per-conversation native-transcript
       // query with a batched project-level lookup and adds the contract member
