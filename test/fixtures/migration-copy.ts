@@ -1,42 +1,24 @@
-import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, openSync, renameSync, statSync } from "node:fs";
+import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { DatabaseSync } from "node:sqlite";
-import { afterEach, describe, expect, it, vi } from "vitest";
+import { afterEach, vi } from "vitest";
 import {
   BackendPublicationCoordinator,
-  BackendPublicationJournalError,
-  assertBackendPublicationConsumerAccess,
-  withBackendPublicationAppendBarrier,
   withBackendPublicationAppendBarrierAsync,
-  type BackendPublicationLockToken,
   type BackendPublicationDriver,
 } from "../../src/storage/backend-publication.js";
 import { SQLiteLocalHookOutboxFactory } from "../../src/storage/local-hook-outbox.js";
 import {
-  assertMigrationReplayAdmission,
   prepareSqliteMigrationEnrollment,
   authenticateSqliteMigrationSource,
   authenticateSqliteMigrationSourceBytes,
-  captureAuthenticatedSqliteMigrationSource,
-  classifyImmutableSqliteSnapshot,
-  inspectImmutableSqliteSnapshot,
-  dryRunAuthenticatedSqliteMigrationSource,
   type SqliteMigrationEnrollmentInput,
 } from "../../src/migration/maintenance.js";
-import { loadDaemonConfig } from "../../src/daemon/config.js";
 import { localProjectIdentity } from "../../src/daemon/project.js";
-import { writeFileSync } from "node:fs";
-import { SqliteStorageBackendFactory } from "../../src/storage/sqlite/factory.js";
 import * as identityApi from "../../src/machine-identity.js";
-import * as publicationApi from "../../src/storage/backend-publication.js";
-import * as identityService from "../../src/identity-service.js";
 import { type IdentityRepository } from "../../src/identity-service.js";
-import { clearProjectMapCache, projectMapPath } from "../../src/project-map.js";
+import { clearProjectMapCache } from "../../src/project-map.js";
 import { closeLcmConnection } from "../../src/db/connection.js";
-import * as connectionApi from "../../src/db/connection.js";
-import { appendLocalHookEvents } from "../../src/hooks/local-enqueue.js";
-import { getMigrationReceiptEpoch } from "../../src/migration/receipts.js";
 
 const HASH_A = "a".repeat(64);
 const HASH_B = "b".repeat(64);
