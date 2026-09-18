@@ -2,6 +2,7 @@ import { createHash, randomBytes } from "node:crypto";
 import type { DatabaseSync, SQLInputValue } from "node:sqlite";
 import { isDeepStrictEqual } from "node:util";
 import {
+  NATIVE_SOURCE_LOCATOR_BATCH_SIZE,
   NATIVE_TRANSCRIPT_MAX_JSON_DEPTH,
   type CreateNativeTranscriptInput,
   type JsonObject,
@@ -269,6 +270,28 @@ export class SqliteNativeTranscriptRepository implements NativeTranscriptReposit
 
   listByNativeSession(input: { readonly nativeSessionId: string }): Promise<NativeTranscriptRecord[]> {
     return this.execute("listByNativeSession", () => this.db.prepare(`SELECT ${transcriptColumns} FROM runtime_native_transcripts AS transcript WHERE project_id = ? AND native_session_id = ? ORDER BY observed_at, transcript_id`).all(this.projectId, text(object(input).nativeSessionId)).map(row => this.readTranscript(row)));
+  }
+
+  listUnambiguousSourceLocators(input: { readonly nativeSessionIds: readonly string[] }): Promise<ReadonlyMap<string, string>> {
+    return this.execute("listUnambiguousSourceLocators", () => {
+      const requested = array(object(input).nativeSessionIds).map(value => text(value));
+      const sessionIds = [...new Set(requested)];
+      const locators = new Map<string, string>();
+      for (let offset = 0; offset < sessionIds.length; offset += NATIVE_SOURCE_LOCATOR_BATCH_SIZE) {
+        const chunk = sessionIds.slice(offset, offset + NATIVE_SOURCE_LOCATOR_BATCH_SIZE);
+        const rows = this.db.prepare(
+          `SELECT native_session_id, MIN(source_locator) AS source_locator, COUNT(DISTINCT source_locator) AS locator_count
+             FROM runtime_native_transcripts
+            WHERE project_id = ? AND native_session_id IN (${chunk.map(() => "?").join(",")})
+            GROUP BY native_session_id`,
+        ).all(this.projectId, ...chunk);
+        for (const row of rows) {
+          if (integer(row.locator_count) !== 1) continue;
+          locators.set(text(row.native_session_id), text(row.source_locator));
+        }
+      }
+      return locators as ReadonlyMap<string, string>;
+    });
   }
 
   listBySource(input: NativeTranscriptCheckpointKey): Promise<NativeTranscriptRecord[]> {

@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import { Buffer } from "node:buffer";
-import { mkdtemp, readFile, writeFile } from "node:fs/promises";
+import { mkdtemp, readdir, readFile, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test from "node:test";
@@ -1795,6 +1795,32 @@ test("repository policy and Issue Form use native Question without an overlappin
   );
   assert.match(questionForm, /^type: Question$/mu);
   assert.doesNotMatch(questionForm, /^labels:/mu);
+});
+
+test("offers every configured issue type without a self-referential contact link", async () => {
+  const repositoryPolicy = await loadTriagePolicy(
+    join(process.cwd(), ".github/codex/issue-triage-policy.json"),
+  );
+  const templateTypes = [];
+  const templateDirectory = join(process.cwd(), ".github/ISSUE_TEMPLATE");
+  for (const file of (await readdir(templateDirectory)).filter((name) => name !== "config.yml").sort()) {
+    const form = await readFile(join(templateDirectory, file), "utf8");
+    const type = /^type: (?<type>.+)$/mu.exec(form)?.groups?.type;
+    assert.ok(type, `${file} must declare a native issue type`);
+    templateTypes.push(type);
+  }
+  assert.deepEqual(
+    [...new Set(templateTypes)].sort(),
+    [...repositoryPolicy.issueTypes].sort(),
+  );
+
+  // The inherited "LCM Decision" link sent contributors of this repository back
+  // to this repository's own issue list, so it routed nobody anywhere. Only that
+  // self-referential destination is forbidden; a contact link pointing somewhere
+  // a contributor can actually go remains allowed.
+  const config = await readFile(join(templateDirectory, "config.yml"), "utf8");
+  assert.match(config, /^blank_issues_enabled: false$/mu);
+  assert.doesNotMatch(config, /https:\/\/github\.com\/donadiosolutions\/lcm\/issues\b/u);
 });
 
 test("documents safe initial and incremental Question migration paths", async () => {
