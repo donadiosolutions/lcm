@@ -159,6 +159,8 @@ component_management:
         # daemon-core-owned.
         # #1343 bracketed nested public URL handoffs and #1348 drive-root
         # handoff arming also remain daemon-core-owned.
+        # #1374 replaces the flag-based path-ownership layer with a bracket-group
+        # and span pre-pass classification, which stays daemon-core-owned.
         - "^src/daemon/safe-error\\.ts$"
         - "^src/daemon/server\\.ts$"
         - "^src/daemon/summarizer\\.ts$"
