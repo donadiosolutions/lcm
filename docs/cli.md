@@ -36,9 +36,12 @@ Aliases of the same selected project are processed once. This does not
 enumerate every project hosted by the PostgreSQL server. With
 `storage.backend` set to `postgresql`, an unbound local project is still
 enumerated rather than aborting the run: it is reported as that project's own
-failure, carrying the `lcm project create` or `lcm project link <project-id>`
-remedy, while every other selected project is still processed. This condition
-is specific to the PostgreSQL backend; SQLite has no binding to check.
+failure while every other selected project is still processed.
+`lcm compact --all` and `lcm export --all` name the `lcm project create` or
+`lcm project link <project-id>` remedy for that failure; `lcm promote --all`
+and `lcm import --all` currently report it with their generic per-project
+failure text instead. This condition is specific to the PostgreSQL backend;
+SQLite has no binding to check.
 
 `lcm promote --all` processes the canonical paths from those bindings even when
 no local `meta.json` exists. `--verbose` reports each project's counts and
