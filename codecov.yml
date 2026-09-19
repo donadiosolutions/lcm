@@ -115,6 +115,8 @@ component_management:
         # #1270 keeps exact retired-fence event scrubbing and terminal-only
         # hook diagnostics within the existing hooks component.
         # PreCompact initial unsafe-storage diagnostics remain in that same owner.
+        # #1395 keeps the backend-conditional SessionStart retention gate and
+        # its processed-event prune predicate hook-owned.
         - "src/hooks/"
     # #1201 keeps process-only observation, its parser/client, and route allowlist here.
     - component_id: "unit-daemon-core"
@@ -330,6 +332,8 @@ component_management:
         # #1247 keeps explicit promotion queue admission in this component.
         # #1229 admits local outbox health, recent-error, and delivery
         # diagnostics through an optional live publication token here.
+        # #1395 forwards the processed-event retention contract through this
+        # existing local-event-storage owner.
         - "^src/storage/local-hook-event-sequence\\.ts$"
         - "^src/storage/local-hook-outbox\\.ts$"
         - "^src/storage/local-hook-outbox-schema\\.ts$"
