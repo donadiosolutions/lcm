@@ -63,6 +63,9 @@ component_management:
         # and retained parent after destination authorization in this owner.
         # PR #791 keeps generated Gitleaks hostname-literal normalization in
         # this existing configuration-security owner.
+        # #1358 keeps the collapsed nested lazy prefixes and the structurally
+        # verified, fail-closed Gitleaks keyword prefilter in that same owner,
+        # for both the scrub engine and its generated pattern table.
         - "^src/config-manager\\.ts$"
         - "^src/config-projection\\.ts$"
         - "^src/generated-patterns\\.ts$"
@@ -325,6 +328,8 @@ component_management:
         - "^src/transcript-provider\\.ts$"
         - "^src/transcript\\.ts$"
         - "^src/storage/local-transcript-quarantine\\.ts$"
+        # #1358 keeps the removal of the redundant residual scrub pass, for
+        # strings the first pass left unchanged, in this existing import owner.
         - "^src/storage/native-transcript-ingest\\.ts$"
         - "^src/storage/native-transcripts\\.ts$"
     - component_id: "unit-memory-retrieval"
