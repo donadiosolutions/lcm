@@ -398,6 +398,19 @@ describe("createMigrationVerificationReport / parseMigrationVerificationReport",
     const report = createMigrationVerificationReport(baseInput());
     expectReportError(() => parseMigrationVerificationReport({ ...report, reportId: `verify-generation-${HASH_A}` }), "unexpected-state");
   });
+  it("round-4 P2 red case: rejects a tampered reconciliationOutcomeDigestSha256 rather than silently recomputing over it", () => {
+    // createMigrationVerificationReportBody has no input field for this
+    // digest at all -- it is always recomputed from
+    // mismatches/mismatchTotals -- so before this fix, the raw record's
+    // own value for this field was never even read during parsing. A
+    // tampered digest, with mismatches/mismatchTotals left alone,
+    // silently "corrected" itself back to the recomputed value instead
+    // of being rejected as evidence of tampering.
+    const report = createMigrationVerificationReport(baseInput());
+    expectReportError(() => parseMigrationVerificationReport({
+      ...report, body: { ...report.body, reconciliationOutcomeDigestSha256: HASH_A },
+    }), "unexpected-state");
+  });
   it("computes activationEligible as false when clean but a required class did not run", () => {
     const notFullyCovered = createMigrationVerificationReport(baseInput({
       classCoverage: MIGRATION_MISMATCH_CLASSES.map((mismatchClass) => ({ class: mismatchClass, ran: mismatchClass !== "ledger" })),

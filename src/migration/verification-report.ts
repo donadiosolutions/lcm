@@ -668,6 +668,17 @@ export function parseMigrationVerificationReport(value: unknown): MigrationVerif
   if (!Array.isArray(record.mismatches) || !Array.isArray(record.mismatchTotals)) {
     reportError("invalid-input", "verification report mismatch evidence is invalid");
   }
+  // Round-4 P2: createMigrationVerificationReportBody always recomputes
+  // reconciliationOutcomeDigestSha256 from mismatches/mismatchTotals
+  // rather than accepting it as an input field (there is no field for
+  // it on CreateMigrationVerificationReportBodyInput), so the raw
+  // record's own value for this field was previously never looked at
+  // during parsing -- a tampered digest, with mismatches/mismatchTotals
+  // left alone, silently "corrected" itself back to the recomputed
+  // value rather than being rejected as evidence of tampering.
+  if ((record.body as RecordValue).reconciliationOutcomeDigestSha256 !== body.reconciliationOutcomeDigestSha256) {
+    reportError("unexpected-state", "verification report reconciliation outcome digest does not match its content");
+  }
   const mismatches = record.mismatches.map(parseMismatch);
   const mismatchTotals = record.mismatchTotals.map(parseMismatchTotal);
   const clean = mismatchTotals.length === 0;
