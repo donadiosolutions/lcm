@@ -373,11 +373,62 @@ export type ActivationLeaseIdentity = Readonly<{
   evidenceSha256: string;
 }>;
 
+/**
+ * Whether a resolved "present" fence belongs to this exact caller's
+ * generation. Compares publicationId and machineId only -- see below for
+ * why targetBackend and evidenceSha256 were removed from this comparison
+ * rather than kept as defensive belt-and-suspenders checks.
+ *
+ * Verified at source, not assumed: this function is only ever reached
+ * from within resolveActivationLeaseFence's "present" branch (both call
+ * sites below call resolveActivationLeaseFence first and return early on
+ * every other outcome). resolveActivationLeaseFence's fence comes from
+ * guard.read(), and the real PostgreSqlBackendPublicationGuard#read
+ * (publication-guard.ts) validates its row through
+ * exactFence(row, { projectId, targetBackend, evidenceSha256 }, operation)
+ * -- deliberately omitting exactFence's optional expected.machineId and
+ * expected.publicationId parameters. exactFence's own check fails the row
+ * when fence.targetBackend does not match, when fence.evidenceSha256 does
+ * not match, or (only when that expected field is passed) when machineId
+ * or publicationId do not match; with the latter two never passed by
+ * read(), it can throw "invalid-row" (surfaced by
+ * resolveActivationLeaseFence as "identity-mismatch", and handled by both
+ * of this function's callers *before* sameGeneration ever runs) only for a
+ * targetBackend or evidenceSha256 mismatch. It can never return a
+ * "present" fence whose targetBackend or evidenceSha256 differ from the
+ * caller's own input -- by the time this function runs, those two fields
+ * are already guaranteed to match. machineId and publicationId are the
+ * only fields read()'s exactFence call never validates, so they are the
+ * only two fields left for this function to check.
+ *
+ * This was previously a four-field comparison. The targetBackend and
+ * evidenceSha256 clauses were reachable in this module's unit tests only
+ * through a fake guard whose read() returned a "present" fence with a
+ * differing targetBackend or evidenceSha256 -- a shape the real guard's
+ * read() can never produce, since it throws first. Production code kept
+ * alive only by a fake that does not reproduce its real collaborator's
+ * behaviour is the same untested-wrapper problem this repository's
+ * no-exclusions coverage rule exists to prevent, approached from the
+ * opposite direction, so those two clauses (and the branches they added)
+ * were removed rather than defended with a misbehaving fixture.
+ *
+ * This is unrelated to PostgreSqlBackendPublicationGuard#acquire's own,
+ * separate internal sameGeneration check (see acquire's local variable of
+ * the same name in publication-guard.ts): that check reads the competing
+ * row through the more permissive storedFenceFromRow, not exactFence, and
+ * so genuinely can observe a targetBackend/evidenceSha256 mismatch there.
+ * That is a different call path with a different validator and is
+ * unaffected by this change.
+ *
+ * Issue #1419 tracks the real guard folding an identity mismatch and a
+ * corrupted stored row into one indistinguishable thrown "invalid-row"
+ * error. If that is ever narrowed so read() can return a non-matching row
+ * instead of throwing, this function's reachability analysis -- and its
+ * test coverage -- will need to be revisited.
+ */
 function sameGeneration(fence: ActivationLeaseFence, identity: ActivationLeaseIdentity): boolean {
   return fence.publicationId === identity.publicationId
-    && fence.machineId === identity.machineId
-    && fence.targetBackend === identity.targetBackend
-    && fence.evidenceSha256 === identity.evidenceSha256;
+    && fence.machineId === identity.machineId;
 }
 
 export type ActivationLeaseRenewInput = PostgreSqlBackendPublicationMutationInput & Readonly<{ ttlMs: number }>;
