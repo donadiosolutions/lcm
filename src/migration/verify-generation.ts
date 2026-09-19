@@ -2,7 +2,6 @@ import { createHash } from "node:crypto";
 import { PostgreSqlRuntime } from "../storage/postgresql/runtime.js";
 import { PostgreSqlWorkCoordinator } from "../storage/postgresql/coordination.js";
 import { verifyPostgreSqlTransferSchema } from "../storage/postgresql/runtime-readiness.js";
-import { loadPostgreSqlMigrations } from "../storage/postgresql/migrations.js";
 import { inspectPostgreSqlSearchConfiguration } from "../storage/postgresql/search-configuration.js";
 import {
   createPostgreSqlPortableSource, readPostgreSqlPortableSourceDomainCensus,
@@ -164,12 +163,33 @@ async function captureSequenceStateSha256(executor: PostgreSqlQueryExecutor, sig
   return sha256Hex(portableCanonicalJson(["lcm-migration-verification-sequence-state-v1", result.rows]));
 }
 
+/**
+ * Round-1 P2: migrationsSha256 must witness what the destination's own
+ * migration ledger actually records as applied, not what the currently
+ * running binary happens to bundle. loadPostgreSqlMigrations() reflects
+ * this process's compiled-in migration set, which can legitimately
+ * differ from the destination's own lcm.schema_migrations history (a
+ * different LCM version ran the copy, for instance) -- comparing the
+ * bundle's digest against the frozen expected value would validate the
+ * wrong thing whenever that happens, agreeing or disagreeing with the
+ * expected value for a reason unrelated to what is actually on the
+ * destination.
+ */
+async function captureAppliedMigrationsSha256(
+  executor: PostgreSqlQueryExecutor, signal?: AbortSignal,
+): Promise<string> {
+  const result = await executor.query<{ id: string; checksum_sha256: string }>({
+    text: "SELECT id, checksum_sha256 FROM lcm.schema_migrations ORDER BY id",
+  }, { domain: "factory", operation: "verifyGenerationAppliedMigrations", signal });
+  return sha256Hex(portableCanonicalJson(
+    result.rows.map(({ id, checksum_sha256: checksum }) => ({ id, sha256: checksum })),
+  ));
+}
+
 async function captureDestinationSchemaWitness(
   executor: PostgreSqlQueryExecutor, signal?: AbortSignal,
 ): Promise<MigrationSchemaWitness> {
-  const migrationsSha256 = sha256Hex(portableCanonicalJson(
-    loadPostgreSqlMigrations().map(({ id, sha256: checksum }) => ({ id, sha256: checksum })),
-  ));
+  const migrationsSha256 = await captureAppliedMigrationsSha256(executor, signal);
   const searchStatus = await inspectPostgreSqlSearchConfiguration(executor, { signal });
   if (searchStatus.actualSha256 === null) driverError("invalid-input", "destination search configuration is absent");
   const [collationSha256, sequenceStateSha256] = await Promise.all([

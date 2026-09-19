@@ -5,7 +5,6 @@ import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { migrationWitnessSha256 } from "../../src/migration/activation-witness.js";
 import * as coordination from "../../src/storage/postgresql/coordination.js";
 import * as searchConfiguration from "../../src/storage/postgresql/search-configuration.js";
-import * as migrations from "../../src/storage/postgresql/migrations.js";
 import * as portableSource from "../../src/storage/postgresql/portable-source.js";
 import * as portableDestination from "../../src/storage/postgresql/portable-destination.js";
 import * as manifestStoreModule from "../../src/migration/manifest-store.js";
@@ -310,6 +309,15 @@ function fakeRuntime(overrides: {
     health: vi.fn(async () => ({ status: "healthy", backend: "postgresql", tls: true, serverMajorVersion: 18, serverEncoding: "UTF8" })),
     query: vi.fn(async (config: { text: string }) => {
       if (config.text.includes("lcm.conversations")) return { rows: overrides.conversationsRows ?? [] };
+      if (config.text.includes("lcm.schema_migrations")) {
+        // Round-1 P2: migrationsSha256 now witnesses the destination's
+        // own applied-migrations ledger rather than the compiled-in
+        // bundle, so the fixture must serve rows shaped like that
+        // table's columns -- matching FAKE_MIGRATIONS, which is what
+        // EXPECTED_MIGRATIONS_SHA256 (baseInput's default
+        // destinationMigrationsSha256) is derived from.
+        return { rows: FAKE_MIGRATIONS.map(({ id, sha256 }) => ({ id, checksum_sha256: sha256 })) };
+      }
       if (config.text.includes("pg_collation")) {
         return { rows: [{ collname: "default", collcollate: "C", collctype: "C", collprovider: "c" }] };
       }
@@ -349,7 +357,6 @@ function stubDestinationPrimitives(options: {
     acquireLease: vi.fn(async () => ({ fencingToken: 1n } as never)),
     releaseLease: vi.fn(async () => null),
   } as never); });
-  vi.spyOn(migrations, "loadPostgreSqlMigrations").mockReturnValue(FAKE_MIGRATIONS as never);
   vi.spyOn(searchConfiguration, "inspectPostgreSqlSearchConfiguration").mockResolvedValue({ actualSha256: HASH_A } as never);
   vi.spyOn(portableSource, "readPostgreSqlPortableWitness").mockResolvedValue(HASH_A);
   vi.spyOn(portableDestination, "probePostgreSqlPortableDestination").mockResolvedValue({
@@ -441,7 +448,6 @@ describe("readFencedDestinationCensus", () => {
     vi.spyOn(coordination, "PostgreSqlWorkCoordinator").mockImplementation(function () { return ({
       acquireLease: vi.fn(async () => ({ fencingToken: 1n } as never)), releaseLease: vi.fn(async () => null),
     } as never); });
-    vi.spyOn(migrations, "loadPostgreSqlMigrations").mockReturnValue(FAKE_MIGRATIONS as never);
     vi.spyOn(searchConfiguration, "inspectPostgreSqlSearchConfiguration").mockResolvedValue({ actualSha256: HASH_A } as never);
     vi.spyOn(portableSource, "readPostgreSqlPortableWitness").mockResolvedValue(HASH_A);
     vi.spyOn(portableSource, "readPostgreSqlPortableSourceDomainCensus").mockImplementation(((_s: unknown, domain: PortableDomain) => ({
@@ -975,6 +981,32 @@ describe("verifyMigrationGeneration", () => {
     expect(copySource.stream.close).toHaveBeenCalledTimes(1);
   });
 
+  it("round-1 P2 red case: refuses when the destination's own applied-migrations table disagrees with the expected witness, even though the compiled-in migration bundle would agree", async () => {
+    // migrationsSha256 must witness what lcm.schema_migrations actually
+    // records on the destination, not what the currently running
+    // binary's migration bundle happens to contain. Here the live table
+    // disagrees with the expected witness while the compiled-in bundle
+    // (FAKE_MIGRATIONS, matching EXPECTED_MIGRATIONS_SHA256) would have
+    // agreed with it -- so a driver that read the bundle instead of the
+    // live table would wrongly certify a destination whose real applied
+    // migrations do not match what is expected.
+    stubDestinationPrimitives();
+    const copySource = fakeCopySource();
+    const runtime = fakeRuntime();
+    const originalRuntimeQuery = runtime.query;
+    runtime.query = vi.fn(async (config: { text: string }) => {
+      if (config.text.includes("lcm.schema_migrations")) {
+        return { rows: [{ id: "0001", checksum_sha256: fakeHash("drifted-migration-checksum") }] };
+      }
+      return originalRuntimeQuery(config as never);
+    }) as never;
+    const dependencies = dependenciesFor(copySource, runtime);
+    await expect(verifyMigrationGeneration(
+      baseInput({ homeDir: "/tmp/lcm-verify-live-migrations-drift", destinationMigrationsSha256: EXPECTED_MIGRATIONS_SHA256 }),
+      dependencies,
+    )).rejects.toMatchObject({ reason: "destination-drift" });
+  });
+
   it("round-1 P1 red case: refuses when the destination search configuration changes inside the fenced window (v3.2 live-to-live)", async () => {
     // W4: search-configuration/collation were previously captured once
     // and never compared to anything -- recorded, not evidence. Frozen
@@ -1034,7 +1066,6 @@ describe("verifyMigrationGeneration", () => {
       acquireLease: vi.fn(async () => null),
       releaseLease: vi.fn(async () => null),
     } as never); });
-    vi.spyOn(migrations, "loadPostgreSqlMigrations").mockReturnValue(FAKE_MIGRATIONS as never);
     vi.spyOn(searchConfiguration, "inspectPostgreSqlSearchConfiguration").mockResolvedValue({ actualSha256: HASH_A } as never);
     vi.spyOn(portableSource, "readPostgreSqlPortableWitness").mockResolvedValue(HASH_A);
     vi.spyOn(portableDestination, "probePostgreSqlPortableDestination").mockResolvedValue({
@@ -1053,7 +1084,6 @@ describe("verifyMigrationGeneration", () => {
     vi.spyOn(coordination, "PostgreSqlWorkCoordinator").mockImplementation(function () { return ({
       acquireLease: vi.fn(async () => ({ fencingToken: 1n } as never)), releaseLease: vi.fn(async () => null),
     } as never); });
-    vi.spyOn(migrations, "loadPostgreSqlMigrations").mockReturnValue(FAKE_MIGRATIONS as never);
     vi.spyOn(searchConfiguration, "inspectPostgreSqlSearchConfiguration").mockResolvedValue({ actualSha256: null } as never);
     vi.spyOn(portableSource, "readPostgreSqlPortableWitness").mockResolvedValue(HASH_A);
     const copySource = fakeCopySource();
@@ -1067,12 +1097,19 @@ describe("verifyMigrationGeneration", () => {
     vi.spyOn(coordination, "PostgreSqlWorkCoordinator").mockImplementation(function () { return ({
       acquireLease: vi.fn(async () => ({ fencingToken: 1n } as never)), releaseLease: vi.fn(async () => null),
     } as never); });
-    vi.spyOn(migrations, "loadPostgreSqlMigrations").mockReturnValue(FAKE_MIGRATIONS as never);
     vi.spyOn(searchConfiguration, "inspectPostgreSqlSearchConfiguration").mockResolvedValue({ actualSha256: HASH_A } as never);
     vi.spyOn(portableSource, "readPostgreSqlPortableWitness").mockResolvedValue(HASH_A);
     const copySource = fakeCopySource();
     const badRuntime = fakeRuntime();
-    badRuntime.query = vi.fn(async () => ({ rows: [{ system_identifier: "not-a-number" }] })) as never;
+    // Only the system-identifier query returns the malformed value;
+    // everything else (schema_migrations, collation) must still answer
+    // normally, or this refuses for the wrong reason before the
+    // system-identifier check is ever reached.
+    const originalBadRuntimeQuery = badRuntime.query;
+    badRuntime.query = vi.fn(async (config: { text: string }) => {
+      if (config.text.includes("pg_control_system")) return { rows: [{ system_identifier: "not-a-number" }] };
+      return originalBadRuntimeQuery(config as never);
+    }) as never;
     const dependencies = dependenciesFor(copySource, badRuntime);
     await expect(verifyMigrationGeneration(baseInput({ homeDir: "/tmp/lcm-verify-sysid" }), dependencies))
       .rejects.toThrow(MigrationVerificationDriverError);
