@@ -153,7 +153,8 @@ jobs:
             --repo "$REPOSITORY" \
             --pattern 'vitest-blob-*' \
             --dir "$download_root"
-          find "$download_root" -mindepth 2 -maxdepth 2 -type f -name '*.json' -exec mv -t "$blob_root" -- {} +
+          # gh nests each artifact in its own directory; accept a flat layout too.
+          find "$download_root" -type f -name '*.json' -exec mv -t "$blob_root" -- {} +
           ls -l "$blob_root"
 
       - name: Merge shard reports

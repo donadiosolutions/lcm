@@ -77,6 +77,9 @@ describe("CI plan classification", () => {
       "src/prompts/x.yaml", "src/storage/postgresql/migrations/001.sql", "src/connectors/templates/a.md",
       "test/setup/isolate-runtime-home.ts", "test/fixtures/a.json", "package.json", "pnpm-lock.yaml",
       "vitest.config.ts", "tsconfig.json", ".github/workflows/ci.yml", "scripts/ci-plan.mjs", "docs/cli.md",
+      // Fixtures are consumed outside the module graph (esbuild plugins, disk reads).
+      "test/fixtures/session-end-process-admission.ts", "test/postgresql/fixtures/persistent-worker.integration.ts",
+      "test/connectors/fixtures/x.ts", "test/fixtures/e2e/subagents/a.ts",
     ]) {
       expect(isGraphVisible(path), path).toBe(false);
     }

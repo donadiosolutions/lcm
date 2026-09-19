@@ -27,12 +27,14 @@ export const TEST_FILE_PATTERN = /^test\/[A-Za-z0-9_-]+(?:\/[A-Za-z0-9_-]+)*\.[A
 export const SHA_PATTERN = /^[0-9a-f]{40}$/u;
 
 // Changes to these paths are visible to Vitest's module graph: a test file
-// either is one of them or imports them (directly or transitively).
+// either is one of them or imports them (directly or transitively). Fixture
+// directories are excluded: fixtures are read from disk or bundled by test
+// plugins, so a change to one has no module edge and must force a full run.
 export const GRAPH_VISIBLE_PATTERNS = Object.freeze([
   /^src\/.+\.ts$/u,
   /^bin\/.+\.ts$/u,
   /^installer\/.+\.ts$/u,
-  /^test\/(?!setup\/).+\.ts$/u,
+  /^test\/(?!setup\/)(?:(?!fixtures\/).)+\.ts$/u,
 ]);
 
 // Paths that tests read from disk instead of importing. A change to one of
