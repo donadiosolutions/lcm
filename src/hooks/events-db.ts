@@ -639,6 +639,13 @@ export class EventsDb {
    * prunable on age alone, as it was before #91. A row that does carry remote
    * state still needs the full drained proof, so an install that moved from
    * PostgreSQL back to SQLite cannot lose an undrained event.
+   *
+   * "Never entered the pipeline" means never claimed. A claimed row that came
+   * back as `retry` is not proof that nothing reached the remote inbox: the
+   * worker marks a row `retry` when its insert throws and the readback that
+   * would settle the outcome is unavailable too, so the insert may have
+   * committed. Claiming is what increments `delivery_attempts`, so an
+   * untouched row is exactly `pending` with no attempts and no inbox id.
    */
   pruneProcessed(
     olderThanDays: number,
@@ -647,7 +654,9 @@ export class EventsDb {
     const drained = "delivery_state = 'acknowledged' AND remote_pruned_at IS NOT NULL";
     const prunable = options.awaitingReplication === false
       ? `((${drained})
-          OR (remote_inbox_id IS NULL AND delivery_state IN ('pending', 'retry')))`
+          OR (remote_inbox_id IS NULL
+              AND delivery_state = 'pending'
+              AND delivery_attempts = 0))`
       : drained;
     const result = this.db.prepare(
       `DELETE FROM events WHERE processed_at IS NOT NULL

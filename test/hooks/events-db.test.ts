@@ -1050,7 +1050,12 @@ describe("EventsDb", () => {
     db.close();
   });
 
-  it("retains an aged processed event that is still awaiting delivery retry", () => {
+  // A retry row is not proof that nothing reached the remote inbox. The
+  // replication worker marks a claimed row `retry` when the insert throws and
+  // the readback that would settle it is unavailable too, so the insert may
+  // well have committed remotely. After a move back to SQLite, age alone must
+  // not delete a row whose remote outcome is still unknown.
+  it("retains an aged processed event whose remote outcome is unknown", () => {
     const db = new EventsDb(dbPath);
     db.insertEvent("s1", { type: "a", category: "file", data: "x", priority: 3 }, "PostToolUse");
     const events = db.getUnprocessed();
@@ -1071,9 +1076,7 @@ describe("EventsDb", () => {
       new Date(Date.now() + 60_000).toISOString(),
     )).toBe(true);
 
-    // Retry rows never reached a remote inbox, so a non-replicating install
-    // may reclaim them on age once they are processed.
-    expect(db.pruneProcessed(7, { awaitingReplication: false })).toBe(1);
+    expect(db.pruneProcessed(7, { awaitingReplication: false })).toBe(0);
     db.close();
   });
 
