@@ -1368,6 +1368,8 @@ describe("daemon lifecycle test-scope validation", () => {
         _listeningPortsOverride: () => [37_351],
         _processStartTimeForTesting: pid => `birth-${String(pid)}`,
         _peerProcessCommandOverride: () => `node ${fixture.scope.entrypoint} daemon start --foreground`,
+        _peerProcessExecutableOverride: () => process.execPath,
+        _peerProcessOwnerUidOverride: () => process.getuid?.() ?? null,
         _monotonicNowOverride: () => 0,
         _skipSpawn: true,
       })).resolves.toMatchObject({
@@ -1410,6 +1412,9 @@ describe("daemon lifecycle test-scope validation", () => {
         _sleepOverride: async () => undefined,
         _listeningPortsOverride: () => [37_352],
         _processStartTimeForTesting: pid => `birth-${String(pid)}`,
+        _peerProcessCommandOverride: () => `node ${fixture.scope.entrypoint} daemon start --foreground`,
+        _peerProcessExecutableOverride: () => process.execPath,
+        _peerProcessOwnerUidOverride: () => process.getuid?.() ?? null,
         _monotonicNowOverride: () => 0,
         _ensureDaemonOverride: async () => ({
           connected: false,

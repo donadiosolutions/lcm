@@ -760,7 +760,6 @@ describe("issue 400 managed ensure admission matrix", () => {
         response({}, 200),
       ]),
     });
-
     const result = await ensureDaemon(optionsFor(fixture, {
       _skipSpawn: false,
       expectedRuntimeDigest: "a".repeat(64),
@@ -768,6 +767,8 @@ describe("issue 400 managed ensure admission matrix", () => {
       _platform: "freebsd",
       _monotonicNowOverride: () => now,
       _processStartTimeForTesting: (_pid, _observer, options) => {
+        rmSync(fixture.tokenPath, { force: true });
+        if (!existsSync(fixture.tokenPath)) mkdirSync(fixture.tokenPath);
         const timeoutMs = options?.timeoutMs;
         if (timeoutMs === undefined) return null;
         birthTimeouts.push(timeoutMs!);
@@ -782,7 +783,7 @@ describe("issue 400 managed ensure admission matrix", () => {
       spawned: true,
       startMethod: "detached-spawn",
     });
-    expect(birthTimeouts).toEqual([25, 18]);
+    expect(birthTimeouts).toEqual([25]);
     expect(fixture.seams.fetch).toHaveBeenCalledTimes(2);
     expect(vi.mocked(fixture.seams.fetch).mock.calls.every(([, init]) => (
       (init as RequestInit | undefined)?.headers === undefined
@@ -2077,7 +2078,7 @@ describe("issue 400 managed ensure admission matrix", () => {
     writeFileSync(fixture.pidPath, "4242");
     writeFileSync(fixture.tokenPath, "managed-token", { mode: 0o600 });
     await expect(ensureDaemon(optionsFor(fixture, {
-      expectedEntrypoint: undefined,
+      expectedEntrypoint: "/tmp/lcm-daemon-entrypoint.mjs",
       expectedRuntimeDigest: runtimeDigest,
       _skipSpawn: true,
     }))).resolves.toMatchObject({ connected: true, spawned: false, pid: 4242 });

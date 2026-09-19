@@ -2196,6 +2196,8 @@ type DaemonClientWithConfig = Readonly<{
 }>;
 
 function verifyManagedDaemonPeer(port: number, pidFilePath: string): void {
+  const expectedEntrypoint = PACKAGED_RUNTIME_ENTRYPOINT
+    ?? (isAbsolute(process.argv[1] ?? "") ? process.argv[1] : undefined);
   const evidence = admitManagedDaemonPeer({
     authority: {
       kind: "pid-file",
@@ -2203,7 +2205,7 @@ function verifyManagedDaemonPeer(port: number, pidFilePath: string): void {
       expectedUid: process.getuid?.(),
     },
     port,
-    expectedEntrypoint: PACKAGED_RUNTIME_ENTRYPOINT,
+    expectedEntrypoint,
   });
   if (evidence === null) {
     throw new Error("Daemon peer ownership could not be verified.");

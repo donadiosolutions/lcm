@@ -519,6 +519,7 @@ describe("lifecycle procfs and parent warnings", () => {
     const result = await ensureDaemon({
       port: 1, pidFilePath: pidPath, spawnTimeoutMs: 100, enforceUserManagerParent: true,
       expectedVersion: "1",
+      expectedEntrypoint: "lcm",
       _platform: "linux", _procRoot: procRoot, _uid: 1000, _fetchOverride: fetch as never,
       _isProcessAliveOverride: () => alive, _listeningPortsOverride: () => [1], _skipSpawn: true,
       _processStartTimeForTesting: pid => `birth-${String(pid)}`,
@@ -683,6 +684,7 @@ describe("lifecycle spawn and restart failure boundaries", () => {
     const result = await ensureDaemon({
       port: 13, pidFilePath: pidPath, spawnTimeoutMs: 100, _platform: "linux", enforceUserManagerParent: true,
       _procRoot: root, _uid: 1000, _isProcessAliveOverride: () => true, _fetchOverride: fetchHealthy(20) as never,
+      expectedEntrypoint: "lcm",
       _listeningPortsOverride: () => [13], _monotonicNowOverride: () => 0, _skipSpawn: true, expectedVersion: "1",
       _processStartTimeForTesting: pid => `birth-${String(pid)}`,
       _supervisorOverride: unavailableSupervisor(),

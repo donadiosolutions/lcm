@@ -87,7 +87,12 @@ import {
   admitManagedDaemonPeer,
   findListeningTcpPorts as findSharedListeningTcpPorts,
   isLikelyLcmDaemonProcessForPlatform as isLikelySharedLcmDaemonProcessForPlatform,
+  parseProcessCommandLine as parseSharedProcessCommandLine,
+  readPlatformProcessArguments as readSharedPlatformProcessArguments,
   readPlatformProcessCommand as readSharedPlatformProcessCommand,
+  readPlatformProcessOwnerIdentity as readSharedPlatformProcessOwnerIdentity,
+  readPlatformProcessOwnerUid as readSharedPlatformProcessOwnerUid,
+  readPlatformProcessExecutable as readSharedPlatformProcessExecutable,
   resolveLinuxSsPath as resolveSharedLinuxSsPath,
   resolveWindowsNetstatPath as resolveSharedWindowsNetstatPath,
   resolveWindowsPowerShellPath as resolveSharedWindowsPowerShellPath,
@@ -274,6 +279,12 @@ export type EnsureDaemonOptions = {
   _listeningPortsOverride?: (pid: number) => number[];
   /** @internal Deterministic peer process-command seam for lifecycle tests. */
   _peerProcessCommandOverride?: (pid: number) => string | null;
+  /** @internal Deterministic peer process-image seam for lifecycle tests. */
+  _peerProcessExecutableOverride?: (pid: number) => string | null;
+  /** @internal Deterministic POSIX peer process-owner seam for lifecycle tests. */
+  _peerProcessOwnerUidOverride?: (pid: number) => number | null;
+  /** @internal Deterministic portable peer process-owner seam for lifecycle tests. */
+  _peerProcessOwnerIdentityOverride?: (pid: number) => string | null;
   /** @internal Deterministic trusted Windows PowerShell seam for lifecycle tests. */
   _windowsPowerShellPathOverride?: string | null;
   /** @internal Deterministic trusted Linux socket-diagnostic seam for lifecycle tests. */
@@ -1600,7 +1611,10 @@ async function captureLifecyclePublicationEvidence(
   const expectedEntrypoint = opts._testScope?.entrypoint
     ?? opts.expectedEntrypoint
     ?? opts._packagedEntrypointOverride
-    ?? PACKAGED_RUNTIME_ENTRYPOINT;
+    ?? PACKAGED_RUNTIME_ENTRYPOINT
+    ?? (isAbsolute(process.argv[1] ?? "") && !isVitestWorkerEntrypoint(process.argv[1])
+      ? process.argv[1]
+      : undefined);
   const expectedRuntimeDigest = opts.expectedRuntimeDigest ?? RUNTIME_DIGEST;
   if (
     typeof expectedEntrypoint !== "string"
@@ -1695,6 +1709,49 @@ async function captureLifecyclePublicationEvidence(
           publicationProcRoot,
           publicationPowerShell,
         ),
+      readProcessArguments: candidatePid => {
+        const override = opts._peerProcessCommandOverride?.(candidatePid);
+        if (override === null) return null;
+        return override === undefined
+          ? readSharedPlatformProcessArguments(
+              candidatePid,
+              publicationPlatform,
+              dependencies.spawnSync,
+              publicationProcRoot,
+              publicationPowerShell,
+            )
+          : parseSharedProcessCommandLine(override, publicationPlatform);
+      },
+      readProcessOwnerUid: candidatePid => opts._peerProcessOwnerUidOverride !== undefined
+        ? opts._peerProcessOwnerUidOverride(candidatePid)
+        : scopedState === undefined
+          ? readSharedPlatformProcessOwnerUid(
+            candidatePid,
+            publicationPlatform,
+            dependencies.spawnSync,
+            publicationProcRoot,
+          )
+          : dependencies.uid ?? process.getuid?.() ?? null,
+      readProcessOwnerIdentity: candidatePid => opts._peerProcessOwnerIdentityOverride !== undefined
+        ? opts._peerProcessOwnerIdentityOverride(candidatePid)
+        : readSharedPlatformProcessOwnerIdentity(
+            candidatePid,
+            publicationPlatform,
+            dependencies.spawnSync,
+            publicationProcRoot,
+            publicationPowerShell,
+          ),
+      readProcessExecutable: candidatePid => opts._peerProcessExecutableOverride !== undefined
+        ? opts._peerProcessExecutableOverride(candidatePid)
+        : scopedState === undefined
+          ? readSharedPlatformProcessExecutable(
+              candidatePid,
+              publicationPlatform,
+              dependencies.spawnSync,
+              publicationProcRoot,
+              publicationPowerShell,
+            )
+          : process.execPath,
       findListeningTcpPorts: (candidatePid, _platform, targetPort, controlGroup) => opts._listeningPortsOverride
         ? opts._listeningPortsOverride(candidatePid).filter(port => port === targetPort)
         : findListeningTcpPorts(
@@ -2242,7 +2299,7 @@ async function ensureDaemonUnlocked(opts: EnsureDaemonOptions): Promise<EnsureDa
   };
   const captureAdmissionPins = (pid: number): LifecycleAdmissionPins => ({
     birthBefore: readAdmissionBirth(pid),
-    tokenBefore: readOwnedToken(tokenPath),
+    tokenBefore: null,
     birthAfter: null,
     tokenAfter: null,
   });
@@ -2255,7 +2312,10 @@ async function ensureDaemonUnlocked(opts: EnsureDaemonOptions): Promise<EnsureDa
   const expectedEntrypoint = testScope?.entrypoint
     ?? opts.expectedEntrypoint
     ?? opts._packagedEntrypointOverride
-    ?? PACKAGED_RUNTIME_ENTRYPOINT;
+    ?? PACKAGED_RUNTIME_ENTRYPOINT
+    ?? (isAbsolute(process.argv[1] ?? "") && !isVitestWorkerEntrypoint(process.argv[1])
+      ? process.argv[1]
+      : undefined);
   const expectedRuntimeDigest = opts.expectedRuntimeDigest ?? RUNTIME_DIGEST;
   const expectedOwnerId = testScope?.ownerId;
   const windowsPowerShellPath = opts._windowsPowerShellPathOverride === undefined
@@ -2287,6 +2347,49 @@ async function ensureDaemonUnlocked(opts: EnsureDaemonOptions): Promise<EnsureDa
           procRoot,
           windowsPowerShellPath,
         ),
+      readProcessArguments: pid => {
+        const override = opts._peerProcessCommandOverride?.(pid);
+        if (override === null) return null;
+        return override === undefined
+          ? readSharedPlatformProcessArguments(
+              pid,
+              platform,
+              dependencies.spawnSync,
+              procRoot,
+              windowsPowerShellPath,
+            )
+          : parseSharedProcessCommandLine(override, platform);
+      },
+      readProcessOwnerUid: pid => opts._peerProcessOwnerUidOverride !== undefined
+        ? opts._peerProcessOwnerUidOverride(pid)
+        : testScope === undefined && hermeticSeams === undefined
+          ? readSharedPlatformProcessOwnerUid(
+            pid,
+            platform,
+            dependencies.spawnSync,
+            procRoot,
+          )
+          : dependencies.uid ?? process.getuid?.() ?? null,
+      readProcessOwnerIdentity: pid => opts._peerProcessOwnerIdentityOverride !== undefined
+        ? opts._peerProcessOwnerIdentityOverride(pid)
+        : readSharedPlatformProcessOwnerIdentity(
+            pid,
+            platform,
+            dependencies.spawnSync,
+            procRoot,
+            windowsPowerShellPath,
+          ),
+      readProcessExecutable: pid => opts._peerProcessExecutableOverride !== undefined
+        ? opts._peerProcessExecutableOverride(pid)
+        : testScope === undefined && hermeticSeams === undefined
+          ? readSharedPlatformProcessExecutable(
+              pid,
+              platform,
+              dependencies.spawnSync,
+              procRoot,
+              windowsPowerShellPath,
+            )
+          : process.execPath,
       findListeningTcpPorts: (pid, _platform, targetPort, controlGroup) => opts._listeningPortsOverride
         ? opts._listeningPortsOverride(pid).filter(port => port === targetPort)
         : findListeningTcpPorts(
@@ -2540,9 +2643,6 @@ async function ensureDaemonUnlocked(opts: EnsureDaemonOptions): Promise<EnsureDa
     const birthBefore = witnessEligible
       ? admissionPins !== undefined ? admissionPins.birthBefore : readAdmissionBirth(health.pid!)
       : null;
-    const tokenBefore = witnessEligible
-      ? admissionPins !== undefined ? admissionPins.tokenBefore : readOwnedToken(tokenPath)
-      : null;
     let verifiedHealth = health;
     if (!access.alreadyVerified) {
       const authenticated = await checkDaemonDiagnostics(
@@ -2565,6 +2665,9 @@ async function ensureDaemonUnlocked(opts: EnsureDaemonOptions): Promise<EnsureDa
     }
     if (!processEntrypointMatches(verifiedHealth, expectedEntrypoint, platform, procRoot, realpath)) return null;
     if (!healthRuntimeDigestMatches(verifiedHealth, expectedRuntimeDigest)) return null;
+    const tokenBefore = witnessEligible
+      ? admissionPins !== undefined ? admissionPins.tokenBefore : readOwnedToken(tokenPath)
+      : null;
     const birthAfter = witnessEligible
       ? admissionPins !== undefined
         ? admissionPins.birthAfter
@@ -3383,6 +3486,7 @@ async function ensureDaemonUnlocked(opts: EnsureDaemonOptions): Promise<EnsureDa
       birthAfter: admissionBefore.birthBefore === null
         ? null
         : readAdmissionBirth(authenticated.pid!),
+      tokenBefore: readOwnedToken(tokenPath),
       tokenAfter: readOwnedToken(tokenPath),
     };
     let finalProbe: SupervisorObservation;
@@ -3550,6 +3654,7 @@ async function ensureDaemonUnlocked(opts: EnsureDaemonOptions): Promise<EnsureDa
                 birthAfter: admissionBefore.birthBefore === null
                   ? null
                   : readAdmissionBirth(authenticated.pid!),
+                tokenBefore: readOwnedToken(tokenPath),
                 tokenAfter: readOwnedToken(tokenPath),
               };
               let finalProbe: SupervisorObservation;
@@ -4283,7 +4388,10 @@ async function restartDaemonUnlocked(
   const expectedEntrypoint = testScope?.entrypoint
     ?? opts.expectedEntrypoint
     ?? opts._packagedEntrypointOverride
-    ?? PACKAGED_RUNTIME_ENTRYPOINT;
+    ?? PACKAGED_RUNTIME_ENTRYPOINT
+    ?? (isAbsolute(process.argv[1] ?? "") && !isVitestWorkerEntrypoint(process.argv[1])
+      ? process.argv[1]
+      : undefined);
   const ensureOptionsWithEntrypoint = { ...ensureOptions, expectedEntrypoint };
   const monotonicNow = opts._monotonicNowOverride ?? performance.now.bind(performance);
   const setTimeoutFn = opts._setTimeoutOverride ?? setTimeout;
@@ -4341,6 +4449,51 @@ async function restartDaemonUnlocked(
             procRoot,
             windowsPowerShellPath,
           )),
+      readProcessArguments: pid => {
+        const override = opts._peerProcessCommandOverride?.(pid)
+          ?? (_isManagedProcessOverride?.(pid)
+            ? `node ${expectedEntrypoint ?? "lcm"} daemon start`
+            : undefined);
+        return override === undefined
+          ? readSharedPlatformProcessArguments(
+              pid,
+              platform,
+              dependencies.spawnSync,
+              procRoot,
+              windowsPowerShellPath,
+            )
+          : parseSharedProcessCommandLine(override, platform);
+      },
+      readProcessOwnerUid: pid => opts._peerProcessOwnerUidOverride !== undefined
+        ? opts._peerProcessOwnerUidOverride(pid)
+        : testScope === undefined && hermeticSeams === undefined
+          ? readSharedPlatformProcessOwnerUid(
+            pid,
+            platform,
+            dependencies.spawnSync,
+            procRoot,
+          )
+          : dependencies.uid ?? process.getuid?.() ?? null,
+      readProcessOwnerIdentity: pid => opts._peerProcessOwnerIdentityOverride !== undefined
+        ? opts._peerProcessOwnerIdentityOverride(pid)
+        : readSharedPlatformProcessOwnerIdentity(
+            pid,
+            platform,
+            dependencies.spawnSync,
+            procRoot,
+            windowsPowerShellPath,
+          ),
+      readProcessExecutable: pid => opts._peerProcessExecutableOverride !== undefined
+        ? opts._peerProcessExecutableOverride(pid)
+        : testScope === undefined && hermeticSeams === undefined
+          ? readSharedPlatformProcessExecutable(
+              pid,
+              platform,
+              dependencies.spawnSync,
+              procRoot,
+              windowsPowerShellPath,
+            )
+          : process.execPath,
       findListeningTcpPorts: (pid, _platform, targetPort, controlGroup) => opts._listeningPortsOverride
         ? opts._listeningPortsOverride(pid).filter(port => port === targetPort)
         : findListeningTcpPorts(

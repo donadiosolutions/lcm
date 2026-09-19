@@ -5,10 +5,11 @@ import {
   readlinkSync,
   readdirSync,
 } from "node:fs";
-import { dirname, join, win32 } from "node:path";
+import { basename, dirname, join, win32 } from "node:path";
 import { platform as currentPlatform } from "node:os";
 import { processStartTime } from "../private-mutation-lock.js";
 import { readBoundedRegularFileWithStat } from "../security-files.js";
+import { daemonEntrypointMatches } from "./lifecycle-scope.js";
 
 export type ManagedDaemonPeerAuthority =
   | Readonly<{
@@ -38,6 +39,10 @@ export type ManagedDaemonPeerAdmissionOptions = Readonly<{
     isProcessAlive?: (pid: number) => boolean;
     processBirth?: (pid: number) => string | null;
     readProcessCommand?: (pid: number, platform: NodeJS.Platform) => string | null;
+    readProcessArguments?: (pid: number, platform: NodeJS.Platform) => readonly string[] | null;
+    readProcessExecutable?: (pid: number, platform: NodeJS.Platform) => string | null;
+    readProcessOwnerUid?: (pid: number, platform: NodeJS.Platform) => number | null;
+    readProcessOwnerIdentity?: (pid: number, platform: NodeJS.Platform) => string | null;
     findListeningTcpPorts?: (
       pid: number,
       platform: NodeJS.Platform,
@@ -180,6 +185,266 @@ export function readPlatformProcessCommand(
   }
 }
 
+export function parseProcessCommandLine(
+  command: string,
+  platform: NodeJS.Platform,
+): string[] | null {
+  if (platform === "win32") {
+    const args: string[] = [];
+    let index = 0;
+    while (index < command.length) {
+      while (/\s/u.test(command[index] ?? "")) index++;
+      if (index >= command.length) break;
+      let current = "";
+      let quoted = false;
+      while (index < command.length) {
+        let backslashes = 0;
+        while (command[index] === "\\") {
+          backslashes++;
+          index++;
+        }
+        if (command[index] === '"') {
+          current += "\\".repeat(Math.floor(backslashes / 2));
+          if (backslashes % 2 === 1) {
+            current += '"';
+            index++;
+          } else {
+            quoted = !quoted;
+            index++;
+          }
+          continue;
+        }
+        current += "\\".repeat(backslashes);
+        const character = command[index];
+        if (character === undefined || (!quoted && /\s/u.test(character))) break;
+        current += character;
+        index++;
+      }
+      if (quoted) return null;
+      args.push(current);
+      while (/\s/u.test(command[index] ?? "")) index++;
+    }
+    return args.length > 0 ? args : null;
+  }
+  const args: string[] = [];
+  let current = "";
+  let quote: "'" | '"' | undefined;
+  let started = false;
+  for (let index = 0; index < command.length; index++) {
+    const character = command[index]!;
+    if (quote !== undefined) {
+      if (character === quote) {
+        quote = undefined;
+        started = true;
+      } else if (character === "\\" && quote === '"' && command[index + 1] === '"') {
+        current += '"';
+        index++;
+      } else {
+        current += character;
+      }
+      continue;
+    }
+    if (character === "'" || character === '"') {
+      quote = character;
+      started = true;
+      continue;
+    }
+    if (/\s/u.test(character)) {
+      if (started) {
+        args.push(current);
+        current = "";
+        started = false;
+      }
+      continue;
+    }
+    if (character === "\\" && (command[index + 1] === '"' || command[index + 1] === "'")) {
+      current += command[index + 1];
+      index++;
+      started = true;
+      continue;
+    }
+    current += character;
+    started = true;
+  }
+  if (quote !== undefined) return null;
+  if (started) args.push(current);
+  return args.length > 0 ? args : null;
+}
+
+export function readPlatformProcessArguments(
+  pid: number,
+  platform: NodeJS.Platform,
+  spawnSyncImpl: typeof spawnSync = defaultSpawnSync,
+  procRoot = "/proc",
+  windowsPowerShellPath = resolveWindowsPowerShellPath(),
+): string[] | null {
+  if (platform === "linux") {
+    try {
+      const args = readFileSync(join(procRoot, String(pid), "cmdline"), "utf8")
+        .split("\0")
+        .filter((argument) => argument.length > 0);
+      return args.length > 0 ? args : null;
+    } catch {
+      return null;
+    }
+  }
+  if (platform === "darwin") {
+    try {
+      const result = spawnSyncImpl("/usr/sbin/sysctl", ["-b", `kern.procargs2.${String(pid)}`], {
+        encoding: "buffer",
+        timeout: 1_000,
+        maxBuffer: 64 * 1_024,
+        shell: false,
+        windowsHide: true,
+      });
+      if (result.status !== 0 || !Buffer.isBuffer(result.stdout) || result.stdout.length < 5) return null;
+      const argumentCount = result.stdout.readInt32LE(0);
+      if (!Number.isInteger(argumentCount) || argumentCount < 1 || argumentCount > 1_024) return null;
+      let offset = 4;
+      while (offset < result.stdout.length && result.stdout[offset] !== 0) offset++;
+      while (offset < result.stdout.length && result.stdout[offset] === 0) offset++;
+      const args: string[] = [];
+      while (offset < result.stdout.length && args.length < argumentCount) {
+        const end = result.stdout.indexOf(0, offset);
+        if (end < 0) return null;
+        args.push(result.stdout.subarray(offset, end).toString("utf8"));
+        offset = end + 1;
+      }
+      return args.length === argumentCount && args.every((argument) => !argument.includes("\u0000"))
+        ? args
+        : null;
+    } catch {
+      return null;
+    }
+  }
+  const command = readPlatformProcessCommand(
+    pid,
+    platform,
+    spawnSyncImpl,
+    procRoot,
+    windowsPowerShellPath,
+  );
+  return command === null ? null : parseProcessCommandLine(command, platform);
+}
+
+export function readPlatformProcessOwnerIdentity(
+  pid: number,
+  platform: NodeJS.Platform,
+  spawnSyncImpl: typeof spawnSync = defaultSpawnSync,
+  procRoot = "/proc",
+  windowsPowerShellPath = resolveWindowsPowerShellPath(),
+): string | null {
+  if (platform === "linux" || platform === "darwin") {
+    const uid = readPlatformProcessOwnerUid(pid, platform, spawnSyncImpl, procRoot);
+    return uid === null ? null : `uid:${String(uid)}`;
+  }
+  if (platform !== "win32" || windowsPowerShellPath === null) return null;
+  try {
+    const result = spawnSyncImpl(windowsPowerShellPath, [
+      "-NoLogo",
+      "-NoProfile",
+      "-NonInteractive",
+      "-Command",
+      `$process = Get-CimInstance -ClassName Win32_Process -Filter 'ProcessId = ${String(pid)}'; if ($null -ne $process) { $owner = Invoke-CimMethod -InputObject $process -MethodName GetOwnerSid; if ($owner.ReturnValue -eq 0) { [Console]::Out.Write($owner.Sid) } }`,
+    ], {
+      encoding: "utf-8",
+      timeout: 1_000,
+      maxBuffer: 4 * 1_024,
+      shell: false,
+      windowsHide: true,
+    });
+    if (result.status !== 0 || typeof result.stdout !== "string") return null;
+    const sid = result.stdout.trim();
+    return /^S-\d-(?:\d+-){1,14}\d+$/iu.test(sid) ? sid.toUpperCase() : null;
+  } catch {
+    return null;
+  }
+}
+
+export function readPlatformProcessExecutable(
+  pid: number,
+  platform: NodeJS.Platform,
+  spawnSyncImpl: typeof spawnSync = defaultSpawnSync,
+  procRoot = "/proc",
+  windowsPowerShellPath = resolveWindowsPowerShellPath(),
+): string | null {
+  if (platform === "linux") {
+    try {
+      const executable = readlinkSync(join(procRoot, String(pid), "exe"));
+      return executable.startsWith("/") ? executable : null;
+    } catch {
+      return null;
+    }
+  }
+  const command = platform === "darwin"
+    ? "/usr/sbin/lsof"
+    : platform === "win32"
+      ? windowsPowerShellPath
+      : null;
+  if (command === null) return null;
+  const args = platform === "darwin"
+    ? ["-nP", "-a", "-p", String(pid), "-d", "txt", "-Fn"]
+    : [
+        "-NoLogo",
+        "-NoProfile",
+        "-NonInteractive",
+        "-Command",
+        `$process = Get-CimInstance -ClassName Win32_Process -Filter 'ProcessId = ${String(pid)}'; if ($null -ne $process) { [Console]::Out.Write($process.ExecutablePath) }`,
+      ];
+  try {
+    const result = spawnSyncImpl(command, args, {
+      encoding: "utf-8",
+      timeout: 1_000,
+      maxBuffer: 64 * 1_024,
+      shell: false,
+      windowsHide: true,
+    });
+    if (result.status !== 0 || typeof result.stdout !== "string") return null;
+    if (platform === "win32") return result.stdout.trim() || null;
+    const executables = result.stdout.split(/\r?\n/u)
+      .filter((line) => line.startsWith("n/"))
+      .map((line) => line.slice(1));
+    return executables.length === 1 ? executables[0]! : null;
+  } catch {
+    return null;
+  }
+}
+
+export function readPlatformProcessOwnerUid(
+  pid: number,
+  platform: NodeJS.Platform,
+  spawnSyncImpl: typeof spawnSync = defaultSpawnSync,
+  procRoot = "/proc",
+): number | null {
+  let output: string;
+  if (platform === "linux") {
+    try {
+      output = readFileSync(join(procRoot, String(pid), "status"), "utf8");
+      const match = /^Uid:\s+(\d+)(?:\s+\d+){3}\s*$/mu.exec(output);
+      const uid = match?.[1] === undefined ? NaN : Number.parseInt(match[1], 10);
+      return Number.isSafeInteger(uid) && uid >= 0 ? uid : null;
+    } catch {
+      return null;
+    }
+  }
+  if (platform !== "darwin") return null;
+  try {
+    const result = spawnSyncImpl("/bin/ps", ["-p", String(pid), "-o", "uid="], {
+      encoding: "utf-8",
+      timeout: 1_000,
+      maxBuffer: 1_024,
+      shell: false,
+      windowsHide: true,
+    });
+    if (result.status !== 0 || typeof result.stdout !== "string") return null;
+    const value = result.stdout.trim();
+    const uid = /^\d+$/u.test(value) ? Number.parseInt(value, 10) : NaN;
+    return Number.isSafeInteger(uid) && uid >= 0 ? uid : null;
+  } catch {
+    return null;
+  }
+}
+
 export function isLikelyLcmDaemonProcessForPlatform(
   pid: number,
   platform: NodeJS.Platform,
@@ -187,17 +452,16 @@ export function isLikelyLcmDaemonProcessForPlatform(
   procRoot: string,
   windowsPowerShellPath: string | null,
 ): boolean {
-  return commandMatches(
-    readPlatformProcessCommand(
-      pid,
-      platform,
-      spawnSyncImpl,
-      procRoot,
-      windowsPowerShellPath,
-    ),
-    undefined,
+  const command = readPlatformProcessCommand(
+    pid,
     platform,
+    spawnSyncImpl,
+    procRoot,
+    windowsPowerShellPath,
   );
+  if (command === null) return false;
+  const parts = command.split(/\s+/u);
+  return command.includes("lcm") && parts.includes("daemon") && parts.includes("start");
 }
 
 export function findListeningTcpPorts(
@@ -331,13 +595,28 @@ export function findListeningTcpPorts(
 }
 
 function commandMatches(
-  command: string | null,
-  _expectedEntrypoint: string | undefined,
-  _platform: NodeJS.Platform,
+  args: readonly string[] | null,
+  processExecutable: string | null,
+  expectedEntrypoint: string | undefined,
+  platform: NodeJS.Platform,
 ): boolean {
-  if (command === null) return false;
-  const parts = command.split(/\s+/u);
-  return command.includes("lcm") && parts.includes("daemon") && parts.includes("start");
+  if (args === null || processExecutable === null || expectedEntrypoint === undefined) return false;
+  const daemonIndex = args.findIndex((argument, index) => (
+    argument === "daemon" && args[index + 1] === "start"
+  ));
+  if (daemonIndex < 1) return false;
+  const entrypointIndex = daemonIndex - 1;
+  if (!daemonEntrypointMatches(args[entrypointIndex], expectedEntrypoint, platform)) return false;
+  const prefix = args.slice(0, entrypointIndex);
+  if (prefix.length === 0) {
+    return daemonEntrypointMatches(processExecutable, expectedEntrypoint, platform);
+  }
+  const executable = platform === "win32"
+    ? win32.basename(prefix[0]!)
+    : basename(prefix[0]!);
+  return prefix.length === 1
+    && /^node(?:\.exe)?$/iu.test(executable)
+    && daemonEntrypointMatches(processExecutable, process.execPath, platform);
 }
 
 export function admitManagedDaemonPeer(
@@ -351,6 +630,39 @@ export function admitManagedDaemonPeer(
   const birth = options._seams?.processBirth ?? ((pid: number) => processStartTime(pid));
   const readCommand = options._seams?.readProcessCommand
     ?? ((pid: number, requestedPlatform: NodeJS.Platform) => readPlatformProcessCommand(
+      pid,
+      requestedPlatform,
+      spawnSyncImpl,
+      procRoot,
+    ));
+  const readArguments = options._seams?.readProcessArguments
+    ?? (options._seams?.readProcessCommand === undefined
+      ? ((pid: number, requestedPlatform: NodeJS.Platform) => readPlatformProcessArguments(
+          pid,
+          requestedPlatform,
+          spawnSyncImpl,
+          procRoot,
+        ))
+      : ((pid: number, requestedPlatform: NodeJS.Platform) => {
+          const command = readCommand(pid, requestedPlatform);
+          return command === null ? null : parseProcessCommandLine(command, requestedPlatform);
+        }));
+  const readOwnerUid = options._seams?.readProcessOwnerUid
+    ?? ((pid: number, requestedPlatform: NodeJS.Platform) => readPlatformProcessOwnerUid(
+      pid,
+      requestedPlatform,
+      spawnSyncImpl,
+      procRoot,
+    ));
+  const readOwnerIdentity = options._seams?.readProcessOwnerIdentity
+    ?? ((pid: number, requestedPlatform: NodeJS.Platform) => readPlatformProcessOwnerIdentity(
+      pid,
+      requestedPlatform,
+      spawnSyncImpl,
+      procRoot,
+    ));
+  const readExecutable = options._seams?.readProcessExecutable
+    ?? ((pid: number, requestedPlatform: NodeJS.Platform) => readPlatformProcessExecutable(
       pid,
       requestedPlatform,
       spawnSyncImpl,
@@ -382,9 +694,29 @@ export function admitManagedDaemonPeer(
   ) return null;
 
   const birthBefore = birth(pid);
+  const executableBefore = readExecutable(pid, platform);
+  const expectedProcessOwner = options.authority.kind !== "pid-file"
+    ? undefined
+    : options.authority.expectedUid !== undefined
+      ? `uid:${String(options.authority.expectedUid)}`
+      : platform === "win32"
+        ? readOwnerIdentity(process.pid, platform)
+        : null;
+  const ownerBefore = expectedProcessOwner === undefined
+    ? undefined
+    : expectedProcessOwner === null
+      ? null
+      : options.authority.kind === "pid-file" && options.authority.expectedUid !== undefined
+        ? (() => {
+            const uid = readOwnerUid(pid, platform);
+            return uid === null ? null : `uid:${String(uid)}`;
+          })()
+        : readOwnerIdentity(pid, platform);
   if (
     birthBefore === null
-    || !commandMatches(readCommand(pid, platform), options.expectedEntrypoint, platform)
+    || expectedProcessOwner === null
+    || (expectedProcessOwner !== undefined && ownerBefore !== expectedProcessOwner)
+    || !commandMatches(readArguments(pid, platform), executableBefore, options.expectedEntrypoint, platform)
     || !listeningPorts(pid, platform, options.port, options.authority.kind === "manager" ? options.authority.systemdControlGroup : undefined).includes(options.port)
   ) return null;
 
@@ -398,7 +730,16 @@ export function admitManagedDaemonPeer(
   if (
     !alive(pid)
     || birth(pid) !== birthBefore
-    || !commandMatches(readCommand(pid, platform), options.expectedEntrypoint, platform)
+    || (expectedProcessOwner !== undefined && (
+      options.authority.kind === "pid-file" && options.authority.expectedUid !== undefined
+        ? (() => {
+            const uid = readOwnerUid(pid, platform);
+            return uid === null ? null : `uid:${String(uid)}`;
+          })()
+        : readOwnerIdentity(pid, platform)
+    ) !== ownerBefore)
+    || !daemonEntrypointMatches(readExecutable(pid, platform) ?? undefined, executableBefore ?? undefined, platform)
+    || !commandMatches(readArguments(pid, platform), executableBefore, options.expectedEntrypoint, platform)
     || !listeningPorts(pid, platform, options.port, options.authority.kind === "manager" ? options.authority.systemdControlGroup : undefined).includes(options.port)
   ) return null;
 

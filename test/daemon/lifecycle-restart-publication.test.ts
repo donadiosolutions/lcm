@@ -1909,6 +1909,8 @@ describe("restart publication assertion convergence", () => {
         _listeningPortsOverride: () => [43_950],
         _peerProcessCommandOverride: () => "node /opt/lcm.mjs daemon start --foreground",
         _processStartTimeForTesting: () => "birth-111",
+        _peerProcessExecutableOverride: () => process.execPath,
+        _peerProcessOwnerUidOverride: () => process.getuid?.() ?? null,
         _readPrivateMutationLockOwnerForTesting: () => ({
           version: 1,
           pid: 999,
@@ -2000,7 +2002,7 @@ describe("restart publication assertion convergence", () => {
     expect(boundedReadCalls[0]?.options.expectedUid).toBe(0);
   });
 
-  it("retains production capture compatibility when process.getuid is unavailable", async () => {
+  it("fails closed before production capture when process ownership is unavailable", async () => {
     const root = mkdtempSync(join(tmpdir(), "lcm-950-no-getuid-"));
     roots.push(root);
     const stateDir = join(root, ".lcm");
@@ -2038,7 +2040,7 @@ describe("restart publication assertion convergence", () => {
       process.argv[1] = originalEntrypoint;
     }
 
-    expect(fetch).toHaveBeenCalledTimes(3);
+    expect(fetch).toHaveBeenCalledOnce();
     expect(boundedReadCalls).not.toHaveLength(0);
     expect(boundedReadCalls.every(call => call.options.expectedUid === undefined)).toBe(true);
   });

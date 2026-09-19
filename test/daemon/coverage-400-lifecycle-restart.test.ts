@@ -328,7 +328,7 @@ function writePid(rootPath: string, pid: number): string {
   return path;
 }
 
-function writeProc(rootPath: string, pid: number, parentPid = 1, command = "node lcm daemon start --foreground"): void {
+function writeProc(rootPath: string, pid: number, parentPid = 1, command = "node /lcm daemon start --foreground"): void {
   const dir = join(rootPath, String(pid));
   mkdirSync(dir, { recursive: true });
   writeFileSync(join(dir, "status"), `Name:\tnode\nUid:\t1000\t1000\t1000\t1000\nPPid:\t${parentPid}\n`);
@@ -371,7 +371,7 @@ function hermetic(options: EnsureDaemonOptions, environment: NodeJS.ProcessEnv =
     _processStartTimeForTesting: options._processStartTimeForTesting
       ?? (pid => `birth-${String(pid)}`),
     _peerProcessCommandOverride: options._peerProcessCommandOverride
-      ?? ((options._platform ?? "linux") === "linux" && options._procRoot === undefined
+      ?? (options._procRoot === undefined
         ? () => `node ${options.expectedEntrypoint ?? "/lcm"} daemon start --foreground`
         : undefined),
     _hermeticTestSeams: seams,
@@ -614,7 +614,7 @@ async function runLegacyFixture(config: LegacyFixtureConfig = {}): Promise<{
     symlinkSync(external, tokenPath);
   }
   const aliveState = { value: config.alive ?? true };
-  writeProc(procRoot, 4242, 1234, config.processCommand ?? "node lcm daemon start --foreground");
+  writeProc(procRoot, 4242, 1234, config.processCommand ?? "node /lcm daemon start --foreground");
   const candidate = legacyUnit();
   const discoveries = config.discoveries ?? [{ kind: "candidates" as const, candidates: [candidate] }];
   let discoveryIndex = 0;
@@ -1946,7 +1946,7 @@ describe("managed restart refusal and repair coverage", () => {
     mkdirSync(procRoot, { recursive: true });
     const pidPath = writePid(dir, 4242);
     writeFileSync(join(dir, "daemon.token"), "legacy-token", { mode: 0o600 });
-    writeProc(procRoot, 4242, 1234, "node lcm daemon start --foreground");
+    writeProc(procRoot, 4242, 1234, "node /lcm daemon start --foreground");
     let alive = true;
     const events: string[] = [];
     const candidate = legacyUnit();
@@ -2042,7 +2042,7 @@ describe("managed restart refusal and repair coverage", () => {
     mkdirSync(procRoot, { recursive: true });
     const pidPath = writePid(dir, 4242);
     writeFileSync(join(dir, "daemon.token"), "legacy-token", { mode: 0o600 });
-    writeProc(procRoot, 4242, 1234, "node lcm daemon start --foreground");
+    writeProc(procRoot, 4242, 1234, "node /lcm daemon start --foreground");
     let alive = true;
     const candidate = legacyUnit();
     const managerCalls: string[][] = [];
@@ -2123,7 +2123,7 @@ describe("managed restart refusal and repair coverage", () => {
     mkdirSync(procRoot, { recursive: true });
     const pidPath = writePid(dir, 4242);
     writeFileSync(join(dir, "daemon.token"), "legacy-token", { mode: 0o600 });
-    writeProc(procRoot, 4242, 1234, "node lcm daemon start --foreground");
+    writeProc(procRoot, 4242, 1234, "node /lcm daemon start --foreground");
     let alive = true;
     const candidate = legacyUnit();
     const managerResults = [
@@ -2564,7 +2564,7 @@ describe("authenticated legacy generated systemd refusal matrix", () => {
     mkdirSync(procRoot, { recursive: true });
     const pidPath = writePid(dir, 4242);
     writeFileSync(join(dir, "daemon.token"), "legacy-token", { mode: 0o600 });
-    writeProc(procRoot, 4242, 1234, "node lcm daemon start --foreground");
+    writeProc(procRoot, 4242, 1234, "node /lcm daemon start --foreground");
     let alive = true;
     const candidate = legacyUnit();
     const supervisor = legacyMigrationSupervisor(
@@ -2603,7 +2603,7 @@ describe("authenticated legacy generated systemd refusal matrix", () => {
     const pidPath = writePid(dir, 4242);
     linkSync(pidPath, `${pidPath}.alias`);
     writeFileSync(join(dir, "daemon.token"), "legacy-token", { mode: 0o600 });
-    writeProc(procRoot, 4242, 1234, "node lcm daemon start --foreground");
+    writeProc(procRoot, 4242, 1234, "node /lcm daemon start --foreground");
     const candidate = legacyUnit();
     const supervisor = legacyMigrationSupervisor({ kind: "candidates", candidates: [candidate] });
     const ensureMock = vi.fn(async () => ({ connected: true, port: 19_999, spawned: false }));
@@ -3020,7 +3020,7 @@ describe("legacy restart and terminal cleanup coverage", () => {
     let psCalls = 0;
     const ps = vi.fn(() => ({
       status: 0,
-      stdout: ++psCalls < 15 ? "node lcm daemon start --foreground\n" : "node unrelated\n",
+      stdout: ++psCalls < 3 ? "node lcm daemon start --foreground\n" : "node unrelated\n",
       stderr: "",
     }));
     const fetch = diagnosticsFetch(health(20), health(20));
@@ -3079,7 +3079,7 @@ describe("legacy restart and terminal cleanup coverage", () => {
     });
     expect(result).toMatchObject({ restarted: true, stoppedPid: 20 });
     expect(kill).toHaveBeenCalledWith(20, "SIGTERM");
-    expect(ps).toHaveBeenCalledTimes(15);
+    expect(ps).toHaveBeenCalledTimes(3);
   });
 
   it("rejects malformed restart seams and state mutation before validation", async () => {

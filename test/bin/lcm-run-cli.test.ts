@@ -1217,6 +1217,51 @@ describe("runCli registration and help dispatch", () => {
     expect(state.post).not.toHaveBeenCalled();
   });
 
+  it("sends no credential or store body to a reused PID running a foreign entrypoint", async () => {
+    const root = actualFs.mkdtempSync(join(tmpdir(), "lcm-cli-reused-peer-"));
+    const pidFilePath = join(root, "daemon.pid");
+    actualFs.writeFileSync(pidFilePath, "42\n", { mode: 0o600 });
+    const actualPeer = await vi.importActual<typeof import("../../src/daemon/peer-admission.js")>(
+      "../../src/daemon/peer-admission.js",
+    );
+    try {
+      state.peerEvidence = actualPeer.admitManagedDaemonPeer({
+        authority: { kind: "pid-file", pidFilePath, expectedUid: process.getuid?.() },
+        port: 3737,
+        platform: "linux",
+        expectedEntrypoint: "/opt/lcm/lcm.mjs",
+        _seams: {
+          isProcessAlive: () => true,
+          processBirth: () => "reused-birth",
+          readProcessArguments: () => [
+            "/usr/bin/node",
+            "/tmp/foreign-lcm.mjs",
+            "/opt/lcm/lcm.mjs",
+            "daemon",
+            "start",
+          ],
+          readProcessExecutable: () => process.execPath,
+          readProcessOwnerUid: () => process.getuid?.() ?? null,
+          findListeningTcpPorts: () => [3737],
+        },
+      });
+      expect(state.peerEvidence).toBeNull();
+
+      const error = await invoke(["store", "must-not-send"], {
+        migrate: vi.fn(),
+        sleep: async () => undefined,
+      });
+
+      expect(error?.message).toContain("Daemon peer ownership could not be verified");
+      expect(state.readAuthToken).not.toHaveBeenCalled();
+      expect(state.health).not.toHaveBeenCalled();
+      expect(state.get).not.toHaveBeenCalled();
+      expect(state.post).not.toHaveBeenCalled();
+    } finally {
+      actualFs.rmSync(root, { recursive: true, force: true });
+    }
+  });
+
   it("shows the static missing-storage remedy for export and import failures", async () => {
     const missing=new CliProjectStorageMissingError();
     missing.message="SECRET_CANARY";
@@ -1738,6 +1783,12 @@ describe("runCli daemon-backed and utility actions", () => {
 
     expect(migrate).toHaveBeenCalledOnce();
     expect(state.ensureDaemon).toHaveBeenCalledOnce();
+    if (entrypoint === undefined) {
+      const peerAdmission = await import("../../src/daemon/peer-admission.js");
+      expect(vi.mocked(peerAdmission.admitManagedDaemonPeer)).toHaveBeenLastCalledWith(
+        expect.objectContaining({ expectedEntrypoint: process.argv[1] }),
+      );
+    }
   });
 
   it.each([

@@ -112,11 +112,23 @@ function withHermeticLifecycleSeams(
   }
   return {
     ...options,
+    ...((options._platform ?? "linux") === "linux"
+      && options.expectedEntrypoint === undefined
+      ? { expectedEntrypoint: "lcm" }
+      : {}),
     _processStartTimeForTesting: options._processStartTimeForTesting
       ?? (pid => `birth-${String(pid)}`),
     _peerProcessCommandOverride: options._peerProcessCommandOverride
       ?? (options._procRoot === undefined || (options._platform ?? "linux") !== "linux"
-        ? () => `node ${options.expectedEntrypoint ?? "lcm"} daemon start --foreground`
+        ? (pid) => {
+            const entrypoint = options.expectedEntrypoint ?? "lcm";
+            if ((options._platform ?? "linux") === "linux") {
+              const processRoot = join(seams.procRoot, String(pid));
+              mkdirSync(processRoot, { recursive: true });
+              writeFileSync(join(processRoot, "cmdline"), `node\0${entrypoint}\0daemon\0start\0--foreground\0`);
+            }
+            return `node ${entrypoint} daemon start --foreground`;
+          }
         : undefined),
     _hermeticTestSeams: seams,
     _assertBackendPublication: () => undefined,
@@ -1011,7 +1023,7 @@ describe("ensureDaemon", () => {
     expect(readFileSync(pidFile, "utf-8")).toBe("200");
   });
 
-  it("defaults to the captured packaged entrypoint when replacing a same-version daemon", async (): Promise<void> => {
+  it("refuses a stale packaged entrypoint before authenticating the daemon", async (): Promise<void> => {
     const tempDir = mkdtempSync(join(tmpdir(), "lcm-lifecycle-entrypoint-mismatch-"));
     tempDirs.push(tempDir);
     const procRoot = join(tempDir, "proc");
@@ -1057,8 +1069,11 @@ describe("ensureDaemon", () => {
     });
 
     expect(result.connected).toBe(false);
-    expect(killMock).toHaveBeenCalledWith(200, "SIGTERM");
-    expect(existsSync(pidFile)).toBe(false);
+    expect(killMock).not.toHaveBeenCalled();
+    expect(fetchMock.mock.calls.every(([, init]) => (
+      (init as RequestInit | undefined)?.headers === undefined
+    ))).toBe(true);
+    expect(existsSync(pidFile)).toBe(true);
   });
 
   it.each(["darwin", "win32"] as const)(
@@ -2452,7 +2467,7 @@ describe("ensureDaemon", () => {
       version: "1.2.3",
       storageBackend: "sqlite",
       pid: fixture.pid,
-      entrypoint: "lcm",
+      entrypoint: testIdentity.entrypoint,
       runtimeDigest: TEST_RUNTIME_DIGEST,
     };
     const fetchMock = vi.fn(async (url: string): Promise<Response> => {
@@ -2468,7 +2483,7 @@ describe("ensureDaemon", () => {
       pidFilePath: fixture.pidFile,
       spawnTimeoutMs: 100,
       expectedVersion: "1.2.3",
-      expectedEntrypoint: "lcm",
+      expectedEntrypoint: testIdentity.entrypoint,
       expectedRuntimeDigest: TEST_RUNTIME_DIGEST,
       _fetchOverride: fetchMock as FetchOverride,
       _killOverride: killMock,
@@ -2998,6 +3013,7 @@ describe("ensureDaemon", () => {
       spawnTimeoutMs: 600,
       expectedVersion: "1.2.3",
       expectedStorageBackend: "postgresql",
+      expectedEntrypoint: "lcm",
       _fetchOverride: mockFetch as FetchOverride,
       _spawnOverride: spawnMock as unknown as SpawnOverride,
       _isProcessAliveOverride: () => true,
@@ -3711,7 +3727,13 @@ describe("restartDaemon", () => {
       if (url.endsWith("/health")) {
         return {
           ok: true,
-          json: async () => ({ status: "ok", version: "1.2.3", storageBackend: "sqlite", pid: 4242 }),
+          json: async () => ({
+            status: "ok",
+            version: "1.2.3",
+            storageBackend: "sqlite",
+            pid: 4242,
+            entrypoint: "lcm",
+          }),
         } as Response;
       }
       expect(init?.headers).toEqual({ Authorization: "Bearer local-token" });
@@ -3733,9 +3755,11 @@ describe("restartDaemon", () => {
       spawnTimeoutMs: 100,
       expectedVersion: "1.2.3",
       expectedStorageBackend: "postgresql",
+      expectedEntrypoint: "lcm",
       _platform: "darwin",
       _fetchOverride: fetchMock as FetchOverride,
       _spawnSyncOverride: spawnSyncMock as unknown as SpawnSyncOverride,
+      _peerProcessCommandOverride: () => "node lcm daemon start --foreground",
       _listeningPortsOverride: (): number[] => [19999],
       _isProcessAliveOverride: () => alive,
       _killOverride: killMock,
