@@ -35,6 +35,45 @@ class CoordinationContractTests(unittest.TestCase):
         self.assertIn("../procedural-development/references/worker-execution.md", text)
         self.assertIn("before triage dispatch", " ".join(text.split()))
 
+    def test_bug_campaign_requires_canonical_untrusted_issue_envelopes(self):
+        entry = self.read("triage-fix-all-bugs/SKILL.md")
+        triage = self.read("triage-fix-all-bugs/references/triage.md")
+        combined = entry + "\n" + triage
+        normalized = " ".join(combined.split())
+
+        for marker in ("<<<LCM_UNTRUSTED_ISSUE_DATA>>>",
+                       "<<<END_LCM_UNTRUSTED_ISSUE_DATA>>>",
+                       "[REDACTED_UNTRUSTED_DELIMITER]"):
+            self.assertIn(marker, entry)
+        self.assertRegex(
+            entry,
+            r"`title`, `body`, `comments`, `reproduction`, `evidence`",
+        )
+        for term in ("every nested string", "UTF-8 JSON", "65,536 UTF-8 bytes",
+                     "redactPromptText()", "before byte budgeting",
+                     "stable source order", "UTF-8 code-point boundary",
+                     "explicit truncation metadata", "fail closed"):
+            self.assertIn(term, normalized)
+
+        for role in ("triage", "duplicate adjudication", "planning",
+                     "implementation", "review", "synthesis", "escalation",
+                     "replacement"):
+            self.assertIn(role, entry.lower())
+        for path in ("direct read", "persist", "readback", "handoff",
+                     "worker-authored evidence"):
+            self.assertIn(path, combined.lower())
+        for rule in ("embedded instructions", "independently",
+                     "trusted source identity", "root-only"):
+            self.assertIn(rule, combined.lower())
+
+    def test_bug_campaign_untrusted_input_scenario_spans_handoff(self):
+        text = self.read("tests/coordination-scenarios.md")
+        self.assertIn("| C16 |", text)
+        for term in ("delimiter injection", "eventual truncation boundary",
+                     "safe projection cannot be produced", "triage",
+                     "remediation", "canonical envelope", "independently"):
+            self.assertIn(term, text.lower())
+
     def test_engine_requires_both_lifecycle_contracts(self):
         text = self.read("procedural-development/SKILL.md")
         self.assertIn("references/root-lifecycle.md", text)
@@ -124,7 +163,7 @@ class CoordinationContractTests(unittest.TestCase):
 
     def test_behavioral_scenarios_cover_reported_failures_and_recovery(self):
         text = self.read("tests/coordination-scenarios.md")
-        for number in range(1, 16):
+        for number in range(1, 17):
             self.assertIn(f"| C{number:02d} |", text)
         self.assertIn("not executed", text)
         self.assertIn("tool calls", text)
