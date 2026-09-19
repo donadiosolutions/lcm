@@ -5,6 +5,7 @@ import {
   ScrubEngine,
 } from "../src/scrub.js";
 import { GITLEAKS_PATTERNS } from "../src/generated-patterns.js";
+import { analyzeRequiredKeywords, createRegexWitness } from "../scripts/update-gitleaks-patterns.js";
 
 function compiledGitleaksRule(id: string): RegExp {
   const pattern = GITLEAKS_PATTERNS.find((candidate) => candidate.id === id);
@@ -648,5 +649,208 @@ describe("ScrubEngine.loadProjectPatterns", () => {
 
   it("rethrows non-ENOENT errors", async () => {
     await expect(ScrubEngine.loadProjectPatterns("/")).rejects.toThrow();
+  });
+});
+
+describe("Gitleaks generated pattern runtime bounds", () => {
+  // A nested same-class bounded lazy prefix multiplies the prefix attempts at
+  // every start position (51 * 51 instead of 51), which made
+  // cisco-meraki-api-key and four sibling rules roughly 25x slower than an
+  // equivalent single prefix on long opaque no-match input. The two prefixes
+  // are redundant: only the total consumed length is observable because both
+  // span the same character class.
+  const NESTED_LAZY_PREFIX = /(\[(?:[^\]\\]|\\.)*\])\{0,\d+\}\?\(\?:\1\{0,\d+\}\?/;
+
+  it("compiles no rule with a redundant nested same-class lazy prefix", () => {
+    const offenders = GITLEAKS_PATTERNS
+      .filter((pattern) => NESTED_LAZY_PREFIX.test(pattern.regex))
+      .map((pattern) => pattern.id);
+    expect(offenders).toEqual([]);
+  });
+
+  it("emits only structurally verified prefilters with pinned coverage", () => {
+    const prefiltered = GITLEAKS_PATTERNS.filter((pattern) => pattern.prefilter);
+    const failClosed = GITLEAKS_PATTERNS
+      .filter((pattern) => !pattern.prefilter)
+      .map((pattern) => pattern.id)
+      .sort();
+
+    expect(prefiltered).toHaveLength(216);
+    expect(
+      GITLEAKS_PATTERNS
+        .filter((pattern) => pattern.keywords.length === 0)
+        .map((pattern) => pattern.id),
+    ).toEqual([]);
+    expect(failClosed).toEqual([
+      "airtable-personnal-access-token",
+      "facebook-access-token",
+      "slack-config-access-token",
+      "sourcegraph-access-token",
+    ]);
+    expect(
+      prefiltered
+        .filter((pattern) =>
+          !analyzeRequiredKeywords(
+            pattern.regex,
+            pattern.keywords,
+            pattern.flags,
+          ).verified
+        )
+        .map((pattern) => pattern.id),
+    ).toEqual([]);
+  });
+
+  it("keeps unverified rules unconditional on keyword-absent positives", () => {
+    const samples = new Map<string, string>([
+      [
+        "airtable-personnal-access-token",
+        "pat" + "a".repeat(14) + "." + "a".repeat(64),
+      ],
+      [
+        "facebook-access-token",
+        "0".repeat(15) + "|" + "a".repeat(27) + " ",
+      ],
+      [
+        "slack-config-access-token",
+        "XOXEaXOXB-0-" + "a".repeat(163),
+      ],
+      ["sourcegraph-access-token", "a".repeat(40)],
+    ]);
+    const engine = new ScrubEngine([], []);
+
+    for (const pattern of GITLEAKS_PATTERNS.filter(({ prefilter }) => !prefilter)) {
+      const sample = samples.get(pattern.id);
+      expect(sample, pattern.id).toBeDefined();
+      expect(
+        pattern.keywords.some((keyword) => sample!.toLowerCase().includes(keyword)),
+        pattern.id,
+      ).toBe(false);
+      expect(new RegExp(pattern.regex, pattern.flags).test(sample!), pattern.id)
+        .toBe(true);
+      expect(engine.scrub(sample!), pattern.id).not.toBe(sample);
+    }
+  });
+
+  it("redacts a generated positive for every prefiltered rule", () => {
+    const engine = new ScrubEngine([], []);
+    const failures: string[] = [];
+
+    for (const pattern of GITLEAKS_PATTERNS.filter(({ prefilter }) => prefilter)) {
+      const sample = createRegexWitness(pattern.regex, pattern.flags);
+      const scrubbed = sample === null ? null : engine.scrubWithCounts(sample);
+      if (
+        sample === null
+        || !new RegExp(pattern.regex, pattern.flags).test(sample)
+        || !pattern.keywords.some((keyword) => sample.toLowerCase().includes(keyword))
+        || scrubbed?.text === sample
+        || scrubbed?.gitleaks === 0
+      ) {
+        failures.push(pattern.id);
+      }
+    }
+
+    expect(failures).toEqual([]);
+  });
+
+  it("executes a prefiltered rule only when its keyword is present", () => {
+    const pattern = GITLEAKS_PATTERNS.find(({ id }) => id === "twilio-api-key");
+    expect(pattern).toBeDefined();
+    const engine = new ScrubEngine([], []);
+    const internals = engine as unknown as {
+      spanningPatterns: Array<{ source: string; regex: RegExp }>;
+    };
+    const compiled = internals.spanningPatterns.find(
+      ({ source }) => source === pattern!.regex,
+    );
+    expect(compiled).toBeDefined();
+    const execSpy = vi.spyOn(compiled!.regex, "exec");
+
+    const absent = "opaque input without the required marker";
+    expect(engine.scrubWithCounts(absent)).toEqual({
+      text: absent,
+      gitleaks: 0,
+      builtIn: 0,
+      global: 0,
+      project: 0,
+    });
+    expect(execSpy.mock.calls).toEqual([]);
+
+    const present = "sk is present without a matching Twilio key";
+    expect(engine.scrubWithCounts(present)).toEqual({
+      text: present,
+      gitleaks: 0,
+      builtIn: 0,
+      global: 0,
+      project: 0,
+    });
+    expect(execSpy.mock.calls).toEqual([[present]]);
+    execSpy.mockRestore();
+  });
+
+  it("requires every prefiltered witness to depend on an intact keyword", () => {
+    const failures: Array<{ id: string; reason: string }> = [];
+
+    for (const pattern of GITLEAKS_PATTERNS.filter(({ prefilter }) => prefilter)) {
+      const sample = createRegexWitness(pattern.regex, pattern.flags);
+      const regex = new RegExp(pattern.regex, pattern.flags);
+      if (sample === null || !regex.test(sample)) {
+        failures.push({ id: pattern.id, reason: "no matching witness" });
+        continue;
+      }
+
+      const matchedKeywords = pattern.keywords
+        .filter((keyword) => sample.toLowerCase().includes(keyword.toLowerCase()))
+        .sort((left, right) => right.length - left.length);
+      if (matchedKeywords.length === 0) {
+        failures.push({ id: pattern.id, reason: "witness contains no keyword" });
+        continue;
+      }
+
+      let corrupted = sample;
+      for (const keyword of matchedKeywords) {
+        let offset = corrupted.toLowerCase().indexOf(keyword.toLowerCase());
+        while (offset >= 0) {
+          corrupted = corrupted.slice(0, offset)
+            + "\0".repeat(keyword.length)
+            + corrupted.slice(offset + keyword.length);
+          offset = corrupted.toLowerCase().indexOf(keyword.toLowerCase());
+        }
+      }
+      if (regex.test(corrupted)) {
+        failures.push({ id: pattern.id, reason: "corrupted keyword still matches" });
+      }
+    }
+
+    expect(failures).toEqual([]);
+  });
+
+  it("keeps prefiltered and unconditional engine output byte-identical", () => {
+    const samples = GITLEAKS_PATTERNS.map((pattern) =>
+      createRegexWitness(pattern.regex, pattern.flags)
+    );
+    expect(samples.filter((sample) => sample === null)).toEqual([]);
+
+    const cases = [
+      ...(samples as string[]),
+      "opaque-" + "qz_019".repeat(256),
+      "context contains meraki but no matching secret",
+    ];
+    const prefiltered = new ScrubEngine([], []);
+    const unconditional = new ScrubEngine([], [], {
+      useGitleaksPrefilter: false,
+    });
+
+    for (const [index, sample] of cases.entries()) {
+      expect(prefiltered.scrubWithCounts(sample), "case " + index)
+        .toEqual(unconditional.scrubWithCounts(sample));
+    }
+  });
+  it("keeps the previously nested rules detecting their secrets", () => {
+    expect("meraki_api_key = 0123456789abcdef0123456789abcdef01234567 ")
+      .toMatch(compiledGitleaksRule("cisco-meraki-api-key"));
+    expect("cohere_api_key = " + "A".repeat(40) + " ")
+      .toMatch(compiledGitleaksRule("cohere-api-token"));
+    expect("okta.com token: " + "0".repeat(42) + " ")
+      .toMatch(compiledGitleaksRule("okta-access-token"));
   });
 });
