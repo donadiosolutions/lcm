@@ -115,6 +115,61 @@ without changing either local hash. Git common-directory evidence affects only
 local identity. LCM never creates, selects, or changes a PostgreSQL UUID from a
 Git remote, repository name, directory contents, or matching display names.
 
+## Authenticated map keys
+
+A `map.json` key is not accepted just because its entry names your directory.
+Before a key becomes the storage identity for a path, LCM requires local
+evidence binding the two, on one of three grounds:
+
+- the key is the SHA-256 of the canonical path, which is the derivation every
+  other code path reproduces, including the hook side;
+- the key is a renewal successor whose retired predecessor fence still
+  authenticates it, as described under Retired local identities below;
+- the key is a legacy hash and `~/.lcm/projects/<key>/meta.json` records a
+  `cwd` that normalizes to the same canonical path.
+
+The third ground exists for hashes minted before the current path
+normalization, which metadata-backed discovery legitimately restores into the
+map. It is corroboration rather than an independent trust anchor: it is read
+under the same ownership, link-count, and size checks as any other project
+metadata, and anyone who can write `map.json` can usually also write that file.
+What it rules out is a key with no corroboration anywhere on disk, where the
+CLI would adopt an identity the hook side would never derive, leaving the two
+in disagreement about which project a directory belongs to.
+
+A key meeting none of the three grounds is refused rather than used:
+
+```text
+project map identity is not authenticated for its canonical path: <path> (<key>)
+```
+
+Repair it by restoring the entry under the key the canonical path derives, or
+by removing the entry and letting LCM recreate it. `lcm doctor` reports project
+health separately.
+
+Renewal successors are decided only by their predecessor fence. A renewed
+project writes its own `projects/<successor>/meta.json` the first time storage
+opens it, and that metadata does not substitute for a missing fence.
+
+Surfaces that resolve a project through the map follow the same rules, so
+they do not act on an identity storage will refuse. Reads that never
+resolve an identity are unaffected, such as stats aggregates and doctor's
+read-only secret-detection lookup, which uses the map key as a lookup key
+without admitting it as a storage identity.
+
+`lcm compact --all` and SQLite compaction preview skip an identity they
+cannot authenticate and continue with the rest. `lcm import --all` skips it
+when enumerating projects, and fails loudly on a per-session attribution
+that reaches one.
+
+`lcm project list` and `lcm project show` are diagnostic surfaces, so both
+report such an entry and mark it rather than hiding it, because an operator
+who cannot see a broken entry cannot repair it. Either command prints:
+
+```text
+  unauthenticated: storage will refuse this identity
+```
+
 ## Linked worktrees and reconciliation
 
 ### Retired local identities

@@ -43,11 +43,11 @@ If you get `fts5: fail`, build or install an FTS5-capable Node and point the gat
 
 ## Build an FTS5-capable Node on macOS
 
-This workflow was verified with Node `v22.15.0`.
+This procedure targets Node `v25.4.0`, the runtime floor this package declares.
 
 ```bash
 cd ~/Projects
-git clone --depth 1 --branch v22.15.0 https://github.com/nodejs/node.git node-fts5
+git clone --depth 1 --branch v25.4.0 https://github.com/nodejs/node.git node-fts5
 cd node-fts5
 ```
 
@@ -80,17 +80,17 @@ Expose the binary under a Node-compatible basename that Claude Code recognizes:
 
 ```bash
 mkdir -p ~/Projects/node-fts5/bin
-ln -sfn ~/Projects/node-fts5/out/Release/node ~/Projects/node-fts5/bin/node-22.15.0
+ln -sfn ~/Projects/node-fts5/out/Release/node ~/Projects/node-fts5/bin/node-25.4.0
 ```
 
-Use a basename like `node-22.15.0`, `node`, or `nodejs`. Names like
-`node-v22.15.0-fts5` may not be recognized correctly by Claude Code's CLI/runtime parsing.
+Use a basename like `node-25.4.0`, `node`, or `nodejs`. Names like
+`node-v25.4.0-fts5` may not be recognized correctly by Claude Code's CLI/runtime parsing.
 
 Verify the new runtime:
 
 ```bash
-~/Projects/node-fts5/bin/node-22.15.0 --version
-~/Projects/node-fts5/bin/node-22.15.0 --input-type=module - <<'NODE'
+~/Projects/node-fts5/bin/node-25.4.0 --version
+~/Projects/node-fts5/bin/node-25.4.0 --input-type=module - <<'NODE'
 import { DatabaseSync } from 'node:sqlite';
 const db = new DatabaseSync(':memory:');
 db.exec("CREATE VIRTUAL TABLE t USING fts5(content)");
@@ -110,7 +110,7 @@ cp ~/Library/LaunchAgents/ai.claude.gateway.plist \
 Replace the runtime path, then reload the agent:
 
 ```bash
-/usr/libexec/PlistBuddy -c 'Set :ProgramArguments:0 /Users/youruser/Projects/node-fts5/bin/node-22.15.0' \
+/usr/libexec/PlistBuddy -c 'Set :ProgramArguments:0 /Users/youruser/Projects/node-fts5/bin/node-25.4.0' \
   ~/Library/LaunchAgents/ai.claude.gateway.plist
 
 launchctl bootout gui/$UID ~/Library/LaunchAgents/ai.claude.gateway.plist 2>/dev/null || true
@@ -127,7 +127,7 @@ launchctl print gui/$UID/ai.claude.gateway | sed -n '1,80p'
 You should see:
 
 ```text
-program = /Users/youruser/Projects/node-fts5/bin/node-22.15.0
+program = /Users/youruser/Projects/node-fts5/bin/node-25.4.0
 ```
 
 ## Verify `Long Context Manager (LCM)`
@@ -147,7 +147,7 @@ You want:
 Then force one turn through the gateway and verify the DB fills:
 
 ```bash
-/Users/youruser/Projects/node-fts5/bin/node-22.15.0 \
+/Users/youruser/Projects/node-fts5/bin/node-25.4.0 \
   /path/to/claude/dist/index.js \
   agent --session-id fts5-smoke --message 'Reply with exactly: ok' --timeout 60
 

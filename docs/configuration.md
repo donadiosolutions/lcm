@@ -1,6 +1,6 @@
 # Configuration guide
 
-LCM requires Node.js 22.12.0 or newer.
+LCM requires Node.js 25.4.0 or newer.
 
 ## Quick start
 
@@ -89,7 +89,7 @@ advisories without exposing additional parser paths in consumer installations.
 Update LCM to receive the corrected bundled runtime.
 
 LCM's optional OpenAI integration is pinned as both a development dependency
-and an optional peer dependency in `package.json`; use Node.js 22.12.0 or newer.
+and an optional peer dependency in `package.json`; use Node.js 25.4.0 or newer.
 
 When the setup wizard's **Custom server** summarizer is selected, both the
 OpenAI-compatible server URL and model name are required. The wizard retries an

@@ -192,18 +192,7 @@ function assertExactReceiptSchema(db: DatabaseSync): void {
 }
 
 function hasActiveTransaction(db: DatabaseSync): boolean {
-  if (typeof db.isTransaction === "boolean") return db.isTransaction;
-  // Node 22.12-22.15 lacks isTransaction. BEGIN DEFERRED changes no data and
-  // only the exact nested-transaction error proves a transaction already owns
-  // this connection. A successful probe is rolled back and is not admission.
-  try { db.exec("BEGIN DEFERRED"); } catch (error) {
-    const sqlite = error as { code?: string; errcode?: number; message?: string };
-    if (sqlite.code === "ERR_SQLITE_ERROR" && sqlite.errcode === 1
-      && sqlite.message === "cannot start a transaction within a transaction") return true;
-    throw error;
-  }
-  db.exec("ROLLBACK");
-  return false;
+  return db.isTransaction;
 }
 
 export function adoptMigrationReceiptEpoch(

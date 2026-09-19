@@ -84,13 +84,19 @@ findings need no follow-up.
 
 ### Deferred findings
 
-Create GitHub issues under caller classification rules, describing the distinct
-remaining problem with source item, candidate, review context, reproduction and
-evidence. Link source and PR. Before publication, create the issue with its PR link
-pending; this satisfies the pre-publication gate. Add that link immediately after
-publication; missing links block merge/final audit. Follow-ups never enter inventory
-or become native children of its tracker. Read back required type and current
-resolution; preserve valid fixes, duplicates and successors.
+Use the caller's `FOLLOWUP_CHANNEL`: default `github-issue` creates GitHub issues
+under caller classification rules; explicit `private-record` creates durable
+records in the caller's private campaign directory instead. Never infer the private
+channel for existing Bug/Epic callers or silently publish a private record.
+
+Both channels require the distinct remaining problem, acceptance criteria, owner,
+source item, candidate, review context, reproduction and evidence. Link source and
+PR. Before publication, create the record with its PR link pending; this satisfies
+the pre-publication gate. Add that link immediately after publication; missing
+links block merge/final audit. Follow-ups never enter inventory or become native
+children of its tracker. Read back the record and current resolution; verify native
+type when using GitHub issues. Preserve valid fixes, duplicates and successors.
+Private evidence and record paths must not enter public PR text or comments.
 
 ## Publish and merge
 

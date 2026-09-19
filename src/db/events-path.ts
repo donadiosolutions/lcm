@@ -2,6 +2,7 @@ import { existsSync } from "node:fs";
 import { join, resolve } from "node:path";
 import { localProjectIdentity } from "../daemon/project.js";
 import {
+  UnauthenticatedProjectIdentityError,
   hashProjectPath,
   isAuthenticatedRetiredProjectIdentitySuccessor,
   isRetiredProjectIdentitySuccessor,
@@ -141,6 +142,27 @@ export function eventsDbPath(cwd: string): string {
 }
 
 /**
+ * Resolve only an identity this probe is allowed to act on.
+ *
+ * The probe must stay usable while recovering an unavailable working
+ * directory, so a map key that no local evidence binds to the path is treated
+ * as no identity rather than as an error. The caller then falls back to the
+ * sidecar the canonical path derives, instead of opening whichever sidecar an
+ * unauthenticated key names.
+ */
+function authenticatedExistingProjectIdentity(
+  cwd: string,
+  publicationLockToken?: BackendPublicationLockToken,
+): ReturnType<typeof resolveExistingProjectIdentity> {
+  try {
+    return resolveExistingProjectIdentity(cwd, publicationLockToken);
+  } catch (error) {
+    if (error instanceof UnauthenticatedProjectIdentityError) return null;
+    throw error;
+  }
+}
+
+/**
  * Derive a sidecar path only from identity or sidecar state that already
  * exists. This must remain read-only because callers use it while recovering
  * unavailable working directories.
@@ -149,7 +171,7 @@ export function existingEventsDbPath(
   cwd: string,
   options: ExistingEventsDbPathOptions = {},
 ): string | undefined {
-  const identity = resolveExistingProjectIdentity(cwd, options.publicationLockToken);
+  const identity = authenticatedExistingProjectIdentity(cwd, options.publicationLockToken);
   const directory = eventsDir();
   const expectedUid = options._effectiveUidForTesting?.() ?? effectiveUid();
   let handle: ReturnType<typeof openPrivateDirectory>;

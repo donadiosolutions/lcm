@@ -326,6 +326,27 @@ export interface PromotedMemoryRepository {
   revive(id: string): Promise<void>;
 }
 
+/**
+ * Serializes one project's promoted-memory deduplication decisions until the
+ * caller's transaction ends.
+ *
+ * Deduplication reads the existing candidates and then inserts when it finds
+ * none. Under READ COMMITTED neither of two concurrent transactions can see
+ * the other's uncommitted insert, so both reach the insert branch and both
+ * commit. Holding this serializer for the duration of the deciding
+ * transaction makes the second transaction wait, so its candidate read runs
+ * at a snapshot that already contains the first transaction's committed row.
+ *
+ * The grain is the project rather than the content. A finer key would let
+ * one transaction accumulate one lock per distinct content and exhaust the
+ * shared lock table on a large import, and would let two transactions take
+ * the same keys in opposite orders and deadlock. One key per project costs
+ * concurrency between unrelated contents and removes both failures.
+ */
+export interface PromotedDecisionSerializer {
+  serializeDecision(): Promise<void>;
+}
+
 export interface RecallRepository {
   logSurfacing(memoryIds: string[], sessionId: string | null): Promise<void>;
   getFeedback(memoryIds: string[]): Promise<Map<string, RecallFeedback>>;
@@ -432,6 +453,11 @@ export interface ProjectRepositories {
 export type TransactionRepositories = ProjectRepositories & Readonly<{
   /** SQLite-private exactly-once evidence; never a canonical transfer domain. */
   migrationReceipt?: MigrationReceiptRepository;
+  /**
+   * Serializes promoted-memory deduplication decisions. Present only on
+   * backends that run concurrent root transactions on separate connections.
+   */
+  promotedDecisionSerializer?: PromotedDecisionSerializer;
 }>;
 
 export interface ProjectStorage extends ProjectRepositories {
