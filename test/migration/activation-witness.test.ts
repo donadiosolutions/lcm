@@ -9,7 +9,6 @@ import {
   createMigrationIntraActivationWatermark,
   createMigrationOpaqueEvidence,
   createMigrationQuiescenceFence,
-  deriveMigrationActivationAttemptId,
   deriveMigrationActivationEpochId,
   migrationActivationCensusMatchVerdict,
   migrationCanonicalDeltaChanged,
