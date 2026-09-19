@@ -1200,8 +1200,16 @@ export async function verifyMigrationGeneration(
     manifestStore.update(input.generationId, resumeManifest.checksumSha256, (current) => completeMigrationEffect(current, {
       effectId: pending.effectId, completedAt, activationEligible: true,
       report: {
+        // createdAt binds to the effect's own startedAt, not to this
+        // completion's wall clock: the effect began exactly once (by
+        // this driver's own prior attempt, since persist always
+        // precedes begin), so startedAt is the one value every resumed
+        // completion of the same effect agrees on. Using a fresh
+        // completedAt here instead would make the manifest content for
+        // the same effect differ across retries for no reason other
+        // than which attempt happened to finish it.
         kind: "verification", reportId: persistedReport.reportId,
-        reportSha256: persistedReport.reportSha256, createdAt: completedAt,
+        reportSha256: persistedReport.reportSha256, createdAt: pending.startedAt,
       },
     }));
     return {
@@ -1228,10 +1236,11 @@ export async function verifyMigrationGeneration(
   // begun for it, so it can never wedge activation on a bad reading.
   if (persisted.report.activationEligible) {
     let effectManifest = manifestStore.read(input.generationId);
+    const beginStartedAt = new Date().toISOString();
     if (effectManifest.pendingEffect === null) {
       effectManifest = manifestStore.update(input.generationId, effectManifest.checksumSha256, (current) => beginMigrationEffect(current, {
         kind: "verify-generation", effectId: result.effectId, inputSha256: result.inputSha256,
-        startedAt: new Date().toISOString(),
+        startedAt: beginStartedAt,
       }));
     } else {
       // Any pending effect reached here cannot be kind
@@ -1255,8 +1264,13 @@ export async function verifyMigrationGeneration(
     manifestStore.update(input.generationId, effectManifest.checksumSha256, (current) => completeMigrationEffect(current, {
       effectId: result.effectId, completedAt, activationEligible: true,
       report: {
+        // createdAt binds to this effect's own startedAt rather than the
+        // wall clock at completion, for the same reason as the resume
+        // branch above: it is the one value a retry of the same effect
+        // agrees on, which is what keeps the manifest content for a
+        // retried attempt byte-identical to the original.
         kind: "verification", reportId: persisted.report.reportId,
-        reportSha256: persisted.report.reportSha256, createdAt: completedAt,
+        reportSha256: persisted.report.reportSha256, createdAt: beginStartedAt,
       },
     }));
   }

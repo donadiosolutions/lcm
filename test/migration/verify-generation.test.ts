@@ -1196,6 +1196,44 @@ describe("verifyMigrationGeneration", () => {
     );
   }, 15000);
 
+  it("round-1 P2: a resumed completion binds the report's createdAt to the effect's startedAt, not to the resume attempt's own wall clock", async () => {
+    // The effect began at a fixed, known-past instant (MANIFEST_FIXTURE_AT,
+    // 2026-01-01), well before "now" at test-run time. If createdAt were
+    // still bound to a fresh completedAt wall clock (the round-1 defect),
+    // this assertion would see today's date instead and fail outright --
+    // no timer or Date mocking needed, since the two values are already
+    // naturally far apart.
+    const homeDir = "/tmp/lcm-verify-created-at-binds-to-started-at";
+    stubDestinationPrimitives();
+    const recordCounts = Object.fromEntries(PORTABLE_RECORD_DOMAIN_ORDER.map((domain, index) => [domain, index])) as Partial<Record<PortableDomain, number>>;
+    const firstResult = await verifyMigrationGeneration(
+      baseInput({ homeDir }), dependenciesFor(fakeCopySource({ recordCounts }), fakeRuntime()),
+    );
+    expect(firstResult.outcome).toBe("clean");
+
+    // Simulate a crash between begin and complete, exactly like the
+    // no-recompute resume test above, but starting the effect at the
+    // fixed MANIFEST_FIXTURE_AT instant rather than "now".
+    const resumeManifestStore = fakeManifestStore();
+    resumeManifestStore.current = beginMigrationEffect(resumeManifestStore.current, {
+      kind: "verify-generation", effectId: firstResult.effectId, inputSha256: firstResult.inputSha256,
+      startedAt: MANIFEST_FIXTURE_AT,
+    });
+    const resumedResult = await verifyMigrationGeneration(baseInput({ homeDir }), {
+      openSource: vi.fn(async () => { throw new Error("resume must not reopen the source"); }) as never,
+      createRuntime: vi.fn(() => { throw new Error("resume must not open a fresh runtime"); }) as never,
+      verifyTransferSchema: vi.fn(async () => { throw new Error("resume must not re-verify the transfer schema"); }) as never,
+    });
+    expect(resumedResult.outcome).toBe("clean");
+    // The wall clock at resume time is today's date, not
+    // MANIFEST_FIXTURE_AT -- so this only passes if createdAt was bound
+    // to the effect's own startedAt rather than to this resume attempt's
+    // completedAt.
+    expect(resumeManifestStore.current.reports).toContainEqual(
+      { kind: "verification", reportId: resumedResult.report.reportId, reportSha256: resumedResult.report.reportSha256, createdAt: MANIFEST_FIXTURE_AT },
+    );
+  }, 15000);
+
   it("does not begin an effect for an ineligible report: persisted evidence only, no pending effect", async () => {
     // The "operator evidence" path: a badly diverged destination still
     // gets a persisted report, but plan-v4's steps 10-11 never run for
