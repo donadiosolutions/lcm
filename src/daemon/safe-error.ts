@@ -127,7 +127,9 @@ interface BracketGroupIndex {
   groupOf: Int32Array;
   depth: Int32Array;
   urlBearingBefore: Uint8Array;
+  spanUrlBearingBefore: Uint8Array;
   fileChildBearing: Uint8Array;
+  fileChildBearingBefore: Uint8Array;
   filePathChildBearing: Uint8Array;
   fileChildSettled: Uint8Array;
   childCloseOwner: Uint8Array;
@@ -252,6 +254,16 @@ function classifyBracketGroups(chars: readonly string[]): BracketGroupIndex {
   // carried URL syntax when each position was reached.
   const urlBearingBefore = new Uint8Array(chars.length);
   const fileChildBearing: number[] = [0];
+  // A file child owns only the text that follows it, exactly like any other URL
+  // syntax, so the per-group summary alone cannot answer an ownership question
+  // asked at a position the child has not reached yet.
+  const fileChildBearingBefore = new Uint8Array(chars.length);
+  // Whether the whitespace-delimited span already carried URL syntax at its own
+  // root when this position was reached. A bracket group's query punctuation
+  // only inherits wrapper ownership inside a span that actually holds a URL, so
+  // a "?" in ordinary bracketed prose never becomes ownership evidence on its
+  // own. Reading the span root keeps this a constant-time question.
+  const spanUrlBearingBefore = new Uint8Array(chars.length);
   // A child that reached a path returns ownership to every wrapper that
   // outlives it, unlike fileChildBearing, which expires with the wrapper that
   // held the child so a query-only child keeps its relative tail public.
@@ -290,6 +302,8 @@ function classifyBracketGroups(chars: readonly string[]): BracketGroupIndex {
         groupOf[index] = held;
         depth[index] = stack.length - 1;
         if (urlBearing[held] === 1) urlBearingBefore[index] = 1;
+        if (fileChildBearing[held] === 1) fileChildBearingBefore[index] = 1;
+        if (urlBearing[stack[0]] === 1) spanUrlBearingBefore[index] = 1;
         continue;
       }
       // Whitespace is a hard ownership boundary, matching the scanner reset, so
@@ -333,6 +347,8 @@ function classifyBracketGroups(chars: readonly string[]): BracketGroupIndex {
     groupOf[index] = current;
     depth[index] = stack.length - 1;
     if (urlBearing[current] === 1) urlBearingBefore[index] = 1;
+    if (fileChildBearing[current] === 1) fileChildBearingBefore[index] = 1;
+    if (urlBearing[stack[0]] === 1) spanUrlBearingBefore[index] = 1;
     if (pathlessChildQueryStarts[index] === 1) pathlessQueryActive[current] = 1;
     if (pathlessQueryActive[current] === 1) {
       // The region is held on the group that opened it, so a sibling wrapper
@@ -414,7 +430,9 @@ function classifyBracketGroups(chars: readonly string[]): BracketGroupIndex {
     whitespace,
     wordRunEnds,
     urlBearingBefore,
+    spanUrlBearingBefore,
     fileChildBearing: Uint8Array.from(fileChildBearing),
+    fileChildBearingBefore,
     filePathChildBearing: Uint8Array.from(filePathChildBearing),
     fileChildSettled: Uint8Array.from(fileChildSettled),
   };
@@ -433,7 +451,7 @@ function findUrlPathStarts(chars: readonly string[]): UrlPathStarts {
   // that follows it, so a trailing URL cannot claim an earlier sibling value.
   const ownsRootedSuccessors = (index: number): boolean =>
     groups.urlBearingBefore[index] === 1 ||
-    groups.fileChildBearing[groups.groupOf[index]] === 1;
+    groups.fileChildBearingBefore[index] === 1;
   // Facts propagate outward on close, so an enclosing group already carries
   // everything its children carried. Checking the adjacent close is therefore
   // enough to know whether an owning child just ended, however deep the run of
@@ -545,9 +563,15 @@ function findUrlPathStarts(chars: readonly string[]): UrlPathStarts {
       char === "\\" &&
       chars[index - 1] === "=" &&
       (ownsRootedSuccessors(index) ||
-        (groups.depth[index] > 0 && groups.queryBearing[groups.groupOf[index]] === 1)) &&
-      (separator < 0 ||
-        (!exactFileScheme && groups.fileChildBearing[groups.groupOf[index]] === 1))
+        (groups.depth[index] > 0 &&
+          groups.queryBearing[groups.groupOf[index]] === 1 &&
+          groups.spanUrlBearingBefore[index] === 1)) &&
+      // The span-local "separator" and "exactFileScheme" facts change once an
+      // earlier pass has rewritten a nested file path as "<path>", so gating
+      // only on them made the same message redact differently on the second
+      // pass. The group's file-child fact is derived from observable "file://"
+      // syntax that survives redaction, so both passes agree.
+      (separator < 0 || groups.fileChildBearing[groups.groupOf[index]] === 1)
     ) {
       forcedPath[index] = 1;
       continue;

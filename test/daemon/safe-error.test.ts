@@ -4533,6 +4533,31 @@ describe("sanitizeError", () => {
         "C:/Users/SECRET/x",
         "C:<path>",
       ],
+      [
+        "R3d a named Windows successor settles in the first pass",
+        "https://outer.test/x?next=file://host/Users/a&name=\\Users\\bob\\secret.db",
+        "https://outer.test/x?next=file://host<path>&name=<path>",
+      ],
+      [
+        "R3e a later file URL does not own an earlier named value",
+        "name=\\Users\\literal|file://h/a",
+        "name=\\Users\\literal|file://h<path>",
+      ],
+      [
+        "R3f control the same shape with a trailing public URL",
+        "name=\\Users\\literal|https://h/a",
+        "name=\\Users\\literal|https://h/a",
+      ],
+      [
+        "R3g query punctuation alone is not URL ownership",
+        "[name=\\Users\\literal?retry]",
+        "[name=\\Users\\literal?retry]",
+      ],
+      [
+        "R3h control bracketed query text inside a URL span still owns",
+        "file://h?x=[[a]<opaque>?key=\\Users\\alice\\secret.db]",
+        "file://h?x=[[a]<opaque>?key=<path>]",
+      ],
     ] as const)("resolves %s in one pass", (_name, input, expected) => {
       const first = sanitizeError(input);
 
