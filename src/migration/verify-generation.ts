@@ -2,7 +2,10 @@ import { createHash } from "node:crypto";
 import { PostgreSqlRuntime } from "../storage/postgresql/runtime.js";
 import { PostgreSqlWorkCoordinator } from "../storage/postgresql/coordination.js";
 import { verifyPostgreSqlTransferSchema } from "../storage/postgresql/runtime-readiness.js";
-import { inspectPostgreSqlSearchConfiguration } from "../storage/postgresql/search-configuration.js";
+import {
+  inspectPostgreSqlSearchConfiguration,
+  POSTGRESQL_SEARCH_CONFIGURATION_SHA256,
+} from "../storage/postgresql/search-configuration.js";
 import {
   createPostgreSqlPortableSource, readPostgreSqlPortableSourceDomainCensus,
   readPostgreSqlPortableWitness,
@@ -228,6 +231,21 @@ async function captureDestinationSchemaWitness(
   const migrationsSha256 = await captureAppliedMigrationsSha256(executor, signal);
   const searchStatus = await inspectPostgreSqlSearchConfiguration(executor, { signal });
   if (searchStatus.actualSha256 === null) driverError("invalid-input", searchConfigurationAbsentReason(searchStatus));
+  // Round-3 P2: the in-window comparison below (assertSchemaWitnessLiveToLive)
+  // only proves the pre-window and in-window reads agree with each
+  // other -- it says nothing about whether either read is *correct*.
+  // A search configuration that is stable but wrong (installed from a
+  // different migration revision, hand-edited, or never updated to
+  // match this build's expectation) would pass live-to-live cleanly
+  // while never having been the configuration this driver's own
+  // contract expects. Pinning the pre-window read against the same
+  // compiled-in digest the schema installer itself enforces closes
+  // that gap: a stable-wrong value now refuses here, before the window
+  // even opens, rather than silently becoming "expected" for the rest
+  // of the pass.
+  if (searchStatus.actualSha256 !== POSTGRESQL_SEARCH_CONFIGURATION_SHA256) {
+    driverError("invalid-input", "destination search configuration digest does not match the pinned lcm.search_v1 contract");
+  }
   const [collationSha256, sequenceStateSha256] = await Promise.all([
     captureCollationSha256(executor, signal),
     captureSequenceStateSha256(executor, signal),

@@ -173,9 +173,9 @@ export const MIGRATION_WITNESS_AUDIT: readonly MigrationWitnessAuditEntry[] = Ob
   },
   {
     id: "destination-schema-search-configuration", bodyField: "destinationSchemaWitness",
-    description: "The destination's text-search configuration digest.",
+    description: "The destination's text-search configuration digest, captured once before the fenced window opens.",
     comparison: "compared-live",
-    consequence: "refuses destination-drift (round-1 W4 fix): compared against a second live read from inside the fenced window, on the same borrowed read-only session as the census -- witness-schema-FROZEN-v3.2.md's audit row names this comparison live-to-live, since a manifest-sealed baseline from copy time does not exist for this value the way it does for migrations",
+    consequence: "two independent live comparisons, not one: (1) round-3 P2's pinned check -- the pre-window read itself is compared against the compiled-in POSTGRESQL_SEARCH_CONFIGURATION_SHA256 constant the schema installer enforces, refusing invalid-input on a stable-but-wrong configuration that a live-to-live check alone cannot see, since a value that never changes agrees with itself; (2) round-1 W4's fix -- that same pre-window read is compared against a second live read from inside the fenced window, on the same borrowed read-only session as the census, refusing destination-drift on a change between the two reads. Neither subsumes the other: (1) catches a wrong value that is stable across the whole pass, (2) catches a right value that becomes wrong mid-pass. witness-schema-FROZEN-v3.2.md's audit row names the second comparison live-to-live, since a manifest-sealed per-generation baseline from copy time does not exist for this value the way it does for migrations; the pinned constant is a build-level baseline, not a per-generation one, so it does not fill that gap on its own",
     mismatchClasses: ["schema"],
   },
   {

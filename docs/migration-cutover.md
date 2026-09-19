@@ -617,7 +617,11 @@ Verification refuses outright, before any report is written, when:
   manifest's recorded destination identity (`destination-drift`, identity) --
   this is what catches a same-data verification run pointed at the wrong
   database, such as a misconfigured connection string or a restored clone;
-- the destination's search configuration is absent or malformed;
+- the destination's search configuration is absent, malformed, or present
+  but does not match the digest this build's schema installer expects
+  (a stable configuration installed from a different revision, for
+  example) -- checked once before the fenced window opens, and again
+  from inside the window to catch a value that changes mid-pass;
 - the verification lease is already held by another worker
   (`lease-unavailable`).
 

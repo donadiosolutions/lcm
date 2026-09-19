@@ -41,6 +41,15 @@ import { MigrationVerificationReportStore } from "../../src/migration/verificati
 import { createMigrationVerificationReportBody, MIGRATION_MISMATCH_CLASSES, MIGRATION_PUBLIC_PROBE_ORDER } from "../../src/migration/verification-report.js";
 
 const HASH_A = "a".repeat(64);
+// Round-3 P2: verify-generation.ts now pins the pre-window search
+// configuration read against the same compiled-in digest the schema
+// installer enforces (POSTGRESQL_SEARCH_CONFIGURATION_SHA256), not
+// just against a second in-window read of itself. Every "happy path"
+// stub of inspectPostgreSqlSearchConfiguration below must return this
+// real constant rather than an arbitrary fixture hash like HASH_A, or
+// it now refuses before reaching whatever the test actually means to
+// exercise.
+const REAL_SEARCH_CONFIGURATION_SHA256 = searchConfiguration.POSTGRESQL_SEARCH_CONFIGURATION_SHA256;
 const FAKE_MIGRATIONS = [{ id: "0001", filename: "0001.sql", sql: "", sha256: HASH_A }];
 const EXPECTED_MIGRATIONS_SHA256 = createHash("sha256")
   .update(canonicalJson(FAKE_MIGRATIONS.map(({ id, sha256 }) => ({ id, sha256 }))), "utf8")
@@ -411,7 +420,7 @@ function stubDestinationPrimitives(options: {
     acquireLease: vi.fn(async () => ({ fencingToken: 1n } as never)),
     releaseLease: vi.fn(async () => null),
   } as never); });
-  vi.spyOn(searchConfiguration, "inspectPostgreSqlSearchConfiguration").mockResolvedValue({ actualSha256: HASH_A } as never);
+  vi.spyOn(searchConfiguration, "inspectPostgreSqlSearchConfiguration").mockResolvedValue({ actualSha256: REAL_SEARCH_CONFIGURATION_SHA256 } as never);
   vi.spyOn(portableSource, "readPostgreSqlPortableWitness").mockResolvedValue(HASH_A);
   vi.spyOn(portableDestination, "probePostgreSqlPortableDestination").mockResolvedValue({
     destinationWitnessSha256: HASH_A, identityFingerprintSha256: options.identityFingerprintSha256 ?? HASH_A,
@@ -502,7 +511,7 @@ describe("readFencedDestinationCensus", () => {
     vi.spyOn(coordination, "PostgreSqlWorkCoordinator").mockImplementation(function () { return ({
       acquireLease: vi.fn(async () => ({ fencingToken: 1n } as never)), releaseLease: vi.fn(async () => null),
     } as never); });
-    vi.spyOn(searchConfiguration, "inspectPostgreSqlSearchConfiguration").mockResolvedValue({ actualSha256: HASH_A } as never);
+    vi.spyOn(searchConfiguration, "inspectPostgreSqlSearchConfiguration").mockResolvedValue({ actualSha256: REAL_SEARCH_CONFIGURATION_SHA256 } as never);
     vi.spyOn(portableSource, "readPostgreSqlPortableWitness").mockResolvedValue(HASH_A);
     vi.spyOn(portableSource, "readPostgreSqlPortableSourceDomainCensus").mockImplementation(((_s: unknown, domain: PortableDomain) => ({
       domain, recordCount: 2, prefixSha256: fakeHash("prefix-" + domain), terminalIdentitySha256: HASH_A,
@@ -1075,7 +1084,7 @@ describe("verifyMigrationGeneration", () => {
     // window against a second read taken from inside it.
     stubDestinationPrimitives();
     vi.spyOn(searchConfiguration, "inspectPostgreSqlSearchConfiguration")
-      .mockResolvedValueOnce({ actualSha256: HASH_A } as never)
+      .mockResolvedValueOnce({ actualSha256: REAL_SEARCH_CONFIGURATION_SHA256 } as never)
       .mockResolvedValueOnce({ actualSha256: fakeHash("drifted-search-configuration") } as never);
     const copySource = fakeCopySource();
     const runtime = fakeRuntime();
@@ -1088,7 +1097,7 @@ describe("verifyMigrationGeneration", () => {
   it("refuses when the destination search configuration becomes absent inside the fenced window", async () => {
     stubDestinationPrimitives();
     vi.spyOn(searchConfiguration, "inspectPostgreSqlSearchConfiguration")
-      .mockResolvedValueOnce({ actualSha256: HASH_A } as never)
+      .mockResolvedValueOnce({ actualSha256: REAL_SEARCH_CONFIGURATION_SHA256 } as never)
       .mockResolvedValueOnce({ actualSha256: null } as never);
     const copySource = fakeCopySource();
     const runtime = fakeRuntime();
@@ -1125,7 +1134,7 @@ describe("verifyMigrationGeneration", () => {
       acquireLease: vi.fn(async () => null),
       releaseLease: vi.fn(async () => null),
     } as never); });
-    vi.spyOn(searchConfiguration, "inspectPostgreSqlSearchConfiguration").mockResolvedValue({ actualSha256: HASH_A } as never);
+    vi.spyOn(searchConfiguration, "inspectPostgreSqlSearchConfiguration").mockResolvedValue({ actualSha256: REAL_SEARCH_CONFIGURATION_SHA256 } as never);
     vi.spyOn(portableSource, "readPostgreSqlPortableWitness").mockResolvedValue(HASH_A);
     vi.spyOn(portableDestination, "probePostgreSqlPortableDestination").mockResolvedValue({
       destinationWitnessSha256: HASH_A, identityFingerprintSha256: HASH_A, nonIdentityDomainsEmpty: true, existingRun: null,
@@ -1151,6 +1160,33 @@ describe("verifyMigrationGeneration", () => {
     const dependencies = dependenciesFor(copySource, runtime);
     await expect(verifyMigrationGeneration(baseInput({ homeDir: "/tmp/lcm-verify-search" }), dependencies))
       .rejects.toMatchObject({ reason: "invalid-input", message: "destination search configuration is absent" });
+  });
+
+  it("round-3 P2 red case: refuses a stable-but-wrong search configuration digest, never comparing only to itself", async () => {
+    // Distinct from the live-to-live drift test above: this value never
+    // changes between the pre-window and in-window reads, so a
+    // comparison against only itself (the live-to-live mechanism alone)
+    // would pass cleanly. A non-null, well-formed, *stable* digest that
+    // simply is not the one this driver's own build expects -- an
+    // installer from a different revision, or a hand-edited
+    // configuration that happens to be internally consistent -- must
+    // still refuse, by pinning the pre-window read against the
+    // compiled-in POSTGRESQL_SEARCH_CONFIGURATION_SHA256 rather than
+    // only against a second read of itself.
+    vi.spyOn(coordination, "PostgreSqlWorkCoordinator").mockImplementation(function () { return ({
+      acquireLease: vi.fn(async () => ({ fencingToken: 1n } as never)), releaseLease: vi.fn(async () => null),
+    } as never); });
+    vi.spyOn(searchConfiguration, "inspectPostgreSqlSearchConfiguration")
+      .mockResolvedValue({ actualSha256: fakeHash("stable-wrong-search-configuration"), objectCount: 19, ownershipReady: true } as never);
+    vi.spyOn(portableSource, "readPostgreSqlPortableWitness").mockResolvedValue(HASH_A);
+    const copySource = fakeCopySource();
+    const runtime = fakeRuntime();
+    const dependencies = dependenciesFor(copySource, runtime);
+    await expect(verifyMigrationGeneration(baseInput({ homeDir: "/tmp/lcm-verify-search-stable-wrong" }), dependencies))
+      .rejects.toMatchObject({
+        reason: "invalid-input",
+        message: "destination search configuration digest does not match the pinned lcm.search_v1 contract",
+      });
   });
 
   it("round-1 P3: distinguishes a present-but-malformed search configuration from a genuinely absent one", async () => {
@@ -1179,7 +1215,7 @@ describe("verifyMigrationGeneration", () => {
     vi.spyOn(coordination, "PostgreSqlWorkCoordinator").mockImplementation(function () { return ({
       acquireLease: vi.fn(async () => ({ fencingToken: 1n } as never)), releaseLease: vi.fn(async () => null),
     } as never); });
-    vi.spyOn(searchConfiguration, "inspectPostgreSqlSearchConfiguration").mockResolvedValue({ actualSha256: HASH_A } as never);
+    vi.spyOn(searchConfiguration, "inspectPostgreSqlSearchConfiguration").mockResolvedValue({ actualSha256: REAL_SEARCH_CONFIGURATION_SHA256 } as never);
     vi.spyOn(portableSource, "readPostgreSqlPortableWitness").mockResolvedValue(HASH_A);
     const copySource = fakeCopySource();
     const badRuntime = fakeRuntime();
