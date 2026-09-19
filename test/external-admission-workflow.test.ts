@@ -161,6 +161,36 @@ const acceptedEventFixtures: EventFixture[] = [
       repository: { full_name: REPOSITORY },
     },
   }),
+  makeEventFixture("managed Copilot requested", "workflow_run", true, {
+    action: "requested",
+    workflowRun: {
+      event: "dynamic",
+      head_sha: HEAD_SHA,
+      name: "Running Copilot Code Review",
+      path: "dynamic/agents/copilot-pull-request-reviewer",
+      repository: { full_name: REPOSITORY },
+    },
+  }),
+  makeEventFixture("managed Copilot in_progress", "workflow_run", true, {
+    action: "in_progress",
+    workflowRun: {
+      event: "dynamic",
+      head_sha: HEAD_SHA,
+      name: "Running Copilot Code Review",
+      path: "dynamic/agents/copilot-pull-request-reviewer",
+      repository: { full_name: REPOSITORY },
+    },
+  }),
+  makeEventFixture("managed Copilot completed", "workflow_run", true, {
+    action: "completed",
+    workflowRun: {
+      event: "dynamic",
+      head_sha: HEAD_SHA,
+      name: "Running Copilot Code Review",
+      path: "dynamic/agents/copilot-pull-request-reviewer",
+      repository: { full_name: REPOSITORY },
+    },
+  }),
   makeEventFixture("DCO created", "check_run", true, {
     action: "created",
     checkRun: {
@@ -195,6 +225,36 @@ const acceptedEventFixtures: EventFixture[] = [
 ];
 
 const rejectedEventFixtures: EventFixture[] = [
+  makeEventFixture("managed Copilot wrong dynamic path", "workflow_run", false, {
+    action: "requested",
+    workflowRun: {
+      event: "dynamic",
+      head_sha: HEAD_SHA,
+      name: "Running Copilot Code Review",
+      path: "dynamic/agents/untrusted-review",
+      repository: { full_name: REPOSITORY },
+    },
+  }),
+  makeEventFixture("managed Copilot spoofed run name", "workflow_run", false, {
+    action: "requested",
+    workflowRun: {
+      event: "dynamic",
+      head_sha: HEAD_SHA,
+      name: "Copilot",
+      path: "dynamic/agents/copilot-pull-request-reviewer",
+      repository: { full_name: REPOSITORY },
+    },
+  }),
+  makeEventFixture("repository workflow named Copilot", "workflow_run", false, {
+    action: "requested",
+    workflowRun: {
+      event: "pull_request",
+      head_sha: HEAD_SHA,
+      name: "Copilot",
+      path: ".github/workflows/copilot.yml",
+      repository: { full_name: REPOSITORY },
+    },
+  }),
   makeEventFixture("CI wrong workflow path", "workflow_run", false, {
     workflowRun: {
       event: "pull_request",
@@ -279,7 +339,11 @@ if [[ "$*" == *"/statuses/"* ]]; then
   exit 0
 fi
 if [[ "$*" == *"/commits/"*"/pulls?per_page=100"* ]]; then
-  printf '%s\\n' '[{"number":123,"state":"open","draft":false,"base":{"ref":"main","repo":{"full_name":"example/repository"}},"head":{"sha":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"}}]'
+  printf '%s\\n' '[{"number":123,"changed_files":1,"commits":1,"state":"open","draft":false,"user":{"id":42,"login":"contributor","type":"User"},"base":{"ref":"main","repo":{"full_name":"example/repository"}},"head":{"sha":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","ref":"feature/admission","repo":{"full_name":"example/repository"}}}]'
+  exit 0
+fi
+if [[ "$*" == *"/pulls/123/files?per_page=100"* ]]; then
+  printf '%s\\n' '[[{"filename":"docs/external-admission.md","status":"modified"}]]'
   exit 0
 fi
 if [[ "$*" == *"/pulls/123"* ]]; then
@@ -288,10 +352,10 @@ if [[ "$*" == *"/pulls/123"* ]]; then
     exit 0
   fi
   if [[ "$FAIL_ADMISSION_COMMAND" == valid-ineligible ]]; then
-    printf '%s\\n' '{"number":123,"state":"closed","draft":false,"base":{"ref":"main","repo":{"full_name":"example/repository"}},"head":{"sha":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"}}'
+    printf '%s\\n' '{"number":123,"changed_files":1,"commits":1,"state":"closed","draft":false,"base":{"ref":"main","repo":{"full_name":"example/repository"}},"head":{"sha":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"}}'
     exit 0
   fi
-  printf '%s\\n' '{"number":123,"state":"open","draft":false,"base":{"ref":"main","repo":{"full_name":"example/repository"}},"head":{"sha":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"}}'
+  printf '%s\\n' '{"number":123,"changed_files":1,"commits":1,"state":"open","draft":false,"user":{"id":42,"login":"contributor","type":"User"},"base":{"ref":"main","repo":{"full_name":"example/repository"}},"head":{"sha":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","ref":"feature/admission","repo":{"full_name":"example/repository"}}}'
   exit 0
 fi
 if [[ "$*" == *"/branches/"* ]]; then
@@ -338,6 +402,22 @@ if [[ "$2" == "evaluate-checks" ]]; then
 fi
 if [[ "$2" == "evaluate-ci-run" ]]; then
   printf '%s\\n' '{"state":"completed","ready":true}'
+  exit 0
+fi
+if [[ "$2" == "classify-files" ]]; then
+  printf '%s\\n' '{"classification":"non-sensitive","sensitive":false,"auditedPaths":["docs/external-admission.md"],"matchedPaths":[]}'
+  exit 0
+fi
+if [[ "$2" == "evaluate-file-binding" ]]; then
+  printf '%s\\n' '{"ready":true}'
+  exit 0
+fi
+if [[ "$2" == "evaluate-review-check" ]]; then
+  printf '%s\\n' '{"state":"missing","ready":false,"pending":true}'
+  exit 0
+fi
+if [[ "$2" == "evaluate-sensitive-admission" ]]; then
+  printf '%s\\n' '{"ready":true,"evidenceClass":"ci-dco","evidenceIds":[]}'
   exit 0
 fi
 if [[ "$2" == "evaluate-freshness" ]]; then
@@ -420,6 +500,11 @@ type AdmissionScenario =
   | "equal-dco-created"
   | "equal-dco-rerequested"
   | "equal-dco-completed"
+  | "review-requested-newer"
+  | "review-in-progress-equal"
+  | "review-completed-equal"
+  | "review-completed-newer"
+  | "review-completed-terminal"
   | "no-unique-pr"
   | "protected-main"
   | "protected-maintenance"
@@ -427,7 +512,23 @@ type AdmissionScenario =
   | "invalid-or-changed-base"
   | "transient-base"
   | "mixed-deleted-base"
-  | "duplicate-base-candidates";
+  | "duplicate-base-candidates"
+  | "sensitive-without-evidence"
+  | "sensitive-copilot"
+  | "sensitive-dependabot-without-copilot"
+  | "sensitive-dependabot-copilot"
+  | "sensitive-review-api-pending"
+  | "sensitive-file-drift"
+  | "sensitive-postgresql-template-init"
+  | "sensitive-postgresql-cached-run-init"
+  | "sensitive-postgresql-init"
+  | "sensitive-postgresql-harness"
+  | "sensitive-postgresql-operational-fixture"
+  | "sensitive-postgresql-portable-fixture"
+  | "sensitive-e2e-harness"
+  | "pr-files-head-race"
+  | "transient-pr-files"
+  | "malformed-pr-files";
 
 type AdmissionEligibilityVariant =
   | "unsupported-base"
@@ -442,12 +543,20 @@ function makeAdmissionPullRequest({
   draft = false,
   state = "open",
   headSha = HEAD_SHA,
+  user = { id: 42, login: "contributor", type: "User" },
+  headRef = "feature/admission",
+  headRepository = REPOSITORY,
+  changedFiles = 1,
+  commits = 1,
 } = {}) {
  return {
     number,
+   changed_files: changedFiles,
+   commits,
    state,
    draft,
-    head: { sha: headSha },
+    user,
+    head: { sha: headSha, ref: headRef, repo: { full_name: headRepository } },
     base: { ref: baseRef, repo: { full_name: baseRepository } },
   };
 }
@@ -460,6 +569,8 @@ function runAdmissionScenario(
   const ghPath = join(directory, "gh");
   const branchCallsPath = join(directory, "branch-calls.log");
   const branchRequestsPath = join(directory, "branch-requests.log");
+  const fileCallsPath = join(directory, "file-calls.log");
+  const pullCallsPath = join(directory, "pull-calls.log");
   const statusLogPath = join(directory, "statuses.log");
   const headSha = "a".repeat(40);
   const ciRunId = "123";
@@ -480,6 +591,15 @@ function runAdmissionScenario(
     status: "completed",
     conclusion: "success",
   };
+  const reviewCheckRun = {
+    id: 12,
+    name: "copilot-pull-request-reviewer",
+    head_sha: headSha,
+    app: { id: 15368, slug: "github-actions" },
+    status: "completed",
+    conclusion: "success",
+    details_url: `https://example.test/${REPOSITORY}/actions/runs/456/job/789`,
+  };
   const ciRun = {
     id: Number(ciRunId),
     event: "pull_request",
@@ -489,14 +609,30 @@ function runAdmissionScenario(
     conclusion: "success",
     repository: { full_name: REPOSITORY },
   };
+  const reviewRun = {
+    id: 456,
+    event: "dynamic",
+    path: "dynamic/agents/copilot-pull-request-reviewer",
+    head_sha: headSha,
+    status: "completed",
+    conclusion: "success",
+    repository: { full_name: REPOSITORY },
+  };
   let associatedPullRequests = [makeAdmissionPullRequest()];
   let pullRequest = makeAdmissionPullRequest();
+  let pullRequestFiles = [[{ filename: "docs/external-admission.md", status: "modified" }]];
+  let checkRuns = [ciCheckRun, dcoCheckRun];
+  let reviewRunApiFails = false;
+  let pullRequestFilesApiFails = false;
+  let pullRequestFileSnapshots: unknown[] | undefined;
+  let pullRequestSnapshots: unknown[] | undefined;
   let branchProtectionSequence = ["true"];
   let branchDeletedSuffix = "";
   let branchLookupMustNotHappen = false;
   let eventSource = "repository_dispatch";
   let eventWorkflowRunId = "";
   let eventWorkflowRunAction = "";
+  let eventWorkflowRunPath = "";
   let eventCheckRunId = "";
   let eventCheckRunAction = "";
 
@@ -505,21 +641,25 @@ function runAdmissionScenario(
       eventSource = "workflow_run";
       eventWorkflowRunId = "99";
       eventWorkflowRunAction = "completed";
+      eventWorkflowRunPath = ".github/workflows/ci.yml";
       break;
     case "newer-workflow-run":
       eventSource = "workflow_run";
       eventWorkflowRunId = "124";
       eventWorkflowRunAction = "completed";
+      eventWorkflowRunPath = ".github/workflows/ci.yml";
       break;
     case "in-progress-workflow-run":
       eventSource = "workflow_run";
       eventWorkflowRunId = "99";
       eventWorkflowRunAction = "in_progress";
+      eventWorkflowRunPath = ".github/workflows/ci.yml";
       break;
     case "equal-in-progress-workflow-run":
       eventSource = "workflow_run";
       eventWorkflowRunId = ciRunId;
       eventWorkflowRunAction = "in_progress";
+      eventWorkflowRunPath = ".github/workflows/ci.yml";
       break;
     case "equal-dco-created":
       eventSource = "check_run";
@@ -535,6 +675,50 @@ function runAdmissionScenario(
       eventSource = "check_run";
       eventCheckRunId = "11";
       eventCheckRunAction = "completed";
+      break;
+    case "review-requested-newer":
+      eventSource = "workflow_run";
+      eventWorkflowRunId = "457";
+      eventWorkflowRunAction = "requested";
+      eventWorkflowRunPath = "dynamic/agents/copilot-pull-request-reviewer";
+      pullRequestFiles = [[{ filename: "package.json", status: "modified" }]];
+      checkRuns = [ciCheckRun, dcoCheckRun, reviewCheckRun];
+      break;
+    case "review-in-progress-equal":
+      eventSource = "workflow_run";
+      eventWorkflowRunId = "456";
+      eventWorkflowRunAction = "in_progress";
+      eventWorkflowRunPath = "dynamic/agents/copilot-pull-request-reviewer";
+      pullRequestFiles = [[{ filename: "package.json", status: "modified" }]];
+      checkRuns = [ciCheckRun, dcoCheckRun, reviewCheckRun];
+      break;
+    case "review-completed-equal":
+      eventSource = "workflow_run";
+      eventWorkflowRunId = "456";
+      eventWorkflowRunAction = "completed";
+      eventWorkflowRunPath = "dynamic/agents/copilot-pull-request-reviewer";
+      pullRequestFiles = [[{ filename: "package.json", status: "modified" }]];
+      checkRuns = [ciCheckRun, dcoCheckRun, reviewCheckRun];
+      break;
+    case "review-completed-newer":
+      eventSource = "workflow_run";
+      eventWorkflowRunId = "457";
+      eventWorkflowRunAction = "completed";
+      eventWorkflowRunPath = "dynamic/agents/copilot-pull-request-reviewer";
+      pullRequestFiles = [[{ filename: "package.json", status: "modified" }]];
+      checkRuns = [ciCheckRun, dcoCheckRun, reviewCheckRun];
+      break;
+    case "review-completed-terminal":
+      eventSource = "workflow_run";
+      eventWorkflowRunId = "456";
+      eventWorkflowRunAction = "completed";
+      eventWorkflowRunPath = "dynamic/agents/copilot-pull-request-reviewer";
+      pullRequestFiles = [[{ filename: "package.json", status: "modified" }]];
+      checkRuns = [
+        ciCheckRun,
+        dcoCheckRun,
+        { ...reviewCheckRun, conclusion: "failure" },
+      ];
       break;
     case "no-unique-pr":
       associatedPullRequests = [];
@@ -554,6 +738,100 @@ function runAdmissionScenario(
       pullRequest = makeAdmissionPullRequest({ baseRef: "maintenance/1.x" });
       associatedPullRequests = [pullRequest];
       branchProtectionSequence = ["true"];
+      break;
+    case "sensitive-without-evidence":
+      pullRequestFiles = [[{ filename: ".github/workflows/ci.yml", status: "modified" }]];
+      break;
+    case "sensitive-copilot":
+      pullRequestFiles = [[{ filename: ".github/scripts/external-admission.sh", status: "modified" }]];
+      checkRuns = [ciCheckRun, dcoCheckRun, reviewCheckRun];
+      break;
+    case "sensitive-dependabot-without-copilot": {
+      pullRequest = makeAdmissionPullRequest({
+        user: { id: 49699333, login: "dependabot[bot]", type: "Bot" },
+        headRef: "dependabot/npm_and_yarn/example-1.2.3",
+      });
+      associatedPullRequests = [pullRequest];
+      pullRequestFiles = [[{ filename: "pnpm-lock.yaml", status: "modified" }]];
+      break;
+    }
+    case "sensitive-dependabot-copilot": {
+      pullRequest = makeAdmissionPullRequest({
+        user: { id: 49699333, login: "dependabot[bot]", type: "Bot" },
+        headRef: "dependabot/npm_and_yarn/example-1.2.3",
+      });
+      associatedPullRequests = [pullRequest];
+      pullRequestFiles = [[{ filename: "pnpm-lock.yaml", status: "modified" }]];
+      checkRuns = [ciCheckRun, dcoCheckRun, reviewCheckRun];
+      break;
+    }
+    case "sensitive-review-api-pending":
+      pullRequestFiles = [[{ filename: "package.json", status: "modified" }]];
+      checkRuns = [ciCheckRun, dcoCheckRun, reviewCheckRun];
+      reviewRunApiFails = true;
+      break;
+    case "sensitive-file-drift":
+      checkRuns = [ciCheckRun, dcoCheckRun, reviewCheckRun];
+      pullRequestFileSnapshots = [
+        [[{ filename: "src/first.ts", status: "modified" }]],
+        [[{ filename: "src/second.ts", status: "modified" }]],
+        [[{ filename: "src/second.ts", status: "modified" }]],
+      ];
+      break;
+    case "sensitive-postgresql-template-init":
+      pullRequestFiles = [[{
+        filename: "test/postgresql/template-init.sh",
+        status: "modified",
+      }]];
+      break;
+    case "sensitive-postgresql-cached-run-init":
+      pullRequestFiles = [[{
+        filename: "test/postgresql/cached-run-init.sh",
+        status: "modified",
+      }]];
+      break;
+    case "sensitive-postgresql-init":
+      pullRequestFiles = [[{
+        filename: "test/postgresql/init.sh",
+        status: "modified",
+      }]];
+      break;
+    case "sensitive-postgresql-harness":
+      pullRequestFiles = [[{ filename: "test/postgresql/harness.ts", status: "modified" }]];
+      break;
+    case "sensitive-postgresql-operational-fixture":
+      pullRequestFiles = [[{
+        filename: "test/postgresql/operational-fixture.ts",
+        status: "modified",
+      }]];
+      break;
+    case "sensitive-postgresql-portable-fixture":
+      pullRequestFiles = [[{
+        filename: "test/postgresql/portable-fixture.ts",
+        status: "modified",
+      }]];
+      break;
+    case "sensitive-e2e-harness":
+      pullRequestFiles = [[{ filename: "test/e2e/harness.ts", status: "modified" }]];
+      break;
+    case "pr-files-head-race":
+      pullRequestSnapshots = [
+        pullRequest,
+        pullRequest,
+        pullRequest,
+        pullRequest,
+        pullRequest,
+        pullRequest,
+        pullRequest,
+        pullRequest,
+        makeAdmissionPullRequest({ headSha: "b".repeat(40), changedFiles: 1 }),
+      ];
+      break;
+    case "transient-pr-files":
+      pullRequestFilesApiFails = true;
+      break;
+    case "malformed-pr-files":
+      pullRequestFileSnapshots = [[[]]];
       break;
   }
 
@@ -631,7 +909,26 @@ if [[ "$endpoint" == repos/*/commits/*/pulls?per_page=100 ]]; then
   exit 0
 fi
 if [[ "$endpoint" == repos/*/pulls/123 ]]; then
-  printf '%s\n' "$PULL_REQUEST_JSON"
+  pull_call_count=0
+  if [[ -f "$PULL_CALLS" ]]; then read -r pull_call_count < "$PULL_CALLS"; fi
+  pull_call_count=$((pull_call_count + 1))
+  printf '%s\n' "$pull_call_count" > "$PULL_CALLS"
+  pull_index=$((pull_call_count - 1))
+  pull_last_index="$(jq 'length - 1' <<<"$PULL_REQUEST_SNAPSHOTS_JSON")"
+  if (( pull_index > pull_last_index )); then pull_index="$pull_last_index"; fi
+  jq -c --argjson index "$pull_index" '.[$index]' <<<"$PULL_REQUEST_SNAPSHOTS_JSON"
+  exit 0
+fi
+if [[ "$endpoint" == repos/*/pulls/123/files?per_page=100 ]]; then
+  if [[ "$PULL_REQUEST_FILES_API_FAILS" == true ]]; then exit 98; fi
+  file_call_count=0
+  if [[ -f "$FILE_CALLS" ]]; then read -r file_call_count < "$FILE_CALLS"; fi
+  file_call_count=$((file_call_count + 1))
+  printf '%s\n' "$file_call_count" > "$FILE_CALLS"
+  file_index=$((file_call_count - 1))
+  file_last_index="$(jq 'length - 1' <<<"$PULL_REQUEST_FILE_SNAPSHOTS_JSON")"
+  if (( file_index > file_last_index )); then file_index="$file_last_index"; fi
+  jq -c --argjson index "$file_index" '.[$index]' <<<"$PULL_REQUEST_FILE_SNAPSHOTS_JSON"
   exit 0
 fi
   if [[ "$endpoint" == repos/*/branches/* ]]; then
@@ -667,7 +964,12 @@ if [[ "$endpoint" == *"check-runs?filter=latest&per_page=100" ]]; then
   exit 0
 fi
 if [[ "$endpoint" == repos/*/actions/runs/* ]]; then
-  printf '%s\n' "$CI_RUN_JSON"
+  if [[ "$endpoint" == */actions/runs/456 ]]; then
+    if [[ "$REVIEW_RUN_API_FAILS" == true ]]; then exit 97; fi
+    printf '%s\n' "$REVIEW_RUN_JSON"
+  else
+    printf '%s\n' "$CI_RUN_JSON"
+  fi
   exit 0
 fi
 printf 'unexpected fake-gh endpoint: %s\n' "$endpoint" >&2
@@ -676,6 +978,8 @@ exit 99
     chmodSync(ghPath, 0o755);
     writeFileSync(branchCallsPath, "0\n");
     writeFileSync(branchRequestsPath, "");
+    writeFileSync(fileCallsPath, "0\n");
+    writeFileSync(pullCallsPath, "0\n");
     writeFileSync(statusLogPath, "");
 
     const result = spawnSync("bash", [evaluatorPath], {
@@ -688,7 +992,7 @@ exit 99
         BRANCH_LOOKUP_MUST_NOT_HAPPEN: String(branchLookupMustNotHappen),
         BRANCH_REQUESTS: branchRequestsPath,
         BRANCH_PROTECTION_SEQUENCE: branchProtectionSequence.join(","),
-        CHECK_RUN_PAGES_JSON: JSON.stringify([{ check_runs: [ciCheckRun, dcoCheckRun] }]),
+        CHECK_RUN_PAGES_JSON: JSON.stringify([{ check_runs: checkRuns }]),
         CI_RUN_JSON: JSON.stringify(ciRun),
         EVENT_HEAD_SHA: headSha,
         EVENT_SOURCE: eventSource,
@@ -696,9 +1000,18 @@ exit 99
         EVENT_CHECK_RUN_ID: eventCheckRunId,
         EVENT_WORKFLOW_RUN_ACTION: eventWorkflowRunAction,
         EVENT_WORKFLOW_RUN_ID: eventWorkflowRunId,
+        EVENT_WORKFLOW_RUN_PATH: eventWorkflowRunPath,
+        FILE_CALLS: fileCallsPath,
         PATH: `${directory}:${process.env.PATH ?? ""}`,
-        PULL_REQUEST_JSON: JSON.stringify(pullRequest),
+        PULL_CALLS: pullCallsPath,
+        PULL_REQUEST_FILES_API_FAILS: String(pullRequestFilesApiFails),
+        PULL_REQUEST_FILE_SNAPSHOTS_JSON: JSON.stringify(
+          pullRequestFileSnapshots ?? [pullRequestFiles, pullRequestFiles, pullRequestFiles],
+        ),
+        PULL_REQUEST_SNAPSHOTS_JSON: JSON.stringify(pullRequestSnapshots ?? [pullRequest]),
         REPOSITORY,
+        REVIEW_RUN_API_FAILS: String(reviewRunApiFails),
+        REVIEW_RUN_JSON: JSON.stringify(reviewRun),
         RUN_URL: "https://example.test/run/1",
         SERVER_URL: "https://example.test",
         STATUS_LOG: statusLogPath,
@@ -709,6 +1022,7 @@ exit 99
       statuses: readFileSync(statusLogPath, "utf8").trim().split("\n").filter(Boolean),
       branchCalls: Number(readFileSync(branchCallsPath, "utf8").trim()),
       branchRequests: readFileSync(branchRequestsPath, "utf8").trim().split("\n").filter(Boolean),
+      pullCalls: Number(readFileSync(pullCallsPath, "utf8").trim()),
     };
   } finally {
     rmSync(directory, { force: true, recursive: true });
@@ -759,6 +1073,31 @@ describe("external admission workflow", () => {
     expect(statuses.at(-1)?.split("\t", 1)[0]).toBe("success");
   });
 
+  it.each([
+    "review-requested-newer",
+    "review-in-progress-equal",
+    "review-completed-newer",
+  ] as const)("keeps managed review freshness scenario %s pending", (scenario) => {
+    const { result, statuses } = runAdmissionScenario(scenario);
+    expect(result.status, `${scenario}\n${result.stdout}\n${result.stderr}`).toBe(0);
+    expect(statuses.at(-1)?.split("\t", 1)[0]).toBe("pending");
+    expect(statuses.some((status) => status.startsWith("success\t"))).toBe(false);
+  });
+
+  it("reconciles an equal completed managed review event", () => {
+    const { result, statuses } = runAdmissionScenario("review-completed-equal");
+    expect(result.status, `${result.stdout}\n${result.stderr}`).toBe(0);
+    expect(statuses.at(-1)?.split("\t", 1)[0]).toBe("success");
+    expect(statuses.at(-1)).toContain("Copilot");
+  });
+
+  it("terminalizes an equal completed managed review failure", () => {
+    const { result, statuses } = runAdmissionScenario("review-completed-terminal");
+    expect(result.status, `${result.stdout}\n${result.stderr}`).toBe(0);
+    expect(statuses.at(-1)?.split("\t", 1)[0]).toBe("failure");
+    expect(statuses.some((status) => status.startsWith("success\t"))).toBe(false);
+  });
+
   it("terminalizes an exact head with no unique eligible pull request", () => {
     const { result, statuses } = runAdmissionScenario("no-unique-pr");
     expect(result.status).toBe(0);
@@ -784,6 +1123,76 @@ describe("external admission workflow", () => {
     expect(branchCalls).toBeGreaterThan(1);
     expect(branchRequests.every((request) => request.endsWith("/branches/maintenance%2F1.4.x")))
       .toBe(true);
+  });
+
+  it("keeps sensitive changes pending without exact-head Copilot evidence", () => {
+    const { result, statuses } = runAdmissionScenario("sensitive-without-evidence");
+    expect(result.status).toBe(0);
+    expect(statuses.at(-1)?.split("\t", 1)[0]).toBe("pending");
+    expect(statuses.at(-1)).toContain("exact-head Copilot evidence");
+    expect(result.stdout).toContain("awaits exact-head Copilot evidence");
+  });
+
+  it.each([
+    "sensitive-postgresql-template-init",
+    "sensitive-postgresql-cached-run-init",
+    "sensitive-postgresql-init",
+    "sensitive-postgresql-harness",
+    "sensitive-postgresql-operational-fixture",
+    "sensitive-postgresql-portable-fixture",
+    "sensitive-e2e-harness",
+  ] as const)("classifies %s as sensitive in the trusted reducer", (scenario) => {
+    const { result, statuses } = runAdmissionScenario(scenario);
+    expect(result.status, `${scenario}\n${result.stdout}\n${result.stderr}`).toBe(0);
+    expect(statuses.at(-1)?.split("\t", 1)[0]).toBe("pending");
+    expect(statuses.at(-1)).toContain("exact-head Copilot evidence");
+    expect(statuses.some((status) => status.startsWith("success\t"))).toBe(false);
+  });
+
+  it("admits sensitive changes with exact Copilot dynamic provenance", () => {
+    const { result, statuses } = runAdmissionScenario("sensitive-copilot");
+    expect(result.status, `${result.stdout}\n${result.stderr}`).toBe(0);
+    expect(statuses.at(-1)?.split("\t", 1)[0]).toBe("success");
+    expect(statuses.at(-1)).toContain("Copilot");
+  });
+
+  it("requires Copilot evidence for sensitive Dependabot pull requests", () => {
+    const { result, statuses } = runAdmissionScenario("sensitive-dependabot-without-copilot");
+    expect(result.status, `${result.stdout}\n${result.stderr}`).toBe(0);
+    expect(statuses.at(-1)?.split("\t", 1)[0]).toBe("pending");
+    expect(statuses.at(-1)).toContain("exact-head Copilot evidence");
+    expect(result.stderr).not.toContain("unexpected fake-gh endpoint");
+  });
+
+  it("admits a sensitive Dependabot pull request only with exact Copilot provenance", () => {
+    const { result, statuses } = runAdmissionScenario("sensitive-dependabot-copilot");
+    expect(result.status, `${result.stdout}\n${result.stderr}`).toBe(0);
+    expect(statuses.at(-1)?.split("\t", 1)[0]).toBe("success");
+    expect(statuses.at(-1)).toContain("Copilot");
+  });
+
+  it("keeps sensitive admission pending when the Copilot run API is transient", () => {
+    const { result, statuses } = runAdmissionScenario("sensitive-review-api-pending");
+    expect(result.status, `${result.stdout}\n${result.stderr}`).toBe(0);
+    expect(statuses.at(-1)?.split("\t", 1)[0]).toBe("pending");
+    expect(statuses.at(-1)).toContain("exact-head Copilot evidence");
+  });
+
+  it("keeps admission pending when sensitive file evidence drifts", () => {
+    const { result, statuses } = runAdmissionScenario("sensitive-file-drift");
+    expect(result.status, `${result.stdout}\n${result.stderr}`).toBe(0);
+    expect(statuses.at(-1)?.split("\t", 1)[0]).toBe("pending");
+    expect(statuses.at(-1)).toContain("Trusted admission evidence changed");
+    expect(statuses.some((status) => status.startsWith("success\t"))).toBe(false);
+  });
+
+  it("keeps a final same-count file snapshot pending when the PR head changes", () => {
+    const { result, statuses, pullCalls } = runAdmissionScenario("pr-files-head-race");
+    expect(result.status, `${result.stdout}\n${result.stderr}`).toBe(0);
+    expect(statuses.at(-1)?.split("\t", 1)[0]).toBe("pending");
+    expect(statuses.at(-1)).toContain("PR file evidence changed");
+    expect(statuses.some((status) => status.startsWith("success\t"))).toBe(false);
+    expect(pullCalls).toBe(9);
   });
 
   it("terminalizes an unprotected maintenance/1.4.x pull request", () => {
@@ -836,6 +1245,24 @@ describe("external admission workflow", () => {
     expect(statuses.some((status) => status.startsWith("success\t"))).toBe(false);
   });
 
+  it("keeps transient PR-file API failures pending", () => {
+    const { result, statuses } = runAdmissionScenario("transient-pr-files");
+    expect(result.status, `${result.stdout}\n${result.stderr}`).toBe(0);
+    expect(statuses.at(-1)?.split("\t", 1)[0]).toBe("pending");
+    expect(statuses.at(-1)).toContain("PR file evidence is temporarily unavailable");
+    expect(statuses.at(-1)).not.toContain("Copilot");
+    expect(statuses.at(-1)).not.toContain("Dependabot");
+    expect(statuses.some((status) => status.startsWith("failure\t"))).toBe(false);
+    expect(statuses.some((status) => status.startsWith("success\t"))).toBe(false);
+  });
+
+  it("terminalizes a successful but incomplete PR-file response", () => {
+    const { result, statuses } = runAdmissionScenario("malformed-pr-files");
+    expect(result.status).not.toBe(0);
+    expect(statuses.at(-1)?.split("\t", 1)[0]).toBe("failure");
+    expect(statuses.some((status) => status.startsWith("success\t"))).toBe(false);
+  });
+
   it("ignores a deleted historical base when one valid PR remains", () => {
     const { result, statuses, branchRequests } = runAdmissionScenario("mixed-deleted-base");
     const evidence = `${result.stdout}\n${result.stderr}\n${statuses.join("\n")}\n${branchRequests.join("\n")}`;
@@ -857,7 +1284,7 @@ describe("external admission workflow", () => {
       check_run: { types: ["created", "rerequested", "completed"] },
       repository_dispatch: { types: ["external-admission-reconcile"] },
       workflow_run: {
-        workflows: ["CI"],
+        workflows: ["CI", "Copilot"],
         types: ["requested", "in_progress", "completed"],
       },
     });
@@ -925,7 +1352,19 @@ describe("external admission workflow", () => {
     }
   });
 
-  it("starts only for authenticated DCO, canonical pull-request CI, or reconciliation", () => {
+  it("revokes stale success for a managed review rerun before trusted checkout", () => {
+    const fixture = acceptedEventFixtures.find(({ name }) => name === "managed Copilot requested");
+    expect(fixture).toBeDefined();
+    expect(simulateWorkflowFixture(fixture!)).toEqual({
+      evaluatorReached: true,
+      jobRuns: true,
+      statusWrites: 1,
+    });
+    expect(job.steps[0]?.name).toBe("Revoke stale external admission");
+    expect(job.steps[1]?.name).toBe("Check out trusted admission evaluator");
+  });
+
+  it("starts only for trusted DCO, CI, managed Copilot, or reconciliation", () => {
     for (const value of ["DCO", "1861", "dco"]) expect(job.if).toContain(value);
     expect(job.if).toContain("github.event_name == 'repository_dispatch'");
     expect(job.if).toContain("github.event.action == 'external-admission-reconcile'");
@@ -933,6 +1372,11 @@ describe("external admission workflow", () => {
     expect(job.if).toContain("github.event.workflow_run.name == 'CI'");
     expect(job.if).toContain("github.event.workflow_run.event == 'pull_request'");
     expect(job.if).toContain("github.event.workflow_run.path == '.github/workflows/ci.yml'");
+    expect(job.if).toContain("github.event.workflow_run.name == 'Running Copilot Code Review'");
+    expect(job.if).toContain("github.event.workflow_run.event == 'dynamic'");
+    expect(job.if).toContain(
+      "github.event.workflow_run.path == 'dynamic/agents/copilot-pull-request-reviewer'",
+    );
     expect(job.if).toContain(
       "github.event.workflow_run.repository.full_name == github.repository",
     );
@@ -964,7 +1408,7 @@ describe("external admission workflow", () => {
       .toHaveLength(2);
   });
 
-  it("isolates rejected CI workflow runs from exact-SHA concurrency", () => {
+  it("isolates rejected CI and Copilot workflow runs from exact-SHA concurrency", () => {
     const group = workflow.concurrency.group;
     expect(workflow.concurrency["cancel-in-progress"]).toBe(true);
     for (const condition of [
@@ -982,16 +1426,29 @@ describe("external admission workflow", () => {
     expect(group).toMatch(
       /github\.event_name == 'workflow_run'\s+&&\s+format\('workflow-run-\{0\}', github\.run_id\)/u,
     );
+    for (const condition of [
+      "github.event.workflow_run.name == 'Running Copilot Code Review'",
+      "github.event.workflow_run.event == 'dynamic'",
+      "github.event.workflow_run.path == 'dynamic/agents/copilot-pull-request-reviewer'",
+      "github.event.workflow_run.repository.full_name == github.repository",
+    ]) {
+      expect(group).toContain(condition);
+      expect(job.if).toContain(condition);
+    }
+    expect(group).toMatch(
+      /github\.event\.workflow_run\.path == 'dynamic\/agents\/copilot-pull-request-reviewer'\s+&&\s+github\.event\.workflow_run\.repository\.full_name == github\.repository\s+&&\s+github\.event\.workflow_run\.head_sha/u,
+    );
   });
 
   it("repeats exact-head PR, CI, and DCO validation before success", () => {
     expect(evaluator).toContain("commits/$HEAD_SHA/pulls?per_page=100");
     expect(evaluator).toContain("check-runs?filter=latest&per_page=100");
-    expect(evaluator).not.toContain("/files?per_page=100");
+    expect(evaluator).toContain("/files?per_page=100");
+    expect(evaluator).not.toContain("/commits?per_page=100");
     const initial = evaluator.indexOf('validate_required_snapshot "Initial"');
     const current = evaluator.indexOf('validate_required_snapshot "Current"');
     const final = evaluator.indexOf('validate_required_snapshot "Final"');
-    const success = evaluator.indexOf('post_admission_status success "CI and DCO passed"');
+    const success = evaluator.indexOf('post_admission_status success "$success_description"');
     expect(initial).toBeGreaterThan(evaluator.indexOf('matching_prs="$(fetch_associated_pull_requests)"'));
     expect(current).toBeGreaterThan(evaluator.indexOf('current_matching_prs="$(fetch_associated_pull_requests)"'));
     expect(final).toBeGreaterThan(current);
@@ -1002,24 +1459,31 @@ describe("external admission workflow", () => {
     expect(evaluator).toContain("external-admission-policy.mjs evaluate-ci-run");
     expect(evaluator).toContain('if [[ "$EVENT_SOURCE" == workflow_run');
     expect(evaluator).toContain("EVENT_WORKFLOW_RUN_ACTION");
+    expect(evaluator).toContain("EVENT_WORKFLOW_RUN_PATH");
     expect(evaluator).toContain("EVENT_CHECK_RUN_ACTION");
     expect(evaluator).toContain("EVENT_CHECK_RUN_ID");
-    expect(evaluator).toContain('printf -v "$fingerprint_variable" \'%s\' "$ci_check_run_id:$dco_check_run_id:$ci_run_id"');
+    expect(evaluator).toContain("classification_fingerprint");
+    expect(evaluator).toContain("selected_evidence_fingerprint");
     expect(evaluator).toContain('validate_required_snapshot "Initial" initial_admission_fingerprint');
     expect(evaluator).toContain('validate_required_snapshot "Current" current_admission_fingerprint');
     expect(evaluator).toContain('validate_required_snapshot "Final" final_admission_fingerprint');
     expect(evaluator.match(/admission_fingerprint" != "\$initial_admission_fingerprint/gu)).toHaveLength(2);
     expect(evaluator).not.toContain('VALIDATED_ADMISSION_FINGERPRINT');
-    expect(evaluator).not.toContain("classify-files");
-    expect(evaluator).not.toContain("select-admission");
-    expect(evaluator).not.toContain("admission-decision");
+    expect(evaluator).toContain("classify-files");
+    expect(evaluator).toContain("evaluate-review-check");
+    expect(evaluator).toContain("evaluate-review-run");
+    expect(evaluator).not.toContain("evaluate-dependabot-pr");
+    expect(evaluator).not.toContain("evaluate-dependabot-commits");
+    expect(evaluator).toContain("evaluate-sensitive-admission");
+    expect(evaluator).not.toContain("/git/trees/");
+    expect(evaluator).not.toContain("/reviews");
   });
 
   it("runs each validator as a simple command and fails closed on evaluator and eligibility errors", () => {
     expect(evaluator).not.toContain("validate_or_exit");
     for (const phase of ["Initial", "Current", "Final"]) {
       expect(evaluator).toMatch(new RegExp(
-        `^validate_required_snapshot "${phase}" [a-z_]+$`,
+        `^validate_required_snapshot "${phase}" [a-z_]+ "\\$[a-z_]+"$`,
         "mu",
       ));
       expect(evaluator).not.toMatch(new RegExp(
@@ -1153,5 +1617,8 @@ describe("external admission workflow", () => {
     expect(documentation).toMatch(/no user-configurable options/iu);
     expect(documentation).toMatch(/freshness lower bound/iu);
     expect(documentation).toMatch(/transient.*branch.*pending/isu);
+    expect(documentation).toMatch(/PR-file API.*pending/isu);
+    expect(documentation).toMatch(/eslint\.config\.js.*outside.*closed set/isu);
+    expect(documentation).toMatch(/execute.*ESLint.*classifier.*tests.*documentation.*same/isu);
   });
 });

@@ -25,7 +25,8 @@ maintenance fix branches        → maintenance/<major>.<minor>.x
 ## Admission and CI invariants
 
 - Required protected reviews and exact-head checks are authoritative. Do not infer merge readiness from an aggregate `ci` success while another required check is still incomplete.
-- Before changing external admission, read `docs/external-admission.md`. Preserve fail-closed exact-head CI+DCO admission and the rule that write-capable evaluation uses trusted workflow code only and never executes or consumes PR-controlled code, artifacts, or caches.
+- Before changing external admission, read `docs/external-admission.md`. Preserve fail-closed exact-head CI+DCO admission. A PR that changes CI, build, package, production, or trusted test-harness inputs also requires an authenticated exact-head Copilot dynamic run. The write-capable evaluator uses trusted workflow code only and never executes or consumes PR-controlled code, artifacts, or caches.
+- Keep the sensitive-path classifier synchronized with the CI workflow, package scripts, Vitest and TypeScript configuration, and transitively executed support. Update its focused tests and user documentation atomically whenever those execution roots change.
 - CI dependency/image/database caches are initialization state, not reusable test state. Preserve exact dependency-cache validation, digest validation for cached images, a secret-free PostgreSQL template, and fresh run-scoped credentials/resources for each conformance leg.
 - npm publishing remains on GitHub-hosted runners because trusted provenance does not accept self-hosted runners.
 
