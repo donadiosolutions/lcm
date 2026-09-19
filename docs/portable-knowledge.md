@@ -37,6 +37,14 @@ uses its stored retry identities to skip already accepted entries. SQLite keeps
 its existing source-scoped search and deduplication behavior.
 Nonidentical content still requires the configured deduplication threshold.
 
+Compaction-driven promotion (`lcm promote`, including the promote step that
+runs after `lcm compact`) makes the same owner-scoped decision on PostgreSQL.
+A promoted summary whose exact content is already an active memory of the
+bound project merges into that memory, even when ranked search cannot recall
+it because the content carries no searchable terms or falls outside the
+candidate page. Earlier versions decided promotion from ranked search alone
+and could store such content twice.
+
 ## Version 1 format and privacy
 
 The JSON document retains the version 1 schema:
