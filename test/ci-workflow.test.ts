@@ -472,9 +472,25 @@ describe("CI workflow", () => {
         name: "vitest-reports",
         path: "${{ runner.temp }}/lcm-vitest-${{ github.run_id }}-${{ github.run_attempt }}/coverage/\n${{ runner.temp }}/lcm-vitest-${{ github.run_id }}-${{ github.run_attempt }}/test-report.junit.xml\n",
         "if-no-files-found": "warn",
+        overwrite: true,
       },
     });
     expect(report.steps.at(-1)?.run).toBe("bash .github/scripts/check-workspace-clean.sh");
+    // Re-running failed jobs replaces artifacts instead of colliding on the
+    // immutable names, for shard blobs and for the merged reports alike.
+    const shard = loadYaml(vitestShardSource) as { runs: { steps: WorkflowStep[] } };
+    const blobUpload = shard.runs.steps.find((step) => step.name === "Upload shard blob");
+    expect(blobUpload).toMatchObject({
+      if: "${{ !cancelled() }}",
+      uses: expect.stringMatching(/^actions\/upload-artifact@[0-9a-f]{40}$/u),
+      with: {
+        name: "vitest-blob-${{ inputs.name }}",
+        path: "${{ inputs.artifact-root }}/blobs/",
+        "if-no-files-found": "error",
+        "retention-days": 1,
+        overwrite: true,
+      },
+    });
   });
 
   it("gates every planned job result through the sparse checkout", () => {

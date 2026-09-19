@@ -39,6 +39,9 @@ runs:
         path: ${{ inputs.artifact-root }}/blobs/
         if-no-files-found: error
         retention-days: 1
+        # Re-running failed jobs must be able to replace the blob of a shard
+        # that uploaded before a later step failed.
+        overwrite: true
 
     - name: Check for workspace artifacts
       shell: bash
