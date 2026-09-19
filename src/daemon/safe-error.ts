@@ -76,10 +76,14 @@ function computeWordRunEnds(chars: readonly string[]): Int32Array {
   // Every path-word run is measured once for the whole message. Without this
   // table each word-bearing question rescans the run it starts from, so a
   // single long word makes classification quadratic in the message length.
+  // The table is its own bound: reading the length back keeps every index an
+  // integer derived from the allocation rather than from the message, which is
+  // what CodeQL's remote-property-injection query reports on this write.
   const ends = new Int32Array(chars.length + 1);
-  ends[chars.length] = chars.length;
-  for (let index = chars.length - 1; index >= 0; index -= 1) {
-    ends[index] = isPathWord(chars[index]) ? ends[index + 1] : index;
+  let runEnd = ends.length - 1;
+  for (let index = ends.length - 1; index >= 0; index -= 1) {
+    if (!isPathWord(chars[index])) runEnd = index;
+    ends[index] = runEnd;
   }
   return ends;
 }
