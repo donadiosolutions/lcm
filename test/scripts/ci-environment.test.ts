@@ -82,19 +82,19 @@ afterEach(() => {
 });
 
 describe("CI environment cache metadata", () => {
-  it("pins the unified composite action and keeps cache restores exact", () => {
-    const action = readFileSync(new URL("../../.github/actions/setup-ci/action.yml", import.meta.url), "utf8");
+  it("pins the split composite actions and keeps cache restores exact", () => {
+    const action = readFileSync(new URL("../../.github/actions/setup-node/action.yml", import.meta.url), "utf8");
     const workflow = readFileSync(new URL("../../.github/workflows/ci.yml", import.meta.url), "utf8");
 
     expect(action).toMatch(/actions\/cache\/restore@[0-9a-f]{40}/u);
     expect(action).toMatch(/actions\/cache\/save@[0-9a-f]{40}/u);
     expect(action).not.toContain("restore-keys:");
     expect(action).toContain("path: node_modules");
-    expect(action.match(/node-version:\s*"([^"]+)"/u)?.[1]).toBe(NODE_VERSION);
-    expect(workflow).toContain("name: Initialize CI environment");
+    expect(action.match(/inputs:\s*\n\s*node-version:[\s\S]*?\n\s*default:\s*"([^"]+)"/u)?.[1]).toBe(NODE_VERSION);
+    expect(workflow.match(/uses: \.\/\.github\/actions\/setup-node/gu)).toHaveLength(7);
+    expect(workflow.match(/uses: \.\/\.github\/actions\/stage-postgresql/gu)).toHaveLength(2);
     expect(workflow.match(/runs-on: blacksmith-4vcpu-ubuntu-2404/gu)).toHaveLength(2);
-    expect(workflow.match(/uses: \.\/\.github\/actions\/setup-ci/gu)).toHaveLength(3);
-    expect(workflow.match(/runs-on: ubuntu-latest/gu)).toHaveLength(3);
+    expect(workflow.match(/runs-on: ubuntu-latest/gu)).toHaveLength(2);
   });
 
   it("derives exact platform-specific keys without fallback prefixes", () => {

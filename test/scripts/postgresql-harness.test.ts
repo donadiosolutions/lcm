@@ -1117,7 +1117,8 @@ describe("PostgreSQL harness utilities", () => {
         CI: "true",
         LCM_TEST_POSTGRES_INNER_CI: "true",
       });
-      expect(createPostgresqlVitestConfiguration(runnerEnvironment).test.maxWorkers).toBe(4);
+      // The runner environment keeps CI sizing: workers follow the runner's CPUs.
+      expect(createPostgresqlVitestConfiguration(runnerEnvironment, () => 8).test.maxWorkers).toBe(8);
       expect(setupDocker).toHaveBeenCalledWith(expect.arrayContaining([
         "create", "--env-file", join(directory, "runner.env"),
       ]));
