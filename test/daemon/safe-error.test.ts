@@ -4172,6 +4172,36 @@ describe("sanitizeError", () => {
         "https://outer.test/x?next=file://host.invalid/Users/canary/My Files/private.db",
         "https://outer.test/x?next=file://host.invalid<path> Files/private.db",
       ],
+      [
+        "Bug #1374 control an unmatched close ends a query-only child region",
+        "file://h?x=file://g?y=]a&later/Users/secret",
+        "file://h?x=file://g?y=]a&later<path>",
+      ],
+      [
+        "Bug #1374 control an unterminated bracket authority is not a child",
+        "file://h?x=[file://[::1?key=/public&later/Users/secret]",
+        "file://h?x=[file://[::1?key=<path>&later<path>]",
+      ],
+      [
+        "Bug #1374 control a non-hex bracket authority is not a child",
+        "file://h?x=[file://[g::1]?key=/public&later/Users/secret]",
+        "file://h?x=[file://[g::1]?key=<path>&later<path>]",
+      ],
+      [
+        "Bug #1374 control an empty bracket authority is not a child",
+        "file://h?x=[file://[]?key=/public&later/Users/secret]",
+        "file://h?x=[file://[]?key=<path>&later<path>]",
+      ],
+      [
+        "Bug #1374 control a non-hex zone identifier is not a child",
+        "file://h?x=[file://[fe80::1%25eth0]?key=/public&later/Users/secret]",
+        "file://h?x=[file://[fe80::1%25eth0]?key=<path>&later<path>]",
+      ],
+      [
+        "Bug #1374 control a bracket authority truncated at end of message",
+        "file://h?x=file://[",
+        "file://h?x=file://[",
+      ],
     ] as const)("keeps %s byte-stable", (_name, input, expected) => {
       const first = sanitizeError(input);
 
@@ -4308,12 +4338,60 @@ describe("sanitizeError", () => {
         "'https://outer.test/x?next=file://host.invalid/Users/canary/My Files/private.db&other=1'",
         "'https://outer.test/x?next=file://host.invalid<path>&other=1'",
       ],
+      [
+        "Bug #917 an unquoted nested scheme keeping the enclosing quote",
+        "'https://outer.test/x?a=1|https://inner.test/x&file://host.invalid/Users/canary/My Files/private.db'",
+        "'https://outer.test/x?a=1|https://inner.test/x&file://host.invalid<path>'",
+      ],
+      [
+        "Bug #917 a piped nested file child keeping the enclosing quote",
+        "'https://outer.test/x?a=1|https://inner.test/x|file://host.invalid/Users/canary/My Files/private.db'",
+        "'https://outer.test/x?a=1|https://inner.test/x|file://host.invalid<path>'",
+      ],
+      [
+        "Bug #1374 an IPv6 authority child keeping its relative tail",
+        "file://h?x=[file://[::1]?key=/public&later/Users/secret]",
+        "file://h?x=[file://[::1]?key=<path>&later/Users/secret]",
+      ],
+      [
+        "Bug #1374 an IPv4-mapped IPv6 authority child keeping its tail",
+        "file://h?x=[file://[::ffff:1.2.3.4]?key=/public&later/Users/secret]",
+        "file://h?x=[file://[::ffff:1.2.3.4]?key=<path>&later/Users/secret]",
+      ],
     ] as const)("resolves %s in one pass", (_name, input, expected) => {
       const first = sanitizeError(input);
 
       expect(first).toBe(expected);
       expect(sanitizeError(first)).toBe(first);
       expect(sanitizeError(sanitizeError(first))).toBe(first);
+    });
+
+    it("classifies a long word run without rescanning it per character", () => {
+      // Each character used to re-measure the word run it started, so a plain
+      // 32 KB run took 17.8 seconds. The budget is deliberately loose: it fails
+      // only if growth returns to superlinear, not on ordinary host variance.
+      const run = "a".repeat(128_000);
+      const input = `${run}/Users/canary/secret.db`;
+      const started = performance.now();
+
+      const result = sanitizeError(input);
+
+      expect(result).toBe(input);
+      expect(performance.now() - started).toBeLessThan(5_000);
+    });
+
+    it("classifies nested query-only children without rescanning suffixes", () => {
+      // Every nested file child used to walk the whole remaining message, so a
+      // deeply nested query-only chain cost one suffix scan per child.
+      // At this depth the rescanning version measured 6.7s against 0.2s here.
+      const depth = 20_000;
+      const input = `${"file://h?x=[".repeat(depth)}t${"]".repeat(depth)}`;
+      const started = performance.now();
+
+      const result = sanitizeError(input);
+
+      expect(result).toBe(input);
+      expect(performance.now() - started).toBeLessThan(5_000);
     });
   });
 

@@ -11,6 +11,7 @@ const PATH_DELIMITERS = new Set(["#", "&", "=", "|", ",", ";", ":", "!", "?", ")
 const URL_END_DELIMITERS = new Set(["|", ",", ";", ")", "]", "}", "'", '"', "<", ">"]);
 const FILE_URL_AUTHORITY_DELIMITERS = new Set([",", ";", ")", "}", "'"]);
 const NESTED_FILE_URL_DELIMITERS = new Set(["?", "#", "&", "="]);
+const IPV6_AUTHORITY_PATTERN = /^[\dA-Fa-f:.%]$/u;
 
 function isPathWord(char: string | undefined): boolean {
   return char !== undefined && (PATH_WORD_PATTERN.test(char) || "_.-@+~%$*".includes(char));
@@ -71,27 +72,48 @@ function isSingleSlashFileUrlLiteral(chars: readonly string[], index: number): b
   );
 }
 
-function startsWordBearingSlashPath(chars: readonly string[], index: number): boolean {
+function computeWordRunEnds(chars: readonly string[]): Int32Array {
+  // Every path-word run is measured once for the whole message. Without this
+  // table each word-bearing question rescans the run it starts from, so a
+  // single long word makes classification quadratic in the message length.
+  const ends = new Int32Array(chars.length + 1);
+  ends[chars.length] = chars.length;
+  for (let index = chars.length - 1; index >= 0; index -= 1) {
+    ends[index] = isPathWord(chars[index]) ? ends[index + 1] : index;
+  }
+  return ends;
+}
+
+function startsWordBearingSlashPath(
+  chars: readonly string[],
+  index: number,
+  wordRunEnds: Int32Array,
+): boolean {
   if (!isPathWord(chars[index])) return false;
-  let cursor = index + 1;
-  while (isPathWord(chars[cursor])) cursor += 1;
+  const cursor = wordRunEnds[index];
   return chars[cursor] === "/" && isPathWord(chars[cursor + 1]);
 }
 
-function wordBearingPrivateRootPathStart(chars: readonly string[], index: number): number {
+function wordBearingPrivateRootPathStart(
+  chars: readonly string[],
+  index: number,
+  wordRunEnds: Int32Array,
+): number {
   if (!isPathWord(chars[index])) return -1;
-  let cursor = index + 1;
-  while (isPathWord(chars[cursor])) cursor += 1;
+  const cursor = wordRunEnds[index];
   if (chars[cursor] !== "/") return -1;
   const root = chars.slice(cursor + 1, cursor + 6).join("").toLowerCase();
   if (root !== "users" || (chars[cursor + 6] !== "/" && chars[cursor + 6] !== "\\")) return -1;
   return cursor;
 }
 
-function wordBearingWindowsValuePathStart(chars: readonly string[], index: number): number {
+function wordBearingWindowsValuePathStart(
+  chars: readonly string[],
+  index: number,
+  wordRunEnds: Int32Array,
+): number {
   if (!isPathWord(chars[index])) return -1;
-  let cursor = index + 1;
-  while (isPathWord(chars[cursor])) cursor += 1;
+  const cursor = wordRunEnds[index];
   if (chars[cursor] !== "=") return -1;
   const valueStart = cursor + 1;
   return chars[valueStart] === "\\" || isWindowsDrivePathStart(chars, valueStart) ? valueStart : -1;
@@ -107,48 +129,40 @@ interface BracketGroupIndex {
   armedHandoff: Uint8Array;
   queryBearing: Uint8Array;
   whitespace: Uint8Array;
+  wordRunEnds: Int32Array;
 }
 
-function markPathlessChildQuery(
+function pathlessChildQueryStart(
   chars: readonly string[],
   start: number,
   whitespace: Uint8Array,
-  out: Uint8Array,
-): void {
+): number {
   // A nested file child that never reaches a path owns its own query text. Its
   // relative successors stay public until another URL element intervenes, which
-  // is the difference between Bug #1349's controls and the K2 disclosure.
+  // is the difference between Bug #1349's controls and the K2 disclosure. This
+  // reports where that region opens; the walk that classifies groups carries it
+  // forward, so no child rescans the text that follows it.
   let cursor = start + FILE_SCHEME.length + 3;
-  while (cursor < chars.length) {
-    const char = chars[cursor];
-    if (char === "?" || char === "#") break;
-    if (char === "/" || char === "\\" || char === "[" || char === "]" || char === "|" || char === "&") return;
-    if (whitespace[cursor] === 1) return;
+  if (chars[cursor] === "[") {
+    // A bracketed IPv6 authority is host syntax rather than a wrapper boundary,
+    // so an address-literal child is still eligible for query-only ownership.
+    const authorityStart = cursor + 1;
+    cursor += 1;
+    while (IPV6_AUTHORITY_PATTERN.test(chars[cursor] ?? "")) cursor += 1;
+    if (cursor === authorityStart || chars[cursor] !== "]") return -1;
     cursor += 1;
   }
-  let nested = 0;
-  for (let index = cursor; index < chars.length; index += 1) {
-    const char = chars[index];
-    if (char === "[") {
-      // A sibling wrapper keeps its own ownership, and the query resumes after
-      // it closes, so the child's region spans the nested group rather than
-      // ending at it.
-      nested += 1;
-      continue;
-    }
-    if (char === "]") {
-      if (nested === 0) return;
-      nested -= 1;
-      continue;
-    }
-    if (nested > 0) continue;
-    if (char === "'" || char === '"' || whitespace[index] === 1) return;
-    if (isFileUrlLiteral(chars, index) || isOwnershipSchemeColon(chars, index)) return;
-    out[index] = 1;
+  while (cursor < chars.length) {
+    const char = chars[cursor];
+    if (char === "?" || char === "#") return cursor;
+    if (char === "/" || char === "\\" || char === "[" || char === "]" || char === "|" || char === "&") return -1;
+    if (whitespace[cursor] === 1) return -1;
+    cursor += 1;
   }
+  return -1;
 }
 
-function startsRootedValue(chars: readonly string[], index: number): boolean {
+function startsRootedValue(chars: readonly string[], index: number, wordRunEnds: Int32Array): boolean {
   const char = chars[index];
   if (char === "/") {
     const previous = chars[index - 1];
@@ -161,7 +175,10 @@ function startsRootedValue(chars: readonly string[], index: number): boolean {
     const root = chars.slice(index + 1, index + 6).join("").toLowerCase();
     return root === "users" && (chars[index + 6] === "/" || chars[index + 6] === "\\");
   }
-  return isWindowsDrivePathStart(chars, index) || wordBearingPrivateRootPathStart(chars, index) >= 0;
+  return (
+    isWindowsDrivePathStart(chars, index) ||
+    wordBearingPrivateRootPathStart(chars, index, wordRunEnds) >= 0
+  );
 }
 
 function isOwnershipSchemeColon(chars: readonly string[], index: number): boolean {
@@ -185,6 +202,7 @@ function classifyBracketGroups(chars: readonly string[]): BracketGroupIndex {
   const depth = new Int32Array(chars.length);
   const childCloseOwner = new Uint8Array(chars.length);
   const pathlessChildQuery = new Uint8Array(chars.length);
+  const pathlessChildQueryStarts = new Uint8Array(chars.length);
   const armedHandoff: number[] = [0];
   const queryBearing: number[] = [0];
   const whitespace = new Uint8Array(chars.length);
@@ -193,15 +211,20 @@ function classifyBracketGroups(chars: readonly string[]): BracketGroupIndex {
   for (let index = 0; index < chars.length; index += 1) {
     if (WHITESPACE_PATTERN.test(chars[index])) whitespace[index] = 1;
   }
+  // Word-run ends are shared the same way, so both passes answer word-bearing
+  // questions in constant time instead of rescanning the run each time.
+  const wordRunEnds = computeWordRunEnds(chars);
   const urlBearing: number[] = [0];
   const fileChildBearing: number[] = [0];
   const rootedBearing: number[] = [0];
+  const pathlessQueryActive: number[] = [0];
   const openGroup = (): number => {
     urlBearing.push(0);
     fileChildBearing.push(0);
     rootedBearing.push(0);
     armedHandoff.push(0);
     queryBearing.push(0);
+    pathlessQueryActive.push(0);
     return urlBearing.length - 1;
   };
   let stack = [0];
@@ -247,7 +270,28 @@ function classifyBracketGroups(chars: readonly string[]): BracketGroupIndex {
     const current = stack[stack.length - 1];
     groupOf[index] = current;
     depth[index] = stack.length - 1;
-    if ((char === "|" || char === "&") && (inUrlSpan || spanEndAdjacent) && startsRootedValue(chars, index + 1)) {
+    if (pathlessChildQueryStarts[index] === 1) pathlessQueryActive[current] = 1;
+    if (pathlessQueryActive[current] === 1) {
+      // The region is held on the group that opened it, so a sibling wrapper
+      // keeps its own ownership and the query resumes after that wrapper
+      // closes. An unmatched close, a quote, or another URL element releases
+      // it. Carrying the region here is what keeps the pre-pass linear.
+      if (
+        char === "]" ||
+        quoteCode(char) !== 0 ||
+        isFileUrlLiteral(chars, index) ||
+        isOwnershipSchemeColon(chars, index)
+      ) {
+        pathlessQueryActive[current] = 0;
+      } else {
+        pathlessChildQuery[index] = 1;
+      }
+    }
+    if (
+      (char === "|" || char === "&") &&
+      (inUrlSpan || spanEndAdjacent) &&
+      startsRootedValue(chars, index + 1, wordRunEnds)
+    ) {
       // The first rooted successor handed off by an ending URL span arms this
       // wrapper. Later rooted successors in the same wrapper stay owned, which
       // is why a repeated pipe does not silently leak.
@@ -269,7 +313,8 @@ function classifyBracketGroups(chars: readonly string[]): BracketGroupIndex {
       const previous = chars[index - 1];
       if (stack.length > 1 || (previous !== undefined && (NESTED_FILE_URL_DELIMITERS.has(previous) || previous === "|"))) {
         fileChildBearing[current] = 1;
-        markPathlessChildQuery(chars, index, whitespace, pathlessChildQuery);
+        const queryStart = pathlessChildQueryStart(chars, index, whitespace);
+        if (queryStart >= 0) pathlessChildQueryStarts[queryStart] = 1;
       }
       inUrlSpan = true;
       continue;
@@ -278,7 +323,7 @@ function classifyBracketGroups(chars: readonly string[]): BracketGroupIndex {
       urlBearing[current] = 1;
       inUrlSpan = true;
     }
-    if (startsRootedValue(chars, index)) rootedBearing[current] = 1;
+    if (startsRootedValue(chars, index, wordRunEnds)) rootedBearing[current] = 1;
   }
 
   return {
@@ -289,6 +334,7 @@ function classifyBracketGroups(chars: readonly string[]): BracketGroupIndex {
     armedHandoff: Uint8Array.from(armedHandoff),
     queryBearing: Uint8Array.from(queryBearing),
     whitespace,
+    wordRunEnds,
     urlBearing: Uint8Array.from(urlBearing),
     fileChildBearing: Uint8Array.from(fileChildBearing),
   };
@@ -469,10 +515,10 @@ function findUrlPathStarts(chars: readonly string[]): UrlPathStarts {
     }
     if ((quotedQueryTail || quotedQueryPublicUrl) && char === "&") {
       const privateRootPathStart = quotedQueryPublicUrl
-        ? wordBearingPrivateRootPathStart(chars, index + 1)
+        ? wordBearingPrivateRootPathStart(chars, index + 1, groups.wordRunEnds)
         : -1;
       const windowsValuePathStart = quotedQueryPublicUrl
-        ? wordBearingWindowsValuePathStart(chars, index + 1)
+        ? wordBearingWindowsValuePathStart(chars, index + 1, groups.wordRunEnds)
         : -1;
       if (chars[index + 1] === "/") {
         forcedPath[index + 1] = 1;
@@ -487,7 +533,7 @@ function findUrlPathStarts(chars: readonly string[]): UrlPathStarts {
       } else if (
         quotedQueryPublicUrl &&
         !quotedQueryPublicUrlOwnQueryOrFragment &&
-        startsWordBearingSlashPath(chars, index + 1)
+        startsWordBearingSlashPath(chars, index + 1, groups.wordRunEnds)
       ) {
         // A later word-bearing parameter resumes the surrounding quoted-file
         // query without treating named public URL parameters as private paths.
@@ -566,7 +612,7 @@ function findUrlPathStarts(chars: readonly string[]): UrlPathStarts {
       (char === "&" || char === "|")
     ) {
       const wordBearingPrivatePathStart = queryOrFragment
-        ? wordBearingPrivateRootPathStart(chars, index + 1)
+        ? wordBearingPrivateRootPathStart(chars, index + 1, groups.wordRunEnds)
         : -1;
       const returnsToParent =
         !queryOrFragment ||
@@ -597,7 +643,11 @@ function findUrlPathStarts(chars: readonly string[]): UrlPathStarts {
       groups.fileChildBearing[groups.groupOf[index]] === 1 &&
       groups.pathlessChildQuery[index] === 0
     ) {
-      const retainedPrivateRootStart = wordBearingPrivateRootPathStart(chars, index + 1);
+      const retainedPrivateRootStart = wordBearingPrivateRootPathStart(
+        chars,
+        index + 1,
+        groups.wordRunEnds,
+      );
       if (retainedPrivateRootStart >= 0) {
         forcedPath[retainedPrivateRootStart] = 1;
         // A public child that ends here returns the wrapper to its own grammar.
@@ -893,8 +943,15 @@ function findUrlPathStarts(chars: readonly string[]): UrlPathStarts {
       authority[index + 1] = 1;
       authority[index + 2] = 1;
       exactFileScheme = schemeLength === FILE_SCHEME.length && fileSchemeLength === FILE_SCHEME.length;
-      enclosingSchemeQuote = schemeQuote;
-      spacedFileTailPending = false;
+      // Bug #917: an unquoted nested scheme does not close the quote around the
+      // URL that contains it, so the enclosing boundary survives until its own
+      // closing delimiter. Clearing it here let a later nested file tail lose
+      // the quote that still bounds it and stop at the first space.
+      if (schemeQuote !== 0 || enclosingSchemeQuote === 0) enclosingSchemeQuote = schemeQuote;
+      // A file URL that arrives on a delimiter this branch handles is bounded
+      // by the same enclosing quote as one reached through a query delimiter,
+      // so both routes agree on whether a space can end its path.
+      spacedFileTailPending = exactFileScheme && schemeQuote === 0 && enclosingSchemeQuote !== 0;
       foundFilePath = false;
       filePathBracketDepth = 0;
       continue;
