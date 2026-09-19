@@ -35,7 +35,9 @@ filters, collection time and source availability independently.
 
 Secret Scanning requires an additional intake step: use the endpoint above, strip
 the `secret` field and other credential-bearing fields in process before output or
-persistence, then invoke `triage-finding` on sanitized supplied claims. Project
+persistence, then invoke `triage-finding` on sanitized supplied claims using its
+existing `freeform` source type, retaining the namespaced alert ID and redacted
+provenance. Do not invent a Secret Scanning enum in that skill's schema. Project
 metadata through an allowlist; review descriptions, messages and location snippets
 for embedded credentials too. Never stream raw API responses or error bodies into
 tool output, debug logs, files, model context or memory. Preserve type, source ID,
@@ -88,6 +90,8 @@ A supplied CSV is a dated snapshot. Record provenance and hash; do not infer exp
 time from detection time or filename alone. Reconcile live membership/status before
 claiming an all-current-alerts freeze. If access is unavailable, assess it only as
 an explicitly user-selected snapshot scope; pending live resolution stays pending.
+Pass cloud CSV claims to `triage-finding` as `freeform`, preserving `finding_url`
+and supplied scan/commit provenance rather than inventing local scan occurrence IDs.
 
 ## Source writes and proof
 
