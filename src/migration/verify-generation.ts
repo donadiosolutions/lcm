@@ -987,11 +987,67 @@ export function totalsFor(mismatches: readonly MigrationVerificationMismatch[]):
 export function truncateMismatchesPerClass(
   mismatches: readonly MigrationVerificationMismatch[],
 ): MigrationVerificationMismatch[] {
-  const perClassRetained = new Map<MigrationMismatchClass, number>();
+  // Round-1 candidate review 2, P1: truncating per class alone (ignoring
+  // domain) could keep the frozen limit's worth of entries entirely from
+  // one early domain and drop every entry from a later domain in the
+  // same class -- but the full, untruncated totals still record that
+  // later domain's count, and the report body's own consistency check
+  // requires every total to have at least one retained entry. A badly
+  // diverged multi-domain destination (for example 150 relation
+  // mismatches on one domain plus 1 on another) then threw
+  // "a mismatch total has no recorded entries" before persist, instead
+  // of producing either a refused report or operator evidence -- for
+  // exactly the destination this evidence path exists to serve.
+  //
+  // Truncate per (domain, class) pair instead, via round-robin across
+  // the domains present in each class: visit every domain with at least
+  // one mismatch in that class once per round, in the order those
+  // domains first appear (already frozen-sort order, since the input
+  // arrives pre-sorted domain-major), so every present domain keeps at
+  // least one entry before any domain's second entry is kept. The
+  // class-wide total retained can never exceed the frozen limit, and at
+  // most 24 domains exist in this schema, so "one entry per present
+  // domain" always fits inside a 100-entry budget with room to spare.
+  const listsByKey = new Map<string, MigrationVerificationMismatch[]>();
+  const domainsByClass = new Map<MigrationMismatchClass, MigrationReconciliationDomain[]>();
+  for (const mismatch of mismatches) {
+    const key = mismatch.domain + "\u0000" + mismatch.class;
+    let list = listsByKey.get(key);
+    if (list === undefined) {
+      list = [];
+      listsByKey.set(key, list);
+      let domains = domainsByClass.get(mismatch.class);
+      if (domains === undefined) { domains = []; domainsByClass.set(mismatch.class, domains); }
+      domains.push(mismatch.domain);
+    }
+    list.push(mismatch);
+  }
+  const keepByKey = new Map<string, number>();
+  for (const [klass, domains] of domainsByClass) {
+    const available = domains.map((domain) => listsByKey.get(domain + "\u0000" + klass)!.length);
+    const keep = new Array<number>(domains.length).fill(0);
+    let remaining = MIGRATION_MISMATCH_CLASS_TRUNCATION_LIMIT;
+    for (let progressed = true; remaining > 0 && progressed;) {
+      progressed = false;
+      for (let index = 0; index < domains.length && remaining > 0; index += 1) {
+        if (keep[index]! < available[index]!) {
+          keep[index] = keep[index]! + 1;
+          remaining -= 1;
+          progressed = true;
+        }
+      }
+    }
+    domains.forEach((domain, index) => keepByKey.set(domain + "\u0000" + klass, keep[index]!));
+  }
+  const takenByKey = new Map<string, number>();
   return mismatches.filter((mismatch) => {
-    const retained = perClassRetained.get(mismatch.class) ?? 0;
-    perClassRetained.set(mismatch.class, retained + 1);
-    return retained < MIGRATION_MISMATCH_CLASS_TRUNCATION_LIMIT;
+    const key = mismatch.domain + "\u0000" + mismatch.class;
+    const taken = takenByKey.get(key) ?? 0;
+    // Every key here was inserted into keepByKey above, since it can
+    // only exist if mismatches contained at least one entry for it.
+    if (taken >= keepByKey.get(key)!) return false;
+    takenByKey.set(key, taken + 1);
+    return true;
   });
 }
 

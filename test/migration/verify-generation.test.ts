@@ -1564,6 +1564,67 @@ describe("truncateMismatchesPerClass", () => {
     // a sorted sequence can never reorder it.
     expect(truncated.filter((mismatch) => mismatch.class === "count")).toEqual(overLimit.slice(0, 100));
   });
+
+  it("round-2 P1 red case: truncating per class alone orphans a second domain's total, through the real report constructor", () => {
+    // The defect: 150 relation mismatches on "machines" plus 1 on
+    // "project" retained the frozen limit's worth of entries entirely
+    // from "machines" (the earlier domain in frozen order) and dropped
+    // every "project" entry in the same class -- but totalsFor still
+    // recorded (project, relation, 1) from the untruncated list, and
+    // createMigrationVerificationReportBody's own consistency check
+    // refuses any total with zero retained entries. A wrong-parent
+    // failure spanning two domains therefore threw before persist
+    // instead of producing a refused report or operator evidence, for
+    // exactly the badly diverged destination this path exists to serve.
+    const machinesMismatches = Array.from({ length: 150 }, (_, index) => ({
+      domain: "machines" as const, class: "relation" as const,
+      identitySha256: fakeHash(`relation-machines-${String(index).padStart(4, "0")}`),
+    }));
+    const projectMismatches = [{ domain: "project" as const, class: "relation" as const, identitySha256: fakeHash("relation-project-0") }];
+    const order = [...PORTABLE_RECORD_DOMAIN_ORDER, "schema", "ledger", "public-listing", "public-search"] as const;
+    const fullMismatches = sortMismatches([...machinesMismatches, ...projectMismatches], order);
+    const mismatchTotals = sortMismatches(
+      totalsFor(fullMismatches) as unknown as typeof fullMismatches, order,
+    ).map((total) => ({ domain: total.domain, class: total.class, count: (total as unknown as { count: number }).count }));
+    expect(mismatchTotals).toEqual(expect.arrayContaining([
+      { domain: "machines", class: "relation", count: 150 },
+      { domain: "project", class: "relation", count: 1 },
+    ]));
+    const truncated = truncateMismatchesPerClass(fullMismatches);
+    // Every domain that had a mismatch in this class keeps at least one
+    // retained entry: the orphan this test exists to catch would show up
+    // here as an empty array for "project".
+    expect(truncated.filter((mismatch) => mismatch.domain === "project" && mismatch.class === "relation")).toHaveLength(1);
+    expect(truncated.filter((mismatch) => mismatch.class === "relation")).toHaveLength(100);
+    const domainVector = <T>(build: (domain: PortableDomain, index: number) => T): T[] => PORTABLE_RECORD_DOMAIN_ORDER.map(build);
+    expect(() => createMigrationVerificationReportBody({
+      generationId: "generation-1", targetGenerationId: "generation-1-postgresql",
+      bindingSha256: HASH_A, manifestRevision: 1, manifestChecksumSha256: HASH_A,
+      sourceWitness: { version: 1, identitySha256: HASH_A, schemaSha256: HASH_A, contentSha256: HASH_A },
+      destinationIdentity: { version: 1, sealedWitnessSha256: HASH_A, systemIdentifier: "712345" },
+      destinationSchemaWitness: {
+        version: 1, migrationsSha256: HASH_A, searchConfigurationSha256: HASH_A,
+        collationSha256: HASH_A, sequenceStateSha256: HASH_A,
+      },
+      projectMapWitnessSha256: HASH_A,
+      queueClassificationWitness: {
+        version: 1, queueCutoff: null, queueSetSha256: HASH_A, receiptSetSha256: HASH_A, epochChecksumSha256: HASH_A,
+      },
+      censusVector: {
+        version: 1,
+        domains: domainVector((domain, index) => ({ domain, recordCount: index, prefixSha256: fakeHash("c" + domain) })),
+        contentSha256: HASH_A,
+      },
+      canonicalDelta: {
+        version: 1,
+        domains: domainVector((domain, index) => ({ domain, recordCount: index, terminalIdentitySha256: fakeHash("d" + domain) })),
+      },
+      classCoverage: MIGRATION_MISMATCH_CLASSES.map((mismatchClass) => ({ class: mismatchClass, ran: true })),
+      publicProbeSha256: HASH_A,
+      sampleParameters: { version: 1, strideOrdinal: 97, sampleCount: 32, seedBasisSha256: HASH_A },
+      mismatches: truncated, mismatchTotals,
+    })).not.toThrow();
+  });
 });
 
 describe("verifyMigrationGeneration: destination identity comparison", () => {

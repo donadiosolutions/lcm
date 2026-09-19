@@ -663,16 +663,27 @@ gates on. The report binds a versioned ordering marker together with the
 probe's own digest specifically so this ordering fact travels with the
 report rather than depending on prose alone.
 
-### Mismatch evidence is truncated per class, never the exact count
+### Mismatch evidence is truncated per (domain, class) pair, never the exact count
 
 A single mismatch class is capped at 100 retained entries in the persisted
-report, regardless of how many domains it spans. This exists so a badly
-diverged destination -- the case where operator evidence matters most --
-still produces a persisted report instead of an in-process failure with no
-evidence at all. The **exact** total for each (domain, class) pair is always
-recorded separately from the retained entries and is never itself truncated;
-an operator reading a report with a truncated class sees both the 100 (or
-fewer) example entries and the true total.
+report, allocated fairly across every domain that class spans rather than
+consumed entirely by whichever domain sorts first: every domain with at
+least one mismatch in a class keeps at least one retained entry, and the
+remaining budget is distributed round-robin across those domains in frozen
+order. This exists so a badly diverged destination -- the case where
+operator evidence matters most -- still produces a persisted report instead
+of an in-process failure with no evidence at all, even when the failure
+spans more than one domain in the same class. Truncating per class alone,
+ignoring domain, could retain the full 100-entry budget from a single early
+domain and drop every entry from a later domain in the same class, while
+that later domain's **exact** total is still recorded separately -- and the
+report's own consistency check refuses to persist a total with zero
+retained entries, so a multi-domain failure produced neither a refused
+report nor evidence under that scheme. The exact total for each
+(domain, class) pair is always recorded separately from the retained
+entries and is never itself truncated; an operator reading a report with a
+truncated class sees both the retained example entries (at least one per
+affected domain) and the true total for every domain that class spans.
 
 ### Verification cost scales with the rows in scope
 
