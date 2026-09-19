@@ -114,8 +114,10 @@ login allowance, and source-update evidence. It does not start a fresh campaign.
 
 Default execution continues through fixes, required reviews/checks, merge, and
 verified source resolution. Narrower requests such as triage-only or draft-only
-are honored. A merged PR is not enough: Dependabot and Code Scanning must report
-the fix, and every grouped alert must meet its own acceptance criteria.
+are honored. A merged PR is not enough: independently confirm closure in every
+applicable source, including Dependabot, Code Scanning, Secret Scanning and Codex
+Security. Dependabot and Code Scanning must report the fix, and every grouped alert
+must meet its own acceptance criteria and have its source state read back.
 
 Secret removal from code does not prove credential revocation. The agent does not
 replay discovered credentials or rotate/revoke external credentials without the

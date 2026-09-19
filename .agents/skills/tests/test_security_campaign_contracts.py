@@ -97,6 +97,12 @@ class SecurityCampaignContractTests(unittest.TestCase):
             self.assertIn(marker, text)
         self.assertRegex(text, r"at most|maximum|no more than")
 
+    def test_secret_inventory_includes_generic_patterns_or_blocks_freeze(self):
+        text = self.read("references/sources.md").lower()
+        for marker in ("generic patterns", "secret_type", "enabled", "paginate",
+                       "coverage gap", "block s0 freeze"):
+            self.assertIn(marker, text)
+
     def test_triage_contract_enforces_freeze_group_barrier_and_safe_resolution(self):
         text = self.read("references/triage.md").lower()
         for marker in ("freeze", "s0", "every", "group", "root cause", "blocks implementation",

@@ -26,6 +26,16 @@ The requested endpoints are:
 | Code Scanning | `/repos/{owner}/{repo}/code-scanning/alerts`, all open alerts including instances and their refs/commit SHAs |
 | Secret Scanning | `/repos/{owner}/{repo}/secret-scanning/alerts`, `state=open`, all alert categories available to the account, plus relevant locations |
 
+Secret Scanning's default query returns default patterns, not generic patterns.
+Establish the repository's enabled generic token names from its authorized
+configuration and the current supported-pattern documentation. In addition to the
+default query, request those names explicitly with `secret_type`, paginate each
+selection and union the results by native alert identity. Record the enabled names
+and query coverage, including evidence when no generic patterns are enabled. If the
+enabled set or its complete enumeration is unavailable, record a coverage gap and
+block S0 freeze; only an explicit user scope reduction permits a limited inventory.
+Do not infer complete Secret Scanning coverage from a successful default query.
+
 Use explicit GET and `gh api --paginate`, following every next page for alerts and
 locations/instances. Check process exit and page completeness before accepting a
 source; never accept truncated stdout or partial pages. Avoid severity, tool, path,
