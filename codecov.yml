@@ -454,6 +454,8 @@ component_management:
         - "^src/daemon/lifecycle-scope\\.ts$"
         - "^src/daemon/lifecycle\\.ts$"
         - "^src/daemon/managed-credentials\\.ts$"
+        # #1450 keeps stable managed PATH canonicalization and direct executable
+        # admission in this existing service-manager owner.
         - "^src/daemon/managed-path\\.ts$"
         # #786/#952 creation-only daemon-tmp rollback remains service-manager owned.
         - "^src/daemon/supervisor\\.ts$"

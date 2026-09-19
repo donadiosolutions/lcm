@@ -349,6 +349,8 @@ const expectedComponents = [
       "^src/daemon/lifecycle-scope\\.ts$",
       "^src/daemon/lifecycle\\.ts$",
       "^src/daemon/managed-credentials\\.ts$",
+      // #1450 keeps stable managed PATH canonicalization and direct executable
+      // admission in this existing service-manager owner.
       "^src/daemon/managed-path\\.ts$",
       "^src/daemon/supervisor\\.ts$",
     ],
@@ -625,7 +627,7 @@ describe("Codecov configuration", () => {
     expect(ownershipCounts.size).toBe(243);
   });
 
-  test("keeps response-fence and #681/#700/#701/#703/#705/#709/#710/#713/#756/#726/#734/#737/#742/#760/#763/#804/#805/#824/#825/#833/#888/#864/#866/#722/#786/#952/#814/#882/#930/#969/#989/#1003/#1049/#964/#1106/#1191/#1196/#1229/#1321/#1338/#1347/#1353/#1354/#1356/#1357/#1358/#1403 files in their intended components", () => {
+  test("keeps response-fence and #681/#700/#701/#703/#705/#709/#710/#713/#756/#726/#734/#737/#742/#760/#763/#804/#805/#824/#825/#833/#888/#864/#866/#722/#786/#952/#814/#882/#930/#969/#989/#1003/#1049/#964/#1106/#1191/#1196/#1229/#1321/#1338/#1347/#1353/#1354/#1356/#1357/#1358/#1403/#1450 files in their intended components", () => {
     const config = readCodecovConfig();
     expect(config).toBeDefined();
     if (config === undefined) {
@@ -807,6 +809,9 @@ describe("Codecov configuration", () => {
       // convergence, and bounded birth samples in the service-manager component.
       ["src/daemon/lifecycle-scope.ts", "integration-service-managers"],
       ["src/daemon/lifecycle.ts", "integration-service-managers"],
+      // #1450 keeps canonical stable managed PATH construction and direct
+      // executable admission in the existing service-manager owner.
+      ["src/daemon/managed-path.ts", "integration-service-managers"],
       ["src/daemon/supervisor.ts", "integration-service-managers"],
       // #837 consumer-admission descriptor cleanup remains storage-owned.
       // #1042 consumer descriptor cleanup and typed error classification remain storage-owned.

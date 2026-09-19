@@ -81,6 +81,28 @@ describe("stable managed daemon PATH canonicalization", () => {
     },
   );
 
+  it("emits the canonical home directory for a checkout-symlinked direct .codex executable", () => {
+    const root = mkdtempSync(join(tmpdir(), "lcm-managed-path-real-fs-"));
+    fixtureRoots.push(root);
+    const home = join(root, "home");
+    const checkout = join(root, "checkout");
+    const canonicalExecutableDir = join(home, ".codex", "plugins", "cache", "lcm", "1.4.0");
+    mkdirSync(canonicalExecutableDir, { recursive: true });
+    mkdirSync(checkout);
+    symlinkSync(join(home, ".codex"), join(checkout, ".codex"), "dir");
+
+    const managedPath = managedDaemonPathForStableLaunch(
+      "/usr/bin/node",
+      [join(checkout, ".codex", "plugins", "cache", "lcm", "1.4.0", "lcm.mjs"), "daemon", "start"],
+      join(root, "state"),
+      home,
+    );
+
+    expect(managedPath).toBe(`${canonicalExecutableDir}:${SYSTEMD_DAEMON_PATH}`);
+    expect(managedPath.split(":"))
+      .not.toContain(join(checkout, ".codex", "plugins", "cache", "lcm", "1.4.0"));
+  });
+
   it("rejects a canonical stable bin whose realpath introduces the PATH delimiter", () => {
     const root = mkdtempSync(join(tmpdir(), "lcm-managed-path-real-fs-"));
     fixtureRoots.push(root);
@@ -103,6 +125,24 @@ describe("stable managed daemon PATH canonicalization", () => {
         "daemon",
         "start",
       ],
+      join(root, "state"),
+      homeAlias,
+    );
+
+    expect(managedPath).toBe(SYSTEMD_DAEMON_PATH);
+  });
+
+  it("rejects a canonical direct stable directory whose realpath introduces the PATH delimiter", () => {
+    const root = mkdtempSync(join(tmpdir(), "lcm-managed-path-real-fs-"));
+    fixtureRoots.push(root);
+    const canonicalHome = join(root, "home:canonical");
+    const homeAlias = join(root, "home-alias");
+    mkdirSync(join(canonicalHome, ".codex", "plugins", "cache", "lcm", "1.4.0"), { recursive: true });
+    symlinkSync(canonicalHome, homeAlias, "dir");
+
+    const managedPath = managedDaemonPathForStableLaunch(
+      "/usr/bin/node",
+      [join(homeAlias, ".codex", "plugins", "cache", "lcm", "1.4.0", "lcm.mjs"), "daemon", "start"],
       join(root, "state"),
       homeAlias,
     );

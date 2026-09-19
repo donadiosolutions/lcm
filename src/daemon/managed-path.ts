@@ -67,11 +67,6 @@ function trustedInstallationDirectory(
   const canonicalDirectory = requireCanonicalHome && installationRoot
     ? canonicalPath(directory)
     : directory;
-  if (
-    requireCanonicalHome
-    && synthesizedNpmBin
-    && canonicalDirectory?.includes(delimiter)
-  ) return undefined;
   const canonicalInstallationRoot = requireCanonicalHome && canonicalDirectory && installationRoot
     ? homeScopedInstallationRoot(canonicalDirectory, synthesizedNpmBin)
     : installationRoot;
@@ -81,8 +76,15 @@ function trustedInstallationDirectory(
     && canonicalDirectory !== undefined
     && relative(homeDirectory, canonicalInstallationRoot) === ""
     && isWithin(canonicalDirectory, homeDirectory);
-  const installationRootOutsideHome = installationRoot !== undefined && !installationRootAtHome;
+  const installationRootOutsideHome = homeDirectory !== undefined
+    && installationRoot !== undefined
+    && !installationRootAtHome;
   if (requireCanonicalHome && synthesizedNpmBin && !installationRootAtHome) return undefined;
+  if (
+    requireCanonicalHome
+    && (synthesizedNpmBin || installationRootAtHome)
+    && canonicalDirectory?.includes(delimiter)
+  ) return undefined;
   if (requireCanonicalHome && installationRootOutsideHome) {
     // Recognized user-installation layouts are trusted only below the
     // canonical home root. This keeps checkout-controlled .codex/.claude and
@@ -102,7 +104,9 @@ function trustedInstallationDirectory(
     (isWithin(directory, workingDirectory) || isWithin(workingDirectory, directory))
     && !installationRootAtHome
   ) return undefined;
-  return requireCanonicalHome && synthesizedNpmBin ? canonicalDirectory : directory;
+  return requireCanonicalHome && (synthesizedNpmBin || installationRootAtHome)
+    ? canonicalDirectory
+    : directory;
 }
 
 function npmGlobalBinForEntrypoint(path: string): string | undefined {

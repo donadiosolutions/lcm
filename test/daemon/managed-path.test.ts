@@ -334,6 +334,18 @@ describe("managed daemon executable path", () => {
     )).toBe(SYSTEMD_DAEMON_PATH);
   });
 
+  it("retains a directly observed .nvm node when implicit home authentication fails", () => {
+    const node = "/srv/isolated-home/.nvm/versions/node/v25.9.0/bin/node";
+    platformMocks.homedir.mockReturnValue("/srv/isolated-home");
+    platformMocks.userInfo.mockImplementationOnce(() => { throw new Error("lookup failed"); });
+
+    expect(managedDaemonPathForStableLaunch(
+      node,
+      ["/opt/lcm/lcm.mjs", "daemon", "start"],
+      "/var/lib/lcm",
+    )).toBe(`/opt/lcm:${"/srv/isolated-home/.nvm/versions/node/v25.9.0/bin"}:${SYSTEMD_DAEMON_PATH}`);
+  });
+
   it("withdraws implicit home trust when account lookup or home stat fails", () => {
     const uid = typeof process.getuid === "function" ? process.getuid() : 1000;
     platformMocks.homedir.mockReturnValue("/srv/isolated-home");
