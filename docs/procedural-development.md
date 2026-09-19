@@ -89,6 +89,14 @@ owner creates an actionable issue for every deferred P2, with the source
 item and review evidence. Its PR link may remain pending until publication, which
 must fill that link before merge.
 
+Callers may explicitly set `FOLLOWUP_CHANNEL=private-record` to retain deferred
+findings in their private campaign directory instead of publishing GitHub issues.
+The default is `github-issue`; existing Bug and Epic campaigns keep that behavior.
+Both channels require acceptance criteria, an owner, source and candidate links,
+review/reproduction evidence, and a completed PR link before merge. Private records
+remain outside the original inventory and their contents are not copied into public
+PR text.
+
 The workflow completes only after every supplied issue has an accounted outcome
 and required publication and merge steps have finished. It reports limitations
 such as an external dependency, unavailable access, unavailable exact model
