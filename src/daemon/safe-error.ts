@@ -124,6 +124,7 @@ interface BracketGroupIndex {
   depth: Int32Array;
   urlBearing: Uint8Array;
   fileChildBearing: Uint8Array;
+  filePathChildBearing: Uint8Array;
   childCloseOwner: Uint8Array;
   pathlessChildQuery: Uint8Array;
   armedHandoff: Uint8Array;
@@ -181,16 +182,20 @@ function startsRootedValue(chars: readonly string[], index: number, wordRunEnds:
   );
 }
 
-function isOwnershipSchemeColon(chars: readonly string[], index: number): boolean {
+function ownershipSchemeStart(chars: readonly string[], index: number): number {
   // A scheme colon needs at least two scheme characters, so a Windows drive
   // letter carries rooted data rather than URL syntax, and a value character
   // after the colon, so ordinary prose punctuation is not read as a scheme.
-  if (chars[index] !== ":") return false;
-  if (!isPathWord(chars[index + 1]) && chars[index + 1] !== "/") return false;
+  if (chars[index] !== ":") return -1;
+  if (!isPathWord(chars[index + 1]) && chars[index + 1] !== "/") return -1;
   let start = index;
   while (start > 0 && URL_SCHEME_CHARACTER_PATTERN.test(chars[start - 1])) start -= 1;
-  if (!URL_SCHEME_START_PATTERN.test(chars[start])) return false;
-  return index - start >= 2;
+  if (!URL_SCHEME_START_PATTERN.test(chars[start])) return -1;
+  return index - start >= 2 ? start : -1;
+}
+
+function isOwnershipSchemeColon(chars: readonly string[], index: number): boolean {
+  return ownershipSchemeStart(chars, index) >= 0;
 }
 
 function classifyBracketGroups(chars: readonly string[]): BracketGroupIndex {
@@ -216,11 +221,16 @@ function classifyBracketGroups(chars: readonly string[]): BracketGroupIndex {
   const wordRunEnds = computeWordRunEnds(chars);
   const urlBearing: number[] = [0];
   const fileChildBearing: number[] = [0];
+  // A child that reached a path returns ownership to every wrapper that
+  // outlives it, unlike fileChildBearing, which expires with the wrapper that
+  // held the child so a query-only child keeps its relative tail public.
+  const filePathChildBearing: number[] = [0];
   const rootedBearing: number[] = [0];
   const pathlessQueryActive: number[] = [0];
   const openGroup = (): number => {
     urlBearing.push(0);
     fileChildBearing.push(0);
+    filePathChildBearing.push(0);
     rootedBearing.push(0);
     armedHandoff.push(0);
     queryBearing.push(0);
@@ -230,18 +240,31 @@ function classifyBracketGroups(chars: readonly string[]): BracketGroupIndex {
   let stack = [0];
   let inUrlSpan = false;
   let spanEndAdjacent = false;
+  // The quote that opened the current URL span, if any. Bug #917: a space
+  // inside a quoted URL belongs to that URL, so it must not end ownership here
+  // either, or the two passes disagree about the shape and the first result is
+  // no longer stable.
+  let spanQuote = 0;
 
   for (let index = 0; index < chars.length; index += 1) {
     const char = chars[index];
     if (whitespace[index] === 1) {
+      if (spanQuote !== 0 && (char === " " || char === "\t")) {
+        const held = stack[stack.length - 1];
+        groupOf[index] = held;
+        depth[index] = stack.length - 1;
+        continue;
+      }
       // Whitespace is a hard ownership boundary, matching the scanner reset, so
       // a later wrapper cannot inherit facts from text before the gap.
       inUrlSpan = false;
+      spanQuote = 0;
       stack = [openGroup()];
       groupOf[index] = stack[0];
       depth[index] = 0;
       continue;
     }
+    if (spanQuote !== 0 && quoteCode(char) === spanQuote) spanQuote = 0;
     if (char === "[") {
       const opened = openGroup();
       stack.push(opened);
@@ -258,6 +281,7 @@ function classifyBracketGroups(chars: readonly string[]): BracketGroupIndex {
       // it expires with the wrapper that held the child.
       if (urlBearing[closed] === 1) urlBearing[parent] = 1;
       if (rootedBearing[closed] === 1) rootedBearing[parent] = 1;
+      if (filePathChildBearing[closed] === 1) filePathChildBearing[parent] = 1;
       // A child that carried both URL syntax and a path root hands its wrapper
       // an owned tail. A literal-only or path-less child hands over nothing.
       if (urlBearing[closed] === 1 && rootedBearing[closed] === 1) childCloseOwner[index] = 1;
@@ -315,12 +339,18 @@ function classifyBracketGroups(chars: readonly string[]): BracketGroupIndex {
         fileChildBearing[current] = 1;
         const queryStart = pathlessChildQueryStart(chars, index, whitespace);
         if (queryStart >= 0) pathlessChildQueryStarts[queryStart] = 1;
+        else filePathChildBearing[current] = 1;
       }
       inUrlSpan = true;
       continue;
     }
-    if (isSingleSlashFileUrlLiteral(chars, index) || isOwnershipSchemeColon(chars, index)) {
+    const schemeStart = ownershipSchemeStart(chars, index);
+    if (isSingleSlashFileUrlLiteral(chars, index) || schemeStart >= 0) {
       urlBearing[current] = 1;
+      // The scheme colon carries the quote for every span, including one opened
+      // by a file literal, because the literal is always followed by its colon
+      // before any whitespace can end the span.
+      if (spanQuote === 0 && schemeStart >= 0) spanQuote = quoteCode(chars[schemeStart - 1]);
       inUrlSpan = true;
     }
     if (startsRootedValue(chars, index, wordRunEnds)) rootedBearing[current] = 1;
@@ -337,6 +367,7 @@ function classifyBracketGroups(chars: readonly string[]): BracketGroupIndex {
     wordRunEnds,
     urlBearing: Uint8Array.from(urlBearing),
     fileChildBearing: Uint8Array.from(fileChildBearing),
+    filePathChildBearing: Uint8Array.from(filePathChildBearing),
   };
 }
 
@@ -389,6 +420,12 @@ function findUrlPathStarts(chars: readonly string[]): UrlPathStarts {
     if (groups.whitespace[index] === 1) {
       const preservesClosedBracketHandoff =
         pendingFileTailBackslash && fileTailBracketDepth === 0 && (char === " " || char === "\t");
+      // Bug #917: a space inside a quoted URL is part of that URL, so the quote
+      // that bounds it outlives the gap and a later nested file tail in the same
+      // quoted span still ends at the quote. A line break ends the span the same
+      // way it ends every other ownership fact here.
+      const preservesEnclosingSchemeQuote =
+        enclosingSchemeQuote !== 0 && separator >= 0 && (char === " " || char === "\t");
       schemeLength = 0;
       fileSchemeLength = 0;
       schemeQuote = 0;
@@ -402,7 +439,7 @@ function findUrlPathStarts(chars: readonly string[]): UrlPathStarts {
       quotedQueryTail = false;
       quotedPathEndedSeparator = -1;
       restartedPathlessBrackets = 0;
-      enclosingSchemeQuote = 0;
+      enclosingSchemeQuote = preservesEnclosingSchemeQuote ? enclosingSchemeQuote : 0;
       spacedFileTailPending = false;
       queryOrFragment = false;
       nestedPublicUrlBracketDepth = 0;
@@ -640,7 +677,9 @@ function findUrlPathStarts(chars: readonly string[]): UrlPathStarts {
     if (
       !exactFileScheme &&
       (char === "&" || char === "|") &&
-      groups.fileChildBearing[groups.groupOf[index]] === 1 &&
+      (groups.fileChildBearing[groups.groupOf[index]] === 1 ||
+        (groups.depth[index] > 0 &&
+          groups.filePathChildBearing[groups.groupOf[index]] === 1)) &&
       groups.pathlessChildQuery[index] === 0
     ) {
       const retainedPrivateRootStart = wordBearingPrivateRootPathStart(
@@ -946,8 +985,11 @@ function findUrlPathStarts(chars: readonly string[]): UrlPathStarts {
       // Bug #917: an unquoted nested scheme does not close the quote around the
       // URL that contains it, so the enclosing boundary survives until its own
       // closing delimiter. Clearing it here let a later nested file tail lose
-      // the quote that still bounds it and stop at the first space.
-      if (schemeQuote !== 0 || enclosingSchemeQuote === 0) enclosingSchemeQuote = schemeQuote;
+      // the quote that still bounds it and stop at the first space. A nested
+      // scheme that carries a quote of its own does not replace it either: that
+      // quote bounds the nested URL through fileQuote, while the enclosing one
+      // still bounds the text that follows the nested quote's close.
+      if (enclosingSchemeQuote === 0) enclosingSchemeQuote = schemeQuote;
       // A file URL that arrives on a delimiter this branch handles is bounded
       // by the same enclosing quote as one reached through a query delimiter,
       // so both routes agree on whether a space can end its path.

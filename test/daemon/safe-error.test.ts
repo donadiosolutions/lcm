@@ -4358,6 +4358,106 @@ describe("sanitizeError", () => {
         "file://h?x=[file://[::ffff:1.2.3.4]?key=/public&later/Users/secret]",
         "file://h?x=[file://[::ffff:1.2.3.4]?key=<path>&later/Users/secret]",
       ],
+      [
+        "Bug #917 a spaced tail before a second nested file child",
+        "'https://outer.test/x?next=file://one/Users/a/My Files/one.db&file://two/Users/b/My Files/two.db'",
+        "'https://outer.test/x?next=file://one<path>&file://two<path>'",
+      ],
+      [
+        "Bug #917 a differently quoted nested child keeping the outer quote",
+        '\'https://outer.test/x?next="file://one/Users/a/My Files/one.db"&file://two/Users/b/My Files/two.db\'',
+        '\'https://outer.test/x?next="file://one<path>"&file://two<path>\'',
+      ],
+      [
+        "Bug #917 a quoted nested public URL keeping the outer quote",
+        '\'https://outer.test/x?next="https://inner.test/y"&file://two/Users/b/My Files/two.db\'',
+        '\'https://outer.test/x?next="https://inner.test/y"&file://two<path>\'',
+      ],
+      [
+        "Bug #917 control a tab inside a quoted span keeps the boundary",
+        "'https://outer.test/x?next=file://one/Users/a/My\tFiles/one.db&file://two/Users/b/My Files/two.db'",
+        "'https://outer.test/x?next=file://one<path>\tFiles/one.db&file://two<path>'",
+      ],
+      [
+        "Bug #917 control a line break still ends the enclosing quote",
+        "'https://outer.test/x?next=file://one/Users/a/My Files/one.db\nfile://two/Users/b/My Files/two.db'",
+        "'https://outer.test/x?next=file://one<path>\nfile://two<path> Files/two.db'",
+      ],
+      [
+        "Bug #917 control a closed quote no longer bounds a later tail",
+        "'https://o.test/x?next=file://one/Users/a'&file://two/Users/b/My Files/two.db",
+        "'https://o.test/x?next=file://one<path>'&file://two<path> Files/two.db",
+      ],
+      [
+        "Bug #1349 a bracketed path-bearing child returning to its wrapper",
+        "file://h?x=[[file:///Users/CHILD/x]&later/Users/alice/secret.db]",
+        "file://h?x=[[file://<path>]&later<path>]",
+      ],
+      [
+        "Bug #1349 the pipe form of that bracketed child return",
+        "file://h?x=[[file:///Users/CHILD/x]|later/Users/alice/secret.db]",
+        "file://h?x=[[file://<path>]|later<path>]",
+      ],
+      [
+        "Bug #1349 a doubly bracketed path-bearing child still returning",
+        "file://h?x=[[[file:///Users/CHILD/x]]&later/Users/alice/secret.db]",
+        "file://h?x=[[[file://<path>]]&later<path>]",
+      ],
+      [
+        "Bug #1349 control a bracketed query-only child keeps its tail",
+        "file://h?x=[[file://host?key=/public]&later/Users/secret]",
+        "file://h?x=[[file://host?key=<path>]&later/Users/secret]",
+      ],
+      [
+        "Bug #1349 control the child return still expires at the wrapper close",
+        "file://h?x=[[file:///Users/CHILD/x]&later/Users/a/s.db]&later/Users/outside",
+        "file://h?x=[[file://<path>]&later<path>]&later/Users/outside",
+      ],
+      [
+        "Bug #917 a quoted span keeping bracket ownership across a space",
+        "'https://outer.test/x?next=[[file://one/Users/a/My Files/one.db]&later/Users/secret]'",
+        "'https://outer.test/x?next=[[file://one<path>]&later<path>]'",
+      ],
+      [
+        "Bug #917 a tab keeping that bracket ownership",
+        "'https://outer.test/x?next=[[file://one/Users/a/My\tFiles/one.db]&later/Users/secret]'",
+        "'https://outer.test/x?next=[[file://one<path>\tFiles/one.db]&later<path>]'",
+      ],
+      [
+        "Bug #917 control a line break ending that bracket ownership",
+        "'https://outer.test/x?next=[[file://one/Users/a/My\nFiles/one.db]&later/Users/secret]'",
+        "'https://outer.test/x?next=[[file://one<path>\nFiles/one.db]&later/Users/secret]'",
+      ],
+      [
+        "Bug #917 control an unquoted span still ending at its space",
+        "https://outer.test/x?next=[[file://one/Users/a/My Files/one.db]&later/Users/secret]",
+        "https://outer.test/x?next=[[file://one<path> Files/one.db]&later/Users/secret]",
+      ],
+      [
+        "Bug #917 a single-slash quoted span bounding a later child",
+        "'file:/one/Users/a/My Files/one.db?x=[[file://two/Users/b/y]&later/Users/secret]'",
+        "'file:<path> Files/one.db?x=[[file://two<path>]&later<path>]'",
+      ],
+      [
+        "Bug #917 an open quote bridging one gap into the next file URL",
+        "'https://o.test/x?a=1 file:///Users/b/My Files/two.db",
+        "'https://o.test/x?a=1 file://<path>",
+      ],
+      [
+        "Bug #917 control a second gap ending that bridged quote",
+        "'https://o.test/x?a=1 and then file:///Users/b/My Files/two.db",
+        "'https://o.test/x?a=1 and then file://<path> Files/two.db",
+      ],
+      [
+        "Bug #1332 control a closed quote ends ownership at the next space",
+        "'https://e.test/t' name=\\Users\\literal",
+        "'https://e.test/t' name=\\Users\\literal",
+      ],
+      [
+        "Bug #1332 control a line break ends ownership before a later gap",
+        "'https://o.test/x?a=1\nhttps://inner.test/y name=\\Users\\literal",
+        "'https://o.test/x?a=1\nhttps://inner.test/y name=\\Users\\literal",
+      ],
     ] as const)("resolves %s in one pass", (_name, input, expected) => {
       const first = sanitizeError(input);
 
