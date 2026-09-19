@@ -48,9 +48,18 @@ export interface PassiveEventReplicationResult {
   readonly pruned: number;
 }
 
+/**
+ * One publication admission around a single replication phase. The daemon
+ * pass supplies this so every phase re-checks the frozen startup backend
+ * before touching replication state, while the consumer lock is released
+ * between phases so hook appends can proceed. Absent, phases run directly.
+ */
+export type PassiveEventReplicationPhaseAdmission = <T>(operation: () => Promise<T>) => Promise<T>;
+
 export interface PassiveEventReplicationDependencies {
   readonly local: LocalHookOutboxRepository;
   readonly remote: PostgreSqlPassiveEventRepository;
+  readonly admitPhase?: PassiveEventReplicationPhaseAdmission;
   readonly applyEvent: (
     executor: PostgreSqlQueryExecutor,
     event: PostgreSqlPassiveEventClaim,
@@ -241,6 +250,14 @@ export class PassiveEventReplicationWorker {
 
   private async performOnce(signal?: AbortSignal): Promise<PassiveEventReplicationResult> {
     const summary = result();
+    // Each phase runs under its own publication admission so the consumer
+    // lock is released between phases and hook appends can proceed. Every
+    // admission re-checks the frozen startup backend, so a publication
+    // switch that lands between phases halts the pass at the next phase
+    // instead of writing to a backend the daemon has already lost (#1384).
+    // Without an admission the phases run directly, as a standalone worker
+    // has no publication topology to consult.
+    const admit = this.dependencies.admitPhase ?? (operation => operation());
     const lease = await this.dependencies.remote.acquireDrainLease(
       this.options.processId,
       this.options.leaseTtlMs,
@@ -249,20 +266,25 @@ export class PassiveEventReplicationWorker {
     if (!lease) return summary;
     const mutable = { ...summary, leaseAcquired: true };
     try {
-      await this.uploadLocal(mutable, signal);
-      if (!await this.renewLease(lease.fencingToken, signal)) return mutable;
-      const claims = await this.dependencies.remote.claimEvents({
+      await admit(() => this.uploadLocal(mutable, signal));
+      const renewed = await admit(() => this.renewLease(lease.fencingToken, signal));
+      if (!renewed) return mutable;
+      const claims = await admit(() => this.dependencies.remote.claimEvents({
         claimOwner: `${this.options.processId}:${lease.fencingToken.toString()}`,
         limit: this.options.batchSize,
         staleClaimMs: this.options.staleClaimMs,
         signal,
-      });
+      }));
       for (const claim of claims) {
-        if (!await this.renewLease(lease.fencingToken, signal)) break;
-        await this.applyClaim(claim, lease.fencingToken, mutable, signal);
+        const kept = await admit(async () => {
+          if (!await this.renewLease(lease.fencingToken, signal)) return false;
+          await this.applyClaim(claim, lease.fencingToken, mutable, signal);
+          return true;
+        });
+        if (!kept) break;
       }
-      await this.reconcileLocal(mutable, signal);
-      await this.pruneAcknowledged(mutable, signal);
+      await admit(() => this.reconcileLocal(mutable, signal));
+      await admit(() => this.pruneAcknowledged(mutable, signal));
       return mutable;
     } finally {
       try {

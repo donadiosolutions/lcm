@@ -5,6 +5,12 @@ import type {
 } from "./passive-event-replication.js";
 import type { LocalHookOutboxRepository } from "../storage/local-hook-outbox.js";
 import type { StoredMachineIdentity } from "../machine-identity.js";
+import type { BackgroundPublicationAdmission } from "./passive-event-processor.js";
+import {
+  BackendPublicationAppendBarrierTimeoutError,
+  BackendPublicationJournalError,
+  withBackendPublicationAppendBarrierAsync,
+} from "../storage/backend-publication.js";
 import { safeLogError } from "../hooks/hook-errors.js";
 import type { PostgreSqlPassiveEventRepository } from "../storage/postgresql/passive-event-repository.js";
 
@@ -68,6 +74,19 @@ export interface PassiveEventReplicationModules {
 export interface PassiveEventReplicationPassOptions {
   /** Lease owner identity; the daemon instance id keeps fencing aligned. */
   readonly processId: string;
+  /**
+   * Publication admission the pass admits each replication phase through.
+   * Every admission re-checks the frozen startup backend, so a publication
+   * switch between phases refuses the next one and halts the pass (#1384).
+   * Without it the worker runs unadmitted, as a standalone worker would.
+   */
+  readonly withPublicationAdmission?: BackgroundPublicationAdmission;
+  /**
+   * Publication home whose consumer lock each phase admission holds. The
+   * append barrier around the admitted token is what keeps the phase-local
+   * outbox usable inside its own admission window.
+   */
+  readonly publicationHome?: string;
   readonly loadModules?: () => Promise<PassiveEventReplicationModules>;
   readonly onError?: (error: unknown) => void | Promise<void>;
   readonly createWorker?: (
@@ -200,6 +219,21 @@ export function createPassiveEventReplicationPass(
 
         outboxFactory ??= loaded.createOutboxFactory();
         const local = await outboxFactory.open(loaded.eventsDbPath(cwd));
+        // Each worker phase runs under its own publication admission so the
+        // consumer lock is released between phases and hook appends can
+        // proceed. Without an admission the phases run directly, as a
+        // standalone worker would.
+        const admit = options.withPublicationAdmission;
+        const admitPhase: PassiveEventReplicationDependencies["admitPhase"] =
+          admit === undefined
+            ? operation => operation()
+            : async operation => admit(
+              publicationLockToken => withBackendPublicationAppendBarrierAsync(
+                options.publicationHome,
+                () => operation(),
+                publicationLockToken,
+              ),
+            );
         try {
           const remote = loaded.createRepository(runtime, remoteProjectId, identity.machineId);
           const dependencies: PassiveEventReplicationDependencies = {
@@ -207,6 +241,7 @@ export function createPassiveEventReplicationPass(
             remote,
             applyEvent: applyReplicatedPassiveEvent,
             onError: report,
+            admitPhase,
           };
           const createWorker = options.createWorker ?? loaded.createWorker;
           const worker = createWorker(dependencies, options.processId);
@@ -224,6 +259,15 @@ export function createPassiveEventReplicationPass(
           }
         }
       } catch (error) {
+        // Publication admission and barrier failures belong to the daemon,
+        // not to this project: rethrow them so the sweep logs them with
+        // the project and halts on a frozen-backend mismatch, exactly as a
+        // direct admission failure would. Every other failure is reported
+        // and skipped like any other unusable project.
+        if (error instanceof BackendPublicationJournalError
+          || error instanceof BackendPublicationAppendBarrierTimeoutError) {
+          throw error;
+        }
         await report(error);
         return null;
       }

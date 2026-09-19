@@ -1,5 +1,5 @@
 import { describe, expect, it, vi } from "vitest";
-import { chmodSync, mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { chmodSync, existsSync, mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { homedir, tmpdir } from "node:os";
 import { join } from "node:path";
 import { loadDaemonConfig } from "../../src/daemon/config.js";
@@ -20,6 +20,12 @@ import {
   type PassiveEventReplicationImports,
   type PassiveEventReplicationModules,
 } from "../../src/daemon/passive-event-replication-pass.js";
+import {
+  BackendPublicationAppendBarrierTimeoutError,
+  BackendPublicationJournalError,
+  withBackendPublicationConsumerLockAsync,
+} from "../../src/storage/backend-publication.js";
+import { PrivateMutationLockContentionError } from "../../src/private-mutation-lock.js";
 
 type Modules = PassiveEventReplicationModules;
 
@@ -464,6 +470,116 @@ describe("passive-event replication pass", () => {
   // so a pass that returns without closing grows the daemon's SQLite
   // connection set forever — the same unbounded-growth defect #1383 exists
   // to remove.
+  it("admits each worker phase separately and releases between phases", async () => {
+    // The pass owns the admission the worker phases run under: the lock
+    // file must be present during every phase and absent between them, so
+    // hook appends can proceed while the sweep is still running.
+    const home = mkdtempSync(join(tmpdir(), "lcm-replication-admission-"));
+    mkdirSync(join(home, ".lcm"), { recursive: true });
+    writeFileSync(join(home, ".lcm", "config.json"), "{}\n", { mode: 0o600 });
+    try {
+      const lockPath = join(home, ".lcm.backend-publication.lock");
+      const fencingToken = 7n;
+      const observed: Record<string, boolean> = {};
+      const probe = (name: string) => { observed[name] = existsSync(lockPath); };
+      const harness = modules();
+      harness.factory.open.mockResolvedValue({
+        claimDeliveries: vi.fn().mockImplementation(async () => { probe("upload"); return []; }),
+        listAwaitingRemote: vi.fn().mockImplementation(async () => { probe("reconcile"); return []; }),
+        listAcknowledgedForRemotePrune: vi.fn().mockImplementation(async () => { probe("prune"); return []; }),
+        close: vi.fn().mockResolvedValue(undefined),
+      });
+      harness.modules.createRepository = vi.fn().mockReturnValue({
+        machineId: "machine-uuid",
+        acquireDrainLease: vi.fn().mockImplementation(async () => {
+          probe("acquire");
+          return { fencingToken };
+        }),
+        renewDrainLease: vi.fn().mockResolvedValue({ fencingToken }),
+        claimEvents: vi.fn().mockImplementation(async () => { probe("claim"); return []; }),
+        releaseDrainLease: vi.fn().mockImplementation(async () => { probe("release"); }),
+      });
+      const pass = createPassiveEventReplicationPass(postgresConfig(), {
+        processId: "lcm-daemon:phased",
+        loadModules: async () => harness.modules,
+        withPublicationAdmission: async operation =>
+          withBackendPublicationConsumerLockAsync(home, token => operation(token)),
+        publicationHome: home,
+      });
+
+      await expect(pass.run("/proj")).resolves.toMatchObject({ leaseAcquired: true });
+      // Every remote and local phase ran admitted; the lease lifecycle on
+      // either side ran outside all admissions.
+      expect(observed).toMatchObject({
+        acquire: false,
+        upload: true,
+        claim: true,
+        reconcile: true,
+        prune: true,
+        release: false,
+      });
+    } finally {
+      rmSync(home, { recursive: true, force: true });
+    }
+  });
+
+  it("threads its phase admission through a custom worker construction", async () => {
+    // A custom createWorker receives the same dependencies object the
+    // loaded fallback would, so the phase admission reaches it either way
+    // (the fallback side runs end to end in the admission test above).
+    const home = mkdtempSync(join(tmpdir(), "lcm-replication-threading-"));
+    mkdirSync(join(home, ".lcm"), { recursive: true });
+    writeFileSync(join(home, ".lcm", "config.json"), "{}\n", { mode: 0o600 });
+    try {
+      const lockPath = join(home, ".lcm.backend-publication.lock");
+      const harness = modules();
+      let heldDuringPhase: boolean | null = null;
+      const pass = createPassiveEventReplicationPass(postgresConfig(), {
+        processId: "lcm-daemon:threading",
+        loadModules: async () => harness.modules,
+        withPublicationAdmission: async operation =>
+          withBackendPublicationConsumerLockAsync(home, token => operation(token)),
+        publicationHome: home,
+        createWorker: (dependencies: PassiveEventReplicationDependencies) => ({
+          runOnce: async () => {
+            await dependencies.admitPhase?.(async () => {
+              heldDuringPhase = existsSync(lockPath);
+            });
+            return summary;
+          },
+        }),
+      });
+      await expect(pass.run("/proj")).resolves.toEqual(summary);
+      expect(heldDuringPhase).toBe(true);
+      await pass.close();
+    } finally {
+      rmSync(home, { recursive: true, force: true });
+    }
+  });
+
+  it("rethrows publication admission and barrier failures instead of reporting them", async () => {
+    // A frozen-backend refusal must reach the processor halting logic, and
+    // barrier contention must reach its per-project log: neither may be
+    // downgraded to a quiet reported skip.
+    const mismatch = new BackendPublicationJournalError("backend-mismatch", "publication moved on");
+    const barrierTimeout = new BackendPublicationAppendBarrierTimeoutError(
+      new PrivateMutationLockContentionError("busy"),
+    );
+    for (const failure of [mismatch, barrierTimeout]) {
+      const harness = modules();
+      const onError = vi.fn();
+      const pass = createPassiveEventReplicationPass(postgresConfig(), {
+        processId: "lcm-daemon:rethrow",
+        loadModules: async () => harness.modules,
+        onError,
+        createWorker: () => ({ runOnce: vi.fn().mockRejectedValue(failure) }),
+      });
+      await expect(pass.run("/proj")).rejects.toBe(failure);
+      expect(onError).not.toHaveBeenCalledWith(failure);
+      await pass.close();
+    }
+  });
+
   it("retains no sidecar outbox once its pass has finished", async () => {
     const directory = mkdtempSync(join(tmpdir(), "lcm-replication-outbox-"));
     const factory = new SQLiteLocalHookOutboxFactory();

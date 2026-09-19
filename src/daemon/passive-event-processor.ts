@@ -9,7 +9,6 @@ import type { StorageBackendFactory } from "../storage/index.js";
 import type { PassiveEventReplicationResult } from "./passive-event-replication.js";
 import {
   BackendPublicationJournalError,
-  withBackendPublicationAppendBarrierAsync,
   type BackendPublicationLockToken,
 } from "../storage/backend-publication.js";
 
@@ -70,11 +69,6 @@ export interface PassiveEventProcessorDeps {
   promoteEventsForCwd?: typeof promoteEventsForCwd;
   storageFactory?: StorageBackendFactory;
   withPublicationAdmission: BackgroundPublicationAdmission;
-  /**
-   * Publication home whose consumer lock admission holds. Replication needs
-   * it to keep the local outbox usable inside its own admission window.
-   */
-  publicationHome?: string;
   collectEventSidecars?: typeof collectEventSidecars;
   replicatePassiveEvents?: PassiveEventReplicationPassRunner;
   setTimeout?: typeof setTimeout;
@@ -103,7 +97,6 @@ type PromoteOneBatch = (
 export class PassiveEventProcessor {
   private readonly promoteOneBatch: PromoteOneBatch;
   private readonly withPublicationAdmission: BackgroundPublicationAdmission;
-  private readonly publicationHome?: string;
   private readonly scanSidecars: typeof collectEventSidecars;
   private readonly replicatePassiveEvents?: PassiveEventReplicationPassRunner;
   private readonly setTimer: typeof setTimeout;
@@ -146,7 +139,6 @@ export class PassiveEventProcessor {
     this.promoteOneBatch = (config, cwd, sidecarPath, publicationLockToken, context) =>
       promoteOneBatch(config, cwd, sidecarPath, deps.storageFactory, publicationLockToken, context);
     this.withPublicationAdmission = deps.withPublicationAdmission;
-    this.publicationHome = deps.publicationHome;
     this.scanSidecars = deps.collectEventSidecars ?? collectEventSidecars;
     // A daemon whose selected backend cannot replicate must not report
     // replication as enabled, and must not record five-minute passes it never
@@ -284,20 +276,35 @@ export class PassiveEventProcessor {
    * a row to the acknowledged-and-remote-pruned state that local retention
    * requires. Projects without a PostgreSQL binding skip quietly.
    *
-   * Each project replicates inside its admission rather than after it.
-   * Replication resolves its backend from this daemon's frozen startup
-   * configuration, and the promotion loop above skips any sidecar with no
-   * unprocessed events, so without this admission a settled daemon would keep
-   * uploading to a backend that publication has already moved away from
-   * (#1384). A check that returns before the upload starts does not give that
-   * guarantee: publication can take the consumer lock in the gap and the pass
-   * still writes to the backend the daemon has just lost.
+   * Each project replicates in admitted phases rather than inside one
+   * admission held across the whole pass. Replication resolves its backend
+   * from this daemon's frozen startup configuration, and the promotion loop
+   * above skips any sidecar with no unprocessed events, so without admission
+   * a settled daemon would keep uploading to a backend that publication has
+   * already moved away from (#1384). A check that returns before the upload
+   * starts does not give that guarantee: publication can take the consumer
+   * lock in the gap and the pass still writes to the backend the daemon has
+   * just lost.
+   *
+   * But holding one admission across the whole pass also holds the
+   * publication consumer lock across a lease acquisition, a bulk upload,
+   * and up to a hundred claim renewals and apply round trips. While held,
+   * every hook append in the home burns its bounded contention budget and
+   * then drops the event, and SessionStart has no retry at all. So the pass
+   * admits per phase instead: the upload under one admission, the claim
+   * fetch under the next, each renew-and-apply under its own, and
+   * reconcile and prune each under their own. The consumer lock is released
+   * between phases so hook appends can proceed, and every admission
+   * re-checks the frozen backend, so a publication switch that lands
+   * between phases refuses the next admission and halts the sweep before
+   * any further write. Losing a hook event to a background sweep is worse
+   * than that slightly wider switch window.
    *
    * Admission holds the publication consumer lock, and every local outbox
    * operation takes that same lock synchronously for the same home, so
    * replicating directly inside the admission callback makes the outbox fail
    * with "backend publication mutation is already in progress". The append
-   * barrier around the admitted token is the seam that makes the nested
+   * barrier around each admitted token is the seam that makes the nested
    * acquisition inherit the token instead of contending for it, exactly as
    * the SessionStart hook already does around its own outbox work.
    */
@@ -314,12 +321,11 @@ export class PassiveEventProcessor {
       if (sidecar.scanError || sidecar.scanSkipped || !cwd) continue;
       let result: PassiveEventReplicationResult | null;
       try {
-        result = await this.withPublicationAdmission(token =>
-          withBackendPublicationAppendBarrierAsync(
-            this.publicationHome,
-            () => replicate(cwd, this.backgroundSignal),
-            token,
-          ));
+        // No outer admission here: the pass admits each replication phase
+        // separately (see above), so the consumer lock is never held across
+        // the whole sweep. A frozen-backend refusal from any phase still
+        // reaches this catch and halts below.
+        result = await replicate(cwd, this.backgroundSignal);
       } catch (error) {
         if (isFrozenBackendMismatch(error)) {
           await this.haltForBackendMismatch(error);

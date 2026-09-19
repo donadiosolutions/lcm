@@ -821,7 +821,6 @@ describe("PassiveEventProcessor", () => {
       {
         ...deps,
         collectEventSidecars,
-        publicationHome: home,
         replicatePassiveEvents,
         withPublicationAdmission: realPublicationAdmission(home),
       } as never,
@@ -890,7 +889,6 @@ describe("PassiveEventProcessor", () => {
       {
         ...deps,
         collectEventSidecars,
-        publicationHome: home,
         replicatePassiveEvents,
         withPublicationAdmission: realPublicationAdmission(home),
       } as never,
@@ -938,43 +936,28 @@ describe("PassiveEventProcessor", () => {
   // snapshot making it keep uploading to a backend it has already lost.
   // Promotion is skipped entirely once a sidecar has no unprocessed events, so
   // replication is the only remaining pass that can reach the old backend.
-  it("halts replication when the live backend leaves the startup backend", async () => {
-    const { home, configPath } = publicationFixture();
+  // The pass admits each phase separately and rethrows a frozen-backend
+  // refusal instead of reporting it, so the sweep still halts here.
+  it("halts replication when a phase admission reports the backend left", async () => {
+    const { home } = publicationFixture();
     const { deps } = timerDeps();
-    const startupConfig = makeReplicatingConfig();
-    const publish = (backend: string): void => {
-      writeFileSync(configPath, JSON.stringify({ storage: { backend } }), { mode: 0o600 });
-    };
-    const liveBackend = (): string =>
-      (JSON.parse(readFileSync(configPath, "utf8")) as { storage: { backend: string } })
-        .storage.backend;
-    // Daemon admission re-reads the live configuration on every admitted
-    // operation and refuses once it no longer matches the startup backend.
-    const withPublicationAdmission: PublicationAdmission = async operation => {
-      if (liveBackend() !== startupConfig.storage.backend) {
-        throw new BackendPublicationJournalError(
-          "backend-mismatch",
-          "daemon request backend differs from the authenticated startup backend",
-        );
-      }
-      return withBackendPublicationConsumerLockAsync(home, token => operation(token));
-    };
-    const promoteEventsForCwd = vi.fn<PromoteEventsForCwd>();
+    const mismatch = new BackendPublicationJournalError(
+      "backend-mismatch",
+      "daemon request backend differs from the authenticated startup backend",
+    );
     const collectEventSidecars = vi.fn<CollectEventSidecars>().mockResolvedValue([
       sidecar({ cwd: "/promoted", path: "/events/promoted.db", unprocessed: 0 }),
     ]);
-    const replicatePassiveEvents = vi.fn(async () => replicationSummary());
-    publish("postgresql");
+    const replicatePassiveEvents = vi.fn()
+      .mockResolvedValueOnce(replicationSummary())
+      .mockRejectedValueOnce(mismatch);
     const processor = new PassiveEventProcessor(
-      startupConfig,
+      makeReplicatingConfig(),
       PASSIVE_EVENT_PROCESSOR_DEFAULTS,
       {
         ...deps,
         collectEventSidecars,
-        promoteEventsForCwd,
-        publicationHome: home,
         replicatePassiveEvents,
-        withPublicationAdmission,
       } as never,
     );
 
@@ -982,13 +965,11 @@ describe("PassiveEventProcessor", () => {
       await processor.runSweep();
       expect(replicatePassiveEvents).toHaveBeenCalledTimes(1);
 
-      // Publication moves the daemon off PostgreSQL. Every sidecar is already
-      // promoted, so nothing else in the sweep consults admission.
-      publish("sqlite");
+      // Publication moves the daemon off PostgreSQL. The next phase
+      // admission refuses, the pass rethrows, and the sweep halts.
       await processor.runSweep();
 
-      expect(promoteEventsForCwd).not.toHaveBeenCalled();
-      expect(replicatePassiveEvents).toHaveBeenCalledTimes(1);
+      expect(replicatePassiveEvents).toHaveBeenCalledTimes(2);
       expect(processor.backgroundDiagnostics()).toMatchObject({
         halted: true,
         haltedReason: "backend-mismatch",
@@ -999,14 +980,12 @@ describe("PassiveEventProcessor", () => {
     }
   });
 
-  // #1384 again, one layer down. An admission that returns before the upload
-  // starts is only a point-in-time check, and from inside the processor it
-  // looks exactly like a real one, so this observes the lock itself: the
-  // admission lock file must be on disk for the whole replication call. The
-  // nested acquisition is what the real local outbox does on every operation,
-  // so it also pins the append barrier that keeps replication able to reach
-  // its own database while that lock is held.
-  it("replicates inside the publication admission it was granted", async () => {
+  // The sweep must not hold publication admission across the replication
+  // call: the pass admits each worker phase separately (proved at the pass
+  // level), so the admission lock file must be absent for the whole call
+  // and hook appends are never blocked behind a full sweep. A reverted
+  // processor that re-wraps the call observes the lock file instead.
+  it("releases publication admission across the replication call", async () => {
     const { home } = publicationFixture();
     const { deps } = timerDeps();
     const lockPath = join(home, ".lcm.backend-publication.lock");
@@ -1031,7 +1010,6 @@ describe("PassiveEventProcessor", () => {
       {
         ...deps,
         collectEventSidecars,
-        publicationHome: home,
         replicatePassiveEvents,
         withPublicationAdmission,
       } as never,
@@ -1041,7 +1019,7 @@ describe("PassiveEventProcessor", () => {
       await processor.runSweep();
 
       expect(replicatePassiveEvents).toHaveBeenCalledTimes(1);
-      expect(lockHeldDuringReplication).toBe(true);
+      expect(lockHeldDuringReplication).toBe(false);
       expect(outboxAccess).toBe("acquired");
     } finally {
       processor.stop();
@@ -1067,7 +1045,6 @@ describe("PassiveEventProcessor", () => {
       {
         ...deps,
         collectEventSidecars,
-        publicationHome: home,
         replicatePassiveEvents,
         withPublicationAdmission: realPublicationAdmission(home),
       } as never,

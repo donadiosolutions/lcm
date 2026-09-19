@@ -607,6 +607,8 @@ export async function createDaemon(config: DaemonConfig, options?: DaemonOptions
   // daemon cannot masquerade as its predecessor's lease holder.
   const passiveEventReplication = createPassiveEventReplicationPass(config, {
     processId: `lcm-daemon:${invocationCoordinator.daemonInstanceId}`,
+    withPublicationAdmission: withBackgroundPublicationAdmission,
+    publicationHome,
   });
   const createFactory = options?._createStorageBackendFactory ?? createStorageBackendFactory;
   let storageFactory: StorageBackendFactory;
@@ -797,7 +799,6 @@ export async function createDaemon(config: DaemonConfig, options?: DaemonOptions
     {
       storageFactory,
       withPublicationAdmission: withBackgroundPublicationAdmission,
-      publicationHome,
       replicatePassiveEvents: passiveEventReplication.run,
       signal: shutdownController.signal,
     },
