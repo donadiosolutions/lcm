@@ -151,8 +151,9 @@ and the `external-admission` status on `HEAD_SHA`.
   in progress, pending, or waiting. A newer event ID than the visible evidence,
   an equal `requested`/`in_progress` CI event, or an equal DCO `created` or
   `rerequested` event also remains pending. Transient branch-protection API
-  failures such as network errors, rate limits, and HTTP 5xx responses remain
-  pending so recovery can retry them.
+  failures and PR-file API transport failures remain pending so recovery can
+  retry them. A successful but malformed PR-file response, incomplete file
+  count, or invalid classification remains a terminal policy failure.
 - **Success:** three consecutive fresh snapshots prove authenticated CI and DCO
   success on the same exact head, while live base protection and pull-request
   eligibility remain valid. Exactly one open, non-draft pull request in the

@@ -456,7 +456,9 @@ type AdmissionScenario =
   | "sensitive-file-drift"
   | "sensitive-postgresql-template-init"
   | "sensitive-postgresql-cached-run-init"
-  | "sensitive-postgresql-init";
+  | "sensitive-postgresql-init"
+  | "transient-pr-files"
+  | "malformed-pr-files";
 
 type AdmissionEligibilityVariant =
   | "unsupported-base"
@@ -552,6 +554,7 @@ function runAdmissionScenario(
   let checkRuns = [ciCheckRun, dcoCheckRun];
   let reviewRunApiFails = false;
   let commitApiFails = false;
+  let pullRequestFilesApiFails = false;
   let pullRequestFileSnapshots: unknown[] | undefined;
   let branchProtectionSequence = ["true"];
   let branchDeletedSuffix = "";
@@ -692,6 +695,12 @@ function runAdmissionScenario(
         status: "modified",
       }]];
       break;
+    case "transient-pr-files":
+      pullRequestFilesApiFails = true;
+      break;
+    case "malformed-pr-files":
+      pullRequestFileSnapshots = [[[]]];
+      break;
   }
 
   if (scenario === "invalid-or-changed-base") {
@@ -772,6 +781,7 @@ if [[ "$endpoint" == repos/*/pulls/123 ]]; then
   exit 0
 fi
 if [[ "$endpoint" == repos/*/pulls/123/files?per_page=100 ]]; then
+  if [[ "$PULL_REQUEST_FILES_API_FAILS" == true ]]; then exit 98; fi
   file_call_count=0
   if [[ -f "$FILE_CALLS" ]]; then read -r file_call_count < "$FILE_CALLS"; fi
   file_call_count=$((file_call_count + 1))
@@ -859,7 +869,7 @@ exit 99
         FILE_CALLS: fileCallsPath,
         PATH: `${directory}:${process.env.PATH ?? ""}`,
         PULL_REQUEST_JSON: JSON.stringify(pullRequest),
-        PULL_REQUEST_FILES_JSON: JSON.stringify(pullRequestFiles),
+        PULL_REQUEST_FILES_API_FAILS: String(pullRequestFilesApiFails),
         PULL_REQUEST_FILE_SNAPSHOTS_JSON: JSON.stringify(
           pullRequestFileSnapshots ?? [pullRequestFiles, pullRequestFiles, pullRequestFiles],
         ),
@@ -1055,6 +1065,24 @@ describe("external admission workflow", () => {
     expect(result.status).toBe(0);
     expect(statuses).toHaveLength(1);
     expect(statuses[0]?.split("\t", 1)[0]).toBe("pending");
+    expect(statuses.some((status) => status.startsWith("success\t"))).toBe(false);
+  });
+
+  it("keeps transient PR-file API failures pending", () => {
+    const { result, statuses } = runAdmissionScenario("transient-pr-files");
+    expect(result.status, `${result.stdout}\n${result.stderr}`).toBe(0);
+    expect(statuses.at(-1)?.split("\t", 1)[0]).toBe("pending");
+    expect(statuses.at(-1)).toContain("PR file evidence is temporarily unavailable");
+    expect(statuses.at(-1)).not.toContain("Copilot");
+    expect(statuses.at(-1)).not.toContain("Dependabot");
+    expect(statuses.some((status) => status.startsWith("failure\t"))).toBe(false);
+    expect(statuses.some((status) => status.startsWith("success\t"))).toBe(false);
+  });
+
+  it("terminalizes a successful but incomplete PR-file response", () => {
+    const { result, statuses } = runAdmissionScenario("malformed-pr-files");
+    expect(result.status).not.toBe(0);
+    expect(statuses.at(-1)?.split("\t", 1)[0]).toBe("failure");
     expect(statuses.some((status) => status.startsWith("success\t"))).toBe(false);
   });
 
@@ -1382,6 +1410,7 @@ describe("external admission workflow", () => {
     expect(documentation).toMatch(/no user-configurable options/iu);
     expect(documentation).toMatch(/freshness lower bound/iu);
     expect(documentation).toMatch(/transient.*branch.*pending/isu);
+    expect(documentation).toMatch(/PR-file API.*pending/isu);
     expect(documentation).toMatch(/eslint\.config\.js.*outside.*closed set/isu);
     expect(documentation).toMatch(/execute.*ESLint.*classifier.*tests.*documentation.*same/isu);
   });

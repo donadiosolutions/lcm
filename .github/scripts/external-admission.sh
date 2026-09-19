@@ -358,7 +358,11 @@ validate_required_snapshot() {
   local admission_ready admission_pending admission_terminal_failure evidence_class selected_evidence_fingerprint
 
   changed_file_count="$(jq -r '.changed_files' <<<"$pull_request")" || return $?
-  file_pages="$(fetch_pull_request_files "$PR_NUMBER")" || return $?
+  if ! file_pages="$(fetch_pull_request_files "$PR_NUMBER")"; then
+    exit_pending \
+      "PR file evidence is temporarily unavailable" \
+      "$phase PR file evidence could not be fetched; admission remains pending."
+  fi
   classification="$(classify_pull_request_files "$changed_file_count" <<<"$file_pages")" || return $?
   sensitive="$(jq -r '.sensitive' <<<"$classification")" || return $?
   classification_fingerprint="$(jq -c \
