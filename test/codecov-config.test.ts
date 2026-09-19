@@ -625,7 +625,7 @@ describe("Codecov configuration", () => {
     expect(ownershipCounts.size).toBe(243);
   });
 
-  test("keeps response-fence and #681/#700/#701/#703/#705/#709/#710/#713/#756/#726/#734/#737/#742/#760/#763/#804/#805/#824/#825/#833/#888/#864/#866/#722/#786/#952/#814/#882/#930/#969/#989/#1003/#1049/#964/#1106/#1191/#1196/#1229/#1321/#1338/#1347/#1353/#1354/#1356/#1357/#1358/#1403 files in their intended components", () => {
+  test("keeps response-fence and #681/#700/#701/#703/#705/#709/#710/#713/#756/#726/#734/#737/#742/#760/#763/#804/#805/#824/#825/#833/#888/#864/#866/#722/#786/#952/#814/#882/#930/#969/#989/#1003/#1049/#964/#1106/#1191/#1196/#1229/#1321/#1338/#1347/#1353/#1354/#1356/#1357/#1358/#1403/#1390/#1371 files in their intended components", () => {
     const config = readCodecovConfig();
     expect(config).toBeDefined();
     if (config === undefined) {
@@ -725,6 +725,9 @@ describe("Codecov configuration", () => {
       ["src/daemon/routes/describe.ts", "unit-daemon-routes"],
       ["src/daemon/routes/expand.ts", "unit-daemon-routes"],
       ["src/daemon/routes/ingest.ts", "unit-daemon-routes"],
+      // #1371 routes the manual store through the shared deduplication
+      // decision instead of a direct insert. The route owns its input; the
+      // decision helper stays in unit-promotion.
       ["src/daemon/routes/store.ts", "unit-daemon-routes"],
       ["src/daemon/routes/status.ts", "unit-daemon-routes"],
       ["src/daemon/routes/session-complete.ts", "unit-daemon-routes"],
@@ -747,6 +750,9 @@ describe("Codecov configuration", () => {
       // search candidate recall remain owned by daemon routes.
       ["src/daemon/routes/search.ts", "unit-daemon-routes"],
       ["src/daemon/routes/grep.ts", "unit-daemon-routes"],
+      // #1390 threads owner scope and the live backend into the promote
+      // route's deduplication call so the exact-content lookup runs; the
+      // input is route-owned and the decision helper stays in unit-promotion.
       ["src/daemon/routes/promote.ts", "unit-daemon-routes"],
       ["src/daemon/routes/recent.ts", "unit-daemon-routes"],
       ["src/daemon/passive-event-processor.ts", "unit-daemon-events"],
@@ -886,6 +892,10 @@ describe("Codecov configuration", () => {
       ["src/mcp/tools/lcm-grep.ts", "unit-mcp"],
       // #863 expand-depth schema remains owned by MCP tools.
       ["src/mcp/tools/lcm-expand.ts", "unit-mcp"],
+      // #1371 store merge-behavior help and tool description keep their
+      // CLI and MCP owners.
+      ["src/cli-help.ts", "unit-cli"],
+      ["src/mcp/tools/lcm-store.ts", "unit-mcp"],
       // #972 search cwd client typing remains memory/retrieval-owned.
       ["src/memory/index.ts", "unit-memory-retrieval"],
       // #793 shared search-limit contract remains retrieval-owned.

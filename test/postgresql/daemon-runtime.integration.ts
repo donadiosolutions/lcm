@@ -433,6 +433,38 @@ describe("PostgreSQL 18 daemon runtime", { timeout: 120_000 }, () => {
         });
         expect(stored.stored).toBe(true);
         expect(stored.id).toEqual(expect.any(String));
+        // #1371: a repeated manual store merges into the existing memory and
+        // returns its id with tags unioned; a punctuation-only store repeats
+        // through the exact-content lookup that ranked search cannot serve.
+        const repeated = await client.post<{ stored: boolean; id: string }>("/store", {
+          cwd: projectPath,
+          text: "PostgreSQL promoted daemon needle",
+          tags: ["repeat"],
+          metadata: { projectPath, sessionId: "daemon-runtime-store-repeat" },
+        });
+        expect(repeated).toEqual({ stored: true, id: stored.id });
+        const punctuationFirst = await client.post<{ stored: boolean; id: string }>("/store", {
+          cwd: projectPath, text: "!!! ??? --- ### @@@ %%% &&&", metadata: { projectPath },
+        });
+        const punctuationSecond = await client.post<{ stored: boolean; id: string }>("/store", {
+          cwd: projectPath, text: "!!! ??? --- ### @@@ %%% &&&", metadata: { projectPath },
+        });
+        expect(punctuationSecond).toEqual({ stored: true, id: punctuationFirst.id });
+        const storedRows = await database.migrator.query({
+          text: `SELECT m.memory_id,
+                        COALESCE(array_agg(t.tag ORDER BY t.ordinal) FILTER (WHERE t.tag IS NOT NULL), '{}') AS tags
+                 FROM lcm.promoted_memories AS m
+                 LEFT JOIN lcm.promoted_memory_tags AS t
+                   ON t.project_id = m.project_id AND t.memory_id = m.memory_id
+                 WHERE m.project_id = $1 AND m.archived_at IS NULL
+                 GROUP BY m.memory_id, m.created_at
+                 ORDER BY m.created_at`,
+          values: [project.projectId],
+        }, { domain: "promoted-memory", operation: "verifyStoreDedup" });
+        expect(storedRows.rows).toEqual([
+          { memory_id: stored.id, tags: ["runtime", "postgresql", "repeat"] },
+          { memory_id: punctuationFirst.id, tags: [] },
+        ]);
 
         const ingested = await client.post<{ ingested: number; totalTokens: number }>("/ingest", {
           session_id: "daemon-runtime-ingest",

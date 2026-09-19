@@ -406,6 +406,13 @@ export function createPromoteHandler(
                       content: scrubbedContent,
                       tags: promotionResult.tags.map((tag) => scrubber.scrub(tag)),
                       sourceProjectId: paths.id,
+                      // Decide against the bound owner's whole provenance on
+                      // PostgreSQL so the digest-backed exact lookup runs, as
+                      // import and passive promotion already do. Without the
+                      // scope and backend the helper never consults it, and
+                      // content lexical search cannot retrieve is stored twice.
+                      candidateScope: "owner",
+                      backend: project.backend,
                       sessionId: conversation.sessionId,
                       depth: summary.depth,
                       confidence: promotionResult.confidence,
