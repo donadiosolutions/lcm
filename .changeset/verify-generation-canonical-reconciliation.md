@@ -58,3 +58,18 @@ The verification lease is held until the report has been durably
 persisted, not released beforehand, so a second worker cannot acquire it
 and start a concurrent recomputation while this attempt's own persist is
 still in flight.
+
+The sequence self-consistency bound is table-wide, not scoped to the
+project being verified: identity sequences are shared per table across
+every project, so a colliding row in a different project would otherwise
+go undetected whenever the verified project's own copy of that domain
+happened to be empty. The search self-match probe now requires a
+correlated match, not merely a non-empty result: it resolves each
+candidate's own destination-native key through the transfer ledger and
+confirms that exact key appears among the search results, so a search
+path that returns some unrelated but non-empty result can no longer be
+mistaken for a working self-match. The ledger check additionally
+reconciles the destination's recorded identity set against the census's
+own per-domain identities (not only their count and uniqueness), so a
+substitution that preserves cardinality and injectivity while recording
+the wrong identities is now caught.

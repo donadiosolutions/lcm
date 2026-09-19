@@ -498,27 +498,93 @@ export type MigrationSearchProbeOutcome =
  * tokenization agrees with PostgreSQL's -- exactly the second-
  * implementation drift this item has rejected twice for other classes.
  */
+/**
+ * Round-4 P1: a bare non-empty result was previously accepted as "ran",
+ * with no check that the result was the *candidate's own* message. A
+ * search path that ignores its query, uses the wrong configuration, or
+ * returns some unrelated fixed result would pass every attempt in the
+ * pool, since "some row came back" was the entire test -- exactly the
+ * defect a self-match probe exists to catch. Fixed by correlating the
+ * candidate's source-space identitySha256 to the destination's native
+ * message_id through lcm.transfer_identities (the only place that
+ * mapping is recorded) and requiring that native key to actually appear
+ * among the search results, not merely that the results are non-empty.
+ *
+ * This borrows trust from one ledger row per candidate tried: a false
+ * pass now requires two coordinated corruptions -- a broken search
+ * *and* a transfer_identities row that happens to name exactly the
+ * message the broken search returned. That conjunction is recorded here
+ * and in witness-audit.ts rather than left for a reader to reconstruct.
+ * Per the frozen absence rule, an unattributable correlation (no row,
+ * because run_id is missing entirely, or a candidate's identity has no
+ * matching row) is never treated as a pass: it makes that source of
+ * evidence unusable for this candidate, and the walk moves on to the
+ * next one, exactly as it already does for a search that came back
+ * empty. Only a correlated, confirmed self-match ever reports ran:true.
+ *
+ * The transfer_runs/transfer_identities reads here are a second,
+ * separate read of the same immutable post-copy evidence the ledger
+ * class reads inside the fenced window -- not a restatement of the
+ * ledger check and not itself the ledger's cardinality/injectivity
+ * reconciliation. Bounded by the same fixed-size candidate pool as
+ * before, so the added cost is at most one transfer_runs lookup plus
+ * one transfer_identities lookup per attempt, never proportional to
+ * domain size.
+ */
 export async function runSearchSelfMatchProbe(
-  executor: PostgreSqlRuntime, projectId: string,
+  executor: PostgreSqlRuntime, projectId: string, targetGenerationId: string,
   candidates: readonly MigrationSearchProbeSourceEntry[], seedBasisSha256: string, signal?: AbortSignal,
 ): Promise<MigrationSearchProbeOutcome> {
   if (candidates.length === 0) {
     return { ran: false, chosenOrdinal: null, notRunReason: "no source messages are available to search-probe" };
   }
+  const runResult = await executor.query<{ run_id: string }>({
+    text: "SELECT run_id FROM lcm.transfer_runs WHERE project_id = $1::uuid AND target_generation = $2",
+    values: [projectId, targetGenerationId],
+  }, { domain: "factory", operation: "verifyGenerationSearchProbeRun", signal });
+  const runId = runResult.rows[0]?.run_id;
+  if (runId === undefined) {
+    // No source of correlation exists at all: every candidate would be
+    // unattributable, so there is no point walking the pool.
+    return {
+      ran: false, chosenOrdinal: null,
+      notRunReason: "no completed transfer run was found to correlate search-probe candidates against",
+    };
+  }
   const repository = new PostgreSqlLexicalSearchRepository(executor, projectId);
   const seedIndex = Number.parseInt(seedBasisSha256.slice(0, 8), 16) % candidates.length;
+  let unattributedAttempts = 0;
+  let unconfirmedAttempts = 0;
   for (let attempt = 0; attempt < candidates.length; attempt += 1) {
     const candidate = candidates[(seedIndex + attempt) % candidates.length]!;
+    const identityResult = await executor.query<{ native_key: string }>({
+      text: "SELECT native_key FROM lcm.transfer_identities WHERE run_id = $1 AND domain = 'messages' AND identity_sha256 = $2",
+      values: [runId, candidate.identitySha256],
+    }, { domain: "factory", operation: "verifyGenerationSearchProbeCorrelation", signal });
+    if (identityResult.rows.length !== 1) {
+      // Zero rows: this candidate's identity was never recorded in the
+      // ledger, so no destination-native key exists to check search
+      // results against -- unattributable, not evidence either way.
+      // More than one row cannot occur under this table's own primary
+      // key (run_id, domain, identity_sha256), but is still checked
+      // rather than assumed, per the same discipline as the sequence
+      // witness's privilege-versus-never-called split.
+      unattributedAttempts += 1;
+      continue;
+    }
+    const expectedNativeKey = identityResult.rows[0]!.native_key;
     const results = await repository.searchMessages({
       query: candidate.content, mode: "full_text" as const, limit: 1,
     });
-    if (results.length > 0) {
+    if (results.some((result) => String(result.messageId) === expectedNativeKey)) {
       return { ran: true, chosenOrdinal: candidate.ordinal, notRunReason: null };
     }
+    unconfirmedAttempts += 1;
   }
   return {
     ran: false, chosenOrdinal: null,
-    notRunReason: `no candidate among ${candidates.length} produced a non-empty search_v1 result within the attempt cap`,
+    notRunReason: `none of ${candidates.length} candidates confirmed a correlated self-match `
+      + `(${unattributedAttempts} unattributable, ${unconfirmedAttempts} searched but not confirmed) within the attempt cap`,
   };
 }
 
@@ -689,7 +755,41 @@ export interface MigrationLedgerReconciliationInput {
   readonly identityFingerprintSha256: string;
   readonly manifestCheckpoints: readonly MigrationCheckpoint[];
   readonly census: readonly MigrationVerificationDomainCensus[];
+  readonly recordIdentities: ReadonlyMap<PortableDomain, ReadonlySet<string>>;
   readonly signal?: AbortSignal;
+}
+
+/**
+ * Round-4 P2: cardinality-plus-injectivity alone lets a substitution
+ * that preserves both pass undetected -- the ledger's own identity_sha256
+ * SET for a domain could differ entirely from what was actually copied
+ * while agreeing on count and staying one-to-one. prefixSha256 (the
+ * census's own per-domain digest) cannot be the comparison target: it is
+ * a full-content rolling digest computed client-side over every field of
+ * every record, not an identity-only aggregate, so it could never agree
+ * with an identity-only ledger digest even on a sound destination.
+ *
+ * The actual comparison operand already exists in memory at zero
+ * marginal cost: recordIdentities, the destination's own per-domain
+ * identity sets, walked once for the relation class. This function
+ * folds each domain's set into one digest (sort, concatenate, SHA-256)
+ * to compare against a matching per-domain aggregate computed entirely
+ * server-side in one grouped query -- no transfer_identities row is
+ * ever pulled to the client for this check. COLLATE "C" is forced in
+ * the query rather than relying on the column's collation, so the two
+ * sides agree by construction rather than because a collation checked
+ * once still holds later; the client-side sort must therefore also be
+ * plain byte-order, which JS's default string sort already is for this
+ * restricted [0-9a-f]{64} character set.
+ *
+ * Returns null for an empty set, matching what string_agg produces for
+ * zero rows (NULL, not an empty-string digest) so a domain with no
+ * records on either side compares null === null rather than disagreeing
+ * for a reason unrelated to content.
+ */
+function digestIdentitySet(identities: ReadonlySet<string>): string | null {
+  if (identities.size === 0) return null;
+  return sha256Hex([...identities].sort().join(""));
 }
 
 /**
@@ -775,6 +875,28 @@ export async function readLedgerMismatches(
       domain: row.domain as PortableDomain, class: "ledger",
       identitySha256: migrationWitnessSha256(["ledger-non-injective-mapping-v1", row.domain, row.native_key]),
     });
+  }
+
+  // Round-4 P2: cardinality and injectivity alone permit a substitution
+  // that preserves both -- this closes it by comparing the actual SET
+  // of copied identities per domain, not just its size and uniqueness.
+  // One grouped, server-side aggregate query; no per-identity row is
+  // ever fetched to the client for this check.
+  const identitySetResult = await session.query<{ domain: string; identity_set_sha256: string | null }>({
+    text: "SELECT domain, encode(digest(string_agg(identity_sha256, '' ORDER BY identity_sha256 COLLATE \"C\"), 'sha256'), 'hex') AS identity_set_sha256 "
+      + "FROM lcm.transfer_identities WHERE run_id = $1 GROUP BY domain",
+    values: [run.run_id],
+  }, { ...queryOptions, operation: "verifyGenerationLedgerIdentitySet" });
+  const identitySetByDomain = new Map(identitySetResult.rows.map((row) => [row.domain, row.identity_set_sha256] as const));
+  for (const domain of PORTABLE_RECORD_DOMAIN_ORDER) {
+    const expectedSha256 = digestIdentitySet(input.recordIdentities.get(domain) ?? new Set());
+    const actualSha256 = identitySetByDomain.get(domain) ?? null;
+    if (expectedSha256 !== actualSha256) {
+      mismatches.push({
+        domain, class: "ledger",
+        identitySha256: migrationWitnessSha256(["ledger-identity-set-mismatch-v1", domain]),
+      });
+    }
   }
 
   return mismatches;
@@ -1505,7 +1627,8 @@ async function computeVerificationReport(
         runtime, input.expectedIdentity.id, conversationsPublicOrder, input.signal,
       );
       const searchProbeOutcome = await runSearchSelfMatchProbe(
-        runtime, input.expectedIdentity.id, searchProbeCandidates, input.sampleParameters.seedBasisSha256, input.signal,
+        runtime, input.expectedIdentity.id, input.targetGenerationId,
+        searchProbeCandidates, input.sampleParameters.seedBasisSha256, input.signal,
       );
 
       const session = await runtime.openReadOnlySnapshot({ projectId: input.expectedIdentity.id, signal: input.signal });
@@ -1524,7 +1647,8 @@ async function computeVerificationReport(
           projectId: input.expectedIdentity.id, targetGenerationId: input.targetGenerationId,
           manifestSha256: copySource.stream.describe().manifestSha256,
           identityFingerprintSha256: destinationProbe.identityFingerprintSha256,
-          manifestCheckpoints: manifest.checkpoints, census: destinationRead.census, signal: input.signal,
+          manifestCheckpoints: manifest.checkpoints, census: destinationRead.census,
+          recordIdentities: destinationRead.recordIdentities, signal: input.signal,
         });
       } finally {
         await session.close();

@@ -262,6 +262,7 @@ function fakeSession(overrides: {
   ledgerRun?: { state?: string; manifestSha256?: string; projectSha256?: string } | null;
   ledgerCheckpoints?: readonly ReturnType<typeof defaultLedgerCheckpoint>[];
   ledgerNonInjective?: ReadonlyArray<{ domain: string; nativeKey: string }>;
+  ledgerIdentitySets?: ReadonlyArray<{ domain: string; identitySha256s: readonly string[] }>;
   identityColumns?: ReadonlyArray<{ tableName: string; columnName: string }>;
   migrationsRows?: ReadonlyArray<{ id: string; checksum_sha256: string }>;
   systemIdentifier?: string;
@@ -274,6 +275,7 @@ function fakeSession(overrides: {
     ?? PORTABLE_RECORD_DOMAIN_ORDER.map((domain) => defaultLedgerCheckpoint(domain));
   const ledgerIdentityTotal = overrides.ledgerIdentityTotal ?? LEDGER_TOTAL_RECORD_COUNT_DEFAULT;
   const ledgerNonInjective = overrides.ledgerNonInjective ?? [];
+  const ledgerIdentitySets = overrides.ledgerIdentitySets;
   // Mirrors SEQUENCE_BACKED_IDENTITY_COLUMN by default, so the round-1
   // P2 completeness guard sees an agreeing "live schema" on the default
   // fixture. A test proving the guard fires overrides this to a
@@ -298,6 +300,24 @@ function fakeSession(overrides: {
       }
       if (config.text.includes("GROUP BY domain, native_key")) {
         return { rows: ledgerNonInjective.map((entry) => ({ domain: entry.domain, native_key: entry.nativeKey })) };
+      }
+      if (config.text.includes("string_agg")) {
+        // Round-4 P2: the ledger identity-set digest, computed entirely
+        // server-side (one row per domain, never a per-identity row).
+        // Default: no rows at all, matching every default fixture's
+        // recordIdentities (readDomainPage's default fixture returns no
+        // records for any domain, so recordIdentities is empty
+        // everywhere by construction) -- both sides agree on null for
+        // every domain unless a test explicitly supplies non-empty
+        // identities on one or both sides.
+        if (ledgerIdentitySets === undefined) return { rows: [] };
+        return {
+          rows: ledgerIdentitySets.map((entry) => ({
+            domain: entry.domain,
+            identity_set_sha256: entry.identitySha256s.length === 0
+              ? null : createHash("sha256").update([...entry.identitySha256s].sort().join(""), "utf8").digest("hex"),
+          })),
+        };
       }
       if (config.text.includes("lcm.transfer_identities")) {
         if (overrides.ledgerIdentityTotal === null) return { rows: [] };
@@ -362,6 +382,8 @@ function fakeRuntime(overrides: {
   session?: ReturnType<typeof fakeSession>;
   conversationsRows?: ReadonlyArray<Record<string, unknown>>;
   searchRows?: ReadonlyArray<Record<string, unknown>>;
+  transferRunId?: string | null;
+  transferIdentities?: ReadonlyArray<{ identitySha256: string; nativeKey: string }>;
 } = {}) {
   const session = overrides.session ?? fakeSession();
   // Default: one well-formed match, so the search self-match probe
@@ -376,7 +398,7 @@ function fakeRuntime(overrides: {
   }];
   return {
     health: vi.fn(async () => ({ status: "healthy", backend: "postgresql", tls: true, serverMajorVersion: 18, serverEncoding: "UTF8" })),
-    query: vi.fn(async (config: { text: string }) => {
+    query: vi.fn(async (config: { text: string; values?: readonly unknown[] }) => {
       if (config.text.includes("lcm.conversations")) return { rows: overrides.conversationsRows ?? [] };
       if (config.text.includes("lcm.schema_migrations")) {
         // Round-1 P2: migrationsSha256 now witnesses the destination's
@@ -389,6 +411,31 @@ function fakeRuntime(overrides: {
       }
       if (config.text.includes("pg_collation")) {
         return { rows: [{ collname: "default", collcollate: "C", collctype: "C", collprovider: "c" }] };
+      }
+      if (config.text.includes("lcm.transfer_runs")) {
+        // Round-4 P1: the search probe's pre-window run_id lookup.
+        // overrides.transferRunId === null simulates no completed run
+        // existing at all (every candidate becomes unattributable
+        // immediately); undefined (the default) provides a fixed run
+        // id, matching the sound-destination default everywhere else
+        // in this file.
+        return overrides.transferRunId === null ? { rows: [] } : { rows: [{ run_id: overrides.transferRunId ?? "run-1" }] };
+      }
+      if (config.text.includes("lcm.transfer_identities")) {
+        // Round-4 P1: the search probe's per-candidate identity-to-
+        // native-key correlation. With no explicit mapping supplied,
+        // every candidate correlates to native_key "1", matching
+        // defaultSearchRows' message_id: 1 -- any candidate the default
+        // fixture picks confirms a self-match, exactly like the
+        // pre-round-4 "any non-empty result" default behaviour this
+        // replaces. A supplied mapping models a real destination where
+        // only specific identities were actually copied.
+        if (overrides.transferIdentities !== undefined) {
+          const identitySha256 = config.values?.[1];
+          const match = overrides.transferIdentities.find((entry) => entry.identitySha256 === identitySha256);
+          return { rows: match ? [{ native_key: match.nativeKey }] : [] };
+        }
+        return { rows: [{ native_key: "1" }] };
       }
       return { rows: [{ system_identifier: "7123456789" }] };
     }),
@@ -669,12 +716,14 @@ describe("readLedgerMismatches", () => {
   function ledgerInput(overrides: {
     manifestCheckpoints?: readonly ReturnType<typeof defaultLedgerCheckpoint>[];
     census?: ReturnType<typeof ledgerCensus>;
+    recordIdentities?: ReadonlyMap<PortableDomain, ReadonlySet<string>>;
   } = {}) {
     return {
       projectId, targetGenerationId: "generation-1-postgresql",
       manifestSha256: HASH_A, identityFingerprintSha256: HASH_A,
       manifestCheckpoints: overrides.manifestCheckpoints ?? PORTABLE_RECORD_DOMAIN_ORDER.map((domain) => defaultLedgerCheckpoint(domain)),
       census: overrides.census ?? ledgerCensus(),
+      recordIdentities: overrides.recordIdentities ?? new Map(),
     };
   }
   it("passes when the run, batches and identities all agree with the manifest and census", async () => {
@@ -750,6 +799,37 @@ describe("readLedgerMismatches", () => {
     expect(mismatches).toEqual([{
       domain: "messages", class: "ledger",
       identitySha256: migrationWitnessSha256(["ledger-non-injective-mapping-v1", "messages", "native-key-a"]),
+    }]);
+  });
+  it("passes when a domain's non-empty identity set agrees between the destination's own read and the ledger", async () => {
+    // Proves the comparison is a real set check, not vacuously true
+    // because both sides default to empty: both sides here carry the
+    // same two identities for "messages", in different insertion order
+    // (the comparison must sort, not compare positionally).
+    const session = fakeSession({
+      ledgerIdentitySets: [{ domain: "messages", identitySha256s: [fakeHash("m-a"), fakeHash("m-b")] }],
+    });
+    const mismatches = await readLedgerMismatches(session as never, ledgerInput({
+      recordIdentities: new Map([["messages", new Set([fakeHash("m-b"), fakeHash("m-a")])]]),
+    }));
+    expect(mismatches).toEqual([]);
+  });
+  it("round-4 P2 red case: flags a substitution that preserves cardinality and injectivity but changes which identities were actually copied", async () => {
+    // The exact defect cardinality-plus-injectivity cannot see: the
+    // ledger's identity set for "messages" has the same size (2) and is
+    // injective (two distinct native keys, two distinct identities), but
+    // one of the two identities differs from what the destination's own
+    // read actually contains -- a substitution, not a count or
+    // uniqueness problem.
+    const session = fakeSession({
+      ledgerIdentitySets: [{ domain: "messages", identitySha256s: [fakeHash("m-a"), fakeHash("m-substituted")] }],
+    });
+    const mismatches = await readLedgerMismatches(session as never, ledgerInput({
+      recordIdentities: new Map([["messages", new Set([fakeHash("m-a"), fakeHash("m-b")])]]),
+    }));
+    expect(mismatches).toEqual([{
+      domain: "messages", class: "ledger",
+      identitySha256: migrationWitnessSha256(["ledger-identity-set-mismatch-v1", "messages"]),
     }]);
   });
 });
@@ -2234,6 +2314,58 @@ describe("verifyMigrationGeneration: search self-match probe (round-2 P1)", () =
     const dependencies = dependenciesFor(copySource, runtime);
     const result = await verifyMigrationGeneration(baseInput({ homeDir: "/tmp/lcm-verify-search-pool-cap" }), dependencies);
     expect(result.report.body.publicProbeCoverage).toContainEqual({ probe: "public-search", ran: true });
+  }, 15000);
+
+  it("round-4 P1 red case: a non-empty search result that is not the candidate's own message is never treated as a pass", async () => {
+    // Pre-fix, "results.length > 0" alone made this ran:true on the
+    // very first attempt -- exactly the defect a self-match probe
+    // exists to catch: a search path that ignores its query, or always
+    // returns some fixed unrelated row, would pass every attempt in
+    // the pool. Here the destination search always returns a
+    // well-formed, non-empty result (message_id 999), but never the
+    // message_id the ledger names for the actual candidate tried
+    // (native_key "1", per fakeRuntime's default correlation). The fix
+    // must refuse to call this confirmed.
+    stubDestinationPrimitives();
+    const recordCounts = Object.fromEntries(PORTABLE_RECORD_DOMAIN_ORDER.map((domain, index) => [domain, index])) as Partial<Record<PortableDomain, number>>;
+    const copySource = fakeCopySource({ recordCounts });
+    const runtime = fakeRuntime({
+      searchRows: [{
+        message_id: 999, conversation_id: 1, role: "user", snippet: "unrelated",
+        created_at: "2026-01-01T00:00:00.000Z", rank: 1, match_phase: 0,
+      }],
+    });
+    const dependencies = dependenciesFor(copySource, runtime);
+    const result = await verifyMigrationGeneration(baseInput({ homeDir: "/tmp/lcm-verify-search-unrelated-result" }), dependencies);
+    expect(result.report.body.publicProbeCoverage).toContainEqual({ probe: "public-search", ran: false });
+    expect(result.report.activationEligible).toBe(false);
+  }, 15000);
+
+  it("round-4 red case: an unattributable candidate (no correlating ledger row) is never treated as a pass, even when the search result looks right", async () => {
+    // Absence of a correlation row is not evidence that search works:
+    // the default search rows here (message_id: 1) would confirm the
+    // default candidate if correlation succeeded, but transferIdentities
+    // is forced empty, so every lookup finds zero rows and the walk
+    // must never reach, let alone accept, the search call's result.
+    stubDestinationPrimitives();
+    const recordCounts = Object.fromEntries(PORTABLE_RECORD_DOMAIN_ORDER.map((domain, index) => [domain, index])) as Partial<Record<PortableDomain, number>>;
+    const copySource = fakeCopySource({ recordCounts });
+    const runtime = fakeRuntime({ transferIdentities: [] });
+    const dependencies = dependenciesFor(copySource, runtime);
+    const result = await verifyMigrationGeneration(baseInput({ homeDir: "/tmp/lcm-verify-search-unattributable" }), dependencies);
+    expect(result.report.body.publicProbeCoverage).toContainEqual({ probe: "public-search", ran: false });
+    expect(result.report.activationEligible).toBe(false);
+  }, 15000);
+
+  it("round-4 red case: no completed transfer run means every candidate is unattributable and the probe never confirms a match", async () => {
+    stubDestinationPrimitives();
+    const recordCounts = Object.fromEntries(PORTABLE_RECORD_DOMAIN_ORDER.map((domain, index) => [domain, index])) as Partial<Record<PortableDomain, number>>;
+    const copySource = fakeCopySource({ recordCounts });
+    const runtime = fakeRuntime({ transferRunId: null });
+    const dependencies = dependenciesFor(copySource, runtime);
+    const result = await verifyMigrationGeneration(baseInput({ homeDir: "/tmp/lcm-verify-search-no-run" }), dependencies);
+    expect(result.report.body.publicProbeCoverage).toContainEqual({ probe: "public-search", ran: false });
+    expect(result.report.activationEligible).toBe(false);
   }, 15000);
 
   it("round-2 P1 red case: a listing mismatch alongside a not-run search probe retains the mismatch and still refuses eligibility", async () => {

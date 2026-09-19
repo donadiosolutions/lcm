@@ -15,6 +15,7 @@ import {
   readLedgerMismatches,
   readRelationDanglingReferenceMismatches,
   reconcileDependencyEdges,
+  runSearchSelfMatchProbe,
   readSequenceSelfConsistencyMismatches,
   readSequenceStoredState,
   SEQUENCE_BACKED_IDENTITY_COLUMN,
@@ -46,6 +47,69 @@ it("the census window is a real PostgreSQL READ ONLY transaction that never assi
       } finally {
         await session.close();
       }
+    } finally {
+      await runtime.close();
+    }
+  });
+}, 60000);
+
+/**
+ * Live PostgreSQL 18 proof for the round-4 P1 fix: the search probe's
+ * queries (lcm.transfer_runs run_id lookup, lcm.transfer_identities
+ * correlation lookup, and the real full-text search through
+ * PostgreSqlLexicalSearchRepository.searchMessages) are genuinely
+ * exercised as SQL against a live database, not asserted against a
+ * fake. Round-4's own sequence and ledger fixes were each caught only
+ * by a live query throwing (a wrong pg_sequences join column, and a
+ * missing transfer-table grant); the search probe's queries are new in
+ * the same way and get the same proof rather than an inherited
+ * assumption that they parse and execute correctly.
+ */
+it("the search probe's ledger correlation and real search both run as live SQL and confirm a genuine self-match", async () => {
+  await withPostgreSqlTestDatabase("migration-verification-search-probe", async (db) => {
+    const seeded = await seedPortablePostgreSql(db.migrator);
+    // {transfer: true}: the correlation lookup needs
+    // lcm.transfer_runs/transfer_identities privileges, the same as the
+    // relation-and-ledger live test above.
+    await grantPortablePostgreSql(db, { transfer: true });
+    const runtime = new PostgreSqlRuntime(settings(db.runtimeUrl));
+    try {
+      const runId = "live-search-probe-run";
+      const targetGenerationId = "live-search-probe-target";
+      await db.migrator.query({
+        text: "INSERT INTO lcm.transfer_runs "
+          + "(run_id, target_generation, project_id, manifest_bytes, manifest_sha256, schema_sha256, project_sha256, source_sha256, source_witness_sha256, state) "
+          + "VALUES ($1, $2, $3, $4, $5, $5, $5, $5, $5, 'completed')",
+        values: [runId, targetGenerationId, seeded.expectedIdentity.id, Buffer.from("{}"), "d".repeat(64)],
+      }, { domain: "factory", operation: "seedLiveSearchProbeRun" });
+      // The picked identitySha256 is arbitrary (this test does not
+      // exercise canonicalisation); what matters is that it is the
+      // *only* fact tying the candidate to seeded.messageId, exactly
+      // the correlation the fix performs live.
+      const candidateIdentitySha256 = createHash("sha256").update("live-search-probe-candidate").digest("hex");
+      await db.migrator.query({
+        text: "INSERT INTO lcm.transfer_identities (run_id, domain, identity_sha256, ordinal, native_key, record_sha256) "
+          + "VALUES ($1, 'messages', $2, 0, $3, $4)",
+        values: [runId, candidateIdentitySha256, seeded.messageId, "e".repeat(64)],
+      }, { domain: "factory", operation: "seedLiveSearchProbeIdentity" });
+
+      const outcome = await runSearchSelfMatchProbe(
+        runtime, seeded.expectedIdentity.id, targetGenerationId,
+        [{ ordinal: 0, identitySha256: candidateIdentitySha256, content: "Portable primary message" }],
+        "a".repeat(64),
+      );
+      expect(outcome).toEqual({ ran: true, chosenOrdinal: 0, notRunReason: null });
+
+      // The live-negative half of the same proof: a candidate whose
+      // content never appears in the destination at all must not be
+      // confirmed by a live search that genuinely finds nothing, not
+      // just by fake plumbing that always returns empty.
+      const noMatchOutcome = await runSearchSelfMatchProbe(
+        runtime, seeded.expectedIdentity.id, targetGenerationId,
+        [{ ordinal: 0, identitySha256: candidateIdentitySha256, content: "no-such-content-exists-anywhere-zyx" }],
+        "a".repeat(64),
+      );
+      expect(noMatchOutcome.ran).toBe(false);
     } finally {
       await runtime.close();
     }
@@ -193,10 +257,18 @@ it("flags a table-wide identity collision from another project even when the ver
     const seeded = await seedPortablePostgreSql(db.migrator, { identityOnly: true });
     await grantPortablePostgreSql(db);
     const otherProjectId = "01990000-0000-7000-8000-0000000000ff";
+    // identity_key must match lcm.projects' CHECK constraint
+    // ('^[a-f0-9]{64}$', a SHA-256 hex digest shape), never an
+    // arbitrary descriptive string -- this was a real fixture defect,
+    // confirmed by reading the actual PostgreSQL ERROR/DETAIL from a
+    // live run (projects_identity_key_check), not assumed from where
+    // the wrapping StorageOperationError's generic redacted message
+    // happened to point.
+    const otherProjectIdentityKey = createHash("sha256").update("cross-project-sequence-fixture-identity-key").digest("hex");
     await db.migrator.query({
       text: "INSERT INTO lcm.projects (project_id, identity_key, display_name, created_at, updated_at) "
         + "VALUES ($1, $2, 'Cross-project fixture', now(), now())",
-      values: [otherProjectId, "cross-project-sequence-fixture-identity-key"],
+      values: [otherProjectId, otherProjectIdentityKey],
     }, { domain: "factory", operation: "seedCrossProjectSequenceFixtureProject" });
     await db.migrator.query({
       text: "INSERT INTO lcm.conversations (conversation_id, project_id, session_id, created_at, updated_at) "
@@ -359,17 +431,25 @@ it("relation and ledger read real SQL against a sound fixture and produce no mis
       });
 
       // Warm-up read: learn the real total record count so the ledger
-      // fixture below can be seeded to match it exactly. A second,
-      // authoritative read happens after seeding, inside a fresh
-      // snapshot, which is the one this test actually asserts against.
+      // fixture below can be seeded to match it exactly -- both the
+      // total count and, per round-4 P2, the exact per-domain identity
+      // sets, since the identity-set digest check compares the
+      // destination's own recordIdentities against the ledger's per-
+      // domain identity set and a total-only or fake-hash fixture would
+      // now fail this test for the wrong reason. A second, authoritative
+      // read happens after seeding, inside a fresh snapshot, which is
+      // the one this test actually asserts against; nothing writes to
+      // the destination between the two reads, so the two agree.
       const warmupSession = await runtime.openReadOnlySnapshot({ projectId: seeded.expectedIdentity.id });
-      let totalRecordCount = 0;
+      const identityRows: Array<{ domain: string; identitySha256: string }> = [];
       try {
         const warmupRead = await readFencedDestinationCensus(warmupSession, {
           settings: settings(db.runtimeUrl), expectedOwner: "lcm_test_migrator",
           expectedIdentity: seeded.expectedIdentity, scratchParent,
         });
-        totalRecordCount = warmupRead.census.reduce((sum, entry) => sum + entry.recordCount, 0);
+        for (const [domain, identities] of warmupRead.recordIdentities) {
+          for (const identitySha256 of identities) identityRows.push({ domain, identitySha256 });
+        }
       } finally {
         await warmupSession.close();
       }
@@ -402,10 +482,13 @@ it("relation and ledger read real SQL against a sound fixture and produce no mis
       }, { domain: "factory", operation: "seedLiveLedgerBatches" });
       await db.migrator.query({
         text: "INSERT INTO lcm.transfer_identities (run_id, domain, identity_sha256, ordinal, native_key, record_sha256) "
-          + "SELECT $1, 'machines', encode(digest('live-identity-' || g, 'sha256'), 'hex'), g, "
-          + "'live-native-key-' || g, encode(digest('live-record-' || g, 'sha256'), 'hex') "
-          + "FROM generate_series(0, $2::int - 1) AS g",
-        values: [runId, totalRecordCount],
+          + "SELECT $1, d.domain, d.identity_sha256, d.ordinal, "
+          + "'live-native-key-' || d.ordinal, encode(digest('live-record-' || d.ordinal, 'sha256'), 'hex') "
+          + "FROM unnest($2::text[], $3::text[], $4::bigint[]) AS d(domain, identity_sha256, ordinal)",
+        values: [
+          runId, identityRows.map((row) => row.domain), identityRows.map((row) => row.identitySha256),
+          identityRows.map((_row, index) => index),
+        ],
       }, { domain: "factory", operation: "seedLiveLedgerIdentities" });
 
       const session = await runtime.openReadOnlySnapshot({ projectId: seeded.expectedIdentity.id });
@@ -426,6 +509,7 @@ it("relation and ledger read real SQL against a sound fixture and produce no mis
           projectId: seeded.expectedIdentity.id, targetGenerationId,
           manifestSha256, identityFingerprintSha256: probe.identityFingerprintSha256,
           manifestCheckpoints, census: destinationRead.census,
+          recordIdentities: destinationRead.recordIdentities,
         });
         expect(ledgerMismatches).toEqual([]);
       } finally {

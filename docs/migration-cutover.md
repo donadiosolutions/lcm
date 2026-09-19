@@ -742,26 +742,32 @@ The in-window read -- the fenced census (which also collects `relation`-
 class dependency edges via a second `readDomainPage` walk over the same
 open destination source), the sequence self-consistency check, and the
 `ledger` class's three-table SQL against `transfer_runs`/`transfer_batches`/
-`transfer_identities` -- does not have a fixed cost. Its dominant cost is
-the census: the destination's canonicalisation path reads and re-hashes
-each row individually rather than in batches, and the `relation` class
-re-reads every row a second time through that same per-record path to
-collect dependency edges, so wall time is roughly linear in the number of
-rows in scope, not a flat per-domain overhead. Measured against a live
-PostgreSQL 18 instance with 9,345 rows across the copied domains
-(dominated by conversations, messages and message-parts), the
-census-plus-relation phase took about 100.4 seconds and the ledger phase
-took about 93 milliseconds; together with the read-only guard and the
-sequence check, the whole in-window read took about 100.6 seconds, and the
-two pre-window probes (the public-listing repository read and the
-destination probe) added a further 238 milliseconds outside the lease
-window, for a measured total of about 100.8 seconds. Census-plus-relation
-alone is 99.7% of that total; the ledger, sequence-check and read-only
-guard phases are each under 100 milliseconds and do not materially move
-the figure. This section's name is historical -- the number below covers
-the whole in-window read, not the census alone -- because once `relation`
-and `ledger` existed, splitting the figure back apart would have told an
-operator less, not more, about what `leaseTtlMs` actually needs to cover.
+`transfer_identities` (including, as of round-4 P2, a per-domain identity-
+set digest reconciling exactly which identities the ledger recorded
+against what the destination's own read independently observed) -- does
+not have a fixed cost. Its dominant cost is the census: the destination's
+canonicalisation path reads and re-hashes each row individually rather
+than in batches, and the `relation` class re-reads every row a second
+time through that same per-record path to collect dependency edges, so
+wall time is roughly linear in the number of rows in scope, not a flat
+per-domain overhead. Measured against a live PostgreSQL 18 instance with
+9,345 rows across the copied domains (dominated by conversations,
+messages and message-parts), the census-plus-relation phase took about
+130.5 seconds and the ledger phase (all four of its checks, including the
+round-4 P2 identity-set digest) took about 97.6 milliseconds -- 0.075% of
+the census-plus-relation figure, comfortably inside the 10% abort
+threshold that addition was measured against before it was kept; together
+with the read-only guard and the sequence check, the whole in-window read
+took about 130.7 seconds, and the two pre-window probes (the
+public-listing repository read and the destination probe) added a further
+272 milliseconds outside the lease window, for a measured total of about
+130.9 seconds. Census-plus-relation alone is 99.7% of that total; the
+ledger, sequence-check and read-only guard phases are each under 100
+milliseconds and do not materially move the figure. This section's name
+is historical -- the number below covers the whole in-window read, not
+the census alone -- because once `relation` and `ledger` existed,
+splitting the figure back apart would have told an operator less, not
+more, about what `leaseTtlMs` actually needs to cover.
 
 The extra `relation`-class read pass is structural, not an oversight left
 for a later item. The only surface this driver is permitted to read
@@ -791,21 +797,28 @@ sizing `leaseTtlMs` for a large project should measure the whole in-window
 read against a realistic copy of that project's own row counts before a
 cutover, not discover the lease was too short during one. As a starting
 point rather than a promise, this repository's own measured total above
-(about 100.8 seconds) scaled by a stated 3x safety margin -- not a second
-measurement -- yields `leaseTtlMs = 302,384`; the same approach (measure,
+(about 130.9 seconds) scaled by a stated 3x safety margin -- not a second
+measurement -- yields `leaseTtlMs = 392,787`; the same approach (measure,
 then apply a stated margin, then let the arithmetic be checked) is what an
 operator should repeat against their own data before relying on any
 specific `leaseTtlMs` value. This section has stated 95.9 seconds
-(`leaseTtlMs = 288,787`) and 98.7 seconds (`leaseTtlMs = 297,088`) in
-earlier runs of the same harness against the same fixture; the figures
-above are from a run at this candidate's own commit, after the round-1
-review fixes in this item added one pg_catalog metadata query inside
-the fenced window (the sequence-backed identity-column completeness
-guard) and one before it (reading the destination's own applied-
-migrations table instead of the compiled-in bundle) -- both are single
-queries, not per-row reads, and do not change the census's dominant,
-round-trip-per-record cost, but the small increase across these three
-runs is consistent with that added work plus ordinary host variance.
+(`leaseTtlMs = 288,787`), 98.7 seconds (`leaseTtlMs = 297,088`) and 100.8
+seconds (`leaseTtlMs = 302,384`) in earlier runs of the same harness
+against the same fixture; the figures above are from a run at this
+candidate's own commit, after round-4 added the ledger class's per-domain
+identity-set digest reconciliation (verify-generation.ts's
+`readLedgerMismatches`) inside the fenced window -- one grouped,
+server-side SQL aggregate, not a per-row read, measured against the 10%
+abort threshold before being kept (see
+`.superpowers/624/impl/census-cost.md`) -- and the round-1 review fixes
+that added one pg_catalog metadata query inside the fenced window (the
+sequence-backed identity-column completeness guard) and one before it
+(reading the destination's own applied-migrations table instead of the
+compiled-in bundle). None of these are per-row reads and none changes
+the census's dominant, round-trip-per-record cost; the increase across
+these four runs is consistent with that added work plus ordinary host
+variance.
+
 The authoritative source for these numbers is
 `.superpowers/624/impl/census-cost.md` (worktree-local, regenerated
 by re-running
@@ -813,5 +826,5 @@ by re-running
 not hand-edited); this section is kept in sync with that file rather
 than the reverse. Re-running the same harness against the same fixture
 can itself produce a few seconds of variance on a shared host, as the
-three figures above show, so treat any single run as an estimate to
+four figures above show, so treat any single run as an estimate to
 re-check periodically, not an exact constant.
