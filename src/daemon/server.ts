@@ -797,7 +797,7 @@ export async function createDaemon(config: DaemonConfig, options?: DaemonOptions
     {
       storageFactory,
       withPublicationAdmission: withBackgroundPublicationAdmission,
-      replicatePassiveEvents: (cwd, signal) => passiveEventReplication.run(cwd, signal),
+      replicatePassiveEvents: passiveEventReplication.run,
       signal: shutdownController.signal,
     },
   );
