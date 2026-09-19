@@ -7,6 +7,7 @@ import { migrationWitnessSha256 } from "../../src/migration/activation-witness.j
 import {
   createMigrationVerificationReport,
   MIGRATION_MISMATCH_CLASSES,
+  MIGRATION_PUBLIC_PROBE_ORDER,
   MigrationVerificationReportError,
   type CreateMigrationVerificationReportInput,
 } from "../../src/migration/verification-report.js";
@@ -56,6 +57,7 @@ function baseInput(overrides: Partial<CreateMigrationVerificationReportInput> = 
     classCoverage: MIGRATION_MISMATCH_CLASSES.map((mismatchClass) => ({ class: mismatchClass, ran: true })),
     sampleParameters: { version: 1, strideOrdinal: 97, sampleCount: 32, seedBasisSha256: HASH_D },
     publicProbeSha256: migrationWitnessSha256(["public-probe"]),
+    publicProbeCoverage: MIGRATION_PUBLIC_PROBE_ORDER.map((probe) => ({ probe, ran: true })),
     mismatches: [],
     mismatchTotals: [],
     ...overrides,
