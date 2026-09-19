@@ -16,9 +16,9 @@ full public-probe coverage; the persisted report records all three as
 (the two coverage vectors are independent, so a genuine listing-ordering
 mismatch is never discarded just because the unrelated search probe could
 not evaluate that pass), so eligibility is provable from the artifact
-rather than assumed. A
-report with mismatches is still persisted in full as operator evidence, but
-requires explicit abort and a new generation rather than an in-place retry.
+rather than assumed. A report with mismatches is still persisted in full
+as operator evidence, but requires explicit abort and a new generation
+rather than an in-place retry.
 Reconciliation now includes a sequence self-consistency bound (an identity
 sequence's on-disk state must not allow the next allocation to collide with
 a copied row, distinguishing a privilege gap from a genuinely never-called
@@ -53,3 +53,8 @@ count rather than a flat per-domain cost, and the census, sequence check and
 read-only guard all run inside one fenced window bounded by a single
 verification lease that is never renewed mid-window. See
 `docs/migration-cutover.md` for the measured figure and sizing guidance.
+
+The verification lease is held until the report has been durably
+persisted, not released beforehand, so a second worker cannot acquire it
+and start a concurrent recomputation while this attempt's own persist is
+still in flight.
