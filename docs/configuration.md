@@ -999,12 +999,22 @@ interactive session, but the daemon is launched through the trusted
 addresses). Process-based Claude and Codex providers also receive
 `CLAUDE_CONFIG_DIR` and `CODEX_HOME` only when each is an absolute, canonical,
 user-owned private directory. For managed systemd and launchd starts, `PATH` is
-synthesized from the trusted packaged daemon entrypoint and fixed system
-directories so the service sees the same provider search path that `lcm doctor`
-checks, even when the command was invoked through a user-level wrapper. Default
-managed lifecycle calls use that same packaged entrypoint in their manager
-arguments, keeping start and restart admission on one stable identity. Doctor
-observes that same packaged runtime identity without invoking lifecycle work.
+synthesized from directly observed absolute executables, authenticated
+per-user package layouts, and fixed system directories. Derived package-manager
+bins such as `~/.local/bin` are included only when the layout is recognized and
+its canonical prefix is rooted at the authenticated owner home. An implicit
+home is trusted when it resolves to the operating-system account home, or when
+the resolved directory is owned by the current user and is not group- or
+other-writable. If account lookup, path resolution, or ownership validation
+fails, managed start and restart omit per-user derived bins while retaining
+directly observed executables and fixed system directories. Checkout-contained
+`.local` directories and renamed package prefixes are never promoted into the
+stable managed PATH, even when the caller is outside that checkout. Default
+managed lifecycle calls use the packaged entrypoint in their manager arguments,
+keeping start and restart admission on one stable identity. `lcm doctor`
+observes the packaged runtime without invoking lifecycle work; its caller-scoped
+non-stable PATH observation is intentionally distinct from managed-launch home
+authentication.
 Service identity metadata and credential-file markers are passed as
 names and paths only. API keys and database URLs are never copied into argv,
 unit properties, plist contents, or logs; the daemon reads them from the

@@ -6,6 +6,7 @@ import type { RecallFeedback } from "../../../src/db/recall.js";
 import type { DaemonConfig } from "../../../src/daemon/config.js";
 import type { ProjectStorage, StorageBackendFactory } from "../../../src/storage/index.js";
 import { StorageOperationError } from "../../../src/storage/errors.js";
+import { BackendPublicationJournalError } from "../../../src/storage/backend-publication.js";
 import { makeMockStorageFactory } from "./mock-storage-factory.js";
 
 const state = vi.hoisted(() => ({
@@ -335,6 +336,30 @@ describe("prompt-search route coverage", () => {
 
     expect(output.status()).toBe(503);
     expect(output.json()).toEqual(failure.toJSON());
+    expect(state.closed).toEqual(["project"]);
+    expect(state.factoryClosed).toBe(1);
+  });
+
+  it("returns a sanitized 503 for a surfacing publication-journal failure", async () => {
+    state.searchResults = [result()];
+    state.logError = new BackendPublicationJournalError(
+      "unexpected-state",
+      "private publication detail",
+    );
+    const output = response();
+
+    await createPromptSearchHandler(config())(
+      {} as never,
+      output.res,
+      JSON.stringify({ query: "q", cwd: "/tmp" }),
+    );
+
+    expect(output.status()).toBe(503);
+    expect(output.json()).toEqual({
+      status: "blocked",
+      error: "backend publication admission blocked",
+    });
+    expect(JSON.stringify(output.json())).not.toContain("private publication detail");
     expect(state.closed).toEqual(["project"]);
     expect(state.factoryClosed).toBe(1);
   });

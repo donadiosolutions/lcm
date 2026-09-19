@@ -352,6 +352,8 @@ const expectedComponents = [
       "^src/daemon/lifecycle-scope\\.ts$",
       "^src/daemon/lifecycle\\.ts$",
       "^src/daemon/managed-credentials\\.ts$",
+      // #1450 keeps stable managed PATH canonicalization and direct executable
+      // admission in this existing service-manager owner.
       "^src/daemon/managed-path\\.ts$",
       "^src/daemon/supervisor\\.ts$",
     ],
@@ -628,7 +630,7 @@ describe("Codecov configuration", () => {
     expect(ownershipCounts.size).toBe(244);
   });
 
-  test("keeps response-fence and #681/#700/#701/#703/#705/#709/#710/#713/#756/#726/#734/#737/#742/#760/#763/#804/#805/#824/#825/#833/#888/#864/#866/#722/#786/#952/#814/#882/#930/#969/#989/#1003/#1049/#964/#1106/#1191/#1196/#1229/#1321/#1338/#1347/#1353/#1354/#1356/#1357/#1358/#1403/#1383/#1384/#1395 files in their intended components", () => {
+  test("keeps response-fence and #681/#700/#701/#703/#705/#709/#710/#713/#756/#726/#734/#737/#742/#760/#763/#804/#805/#824/#825/#833/#888/#864/#866/#722/#786/#952/#814/#882/#930/#969/#989/#1003/#1049/#964/#1106/#1191/#1196/#1229/#1321/#1338/#1347/#1353/#1354/#1356/#1357/#1358/#1403/#1450/#1383/#1384/#1395 files in their intended components", () => {
     const config = readCodecovConfig();
     expect(config).toBeDefined();
     if (config === undefined) {
@@ -719,6 +721,7 @@ describe("Codecov configuration", () => {
       // fencing remain installer-owned.
       ["installer/install.ts", "unit-installation"],
       // #1201 observation parser/client, allowlist and server retain daemon-core ownership.
+      // Prompt-search publication dispatch remains daemon-core-owned.
       ["src/daemon/client.ts", "unit-daemon-core"],
       ["src/daemon/http-url.ts", "unit-daemon-core"],
       ["src/daemon/config.ts", "unit-daemon-core"],
@@ -733,7 +736,9 @@ describe("Codecov configuration", () => {
       ["src/daemon/routes/session-complete.ts", "unit-daemon-routes"],
       ["src/daemon/routes/review-stale.ts", "unit-daemon-routes"],
       // #1148 keeps promoted created_at UTC parsing in the existing daemon
-      // routes owner; prompt-search and restore retain their route ownership.
+      // routes owner; prompt-search publication errors and restore retain their
+      // route ownership.
+      ["src/daemon/routes/prompt-search.ts", "unit-daemon-routes"],
       // #1203 adds native recall evidence without changing component topology.
       ["src/db/promoted-recall-evidence.ts", "unit-local-persistence"],
       ["src/storage/postgresql/tsquery-evidence.ts", "integration-postgresql-search"],
@@ -813,6 +818,9 @@ describe("Codecov configuration", () => {
       // convergence, and bounded birth samples in the service-manager component.
       ["src/daemon/lifecycle-scope.ts", "integration-service-managers"],
       ["src/daemon/lifecycle.ts", "integration-service-managers"],
+      // #1450 keeps canonical stable managed PATH construction and direct
+      // executable admission in the existing service-manager owner.
+      ["src/daemon/managed-path.ts", "integration-service-managers"],
       ["src/daemon/supervisor.ts", "integration-service-managers"],
       // #837 consumer-admission descriptor cleanup remains storage-owned.
       // #1042 consumer descriptor cleanup and typed error classification remain storage-owned.
@@ -876,7 +884,11 @@ describe("Codecov configuration", () => {
       ["src/storage/sqlite/project-storage.ts", "unit-local-persistence"],
       // #1020 keeps message timestamp mapping in the existing local-persistence
       // component; conversation timestamps remain on their existing mapper.
+      // G007 keeps SQLite regex snippet redaction and Unicode bounding in this
+      // existing owner without changing the component taxonomy.
       ["src/store/conversation-store.ts", "unit-local-persistence"],
+      ["src/store/summary-store.ts", "unit-local-persistence"],
+      ["src/store/regex-snippet.ts", "unit-local-persistence"],
       ["src/db/stored-timestamp.ts", "unit-local-persistence"],
       ["src/hooks/event-scrubbing.ts", "unit-hooks"],
       // #1229 local-enqueue health-token forwarding stays hook-owned.

@@ -121,6 +121,7 @@ component_management:
         # its processed-event prune predicate hook-owned.
         - "src/hooks/"
     # #1201 keeps process-only observation, its parser/client, and route allowlist here.
+    # Prompt-search publication dispatch remains daemon-core-owned.
     - component_id: "unit-daemon-core"
       name: "Unit - Daemon Core"
       paths:
@@ -176,6 +177,7 @@ component_management:
         # The #700 cancellation-aware open lifecycle and compact/restore response
         # handling remain route-owned; #703 describe/expand compatibility errors,
         # #705 prompt-search surfacing-log failures, #709 search and grep routes,
+        # and prompt-search publication-error handling remain route-owned.
         # #710 grep mode, #792 session filtering, #793 search-limit validation,
         # #794 grep-since validation, #825 bounded atomic promotion metadata,
         # #1217 native snapshot retries, preparation/admission and attempt lifetime remain route-owned.
@@ -471,6 +473,8 @@ component_management:
         - "^src/daemon/lifecycle-scope\\.ts$"
         - "^src/daemon/lifecycle\\.ts$"
         - "^src/daemon/managed-credentials\\.ts$"
+        # #1450 keeps stable managed PATH canonicalization and direct executable
+        # admission in this existing service-manager owner.
         - "^src/daemon/managed-path\\.ts$"
         # #786/#952 creation-only daemon-tmp rollback remains service-manager owned.
         - "^src/daemon/supervisor\\.ts$"
