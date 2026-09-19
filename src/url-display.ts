@@ -1,3 +1,4 @@
+// Absolute URIs start with a scheme; protocol-relative values start with //.
 const ABSOLUTE_URI_VALUE_PATTERN = /^\s*[a-z][a-z\d+.-]*:\/\//i;
 const PROTOCOL_RELATIVE_URL_VALUE_PATTERN = /^\s*\/\//;
 const URL_KEY_SUFFIXES = [
