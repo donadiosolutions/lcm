@@ -624,11 +624,34 @@ export class EventsDb {
     this.db.prepare("DELETE FROM missing_cwd_state WHERE id = 1").run();
   }
 
-  pruneProcessed(olderThanDays: number): number {
+  /**
+   * Delete processed events past the retention window.
+   *
+   * Pass `awaitingReplication: false` only when PostgreSQL replication cannot
+   * claim these rows. #91 added the acknowledged/remote-pruned gate so that an
+   * event is never destroyed before the remote inbox durably holds it, which is
+   * correct wherever replication runs. That gate is unsatisfiable without a
+   * remote inbox, though, because the schema requires `remote_inbox_id` for
+   * `'acknowledged'`. A SQLite-backed install therefore pruned nothing at all
+   * and its events table grew without bound (#1395).
+   *
+   * With replication absent, a row that never entered the remote pipeline is
+   * prunable on age alone, as it was before #91. A row that does carry remote
+   * state still needs the full drained proof, so an install that moved from
+   * PostgreSQL back to SQLite cannot lose an undrained event.
+   */
+  pruneProcessed(
+    olderThanDays: number,
+    options: { awaitingReplication?: boolean } = {},
+  ): number {
+    const drained = "delivery_state = 'acknowledged' AND remote_pruned_at IS NOT NULL";
+    const prunable = options.awaitingReplication === false
+      ? `((${drained})
+          OR (remote_inbox_id IS NULL AND delivery_state IN ('pending', 'retry')))`
+      : drained;
     const result = this.db.prepare(
       `DELETE FROM events WHERE processed_at IS NOT NULL
-       AND delivery_state = 'acknowledged'
-       AND remote_pruned_at IS NOT NULL
+       AND ${prunable}
        AND processed_at < datetime('now', '-' || ? || ' days')`
     ).run(olderThanDays);
     return Number(result.changes);

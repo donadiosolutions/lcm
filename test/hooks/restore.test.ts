@@ -521,6 +521,42 @@ describe("handleSessionStart", () => {
     }
   });
 
+  // #1395: only a PostgreSQL install can drain an event to a remote inbox, so
+  // only there may retention wait for that proof. A SQLite install that waited
+  // for it pruned nothing at all.
+  it.each([
+    ["sqlite", false],
+    ["postgresql", true],
+  ] as const)("scavenges SessionStart retention for a %s backend", async (backend, awaitingReplication) => {
+    const restoreHome = usePrivatePublicationHome("lcm-restore-retention-");
+    const outbox = {
+      pruneProcessed: vi.fn().mockResolvedValue(0),
+      pruneUnprocessed: vi.fn().mockResolvedValue({ pruned: 0 }),
+      pruneErrorLog: vi.fn().mockResolvedValue(0),
+      getUnprocessed: vi.fn().mockResolvedValue([]),
+    };
+    const open = vi.spyOn(SQLiteLocalHookOutboxFactory.prototype, "open")
+      .mockResolvedValue(outbox as never);
+    const close = vi.spyOn(SQLiteLocalHookOutboxFactory.prototype, "close")
+      .mockResolvedValue(undefined);
+    mockEnsureDaemon.mockResolvedValue({ connected: true, port: 3737, spawned: false });
+
+    try {
+      await expect(handleSessionStart(
+        JSON.stringify({ session_id: `retention-${backend}`, cwd: "/proj" }),
+        { post: vi.fn().mockResolvedValue({ context: "restored" }) },
+        undefined,
+        { backend },
+      )).resolves.toEqual({ exitCode: 0, stdout: "restored" });
+      expect(outbox.pruneProcessed).toHaveBeenCalledWith(7, { awaitingReplication });
+    } finally {
+      open.mockRestore();
+      close.mockRestore();
+      rmSync(sessionLockPathForTesting(`retention-${backend}`), { force: true });
+      restoreHome();
+    }
+  });
+
   it.each([
     "open",
     "pruneProcessed",

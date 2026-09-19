@@ -206,9 +206,8 @@ Sidecars that are missing project metadata are reported separately because their
 ### Separate PostgreSQL event delivery
 
 When PostgreSQL storage is configured, issue #91 provides a separate explicit
-event-delivery worker for the local outbox. It is not started automatically by
-the daemon and is distinct from the daemon's selected `ProjectStorage` route
-consumer. The worker:
+event-delivery worker for the local outbox, distinct from the daemon's selected
+`ProjectStorage` route consumer. The worker:
 
 1. acquires and renews the existing #90 fenced drain lease;
 2. claims a ready local sequence prefix in a bounded batch;
@@ -226,6 +225,58 @@ concurrently. Retry delay uses bounded exponential backoff with deterministic
 jitter, stale claims are recoverable, and poison events remain inspectable
 until exact replay.
 
+Applying a claimed event performs no additional remote work. The inbox row is
+itself the delivery artifact and memory promotion happens locally through the
+selected project storage, so an event is fully delivered once its inbox row is
+durably `applied`. Whether a real remote-side effect was originally intended
+here is tracked in issue #1398.
+
+#### When the daemon runs it
+
+Through issue #91 this worker was **not started automatically by the daemon**.
+It was complete but had no production caller, so in practice nothing advanced a
+local event past `replicated`, and the acknowledged-and-remote-pruned state
+that local retention depends on was unreachable. That was issue #1383.
+
+A PostgreSQL-backed daemon now drives replication itself. Each pass runs on the
+existing passive-event sweep, once at daemon startup and then every five
+minutes, and covers one project per scanned sidecar. The lease owner is the
+daemon instance id, so fencing follows daemon lifetime and a restarted daemon
+cannot reuse its predecessor's lease. Batch size, lease TTL, retry backoff and
+quarantine thresholds keep their built-in values and are not configurable.
+
+A pass only runs for a project when all of the following hold. Each is a quiet
+skip rather than an error:
+
+1. the daemon's storage backend is `postgresql`;
+2. a machine identity is registered;
+3. the project is linked to a remote project id; and
+4. PostgreSQL storage reports healthy.
+
+A SQLite-backed daemon fails the first check and never opens a PostgreSQL
+connection, so its behaviour is unchanged. Replication is still not started by
+a hook, and it remains separate from the selected `ProjectStorage` route.
+
+Every project is admitted through the same publication check that promotion
+uses, immediately before it replicates. A daemon keeps its startup backend for
+its whole lifetime, so when the configured backend changes underneath it the
+admission refuses, the daemon halts exactly as it does for promotion, and no
+event is uploaded to a backend the daemon has already lost.
+
+Each pass releases its project outbox when it finishes. The local outbox
+factory registers every repository it opens and drops one only when that
+repository closes, so a daemon holds one SQLite connection per project while
+that project is replicating and none between passes.
+
+`lcm status` reports what replication has done under `passiveEvents`: whether
+it is `enabled` at all, the `lastPassAt` timestamp, how many passes and
+projects were attempted, and how many events were uploaded, applied,
+acknowledged, pruned, retried and quarantined. A daemon that has never
+replicated reports `enabled: false` with zero counters, which distinguishes
+"nothing to do" from "never ran". A SQLite daemon reports `enabled: false`
+permanently and records no passes, because replication is not something it can
+ever do. Counts only; no payloads or project paths.
+
 The staged operator commands are:
 
 ```bash
@@ -238,8 +289,9 @@ lcm events replay <event-id> [--machine <machine-id>] [--json]
 They require PostgreSQL configuration, a registered machine, and a linked
 remote project. `status` and `validate` expose the durable checkpoints;
 `quarantine` lists local compatibility failures and remote poison rows; and
-`replay` retries one exact local or remote event. These commands do not start
-replication. CLI/import-export remains #618-owned. Stats and doctor expose
+`replay` retries one exact local or remote event. They inspect and repair; the
+daemon drives replication, not these commands. CLI/import-export remains
+#618-owned. Stats and doctor expose
 observed local outbox counts alongside selected-backend readiness through the
 [shared diagnostic snapshot](cli.md#observational-diagnostics).
 

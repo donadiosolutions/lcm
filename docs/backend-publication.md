@@ -254,6 +254,20 @@ own authoritative terminal readback.
 After an authenticated abort, SQLite consumer admission resumes. After selected-
 generation completion, only the recorded target backend is admitted.
 
+A daemon that is already running authenticates its startup backend once and
+keeps it for its whole lifetime. Changing the configured backend underneath it
+does not migrate that process: every later request and background sweep
+compares the freshly loaded configuration against the frozen startup backend
+and refuses with a `backend-mismatch` publication error. Only a restart can
+resolve that divergence, so the daemon's background passive-event work stops
+after the first refusal instead of retrying on its five-minute sweep interval,
+records the halt, and reports it once. The unauthenticated `/health` response
+then carries a `passiveEvents` object with `halted`, `haltedReason`, and
+`haltedMessage`; it is absent on a healthy daemon. Health is the surface to
+check for this, because read admission refuses `/status` and every other route
+under the same mismatch. The next hook run observes the `/health` backend
+mismatch through `ensureDaemon` and replaces the daemon, which clears the halt.
+
 Do not edit a held journal to release it. Preserve the journal and snapshot
 generation when capture, selection, or abort readback fails. A migration report,
 elapsed time, or apparently quiet outbox is not release evidence.

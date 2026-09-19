@@ -4,6 +4,7 @@ import { validateCwd } from "../validate-cwd.js";
 import { collectStats, StatsUnavailableError } from "../../stats.js";
 import { backendDiagnosticFailure } from "../../storage/diagnostics.js";
 import type { StorageBackendFactory } from "../../storage/contracts.js";
+import type { PassiveEventBackgroundDiagnostics } from "../passive-event-processor.js";
 
 export function createStatusHandler(
   config: DaemonConfig,
@@ -11,6 +12,7 @@ export function createStatusHandler(
   actualPort?: number,
   homeDir?: string,
   storageFactory?: StorageBackendFactory,
+  passiveEventDiagnostics?: () => PassiveEventBackgroundDiagnostics,
 ): RouteHandler {
   return async (_req, res, body, context) => {
     let input: unknown;
@@ -31,11 +33,15 @@ export function createStatusHandler(
       uptime: Math.max(0, Math.floor((Date.now() - startTime) / 1000)),
       port: actualPort ?? config.daemon.port,
     };
+    // #1384: a halted background sweep is only a defect if nobody can see it.
+    const passiveEvents = passiveEventDiagnostics?.();
+    const background = passiveEvents === undefined ? {} : { passiveEvents };
     try {
       const stats = await collectStats({ cwd, homeDir, storageFactory, signal: context?.signal });
       sendJson(res, 200, {
         daemon,
         backendDiagnostics: stats.backendDiagnostics,
+        ...background,
         project: {
           messageCount: stats.messages,
           summaryCount: stats.summaries,
@@ -47,6 +53,7 @@ export function createStatusHandler(
         daemon,
         backendDiagnostics: error instanceof StatsUnavailableError
           ? error.diagnostics : backendDiagnosticFailure(error, config.storage.backend),
+        ...background,
       });
     }
   };

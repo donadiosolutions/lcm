@@ -58,6 +58,40 @@ describe("status observation boundaries", () => {
       project: { messageCount: 2, summaryCount: 3, promotedCount: 4 },
     });
   });
+
+  // #1383: "never ran" has to be as legible from outside as "ran at T".
+  it("reports background passive-event replication when a source is supplied", async () => {
+    const res = {} as never;
+    const background = {
+      halted: false,
+      haltedReason: null,
+      haltedMessage: null,
+      replication: {
+        enabled: true,
+        lastPassAt: "2026-09-19T04:00:00.000Z",
+        passes: 2,
+        projects: 1,
+        uploaded: 7,
+        applied: 6,
+        acknowledged: 6,
+        pruned: 5,
+        retried: 1,
+        quarantined: 0,
+      },
+    };
+    const handler = createStatusHandler(
+      config, Date.now(), 4321, "/owned", {} as never, () => background,
+    );
+    await handler({} as never, res, '{"cwd":"/project"}');
+    expect(mocks.send.mock.calls.at(-1)?.[2])
+      .toHaveProperty("passiveEvents", background);
+
+    // The same block survives a diagnostics failure response.
+    mocks.collect.mockRejectedValueOnce(new StatsUnavailableError(diagnostic));
+    await handler({} as never, res, '{"cwd":"/project"}');
+    expect(mocks.send.mock.calls.at(-1)?.[2])
+      .toHaveProperty("passiveEvents", background);
+  });
   it("omits unknown metrics and arbitrary metadata after classified failures", async () => {
     const res = {} as never;
     mocks.collect.mockRejectedValueOnce(new StatsUnavailableError(diagnostic));

@@ -247,7 +247,11 @@ export async function handleSessionStart(
               assertStableRoot(rootHandle, rootPath, rootWitness);
               const eventsDb = await outboxFactory.open(eventsDbPath(cwd), {}, lockToken);
               try {
-                await eventsDb.pruneProcessed(7);
+                // #1395: only a PostgreSQL install can drain events to a remote
+                // inbox, so only there must retention wait for that proof.
+                await eventsDb.pruneProcessed(7, {
+                  awaitingReplication: storage.backend === "postgresql",
+                });
                 await eventsDb.pruneUnprocessed(10_000, 30);
                 await eventsDb.pruneErrorLog(30);
                 const unprocessed = await eventsDb.getUnprocessed(1);
