@@ -281,6 +281,8 @@ vi.mock("../../src/daemon/managed-credentials.js", async (importOriginal) => {
 });
 
 const roots: string[] = [];
+const currentTestUid = (): number => process.getuid?.() ?? 1000;
+const TEST_UID = currentTestUid();
 
 afterEach(() => {
   vi.restoreAllMocks();
@@ -331,7 +333,7 @@ function writePid(rootPath: string, pid: number): string {
 function writeProc(rootPath: string, pid: number, parentPid = 1, command = "node /lcm daemon start --foreground"): void {
   const dir = join(rootPath, String(pid));
   mkdirSync(dir, { recursive: true });
-  writeFileSync(join(dir, "status"), `Name:\tnode\nUid:\t1000\t1000\t1000\t1000\nPPid:\t${parentPid}\n`);
+  writeFileSync(join(dir, "status"), `Name:\tnode\nUid:\t${String(TEST_UID)}\t${String(TEST_UID)}\t${String(TEST_UID)}\t${String(TEST_UID)}\nPPid:\t${parentPid}\n`);
   writeFileSync(join(dir, "cmdline"), command.replaceAll(" ", "\0"));
 }
 
@@ -353,7 +355,7 @@ function hermetic(options: EnsureDaemonOptions, environment: NodeJS.ProcessEnv =
     credentialDir: join(stateDir, ".credentials"),
     procRoot: options._procRoot === "/proc" ? join(stateDir, ".proc") : options._procRoot ?? join(stateDir, ".proc"),
     platform: options._platform ?? "linux",
-    uid: options._uid ?? 1000,
+    uid: options._uid ?? currentTestUid(),
     environment,
     fetch: options._fetchOverride ?? (vi.fn().mockRejectedValue(new Error("offline")) as FetchOverride),
     spawn: options._spawnOverride ?? (vi.fn(() => ({ pid: undefined, once: vi.fn().mockReturnThis(), unref: vi.fn() })) as unknown as SpawnOverride),
@@ -801,7 +803,7 @@ describe("ensureDaemon restart and terminal coverage", () => {
       ...baseOptions(dir),
       enforceUserManagerParent: true,
       _procRoot: procRoot,
-      _uid: 1000,
+      _uid: TEST_UID,
       _isProcessAliveOverride: () => alive,
       _processStartTimeForTesting: () => "birth",
       _killOverride: kill,
@@ -1122,7 +1124,7 @@ describe("ensureDaemon restart and terminal coverage", () => {
       ...baseOptions(dir),
       enforceUserManagerParent: true,
       _procRoot: procRoot,
-      _uid: 1000,
+      _uid: TEST_UID,
       _isProcessAliveOverride: () => alive,
       _killOverride: kill,
       _listeningPortsOverride: () => [],

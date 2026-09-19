@@ -67,6 +67,8 @@ type ScopeFixture = {
 };
 
 const roots: string[] = [];
+const currentTestUid = (): number => process.getuid?.() ?? 1000;
+const TEST_UID = currentTestUid();
 function shouldCollectSystemdBarrier(
   command: string,
   args: readonly string[],
@@ -273,7 +275,7 @@ function withHermeticLifecycleSeams(
     credentialDir,
     procRoot,
     platform: options._platform ?? "linux",
-    uid: options._uid ?? 1000,
+    uid: options._uid ?? currentTestUid(),
     environment: {},
     fetch: options._fetchOverride
       ?? (vi.fn().mockRejectedValue(new Error("hermetic offline")) as never),
@@ -1180,7 +1182,7 @@ describe("daemon lifecycle test-scope validation", () => {
         _realpathOverride: path => path,
         _platform: "linux",
         _procRoot: join(fixture.root, "proc"),
-        _uid: 1000,
+        _uid: TEST_UID,
         _skipHealthWait: true,
       })).resolves.toMatchObject({
         connected: false,
@@ -1736,7 +1738,7 @@ describe("run-owned lifecycle resources", () => {
     mkdirSync(join(procRoot, String(managerPid)), { recursive: true });
     writeFileSync(
       join(procRoot, String(daemonPid), "status"),
-      `Name:\tlcm\nUid:\t1000\t1000\t1000\t1000\nPPid:\t${managerPid}\n`,
+      `Name:\tlcm\nUid:\t${String(TEST_UID)}\t${String(TEST_UID)}\t${String(TEST_UID)}\t${String(TEST_UID)}\nPPid:\t${managerPid}\n`,
     );
     writeFileSync(
       join(procRoot, String(daemonPid), "cmdline"),
@@ -1744,7 +1746,7 @@ describe("run-owned lifecycle resources", () => {
     );
     writeFileSync(
       join(procRoot, String(managerPid), "status"),
-      "Name:\tsystemd\nUid:\t1000\t1000\t1000\t1000\nPPid:\t1\n",
+      `Name:\tsystemd\nUid:\t${String(TEST_UID)}\t${String(TEST_UID)}\t${String(TEST_UID)}\t${String(TEST_UID)}\nPPid:\t1\n`,
     );
     writeFileSync(
       join(procRoot, String(managerPid), "cmdline"),
@@ -1776,7 +1778,7 @@ describe("run-owned lifecycle resources", () => {
       ...scopedOptions(fixture),
       _testScope: scope,
       _procRoot: procRoot,
-      _uid: 1000,
+      _uid: TEST_UID,
       _listeningPortsOverride: () => [48_321],
     })).resolves.toMatchObject({
       connected: false,

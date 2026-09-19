@@ -13,6 +13,8 @@ import {
 import type { DaemonLifecycleHermeticTestSeams } from "../../src/daemon/lifecycle-scope.js";
 
 const dirs: string[] = [];
+const currentTestUid = (): number => process.getuid?.() ?? 1000;
+const TEST_UID = currentTestUid();
 type EnsureDaemonOptions = Parameters<typeof ensureDaemonProduction>[0];
 afterEach(() => { vi.restoreAllMocks(); for (const dir of dirs.splice(0)) rmSync(dir, { recursive: true, force: true }); });
 const temp = () => { const d = mkdtempSync(join(tmpdir(), "lcm-core-life-")); dirs.push(d); return d; };
@@ -71,7 +73,7 @@ function withHermeticLifecycleSeams(options: EnsureDaemonOptions): EnsureDaemonO
     credentialDir,
     procRoot,
     platform: options._platform ?? "linux",
-    uid: options._uid ?? 1000,
+    uid: options._uid ?? currentTestUid(),
     environment: {},
     fetch: options._fetchOverride
       ?? (vi.fn().mockRejectedValue(new Error("hermetic offline")) as never),
@@ -506,11 +508,11 @@ describe("lifecycle procfs and parent warnings", () => {
   it.each([
     ["dead", false, "node lcm daemon start --foreground", "PPid:\t1\n", false, undefined],
     ["wrong", true, "node other", "PPid:\t1\n", false, "could not be authenticated"],
-    ["parent", true, "node lcm daemon start --foreground", "Uid:\t1000\n", true, "parent could not be read"],
+    ["parent", true, "node lcm daemon start --foreground", `Uid:\t${String(TEST_UID)}\n`, true, "parent could not be read"],
   ])("handles %s PID metadata after endpoint identity checks", async (_name, alive, command, daemonStatus, connected, warning) => {
     const dir = temp(); const procRoot = join(dir, "proc"); mkdirSync(procRoot);
     const pidPath = join(dir, "daemon.pid"); writeFileSync(pidPath, "20"); ensureAuthToken(join(dir, "daemon.token"));
-    proc(procRoot, 10, "Uid:\t1000\nPPid:\t1\n", "systemd --user");
+    proc(procRoot, 10, `Uid:\t${String(TEST_UID)}\nPPid:\t1\n`, "systemd --user");
     proc(procRoot, 20, daemonStatus, command);
     const fetch = fetchHealthy(20);
     // observeHttpHealth owns a real wall-clock deadline not controlled by
@@ -520,7 +522,7 @@ describe("lifecycle procfs and parent warnings", () => {
       port: 1, pidFilePath: pidPath, spawnTimeoutMs: 100, enforceUserManagerParent: true,
       expectedVersion: "1",
       expectedEntrypoint: "lcm",
-      _platform: "linux", _procRoot: procRoot, _uid: 1000, _fetchOverride: fetch as never,
+      _platform: "linux", _procRoot: procRoot, _uid: TEST_UID, _fetchOverride: fetch as never,
       _isProcessAliveOverride: () => alive, _listeningPortsOverride: () => [1], _skipSpawn: true,
       _processStartTimeForTesting: pid => `birth-${String(pid)}`,
       _monotonicNowOverride: (): number => 0,
@@ -541,7 +543,7 @@ describe("lifecycle procfs and parent warnings", () => {
 
     const dir = temp(); const procRoot = join(dir, "proc"); mkdirSync(procRoot);
     const pidPath = join(dir, "daemon.pid"); writeFileSync(pidPath, "31"); ensureAuthToken(join(dir, "daemon.token"));
-    proc(procRoot, 31, "Uid:\t1000\nPPid:\t1\n");
+    proc(procRoot, 31, `Uid:\t${String(TEST_UID)}\nPPid:\t1\n`);
     const runtimeIdentity = {
       entrypoint: "/fixture/lcm-daemon",
       runtimeDigest: "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef",
@@ -553,7 +555,7 @@ describe("lifecycle procfs and parent warnings", () => {
       port: 1, pidFilePath: pidPath, spawnTimeoutMs: 1, enforceUserManagerParent: true,
       expectedVersion: "1", expectedEntrypoint: runtimeIdentity.entrypoint,
       expectedRuntimeDigest: runtimeIdentity.runtimeDigest,
-      _platform: "linux", _procRoot: procRoot, _uid: 1000, _fetchOverride: fetchHealthy(31, runtimeIdentity) as never,
+      _platform: "linux", _procRoot: procRoot, _uid: TEST_UID, _fetchOverride: fetchHealthy(31, runtimeIdentity) as never,
       _isProcessAliveOverride: () => true, _listeningPortsOverride: () => [1], _skipSpawn: true,
       _processStartTimeForTesting: pid => `birth-${String(pid)}`,
       _monotonicNowOverride: (): number => 0,
@@ -607,7 +609,7 @@ describe("lifecycle spawn and restart failure boundaries", () => {
     vi.spyOn(performance, "now").mockReturnValue(0);
     const dir = temp(); const procRoot = join(dir, "proc"); mkdirSync(procRoot);
     const pidPath = join(dir, "daemon.pid"); writeFileSync(pidPath, "33"); ensureAuthToken(join(dir, "daemon.token"));
-    proc(procRoot, 33, "Uid:\t1000\nPPid:\t1\n", "node lcm daemon start --foreground");
+    proc(procRoot, 33, `Uid:\t${String(TEST_UID)}\nPPid:\t1\n`, "node lcm daemon start --foreground");
     let aliveState = true;
     const kill = vi.fn(() => { aliveState = false; });
     const alive = vi.fn(() => aliveState);
@@ -676,14 +678,14 @@ describe("lifecycle spawn and restart failure boundaries", () => {
   it("accepts a daemon whose parent is the user systemd manager", async () => {
     const dir = temp(); const root = join(dir, "proc"); mkdirSync(root);
     const pidPath = join(dir, "daemon.pid"); writeFileSync(pidPath, "20"); ensureAuthToken(join(dir, "daemon.token"));
-    proc(root, 10, "Uid:\t1000\nPPid:\t1\n", "systemd --user");
-    proc(root, 20, "Uid:\t1000\nPPid:\t10\n", "node lcm daemon start --foreground");
+    proc(root, 10, `Uid:\t${String(TEST_UID)}\nPPid:\t1\n`, "systemd --user");
+    proc(root, 20, `Uid:\t${String(TEST_UID)}\nPPid:\t10\n`, "node lcm daemon start --foreground");
     // observeHttpHealth owns a real wall-clock deadline independent of
     // _monotonicNowOverride, so pin its nested clock for this 1 ms fixture.
     vi.spyOn(performance, "now").mockReturnValue(0);
     const result = await ensureDaemon({
       port: 13, pidFilePath: pidPath, spawnTimeoutMs: 100, _platform: "linux", enforceUserManagerParent: true,
-      _procRoot: root, _uid: 1000, _isProcessAliveOverride: () => true, _fetchOverride: fetchHealthy(20) as never,
+      _procRoot: root, _uid: TEST_UID, _isProcessAliveOverride: () => true, _fetchOverride: fetchHealthy(20) as never,
       expectedEntrypoint: "lcm",
       _listeningPortsOverride: () => [13], _monotonicNowOverride: () => 0, _skipSpawn: true, expectedVersion: "1",
       _processStartTimeForTesting: pid => `birth-${String(pid)}`,
@@ -707,10 +709,10 @@ describe("lifecycle spawn and restart failure boundaries", () => {
 
     const parentDir = temp(); const root = join(parentDir, "proc"); mkdirSync(root);
     const parentPid = join(parentDir, "daemon.pid"); writeFileSync(parentPid, "21"); ensureAuthToken(join(parentDir, "daemon.token"));
-    proc(root, 21, "Uid:\t1000\nPPid:\t10\n", "node lcm daemon start --foreground");
+    proc(root, 21, `Uid:\t${String(TEST_UID)}\nPPid:\t10\n`, "node lcm daemon start --foreground");
     await expect(ensureDaemon({
       port: 15, pidFilePath: parentPid, spawnTimeoutMs: 1, _platform: "linux", enforceUserManagerParent: true,
-      _procRoot: root, _uid: 1000, _fetchOverride: vi.fn().mockRejectedValue(new Error("down")),
+      _procRoot: root, _uid: TEST_UID, _fetchOverride: vi.fn().mockRejectedValue(new Error("down")),
       _isProcessAliveOverride: () => true, _sleepOverride: async () => {}, _skipSpawn: true,
     })).resolves.toMatchObject({ connected: false });
   });
