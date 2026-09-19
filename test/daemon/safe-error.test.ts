@@ -4558,6 +4558,21 @@ describe("sanitizeError", () => {
         "file://h?x=[[a]<opaque>?key=\\Users\\alice\\secret.db]",
         "file://h?x=[[a]<opaque>?key=<path>]",
       ],
+      [
+        "R3i a second gap ends the quoted named-value bridge",
+        "'https://e.test/t x name=\\Users\\literal'",
+        "'https://e.test/t x name=\\Users\\literal'",
+      ],
+      [
+        "R3j a second adjacent gap ends that bridge too",
+        "'https://e.test/t  name=\\Users\\literal'",
+        "'https://e.test/t  name=\\Users\\literal'",
+      ],
+      [
+        "R3k control one gap still bridges to a named value",
+        "'https://e.test/t name=\\Users\\literal'",
+        "'https://e.test/t name=<path>'",
+      ],
     ] as const)("resolves %s in one pass", (_name, input, expected) => {
       const first = sanitizeError(input);
 

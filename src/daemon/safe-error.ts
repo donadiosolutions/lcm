@@ -293,23 +293,31 @@ function classifyBracketGroups(chars: readonly string[]): BracketGroupIndex {
   // either, or the two passes disagree about the shape and the first result is
   // no longer stable.
   let spanQuote = 0;
+  // Mirrors the emit scanner's "separator", which every gap clears. The quote
+  // bridges a gap only while the span still carries URL syntax up to it, so one
+  // gap is bridged and a second consecutive gap ends the span. Without this the
+  // pre-pass bridged unlimited gaps and kept marking ordinary quoted prose as
+  // URL-owned after the scanner had already let the span go.
+  let spanSeparatorSeen = false;
 
   for (let index = 0; index < chars.length; index += 1) {
     const char = chars[index];
     if (whitespace[index] === 1) {
-      if (spanQuote !== 0 && (char === " " || char === "\t")) {
+      if (spanQuote !== 0 && spanSeparatorSeen && (char === " " || char === "\t")) {
         const held = stack[stack.length - 1];
         groupOf[index] = held;
         depth[index] = stack.length - 1;
         if (urlBearing[held] === 1) urlBearingBefore[index] = 1;
         if (fileChildBearing[held] === 1) fileChildBearingBefore[index] = 1;
         if (urlBearing[stack[0]] === 1) spanUrlBearingBefore[index] = 1;
+        spanSeparatorSeen = false;
         continue;
       }
       // Whitespace is a hard ownership boundary, matching the scanner reset, so
       // a later wrapper cannot inherit facts from text before the gap.
       inUrlSpan = false;
       spanQuote = 0;
+      spanSeparatorSeen = false;
       stack = [openGroup()];
       groupOf[index] = stack[0];
       depth[index] = 0;
@@ -416,6 +424,7 @@ function classifyBracketGroups(chars: readonly string[]): BracketGroupIndex {
       // before any whitespace can end the span.
       if (spanQuote === 0 && schemeStart >= 0) spanQuote = quoteCode(chars[schemeStart - 1]);
       inUrlSpan = true;
+      spanSeparatorSeen = true;
     }
     if (startsRootedValue(chars, index, wordRunEnds)) rootedBearing[current] = 1;
   }
