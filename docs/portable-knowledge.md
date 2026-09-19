@@ -44,10 +44,8 @@ runs after `lcm compact`) makes the same owner-scoped decision on every
 backend. A promoted summary whose exact content is already an active memory
 in scope merges into that memory, even when ranked search cannot recall it
 because the content carries no searchable terms or falls outside the
-candidate page. Earlier versions decided promotion from ranked search alone
-and could store such content twice; SQLite kept that gap even after the
-PostgreSQL case was fixed, because the exact-content lookup was gated to the
-PostgreSQL backend rather than to the owner-scoped decision itself.
+candidate page. Earlier versions decided promotion from ranked search
+alone on every backend and could store such content twice.
 
 ## Version 1 format and privacy
 
