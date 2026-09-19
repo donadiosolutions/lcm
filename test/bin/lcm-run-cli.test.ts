@@ -257,19 +257,32 @@ vi.mock("../../src/daemon/peer-admission.js", () => ({
 vi.mock("../../src/daemon/client.js", () => ({
   DaemonClient: class {
     private readonly verify?: () => void | Promise<void>;
+    private readonly tokenPath: string;
+    private tokenLoaded = false;
+    private token: string | null = null;
+    private readToken(): string | null {
+      if (!this.tokenLoaded) {
+        this.token = state.readAuthToken(this.tokenPath);
+        this.tokenLoaded = true;
+      }
+      return this.token;
+    }
     post = async (...args: unknown[]) => {
       await this.verify?.();
+      this.readToken();
       await this.verify?.();
       return await Reflect.apply(state.post, state, args);
     };
     get = async (...args: unknown[]) => {
       await this.verify?.();
+      this.readToken();
       await this.verify?.();
       return await Reflect.apply(state.get, state, args);
     };
     health = async (...args: unknown[]) => {
       try {
         await this.verify?.();
+        this.readToken();
         await this.verify?.();
         return await Reflect.apply(state.health, state, args);
       } catch {
@@ -279,14 +292,16 @@ vi.mock("../../src/daemon/client.js", () => ({
     observe = async (...args: unknown[]) => {
       try {
         await this.verify?.();
+        if (this.readToken() === null) return null;
         await this.verify?.();
         return await Reflect.apply(state.observe, state, args);
       } catch {
         return null;
       }
     };
-    constructor(_baseUrl: string, _tokenPath?: string, security?: { verifyProtectedRequest?: () => void | Promise<void> }) {
+    constructor(_baseUrl: string, tokenPath?: string, security?: { verifyProtectedRequest?: () => void | Promise<void> }) {
       state.daemonClientInstances++;
+      this.tokenPath = tokenPath ?? state.runtimeTokenPath;
       this.verify = security?.verifyProtectedRequest;
     }
   },
@@ -1562,7 +1577,15 @@ describe("runCli daemon-backed and utility actions", () => {
 
   it("retains manager-authorized peer evidence on the lifecycle fallback client", async () => {
     state.peerEvidence = null;
-    const admitPeer = vi.fn(async () => ({ pid: 42, birth: "manager-birth" }));
+    const order: string[] = [];
+    state.readAuthToken.mockImplementation(() => {
+      order.push("token");
+      return state.authToken;
+    });
+    const admitPeer = vi.fn(async () => {
+      order.push("manager");
+      return { pid: 42, birth: "manager-birth" };
+    });
     state.ensureDaemon.mockImplementationOnce(async (options: {
       _onAuthenticatedDaemonResult?: (evidence: unknown) => void;
     }) => {
@@ -1579,7 +1602,36 @@ describe("runCli daemon-backed and utility actions", () => {
       sleep: async () => undefined,
     })).toBeUndefined();
     expect(admitPeer).toHaveBeenCalledTimes(2);
+    expect(order).toEqual(["manager", "token", "manager"]);
     expect(state.post).toHaveBeenCalledOnce();
+  });
+
+  it.each([
+    ["read", ["search", "query"]],
+    ["store", ["store", "memory"]],
+  ] as const)("sends no credential or protected %s body when fast and fallback peer admission fail", async (
+    _label,
+    args,
+  ) => {
+    state.peerEvidence = null;
+    state.ensureDaemon.mockResolvedValueOnce({
+      connected: true,
+      spawned: false,
+      restartedForParent: false,
+      pid: 42,
+    });
+
+    const error = await invoke([...args], {
+      migrate: vi.fn(),
+      sleep: async () => undefined,
+    });
+
+    expect(error?.message).toContain("Daemon peer ownership could not be verified");
+    expect(state.ensureDaemon).toHaveBeenCalledOnce();
+    expect(state.readAuthToken).not.toHaveBeenCalled();
+    expect(state.health).not.toHaveBeenCalled();
+    expect(state.get).not.toHaveBeenCalled();
+    expect(state.post).not.toHaveBeenCalled();
   });
 
   it("falls back to authenticated migration when store preflight cannot authorize", async () => {
