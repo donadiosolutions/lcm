@@ -47,7 +47,7 @@ import {
   type MigrationReconciliationDomain, type MigrationSourceWitnessDigests, type MigrationVerificationMismatch,
   type MigrationVerificationMismatchTotal, type MigrationVerificationReport, type MigrationVerificationSampleParameters,
 } from "./verification-report.js";
-import { MigrationVerificationReportStore } from "./verification-store.js";
+import { MigrationVerificationReportStore, type MigrationVerificationPersistOutcome } from "./verification-store.js";
 
 /**
  * V2's replacement for census-alone gating: classes this driver actually
@@ -354,6 +354,20 @@ export const MIGRATION_SEARCH_PROBE_CANDIDATE_POOL_SIZE = 25;
  * has no separate field of its own on MigrationVerificationMismatch,
  * since that type carries only domain, class and identitySha256.
  */
+/**
+ * Round-2 P3: a fixed marker, not a hash of actualOrder.length. The
+ * "empty source vs non-empty destination" case names one kind of
+ * mismatch, not a distinct one per destination row count -- folding
+ * the count into the identity would let a reader infer how many
+ * destination rows exist from the digest alone, which is exactly the
+ * kind of leak the redaction ceiling (domain plus class plus identity
+ * digest, never a value) exists to prevent. There is no single "the
+ * sampled record" to name here, since the source has none, so a
+ * versioned constant is the honest identity rather than a
+ * manufactured one.
+ */
+export const MIGRATION_SAMPLE_EMPTY_SOURCE_IDENTITY_SHA256 = migrationWitnessSha256(["sample-empty-source"]);
+
 async function runOrderedListingProbe(
   executor: PostgreSqlRuntime, projectId: string,
   expectedOrder: readonly MigrationPublicListingSourceEntry[], signal?: AbortSignal,
@@ -379,7 +393,7 @@ async function runOrderedListingProbe(
       publicListingSha256,
       mismatch: {
         domain: "public-listing", class: "sample",
-        identitySha256: migrationWitnessSha256(["sample-empty-source", actualOrder.length]),
+        identitySha256: MIGRATION_SAMPLE_EMPTY_SOURCE_IDENTITY_SHA256,
       },
     };
   }
@@ -1116,6 +1130,30 @@ export function totalsFor(mismatches: readonly MigrationVerificationMismatch[]):
 }
 
 /**
+ * Round-2 P3: totals previously borrowed sortMismatches via an
+ * `as unknown as MigrationVerificationMismatch[]` double-cast, relying
+ * on mismatchOrdinal's third tie-break (value.identitySha256) silently
+ * reading undefined off every total -- harmless only because
+ * totalsFor's Map already guarantees at most one entry per
+ * (domain, class) pair, so the tie-break is never reached in practice.
+ * That "harmless because the caller happens to guarantee no ties" is
+ * exactly the kind of fact a type system should not have to be
+ * trusted on. This sorter has its own two-key comparator -- domain then
+ * class ordinal, the only two fields MigrationVerificationMismatchTotal
+ * actually has -- so there is no cast and no borrowed field to misread.
+ */
+export function sortMismatchTotals(
+  totals: readonly MigrationVerificationMismatchTotal[], order: readonly MigrationReconciliationDomain[],
+): MigrationVerificationMismatchTotal[] {
+  return [...totals].sort((left, right) => {
+    const leftDomain = order.indexOf(left.domain);
+    const rightDomain = order.indexOf(right.domain);
+    if (leftDomain !== rightDomain) return leftDomain - rightDomain;
+    return migrationMismatchClassOrdinal(left.class) - migrationMismatchClassOrdinal(right.class);
+  });
+}
+
+/**
  * The report body rejects more than MIGRATION_MISMATCH_CLASS_TRUNCATION_LIMIT
  * recorded entries in one class; it does not truncate for the driver. This
  * is the truncation itself: called on the full, already-sorted mismatch
@@ -1291,10 +1329,25 @@ export function migrationVerificationEffectId(reportSha256: string): string {
  * verifyMigrationGeneration's resume path, which never calls this
  * function at all for a resumed attempt) and never retries internally.
  */
+/**
+ * Round-2 P3: the lease is returned unreleased on success, so the caller
+ * can defer release until after its own persist -- release-before-
+ * persist would let a second worker acquire the lease and start a
+ * concurrent recomputation while the first worker's persist is still in
+ * flight, exactly the window the lease exists to close. On any failure
+ * path below (including construction of the report itself), the lease
+ * is released here before the error propagates, since there is nothing
+ * left for a caller to persist in that case and nothing should hold the
+ * lease past this function's own failure. inspectMigrationVerification
+ * has no persist step at all, so it releases immediately on success too
+ * -- deferred release is a verifyMigrationGeneration-only property, not
+ * an escaping resource caller-owned wrapper types can accidentally sit
+ * on for the lease's protection to depend on.
+ */
 async function computeVerificationReport(
   input: VerifyMigrationGenerationInput,
   dependencies: VerifyMigrationGenerationDependencies,
-): Promise<MigrationVerificationReport> {
+): Promise<{ report: MigrationVerificationReport; releaseLease: () => Promise<void> }> {
   const copySource = await dependencies.openSource({
     generationId: input.generationId, homeDir: input.homeDir, expectedIdentity: input.expectedIdentity,
     scratchParent: input.scratchParent, signal: input.signal,
@@ -1350,6 +1403,9 @@ async function computeVerificationReport(
     };
     const lease = await coordinator.acquireLease({ ...resource, ttlMs: input.leaseTtlMs, signal: input.signal });
     if (lease === null) driverError("lease-unavailable", "migration verification lease is held by another worker");
+    const releaseLease = async (): Promise<void> => {
+      await coordinator.releaseLease({ ...resource, fencingToken: lease.fencingToken }).catch(() => undefined);
+    };
     try {
       const { mismatch: publicListingMismatch, publicListingSha256 } = await runOrderedListingProbe(
         runtime, input.expectedIdentity.id, conversationsPublicOrder, input.signal,
@@ -1397,10 +1453,7 @@ async function computeVerificationReport(
       // Totals must reflect the full (untruncated) evidence: truncation is
       // an operator-facing display bound on retained entries, never on the
       // exact count the operator is told about.
-      const mismatchTotals = sortMismatches(
-        totalsFor(fullMismatches) as unknown as MigrationVerificationMismatch[],
-        domainOrder,
-      ) as unknown as MigrationVerificationMismatchTotal[];
+      const mismatchTotals = sortMismatchTotals(totalsFor(fullMismatches), domainOrder);
       // The report body rejects more than the frozen per-class limit among
       // *retained* entries; a badly diverged destination -- the exact case
       // operator evidence matters most for -- must still produce a report,
@@ -1436,9 +1489,10 @@ async function computeVerificationReport(
         sampleParameters: input.sampleParameters,
         mismatches, mismatchTotals,
       };
-      return createMigrationVerificationReport(reportInput);
-    } finally {
-      await coordinator.releaseLease({ ...resource, fencingToken: lease.fencingToken }).catch(() => undefined);
+      return { report: createMigrationVerificationReport(reportInput), releaseLease };
+    } catch (error) {
+      await releaseLease();
+      throw error;
     }
   } finally {
     try { await copySource.stream.close(); } catch { /* preserve the primary failure */ }
@@ -1462,7 +1516,12 @@ export async function inspectMigrationVerification(
   input: VerifyMigrationGenerationInput,
   dependencies: VerifyMigrationGenerationDependencies = defaultDependencies,
 ): Promise<MigrationVerificationReport> {
-  return computeVerificationReport(input, dependencies);
+  // No persist step exists on this path, so there is nothing to defer
+  // release for: release immediately, the same as every failure path
+  // inside computeVerificationReport itself.
+  const { report, releaseLease } = await computeVerificationReport(input, dependencies);
+  await releaseLease();
+  return report;
 }
 
 /**
@@ -1520,8 +1579,18 @@ export async function verifyMigrationGeneration(
       effectId: pending.effectId, inputSha256: pending.inputSha256,
     };
   }
-  const report = await computeVerificationReport(input, dependencies);
-  const persisted = reportStore.persist(input.generationId, report);
+  const { report, releaseLease } = await computeVerificationReport(input, dependencies);
+  // Round-2 P3: the lease stays held across persist and is released
+  // only once persist itself has settled (success or failure), so a
+  // second worker cannot acquire it and start a concurrent
+  // recomputation while this attempt's persist is still in flight --
+  // exactly the window releasing before persist left open.
+  let persisted: MigrationVerificationPersistOutcome;
+  try {
+    persisted = reportStore.persist(input.generationId, report);
+  } finally {
+    await releaseLease();
+  }
   const result: VerifyMigrationGenerationResult = {
     report: persisted.report, outcome: persisted.report.clean ? "clean" : "mismatches",
     effectId: migrationVerificationEffectId(persisted.report.reportSha256),

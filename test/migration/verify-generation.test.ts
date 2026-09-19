@@ -27,9 +27,11 @@ import {
   reconcileDependencyEdges,
   readSequenceSelfConsistencyMismatches,
   MIGRATION_SEARCH_PROBE_CANDIDATE_POOL_SIZE,
+  MIGRATION_SAMPLE_EMPTY_SOURCE_IDENTITY_SHA256,
   reconcileCounts,
   SEQUENCE_BACKED_IDENTITY_COLUMN,
   sortMismatches,
+  sortMismatchTotals,
   streamSourceCheckpoints,
   totalsFor,
   truncateMismatchesPerClass,
@@ -911,6 +913,35 @@ describe("sortMismatches", () => {
     ], order);
     expect(equal.map((m) => m.identitySha256)).toEqual([same, same]);
   });
+  it("sortMismatchTotals: round-2 P3 -- orders two totals that differ only by class within the same domain, without borrowing sortMismatches' identity tie-break", () => {
+    // The dedicated sorter this replaced an `as unknown as` cast with:
+    // MigrationVerificationMismatchTotal has no identitySha256 field at
+    // all, so this test only exercises the two fields the sorter
+    // actually has -- domain and class -- and is the only place that
+    // exercises the "same domain" branch of sortMismatchTotals directly
+    // (the double-cast version relied on sortMismatches' third
+    // comparator key silently reading undefined off every total, which
+    // this dedicated sorter no longer has to be trusted about).
+    const order = [...PORTABLE_RECORD_DOMAIN_ORDER, "schema", "ledger"] as const;
+    const ledgerFirst = sortMismatchTotals([
+      { domain: "messages" as const, class: "ledger" as const, count: 1 },
+      { domain: "messages" as const, class: "relation" as const, count: 1 },
+    ], order);
+    expect(ledgerFirst.map((total) => total.class)).toEqual(["relation", "ledger"]);
+    const relationFirst = sortMismatchTotals([
+      { domain: "messages" as const, class: "relation" as const, count: 1 },
+      { domain: "messages" as const, class: "ledger" as const, count: 1 },
+    ], order);
+    expect(relationFirst.map((total) => total.class)).toEqual(["relation", "ledger"]);
+  });
+  it("sortMismatchTotals: orders two totals by domain when their classes differ too", () => {
+    const order = [...PORTABLE_RECORD_DOMAIN_ORDER, "schema", "ledger"] as const;
+    const sorted = sortMismatchTotals([
+      { domain: "messages" as const, class: "ledger" as const, count: 1 },
+      { domain: "conversations" as const, class: "count" as const, count: 2 },
+    ], order);
+    expect(sorted.map((total) => total.domain)).toEqual(["conversations", "messages"]);
+  });
   it("round-1 P1 red case: orders relation before ledger within one domain, per the frozen class ordinal, not lexicographically", () => {
     // "ledger" < "relation" lexicographically, but the frozen
     // MIGRATION_MISMATCH_CLASSES ordinal places relation (index 3) before
@@ -1292,6 +1323,38 @@ describe("verifyMigrationGeneration", () => {
     expect(result.report.mismatches.some((mismatch) => mismatch.domain === "machines" && mismatch.class === "count")).toBe(true);
   }, 15000);
 
+  it("round-2 P3: releases the lease only after persist has settled, not before it", async () => {
+    // Before this fix, the lease was released inside
+    // computeVerificationReport before it ever returned to
+    // verifyMigrationGeneration, so a second worker could acquire the
+    // lease and start a concurrent recomputation while this attempt's
+    // persist was still in flight. Recording actual call order --
+    // rather than merely asserting release eventually happens, which
+    // the existing "still releases the lease" tests already do -- is
+    // the only way to prove the ordering rather than just the
+    // occurrence.
+    stubDestinationPrimitives();
+    const order: string[] = [];
+    vi.spyOn(coordination, "PostgreSqlWorkCoordinator").mockImplementation(function () { return ({
+      acquireLease: vi.fn(async () => ({ fencingToken: 1n } as never)),
+      releaseLease: vi.fn(async () => { order.push("release"); return null; }),
+    } as never); });
+    const originalPersist = MigrationVerificationReportStore.prototype.persist;
+    const persistSpy = vi.spyOn(MigrationVerificationReportStore.prototype, "persist").mockImplementation(
+      function (this: MigrationVerificationReportStore, ...args: Parameters<typeof originalPersist>) {
+        order.push("persist");
+        return originalPersist.apply(this, args);
+      },
+    );
+    const recordCounts = Object.fromEntries(PORTABLE_RECORD_DOMAIN_ORDER.map((domain, index) => [domain, index])) as Partial<Record<PortableDomain, number>>;
+    const copySource = fakeCopySource({ recordCounts });
+    const runtime = fakeRuntime();
+    const dependencies = dependenciesFor(copySource, runtime);
+    const result = await verifyMigrationGeneration(baseInput({ homeDir: "/tmp/lcm-verify-lease-release-order" }), dependencies);
+    expect(result.outcome).toBe("clean");
+    expect(order).toEqual(["persist", "release"]);
+    persistSpy.mockRestore();
+  }, 15000);
   it("swallows a failure releasing the lease without masking the primary result", async () => {
     stubDestinationPrimitives();
     vi.spyOn(coordination, "PostgreSqlWorkCoordinator").mockImplementation(function () { return ({
@@ -1891,7 +1954,7 @@ describe("verifyMigrationGeneration: public listing probe", () => {
     expect(result.outcome).toBe("mismatches");
     expect(result.report.mismatches).toContainEqual({
       domain: "public-listing", class: "sample",
-      identitySha256: migrationWitnessSha256(["sample-empty-source", 1]),
+      identitySha256: MIGRATION_SAMPLE_EMPTY_SOURCE_IDENTITY_SHA256,
     });
   }, 15000);
 });
