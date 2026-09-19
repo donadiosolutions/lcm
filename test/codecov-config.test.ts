@@ -162,7 +162,10 @@ const expectedComponents = [
   {
     component_id: "unit-daemon-events",
     name: "Unit - Daemon Passive Events",
-    paths: ["^src/daemon/passive-event-processor\\.ts$"],
+    paths: [
+      "^src/daemon/passive-event-processor\\.ts$",
+      "^src/daemon/passive-event-replication-pass\\.ts$",
+    ],
   },
   {
     component_id: "unit-mcp",
@@ -594,7 +597,7 @@ describe("Codecov configuration", () => {
       expect(isSafeOwnershipPath(path)).toBe(true);
     }
 
-    expect(productionFiles).toHaveLength(244);
+    expect(productionFiles).toHaveLength(245);
 
     for (const component of validateComponents(components)) {
       expect(filesMatchedByComponent(component, productionFiles).length).toBeGreaterThan(0);
@@ -624,10 +627,10 @@ describe("Codecov configuration", () => {
 
     expect(unownedFiles).toEqual([]);
     expect(multiplyOwnedFiles).toEqual([]);
-    expect(ownershipCounts.size).toBe(244);
+    expect(ownershipCounts.size).toBe(245);
   });
 
-  test("keeps response-fence and #681/#700/#701/#703/#705/#709/#710/#713/#756/#726/#734/#737/#742/#760/#763/#804/#805/#824/#825/#833/#888/#864/#866/#722/#786/#952/#814/#882/#930/#969/#989/#1003/#1049/#964/#1106/#1191/#1196/#1229/#1321/#1338/#1347/#1353/#1354/#1356/#1357/#1358/#1403/#1450 files in their intended components", () => {
+  test("keeps response-fence and #681/#700/#701/#703/#705/#709/#710/#713/#756/#726/#734/#737/#742/#760/#763/#804/#805/#824/#825/#833/#888/#864/#866/#722/#786/#952/#814/#882/#930/#969/#989/#1003/#1049/#964/#1106/#1191/#1196/#1229/#1321/#1338/#1347/#1353/#1354/#1356/#1357/#1358/#1403/#1450/#1383/#1384/#1395 files in their intended components", () => {
     const config = readCodecovConfig();
     expect(config).toBeDefined();
     if (config === undefined) {
@@ -755,6 +758,9 @@ describe("Codecov configuration", () => {
       ["src/daemon/routes/promote.ts", "unit-daemon-routes"],
       ["src/daemon/routes/recent.ts", "unit-daemon-routes"],
       ["src/daemon/passive-event-processor.ts", "unit-daemon-events"],
+      // #1383 adds the daemon-owned replication pass beside the processor that
+      // drives it, keeping both in the passive-events owner.
+      ["src/daemon/passive-event-replication-pass.ts", "unit-daemon-events"],
       // #1153 exact identity and #1158 backend-guarded owner scope remain
       // within the existing promotion component.
       // #1354 serializes promoted-memory deduplication decisions with a

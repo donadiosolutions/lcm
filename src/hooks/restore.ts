@@ -29,6 +29,7 @@ import {
   isBackendPublicationEvidenceMissing,
   isBackendPublicationJournalError,
   hookPublicationHome,
+  hookPublicationBackend,
   withHookPublicationFenceAsync,
 } from "./publication-fence.js";
 import { withBackendPublicationAppendBarrierAsync } from "../storage/backend-publication.js";
@@ -247,7 +248,15 @@ export async function handleSessionStart(
               assertStableRoot(rootHandle, rootPath, rootWitness);
               const eventsDb = await outboxFactory.open(eventsDbPath(cwd), {}, lockToken);
               try {
-                await eventsDb.pruneProcessed(7);
+                // #1395: only a PostgreSQL install can drain events to a
+                // remote inbox, so only there must retention wait for that
+                // proof. The backend comes from this fence rather than from
+                // the configuration this hook loaded before it, so a
+                // SessionStart overlapping a publication cannot apply the
+                // permissive predicate to a state that has already moved.
+                await eventsDb.pruneProcessed(7, {
+                  awaitingReplication: hookPublicationBackend(lockToken) === "postgresql",
+                });
                 await eventsDb.pruneUnprocessed(10_000, 30);
                 await eventsDb.pruneErrorLog(30);
                 const unprocessed = await eventsDb.getUnprocessed(1);

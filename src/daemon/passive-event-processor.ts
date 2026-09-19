@@ -6,7 +6,11 @@ import { EVENTS_UNPROCESSED_BATCH_LIMIT } from "../hooks/events-db.js";
 import { collectEventSidecars } from "../db/event-sidecars.js";
 import { promoteEventsForCwd, type PromoteResult } from "./routes/promote-events.js";
 import type { StorageBackendFactory } from "../storage/index.js";
-import type { BackendPublicationLockToken } from "../storage/backend-publication.js";
+import type { PassiveEventReplicationResult } from "./passive-event-replication.js";
+import {
+  BackendPublicationJournalError,
+  type BackendPublicationLockToken,
+} from "../storage/backend-publication.js";
 
 export const PASSIVE_EVENT_PROCESSOR_DEFAULTS = {
   priorityDelayMs: 250,
@@ -25,11 +29,48 @@ export interface PassiveEventNotification {
   sourceHook?: string;
 }
 
+/**
+ * A running daemon's startup backend is frozen for its whole lifetime, so a
+ * configured-backend change can never be admitted by the current process. The
+ * background sweep records that halt instead of retrying every five minutes
+ * with nothing but a log line to show for it (#1384).
+ */
+export interface PassiveEventBackgroundDiagnostics {
+  readonly halted: boolean;
+  readonly haltedReason: "backend-mismatch" | null;
+  readonly haltedMessage: string | null;
+  readonly replication: PassiveEventReplicationDiagnostics;
+}
+
+/**
+ * Operator-visible proof that replication is running (#1383). The worker
+ * previously had no caller and nothing reported its absence, so "never ran"
+ * has to be as legible from outside as "ran at T and moved N events".
+ */
+export interface PassiveEventReplicationDiagnostics {
+  readonly enabled: boolean;
+  readonly lastPassAt: string | null;
+  readonly passes: number;
+  readonly projects: number;
+  readonly uploaded: number;
+  readonly applied: number;
+  readonly acknowledged: number;
+  readonly pruned: number;
+  readonly retried: number;
+  readonly quarantined: number;
+}
+
+export type PassiveEventReplicationPassRunner = (
+  cwd: string,
+  signal?: AbortSignal,
+) => Promise<PassiveEventReplicationResult | null>;
+
 export interface PassiveEventProcessorDeps {
   promoteEventsForCwd?: typeof promoteEventsForCwd;
   storageFactory?: StorageBackendFactory;
   withPublicationAdmission: BackgroundPublicationAdmission;
   collectEventSidecars?: typeof collectEventSidecars;
+  replicatePassiveEvents?: PassiveEventReplicationPassRunner;
   setTimeout?: typeof setTimeout;
   clearTimeout?: typeof clearTimeout;
   setInterval?: typeof setInterval;
@@ -57,6 +98,7 @@ export class PassiveEventProcessor {
   private readonly promoteOneBatch: PromoteOneBatch;
   private readonly withPublicationAdmission: BackgroundPublicationAdmission;
   private readonly scanSidecars: typeof collectEventSidecars;
+  private readonly replicatePassiveEvents?: PassiveEventReplicationPassRunner;
   private readonly setTimer: typeof setTimeout;
   private readonly clearTimer: typeof clearTimeout;
   private readonly setRepeating: typeof setInterval;
@@ -73,6 +115,19 @@ export class PassiveEventProcessor {
   private sweepTimer: TimeoutHandle | null = null;
   private sweepInterval: IntervalHandle | null = null;
   private sweepStartIndex = 0;
+  private haltedReason: "backend-mismatch" | null = null;
+  private haltedMessage: string | null = null;
+  private readonly replication = {
+    lastPassAt: null as string | null,
+    passes: 0,
+    projects: 0,
+    uploaded: 0,
+    applied: 0,
+    acknowledged: 0,
+    pruned: 0,
+    retried: 0,
+    quarantined: 0,
+  };
   private readonly drainWaiters = new Set<() => void>();
 
   constructor(
@@ -85,6 +140,13 @@ export class PassiveEventProcessor {
       promoteOneBatch(config, cwd, sidecarPath, deps.storageFactory, publicationLockToken, context);
     this.withPublicationAdmission = deps.withPublicationAdmission;
     this.scanSidecars = deps.collectEventSidecars ?? collectEventSidecars;
+    // A daemon whose selected backend cannot replicate must not report
+    // replication as enabled, and must not record five-minute passes it never
+    // made (#1383). The startup backend is frozen for this process, so this
+    // decision is settled once here rather than re-asked every sweep.
+    this.replicatePassiveEvents = config.storage.backend === "postgresql"
+      ? deps.replicatePassiveEvents
+      : undefined;
     this.setTimer = deps.setTimeout ?? setTimeout;
     this.clearTimer = deps.clearTimeout ?? clearTimeout;
     this.setRepeating = deps.setInterval ?? setInterval;
@@ -118,20 +180,7 @@ export class PassiveEventProcessor {
     this.stopped = true;
     this.stopController.abort();
     this.detachExternalSignal?.();
-    for (const timer of this.debounceTimers.values()) {
-      this.clearTimer(timer);
-    }
-    this.debounceTimers.clear();
-    this.debounceDeadlines.clear();
-    this.queuedProjects.clear();
-    if (this.sweepTimer) {
-      this.clearTimer(this.sweepTimer);
-      this.sweepTimer = null;
-    }
-    if (this.sweepInterval) {
-      this.clearRepeating(this.sweepInterval);
-      this.sweepInterval = null;
-    }
+    this.clearScheduledWork();
   }
 
   async stopAndWait(): Promise<void> {
@@ -143,7 +192,7 @@ export class PassiveEventProcessor {
   }
 
   notify(input: PassiveEventNotification): void {
-    if (this.stopped) return;
+    if (this.stopped || this.haltedReason !== null) return;
     const cwd = validateCwd(input.cwd);
     const priority = normalizePriority(input.priority);
     const pendingCount = normalizePendingCount(input.pendingCount);
@@ -159,8 +208,22 @@ export class PassiveEventProcessor {
     await this.drainQueuedProjects();
   }
 
+  /** Background halt state for operator-facing daemon status (#1384). */
+  backgroundDiagnostics(): PassiveEventBackgroundDiagnostics {
+    return {
+      halted: this.haltedReason !== null,
+      haltedReason: this.haltedReason,
+      haltedMessage: this.haltedMessage,
+      replication: {
+        enabled: this.replicatePassiveEvents !== undefined,
+        ...this.replication,
+      },
+    };
+  }
+
   async runSweep(): Promise<void> {
     if (this.stopped) return;
+    if (this.haltedReason !== null) return;
     if (this.draining) {
       this.scheduleSweep(this.defaults.debounceMs);
       return;
@@ -192,11 +255,93 @@ export class PassiveEventProcessor {
             },
           );
         } catch (error) {
+          if (isFrozenBackendMismatch(error)) {
+            await this.haltForBackendMismatch(error);
+            return;
+          }
           await this.logError("passive-event-processor", error, { cwd: sidecar.cwd });
         }
       }
+      await this.replicateSidecars(sidecars);
     } finally {
       this.finishDrain();
+    }
+  }
+
+  /**
+   * Drain each project's local outbox to the remote inbox (#1383).
+   *
+   * This runs after promotion and independently of it: an event can be
+   * promoted locally yet still be undelivered, and only this pass can advance
+   * a row to the acknowledged-and-remote-pruned state that local retention
+   * requires. Projects without a PostgreSQL binding skip quietly.
+   *
+   * Each project replicates in admitted phases rather than inside one
+   * admission held across the whole pass. Replication resolves its backend
+   * from this daemon's frozen startup configuration, and the promotion loop
+   * above skips any sidecar with no unprocessed events, so without admission
+   * a settled daemon would keep uploading to a backend that publication has
+   * already moved away from (#1384). A check that returns before the upload
+   * starts does not give that guarantee: publication can take the consumer
+   * lock in the gap and the pass still writes to the backend the daemon has
+   * just lost.
+   *
+   * But holding one admission across the whole pass also holds the
+   * publication consumer lock across a lease acquisition, a bulk upload,
+   * and up to a hundred claim renewals and apply round trips. While held,
+   * every hook append in the home burns its bounded contention budget and
+   * then drops the event, and SessionStart has no retry at all. So the pass
+   * admits per phase instead: the upload under one admission, the claim
+   * fetch under the next, each renew-and-apply under its own, and
+   * reconcile and prune each under their own. The consumer lock is released
+   * between phases so hook appends can proceed, and every admission
+   * re-checks the frozen backend, so a publication switch that lands
+   * between phases refuses the next admission and halts the sweep before
+   * any further write. Losing a hook event to a background sweep is worse
+   * than that slightly wider switch window.
+   *
+   * Admission holds the publication consumer lock, and every local outbox
+   * operation takes that same lock synchronously for the same home, so
+   * replicating directly inside the admission callback makes the outbox fail
+   * with "backend publication mutation is already in progress". The append
+   * barrier around each admitted token is the seam that makes the nested
+   * acquisition inherit the token instead of contending for it, exactly as
+   * the SessionStart hook already does around its own outbox work.
+   */
+  private async replicateSidecars(
+    sidecars: readonly Awaited<ReturnType<typeof collectEventSidecars>>[number][],
+  ): Promise<void> {
+    const replicate = this.replicatePassiveEvents;
+    if (replicate === undefined) return;
+    this.replication.passes += 1;
+    this.replication.lastPassAt = new Date().toISOString();
+    for (const sidecar of sidecars) {
+      if (this.stopped || this.haltedReason !== null) return;
+      const cwd = sidecar.cwd;
+      if (sidecar.scanError || sidecar.scanSkipped || !cwd) continue;
+      let result: PassiveEventReplicationResult | null;
+      try {
+        // No outer admission here: the pass admits each replication phase
+        // separately (see above), so the consumer lock is never held across
+        // the whole sweep. A frozen-backend refusal from any phase still
+        // reaches this catch and halts below.
+        result = await replicate(cwd, this.backgroundSignal);
+      } catch (error) {
+        if (isFrozenBackendMismatch(error)) {
+          await this.haltForBackendMismatch(error);
+          return;
+        }
+        await this.logError("passive-event-processor", error, { cwd });
+        continue;
+      }
+      if (result === null) continue;
+      this.replication.projects += 1;
+      this.replication.uploaded += result.uploaded;
+      this.replication.applied += result.applied;
+      this.replication.acknowledged += result.acknowledged;
+      this.replication.pruned += result.pruned;
+      this.replication.retried += result.retried;
+      this.replication.quarantined += result.quarantined;
     }
   }
 
@@ -243,6 +388,7 @@ export class PassiveEventProcessor {
       const projects = [...this.queuedProjects];
       this.queuedProjects.clear();
       for (const cwd of projects) {
+        if (this.haltedReason !== null) break;
         await this.processProject(cwd);
       }
     } finally {
@@ -266,6 +412,10 @@ export class PassiveEventProcessor {
           },
         );
       } catch (error) {
+        if (isFrozenBackendMismatch(error)) {
+          await this.haltForBackendMismatch(error);
+          return;
+        }
         await this.logError("passive-event-processor", error, { cwd });
         return;
       }
@@ -295,6 +445,51 @@ export class PassiveEventProcessor {
   private unref(handle: { unref?: () => unknown } | null): void {
     try { handle?.unref?.(); } catch { /* non-fatal */ }
   }
+
+  /**
+   * Retire every scheduled background timer. Shared by ordinary shutdown and by
+   * the #1384 frozen-backend halt, which must stop rescheduling work that this
+   * process can never get admitted again.
+   */
+  private clearScheduledWork(): void {
+    for (const timer of this.debounceTimers.values()) {
+      this.clearTimer(timer);
+    }
+    this.debounceTimers.clear();
+    this.debounceDeadlines.clear();
+    this.queuedProjects.clear();
+    if (this.sweepTimer) {
+      this.clearTimer(this.sweepTimer);
+      this.sweepTimer = null;
+    }
+    if (this.sweepInterval) {
+      this.clearRepeating(this.sweepInterval);
+      this.sweepInterval = null;
+    }
+  }
+
+  /**
+   * The configured backend no longer matches this daemon's authenticated
+   * startup backend. Only a restart resolves it, so record the halt, drop every
+   * scheduled sweep, and report once instead of logging the identical refusal
+   * every five minutes. The next hook's `ensureDaemon` observes the `/health`
+   * backend mismatch and replaces this daemon.
+   */
+  private async haltForBackendMismatch(
+    error: BackendPublicationJournalError,
+  ): Promise<void> {
+    this.haltedReason = "backend-mismatch";
+    this.haltedMessage = error.message;
+    this.clearScheduledWork();
+    await this.logError("passive-event-processor", error, {});
+  }
+}
+
+function isFrozenBackendMismatch(
+  error: unknown,
+): error is BackendPublicationJournalError {
+  return error instanceof BackendPublicationJournalError
+    && error.reason === "backend-mismatch";
 }
 
 function normalizePriority(value: unknown): number | undefined {

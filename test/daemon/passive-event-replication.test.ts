@@ -19,6 +19,7 @@ import {
   type PassiveEventReplicationDependencies,
   type PassiveEventReplicationOptions,
 } from "../../src/daemon/passive-event-replication.js";
+import { BackendPublicationJournalError } from "../../src/storage/backend-publication.js";
 
 const PROJECT_ID = "0195d250-0000-7000-8000-000000000001";
 const MACHINE_ID = "0195d250-0000-7000-8000-000000000002";
@@ -1326,6 +1327,102 @@ describe("PassiveEventReplicationWorker", () => {
       retryJitterRatio: 0.2,
       quarantineAfterAttempts: 5,
     });
+  });
+
+  it("admits each phase separately and releases between phases", async () => {
+    // The daemon pass supplies this admission so hook appends can proceed
+    // between replication phases. Every phase must run inside it, and the
+    // lease lifecycle outside it: without the boundaries a reverted worker
+    // runs everything unadmitted and this records no admissions at all.
+    const events: string[] = [];
+    const admitPhase = async <T>(operation: () => Promise<T>): Promise<T> => {
+      events.push("enter");
+      try {
+        return await operation();
+      } finally {
+        events.push("exit");
+      }
+    };
+    const pending = localRow({ delivery_state: "claimed", delivery_owner: "worker:local" });
+    const local = localRepository({
+      claimDeliveries: vi.fn().mockImplementation(async () => {
+        events.push("claimDeliveries");
+        return [pending];
+      }),
+    });
+    const claimed = claim();
+    const remote = remoteRepository({
+      acquireDrainLease: vi.fn().mockImplementation(async () => {
+        events.push("acquireDrainLease");
+        return lease();
+      }),
+      insertEvents: vi.fn().mockImplementation(async () => {
+        events.push("insertEvents");
+        return [remoteRecord()];
+      }),
+      claimEvents: vi.fn().mockImplementation(async () => {
+        events.push("claimEvents");
+        return [claimed];
+      }),
+      completeApplied: vi.fn().mockImplementation(async () => {
+        events.push("completeApplied");
+        return { event: remoteRecord({ status: "applied" }), result: undefined };
+      }),
+      releaseDrainLease: vi.fn().mockImplementation(async () => {
+        events.push("releaseDrainLease");
+        return { ...lease(), releasedAt: "2026-07-29T12:01:00.000Z" };
+      }),
+    });
+
+    await expect(worker(local, remote, { admitPhase }).runOnce()).resolves.toMatchObject({
+      leaseAcquired: true,
+      uploaded: 1,
+      applied: 1,
+    });
+
+    // Upload, claim fetch, one apply, reconcile, prune: six admissions.
+    expect(events.filter(event => event === "enter")).toHaveLength(6);
+    // Every replication operation ran inside exactly one admission, and the
+    // lease lifecycle ran outside all of them.
+    let depth = 0;
+    for (const event of events) {
+      if (event === "enter") depth += 1;
+      else if (event === "exit") depth -= 1;
+      else if (event === "acquireDrainLease" || event === "releaseDrainLease") {
+        expect(depth).toBe(0);
+      } else {
+        expect(depth).toBe(1);
+      }
+    }
+    expect(depth).toBe(0);
+    expect(events.indexOf("claimDeliveries")).toBeLessThan(events.indexOf("insertEvents"));
+    expect(events.indexOf("insertEvents")).toBeLessThan(events.indexOf("claimEvents"));
+    expect(events.indexOf("claimEvents")).toBeLessThan(events.indexOf("completeApplied"));
+    expect(events.indexOf("acquireDrainLease")).toBeLessThan(events.indexOf("enter"));
+    expect(events.lastIndexOf("exit")).toBeLessThan(events.indexOf("releaseDrainLease"));
+  });
+
+  it("propagates a refused phase admission without running later phases", async () => {
+    const refusal = new BackendPublicationJournalError("backend-mismatch", "publication moved on");
+    let admissions = 0;
+    const admitPhase = async <T>(operation: () => Promise<T>): Promise<T> => {
+      admissions += 1;
+      if (admissions > 1) throw refusal;
+      return operation();
+    };
+    const pending = localRow({ delivery_state: "claimed", delivery_owner: "worker:local" });
+    const local = localRepository({
+      claimDeliveries: vi.fn().mockResolvedValue([pending]),
+    });
+    const remote = remoteRepository({
+      insertEvents: vi.fn().mockResolvedValue([remoteRecord()]),
+    });
+
+    await expect(worker(local, remote, { admitPhase }).runOnce()).rejects.toBe(refusal);
+    // The upload ran admitted; nothing after the refusal did, but the lease
+    // still released through the worker finally.
+    expect(remote.claimEvents).not.toHaveBeenCalled();
+    expect(remote.releaseDrainLease).toHaveBeenCalledOnce();
   });
 
   it("accepts an apply callback with the transaction executor contract", async () => {

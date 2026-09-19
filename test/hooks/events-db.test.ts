@@ -1001,6 +1001,85 @@ describe("EventsDb", () => {
     db.close();
   });
 
+  // #1395: the acknowledged/remote-pruned gate is unsatisfiable without a
+  // remote inbox, so a SQLite install pruned nothing and grew without bound.
+  it("prunes aged processed events when replication cannot claim them", () => {
+    const db = new EventsDb(dbPath);
+    db.insertEvent("s1", { type: "a", category: "file", data: "x", priority: 3 }, "PostToolUse");
+    const events = db.getUnprocessed();
+    db.markProcessed([events[0].event_id]);
+    withSqlite(dbPath, (raw) => raw.exec(
+      `UPDATE events SET processed_at = datetime('now', '-10 days') WHERE event_id = ${events[0].event_id}`
+    ));
+
+    // The replicating contract still retains it: nothing has drained it.
+    expect(db.pruneProcessed(7, { awaitingReplication: true })).toBe(0);
+    // The default stays conservative for callers that say nothing.
+    expect(db.pruneProcessed(7)).toBe(0);
+    // With no remote inbox to wait for, age alone is enough, as before #91.
+    expect(db.pruneProcessed(7, { awaitingReplication: false })).toBe(1);
+    db.close();
+  });
+
+  it("retains a remotely enrolled event even when replication is absent", () => {
+    const db = new EventsDb(dbPath);
+    db.insertEvent("s1", { type: "a", category: "file", data: "x", priority: 3 }, "PostToolUse");
+    const events = db.getUnprocessed();
+    db.markProcessed([events[0].event_id]);
+    withSqlite(dbPath, (raw) => raw.exec(
+      `UPDATE events SET processed_at = datetime('now', '-10 days') WHERE event_id = ${events[0].event_id}`
+    ));
+    const [claimed] = db.claimDeliveries({
+      machineId: events[0].machine_id ?? fallbackMachineId,
+      claimOwner: "test-owner",
+      limit: 1,
+      staleClaimMs: 1_000,
+    });
+
+    // A claimed row is mid-flight and is never prunable on age.
+    expect(db.pruneProcessed(7, { awaitingReplication: false })).toBe(0);
+
+    // An uploaded row carries remote state, so it still needs the full drained
+    // proof. This is the install that moved from PostgreSQL back to SQLite.
+    expect(db.markReplicated(claimed.event_uuid, "test-owner", 10n)).toBe(true);
+    expect(db.pruneProcessed(7, { awaitingReplication: false })).toBe(0);
+    expect(db.markAcknowledged(claimed.event_uuid, 10n)).toBe(true);
+    expect(db.pruneProcessed(7, { awaitingReplication: false })).toBe(0);
+    expect(db.markRemotePruned(claimed.event_uuid)).toBe(true);
+    expect(db.pruneProcessed(7, { awaitingReplication: false })).toBe(1);
+    db.close();
+  });
+
+  // A retry row is not proof that nothing reached the remote inbox. The
+  // replication worker marks a claimed row `retry` when the insert throws and
+  // the readback that would settle it is unavailable too, so the insert may
+  // well have committed remotely. After a move back to SQLite, age alone must
+  // not delete a row whose remote outcome is still unknown.
+  it("retains an aged processed event whose remote outcome is unknown", () => {
+    const db = new EventsDb(dbPath);
+    db.insertEvent("s1", { type: "a", category: "file", data: "x", priority: 3 }, "PostToolUse");
+    const events = db.getUnprocessed();
+    db.markProcessed([events[0].event_id]);
+    withSqlite(dbPath, (raw) => raw.exec(
+      `UPDATE events SET processed_at = datetime('now', '-10 days') WHERE event_id = ${events[0].event_id}`
+    ));
+    const [claimed] = db.claimDeliveries({
+      machineId: events[0].machine_id ?? fallbackMachineId,
+      claimOwner: "test-owner",
+      limit: 1,
+      staleClaimMs: 1_000,
+    });
+    expect(db.markDeliveryRetry(
+      claimed.event_uuid,
+      "test-owner",
+      "upload failed",
+      new Date(Date.now() + 60_000).toISOString(),
+    )).toBe(true);
+
+    expect(db.pruneProcessed(7, { awaitingReplication: false })).toBe(0);
+    db.close();
+  });
+
   it("handles concurrent opens (WAL mode)", () => {
     const sequencePath = join(dir, ".machine-sequence.sqlite");
     const db1 = new EventsDb(dbPath);

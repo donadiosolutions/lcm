@@ -141,7 +141,10 @@ export interface LocalHookOutboxRepository {
     publicationLockToken?: BackendPublicationLockToken,
   ): Promise<LocalHookMissingCwdState>;
   clearMissingCwd(publicationLockToken?: BackendPublicationLockToken): Promise<void>;
-  pruneProcessed(olderThanDays: number): Promise<number>;
+  pruneProcessed(
+    olderThanDays: number,
+    options?: { awaitingReplication?: boolean },
+  ): Promise<number>;
   setPrevEventId(
     eventId: number,
     prevEventId: number,
@@ -418,9 +421,12 @@ class SQLiteLocalHookOutboxRepository implements LocalHookOutboxRepository {
     this.admitted(() => this.database.clearMissingCwd(), publicationLockToken);
   }
 
-  async pruneProcessed(olderThanDays: number): Promise<number> {
+  async pruneProcessed(
+    olderThanDays: number,
+    options?: { awaitingReplication?: boolean },
+  ): Promise<number> {
     this.assertOpen("pruneProcessed");
-    return this.admitted(() => this.database.pruneProcessed(olderThanDays));
+    return this.admitted(() => this.database.pruneProcessed(olderThanDays, options));
   }
 
   async setPrevEventId(

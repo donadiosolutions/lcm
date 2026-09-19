@@ -38,7 +38,9 @@ import {
   PASSIVE_EVENT_PROCESSOR_DEFAULTS,
   PassiveEventProcessor,
   type BackgroundPublicationAdmission,
+  type PassiveEventBackgroundDiagnostics,
 } from "./passive-event-processor.js";
+import { createPassiveEventReplicationPass } from "./passive-event-replication-pass.js";
 import { createStatsHandler } from "./routes/stats.js";
 import { backendDiagnosticFailure } from "../storage/diagnostics.js";
 import { createPoolStatsHandler } from "./routes/pool-stats.js";
@@ -430,7 +432,7 @@ function assertDaemonRequestStorageAdmission(
   const requestConfig = parseDaemonConfig(content, {}, resolveDaemonConfigEnv(process.env));
   if (requestConfig.storage.backend !== startupConfig.storage.backend) {
     throw new BackendPublicationJournalError(
-      "unexpected-state",
+      "backend-mismatch",
       "daemon request backend differs from the authenticated startup backend",
     );
   }
@@ -619,6 +621,14 @@ export async function createDaemon(config: DaemonConfig, options?: DaemonOptions
   const invocationCoordinator = createInvocationCoordinator({
     daemonInstanceId: options?._daemonInstanceId,
   });
+  // #1383: the daemon owns passive-event replication. The lease owner is the
+  // daemon instance id so fencing follows daemon lifetime and a restarted
+  // daemon cannot masquerade as its predecessor's lease holder.
+  const passiveEventReplication = createPassiveEventReplicationPass(config, {
+    processId: `lcm-daemon:${invocationCoordinator.daemonInstanceId}`,
+    withPublicationAdmission: withBackgroundPublicationAdmission,
+    publicationHome,
+  });
   const createFactory = options?._createStorageBackendFactory ?? createStorageBackendFactory;
   let storageFactory: StorageBackendFactory;
   try {
@@ -686,6 +696,20 @@ export async function createDaemon(config: DaemonConfig, options?: DaemonOptions
     }, idleTimeoutMs);
   }
 
+  /**
+   * #1384: report a halted background sweep on the health route. Read admission
+   * refuses every other route once the configured backend diverges from this
+   * daemon's frozen startup backend, so unauthenticated health is the only
+   * surface that still answers when the halt is most relevant. A healthy daemon
+   * keeps its existing response shape.
+   */
+  const passiveEventHaltReport = (): {
+    passiveEvents?: PassiveEventBackgroundDiagnostics;
+  } => {
+    const diagnostics = passiveEventProcessor.backgroundDiagnostics();
+    return diagnostics.halted ? { passiveEvents: diagnostics } : {};
+  };
+
   registerBuiltInRoute("GET", "/health", async (req, res) => {
     if (serverToken && req.headers.authorization === undefined) {
       sendJson(res, 200, {
@@ -695,6 +719,7 @@ export async function createDaemon(config: DaemonConfig, options?: DaemonOptions
         uptime: Math.floor((Date.now() - startTime) / 1000),
         pid: process.pid,
         ...(daemonOwnerId ? { ownerId: daemonOwnerId } : {}),
+        ...passiveEventHaltReport(),
       });
       return;
     }
@@ -708,6 +733,7 @@ export async function createDaemon(config: DaemonConfig, options?: DaemonOptions
       pid: process.pid,
       entrypoint: daemonEntrypoint,
       ...(daemonOwnerId ? { ownerId: daemonOwnerId } : {}),
+      ...passiveEventHaltReport(),
       ...(serverToken && req.headers.authorization !== undefined
         ? { daemonInstanceId: invocationCoordinator.daemonInstanceId }
         : {}),
@@ -800,6 +826,7 @@ export async function createDaemon(config: DaemonConfig, options?: DaemonOptions
     {
       storageFactory,
       withPublicationAdmission: withBackgroundPublicationAdmission,
+      replicatePassiveEvents: passiveEventReplication.run,
       signal: shutdownController.signal,
     },
   );
@@ -1136,7 +1163,14 @@ export async function createDaemon(config: DaemonConfig, options?: DaemonOptions
       registerBuiltInRoute(
         "POST",
         "/status",
-        createStatusHandler(config, startTime, actualPort, publicationHome, storageFactory),
+        createStatusHandler(
+          config,
+          startTime,
+          actualPort,
+          publicationHome,
+          storageFactory,
+          () => passiveEventProcessor.backgroundDiagnostics(),
+        ),
         "read",
       );
       passiveEventProcessor.start();
@@ -1153,6 +1187,7 @@ export async function createDaemon(config: DaemonConfig, options?: DaemonOptions
           await settleCleanup(() => activeIngestScan);
           await settleCleanup(() => projectMapWatcher.close());
           await settleCleanup(() => passiveEventProcessor.stopAndWait());
+          await settleCleanup(() => passiveEventReplication.close());
           await settleCleanup(() => { idleTimer = clearIdleTimer(idleTimer, clearIdleTimeout); });
           if (proxyManager) {
             await settleCleanup(() => proxyManager.stop());
@@ -1195,6 +1230,7 @@ export async function createDaemon(config: DaemonConfig, options?: DaemonOptions
       const processor = constructedProcessor;
       await settleCleanup(() => processor.stopAndWait());
     }
+    await settleCleanup(() => passiveEventReplication.close());
     await closeStorageFactoryForTerminalCleanup();
     throw error;
   }

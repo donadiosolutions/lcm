@@ -206,9 +206,8 @@ Sidecars that are missing project metadata are reported separately because their
 ### Separate PostgreSQL event delivery
 
 When PostgreSQL storage is configured, issue #91 provides a separate explicit
-event-delivery worker for the local outbox. It is not started automatically by
-the daemon and is distinct from the daemon's selected `ProjectStorage` route
-consumer. The worker:
+event-delivery worker for the local outbox, distinct from the daemon's selected
+`ProjectStorage` route consumer. The worker:
 
 1. acquires and renews the existing #90 fenced drain lease;
 2. claims a ready local sequence prefix in a bounded batch;
@@ -226,6 +225,78 @@ concurrently. Retry delay uses bounded exponential backoff with deterministic
 jitter, stale claims are recoverable, and poison events remain inspectable
 until exact replay.
 
+Applying a claimed event performs no additional remote work. The inbox row is
+itself the delivery artifact and memory promotion happens locally through the
+selected project storage, so an event is fully delivered once its inbox row is
+durably `applied`. Whether a real remote-side effect was originally intended
+here is tracked in issue #1398.
+
+#### When the daemon runs it
+
+Through issue #91 this worker was **not started automatically by the daemon**.
+It was complete but had no production caller, so in practice nothing advanced a
+local event past `replicated`, and the acknowledged-and-remote-pruned state
+that local retention depends on was unreachable. That was issue #1383.
+
+A PostgreSQL-backed daemon now drives replication itself. Each pass runs on the
+existing passive-event sweep, once at daemon startup and then every five
+minutes, and covers one project per scanned sidecar. The lease owner is the
+daemon instance id, so fencing follows daemon lifetime and a restarted daemon
+cannot reuse its predecessor's lease. Batch size, lease TTL, retry backoff and
+quarantine thresholds keep their built-in values and are not configurable.
+
+A pass only runs for a project when all of the following hold:
+
+1. the daemon's storage backend is `postgresql`;
+2. a machine identity is registered;
+3. the project is linked to a remote project id; and
+4. PostgreSQL storage reports healthy.
+
+The first three are quiet skips. A machine that was never registered, or whose
+registration was interrupted, and a project with no remote binding are states
+an operator has simply not configured, so they produce no diagnostic however
+many sweeps pass over them. The fourth skips too but logs the storage failure
+first, as does a `machine.json` that exists and cannot be read, because those
+are faults rather than states.
+
+A SQLite-backed daemon fails the first check before any PostgreSQL module is
+imported, so it never opens a PostgreSQL connection and its behaviour is
+unchanged. Replication is still not started by a hook, and it remains separate
+from the selected `ProjectStorage` route.
+
+Every project replicates in admitted phases rather than inside one admission
+held across the whole pass. The upload runs under one admission, the claim
+fetch under the next, each renew-and-apply under its own, and reconcile and
+prune each under their own, using the same publication check that promotion
+uses. The consumer lock is released between phases so hook appends can
+proceed instead of waiting behind a whole sweep. A daemon keeps its startup
+backend for its whole lifetime, so when the configured backend changes
+underneath it the next phase admission refuses, the daemon halts exactly as
+it does for promotion, and no further event is uploaded to a backend the
+daemon has already lost.
+
+Each pass releases its project outbox when it finishes. The local outbox
+factory registers every repository it opens and drops one only when that
+repository closes, so a daemon holds one SQLite connection per project while
+that project is replicating and none between passes.
+
+`lcm status` reports what replication has done under `passiveEvents`: whether
+it is `enabled` at all, the `lastPassAt` timestamp, how many passes have run
+and how many projects those passes replicated, and how many events were
+uploaded, applied, acknowledged, pruned, retried and quarantined. `enabled`
+describes backend capability rather than progress. It is true for any daemon
+that started on PostgreSQL, including one where every project skips because
+the machine is unregistered, nothing is linked to a remote project, or storage
+is unavailable. A SQLite daemon reports `enabled: false` permanently, because
+replication is not something it can ever do. `passes` and `lastPassAt` are
+what separate a daemon that has never replicated from one that has: they stay
+at `0` and `null` until the first sweep and advance on every sweep afterwards,
+whether or not a project was admitted. `projects` counts the passes that
+returned a replication result: gate skips return nothing, and a project
+whose batch throws mid-way returns nothing either, so an enabled daemon
+with passes recorded and no projects is skipping or failing rather than
+idle. Counts only; no payloads or project paths.
+
 The staged operator commands are:
 
 ```bash
@@ -238,8 +309,9 @@ lcm events replay <event-id> [--machine <machine-id>] [--json]
 They require PostgreSQL configuration, a registered machine, and a linked
 remote project. `status` and `validate` expose the durable checkpoints;
 `quarantine` lists local compatibility failures and remote poison rows; and
-`replay` retries one exact local or remote event. These commands do not start
-replication. CLI/import-export remains #618-owned. Stats and doctor expose
+`replay` retries one exact local or remote event. They inspect and repair; the
+daemon drives replication, not these commands. CLI/import-export remains
+#618-owned. Stats and doctor expose
 observed local outbox counts alongside selected-backend readiness through the
 [shared diagnostic snapshot](cli.md#observational-diagnostics).
 
@@ -279,8 +351,11 @@ When a pattern crosses the reinforcement threshold, `reinforcementBoost` is adde
 - **Sidecar DB**: `~/.lcm/events/<sha256-of-project-path>.db`
   - Per-project SQLite database in WAL mode
   - Local promotion state and remote delivery state are independent
-  - Processed events are pruned after 7 days only when remote delivery is
-    acknowledged and any remote applied row is proven pruned
+  - Processed events are pruned after 7 days. On a PostgreSQL install only
+    when remote delivery is acknowledged and any remote applied row is
+    proven pruned; on a SQLite install on age alone for rows that never
+    entered the remote pipeline, with full drained proof still required
+    for any row carrying remote state
   - Unprocessed and replayable events are never discarded by age or row-count
     retention guards; a maintenance diagnostic records guard breaches
   - Schema versioned for future migrations (currently v5)
@@ -306,7 +381,12 @@ inspects, and closes the local sidecar. A concurrent publication causes this
 best-effort maintenance and its promotion trigger to be skipped; the later
 restore proceeds only if its own short publication admission succeeds.
 Publication-journal errors remain fail-closed. Daemon startup and network
-requests do not retain the maintenance lock.
+requests do not retain the maintenance lock. Upgrading a SQLite install
+reclaims the backlog on the first SessionStart: processed events older than
+seven days that were never claimed for remote delivery are deleted,
+including everything accumulated since the replication gate made the prune
+a no-op (2026-07-30). That prune runs under this same fence, so a large
+backlog also lengthens this hold on the first start after upgrading.
 
 The passive sidecar sweep applies the same boundary to orphan cleanup. For each
 sidecar that may be deleted, LCM retains publication admission while it

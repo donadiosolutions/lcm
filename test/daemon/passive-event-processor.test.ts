@@ -1,5 +1,5 @@
-import { describe, expect, it, vi } from "vitest";
-import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { describe, expect, it, onTestFinished, vi } from "vitest";
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import type { IncomingMessage, ServerResponse } from "node:http";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -16,6 +16,7 @@ import {
   assertBackendPublicationConsumerAccess,
   BackendPublicationJournalError,
   withBackendPublicationConfigLockAsync,
+  withBackendPublicationConsumerLock,
   withBackendPublicationConsumerLockAsync,
 } from "../../src/storage/backend-publication.js";
 
@@ -36,6 +37,29 @@ function makeConfig() {
   return loadDaemonConfig("/nonexistent", { daemon: { port: 0 }, llm: { provider: "disabled" } });
 }
 
+/** A daemon whose selected backend can actually replicate passive events. */
+function makeReplicatingConfig() {
+  return {
+    ...makeConfig(),
+    storage: {
+      backend: "postgresql",
+      postgresql: { url: "postgresql://example.test/lcm" },
+    },
+  } as unknown as ReturnType<typeof makeConfig>;
+}
+
+function replicationSummary() {
+  return {
+    leaseAcquired: true,
+    uploaded: 1,
+    applied: 1,
+    retried: 0,
+    quarantined: 0,
+    acknowledged: 1,
+    pruned: 1,
+  };
+}
+
 function publicationFixture(): { home: string; configPath: string } {
   const home = mkdtempSync(join(tmpdir(), "lcm-passive-publication-"));
   const lcmDir = join(home, ".lcm");
@@ -43,6 +67,25 @@ function publicationFixture(): { home: string; configPath: string } {
   const configPath = join(lcmDir, "config.json");
   writeFileSync(configPath, "{}\n", { mode: 0o600 });
   return { home, configPath };
+}
+
+/** A publication home for one test, removed when that test finishes. */
+function replicationHome(): string {
+  const { home } = publicationFixture();
+  onTestFinished(() => { rmSync(home, { recursive: true, force: true }); });
+  return home;
+}
+
+/**
+ * Background admission as the daemon really grants it. The publication
+ * consumer lock is held for the whole admitted operation, so the callback
+ * receives a live token that its nested local-outbox work can inherit. A
+ * synthetic token cannot stand in here: the append barrier rejects one that
+ * no lock owns, which is the property replication depends on.
+ */
+function realPublicationAdmission(home: string): PublicationAdmission {
+  return async operation =>
+    withBackendPublicationConsumerLockAsync(home, token => operation(token));
 }
 
 function mockRes() {
@@ -655,6 +698,366 @@ describe("PassiveEventProcessor", () => {
         signal: expect.any(Object),
       }),
     );
+  });
+
+  // #1384: a frozen startup backend can never be re-admitted by this process,
+  // so the sweep must stop and report instead of retrying every five minutes.
+  it("halts the sweep and reports once on a frozen startup-backend mismatch", async () => {
+    const { deps } = timerDeps();
+    const mismatch = new BackendPublicationJournalError(
+      "backend-mismatch",
+      "daemon request backend differs from the authenticated startup backend",
+    );
+    const collectEventSidecars = vi.fn<CollectEventSidecars>().mockResolvedValue([
+      sidecar({ cwd: "/mismatched", path: "/events/mismatched.db", unprocessed: 1 }),
+      sidecar({ cwd: "/later", path: "/events/later.db", unprocessed: 1 }),
+    ]);
+    const promoteEventsForCwd = vi.fn<PromoteEventsForCwd>().mockImplementation(async (...args) =>
+      args[5]?.withPublicationAdmission?.(() => {
+        throw mismatch;
+      }) ?? { promoted: 1, skipped: 0, correlated: 0, errors: 0 });
+    const withPublicationAdmission: PublicationAdmission = async operation => operation({});
+    const processor = new PassiveEventProcessor(makeConfig(), PASSIVE_EVENT_PROCESSOR_DEFAULTS, {
+      ...deps,
+      collectEventSidecars,
+      promoteEventsForCwd,
+      withPublicationAdmission,
+    } as never);
+
+    processor.start();
+    expect(processor.backgroundDiagnostics()).toMatchObject({
+      halted: false,
+      haltedReason: null,
+      haltedMessage: null,
+    });
+
+    await processor.runSweep();
+
+    // The later sidecar is abandoned: every sidecar would fail identically.
+    expect(promoteEventsForCwd).toHaveBeenCalledTimes(1);
+    expect(deps.safeLogError).toHaveBeenCalledTimes(1);
+    expect(deps.safeLogError).toHaveBeenCalledWith("passive-event-processor", mismatch, {});
+    expect(processor.backgroundDiagnostics()).toMatchObject({
+      halted: true,
+      haltedReason: "backend-mismatch",
+      haltedMessage: "daemon request backend differs from the authenticated startup backend",
+    });
+    // The periodic sweep is retired rather than left looping.
+    expect(deps.clearInterval).toHaveBeenCalled();
+
+    // A further sweep neither promotes nor re-reports the identical refusal.
+    await processor.runSweep();
+    expect(promoteEventsForCwd).toHaveBeenCalledTimes(1);
+    expect(deps.safeLogError).toHaveBeenCalledTimes(1);
+  });
+
+  it("halts notified promotion and abandons the remaining queued projects", async () => {
+    const { deps } = timerDeps();
+    const mismatch = new BackendPublicationJournalError(
+      "backend-mismatch",
+      "daemon request backend differs from the authenticated startup backend",
+    );
+    const firstCwd = mkdtempSync(join(tmpdir(), "lcm-passive-mismatch-"));
+    const secondCwd = mkdtempSync(join(tmpdir(), "lcm-passive-later-"));
+    const promoteEventsForCwd = vi.fn<PromoteEventsForCwd>().mockImplementation(async (...args) =>
+      args[5]?.withPublicationAdmission?.(() => {
+        throw mismatch;
+      }) ?? { promoted: 0, skipped: 0, correlated: 0, errors: 0, message: "no unprocessed events" });
+    const withPublicationAdmission: PublicationAdmission = async operation => operation({});
+    const processor = new PassiveEventProcessor(makeConfig(), PASSIVE_EVENT_PROCESSOR_DEFAULTS, {
+      ...deps,
+      promoteEventsForCwd,
+      withPublicationAdmission,
+    } as never);
+
+    try {
+      processor.notify({ cwd: firstCwd, priority: 1 });
+      processor.notify({ cwd: secondCwd, priority: 1 });
+      await processor.flushOnce();
+
+      expect(promoteEventsForCwd).toHaveBeenCalledTimes(1);
+      expect(deps.safeLogError).toHaveBeenCalledTimes(1);
+      expect(processor.backgroundDiagnostics().haltedReason).toBe("backend-mismatch");
+
+      // A halted processor stops accepting new background work entirely.
+      processor.notify({ cwd: secondCwd, priority: 1 });
+      await processor.flushOnce();
+      expect(promoteEventsForCwd).toHaveBeenCalledTimes(1);
+    } finally {
+      processor.stop();
+      rmSync(firstCwd, { recursive: true, force: true });
+      rmSync(secondCwd, { recursive: true, force: true });
+    }
+  });
+
+  // #1383: the replication worker had no production caller, so markReplicated
+  // and markRemotePruned were unreachable and nothing reported the absence.
+  it("drains each scanned project and reports what replication moved", async () => {
+    const home = replicationHome();
+    const { deps } = timerDeps();
+    const collectEventSidecars = vi.fn<CollectEventSidecars>().mockResolvedValue([
+      sidecar({ cwd: "/bound", path: "/events/bound.db", unprocessed: 0 }),
+      sidecar({ cwd: "/unbound", path: "/events/unbound.db", unprocessed: 0 }),
+      sidecar({ cwd: "/broken", path: "/events/broken.db", scanError: "io" }),
+      sidecar({ cwd: "/budget", path: "/events/budget.db", scanSkipped: true }),
+      sidecar({ cwd: undefined, path: "/events/orphan.db" }),
+    ]);
+    const replicatePassiveEvents = vi.fn(async (cwd: string) => (
+      cwd === "/bound"
+        ? {
+          leaseAcquired: true,
+          uploaded: 4,
+          applied: 3,
+          retried: 1,
+          quarantined: 2,
+          acknowledged: 3,
+          pruned: 5,
+        }
+        : null
+    ));
+    const processor = new PassiveEventProcessor(
+      makeReplicatingConfig(),
+      PASSIVE_EVENT_PROCESSOR_DEFAULTS,
+      {
+        ...deps,
+        collectEventSidecars,
+        replicatePassiveEvents,
+        withPublicationAdmission: realPublicationAdmission(home),
+      } as never,
+    );
+
+    await processor.runSweep();
+
+    // Only scannable projects with a cwd are offered to replication.
+    expect(replicatePassiveEvents.mock.calls.map(call => call[0]))
+      .toEqual(["/bound", "/unbound"]);
+    expect(processor.backgroundDiagnostics().replication).toMatchObject({
+      enabled: true,
+      passes: 1,
+      projects: 1,
+      uploaded: 4,
+      applied: 3,
+      acknowledged: 3,
+      pruned: 5,
+      retried: 1,
+      quarantined: 2,
+    });
+    expect(processor.backgroundDiagnostics().replication.lastPassAt).toEqual(expect.any(String));
+  });
+
+  it("reports that replication never ran when the daemon cannot replicate", async () => {
+    const { deps } = timerDeps();
+    const collectEventSidecars = vi.fn<CollectEventSidecars>().mockResolvedValue([
+      sidecar({ cwd: "/project", path: "/events/project.db", unprocessed: 0 }),
+    ]);
+    const processor = new PassiveEventProcessor(makeConfig(), PASSIVE_EVENT_PROCESSOR_DEFAULTS, {
+      ...deps,
+      collectEventSidecars,
+    } as never);
+
+    await processor.runSweep();
+
+    expect(processor.backgroundDiagnostics().replication).toEqual({
+      enabled: false,
+      lastPassAt: null,
+      passes: 0,
+      projects: 0,
+      uploaded: 0,
+      applied: 0,
+      acknowledged: 0,
+      pruned: 0,
+      retried: 0,
+      quarantined: 0,
+    });
+  });
+
+  it("abandons replication when the processor stops mid-pass", async () => {
+    const home = replicationHome();
+    const { deps } = timerDeps();
+    const collectEventSidecars = vi.fn<CollectEventSidecars>().mockResolvedValue([
+      sidecar({ cwd: "/first", path: "/events/first.db", unprocessed: 0 }),
+      sidecar({ cwd: "/second", path: "/events/second.db", unprocessed: 0 }),
+    ]);
+    let processor!: PassiveEventProcessor;
+    const replicatePassiveEvents = vi.fn(async () => {
+      processor.stop();
+      return null;
+    });
+    processor = new PassiveEventProcessor(
+      makeReplicatingConfig(),
+      PASSIVE_EVENT_PROCESSOR_DEFAULTS,
+      {
+        ...deps,
+        collectEventSidecars,
+        replicatePassiveEvents,
+        withPublicationAdmission: realPublicationAdmission(home),
+      } as never,
+    );
+
+    await processor.runSweep();
+
+    expect(replicatePassiveEvents).toHaveBeenCalledTimes(1);
+  });
+
+  // #1383 asked for trustworthy replication signals. A SQLite daemon can never
+  // replicate, so counting five-minute passes and reporting `enabled` there is
+  // a standing false signal on the default backend.
+  it("never claims replication on a daemon whose backend cannot replicate", async () => {
+    const { deps } = timerDeps();
+    const collectEventSidecars = vi.fn<CollectEventSidecars>().mockResolvedValue([
+      sidecar({ cwd: "/project", path: "/events/project.db", unprocessed: 0 }),
+    ]);
+    const replicatePassiveEvents = vi.fn(async () => replicationSummary());
+    const processor = new PassiveEventProcessor(makeConfig(), PASSIVE_EVENT_PROCESSOR_DEFAULTS, {
+      ...deps,
+      collectEventSidecars,
+      replicatePassiveEvents,
+    } as never);
+
+    await processor.runSweep();
+
+    expect(replicatePassiveEvents).not.toHaveBeenCalled();
+    expect(processor.backgroundDiagnostics().replication).toEqual({
+      enabled: false,
+      lastPassAt: null,
+      passes: 0,
+      projects: 0,
+      uploaded: 0,
+      applied: 0,
+      acknowledged: 0,
+      pruned: 0,
+      retried: 0,
+      quarantined: 0,
+    });
+  });
+
+  // #1384 in the other direction. That issue was a frozen startup backend
+  // making the daemon do nothing and say nothing; this is the same frozen
+  // snapshot making it keep uploading to a backend it has already lost.
+  // Promotion is skipped entirely once a sidecar has no unprocessed events, so
+  // replication is the only remaining pass that can reach the old backend.
+  // The pass admits each phase separately and rethrows a frozen-backend
+  // refusal instead of reporting it, so the sweep still halts here.
+  it("halts replication when a phase admission reports the backend left", async () => {
+    const { home } = publicationFixture();
+    const { deps } = timerDeps();
+    const mismatch = new BackendPublicationJournalError(
+      "backend-mismatch",
+      "daemon request backend differs from the authenticated startup backend",
+    );
+    const collectEventSidecars = vi.fn<CollectEventSidecars>().mockResolvedValue([
+      sidecar({ cwd: "/promoted", path: "/events/promoted.db", unprocessed: 0 }),
+    ]);
+    const replicatePassiveEvents = vi.fn()
+      .mockResolvedValueOnce(replicationSummary())
+      .mockRejectedValueOnce(mismatch);
+    const processor = new PassiveEventProcessor(
+      makeReplicatingConfig(),
+      PASSIVE_EVENT_PROCESSOR_DEFAULTS,
+      {
+        ...deps,
+        collectEventSidecars,
+        replicatePassiveEvents,
+      } as never,
+    );
+
+    try {
+      await processor.runSweep();
+      expect(replicatePassiveEvents).toHaveBeenCalledTimes(1);
+
+      // Publication moves the daemon off PostgreSQL. The next phase
+      // admission refuses, the pass rethrows, and the sweep halts.
+      await processor.runSweep();
+
+      expect(replicatePassiveEvents).toHaveBeenCalledTimes(2);
+      expect(processor.backgroundDiagnostics()).toMatchObject({
+        halted: true,
+        haltedReason: "backend-mismatch",
+      });
+    } finally {
+      processor.stop();
+      rmSync(home, { recursive: true, force: true });
+    }
+  });
+
+  // The sweep must not hold publication admission across the replication
+  // call: the pass admits each worker phase separately (proved at the pass
+  // level), so the admission lock file must be absent for the whole call
+  // and hook appends are never blocked behind a full sweep. A reverted
+  // processor that re-wraps the call observes the lock file instead.
+  it("releases publication admission across the replication call", async () => {
+    const { home } = publicationFixture();
+    const { deps } = timerDeps();
+    const lockPath = join(home, ".lcm.backend-publication.lock");
+    let lockHeldDuringReplication: boolean | null = null;
+    let outboxAccess = "not attempted";
+    const withPublicationAdmission = realPublicationAdmission(home);
+    const collectEventSidecars = vi.fn<CollectEventSidecars>().mockResolvedValue([
+      sidecar({ cwd: "/bound", path: "/events/bound.db", unprocessed: 0 }),
+    ]);
+    const replicatePassiveEvents = vi.fn(async () => {
+      lockHeldDuringReplication = existsSync(lockPath);
+      try {
+        outboxAccess = withBackendPublicationConsumerLock(home, () => "acquired");
+      } catch (error) {
+        outboxAccess = (error as Error).message;
+      }
+      return replicationSummary();
+    });
+    const processor = new PassiveEventProcessor(
+      makeReplicatingConfig(),
+      PASSIVE_EVENT_PROCESSOR_DEFAULTS,
+      {
+        ...deps,
+        collectEventSidecars,
+        replicatePassiveEvents,
+        withPublicationAdmission,
+      } as never,
+    );
+
+    try {
+      await processor.runSweep();
+
+      expect(replicatePassiveEvents).toHaveBeenCalledTimes(1);
+      expect(lockHeldDuringReplication).toBe(false);
+      expect(outboxAccess).toBe("acquired");
+    } finally {
+      processor.stop();
+      rmSync(home, { recursive: true, force: true });
+    }
+  });
+
+  it("reports one failed replication pass and continues to the next project", async () => {
+    const home = replicationHome();
+    const { deps } = timerDeps();
+    const failure = new Error("replication pass failed");
+    const collectEventSidecars = vi.fn<CollectEventSidecars>().mockResolvedValue([
+      sidecar({ cwd: "/first", path: "/events/first.db", unprocessed: 0 }),
+      sidecar({ cwd: "/second", path: "/events/second.db", unprocessed: 0 }),
+    ]);
+    const replicatePassiveEvents = vi.fn(async (cwd: string) => {
+      if (cwd === "/first") throw failure;
+      return replicationSummary();
+    });
+    const processor = new PassiveEventProcessor(
+      makeReplicatingConfig(),
+      PASSIVE_EVENT_PROCESSOR_DEFAULTS,
+      {
+        ...deps,
+        collectEventSidecars,
+        replicatePassiveEvents,
+        withPublicationAdmission: realPublicationAdmission(home),
+      } as never,
+    );
+
+    await processor.runSweep();
+
+    expect(deps.safeLogError)
+      .toHaveBeenCalledWith("passive-event-processor", failure, { cwd: "/first" });
+    expect(processor.backgroundDiagnostics()).toMatchObject({
+      halted: false,
+      replication: { projects: 1 },
+    });
   });
 
   it("waits for an in-flight drain before completing shutdown", async () => {
