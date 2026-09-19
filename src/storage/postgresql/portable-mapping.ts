@@ -150,6 +150,39 @@ export async function readCanonicalContentRows(executor:PostgreSqlQueryExecutor,
   for (const {__locator,...row} of result.rows) found.set(__locator,row);
   return found;
 }
+/**
+ * Size-only companion to readCanonicalContentRows, keyed by the same locator
+ * strings. A caller that must re-verify many records cannot ask for up to
+ * PORTABLE_LIMITS.maxBatchRecords payload projections at once, because each
+ * projection is individually allowed to reach PORTABLE_LIMITS.maxBatchBytes
+ * and the aggregate would be tens of gigabytes materialised client side.
+ * This read answers only how large each projection is, so the caller can
+ * group locators into aggregate-byte-bounded chunks before fetching payloads.
+ *
+ * Deliberately no <= maxBatchBytes predicate, unlike readCanonicalContentRows:
+ * an oversized row must be reported at its real size so the caller gives it
+ * its own chunk. readCanonicalContentRows then excludes that row and the
+ * caller treats it as a content mismatch. A locator absent from the source
+ * table is likewise simply absent from the returned map; callers must treat
+ * that as a mismatch, not as zero bytes.
+ *
+ * This read takes no row locks and does not fence anything by itself; see
+ * readCanonicalContentRows for why a re-verifying caller must already hold a
+ * writer fence for the project.
+ */
+export async function readCanonicalContentSizes(executor:PostgreSqlQueryExecutor,projectId:string,domain:PortableDomain,locators:readonly string[],signal?:AbortSignal):Promise<ReadonlyMap<string,bigint>> {
+  if (locators.length===0) return new Map();
+  if (locators.length>PORTABLE_LIMITS.maxBatchRecords) throw new PortableStreamError("invalid-limit");
+  const mapping = mappingForDomain(domain);
+  for (const locator of locators) parseLocator(locator,mapping.keys.length);
+  const result = await executor.query<{__locator:string;__bytes:string}>({text:`SELECT ${locatorExpression(mapping)} AS __locator, ${sizeExpression(domain,mapping)}::text AS __bytes FROM ${mapping.table} r${mapping.joins ?? ""} WHERE (${scope(domain)}) AND ${locatorExpression(mapping)} = ANY($2::text[])`,values:[projectId,locators]},{domain:"transaction",operation:"portable-content-sizes",projectId,signal});
+  const sizes = new Map<string,bigint>();
+  for (const {__locator,__bytes} of result.rows) {
+    if (!/^\d+$/u.test(__bytes)) throw new PortableStreamError("malformed-record");
+    sizes.set(__locator,BigInt(__bytes));
+  }
+  return sizes;
+}
 export interface CanonicalDecodeContext {
   readonly projectIdentity:PortableProjectIdentity;
   /** Authenticated path identity used by ordinary runtime promotions. */

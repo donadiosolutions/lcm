@@ -221,6 +221,55 @@ it("refuses a malformed locator in a batch before issuing SQL",async()=>{
   for(const bad of ["bad",'{}','[]','[1]']) await expect(mapping.readCanonicalContentRows(db,projectId,"messages",[bad])).rejects.toThrow();
   expect(query).not.toHaveBeenCalled();
 });
+it("reads canonical content sizes without projecting payload columns or bounding row size",async()=>{
+  const locators=[0,1,2].map(index=>JSON.stringify(["key"+index]));
+  const {db,query}=executor([
+    {__locator:locators[0],__bytes:"17"},
+    {__locator:locators[2],__bytes:"150994944"},
+  ]);
+  const sizes=await mapping.readCanonicalContentSizes(db,projectId,"machines",locators);
+  expect(query.mock.calls).toHaveLength(1);
+  expect(query.mock.calls[0][0].text).toContain("= ANY($2::text[])");
+  expect(query.mock.calls[0][0].text).toContain("octet_length");
+  expect(query.mock.calls[0][0].text).not.toContain("<= $3");
+  expect(query.mock.calls[0][0].values).toEqual([projectId,locators]);
+  expect(query.mock.calls[0][1].operation).toBe("portable-content-sizes");
+  expect(sizes.get(locators[0]!)).toBe(17n);
+  expect(sizes.get(locators[2]!)).toBe(150994944n);
+});
+it("omits a locator missing from the size result instead of reporting it as zero bytes",async()=>{
+  const locators=[0,1].map(index=>JSON.stringify(["key"+index]));
+  const {db,query}=executor([{__locator:locators[1],__bytes:"0"}]);
+  const sizes=await mapping.readCanonicalContentSizes(db,projectId,"session-instructions",locators);
+  expect(query.mock.calls[0][0].text).toContain("JOIN lcm.machines m");
+  expect(sizes.size).toBe(1);
+  expect(sizes.has(locators[0]!)).toBe(false);
+  expect(sizes.get(locators[1]!)).toBe(0n);
+});
+it("returns an empty size map without querying when there are no locators to size",async()=>{
+  const {db,query}=executor([]);
+  expect(await mapping.readCanonicalContentSizes(db,projectId,"machines",[])).toEqual(new Map());
+  expect(query).not.toHaveBeenCalled();
+});
+it("refuses size batches larger than the shared portable batch-record bound",async()=>{
+  const {db,query}=executor([]);
+  const {PORTABLE_LIMITS}=await import("../../src/storage/portable-record.js");
+  const oversized=Array.from({length:PORTABLE_LIMITS.maxBatchRecords+1},(_,index)=>JSON.stringify(["key"+index]));
+  await expect(mapping.readCanonicalContentSizes(db,projectId,"machines",oversized)).rejects.toThrow(/invalid-limit/);
+  expect(query).not.toHaveBeenCalled();
+});
+it("refuses a malformed locator before issuing a size query",async()=>{
+  const {db,query}=executor([]);
+  for(const bad of ["bad",'{}','[]','[1]']) await expect(mapping.readCanonicalContentSizes(db,projectId,"messages",[bad])).rejects.toThrow();
+  expect(query).not.toHaveBeenCalled();
+});
+it("refuses a non-numeric canonical size value instead of coercing or dropping it",async()=>{
+  const locator=JSON.stringify(["key0"]);
+  for(const bad of ["","17.5","-1","1e3","NaN",null]){
+    const {db}=executor([{__locator:locator,__bytes:bad}]);
+    await expect(mapping.readCanonicalContentSizes(db,projectId,"machines",[locator])).rejects.toThrow(/malformed-record/);
+  }
+});
 
 it("refuses missing decode evidence instead of inventing parent identities or duplicate occurrences",()=>{
   const context={projectIdentity:{scope:"shared" as const,projectId}};
