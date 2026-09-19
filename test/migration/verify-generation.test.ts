@@ -263,6 +263,8 @@ function fakeSession(overrides: {
   ledgerCheckpoints?: readonly ReturnType<typeof defaultLedgerCheckpoint>[];
   ledgerNonInjective?: ReadonlyArray<{ domain: string; nativeKey: string }>;
   identityColumns?: ReadonlyArray<{ tableName: string; columnName: string }>;
+  migrationsRows?: ReadonlyArray<{ id: string; checksum_sha256: string }>;
+  systemIdentifier?: string;
 } = {}) {
   const sequenceState = overrides.sequenceState ?? {};
   const ledgerRun = overrides.ledgerRun === undefined
@@ -336,6 +338,19 @@ function fakeSession(overrides: {
         // alone (or session.query alone) is how a test simulates real
         // window-drift.
         return { rows: [{ collname: "default", collcollate: "C", collctype: "C", collprovider: "c" }] };
+      }
+      if (config.text.includes("lcm.schema_migrations")) {
+        // Round-4: mirrors fakeRuntime's own lcm.schema_migrations
+        // branch, same reasoning as pg_collation above -- byte-identical
+        // by construction on the default fixture, since the new
+        // live-to-live migrations recheck now also runs on this session.
+        return { rows: overrides.migrationsRows ?? FAKE_MIGRATIONS.map(({ id, sha256 }) => ({ id, checksum_sha256: sha256 })) };
+      }
+      if (config.text.includes("pg_control_system")) {
+        // Round-4: mirrors fakeRuntime's own pg_control_system branch,
+        // same reasoning -- the new live-to-live system_identifier
+        // recheck now also runs on this session.
+        return { rows: [{ system_identifier: overrides.systemIdentifier ?? "7123456789" }] };
       }
       return { rows: [{ admitted: true }] };
     }),
@@ -1157,6 +1172,50 @@ describe("verifyMigrationGeneration", () => {
     const dependencies = dependenciesFor(copySource, runtime);
     await expect(verifyMigrationGeneration(
       baseInput({ homeDir: "/tmp/lcm-verify-collation-window-drift" }), dependencies,
+    )).rejects.toMatchObject({ reason: "destination-drift" });
+  }, 15000);
+
+  it("round-4 red case: refuses when the destination migrations chain changes inside the fenced window (live-to-live)", async () => {
+    // Pre-window capture (via runtime.query, step 2) and the in-window
+    // re-read (via session.query, assertSchemaWitnessLiveToLive) are
+    // deliberately made to disagree here -- both agreeing with the
+    // *expected* destinationMigrationsSha256 individually would not be
+    // enough, since the interval this check closes is exactly the one
+    // between the pre-lease read and the window opening, where a
+    // migration could commit in between. The default runtime still
+    // reports FAKE_MIGRATIONS (matching EXPECTED_MIGRATIONS_SHA256, the
+    // pre-window comparison target), so only the in-window session read
+    // is drifted -- a driver that reused the pre-window value instead of
+    // rereading it live would wrongly pass this case.
+    stubDestinationPrimitives();
+    const copySource = fakeCopySource();
+    const driftedSession = fakeSession({
+      migrationsRows: [{ id: "0001", checksum_sha256: fakeHash("drifted-migration-checksum") }],
+    });
+    const runtime = fakeRuntime({ session: driftedSession });
+    const dependencies = dependenciesFor(copySource, runtime);
+    await expect(verifyMigrationGeneration(
+      baseInput({ homeDir: "/tmp/lcm-verify-live-migrations-window-drift", destinationMigrationsSha256: EXPECTED_MIGRATIONS_SHA256 }),
+      dependencies,
+    )).rejects.toMatchObject({ reason: "destination-drift" });
+  }, 15000);
+
+  it("round-4 red case: refuses when the destination system identifier changes inside the fenced window (live-to-live)", async () => {
+    // Same shape as the migrations-chain case above, but for
+    // system_identifier: the pre-window read (captureDestinationIdentity,
+    // via runtime.query) still agrees with expectedSystemIdentifier, and
+    // only the in-window session read disagrees, simulating a failover
+    // landing in the interval between the pre-lease read and the window
+    // actually opening -- the interval assertSchemaWitnessLiveToLive's
+    // own docstring names but which, before round-4, nothing checked.
+    stubDestinationPrimitives();
+    const copySource = fakeCopySource();
+    const driftedSession = fakeSession({ systemIdentifier: "9999999999" });
+    const runtime = fakeRuntime({ session: driftedSession });
+    const dependencies = dependenciesFor(copySource, runtime);
+    await expect(verifyMigrationGeneration(
+      baseInput({ homeDir: "/tmp/lcm-verify-live-system-identifier-window-drift", expectedSystemIdentifier: "7123456789" }),
+      dependencies,
     )).rejects.toMatchObject({ reason: "destination-drift" });
   }, 15000);
 

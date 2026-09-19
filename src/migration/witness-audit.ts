@@ -159,16 +159,16 @@ export const MIGRATION_WITNESS_AUDIT: readonly MigrationWitnessAuditEntry[] = Ob
   },
   {
     id: "destination-system-identifier", bodyField: "destinationIdentity",
-    description: "pg_control_system()'s system_identifier, recorded as a sibling of the sealed witness.",
+    description: "pg_control_system()'s system_identifier, recorded as a sibling of the sealed witness, captured once before the fenced window opens.",
     comparison: "compared-live",
-    consequence: "refuses destination-drift when it disagrees with expectedSystemIdentifier",
+    consequence: "refuses destination-drift when it disagrees with expectedSystemIdentifier (compared pre-window); round-4 also rechecks it live-to-live from inside the fenced window, on the same borrowed read-only session as the census, refusing destination-drift on a failover between the pre-lease read and the window that the pre-window comparison alone cannot see",
     mismatchClasses: ["identity"],
   },
   {
     id: "destination-schema-migrations", bodyField: "destinationSchemaWitness",
-    description: "The destination's applied migrations chain digest.",
+    description: "The destination's applied migrations chain digest, captured once before the fenced window opens.",
     comparison: "compared-live",
-    consequence: "refuses destination-drift when it disagrees with destinationMigrationsSha256",
+    consequence: "refuses destination-drift when it disagrees with destinationMigrationsSha256 (compared pre-window); round-4 also rechecks it live-to-live from inside the fenced window, on the same borrowed read-only session as the census, refusing destination-drift on a migration committing between the pre-lease read and the window that the pre-window comparison alone cannot see",
     mismatchClasses: ["schema"],
   },
   {

@@ -272,13 +272,32 @@ async function captureDestinationSchemaWitness(
  * census's row-level comparison cannot see -- refuses here instead of
  * silently publishing a clean report against a schema the window never
  * actually held constant.
+ *
+ * Round-4: system_identifier and the migrations chain digest were both
+ * captured once before the lease was even acquired (captureDestinationIdentity
+ * and captureAppliedMigrationsSha256, step 2) and never rechecked --
+ * unlike search configuration and collation, both of these DO have a
+ * pre-window comparison (against expectedSystemIdentifier and
+ * destinationMigrationsSha256 respectively), but neither of those
+ * comparisons says anything about whether the value was still true once
+ * the window actually opened. A failover between the pre-lease read and
+ * the window would change system_identifier; a migration committing in
+ * that same interval would change the migrations chain -- either would
+ * let the report certify census rows read from a destination that was
+ * no longer the one identity-witnessed and schema-witnessed at step 2.
+ * Both are now rechecked live-to-live here too, closing the interval
+ * this function's own name already promised to cover but did not.
  */
 async function assertSchemaWitnessLiveToLive(
-  session: PostgreSqlSnapshotSession, expected: MigrationSchemaWitness, signal?: AbortSignal,
+  session: PostgreSqlSnapshotSession, expected: MigrationSchemaWitness, expectedSystemIdentifier: string, signal?: AbortSignal,
 ): Promise<void> {
-  const [searchStatus, collationSha256] = await Promise.all([
+  const [searchStatus, collationSha256, migrationsSha256, systemIdentifierResult] = await Promise.all([
     inspectPostgreSqlSearchConfiguration(session, { signal }),
     captureCollationSha256(session, signal),
+    captureAppliedMigrationsSha256(session, signal),
+    session.query<{ system_identifier: string }>({
+      text: "SELECT system_identifier::text AS system_identifier FROM pg_catalog.pg_control_system()",
+    }, { domain: "factory", operation: "verifyGenerationDestinationIdentityLiveToLive", signal }),
   ]);
   if (searchStatus.actualSha256 === null) driverError("invalid-input", searchConfigurationAbsentReason(searchStatus));
   if (searchStatus.actualSha256 !== expected.searchConfigurationSha256) {
@@ -286,6 +305,12 @@ async function assertSchemaWitnessLiveToLive(
   }
   if (collationSha256 !== expected.collationSha256) {
     driverError("destination-drift", "destination collation changed inside the fenced verification window");
+  }
+  if (migrationsSha256 !== expected.migrationsSha256) {
+    driverError("destination-drift", "destination migrations chain changed inside the fenced verification window");
+  }
+  if (systemIdentifierResult.rows[0]?.system_identifier !== expectedSystemIdentifier) {
+    driverError("destination-drift", "destination system identifier changed inside the fenced verification window");
   }
 }
 
@@ -1464,7 +1489,7 @@ async function computeVerificationReport(
       let ledgerMismatches: MigrationVerificationMismatch[];
       try {
         await assertPermanentReadOnlyGuard(session, input.signal);
-        await assertSchemaWitnessLiveToLive(session, destinationSchemaWitness, input.signal);
+        await assertSchemaWitnessLiveToLive(session, destinationSchemaWitness, input.expectedSystemIdentifier, input.signal);
         destinationRead = await readFencedDestinationCensus(session, {
           settings: input.destinationSettings, expectedOwner: input.expectedOwner,
           expectedIdentity: input.expectedIdentity, scratchParent: input.scratchParent, signal: input.signal,
