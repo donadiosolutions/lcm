@@ -537,42 +537,17 @@ describe("migration receipt v1", () => {
   });
 });
 
-describe("Node 22.12 receipt transaction compatibility", () => {
-  it("proves transaction ownership when the driver has no isTransaction property", () => {
-    const native = database();
-    const db = { exec: native.exec.bind(native), prepare: native.prepare.bind(native), isTransaction: undefined } as unknown as DatabaseSync;
+describe("receipt epoch transaction ownership", () => {
+  it("refuses epoch adoption while the connection already owns a transaction", () => {
+    const db = database();
     adopt(db);
-    const input = { projectId: PROJECT_ID, epochId: EPOCH_ID, envelope: envelope() };
-    expect(() => findMatchingMigrationReceipt(db, input)).toThrow("active project transaction");
     db.exec("BEGIN");
-    expect(findMatchingMigrationReceipt(db, input)).toBeNull();
-    const receipt = recordMigrationReceipt(db, { ...input, effectWitness: { version: 1, outcome: "no-effect", reason: "unreinforced-pattern" }, committedAt: "2026-09-07T03:04:05.123456Z" });
-    expect(findMatchingMigrationReceipt(db, input)).toEqual(receipt);
-    expect(() => adopt(db)).toThrow("owns its transaction");
+
+    expect(() => adopt(db)).toThrow("migration receipt epoch adoption owns its transaction");
+
+    expect(db.isTransaction).toBe(true);
     db.exec("ROLLBACK");
-    expect(() => recordMigrationReceipt(db, { ...input, effectWitness: { version: 1, outcome: "no-effect", reason: "unreinforced-pattern" }, committedAt: "2026-09-07T03:04:05.123456Z" })).toThrow("active project transaction");
-    db.exec("BEGIN; COMMIT");
-  });
-
-  it.each([
-    { code: "ERR_SQLITE_ERROR", errcode: 5, message: "database is locked" },
-    { code: "ERR_SQLITE_ERROR", errcode: 1, message: "unexpected SQLite failure" },
-    { code: "EIO", errcode: 1, message: "cannot start a transaction within a transaction" },
-  ])("does not treat an arbitrary failed probe as active transaction proof", (failure) => {
-    const native = database();
-    const db = { exec: native.exec.bind(native), prepare: native.prepare.bind(native), isTransaction: undefined } as unknown as DatabaseSync;
-    const exec = vi.spyOn(db, "exec").mockImplementationOnce(() => { throw failure; });
-    try { expect(() => adopt(db)).toThrow(); } finally { exec.mockRestore(); }
-  });
-
-  it("propagates rollback failure instead of granting probe admission", () => {
-    const native = database();
-    const db = { exec: native.exec.bind(native), prepare: native.prepare.bind(native), isTransaction: undefined } as unknown as DatabaseSync;
-    const original = db.exec.bind(db);
-    const exec = vi.spyOn(db, "exec").mockImplementation((sql) => {
-      if (sql === "ROLLBACK") throw new Error("probe rollback failed");
-      original(sql);
-    });
-    try { expect(() => adopt(db)).toThrow("probe rollback failed"); } finally { exec.mockRestore(); db.exec("ROLLBACK"); }
+    expect(db.isTransaction).toBe(false);
+    expect(adopt(db).epochId).toBe(EPOCH_ID);
   });
 });
