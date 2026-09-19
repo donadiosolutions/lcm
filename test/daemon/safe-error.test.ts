@@ -4518,6 +4518,21 @@ describe("sanitizeError", () => {
         "https://outer.test/x?next=file://host&later/Users/secret",
         "https://outer.test/x?next=file://host&later<path>",
       ],
+      [
+        "R3a a one-character scheme classifies as URL syntax",
+        "file://h?x=[a://public.test|name=\\Users\\SECRET\\x]",
+        "file://h?x=[a://public.test|name=<path>]",
+      ],
+      [
+        "R3b control a two-character scheme already classified",
+        "file://h?x=[ab://public.test|name=\\Users\\SECRET\\x]",
+        "file://h?x=[ab://public.test|name=<path>]",
+      ],
+      [
+        "R3c control a drive root is not a one-character scheme",
+        "C:/Users/SECRET/x",
+        "C:<path>",
+      ],
     ] as const)("resolves %s in one pass", (_name, input, expected) => {
       const first = sanitizeError(input);
 

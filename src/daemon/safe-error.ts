@@ -201,15 +201,23 @@ function startsRootedValue(chars: readonly string[], index: number, wordRunEnds:
 }
 
 function ownershipSchemeStart(chars: readonly string[], index: number): number {
-  // A scheme colon needs at least two scheme characters, so a Windows drive
-  // letter carries rooted data rather than URL syntax, and a value character
-  // after the colon, so ordinary prose punctuation is not read as a scheme.
+  // A scheme colon needs a value character after it, so ordinary prose
+  // punctuation is not read as a scheme.
   if (chars[index] !== ":") return -1;
   if (!isPathWord(chars[index + 1]) && chars[index + 1] !== "/") return -1;
   let start = index;
   while (start > 0 && URL_SCHEME_CHARACTER_PATTERN.test(chars[start - 1])) start -= 1;
   if (!URL_SCHEME_START_PATTERN.test(chars[start])) return -1;
-  return index - start >= 2 ? start : -1;
+  if (index - start >= 2) return start;
+  // RFC 3986 allows a one-character scheme and the emit scanner accepts one,
+  // so only the Windows drive form stays excluded. A drive root has a single
+  // slash where a scheme authority has two, which is what separates "C:/Users"
+  // from "a://host". Rejecting every one-character scheme here left the emit
+  // scanner treating "a://host" as a URL while the pre-pass did not, so the
+  // group never became URL-bearing and a later private value stayed in clear.
+  return index - start === 1 && chars[index + 1] === "/" && chars[index + 2] === "/"
+    ? start
+    : -1;
 }
 
 function isOwnershipSchemeColon(chars: readonly string[], index: number): boolean {
