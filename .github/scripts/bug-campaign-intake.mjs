@@ -2,7 +2,7 @@ import { Buffer } from "node:buffer";
 import { execFile } from "node:child_process";
 import { readFile } from "node:fs/promises";
 import { resolve } from "node:path";
-import { fileURLToPath, pathToFileURL } from "node:url";
+import { pathToFileURL } from "node:url";
 import { promisify } from "node:util";
 import ts from "typescript";
 
@@ -187,14 +187,15 @@ function readGitleaksPatterns(array) {
     const flags = literalString(fields.get("flags"), `Gitleaks pattern ${index}.flags`);
     const regex = literalString(fields.get("regex"), `Gitleaks pattern ${index}.regex`);
     literalString(fields.get("description"), `Gitleaks pattern ${index}.description`);
-    const keywords = fields.get("keywords");
-    if (!ts.isArrayLiteralExpression(keywords)) {
+    const keywordNodes = fields.get("keywords");
+    if (!ts.isArrayLiteralExpression(keywordNodes)) {
       throw new Error(`Gitleaks pattern ${index}.keywords must be an array literal`);
     }
-    for (const keyword of keywords.elements) {
-      literalString(keyword, `Gitleaks pattern ${index}.keywords`);
-    }
-    literalBoolean(fields.get("prefilter"), `Gitleaks pattern ${index}.prefilter`);
+    const keywords = Object.freeze(Array.from(
+      keywordNodes.elements,
+      (keyword) => literalString(keyword, `Gitleaks pattern ${index}.keywords`).toLowerCase(),
+    ));
+    const prefilter = literalBoolean(fields.get("prefilter"), `Gitleaks pattern ${index}.prefilter`);
     if (!/^[i]*$/u.test(flags)) {
       throw new Error(`Gitleaks pattern ${id} uses unsupported flags`);
     }
@@ -203,6 +204,8 @@ function readGitleaksPatterns(array) {
       return Object.freeze({
         id,
         regex: new RegExp(normalized.source, `g${normalized.flags}`),
+        keywords,
+        prefilter,
       });
     } catch {
       throw new Error(`Gitleaks pattern ${id} cannot be compiled safely`);
@@ -214,7 +217,12 @@ function readNativePatterns(array) {
   return Object.freeze(array.elements.map((entry, index) => {
     const source = literalString(entry, `Native pattern ${index}`);
     try {
-      return Object.freeze({ id: `native-${index}`, regex: new RegExp(source, "g") });
+      return Object.freeze({
+        id: `native-${index}`,
+        regex: new RegExp(source, "g"),
+        keywords: Object.freeze([]),
+        prefilter: false,
+      });
     } catch {
       throw new Error(`Native pattern ${index} cannot be compiled safely`);
     }
@@ -258,7 +266,14 @@ async function redactIssueString(value) {
   let redacted;
   try {
     redacted = redactPromptText(value, Number.MAX_SAFE_INTEGER);
+    const lowercaseRedacted = redacted.toLowerCase();
     for (const pattern of await trustedPatterns()) {
+      if (
+        pattern.prefilter
+        && !pattern.keywords.some((keyword) => lowercaseRedacted.includes(keyword))
+      ) {
+        continue;
+      }
       redacted = redactWithPattern(redacted, pattern);
     }
   } catch {

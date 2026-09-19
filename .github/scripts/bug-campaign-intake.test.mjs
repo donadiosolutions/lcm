@@ -125,6 +125,88 @@ test("redacts nested alternate issue-derived fields before serialization", async
   assert.deepEqual(parsed.truncation, { applied: false });
 });
 
+test("redacts a prefiltered Gitleaks rule when its keyword is present", async () => {
+  // Mutation caught: skipping prefiltered rules even when their required keyword is present.
+  const { projectUntrustedIssueData } = await intakeApi();
+  const merakiCredential = "MERAKI = 0123456789abcdef0123456789abcdef01234567";
+  const envelope = await projectUntrustedIssueData({
+    title: merakiCredential,
+    body: "",
+    comments: [],
+    reproduction: [],
+    evidence: [],
+  });
+
+  assert.equal(parseEnvelope(envelope).title, "[REDACTED]");
+});
+
+test("preserves a keyword-absent near miss while applying other redaction rules", async () => {
+  // Mutation caught: skipping the complete redaction union with a prefiltered near miss.
+  const { projectUntrustedIssueData } = await intakeApi();
+  const merakiNearMiss = "MR0000000000000000000000000000000000000000";
+  const githubToken = "ghp_AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA";
+  const envelope = await projectUntrustedIssueData({
+    title: `near-miss=${merakiNearMiss} other=${githubToken}`,
+    body: "",
+    comments: [],
+    reproduction: [],
+    evidence: [],
+  });
+
+  assert.equal(
+    parseEnvelope(envelope).title,
+    `near-miss=${merakiNearMiss} other=[REDACTED]`,
+  );
+});
+
+test("keeps unprefiltered Gitleaks and native patterns unconditional", async () => {
+  // Mutation caught: applying keyword gating to the four fail-closed rules or native patterns.
+  const { projectUntrustedIssueData } = await intakeApi();
+  const keywordAbsentFacebookToken = "000000000000000|aaaaaaaaaaaaaaaaaaaaaaaaaaa ";
+  const nativeSecret = "sk-AAAAAAAAAAAAAAAAAAAA";
+  const envelope = await projectUntrustedIssueData({
+    title: keywordAbsentFacebookToken,
+    body: nativeSecret,
+    comments: [],
+    reproduction: [],
+    evidence: [],
+  });
+  const projected = parseEnvelope(envelope);
+
+  assert.equal(projected.title, "[REDACTED]");
+  assert.equal(projected.body, "[REDACTED]");
+});
+
+test("skips a prefiltered full-pattern scan for a bounded keyword-absent near miss", async () => {
+  // Mutation caught: discarding generated prefilter metadata and executing every rule.
+  const { projectUntrustedIssueData } = await intakeApi();
+  const nearMiss = ("MR" + "0".repeat(40) + " ").repeat(190);
+  const merakiPatternMarker = "[Mm]eraki|MERAKI";
+  const originalExec = RegExp.prototype.exec;
+  let merakiExecutions = 0;
+  RegExp.prototype.exec = function instrumentedExec(value) {
+    if (value === nearMiss && this.source.includes(merakiPatternMarker)) {
+      merakiExecutions += 1;
+    }
+    return originalExec.call(this, value);
+  };
+
+  try {
+    const envelope = await projectUntrustedIssueData({
+      title: nearMiss,
+      body: "",
+      comments: [],
+      reproduction: [],
+      evidence: [],
+    });
+    assert.equal(parseEnvelope(envelope).title, nearMiss);
+  } finally {
+    RegExp.prototype.exec = originalExec;
+  }
+
+  assert.equal(merakiExecutions, 0);
+});
+
 test("fails closed for non-Bug campaign controls and hides raw transport errors", async () => {
   // Mutation caught: accepting a non-Bug/open issue or forwarding subprocess output.
   const { fetchBugCampaignIssue } = await intakeApi();
