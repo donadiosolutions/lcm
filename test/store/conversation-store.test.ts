@@ -14,6 +14,7 @@ import {
   type CreateMessagePartInput,
   type MessageId,
 } from "../../src/store/conversation-store.js";
+import { REGEX_SNIPPET_REDACTION_FALLBACK } from "../../src/store/regex-snippet.js";
 
 type ExactParameters<Actual, Expected> =
   Actual extends Expected
@@ -683,6 +684,8 @@ describe("ConversationStore — deleteMessages", () => {
 // ── searchMessages — regex mode ───────────────────────────────────────────────
 
 describe("ConversationStore — searchMessages regex", () => {
+  const truncationMarker = "…[truncated]";
+
   it.each(["full_text", "regex"] as const)(
     "rejects NUL in %s search queries before SQL",
     async (mode) => {
@@ -731,11 +734,182 @@ describe("ConversationStore — searchMessages regex", () => {
     expect(results.length).toBeGreaterThanOrEqual(2);
   });
 
+  it("redacts and bounds whole-row regex snippets by Unicode code point", async () => {
+    const db = makeDb();
+    const store = makeStore(db);
+    const exact = await store.createConversation({ sessionId: "regex-exact-boundary" });
+    const over = await store.createConversation({ sessionId: "regex-over-boundary" });
+    const secret = await store.createConversation({ sessionId: "regex-secret" });
+    const astral = await store.createConversation({ sessionId: "regex-astral" });
+
+    await store.createMessage({
+      conversationId: exact.conversationId,
+      seq: 1,
+      role: "user",
+      content: "a".repeat(512),
+      tokenCount: 1,
+    });
+    await store.createMessage({
+      conversationId: over.conversationId,
+      seq: 1,
+      role: "user",
+      content: "b".repeat(513),
+      tokenCount: 1,
+    });
+    await store.createMessage({
+      conversationId: secret.conversationId,
+      seq: 1,
+      role: "user",
+      content: `prefix token=ghp_${"A".repeat(36)} suffix`,
+      tokenCount: 1,
+    });
+    await store.createMessage({
+      conversationId: astral.conversationId,
+      seq: 1,
+      role: "user",
+      content: `${"c".repeat(511)}😀😀`,
+      tokenCount: 1,
+    });
+
+    const [exactResult] = await store.searchMessages({
+      conversationId: exact.conversationId,
+      query: "[\\s\\S]*",
+      mode: "regex",
+    });
+    const [overResult] = await store.searchMessages({
+      conversationId: over.conversationId,
+      query: "[\\s\\S]*",
+      mode: "regex",
+    });
+    const [secretResult] = await store.searchMessages({
+      conversationId: secret.conversationId,
+      query: "[\\s\\S]*",
+      mode: "regex",
+    });
+    const [astralResult] = await store.searchMessages({
+      conversationId: astral.conversationId,
+      query: "[\\s\\S]*",
+      mode: "regex",
+    });
+
+    expect(exactResult.snippet).toBe("a".repeat(512));
+    expect(overResult.snippet.endsWith(truncationMarker)).toBe(true);
+    expect(Array.from(overResult.snippet)).toHaveLength(512);
+    expect(secretResult.snippet).toContain("[REDACTED]");
+    expect(secretResult.snippet).not.toContain("ghp_");
+    expect(Array.from(astralResult.snippet)).toHaveLength(512);
+    expect(astralResult.snippet.endsWith(truncationMarker)).toBe(true);
+    expect(astralResult.snippet).not.toMatch(/[\uD800-\uDBFF](?![\uDC00-\uDFFF])|(?<![\uD800-\uDBFF])[\uDC00-\uDFFF]/u);
+  });
+
+  it("preserves short and zero-width matches while bounding large matches", async () => {
+    const store = makeStore(makeDb());
+    const conv = await store.createConversation({ sessionId: "regex-match-shapes" });
+    await store.createMessage({
+      conversationId: conv.conversationId,
+      seq: 1,
+      role: "user",
+      content: `ordinary ${"z".repeat(800)}`,
+      tokenCount: 1,
+    });
+
+    const [short] = await store.searchMessages({
+      conversationId: conv.conversationId,
+      query: "ordinary",
+      mode: "regex",
+    });
+    const [empty] = await store.searchMessages({
+      conversationId: conv.conversationId,
+      query: "^",
+      mode: "regex",
+    });
+    const [large] = await store.searchMessages({
+      conversationId: conv.conversationId,
+      query: "z+",
+      mode: "regex",
+    });
+
+    expect(short.snippet).toBe("ordinary");
+    expect(empty.snippet).toBe("");
+    expect(Array.from(large.snippet)).toHaveLength(512);
+    expect(large.snippet.endsWith(truncationMarker)).toBe(true);
+  });
+
+  it("scrubs a credential spanning the truncation boundary before bounding", async () => {
+    const store = makeStore(makeDb());
+    const conv = await store.createConversation({ sessionId: "regex-scrub-before-bound" });
+    await store.createMessage({
+      conversationId: conv.conversationId,
+      seq: 1,
+      role: "user",
+      content: `${"x".repeat(480)} token=ghp_${"A".repeat(36)} suffix`,
+      tokenCount: 1,
+    });
+
+    const [result] = await store.searchMessages({
+      conversationId: conv.conversationId,
+      query: "[\\s\\S]*",
+      mode: "regex",
+    });
+
+    expect(result.snippet).toContain("[REDACTED]");
+    expect(result.snippet).not.toContain("ghp_");
+    expect(Array.from(result.snippet).length).toBeLessThanOrEqual(512);
+  });
+
+  it("prevents compositional credential disclosure across regex queries", async () => {
+    const store = makeStore(makeDb());
+    const conv = await store.createConversation({ sessionId: "regex-compositional-boundary" });
+    const canary = `ghp_${"A".repeat(36)}`;
+    await store.createMessage({
+      conversationId: conv.conversationId,
+      seq: 1,
+      role: "user",
+      content: `safe-sentinel token=${canary} ordinary-term`,
+      tokenCount: 1,
+    });
+
+    const [firstHalf] = await store.searchMessages({
+      conversationId: conv.conversationId,
+      query: "ghp_[A-Za-z0-9]{18}",
+      mode: "regex",
+    });
+    const [secondHalf] = await store.searchMessages({
+      conversationId: conv.conversationId,
+      query: "(?<=ghp_[A-Za-z0-9]{18})[A-Za-z0-9]{18}",
+      mode: "regex",
+    });
+    const [wholeRow] = await store.searchMessages({
+      conversationId: conv.conversationId,
+      query: "[\\s\\S]*",
+      mode: "regex",
+    });
+    const [ordinary] = await store.searchMessages({
+      conversationId: conv.conversationId,
+      query: "ordinary-term",
+      mode: "regex",
+    });
+
+    expect(firstHalf.snippet).toBe(REGEX_SNIPPET_REDACTION_FALLBACK);
+    expect(secondHalf.snippet).toBe(REGEX_SNIPPET_REDACTION_FALLBACK);
+    expect(firstHalf.snippet + secondHalf.snippet).not.toContain(canary);
+    expect(wholeRow.snippet).toContain("safe-sentinel");
+    expect(wholeRow.snippet).toContain(REGEX_SNIPPET_REDACTION_FALLBACK);
+    expect(wholeRow.snippet).not.toBe(REGEX_SNIPPET_REDACTION_FALLBACK);
+    expect(wholeRow.snippet).not.toContain(canary);
+    expect(ordinary.snippet).toBe("ordinary-term");
+  });
+
   it("throws on unsafe regex pattern", async () => {
     const store = makeStore(makeDb());
     await expect(
       store.searchMessages({ query: nestedQuantifierFixture(), mode: "regex" }),
     ).rejects.toThrow(/unsafe/i);
+  });
+
+  it("throws on invalid regex syntax", async () => {
+    const store = makeStore(makeDb());
+    await expect(store.searchMessages({ query: "[", mode: "regex" })).rejects.toThrow();
   });
 
   it("returns empty when no message matches regex", async () => {
@@ -767,6 +941,48 @@ describe("ConversationStore — searchMessages regex", () => {
     }
     const results = await store.searchMessages({ query: "token-\\d", mode: "regex", limit: 2 });
     expect(results).toHaveLength(2);
+  });
+
+  it("streams past newer non-matches and limits newest matching messages", async () => {
+    const db = makeDb();
+    const store = makeStore(db);
+    const conv = await store.createConversation({ sessionId: "regex-stream-limit" });
+    const oldest = await store.createMessage({
+      conversationId: conv.conversationId,
+      seq: 1,
+      role: "user",
+      content: "target oldest",
+      tokenCount: 1,
+    });
+    const newestMatch = await store.createMessage({
+      conversationId: conv.conversationId,
+      seq: 2,
+      role: "user",
+      content: "target newest",
+      tokenCount: 1,
+    });
+    const nonMatch = await store.createMessage({
+      conversationId: conv.conversationId,
+      seq: 3,
+      role: "user",
+      content: "skip newest row",
+      tokenCount: 1,
+    });
+    db.prepare("UPDATE messages SET created_at = ? WHERE message_id = ?")
+      .run("2026-01-01 00:00:01", oldest.messageId);
+    db.prepare("UPDATE messages SET created_at = ? WHERE message_id = ?")
+      .run("2026-01-01 00:00:02", newestMatch.messageId);
+    db.prepare("UPDATE messages SET created_at = ? WHERE message_id = ?")
+      .run("2026-01-01 00:00:03", nonMatch.messageId);
+
+    const results = await store.searchMessages({
+      conversationId: conv.conversationId,
+      query: "target",
+      mode: "regex",
+      limit: 1,
+    });
+
+    expect(results).toMatchObject([{ messageId: newestMatch.messageId, snippet: "target" }]);
   });
 });
 

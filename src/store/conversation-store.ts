@@ -4,6 +4,7 @@ import { randomUUID } from "node:crypto";
 import { sanitizeFts5Query } from "./fts5-sanitize.js";
 import { buildLikeSearchPlan, createFallbackSnippet } from "./full-text-fallback.js";
 import { validateRegex } from "./regex-safety.js";
+import { createRegexSnippet } from "./regex-snippet.js";
 import { parseStoredTimestamp } from "../db/stored-timestamp.js";
 
 export type ConversationId = number;
@@ -1073,6 +1074,9 @@ export class ConversationStore {
   ): MessageSearchResult[] {
     // SQLite has no native POSIX regex; fetch candidates and filter in JS
     const re = validateRegex(pattern);
+    if (limit <= 0) {
+      return [];
+    }
 
     const where: string[] = [];
     const args: Array<string | number> = [];
@@ -1089,30 +1093,28 @@ export class ConversationStore {
       args.push(before.toISOString());
     }
     const whereClause = where.length > 0 ? `WHERE ${where.join(" AND ")}` : "";
-    const rows = this.db
-      .prepare(
-        `SELECT message_id, conversation_id, seq, role, content, token_count, created_at
-         FROM messages
-         ${whereClause}
-         ORDER BY created_at DESC`,
-      )
-      .all(...args) as unknown as MessageRow[];
+    const rows = this.db.prepare(
+      `SELECT message_id, conversation_id, seq, role, content, token_count, created_at
+       FROM messages
+       ${whereClause}
+       ORDER BY created_at DESC`,
+    );
 
     const results: MessageSearchResult[] = [];
-    for (const row of rows) {
-      if (results.length >= limit) {
-        break;
-      }
+    for (const row of rows.iterate(...args) as Iterable<MessageRow>) {
       const match = re.exec(row.content);
       if (match) {
         results.push({
           messageId: row.message_id,
           conversationId: row.conversation_id,
           role: row.role,
-          snippet: match[0],
+          snippet: createRegexSnippet(row.content, re),
           createdAt: parseStoredTimestamp(row.created_at),
           rank: 0,
         });
+        if (results.length >= limit) {
+          break;
+        }
       }
     }
     return results;

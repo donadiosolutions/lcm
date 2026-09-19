@@ -592,7 +592,7 @@ describe("Codecov configuration", () => {
       expect(isSafeOwnershipPath(path)).toBe(true);
     }
 
-    expect(productionFiles).toHaveLength(243);
+    expect(productionFiles).toHaveLength(244);
 
     for (const component of validateComponents(components)) {
       expect(filesMatchedByComponent(component, productionFiles).length).toBeGreaterThan(0);
@@ -622,7 +622,7 @@ describe("Codecov configuration", () => {
 
     expect(unownedFiles).toEqual([]);
     expect(multiplyOwnedFiles).toEqual([]);
-    expect(ownershipCounts.size).toBe(243);
+    expect(ownershipCounts.size).toBe(244);
   });
 
   test("keeps response-fence and #681/#700/#701/#703/#705/#709/#710/#713/#756/#726/#734/#737/#742/#760/#763/#804/#805/#824/#825/#833/#888/#864/#866/#722/#786/#952/#814/#882/#930/#969/#989/#1003/#1049/#964/#1106/#1191/#1196/#1229/#1321/#1338/#1347/#1353/#1354/#1356/#1357/#1358/#1403 files in their intended components", () => {
@@ -870,7 +870,11 @@ describe("Codecov configuration", () => {
       ["src/storage/sqlite/project-storage.ts", "unit-local-persistence"],
       // #1020 keeps message timestamp mapping in the existing local-persistence
       // component; conversation timestamps remain on their existing mapper.
+      // G007 keeps SQLite regex snippet redaction and Unicode bounding in this
+      // existing owner without changing the component taxonomy.
       ["src/store/conversation-store.ts", "unit-local-persistence"],
+      ["src/store/summary-store.ts", "unit-local-persistence"],
+      ["src/store/regex-snippet.ts", "unit-local-persistence"],
       ["src/db/stored-timestamp.ts", "unit-local-persistence"],
       ["src/hooks/event-scrubbing.ts", "unit-hooks"],
       // #1229 local-enqueue health-token forwarding stays hook-owned.
