@@ -1283,6 +1283,8 @@ function loadProjectMapWithMetadata(opts: {
   strict?: boolean;
   reload?: boolean;
   homeDir?: string;
+  /** @internal Return metadata backfill in memory without publishing it. */
+  _suppressMetadataBackfill?: boolean;
   _beforeMetadataLockForTesting?: () => void;
   _beforeMetadataMutationLockForTesting?: () => void;
   _publicationLockToken?: BackendPublicationLockToken;
@@ -1295,6 +1297,7 @@ function loadProjectMapWithMetadata(opts: {
 
   const populated = populateFromExistingProjectMetadata(map, opts.homeDir);
   if (populated.changed) {
+    if (opts._suppressMetadataBackfill) return populated.map;
     opts._beforeMetadataMutationLockForTesting?.();
     if (activeProjectMapMutationLocks.has(projectMapMutationLockPath(opts.homeDir))) {
       writeProjectMap(populated.map, opts.homeDir, { metadataPopulated: true });
@@ -1421,6 +1424,109 @@ function existingProjectHasStoredData(hash: string): boolean {
     || existsSync(join(lcmHomeDir(), "events", `${hash}.db`));
 }
 
+/** Reject a map key that no local evidence binds to its canonical path. */
+export class UnauthenticatedProjectIdentityError extends Error {
+  constructor(readonly id: string, readonly canonical: string) {
+    super(`project map identity is not authenticated for its canonical path: ${canonical} (${id})`);
+    this.name = "UnauthenticatedProjectIdentityError";
+  }
+}
+
+/**
+ * Decide whether one map key may act as the storage identity for its path.
+ *
+ * Three grounds admit a key, and their order matters. The canonical path hash
+ * is the derivation every other code path reproduces. A renewal successor is
+ * decided solely by its retained predecessor fence: once a key has the
+ * successor shape, no other evidence may stand in for that fence, because a
+ * renewed project writes its own project metadata the first time it is opened
+ * and that metadata would otherwise re-admit a successor whose fence was lost.
+ * Only keys matching neither of the first two grounds use metadata
+ * corroboration.
+ *
+ * The metadata ground is compatibility, not a defence. A hash minted before
+ * the current path normalization does not equal hashProjectPath(canonical),
+ * and populateFromExistingProjectMetadata legitimately backfills the map from
+ * such a directory, so refusing it would reject identities this repository
+ * supports. It is not an independent trust anchor: anyone who can write
+ * map.json can usually also write projects/<id>/meta.json. What it removes is
+ * the case with no corroboration anywhere on disk, where the CLI adopted a key
+ * the hook side would never derive.
+ */
+export function isAuthenticatedProjectIdentity(
+  id: string,
+  canonical: string,
+  homeDir?: string,
+): boolean {
+  // Resolve symlinks before deriving anything. An entry reached through an
+  // alias carries its canonical path verbatim, so a symlinked canonical would
+  // otherwise authenticate the lexical path hash while the hook side derives
+  // the real target's hash.
+  //
+  // Deliberately realpath only, not the Git anchor. A legacy entry keyed by a
+  // linked worktree's own path hash is a supported shape that reconciliation
+  // still has to migrate, and anchoring here would refuse it before the
+  // legacy-storage path ever reports it.
+  const normalized = normalizeProjectPath(canonical);
+  const retiredId = hashProjectPath(normalized);
+  if (id === retiredId) return true;
+  if (isRetiredProjectIdentitySuccessor(id, retiredId, normalized)) {
+    return isAuthenticatedRetiredProjectIdentitySuccessor(id, retiredId, normalized, homeDir);
+  }
+  return projectMetadataBindsCanonical(id, normalized, homeDir);
+}
+
+/**
+ * Recognize a legacy identity corroborated by its own project metadata.
+ *
+ * The stored cwd must normalize to the same canonical path the entry claims,
+ * read through the same bounded, single-link, owner-checked reader the map
+ * backfill uses, so an unreadable or mismatched metadata file corroborates
+ * nothing. This is same-UID corroboration rather than an independent trust
+ * anchor; see isAuthenticatedProjectIdentity for what it does and does not
+ * establish.
+ */
+function projectMetadataBindsCanonical(
+  id: string,
+  canonical: string,
+  homeDir?: string,
+): boolean {
+  const dir = join(projectsDir(homeDir), id);
+  const metaPath = join(dir, "meta.json");
+  if (!existsSync(metaPath)) return false;
+  try {
+    const meta = JSON.parse(readBoundedRegularFile(metaPath, {
+      allowedRoot: dir,
+      maxBytes: 1024 * 1024,
+      expectedUid: typeof process.getuid === "function" ? process.getuid() : undefined,
+      requireSingleLink: true,
+    })) as { cwd?: unknown };
+    return typeof meta.cwd === "string"
+      && meta.cwd.length > 0
+      && normalizeProjectPath(meta.cwd) === canonical;
+  } catch {
+    return false;
+  }
+}
+
+/**
+ * Refuse a map key no derivation can produce, before it becomes an identity.
+ *
+ * A successor-shaped key deliberately passes here even when its predecessor
+ * fence is missing or tampered: admission and reconciliation already refuse it
+ * with the specific renewal diagnostic, and pre-empting them with a generic
+ * message would lose that guidance. Enumeration uses the authenticated
+ * predicate instead, so no surface presents a successor it cannot open.
+ */
+function assertDerivableProjectIdentity(id: string, canonical: string): void {
+  const normalized = normalizeProjectPath(canonical);
+  const pathHash = hashProjectPath(normalized);
+  if (id === pathHash) return;
+  if (isRetiredProjectIdentitySuccessor(id, pathHash, normalized)) return;
+  if (projectMetadataBindsCanonical(id, normalized)) return;
+  throw new UnauthenticatedProjectIdentityError(id, canonical);
+}
+
 function identityForMatches(
   map: ProjectMap,
   cwd: string,
@@ -1432,9 +1538,11 @@ function identityForMatches(
   }
   if (matches.size === 0) return null;
   const id = [...matches][0];
+  const canonical = resolve(map[id].canonical);
+  assertDerivableProjectIdentity(id, canonical);
   return {
     id,
-    canonical: resolve(map[id].canonical),
+    canonical,
     ...(map[id].remoteProjectId ? { remoteProjectId: map[id].remoteProjectId } : {}),
   };
 }
@@ -1450,10 +1558,13 @@ function resolveProjectIdentityUnlocked(
     readonly _beforeMetadataMutationLockForTesting?: () => void;
     /** @internal Test-only synchronization seam for missing-entry races. */
     readonly _beforeMissingIdentityLockForTesting?: () => void;
+    /** @internal Resolve against metadata backfill without publishing it. */
+    readonly _suppressMetadataBackfill?: boolean;
   } = {},
   publicationLockToken?: BackendPublicationLockToken,
 ): ProjectIdentity {
   const map = loadProjectMapWithMetadata({
+    _suppressMetadataBackfill: opts._suppressMetadataBackfill,
     _beforeMetadataLockForTesting: opts._beforeMetadataLockForTesting,
     _beforeMetadataMutationLockForTesting: opts._beforeMetadataMutationLockForTesting,
     _publicationLockToken: publicationLockToken,
@@ -1471,6 +1582,7 @@ function resolveProjectIdentityUnlocked(
       current = loadProjectMapWithMetadata({
         strict: true,
         reload: true,
+        _suppressMetadataBackfill: opts._suppressMetadataBackfill,
         _publicationLockToken: publicationLockToken,
       });
     } catch (error) {
@@ -1653,6 +1765,7 @@ export function showProjectMapEntry(
 function resolveCliTarget(
   opts: { canonical?: string; hash?: string },
   publicationLockToken?: BackendPublicationLockToken,
+  resolutionOpts: { readonly _suppressMetadataBackfill?: boolean } = {},
 ): { hash: string; entry: ProjectMapEntry; map: ProjectMap } {
   if (opts.canonical && opts.hash) {
     throw new Error("--canonical and --hash are mutually exclusive");
@@ -1661,10 +1774,11 @@ function resolveCliTarget(
     const canonical = normalizeProjectPath(opts.canonical);
     if (!existsSync(canonical)) throw new Error(`canonical path does not exist: ${canonical}`);
     if (!statSync(canonical).isDirectory()) throw new Error(`canonical path must be an existing directory: ${canonical}`);
-    const identity = resolveProjectIdentityUnlocked(canonical, {}, publicationLockToken);
+    const identity = resolveProjectIdentityUnlocked(canonical, resolutionOpts, publicationLockToken);
     const map = loadProjectMapWithMetadata({
       strict: true,
       reload: true,
+      _suppressMetadataBackfill: resolutionOpts._suppressMetadataBackfill,
       _publicationLockToken: publicationLockToken,
     });
     return { hash: identity.id, entry: map[identity.id], map };
@@ -1672,6 +1786,7 @@ function resolveCliTarget(
   const map = loadProjectMapWithMetadata({
     strict: true,
     reload: true,
+    _suppressMetadataBackfill: resolutionOpts._suppressMetadataBackfill,
     _publicationLockToken: publicationLockToken,
   });
   if (opts.hash) {
@@ -1680,10 +1795,11 @@ function resolveCliTarget(
     if (!entry) throw new Error(`unknown project hash: ${opts.hash}`);
     return { hash: opts.hash, entry, map };
   }
-  const identity = resolveProjectIdentityUnlocked(process.cwd(), {}, publicationLockToken);
+  const identity = resolveProjectIdentityUnlocked(process.cwd(), resolutionOpts, publicationLockToken);
   const refreshed = loadProjectMapWithMetadata({
     strict: true,
     reload: true,
+    _suppressMetadataBackfill: resolutionOpts._suppressMetadataBackfill,
     _publicationLockToken: publicationLockToken,
   });
   return { hash: identity.id, entry: refreshed[identity.id], map: refreshed };
@@ -1939,9 +2055,17 @@ export function addProjectAlias(alias: string, opts: {
   if (!statSync(normalizedAlias).isDirectory()) throw new Error(`alias path must be an existing directory: ${normalizedAlias}`);
   return withProjectMapMutationLock((publicationLockToken) => {
     opts._afterLockForTesting?.();
-    const target = resolveCliTarget(opts, publicationLockToken);
+    const target = resolveCliTarget(opts, publicationLockToken, {
+      _suppressMetadataBackfill: true,
+    });
     assertExpectedProjectMapEntry(target.hash, target.entry, opts.expectedEntry);
     const canonical = resolve(target.entry.canonical);
+    // Refuse before any mutation. Resolution keeps metadata backfill in memory
+    // until this gate authenticates the target, so a refused link leaves the
+    // persisted map byte-identical.
+    if (!isAuthenticatedProjectIdentity(target.hash, canonical)) {
+      throw new UnauthenticatedProjectIdentityError(target.hash, canonical);
+    }
     if (normalizedAlias === canonical) {
       throw new Error(`alias matches canonical path for ${target.hash}: ${normalizedAlias}`);
     }

@@ -21,11 +21,12 @@ import {
 import {
   addProjectAlias,
   clearRemoteProjectBinding,
+  isAuthenticatedProjectIdentity,
   isProjectHash,
   listProjectMapEntries,
   normalizeProjectPath,
-  projectMapPath,
   projectMapEntryHasStoredData,
+  projectMapPath,
   removeProjectAlias,
   resolveProjectIdentity,
   setRemoteProjectBinding,
@@ -608,6 +609,8 @@ export interface LocalProjectListing {
   readonly canonical: string;
   readonly aliases: readonly string[];
   readonly remoteProjectId?: string;
+  /** Present when no local evidence binds this key to its canonical path. */
+  readonly unauthenticated?: true;
 }
 
 export interface ProjectListing {
@@ -615,7 +618,15 @@ export interface ProjectListing {
   readonly remote?: readonly RemoteProject[];
 }
 
-function localProjectListing(map: ProjectMap): LocalProjectListing[] {
+/**
+ * List the map as it is on disk, marking what storage will not open.
+ *
+ * This is a diagnostic surface, so an entry no local evidence authenticates is
+ * marked rather than hidden: an operator who cannot see a broken entry cannot
+ * repair it. Storage admission and reconciliation still refuse these
+ * identities, which is the disagreement the marker makes visible.
+ */
+function localProjectListing(map: ProjectMap, homeDir?: string): LocalProjectListing[] {
   return Object.entries(map)
     .sort(([left], [right]) => left.localeCompare(right))
     .map(([hash, entry]) => ({
@@ -623,6 +634,9 @@ function localProjectListing(map: ProjectMap): LocalProjectListing[] {
       canonical: entry.canonical,
       aliases: [...entry.aliases],
       ...(entry.remoteProjectId ? { remoteProjectId: entry.remoteProjectId } : {}),
+      ...(isAuthenticatedProjectIdentity(hash, resolve(entry.canonical), homeDir)
+        ? {}
+        : { unauthenticated: true as const }),
     }));
 }
 
@@ -632,7 +646,7 @@ export async function listProjects(
 ): Promise<ProjectListing> {
   const deps = dependencies(dependencyOverrides);
   assertIdentityPublication(config, deps);
-  const local = localProjectListing(listProjectMapEntries(deps.homeDir));
+  const local = localProjectListing(listProjectMapEntries(deps.homeDir), deps.homeDir);
   if (config.backend === "sqlite") return { local };
   const remote = await withSession(config, deps, (repository) => repository.listProjects());
   return { local, remote };
@@ -646,11 +660,17 @@ export async function showProject(
   readonly hash: string;
   readonly entry: ProjectMapEntry;
   readonly transient?: boolean;
+  readonly unauthenticated?: true;
   readonly remote?: RemoteProject;
 }> {
   const deps = dependencies(dependencyOverrides);
   assertIdentityPublication(config, deps);
-  const shown = showProjectMapEntry(target);
+  const found = showProjectMapEntry(target);
+  // Mark for the same reason listProjects does: this is a diagnostic surface,
+  // and an operator who cannot see a refused identity cannot repair it.
+  const shown = isAuthenticatedProjectIdentity(found.hash, resolve(found.entry.canonical), deps.homeDir)
+    ? found
+    : { ...found, unauthenticated: true as const };
   if (config.backend === "sqlite" || !shown.entry.remoteProjectId) return shown;
   const remote = await withSession(
     config,
