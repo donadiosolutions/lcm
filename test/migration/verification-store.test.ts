@@ -108,6 +108,34 @@ describe("MigrationVerificationReportStore", () => {
     expect(second.report).toEqual(report);
   });
 
+  it("round-4: rejects persisting a report whose body names a different generation than the call site", () => {
+    // Before this fix, persist() validated the report's own internal
+    // consistency but never checked it against the generationId
+    // parameter used to build the file path -- a report for generation
+    // A could be written under generation B's path, and a pending B
+    // effect could later resume on evidence that was never actually
+    // about B.
+    const wrongGenerationReport = createMigrationVerificationReport(baseInput({ generationId: "generation-2" }));
+    expectStoreError(() => store.persist("generation-1", wrongGenerationReport), "malformed-record");
+  });
+
+  it("round-4: rejects reading back a stored report whose body names a different generation than the path it was read from", () => {
+    // Mirrors "rejects a stored report whose content identity does not
+    // match its own filename" above: persist() writes canonical bytes
+    // for a generation-2 report at generation-2's own identity path;
+    // copying those exact bytes under generation-1's path (same
+    // reportSha256, different generation directory) produces well-
+    // formed, canonical, validating content naming the wrong generation.
+    const otherGenerationReport = createMigrationVerificationReport(baseInput({ generationId: "generation-2" }));
+    store.persist("generation-2", otherGenerationReport);
+    const sourcePath = reportPath("generation-2", otherGenerationReport.reportSha256);
+    const targetPath = reportPath("generation-1", otherGenerationReport.reportSha256);
+    mkdirSync(join(targetPath, ".."), { recursive: true, mode: 0o700 });
+    copyFileSync(sourcePath, targetPath);
+    chmodSync(targetPath, 0o600);
+    expectStoreError(() => store.read("generation-1", otherGenerationReport.reportSha256), "malformed-record");
+  });
+
   it("round-4 P1-adjacent: defaults expectedUid to the current process uid rather than leaving the descriptor-owner check disabled", () => {
     // Before this fix, an omitted expectedUid stayed undefined and was
     // passed straight through to readBoundedRegularFileWithStat, whose

@@ -162,6 +162,18 @@ export class MigrationVerificationReportStore {
   persist(generationId: string, report: MigrationVerificationReport): MigrationVerificationPersistOutcome {
     assertGenerationId(generationId);
     const validated = parseMigrationVerificationReport(report);
+    // Round-4: generation binding was never enforced -- persist trusted
+    // the caller's generationId parameter for the file path but never
+    // checked it against the report's own body.generationId, so a
+    // report for generation A could be persisted and later read back
+    // under generation B's path, and a pending B effect could resume on
+    // evidence that was never actually about B.
+    if (validated.body.generationId !== generationId) {
+      storeError(
+        "malformed-record",
+        `migration verification report body names generation ${validated.body.generationId}, not ${generationId}`,
+      );
+    }
     const content = reportContent(validated);
     const directory = reportsDirectory(generationId, this.#homeDir);
     const path = reportPath(generationId, validated.reportSha256, this.#homeDir);
@@ -219,6 +231,17 @@ export class MigrationVerificationReportStore {
     const report = parsePersistedContent(existing.content, path);
     if (report.reportSha256 !== reportSha256) {
       storeError("malformed-record", `migration verification report at ${path} does not match its own filename`);
+    }
+    // Same generation-binding enforcement as persist(), for the read
+    // path: content whose own body.generationId disagrees with the
+    // generationId this read was addressed to is not what its path
+    // claims it is, the same shape as a reportSha256 that does not
+    // match its own filename immediately above.
+    if (report.body.generationId !== generationId) {
+      storeError(
+        "malformed-record",
+        `migration verification report at ${path} names generation ${report.body.generationId}, not ${generationId}`,
+      );
     }
     return report;
   }
