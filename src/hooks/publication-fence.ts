@@ -274,6 +274,25 @@ export function assertHookPublicationFence(): void {
   withHookPublicationFence((lockToken) => assertHookPublicationFenceToken(lockToken));
 }
 
+/**
+ * The backend this fence has just authenticated, for a decision that must
+ * belong to the admitted state rather than to a snapshot.
+ *
+ * A hook loads its configuration before it reaches a fence, so a SessionStart
+ * that overlaps a coordinated publication still holds the value from the far
+ * side of the change. Retention cannot choose its predicate from that: the
+ * permissive branch is only safe where replication genuinely cannot claim the
+ * rows (#1395), and a stale SQLite reading would apply it just as PostgreSQL
+ * replication becomes active. Reading the config the fence has authenticated
+ * ties the answer to the same live token.
+ */
+export function hookPublicationBackend(
+  lockToken: HookPublicationLockToken,
+): "sqlite" | "postgresql" {
+  assertHookPublicationEvidence(lockToken);
+  return configBackend(readObservedFile(defaultConfigPath(), lcmHomeDir()));
+}
+
 /** Validate a token at a direct action seam such as an unreffed HTTP request. */
 export function assertHookPublicationFenceToken(lockToken: HookPublicationLockToken): void {
   assertHookPublicationEvidence(lockToken);

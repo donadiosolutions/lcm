@@ -15,6 +15,7 @@ import { lcmHomeDir } from "../../src/runtime-paths.js";
 import {
   backendPublicationDirectory,
   BackendPublicationJournalError,
+  BackendPublicationCoordinator,
 } from "../../src/storage/backend-publication.js";
 import { SQLiteLocalHookOutboxFactory } from "../../src/storage/local-hook-outbox.js";
 
@@ -76,6 +77,49 @@ function usePrivatePublicationHome(prefix: string): () => void {
     else process.env.HOME = previousHome;
     rmSync(home, { recursive: true, force: true });
   };
+}
+
+/**
+ * A home whose coordinator has completed a selection to PostgreSQL. This is
+ * the state a real SQLite-to-PostgreSQL publication leaves behind, and the
+ * only state in which a PostgreSQL configuration is admissible at all.
+ */
+async function publishPostgreSqlSelection(home: string): Promise<void> {
+  const forbidden = async (): Promise<never> => {
+    throw new Error("publication driver must not run");
+  };
+  const coordinator = new BackendPublicationCoordinator({
+    homeDir: home,
+    driver: {
+      observeLocalState: forbidden,
+      publishProjectMap: forbidden,
+      publishConfig: forbidden,
+      restoreConfig: forbidden,
+      restoreProjectMap: forbidden,
+    },
+  });
+  const held = await coordinator.enterMaintenance({
+    publicationId: "restore-retention-publication",
+    generationId: "restore-retention-generation",
+    sourceSelectionSha256: "a".repeat(64),
+    queueEvidenceSha256: "b".repeat(64),
+    roster: [{
+      machineId: "0195d250-0000-7000-8000-000000000091",
+      queueCutoff: null,
+      evidenceSha256: "a".repeat(64),
+    }],
+  });
+  const prepared = await coordinator.prepareMaintenanceSelection({
+    expectedChecksumSha256: held.checksumSha256,
+    generationId: held.generationId,
+    targetBackend: "postgresql",
+    terminalEvidenceSha256: "c".repeat(64),
+  });
+  await coordinator.completeMaintenanceSelection({
+    expectedChecksumSha256: prepared.checksumSha256,
+    generationId: prepared.generationId,
+    terminalEvidenceSha256: prepared.terminalEvidenceSha256!,
+  });
 }
 
 describe("handleSessionStart", () => {
@@ -524,11 +568,23 @@ describe("handleSessionStart", () => {
   // #1395: only a PostgreSQL install can drain an event to a remote inbox, so
   // only there may retention wait for that proof. A SQLite install that waited
   // for it pruned nothing at all.
+  // The backend that decides this is the one the fence authenticates, not the
+  // configuration the hook loaded before it. A SessionStart that overlaps a
+  // coordinated publication holds a value from the far side of the change,
+  // and taking the permissive predicate from it would delete undrained rows
+  // exactly as replication becomes active.
   it.each([
-    ["sqlite", false],
-    ["postgresql", true],
-  ] as const)("scavenges SessionStart retention for a %s backend", async (backend, awaitingReplication) => {
+    ["sqlite", "sqlite", false],
+    ["postgresql", "postgresql", true],
+    ["postgresql", "sqlite", true],
+  ] as const)("scavenges SessionStart retention for published %s loaded as %s", async (published, loaded, awaitingReplication) => {
     const restoreHome = usePrivatePublicationHome("lcm-restore-retention-");
+    if (published === "postgresql") await publishPostgreSqlSelection(dirname(lcmHomeDir()));
+    writeFileSync(
+      join(lcmHomeDir(), "config.json"),
+      JSON.stringify({ storage: { backend: published } }),
+      { mode: 0o600 },
+    );
     const outbox = {
       pruneProcessed: vi.fn().mockResolvedValue(0),
       pruneUnprocessed: vi.fn().mockResolvedValue({ pruned: 0 }),
@@ -543,16 +599,16 @@ describe("handleSessionStart", () => {
 
     try {
       await expect(handleSessionStart(
-        JSON.stringify({ session_id: `retention-${backend}`, cwd: "/proj" }),
+        JSON.stringify({ session_id: `retention-${published}-${loaded}`, cwd: "/proj" }),
         { post: vi.fn().mockResolvedValue({ context: "restored" }) },
         undefined,
-        { backend },
+        { backend: loaded },
       )).resolves.toEqual({ exitCode: 0, stdout: "restored" });
       expect(outbox.pruneProcessed).toHaveBeenCalledWith(7, { awaitingReplication });
     } finally {
       open.mockRestore();
       close.mockRestore();
-      rmSync(sessionLockPathForTesting(`retention-${backend}`), { force: true });
+      rmSync(sessionLockPathForTesting(`retention-${published}-${loaded}`), { force: true });
       restoreHome();
     }
   });
