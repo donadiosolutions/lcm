@@ -290,9 +290,29 @@ it("measures the full live in-window read against a realistic destination and re
         "proposed leaseTtlMs = ceil(" + formatMs(totalMs) + " * " + String(marginMultiplier) + ") = " + String(proposedLeaseTtlMs) + " ms",
         "",
       ];
-      const outputDir = join(process.cwd(), ".superpowers/624/impl");
-      mkdirSync(outputDir, { recursive: true });
-      writeFileSync(join(outputDir, "census-cost.md"), reportLines.join("\n"), "utf8");
+      // The evidence file this measurement regenerates lives at a
+      // gitignored, repository-tree-relative path
+      // (.superpowers/624/impl/census-cost.md) that only ever existed in
+      // the worktrees that produced it. Deriving that path from
+      // process.cwd() assumed a repository layout no clean checkout
+      // guarantees: PR #1420's CI run failed with ENOENT on a fresh
+      // checkout where .superpowers/ (and its parent, in that container)
+      // never existed, even though the measurement itself succeeded in
+      // about 68 seconds. The write is now opt-in, gated on an explicit
+      // env var the caller supplies rather than a path this test
+      // invents: set only when a developer is deliberately regenerating
+      // the checked-in evidence file locally. When it is not set (every
+      // CI run, and any environment that has not opted in), the report
+      // is still produced and still logged, just not written to disk --
+      // the measurement and its assertions below are unaffected either
+      // way.
+      const evidenceDir = process.env.LCM_MIGRATION_CENSUS_COST_EVIDENCE_DIR;
+      if (evidenceDir) {
+        mkdirSync(evidenceDir, { recursive: true });
+        writeFileSync(join(evidenceDir, "census-cost.md"), reportLines.join("\n"), "utf8");
+      } else {
+        console.log(reportLines.join("\n"));
+      }
 
       expect(census).toHaveLength(22);
       expect(rowCountsByDomain.conversations).toBeGreaterThanOrEqual(BULK_CONVERSATION_COUNT);
