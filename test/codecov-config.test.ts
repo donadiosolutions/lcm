@@ -821,6 +821,12 @@ describe("Codecov configuration", () => {
       ["src/migration/receipts.ts", "unit-migration-cutover"],
       ["src/migration/queue-evidence.ts", "unit-migration-cutover"],
       ["src/migration/sqlite-snapshot.ts", "unit-migration-cutover"],
+      // #1380 clears the settlement primary error once a mutate is
+      // acknowledged, so retry diagnostics report the current readback
+      // failure instead of a stale one from an earlier attempt. The change
+      // is confined to this existing file, so it keeps its established
+      // owner; this pin records that decision.
+      ["src/migration/copy-destination.ts", "unit-migration-cutover"],
       ["src/storage/contracts.ts", "unit-storage-abstractions"],
       ["src/storage/portable-record-stream.ts", "unit-storage-abstractions"],
       // #1354 supplies the promoted-memory decision serializer only from the

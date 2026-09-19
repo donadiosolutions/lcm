@@ -67,6 +67,13 @@ export async function settleMigrationCopyOperation<T>(input: {
         try {
             await input.mutate();
             proofRequired = true;
+            // A newly acknowledged mutation supersedes any error recorded
+            // by an earlier, unrelated attempt. Without this reset, a
+            // stale mutate-side error from a prior retryable failure (or
+            // a prior ambiguous commit whose readback came back null)
+            // could outlive the mutation that produced it and mask a
+            // fresh readback failure that belongs to this attempt.
+            primary = undefined;
         }
         catch (error) {
             primary = error;

@@ -93,11 +93,34 @@ it('closes both owners after preflight refusal',async()=>{
  state.failure='preflight';await expect(destination()).rejects.toThrow('preflight');expect(state.closed).toBe(1);expect(state.writerClosed).toBe(1);
 });
 
-it('keeps readback mode after unavailable proof and counts recovery against the same budget',async()=>{
+it('retries readback without repeating the mutation after a transient failure',async()=>{
  const {settleMigrationCopyOperation}=await import('../../src/migration/copy-destination.js');
  let writes=0,reads=0,reconnections=0;
  expect(await settleMigrationCopyOperation({maximumTransactionAttempts:3,mutate:async()=>{writes++;},readback:async()=>{if(++reads===1)throw new Error('unavailable');return 'exact';},reconnect:async()=>{reconnections++;}})).toBe('exact');
  expect({writes,reads,reconnections}).toEqual({writes:1,reads:2,reconnections:1});
+});
+it('reports the current readback failure instead of a stale retried-mutation error',async()=>{
+ const {settleMigrationCopyOperation}=await import('../../src/migration/copy-destination.js');
+ const {PostgreSqlStorageOperationError}=await import('../../src/storage/postgresql/errors.js');
+ const stale=new PostgreSqlStorageOperationError('STORAGE_OPERATION_FAILED',{domain:'factory',operation:'test'},'40001',true);
+ const fresh=new Error('fresh readback failure');
+ let attempt=0;
+ await expect(settleMigrationCopyOperation({maximumTransactionAttempts:2,
+  mutate:async()=>{attempt++;if(attempt===1)throw stale;},
+  readback:async()=>{throw fresh;},
+  reconnect:async()=>{}})).rejects.toBe(fresh);
+});
+it('reports the current readback failure instead of a stale ambiguous-commit error',async()=>{
+ const {settleMigrationCopyOperation}=await import('../../src/migration/copy-destination.js');
+ const {PostgreSqlCommitOutcomeUnknownError}=await import('../../src/storage/postgresql/errors.js');
+ const stale=new PostgreSqlCommitOutcomeUnknownError({domain:'factory',operation:'test'});
+ const fresh=new Error('fresh readback failure');
+ let attempt=0,reads=0;
+ await expect(settleMigrationCopyOperation({maximumTransactionAttempts:2,
+  mutate:async()=>{attempt++;if(attempt===1)throw stale;},
+  readback:async()=>{reads++;if(attempt===1)return null;throw fresh;},
+  reconnect:async()=>{}})).rejects.toBe(fresh);
+ expect(reads).toBe(3);
 });
 it('retries whole transactions only for the two supported serialization states',async()=>{
  const {settleMigrationCopyOperation}=await import('../../src/migration/copy-destination.js');

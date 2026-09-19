@@ -316,6 +316,9 @@ component_management:
         # #1321 drops the Node 22 transaction-probe fallback and drives
         # epoch-adoption refusal through a real transaction, keeping receipts
         # in this migration owner.
+        # #1380 clears the settlement primary error once a mutate is
+        # acknowledged, so a stale prior-attempt error can no longer mask
+        # the current readback failure; ownership is unchanged.
         - "src/migration/"
     - component_id: "unit-local-event-storage"
       name: "Unit - Local Event Storage"
