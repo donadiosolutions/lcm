@@ -501,7 +501,7 @@ const GROUPS = [
       { name: "status [--json]", summary: "Daemon status and project memory stats" },
       { name: "doctor", summary: "Diagnostics: daemon, hooks, MCP, summarizer" },
       { name: "machine <register|show|recover>", summary: "Manage this machine's PostgreSQL identity" },
-      { name: "project <create|link|unlink|list|show|reconcile-worktrees>", summary: "Manage local and PostgreSQL project identities" },
+      { name: "project <create|link|unlink|list|show|reconcile-worktrees|renew-retired-identity>", summary: "Manage local and PostgreSQL project identities" },
       { name: "postgres migrate [--json]", summary: "Apply packaged PostgreSQL schema migrations" },
       { name: "mcp", summary: "Start the MCP server (stdio transport)" },
     ],

@@ -41,6 +41,27 @@ describe("printHelp — full reference", () => {
     expect(text).toContain("-V, --version");
     expect(text).toContain("--help");
   });
+  it("summarizes project with the same subcommands the detailed usage grammar lists", () => {
+    // Bug #1393: the detailed project usage grammar listed
+    // renew-retired-identity while the Runtime condensed summary omitted it.
+    // Assert the two grammars agree rather than pinning either literal, so
+    // adding a subcommand to one and not the other fails here.
+    const out = vi.spyOn(process.stdout, "write").mockImplementation(() => true);
+    printHelp();
+    const summary = out.mock.calls.map(c => c[0]).join("");
+    out.mockClear();
+    printHelp("project");
+    const detail = out.mock.calls.map(c => c[0]).join("");
+
+    const subcommands = (text: string): string[] => {
+      const match = /project <([^>]+)>/u.exec(text);
+      if (match === null) throw new Error("no project grammar found");
+      return match[1].split("|");
+    };
+
+    expect(subcommands(summary)).toEqual(subcommands(detail));
+    expect(subcommands(summary)).toContain("renew-retired-identity");
+  });
 });
 
 describe("printHelp — per-command detail", () => {
