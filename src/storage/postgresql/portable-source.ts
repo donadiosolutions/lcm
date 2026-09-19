@@ -19,7 +19,7 @@ import type {
 import { PostgreSqlRuntime } from "./runtime.js";
 import { verifyPostgreSqlRuntimeSchema, verifyPostgreSqlTransferSchema } from "./runtime-readiness.js";
 import { PortableTransferError } from "../portable-transfer.js";
-import { createPortableIndex, type PortableIndex } from "../portable-index.js";
+import { createPortableIndex, type PortableIndex, type PortableIndexEntry } from "../portable-index.js";
 import {
   decodeCanonicalRow, listCanonicalHeaders, listConversationMessageHeaders,
   readCanonicalContentRows, readCanonicalRow,
@@ -230,7 +230,7 @@ async function buildSource(input: BuildInput): Promise<PortableRecordSource> {
     }
     yield `],"sessionId":${canonicalJson(value.sessionId)},"title":${canonicalJson(value.title)},"updatedAt":${canonicalJson(value.updatedAt)}}]`;
   };
-  const eachHeader=async (domain: PortableDomain, visit:(locator:string)=>Promise<void>) => {
+  const eachHeader=async (domain: PortableDomain, visit:(locator:string,byteLength:string)=>Promise<void>) => {
     let after: string | null=null;
     while (true) {
       abort(options.signal);
@@ -240,7 +240,7 @@ async function buildSource(input: BuildInput): Promise<PortableRecordSource> {
       for (const header of headers) {
         assertHeaderLength(header.byteLength);
         if (header.locator === after) invalid();
-        await visit(header.locator);
+        await visit(header.locator,header.byteLength);
         after=header.locator;
       }
     }
@@ -296,9 +296,9 @@ async function buildSource(input: BuildInput): Promise<PortableRecordSource> {
   };
   for (const domain of PORTABLE_RECORD_DOMAIN_ORDER) {
     let count=0;
-    await eachHeader(domain,async(locator) => {
+    await eachHeader(domain,async(locator,byteLength) => {
       const draft=await recordAt(domain,locator,0,options.signal);
-      index.add(locator,draft);
+      index.add(locator,draft,byteLength);
       count++;
     });
     index.finalizeDomain(domain); counts.set(domain,count);
@@ -330,6 +330,32 @@ async function buildSource(input: BuildInput): Promise<PortableRecordSource> {
     if (entry === undefined) invalid();
     return checkedRecordAt(domain,entry.locator,entry.ordinal,signal);
   };
+  /**
+   * Splits an ordinal-ordered entries page into round trips whose aggregate
+   * SQL-measured bytes (per entry.byteLength, captured in the disk-backed
+   * index from the same sizeExpression readCanonicalContentRows' guard
+   * enforces; see PortableIndex.add) stay within
+   * PORTABLE_LIMITS.maxBatchBytes. A single oversized locator still forms its
+   * own one-element chunk; assertHeaderLength already refused anything
+   * larger than PORTABLE_LIMITS.maxBatchBytes during the header walk.
+   * Callers must only pass a non-empty batch (boundaryAt already refuses an
+   * empty entries page before calling this), so the final chunk is always
+   * flushed unconditionally below.
+   */
+  const chunkEntriesByBytes=(batch:readonly PortableIndexEntry[]):PortableIndexEntry[][] => {
+    const budget=BigInt(PORTABLE_LIMITS.maxBatchBytes);
+    const chunks:PortableIndexEntry[][]=[];
+    let current:PortableIndexEntry[]=[];
+    let currentBytes=0n;
+    for (const item of batch) {
+      if (item.byteLength === undefined) invalid();
+      const size=BigInt(item.byteLength);
+      if (current.length > 0 && currentBytes+size > budget) { chunks.push(current); current=[]; currentBytes=0n; }
+      current.push(item); currentBytes+=size;
+    }
+    chunks.push(current);
+    return chunks;
+  };
   const boundaryAt=async(domain:PortableDomain,nextOrdinal:number,capture:boolean,signal?:AbortSignal) => {
     let prefix=initialPrefix(domain);
     let last:BoundaryEvidence["last"]=null;
@@ -338,21 +364,31 @@ async function buildSource(input: BuildInput): Promise<PortableRecordSource> {
       const entries=index.entries(domain,{afterOrdinal:ordinal-1,limit:Math.min(PORTABLE_LIMITS.maxBatchRecords,nextOrdinal-ordinal),
         maxBytes:PORTABLE_LIMITS.maxBatchBytes,signal});
       if (entries.length === 0) invalid();
-      // Batched: one round trip answers every locator in this chunk (bounded
-      // by PORTABLE_LIMITS.maxBatchRecords above) instead of one per record.
-      // See #1388; the incremental digest chain below still processes rows
-      // strictly in entries' order, so boundary/ordering semantics do not
-      // change, only how many queries produce the same bytes.
+      // Batched: one round trip per aggregate-byte-bounded chunk answers the
+      // locators in this ordinal window (bounded by PORTABLE_LIMITS.maxBatchRecords
+      // above) instead of one round trip per record. See #1388; the
+      // incremental digest chain below still processes rows strictly in
+      // entries' order, so boundary/ordering semantics do not change.
+      // Chunking here additionally bounds each round trip's aggregate SQL
+      // payload bytes to PORTABLE_LIMITS.maxBatchBytes: index.entries' own
+      // maxBytes bound only limits JSON-stringified index metadata, not the
+      // record payload readCanonicalContentRows fetches. The digest loop
+      // runs immediately after each chunk's read, inside this loop, instead
+      // of after accumulating every chunk's rows into one map first: the
+      // Node process's peak resident payload is therefore one chunk (at
+      // most PORTABLE_LIMITS.maxBatchBytes), not the whole entries page.
       abort(signal); abort(options.signal);
-      const rows=await readCanonicalContentRows(session,expectedIdentity.id,domain,entries.map(entry=>entry.locator),signal);
-      for (const entry of entries) {
-        const row=rows.get(entry.locator);
-        if (row === undefined) invalid();
-        const record=recordFromRow(domain,row,entry.locator,entry.ordinal);
-        if (!capture) assertBoundaryMatches(domain,entry.ordinal,record);
-        prefix=appendDigest(prefix,serializePortableRecord(record));
-        last={recordSha256:record.recordSha256,identitySha256:record.identitySha256};ordinal++;
-        if (capture) index.bindScope(prefixScope(domain),String(ordinal),JSON.stringify({prefix,last}));
+      for (const chunk of chunkEntriesByBytes(entries)) {
+        const chunkRows=await readCanonicalContentRows(session,expectedIdentity.id,domain,chunk.map(item=>item.locator),signal);
+        for (const item of chunk) {
+          const row=chunkRows.get(item.locator);
+          if (row === undefined) invalid();
+          const record=recordFromRow(domain,row,item.locator,item.ordinal);
+          if (!capture) assertBoundaryMatches(domain,item.ordinal,record);
+          prefix=appendDigest(prefix,serializePortableRecord(record));
+          last={recordSha256:record.recordSha256,identitySha256:record.identitySha256};ordinal++;
+          if (capture) index.bindScope(prefixScope(domain),String(ordinal),JSON.stringify({prefix,last}));
+        }
       }
     }
     return {prefix,last};

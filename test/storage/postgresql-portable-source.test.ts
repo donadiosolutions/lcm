@@ -360,6 +360,37 @@ describe('PostgreSQL source private scratch and authenticated prefix evidence',(
     const first=await measure(1200),second=await measure(2400);
     expect(second-first).toBeLessThanOrEqual(4*1200+5);
   },30000);
+  it('bounds a batched boundary read by aggregate payload bytes, not just record count',async()=>{
+    const rows2=['1','2'].map(ingest_key=>({ingest_key,session_id:ingest_key,message_count:'1',completed_at:timestamp}));
+    const h=dataHarness({'session-ingest':rows2}),list=h.list.getMockImplementation()!;
+    // Two records each well within the per-row 144MiB guard, but together
+    // exceeding PORTABLE_LIMITS.maxBatchBytes: #1388's batching must not
+    // fetch their content in a single round trip on the strength of
+    // index.entries' own maxBytes bound alone, since that bound only limits
+    // JSON-stringified index metadata, not the record payload this batch
+    // reads. Before the aggregate-bytes chunking fix this issued exactly one
+    // readCanonicalContentRows call for both locators.
+    h.list.mockImplementation(async(...args)=>(await list(...(args as Parameters<typeof list>)))
+      .map(header=>({...header,byteLength:'90000000'})));
+    const source=await open(h);
+    const calls=h.contentRows.mock.calls.filter(call=>call[2]==='session-ingest');
+    expect(calls).toHaveLength(2);
+    expect(calls.every(call=>call[3].length===1)).toBe(true);
+    await source.close();
+  });
+  it('fails closed when a batched chunk entry lacks its captured byte length',async()=>{
+    const h=dataHarness({'session-ingest':['1'].map(ingest_key=>({ingest_key,session_id:ingest_key,message_count:'1',completed_at:timestamp}))});
+    const original=PortableIndex.prototype.entries;
+    vi.spyOn(PortableIndex.prototype,'entries').mockImplementation(function(this:PortableIndex,domain,options){
+      const result=original.call(this,domain,options);
+      // Strip the captured byte lengths but keep every locator valid: the
+      // fail-closed chunk guard must fire before any content read, so this
+      // pins that guard rather than the pre-existing missing-row guard the
+      // previous fake-locator injection reached instead.
+      return domain==='session-ingest' ? result.map(entry=>({...entry,byteLength:undefined})) : result;
+    });
+    await expect(open(h)).rejects.toMatchObject({code:'source-invalid'});
+  });
   it('validates zero and arbitrary resumed prefixes without accepting forged evidence',async()=>{
     const h=dataHarness({'session-ingest':rows(2)}),source=await open(h),description=source.describeSource();
     const first=(await source.readDomainPage(page('session-ingest'))).records[0];
