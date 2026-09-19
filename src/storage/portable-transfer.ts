@@ -23,7 +23,7 @@ import type {
 export type PortableTransferErrorCode =
   | "invalid-input" | "unsupported-capability" | "source-changed"
   | "source-failed" | "destination-conflict" | "destination-failed"
-  | "destination-uncertain" | "checkpoint-mismatch" | "zero-progress"
+  | "destination-uncertain" | "destination-unexpected-rows" | "checkpoint-mismatch" | "zero-progress"
   | "aborted" | "verification-failed" | "close-failed";
 
 const ERROR_POLICY: Readonly<Record<PortableStreamErrorCode, readonly [PortableTransferErrorCode, boolean]>> = {
@@ -49,7 +49,7 @@ const ERROR_POLICY: Readonly<Record<PortableStreamErrorCode, readonly [PortableT
 const ERROR_CODES: readonly PortableTransferErrorCode[] = [
   "invalid-input", "unsupported-capability", "source-changed", "source-failed",
   "destination-conflict", "destination-failed", "destination-uncertain",
-  "checkpoint-mismatch", "zero-progress", "aborted", "verification-failed", "close-failed",
+  "destination-unexpected-rows", "checkpoint-mismatch", "zero-progress", "aborted", "verification-failed", "close-failed",
 ];
 
 /** A closed vocabulary deliberately excludes driver text, causes and record data. */
