@@ -298,7 +298,19 @@ describe("store persistence boundaries", () => {
 
   // #1371: the route makes the shared deduplication decision instead of
   // inserting directly. The helper is real; only the repositories are fakes.
-  it("scopes the SQLite decision to the recorded origin and inserts new content", async () => {
+  //
+  // #1390/#1406 widened deduplicateAndInsertInRepositories' exact-content
+  // lookup to run on every backend for owner-scoped dedup, not only
+  // PostgreSQL (see src/promotion/dedup.ts). Before that widening this test
+  // asserted findExact was never called on SQLite; that assertion encoded
+  // the pre-widening gate, not the scoping this test names. The scoping
+  // property is unchanged and still covered here: candidateSourceProjectId
+  // narrows both the fuzzy search and (now) the exact lookup to the
+  // recorded origin ("origin-a") rather than the whole owner. No coverage
+  // is lost by asserting the call instead of its absence -- the origin
+  // argument is checked either way, and the insert-on-miss path below still
+  // exercises the no-match branch.
+  it("scopes both SQLite dedup lookups to the recorded origin and inserts new content", async () => {
     await createStoreHandler(config)(
       {} as never,
       response,
@@ -306,7 +318,7 @@ describe("store persistence boundaries", () => {
     );
 
     expect(mocks.search).toHaveBeenCalledWith("scrubbed:value", candidateLimit, undefined, "origin-a");
-    expect(mocks.findExact).not.toHaveBeenCalled();
+    expect(mocks.findExact).toHaveBeenCalledWith("scrubbed:value", "origin-a");
     expect(mocks.insert).toHaveBeenCalledOnce();
     expect(mocks.update).not.toHaveBeenCalled();
     expect(mocks.send).toHaveBeenLastCalledWith(response, 200, { stored: true, id: "stored-id" });
