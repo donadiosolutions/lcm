@@ -927,9 +927,20 @@ SQLite keeps its existing best-effort behavior when SQLite is selected. The
 PostgreSQL routes never open a project SQLite database or return a false empty
 read result as fallback. The raw hook-facing `POST /prompt-search` endpoint
 still lets the prompt hook treat optional hint failure as non-fatal, while
-identity errors remain visible as admission failures. A typed surfacing-log
-failure under the selected PostgreSQL backend returns a sanitized HTTP `503`;
-PostgreSQL never falls back to SQLite for that failure. Setting
+identity errors remain visible as admission failures. Prompt search retains one
+operation-scoped publication admission from project identity resolution through
+the selected backend open, recall reads, optional surfacing metadata write, and
+project close. This lock-held admission replaces the former post-read witness,
+so a backend publication or project-map transition cannot redirect the write.
+All prompt-search requests take this admission, including
+`logSurfacing: false`; that option still performs no metadata write and returns
+the same bounded hint, ID, and debug shapes. Prompt-search responses remain
+bounded by their result and byte budgets, and retain the daemon's 10 MiB response
+ceiling after leaving the generic buffered-read path. A blocked publication
+admission returns a sanitized HTTP `503`, which the prompt hook degrades to no
+hints. Ordinary SQLite surfacing-log failures remain best-effort. A typed
+surfacing-log failure under the selected PostgreSQL backend returns a sanitized
+HTTP `503`; PostgreSQL never falls back to SQLite for that failure. Setting
 `restoration.promptSearchMaxResults` to `0` suppresses returned hints but does
 not bypass PostgreSQL identity or storage admission. Disabled compaction and
 empty ingestion still authenticate the selected backend before returning their
