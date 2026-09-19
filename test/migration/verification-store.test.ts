@@ -136,6 +136,22 @@ describe("MigrationVerificationReportStore", () => {
     expectStoreError(() => store.read("generation-1", otherGenerationReport.reportSha256), "malformed-record");
   });
 
+  it("round-4 P3: rejects has() for a stored report whose body names a different generation than the path it was checked at", () => {
+    // has() previously only checked file existence, never parsing
+    // content the way persist() and read() both do -- the one of three
+    // methods that did not enforce the generation binding, so a
+    // wrong-generation report on the right path would have answered
+    // true. Same fixture trick as the read() test immediately above.
+    const otherGenerationReport = createMigrationVerificationReport(baseInput({ generationId: "generation-2" }));
+    store.persist("generation-2", otherGenerationReport);
+    const sourcePath = reportPath("generation-2", otherGenerationReport.reportSha256);
+    const targetPath = reportPath("generation-1", otherGenerationReport.reportSha256);
+    mkdirSync(join(targetPath, ".."), { recursive: true, mode: 0o700 });
+    copyFileSync(sourcePath, targetPath);
+    chmodSync(targetPath, 0o600);
+    expectStoreError(() => store.has("generation-1", otherGenerationReport.reportSha256), "malformed-record");
+  });
+
   it("round-4 P1-adjacent: defaults expectedUid to the current process uid rather than leaving the descriptor-owner check disabled", () => {
     // Before this fix, an omitted expectedUid stayed undefined and was
     // passed straight through to readBoundedRegularFileWithStat, whose

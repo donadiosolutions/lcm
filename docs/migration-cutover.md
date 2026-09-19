@@ -650,9 +650,18 @@ failures that byte-for-byte content equality cannot see:
   production read paths, never a hand-written re-implementation of either.
   The ordered-listing probe runs `PostgreSqlConversationRepository`'s
   production read and compares the result against the source's own
-  canonical `createdAt` ordering captured while streaming the source; a
-  repository bug in filtering, ordering, or row count shows up here even
-  when the underlying copied bytes are correct. The search self-match
+  canonical `(createdAt, identitySha256)` ordering captured while
+  streaming the source, grouped by truncated `createdAt` with each
+  group's titles compared as a canonically sorted multiset rather than
+  positionally: the destination lists same-`createdAt` ties by its own
+  native row id, an independent key from the source's tie-break, so a
+  positional comparison would flag a correctly copied project whenever
+  those two tie-breaks happened to disagree, which is routine at
+  second-precision timestamps. A repository bug in filtering, ordering,
+  row count, or a substituted/replaced record within a tie group still
+  shows up here even when the underlying copied bytes are otherwise
+  correct; a permutation of two same-second conversations' titles with
+  each other is the one case this probe cannot see. The search self-match
   probe runs `PostgreSqlLexicalSearchRepository.searchMessages` against
   `lcm.search_v1`, walking a small, seeded pool of source message
   candidates until one candidate's own content produces a non-empty

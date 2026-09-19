@@ -1,9 +1,10 @@
 import { createHash } from "node:crypto";
-import { mkdtempSync } from "node:fs";
+import { mkdirSync, mkdtempSync, readFileSync, rmSync, statSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import { DatabaseSync } from "node:sqlite";
 import { Client } from "pg";
-import { beforeAll, expect, it } from "vitest";
+import { beforeAll, expect, it, vi } from "vitest";
 import { assertHarnessReady, settings, withPostgreSqlTestDatabase } from "./harness.js";
 import { grantPortablePostgreSql, seedPortablePostgreSql } from "./portable-fixture.js";
 import { PostgreSqlRuntime } from "../../src/storage/postgresql/runtime.js";
@@ -11,6 +12,8 @@ import { probePostgreSqlPortableDestination } from "../../src/storage/postgresql
 import { PORTABLE_RECORD_DOMAIN_ORDER } from "../../src/storage/portable-record.js";
 import {
   assertPermanentReadOnlyGuard,
+  captureDestinationIdentity,
+  captureDestinationSchemaWitness,
   readFencedDestinationCensus,
   readLedgerMismatches,
   readRelationDanglingReferenceMismatches,
@@ -19,7 +22,28 @@ import {
   readSequenceSelfConsistencyMismatches,
   readSequenceStoredState,
   SEQUENCE_BACKED_IDENTITY_COLUMN,
+  verifyMigrationGeneration,
 } from "../../src/migration/verify-generation.js";
+import { migrationCopyTargetGeneration } from "../../src/migration/copy-source.js";
+import { inspectSqliteMigrationCopy, runSqliteMigrationCopy } from "../../src/migration/batch-copy.js";
+import { beginMigrationEffect, completeMigrationEffect, createMigrationManifest } from "../../src/migration/protocol.js";
+import { MigrationManifestStore } from "../../src/migration/manifest-store.js";
+import {
+  authenticateSqliteMigrationSource, authenticateSqliteMigrationSourceBytes,
+  captureAuthenticatedSqliteMigrationSource, prepareSqliteMigrationEnrollment,
+} from "../../src/migration/maintenance.js";
+import { getMigrationReceiptEpoch, recordMigrationReceipt, type MigrationReceiptEnvelope } from "../../src/migration/receipts.js";
+import { withMigrationQueueEvidence } from "../../src/migration/queue-evidence.js";
+import { localProjectIdentity } from "../../src/daemon/project.js";
+import {
+  BackendPublicationCoordinator, withBackendPublicationAppendBarrierAsync,
+  type BackendPublicationDriver,
+} from "../../src/storage/backend-publication.js";
+import { PostgreSqlIdentityRepository } from "../../src/storage/postgresql/identity-repository.js";
+import { appendLocalHookEvents } from "../../src/hooks/local-enqueue.js";
+import { readMachineIdentity } from "../../src/machine-identity.js";
+import { closeLcmConnection } from "../../src/db/connection.js";
+import { seedPortableSqlite } from "../storage/sqlite-portable-fixture.js";
 
 beforeAll(assertHarnessReady);
 
@@ -52,6 +76,206 @@ it("the census window is a real PostgreSQL READ ONLY transaction that never assi
     }
   });
 }, 60000);
+
+
+/**
+ * Round-4 P1 end-to-end proof, the gap both reviewers found: no test
+ * anywhere drove a real copy into verifyMigrationGeneration and
+ * asserted eligibility. The two existing live tests for this probe
+ * (the round-2 fixture-seeded ones above and in the unit suite) both
+ * hand-wrote native_key as a bare id, which is not what the copy
+ * actually writes (json_build_array(id::text)::text, per
+ * portable-mapping.ts's locatorExpression) -- so they passed against a
+ * format the destination never produces. This test performs a real
+ * authenticated SQLite copy through runSqliteMigrationCopy (the same
+ * driver bin/lcm.ts's migrate command uses), producing a genuine
+ * lcm.transfer_identities table and a genuine on-disk manifest, then
+ * calls verifyMigrationGeneration against that real destination with
+ * verifyMigrationGeneration's own default dependencies (the real
+ * openMigrationCopySource, not a stub), and asserts both a confirmed
+ * search self-match and a genuinely activation-eligible report.
+ */
+it("a real authenticated SQLite copy verifies eligible, with a genuine search self-match against the copy's real locator format", async () => {
+  await withPostgreSqlTestDatabase("migration-verification-e2e", async (db) => {
+    await grantPortablePostgreSql(db, { transfer: true });
+    const home = mkdtempSync(join(tmpdir(), "migration-verification-e2e-"));
+    vi.stubEnv("HOME", home); vi.stubEnv("USERPROFILE", home);
+    try {
+      const cwd = join(home, "project"); mkdirSync(cwd, { mode: 0o700 });
+      const local = localProjectIdentity(cwd, home);
+      const projectDir = join(home, ".lcm", "projects", local.id);
+      mkdirSync(projectDir, { recursive: true, mode: 0o700 });
+      writeFileSync(join(projectDir, "meta.json"), JSON.stringify({ cwd }) + "\n", { mode: 0o600 });
+      const enrolled = await prepareSqliteMigrationEnrollment({
+        cwd, homeDir: home,
+        targetConfig: { backend: "postgresql", postgresql: { ...settings(db.runtimeUrl), migrationRole: "lcm_test_migrator" } },
+      });
+      const remote = await new PostgreSqlIdentityRepository(db.runtime).createProject({
+        machineId: enrolled.identity.machineId, displayName: "verification e2e target", path: cwd, normalizedPath: cwd,
+      });
+      const expectedIdentity = {
+        id: remote.projectId, remoteProjectId: remote.projectId, localProjectId: local.id,
+        machineId: enrolled.identity.machineId, canonical: cwd, selectedPath: cwd,
+      };
+      const machine = readMachineIdentity(home)!;
+      const seed = seedPortableSqlite(join(projectDir, "db.sqlite"), {
+        projectIdentity: { scope: "shared", projectId: remote.projectId }, sourceLocalProjectId: local.id,
+        identityFacts: {
+          machines: [{ identityKey: machine.identityKey, machineId: machine.machineId }],
+          aliases: [{ machineIdentityKey: machine.identityKey, path: cwd, normalizedPath: cwd }],
+        },
+      });
+      if (Array.isArray(seed.capturedSidecars!.instructions)) {
+        for (const file of seed.capturedSidecars!.instructions) rmSync(file.databasePath);
+      }
+      if ("databasePath" in seed.capturedSidecars!.events) rmSync(seed.capturedSidecars!.events.databasePath);
+      await appendLocalHookEvents({
+        cwd, sessionId: "retained", sourceHook: "SessionStart",
+        events: ["applied", "no-effect", "retained"].map((data) => ({ type: "decision", category: "decision", data, priority: 1 })),
+      });
+      closeLcmConnection();
+      const eventsPath = join(home, ".lcm", "events", local.id + ".db");
+      const project = new DatabaseSync(join(projectDir, "db.sqlite"));
+      const events = new DatabaseSync(eventsPath);
+      try {
+        const epoch = getMigrationReceiptEpoch(project, local.id, machine.machineId!)!;
+        const envelopes = events.prepare(
+          "SELECT event_uuid AS eventUuid, event_version AS eventVersion, machine_id AS machineId, "
+            + "machine_sequence AS machineSequence, session_id AS sessionId, seq AS sessionSequence, "
+            + "type, category, data, priority, source_hook AS sourceHook, created_at AS createdAt "
+            + "FROM events ORDER BY machine_sequence",
+        ).all() as unknown as MigrationReceiptEnvelope[];
+        const memory = project.prepare("SELECT id FROM promoted ORDER BY id LIMIT 1").get() as { id: string };
+        project.exec("BEGIN IMMEDIATE");
+        for (const [index, envelope] of envelopes.slice(0, 2).entries()) {
+          recordMigrationReceipt(project, {
+            projectId: local.id, epochId: epoch.epochId, envelope,
+            effectWitness: index === 0
+              ? { version: 1, outcome: "applied", promotedMemoryId: memory.id }
+              : { version: 1, outcome: "no-effect", reason: "unreinforced-pattern" },
+            committedAt: "2026-09-14T03:00:00.000000Z",
+          });
+        }
+        project.exec("COMMIT");
+        events.exec("UPDATE events SET processed_at='2026-09-14T03:00:00.000Z' WHERE data IN ('applied','no-effect')");
+      } finally {
+        events.close(); project.close();
+      }
+      const unavailable = async (): Promise<never> => { throw new Error("no publication"); };
+      const driver: BackendPublicationDriver = {
+        observeLocalState: unavailable, publishProjectMap: unavailable, publishConfig: unavailable,
+        restoreConfig: unavailable, restoreProjectMap: unavailable,
+      };
+      const entered = await withBackendPublicationAppendBarrierAsync(home, async (token) => {
+        const authority = authenticateSqliteMigrationSource(cwd, home, token);
+        const expectedSourceBytes = await authenticateSqliteMigrationSourceBytes(authority, { homeDir: home, lockToken: token });
+        const held = await new BackendPublicationCoordinator({ homeDir: home, driver }).enterMaintenance({
+          publicationId: "verify-e2e:all.1", generationId: "verify-e2e:all.1",
+          sourceSelectionSha256: authority.sourceSelectionSha256, queueEvidenceSha256: expectedSourceBytes.checksumSha256,
+          roster: [{ machineId: machine.machineId!, queueCutoff: "0000000000000000002", evidenceSha256: expectedSourceBytes.checksumSha256 }],
+        }, token);
+        return { authority, expectedSourceBytes, held };
+      });
+      const snapshot = await captureAuthenticatedSqliteMigrationSource(entered.authority, {
+        homeDir: home, generationId: entered.held.generationId, maintenanceChecksumSha256: entered.held.checksumSha256,
+        expectedSourceBytes: entered.expectedSourceBytes,
+      });
+      const evidence = await withMigrationQueueEvidence(home, snapshot.artifact, entered.held, async (_reference, records) => [...records]);
+      expect(evidence.map((record) => record.disposition)).toEqual(["represented", "represented", "retained"]);
+      closeLcmConnection();
+      const copyInput = {
+        generationId: snapshot.artifact.generationId, homeDir: home, settings: settings(db.runtimeUrl),
+        expectedOwner: "lcm_test_migrator", expectedIdentity, ownerProcessId: "verify-e2e-copy-owner",
+        maxRecords: 500, maxBytes: 150994944,
+      };
+      // runSqliteMigrationCopy reads an existing manifest head rather
+      // than creating one itself -- the manifest is created here,
+      // through the real protocol.ts constructor, from the same
+      // witness inspectSqliteMigrationCopy derives, exactly like
+      // batch-copy.ts's own production callers (bin/lcm.ts's migrate
+      // command) are expected to do it.
+      const witness = await inspectSqliteMigrationCopy({ ...copyInput, destinationCapturedAt: "2026-09-14T03:00:00.000Z" });
+      const manifestStoreForCreate = new MigrationManifestStore({ homeDir: home });
+      let createdJournal = manifestStoreForCreate.create(createMigrationManifest({
+        generationId: copyInput.generationId, source: witness.source, destination: witness.destination,
+        parentGenerationId: null, preservedSourceGenerationId: copyInput.generationId,
+        createdAt: "2026-09-14T03:00:00.000Z",
+      }));
+      // runSqliteMigrationCopy requires the manifest to already be past
+      // "planned" (dry-run-verified, copying, or copied) -- a real
+      // caller runs a dry-run verification pass first. A minimal
+      // synthetic dry-run report is sufficient here since this test's
+      // subject is the copy and its ledger output, not the dry-run
+      // report's own content.
+      createdJournal = manifestStoreForCreate.update(copyInput.generationId, createdJournal.checksumSha256, (current) => beginMigrationEffect(current, {
+        kind: "verify-dry-run", effectId: "e2e-dryrun", inputSha256: "a".repeat(64), startedAt: current.updatedAt,
+      }));
+      manifestStoreForCreate.update(copyInput.generationId, createdJournal.checksumSha256, (current) => completeMigrationEffect(current, {
+        effectId: "e2e-dryrun", completedAt: current.updatedAt,
+        report: { kind: "dry-run", reportId: "e2e-dryrun-verified", reportSha256: "b".repeat(64), createdAt: current.updatedAt },
+      }));
+      const result = await runSqliteMigrationCopy(copyInput);
+      expect(result.phase).toBe("copied");
+      expect(result.checkpoints).toHaveLength(22);
+
+      // The manifest runSqliteMigrationCopy actually wrote to disk --
+      // consumed directly, never restated, exactly like the driver's
+      // own contract with MigrationManifestStore.
+      const manifestStore = new MigrationManifestStore({ homeDir: home });
+      const manifest = manifestStore.read(copyInput.generationId);
+      expect(manifest.checkpoints).toHaveLength(22);
+
+      // Destination witnesses computed through the exact functions the
+      // driver itself uses, never re-derived independently, so this
+      // input cannot silently drift from what verifyMigrationGeneration
+      // will itself compute at step 2.
+      const witnessRuntime = new PostgreSqlRuntime(settings(db.runtimeUrl));
+      let destinationMigrationsSha256: string;
+      let expectedDestinationIdentitySha256: string;
+      let expectedSystemIdentifier: string;
+      try {
+        const [schemaWitness, identity] = await Promise.all([
+          captureDestinationSchemaWitness(witnessRuntime),
+          captureDestinationIdentity(witnessRuntime, expectedIdentity.id),
+        ]);
+        destinationMigrationsSha256 = schemaWitness.migrationsSha256;
+        expectedDestinationIdentitySha256 = identity.sealedWitnessSha256;
+        expectedSystemIdentifier = identity.systemIdentifier;
+      } finally {
+        await witnessRuntime.close();
+      }
+
+      const scratchParent = mkdtempSync(join(tmpdir(), "lcm-verify-e2e-scratch-"));
+      const verified = await verifyMigrationGeneration({
+        generationId: copyInput.generationId,
+        targetGenerationId: migrationCopyTargetGeneration(copyInput.generationId),
+        homeDir: home, expectedIdentity, destinationSettings: settings(db.runtimeUrl),
+        expectedOwner: "lcm_test_migrator", ownerProcessId: "verify-e2e-verify-owner",
+        scratchParent, leaseTtlMs: 300000,
+        manifestRevision: manifest.revision, manifestChecksumSha256: manifest.checksumSha256,
+        destinationMigrationsSha256, expectedDestinationIdentitySha256, expectedSystemIdentifier,
+        // Neither of these is compared against anything live in
+        // verify-generation.ts -- both are recorded into the report
+        // verbatim for a future #625/#626 consumer, so a well-formed
+        // placeholder is honest here, not a hidden second
+        // implementation of something this driver itself checks.
+        projectMapWitnessSha256: "a".repeat(64),
+        queueClassificationWitness: {
+          version: 1, queueCutoff: null, queueSetSha256: "a".repeat(64),
+          receiptSetSha256: "a".repeat(64), epochChecksumSha256: "a".repeat(64),
+        },
+        sampleParameters: { version: 1, strideOrdinal: 97, sampleCount: 32, seedBasisSha256: "a".repeat(64) },
+      });
+
+      expect(verified.report.body.publicProbeCoverage).toContainEqual({ probe: "public-search", ran: true });
+      expect(verified.report.mismatches).toEqual([]);
+      expect(verified.report.activationEligible).toBe(true);
+    } finally {
+      closeLcmConnection(); vi.unstubAllEnvs(); rmSync(home, { recursive: true, force: true });
+    }
+  });
+}, 120000);
+
 
 /**
  * Live PostgreSQL 18 proof for the round-4 P1 fix: the search probe's
@@ -87,10 +311,17 @@ it("the search probe's ledger correlation and real search both run as live SQL a
       // *only* fact tying the candidate to seeded.messageId, exactly
       // the correlation the fix performs live.
       const candidateIdentitySha256 = createHash("sha256").update("live-search-probe-candidate").digest("hex");
+      // Round-4 P1 (candidate-review-4): native_key is the copy's own
+      // JSON-array locator format (portable-mapping.ts's
+      // locatorExpression: json_build_array(id::text)::text), never a
+      // bare id. Seeding it as a bare id here previously let this test
+      // pass against a format the destination never actually produces
+      // -- exactly the defect both reviewers found in the production
+      // code, just reproduced in the fixture instead.
       await db.migrator.query({
         text: "INSERT INTO lcm.transfer_identities (run_id, domain, identity_sha256, ordinal, native_key, record_sha256) "
           + "VALUES ($1, 'messages', $2, 0, $3, $4)",
-        values: [runId, candidateIdentitySha256, seeded.messageId, "e".repeat(64)],
+        values: [runId, candidateIdentitySha256, JSON.stringify([seeded.messageId]), "e".repeat(64)],
       }, { domain: "factory", operation: "seedLiveSearchProbeIdentity" });
 
       const outcome = await runSearchSelfMatchProbe(

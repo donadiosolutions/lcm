@@ -143,7 +143,15 @@ function emptyTerminalIdentitySha256(domain: PortableDomain): string {
 
 // --- Step 2: destination identity and schema witnesses ---------------------
 
-async function captureDestinationIdentity(
+/**
+ * Exported so a live end-to-end test can compute the exact witness
+ * values a real copy's destination produces, rather than a second,
+ * potentially drifting implementation of the same digest -- the same
+ * discipline this file already applies to reused primitives elsewhere
+ * (readDomainPage for relation, the copy's own locator format for the
+ * search probe).
+ */
+export async function captureDestinationIdentity(
   executor: PostgreSqlQueryExecutor, projectId: string, signal?: AbortSignal,
 ): Promise<MigrationDestinationIdentity> {
   const sealedWitnessSha256 = await readPostgreSqlPortableWitness(executor, projectId, signal);
@@ -225,7 +233,8 @@ function searchConfigurationAbsentReason(status: Readonly<{ objectCount: number;
     : "destination search configuration is present but does not satisfy its ownership or definition contract";
 }
 
-async function captureDestinationSchemaWitness(
+/** Exported for the same reason as captureDestinationIdentity above. */
+export async function captureDestinationSchemaWitness(
   executor: PostgreSqlQueryExecutor, signal?: AbortSignal,
 ): Promise<MigrationSchemaWitness> {
   const migrationsSha256 = await captureAppliedMigrationsSha256(executor, signal);
@@ -415,17 +424,59 @@ export const MIGRATION_SEARCH_PROBE_CANDIDATE_POOL_SIZE = 25;
  */
 export const MIGRATION_SAMPLE_EMPTY_SOURCE_IDENTITY_SHA256 = migrationWitnessSha256(["sample-empty-source"]);
 
+function compareTieOrderTitle(left: string | null, right: string | null): number {
+  if (left === right) return 0;
+  if (left === null) return -1;
+  if (right === null) return 1;
+  return left < right ? -1 : 1;
+}
+
 async function runOrderedListingProbe(
   executor: PostgreSqlRuntime, projectId: string,
   expectedOrder: readonly MigrationPublicListingSourceEntry[], signal?: AbortSignal,
 ): Promise<{ mismatch: MigrationVerificationMismatch | null; publicListingSha256: string }> {
   const repository = new PostgreSqlConversationRepository(executor, projectId);
   const rows = await repository.listConversations();
-  const actualOrder = rows.map((row) =>
-    [truncateToMillisecondIso(row.createdAt.toISOString()), row.title] as const);
-  const publicListingSha256 = sha256Hex(portableCanonicalJson(["lcm-migration-verification-public-listing-v1", actualOrder]));
-  const expectedEntries = expectedOrder.map((entry) => [entry.createdAt, entry.title] as const);
-  const expectedSha256 = sha256Hex(portableCanonicalJson(["lcm-migration-verification-public-listing-v1", expectedEntries]));
+  const actualEntries = rows.map((row) => ({
+    createdAt: truncateToMillisecondIso(row.createdAt.toISOString()), title: row.title,
+  }));
+  // Round-4: group both sides by truncated createdAt and compare titles
+  // within each group as a canonically sorted multiset, not
+  // positionally. listConversations() ties by the destination-native
+  // conversation_id (assigned in the source's canonical sessionId-first
+  // stream order), while expectedOrder ties by portable identitySha256
+  // -- independent keys that routinely disagree on same-second pairs,
+  // since SQLite's created_at is second-precision and
+  // getOrCreateConversation runs per session start. A positional
+  // comparison reported a mismatch on a correctly copied project
+  // whenever those two independent tie-breaks happened to disagree,
+  // roughly half the time a tie exists -- round-4 candidate-review-4's
+  // P1, found independently by two reviewers. Grouping removes that
+  // false positive while still catching a real content change: a
+  // substitution or replacement inside a tie group changes the sorted
+  // multiset. It cannot catch a permutation *within* one tie group --
+  // two same-second conversations with their titles swapped with each
+  // other -- because telling that apart needs the intended pairing,
+  // which needs a correlation this probe deliberately does not add
+  // (the root ruled out correlating this through the transfer ledger).
+  type ListingGroup = Readonly<{ createdAt: string; startOrdinal: number; titles: readonly (string | null)[] }>;
+  function buildListingGroups(entries: readonly { createdAt: string; title: string | null }[]): ListingGroup[] {
+    const groups: Array<{ createdAt: string; startOrdinal: number; titles: (string | null)[] }> = [];
+    entries.forEach((entry, index) => {
+      const last = groups[groups.length - 1];
+      if (last && last.createdAt === entry.createdAt) last.titles.push(entry.title);
+      else groups.push({ createdAt: entry.createdAt, startOrdinal: index, titles: [entry.title] });
+    });
+    for (const group of groups) group.titles.sort(compareTieOrderTitle);
+    return groups;
+  }
+  const actualGroups = buildListingGroups(actualEntries);
+  const expectedGroups = buildListingGroups(expectedOrder);
+  const digestOfGroups = (groups: readonly ListingGroup[]): string => sha256Hex(portableCanonicalJson(
+    ["lcm-migration-verification-public-listing-v1", groups.map((group) => [group.createdAt, group.titles])],
+  ));
+  const publicListingSha256 = digestOfGroups(actualGroups);
+  const expectedSha256 = digestOfGroups(expectedGroups);
   if (expectedSha256 === publicListingSha256) return { mismatch: null, publicListingSha256 };
   // An empty expected (source) order can only reach here when the actual
   // (destination) order disagrees, since two empty arrays hash equal and
@@ -445,16 +496,24 @@ async function runOrderedListingProbe(
       },
     };
   }
-  // The first position where the two orders diverge, clamped so a length
-  // difference still names a real source record rather than indexing
-  // past the end of whichever side ran out first.
-  let ordinal = 0;
+  // The first tie-group where the two sides diverge -- a different
+  // createdAt at this group position, a different tie-group size, or
+  // the same createdAt with a differing sorted title multiset --
+  // clamped so a group-count difference still names a real source
+  // record rather than indexing past the end of whichever side ran out
+  // first. The named record is that group's first entry in canonical
+  // (identitySha256-tiebreak) order, the same "concrete record
+  // responsible" naming this class used before grouping existed.
+  let groupIndex = 0;
   while (
-    ordinal < expectedEntries.length && ordinal < actualOrder.length
-    && expectedEntries[ordinal]![0] === actualOrder[ordinal]![0]
-    && expectedEntries[ordinal]![1] === actualOrder[ordinal]![1]
-  ) ordinal += 1;
-  const sampledRecord = expectedOrder[Math.min(ordinal, expectedOrder.length - 1)]!;
+    groupIndex < expectedGroups.length && groupIndex < actualGroups.length
+    && expectedGroups[groupIndex]!.createdAt === actualGroups[groupIndex]!.createdAt
+    && expectedGroups[groupIndex]!.titles.length === actualGroups[groupIndex]!.titles.length
+    && expectedGroups[groupIndex]!.titles.every((title, index) => title === actualGroups[groupIndex]!.titles[index])
+  ) groupIndex += 1;
+  const divergentGroup = expectedGroups[Math.min(groupIndex, expectedGroups.length - 1)]!;
+  const ordinal = divergentGroup.startOrdinal;
+  const sampledRecord = expectedOrder[ordinal]!;
   return {
     publicListingSha256,
     mismatch: {
@@ -538,30 +597,58 @@ export async function runSearchSelfMatchProbe(
   if (candidates.length === 0) {
     return { ran: false, chosenOrdinal: null, notRunReason: "no source messages are available to search-probe" };
   }
-  const runResult = await executor.query<{ run_id: string }>({
-    text: "SELECT run_id FROM lcm.transfer_runs WHERE project_id = $1::uuid AND target_generation = $2",
+  // Round-4 P2: the run lookup used to have no state filter, so an
+  // in-progress copy's incomplete run correlated candidates against a
+  // ledger that is not yet the final one, and the not-run reason said
+  // "no completed transfer run" even though an active run did exist --
+  // the outcome (never a pass) was fail-closed, but the reason lied
+  // about which of the three absences actually happened. The query
+  // now filters on state, and the two "no correlation source" cases
+  // are told apart: no run row at all, versus a run row that exists
+  // but has not reached "completed".
+  const runResult = await executor.query<{ run_id: string; state: string }>({
+    text: "SELECT run_id, state FROM lcm.transfer_runs WHERE project_id = $1::uuid AND target_generation = $2",
     values: [projectId, targetGenerationId],
   }, { domain: "factory", operation: "verifyGenerationSearchProbeRun", signal });
-  const runId = runResult.rows[0]?.run_id;
-  if (runId === undefined) {
+  const run = runResult.rows[0];
+  if (run === undefined) {
     // No source of correlation exists at all: every candidate would be
     // unattributable, so there is no point walking the pool.
     return {
       ran: false, chosenOrdinal: null,
-      notRunReason: "no completed transfer run was found to correlate search-probe candidates against",
+      notRunReason: "no transfer run was found to correlate search-probe candidates against",
     };
   }
+  if (run.state !== "completed") {
+    return {
+      ran: false, chosenOrdinal: null,
+      notRunReason: `a transfer run exists for this generation but is not completed (state: ${run.state}), `
+        + "so it is not yet the final ledger to correlate search-probe candidates against",
+    };
+  }
+  const runId = run.run_id;
   const repository = new PostgreSqlLexicalSearchRepository(executor, projectId);
   const seedIndex = Number.parseInt(seedBasisSha256.slice(0, 8), 16) % candidates.length;
   let unattributedAttempts = 0;
   let unconfirmedAttempts = 0;
   for (let attempt = 0; attempt < candidates.length; attempt += 1) {
     const candidate = candidates[(seedIndex + attempt) % candidates.length]!;
-    const identityResult = await executor.query<{ native_key: string }>({
-      text: "SELECT native_key FROM lcm.transfer_identities WHERE run_id = $1 AND domain = 'messages' AND identity_sha256 = $2",
+    // Round-4 P1: native_key is not a bare id. The copy writes it as
+    // the same JSON-array locator format insertCanonicalRecord's own
+    // dependency resolver reads back (portable-mapping.ts's
+    // locatorExpression / parseLocator): json_build_array(id::text)
+    // for a single-key domain like messages, e.g. '["42"]', not "42".
+    // Comparing the bare search result id against that locator string
+    // directly was never true on real data -- unwrap it the same way
+    // the copy's own read path does, server-side, so this cannot drift
+    // from that format independently: ::json->>0 extracts the sole
+    // array element as text.
+    const identityResult = await executor.query<{ native_key: string | null }>({
+      text: "SELECT native_key::json->>0 AS native_key FROM lcm.transfer_identities "
+        + "WHERE run_id = $1 AND domain = 'messages' AND identity_sha256 = $2",
       values: [runId, candidate.identitySha256],
     }, { domain: "factory", operation: "verifyGenerationSearchProbeCorrelation", signal });
-    if (identityResult.rows.length !== 1) {
+    if (identityResult.rows.length !== 1 || identityResult.rows[0]!.native_key === null) {
       // Zero rows: this candidate's identity was never recorded in the
       // ledger, so no destination-native key exists to check search
       // results against -- unattributable, not evidence either way.
@@ -883,7 +970,7 @@ export async function readLedgerMismatches(
   // One grouped, server-side aggregate query; no per-identity row is
   // ever fetched to the client for this check.
   const identitySetResult = await session.query<{ domain: string; identity_set_sha256: string | null }>({
-    text: "SELECT domain, encode(digest(string_agg(identity_sha256, '' ORDER BY identity_sha256 COLLATE \"C\"), 'sha256'), 'hex') AS identity_set_sha256 "
+    text: "SELECT domain, encode(public.digest(string_agg(identity_sha256, '' ORDER BY identity_sha256 COLLATE \"C\"), 'sha256'), 'hex') AS identity_set_sha256 "
       + "FROM lcm.transfer_identities WHERE run_id = $1 GROUP BY domain",
     values: [run.run_id],
   }, { ...queryOptions, operation: "verifyGenerationLedgerIdentitySet" });
@@ -1820,9 +1907,19 @@ export async function verifyMigrationGeneration(
   let persisted: MigrationVerificationPersistOutcome;
   try {
     persisted = reportStore.persist(input.generationId, report);
-  } finally {
-    await releaseLease();
+  } catch (persistError) {
+    // Round-4 P3: a plain try/finally here would let releaseLease's own
+    // failure silently replace persist's in the finally clause's own
+    // throw, per ordinary JS try/finally semantics -- trading a real
+    // persist failure for a misattributed release failure. persist's
+    // error is the one worth propagating, the same preserve-the-
+    // primary-failure discipline this file already applies elsewhere
+    // (computeVerificationReport's own catch, the runtime close in its
+    // finally). The lease is still released either way.
+    await releaseLease().catch(() => undefined);
+    throw persistError;
   }
+  await releaseLease();
   const result: VerifyMigrationGenerationResult = {
     report: persisted.report, outcome: persisted.report.clean ? "clean" : "mismatches",
     effectId: migrationVerificationEffectId(persisted.report.reportSha256),

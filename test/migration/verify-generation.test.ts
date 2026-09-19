@@ -383,6 +383,14 @@ function fakeRuntime(overrides: {
   conversationsRows?: ReadonlyArray<Record<string, unknown>>;
   searchRows?: ReadonlyArray<Record<string, unknown>>;
   transferRunId?: string | null;
+  transferRunState?: string;
+  // nativeKey is the raw locator format the copy actually writes
+  // (json_build_array(id::text)::text, e.g. '["1"]' for a single-key
+  // domain), never a bare id -- round-4 P1 found that comparing a bare
+  // search-result id against this raw column directly was never true
+  // on real data. The fake unwraps it the same way the production SQL
+  // now does (::json->>0), so a fixture that hand-wrote a bare id here
+  // could no longer silently agree with buggy production code.
   transferIdentities?: ReadonlyArray<{ identitySha256: string; nativeKey: string }>;
 } = {}) {
   const session = overrides.session ?? fakeSession();
@@ -418,8 +426,13 @@ function fakeRuntime(overrides: {
         // existing at all (every candidate becomes unattributable
         // immediately); undefined (the default) provides a fixed run
         // id, matching the sound-destination default everywhere else
-        // in this file.
-        return overrides.transferRunId === null ? { rows: [] } : { rows: [{ run_id: overrides.transferRunId ?? "run-1" }] };
+        // in this file. Round-4 P2: also returns state, defaulting to
+        // "completed"; overrides.transferRunState models an
+        // in-progress copy whose run exists but is not yet the final
+        // ledger to correlate against.
+        return overrides.transferRunId === null
+          ? { rows: [] }
+          : { rows: [{ run_id: overrides.transferRunId ?? "run-1", state: overrides.transferRunState ?? "completed" }] };
       }
       if (config.text.includes("lcm.transfer_identities")) {
         // Round-4 P1: the search probe's per-candidate identity-to-
@@ -433,7 +446,11 @@ function fakeRuntime(overrides: {
         if (overrides.transferIdentities !== undefined) {
           const identitySha256 = config.values?.[1];
           const match = overrides.transferIdentities.find((entry) => entry.identitySha256 === identitySha256);
-          return { rows: match ? [{ native_key: match.nativeKey }] : [] };
+          // Unwraps the raw locator the same way the production
+          // query's ::json->>0 does, so the fixture's input format
+          // matches what the copy actually writes rather than the
+          // already-unwrapped value production expects.
+          return { rows: match ? [{ native_key: (JSON.parse(match.nativeKey) as string[])[0] }] : [] };
         }
         return { rows: [{ native_key: "1" }] };
       }
@@ -1559,6 +1576,40 @@ describe("verifyMigrationGeneration", () => {
     expect(store.has("generation-1", persistedReportSha256!)).toBe(true);
   }, 15000);
 
+  it("round-4 P3: a persist failure propagates over a release failure that follows it, not the reverse", async () => {
+    // Before this fix, persist and releaseLease shared a plain
+    // try/finally: if persist threw and releaseLease's own finally-
+    // block call also threw, ordinary JS try/finally semantics let the
+    // finally clause's exception silently replace the try block's --
+    // trading a real persist failure for a misattributed release
+    // failure. Both are made to throw here, with distinguishable
+    // messages, so the assertion can tell which one actually
+    // propagated rather than merely that something did.
+    stubDestinationPrimitives();
+    let releaseLeaseCalled = false;
+    vi.spyOn(coordination, "PostgreSqlWorkCoordinator").mockImplementation(function () { return ({
+      acquireLease: vi.fn(async () => ({ fencingToken: 1n } as never)),
+      releaseLease: vi.fn(async () => { releaseLeaseCalled = true; throw new Error("release-failure-canary"); }),
+    } as never); });
+    const persistSpy = vi.spyOn(MigrationVerificationReportStore.prototype, "persist").mockImplementation(
+      () => { throw new Error("persist-failure-canary"); },
+    );
+    const recordCounts = Object.fromEntries(PORTABLE_RECORD_DOMAIN_ORDER.map((domain, index) => [domain, index])) as Partial<Record<PortableDomain, number>>;
+    const copySource = fakeCopySource({ recordCounts });
+    const runtime = fakeRuntime();
+    const dependencies = dependenciesFor(copySource, runtime);
+    try {
+      await expect(verifyMigrationGeneration(baseInput({ homeDir: "/tmp/lcm-verify-persist-fail-masks-release" }), dependencies))
+        .rejects.toThrow("persist-failure-canary");
+    } finally {
+      persistSpy.mockRestore();
+    }
+    // releaseLease still ran (and its own failure was swallowed rather
+    // than silently skipped), proving the lease is not leaked merely
+    // because persist failed first.
+    expect(releaseLeaseCalled).toBe(true);
+  }, 15000);
+
   it("round-4 P1 red case: releaseLease's runtime is still open when the release call itself runs, proven against a runtime that rejects work once closed", async () => {
     // The round-2 fix returned releaseLease unreleased so the caller
     // could defer it past persist, but computeVerificationReport's own
@@ -2204,6 +2255,64 @@ describe("verifyMigrationGeneration: public listing probe", () => {
     expect(result.report.mismatches.some((mismatch) => mismatch.domain === "public-listing")).toBe(true);
   }, 15000);
 
+  it("round-4 candidate-review-4 P1 red case: a healthy copy whose tie-break order disagrees between source and destination is not a mismatch", async () => {
+    // The false positive both reviewers found: "beta" sorts before
+    // "alpha" by identitySha256 (fakeHash("identity-beta") <
+    // fakeHash("identity-alpha")), so expectedOrder is [beta, alpha].
+    // The destination lists same-millisecond ties by its own native
+    // conversation_id, assigned in copy order -- here, alpha was
+    // copied first, so the destination returns [alpha, beta], the
+    // reverse of expectedOrder. Nothing is wrong: both titles are
+    // exactly where the copy put them, just in a different tie order,
+    // because the two sides' tie-breaks are independent keys. A
+    // positional comparison reported this as a public-listing mismatch
+    // for a project that copied correctly; the grouped-multiset
+    // comparison must not.
+    stubDestinationPrimitives();
+    const conversationsRecords = [
+      fakeConversationRecord("2026-01-01T00:00:00.111000Z", "alpha", "Alpha Title"),
+      fakeConversationRecord("2026-01-01T00:00:00.111000Z", "beta", "Beta Title"),
+    ];
+    const recordCounts = Object.fromEntries(PORTABLE_RECORD_DOMAIN_ORDER.map((domain, index) => [domain, index])) as Partial<Record<PortableDomain, number>>;
+    const copySource = fakeCopySource({ recordCounts, conversationsRecords });
+    const runtime = fakeRuntime({
+      conversationsRows: [
+        { conversation_id: "1", session_id: "alpha", title: "Alpha Title", bootstrapped_at: null, created_at: "2026-01-01T00:00:00.111Z", updated_at: "2026-01-01T00:00:00.111Z" },
+        { conversation_id: "2", session_id: "beta", title: "Beta Title", bootstrapped_at: null, created_at: "2026-01-01T00:00:00.111Z", updated_at: "2026-01-01T00:00:00.111Z" },
+      ],
+    });
+    const result = await verifyMigrationGeneration(
+      baseInput({ homeDir: "/tmp/lcm-verify-probe-healthy-tie-order" }),
+      dependenciesFor(copySource, runtime),
+    );
+    expect(result.report.mismatches.some((mismatch) => mismatch.domain === "public-listing")).toBe(false);
+  }, 15000);
+
+  it("round-4 candidate-review-4 P1: a tie group mixing a null title with a real one sorts null first on both sides", async () => {
+    // Exercises compareTieOrderTitle's explicit null placement inside
+    // an actual multi-entry tie group (a single-entry group's sort
+    // never invokes the comparator at all), on both the expected and
+    // actual sides, for a healthy copy that must not be flagged.
+    stubDestinationPrimitives();
+    const conversationsRecords = [
+      fakeConversationRecord("2026-01-01T00:00:00.111000Z", "untitled"),
+      fakeConversationRecord("2026-01-01T00:00:00.111000Z", "titled", "Real Title"),
+    ];
+    const recordCounts = Object.fromEntries(PORTABLE_RECORD_DOMAIN_ORDER.map((domain, index) => [domain, index])) as Partial<Record<PortableDomain, number>>;
+    const copySource = fakeCopySource({ recordCounts, conversationsRecords });
+    const runtime = fakeRuntime({
+      conversationsRows: [
+        { conversation_id: "1", session_id: "titled", title: "Real Title", bootstrapped_at: null, created_at: "2026-01-01T00:00:00.111Z", updated_at: "2026-01-01T00:00:00.111Z" },
+        { conversation_id: "2", session_id: "untitled", title: null, bootstrapped_at: null, created_at: "2026-01-01T00:00:00.111Z", updated_at: "2026-01-01T00:00:00.111Z" },
+      ],
+    });
+    const result = await verifyMigrationGeneration(
+      baseInput({ homeDir: "/tmp/lcm-verify-probe-null-title-tie" }),
+      dependenciesFor(copySource, runtime),
+    );
+    expect(result.report.mismatches.some((mismatch) => mismatch.domain === "public-listing")).toBe(false);
+  }, 15000);
+
   it("round-1 P1 red case: an empty source conversations listing against a non-empty destination records a sample mismatch instead of crashing", async () => {
     // Math.min(0, expectedOrder.length - 1) was Math.min(0, -1) = -1 when
     // the source listing was legitimately empty, and expectedOrder[-1] is
@@ -2366,6 +2475,48 @@ describe("verifyMigrationGeneration: search self-match probe (round-2 P1)", () =
     const result = await verifyMigrationGeneration(baseInput({ homeDir: "/tmp/lcm-verify-search-no-run" }), dependencies);
     expect(result.report.body.publicProbeCoverage).toContainEqual({ probe: "public-search", ran: false });
     expect(result.report.activationEligible).toBe(false);
+  }, 15000);
+
+  it("round-4 P2 red case: a transfer run that exists but is not completed is distinguished from no run at all", async () => {
+    // The three-way-absence standard applied to the reason text, not
+    // only the outcome: an in-progress copy's active run must not be
+    // reported as "no transfer run was found" -- that reason is
+    // reserved for the genuinely absent case (the previous test).
+    stubDestinationPrimitives();
+    const recordCounts = Object.fromEntries(PORTABLE_RECORD_DOMAIN_ORDER.map((domain, index) => [domain, index])) as Partial<Record<PortableDomain, number>>;
+    const copySource = fakeCopySource({ recordCounts });
+    const runtime = fakeRuntime({ transferRunState: "active" });
+    const dependencies = dependenciesFor(copySource, runtime);
+    const result = await verifyMigrationGeneration(baseInput({ homeDir: "/tmp/lcm-verify-search-run-not-completed" }), dependencies);
+    expect(result.report.body.publicProbeCoverage).toContainEqual({ probe: "public-search", ran: false });
+    expect(result.report.activationEligible).toBe(false);
+    expect(result.report.body.publicProbeSha256).not.toBe(
+      (await verifyMigrationGeneration(
+        baseInput({ homeDir: "/tmp/lcm-verify-search-run-not-completed-2" }),
+        dependenciesFor(fakeCopySource({ recordCounts }), fakeRuntime({ transferRunId: null })),
+      )).report.body.publicProbeSha256,
+    );
+  }, 15000);
+
+  it("round-4 P1 red case: a candidate correlates through the copy's real JSON-array locator format, not a bare id", async () => {
+    // The defect that made the probe unusable in production: native_key
+    // is json_build_array(id::text)::text (e.g. '["1"]'), never a bare
+    // "1" -- the copy's own dependency resolver (insertCanonicalRecord's
+    // physical()) reads it back exactly that way. This fixture supplies
+    // the raw locator format on purpose, exercising the same
+    // ::json->>0 unwrap the production query performs, rather than a
+    // pre-unwrapped value that could agree with buggy code by accident.
+    stubDestinationPrimitives();
+    const recordCounts = Object.fromEntries(PORTABLE_RECORD_DOMAIN_ORDER.map((domain, index) => [domain, index])) as Partial<Record<PortableDomain, number>>;
+    const copySource = fakeCopySource({ recordCounts });
+    const candidateIdentitySha256 = fakeHash("message-identity-default");
+    const runtime = fakeRuntime({
+      transferIdentities: [{ identitySha256: candidateIdentitySha256, nativeKey: JSON.stringify(["1"]) }],
+    });
+    const dependencies = dependenciesFor(copySource, runtime);
+    const result = await verifyMigrationGeneration(baseInput({ homeDir: "/tmp/lcm-verify-search-locator-format" }), dependencies);
+    expect(result.report.body.publicProbeCoverage).toContainEqual({ probe: "public-search", ran: true });
+    expect(result.report.activationEligible).toBe(true);
   }, 15000);
 
   it("round-2 P1 red case: a listing mismatch alongside a not-run search probe retains the mismatch and still refuses eligibility", async () => {

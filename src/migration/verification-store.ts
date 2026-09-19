@@ -252,8 +252,9 @@ export class MigrationVerificationReportStore {
     assertReportSha256(reportSha256);
     const directory = reportsDirectory(generationId, this.#homeDir);
     const path = reportPath(generationId, reportSha256, this.#homeDir);
+    let existing: ReturnType<typeof readBoundedRegularFileWithStat>;
     try {
-      readBoundedRegularFileWithStat(path, {
+      existing = readBoundedRegularFileWithStat(path, {
         allowedRoot: directory,
         maxBytes: MAX_REPORT_BYTES,
         expectedUid: this.#expectedUid,
@@ -264,6 +265,17 @@ export class MigrationVerificationReportStore {
     } catch (error) {
       if ((error as NodeJS.ErrnoException).code === "ENOENT") return false;
       storeError("malformed-record", `migration verification report at ${path} cannot be inspected`, { cause: error });
+    }
+    // Round-4 P3: has() previously only checked file existence, never
+    // parsing content the way persist() and read() both do -- the one
+    // of three methods that did not enforce the generation binding.
+    // No production caller exists today, but leaving one method
+    // unbound is exactly the inconsistency a later caller trips over:
+    // a wrong-generation report on the right path would have answered
+    // true. Parse and check body.generationId the same way read() does.
+    const report = parsePersistedContent(existing.content, path);
+    if (report.reportSha256 !== reportSha256 || report.body.generationId !== generationId) {
+      storeError("malformed-record", `migration verification report at ${path} does not match its own filename or generation`);
     }
     return true;
   }
