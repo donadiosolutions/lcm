@@ -1,5 +1,6 @@
 import { homedir } from "node:os";
-import { join } from "node:path";
+import { basename, join } from "node:path";
+import { fsyncSync, lstatSync, readdirSync, unlinkSync } from "node:fs";
 import {
   type BackendPublicationProjectRecord,
   type BackendPublicationRecoveryFile,
@@ -11,9 +12,11 @@ import {
   atomicWritePrivateFileDurable,
   ensurePrivateDirectory,
   isOwnerOnlyFileMode,
+  isPrivateFileCollisionFailure,
   openPrivateDirectory,
   readBoundedRegularFileWithStat,
   type BoundedFileResult,
+  type PrivateDirectoryHandle,
 } from "../security-files.js";
 import { attributeNullableRead } from "./activation-absence.js";
 
@@ -232,14 +235,26 @@ export function activationArtifactPath(homeDir: string | undefined, identityDige
  * creates ~/.lcm itself); the subdirectory itself is created and
  * mode-tightened via security-files.ts's own ensurePrivateDirectory (reused
  * rather than reimplemented) if missing, and then opened and authenticated.
- * A freshly created subdirectory's own durability is not separately forced
- * here: the crash-safety contract this module actually promises (see the
- * module doc comment) is about the recovery-material *file*, and
- * atomicWritePrivateFileDurable already fsyncs that file's immediate
- * parent -- this directory -- on every publish. If the subdirectory-creation
- * entry itself did not survive an earlier crash, the next attempt simply
- * recreates it, which is idempotent and safe.
+ * When this call is the one that actually creates the subdirectory, both
+ * the fresh directory's own descriptor and the parent root's descriptor
+ * are fsynced before returning -- mirroring generation-binding-store.ts's
+ * ensureSyncedPrivateChild -- so the new directory entry durably survives
+ * a crash immediately after this call returns. atomicWritePrivateFileDurable
+ * only fsyncs the file's immediate parent on publish, which is this
+ * directory itself, never this directory's own entry in ~/.lcm: without
+ * the creation-path fsync here, a first write's directories could be lost
+ * to power loss even though the file's contents were durable.
  */
+function pathExists(path: string): boolean {
+  try {
+    lstatSync(path);
+    return true;
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code === "ENOENT") return false;
+    throw error;
+  }
+}
+
 function ensureActivationArtifactDirectory(homeDir: string | undefined, expectedUid: number | undefined): void {
   const root = rootPath(homeDir);
   let rootHandle;
@@ -253,9 +268,17 @@ function ensureActivationArtifactDirectory(homeDir: string | undefined, expected
   }
   const directory = activationArtifactDirectory(homeDir);
   try {
+    const alreadyExisted = pathExists(directory);
     ensurePrivateDirectory(directory);
-    const handle = openPrivateDirectory(directory, { expectedUid });
-    handle.close();
+    const handle: PrivateDirectoryHandle = openPrivateDirectory(directory, { expectedUid });
+    try {
+      if (!alreadyExisted) {
+        fsyncSync(handle.fd);
+        fsyncSync(rootHandle.fd);
+      }
+    } finally {
+      handle.close();
+    }
   } catch (error) {
     throw new ActivationArtifactUnsafeStorageError(
       "activation artifact directory is unsafe: " + (error as Error).message,
@@ -534,13 +557,13 @@ function parseActivationArtifactMaterial(content: string, path: string): Activat
 
 /** A benign, expected collision: something already occupies the exclusive
  * destination this call tried to create. atomicWritePrivateFileDurable
- * signals both the pre-check collision and the concurrent-link race this
- * way (see security-files.ts); neither is a distinct error class there, so
- * this module recognizes them by their exact, stable message text rather
- * than folding every durable-write failure into "go re-read and compare". */
+ * signals both the pre-check collision and the concurrent-link race as a
+ * typed PrivateFileCollisionError (see security-files.ts), so this module
+ * recognizes them by class rather than by message text -- a reworded
+ * message still reconciles, while an unrelated failure carrying similar
+ * text is never mistaken for a benign race. */
 function isBenignCollisionRace(error: unknown): boolean {
-  return error instanceof Error
-    && (error.message === "private file already exists" || error.message === "private file was created concurrently");
+  return isPrivateFileCollisionFailure(error);
 }
 
 export type ActivationArtifactPublishDependencies = Readonly<{
@@ -559,6 +582,199 @@ type ReconcileOutcome =
   | Readonly<{ kind: "absent" }>
   | Readonly<{ kind: "reused" }>;
 
+const MULTIPLE_HARD_LINKS_MESSAGE = "file has multiple hard links";
+
+function isMultipleHardLinksError(error: unknown): boolean {
+  return error instanceof Error && error.message === MULTIPLE_HARD_LINKS_MESSAGE;
+}
+
+/** Match atomicWritePrivateFileDurable's own scratch-naming convention (see
+ * security-files.ts): a leading dot, the final basename, a dot, one or more
+ * lowercase hex characters (the writer's random suffix -- its exact byte
+ * count is deliberately not pinned here, so a future change to that byte
+ * count cannot silently stop this module's own crash-twin recovery from
+ * recognising it), and a ".tmp" extension. The structural shape is matched
+ * by name; full authentication is by content and metadata identity
+ * (exactWriterLinkPair below), never by name alone, so an unrelated file
+ * that happens to fit this shape still cannot be mistaken for a genuine
+ * scratch twin. */
+function isWriterScratchName(entry: string, finalFileName: string): boolean {
+  const prefix = "." + finalFileName + ".";
+  const suffix = ".tmp";
+  if (!entry.startsWith(prefix) || !entry.endsWith(suffix)) return false;
+  const middle = entry.slice(prefix.length, entry.length - suffix.length);
+  return middle.length > 0
+    && [...middle].every((character) => (character >= "0" && character <= "9") || (character >= "a" && character <= "f"));
+}
+
+/**
+ * A local duplicate of generation-binding-store.ts's exactWriterLinkPair:
+ * two reads of the SAME published inode -- the final published name and
+ * its not-yet-unlinked writer scratch twin -- agree on every field a
+ * legitimate atomicWritePrivateFileDurable crash between linkSync and the
+ * scratch unlink can produce. Full content and metadata equality, not just
+ * nlink, is what tells an authentic post-link crash twin apart from an
+ * unrelated multi-link collision.
+ */
+function exactWriterLinkPair(left: BoundedFileResult, right: BoundedFileResult): boolean {
+  return left.nlink === "2"
+    && right.nlink === "2"
+    && left.exactDev === right.exactDev
+    && left.exactIno === right.exactIno
+    && left.parentDev === right.parentDev
+    && left.parentIno === right.parentIno
+    && left.mode === right.mode
+    && left.uid === right.uid
+    && left.gid === right.gid
+    && left.mtimeMs === right.mtimeMs
+    && left.content === right.content;
+}
+
+/**
+ * Read the published file's current link count after the interrupted
+ * scratch unlink is completed (or already complete). Returns undefined when
+ * the published file itself is already gone, so the caller treats the key
+ * as genuinely absent rather than guessing. Any other lookup failure
+ * propagates raw.
+ */
+function publishedLinkCount(publishedPath: string): bigint | undefined {
+  try {
+    return lstatSync(publishedPath, { bigint: true }).nlink;
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code === "ENOENT") return undefined;
+    throw error;
+  }
+}
+
+/**
+ * Remove the authenticated scratch twin, re-verifying its identity
+ * immediately before removal rather than trusting the earlier read, and
+ * then report the published file's own link count so the caller can assert
+ * the single-link invariant this recovery claims. The twin already being
+ * gone (ENOENT) is not an error: another retry may have completed the
+ * unlink first. Any other failure propagates raw rather than being
+ * swallowed.
+ */
+function completeInterruptedScratchUnlink(
+  scratchPath: string,
+  publishedPath: string,
+  publishedIdentity: BoundedFileResult,
+): bigint | undefined {
+  let current;
+  try {
+    current = lstatSync(scratchPath, { bigint: true });
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code === "ENOENT") return publishedLinkCount(publishedPath);
+    throw error;
+  }
+  if (
+    !current.isFile()
+    || current.dev.toString(10) !== publishedIdentity.exactDev
+    || current.ino.toString(10) !== publishedIdentity.exactIno
+  ) {
+    return publishedLinkCount(publishedPath);
+  }
+  try {
+    unlinkSync(scratchPath);
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code === "ENOENT") return publishedLinkCount(publishedPath);
+    throw error;
+  }
+  return publishedLinkCount(publishedPath);
+}
+
+/**
+ * Authenticate and, if found, complete an interrupted durable-write crash
+ * twin: atomicWritePrivateFileDurable's requireAbsent path publishes by
+ * linking the writer's scratch file onto the final name and only afterward
+ * unlinks the scratch, so a crash between those two syscalls leaves the
+ * published name and its scratch twin as two links to one inode. A twin is
+ * accepted only when a scratch file matching the writer's exact naming
+ * convention in the same directory is byte-and-metadata identical to the
+ * published name via exactWriterLinkPair. On a match, the interrupted
+ * unlink is completed and the published file is asserted single-link again
+ * before reconciliation proceeds against the published content exactly as
+ * it would for any ordinary existing file: byte-identical content is an
+ * idempotent reuse, different content is an identity mismatch, never a
+ * silent overwrite. A post-unlink count other than exactly 1, or a twin
+ * search that cannot authenticate exactly one twin, refuses as
+ * ActivationArtifactPresenceUnresolvableError: a multi-link state this
+ * module could not resolve is not evidence of a conflict, because no
+ * comparison against a trustworthy read ever ran. A published file that
+ * vanished entirely in that same window is reported as absent instead.
+ */
+function reconcileArtifactScratchTwin(
+  path: string,
+  directory: string,
+  serialized: string,
+  identityDigest: string,
+  expectedUid: number | undefined,
+  readWithStat: typeof readBoundedRegularFileWithStat,
+): ReconcileOutcome {
+  const unresolvable = (): never => {
+    throw new ActivationArtifactPresenceUnresolvableError(
+      "a multi-link activation artifact at " + path +
+        " could not be authenticated as an interrupted durable-write scratch twin",
+    );
+  };
+  const readTwinAt = (candidatePath: string) =>
+    attributeNullableRead<BoundedFileResult>(
+      () => readWithStat(candidatePath, {
+        allowedRoot: directory,
+        maxBytes: MAX_ACTIVATION_ARTIFACT_BYTES,
+        expectedUid,
+        allowedModes: [PRIVATE_FILE_MODE],
+      }),
+    );
+
+  const finalOutcome = readTwinAt(path);
+  if (finalOutcome.kind !== "present" || finalOutcome.value.nlink !== "2") {
+    return unresolvable();
+  }
+
+  const finalFileName = basename(path);
+  let entries: readonly string[];
+  try {
+    entries = readdirSync(directory);
+  } catch {
+    return unresolvable();
+  }
+
+  let twinPath: string | undefined;
+  for (const entry of entries) {
+    if (!isWriterScratchName(entry, finalFileName)) continue;
+    // A scan candidate is a directory entry this module did not create and
+    // cannot vouch for, so its error surface is open-ended: any read of a
+    // scan candidate that does not produce a trusted present-or-absent
+    // outcome -- recognised or not -- is fail-closed here rather than left
+    // to escape raw.
+    let candidateOutcome: ReturnType<typeof readTwinAt>;
+    try {
+      candidateOutcome = readTwinAt(join(directory, entry));
+    } catch {
+      return unresolvable();
+    }
+    if (candidateOutcome.kind === "unresolvable") return unresolvable();
+    if (candidateOutcome.kind === "absent") continue;
+    if (!exactWriterLinkPair(finalOutcome.value, candidateOutcome.value)) continue;
+    if (twinPath !== undefined) return unresolvable();
+    twinPath = join(directory, entry);
+  }
+  if (twinPath === undefined) return unresolvable();
+
+  const publishedNlink = completeInterruptedScratchUnlink(twinPath, path, finalOutcome.value);
+  if (publishedNlink === undefined) return { kind: "absent" };
+  if (publishedNlink !== 1n) return unresolvable();
+
+  if (finalOutcome.value.content === serialized) {
+    return { kind: "reused" };
+  }
+  throw new ActivationArtifactIdentityMismatchError(
+    "an activation artifact already exists at " + path + " for identity digest " + identityDigest +
+      " with different content; refusing to overwrite durable recovery material",
+  );
+}
+
 function reconcileExisting(
   path: string,
   directory: string,
@@ -567,15 +783,23 @@ function reconcileExisting(
   expectedUid: number | undefined,
   readWithStat: typeof readBoundedRegularFileWithStat,
 ): ReconcileOutcome {
-  const outcome = attributeNullableRead<BoundedFileResult>(
-    () => readWithStat(path, {
-      allowedRoot: directory,
-      maxBytes: MAX_ACTIVATION_ARTIFACT_BYTES,
-      expectedUid,
-      allowedModes: [PRIVATE_FILE_MODE],
-      requireSingleLink: true,
-    }),
-  );
+  let outcome;
+  try {
+    outcome = attributeNullableRead<BoundedFileResult>(
+      () => readWithStat(path, {
+        allowedRoot: directory,
+        maxBytes: MAX_ACTIVATION_ARTIFACT_BYTES,
+        expectedUid,
+        allowedModes: [PRIVATE_FILE_MODE],
+        requireSingleLink: true,
+      }),
+    );
+  } catch (error) {
+    if (isMultipleHardLinksError(error)) {
+      return reconcileArtifactScratchTwin(path, directory, serialized, identityDigest, expectedUid, readWithStat);
+    }
+    throw error;
+  }
   if (outcome.kind === "unresolvable") {
     throw new ActivationArtifactPresenceUnresolvableError(
       "cannot determine whether an activation artifact already exists at " + path + ": " + outcome.detail,
@@ -654,12 +878,16 @@ export type ActivationArtifactReadDependencies = Readonly<{
 }>;
 
 /**
- * Read back a previously published recovery-material record by its identity
- * digest. Returns null only for an attributed absence (a genuinely missing
- * file); a permission-denied or otherwise unresolvable read throws rather
- * than being reported as "nothing here yet".
- */
-export function readActivationArtifact(
+  * Read back a previously published recovery-material record by its identity
+  * digest. Returns null only for an attributed absence (a genuinely missing
+  * file); a permission-denied or otherwise unresolvable read throws rather
+  * than being reported as "nothing here yet". A multi-link stored file --
+  * the post-link crash state publishActivationArtifact's own retry
+  * converges out of -- is reported as unresolvable here, never silently
+  * repaired: reads never mutate, so converging that state is the writer
+  * retry's job, not this reader's.
+  */
+ export function readActivationArtifact(
   input: Readonly<{ homeDir?: string; identityDigest: string }>,
   dependencies: ActivationArtifactReadDependencies = {},
 ): ActivationArtifactRecoveryMaterial | null {
@@ -671,15 +899,26 @@ export function readActivationArtifact(
   const expectedUid = dependencies.expectedUid ?? currentUid();
   const readWithStat = dependencies.readWithStat ?? readBoundedRegularFileWithStat;
 
-  const outcome = attributeNullableRead<BoundedFileResult>(
-    () => readWithStat(path, {
-      allowedRoot: directory,
-      maxBytes: MAX_ACTIVATION_ARTIFACT_BYTES,
-      expectedUid,
-      allowedModes: [PRIVATE_FILE_MODE],
-      requireSingleLink: true,
-    }),
-  );
+  let outcome;
+  try {
+    outcome = attributeNullableRead<BoundedFileResult>(
+      () => readWithStat(path, {
+        allowedRoot: directory,
+        maxBytes: MAX_ACTIVATION_ARTIFACT_BYTES,
+        expectedUid,
+        allowedModes: [PRIVATE_FILE_MODE],
+        requireSingleLink: true,
+      }),
+    );
+  } catch (error) {
+    if (isMultipleHardLinksError(error)) {
+      throw new ActivationArtifactPresenceUnresolvableError(
+        "activation artifact at " + path +
+          " has multiple hard links and cannot be authenticated by a read; retry publication to converge the interrupted durable write",
+      );
+    }
+    throw error;
+  }
   if (outcome.kind === "unresolvable") {
     throw new ActivationArtifactPresenceUnresolvableError(
       "cannot determine whether an activation artifact exists at " + path + ": " + outcome.detail,
@@ -745,5 +984,3 @@ export function captureActivationRecoveryFile(
     parentIno: observed.parentIno,
   };
 }
-
-

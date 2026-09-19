@@ -4114,3 +4114,41 @@ describe("private filesystem primitives", () => {
   });
 
 });
+
+describe("atomicWritePrivateFileDurable: exclusive-creation collisions are typed (#1434)", () => {
+  it("surfaces the pre-check collision as PrivateFileCollisionError through the real write path", () => {
+    const root = makeRoot();
+    const path = join(root, "occupied");
+    writeFileSync(path, "existing", { mode: 0o600 });
+    let observed: unknown;
+    try {
+      atomicWritePrivateFileDurable(path, "candidate", { requireAbsent: true });
+    } catch (error) {
+      observed = error;
+    }
+    expect(observed).toBeInstanceOf(PrivateFileCollisionError);
+    expect((observed as Error).message).toBe("private file already exists");
+    expect(readFileSync(path, "utf8")).toBe("existing");
+  });
+
+  it("surfaces the link race as PrivateFileCollisionError when a winner lands between the pre-check and" +
+    " the link, through the real link syscall rather than an injected throw", () => {
+    const root = makeRoot();
+    const race = join(root, "race");
+    let observed: unknown;
+    try {
+      atomicWritePrivateFileDurable(race, "content", {
+        requireAbsent: true,
+        random: () => {
+          writeFileSync(race, "winner", { mode: 0o600 });
+          return Buffer.alloc(12, 0x11);
+        },
+      });
+    } catch (error) {
+      observed = error;
+    }
+    expect(observed).toBeInstanceOf(PrivateFileCollisionError);
+    expect((observed as Error).message).toBe("private file was created concurrently");
+    expect(readFileSync(race, "utf8")).toBe("winner");
+  });
+});

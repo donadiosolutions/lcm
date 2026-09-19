@@ -32,6 +32,8 @@ import {
 } from "../../src/migration/generation-binding-store.js";
 import {
   BoundedFileIdentityChangedError,
+  PrivateFileCollisionCleanupError,
+  PrivateFileCollisionError,
   type BoundedFileOptions,
   type BoundedFileResult,
   readBoundedRegularFileWithStat,
@@ -359,7 +361,7 @@ describe("recordMigrationSelectionBinding: durable write and idempotency", () =>
             writeDurable: (targetPath, content) => {
               calls += 1;
               writeFileSync(targetPath, content, { mode: 0o600 });
-              throw new Error("private file was created concurrently");
+              throw new PrivateFileCollisionError("private file was created concurrently");
             },
           },
         ),
@@ -376,7 +378,7 @@ describe("recordMigrationSelectionBinding: durable write and idempotency", () =>
           {
             writeDurable: (targetPath, content) => {
               writeFileSync(targetPath, content, { mode: 0o600 });
-              throw new Error("private file already exists");
+              throw new PrivateFileCollisionError("private file already exists");
             },
           },
         ),
@@ -388,7 +390,7 @@ describe("recordMigrationSelectionBinding: durable write and idempotency", () =>
       expect(() =>
         recordMigrationSelectionBinding(
           { homeDir, generationId: GENERATION_ID, binding: selectionBinding() },
-          { writeDurable: () => { throw new Error("private file already exists"); } },
+          { writeDurable: () => { throw new PrivateFileCollisionError("private file already exists"); } },
         ),
       ).toThrow("private file already exists");
     });
@@ -906,9 +908,9 @@ describe("recordMigrationWitnessBinding: durable write, per-witness keying and f
         recordMigrationWitnessBinding(
           { homeDir, generationId: GENERATION_ID, binding },
           {
-            writeDurable: (targetPath, content) => {
+          writeDurable: (targetPath, content) => {
               writeFileSync(targetPath, content, { mode: 0o600 });
-              throw new Error("private file was created concurrently");
+              throw new PrivateFileCollisionError("private file was created concurrently");
             },
           },
         ),
@@ -920,7 +922,7 @@ describe("recordMigrationWitnessBinding: durable write, per-witness keying and f
       expect(() =>
         recordMigrationWitnessBinding(
           { homeDir, generationId: GENERATION_ID, binding: witnessBinding() },
-          { writeDurable: () => { throw new Error("private file already exists"); } },
+          { writeDurable: () => { throw new PrivateFileCollisionError("private file already exists"); } },
         ),
       ).toThrow("private file already exists");
     });
@@ -1419,7 +1421,10 @@ describe("completeInterruptedScratchUnlink / reconcileWriterScratchTwin: interna
   });
 
   it("completeInterruptedScratchUnlink: leaves a same-named, different-identity file alone rather than removing" +
-    " it, when a real lstat right before removal disagrees with the earlier authenticated read", () => {
+    " it, when a real lstat right before removal disagrees with the earlier authenticated read -- and refuses" +
+    " as unresolvable rather than reporting a reuse, because the twin was deliberately left unlinked and the" +
+    " published file is still multi-link: the post-unlink single-link assertion (#1444) must not be" +
+    " satisfiable by a cleanup this call refused to perform", () => {
     const homeDir = home();
     const binding = selectionBinding();
     const cleanBytes = captureCleanSelectionBytes(binding);
@@ -1434,10 +1439,11 @@ describe("completeInterruptedScratchUnlink / reconcileWriterScratchTwin: interna
       }) as never, () =>
         recordMigrationSelectionBinding({ homeDir, generationId: GENERATION_ID, binding }),
       ),
-    ).not.toThrow();
+    ).toThrow(MigrationBindingUnresolvableError);
     expect(existsSync(scratchPath)).toBe(true);
     expect(existsSync(decoyPath)).toBe(true);
     expect(readFileSync(finalPath, "utf8")).toBe(cleanBytes);
+    expect(statSync(finalPath).nlink).toBe(2);
   });
 
   it("completeInterruptedScratchUnlink: swallows an ENOENT raised by the unlink call itself, not only by the" +
@@ -1764,5 +1770,128 @@ describe("pathExists (via ensureSyncedPrivateChild): internal branch coverage", 
     });
     expect(caught).toBeInstanceOf(MigrationBindingUnsafeStorageError);
     expect((caught as MigrationBindingUnsafeStorageError & { cause?: unknown }).cause).toBe(boom);
+  });
+});
+
+describe("completeInterruptedScratchUnlink: post-unlink single-link assertion (#1444)", () => {
+  it("is unresolvable, never reused, when a third hard link appears between twin authentication and the" +
+    " unlink -- the published bytes are content-correct throughout, so this is a detection gap made" +
+    " fail-closed rather than a corruption being repaired", () => {
+    const homeDir = home();
+    const binding = selectionBinding();
+    const cleanBytes = captureCleanSelectionBytes(binding);
+    const { finalPath, scratchPath } = buildCrashTwin(homeDir, GENERATION_ID, "selection-activation.binding", cleanBytes);
+    const directory = migrationGenerationBindingDirectory(homeDir, GENERATION_ID);
+    const thirdPath = join(directory, "foreign-third-link");
+    const realUnlinkSync = (createRequire(import.meta.url)("node:fs") as { unlinkSync: (p: string) => void }).unlinkSync;
+    expect(() =>
+      withPatchedFs("unlinkSync", ((path: string) => {
+        if (path === scratchPath) {
+          linkSync(finalPath, thirdPath);
+        }
+        return realUnlinkSync(path);
+      }) as never, () =>
+        recordMigrationSelectionBinding({ homeDir, generationId: GENERATION_ID, binding }),
+      ),
+    ).toThrow(MigrationBindingUnresolvableError);
+    expect(readFileSync(finalPath, "utf8")).toBe(cleanBytes);
+    expect(existsSync(finalPath)).toBe(true);
+    expect(statSync(finalPath).nlink).toBe(2);
+  });
+
+  it("treats a published file that vanishes between twin authentication and the post-unlink assertion as" +
+    " absent and writes fresh, rather than reporting a reuse of a file that no longer exists", () => {
+    const homeDir = home();
+    const binding = selectionBinding();
+    const cleanBytes = captureCleanSelectionBytes(binding);
+    const { finalPath, scratchPath } = buildCrashTwin(homeDir, GENERATION_ID, "selection-activation.binding", cleanBytes);
+    recordMigrationSelectionBinding(
+      { homeDir, generationId: GENERATION_ID, binding },
+      {
+        readWithStat: (path: string, options: BoundedFileOptions) => {
+          const result = readBoundedRegularFileWithStat(path, options);
+          if (path === scratchPath && options.requireSingleLink !== true) {
+            rmSync(finalPath, { force: true });
+            rmSync(scratchPath, { force: true });
+          }
+          return result;
+        },
+      },
+    );
+    expect(readFileSync(finalPath, "utf8")).toBe(cleanBytes);
+    expect(statSync(finalPath).nlink).toBe(1);
+  });
+});
+
+describe("recordMigrationSelectionBinding: typed durable-write collision recognition (#1434)", () => {
+  it("reconciles as reused when the write primitive raises a typed collision with unrelated message text", () => {
+    const homeDir = home();
+    const binding = selectionBinding();
+    expect(() =>
+      recordMigrationSelectionBinding(
+        { homeDir, generationId: GENERATION_ID, binding },
+        {
+          writeDurable: (targetPath, content) => {
+            writeFileSync(targetPath, content, { mode: 0o600 });
+            throw new PrivateFileCollisionError("driver-specific wording that must never be matched");
+          },
+        },
+      ),
+    ).not.toThrow();
+  });
+
+  it("reconciles as reused for a typed collision cleanup whose primary failure is a collision", () => {
+    const homeDir = home();
+    const binding = selectionBinding();
+    expect(() =>
+      recordMigrationSelectionBinding(
+        { homeDir, generationId: GENERATION_ID, binding },
+        {
+          writeDurable: (targetPath, content) => {
+            writeFileSync(targetPath, content, { mode: 0o600 });
+            throw new PrivateFileCollisionCleanupError("wrapped typed collision", {
+              cause: new PrivateFileCollisionError("driver-specific primary wording"),
+            });
+          },
+        },
+      ),
+    ).not.toThrow();
+  });
+
+  it("propagates a same-message bare Error rather than treating its text as a collision", () => {
+    const homeDir = home();
+    const binding = selectionBinding();
+    const boom = new Error("private file was created concurrently");
+    expect(() =>
+      recordMigrationSelectionBinding(
+        { homeDir, generationId: GENERATION_ID, binding },
+        {
+          writeDurable: (targetPath, content) => {
+            writeFileSync(targetPath, content, { mode: 0o600 });
+            throw boom;
+          },
+        },
+      ),
+    ).toThrow(boom);
+  });
+});
+
+describe("publishedLinkCount: internal branch coverage (#1444)", () => {
+  it("propagates a genuine, non-ENOENT published-link-count lookup failure unchanged rather than" +
+    " swallowing it into either the absent or the unresolvable bucket", () => {
+    const homeDir = home();
+    const binding = selectionBinding();
+    const cleanBytes = captureCleanSelectionBytes(binding);
+    const { finalPath } = buildCrashTwin(homeDir, GENERATION_ID, "selection-activation.binding", cleanBytes);
+    const boom = Object.assign(new Error("permission denied for testing"), { code: "EACCES" });
+    const realLstatSync = (createRequire(import.meta.url)("node:fs") as { lstatSync: (p: string, o?: unknown) => unknown }).lstatSync;
+    expect(() =>
+      withPatchedFs("lstatSync", ((path: string, options?: unknown) => {
+        if (path === finalPath) throw boom;
+        return realLstatSync(path, options);
+      }) as never, () =>
+        recordMigrationSelectionBinding({ homeDir, generationId: GENERATION_ID, binding }),
+      ),
+    ).toThrow(boom);
   });
 });

@@ -99,6 +99,20 @@ export class PrivateFileCollisionCleanupError extends PrivateDirectoryTopologyEr
   }
 }
 
+/**
+ * Recognize a create-if-absent publication collision by type rather than by
+ * message text, so recognition cannot break silently when a message is
+ * reworded. Both the plain collision and the collision-with-cleanup-failure
+ * variant count: the latter carries the collision as its primary failure
+ * (its message is the primary's message verbatim), and the migration stores
+ * that reconcile a collision by re-reading treat both the same way, exactly
+ * as the message-text matching they replace already did.
+ */
+export function isPrivateFileCollisionFailure(error: unknown): boolean {
+  return error instanceof PrivateFileCollisionError
+    || error instanceof PrivateFileCollisionCleanupError;
+}
+
 /** A retained bounded-file descriptor no longer matches its pathname witness. */
 export type BoundedFileParentIdentity = Readonly<{
   mode: number;
@@ -1872,7 +1886,7 @@ export function atomicWritePrivateFileDurable(
       }
     })();
     if (options.requireAbsent && current) {
-      throw new Error("private file already exists");
+      throw new PrivateFileCollisionError("private file already exists");
     }
 
     temporaryPath = join(
@@ -1909,7 +1923,7 @@ export function atomicWritePrivateFileDurable(
         linkSync(temporaryPath, path);
       } catch (error) {
         if (errorCode(error) === "EEXIST") {
-          throw new Error("private file was created concurrently");
+          throw new PrivateFileCollisionError("private file was created concurrently");
         }
         throw error;
       }
