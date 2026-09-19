@@ -487,7 +487,7 @@ validate_required_snapshot() {
     if [[ "$admission_pending" == true ]]; then
       exit_pending \
         "Waiting for independent trusted evidence" \
-        "$phase sensitive change awaits exact-head Copilot evidence; admission remains pending."
+        "$phase sensitive change awaits independent trusted evidence; admission remains pending."
     fi
     echo "$phase sensitive evidence was denied: $admission_terminal_failure" >&2
     exit_failure \

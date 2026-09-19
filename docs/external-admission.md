@@ -50,15 +50,23 @@ The sensitive set is closed: `.github/actions/**`, `.github/codeql/**`,
 `scripts/**`, `src/**`, `test/setup/**`, `.agents/skills/tests/**`,
 `.agents/skills/*/scripts/**`, `package.json`, `pnpm-lock.yaml`, `.npmrc`,
 `pnpm-workspace.yaml`, `.pnpmfile.cjs`, `install.sh`, `vitest*.config.*`,
-`tsconfig*.json`, and `codecov.yml`.
+`tsconfig*.json`, `codecov.yml`, and the exact PostgreSQL harness scripts
+`test/postgresql/template-init.sh`, `test/postgresql/cached-run-init.sh`, and
+`test/postgresql/init.sh`.
 Renames classify both the old and new path. Ordinary test bodies are candidate
 assertions, not trusted harness definitions, and deliberately remain outside
 this set; the configuration and setup code that discovers and initializes them
-is included.
+is included. The three PostgreSQL scripts above are trusted setup code mounted
+into `/docker-entrypoint-initdb.d/` and executed by required PostgreSQL CI.
 
 Any change to the CI workflow, package commands, Vitest or TypeScript
 configuration, or transitively executed support must update this set, its
 focused tests, and this documentation in the same pull request.
+
+`eslint.config.js` is currently outside the closed set because protected CI
+does not execute ESLint. Any workflow or package change that begins to execute
+ESLint must update the classifier, its focused tests, and this documentation in
+the same pull request.
 
 ## Sensitive pull requests
 

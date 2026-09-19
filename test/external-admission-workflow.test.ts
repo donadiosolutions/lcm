@@ -453,7 +453,10 @@ type AdmissionScenario =
   | "sensitive-dependabot"
   | "spoofed-review-valid-dependabot"
   | "denied-dependabot-valid-review"
-  | "sensitive-file-drift";
+  | "sensitive-file-drift"
+  | "sensitive-postgresql-template-init"
+  | "sensitive-postgresql-cached-run-init"
+  | "sensitive-postgresql-init";
 
 type AdmissionEligibilityVariant =
   | "unsupported-base"
@@ -670,6 +673,24 @@ function runAdmissionScenario(
         [[{ filename: "src/second.ts", status: "modified" }]],
         [[{ filename: "src/second.ts", status: "modified" }]],
       ];
+      break;
+    case "sensitive-postgresql-template-init":
+      pullRequestFiles = [[{
+        filename: "test/postgresql/template-init.sh",
+        status: "modified",
+      }]];
+      break;
+    case "sensitive-postgresql-cached-run-init":
+      pullRequestFiles = [[{
+        filename: "test/postgresql/cached-run-init.sh",
+        status: "modified",
+      }]];
+      break;
+    case "sensitive-postgresql-init":
+      pullRequestFiles = [[{
+        filename: "test/postgresql/init.sh",
+        status: "modified",
+      }]];
       break;
   }
 
@@ -938,6 +959,20 @@ describe("external admission workflow", () => {
     expect(result.status).toBe(0);
     expect(statuses.at(-1)?.split("\t", 1)[0]).toBe("pending");
     expect(statuses.at(-1)).toContain("independent trusted evidence");
+    expect(result.stdout).toContain("awaits independent trusted evidence");
+    expect(result.stdout).not.toContain("awaits exact-head Copilot evidence");
+  });
+
+  it.each([
+    "sensitive-postgresql-template-init",
+    "sensitive-postgresql-cached-run-init",
+    "sensitive-postgresql-init",
+  ] as const)("classifies %s as sensitive in the trusted reducer", (scenario) => {
+    const { result, statuses } = runAdmissionScenario(scenario);
+    expect(result.status, `${scenario}\n${result.stdout}\n${result.stderr}`).toBe(0);
+    expect(statuses.at(-1)?.split("\t", 1)[0]).toBe("pending");
+    expect(statuses.at(-1)).toContain("independent trusted evidence");
+    expect(statuses.some((status) => status.startsWith("success\t"))).toBe(false);
   });
 
   it("admits sensitive changes with exact Copilot dynamic provenance", () => {
@@ -1347,5 +1382,7 @@ describe("external admission workflow", () => {
     expect(documentation).toMatch(/no user-configurable options/iu);
     expect(documentation).toMatch(/freshness lower bound/iu);
     expect(documentation).toMatch(/transient.*branch.*pending/isu);
+    expect(documentation).toMatch(/eslint\.config\.js.*outside.*closed set/isu);
+    expect(documentation).toMatch(/execute.*ESLint.*classifier.*tests.*documentation.*same/isu);
   });
 });

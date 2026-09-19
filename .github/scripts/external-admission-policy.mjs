@@ -52,6 +52,7 @@ const SENSITIVE_PATHS = [
   /^\.github\/(?:actions|codeql|scripts|workflows)\//u,
   /^(?:bin|installer|scripts|src)\//u,
   /^test\/setup\//u,
+  /^test\/postgresql\/(?:template-init\.sh|cached-run-init\.sh|init\.sh)$/u,
   /^\.agents\/skills\/tests\//u,
   /^\.agents\/skills\/[^/]+\/scripts\//u,
   /^(?:package\.json|pnpm-lock\.yaml|\.npmrc|pnpm-workspace\.yaml|codecov\.yml|install\.sh|\.pnpmfile\.cjs)$/u,
