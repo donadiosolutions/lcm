@@ -385,6 +385,7 @@ export type BackendPublicationLockToken = object;
 
 const activePublicationLockTokens = new WeakMap<BackendPublicationLockToken, {
   readonly rootPath: string;
+  readonly origin: "sync" | "async";
   active: boolean;
 }>();
 /**
@@ -1702,9 +1703,12 @@ function contextualAppendLockToken(
   return inherited.token;
 }
 
-function newLockToken(homeDir: string | undefined): BackendPublicationLockToken {
+function newLockToken(
+  homeDir: string | undefined,
+  origin: "sync" | "async",
+): BackendPublicationLockToken {
   const token = {};
-  activePublicationLockTokens.set(token, { rootPath: rootPath(homeDir), active: true });
+  activePublicationLockTokens.set(token, { rootPath: rootPath(homeDir), origin, active: true });
   return token;
 }
 
@@ -1897,7 +1901,7 @@ function consumerLockCallback<T>(
   };
   const run = (): T => {
     refreshDirectories();
-    const token = newLockToken(homeDir);
+    const token = newLockToken(homeDir, "sync");
     if (rootHandle !== undefined) checkRetainedConsumerDirectories(homeDir, rootHandle, publicationHandle);
     if (!options.allowUnresolved) assertBackendPublicationConsumerAccessUnlocked({ homeDir });
     try {
@@ -1961,7 +1965,7 @@ export async function withBackendPublicationConsumerLockAsync<T>(
   };
   const run = async (): Promise<T> => {
     refreshDirectories();
-    const token = newLockToken(homeDir);
+    const token = newLockToken(homeDir, "async");
     if (rootHandle !== undefined) checkRetainedConsumerDirectories(homeDir, rootHandle, publicationHandle);
     if (!options.allowUnresolved) assertBackendPublicationConsumerAccessUnlocked({ homeDir });
     try {
@@ -3905,6 +3909,12 @@ export class BackendPublicationCoordinator {
     };
     if (lockToken !== undefined) {
       assertLockToken(lockToken, this.#homeDir);
+      if (activePublicationLockTokens.get(lockToken)!.origin === "sync") {
+        return fail(
+          "permit-mismatch",
+          "synchronous-origin publication lock token cannot authorize an asynchronous coordinator seam because the synchronous wrapper releases the lock when its callback returns",
+        );
+      }
       return operation();
     }
     return withBackendPublicationLockAsync(this.#homeDir, operation);
