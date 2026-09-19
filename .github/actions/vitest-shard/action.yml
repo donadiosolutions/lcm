@@ -1,0 +1,48 @@
+name: Run a Vitest shard
+description: Execute one planned test shard with the blob reporter, publish its blob, and verify the workspace stayed clean.
+
+inputs:
+  name:
+    description: Shard name from scripts/ci-test-shards.mjs.
+    required: true
+  projects:
+    description: JSON array of Vitest project names to run.
+    required: true
+  files:
+    description: JSON array of repository-relative test files to run.
+    required: true
+  coverage:
+    description: Collect coverage into the blob ("true" or "false"). Thresholds are enforced by the report job only.
+    required: true
+  artifact-root:
+    description: Fresh absolute directory for Vitest cache, blob, and coverage output.
+    required: true
+
+runs:
+  using: composite
+  steps:
+    - name: Run shard
+      shell: bash
+      env:
+        LCM_CI_SHARD_NAME: ${{ inputs.name }}
+        LCM_CI_SHARD_PROJECTS: ${{ inputs.projects }}
+        LCM_CI_SHARD_FILES: ${{ inputs.files }}
+        LCM_CI_SHARD_COVERAGE: ${{ inputs.coverage }}
+        LCM_TEST_ARTIFACT_ROOT: ${{ inputs.artifact-root }}
+      run: node scripts/ci-vitest.mjs shard
+
+    - name: Upload shard blob
+      if: ${{ !cancelled() }}
+      uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+      with:
+        name: vitest-blob-${{ inputs.name }}
+        path: ${{ inputs.artifact-root }}/blobs/
+        if-no-files-found: error
+        retention-days: 1
+        # Re-running failed jobs must be able to replace the blob of a shard
+        # that uploaded before a later step failed.
+        overwrite: true
+
+    - name: Check for workspace artifacts
+      shell: bash
+      run: bash .github/scripts/check-workspace-clean.sh

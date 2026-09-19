@@ -7,6 +7,7 @@ import { describe, expect, it } from "vitest";
 
 interface WorkflowStep {
   name?: string;
+  id?: string;
   run?: string;
   uses?: string;
   if?: string;
@@ -14,53 +15,34 @@ interface WorkflowStep {
   with?: Record<string, unknown>;
 }
 
-interface IntegrationJob {
+interface WorkflowJob {
   name: string;
-  needs: string;
+  needs?: string | string[];
   "runs-on": string;
   "timeout-minutes"?: number;
   if?: string;
   "continue-on-error"?: boolean;
-  steps: WorkflowStep[];
-}
-
-interface CodecovJob {
-  needs: string;
-  if: string;
-  permissions: Record<string, string>;
+  outputs?: Record<string, string>;
+  permissions?: Record<string, string>;
+  strategy?: {
+    "fail-fast"?: boolean;
+    matrix: unknown;
+  };
   steps: WorkflowStep[];
 }
 
 interface CiWorkflow {
-  jobs: {
-    environment: {
-      name: string;
-      "runs-on": string;
-      steps: WorkflowStep[];
-    };
-    core: {
-      name: string;
-      needs: string;
-      "runs-on": string;
-      env?: Record<string, string>;
-      steps: WorkflowStep[];
-    };
-    postgresql: {
-      needs: string;
-      "runs-on": string;
-      strategy: { matrix: { run: number[] } };
-    };
-    "linux-systemd": IntegrationJob;
-    "macos-launchd": IntegrationJob;
-    ci: {
-      name: string;
-      needs: string[];
-      if: string;
-      steps: WorkflowStep[];
-    };
-    codecov: CodecovJob;
-    "codecov-fork": CodecovJob;
+  on: {
+    push: { branches: string[] };
+    pull_request: null;
+    merge_group: { types: string[] };
   };
+  permissions: Record<string, string>;
+  concurrency: {
+    group: string;
+    "cancel-in-progress": boolean;
+  };
+  jobs: Record<string, WorkflowJob>;
 }
 
 interface CodeqlWorkflow {
@@ -95,11 +77,33 @@ const launchdIntegrationSource = readFileSync(
   new URL("./daemon/lifecycle-launchd.integration.test.ts", import.meta.url),
   "utf8",
 );
+const setupNodeSource = readFileSync(
+  new URL("../.github/actions/setup-node/action.yml", import.meta.url),
+  "utf8",
+);
+const stagePostgresqlSource = readFileSync(
+  new URL("../.github/actions/stage-postgresql/action.yml", import.meta.url),
+  "utf8",
+);
+const vitestShardSource = readFileSync(
+  new URL("../.github/actions/vitest-shard/action.yml", import.meta.url),
+  "utf8",
+);
+const workspaceCleanSource = readFileSync(
+  new URL("../.github/scripts/check-workspace-clean.sh", import.meta.url),
+  "utf8",
+);
+const systemdIntegrationRun = readFileSync(
+  new URL("../.github/scripts/systemd-integration.sh", import.meta.url),
+  "utf8",
+);
 const workflow = loadYaml(source) as CiWorkflow;
 const codeqlWorkflow = loadYaml(codeqlSource) as CodeqlWorkflow;
 const codeqlExtendedWorkflow = loadYaml(codeqlExtendedSource) as CodeqlWorkflow;
-const launchdEvidenceRun =
-  workflow.jobs["macos-launchd"].steps.find((step) => step.name === "Run launchd integration path")?.run ?? "";
+const launchdEvidenceRun = readFileSync(
+  new URL("../.github/scripts/launchd-integration.sh", import.meta.url),
+  "utf8",
+);
 const launchdFixtureToken = "11111111-1111-1111-1111-111111111111";
 const launchdFixtureLabel = "com.donadiosolutions.lcm.daemon.0123456789abcdef0123";
 
@@ -205,51 +209,66 @@ const expectedCodecovRunSteps = [
 ];
 
 describe("CI workflow", () => {
-  it("bootstraps verified pnpm before exact store caches and fresh native installs", () => {
-    const setup = loadYaml(readFileSync(
-      new URL("../.github/actions/setup-ci/action.yml", import.meta.url), "utf8",
-    )) as { runs: { steps: WorkflowStep[] } };
-    for (const [steps, nodeVersion] of [
-      [setup.runs.steps, "25.4.0"],
-      [workflow.jobs["linux-systemd"].steps, "25.9.0"],
-      [workflow.jobs["macos-launchd"].steps, "25.9.0"],
-    ] as const) {
-      const nodeIndex = steps.findIndex((step) => step.uses?.startsWith("actions/setup-node@"));
-      const bootstrapIndex = steps.findIndex((step) => step.name === "Bootstrap verified pnpm");
-      const locateIndex = steps.findIndex((step) => step.name === "Locate pnpm store");
-      const cacheIndex = steps.findIndex((step) => step.name === "Cache pnpm store");
-      expect(bootstrapIndex).toBe(nodeIndex + 1);
-      expect(locateIndex).toBe(bootstrapIndex + 1);
-      expect(cacheIndex).toBe(locateIndex + 1);
-      expect(steps[nodeIndex]?.with).toEqual({ "node-version": nodeVersion });
-      const bootstrap = steps[bootstrapIndex]?.run ?? "";
-      expect(bootstrap).toContain('mktemp -d "$RUNNER_TEMP/lcm-pnpm.XXXXXX"');
-      expect(bootstrap).toContain('node scripts/bootstrap-pnpm.mjs --destination "$bootstrap_root/pnpm"');
-      expect(bootstrap).toContain('"$pnpm_bin" >> "$GITHUB_PATH"');
-      expect(bootstrap).toContain("npm_config_store_dir=%s");
-      expect(bootstrap).toContain('"$RUNNER_TEMP/lcm-pnpm-store" >> "$GITHUB_ENV"');
-      expect(steps[locateIndex]?.run).toContain('store_path="$(pnpm store path)"');
-      expect(steps[cacheIndex]).toMatchObject({
-        uses: expect.stringMatching(/^actions\/cache@[0-9a-f]{40}$/u),
-        with: {
-          path: "${{ steps.pnpm-store.outputs.path }}",
-          key: `pnpm-store-v1-\${{ runner.os }}-\${{ runner.arch }}-node-${nodeVersion}-\${{ hashFiles('package.json', 'pnpm-lock.yaml', '.npmrc', 'pnpm-workspace.yaml', 'scripts/bootstrap-pnpm.mjs') }}`,
-        },
-      });
-      expect(steps[cacheIndex]?.with).not.toHaveProperty("restore-keys");
-      if (steps !== setup.runs.steps) {
-        const installIndex = steps.findIndex((step) => step.name === "Install dependencies");
-        expect(installIndex).toBe(cacheIndex + 1);
-        expect(steps[installIndex]?.run).toBe("pnpm install --frozen-lockfile");
-        expect(steps[installIndex]?.if).toBeUndefined();
-        expect(steps.some((step) => step.with?.path === "node_modules")).toBe(false);
-      }
-    }
-    const install = setup.runs.steps.find((step) => step.name === "Install or validate Node dependencies");
+  it("bootstraps verified pnpm through the unified setup action", () => {
+    const setup = loadYaml(setupNodeSource) as {
+      inputs: { "node-version": { default: string } };
+      runs: { steps: WorkflowStep[] };
+    };
+    const steps = setup.runs.steps;
+    // The default is the declared engines floor; the OS integration jobs
+    // override it with the latest runtime (see test/node-engine-floor.test.ts).
+    expect(setup.inputs["node-version"].default).toBe("25.4.0");
+    expect(steps.map((step) => step.name)).toEqual([
+      "Set up Node",
+      "Bootstrap verified pnpm",
+      "Locate pnpm store",
+      "Cache pnpm store",
+      "Derive exact cache keys",
+      "Restore installed Node dependencies",
+      "Install or validate Node dependencies",
+      "Save installed Node dependencies",
+    ]);
+    expect(steps[0]).toMatchObject({
+      uses: expect.stringMatching(/^actions\/setup-node@[0-9a-f]{40}$/u),
+      with: { "node-version": "${{ inputs.node-version }}" },
+    });
+    const bootstrap = steps[1]?.run ?? "";
+    expect(bootstrap).toContain('mktemp -d "$RUNNER_TEMP/lcm-pnpm.XXXXXX"');
+    expect(bootstrap).toContain('node scripts/bootstrap-pnpm.mjs --destination "$bootstrap_root/pnpm"');
+    expect(bootstrap).toContain('"$pnpm_bin" >> "$GITHUB_PATH"');
+    expect(bootstrap).toContain("npm_config_store_dir=%s");
+    expect(bootstrap).toContain('"$RUNNER_TEMP/lcm-pnpm-store" >> "$GITHUB_ENV"');
+    expect(steps[2]?.run).toContain('store_path="$(pnpm store path)"');
+    expect(steps[3]).toMatchObject({
+      uses: "actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9",
+      with: {
+        path: "${{ steps.pnpm-store.outputs.path }}",
+        key: "pnpm-store-v1-${{ runner.os }}-${{ runner.arch }}-node-${{ inputs.node-version }}-${{ hashFiles('package.json', 'pnpm-lock.yaml', '.npmrc', 'pnpm-workspace.yaml', 'scripts/bootstrap-pnpm.mjs') }}",
+      },
+    });
+    expect(steps[3]?.with).not.toHaveProperty("restore-keys");
+    const install = steps.find((step) => step.name === "Install or validate Node dependencies");
     expect(install?.run).toContain("pnpm install --frozen-lockfile");
     expect(install?.run).toContain("validate-node-modules node_modules");
     expect(install?.run).toContain("write-node-modules-stamp node_modules");
     expect(install?.run).not.toMatch(/(?:npm ls|pnpm list)/u);
+    // The exact node_modules inventory needs Linux /proc; other platforms
+    // opt out and install from the pnpm store cache instead.
+    expect(setup.inputs["cache-node-modules"].default).toBe("true");
+    expect(install?.run).toMatch(/if \[\[ "\$CACHE_NODE_MODULES" != "true" \]\]; then\n\s*pnpm install --frozen-lockfile/u);
+    for (const name of ["Derive exact cache keys", "Restore installed Node dependencies"]) {
+      expect(steps.find((step) => step.name === name)?.if).toBe("${{ inputs.cache-node-modules == 'true' }}");
+    }
+    expect(steps.find((step) => step.name === "Save installed Node dependencies")?.if).toBe(
+      "${{ inputs.cache-node-modules == 'true' && steps.restore-node-modules.outputs.cache-hit != 'true' }}",
+    );
+    for (const jobName of ["linux-systemd", "macos-launchd"]) {
+      const job = workflow.jobs[jobName];
+      const setupStep = job.steps.find((step) => step.uses === "./.github/actions/setup-node");
+      expect(setupStep).toBeDefined();
+      expect(setupStep?.with).toEqual({ "node-version": "25.9.0", "cache-node-modules": "false" });
+      expect(job.steps.some((step) => step.uses?.startsWith("actions/setup-node@"))).toBe(false);
+    }
     expect(source).not.toMatch(/\bnpm (?:ci|run)|\bnpx\b/u);
   });
 
@@ -303,86 +322,223 @@ describe("CI workflow", () => {
     }
   });
 
-  it("seeds the environment and gates the stable check on every required suite", () => {
-    expect(workflow.jobs.environment).toMatchObject({
-      name: "Initialize CI environment",
-      "runs-on": "blacksmith-4vcpu-ubuntu-2404",
+  it("defines the plan-driven job graph, triggers, and immutable action pins", () => {
+    expect(workflow.on).toEqual({
+      push: { branches: ["main", "release"] },
+      pull_request: null,
+      merge_group: { types: ["checks_requested"] },
     });
-    expect(workflow.jobs.core.name).toBe("Core CI");
-    expect(workflow.jobs.core.needs).toBe("environment");
-    expect(workflow.jobs.core["runs-on"]).toBe("blacksmith-8vcpu-ubuntu-2404");
-    expect(workflow.jobs.postgresql.needs).toBe("environment");
-    expect(workflow.jobs.postgresql["runs-on"]).toBe("blacksmith-4vcpu-ubuntu-2404");
-    expect(workflow.jobs.postgresql.strategy.matrix.run).toEqual([1, 2]);
-    expect(workflow.jobs["linux-systemd"]).toMatchObject({
-      name: "Linux Ubuntu 24.04 user-systemd integration",
-      needs: "environment",
-      "runs-on": "ubuntu-24.04",
-      "timeout-minutes": 15,
+    expect(workflow.permissions).toEqual({ contents: "read" });
+    expect(workflow.concurrency).toEqual({
+      group: "ci-${{ github.workflow }}-${{ github.ref }}",
+      "cancel-in-progress": true,
     });
-    expect(workflow.jobs["macos-launchd"]).toMatchObject({
-      name: "macOS 15 launchd feasibility",
-      needs: "environment",
-      "runs-on": "macos-15",
-      "timeout-minutes": 15,
+    expect(Object.keys(workflow.jobs)).toEqual([
+      "plan",
+      "checks",
+      "unit",
+      "report",
+      "postgresql",
+      "linux-systemd",
+      "macos-launchd",
+      "ci",
+      "codecov",
+    ]);
+    expect(Object.fromEntries(Object.entries(workflow.jobs).map(([key, job]) => [key, job.name]))).toEqual({
+      plan: "Plan",
+      checks: "Checks",
+      unit: "Unit (${{ matrix.name }})",
+      report: "Report",
+      postgresql: "PostgreSQL 18 conformance",
+      "linux-systemd": "Linux Ubuntu 24.04 user-systemd integration",
+      "macos-launchd": "macOS 15 launchd feasibility",
+      ci: "ci",
+      codecov: "Codecov upload",
     });
-    expect(workflow.jobs.ci).toMatchObject({
-      name: "ci",
-      needs: ["environment", "core", "postgresql", "linux-systemd", "macos-launchd"],
-      if: "${{ always() }}",
+    expect(Object.fromEntries(Object.entries(workflow.jobs).map(([key, job]) => [key, job.needs]))).toEqual({
+      plan: undefined,
+      checks: "plan",
+      unit: "plan",
+      report: ["plan", "unit"],
+      postgresql: "plan",
+      "linux-systemd": "plan",
+      "macos-launchd": "plan",
+      ci: ["plan", "checks", "unit", "report", "postgresql", "linux-systemd", "macos-launchd"],
+      codecov: ["plan", "report"],
     });
-    const gate = workflow.jobs.ci.steps.find((step) => step.name === "Require every CI suite");
-    expect(gate?.env).toEqual({
-      ENVIRONMENT_RESULT: "${{ needs.environment.result }}",
-      CORE_RESULT: "${{ needs.core.result }}",
-      POSTGRESQL_RESULT: "${{ needs.postgresql.result }}",
-      LINUX_SYSTEMD_RESULT: "${{ needs.linux-systemd.result }}",
-      MACOS_LAUNCHD_RESULT: "${{ needs.macos-launchd.result }}",
-    });
-    expect(gate?.run).toContain(
-      '[[ "$ENVIRONMENT_RESULT" != success || "$CORE_RESULT" != success || "$POSTGRESQL_RESULT" != success || "$LINUX_SYSTEMD_RESULT" != success || "$MACOS_LAUNCHD_RESULT" != success ]]',
-    );
-    expect(gate?.run).toContain("Linux user-systemd result: $LINUX_SYSTEMD_RESULT");
-    expect(gate?.run).toContain("macOS launchd result: $MACOS_LAUNCHD_RESULT");
-    expect(workflow.jobs.ci.needs).toContain("macos-launchd");
-    expect(workflow.jobs.codecov.needs).toBe("ci");
-    expect(workflow.jobs["codecov-fork"].needs).toBe("ci");
+    expect(source).not.toMatch(/^\s+(?:codecov-fork|environment|core):\s*$/mu);
+    expect(Object.values(workflow.jobs).every((job) =>
+      typeof job.strategy?.matrix !== "object" || job.strategy.matrix === null || !("run" in job.strategy.matrix)
+    )).toBe(true);
+
+    for (const actionSource of [source, setupNodeSource, stagePostgresqlSource, vitestShardSource]) {
+      for (const match of actionSource.matchAll(/^\s*uses:\s*([^\s#]+)(?:\s+#.*)?$/gmu)) {
+        if (!match[1]?.startsWith("./")) expect(match[1]).toMatch(/@[0-9a-f]{40}$/u);
+      }
+    }
   });
 
-  it("publishes the single test report artifact after the core test run", () => {
-    const steps = workflow.jobs.core.steps;
-    const testCiSteps = steps.filter((step) => step.run === "pnpm run test:ci");
-    expect(testCiSteps).toHaveLength(1);
-    expect(testCiSteps[0]?.env).toEqual({
-      LCM_TEST_ARTIFACT_ROOT:
-        "${{ runner.temp }}/lcm-vitest-${{ github.run_id }}-${{ github.run_attempt }}",
+  it("plans the run and executes checks and dynamic unit shards", () => {
+    const plan = workflow.jobs.plan;
+    expect(plan["runs-on"]).toBe("blacksmith-4vcpu-ubuntu-2404");
+    expect(plan.outputs).toEqual({
+      mode: "${{ steps.plan.outputs.mode }}",
+      coverage: "${{ steps.plan.outputs.coverage }}",
+      unit: "${{ steps.plan.outputs.unit }}",
+      postgresql: "${{ steps.plan.outputs.postgresql }}",
+      systemd: "${{ steps.plan.outputs.systemd }}",
+      launchd: "${{ steps.plan.outputs.launchd }}",
+      shards: "${{ steps.plan.outputs.shards }}",
+      "expected-file-count": "${{ steps.plan.outputs.expected-file-count }}",
     });
-    expect(workflow.jobs.core.env ?? {}).not.toHaveProperty("LCM_TEST_ARTIFACT_ROOT");
+    expect(plan.steps.find((step) => step.name === "Checkout")?.with).toMatchObject({
+      "persist-credentials": false,
+      "fetch-depth": 0,
+    });
+    const planner = plan.steps.find((step) => step.name === "Plan the run");
+    expect(planner).toMatchObject({
+      id: "plan",
+      env: {
+        EVENT_NAME: "${{ github.event_name }}",
+        REF: "${{ github.ref }}",
+        BASE_SHA: "${{ github.event.pull_request.base.sha || github.event.merge_group.base_sha || '' }}",
+        HEAD_SHA: "${{ github.sha }}",
+      },
+      run: 'node scripts/ci-plan.mjs --event "$EVENT_NAME" --ref "$REF" --base "$BASE_SHA" --head "$HEAD_SHA"',
+    });
+    expect(plan.steps.find((step) => step.name === "Seed PostgreSQL harness caches")).toMatchObject({
+      if: "${{ steps.plan.outputs.postgresql == 'true' }}",
+      uses: "./.github/actions/stage-postgresql",
+    });
 
-    const uploadSteps = steps.filter((step) => step.name === "Upload Vitest reports");
-    expect(uploadSteps).toHaveLength(1);
-    const uploadStep = uploadSteps[0];
-    expect(uploadStep).toBeDefined();
-    expect(steps.indexOf(uploadStep!)).toBeGreaterThan(steps.indexOf(testCiSteps[0]!));
-    expect(uploadStep).toMatchObject({
-      name: "Upload Vitest reports",
+    expect(workflow.jobs.checks["runs-on"]).toBe("blacksmith-8vcpu-ubuntu-2404");
+    expect(workflow.jobs.checks.steps.map((step) => step.run).filter(Boolean)).toEqual([
+      "pnpm run typecheck",
+      "pnpm run build",
+      "node --test .github/scripts/*.test.mjs",
+      "python3 -B -m unittest discover -s .agents/skills/tests -v",
+      "bash .github/scripts/check-workspace-clean.sh",
+    ]);
+
+    const unit = workflow.jobs.unit;
+    expect(unit.if).toBe("${{ needs.plan.outputs.unit == 'true' }}");
+    expect(unit["runs-on"]).toBe("${{ matrix.runner }}");
+    expect(unit.strategy).toEqual({
+      "fail-fast": false,
+      matrix: "${{ fromJSON(needs.plan.outputs.shards) }}",
+    });
+    const shard = unit.steps.find((step) => step.name === "Run Vitest shard");
+    expect(shard).toEqual({
+      name: "Run Vitest shard",
+      uses: "./.github/actions/vitest-shard",
+      with: {
+        name: "${{ matrix.name }}",
+        projects: "${{ matrix.projects }}",
+        files: "${{ matrix.files }}",
+        coverage: "${{ needs.plan.outputs.coverage }}",
+        "artifact-root": "${{ runner.temp }}/lcm-vitest-${{ github.run_id }}-${{ github.run_attempt }}",
+      },
+    });
+    const shardAction = loadYaml(vitestShardSource) as {
+      inputs: Record<string, { required: boolean }>;
+    };
+    expect(Object.keys(shardAction.inputs)).toEqual(["name", "projects", "files", "coverage", "artifact-root"]);
+    expect(Object.values(shardAction.inputs).every((input) => input.required)).toBe(true);
+  });
+
+  it("merges shard reports into one fixed artifact", () => {
+    const report = workflow.jobs.report;
+    expect(report.permissions).toEqual({ actions: "read", contents: "read" });
+    const download = report.steps.find((step) => step.name === "Download shard blobs");
+    expect(download?.run).toContain('gh run download "$GITHUB_RUN_ID"');
+    expect(download?.run).toContain("--pattern 'vitest-blob-*'");
+    const merge = report.steps.find((step) => step.name === "Merge shard reports");
+    expect(merge).toEqual({
+      name: "Merge shard reports",
+      env: {
+        LCM_TEST_ARTIFACT_ROOT: "${{ runner.temp }}/lcm-vitest-${{ github.run_id }}-${{ github.run_attempt }}",
+        LCM_CI_BLOB_DIRECTORY: "${{ runner.temp }}/lcm-blobs",
+        LCM_CI_COVERAGE: "${{ needs.plan.outputs.coverage }}",
+        LCM_CI_EXPECTED_FILE_COUNT: "${{ needs.plan.outputs.expected-file-count }}",
+      },
+      run: "node scripts/ci-vitest.mjs report",
+    });
+    const upload = report.steps.find((step) => step.name === "Upload Vitest reports");
+    expect(report.steps.indexOf(upload!)).toBeGreaterThan(report.steps.indexOf(merge!));
+    expect(upload).toMatchObject({
       if: "${{ !cancelled() }}",
       uses: expect.stringMatching(/^actions\/upload-artifact@[0-9a-f]{40}$/u),
       with: {
         name: "vitest-reports",
-        path:
-          "${{ runner.temp }}/lcm-vitest-${{ github.run_id }}-${{ github.run_attempt }}/coverage/\n${{ runner.temp }}/lcm-vitest-${{ github.run_id }}-${{ github.run_attempt }}/test-report.junit.xml\n",
+        path: "${{ runner.temp }}/lcm-vitest-${{ github.run_id }}-${{ github.run_attempt }}/coverage/\n${{ runner.temp }}/lcm-vitest-${{ github.run_id }}-${{ github.run_attempt }}/test-report.junit.xml\n",
         "if-no-files-found": "warn",
+        overwrite: true,
       },
     });
-    expect(uploadStep?.with?.path).not.toContain("/cache/");
+    expect(report.steps.at(-1)?.run).toBe("bash .github/scripts/check-workspace-clean.sh");
+    // Re-running failed jobs replaces artifacts instead of colliding on the
+    // immutable names, for shard blobs and for the merged reports alike.
+    const shard = loadYaml(vitestShardSource) as { runs: { steps: WorkflowStep[] } };
+    const blobUpload = shard.runs.steps.find((step) => step.name === "Upload shard blob");
+    expect(blobUpload).toMatchObject({
+      if: "${{ !cancelled() }}",
+      uses: expect.stringMatching(/^actions\/upload-artifact@[0-9a-f]{40}$/u),
+      with: {
+        name: "vitest-blob-${{ inputs.name }}",
+        path: "${{ inputs.artifact-root }}/blobs/",
+        "if-no-files-found": "error",
+        "retention-days": 1,
+        overwrite: true,
+      },
+    });
+  });
+
+  it("gates every planned job result through the sparse checkout", () => {
+    const gateJob = workflow.jobs.ci;
+    expect(gateJob.if).toBe("${{ always() }}");
+    expect(gateJob["runs-on"]).toBe("ubuntu-latest");
+    expect(gateJob.steps[0]?.with).toMatchObject({
+      "persist-credentials": false,
+      "sparse-checkout": ".github/scripts/ci-gate.mjs",
+      "sparse-checkout-cone-mode": false,
+    });
+    expect(gateJob.steps.find((step) => step.name === "Require every planned CI job")).toEqual({
+      name: "Require every planned CI job",
+      env: {
+        PLAN_UNIT: "${{ needs.plan.outputs.unit }}",
+        PLAN_POSTGRESQL: "${{ needs.plan.outputs.postgresql }}",
+        PLAN_SYSTEMD: "${{ needs.plan.outputs.systemd }}",
+        PLAN_LAUNCHD: "${{ needs.plan.outputs.launchd }}",
+        PLAN_RESULT: "${{ needs.plan.result }}",
+        CHECKS_RESULT: "${{ needs.checks.result }}",
+        UNIT_RESULT: "${{ needs.unit.result }}",
+        REPORT_RESULT: "${{ needs.report.result }}",
+        POSTGRESQL_RESULT: "${{ needs.postgresql.result }}",
+        LINUX_SYSTEMD_RESULT: "${{ needs.linux-systemd.result }}",
+        MACOS_LAUNCHD_RESULT: "${{ needs.macos-launchd.result }}",
+      },
+      run: "node .github/scripts/ci-gate.mjs",
+    });
+  });
+
+  it("runs PostgreSQL once and keeps its cache restores exact", () => {
+    const postgresql = workflow.jobs.postgresql;
+    expect(postgresql).toMatchObject({
+      needs: "plan",
+      if: "${{ needs.plan.outputs.postgresql == 'true' }}",
+      "runs-on": "blacksmith-8vcpu-ubuntu-2404",
+    });
+    expect(postgresql.strategy).toBeUndefined();
+    expect(postgresql.steps.some((step) => step.uses === "./.github/actions/setup-node")).toBe(true);
+    expect(postgresql.steps.some((step) => step.uses === "./.github/actions/stage-postgresql")).toBe(true);
+    expect(postgresql.steps.at(-1)?.run).toBe("pnpm run test:postgresql");
+    expect(stagePostgresqlSource.match(/uses: actions\/cache\/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9/gu)).toHaveLength(2);
+    expect(stagePostgresqlSource.match(/uses: actions\/cache\/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9/gu)).toHaveLength(2);
+    expect(stagePostgresqlSource).not.toContain("restore-keys:");
   });
 
   it("fails directly on legacy checkout artifacts while preserving the porcelain gate", () => {
-    const workspaceCheck = workflow.jobs.core.steps.find(
-      (step) => step.name === "Check for workspace artifacts",
-    );
-    const run = workspaceCheck?.run ?? "";
+    const run = workspaceCleanSource;
 
     expect(run).toContain("git diff --exit-code");
     expect(run).toMatch(
@@ -399,22 +555,26 @@ describe("CI workflow", () => {
   it("runs the pinned Linux user-systemd integration with exact scoped cleanup", () => {
     const job = workflow.jobs["linux-systemd"];
     const checkout = job.steps.find((step) => step.name === "Checkout");
-    const node = job.steps.find((step) => step.name === "Set up Node.js 25.9.0");
-    const install = job.steps.find((step) => step.name === "Install dependencies");
+    const setup = job.steps.find((step) => step.name === "Set up Node.js and dependencies");
     const build = job.steps.find((step) => step.name === "Build package");
     const integration = job.steps.find((step) => step.name === "Run real user-systemd integration");
 
+    expect(job).toMatchObject({
+      needs: "plan",
+      if: "${{ needs.plan.outputs.systemd == 'true' }}",
+      "runs-on": "ubuntu-24.04",
+      "timeout-minutes": 15,
+    });
     expect(checkout).toEqual({
       name: "Checkout",
       uses: expect.stringMatching(/^actions\/checkout@[0-9a-f]{40}$/u),
       with: { "persist-credentials": false },
     });
-    expect(node).toEqual({
-      name: "Set up Node.js 25.9.0",
-      uses: expect.stringMatching(/^actions\/setup-node@[0-9a-f]{40}$/u),
-      with: { "node-version": "25.9.0" },
+    expect(setup).toEqual({
+      name: "Set up Node.js and dependencies",
+      uses: "./.github/actions/setup-node",
+      with: { "node-version": "25.9.0", "cache-node-modules": "false" },
     });
-    expect(install?.run).toBe("pnpm install --frozen-lockfile");
     expect(build?.run).toBe("pnpm run build");
     expect(integration?.env).toEqual({
       LCM_SYSTEMD_CREDENTIAL_INTEGRATION: "1",
@@ -428,30 +588,32 @@ describe("CI workflow", () => {
       LCM_RUNTIME_PATHS_SYSTEMD_RUN_ROOT:
         "${{ runner.temp }}/lcm-runtime-paths-${{ github.run_id }}-${{ github.run_attempt }}",
     });
-    expect(integration?.run).toMatch(
+    expect(integration?.run).toBe("bash .github/scripts/systemd-integration.sh");
+    const run = systemdIntegrationRun;
+    expect(run).toMatch(
       /systemd_state="\$\(systemctl --user is-system-running \|\| true\)"[\s\S]*case "\$systemd_state" in[\s\S]*running\|degraded\)\s*;;[\s\S]*\*\)[\s\S]*exit 1/u,
     );
-    expect(integration?.run).toContain("test/daemon/lifecycle-isolation.test.ts");
-    expect(integration?.run).toContain("test/daemon/lifecycle-systemd.integration.test.ts");
-    expect(integration?.run).toContain("test/daemon/systemd-credential-loader.test.ts");
-    expect(integration?.run).toContain("test/runtime-paths-systemd.integration.test.ts");
-    expect(integration?.run).toContain(
+    expect(run).toContain("test/daemon/lifecycle-isolation.test.ts");
+    expect(run).toContain("test/daemon/lifecycle-systemd.integration.test.ts");
+    expect(run).toContain("test/daemon/systemd-credential-loader.test.ts");
+    expect(run).toContain("test/runtime-paths-systemd.integration.test.ts");
+    expect(run).toContain(
       "pnpm exec vitest run test/runtime-paths-systemd.integration.test.ts",
     );
     expect(
-      integration?.run.match(/pnpm exec vitest run test\/runtime-paths-systemd\.integration\.test\.ts\b/gu),
+      run.match(/pnpm exec vitest run test\/runtime-paths-systemd\.integration\.test\.ts\b/gu),
     ).toHaveLength(1);
     expect(
-      integration?.run.match(/pnpm exec vitest run test\/runtime-paths-systemd\.integration\.test\.ts[^\n]*--testNamePattern/gu),
+      run.match(/pnpm exec vitest run test\/runtime-paths-systemd\.integration\.test\.ts[^\n]*--testNamePattern/gu),
     ).toBeNull();
-    expect(integration?.run).not.toContain("PrivateTmp=no");
-    expect(integration?.run).not.toContain("--system");
-    expect(integration?.run).not.toContain("PrivatePIDs=yes");
-    expect(integration?.run).not.toContain("--scope");
-    expect(integration?.run).not.toContain("/tmp:/tmp");
-    expect(integration?.run).not.toContain("map.includes");
-    expect(integration?.run).not.toContain("65534");
-    expect(integration?.run).toContain(
+    expect(run).not.toContain("PrivateTmp=no");
+    expect(run).not.toContain("--system");
+    expect(run).not.toContain("PrivatePIDs=yes");
+    expect(run).not.toContain("--scope");
+    expect(run).not.toContain("/tmp:/tmp");
+    expect(run).not.toContain("map.includes");
+    expect(run).not.toContain("65534");
+    expect(run).toContain(
       '--testNamePattern "observes the real user-systemd LoadCredential modes"',
     );
     for (const pattern of [
@@ -463,15 +625,15 @@ describe("CI workflow", () => {
       "refuses clean-environment drift before admitting an existing unit",
       "observes the real user-systemd LoadCredential modes",
     ]) {
-      expect(integration?.run).toContain(pattern);
+      expect(run).toContain(pattern);
     }
-    expect(integration?.run).toContain("|starts and admits a healthy managed unit");
-    expect(integration?.run).toContain("systemctl --user stop \"$unit_name\"");
-    expect(integration?.run).toContain(
+    expect(run).toContain("|starts and admits a healthy managed unit");
+    expect(run).toContain("systemctl --user stop \"$unit_name\"");
+    expect(run).toContain(
       'if [[ "$unit_name" =~ ^lcm-daemon-[0-9a-f]{20}\\.service$ ]]; then',
     );
-    expect(integration?.run).toContain('systemctl --user reset-failed "$unit_name"');
-    expect(integration?.run).not.toContain("lcm-test-daemon-${scope_id}");
+    expect(run).toContain('systemctl --user reset-failed "$unit_name"');
+    expect(run).not.toContain("lcm-test-daemon-${scope_id}");
     const ownedUnit = /^lcm-daemon-[0-9a-f]{20}\.service$/u;
     for (const value of [
       "lcm-daemon-0123456789abcdef0123.service",
@@ -487,27 +649,28 @@ describe("CI workflow", () => {
     ]) {
       expect(ownedUnit.test(value)).toBe(false);
     }
-    expect(integration?.run).toContain('rm -rf -- "$barrier_dir"');
-    expect(integration?.run).not.toMatch(/\b(?:pkill|killall)\b/u);
+    expect(run).toContain('rm -rf -- "$barrier_dir"');
+    expect(run).not.toMatch(/\b(?:pkill|killall)\b/u);
   });
 
   it("keeps the macOS launchd feasibility job active, validates the private derived product label, and runs its integration path", () => {
     const job = workflow.jobs["macos-launchd"];
     const checkout = job.steps.find((step) => step.name === "Checkout");
-    const node = job.steps.find((step) => step.name === "Set up Node.js 25.9.0");
-    const install = job.steps.find((step) => step.name === "Install dependencies");
+    const setup = job.steps.find((step) => step.name === "Set up Node.js and dependencies");
     const descriptorProbe = job.steps.find((step) => step.name === "Probe descriptor-relative runtime migration");
     const integration = job.steps.find((step) => step.name === "Run launchd integration path");
 
-    expect(job.if).toBeUndefined();
+    expect(job.if).toBe("${{ needs.plan.outputs.launchd == 'true' }}");
+    expect(job.needs).toBe("plan");
+    expect(job["runs-on"]).toBe("macos-15");
+    expect(job["timeout-minutes"]).toBe(15);
     expect(job["continue-on-error"]).toBeUndefined();
     expect(checkout?.uses).toMatch(/^actions\/checkout@[0-9a-f]{40}$/u);
-    expect(node).toEqual({
-      name: "Set up Node.js 25.9.0",
-      uses: expect.stringMatching(/^actions\/setup-node@[0-9a-f]{40}$/u),
-      with: { "node-version": "25.9.0" },
+    expect(setup).toEqual({
+      name: "Set up Node.js and dependencies",
+      uses: "./.github/actions/setup-node",
+      with: { "node-version": "25.9.0", "cache-node-modules": "false" },
     });
-    expect(install?.run).toBe("pnpm install --frozen-lockfile");
     expect(descriptorProbe?.run).toBe(
       'pnpm exec vitest run test/runtime-paths.test.ts --testNamePattern "uses actual platform semantics for nested legacy migration"',
     );
@@ -519,7 +682,8 @@ describe("CI workflow", () => {
       LCM_LAUNCHD_LABEL:
         "com.donadiosolutions.lcm.ci.${{ github.run_id }}.${{ github.run_attempt }}",
     });
-    const run = integration?.run ?? "";
+    expect(integration?.run).toBe("bash .github/scripts/launchd-integration.sh");
+    const run = launchdEvidenceRun;
     // The run creates one fresh unpredictable current-run evidence token,
     // passes it to the worker only through the environment, and the trap may
     // bootout only exact evidence proven to belong to this run. A stale or
@@ -641,9 +805,7 @@ describe("CI workflow", () => {
   });
 
   it("binds launchd activity to one shared run root without credential or token disclosure", () => {
-    const run = workflow.jobs["macos-launchd"].steps.find(
-      (step) => step.name === "Run launchd integration path",
-    )?.run ?? "";
+    const run = launchdEvidenceRun;
 
     // All sequential real tests must derive one exact label from the workflow
     // state root, while their runtime and home roots remain per-fixture.
@@ -761,110 +923,88 @@ describe("CI workflow", () => {
     expect(normalized).toBe("Tests  4 passed (4)\n");
   });
 
-  it("separates trusted OIDC uploads from tokenless fork uploads", () => {
+  it("uploads coverage only after a successful planned report", () => {
     expect(workflow.jobs.codecov.if).toBe(
-      "${{ !cancelled() && github.event_name != 'merge_group' && (github.event_name == 'push' || (github.event_name == 'pull_request' && github.event.pull_request.head.repo.full_name == github.repository)) }}",
+      "${{ !cancelled() && needs.plan.outputs.coverage == 'true' && needs.report.result == 'success' }}",
     );
+    expect(workflow.jobs.codecov.needs).toEqual(["plan", "report"]);
     expect(workflow.jobs.codecov.permissions).toEqual({
       actions: "read",
       contents: "read",
       "id-token": "write",
     });
-    expect(workflow.jobs["codecov-fork"].if).toBe(
-      "${{ !cancelled() && github.event_name == 'pull_request' && github.event.pull_request.head.repo.full_name != github.repository }}",
-    );
-    expect(workflow.jobs["codecov-fork"].permissions).toEqual({
-      actions: "read",
-      contents: "read",
-    });
   });
 
   it("checks out the artifact-producing tree and permits only fixed infrastructure scripts", () => {
-    for (const job of [workflow.jobs.codecov, workflow.jobs["codecov-fork"]]) {
-      const { steps } = job;
-      expect(steps.map((step) => step.name)).toEqual([
-        "Checkout source for Codecov",
-        "Download Vitest reports",
-        "Download verified Codecov CLI",
-        "Upload coverage to Codecov",
-        "Upload test results to Codecov",
-      ]);
-
-      const checkoutIndex = steps.findIndex((step) => step.name === "Checkout source for Codecov");
-      const firstUploadIndex = steps.findIndex((step) =>
-        step.uses?.startsWith("codecov/codecov-action@"),
-      );
-      expect(checkoutIndex).toBeGreaterThanOrEqual(0);
-      expect(firstUploadIndex).toBeGreaterThan(checkoutIndex);
-      expect(steps[checkoutIndex]).toEqual({
-        name: "Checkout source for Codecov",
-        uses: expect.stringMatching(/^actions\/checkout@[0-9a-f]{40}$/u),
-        with: {
-          repository: "${{ github.repository }}",
-          ref: "${{ github.sha }}",
-          "persist-credentials": false,
-        },
-      });
-      expect(
-        steps
-          .filter((step) => step.run !== undefined)
-          .map((step) => ({ name: step.name, run: step.run?.trim() })),
-      ).toEqual(expectedCodecovRunSteps);
-    }
+    const { steps } = workflow.jobs.codecov;
+    expect(steps.map((step) => step.name)).toEqual([
+      "Checkout source for Codecov",
+      "Download Vitest reports",
+      "Download verified Codecov CLI",
+      "Upload coverage to Codecov",
+      "Upload test results to Codecov",
+    ]);
+    const checkoutIndex = steps.findIndex((step) => step.name === "Checkout source for Codecov");
+    const firstUploadIndex = steps.findIndex((step) => step.uses?.startsWith("codecov/codecov-action@"));
+    expect(firstUploadIndex).toBeGreaterThan(checkoutIndex);
+    expect(steps[checkoutIndex]).toEqual({
+      name: "Checkout source for Codecov",
+      uses: expect.stringMatching(/^actions\/checkout@[0-9a-f]{40}$/u),
+      with: {
+        repository: "${{ github.repository }}",
+        ref: "${{ github.sha }}",
+        "persist-credentials": false,
+      },
+    });
+    expect(
+      steps.filter((step) => step.run !== undefined)
+        .map((step) => ({ name: step.name, run: step.run?.trim() })),
+    ).toEqual(expectedCodecovRunSteps);
   });
 
-  it("reuses a digest-verified pinned Codecov CLI for both uploads in each job", () => {
-    for (const [jobName, useOidc] of [
-      ["codecov", true],
-      ["codecov-fork", false],
-    ] as const) {
-      const steps = workflow.jobs[jobName].steps;
-      const overridePr =
-        jobName === "codecov"
-          ? "${{ github.event_name == 'pull_request' && github.event.pull_request.number || '' }}"
-          : "${{ github.event.pull_request.number }}";
-      const download = steps.find((step) => step.name === "Download verified Codecov CLI");
+  it("reuses one digest-verified pinned Codecov CLI for both OIDC uploads", () => {
+    const steps = workflow.jobs.codecov.steps;
+    const download = steps.find((step) => step.name === "Download verified Codecov CLI");
 
-      expect(download?.env).toMatchObject({
-        CODECOV_CLI_REPOSITORY: "codecov/codecov-cli",
-        CODECOV_CLI_TAG: "v11.2.6",
-        CODECOV_CLI_ASSET: "codecovcli_linux",
-        CODECOV_CLI_SHA256: "fd34214e2b2c738e48e3ac90b2c23ec4e975d0e9aee51f2cebe81b5704af3f6c",
+    expect(download?.env).toMatchObject({
+      CODECOV_CLI_REPOSITORY: "codecov/codecov-cli",
+      CODECOV_CLI_TAG: "v11.2.6",
+      CODECOV_CLI_ASSET: "codecovcli_linux",
+      CODECOV_CLI_SHA256: "fd34214e2b2c738e48e3ac90b2c23ec4e975d0e9aee51f2cebe81b5704af3f6c",
+    });
+    expect(
+      `https://github.com/${download?.env?.CODECOV_CLI_REPOSITORY}/releases/download/${download?.env?.CODECOV_CLI_TAG}/${download?.env?.CODECOV_CLI_ASSET}`,
+    ).toBe("https://github.com/codecov/codecov-cli/releases/download/v11.2.6/codecovcli_linux");
+
+    const downloadScript = download?.run ?? "";
+    const downloadIndex = downloadScript.indexOf("gh release download");
+    const verifyIndex = downloadScript.indexOf("sha256sum --check --strict");
+    const chmodIndex = downloadScript.indexOf('chmod 0755 "$CODECOV_CLI_PATH"');
+    expect(downloadIndex).toBeGreaterThanOrEqual(0);
+    expect(verifyIndex).toBeGreaterThan(downloadIndex);
+    expect(chmodIndex).toBeGreaterThan(verifyIndex);
+    expect(downloadScript).toContain('CODECOV_CLI_PATH="$RUNNER_TEMP/codecov"');
+
+    const uploads = steps.filter((step) => step.uses?.startsWith("codecov/codecov-action@"));
+    expect(uploads).toHaveLength(2);
+    for (const upload of uploads) {
+      expect(upload.uses).toMatch(/^codecov\/codecov-action@[0-9a-f]{40}$/u);
+      expect(upload.with).toMatchObject({
+        binary: "${{ runner.temp }}/codecov",
+        fail_ci_if_error: true,
+        use_oidc: true,
       });
-      expect(
-        `https://github.com/${download?.env?.CODECOV_CLI_REPOSITORY}/releases/download/${download?.env?.CODECOV_CLI_TAG}/${download?.env?.CODECOV_CLI_ASSET}`,
-      ).toBe("https://github.com/codecov/codecov-cli/releases/download/v11.2.6/codecovcli_linux");
-
-      const downloadScript = download?.run ?? "";
-      const downloadIndex = downloadScript.indexOf("gh release download");
-      const verifyIndex = downloadScript.indexOf("sha256sum --check --strict");
-      const chmodIndex = downloadScript.indexOf('chmod 0755 "$CODECOV_CLI_PATH"');
-      expect(downloadIndex).toBeGreaterThanOrEqual(0);
-      expect(verifyIndex).toBeGreaterThan(downloadIndex);
-      expect(chmodIndex).toBeGreaterThan(verifyIndex);
-      expect(downloadScript).toContain('CODECOV_CLI_PATH="$RUNNER_TEMP/codecov"');
-
-      const uploads = steps.filter((step) => step.uses?.startsWith("codecov/codecov-action@"));
-      expect(uploads).toHaveLength(2);
-      for (const upload of uploads) {
-        expect(upload.uses).toMatch(/^codecov\/codecov-action@[0-9a-f]{40}$/u);
-        expect(upload.with).toMatchObject({
-          binary: "${{ runner.temp }}/codecov",
-          fail_ci_if_error: true,
-          override_pr: overridePr,
-          use_oidc: useOidc,
-        });
-        expect(upload.with).not.toHaveProperty("token");
-        expect(upload.with).not.toHaveProperty("version");
-      }
-      expect(uploads.map((upload) => upload.with?.files)).toEqual([
-        "coverage/lcov.info",
-        "test-report.junit.xml",
-      ]);
-      expect(uploads[0]?.with).not.toHaveProperty("report_type");
-      expect(uploads[1]?.with).toMatchObject({ report_type: "test_results" });
-      expect(steps.some((step) => step.name === "Clean Codecov uploader files")).toBe(false);
+      expect(upload.with).not.toHaveProperty("override_pr");
+      expect(upload.with).not.toHaveProperty("token");
+      expect(upload.with).not.toHaveProperty("version");
     }
-    expect(source.match(/gh release download/gu)).toHaveLength(2);
+    expect(uploads.map((upload) => upload.with?.files)).toEqual([
+      "coverage/lcov.info",
+      "test-report.junit.xml",
+    ]);
+    expect(uploads[0]?.with).not.toHaveProperty("report_type");
+    expect(uploads[1]?.with).toMatchObject({ report_type: "test_results" });
+    expect(steps.some((step) => step.name === "Clean Codecov uploader files")).toBe(false);
+    expect(source.match(/gh release download/gu)).toHaveLength(1);
   });
 });
