@@ -4488,6 +4488,36 @@ describe("sanitizeError", () => {
         "'https://o.test/x?a=1\nhttps://inner.test/y name=\\Users\\literal",
         "'https://o.test/x?a=1\nhttps://inner.test/y name=\\Users\\literal",
       ],
+      [
+        "Bug #1427 an unbracketed path-bearing child converging in one pass",
+        "https://outer.test/x?next=file://host/Users/a&later/Users/secret",
+        "https://outer.test/x?next=file://host<path>&later/Users/secret",
+      ],
+      [
+        "Bug #1427 the pipe form of that child",
+        "https://outer.test/x?next=file://host/Users/a|later/Users/secret",
+        "https://outer.test/x?next=file://host<path>|later/Users/secret",
+      ],
+      [
+        "Bug #1427 the same shape inside a file wrapper",
+        "file://h?x=file://host/Users/a&later/Users/secret",
+        "file://h?x=file://host<path>&later/Users/secret",
+      ],
+      [
+        "Bug #1427 a marker-bearing child owning no word-bearing successor",
+        "https://outer.test/x?next=file://host<path>&later/Users/secret",
+        "https://outer.test/x?next=file://host<path>&later/Users/secret",
+      ],
+      [
+        "Bug #1427 control a rooted successor after a marker still redacts",
+        "https://outer.test/x?next=file://host<path>&/Users/secret",
+        "https://outer.test/x?next=file://host<path>&<path>",
+      ],
+      [
+        "Bug #1427 control a bare child successor is unchanged",
+        "https://outer.test/x?next=file://host&later/Users/secret",
+        "https://outer.test/x?next=file://host&later<path>",
+      ],
     ] as const)("resolves %s in one pass", (_name, input, expected) => {
       const first = sanitizeError(input);
 

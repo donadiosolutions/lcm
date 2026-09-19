@@ -129,6 +129,7 @@ interface BracketGroupIndex {
   urlBearingBefore: Uint8Array;
   fileChildBearing: Uint8Array;
   filePathChildBearing: Uint8Array;
+  fileChildSettled: Uint8Array;
   childCloseOwner: Uint8Array;
   pathlessChildQuery: Uint8Array;
   armedHandoff: Uint8Array;
@@ -137,16 +138,19 @@ interface BracketGroupIndex {
   wordRunEnds: Int32Array;
 }
 
-function pathlessChildQueryStart(
+function fileChildAuthorityEnd(
   chars: readonly string[],
   start: number,
   whitespace: Uint8Array,
 ): number {
-  // A nested file child that never reaches a path owns its own query text. Its
-  // relative successors stay public until another URL element intervenes, which
-  // is the difference between Bug #1349's controls and the K2 disclosure. This
-  // reports where that region opens; the walk that classifies groups carries it
-  // forward, so no child rescans the text that follows it.
+  // Walks a nested file child's authority once and reports where it ends. The
+  // caller reads the character there: "?" or "#" opens a query region the child
+  // owns, "/" or "\\" means the child reached a path, and anything else means it
+  // settled on neither. A malformed bracketed authority reports -1, which is
+  // also neither. Reporting the position rather than only the query start is
+  // what lets ownership stop depending on a "<path>" marker an earlier pass
+  // wrote, because a child whose authority runs into that marker reached no
+  // path and no query in either text.
   let cursor = start + FILE_SCHEME.length + 3;
   if (chars[cursor] === "[") {
     // A bracketed IPv6 authority is host syntax rather than a wrapper boundary,
@@ -159,12 +163,22 @@ function pathlessChildQueryStart(
   }
   while (cursor < chars.length) {
     const char = chars[cursor];
-    if (char === "?" || char === "#") return cursor;
-    if (char === "/" || char === "\\" || char === "[" || char === "]" || char === "|" || char === "&") return -1;
-    if (whitespace[cursor] === 1) return -1;
+    if (
+      char === "?" ||
+      char === "#" ||
+      char === "/" ||
+      char === "\\" ||
+      char === "[" ||
+      char === "]" ||
+      char === "|" ||
+      char === "&" ||
+      whitespace[cursor] === 1
+    ) {
+      return cursor;
+    }
     cursor += 1;
   }
-  return -1;
+  return cursor;
 }
 
 function startsRootedValue(chars: readonly string[], index: number, wordRunEnds: Int32Array): boolean {
@@ -234,12 +248,17 @@ function classifyBracketGroups(chars: readonly string[]): BracketGroupIndex {
   // outlives it, unlike fileChildBearing, which expires with the wrapper that
   // held the child so a query-only child keeps its relative tail public.
   const filePathChildBearing: number[] = [0];
+  // Whether a file child in this group reached a path or opened a query of its
+  // own. A child that reached neither never settles on an ownership grammar, so
+  // it cannot hand a successor back to its wrapper.
+  const fileChildSettled: number[] = [0];
   const rootedBearing: number[] = [0];
   const pathlessQueryActive: number[] = [0];
   const openGroup = (): number => {
     urlBearing.push(0);
     fileChildBearing.push(0);
     filePathChildBearing.push(0);
+    fileChildSettled.push(0);
     rootedBearing.push(0);
     armedHandoff.push(0);
     queryBearing.push(0);
@@ -292,6 +311,7 @@ function classifyBracketGroups(chars: readonly string[]): BracketGroupIndex {
       if (urlBearing[closed] === 1) urlBearing[parent] = 1;
       if (rootedBearing[closed] === 1) rootedBearing[parent] = 1;
       if (filePathChildBearing[closed] === 1) filePathChildBearing[parent] = 1;
+      if (fileChildSettled[closed] === 1) fileChildSettled[parent] = 1;
       // A child that carried both URL syntax and a path root hands its wrapper
       // an owned tail. A literal-only or path-less child hands over nothing.
       if (urlBearing[closed] === 1 && rootedBearing[closed] === 1) childCloseOwner[index] = 1;
@@ -348,9 +368,18 @@ function classifyBracketGroups(chars: readonly string[]): BracketGroupIndex {
       const previous = chars[index - 1];
       if (stack.length > 1 || (previous !== undefined && (NESTED_FILE_URL_DELIMITERS.has(previous) || previous === "|"))) {
         fileChildBearing[current] = 1;
-        const queryStart = pathlessChildQueryStart(chars, index, whitespace);
-        if (queryStart >= 0) pathlessChildQueryStarts[queryStart] = 1;
-        else filePathChildBearing[current] = 1;
+        const authorityEnd = fileChildAuthorityEnd(chars, index, whitespace);
+        const authorityStop = authorityEnd >= 0 ? chars[authorityEnd] : undefined;
+        if (authorityStop === "?" || authorityStop === "#") {
+          pathlessChildQueryStarts[authorityEnd] = 1;
+        } else {
+          filePathChildBearing[current] = 1;
+        }
+        // A child settles on a grammar of its own unless its authority ran
+        // straight into the delimiter that hands ownership back. A malformed
+        // bracketed authority reports no stop and still settles, because it is
+        // not a query-only child and its wrapper keeps the tail.
+        if (authorityStop !== "&" && authorityStop !== "|") fileChildSettled[current] = 1;
       }
       inUrlSpan = true;
       continue;
@@ -379,6 +408,7 @@ function classifyBracketGroups(chars: readonly string[]): BracketGroupIndex {
     urlBearingBefore,
     fileChildBearing: Uint8Array.from(fileChildBearing),
     filePathChildBearing: Uint8Array.from(filePathChildBearing),
+    fileChildSettled: Uint8Array.from(fileChildSettled),
   };
 }
 
@@ -689,6 +719,12 @@ function findUrlPathStarts(chars: readonly string[]): UrlPathStarts {
     if (
       !exactFileScheme &&
       (char === "&" || char === "|") &&
+      // A child that reached neither a path nor a query of its own never
+      // settled on a grammar it could hand back, so it owns no successor.
+      // Without this the scan read a "<path>" marker written by an earlier
+      // pass as evidence that a path-bearing child had ended, which made the
+      // classification depend on our own previous output.
+      groups.fileChildSettled[groups.groupOf[index]] === 1 &&
       (groups.fileChildBearing[groups.groupOf[index]] === 1 ||
         (groups.depth[index] > 0 &&
           groups.filePathChildBearing[groups.groupOf[index]] === 1)) &&

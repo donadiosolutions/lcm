@@ -13,3 +13,8 @@ ownership to the wrapper that contains it, so bracketing a child no longer
 leaves its private-root successor visible. URL syntax owns only the text that
 follows it, so a trailing URL no longer redacts an earlier named Windows value
 in the same group.
+
+Sanitizing an error message twice now gives the same result for a nested file
+URL whose path is followed by a delimiter and a private root, because ownership
+no longer reads a `<path>` marker from an earlier pass as evidence about the
+child that produced it.

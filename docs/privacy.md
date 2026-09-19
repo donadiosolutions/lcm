@@ -681,7 +681,12 @@ The `Security` section of the doctor output shows:
   Later passes therefore derive ownership of named slash-bearing values from the
   retained URL syntax. A literal `<path>` followed directly by `?` or `#` carries
   no provenance; slash-bearing values in that ambiguous form are conservatively
-  redacted. The observable outer brackets of a pathless file query or fragment
+  redacted. A `<path>` standing where a nested file URL's path would be carries
+  no provenance either: the child reached neither a path nor a query of its own,
+  so a following word-bearing private root after `&` or `|` is not treated as
+  returning to that child's wrapper, and the first sanitized result of the
+  unredacted form is already stable.
+  The observable outer brackets of a pathless file query or fragment
   remain the owner across arbitrary literal text, so a bare query or fragment
   value beginning with a root-relative Windows backslash is also redacted while
   that wrapper remains open. A named value such as `later=\Users\bob\secret.db`
