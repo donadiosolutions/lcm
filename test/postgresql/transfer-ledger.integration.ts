@@ -28,8 +28,8 @@ const insertBatch = `INSERT INTO lcm.transfer_batches
    checkpoint_sha256,first_ordinal,next_ordinal)
   VALUES ('run','messages',$1,$2,$3,$4,$5,$6)`;
 const insertIdentity = `INSERT INTO lcm.transfer_identities
-  (run_id,domain,identity_sha256,ordinal,native_key,record_sha256)
-  VALUES ('run','messages',$1,$2,'native-key',$3)`;
+  (run_id,domain,identity_sha256,ordinal,native_key,record_sha256,content_sha256)
+  VALUES ('run','messages',$1,$2,'native-key',$3,$4)`;
 
 describe("PostgreSQL transfer ledger", () => {
   it("keeps exact receipt bytes, supports empty ranges and rejects conflicting replay keys", async () => {
@@ -57,12 +57,12 @@ describe("PostgreSQL transfer ledger", () => {
   it("rejects duplicate logical identities and ordinals without storing record payloads", async () => {
     await withPostgreSqlTestDatabase("transfer-identities", async ({ migrator }) => {
       await seedRun(migrator);
-      await migrator.query({ text: insertIdentity, values: [sha, "0", sha] }, options);
-      for (const values of [[sha, "1", otherSha], [otherSha, "0", sha], [otherSha, "-1", sha]]) {
+      await migrator.query({ text: insertIdentity, values: [sha, "0", sha, sha] }, options);
+      for (const values of [[sha, "1", otherSha, sha], [otherSha, "0", sha, sha], [otherSha, "-1", sha, sha]]) {
         await expect(migrator.query({ text: insertIdentity, values }, options)).rejects.toMatchObject({ backend: "postgresql" });
       }
       const rows = await migrator.query({ text: "SELECT * FROM lcm.transfer_identities" }, options);
-      expect(rows.rows).toEqual([{ run_id: "run", domain: "messages", identity_sha256: sha, ordinal: "0", native_key: "native-key", record_sha256: sha }]);
+      expect(rows.rows).toEqual([{ run_id: "run", domain: "messages", identity_sha256: sha, ordinal: "0", native_key: "native-key", record_sha256: sha, content_sha256: sha }]);
     });
   });
 
@@ -81,7 +81,7 @@ describe("PostgreSQL transfer ledger", () => {
         .rejects.toMatchObject({ backend: "postgresql" });
       await expect(migrator.transaction(async (transaction) => {
         await transaction.query({ text: insertBatch, values: [sha, sha, Buffer.from("checkpoint"), sha, "0", "1"] }, options);
-        await transaction.query({ text: insertIdentity, values: [sha, "0", sha] }, options);
+        await transaction.query({ text: insertIdentity, values: [sha, "0", sha, sha] }, options);
         await transaction.query({ text: "UPDATE lcm.transfer_runs SET current_domain='messages'" }, options);
         throw new Error("injected before commit");
       }, { ...options, mode: "read-committed-read-write" })).rejects.toThrow();

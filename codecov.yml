@@ -318,6 +318,9 @@ component_management:
         # #1321 drops the Node 22 transaction-probe fallback and drives
         # epoch-adoption refusal through a real transaction, keeping receipts
         # in this migration owner.
+        # #1380 clears the settlement primary error once a mutate is
+        # acknowledged, so a stale prior-attempt error can no longer mask
+        # the current readback failure; ownership is unchanged.
         - "src/migration/"
     - component_id: "unit-local-event-storage"
       name: "Unit - Local Event Storage"
@@ -474,6 +477,9 @@ component_management:
       name: "Integration - PostgreSQL Portable Transfer"
       paths:
         # #618 canonical self-provenance stays in PostgreSQL portable transfer.
+        # #1378 re-derives each written record's canonical content
+        # fingerprint inside the completion transaction, batched via a
+        # new readCanonicalContentRows; ownership is unchanged.
         - "^src/storage/postgresql/portable-source\\.ts$"
         - "^src/storage/postgresql/portable-destination\\.ts$"
         - "^src/storage/postgresql/portable-mapping\\.ts$"
@@ -485,6 +491,8 @@ component_management:
         # the existing PostgreSQL schema owner.
         # #1306 adds the 0007 promoted-content digest migration and its
         # schema snapshot, keeping the packaged migration manifest here.
+        # #1378 adds the 0008 transfer-identity content-digest migration
+        # and its regenerated schema snapshot; ownership is unchanged.
         - "^src/storage/postgresql/migrations\\.ts$"
         - "^src/storage/postgresql/provisioning\\.ts$"
         - "^src/storage/postgresql/runtime-readiness\\.ts$"

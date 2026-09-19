@@ -414,9 +414,9 @@ it("preserves full Porter matches and refuses weak partials in packed SQLite sho
   });
 }, 120_000);
 
-it("starts the installed packed CLI with PostgreSQL and all seven verified migration assets", async () => {
+it("starts the installed packed CLI with PostgreSQL and all eight verified migration assets", async () => {
   const packageRoot = stagePackage("pristine");
-  expect(migrations).toHaveLength(7);
+  expect(migrations).toHaveLength(8);
   expect(createHash("sha256").update(readFileSync(join(packageRoot, "dist/lcm.mjs"))).digest("hex"))
     .toBe(createHash("sha256").update(readFileSync(join(process.cwd(), "dist/lcm.mjs"))).digest("hex"));
   for (const migration of migrations) {
