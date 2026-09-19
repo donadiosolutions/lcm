@@ -5,6 +5,7 @@ import {
   MIGRATION_MISMATCH_CLASSES,
   MIGRATION_MISMATCH_CLASS_TRUNCATION_LIMIT,
   MIGRATION_RECONCILIATION_DOMAIN_ORDER,
+  MIGRATION_PUBLIC_PROBE_ORDER,
   MigrationVerificationReportError,
   createMigrationVerificationReport,
   createMigrationVerificationReportBody,
@@ -87,6 +88,7 @@ function baseInput(overrides: Partial<CreateMigrationVerificationReportInput> = 
     },
     classCoverage: MIGRATION_MISMATCH_CLASSES.map((mismatchClass) => ({ class: mismatchClass, ran: true })),
     publicProbeSha256: migrationWitnessSha256(["public-probe"]),
+    publicProbeCoverage: MIGRATION_PUBLIC_PROBE_ORDER.map((probe) => ({ probe, ran: true })),
     sampleParameters: sampleParameters(),
     mismatches: [],
     mismatchTotals: [],
@@ -365,6 +367,25 @@ describe("createMigrationVerificationReport / parseMigrationVerificationReport",
     expectReportError(() => parseMigrationVerificationReport({ ...report, mismatches: "bad" }), "invalid-input");
     expectReportError(() => parseMigrationVerificationReport({ ...report, mismatchTotals: "bad" }), "invalid-input");
   });
+  it("rejects a public probe coverage vector out of the frozen probe order on parse", () => {
+    // Exercises parseMigrationPublicProbeCoverageVector's own rejection
+    // path directly: every other test in this suite only ever supplies
+    // a well-formed publicProbeCoverage, so this is the one place that
+    // reordering (or a non-boolean ran) is proven to refuse rather than
+    // silently coerce.
+    const report = createMigrationVerificationReport(baseInput());
+    const reordered = [...report.body.publicProbeCoverage].reverse();
+    expectReportError(() => parseMigrationVerificationReport({
+      ...report, body: { ...report.body, publicProbeCoverage: reordered },
+    }), "invalid-input");
+  });
+  it("rejects a public probe coverage vector with the wrong number of entries on parse", () => {
+    const report = createMigrationVerificationReport(baseInput());
+    const truncated = report.body.publicProbeCoverage.slice(0, 1);
+    expectReportError(() => parseMigrationVerificationReport({
+      ...report, body: { ...report.body, publicProbeCoverage: truncated },
+    }), "invalid-input");
+  });
   it("rejects a clean flag that disagrees with the mismatch totals", () => {
     const report = createMigrationVerificationReport(baseInput());
     expectReportError(() => parseMigrationVerificationReport({ ...report, clean: false }), "unexpected-state");
@@ -391,6 +412,19 @@ describe("createMigrationVerificationReport / parseMigrationVerificationReport",
       mismatchTotals: [{ domain: "messages", class: "count", count: 1 }],
     }));
     expect(dirtyButCovered.activationEligible).toBe(false);
+  });
+  it("computes activationEligible as false when every class ran and the report is clean, but a public probe did not run", () => {
+    // Round-2 P1 follow-up: publicProbeCoverage gates eligibility
+    // independently of classCoverage, so a not-run public probe refuses
+    // even when the class-level vector is fully covered and the report
+    // has zero mismatches -- the exact join that closed the compound
+    // case (a genuine listing mismatch plus a not-run search probe).
+    const searchNotRun = createMigrationVerificationReport(baseInput({
+      publicProbeCoverage: MIGRATION_PUBLIC_PROBE_ORDER.map((probe) => ({ probe, ran: probe !== "public-search" })),
+    }));
+    expect(searchNotRun.clean).toBe(true);
+    expect(searchNotRun.activationEligible).toBe(false);
+    expect(parseMigrationVerificationReport(searchNotRun)).toEqual(searchNotRun);
   });
   it("rejects a tampered activationEligible flag on parse", () => {
     const report = createMigrationVerificationReport(baseInput());

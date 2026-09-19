@@ -3,6 +3,7 @@ import { PORTABLE_RECORD_DOMAIN_ORDER, type PortableDomain } from "../../src/sto
 import { migrationWitnessSha256 } from "../../src/migration/activation-witness.js";
 import {
   MIGRATION_MISMATCH_CLASSES,
+  MIGRATION_PUBLIC_PROBE_ORDER,
   createMigrationVerificationReportBody,
   MigrationVerificationReportError,
   type CreateMigrationVerificationReportBodyInput,
@@ -58,6 +59,7 @@ function fixtureBodyInput(): CreateMigrationVerificationReportBodyInput {
     },
     classCoverage: MIGRATION_MISMATCH_CLASSES.map((mismatchClass) => ({ class: mismatchClass, ran: true })),
     publicProbeSha256: HASH_A,
+    publicProbeCoverage: MIGRATION_PUBLIC_PROBE_ORDER.map((probe) => ({ probe, ran: true })),
     sampleParameters: { version: 1, strideOrdinal: 97, sampleCount: 32, seedBasisSha256: HASH_A },
     mismatches: [],
     mismatchTotals: [],
@@ -130,6 +132,21 @@ describe("machine-checked witness audit", () => {
       expect(entry.refusal.length).toBeGreaterThan(0);
     }
   });
+  it("requires a compared-live-probe-coverage entry to name a real consequence and at least one probe", () => {
+    // The probe-coverage sibling of the compared-live check above: this
+    // shape exists precisely because the search probe gates
+    // activationEligible without ever producing a mismatch class, so it
+    // needs its own non-empty-field enforcement rather than silently
+    // inheriting compared-live's.
+    const probeCoverageEntries = MIGRATION_WITNESS_AUDIT.filter(
+      (entry): entry is Extract<MigrationWitnessAuditEntry, { comparison: "compared-live-probe-coverage" }> => entry.comparison === "compared-live-probe-coverage",
+    );
+    expect(probeCoverageEntries.length).toBeGreaterThan(0);
+    for (const entry of probeCoverageEntries) {
+      expect(entry.consequence.length).toBeGreaterThan(0);
+      expect(entry.probes.length).toBeGreaterThan(0);
+    }
+  });
   it("requires a recorded-only-per-plan or accepted-trust-boundary entry to name the exact missing comparison and its owning item", () => {
     const nonLiveEntries = MIGRATION_WITNESS_AUDIT.filter(
       (entry): entry is Extract<MigrationWitnessAuditEntry, { comparison: "recorded-only-per-plan" | "accepted-trust-boundary" }> => (
@@ -152,6 +169,7 @@ describe("machine-checked witness audit", () => {
     const bareMarkerFields = (entry: MigrationWitnessAuditEntry): readonly string[] => {
       switch (entry.comparison) {
         case "compared-live": return [entry.consequence];
+        case "compared-live-probe-coverage": return [entry.consequence];
         case "structurally-protected": return [entry.comparator, entry.refusal];
         case "recorded-only-per-plan":
         case "accepted-trust-boundary": return [entry.missingComparison, entry.owningItem];
@@ -228,6 +246,47 @@ describe("reconciliation-class coverage, tied to the same audit inventory", () =
     })).toThrow(MigrationVerificationReportError);
   });
   it("passes once every reconciliation class has a coverage-vector entry (green after the red case above)", () => {
+    expect(() => realBody()).not.toThrow();
+  });
+});
+
+describe("public-probe coverage, tied to the same audit inventory", () => {
+  it("has an audit entry mapped to every public probe the report claims coverage for, and no other", () => {
+    // The MIGRATION_PUBLIC_PROBE_ORDER analogue of the mismatch-class
+    // cross-check above: publicProbeCoverage is a second, independent
+    // gate on activationEligible (owner's round-3 compound-case fix), so
+    // it needs the same drift-proofing the mismatch classes already
+    // have, not just the field-presence check the generic tests give it.
+    const probesNamedByLiveEntries = new Set(
+      MIGRATION_WITNESS_AUDIT
+        .filter((entry): entry is Extract<MigrationWitnessAuditEntry, { comparison: "compared-live-probe-coverage" }> => entry.comparison === "compared-live-probe-coverage")
+        .flatMap((entry) => entry.probes),
+    );
+    expect(probesNamedByLiveEntries).toEqual(new Set(MIGRATION_PUBLIC_PROBE_ORDER));
+  });
+  it("fails that cross-check when a live-compared probe-coverage witness's probes is dropped (red-first demonstration)", () => {
+    const withoutSearchProbe: readonly MigrationWitnessAuditEntry[] = MIGRATION_WITNESS_AUDIT.map((entry) => (
+      entry.id === "public-probe-coverage" && entry.comparison === "compared-live-probe-coverage"
+        ? { ...entry, probes: ["public-listing"] as const }
+        : entry
+    ));
+    const probesNamedByLiveEntries = new Set(
+      withoutSearchProbe
+        .filter((entry): entry is Extract<MigrationWitnessAuditEntry, { comparison: "compared-live-probe-coverage" }> => entry.comparison === "compared-live-probe-coverage")
+        .flatMap((entry) => entry.probes),
+    );
+    expect(probesNamedByLiveEntries).not.toEqual(new Set(MIGRATION_PUBLIC_PROBE_ORDER));
+    expect(probesNamedByLiveEntries.has("public-search")).toBe(false);
+  });
+  it("rejects a report body whose publicProbeCoverage vector omits a probe entirely", () => {
+    const incompleteProbeCoverage = MIGRATION_PUBLIC_PROBE_ORDER
+      .filter((probe) => probe !== "public-search")
+      .map((probe) => ({ probe, ran: true }));
+    expect(() => createMigrationVerificationReportBody({
+      ...fixtureBodyInput(), publicProbeCoverage: incompleteProbeCoverage,
+    })).toThrow(MigrationVerificationReportError);
+  });
+  it("passes once every public probe has a coverage-vector entry (green after the red case above)", () => {
     expect(() => realBody()).not.toThrow();
   });
 });

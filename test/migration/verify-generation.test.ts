@@ -38,7 +38,7 @@ import {
   type VerifyMigrationGenerationInput,
 } from "../../src/migration/verify-generation.js";
 import { MigrationVerificationReportStore } from "../../src/migration/verification-store.js";
-import { createMigrationVerificationReportBody, MIGRATION_MISMATCH_CLASSES } from "../../src/migration/verification-report.js";
+import { createMigrationVerificationReportBody, MIGRATION_MISMATCH_CLASSES, MIGRATION_PUBLIC_PROBE_ORDER } from "../../src/migration/verification-report.js";
 
 const HASH_A = "a".repeat(64);
 const FAKE_MIGRATIONS = [{ id: "0001", filename: "0001.sql", sql: "", sha256: HASH_A }];
@@ -959,6 +959,7 @@ describe("sortMismatches", () => {
       },
       classCoverage: MIGRATION_MISMATCH_CLASSES.map((mismatchClass) => ({ class: mismatchClass, ran: true })),
       publicProbeSha256: HASH_A,
+      publicProbeCoverage: MIGRATION_PUBLIC_PROBE_ORDER.map((probe) => ({ probe, ran: true })),
       sampleParameters: { version: 1, strideOrdinal: 97, sampleCount: 32, seedBasisSha256: HASH_A },
       mismatches, mismatchTotals,
     })).not.toThrow();
@@ -990,6 +991,10 @@ describe("verifyMigrationGeneration", () => {
       { class: "schema", ran: true },
       { class: "ledger", ran: true },
       { class: "sample", ran: true },
+    ]);
+    expect(result.report.body.publicProbeCoverage).toEqual([
+      { probe: "public-listing", ran: true },
+      { probe: "public-search", ran: true },
     ]);
     expect(runtime.close).toHaveBeenCalledTimes(1);
     expect(copySource.stream.close).toHaveBeenCalledTimes(1);
@@ -1663,6 +1668,7 @@ describe("truncateMismatchesPerClass", () => {
       },
       classCoverage: MIGRATION_MISMATCH_CLASSES.map((mismatchClass) => ({ class: mismatchClass, ran: true })),
       publicProbeSha256: HASH_A,
+      publicProbeCoverage: MIGRATION_PUBLIC_PROBE_ORDER.map((probe) => ({ probe, ran: true })),
       sampleParameters: { version: 1, strideOrdinal: 97, sampleCount: 32, seedBasisSha256: HASH_A },
       mismatches: truncated, mismatchTotals,
     })).not.toThrow();
@@ -1859,9 +1865,11 @@ describe("verifyMigrationGeneration: search self-match probe (round-2 P1)", () =
     // The owner's own fixture: search_v1 is broken in a way that leaves
     // every digest comparison agreeing (no listing drift, no census
     // drift, nothing else touched), so the ONLY signal a real operator
-    // would have that something is wrong is that classCoverage's sample
-    // bit is false and activationEligible is false, on an otherwise
-    // "clean" (zero-mismatch) report.
+    // would have that something is wrong is that publicProbeCoverage's
+    // public-search entry is false and activationEligible is false, on
+    // an otherwise "clean" (zero-mismatch) report. classCoverage's
+    // sample bit stays true, since listing (the other half of that
+    // class) ran fine -- the two probes have independent coverage.
     stubDestinationPrimitives();
     const recordCounts = Object.fromEntries(PORTABLE_RECORD_DOMAIN_ORDER.map((domain, index) => [domain, index])) as Partial<Record<PortableDomain, number>>;
     const copySource = fakeCopySource({ recordCounts });
@@ -1874,11 +1882,12 @@ describe("verifyMigrationGeneration: search self-match probe (round-2 P1)", () =
     const result = await verifyMigrationGeneration(baseInput({ homeDir: "/tmp/lcm-verify-search-broken" }), dependencies);
     expect(result.outcome).toBe("clean");
     expect(result.report.mismatches).toEqual([]);
-    expect(result.report.body.classCoverage).toContainEqual({ class: "sample", ran: false });
+    expect(result.report.body.classCoverage).toContainEqual({ class: "sample", ran: true });
+    expect(result.report.body.publicProbeCoverage).toContainEqual({ probe: "public-search", ran: false });
     expect(result.report.activationEligible).toBe(false);
   }, 15000);
 
-  it("finds a message searching for its own content and marks sample ran, folding the outcome into publicProbeSha256", async () => {
+  it("finds a message searching for its own content and marks public-search ran, folding the outcome into publicProbeSha256", async () => {
     stubDestinationPrimitives();
     const recordCounts = Object.fromEntries(PORTABLE_RECORD_DOMAIN_ORDER.map((domain, index) => [domain, index])) as Partial<Record<PortableDomain, number>>;
     // Two distinct candidates so a different seed can land on a
@@ -1891,7 +1900,7 @@ describe("verifyMigrationGeneration: search self-match probe (round-2 P1)", () =
     const runtime = fakeRuntime();
     const dependencies = dependenciesFor(copySource, runtime);
     const result = await verifyMigrationGeneration(baseInput({ homeDir: "/tmp/lcm-verify-search-self-match" }), dependencies);
-    expect(result.report.body.classCoverage).toContainEqual({ class: "sample", ran: true });
+    expect(result.report.body.publicProbeCoverage).toContainEqual({ probe: "public-search", ran: true });
     expect(result.report.activationEligible).toBe(true);
     // Changing which candidate the walk lands on (via a different
     // seedBasisSha256) changes the digest: the outcome is genuinely
@@ -1911,7 +1920,7 @@ describe("verifyMigrationGeneration: search self-match probe (round-2 P1)", () =
     const runtime = fakeRuntime();
     const dependencies = dependenciesFor(copySource, runtime);
     const result = await verifyMigrationGeneration(baseInput({ homeDir: "/tmp/lcm-verify-search-no-messages" }), dependencies);
-    expect(result.report.body.classCoverage).toContainEqual({ class: "sample", ran: false });
+    expect(result.report.body.publicProbeCoverage).toContainEqual({ probe: "public-search", ran: false });
     expect(result.report.activationEligible).toBe(false);
   }, 15000);
 
@@ -1930,16 +1939,20 @@ describe("verifyMigrationGeneration: search self-match probe (round-2 P1)", () =
     const runtime = fakeRuntime();
     const dependencies = dependenciesFor(copySource, runtime);
     const result = await verifyMigrationGeneration(baseInput({ homeDir: "/tmp/lcm-verify-search-pool-cap" }), dependencies);
-    expect(result.report.body.classCoverage).toContainEqual({ class: "sample", ran: true });
+    expect(result.report.body.publicProbeCoverage).toContainEqual({ probe: "public-search", ran: true });
   }, 15000);
 
-  it("round-2 P1 red case: a listing mismatch alongside a not-run search probe does not crash report construction", async () => {
-    // Compound failure the validator's own rule ("a not-run class must
-    // have zero evidence") would otherwise reject at construction: a
-    // genuine listing drift and a broken search path happening in the
-    // same pass. The listing mismatch is suppressed from the persisted
-    // evidence rather than crashing, since classCoverage already refuses
-    // eligibility on sample: false alone.
+  it("round-2 P1 red case: a listing mismatch alongside a not-run search probe retains the mismatch and still refuses eligibility", async () => {
+    // The compound case the owner explicitly did not want handled by
+    // suppression: a genuine listing drift and a broken search path in
+    // the same pass. Because publicProbeCoverage tracks the search
+    // probe's liveness independently of classCoverage's "sample" bit
+    // (which now reflects only whether listing ran, which is always),
+    // the listing mismatch is retained as real operator evidence AND
+    // activationEligible is refused via public-search: false -- neither
+    // property is sacrificed for the other, and the validator's "a
+    // not-run class must have zero evidence" rule is never even
+    // approached, because classCoverage's sample bit is true here.
     stubDestinationPrimitives();
     const recordCounts = Object.fromEntries(PORTABLE_RECORD_DOMAIN_ORDER.map((domain, index) => [domain, index])) as Partial<Record<PortableDomain, number>>;
     const conversationsRecords = [fakeConversationRecord("2026-01-01T00:00:00.111000Z", "first")];
@@ -1952,8 +1965,9 @@ describe("verifyMigrationGeneration: search self-match probe (round-2 P1)", () =
     });
     const dependencies = dependenciesFor(copySource, runtime);
     const result = await verifyMigrationGeneration(baseInput({ homeDir: "/tmp/lcm-verify-search-and-listing-both-broken" }), dependencies);
-    expect(result.report.mismatches.some((mismatch) => mismatch.domain === "public-listing")).toBe(false);
-    expect(result.report.body.classCoverage).toContainEqual({ class: "sample", ran: false });
+    expect(result.report.mismatches.some((mismatch) => mismatch.domain === "public-listing" && mismatch.class === "sample")).toBe(true);
+    expect(result.report.body.classCoverage).toContainEqual({ class: "sample", ran: true });
+    expect(result.report.body.publicProbeCoverage).toContainEqual({ probe: "public-search", ran: false });
     expect(result.report.activationEligible).toBe(false);
   }, 15000);
 });

@@ -172,6 +172,41 @@ function parseMigrationClassCoverageVector(value: unknown): MigrationClassCovera
 }
 
 /**
+ * The step 5 public reads are two independent probes (ordered-listing,
+ * search self-match), and "sample" is one mismatch class that both of
+ * them can feed. Collapsing both probes' liveness into that single
+ * class-coverage bit meant a genuine listing mismatch and an unrelated
+ * not-run search probe in the same pass had no honest joint
+ * representation: either the mismatch was suppressed to keep "not-run
+ * classes have zero evidence" true, or the bit was forced true and the
+ * search probe's own failure silently stopped mattering. This vector
+ * gives each public probe its own ran bit, in MIGRATION_PUBLIC_PROBE_ORDER,
+ * so a listing mismatch is retained as evidence exactly when listing ran
+ * (independent of search), and a not-run search probe refuses
+ * activationEligible on its own (independent of what listing found) --
+ * the compound case no longer needs handling because it can no longer
+ * produce a contradiction.
+ */
+export const MIGRATION_PUBLIC_PROBE_ORDER = Object.freeze(["public-listing", "public-search"] as const);
+export type MigrationPublicProbeName = (typeof MIGRATION_PUBLIC_PROBE_ORDER)[number];
+export type MigrationPublicProbeCoverageEntry = Readonly<{ probe: MigrationPublicProbeName; ran: boolean }>;
+export type MigrationPublicProbeCoverageVector = readonly MigrationPublicProbeCoverageEntry[];
+
+function parseMigrationPublicProbeCoverageVector(value: unknown): MigrationPublicProbeCoverageVector {
+  if (!Array.isArray(value) || value.length !== MIGRATION_PUBLIC_PROBE_ORDER.length) {
+    reportError("invalid-input", "public probe coverage vector must have exactly one entry per public probe");
+  }
+  const entries = value.map((entry, index) => {
+    const record = assertExactObject(entry, ["probe", "ran"], "public probe coverage entry");
+    if (record.probe !== MIGRATION_PUBLIC_PROBE_ORDER[index] || typeof record.ran !== "boolean") {
+      reportError("invalid-input", "public probe coverage vector is not in the frozen probe order");
+    }
+    return { probe: record.probe as MigrationPublicProbeName, ran: record.ran };
+  });
+  return deepFreeze(entries);
+}
+
+/**
  * Frozen ordering marker for the step 5 public probes: they always run
  * before the step 6 census window opens, and only ever describe an
  * instant at or before the census. The report body carries no wall clock,
@@ -410,6 +445,14 @@ export type MigrationVerificationReportBody = Readonly<{
    * only that it is a hash, the same way it treats bindingSha256.
    */
   publicProbeSha256: string;
+  /**
+   * Per-probe liveness for the two step 5 public reads, independent of
+   * classCoverage's "sample" bit: a probe not running this pass refuses
+   * activationEligible on its own, regardless of what the other probe
+   * found. See MIGRATION_PUBLIC_PROBE_ORDER's own comment for why this
+   * is its own vector rather than folded into classCoverage.
+   */
+  publicProbeCoverage: MigrationPublicProbeCoverageVector;
   reconciliationOutcomeDigestSha256: string;
   sampleParameters: MigrationVerificationSampleParameters;
 }>;
@@ -429,6 +472,7 @@ export type CreateMigrationVerificationReportBodyInput = Readonly<{
   canonicalDelta: MigrationCanonicalDelta;
   classCoverage: MigrationClassCoverageVector;
   publicProbeSha256: string;
+  publicProbeCoverage: MigrationPublicProbeCoverageVector;
   sampleParameters: MigrationVerificationSampleParameters;
   mismatches: readonly MigrationVerificationMismatch[];
   mismatchTotals: readonly MigrationVerificationMismatchTotal[];
@@ -467,6 +511,7 @@ export function createMigrationVerificationReportBody(
   const censusVector = parseMigrationCensusVector(input.censusVector);
   const canonicalDelta = parseMigrationCanonicalDelta(input.canonicalDelta);
   const classCoverage = parseMigrationClassCoverageVector(input.classCoverage);
+  const publicProbeCoverage = parseMigrationPublicProbeCoverageVector(input.publicProbeCoverage);
   const sampleParameters = parseMigrationVerificationSampleParameters(input.sampleParameters);
   if (!Array.isArray(input.mismatches) || !Array.isArray(input.mismatchTotals)) {
     reportError("invalid-input", "verification report mismatch evidence is invalid");
@@ -501,6 +546,7 @@ export function createMigrationVerificationReportBody(
     canonicalDelta,
     classCoverage,
     publicProbeSha256: input.publicProbeSha256,
+    publicProbeCoverage,
     reconciliationOutcomeDigestSha256: migrationReconciliationOutcomeDigest(mismatches, mismatchTotals),
     sampleParameters,
   });
@@ -545,6 +591,22 @@ function reportPayloadSha256(
   ]);
 }
 
+/**
+ * Eligibility requires clean evidence AND every reconciliation class
+ * having run AND every independent public probe having run. The three
+ * conjuncts are deliberately separate: classCoverage answers "did each
+ * mismatch class execute", publicProbeCoverage answers "did each public
+ * probe execute", and neither can stand in for the other -- folding the
+ * search probe's liveness into classCoverage's single "sample" bit was
+ * round 2's P1 (a listing mismatch and a not-run search probe in the
+ * same pass had no honest joint representation under one bit).
+ */
+function computeActivationEligible(
+  clean: boolean, classCoverage: MigrationClassCoverageVector, publicProbeCoverage: MigrationPublicProbeCoverageVector,
+): boolean {
+  return clean && classCoverage.every((entry) => entry.ran) && publicProbeCoverage.every((entry) => entry.ran);
+}
+
 export function createMigrationVerificationReport(
   input: CreateMigrationVerificationReportInput,
 ): MigrationVerificationReport {
@@ -553,7 +615,7 @@ export function createMigrationVerificationReport(
   const mismatches = input.mismatches.map(parseMismatch);
   const mismatchTotals = input.mismatchTotals.map(parseMismatchTotal);
   const clean = mismatchTotals.length === 0;
-  const activationEligible = clean && body.classCoverage.every((entry) => entry.ran);
+  const activationEligible = computeActivationEligible(clean, body.classCoverage, body.publicProbeCoverage);
   const reportSha256 = reportPayloadSha256(body, mismatches, mismatchTotals, clean, activationEligible);
   return deepFreeze({
     version: 1,
@@ -598,6 +660,7 @@ export function parseMigrationVerificationReport(value: unknown): MigrationVerif
     canonicalDelta: (record.body as RecordValue).canonicalDelta as MigrationCanonicalDelta,
     classCoverage: (record.body as RecordValue).classCoverage as MigrationClassCoverageVector,
     publicProbeSha256: (record.body as RecordValue).publicProbeSha256 as string,
+    publicProbeCoverage: (record.body as RecordValue).publicProbeCoverage as MigrationPublicProbeCoverageVector,
     sampleParameters: (record.body as RecordValue).sampleParameters as MigrationVerificationSampleParameters,
     mismatches: Array.isArray(record.mismatches) ? record.mismatches : [],
     mismatchTotals: Array.isArray(record.mismatchTotals) ? record.mismatchTotals : [],
@@ -609,7 +672,7 @@ export function parseMigrationVerificationReport(value: unknown): MigrationVerif
   const mismatchTotals = record.mismatchTotals.map(parseMismatchTotal);
   const clean = mismatchTotals.length === 0;
   if (clean !== record.clean) reportError("unexpected-state", "verification report clean flag does not match its mismatch totals");
-  const activationEligible = clean && body.classCoverage.every((entry) => entry.ran);
+  const activationEligible = computeActivationEligible(clean, body.classCoverage, body.publicProbeCoverage);
   if (activationEligible !== record.activationEligible) {
     reportError("unexpected-state", "verification report activationEligible flag does not match its class coverage");
   }

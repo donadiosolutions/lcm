@@ -660,11 +660,41 @@ failures that byte-for-byte content equality cannot see:
   candidate in the pool exhausts without a match, the probe cannot tell
   "search is broken" apart from "the sampled candidates happen not to
   index to anything" and does not guess: it marks itself not-run with its
-  reason, the `sample` class's classCoverage bit is false, and
-  `activationEligible` cannot be true for that pass even though nothing
-  is recorded as a mismatch. On a real project with real message content
-  this does not trigger; it exists to catch a `search_v1` configuration
-  that is wrong in a way no digest comparison can see.
+  reason, and `activationEligible` cannot be true for that pass even
+  though nothing is recorded as a mismatch. On a real project with real
+  message content this does not trigger; it exists to catch a
+  `search_v1` configuration that is wrong in a way no digest comparison
+  can see.
+
+  The search self-match candidate pool draws from a fixed-size, early
+  slice of the source's canonical message order (the first
+  `MIGRATION_SEARCH_PROBE_CANDIDATE_POOL_SIZE` messages), not the whole
+  domain: reading an arbitrary position deep in the domain would require
+  either a second full domain read or buffering the domain in memory,
+  both of which this item has avoided elsewhere for the same cost
+  reason. The seed drawn from `sampleParameters.seedBasisSha256`
+  chooses the starting index and wrap order within that fixed pool, so
+  the walk is still deterministic and reproducible from the recorded
+  candidate ordinal, but the probe only ever samples an early canonical
+  region of the domain rather than the whole domain. This is a real
+  limitation of what the probe's pass proves -- content anomalies
+  confined to messages outside the pool are not covered by this
+  particular probe -- even though it is the right trade for a liveness
+  check whose job is to catch `search_v1` configuration drift rather
+  than to sample the domain exhaustively.
+
+  The ordered-listing probe's own `ran` state and the search probe's own
+  `ran` state are tracked independently (`publicProbeCoverage`, one
+  entry per probe), never folded into a single `sample`-class coverage
+  bit: a genuine listing-ordering mismatch stays recorded as evidence
+  exactly when the listing probe ran, regardless of whether the search
+  probe could evaluate that pass, and a not-run search probe refuses
+  `activationEligible` on its own regardless of what the listing probe
+  found. Collapsing both probes' liveness into one bit meant a listing
+  mismatch found in the same pass as a not-run search probe had no
+  honest way to be recorded -- the report would either have to discard
+  real evidence of a listing-ordering bug, or claim `sample` fully ran
+  when only half of it did.
 
 ### The public-probe sampling skew
 

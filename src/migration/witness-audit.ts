@@ -1,4 +1,4 @@
-import type { MigrationMismatchClass, MigrationVerificationReportBody } from "./verification-report.js";
+import type { MigrationMismatchClass, MigrationPublicProbeName, MigrationVerificationReportBody } from "./verification-report.js";
 
 /**
  * The synthesis-round rule (V5/V6): a witness recorded without a
@@ -71,6 +71,7 @@ import type { MigrationMismatchClass, MigrationVerificationReportBody } from "./
  */
 export type MigrationWitnessComparisonKind =
   | "compared-live"
+  | "compared-live-probe-coverage"
   | "structurally-protected"
   | "recorded-only-per-plan"
   | "accepted-trust-boundary";
@@ -97,6 +98,24 @@ export type MigrationWitnessAuditEntry =
        * live-compared witness here, and vice versa.
        */
       mismatchClasses: readonly MigrationMismatchClass[];
+    }>)
+  | (MigrationWitnessAuditEntryCommon & Readonly<{
+      comparison: "compared-live-probe-coverage";
+      /** The real consequence when this witness disagrees this pass -- never a placeholder. */
+      consequence: string;
+      /**
+       * The public probes this witness's liveness gates, via
+       * publicProbeCoverage rather than a mismatch class. Round-2 P1's
+       * search probe is the reason this shape exists: it gates
+       * activationEligible on its own outcome without ever producing a
+       * MigrationVerificationMismatch, so "compared-live"'s
+       * mismatchClasses requirement (which the audit test enforces as
+       * non-empty) cannot honestly describe it. Ties this inventory to
+       * MIGRATION_PUBLIC_PROBE_ORDER so the two cannot silently drift
+       * apart, the same discipline compared-live's mismatchClasses
+       * applies to classCoverage.
+       */
+      probes: readonly MigrationPublicProbeName[];
     }>)
   | (MigrationWitnessAuditEntryCommon & Readonly<{
       comparison: "structurally-protected";
@@ -237,11 +256,11 @@ export const MIGRATION_WITNESS_AUDIT: readonly MigrationWitnessAuditEntry[] = Ob
     mismatchClasses: ["sample"],
   },
   {
-    id: "search-self-match-probe", bodyField: "publicProbeSha256",
-    description: "The plan-v4 step 5 lcm.search_v1 search probe: PostgreSqlLexicalSearchRepository.searchMessages, run before the window through the real repository, walking a bounded pool of source message candidates starting at an index derived from sampleParameters.seedBasisSha256 until one candidate's own content produces a non-empty destination search result (a self-match, never a cross-engine comparison against SQLite's own search behaviour).",
-    comparison: "compared-live",
-    consequence: "when a match is found, folds ran plus the chosen candidate's canonical ordinal into publicProbeSha256, and the sample class's classCoverage bit is true; when every candidate in the pool is exhausted without a match, folds the not-run reason into publicProbeSha256 instead, the sample class's classCoverage bit is false, and activationEligible cannot be true this pass -- an attributed absence per the frozen absence rule, not a mismatch and not a silent pass",
-    mismatchClasses: ["sample"],
+    id: "public-probe-coverage", bodyField: "publicProbeCoverage",
+    description: "publicProbeCoverage's two entries: public-listing is unconditionally true (runOrderedListingProbe always executes before this vector is built, so it has no reachable not-run outcome); public-search is the plan-v4 step 5 lcm.search_v1 search probe -- PostgreSqlLexicalSearchRepository.searchMessages, run before the window through the real repository, walking a bounded pool of source message candidates starting at an index derived from sampleParameters.seedBasisSha256 until one candidate's own content produces a non-empty destination search result (a self-match, never a cross-engine comparison against SQLite's own search behaviour).",
+    comparison: "compared-live-probe-coverage",
+    consequence: "public-listing's entry is always true. For public-search: when a match is found, folds ran plus the candidate pool size and the chosen candidate's canonical ordinal into publicProbeSha256, and its entry is true; when every candidate in the pool is exhausted without a match, folds the not-run reason into publicProbeSha256 instead, its entry is false, and activationEligible cannot be true this pass regardless of what the listing probe or any mismatch class found -- an attributed absence per the frozen absence rule, not a mismatch and not a silent pass",
+    probes: ["public-listing", "public-search"],
   },
   {
     id: "project-map-witness", bodyField: "projectMapWitnessSha256",
@@ -273,7 +292,7 @@ export const MIGRATION_WITNESS_AUDIT: readonly MigrationWitnessAuditEntry[] = Ob
   },
   {
     id: "sample-parameters", bodyField: "sampleParameters",
-    description: "Caller-supplied frozen sample stride/count/seed-basis parameters. seedBasisSha256 now drives search-self-match-probe's candidate walk (see that entry); strideOrdinal and sampleCount remain unused by any per-record stride sampler, which this driver pass does not implement.",
+    description: "Caller-supplied frozen sample stride/count/seed-basis parameters. seedBasisSha256 now drives public-probe-coverage's search candidate walk (see that entry); strideOrdinal and sampleCount remain unused by any per-record stride sampler, which this driver pass does not implement.",
     comparison: "accepted-trust-boundary",
     missingComparison: "strideOrdinal and sampleCount do not drive any per-record stride sampler, which this driver pass does not implement; bound into the report identity but otherwise inert",
     owningItem: "plan-v4's sampling scope, not yet implemented",

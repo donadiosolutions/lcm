@@ -36,8 +36,10 @@ import {
   createMigrationVerificationReport,
   MIGRATION_MISMATCH_CLASSES,
   MIGRATION_MISMATCH_CLASS_TRUNCATION_LIMIT, MIGRATION_PUBLIC_PROBE_ORDERING_SHA256,
+  MIGRATION_PUBLIC_PROBE_ORDER,
   migrationMismatchClassOrdinal,
   type MigrationClassCoverageVector,
+  type MigrationPublicProbeCoverageVector,
   type CreateMigrationVerificationReportInput, type MigrationMismatchClass, type MigrationQueueClassificationWitness,
   type MigrationReconciliationDomain, type MigrationSourceWitnessDigests, type MigrationVerificationMismatch,
   type MigrationVerificationMismatchTotal, type MigrationVerificationReport, type MigrationVerificationSampleParameters,
@@ -62,25 +64,25 @@ export const DRIVER_IMPLEMENTED_MISMATCH_CLASSES: ReadonlySet<MigrationMismatchC
   "count", "digest", "identity", "sequence", "schema", "sample", "relation", "ledger",
 ]);
 
-/**
- * Round-2 P1 (X2): "sample" is the one class whose ran bit this driver
- * derives from what actually happened this pass, via searchProbeRan,
- * rather than from DRIVER_IMPLEMENTED_MISMATCH_CLASSES alone.
- * DRIVER_IMPLEMENTED_MISMATCH_CLASSES still says the driver has a
- * mechanism for "sample" (the listing probe unconditionally runs; the
- * search probe has a real implementation below it), but "mechanism
- * exists in code" and "ran this specific pass" are different claims --
- * conflating them for "sample" was exactly how a destination whose
- * search path was never touched could still publish as
- * activationEligible. Every other class here keeps the static
- * declaration: unlike search, none of them has a reachable per-run
- * "could not evaluate" outcome distinct from either running cleanly or
- * producing a mismatch.
- */
-function buildClassCoverageVector(searchProbeRan: boolean): MigrationClassCoverageVector {
+function buildClassCoverageVector(): MigrationClassCoverageVector {
   return MIGRATION_MISMATCH_CLASSES.map((mismatchClass) => ({
-    class: mismatchClass,
-    ran: mismatchClass === "sample" ? searchProbeRan : DRIVER_IMPLEMENTED_MISMATCH_CLASSES.has(mismatchClass),
+    class: mismatchClass, ran: DRIVER_IMPLEMENTED_MISMATCH_CLASSES.has(mismatchClass),
+  }));
+}
+
+/**
+ * Round-2 follow-up to X2: the search probe's liveness has its own
+ * vector, separate from classCoverage's "sample" bit, so a genuine
+ * listing mismatch and a not-run search probe in the same pass have an
+ * honest joint representation instead of a forced choice between
+ * suppressing real evidence and crashing report construction. The
+ * listing probe always runs unconditionally; the search probe's ran bit
+ * is this pass's actual outcome. See
+ * MIGRATION_PUBLIC_PROBE_ORDER's own comment for the reasoning.
+ */
+function buildPublicProbeCoverageVector(searchProbeRan: boolean): MigrationPublicProbeCoverageVector {
+  return MIGRATION_PUBLIC_PROBE_ORDER.map((probe) => ({
+    probe, ran: probe === "public-listing" ? true : searchProbeRan,
   }));
 }
 
@@ -1369,22 +1371,9 @@ async function computeVerificationReport(
         destinationRead.dependencyEdges, destinationRead.recordIdentities,
       );
       const domainOrder = [...PORTABLE_RECORD_DOMAIN_ORDER, "schema", "ledger", "public-listing"] as const;
-      // classCoverage's own construction-time validator refuses any
-      // mismatch total naming a class the coverage vector marks as
-      // not-run: "not-run" must mean zero evidence for the whole class,
-      // never a partial state. sample.ran is false exactly when the
-      // search probe could not evaluate this pass, so a listing mismatch
-      // found in that same pass cannot be recorded under class "sample"
-      // without contradicting that declaration -- it is suppressed here
-      // rather than crashing report construction. classCoverage's
-      // sample: false already refuses activation eligibility on its
-      // own, so no evidence is silently accepted as clean; the specific
-      // listing-drift detail is simply not the evidence carried this
-      // pass when the search probe itself could not run.
-      const sampleMismatches = searchProbeOutcome.ran && publicListingMismatch ? [publicListingMismatch] : [];
       const allMismatches = [
         ...countMismatches, ...sequenceMismatches, ...relationEdgeMismatches, ...relationDanglingMismatches,
-        ...ledgerMismatches, ...sampleMismatches,
+        ...ledgerMismatches, ...(publicListingMismatch ? [publicListingMismatch] : []),
       ];
       const fullMismatches = sortMismatches(allMismatches, domainOrder);
       // Totals must reflect the full (untruncated) evidence: truncation is
@@ -1410,11 +1399,13 @@ async function computeVerificationReport(
       const publicProbeSha256 = migrationWitnessSha256([
         "lcm-migration-verification-public-probe-v1", MIGRATION_PUBLIC_PROBE_ORDERING_SHA256, publicListingSha256,
         // The search probe's outcome folds in here so a report can never
-        // again record and discard it: ran plus the chosen candidate's
-        // ordinal when it ran, or the not-run reason when it did not --
-        // never the candidate's content, and never a query string.
+        // again record and discard it: ran, the fixed candidate pool
+        // size and the chosen candidate's ordinal when it ran (both
+        // needed to reproduce which candidate was tried without reading
+        // the driver's own constant), or the not-run reason when it did
+        // not -- never the candidate's content, and never a query string.
         searchProbeOutcome.ran
-          ? ["search-self-match", true, searchProbeOutcome.chosenOrdinal]
+          ? ["search-self-match", true, MIGRATION_SEARCH_PROBE_CANDIDATE_POOL_SIZE, searchProbeOutcome.chosenOrdinal]
           : ["search-self-match", false, searchProbeOutcome.notRunReason],
       ]);
       const reportInput: CreateMigrationVerificationReportInput = {
@@ -1422,8 +1413,9 @@ async function computeVerificationReport(
         manifestRevision: input.manifestRevision, manifestChecksumSha256: input.manifestChecksumSha256,
         sourceWitness, destinationIdentity, destinationSchemaWitness,
         projectMapWitnessSha256: input.projectMapWitnessSha256, queueClassificationWitness: input.queueClassificationWitness,
-        censusVector, canonicalDelta, classCoverage: buildClassCoverageVector(searchProbeOutcome.ran),
-        publicProbeSha256, sampleParameters: input.sampleParameters,
+        censusVector, canonicalDelta, classCoverage: buildClassCoverageVector(),
+        publicProbeSha256, publicProbeCoverage: buildPublicProbeCoverageVector(searchProbeOutcome.ran),
+        sampleParameters: input.sampleParameters,
         mismatches, mismatchTotals,
       };
       return createMigrationVerificationReport(reportInput);

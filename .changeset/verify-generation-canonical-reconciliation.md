@@ -10,9 +10,13 @@ content-addressed report before any activation step may consider the
 generation.
 
 Publication requires both a clean report (no recorded mismatches, including
-the public-probe sample class) and full reconciliation class coverage; the
-persisted report records both as `classCoverage` and `activationEligible`
-fields, so eligibility is provable from the artifact rather than assumed. A
+the public-probe sample class) and full reconciliation class coverage and
+full public-probe coverage; the persisted report records all three as
+`classCoverage`, `publicProbeCoverage` and `activationEligible` fields
+(the two coverage vectors are independent, so a genuine listing-ordering
+mismatch is never discarded just because the unrelated search probe could
+not evaluate that pass), so eligibility is provable from the artifact
+rather than assumed. A
 report with mismatches is still persisted in full as operator evidence, but
 requires explicit abort and a new generation rather than an in-place retry.
 Reconciliation now includes a sequence self-consistency bound (an identity
@@ -22,11 +26,13 @@ sequence rather than collapsing both into the same refusal), and the
 step-5 public reads run two probes through the real PostgreSQL repository
 paths: an ordered-listing probe compared against the source's own canonical
 ordering, and a search self-match probe that finds a sampled message by its
-own content through `lcm.search_v1`. If no sampled message can be found
-this way, the sample class is marked not-run and activation eligibility is
-refused for that pass rather than silently treated as a pass, since a
-search configuration wrong in a way no digest comparison can see is exactly
-what this probe exists to catch.
+own content through `lcm.search_v1`, sampled from a fixed-size early
+slice of the source's canonical order rather than the whole domain. If no
+sampled message can be found this way, the search probe is marked not-run
+in `publicProbeCoverage` and activation eligibility is refused for that
+pass rather than silently treated as a pass, since a search configuration
+wrong in a way no digest comparison can see is exactly what this probe
+exists to catch.
 
 Reconciliation also includes a foreign-key edge-set equality check (a
 `relation`-class mismatch names the child record whose reference no
