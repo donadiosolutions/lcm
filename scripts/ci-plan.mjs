@@ -37,10 +37,12 @@ export const GRAPH_VISIBLE_PATTERNS = Object.freeze([
   /^test\/(?!setup\/)(?:(?!fixtures\/).)+\.ts$/u,
 ]);
 
-// Paths that tests read from disk instead of importing. A change to one of
-// them cannot be traced through the module graph, so the listed test files
-// always run. `test/scripts/ci-plan.test.ts` checks that every test file that
-// literally references one of these paths is listed here.
+// Paths that tests consume without importing them: documentation and
+// changesets read from disk, and test files another test spawns as a child
+// Vitest run. A change to one of them cannot be traced through the module
+// graph, so the listed test files always run, whether or not the path is
+// itself graph-visible. `test/scripts/ci-plan.test.ts` checks that every test
+// file that literally references one of these paths is listed here.
 export const GRAPH_INVISIBLE_INPUTS = Object.freeze([
   Object.freeze({
     name: "documentation",
@@ -60,6 +62,11 @@ export const GRAPH_INVISIBLE_INPUTS = Object.freeze([
       "test/scripts/version-packages.test.ts",
       "test/update-patterns-workflow.test.ts",
     ]),
+  }),
+  Object.freeze({
+    name: "spawned-tests",
+    pattern: /^test\/timezone-fixture\.test\.ts$/u,
+    tests: Object.freeze(["test/timezone-fixture-runner.test.ts"]),
   }),
 ]);
 
@@ -104,10 +111,9 @@ export function graphInvisibleTests(path) {
 export function classifyChanges(changed) {
   const alwaysRun = new Set();
   for (const path of changed) {
-    if (isGraphVisible(path)) continue;
     const mapped = graphInvisibleTests(path);
-    if (mapped.length === 0) return { mode: "full", reason: path, alwaysRun: [] };
     for (const test of mapped) alwaysRun.add(test);
+    if (mapped.length === 0 && !isGraphVisible(path)) return { mode: "full", reason: path, alwaysRun: [] };
   }
   return { mode: "selective", reason: undefined, alwaysRun: [...alwaysRun].sort() };
 }

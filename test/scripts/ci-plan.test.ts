@@ -90,6 +90,7 @@ describe("CI plan classification", () => {
     expect(graphInvisibleTests("README.md")).toEqual([...GRAPH_INVISIBLE_INPUTS[0].tests]);
     expect(graphInvisibleTests("LICENSE")).toEqual([...GRAPH_INVISIBLE_INPUTS[0].tests]);
     expect(graphInvisibleTests(".changeset/x.md")).toEqual([...GRAPH_INVISIBLE_INPUTS[1].tests]);
+    expect(graphInvisibleTests("test/timezone-fixture.test.ts")).toEqual(["test/timezone-fixture-runner.test.ts"]);
     expect(graphInvisibleTests("package.json")).toEqual([]);
     expect(graphInvisibleTests("docs-old/x.md")).toEqual([]);
     for (const input of GRAPH_INVISIBLE_INPUTS) {
@@ -109,6 +110,13 @@ describe("CI plan classification", () => {
     expect(classifyChanges([".changeset/a.md", "docs/b.md"]).alwaysRun).toEqual(
       [...new Set([...GRAPH_INVISIBLE_INPUTS[0].tests, ...GRAPH_INVISIBLE_INPUTS[1].tests])].sort(),
     );
+    // A spawned test file is graph-visible (it runs itself) and still maps
+    // to the runner that executes it under other time zones.
+    expect(classifyChanges(["test/timezone-fixture.test.ts"])).toEqual({
+      mode: "selective",
+      reason: undefined,
+      alwaysRun: ["test/timezone-fixture-runner.test.ts"],
+    });
     for (const path of ["package.json", "vitest.config.ts", "test/setup/x.ts", "src/a.sql", ".github/workflows/ci.yml", "scripts/x.mjs", "test/fixtures/a.jsonl"]) {
       expect(classifyChanges(["src/a.ts", path])).toEqual({ mode: "full", reason: path, alwaysRun: [] });
     }
@@ -362,6 +370,8 @@ describe("graph-invisible input table completeness", () => {
       /readRepositoryFile\("(?:docs\/|README\.md|ACKNOWLEDGMENTS\.md|LICENSE)/u,
     ],
     changesets: [/new URL\("(?:\.\.\/)*\.changeset\//u],
+    // A child Vitest invocation of the fixture file.
+    "spawned-tests": [/"run", "test\/timezone-fixture\.test\.ts"/u],
   };
 
   function* testFiles(directory: string): Generator<string> {
@@ -379,6 +389,7 @@ describe("graph-invisible input table completeness", () => {
     for (const input of GRAPH_INVISIBLE_INPUTS) {
       const mapped = new Set(input.tests);
       const missing = sources
+        .filter(({ file }) => !input.pattern.test(file))
         .filter(({ source }) => readers[input.name]!.some((reader) => reader.test(source)))
         .map(({ file }) => file)
         .filter((file) => !mapped.has(file));
