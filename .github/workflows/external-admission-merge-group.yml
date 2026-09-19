@@ -29,6 +29,6 @@ jobs:
           fi
 
           # Every PR head already passed exact-head CI and DCO. Sensitive heads
-          # also supplied trusted Copilot execution or exact Dependabot provenance.
+          # also supplied authenticated exact-head Copilot dynamic execution.
           # Those sources do not report on synthetic merge commits.
           echo "Trusted pull-request admission passed before merge-queue admission."

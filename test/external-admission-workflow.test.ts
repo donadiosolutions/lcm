@@ -352,10 +352,6 @@ if [[ "$2" == "evaluate-review-check" ]]; then
   printf '%s\\n' '{"state":"missing","ready":false,"pending":true}'
   exit 0
 fi
-if [[ "$2" == "evaluate-dependabot-pr" ]]; then
-  printf '%s\\n' '{"candidate":false,"ready":false,"terminalFailure":"dependabot-pr"}'
-  exit 0
-fi
 if [[ "$2" == "evaluate-sensitive-admission" ]]; then
   printf '%s\\n' '{"ready":true,"evidenceClass":"ci-dco","evidenceIds":[]}'
   exit 0
@@ -450,13 +446,16 @@ type AdmissionScenario =
   | "duplicate-base-candidates"
   | "sensitive-without-evidence"
   | "sensitive-copilot"
-  | "sensitive-dependabot"
-  | "spoofed-review-valid-dependabot"
-  | "denied-dependabot-valid-review"
+  | "sensitive-dependabot-without-copilot"
+  | "sensitive-dependabot-copilot"
+  | "sensitive-review-api-pending"
   | "sensitive-file-drift"
   | "sensitive-postgresql-template-init"
   | "sensitive-postgresql-cached-run-init"
   | "sensitive-postgresql-init"
+  | "sensitive-postgresql-harness"
+  | "sensitive-postgresql-operational-fixture"
+  | "sensitive-postgresql-portable-fixture"
   | "transient-pr-files"
   | "malformed-pr-files";
 
@@ -550,10 +549,8 @@ function runAdmissionScenario(
   let associatedPullRequests = [makeAdmissionPullRequest()];
   let pullRequest = makeAdmissionPullRequest();
   let pullRequestFiles = [[{ filename: "docs/external-admission.md", status: "modified" }]];
-  let pullRequestCommits: unknown[][] = [];
   let checkRuns = [ciCheckRun, dcoCheckRun];
   let reviewRunApiFails = false;
-  let commitApiFails = false;
   let pullRequestFilesApiFails = false;
   let pullRequestFileSnapshots: unknown[] | undefined;
   let branchProtectionSequence = ["true"];
@@ -627,47 +624,29 @@ function runAdmissionScenario(
       pullRequestFiles = [[{ filename: ".github/scripts/external-admission.sh", status: "modified" }]];
       checkRuns = [ciCheckRun, dcoCheckRun, reviewCheckRun];
       break;
-    case "sensitive-dependabot": {
+    case "sensitive-dependabot-without-copilot": {
       pullRequest = makeAdmissionPullRequest({
         user: { id: 49699333, login: "dependabot[bot]", type: "Bot" },
         headRef: "dependabot/npm_and_yarn/example-1.2.3",
       });
       associatedPullRequests = [pullRequest];
       pullRequestFiles = [[{ filename: "pnpm-lock.yaml", status: "modified" }]];
-      pullRequestCommits = [[{
-        sha: "b".repeat(40),
-        commit: { verification: { verified: true, reason: "valid" } },
-        author: { id: 49699333, login: "dependabot[bot]", type: "Bot" },
-        committer: { id: 19864447, login: "web-flow", type: "User" },
-      }]];
       break;
     }
-    case "spoofed-review-valid-dependabot": {
+    case "sensitive-dependabot-copilot": {
       pullRequest = makeAdmissionPullRequest({
         user: { id: 49699333, login: "dependabot[bot]", type: "Bot" },
         headRef: "dependabot/npm_and_yarn/example-1.2.3",
       });
       associatedPullRequests = [pullRequest];
-      pullRequestFiles = [[{ filename: "package.json", status: "modified" }]];
-      pullRequestCommits = [[{
-        sha: "b".repeat(40),
-        commit: { verification: { verified: true, reason: "valid" } },
-        author: { id: 49699333, login: "dependabot[bot]", type: "Bot" },
-        committer: { id: 49699333, login: "dependabot[bot]", type: "Bot" },
-      }]];
-      checkRuns = [ciCheckRun, dcoCheckRun, { ...reviewCheckRun, id: 99 }];
-      reviewRunApiFails = true;
+      pullRequestFiles = [[{ filename: "pnpm-lock.yaml", status: "modified" }]];
+      checkRuns = [ciCheckRun, dcoCheckRun, reviewCheckRun];
       break;
     }
-    case "denied-dependabot-valid-review":
-      pullRequest = makeAdmissionPullRequest({
-        user: { id: 49699333, login: "dependabot[bot]", type: "Bot" },
-        headRef: "dependabot/npm_and_yarn/example-1.2.3",
-      });
-      associatedPullRequests = [pullRequest];
+    case "sensitive-review-api-pending":
       pullRequestFiles = [[{ filename: "package.json", status: "modified" }]];
       checkRuns = [ciCheckRun, dcoCheckRun, reviewCheckRun];
-      commitApiFails = true;
+      reviewRunApiFails = true;
       break;
     case "sensitive-file-drift":
       checkRuns = [ciCheckRun, dcoCheckRun, reviewCheckRun];
@@ -692,6 +671,21 @@ function runAdmissionScenario(
     case "sensitive-postgresql-init":
       pullRequestFiles = [[{
         filename: "test/postgresql/init.sh",
+        status: "modified",
+      }]];
+      break;
+    case "sensitive-postgresql-harness":
+      pullRequestFiles = [[{ filename: "test/postgresql/harness.ts", status: "modified" }]];
+      break;
+    case "sensitive-postgresql-operational-fixture":
+      pullRequestFiles = [[{
+        filename: "test/postgresql/operational-fixture.ts",
+        status: "modified",
+      }]];
+      break;
+    case "sensitive-postgresql-portable-fixture":
+      pullRequestFiles = [[{
+        filename: "test/postgresql/portable-fixture.ts",
         status: "modified",
       }]];
       break;
@@ -792,11 +786,6 @@ if [[ "$endpoint" == repos/*/pulls/123/files?per_page=100 ]]; then
   jq -c --argjson index "$file_index" '.[$index]' <<<"$PULL_REQUEST_FILE_SNAPSHOTS_JSON"
   exit 0
 fi
-if [[ "$endpoint" == repos/*/pulls/123/commits?per_page=100 ]]; then
-  if [[ "$COMMIT_API_FAILS" == true ]]; then exit 96; fi
-  printf '%s\n' "$PULL_REQUEST_COMMITS_JSON"
-  exit 0
-fi
   if [[ "$endpoint" == repos/*/branches/* ]]; then
   call_count=0
   if [[ -f "$BRANCH_CALLS" ]]; then read -r call_count < "$BRANCH_CALLS"; fi
@@ -859,7 +848,6 @@ exit 99
         BRANCH_PROTECTION_SEQUENCE: branchProtectionSequence.join(","),
         CHECK_RUN_PAGES_JSON: JSON.stringify([{ check_runs: checkRuns }]),
         CI_RUN_JSON: JSON.stringify(ciRun),
-        COMMIT_API_FAILS: String(commitApiFails),
         EVENT_HEAD_SHA: headSha,
         EVENT_SOURCE: eventSource,
         EVENT_CHECK_RUN_ACTION: eventCheckRunAction,
@@ -873,7 +861,6 @@ exit 99
         PULL_REQUEST_FILE_SNAPSHOTS_JSON: JSON.stringify(
           pullRequestFileSnapshots ?? [pullRequestFiles, pullRequestFiles, pullRequestFiles],
         ),
-        PULL_REQUEST_COMMITS_JSON: JSON.stringify(pullRequestCommits),
         REPOSITORY,
         REVIEW_RUN_API_FAILS: String(reviewRunApiFails),
         REVIEW_RUN_JSON: JSON.stringify(reviewRun),
@@ -964,24 +951,26 @@ describe("external admission workflow", () => {
       .toBe(true);
   });
 
-  it("keeps sensitive changes pending without independent trusted evidence", () => {
+  it("keeps sensitive changes pending without exact-head Copilot evidence", () => {
     const { result, statuses } = runAdmissionScenario("sensitive-without-evidence");
     expect(result.status).toBe(0);
     expect(statuses.at(-1)?.split("\t", 1)[0]).toBe("pending");
-    expect(statuses.at(-1)).toContain("independent trusted evidence");
-    expect(result.stdout).toContain("awaits independent trusted evidence");
-    expect(result.stdout).not.toContain("awaits exact-head Copilot evidence");
+    expect(statuses.at(-1)).toContain("exact-head Copilot evidence");
+    expect(result.stdout).toContain("awaits exact-head Copilot evidence");
   });
 
   it.each([
     "sensitive-postgresql-template-init",
     "sensitive-postgresql-cached-run-init",
     "sensitive-postgresql-init",
+    "sensitive-postgresql-harness",
+    "sensitive-postgresql-operational-fixture",
+    "sensitive-postgresql-portable-fixture",
   ] as const)("classifies %s as sensitive in the trusted reducer", (scenario) => {
     const { result, statuses } = runAdmissionScenario(scenario);
     expect(result.status, `${scenario}\n${result.stdout}\n${result.stderr}`).toBe(0);
     expect(statuses.at(-1)?.split("\t", 1)[0]).toBe("pending");
-    expect(statuses.at(-1)).toContain("independent trusted evidence");
+    expect(statuses.at(-1)).toContain("exact-head Copilot evidence");
     expect(statuses.some((status) => status.startsWith("success\t"))).toBe(false);
   });
 
@@ -992,23 +981,27 @@ describe("external admission workflow", () => {
     expect(statuses.at(-1)).toContain("Copilot");
   });
 
-  it("admits exact Dependabot commit provenance without Copilot", () => {
-    const { result, statuses } = runAdmissionScenario("sensitive-dependabot");
+  it("requires Copilot evidence for sensitive Dependabot pull requests", () => {
+    const { result, statuses } = runAdmissionScenario("sensitive-dependabot-without-copilot");
     expect(result.status, `${result.stdout}\n${result.stderr}`).toBe(0);
-    expect(statuses.at(-1)?.split("\t", 1)[0]).toBe("success");
-    expect(statuses.at(-1)).toContain("Dependabot");
+    expect(statuses.at(-1)?.split("\t", 1)[0]).toBe("pending");
+    expect(statuses.at(-1)).toContain("exact-head Copilot evidence");
+    expect(result.stderr).not.toContain("unexpected fake-gh endpoint");
   });
 
-  it("keeps the Copilot and Dependabot alternatives isolated in both directions", () => {
-    for (const scenario of [
-      "spoofed-review-valid-dependabot",
-      "denied-dependabot-valid-review",
-    ] as const) {
-      const { result, statuses } = runAdmissionScenario(scenario);
-      expect(result.status, `${scenario}\n${result.stdout}\n${result.stderr}`).toBe(0);
-      expect(statuses.at(-1)?.split("\t", 1)[0], scenario).toBe("success");
-    }
-  }, 15_000);
+  it("admits a sensitive Dependabot pull request only with exact Copilot provenance", () => {
+    const { result, statuses } = runAdmissionScenario("sensitive-dependabot-copilot");
+    expect(result.status, `${result.stdout}\n${result.stderr}`).toBe(0);
+    expect(statuses.at(-1)?.split("\t", 1)[0]).toBe("success");
+    expect(statuses.at(-1)).toContain("Copilot");
+  });
+
+  it("keeps sensitive admission pending when the Copilot run API is transient", () => {
+    const { result, statuses } = runAdmissionScenario("sensitive-review-api-pending");
+    expect(result.status, `${result.stdout}\n${result.stderr}`).toBe(0);
+    expect(statuses.at(-1)?.split("\t", 1)[0]).toBe("pending");
+    expect(statuses.at(-1)).toContain("exact-head Copilot evidence");
+  });
 
   it("keeps admission pending when sensitive file evidence drifts", () => {
     const { result, statuses } = runAdmissionScenario("sensitive-file-drift");
@@ -1238,7 +1231,7 @@ describe("external admission workflow", () => {
     expect(evaluator).toContain("commits/$HEAD_SHA/pulls?per_page=100");
     expect(evaluator).toContain("check-runs?filter=latest&per_page=100");
     expect(evaluator).toContain("/files?per_page=100");
-    expect(evaluator).toContain("/commits?per_page=100");
+    expect(evaluator).not.toContain("/commits?per_page=100");
     const initial = evaluator.indexOf('validate_required_snapshot "Initial"');
     const current = evaluator.indexOf('validate_required_snapshot "Current"');
     const final = evaluator.indexOf('validate_required_snapshot "Final"');
@@ -1265,8 +1258,8 @@ describe("external admission workflow", () => {
     expect(evaluator).toContain("classify-files");
     expect(evaluator).toContain("evaluate-review-check");
     expect(evaluator).toContain("evaluate-review-run");
-    expect(evaluator).toContain("evaluate-dependabot-pr");
-    expect(evaluator).toContain("evaluate-dependabot-commits");
+    expect(evaluator).not.toContain("evaluate-dependabot-pr");
+    expect(evaluator).not.toContain("evaluate-dependabot-commits");
     expect(evaluator).toContain("evaluate-sensitive-admission");
     expect(evaluator).not.toContain("/git/trees/");
     expect(evaluator).not.toContain("/reviews");

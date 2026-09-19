@@ -2,4 +2,4 @@
 "@donadiosolutions/lcm": patch
 ---
 
-Require independently authenticated evidence before external admission accepts pull requests that change CI, build, package, production, or trusted test-harness inputs.
+Require authenticated exact-head Copilot dynamic-run evidence before external admission accepts pull requests that change CI, build, package, production, or trusted test-harness inputs.

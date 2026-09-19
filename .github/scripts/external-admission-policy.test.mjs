@@ -7,8 +7,6 @@ import {
   classifyPullRequestFiles,
   evaluateAdmissionChecks,
   evaluateCiActionsRun,
-  evaluateDependabotCommits,
-  evaluateDependabotPullRequest,
   evaluateEventFreshness,
   evaluatePullRequestEligibility,
   evaluateReviewActionsRun,
@@ -82,25 +80,6 @@ function reviewRun(overrides = {}) {
   });
 }
 
-function dependabotPullRequest(overrides = {}) {
-  return {
-    ...eligibleMain,
-    user: { id: 49699333, login: "dependabot[bot]", type: "Bot" },
-    head: { sha: HEAD_SHA, ref: "dependabot/npm_and_yarn/example-1.2.3", repo: { full_name: REPOSITORY } },
-    ...overrides,
-  };
-}
-
-function dependabotCommit(overrides = {}) {
-  return {
-    sha: "b".repeat(40),
-    commit: { verification: { verified: true, reason: "valid" } },
-    author: { id: 49699333, login: "dependabot[bot]", type: "Bot" },
-    committer: { id: 19864447, login: "web-flow", type: "User" },
-    ...overrides,
-  };
-}
-
 test("defines the exact authenticated CI, DCO, and Copilot identities", () => {
   assert.deepEqual(Object.keys(CHECK_IDENTITIES), ["dco", "ci", "review"]);
   assert.deepEqual(CHECK_IDENTITIES.dco, { name: "DCO", appId: 1861, appSlug: "dco" });
@@ -130,6 +109,9 @@ test("classifies the complete closed sensitive path set and both rename sides", 
     "test/postgresql/template-init.sh",
     "test/postgresql/cached-run-init.sh",
     "test/postgresql/init.sh",
+    "test/postgresql/harness.ts",
+    "test/postgresql/operational-fixture.ts",
+    "test/postgresql/portable-fixture.ts",
     ".agents/skills/tests/policy.test.mjs",
     ".agents/skills/example/scripts/check.mjs",
     "package.json",
@@ -153,6 +135,9 @@ test("classifies the complete closed sensitive path set and both rename sides", 
 
   for (const filename of [
     "test/example.test.ts",
+    "test/postgresql/harness.test.ts",
+    "test/postgresql/runtime.integration.ts",
+    "test/postgresql/fixtures/coordination-crash-worker.mjs",
     ".agents/skills/example/SKILL.md",
     "eslint.config.js",
     ".github/renovate.json",
@@ -271,76 +256,28 @@ test("authenticates only an exact successful Copilot dynamic check and run", () 
   }
 });
 
-test("requires exact bounded Dependabot PR and commit provenance", () => {
-  assert.deepEqual(evaluateDependabotPullRequest(dependabotPullRequest(), {
-    headSha: HEAD_SHA,
-    repository: REPOSITORY,
-  }), { candidate: true, ready: true, commitCount: 1 });
-  assert.deepEqual(evaluateDependabotCommits([[dependabotCommit()]], 1), {
-    ready: true,
-    commitShas: ["b".repeat(40)],
-  });
-
-  for (const [name, value] of [
-    ["wrong user id", { user: { id: 7, login: "dependabot[bot]", type: "Bot" } }],
-    ["lookalike login", { user: { id: 49699333, login: "dependabot", type: "Bot" } }],
-    ["wrong user type", { user: { id: 49699333, login: "dependabot[bot]", type: "User" } }],
-    ["fork", { head: { sha: HEAD_SHA, ref: "dependabot/npm/a", repo: { full_name: "fork/repo" } } }],
-    ["empty suffix", { head: { sha: HEAD_SHA, ref: "dependabot/", repo: { full_name: REPOSITORY } } }],
-    ["wrong head", { head: { sha: "c".repeat(40), ref: "dependabot/npm/a", repo: { full_name: REPOSITORY } } }],
-    ["zero commits", { commits: 0 }],
-    ["too many commits", { commits: 251 }],
-  ]) {
-    const result = evaluateDependabotPullRequest(dependabotPullRequest(value), {
-      headSha: HEAD_SHA,
-      repository: REPOSITORY,
-    });
-    assert.equal(result.ready, false, name);
-    assert.equal(result.terminalFailure, "dependabot-pr", name);
-  }
-
-  const invalidCommits = [
-    [[], 1],
-    [[[dependabotCommit(), dependabotCommit()]], 2],
-    [[[dependabotCommit({ commit: { verification: { verified: false, reason: "unsigned" } } })]], 1],
-    [[[dependabotCommit({ author: { id: 42, login: "member", type: "User" } })]], 1],
-    [[[dependabotCommit({ committer: { id: 42, login: "member", type: "User" } })]], 1],
-    [[[dependabotCommit({ committer: { id: 19864447, login: "web-flow", type: "Bot" } })]], 1],
-  ];
-  for (const [pages, count] of invalidCommits) {
-    const result = evaluateDependabotCommits(pages, count);
-    assert.equal(result.ready, false);
-    assert.equal(result.terminalFailure, "dependabot-commits");
-  }
-});
-
-test("isolates both sensitive-admission alternatives", () => {
-  const validDependabot = { ready: true, commitShas: ["b".repeat(40)] };
+test("requires exact Copilot dynamic-run evidence for every sensitive change", () => {
   const validReview = { ready: true, checkRunId: "3", runId: "123" };
   assert.deepEqual(evaluateSensitiveAdmission({
     sensitive: true,
-    review: { ready: false, pending: false, terminalFailure: "review-run-metadata" },
-    dependabot: validDependabot,
-  }), { ready: true, evidenceClass: "dependabot", evidenceIds: ["b".repeat(40)] });
-  assert.deepEqual(evaluateSensitiveAdmission({
-    sensitive: true,
     review: validReview,
-    dependabot: { ready: false, terminalFailure: "dependabot-commits" },
   }), { ready: true, evidenceClass: "copilot", evidenceIds: ["3", "123"] });
   assert.deepEqual(evaluateSensitiveAdmission({
     sensitive: false,
     review: { ready: false, pending: true },
-    dependabot: { ready: false },
   }), { ready: true, evidenceClass: "ci-dco", evidenceIds: [] });
   assert.deepEqual(evaluateSensitiveAdmission({
     sensitive: true,
     review: { ready: false, pending: true },
-    dependabot: { ready: false, terminalFailure: "dependabot-pr" },
   }), { ready: false, pending: true, terminalFailure: undefined });
   assert.deepEqual(evaluateSensitiveAdmission({
     sensitive: true,
     review: { ready: false, pending: false, terminalFailure: "review-run" },
-    dependabot: { ready: false, terminalFailure: "dependabot-pr" },
+  }), { ready: false, pending: false, terminalFailure: "trusted-automation" });
+  assert.deepEqual(evaluateSensitiveAdmission({
+    sensitive: true,
+    review: { ready: false, pending: false, terminalFailure: "review-run-metadata" },
+    dependabot: { ready: true, commitShas: ["b".repeat(40)] },
   }), { ready: false, pending: false, terminalFailure: "trusted-automation" });
 });
 
@@ -807,6 +744,12 @@ test("exposes the complete policy through deterministic CLI commands", () => {
 
   assert.throws(() => runPolicyCommand("unknown", [], "{}"), /unknown policy command/u);
   assert.throws(() => runPolicyCommand("evaluate-checks", [], "{}"), /unknown policy command/u);
+  assert.throws(() => runPolicyCommand(
+    "evaluate-dependabot-pr", [HEAD_SHA, REPOSITORY], JSON.stringify(eligibleMain),
+  ), /unknown policy command/u);
+  assert.throws(() => runPolicyCommand(
+    "evaluate-dependabot-commits", ["1"], "[]",
+  ), /unknown policy command/u);
   assert.throws(() => runPolicyCommand(
     "evaluate-ci-run", ["123", HEAD_SHA], "{}",
   ), /unknown policy command/u);

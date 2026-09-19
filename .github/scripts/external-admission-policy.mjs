@@ -46,13 +46,12 @@ const PULL_REQUEST_FILE_STATUSES = new Set([
   "changed",
   "unchanged",
 ]);
-const DEPENDABOT_IDENTITY = Object.freeze({ id: 49699333, login: "dependabot[bot]", type: "Bot" });
-const WEB_FLOW_IDENTITY = Object.freeze({ id: 19864447, login: "web-flow", type: "User" });
 const SENSITIVE_PATHS = [
   /^\.github\/(?:actions|codeql|scripts|workflows)\//u,
   /^(?:bin|installer|scripts|src)\//u,
   /^test\/setup\//u,
   /^test\/postgresql\/(?:template-init\.sh|cached-run-init\.sh|init\.sh)$/u,
+  /^test\/postgresql\/(?:harness|operational-fixture|portable-fixture)\.ts$/u,
   /^\.agents\/skills\/tests\//u,
   /^\.agents\/skills\/[^/]+\/scripts\//u,
   /^(?:package\.json|pnpm-lock\.yaml|\.npmrc|pnpm-workspace\.yaml|codecov\.yml|install\.sh|\.pnpmfile\.cjs)$/u,
@@ -84,12 +83,6 @@ function requireSafePositiveInteger(value, label, maximum = Number.MAX_SAFE_INTE
     throw new TypeError(`${label} must be a safe positive integer no greater than ${maximum}`);
   }
   return value;
-}
-
-function matchesIdentity(value, identity) {
-  return value?.id === identity.id
-    && value?.login === identity.login
-    && value?.type === identity.type;
 }
 
 export function flattenPullRequestFilePages(pages) {
@@ -388,61 +381,8 @@ export function evaluateReviewActionsRun(run, { runId, headSha, repository }) {
   };
 }
 
-export function evaluateDependabotPullRequest(pullRequest, { headSha, repository }) {
-  let commitCount;
-  try {
-    const value = requireObject(pullRequest, "pull request");
-    commitCount = requireSafePositiveInteger(value.commits, "pull request commits", 250);
-    const ready = matchesIdentity(value.user, DEPENDABOT_IDENTITY)
-      && value.head?.sha === headSha
-      && value.head?.repo?.full_name === repository
-      && value.base?.repo?.full_name === repository
-      && typeof value.head?.ref === "string"
-      && value.head.ref.startsWith("dependabot/")
-      && value.head.ref.length > "dependabot/".length;
-    return ready
-      ? { candidate: true, ready: true, commitCount }
-      : { candidate: false, ready: false, terminalFailure: "dependabot-pr" };
-  } catch {
-    return { candidate: false, ready: false, terminalFailure: "dependabot-pr" };
-  }
-}
-
-export function evaluateDependabotCommits(pages, expectedCount) {
-  try {
-    const count = requireSafePositiveInteger(expectedCount, "pull request commits", 250);
-    const commits = requireArray(pages, "pull request commit pages").flatMap((page, index) =>
-      requireArray(page, `pull request commit page ${index}`));
-    if (commits.length !== count) throw new TypeError("commit count mismatch");
-    const shas = new Set();
-    for (const [index, value] of commits.entries()) {
-      const commit = requireObject(value, `pull request commit ${index}`);
-      const sha = requireNonEmptyString(commit.sha, `pull request commit ${index}.sha`);
-      if (shas.has(sha)) throw new TypeError("duplicate commit SHA");
-      shas.add(sha);
-      if (commit.commit?.verification?.verified !== true
-        || commit.commit?.verification?.reason !== "valid"
-        || !matchesIdentity(commit.author, DEPENDABOT_IDENTITY)
-        || (!matchesIdentity(commit.committer, DEPENDABOT_IDENTITY)
-          && !matchesIdentity(commit.committer, WEB_FLOW_IDENTITY))) {
-        throw new TypeError("invalid Dependabot commit provenance");
-      }
-    }
-    return { ready: true, commitShas: [...shas] };
-  } catch {
-    return { ready: false, terminalFailure: "dependabot-commits" };
-  }
-}
-
-export function evaluateSensitiveAdmission({ sensitive, review, dependabot }) {
+export function evaluateSensitiveAdmission({ sensitive, review }) {
   if (sensitive !== true) return { ready: true, evidenceClass: "ci-dco", evidenceIds: [] };
-  if (dependabot?.ready === true) {
-    return {
-      ready: true,
-      evidenceClass: "dependabot",
-      evidenceIds: requireArray(dependabot.commitShas, "Dependabot commit SHAs"),
-    };
-  }
   if (review?.ready === true) {
     return {
       ready: true,
@@ -453,7 +393,7 @@ export function evaluateSensitiveAdmission({ sensitive, review, dependabot }) {
       ],
     };
   }
-  if (review?.pending === true || dependabot?.pending === true) {
+  if (review?.pending === true) {
     return { ready: false, pending: true, terminalFailure: undefined };
   }
   return { ready: false, pending: false, terminalFailure: "trusted-automation" };
@@ -552,13 +492,6 @@ export function runPolicyCommand(command, args, input) {
   if (command === "evaluate-review-run" && args.length === 3) {
     const [runId, headSha, repository] = args;
     return JSON.stringify(evaluateReviewActionsRun(payload, { runId, headSha, repository }));
-  }
-  if (command === "evaluate-dependabot-pr" && args.length === 2) {
-    const [headSha, repository] = args;
-    return JSON.stringify(evaluateDependabotPullRequest(payload, { headSha, repository }));
-  }
-  if (command === "evaluate-dependabot-commits" && args.length === 1) {
-    return JSON.stringify(evaluateDependabotCommits(payload, Number(args[0])));
   }
   if (command === "evaluate-sensitive-admission" && args.length === 0) {
     return JSON.stringify(evaluateSensitiveAdmission(payload));
