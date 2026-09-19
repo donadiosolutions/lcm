@@ -493,7 +493,9 @@ describe("deduplicateAndInsert", () => {
     expect(update).toHaveBeenCalledWith("exact-owner", { confidence: 0.8, tags: ["existing", "incoming"] });
   });
 
-  it("uses an exact owner lookup when punctuation produces an empty fuzzy page", async () => {
+  it.each(["postgresql", "sqlite"] as const)(
+    "uses an exact owner lookup when punctuation produces an empty fuzzy page (backend=%s)",
+    async backend => {
     const searchPromoted = vi.fn().mockResolvedValue([]);
     const exact = {
       id: "punctuation-owner",
@@ -518,6 +520,16 @@ describe("deduplicateAndInsert", () => {
     };
     const transaction = async <T>(callback: (value: typeof repositories) => Promise<T>) => callback(repositories);
 
+    // PostgreSQL's owner scope searches every source project the owner
+    // controls, so the caller's sourceProjectId is dropped (undefined) for
+    // both the fuzzy and exact lookups. SQLite has no cross-project owner
+    // scope, so both stay scoped to the caller's sourceProjectId. The
+    // point of this test is that the exact lookup itself is not gated by
+    // backend: SQLite's is a plain indexed point query with no lexical
+    // dependency, so it still finds punctuation-only content that the
+    // (also backend-agnostic) empty fuzzy page above could not.
+    const expectedScope = backend === "postgresql" ? undefined : "incoming-source";
+
     await expect(deduplicateAndInsert({
       transaction,
       repositories,
@@ -525,20 +537,21 @@ describe("deduplicateAndInsert", () => {
       tags: ["incoming"],
       sourceProjectId: "incoming-source",
       candidateScope: "owner",
-      backend: "postgresql",
+      backend,
       depth: 0,
       confidence: 0.7,
       thresholds: { dedupBm25Threshold: 15, dedupCandidateLimit: 10 },
     })).resolves.toBe("punctuation-owner");
 
-    expect(searchPromoted).toHaveBeenCalledWith("!!!", 10, undefined, undefined);
-    expect(findExactContent).toHaveBeenCalledWith("!!!", undefined);
+    expect(searchPromoted).toHaveBeenCalledWith("!!!", 10, undefined, expectedScope);
+    expect(findExactContent).toHaveBeenCalledWith("!!!", expectedScope);
     expect(insert).not.toHaveBeenCalled();
     expect(update).toHaveBeenCalledWith("punctuation-owner", {
       confidence: 0.7,
       tags: ["existing", "incoming"],
     });
-  });
+    },
+  );
 
   it("preserves fuzzy page order when the exact owner row is already present", async () => {
     const exact = {

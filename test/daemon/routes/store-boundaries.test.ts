@@ -9,6 +9,11 @@ const mocks = vi.hoisted(() => ({
   getConnection: vi.fn(),
   close: vi.fn(),
   insert: vi.fn(() => "stored-id"),
+  search: vi.fn(async () => [] as never[]),
+  findExact: vi.fn(async () => null as unknown),
+  update: vi.fn(async () => undefined),
+  archive: vi.fn(async () => undefined),
+  transaction: vi.fn(),
   scrub: vi.fn((text: string) => `scrubbed:${text}`),
   forProject: vi.fn(async () => ({ scrub: mocks.scrub })),
   validate: vi.fn((cwd: string) => cwd),
@@ -62,12 +67,34 @@ import { createStoreHandler } from "../../../src/daemon/routes/store.js";
 
 const config = loadDaemonConfig("/tmp/store-boundaries");
 const response = {} as never;
+const candidateLimit = config.compaction.promotionThresholds.dedupCandidateLimit;
+
+/** Project storage whose transaction exposes the repositories the real dedup helper uses. */
+function makeProject(backend: "sqlite" | "postgresql" = "sqlite") {
+  return {
+    backend,
+    transaction: mocks.transaction,
+    close: mocks.projectClose,
+  };
+}
 
 describe("store persistence boundaries", () => {
   beforeEach(() => {
     for (const mock of Object.values(mocks)) mock.mockClear();
     mocks.stat.mockReturnValue({ mtimeMs: 1 });
     mocks.insert.mockReturnValue("stored-id");
+    mocks.search.mockResolvedValue([]);
+    mocks.findExact.mockResolvedValue(null);
+    mocks.transaction.mockImplementation(async (callback: (repositories: unknown) => Promise<unknown>) =>
+      callback({
+        lexicalSearch: { searchPromoted: mocks.search },
+        promotedMemory: {
+          insert: mocks.insert,
+          findExactContent: mocks.findExact,
+          update: mocks.update,
+          archive: mocks.archive,
+        },
+      }));
     mocks.scrub.mockImplementation((text: string) => `scrubbed:${text}`);
     mocks.forProject.mockImplementation(async () => ({ scrub: mocks.scrub }));
     mocks.validate.mockImplementation((cwd: string) => cwd);
@@ -85,10 +112,7 @@ describe("store persistence boundaries", () => {
       metaPath: `/lcm/projects/${identity.id}/meta.json`,
     }));
     mocks.getConnection.mockReturnValue({});
-    mocks.openProject.mockResolvedValue({
-      promotedMemory: { insert: mocks.insert },
-      close: mocks.projectClose,
-    });
+    mocks.openProject.mockResolvedValue(makeProject());
   });
 
   it("validates text, path sources, and typed cwd failures", async () => {
@@ -185,10 +209,7 @@ describe("store persistence boundaries", () => {
     const controller = new AbortController();
     mocks.openProject.mockImplementationOnce(async () => {
       controller.abort();
-      return {
-        promotedMemory: { insert: mocks.insert },
-        close: mocks.projectClose,
-      };
+      return makeProject();
     });
 
     await handler(
@@ -264,6 +285,7 @@ describe("store persistence boundaries", () => {
       "insert",
     );
     mocks.insert.mockImplementationOnce(() => { throw error; });
+    mocks.openProject.mockResolvedValueOnce(makeProject("postgresql"));
 
     await createStoreHandler(postgresqlConfig, injected)(
       {} as never,
@@ -272,6 +294,86 @@ describe("store persistence boundaries", () => {
     );
 
     expect(mocks.send).toHaveBeenLastCalledWith(response, 503, error.toJSON());
+  });
+
+  // #1371: the route makes the shared deduplication decision instead of
+  // inserting directly. The helper is real; only the repositories are fakes.
+  //
+  // #1390/#1406 widened deduplicateAndInsertInRepositories' exact-content
+  // lookup to run on every backend for owner-scoped dedup, not only
+  // PostgreSQL (see src/promotion/dedup.ts). Before that widening this test
+  // asserted findExact was never called on SQLite; that assertion encoded
+  // the pre-widening gate, not the scoping this test names. The scoping
+  // property is unchanged and still covered here: candidateSourceProjectId
+  // narrows both the fuzzy search and (now) the exact lookup to the
+  // recorded origin ("origin-a") rather than the whole owner. No coverage
+  // is lost by asserting the call instead of its absence -- the origin
+  // argument is checked either way, and the insert-on-miss path below still
+  // exercises the no-match branch.
+  it("scopes both SQLite dedup lookups to the recorded origin and inserts new content", async () => {
+    await createStoreHandler(config)(
+      {} as never,
+      response,
+      JSON.stringify({ text: "value", cwd: "/sqlite-scope", metadata: { projectId: "origin-a" } }),
+    );
+
+    expect(mocks.search).toHaveBeenCalledWith("scrubbed:value", candidateLimit, undefined, "origin-a");
+    expect(mocks.findExact).toHaveBeenCalledWith("scrubbed:value", "origin-a");
+    expect(mocks.insert).toHaveBeenCalledOnce();
+    expect(mocks.update).not.toHaveBeenCalled();
+    expect(mocks.send).toHaveBeenLastCalledWith(response, 200, { stored: true, id: "stored-id" });
+  });
+
+  it("returns the existing memory id when the PostgreSQL owner-scoped exact lookup matches", async () => {
+    const postgresqlConfig = {
+      ...config,
+      storage: {
+        backend: "postgresql",
+        postgresql: {
+          url: "postgresql://user:secret@db.example/lcm",
+          poolMax: 1,
+          connectionTimeoutMs: 100,
+          idleTimeoutMs: 100,
+          statementTimeoutMs: 100,
+        },
+      },
+    } as const;
+    const injected = {
+      backend: "postgresql",
+      openProject: mocks.openProject,
+      close: mocks.factoryClose,
+    } as unknown as StorageBackendFactory;
+    mocks.openProject.mockResolvedValueOnce(makeProject("postgresql"));
+    mocks.findExact.mockResolvedValueOnce({
+      id: "existing-id",
+      content: "scrubbed:value",
+      tags: ["earlier"],
+      metadata: {},
+      sourceSummaryId: null,
+      projectId: "other-origin",
+      sessionId: "earlier-session",
+      depth: 0,
+      confidence: 0.3,
+      createdAt: "2026-01-01T00:00:00.000Z",
+      archivedAt: null,
+    });
+
+    await createStoreHandler(postgresqlConfig, injected)(
+      {} as never,
+      response,
+      JSON.stringify({ text: "value", tags: ["new"], cwd: "/exact-match" }),
+    );
+
+    // Owner scope: neither lookup is narrowed to this store's recorded origin.
+    expect(mocks.search).toHaveBeenCalledWith("scrubbed:value", candidateLimit, undefined, undefined);
+    expect(mocks.findExact).toHaveBeenCalledWith("scrubbed:value", undefined);
+    expect(mocks.insert).not.toHaveBeenCalled();
+    expect(mocks.update).toHaveBeenCalledWith("existing-id", {
+      confidence: 1,
+      tags: ["earlier", "scrubbed:new"],
+    });
+    expect(mocks.archive).not.toHaveBeenCalled();
+    expect(mocks.send).toHaveBeenLastCalledWith(response, 200, { stored: true, id: "existing-id" });
   });
 
   it("uses an injected factory without taking ownership of it", async () => {

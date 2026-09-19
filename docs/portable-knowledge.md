@@ -31,11 +31,21 @@ imported from elsewhere. Import compares against that same owner scope, so an
 existing normal promotion can be merged and retains its metadata and retry
 history. A memory's origin does not grant access to another remote project.
 SQLite keeps its existing project-origin filter for this version 1 format.
-For PostgreSQL, owner-bound exact content matches merge even when the row is
-outside the bounded fuzzy candidate page. Repeating the same document then
-uses its stored retry identities to skip already accepted entries. SQLite keeps
-its existing source-scoped search and deduplication behavior.
-Nonidentical content still requires the configured deduplication threshold.
+Owner-bound exact content matches merge even when the row is outside the
+bounded fuzzy candidate page or the content carries no searchable lexical
+terms, on both backends: PostgreSQL matches across the bound project's
+whole provenance, and SQLite matches within its existing source-scoped
+boundary. Repeating the same document then uses its stored retry identities
+to skip already accepted entries. Nonidentical content still requires the
+configured deduplication threshold.
+
+Compaction-driven promotion (`lcm promote`, including the promote step that
+runs after `lcm compact`) makes the same owner-scoped decision on every
+backend. A promoted summary whose exact content is already an active memory
+in scope merges into that memory, even when ranked search cannot recall it
+because the content carries no searchable terms or falls outside the
+candidate page. Earlier versions decided promotion from ranked search
+alone on every backend and could store such content twice.
 
 ## Version 1 format and privacy
 
@@ -114,10 +124,20 @@ This serialization is a PostgreSQL behavior. The SQLite backend runs its root
 transactions on a single connection, which already orders one import's
 decision after another's.
 
-Because an import holds this protection for its whole run, two imports into
-the same project take turns rather than running side by side, whatever
-content they carry. The second waits for the first to finish and then
-proceeds. Imports into different projects are unaffected.
+Knowledge import, compaction-driven promotion (`lcm promote`), and manual
+`lcm store` share one project-scoped decision serializer on PostgreSQL. Each
+writer takes it before reading candidates and holds it until its transaction
+commits, so a manual store of content C cannot slip between another writer's
+empty candidate read and its insert: whichever writer reaches the decision
+first commits, and the other then reads that committed memory and merges into
+it. Because an import holds this protection for its whole run, two imports
+into the same project take turns rather than running side by side, whatever
+content they carry, and a promote or store into that project waits for a
+running import in the same way. The second waits for the first to finish and
+then proceeds. Writers into different projects are unaffected.
+
+A manual store that matches an existing active memory returns that memory's
+id, with tags unioned and confidence kept at the maximum, instead of a new id.
 
 Successful commands exit zero. Operational failures, including failed projects
 in `export --all`, exit one. JSON output contains the requested payload; progress

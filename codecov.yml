@@ -18,6 +18,7 @@ component_management:
         # #1233 keeps publication-contention restart recovery at the CLI boundary.
         # #1283 keeps retired-identity renewal CLI admission and bounded
         # compact progress rendering in the existing CLI component.
+        # #1371 keeps the store merge-behavior help text CLI-owned.
         - "bin/"
         - "src/cli/"
         - "^src/cli-help\\.ts$"
@@ -197,6 +198,10 @@ component_management:
         # #1203 keeps evidence-based prompt scoring and debug output route-owned.
         # #1230 keeps route project close on the live request token.
         # #1247 keeps local queue preparation, acknowledgement, and cleanup route-owned.
+        # #1390 keeps the promote route's owner-scoped, backend-aware
+        # deduplication input route-owned; the decision stays in unit-promotion.
+        # #1371 routes the manual store through that same deduplication
+        # decision instead of a direct insert; the input stays route-owned.
         - "src/daemon/routes/"
     - component_id: "unit-daemon-events"
       name: "Unit - Daemon Passive Events"
@@ -210,6 +215,7 @@ component_management:
         # The #709 canonical search and grep MCP tools, #710 grep mode, #793
         # search-limit schema, #794 grep-since schema, and #863 expand-depth
         # schema remain MCP-owned.
+        # #1371 keeps the lcm_store merge-behavior description MCP-owned.
         - "src/mcp/"
     - component_id: "unit-llm-prompts"
       name: "Unit - LLM, Responses, and Prompts"

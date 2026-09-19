@@ -58,6 +58,40 @@ describe("Continuous Learning", { timeout: 60_000 }, () => {
     expect(Array.isArray(search.hints)).toBe(true);
   });
 
+  it("merges two identical punctuation-only stores into one active memory", async () => {
+    // Regression for PR #1406 review thread 4052704721: SQLite's lexical
+    // search tokenizer strips non-word characters, so punctuation-only
+    // content produces zero search terms and an empty fuzzy candidate
+    // page. Dedup must still converge via the exact-content lookup, which
+    // is backend-independent, not only reachable on PostgreSQL.
+    const punctuationOnly = "!!!???...";
+
+    const first = await handle.client.post<{ stored: boolean; id: string }>("/store", {
+      text: punctuationOnly,
+      tags: [],
+      cwd: handle.tmpDir,
+    });
+    const second = await handle.client.post<{ stored: boolean; id: string }>("/store", {
+      text: punctuationOnly,
+      tags: [],
+      cwd: handle.tmpDir,
+    });
+
+    expect(second.id).toBe(first.id);
+
+    const { db, close } = openProjectDb(handle.tmpDir);
+    try {
+      const rows = db.prepare(
+        "SELECT id, archived_at FROM promoted WHERE content = ?"
+      ).all(punctuationOnly) as Array<{ id: string; archived_at: string | null }>;
+      const activeRows = rows.filter((row) => row.archived_at === null);
+      expect(activeRows).toHaveLength(1);
+      expect(activeRows[0].id).toBe(first.id);
+    } finally {
+      close();
+    }
+  });
+
   // ── Part 2: Rolling ingest idempotency ──────────────────────────────────────
 
   it("first ingest of synthetic session stores messages", async () => {

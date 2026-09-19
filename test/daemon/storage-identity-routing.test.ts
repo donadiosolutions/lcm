@@ -95,8 +95,15 @@ describe("daemon storage identity routing", () => {
     recoverMachineIdentity(machine, { homeDir: home });
     const local = resolveProjectIdentity(cwd);
     setRemoteProjectBinding(PROJECT_ID, { hash: local.id });
+    const searchPromoted = vi.fn(async () => []);
+    const findExactContent = vi.fn(async () => null);
+    const insert = vi.fn(async () => "stored-id");
     const openProject = vi.fn(async (_identity: StorageIdentityContext) => ({
-      promotedMemory: { insert: vi.fn(async () => "stored-id") },
+      backend: "postgresql",
+      transaction: async (callback: (repositories: unknown) => Promise<unknown>) => callback({
+        lexicalSearch: { searchPromoted },
+        promotedMemory: { insert, findExactContent },
+      }),
       close: vi.fn(async () => undefined),
     } as unknown as ProjectStorage));
     const factory = {
@@ -109,6 +116,7 @@ describe("daemon storage identity routing", () => {
     };
     const config = {
       storage: POSTGRESQL_STORAGE,
+      compaction: { promotionThresholds: { dedupBm25Threshold: 15, dedupCandidateLimit: 100 } },
       security: { sensitivePatterns: [], notify_on_filter: false },
     } as unknown as DaemonConfig;
 
@@ -125,6 +133,10 @@ describe("daemon storage identity routing", () => {
       remoteProjectId: PROJECT_ID,
       machineId: MACHINE_ID,
     }, undefined, expect.any(AbortSignal));
+    // #1371: the bound-identity store decides across the owner's provenance.
+    expect(searchPromoted).toHaveBeenCalledWith("remember", 100, undefined, undefined);
+    expect(findExactContent).toHaveBeenCalledWith("remember", undefined);
+    expect(insert).toHaveBeenCalledOnce();
     expect(response.writeHead).toHaveBeenCalledWith(200, {
       "Content-Type": "application/json",
     });
