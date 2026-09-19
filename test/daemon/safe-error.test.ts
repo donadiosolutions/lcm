@@ -4573,6 +4573,11 @@ describe("sanitizeError", () => {
         "'https://e.test/t name=\\Users\\literal'",
         "'https://e.test/t name=<path>'",
       ],
+      [
+        "R3l a bracketed quoted file path bridging its own gap",
+        "['file://h/Users/a/My Files/one.db']",
+        "['file://h<path>']",
+      ],
     ] as const)("resolves %s in one pass", (_name, input, expected) => {
       const first = sanitizeError(input);
 
