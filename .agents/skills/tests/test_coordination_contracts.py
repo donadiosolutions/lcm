@@ -146,6 +146,9 @@ class CoordinationContractTests(unittest.TestCase):
                      "projection after worker exposure is too late",
                      "fail closed without reading"):
             self.assertIn(term, combined)
+        for term in ("bug-campaign-intake.mjs", "gh issue view",
+                     "trustedIssue", "untrustedIssueData"):
+            self.assertIn(term, combined)
 
     def test_bug_campaign_bounds_the_complete_wrapped_envelope(self):
         entry = self.read("triage-fix-all-bugs/SKILL.md")

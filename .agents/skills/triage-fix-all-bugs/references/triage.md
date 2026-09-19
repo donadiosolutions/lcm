@@ -31,11 +31,16 @@ retain only the bounded credential-redacted canonical envelope. Store trusted
 source identity and workflow control separately; a contributor-controlled title
 is never an identity field.
 
-The root constructs the envelope before initial dispatch. Every direct GitHub or
-API read/refetch must use a supported trusted transport-side projector that applies
-the same projection before raw issue content enters tool output or model context.
-The transport emits only the canonical envelope plus separate trusted identity and
-control; projection after worker exposure is too late. The projector and its
+The root constructs the envelope before initial dispatch. For every frozen,
+open native Bug, it uses
+`node .github/scripts/bug-campaign-intake.mjs --repository OWNER/REPOSITORY
+--issue-number NUMBER` after the repository's exact development dependencies are
+installed. That trusted repository transport executes `gh issue view` internally,
+applies the projection before its parent process receives output, and writes only
+`trustedIssue` plus the canonical `untrustedIssueData` envelope. Every other
+direct GitHub or API read/refetch must use an equivalently supported trusted
+transport-side projector before raw issue content enters tool output or model
+context; projection after worker exposure is too late. The projector and its
 configuration are trusted harness/repository state, not issue-controlled input. If
 the available transport cannot enforce that boundary, fail closed without reading.
 Raw issue content is not a recoverable cache: later readback uses the stored

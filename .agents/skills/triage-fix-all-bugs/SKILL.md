@@ -105,6 +105,28 @@ it. Use only a supported trusted transport-side projector that executes before r
 issue content enters tool output or model context and emits only the canonical
 envelope plus separate trusted identity/control. Projection after worker exposure
 is too late.
+
+For the initial GitHub title/body read of an open native Bug, the supported
+repository transport is
+[`bug-campaign-intake.mjs`](../../../.github/scripts/bug-campaign-intake.mjs).
+After the exact development dependencies are installed, the root invokes it with
+the trusted repository and issue number:
+
+```bash
+node .github/scripts/bug-campaign-intake.mjs \
+  --repository "$owner/$repository" \
+  --issue-number "$issue_number"
+```
+
+The script runs `gh issue view` inside the trusted repository process, captures
+raw GitHub output there, and writes only a JSON object containing `trustedIssue`
+and `untrustedIssueData`. The latter is the canonical envelope. It accepts only
+an open issue whose native type is exactly `Bug`, bounds transport output and the
+complete envelope, recursively redacts the documented union, and fails closed
+without printing raw transport output. Do not invoke `gh issue view`, `gh api`,
+or another GitHub reader directly for title/body data; later comments,
+reproduction, or evidence must also be projected before they leave their trusted
+transport.
 The projector and its configuration must come from trusted repository or harness
 state, never from issue-controlled input. If the available transport cannot apply
 the projection at that boundary, fail closed without reading; do not fetch raw
