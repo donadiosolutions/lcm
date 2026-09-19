@@ -6,7 +6,10 @@ import { EVENTS_UNPROCESSED_BATCH_LIMIT } from "../hooks/events-db.js";
 import { collectEventSidecars } from "../db/event-sidecars.js";
 import { promoteEventsForCwd, type PromoteResult } from "./routes/promote-events.js";
 import type { StorageBackendFactory } from "../storage/index.js";
-import type { BackendPublicationLockToken } from "../storage/backend-publication.js";
+import {
+  BackendPublicationJournalError,
+  type BackendPublicationLockToken,
+} from "../storage/backend-publication.js";
 
 export const PASSIVE_EVENT_PROCESSOR_DEFAULTS = {
   priorityDelayMs: 250,
@@ -23,6 +26,18 @@ export interface PassiveEventNotification {
   priority?: number;
   pendingCount?: number;
   sourceHook?: string;
+}
+
+/**
+ * A running daemon's startup backend is frozen for its whole lifetime, so a
+ * configured-backend change can never be admitted by the current process. The
+ * background sweep records that halt instead of retrying every five minutes
+ * with nothing but a log line to show for it (#1384).
+ */
+export interface PassiveEventBackgroundDiagnostics {
+  readonly halted: boolean;
+  readonly haltedReason: "backend-mismatch" | null;
+  readonly haltedMessage: string | null;
 }
 
 export interface PassiveEventProcessorDeps {
@@ -73,6 +88,8 @@ export class PassiveEventProcessor {
   private sweepTimer: TimeoutHandle | null = null;
   private sweepInterval: IntervalHandle | null = null;
   private sweepStartIndex = 0;
+  private haltedReason: "backend-mismatch" | null = null;
+  private haltedMessage: string | null = null;
   private readonly drainWaiters = new Set<() => void>();
 
   constructor(
@@ -118,20 +135,7 @@ export class PassiveEventProcessor {
     this.stopped = true;
     this.stopController.abort();
     this.detachExternalSignal?.();
-    for (const timer of this.debounceTimers.values()) {
-      this.clearTimer(timer);
-    }
-    this.debounceTimers.clear();
-    this.debounceDeadlines.clear();
-    this.queuedProjects.clear();
-    if (this.sweepTimer) {
-      this.clearTimer(this.sweepTimer);
-      this.sweepTimer = null;
-    }
-    if (this.sweepInterval) {
-      this.clearRepeating(this.sweepInterval);
-      this.sweepInterval = null;
-    }
+    this.clearScheduledWork();
   }
 
   async stopAndWait(): Promise<void> {
@@ -143,7 +147,7 @@ export class PassiveEventProcessor {
   }
 
   notify(input: PassiveEventNotification): void {
-    if (this.stopped) return;
+    if (this.stopped || this.haltedReason !== null) return;
     const cwd = validateCwd(input.cwd);
     const priority = normalizePriority(input.priority);
     const pendingCount = normalizePendingCount(input.pendingCount);
@@ -159,8 +163,18 @@ export class PassiveEventProcessor {
     await this.drainQueuedProjects();
   }
 
+  /** Background halt state for operator-facing daemon status (#1384). */
+  backgroundDiagnostics(): PassiveEventBackgroundDiagnostics {
+    return {
+      halted: this.haltedReason !== null,
+      haltedReason: this.haltedReason,
+      haltedMessage: this.haltedMessage,
+    };
+  }
+
   async runSweep(): Promise<void> {
     if (this.stopped) return;
+    if (this.haltedReason !== null) return;
     if (this.draining) {
       this.scheduleSweep(this.defaults.debounceMs);
       return;
@@ -192,6 +206,10 @@ export class PassiveEventProcessor {
             },
           );
         } catch (error) {
+          if (isFrozenBackendMismatch(error)) {
+            await this.haltForBackendMismatch(error);
+            return;
+          }
           await this.logError("passive-event-processor", error, { cwd: sidecar.cwd });
         }
       }
@@ -243,6 +261,7 @@ export class PassiveEventProcessor {
       const projects = [...this.queuedProjects];
       this.queuedProjects.clear();
       for (const cwd of projects) {
+        if (this.haltedReason !== null) break;
         await this.processProject(cwd);
       }
     } finally {
@@ -266,6 +285,10 @@ export class PassiveEventProcessor {
           },
         );
       } catch (error) {
+        if (isFrozenBackendMismatch(error)) {
+          await this.haltForBackendMismatch(error);
+          return;
+        }
         await this.logError("passive-event-processor", error, { cwd });
         return;
       }
@@ -295,6 +318,51 @@ export class PassiveEventProcessor {
   private unref(handle: { unref?: () => unknown } | null): void {
     try { handle?.unref?.(); } catch { /* non-fatal */ }
   }
+
+  /**
+   * Retire every scheduled background timer. Shared by ordinary shutdown and by
+   * the #1384 frozen-backend halt, which must stop rescheduling work that this
+   * process can never get admitted again.
+   */
+  private clearScheduledWork(): void {
+    for (const timer of this.debounceTimers.values()) {
+      this.clearTimer(timer);
+    }
+    this.debounceTimers.clear();
+    this.debounceDeadlines.clear();
+    this.queuedProjects.clear();
+    if (this.sweepTimer) {
+      this.clearTimer(this.sweepTimer);
+      this.sweepTimer = null;
+    }
+    if (this.sweepInterval) {
+      this.clearRepeating(this.sweepInterval);
+      this.sweepInterval = null;
+    }
+  }
+
+  /**
+   * The configured backend no longer matches this daemon's authenticated
+   * startup backend. Only a restart resolves it, so record the halt, drop every
+   * scheduled sweep, and report once instead of logging the identical refusal
+   * every five minutes. The next hook's `ensureDaemon` observes the `/health`
+   * backend mismatch and replaces this daemon.
+   */
+  private async haltForBackendMismatch(
+    error: BackendPublicationJournalError,
+  ): Promise<void> {
+    this.haltedReason = "backend-mismatch";
+    this.haltedMessage = error.message;
+    this.clearScheduledWork();
+    await this.logError("passive-event-processor", error, {});
+  }
+}
+
+function isFrozenBackendMismatch(
+  error: unknown,
+): error is BackendPublicationJournalError {
+  return error instanceof BackendPublicationJournalError
+    && error.reason === "backend-mismatch";
 }
 
 function normalizePriority(value: unknown): number | undefined {

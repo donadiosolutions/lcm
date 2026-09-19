@@ -38,6 +38,7 @@ import {
   PASSIVE_EVENT_PROCESSOR_DEFAULTS,
   PassiveEventProcessor,
   type BackgroundPublicationAdmission,
+  type PassiveEventBackgroundDiagnostics,
 } from "./passive-event-processor.js";
 import { createStatsHandler } from "./routes/stats.js";
 import { backendDiagnosticFailure } from "../storage/diagnostics.js";
@@ -411,7 +412,7 @@ function assertDaemonRequestStorageAdmission(
   const requestConfig = parseDaemonConfig(content, {}, resolveDaemonConfigEnv(process.env));
   if (requestConfig.storage.backend !== startupConfig.storage.backend) {
     throw new BackendPublicationJournalError(
-      "unexpected-state",
+      "backend-mismatch",
       "daemon request backend differs from the authenticated startup backend",
     );
   }
@@ -666,6 +667,20 @@ export async function createDaemon(config: DaemonConfig, options?: DaemonOptions
     }, idleTimeoutMs);
   }
 
+  /**
+   * #1384: report a halted background sweep on the health route. Read admission
+   * refuses every other route once the configured backend diverges from this
+   * daemon's frozen startup backend, so unauthenticated health is the only
+   * surface that still answers when the halt is most relevant. A healthy daemon
+   * keeps its existing response shape.
+   */
+  const passiveEventHaltReport = (): {
+    passiveEvents?: PassiveEventBackgroundDiagnostics;
+  } => {
+    const diagnostics = passiveEventProcessor.backgroundDiagnostics();
+    return diagnostics.halted ? { passiveEvents: diagnostics } : {};
+  };
+
   registerBuiltInRoute("GET", "/health", async (req, res) => {
     if (serverToken && req.headers.authorization === undefined) {
       sendJson(res, 200, {
@@ -675,6 +690,7 @@ export async function createDaemon(config: DaemonConfig, options?: DaemonOptions
         uptime: Math.floor((Date.now() - startTime) / 1000),
         pid: process.pid,
         ...(daemonOwnerId ? { ownerId: daemonOwnerId } : {}),
+        ...passiveEventHaltReport(),
       });
       return;
     }
@@ -688,6 +704,7 @@ export async function createDaemon(config: DaemonConfig, options?: DaemonOptions
       pid: process.pid,
       entrypoint: daemonEntrypoint,
       ...(daemonOwnerId ? { ownerId: daemonOwnerId } : {}),
+      ...passiveEventHaltReport(),
       ...(serverToken && req.headers.authorization !== undefined
         ? { daemonInstanceId: invocationCoordinator.daemonInstanceId }
         : {}),
@@ -1101,7 +1118,14 @@ export async function createDaemon(config: DaemonConfig, options?: DaemonOptions
       registerBuiltInRoute(
         "POST",
         "/status",
-        createStatusHandler(config, startTime, actualPort, publicationHome, storageFactory),
+        createStatusHandler(
+          config,
+          startTime,
+          actualPort,
+          publicationHome,
+          storageFactory,
+          () => passiveEventProcessor.backgroundDiagnostics(),
+        ),
         "read",
       );
       passiveEventProcessor.start();

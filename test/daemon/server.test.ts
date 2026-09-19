@@ -365,6 +365,75 @@ describe("daemon server", () => {
     }
   });
 
+  // #1384: drives the real assertDaemonRequestStorageAdmission seam rather than
+  // the _assertBackendPublication override, because the defect was precisely
+  // that the frozen-startup-backend comparison shipped with no coverage.
+  it("halts background passive-event work and reports it on health when the configured backend diverges from startup", async () => {
+    const configPath = join(tempHome!, "divergent-config.json");
+    writeFileSync(configPath, "{}", { mode: 0o600 });
+    const caPath = join(tempHome!, "postgres-ca.pem");
+    writeFileSync(caPath, "-----BEGIN CERTIFICATE-----\ntest\n-----END CERTIFICATE-----\n", { mode: 0o600 });
+    const tokenPath = join(tempHome!, "daemon.token");
+    ensureAuthToken(tokenPath);
+    const projectCwd = mkdtempSync(join(tmpdir(), "lcm-passive-divergent-"));
+    const previousUrl = process.env.LCM_POSTGRES_URL;
+    const previousCa = process.env.LCM_POSTGRES_CA_FILE;
+    const previousMigrationRole = process.env.LCM_POSTGRES_MIGRATION_ROLE;
+    const previousEntrypoint = process.argv[1];
+    process.argv[1] = join(tempHome!, "daemon.mjs");
+    process.env.LCM_POSTGRES_URL = "postgresql://user:secret@db.example.test/lcm";
+    process.env.LCM_POSTGRES_CA_FILE = caPath;
+    process.env.LCM_POSTGRES_MIGRATION_ROLE = "lcm_test_migrator";
+
+    daemon = await createDaemon(
+      loadDaemonConfig(configPath, { daemon: { port: 0, idleTimeoutMs: 0 } }),
+      { publicationConfigPath: configPath, tokenPath },
+    );
+    const port = daemon.address().port;
+    const token = readFileSync(tokenPath, "utf8").trim();
+
+    try {
+      // Health is clean while the configured backend still matches startup.
+      const before = await fetch(`http://127.0.0.1:${port}/health`);
+      expect(before.status).toBe(200);
+      expect(await before.json()).not.toHaveProperty("passiveEvents");
+
+      // Queue background promotion while the daemon is still admissible.
+      const notified = await fetch(`http://127.0.0.1:${port}/promote-events/notify`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json", authorization: `Bearer ${token}` },
+        body: JSON.stringify({ cwd: projectCwd, priority: 1 }),
+      });
+      expect(notified.status).toBe(200);
+
+      // An operator now switches the configured backend under a running daemon.
+      writeFileSync(configPath, JSON.stringify({ storage: { backend: "postgresql" } }), { mode: 0o600 });
+
+      // The debounced drain reaches the genuine admission seam, which refuses.
+      await vi.waitFor(async () => {
+        const health = await fetch(`http://127.0.0.1:${port}/health`);
+        expect(health.status).toBe(200);
+        await expect(health.json()).resolves.toMatchObject({
+          storageBackend: "sqlite",
+          passiveEvents: {
+            halted: true,
+            haltedReason: "backend-mismatch",
+            haltedMessage: "daemon request backend differs from the authenticated startup backend",
+          },
+        });
+      }, { timeout: 5_000, interval: 25 });
+    } finally {
+      rmSync(projectCwd, { recursive: true, force: true });
+      process.argv[1] = previousEntrypoint;
+      if (previousUrl === undefined) delete process.env.LCM_POSTGRES_URL;
+      else process.env.LCM_POSTGRES_URL = previousUrl;
+      if (previousCa === undefined) delete process.env.LCM_POSTGRES_CA_FILE;
+      else process.env.LCM_POSTGRES_CA_FILE = previousCa;
+      if (previousMigrationRole === undefined) delete process.env.LCM_POSTGRES_MIGRATION_ROLE;
+      else process.env.LCM_POSTGRES_MIGRATION_ROLE = previousMigrationRole;
+    }
+  });
+
   it("starts and responds to /health", async () => {
     daemon = await createDaemon(loadDaemonConfig("/x", { daemon: { port: 0 } }));
     const port = daemon.address().port;

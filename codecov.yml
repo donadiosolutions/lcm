@@ -156,6 +156,8 @@ component_management:
         # daemon-core-owned.
         # #1343 bracketed nested public URL handoffs and #1348 drive-root
         # handoff arming also remain daemon-core-owned.
+        # #1384 keeps the frozen startup-backend admission discriminator and the
+        # halted-sweep health report daemon-core-owned.
         - "^src/daemon/safe-error\\.ts$"
         - "^src/daemon/server\\.ts$"
         - "^src/daemon/summarizer\\.ts$"
@@ -193,12 +195,16 @@ component_management:
         # #1203 keeps evidence-based prompt scoring and debug output route-owned.
         # #1230 keeps route project close on the live request token.
         # #1247 keeps local queue preparation, acknowledgement, and cleanup route-owned.
+        # #1384 keeps the optional background passive-event status block
+        # route-owned.
         - "src/daemon/routes/"
     - component_id: "unit-daemon-events"
       name: "Unit - Daemon Passive Events"
       paths:
         # #969 promote-events notification body-shape validation remains
         # daemon-events-owned.
+        # #1384 keeps the frozen-backend sweep halt, its single report, and the
+        # shared scheduled-work teardown daemon-events-owned.
         - "^src/daemon/passive-event-processor\\.ts$"
     - component_id: "unit-mcp"
       name: "Unit - MCP"

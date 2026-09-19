@@ -657,6 +657,96 @@ describe("PassiveEventProcessor", () => {
     );
   });
 
+  // #1384: a frozen startup backend can never be re-admitted by this process,
+  // so the sweep must stop and report instead of retrying every five minutes.
+  it("halts the sweep and reports once on a frozen startup-backend mismatch", async () => {
+    const { deps } = timerDeps();
+    const mismatch = new BackendPublicationJournalError(
+      "backend-mismatch",
+      "daemon request backend differs from the authenticated startup backend",
+    );
+    const collectEventSidecars = vi.fn<CollectEventSidecars>().mockResolvedValue([
+      sidecar({ cwd: "/mismatched", path: "/events/mismatched.db", unprocessed: 1 }),
+      sidecar({ cwd: "/later", path: "/events/later.db", unprocessed: 1 }),
+    ]);
+    const promoteEventsForCwd = vi.fn<PromoteEventsForCwd>().mockImplementation(async (...args) =>
+      args[5]?.withPublicationAdmission?.(() => {
+        throw mismatch;
+      }) ?? { promoted: 1, skipped: 0, correlated: 0, errors: 0 });
+    const withPublicationAdmission: PublicationAdmission = async operation => operation({});
+    const processor = new PassiveEventProcessor(makeConfig(), PASSIVE_EVENT_PROCESSOR_DEFAULTS, {
+      ...deps,
+      collectEventSidecars,
+      promoteEventsForCwd,
+      withPublicationAdmission,
+    } as never);
+
+    processor.start();
+    expect(processor.backgroundDiagnostics()).toEqual({
+      halted: false,
+      haltedReason: null,
+      haltedMessage: null,
+    });
+
+    await processor.runSweep();
+
+    // The later sidecar is abandoned: every sidecar would fail identically.
+    expect(promoteEventsForCwd).toHaveBeenCalledTimes(1);
+    expect(deps.safeLogError).toHaveBeenCalledTimes(1);
+    expect(deps.safeLogError).toHaveBeenCalledWith("passive-event-processor", mismatch, {});
+    expect(processor.backgroundDiagnostics()).toEqual({
+      halted: true,
+      haltedReason: "backend-mismatch",
+      haltedMessage: "daemon request backend differs from the authenticated startup backend",
+    });
+    // The periodic sweep is retired rather than left looping.
+    expect(deps.clearInterval).toHaveBeenCalled();
+
+    // A further sweep neither promotes nor re-reports the identical refusal.
+    await processor.runSweep();
+    expect(promoteEventsForCwd).toHaveBeenCalledTimes(1);
+    expect(deps.safeLogError).toHaveBeenCalledTimes(1);
+  });
+
+  it("halts notified promotion and abandons the remaining queued projects", async () => {
+    const { deps } = timerDeps();
+    const mismatch = new BackendPublicationJournalError(
+      "backend-mismatch",
+      "daemon request backend differs from the authenticated startup backend",
+    );
+    const firstCwd = mkdtempSync(join(tmpdir(), "lcm-passive-mismatch-"));
+    const secondCwd = mkdtempSync(join(tmpdir(), "lcm-passive-later-"));
+    const promoteEventsForCwd = vi.fn<PromoteEventsForCwd>().mockImplementation(async (...args) =>
+      args[5]?.withPublicationAdmission?.(() => {
+        throw mismatch;
+      }) ?? { promoted: 0, skipped: 0, correlated: 0, errors: 0, message: "no unprocessed events" });
+    const withPublicationAdmission: PublicationAdmission = async operation => operation({});
+    const processor = new PassiveEventProcessor(makeConfig(), PASSIVE_EVENT_PROCESSOR_DEFAULTS, {
+      ...deps,
+      promoteEventsForCwd,
+      withPublicationAdmission,
+    } as never);
+
+    try {
+      processor.notify({ cwd: firstCwd, priority: 1 });
+      processor.notify({ cwd: secondCwd, priority: 1 });
+      await processor.flushOnce();
+
+      expect(promoteEventsForCwd).toHaveBeenCalledTimes(1);
+      expect(deps.safeLogError).toHaveBeenCalledTimes(1);
+      expect(processor.backgroundDiagnostics().haltedReason).toBe("backend-mismatch");
+
+      // A halted processor stops accepting new background work entirely.
+      processor.notify({ cwd: secondCwd, priority: 1 });
+      await processor.flushOnce();
+      expect(promoteEventsForCwd).toHaveBeenCalledTimes(1);
+    } finally {
+      processor.stop();
+      rmSync(firstCwd, { recursive: true, force: true });
+      rmSync(secondCwd, { recursive: true, force: true });
+    }
+  });
+
   it("waits for an in-flight drain before completing shutdown", async () => {
     const { deps } = timerDeps();
     let releasePromotion: ((value: unknown) => void) | undefined;
