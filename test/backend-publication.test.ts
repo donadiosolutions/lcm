@@ -4284,7 +4284,10 @@ describe("BackendPublicationCoordinator", () => {
       await terminalArchiveFixture(home, 2);
       const history = backendPublicationHistoryDirectory(home);
       if (kind === "file") writeFileSync(history, "unsafe", { mode: 0o600 });
-      if (kind === "non-private-directory") mkdirSync(history, { mode: 0o755 });
+      if (kind === "non-private-directory") {
+        mkdirSync(history, { mode: 0o755 });
+        chmodSync(history, 0o755);
+      }
       if (kind === "symlink") {
         const victim = join(home, "history-victim");
         mkdirSync(victim, { mode: 0o700 });
