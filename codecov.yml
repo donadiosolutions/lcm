@@ -24,6 +24,8 @@ component_management:
         # #1356/#1357 keep CLI admission of an authenticated project-map
         # identity, and the unauthenticated marker that project list and
         # project show now print, in this existing owner.
+        # #1403 keeps guarded per-project identity resolution during
+        # project enumeration in this existing owner.
         - "^src/cli-storage\\.ts$"
     - component_id: "unit-installation"
       name: "Unit - Installation"
@@ -364,6 +366,8 @@ component_management:
         # #618 authenticated batch discovery remains within this compaction owner.
         # #1283 keeps authenticated retired-fence discovery and structured
         # item progress in this existing compaction component.
+        # #1403 keeps the per-project unbound-binding discovery diagnostic
+        # in this existing compaction owner.
         - "^src/batch-compact\\.ts$"
         - "^src/compaction\\.ts$"
         - "^src/large-files\\.ts$"

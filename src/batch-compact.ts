@@ -18,6 +18,7 @@ import { projectPathsForIdentity } from "./daemon/project.js";
 import { CliProjectStorageMissingError, listCliProjects, withCliProjectStorage } from "./cli-storage.js";
 import { NATIVE_SOURCE_LOCATOR_BATCH_SIZE, type ProjectRepositories } from "./storage/contracts.js";
 import { createSqliteRepositories, createSqliteRepositoryStores } from "./storage/sqlite/repositories.js";
+import { StorageIdentityConfigurationError, UNBOUND_POSTGRESQL_PROJECT_MESSAGE } from "./storage/identity-context.js";
 import {
   RetiredProjectIdentityError,
   assertProjectStorageIdentityActive,
@@ -480,9 +481,16 @@ async function discoverUncompacted(
           });
           continue;
         }
+        // Map the class to a static remedy, never to error.message: only
+        // RetiredProjectIdentityError's own diagnostic and the fixed
+        // UNBOUND_POSTGRESQL_PROJECT_MESSAGE constant are safe to surface
+        // here. StorageIdentityConfigurationError's constructor accepts an
+        // arbitrary string, so its message is not a static remedy.
         const message = error instanceof RetiredProjectIdentityError
           ? error.message
-          : "project storage discovery failed";
+          : error instanceof StorageIdentityConfigurationError
+            ? UNBOUND_POSTGRESQL_PROJECT_MESSAGE
+            : "project storage discovery failed";
         failures.push({ target: project.canonical, message });
         onEvent?.({
           type: "phase-failure",

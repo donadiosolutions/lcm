@@ -11,14 +11,15 @@ import {
   readProjectMapSnapshot,
   resolveExistingProjectIdentity,
   resolveProjectIdentity,
+  type ProjectIdentity,
 } from "./project-map.js";
 import { configPath, lcmHomeDir } from "./runtime-paths.js";
 import { ensurePrivateDirectory, atomicWritePrivateFileExclusive } from "./security-files.js";
 import { selectStorageBackendForConfig, assertStorageBackendPublication } from "./storage/backend.js";
 import { withBackendPublicationConsumerLockAsync } from "./storage/backend-publication.js";
-import type { ProjectStorage, StorageBackendFactory } from "./storage/contracts.js";
+import type { ProjectStorage, StorageBackendFactory, StorageIdentityContext } from "./storage/contracts.js";
 import { createStorageBackendFactory } from "./storage/factory.js";
-import { resolveStorageIdentityContext } from "./storage/identity-context.js";
+import { resolveStorageIdentityContext, StorageIdentityConfigurationError } from "./storage/identity-context.js";
 import { withPublicationAdmissionRetry, type PublicationConvergence } from "./storage/publication-convergence.js";
 import { SqliteStorageBackendFactory } from "./storage/sqlite/factory.js";
 import { ensureWorktreeProjectReconciled } from "./worktree-reconciliation.js";
@@ -200,14 +201,37 @@ export async function listCliProjects(): Promise<Array<{ id: string; canonical: 
       // backend-specific identity resolution runs. Under a PostgreSQL
       // config, resolveStorageIdentityContext throws its generic
       // unbound-project message for any entry without a remote binding,
-      // including a fenced one; that would escape this loop and abort the
-      // whole enumeration, so a fenced project would never reach the
-      // per-project RetiredProjectIdentityError branch in the caller. A
-      // fenced entry enumerates with its own local identity instead, which
-      // keeps enumeration whole for every other project.
-      const identity = isAuthenticatedRetiredProjectIdentityFence(projectPathsForIdentity(local).dir, local.id)
-        ? local
-        : resolveStorageIdentityContext(config.storage, local, undefined, local.canonical);
+      // including a fenced one. A fenced entry enumerates with its own
+      // local identity instead, which keeps enumeration whole for every
+      // other project. A non-fenced unbound entry no longer escapes this
+      // loop either: the guarded resolution below degrades it to its own
+      // local identity too, through the same per-project path, instead of
+      // aborting enumeration for every other project.
+      //
+      // The two "Legacy worktree storage ..." throws and the ambiguous
+      // project-map propagation earlier in this loop remain deliberately
+      // fail-closed and still abort the whole enumeration, because they
+      // signal a machine-local storage conflict rather than a per-project
+      // binding gap. MachineIdentityFileError raised by
+      // requireMachineIdentity inside resolveStorageIdentityContext also
+      // still aborts enumeration unchanged, since a broken machine identity
+      // is a machine-wide condition, not a per-project one.
+      const fenced = isAuthenticatedRetiredProjectIdentityFence(projectPathsForIdentity(local).dir, local.id);
+      let identity: ProjectIdentity | (StorageIdentityContext & { readonly localProjectId: string });
+      if (fenced) {
+        identity = local;
+      } else {
+        try {
+          identity = resolveStorageIdentityContext(config.storage, local, undefined, local.canonical);
+        } catch (error) {
+          // An entry with no remote binding is a per-project condition, not
+          // an enumeration failure: keep it selected under its local
+          // identity so the caller reports it and every other project is
+          // still processed.
+          if (!(error instanceof StorageIdentityConfigurationError)) throw error;
+          identity = local;
+        }
+      }
       const prior = selected.get(identity.id);
       selected.set(identity.id, {
         id: identity.id,
