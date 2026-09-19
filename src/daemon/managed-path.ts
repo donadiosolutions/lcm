@@ -23,7 +23,7 @@ function homeScopedInstallationRoot(
     ? /^(.*)\/(?:\.local|\.nvm|\.npm-global|\.npm-packages|\.volta|\.asdf|\.codex|\.claude)(?:\/|$)/
     : /^(.*)\/(?:\.nvm|\.npm-global|\.npm-packages|\.volta|\.asdf|\.codex|\.claude)(?:\/|$)/;
   const match = pattern.exec(directory);
-  return match?.[1] || undefined;
+  return match ? match[1] || sep : undefined;
 }
 
 function canonicalPath(path: string): string | undefined {

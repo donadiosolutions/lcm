@@ -199,6 +199,15 @@ describe("managed daemon executable path", () => {
     );
   });
 
+  it("preserves a root-home stable synthesized bin", () => {
+    expect(managedDaemonPathForStableLaunch(
+      "/usr/bin/node",
+      ["/.local/lib/node_modules/@donadiosolutions/lcm/dist/lcm.mjs", "daemon", "start"],
+      "/var/lib/lcm",
+      "/",
+    )).toBe(`/.local/bin:${SYSTEMD_DAEMON_PATH}`);
+  });
+
   it("accepts an implicit home authenticated by passwd realpath equality", () => {
     platformMocks.homedir.mockReturnValue("/home/alias");
     platformMocks.userInfo.mockReturnValue({
