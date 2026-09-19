@@ -237,6 +237,44 @@ classify_pull_request_files() {
     "$changed_file_count"
 }
 
+evaluate_pull_request_file_binding() {
+  local changed_file_count="$1"
+  node .github/scripts/external-admission-policy.mjs evaluate-file-binding \
+    "$HEAD_SHA" "$changed_file_count"
+}
+
+validate_pull_request_file_binding() {
+  local phase="$1"
+  local position="$2"
+  local changed_file_count="$3"
+  local current_pull_request evaluation ready pending terminal_failure
+
+  if ! current_pull_request="$(fetch_pull_request "$PR_NUMBER")"; then
+    exit_pending \
+      "PR file binding evidence is temporarily unavailable" \
+      "$phase $position-file PR evidence could not be fetched; admission remains pending."
+  fi
+  evaluation="$(
+    evaluate_pull_request_file_binding "$changed_file_count" <<<"$current_pull_request"
+  )" || return $?
+  ready="$(jq -r '.ready' <<<"$evaluation")" || return $?
+  pending="$(jq -r '.pending // false' <<<"$evaluation")" || return $?
+  terminal_failure="$(jq -r '.terminalFailure // empty' <<<"$evaluation")" || return $?
+  if [[ -n "$terminal_failure" ]]; then
+    echo "$phase $position-file PR binding evidence is invalid: $terminal_failure" >&2
+    return 2
+  fi
+  if [[ "$pending" == true ]]; then
+    exit_pending \
+      "PR file evidence changed during evaluation" \
+      "$phase $position-file PR head or changed-file count changed; admission remains pending."
+  fi
+  if [[ "$ready" != true ]]; then
+    echo "$phase $position-file PR binding returned an invalid state." >&2
+    return 2
+  fi
+}
+
 evaluate_check_runs() {
   node .github/scripts/external-admission-policy.mjs evaluate-checks \
     "$HEAD_SHA" "$REPOSITORY" "$SERVER_URL"
@@ -339,11 +377,13 @@ validate_required_snapshot() {
   local admission_ready admission_pending admission_terminal_failure evidence_class selected_evidence_fingerprint
 
   changed_file_count="$(jq -r '.changed_files' <<<"$pull_request")" || return $?
+  validate_pull_request_file_binding "$phase" before "$changed_file_count"
   if ! file_pages="$(fetch_pull_request_files "$PR_NUMBER")"; then
     exit_pending \
       "PR file evidence is temporarily unavailable" \
       "$phase PR file evidence could not be fetched; admission remains pending."
   fi
+  validate_pull_request_file_binding "$phase" after "$changed_file_count"
   classification="$(classify_pull_request_files "$changed_file_count" <<<"$file_pages")" || return $?
   sensitive="$(jq -r '.sensitive' <<<"$classification")" || return $?
   classification_fingerprint="$(jq -c \

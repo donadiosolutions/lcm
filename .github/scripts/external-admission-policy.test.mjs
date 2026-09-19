@@ -112,6 +112,7 @@ test("classifies the complete closed sensitive path set and both rename sides", 
     "test/postgresql/harness.ts",
     "test/postgresql/operational-fixture.ts",
     "test/postgresql/portable-fixture.ts",
+    "test/e2e/harness.ts",
     ".agents/skills/tests/policy.test.mjs",
     ".agents/skills/example/scripts/check.mjs",
     "package.json",
@@ -190,6 +191,29 @@ test("rejects incomplete, duplicate, over-cap, and malformed PR file records", (
   ]) {
     assert.throws(() => classifyPullRequestFiles([file], 1), /pull request file/u);
   }
+});
+
+test("binds PR file evidence to the exact head and changed-file count", () => {
+  assert.deepEqual(JSON.parse(runPolicyCommand(
+    "evaluate-file-binding",
+    [HEAD_SHA, "1"],
+    JSON.stringify(eligibleMain),
+  )), { ready: true });
+  assert.deepEqual(JSON.parse(runPolicyCommand(
+    "evaluate-file-binding",
+    [HEAD_SHA, "1"],
+    JSON.stringify({ ...eligibleMain, head: { ...eligibleMain.head, sha: "b".repeat(40) } }),
+  )), { ready: false, pending: true, reason: "pr-file-snapshot-changed" });
+  assert.deepEqual(JSON.parse(runPolicyCommand(
+    "evaluate-file-binding",
+    [HEAD_SHA, "1"],
+    JSON.stringify({ ...eligibleMain, changed_files: 2 }),
+  )), { ready: false, pending: true, reason: "pr-file-snapshot-changed" });
+  assert.deepEqual(JSON.parse(runPolicyCommand(
+    "evaluate-file-binding",
+    [HEAD_SHA, "1"],
+    JSON.stringify({ ...eligibleMain, changed_files: "1" }),
+  )), { ready: false, pending: false, terminalFailure: "pr-file-snapshot" });
 });
 
 test("authenticates only an exact successful Copilot dynamic check and run", () => {

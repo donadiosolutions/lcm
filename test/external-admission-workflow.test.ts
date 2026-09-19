@@ -348,6 +348,10 @@ if [[ "$2" == "classify-files" ]]; then
   printf '%s\\n' '{"classification":"non-sensitive","sensitive":false,"auditedPaths":["docs/external-admission.md"],"matchedPaths":[]}'
   exit 0
 fi
+if [[ "$2" == "evaluate-file-binding" ]]; then
+  printf '%s\\n' '{"ready":true}'
+  exit 0
+fi
 if [[ "$2" == "evaluate-review-check" ]]; then
   printf '%s\\n' '{"state":"missing","ready":false,"pending":true}'
   exit 0
@@ -456,6 +460,8 @@ type AdmissionScenario =
   | "sensitive-postgresql-harness"
   | "sensitive-postgresql-operational-fixture"
   | "sensitive-postgresql-portable-fixture"
+  | "sensitive-e2e-harness"
+  | "pr-files-head-race"
   | "transient-pr-files"
   | "malformed-pr-files";
 
@@ -499,6 +505,7 @@ function runAdmissionScenario(
   const branchCallsPath = join(directory, "branch-calls.log");
   const branchRequestsPath = join(directory, "branch-requests.log");
   const fileCallsPath = join(directory, "file-calls.log");
+  const pullCallsPath = join(directory, "pull-calls.log");
   const statusLogPath = join(directory, "statuses.log");
   const headSha = "a".repeat(40);
   const ciRunId = "123";
@@ -553,6 +560,7 @@ function runAdmissionScenario(
   let reviewRunApiFails = false;
   let pullRequestFilesApiFails = false;
   let pullRequestFileSnapshots: unknown[] | undefined;
+  let pullRequestSnapshots: unknown[] | undefined;
   let branchProtectionSequence = ["true"];
   let branchDeletedSuffix = "";
   let branchLookupMustNotHappen = false;
@@ -689,6 +697,22 @@ function runAdmissionScenario(
         status: "modified",
       }]];
       break;
+    case "sensitive-e2e-harness":
+      pullRequestFiles = [[{ filename: "test/e2e/harness.ts", status: "modified" }]];
+      break;
+    case "pr-files-head-race":
+      pullRequestSnapshots = [
+        pullRequest,
+        pullRequest,
+        pullRequest,
+        pullRequest,
+        pullRequest,
+        pullRequest,
+        pullRequest,
+        pullRequest,
+        makeAdmissionPullRequest({ headSha: "b".repeat(40), changedFiles: 1 }),
+      ];
+      break;
     case "transient-pr-files":
       pullRequestFilesApiFails = true;
       break;
@@ -771,7 +795,14 @@ if [[ "$endpoint" == repos/*/commits/*/pulls?per_page=100 ]]; then
   exit 0
 fi
 if [[ "$endpoint" == repos/*/pulls/123 ]]; then
-  printf '%s\n' "$PULL_REQUEST_JSON"
+  pull_call_count=0
+  if [[ -f "$PULL_CALLS" ]]; then read -r pull_call_count < "$PULL_CALLS"; fi
+  pull_call_count=$((pull_call_count + 1))
+  printf '%s\n' "$pull_call_count" > "$PULL_CALLS"
+  pull_index=$((pull_call_count - 1))
+  pull_last_index="$(jq 'length - 1' <<<"$PULL_REQUEST_SNAPSHOTS_JSON")"
+  if (( pull_index > pull_last_index )); then pull_index="$pull_last_index"; fi
+  jq -c --argjson index "$pull_index" '.[$index]' <<<"$PULL_REQUEST_SNAPSHOTS_JSON"
   exit 0
 fi
 if [[ "$endpoint" == repos/*/pulls/123/files?per_page=100 ]]; then
@@ -834,6 +865,7 @@ exit 99
     writeFileSync(branchCallsPath, "0\n");
     writeFileSync(branchRequestsPath, "");
     writeFileSync(fileCallsPath, "0\n");
+    writeFileSync(pullCallsPath, "0\n");
     writeFileSync(statusLogPath, "");
 
     const result = spawnSync("bash", [evaluatorPath], {
@@ -856,11 +888,12 @@ exit 99
         EVENT_WORKFLOW_RUN_ID: eventWorkflowRunId,
         FILE_CALLS: fileCallsPath,
         PATH: `${directory}:${process.env.PATH ?? ""}`,
-        PULL_REQUEST_JSON: JSON.stringify(pullRequest),
+        PULL_CALLS: pullCallsPath,
         PULL_REQUEST_FILES_API_FAILS: String(pullRequestFilesApiFails),
         PULL_REQUEST_FILE_SNAPSHOTS_JSON: JSON.stringify(
           pullRequestFileSnapshots ?? [pullRequestFiles, pullRequestFiles, pullRequestFiles],
         ),
+        PULL_REQUEST_SNAPSHOTS_JSON: JSON.stringify(pullRequestSnapshots ?? [pullRequest]),
         REPOSITORY,
         REVIEW_RUN_API_FAILS: String(reviewRunApiFails),
         REVIEW_RUN_JSON: JSON.stringify(reviewRun),
@@ -874,6 +907,7 @@ exit 99
       statuses: readFileSync(statusLogPath, "utf8").trim().split("\n").filter(Boolean),
       branchCalls: Number(readFileSync(branchCallsPath, "utf8").trim()),
       branchRequests: readFileSync(branchRequestsPath, "utf8").trim().split("\n").filter(Boolean),
+      pullCalls: Number(readFileSync(pullCallsPath, "utf8").trim()),
     };
   } finally {
     rmSync(directory, { force: true, recursive: true });
@@ -966,6 +1000,7 @@ describe("external admission workflow", () => {
     "sensitive-postgresql-harness",
     "sensitive-postgresql-operational-fixture",
     "sensitive-postgresql-portable-fixture",
+    "sensitive-e2e-harness",
   ] as const)("classifies %s as sensitive in the trusted reducer", (scenario) => {
     const { result, statuses } = runAdmissionScenario(scenario);
     expect(result.status, `${scenario}\n${result.stdout}\n${result.stderr}`).toBe(0);
@@ -1009,6 +1044,15 @@ describe("external admission workflow", () => {
     expect(statuses.at(-1)?.split("\t", 1)[0]).toBe("pending");
     expect(statuses.at(-1)).toContain("Trusted admission evidence changed");
     expect(statuses.some((status) => status.startsWith("success\t"))).toBe(false);
+  });
+
+  it("keeps a final same-count file snapshot pending when the PR head changes", () => {
+    const { result, statuses, pullCalls } = runAdmissionScenario("pr-files-head-race");
+    expect(result.status, `${result.stdout}\n${result.stderr}`).toBe(0);
+    expect(statuses.at(-1)?.split("\t", 1)[0]).toBe("pending");
+    expect(statuses.at(-1)).toContain("PR file evidence changed");
+    expect(statuses.some((status) => status.startsWith("success\t"))).toBe(false);
+    expect(pullCalls).toBe(9);
   });
 
   it("terminalizes an unprotected maintenance/1.4.x pull request", () => {

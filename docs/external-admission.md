@@ -46,7 +46,8 @@ example are one-shot operator variables, not configuration settings.
 
 The sensitive set is closed: `.github/actions/**`, `.github/codeql/**`,
 `.github/scripts/**`, `.github/workflows/**`, `bin/**`, `installer/**`,
-`scripts/**`, `src/**`, `test/setup/**`, `.agents/skills/tests/**`,
+`scripts/**`, `src/**`, `test/setup/**`, the exact central E2E harness
+`test/e2e/harness.ts`, `.agents/skills/tests/**`,
 `.agents/skills/*/scripts/**`, `package.json`, `pnpm-lock.yaml`, `.npmrc`,
 `pnpm-workspace.yaml`, `.pnpmfile.cjs`, `install.sh`, `vitest*.config.*`,
 `tsconfig*.json`, `codecov.yml`, the exact PostgreSQL harness scripts
@@ -62,6 +63,9 @@ and spawned PostgreSQL crash-worker fixtures remain candidate-test inputs. The
 three PostgreSQL scripts above are trusted setup code mounted into
 `/docker-entrypoint-initdb.d/`, while the three central TypeScript support
 modules are imported across required PostgreSQL conformance tests.
+The E2E harness creates the daemon and database used by flow tests collected by
+the required core test run; individual E2E test bodies remain candidate
+assertions outside the sensitive set.
 
 Any change to the CI workflow, package commands, Vitest or TypeScript
 configuration, or transitively executed support must update this set, its

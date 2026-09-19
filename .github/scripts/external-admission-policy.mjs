@@ -50,6 +50,7 @@ const SENSITIVE_PATHS = [
   /^\.github\/(?:actions|codeql|scripts|workflows)\//u,
   /^(?:bin|installer|scripts|src)\//u,
   /^test\/setup\//u,
+  /^test\/e2e\/harness\.ts$/u,
   /^test\/postgresql\/(?:template-init\.sh|cached-run-init\.sh|init\.sh)$/u,
   /^test\/postgresql\/(?:harness|operational-fixture|portable-fixture)\.ts$/u,
   /^\.agents\/skills\/tests\//u,
@@ -144,6 +145,33 @@ export function classifyPullRequestFiles(files, changedFileCount) {
     auditedPaths,
     matchedPaths,
   };
+}
+
+export function evaluatePullRequestFileBinding(
+  pullRequest,
+  { headSha, changedFileCount },
+) {
+  try {
+    const value = requireObject(pullRequest, "pull request");
+    const expectedHead = requireNonEmptyString(headSha, "head SHA");
+    const expectedCount = requireSafePositiveInteger(
+      changedFileCount,
+      "expected pull request changed_files",
+      3000,
+    );
+    const currentHead = requireNonEmptyString(value.head?.sha, "pull request head SHA");
+    const currentCount = requireSafePositiveInteger(
+      value.changed_files,
+      "pull request changed_files",
+      3000,
+    );
+    if (currentHead !== expectedHead || currentCount !== expectedCount) {
+      return { ready: false, pending: true, reason: "pr-file-snapshot-changed" };
+    }
+    return { ready: true };
+  } catch {
+    return { ready: false, pending: false, terminalFailure: "pr-file-snapshot" };
+  }
 }
 
 export function evaluatePullRequestEligibility({
@@ -479,6 +507,13 @@ export function runPolicyCommand(command, args, input) {
       flattenPullRequestFilePages(payload),
       Number(args[0]),
     ));
+  }
+  if (command === "evaluate-file-binding" && args.length === 2) {
+    const [headSha, changedFileCount] = args;
+    return JSON.stringify(evaluatePullRequestFileBinding(payload, {
+      headSha,
+      changedFileCount: Number(changedFileCount),
+    }));
   }
   if (command === "evaluate-review-check" && args.length === 3) {
     const [headSha, repository, serverUrl] = args;
