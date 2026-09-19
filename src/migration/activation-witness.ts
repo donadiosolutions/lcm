@@ -792,6 +792,18 @@ export type ClassifyMigrationRollbackModeInput = Readonly<{
 export function classifyMigrationRollbackMode(
   input: ClassifyMigrationRollbackModeInput,
 ): "pre-write" | "post-write" {
+  // Round-2 P3: createMigrationActivationWitness already refuses an
+  // epoch/attempt mismatch before ever calling this function, but this
+  // function is itself exported and callable standalone (#626 and any
+  // other future consumer may call it directly without going through
+  // witness construction). Without its own guard, a mismatched pair
+  // would silently classify against the wrong epoch's census/delta
+  // rather than refusing -- the same class of defect as the round-1 P0
+  // this module already fixed once, just reachable through a different
+  // door.
+  if (input.epoch.epochId !== input.attempt.epochId) {
+    witnessError("unexpected-state", "rollback classification attempt does not belong to this epoch");
+  }
   if (migrationCanonicalDeltaChanged(input.postEpochDelta, input.attempt.canonicalDeltaBaseline)) {
     return "post-write";
   }

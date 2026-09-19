@@ -558,6 +558,21 @@ describe("classifyMigrationRollbackMode", () => {
     // epoch", so a caller reading either field gets the same answer.
     expect(migrationActivationCensusMatchVerdict(e, a)).toBe(false);
   });
+  it("round-3 P3 red case: refuses standalone when the attempt does not belong to the epoch, without needing createMigrationActivationWitness's own upstream guard", () => {
+    // createMigrationActivationWitness already checks epoch.epochId
+    // against attempt.epochId before ever calling this function -- but
+    // this function is itself exported and callable directly (#626 or
+    // any other future consumer). Cross-epoch pairing (different
+    // generationId, so a genuinely different epoch, not just a
+    // different census seed) must still refuse when this function is
+    // called on its own, not only through witness construction.
+    const e = epoch(0);
+    const other = epoch(0, "generation-2");
+    const a = attempt({ epochId: other.epochId, deltaSeed: 0, censusSeed: 0 });
+    expectWitnessError(() => classifyMigrationRollbackMode({
+      epoch: e, attempt: a, postEpochDelta: canonicalDelta(0), postEpochCensus: censusVector(0),
+    }), "unexpected-state");
+  });
 });
 
 describe("MigrationActivationWitness", () => {
