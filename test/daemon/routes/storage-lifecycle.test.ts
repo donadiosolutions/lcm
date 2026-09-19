@@ -219,6 +219,7 @@ describe("route storage cleanup", () => {
       new StorageIdentityConfigurationError("binding required"),
     )).toEqual({
       code: "STORAGE_IDENTITY_REQUIRED",
+      reason: "unbound-postgresql-project",
       error: "binding required",
       storageBackend: "postgresql",
     });
@@ -230,6 +231,7 @@ describe("route storage cleanup", () => {
       status: 409,
       body: {
         code: "STORAGE_IDENTITY_REQUIRED",
+        reason: "unbound-postgresql-project",
         error: "binding required",
         storageBackend: "postgresql",
       },
@@ -238,6 +240,7 @@ describe("route storage cleanup", () => {
       new MachineIdentityFileError("machine missing", "Register it."),
     )).toEqual({
       code: "STORAGE_IDENTITY_REQUIRED",
+      reason: "machine-identity-unavailable",
       error: "Machine identity is unavailable. Run `lcm machine show` for recovery guidance.",
       storageBackend: "postgresql",
     });
@@ -254,6 +257,7 @@ describe("route storage cleanup", () => {
 
     expect(response).toEqual({
       code: "STORAGE_IDENTITY_REQUIRED",
+      reason: "machine-identity-unavailable",
       error: "Machine identity is unavailable. Run `lcm machine show` for recovery guidance.",
       storageBackend: "postgresql",
     });
@@ -915,6 +919,7 @@ describe("route storage cleanup", () => {
       status: 409,
       body: {
         code: "STORAGE_IDENTITY_REQUIRED",
+        reason: "unbound-postgresql-project",
         error: "binding required",
         storageBackend: "postgresql",
       },

@@ -42,7 +42,7 @@ import {
 } from "../src/runtime-paths.js";
 import type { ProgressState } from "../src/cli/progress-state.js";
 import { CliProjectStorageMissingError } from "../src/cli-storage.js";
-import { StorageIdentityConfigurationError, UNBOUND_POSTGRESQL_PROJECT_MESSAGE } from "../src/storage/identity-context.js";
+import { StorageIdentityConfigurationError, TransportedUnboundProjectError, UNBOUND_POSTGRESQL_PROJECT_MESSAGE } from "../src/storage/identity-context.js";
 import { MachineIdentityFileError } from "../src/machine-identity.js";
 import { StorageBackendUnavailableError } from "../src/storage/backend.js";
 import { PrivateMutationLockContentionError } from "../src/private-mutation-lock.js";
@@ -4186,7 +4186,7 @@ export async function runCli(
         } catch (err: any) {
           if (err instanceof PrivateMutationLockContentionError || err instanceof BackendPublicationJournalError) throw err;
           failures++;
-          process.stderr.write(`  ${knownCliErrorDiagnostic(err) ?? "Export failed for a selected project. Check its storage binding and retry."}\n`);
+          process.stderr.write(`  ${sanitizeTerminalText(cwd)}: ${knownCliErrorDiagnostic(err) ?? "Export failed for a selected project. Check its storage binding and retry."}\n`);
         }
       }
 
@@ -4309,6 +4309,7 @@ export async function runCli(
 function knownCliErrorDiagnostic(error: unknown): string | undefined {
   if (error instanceof BackendPublicationJournalError) return BACKEND_PUBLICATION_ADMISSION_DIAGNOSTIC;
   if (error instanceof StorageIdentityConfigurationError) return UNBOUND_POSTGRESQL_PROJECT_MESSAGE;
+  if (error instanceof TransportedUnboundProjectError) return UNBOUND_POSTGRESQL_PROJECT_MESSAGE;
   if (error instanceof CliProjectStorageMissingError) return "No LCM storage found for this project. Run `lcm import` or `lcm import-knowledge <file>` in the intended project, then retry.";
   if (error instanceof MachineIdentityFileError) return "LCM machine identity is unavailable. Run `lcm machine show` and register or recover the machine before retrying.";
   if (error instanceof ConfigValidationError) return "LCM configuration is invalid. Check config.json and the required environment variables, then retry.";

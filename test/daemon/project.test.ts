@@ -1355,6 +1355,15 @@ describe("secure project-root handoff", () => {
       process.getuid = originalGetuid;
     }
   });
+  it("never carries a remote binding, so it cannot satisfy BoundProjectIdentity", () => {
+    // Bug #1430: the hook-durability identity must stay unassignable where a
+    // remote binding is required. The type-level split (BoundProjectIdentity
+    // overloads in src/storage/identity-context.ts) rests on this shape.
+    mkdirSync(join(home, ".lcm"), { mode: 0o700 });
+    const identity = localProjectIdentity("/project", home);
+    expect(identity).toEqual({ id: hashProjectPath("/project"), canonical: "/project" });
+    expect("remoteProjectId" in identity).toBe(false);
+  });
 
   it("falls back when no compatibility-map entry matches the canonical path", () => {
     mkdirSync(join(home, ".lcm"), { mode: 0o700 });

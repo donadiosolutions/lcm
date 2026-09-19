@@ -2176,7 +2176,33 @@ describe("batch compaction discovery", () => {
       }],
     }]);
     expect(log).not.toHaveBeenCalledWith("Nothing to compact — no sessions are currently eligible.");
-    expect(error).toHaveBeenCalledWith("No sessions were compacted because project discovery failed.");
+    // Enumeration succeeded but the only selected project failed to open,
+    // so the per-project sentence prints instead of the discovery one.
+    expect(error).toHaveBeenCalledWith("No sessions were compacted because 1 selected project failed.");
+    expect(error).not.toHaveBeenCalledWith("No sessions were compacted because project discovery failed.");
+  });
+
+  it("reports per-project open failures distinctly from discovery failure", async () => {
+    // Follow-up to #1413: enumeration succeeded but every selected project
+    // failed to open, so the leftover discovery-failed sentence must not print.
+    const firstCwd = makeDir("compact-unreadable-first");
+    const secondCwd = makeDir("compact-unreadable-second");
+    for (const cwd of [firstCwd, secondCwd]) {
+      const projectDir = projectPaths(cwd).dir;
+      ensureProjectDir(cwd);
+      writeFileSync(join(projectDir, "meta.json"), JSON.stringify({ cwd }));
+      writeFileSync(join(projectDir, "db.sqlite"), "not sqlite");
+    }
+    const error = vi.spyOn(console, "error").mockImplementation(() => undefined);
+    expect(await batchCompact({ minTokens: 100, dryRun: false, port: 3737 })).toEqual({
+      compacted: 0,
+      unchanged: 0,
+      skipped: 0,
+      failures: 2,
+      compactedProjects: [],
+    });
+    expect(error).toHaveBeenCalledWith("No sessions were compacted because 2 selected projects failed.");
+    expect(error).not.toHaveBeenCalledWith("No sessions were compacted because project discovery failed.");
   });
 
   it("ignores directories without authenticated project bindings", async () => {
@@ -2401,7 +2427,7 @@ describe("batch compaction discovery", () => {
     writeFileSync(projectMapPath(), "{");
     clearProjectMapCache();
     const post = vi.spyOn(DaemonClient.prototype, "post");
-    vi.spyOn(console, "error").mockImplementation(() => undefined);
+    const error = vi.spyOn(console, "error").mockImplementation(() => undefined);
     vi.spyOn(console, "error").mockImplementation(() => undefined);
     const progress: Array<Partial<ProgressState>> = [];
     expect(await batchCompact({ minTokens: 100, dryRun: true, port: 3737, cwd,
@@ -2411,6 +2437,8 @@ describe("batch compaction discovery", () => {
       { phase: "Compact", target: cwd, message: "project discovery failed" },
     ] }]);
     expect(post).not.toHaveBeenCalled();
+    // Enumeration itself failed, so the discovery-failed sentence still prints.
+    expect(error).toHaveBeenCalledWith("No sessions were compacted because project discovery failed.");
     expect(await batchCompact({ minTokens: 100, dryRun: true, port: 3737 })).toMatchObject({ failures: 1 });
   });
 

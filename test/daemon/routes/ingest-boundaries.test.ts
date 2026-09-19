@@ -838,6 +838,7 @@ describe("ingest persistence boundaries", () => {
 
     expect(mocks.send).toHaveBeenLastCalledWith(response, 409, {
       code: "STORAGE_IDENTITY_REQUIRED",
+      reason: "machine-identity-unavailable",
       error: "Machine identity is unavailable. Run `lcm machine show` for recovery guidance.",
       storageBackend: "postgresql",
     });

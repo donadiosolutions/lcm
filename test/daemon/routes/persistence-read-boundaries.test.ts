@@ -1093,6 +1093,9 @@ describe("persistence read route boundaries", () => {
       await invoke(handler, body);
       expectLast(409, {
         code: "STORAGE_IDENTITY_REQUIRED",
+        reason: identityError instanceof MachineIdentityFileError
+          ? "machine-identity-unavailable"
+          : "unbound-postgresql-project",
         error: identityError instanceof MachineIdentityFileError
           ? "Machine identity is unavailable. Run `lcm machine show` for recovery guidance."
           : identityError.message,

@@ -19,7 +19,11 @@ import { selectStorageBackendForConfig, assertStorageBackendPublication } from "
 import { withBackendPublicationConsumerLockAsync } from "./storage/backend-publication.js";
 import type { ProjectStorage, StorageBackendFactory, StorageIdentityContext } from "./storage/contracts.js";
 import { createStorageBackendFactory } from "./storage/factory.js";
-import { resolveStorageIdentityContext, StorageIdentityConfigurationError } from "./storage/identity-context.js";
+import {
+  resolveBoundStorageIdentityContext,
+  resolveStorageIdentityContext,
+  StorageIdentityConfigurationError,
+} from "./storage/identity-context.js";
 import { withPublicationAdmissionRetry, type PublicationConvergence } from "./storage/publication-convergence.js";
 import { SqliteStorageBackendFactory } from "./storage/sqlite/factory.js";
 import { ensureWorktreeProjectReconciled } from "./worktree-reconciliation.js";
@@ -222,7 +226,13 @@ export async function listCliProjects(): Promise<Array<{ id: string; canonical: 
         identity = local;
       } else {
         try {
-          identity = resolveStorageIdentityContext(config.storage, local, undefined, local.canonical);
+          // SQLite accepts any local identity; PostgreSQL requires an
+          // explicit remote binding, refused loudly through
+          // resolveBoundStorageIdentityContext and degraded to the local
+          // identity by the catch below.
+          identity = config.storage.backend === "sqlite"
+            ? resolveStorageIdentityContext(config.storage, local, undefined, local.canonical)
+            : resolveBoundStorageIdentityContext(config.storage, local, undefined, local.canonical);
         } catch (error) {
           // An entry with no remote binding is a per-project condition, not
           // an enumeration failure: keep it selected under its local
