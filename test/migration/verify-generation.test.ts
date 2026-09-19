@@ -177,14 +177,14 @@ function checkpoint(domain: PortableDomain, recordCount: number, prefixSha256: s
   } as PortableCheckpoint;
 }
 
-function fakeConversationRecord(createdAt: string, identitySeed: string) {
+function fakeConversationRecord(createdAt: string, identitySeed: string, title: string | null = null) {
   return {
     version: 1, domain: "conversations" as const, domainVersion: 1, ordinal: 0, order: [],
     identitySha256: fakeHash(`identity-${identitySeed}`),
     dependencies: [],
     value: {
       conversationFingerprint: fakeHash(`fingerprint-${identitySeed}`), occurrenceOrdinal: 0,
-      sessionId: identitySeed, createdAt, title: null, bootstrappedAt: null, updatedAt: createdAt,
+      sessionId: identitySeed, createdAt, title, bootstrappedAt: null, updatedAt: createdAt,
     },
     recordSha256: fakeHash(`record-${identitySeed}`),
   };
@@ -2087,6 +2087,41 @@ describe("verifyMigrationGeneration: public listing probe", () => {
         identitySha256: migrationWitnessSha256(["sample", secondRecordIdentitySha256, 1]),
       },
     ]);
+  }, 15000);
+
+  it("round-4 red case: catches a same-millisecond title swap that truncated-createdAt-only equality is blind to", async () => {
+    // Round-4 P2: listConversations() orders ties by the destination's
+    // native conversation_id, a different identity space from the
+    // source's portable identitySha256 -- so before this fix, the digest
+    // compared only truncateToMillisecondIso(createdAt) on both sides,
+    // which cannot see two same-millisecond rows swap content, because
+    // both sides reduce to the identical array [t1, t1] regardless of
+    // which row holds which content. "first" and "second" share exactly
+    // the same truncated millisecond here on purpose; the destination
+    // returns neither of their real titles ("Alpha", "Beta") at either
+    // position, which is undetectable by createdAt alone but must be
+    // caught once title is folded into the comparison on both sides.
+    stubDestinationPrimitives();
+    const conversationsRecords = [
+      fakeConversationRecord("2026-01-01T00:00:00.111000Z", "first", "Alpha"),
+      fakeConversationRecord("2026-01-01T00:00:00.111000Z", "second", "Beta"),
+      fakeConversationRecord("2026-01-03T00:00:00.333000Z", "third"),
+    ];
+    const recordCounts = Object.fromEntries(PORTABLE_RECORD_DOMAIN_ORDER.map((domain, index) => [domain, index])) as Partial<Record<PortableDomain, number>>;
+    const copySource = fakeCopySource({ recordCounts, conversationsRecords });
+    const runtime = fakeRuntime({
+      conversationsRows: [
+        { conversation_id: "1", session_id: "first", title: "Wrong", bootstrapped_at: null, created_at: "2026-01-01T00:00:00.111Z", updated_at: "2026-01-01T00:00:00.111Z" },
+        { conversation_id: "2", session_id: "second", title: "Wrong", bootstrapped_at: null, created_at: "2026-01-01T00:00:00.111Z", updated_at: "2026-01-01T00:00:00.111Z" },
+        { conversation_id: "3", session_id: "third", title: null, bootstrapped_at: null, created_at: "2026-01-03T00:00:00.333Z", updated_at: "2026-01-03T00:00:00.333Z" },
+      ],
+    });
+    const result = await verifyMigrationGeneration(
+      baseInput({ homeDir: "/tmp/lcm-verify-probe-title-swap" }),
+      dependenciesFor(copySource, runtime),
+    );
+    expect(result.outcome).toBe("mismatches");
+    expect(result.report.mismatches.some((mismatch) => mismatch.domain === "public-listing")).toBe(true);
   }, 15000);
 
   it("round-1 P1 red case: an empty source conversations listing against a non-empty destination records a sample mismatch instead of crashing", async () => {

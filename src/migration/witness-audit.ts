@@ -250,7 +250,7 @@ export const MIGRATION_WITNESS_AUDIT: readonly MigrationWitnessAuditEntry[] = Ob
   },
   {
     id: "public-listing-probe", bodyField: "publicProbeSha256",
-    description: "The destination's ordered-listing repository read, compared against the source's own canonical createdAt ordering captured during step 1.",
+    description: "The destination's ordered-listing repository read, compared against the source's own canonical (createdAt, title) ordering captured during step 1. title is folded in alongside createdAt (round-4 P2) because the destination-native conversationId that listConversations() orders ties by is a different identity space than the source's portable identitySha256 -- the same correlation problem the search probe has -- and comparing it directly would compare a value the other side can never produce. title is a plain scalar copied verbatim by the copy (no ledger correlation needed), so folding it in distinguishes two destination rows sharing a millisecond whenever their titles differ. It remains a probe, not a proof: two same-millisecond conversations sharing both a millisecond and a title are still indistinguishable by this check.",
     comparison: "compared-live",
     consequence: "records a sample-class mismatch on the public-listing pseudo-domain",
     mismatchClasses: ["sample"],

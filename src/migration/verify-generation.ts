@@ -327,7 +327,29 @@ function truncateToMillisecondIso(value: string): string {
 }
 
 /** One source "conversations" record's public-listing-relevant projection, in canonical order. */
-export type MigrationPublicListingSourceEntry = Readonly<{ createdAt: string; identitySha256: string }>;
+export type MigrationPublicListingSourceEntry = Readonly<{
+  createdAt: string;
+  identitySha256: string;
+  /**
+   * Round-4 P2: the destination's native listConversations() read has
+   * no field in common with the source's portable identitySha256 --
+   * they are different identity spaces, the same shape as the search
+   * probe's correlation problem, and adding the destination-native
+   * conversationId into this digest would compare a value one side can
+   * never produce, closing nothing. title, unlike conversationId, is a
+   * plain scalar copied verbatim by the copy (see
+   * portable-mapping.ts's fields("... title ...") with no transform,
+   * and portable-source.ts's canonicalJson(value.title) on the read
+   * side), so it exists unchanged on both the source's canonical record
+   * and the destination's row. Folding it into both sides distinguishes
+   * two destination rows sharing a millisecond whenever their titles
+   * differ, without any ledger correlation and without adding a query.
+   * It is still a probe, not a proof: two same-millisecond
+   * conversations that also share a title remain indistinguishable by
+   * this check alone.
+   */
+  title: string | null;
+}>;
 
 /**
  * One source "messages" record's search-probe candidate projection: its
@@ -399,10 +421,11 @@ async function runOrderedListingProbe(
 ): Promise<{ mismatch: MigrationVerificationMismatch | null; publicListingSha256: string }> {
   const repository = new PostgreSqlConversationRepository(executor, projectId);
   const rows = await repository.listConversations();
-  const actualOrder = rows.map((row) => truncateToMillisecondIso(row.createdAt.toISOString()));
+  const actualOrder = rows.map((row) =>
+    [truncateToMillisecondIso(row.createdAt.toISOString()), row.title] as const);
   const publicListingSha256 = sha256Hex(portableCanonicalJson(["lcm-migration-verification-public-listing-v1", actualOrder]));
-  const expectedCreatedAt = expectedOrder.map((entry) => entry.createdAt);
-  const expectedSha256 = sha256Hex(portableCanonicalJson(["lcm-migration-verification-public-listing-v1", expectedCreatedAt]));
+  const expectedEntries = expectedOrder.map((entry) => [entry.createdAt, entry.title] as const);
+  const expectedSha256 = sha256Hex(portableCanonicalJson(["lcm-migration-verification-public-listing-v1", expectedEntries]));
   if (expectedSha256 === publicListingSha256) return { mismatch: null, publicListingSha256 };
   // An empty expected (source) order can only reach here when the actual
   // (destination) order disagrees, since two empty arrays hash equal and
@@ -427,8 +450,9 @@ async function runOrderedListingProbe(
   // past the end of whichever side ran out first.
   let ordinal = 0;
   while (
-    ordinal < expectedCreatedAt.length && ordinal < actualOrder.length
-    && expectedCreatedAt[ordinal] === actualOrder[ordinal]
+    ordinal < expectedEntries.length && ordinal < actualOrder.length
+    && expectedEntries[ordinal]![0] === actualOrder[ordinal]![0]
+    && expectedEntries[ordinal]![1] === actualOrder[ordinal]![1]
   ) ordinal += 1;
   const sampledRecord = expectedOrder[Math.min(ordinal, expectedOrder.length - 1)]!;
   return {
@@ -1048,7 +1072,7 @@ export async function streamSourceCheckpoints(
   stream: PortableRecordStream, signal?: AbortSignal,
 ): Promise<StreamedSourceCheckpoints> {
   const checkpoints = new Map<PortableDomain, PortableCheckpoint>();
-  const conversationEntries: Array<{ createdAt: string; identitySha256: string }> = [];
+  const conversationEntries: Array<{ createdAt: string; identitySha256: string; title: string | null }> = [];
   const dependencyEdges = new Map<PortableDomain, Set<string>>();
   const searchProbeCandidates: MigrationSearchProbeSourceEntry[] = [];
   let messageOrdinal = 0;
@@ -1063,6 +1087,7 @@ export async function streamSourceCheckpoints(
           const value = record.value as PortableRecordValueByDomain["conversations"];
           conversationEntries.push({
             createdAt: truncateToMillisecondIso(value.createdAt), identitySha256: record.identitySha256,
+            title: value.title,
           });
         }
       }
