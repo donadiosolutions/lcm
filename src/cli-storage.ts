@@ -1,10 +1,12 @@
 import { inspectExistingLcmDatabasePath } from "./db/connection.js";
 import { realpathSync } from "node:fs";
-import { join } from "node:path";
+import { join, resolve } from "node:path";
 import { loadDaemonConfig } from "./daemon/config.js";
 import { ensureProjectDirForIdentity, projectIdentity, projectPathsForIdentity } from "./daemon/project.js";
 import {
+  UnauthenticatedProjectIdentityError,
   hashProjectPath,
+  isAuthenticatedProjectIdentity,
   normalizeProjectIdentityPath,
   readProjectMapSnapshot,
   resolveExistingProjectIdentity,
@@ -171,8 +173,23 @@ export async function listCliProjects(): Promise<Array<{ id: string; canonical: 
     const map = readProjectMapSnapshot(undefined, token);
     const selected = new Map<string, { id: string; canonical: string; aliases: readonly string[] }>();
     for (const [id, entry] of Object.entries(map)) {
-      const existing = resolveExistingProjectIdentity(entry.canonical, token);
+      let existing: ReturnType<typeof resolveExistingProjectIdentity>;
+      try {
+        existing = resolveExistingProjectIdentity(entry.canonical, token);
+      } catch (error) {
+        // An entry whose key no local evidence authenticates is refused by
+        // admission and reconciliation, so enumerating it would advertise a
+        // project that cannot be opened. Skip it and keep the inventory whole
+        // for every other project.
+        if (error instanceof UnauthenticatedProjectIdentityError) continue;
+        throw error;
+      }
       const local = existing ?? { id, ...entry };
+      // A successor-shaped identity resolves normally but is only openable
+      // while its retained predecessor fence authenticates it. Enumerating an
+      // unauthenticated one would advertise a project that admission and
+      // reconciliation refuse.
+      if (!isAuthenticatedProjectIdentity(local.id, resolve(local.canonical))) continue;
       if (local.id !== id && inspectExistingLcmDatabasePath(projectPathsForIdentity({id,canonical:entry.canonical}).dbPath) !== null) {
         throw new Error("Legacy worktree storage requires reconciliation before project enumeration.");
       }

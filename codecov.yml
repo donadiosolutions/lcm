@@ -21,6 +21,9 @@ component_management:
         - "bin/"
         - "src/cli/"
         - "^src/cli-help\\.ts$"
+        # #1356/#1357 keep CLI admission of an authenticated project-map
+        # identity, and the unauthenticated marker that project list and
+        # project show now print, in this existing owner.
         - "^src/cli-storage\\.ts$"
     - component_id: "unit-installation"
       name: "Unit - Installation"
@@ -242,6 +245,9 @@ component_management:
         # in local persistence; this change does not alter component ownership.
         # #1084/#1085/#1092 keep SQLite UTC timestamp parsing in this owner.
         # #1203 keeps selected SQLite recall evidence and its owned query tokenizer here.
+        # #1356/#1357 keep the events-sidecar probe here: it treats a map
+        # key no local evidence authenticates as no identity and falls
+        # back to the canonical path sidecar.
         - "src/db/"
         # Captured UTF-8 decoding and immutable-file authority remain local-persistence-owned.
         # #618 optional receipt schema admission stays local-persistence-owned.
@@ -275,6 +281,11 @@ component_management:
         # #1307 adds explicit-only retained append admission for non-append
         # mutation participants in this same storage-abstractions owner.
         - "^src/storage/backend\\.ts$"
+        # #1347 lets held publication admission skip the append tail wait
+        # while still taking the append file lock and phase check here, and
+        # chains an admitted frame behind its unresolved admitted predecessor
+        # so a timed-out intermediate frame cannot release later same-token
+        # frames early.
         - "^src/storage/backend-publication\\.ts$"
         # #910 keeps shared publication retry deadlines monotonic in this owner.
         - "^src/storage/publication-convergence\\.ts$"
@@ -385,6 +396,10 @@ component_management:
         # existing component; no taxonomy, status, or policy change.
         # #1270/#1283 keep exact project-fence classification and deterministic
         # local successor renewal in this existing project/worktree component.
+        # #1356/#1357 keep project-map key authentication in this owner:
+        # a key is admitted only as the canonical path hash, a fenced
+        # renewal successor, or a legacy hash its own metadata corroborates;
+        # alias refusal also suppresses metadata backfill until authentication.
         - "^src/project-map\\.ts$"
         - "^src/worktree-reconciliation-fence\\.ts$"
         # #1044 keeps the existing owner; no taxonomy, status, or policy change.
@@ -483,6 +498,8 @@ component_management:
     - component_id: "integration-postgresql-identity"
       name: "Integration - PostgreSQL Identity"
       paths:
+        # #1356/#1357 keep local project listing and show, which mark an
+        # identity storage will refuse rather than hiding it, in this owner.
         - "^src/identity-service\\.ts$"
         - "^src/storage/postgresql/identity-repository\\.ts$"
     - component_id: "integration-postgresql-memory"

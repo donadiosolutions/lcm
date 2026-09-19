@@ -321,7 +321,33 @@ reads and cleanup without contending with itself.
 That orphan cleanup also enters the local append order before it takes
 publication admission. If another local append has already started, the sweep
 waits for it to finish and then scans, so a queued append completes and its
-events stay durable instead of timing out behind the sweep. The sweep holds one
+events stay durable instead of timing out behind the sweep. A sweep whose
+caller already holds publication admission can bypass a queued tokenless
+append, because that append cannot acquire publication until the caller
+releases it, so waiting would only burn the sweep deadline. This exception
+does not bypass another frame using the same live publication token while
+that frame is still queued in tail admission: those queued frames remain
+ordered, and the later frame waits for the earlier admitted frame before it
+attempts the fail-fast local append lock. An intermediate same-token frame
+that times out or is cancelled while waiting does not release the frames
+behind it: the unresolved earlier admitted frame is carried forward, so a
+later frame still waits for it. A same-token call made after the
+earlier frame's append callback has already started does not wait: it takes
+the reentrant fast path and runs nested under the earlier frame's held
+append lock, so the two callbacks can overlap. Serializing that post-entry
+case would deadlock, since the earlier callback cannot finish while blocked
+on the nested call. The sweep still
+takes that lock and runs the append-admission phase check. Tokenless appends
+that arrive later remain queued behind the complete append tail. Be precise
+about what that phase check is: it is not the
+consumer gate, because a live caller token short-circuits the consumer lock,
+and the phase check itself permits maintenance-held as the narrow append
+capability. The exception path therefore does not refuse on its own account.
+Maintenance is still protected, but by admission exclusion rather than by this
+path: entering maintenance takes the same publication flock the caller holds,
+so a live consumer token cannot be minted while maintenance holds publication.
+The refusal described below is the one that applies to a sweep owning no
+caller admission. The sweep holds one
 retained admission from the diagnostic snapshot through the real close, the
 final eligibility check, and deletion. That admission grants no implicit append
 authority: an append started underneath the scan, such as one triggered during

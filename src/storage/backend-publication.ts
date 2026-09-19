@@ -387,12 +387,33 @@ const activePublicationLockTokens = new WeakMap<BackendPublicationLockToken, {
   readonly rootPath: string;
   active: boolean;
 }>();
+/**
+ * Whether this token is a live publication-lock authority for this root.
+ * Holding it means the caller owns the publication flock that any queued
+ * tokenless append must acquire before it can release the append tail.
+ */
+function holdsActivePublicationLock(
+  token: BackendPublicationLockToken,
+  homeDir: string | undefined,
+): boolean {
+  const state = activePublicationLockTokens.get(token);
+  return state !== undefined && state.active && state.rootPath === rootPath(homeDir);
+}
+
 const activeAppendBarrierTokens = new WeakSet<BackendPublicationLockToken>();
 const activeAppendBarrierContext = new AsyncLocalStorage<Readonly<{
   rootPath: string;
   token: BackendPublicationLockToken;
 }> | null>();
-const appendBarrierTails = new Map<string, Promise<void>>();
+type AppendBarrierTail = Readonly<{
+  /** Full FIFO tail used by entrants without publication admission. */
+  tail: Promise<void>;
+  /** Captured when this frame installs itself, before append-lock acquisition. */
+  holdsPublicationAdmission: boolean;
+  /** Latest admitted frame in this tail, excluding intervening tokenless frames. */
+  latestAdmittedFrame: Promise<void> | undefined;
+}>;
+const appendBarrierTails = new Map<string, AppendBarrierTail>();
 
 export class BackendPublicationAppendBarrierTimeoutError
   extends PrivateMutationLockContentionError {
@@ -1657,8 +1678,7 @@ function assertLockToken(
   token: BackendPublicationLockToken,
   homeDir: string | undefined,
 ): void {
-  const state = activePublicationLockTokens.get(token);
-  if (state === undefined || !state.active || state.rootPath !== rootPath(homeDir)) {
+  if (!holdsActivePublicationLock(token, homeDir)) {
     return fail("permit-mismatch", "backend publication lock token is not active");
   }
 }
@@ -2105,21 +2125,43 @@ export async function withBackendPublicationAppendBarrierAsync<T>(
   }
   const timing = appendBarrierTiming(options);
   const deadline = timing.now() + timing.contentionWaitMs;
-  const previous = appendBarrierTails.get(key) ?? Promise.resolve();
+  const holdsPublicationAdmission = contextualToken !== undefined
+    && holdsActivePublicationLock(contextualToken, homeDir);
+  const predecessor = appendBarrierTails.get(key);
+  const previous = predecessor?.tail ?? Promise.resolve();
+  const previousAdmittedFrame = predecessor?.latestAdmittedFrame;
   let release!: () => void;
   const current = new Promise<void>((resolve): void => { release = resolve; });
   const tail = previous.then(() => current);
-  appendBarrierTails.set(key, tail);
+  const entry: AppendBarrierTail = {
+    tail,
+    holdsPublicationAdmission,
+    // Chain an admitted frame behind its unresolved admitted predecessor so
+    // an intermediate frame that times out or aborts before admission cannot
+    // settle the chain early: its own frame resolves in `finally`, but the
+    // published frame stays pending until the predecessor settles.
+    latestAdmittedFrame: holdsPublicationAdmission
+      ? (previousAdmittedFrame?.then(() => current) ?? current)
+      : previousAdmittedFrame,
+  };
+  appendBarrierTails.set(key, entry);
   void tail.then(() => {
-    if (appendBarrierTails.get(key) === tail) appendBarrierTails.delete(key);
+    if (appendBarrierTails.get(key) === entry) appendBarrierTails.delete(key);
   });
   try {
-    let previousSettled = false;
-    void previous.then(() => { previousSettled = true; });
+    const predecessorToWait = holdsPublicationAdmission
+      ? predecessor?.latestAdmittedFrame
+      : previous;
+    let previousSettled = predecessorToWait === undefined;
+    void predecessorToWait?.then(() => { previousSettled = true; });
     await Promise.resolve();
-    if (!previousSettled) {
+    // A live publication holder may bypass tokenless frames because they
+    // cannot acquire the publication flock it owns. The tail entry captures
+    // the latest admitted frame at installation time, so same-token siblings
+    // still wait for one another even when tokenless frames lie between them.
+    if (!previousSettled && predecessorToWait !== undefined) {
       if (!timing.bounded) {
-        await previous;
+        await predecessorToWait;
       } else {
         const remaining = deadline - timing.now();
         const queued = new PrivateMutationLockContentionError(
@@ -2127,7 +2169,7 @@ export async function withBackendPublicationAppendBarrierAsync<T>(
         );
         const predecessor = remaining <= 0
           ? "deadline"
-          : await waitForAppendPredecessor(previous, timing, deadline);
+          : await waitForAppendPredecessor(predecessorToWait, timing, deadline);
         if (predecessor !== "settled") {
           throw new BackendPublicationAppendBarrierTimeoutError(queued);
         }
@@ -2205,22 +2247,42 @@ export async function withBackendPublicationRetainedAppendAdmissionAsync<T>(
     }
   }
 
+  const holdsPublicationAdmission = lockToken !== undefined
+    && holdsActivePublicationLock(lockToken, homeDir);
   const key = rootPath(homeDir);
-  const previous = appendBarrierTails.get(key) ?? Promise.resolve();
+  const predecessor = appendBarrierTails.get(key);
+  const previous = predecessor?.tail ?? Promise.resolve();
+  const previousAdmittedFrame = predecessor?.latestAdmittedFrame;
   let release!: () => void;
   const current = new Promise<void>((resolve): void => { release = resolve; });
   const tail = previous.then(() => current);
-  appendBarrierTails.set(key, tail);
+  const entry: AppendBarrierTail = {
+    tail,
+    holdsPublicationAdmission,
+    // Chain an admitted frame behind its unresolved admitted predecessor so
+    // an intermediate frame that times out or aborts before admission cannot
+    // settle the chain early: its own frame resolves in `finally`, but the
+    // published frame stays pending until the predecessor settles.
+    latestAdmittedFrame: holdsPublicationAdmission
+      ? (previousAdmittedFrame?.then(() => current) ?? current)
+      : previousAdmittedFrame,
+  };
+  appendBarrierTails.set(key, entry);
   void tail.then(() => {
-    if (appendBarrierTails.get(key) === tail) appendBarrierTails.delete(key);
+    if (appendBarrierTails.get(key) === entry) appendBarrierTails.delete(key);
   });
   try {
-    let previousSettled = false;
-    void previous.then(() => { previousSettled = true; });
+    const predecessorToWait = holdsPublicationAdmission
+      ? predecessor?.latestAdmittedFrame
+      : previous;
+    let previousSettled = predecessorToWait === undefined;
+    void predecessorToWait?.then(() => { previousSettled = true; });
     await Promise.resolve();
-    if (!previousSettled) {
+    // Preserve same-token order while bypassing only tokenless frames that
+    // cannot acquire the publication flock held by this caller.
+    if (!previousSettled && predecessorToWait !== undefined) {
       const predecessor = await waitForAppendPredecessor(
-        previous,
+        predecessorToWait,
         timing,
         deadline,
         options.signal,
@@ -3640,6 +3702,7 @@ export class BackendPublicationCoordinator {
 
   async prepareMaintenanceSelection(
     input: PrepareBackendMaintenanceSelectionInput,
+    lockToken?: BackendPublicationLockToken,
   ): Promise<BackendMaintenanceJournal> {
     return this.#locked(async (directoryHandle) => {
       const journal = readMaintenanceJournalFromDirectory(this.#homeDir, directoryHandle);
@@ -3669,11 +3732,12 @@ export class BackendPublicationCoordinator {
       });
       writeMaintenanceJournal(this.#homeDir, directoryHandle, prepared, journal.checksumSha256);
       return prepared;
-    });
+    }, lockToken);
   }
 
   async completeMaintenanceSelection(
     input: CompleteBackendMaintenanceSelectionInput,
+    lockToken?: BackendPublicationLockToken,
   ): Promise<BackendMaintenanceJournal> {
     return this.#locked(async (directoryHandle) => {
       const journal = readMaintenanceJournalFromDirectory(this.#homeDir, directoryHandle);
@@ -3701,10 +3765,13 @@ export class BackendPublicationCoordinator {
       });
       writeMaintenanceJournal(this.#homeDir, directoryHandle, completed, journal.checksumSha256);
       return completed;
-    });
+    }, lockToken);
   }
 
-  async abortMaintenance(input: AbortBackendMaintenanceInput): Promise<BackendMaintenanceJournal> {
+  async abortMaintenance(
+    input: AbortBackendMaintenanceInput,
+    lockToken?: BackendPublicationLockToken,
+  ): Promise<BackendMaintenanceJournal> {
     return this.#locked(async (directoryHandle) => {
       const journal = readMaintenanceJournalFromDirectory(this.#homeDir, directoryHandle);
       if (journal === null) return fail("publication-evidence-missing", "backend maintenance journal is missing");
@@ -3730,10 +3797,13 @@ export class BackendPublicationCoordinator {
       });
       writeMaintenanceJournal(this.#homeDir, directoryHandle, aborted, journal.checksumSha256);
       return aborted;
-    });
+    }, lockToken);
   }
 
-  async prepare(input: PrepareBackendPublicationInput): Promise<BackendPublicationJournal> {
+  async prepare(
+    input: PrepareBackendPublicationInput,
+    lockToken?: BackendPublicationLockToken,
+  ): Promise<BackendPublicationJournal> {
     return this.#locked(async (directoryHandle) => {
       const validated = validateInput(input);
       const existing = readParsedJournalFromDirectory(
@@ -3790,24 +3860,27 @@ export class BackendPublicationCoordinator {
       );
       this.#observer("after-prepared", backendPublicationJournalPath(this.#homeDir));
       return prepared;
-    });
+    }, lockToken);
   }
 
-  async resume(): Promise<BackendPublicationJournal> {
-    return this.#locked(async (directoryHandle) => this.#resumeUnlocked(directoryHandle));
+  async resume(lockToken?: BackendPublicationLockToken): Promise<BackendPublicationJournal> {
+    return this.#locked(async (directoryHandle) => this.#resumeUnlocked(directoryHandle), lockToken);
   }
 
-  async abort(): Promise<BackendPublicationJournal> {
-    return this.#locked(async (directoryHandle) => this.#abortUnlocked(directoryHandle));
+  async abort(lockToken?: BackendPublicationLockToken): Promise<BackendPublicationJournal> {
+    return this.#locked(async (directoryHandle) => this.#abortUnlocked(directoryHandle), lockToken);
   }
 
-  async recoverPending(options: RecoverPendingOptions = {}): Promise<BackendPublicationJournal | null> {
+  async recoverPending(
+    options: RecoverPendingOptions = {},
+    lockToken?: BackendPublicationLockToken,
+  ): Promise<BackendPublicationJournal | null> {
     return this.#locked(async (directoryHandle) => {
       const journal = readJournalFromDirectory(this.#homeDir, directoryHandle);
       if (journal === null) return null;
       if (options.disposition === "abort") return this.#abortUnlocked(directoryHandle);
       return this.#resumeUnlocked(directoryHandle);
-    });
+    }, lockToken);
   }
 
   async #locked<T>(

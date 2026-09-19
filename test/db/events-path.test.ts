@@ -91,6 +91,20 @@ describe("backend-independent local project identity", () => {
     }
   });
 
+  it("propagates an ambiguous project map instead of silently probing a fallback sidecar", () => {
+    // Only an unauthenticated map key is downgraded to "no identity"; every
+    // other resolution failure must still reach the caller.
+    mkdirSync(join(home, ".lcm", "events"), { recursive: true, mode: 0o700 });
+    const canonical = normalizeProjectIdentityPath(project);
+    writeFileSync(projectMapPath(), JSON.stringify({
+      [hashProjectPath(canonical)]: { canonical, aliases: [] },
+      ["c".repeat(64)]: { canonical: join(project, ".."), aliases: [canonical] },
+    }), { mode: 0o600 });
+    chmodSync(projectMapPath(), 0o600);
+
+    expect(() => existingEventsDbPath(project)).toThrow("project path maps to multiple hashes");
+  });
+
   it("keeps the existing-only probe read-only while recovering an orphaned sidecar", () => {
     const unavailable = join(project, "gone");
     expect(existingEventsDbPath(unavailable)).toBeUndefined();
@@ -104,12 +118,16 @@ describe("backend-independent local project identity", () => {
     writeFileSync(existingSidecar, "");
     expect(existingEventsDbPath(project)).toBe(existingSidecar);
 
+    // A map key no local evidence binds to this path cannot name the sidecar:
+    // the probe ignores it and keeps using the identity the canonical path
+    // derives, so a hand-edited map cannot redirect recovery at an arbitrary
+    // events database.
     const mappedId = "b".repeat(64);
     writeFileSync(projectMapPath(), JSON.stringify({
       [mappedId]: { canonical: project, aliases: [] },
     }), { mode: 0o600 });
     chmodSync(projectMapPath(), 0o600);
-    expect(existingEventsDbPath(project)).toBe(join(sidecarDir, `${mappedId}.db`));
+    expect(existingEventsDbPath(project)).toBe(existingSidecar);
     rmSync(projectMapPath(), { force: true });
 
     const sidecar = join(sidecarDir, `${hashProjectPath(normalizeProjectPath(unavailable))}.db`);
