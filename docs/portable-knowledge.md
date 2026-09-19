@@ -103,12 +103,21 @@ just before this run observed it may still be reported as imported by this
 run; that costs no metadata and no retry identity.
 
 This protects a memory once two imports have matched it as the same memory.
-It does not stop two imports that each find no existing match for the same
-new content from both inserting it: nothing currently serializes that
-decision against a concurrent insert, so two imports of matching new content
-run at the same time can still create two separate active memories with
-identical content. A later replay of either source document recognizes its
-own retry identity and is skipped, but the two memories are not merged.
+Two imports that each find no existing match for the same new content are
+also protected on PostgreSQL. The first import to reach that decision holds
+it for the rest of its transaction, so a second import running at the same
+time waits and then reads the committed memory instead of inserting a second
+copy of identical content. The second import merges into that memory exactly
+as it would have if it had matched it in the first place.
+
+This serialization is a PostgreSQL behavior. The SQLite backend runs its root
+transactions on a single connection, which already orders one import's
+decision after another's.
+
+Because an import holds this protection for its whole run, two imports into
+the same project take turns rather than running side by side, whatever
+content they carry. The second waits for the first to finish and then
+proceeds. Imports into different projects are unaffected.
 
 Successful commands exit zero. Operational failures, including failed projects
 in `export --all`, exit one. JSON output contains the requested payload; progress
