@@ -64,6 +64,13 @@ const preflights = new WeakMap<PortablePreflight, {state:DestinationState; index
 const completions = new WeakMap<PortableDestinationVerification,{state:DestinationState;manifest:PortableManifest;checkpoints:readonly string[]}>();
 const INITIAL = sha256('lcm-portable-initial-v1');
 export const IDENTITY_DOMAINS = ['machines','project','project-aliases'] as const;
+/**
+ * Digest recorded by migration 0008 for transfer_identities rows written
+ * before the column existed. Those rows predate the write-time capture, so no
+ * real content fingerprint can be reconstructed for them; completion treats
+ * the sentinel as an unverifiable row and fails closed.
+ */
+export const UNKNOWN_TRANSFER_CONTENT_SHA256 = sha256('lcm-transfer-identity-content-unknown-v1');
 const UUID7 = /^[0-9a-f]{8}-[0-9a-f]{4}-7[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/u;
 
 function fail(code: ConstructorParameters<typeof PortableTransferError>[0]): never {
@@ -478,6 +485,11 @@ async function verifiedCompletionState(executor:PostgreSqlQueryExecutor,authorit
       const chunk=entries.slice(offset,offset+PORTABLE_LIMITS.maxBatchRecords);
       const current=await readCanonicalContentRows(executor,state.input.expectedIdentity.id,domain,chunk.map(entry=>entry.locator),signal);
       for(const entry of chunk){
+        // Migration 0008 backfills rows written before the write-time capture
+        // existed with UNKNOWN_TRANSFER_CONTENT_SHA256. Those rows can never
+        // be re-derived, so refuse the completion instead of comparing a
+        // sentinel against live content.
+        if(entry.expected===UNKNOWN_TRANSFER_CONTENT_SHA256)fail('verification-failed');
         const row=current.get(entry.locator);
         if(!row||canonicalRowContentSha256(row)!==entry.expected)fail('verification-failed');
       }

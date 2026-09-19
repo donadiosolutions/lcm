@@ -23,6 +23,7 @@ import type {
   PostgreSqlQueryOptions,
 } from "../../src/storage/postgresql/contracts.js";
 import { PostgreSqlPromotedMemoryRepository } from "../../src/storage/postgresql/memory-repositories.js";
+import { UNKNOWN_TRANSFER_CONTENT_SHA256 } from "../../src/storage/postgresql/portable-destination.js";
 import {
   POSTGRESQL_RUNTIME_PRIVILEGE_MANIFEST,
   verifyPostgreSqlRuntimeSchema,
@@ -4524,6 +4525,71 @@ describe("PostgreSQL migrations and database isolation", () => {
       await expect(retry).resolves.toBeUndefined();
     } finally {
       await admin.close();
+      await database.drop();
+    }
+  });
+});
+
+describe("PostgreSQL transfer identity content digest upgrade", () => {
+  it("applies 0008 to an installation whose transfer ledger already retains rows", async () => {
+    const database = await createPostgreSqlTestDatabase(
+      "transfer-digest-upgrade",
+      { runMigrations: false },
+    );
+    try {
+      const migrations = loadPostgreSqlMigrations();
+      const snapshots = loadPostgreSqlSchemaSnapshots();
+      const priorMigrations = migrations.slice(0, migrations.length - 1);
+      await runPostgreSqlMigrations(database.migrator, {
+        migrations: priorMigrations,
+        schemaSnapshots: snapshots.slice(0, snapshots.length - 1),
+      });
+      const options = {
+        domain: "factory",
+        operation: "seedRetainedTransferLedger",
+      } as const;
+      const project = await database.migrator.query<{ project_id: string }>({
+        text: `INSERT INTO lcm.projects (identity_key, display_name)
+               VALUES (pg_catalog.repeat('d', 64), 'Retained ledger')
+               RETURNING project_id`,
+      }, options);
+      const projectId = project.rows[0]!.project_id;
+      const digest = "a".repeat(64);
+      await database.migrator.query({
+        text: `INSERT INTO lcm.transfer_runs
+                 (run_id, target_generation, project_id, manifest_bytes,
+                  manifest_sha256, schema_sha256, project_sha256, source_sha256,
+                  source_witness_sha256, state)
+               VALUES ('retained-run', 'retained-generation', $1, $2,
+                       $3, $3, $3, $3, $3, 'completed')`,
+        values: [projectId, Buffer.from('{"protocol":"manifest"}'), digest],
+      }, options);
+      await database.migrator.query({
+        text: `INSERT INTO lcm.transfer_identities
+                 (run_id, domain, identity_sha256, ordinal, native_key,
+                  record_sha256)
+               VALUES ('retained-run', 'conversations', $1, 0, '["1"]', $1)`,
+        values: [digest],
+      }, options);
+      await expect(runPostgreSqlMigrations(database.migrator, {
+        migrations,
+        schemaSnapshots: snapshots,
+      })).resolves.toEqual({
+        applied: [migrations.at(-1)!.id],
+        current: migrations.map(({ id }) => id),
+      });
+      const backfilled = await database.migrator.query<{
+        content_sha256: string;
+      }>({
+        text: `SELECT content_sha256 FROM lcm.transfer_identities
+               WHERE run_id = 'retained-run'`,
+      }, options);
+      expect(backfilled.rows).toEqual([{
+        content_sha256: UNKNOWN_TRANSFER_CONTENT_SHA256,
+      }]);
+      expect(UNKNOWN_TRANSFER_CONTENT_SHA256).toBe(createHash("sha256")
+        .update("lcm-transfer-identity-content-unknown-v1").digest("hex"));
+    } finally {
       await database.drop();
     }
   });

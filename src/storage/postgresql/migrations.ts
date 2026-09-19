@@ -53,7 +53,7 @@ const MIGRATION_MANIFEST = [
   {
     id: "0008_transfer_identity_content_digest",
     filename: "0008_transfer_identity_content_digest.sql",
-    sha256: "16687f1b978ffe9dda2cac6385aa969a93bdecdca1f458fe73e4816cef237426",
+    sha256: "e9510bb6099da4c17d162a96e122466ea0cd77f789b608e72fa1f55da40b70ed",
   },
 ] as const;
 

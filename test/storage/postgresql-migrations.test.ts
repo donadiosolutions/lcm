@@ -485,7 +485,7 @@ describe("PostgreSQL migration runner", () => {
       expect.objectContaining({ id: "0005_summary_context_integrity", sha256: "e16cb52a34bd06c0226e2dcff0273982eea975c394b1d7fa2cf6c8bcab1c2b3f" }),
       expect.objectContaining({ id: "0006_transfer_ledger", sha256: "81fed3ac0a6059b6e2a536647a5ab5d8673322b7ba5804a60b068b927367983a" }),
       expect.objectContaining({ id: "0007_promoted_content_digest", sha256: "13d5c5ced7aacb2ac8f474ba63d576541d24d9907f69015c6cefa053b7cf0dd7" }),
-      expect.objectContaining({ id: "0008_transfer_identity_content_digest", sha256: "16687f1b978ffe9dda2cac6385aa969a93bdecdca1f458fe73e4816cef237426" }),
+      expect.objectContaining({ id: "0008_transfer_identity_content_digest", sha256: "e9510bb6099da4c17d162a96e122466ea0cd77f789b608e72fa1f55da40b70ed" }),
     ]);
     expect(migrations[1]?.sql).toContain(
       "fencing_token bigint GENERATED ALWAYS AS IDENTITY CHECK (fencing_token > 0)",

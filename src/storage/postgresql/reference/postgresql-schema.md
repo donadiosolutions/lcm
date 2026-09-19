@@ -970,6 +970,19 @@ pinned for safe incremental upgrades.
 Migration `0008_transfer_identity_content_digest.sql` adds an ordinary,
 required `content_sha256` `text` column to `lcm.transfer_identities`,
 checked against the same lowercase-hex-SHA-256 pattern as `record_sha256`.
+The ledger retains its rows — 0006 restricts deletion and the transfer role
+holds only `SELECT` and `INSERT` on it — so an installation that has already
+copied once still holds identity rows when this migration runs. Adding the
+column as `NOT NULL` in a single statement aborts with SQLSTATE `23502` on
+those rows and leaves the installation unable to apply the migration at all.
+The migration therefore adds the column nullable, backfills existing rows
+with the explicit unknown-content sentinel
+`sha256('lcm-transfer-identity-content-unknown-v1')`, and only then applies
+`SET NOT NULL`. That sentinel cannot equal the fingerprint of any real row
+projection, and `verifiedCompletionState` recognises it and refuses to
+complete a run that still carries one, so the upgrade admits pre-existing
+rows without letting an unverifiable row pass and without weakening the
+requirement for every row written afterwards.
 `applyPortableBatchInTransaction` populates it inside the same fenced
 transaction that writes the identity row: for every domain outside
 `IDENTITY_DOMAINS` (machines, project, project-aliases), it reads the row
