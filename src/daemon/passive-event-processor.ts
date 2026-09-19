@@ -9,6 +9,7 @@ import type { StorageBackendFactory } from "../storage/index.js";
 import type { PassiveEventReplicationResult } from "./passive-event-replication.js";
 import {
   BackendPublicationJournalError,
+  withBackendPublicationAppendBarrierAsync,
   type BackendPublicationLockToken,
 } from "../storage/backend-publication.js";
 
@@ -69,6 +70,11 @@ export interface PassiveEventProcessorDeps {
   promoteEventsForCwd?: typeof promoteEventsForCwd;
   storageFactory?: StorageBackendFactory;
   withPublicationAdmission: BackgroundPublicationAdmission;
+  /**
+   * Publication home whose consumer lock admission holds. Replication needs
+   * it to keep the local outbox usable inside its own admission window.
+   */
+  publicationHome?: string;
   collectEventSidecars?: typeof collectEventSidecars;
   replicatePassiveEvents?: PassiveEventReplicationPassRunner;
   setTimeout?: typeof setTimeout;
@@ -97,6 +103,7 @@ type PromoteOneBatch = (
 export class PassiveEventProcessor {
   private readonly promoteOneBatch: PromoteOneBatch;
   private readonly withPublicationAdmission: BackgroundPublicationAdmission;
+  private readonly publicationHome?: string;
   private readonly scanSidecars: typeof collectEventSidecars;
   private readonly replicatePassiveEvents?: PassiveEventReplicationPassRunner;
   private readonly setTimer: typeof setTimeout;
@@ -139,6 +146,7 @@ export class PassiveEventProcessor {
     this.promoteOneBatch = (config, cwd, sidecarPath, publicationLockToken, context) =>
       promoteOneBatch(config, cwd, sidecarPath, deps.storageFactory, publicationLockToken, context);
     this.withPublicationAdmission = deps.withPublicationAdmission;
+    this.publicationHome = deps.publicationHome;
     this.scanSidecars = deps.collectEventSidecars ?? collectEventSidecars;
     // A daemon whose selected backend cannot replicate must not report
     // replication as enabled, and must not record five-minute passes it never
@@ -276,11 +284,22 @@ export class PassiveEventProcessor {
    * a row to the acknowledged-and-remote-pruned state that local retention
    * requires. Projects without a PostgreSQL binding skip quietly.
    *
-   * Each project is admitted before it replicates. Replication resolves its
-   * backend from this daemon's frozen startup configuration, and the promotion
-   * loop above skips any sidecar with no unprocessed events, so without this
-   * admission a settled daemon would keep uploading to a backend that
-   * publication has already moved away from (#1384).
+   * Each project replicates inside its admission rather than after it.
+   * Replication resolves its backend from this daemon's frozen startup
+   * configuration, and the promotion loop above skips any sidecar with no
+   * unprocessed events, so without this admission a settled daemon would keep
+   * uploading to a backend that publication has already moved away from
+   * (#1384). A check that returns before the upload starts does not give that
+   * guarantee: publication can take the consumer lock in the gap and the pass
+   * still writes to the backend the daemon has just lost.
+   *
+   * Admission holds the publication consumer lock, and every local outbox
+   * operation takes that same lock synchronously for the same home, so
+   * replicating directly inside the admission callback makes the outbox fail
+   * with "backend publication mutation is already in progress". The append
+   * barrier around the admitted token is the seam that makes the nested
+   * acquisition inherit the token instead of contending for it, exactly as
+   * the SessionStart hook already does around its own outbox work.
    */
   private async replicateSidecars(
     sidecars: readonly Awaited<ReturnType<typeof collectEventSidecars>>[number][],
@@ -291,17 +310,22 @@ export class PassiveEventProcessor {
     this.replication.lastPassAt = new Date().toISOString();
     for (const sidecar of sidecars) {
       if (this.stopped || this.haltedReason !== null) return;
-      if (sidecar.scanError || sidecar.scanSkipped || !sidecar.cwd) continue;
+      const cwd = sidecar.cwd;
+      if (sidecar.scanError || sidecar.scanSkipped || !cwd) continue;
       let result: PassiveEventReplicationResult | null;
       try {
-        await this.withPublicationAdmission(() => undefined);
-        result = await replicate(sidecar.cwd, this.backgroundSignal);
+        result = await this.withPublicationAdmission(token =>
+          withBackendPublicationAppendBarrierAsync(
+            this.publicationHome,
+            () => replicate(cwd, this.backgroundSignal),
+            token,
+          ));
       } catch (error) {
         if (isFrozenBackendMismatch(error)) {
           await this.haltForBackendMismatch(error);
           return;
         }
-        await this.logError("passive-event-processor", error, { cwd: sidecar.cwd });
+        await this.logError("passive-event-processor", error, { cwd });
         continue;
       }
       if (result === null) continue;
