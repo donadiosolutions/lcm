@@ -1,4 +1,3 @@
-import { createHash } from "node:crypto";
 import type { QueryConfig, QueryResult, QueryResultRow } from "pg";
 import { describe, expect, it, vi } from "vitest";
 import type { PostgreSqlQueryOptions } from "../../src/storage/postgresql/contracts.js";
