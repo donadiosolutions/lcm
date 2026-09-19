@@ -7,6 +7,7 @@ import type { DaemonConfig } from "../config.js";
 import { sanitizeError } from "../safe-error.js";
 import { ScrubEngine } from "../../scrub.js";
 import { validateCwd } from "../validate-cwd.js";
+import { deduplicateAndInsert } from "../../promotion/dedup.js";
 import {
   type StorageBackendFactory,
 } from "../../storage/index.js";
@@ -115,13 +116,27 @@ export function createStoreHandler(
           mode: "create",
           expectedIdentity: storageIdentity,
         },
-        async (project) => project.promotedMemory.insert({
+        // Make the same deduplication decision as import and promote. Content
+        // that already exists as an active memory in scope merges into it and
+        // returns that memory's id, with confidence raised to the maximum and
+        // tags unioned; only new content inserts. On PostgreSQL the helper also
+        // takes the project-scoped decision lock, so a manual store serializes
+        // with a concurrent import or promote into the same project instead of
+        // committing a second copy neither writer could see.
+        async (project) => deduplicateAndInsert({
+          transaction: project.transaction.bind(project),
           content: scrubbedText,
           tags: scrubbedTags,
           sourceProjectId: metadata.projectId ?? "manual",
+          candidateScope: "owner",
+          backend: project.backend,
           sessionId: metadata.sessionId ?? "manual",
           depth: metadata.depth ?? 0,
           confidence: 1.0,
+          thresholds: {
+            dedupBm25Threshold: config.compaction.promotionThresholds.dedupBm25Threshold,
+            dedupCandidateLimit: config.compaction.promotionThresholds.dedupCandidateLimit,
+          },
         }),
       );
 

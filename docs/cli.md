@@ -95,6 +95,19 @@ In `lcm store`, `--tag` and `--tags` are repeatable single-tag aliases. This is
 different from `lcm export --tags`, which remains a comma-separated filter,
 for example `lcm export --tags decision,architecture`.
 
+`lcm store` makes the same deduplication decision as `lcm promote` and
+knowledge import. When the content already exists as an active memory in
+scope, the command merges into that memory instead of adding a second one:
+the printed `id` is the existing memory's id, its tags are unioned with the
+new ones, and its confidence stays at the maximum of the two. Repeating the
+same `lcm store` therefore yields one memory. Content that does not match
+returns a fresh id. On PostgreSQL the scope is every active memory of the
+bound project, and the store takes the project's deduplication lock for the
+duration of its write, so it takes turns with a concurrent `lcm promote` or
+knowledge import into that same project. On SQLite the decision is scoped to
+memories with the same recorded origin, which for `lcm store` is `manual`
+unless the request supplies `metadata.projectId`.
+
 When SQLite is selected, the stored text must not contain an embedded NUL
 character (`U+0000`). The store operation rejects that input before writing;
 JSON-escaped NUL characters in tags remain supported. A selected legacy

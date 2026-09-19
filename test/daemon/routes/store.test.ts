@@ -64,6 +64,57 @@ describe("POST /store", () => {
     }
   });
 
+  // #1371: two identical stores yield one memory. The second returns the
+  // existing id with tags unioned and confidence kept at the maximum.
+  it("merges an identical store into the existing memory instead of adding a second", async () => {
+    const tempDir = mkdtempSync(join(tmpdir(), "lcm-store-dedup-"));
+    tempDirs.push(tempDir);
+    const config = loadDaemonConfig("/nonexistent");
+    config.daemon.port = 0;
+    const daemon = await createDaemon(config);
+    const port = daemon.address().port;
+
+    const store = async (tags: string[]) => {
+      const res = await fetch(`http://127.0.0.1:${port}/store`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ text: "We agreed to keep the ledger append-only", tags, cwd: tempDir }),
+      });
+      expect(res.status).toBe(200);
+      return await res.json() as { stored: boolean; id: string };
+    };
+
+    try {
+      const first = await store(["decision"]);
+      const second = await store(["ledger"]);
+      const fresh = await fetch(`http://127.0.0.1:${port}/store`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ text: "An unrelated note about cache warmup", cwd: tempDir }),
+      });
+      const freshBody = await fresh.json() as { stored: boolean; id: string };
+
+      expect(second).toEqual({ stored: true, id: first.id });
+      expect(freshBody.stored).toBe(true);
+      expect(freshBody.id).not.toBe(first.id);
+
+      const db = new DatabaseSync(projectDbPath(tempDir));
+      db.exec("PRAGMA busy_timeout = 5000");
+      try {
+        const rows = db.prepare(
+          "SELECT id, tags, confidence FROM promoted WHERE archived_at IS NULL ORDER BY created_at",
+        ).all() as Array<{ id: string; tags: string; confidence: number }>;
+        expect(rows.map((row) => row.id)).toEqual([first.id, freshBody.id]);
+        expect(JSON.parse(rows[0].tags)).toEqual(["decision", "ledger"]);
+        expect(rows[0].confidence).toBe(1);
+      } finally {
+        db.close();
+      }
+    } finally {
+      await daemon.stop();
+    }
+  });
+
   it("returns 400 when cwd is missing", async () => {
     const config = loadDaemonConfig("/nonexistent");
     config.daemon.port = 0;

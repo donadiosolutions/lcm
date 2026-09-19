@@ -122,10 +122,20 @@ This serialization is a PostgreSQL behavior. The SQLite backend runs its root
 transactions on a single connection, which already orders one import's
 decision after another's.
 
-Because an import holds this protection for its whole run, two imports into
-the same project take turns rather than running side by side, whatever
-content they carry. The second waits for the first to finish and then
-proceeds. Imports into different projects are unaffected.
+Knowledge import, compaction-driven promotion (`lcm promote`), and manual
+`lcm store` share one project-scoped decision serializer on PostgreSQL. Each
+writer takes it before reading candidates and holds it until its transaction
+commits, so a manual store of content C cannot slip between another writer's
+empty candidate read and its insert: whichever writer reaches the decision
+first commits, and the other then reads that committed memory and merges into
+it. Because an import holds this protection for its whole run, two imports
+into the same project take turns rather than running side by side, whatever
+content they carry, and a promote or store into that project waits for a
+running import in the same way. The second waits for the first to finish and
+then proceeds. Writers into different projects are unaffected.
+
+A manual store that matches an existing active memory returns that memory's
+id, with tags unioned and confidence kept at the maximum, instead of a new id.
 
 Successful commands exit zero. Operational failures, including failed projects
 in `export --all`, exit one. JSON output contains the requested payload; progress
