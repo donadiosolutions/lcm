@@ -162,6 +162,15 @@ client for each read:
 | `lcm describe <nodeId>` | Read summary or stored-memory metadata |
 | `lcm expand <nodeId>` | Traverse a summary's DAG links and list its child summaries as short snippets |
 
+For `lcm grep --mode regex`, snippet handling depends on the selected storage
+backend. For each matching row, the default SQLite backend applies built-in
+credential redaction to the complete row before deriving the returned snippet.
+If redaction removes the requested match, the snippet is exactly `[REDACTED]`.
+SQLite then limits the snippet to 512 Unicode code points, including its
+truncation marker. PostgreSQL separately limits regex matches to 512 characters
+without read-time credential redaction or a marker. Exact-text/full-text snippets
+are unchanged.
+
 When `--since` is supplied, its value is forwarded to the daemon exactly as
 provided. An empty or whitespace-only value is therefore invalid and returns
 HTTP 400; omit the option when no lower-bound filter is wanted.

@@ -103,6 +103,15 @@ meaning across search modes or hit types. The input `sessionId` is a string
 filter resolved to a conversation and is not returned on hits, and neither hit
 type has a `type` field.
 
+Regex snippet handling is backend-specific. For each matching row, the default
+SQLite backend applies LCM's built-in credential redaction to the complete row
+before deriving the returned regex snippet. If redaction removes the requested
+match, the snippet is exactly `[REDACTED]`. SQLite then limits the snippet to 512
+Unicode code points; when truncation is needed, the visible truncation marker is
+included in that total. The PostgreSQL backend independently limits
+`regexp_substr` output to 512 characters without read-time credential redaction
+or a truncation marker. Other search modes keep their existing snippet behavior.
+
 Message timestamps stored by the local SQLite backend without a timezone
 designator (for example, `YYYY-MM-DD HH:mm:ss`) are UTC instants and are
 converted to the same UTC representation on reads. Fractional seconds are

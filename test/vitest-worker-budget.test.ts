@@ -60,8 +60,14 @@ describe("local Vitest worker budget", () => {
   );
 
   it.each(["true", "1"])("preserves PostgreSQL CI sizing when CI is %s", (CI) => {
-    const configuration = createPostgresqlVitestConfiguration({ CI });
+    const configuration = createPostgresqlVitestConfiguration({ CI }, () => 8);
 
-    expect(configuration.test.maxWorkers).toBe(4);
+    expect(configuration.test.maxWorkers).toBe(8);
+  });
+
+  it.each(["true", "1"])("keeps PostgreSQL CI sizing at one when CPU discovery is zero and CI is %s", (CI) => {
+    const configuration = createPostgresqlVitestConfiguration({ CI }, () => 0);
+
+    expect(configuration.test.maxWorkers).toBe(1);
   });
 });
