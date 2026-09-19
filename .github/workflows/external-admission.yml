@@ -10,11 +10,13 @@ on:
       - rerequested
       - completed
   # GitHub suppresses check_run workflow recursion for checks produced by
-  # Actions. Use the canonical CI workflow lifecycle as the trusted wake-up
-  # source instead of occupying a runner while polling its aggregate check.
+  # Actions. Canonical CI and the registered managed Copilot workflow are the
+  # wake-up sources; strict payload predicates below reject repository workflows
+  # that merely reuse the registered Copilot trigger name.
   workflow_run:
     workflows:
       - CI
+      - Copilot
     types:
       - requested
       - in_progress
@@ -43,6 +45,12 @@ concurrency:
         github.event.workflow_run.name == 'CI' &&
         github.event.workflow_run.event == 'pull_request' &&
         github.event.workflow_run.path == '.github/workflows/ci.yml' &&
+      github.event.workflow_run.repository.full_name == github.repository &&
+      github.event.workflow_run.head_sha ||
+      github.event_name == 'workflow_run' &&
+        github.event.workflow_run.name == 'Running Copilot Code Review' &&
+        github.event.workflow_run.event == 'dynamic' &&
+        github.event.workflow_run.path == 'dynamic/agents/copilot-pull-request-reviewer' &&
         github.event.workflow_run.repository.full_name == github.repository &&
         github.event.workflow_run.head_sha ||
       github.event_name == 'workflow_run' &&
@@ -62,10 +70,11 @@ concurrency:
 jobs:
   external-admission-evaluator:
     name: external-admission-evaluator
-    # CI wake-ups are limited to the canonical pull-request workflow. Push and
-    # merge-group runs are owned by their native required checks and the
-    # permissionless external-admission-merge-group workflow. DCO results on
-    # GitHub's reserved queue refs must not create a legacy commit status.
+    # Workflow wake-ups are limited to canonical pull-request CI or the exact
+    # managed Copilot dynamic run. Repository workflows named Copilot remain
+    # skipped. Push and merge-group runs are owned by their native required
+    # checks. DCO results on GitHub's reserved queue refs must not create a
+    # legacy commit status.
     if: >-
       (github.event_name == 'repository_dispatch' &&
         github.event.action == 'external-admission-reconcile' &&
@@ -74,6 +83,11 @@ jobs:
         github.event.workflow_run.name == 'CI' &&
         github.event.workflow_run.event == 'pull_request' &&
         github.event.workflow_run.path == '.github/workflows/ci.yml' &&
+        github.event.workflow_run.repository.full_name == github.repository) ||
+      (github.event_name == 'workflow_run' &&
+        github.event.workflow_run.name == 'Running Copilot Code Review' &&
+        github.event.workflow_run.event == 'dynamic' &&
+        github.event.workflow_run.path == 'dynamic/agents/copilot-pull-request-reviewer' &&
         github.event.workflow_run.repository.full_name == github.repository) ||
       (github.event_name == 'check_run' &&
         github.event.check_run.check_suite.head_branch != null &&
@@ -141,6 +155,8 @@ jobs:
             ${{ github.event_name == 'workflow_run' && github.event.action || '' }}
           EVENT_WORKFLOW_RUN_ID: >-
             ${{ github.event_name == 'workflow_run' && github.event.workflow_run.id || '' }}
+          EVENT_WORKFLOW_RUN_PATH: >-
+            ${{ github.event_name == 'workflow_run' && github.event.workflow_run.path || '' }}
           EVENT_CHECK_RUN_ACTION: >-
             ${{ github.event_name == 'check_run' && github.event.action || '' }}
           EVENT_CHECK_RUN_ID: >-
