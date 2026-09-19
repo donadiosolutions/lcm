@@ -379,20 +379,19 @@ describe("pnpm development configuration", () => {
   it("retains canonical direct and override dependency keys in the lock graph", () => {
     const lock = loadYaml(
       readFileSync(join(repositoryRoot, "pnpm-lock.yaml"), "utf8"),
-    ) as { packages: Record<string, { resolution?: { integrity?: unknown } }> };
+    ) as {
+      overrides: Record<string, string>;
+      packages: Record<string, { resolution?: { integrity?: unknown } }>;
+    };
     const packageKeys = Object.keys(lock.packages);
     const workspace = loadYaml(
       readFileSync(join(repositoryRoot, "pnpm-workspace.yaml"), "utf8"),
     ) as { overrides: Record<string, string> };
     const direct = { ...pkg.dependencies, ...pkg.devDependencies };
-    const overrideKeys = Object.entries(workspace.overrides).map(([selector, version]) => [
-      selector.slice(selector.lastIndexOf(">") + 1), version,
-    ]);
-    const expectedKeys = [
-      ...Object.entries(direct),
-      ...overrideKeys,
-    ].map(([name, version]) => `${name}@${version}`);
-    expect(packageKeys).toEqual(expect.arrayContaining(expectedKeys));
+    for (const [name, version] of Object.entries(direct)) {
+      expect(packageKeys).toContain(`${name}@${version}`);
+    }
+    expect(lock.overrides).toEqual(workspace.overrides);
     for (const [packageKey, entry] of Object.entries(lock.packages)) {
       expect(entry.resolution?.integrity, packageKey).toMatch(/^sha512-[A-Za-z0-9+/]{86}==$/u);
     }
