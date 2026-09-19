@@ -325,9 +325,15 @@ events stay durable instead of timing out behind the sweep. A sweep whose
 caller already holds publication admission can bypass a queued tokenless
 append, because that append cannot acquire publication until the caller
 releases it, so waiting would only burn the sweep deadline. This exception
-does not bypass another frame using the same live publication token: those
-frames remain ordered, and the later frame waits for the earlier callback to
-finish before it attempts the fail-fast local append lock. The sweep still
+does not bypass another frame using the same live publication token while
+that frame is still queued in tail admission: those queued frames remain
+ordered, and the later frame waits for the earlier admitted frame before it
+attempts the fail-fast local append lock. A same-token call made after the
+earlier frame's append callback has already started does not wait: it takes
+the reentrant fast path and runs nested under the earlier frame's held
+append lock, so the two callbacks can overlap. Serializing that post-entry
+case would deadlock, since the earlier callback cannot finish while blocked
+on the nested call. The sweep still
 takes that lock and runs the append-admission phase check. Tokenless appends
 that arrive later remain queued behind the complete append tail. Be precise
 about what that phase check is: it is not the
