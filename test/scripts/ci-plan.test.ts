@@ -91,6 +91,8 @@ describe("CI plan classification", () => {
     expect(graphInvisibleTests("LICENSE")).toEqual([...GRAPH_INVISIBLE_INPUTS[0].tests]);
     expect(graphInvisibleTests(".changeset/x.md")).toEqual([...GRAPH_INVISIBLE_INPUTS[1].tests]);
     expect(graphInvisibleTests("test/timezone-fixture.test.ts")).toEqual(["test/timezone-fixture-runner.test.ts"]);
+    expect(graphInvisibleTests("src/memory/index.ts")).toEqual(["test/memory/search-type-contract.test.ts"]);
+    expect(graphInvisibleTests("src/memory/other.ts")).toEqual([]);
     expect(graphInvisibleTests("package.json")).toEqual([]);
     expect(graphInvisibleTests("docs-old/x.md")).toEqual([]);
     for (const input of GRAPH_INVISIBLE_INPUTS) {
@@ -372,6 +374,8 @@ describe("graph-invisible input table completeness", () => {
     changesets: [/new URL\("(?:\.\.\/)*\.changeset\//u],
     // A child Vitest invocation of the fixture file.
     "spawned-tests": [/"run", "test\/timezone-fixture\.test\.ts"/u],
+    // A source file resolved for the TypeScript compiler API rather than imported.
+    "compiled-sources": [/resolve\(process\.cwd\(\), "src\/[^"]+\.ts"\)/u],
   };
 
   function* testFiles(directory: string): Generator<string> {

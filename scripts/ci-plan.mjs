@@ -68,6 +68,12 @@ export const GRAPH_INVISIBLE_INPUTS = Object.freeze([
     pattern: /^test\/timezone-fixture\.test\.ts$/u,
     tests: Object.freeze(["test/timezone-fixture-runner.test.ts"]),
   }),
+  // Sources a test compiles through the TypeScript API instead of importing.
+  Object.freeze({
+    name: "compiled-sources",
+    pattern: /^src\/memory\/index\.ts$/u,
+    tests: Object.freeze(["test/memory/search-type-contract.test.ts"]),
+  }),
 ]);
 
 // The PostgreSQL conformance harness exercises the packed CLI and daemon in a
