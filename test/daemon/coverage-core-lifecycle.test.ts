@@ -326,14 +326,18 @@ describe("lifecycle procfs and parent warnings", () => {
     expect(__lifecycleTestUtils.resolveWindowsNetstatPath("C:\\Windows", " D:\\Windows\\ ", windowsFileExists)).toBe("D:\\Windows\\System32\\netstat.exe");
     expect(windowsFileExists).toHaveBeenCalledWith("C:\\Windows\\System32\\netstat.exe");
     expect(windowsFileExists).toHaveBeenCalledWith("D:\\Windows\\System32\\netstat.exe");
-    const many = Array.from({ length: 40 }, (_, index) => `n127.0.0.1:${1000 + index}`).join("\n");
-    const spawnSync = vi.fn(() => ({ status: 0, stdout: many }));
-    expect(__lifecycleTestUtils.findListeningTcpPorts(1, "freebsd", spawnSync as never)).toHaveLength(32);
-    expect(__lifecycleTestUtils.findListeningTcpPorts(1, "freebsd", spawnSync as never, "/proc", 1039)).toEqual([1039]);
-    expect(spawnSync).toHaveBeenCalledWith("lsof", expect.any(Array), expect.any(Object));
+    const unsupportedSpawn = vi.fn(() => ({ status: 0, stdout: "n127.0.0.1:4545" }));
+    expect(__lifecycleTestUtils.findListeningTcpPorts(1, "freebsd", unsupportedSpawn as never)).toEqual([]);
+    expect(__lifecycleTestUtils.findListeningTcpPorts(1, "freebsd", unsupportedSpawn as never, "/proc", 4545)).toEqual([]);
+    expect(unsupportedSpawn).not.toHaveBeenCalled();
     expect(__lifecycleTestUtils.findListeningTcpPorts(1, "freebsd", vi.fn(() => ({
       status: 0, stdout: "n127.0.0.2:3737\nn127.0.0.1:invalid\nn127.0.0.1:4545",
-    })) as never)).toEqual([4545]);
+    })) as never)).toEqual([]);
+    const many = Array.from({ length: 40 }, (_, index) => `n127.0.0.1:${1000 + index}`).join("\n");
+    const darwinLsof = vi.fn(() => ({ status: 0, stdout: many }));
+    expect(__lifecycleTestUtils.findListeningTcpPorts(1, "darwin", darwinLsof as never)).toHaveLength(32);
+    expect(__lifecycleTestUtils.findListeningTcpPorts(1, "darwin", darwinLsof as never, "/proc", 1039)).toEqual([1039]);
+    expect(darwinLsof).toHaveBeenCalledWith("/usr/sbin/lsof", expect.any(Array), expect.any(Object));
     expect(__lifecycleTestUtils.findListeningTcpPorts(1, "darwin", vi.fn(() => ({ status: 1, stdout: "" })) as never)).toEqual([]);
     const win32Netstat = vi.fn(() => ({
       status: 0,
@@ -501,7 +505,7 @@ describe("lifecycle procfs and parent warnings", () => {
 
   it.each([
     ["dead", false, "node lcm daemon start --foreground", "PPid:\t1\n", false, undefined],
-    ["wrong", true, "node other", "PPid:\t1\n", true, "not an LCM daemon"],
+    ["wrong", true, "node other", "PPid:\t1\n", false, "could not be authenticated"],
     ["parent", true, "node lcm daemon start --foreground", "Uid:\t1000\n", true, "parent could not be read"],
   ])("handles %s PID metadata after endpoint identity checks", async (_name, alive, command, daemonStatus, connected, warning) => {
     const dir = temp(); const procRoot = join(dir, "proc"); mkdirSync(procRoot);
@@ -513,10 +517,11 @@ describe("lifecycle procfs and parent warnings", () => {
     // _monotonicNowOverride, so pin performance.now for this 1 ms fixture.
     vi.spyOn(performance, "now").mockReturnValue(0);
     const result = await ensureDaemon({
-      port: 1, pidFilePath: pidPath, spawnTimeoutMs: 1, enforceUserManagerParent: true,
+      port: 1, pidFilePath: pidPath, spawnTimeoutMs: 100, enforceUserManagerParent: true,
       expectedVersion: "1",
       _platform: "linux", _procRoot: procRoot, _uid: 1000, _fetchOverride: fetch as never,
       _isProcessAliveOverride: () => alive, _listeningPortsOverride: () => [1], _skipSpawn: true,
+      _processStartTimeForTesting: pid => `birth-${String(pid)}`,
       _monotonicNowOverride: (): number => 0,
       _supervisorOverride: unavailableSupervisor(),
     });
@@ -528,7 +533,7 @@ describe("lifecycle procfs and parent warnings", () => {
     }
   });
 
-  it("handles an unavailable current uid and a missing daemon cmdline", async () => {
+  it("fails closed with an unavailable uid and missing daemon command evidence", async () => {
     const getuid = vi.spyOn(process, "getuid").mockReturnValue(undefined as never);
     expect(findUserSystemdPid({ procRoot: temp() })).toBeNull();
     getuid.mockRestore();
@@ -549,12 +554,13 @@ describe("lifecycle procfs and parent warnings", () => {
       expectedRuntimeDigest: runtimeIdentity.runtimeDigest,
       _platform: "linux", _procRoot: procRoot, _uid: 1000, _fetchOverride: fetchHealthy(31, runtimeIdentity) as never,
       _isProcessAliveOverride: () => true, _listeningPortsOverride: () => [1], _skipSpawn: true,
+      _processStartTimeForTesting: pid => `birth-${String(pid)}`,
       _monotonicNowOverride: (): number => 0,
       _supervisorOverride: unavailableSupervisor(),
     });
     expect(result).toMatchObject({
-      connected: true,
-      warning: "daemon PID 31 is not an LCM daemon; daemon parent invariant is not verified",
+      connected: false,
+      warning: expect.stringContaining("could not be authenticated"),
     });
   });
 });
@@ -675,9 +681,10 @@ describe("lifecycle spawn and restart failure boundaries", () => {
     // _monotonicNowOverride, so pin its nested clock for this 1 ms fixture.
     vi.spyOn(performance, "now").mockReturnValue(0);
     const result = await ensureDaemon({
-      port: 13, pidFilePath: pidPath, spawnTimeoutMs: 1, _platform: "linux", enforceUserManagerParent: true,
+      port: 13, pidFilePath: pidPath, spawnTimeoutMs: 100, _platform: "linux", enforceUserManagerParent: true,
       _procRoot: root, _uid: 1000, _isProcessAliveOverride: () => true, _fetchOverride: fetchHealthy(20) as never,
       _listeningPortsOverride: () => [13], _monotonicNowOverride: () => 0, _skipSpawn: true, expectedVersion: "1",
+      _processStartTimeForTesting: pid => `birth-${String(pid)}`,
       _supervisorOverride: unavailableSupervisor(),
     });
     expect(result.connected).toBe(true); expect(result.warning).toBeUndefined();

@@ -129,6 +129,8 @@ component_management:
         - "^src/daemon/invocation-coordinator\\.ts$"
         - "^src/daemon/cancellation\\.ts$"
         - "^src/daemon/orientation\\.ts$"
+        # G002 keeps credential-free managed-peer admission daemon-core-owned.
+        - "^src/daemon/peer-admission\\.ts$"
         - "^src/daemon/project-queue\\.ts$"
         - "^src/daemon/publication-queue\\.ts$"
         # #1270/#1283 keep renewed hook identity selection daemon-core-owned.

@@ -78,6 +78,12 @@ export type DaemonRequestOptions = Readonly<{
   timeoutMs?: number;
 }>;
 
+export type DaemonClientSecurityOptions = Readonly<{
+  verifyProtectedRequest?: () => void | Promise<void>;
+  /** @internal Deterministic credential-boundary seam. */
+  _readToken?: typeof readAuthToken;
+}>;
+
 export type InvocationControlRequest = Readonly<{
   invocationId: string;
   command: "compact";
@@ -100,13 +106,17 @@ export class DaemonClient {
   private tokenLoaded = false;
   private readonly port: number;
 
-  constructor(baseUrl: string, private tokenPath?: string) {
+  constructor(
+    baseUrl: string,
+    private tokenPath?: string,
+    private readonly security: DaemonClientSecurityOptions = {},
+  ) {
     this.port = daemonPortFromLoopbackUrl(baseUrl);
   }
 
   private getToken(): string | null {
     if (!this.tokenLoaded) {
-      this.token = readAuthToken(
+      this.token = (this.security._readToken ?? readAuthToken)(
         this.tokenPath ?? daemonTokenPath(),
       );
       this.tokenLoaded = true;
@@ -117,7 +127,9 @@ export class DaemonClient {
   async health(options?: DaemonRequestOptions): Promise<DaemonHealth | null> {
     try {
       throwIfAborted(options?.signal);
+      await this.security.verifyProtectedRequest?.();
       const token = this.getToken();
+      await this.security.verifyProtectedRequest?.();
       const headers: Record<string, string> = {};
       if (token) {
         headers.Authorization = `Bearer ${token}`;
@@ -145,8 +157,10 @@ export class DaemonClient {
   async observe(options?: DaemonRequestOptions): Promise<DaemonObservation | null> {
     try {
       throwIfAborted(options?.signal);
+      await this.security.verifyProtectedRequest?.();
       const token = this.getToken();
       if (!token) return null;
+      await this.security.verifyProtectedRequest?.();
       const response = await daemonJsonResponse<unknown>(this.port, "/health/observe", {
         method: "GET",
         headers: { Authorization: `Bearer ${token}` },
@@ -162,7 +176,9 @@ export class DaemonClient {
   async get<T = unknown>(path: string, options?: DaemonRequestOptions): Promise<T> {
     throwIfAborted(options?.signal);
     const route = normalizeDaemonPath(path);
+    await this.security.verifyProtectedRequest?.();
     const token = this.getToken();
+    await this.security.verifyProtectedRequest?.();
     const headers: Record<string, string> = {};
     if (token) {
       headers["Authorization"] = `Bearer ${token}`;
@@ -177,7 +193,9 @@ export class DaemonClient {
   async post<T = unknown>(path: string, body: unknown, options?: DaemonRequestOptions): Promise<T> {
     throwIfAborted(options?.signal);
     const route = normalizeDaemonPath(path);
+    await this.security.verifyProtectedRequest?.();
     const token = this.getToken();
+    await this.security.verifyProtectedRequest?.();
     const headers: Record<string, string> = { "Content-Type": "application/json" };
     if (token) {
       headers["Authorization"] = `Bearer ${token}`;

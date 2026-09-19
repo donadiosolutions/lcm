@@ -110,7 +110,17 @@ function withHermeticLifecycleSeams(
   ]) {
     mkdirSync(directory, { recursive: true });
   }
-  return { ...options, _hermeticTestSeams: seams, _assertBackendPublication: () => undefined };
+  return {
+    ...options,
+    _processStartTimeForTesting: options._processStartTimeForTesting
+      ?? (pid => `birth-${String(pid)}`),
+    _peerProcessCommandOverride: options._peerProcessCommandOverride
+      ?? (options._procRoot === undefined || (options._platform ?? "linux") !== "linux"
+        ? () => `node ${options.expectedEntrypoint ?? "lcm"} daemon start --foreground`
+        : undefined),
+    _hermeticTestSeams: seams,
+    _assertBackendPublication: () => undefined,
+  };
 }
 
 function ensureDaemon(
@@ -158,7 +168,7 @@ function createOwnedDaemonFixture(prefix: string, pid = 200): {
     procRoot,
     pid,
     "Name:\tnode\nUid:\t1000\t1000\t1000\t1000\nPPid:\t1\n",
-    "node lcm daemon start --foreground",
+    `node ${testIdentity.entrypoint} daemon start --foreground`,
   );
   return { pid, pidFile, procRoot, tokenFile };
 }
@@ -4137,9 +4147,55 @@ describe("restartDaemon", () => {
     });
 
     expect(result).toMatchObject({ connected: true, spawned: false, startMethod: "systemd-user", pid: 200 });
-    expect(probe).toHaveBeenCalledTimes(3);
+    expect(probe).toHaveBeenCalledTimes(9);
     expect(spec).toBeDefined();
     expect(supervisor.start).not.toHaveBeenCalled();
+  });
+
+  it("sends no credential when the manager registration changes before authentication", async () => {
+    const fixture = createOwnedDaemonFixture("lcm-lifecycle-manager-drift-", 200);
+    let spec: { scopeDigest: string; nonce: string; name: string } | undefined;
+    let probes = 0;
+    const probe = vi.fn(async (candidate: typeof spec) => {
+      spec = candidate!;
+      probes += 1;
+      return probes <= 2
+        ? {
+            kind: "registered-running-valid" as const,
+            managerPid: 200,
+            scopeDigest: candidate!.scopeDigest,
+            nonce: candidate!.nonce,
+            name: candidate!.name,
+          }
+        : { kind: "absent" as const, name: candidate!.name };
+    });
+    const fetchMock = vi.fn(async (_url: string, init?: RequestInit) => new Response(JSON.stringify({
+      status: "ok",
+      version: "1.4.2",
+      pid: 200,
+      entrypoint: testIdentity.entrypoint,
+      storageBackend: "sqlite",
+    }), { status: 200 }));
+
+    const result = await ensureDaemon({
+      port: 19999,
+      pidFilePath: fixture.pidFile,
+      spawnTimeoutMs: 100,
+      expectedVersion: "1.4.2",
+      expectedEntrypoint: testIdentity.entrypoint,
+      enforceUserManagerParent: true,
+      _platform: "linux",
+      _procRoot: fixture.procRoot,
+      _fetchOverride: fetchMock as FetchOverride,
+      _isProcessAliveOverride: () => true,
+      _listeningPortsOverride: () => [19999],
+      _supervisorOverride: { probe, start: vi.fn(), stopAndStart: vi.fn(), stopAndAwaitAbsent: vi.fn() } as never,
+    });
+
+    expect(result.connected).toBe(false);
+    expect(fetchMock.mock.calls.filter(([, init]) => (init as RequestInit | undefined)?.headers !== undefined))
+      .toEqual([]);
+    expect(spec).toBeDefined();
   });
 
   it("refuses managed ensure recovery when a registered job gives no response", async () => {

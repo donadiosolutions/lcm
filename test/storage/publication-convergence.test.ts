@@ -9,6 +9,7 @@ import { PrivateMutationLockContentionError } from "../../src/private-mutation-l
 
 const identity = {
   pid: 42,
+  birth: "birth",
   version: "1.0.0",
   storageBackend: "sqlite" as const,
   entrypoint: "/opt/lcm.mjs",
@@ -31,6 +32,7 @@ function deps(overrides: Partial<PublicationConvergenceDeps> = {}): PublicationC
     readToken: () => "token",
     readOwner: () => ({ version: 1, pid: 42, processStartTime: "birth", nonce: "a".repeat(32) }),
     processBirth: () => "birth",
+    admitPeer: () => ({ pid: 42, birth: "birth" }),
     platform: "linux",
     lockPath: "/tmp/lock",
     ...overrides,
@@ -38,6 +40,44 @@ function deps(overrides: Partial<PublicationConvergenceDeps> = {}): PublicationC
 }
 
 describe("publication convergence", () => {
+  it("refuses token access and authenticated health when peer re-admission fails", async () => {
+    const readToken = vi.fn(() => "must-not-be-read");
+    const fetch = healthFetch();
+    await expect(capturePublicationIdentity({
+      port: 3737,
+      admittedPeer: identity,
+      expectedVersion: identity.version,
+      expectedStorageBackend: identity.storageBackend,
+      expectedEntrypoint: identity.entrypoint,
+      expectedRuntimeDigest: identity.runtimeDigest,
+      deps: deps({ admitPeer: () => null, readToken, fetch }),
+    })).resolves.toBeUndefined();
+    expect(readToken).not.toHaveBeenCalled();
+    expect(fetch).not.toHaveBeenCalled();
+  });
+
+  it("re-admits after token access and sends nothing when the pinned peer changed", async () => {
+    let admitted = true;
+    const fetch = healthFetch();
+    await expect(capturePublicationIdentity({
+      port: 3737,
+      admittedPeer: identity,
+      expectedVersion: identity.version,
+      expectedStorageBackend: identity.storageBackend,
+      expectedEntrypoint: identity.entrypoint,
+      expectedRuntimeDigest: identity.runtimeDigest,
+      deps: deps({
+        admitPeer: () => admitted ? { pid: 42, birth: "birth" } : null,
+        readToken: () => {
+          admitted = false;
+          return "must-not-send";
+        },
+        fetch,
+      }),
+    })).resolves.toBeUndefined();
+    expect(fetch).not.toHaveBeenCalled();
+  });
+
   it("captures a fully authenticated identity and rejects drift", async () => {
     await expect(capturePublicationIdentity({
       port: 3737, expectedVersion: undefined, expectedStorageBackend: "sqlite",

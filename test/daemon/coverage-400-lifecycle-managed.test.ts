@@ -10,7 +10,7 @@ import {
   writeFileSync,
 } from "node:fs";
 import { homedir, tmpdir } from "node:os";
-import { join } from "node:path";
+import { dirname, join } from "node:path";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import {
   __lifecycleTestUtils,
@@ -272,6 +272,8 @@ function optionsFor(
     _supervisorOverride: fixture.supervisor,
     _monotonicNowOverride: () => 0,
     _listeningPortsOverride: () => [fixture.port],
+    _processStartTimeForTesting: pid => `birth-${String(pid)}`,
+    _peerProcessCommandOverride: () => "node /tmp/lcm-daemon-entrypoint.mjs daemon start --foreground",
     ...extra,
   };
 }
@@ -393,6 +395,11 @@ describe("issue 400 lifecycle managed preparation and utility boundaries", () =>
       environment: { PATH: "/ambient/bin" },
     });
     const callerHome = homedir();
+    const callerLocal = join(callerHome, ".local");
+    const callerBin = join(callerLocal, "bin");
+    mkdirSync(callerBin, { recursive: true, mode: 0o700 });
+    chmodSync(callerLocal, 0o700);
+    chmodSync(callerBin, 0o700);
     const projectCwd = join(fixture.root, "project");
     const spawnCommand = "/usr/bin/node";
     const spawnArgs = [
@@ -401,6 +408,8 @@ describe("issue 400 lifecycle managed preparation and utility boundaries", () =>
       "start",
       "--foreground",
     ];
+    mkdirSync(dirname(spawnArgs[0]!), { recursive: true, mode: 0o700 });
+    writeFileSync(spawnArgs[0]!, "// managed fixture\n", { mode: 0o600 });
     let callerCwd = callerHome;
     vi.spyOn(process, "cwd").mockImplementation(() => callerCwd);
     const probed: SupervisorSpec[] = [];
@@ -422,7 +431,7 @@ describe("issue 400 lifecycle managed preparation and utility boundaries", () =>
     expect(probed[0]?.stateRoot).toBe(probed[1]?.stateRoot);
     expect(probed[0]?.scopeDigest).toBe(probed[1]?.scopeDigest);
     expect(probed[0]?.launchEnvironment?.PATH).toBe(probed[1]?.launchEnvironment?.PATH);
-    expect(probed[0]?.launchEnvironment?.PATH).toContain(join(callerHome, ".local", "bin"));
+    expect(probed[0]?.launchEnvironment?.PATH).not.toContain(projectCwd);
     const digest = (spec: SupervisorSpec): string => managedLaunchEnvironmentDigest(
       spec,
       spec.kind,
@@ -681,6 +690,7 @@ describe("issue 400 lifecycle managed preparation and utility boundaries", () =>
       stopAndStart: vi.fn(),
       stopAndAwaitAbsent: vi.fn(),
     } as never;
+    let tokenReplaced = false;
     await expect(ensureDaemon({
       port: fixture.port,
       pidFilePath: fixture.pidPath,
@@ -693,11 +703,16 @@ describe("issue 400 lifecycle managed preparation and utility boundaries", () =>
       _testScope: scope,
       _supervisorOverride: supervisor,
       _listeningPortsOverride: () => {
-        rmSync(fixture.tokenPath, { force: true });
-        mkdirSync(fixture.tokenPath);
+        if (!tokenReplaced) {
+          tokenReplaced = true;
+          rmSync(fixture.tokenPath, { force: true });
+          mkdirSync(fixture.tokenPath);
+        }
         return [fixture.port];
       },
       _isProcessAliveOverride: () => true,
+      _processStartTimeForTesting: pid => `birth-${String(pid)}`,
+      _peerProcessCommandOverride: () => `node ${scope.entrypoint} daemon start --foreground`,
       _skipSpawn: true,
     })).rejects.toThrow("unsafe daemon lifecycle token read");
   });
@@ -729,7 +744,7 @@ describe("issue 400 lifecycle managed preparation and utility boundaries", () =>
 });
 
 describe("issue 400 managed ensure admission matrix", () => {
-  it("bounds a direct-start birth probe without starving authenticated diagnostics", async () => {
+  it("fails closed when a bounded direct-start birth probe is unavailable", async () => {
     let now = 0;
     const birthTimeouts: number[] = [];
     const authenticated = vi.fn();
@@ -762,13 +777,15 @@ describe("issue 400 managed ensure admission matrix", () => {
     }));
 
     expect(result).toMatchObject({
-      connected: true,
+      connected: false,
       spawned: true,
-      pid: 4242,
       startMethod: "detached-spawn",
     });
-    expect(birthTimeouts).toEqual([25]);
-    expect(fixture.seams.fetch).toHaveBeenCalledTimes(4);
+    expect(birthTimeouts).toEqual([25, 100]);
+    expect(fixture.seams.fetch).toHaveBeenCalledTimes(2);
+    expect(vi.mocked(fixture.seams.fetch).mock.calls.every(([, init]) => (
+      (init as RequestInit | undefined)?.headers === undefined
+    ))).toBe(true);
     expect(authenticated).not.toHaveBeenCalled();
   });
 

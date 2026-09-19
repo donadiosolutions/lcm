@@ -133,6 +133,7 @@ function minimalDeps(overrides: DoctorOverrides = {}): DoctorDeps {
     }),
     homedir: defaultDoctorHome,
     _expectedRuntimeDigestForTesting: EXPECTED_RUNTIME_DIGEST,
+    _admitDaemonPeer: () => ({ pid: DAEMON_OBSERVATION.pid, birth: "birth" }),
     platform: "darwin",
     ...rest,
   };
@@ -1670,6 +1671,25 @@ describe("doctor authenticated daemon identity", () => {
     });
   }
   const healthy = DAEMON_OBSERVATION;
+
+  it("does not read or transmit the token when local peer admission fails", async () => {
+    const tokenReads = vi.fn();
+    const fetch = vi.fn();
+    const baseRead = minimalDeps().readFileSync;
+    const results = await runDoctor(minimalDeps({
+      _admitDaemonPeer: () => null,
+      fetch,
+      readFileSync: (path, encoding) => {
+        if (path.endsWith("daemon.token")) tokenReads();
+        return baseRead(path, encoding);
+      },
+    }));
+    expect(results.find(result => result.name === "daemon")?.status).toBe("fail");
+    expect(tokenReads).not.toHaveBeenCalled();
+    expect(fetch).not.toHaveBeenCalled();
+    expect(ensureDaemon).not.toHaveBeenCalled();
+    expect(restartDaemon).not.toHaveBeenCalled();
+  });
 
   it.each([
     ["version", undefined], ["version", "0.4.0"], ["runtimeDigest", undefined],

@@ -9,7 +9,6 @@ import {
   lstatSync,
   openSync,
   readFileSync,
-  readlinkSync,
   readdirSync,
   realpathSync,
   renameSync,
@@ -20,7 +19,7 @@ import {
 } from "node:fs";
 import { spawn, spawnSync, type ChildProcess } from "node:child_process";
 import { platform as osPlatform } from "node:os";
-import { basename, dirname, isAbsolute, join, resolve, win32 } from "node:path";
+import { basename, dirname, isAbsolute, join, resolve } from "node:path";
 import { ensureAuthToken, readAuthToken } from "./auth.js";
 import { PACKAGED_RUNTIME_ENTRYPOINT, PKG_VERSION, RUNTIME_DIGEST } from "./version.js";
 import type { StorageBackend } from "./config.js";
@@ -84,12 +83,26 @@ import {
   PrivateMutationLockContentionError,
 } from "../private-mutation-lock.js";
 import { atomicWritePrivateFile, readBoundedRegularFileWithStat } from "../security-files.js";
+import {
+  admitManagedDaemonPeer,
+  findListeningTcpPorts as findSharedListeningTcpPorts,
+  isLikelyLcmDaemonProcessForPlatform as isLikelySharedLcmDaemonProcessForPlatform,
+  readPlatformProcessCommand as readSharedPlatformProcessCommand,
+  resolveLinuxSsPath as resolveSharedLinuxSsPath,
+  resolveWindowsNetstatPath as resolveSharedWindowsNetstatPath,
+  resolveWindowsPowerShellPath as resolveSharedWindowsPowerShellPath,
+  type ManagedDaemonPeerEvidence,
+} from "./peer-admission.js";
 
 type KillProcess = (pid: number, signal?: NodeJS.Signals | number) => void;
 type SleepFn = (ms: number) => Promise<void>;
 type SetTimeoutFn = (callback: () => void, delayMs: number) => ReturnType<typeof setTimeout>;
 type ClearTimeoutFn = (timeout: ReturnType<typeof setTimeout>) => void;
 type CleanupFn = () => void | Promise<void>;
+type ManagedDaemonPeerVerifier = () =>
+  | ManagedDaemonPeerEvidence
+  | null
+  | Promise<ManagedDaemonPeerEvidence | null>;
 
 type LifecycleAdmissionEvidence = Readonly<{
   result: EnsureDaemonResult;
@@ -100,6 +113,7 @@ type LifecycleAdmissionEvidence = Readonly<{
   expectedRuntimeDigest: string;
   processBirth: typeof processStartTime;
   readOwner: typeof readPrivateMutationLockOwner;
+  admitPeer: ManagedDaemonPeerVerifier;
   birthBefore: string;
   birthAfter: string;
   token: string;
@@ -119,7 +133,11 @@ type PublicationAdmissionWrapper = <T>(
 
 type LifecyclePublicationCaptureMode =
   | Readonly<{ kind: "current" }>
-  | Readonly<{ kind: "replacement-manager"; managerPid: number }>
+  | Readonly<{
+    kind: "replacement-manager";
+    managerPid: number;
+    admitManagerPeer: ManagedDaemonPeerVerifier;
+  }>
   | Readonly<{ kind: "replacement-owned" }>;
 
 type LifecyclePublicationEvidence = Readonly<{
@@ -129,6 +147,7 @@ type LifecyclePublicationEvidence = Readonly<{
   entrypoint: string;
   runtimeDigest: string;
   birth: string;
+  admitPeer: ManagedDaemonPeerVerifier;
   token: string;
   readToken: () => string | null;
   processBirth: typeof processStartTime;
@@ -253,6 +272,8 @@ export type EnsureDaemonOptions = {
   _packagedEntrypointOverride?: string;
   /** @internal Deterministic listener-ownership seam for lifecycle tests. */
   _listeningPortsOverride?: (pid: number) => number[];
+  /** @internal Deterministic peer process-command seam for lifecycle tests. */
+  _peerProcessCommandOverride?: (pid: number) => string | null;
   /** @internal Deterministic trusted Windows PowerShell seam for lifecycle tests. */
   _windowsPowerShellPathOverride?: string | null;
   /** @internal Deterministic trusted Linux socket-diagnostic seam for lifecycle tests. */
@@ -1058,36 +1079,12 @@ function isLikelyLcmDaemonProcess(pid: number, procRoot = "/proc"): boolean {
   return isLikelyLcmDaemonCommand(readProcessCommand(pid, procRoot));
 }
 
-function resolveWindowsSystemExecutable(
-  relativeSegments: readonly string[],
-  systemRoot: string | undefined,
-  windir: string | undefined,
-  fileExists: (path: string) => boolean = existsSync,
-): string | null {
-  for (const candidate of [systemRoot, windir]) {
-    if (typeof candidate !== "string") continue;
-    const normalized = win32.normalize(candidate.trim()).replace(/[\\/]+$/, "");
-    // SystemRoot/WINDIR should identify the OS Windows directory itself. Do
-    // not accept arbitrary absolute directories supplied through the process
-    // environment, UNC paths, relative paths, or executable search fallback.
-    if (!/^[A-Za-z]:\\Windows$/i.test(normalized)) continue;
-    const executable = win32.join(normalized, ...relativeSegments);
-    if (fileExists(executable)) return executable;
-  }
-  return null;
-}
-
 function resolveWindowsNetstatPath(
   systemRoot: string | undefined,
   windir: string | undefined,
   fileExists: (path: string) => boolean = existsSync,
 ): string | null {
-  return resolveWindowsSystemExecutable(
-    ["System32", "netstat.exe"],
-    systemRoot,
-    windir,
-    fileExists,
-  );
+  return resolveSharedWindowsNetstatPath(systemRoot, windir, fileExists);
 }
 
 function resolveWindowsPowerShellPath(
@@ -1095,21 +1092,13 @@ function resolveWindowsPowerShellPath(
   windir: string | undefined,
   fileExists: (path: string) => boolean = existsSync,
 ): string | null {
-  return resolveWindowsSystemExecutable(
-    ["System32", "WindowsPowerShell", "v1.0", "powershell.exe"],
-    systemRoot,
-    windir,
-    fileExists,
-  );
+  return resolveSharedWindowsPowerShellPath(systemRoot, windir, fileExists);
 }
 
 function resolveLinuxSsPath(
   fileExists: (path: string) => boolean = existsSync,
 ): string | null {
-  for (const candidate of ["/usr/bin/ss", "/usr/sbin/ss"]) {
-    if (fileExists(candidate)) return candidate;
-  }
-  return null;
+  return resolveSharedLinuxSsPath(fileExists);
 }
 
 function readPlatformProcessCommand(
@@ -1122,40 +1111,13 @@ function readPlatformProcessCommand(
     process.env.WINDIR,
   ),
 ): string | null {
-  if (platform === "linux") return readProcessCommand(pid, procRoot);
-
-  let executable: string;
-  let args: string[];
-  if (platform === "darwin") {
-    executable = "/bin/ps";
-    args = ["-p", String(pid), "-o", "command="];
-  } else if (platform === "win32" && windowsPowerShellPath !== null) {
-    executable = windowsPowerShellPath;
-    args = [
-      "-NoLogo",
-      "-NoProfile",
-      "-NonInteractive",
-      "-Command",
-      `$process = Get-CimInstance -ClassName Win32_Process -Filter 'ProcessId = ${String(pid)}'; if ($null -ne $process) { [Console]::Out.Write($process.CommandLine) }`,
-    ];
-  } else {
-    return null;
-  }
-
-  try {
-    const result = spawnSyncImpl(executable, args, {
-      encoding: "utf-8",
-      timeout: 1000,
-      maxBuffer: 64 * 1024,
-      shell: false,
-      windowsHide: true,
-    });
-    if (result.status !== 0 || typeof result.stdout !== "string") return null;
-    const command = result.stdout.trim();
-    return command.length > 0 ? command : null;
-  } catch {
-    return null;
-  }
+  return readSharedPlatformProcessCommand(
+    pid,
+    platform,
+    spawnSyncImpl,
+    procRoot,
+    windowsPowerShellPath,
+  );
 }
 
 function isLikelyLcmDaemonProcessForPlatform(
@@ -1165,14 +1127,12 @@ function isLikelyLcmDaemonProcessForPlatform(
   procRoot: string,
   windowsPowerShellPath: string | null,
 ): boolean {
-  return isLikelyLcmDaemonCommand(
-    readPlatformProcessCommand(
-      pid,
-      platform,
-      spawnSyncImpl,
-      procRoot,
-      windowsPowerShellPath,
-    ),
+  return isLikelySharedLcmDaemonProcessForPlatform(
+    pid,
+    platform,
+    spawnSyncImpl,
+    procRoot,
+    windowsPowerShellPath,
   );
 }
 
@@ -1186,135 +1146,16 @@ function findListeningTcpPorts(
   systemdControlGroup?: string,
   linuxSsPath = resolveLinuxSsPath(),
 ): number[] {
-  if (platform === "linux") {
-    try {
-      const socketInodes = new Set<string>();
-      const descriptorEntries = readdirSync(join(procRoot, String(pid), "fd"));
-      let readableDescriptors = 0;
-      for (const entry of descriptorEntries) {
-        try {
-          const target = readlinkSync(join(procRoot, String(pid), "fd", entry));
-          readableDescriptors += 1;
-          const match = /^socket:\[(\d+)\]$/.exec(target);
-          if (match) socketInodes.add(match[1]);
-        } catch {
-          // File descriptors can disappear while the process is running.
-        }
-      }
-      const ports = new Set<number>();
-      for (const table of ["tcp", "tcp6"]) {
-        let rows: string;
-        try {
-          rows = readFileSync(join(procRoot, "net", table), "utf-8");
-        } catch {
-          continue;
-        }
-        for (const row of rows.split(/\r?\n/).slice(1)) {
-          const columns = row.trim().split(/\s+/);
-          // Canonical /proc/net/tcp tokenization is: sl=0, local=1,
-          // remote=2, state=3, queues/timers=4..6, uid=7, timeout=8,
-          // inode=9, followed by ref/pointer fields.
-          if (columns.length < 10 || columns[3] !== "0A" || !socketInodes.has(columns[9])) continue;
-          const [addressHex, portHex] = columns[1]!.split(":");
-          // Requests are sent specifically to 127.0.0.1. A socket on another
-          // loopback address does not prove ownership of that endpoint.
-          if (addressHex !== "0100007F") continue;
-          const port = portHex ? Number.parseInt(portHex, 16) : NaN;
-          if (Number.isInteger(port) && port >= 1 && port <= 65_535 && (targetPort === undefined || port === targetPort)) ports.add(port);
-        }
-      }
-      if (ports.size > 0 || readableDescriptors > 0 || descriptorEntries.length === 0) {
-        return [...ports].sort((a, b) => a - b);
-      }
-    } catch {
-      // A process in a sibling user namespace can expose the fd directory
-      // while denying every descriptor target. Fall through to the bounded
-      // manager-cgroup witness instead of treating that isolation as absence.
-    }
-    if (
-      targetPort === undefined
-      || !Number.isInteger(targetPort)
-      || targetPort < 1
-      || targetPort > 65_535
-      || typeof systemdControlGroup !== "string"
-      || !/^\/(?:[A-Za-z0-9_.:@-]+\/)*[A-Za-z0-9_.:@-]+$/u.test(systemdControlGroup)
-      || Buffer.byteLength(systemdControlGroup, "utf8") > 4 * 1024
-      || linuxSsPath === null
-    ) return [];
-    try {
-      const result = spawnSyncImpl(linuxSsPath, ["-H", "-ltnpe4", `sport = :${String(targetPort)}`], {
-        encoding: "utf-8",
-        timeout: 1000,
-        maxBuffer: 64 * 1024,
-        shell: false,
-        windowsHide: true,
-      });
-      if (result.status !== 0 || typeof result.stdout !== "string") return [];
-      const localEndpoint = `127.0.0.1:${String(targetPort)}`;
-      const matchingRows = result.stdout.split(/\r?\n/).filter((row) => {
-        const columns = row.trim().split(/\s+/);
-        return columns[0] === "LISTEN" && columns[3] === localEndpoint;
-      });
-      if (matchingRows.length === 0) return [];
-      const everyRowOwned = matchingRows.every((row) => {
-        const cgroups = row.trim().split(/\s+/).filter((column) => column.startsWith("cgroup:"));
-        return cgroups.length === 1 && cgroups[0] === `cgroup:${systemdControlGroup}`;
-      });
-      return everyRowOwned ? [targetPort] : [];
-    } catch {
-      return [];
-    }
-  }
-  if (platform === "win32") {
-    if (windowsNetstatPath === null) return [];
-    try {
-      const result = spawnSyncImpl(windowsNetstatPath, ["-ano", "-p", "tcp"], {
-        encoding: "utf-8", timeout: 1000, maxBuffer: 256 * 1024,
-      });
-      if (result.status !== 0 || typeof result.stdout !== "string") return [];
-      const ports = new Set<number>();
-      for (const line of result.stdout.split(/\r?\n/)) {
-        const columns = line.trim().split(/\s+/);
-        if (columns.length < 5 || columns[0]?.toUpperCase() !== "TCP" || columns[3]?.toUpperCase() !== "LISTENING") continue;
-        if (Number.parseInt(columns[4], 10) !== pid) continue;
-        if (!columns[1]?.startsWith("127.0.0.1:")) continue;
-        const port = Number.parseInt(columns[1]?.match(/:(\d+)$/)?.[1] ?? "", 10);
-        if (Number.isInteger(port) && port >= 1 && port <= 65_535 && (targetPort === undefined || port === targetPort)) ports.add(port);
-      }
-      return [...ports].sort((a, b) => a - b);
-    } catch {
-      return [];
-    }
-  }
-  try {
-    const command = platform === "darwin" ? "/usr/sbin/lsof" : "lsof";
-    const result = spawnSyncImpl(command, [
-      "-nP",
-      "-a",
-      "-p", String(pid),
-      "-iTCP",
-      "-sTCP:LISTEN",
-      "-Fn",
-    ], {
-      encoding: "utf-8",
-      timeout: 1000,
-      maxBuffer: 64 * 1024,
-    });
-    if (result.status !== 0 || typeof result.stdout !== "string") return [];
-    const ports = new Set<number>();
-    for (const line of result.stdout.split(/\r?\n/)) {
-      if (!line.startsWith("n127.0.0.1:")) continue;
-      const match = line.match(/:(\d+)(?:\s+\(LISTEN\))?$/);
-      if (!match) continue;
-      const port = Number.parseInt(match[1], 10);
-      if (Number.isInteger(port) && port >= 1 && port <= 65_535 && (targetPort === undefined || port === targetPort)) ports.add(port);
-      if (targetPort !== undefined && ports.has(targetPort)) break;
-      if (ports.size >= 32) break;
-    }
-    return [...ports].sort((a, b) => a - b);
-  } catch {
-    return [];
-  }
+  return findSharedListeningTcpPorts(
+    pid,
+    platform,
+    spawnSyncImpl,
+    procRoot,
+    targetPort,
+    windowsNetstatPath,
+    systemdControlGroup,
+    linuxSsPath,
+  );
 }
 
 export function findUserSystemdPid(options: { procRoot?: string; uid?: number } = {}): number | null {
@@ -1586,10 +1427,19 @@ async function checkDaemonDiagnostics(
   remainingDeadline: () => RequestDeadline | null,
   publicHealth: HealthResponse,
   expectedStorageBackend: StorageBackend,
+  admitPeer: ManagedDaemonPeerVerifier,
   readToken: (path: string) => string | null = readAuthToken,
 ): Promise<HealthResponse | null> {
+  const admittedBeforeToken = await admitPeer();
+  if (admittedBeforeToken === null || publicHealth.pid !== admittedBeforeToken.pid) return null;
   const token = readToken(tokenPath);
   if (!token) return null;
+  const admittedBeforeHealth = await admitPeer();
+  if (
+    admittedBeforeHealth === null
+    || admittedBeforeHealth.pid !== admittedBeforeToken.pid
+    || admittedBeforeHealth.birth !== admittedBeforeToken.birth
+  ) return null;
   const healthDeadline = remainingDeadline();
   if (!healthDeadline) return null;
   const authenticatedHealth = await checkDaemonHealth(port, fetchFn, healthDeadline, token);
@@ -1599,6 +1449,12 @@ async function checkDaemonDiagnostics(
   ) {
     return null;
   }
+  const admittedBeforeAccess = await admitPeer();
+  if (
+    admittedBeforeAccess === null
+    || admittedBeforeAccess.pid !== admittedBeforeToken.pid
+    || admittedBeforeAccess.birth !== admittedBeforeToken.birth
+  ) return null;
   const accessDeadline = remainingDeadline();
   if (!accessDeadline) return null;
   return await checkDaemonAccess(
@@ -1761,6 +1617,17 @@ async function captureLifecyclePublicationEvidence(
 
   const dependencies = resolveLifecycleDependencies(opts);
   const publicationExpectedUid = dependencies.uid ?? process.getuid?.();
+  const publicationPlatform = dependencies.platform;
+  const publicationProcRoot = dependencies.procRoot;
+  const publicationPowerShell = opts._windowsPowerShellPathOverride === undefined
+    ? resolveWindowsPowerShellPath(
+        dependencies.environment.SystemRoot,
+        dependencies.environment.WINDIR,
+      )
+    : opts._windowsPowerShellPathOverride;
+  const publicationSs = opts._linuxSsPathOverride === undefined
+    ? resolveLinuxSsPath()
+    : opts._linuxSsPathOverride;
   const now = opts._monotonicNowOverride ?? performance.now.bind(performance);
   const setTimeoutFn = opts._setTimeoutOverride ?? setTimeout;
   const clearTimeoutFn = opts._clearTimeoutOverride ?? clearTimeout;
@@ -1786,6 +1653,14 @@ async function captureLifecyclePublicationEvidence(
       return null;
     }
   };
+  const readPeerBirth = (pid: number): string | null => {
+    if (opts._abortSignal?.aborted) return null;
+    try {
+      return processBirth(pid, undefined, { timeoutMs: 100 });
+    } catch {
+      return null;
+    }
+  };
 
   const firstPidEvidence = readPublicationPidEvidence(
     opts.pidFilePath,
@@ -1798,6 +1673,44 @@ async function captureLifecyclePublicationEvidence(
   }
   const birthBefore = readBirth(pid);
   if (birthBefore === null) return undefined;
+  const admitProcessPeer = (): ManagedDaemonPeerEvidence | null => admitManagedDaemonPeer({
+    authority: {
+      kind: "pid-file",
+      pidFilePath: opts.pidFilePath,
+      expectedUid: publicationExpectedUid,
+    },
+    port: opts.port,
+    platform: publicationPlatform,
+    procRoot: publicationProcRoot,
+    expectedEntrypoint,
+    _seams: {
+      isProcessAlive: dependencies.isProcessAlive,
+      processBirth: readPeerBirth,
+      readProcessCommand: candidatePid => opts._peerProcessCommandOverride?.(candidatePid)
+        ?? readPlatformProcessCommand(
+          candidatePid,
+          publicationPlatform,
+          dependencies.spawnSync,
+          publicationProcRoot,
+          publicationPowerShell,
+        ),
+      findListeningTcpPorts: (candidatePid, _platform, targetPort, controlGroup) => opts._listeningPortsOverride
+        ? opts._listeningPortsOverride(candidatePid).filter(port => port === targetPort)
+        : findListeningTcpPorts(
+            candidatePid,
+            publicationPlatform,
+            dependencies.spawnSync,
+            publicationProcRoot,
+            targetPort,
+            undefined,
+            controlGroup,
+            publicationSs,
+          ),
+    },
+  });
+  const admitPeer: ManagedDaemonPeerVerifier = mode.kind === "replacement-manager"
+    ? mode.admitManagerPeer
+    : admitProcessPeer;
   const publicDeadline = remainingDeadline();
   if (publicDeadline === null) return undefined;
   const publicHealth = await checkDaemonHealth(opts.port, dependencies.fetch, publicDeadline);
@@ -1823,6 +1736,11 @@ async function captureLifecyclePublicationEvidence(
     )
   ) return undefined;
 
+  const admittedBeforeToken = await admitPeer();
+  if (admittedBeforeToken === null || admittedBeforeToken.pid !== pid || admittedBeforeToken.birth !== birthBefore) {
+    return undefined;
+  }
+
   const tokenBefore = readPublicationToken(tokenPath, scopedState, publicationExpectedUid);
   if (tokenBefore === null) return undefined;
   const authenticatedHealth = await checkDaemonDiagnostics(
@@ -1832,6 +1750,7 @@ async function captureLifecyclePublicationEvidence(
     remainingDeadline,
     publicHealth,
     publicStorageBackend,
+    admitPeer,
     () => {
       const token = readPublicationToken(tokenPath, scopedState, publicationExpectedUid);
       return token === tokenBefore ? token : null;
@@ -1882,6 +1801,7 @@ async function captureLifecyclePublicationEvidence(
     entrypoint: expectedEntrypoint,
     runtimeDigest: authenticatedHealth.runtimeDigest,
     birth: birthBefore,
+    admitPeer,
     token: tokenBefore,
     readToken: () => {
       const token = readPublicationToken(tokenPath, scopedState, publicationExpectedUid);
@@ -1967,6 +1887,7 @@ function createLifecyclePublicationConvergence(
     port: opts.port,
     identity: {
       pid: evidence.pid,
+      birth: evidence.birth,
       version: evidence.version,
       storageBackend: evidence.storageBackend,
       entrypoint: evidence.entrypoint,
@@ -1976,6 +1897,7 @@ function createLifecyclePublicationConvergence(
       now: opts._monotonicNowOverride ?? performance.now.bind(performance),
       sleep,
       fetch,
+      admitPeer: evidence.admitPeer,
       readToken: evidence.readToken,
       readOwner: evidence.readOwner,
       processBirth: (pid, observer, options) => {
@@ -2172,6 +2094,7 @@ export async function ensureDaemon(opts: EnsureDaemonOptions): Promise<EnsureDae
       entrypoint: evidence.expectedEntrypoint,
       runtimeDigest: evidence.expectedRuntimeDigest,
       birth: evidence.birthBefore,
+      admitPeer: evidence.admitPeer,
       token: evidence.token,
       readToken: () => {
         const current = evidence.readToken();
@@ -2308,6 +2231,14 @@ async function ensureDaemonUnlocked(opts: EnsureDaemonOptions): Promise<EnsureDa
       return null;
     }
   };
+  const readAdmissionPeerBirth = (pid: number): string | null => {
+    if (opts._abortSignal?.aborted) return null;
+    try {
+      return processBirthProbe(pid, undefined, { timeoutMs: 100 });
+    } catch {
+      return null;
+    }
+  };
   const captureAdmissionPins = (pid: number): LifecycleAdmissionPins => ({
     birthBefore: readAdmissionBirth(pid),
     tokenBefore: readOwnedToken(tokenPath),
@@ -2335,6 +2266,54 @@ async function ensureDaemonUnlocked(opts: EnsureDaemonOptions): Promise<EnsureDa
   const linuxSsPath = opts._linuxSsPathOverride === undefined
     ? resolveLinuxSsPath()
     : opts._linuxSsPathOverride;
+  const admitPeerWithAuthority = (
+    authority: Parameters<typeof admitManagedDaemonPeer>[0]["authority"],
+  ): ManagedDaemonPeerEvidence | null => admitManagedDaemonPeer({
+    authority,
+    port: opts.port,
+    platform,
+    procRoot,
+    expectedEntrypoint,
+    _seams: {
+      isProcessAlive: isAlive,
+      processBirth: readAdmissionPeerBirth,
+      readProcessCommand: pid => opts._peerProcessCommandOverride?.(pid)
+        ?? readPlatformProcessCommand(
+          pid,
+          platform,
+          dependencies.spawnSync,
+          procRoot,
+          windowsPowerShellPath,
+        ),
+      findListeningTcpPorts: (pid, _platform, targetPort, controlGroup) => opts._listeningPortsOverride
+        ? opts._listeningPortsOverride(pid).filter(port => port === targetPort)
+        : findListeningTcpPorts(
+            pid,
+            platform,
+            dependencies.spawnSync,
+            procRoot,
+            targetPort,
+            undefined,
+            controlGroup,
+            linuxSsPath,
+          ),
+    },
+  });
+  const admitOwnedPeer = (): ManagedDaemonPeerEvidence | null => admitPeerWithAuthority({
+    kind: "pid-file",
+    pidFilePath: opts.pidFilePath,
+    expectedUid: dependencies.uid ?? process.getuid?.(),
+  });
+  const admitManagerPeer = (
+    pid: number,
+    revalidate: () => boolean,
+    systemdControlGroup?: string,
+  ): ManagedDaemonPeerEvidence | null => admitPeerWithAuthority({
+    kind: "manager",
+    pid,
+    revalidate,
+    systemdControlGroup,
+  });
   let restartedForParent = false;
 
   if (testScope && opts.expectedEntrypoint !== undefined && opts.expectedEntrypoint !== testScope.entrypoint) {
@@ -2533,6 +2512,7 @@ async function ensureDaemonUnlocked(opts: EnsureDaemonOptions): Promise<EnsureDa
     warning?: string,
     allowParentWarning = false,
     admissionPins?: LifecycleAdmissionPins,
+    publicationAdmitPeerOverride?: ManagedDaemonPeerVerifier,
   ): Promise<EnsureDaemonResult | null> {
     if (health === null || !endpointIdentityMatches(
       health,
@@ -2569,6 +2549,7 @@ async function ensureDaemonUnlocked(opts: EnsureDaemonOptions): Promise<EnsureDa
         },
         health,
         expectedStorageBackend,
+        admitOwnedPeer,
         readOwnedToken,
       );
       if (!authenticated) return null;
@@ -2596,6 +2577,23 @@ async function ensureDaemonUnlocked(opts: EnsureDaemonOptions): Promise<EnsureDa
         && tokenBefore === tokenAfter
         && result.pid === verifiedHealth.pid
       ) {
+        const publicationAdmitPeer = publicationAdmitPeerOverride ?? (() => {
+          const pid = verifiedHealth.pid;
+          if (pid === undefined) return null;
+          if (
+            opts._managedOperationAuthorized === true
+            && opts._managedOperationManagerPid === pid
+          ) {
+            return admitManagerPeer(
+              pid,
+              () => opts._managedOperationAuthorized === true
+                && opts._managedOperationManagerPid === pid
+                && isAlive(pid),
+              access.alreadyVerified ? access.systemdControlGroup : undefined,
+            );
+          }
+          return admitOwnedPeer();
+        });
         opts._onAuthenticatedDaemonResult?.({
           result,
           health: verifiedHealth,
@@ -2605,6 +2603,7 @@ async function ensureDaemonUnlocked(opts: EnsureDaemonOptions): Promise<EnsureDa
           expectedRuntimeDigest,
           processBirth: processBirthProbe,
           readOwner: readOwnerProbe,
+          admitPeer: publicationAdmitPeer,
           birthBefore,
           birthAfter,
           token: tokenBefore,
@@ -2727,6 +2726,45 @@ async function ensureDaemonUnlocked(opts: EnsureDaemonOptions): Promise<EnsureDa
           linuxSsPath,
         );
     return listenerPorts.includes(opts.port);
+  }
+
+  function sameManagerRegistration(
+    left: SupervisorObservation,
+    right: SupervisorObservation,
+    spec: SupervisorSpec,
+    pid: number,
+  ): boolean {
+    return supervisorMetadataMatches(left, spec)
+      && supervisorMetadataMatches(right, spec)
+      && left.managerPid === pid
+      && right.managerPid === pid
+      && left.scopeDigest === right.scopeDigest
+      && left.nonce === right.nonce
+      && left.name === right.name
+      && left.controlGroup === right.controlGroup;
+  }
+
+  async function admitFreshManagerPeer(
+    supervisor: Supervisor,
+    spec: SupervisorSpec,
+    pid: number,
+  ): Promise<ManagedDaemonPeerEvidence | null> {
+    let before: SupervisorObservation;
+    try {
+      before = await supervisor.probe(spec, { deadline });
+    } catch {
+      return null;
+    }
+    if (!supervisorMetadataMatches(before, spec) || before.managerPid !== pid) return null;
+    const admitted = admitManagerPeer(pid, () => true, before.controlGroup);
+    if (admitted === null) return null;
+    let after: SupervisorObservation;
+    try {
+      after = await supervisor.probe(spec, { deadline });
+    } catch {
+      return null;
+    }
+    return sameManagerRegistration(before, after, spec, pid) ? admitted : null;
   }
 
   function observedCredentialMetadataIsSafe(
@@ -3316,6 +3354,9 @@ async function ensureDaemonUnlocked(opts: EnsureDaemonOptions): Promise<EnsureDa
       remainingRequestDeadline,
       health,
       publicStorageBackend,
+      () => health.pid === undefined
+        ? null
+        : admitFreshManagerPeer(supervisor, requestedSpec, health.pid),
       readOwnedToken,
     );
     if (authenticated === null) {
@@ -3348,6 +3389,9 @@ async function ensureDaemonUnlocked(opts: EnsureDaemonOptions): Promise<EnsureDa
       undefined,
       true,
       admissionPins,
+      () => authenticated.pid === undefined
+        ? null
+        : admitFreshManagerPeer(supervisor, requestedSpec, authenticated.pid),
     );
     return accepted ?? refusalResult("response-invalid", "managed daemon identity could not be admitted", { pid: observation.managerPid });
   }
@@ -3473,6 +3517,9 @@ async function ensureDaemonUnlocked(opts: EnsureDaemonOptions): Promise<EnsureDa
               remainingRequestDeadline,
               health,
               storage,
+              () => health.pid === undefined
+                ? null
+                : admitFreshManagerPeer(supervisor, launchSpec, health.pid),
               readOwnedToken,
             );
             if (authenticated !== null) {
@@ -3513,6 +3560,9 @@ async function ensureDaemonUnlocked(opts: EnsureDaemonOptions): Promise<EnsureDa
                 undefined,
                 true,
                 admissionPins,
+                () => authenticated.pid === undefined
+                  ? null
+                  : admitFreshManagerPeer(supervisor, launchSpec, authenticated.pid),
               );
               if (accepted) {
                 if (managedCredentialDirectoryForCleanup !== undefined) {
@@ -3644,6 +3694,7 @@ async function ensureDaemonUnlocked(opts: EnsureDaemonOptions): Promise<EnsureDa
           remainingRequestDeadline,
           health,
           publicStorageBackend,
+          admitOwnedPeer,
           readOwnedToken,
         )
       : null;
@@ -3741,6 +3792,7 @@ async function ensureDaemonUnlocked(opts: EnsureDaemonOptions): Promise<EnsureDa
                 remainingRequestDeadline,
                 retry,
                 retryPublicStorageBackend,
+                admitOwnedPeer,
                 readOwnedToken,
               )
             : null;
@@ -4232,6 +4284,64 @@ async function restartDaemonUnlocked(
       return null;
     }
   };
+  const readRecoveryPeerBirth = (pid: number): string | null => {
+    if (opts._abortSignal?.aborted) return null;
+    try {
+      return processBirthProbe(pid, undefined, { timeoutMs: 100 });
+    } catch {
+      return null;
+    }
+  };
+  const admitRestartPeerWithAuthority = (
+    authority: Parameters<typeof admitManagedDaemonPeer>[0]["authority"],
+  ): ManagedDaemonPeerEvidence | null => admitManagedDaemonPeer({
+    authority,
+    port: opts.port,
+    platform,
+    procRoot,
+    expectedEntrypoint,
+    _seams: {
+      isProcessAlive: isAlive,
+      processBirth: readRecoveryPeerBirth,
+      readProcessCommand: pid => opts._peerProcessCommandOverride?.(pid)
+        ?? (_isManagedProcessOverride?.(pid)
+          ? `node ${expectedEntrypoint ?? "lcm"} daemon start`
+          : readPlatformProcessCommand(
+            pid,
+            platform,
+            dependencies.spawnSync,
+            procRoot,
+            windowsPowerShellPath,
+          )),
+      findListeningTcpPorts: (pid, _platform, targetPort, controlGroup) => opts._listeningPortsOverride
+        ? opts._listeningPortsOverride(pid).filter(port => port === targetPort)
+        : findListeningTcpPorts(
+            pid,
+            platform,
+            dependencies.spawnSync,
+            procRoot,
+            targetPort,
+            undefined,
+            controlGroup,
+            linuxSsPath,
+          ),
+    },
+  });
+  const admitRestartOwnedPeer = (): ManagedDaemonPeerEvidence | null => admitRestartPeerWithAuthority({
+    kind: "pid-file",
+    pidFilePath: opts.pidFilePath,
+    expectedUid: dependencies.uid ?? process.getuid?.(),
+  });
+  const admitRestartManagerPeer = (
+    pid: number,
+    revalidate: () => boolean,
+    systemdControlGroup?: string,
+  ): ManagedDaemonPeerEvidence | null => admitRestartPeerWithAuthority({
+    kind: "manager",
+    pid,
+    revalidate,
+    systemdControlGroup,
+  });
   async function isAuthenticatedDaemonAtPort(port: number, pid: number): Promise<boolean> {
     const healthDeadline = remainingVerificationDeadline();
     if (!healthDeadline) return false;
@@ -4251,6 +4361,10 @@ async function restartDaemonUnlocked(
       remainingVerificationDeadline,
       health,
       currentStorageBackend,
+      () => {
+        const admitted = admitRestartOwnedPeer();
+        return admitted?.pid === pid ? admitted : null;
+      },
       readOwnedToken,
     );
     return authenticatedHealth !== null
@@ -4405,11 +4519,43 @@ async function restartDaemonUnlocked(
       const managerPidIsValid = managerPid !== undefined
         && Number.isSafeInteger(managerPid)
         && managerPid > 0;
+      const admitReplacementManagerPeer: ManagedDaemonPeerVerifier = async () => {
+        if (!managerPidIsValid || managerPid === undefined || admittedSpec === undefined) return null;
+        let before: SupervisorObservation;
+        try {
+          before = await supervisor.probe(admittedSpec, { deadline: verificationDeadline });
+        } catch {
+          return null;
+        }
+        if (
+          before.kind !== "registered-running-valid"
+          || before.scopeDigest !== admittedSpec.scopeDigest
+          || before.nonce !== admittedSpec.nonce
+          || before.name !== admittedSpec.name
+          || before.managerPid !== managerPid
+        ) return null;
+        const admitted = admitRestartManagerPeer(managerPid, () => true, before.controlGroup);
+        if (admitted === null) return null;
+        let after: SupervisorObservation;
+        try {
+          after = await supervisor.probe(admittedSpec, { deadline: verificationDeadline });
+        } catch {
+          return null;
+        }
+        return after.kind === "registered-running-valid"
+          && after.scopeDigest === before.scopeDigest
+          && after.nonce === before.nonce
+          && after.name === before.name
+          && after.managerPid === before.managerPid
+          && after.controlGroup === before.controlGroup
+          ? admitted
+          : null;
+      };
       const initialPublicationWrap = managerPidIsValid
         && _restartPublicationRetryBudget !== undefined
         ? restartPublicationWrapper(
             opts,
-            { kind: "replacement-manager", managerPid },
+            { kind: "replacement-manager", managerPid, admitManagerPeer: admitReplacementManagerPeer },
             _restartPublicationRetryBudget,
           )
         : undefined;
@@ -4575,6 +4721,10 @@ async function restartDaemonUnlocked(
       }
       const storage = recognizedHealthStorageBackend(publicHealth);
       if (storage === null) return legacyRefusal("response-invalid", "legacy daemon reported an unknown storage backend", pid);
+      const admittedPeer = admitRestartOwnedPeer();
+      if (admittedPeer === null || admittedPeer.pid !== pid) {
+        return legacyRefusal("invalid-collision", "legacy daemon peer ownership could not be admitted before authentication", pid);
+      }
       const tokenEvidence = readLegacyTokenEvidence(tokenPath);
       if (tokenEvidence.kind !== "present") {
         return legacyRefusal("response-auth-failure", "legacy daemon token evidence was missing or unsafe", pid);
@@ -4586,6 +4736,7 @@ async function restartDaemonUnlocked(
         remainingVerificationDeadline,
         publicHealth,
         storage,
+        admitRestartOwnedPeer,
         (path: string) => {
           const current = readLegacyTokenEvidence(path);
           return current.kind === "present" ? current.token : null;
@@ -4720,6 +4871,38 @@ async function restartDaemonUnlocked(
         && second.name === spec.name
         && second.managerPid === managerPid;
     };
+    const admitCurrentManagerPeer: ManagedDaemonPeerVerifier = async () => {
+      if (managerPid === undefined) return null;
+      let before: SupervisorObservation;
+      try {
+        before = await supervisor.probe(spec, { deadline: verificationDeadline });
+      } catch {
+        return null;
+      }
+      if (
+        before.kind !== "registered-running-valid"
+        || before.scopeDigest !== spec.scopeDigest
+        || before.nonce !== (observation.nonce ?? spec.nonce)
+        || before.name !== spec.name
+        || before.managerPid !== managerPid
+      ) return null;
+      const admitted = admitRestartManagerPeer(managerPid, () => true, before.controlGroup);
+      if (admitted === null) return null;
+      let after: SupervisorObservation;
+      try {
+        after = await supervisor.probe(spec, { deadline: verificationDeadline });
+      } catch {
+        return null;
+      }
+      return after.kind === "registered-running-valid"
+        && after.scopeDigest === before.scopeDigest
+        && after.nonce === before.nonce
+        && after.name === before.name
+        && after.managerPid === before.managerPid
+        && after.controlGroup === before.controlGroup
+        ? admitted
+        : null;
+    };
     const remainingHealthDeadline = remainingVerificationDeadline();
     if (!remainingHealthDeadline) {
       if (currentContention !== undefined) throw currentContention;
@@ -4840,6 +5023,7 @@ async function restartDaemonUnlocked(
         remainingVerificationDeadline,
         health,
         storage,
+        admitCurrentManagerPeer,
         readOwnedToken,
       );
       if (authenticated === null) return restartRefusal("response-auth-failure", "managed daemon health could not be authenticated; refusing restart", { pid: managerPid });

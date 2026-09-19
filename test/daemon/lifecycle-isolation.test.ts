@@ -250,6 +250,8 @@ function scopedOptions(fixture: ScopeFixture): Parameters<typeof ensureDaemon>[0
     _testScope: fixture.scope,
     _skipHealthWait: true,
     _supervisorOverride: fixture.supervisor as never,
+    _processStartTimeForTesting: pid => `birth-${String(pid)}`,
+    _peerProcessCommandOverride: () => `node ${fixture.scope.entrypoint} daemon start --foreground`,
   };
 }
 
@@ -1364,6 +1366,8 @@ describe("daemon lifecycle test-scope validation", () => {
         _fetchOverride: fetchHealthy as never,
         _isProcessAliveOverride: () => true,
         _listeningPortsOverride: () => [37_351],
+        _processStartTimeForTesting: pid => `birth-${String(pid)}`,
+        _peerProcessCommandOverride: () => `node ${fixture.scope.entrypoint} daemon start --foreground`,
         _monotonicNowOverride: () => 0,
         _skipSpawn: true,
       })).resolves.toMatchObject({
@@ -1390,7 +1394,7 @@ describe("daemon lifecycle test-scope validation", () => {
           : { ok: true, status: 200, json: async () => ({}) }
       ));
       const processIdentity = vi.fn((command: string) => command === "/bin/ps"
-        ? { status: 0, stdout: "node lcm daemon start --foreground\n", stderr: "" }
+        ? { status: 0, stdout: `node ${fixture.scope.entrypoint} daemon start --foreground\n`, stderr: "" }
         : { status: 0, stdout: "", stderr: "" });
       await expect(restartDaemon({
         port: 37_352,
@@ -1405,6 +1409,7 @@ describe("daemon lifecycle test-scope validation", () => {
         _killOverride: kill,
         _sleepOverride: async () => undefined,
         _listeningPortsOverride: () => [37_352],
+        _processStartTimeForTesting: pid => `birth-${String(pid)}`,
         _monotonicNowOverride: () => 0,
         _ensureDaemonOverride: async () => ({
           connected: false,
@@ -2302,7 +2307,7 @@ describe("run-owned lifecycle resources", () => {
       startMethod: "systemd-user" as const,
     }));
     fixture.runSystemd.mockImplementation((command: string) => command === "/bin/ps"
-      ? { status: 0, stdout: "node lcm daemon start --foreground\n", stderr: "" }
+      ? { status: 0, stdout: `node ${fixture.scope.entrypoint} daemon start --foreground\n`, stderr: "" }
       : { status: 0, stdout: "", stderr: "" });
     await expect(restartDaemon({
       ...scopedOptions(fixture),

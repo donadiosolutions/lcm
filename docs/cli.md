@@ -236,6 +236,16 @@ configuration witness must remain unchanged.
 This lets ordinary reads continue while a publication consumer holds the
 exclusive lock without reusing a stale packaged daemon after a rebuild.
 
+Before the token existence check and before every request, these commands also
+require credential-free local proof that the managed daemon PID is live, has a
+stable process birth, is an LCM daemon process, and owns the configured
+`127.0.0.1` listener. Public or authenticated HTTP metadata can reject this
+local identity but cannot create it. Search, grep, describe, expand, and store
+use the same request-time boundary, including after lifecycle fallback. If the
+platform cannot inspect the process or listener, the fast path sends neither an
+Authorization header nor a protected request body and uses the existing safe
+fallback or refusal. See [Daemon safety](configuration.md#daemon-safety).
+
 Authenticated daemon read responses are buffered until request-time admission
 is repeated after the handler finishes. LCM compares both the configuration
 witness and terminal publication-journal checksum before releasing up to 10 MiB

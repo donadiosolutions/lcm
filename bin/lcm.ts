@@ -87,6 +87,7 @@ import type {
 import { CONNECTOR_TRANSPORTS } from "../src/connectors/types.js";
 import { createAbortError, isAbortError, throwIfAborted } from "../src/daemon/cancellation.js";
 import { SUPERVISOR_DAEMON_TEMP_CREATION_WARNING } from "../src/daemon/supervisor.js";
+import { admitManagedDaemonPeer } from "../src/daemon/peer-admission.js";
 
 function readStdin(): Promise<string> {
   return new Promise((resolve) => {
@@ -2188,6 +2189,21 @@ type DaemonClientWithConfig = Readonly<{
   health?: DaemonHealth;
 }>;
 
+function verifyManagedDaemonPeer(port: number, pidFilePath: string): void {
+  const evidence = admitManagedDaemonPeer({
+    authority: {
+      kind: "pid-file",
+      pidFilePath,
+      expectedUid: process.getuid?.(),
+    },
+    port,
+    expectedEntrypoint: PACKAGED_RUNTIME_ENTRYPOINT,
+  });
+  if (evidence === null) {
+    throw new Error("Daemon peer ownership could not be verified.");
+  }
+}
+
 async function createDaemonClientOrExitWithConfig(): Promise<DaemonClientWithConfig> {
   const { ensureDaemon } = await import("../src/daemon/lifecycle.js");
   const { loadDaemonConfig } = await import("../src/daemon/config.js");
@@ -2199,6 +2215,7 @@ async function createDaemonClientOrExitWithConfig(): Promise<DaemonClientWithCon
   const port = config.daemon?.port ?? 3737;
   const pidFilePath = daemonPidPath();
   const tokenPath = daemonTokenPath();
+  let verifyLifecyclePeer: (() => Promise<void>) | undefined;
   let result: LifecycleResultWithRefusal & { connected: boolean };
   try {
     result = await ensureDaemon({
@@ -2207,6 +2224,20 @@ async function createDaemonClientOrExitWithConfig(): Promise<DaemonClientWithCon
       spawnTimeoutMs: 5000,
       expectedStorageBackend: config.storage.backend,
       enforceUserManagerParent: true,
+      _onAuthenticatedDaemonResult: (evidence) => {
+        const expectedPid = evidence.health.pid;
+        const expectedBirth = evidence.birthBefore;
+        verifyLifecyclePeer = async () => {
+          const admitted = await evidence.admitPeer();
+          if (
+            admitted === null
+            || admitted.pid !== expectedPid
+            || admitted.birth !== expectedBirth
+          ) {
+            throw new Error("Daemon peer ownership changed after lifecycle admission.");
+          }
+        };
+      },
     });
   } catch {
     console.error(`  ${daemonUnavailableMessage(undefined, "ambiguous")}`);
@@ -2220,7 +2251,10 @@ async function createDaemonClientOrExitWithConfig(): Promise<DaemonClientWithCon
   clearDaemonRemediationMarker();
 
   return {
-    client: new DaemonClient(`http://127.0.0.1:${port}`, tokenPath),
+    client: new DaemonClient(`http://127.0.0.1:${port}`, tokenPath, {
+      verifyProtectedRequest: verifyLifecyclePeer
+        ?? (() => verifyManagedDaemonPeer(port, pidFilePath)),
+    }),
     config,
   };
 }
@@ -2237,39 +2271,42 @@ async function createDaemonReadClientOrExit(
   try {
     const first = readDaemonConfigSnapshot(configPath);
     const tokenPath = daemonTokenPath();
+    const port = first.config.daemon.port;
+    const pidFilePath = daemonPidPath();
+    verifyManagedDaemonPeer(port, pidFilePath);
     const { readAuthToken } = await import("../src/daemon/auth.js");
     const token = readAuthToken(tokenPath);
-    if (typeof token === "string" && token.length > 0) {
-      const port = first.config.daemon.port;
-      const client = new DaemonClient(`http://127.0.0.1:${port}`, tokenPath);
-      const health = options.diagnosticOnly
-        ? await client.observe({ timeoutMs: 2000 })
-        : await client.health();
+    if (token === null || token.length === 0) throw new Error("Daemon token is unavailable.");
+    const client = new DaemonClient(`http://127.0.0.1:${port}`, tokenPath, {
+      verifyProtectedRequest: () => verifyManagedDaemonPeer(port, pidFilePath),
+    });
+    const health = options.diagnosticOnly
+      ? await client.observe({ timeoutMs: 2000 })
+      : await client.health();
+    if (
+      (health?.status === "ok" || health?.status === "healthy")
+      && typeof PKG_VERSION === "string"
+      && health.version === PKG_VERSION
+      && health.storageBackend === first.config.storage.backend
+      && typeof health.entrypoint === "string"
+      && health.entrypoint.length > 0
+      && PACKAGED_RUNTIME_ENTRYPOINT !== undefined
+      && daemonEntrypointMatches(
+        health.entrypoint,
+        PACKAGED_RUNTIME_ENTRYPOINT,
+        process.platform,
+      )
+      && typeof health.runtimeDigest === "string"
+      && health.runtimeDigest.length > 0
+      && RUNTIME_DIGEST !== undefined
+      && health.runtimeDigest === RUNTIME_DIGEST
+    ) {
+      const second = readDaemonConfigSnapshot(configPath);
       if (
-        (health?.status === "ok" || health?.status === "healthy")
-        && typeof PKG_VERSION === "string"
-        && health.version === PKG_VERSION
-        && health.storageBackend === first.config.storage.backend
-        && typeof health.entrypoint === "string"
-        && health.entrypoint.length > 0
-        && PACKAGED_RUNTIME_ENTRYPOINT !== undefined
-        && daemonEntrypointMatches(
-          health.entrypoint,
-          PACKAGED_RUNTIME_ENTRYPOINT,
-          process.platform,
-        )
-        && typeof health.runtimeDigest === "string"
-        && health.runtimeDigest.length > 0
-        && RUNTIME_DIGEST !== undefined
-        && health.runtimeDigest === RUNTIME_DIGEST
+        second.config.storage.backend === first.config.storage.backend
+        && daemonConfigSnapshotWitnessEqual(first.witness, second.witness)
       ) {
-        const second = readDaemonConfigSnapshot(configPath);
-        if (
-          second.config.storage.backend === first.config.storage.backend
-          && daemonConfigSnapshotWitnessEqual(first.witness, second.witness)
-        ) {
-          return { client, config: second.config, health };
-        }
+        return { client, config: second.config, health };
       }
     }
   } catch {

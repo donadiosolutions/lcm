@@ -1,4 +1,4 @@
-import { describe, it, expect, afterEach } from "vitest";
+import { describe, it, expect, afterEach, vi } from "vitest";
 import { mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -117,6 +117,108 @@ describe("DaemonClient", () => {
   it("rejects unknown daemon routes", async () => {
     const client = new DaemonClient("http://127.0.0.1:19999");
     await expect(client.get("http://169.254.169.254/latest")).rejects.toThrow(/route/i);
+  });
+
+  it("refuses every protected request before reading credentials when peer admission fails", async () => {
+    let requestCount = 0;
+    const server = createServer((_request, response) => {
+      requestCount++;
+      response.writeHead(200, { "Content-Type": "application/json" });
+      response.end(JSON.stringify({ status: "ok" }));
+    });
+    await new Promise<void>((resolve) => server.listen(0, "127.0.0.1", resolve));
+
+    try {
+      const address = server.address();
+      if (address === null || typeof address === "string") throw new Error("expected TCP server address");
+      const readToken = vi.fn(() => "must-not-be-read");
+      const verifier = vi.fn(() => { throw new Error("daemon peer is not admitted"); });
+      const client = new DaemonClient(
+        `http://127.0.0.1:${address.port}`,
+        "/unused/token",
+        { verifyProtectedRequest: verifier, _readToken: readToken },
+      );
+
+      await expect(client.health()).resolves.toBeNull();
+      await expect(client.observe()).resolves.toBeNull();
+      await expect(client.get("/stats/pool")).rejects.toThrow("daemon peer is not admitted");
+      await expect(client.post("/store", { content: "secret body" })).rejects.toThrow("daemon peer is not admitted");
+      expect(verifier).toHaveBeenCalledTimes(4);
+      expect(readToken).not.toHaveBeenCalled();
+      expect(requestCount).toBe(0);
+    } finally {
+      await new Promise<void>((resolve, reject) => server.close((error) => error ? reject(error) : resolve()));
+    }
+  });
+
+  it("re-admits the peer before each request while caching only the token", async () => {
+    const requests: Array<Readonly<{ authorization?: string; body: string }>> = [];
+    const server = createServer((request, response) => {
+      let body = "";
+      request.setEncoding("utf8");
+      request.on("data", chunk => { body += chunk; });
+      request.on("end", () => {
+        requests.push({ authorization: request.headers.authorization, body });
+        response.writeHead(200, { "Content-Type": "application/json" });
+        response.end(JSON.stringify({ ok: true }));
+      });
+    });
+    await new Promise<void>((resolve) => server.listen(0, "127.0.0.1", resolve));
+
+    try {
+      const address = server.address();
+      if (address === null || typeof address === "string") throw new Error("expected TCP server address");
+      const readToken = vi.fn(() => "stable-token");
+      const verifier = vi.fn(async () => undefined);
+      const client = new DaemonClient(
+        `http://127.0.0.1:${address.port}`,
+        "/unused/token",
+        { verifyProtectedRequest: verifier, _readToken: readToken },
+      );
+
+      await expect(client.get("/stats/pool")).resolves.toEqual({ ok: true });
+      await expect(client.post("/store", { secret: "body" })).resolves.toEqual({ ok: true });
+      expect(verifier).toHaveBeenCalledTimes(4);
+      expect(readToken).toHaveBeenCalledOnce();
+      expect(requests).toEqual([
+        { authorization: "Bearer stable-token", body: "" },
+        { authorization: "Bearer stable-token", body: JSON.stringify({ secret: "body" }) },
+      ]);
+    } finally {
+      await new Promise<void>((resolve, reject) => server.close((error) => error ? reject(error) : resolve()));
+    }
+  });
+
+  it("re-admits after the first token read and sends nothing when ownership changed", async () => {
+    let requestCount = 0;
+    let admitted = true;
+    const server = createServer((_request, response) => {
+      requestCount++;
+      response.end(JSON.stringify({ ok: true }));
+    });
+    await new Promise<void>((resolve) => server.listen(0, "127.0.0.1", resolve));
+    try {
+      const address = server.address();
+      if (address === null || typeof address === "string") throw new Error("expected TCP server address");
+      const client = new DaemonClient(
+        `http://127.0.0.1:${address.port}`,
+        "/unused/token",
+        {
+          verifyProtectedRequest: () => {
+            if (!admitted) throw new Error("daemon peer changed after token read");
+          },
+          _readToken: () => {
+            admitted = false;
+            return "must-not-send";
+          },
+        },
+      );
+      await expect(client.post("/store", { secret: "body" }))
+        .rejects.toThrow("daemon peer changed after token read");
+      expect(requestCount).toBe(0);
+    } finally {
+      await new Promise<void>((resolve, reject) => server.close(error => error ? reject(error) : resolve()));
+    }
   });
 
   it("uses the auth token for protected GET routes", async () => {

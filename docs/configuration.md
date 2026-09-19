@@ -1101,10 +1101,14 @@ storage readiness stays explicitly unverified. Pending queues therefore warn
 that queue draining is unverified. Authenticated active `GET /health` continues
 to probe storage readiness for lifecycle callers.
 
-Before sending the bearer token or admitting a daemon for ordinary use,
-lifecycle checks require the public `/health` PID and installed version, a
-recognized active storage backend, the PID file, process liveness, and exact
-`127.0.0.1` listener ownership to agree. Authenticated full health and
+Before reading or sending the bearer token, covered CLI reads and stores,
+installation convergence, doctor, and lifecycle checks first establish a local
+managed-peer identity without using HTTP response fields as authority. The
+evidence is either the owner-checked, single-link daemon PID file or an exact
+current service-manager operation. LCM then pins process liveness and birth,
+recognizes an LCM daemon command, proves that exact process owns the configured
+`127.0.0.1` listener, and repeats the proof immediately before each protected
+request. Authenticated full health and
 `/stats/pool` then verify authenticated access; the entrypoint identity is
 checked through authenticated health, while pool diagnostics omit paths. An
 occupied port with missing or unverifiable identity is rejected rather than
@@ -1113,6 +1117,17 @@ so selecting PostgreSQL cannot silently reuse an existing SQLite process.
 The PID, PID-file, and listener observations in this admission check are
 consistency evidence for a responsive managed service; they are never offline
 authority to signal or replace a process.
+
+Peer inspection is fail closed. Linux uses bounded `/proc` socket ownership;
+the `ss` fallback is accepted only for an exact managed-service cgroup. macOS
+uses `/bin/ps` and `/usr/sbin/lsof`. Windows uses trusted System32 PowerShell
+and `netstat.exe` paths. Missing tools, unreadable process state, unsafe PID
+files, changed process birth, listener replacement, or ambiguous manager state
+prevent credential transmission. Run `lcm doctor` to inspect the refusal and
+restore the platform tool or managed service evidence; do not start another
+daemon on the occupied port. The inspection and subsequent TCP connection are
+not an atomic kernel operation, so LCM rechecks as late as the supported APIs
+permit but does not claim cryptographic socket-to-process binding.
 If bounded health checks remain unavailable while the exact PID-file process is
 still a live likely-LCM process and still owns the configured listener,
 lifecycle admission reports `connected: false` with a busy/unavailable warning

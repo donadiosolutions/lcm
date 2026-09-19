@@ -122,6 +122,8 @@ const expectedComponents = [
       "^src/daemon/invocation-coordinator\\.ts$",
       "^src/daemon/cancellation\\.ts$",
       "^src/daemon/orientation\\.ts$",
+      // G002 keeps credential-free managed-peer admission daemon-core-owned.
+      "^src/daemon/peer-admission\\.ts$",
       "^src/daemon/project-queue\\.ts$",
       "^src/daemon/publication-queue\\.ts$",
       // #1270/#1283 keep renewed hook identity selection daemon-core-owned.
@@ -592,7 +594,7 @@ describe("Codecov configuration", () => {
       expect(isSafeOwnershipPath(path)).toBe(true);
     }
 
-    expect(productionFiles).toHaveLength(243);
+    expect(productionFiles).toHaveLength(244);
 
     for (const component of validateComponents(components)) {
       expect(filesMatchedByComponent(component, productionFiles).length).toBeGreaterThan(0);
@@ -622,7 +624,7 @@ describe("Codecov configuration", () => {
 
     expect(unownedFiles).toEqual([]);
     expect(multiplyOwnedFiles).toEqual([]);
-    expect(ownershipCounts.size).toBe(243);
+    expect(ownershipCounts.size).toBe(244);
   });
 
   test("keeps response-fence and #681/#700/#701/#703/#705/#709/#710/#713/#756/#726/#734/#737/#742/#760/#763/#804/#805/#824/#825/#833/#888/#864/#866/#722/#786/#952/#814/#882/#930/#969/#989/#1003/#1049/#964/#1106/#1191/#1196/#1229/#1321/#1338/#1353/#1354/#1358 files in their intended components", () => {
@@ -703,6 +705,7 @@ describe("Codecov configuration", () => {
       ["installer/install.ts", "unit-installation"],
       // #1201 observation parser/client, allowlist and server retain daemon-core ownership.
       ["src/daemon/client.ts", "unit-daemon-core"],
+      ["src/daemon/peer-admission.ts", "unit-daemon-core"],
       ["src/daemon/http-url.ts", "unit-daemon-core"],
       ["src/daemon/config.ts", "unit-daemon-core"],
       ["src/daemon/project.ts", "unit-daemon-core"],

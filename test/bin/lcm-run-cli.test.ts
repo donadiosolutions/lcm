@@ -123,6 +123,7 @@ const state = vi.hoisted(() => ({
   runtimeHome: "/lcm",
   runtimePidPath: "/lcm/daemon.pid",
   runtimeTokenPath: "/lcm/daemon.token",
+  peerEvidence: { pid: 42, birth: "birth" } as { pid: number; birth: string } | null,
   migrateLegacyHome: vi.fn(),
   install: vi.fn(async () => undefined),
   createInstallerPublicationConvergence: vi.fn(),
@@ -250,14 +251,43 @@ vi.mock("../../src/runtime-paths.js", async importOriginal => ({
   migrateLegacyHomeIfNeeded: state.migrateLegacyHome,
   projectsDir: () => `${state.runtimeHome}/projects`,
 }));
+vi.mock("../../src/daemon/peer-admission.js", () => ({
+  admitManagedDaemonPeer: vi.fn(() => state.peerEvidence),
+}));
 vi.mock("../../src/daemon/client.js", () => ({
   DaemonClient: class {
-    post = state.post;
-    get = state.get;
-    health = state.health;
-    observe = state.observe;
-    constructor() {
+    private readonly verify?: () => void | Promise<void>;
+    post = async (...args: unknown[]) => {
+      await this.verify?.();
+      await this.verify?.();
+      return await Reflect.apply(state.post, state, args);
+    };
+    get = async (...args: unknown[]) => {
+      await this.verify?.();
+      await this.verify?.();
+      return await Reflect.apply(state.get, state, args);
+    };
+    health = async (...args: unknown[]) => {
+      try {
+        await this.verify?.();
+        await this.verify?.();
+        return await Reflect.apply(state.health, state, args);
+      } catch {
+        return null;
+      }
+    };
+    observe = async (...args: unknown[]) => {
+      try {
+        await this.verify?.();
+        await this.verify?.();
+        return await Reflect.apply(state.observe, state, args);
+      } catch {
+        return null;
+      }
+    };
+    constructor(_baseUrl: string, _tokenPath?: string, security?: { verifyProtectedRequest?: () => void | Promise<void> }) {
       state.daemonClientInstances++;
+      this.verify = security?.verifyProtectedRequest;
     }
   },
 }));
@@ -414,13 +444,14 @@ function makeTestConvergence(
   let now = 0;
   return createPublicationConvergence({
     port: 3737,
-    identity: { pid: 42, version: "1.4.2", storageBackend: "sqlite", entrypoint: "/daemon", runtimeDigest: "runtime" },
+    identity: { pid: 42, birth: "birth", version: "1.4.2", storageBackend: "sqlite", entrypoint: "/daemon", runtimeDigest: "runtime" },
     deps: {
       now: () => now,
       sleep: async (delayMs: number) => { now += delayMs; },
       readToken: () => "token",
       readOwner,
       processBirth: () => "birth",
+      admitPeer: () => ({ pid: 42, birth: "birth" }),
       lockPath: "/tmp/publication.lock",
       fetch: vi.fn(async () => ({ ok: true, json: async () => ({
         status: "ok", pid: 42, version: "1.4.2", storageBackend: "sqlite",
@@ -541,6 +572,7 @@ beforeEach(() => {
   state.listCliProjects.mockImplementation(async () => state.cliProjects);
   state.packagedRuntimeEntrypoint = "/daemon";
   state.runtimeDigest = "runtime";
+  state.peerEvidence = { pid: 42, birth: "birth" };
   state.provisionResult = {
     applied: ["0001_migration_ledger"],
     current: ["0001_migration_ledger"],
@@ -568,11 +600,12 @@ describe("runCli registration and help dispatch", () => {
   it("creates one convergence and passes it to top-level install", async () => {
     const convergence = createPublicationConvergence({
       port: 3737,
-      identity: { pid: 42, version: "1.4.2", storageBackend: "sqlite", entrypoint: "/daemon", runtimeDigest: "runtime" },
+      identity: { pid: 42, birth: "birth", version: "1.4.2", storageBackend: "sqlite", entrypoint: "/daemon", runtimeDigest: "runtime" },
       deps: {
         readToken: () => "token",
         readOwner: () => ({ version: 1, pid: 42, processStartTime: "birth", nonce: "a".repeat(32) }),
         processBirth: () => "birth",
+        admitPeer: () => ({ pid: 42, birth: "birth" }),
         lockPath: "/tmp/publication.lock",
         fetch: vi.fn(async () => ({ ok: true, json: async () => ({ status: "ok", pid: 42, version: "1.4.2", storageBackend: "sqlite", entrypoint: "/daemon", runtimeDigest: "runtime" }) })) as unknown as typeof globalThis.fetch,
       },
@@ -622,12 +655,13 @@ describe("runCli registration and help dispatch", () => {
   it("reuses the preAction convergence for config reads and prints once", async () => {
     const convergence = createPublicationConvergence({
       port: 3737,
-      identity: { pid: 42, version: "1.4.2", storageBackend: "sqlite", entrypoint: "/daemon", runtimeDigest: "runtime" },
+      identity: { pid: 42, birth: "birth", version: "1.4.2", storageBackend: "sqlite", entrypoint: "/daemon", runtimeDigest: "runtime" },
       deps: {
         sleep: async () => undefined,
         readToken: () => "token",
         readOwner: () => ({ version: 1, pid: 42, processStartTime: "birth", nonce: "a".repeat(32) }),
         processBirth: () => "birth",
+        admitPeer: () => ({ pid: 42, birth: "birth" }),
         lockPath: "/tmp/publication.lock",
         fetch: vi.fn(async () => ({ ok: true, json: async () => ({
           status: "ok", pid: 42, version: "1.4.2", storageBackend: "sqlite",
@@ -653,13 +687,14 @@ describe("runCli registration and help dispatch", () => {
     let sleeps = 0;
     const convergence = createPublicationConvergence({
       port: 3737,
-      identity: { pid: 42, version: "1.4.2", storageBackend: "sqlite", entrypoint: "/daemon", runtimeDigest: "runtime" },
+      identity: { pid: 42, birth: "birth", version: "1.4.2", storageBackend: "sqlite", entrypoint: "/daemon", runtimeDigest: "runtime" },
       deps: {
         now: () => now,
         sleep: async () => { sleeps += 1; now = sleeps === 1 ? 1_990 : 2_000; },
         readToken: () => "token",
         readOwner: () => ({ version: 1, pid: 42, processStartTime: "birth", nonce: "a".repeat(32) }),
         processBirth: () => "birth",
+        admitPeer: () => ({ pid: 42, birth: "birth" }),
         lockPath: "/tmp/publication.lock",
         fetch: vi.fn(async () => ({ ok: true, json: async () => ({
           status: "ok", pid: 42, version: "1.4.2", storageBackend: "sqlite",
@@ -1523,6 +1558,28 @@ describe("runCli daemon-backed and utility actions", () => {
 
     expect(migrate).toHaveBeenCalledOnce();
     expect(state.ensureDaemon).toHaveBeenCalledOnce();
+  });
+
+  it("retains manager-authorized peer evidence on the lifecycle fallback client", async () => {
+    state.peerEvidence = null;
+    const admitPeer = vi.fn(async () => ({ pid: 42, birth: "manager-birth" }));
+    state.ensureDaemon.mockImplementationOnce(async (options: {
+      _onAuthenticatedDaemonResult?: (evidence: unknown) => void;
+    }) => {
+      options._onAuthenticatedDaemonResult?.({
+        health: { pid: 42 },
+        birthBefore: "manager-birth",
+        admitPeer,
+      });
+      return { connected: true, spawned: false, restartedForParent: false, pid: 42 };
+    });
+
+    expect(await invoke(["search", "query"], {
+      migrate: vi.fn(),
+      sleep: async () => undefined,
+    })).toBeUndefined();
+    expect(admitPeer).toHaveBeenCalledTimes(2);
+    expect(state.post).toHaveBeenCalledOnce();
   });
 
   it("falls back to authenticated migration when store preflight cannot authorize", async () => {

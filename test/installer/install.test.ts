@@ -2113,11 +2113,31 @@ describe("installer publication admission integration", () => {
     return {
       fetch,
       readToken: () => "token",
+      admitPeer: () => ({ pid: process.pid, birth: "birth" }),
       _expectedVersionForTesting: expectedVersion,
       _expectedEntrypointForTesting: expectedEntrypoint,
       _expectedRuntimeDigestForTesting: expectedRuntimeDigest,
     } as const;
   }
+
+  it("does not read or transmit the token when installer peer admission fails", async () => {
+    const home = mkdtempSync(join(tmpdir(), "lcm-installer-peer-refusal-"));
+    const configPath = join(home, "config.json");
+    fsWriteFileSync(configPath, '{"daemon":{"port":3737}}', { mode: 0o600 });
+    const readToken = vi.fn(() => "must-not-be-read");
+    const fetch = healthyFetch();
+    try {
+      await expect(createInstallerPublicationConvergence(configPath, {
+        ...healthyFactorySeams(fetch),
+        admitPeer: () => null,
+        readToken,
+      })).resolves.toMatchObject({ identity: undefined });
+      expect(readToken).not.toHaveBeenCalled();
+      expect(fetch).not.toHaveBeenCalled();
+    } finally {
+      fsRmSync(home, { recursive: true, force: true });
+    }
+  });
 
   it("captures configured and default daemon ports through the real factory", async () => {
     const home = mkdtempSync(join(tmpdir(), "lcm-installer-factory-port-"));
@@ -2437,6 +2457,7 @@ describe("installer publication admission integration", () => {
     try {
       const canonical = await createInstallerPublicationConvergence(canonicalConfig, {
         fetch: health,
+        admitPeer: () => ({ pid: process.pid, birth: "birth" }),
         _expectedVersionForTesting: expectedVersion,
         _expectedEntrypointForTesting: expectedEntrypoint,
         _expectedRuntimeDigestForTesting: expectedRuntimeDigest,
@@ -2701,6 +2722,7 @@ describe("installer publication admission integration", () => {
       port: 3737,
       identity: {
         pid: process.pid,
+        birth: "birth",
         version: "1.4.2",
         storageBackend: "sqlite",
         entrypoint: "/opt/lcm.mjs",
@@ -2712,6 +2734,7 @@ describe("installer publication admission integration", () => {
         readToken: () => "token",
         readOwner: () => ({ version: 1, pid: process.pid, processStartTime: "birth", nonce: "a".repeat(32) }),
         processBirth: () => "birth",
+        admitPeer: () => ({ pid: process.pid, birth: "birth" }),
         fetch: vi.fn(async () => ({
           ok: true,
           json: async () => ({ status: "ok", pid: process.pid, version: "1.4.2", storageBackend: "sqlite", entrypoint: "/opt/lcm.mjs", runtimeDigest: "a".repeat(64) }),
