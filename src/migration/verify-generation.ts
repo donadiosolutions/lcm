@@ -186,12 +186,29 @@ async function captureAppliedMigrationsSha256(
   ));
 }
 
+/**
+ * Round-1 P3: distinguishes why the search configuration's digest is
+ * unreadable rather than collapsing every cause to one "absent" message.
+ * v3.4's unattributable-NULL shape applies here just as it does to the
+ * sequence witness: a NULL actualSha256 can mean the configuration was
+ * never created (objectCount 0) or that it exists but fails its
+ * ownership/definition contract (objectCount > 0, ownershipReady false,
+ * or the function/mapping shape does not match) -- two different
+ * failures an operator would investigate differently, and treating both
+ * as "absent" would misdirect that investigation.
+ */
+function searchConfigurationAbsentReason(status: Readonly<{ objectCount: number; ownershipReady: boolean }>): string {
+  return status.objectCount === 0
+    ? "destination search configuration is absent"
+    : "destination search configuration is present but does not satisfy its ownership or definition contract";
+}
+
 async function captureDestinationSchemaWitness(
   executor: PostgreSqlQueryExecutor, signal?: AbortSignal,
 ): Promise<MigrationSchemaWitness> {
   const migrationsSha256 = await captureAppliedMigrationsSha256(executor, signal);
   const searchStatus = await inspectPostgreSqlSearchConfiguration(executor, { signal });
-  if (searchStatus.actualSha256 === null) driverError("invalid-input", "destination search configuration is absent");
+  if (searchStatus.actualSha256 === null) driverError("invalid-input", searchConfigurationAbsentReason(searchStatus));
   const [collationSha256, sequenceStateSha256] = await Promise.all([
     captureCollationSha256(executor, signal),
     captureSequenceStateSha256(executor, signal),
@@ -226,7 +243,7 @@ async function assertSchemaWitnessLiveToLive(
     inspectPostgreSqlSearchConfiguration(session, { signal }),
     captureCollationSha256(session, signal),
   ]);
-  if (searchStatus.actualSha256 === null) driverError("invalid-input", "destination search configuration is absent");
+  if (searchStatus.actualSha256 === null) driverError("invalid-input", searchConfigurationAbsentReason(searchStatus));
   if (searchStatus.actualSha256 !== expected.searchConfigurationSha256) {
     driverError("destination-drift", "destination search configuration changed inside the fenced verification window");
   }
@@ -269,6 +286,10 @@ export type MigrationPublicListingSourceEntry = Readonly<{ createdAt: string; id
  * query string. The "sampled record" is the source's own record at the
  * first position the two orders diverge, which is the earliest point a
  * reader can name a single concrete record responsible for the mismatch.
+ * The pair is folded into the single identitySha256 hash below
+ * (migrationWitnessSha256(["sample", identity, ordinal])); the ordinal
+ * has no separate field of its own on MigrationVerificationMismatch,
+ * since that type carries only domain, class and identitySha256.
  */
 async function runOrderedListingProbe(
   executor: PostgreSqlRuntime, projectId: string,
@@ -899,12 +920,19 @@ export function reconcileCounts(
     if (source.recordCount !== entry.recordCount) {
       mismatches.push({
         domain: entry.domain, class: "count",
-        identitySha256: domainMismatchIdentity(["count", entry.domain, source.recordCount, entry.recordCount]),
+        // W5: hashing the two record counts alongside the domain is
+        // technically enumerable, since record counts are typically
+        // small integers a reader could brute-force against the
+        // published digest. domain and class are already plain fields
+        // on this mismatch, and at most one count mismatch is ever
+        // emitted per domain here, so a constant per-domain token loses
+        // no evidence this identity is relied on to carry.
+        identitySha256: domainMismatchIdentity(["count-mismatch-v1", entry.domain]),
       });
     } else if (source.prefixSha256 !== entry.prefixSha256) {
       mismatches.push({
         domain: entry.domain, class: "digest",
-        identitySha256: domainMismatchIdentity(["digest", entry.domain, source.prefixSha256, entry.prefixSha256]),
+        identitySha256: domainMismatchIdentity(["digest-mismatch-v1", entry.domain]),
       });
     }
   }

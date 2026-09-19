@@ -1096,13 +1096,36 @@ describe("verifyMigrationGeneration", () => {
     vi.spyOn(coordination, "PostgreSqlWorkCoordinator").mockImplementation(function () { return ({
       acquireLease: vi.fn(async () => ({ fencingToken: 1n } as never)), releaseLease: vi.fn(async () => null),
     } as never); });
-    vi.spyOn(searchConfiguration, "inspectPostgreSqlSearchConfiguration").mockResolvedValue({ actualSha256: null } as never);
+    vi.spyOn(searchConfiguration, "inspectPostgreSqlSearchConfiguration")
+      .mockResolvedValue({ actualSha256: null, objectCount: 0, ownershipReady: false } as never);
     vi.spyOn(portableSource, "readPostgreSqlPortableWitness").mockResolvedValue(HASH_A);
     const copySource = fakeCopySource();
     const runtime = fakeRuntime();
     const dependencies = dependenciesFor(copySource, runtime);
     await expect(verifyMigrationGeneration(baseInput({ homeDir: "/tmp/lcm-verify-search" }), dependencies))
-      .rejects.toThrow(MigrationVerificationDriverError);
+      .rejects.toMatchObject({ reason: "invalid-input", message: "destination search configuration is absent" });
+  });
+
+  it("round-1 P3: distinguishes a present-but-malformed search configuration from a genuinely absent one", async () => {
+    // objectCount > 0 means the configuration/function objects exist but
+    // fail the ownership or definition contract -- a different failure
+    // an operator would investigate differently than "never created".
+    // v3.4's unattributable-NULL shape: a NULL actualSha256 alone does
+    // not say which of the two happened.
+    vi.spyOn(coordination, "PostgreSqlWorkCoordinator").mockImplementation(function () { return ({
+      acquireLease: vi.fn(async () => ({ fencingToken: 1n } as never)), releaseLease: vi.fn(async () => null),
+    } as never); });
+    vi.spyOn(searchConfiguration, "inspectPostgreSqlSearchConfiguration")
+      .mockResolvedValue({ actualSha256: null, objectCount: 1, ownershipReady: false } as never);
+    vi.spyOn(portableSource, "readPostgreSqlPortableWitness").mockResolvedValue(HASH_A);
+    const copySource = fakeCopySource();
+    const runtime = fakeRuntime();
+    const dependencies = dependenciesFor(copySource, runtime);
+    await expect(verifyMigrationGeneration(baseInput({ homeDir: "/tmp/lcm-verify-search-malformed" }), dependencies))
+      .rejects.toMatchObject({
+        reason: "invalid-input",
+        message: expect.stringContaining("does not satisfy its ownership or definition contract"),
+      });
   });
 
   it("refuses when the destination system identifier is malformed", async () => {

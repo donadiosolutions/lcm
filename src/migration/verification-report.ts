@@ -170,7 +170,7 @@ function parseMigrationClassCoverageVector(value: unknown): MigrationClassCovera
  * instant at or before the census. The report body carries no wall clock,
  * so this versioned constant is how the skew is disclosed structurally
  * rather than through prose the body cannot express. See
- * docs/migration-verification.md for the operator-facing explanation.
+ * docs/migration-cutover.md for the operator-facing explanation.
  */
 export const MIGRATION_PUBLIC_PROBE_ORDERING_SHA256 = migrationWitnessSha256([
   "lcm-migration-verification-public-probe-ordering-v1", "probe-before-census",

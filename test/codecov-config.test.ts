@@ -592,10 +592,12 @@ describe("Codecov configuration", () => {
       expect(isSafeOwnershipPath(path)).toBe(true);
     }
 
-    // 2026-09-18: #624 added four new production files under
+    // 2026-09-18: #624 added six new production files under
     // src/migration/ (already an owned whole-directory component):
     // activation-witness.ts, verification-report.ts, verification-store.ts,
-    // verify-generation.ts.
+    // verify-generation.ts, index.ts, and witness-audit.ts (the last two
+    // landed in later review rounds -- index.ts curates #624's public
+    // exports, witness-audit.ts is the machine-checked witness audit).
     expect(productionFiles).toHaveLength(248);
 
     for (const component of validateComponents(components)) {
