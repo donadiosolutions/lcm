@@ -912,6 +912,35 @@ describe("ConversationStore — searchMessages regex", () => {
     await expect(store.searchMessages({ query: "[", mode: "regex" })).rejects.toThrow();
   });
 
+  it("validates regex before returning no results for nonpositive limits", async () => {
+    const store = makeStore(makeDb());
+    await expect(
+      store.searchMessages({ query: nestedQuantifierFixture(), mode: "regex", limit: 0 }),
+    ).rejects.toThrow(/unsafe/i);
+    await expect(
+      store.searchMessages({ query: "[", mode: "regex", limit: 0 }),
+    ).rejects.toThrow();
+
+    const conv = await store.createConversation({ sessionId: "nonpositive-regex-limit" });
+    await store.createMessage({
+      conversationId: conv.conversationId,
+      seq: 1,
+      role: "user",
+      content: "visible regex message",
+      tokenCount: 1,
+    });
+
+    for (const limit of [0, -1]) {
+      const results = await store.searchMessages({
+        conversationId: conv.conversationId,
+        query: "visible",
+        mode: "regex",
+        limit,
+      });
+      expect(results).toEqual([]);
+    }
+  });
+
   it("returns empty when no message matches regex", async () => {
     const store = makeStore(makeDb());
     const conv = await store.createConversation({ sessionId: "nomatch-sess" });

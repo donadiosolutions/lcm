@@ -503,6 +503,36 @@ describe("SummaryStore — searchSummaries regex", () => {
     await expect(store.searchSummaries({ query: "[", mode: "regex" })).rejects.toThrow();
   });
 
+  it("validates regex before returning no results for nonpositive limits", async () => {
+    const db = makeDb();
+    const store = makeStore(db);
+    await expect(
+      store.searchSummaries({ query: nestedQuantifierFixture(), mode: "regex", limit: 0 }),
+    ).rejects.toThrow(/unsafe/i);
+    await expect(
+      store.searchSummaries({ query: "[", mode: "regex", limit: 0 }),
+    ).rejects.toThrow();
+
+    const convId = await makeConversation(db);
+    await store.insertSummary({
+      summaryId: "nonpositive-regex-limit",
+      conversationId: convId,
+      kind: "leaf",
+      content: "visible regex summary",
+      tokenCount: 1,
+    });
+
+    for (const limit of [0, -1]) {
+      const results = await store.searchSummaries({
+        conversationId: convId,
+        query: "visible",
+        mode: "regex",
+        limit,
+      });
+      expect(results).toEqual([]);
+    }
+  });
+
   it("respects limit in regex search", async () => {
     const db = makeDb();
     const store = makeStore(db);
