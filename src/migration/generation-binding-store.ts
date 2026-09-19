@@ -1,14 +1,21 @@
-import { join } from "node:path";
+import { basename, join } from "node:path";
+import { fsyncSync, lstatSync, readdirSync, unlinkSync } from "node:fs";
 import { canonicalJson, sha256 } from "../storage/portable-record.js";
 import {
+  BoundedFileIdentityChangedError,
   PRIVATE_FILE_MODE,
   atomicWritePrivateFileDurable,
   ensurePrivateDirectory,
   openPrivateDirectory,
   readBoundedRegularFileWithStat,
   type BoundedFileResult,
+  type PrivateDirectoryHandle,
 } from "../security-files.js";
-import { attributeNullableRead } from "./activation-absence.js";
+import {
+  attributeNullableRead,
+  classifyNodeFsAbsence,
+  type NullableReadClassification,
+} from "./activation-absence.js";
 
 /**
  * Crash-safe, idempotent, synchronous persistence for the two durable
@@ -53,12 +60,13 @@ import { attributeNullableRead } from "./activation-absence.js";
  *
  * The witness writer compares only the fields section 4's checksum preimage
  * actually covers -- kind, epochId and attemptId -- plus the generationId
- * cross-check every write already performs; it deliberately does NOT compare
- * manifestRevision. The key is witnessChecksumSha256 itself, and that digest
- * does not cover manifestRevision, so manifestRevision is the one field that
- * can legitimately differ between two writes under one key: a crash after
- * the first durable write, with other transitions sealing in between,
- * produces a legitimate rewrite of the same witness at a higher revision. A
+ * cross-check every write already performs and the storage-key cross-check
+ * described below; it deliberately does NOT compare manifestRevision. The
+ * key is witnessChecksumSha256 itself, and that digest does not cover
+ * manifestRevision, so manifestRevision is the one field that can
+ * legitimately differ between two writes under one key: a crash after the
+ * first durable write, with other transitions sealing in between, produces
+ * a legitimate rewrite of the same witness at a higher revision. A
  * whole-record comparison would refuse there, permanently, on exactly the
  * path recovery is supposed to take. So the witness writer treats
  * manifestRevision as first-write-wins lineage metadata: on a match of the
@@ -72,6 +80,18 @@ import { attributeNullableRead } from "./activation-absence.js";
  * genuinely exceptional, which is exactly why it still gets a
  * distinguishable error rather than being silently resolved either way.
  *
+ * The stored record is parsed with the same strictness a candidate is
+ * validated with, not merely read for the four compared fields: exact
+ * envelope keys, the module's own wire version, and a full
+ * validateWitnessBinding pass on the binding object, which also requires
+ * the stored binding's own embedded witnessChecksumSha256 to equal the key
+ * its filename encodes. A stored record that is missing fields, carries
+ * unknown keys, is at an unrecognised wire version, or whose embedded
+ * checksum disagrees with its own storage key can never be silently
+ * accepted as a match; anything that fails that parse is treated exactly
+ * like a whole-record mismatch is for a selection -- a conflict, never a
+ * silent reuse.
+ *
  * Idempotency and the crash window, restated for both writers together.
  * Recording the exact same binding a second time is the ordinary recovery
  * action, never an anomaly: reconciliation reads the existing file back and
@@ -83,6 +103,31 @@ import { attributeNullableRead } from "./activation-absence.js";
  * benign concurrent-collision race is reconciled the same way a
  * crash-then-retry is, by re-reading and comparing rather than failing
  * outright.
+ *
+ * One specific crash window needs its own machinery rather than falling out
+ * of that reconciliation for free. atomicWritePrivateFileDurable's
+ * requireAbsent path publishes by linking the writer's scratch file onto the
+ * final name and only afterward unlinks the scratch; a crash between those
+ * two syscalls leaves the published name and its scratch twin as two links
+ * to one inode, both nlink=2. The bounded reader's own requireSingleLink
+ * check turns that state into a bare, code-less Error that this module's
+ * default read classifier does not recognise. reconcileWriterScratchTwin
+ * below is what makes the rewrite this module promises above actually
+ * survive that specific window: it authenticates the scratch twin by full
+ * content-and-metadata identity (never by name alone), completes the
+ * interrupted unlink, and only then reconciles as it would for any ordinary
+ * existing file. A multi-link state that cannot be authenticated as that
+ * exact twin is refused as MigrationBindingUnresolvableError -- a state this
+ * module could not resolve, never a conflict it did resolve.
+ *
+ * Every code-less integrity failure the bounded reader can throw --
+ * oversize, a torn-read identity change, an untrusted mode or owner -- is
+ * classified the same way, for the same reason: a failed integrity check
+ * has not told this module what the stored content is, so it cannot
+ * conclude two publications are claiming one authority. It can only
+ * conclude the read could not be trusted. Only a genuinely unrecognised
+ * throw -- one this module's classifier has no rule for at all -- still
+ * propagates raw.
  *
  * Ordering is a caller obligation, not something this module enforces. A
  * witness binding is written *before* its selection is prepared -- it is
@@ -98,7 +143,10 @@ import { attributeNullableRead } from "./activation-absence.js";
  * await, a Promise or an async call anywhere in its call path. Both are
  * called from inside a retained fenced window right before that window's
  * barrier token is released, and an async writer there would reintroduce
- * the suspend-across-await hazard the lock seam was closed against.
+ * the suspend-across-await hazard the lock seam was closed against. The
+ * crash-twin recovery above is synchronous too: every syscall it performs
+ * (readdirSync, lstatSync, unlinkSync, and the bounded reads) is the
+ * synchronous form.
  *
  * attemptId is validated for shape only, everywhere in this module, and
  * never asserted to be stable across a retry: its derivation is unsettled
@@ -115,7 +163,11 @@ import { attributeNullableRead } from "./activation-absence.js";
  * nothing and a read that could not be completed are never folded into the
  * same conclusion, and the private LCM root is authenticated but never
  * created by this module -- only the store subdirectory and the
- * per-generation directory beneath it are.
+ * per-generation directory beneath it are, and their creation is now
+ * durable up the tree (see ensureSyncedPrivateChild): a selection binding
+ * is written once, inside the fenced window, before the token is released,
+ * so there is no later attempt that would otherwise recreate a directory
+ * lost to power loss right after this module returned success.
  */
 
 const GENERATION_BINDING_SUBDIRECTORY = "migration-generation-bindings";
@@ -181,9 +233,9 @@ export class MigrationBindingValidationError extends Error {
 /** A binding already exists at the candidate's key with content that does
  * not reconcile with the candidate: a whole-record mismatch for a selection
  * (two publications claiming one authority), or a mismatch of a
- * digest-covered field for a witness (a checksum collision or corruption).
- * Never overwritten; the caller must investigate rather than have this
- * module silently resolve it either way. */
+ * digest-covered field (or a strict-parse failure of the stored record) for
+ * a witness. Never overwritten; the caller must investigate rather than
+ * have this module silently resolve it either way. */
 export class MigrationBindingConflictError extends Error {
   constructor(message: string, options?: { readonly cause?: unknown }) {
     super(message, options);
@@ -192,9 +244,13 @@ export class MigrationBindingConflictError extends Error {
 }
 
 /** A read needed to decide whether a binding already exists could not be
- * completed (attributed by activation-absence.ts as "unresolvable", e.g.
- * permission denied) rather than genuinely finding nothing. This module
- * refuses instead of guessing that the read failure means absence. */
+ * completed and trusted (attributed by activation-absence.ts as
+ * "unresolvable" -- e.g. permission denied -- or by this module's own
+ * classifier as a code-less integrity failure, or as a multi-link state
+ * that could not be authenticated as an interrupted durable-write scratch
+ * twin) rather than genuinely finding nothing or finding a comparable
+ * value. This module refuses instead of guessing that an untrustworthy read
+ * means either absence or a conflict. */
 export class MigrationBindingUnresolvableError extends Error {
   constructor(message: string, options?: { readonly cause?: unknown }) {
     super(message, options);
@@ -381,27 +437,40 @@ function witnessWireContent(generationId: string, binding: MigrationWitnessBindi
   });
 }
 
-/** Best-effort field extraction from a stored generation-binding envelope,
- * for the witness reconciler's digest-covered-field comparison only. Never
- * throws: any parse or shape failure returns undefined, which the caller
- * below treats as "does not reconcile" (a conflict), the same fate a
+/**
+ * Strictly parse a stored witness-binding envelope for the reconciler's
+ * comparison: exact envelope keys, the module's own wire version, and a
+ * full validateWitnessBinding pass on the binding object -- the same
+ * strictness applied to a candidate, not merely a loose read of the four
+ * compared fields. Any parse or shape failure returns undefined, which the
+ * caller treats as "does not reconcile" (a conflict), the same fate a
  * whole-record mismatch gets in the selection writer. This module never
  * exposes a general-purpose reader of this wire format; a validated,
  * fully-typed read-back belongs to whichever future module resolves these
- * bindings, not to this writer's own reconciliation check. */
-function extractStoredWitnessFields(
+ * bindings, not to this writer's own reconciliation check.
+ */
+function parseStoredWitnessBinding(
   content: string,
-): Readonly<{ generationId: string; kind: unknown; epochId: unknown; attemptId: unknown }> | undefined {
+): Readonly<{ generationId: string; binding: MigrationWitnessBinding }> | undefined {
   let value: unknown;
   try {
     value = JSON.parse(content);
   } catch {
     return undefined;
   }
-  if (!isRecord(value) || typeof value.generationId !== "string") return undefined;
-  const binding = value.binding;
-  if (!isRecord(binding)) return undefined;
-  return { generationId: value.generationId, kind: binding.kind, epochId: binding.epochId, attemptId: binding.attemptId };
+  if (
+    !isRecord(value)
+    || !exactKeys(value, ["binding", "generationId", "version"])
+    || value.version !== GENERATION_BINDING_WIRE_VERSION
+    || typeof value.generationId !== "string"
+  ) {
+    return undefined;
+  }
+  try {
+    return { generationId: value.generationId, binding: validateWitnessBinding(value.binding) };
+  } catch {
+    return undefined;
+  }
 }
 
 /** A benign, expected collision: something already occupies the exclusive
@@ -418,17 +487,294 @@ function isBenignCollisionRace(error: unknown): boolean {
     && (error.message === "private file already exists" || error.message === "private file was created concurrently");
 }
 
+const MULTIPLE_HARD_LINKS_MESSAGE = "file has multiple hard links";
+
+function isMultipleHardLinksError(error: unknown): boolean {
+  return error instanceof Error && error.message === MULTIPLE_HARD_LINKS_MESSAGE;
+}
+
+/** The other code-less integrity failures validateBoundedFileMetadata (and
+ * its callers) in security-files.ts throw for a bounded read: no .code, so
+ * activation-absence.ts's default classifier does not recognise them and
+ * they would otherwise escape raw. Every one of them means the read could
+ * not be trusted, never that a comparison ran and disagreed. */
+const READ_INTEGRITY_FAILURE_MESSAGES: ReadonlySet<string> = new Set([
+  "path is not a regular file",
+  "file owner is not trusted",
+  "file mode is not trusted",
+  "file exceeds the configured size limit",
+  "file content hash does not match expected witness",
+  "file is outside the permitted root",
+]);
+
+/**
+ * Classify a bounded-read failure for this module's own reconciliation
+ * reads. Extends activation-absence.ts's default Node-fs classifier
+ * (ENOENT/ENOTDIR absent, EACCES/EPERM unresolvable) with the code-less
+ * integrity failures readBoundedRegularFileWithStat itself throws: an
+ * oversize file, a torn read reported as BoundedFileIdentityChangedError,
+ * and the other bounded-read refusals above. None of these tell this
+ * module what the stored content actually is -- a failed integrity check is
+ * not a comparison that ran -- so every one of them is
+ * MigrationBindingUnresolvableError, never a conflict and never a raw
+ * escape. "file has multiple hard links" is deliberately left unclassified
+ * here: it has its own authenticated-twin recovery path
+ * (reconcileWriterScratchTwin) and only becomes unresolvable once that
+ * recovery itself fails to authenticate a twin. Any other, genuinely
+ * unrecognised error is left unclassified too and propagates raw,
+ * unchanged.
+ */
+function classifyGenerationBindingReadFailure(error: unknown): NullableReadClassification | undefined {
+  const base = classifyNodeFsAbsence()(error);
+  if (base !== undefined) return base;
+  if (!(error instanceof Error) || isMultipleHardLinksError(error)) return undefined;
+  if (error instanceof BoundedFileIdentityChangedError) {
+    return { kind: "unresolvable", cause: "identity-changed", detail: error.message };
+  }
+  if (READ_INTEGRITY_FAILURE_MESSAGES.has(error.message)) {
+    return { kind: "unresolvable", cause: "integrity-check-failed", detail: error.message };
+  }
+  return undefined;
+}
+
+function escapeRegExpLiteral(value: string): string {
+  return value.replace(/[.*+?^$()|[\]{}\\]/gu, "\\$&");
+}
+
+/** atomicWritePrivateFileDurable's own scratch-naming convention (see
+ * security-files.ts): a leading dot, the final basename, a dot, one or more
+ * lowercase hex characters (the writer's randomBytes(N).toString("hex")
+ * suffix -- its exact byte count is deliberately not pinned here, so a
+ * future change to that byte count cannot silently stop this module's own
+ * crash-twin recovery from recognising it), and a ".tmp" extension. The
+ * structural shape is matched by name; full authentication is by content
+ * and metadata identity (exactWriterLinkPair below), never by name alone,
+ * so an unrelated dotfile that happens to fit this shape still cannot be
+ * mistaken for a genuine scratch twin. */
+function writerScratchNamePattern(finalFileName: string): RegExp {
+  return new RegExp(`^\\.${escapeRegExpLiteral(finalFileName)}\\.[0-9a-f]+\\.tmp$`, "u");
+}
+
+/**
+ * A local duplicate of manifest-store.ts's exactWriterLinkPair (there at
+ * lines 759-774, module-private, cited here rather than imported per this
+ * codebase's established convention for a small predicate): two reads of
+ * the SAME published inode -- the final published name and its
+ * not-yet-unlinked writer scratch twin -- agree on every field a legitimate
+ * atomicWritePrivateFileDurable crash between linkSync and the scratch
+ * unlink can produce. Full content and metadata equality, not just nlink,
+ * is what tells an authentic post-link crash twin apart from an unrelated
+ * multi-link collision.
+ */
+function exactWriterLinkPair(left: BoundedFileResult, right: BoundedFileResult): boolean {
+  return left.nlink === "2"
+    && right.nlink === "2"
+    && left.exactDev === right.exactDev
+    && left.exactIno === right.exactIno
+    && left.parentDev === right.parentDev
+    && left.parentIno === right.parentIno
+    && left.mode === right.mode
+    && left.uid === right.uid
+    && left.gid === right.gid
+    && left.mtimeMs === right.mtimeMs
+    && left.content === right.content;
+}
+
+/**
+ * Remove the authenticated scratch twin, re-verifying its identity
+ * immediately before removal rather than trusting the earlier read -- the
+ * same minimal TOCTOU discipline security-files.ts's own
+ * unlinkPrivateFileIfIdentityMatches applies (module-private there, so not
+ * reused directly). The twin already being gone (ENOENT) is not an error:
+ * another retry may have completed the unlink first. Any other failure
+ * propagates raw rather than being swallowed, matching
+ * atomicWritePrivateFileDurable's own treatment of this exact cleanup step
+ * as part of the operation rather than a best-effort afterthought.
+ */
+function completeInterruptedScratchUnlink(scratchPath: string, publishedIdentity: BoundedFileResult): void {
+  let current;
+  try {
+    current = lstatSync(scratchPath, { bigint: true });
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code === "ENOENT") return;
+    throw error;
+  }
+  if (
+    !current.isFile()
+    || current.dev.toString(10) !== publishedIdentity.exactDev
+    || current.ino.toString(10) !== publishedIdentity.exactIno
+  ) {
+    return;
+  }
+  unlinkSync(scratchPath);
+}
+
+type ReconcileDecision = "reused" | "conflict";
+/** Decide, from an existing stored file's raw content, whether it reconciles
+ * with the candidate this write is for (see the module doc comment for why
+ * this comparison differs between the two writers). */
+type GenerationBindingReconciler = (storedContent: string) => ReconcileDecision;
+
+/**
+ * Authenticate and, if found, complete an interrupted durable-write crash
+ * twin (see the module doc comment for the exact crash window this
+ * recovers). A twin is accepted only when a scratch file matching the
+ * writer's exact naming convention in the same directory is byte-and-
+ * metadata identical to the published name via exactWriterLinkPair. On a
+ * match, the interrupted unlink is completed and reconciliation proceeds
+ * against the published content exactly as it would for any ordinary
+ * existing file. Zero matches, more than one match, or a final nlink that
+ * is not exactly 2 cannot be authenticated as this specific crash shape and
+ * refuse as MigrationBindingUnresolvableError: a multi-link state this
+ * module could not resolve is not evidence of a conflict, because no
+ * comparison against a trustworthy read ever ran.
+ */
+function reconcileWriterScratchTwin(
+  path: string,
+  directory: string,
+  expectedUid: number | undefined,
+  readWithStat: typeof readBoundedRegularFileWithStat,
+  reconcile: GenerationBindingReconciler,
+): "absent" | "reused" {
+  const unresolvable = (): never => {
+    throw new MigrationBindingUnresolvableError(
+      "a multi-link generation binding at " + path +
+        " could not be authenticated as an interrupted durable-write scratch twin",
+    );
+  };
+  const readAt = (candidatePath: string) =>
+    attributeNullableRead<BoundedFileResult>(
+      () => readWithStat(candidatePath, {
+        allowedRoot: directory,
+        maxBytes: MAX_GENERATION_BINDING_FILE_BYTES,
+        expectedUid,
+        allowedModes: [PRIVATE_FILE_MODE],
+      }),
+      { classifyError: classifyGenerationBindingReadFailure },
+    );
+
+  const finalOutcome = readAt(path);
+  if (finalOutcome.kind !== "present" || finalOutcome.value.nlink !== "2") {
+    return unresolvable();
+  }
+
+  const namePattern = writerScratchNamePattern(basename(path));
+  let entries: readonly string[];
+  try {
+    entries = readdirSync(directory);
+  } catch {
+    return unresolvable();
+  }
+
+  let twinPath: string | undefined;
+  for (const entry of entries) {
+    if (!namePattern.test(entry)) continue;
+    const candidateOutcome = readAt(join(directory, entry));
+    if (candidateOutcome.kind === "unresolvable") return unresolvable();
+    if (candidateOutcome.kind === "absent") continue;
+    if (!exactWriterLinkPair(finalOutcome.value, candidateOutcome.value)) continue;
+    if (twinPath !== undefined) return unresolvable();
+    twinPath = join(directory, entry);
+  }
+  if (twinPath === undefined) return unresolvable();
+
+  completeInterruptedScratchUnlink(twinPath, finalOutcome.value);
+
+  if (reconcile(finalOutcome.value.content) === "reused") return "reused";
+  throw new MigrationBindingConflictError(
+    "a generation binding already exists at " + path +
+      " and does not reconcile with the candidate; refusing to overwrite durable authority",
+  );
+}
+
+function reconcileGenerationBindingFile(
+  path: string,
+  directory: string,
+  expectedUid: number | undefined,
+  readWithStat: typeof readBoundedRegularFileWithStat,
+  reconcile: GenerationBindingReconciler,
+): "absent" | "reused" {
+  let outcome;
+  try {
+    outcome = attributeNullableRead<BoundedFileResult>(
+      () => readWithStat(path, {
+        allowedRoot: directory,
+        maxBytes: MAX_GENERATION_BINDING_FILE_BYTES,
+        expectedUid,
+        allowedModes: [PRIVATE_FILE_MODE],
+        requireSingleLink: true,
+      }),
+      { classifyError: classifyGenerationBindingReadFailure },
+    );
+  } catch (error) {
+    if (isMultipleHardLinksError(error)) {
+      return reconcileWriterScratchTwin(path, directory, expectedUid, readWithStat, reconcile);
+    }
+    throw error;
+  }
+  if (outcome.kind === "unresolvable") {
+    throw new MigrationBindingUnresolvableError(
+      "cannot determine whether a generation binding already exists at " + path + ": " + outcome.detail,
+    );
+  }
+  if (outcome.kind === "absent") return "absent";
+  if (reconcile(outcome.value.content) === "reused") return "reused";
+  throw new MigrationBindingConflictError(
+    "a generation binding already exists at " + path +
+      " and does not reconcile with the candidate; refusing to overwrite durable authority",
+  );
+}
+
+function pathExists(path: string): boolean {
+  try {
+    lstatSync(path);
+    return true;
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code === "ENOENT") return false;
+    throw error;
+  }
+}
+
+/**
+ * Create (if absent) and authenticate a private child directory beneath an
+ * already-open, already-authenticated parent handle. When this call is the
+ * one that actually creates the child, fsync both the fresh child's own
+ * descriptor and the parent's descriptor before returning -- mirroring
+ * manifest-store.ts's ensurePrivateChild (there at lines 395-424,
+ * module-private, duplicated locally per this codebase's convention rather
+ * than imported) -- so the new directory entry durably survives a crash
+ * immediately after this call returns. This matters here specifically
+ * because a selection binding is written once, inside the fenced window,
+ * before the barrier token is released: unlike the sibling
+ * activation-artifact-store.ts's republishable recovery material, there is
+ * no later attempt that would otherwise recreate a directory a crash right
+ * after a successful return silently took with it.
+ *
+ * An already-existing child is only authenticated, never re-synced:
+ * nothing new was durably created, so there is nothing new to flush, and
+ * re-chmod-healing an existing directory's mode is ensurePrivateDirectory's
+ * own concern, not this helper's.
+ */
+function ensureSyncedPrivateChild(
+  parentHandle: PrivateDirectoryHandle,
+  childPath: string,
+  expectedUid: number | undefined,
+): PrivateDirectoryHandle {
+  const alreadyExisted = pathExists(childPath);
+  ensurePrivateDirectory(childPath);
+  const childHandle = openPrivateDirectory(childPath, { expectedUid });
+  if (!alreadyExisted) {
+    fsyncSync(childHandle.fd);
+    fsyncSync(parentHandle.fd);
+  }
+  return childHandle;
+}
+
 /**
  * Authenticate (and create if absent) the private generation-binding store
  * subdirectory and the per-generation directory beneath it, atop an
- * already-existing private LCM root this module never creates. Both
- * directories are created and mode-tightened via security-files.ts's own
- * ensurePrivateDirectory (reused rather than reimplemented) if missing, then
- * opened and authenticated. A freshly created directory's own durability is
- * not separately forced here: atomicWritePrivateFileDurable already fsyncs
- * a file's immediate parent -- the per-generation directory -- on every
- * write, and if the directory-creation step itself did not survive an
- * earlier crash, the next attempt simply recreates it, which is idempotent.
+ * already-existing private LCM root this module never creates. See
+ * ensureSyncedPrivateChild for the creation-path durability guarantee.
  */
 function ensureGenerationBindingDirectories(
   homeDir: string,
@@ -436,7 +782,7 @@ function ensureGenerationBindingDirectories(
   expectedUid: number | undefined,
 ): string {
   const root = rootPath(homeDir);
-  let rootHandle;
+  let rootHandle: PrivateDirectoryHandle;
   try {
     rootHandle = openPrivateDirectory(root, { expectedUid });
   } catch (error) {
@@ -447,28 +793,31 @@ function ensureGenerationBindingDirectories(
   }
   try {
     const store = migrationGenerationBindingStoreDirectory(homeDir);
+    let storeHandle: PrivateDirectoryHandle;
     try {
-      ensurePrivateDirectory(store);
-      const storeHandle = openPrivateDirectory(store, { expectedUid });
-      storeHandle.close();
+      storeHandle = ensureSyncedPrivateChild(rootHandle, store, expectedUid);
     } catch (error) {
       throw new MigrationBindingUnsafeStorageError(
         "generation binding store directory is unsafe: " + (error as Error).message,
         { cause: error },
       );
     }
-    const generationDirectory = migrationGenerationBindingDirectory(homeDir, generationId);
     try {
-      ensurePrivateDirectory(generationDirectory);
-      const generationHandle = openPrivateDirectory(generationDirectory, { expectedUid });
+      const generationDirectory = migrationGenerationBindingDirectory(homeDir, generationId);
+      let generationHandle: PrivateDirectoryHandle;
+      try {
+        generationHandle = ensureSyncedPrivateChild(storeHandle, generationDirectory, expectedUid);
+      } catch (error) {
+        throw new MigrationBindingUnsafeStorageError(
+          "per-generation binding directory is unsafe: " + (error as Error).message,
+          { cause: error },
+        );
+      }
       generationHandle.close();
-    } catch (error) {
-      throw new MigrationBindingUnsafeStorageError(
-        "per-generation binding directory is unsafe: " + (error as Error).message,
-        { cause: error },
-      );
+      return generationDirectory;
+    } finally {
+      storeHandle.close();
     }
-    return generationDirectory;
   } finally {
     rootHandle.close();
   }
@@ -488,41 +837,6 @@ export type RecordMigrationSelectionBindingDependencies = Readonly<{
 /** See RecordMigrationSelectionBindingDependencies; identical shape, kept as
  * its own named type so each entry point's signature is self-describing. */
 export type RecordMigrationWitnessBindingDependencies = RecordMigrationSelectionBindingDependencies;
-
-type ReconcileDecision = "reused" | "conflict";
-/** Decide, from an existing stored file's raw content, whether it reconciles
- * with the candidate this write is for (see the module doc comment for why
- * this comparison differs between the two writers). */
-type GenerationBindingReconciler = (storedContent: string) => ReconcileDecision;
-
-function reconcileGenerationBindingFile(
-  path: string,
-  directory: string,
-  expectedUid: number | undefined,
-  readWithStat: typeof readBoundedRegularFileWithStat,
-  reconcile: GenerationBindingReconciler,
-): "absent" | "reused" {
-  const outcome = attributeNullableRead<BoundedFileResult>(() =>
-    readWithStat(path, {
-      allowedRoot: directory,
-      maxBytes: MAX_GENERATION_BINDING_FILE_BYTES,
-      expectedUid,
-      allowedModes: [PRIVATE_FILE_MODE],
-      requireSingleLink: true,
-    }),
-  );
-  if (outcome.kind === "unresolvable") {
-    throw new MigrationBindingUnresolvableError(
-      "cannot determine whether a generation binding already exists at " + path + ": " + outcome.detail,
-    );
-  }
-  if (outcome.kind === "absent") return "absent";
-  if (reconcile(outcome.value.content) === "reused") return "reused";
-  throw new MigrationBindingConflictError(
-    "a generation binding already exists at " + path +
-      " and does not reconcile with the candidate; refusing to overwrite durable authority",
-  );
-}
 
 /**
  * The shared core both entry points call: authenticate the per-generation
@@ -616,13 +930,14 @@ export function recordMigrationWitnessBinding(
   const serialized = witnessWireContent(generationId, binding);
   const fileName = `witness-${binding.witnessChecksumSha256}.binding`;
   const reconcile: GenerationBindingReconciler = (stored) => {
-    const parsed = extractStoredWitnessFields(stored);
+    const parsed = parseStoredWitnessBinding(stored);
     if (
       parsed === undefined
       || parsed.generationId !== generationId
-      || parsed.kind !== binding.kind
-      || parsed.epochId !== binding.epochId
-      || parsed.attemptId !== binding.attemptId
+      || parsed.binding.witnessChecksumSha256 !== binding.witnessChecksumSha256
+      || parsed.binding.kind !== binding.kind
+      || parsed.binding.epochId !== binding.epochId
+      || parsed.binding.attemptId !== binding.attemptId
     ) {
       return "conflict";
     }
