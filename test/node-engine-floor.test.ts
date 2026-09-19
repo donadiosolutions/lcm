@@ -180,7 +180,11 @@ describe("declared Node engine floor", () => {
     }
   });
 
-  it.runIf(process.env.CI !== undefined)("runs CI on exactly the declared floor runtime", () => {
+  // Match vitest.config.ts exactly: only CI=true and CI=1 mean CI. A local run
+  // that exports CI=false or CI="" must not be held to the floor runtime.
+  const runningInCi = process.env.CI === "true" || process.env.CI === "1";
+
+  it.runIf(runningInCi)("runs CI on exactly the declared floor runtime", () => {
     const floor = declaredFloor();
     expect(process.version).toBe(`v${floor.join(".")}`);
   });
