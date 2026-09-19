@@ -77,7 +77,14 @@ all actionable states shown by the current UI (including `new`), export the full
 filtered CSV, and verify export count/completeness against the UI. Observe current
 controls rather than assuming labels, URLs or private backend request shapes.
 
-`CODEX_CSV` accepts an existing export. Parse using an existing CSV-capable tool or
+`CODEX_CSV` accepts an existing export. Before parsing, use existing safe file I/O
+to open the user-selected regular file without following symlinks, verify its
+identity/ownership on the opened handle, and bound the retained bytes to 64 MiB
+(including growth while reading). Reject special files or an exceeded limit with
+a clear intake error; the user may explicitly select another bound. Do not change
+the original file or require owner-only modes on a supplied Downloads export;
+check and report its permissions, then keep any retained working copy private
+under the authentication contract. Parse only the bounded bytes. Use an existing CSV-capable tool or
 Python's standard `csv.DictReader` with newline handling and UTF-8 BOM support, not
 line splitting or shell evaluation. The supplied export's columns are:
 
