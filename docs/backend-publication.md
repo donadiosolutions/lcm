@@ -376,6 +376,25 @@ The internal coordinator exposes `prepare`, `resume`, `abort`, and
 to the permit object and revoked when their callback ends, so an inherited
 asynchronous callback cannot reuse authority after a phase change or release.
 
+### Calling coordinator seams from inside a retained barrier
+
+The maintenance and publication coordinator methods -- `enterMaintenance`,
+`prepareMaintenanceSelection`, `completeMaintenanceSelection`,
+`abortMaintenance`, `prepare`, `resume`, `abort`, and `recoverPending` --
+accept an optional trailing lock token. That token exists for one calling
+mode: a caller already inside `withBackendPublicationAppendBarrierAsync`
+holding the publication lock. Passing the barrier token lets the seam skip
+re-acquiring the same lock; omitting it inside a retained barrier contends
+with the caller's own lock and fails with `PrivateMutationLockContentionError`,
+which refuses admission rather than silently sharing the lock.
+
+Only async-origin tokens authorize these seams. A token minted by a
+synchronous wrapper (`withBackendPublicationConsumerLock` or the synchronous
+append barrier) is refused with `permit-mismatch`, because the synchronous
+wrapper releases the lock when its callback returns while async coordinator
+work can still resume afterwards; accepting such a token would let a caller
+observe failure while a publication mutation escapes unlocked.
+
 If a process dies at any checkpoint, a present journal and its material are
 recovery evidence. Do not edit, delete, rename, or bulk-clean the directory.
 The current command surface does not provide a general journal-editing command.

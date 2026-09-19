@@ -12,6 +12,7 @@ import { StorageOperationError } from "../../src/storage/errors.js";
 import {
   createPostgreSqlStorageBackendFactoryForTesting,
   createPostgreSqlStorageBackendFactoryWithHome,
+  capturePublicationWitnessOutcome,
   FactorySignalExecutor,
   type PostgreSqlFactoryDependencies,
 } from "../../src/storage/postgresql/factory.js";
@@ -912,6 +913,78 @@ describe("PostgreSQL storage backend factory", () => {
         code: "STORAGE_INITIALIZATION_FAILED",
       });
     }
+  });
+
+  it("distinguishes authoritative absence from a definite witness mismatch", async () => {
+    const { dependencies } = harness();
+    dependencies.readJournal = () => null;
+    await expect(capturePublicationWitnessOutcome(dependencies, "/home/operator"))
+      .resolves.toEqual({ status: "absent" });
+    const mismatched: Array<{
+      publicationJournal: BackendPublicationJournal;
+      phase: string;
+      targetBackend: string;
+    }> = [
+      {
+        publicationJournal: { ...journal, phase: "aborted" },
+        phase: "aborted",
+        targetBackend: "postgresql",
+      },
+      {
+        publicationJournal: { ...journal, targetBackend: "sqlite" },
+        phase: "completed",
+        targetBackend: "sqlite",
+      },
+    ];
+    for (const { publicationJournal, phase, targetBackend } of mismatched) {
+      const { dependencies: mismatchDependencies } = harness();
+      mismatchDependencies.readJournal = () => publicationJournal;
+      await expect(
+        capturePublicationWitnessOutcome(mismatchDependencies, "/home/operator"),
+      ).resolves.toEqual({ status: "mismatch", phase, targetBackend });
+    }
+  });
+
+  it("returns the four-field witness when the journal attests postgresql", async () => {
+    const { dependencies } = harness();
+    const outcome = await capturePublicationWitnessOutcome(dependencies, "/home/operator");
+    expect(outcome).toEqual({
+      status: "present",
+      witness: {
+        journalChecksum: journal.checksumSha256,
+        journalPhase: "completed",
+        targetBackend: "postgresql",
+        stateSha256: expect.any(String),
+      },
+    });
+    expect(Object.isFrozen(outcome)).toBe(true);
+  });
+
+  it("carries a failed witness read as unresolvable instead of discarding it", async () => {
+    const readCanary = new Error("private journal-read canary");
+    const { dependencies: readDependencies } = harness();
+    readDependencies.readJournal = () => { throw readCanary; };
+    await expect(
+      capturePublicationWitnessOutcome(readDependencies, "/home/operator"),
+    ).resolves.toEqual({ status: "unresolvable", cause: readCanary });
+    const stateCanary = new Error("private state-capture canary");
+    const { dependencies: stateDependencies } = harness();
+    stateDependencies.captureState = () => { throw stateCanary; };
+    await expect(
+      capturePublicationWitnessOutcome(stateDependencies, "/home/operator"),
+    ).resolves.toEqual({ status: "unresolvable", cause: stateCanary });
+    const admissionCanary = new Error("private admission canary");
+    const { dependencies: admissionDependencies } = harness();
+    admissionDependencies.assertPublication = () => { throw admissionCanary; };
+    await expect(
+      capturePublicationWitnessOutcome(admissionDependencies, "/home/operator"),
+    ).resolves.toEqual({ status: "unresolvable", cause: admissionCanary });
+    const lockCanary = new Error("private lock canary");
+    const { dependencies: lockDependencies } = harness();
+    lockDependencies.withConsumerLock = async () => { throw lockCanary; };
+    await expect(
+      capturePublicationWitnessOutcome(lockDependencies, "/home/operator"),
+    ).resolves.toEqual({ status: "unresolvable", cause: lockCanary });
   });
 
   it("reports sanitized runtime health while open", async () => {

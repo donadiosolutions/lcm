@@ -434,6 +434,30 @@ describe("PostgreSQL publication admission", () => {
     })).read(readInput)).resolves.toMatchObject({ fencingToken: 7n });
   });
 
+  it("reports a decodable non-matching row as fence-mismatch instead of invalid-row", async () => {
+    const readInput = {
+      projectId: PROJECT,
+      targetBackend: "postgresql" as const,
+      evidenceSha256: EVIDENCE,
+    };
+    // Both rows decode cleanly: storedFenceFromRow accepts them, so only the
+    // caller-identity comparison fails. That is a routine different-generation
+    // conflict, not data damage, and it must not share invalid-row with the
+    // malformed rows above.
+    const mismatched = [
+      leaseRow({ evidenceSha256: "b".repeat(64) }),
+      leaseRow({ targetBackend: "sqlite" }),
+    ];
+    for (const row of mismatched) {
+      const e = executor({ transactionQuery: () => result([]), readbackRows: [row] });
+      await expect(new PostgreSqlBackendPublicationGuard(e).read(readInput))
+        .rejects.toMatchObject({
+          name: "PostgreSqlBackendPublicationGuardError",
+          reason: "fence-mismatch",
+        });
+    }
+  });
+
   it("renews and releases only the exact live fence", async () => {
     const normal = executor({ transactionQuery: () => result([leaseRow()]) });
     await expect(new PostgreSqlBackendPublicationGuard(normal).renew({

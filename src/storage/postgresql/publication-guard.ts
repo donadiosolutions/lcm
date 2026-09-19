@@ -773,13 +773,19 @@ export class PostgreSqlBackendPublicationGuard {
       return publicationError(projectId, operation, "invalid-row");
     }
     const row = result.rows[0];
-    return row === undefined
-      ? null
-      : exactFence(row, {
-        projectId,
-        targetBackend: target,
-        evidenceSha256: evidence,
-      }, operation);
+    if (row === undefined) return null;
+    // Decode before comparing identity so a genuinely corrupt row keeps
+    // invalid-row: only a decodable row that names a different generation
+    // reports fence-mismatch, which callers can handle as a routine
+    // conflict instead of data damage.
+    const fence = storedFenceFromRow(row, projectId, operation);
+    if (
+      fence.targetBackend !== target
+      || fence.evidenceSha256 !== evidence
+    ) {
+      return publicationError(projectId, operation, "fence-mismatch");
+    }
+    return fence;
   }
 
   private async mutateExact(

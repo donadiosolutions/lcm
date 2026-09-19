@@ -99,6 +99,86 @@ type PublicationWitness = Readonly<{
   stateSha256: string;
 }>;
 
+/**
+ * Discriminated outcome of reading the backend-publication witness that
+ * determines whether a PostgreSQL destination is operable.
+ *
+ * Authoritative absence (the read succeeded and the journal slot is empty),
+ * a definite mismatch (the journal names a different phase or backend, with
+ * that attribution carried), and an inability to determine the state (the
+ * read itself failed, with its cause carried) are different answers, and a
+ * caller that must refuse safely needs to know which one it received.
+ */
+export type PublicationWitnessOutcome =
+  | Readonly<{ status: "present"; witness: PublicationWitness }>
+  | Readonly<{ status: "absent" }>
+  | Readonly<{ status: "mismatch"; phase: string; targetBackend: string }>
+  | Readonly<{ status: "unresolvable"; cause: unknown }>;
+
+/**
+ * Read the publication witness without collapsing its outcome. Never throws
+ * for the three non-witnessed cases: absence, mismatch, and an unreadable
+ * journal all return as data so the caller can tell a benign state from a
+ * corrupt or indeterminate one. The four-field witness shape and its
+ * canonical digest are unchanged, so callers comparing the fact as a value
+ * are unaffected.
+ */
+export async function capturePublicationWitnessOutcome(
+  dependencies: PostgreSqlFactoryDependencies,
+  homeDir: string | undefined,
+): Promise<PublicationWitnessOutcome> {
+  try {
+    return await dependencies.withConsumerLock(homeDir, (token) => {
+      dependencies.assertPublication({
+        backend: "postgresql",
+        homeDir,
+      }, token);
+      const journal = dependencies.readJournal(homeDir);
+      if (journal === null) return Object.freeze({ status: "absent" as const });
+      if (
+        journal.phase !== "completed"
+        || journal.targetBackend !== "postgresql"
+      ) {
+        return Object.freeze({
+          status: "mismatch" as const,
+          phase: journal.phase,
+          targetBackend: journal.targetBackend,
+        });
+      }
+      return Object.freeze({
+        status: "present" as const,
+        witness: Object.freeze({
+          journalChecksum: journal.checksumSha256,
+          journalPhase: journal.phase,
+          targetBackend: journal.targetBackend,
+          stateSha256: backendPublicationCanonicalSha256(
+            dependencies.captureState(homeDir),
+          ),
+        }),
+      });
+    });
+  } catch (cause) {
+    // A closed factory is a lifecycle signal, not a witness state: let it
+    // reach the open path's dedicated handler, which rebuilds it cause-free
+    // with the current identity, instead of laundering it into unresolvable.
+    if (cause instanceof StorageOperationError && cause.code === "STORAGE_CLOSED") {
+      throw cause;
+    }
+    return Object.freeze({ status: "unresolvable" as const, cause });
+  }
+}
+
+function requirePublicationWitness(
+  outcome: PublicationWitnessOutcome,
+  projectId: string,
+  operation: string,
+): PublicationWitness {
+  if (outcome.status !== "present") {
+    throw initializationError(projectId, operation);
+  }
+  return outcome.witness;
+}
+
 function initializationError(
   projectId: string | undefined,
   operation: string,
@@ -463,7 +543,11 @@ export class PostgreSqlStorageBackendFactory implements StorageBackendFactory {
         assertIdentity(identity, operation);
         this.assertOpen(identity.id, operation);
         const before = publicationLockToken === undefined
-          ? await this.capturePublicationWitness()
+          ? requirePublicationWitness(
+            await capturePublicationWitnessOutcome(this.dependencies, this.homeDir),
+            identity.id,
+            operation,
+          )
           : this.assertPublicationToken(publicationLockToken);
         this.assertOpen(identity.id, operation);
         if (signal?.aborted) throw operationError(operation);
@@ -486,7 +570,11 @@ export class PostgreSqlStorageBackendFactory implements StorageBackendFactory {
           );
         }
         if (publicationLockToken === undefined) {
-          const after = await this.capturePublicationWitness();
+          const after = requirePublicationWitness(
+            await capturePublicationWitnessOutcome(this.dependencies, this.homeDir),
+            identity.id,
+            operation,
+          );
           this.assertOpen(identity.id, operation);
           if (signal?.aborted) throw operationError(operation);
           if (backendPublicationCanonicalSha256(before)
@@ -513,31 +601,6 @@ export class PostgreSqlStorageBackendFactory implements StorageBackendFactory {
     this.pendingOperations.add(settled);
     void settled.then(() => { this.pendingOperations.delete(settled); });
     return work;
-  }
-
-  private async capturePublicationWitness(): Promise<PublicationWitness> {
-    return this.dependencies.withConsumerLock(this.homeDir, (token) => {
-      this.dependencies.assertPublication({
-        backend: "postgresql",
-        homeDir: this.homeDir,
-      }, token);
-      const journal = this.dependencies.readJournal(this.homeDir);
-      if (
-        journal === null
-        || journal.phase !== "completed"
-        || journal.targetBackend !== "postgresql"
-      ) {
-        throw initializationError(undefined, "publicationAdmission");
-      }
-      return Object.freeze({
-        journalChecksum: journal.checksumSha256,
-        journalPhase: journal.phase,
-        targetBackend: journal.targetBackend,
-        stateSha256: backendPublicationCanonicalSha256(
-          this.dependencies.captureState(this.homeDir),
-        ),
-      });
-    });
   }
 
   private assertPublicationToken(token: BackendPublicationLockToken): undefined {
