@@ -290,13 +290,14 @@ describe("lcm events staged PostgreSQL operator commands", () => {
     let now = 0;
     state.factory.mockResolvedValue(createPublicationConvergence({
       port: 3737,
-      identity: { pid: 42, version: "test", storageBackend: "sqlite", entrypoint: "/daemon", runtimeDigest: "runtime" },
+      identity: { pid: 42, birth: "birth", version: "test", storageBackend: "sqlite", entrypoint: "/daemon", runtimeDigest: "runtime" },
       deps: {
         now: () => now,
         sleep: async (delayMs: number) => { now += delayMs; },
         readToken: () => "token",
         readOwner: () => ({ version: 1, pid: 42, processStartTime: "birth", nonce: "a".repeat(32) }),
         processBirth: () => "birth",
+        admitPeer: expected => expected ?? { pid: 42, birth: "birth" },
         lockPath: "/tmp/publication.lock",
         fetch: vi.fn(async () => ({ ok: true, json: async () => ({
           status: "ok", pid: 42, version: "test", storageBackend: "sqlite",

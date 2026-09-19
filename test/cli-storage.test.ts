@@ -12,7 +12,7 @@ import * as publicationModule from "../src/storage/backend-publication.js";
 import * as projectModule from "../src/daemon/project.js";
 import { SqliteStorageBackendFactory } from "../src/storage/sqlite/factory.js";
 import { hashProjectPath } from "../src/project-map.js";
-import { PrivateMutationLockContentionError, withPrivateMutationLock, withPrivateMutationLockAsync } from "../src/private-mutation-lock.js";
+import { PrivateMutationLockContentionError, processStartTime, withPrivateMutationLock, withPrivateMutationLockAsync } from "../src/private-mutation-lock.js";
 import { createPublicationConvergence } from "../src/storage/publication-convergence.js";
 import { isLcmConnectionOpen } from "../src/db/connection.js";
 
@@ -165,8 +165,10 @@ describe("CLI selected project storage", () => {
   });
 
   function convergence(sleep: (ms: number) => Promise<void>, syntheticOwner = false) {
+    const birth = syntheticOwner ? "birth" : processStartTime(process.pid);
+    if (birth === null) throw new Error("test process birth is unavailable");
     const identity = {
-      pid: process.pid, version: "1.0.0", storageBackend: "sqlite" as const,
+      pid: process.pid, birth, version: "1.0.0", storageBackend: "sqlite" as const,
       entrypoint: "/opt/lcm.mjs", runtimeDigest: "a".repeat(64),
     };
     let now = 0;
@@ -175,6 +177,7 @@ describe("CLI selected project storage", () => {
       deps: {
         homeDir: home, now: () => now,
         readToken: () => "fixture-token",
+        admitPeer: expected => expected ?? { pid: process.pid, birth },
         ...(syntheticOwner ? {
           readOwner: () => ({ version: 1 as const, pid: process.pid, processStartTime: "birth", nonce: "a".repeat(32) }),
           processBirth: () => "birth",

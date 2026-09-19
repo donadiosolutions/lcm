@@ -162,6 +162,7 @@ describe("mocked lifecycle identity boundaries", () => {
       port: 1,
       identity: {
         pid: process.pid,
+        birth: "birth",
         version: "1",
         storageBackend: "sqlite",
         entrypoint: "/opt/lcm.mjs",
@@ -173,6 +174,7 @@ describe("mocked lifecycle identity boundaries", () => {
         readToken: () => "token",
         readOwner: () => ({ version: 1, pid: process.pid, processStartTime: "birth", nonce: "a".repeat(32) }),
         processBirth: () => "birth",
+        admitPeer: expected => expected ?? { pid: process.pid, birth: "birth" },
         fetch: vi.fn(async () => ({ ok: true, json: async () => ({
           status: "ok", pid: process.pid, version: "1", storageBackend: "sqlite",
           entrypoint: "/opt/lcm.mjs", runtimeDigest: "a".repeat(64),

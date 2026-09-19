@@ -310,13 +310,14 @@ describe("portable-knowledge — export", () => {
     admitStorage.mockImplementationOnce(() => { throw contention; });
     const convergence = createPublicationConvergence({
       port: 3737,
-      identity: { pid: 42, version: "test", storageBackend: "sqlite", entrypoint: "/daemon", runtimeDigest: "runtime" },
+      identity: { pid: 42, birth: "birth", version: "test", storageBackend: "sqlite", entrypoint: "/daemon", runtimeDigest: "runtime" },
       deps: {
         now: (() => { let value = 0; return () => value; })(),
         sleep: async () => undefined,
         readToken: () => "token",
         readOwner: () => ({ version: 1, pid: 42, processStartTime: "birth", nonce: "a".repeat(32) }),
         processBirth: () => "birth",
+        admitPeer: expected => expected ?? { pid: 42, birth: "birth" },
         lockPath: join(baseDir, "publication.lock"),
         fetch: vi.fn(async () => ({ ok: true, json: async () => ({
           status: "ok", pid: 42, version: "test", storageBackend: "sqlite",
@@ -349,12 +350,13 @@ describe("portable-knowledge — export", () => {
     let now = 0;
     const convergence = createPublicationConvergence({
       port: 3737,
-      identity: { pid: 42, version: "test", storageBackend: "sqlite", entrypoint: "/daemon", runtimeDigest: "runtime" },
+      identity: { pid: 42, birth: "birth", version: "test", storageBackend: "sqlite", entrypoint: "/daemon", runtimeDigest: "runtime" },
       deps: {
         now: () => now, sleep: async (delayMs: number) => { now += delayMs; },
         readToken: () => "token",
         readOwner: () => ({ version: 1, pid: 42, processStartTime: "birth", nonce: "a".repeat(32) }),
         processBirth: () => "birth", lockPath: join(baseDir, "publication.lock"),
+        admitPeer: expected => expected ?? { pid: 42, birth: "birth" },
         fetch: vi.fn(async () => ({ ok: true, json: async () => ({
           status: "ok", pid: 42, version: "test", storageBackend: "sqlite",
           entrypoint: "/daemon", runtimeDigest: "runtime",
@@ -390,12 +392,13 @@ describe("portable-knowledge — export", () => {
     let now = 0;
     const convergence = createPublicationConvergence({
       port: 3737,
-      identity: { pid: 42, version: "test", storageBackend: "sqlite", entrypoint: "/daemon", runtimeDigest: "runtime" },
+      identity: { pid: 42, birth: "birth", version: "test", storageBackend: "sqlite", entrypoint: "/daemon", runtimeDigest: "runtime" },
       deps: {
         now: () => now, sleep: async (delayMs: number) => { now += delayMs; },
         readToken: () => "token",
         readOwner: () => ({ version: 1, pid: authenticated ? 42 : 99, processStartTime: "birth", nonce: "a".repeat(32) }),
         processBirth: () => "birth", lockPath: join(baseDir, "publication.lock"),
+        admitPeer: expected => expected ?? { pid: 42, birth: "birth" },
         fetch: vi.fn(async () => ({ ok: true, json: async () => ({
           status: "ok", pid: 42, version: "test", storageBackend: "sqlite",
           entrypoint: "/daemon", runtimeDigest: "runtime",

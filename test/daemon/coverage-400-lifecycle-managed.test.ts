@@ -752,6 +752,7 @@ describe("issue 400 managed ensure admission matrix", () => {
       platform: "freebsd",
       isAlive: () => true,
       spawn: detachedSpawn(),
+      sleep: async (delayMs) => { now += delayMs; },
       fetch: sequenceFetch([
         new Error("pre-start offline"),
         healthy(4242, "/tmp/lcm-daemon-entrypoint.mjs", { runtimeDigest: "a".repeat(64) }),
@@ -781,7 +782,7 @@ describe("issue 400 managed ensure admission matrix", () => {
       spawned: true,
       startMethod: "detached-spawn",
     });
-    expect(birthTimeouts).toEqual([25, 100]);
+    expect(birthTimeouts).toEqual([25, 18]);
     expect(fixture.seams.fetch).toHaveBeenCalledTimes(2);
     expect(vi.mocked(fixture.seams.fetch).mock.calls.every(([, init]) => (
       (init as RequestInit | undefined)?.headers === undefined
@@ -823,13 +824,13 @@ describe("issue 400 managed ensure admission matrix", () => {
     }));
 
     expect(result).toMatchObject({ connected: true, spawned: true, pid: 4242 });
-    expect(birthTimeouts).toEqual([100, 100]);
+    expect(birthTimeouts).toEqual([100, 100, 100, 100, 100, 100, 100, 75]);
     expect(authenticated).toHaveBeenCalledOnce();
   });
 
   it.each([
     ["expired", 0, false, 2],
-    ["whose quarter floors to zero", 3.5, true, 4],
+    ["whose quarter floors to zero", 3.5, false, 2],
   ] as const)("skips a managed-start birth budget %s", async (
     _name,
     remainingMs,
@@ -839,7 +840,10 @@ describe("issue 400 managed ensure admission matrix", () => {
     let now = 0;
     let fetchCalls = 0;
     const processBirth = vi.fn(() => "birth");
-    const fixture = createFixture({ isAlive: () => true });
+    const fixture = createFixture({
+      isAlive: () => true,
+      sleep: async (delayMs) => { now += delayMs; },
+    });
     fixture.seams.fetch = vi.fn(async () => {
       fetchCalls += 1;
       if (fetchCalls === 1) throw new Error("pre-start offline");
@@ -897,11 +901,13 @@ describe("issue 400 managed ensure admission matrix", () => {
     expect(fetchCalls).toBe(2);
   });
 
-  it("skips the managed-reuse after-sample when its first birth is unavailable", async () => {
+  it("fails closed when the managed-reuse birth is unavailable", async () => {
+    let now = 0;
     const authenticated = vi.fn();
     const processBirth = vi.fn(() => null);
     const fixture = createFixture({
       isAlive: () => true,
+      sleep: async (delayMs) => { now += delayMs; },
       fetch: sequenceFetch([
         healthy(4242, "/tmp/lcm-daemon-entrypoint.mjs", { runtimeDigest: "a".repeat(64) }),
         healthy(4242, "/tmp/lcm-daemon-entrypoint.mjs", { runtimeDigest: "a".repeat(64) }),
@@ -915,12 +921,13 @@ describe("issue 400 managed ensure admission matrix", () => {
       expectedRuntimeDigest: "a".repeat(64),
       _managedOperationAuthorized: true,
       _managedOperationManagerPid: 4242,
+      _monotonicNowOverride: () => now,
       _processStartTimeForTesting: processBirth,
       _onAuthenticatedDaemonResult: authenticated,
     }));
 
-    expect(result).toMatchObject({ connected: true, spawned: false, pid: 4242 });
-    expect(processBirth).toHaveBeenCalledOnce();
+    expect(result).toMatchObject({ connected: false, spawned: false, pid: 4242 });
+    expect(processBirth).toHaveBeenCalledTimes(2);
     expect(authenticated).not.toHaveBeenCalled();
   });
 
@@ -961,7 +968,7 @@ describe("issue 400 managed ensure admission matrix", () => {
     }));
 
     expect(result).toMatchObject({ connected: true, spawned: true, pid: 4242 });
-    expect(processBirth).toHaveBeenCalledOnce();
+    expect(processBirth).toHaveBeenCalledTimes(7);
   });
 
   it("converges a final publication contention for the newly admitted child", async () => {
@@ -1133,10 +1140,12 @@ describe("issue 400 managed ensure admission matrix", () => {
     expect(publicationAssertions).toBe(2);
   });
 
-  it("preserves ordinary admission when the birth probe throws", async () => {
+  it("fails closed within the deadline when the birth probe throws", async () => {
+    let now = 0;
     let birthReads = 0;
     const fixture = createFixture({
       isAlive: () => true,
+      sleep: async (delayMs) => { now += delayMs; },
       fetch: sequenceFetch([
         new Error("pre-start offline"),
         healthy(4242, "/tmp/lcm-daemon-entrypoint.mjs", { runtimeDigest: "a".repeat(64) }),
@@ -1151,12 +1160,14 @@ describe("issue 400 managed ensure admission matrix", () => {
     await expect(ensureDaemon(optionsFor(fixture, {
       expectedRuntimeDigest: "a".repeat(64),
       _skipSpawn: false,
+      _monotonicNowOverride: () => now,
       _processStartTimeForTesting: () => {
         birthReads += 1;
         throw new Error("birth unavailable");
       },
-    }))).resolves.toMatchObject({ connected: true, spawned: true, pid: 4242 });
-    expect(birthReads).toBe(1);
+    }))).resolves.toMatchObject({ connected: false, spawned: true, pid: 4242 });
+    expect(birthReads).toBe(2);
+    expect(now).toBe(100);
   });
 
   it("declines retry when the child birth changes after admission", async () => {
@@ -1354,7 +1365,7 @@ describe("issue 400 managed ensure admission matrix", () => {
       },
     }))).rejects.toBe(contention);
     expect(publicationAssertions).toBe(2);
-    expect(birthReads).toBe(1);
+    expect(birthReads).toBe(7);
   });
 
   it("blocks the next assertion when abort lands after convergence sleep", async () => {
@@ -1713,7 +1724,7 @@ describe("issue 400 managed ensure admission matrix", () => {
       _supervisorNonceOverride: () => "new-launch-nonce",
     }));
     expect(adoptionResult).toMatchObject({ connected: true, spawned: false, pid: 4242 });
-    expect(calls).toBe(4);
+    expect(calls).toBe(10);
   });
 
   it("adopts the same running manager across independent fresh candidate nonces", async () => {
@@ -1745,10 +1756,12 @@ describe("issue 400 managed ensure admission matrix", () => {
 
     expect(first).toMatchObject({ connected: true, spawned: false, pid: 4242 });
     expect(second).toMatchObject({ connected: true, spawned: false, pid: 4242 });
-    expect(fixture.probe.mock.calls.map(([spec]) => (spec as SupervisorSpec).nonce)).toEqual([
-      "fresh-candidate-one", priorNonce, priorNonce, priorNonce,
-      "fresh-candidate-two", priorNonce, priorNonce, priorNonce,
-    ]);
+    const observedNonces = fixture.probe.mock.calls.map(([spec]) => (spec as SupervisorSpec).nonce);
+    expect(observedNonces).toHaveLength(20);
+    expect(observedNonces[0]).toBe("fresh-candidate-one");
+    expect(observedNonces[10]).toBe("fresh-candidate-two");
+    expect(observedNonces.filter((_, index) => index !== 0 && index !== 10))
+      .toEqual(Array.from({ length: 18 }, () => priorNonce));
     expect(fixture.start).not.toHaveBeenCalled();
     expect(fixture.stopAndStart).not.toHaveBeenCalled();
   });
@@ -1787,7 +1800,7 @@ describe("issue 400 managed ensure admission matrix", () => {
 
     expect(result).toMatchObject({ connected: true, spawned: false, startMethod: method, pid: 4242 });
     expect(observed[0]?.credentialDirectory).toBeUndefined();
-    expect(observed).toHaveLength(4);
+    expect(observed).toHaveLength(10);
     expect(observed.slice(1).every(spec => spec.nonce === persistedNonce && spec.credentialDirectory === credentialDirectory && spec.credentialFiles?.[0]?.path === credentialFile)).toBe(true);
     expect(observed[1]).toMatchObject({
       nonce: persistedNonce,
@@ -2190,7 +2203,7 @@ describe("issue 400 managed ensure admission matrix", () => {
     expect(replacementResult).toMatchObject({ connected: true, pid: 5252 });
     expect(sleep).toHaveBeenCalledOnce();
     expect(replacement.stopAndAwaitAbsent).not.toHaveBeenCalled();
-    expect(replacement.probe.mock.calls).toHaveLength(4);
+    expect(replacement.probe.mock.calls).toHaveLength(10);
     expect(replacement.probe.mock.calls.every(([spec]) => (spec as SupervisorSpec).nonce === "replacement-nonce")).toBe(true);
 
     let driftProbeCalls = 0;
@@ -2322,7 +2335,7 @@ describe("issue 400 managed ensure admission matrix", () => {
     writeFileSync(afterAuthentication.pidPath, "4242");
     writeFileSync(afterAuthentication.tokenPath, "managed-token", { mode: 0o600 });
     const afterAuthenticationResult = await ensureDaemon(optionsFor(afterAuthentication));
-    expect(afterAuthenticationResult).toMatchObject({ refusalReason: "ambiguous" });
+    expect(afterAuthenticationResult).toMatchObject({ refusalReason: "response-auth-failure" });
     expect(admissionProbes).toBe(3);
   });
 
@@ -2338,7 +2351,7 @@ describe("issue 400 managed ensure admission matrix", () => {
     writeFileSync(finalProbeFailure.pidPath, "4242");
     writeFileSync(finalProbeFailure.tokenPath, "managed-token", { mode: 0o600 });
     await expect(ensureDaemon(optionsFor(finalProbeFailure))).resolves.toMatchObject({
-      refusalReason: "ambiguous",
+      refusalReason: "response-auth-failure",
       pid: 4242,
     });
 
@@ -2792,8 +2805,8 @@ describe("issue 400 managed start, cleanup, deadline, and process seams", () => 
     writeFileSync(finalProbeFailure.tokenPath, "managed-token", { mode: 0o600 });
     await expect(ensureDaemon(optionsFor(finalProbeFailure, {
       _skipHealthWait: false,
-      _monotonicNowOverride: () => 0,
-    }))).resolves.toMatchObject({ refusalReason: "ambiguous", spawned: true, pid: 4242 });
+      _monotonicNowOverride: deadlineClock(),
+    }))).resolves.toMatchObject({ refusalReason: "startup-failure", spawned: true, pid: 4242 });
 
     const identityRace = createFixture({
       isAlive: () => true,
@@ -2806,8 +2819,8 @@ describe("issue 400 managed start, cleanup, deadline, and process seams", () => 
     writeFileSync(identityRace.tokenPath, "managed-token", { mode: 0o600 });
     await expect(ensureDaemon(optionsFor(identityRace, {
       _skipHealthWait: false,
-      _monotonicNowOverride: () => 0,
-    }))).resolves.toMatchObject({ refusalReason: "ambiguous", spawned: true, pid: 4242 });
+      _monotonicNowOverride: deadlineClock(),
+    }))).resolves.toMatchObject({ refusalReason: "startup-failure", spawned: true, pid: 4242 });
 
     const rejectedAdmission = createFixture({
       isAlive: () => true,
@@ -2850,7 +2863,7 @@ describe("issue 400 managed start, cleanup, deadline, and process seams", () => 
     writeFileSync(cleanupFailure.tokenPath, "managed-token", { mode: 0o600 });
     await expect(ensureDaemon(optionsFor(cleanupFailure, {
       _skipHealthWait: false,
-      _monotonicNowOverride: () => 0,
+      _monotonicNowOverride: deadlineClock(),
     }))).resolves.toMatchObject({
       refusalReason: "startup-failure",
       spawned: true,

@@ -138,7 +138,7 @@ vi.mock("node:fs", async (importOriginal) => {
       if (
         legacyPidFileFault.path !== undefined
         && String(args[0]) === legacyPidFileFault.path
-        && legacyPidFileFault.openCalls === 4
+        && legacyPidFileFault.openCalls === 12
         && legacyPidFileFault.mode?.startsWith("former-cleanup-") === true
       ) {
         legacyPidFileFault.formerCleanupDescriptor = descriptor;
@@ -193,7 +193,7 @@ vi.mock("node:fs", async (importOriginal) => {
         legacyPidFileFault.path !== undefined
         && String(args[0]) === legacyPidFileFault.path
         && legacyPidFileFault.mode === "after-stop-validation-missing"
-        && legacyPidFileFault.openCalls === 4
+        && legacyPidFileFault.openCalls === 12
       ) {
         actual.unlinkSync(legacyPidFileFault.path);
         const error = new Error("PID file disappeared during validation") as NodeJS.ErrnoException;
@@ -221,7 +221,7 @@ vi.mock("node:fs", async (importOriginal) => {
         legacyPidFileFault.path !== undefined
         && String(args[0]) === legacyPidFileFault.path
         && legacyPidFileFault.mode === "after-stop-validation-dangling-symlink"
-        && legacyPidFileFault.openCalls === 4
+        && legacyPidFileFault.openCalls === 12
       ) {
         const openedPath = `${legacyPidFileFault.path}.opened`;
         actual.renameSync(legacyPidFileFault.path, openedPath);
@@ -366,7 +366,16 @@ function hermetic(options: EnsureDaemonOptions, environment: NodeJS.ProcessEnv =
   };
   privateDirectory(seams.homeDir);
   for (const directory of [seams.runtimeDir, seams.credentialDir, seams.procRoot]) mkdirSync(directory, { recursive: true });
-  return { ...options, _hermeticTestSeams: seams };
+  return {
+    ...options,
+    _processStartTimeForTesting: options._processStartTimeForTesting
+      ?? (pid => `birth-${String(pid)}`),
+    _peerProcessCommandOverride: options._peerProcessCommandOverride
+      ?? ((options._platform ?? "linux") === "linux" && options._procRoot === undefined
+        ? () => `node ${options.expectedEntrypoint ?? "/lcm"} daemon start --foreground`
+        : undefined),
+    _hermeticTestSeams: seams,
+  };
 }
 
 function ensure(options: EnsureDaemonOptions): ReturnType<typeof ensureDaemonProduction> {
@@ -677,6 +686,7 @@ async function runLegacyFixture(config: LegacyFixtureConfig = {}): Promise<{
     legacyTokenFileFault.code = config.tokenErrorAfterInitialRead ? "EACCES" : "ENOENT";
   }
   const preStopClock = { expired: false };
+  let listenerChecks = 0;
   const monotonicNow = config.expireBeforePreStop
     ? () => preStopClock.expired ? 100 : 0
     : config.monotonicNow ?? (() => 0);
@@ -689,8 +699,11 @@ async function runLegacyFixture(config: LegacyFixtureConfig = {}): Promise<{
     _isProcessAliveOverride: () => aliveState.value,
     ...(config.useProcListener ? {} : {
       _listeningPortsOverride: () => {
-        if (config.abortBeforePreStop) config.abortController?.abort();
-        if (config.expireBeforePreStop) preStopClock.expired = true;
+        listenerChecks += 1;
+        if (listenerChecks === 9) {
+          if (config.abortBeforePreStop) config.abortController?.abort();
+          if (config.expireBeforePreStop) preStopClock.expired = true;
+        }
         return [...(config.listenerPorts ?? [19_999])];
       },
     }),
@@ -790,6 +803,7 @@ describe("ensureDaemon restart and terminal coverage", () => {
       _procRoot: procRoot,
       _uid: 1000,
       _isProcessAliveOverride: () => alive,
+      _processStartTimeForTesting: () => "birth",
       _killOverride: kill,
       _listeningPortsOverride: () => [19_999],
       _fetchOverride: fetch,
@@ -815,6 +829,8 @@ describe("ensureDaemon restart and terminal coverage", () => {
     const result = await ensure({
       ...baseOptions(dir),
       _isProcessAliveOverride: () => true,
+      _processStartTimeForTesting: () => "birth",
+      _peerProcessCommandOverride: () => "node /lcm daemon start --foreground",
       _listeningPortsOverride: () => [19_999],
       _fetchOverride: fetch,
       _supervisorOverride: unavailableSupervisor(),
@@ -825,12 +841,23 @@ describe("ensureDaemon restart and terminal coverage", () => {
 
   it("accepts a recognized retry endpoint after an initial PID collision", async () => {
     const dir = root();
+    const procRoot = join(dir, "proc");
+    mkdirSync(procRoot, { recursive: true });
     writePid(dir, 20);
+    writeProc(procRoot, 20, 1, "node /lcm daemon start --foreground");
     writeFileSync(join(dir, "daemon.token"), "token", { mode: 0o600 });
-    const fetch = diagnosticsFetch({ status: "warming", version: "1.0.0", pid: 999 }, health(20), health(20));
+    const runtimeDigest = "a".repeat(64);
+    const fetch = diagnosticsFetch(
+      { status: "warming", version: "1.0.0", pid: 999 },
+      health(20, { runtimeDigest }),
+      health(20, { runtimeDigest }),
+    );
     const result = await ensure({
       ...baseOptions(dir),
+      expectedRuntimeDigest: runtimeDigest,
+      _procRoot: procRoot,
       _isProcessAliveOverride: () => true,
+      _processStartTimeForTesting: () => "birth",
       _listeningPortsOverride: () => [19_999],
       _fetchOverride: fetch,
       _supervisorOverride: unavailableSupervisor(),
@@ -1149,6 +1176,8 @@ describe("ensureDaemon restart and terminal coverage", () => {
       expectedRuntimeDigest: "a".repeat(64),
       _spawnOverride: vi.fn(() => child) as unknown as SpawnOverride,
       _isProcessAliveOverride: () => true,
+      _processStartTimeForTesting: () => "birth",
+      _peerProcessCommandOverride: () => "node /lcm daemon start --foreground",
       _listeningPortsOverride: () => [19_999],
       _fetchOverride: fetch,
     });
@@ -1775,8 +1804,8 @@ describe("managed restart refusal and repair coverage", () => {
     writeFileSync(join(dir, "daemon.token"), "token", { mode: 0o600 });
     const managed = managedSupervisor((spec) => ({ kind: "registered-running-valid", managerPid: 200, scopeDigest: spec.scopeDigest, nonce: spec.nonce, name: spec.name }), { kind: "systemd-user", managerPid: 201 });
     const fetch = diagnosticsFetch(
-      health(200, { entrypoint: "/expected", runtimeDigest: "b".repeat(64) }),
-      health(200, { entrypoint: "/expected", runtimeDigest: "b".repeat(64) }),
+      health(200, { entrypoint: "/lcm", runtimeDigest: "b".repeat(64) }),
+      health(200, { entrypoint: "/lcm", runtimeDigest: "b".repeat(64) }),
     );
     const ensureMock = vi.fn(async () => ({ connected: true, port: 19_999, spawned: false }));
     let monotonicNow = 0;
@@ -1785,7 +1814,7 @@ describe("managed restart refusal and repair coverage", () => {
       monotonicNow = 30_000.75;
       return { kind: "systemd-user", managerPid: 200 };
     });
-    const repaired = await restart({ ...baseOptions(dir), spawnTimeoutMs: 120_000, enforceUserManagerParent: true, expectedVersion: "2.0.0", expectedEntrypoint: "/expected", expectedRuntimeDigest: "b".repeat(64), spawnCommand: process.execPath, spawnArgs: ["/lcm", "daemon", "start", "--foreground"], _supervisorOverride: managed.supervisor, _isProcessAliveOverride: () => true, _listeningPortsOverride: () => [19_999], _fetchOverride: fetch, _ensureDaemonOverride: ensureMock, _monotonicNowOverride: clock });
+    const repaired = await restart({ ...baseOptions(dir), spawnTimeoutMs: 120_000, enforceUserManagerParent: true, expectedVersion: "2.0.0", expectedEntrypoint: "/lcm", expectedRuntimeDigest: "b".repeat(64), spawnCommand: process.execPath, spawnArgs: ["/lcm", "daemon", "start", "--foreground"], _supervisorOverride: managed.supervisor, _isProcessAliveOverride: () => true, _listeningPortsOverride: () => [19_999], _fetchOverride: fetch, _ensureDaemonOverride: ensureMock, _monotonicNowOverride: clock });
     expect(repaired.restarted).toBe(true);
     expect(managed.stopAndStart).toHaveBeenCalledWith(expect.anything(), { deadline: 120_000 });
     expect(ensureMock).toHaveBeenCalledWith(expect.objectContaining({
@@ -1800,7 +1829,7 @@ describe("managed restart refusal and repair coverage", () => {
     writePid(changedDir, 200);
     writeFileSync(join(changedDir, "daemon.token"), "token", { mode: 0o600 });
     const refused = await restart({ ...baseOptions(changedDir), enforceUserManagerParent: true, _isProcessAliveOverride: () => true, _listeningPortsOverride: () => [19_999], _fetchOverride: diagnosticsFetch(health(200), health(200)), _supervisorOverride: changed.supervisor });
-    expect(refused.refusalReason).toBe("ambiguous");
+    expect(refused.refusalReason).toBe("response-auth-failure");
   });
 
   it("floors exhausted managed restart admission budgets to zero", async () => {
@@ -1827,7 +1856,7 @@ describe("managed restart refusal and repair coverage", () => {
       spawnTimeoutMs: 120_000,
       enforceUserManagerParent: true,
       expectedVersion: "2.0.0",
-      expectedEntrypoint: "/expected",
+      expectedEntrypoint: "/lcm",
       expectedRuntimeDigest: "b".repeat(64),
       spawnCommand: process.execPath,
       spawnArgs: ["/lcm", "daemon", "start", "--foreground"],
@@ -1835,8 +1864,8 @@ describe("managed restart refusal and repair coverage", () => {
       _isProcessAliveOverride: () => true,
       _listeningPortsOverride: () => [19_999],
       _fetchOverride: diagnosticsFetch(
-        health(200, { entrypoint: "/expected", runtimeDigest: "b".repeat(64) }),
-        health(200, { entrypoint: "/expected", runtimeDigest: "b".repeat(64) }),
+        health(200, { entrypoint: "/lcm", runtimeDigest: "b".repeat(64) }),
+        health(200, { entrypoint: "/lcm", runtimeDigest: "b".repeat(64) }),
       ),
       _ensureDaemonOverride: ensureMock,
       _monotonicNowOverride: clock,
@@ -2228,7 +2257,7 @@ describe("authenticated legacy generated systemd refusal matrix", () => {
     ["changed PID file after stop", { stopBehavior: "replace-pid" as const }, "ambiguous"],
     ["unsafe PID file after stop", { stopBehavior: "replace-unsafe" as const }, "ambiguous"],
     ["PID remains alive after stop", { stopBehavior: "keep-alive" as const }, "startup-failure"],
-    ["descriptor replacement between reads", { mutatePidBeforeSecondDiscovery: true }, "ambiguous"],
+    ["descriptor replacement between reads", { mutatePidBeforeSecondDiscovery: true }, "invalid-collision"],
     ["manager discovery unavailable", { discoveries: [{ kind: "unavailable" as const, reason: "manager-timeout" }] }, "manager-unavailable"],
     ["manager discovery failure", { discoveryThrows: true }, "manager-unavailable"],
   ] as const)("refuses $0 without broad mutation", async (_name, config, refusalReason) => {
@@ -2318,7 +2347,7 @@ describe("authenticated legacy generated systemd refusal matrix", () => {
       restarted: true,
       stoppedPid: 4242,
     });
-    expect(legacyPidFileFault.openFlags).toEqual(Array(3).fill(expectedFlags));
+    expect(legacyPidFileFault.openFlags).toEqual(Array(11).fill(expectedFlags));
     expect(legacyTokenFileFault.openFlags).toEqual(Array(2).fill(expectedFlags));
   });
 
@@ -2558,7 +2587,7 @@ describe("authenticated legacy generated systemd refusal matrix", () => {
         _supervisorOverride: supervisor.supervisor,
         _ensureDaemonOverride: ensureMock,
       });
-      expect(result).toMatchObject({ connected: false, restarted: false, refusalReason: "ambiguous", pid: 4242 });
+      expect(result).toMatchObject({ connected: false, restarted: false, refusalReason: "invalid-collision", pid: 4242 });
       expect(readFileSync(pidPath, "utf-8")).toBe("4242");
       expect(supervisor.start).not.toHaveBeenCalled();
       expect(ensureMock).not.toHaveBeenCalled();
@@ -2773,6 +2802,7 @@ describe("managed restart staged credential cleanup", () => {
     const options: RestartDaemonOptions = {
       ...baseOptions(dir),
       _platform: "darwin",
+      _peerProcessCommandOverride: () => "node /lcm daemon start --foreground",
       enforceUserManagerParent: true,
       _supervisorOverride: supervisor,
       _isProcessAliveOverride: () => true,
@@ -2990,7 +3020,7 @@ describe("legacy restart and terminal cleanup coverage", () => {
     let psCalls = 0;
     const ps = vi.fn(() => ({
       status: 0,
-      stdout: ++psCalls === 1 ? "node lcm daemon start --foreground\n" : "node unrelated\n",
+      stdout: ++psCalls < 15 ? "node lcm daemon start --foreground\n" : "node unrelated\n",
       stderr: "",
     }));
     const fetch = diagnosticsFetch(health(20), health(20));
@@ -3049,7 +3079,7 @@ describe("legacy restart and terminal cleanup coverage", () => {
     });
     expect(result).toMatchObject({ restarted: true, stoppedPid: 20 });
     expect(kill).toHaveBeenCalledWith(20, "SIGTERM");
-    expect(ps).toHaveBeenCalled();
+    expect(ps).toHaveBeenCalledTimes(15);
   });
 
   it("rejects malformed restart seams and state mutation before validation", async () => {

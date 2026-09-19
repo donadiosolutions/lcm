@@ -2269,6 +2269,7 @@ async function ensureDaemonUnlocked(opts: EnsureDaemonOptions): Promise<EnsureDa
     : opts._linuxSsPathOverride;
   const admitPeerWithAuthority = (
     authority: Parameters<typeof admitManagedDaemonPeer>[0]["authority"],
+    readPeerBirth: (pid: number) => string | null = readAdmissionBirth,
   ): ManagedDaemonPeerEvidence | null => admitManagedDaemonPeer({
     authority,
     port: opts.port,
@@ -2277,7 +2278,7 @@ async function ensureDaemonUnlocked(opts: EnsureDaemonOptions): Promise<EnsureDa
     expectedEntrypoint,
     _seams: {
       isProcessAlive: isAlive,
-      processBirth: readAdmissionPeerBirth,
+      processBirth: readPeerBirth,
       readProcessCommand: pid => opts._peerProcessCommandOverride?.(pid)
         ?? readPlatformProcessCommand(
           pid,
@@ -2305,16 +2306,22 @@ async function ensureDaemonUnlocked(opts: EnsureDaemonOptions): Promise<EnsureDa
     pidFilePath: opts.pidFilePath,
     expectedUid: dependencies.uid ?? process.getuid?.(),
   });
+  const admitRetainedOwnedPeer = (): ManagedDaemonPeerEvidence | null => admitPeerWithAuthority({
+    kind: "pid-file",
+    pidFilePath: opts.pidFilePath,
+    expectedUid: dependencies.uid ?? process.getuid?.(),
+  }, readAdmissionPeerBirth);
   const admitManagerPeer = (
     pid: number,
     revalidate: () => boolean,
     systemdControlGroup?: string,
+    readPeerBirth: (candidatePid: number) => string | null = readAdmissionBirth,
   ): ManagedDaemonPeerEvidence | null => admitPeerWithAuthority({
     kind: "manager",
     pid,
     revalidate,
     systemdControlGroup,
-  });
+  }, readPeerBirth);
   let restartedForParent = false;
 
   if (testScope && opts.expectedEntrypoint !== undefined && opts.expectedEntrypoint !== testScope.entrypoint) {
@@ -2591,9 +2598,10 @@ async function ensureDaemonUnlocked(opts: EnsureDaemonOptions): Promise<EnsureDa
                 && opts._managedOperationManagerPid === pid
                 && isAlive(pid),
               access.alreadyVerified ? access.systemdControlGroup : undefined,
+              readAdmissionPeerBirth,
             );
           }
-          return admitOwnedPeer();
+          return admitRetainedOwnedPeer();
         });
         opts._onAuthenticatedDaemonResult?.({
           result,
@@ -2750,6 +2758,7 @@ async function ensureDaemonUnlocked(opts: EnsureDaemonOptions): Promise<EnsureDa
     spec: SupervisorSpec,
     pid: number,
     probeDeadline = deadline,
+    readPeerBirth: (candidatePid: number) => string | null = readAdmissionBirth,
   ): Promise<ManagedDaemonPeerEvidence | null> {
     let before: SupervisorObservation;
     try {
@@ -2758,7 +2767,12 @@ async function ensureDaemonUnlocked(opts: EnsureDaemonOptions): Promise<EnsureDa
       return null;
     }
     if (!supervisorMetadataMatches(before, spec) || before.managerPid !== pid) return null;
-    const admitted = admitManagerPeer(pid, () => true, before.controlGroup);
+    const admitted = admitManagerPeer(
+      pid,
+      () => true,
+      before.controlGroup,
+      readPeerBirth,
+    );
     if (admitted === null) return null;
     let after: SupervisorObservation;
     try {
@@ -3398,6 +3412,7 @@ async function ensureDaemonUnlocked(opts: EnsureDaemonOptions): Promise<EnsureDa
             requestedSpec,
             authenticated.pid,
             monotonicNow() + MANAGER_PEER_REVALIDATION_MS,
+            readAdmissionPeerBirth,
           ),
     );
     return accepted ?? refusalResult("response-invalid", "managed daemon identity could not be admitted", { pid: observation.managerPid });
@@ -3574,6 +3589,7 @@ async function ensureDaemonUnlocked(opts: EnsureDaemonOptions): Promise<EnsureDa
                       launchSpec,
                       authenticated.pid,
                       monotonicNow() + MANAGER_PEER_REVALIDATION_MS,
+                      readAdmissionPeerBirth,
                     ),
               );
               if (accepted) {
