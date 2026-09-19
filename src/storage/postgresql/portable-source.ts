@@ -22,7 +22,7 @@ import { PortableTransferError } from "../portable-transfer.js";
 import { createPortableIndex, type PortableIndex } from "../portable-index.js";
 import {
   decodeCanonicalRow, listCanonicalHeaders, listConversationMessageHeaders,
-  readCanonicalRow,
+  readCanonicalContentRows, readCanonicalRow,
 } from "./portable-mapping.js";
 
 type Snapshot = PostgreSqlQueryExecutor & {
@@ -234,9 +234,9 @@ async function buildSource(input: BuildInput): Promise<PortableRecordSource> {
     let after: string | null=null;
     while (true) {
       abort(options.signal);
-      const headers=await listCanonicalHeaders(session,expectedIdentity.id,domain,after,1,options.signal);
+      const headers=await listCanonicalHeaders(session,expectedIdentity.id,domain,after,PORTABLE_LIMITS.maxBatchRecords,options.signal);
       if (headers.length === 0) break;
-      if (headers.length > 1) invalid();
+      if (headers.length > PORTABLE_LIMITS.maxBatchRecords) invalid();
       for (const header of headers) {
         assertHeaderLength(header.byteLength);
         if (header.locator === after) invalid();
@@ -262,8 +262,7 @@ async function buildSource(input: BuildInput): Promise<PortableRecordSource> {
       }
     } finally { await l.return(undefined); await r.return(undefined); }
   });
-  const recordAt=async(domain:PortableDomain,locator:string,ordinal:number,signal?:AbortSignal):Promise<PortableRecord> => {
-    const row=await queryRow(domain,locator,signal);
+  const recordFromRow=(domain:PortableDomain,row:Record<string,unknown>,locator:string,ordinal:number):PortableRecord => {
     const parent=(parentDomain:"conversations"|"messages",column:string) => {
       if (row[column] === undefined || row[column] === null || domain === parentDomain) return undefined;
       const located=index.lookup(parentDomain,JSON.stringify([String(row[column])]));
@@ -291,6 +290,10 @@ async function buildSource(input: BuildInput): Promise<PortableRecordSource> {
       conversation:conversation as {identitySha256:string;order:PortableRawConversationOrder}|undefined,
       message:message as {identitySha256:string;order:PortableRawMessageOrder}|undefined,occurrenceOrdinal}),ordinal});
   };
+  const recordAt=async(domain:PortableDomain,locator:string,ordinal:number,signal?:AbortSignal):Promise<PortableRecord> => {
+    const row=await queryRow(domain,locator,signal);
+    return recordFromRow(domain,row,locator,ordinal);
+  };
   for (const domain of PORTABLE_RECORD_DOMAIN_ORDER) {
     let count=0;
     await eachHeader(domain,async(locator) => {
@@ -311,12 +314,15 @@ async function buildSource(input: BuildInput): Promise<PortableRecordSource> {
     if (encoded === null) invalid();
     return JSON.parse(encoded) as BoundaryEvidence;
   };
-  const checkedRecordAt=async(domain:PortableDomain,locator:string,ordinal:number,signal?:AbortSignal) => {
-    const record=await recordAt(domain,locator,ordinal,signal);
+  const assertBoundaryMatches=(domain:PortableDomain,ordinal:number,record:PortableRecord) => {
     const expected=cachedBoundary(domain,ordinal+1).last;
     if (expected?.recordSha256 !== record.recordSha256 || expected.identitySha256 !== record.identitySha256) {
       throw new PortableStreamError("source-changed");
     }
+  };
+  const checkedRecordAt=async(domain:PortableDomain,locator:string,ordinal:number,signal?:AbortSignal) => {
+    const record=await recordAt(domain,locator,ordinal,signal);
+    assertBoundaryMatches(domain,ordinal,record);
     return record;
   };
   const readOrdinal=async(domain:PortableDomain,ordinal:number,signal?:AbortSignal) => {
@@ -329,11 +335,21 @@ async function buildSource(input: BuildInput): Promise<PortableRecordSource> {
     let last:BoundaryEvidence["last"]=null;
     let ordinal=0;
     while (ordinal < nextOrdinal) {
-      const entries=index.entries(domain,{afterOrdinal:ordinal-1,limit:Math.min(500,nextOrdinal-ordinal),
+      const entries=index.entries(domain,{afterOrdinal:ordinal-1,limit:Math.min(PORTABLE_LIMITS.maxBatchRecords,nextOrdinal-ordinal),
         maxBytes:PORTABLE_LIMITS.maxBatchBytes,signal});
       if (entries.length === 0) invalid();
+      // Batched: one round trip answers every locator in this chunk (bounded
+      // by PORTABLE_LIMITS.maxBatchRecords above) instead of one per record.
+      // See #1388; the incremental digest chain below still processes rows
+      // strictly in entries' order, so boundary/ordering semantics do not
+      // change, only how many queries produce the same bytes.
+      abort(signal); abort(options.signal);
+      const rows=await readCanonicalContentRows(session,expectedIdentity.id,domain,entries.map(entry=>entry.locator),signal);
       for (const entry of entries) {
-        const record=await (capture ? recordAt : checkedRecordAt)(domain,entry.locator,entry.ordinal,signal);
+        const row=rows.get(entry.locator);
+        if (row === undefined) invalid();
+        const record=recordFromRow(domain,row,entry.locator,entry.ordinal);
+        if (!capture) assertBoundaryMatches(domain,entry.ordinal,record);
         prefix=appendDigest(prefix,serializePortableRecord(record));
         last={recordSha256:record.recordSha256,identitySha256:record.identitySha256};ordinal++;
         if (capture) index.bindScope(prefixScope(domain),String(ordinal),JSON.stringify({prefix,last}));
