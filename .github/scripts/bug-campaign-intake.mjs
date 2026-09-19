@@ -72,6 +72,16 @@ function parseRepository(repository) {
   return Object.freeze({ owner: match[1], repository: match[2], value: repository });
 }
 
+function parseParentRepository(parent) {
+  if (!isPlainObject(parent)) {
+    throw new TypeError("Issue parent must be an object");
+  }
+  if (!isPlainObject(parent.repository)) {
+    throw new TypeError("Issue parent.repository must be an object");
+  }
+  return parseRepository(parent.repository.nameWithOwner);
+}
+
 function validateIssueUrl(value, repository, issueNumber, label) {
   const url = assertNonEmptyString(value, `${label}.url`);
   let parsed;
@@ -491,7 +501,12 @@ function parseTransportResponse(value, repository, issueNumber) {
   }
   let parent = null;
   if (response.parent !== null && response.parent !== undefined) {
-    parent = validateIssueIdentity(response.parent, repository, undefined, "Issue parent");
+    parent = validateIssueIdentity(
+      response.parent,
+      parseParentRepository(response.parent),
+      undefined,
+      "Issue parent",
+    );
   }
   return Object.freeze({
     trustedIssue: Object.freeze({
