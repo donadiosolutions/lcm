@@ -1,5 +1,5 @@
 import { defineConfig } from "vitest/config";
-import { tmpdir } from "node:os";
+import { availableParallelism, tmpdir } from "node:os";
 import { join } from "node:path";
 
 const POSTGRESQL_RUN_ID_PATTERN = /^[0-9a-f]{32}$/u;
@@ -17,10 +17,11 @@ export function postgresqlVitestCacheDir(
 
 export function createPostgresqlVitestConfiguration(
   environment: Readonly<NodeJS.ProcessEnv> = process.env,
+  cpuCount: () => number = availableParallelism,
 ) {
   // PostgreSQL integration tests also run from local agent worktrees. Keep their
-  // fork pool within the local allocation while retaining the CI concurrency.
-  const maxWorkers = environment.CI === "true" || environment.CI === "1" ? 4 : 1;
+  // fork pool within the local allocation; CI sizes the pool from the runner.
+  const maxWorkers = environment.CI === "true" || environment.CI === "1" ? Math.max(1, cpuCount()) : 1;
   return {
     cacheDir: postgresqlVitestCacheDir(environment),
     test: {

@@ -30,13 +30,23 @@ import {
   type DaemonLifecycleHermeticTestSeams,
   type DaemonLifecycleTestScope,
 } from "../../src/daemon/lifecycle-scope.js";
-import { managedDaemonPath } from "../../src/daemon/managed-path.js";
+import { SYSTEMD_DAEMON_PATH } from "../../src/daemon/managed-path.js";
 import {
   createSupervisor,
   managedLaunchEnvironmentDigest,
   SUPERVISOR_DAEMON_TEMP_CREATION_WARNING,
   SupervisorDaemonTempCreationError,
 } from "../../src/daemon/supervisor.js";
+
+vi.mock("node:os", async (importOriginal) => {
+  const actual = await importOriginal<typeof import("node:os")>();
+  const isolatedHome = (): string => process.env.HOME ?? actual.homedir();
+  return {
+    ...actual,
+    homedir: isolatedHome,
+    userInfo: () => ({ ...actual.userInfo(), homedir: isolatedHome() }),
+  };
+});
 
 type EnsureDaemonOptions = Parameters<typeof ensureDaemonProduction>[0];
 type RestartDaemonOptions = Parameters<typeof restartDaemonProduction>[0];
@@ -1379,12 +1389,18 @@ describe("managed restart refusal and repair coverage", () => {
     const callerHome = homedir();
     const projectCwd = join(dir, "project");
     const spawnCommand = "/usr/bin/node";
+    const legitimatePrefix = join(callerHome, ".local");
     const spawnArgs = [
-      join(callerHome, ".local", "lib", "node_modules", "@donadiosolutions", "lcm", "dist", "lcm.mjs"),
+      join(legitimatePrefix, "lib", "node_modules", "@donadiosolutions", "lcm", "dist", "lcm.mjs"),
       "daemon",
       "start",
       "--foreground",
     ];
+    mkdirSync(join(legitimatePrefix, "bin"), { recursive: true });
+    mkdirSync(join(legitimatePrefix, "lib", "node_modules", "@donadiosolutions", "lcm", "dist"), {
+      recursive: true,
+    });
+    writeFileSync(spawnArgs[0]!, "export {};\n");
     let callerCwd = callerHome;
     vi.spyOn(process, "cwd").mockImplementation(() => callerCwd);
     const probed: SupervisorSpec[] = [];
@@ -1413,9 +1429,8 @@ describe("managed restart refusal and repair coverage", () => {
 
     expect(probed).toHaveLength(2);
     expect(probed[0]?.launchEnvironment?.PATH).toBe(probed[1]?.launchEnvironment?.PATH);
-    expect(probed[0]?.launchEnvironment?.PATH).toContain(join(callerHome, ".local", "bin"));
     expect(probed[0]?.launchEnvironment?.PATH).toBe(
-      managedDaemonPath(spawnCommand, spawnArgs, dir),
+      `${join(callerHome, ".local", "bin")}:${SYSTEMD_DAEMON_PATH}`,
     );
     expect(managedLaunchEnvironmentDigest(
       probed[0]!,
@@ -1428,6 +1443,58 @@ describe("managed restart refusal and repair coverage", () => {
       1000,
       probed[1]!.launchEnvironment!,
     ));
+  });
+
+  it("excludes checkout-local synthesis from stable restart identity", async () => {
+    const dir = root();
+    const checkout = join(dir, "checkout");
+    const entrypoint = join(
+      checkout,
+      ".local",
+      "lib",
+      "node_modules",
+      "@donadiosolutions",
+      "lcm",
+      "dist",
+      "lcm.mjs",
+    );
+    mkdirSync(join(checkout, ".local", "bin"), { recursive: true });
+    mkdirSync(join(checkout, ".local", "lib", "node_modules", "@donadiosolutions", "lcm", "dist"), {
+      recursive: true,
+    });
+    writeFileSync(entrypoint, "export {};\n");
+    const spawnArgs = [entrypoint, "daemon", "start", "--foreground"];
+    const probed: SupervisorSpec[] = [];
+    const managed = managedSupervisor((spec) => {
+      probed.push(spec);
+      return {
+        kind: "registered-stale-config",
+        reason: "metadata-mismatch",
+        scopeDigest: spec.scopeDigest,
+        name: spec.name,
+      };
+    });
+    const ensureMock = vi.fn(async () => ({ connected: true, port: 19_999, spawned: false }));
+    let callerCwd = homedir();
+    vi.spyOn(process, "cwd").mockImplementation(() => callerCwd);
+    const options = {
+      ...baseOptions(dir),
+      spawnCommand: "/usr/bin/node",
+      spawnArgs,
+      enforceUserManagerParent: true,
+      _supervisorOverride: managed.supervisor,
+      _ensureDaemonOverride: ensureMock,
+    };
+
+    await expect(restart(options)).resolves.toMatchObject({ restarted: true, connected: true });
+    callerCwd = checkout;
+    await expect(restart(options)).resolves.toMatchObject({ restarted: true, connected: true });
+
+    expect(probed).toHaveLength(2);
+    expect(probed[0]?.launchEnvironment?.PATH).toBe(SYSTEMD_DAEMON_PATH);
+    expect(probed[1]?.launchEnvironment?.PATH).toBe(SYSTEMD_DAEMON_PATH);
+    expect(probed[0]?.launchEnvironment?.PATH).not.toContain(join(checkout, ".local", "bin"));
+    expect(probed[0]?.scopeDigest).toBe(probed[1]?.scopeDigest);
   });
 
   it.each([

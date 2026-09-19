@@ -2,6 +2,7 @@ import type { DatabaseSync } from "node:sqlite";
 import { sanitizeFts5Query } from "./fts5-sanitize.js";
 import { buildLikeSearchPlan, createFallbackSnippet } from "./full-text-fallback.js";
 import { validateRegex } from "./regex-safety.js";
+import { createRegexSnippet } from "./regex-snippet.js";
 
 export type SummaryKind = "leaf" | "condensed";
 export type ContextItemType = "message" | "summary";
@@ -862,6 +863,9 @@ export class SummaryStore {
     before?: Date,
   ): SummarySearchResult[] {
     const re = validateRegex(pattern);
+    if (limit <= 0) {
+      return [];
+    }
 
     const where: string[] = [];
     const args: Array<string | number> = [];
@@ -878,32 +882,30 @@ export class SummaryStore {
       args.push(before.toISOString());
     }
     const whereClause = where.length > 0 ? `WHERE ${where.join(" AND ")}` : "";
-    const rows = this.db
-      .prepare(
-        `SELECT summary_id, conversation_id, kind, depth, content, token_count, file_ids,
-                earliest_at, latest_at, descendant_count, descendant_token_count,
-                source_message_token_count, created_at
-         FROM summaries
-         ${whereClause}
-         ORDER BY created_at DESC`,
-      )
-      .all(...args) as unknown as SummaryRow[];
+    const rows = this.db.prepare(
+      `SELECT summary_id, conversation_id, kind, depth, content, token_count, file_ids,
+              earliest_at, latest_at, descendant_count, descendant_token_count,
+              source_message_token_count, created_at
+       FROM summaries
+       ${whereClause}
+       ORDER BY created_at DESC`,
+    );
 
     const results: SummarySearchResult[] = [];
-    for (const row of rows) {
-      if (results.length >= limit) {
-        break;
-      }
+    for (const row of rows.iterate(...args) as Iterable<SummaryRow>) {
       const match = re.exec(row.content);
       if (match) {
         results.push({
           summaryId: row.summary_id,
           conversationId: row.conversation_id,
           kind: row.kind,
-          snippet: match[0],
+          snippet: createRegexSnippet(row.content, re),
           createdAt: parseStoredTimestamp(row.created_at),
           rank: 0,
         });
+        if (results.length >= limit) {
+          break;
+        }
       }
     }
     return results;

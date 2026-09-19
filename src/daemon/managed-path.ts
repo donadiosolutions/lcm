@@ -1,11 +1,13 @@
+import { realpathSync, statSync } from "node:fs";
 import { delimiter, dirname, isAbsolute, join, relative, sep } from "node:path";
-import { homedir } from "node:os";
+import { homedir, userInfo } from "node:os";
 
 export const SYSTEMD_DAEMON_PATH = "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin";
 
 interface TrustedExecutableDir {
   directory: string;
   entrypoint: boolean;
+  synthesizedNpmBin: boolean;
 }
 
 function isWithin(directory: string, root: string): boolean {
@@ -13,41 +15,98 @@ function isWithin(directory: string, root: string): boolean {
   return path === "" || (path !== ".." && !path.startsWith(`..${sep}`) && !isAbsolute(path));
 }
 
-function homeScopedInstallationRoot(directory: string): string | undefined {
-  const match = /^(.*)\/(?:\.nvm|\.npm-global|\.npm-packages|\.volta|\.asdf|\.codex|\.claude)(?:\/|$)/.exec(directory);
-  return match?.[1] || undefined;
+function homeScopedInstallationRoot(
+  directory: string,
+  includeLocal: boolean,
+): string | undefined {
+  const pattern = includeLocal
+    ? /^(.*)\/(?:\.local|\.nvm|\.npm-global|\.npm-packages|\.volta|\.asdf|\.codex|\.claude)(?:\/|$)/
+    : /^(.*)\/(?:\.nvm|\.npm-global|\.npm-packages|\.volta|\.asdf|\.codex|\.claude)(?:\/|$)/;
+  const match = pattern.exec(directory);
+  return match ? match[1] || sep : undefined;
 }
 
-function isTrustedInstallationDir(
+function canonicalPath(path: string): string | undefined {
+  try {
+    return realpathSync(path);
+  } catch {
+    return undefined;
+  }
+}
+
+function authenticatedImplicitHomeDirectory(): string | undefined {
+  try {
+    const requestedHome = canonicalPath(homedir());
+    const accountHome = canonicalPath(userInfo().homedir);
+    if (!requestedHome || !accountHome) return undefined;
+    if (requestedHome === accountHome) return requestedHome;
+
+    const stats = statSync(requestedHome);
+    const uid = typeof process.getuid === "function" ? process.getuid() : undefined;
+    if (
+      uid === undefined
+      || !stats.isDirectory()
+      || stats.uid !== uid
+      || (stats.mode & 0o022) !== 0
+    ) return undefined;
+    return requestedHome;
+  } catch {
+    return undefined;
+  }
+}
+
+function trustedInstallationDirectory(
   directory: string,
   workingDirectory: string,
-  homeDirectory: string,
+  homeDirectory: string | undefined,
   requireCanonicalHome: boolean,
-): boolean {
-  if (/(?:^|\/)node_modules(?:\/|$)/.test(directory)) return false;
-  const installationRoot = homeScopedInstallationRoot(directory);
-  const installationRootOutsideHome = installationRoot !== undefined
-    && relative(homeDirectory, installationRoot) !== "";
+  synthesizedNpmBin: boolean,
+): string | undefined {
+  if (/(?:^|\/)node_modules(?:\/|$)/.test(directory)) return undefined;
+  const installationRoot = homeScopedInstallationRoot(directory, synthesizedNpmBin);
+  const canonicalDirectory = requireCanonicalHome && installationRoot
+    ? canonicalPath(directory)
+    : directory;
+  const canonicalInstallationRoot = requireCanonicalHome && canonicalDirectory && installationRoot
+    ? homeScopedInstallationRoot(canonicalDirectory, synthesizedNpmBin)
+    : installationRoot;
+  const installationRootAtHome = installationRoot !== undefined
+    && homeDirectory !== undefined
+    && canonicalInstallationRoot !== undefined
+    && canonicalDirectory !== undefined
+    && relative(homeDirectory, canonicalInstallationRoot) === ""
+    && isWithin(canonicalDirectory, homeDirectory);
+  const installationRootOutsideHome = homeDirectory !== undefined
+    && installationRoot !== undefined
+    && !installationRootAtHome;
+  if (requireCanonicalHome && synthesizedNpmBin && !installationRootAtHome) return undefined;
+  if (
+    requireCanonicalHome
+    && (synthesizedNpmBin || installationRootAtHome)
+    && canonicalDirectory?.includes(delimiter)
+  ) return undefined;
   if (requireCanonicalHome && installationRootOutsideHome) {
     // Recognized user-installation layouts are trusted only below the
     // canonical home root. This keeps checkout-controlled .codex/.claude and
     // package-manager lookalikes rejected even when a managed lifecycle uses a
     // stable supervisor anchor instead of the caller's working directory.
-    return false;
+    return undefined;
   }
   if (installationRoot && isWithin(workingDirectory, installationRoot)) {
     // The real per-user installation root remains trusted even when a command
     // is run from $HOME. Lookalike caches rooted in a checkout do not.
-    if (installationRootOutsideHome) return false;
+    if (installationRootOutsideHome) return undefined;
   }
   // Project containment wins over recognizable install layouts. A checkout can
   // contain attacker-controlled .codex/.claude caches or package-manager paths
   // whose names would otherwise look like approved global trust anchors.
   if (
     (isWithin(directory, workingDirectory) || isWithin(workingDirectory, directory))
-    && relative(homeDirectory, installationRoot ?? directory) !== ""
-  ) return false;
-  return true;
+    && !installationRootAtHome
+  ) return undefined;
+  return requireCanonicalHome && (synthesizedNpmBin || installationRootAtHome)
+    ? canonicalDirectory
+    : directory;
 }
 
 function npmGlobalBinForEntrypoint(path: string): string | undefined {
@@ -61,32 +120,52 @@ function trustedExecutableDirs(
   spawnCommand: string,
   spawnArgs: readonly string[],
   workingDirectory: string,
-  homeDirectory: string,
+  homeDirectory: string | undefined,
   requireCanonicalHome: boolean,
 ): TrustedExecutableDir[] {
   const firstArg = spawnArgs[0];
-  const executables: Array<{ path: string; entrypoint: boolean }> = [];
+  const executables: Array<{
+    path: string;
+    entrypoint: boolean;
+    synthesizedNpmBin: boolean;
+  }> = [];
   if (firstArg && isAbsolute(firstArg)) {
-    executables.push({ path: firstArg, entrypoint: true });
+    executables.push({ path: firstArg, entrypoint: true, synthesizedNpmBin: false });
     const npmGlobalBin = npmGlobalBinForEntrypoint(firstArg);
-    if (npmGlobalBin) executables.push({ path: join(npmGlobalBin, "lcm"), entrypoint: true });
-    if (isAbsolute(spawnCommand)) executables.push({ path: spawnCommand, entrypoint: false });
+    if (npmGlobalBin) {
+      executables.push({
+        path: join(npmGlobalBin, "lcm"),
+        entrypoint: true,
+        synthesizedNpmBin: true,
+      });
+    }
+    if (isAbsolute(spawnCommand)) {
+      executables.push({ path: spawnCommand, entrypoint: false, synthesizedNpmBin: false });
+    }
   } else if (firstArg === "daemon" && isAbsolute(spawnCommand)) {
-    executables.push({ path: spawnCommand, entrypoint: true });
+    executables.push({ path: spawnCommand, entrypoint: true, synthesizedNpmBin: false });
   }
-  return executables
-    .map(({ path, entrypoint }) => ({ directory: dirname(path), entrypoint }))
-    .filter(({ directory }) =>
-      !directory.includes(delimiter)
-      && isTrustedInstallationDir(directory, workingDirectory, homeDirectory, requireCanonicalHome)
+  return executables.flatMap(({ path, entrypoint, synthesizedNpmBin }) => {
+    const directory = dirname(path);
+    if (directory.includes(delimiter)) return [];
+    const trustedDirectory = trustedInstallationDirectory(
+      directory,
+      workingDirectory,
+      homeDirectory,
+      requireCanonicalHome,
+      synthesizedNpmBin,
     );
+    return trustedDirectory === undefined
+      ? []
+      : [{ directory: trustedDirectory, entrypoint, synthesizedNpmBin }];
+  });
 }
 
 function buildManagedDaemonPath(
   spawnCommand: string,
   spawnArgs: readonly string[],
   workingDirectory: string,
-  homeDirectory: string,
+  homeDirectory: string | undefined,
   requireCanonicalHome: boolean,
 ): string {
   const systemDirs = SYSTEMD_DAEMON_PATH.split(":");
@@ -117,7 +196,10 @@ export function managedDaemonPathForStableLaunch(
   spawnCommand: string,
   spawnArgs: readonly string[],
   workingDirectory: string,
-  homeDirectory = homedir(),
+  homeDirectory?: string,
 ): string {
-  return buildManagedDaemonPath(spawnCommand, spawnArgs, workingDirectory, homeDirectory, true);
+  const authenticatedHome = homeDirectory === undefined
+    ? authenticatedImplicitHomeDirectory()
+    : canonicalPath(homeDirectory);
+  return buildManagedDaemonPath(spawnCommand, spawnArgs, workingDirectory, authenticatedHome, true);
 }

@@ -1,5 +1,5 @@
 import type { DaemonConfig } from "../config.js";
-import { sendJson } from "../server.js";
+import { isBufferedResponseSizeLimitError, sendJson } from "../server.js";
 import type { RouteHandler } from "../server.js";
 import type { PromotedRecallCandidate } from "../../storage/contracts.js";
 import type { SearchResult } from "../../db/promoted.js";
@@ -9,6 +9,8 @@ import { selectMemoryHintsWithinBudget } from "../../hooks/memory-context.js";
 import { validateCwd } from "../validate-cwd.js";
 import type { StorageBackendFactory } from "../../storage/index.js";
 import { StorageOperationError } from "../../storage/errors.js";
+import { BackendPublicationJournalError } from "../../storage/backend-publication.js";
+import { isAbortError } from "../cancellation.js";
 import {
   storageRouteFailureResponse,
   withProjectStorage,
@@ -379,6 +381,7 @@ export function createPromptSearchHandler(config: DaemonConfig, storageFactory?:
               await project.recall.logSurfacing(ids, session_id ?? null);
             }
           } catch (error) {
+            if (isAbortError(error) || error instanceof BackendPublicationJournalError) throw error;
             if (
               config.storage.backend === "postgresql"
               && error instanceof StorageOperationError
@@ -398,6 +401,14 @@ export function createPromptSearchHandler(config: DaemonConfig, storageFactory?:
         result ?? (config.restoration.promptSearchMaxResults === 0 ? { hints: [], ids: [] } : { hints: [] }),
       );
     } catch (error) {
+      if (isAbortError(error) || isBufferedResponseSizeLimitError(error)) throw error;
+      if (error instanceof BackendPublicationJournalError) {
+        sendJson(res, 503, {
+          status: "blocked",
+          error: "backend publication admission blocked",
+        });
+        return;
+      }
       const storageFailure = storageRouteFailureResponse(config.storage.backend, error, "prompt-search", storageFactory);
       if (storageFailure) {
         sendJson(res, storageFailure.status, storageFailure.body);

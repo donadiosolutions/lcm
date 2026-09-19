@@ -87,12 +87,69 @@ worker limits. A worker cap does not bound subprocesses created inside a test, s
 commands also need finite deadlines and ownership through descendant cleanup.
 
 Run focused tests for changed code and its direct integration boundaries
-locally. Fresh exact-head CI must pass `pnpm run test:ci` with 100% lines,
-branches, functions, and statements for every collected production TypeScript
-file. Do not exclude files or skip tests to meet that gate. PostgreSQL
-integration files run only through `pnpm run test:postgresql`; see
+locally. Every push to `main` runs the complete suite and must reach 100%
+lines, branches, functions, and statements for every collected production
+TypeScript file; `pnpm run test:ci` reproduces that gate locally. Do not
+exclude files or skip tests to meet it. PostgreSQL integration files run only
+through `pnpm run test:postgresql`; see
 [PostgreSQL development](../src/storage/postgresql/reference/postgresql-development.md)
 for the isolated container prerequisites and lifecycle.
+
+## Continuous integration
+
+`.github/workflows/ci.yml` is a small job graph. The `plan` job runs first
+and decides everything else; the `ci` job is the required status check and
+passes only when every job the plan required succeeded and every job it did
+not require was skipped.
+
+```text
+plan ─┬─ checks ────────────────────────────┐
+      ├─ unit (matrix from plan) ─ report ──┼─ ci
+      │                             └─ codecov (main/release only)
+      ├─ postgresql (when planned) ─────────┤
+      ├─ linux-systemd (when planned) ──────┤
+      └─ macos-launchd (when planned) ──────┘
+```
+
+- `plan` (`scripts/ci-plan.mjs`) seeds the dependency caches, then picks a
+  mode. Pushes to `main` and `release` run every test file with coverage.
+  Pull requests and merge-queue entries diff against the merge base: when
+  every changed path is TypeScript under `src/`, `bin/`, `installer/`, or
+  `test/` (outside `test/setup/`), Vitest's module graph (`vitest list
+  --changed`) selects the related test files; paths that tests read from disk
+  (documentation, changesets) add the files listed in `GRAPH_INVISIBLE_INPUTS`;
+  any other change runs the complete suite without coverage. The job summary
+  shows the mode, the changed paths, and the selected files per shard.
+- `unit` runs one shard per matrix entry from `scripts/ci-test-shards.mjs`:
+  the parallel pool is split in two by weight, the two 144 MiB portable
+  boundary files run alone, the remaining boundary files share a runner, and
+  the serial projects (`unit-package`, `unit-sqlite-routes`, `e2e`) share
+  another. Each shard uses the blob reporter, verifies that it executed exactly
+  the planned files, and uploads its blob.
+- `report` merges the blobs with `vitest --merge-reports` into one JUnit
+  report and, on `main`/`release`, the merged coverage that must satisfy the
+  100% per-file thresholds from `vitest.config.ts`. Shards disable those
+  thresholds because no single shard sees the complete map.
+- `postgresql`, `linux-systemd`, and `macos-launchd` run when the plan
+  selects their integration files, when a process-boundary path changed
+  (`bin/`, `installer/`, `src/cli/`, `src/daemon/`, `src/storage/postgresql/`,
+  the harness scripts), or in full mode.
+- `checks` type-checks, builds, runs the GitHub policy module tests and the
+  helper regressions, and fails on leftover workspace files.
+
+Reproduce a shard locally with the same executor CI uses, for example:
+
+```bash
+LCM_TEST_ARTIFACT_ROOT="$(mktemp -u)" \
+LCM_CI_SHARD_NAME=unit-1 \
+LCM_CI_SHARD_PROJECTS='["unit-parallel"]' \
+LCM_CI_SHARD_FILES='["test/config-manager.test.ts"]' \
+LCM_CI_SHARD_COVERAGE=false \
+node scripts/ci-vitest.mjs shard
+```
+
+`node scripts/ci-plan.mjs --event push --ref refs/heads/main` prints the plan
+summary for a full run without writing GitHub outputs.
 
 ## Coordinated GitHub work
 
