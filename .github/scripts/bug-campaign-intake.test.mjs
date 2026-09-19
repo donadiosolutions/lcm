@@ -229,13 +229,14 @@ test("preserves prompt, generated, and native redaction in intake", async () => 
   // Mutation caught: dropping one redaction layer while changing prompt URL handling.
   const { projectUntrustedIssueData } = await intakeApi();
   const urlCredential = "CuStOm+SSL://user:url-secret@example.test/private";
+  const emptyUserinfoCredential = "CuStOm+SSL://:empty-userinfo-secret@example.test/private";
   const generatedCredential = "MERAKI = 0123456789abcdef0123456789abcdef01234567";
   const nativeCredential = "rediss://:redis-secret@example.test/0";
   const envelope = await projectUntrustedIssueData({
     title: urlCredential,
     body: generatedCredential,
     comments: [nativeCredential],
-    reproduction: [],
+    reproduction: [emptyUserinfoCredential],
     evidence: [],
   });
   const projected = parseEnvelope(envelope);
@@ -246,8 +247,18 @@ test("preserves prompt, generated, and native redaction in intake", async () => 
   );
   assert.equal(projected.body, "[REDACTED]");
   assert.deepEqual(projected.comments, ["[REDACTED]/0"]);
-  for (const credential of ["url-secret", generatedCredential, "redis-secret"]) {
-    assert.doesNotMatch(envelope, new RegExp(credential, "u"));
+  assert.equal(projected.reproduction[0].includes("empty-userinfo-secret"), false);
+  assert.equal(
+    projected.reproduction[0].includes("CuStOm+SSL://:[REDACTED]@example.test/private"),
+    true,
+  );
+  for (const credential of [
+    "url-secret",
+    generatedCredential,
+    "redis-secret",
+    "empty-userinfo-secret",
+  ]) {
+    assert.equal(envelope.includes(credential), false);
   }
 });
 
