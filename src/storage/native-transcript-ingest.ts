@@ -137,7 +137,11 @@ function scrubString(engine: ScrubEngine, value: string): string {
   const scrubbed = engine.scrub(value);
   assertUnicodeScalarValue(scrubbed);
   assertNoNul(scrubbed);
-  if (engine.scrub(scrubbed) !== scrubbed) {
+  // An unchanged result is already its own fixed point for a deterministic
+  // engine, so only a redacted string needs the residual pass. Transcript
+  // backfill scrubs overwhelmingly secret-free strings, and this second full
+  // scan over long opaque values doubled the cost of that path (#1358).
+  if (scrubbed !== value && engine.scrub(scrubbed) !== scrubbed) {
     throw new NativeTranscriptRecordError("residual-secret");
   }
   return scrubbed;

@@ -5335,3 +5335,43 @@ describe("local transcript quarantine", () => {
     missingRowDb.close();
   });
 });
+
+describe("native transcript scrubbing residual verification", () => {
+  function recordedScrubCalls(
+    value: JsonObject,
+  ): { result: JsonObject | JsonValue[]; calls: string[] } {
+    const scrubber = createNativeTranscriptScrubber({
+      globalPatterns: [],
+      projectPatterns: [],
+    });
+    const spy = vi.spyOn(ScrubEngine.prototype, "scrub");
+    try {
+      const result = scrubber.scrubJson(value);
+      return { result, calls: spy.mock.calls.map(([text]) => text) };
+    } finally {
+      spy.mockRestore();
+    }
+  }
+
+  it("scrubs an unchanged string once instead of re-scrubbing it", () => {
+    const { result, calls } = recordedScrubCalls({ alpha: "beta" });
+
+    expect(result).toEqual({ alpha: "beta" });
+    expect(calls).toEqual(["alpha", "beta", '{"alpha":"beta"}']);
+  });
+
+  it("still re-scrubs a redacted string to prove no secret survives", () => {
+    const secret = "key=sk-abcdefghijklmnopqrstu";
+    const { result, calls } = recordedScrubCalls({ alpha: secret });
+
+    const redacted = new ScrubEngine([], []).scrub(secret);
+    expect(redacted).not.toBe(secret);
+    expect(result).toEqual({ alpha: redacted });
+    expect(calls).toEqual([
+      "alpha",
+      secret,
+      redacted,
+      JSON.stringify({ alpha: redacted }),
+    ]);
+  });
+});
