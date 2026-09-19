@@ -27,6 +27,7 @@ import {
   reconcileDependencyEdges,
   readSequenceSelfConsistencyMismatches,
   reconcileCounts,
+  SEQUENCE_BACKED_IDENTITY_COLUMN,
   sortMismatches,
   streamSourceCheckpoints,
   totalsFor,
@@ -230,6 +231,7 @@ function fakeSession(overrides: {
   ledgerRun?: { state?: string; manifestSha256?: string; projectSha256?: string } | null;
   ledgerCheckpoints?: readonly ReturnType<typeof defaultLedgerCheckpoint>[];
   ledgerNonInjective?: ReadonlyArray<{ domain: string; nativeKey: string }>;
+  identityColumns?: ReadonlyArray<{ tableName: string; columnName: string }>;
 } = {}) {
   const sequenceState = overrides.sequenceState ?? {};
   const ledgerRun = overrides.ledgerRun === undefined
@@ -239,11 +241,21 @@ function fakeSession(overrides: {
     ?? PORTABLE_RECORD_DOMAIN_ORDER.map((domain) => defaultLedgerCheckpoint(domain));
   const ledgerIdentityTotal = overrides.ledgerIdentityTotal ?? LEDGER_TOTAL_RECORD_COUNT_DEFAULT;
   const ledgerNonInjective = overrides.ledgerNonInjective ?? [];
+  // Mirrors SEQUENCE_BACKED_IDENTITY_COLUMN by default, so the round-1
+  // P2 completeness guard sees an agreeing "live schema" on the default
+  // fixture. A test proving the guard fires overrides this to a
+  // deliberately disagreeing set.
+  const identityColumns = overrides.identityColumns ?? Object.values(SEQUENCE_BACKED_IDENTITY_COLUMN).map((target) => ({
+    tableName: target!.table.replace("lcm.", ""), columnName: target!.column,
+  }));
   const seqNameFor = (domain: string) => `lcm.fake_${domain}_seq`;
   return {
     identity: { sessionId: "window-session", backendPid: 999, projectId },
     query: vi.fn(async (config: { text: string; values?: readonly unknown[] }) => {
       if (config.text.includes("pg_current_xact_id_if_assigned")) return { rows: [{ xid: overrides.xid ?? null }] };
+      if (config.text.includes("attidentity")) {
+        return { rows: identityColumns.map(({ tableName, columnName }) => ({ table_name: tableName, column_name: columnName })) };
+      }
       if (config.text.includes("lcm.transfer_runs")) {
         if (ledgerRun === null) return { rows: [] };
         return { rows: [{ run_id: "fake-run-id", state: ledgerRun.state, manifest_sha256: ledgerRun.manifestSha256, project_sha256: ledgerRun.projectSha256 }] };
@@ -1411,6 +1423,18 @@ describe("inspectMigrationVerification", () => {
 });
 
 describe("readSequenceSelfConsistencyMismatches", () => {
+  it("round-1 P2 red case: refuses when the live schema's identity columns disagree with SEQUENCE_BACKED_IDENTITY_COLUMN", async () => {
+    // A stale map -- one that no longer matches what pg_catalog actually
+    // reports as identity-backed under schema lcm -- must refuse rather
+    // than silently let the self-consistency bound run against an
+    // incomplete or wrong set of columns while sequence classCoverage
+    // still claims ran: true.
+    const session = fakeSession({
+      identityColumns: [{ tableName: "conversations", columnName: "conversation_id" }],
+    });
+    await expect(readSequenceSelfConsistencyMismatches(session as never, projectId))
+      .rejects.toMatchObject({ reason: "invalid-input" });
+  });
   it("skips a domain whose sequence has never been called and the max identity is null (empty domain)", async () => {
     const session = fakeSession();
     const mismatches = await readSequenceSelfConsistencyMismatches(session as never, projectId);
@@ -1458,6 +1482,9 @@ describe("readSequenceSelfConsistencyMismatches", () => {
     // the schema; that must fail closed rather than silently pass.
     const session = {
       query: vi.fn(async (config: { text: string }) => {
+        if (config.text.includes("attidentity")) {
+          return { rows: Object.values(SEQUENCE_BACKED_IDENTITY_COLUMN).map((target) => ({ table_name: target!.table.replace("lcm.", ""), column_name: target!.column })) };
+        }
         if (config.text.includes("MAX(")) return { rows: [{ max_value: "500" }] };
         if (config.text.includes("pg_get_serial_sequence")) return { rows: [{ seq_name: null }] };
         return { rows: [{ admitted: true }] };

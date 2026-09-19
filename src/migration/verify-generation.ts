@@ -685,9 +685,49 @@ export async function readSequenceStoredState(
   return { kind: "called", lastValue: BigInt(row.last_value), incrementBy: BigInt(row.increment_by) };
 }
 
+/**
+ * Round-1 P2: SEQUENCE_BACKED_IDENTITY_COLUMN is a hand-maintained
+ * completeness claim about which portable domains have an identity
+ * sequence to bound. Previously this claim was proven against
+ * pg_catalog only by an integration test requiring a live PostgreSQL 18
+ * harness to even run -- every fake-backed unit test, and any
+ * environment that skips the harness, could ship a stale map (a future
+ * migration adding an identity column that never gets added here)
+ * completely undetected, while sequence classCoverage kept claiming
+ * ran: true for a column the self-consistency bound never actually
+ * checked. Asserting this here, inside the fenced window on every real
+ * run, makes a stale map a refusal on that run rather than an untested
+ * assumption resting on whether anyone happened to run the harness.
+ * fenced_leases.fencing_token is coordination-internal lease machinery,
+ * not a portable domain, and is excluded exactly as the integration
+ * test excludes it.
+ */
+async function assertSequenceBackedIdentityColumnCompleteness(
+  session: PostgreSqlSnapshotSession, signal?: AbortSignal,
+): Promise<void> {
+  const result = await session.query<{ table_name: string; column_name: string }>({
+    text: "SELECT c.relname AS table_name, a.attname AS column_name "
+      + "FROM pg_catalog.pg_attribute a "
+      + "JOIN pg_catalog.pg_class c ON c.oid OPERATOR(pg_catalog.=) a.attrelid "
+      + "JOIN pg_catalog.pg_namespace n ON n.oid OPERATOR(pg_catalog.=) c.relnamespace "
+      + "WHERE n.nspname OPERATOR(pg_catalog.=) 'lcm' AND a.attidentity OPERATOR(pg_catalog.<>) '' "
+      + "AND c.relkind OPERATOR(pg_catalog.=) 'r' AND NOT a.attisdropped "
+      + "AND c.relname OPERATOR(pg_catalog.<>) 'fenced_leases'",
+  }, { domain: "factory", operation: "verifyGenerationSequenceCompleteness", signal });
+  const actual = result.rows.map((row) => `${row.table_name}.${row.column_name}`).sort();
+  const expected = Object.values(SEQUENCE_BACKED_IDENTITY_COLUMN)
+    .map((target) => `${target!.table.replace("lcm.", "")}.${target!.column}`)
+    .sort();
+  const matches = actual.length === expected.length && actual.every((value, index) => value === expected[index]);
+  if (!matches) {
+    driverError("invalid-input", "the sequence-backed identity column map does not match the destination's live schema");
+  }
+}
+
 export async function readSequenceSelfConsistencyMismatches(
   session: PostgreSqlSnapshotSession, projectId: string, signal?: AbortSignal,
 ): Promise<MigrationVerificationMismatch[]> {
+  await assertSequenceBackedIdentityColumnCompleteness(session, signal);
   const mismatches: MigrationVerificationMismatch[] = [];
   for (const [domain, target] of Object.entries(SEQUENCE_BACKED_IDENTITY_COLUMN)) {
     const maxResult = await session.query<{ max_value: string | null }>({
