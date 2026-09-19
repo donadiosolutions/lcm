@@ -650,6 +650,7 @@ function recognizedHealthStorageBackend(health: HealthResponse): StorageBackend 
 const USER_SYSTEMD_PID_CACHE_TTL_MS = 5000;
 const MAX_TIMER_DELAY_MS = 2_147_483_647;
 const MAX_SUPERVISOR_COMMAND_TIMEOUT_MS = 60_000;
+const MANAGER_PEER_REVALIDATION_MS = 1_000;
 const STORAGE_BACKEND_AUTH_WARNING = "daemon reuse or replacement was blocked because the storage-backend mismatch could not be authenticated or terminated safely; verify the local daemon token, stop the existing daemon if necessary, and retry";
 const RUNTIME_IDENTITY_AUTH_WARNING = "daemon reuse or replacement was blocked because the runtime-identity mismatch (entrypoint or packaged-runtime digest) could not be authenticated or terminated safely; verify the local daemon token, stop the existing daemon if necessary, and retry";
 const userSystemdPidCache = new Map<string, { pid: number | null; expiresAt: number }>();
@@ -2748,10 +2749,11 @@ async function ensureDaemonUnlocked(opts: EnsureDaemonOptions): Promise<EnsureDa
     supervisor: Supervisor,
     spec: SupervisorSpec,
     pid: number,
+    probeDeadline = deadline,
   ): Promise<ManagedDaemonPeerEvidence | null> {
     let before: SupervisorObservation;
     try {
-      before = await supervisor.probe(spec, { deadline });
+      before = await supervisor.probe(spec, { deadline: probeDeadline });
     } catch {
       return null;
     }
@@ -2760,7 +2762,7 @@ async function ensureDaemonUnlocked(opts: EnsureDaemonOptions): Promise<EnsureDa
     if (admitted === null) return null;
     let after: SupervisorObservation;
     try {
-      after = await supervisor.probe(spec, { deadline });
+      after = await supervisor.probe(spec, { deadline: probeDeadline });
     } catch {
       return null;
     }
@@ -3391,7 +3393,12 @@ async function ensureDaemonUnlocked(opts: EnsureDaemonOptions): Promise<EnsureDa
       admissionPins,
       () => authenticated.pid === undefined
         ? null
-        : admitFreshManagerPeer(supervisor, requestedSpec, authenticated.pid),
+        : admitFreshManagerPeer(
+            supervisor,
+            requestedSpec,
+            authenticated.pid,
+            monotonicNow() + MANAGER_PEER_REVALIDATION_MS,
+          ),
     );
     return accepted ?? refusalResult("response-invalid", "managed daemon identity could not be admitted", { pid: observation.managerPid });
   }
@@ -3562,7 +3569,12 @@ async function ensureDaemonUnlocked(opts: EnsureDaemonOptions): Promise<EnsureDa
                 admissionPins,
                 () => authenticated.pid === undefined
                   ? null
-                  : admitFreshManagerPeer(supervisor, launchSpec, authenticated.pid),
+                  : admitFreshManagerPeer(
+                      supervisor,
+                      launchSpec,
+                      authenticated.pid,
+                      monotonicNow() + MANAGER_PEER_REVALIDATION_MS,
+                    ),
               );
               if (accepted) {
                 if (managedCredentialDirectoryForCleanup !== undefined) {

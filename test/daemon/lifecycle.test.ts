@@ -4198,6 +4198,78 @@ describe("restartDaemon", () => {
     expect(spec).toBeDefined();
   });
 
+  it("uses a fresh deadline for retained manager peer admission", async () => {
+    const fixture = createOwnedDaemonFixture("lcm-lifecycle-retained-manager-", 200);
+    let now = 0;
+    let drift = false;
+    const probeDeadlines: Array<number | undefined> = [];
+    const probe = vi.fn(async (
+      candidate: { scopeDigest: string; nonce: string; name: string },
+      operation?: { readonly deadline?: number },
+    ) => {
+      probeDeadlines.push(operation?.deadline);
+      if ((operation?.deadline ?? 0) <= now) {
+        return { kind: "ambiguous" as const, name: candidate.name, reason: "deadline-expired" };
+      }
+      return {
+        kind: "registered-running-valid" as const,
+        managerPid: drift ? 201 : 200,
+        scopeDigest: candidate.scopeDigest,
+        nonce: candidate.nonce,
+        name: candidate.name,
+        controlGroup: drift ? "/user.slice/foreign.service" : "/user.slice/lcm.service",
+      };
+    });
+    const supervisor = { probe, start: vi.fn(), stopAndStart: vi.fn(), stopAndAwaitAbsent: vi.fn() };
+    const health = {
+      status: "ok",
+      version: "1.4.2",
+      pid: 200,
+      entrypoint: testIdentity.entrypoint,
+      storageBackend: "sqlite",
+      runtimeDigest: TEST_RUNTIME_DIGEST,
+    };
+    const fetchMock = vi.fn()
+      .mockResolvedValueOnce(new Response(JSON.stringify(health), { status: 200 }))
+      .mockResolvedValueOnce(new Response(JSON.stringify(health), { status: 200 }))
+      .mockResolvedValueOnce(new Response(JSON.stringify({ totalConnections: 0 }), { status: 200 }));
+    const authenticated = vi.fn();
+
+    const result = await ensureDaemon({
+      port: 19999,
+      pidFilePath: fixture.pidFile,
+      spawnTimeoutMs: 100,
+      expectedVersion: "1.4.2",
+      expectedEntrypoint: testIdentity.entrypoint,
+      expectedRuntimeDigest: TEST_RUNTIME_DIGEST,
+      enforceUserManagerParent: true,
+      _managedOperationAuthorized: true,
+      _managedOperationManagerPid: 200,
+      _platform: "linux",
+      _procRoot: fixture.procRoot,
+      _fetchOverride: fetchMock as FetchOverride,
+      _isProcessAliveOverride: () => true,
+      _listeningPortsOverride: () => [19999],
+      _monotonicNowOverride: () => now,
+      _supervisorOverride: supervisor as never,
+      _onAuthenticatedDaemonResult: authenticated,
+    });
+    expect(result).toMatchObject({ connected: true, pid: 200 });
+    expect(authenticated).toHaveBeenCalledOnce();
+
+    const evidence = authenticated.mock.calls[0]![0] as {
+      admitPeer: () => Promise<{ pid: number; birth: string } | null>;
+    };
+    now = 10_000;
+    await expect(evidence.admitPeer()).resolves.toMatchObject({ pid: 200 });
+
+    drift = true;
+    const readToken = vi.fn();
+    if (await evidence.admitPeer() !== null) readToken();
+    expect(readToken).not.toHaveBeenCalled();
+    expect(probeDeadlines.slice(-3)).toEqual([11_000, 11_000, 11_000]);
+  });
+
   it("refuses managed ensure recovery when a registered job gives no response", async () => {
     const tempDir = mkdtempSync(join(tmpdir(), "lcm-lifecycle-managed-offline-"));
     tempDirs.push(tempDir);
