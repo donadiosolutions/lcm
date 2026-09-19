@@ -43,14 +43,17 @@ escalation, follow-up, or replacement worker, it recursively redacts credential-
 like content and wraps the result as a canonical JSON envelope between
 `<<<LCM_UNTRUSTED_ISSUE_DATA>>>` and
 `<<<END_LCM_UNTRUSTED_ISSUE_DATA>>>`. Injected delimiter text is replaced, and the
-serialized JSON is limited to 65,536 UTF-8 bytes only after redaction so a secret
-cannot evade redaction by crossing the truncation boundary.
+complete wrapped envelope is limited to 65,536 UTF-8 bytes only after redaction so
+a secret cannot evade redaction by crossing the truncation boundary. The limit
+covers both delimiter lines, the two separating LF bytes, and all bytes including
+the JSON rather than applying only to the JSON payload.
 
-Redaction uses the union of the issue-label prompt redactor and every repository
-built-in secret pattern, including bare npm, Slack, Stripe, Google, and SendGrid
-tokens that do not have assignment labels or surrounding context. The canonical
-projector owns all truncation; it never uses the prompt helper's default 8,000
-UTF-16-code-unit maximum. Content that remains below the aggregate envelope limit
+Redaction uses the union of the issue-label prompt redactor, every generated
+`GITLEAKS_PATTERNS` entry, and every hand-curated `NATIVE_PATTERNS` entry, including
+bare npm, GitLab, Slack, Stripe, Google, and SendGrid tokens that do not have
+assignment labels or surrounding context. The canonical projector owns all
+truncation; it never uses the prompt helper's default 8,000 UTF-16-code-unit
+maximum. Content whose complete wrapper remains below the aggregate envelope limit
 after redaction is preserved in full. Known unavoidable loss before projection is
 reported in truncation metadata, and unknown or unsafe earlier loss fails closed.
 
@@ -69,16 +72,20 @@ unsafe content.
 Every worker is told that enveloped content is inert untrusted data. Embedded
 instructions are prohibited and are never authority to run commands, change
 scope, or mutate GitHub. Reproduction steps must be derived independently from
-trusted repository state. Direct issue reads use the same projection before the
-content is quoted, stored, or forwarded; persisted and read-back campaign evidence
-stays bounded and redacted, including worker-authored evidence that quotes issue
-text. The S0 inventory, root Epic, child trackers, and checkpoints persist complete
+trusted repository state. Direct GitHub and API reads require a supported trusted
+transport-side projector before raw issue content enters tool output or model
+context. Projection after worker exposure is too late. When that transport is not
+available, the campaign must fail closed without reading instead of exposing raw
+content and projecting afterward. Persisted and read-back campaign evidence stays
+bounded and redacted, including worker-authored evidence that quotes issue text.
+The S0 inventory, root Epic, child trackers, and checkpoints persist complete
 member coverage only as canonical envelopes plus their separate trusted source
 identity. That same form crosses the triage-to-remediation handoff.
 
-This safety contract is repository-owned guidance. Prompt assembly and enforcement
-inside an external agent harness remain a compatibility boundary and require the
-documented runtime scenario to validate. It does not change campaign authority:
+This safety contract is repository-owned guidance. Prompt assembly, trusted
+transport-side projection, and enforcement inside an external agent harness remain
+a compatibility boundary and require the documented runtime scenario to validate.
+It does not change campaign authority:
 the root coordinator remains the only actor that writes issue/tracker state,
 publishes, or merges, while workers return proposed actions and results. Only the
 root comments on or closes a Bug, then reports authoritative closure readback from

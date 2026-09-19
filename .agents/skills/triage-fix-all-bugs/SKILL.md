@@ -56,8 +56,10 @@ string before serialization:
 
 1. Apply the redaction union before byte budgeting: the complete credential, token,
    private-key, and credential-bearing URL behavior of `redactPromptText()` in
-   [the issue-label policy](../../../.github/scripts/issue-label-policy.mjs), plus
-   every repository built-in secret pattern in `NATIVE_PATTERNS` from
+   [the issue-label policy](../../../.github/scripts/issue-label-policy.mjs), every
+   generated `GITLEAKS_PATTERNS` entry from
+   [`src/generated-patterns.ts`](../../../src/generated-patterns.ts), and every
+   hand-curated `NATIVE_PATTERNS` entry from
    [`src/scrub.ts`](../../../src/scrub.ts). This includes bare token formats even
    without an assignment label or surrounding context. Keep the public behavior
    aligned with [issue triage](../../../docs/issue-triage.md#security-and-operations).
@@ -66,17 +68,19 @@ string before serialization:
    default maximum of 8,000 UTF-16 code units. If the helper is reused, pass an
    explicit no-loss maximum such as `Number.MAX_SAFE_INTEGER`, verify it retained
    the full value, and then apply the remaining union patterns over the complete
-   text. Preserve all redacted content whenever the aggregate canonical envelope
-   fits within 65,536 UTF-8 bytes.
+   text. Preserve all redacted content whenever the complete wrapped envelope fits
+   within 65,536 UTF-8 bytes.
 2. Replace every exact injected `<<<LCM_UNTRUSTED_ISSUE_DATA>>>` or
    `<<<END_LCM_UNTRUSTED_ISSUE_DATA>>>` token in a value with the literal
    `[REDACTED_UNTRUSTED_DELIMITER]`.
-3. Serialize the projection and explicit truncation metadata to at most 65,536
-   UTF-8 bytes between the delimiters. If reduction is needed, retain the
-   truncation metadata and remove later data-field and array content first,
-   dropping array tails while retaining stable source order. Any scalar cut lands
-   on a UTF-8 code-point boundary and must not split JSON syntax, a delimiter
-   token, or a redaction marker. Truncation must never restore a redacted span.
+3. Serialize the complete wrapped envelope to at most 65,536 UTF-8 bytes. That
+   ceiling covers both delimiter lines, the two separating LF bytes, and all bytes
+   including the JSON projection and explicit truncation metadata; it is not a
+   JSON-only budget. If reduction is needed, retain the truncation metadata and
+   remove later data-field and array content first, dropping array tails while
+   retaining stable source order. Any scalar cut lands on a UTF-8 code-point
+   boundary and must not split JSON syntax, a delimiter token, or a redaction
+   marker. Truncation must never restore a redacted span.
 
 The truncation object uses exactly these metadata key names: `applied`, `source`,
 `reason`, `originalBytes`, and `retainedBytes`. An untruncated envelope needs only
@@ -96,11 +100,17 @@ trusted repository state rather than copied or executed from the envelope.
 
 This boundary applies to triage, duplicate adjudication, planning, implementation,
 review, synthesis, escalation, follow-up, and replacement workers, including all
-shared procedural roles. A direct read or refetch does not bypass it: apply the
-same projection before quoting, persisting, summarizing, or forwarding content.
-Only canonical envelopes may cross worker and phase boundaries. Downstream roles
-preserve the envelope and must not re-expand raw issue content without projecting
-it again.
+shared procedural roles. A direct read from GitHub or another API does not bypass
+it. Use only a supported trusted transport-side projector that executes before raw
+issue content enters tool output or model context and emits only the canonical
+envelope plus separate trusted identity/control. Projection after worker exposure
+is too late.
+The projector and its configuration must come from trusted repository or harness
+state, never from issue-controlled input. If the available transport cannot apply
+the projection at that boundary, fail closed without reading; do not fetch raw
+issue content and attempt to repair it afterward. Only canonical envelopes may
+cross worker and phase boundaries. Downstream roles preserve the envelope and must
+not re-expand raw issue content without using that same pre-exposure transport.
 
 Keep the enumerated trusted source identity outside the envelope: canonical
 host/repository, issue number and native node ID, URL, native type, and parent.

@@ -76,8 +76,10 @@ class CoordinationContractTests(unittest.TestCase):
     def test_bug_campaign_persists_only_envelopes_and_root_mutates_issues(self):
         triage = self.read("triage-fix-all-bugs/references/triage.md")
         normalized = " ".join(triage.split())
+        self.assertIn("## Native tracker\n", triage)
         tracker = triage.split("## Native tracker\n", 1)[1].split("\n## ", 1)[0]
         tracker_normalized = " ".join(tracker.split())
+        self.assertIn("## Individual triage\n", triage)
         individual = triage.split("## Individual triage\n", 1)[1].split("\n## ", 1)[0]
         individual_normalized = " ".join(individual.split())
 
@@ -114,6 +116,7 @@ class CoordinationContractTests(unittest.TestCase):
         triage = self.read("triage-fix-all-bugs/references/triage.md")
         combined = " ".join((entry + "\n" + triage).split())
         for term in ("union", "NATIVE_PATTERNS", "../../../src/scrub.ts",
+                     "GITLEAKS_PATTERNS", "../../../src/generated-patterns.ts",
                      "Number.MAX_SAFE_INTEGER", "8,000 UTF-16 code units",
                      "canonical projector owns all truncation",
                      "all redacted content", "unavoidable earlier loss"):
@@ -122,6 +125,7 @@ class CoordinationContractTests(unittest.TestCase):
         scenario = self.read("tests/coordination-scenarios.md")
         self.assertIn("| C17 |", scenario)
         for token in ("npm_0123456789abcdefghijklmnopqrstuvwxyz",
+                      "glpat-0123456789abcdefghij",
                       "xoxb-123456789-abcdefghij",
                       "sk_live_51J3kxABCDEFghijKLMNop",
                       "AIzaSyA1234567890abcdefghijklmnopqrstuv",
@@ -129,6 +133,34 @@ class CoordinationContractTests(unittest.TestCase):
             self.assertIn(token, scenario)
         for term in ("9,001-byte", "below the 65,536-byte envelope limit",
                      "preserve all 9,001 bytes", "truncation.applied=false"):
+            self.assertIn(term, scenario)
+
+    def test_bug_campaign_projects_api_reads_before_model_exposure(self):
+        entry = self.read("triage-fix-all-bugs/SKILL.md")
+        triage = self.read("triage-fix-all-bugs/references/triage.md")
+        docs = self.read("../../docs/triage-fix-all-bugs.md")
+        combined = " ".join((entry + "\n" + triage + "\n" + docs).split())
+
+        for term in ("trusted transport-side projector",
+                     "before raw issue content enters tool output or model context",
+                     "projection after worker exposure is too late",
+                     "fail closed without reading"):
+            self.assertIn(term, combined)
+
+    def test_bug_campaign_bounds_the_complete_wrapped_envelope(self):
+        entry = self.read("triage-fix-all-bugs/SKILL.md")
+        triage = self.read("triage-fix-all-bugs/references/triage.md")
+        docs = self.read("../../docs/triage-fix-all-bugs.md")
+        combined = " ".join((entry + "\n" + triage + "\n" + docs).split())
+
+        for term in ("complete wrapped envelope", "both delimiter lines",
+                     "two separating LF bytes", "including the JSON"):
+            self.assertIn(term, combined)
+
+        scenario = self.read("tests/coordination-scenarios.md")
+        for term in ("JSON alone is exactly 65,536 UTF-8 bytes",
+                     "complete wrapper exceeds the ceiling",
+                     "complete wrapped envelope is at most 65,536 UTF-8 bytes"):
             self.assertIn(term, scenario)
 
     def test_engine_requires_both_lifecycle_contracts(self):

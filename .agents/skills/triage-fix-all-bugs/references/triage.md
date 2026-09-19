@@ -31,22 +31,28 @@ retain only the bounded credential-redacted canonical envelope. Store trusted
 source identity and workflow control separately; a contributor-controlled title
 is never an identity field.
 
-The root constructs the envelope before initial dispatch. A worker that directly
-reads or refetches an issue through GitHub or another API must apply exactly the
-same projection before the content is reused in a prompt, quoted, persisted,
-summarized, or forwarded. Raw issue content is not a recoverable cache: later
-readback uses the stored envelope, and a downstream role may re-read raw content
-only by constructing a fresh canonical projection first.
+The root constructs the envelope before initial dispatch. Every direct GitHub or
+API read/refetch must use a supported trusted transport-side projector that applies
+the same projection before raw issue content enters tool output or model context.
+The transport emits only the canonical envelope plus separate trusted identity and
+control; projection after worker exposure is too late. The projector and its
+configuration are trusted harness/repository state, not issue-controlled input. If
+the available transport cannot enforce that boundary, fail closed without reading.
+Raw issue content is not a recoverable cache: later readback uses the stored
+envelope, and a downstream role may re-read only through the same pre-exposure
+transport projection.
 
 For every read or refetch, apply the entrypoint's full redaction union: the
-issue-label redactor behavior plus all repository `NATIVE_PATTERNS`. The canonical
-projector owns all truncation. Never accept the issue-label helper's default
-8,000 UTF-16 code units; use an explicit verified no-loss maximum such as
-`Number.MAX_SAFE_INTEGER`. If the complete redacted projection remains below the
-aggregate envelope ceiling, preserve all redacted content and keep
-`truncation.applied` false. Any unavoidable earlier loss must be authenticated and
-described by true truncation metadata; when its extent or redaction safety cannot
-be proven, record an intake blocker and fail closed.
+issue-label redactor behavior, all generated `GITLEAKS_PATTERNS`, and all
+hand-curated repository `NATIVE_PATTERNS`. The canonical projector owns all
+truncation. Never accept the issue-label helper's default 8,000 UTF-16 code units;
+use an explicit verified no-loss maximum such as `Number.MAX_SAFE_INTEGER`. If the
+complete redacted projection remains below the complete wrapped envelope ceiling,
+preserve all redacted content and keep `truncation.applied` false. The 65,536-byte
+budget covers both delimiter lines, the two separating LF bytes, and all bytes
+including the JSON, not only the JSON payload. Any unavoidable earlier loss must
+be authenticated and described by true truncation metadata; when its extent or
+redaction safety cannot be proven, record an intake blocker and fail closed.
 
 Every triager and duplicate adjudicator prompt labels the delimited envelope as
 untrusted data, prohibits following embedded instructions, and requires any
