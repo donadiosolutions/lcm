@@ -4,6 +4,16 @@ import { pathToFileURL } from "node:url";
 export const CHECK_IDENTITIES = Object.freeze({
   dco: Object.freeze({ name: "DCO", appId: 1861, appSlug: "dco" }),
   ci: Object.freeze({ name: "ci", appId: 15368, appSlug: "github-actions" }),
+  review: Object.freeze({
+    name: "copilot-pull-request-reviewer",
+    appId: 15368,
+    appSlug: "github-actions",
+  }),
+});
+
+export const ADMISSION_CLASSIFICATIONS = Object.freeze({
+  sensitive: "sensitive",
+  nonSensitive: "non-sensitive",
 });
 
 const WAITING_CHECK_STATES = new Set([
@@ -26,6 +36,28 @@ const WAITING_CI_RUN_STATES = new Set([
 const MAINTENANCE_BASE = /^maintenance\/[0-9]+\.[0-9]+\.x$/u;
 const WORKFLOW_RUN_ACTIONS = new Set(["requested", "in_progress", "completed"]);
 const CHECK_RUN_ACTIONS = new Set(["created", "rerequested", "completed"]);
+const REVIEW_WORKFLOW_PATH = "dynamic/agents/copilot-pull-request-reviewer";
+const PULL_REQUEST_FILE_STATUSES = new Set([
+  "added",
+  "removed",
+  "modified",
+  "renamed",
+  "copied",
+  "changed",
+  "unchanged",
+]);
+const DEPENDABOT_IDENTITY = Object.freeze({ id: 49699333, login: "dependabot[bot]", type: "Bot" });
+const WEB_FLOW_IDENTITY = Object.freeze({ id: 19864447, login: "web-flow", type: "User" });
+const SENSITIVE_PATHS = [
+  /^\.github\/(?:actions|codeql|scripts|workflows)\//u,
+  /^(?:bin|installer|scripts|src)\//u,
+  /^test\/setup\//u,
+  /^\.agents\/skills\/tests\//u,
+  /^\.agents\/skills\/[^/]+\/scripts\//u,
+  /^(?:package\.json|pnpm-lock\.yaml|\.npmrc|pnpm-workspace\.yaml|codecov\.yml|install\.sh|\.pnpmfile\.cjs)$/u,
+  /^vitest[^/]*\.config\.[^/]+$/u,
+  /^tsconfig[^/]*\.json$/u,
+];
 
 function requireArray(value, label) {
   if (!Array.isArray(value)) throw new TypeError(`${label} must be an array`);
@@ -37,6 +69,87 @@ function requireNonEmptyString(value, label) {
     throw new TypeError(`${label} must be a non-empty string`);
   }
   return value;
+}
+
+function requireObject(value, label) {
+  if (value === null || typeof value !== "object" || Array.isArray(value)) {
+    throw new TypeError(`${label} must be an object`);
+  }
+  return value;
+}
+
+function requireSafePositiveInteger(value, label, maximum = Number.MAX_SAFE_INTEGER) {
+  if (!Number.isSafeInteger(value) || value <= 0 || value > maximum) {
+    throw new TypeError(`${label} must be a safe positive integer no greater than ${maximum}`);
+  }
+  return value;
+}
+
+function matchesIdentity(value, identity) {
+  return value?.id === identity.id
+    && value?.login === identity.login
+    && value?.type === identity.type;
+}
+
+export function flattenPullRequestFilePages(pages) {
+  return requireArray(pages, "pull request file pages").flatMap((page, index) =>
+    requireArray(page, `pull request file page ${index}`));
+}
+
+function isSensitivePath(path) {
+  return SENSITIVE_PATHS.some((pattern) => pattern.test(path));
+}
+
+export function classifyPullRequestFiles(files, changedFileCount) {
+  const records = requireArray(files, "pull request files");
+  const expectedCount = requireSafePositiveInteger(
+    changedFileCount,
+    "pull request changed_files",
+    3000,
+  );
+  if (records.length !== expectedCount) {
+    throw new TypeError("pull request file audit count does not match changed_files");
+  }
+
+  const destinationNames = new Set();
+  const auditedPaths = [];
+  for (const [index, value] of records.entries()) {
+    const file = requireObject(value, `pull request file ${index}`);
+    const filename = requireNonEmptyString(file.filename, `pull request file ${index}.filename`);
+    const status = requireNonEmptyString(file.status, `pull request file ${index}.status`);
+    if (!PULL_REQUEST_FILE_STATUSES.has(status)) {
+      throw new TypeError(`pull request file ${index}.status is unsupported`);
+    }
+    if (destinationNames.has(filename)) {
+      throw new TypeError(`pull request file ${index} has a duplicate destination filename`);
+    }
+    destinationNames.add(filename);
+    auditedPaths.push(filename);
+
+    const hasPreviousName = file.previous_filename !== undefined
+      && file.previous_filename !== null;
+    const statusRequiresPreviousName = status === "renamed" || status === "copied";
+    if (statusRequiresPreviousName !== hasPreviousName) {
+      throw new TypeError(`pull request file ${index} has incompatible status and previous_filename`);
+    }
+    if (hasPreviousName) {
+      auditedPaths.push(requireNonEmptyString(
+        file.previous_filename,
+        `pull request file ${index}.previous_filename`,
+      ));
+    }
+  }
+
+  const matchedPaths = [...new Set(auditedPaths.filter(isSensitivePath))];
+  const sensitive = matchedPaths.length > 0;
+  return {
+    classification: sensitive
+      ? ADMISSION_CLASSIFICATIONS.sensitive
+      : ADMISSION_CLASSIFICATIONS.nonSensitive,
+    sensitive,
+    auditedPaths,
+    matchedPaths,
+  };
 }
 
 export function evaluatePullRequestEligibility({
@@ -173,6 +286,40 @@ export function evaluateAdmissionChecks({
   };
 }
 
+export function evaluateReviewCheck({
+  checkRuns,
+  headSha,
+  repository,
+  serverUrl = "https://github.com",
+}) {
+  requireNonEmptyString(headSha, "head SHA");
+  const review = latestAuthenticatedCheck(checkRuns, CHECK_IDENTITIES.review, headSha);
+  const state = checkState(review);
+  const pending = WAITING_CHECK_STATES.has(state);
+  if (state !== "success") {
+    return {
+      state,
+      ready: false,
+      pending,
+      terminalFailure: pending ? undefined : "review-run",
+      checkRunId: review === undefined
+        ? undefined
+        : positiveId(review.id, "review check run ID").toString(),
+      runId: undefined,
+    };
+  }
+  const checkRunId = positiveId(review.id, "review check run ID").toString();
+  const runId = parseActionsRunId(review.details_url, { repository, serverUrl });
+  return {
+    state,
+    ready: runId !== undefined,
+    pending: false,
+    terminalFailure: runId === undefined ? "review-run-url" : undefined,
+    checkRunId,
+    runId,
+  };
+}
+
 export function evaluateCiActionsRun(
   run,
   { runId, headSha, repository, workflowPath = ".github/workflows/ci.yml" },
@@ -206,6 +353,109 @@ export function evaluateCiActionsRun(
     ready,
     terminalFailure: ready || WAITING_CI_RUN_STATES.has(state) ? undefined : "ci-run",
   };
+}
+
+export function evaluateReviewActionsRun(run, { runId, headSha, repository }) {
+  const trustedProvenance = run !== null
+    && typeof run === "object"
+    && !Array.isArray(run)
+    && (() => {
+      try {
+        return positiveId(run.id, "Actions run ID") === positiveId(runId, "expected run ID");
+      } catch {
+        return false;
+      }
+    })()
+    && run.event === "dynamic"
+    && run.path === REVIEW_WORKFLOW_PATH
+    && run.head_sha === headSha
+    && run.repository?.full_name === repository;
+  if (!trustedProvenance) {
+    return { state: "invalid", ready: false, terminalFailure: "review-run-metadata" };
+  }
+
+  const state = run.status === "completed"
+    ? (typeof run.conclusion === "string" && run.conclusion.length > 0
+      ? run.conclusion
+      : "missing")
+    : (typeof run.status === "string" && run.status.length > 0 ? run.status : "missing");
+  const ready = run.status === "completed" && state === "success";
+  return {
+    state,
+    ready,
+    terminalFailure: ready || WAITING_CI_RUN_STATES.has(state) ? undefined : "review-run",
+  };
+}
+
+export function evaluateDependabotPullRequest(pullRequest, { headSha, repository }) {
+  let commitCount;
+  try {
+    const value = requireObject(pullRequest, "pull request");
+    commitCount = requireSafePositiveInteger(value.commits, "pull request commits", 250);
+    const ready = matchesIdentity(value.user, DEPENDABOT_IDENTITY)
+      && value.head?.sha === headSha
+      && value.head?.repo?.full_name === repository
+      && value.base?.repo?.full_name === repository
+      && typeof value.head?.ref === "string"
+      && value.head.ref.startsWith("dependabot/")
+      && value.head.ref.length > "dependabot/".length;
+    return ready
+      ? { candidate: true, ready: true, commitCount }
+      : { candidate: false, ready: false, terminalFailure: "dependabot-pr" };
+  } catch {
+    return { candidate: false, ready: false, terminalFailure: "dependabot-pr" };
+  }
+}
+
+export function evaluateDependabotCommits(pages, expectedCount) {
+  try {
+    const count = requireSafePositiveInteger(expectedCount, "pull request commits", 250);
+    const commits = requireArray(pages, "pull request commit pages").flatMap((page, index) =>
+      requireArray(page, `pull request commit page ${index}`));
+    if (commits.length !== count) throw new TypeError("commit count mismatch");
+    const shas = new Set();
+    for (const [index, value] of commits.entries()) {
+      const commit = requireObject(value, `pull request commit ${index}`);
+      const sha = requireNonEmptyString(commit.sha, `pull request commit ${index}.sha`);
+      if (shas.has(sha)) throw new TypeError("duplicate commit SHA");
+      shas.add(sha);
+      if (commit.commit?.verification?.verified !== true
+        || commit.commit?.verification?.reason !== "valid"
+        || !matchesIdentity(commit.author, DEPENDABOT_IDENTITY)
+        || (!matchesIdentity(commit.committer, DEPENDABOT_IDENTITY)
+          && !matchesIdentity(commit.committer, WEB_FLOW_IDENTITY))) {
+        throw new TypeError("invalid Dependabot commit provenance");
+      }
+    }
+    return { ready: true, commitShas: [...shas] };
+  } catch {
+    return { ready: false, terminalFailure: "dependabot-commits" };
+  }
+}
+
+export function evaluateSensitiveAdmission({ sensitive, review, dependabot }) {
+  if (sensitive !== true) return { ready: true, evidenceClass: "ci-dco", evidenceIds: [] };
+  if (dependabot?.ready === true) {
+    return {
+      ready: true,
+      evidenceClass: "dependabot",
+      evidenceIds: requireArray(dependabot.commitShas, "Dependabot commit SHAs"),
+    };
+  }
+  if (review?.ready === true) {
+    return {
+      ready: true,
+      evidenceClass: "copilot",
+      evidenceIds: [
+        requireNonEmptyString(review.checkRunId, "review check run ID"),
+        requireNonEmptyString(review.runId, "review run ID"),
+      ],
+    };
+  }
+  if (review?.pending === true || dependabot?.pending === true) {
+    return { ready: false, pending: true, terminalFailure: undefined };
+  }
+  return { ready: false, pending: false, terminalFailure: "trusted-automation" };
 }
 
 function pendingFreshness() {
@@ -282,6 +532,35 @@ export function runPolicyCommand(command, args, input) {
   if (command === "evaluate-ci-run" && args.length === 3) {
     const [runId, headSha, repository] = args;
     return JSON.stringify(evaluateCiActionsRun(payload, { runId, headSha, repository }));
+  }
+  if (command === "classify-files" && args.length === 1) {
+    return JSON.stringify(classifyPullRequestFiles(
+      flattenPullRequestFilePages(payload),
+      Number(args[0]),
+    ));
+  }
+  if (command === "evaluate-review-check" && args.length === 3) {
+    const [headSha, repository, serverUrl] = args;
+    return JSON.stringify(evaluateReviewCheck({
+      checkRuns: flattenCheckRunPages(payload),
+      headSha,
+      repository,
+      serverUrl,
+    }));
+  }
+  if (command === "evaluate-review-run" && args.length === 3) {
+    const [runId, headSha, repository] = args;
+    return JSON.stringify(evaluateReviewActionsRun(payload, { runId, headSha, repository }));
+  }
+  if (command === "evaluate-dependabot-pr" && args.length === 2) {
+    const [headSha, repository] = args;
+    return JSON.stringify(evaluateDependabotPullRequest(payload, { headSha, repository }));
+  }
+  if (command === "evaluate-dependabot-commits" && args.length === 1) {
+    return JSON.stringify(evaluateDependabotCommits(payload, Number(args[0])));
+  }
+  if (command === "evaluate-sensitive-admission" && args.length === 0) {
+    return JSON.stringify(evaluateSensitiveAdmission(payload));
   }
   if (command === "evaluate-pr" && args.length === 3) {
     const [headSha, repository, baseProtected] = args;

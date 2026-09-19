@@ -1,14 +1,19 @@
 # External admission recovery
 
 The required `external-admission` commit status admits an exact pull request
-head only after authenticated CI and DCO checks succeed. Normal admission is
-automatic: every accepted authenticated DCO `check_run` event, canonical
-pull-request CI `workflow_run` event, or default-branch recovery dispatch wakes
-the reducer, which evaluates the latest exact-head snapshot without polling on
-a runner. Event IDs are never state authority. An accepted CI or DCO event ID
-also imposes a freshness lower bound: older visible evidence may be superseded,
-but newer or equal non-terminal event evidence remains pending until the
-corresponding current check or run is visible.
+head only after authenticated CI and DCO checks succeed. A pull request that
+changes an input capable of influencing that CI result must also provide one of
+two independent evidence classes: an authenticated exact-head Copilot dynamic
+run, or exact Dependabot PR and commit provenance.
+
+Normal admission is automatic: every accepted authenticated DCO `check_run`
+event, canonical pull-request CI `workflow_run` event, or default-branch
+recovery dispatch wakes the reducer, which evaluates the latest exact-head
+snapshot without polling on a runner. Copilot is evidence, not a new trigger.
+Event IDs are never state authority. An accepted CI or DCO event ID also imposes
+a freshness lower bound: older visible evidence may be superseded, but newer or
+equal non-terminal event evidence remains pending until the corresponding
+current check or run is visible.
 
 DCO can also report against GitHub synthetic commits with an empty suite branch
 or a `gh-readonly-queue/` ref. External admission requires a non-empty suite
@@ -35,10 +40,66 @@ replace, or manufacture any required check.
 ## Configuration
 
 There are no user-configurable options. The accepted event identities,
-freshness rules, status context, protected-base patterns, and trusted evaluator
-behavior are repository policy. Changing them requires a reviewed workflow or
-policy change; `PR_NUMBER` and `HEAD_SHA` in the recovery example are one-shot
-operator variables, not configuration settings.
+freshness rules, status context, protected-base patterns, sensitive paths, and
+trusted evaluator behavior are repository policy. Changing them requires a
+reviewed workflow or policy change; `PR_NUMBER` and `HEAD_SHA` in the recovery
+example are one-shot operator variables, not configuration settings.
+
+The sensitive set is closed: `.github/actions/**`, `.github/codeql/**`,
+`.github/scripts/**`, `.github/workflows/**`, `bin/**`, `installer/**`,
+`scripts/**`, `src/**`, `test/setup/**`, `.agents/skills/tests/**`,
+`.agents/skills/*/scripts/**`, `package.json`, `pnpm-lock.yaml`, `.npmrc`,
+`pnpm-workspace.yaml`, `.pnpmfile.cjs`, `install.sh`, `vitest*.config.*`,
+`tsconfig*.json`, and `codecov.yml`.
+Renames classify both the old and new path. Ordinary test bodies are candidate
+assertions, not trusted harness definitions, and deliberately remain outside
+this set; the configuration and setup code that discovers and initializes them
+is included.
+
+Any change to the CI workflow, package commands, Vitest or TypeScript
+configuration, or transitively executed support must update this set, its
+focused tests, and this documentation in the same pull request.
+
+## Sensitive pull requests
+
+For a repository-user pull request, Copilot review normally starts
+automatically. If an exact-head dynamic check is absent for a sensitive fork,
+human, or other-bot pull request, a maintainer requests it explicitly and then
+uses the existing recovery dispatch after the check finishes:
+
+```bash
+gh pr edit "$PR_NUMBER" \
+  --repo donadiosolutions/lcm \
+  --add-reviewer copilot-pull-request-reviewer
+```
+
+Wait for `copilot-pull-request-reviewer` on the current head, then send the
+`external-admission-reconcile` dispatch shown below. There is no review-event
+trigger and no approval lookup. A draft-to-ready transition can therefore have
+a legitimate pending window while the dynamic run starts and completes.
+
+Copilot check success proves that the GitHub-managed dynamic workflow completed
+on the exact head with authenticated run provenance. It is not an approval and
+does not prove content independence: Copilot may read instructions from the
+head branch. Review-thread resolution and the repository's other protected
+gates retain their own meaning. The accepted dynamic identity is deliberately
+narrow and may drift if GitHub migrates the feature, changes entitlement, or
+has an outage. In that case admission stays closed until a reviewed policy
+update or service recovery; repository dispatch only re-evaluates current
+evidence and cannot manufacture it.
+
+Genuine Dependabot pull requests use the alternate trusted path. The PR must be
+the exact `49699333/dependabot[bot]/Bot` identity in this repository, use a
+non-empty `dependabot/` head ref, and contain at most 250 completely enumerated
+commits. Every commit must be validly verified and authored by exact Dependabot;
+the committer may be exact Dependabot or `19864447/web-flow/User`. A `web-flow`
+signature proves GitHub-mediated creation, not Dependabot authorship, so a
+member-added update commit is denied. This narrowly trusts Dependabot as the
+producer; package-content risk remains owned by the repository's Socket gates.
+
+Changesets version pull requests retain their existing maintainer-operated
+release path. This admission policy does not create a new automatic or
+administrator-bypass path for them.
 
 ## Find and dispatch the exact PR head SHA
 
@@ -77,8 +138,10 @@ and the `external-admission` status on `HEAD_SHA`.
 - **Pending:** the workflow posts pending before PR association or policy
   evaluation. It remains pending when the current authenticated CI or DCO
   evidence is missing, incomplete, transient, or changes during the
-  three-snapshot evaluation. A newer event ID than the visible evidence, an
-  equal `requested`/`in_progress` CI event, or an equal DCO `created` or
+  three-snapshot evaluation. Sensitive changes also remain pending while an
+  exact Copilot check or backing dynamic run is missing, queued, requested,
+  in progress, pending, or waiting. A newer event ID than the visible evidence,
+  an equal `requested`/`in_progress` CI event, or an equal DCO `created` or
   `rerequested` event also remains pending. Transient branch-protection API
   failures such as network errors, rate limits, and HTTP 5xx responses remain
   pending so recovery can retry them.
@@ -88,14 +151,19 @@ and the `external-admission` status on `HEAD_SHA`.
   exact repository must target protected `main` or protected
   `maintenance/X.Y.x`. The CI check must resolve to a successful terminal
   `pull_request` run of `.github/workflows/ci.yml` for the same repository and
-  SHA.
+  SHA. Non-sensitive changes need no additional evidence. Sensitive changes
+  also have either the exact Copilot dynamic provenance or exact Dependabot PR
+  and commit provenance described above.
 - **Failure:** pull-request or base evidence is missing, ambiguous, invalid, or
   ineligible; a supported `main` or maintenance base returns HTTP 404 because
   it was deleted; a required check is terminally unsuccessful; CI provenance is
-  invalid or terminally unsuccessful; or evaluation encounters a malformed or
-  non-transient API or policy error. A deleted historical candidate is ignored
-  only when another unique eligible pull request remains. Inspect the linked
-  workflow run before retrying.
+  invalid or terminally unsuccessful; sensitive evidence is terminally invalid
+  and neither independent alternative is valid; or evaluation encounters a
+  malformed or non-transient API or policy error. Dedicated diagnostics
+  distinguish an invalid Copilot run URL, invalid run metadata, terminal run
+  state, invalid Dependabot PR identity, and invalid commit provenance. A
+  deleted historical candidate is ignored only when another unique eligible
+  pull request remains. Inspect the linked workflow run before retrying.
 
 An invalid or missing SHA fails before a status can be safely written. The
 workflow normalizes a valid hexadecimal payload SHA to lowercase before status
@@ -174,13 +242,17 @@ as code.
 Every accepted event revokes stale admission before checkout or PR association,
 then evaluates the latest exact-head snapshot. Stale event IDs are wake-up
 context only; accepted CI/DCO IDs additionally impose the freshness lower bound
-described above. The evaluator paginates commit-associated pull requests and
-check runs, authenticates exact check names and application identities, reads
-live base-branch protection, caches each base-ref lookup only within one
-snapshot resolution, and revalidates PR eligibility, required checks, and CI
-provenance immediately before success. The evaluator never downloads CI
-artifacts or caches and never checks out or executes pull-request-controlled
-content.
+described above. The evaluator paginates commit-associated pull requests, PR
+files, check runs, and eligible Dependabot commits. It rejects incomplete
+counts, duplicate destination filenames or commit SHAs, malformed rename/copy
+records, and the 3,000-file or 250-commit policy caps. It authenticates exact
+check names and application identities, reads live base-branch protection,
+caches each base-ref lookup only within one snapshot resolution, and revalidates
+PR eligibility, required checks, file classification, CI provenance, and the
+selected independent evidence immediately before success. Optional Copilot IDs
+do not destabilize a selected Dependabot fingerprint. The evaluator never
+reads the base tree, approval endpoints, CI artifacts, or caches and never
+checks out or executes pull-request-controlled content.
 
 Do not add or use `workflow_dispatch` for this recovery path. Its caller can
 select a branch or tag containing a different workflow revision, which is not
@@ -191,4 +263,5 @@ maintainer bootstrap because the default-branch evaluator could not admit its
 own replacement. That bootstrap required a manually recorded exact head plus
 successful CI, DCO, Socket, CodeQL, coverage, and review results. It is not a
 normal merge path; subsequent changes use the standard protected CI-and-DCO
-admission flow.
+admission flow, with independent evidence added when the sensitive classifier
+requires it.

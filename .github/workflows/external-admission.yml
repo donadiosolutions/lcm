@@ -10,8 +10,8 @@ on:
       - rerequested
       - completed
   # GitHub suppresses check_run workflow recursion for checks produced by
-  # Actions. Use the canonical CI workflow lifecycle as the trusted wake-up
-  # source instead of occupying a runner while polling its aggregate check.
+  # Actions. Canonical CI remains the wake-up source; the trusted evaluator
+  # reads any required Copilot dynamic evidence from the exact-head snapshot.
   workflow_run:
     workflows:
       - CI

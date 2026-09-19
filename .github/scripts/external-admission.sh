@@ -16,6 +16,7 @@ EVENT_CHECK_RUN_ID="${EVENT_CHECK_RUN_ID:-}"
 declare -A BASE_BRANCH_CACHE=()
 BASE_BRANCH_RESULT=""
 PULL_REQUEST_EVALUATION=""
+success_description="CI and DCO passed for non-sensitive change"
 
 reset_base_branch_cache() {
   BASE_BRANCH_CACHE=()
@@ -223,6 +224,26 @@ fetch_pull_request() {
     "repos/$REPOSITORY/pulls/$pull_request_number"
 }
 
+fetch_pull_request_files() {
+  local pull_request_number="$1"
+  gh api --paginate --slurp \
+    -H "X-GitHub-Api-Version: 2022-11-28" \
+    "repos/$REPOSITORY/pulls/$pull_request_number/files?per_page=100"
+}
+
+fetch_pull_request_commits() {
+  local pull_request_number="$1"
+  gh api --paginate --slurp \
+    -H "X-GitHub-Api-Version: 2022-11-28" \
+    "repos/$REPOSITORY/pulls/$pull_request_number/commits?per_page=100"
+}
+
+classify_pull_request_files() {
+  local changed_file_count="$1"
+  node .github/scripts/external-admission-policy.mjs classify-files \
+    "$changed_file_count"
+}
+
 evaluate_check_runs() {
   node .github/scripts/external-admission-policy.mjs evaluate-checks \
     "$HEAD_SHA" "$REPOSITORY" "$SERVER_URL"
@@ -232,6 +253,32 @@ evaluate_ci_run() {
   local run_id="$1"
   node .github/scripts/external-admission-policy.mjs evaluate-ci-run \
     "$run_id" "$HEAD_SHA" "$REPOSITORY"
+}
+
+evaluate_review_check() {
+  node .github/scripts/external-admission-policy.mjs evaluate-review-check \
+    "$HEAD_SHA" "$REPOSITORY" "$SERVER_URL"
+}
+
+evaluate_review_run() {
+  local run_id="$1"
+  node .github/scripts/external-admission-policy.mjs evaluate-review-run \
+    "$run_id" "$HEAD_SHA" "$REPOSITORY"
+}
+
+evaluate_dependabot_pull_request() {
+  node .github/scripts/external-admission-policy.mjs evaluate-dependabot-pr \
+    "$HEAD_SHA" "$REPOSITORY"
+}
+
+evaluate_dependabot_commits() {
+  local commit_count="$1"
+  node .github/scripts/external-admission-policy.mjs evaluate-dependabot-commits \
+    "$commit_count"
+}
+
+evaluate_sensitive_admission() {
+  node .github/scripts/external-admission-policy.mjs evaluate-sensitive-admission
 }
 
 evaluate_event_freshness() {
@@ -300,9 +347,22 @@ exit_failure() {
 validate_required_snapshot() {
   local phase="$1"
   local fingerprint_variable="$2"
+  local pull_request="$3"
   local check_run_pages evaluation check_states terminal_failure checks_ready ci_check_run_id dco_check_run_id ci_run_id
   local ci_run ci_evaluation
   local ci_terminal_failure ci_ready ci_state freshness freshness_pending freshness_failure
+  local changed_file_count file_pages classification sensitive classification_fingerprint
+  local review_check_evaluation review_check_ready review_run_id review_run review_run_evaluation
+  local review_run_ready review_pending review_evidence dependabot_pr_evaluation dependabot_ready
+  local commit_count commit_pages dependabot_evidence dependabot_evidence_ready admission_input admission_evaluation
+  local admission_ready admission_pending admission_terminal_failure evidence_class selected_evidence_fingerprint
+
+  changed_file_count="$(jq -r '.changed_files' <<<"$pull_request")" || return $?
+  file_pages="$(fetch_pull_request_files "$PR_NUMBER")" || return $?
+  classification="$(classify_pull_request_files "$changed_file_count" <<<"$file_pages")" || return $?
+  sensitive="$(jq -r '.sensitive' <<<"$classification")" || return $?
+  classification_fingerprint="$(jq -c \
+    '{classification,auditedPaths,matchedPaths}' <<<"$classification")" || return $?
 
   check_run_pages="$(gh api --paginate --slurp \
     -H "X-GitHub-Api-Version: 2022-11-28" \
@@ -358,7 +418,110 @@ validate_required_snapshot() {
       "$phase CI workflow run is $ci_state; admission remains pending."
   fi
 
-  printf -v "$fingerprint_variable" '%s' "$ci_check_run_id:$dco_check_run_id:$ci_run_id"
+  review_evidence='{"ready":false,"pending":false,"terminalFailure":"review-not-evaluated"}'
+  dependabot_evidence='{"ready":false,"pending":false,"terminalFailure":"dependabot-not-evaluated"}'
+  if [[ "$sensitive" == true ]]; then
+    dependabot_pr_evaluation="$(evaluate_dependabot_pull_request <<<"$pull_request")" || return $?
+    dependabot_ready="$(jq -r '.ready' <<<"$dependabot_pr_evaluation")" || return $?
+    if [[ "$dependabot_ready" == true ]]; then
+      commit_count="$(jq -r '.commitCount' <<<"$dependabot_pr_evaluation")" || return $?
+      if commit_pages="$(fetch_pull_request_commits "$PR_NUMBER")"; then
+        dependabot_evidence="$(
+          evaluate_dependabot_commits "$commit_count" <<<"$commit_pages"
+        )" || return $?
+      else
+        dependabot_evidence='{"ready":false,"pending":true,"terminalFailure":"dependabot-api"}'
+      fi
+    else
+      dependabot_evidence="$dependabot_pr_evaluation"
+    fi
+
+    dependabot_evidence_ready="$(jq -r '.ready' <<<"$dependabot_evidence")" || return $?
+    if [[ "$dependabot_evidence_ready" != true ]]; then
+      review_check_evaluation="$(evaluate_review_check <<<"$check_run_pages")" || return $?
+      review_check_ready="$(jq -r '.ready' <<<"$review_check_evaluation")" || return $?
+      if [[ "$review_check_ready" == true ]]; then
+        review_run_id="$(jq -r '.runId' <<<"$review_check_evaluation")" || return $?
+        if review_run="$(gh api \
+          -H "X-GitHub-Api-Version: 2022-11-28" \
+          "repos/$REPOSITORY/actions/runs/$review_run_id")"; then
+          review_run_evaluation="$(
+            evaluate_review_run "$review_run_id" <<<"$review_run"
+          )" || return $?
+          review_run_ready="$(jq -r '.ready' <<<"$review_run_evaluation")" || return $?
+          review_pending="$(jq -r \
+            '(.terminalFailure == null) and (.ready != true)' <<<"$review_run_evaluation")" || return $?
+          review_evidence="$(jq -cn \
+            --argjson check "$review_check_evaluation" \
+            --argjson run "$review_run_evaluation" \
+            --argjson ready "$review_run_ready" \
+            --argjson pending "$review_pending" \
+            '{ready:$ready,pending:$pending,checkRunId:$check.checkRunId,runId:$check.runId,
+              terminalFailure:$run.terminalFailure}')" || return $?
+        else
+          review_evidence="$(jq -cn \
+            --arg checkRunId "$(jq -r '.checkRunId' <<<"$review_check_evaluation")" \
+            --arg runId "$review_run_id" \
+            '{ready:false,pending:true,terminalFailure:"review-run-api",
+              checkRunId:$checkRunId,runId:$runId}')" || return $?
+        fi
+      else
+        review_evidence="$review_check_evaluation"
+      fi
+    fi
+  else
+    review_evidence='{"ready":false,"pending":false}'
+    dependabot_evidence='{"ready":false,"pending":false}'
+  fi
+
+  admission_input="$(jq -cn \
+    --argjson sensitive "$sensitive" \
+    --argjson review "$review_evidence" \
+    --argjson dependabot "$dependabot_evidence" \
+    '{sensitive:$sensitive,review:$review,dependabot:$dependabot}')" || return $?
+  admission_evaluation="$(evaluate_sensitive_admission <<<"$admission_input")" || return $?
+  admission_ready="$(jq -r '.ready' <<<"$admission_evaluation")" || return $?
+  admission_pending="$(jq -r '.pending // false' <<<"$admission_evaluation")" || return $?
+  admission_terminal_failure="$(jq -r '.terminalFailure // empty' <<<"$admission_evaluation")" || return $?
+  if [[ "$admission_ready" != true ]]; then
+    if [[ "$admission_pending" == true ]]; then
+      exit_pending \
+        "Waiting for independent trusted evidence" \
+        "$phase sensitive change awaits exact-head Copilot evidence; admission remains pending."
+    fi
+    echo "$phase sensitive evidence was denied: $admission_terminal_failure" >&2
+    exit_failure \
+      "Sensitive change lacks independent trusted evidence" \
+      "$phase sensitive change has no valid Copilot or Dependabot evidence; admission failed."
+  fi
+
+  evidence_class="$(jq -r '.evidenceClass' <<<"$admission_evaluation")" || return $?
+  selected_evidence_fingerprint="$(jq -c \
+    '{evidenceClass,evidenceIds}' <<<"$admission_evaluation")" || return $?
+  case "$evidence_class" in
+    ci-dco)
+      success_description="CI and DCO passed for non-sensitive change"
+      ;;
+    copilot)
+      success_description="CI, DCO, and trusted Copilot execution passed"
+      ;;
+    dependabot)
+      success_description="CI, DCO, and trusted Dependabot provenance passed"
+      ;;
+    *)
+      echo "Invalid selected admission evidence class." >&2
+      return 2
+      ;;
+  esac
+
+  printf -v "$fingerprint_variable" '%s' "$(jq -cn \
+    --arg ciCheckRunId "$ci_check_run_id" \
+    --arg dcoCheckRunId "$dco_check_run_id" \
+    --arg ciRunId "$ci_run_id" \
+    --argjson classification "$classification_fingerprint" \
+    --argjson evidence "$selected_evidence_fingerprint" \
+    '{ciCheckRunId:$ciCheckRunId,dcoCheckRunId:$dcoCheckRunId,ciRunId:$ciRunId,
+      classification:$classification,evidence:$evidence}')"
   return 0
 }
 
@@ -379,7 +542,7 @@ fi
 
 post_admission_status pending "Waiting for trusted CI and DCO"
 initial_admission_fingerprint=""
-validate_required_snapshot "Initial" initial_admission_fingerprint
+validate_required_snapshot "Initial" initial_admission_fingerprint "$pull_request"
 
 current_matching_prs="$(fetch_associated_pull_requests)"
 select_eligible_pr_number "$current_matching_prs"
@@ -400,19 +563,11 @@ if [[ "$current_pull_request_eligible" != true ]]; then
     "Pull request eligibility changed during evaluation; admission failed."
 fi
 current_admission_fingerprint=""
-validate_required_snapshot "Current" current_admission_fingerprint
+validate_required_snapshot "Current" current_admission_fingerprint "$current_pull_request"
 if [[ "$current_admission_fingerprint" != "$initial_admission_fingerprint" ]]; then
   exit_pending \
-    "Latest trusted check changed during admission" \
-    "Trusted CI or DCO check changed during evaluation; admission remains pending."
-fi
-
-final_admission_fingerprint=""
-validate_required_snapshot "Final" final_admission_fingerprint
-if [[ "$final_admission_fingerprint" != "$initial_admission_fingerprint" ]]; then
-  exit_pending \
-    "Latest trusted check changed during final validation" \
-    "Final trusted CI or DCO check changed during evaluation; admission remains pending."
+    "Trusted admission evidence changed during evaluation" \
+    "CI, DCO, classification, or independent evidence changed; admission remains pending."
 fi
 
 final_matching_prs="$(fetch_associated_pull_requests)"
@@ -434,5 +589,13 @@ if [[ "$final_pull_request_eligible" != true ]]; then
     "Final pull request eligibility changed; admission failed."
 fi
 
-post_admission_status success "CI and DCO passed"
+final_admission_fingerprint=""
+validate_required_snapshot "Final" final_admission_fingerprint "$final_pull_request"
+if [[ "$final_admission_fingerprint" != "$initial_admission_fingerprint" ]]; then
+  exit_pending \
+    "Trusted admission evidence changed during final validation" \
+    "Final CI, DCO, classification, or independent evidence changed; admission remains pending."
+fi
+
+post_admission_status success "$success_description"
 trap - EXIT INT TERM

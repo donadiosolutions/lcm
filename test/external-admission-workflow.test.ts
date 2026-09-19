@@ -279,7 +279,11 @@ if [[ "$*" == *"/statuses/"* ]]; then
   exit 0
 fi
 if [[ "$*" == *"/commits/"*"/pulls?per_page=100"* ]]; then
-  printf '%s\\n' '[{"number":123,"state":"open","draft":false,"base":{"ref":"main","repo":{"full_name":"example/repository"}},"head":{"sha":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"}}]'
+  printf '%s\\n' '[{"number":123,"changed_files":1,"commits":1,"state":"open","draft":false,"user":{"id":42,"login":"contributor","type":"User"},"base":{"ref":"main","repo":{"full_name":"example/repository"}},"head":{"sha":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","ref":"feature/admission","repo":{"full_name":"example/repository"}}}]'
+  exit 0
+fi
+if [[ "$*" == *"/pulls/123/files?per_page=100"* ]]; then
+  printf '%s\\n' '[[{"filename":"docs/external-admission.md","status":"modified"}]]'
   exit 0
 fi
 if [[ "$*" == *"/pulls/123"* ]]; then
@@ -288,10 +292,10 @@ if [[ "$*" == *"/pulls/123"* ]]; then
     exit 0
   fi
   if [[ "$FAIL_ADMISSION_COMMAND" == valid-ineligible ]]; then
-    printf '%s\\n' '{"number":123,"state":"closed","draft":false,"base":{"ref":"main","repo":{"full_name":"example/repository"}},"head":{"sha":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"}}'
+    printf '%s\\n' '{"number":123,"changed_files":1,"commits":1,"state":"closed","draft":false,"base":{"ref":"main","repo":{"full_name":"example/repository"}},"head":{"sha":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"}}'
     exit 0
   fi
-  printf '%s\\n' '{"number":123,"state":"open","draft":false,"base":{"ref":"main","repo":{"full_name":"example/repository"}},"head":{"sha":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"}}'
+  printf '%s\\n' '{"number":123,"changed_files":1,"commits":1,"state":"open","draft":false,"user":{"id":42,"login":"contributor","type":"User"},"base":{"ref":"main","repo":{"full_name":"example/repository"}},"head":{"sha":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","ref":"feature/admission","repo":{"full_name":"example/repository"}}}'
   exit 0
 fi
 if [[ "$*" == *"/branches/"* ]]; then
@@ -338,6 +342,22 @@ if [[ "$2" == "evaluate-checks" ]]; then
 fi
 if [[ "$2" == "evaluate-ci-run" ]]; then
   printf '%s\\n' '{"state":"completed","ready":true}'
+  exit 0
+fi
+if [[ "$2" == "classify-files" ]]; then
+  printf '%s\\n' '{"classification":"non-sensitive","sensitive":false,"auditedPaths":["docs/external-admission.md"],"matchedPaths":[]}'
+  exit 0
+fi
+if [[ "$2" == "evaluate-review-check" ]]; then
+  printf '%s\\n' '{"state":"missing","ready":false,"pending":true}'
+  exit 0
+fi
+if [[ "$2" == "evaluate-dependabot-pr" ]]; then
+  printf '%s\\n' '{"candidate":false,"ready":false,"terminalFailure":"dependabot-pr"}'
+  exit 0
+fi
+if [[ "$2" == "evaluate-sensitive-admission" ]]; then
+  printf '%s\\n' '{"ready":true,"evidenceClass":"ci-dco","evidenceIds":[]}'
   exit 0
 fi
 if [[ "$2" == "evaluate-freshness" ]]; then
@@ -427,7 +447,13 @@ type AdmissionScenario =
   | "invalid-or-changed-base"
   | "transient-base"
   | "mixed-deleted-base"
-  | "duplicate-base-candidates";
+  | "duplicate-base-candidates"
+  | "sensitive-without-evidence"
+  | "sensitive-copilot"
+  | "sensitive-dependabot"
+  | "spoofed-review-valid-dependabot"
+  | "denied-dependabot-valid-review"
+  | "sensitive-file-drift";
 
 type AdmissionEligibilityVariant =
   | "unsupported-base"
@@ -442,12 +468,20 @@ function makeAdmissionPullRequest({
   draft = false,
   state = "open",
   headSha = HEAD_SHA,
+  user = { id: 42, login: "contributor", type: "User" },
+  headRef = "feature/admission",
+  headRepository = REPOSITORY,
+  changedFiles = 1,
+  commits = 1,
 } = {}) {
  return {
     number,
+   changed_files: changedFiles,
+   commits,
    state,
    draft,
-    head: { sha: headSha },
+    user,
+    head: { sha: headSha, ref: headRef, repo: { full_name: headRepository } },
     base: { ref: baseRef, repo: { full_name: baseRepository } },
   };
 }
@@ -460,6 +494,7 @@ function runAdmissionScenario(
   const ghPath = join(directory, "gh");
   const branchCallsPath = join(directory, "branch-calls.log");
   const branchRequestsPath = join(directory, "branch-requests.log");
+  const fileCallsPath = join(directory, "file-calls.log");
   const statusLogPath = join(directory, "statuses.log");
   const headSha = "a".repeat(40);
   const ciRunId = "123";
@@ -480,6 +515,15 @@ function runAdmissionScenario(
     status: "completed",
     conclusion: "success",
   };
+  const reviewCheckRun = {
+    id: 12,
+    name: "copilot-pull-request-reviewer",
+    head_sha: headSha,
+    app: { id: 15368, slug: "github-actions" },
+    status: "completed",
+    conclusion: "success",
+    details_url: `https://example.test/${REPOSITORY}/actions/runs/456/job/789`,
+  };
   const ciRun = {
     id: Number(ciRunId),
     event: "pull_request",
@@ -489,8 +533,23 @@ function runAdmissionScenario(
     conclusion: "success",
     repository: { full_name: REPOSITORY },
   };
+  const reviewRun = {
+    id: 456,
+    event: "dynamic",
+    path: "dynamic/agents/copilot-pull-request-reviewer",
+    head_sha: headSha,
+    status: "completed",
+    conclusion: "success",
+    repository: { full_name: REPOSITORY },
+  };
   let associatedPullRequests = [makeAdmissionPullRequest()];
   let pullRequest = makeAdmissionPullRequest();
+  let pullRequestFiles = [[{ filename: "docs/external-admission.md", status: "modified" }]];
+  let pullRequestCommits: unknown[][] = [];
+  let checkRuns = [ciCheckRun, dcoCheckRun];
+  let reviewRunApiFails = false;
+  let commitApiFails = false;
+  let pullRequestFileSnapshots: unknown[] | undefined;
   let branchProtectionSequence = ["true"];
   let branchDeletedSuffix = "";
   let branchLookupMustNotHappen = false;
@@ -554,6 +613,63 @@ function runAdmissionScenario(
       pullRequest = makeAdmissionPullRequest({ baseRef: "maintenance/1.x" });
       associatedPullRequests = [pullRequest];
       branchProtectionSequence = ["true"];
+      break;
+    case "sensitive-without-evidence":
+      pullRequestFiles = [[{ filename: ".github/workflows/ci.yml", status: "modified" }]];
+      break;
+    case "sensitive-copilot":
+      pullRequestFiles = [[{ filename: ".github/scripts/external-admission.sh", status: "modified" }]];
+      checkRuns = [ciCheckRun, dcoCheckRun, reviewCheckRun];
+      break;
+    case "sensitive-dependabot": {
+      pullRequest = makeAdmissionPullRequest({
+        user: { id: 49699333, login: "dependabot[bot]", type: "Bot" },
+        headRef: "dependabot/npm_and_yarn/example-1.2.3",
+      });
+      associatedPullRequests = [pullRequest];
+      pullRequestFiles = [[{ filename: "pnpm-lock.yaml", status: "modified" }]];
+      pullRequestCommits = [[{
+        sha: "b".repeat(40),
+        commit: { verification: { verified: true, reason: "valid" } },
+        author: { id: 49699333, login: "dependabot[bot]", type: "Bot" },
+        committer: { id: 19864447, login: "web-flow", type: "User" },
+      }]];
+      break;
+    }
+    case "spoofed-review-valid-dependabot": {
+      pullRequest = makeAdmissionPullRequest({
+        user: { id: 49699333, login: "dependabot[bot]", type: "Bot" },
+        headRef: "dependabot/npm_and_yarn/example-1.2.3",
+      });
+      associatedPullRequests = [pullRequest];
+      pullRequestFiles = [[{ filename: "package.json", status: "modified" }]];
+      pullRequestCommits = [[{
+        sha: "b".repeat(40),
+        commit: { verification: { verified: true, reason: "valid" } },
+        author: { id: 49699333, login: "dependabot[bot]", type: "Bot" },
+        committer: { id: 49699333, login: "dependabot[bot]", type: "Bot" },
+      }]];
+      checkRuns = [ciCheckRun, dcoCheckRun, { ...reviewCheckRun, id: 99 }];
+      reviewRunApiFails = true;
+      break;
+    }
+    case "denied-dependabot-valid-review":
+      pullRequest = makeAdmissionPullRequest({
+        user: { id: 49699333, login: "dependabot[bot]", type: "Bot" },
+        headRef: "dependabot/npm_and_yarn/example-1.2.3",
+      });
+      associatedPullRequests = [pullRequest];
+      pullRequestFiles = [[{ filename: "package.json", status: "modified" }]];
+      checkRuns = [ciCheckRun, dcoCheckRun, reviewCheckRun];
+      commitApiFails = true;
+      break;
+    case "sensitive-file-drift":
+      checkRuns = [ciCheckRun, dcoCheckRun, reviewCheckRun];
+      pullRequestFileSnapshots = [
+        [[{ filename: "src/first.ts", status: "modified" }]],
+        [[{ filename: "src/second.ts", status: "modified" }]],
+        [[{ filename: "src/second.ts", status: "modified" }]],
+      ];
       break;
   }
 
@@ -634,6 +750,22 @@ if [[ "$endpoint" == repos/*/pulls/123 ]]; then
   printf '%s\n' "$PULL_REQUEST_JSON"
   exit 0
 fi
+if [[ "$endpoint" == repos/*/pulls/123/files?per_page=100 ]]; then
+  file_call_count=0
+  if [[ -f "$FILE_CALLS" ]]; then read -r file_call_count < "$FILE_CALLS"; fi
+  file_call_count=$((file_call_count + 1))
+  printf '%s\n' "$file_call_count" > "$FILE_CALLS"
+  file_index=$((file_call_count - 1))
+  file_last_index="$(jq 'length - 1' <<<"$PULL_REQUEST_FILE_SNAPSHOTS_JSON")"
+  if (( file_index > file_last_index )); then file_index="$file_last_index"; fi
+  jq -c --argjson index "$file_index" '.[$index]' <<<"$PULL_REQUEST_FILE_SNAPSHOTS_JSON"
+  exit 0
+fi
+if [[ "$endpoint" == repos/*/pulls/123/commits?per_page=100 ]]; then
+  if [[ "$COMMIT_API_FAILS" == true ]]; then exit 96; fi
+  printf '%s\n' "$PULL_REQUEST_COMMITS_JSON"
+  exit 0
+fi
   if [[ "$endpoint" == repos/*/branches/* ]]; then
   call_count=0
   if [[ -f "$BRANCH_CALLS" ]]; then read -r call_count < "$BRANCH_CALLS"; fi
@@ -667,7 +799,12 @@ if [[ "$endpoint" == *"check-runs?filter=latest&per_page=100" ]]; then
   exit 0
 fi
 if [[ "$endpoint" == repos/*/actions/runs/* ]]; then
-  printf '%s\n' "$CI_RUN_JSON"
+  if [[ "$endpoint" == */actions/runs/456 ]]; then
+    if [[ "$REVIEW_RUN_API_FAILS" == true ]]; then exit 97; fi
+    printf '%s\n' "$REVIEW_RUN_JSON"
+  else
+    printf '%s\n' "$CI_RUN_JSON"
+  fi
   exit 0
 fi
 printf 'unexpected fake-gh endpoint: %s\n' "$endpoint" >&2
@@ -676,6 +813,7 @@ exit 99
     chmodSync(ghPath, 0o755);
     writeFileSync(branchCallsPath, "0\n");
     writeFileSync(branchRequestsPath, "");
+    writeFileSync(fileCallsPath, "0\n");
     writeFileSync(statusLogPath, "");
 
     const result = spawnSync("bash", [evaluatorPath], {
@@ -688,17 +826,26 @@ exit 99
         BRANCH_LOOKUP_MUST_NOT_HAPPEN: String(branchLookupMustNotHappen),
         BRANCH_REQUESTS: branchRequestsPath,
         BRANCH_PROTECTION_SEQUENCE: branchProtectionSequence.join(","),
-        CHECK_RUN_PAGES_JSON: JSON.stringify([{ check_runs: [ciCheckRun, dcoCheckRun] }]),
+        CHECK_RUN_PAGES_JSON: JSON.stringify([{ check_runs: checkRuns }]),
         CI_RUN_JSON: JSON.stringify(ciRun),
+        COMMIT_API_FAILS: String(commitApiFails),
         EVENT_HEAD_SHA: headSha,
         EVENT_SOURCE: eventSource,
         EVENT_CHECK_RUN_ACTION: eventCheckRunAction,
         EVENT_CHECK_RUN_ID: eventCheckRunId,
         EVENT_WORKFLOW_RUN_ACTION: eventWorkflowRunAction,
         EVENT_WORKFLOW_RUN_ID: eventWorkflowRunId,
+        FILE_CALLS: fileCallsPath,
         PATH: `${directory}:${process.env.PATH ?? ""}`,
         PULL_REQUEST_JSON: JSON.stringify(pullRequest),
+        PULL_REQUEST_FILES_JSON: JSON.stringify(pullRequestFiles),
+        PULL_REQUEST_FILE_SNAPSHOTS_JSON: JSON.stringify(
+          pullRequestFileSnapshots ?? [pullRequestFiles, pullRequestFiles, pullRequestFiles],
+        ),
+        PULL_REQUEST_COMMITS_JSON: JSON.stringify(pullRequestCommits),
         REPOSITORY,
+        REVIEW_RUN_API_FAILS: String(reviewRunApiFails),
+        REVIEW_RUN_JSON: JSON.stringify(reviewRun),
         RUN_URL: "https://example.test/run/1",
         SERVER_URL: "https://example.test",
         STATUS_LOG: statusLogPath,
@@ -784,6 +931,46 @@ describe("external admission workflow", () => {
     expect(branchCalls).toBeGreaterThan(1);
     expect(branchRequests.every((request) => request.endsWith("/branches/maintenance%2F1.4.x")))
       .toBe(true);
+  });
+
+  it("keeps sensitive changes pending without independent trusted evidence", () => {
+    const { result, statuses } = runAdmissionScenario("sensitive-without-evidence");
+    expect(result.status).toBe(0);
+    expect(statuses.at(-1)?.split("\t", 1)[0]).toBe("pending");
+    expect(statuses.at(-1)).toContain("independent trusted evidence");
+  });
+
+  it("admits sensitive changes with exact Copilot dynamic provenance", () => {
+    const { result, statuses } = runAdmissionScenario("sensitive-copilot");
+    expect(result.status, `${result.stdout}\n${result.stderr}`).toBe(0);
+    expect(statuses.at(-1)?.split("\t", 1)[0]).toBe("success");
+    expect(statuses.at(-1)).toContain("Copilot");
+  });
+
+  it("admits exact Dependabot commit provenance without Copilot", () => {
+    const { result, statuses } = runAdmissionScenario("sensitive-dependabot");
+    expect(result.status, `${result.stdout}\n${result.stderr}`).toBe(0);
+    expect(statuses.at(-1)?.split("\t", 1)[0]).toBe("success");
+    expect(statuses.at(-1)).toContain("Dependabot");
+  });
+
+  it("keeps the Copilot and Dependabot alternatives isolated in both directions", () => {
+    for (const scenario of [
+      "spoofed-review-valid-dependabot",
+      "denied-dependabot-valid-review",
+    ] as const) {
+      const { result, statuses } = runAdmissionScenario(scenario);
+      expect(result.status, `${scenario}\n${result.stdout}\n${result.stderr}`).toBe(0);
+      expect(statuses.at(-1)?.split("\t", 1)[0], scenario).toBe("success");
+    }
+  }, 15_000);
+
+  it("keeps admission pending when sensitive file evidence drifts", () => {
+    const { result, statuses } = runAdmissionScenario("sensitive-file-drift");
+    expect(result.status, `${result.stdout}\n${result.stderr}`).toBe(0);
+    expect(statuses.at(-1)?.split("\t", 1)[0]).toBe("pending");
+    expect(statuses.at(-1)).toContain("Trusted admission evidence changed");
+    expect(statuses.some((status) => status.startsWith("success\t"))).toBe(false);
   });
 
   it("terminalizes an unprotected maintenance/1.4.x pull request", () => {
@@ -987,11 +1174,12 @@ describe("external admission workflow", () => {
   it("repeats exact-head PR, CI, and DCO validation before success", () => {
     expect(evaluator).toContain("commits/$HEAD_SHA/pulls?per_page=100");
     expect(evaluator).toContain("check-runs?filter=latest&per_page=100");
-    expect(evaluator).not.toContain("/files?per_page=100");
+    expect(evaluator).toContain("/files?per_page=100");
+    expect(evaluator).toContain("/commits?per_page=100");
     const initial = evaluator.indexOf('validate_required_snapshot "Initial"');
     const current = evaluator.indexOf('validate_required_snapshot "Current"');
     const final = evaluator.indexOf('validate_required_snapshot "Final"');
-    const success = evaluator.indexOf('post_admission_status success "CI and DCO passed"');
+    const success = evaluator.indexOf('post_admission_status success "$success_description"');
     expect(initial).toBeGreaterThan(evaluator.indexOf('matching_prs="$(fetch_associated_pull_requests)"'));
     expect(current).toBeGreaterThan(evaluator.indexOf('current_matching_prs="$(fetch_associated_pull_requests)"'));
     expect(final).toBeGreaterThan(current);
@@ -1004,22 +1192,28 @@ describe("external admission workflow", () => {
     expect(evaluator).toContain("EVENT_WORKFLOW_RUN_ACTION");
     expect(evaluator).toContain("EVENT_CHECK_RUN_ACTION");
     expect(evaluator).toContain("EVENT_CHECK_RUN_ID");
-    expect(evaluator).toContain('printf -v "$fingerprint_variable" \'%s\' "$ci_check_run_id:$dco_check_run_id:$ci_run_id"');
+    expect(evaluator).toContain("classification_fingerprint");
+    expect(evaluator).toContain("selected_evidence_fingerprint");
     expect(evaluator).toContain('validate_required_snapshot "Initial" initial_admission_fingerprint');
     expect(evaluator).toContain('validate_required_snapshot "Current" current_admission_fingerprint');
     expect(evaluator).toContain('validate_required_snapshot "Final" final_admission_fingerprint');
     expect(evaluator.match(/admission_fingerprint" != "\$initial_admission_fingerprint/gu)).toHaveLength(2);
     expect(evaluator).not.toContain('VALIDATED_ADMISSION_FINGERPRINT');
-    expect(evaluator).not.toContain("classify-files");
-    expect(evaluator).not.toContain("select-admission");
-    expect(evaluator).not.toContain("admission-decision");
+    expect(evaluator).toContain("classify-files");
+    expect(evaluator).toContain("evaluate-review-check");
+    expect(evaluator).toContain("evaluate-review-run");
+    expect(evaluator).toContain("evaluate-dependabot-pr");
+    expect(evaluator).toContain("evaluate-dependabot-commits");
+    expect(evaluator).toContain("evaluate-sensitive-admission");
+    expect(evaluator).not.toContain("/git/trees/");
+    expect(evaluator).not.toContain("/reviews");
   });
 
   it("runs each validator as a simple command and fails closed on evaluator and eligibility errors", () => {
     expect(evaluator).not.toContain("validate_or_exit");
     for (const phase of ["Initial", "Current", "Final"]) {
       expect(evaluator).toMatch(new RegExp(
-        `^validate_required_snapshot "${phase}" [a-z_]+$`,
+        `^validate_required_snapshot "${phase}" [a-z_]+ "\\$[a-z_]+"$`,
         "mu",
       ));
       expect(evaluator).not.toMatch(new RegExp(
