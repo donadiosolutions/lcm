@@ -23,7 +23,39 @@ type Job = Readonly<{ steps?: readonly Step[] }>;
 
 type Workflow = Readonly<{ jobs?: Readonly<Record<string, Job>> }>;
 
-type CompositeAction = Readonly<{ runs?: Readonly<{ steps?: readonly Step[] }> }>;
+type CompositeAction = Readonly<{
+  inputs?: Readonly<Record<string, Readonly<{ default?: unknown }>>>;
+  runs?: Readonly<{ steps?: readonly Step[] }>;
+}>;
+
+// A composite action may pin node-version through one of its inputs; the pin
+// it tracks is then that input's default, and a job may override it with an
+// explicit `with.node-version`.
+function resolvePin(version: unknown, document: CompositeAction): unknown {
+  const match = /^\$\{\{\s*inputs\.([\w-]+)\s*\}\}$/u.exec(String(version));
+  if (match === null) return version;
+  const input = document.inputs?.[match[1]!];
+  expect(input, `composite input ${match[1]} must declare a default`).toBeDefined();
+  return input!.default;
+}
+
+function compositeActionPath(uses: string): string {
+  const action = join(repositoryRoot, uses.slice(2));
+  const path = [join(action, "action.yml"), join(action, "action.yaml")]
+    .find((candidate) => readdirSync(action).includes(candidate.slice(action.length + 1)));
+  expect(path, `${uses} must define a composite action`).toBeDefined();
+  return path!;
+}
+
+// Undefined when the composite installs no Node runtime of its own.
+function compositePinDefault(uses: string): unknown {
+  const document = loadYaml(readFileSync(compositeActionPath(uses), "utf8")) as CompositeAction;
+  const versions = (document.runs?.steps ?? [])
+    .filter((step) => step.uses?.startsWith("actions/setup-node@") === true)
+    .map((step) => resolvePin(step.with?.["node-version"], document));
+  expect(versions.length).toBeLessThanOrEqual(1);
+  return versions[0];
+}
 
 function parseVersion(value: unknown): readonly number[] | null {
   const match = /^(\d+)\.(\d+)\.(\d+)$/u.exec(String(value));
@@ -59,7 +91,10 @@ function stepsOf(path: string): readonly Step[] {
   const document = loadYaml(readFileSync(path, "utf8")) as Workflow & CompositeAction;
   return [
     ...Object.values(document.jobs ?? {}).flatMap((job) => job.steps ?? []),
-    ...(document.runs?.steps ?? []),
+    ...(document.runs?.steps ?? []).map((step) => ({
+      ...step,
+      with: step.with === undefined ? undefined : { ...step.with, "node-version": resolvePin(step.with["node-version"], document) },
+    })),
   ];
 }
 
@@ -92,6 +127,11 @@ function floorTrackedPins(): readonly Readonly<{ source: string; version: unknow
             source: `${path.slice(repositoryRoot.length)}#${jobName}`,
             version: step.with?.["node-version"],
           });
+        } else if (step.uses?.startsWith(COMPOSITE_ACTION_PREFIX) === true) {
+          const version = step.with?.["node-version"] ?? compositePinDefault(step.uses);
+          if (version !== undefined) {
+            pins.push({ source: `${path.slice(repositoryRoot.length)}#${jobName}`, version });
+          }
         }
       }
     }
@@ -99,24 +139,12 @@ function floorTrackedPins(): readonly Readonly<{ source: string; version: unknow
       if (step.uses?.startsWith("actions/setup-node@") === true) {
         pins.push({
           source: `${path.slice(repositoryRoot.length)}#composite`,
-          version: step.with?.["node-version"],
+          version: resolvePin(step.with?.["node-version"], document),
         });
       }
     }
   }
   return pins.filter((pin) => !LATEST_RUNTIME_PIN_SOURCES.has(pin.source));
-}
-
-function compositeActionNodeVersion(uses: string): unknown {
-  const action = join(repositoryRoot, uses.slice(2));
-  const path = [join(action, "action.yml"), join(action, "action.yaml")]
-    .find((candidate) => readdirSync(action).includes(candidate.slice(action.length + 1)));
-  expect(path, `${uses} must define a composite action`).toBeDefined();
-  const versions = stepsOf(path!)
-    .filter((step) => step.uses?.startsWith("actions/setup-node@") === true)
-    .map((step) => step.with?.["node-version"]);
-  expect(versions).toHaveLength(1);
-  return versions[0];
 }
 
 function coverageGateRuntimes(): readonly unknown[] {
@@ -130,7 +158,8 @@ function coverageGateRuntimes(): readonly unknown[] {
         if (step.uses?.startsWith("actions/setup-node@") === true) {
           runtimes.push(step.with?.["node-version"]);
         } else if (step.uses?.startsWith(COMPOSITE_ACTION_PREFIX) === true) {
-          runtimes.push(compositeActionNodeVersion(step.uses));
+          const version = step.with?.["node-version"] ?? compositePinDefault(step.uses);
+          if (version !== undefined) runtimes.push(version);
         }
       }
     }
