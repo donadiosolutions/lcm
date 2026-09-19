@@ -1283,6 +1283,8 @@ function loadProjectMapWithMetadata(opts: {
   strict?: boolean;
   reload?: boolean;
   homeDir?: string;
+  /** @internal Return metadata backfill in memory without publishing it. */
+  _suppressMetadataBackfill?: boolean;
   _beforeMetadataLockForTesting?: () => void;
   _beforeMetadataMutationLockForTesting?: () => void;
   _publicationLockToken?: BackendPublicationLockToken;
@@ -1295,6 +1297,7 @@ function loadProjectMapWithMetadata(opts: {
 
   const populated = populateFromExistingProjectMetadata(map, opts.homeDir);
   if (populated.changed) {
+    if (opts._suppressMetadataBackfill) return populated.map;
     opts._beforeMetadataMutationLockForTesting?.();
     if (activeProjectMapMutationLocks.has(projectMapMutationLockPath(opts.homeDir))) {
       writeProjectMap(populated.map, opts.homeDir, { metadataPopulated: true });
@@ -1438,7 +1441,8 @@ export class UnauthenticatedProjectIdentityError extends Error {
  * successor shape, no other evidence may stand in for that fence, because a
  * renewed project writes its own project metadata the first time it is opened
  * and that metadata would otherwise re-admit a successor whose fence was lost.
- * Only a key that is neither falls through to its project metadata.
+ * Only keys matching neither of the first two grounds use metadata
+ * corroboration.
  *
  * The metadata ground is compatibility, not a defence. A hash minted before
  * the current path normalization does not equal hashProjectPath(canonical),
@@ -1554,10 +1558,13 @@ function resolveProjectIdentityUnlocked(
     readonly _beforeMetadataMutationLockForTesting?: () => void;
     /** @internal Test-only synchronization seam for missing-entry races. */
     readonly _beforeMissingIdentityLockForTesting?: () => void;
+    /** @internal Resolve against metadata backfill without publishing it. */
+    readonly _suppressMetadataBackfill?: boolean;
   } = {},
   publicationLockToken?: BackendPublicationLockToken,
 ): ProjectIdentity {
   const map = loadProjectMapWithMetadata({
+    _suppressMetadataBackfill: opts._suppressMetadataBackfill,
     _beforeMetadataLockForTesting: opts._beforeMetadataLockForTesting,
     _beforeMetadataMutationLockForTesting: opts._beforeMetadataMutationLockForTesting,
     _publicationLockToken: publicationLockToken,
@@ -1575,6 +1582,7 @@ function resolveProjectIdentityUnlocked(
       current = loadProjectMapWithMetadata({
         strict: true,
         reload: true,
+        _suppressMetadataBackfill: opts._suppressMetadataBackfill,
         _publicationLockToken: publicationLockToken,
       });
     } catch (error) {
@@ -1757,6 +1765,7 @@ export function showProjectMapEntry(
 function resolveCliTarget(
   opts: { canonical?: string; hash?: string },
   publicationLockToken?: BackendPublicationLockToken,
+  resolutionOpts: { readonly _suppressMetadataBackfill?: boolean } = {},
 ): { hash: string; entry: ProjectMapEntry; map: ProjectMap } {
   if (opts.canonical && opts.hash) {
     throw new Error("--canonical and --hash are mutually exclusive");
@@ -1765,10 +1774,11 @@ function resolveCliTarget(
     const canonical = normalizeProjectPath(opts.canonical);
     if (!existsSync(canonical)) throw new Error(`canonical path does not exist: ${canonical}`);
     if (!statSync(canonical).isDirectory()) throw new Error(`canonical path must be an existing directory: ${canonical}`);
-    const identity = resolveProjectIdentityUnlocked(canonical, {}, publicationLockToken);
+    const identity = resolveProjectIdentityUnlocked(canonical, resolutionOpts, publicationLockToken);
     const map = loadProjectMapWithMetadata({
       strict: true,
       reload: true,
+      _suppressMetadataBackfill: resolutionOpts._suppressMetadataBackfill,
       _publicationLockToken: publicationLockToken,
     });
     return { hash: identity.id, entry: map[identity.id], map };
@@ -1776,6 +1786,7 @@ function resolveCliTarget(
   const map = loadProjectMapWithMetadata({
     strict: true,
     reload: true,
+    _suppressMetadataBackfill: resolutionOpts._suppressMetadataBackfill,
     _publicationLockToken: publicationLockToken,
   });
   if (opts.hash) {
@@ -1784,10 +1795,11 @@ function resolveCliTarget(
     if (!entry) throw new Error(`unknown project hash: ${opts.hash}`);
     return { hash: opts.hash, entry, map };
   }
-  const identity = resolveProjectIdentityUnlocked(process.cwd(), {}, publicationLockToken);
+  const identity = resolveProjectIdentityUnlocked(process.cwd(), resolutionOpts, publicationLockToken);
   const refreshed = loadProjectMapWithMetadata({
     strict: true,
     reload: true,
+    _suppressMetadataBackfill: resolutionOpts._suppressMetadataBackfill,
     _publicationLockToken: publicationLockToken,
   });
   return { hash: identity.id, entry: refreshed[identity.id], map: refreshed };
@@ -2043,12 +2055,14 @@ export function addProjectAlias(alias: string, opts: {
   if (!statSync(normalizedAlias).isDirectory()) throw new Error(`alias path must be an existing directory: ${normalizedAlias}`);
   return withProjectMapMutationLock((publicationLockToken) => {
     opts._afterLockForTesting?.();
-    const target = resolveCliTarget(opts, publicationLockToken);
+    const target = resolveCliTarget(opts, publicationLockToken, {
+      _suppressMetadataBackfill: true,
+    });
     assertExpectedProjectMapEntry(target.hash, target.entry, opts.expectedEntry);
     const canonical = resolve(target.entry.canonical);
-    // Refuse before any mutation. Resolution refuses an unauthenticated
-    // key when the alias is read back, so checking only there would leave
-    // a failed link having already published one more claimed path.
+    // Refuse before any mutation. Resolution keeps metadata backfill in memory
+    // until this gate authenticates the target, so a refused link leaves the
+    // persisted map byte-identical.
     if (!isAuthenticatedProjectIdentity(target.hash, canonical)) {
       throw new UnauthenticatedProjectIdentityError(target.hash, canonical);
     }

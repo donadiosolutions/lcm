@@ -248,6 +248,20 @@ describe("project-map identity authentication", () => {
       expect(readFileSync(projectMapPath(), "utf8")).toBe(before);
     });
 
+    it("refuses an unauthenticated alias without publishing unrelated metadata", () => {
+      const canonical = makeProject("alias-unauthenticated-orphan");
+      const aliasPath = makeProject("alias-unauthenticated-orphan-target");
+      const arbitrary = "f".repeat(64);
+      const orphan = makeProject("alias-unauthenticated-orphan-unrelated");
+      writeProjectMetadata(hashProjectPath(orphan), orphan);
+      writeMap({ [arbitrary]: { canonical, aliases: [] } });
+      const before = readFileSync(projectMapPath());
+
+      expect(() => addProjectAlias(aliasPath, { hash: arbitrary }))
+        .toThrow(UnauthenticatedProjectIdentityError);
+      expect(readFileSync(projectMapPath())).toEqual(before);
+    });
+
     it("adds an alias under a key the canonical path hash authenticates", () => {
       const canonical = makeProject("alias-authenticated");
       const aliasPath = makeProject("alias-authenticated-target");
@@ -334,4 +348,3 @@ describe("project-map identity authentication", () => {
     });
   });
 });
-

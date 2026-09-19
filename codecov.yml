@@ -388,7 +388,8 @@ component_management:
         # local successor renewal in this existing project/worktree component.
         # #1356/#1357 keep project-map key authentication in this owner:
         # a key is admitted only as the canonical path hash, a fenced
-        # renewal successor, or a legacy hash its own metadata corroborates.
+        # renewal successor, or a legacy hash its own metadata corroborates;
+        # alias refusal also suppresses metadata backfill until authentication.
         - "^src/project-map\\.ts$"
         - "^src/worktree-reconciliation-fence\\.ts$"
         # #1044 keeps the existing owner; no taxonomy, status, or policy change.

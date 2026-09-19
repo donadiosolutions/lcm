@@ -689,7 +689,8 @@ describe("Codecov configuration", () => {
       // #1049 keeps project metadata owner and single-link admission here.
       ["src/project-map.ts", "unit-project-worktrees"],
       // #1356/#1357 authenticate the project-map key before it becomes a
-      // storage identity, and stop enumeration and preview presenting an
+      // storage identity, suppress alias-time metadata backfill until that
+      // authentication, and stop enumeration and preview presenting an
       // identity storage refuses. The change is confined to existing files and
       // adds no component, so every touched file keeps its established owner;
       // these pins record that decision for materially changed files.
