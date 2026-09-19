@@ -217,6 +217,9 @@ vi.mock("../../src/daemon/config.js", async importOriginal => ({
   ...(await importOriginal<typeof import("../../src/daemon/config.js")>()), loadDaemonConfig: state.loadConfig,
 }));
 vi.mock("../../src/daemon/lifecycle.js", () => ({ ensureDaemon: state.ensureDaemon, restartDaemon: state.restartDaemon }));
+vi.mock("../../src/daemon/peer-admission.js", () => ({
+  admitManagedDaemonPeer: vi.fn(() => ({ pid: 42, birth: "birth" })),
+}));
 vi.mock("../../src/daemon/client.js", () => ({ DaemonClient: class {
   post = state.post;
   get = state.get;

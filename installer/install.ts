@@ -4,7 +4,7 @@ import { homedir } from "node:os";
 import { dirname, isAbsolute, join } from "node:path";
 import { spawnSync, type SpawnSyncOptionsWithStringEncoding, type SpawnSyncReturns } from "node:child_process";
 import { ensureCore } from "../src/bootstrap.js";
-import { bootstrapLcmHome, lcmHomeDir } from "../src/runtime-paths.js";
+import { bootstrapLcmHome, daemonPidPath, lcmHomeDir } from "../src/runtime-paths.js";
 import {
   assertPrivateDirectoryEntry,
   atomicWritePrivateFile,
@@ -45,6 +45,7 @@ import {
   type PublicationConvergenceDeps,
 } from "../src/storage/publication-convergence.js";
 import { PACKAGED_RUNTIME_ENTRYPOINT, PKG_VERSION, RUNTIME_DIGEST } from "../src/daemon/version.js";
+import { admitManagedDaemonPeer, type ManagedDaemonPeerEvidence } from "../src/daemon/peer-admission.js";
 import { packageExecutable, packageRootFor } from "../src/runtime-root.js";
 import {
   hasCanonicalClaudeMcpEntry,
@@ -328,6 +329,22 @@ export async function createInstallerPublicationConvergence(
   const expectedVersion = seams._expectedVersionForTesting ?? PKG_VERSION;
   const expectedEntrypoint = seams._expectedEntrypointForTesting ?? PACKAGED_RUNTIME_ENTRYPOINT;
   const expectedRuntimeDigest = seams._expectedRuntimeDigestForTesting ?? RUNTIME_DIGEST;
+  const admitPeer = seams.admitPeer ?? ((expected?: ManagedDaemonPeerEvidence) => {
+    if (homeDir === undefined) return null;
+    const admitted = admitManagedDaemonPeer({
+      authority: {
+        kind: "pid-file",
+        pidFilePath: daemonPidPath(homeDir),
+        expectedUid: process.getuid?.(),
+      },
+      port,
+      expectedEntrypoint,
+    });
+    return admitted !== null
+      && (expected === undefined || (admitted.pid === expected.pid && admitted.birth === expected.birth))
+      ? admitted
+      : null;
+  });
   let rootHandle: ReturnType<typeof openBackendPublicationReadRoot>;
   let identity: PublicationConvergence["identity"];
   const assertReadRoot = (canonicalHomeDir: string): void => {
@@ -374,8 +391,10 @@ export async function createInstallerPublicationConvergence(
       // Missing, malformed, or unstable config cannot authenticate a daemon.
     }
     if (homeDir !== undefined && authenticated !== undefined) {
+      const admittedPeer = await admitPeer();
       const captured = await capturePublicationIdentity({
         port,
+        admittedPeer: admittedPeer ?? undefined,
         expectedVersion,
         expectedStorageBackend: backend,
         expectedEntrypoint,
@@ -385,6 +404,7 @@ export async function createInstallerPublicationConvergence(
           homeDir,
           lockPath: join(homeDir, ".lcm.backend-publication.lock"),
           fetch: seams.fetch ?? globalThis.fetch,
+          admitPeer,
           readToken: seams.readToken ?? (() => readAuthToken(daemonTokenPath(homeDir))),
         },
       });
@@ -423,6 +443,7 @@ export async function createInstallerPublicationConvergence(
       homeDir,
       lockPath: homeDir === undefined ? undefined : join(homeDir, ".lcm.backend-publication.lock"),
       fetch: seams.fetch ?? globalThis.fetch,
+      admitPeer,
       readToken: seams.readToken ?? (() => homeDir === undefined ? null : readAuthToken(daemonTokenPath(homeDir))),
     },
   });

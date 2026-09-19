@@ -42,6 +42,8 @@ const testIdentity = {
   entrypoint: "/lcm-tests/lifecycle-daemon.mjs",
 } as const;
 const TEST_RUNTIME_DIGEST = "a".repeat(64);
+const currentTestUid = (): number => process.getuid?.() ?? 1000;
+const TEST_UID = currentTestUid();
 
 function makeSpawnChild(pid: number | undefined): SpawnChildMock {
   const child: SpawnChildMock = {
@@ -86,7 +88,7 @@ function withHermeticLifecycleSeams(
       ? join(stateDir, ".hermetic-proc")
       : options._procRoot ?? join(stateDir, ".hermetic-proc"),
     platform: options._platform ?? "linux",
-    uid: options._uid ?? 1000,
+    uid: options._uid ?? currentTestUid(),
     environment: {},
     fetch: options._fetchOverride
       ?? (vi.fn().mockRejectedValue(new Error("hermetic offline")) as FetchOverride),
@@ -110,7 +112,29 @@ function withHermeticLifecycleSeams(
   ]) {
     mkdirSync(directory, { recursive: true });
   }
-  return { ...options, _hermeticTestSeams: seams, _assertBackendPublication: () => undefined };
+  return {
+    ...options,
+    ...((options._platform ?? "linux") === "linux"
+      && options.expectedEntrypoint === undefined
+      ? { expectedEntrypoint: "lcm" }
+      : {}),
+    _processStartTimeForTesting: options._processStartTimeForTesting
+      ?? (pid => `birth-${String(pid)}`),
+    _peerProcessCommandOverride: options._peerProcessCommandOverride
+      ?? (options._procRoot === undefined || (options._platform ?? "linux") !== "linux"
+        ? (pid) => {
+            const entrypoint = options.expectedEntrypoint ?? "lcm";
+            if ((options._platform ?? "linux") === "linux") {
+              const processRoot = join(seams.procRoot, String(pid));
+              mkdirSync(processRoot, { recursive: true });
+              writeFileSync(join(processRoot, "cmdline"), `node\0${entrypoint}\0daemon\0start\0--foreground\0`);
+            }
+            return `node ${entrypoint} daemon start --foreground`;
+          }
+        : undefined),
+    _hermeticTestSeams: seams,
+    _assertBackendPublication: () => undefined,
+  };
 }
 
 function ensureDaemon(
@@ -132,6 +156,11 @@ afterEach(() => {
     rmSync(dir, { recursive: true, force: true });
   }
 });
+
+function currentUserProcStatus(name: string, parentPid: number): string {
+  const uid = String(TEST_UID);
+  return `Name:\t${name}\nUid:\t${uid}\t${uid}\t${uid}\t${uid}\nPPid:\t${String(parentPid)}\n`;
+}
 
 function writeProcEntry(procRoot: string, pid: number, status: string, cmdline: string): void {
   const dir = join(procRoot, String(pid));
@@ -157,13 +186,32 @@ function createOwnedDaemonFixture(prefix: string, pid = 200): {
   writeProcEntry(
     procRoot,
     pid,
-    "Name:\tnode\nUid:\t1000\t1000\t1000\t1000\nPPid:\t1\n",
-    "node lcm daemon start --foreground",
+    currentUserProcStatus("node", 1),
+    `node ${testIdentity.entrypoint} daemon start --foreground`,
   );
   return { pid, pidFile, procRoot, tokenFile };
 }
 
 describe("ensureDaemon", () => {
+  it("derives hermetic file authority from the current process UID", () => {
+    const originalGetuid = Object.getOwnPropertyDescriptor(process, "getuid");
+    Object.defineProperty(process, "getuid", {
+      configurable: true,
+      value: vi.fn(() => 42_424),
+    });
+    try {
+      const options = withHermeticLifecycleSeams({
+        port: 37_373,
+        pidFilePath: makeHermeticPidFile("lcm-lifecycle-current-uid-"),
+        spawnTimeoutMs: 1,
+      });
+      expect(options._hermeticTestSeams?.uid).toBe(42_424);
+    } finally {
+      if (originalGetuid) Object.defineProperty(process, "getuid", originalGetuid);
+      else Reflect.deleteProperty(process, "getuid");
+    }
+  });
+
   it("resolves production probe defaults without invoking host probes on a skipped safe path", async () => {
     const tempDir = mkdtempSync(join(tmpdir(), "lcm-lifecycle-probe-defaults-"));
     tempDirs.push(tempDir);
@@ -689,7 +737,7 @@ describe("ensureDaemon", () => {
     writeFileSync(pidFile, "200");
     writeFileSync(join(tempDir, "daemon.token"), "local-token");
     writeFileSync(caFile, "trusted-ca");
-    writeProcEntry(procRoot, 200, "Name:\tnode\nUid:\t1000\t1000\t1000\t1000\nPPid:\t1\n", "node lcm daemon start --foreground");
+    writeProcEntry(procRoot, 200, currentUserProcStatus("node", 1), "node lcm daemon start --foreground");
     const effectiveConfig = parseDaemonConfig("{}", { storage: { backend: "postgresql" } }, {
       LCM_POSTGRES_URL: "postgresql://user:secret@db.example.com/lcm",
       LCM_POSTGRES_CA_FILE: caFile,
@@ -744,7 +792,7 @@ describe("ensureDaemon", () => {
     const pidFile = join(tempDir, "daemon.pid");
     writeFileSync(pidFile, "200");
     writeFileSync(join(tempDir, "daemon.token"), "wrong-token");
-    writeProcEntry(procRoot, 200, "Name:\tnode\nUid:\t1000\t1000\t1000\t1000\nPPid:\t1\n", "node lcm daemon start --foreground");
+    writeProcEntry(procRoot, 200, currentUserProcStatus("node", 1), "node lcm daemon start --foreground");
     const fetchMock = vi.fn(async (url: string, init?: RequestInit): Promise<Response> => {
       if (url.endsWith("/health")) {
         return {
@@ -844,7 +892,7 @@ describe("ensureDaemon", () => {
       writeProcEntry(
         procRoot,
         200,
-        "Name:\tnode\nUid:\t1000\t1000\t1000\t1000\nPPid:\t1\n",
+        currentUserProcStatus("node", 1),
         "node lcm daemon start --foreground",
       );
       const fetchMock = vi.fn(async (url: string, init?: RequestInit): Promise<Response> => {
@@ -902,7 +950,7 @@ describe("ensureDaemon", () => {
     writeProcEntry(
       procRoot,
       200,
-      "Name:\tnode\nUid:\t1000\t1000\t1000\t1000\nPPid:\t1\n",
+      currentUserProcStatus("node", 1),
       "node lcm daemon start --foreground",
     );
     const fetchMock = vi.fn(async (url: string, init?: RequestInit): Promise<Response> => {
@@ -957,7 +1005,7 @@ describe("ensureDaemon", () => {
     writeProcEntry(
       procRoot,
       200,
-      "Name:\tsleep\nUid:\t1000\t1000\t1000\t1000\nPPid:\t1\n",
+      currentUserProcStatus("sleep", 1),
       "sleep 1000",
     );
     const fetchMock = vi.fn(async (url: string, init?: RequestInit): Promise<Response> => {
@@ -1001,7 +1049,7 @@ describe("ensureDaemon", () => {
     expect(readFileSync(pidFile, "utf-8")).toBe("200");
   });
 
-  it("defaults to the captured packaged entrypoint when replacing a same-version daemon", async (): Promise<void> => {
+  it("refuses a stale packaged entrypoint before authenticating the daemon", async (): Promise<void> => {
     const tempDir = mkdtempSync(join(tmpdir(), "lcm-lifecycle-entrypoint-mismatch-"));
     tempDirs.push(tempDir);
     const procRoot = join(tempDir, "proc");
@@ -1012,7 +1060,7 @@ describe("ensureDaemon", () => {
     writeProcEntry(
       procRoot,
       200,
-      "Name:\tnode\nUid:\t1000\t1000\t1000\t1000\nPPid:\t1\n",
+      currentUserProcStatus("node", 1),
       "node\0/home/user/.claude/plugins/cache/lcm/1.4.1/lcm.mjs\0daemon\0start\0--foreground\0",
     );
     const fetchMock = vi.fn(async (url: string, init?: RequestInit): Promise<Response> => {
@@ -1047,8 +1095,11 @@ describe("ensureDaemon", () => {
     });
 
     expect(result.connected).toBe(false);
-    expect(killMock).toHaveBeenCalledWith(200, "SIGTERM");
-    expect(existsSync(pidFile)).toBe(false);
+    expect(killMock).not.toHaveBeenCalled();
+    expect(fetchMock.mock.calls.every(([, init]) => (
+      (init as RequestInit | undefined)?.headers === undefined
+    ))).toBe(true);
+    expect(existsSync(pidFile)).toBe(true);
   });
 
   it.each(["darwin", "win32"] as const)(
@@ -1207,7 +1258,7 @@ describe("ensureDaemon", () => {
     const pidFile = join(tempDir, "daemon.pid");
     writeFileSync(pidFile, "200");
     writeFileSync(join(tempDir, "daemon.token"), "wrong-token");
-    writeProcEntry(procRoot, 200, "Name:\tnode\nUid:\t1000\t1000\t1000\t1000\nPPid:\t1\n", "node lcm daemon start --foreground");
+    writeProcEntry(procRoot, 200, currentUserProcStatus("node", 1), "node lcm daemon start --foreground");
     const fetchMock = vi.fn(async (url: string): Promise<Response> => url.endsWith("/health")
       ? { ok: true, json: async () => ({ status: "ok", version: "1.0.0", storageBackend: "sqlite", pid: 200 }) } as Response
       : { ok: false, status: 401 } as Response);
@@ -1246,8 +1297,8 @@ describe("ensureDaemon", () => {
     const pidFile = join(tempDir, "daemon.pid");
     writeFileSync(pidFile, "200");
     writeFileSync(join(tempDir, "daemon.token"), "local-token");
-    writeProcEntry(procRoot, 200, "Name:\tnode\nUid:\t1000\t1000\t1000\t1000\nPPid:\t1\n", "node lcm daemon start --foreground");
-    writeProcEntry(procRoot, 201, "Name:\tnode\nUid:\t1000\t1000\t1000\t1000\nPPid:\t1\n", "node lcm daemon start --foreground");
+    writeProcEntry(procRoot, 200, currentUserProcStatus("node", 1), "node lcm daemon start --foreground");
+    writeProcEntry(procRoot, 201, currentUserProcStatus("node", 1), "node lcm daemon start --foreground");
     const fetchMock = vi.fn(async (url: string): Promise<Response> => {
       if (url.endsWith("/health")) {
         return {
@@ -1294,7 +1345,7 @@ describe("ensureDaemon", () => {
     const pidFile = join(tempDir, "daemon.pid");
     writeFileSync(pidFile, "200");
     writeFileSync(join(tempDir, "daemon.token"), "local-token");
-    writeProcEntry(procRoot, 200, "Name:\tnode\nUid:\t1000\t1000\t1000\t1000\nPPid:\t1\n", "node unrelated-server.js");
+    writeProcEntry(procRoot, 200, currentUserProcStatus("node", 1), "node unrelated-server.js");
     const fetchMock = vi.fn(async (url: string): Promise<Response> => url.endsWith("/health")
       ? { ok: true, json: async () => ({ status: "ok", version: "1.2.3", storageBackend: "sqlite", pid: 200 }) } as Response
       : { ok: true, json: async () => ({ totalConnections: 0 }) } as Response);
@@ -1333,8 +1384,8 @@ describe("ensureDaemon", () => {
     const pidFile = join(tempDir, "daemon.pid");
     writeFileSync(pidFile, "200");
     writeFileSync(join(tempDir, "daemon.token"), "local-token");
-    writeProcEntry(procRoot, 200, "Name:\tnode\nUid:\t1000\t1000\t1000\t1000\nPPid:\t1\n", "node lcm daemon start --foreground");
-    writeProcEntry(procRoot, 201, "Name:\tnode\nUid:\t1000\t1000\t1000\t1000\nPPid:\t1\n", "node lcm daemon start --foreground");
+    writeProcEntry(procRoot, 200, currentUserProcStatus("node", 1), "node lcm daemon start --foreground");
+    writeProcEntry(procRoot, 201, currentUserProcStatus("node", 1), "node lcm daemon start --foreground");
     let healthChecks = 0;
     const fetchMock = vi.fn(async (url: string): Promise<Response> => {
       if (!url.endsWith("/health")) {
@@ -1390,8 +1441,8 @@ describe("ensureDaemon", () => {
     const pidFile = join(tempDir, "daemon.pid");
     writeFileSync(pidFile, "200");
     writeFileSync(join(tempDir, "daemon.token"), "local-token");
-    writeProcEntry(procRoot, 200, "Name:\tnode\nUid:\t1000\t1000\t1000\t1000\nPPid:\t1\n", "node lcm daemon start --foreground");
-    writeProcEntry(procRoot, 201, "Name:\tnode\nUid:\t1000\t1000\t1000\t1000\nPPid:\t1\n", "node lcm daemon start --foreground");
+    writeProcEntry(procRoot, 200, currentUserProcStatus("node", 1), "node lcm daemon start --foreground");
+    writeProcEntry(procRoot, 201, currentUserProcStatus("node", 1), "node lcm daemon start --foreground");
     let monotonicMs = 0;
     let healthChecks = 0;
     const fetchMock = vi.fn(async (url: string): Promise<Response> => {
@@ -1458,8 +1509,8 @@ describe("ensureDaemon", () => {
     const pidFile = join(tempDir, "daemon.pid");
     writeFileSync(pidFile, "200");
     writeFileSync(join(tempDir, "daemon.token"), "local-token");
-    writeProcEntry(procRoot, 200, "Name:\tnode\nUid:\t1000\t1000\t1000\t1000\nPPid:\t1\n", "node lcm daemon start --foreground");
-    writeProcEntry(procRoot, 201, "Name:\tnode\nUid:\t1000\t1000\t1000\t1000\nPPid:\t1\n", "node lcm daemon start --foreground");
+    writeProcEntry(procRoot, 200, currentUserProcStatus("node", 1), "node lcm daemon start --foreground");
+    writeProcEntry(procRoot, 201, currentUserProcStatus("node", 1), "node lcm daemon start --foreground");
     let monotonicMs = 0;
     let healthChecks = 0;
     const fetchMock = vi.fn(async (url: string): Promise<Response> => {
@@ -1521,7 +1572,7 @@ describe("ensureDaemon", () => {
     const pidFile = join(tempDir, "daemon.pid");
     writeFileSync(pidFile, "200");
     writeFileSync(join(tempDir, "daemon.token"), "local-token");
-    writeProcEntry(procRoot, 200, "Name:\tnode\nUid:\t1000\t1000\t1000\t1000\nPPid:\t1\n", "node lcm daemon start --foreground");
+    writeProcEntry(procRoot, 200, currentUserProcStatus("node", 1), "node lcm daemon start --foreground");
     const fetchMock = vi.fn(async (url: string): Promise<Response> => url.endsWith("/health")
       ? { ok: true, json: async () => ({ status: "ok", version: "1.2.3", storageBackend: "sqlite", pid: 200 }) } as Response
       : { ok: true, json: async () => ({ totalConnections: 0 }) } as Response);
@@ -1560,7 +1611,7 @@ describe("ensureDaemon", () => {
     const pidFile = join(tempDir, "daemon.pid");
     writeFileSync(pidFile, "200");
     writeFileSync(join(tempDir, "daemon.token"), "wrong-token");
-    writeProcEntry(procRoot, 200, "Name:\tnode\nUid:\t1000\t1000\t1000\t1000\nPPid:\t1\n", "node lcm daemon start --foreground");
+    writeProcEntry(procRoot, 200, currentUserProcStatus("node", 1), "node lcm daemon start --foreground");
     const fetchMock = vi.fn()
       .mockResolvedValueOnce({ ok: false } as Response)
       .mockResolvedValueOnce({
@@ -1602,7 +1653,7 @@ describe("ensureDaemon", () => {
     const pidFile = join(tempDir, "daemon.pid");
     writeFileSync(pidFile, "200");
     writeFileSync(join(tempDir, "daemon.token"), "wrong-token");
-    writeProcEntry(procRoot, 200, "Name:\tnode\nUid:\t1000\t1000\t1000\t1000\nPPid:\t1\n", "node lcm daemon start --foreground");
+    writeProcEntry(procRoot, 200, currentUserProcStatus("node", 1), "node lcm daemon start --foreground");
     const fetchMock = vi.fn()
       .mockResolvedValueOnce({ ok: false } as Response)
       .mockResolvedValueOnce({
@@ -1645,7 +1696,7 @@ describe("ensureDaemon", () => {
     const tokenFile = join(tempDir, "daemon.token");
     writeFileSync(pidFile, "200");
     writeFileSync(tokenFile, "local-token");
-    writeProcEntry(procRoot, 200, "Name:\tnode\nUid:\t1000\t1000\t1000\t1000\nPPid:\t1\n", "node lcm daemon start --foreground");
+    writeProcEntry(procRoot, 200, currentUserProcStatus("node", 1), "node lcm daemon start --foreground");
 
     let healthCalls = 0;
     const mockFetch = vi.fn().mockImplementation(async (url: string): Promise<Response> => {
@@ -2048,8 +2099,8 @@ describe("ensureDaemon", () => {
     const tokenFile = join(tempDir, "daemon.token");
     writeFileSync(tokenFile, "local-token");
     writeFileSync(pidFile, "200");
-    writeProcEntry(procRoot, 100, "Name:\tsystemd\nUid:\t1000\t1000\t1000\t1000\nPPid:\t1\n", "/usr/lib/systemd/systemd --user");
-    writeProcEntry(procRoot, 200, "Name:\tnode\nUid:\t1000\t1000\t1000\t1000\nPPid:\t1\n", "node lcm daemon start --foreground");
+    writeProcEntry(procRoot, 100, currentUserProcStatus("systemd", 1), "/usr/lib/systemd/systemd --user");
+    writeProcEntry(procRoot, 200, currentUserProcStatus("node", 1), "node lcm daemon start --foreground");
 
     const fetchMock = vi.fn()
       .mockResolvedValueOnce({ ok: true, json: async () => ({ status: "ok", version: "1.2.3", pid: 200 }) } as Response)
@@ -2067,7 +2118,7 @@ describe("ensureDaemon", () => {
       enforceUserManagerParent: true,
       _platform: "linux",
       _procRoot: procRoot,
-      _uid: 1000,
+      _uid: TEST_UID,
       _fetchOverride: fetchMock as FetchOverride,
       _killOverride: killMock,
       _sleepOverride: async () => {},
@@ -2090,8 +2141,8 @@ describe("ensureDaemon", () => {
     const pidFile = join(tempDir, "daemon.pid");
     writeFileSync(join(tempDir, "daemon.token"), "local-token");
     writeFileSync(pidFile, "200");
-    writeProcEntry(procRoot, 100, "Name:\tsystemd\nUid:\t1000\t1000\t1000\t1000\nPPid:\t1\n", "/usr/lib/systemd/systemd --user");
-    writeProcEntry(procRoot, 200, "Name:\tnode\nUid:\t1000\t1000\t1000\t1000\nPPid:\t1\n", "node lcm daemon start --foreground");
+    writeProcEntry(procRoot, 100, currentUserProcStatus("systemd", 1), "/usr/lib/systemd/systemd --user");
+    writeProcEntry(procRoot, 200, currentUserProcStatus("node", 1), "node lcm daemon start --foreground");
     const listenerPorts = vi.fn()
       .mockReturnValueOnce([19999])
       .mockReturnValueOnce([19999])
@@ -2107,7 +2158,7 @@ describe("ensureDaemon", () => {
       enforceUserManagerParent: true,
       _platform: "linux",
       _procRoot: procRoot,
-      _uid: 1000,
+      _uid: TEST_UID,
       _fetchOverride: vi.fn()
         .mockResolvedValueOnce({ ok: true, json: async () => ({ status: "ok", version: "1.2.3", pid: 200 }) } as Response)
         .mockResolvedValueOnce({ ok: true, json: async () => ({ status: "ok", version: "1.2.3", pid: 200 }) } as Response)
@@ -2133,7 +2184,7 @@ describe("ensureDaemon", () => {
     const tokenFile = join(tempDir, "daemon.token");
     writeFileSync(tokenFile, "local-token");
     writeFileSync(pidFile, "200");
-    writeProcEntry(procRoot, 200, "Name:\tnode\nUid:\t1000\t1000\t1000\t1000\nPPid:\t1\n", "node lcm daemon start --foreground");
+    writeProcEntry(procRoot, 200, currentUserProcStatus("node", 1), "node lcm daemon start --foreground");
 
     const fetchMock = vi.fn()
       .mockResolvedValueOnce({ ok: true, json: async () => ({ status: "ok", version: "1.2.3", pid: 200 }) } as Response)
@@ -2150,7 +2201,7 @@ describe("ensureDaemon", () => {
       enforceUserManagerParent: true,
       _platform: "linux",
       _procRoot: procRoot,
-      _uid: 1000,
+      _uid: TEST_UID,
       _fetchOverride: fetchMock as FetchOverride,
       _isProcessAliveOverride: () => true,
       _listeningPortsOverride: (): number[] => [19999],
@@ -2186,7 +2237,7 @@ describe("ensureDaemon", () => {
       enforceUserManagerParent: true,
       _platform: "linux",
       _procRoot: procRoot,
-      _uid: 1000,
+      _uid: TEST_UID,
       _fetchOverride: fetchMock as FetchOverride,
       _isProcessAliveOverride: () => true,
       _spawnSyncOverride: spawnSyncMock as unknown as SpawnSyncOverride,
@@ -2207,8 +2258,8 @@ describe("ensureDaemon", () => {
     const tokenFile = join(tempDir, "daemon.token");
     writeFileSync(tokenFile, "local-token");
     writeFileSync(pidFile, "200");
-    writeProcEntry(procRoot, 100, "Name:\tsystemd\nUid:\t1000\t1000\t1000\t1000\nPPid:\t1\n", "/usr/lib/systemd/systemd --user");
-    writeProcEntry(procRoot, 200, "Name:\tnode\nUid:\t1000\t1000\t1000\t1000\nPPid:\t1\n", "node lcm daemon start --foreground");
+    writeProcEntry(procRoot, 100, currentUserProcStatus("systemd", 1), "/usr/lib/systemd/systemd --user");
+    writeProcEntry(procRoot, 200, currentUserProcStatus("node", 1), "node lcm daemon start --foreground");
 
     const fetchMock = vi.fn()
       .mockResolvedValueOnce({ ok: false, json: async () => ({}) } as Response)
@@ -2227,7 +2278,7 @@ describe("ensureDaemon", () => {
       enforceUserManagerParent: true,
       _platform: "linux",
       _procRoot: procRoot,
-      _uid: 1000,
+      _uid: TEST_UID,
       _fetchOverride: fetchMock as FetchOverride,
       _killOverride: killMock,
       _sleepOverride: async () => {},
@@ -2442,7 +2493,7 @@ describe("ensureDaemon", () => {
       version: "1.2.3",
       storageBackend: "sqlite",
       pid: fixture.pid,
-      entrypoint: "lcm",
+      entrypoint: testIdentity.entrypoint,
       runtimeDigest: TEST_RUNTIME_DIGEST,
     };
     const fetchMock = vi.fn(async (url: string): Promise<Response> => {
@@ -2458,7 +2509,7 @@ describe("ensureDaemon", () => {
       pidFilePath: fixture.pidFile,
       spawnTimeoutMs: 100,
       expectedVersion: "1.2.3",
-      expectedEntrypoint: "lcm",
+      expectedEntrypoint: testIdentity.entrypoint,
       expectedRuntimeDigest: TEST_RUNTIME_DIGEST,
       _fetchOverride: fetchMock as FetchOverride,
       _killOverride: killMock,
@@ -2562,7 +2613,7 @@ describe("ensureDaemon", () => {
     writeProcEntry(
       fixture.procRoot,
       100,
-      "Name:\tsystemd\nUid:\t1000\t1000\t1000\t1000\nPPid:\t1\n",
+      currentUserProcStatus("systemd", 1),
       "/usr/lib/systemd/systemd --user",
     );
     const fetchMock = vi.fn().mockResolvedValue({ ok: false } as Response);
@@ -2592,7 +2643,7 @@ describe("ensureDaemon", () => {
       _isProcessAliveOverride: (): boolean => alive,
       _platform: "linux",
       _procRoot: fixture.procRoot,
-      _uid: 1000,
+      _uid: TEST_UID,
       _spawnSyncOverride: managerUnavailable as unknown as SpawnSyncOverride,
       _listeningPortsOverride: listenerPorts,
       _skipSpawn: true,
@@ -2613,7 +2664,7 @@ describe("ensureDaemon", () => {
     writeProcEntry(
       fixture.procRoot,
       100,
-      "Name:\tsystemd\nUid:\t1000\t1000\t1000\t1000\nPPid:\t1\n",
+      currentUserProcStatus("systemd", 1),
       "/usr/lib/systemd/systemd --user",
     );
     const controller = new AbortController();
@@ -2641,7 +2692,7 @@ describe("ensureDaemon", () => {
       _isProcessAliveOverride: (): boolean => alive,
       _platform: "linux",
       _procRoot: fixture.procRoot,
-      _uid: 1000,
+      _uid: TEST_UID,
       _spawnSyncOverride: managerUnavailable as unknown as SpawnSyncOverride,
       _skipSpawn: true,
     });
@@ -2659,7 +2710,7 @@ describe("ensureDaemon", () => {
     writeProcEntry(
       fixture.procRoot,
       100,
-      "Name:\tsystemd\nUid:\t1000\t1000\t1000\t1000\nPPid:\t1\n",
+      currentUserProcStatus("systemd", 1),
       "/usr/lib/systemd/systemd --user",
     );
     let monotonicMs = 0;
@@ -2691,7 +2742,7 @@ describe("ensureDaemon", () => {
       _monotonicNowOverride: (): number => monotonicMs,
       _platform: "linux",
       _procRoot: fixture.procRoot,
-      _uid: 1000,
+      _uid: TEST_UID,
       _spawnSyncOverride: managerUnavailable as unknown as SpawnSyncOverride,
       _listeningPortsOverride: listenerPorts,
     });
@@ -2716,7 +2767,7 @@ describe("ensureDaemon", () => {
     writeProcEntry(
       fixture.procRoot,
       fixture.pid,
-      "Name:\tnode\nUid:\t1000\t1000\t1000\t1000\nPPid:\t1\n",
+      currentUserProcStatus("node", 1),
       processCommand,
     );
     const fetchMock = vi.fn().mockResolvedValue({ ok: false } as Response);
@@ -2760,8 +2811,8 @@ describe("ensureDaemon", () => {
     const tokenFile = join(tempDir, "daemon.token");
     writeFileSync(tokenFile, "local-token");
     writeFileSync(pidFile, "200");
-    writeProcEntry(procRoot, 100, "Name:\tsystemd\nUid:\t1000\t1000\t1000\t1000\nPPid:\t1\n", "/usr/lib/systemd/systemd --user");
-    writeProcEntry(procRoot, 200, "Name:\tsleep\nUid:\t1000\t1000\t1000\t1000\nPPid:\t1\n", "sleep 1000");
+    writeProcEntry(procRoot, 100, currentUserProcStatus("systemd", 1), "/usr/lib/systemd/systemd --user");
+    writeProcEntry(procRoot, 200, currentUserProcStatus("sleep", 1), "sleep 1000");
 
     const fetchMock = vi.fn()
       .mockResolvedValueOnce({ ok: false, json: async () => ({}) } as Response)
@@ -2779,7 +2830,7 @@ describe("ensureDaemon", () => {
       enforceUserManagerParent: true,
       _platform: "linux",
       _procRoot: procRoot,
-      _uid: 1000,
+      _uid: TEST_UID,
       _fetchOverride: fetchMock as FetchOverride,
       _killOverride: killMock,
       _sleepOverride: async () => {},
@@ -2805,7 +2856,7 @@ describe("ensureDaemon", () => {
     const tokenFile = join(tempDir, "daemon.token");
     writeFileSync(tokenFile, "local-token");
     writeFileSync(pidFile, "200");
-    writeProcEntry(procRoot, 200, "Name:\tsleep\nUid:\t1000\t1000\t1000\t1000\nPPid:\t1\n", "sleep 1000");
+    writeProcEntry(procRoot, 200, currentUserProcStatus("sleep", 1), "sleep 1000");
 
     const fetchMock = vi.fn()
       .mockResolvedValueOnce({ ok: true, json: async () => ({ status: "ok", version: "0.0.1" }) } as Response)
@@ -2820,7 +2871,7 @@ describe("ensureDaemon", () => {
       enforceUserManagerParent: true,
       _platform: "linux",
       _procRoot: procRoot,
-      _uid: 1000,
+      _uid: TEST_UID,
       _fetchOverride: fetchMock as FetchOverride,
       _killOverride: killMock,
       _sleepOverride: async () => {},
@@ -2988,6 +3039,7 @@ describe("ensureDaemon", () => {
       spawnTimeoutMs: 600,
       expectedVersion: "1.2.3",
       expectedStorageBackend: "postgresql",
+      expectedEntrypoint: "lcm",
       _fetchOverride: mockFetch as FetchOverride,
       _spawnOverride: spawnMock as unknown as SpawnOverride,
       _isProcessAliveOverride: () => true,
@@ -3701,7 +3753,13 @@ describe("restartDaemon", () => {
       if (url.endsWith("/health")) {
         return {
           ok: true,
-          json: async () => ({ status: "ok", version: "1.2.3", storageBackend: "sqlite", pid: 4242 }),
+          json: async () => ({
+            status: "ok",
+            version: "1.2.3",
+            storageBackend: "sqlite",
+            pid: 4242,
+            entrypoint: "lcm",
+          }),
         } as Response;
       }
       expect(init?.headers).toEqual({ Authorization: "Bearer local-token" });
@@ -3723,9 +3781,11 @@ describe("restartDaemon", () => {
       spawnTimeoutMs: 100,
       expectedVersion: "1.2.3",
       expectedStorageBackend: "postgresql",
+      expectedEntrypoint: "lcm",
       _platform: "darwin",
       _fetchOverride: fetchMock as FetchOverride,
       _spawnSyncOverride: spawnSyncMock as unknown as SpawnSyncOverride,
+      _peerProcessCommandOverride: () => "node lcm daemon start --foreground",
       _listeningPortsOverride: (): number[] => [19999],
       _isProcessAliveOverride: () => alive,
       _killOverride: killMock,
@@ -4015,7 +4075,7 @@ describe("restartDaemon", () => {
     tempDirs.push(tempDir);
     const procRoot = join(tempDir, "proc");
     mkdirSync(procRoot);
-    writeProcEntry(procRoot, 4242, "Name:\tnode\nUid:\t1000\t1000\t1000\t1000\nPPid:\t1\n", "node lcm daemon start --foreground");
+    writeProcEntry(procRoot, 4242, currentUserProcStatus("node", 1), "node lcm daemon start --foreground");
     const pidFile = join(tempDir, "daemon.pid");
     writeFileSync(pidFile, "4242");
     writeFileSync(join(tempDir, "daemon.token"), "local-token");
@@ -4137,9 +4197,127 @@ describe("restartDaemon", () => {
     });
 
     expect(result).toMatchObject({ connected: true, spawned: false, startMethod: "systemd-user", pid: 200 });
-    expect(probe).toHaveBeenCalledTimes(3);
+    expect(probe).toHaveBeenCalledTimes(9);
     expect(spec).toBeDefined();
     expect(supervisor.start).not.toHaveBeenCalled();
+  });
+
+  it("sends no credential when the manager registration changes before authentication", async () => {
+    const fixture = createOwnedDaemonFixture("lcm-lifecycle-manager-drift-", 200);
+    let spec: { scopeDigest: string; nonce: string; name: string } | undefined;
+    let probes = 0;
+    const probe = vi.fn(async (candidate: typeof spec) => {
+      spec = candidate!;
+      probes += 1;
+      return probes <= 2
+        ? {
+            kind: "registered-running-valid" as const,
+            managerPid: 200,
+            scopeDigest: candidate!.scopeDigest,
+            nonce: candidate!.nonce,
+            name: candidate!.name,
+          }
+        : { kind: "absent" as const, name: candidate!.name };
+    });
+    const fetchMock = vi.fn(async (_url: string, init?: RequestInit) => new Response(JSON.stringify({
+      status: "ok",
+      version: "1.4.2",
+      pid: 200,
+      entrypoint: testIdentity.entrypoint,
+      storageBackend: "sqlite",
+    }), { status: 200 }));
+
+    const result = await ensureDaemon({
+      port: 19999,
+      pidFilePath: fixture.pidFile,
+      spawnTimeoutMs: 100,
+      expectedVersion: "1.4.2",
+      expectedEntrypoint: testIdentity.entrypoint,
+      enforceUserManagerParent: true,
+      _platform: "linux",
+      _procRoot: fixture.procRoot,
+      _fetchOverride: fetchMock as FetchOverride,
+      _isProcessAliveOverride: () => true,
+      _listeningPortsOverride: () => [19999],
+      _supervisorOverride: { probe, start: vi.fn(), stopAndStart: vi.fn(), stopAndAwaitAbsent: vi.fn() } as never,
+    });
+
+    expect(result.connected).toBe(false);
+    expect(fetchMock.mock.calls.filter(([, init]) => (init as RequestInit | undefined)?.headers !== undefined))
+      .toEqual([]);
+    expect(spec).toBeDefined();
+  });
+
+  it("uses a fresh deadline for retained manager peer admission", async () => {
+    const fixture = createOwnedDaemonFixture("lcm-lifecycle-retained-manager-", 200);
+    let now = 0;
+    let drift = false;
+    const probeDeadlines: Array<number | undefined> = [];
+    const probe = vi.fn(async (
+      candidate: { scopeDigest: string; nonce: string; name: string },
+      operation?: { readonly deadline?: number },
+    ) => {
+      probeDeadlines.push(operation?.deadline);
+      if ((operation?.deadline ?? 0) <= now) {
+        return { kind: "ambiguous" as const, name: candidate.name, reason: "deadline-expired" };
+      }
+      return {
+        kind: "registered-running-valid" as const,
+        managerPid: drift ? 201 : 200,
+        scopeDigest: candidate.scopeDigest,
+        nonce: candidate.nonce,
+        name: candidate.name,
+        controlGroup: drift ? "/user.slice/foreign.service" : "/user.slice/lcm.service",
+      };
+    });
+    const supervisor = { probe, start: vi.fn(), stopAndStart: vi.fn(), stopAndAwaitAbsent: vi.fn() };
+    const health = {
+      status: "ok",
+      version: "1.4.2",
+      pid: 200,
+      entrypoint: testIdentity.entrypoint,
+      storageBackend: "sqlite",
+      runtimeDigest: TEST_RUNTIME_DIGEST,
+    };
+    const fetchMock = vi.fn()
+      .mockResolvedValueOnce(new Response(JSON.stringify(health), { status: 200 }))
+      .mockResolvedValueOnce(new Response(JSON.stringify(health), { status: 200 }))
+      .mockResolvedValueOnce(new Response(JSON.stringify({ totalConnections: 0 }), { status: 200 }));
+    const authenticated = vi.fn();
+
+    const result = await ensureDaemon({
+      port: 19999,
+      pidFilePath: fixture.pidFile,
+      spawnTimeoutMs: 100,
+      expectedVersion: "1.4.2",
+      expectedEntrypoint: testIdentity.entrypoint,
+      expectedRuntimeDigest: TEST_RUNTIME_DIGEST,
+      enforceUserManagerParent: true,
+      _managedOperationAuthorized: true,
+      _managedOperationManagerPid: 200,
+      _platform: "linux",
+      _procRoot: fixture.procRoot,
+      _fetchOverride: fetchMock as FetchOverride,
+      _isProcessAliveOverride: () => true,
+      _listeningPortsOverride: () => [19999],
+      _monotonicNowOverride: () => now,
+      _supervisorOverride: supervisor as never,
+      _onAuthenticatedDaemonResult: authenticated,
+    });
+    expect(result).toMatchObject({ connected: true, pid: 200 });
+    expect(authenticated).toHaveBeenCalledOnce();
+
+    const evidence = authenticated.mock.calls[0]![0] as {
+      admitPeer: () => Promise<{ pid: number; birth: string } | null>;
+    };
+    now = 10_000;
+    await expect(evidence.admitPeer()).resolves.toMatchObject({ pid: 200 });
+
+    drift = true;
+    const readToken = vi.fn();
+    if (await evidence.admitPeer() !== null) readToken();
+    expect(readToken).not.toHaveBeenCalled();
+    expect(probeDeadlines.slice(-3)).toEqual([11_000, 11_000, 11_000]);
   });
 
   it("refuses managed ensure recovery when a registered job gives no response", async () => {

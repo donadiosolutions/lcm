@@ -20,6 +20,10 @@ vi.mock("../../src/daemon/version.js", async importOriginal => ({
   RUNTIME_DIGEST: "runtime",
 }));
 
+vi.mock("../../src/daemon/peer-admission.js", () => ({
+  admitManagedDaemonPeer: vi.fn(() => ({ pid: 42, birth: "birth" })),
+}));
+
 vi.mock("../../src/daemon/client.js", () => ({
   DaemonClient: class {
     async health() {

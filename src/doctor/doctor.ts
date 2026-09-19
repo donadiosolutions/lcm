@@ -20,6 +20,7 @@ import { collectEventStats, collectDetailedEventStats } from "../db/events-stats
 import { validateRegex } from "../store/regex-safety.js";
 import {
   configPath,
+  daemonPidPath,
   daemonTokenPath,
   lcmHomeDir,
   projectsDir,
@@ -54,6 +55,7 @@ import {
   parseDaemonObservation,
   type DaemonObservation,
 } from "../daemon/client.js";
+import { admitManagedDaemonPeer } from "../daemon/peer-admission.js";
 import {
   assertBackendPublicationConfigReadAccess,
   BackendPublicationJournalError,
@@ -190,11 +192,21 @@ function readDoctorDaemonToken(deps: DoctorDeps): string | null {
 async function readDoctorAuthenticatedObservation(
   deps: DoctorDeps,
   port: number,
+  expectedPeer: Readonly<{ pid: number; birth: string }>,
+  admitPeer: () => Readonly<{ pid: number; birth: string }> | null,
 ): Promise<DaemonObservation | null> {
+  const token = readDoctorDaemonToken(deps);
+  if (token === null) return null;
+  const admitted = admitPeer();
+  if (
+    admitted === null
+    || admitted.pid !== expectedPeer.pid
+    || admitted.birth !== expectedPeer.birth
+  ) return null;
   return readDaemonObservation(
     deps.fetch,
     port,
-    readDoctorDaemonToken(deps),
+    token,
   );
 }
 
@@ -219,10 +231,9 @@ function daemonObservationMatchesIdentity(
 }
 
 /**
- * Build the identity doctor requires from token-authenticated observation.
- * The PID comes from the observation; every remaining field is the identity
- * this installation expects. Active storage readiness is not probed. Peer
- * metadata cannot supply a missing local version or runtime digest.
+ * Build the identity doctor requires from credential-free local peer evidence.
+ * Token-authenticated observation only corroborates this identity. Active
+ * storage readiness is not probed.
  */
 function expectedDaemonIdentity(
   observedPid: number | undefined,
@@ -770,9 +781,27 @@ export async function runDoctor(overrides?: Partial<DoctorDeps>, doctorOptions: 
       results.push({ name: "daemon", category: "Daemon", status: "skip", message: repairSkipMessage });
     } else {
       try {
-        const observation = await readDoctorAuthenticatedObservation(deps, config.port);
+        const admitPeer = deps._admitDaemonPeer ?? ((port: number, expectedEntrypoint: string) => admitManagedDaemonPeer({
+          authority: {
+            kind: "pid-file",
+            pidFilePath: daemonPidPath(deps.homedir),
+            expectedUid: process.getuid?.(),
+          },
+          port,
+          platform: deps.platform,
+          expectedEntrypoint,
+        }));
+        const admittedPeer = admitPeer(config.port, runtimePath);
+        const observation = admittedPeer === null
+          ? null
+          : await readDoctorAuthenticatedObservation(
+              deps,
+              config.port,
+              admittedPeer,
+              () => admitPeer(config.port, runtimePath),
+            );
         const identity = expectedDaemonIdentity(
-          observation?.pid, config, pkgVersion, runtimePath, expectedRuntimeDigest,
+          admittedPeer?.pid, config, pkgVersion, runtimePath, expectedRuntimeDigest,
         );
         if (observation !== null && identity !== undefined
           && daemonObservationMatchesIdentity(observation, identity, deps.platform)) {

@@ -61,6 +61,7 @@ function makeDeps(options: {
   procEnviron?: string;
   readPaths?: string[];
   writes?: string[];
+  admittedPid?: number;
 } = {}): DoctorDeps {
   const observations = [...(options.observations ?? [{ ok: false }])];
   const configReadError = options.readError?.(join(DOCTOR_HOME, ".lcm", "config.json"));
@@ -97,6 +98,7 @@ function makeDeps(options: {
     cwd: DOCTOR_CWD,
     managedDaemonPath: options.managedDaemonPath,
     _expectedRuntimeDigestForTesting: "doctor-fixture-digest",
+    _admitDaemonPeer: () => ({ pid: options.admittedPid ?? 4242, birth: "birth" }),
     ...configSeams,
   };
 }
@@ -311,6 +313,7 @@ describe("doctor service coverage", () => {
       config: { llm: { provider: "codex-process" } },
       procEnviron: "PATH=/health-pid/bin:/usr/bin\0",
       readPaths,
+      admittedPid: 4343,
       observations: [
         identityObservation({ pid: 4343 }),
         identityObservation({ pid: 4343 }),

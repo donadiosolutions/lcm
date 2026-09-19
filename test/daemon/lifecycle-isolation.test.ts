@@ -67,6 +67,8 @@ type ScopeFixture = {
 };
 
 const roots: string[] = [];
+const currentTestUid = (): number => process.getuid?.() ?? 1000;
+const TEST_UID = currentTestUid();
 function shouldCollectSystemdBarrier(
   command: string,
   args: readonly string[],
@@ -250,6 +252,8 @@ function scopedOptions(fixture: ScopeFixture): Parameters<typeof ensureDaemon>[0
     _testScope: fixture.scope,
     _skipHealthWait: true,
     _supervisorOverride: fixture.supervisor as never,
+    _processStartTimeForTesting: pid => `birth-${String(pid)}`,
+    _peerProcessCommandOverride: () => `node ${fixture.scope.entrypoint} daemon start --foreground`,
   };
 }
 
@@ -271,7 +275,7 @@ function withHermeticLifecycleSeams(
     credentialDir,
     procRoot,
     platform: options._platform ?? "linux",
-    uid: options._uid ?? 1000,
+    uid: options._uid ?? currentTestUid(),
     environment: {},
     fetch: options._fetchOverride
       ?? (vi.fn().mockRejectedValue(new Error("hermetic offline")) as never),
@@ -1178,7 +1182,7 @@ describe("daemon lifecycle test-scope validation", () => {
         _realpathOverride: path => path,
         _platform: "linux",
         _procRoot: join(fixture.root, "proc"),
-        _uid: 1000,
+        _uid: TEST_UID,
         _skipHealthWait: true,
       })).resolves.toMatchObject({
         connected: false,
@@ -1364,6 +1368,10 @@ describe("daemon lifecycle test-scope validation", () => {
         _fetchOverride: fetchHealthy as never,
         _isProcessAliveOverride: () => true,
         _listeningPortsOverride: () => [37_351],
+        _processStartTimeForTesting: pid => `birth-${String(pid)}`,
+        _peerProcessCommandOverride: () => `node ${fixture.scope.entrypoint} daemon start --foreground`,
+        _peerProcessExecutableOverride: () => process.execPath,
+        _peerProcessOwnerUidOverride: () => process.getuid?.() ?? null,
         _monotonicNowOverride: () => 0,
         _skipSpawn: true,
       })).resolves.toMatchObject({
@@ -1390,7 +1398,7 @@ describe("daemon lifecycle test-scope validation", () => {
           : { ok: true, status: 200, json: async () => ({}) }
       ));
       const processIdentity = vi.fn((command: string) => command === "/bin/ps"
-        ? { status: 0, stdout: "node lcm daemon start --foreground\n", stderr: "" }
+        ? { status: 0, stdout: `node ${fixture.scope.entrypoint} daemon start --foreground\n`, stderr: "" }
         : { status: 0, stdout: "", stderr: "" });
       await expect(restartDaemon({
         port: 37_352,
@@ -1405,6 +1413,10 @@ describe("daemon lifecycle test-scope validation", () => {
         _killOverride: kill,
         _sleepOverride: async () => undefined,
         _listeningPortsOverride: () => [37_352],
+        _processStartTimeForTesting: pid => `birth-${String(pid)}`,
+        _peerProcessCommandOverride: () => `node ${fixture.scope.entrypoint} daemon start --foreground`,
+        _peerProcessExecutableOverride: () => process.execPath,
+        _peerProcessOwnerUidOverride: () => process.getuid?.() ?? null,
         _monotonicNowOverride: () => 0,
         _ensureDaemonOverride: async () => ({
           connected: false,
@@ -1726,7 +1738,7 @@ describe("run-owned lifecycle resources", () => {
     mkdirSync(join(procRoot, String(managerPid)), { recursive: true });
     writeFileSync(
       join(procRoot, String(daemonPid), "status"),
-      `Name:\tlcm\nUid:\t1000\t1000\t1000\t1000\nPPid:\t${managerPid}\n`,
+      `Name:\tlcm\nUid:\t${String(TEST_UID)}\t${String(TEST_UID)}\t${String(TEST_UID)}\t${String(TEST_UID)}\nPPid:\t${managerPid}\n`,
     );
     writeFileSync(
       join(procRoot, String(daemonPid), "cmdline"),
@@ -1734,7 +1746,7 @@ describe("run-owned lifecycle resources", () => {
     );
     writeFileSync(
       join(procRoot, String(managerPid), "status"),
-      "Name:\tsystemd\nUid:\t1000\t1000\t1000\t1000\nPPid:\t1\n",
+      `Name:\tsystemd\nUid:\t${String(TEST_UID)}\t${String(TEST_UID)}\t${String(TEST_UID)}\t${String(TEST_UID)}\nPPid:\t1\n`,
     );
     writeFileSync(
       join(procRoot, String(managerPid), "cmdline"),
@@ -1766,7 +1778,7 @@ describe("run-owned lifecycle resources", () => {
       ...scopedOptions(fixture),
       _testScope: scope,
       _procRoot: procRoot,
-      _uid: 1000,
+      _uid: TEST_UID,
       _listeningPortsOverride: () => [48_321],
     })).resolves.toMatchObject({
       connected: false,
@@ -2302,7 +2314,7 @@ describe("run-owned lifecycle resources", () => {
       startMethod: "systemd-user" as const,
     }));
     fixture.runSystemd.mockImplementation((command: string) => command === "/bin/ps"
-      ? { status: 0, stdout: "node lcm daemon start --foreground\n", stderr: "" }
+      ? { status: 0, stdout: `node ${fixture.scope.entrypoint} daemon start --foreground\n`, stderr: "" }
       : { status: 0, stdout: "", stderr: "" });
     await expect(restartDaemon({
       ...scopedOptions(fixture),

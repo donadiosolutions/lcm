@@ -49,6 +49,8 @@ type SpawnOverride = NonNullable<EnsureDaemonOptions["_spawnOverride"]>;
 
 const saved = { anthropic: process.env.ANTHROPIC_API_KEY, openai: process.env.OPENAI_API_KEY, lcm: process.env.LCM_SUMMARY_API_KEY };
 const originalGetuid = Object.getOwnPropertyDescriptor(process, "getuid");
+const currentTestUid = (): number => process.getuid?.() ?? 1000;
+const TEST_UID = currentTestUid();
 let runtimeRoot: string;
 beforeEach(async () => {
   runtimeRoot = await mkdtemp(join(tmpdir(), "lcm-mocked-lifecycle-"));
@@ -56,7 +58,7 @@ beforeEach(async () => {
   await mkdir(join(runtimeRoot, ".hermetic-credentials"));
   await mkdir(join(runtimeRoot, ".hermetic-proc"));
   await writeFile(join(runtimeRoot, "daemon.token"), "token", { mode: 0o600 });
-  Object.defineProperty(process, "getuid", { configurable: true, value: vi.fn(() => 1000) });
+  Object.defineProperty(process, "getuid", { configurable: true, value: vi.fn(() => TEST_UID) });
   vi.clearAllMocks();
   fs.exists.mockImplementation((path: string) => path.endsWith("daemon.token"));
   fs.lstat.mockImplementation((path: string) => {
@@ -127,7 +129,7 @@ function ensureDaemon(options: EnsureDaemonOptions): ReturnType<typeof ensureDae
     credentialDir: join(runtimeRoot, ".hermetic-credentials"),
     procRoot: join(runtimeRoot, ".hermetic-proc"),
     platform: options._platform ?? "linux",
-    uid: options._uid ?? 1000,
+    uid: options._uid ?? currentTestUid(),
     environment: { ...process.env },
     fetch: options._fetchOverride
       ?? (vi.fn().mockRejectedValue(new Error("hermetic offline")) as never),
@@ -162,6 +164,7 @@ describe("mocked lifecycle identity boundaries", () => {
       port: 1,
       identity: {
         pid: process.pid,
+        birth: "birth",
         version: "1",
         storageBackend: "sqlite",
         entrypoint: "/opt/lcm.mjs",
@@ -173,6 +176,7 @@ describe("mocked lifecycle identity boundaries", () => {
         readToken: () => "token",
         readOwner: () => ({ version: 1, pid: process.pid, processStartTime: "birth", nonce: "a".repeat(32) }),
         processBirth: () => "birth",
+        admitPeer: expected => expected ?? { pid: process.pid, birth: "birth" },
         fetch: vi.fn(async () => ({ ok: true, json: async () => ({
           status: "ok", pid: process.pid, version: "1", storageBackend: "sqlite",
           entrypoint: "/opt/lcm.mjs", runtimeDigest: "a".repeat(64),
@@ -201,9 +205,9 @@ describe("mocked lifecycle identity boundaries", () => {
     fs.readdir.mockReturnValue([{ isDirectory: () => true, name: "11" }]);
     fs.read.mockImplementation((path: string) => {
       if (path.endsWith("daemon.pid")) return "20";
-      if (path.endsWith("/11/status")) return "Uid:\t1000\nPPid:\t1\n";
+      if (path.endsWith("/11/status")) return `Uid:\t${String(TEST_UID)}\nPPid:\t1\n`;
       if (path.endsWith("/11/cmdline")) return "systemd\0--user";
-      if (path.endsWith("/20/status")) return "Uid:\t1000\nPPid:\t10\n";
+      if (path.endsWith("/20/status")) return `Uid:\t${String(TEST_UID)}\nPPid:\t10\n`;
       if (path.endsWith("/20/cmdline")) {
         daemonCommandReads++;
         return daemonCommandReads === 1 ? "node\0lcm\0daemon\0start\0--foreground" : "node\0other";
@@ -213,7 +217,7 @@ describe("mocked lifecycle identity boundaries", () => {
     });
     const kill = vi.fn();
     const result = await ensureDaemon({
-      ...base(), _procRoot: "/proc", _uid: 1000, _skipSpawn: true, _skipHealthWait: false,
+      ...base(), _procRoot: "/proc", _uid: TEST_UID, _skipSpawn: true, _skipHealthWait: false,
       _isProcessAliveOverride: () => true, _killOverride: kill, _sleepOverride: async () => {},
     });
     expect(result.connected).toBe(false);
@@ -227,9 +231,9 @@ describe("mocked lifecycle identity boundaries", () => {
     fs.readdir.mockReturnValue([{ isDirectory: () => true, name: "10" }]);
     fs.read.mockImplementation((path: string) => {
       if (path.endsWith("daemon.pid")) return "20";
-      if (path.endsWith("/10/status")) return "Uid:\t1000\nPPid:\t1\n";
+      if (path.endsWith("/10/status")) return `Uid:\t${String(TEST_UID)}\nPPid:\t1\n`;
       if (path.endsWith("/10/cmdline")) return "systemd\0--user";
-      if (path.endsWith("/20/status")) return "Uid:\t1000\nPPid:\t10\n";
+      if (path.endsWith("/20/status")) return `Uid:\t${String(TEST_UID)}\nPPid:\t10\n`;
       if (path.endsWith("/20/cmdline")) return ++daemonCommandReads === 1 ? "node\0lcm\0daemon\0start" : "node\0other";
       if (path.endsWith("daemon.token")) return "token";
       throw new Error(`unexpected read ${path}`);
@@ -239,7 +243,7 @@ describe("mocked lifecycle identity boundaries", () => {
       : { ok: true, json: async () => ({}) });
     const kill = vi.fn();
     const result = await ensureDaemon({
-      ...base(), _procRoot: "/proc", _uid: 1000, _skipSpawn: true, _skipHealthWait: false,
+      ...base(), _procRoot: "/proc", _uid: TEST_UID, _skipSpawn: true, _skipHealthWait: false,
       _fetchOverride: fetch as never, _isProcessAliveOverride: () => true, _killOverride: kill,
     });
     expect(result.connected).toBe(false);
@@ -252,9 +256,9 @@ describe("mocked lifecycle identity boundaries", () => {
     fs.readdir.mockReturnValue([{ isDirectory: () => true, name: "11" }]);
     fs.read.mockImplementation((path: string) => {
       if (path.endsWith("daemon.pid")) return "20";
-      if (path.endsWith("/11/status")) return "Uid:\t1000\nPPid:\t1\n";
+      if (path.endsWith("/11/status")) return `Uid:\t${String(TEST_UID)}\nPPid:\t1\n`;
       if (path.endsWith("/11/cmdline")) return "systemd\0--user";
-      if (path.endsWith("/20/status")) return "Uid:\t1000\nPPid:\t10\n";
+      if (path.endsWith("/20/status")) return `Uid:\t${String(TEST_UID)}\nPPid:\t10\n`;
       if (path.endsWith("/20/cmdline")) {
         writePidLeaf(Number.NaN);
         return "node\0lcm\0daemon\0start";
@@ -267,7 +271,7 @@ describe("mocked lifecycle identity boundaries", () => {
       : { ok: true, json: async () => ({}) });
     const kill = vi.fn();
     const result = await ensureDaemon({
-      ...base(), _procRoot: "/proc", _uid: 1000, _skipSpawn: true, _skipHealthWait: false,
+      ...base(), _procRoot: "/proc", _uid: TEST_UID, _skipSpawn: true, _skipHealthWait: false,
       _fetchOverride: fetch as never, _isProcessAliveOverride: () => true, _killOverride: kill,
     });
     expect(result.connected).toBe(false);

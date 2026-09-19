@@ -70,6 +70,7 @@ describe("ensureCore", () => {
       port: 3737,
       identity: {
         pid: process.pid,
+        birth: "birth",
         version: publicationVersion,
         storageBackend: "sqlite",
         entrypoint: publicationEntrypoint,
@@ -81,6 +82,7 @@ describe("ensureCore", () => {
         readToken: () => "token",
         readOwner: () => ({ version: 1, pid: process.pid, processStartTime: "birth", nonce: "a".repeat(32) }),
         processBirth: () => "birth",
+        admitPeer: expected => expected ?? { pid: process.pid, birth: "birth" },
         fetch: vi.fn(async () => ({
           ok: true,
           json: async () => ({ status: "ok", pid: process.pid, version: publicationVersion,

@@ -2,6 +2,7 @@ import { join } from "node:path";
 import { daemonEntrypointMatches } from "../daemon/lifecycle-scope.js";
 import { isStagedPostgreSqlHealth } from "../daemon/staged-postgresql.js";
 import { PrivateMutationLockContentionError, processStartTime, readPrivateMutationLockOwner } from "../private-mutation-lock.js";
+import type { ManagedDaemonPeerEvidence } from "../daemon/peer-admission.js";
 
 export const PUBLICATION_CONVERGENCE_MS = 2_000;
 export const PUBLICATION_CONVERGENCE_POLL_MS = 50;
@@ -17,6 +18,7 @@ export type PublicationDaemonHealth = Readonly<{
 
 export type PublicationDaemonIdentity = Readonly<{
   pid: number;
+  birth: string;
   version: string;
   storageBackend: "sqlite" | "postgresql";
   entrypoint: string;
@@ -31,6 +33,9 @@ export type PublicationConvergenceDeps = Readonly<{
   readToken?: () => string | null;
   readOwner?: typeof readPrivateMutationLockOwner;
   processBirth?: typeof processStartTime;
+  admitPeer?: (
+    expected?: ManagedDaemonPeerEvidence,
+  ) => ManagedDaemonPeerEvidence | null | Promise<ManagedDaemonPeerEvidence | null>;
   platform?: NodeJS.Platform;
   lockPath?: string;
   homeDir?: string;
@@ -86,12 +91,21 @@ async function authenticatedHealth(
   deps: PublicationConvergenceDeps,
   port: number,
   timeoutMs: number,
+  expectedPeer: ManagedDaemonPeerEvidence,
 ): Promise<PublicationDaemonHealth | null> {
   const controller = new AbortController();
   let timer: ReturnType<typeof setTimeout> | undefined;
   try {
+    const admitted = await deps.admitPeer?.(expectedPeer) ?? null;
+    if (admitted === null || admitted.pid !== expectedPeer.pid || admitted.birth !== expectedPeer.birth) return null;
     const token = deps.readToken?.() ?? null;
     if (token === null || deps.fetch === undefined) return null;
+    const admittedBeforeSend = await deps.admitPeer?.(expectedPeer) ?? null;
+    if (
+      admittedBeforeSend === null
+      || admittedBeforeSend.pid !== expectedPeer.pid
+      || admittedBeforeSend.birth !== expectedPeer.birth
+    ) return null;
     const timeout = new Promise<never>((_, reject) => {
       timer = setTimeout(() => {
         controller.abort();
@@ -122,6 +136,7 @@ async function authenticatedHealth(
 
 export async function capturePublicationIdentity(input: Readonly<{
   port: number;
+  admittedPeer?: ManagedDaemonPeerEvidence;
   expectedVersion: string | undefined;
   expectedStorageBackend: "sqlite" | "postgresql";
   expectedEntrypoint: string | undefined;
@@ -134,19 +149,23 @@ export async function capturePublicationIdentity(input: Readonly<{
     || input.expectedRuntimeDigest === undefined
   ) return undefined;
   const deps = input.deps ?? {};
-  const health = await authenticatedHealth(deps, input.port, 2_000);
+  const admittedPeer = input.admittedPeer ?? await deps.admitPeer?.();
+  if (admittedPeer === undefined || admittedPeer === null) return undefined;
+  const health = await authenticatedHealth(deps, input.port, 2_000, admittedPeer);
   if (
     health === null
     || typeof health.pid !== "number"
     || !Number.isSafeInteger(health.pid)
     || health.pid <= 0
+    || health.pid !== admittedPeer.pid
     || health.version !== input.expectedVersion
     || (health.storageBackend ?? "sqlite") !== input.expectedStorageBackend
     || !daemonEntrypointMatches(health.entrypoint, input.expectedEntrypoint, deps.platform ?? process.platform)
     || health.runtimeDigest !== input.expectedRuntimeDigest
   ) return undefined;
   return Object.freeze({
-    pid: health.pid,
+    pid: admittedPeer.pid,
+    birth: admittedPeer.birth,
     version: input.expectedVersion,
     storageBackend: input.expectedStorageBackend,
     entrypoint: input.expectedEntrypoint,
@@ -185,7 +204,12 @@ async function retryDelay(
   if (lockPath === undefined) return undefined;
   let owner;
   try { owner = ownerReader(lockPath, "backend publication"); } catch { return undefined; }
-  if (owner === null || owner.pid !== convergence.identity.pid || owner.processStartTime === null) return undefined;
+  if (
+    owner === null
+    || owner.pid !== convergence.identity.pid
+    || owner.processStartTime === null
+    || owner.processStartTime !== convergence.identity.birth
+  ) return undefined;
   const deadline = existingDeadline ?? now() + PUBLICATION_CONVERGENCE_MS;
   const remainingBirth = Math.floor(deadline - now());
   if (remainingBirth <= 0) return { expired: true };
@@ -198,7 +222,12 @@ async function retryDelay(
   if (birth !== owner.processStartTime) return now() >= deadline ? { expired: true } : undefined;
   const remainingHealth = deadline - now();
   if (remainingHealth <= 0) return { expired: true };
-  const health = await authenticatedHealth(convergence.deps, convergence.port, Math.min(2_000, remainingHealth));
+  const health = await authenticatedHealth(
+    convergence.deps,
+    convergence.port,
+    Math.min(2_000, remainingHealth),
+    convergence.identity,
+  );
   if (now() >= deadline) return { expired: true };
   if (!healthMatches(health, convergence.identity, convergence.deps.platform ?? process.platform)) return undefined;
   convergence.deadline = deadline;

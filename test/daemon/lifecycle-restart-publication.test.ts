@@ -215,6 +215,9 @@ function options(
     expectedRuntimeDigest: "b".repeat(64),
     _hermeticTestSeams: f.seams,
     _isManagedProcessOverride: () => true,
+    _listeningPortsOverride: () => [43_950],
+    _processStartTimeForTesting: pid => `birth-${String(pid)}`,
+    _peerProcessCommandOverride: () => "node /opt/lcm.mjs daemon start --foreground",
     ...overrides,
   };
 }
@@ -376,14 +379,16 @@ describe("restart publication assertion convergence", () => {
       });
     }) as never;
     f.seams.isProcessAlive = vi.fn(() => true);
+    let phase: "current" | "replacement" = "current";
     const probe = vi.fn(async (spec: SupervisorSpec): Promise<SupervisorObservation> => ({
       kind: "registered-running-valid",
       name: spec.name,
       scopeDigest: spec.scopeDigest,
       nonce: spec.nonce,
-      managerPid: 111,
+      managerPid: phase === "current" ? 111 : 222,
     }));
     const stopAndStart = vi.fn(async (spec: SupervisorSpec) => {
+      phase = "replacement";
       writeFileSync(f.pidPath, "222", { mode: 0o600 });
       return {
         kind: spec.kind,
@@ -1057,8 +1062,8 @@ describe("restart publication assertion convergence", () => {
       _assertBackendPublication: () => { throw contention; },
     }))).rejects.toBe(contention);
 
-    expect(boundedReadCalls).toHaveLength(5);
-    expect(boundedReadCalls.filter(call => call.path === f.pidPath)).toHaveLength(2);
+    expect(boundedReadCalls).toHaveLength(13);
+    expect(boundedReadCalls.filter(call => call.path === f.pidPath)).toHaveLength(10);
     expect(boundedReadCalls.filter(call => call.path === f.tokenPath)).toHaveLength(3);
     expect(boundedReadCalls).toEqual(expect.arrayContaining([
       {
@@ -1134,6 +1139,8 @@ describe("restart publication assertion convergence", () => {
         expectedEntrypoint: "/opt/lcm.mjs",
         _fetchOverride: fetch,
         _isProcessAliveOverride: () => true,
+        _listeningPortsOverride: () => [43_950],
+        _peerProcessCommandOverride: () => "node /opt/lcm.mjs daemon start --foreground",
         _processStartTimeForTesting: () => "birth-111",
         _killOverride: kill,
         _ensureDaemonOverride: ensure,
@@ -1468,7 +1475,7 @@ describe("restart publication assertion convergence", () => {
     expect(fetch).toHaveBeenCalledOnce();
   });
 
-  it("declines when hermetic process-birth evidence uses the default null probe", async () => {
+  it("refuses authenticated capture when hermetic peer evidence is incomplete", async () => {
     const f = fixture();
     writeFileSync(f.pidPath, "111", { mode: 0o600 });
     writeFileSync(f.tokenPath, "current-token", { mode: 0o600 });
@@ -1479,7 +1486,11 @@ describe("restart publication assertion convergence", () => {
       _assertBackendPublication: () => { throw contention; },
     }))).rejects.toBe(contention);
 
-    expect(f.seams.fetch).not.toHaveBeenCalled();
+    expect(f.seams.fetch).toHaveBeenCalledOnce();
+    expect(f.seams.fetch).toHaveBeenCalledWith(
+      "http://127.0.0.1:43950/health",
+      expect.objectContaining({ signal: expect.any(AbortSignal) }),
+    );
     expect(f.seams.killProcess).not.toHaveBeenCalled();
   });
 
@@ -1782,7 +1793,7 @@ describe("restart publication assertion convergence", () => {
       _assertBackendPublication: () => { throw contention; },
     }))).rejects.toBe(contention);
 
-    expect(f.seams.fetch).toHaveBeenCalledTimes(3);
+    expect(f.seams.fetch).toHaveBeenCalledTimes(drift === "token" ? 3 : 1);
     expect(f.seams.killProcess).not.toHaveBeenCalled();
   });
 
@@ -1895,7 +1906,11 @@ describe("restart publication assertion convergence", () => {
         expectedEntrypoint: "/opt/lcm.mjs",
         _fetchOverride: fetch,
         _isProcessAliveOverride: () => true,
+        _listeningPortsOverride: () => [43_950],
+        _peerProcessCommandOverride: () => "node /opt/lcm.mjs daemon start --foreground",
         _processStartTimeForTesting: () => "birth-111",
+        _peerProcessExecutableOverride: () => process.execPath,
+        _peerProcessOwnerUidOverride: () => process.getuid?.() ?? null,
         _readPrivateMutationLockOwnerForTesting: () => ({
           version: 1,
           pid: 999,
@@ -1940,6 +1955,8 @@ describe("restart publication assertion convergence", () => {
         expectedEntrypoint: "/opt/lcm.mjs",
         _fetchOverride: fetch,
         _isProcessAliveOverride: () => true,
+        _listeningPortsOverride: () => [43_950],
+        _peerProcessCommandOverride: () => "node /opt/lcm.mjs daemon start --foreground",
         _processStartTimeForTesting: () => "birth-111",
         _readPrivateMutationLockOwnerForTesting: () => null,
         _killOverride: kill,
@@ -1985,7 +2002,7 @@ describe("restart publication assertion convergence", () => {
     expect(boundedReadCalls[0]?.options.expectedUid).toBe(0);
   });
 
-  it("retains production capture compatibility when process.getuid is unavailable", async () => {
+  it("fails closed before production capture when process ownership is unavailable", async () => {
     const root = mkdtempSync(join(tmpdir(), "lcm-950-no-getuid-"));
     roots.push(root);
     const stateDir = join(root, ".lcm");
@@ -2012,6 +2029,8 @@ describe("restart publication assertion convergence", () => {
         expectedEntrypoint: "/opt/lcm.mjs",
         _fetchOverride: fetch,
         _isProcessAliveOverride: () => true,
+        _listeningPortsOverride: () => [43_950],
+        _peerProcessCommandOverride: () => "node /opt/lcm.mjs daemon start --foreground",
         _processStartTimeForTesting: () => "birth-111",
         _readPrivateMutationLockOwnerForTesting: () => null,
         _assertBackendPublication: () => { throw contention; },
@@ -2021,7 +2040,7 @@ describe("restart publication assertion convergence", () => {
       process.argv[1] = originalEntrypoint;
     }
 
-    expect(fetch).toHaveBeenCalledTimes(3);
+    expect(fetch).toHaveBeenCalledOnce();
     expect(boundedReadCalls).not.toHaveLength(0);
     expect(boundedReadCalls.every(call => call.options.expectedUid === undefined)).toBe(true);
   });
@@ -2247,6 +2266,7 @@ describe("restart publication assertion convergence", () => {
     await expect(restartDaemon(options(f, {
       expectedEntrypoint: undefined,
       _packagedEntrypointOverride: "/packaged/lcm.mjs",
+      _peerProcessCommandOverride: () => "node /packaged/lcm.mjs daemon start --foreground",
       _processStartTimeForTesting: () => "birth-111",
       _readPrivateMutationLockOwnerForTesting: () => ({
         version: 1,
@@ -2856,7 +2876,7 @@ describe("restart publication assertion convergence", () => {
       name: spec.name,
       scopeDigest: spec.scopeDigest,
       nonce: spec.nonce,
-      managerPid: 111,
+      managerPid: phase === "current" ? 111 : 222,
     }));
     const stopAndStart = vi.fn(async (spec: SupervisorSpec) => {
       phase = "replacement";

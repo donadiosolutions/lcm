@@ -219,7 +219,10 @@ describe("Epic 400 lifecycle final branch closure", () => {
       _skipSpawn: true,
       _listeningPortsOverride: () => (++listenerCalls === 1 ? [f.port] : []),
     });
-    expect(result.refusalReason).toBe("ambiguous");
+    expect(result.refusalReason).toBe("response-auth-failure");
+    expect(vi.mocked(f.seams.fetch).mock.calls.every(([, init]) => (
+      (init as RequestInit | undefined)?.headers === undefined
+    ))).toBe(true);
     const restartRoot = offlineFixture({ isAlive: () => true }, { listener: true });
     const restartManager = manager((spec) => managerObservation(spec, "registered-running-valid", { managerPid: 42 }));
     const ensured = vi.fn(async () => ({ connected: false, port: restartRoot.port, spawned: false }));

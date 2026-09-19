@@ -123,6 +123,7 @@ const state = vi.hoisted(() => ({
   runtimeHome: "/lcm",
   runtimePidPath: "/lcm/daemon.pid",
   runtimeTokenPath: "/lcm/daemon.token",
+  peerEvidence: { pid: 42, birth: "birth" } as { pid: number; birth: string } | null,
   migrateLegacyHome: vi.fn(),
   install: vi.fn(async () => undefined),
   createInstallerPublicationConvergence: vi.fn(),
@@ -250,14 +251,58 @@ vi.mock("../../src/runtime-paths.js", async importOriginal => ({
   migrateLegacyHomeIfNeeded: state.migrateLegacyHome,
   projectsDir: () => `${state.runtimeHome}/projects`,
 }));
+vi.mock("../../src/daemon/peer-admission.js", () => ({
+  admitManagedDaemonPeer: vi.fn(() => state.peerEvidence),
+}));
 vi.mock("../../src/daemon/client.js", () => ({
   DaemonClient: class {
-    post = state.post;
-    get = state.get;
-    health = state.health;
-    observe = state.observe;
-    constructor() {
+    private readonly verify?: () => void | Promise<void>;
+    private readonly tokenPath: string;
+    private tokenLoaded = false;
+    private token: string | null = null;
+    private readToken(): string | null {
+      if (!this.tokenLoaded) {
+        this.token = state.readAuthToken(this.tokenPath);
+        this.tokenLoaded = true;
+      }
+      return this.token;
+    }
+    post = async (...args: unknown[]) => {
+      await this.verify?.();
+      this.readToken();
+      await this.verify?.();
+      return await Reflect.apply(state.post, state, args);
+    };
+    get = async (...args: unknown[]) => {
+      await this.verify?.();
+      this.readToken();
+      await this.verify?.();
+      return await Reflect.apply(state.get, state, args);
+    };
+    health = async (...args: unknown[]) => {
+      try {
+        await this.verify?.();
+        this.readToken();
+        await this.verify?.();
+        return await Reflect.apply(state.health, state, args);
+      } catch {
+        return null;
+      }
+    };
+    observe = async (...args: unknown[]) => {
+      try {
+        await this.verify?.();
+        if (this.readToken() === null) return null;
+        await this.verify?.();
+        return await Reflect.apply(state.observe, state, args);
+      } catch {
+        return null;
+      }
+    };
+    constructor(_baseUrl: string, tokenPath?: string, security?: { verifyProtectedRequest?: () => void | Promise<void> }) {
       state.daemonClientInstances++;
+      this.tokenPath = tokenPath ?? state.runtimeTokenPath;
+      this.verify = security?.verifyProtectedRequest;
     }
   },
 }));
@@ -414,13 +459,14 @@ function makeTestConvergence(
   let now = 0;
   return createPublicationConvergence({
     port: 3737,
-    identity: { pid: 42, version: "1.4.2", storageBackend: "sqlite", entrypoint: "/daemon", runtimeDigest: "runtime" },
+    identity: { pid: 42, birth: "birth", version: "1.4.2", storageBackend: "sqlite", entrypoint: "/daemon", runtimeDigest: "runtime" },
     deps: {
       now: () => now,
       sleep: async (delayMs: number) => { now += delayMs; },
       readToken: () => "token",
       readOwner,
       processBirth: () => "birth",
+      admitPeer: () => ({ pid: 42, birth: "birth" }),
       lockPath: "/tmp/publication.lock",
       fetch: vi.fn(async () => ({ ok: true, json: async () => ({
         status: "ok", pid: 42, version: "1.4.2", storageBackend: "sqlite",
@@ -541,6 +587,7 @@ beforeEach(() => {
   state.listCliProjects.mockImplementation(async () => state.cliProjects);
   state.packagedRuntimeEntrypoint = "/daemon";
   state.runtimeDigest = "runtime";
+  state.peerEvidence = { pid: 42, birth: "birth" };
   state.provisionResult = {
     applied: ["0001_migration_ledger"],
     current: ["0001_migration_ledger"],
@@ -568,11 +615,12 @@ describe("runCli registration and help dispatch", () => {
   it("creates one convergence and passes it to top-level install", async () => {
     const convergence = createPublicationConvergence({
       port: 3737,
-      identity: { pid: 42, version: "1.4.2", storageBackend: "sqlite", entrypoint: "/daemon", runtimeDigest: "runtime" },
+      identity: { pid: 42, birth: "birth", version: "1.4.2", storageBackend: "sqlite", entrypoint: "/daemon", runtimeDigest: "runtime" },
       deps: {
         readToken: () => "token",
         readOwner: () => ({ version: 1, pid: 42, processStartTime: "birth", nonce: "a".repeat(32) }),
         processBirth: () => "birth",
+        admitPeer: () => ({ pid: 42, birth: "birth" }),
         lockPath: "/tmp/publication.lock",
         fetch: vi.fn(async () => ({ ok: true, json: async () => ({ status: "ok", pid: 42, version: "1.4.2", storageBackend: "sqlite", entrypoint: "/daemon", runtimeDigest: "runtime" }) })) as unknown as typeof globalThis.fetch,
       },
@@ -622,12 +670,13 @@ describe("runCli registration and help dispatch", () => {
   it("reuses the preAction convergence for config reads and prints once", async () => {
     const convergence = createPublicationConvergence({
       port: 3737,
-      identity: { pid: 42, version: "1.4.2", storageBackend: "sqlite", entrypoint: "/daemon", runtimeDigest: "runtime" },
+      identity: { pid: 42, birth: "birth", version: "1.4.2", storageBackend: "sqlite", entrypoint: "/daemon", runtimeDigest: "runtime" },
       deps: {
         sleep: async () => undefined,
         readToken: () => "token",
         readOwner: () => ({ version: 1, pid: 42, processStartTime: "birth", nonce: "a".repeat(32) }),
         processBirth: () => "birth",
+        admitPeer: () => ({ pid: 42, birth: "birth" }),
         lockPath: "/tmp/publication.lock",
         fetch: vi.fn(async () => ({ ok: true, json: async () => ({
           status: "ok", pid: 42, version: "1.4.2", storageBackend: "sqlite",
@@ -653,13 +702,14 @@ describe("runCli registration and help dispatch", () => {
     let sleeps = 0;
     const convergence = createPublicationConvergence({
       port: 3737,
-      identity: { pid: 42, version: "1.4.2", storageBackend: "sqlite", entrypoint: "/daemon", runtimeDigest: "runtime" },
+      identity: { pid: 42, birth: "birth", version: "1.4.2", storageBackend: "sqlite", entrypoint: "/daemon", runtimeDigest: "runtime" },
       deps: {
         now: () => now,
         sleep: async () => { sleeps += 1; now = sleeps === 1 ? 1_990 : 2_000; },
         readToken: () => "token",
         readOwner: () => ({ version: 1, pid: 42, processStartTime: "birth", nonce: "a".repeat(32) }),
         processBirth: () => "birth",
+        admitPeer: () => ({ pid: 42, birth: "birth" }),
         lockPath: "/tmp/publication.lock",
         fetch: vi.fn(async () => ({ ok: true, json: async () => ({
           status: "ok", pid: 42, version: "1.4.2", storageBackend: "sqlite",
@@ -1167,6 +1217,51 @@ describe("runCli registration and help dispatch", () => {
     expect(state.post).not.toHaveBeenCalled();
   });
 
+  it("sends no credential or store body to a reused PID running a foreign entrypoint", async () => {
+    const root = actualFs.mkdtempSync(join(tmpdir(), "lcm-cli-reused-peer-"));
+    const pidFilePath = join(root, "daemon.pid");
+    actualFs.writeFileSync(pidFilePath, "42\n", { mode: 0o600 });
+    const actualPeer = await vi.importActual<typeof import("../../src/daemon/peer-admission.js")>(
+      "../../src/daemon/peer-admission.js",
+    );
+    try {
+      state.peerEvidence = actualPeer.admitManagedDaemonPeer({
+        authority: { kind: "pid-file", pidFilePath, expectedUid: process.getuid?.() },
+        port: 3737,
+        platform: "linux",
+        expectedEntrypoint: "/opt/lcm/lcm.mjs",
+        _seams: {
+          isProcessAlive: () => true,
+          processBirth: () => "reused-birth",
+          readProcessArguments: () => [
+            "/usr/bin/node",
+            "/tmp/foreign-lcm.mjs",
+            "/opt/lcm/lcm.mjs",
+            "daemon",
+            "start",
+          ],
+          readProcessExecutable: () => process.execPath,
+          readProcessOwnerUid: () => process.getuid?.() ?? null,
+          findListeningTcpPorts: () => [3737],
+        },
+      });
+      expect(state.peerEvidence).toBeNull();
+
+      const error = await invoke(["store", "must-not-send"], {
+        migrate: vi.fn(),
+        sleep: async () => undefined,
+      });
+
+      expect(error?.message).toContain("Daemon peer ownership could not be verified");
+      expect(state.readAuthToken).not.toHaveBeenCalled();
+      expect(state.health).not.toHaveBeenCalled();
+      expect(state.get).not.toHaveBeenCalled();
+      expect(state.post).not.toHaveBeenCalled();
+    } finally {
+      actualFs.rmSync(root, { recursive: true, force: true });
+    }
+  });
+
   it("shows the static missing-storage remedy for export and import failures", async () => {
     const missing=new CliProjectStorageMissingError();
     missing.message="SECRET_CANARY";
@@ -1567,6 +1662,65 @@ describe("runCli daemon-backed and utility actions", () => {
     expect(state.ensureDaemon).toHaveBeenCalledOnce();
   });
 
+  it("retains manager-authorized peer evidence on the lifecycle fallback client", async () => {
+    state.peerEvidence = null;
+    const order: string[] = [];
+    state.readAuthToken.mockImplementation(() => {
+      order.push("token");
+      return state.authToken;
+    });
+    const admitPeer = vi.fn(async () => {
+      order.push("manager");
+      return { pid: 42, birth: "manager-birth" };
+    });
+    state.ensureDaemon.mockImplementationOnce(async (options: {
+      _onAuthenticatedDaemonResult?: (evidence: unknown) => void;
+    }) => {
+      options._onAuthenticatedDaemonResult?.({
+        health: { pid: 42 },
+        birthBefore: "manager-birth",
+        admitPeer,
+      });
+      return { connected: true, spawned: false, restartedForParent: false, pid: 42 };
+    });
+
+    expect(await invoke(["search", "query"], {
+      migrate: vi.fn(),
+      sleep: async () => undefined,
+    })).toBeUndefined();
+    expect(admitPeer).toHaveBeenCalledTimes(2);
+    expect(order).toEqual(["manager", "token", "manager"]);
+    expect(state.post).toHaveBeenCalledOnce();
+  });
+
+  it.each([
+    ["read", ["search", "query"]],
+    ["store", ["store", "memory"]],
+  ] as const)("sends no credential or protected %s body when fast and fallback peer admission fail", async (
+    _label,
+    args,
+  ) => {
+    state.peerEvidence = null;
+    state.ensureDaemon.mockResolvedValueOnce({
+      connected: true,
+      spawned: false,
+      restartedForParent: false,
+      pid: 42,
+    });
+
+    const error = await invoke([...args], {
+      migrate: vi.fn(),
+      sleep: async () => undefined,
+    });
+
+    expect(error?.message).toContain("Daemon peer ownership could not be verified");
+    expect(state.ensureDaemon).toHaveBeenCalledOnce();
+    expect(state.readAuthToken).not.toHaveBeenCalled();
+    expect(state.health).not.toHaveBeenCalled();
+    expect(state.get).not.toHaveBeenCalled();
+    expect(state.post).not.toHaveBeenCalled();
+  });
+
   it("falls back to authenticated migration when store preflight cannot authorize", async () => {
     state.health.mockResolvedValue({ status: "ok", storageBackend: "postgresql" });
     const migrate = vi.fn();
@@ -1629,6 +1783,12 @@ describe("runCli daemon-backed and utility actions", () => {
 
     expect(migrate).toHaveBeenCalledOnce();
     expect(state.ensureDaemon).toHaveBeenCalledOnce();
+    if (entrypoint === undefined) {
+      const peerAdmission = await import("../../src/daemon/peer-admission.js");
+      expect(vi.mocked(peerAdmission.admitManagedDaemonPeer)).toHaveBeenLastCalledWith(
+        expect.objectContaining({ expectedEntrypoint: process.argv[1] }),
+      );
+    }
   });
 
   it.each([

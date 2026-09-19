@@ -36,6 +36,11 @@ export interface DoctorDeps {
   _lstatLcmRootForTesting?: typeof import("node:fs").lstatSync;
   /** Internal packaged runtime digest seam used by deterministic tests. */
   _expectedRuntimeDigestForTesting?: string;
+  /** Internal credential-free daemon-peer admission seam. */
+  _admitDaemonPeer?: (
+    port: number,
+    expectedEntrypoint: string,
+  ) => import("../daemon/peer-admission.js").ManagedDaemonPeerEvidence | null;
   /** Test seam for transport-aware Claude guidance validation. */
   _claudeTransport?: "cli" | "mcp";
   renderClaudeSkill?: (transport: "cli" | "mcp") => string;
