@@ -1,10 +1,15 @@
 import { afterEach, describe, expect, it } from "vitest";
+import { createRequire, syncBuiltinESMExports } from "node:module";
+import { randomBytes } from "node:crypto";
 import {
   chmodSync,
+  existsSync,
+  linkSync,
   mkdirSync,
   mkdtempSync,
   readFileSync,
   rmSync,
+  statSync,
   writeFileSync,
 } from "node:fs";
 import { tmpdir } from "node:os";
@@ -23,6 +28,12 @@ import {
   type ActivationArtifactRecoveryMaterial,
 } from "../../src/migration/activation-artifact-store.js";
 import type { BackendPublicationRecoveryFile } from "../../src/storage/backend-publication.js";
+import {
+  PrivateFileCollisionCleanupError,
+  PrivateFileCollisionError,
+  readBoundedRegularFileWithStat,
+  type BoundedFileOptions,
+} from "../../src/security-files.js";
 
 const roots: string[] = [];
 
@@ -412,7 +423,7 @@ describe("publishActivationArtifact", () => {
             // (byte-identical to this candidate) is already on disk by the
             // time this call's own link attempt is rejected.
             writeFileSync(targetPath, content, { mode: 0o600 });
-            throw new Error("private file was created concurrently");
+            throw new PrivateFileCollisionError("private file was created concurrently");
           },
         },
       );
@@ -431,7 +442,7 @@ describe("publishActivationArtifact", () => {
           { homeDir, material },
           {
             writeDurable: () => {
-              throw new Error("private file already exists");
+              throw new PrivateFileCollisionError("private file already exists");
             },
           },
         ),
@@ -774,3 +785,623 @@ describe("recoveryFileFromWireJson malformed-stored-record branches", () => {
   });
 });
 
+/** Mirror of generation-binding-store.test.ts's withPatchedFs: patch one
+ * node:fs export for the duration of callback, then restore it, so calls
+ * made through this module's own named ESM imports are reached too. */
+function withPatchedFs<T>(name: string, replacement: unknown, callback: () => T): T {
+  const nodeFs = createRequire(import.meta.url)("node:fs") as Record<string, unknown>;
+  const original = nodeFs[name];
+  nodeFs[name] = replacement;
+  syncBuiltinESMExports();
+  try {
+    return callback();
+  } finally {
+    nodeFs[name] = original;
+    syncBuiltinESMExports();
+  }
+}
+
+/** Publish once, then hand back the exact on-disk wire bytes and remove the
+ * published file, so the caller can rebuild the precise post-link crash
+ * state from genuine bytes rather than hand-built approximations. */
+function capturePublishedArtifactBytes(
+  homeDir: string,
+  material: ActivationArtifactRecoveryMaterial,
+): string {
+  const first = publishActivationArtifact({ homeDir, material });
+  expect(first.outcome).toBe("written");
+  const bytes = readFileSync(first.path, "utf8");
+  rmSync(first.path);
+  return bytes;
+}
+
+/** Rebuild the exact crash state atomicWritePrivateFileDurable's
+ * requireAbsent path leaves when linkSync(final) succeeds but the matching
+ * unlinkSync(scratch) never runs: the final name and its scratch twin are
+ * two links to one inode, both nlink=2. */
+function buildArtifactCrashTwin(
+  homeDir: string,
+  identityDigest: string,
+  content: string,
+): Readonly<{ finalPath: string; scratchPath: string }> {
+  const directory = activationArtifactDirectory(homeDir);
+  mkdirSync(directory, { recursive: true, mode: 0o700 });
+  const finalPath = activationArtifactPath(homeDir, identityDigest);
+  const scratchPath = join(
+    directory,
+    "." + identityDigest + ".material." + randomBytes(12).toString("hex") + ".tmp",
+  );
+  writeFileSync(scratchPath, content, { mode: 0o600 });
+  linkSync(scratchPath, finalPath);
+  return { finalPath, scratchPath };
+}
+
+describe("publishActivationArtifact: post-link crash-twin recovery (#1436)", () => {
+  it("converges on retry after the exact post-link crash state, completing the interrupted unlink" +
+    " instead of escaping the raw multi-link read error", () => {
+    const homeDir = home();
+    const material = buildMaterial(homeDir, "pub-1");
+    const digest = computeActivationArtifactIdentityDigest(material);
+    const cleanBytes = capturePublishedArtifactBytes(homeDir, material);
+    const { finalPath, scratchPath } = buildArtifactCrashTwin(homeDir, digest, cleanBytes);
+    expect(statSync(finalPath).nlink).toBe(2);
+    const result = publishActivationArtifact({ homeDir, material: buildMaterial(homeDir, "pub-1") });
+    expect(result.outcome).toBe("reused");
+    expect(statSync(finalPath).nlink).toBe(1);
+    expect(existsSync(scratchPath)).toBe(false);
+    expect(readFileSync(finalPath, "utf8")).toBe(cleanBytes);
+  });
+
+  it("refuses a conflicting rewrite when the authenticated twin's content differs from the candidate", () => {
+    const homeDir = home();
+    const material = buildMaterial(homeDir, "pub-1");
+    const digest = computeActivationArtifactIdentityDigest(material);
+    const cleanBytes = capturePublishedArtifactBytes(homeDir, material);
+    buildArtifactCrashTwin(homeDir, digest, cleanBytes);
+    const conflicting = { ...buildMaterial(homeDir, "pub-1"), publicationId: "pub-2" };
+    expect(() => publishActivationArtifact({ homeDir, material: conflicting })).toThrow(
+      ActivationArtifactIdentityMismatchError,
+    );
+  });
+
+  it("is unresolvable, never raw and never a conflict, when nlink=2 has no matching writer-scratch twin", () => {
+    const homeDir = home();
+    const material = buildMaterial(homeDir, "pub-1");
+    const digest = computeActivationArtifactIdentityDigest(material);
+    const directory = activationArtifactDirectory(homeDir);
+    mkdirSync(directory, { recursive: true, mode: 0o700 });
+    const unrelatedPath = join(directory, "unrelated-hardlink-name");
+    const finalPath = activationArtifactPath(homeDir, digest);
+    writeFileSync(unrelatedPath, "not a writer scratch file", { mode: 0o600 });
+    linkSync(unrelatedPath, finalPath);
+    expect(statSync(finalPath).nlink).toBe(2);
+    expect(() => publishActivationArtifact({ homeDir, material: buildMaterial(homeDir, "pub-1") })).toThrow(
+      ActivationArtifactPresenceUnresolvableError,
+    );
+  });
+
+  it("readActivationArtifact reports the same stuck-twin state as unresolvable, not a raw error", () => {
+    const homeDir = home();
+    const material = buildMaterial(homeDir, "pub-1");
+    const digest = computeActivationArtifactIdentityDigest(material);
+    const cleanBytes = capturePublishedArtifactBytes(homeDir, material);
+    buildArtifactCrashTwin(homeDir, digest, cleanBytes);
+    expect(() => readActivationArtifact({ homeDir, identityDigest: digest })).toThrow(
+      ActivationArtifactPresenceUnresolvableError,
+    );
+  });
+});
+
+describe("publishActivationArtifact: typed durable-write collision recognition (#1434)", () => {
+  it("reconciles as reused when the write primitive raises a typed collision with unrelated message text", () => {
+    const homeDir = home();
+    const material = buildMaterial(homeDir, "pub-1");
+    const result = publishActivationArtifact(
+      { homeDir, material },
+      {
+        writeDurable: (targetPath, content) => {
+          writeFileSync(targetPath, content, { mode: 0o600 });
+          throw new PrivateFileCollisionError("driver-specific wording that must never be matched");
+        },
+      },
+    );
+    expect(result.outcome).toBe("reused");
+  });
+
+  it("reconciles as reused for a typed collision cleanup whose primary failure is a collision", () => {
+    const homeDir = home();
+    const material = buildMaterial(homeDir, "pub-1");
+    const result = publishActivationArtifact(
+      { homeDir, material },
+      {
+        writeDurable: (targetPath, content) => {
+          writeFileSync(targetPath, content, { mode: 0o600 });
+          throw new PrivateFileCollisionCleanupError("wrapped typed collision", {
+            cause: new PrivateFileCollisionError("driver-specific primary wording"),
+          });
+        },
+      },
+    );
+    expect(result.outcome).toBe("reused");
+  });
+
+  it("propagates a same-message bare Error rather than treating its text as a collision", () => {
+    const homeDir = home();
+    const material = buildMaterial(homeDir, "pub-1");
+    const boom = new Error("private file was created concurrently");
+    expect(() =>
+      publishActivationArtifact(
+        { homeDir, material },
+        {
+          writeDurable: (targetPath, content) => {
+            // A genuine concurrent winner's bytes are on disk, exactly as
+            // in the benign case above -- only the error's type differs.
+            writeFileSync(targetPath, content, { mode: 0o600 });
+            throw boom;
+          },
+        },
+      ),
+    ).toThrow(boom);
+  });
+});
+
+describe("ensureActivationArtifactDirectory: creation-path durability (#1437)", () => {
+  it("fsyncs the freshly created store directory and its parent LCM root on first creation", () => {
+    const homeDir = home();
+    const material = buildMaterial(homeDir, "pub-1");
+    const root = join(homeDir, ".lcm");
+    const store = activationArtifactDirectory(homeDir);
+    const nodeFs = createRequire(import.meta.url)("node:fs") as Record<string, unknown>;
+    const originalOpenSync = nodeFs.openSync as (path: string, flags: unknown, mode?: unknown) => number;
+    const originalFsyncSync = nodeFs.fsyncSync as (fd: number) => void;
+    const pathByFd = new Map<number, string>();
+    const fsyncedPaths: string[] = [];
+    withPatchedFs("openSync", ((path: string, flags: unknown, mode?: unknown) => {
+      const fd = mode === undefined ? originalOpenSync(path, flags) : originalOpenSync(path, flags, mode);
+      pathByFd.set(fd, path);
+      return fd;
+    }) as never, () => withPatchedFs("fsyncSync", ((fd: number) => {
+      const path = pathByFd.get(fd);
+      if (path !== undefined) fsyncedPaths.push(path);
+      originalFsyncSync(fd);
+    }) as never, () => {
+      publishActivationArtifact({ homeDir, material });
+    }));
+    expect(fsyncedPaths.filter((path) => path === root).length).toBeGreaterThanOrEqual(1);
+    expect(fsyncedPaths.filter((path) => path === store).length).toBeGreaterThanOrEqual(2);
+  });
+});
+
+describe("reconcileArtifactScratchTwin: internal branch coverage", () => {
+  it("is unresolvable when the final re-read reports absent (ENOENT) rather than present", () => {
+    const homeDir = home();
+    const material = buildMaterial(homeDir, "pub-1");
+    const digest = computeActivationArtifactIdentityDigest(material);
+    const cleanBytes = capturePublishedArtifactBytes(homeDir, material);
+    const { finalPath } = buildArtifactCrashTwin(homeDir, digest, cleanBytes);
+    expect(() =>
+      publishActivationArtifact(
+        { homeDir, material },
+        {
+          readWithStat: (path: string, options: BoundedFileOptions) => {
+            if (path === finalPath && options.requireSingleLink !== true) {
+              const error = new Error("ENOENT") as NodeJS.ErrnoException;
+              error.code = "ENOENT";
+              throw error;
+            }
+            return readBoundedRegularFileWithStat(path, options);
+          },
+        },
+      ),
+    ).toThrow(ActivationArtifactPresenceUnresolvableError);
+  });
+
+  it("is unresolvable when the final re-read is unresolvable (EACCES) rather than present", () => {
+    const homeDir = home();
+    const material = buildMaterial(homeDir, "pub-1");
+    const digest = computeActivationArtifactIdentityDigest(material);
+    const cleanBytes = capturePublishedArtifactBytes(homeDir, material);
+    const { finalPath } = buildArtifactCrashTwin(homeDir, digest, cleanBytes);
+    const boom = Object.assign(new Error("permission denied for testing"), { code: "EACCES" });
+    expect(() =>
+      publishActivationArtifact(
+        { homeDir, material },
+        {
+          readWithStat: (path: string, options: BoundedFileOptions) => {
+            if (path === finalPath && options.requireSingleLink !== true) throw boom;
+            return readBoundedRegularFileWithStat(path, options);
+          },
+        },
+      ),
+    ).toThrow(ActivationArtifactPresenceUnresolvableError);
+  });
+
+  it("is unresolvable when the final re-read is present but nlink is no longer exactly 2", () => {
+    const homeDir = home();
+    const material = buildMaterial(homeDir, "pub-1");
+    const digest = computeActivationArtifactIdentityDigest(material);
+    const directory = activationArtifactDirectory(homeDir);
+    mkdirSync(directory, { recursive: true, mode: 0o700 });
+    const finalPath = activationArtifactPath(homeDir, digest);
+    writeFileSync(finalPath, "unrelated multi-link content", { mode: 0o600 });
+    linkSync(finalPath, join(directory, "foreign-second-link"));
+    linkSync(finalPath, join(directory, "foreign-third-link"));
+    expect(statSync(finalPath).nlink).toBe(3);
+    expect(() => publishActivationArtifact({ homeDir, material })).toThrow(
+      ActivationArtifactPresenceUnresolvableError,
+    );
+  });
+
+  it("is unresolvable when readdirSync itself fails while scanning for a scratch twin", () => {
+    const homeDir = home();
+    const material = buildMaterial(homeDir, "pub-1");
+    const digest = computeActivationArtifactIdentityDigest(material);
+    const cleanBytes = capturePublishedArtifactBytes(homeDir, material);
+    const { finalPath } = buildArtifactCrashTwin(homeDir, digest, cleanBytes);
+    const directory = activationArtifactDirectory(homeDir);
+    const realReaddirSync = (createRequire(import.meta.url)("node:fs") as { readdirSync: (p: string) => string[] }).readdirSync;
+    expect(() =>
+      withPatchedFs("readdirSync", ((path: string) => {
+        if (path === directory) throw new Error("synthetic readdir failure");
+        return realReaddirSync(path);
+      }) as never, () => publishActivationArtifact({ homeDir, material })),
+    ).toThrow(ActivationArtifactPresenceUnresolvableError);
+    expect(statSync(finalPath).nlink).toBe(2);
+  });
+
+  it("is unresolvable when a name-matching candidate fails an integrity check while being read", () => {
+    const homeDir = home();
+    const material = buildMaterial(homeDir, "pub-1");
+    const digest = computeActivationArtifactIdentityDigest(material);
+    const directory = activationArtifactDirectory(homeDir);
+    mkdirSync(directory, { recursive: true, mode: 0o700 });
+    const unrelatedPath = join(directory, "unrelated-hardlink-name");
+    const finalPath = activationArtifactPath(homeDir, digest);
+    writeFileSync(unrelatedPath, "not a writer scratch file", { mode: 0o600 });
+    linkSync(unrelatedPath, finalPath);
+    const looseName = "." + digest + ".material." + randomBytes(12).toString("hex") + ".tmp";
+    writeFileSync(join(directory, looseName), "wrong mode", { mode: 0o644 });
+    expect(() => publishActivationArtifact({ homeDir, material })).toThrow(
+      ActivationArtifactPresenceUnresolvableError,
+    );
+  });
+
+  it("is unresolvable when a name-matching candidate read is itself unresolvable", () => {
+    const homeDir = home();
+    const material = buildMaterial(homeDir, "pub-1");
+    const digest = computeActivationArtifactIdentityDigest(material);
+    const cleanBytes = capturePublishedArtifactBytes(homeDir, material);
+    const { scratchPath } = buildArtifactCrashTwin(homeDir, digest, cleanBytes);
+    const boom = Object.assign(new Error("permission denied for testing"), { code: "EACCES" });
+    expect(() =>
+      publishActivationArtifact(
+        { homeDir, material },
+        {
+          readWithStat: (path: string, options: BoundedFileOptions) => {
+            if (path === scratchPath && options.requireSingleLink !== true) throw boom;
+            return readBoundedRegularFileWithStat(path, options);
+          },
+        },
+      ),
+    ).toThrow(ActivationArtifactPresenceUnresolvableError);
+  });
+
+  it("passes over a name-matching decoy with a separate inode and refuses with no genuine twin found", () => {
+    const homeDir = home();
+    const material = buildMaterial(homeDir, "pub-1");
+    const digest = computeActivationArtifactIdentityDigest(material);
+    const directory = activationArtifactDirectory(homeDir);
+    mkdirSync(directory, { recursive: true, mode: 0o700 });
+    const unrelatedPath = join(directory, "unrelated-hardlink-name");
+    const finalPath = activationArtifactPath(homeDir, digest);
+    writeFileSync(unrelatedPath, "not a writer scratch file", { mode: 0o600 });
+    linkSync(unrelatedPath, finalPath);
+    const decoyName = "." + digest + ".material." + randomBytes(12).toString("hex") + ".tmp";
+    const decoyPath = join(directory, decoyName);
+    writeFileSync(decoyPath, "not the same content at all", { mode: 0o600 });
+    expect(() => publishActivationArtifact({ homeDir, material })).toThrow(
+      ActivationArtifactPresenceUnresolvableError,
+    );
+    expect(existsSync(decoyPath)).toBe(true);
+  });
+
+  it("passes over scratch-pattern-shaped non-candidates: a wrong suffix, an empty middle, a non-hex middle", () => {
+    const homeDir = home();
+    const material = buildMaterial(homeDir, "pub-1");
+    const digest = computeActivationArtifactIdentityDigest(material);
+    const directory = activationArtifactDirectory(homeDir);
+    mkdirSync(directory, { recursive: true, mode: 0o700 });
+    const unrelatedPath = join(directory, "unrelated-hardlink-name");
+    const finalPath = activationArtifactPath(homeDir, digest);
+    writeFileSync(unrelatedPath, "not a writer scratch file", { mode: 0o600 });
+    linkSync(unrelatedPath, finalPath);
+    writeFileSync(join(directory, "." + digest + ".material.abc"), "wrong suffix", { mode: 0o600 });
+    writeFileSync(join(directory, "." + digest + ".material..tmp"), "empty middle", { mode: 0o600 });
+    writeFileSync(join(directory, "." + digest + ".material.ZZZ.tmp"), "non-hex middle", { mode: 0o600 });
+    expect(() => publishActivationArtifact({ homeDir, material })).toThrow(
+      ActivationArtifactPresenceUnresolvableError,
+    );
+  });
+
+  it("is unresolvable when dependency-injected reads report more than one authenticated twin", () => {
+    const homeDir = home();
+    const material = buildMaterial(homeDir, "pub-1");
+    const digest = computeActivationArtifactIdentityDigest(material);
+    const directory = activationArtifactDirectory(homeDir);
+    mkdirSync(directory, { recursive: true, mode: 0o700 });
+    const finalPath = activationArtifactPath(homeDir, digest);
+    const scratchAName = "." + digest + ".material." + randomBytes(12).toString("hex") + ".tmp";
+    const scratchBName = "." + digest + ".material." + randomBytes(12).toString("hex") + ".tmp";
+    const scratchAPath = join(directory, scratchAName);
+    const scratchBPath = join(directory, scratchBName);
+    writeFileSync(finalPath, "on-disk content is irrelevant", { mode: 0o600 });
+    writeFileSync(scratchAPath, "irrelevant", { mode: 0o600 });
+    writeFileSync(scratchBPath, "irrelevant", { mode: 0o600 });
+    const fakeIdentity: BoundedFileResult = {
+      content: "shared-fake-content",
+      mtimeMs: 1000,
+      dev: 1,
+      ino: 1,
+      mode: 0o600,
+      uid: 0,
+      gid: 0,
+      nlink: "2",
+      parentDev: "1",
+      parentIno: "1",
+      exactDev: "1",
+      exactIno: "1",
+    };
+    expect(() =>
+      publishActivationArtifact(
+        { homeDir, material },
+        {
+          readWithStat: (path: string, options: BoundedFileOptions): BoundedFileResult => {
+            if (path === finalPath && options.requireSingleLink === true) {
+              throw new Error("file has multiple hard links");
+            }
+            if (path === finalPath || path === scratchAPath || path === scratchBPath) {
+              return { ...fakeIdentity };
+            }
+            throw new Error("unexpected path in fake reader: " + path);
+          },
+        },
+      ),
+    ).toThrow(ActivationArtifactPresenceUnresolvableError);
+  });
+
+  it("completes the unlink when the twin is already gone by cleanup time and reuses", () => {
+    const homeDir = home();
+    const material = buildMaterial(homeDir, "pub-1");
+    const digest = computeActivationArtifactIdentityDigest(material);
+    const cleanBytes = capturePublishedArtifactBytes(homeDir, material);
+    const { finalPath, scratchPath } = buildArtifactCrashTwin(homeDir, digest, cleanBytes);
+    const result = publishActivationArtifact(
+      { homeDir, material },
+      {
+        readWithStat: (path: string, options: BoundedFileOptions) => {
+          const real = readBoundedRegularFileWithStat(path, options);
+          if (path === scratchPath && options.requireSingleLink !== true) rmSync(scratchPath, { force: true });
+          return real;
+        },
+      },
+    );
+    expect(result.outcome).toBe("reused");
+    expect(existsSync(scratchPath)).toBe(false);
+    expect(statSync(finalPath).nlink).toBe(1);
+  });
+
+  it("propagates a genuine, non-ENOENT twin lstat failure unchanged", () => {
+    const homeDir = home();
+    const material = buildMaterial(homeDir, "pub-1");
+    const digest = computeActivationArtifactIdentityDigest(material);
+    const cleanBytes = capturePublishedArtifactBytes(homeDir, material);
+    const { scratchPath } = buildArtifactCrashTwin(homeDir, digest, cleanBytes);
+    const boom = Object.assign(new Error("permission denied for testing"), { code: "EACCES" });
+    const realLstatSync = (createRequire(import.meta.url)("node:fs") as { lstatSync: (p: string, o?: unknown) => unknown }).lstatSync;
+    expect(() =>
+      withPatchedFs("lstatSync", ((path: string, options?: unknown) => {
+        if (path === scratchPath) throw boom;
+        return realLstatSync(path, options);
+      }) as never, () => publishActivationArtifact({ homeDir, material })),
+    ).toThrow(boom);
+  });
+
+  it("leaves a same-named, different-identity file alone and refuses as unresolvable", () => {
+    const homeDir = home();
+    const material = buildMaterial(homeDir, "pub-1");
+    const digest = computeActivationArtifactIdentityDigest(material);
+    const cleanBytes = capturePublishedArtifactBytes(homeDir, material);
+    const { finalPath, scratchPath } = buildArtifactCrashTwin(homeDir, digest, cleanBytes);
+    const decoyPath = scratchPath + ".decoy-swap";
+    writeFileSync(decoyPath, "unrelated", { mode: 0o600 });
+    const realLstatSync = (createRequire(import.meta.url)("node:fs") as { lstatSync: (p: string, o?: unknown) => unknown }).lstatSync;
+    expect(() =>
+      withPatchedFs("lstatSync", ((path: string, options?: unknown) => {
+        if (path === scratchPath) return realLstatSync(decoyPath, options);
+        return realLstatSync(path, options);
+      }) as never, () => publishActivationArtifact({ homeDir, material })),
+    ).toThrow(ActivationArtifactPresenceUnresolvableError);
+    expect(existsSync(scratchPath)).toBe(true);
+    expect(existsSync(decoyPath)).toBe(true);
+    expect(readFileSync(finalPath, "utf8")).toBe(cleanBytes);
+    expect(statSync(finalPath).nlink).toBe(2);
+  });
+
+  it("swallows an ENOENT raised by the unlink call itself", () => {
+    const homeDir = home();
+    const material = buildMaterial(homeDir, "pub-1");
+    const digest = computeActivationArtifactIdentityDigest(material);
+    const cleanBytes = capturePublishedArtifactBytes(homeDir, material);
+    const { finalPath, scratchPath } = buildArtifactCrashTwin(homeDir, digest, cleanBytes);
+    const realUnlinkSync = (createRequire(import.meta.url)("node:fs") as { unlinkSync: (p: string) => void }).unlinkSync;
+    const result = withPatchedFs("unlinkSync", ((path: string) => {
+      if (path === scratchPath) rmSync(scratchPath, { force: true });
+      return realUnlinkSync(path);
+    }) as never, () => publishActivationArtifact({ homeDir, material }));
+    expect(result.outcome).toBe("reused");
+    expect(existsSync(scratchPath)).toBe(false);
+    expect(statSync(finalPath).nlink).toBe(1);
+  });
+
+  it("propagates a genuine, non-ENOENT unlink failure unchanged", () => {
+    const homeDir = home();
+    const material = buildMaterial(homeDir, "pub-1");
+    const digest = computeActivationArtifactIdentityDigest(material);
+    const cleanBytes = capturePublishedArtifactBytes(homeDir, material);
+    const { scratchPath } = buildArtifactCrashTwin(homeDir, digest, cleanBytes);
+    const boom = Object.assign(new Error("permission denied for testing"), { code: "EACCES" });
+    const realUnlinkSync = (createRequire(import.meta.url)("node:fs") as { unlinkSync: (p: string) => void }).unlinkSync;
+    expect(() =>
+      withPatchedFs("unlinkSync", ((path: string) => {
+        if (path === scratchPath) throw boom;
+        return realUnlinkSync(path);
+      }) as never, () => publishActivationArtifact({ homeDir, material })),
+    ).toThrow(boom);
+  });
+
+  it("treats a published file that vanishes before the post-unlink assertion as absent and writes fresh", () => {
+    const homeDir = home();
+    const material = buildMaterial(homeDir, "pub-1");
+    const digest = computeActivationArtifactIdentityDigest(material);
+    const cleanBytes = capturePublishedArtifactBytes(homeDir, material);
+    const { finalPath, scratchPath } = buildArtifactCrashTwin(homeDir, digest, cleanBytes);
+    const result = publishActivationArtifact(
+      { homeDir, material },
+      {
+        readWithStat: (path: string, options: BoundedFileOptions) => {
+          const real = readBoundedRegularFileWithStat(path, options);
+          if (path === scratchPath && options.requireSingleLink !== true) {
+            rmSync(finalPath, { force: true });
+            rmSync(scratchPath, { force: true });
+          }
+          return real;
+        },
+      },
+    );
+    expect(result.outcome).toBe("written");
+    expect(readFileSync(finalPath, "utf8")).toBe(cleanBytes);
+    expect(statSync(finalPath).nlink).toBe(1);
+  });
+
+  it("propagates a genuine, non-ENOENT published-link-count lookup failure unchanged", () => {
+    const homeDir = home();
+    const material = buildMaterial(homeDir, "pub-1");
+    const digest = computeActivationArtifactIdentityDigest(material);
+    const cleanBytes = capturePublishedArtifactBytes(homeDir, material);
+    const { finalPath } = buildArtifactCrashTwin(homeDir, digest, cleanBytes);
+    const boom = Object.assign(new Error("permission denied for testing"), { code: "EACCES" });
+    const realLstatSync = (createRequire(import.meta.url)("node:fs") as { lstatSync: (p: string, o?: unknown) => unknown }).lstatSync;
+    expect(() =>
+      withPatchedFs("lstatSync", ((path: string, options?: unknown) => {
+        if (path === finalPath) throw boom;
+        return realLstatSync(path, options);
+      }) as never, () => publishActivationArtifact({ homeDir, material })),
+    ).toThrow(boom);
+  });
+});
+
+describe("readActivationArtifact: failure attribution", () => {
+  it("propagates an unrecognized read failure unchanged rather than attributing it", () => {
+    const homeDir = home();
+    const material = buildMaterial(homeDir, "pub-1");
+    const boom = new Error("unexpected failure with no fs error code");
+    expect(() =>
+      readActivationArtifact(
+        { homeDir, identityDigest: computeActivationArtifactIdentityDigest(material) },
+        { readWithStat: () => { throw boom; } },
+      ),
+    ).toThrow(boom);
+  });
+});
+
+describe("ensureActivationArtifactDirectory: failure branches", () => {
+  it("wraps a creation-path fsync failure as unsafe storage", () => {
+    const homeDir = home();
+    const material = buildMaterial(homeDir, "pub-1");
+    const boom = new Error("synthetic fsync failure");
+    const realFsyncSync = (createRequire(import.meta.url)("node:fs") as { fsyncSync: (fd: number) => void }).fsyncSync;
+    expect(() =>
+      withPatchedFs("fsyncSync", ((fd: number) => {
+        void realFsyncSync;
+        throw boom;
+      }) as never, () => publishActivationArtifact({ homeDir, material })),
+    ).toThrow(ActivationArtifactUnsafeStorageError);
+  });
+
+  it("wraps a genuine, non-ENOENT existence-check lstat failure as unsafe storage with its cause", () => {
+    const homeDir = home();
+    const material = buildMaterial(homeDir, "pub-1");
+    const store = activationArtifactDirectory(homeDir);
+    const boom = Object.assign(new Error("permission denied for testing"), { code: "EACCES" });
+    const realLstatSync = (createRequire(import.meta.url)("node:fs") as { lstatSync: (p: string, o?: unknown) => unknown }).lstatSync;
+    let caught: unknown;
+    withPatchedFs("lstatSync", ((path: string, options?: unknown) => {
+      if (path === store) throw boom;
+      return realLstatSync(path, options);
+    }) as never, () => {
+      try {
+        publishActivationArtifact({ homeDir, material });
+      } catch (error) {
+        caught = error;
+      }
+    });
+    expect(caught).toBeInstanceOf(ActivationArtifactUnsafeStorageError);
+    expect((caught as ActivationArtifactUnsafeStorageError & { cause?: unknown }).cause).toBe(boom);
+  });
+
+  it("does not re-fsync the store directory or its parent root when both already exist", () => {
+    const homeDir = home();
+    publishActivationArtifact({ homeDir, material: buildMaterial(homeDir, "pub-1") });
+    const root = join(homeDir, ".lcm");
+    const store = activationArtifactDirectory(homeDir);
+    const nodeFs = createRequire(import.meta.url)("node:fs") as Record<string, unknown>;
+    const originalOpenSync = nodeFs.openSync as (path: string, flags: unknown, mode?: unknown) => number;
+    const originalFsyncSync = nodeFs.fsyncSync as (fd: number) => void;
+    const pathByFd = new Map<number, string>();
+    const fsyncedPaths: string[] = [];
+    withPatchedFs("openSync", ((path: string, flags: unknown, mode?: unknown) => {
+      const fd = mode === undefined ? originalOpenSync(path, flags) : originalOpenSync(path, flags, mode);
+      pathByFd.set(fd, path);
+      return fd;
+    }) as never, () => withPatchedFs("fsyncSync", ((fd: number) => {
+      const path = pathByFd.get(fd);
+      if (path !== undefined) fsyncedPaths.push(path);
+      originalFsyncSync(fd);
+    }) as never, () => {
+      // A different identity (different source bytes, hence a different
+      // digest and a different file) in the same, already-existing store
+      // directory: publicationId alone must never change the identity.
+      publishActivationArtifact({
+        homeDir,
+        material: buildMaterial(homeDir, "pub-2", { sourceConfig: '{"backend":"sqlite-v2"}' }),
+      });
+    }));
+    expect(fsyncedPaths.filter((path) => path === root).length).toBe(0);
+    expect(fsyncedPaths.filter((path) => path === store).length).toBe(1);
+  });
+});
+
+describe("reconcileArtifactScratchTwin: vanishing scan candidate", () => {
+  it("continues past a name-matching candidate that vanishes (ENOENT) between being listed and being read", () => {
+    const homeDir = home();
+    const material = buildMaterial(homeDir, "pub-1");
+    const digest = computeActivationArtifactIdentityDigest(material);
+    const cleanBytes = capturePublishedArtifactBytes(homeDir, material);
+    const { scratchPath } = buildArtifactCrashTwin(homeDir, digest, cleanBytes);
+    expect(() =>
+      publishActivationArtifact(
+        { homeDir, material },
+        {
+          readWithStat: (path: string, options: BoundedFileOptions) => {
+            if (path === scratchPath) {
+              const error = new Error("ENOENT") as NodeJS.ErrnoException;
+              error.code = "ENOENT";
+              throw error;
+            }
+            return readBoundedRegularFileWithStat(path, options);
+          },
+        },
+      ),
+    ).toThrow(ActivationArtifactPresenceUnresolvableError);
+  });
+});

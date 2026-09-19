@@ -6,6 +6,7 @@ import {
   PRIVATE_FILE_MODE,
   atomicWritePrivateFileDurable,
   ensurePrivateDirectory,
+  isPrivateFileCollisionFailure,
   openPrivateDirectory,
   readBoundedRegularFileWithStat,
   type BoundedFileResult,
@@ -475,16 +476,16 @@ function parseStoredWitnessBinding(
 
 /** A benign, expected collision: something already occupies the exclusive
  * destination this call tried to create. atomicWritePrivateFileDurable
- * signals both the pre-check collision and the concurrent-link race this
- * way (see security-files.ts); neither is a distinct error class there, so
- * this module recognizes them by their exact, stable message text rather
- * than folding every durable-write failure into "go re-read and compare".
+ * signals both the pre-check collision and the concurrent-link race as a
+ * typed PrivateFileCollisionError (see security-files.ts), so this module
+ * recognizes them by class rather than by message text -- a reworded
+ * message still reconciles, while an unrelated failure carrying similar
+ * text is never mistaken for a benign race.
  * This is a local duplicate of activation-artifact-store.ts's identical
  * helper, per this codebase's established convention for small file-local
  * recognizers rather than a cross-module import. */
 function isBenignCollisionRace(error: unknown): boolean {
-  return error instanceof Error
-    && (error.message === "private file already exists" || error.message === "private file was created concurrently");
+  return isPrivateFileCollisionFailure(error);
 }
 
 const MULTIPLE_HARD_LINKS_MESSAGE = "file has multiple hard links";
@@ -585,18 +586,27 @@ function exactWriterLinkPair(left: BoundedFileResult, right: BoundedFileResult):
  * immediately before removal rather than trusting the earlier read -- the
  * same minimal TOCTOU discipline security-files.ts's own
  * unlinkPrivateFileIfIdentityMatches applies (module-private there, so not
- * reused directly). The twin already being gone (ENOENT) is not an error:
- * another retry may have completed the unlink first. Any other failure
+ * reused directly), and then report the published file's own link count so
+ * the caller can assert the invariant this recovery claims: after the
+ * interrupted unlink is completed, the published name must be single-link
+ * again. The twin already being gone (ENOENT) is not an error: another
+ * retry may have completed the unlink first. A published file that is
+ * itself already gone (ENOENT) is reported as undefined rather than thrown,
+ * so the caller can treat the key as genuinely absent. Any other failure
  * propagates raw rather than being swallowed, matching
  * atomicWritePrivateFileDurable's own treatment of this exact cleanup step
  * as part of the operation rather than a best-effort afterthought.
  */
-function completeInterruptedScratchUnlink(scratchPath: string, publishedIdentity: BoundedFileResult): void {
+function completeInterruptedScratchUnlink(
+  scratchPath: string,
+  publishedPath: string,
+  publishedIdentity: BoundedFileResult,
+): bigint | undefined {
   let current;
   try {
     current = lstatSync(scratchPath, { bigint: true });
   } catch (error) {
-    if ((error as NodeJS.ErrnoException).code === "ENOENT") return;
+    if ((error as NodeJS.ErrnoException).code === "ENOENT") return publishedLinkCount(publishedPath);
     throw error;
   }
   if (
@@ -604,7 +614,7 @@ function completeInterruptedScratchUnlink(scratchPath: string, publishedIdentity
     || current.dev.toString(10) !== publishedIdentity.exactDev
     || current.ino.toString(10) !== publishedIdentity.exactIno
   ) {
-    return;
+    return publishedLinkCount(publishedPath);
   }
   try {
     unlinkSync(scratchPath);
@@ -616,7 +626,24 @@ function completeInterruptedScratchUnlink(scratchPath: string, publishedIdentity
     // propagates raw rather than being swallowed, mirroring
     // consumeBoundedRegularFile's identical ENOENT-after-unlink handling
     // in security-files.ts.
-    if ((error as NodeJS.ErrnoException).code === "ENOENT") return;
+    if ((error as NodeJS.ErrnoException).code === "ENOENT") return publishedLinkCount(publishedPath);
+    throw error;
+  }
+  return publishedLinkCount(publishedPath);
+}
+
+/**
+ * Read the published file's current link count after the interrupted
+ * scratch unlink is completed (or already complete). Returns undefined when
+ * the published file itself is already gone, so the caller treats the key
+ * as genuinely absent rather than guessing. Any other lookup failure
+ * propagates raw.
+ */
+function publishedLinkCount(publishedPath: string): bigint | undefined {
+  try {
+    return lstatSync(publishedPath, { bigint: true }).nlink;
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code === "ENOENT") return undefined;
     throw error;
   }
 }
@@ -633,13 +660,23 @@ type GenerationBindingReconciler = (storedContent: string) => ReconcileDecision;
  * recovers). A twin is accepted only when a scratch file matching the
  * writer's exact naming convention in the same directory is byte-and-
  * metadata identical to the published name via exactWriterLinkPair. On a
- * match, the interrupted unlink is completed and reconciliation proceeds
- * against the published content exactly as it would for any ordinary
- * existing file. Zero matches, more than one match, or a final nlink that
- * is not exactly 2 cannot be authenticated as this specific crash shape and
- * refuse as MigrationBindingUnresolvableError: a multi-link state this
- * module could not resolve is not evidence of a conflict, because no
- * comparison against a trustworthy read ever ran.
+ * match, the interrupted unlink is completed and the published file is
+ * asserted single-link again -- the same expectedNlink discipline
+ * security-files.ts's own unlinkPrivateFileIfIdentityMatches applies --
+ * before reconciliation proceeds against the published content exactly as
+ * it would for any ordinary existing file. A third hard link appearing
+ * between the authenticated read and the unlink would otherwise leave
+ * this call returning "reused" while the file stays multi-link, so a
+ * post-unlink count other than exactly 1 refuses as
+ * MigrationBindingUnresolvableError rather than being silently accepted.
+ * A published file that vanished entirely in that same window is reported
+ * as "absent" instead: the key is genuinely gone, and the caller's
+ * requireAbsent write converges by publishing fresh. Zero matches, more
+ * than one match, or a final nlink that is not exactly 2 cannot be
+ * authenticated as this specific crash shape and refuse as
+ * MigrationBindingUnresolvableError: a multi-link state this module could
+ * not resolve is not evidence of a conflict, because no comparison
+ * against a trustworthy read ever ran.
  */
 function reconcileWriterScratchTwin(
   path: string,
@@ -703,7 +740,9 @@ function reconcileWriterScratchTwin(
   }
   if (twinPath === undefined) return unresolvable();
 
-  completeInterruptedScratchUnlink(twinPath, finalOutcome.value);
+  const publishedNlink = completeInterruptedScratchUnlink(twinPath, path, finalOutcome.value);
+  if (publishedNlink === undefined) return "absent";
+  if (publishedNlink !== 1n) return unresolvable();
 
   if (reconcile(finalOutcome.value.content) === "reused") return "reused";
   throw new MigrationBindingConflictError(
