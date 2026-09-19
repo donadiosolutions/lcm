@@ -100,13 +100,16 @@ knowledge import. When the content already exists as an active memory in
 scope, the command merges into that memory instead of adding a second one:
 the printed `id` is the existing memory's id, its tags are unioned with the
 new ones, and its confidence stays at the maximum of the two. Repeating the
-same `lcm store` therefore yields one memory. Content that does not match
-returns a fresh id. On PostgreSQL the scope is every active memory of the
-bound project, and the store takes the project's deduplication lock for the
-duration of its write, so it takes turns with a concurrent `lcm promote` or
-knowledge import into that same project. On SQLite the decision is scoped to
-memories with the same recorded origin, which for `lcm store` is `manual`
-unless the request supplies `metadata.projectId`.
+same `lcm store` therefore yields one memory, even when the content carries
+no searchable lexical terms (for example, punctuation only) that ranked
+search alone could not recall: an exact-content lookup runs as a fallback on
+every backend. Content that does not match returns a fresh id. On PostgreSQL
+the scope is every active memory of the bound project, and the store takes
+the project's deduplication lock for the duration of its write, so it takes
+turns with a concurrent `lcm promote` or knowledge import into that same
+project. On SQLite the decision is scoped to memories with the same recorded
+origin, which for `lcm store` is `manual` unless the request supplies
+`metadata.projectId`.
 
 When SQLite is selected, the stored text must not contain an embedded NUL
 character (`U+0000`). The store operation rejects that input before writing;

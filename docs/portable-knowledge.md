@@ -31,19 +31,23 @@ imported from elsewhere. Import compares against that same owner scope, so an
 existing normal promotion can be merged and retains its metadata and retry
 history. A memory's origin does not grant access to another remote project.
 SQLite keeps its existing project-origin filter for this version 1 format.
-For PostgreSQL, owner-bound exact content matches merge even when the row is
-outside the bounded fuzzy candidate page. Repeating the same document then
-uses its stored retry identities to skip already accepted entries. SQLite keeps
-its existing source-scoped search and deduplication behavior.
-Nonidentical content still requires the configured deduplication threshold.
+Owner-bound exact content matches merge even when the row is outside the
+bounded fuzzy candidate page or the content carries no searchable lexical
+terms, on both backends: PostgreSQL matches across the bound project's
+whole provenance, and SQLite matches within its existing source-scoped
+boundary. Repeating the same document then uses its stored retry identities
+to skip already accepted entries. Nonidentical content still requires the
+configured deduplication threshold.
 
 Compaction-driven promotion (`lcm promote`, including the promote step that
-runs after `lcm compact`) makes the same owner-scoped decision on PostgreSQL.
-A promoted summary whose exact content is already an active memory of the
-bound project merges into that memory, even when ranked search cannot recall
-it because the content carries no searchable terms or falls outside the
+runs after `lcm compact`) makes the same owner-scoped decision on every
+backend. A promoted summary whose exact content is already an active memory
+in scope merges into that memory, even when ranked search cannot recall it
+because the content carries no searchable terms or falls outside the
 candidate page. Earlier versions decided promotion from ranked search alone
-and could store such content twice.
+and could store such content twice; SQLite kept that gap even after the
+PostgreSQL case was fixed, because the exact-content lookup was gated to the
+PostgreSQL backend rather than to the owner-scoped decision itself.
 
 ## Version 1 format and privacy
 
