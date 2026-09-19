@@ -1751,6 +1751,9 @@ export function registerProjectCommand(
         }
         for (const entry of result.local) {
           console.log(entry.hash);
+          if (entry.unauthenticated) {
+            console.log("  unauthenticated: storage will refuse this identity");
+          }
           console.log(`  canonical: ${sanitizeTerminalText(entry.canonical)}`);
           if (entry.remoteProjectId) console.log(`  PostgreSQL project: ${entry.remoteProjectId}`);
           for (const alias of entry.aliases) {
@@ -1791,6 +1794,9 @@ export function registerProjectCommand(
           return;
         }
         console.log(shown.hash);
+        if (shown.unauthenticated) {
+          console.log("  unauthenticated: storage will refuse this identity");
+        }
         console.log(`  canonical: ${sanitizeTerminalText(shown.entry.canonical)}`);
         if (shown.entry.remoteProjectId) {
           console.log(`  PostgreSQL project: ${shown.entry.remoteProjectId}`);

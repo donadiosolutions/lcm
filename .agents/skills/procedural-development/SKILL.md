@@ -101,7 +101,7 @@ tools only when supported and without withholding necessary review evidence.
 | Roles | Exact model IDs, effective reasoning, requested/confirmed tiers, owner limit |
 | Coordination | Heartbeat automation binding, confirmed target/status/cadence, observation/result reference, next due and last execution when exposed |
 | Execution | Host/run allocation, per-command concurrency/deadline, worker-owned handles, exit and descendant-cleanup evidence |
-| Delivery | Checks, commit/PR/merge rules, docs/release metadata, follow-up classification, source-resolution rules |
+| Delivery | Checks, commit/PR/merge rules, docs/release metadata, follow-up classification/channel, source-resolution rules |
 | Tracker | Identity and allowed checkpoint channel: comment, managed body block, or none |
 | Environment | Startup, target-advance, watchdog and final operations, executors and evidence |
 | Exclusive resources | Exact resource names, flock skill, protected operations and authorized executors |

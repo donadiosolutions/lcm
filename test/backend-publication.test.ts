@@ -26,6 +26,7 @@ import {
   withBackendPublicationAppendBarrier,
   withBackendPublicationAppendBarrierAsync,
   withBackendPublicationRetainedAppendAdmissionAsync,
+  type BackendPublicationLockToken,
   type BackendPublicationDriver,
   type BackendPublicationJournal,
   type BackendMaintenanceJournal,
@@ -4284,7 +4285,10 @@ describe("BackendPublicationCoordinator", () => {
       await terminalArchiveFixture(home, 2);
       const history = backendPublicationHistoryDirectory(home);
       if (kind === "file") writeFileSync(history, "unsafe", { mode: 0o600 });
-      if (kind === "non-private-directory") mkdirSync(history, { mode: 0o755 });
+      if (kind === "non-private-directory") {
+        mkdirSync(history, { mode: 0o755 });
+        chmodSync(history, 0o755);
+      }
       if (kind === "symlink") {
         const victim = join(home, "history-victim");
         mkdirSync(victim, { mode: 0o700 });
@@ -5283,6 +5287,190 @@ describe("BackendPublicationCoordinator", () => {
     )).not.toThrow();
   });
 
+});
+
+describe("BackendPublicationCoordinator lockToken seam", () => {
+  // Each pair below proves two independently breakable facts about one call
+  // site this seam edited: (1) a valid retained-barrier token lets the call
+  // skip re-acquiring the publication lock, so it does not self-deadlock
+  // under a held barrier; (2) omitting the token still takes that same lock
+  // exactly as before the amendment, so it contends with its own barrier and
+  // fails with PrivateMutationLockContentionError. If either branch were
+  // wired wrong -- token ignored, or untokened path silently skipping the
+  // lock -- the corresponding assertion goes red on its own.
+
+  it("prepareMaintenanceSelection: accepts a retained barrier token", async () => {
+    const home = makeHome();
+    const fake = makeDriver(material());
+    const held = await createMaintenanceState(home, fake.driver, "maintenance-held");
+    const active = coordinator(home, fake.driver);
+    const prepared = await withBackendPublicationAppendBarrierAsync(home, async (token) => active.prepareMaintenanceSelection({
+      expectedChecksumSha256: held.checksumSha256,
+      generationId: held.generationId,
+      targetBackend: "postgresql",
+      terminalEvidenceSha256: "c".repeat(64),
+    }, token));
+    expect(prepared.phase).toBe("selection-prepared");
+  });
+
+  it("prepareMaintenanceSelection: still acquires the lock when no token is supplied", async () => {
+    const home = makeHome();
+    const fake = makeDriver(material());
+    const held = await createMaintenanceState(home, fake.driver, "maintenance-held");
+    const active = coordinator(home, fake.driver);
+    await expect(withBackendPublicationAppendBarrierAsync(home, async () => active.prepareMaintenanceSelection({
+      expectedChecksumSha256: held.checksumSha256,
+      generationId: held.generationId,
+      targetBackend: "postgresql",
+      terminalEvidenceSha256: "c".repeat(64),
+    }))).rejects.toBeInstanceOf(PrivateMutationLockContentionError);
+  });
+
+  it("completeMaintenanceSelection: accepts a retained barrier token", async () => {
+    const home = makeHome();
+    const fake = makeDriver(material());
+    const prepared = await createMaintenanceState(home, fake.driver, "selection-prepared");
+    const active = coordinator(home, fake.driver);
+    const completed = await withBackendPublicationAppendBarrierAsync(home, async (token) => active.completeMaintenanceSelection({
+      expectedChecksumSha256: prepared.checksumSha256,
+      generationId: prepared.generationId,
+      terminalEvidenceSha256: prepared.terminalEvidenceSha256!,
+    }, token));
+    expect(completed.phase).toBe("selection-completed");
+  });
+
+  it("completeMaintenanceSelection: still acquires the lock when no token is supplied", async () => {
+    const home = makeHome();
+    const fake = makeDriver(material());
+    const prepared = await createMaintenanceState(home, fake.driver, "selection-prepared");
+    const active = coordinator(home, fake.driver);
+    await expect(withBackendPublicationAppendBarrierAsync(home, async () => active.completeMaintenanceSelection({
+      expectedChecksumSha256: prepared.checksumSha256,
+      generationId: prepared.generationId,
+      terminalEvidenceSha256: prepared.terminalEvidenceSha256!,
+    }))).rejects.toBeInstanceOf(PrivateMutationLockContentionError);
+  });
+
+  it("abortMaintenance: accepts a retained barrier token", async () => {
+    const home = makeHome();
+    const fake = makeDriver(material());
+    const held = await createMaintenanceState(home, fake.driver, "maintenance-held");
+    const active = coordinator(home, fake.driver);
+    const aborted = await withBackendPublicationAppendBarrierAsync(home, async (token) => active.abortMaintenance({
+      expectedChecksumSha256: held.checksumSha256,
+      sourceSelectionSha256: held.sourceSelectionSha256,
+      abortEvidenceSha256: "c".repeat(64),
+    }, token));
+    expect(aborted.phase).toBe("maintenance-aborted");
+  });
+
+  it("abortMaintenance: still acquires the lock when no token is supplied", async () => {
+    const home = makeHome();
+    const fake = makeDriver(material());
+    const held = await createMaintenanceState(home, fake.driver, "maintenance-held");
+    const active = coordinator(home, fake.driver);
+    await expect(withBackendPublicationAppendBarrierAsync(home, async () => active.abortMaintenance({
+      expectedChecksumSha256: held.checksumSha256,
+      sourceSelectionSha256: held.sourceSelectionSha256,
+      abortEvidenceSha256: "c".repeat(64),
+    }))).rejects.toBeInstanceOf(PrivateMutationLockContentionError);
+  });
+
+  it("prepare: accepts a retained barrier token", async () => {
+    const home = makeHome();
+    const input = material();
+    const fake = makeDriver(input);
+    const active = coordinator(home, fake.driver);
+    const prepared = await withBackendPublicationAppendBarrierAsync(home, async (token) => active.prepare(inputFor(input), token));
+    expect(prepared.phase).toBe("prepared");
+  });
+
+  it("prepare: still acquires the lock when no token is supplied", async () => {
+    const home = makeHome();
+    const input = material();
+    const fake = makeDriver(input);
+    const active = coordinator(home, fake.driver);
+    await expect(withBackendPublicationAppendBarrierAsync(home, async () => active.prepare(inputFor(input))))
+      .rejects.toBeInstanceOf(PrivateMutationLockContentionError);
+  });
+
+  it("resume: accepts a retained barrier token", async () => {
+    const { home, fake } = await preparedFixture();
+    const active = coordinator(home, fake.driver);
+    const resumed = await withBackendPublicationAppendBarrierAsync(home, async (token) => active.resume(token));
+    expect(resumed.phase).not.toBe("preparing");
+  });
+
+  it("resume: still acquires the lock when no token is supplied", async () => {
+    const { home, fake } = await preparedFixture();
+    const active = coordinator(home, fake.driver);
+    await expect(withBackendPublicationAppendBarrierAsync(home, async () => active.resume()))
+      .rejects.toBeInstanceOf(PrivateMutationLockContentionError);
+  });
+
+  it("abort: accepts a retained barrier token", async () => {
+    const { home, fake } = await preparedFixture();
+    const active = coordinator(home, fake.driver);
+    const aborted = await withBackendPublicationAppendBarrierAsync(home, async (token) => active.abort(token));
+    expect(aborted.phase).toBe("aborted");
+  });
+
+  it("abort: still acquires the lock when no token is supplied", async () => {
+    const { home, fake } = await preparedFixture();
+    const active = coordinator(home, fake.driver);
+    await expect(withBackendPublicationAppendBarrierAsync(home, async () => active.abort()))
+      .rejects.toBeInstanceOf(PrivateMutationLockContentionError);
+  });
+
+  it("recoverPending: accepts a retained barrier token", async () => {
+    const { home, fake } = await preparedFixture();
+    const active = coordinator(home, fake.driver);
+    const recovered = await withBackendPublicationAppendBarrierAsync(home, async (token) => active.recoverPending({}, token));
+    expect(recovered).not.toBeNull();
+  });
+
+  it("recoverPending: still acquires the lock when no token is supplied", async () => {
+    const { home, fake } = await preparedFixture();
+    const active = coordinator(home, fake.driver);
+    await expect(withBackendPublicationAppendBarrierAsync(home, async () => active.recoverPending({})))
+      .rejects.toBeInstanceOf(PrivateMutationLockContentionError);
+  });
+
+  it("refuses a lock token whose home differs from the coordinator's home", async () => {
+    const { home, fake } = await preparedFixture();
+    const otherHome = makeHome();
+    const active = coordinator(home, fake.driver);
+    await withBackendPublicationAppendBarrierAsync(otherHome, async (foreignToken) => {
+      await expect(active.resume(foreignToken)).rejects.toMatchObject({
+        name: "BackendPublicationJournalError",
+        reason: "permit-mismatch",
+      });
+    });
+  });
+
+  it("refuses a lock token that was already revoked when its barrier released", async () => {
+    const { home, fake } = await preparedFixture();
+    const active = coordinator(home, fake.driver);
+    let capturedToken: BackendPublicationLockToken | undefined;
+    await withBackendPublicationAppendBarrierAsync(home, async (token) => {
+      capturedToken = token;
+    });
+    await expect(active.resume(capturedToken)).rejects.toMatchObject({
+      name: "BackendPublicationJournalError",
+      reason: "permit-mismatch",
+    });
+  });
+
+  it("accepts a plain consumer-lock token, proving append-barrier membership is not required", async () => {
+    const { home, fake } = await preparedFixture();
+    const active = coordinator(home, fake.driver);
+    const resumed = await withBackendPublicationConsumerLockAsync(
+      home,
+      async (token) => active.resume(token),
+      { allowUnresolved: true },
+    );
+    expect(resumed.phase).not.toBe("preparing");
+  });
 });
 
 describe("revocable mutation permits", () => {
@@ -6305,6 +6493,252 @@ describe("revocable mutation permits", () => {
 
     await expect(withBackendPublicationAppendBarrierAsync(home, async () => "appended"))
       .resolves.toBe("appended");
+  });
+
+  it("admits a held consumer token past a queued tokenless append", async () => {
+    const home = makeHome();
+    let queuedEntered = false;
+    let queued!: Promise<void>;
+    const admitted = vi.fn();
+    const elapsed = await withBackendPublicationConsumerLockAsync(home, async token => {
+      queued = withBackendPublicationAppendBarrierAsync(home, () => {
+        queuedEntered = true;
+      }, undefined, { contentionWaitMs: 3_000, retryDelayMs: 25 });
+      await Promise.resolve();
+      const started = performance.now();
+      await expect(withBackendPublicationAppendBarrierAsync(home, () => {
+        admitted();
+        return "admitted";
+      }, token, { contentionWaitMs: 600, retryDelayMs: 25 })).resolves.toBe("admitted");
+      expect(queuedEntered).toBe(false);
+      return performance.now() - started;
+    });
+
+    expect(admitted).toHaveBeenCalledTimes(1);
+    expect(elapsed).toBeLessThan(300);
+    await expect(queued).resolves.toBeUndefined();
+    expect(queuedEntered).toBe(true);
+  });
+
+  it("admits retained append admission past a queued tokenless append", async () => {
+    const home = makeHome();
+    let queuedEntered = false;
+    let queued!: Promise<void>;
+    const admitted = vi.fn();
+    const elapsed = await withBackendPublicationConsumerLockAsync(home, async token => {
+      queued = withBackendPublicationAppendBarrierAsync(home, () => {
+        queuedEntered = true;
+      }, undefined, { contentionWaitMs: 3_000, retryDelayMs: 25 });
+      await Promise.resolve();
+      const started = performance.now();
+      await expect(withBackendPublicationRetainedAppendAdmissionAsync(home, () => {
+        admitted();
+        return "retained";
+      }, token, { contentionWaitMs: 600, externalLockAttempts: 1 })).resolves.toBe("retained");
+      expect(queuedEntered).toBe(false);
+      return performance.now() - started;
+    });
+
+    expect(admitted).toHaveBeenCalledTimes(1);
+    expect(elapsed).toBeLessThan(300);
+    await expect(queued).resolves.toBeUndefined();
+    expect(queuedEntered).toBe(true);
+  });
+
+  it("serializes concurrent same-token append barriers", async () => {
+    const home = makeHome();
+    const order: string[] = [];
+    let releaseFirst!: () => void;
+    let firstEntered!: () => void;
+    const entered = new Promise<void>(resolve => { firstEntered = resolve; });
+    await withBackendPublicationConsumerLockAsync(home, async token => {
+      let secondState: "pending" | "fulfilled" | "contention" | "rejected" = "pending";
+      const first = withBackendPublicationAppendBarrierAsync(home, async () => {
+        order.push("first");
+        firstEntered();
+        await new Promise<void>(resolve => { releaseFirst = resolve; });
+        return "first";
+      }, token);
+      const second = withBackendPublicationAppendBarrierAsync(home, () => {
+        order.push("second");
+        return "second";
+      }, token).then(value => {
+        secondState = "fulfilled";
+        return value;
+      }, (error: unknown) => {
+        secondState = error instanceof PrivateMutationLockContentionError
+          ? "contention"
+          : "rejected";
+        throw error;
+      });
+      const outcomes = Promise.allSettled([first, second]);
+      await entered;
+      for (let turn = 0; turn < 20; turn += 1) await Promise.resolve();
+      try {
+        expect(secondState).toBe("pending");
+        expect(order).toEqual(["first"]);
+      } finally {
+        releaseFirst();
+      }
+      await expect(outcomes).resolves.toEqual([
+        { status: "fulfilled", value: "first" },
+        { status: "fulfilled", value: "second" },
+      ]);
+      expect(secondState).toBe("fulfilled");
+    });
+    expect(order).toEqual(["first", "second"]);
+  });
+
+  it("serializes concurrent same-token retained append admissions", async () => {
+    const home = makeHome();
+    const order: string[] = [];
+    let releaseFirst!: () => void;
+    let firstEntered!: () => void;
+    const entered = new Promise<void>(resolve => { firstEntered = resolve; });
+    await withBackendPublicationConsumerLockAsync(home, async token => {
+      let secondState: "pending" | "fulfilled" | "contention" | "rejected" = "pending";
+      const first = withBackendPublicationRetainedAppendAdmissionAsync(home, async () => {
+        order.push("first");
+        firstEntered();
+        await new Promise<void>(resolve => { releaseFirst = resolve; });
+        return "first";
+      }, token);
+      const second = withBackendPublicationRetainedAppendAdmissionAsync(home, () => {
+        order.push("second");
+        return "second";
+      }, token).then(value => {
+        secondState = "fulfilled";
+        return value;
+      }, (error: unknown) => {
+        secondState = error instanceof PrivateMutationLockContentionError
+          ? "contention"
+          : "rejected";
+        throw error;
+      });
+      const outcomes = Promise.allSettled([first, second]);
+      await entered;
+      for (let turn = 0; turn < 20; turn += 1) await Promise.resolve();
+      try {
+        expect(secondState).toBe("pending");
+        expect(order).toEqual(["first"]);
+      } finally {
+        releaseFirst();
+      }
+      await expect(outcomes).resolves.toEqual([
+        { status: "fulfilled", value: "first" },
+        { status: "fulfilled", value: "second" },
+      ]);
+    expect(secondState).toBe("fulfilled");
+    });
+    expect(order).toEqual(["first", "second"]);
+  });
+
+  it("carries an unresolved admitted predecessor past a timed-out intermediate frame", async () => {
+    const home = makeHome();
+    const order: string[] = [];
+    let releaseFirst!: () => void;
+    let firstEntered!: () => void;
+    const entered = new Promise<void>(resolve => { firstEntered = resolve; });
+    await withBackendPublicationConsumerLockAsync(home, async token => {
+      // Install all three frames before the first frame reaches its append
+      // lock: none of them may take the reentrant fast path, so the
+      // intermediate frame really waits for the first frame and the later
+      // frame really waits for the intermediate one.
+      const first = withBackendPublicationAppendBarrierAsync(home, async () => {
+        order.push("first");
+        firstEntered();
+        await new Promise<void>(resolve => { releaseFirst = resolve; });
+        return "first";
+      }, token);
+      let now = 0;
+      const timedOut = withBackendPublicationAppendBarrierAsync(home, async () => {
+        throw new Error("timed-out intermediate frame must not run");
+      }, token, {
+        contentionWaitMs: 10,
+        _now: () => now,
+        _wait: async () => { now = 10; },
+      });
+      let thirdState: "pending" | "fulfilled" | "contention" | "rejected" = "pending";
+      const third = withBackendPublicationRetainedAppendAdmissionAsync(home, async () => {
+        order.push("third");
+        return "third";
+      }, token, { contentionWaitMs: 5_000, externalLockAttempts: 1 }).then(value => {
+        thirdState = "fulfilled";
+        return value;
+      }, (error: unknown) => {
+        thirdState = error instanceof PrivateMutationLockContentionError
+          ? "contention"
+          : "rejected";
+        throw error;
+      });
+      await entered;
+      // The intermediate frame times out through the real bounded deadline
+      // path while the first frame still holds the append lock.
+      await expect(timedOut).rejects.toMatchObject({ name: "BackendPublicationAppendBarrierTimeoutError" });
+      for (let turn = 0; turn < 20; turn += 1) await Promise.resolve();
+      try {
+        // The later frame must still wait for the unresolved first frame
+        // instead of observing the settled intermediate frame: it must
+        // neither run early nor fail its single append-lock attempt.
+        expect(thirdState).toBe("pending");
+        expect(order).toEqual(["first"]);
+      } finally {
+        releaseFirst();
+      }
+      await expect(first).resolves.toBe("first");
+      await expect(third).resolves.toBe("third");
+      expect(thirdState).toBe("fulfilled");
+      expect(order).toEqual(["first", "third"]);
+    });
+  });
+
+  it("keeps queuing later entrants behind an admitted token holder", async () => {
+    const home = makeHome();
+    const order: string[] = [];
+    let releaseAdmitted!: () => void;
+    let admittedEntered!: () => void;
+    const entered = new Promise<void>(resolve => { admittedEntered = resolve; });
+    let follower!: Promise<void>;
+    await withBackendPublicationConsumerLockAsync(home, async token => {
+      const admitted = withBackendPublicationAppendBarrierAsync(home, async () => {
+        order.push("token");
+        admittedEntered();
+        await new Promise<void>(resolve => { releaseAdmitted = resolve; });
+      }, token, { contentionWaitMs: 600, retryDelayMs: 25 });
+      await entered;
+      follower = withBackendPublicationAppendBarrierAsync(home, () => {
+        order.push("follower");
+      }, undefined, { contentionWaitMs: 5_000, retryDelayMs: 25 });
+      for (let turn = 0; turn < 20; turn += 1) await Promise.resolve();
+      expect(order).toEqual(["token"]);
+      releaseAdmitted();
+      await admitted;
+    });
+
+    await expect(follower).resolves.toBeUndefined();
+    expect(order).toEqual(["token", "follower"]);
+  });
+
+  it("still refuses a tokenless append that exceeds its admission deadline", async () => {
+    const home = makeHome();
+    let release!: () => void;
+    let enter!: () => void;
+    const entered = new Promise<void>(resolve => { enter = resolve; });
+    const owner = withBackendPublicationAppendBarrierAsync(home, async () => {
+      enter();
+      await new Promise<void>(resolve => { release = resolve; });
+    });
+    await entered;
+    const effect = vi.fn();
+
+    await expect(withBackendPublicationAppendBarrierAsync(home, effect, undefined, {
+      contentionWaitMs: 10,
+      retryDelayMs: 5,
+    })).rejects.toBeInstanceOf(BackendPublicationAppendBarrierTimeoutError);
+
+    expect(effect).not.toHaveBeenCalled();
+    release();
+    await expect(owner).resolves.toBeUndefined();
   });
 });
 

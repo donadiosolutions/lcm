@@ -625,7 +625,7 @@ describe("Codecov configuration", () => {
     expect(ownershipCounts.size).toBe(249);
   });
 
-  test("keeps response-fence and #681/#700/#701/#703/#705/#709/#710/#713/#756/#726/#734/#737/#742/#760/#763/#804/#805/#824/#825/#833/#888/#864/#866/#722/#786/#952/#814/#882/#930/#969/#989/#1003/#1049/#964/#1106/#1191/#1196/#1229/#1338 files in their intended components", () => {
+  test("keeps response-fence and #681/#700/#701/#703/#705/#709/#710/#713/#756/#726/#734/#737/#742/#760/#763/#804/#805/#824/#825/#833/#888/#864/#866/#722/#786/#952/#814/#882/#930/#969/#989/#1003/#1049/#964/#1106/#1191/#1196/#1229/#1321/#1338/#1347/#1353/#1354/#1356/#1357/#1358 files in their intended components", () => {
     const config = readCodecovConfig();
     expect(config).toBeDefined();
     if (config === undefined) {
@@ -676,11 +676,27 @@ describe("Codecov configuration", () => {
       ["src/runtime-root.ts", "unit-configuration-security"],
       ["src/security-files.ts", "unit-configuration-security"],
       ["src/sensitive.ts", "unit-configuration-security"],
+      // #1358 collapses redundant nested lazy prefixes in five generated
+      // Gitleaks rules and adds a structurally verified, fail-closed keyword
+      // prefilter to the scrub engine. Both files stay configuration-security
+      // owned and the component topology is unchanged; these pins name the
+      // mappings that decision covers.
+      ["src/scrub.ts", "unit-configuration-security"],
+      ["src/generated-patterns.ts", "unit-configuration-security"],
       // #1335 supplementary-plane CJK column widths are a material change to
       // terminal bounding that retains this owner, as in #1195 and #1203.
       ["src/terminal-sanitize.ts", "unit-configuration-security"],
       // #1049 keeps project metadata owner and single-link admission here.
       ["src/project-map.ts", "unit-project-worktrees"],
+      // #1356/#1357 authenticate the project-map key before it becomes a
+      // storage identity, suppress alias-time metadata backfill until that
+      // authentication, and stop enumeration and preview presenting an
+      // identity storage refuses. The change is confined to existing files and
+      // adds no component, so every touched file keeps its established owner;
+      // these pins record that decision for materially changed files.
+      ["src/cli-storage.ts", "unit-cli"],
+      ["src/db/events-path.ts", "unit-local-persistence"],
+      ["src/identity-service.ts", "integration-postgresql-identity"],
       // #889 keeps private import metadata publication in this owner.
       // #1308 keeps import metadata convergence in this existing owner;
       // canonical and collapsed metadata are now read live after the write
@@ -731,6 +747,11 @@ describe("Codecov configuration", () => {
       ["src/daemon/passive-event-processor.ts", "unit-daemon-events"],
       // #1153 exact identity and #1158 backend-guarded owner scope remain
       // within the existing promotion component.
+      // #1354 serializes promoted-memory deduplication decisions with a
+      // project-scoped transaction advisory lock. The change is confined to
+      // existing files and adds no production file, so every touched file
+      // keeps its established owner and the component topology is unchanged;
+      // these pins record that decision.
       ["src/promotion/dedup.ts", "unit-promotion"],
       // #1106/#618 keep discovery-related files in their established owners.
       ["src/daemon/server.ts", "unit-daemon-core"],
@@ -739,12 +760,21 @@ describe("Codecov configuration", () => {
       // as in #1195 and #1203.
       ["src/daemon/safe-error.ts", "unit-daemon-core"],
       ["src/import.ts", "unit-transcripts-import"],
+      // #1358 also drops the redundant residual scrub pass for strings the
+      // first pass left unchanged, which retains this existing owner.
+      ["src/storage/native-transcript-ingest.ts", "unit-transcripts-import"],
       // #1338 replaces compact discovery's per-conversation native-transcript
       // query with a batched project-level lookup and adds the contract member
       // both backends implement. The change is confined to existing files, so
       // every touched file keeps its established owner and the component
       // topology is unchanged; these pins record that decision.
       ["src/batch-compact.ts", "unit-compaction-summarization"],
+      // #1353 qualifies every equality comparison in the PostgreSQL memory
+      // repositories against pg_catalog so a hostile search_path cannot
+      // resolve a different operator. The change is confined to that existing
+      // file and adds no component, so it keeps its established owner; this
+      // pin records that decision for a materially changed file.
+      ["src/storage/postgresql/memory-repositories.ts", "integration-postgresql-memory"],
       ["src/storage/sqlite/native-transcript-repository.ts", "unit-local-persistence"],
       ["src/storage/postgresql/native-transcript-repository.ts", "integration-postgresql-transcripts"],
       ["src/daemon/version.ts", "unit-daemon-core"],
@@ -772,17 +802,31 @@ describe("Codecov configuration", () => {
       // #1042 consumer descriptor cleanup and typed error classification remain storage-owned.
       // #1307 explicit-only retained append admission for non-append mutation
       // participants stays storage-abstractions-owned.
+      // #1347 lets a caller that already holds publication admission skip the
+      // in-process append tail wait while still taking the append file lock
+      // and the maintenance-phase check, and chains an admitted frame behind
+      // its unresolved admitted predecessor so a timed-out intermediate
+      // frame cannot release later same-token frames early. The change is
+      // confined to this existing file, so it keeps its established owner
+      // and the component topology is unchanged; this pin records that
+      // decision.
       ["src/storage/backend-publication.ts", "unit-storage-abstractions"],
       // #1229 local outbox diagnostic admission stays local-event-storage-owned.
       ["src/storage/local-hook-outbox.ts", "unit-local-event-storage"],
       ["src/storage/local-hook-outbox-schema.ts", "unit-local-event-storage"],
       ["src/migration/manifest-store.ts", "unit-migration-cutover"],
       ["src/migration/maintenance.ts", "unit-migration-cutover"],
+      // #1321 drops the Node 22 transaction-probe fallback from the receipts
+      // module; its cutover receipt logic keeps this owner.
       ["src/migration/receipts.ts", "unit-migration-cutover"],
       ["src/migration/queue-evidence.ts", "unit-migration-cutover"],
       ["src/migration/sqlite-snapshot.ts", "unit-migration-cutover"],
       ["src/storage/contracts.ts", "unit-storage-abstractions"],
       ["src/storage/portable-record-stream.ts", "unit-storage-abstractions"],
+      // #1354 supplies the promoted-memory decision serializer only from the
+      // PostgreSQL transaction scope. A component path regex already matched
+      // this file, but the owner list had never named it.
+      ["src/storage/postgresql/project-storage.ts", "unit-storage-abstractions"],
       ["src/storage/postgresql/factory.ts", "integration-postgresql-runtime"],
       // #1195 checksummed packaged migration loading remains schema-owned.
       // #1306 adds the 0007 promoted-content digest migration and its
@@ -790,6 +834,8 @@ describe("Codecov configuration", () => {
       ["src/storage/postgresql/migrations.ts", "integration-postgresql-schema"],
       // #1306 indexes owner exact-content lookup by a generated SHA-256
       // digest, retaining the raw-equality residual it always used.
+      // #1354 adds the promoted-memory decision serializer beside the
+      // repositories it serializes.
       ["src/storage/postgresql/memory-repositories.ts", "integration-postgresql-memory"],
       ["src/storage/postgresql/summary-context-repositories.ts", "integration-postgresql-memory"],
       // #989 event-sidecar parent authentication stays local-persistence-owned.

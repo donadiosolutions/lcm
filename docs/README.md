@@ -56,6 +56,8 @@ operations. They are not required for normal LCM use.
   and memory tools.
 - [Automated issue triage](issue-triage.md) — classification, duplicate checks,
   rollout, and operational policy.
+- [Security alert campaigns](triage-security-issues.md) — triage existing GitHub
+  and Codex Security alerts, group shared causes, and verify remediation privately.
 - [External admission recovery](external-admission.md) — recover delayed
   protected-branch admission without bypassing exact-head policy.
 - [Stable and beta releases](releasing.md) — prepare versions and recover
