@@ -1305,6 +1305,30 @@ describe("verifyMigrationGeneration", () => {
     expect(session.close).toHaveBeenCalledTimes(1);
   });
 
+  it("round-4 P1: a window failure propagates as the primary error even when the lease-release cleanup that follows it also fails", async () => {
+    // The internal catch inside computeVerificationReport must never
+    // let a secondary failure cleaning up (releasing the lease, closing
+    // runtime) mask the primary error that got it there. Every other
+    // fixture in this file has the mocked coordinator's releaseLease
+    // resolve cleanly during that catch, which cannot exercise this
+    // swallow -- it needs releaseLease to fail too, at exactly this
+    // point, to prove window-failure-canary (not release-failure-
+    // canary) is what surfaces.
+    stubDestinationPrimitives();
+    const session = fakeSession();
+    session.query = vi.fn(async () => { throw new Error("window-failure-canary"); }) as never;
+    const runtime = fakeRuntime({ session });
+    vi.spyOn(coordination, "PostgreSqlWorkCoordinator").mockImplementation(function () { return ({
+      acquireLease: vi.fn(async () => ({ fencingToken: 1n } as never)),
+      releaseLease: vi.fn(async () => { throw new Error("release-failure-canary"); }),
+    } as never); });
+    const copySource = fakeCopySource();
+    const dependencies = dependenciesFor(copySource, runtime);
+    await expect(verifyMigrationGeneration(baseInput({ homeDir: "/tmp/lcm-verify-window-and-release-fail" }), dependencies))
+      .rejects.toThrow("window-failure-canary");
+    expect(session.close).toHaveBeenCalledTimes(1);
+  });
+
   it("proves a write committed between the source stream and the census window is caught, not absorbed", async () => {
     stubDestinationPrimitives({
       domainCensus: (domain) => (domain === "machines"
@@ -1355,7 +1379,17 @@ describe("verifyMigrationGeneration", () => {
     expect(order).toEqual(["persist", "release"]);
     persistSpy.mockRestore();
   }, 15000);
-  it("swallows a failure releasing the lease without masking the primary result", async () => {
+  it("round-4 P1: propagates a lease-release failure rather than masking it, after the report has already reached disk", async () => {
+    // Before this fix, releaseLease's own coordinator.releaseLease(...)
+    // call was wrapped in .catch(() => undefined), so this exact
+    // fixture -- a coordinator whose releaseLease always throws --
+    // silently resolved and returned outcome "clean" as though nothing
+    // had gone wrong. A release that did not happen must now be
+    // distinguishable from one that did: the failure propagates. The
+    // report having already reached disk is asserted independently via
+    // a persist spy, proving the durable half of this operation is
+    // unaffected by the release failure that follows it, rather than
+    // merely asserting the promise rejects.
     stubDestinationPrimitives();
     vi.spyOn(coordination, "PostgreSqlWorkCoordinator").mockImplementation(function () { return ({
       acquireLease: vi.fn(async () => ({ fencingToken: 1n } as never)),
@@ -1365,8 +1399,75 @@ describe("verifyMigrationGeneration", () => {
     const copySource = fakeCopySource({ recordCounts });
     const runtime = fakeRuntime();
     const dependencies = dependenciesFor(copySource, runtime);
-    const result = await verifyMigrationGeneration(baseInput({ homeDir: "/tmp/lcm-verify-release-fail" }), dependencies);
+    const homeDir = "/tmp/lcm-verify-release-fail";
+    let persistedReportSha256: string | undefined;
+    const originalPersist = MigrationVerificationReportStore.prototype.persist;
+    const persistSpy = vi.spyOn(MigrationVerificationReportStore.prototype, "persist").mockImplementation(
+      function (this: MigrationVerificationReportStore, ...args: Parameters<typeof originalPersist>) {
+        const outcome = originalPersist.apply(this, args);
+        persistedReportSha256 = outcome.report.reportSha256;
+        return outcome;
+      },
+    );
+    try {
+      await expect(verifyMigrationGeneration(baseInput({ homeDir }), dependencies))
+        .rejects.toThrow("release-failure-canary");
+    } finally {
+      persistSpy.mockRestore();
+    }
+    expect(persistedReportSha256).toBeDefined();
+    const store = new MigrationVerificationReportStore({ homeDir });
+    expect(store.has("generation-1", persistedReportSha256!)).toBe(true);
+  }, 15000);
+
+  it("round-4 P1 red case: releaseLease's runtime is still open when the release call itself runs, proven against a runtime that rejects work once closed", async () => {
+    // The round-2 fix returned releaseLease unreleased so the caller
+    // could defer it past persist, but computeVerificationReport's own
+    // outer finally closed runtime before that closure was ever handed
+    // back -- invisible under the old "wholesale coordinator mock"
+    // pattern (a bare vi.fn() releaseLease with no connection to
+    // runtime at all cannot see a closed runtime, because it never
+    // touches it). This coordinator mock is deliberately not wholesale:
+    // its releaseLease genuinely calls runtime.transaction(...), the
+    // same primitive the real PostgreSqlWorkCoordinator.releaseLease
+    // uses internally, against a runtime that actually tracks closed
+    // state and rejects work once closed -- exactly the shape needed to
+    // catch "runtime was already closed by the time release ran".
+    stubDestinationPrimitives();
+    const recordCounts = Object.fromEntries(PORTABLE_RECORD_DOMAIN_ORDER.map((domain, index) => [domain, index])) as Partial<Record<PortableDomain, number>>;
+    const copySource = fakeCopySource({ recordCounts });
+    let closed = false;
+    const assertOpen = () => { if (closed) throw new Error("runtime is closed"); };
+    const baseRuntime = fakeRuntime();
+    const order: string[] = [];
+    const runtime = {
+      ...baseRuntime,
+      query: vi.fn(async (config: never) => { assertOpen(); return baseRuntime.query(config); }),
+      transaction: vi.fn(async (callback: never, options: never) => { assertOpen(); return baseRuntime.transaction(callback, options); }),
+      openReadOnlySnapshot: vi.fn(async (options: never) => { assertOpen(); return baseRuntime.openReadOnlySnapshot(options); }),
+      close: vi.fn(async () => { closed = true; order.push("close"); await baseRuntime.close(); }),
+    };
+    vi.spyOn(coordination, "PostgreSqlWorkCoordinator").mockImplementation(function () { return ({
+      acquireLease: vi.fn(async () => ({ fencingToken: 1n } as never)),
+      releaseLease: vi.fn(async () => {
+        order.push("release-start");
+        await (runtime.transaction as unknown as (callback: () => Promise<null>) => Promise<null>)(async () => null);
+        order.push("release-complete");
+        return null;
+      }),
+    } as never); });
+    const dependencies = dependenciesFor(copySource, runtime as never);
+    const result = await verifyMigrationGeneration(baseInput({ homeDir: "/tmp/lcm-verify-release-runtime-open" }), dependencies);
     expect(result.outcome).toBe("clean");
+    // The order, not merely the outcome, is what proves this: under
+    // the round-4 defect, coordinator.releaseLease's own
+    // .catch(() => undefined) swallowed the "runtime is closed"
+    // rejection this fixture would have produced, so result.outcome
+    // alone stays "clean" either way and "release-complete" is what
+    // never gets pushed -- runtime.transaction was still called (and
+    // counted), it just threw internally before reaching that line.
+    expect(order).toEqual(["release-start", "release-complete", "close"]);
+    expect(runtime.close).toHaveBeenCalledTimes(1);
   }, 15000);
 
   it("uses the production default dependencies when none are injected", async () => {

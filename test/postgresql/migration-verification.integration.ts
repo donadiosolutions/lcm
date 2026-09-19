@@ -176,6 +176,51 @@ it("passes a healthy sequence and flags the same sequence once reset, from a fre
 }, 60000);
 
 /**
+ * Round-4 P1: identity sequences are global per table, shared across
+ * every project, not per-project. Scoping the self-consistency bound's
+ * MAX to the project being verified let a genuinely colliding row sit
+ * undetected in a different project's rows of the very same table --
+ * the verified project here has zero conversations of its own, so a
+ * project-scoped MAX would see NULL and skip the domain entirely,
+ * exactly the gap this closes. The other project's row is inserted with
+ * OVERRIDING SYSTEM VALUE specifically so it never calls nextval() and
+ * never advances the shared sequence, isolating the fixture to "a row
+ * exists above the sequence" rather than "something already called
+ * nextval a lot".
+ */
+it("flags a table-wide identity collision from another project even when the verified project's own domain is empty", async () => {
+  await withPostgreSqlTestDatabase("migration-verification-sequence-cross-project", async (db) => {
+    const seeded = await seedPortablePostgreSql(db.migrator, { identityOnly: true });
+    await grantPortablePostgreSql(db);
+    const otherProjectId = "01990000-0000-7000-8000-0000000000ff";
+    await db.migrator.query({
+      text: "INSERT INTO lcm.projects (project_id, identity_key, display_name, created_at, updated_at) "
+        + "VALUES ($1, $2, 'Cross-project fixture', now(), now())",
+      values: [otherProjectId, "cross-project-sequence-fixture-identity-key"],
+    }, { domain: "factory", operation: "seedCrossProjectSequenceFixtureProject" });
+    await db.migrator.query({
+      text: "INSERT INTO lcm.conversations (conversation_id, project_id, session_id, created_at, updated_at) "
+        + "OVERRIDING SYSTEM VALUE VALUES (999999, $1, 'other-project-collision', now(), now())",
+      values: [otherProjectId],
+    }, { domain: "factory", operation: "seedCrossProjectSequenceFixtureRow" });
+    const runtime = new PostgreSqlRuntime(settings(db.runtimeUrl));
+    try {
+      const session = await runtime.openReadOnlySnapshot({ projectId: seeded.expectedIdentity.id });
+      try {
+        const mismatches = await readSequenceSelfConsistencyMismatches(session, seeded.expectedIdentity.id);
+        expect(mismatches).toEqual(expect.arrayContaining([
+          { domain: "conversations", class: "sequence", identitySha256: expect.any(String) },
+        ]));
+      } finally {
+        await session.close();
+      }
+    } finally {
+      await runtime.close();
+    }
+  });
+}, 60000);
+
+/**
  * Three sources disagreed about what makes pg_sequences.last_value NULL:
  * a claim that pg_sequence_last_value() is session-local (wrong: dropped),
  * a claim that the view itself is privilege- or never-called-gated

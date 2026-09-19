@@ -884,14 +884,25 @@ export async function readSequenceSelfConsistencyMismatches(
   await assertSequenceBackedIdentityColumnCompleteness(session, signal);
   const mismatches: MigrationVerificationMismatch[] = [];
   for (const [domain, target] of Object.entries(SEQUENCE_BACKED_IDENTITY_COLUMN)) {
+    // Round-4 P1: identity sequences are global per table, shared by
+    // every project, not per-project. Scoping this MAX to the project
+    // being verified meant an empty (or low-water) project skipped the
+    // check entirely while another project's rows sat above the
+    // sequence in the very same table -- the collision the bound exists
+    // to catch was real, but outside the window this query looked
+    // through. The invariant is "the sequence will not collide with any
+    // row that already exists in this table", which is a table-wide
+    // fact, not a project-scoped one, so the query is now table-wide to
+    // match.
     const maxResult = await session.query<{ max_value: string | null }>({
-      text: "SELECT MAX(" + target.column + ")::text AS max_value FROM " + target.table + " WHERE project_id = $1::uuid",
-      values: [projectId],
+      text: "SELECT MAX(" + target.column + ")::text AS max_value FROM " + target.table,
     }, { domain: "factory", operation: "verifyGenerationSequenceSelfConsistencyMax", projectId, signal });
     const maxValue = maxResult.rows[0]?.max_value ?? null;
-    // Empty domain: nothing exists to collide with, so the bound holds
-    // vacuously regardless of sequence state or privilege. Reading the
-    // sequence is only meaningful once there is a row to protect.
+    // Empty table (across every project, not just the one being
+    // verified): nothing exists anywhere to collide with, so the bound
+    // holds vacuously regardless of sequence state or privilege. Reading
+    // the sequence is only meaningful once some row, in any project,
+    // exists to protect.
     if (maxValue === null) continue;
     const state = await readSequenceStoredState(session, target.table, target.column, signal);
     if (state.kind === "privilege-denied") {
@@ -1343,6 +1354,24 @@ export function migrationVerificationEffectId(reportSha256: string): string {
  * -- deferred release is a verifyMigrationGeneration-only property, not
  * an escaping resource caller-owned wrapper types can accidentally sit
  * on for the lease's protection to depend on.
+ *
+ * Round-4 P1: the round-2 version of this function closed `runtime` in
+ * its own outer `finally` unconditionally, which runs before a
+ * `return` inside the `try` actually hands control back to the
+ * caller. So on every successful pass, `runtime` was already closed by
+ * the time the caller ever got to invoke the returned `releaseLease`,
+ * and `coordinator.releaseLease(...)`'s own `.catch(() => undefined)`
+ * silently absorbed the resulting rejection -- the lease was never
+ * actually released on a successful run, and nothing distinguished that
+ * from a real release, until the lease's own TTL eventually expired it.
+ * `releaseLeaseHandedOff` tracks whether cleanup responsibility for
+ * `runtime` transferred to the returned closure (success, and the
+ * internal failure path below, both close it themselves) so the outer
+ * `finally` only closes `runtime` for a failure that occurred before a
+ * lease was ever acquired. The returned closure itself no longer
+ * swallows a release failure: it always attempts to close `runtime`
+ * (so the resource is never leaked open), but rethrows a genuine
+ * release rejection rather than presenting it as success.
  */
 async function computeVerificationReport(
   input: VerifyMigrationGenerationInput,
@@ -1353,6 +1382,7 @@ async function computeVerificationReport(
     scratchParent: input.scratchParent, signal: input.signal,
   });
   let runtime: PostgreSqlRuntime | undefined;
+  let releaseLeaseHandedOff = false;
   try {
     await copySource.reauthenticate();
     const {
@@ -1403,9 +1433,23 @@ async function computeVerificationReport(
     };
     const lease = await coordinator.acquireLease({ ...resource, ttlMs: input.leaseTtlMs, signal: input.signal });
     if (lease === null) driverError("lease-unavailable", "migration verification lease is held by another worker");
+    // Always closes runtime, even when the release call itself rejects
+    // (so the connection pool is never leaked open), but no longer
+    // swallows that rejection: a caller awaiting this closure now sees
+    // a real release's failure rather than a false success.
     const releaseLease = async (): Promise<void> => {
-      await coordinator.releaseLease({ ...resource, fencingToken: lease.fencingToken }).catch(() => undefined);
+      try {
+        await coordinator.releaseLease({ ...resource, fencingToken: lease.fencingToken });
+      } finally {
+        await runtime?.close();
+      }
     };
+    // From the moment the lease is acquired and this closure exists,
+    // closing runtime is releaseLease's job on every exit path from
+    // here down: the caller invokes it after persist on success, and
+    // the catch immediately below invokes it on failure. The outer
+    // finally must not close runtime a second time in either case.
+    releaseLeaseHandedOff = true;
     try {
       const { mismatch: publicListingMismatch, publicListingSha256 } = await runOrderedListingProbe(
         runtime, input.expectedIdentity.id, conversationsPublicOrder, input.signal,
@@ -1491,12 +1535,26 @@ async function computeVerificationReport(
       };
       return { report: createMigrationVerificationReport(reportInput), releaseLease };
     } catch (error) {
-      await releaseLease();
+      // A secondary failure releasing/closing here must never mask the
+      // primary error that got us into this catch: that primary error
+      // is the one worth propagating. releaseLease still runs (closing
+      // runtime is part of it), its own outcome is just not the thing
+      // this rethrow reports.
+      await releaseLease().catch(() => undefined);
       throw error;
     }
   } finally {
     try { await copySource.stream.close(); } catch { /* preserve the primary failure */ }
-    try { await runtime?.close(); } catch { /* preserve the primary failure */ }
+    // Runtime close is now releaseLease's own responsibility once a
+    // lease has been acquired (success hands the closure to the caller
+    // to invoke after persist; the catch above already invoked it) --
+    // closing it again here would be redundant at best. Only a failure
+    // before a lease was ever acquired (nothing above set the flag)
+    // still needs runtime closed here, since no releaseLease closure
+    // exists in that case to have done it.
+    if (!releaseLeaseHandedOff) {
+      try { await runtime?.close(); } catch { /* preserve the primary failure */ }
+    }
   }
 }
 
