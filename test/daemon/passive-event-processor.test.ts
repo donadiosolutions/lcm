@@ -1,5 +1,5 @@
 import { describe, expect, it, onTestFinished, vi } from "vitest";
-import { mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import type { IncomingMessage, ServerResponse } from "node:http";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -1000,31 +1000,24 @@ describe("PassiveEventProcessor", () => {
   });
 
   // #1384 again, one layer down. An admission that returns before the upload
-  // starts is only a point-in-time check: publication can take the consumer
-  // lock in that gap and the pass still writes to the backend the daemon has
-  // already lost. The nested acquisition below is exactly what the real local
-  // outbox does on every operation, so this also pins the append barrier that
-  // keeps replication able to reach its own database while admission is held.
+  // starts is only a point-in-time check, and from inside the processor it
+  // looks exactly like a real one, so this observes the lock itself: the
+  // admission lock file must be on disk for the whole replication call. The
+  // nested acquisition is what the real local outbox does on every operation,
+  // so it also pins the append barrier that keeps replication able to reach
+  // its own database while that lock is held.
   it("replicates inside the publication admission it was granted", async () => {
     const { home } = publicationFixture();
     const { deps } = timerDeps();
-    let admitted = false;
-    let admittedDuringReplication: boolean | null = null;
+    const lockPath = join(home, ".lcm.backend-publication.lock");
+    let lockHeldDuringReplication: boolean | null = null;
     let outboxAccess = "not attempted";
-    const withPublicationAdmission: PublicationAdmission = async operation =>
-      withBackendPublicationConsumerLockAsync(home, async token => {
-        admitted = true;
-        try {
-          return await operation(token);
-        } finally {
-          admitted = false;
-        }
-      });
+    const withPublicationAdmission = realPublicationAdmission(home);
     const collectEventSidecars = vi.fn<CollectEventSidecars>().mockResolvedValue([
       sidecar({ cwd: "/bound", path: "/events/bound.db", unprocessed: 0 }),
     ]);
     const replicatePassiveEvents = vi.fn(async () => {
-      admittedDuringReplication = admitted;
+      lockHeldDuringReplication = existsSync(lockPath);
       try {
         outboxAccess = withBackendPublicationConsumerLock(home, () => "acquired");
       } catch (error) {
@@ -1048,7 +1041,7 @@ describe("PassiveEventProcessor", () => {
       await processor.runSweep();
 
       expect(replicatePassiveEvents).toHaveBeenCalledTimes(1);
-      expect(admittedDuringReplication).toBe(true);
+      expect(lockHeldDuringReplication).toBe(true);
       expect(outboxAccess).toBe("acquired");
     } finally {
       processor.stop();
