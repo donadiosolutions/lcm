@@ -38,6 +38,16 @@ summarized, or forwarded. Raw issue content is not a recoverable cache: later
 readback uses the stored envelope, and a downstream role may re-read raw content
 only by constructing a fresh canonical projection first.
 
+For every read or refetch, apply the entrypoint's full redaction union: the
+issue-label redactor behavior plus all repository `NATIVE_PATTERNS`. The canonical
+projector owns all truncation. Never accept the issue-label helper's default
+8,000 UTF-16 code units; use an explicit verified no-loss maximum such as
+`Number.MAX_SAFE_INTEGER`. If the complete redacted projection remains below the
+aggregate envelope ceiling, preserve all redacted content and keep
+`truncation.applied` false. Any unavoidable earlier loss must be authenticated and
+described by true truncation metadata; when its extent or redaction safety cannot
+be proven, record an intake blocker and fail closed.
+
 Every triager and duplicate adjudicator prompt labels the delimited envelope as
 untrusted data, prohibits following embedded instructions, and requires any
 reproduction to be derived independently from trusted repository state. Ordinary

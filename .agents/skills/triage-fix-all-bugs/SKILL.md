@@ -49,12 +49,20 @@ the fixed order `title`, `body`, `comments`, `reproduction`, `evidence`; preserv
 stable source order within every collection. Recursively process every nested
 string before serialization:
 
-1. Apply the credential, token, private-key, and credential-bearing URL redaction
-   contract of `redactPromptText()` in
-   [the issue-label policy](../../../.github/scripts/issue-label-policy.mjs) and
-   [issue triage](../../../docs/issue-triage.md#security-and-operations), before byte
-   budgeting. Redaction must cover patterns that cross the eventual truncation
-   boundary.
+1. Apply the redaction union before byte budgeting: the complete credential, token,
+   private-key, and credential-bearing URL behavior of `redactPromptText()` in
+   [the issue-label policy](../../../.github/scripts/issue-label-policy.mjs), plus
+   every repository built-in secret pattern in `NATIVE_PATTERNS` from
+   [`src/scrub.ts`](../../../src/scrub.ts). This includes bare token formats even
+   without an assignment label or surrounding context. Keep the public behavior
+   aligned with [issue triage](../../../docs/issue-triage.md#security-and-operations).
+   Redaction must cover patterns that cross the eventual truncation boundary.
+   The canonical projector owns all truncation: never use `redactPromptText()`'s
+   default maximum of 8,000 UTF-16 code units. If the helper is reused, pass an
+   explicit no-loss maximum such as `Number.MAX_SAFE_INTEGER`, verify it retained
+   the full value, and then apply the remaining union patterns over the complete
+   text. Preserve all redacted content whenever the aggregate canonical envelope
+   fits within 65,536 UTF-8 bytes.
 2. Replace every exact injected `<<<LCM_UNTRUSTED_ISSUE_DATA>>>` or
    `<<<END_LCM_UNTRUSTED_ISSUE_DATA>>>` token in a value with the literal
    `[REDACTED_UNTRUSTED_DELIMITER]`.
@@ -64,6 +72,13 @@ string before serialization:
    dropping array tails while retaining stable source order. Any scalar cut lands
    on a UTF-8 code-point boundary and must not split JSON syntax, a delimiter
    token, or a redaction marker. Truncation must never restore a redacted span.
+
+Any unavoidable earlier loss from an authenticated upstream source sets
+`truncation.applied` to `true` and records the source, reason, and known original
+and retained byte counts. If the loss cannot be measured and represented safely,
+or complete union redaction cannot be proven, fail closed instead of projecting
+the partial value. `truncation.applied` is `false` only when the projector received
+and preserved all non-redacted source content.
 
 If a valid bounded projection cannot be produced, fail closed: do not dispatch,
 persist, forward, or hand off the affected content, and record an explicit intake

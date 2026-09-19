@@ -74,6 +74,28 @@ class CoordinationContractTests(unittest.TestCase):
                      "remediation", "canonical envelope", "independently"):
             self.assertIn(term, text.lower())
 
+    def test_bug_campaign_uses_union_redaction_without_helper_pretruncation(self):
+        entry = self.read("triage-fix-all-bugs/SKILL.md")
+        triage = self.read("triage-fix-all-bugs/references/triage.md")
+        combined = " ".join((entry + "\n" + triage).split())
+        for term in ("union", "NATIVE_PATTERNS", "../../../src/scrub.ts",
+                     "Number.MAX_SAFE_INTEGER", "8,000 UTF-16 code units",
+                     "canonical projector owns all truncation",
+                     "all redacted content", "unavoidable earlier loss"):
+            self.assertIn(term, combined)
+
+        scenario = self.read("tests/coordination-scenarios.md")
+        self.assertIn("| C17 |", scenario)
+        for token in ("npm_0123456789abcdefghijklmnopqrstuvwxyz",
+                      "xoxb-123456789-abcdefghij",
+                      "sk_live_51J3kxABCDEFghijKLMNop",
+                      "AIzaSyA1234567890abcdefghijklmnopqrstuv",
+                      "SG.AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"):
+            self.assertIn(token, scenario)
+        for term in ("9,001-byte", "below the 65,536-byte envelope limit",
+                     "preserve all 9,001 bytes", "truncation.applied=false"):
+            self.assertIn(term, scenario)
+
     def test_engine_requires_both_lifecycle_contracts(self):
         text = self.read("procedural-development/SKILL.md")
         self.assertIn("references/root-lifecycle.md", text)
@@ -163,7 +185,7 @@ class CoordinationContractTests(unittest.TestCase):
 
     def test_behavioral_scenarios_cover_reported_failures_and_recovery(self):
         text = self.read("tests/coordination-scenarios.md")
-        for number in range(1, 17):
+        for number in range(1, 18):
             self.assertIn(f"| C{number:02d} |", text)
         self.assertIn("not executed", text)
         self.assertIn("tool calls", text)

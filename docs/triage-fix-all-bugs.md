@@ -46,6 +46,14 @@ like content and wraps the result as a canonical JSON envelope between
 serialized JSON is limited to 65,536 UTF-8 bytes only after redaction so a secret
 cannot evade redaction by crossing the truncation boundary.
 
+Redaction uses the union of the issue-label prompt redactor and every repository
+built-in secret pattern, including bare npm, Slack, Stripe, Google, and SendGrid
+tokens that do not have assignment labels or surrounding context. The canonical
+projector owns all truncation; it never uses the prompt helper's default 8,000
+UTF-16-code-unit maximum. Content that remains below the aggregate envelope limit
+after redaction is preserved in full. Known unavoidable loss before projection is
+reported in truncation metadata, and unknown or unsafe earlier loss fails closed.
+
 The envelope preserves `title`, `body`, `comments`, `reproduction`, and `evidence`
 in fixed field order and preserves source order in collections. Safe truncation
 removes later content first, records explicit truncation metadata, ends only at a
