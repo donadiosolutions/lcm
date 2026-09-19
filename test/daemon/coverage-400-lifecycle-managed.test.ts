@@ -20,8 +20,8 @@ import {
 } from "../../src/daemon/lifecycle.js";
 import { ensureAuthToken } from "../../src/daemon/auth.js";
 import {
-  managedDaemonPath,
   managedDaemonPathForStableLaunch,
+  SYSTEMD_DAEMON_PATH,
 } from "../../src/daemon/managed-path.js";
 import {
   managedLaunchEnvironmentDigest,
@@ -37,6 +37,16 @@ import {
 } from "../../src/daemon/lifecycle-scope.js";
 import { RUNTIME_DIGEST } from "../../src/daemon/version.js";
 import { PrivateMutationLockContentionError } from "../../src/private-mutation-lock.js";
+
+vi.mock("node:os", async (importOriginal) => {
+  const actual = await importOriginal<typeof import("node:os")>();
+  const isolatedHome = (): string => process.env.HOME ?? actual.homedir();
+  return {
+    ...actual,
+    homedir: isolatedHome,
+    userInfo: () => ({ ...actual.userInfo(), homedir: isolatedHome() }),
+  };
+});
 
 const roots: string[] = [];
 
@@ -395,12 +405,18 @@ describe("issue 400 lifecycle managed preparation and utility boundaries", () =>
     const callerHome = homedir();
     const projectCwd = join(fixture.root, "project");
     const spawnCommand = "/usr/bin/node";
+    const legitimatePrefix = join(callerHome, ".local");
     const spawnArgs = [
-      join(callerHome, ".local", "lib", "node_modules", "@donadiosolutions", "lcm", "dist", "lcm.mjs"),
+      join(legitimatePrefix, "lib", "node_modules", "@donadiosolutions", "lcm", "dist", "lcm.mjs"),
       "daemon",
       "start",
       "--foreground",
     ];
+    mkdirSync(join(legitimatePrefix, "bin"), { recursive: true });
+    mkdirSync(join(legitimatePrefix, "lib", "node_modules", "@donadiosolutions", "lcm", "dist"), {
+      recursive: true,
+    });
+    writeFileSync(spawnArgs[0]!, "export {};\n");
     let callerCwd = callerHome;
     vi.spyOn(process, "cwd").mockImplementation(() => callerCwd);
     const probed: SupervisorSpec[] = [];
@@ -422,7 +438,9 @@ describe("issue 400 lifecycle managed preparation and utility boundaries", () =>
     expect(probed[0]?.stateRoot).toBe(probed[1]?.stateRoot);
     expect(probed[0]?.scopeDigest).toBe(probed[1]?.scopeDigest);
     expect(probed[0]?.launchEnvironment?.PATH).toBe(probed[1]?.launchEnvironment?.PATH);
-    expect(probed[0]?.launchEnvironment?.PATH).toContain(join(callerHome, ".local", "bin"));
+    expect(probed[0]?.launchEnvironment?.PATH).toBe(
+      `${join(callerHome, ".local", "bin")}:${SYSTEMD_DAEMON_PATH}`,
+    );
     const digest = (spec: SupervisorSpec): string => managedLaunchEnvironmentDigest(
       spec,
       spec.kind,
@@ -431,6 +449,52 @@ describe("issue 400 lifecycle managed preparation and utility boundaries", () =>
     );
     expect(digest(probed[0]!)).toBe(digest(probed[1]!));
     expect(fixture.start).not.toHaveBeenCalled();
+  });
+
+  it("excludes checkout-local synthesis from stable ensure identity", async () => {
+    const fixture = createFixture({
+      fetch: vi.fn().mockRejectedValue(new Error("offline")) as never,
+      environment: { PATH: "/ambient/bin" },
+    });
+    const checkout = join(fixture.root, "checkout");
+    const entrypoint = join(
+      checkout,
+      ".local",
+      "lib",
+      "node_modules",
+      "@donadiosolutions",
+      "lcm",
+      "dist",
+      "lcm.mjs",
+    );
+    mkdirSync(join(checkout, ".local", "bin"), { recursive: true });
+    mkdirSync(join(checkout, ".local", "lib", "node_modules", "@donadiosolutions", "lcm", "dist"), {
+      recursive: true,
+    });
+    writeFileSync(entrypoint, "export {};\n");
+    const spawnArgs = [entrypoint, "daemon", "start", "--foreground"];
+    const probed: SupervisorSpec[] = [];
+    fixture.probe.mockImplementation(async (spec: SupervisorSpec) => {
+      probed.push(spec);
+      return observation(spec, "absent");
+    });
+
+    let callerCwd = homedir();
+    vi.spyOn(process, "cwd").mockImplementation(() => callerCwd);
+    const options = optionsFor(fixture, {
+      spawnCommand: "/usr/bin/node",
+      spawnArgs,
+      _skipSpawn: true,
+    });
+    await ensureDaemon(options);
+    callerCwd = checkout;
+    await ensureDaemon(options);
+
+    expect(probed).toHaveLength(2);
+    expect(probed[0]?.launchEnvironment?.PATH).toBe(SYSTEMD_DAEMON_PATH);
+    expect(probed[1]?.launchEnvironment?.PATH).toBe(SYSTEMD_DAEMON_PATH);
+    expect(probed[0]?.launchEnvironment?.PATH).not.toContain(join(checkout, ".local", "bin"));
+    expect(probed[0]?.scopeDigest).toBe(probed[1]?.scopeDigest);
   });
 
   it("uses the authenticated packaged entrypoint for default manager identity args", async () => {
@@ -517,7 +581,7 @@ describe("issue 400 lifecycle managed preparation and utility boundaries", () =>
     const started = fixture.start.mock.calls[0]?.[0] as SupervisorSpec | undefined;
     expect(started?.kind).toBe(method);
     expect(started?.launchEnvironment).toMatchObject({
-      PATH: managedDaemonPath(spawnCommand, spawnArgs),
+      PATH: managedDaemonPathForStableLaunch(spawnCommand, spawnArgs, fixture.stateDir),
       LCM_SUMMARY_PROVIDER: "codex-process",
     });
     expect(started?.launchEnvironment?.PATH).not.toBe("/ambient/bin");

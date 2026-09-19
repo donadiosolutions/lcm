@@ -15,7 +15,9 @@ import { projectDbPath } from "../../../src/daemon/project.js";
 import { PrivateMutationLockContentionError } from "../../../src/private-mutation-lock.js";
 import { SqliteProjectStorage } from "../../../src/storage/sqlite/project-storage.js";
 import {
+  assertBackendPublicationConsumerAccess,
   BackendPublicationJournalError,
+  type BackendPublicationLockToken,
   withBackendPublicationConsumerLockAsync,
 } from "../../../src/storage/backend-publication.js";
 import { makeStagedPostgreSqlStorageFactory } from "./mock-storage-factory.js";
@@ -48,7 +50,7 @@ const EXPECTED_BUILT_IN_ROUTE_ADMISSIONS: readonly [string, RouteAdmission, "ret
   ["POST /store", "mutating", "operation-scoped"],
   ["POST /recent", "read", "retained"],
   ["POST /ingest", "mutating", "operation-scoped"],
-  ["POST /prompt-search", "read", "retained"],
+  ["POST /prompt-search", "mutating", "operation-scoped"],
   ["POST /session-complete", "mutating", "operation-scoped"],
   ["POST /promote-events", "mutating", "operation-scoped"],
   ["POST /promote-events/all", "mutating", "operation-scoped"],
@@ -135,6 +137,193 @@ describe("daemon route publication admission", () => {
         releaseCustomHandler.resolve();
         await expect(customResponsePromise).resolves.toMatchObject({ status: 200 });
       }
+    } finally {
+      if (daemon) await daemon.stop();
+      rmSync(tempHome, { recursive: true, force: true });
+      if (originalHome === undefined) delete process.env.HOME;
+      else process.env.HOME = originalHome;
+      if (originalUserProfile === undefined) delete process.env.USERPROFILE;
+      else process.env.USERPROFILE = originalUserProfile;
+    }
+  });
+
+  it("retains prompt-search admission through surfacing and project close", async () => {
+    const originalHome = process.env.HOME;
+    const originalUserProfile = process.env.USERPROFILE;
+    const tempHome = mkdtempSync(join(tmpdir(), "lcm-prompt-search-admission-"));
+    process.env.HOME = tempHome;
+    process.env.USERPROFILE = tempHome;
+    const lcmDir = join(tempHome, ".lcm");
+    const projectDir = join(tempHome, "project");
+    mkdirSync(lcmDir, { recursive: true, mode: 0o700 });
+    mkdirSync(projectDir, { recursive: true, mode: 0o700 });
+    const configPath = join(lcmDir, "config.json");
+    writeFileSync(configPath, "{}\n", { mode: 0o600 });
+    const logStarted = deferred<void>();
+    const releaseLog = deferred<void>();
+    let openToken: BackendPublicationLockToken | undefined;
+    let logToken: BackendPublicationLockToken | undefined;
+    let closeToken: BackendPublicationLockToken | undefined;
+    const projectClose = vi.fn(async (token?: BackendPublicationLockToken) => {
+      closeToken = token;
+    });
+    const project = {
+      lexicalSearch: {
+        searchPromotedForRecall: vi.fn(async () => ({
+          candidates: [{
+            result: {
+              id: "memory-1",
+              content: "remember prompt search admission",
+              tags: [],
+              projectId: "project",
+              sessionId: "session",
+              confidence: 1,
+              createdAt: new Date().toISOString(),
+              rank: -0.000001,
+            },
+            evidence: { matchedTermCount: 1, queryTermCount: 1 },
+          }],
+        })),
+      },
+      recall: {
+        getFeedback: vi.fn(async () => new Map()),
+        logSurfacing: vi.fn(async () => {
+          logToken = openToken;
+          logStarted.resolve();
+          expect(logToken).toBeDefined();
+          assertBackendPublicationConsumerAccess({
+            homeDir: tempHome,
+            lockToken: logToken,
+          });
+          await releaseLog.promise;
+        }),
+      },
+      close: projectClose,
+    } as unknown as ProjectStorage;
+    const storageFactory = makeMockStorageFactory({
+      openProject: async (_identity, token) => {
+        openToken = token;
+        return project;
+      },
+    });
+    const factoryClose = vi.spyOn(storageFactory, "close");
+    let daemon: DaemonInstance | undefined;
+
+    try {
+      daemon = await createDaemon(loadDaemonConfig(configPath, {
+        daemon: { port: 0, idleTimeoutMs: 0 },
+        restoration: { promptSearchMinScore: 0 },
+      }), {
+        publicationConfigPath: configPath,
+        _createStorageBackendFactory: async () => storageFactory,
+      });
+
+      const responsePromise = fetch(`http://127.0.0.1:${daemon.address().port}/prompt-search`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ query: "admission", cwd: projectDir }),
+      });
+      await logStarted.promise;
+      try {
+        await expect(withBackendPublicationConsumerLockAsync(tempHome, async () => undefined))
+          .rejects.toBeInstanceOf(PrivateMutationLockContentionError);
+      } finally {
+        releaseLog.resolve();
+      }
+
+      const response = await responsePromise;
+      expect(response.status).toBe(200);
+      await expect(response.json()).resolves.toEqual({
+        hints: ["remember prompt search admission"],
+        ids: ["memory-1"],
+      });
+      expect(openToken).toBeDefined();
+      expect(logToken).toBe(openToken);
+      expect(closeToken).toBe(openToken);
+      expect(projectClose).toHaveBeenCalledOnce();
+      expect(factoryClose).not.toHaveBeenCalled();
+      await expect(withBackendPublicationConsumerLockAsync(tempHome, async () => undefined))
+        .resolves.toBeUndefined();
+    } finally {
+      releaseLog.resolve();
+      if (daemon) await daemon.stop();
+      expect(factoryClose).toHaveBeenCalledOnce();
+      rmSync(tempHome, { recursive: true, force: true });
+      if (originalHome === undefined) delete process.env.HOME;
+      else process.env.HOME = originalHome;
+      if (originalUserProfile === undefined) delete process.env.USERPROFILE;
+      else process.env.USERPROFILE = originalUserProfile;
+    }
+  });
+
+  it("keeps prompt-search responses within the 10 MiB server limit after admission", async () => {
+    const originalHome = process.env.HOME;
+    const originalUserProfile = process.env.USERPROFILE;
+    const tempHome = mkdtempSync(join(tmpdir(), "lcm-prompt-search-response-bound-"));
+    process.env.HOME = tempHome;
+    process.env.USERPROFILE = tempHome;
+    const lcmDir = join(tempHome, ".lcm");
+    const projectDir = join(tempHome, "project");
+    mkdirSync(lcmDir, { recursive: true, mode: 0o700 });
+    mkdirSync(projectDir, { recursive: true, mode: 0o700 });
+    const configPath = join(lcmDir, "config.json");
+    writeFileSync(configPath, "{}\n", { mode: 0o600 });
+    const oversizedContent = "x".repeat(10 * 1024 * 1024);
+    const project = {
+      lexicalSearch: {
+        searchPromotedForRecall: vi.fn(async () => ({
+          candidates: [{
+            result: {
+              id: "memory-1",
+              content: oversizedContent,
+              tags: [],
+              projectId: "project",
+              sessionId: "session",
+              confidence: 1,
+              createdAt: new Date().toISOString(),
+              rank: -0.000001,
+            },
+            evidence: { matchedTermCount: 1, queryTermCount: 1 },
+          }],
+        })),
+      },
+      recall: {
+        getFeedback: vi.fn(async () => new Map()),
+        logSurfacing: vi.fn(async () => undefined),
+      },
+      close: vi.fn(async () => undefined),
+    } as unknown as ProjectStorage;
+    const storageFactory = makeMockStorageFactory({
+      openProject: async () => project,
+    });
+    let daemon: DaemonInstance | undefined;
+
+    try {
+      daemon = await createDaemon(loadDaemonConfig(configPath, {
+        daemon: { port: 0, idleTimeoutMs: 0 },
+        restoration: {
+          promptSearchMinScore: 0,
+          promptSearchMaxResults: 1,
+          promptSnippetLength: oversizedContent.length,
+          maxInjectedMemoryBytes: oversizedContent.length + 1024,
+          reservedForLearningInstruction: 0,
+          maxInjectedMemoryItems: 1,
+        },
+      }), {
+        publicationConfigPath: configPath,
+        _createStorageBackendFactory: async () => storageFactory,
+      });
+
+      const response = await fetch(`http://127.0.0.1:${daemon.address().port}/prompt-search`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ query: "x", cwd: projectDir, logSurfacing: false }),
+      });
+
+      expect(response.status).toBe(500);
+      await expect(response.json()).resolves.toEqual({
+        error: "buffered response exceeds the response size limit",
+      });
     } finally {
       if (daemon) await daemon.stop();
       rmSync(tempHome, { recursive: true, force: true });
@@ -583,6 +772,60 @@ describe("daemon route publication admission", () => {
       expect(projectClose).toHaveBeenCalledOnce();
       expect(response?.status).not.toBe(200);
       if (response) await expect(response.text()).resolves.not.toContain("# Orientation");
+    } finally {
+      if (daemon) await daemon.stop();
+      rmSync(tempHome, { recursive: true, force: true });
+      if (originalHome === undefined) delete process.env.HOME;
+      else process.env.HOME = originalHome;
+      if (originalUserProfile === undefined) delete process.env.USERPROFILE;
+      else process.env.USERPROFILE = originalUserProfile;
+    }
+  });
+
+  it("does not turn operation-scoped prompt-search cancellation into empty success", async () => {
+    const originalHome = process.env.HOME;
+    const originalUserProfile = process.env.USERPROFILE;
+    const tempHome = mkdtempSync(join(tmpdir(), "lcm-route-prompt-search-cancel-"));
+    process.env.HOME = tempHome;
+    process.env.USERPROFILE = tempHome;
+    const lcmDir = join(tempHome, ".lcm");
+    const projectDir = join(tempHome, "project");
+    mkdirSync(lcmDir, { recursive: true, mode: 0o700 });
+    mkdirSync(projectDir, { recursive: true, mode: 0o700 });
+    const configPath = join(lcmDir, "config.json");
+    writeFileSync(configPath, "{}\n", { mode: 0o600 });
+    let daemon: DaemonInstance | undefined;
+    const openStarted = deferred<void>();
+    const projectClose = vi.fn(async () => undefined);
+    const project = { close: projectClose } as unknown as ProjectStorage;
+    let observedSignal: AbortSignal | undefined;
+    const storageFactory = makeMockStorageFactory({
+      openProject: async (_identity, _token, signal) => {
+        observedSignal = signal;
+        openStarted.resolve();
+        await new Promise<void>(resolve => signal?.addEventListener("abort", () => resolve(), { once: true }));
+        return project;
+      },
+    });
+
+    try {
+      daemon = await createDaemon(loadDaemonConfig(configPath, {
+        daemon: { port: 0, idleTimeoutMs: 0 },
+      }), {
+        publicationConfigPath: configPath,
+        _createStorageBackendFactory: async () => storageFactory,
+      });
+      const responsePromise = fetch(`http://127.0.0.1:${daemon.address().port}/prompt-search`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ query: "admission", cwd: projectDir }),
+      });
+      await openStarted.promise;
+      await daemon.stop();
+      const response = await responsePromise.catch(() => undefined);
+      expect(observedSignal?.aborted).toBe(true);
+      expect(projectClose).toHaveBeenCalledOnce();
+      expect(response?.status).not.toBe(200);
     } finally {
       if (daemon) await daemon.stop();
       rmSync(tempHome, { recursive: true, force: true });

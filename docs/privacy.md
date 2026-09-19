@@ -362,6 +362,14 @@ bundled Gitleaks rules, built-in patterns, global `security.sensitivePatterns`,
 and the project's `sensitive-patterns.txt`. Previously captured passive events
 are scrubbed again before promotion.
 
+Errors returned through MCP redact supported credential assignments before
+they become tool-visible diagnostics. This includes quoted, unquoted, and
+ODBC-style brace-delimited values for password, token, API-key, authorization,
+and connection-user labels. Complete bounded assignments keep useful surrounding
+context. Malformed or oversized quoted or brace-delimited assignments fail
+closed: LCM keeps the label and redaction marker but discards the unparsed
+remainder so a credential suffix cannot appear in the diagnostic.
+
 The bundled Slack webhook (`hooks.slack.com`) and Sidekiq
 (`gems.contribsys.com` and `enterprise.contribsys.com`) service-hostname rules
 match their hostnames case-insensitively while treating dots literally. The
