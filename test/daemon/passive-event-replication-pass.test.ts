@@ -1,12 +1,17 @@
 import { describe, expect, it, vi } from "vitest";
-import { mkdtempSync, rmSync } from "node:fs";
-import { tmpdir } from "node:os";
+import { chmodSync, mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { homedir, tmpdir } from "node:os";
 import { join } from "node:path";
 import { loadDaemonConfig } from "../../src/daemon/config.js";
+import { readMachineIdentity } from "../../src/machine-identity.js";
 import {
   SQLiteLocalHookOutboxFactory,
   type LocalHookOutboxRepository,
 } from "../../src/storage/local-hook-outbox.js";
+import {
+  PassiveEventReplicationWorker,
+  type PassiveEventReplicationDependencies,
+} from "../../src/daemon/passive-event-replication.js";
 import {
   applyReplicatedPassiveEvent,
   createPassiveEventReplicationPass,
@@ -17,6 +22,39 @@ import {
 } from "../../src/daemon/passive-event-replication-pass.js";
 
 type Modules = PassiveEventReplicationModules;
+
+const PENDING_IDENTITY_KEY = `machine:${"7".repeat(64)}`;
+const REGISTERED_IDENTITY = {
+  version: 1,
+  identityKey: `machine:${"a".repeat(64)}`,
+  machineId: "machine-uuid",
+  displayName: "registered-host",
+};
+
+/**
+ * A real LCM home under the vitest-isolated home directory. The identity gate
+ * is then exercised through the shipped reader against a real machine.json
+ * state rather than a stand-in that only mimics its failures.
+ */
+function identityHome(machineJson?: string): string {
+  const home = mkdtempSync(join(homedir(), "lcm-replication-identity-"));
+  const lcmHome = join(home, ".lcm");
+  mkdirSync(lcmHome, { recursive: true });
+  chmodSync(lcmHome, 0o700);
+  if (machineJson !== undefined) {
+    const path = join(lcmHome, "machine.json");
+    writeFileSync(path, machineJson, { mode: 0o600 });
+    chmodSync(path, 0o600);
+  }
+  return home;
+}
+
+/** Bind the shipped machine-identity reader to one real home. */
+function identitySeam(home: string) {
+  return {
+    readMachineIdentity: () => readMachineIdentity(home),
+  };
+}
 
 /**
  * The factory keeps every repository it opens until it is closed, so the only
@@ -58,11 +96,15 @@ function modules(overrides: Partial<Modules> = {}): { modules: Modules; runtime:
     modules: {
       ensureWorktreeProjectReconciled: vi.fn(),
       resolveProjectIdentity: vi.fn().mockReturnValue({ remoteProjectId: "project-uuid" }),
-      requireMachineIdentity: vi.fn().mockReturnValue({ machineId: "machine-uuid" }),
+      readMachineIdentity: vi.fn().mockReturnValue(REGISTERED_IDENTITY),
       eventsDbPath: vi.fn().mockReturnValue("/events/project.db"),
       createRuntime: vi.fn().mockReturnValue(runtime),
       createOutboxFactory: vi.fn().mockReturnValue(factory),
       createRepository: vi.fn().mockReturnValue({}),
+      createWorker: (
+        dependencies: PassiveEventReplicationDependencies,
+        processId: string,
+      ) => new PassiveEventReplicationWorker(dependencies, { processId }),
       ...overrides,
     } as unknown as Modules,
   };
@@ -88,10 +130,12 @@ describe("passive-event replication pass", () => {
     const PostgreSqlRuntime = vi.fn();
     const SQLiteLocalHookOutboxFactory = vi.fn();
     const PostgreSqlPassiveEventRepository = vi.fn();
+    const Worker = vi.fn();
     const imported = {
       projectMap: { resolveProjectIdentity: vi.fn() },
       reconciliation: { ensureWorktreeProjectReconciled: vi.fn() },
-      identity: { requireMachineIdentity: vi.fn() },
+      identity: { readMachineIdentity: vi.fn() },
+      replication: { PassiveEventReplicationWorker: Worker },
       paths: { eventsDbPath: vi.fn() },
       runtime: { PostgreSqlRuntime },
       outbox: { SQLiteLocalHookOutboxFactory },
@@ -102,7 +146,7 @@ describe("passive-event replication pass", () => {
     expect(bound.resolveProjectIdentity).toBe(imported.projectMap.resolveProjectIdentity);
     expect(bound.ensureWorktreeProjectReconciled)
       .toBe(imported.reconciliation.ensureWorktreeProjectReconciled);
-    expect(bound.requireMachineIdentity).toBe(imported.identity.requireMachineIdentity);
+    expect(bound.readMachineIdentity).toBe(imported.identity.readMachineIdentity);
     expect(bound.eventsDbPath).toBe(imported.paths.eventsDbPath);
 
     const settings = { url: "postgresql://example.test/lcm" } as never;
@@ -115,6 +159,10 @@ describe("passive-event replication pass", () => {
       .toBeInstanceOf(PostgreSqlPassiveEventRepository);
     expect(PostgreSqlPassiveEventRepository)
       .toHaveBeenCalledWith(executor, "project-uuid", "machine-uuid");
+
+    const dependencies = {} as unknown as PassiveEventReplicationDependencies;
+    expect(bound.createWorker(dependencies, "lcm-daemon:bound")).toBeInstanceOf(Worker);
+    expect(Worker).toHaveBeenCalledWith(dependencies, { processId: "lcm-daemon:bound" });
   });
 
   it("loads the real PostgreSQL namespaces on demand", async () => {
@@ -122,10 +170,11 @@ describe("passive-event replication pass", () => {
     const loaded = await loadReplicationModules();
     expect(typeof loaded.resolveProjectIdentity).toBe("function");
     expect(typeof loaded.ensureWorktreeProjectReconciled).toBe("function");
-    expect(typeof loaded.requireMachineIdentity).toBe("function");
+    expect(typeof loaded.readMachineIdentity).toBe("function");
     expect(typeof loaded.eventsDbPath).toBe("function");
     expect(typeof loaded.createRuntime).toBe("function");
     expect(typeof loaded.createRepository).toBe("function");
+    expect(typeof loaded.createWorker).toBe("function");
     const factory = loaded.createOutboxFactory();
     try {
       expect(factory).toBeDefined();
@@ -166,11 +215,11 @@ describe("passive-event replication pass", () => {
     await expect(pass.run("/proj")).resolves.toBeNull();
   });
 
-  it("reports a missing machine identity and skips before resolving the project", async () => {
-    const failure = new Error("machine identity is not registered");
-    const harness = modules({
-      requireMachineIdentity: vi.fn(() => { throw failure; }),
-    });
+  // A daemon that has never run `lcm machine register` is unconfigured, not
+  // broken. Reporting it turns every sidecar of every five-minute sweep into
+  // a diagnostic that never stops arriving and that no operator asked for.
+  it("skips a machine that has never been registered without reporting", async () => {
+    const harness = modules(identitySeam(identityHome()));
     const onError = vi.fn();
     const pass = createPassiveEventReplicationPass(postgresConfig(), {
       processId: "lcm-daemon:test",
@@ -178,9 +227,80 @@ describe("passive-event replication pass", () => {
       onError,
     });
     await expect(pass.run("/proj")).resolves.toBeNull();
-    expect(onError).toHaveBeenCalledWith(failure);
+    expect(onError).not.toHaveBeenCalled();
     expect(harness.modules.ensureWorktreeProjectReconciled).not.toHaveBeenCalled();
     expect(harness.modules.createRuntime).not.toHaveBeenCalled();
+  });
+
+  it("skips a half-finished machine registration without reporting", async () => {
+    const pending = `${JSON.stringify({
+      version: 1,
+      identityKey: PENDING_IDENTITY_KEY,
+      machineId: null,
+      displayName: "pending-host",
+    }, null, 2)}\n`;
+    const harness = modules(identitySeam(identityHome(pending)));
+    const onError = vi.fn();
+    const pass = createPassiveEventReplicationPass(postgresConfig(), {
+      processId: "lcm-daemon:test",
+      loadModules: async () => harness.modules,
+      onError,
+    });
+    await expect(pass.run("/proj")).resolves.toBeNull();
+    expect(onError).not.toHaveBeenCalled();
+    expect(harness.modules.ensureWorktreeProjectReconciled).not.toHaveBeenCalled();
+    expect(harness.modules.createRuntime).not.toHaveBeenCalled();
+  });
+
+  // An unreadable machine.json is a fault rather than a configuration state,
+  // so the quiet skip above must not be a blanket silence over every
+  // MachineIdentityFileError.
+  it("reports an unreadable machine identity instead of skipping it quietly", async () => {
+    const harness = modules(identitySeam(identityHome("{ not json\n")));
+    const onError = vi.fn();
+    const pass = createPassiveEventReplicationPass(postgresConfig(), {
+      processId: "lcm-daemon:test",
+      loadModules: async () => harness.modules,
+      onError,
+    });
+    await expect(pass.run("/proj")).resolves.toBeNull();
+    expect(onError).toHaveBeenCalledWith(expect.objectContaining({
+      name: "MachineIdentityFileError",
+      message: expect.stringContaining("machine.json contains invalid JSON"),
+    }));
+    expect(harness.modules.createRuntime).not.toHaveBeenCalled();
+  });
+
+  // Gate 1 can only keep PostgreSQL out of a SQLite daemon's process if the
+  // worker is reached through the dynamically loaded bundle.
+  it("constructs its worker through the dynamically loaded modules", async () => {
+    const runOnce = vi.fn().mockResolvedValue(summary);
+    const createWorker = vi.fn().mockReturnValue({ runOnce });
+    const harness = modules({ createWorker } as unknown as Partial<Modules>);
+    const pass = createPassiveEventReplicationPass(postgresConfig(), {
+      processId: "lcm-daemon:bundle",
+      loadModules: async () => harness.modules,
+    });
+    await expect(pass.run("/proj")).resolves.toEqual(summary);
+    expect(createWorker).toHaveBeenCalledWith(
+      expect.objectContaining({ applyEvent: applyReplicatedPassiveEvent }),
+      "lcm-daemon:bundle",
+    );
+  });
+
+  it("keeps PostgreSQL storage out of its own static module graph", async () => {
+    const repositoryModule = "../../src/storage/postgresql/passive-event-repository.js";
+    vi.resetModules();
+    vi.doMock(repositoryModule, () => {
+      throw new Error("the pass statically imported the PostgreSQL passive-event repository");
+    });
+    try {
+      const reloaded = await import("../../src/daemon/passive-event-replication-pass.js");
+      expect(typeof reloaded.createPassiveEventReplicationPass).toBe("function");
+    } finally {
+      vi.doUnmock(repositoryModule);
+      vi.resetModules();
+    }
   });
 
   it("skips an unbound project quietly without opening a connection", async () => {

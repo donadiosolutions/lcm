@@ -1,10 +1,10 @@
 import type { DaemonConfig, ResolvedPostgreSqlConfig } from "./config.js";
-import {
-  PassiveEventReplicationWorker,
-  type PassiveEventReplicationDependencies,
-  type PassiveEventReplicationResult,
+import type {
+  PassiveEventReplicationDependencies,
+  PassiveEventReplicationResult,
 } from "./passive-event-replication.js";
 import type { LocalHookOutboxRepository } from "../storage/local-hook-outbox.js";
+import type { StoredMachineIdentity } from "../machine-identity.js";
 import { safeLogError } from "../hooks/hook-errors.js";
 import type { PostgreSqlPassiveEventRepository } from "../storage/postgresql/passive-event-repository.js";
 
@@ -36,10 +36,14 @@ interface OutboxFactoryLike {
   close(): Promise<void>;
 }
 
+interface WorkerLike {
+  runOnce(signal?: AbortSignal): Promise<PassiveEventReplicationResult>;
+}
+
 export interface PassiveEventReplicationModules {
   readonly ensureWorktreeProjectReconciled: (cwd: string) => unknown;
   readonly resolveProjectIdentity: (cwd: string) => { readonly remoteProjectId?: string | null };
-  readonly requireMachineIdentity: () => { readonly machineId: string };
+  readonly readMachineIdentity: () => StoredMachineIdentity | null;
   readonly eventsDbPath: (cwd: string) => string;
   readonly createRuntime: (settings: ResolvedPostgreSqlConfig["postgresql"]) => RuntimeLike;
   readonly createOutboxFactory: () => OutboxFactoryLike;
@@ -48,6 +52,17 @@ export interface PassiveEventReplicationModules {
     projectId: string,
     machineId: string,
   ) => PostgreSqlPassiveEventRepository;
+  /**
+   * The worker is reached through the bundle so this module's own static
+   * graph stops at the daemon: `passive-event-replication.js` imports the
+   * PostgreSQL repository as a value, and `server.ts` imports this file
+   * statically, so a static worker import would load PostgreSQL storage into
+   * every SQLite daemon before gate 1 ever runs.
+   */
+  readonly createWorker: (
+    dependencies: PassiveEventReplicationDependencies,
+    processId: string,
+  ) => WorkerLike;
 }
 
 export interface PassiveEventReplicationPassOptions {
@@ -58,7 +73,7 @@ export interface PassiveEventReplicationPassOptions {
   readonly createWorker?: (
     dependencies: PassiveEventReplicationDependencies,
     processId: string,
-  ) => { runOnce(signal?: AbortSignal): Promise<PassiveEventReplicationResult> };
+  ) => WorkerLike;
 }
 
 export interface PassiveEventReplicationPass {
@@ -72,6 +87,7 @@ export interface PassiveEventReplicationImports {
   readonly projectMap: typeof import("../project-map.js");
   readonly reconciliation: typeof import("../worktree-reconciliation.js");
   readonly identity: typeof import("../machine-identity.js");
+  readonly replication: typeof import("./passive-event-replication.js");
   readonly runtime: typeof import("../storage/postgresql/runtime.js");
   readonly repository: typeof import("../storage/postgresql/passive-event-repository.js");
   readonly outbox: typeof import("../storage/local-hook-outbox.js");
@@ -85,7 +101,7 @@ export function buildReplicationModules(
   return {
     ensureWorktreeProjectReconciled: imported.reconciliation.ensureWorktreeProjectReconciled,
     resolveProjectIdentity: imported.projectMap.resolveProjectIdentity,
-    requireMachineIdentity: imported.identity.requireMachineIdentity,
+    readMachineIdentity: imported.identity.readMachineIdentity,
     eventsDbPath: imported.paths.eventsDbPath,
     createRuntime: settings => new imported.runtime.PostgreSqlRuntime(settings),
     createOutboxFactory: () => new imported.outbox.SQLiteLocalHookOutboxFactory(),
@@ -95,23 +111,26 @@ export function buildReplicationModules(
         projectId,
         machineId,
       ),
+    createWorker: (dependencies, processId) =>
+      new imported.replication.PassiveEventReplicationWorker(dependencies, { processId }),
   };
 }
 
 /** PostgreSQL modules load only on a daemon that actually replicates. */
 export async function loadReplicationModules(): Promise<PassiveEventReplicationModules> {
-  const [projectMap, reconciliation, identity, runtime, repository, outbox, paths] =
+  const [projectMap, reconciliation, identity, replication, runtime, repository, outbox, paths] =
     await Promise.all([
       import("../project-map.js"),
       import("../worktree-reconciliation.js"),
       import("../machine-identity.js"),
+      import("./passive-event-replication.js"),
       import("../storage/postgresql/runtime.js"),
       import("../storage/postgresql/passive-event-repository.js"),
       import("../storage/local-hook-outbox.js"),
       import("../db/events-path.js"),
     ]);
   return buildReplicationModules({
-    projectMap, reconciliation, identity, runtime, repository, outbox, paths,
+    projectMap, reconciliation, identity, replication, runtime, repository, outbox, paths,
   });
 }
 
@@ -124,8 +143,10 @@ export async function loadReplicationModules(): Promise<PassiveEventReplicationM
  * sidecar because replication is inherently per-project: the remote repository
  * is bound to one project id and the local outbox to one events database.
  *
- * Every gate below is a quiet skip. A daemon that cannot replicate must behave
- * exactly as it did before, without opening a PostgreSQL connection.
+ * A daemon that cannot replicate must behave exactly as it did before, without
+ * loading a PostgreSQL module or opening a connection. Gates 1 to 3 are
+ * therefore quiet skips over states an operator has simply not configured;
+ * only gate 4 and an unreadable machine.json report, because those are faults.
  */
 export function createPassiveEventReplicationPass(
   config: DaemonConfig,
@@ -155,7 +176,13 @@ export function createPassiveEventReplicationPass(
         const loaded = await modules;
 
         // Gate 2: a registered machine identity owns the local outbox rows.
-        const machineId = loaded.requireMachineIdentity().machineId;
+        // A machine that was never registered, or whose registration was
+        // interrupted, is unconfigured rather than broken, so it skips as
+        // quietly as an unbound project instead of emitting one diagnostic
+        // per sidecar per sweep forever. A machine.json that exists but
+        // cannot be read still throws out to the reporter below.
+        const identity = loaded.readMachineIdentity();
+        if (identity === null || identity.machineId === null) return null;
 
         // Gate 3: the project must be bound to a remote project id. Reconcile
         // first so a linked worktree resolves to its canonical binding.
@@ -174,16 +201,15 @@ export function createPassiveEventReplicationPass(
         outboxFactory ??= loaded.createOutboxFactory();
         const local = await outboxFactory.open(loaded.eventsDbPath(cwd));
         try {
-          const remote = loaded.createRepository(runtime, remoteProjectId, machineId);
+          const remote = loaded.createRepository(runtime, remoteProjectId, identity.machineId);
           const dependencies: PassiveEventReplicationDependencies = {
             local,
             remote,
             applyEvent: applyReplicatedPassiveEvent,
             onError: report,
           };
-          const worker = options.createWorker === undefined
-            ? new PassiveEventReplicationWorker(dependencies, { processId: options.processId })
-            : options.createWorker(dependencies, options.processId);
+          const createWorker = options.createWorker ?? loaded.createWorker;
+          const worker = createWorker(dependencies, options.processId);
           return await worker.runOnce(signal);
         } finally {
           // The factory registers every repository it opens and only releases

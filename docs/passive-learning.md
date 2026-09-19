@@ -245,17 +245,24 @@ daemon instance id, so fencing follows daemon lifetime and a restarted daemon
 cannot reuse its predecessor's lease. Batch size, lease TTL, retry backoff and
 quarantine thresholds keep their built-in values and are not configurable.
 
-A pass only runs for a project when all of the following hold. Each is a quiet
-skip rather than an error:
+A pass only runs for a project when all of the following hold:
 
 1. the daemon's storage backend is `postgresql`;
 2. a machine identity is registered;
 3. the project is linked to a remote project id; and
 4. PostgreSQL storage reports healthy.
 
-A SQLite-backed daemon fails the first check and never opens a PostgreSQL
-connection, so its behaviour is unchanged. Replication is still not started by
-a hook, and it remains separate from the selected `ProjectStorage` route.
+The first three are quiet skips. A machine that was never registered, or whose
+registration was interrupted, and a project with no remote binding are states
+an operator has simply not configured, so they produce no diagnostic however
+many sweeps pass over them. The fourth skips too but logs the storage failure
+first, as does a `machine.json` that exists and cannot be read, because those
+are faults rather than states.
+
+A SQLite-backed daemon fails the first check before any PostgreSQL module is
+imported, so it never opens a PostgreSQL connection and its behaviour is
+unchanged. Replication is still not started by a hook, and it remains separate
+from the selected `ProjectStorage` route.
 
 Every project is admitted through the same publication check that promotion
 uses, immediately before it replicates. A daemon keeps its startup backend for
@@ -269,13 +276,19 @@ repository closes, so a daemon holds one SQLite connection per project while
 that project is replicating and none between passes.
 
 `lcm status` reports what replication has done under `passiveEvents`: whether
-it is `enabled` at all, the `lastPassAt` timestamp, how many passes and
-projects were attempted, and how many events were uploaded, applied,
-acknowledged, pruned, retried and quarantined. A daemon that has never
-replicated reports `enabled: false` with zero counters, which distinguishes
-"nothing to do" from "never ran". A SQLite daemon reports `enabled: false`
-permanently and records no passes, because replication is not something it can
-ever do. Counts only; no payloads or project paths.
+it is `enabled` at all, the `lastPassAt` timestamp, how many passes have run
+and how many projects those passes replicated, and how many events were
+uploaded, applied, acknowledged, pruned, retried and quarantined. `enabled`
+describes backend capability rather than progress. It is true for any daemon
+that started on PostgreSQL, including one where every project skips because
+the machine is unregistered, nothing is linked to a remote project, or storage
+is unavailable. A SQLite daemon reports `enabled: false` permanently, because
+replication is not something it can ever do. `passes` and `lastPassAt` are
+what separate a daemon that has never replicated from one that has: they stay
+at `0` and `null` until the first sweep and advance on every sweep afterwards,
+whether or not a project was admitted. `projects` counts the projects that got
+past all four checks, so an enabled daemon with passes recorded and no projects
+is skipping rather than idle. Counts only; no payloads or project paths.
 
 The staged operator commands are:
 
