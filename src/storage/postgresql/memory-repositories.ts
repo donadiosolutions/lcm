@@ -8,6 +8,7 @@ import type {
   JsonObject,
   PromotedMemoryRecord,
   PromotedMemoryRepository,
+  PromotedDecisionSerializer,
   RecallRepository,
   RedactionAdminRepository,
   RedactionCounts,
@@ -591,6 +592,48 @@ class RepositoryAccess {
     const execute = state.tail.then(() => callback(executor));
     state.tail = execute.then(() => undefined, () => undefined);
     return execute;
+  }
+}
+
+/** Advisory-lock namespace for promoted-memory deduplication decisions. */
+const PROMOTED_DECISION_NAMESPACE = "promoted-memory-decision";
+
+/**
+ * Serializes one project's promoted-memory deduplication decisions by holding
+ * a transaction-scoped advisory lock until the caller's transaction commits or
+ * rolls back.
+ *
+ * The key is the project alone. It deliberately excludes both the content and
+ * the source project: excluding the source project makes owner-scoped and
+ * source-scoped decisions contend, and excluding the content bounds a
+ * transaction to exactly one lock however many entries it decides. A
+ * content-grained key let one import hold one lock per distinct entry, which
+ * exhausted the shared lock table at roughly 14,900 entries on a stock server,
+ * and let two imports take the same keys in opposite orders and deadlock.
+ * One key per project cannot do either. The lock serializes decisions; it
+ * never changes which candidates a scope considers.
+ */
+export class PostgreSqlPromotedDecisionSerializer
+implements PromotedDecisionSerializer {
+  constructor(
+    private readonly executor: PostgreSqlTransactionScopeExecutor,
+    private readonly projectId: string,
+  ) {}
+
+  async serializeDecision(): Promise<void> {
+    await this.executor.query({
+      text: `SELECT pg_catalog.pg_advisory_xact_lock(
+                      pg_catalog.hashtextextended($1::pg_catalog.text, 0)
+                    )`,
+      values: [derivePostgreSqlAdvisoryLockName(
+        this.projectId,
+        PROMOTED_DECISION_NAMESPACE,
+      )],
+    }, {
+      domain: "promoted-memory",
+      operation: "serializeDecision",
+      projectId: this.projectId,
+    });
   }
 }
 
