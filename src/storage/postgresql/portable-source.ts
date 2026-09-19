@@ -16,6 +16,7 @@ import type {
 import type {
   PostgreSqlConnectionSettings, PostgreSqlQueryExecutor, PostgreSqlRuntimeHealth,
 } from "./contracts.js";
+import type { PostgreSqlSnapshotSession } from "./snapshot-session.js";
 import { PostgreSqlRuntime } from "./runtime.js";
 import { verifyPostgreSqlRuntimeSchema, verifyPostgreSqlTransferSchema } from "./runtime-readiness.js";
 import { PortableTransferError } from "../portable-transfer.js";
@@ -43,6 +44,15 @@ export interface PostgreSqlPortableSourceOptions {
   /** Parent directory for the source-owned bounded disk index. */
   readonly scratchParent?: string;
   readonly signal?: AbortSignal;
+  /**
+   * A borrowed, already-open read-only snapshot session. When present, this
+   * call skips opening an owned runtime and snapshot; the caller already
+   * admitted and opened it (for example, the #624 verification driver's
+   * single fenced census window). `close()` never closes a session it did
+   * not open: the caller retains ownership of a borrowed session, including
+   * on abort and error.
+   */
+  readonly session?: PostgreSqlSnapshotSession;
 }
 
 /** Internal dependency seam; the curated facade exposes only the one-argument opener. */
@@ -59,6 +69,30 @@ const dependencies: PostgreSqlPortableSourceDependencies = {
   normalizePath: normalizeProjectPath,
 };
 const brands = new WeakMap<PortableRecordSource, string>();
+
+/**
+ * The per-domain {recordCount, prefixSha256, terminalIdentity} values the
+ * canonicalisation path in buildSource already derives while indexing. This
+ * additive read-only boundary accessor surfaces exactly that cached data; it
+ * never recomputes a digest or reads from the database.
+ */
+export type PostgreSqlPortableSourceDomainCensus = Readonly<{
+  domain: PortableDomain;
+  recordCount: number;
+  prefixSha256: string;
+  /** The final indexed record's identity digest, or null when the domain has no records. */
+  terminalIdentitySha256: string | null;
+}>;
+const domainCensusAccessors = new WeakMap<PortableRecordSource, (domain: PortableDomain) => PostgreSqlPortableSourceDomainCensus>();
+
+/** Read one domain's already-derived boundary evidence from an open PostgreSQL portable source. */
+export function readPostgreSqlPortableSourceDomainCensus(
+  source: PortableRecordSource, domain: PortableDomain,
+): PostgreSqlPortableSourceDomainCensus {
+  const accessor=domainCensusAccessors.get(source);
+  if (accessor === undefined) throw new PortableStreamError("source-invalid");
+  return accessor(domain);
+}
 
 function abort(signal?: AbortSignal): void {
   if (signal?.aborted) throw new PortableStreamError("aborted");
@@ -143,40 +177,51 @@ export async function createPostgreSqlPortableSource(options: PostgreSqlPortable
   let runtime: SourceRuntime | undefined;
   let session: Snapshot | undefined;
   let index: PortableIndex | undefined;
+  const ownsSession=options.session === undefined;
   try {
     abort(options.signal);
     assertIdentity(options.expectedIdentity);
     const expectedHash=identityHash(options.expectedIdentity);
     const expectedIdentity=structuredClone(options.expectedIdentity);
     const normalizedPath=injected.normalizePath(expectedIdentity.selectedPath!);
-    runtime=injected.createRuntime(options.settings);
-    const health=await runtime.health();
-    if (health.status !== "healthy" || health.tls !== true || health.serverMajorVersion !== 18
-      || health.serverEncoding !== "UTF8") invalid();
-    abort(options.signal);
-    const verify=options.admission === "transfer" ? injected.verifyTransferSchema : injected.verifyRuntimeSchema;
-    if (!verify) invalid();
-    await verify(runtime,{expectedOwner:options.expectedOwner,signal:options.signal});
-    await registeredIdentity(runtime,expectedIdentity,normalizedPath,options.signal);
-    session=await runtime.openReadOnlySnapshot({projectId:expectedIdentity.id,signal:options.signal});
+    if (options.session === undefined) {
+      runtime=injected.createRuntime(options.settings);
+      const health=await runtime.health();
+      if (health.status !== "healthy" || health.tls !== true || health.serverMajorVersion !== 18
+        || health.serverEncoding !== "UTF8") invalid();
+      abort(options.signal);
+      const verify=options.admission === "transfer" ? injected.verifyTransferSchema : injected.verifyRuntimeSchema;
+      if (!verify) invalid();
+      await verify(runtime,{expectedOwner:options.expectedOwner,signal:options.signal});
+      await registeredIdentity(runtime,expectedIdentity,normalizedPath,options.signal);
+      session=await runtime.openReadOnlySnapshot({projectId:expectedIdentity.id,signal:options.signal});
+    } else {
+      // Borrowed: the caller already admitted and opened this session on
+      // its own runtime. No owned runtime is created, so none is closed.
+      session=options.session;
+    }
     if (session.identity.projectId !== expectedIdentity.id) invalid();
     await registeredIdentity(session,expectedIdentity,normalizedPath,options.signal);
     const capturedAt=await snapshotState(session,options.signal);
     const sourceWitnessSha256=await readPostgreSqlPortableWitness(session,expectedIdentity.id,options.signal);
     const sourceIdentitySha256=sha256(canonicalJson(["lcm-postgresql-snapshot-v1",sourceWitnessSha256,session.identity]));
     index=createPortableIndex({scratchParent:options.scratchParent,signal:options.signal});
-    return await buildSource({options, runtime, session,index,expectedHash,expectedIdentity,normalizedPath,
+    return await buildSource({options, runtime, session, ownsSession, index,expectedHash,expectedIdentity,normalizedPath,
       capturedAt,sourceIdentitySha256,sourceWitnessSha256});
   } catch (error) {
     try { index?.close(); } catch { /* Preserve primary sanitized failure. */ }
-    try { await session?.close(); } catch { /* Runtime must still be released. */ }
+    // A borrowed session outlives this call's failure; only a session this
+    // call opened is ever closed here.
+    if (ownsSession) {
+      try { await session?.close(); } catch { /* Runtime must still be released. */ }
+    }
     try { await runtime?.close(); } catch { /* Preserve primary sanitized failure. */ }
     throw safeError(error);
   }
 }
 
 type BuildInput = {
-  options: PostgreSqlPortableSourceOptions; runtime: SourceRuntime; session: Snapshot; index: PortableIndex;
+  options: PostgreSqlPortableSourceOptions; runtime: SourceRuntime | undefined; session: Snapshot; ownsSession: boolean; index: PortableIndex;
   expectedHash: string; expectedIdentity: StorageIdentityContext; normalizedPath: string;
   capturedAt: string; sourceIdentitySha256: string; sourceWitnessSha256: string;
 };
@@ -189,7 +234,7 @@ function initialPrefix(domain: PortableDomain): string {
 }
 
 async function buildSource(input: BuildInput): Promise<PortableRecordSource> {
-  const {options,runtime,session,index,expectedIdentity,expectedHash,normalizedPath}=input;
+  const {options,runtime,session,ownsSession,index,expectedIdentity,expectedHash,normalizedPath}=input;
   const projectIdentity={scope:"shared",projectId:expectedIdentity.id} as const;
   const sessionHash=sha256(canonicalJson(session.identity));
   const counts=new Map<PortableDomain,number>();
@@ -434,14 +479,22 @@ async function buildSource(input: BuildInput): Promise<PortableRecordSource> {
       closePromise=tail.then(async()=> {
         let failed=false;
         try { index.close(); } catch { failed=true; }
-        try { await session.close(); } catch { failed=true; }
-        try { await runtime.close(); } catch { failed=true; }
+        // A borrowed session is retained and closed by its owner; closing
+        // one here would be a defect surfacing only under crash or reuse.
+        if (ownsSession) { try { await session.close(); } catch { failed=true; } }
+        if (runtime !== undefined) { try { await runtime.close(); } catch { failed=true; } }
         if (failed) throw new PortableStreamError("source-unavailable");
       });
       return closePromise;
     },
   });
   brands.set(source,expectedHash);
+  domainCensusAccessors.set(source,(domain)=> {
+    stable();
+    const boundary=cachedBoundary(domain,counts.get(domain)!);
+    return Object.freeze({domain,recordCount:counts.get(domain)!,prefixSha256:boundary.prefix,
+      terminalIdentitySha256:boundary.last?.identitySha256 ?? null});
+  });
   await authenticate(options.signal);
   return source;
 }

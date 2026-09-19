@@ -312,7 +312,13 @@ function initialDomainPrefix(schemaSha256: string, domain: PortableDomain): stri
   return sha256(canonicalJson(["lcm-portable-domain-v1", schemaSha256, domain, 1]));
 }
 
-function aggregateContentSha256(schemaSha256: string, prefixes: readonly string[]): string {
+/**
+ * Exported so callers outside this module (the #624 verification driver's
+ * destination census) can bind their own aggregate to the exact same
+ * digest family the portable manifest uses, rather than inventing a
+ * second, unrelated content-digest family for the same concept.
+ */
+export function aggregateContentSha256(schemaSha256: string, prefixes: readonly string[]): string {
   let digest = sha256(canonicalJson(["lcm-portable-content-v1", schemaSha256]));
   for (const prefix of prefixes) digest = appendLengthPrefixed(digest, Buffer.from(prefix, "hex"));
   return digest;

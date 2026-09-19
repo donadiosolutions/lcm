@@ -35,6 +35,8 @@ import { getMigrationReceiptEpoch } from "../../src/migration/receipts.js";
 import { home, enrollmentFixture, populatedFixture, heldSource, REGISTERED_MACHINE } from "../fixtures/migration-copy.js";
 import { openMigrationCopySource } from "../../src/migration/copy-source.js";
 import { PORTABLE_RECORD_DOMAIN_ORDER } from "../../src/storage/portable-record.js";
+import { inspectAuthenticatedSqliteMigrationSnapshot } from "../../src/migration/queue-evidence.js";
+import { streamSourceCheckpoints } from "../../src/migration/verify-generation.js";
 
 it("opens authenticated local captures under the target identity and retains main instructions", async () => {
   const fixture = await populatedFixture();
@@ -72,6 +74,43 @@ it('binds the original colon generation to legal deterministic target identifier
   const api = await import('../../src/migration/copy-source.js');
   expect(api.migrationCopyTargetGeneration('copy:generation.1')).toMatch(/^migration-generation-[a-f0-9]{64}$/);
   expect(api.migrationCopyTargetGeneration('copy:generation.1')).not.toBe(api.migrationCopyTargetGeneration('copy:generation.2'));
+});
+
+it("leaves the #622 snapshot artifact's byte witness unchanged after a full sampling pass through every domain", async () => {
+  // plan-v4 section 8: "Snapshot byte-witness unchanged after a full
+  // sampling pass." A fake stream cannot prove this -- it would need to
+  // fake not mutating a file it never touched. This opens a real #622
+  // artifact, reads every one of the 22 domains to completion through
+  // the real SQLite-backed stream (the exact function verify-generation's
+  // own step 1 uses), and then independently re-derives the artifact's
+  // identity from disk twice: once through reauthenticate()'s own
+  // machinery (which requires full canonical-JSON equality with the
+  // snapshot captured at open time), and once more directly through
+  // inspectAuthenticatedSqliteMigrationSnapshot, comparing the exact
+  // sourceByteWitnessSha256 field.
+  const fixture = await populatedFixture();
+  const held = await heldSource(fixture);
+  const snapshot = await captureAuthenticatedSqliteMigrationSource(held.authority, held.options);
+  const originalByteWitnessSha256 = snapshot.artifact.sourceByteWitnessSha256;
+  const expectedIdentity = {
+    id: "018f0b5d-1234-7abc-8def-1234567890ac", remoteProjectId: "018f0b5d-1234-7abc-8def-1234567890ac",
+    localProjectId: fixture.local.id, machineId: REGISTERED_MACHINE, selectedPath: fixture.cwd, canonical: fixture.cwd,
+  };
+  const source = await openMigrationCopySource({
+    generationId: snapshot.artifact.generationId, homeDir: fixture.homeDir, expectedIdentity, scratchParent: fixture.homeDir,
+  });
+  try {
+    const streamed = await streamSourceCheckpoints(source.stream);
+    expect(streamed.checkpoints.size).toBe(PORTABLE_RECORD_DOMAIN_ORDER.length);
+    for (const domain of PORTABLE_RECORD_DOMAIN_ORDER) {
+      expect(streamed.checkpoints.get(domain)?.complete).toBe(true);
+    }
+    await expect(source.reauthenticate()).resolves.toBeUndefined();
+    const reInspected = await inspectAuthenticatedSqliteMigrationSnapshot(snapshot.artifact.generationId, fixture.homeDir);
+    expect(reInspected.artifact.sourceByteWitnessSha256).toBe(originalByteWitnessSha256);
+  } finally {
+    await source.stream.close();
+  }
 });
 
 it('refuses arbitrary extra capture facts before source admission', async () => {
