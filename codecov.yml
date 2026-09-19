@@ -307,6 +307,9 @@ component_management:
         # Includes immutable receipt and queue evidence publication.
         # #1231 orders receipt epoch durability before machine identity visibility.
         # #622 seals private artifact modes before the final file sync.
+        # #1321 drops the Node 22 transaction-probe fallback and drives
+        # epoch-adoption refusal through a real transaction, keeping receipts
+        # in this migration owner.
         - "src/migration/"
     - component_id: "unit-local-event-storage"
       name: "Unit - Local Event Storage"
