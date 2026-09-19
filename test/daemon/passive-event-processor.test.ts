@@ -682,7 +682,7 @@ describe("PassiveEventProcessor", () => {
     } as never);
 
     processor.start();
-    expect(processor.backgroundDiagnostics()).toEqual({
+    expect(processor.backgroundDiagnostics()).toMatchObject({
       halted: false,
       haltedReason: null,
       haltedMessage: null,
@@ -694,7 +694,7 @@ describe("PassiveEventProcessor", () => {
     expect(promoteEventsForCwd).toHaveBeenCalledTimes(1);
     expect(deps.safeLogError).toHaveBeenCalledTimes(1);
     expect(deps.safeLogError).toHaveBeenCalledWith("passive-event-processor", mismatch, {});
-    expect(processor.backgroundDiagnostics()).toEqual({
+    expect(processor.backgroundDiagnostics()).toMatchObject({
       halted: true,
       haltedReason: "backend-mismatch",
       haltedMessage: "daemon request backend differs from the authenticated startup backend",
@@ -745,6 +745,103 @@ describe("PassiveEventProcessor", () => {
       rmSync(firstCwd, { recursive: true, force: true });
       rmSync(secondCwd, { recursive: true, force: true });
     }
+  });
+
+  // #1383: the replication worker had no production caller, so markReplicated
+  // and markRemotePruned were unreachable and nothing reported the absence.
+  it("drains each scanned project and reports what replication moved", async () => {
+    const { deps } = timerDeps();
+    const collectEventSidecars = vi.fn<CollectEventSidecars>().mockResolvedValue([
+      sidecar({ cwd: "/bound", path: "/events/bound.db", unprocessed: 0 }),
+      sidecar({ cwd: "/unbound", path: "/events/unbound.db", unprocessed: 0 }),
+      sidecar({ cwd: "/broken", path: "/events/broken.db", scanError: "io" }),
+      sidecar({ cwd: "/budget", path: "/events/budget.db", scanSkipped: true }),
+      sidecar({ cwd: undefined, path: "/events/orphan.db" }),
+    ]);
+    const replicatePassiveEvents = vi.fn(async (cwd: string) => (
+      cwd === "/bound"
+        ? {
+          leaseAcquired: true,
+          uploaded: 4,
+          applied: 3,
+          retried: 1,
+          quarantined: 2,
+          acknowledged: 3,
+          pruned: 5,
+        }
+        : null
+    ));
+    const processor = new PassiveEventProcessor(makeConfig(), PASSIVE_EVENT_PROCESSOR_DEFAULTS, {
+      ...deps,
+      collectEventSidecars,
+      replicatePassiveEvents,
+    } as never);
+
+    await processor.runSweep();
+
+    // Only scannable projects with a cwd are offered to replication.
+    expect(replicatePassiveEvents.mock.calls.map(call => call[0]))
+      .toEqual(["/bound", "/unbound"]);
+    expect(processor.backgroundDiagnostics().replication).toMatchObject({
+      enabled: true,
+      passes: 1,
+      projects: 1,
+      uploaded: 4,
+      applied: 3,
+      acknowledged: 3,
+      pruned: 5,
+      retried: 1,
+      quarantined: 2,
+    });
+    expect(processor.backgroundDiagnostics().replication.lastPassAt).toEqual(expect.any(String));
+  });
+
+  it("reports that replication never ran when the daemon cannot replicate", async () => {
+    const { deps } = timerDeps();
+    const collectEventSidecars = vi.fn<CollectEventSidecars>().mockResolvedValue([
+      sidecar({ cwd: "/project", path: "/events/project.db", unprocessed: 0 }),
+    ]);
+    const processor = new PassiveEventProcessor(makeConfig(), PASSIVE_EVENT_PROCESSOR_DEFAULTS, {
+      ...deps,
+      collectEventSidecars,
+    } as never);
+
+    await processor.runSweep();
+
+    expect(processor.backgroundDiagnostics().replication).toEqual({
+      enabled: false,
+      lastPassAt: null,
+      passes: 0,
+      projects: 0,
+      uploaded: 0,
+      applied: 0,
+      acknowledged: 0,
+      pruned: 0,
+      retried: 0,
+      quarantined: 0,
+    });
+  });
+
+  it("abandons replication when the processor stops mid-pass", async () => {
+    const { deps } = timerDeps();
+    const collectEventSidecars = vi.fn<CollectEventSidecars>().mockResolvedValue([
+      sidecar({ cwd: "/first", path: "/events/first.db", unprocessed: 0 }),
+      sidecar({ cwd: "/second", path: "/events/second.db", unprocessed: 0 }),
+    ]);
+    let processor!: PassiveEventProcessor;
+    const replicatePassiveEvents = vi.fn(async () => {
+      processor.stop();
+      return null;
+    });
+    processor = new PassiveEventProcessor(makeConfig(), PASSIVE_EVENT_PROCESSOR_DEFAULTS, {
+      ...deps,
+      collectEventSidecars,
+      replicatePassiveEvents,
+    } as never);
+
+    await processor.runSweep();
+
+    expect(replicatePassiveEvents).toHaveBeenCalledTimes(1);
   });
 
   it("waits for an in-flight drain before completing shutdown", async () => {

@@ -40,6 +40,7 @@ import {
   type BackgroundPublicationAdmission,
   type PassiveEventBackgroundDiagnostics,
 } from "./passive-event-processor.js";
+import { createPassiveEventReplicationPass } from "./passive-event-replication-pass.js";
 import { createStatsHandler } from "./routes/stats.js";
 import { backendDiagnosticFailure } from "../storage/diagnostics.js";
 import { createPoolStatsHandler } from "./routes/pool-stats.js";
@@ -601,6 +602,12 @@ export async function createDaemon(config: DaemonConfig, options?: DaemonOptions
   const invocationCoordinator = createInvocationCoordinator({
     daemonInstanceId: options?._daemonInstanceId,
   });
+  // #1383: the daemon owns passive-event replication. The lease owner is the
+  // daemon instance id so fencing follows daemon lifetime and a restarted
+  // daemon cannot masquerade as its predecessor's lease holder.
+  const passiveEventReplication = createPassiveEventReplicationPass(config, {
+    processId: `lcm-daemon:${invocationCoordinator.daemonInstanceId}`,
+  });
   const createFactory = options?._createStorageBackendFactory ?? createStorageBackendFactory;
   let storageFactory: StorageBackendFactory;
   try {
@@ -790,6 +797,7 @@ export async function createDaemon(config: DaemonConfig, options?: DaemonOptions
     {
       storageFactory,
       withPublicationAdmission: withBackgroundPublicationAdmission,
+      replicatePassiveEvents: (cwd, signal) => passiveEventReplication.run(cwd, signal),
       signal: shutdownController.signal,
     },
   );
@@ -1142,6 +1150,7 @@ export async function createDaemon(config: DaemonConfig, options?: DaemonOptions
           await settleCleanup(() => activeIngestScan);
           await settleCleanup(() => projectMapWatcher.close());
           await settleCleanup(() => passiveEventProcessor.stopAndWait());
+          await settleCleanup(() => passiveEventReplication.close());
           await settleCleanup(() => { idleTimer = clearIdleTimer(idleTimer, clearIdleTimeout); });
           if (proxyManager) {
             await settleCleanup(() => proxyManager.stop());
@@ -1184,6 +1193,7 @@ export async function createDaemon(config: DaemonConfig, options?: DaemonOptions
       const processor = constructedProcessor;
       await settleCleanup(() => processor.stopAndWait());
     }
+    await settleCleanup(() => passiveEventReplication.close());
     await closeStorageFactoryForTerminalCleanup();
     throw error;
   }

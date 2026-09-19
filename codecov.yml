@@ -160,6 +160,8 @@ component_management:
         # handoff arming also remain daemon-core-owned.
         # #1384 keeps the frozen startup-backend admission discriminator and the
         # halted-sweep health report daemon-core-owned.
+        # #1383 keeps daemon-owned passive-event replication construction and
+        # its shutdown in the daemon-core owner.
         - "^src/daemon/safe-error\\.ts$"
         - "^src/daemon/server\\.ts$"
         - "^src/daemon/summarizer\\.ts$"
@@ -199,6 +201,7 @@ component_management:
         # #1247 keeps local queue preparation, acknowledgement, and cleanup route-owned.
         # #1384 keeps the optional background passive-event status block
         # route-owned.
+        # #1383 keeps the background replication status block route-owned.
         - "src/daemon/routes/"
     - component_id: "unit-daemon-events"
       name: "Unit - Daemon Passive Events"
@@ -207,7 +210,11 @@ component_management:
         # daemon-events-owned.
         # #1384 keeps the frozen-backend sweep halt, its single report, and the
         # shared scheduled-work teardown daemon-events-owned.
+        # #1383 keeps the sweep-driven replication pass, its gates and its
+        # operator counters daemon-events-owned, including the new
+        # passive-event-replication-pass module.
         - "^src/daemon/passive-event-processor\\.ts$"
+        - "^src/daemon/passive-event-replication-pass\\.ts$"
     - component_id: "unit-mcp"
       name: "Unit - MCP"
       paths:

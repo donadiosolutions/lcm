@@ -6,6 +6,7 @@ import { EVENTS_UNPROCESSED_BATCH_LIMIT } from "../hooks/events-db.js";
 import { collectEventSidecars } from "../db/event-sidecars.js";
 import { promoteEventsForCwd, type PromoteResult } from "./routes/promote-events.js";
 import type { StorageBackendFactory } from "../storage/index.js";
+import type { PassiveEventReplicationResult } from "./passive-event-replication.js";
 import {
   BackendPublicationJournalError,
   type BackendPublicationLockToken,
@@ -38,13 +39,38 @@ export interface PassiveEventBackgroundDiagnostics {
   readonly halted: boolean;
   readonly haltedReason: "backend-mismatch" | null;
   readonly haltedMessage: string | null;
+  readonly replication: PassiveEventReplicationDiagnostics;
 }
+
+/**
+ * Operator-visible proof that replication is running (#1383). The worker
+ * previously had no caller and nothing reported its absence, so "never ran"
+ * has to be as legible from outside as "ran at T and moved N events".
+ */
+export interface PassiveEventReplicationDiagnostics {
+  readonly enabled: boolean;
+  readonly lastPassAt: string | null;
+  readonly passes: number;
+  readonly projects: number;
+  readonly uploaded: number;
+  readonly applied: number;
+  readonly acknowledged: number;
+  readonly pruned: number;
+  readonly retried: number;
+  readonly quarantined: number;
+}
+
+export type PassiveEventReplicationPassRunner = (
+  cwd: string,
+  signal?: AbortSignal,
+) => Promise<PassiveEventReplicationResult | null>;
 
 export interface PassiveEventProcessorDeps {
   promoteEventsForCwd?: typeof promoteEventsForCwd;
   storageFactory?: StorageBackendFactory;
   withPublicationAdmission: BackgroundPublicationAdmission;
   collectEventSidecars?: typeof collectEventSidecars;
+  replicatePassiveEvents?: PassiveEventReplicationPassRunner;
   setTimeout?: typeof setTimeout;
   clearTimeout?: typeof clearTimeout;
   setInterval?: typeof setInterval;
@@ -72,6 +98,7 @@ export class PassiveEventProcessor {
   private readonly promoteOneBatch: PromoteOneBatch;
   private readonly withPublicationAdmission: BackgroundPublicationAdmission;
   private readonly scanSidecars: typeof collectEventSidecars;
+  private readonly replicatePassiveEvents?: PassiveEventReplicationPassRunner;
   private readonly setTimer: typeof setTimeout;
   private readonly clearTimer: typeof clearTimeout;
   private readonly setRepeating: typeof setInterval;
@@ -90,6 +117,17 @@ export class PassiveEventProcessor {
   private sweepStartIndex = 0;
   private haltedReason: "backend-mismatch" | null = null;
   private haltedMessage: string | null = null;
+  private readonly replication = {
+    lastPassAt: null as string | null,
+    passes: 0,
+    projects: 0,
+    uploaded: 0,
+    applied: 0,
+    acknowledged: 0,
+    pruned: 0,
+    retried: 0,
+    quarantined: 0,
+  };
   private readonly drainWaiters = new Set<() => void>();
 
   constructor(
@@ -102,6 +140,7 @@ export class PassiveEventProcessor {
       promoteOneBatch(config, cwd, sidecarPath, deps.storageFactory, publicationLockToken, context);
     this.withPublicationAdmission = deps.withPublicationAdmission;
     this.scanSidecars = deps.collectEventSidecars ?? collectEventSidecars;
+    this.replicatePassiveEvents = deps.replicatePassiveEvents;
     this.setTimer = deps.setTimeout ?? setTimeout;
     this.clearTimer = deps.clearTimeout ?? clearTimeout;
     this.setRepeating = deps.setInterval ?? setInterval;
@@ -169,6 +208,10 @@ export class PassiveEventProcessor {
       halted: this.haltedReason !== null,
       haltedReason: this.haltedReason,
       haltedMessage: this.haltedMessage,
+      replication: {
+        enabled: this.replicatePassiveEvents !== undefined,
+        ...this.replication,
+      },
     };
   }
 
@@ -213,8 +256,39 @@ export class PassiveEventProcessor {
           await this.logError("passive-event-processor", error, { cwd: sidecar.cwd });
         }
       }
+      await this.replicateSidecars(sidecars);
     } finally {
       this.finishDrain();
+    }
+  }
+
+  /**
+   * Drain each project's local outbox to the remote inbox (#1383).
+   *
+   * This runs after promotion and independently of it: an event can be
+   * promoted locally yet still be undelivered, and only this pass can advance
+   * a row to the acknowledged-and-remote-pruned state that local retention
+   * requires. Projects without a PostgreSQL binding skip quietly.
+   */
+  private async replicateSidecars(
+    sidecars: readonly Awaited<ReturnType<typeof collectEventSidecars>>[number][],
+  ): Promise<void> {
+    const replicate = this.replicatePassiveEvents;
+    if (replicate === undefined) return;
+    this.replication.passes += 1;
+    this.replication.lastPassAt = new Date().toISOString();
+    for (const sidecar of sidecars) {
+      if (this.stopped || this.haltedReason !== null) return;
+      if (sidecar.scanError || sidecar.scanSkipped || !sidecar.cwd) continue;
+      const result = await replicate(sidecar.cwd, this.backgroundSignal);
+      if (result === null) continue;
+      this.replication.projects += 1;
+      this.replication.uploaded += result.uploaded;
+      this.replication.applied += result.applied;
+      this.replication.acknowledged += result.acknowledged;
+      this.replication.pruned += result.pruned;
+      this.replication.retried += result.retried;
+      this.replication.quarantined += result.quarantined;
     }
   }
 
