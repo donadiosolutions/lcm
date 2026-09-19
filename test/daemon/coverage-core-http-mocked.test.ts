@@ -33,6 +33,14 @@ import {
   daemonJsonRequest,
   isDaemonTransportFailure,
 } from "../../src/daemon/http-url.js";
+import {
+  STORAGE_IDENTITY_REQUIRED_ERROR_CODE,
+  STORAGE_IDENTITY_REQUIRED_MACHINE_REASON,
+  STORAGE_IDENTITY_REQUIRED_UNBOUND_REASON,
+  StorageIdentityConfigurationError,
+  TransportedUnboundProjectError,
+  UNBOUND_POSTGRESQL_PROJECT_MESSAGE,
+} from "../../src/storage/identity-context.js";
 import { createAbortError, isAbortError } from "../../src/daemon/cancellation.js";
 
 describe("mocked daemon HTTP response metadata", () => {
@@ -123,6 +131,54 @@ describe("mocked daemon HTTP response metadata", () => {
   it("uses a structured daemon error", async () => {
     state.status = 400; state.body = '{"error":"structured"}'; state.outcome = "end";
     await expect(daemonJsonRequest(1, "/health", { method: "GET" })).rejects.toThrow("structured");
+  });
+
+  it("rebuilds the typed unbound-project failure for an unbound 409", async () => {
+    state.status = 409;
+    state.body = JSON.stringify({
+      code: STORAGE_IDENTITY_REQUIRED_ERROR_CODE,
+      reason: STORAGE_IDENTITY_REQUIRED_UNBOUND_REASON,
+      error: UNBOUND_POSTGRESQL_PROJECT_MESSAGE,
+      storageBackend: "postgresql",
+    });
+    state.outcome = "end";
+    const error = await daemonJsonRequest(1, "/promote", { method: "POST" }).catch(value => value as unknown);
+    expect(error).toBeInstanceOf(TransportedUnboundProjectError);
+    expect(error).toMatchObject({ message: UNBOUND_POSTGRESQL_PROJECT_MESSAGE, statusCode: 409 });
+    // The transported failure must not trigger promote --all's machine-wide
+    // StorageIdentityConfigurationError rethrow (pinned in
+    // test/bin/lcm-run-cli.test.ts).
+    expect(error).not.toBeInstanceOf(StorageIdentityConfigurationError);
+  });
+
+  it("keeps a machine-identity 409 generic so it is never mistaken for unbound", async () => {
+    state.status = 409;
+    state.body = JSON.stringify({
+      code: STORAGE_IDENTITY_REQUIRED_ERROR_CODE,
+      reason: STORAGE_IDENTITY_REQUIRED_MACHINE_REASON,
+      error: "Machine identity is unavailable. Run `lcm machine show` for recovery guidance.",
+      storageBackend: "postgresql",
+    });
+    state.outcome = "end";
+    const error = await daemonJsonRequest(1, "/promote", { method: "POST" }).catch(value => value as unknown);
+    expect(error).not.toBeInstanceOf(TransportedUnboundProjectError);
+    expect(error).toMatchObject({ statusCode: 409 });
+    expect((error as Error).message).toContain("Machine identity is unavailable");
+  });
+
+  it("keeps a 409 without the identity code or reason generic", async () => {
+    state.status = 409; state.body = '{"error":"conflict"}'; state.outcome = "end";
+    const coded = await daemonJsonRequest(1, "/promote", { method: "POST" }).catch(value => value as unknown);
+    expect(coded).not.toBeInstanceOf(TransportedUnboundProjectError);
+    expect(coded).toMatchObject({ message: "conflict", statusCode: 409 });
+    state.status = 409; state.body = ""; state.outcome = "end";
+    const empty = await daemonJsonRequest(1, "/promote", { method: "POST" }).catch(value => value as unknown);
+    expect(empty).not.toBeInstanceOf(TransportedUnboundProjectError);
+    expect(empty).toMatchObject({ message: "HTTP 409", statusCode: 409 });
+    state.status = 409; state.body = "null"; state.outcome = "end";
+    const nulled = await daemonJsonRequest(1, "/promote", { method: "POST" }).catch(value => value as unknown);
+    expect(nulled).not.toBeInstanceOf(TransportedUnboundProjectError);
+    expect(nulled).toMatchObject({ message: "HTTP 409", statusCode: 409 });
   });
 
   it("rejects a partial JSON response when IncomingMessage aborts", async () => {

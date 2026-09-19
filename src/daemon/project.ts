@@ -24,7 +24,10 @@ import {
 } from "../security-files.js";
 import type { StorageIdentityContext } from "../storage/contracts.js";
 import type { BackendPublicationLockToken } from "../storage/backend-publication.js";
-import { resolveStorageIdentityContext } from "../storage/identity-context.js";
+import {
+  resolveBoundStorageIdentityContext,
+  resolveStorageIdentityContext,
+} from "../storage/identity-context.js";
 import type { ResolvedStorageConfig } from "./config.js";
 import { ensureWorktreeProjectReconciled } from "../worktree-reconciliation.js";
 
@@ -238,7 +241,13 @@ export function projectIdentity(
     _publicationLockToken: publicationLockToken,
   });
   if (!config) return local;
-  const resolved = resolveStorageIdentityContext(config, local, undefined, resolve(cwd));
+  // SQLite accepts any local identity; PostgreSQL requires an explicit
+  // remote binding, refused loudly through resolveBoundStorageIdentityContext
+  // instead of degrading into a permanent unbound refusal. The overloads on
+  // resolveStorageIdentityContext enforce the split at compile time.
+  const resolved = config.backend === "sqlite"
+    ? resolveStorageIdentityContext(config, local, undefined, resolve(cwd))
+    : resolveBoundStorageIdentityContext(config, local, undefined, resolve(cwd));
   const { selectedPath, ...identity } = resolved;
   Object.defineProperty(identity, "selectedPath", {
     configurable: false,

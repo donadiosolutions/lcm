@@ -36,20 +36,22 @@ Aliases of the same selected project are processed once. This does not
 enumerate every project hosted by the PostgreSQL server. With
 `storage.backend` set to `postgresql`, an unbound local project is still
 enumerated rather than aborting the run, and every other selected project
-is still processed. `lcm compact --all` and `lcm export --all` report it
-as that project's own failure and name the `lcm project create` or
-`lcm project link <project-id>` remedy; `lcm promote --all` reports a
-generic per-project failure naming the project path, but not the remedy.
-All three exit with status 1. `lcm import --all` is session-driven rather
+is still processed. `lcm compact --all`, `lcm export --all`, and
+`lcm promote --all` report it as that project's own failure, naming the
+project path and the `lcm project create` or `lcm project link <project-id>`
+remedy, and exit with status 1. `lcm import --all` is session-driven rather
 than project-driven: it fails that project's sessions at ingest, counts
-them in its failed total, and exits 1, but it prints per-session detail
-only under `--verbose` and never names the project; a project with no
-sessions to import is never opened, so nothing is reported for it and the
-command can exit 0. This condition is specific to the PostgreSQL backend;
-SQLite has no binding to check. `lcm import --all --dry-run` contacts no
-project storage, so a clean dry-run never guarantees the following import
-will succeed; this is true of any project it cannot open, not only an
-unbound one.
+them in its failed total, prints one remedy line naming the project, and
+exits 1; per-session detail prints only under `--verbose`. A project with
+no sessions to import is never opened, so nothing is reported for it and
+the command can exit 0. This condition is specific to the PostgreSQL
+backend; SQLite has no binding to check. Under PostgreSQL,
+`lcm import --dry-run` opens each selected project without importing, so the
+preview agrees with a real run: a project that cannot be opened — an unbound
+binding, a missing remote project, or any other open failure — is reported
+as a failure and the command exits 1. Under SQLite a real run creates
+missing project storage on demand, so `--dry-run` stays a discovery preview
+and does not open storage.
 
 `lcm promote --all` processes the canonical paths from those bindings even when
 no local `meta.json` exists. `--verbose` reports each project's counts and
@@ -66,6 +68,10 @@ Unbound-project errors explain how to run `lcm project create` or
 remedies for these known failures are fixed messages; database diagnostics,
 connection strings, and mutable exception text are not printed. Unknown
 failures retain a generic diagnostic and exit with status 1.
+When enumeration succeeds but every selected project fails to open,
+`lcm compact --all` reports "No sessions were compacted because N selected
+projects failed"; "project discovery failed" is reserved for a failed
+enumeration itself.
 
 `lcm export` without `--output` writes only the version-1 promoted-knowledge
 JSON document to stdout. Progress and status messages go to stderr. With

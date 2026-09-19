@@ -3,7 +3,7 @@ import { dirname, join } from "node:path";
 import { tmpdir } from "node:os";
 import { ConfigValidationError, type DaemonConfig } from "../../src/daemon/config.js";
 import { PrivateMutationLockContentionError } from "../../src/private-mutation-lock.js";
-import { StorageIdentityConfigurationError, UNBOUND_POSTGRESQL_PROJECT_MESSAGE } from "../../src/storage/identity-context.js";
+import { StorageIdentityConfigurationError, TransportedUnboundProjectError, UNBOUND_POSTGRESQL_PROJECT_MESSAGE } from "../../src/storage/identity-context.js";
 import { CliProjectStorageMissingError } from "../../src/cli-storage.js";
 import { MachineIdentityFileError } from "../../src/machine-identity.js";
 import { StorageBackendUnavailableError } from "../../src/storage/backend.js";
@@ -1180,6 +1180,49 @@ describe("runCli registration and help dispatch", () => {
     expect((await invoke(["import-knowledge","x"]))?.message).toBe("exit:1");
     expect(error.mock.calls.flat().join(" ")).toContain(UNBOUND_POSTGRESQL_PROJECT_MESSAGE);
     expect([...error.mock.calls,...stderr.mock.calls].flat().join(" ")).not.toContain("SECRET_CANARY");
+  });
+
+  it("reports the static unbound remedy for daemon-transported promote failures", async () => {
+    // Bug #1413: promote --all reached unbound PostgreSQL projects as a
+    // generic per-project failure because the daemon-transported 409 lost
+    // its type. The transported failure keeps the static remedy without
+    // triggering the machine-wide StorageIdentityConfigurationError rethrow.
+    state.cliProjects = [
+      { id: "one", canonical: "/one", aliases: [] },
+      { id: "two", canonical: "/two", aliases: [] },
+    ];
+    state.post
+      .mockRejectedValueOnce(Object.assign(
+        new TransportedUnboundProjectError("SECRET_CANARY postgresql://private SQL"),
+        { statusCode: 409 },
+      ))
+      .mockResolvedValueOnce({ processed: 1, promoted: 1 });
+    const diagnostic = vi.spyOn(console, "error").mockImplementation(() => undefined);
+    expect((await invoke(["promote", "--all"]))?.message).toBe("exit:1");
+    expect(state.post).toHaveBeenCalledTimes(2);
+    expect(state.post).toHaveBeenNthCalledWith(1, "/promote", { cwd: "/one", dry_run: false });
+    expect(state.post).toHaveBeenNthCalledWith(2, "/promote", { cwd: "/two", dry_run: false });
+    const text = diagnostic.mock.calls.flat().join(" ");
+    expect(text).toContain("promote failed for /one");
+    expect(text).toContain(UNBOUND_POSTGRESQL_PROJECT_MESSAGE);
+    expect(text).not.toContain("promotion request failed");
+    expect(text).not.toContain("SECRET_CANARY");
+  });
+
+  it("names the project alongside the remedy for export-all failures", async () => {
+    // Bug #1413 follow-up: export --all named the unbound remedy but not
+    // the affected project directory.
+    state.cliProjects = [
+      { id: "first", canonical: "/first", aliases: [] },
+      { id: "second", canonical: "/second", aliases: [] },
+    ];
+    state.exportError = new StorageIdentityConfigurationError("SECRET_CANARY postgresql://private SQL");
+    const stderr = vi.spyOn(process.stderr, "write").mockReturnValue(true);
+    expect((await invoke(["export", "--all"]))?.message).toBe("exit:1");
+    const text = stderr.mock.calls.flat().join(" ");
+    expect(text).toContain("/first: " + UNBOUND_POSTGRESQL_PROJECT_MESSAGE);
+    expect(text).toContain("/second: " + UNBOUND_POSTGRESQL_PROJECT_MESSAGE);
+    expect(text).not.toContain("SECRET_CANARY");
   });
 
   it("routes executable failures to the supplied top-level handler", async () => {

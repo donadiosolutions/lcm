@@ -9,7 +9,13 @@ import type { DaemonConfig } from "../config.js";
 import { projectIdentity } from "../project.js";
 import type { RouteExecutionContext } from "../server.js";
 import { StorageOperationError } from "../../storage/errors.js";
-import { StorageIdentityConfigurationError } from "../../storage/identity-context.js";
+import {
+  STORAGE_IDENTITY_REQUIRED_ERROR_CODE,
+  STORAGE_IDENTITY_REQUIRED_MACHINE_REASON,
+  STORAGE_IDENTITY_REQUIRED_UNBOUND_REASON,
+  StorageIdentityConfigurationError,
+  type StorageIdentityRequiredReason,
+} from "../../storage/identity-context.js";
 import { MachineIdentityFileError } from "../../machine-identity.js";
 import {
   stagedPostgreSqlUnavailablePayload,
@@ -26,10 +32,16 @@ interface AsyncClosable {
   close(publicationLockToken?: BackendPublicationLockToken): Promise<void> | void;
 }
 
-export const STORAGE_IDENTITY_REQUIRED_ERROR_CODE = "STORAGE_IDENTITY_REQUIRED" as const;
+export {
+  STORAGE_IDENTITY_REQUIRED_ERROR_CODE,
+  STORAGE_IDENTITY_REQUIRED_MACHINE_REASON,
+  STORAGE_IDENTITY_REQUIRED_UNBOUND_REASON,
+  type StorageIdentityRequiredReason,
+} from "../../storage/identity-context.js";
 
 export type StorageIdentityRequiredResponse = {
   readonly code: typeof STORAGE_IDENTITY_REQUIRED_ERROR_CODE;
+  readonly reason: StorageIdentityRequiredReason;
   readonly error: string;
   readonly storageBackend: "postgresql";
 };
@@ -319,19 +331,23 @@ export function stagedPostgreSqlFactoryUnavailableResponse(
 export function storageIdentityRequiredResponse(
   error: unknown,
 ): StorageIdentityRequiredResponse | null {
-  if (
-    !(error instanceof StorageIdentityConfigurationError)
-    && !(error instanceof MachineIdentityFileError)
-  ) {
-    return null;
+  if (error instanceof StorageIdentityConfigurationError) {
+    return {
+      code: STORAGE_IDENTITY_REQUIRED_ERROR_CODE,
+      reason: STORAGE_IDENTITY_REQUIRED_UNBOUND_REASON,
+      error: sanitizeError(error.message),
+      storageBackend: "postgresql",
+    };
   }
-  return {
-    code: STORAGE_IDENTITY_REQUIRED_ERROR_CODE,
-    error: error instanceof MachineIdentityFileError
-      ? "Machine identity is unavailable. Run `lcm machine show` for recovery guidance."
-      : sanitizeError(error.message),
-    storageBackend: "postgresql",
-  };
+  if (error instanceof MachineIdentityFileError) {
+    return {
+      code: STORAGE_IDENTITY_REQUIRED_ERROR_CODE,
+      reason: STORAGE_IDENTITY_REQUIRED_MACHINE_REASON,
+      error: "Machine identity is unavailable. Run `lcm machine show` for recovery guidance.",
+      storageBackend: "postgresql",
+    };
+  }
+  return null;
 }
 
 /**

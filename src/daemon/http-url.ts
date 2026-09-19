@@ -5,6 +5,12 @@ import {
   isAbortError,
   throwIfAborted,
 } from "./cancellation.js";
+import {
+  STORAGE_IDENTITY_REQUIRED_ERROR_CODE,
+  STORAGE_IDENTITY_REQUIRED_UNBOUND_REASON,
+  TransportedUnboundProjectError,
+  UNBOUND_POSTGRESQL_PROJECT_MESSAGE,
+} from "../storage/identity-context.js";
 
 const LOOPBACK_HOSTS = new Set(["127.0.0.1", "localhost", "::1", "[::1]"]);
 
@@ -353,7 +359,33 @@ export async function daemonJsonRequest<T>(
       && typeof (data as { error?: unknown }).error === "string"
       ? (data as { error: string }).error
       : `HTTP ${statusCode}`;
+    const transported = transportedUnboundProjectError(statusCode, data);
+    if (transported !== undefined) throw transported;
     throw Object.assign(new Error(message), { statusCode });
   }
   return data;
+}
+
+/**
+ * Rebuild the typed unbound-project failure when a daemon route reports it
+ * as HTTP 409 with the unbound-project reason.
+ *
+ * Only that reason maps to a typed error. A machine-identity 409 shares the
+ * code but stays generic here, and a 409 without a reason predates the
+ * discriminator and also stays generic, so neither can be mistaken for an
+ * unbound project.
+ */
+function transportedUnboundProjectError(
+  statusCode: number,
+  data: unknown,
+): TransportedUnboundProjectError | undefined {
+  if (statusCode !== 409) return undefined;
+  if (typeof data !== "object" || data === null) return undefined;
+  const body = data as { code?: unknown; reason?: unknown };
+  if (body.code !== STORAGE_IDENTITY_REQUIRED_ERROR_CODE) return undefined;
+  if (body.reason !== STORAGE_IDENTITY_REQUIRED_UNBOUND_REASON) return undefined;
+  return Object.assign(
+    new TransportedUnboundProjectError(UNBOUND_POSTGRESQL_PROJECT_MESSAGE),
+    { statusCode },
+  );
 }
