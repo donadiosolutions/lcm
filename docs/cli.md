@@ -24,8 +24,8 @@ already be linked to a registered remote project and the local machine must
 be registered. A machine-wide identity or publication refusal, or a database
 failure while a project's storage is open, stops the operation; commands
 never fall back to a local SQLite database. An `--all` enumeration is the one
-exception: a single project's missing PostgreSQL binding is reported for that
-project while every other selected project still continues, as described
+exception: a single project's missing PostgreSQL binding no longer aborts
+the run, and every other selected project still continues, as described
 below. Backend selection applies to the configured home and daemon, rather
 than individual projects.
 
@@ -35,13 +35,21 @@ bindings, including bindings that have no SQLite database or `meta.json`.
 Aliases of the same selected project are processed once. This does not
 enumerate every project hosted by the PostgreSQL server. With
 `storage.backend` set to `postgresql`, an unbound local project is still
-enumerated rather than aborting the run: it is reported as that project's own
-failure while every other selected project is still processed.
-`lcm compact --all` and `lcm export --all` name the `lcm project create` or
-`lcm project link <project-id>` remedy for that failure; `lcm promote --all`
-and `lcm import --all` currently report it with their generic per-project
-failure text instead. This condition is specific to the PostgreSQL backend;
-SQLite has no binding to check.
+enumerated rather than aborting the run, and every other selected project
+is still processed. `lcm compact --all` and `lcm export --all` report it
+as that project's own failure and name the `lcm project create` or
+`lcm project link <project-id>` remedy; `lcm promote --all` reports a
+generic per-project failure naming the project path, but not the remedy.
+All three exit with status 1. `lcm import --all` is session-driven rather
+than project-driven: it fails that project's sessions at ingest, counts
+them in its failed total, and exits 1, but it prints per-session detail
+only under `--verbose` and never names the project; a project with no
+sessions to import is never opened, so nothing is reported for it and the
+command can exit 0. This condition is specific to the PostgreSQL backend;
+SQLite has no binding to check. `lcm import --all --dry-run` contacts no
+project storage, so a clean dry-run never guarantees the following import
+will succeed; this is true of any project it cannot open, not only an
+unbound one.
 
 `lcm promote --all` processes the canonical paths from those bindings even when
 no local `meta.json` exists. `--verbose` reports each project's counts and
