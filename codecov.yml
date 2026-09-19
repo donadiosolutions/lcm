@@ -279,6 +279,11 @@ component_management:
         # #1307 adds explicit-only retained append admission for non-append
         # mutation participants in this same storage-abstractions owner.
         - "^src/storage/backend\\.ts$"
+        # #1347 lets held publication admission skip the append tail wait
+        # while still taking the append file lock and phase check here, and
+        # chains an admitted frame behind its unresolved admitted predecessor
+        # so a timed-out intermediate frame cannot release later same-token
+        # frames early.
         - "^src/storage/backend-publication\\.ts$"
         # #910 keeps shared publication retry deadlines monotonic in this owner.
         - "^src/storage/publication-convergence\\.ts$"
@@ -308,6 +313,9 @@ component_management:
         # Includes immutable receipt and queue evidence publication.
         # #1231 orders receipt epoch durability before machine identity visibility.
         # #622 seals private artifact modes before the final file sync.
+        # #1321 drops the Node 22 transaction-probe fallback and drives
+        # epoch-adoption refusal through a real transaction, keeping receipts
+        # in this migration owner.
         - "src/migration/"
     - component_id: "unit-local-event-storage"
       name: "Unit - Local Event Storage"

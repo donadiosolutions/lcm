@@ -517,6 +517,7 @@ describe("configured-home sidecar observation", () => {
   });
 
   it("skips a queued mutating scan cancelled before it opens anything", async () => {
+    vi.useFakeTimers();
     const openSpy = vi.spyOn(SQLiteLocalHookOutboxFactory.prototype, "open");
     const controller = new AbortController();
     let releaseAppend!: () => void;
@@ -536,7 +537,7 @@ describe("configured-home sidecar observation", () => {
     });
     const scanPromise = collectEventSidecars({ homeDir, signal: controller.signal });
     for (let turn = 0; turn < 20; turn += 1) await Promise.resolve();
-    await new Promise<void>(resolve => { setTimeout(resolve, 5); });
+    await vi.advanceTimersByTimeAsync(5);
     controller.abort();
     const result = await scanPromise;
 
@@ -739,4 +740,49 @@ describe("configured-home sidecar observation", () => {
       expect(isLcmConnectionOpen(path)).toBe(false);
     },
   );
+
+  it("scans under a held consumer token while a tokenless append is queued", async () => {
+    let appendEntered = false;
+    let append!: Promise<void>;
+    const summaries = await withBackendPublicationConsumerLockAsync(homeDir, async token => {
+      append = withBackendPublicationAppendBarrierAsync(homeDir, () => {
+        appendEntered = true;
+        const writer = new EventsDb(path);
+        try {
+          writer.insertEvent(
+            "follower-session",
+            { type: "decision", category: "decision", data: "follower", priority: 1 },
+            "PostToolUse",
+          );
+        } finally {
+          writer.close();
+        }
+      }, undefined, { contentionWaitMs: 5_000, retryDelayMs: 25 });
+      await Promise.resolve();
+      const result = await collectEventSidecars({
+        homeDir,
+        publicationLockToken: token,
+        timeoutMs: 300,
+      });
+      expect(appendEntered).toBe(false);
+      return result;
+    });
+
+    expect(summaries).toHaveLength(1);
+    expect(summaries[0]?.scanSkipped).toBeUndefined();
+    expect(summaries[0]).toMatchObject({
+      path,
+      pruned: true,
+      pruneReason: "empty orphan sidecar",
+    });
+
+    await expect(append).resolves.toBeUndefined();
+    expect(appendEntered).toBe(true);
+    const reader = new EventsDb(path);
+    try {
+      expect(reader.getHealthStats()).toMatchObject({ totalEvents: 1, unprocessed: 1 });
+    } finally {
+      reader.close();
+    }
+  });
 });

@@ -625,7 +625,7 @@ describe("Codecov configuration", () => {
     expect(ownershipCounts.size).toBe(243);
   });
 
-  test("keeps response-fence and #681/#700/#701/#703/#705/#709/#710/#713/#756/#726/#734/#737/#742/#760/#763/#804/#805/#824/#825/#833/#888/#864/#866/#722/#786/#952/#814/#882/#930/#969/#989/#1003/#1049/#964/#1106/#1191/#1196/#1229/#1338/#1353/#1354/#1356/#1357/#1358 files in their intended components", () => {
+  test("keeps response-fence and #681/#700/#701/#703/#705/#709/#710/#713/#756/#726/#734/#737/#742/#760/#763/#804/#805/#824/#825/#833/#888/#864/#866/#722/#786/#952/#814/#882/#930/#969/#989/#1003/#1049/#964/#1106/#1191/#1196/#1229/#1321/#1338/#1347/#1353/#1354/#1356/#1357/#1358 files in their intended components", () => {
     const config = readCodecovConfig();
     expect(config).toBeDefined();
     if (config === undefined) {
@@ -802,12 +802,22 @@ describe("Codecov configuration", () => {
       // #1042 consumer descriptor cleanup and typed error classification remain storage-owned.
       // #1307 explicit-only retained append admission for non-append mutation
       // participants stays storage-abstractions-owned.
+      // #1347 lets a caller that already holds publication admission skip the
+      // in-process append tail wait while still taking the append file lock
+      // and the maintenance-phase check, and chains an admitted frame behind
+      // its unresolved admitted predecessor so a timed-out intermediate
+      // frame cannot release later same-token frames early. The change is
+      // confined to this existing file, so it keeps its established owner
+      // and the component topology is unchanged; this pin records that
+      // decision.
       ["src/storage/backend-publication.ts", "unit-storage-abstractions"],
       // #1229 local outbox diagnostic admission stays local-event-storage-owned.
       ["src/storage/local-hook-outbox.ts", "unit-local-event-storage"],
       ["src/storage/local-hook-outbox-schema.ts", "unit-local-event-storage"],
       ["src/migration/manifest-store.ts", "unit-migration-cutover"],
       ["src/migration/maintenance.ts", "unit-migration-cutover"],
+      // #1321 drops the Node 22 transaction-probe fallback from the receipts
+      // module; its cutover receipt logic keeps this owner.
       ["src/migration/receipts.ts", "unit-migration-cutover"],
       ["src/migration/queue-evidence.ts", "unit-migration-cutover"],
       ["src/migration/sqlite-snapshot.ts", "unit-migration-cutover"],
