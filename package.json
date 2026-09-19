@@ -4,7 +4,7 @@
   "description": "Never lose context again. Long Context Manager (LCM) compresses Claude Code sessions into searchable memory — every message preserved, every insight remembered.",
   "type": "module",
   "engines": {
-    "node": ">=25.0.0"
+    "node": ">=25.4.0"
   },
   "main": "dist/src/memory/index.js",
   "exports": {

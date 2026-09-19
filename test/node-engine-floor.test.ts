@@ -73,6 +73,40 @@ function nodePins(): readonly Readonly<{ source: string; version: unknown }>[] {
       })));
 }
 
+// The linux-systemd and macos-launchd jobs in ci.yml validate OS service
+// integration on the latest runtime instead of the declared floor. Every
+// other setup-node pin tracks the floor exactly.
+const LATEST_RUNTIME_PIN_SOURCES = new Set([
+  ".github/workflows/ci.yml#linux-systemd",
+  ".github/workflows/ci.yml#macos-launchd",
+]);
+
+function floorTrackedPins(): readonly Readonly<{ source: string; version: unknown }>[] {
+  const pins: { source: string; version: unknown }[] = [];
+  for (const path of [...yamlFiles(workflowRoot), ...yamlFiles(actionRoot)]) {
+    const document = loadYaml(readFileSync(path, "utf8")) as Workflow & CompositeAction;
+    for (const [jobName, job] of Object.entries(document.jobs ?? {})) {
+      for (const step of job.steps ?? []) {
+        if (step.uses?.startsWith("actions/setup-node@") === true) {
+          pins.push({
+            source: `${path.slice(repositoryRoot.length)}#${jobName}`,
+            version: step.with?.["node-version"],
+          });
+        }
+      }
+    }
+    for (const step of document.runs?.steps ?? []) {
+      if (step.uses?.startsWith("actions/setup-node@") === true) {
+        pins.push({
+          source: `${path.slice(repositoryRoot.length)}#composite`,
+          version: step.with?.["node-version"],
+        });
+      }
+    }
+  }
+  return pins.filter((pin) => !LATEST_RUNTIME_PIN_SOURCES.has(pin.source));
+}
+
 function compositeActionNodeVersion(uses: string): unknown {
   const action = join(repositoryRoot, uses.slice(2));
   const path = [join(action, "action.yml"), join(action, "action.yaml")]
@@ -106,7 +140,7 @@ function coverageGateRuntimes(): readonly unknown[] {
 
 describe("declared Node engine floor", () => {
   it("declares an exact supported minimum runtime", () => {
-    expect(declaredFloor()).toEqual([25, 0, 0]);
+    expect(declaredFloor()).toEqual([25, 4, 0]);
   });
 
   it("pins every workflow runtime to an exact version the package supports", () => {
@@ -123,6 +157,18 @@ describe("declared Node engine floor", () => {
     }
   });
 
+  it("pins every floor-tracked workflow runtime to exactly the declared floor", () => {
+    const floor = declaredFloor();
+    const floorString = floor.join(".");
+    const pins = floorTrackedPins();
+    expect(pins.length).toBeGreaterThan(0);
+    for (const pin of pins) {
+      expect(String(pin.version), `${pin.source} pins node-version ${String(pin.version)}`).toBe(
+        floorString,
+      );
+    }
+  });
+
   it("runs the coverage gate on the declared floor rather than a newer runtime", () => {
     const floor = declaredFloor();
     const runtimes = coverageGateRuntimes();
@@ -134,6 +180,11 @@ describe("declared Node engine floor", () => {
     }
   });
 
+  it.runIf(process.env.CI !== undefined)("runs CI on exactly the declared floor runtime", () => {
+    const floor = declaredFloor();
+    expect(process.version).toBe(`v${floor.join(".")}`);
+  });
+
   it("runs the PostgreSQL conformance runner on a supported runtime", () => {
     const floor = declaredFloor();
     const tag = /^node:(\d+\.\d+\.\d+)-/u.exec(NODE_IMAGE);
@@ -141,4 +192,3 @@ describe("declared Node engine floor", () => {
     expect(compareVersions(parseVersion(tag![1])!, floor) >= 0).toBe(true);
   });
 });
-

@@ -465,7 +465,7 @@ describe("release workflows", () => {
     expect(trustedProvenanceIndex).toBe(2);
     expect(preflightSteps[preflightSetupNodeIndex]).toMatchObject({
       uses: expect.stringMatching(/^actions\/setup-node@[0-9a-f]{40}$/u),
-      with: { "node-version": "25.0.0", "registry-url": "https://registry.npmjs.org/" },
+      with: { "node-version": "25.4.0", "registry-url": "https://registry.npmjs.org/" },
     });
     expect(preflightSetupNodeIndex).toBeLessThan(trustedProvenanceIndex);
     expect(trustedProvenanceIndex).toBeLessThan(preflightTagCheckIndex);
@@ -567,7 +567,7 @@ describe("release workflows", () => {
     expect(recoveryPreflight.steps.indexOf(recoveryHistory!)).toBe(2);
     expect(recoveryPreflight.steps[recoverySetupNodeIndex]).toMatchObject({
       uses: expect.stringMatching(/^actions\/setup-node@[0-9a-f]{40}$/u),
-      with: { "node-version": "25.0.0", "registry-url": "https://registry.npmjs.org/" },
+      with: { "node-version": "25.4.0", "registry-url": "https://registry.npmjs.org/" },
     });
     expect(recoverySetupNodeIndex).toBeLessThan(recoveryPreflight.steps.indexOf(recoveryHistory!));
     expect(recoveryHistory?.with?.script).toMatch(

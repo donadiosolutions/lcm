@@ -20,7 +20,7 @@ import { POSTGRES_IMAGE, POSTGRESQL_HARNESS_IMAGES } from "./postgresql-images.m
 
 export const CI_CACHE_FORMAT = "v1";
 export const NODE_DEPENDENCY_CACHE_FORMAT = "v2";
-export const NODE_VERSION = "25.0.0";
+export const NODE_VERSION = "25.4.0";
 export const POSTGRES_TEMPLATE_DATABASE = "lcm_harness_template";
 export const POSTGRES_TEMPLATE_MARKER = "lcm-postgresql-template-v1";
 export const MAX_CAPTURED_OUTPUT_BYTES = 64 * 1024;

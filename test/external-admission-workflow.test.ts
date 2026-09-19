@@ -900,7 +900,7 @@ describe("external admission workflow", () => {
     const setupNode = job.steps[2];
     expect(setupNode?.if).toBeUndefined();
     expect(setupNode?.uses).toMatch(/^actions\/setup-node@[0-9a-f]{40}$/u);
-    expect(setupNode?.with).toEqual({ "node-version": "25.0.0" });
+    expect(setupNode?.with).toEqual({ "node-version": "25.4.0" });
     expect(job.steps[3]?.if).toBeUndefined();
     expect(evaluatorInvocation).toBe("bash .github/scripts/external-admission.sh");
   });

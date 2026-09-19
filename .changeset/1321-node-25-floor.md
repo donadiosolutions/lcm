@@ -2,7 +2,7 @@
 "@donadiosolutions/lcm": major
 ---
 
-Remove Node.js 22 support and declare Node.js 25.0.0 as the supported runtime.
+Remove Node.js 22 support and declare Node.js 25.4.0 as the supported runtime.
 Installing on Node.js 22 now reports an `EBADENGINE` mismatch, which npm
 enforces as a refusal only when `engine-strict` is enabled and otherwise
 reports as a warning, so the unsupported runtime is stated at install time

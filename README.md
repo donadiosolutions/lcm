@@ -93,7 +93,7 @@ flowchart TD
 
 ### Prerequisites
 
-- Node.js 25.0.0 or newer
+- Node.js 25.4.0 or newer
 - For hook based automation, one of:
   - Claude Code (native hooks)
   - Codex CLI/VSCode integration/app (native hooks)

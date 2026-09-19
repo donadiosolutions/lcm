@@ -78,7 +78,7 @@ jobs:
       - name: Setup Node
         uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
         with:
-          node-version: "25.0.0"
+          node-version: "25.4.0"
 
       - name: Validate release tag
         id: release
@@ -354,7 +354,7 @@ jobs:
       - name: Setup Node
         uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
         with:
-          node-version: "25.0.0"
+          node-version: "25.4.0"
           registry-url: https://registry.npmjs.org/
 
       - name: Validate trusted release provenance
@@ -549,7 +549,7 @@ jobs:
             }
           }
 
-          assertAtLeast('Node', process.version, '25.0.0');
+          assertAtLeast('Node', process.version, '25.4.0');
           assertAtLeast('npm', cp.execFileSync('npm', ['--version'], { encoding: 'utf8' }).trim(), '11.5.1');
           NODE
 
@@ -606,7 +606,7 @@ jobs:
       - name: Setup Node
         uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
         with:
-          node-version: "25.0.0"
+          node-version: "25.4.0"
           registry-url: https://registry.npmjs.org/
 
       - name: Download verified npm artifact
@@ -720,7 +720,7 @@ jobs:
       - name: Setup Node
         uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
         with:
-          node-version: "25.0.0"
+          node-version: "25.4.0"
           registry-url: https://registry.npmjs.org/
 
       - name: Verify recovery request and immutable release tag
@@ -898,7 +898,7 @@ jobs:
               }
             }
           }
-          assertAtLeast('Node', process.version, '25.0.0');
+          assertAtLeast('Node', process.version, '25.4.0');
           assertAtLeast('npm', cp.execFileSync('npm', ['--version'], { encoding: 'utf8' }).trim(), '11.5.1');
           NODE
 
@@ -966,7 +966,7 @@ jobs:
       - name: Setup Node
         uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
         with:
-          node-version: "25.0.0"
+          node-version: "25.4.0"
           registry-url: https://registry.npmjs.org/
 
       - name: Revalidate signed release tag

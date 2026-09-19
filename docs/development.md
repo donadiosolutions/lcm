@@ -1,7 +1,7 @@
 # Developing LCM
 
 LCM development uses pnpm for dependency installation and scripts. Node.js
-25.0.0 or newer remains the runtime. npm remains responsible for consumer
+25.4.0 or newer remains the runtime. npm remains responsible for consumer
 installation, tarball creation, registry checks, and publication.
 
 ## Bootstrap the verified package manager
