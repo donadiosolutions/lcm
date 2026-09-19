@@ -2,9 +2,11 @@
 "@donadiosolutions/lcm": patch
 ---
 
-Serialize the PostgreSQL promoted-content deduplication decision for knowledge
+Serialize PostgreSQL promoted-memory deduplication decisions for knowledge
 import, so two concurrent imports of the same new content can no longer each
 observe an empty candidate set and both insert a separate active memory.
+Imports into one project now take turns rather than running side by side;
+imports into different projects are unaffected.
 
 Compaction-driven promotion is not covered. It deduplicates through
 source-scoped lexical search without the exact-content lookup, so content that

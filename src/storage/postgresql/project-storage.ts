@@ -28,7 +28,7 @@ import {
 } from "./lexical-search-repository.js";
 import {
   PostgreSqlCoordinationRepository,
-  PostgreSqlPromotedContentSerializer,
+  PostgreSqlPromotedDecisionSerializer,
   PostgreSqlPromotedMemoryRepository,
   PostgreSqlRecallRepository,
   PostgreSqlRedactionAdminRepository,
@@ -388,7 +388,7 @@ export class PostgreSqlProjectStorage implements ProjectStorage {
       );
       const transactionRepositories: TransactionRepositories = {
         ...repositories,
-        promotedContentSerializer: new PostgreSqlPromotedContentSerializer(
+        promotedDecisionSerializer: new PostgreSqlPromotedDecisionSerializer(
           scoped,
           this.projectId,
         ),

@@ -143,14 +143,14 @@ export async function deduplicateAndInsertInRepositories(
   repositories: TransactionRepositories,
   input: DedupInsertInput,
 ): Promise<string> {
-  // Hold this content's decision for the rest of the caller's transaction
+  // Hold this project's decisions for the rest of the caller's transaction
   // before reading candidates. Without it two concurrent transactions each
   // read an empty candidate set, each take the insert branch below, and both
-  // commit a separate active memory for identical content. Backends whose
-  // root transactions already run on one connection supply no serializer.
-  await repositories.promotedContentSerializer?.serializeContentDecision(
-    input.content,
-  );
+  // commit a separate active memory for identical content. The grain is the
+  // project, so a transaction holds one lock however many entries it decides.
+  // Backends whose root transactions already run on one connection supply no
+  // serializer.
+  await repositories.promotedDecisionSerializer?.serializeDecision();
   const candidateSourceProjectId = input.candidateScope === "owner"
     && input.backend === "postgresql"
     ? undefined

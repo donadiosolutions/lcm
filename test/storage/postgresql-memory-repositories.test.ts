@@ -11,7 +11,7 @@ import {
   type PostgreSqlMemoryExecutor,
   type PostgreSqlMemoryScopedExecutor,
   PostgreSqlPromotedMemoryRepository,
-  PostgreSqlPromotedContentSerializer,
+  PostgreSqlPromotedDecisionSerializer,
   PostgreSqlRecallRepository,
   PostgreSqlRedactionAdminRepository,
 } from "../../src/storage/postgresql/memory-repositories.js";
@@ -1369,12 +1369,12 @@ describe("PostgreSQL memory repositories", () => {
 });
 
 
-describe("PostgreSQL promoted-content serializer", () => {
-  it("takes one transaction-scoped advisory lock per project and content", async () => {
+describe("PostgreSQL promoted-memory decision serializer", () => {
+  it("takes one transaction-scoped advisory lock keyed on the project", async () => {
     const scoped = scopedExecutor(() => result([{ pg_advisory_xact_lock: "" }]));
-    const serializer = new PostgreSqlPromotedContentSerializer(scoped, projectId);
+    const serializer = new PostgreSqlPromotedDecisionSerializer(scoped, projectId);
 
-    await serializer.serializeContentDecision("durable content");
+    await serializer.serializeDecision();
 
     expect(scoped.query).toHaveBeenCalledTimes(1);
     const [config, options] = scoped.query.mock.calls[0] as [
@@ -1385,38 +1385,31 @@ describe("PostgreSQL promoted-content serializer", () => {
     expect(config.text).toContain("pg_catalog.hashtextextended");
     expect(options).toEqual({
       domain: "promoted-memory",
-      operation: "serializeContentDecision",
+      operation: "serializeDecision",
       projectId,
     });
-    expect(config.values).toEqual([
-      `${projectId}:promoted-content-dedup:${
-        createHash("sha256").update("durable content", "utf8").digest("hex")
-      }`,
-    ]);
+    expect(config.values).toEqual([`${projectId}:promoted-memory-decision`]);
   });
 
-  it("separates distinct content and separates projects holding identical content", async () => {
+  it("uses one key per project and the same key for every decision in it", async () => {
     const keys: unknown[] = [];
-    const capture = () => {
-      const scoped = scopedExecutor((config) => {
-        keys.push(config.values?.[0]);
-        return result([{ pg_advisory_xact_lock: "" }]);
-      });
-      return scoped;
-    };
+    const capture = () => scopedExecutor((config) => {
+      keys.push(config.values?.[0]);
+      return result([{ pg_advisory_xact_lock: "" }]);
+    });
     const otherProjectId = "018f22c4-6d2a-7f10-8a4c-6b8d3e5f9021";
 
-    await new PostgreSqlPromotedContentSerializer(capture(), projectId)
-      .serializeContentDecision("first");
-    await new PostgreSqlPromotedContentSerializer(capture(), projectId)
-      .serializeContentDecision("second");
-    await new PostgreSqlPromotedContentSerializer(capture(), projectId)
-      .serializeContentDecision("first");
-    await new PostgreSqlPromotedContentSerializer(capture(), otherProjectId)
-      .serializeContentDecision("first");
+    const shared = capture();
+    const serializer = new PostgreSqlPromotedDecisionSerializer(shared, projectId);
+    await serializer.serializeDecision();
+    await serializer.serializeDecision();
+    await new PostgreSqlPromotedDecisionSerializer(capture(), otherProjectId)
+      .serializeDecision();
 
-    expect(keys[0]).not.toBe(keys[1]);
-    expect(keys[0]).toBe(keys[2]);
-    expect(keys[0]).not.toBe(keys[3]);
+    // Repeated decisions in one project reuse one key, so a transaction holds
+    // one advisory lock however many entries it decides.
+    expect(keys[0]).toBe(keys[1]);
+    expect(keys[0]).not.toBe(keys[2]);
+    expect(keys).toHaveLength(3);
   });
 });

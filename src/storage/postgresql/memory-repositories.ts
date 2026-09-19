@@ -8,7 +8,7 @@ import type {
   JsonObject,
   PromotedMemoryRecord,
   PromotedMemoryRepository,
-  PromotedContentSerializer,
+  PromotedDecisionSerializer,
   RecallRepository,
   RedactionAdminRepository,
   RedactionCounts,
@@ -595,39 +595,43 @@ class RepositoryAccess {
   }
 }
 
-/** Advisory-lock namespace for the promoted-content deduplication decision. */
-const PROMOTED_CONTENT_DEDUP_NAMESPACE = "promoted-content-dedup";
+/** Advisory-lock namespace for promoted-memory deduplication decisions. */
+const PROMOTED_DECISION_NAMESPACE = "promoted-memory-decision";
 
 /**
- * Serializes deduplication of one exact promoted content within one project
- * by holding a transaction-scoped advisory lock until the caller's
- * transaction commits or rolls back.
+ * Serializes one project's promoted-memory deduplication decisions by holding
+ * a transaction-scoped advisory lock until the caller's transaction commits or
+ * rolls back.
  *
- * The key deliberately covers only the project and the content, not the
- * source project, so that owner-scoped and source-scoped deduplication of the
- * same content contend with each other. The lock serializes the decision; it
+ * The key is the project alone. It deliberately excludes both the content and
+ * the source project: excluding the source project makes owner-scoped and
+ * source-scoped decisions contend, and excluding the content bounds a
+ * transaction to exactly one lock however many entries it decides. A
+ * content-grained key let one import hold one lock per distinct entry, which
+ * exhausted the shared lock table at roughly 14,900 entries on a stock server,
+ * and let two imports take the same keys in opposite orders and deadlock.
+ * One key per project cannot do either. The lock serializes decisions; it
  * never changes which candidates a scope considers.
  */
-export class PostgreSqlPromotedContentSerializer
-implements PromotedContentSerializer {
+export class PostgreSqlPromotedDecisionSerializer
+implements PromotedDecisionSerializer {
   constructor(
     private readonly executor: PostgreSqlTransactionScopeExecutor,
     private readonly projectId: string,
   ) {}
 
-  async serializeContentDecision(content: string): Promise<void> {
+  async serializeDecision(): Promise<void> {
     await this.executor.query({
       text: `SELECT pg_catalog.pg_advisory_xact_lock(
                       pg_catalog.hashtextextended($1::pg_catalog.text, 0)
                     )`,
       values: [derivePostgreSqlAdvisoryLockName(
         this.projectId,
-        PROMOTED_CONTENT_DEDUP_NAMESPACE,
-        content,
+        PROMOTED_DECISION_NAMESPACE,
       )],
     }, {
       domain: "promoted-memory",
-      operation: "serializeContentDecision",
+      operation: "serializeDecision",
       projectId: this.projectId,
     });
   }

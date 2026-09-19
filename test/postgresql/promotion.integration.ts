@@ -660,4 +660,74 @@ describe("PostgreSQL concurrent promoted-content deduplication", { timeout: 120_
       }
     });
   });
+
+  it("holds one advisory lock however many entries a transaction decides", async () => {
+    await withPostgreSqlTestDatabase("promotion-bounded-locks", async (database) => {
+      await grantRuntime(database);
+      const projectId = await createProject(database, "bounded lock owner");
+      const machineId = "018f22c4-6d2a-7f10-8a4c-6b8d3e5f9012";
+      const runtime = new PostgreSqlRuntime(settings(database.runtimeUrl));
+      const storage = new PostgreSqlProjectStorage(
+        runtime,
+        projectId,
+        machineId,
+        () => undefined,
+      );
+      const advisoryLocksHeld = async (): Promise<number> => {
+        const held = await database.migrator.query<{ held: number }>({
+          text: `SELECT count(*)::pg_catalog.int4 AS held
+                 FROM pg_catalog.pg_locks
+                 WHERE locktype OPERATOR(pg_catalog.=) 'advisory'
+                   AND granted
+                   AND database OPERATOR(pg_catalog.=) (
+                     SELECT oid FROM pg_catalog.pg_database
+                     WHERE datname OPERATOR(pg_catalog.=) pg_catalog.current_database()
+                   )`,
+        }, { domain: "promoted-memory", operation: "countHeldAdvisoryLocks" });
+        return held.rows[0].held;
+      };
+
+      try {
+        // A content-grained key would hold one lock per distinct entry here,
+        // which is what exhausted the shared lock table on a large import.
+        // Two locks are expected throughout: the shared publication guard
+        // this transaction already takes, plus one decision lock for the
+        // project. The count after twenty-five entries must equal the count
+        // after the first, because neither grows with the number decided.
+        let afterFirstEntry = 0;
+        const afterAllEntries = await storage.transaction(async (repositories) => {
+          for (let entry = 0; entry < 25; entry++) {
+            await deduplicateAndInsertInRepositories(repositories, {
+              content: `bounded lock probe entry ${entry}`,
+              tags: [],
+              sourceProjectId: "a".repeat(64),
+              candidateScope: "owner" as const,
+              backend: "postgresql" as const,
+              depth: 0,
+              confidence: 0.9,
+              thresholds: { dedupBm25Threshold: 0.5, dedupCandidateLimit: 10 },
+            });
+            if (entry === 0) afterFirstEntry = await advisoryLocksHeld();
+          }
+          return await advisoryLocksHeld();
+        });
+        expect({ afterFirstEntry, afterAllEntries }).toEqual({
+          afterFirstEntry: 2,
+          afterAllEntries: 2,
+        });
+        await expect(advisoryLocksHeld()).resolves.toBe(0);
+
+        const stored = await database.migrator.query<{ stored: number }>({
+          text: `SELECT count(*)::pg_catalog.int4 AS stored
+                 FROM lcm.promoted_memories
+                 WHERE project_id = $1 AND archived_at IS NULL`,
+          values: [projectId],
+        }, { domain: "promoted-memory", operation: "countBoundedLockRows" });
+        expect(stored.rows[0].stored).toBe(25);
+      } finally {
+        await storage.close();
+        await runtime.close();
+      }
+    });
+  });
 });

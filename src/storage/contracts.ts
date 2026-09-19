@@ -327,8 +327,8 @@ export interface PromotedMemoryRepository {
 }
 
 /**
- * Serializes one project's lookup-and-insert deduplication decision for exact
- * promoted content until the caller's transaction ends.
+ * Serializes one project's promoted-memory deduplication decisions until the
+ * caller's transaction ends.
  *
  * Deduplication reads the existing candidates and then inserts when it finds
  * none. Under READ COMMITTED neither of two concurrent transactions can see
@@ -336,9 +336,15 @@ export interface PromotedMemoryRepository {
  * commit. Holding this serializer for the duration of the deciding
  * transaction makes the second transaction wait, so its candidate read runs
  * at a snapshot that already contains the first transaction's committed row.
+ *
+ * The grain is the project rather than the content. A finer key would let
+ * one transaction accumulate one lock per distinct content and exhaust the
+ * shared lock table on a large import, and would let two transactions take
+ * the same keys in opposite orders and deadlock. One key per project costs
+ * concurrency between unrelated contents and removes both failures.
  */
-export interface PromotedContentSerializer {
-  serializeContentDecision(content: string): Promise<void>;
+export interface PromotedDecisionSerializer {
+  serializeDecision(): Promise<void>;
 }
 
 export interface RecallRepository {
@@ -448,10 +454,10 @@ export type TransactionRepositories = ProjectRepositories & Readonly<{
   /** SQLite-private exactly-once evidence; never a canonical transfer domain. */
   migrationReceipt?: MigrationReceiptRepository;
   /**
-   * Serializes the promoted-content deduplication decision. Present only on
+   * Serializes promoted-memory deduplication decisions. Present only on
    * backends that run concurrent root transactions on separate connections.
    */
-  promotedContentSerializer?: PromotedContentSerializer;
+  promotedDecisionSerializer?: PromotedDecisionSerializer;
 }>;
 
 export interface ProjectStorage extends ProjectRepositories {
