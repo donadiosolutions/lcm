@@ -5,9 +5,11 @@ import { join } from "node:path";
 import {
   admitManagedDaemonPeer,
   findListeningTcpPorts,
+  parseDarwinProcessSnapshot,
   parseProcessCommandLine,
   readPlatformProcessArguments,
   readPlatformProcessCommand,
+  readPlatformProcessExecutable,
   readPlatformProcessOwnerIdentity,
   readPlatformProcessOwnerUid,
 } from "../../src/daemon/peer-admission.js";
@@ -43,6 +45,16 @@ describe("managed daemon peer admission", () => {
       readProcessOwnerIdentity: vi.fn(() => "S-1-5-21-1000"),
       findListeningTcpPorts: vi.fn(() => [3737]),
     };
+  }
+
+  function darwinSnapshot(executable: string, args: readonly string[]): Buffer {
+    const count = Buffer.alloc(4);
+    count.writeInt32LE(args.length);
+    return Buffer.concat([
+      count,
+      Buffer.from(`${executable}\0\0`),
+      Buffer.from(`${args.join("\0")}\0`),
+    ]);
   }
 
   it.each(["linux", "darwin", "win32"] as const)(
@@ -390,18 +402,26 @@ describe("managed daemon peer admission", () => {
   });
 
   it("reads lossless Darwin procargs and a bounded Windows owner SID", () => {
-    const darwinPayload = Buffer.concat([
-      Buffer.from(Uint32Array.of(4).buffer),
-      Buffer.from("/usr/bin/node\0\0"),
-      Buffer.from("/usr/bin/node\0/opt/LCM App/lcm.mjs\0daemon\0start\0"),
+    const darwinPayload = darwinSnapshot("/usr/bin/node", [
+      "/usr/bin/node",
+      "/opt/LCM App/lcm.mjs",
+      "daemon",
+      "start",
     ]);
-    const darwin = vi.fn(() => ({ status: 0, stdout: darwinPayload }));
+    const darwin = vi.fn((command: string) => {
+      if (command === "/usr/sbin/lsof") {
+        return { status: 0, stdout: "n/usr/bin/node\nn/usr/lib/dyld\nn/usr/lib/libSystem.B.dylib\n" };
+      }
+      return { status: 0, stdout: darwinPayload };
+    });
     expect(readPlatformProcessArguments(42, "darwin", darwin as never)).toEqual([
       "/usr/bin/node",
       "/opt/LCM App/lcm.mjs",
       "daemon",
       "start",
     ]);
+    expect(readPlatformProcessExecutable(42, "darwin", darwin as never)).toBe("/usr/bin/node");
+    expect(darwin.mock.calls.every(([command]) => command !== "/usr/sbin/lsof")).toBe(true);
     expect(darwin).toHaveBeenCalledWith(
       "/usr/sbin/sysctl",
       ["-b", "kern.procargs2.42"],
@@ -416,5 +436,51 @@ describe("managed daemon peer admission", () => {
       "/proc",
       "C:\\Windows\\System32\\WindowsPowerShell\\v1.0\\powershell.exe",
     )).toBe("S-1-5-21-1000");
+  });
+
+  it("fails closed for malformed or oversized Darwin process snapshots", () => {
+    expect(parseDarwinProcessSnapshot(Buffer.alloc(4))).toBeNull();
+    const zeroArguments = darwinSnapshot("/usr/bin/node", []);
+    expect(parseDarwinProcessSnapshot(zeroArguments)).toBeNull();
+    const truncated = Buffer.concat([Buffer.from([2, 0, 0, 0]), Buffer.from("/usr/bin/node\0\0node\0")]);
+    expect(parseDarwinProcessSnapshot(truncated)).toBeNull();
+    expect(parseDarwinProcessSnapshot(Buffer.alloc(64 * 1_024 + 1))).toBeNull();
+    const relativeExecutable = darwinSnapshot("node", ["node"]);
+    expect(parseDarwinProcessSnapshot(relativeExecutable)).toBeNull();
+  });
+
+  it("covers direct Windows executable and owner inspection branches", () => {
+    const powershell = "C:\\Windows\\System32\\WindowsPowerShell\\v1.0\\powershell.exe";
+    const success = vi.fn((_command: string, args: readonly string[]) => ({
+      status: 0,
+      stdout: String(args.at(-1)).includes("ExecutablePath")
+        ? "C:\\Program Files\\nodejs\\node.exe"
+        : "S-1-5-21-1000",
+    }));
+    expect(readPlatformProcessExecutable(42, "win32", success as never, "/proc", powershell))
+      .toBe("C:\\Program Files\\nodejs\\node.exe");
+    const commandLine = vi.fn(() => ({
+      status: 0,
+      stdout: '"C:\\Program Files\\nodejs\\node.exe" "C:\\LCM App\\lcm.mjs" daemon start',
+    }));
+    expect(readPlatformProcessArguments(42, "win32", commandLine as never, "/proc", powershell)).toEqual([
+      "C:\\Program Files\\nodejs\\node.exe",
+      "C:\\LCM App\\lcm.mjs",
+      "daemon",
+      "start",
+    ]);
+    expect(readPlatformProcessOwnerIdentity(42, "win32", success as never, "/proc", powershell))
+      .toBe("S-1-5-21-1000");
+    expect(readPlatformProcessExecutable(42, "win32", vi.fn(() => ({ status: 1, stdout: "" })) as never, "/proc", powershell))
+      .toBeNull();
+    expect(readPlatformProcessOwnerIdentity(42, "win32", vi.fn(() => ({ status: 0, stdout: "not-a-sid" })) as never, "/proc", powershell))
+      .toBeNull();
+    expect(readPlatformProcessExecutable(42, "win32", success as never, "/proc", null)).toBeNull();
+    expect(readPlatformProcessExecutable(42, "win32", vi.fn(() => { throw new Error("CIM failed"); }) as never, "/proc", powershell))
+      .toBeNull();
+    expect(readPlatformProcessOwnerIdentity(42, "win32", vi.fn(() => { throw new Error("owner failed"); }) as never, "/proc", powershell))
+      .toBeNull();
+    expect(readPlatformProcessArguments(42, "win32", vi.fn(() => ({ status: 0, stdout: "" })) as never, "/proc", powershell))
+      .toBeNull();
   });
 });

@@ -271,6 +271,53 @@ export function parseProcessCommandLine(
   return args.length > 0 ? args : null;
 }
 
+export type DarwinProcessSnapshot = Readonly<{
+  executable: string;
+  arguments: readonly string[];
+}>;
+
+export function parseDarwinProcessSnapshot(buffer: Buffer): DarwinProcessSnapshot | null {
+  if (buffer.length < 5 || buffer.length > 64 * 1_024) return null;
+  const argumentCount = buffer.readInt32LE(0);
+  if (!Number.isInteger(argumentCount) || argumentCount < 1 || argumentCount > 1_024) return null;
+  const executableEnd = buffer.indexOf(0, 4);
+  if (executableEnd <= 4) return null;
+  const executable = buffer.subarray(4, executableEnd).toString("utf8");
+  if (!executable.startsWith("/") || executable.includes("\uFFFD")) return null;
+  let offset = executableEnd + 1;
+  while (offset < buffer.length && buffer[offset] === 0) offset++;
+  const args: string[] = [];
+  while (offset < buffer.length && args.length < argumentCount) {
+    const end = buffer.indexOf(0, offset);
+    if (end < offset) return null;
+    const argument = buffer.subarray(offset, end).toString("utf8");
+    if (argument.includes("\uFFFD")) return null;
+    args.push(argument);
+    offset = end + 1;
+  }
+  return args.length === argumentCount ? { executable, arguments: args } : null;
+}
+
+function readDarwinProcessSnapshot(
+  pid: number,
+  spawnSyncImpl: typeof spawnSync,
+): DarwinProcessSnapshot | null {
+  try {
+    const result = spawnSyncImpl("/usr/sbin/sysctl", ["-b", `kern.procargs2.${String(pid)}`], {
+      encoding: "buffer",
+      timeout: 1_000,
+      maxBuffer: 64 * 1_024,
+      shell: false,
+      windowsHide: true,
+    });
+    return result.status === 0 && Buffer.isBuffer(result.stdout)
+      ? parseDarwinProcessSnapshot(result.stdout)
+      : null;
+  } catch {
+    return null;
+  }
+}
+
 export function readPlatformProcessArguments(
   pid: number,
   platform: NodeJS.Platform,
@@ -289,33 +336,8 @@ export function readPlatformProcessArguments(
     }
   }
   if (platform === "darwin") {
-    try {
-      const result = spawnSyncImpl("/usr/sbin/sysctl", ["-b", `kern.procargs2.${String(pid)}`], {
-        encoding: "buffer",
-        timeout: 1_000,
-        maxBuffer: 64 * 1_024,
-        shell: false,
-        windowsHide: true,
-      });
-      if (result.status !== 0 || !Buffer.isBuffer(result.stdout) || result.stdout.length < 5) return null;
-      const argumentCount = result.stdout.readInt32LE(0);
-      if (!Number.isInteger(argumentCount) || argumentCount < 1 || argumentCount > 1_024) return null;
-      let offset = 4;
-      while (offset < result.stdout.length && result.stdout[offset] !== 0) offset++;
-      while (offset < result.stdout.length && result.stdout[offset] === 0) offset++;
-      const args: string[] = [];
-      while (offset < result.stdout.length && args.length < argumentCount) {
-        const end = result.stdout.indexOf(0, offset);
-        if (end < 0) return null;
-        args.push(result.stdout.subarray(offset, end).toString("utf8"));
-        offset = end + 1;
-      }
-      return args.length === argumentCount && args.every((argument) => !argument.includes("\u0000"))
-        ? args
-        : null;
-    } catch {
-      return null;
-    }
+    const snapshot = readDarwinProcessSnapshot(pid, spawnSyncImpl);
+    return snapshot === null ? null : [...snapshot.arguments];
   }
   const command = readPlatformProcessCommand(
     pid,
@@ -376,15 +398,12 @@ export function readPlatformProcessExecutable(
       return null;
     }
   }
-  const command = platform === "darwin"
-    ? "/usr/sbin/lsof"
-    : platform === "win32"
-      ? windowsPowerShellPath
-      : null;
+  if (platform === "darwin") {
+    return readDarwinProcessSnapshot(pid, spawnSyncImpl)?.executable ?? null;
+  }
+  const command = platform === "win32" ? windowsPowerShellPath : null;
   if (command === null) return null;
-  const args = platform === "darwin"
-    ? ["-nP", "-a", "-p", String(pid), "-d", "txt", "-Fn"]
-    : [
+  const args = [
         "-NoLogo",
         "-NoProfile",
         "-NonInteractive",
@@ -400,11 +419,7 @@ export function readPlatformProcessExecutable(
       windowsHide: true,
     });
     if (result.status !== 0 || typeof result.stdout !== "string") return null;
-    if (platform === "win32") return result.stdout.trim() || null;
-    const executables = result.stdout.split(/\r?\n/u)
-      .filter((line) => line.startsWith("n/"))
-      .map((line) => line.slice(1));
-    return executables.length === 1 ? executables[0]! : null;
+    return result.stdout.trim() || null;
   } catch {
     return null;
   }
