@@ -660,11 +660,13 @@ The `Security` section of the doctor output shows:
   that group a path, while the same value written after the URL is still
   redacted. This holds for a nested `file://` child exactly as it does for an
   ordinary public URL, so a trailing file URL never reaches back over a value
-  written before it. A one-character scheme such as `a://host` is URL syntax
-  like any longer scheme; only a Windows drive root, which has a single slash
-  after its colon rather than two, is excluded. Query or fragment punctuation
-  inside a bracket group is ownership evidence only within a span that already
-  carries URL syntax, so bracketed prose whose only URL-shaped character is a
+  written before it. A one-character scheme counts only with the two-slash
+  authority marker, so `a://host` is URL syntax like any longer scheme, while
+  a Windows drive root such as `C:/Users` and a zero-slash form such as
+  `a:public` alike leave a later named value in clear, unlike `ab:public`.
+  Query or fragment punctuation inside a bracket group is ownership evidence
+  only within a span that already carries URL syntax, so bracketed prose whose
+  only URL-shaped character is a
   `?` leaves a named Windows value unchanged. A named root-relative Windows
   value following a nested file child's path is redacted on the first pass, so
   a message that crosses several forwarding layers keeps the same bytes.

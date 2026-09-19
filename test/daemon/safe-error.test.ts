@@ -4578,6 +4578,36 @@ describe("sanitizeError", () => {
         "['file://h/Users/a/My Files/one.db']",
         "['file://h<path>']",
       ],
+      [
+        "R3m a URL in an open ancestor owns a nested query-bearing value",
+        "[https://x|[name=\\Users\\a?]]",
+        "[https://x|[name=<path>?]]",
+      ],
+      [
+        "R3n control the doubly nested ancestor twin",
+        "[[https://x]|[name=\\Users\\a?]]",
+        "[[https://x]|[name=<path>?]]",
+      ],
+      [
+        "R3o control a file child in an open ancestor",
+        "[file://x/a|[name=\\Users\\a?]]",
+        "[file://x<path>|[name=<path>?]]",
+      ],
+      [
+        "R3p control the single-wrapper twin already redacts",
+        "[https://x]|[name=\\Users\\a?]",
+        "[https://x]|[name=<path>?]",
+      ],
+      [
+        "R3q a trailing file URL never reaches back over an earlier value",
+        "https://e.test/t?a=\\Users\\bob\\y&next=file://host/Users/a",
+        "https://e.test/t?a=\\Users\\bob\\y&next=file://host<path>",
+      ],
+      [
+        "R3r control the same value without the trailing file URL",
+        "https://e.test/t?a=\\Users\\bob\\y",
+        "https://e.test/t?a=\\Users\\bob\\y",
+      ],
     ] as const)("resolves %s in one pass", (_name, input, expected) => {
       const first = sanitizeError(input);
 

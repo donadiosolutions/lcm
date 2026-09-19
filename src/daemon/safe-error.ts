@@ -299,6 +299,13 @@ function classifyBracketGroups(chars: readonly string[]): BracketGroupIndex {
   // pre-pass bridged unlimited gaps and kept marking ordinary quoted prose as
   // URL-owned after the scanner had already let the span go.
   let spanSeparatorSeen = false;
+  // Whether the whitespace-delimited span already carried URL syntax when the
+  // current position was reached. A URL in a still-open ancestor group is
+  // invisible to the span root until that group closes, so reading the root
+  // missed it and left nested values in clear. A scalar set at any scheme
+  // colon or file literal and cleared only on the hard whitespace reset keeps
+  // the question constant-time without inheriting across gaps.
+  let spanUrlSeen = false;
 
   for (let index = 0; index < chars.length; index += 1) {
     const char = chars[index];
@@ -309,7 +316,11 @@ function classifyBracketGroups(chars: readonly string[]): BracketGroupIndex {
         depth[index] = stack.length - 1;
         if (urlBearing[held] === 1) urlBearingBefore[index] = 1;
         if (fileChildBearing[held] === 1) fileChildBearingBefore[index] = 1;
-        if (urlBearing[stack[0]] === 1) spanUrlBearingBefore[index] = 1;
+        // Reaching this bridge requires spanSeparatorSeen, which is set only
+        // together with spanUrlSeen at a scheme colon, so the span always
+        // carries URL syntax here. Assign unconditionally: the guard would be
+        // a branch no input can take on its false side.
+        spanUrlBearingBefore[index] = 1;
         spanSeparatorSeen = false;
         continue;
       }
@@ -318,6 +329,7 @@ function classifyBracketGroups(chars: readonly string[]): BracketGroupIndex {
       inUrlSpan = false;
       spanQuote = 0;
       spanSeparatorSeen = false;
+      spanUrlSeen = false;
       stack = [openGroup()];
       groupOf[index] = stack[0];
       depth[index] = 0;
@@ -356,7 +368,7 @@ function classifyBracketGroups(chars: readonly string[]): BracketGroupIndex {
     depth[index] = stack.length - 1;
     if (urlBearing[current] === 1) urlBearingBefore[index] = 1;
     if (fileChildBearing[current] === 1) fileChildBearingBefore[index] = 1;
-    if (urlBearing[stack[0]] === 1) spanUrlBearingBefore[index] = 1;
+    if (spanUrlSeen) spanUrlBearingBefore[index] = 1;
     if (pathlessChildQueryStarts[index] === 1) pathlessQueryActive[current] = 1;
     if (pathlessQueryActive[current] === 1) {
       // The region is held on the group that opened it, so a sibling wrapper
@@ -395,6 +407,7 @@ function classifyBracketGroups(chars: readonly string[]): BracketGroupIndex {
     }
     if (isFileUrlLiteral(chars, index)) {
       urlBearing[current] = 1;
+      spanUrlSeen = true;
       // Only a nested child answers wrapper-ownership questions. The file URL
       // that opens the message is the wrapper itself, not a child of one.
       const previous = chars[index - 1];
@@ -419,6 +432,7 @@ function classifyBracketGroups(chars: readonly string[]): BracketGroupIndex {
     const schemeStart = ownershipSchemeStart(chars, index);
     if (isSingleSlashFileUrlLiteral(chars, index) || schemeStart >= 0) {
       urlBearing[current] = 1;
+      spanUrlSeen = true;
       // The scheme colon carries the quote for every span, including one opened
       // by a file literal, because the literal is always followed by its colon
       // before any whitespace can end the span.
@@ -578,9 +592,11 @@ function findUrlPathStarts(chars: readonly string[]): UrlPathStarts {
       // The span-local "separator" and "exactFileScheme" facts change once an
       // earlier pass has rewritten a nested file path as "<path>", so gating
       // only on them made the same message redact differently on the second
-      // pass. The group's file-child fact is derived from observable "file://"
-      // syntax that survives redaction, so both passes agree.
-      (separator < 0 || groups.fileChildBearing[groups.groupOf[index]] === 1)
+      // pass. The positional file-child fact is derived from observable
+      // "file://" syntax that survives redaction, so both passes agree, and a
+      // file child only owns the text that follows it: a trailing file URL
+      // never reaches back over a value written before it.
+      (separator < 0 || groups.fileChildBearingBefore[index] === 1)
     ) {
       forcedPath[index] = 1;
       continue;
