@@ -14,8 +14,8 @@ entry now enumerates under its own local identity, the same way an already
 supported retired-identity fence does, so every other selected project
 still runs. `lcm compact --all` and `lcm export --all` report it as that
 project's own failure and name the `lcm project create` / `lcm project link`
-remedy; `lcm compact --all` previously reported it with the generic
-"project storage discovery failed" text instead. `lcm promote --all`
+remedy; `lcm compact --all` previously aborted the whole run with
+`project discovery failed` and compacted nothing. `lcm promote --all`
 reports a generic per-project failure naming the project path, without
 the remedy. `lcm import --all` is session-driven, not project-driven: it
 fails that project's sessions rather than naming the project, and a
