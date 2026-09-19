@@ -2054,6 +2054,33 @@ test("redacts credentials before issue content enters model prompts", () => {
   }
 });
 
+test("skips URL credential matching for bounded no-scheme prompt text", () => {
+  // Mutation caught: running a URL-credential matcher without first finding a scheme separator.
+  const adversarialText = "a".repeat(65_536);
+  const truncatedNoSchemeText = "a".repeat(8_000);
+  const urlCredentialPatternMarkers = ["[^@\\s/]+@", "[^@\\s/]*$"];
+  const originalExec = RegExp.prototype.exec;
+  let urlCredentialExecutions = 0;
+  RegExp.prototype.exec = function instrumentedExec(value) {
+    if (
+      (value === adversarialText || value === truncatedNoSchemeText)
+      && urlCredentialPatternMarkers.some((marker) => this.source.includes(marker))
+    ) {
+      urlCredentialExecutions += 1;
+    }
+    return originalExec.call(this, value);
+  };
+
+  try {
+    assert.equal(redactPromptText(adversarialText, Number.MAX_SAFE_INTEGER), adversarialText);
+    assert.equal(redactPromptText(adversarialText), "a".repeat(8_000));
+  } finally {
+    RegExp.prototype.exec = originalExec;
+  }
+
+  assert.equal(urlCredentialExecutions, 0);
+});
+
 test("parses and validates complete model output", () => {
   assert.deepEqual(
     parseAndValidateClassification(JSON.stringify(validResult), policy, [42]),

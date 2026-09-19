@@ -506,7 +506,7 @@ export function redactPromptText(value, maximum = 8_000) {
   if (!Number.isSafeInteger(maximum) || maximum < 0) {
     throw new TypeError("Maximum prompt text length must be a non-negative integer");
   }
-  const redacted = String(value ?? "")
+  let redacted = String(value ?? "")
     .replace(
       /-----BEGIN [A-Z0-9 ]{0,72}PRIVATE KEY-----[\s\S]*?-----END [A-Z0-9 ]{0,72}PRIVATE KEY-----/gu,
       "[REDACTED]",
@@ -526,16 +526,17 @@ export function redactPromptText(value, maximum = 8_000) {
     .replace(
       /(\b(?:password|passwd|token|secret|api[_-]?key|authorization)\s*[:=]\s*)(?:"[^"\r\n]+"|'[^'\r\n]+'|[^\s,;]+)/giu,
       "$1[REDACTED]",
-    )
-    .replace(
+    );
+  if (redacted.includes("://")) {
+    redacted = redacted.replace(
       /([a-z][a-z0-9+.-]*:\/\/[^:\s/@]+:)[^@\s/]+@/giu,
       "$1[REDACTED]@",
     );
+  }
   const wasTruncated = redacted.length > maximum;
   let bounded = truncatePromptCodeUnits(redacted, maximum);
   if (wasTruncated) {
-    bounded = truncatePromptCodeUnits(
-      bounded
+    let truncatedRedacted = bounded
       .replace(
         /\b(?:github_pat_[A-Za-z0-9_]*|gh[pousr]_[A-Za-z0-9_]*|sk-[A-Za-z0-9_-]*|AKIA[A-Z0-9]*)$/gu,
         "[REDACTED]",
@@ -547,13 +548,14 @@ export function redactPromptText(value, maximum = 8_000) {
       .replace(
         /(\b(?:password|passwd|token|secret|api[_-]?key|authorization)\s*[:=]\s*)(?:"[^"\r\n]*|'[^'\r\n]*|[^\s,;]*)$/giu,
         "$1[REDACTED]",
-      )
-      .replace(
+      );
+    if (truncatedRedacted.includes("://")) {
+      truncatedRedacted = truncatedRedacted.replace(
         /([a-z][a-z0-9+.-]*:\/\/[^:\s/@]+:)[^@\s/]*$/giu,
         "$1[REDACTED]",
-      ),
-      maximum,
-    )
+      );
+    }
+    bounded = truncatePromptCodeUnits(truncatedRedacted, maximum)
       .replace(/\[R(?:E(?:D(?:A(?:C(?:T(?:E(?:D)?)?)?)?)?)?)?$/u, "");
   }
   return bounded;

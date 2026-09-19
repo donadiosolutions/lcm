@@ -225,6 +225,32 @@ test("redacts nested alternate issue-derived fields before serialization", async
   assert.deepEqual(parsed.truncation, { applied: false });
 });
 
+test("preserves prompt, generated, and native redaction in intake", async () => {
+  // Mutation caught: dropping one redaction layer while changing prompt URL handling.
+  const { projectUntrustedIssueData } = await intakeApi();
+  const urlCredential = "CuStOm+SSL://user:url-secret@example.test/private";
+  const generatedCredential = "MERAKI = 0123456789abcdef0123456789abcdef01234567";
+  const nativeCredential = "rediss://:redis-secret@example.test/0";
+  const envelope = await projectUntrustedIssueData({
+    title: urlCredential,
+    body: generatedCredential,
+    comments: [nativeCredential],
+    reproduction: [],
+    evidence: [],
+  });
+  const projected = parseEnvelope(envelope);
+
+  assert.equal(
+    projected.title,
+    "CuStOm+SSL://user:[REDACTED]@example.test/private",
+  );
+  assert.equal(projected.body, "[REDACTED]");
+  assert.deepEqual(projected.comments, ["[REDACTED]/0"]);
+  for (const credential of ["url-secret", generatedCredential, "redis-secret"]) {
+    assert.doesNotMatch(envelope, new RegExp(credential, "u"));
+  }
+});
+
 test("redacts a prefiltered Gitleaks rule when its keyword is present", async () => {
   // Mutation caught: skipping prefiltered rules even when their required keyword is present.
   const { projectUntrustedIssueData } = await intakeApi();
