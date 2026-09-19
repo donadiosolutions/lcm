@@ -91,11 +91,19 @@ function dataHarness(extra:Partial<Record<PortableDomain,Record<string,unknown>[
   });
   const read=vi.spyOn(mapping,'readCanonicalRow').mockImplementation(async(_db,_project,domain,key)=>
     byLocator.get(domain)!.get(key)??null);
+  const contentRows=vi.spyOn(mapping,'readCanonicalContentRows').mockImplementation(async(_db,_project,domain,locators)=>{
+    const found=new Map<string,Record<string,unknown>>();
+    for (const locator of locators) {
+      const row=byLocator.get(domain)!.get(locator);
+      if (row!==undefined) found.set(locator,row);
+    }
+    return found;
+  });
   vi.spyOn(mapping,'listConversationMessageHeaders').mockImplementation(async(_db,_project,conversation,after,limit)=>
     (data.messages??[]).filter(row=>row.conversation_id===conversation&&(after===null||BigInt(String(row.seq))>BigInt(after)))
       .sort((a,b)=>BigInt(String(a.seq))<BigInt(String(b.seq))?-1:1).slice(0,limit)
       .map(row=>({locator:locator('messages',row),byteLength:'1000',seq:String(row.seq)})));
-  return {...harness(),data,list,read};
+  return {...harness(),data,list,read,contentRows};
 }
 const page=(domain:PortableDomain,afterOrdinal=0,includePredecessor=false)=>({domain,afterOrdinal,includePredecessor,maxRecords:500 as const,maxBytes:150994944 as const});
 const open=(h:ReturnType<typeof harness>,expectedIdentity=identity())=>adapter.createPostgreSqlPortableSource({settings,expectedOwner:'owner',expectedIdentity},h.dependencies as never);
@@ -165,9 +173,9 @@ describe('PostgreSQL portable source ordering and lifetime',()=>{
     await expect(open(h)).rejects.toMatchObject({code:'record-unrepresentable'});
     expect(h.read).not.toHaveBeenCalled();expect(h.session.close).toHaveBeenCalledTimes(1);
   });
-  it('fetches one source header at a time so textual locators cannot aggregate',async()=>{
+  it('fetches canonical headers in batches bounded by the shared portable batch size',async()=>{
     const h=dataHarness(),source=await open(h);
-    expect(h.list.mock.calls.every(call=>call[4]===1)).toBe(true);
+    expect(h.list.mock.calls.every(call=>call[4]===codec.PORTABLE_LIMITS.maxBatchRecords)).toBe(true);
     await source.close();
   });
   it('admits projected raw rows through144MiB before exact canonical encoding',async()=>{
@@ -221,6 +229,12 @@ describe('PostgreSQL source failure boundaries',()=>{
     await expect(open(h)).rejects.toMatchObject({code:'source-invalid'});
     h.read.mockResolvedValue(null);
     await expect(open(h)).rejects.toMatchObject({code:'source-invalid'});
+  });
+  it('refuses a canonical row missing from a batched boundary read',async()=>{
+    const h=dataHarness();
+    h.contentRows.mockResolvedValue(new Map());
+    await expect(open(h)).rejects.toMatchObject({code:'source-invalid'});
+    expect(h.contentRows).toHaveBeenCalled();
   });
   it('refuses a backend header page exceeding the row bound or repeating its cursor',async()=>{
     const h=dataHarness();h.list.mockResolvedValueOnce(Array.from({length:501},()=>({locator:'["1"]',byteLength:'1'})));
@@ -335,12 +349,48 @@ describe('PostgreSQL source private scratch and authenticated prefix evidence',(
         const reads=h.read.mock.calls.filter(call=>call[2]==='session-ingest').length;
         expect(reads).toBeLessThanOrEqual(4*count+Math.ceil(count/500));
         expect(hashes.mock.calls.length).toBeLessThanOrEqual(2*count+500);
+        // #1388: boundary/completion recomputation batches its row reads at
+        // PORTABLE_LIMITS.maxBatchRecords locators per query instead of one
+        // round trip per record, so the batched call count stays O(count/500).
+        const contentBatches=h.contentRows.mock.calls.filter(call=>call[2]==='session-ingest').length;
+        expect(contentBatches).toBeLessThanOrEqual(2*Math.ceil(count/codec.PORTABLE_LIMITS.maxBatchRecords));
         return reads;
       } finally {await source.close();vi.restoreAllMocks();}
     };
     const first=await measure(1200),second=await measure(2400);
     expect(second-first).toBeLessThanOrEqual(4*1200+5);
   },30000);
+  it('bounds a batched boundary read by aggregate payload bytes, not just record count',async()=>{
+    const rows2=['1','2'].map(ingest_key=>({ingest_key,session_id:ingest_key,message_count:'1',completed_at:timestamp}));
+    const h=dataHarness({'session-ingest':rows2}),list=h.list.getMockImplementation()!;
+    // Two records each well within the per-row 144MiB guard, but together
+    // exceeding PORTABLE_LIMITS.maxBatchBytes: #1388's batching must not
+    // fetch their content in a single round trip on the strength of
+    // index.entries' own maxBytes bound alone, since that bound only limits
+    // JSON-stringified index metadata, not the record payload this batch
+    // reads. Before the aggregate-bytes chunking fix this issued exactly one
+    // readCanonicalContentRows call for both locators.
+    h.list.mockImplementation(async(...args)=>(await list(...(args as Parameters<typeof list>)))
+      .map(header=>({...header,byteLength:'90000000'})));
+    const source=await open(h);
+    const calls=h.contentRows.mock.calls.filter(call=>call[2]==='session-ingest');
+    expect(calls).toHaveLength(2);
+    expect(calls.every(call=>call[3].length===1)).toBe(true);
+    await source.close();
+  });
+  it('fails closed when a batched chunk entry lacks its captured byte length',async()=>{
+    const h=dataHarness({'session-ingest':['1'].map(ingest_key=>({ingest_key,session_id:ingest_key,message_count:'1',completed_at:timestamp}))});
+    const original=PortableIndex.prototype.entries;
+    vi.spyOn(PortableIndex.prototype,'entries').mockImplementation(function(this:PortableIndex,domain,options){
+      const result=original.call(this,domain,options);
+      // Strip the captured byte lengths but keep every locator valid: the
+      // fail-closed chunk guard must fire before any content read, so this
+      // pins that guard rather than the pre-existing missing-row guard the
+      // previous fake-locator injection reached instead.
+      return domain==='session-ingest' ? result.map(entry=>({...entry,byteLength:undefined})) : result;
+    });
+    await expect(open(h)).rejects.toMatchObject({code:'source-invalid'});
+  });
   it('validates zero and arbitrary resumed prefixes without accepting forged evidence',async()=>{
     const h=dataHarness({'session-ingest':rows(2)}),source=await open(h),description=source.describeSource();
     const first=(await source.readDomainPage(page('session-ingest'))).records[0];

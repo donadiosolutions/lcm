@@ -77,6 +77,16 @@ describe("portable source metadata index", () => {
     expect(() => other.verifyDependencies()).toThrow(expect.objectContaining({ code: "invalid-input" }));
   });
 
+  it("retains optional SQL-measured byte lengths per record", () => {
+    const { index } = open();
+    index.add("sized", machine("sized"), "123");
+    index.add("unsized", machine("unsized"));
+    index.finalizeDomain("machines");
+    const page = index.entries("machines", { afterOrdinal: -1, limit: 500, maxBytes: 1024 * 1024 });
+    expect(page.find((entry) => entry.locator === "sized")?.byteLength).toBe("123");
+    expect(page.find((entry) => entry.locator === "unsized")?.byteLength).toBeUndefined();
+  });
+
   it("assigns conversation occurrences by header then closure digest and compares digest matches", async () => {
     const { index } = open();
     const headerOrder = ["session", null, null, "2026-01-01T00:00:00.000000Z", "2026-01-01T00:00:00.000000Z"];
@@ -158,6 +168,12 @@ describe("portable source metadata index", () => {
     expect(() => index.add("x", { ...machine("m"), identitySha256: "not-a-hash" }))
       .toThrow(expect.objectContaining({ code: "invalid-input" }));
     expect(() => index.add("x", { ...machine("m"), recordSha256: "not-a-hash" }))
+      .toThrow(expect.objectContaining({ code: "invalid-input" }));
+    expect(() => index.add("x", machine("m"), "not-decimal"))
+      .toThrow(expect.objectContaining({ code: "invalid-input" }));
+    expect(() => index.add("x", machine("m"), "-1"))
+      .toThrow(expect.objectContaining({ code: "invalid-input" }));
+    expect(() => index.add("x", machine("m"), String(144 * 1024 * 1024 + 1)))
       .toThrow(expect.objectContaining({ code: "invalid-input" }));
     expect(() => index.add("x", { ...machine("m"), dependencies: [{ domain: "project", identitySha256: "private-canary" }] }))
       .toThrow(expect.objectContaining({ code: "invalid-input" }));

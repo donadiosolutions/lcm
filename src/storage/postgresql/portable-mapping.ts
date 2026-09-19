@@ -116,6 +116,27 @@ export async function readCanonicalRow(executor:PostgreSqlQueryExecutor,projectI
   const result = await executor.query({text:`SELECT ${mapping.selectColumns} FROM ${mapping.table} r${mapping.joins ?? ""} WHERE (${scope(domain)}) AND ${keyExpression(mapping)} = $2::text[] COLLATE "C" AND ${sizeExpression(domain,mapping)} <= $3::bigint LIMIT 1`,values:[projectId,parseLocator(locator,mapping.keys.length),String(PORTABLE_LIMITS.maxBatchBytes)]},{domain:"transaction",operation:"portable-read",projectId,signal});
   return result.rows[0] ?? null;
 }
+/**
+ * Batched counterpart to readCanonicalRow, keyed by the same locator strings
+ * listCanonicalHeaders and the local portable index already hand back. One
+ * query answers up to PORTABLE_LIMITS.maxBatchRecords locators instead of one
+ * round trip per record, which is the per-record shape #1388 flags for
+ * canonical portable-source scanning (eachHeader's header walk and
+ * boundaryAt's row reads). A locator absent from the source table is simply
+ * absent from the returned map; callers must treat that as
+ * record-unrepresentable, the same way a null readCanonicalRow result is
+ * handled today, not silently skip it.
+ */
+export async function readCanonicalContentRows(executor:PostgreSqlQueryExecutor,projectId:string,domain:PortableDomain,locators:readonly string[],signal?:AbortSignal):Promise<ReadonlyMap<string,Row>> {
+  if (locators.length === 0) return new Map();
+  if (locators.length > PORTABLE_LIMITS.maxBatchRecords) throw new PortableStreamError("invalid-limit");
+  const mapping = mappingForDomain(domain);
+  for (const locator of locators) parseLocator(locator,mapping.keys.length);
+  const result = await executor.query<Row & {__locator:string}>({text:`SELECT ${mapping.selectColumns}, ${locatorExpression(mapping)} AS __locator FROM ${mapping.table} r${mapping.joins ?? ""} WHERE (${scope(domain)}) AND ${locatorExpression(mapping)} = ANY($2::text[]) AND ${sizeExpression(domain,mapping)} <= $3::bigint`,values:[projectId,locators,String(PORTABLE_LIMITS.maxBatchBytes)]},{domain:"transaction",operation:"portable-read-batch",projectId,signal});
+  const found = new Map<string,Row>();
+  for (const {__locator,...row} of result.rows) found.set(__locator,row);
+  return found;
+}
 export interface CanonicalDecodeContext {
   readonly projectIdentity:PortableProjectIdentity;
   /** Authenticated path identity used by ordinary runtime promotions. */

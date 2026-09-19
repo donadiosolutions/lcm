@@ -29,6 +29,13 @@ export interface PortableIndexEntry {
   readonly identitySha256: string;
   /** Digest at insertion time. Rebuild source records at their final ordinal. */
   readonly recordSha256: string;
+  /**
+   * Decimal SQL-measured byte length, when the caller supplied one to add().
+   * Disk-backed so callers batching content reads by aggregate bytes (see
+   * postgresql/portable-source.ts) do not need an unbounded in-process map
+   * keyed by locator; absent for callers that never track it.
+   */
+  readonly byteLength?: string;
 }
 
 export interface PortableIndexPageOptions {
@@ -73,6 +80,7 @@ export function encodePortableIndexOrder(order: readonly PortableOrderScalar[]):
 
 type SqlRow = Record<string, unknown>;
 function entry(row: SqlRow): PortableIndexEntry {
+  const byteLength = row.byte_length as number;
   return {
     domain: row.domain as PortableDomain,
     locator: row.locator as string,
@@ -80,6 +88,7 @@ function entry(row: SqlRow): PortableIndexEntry {
     order: JSON.parse(row.order_json as string) as PortableOrderScalar[],
     identitySha256: row.identity_sha as string,
     recordSha256: row.record_sha as string,
+    ...(byteLength === -1 ? {} : { byteLength: String(byteLength) }),
   };
 }
 function positive(value: number): boolean {
@@ -87,6 +96,9 @@ function positive(value: number): boolean {
 }
 function hash(value: string): boolean {
   return typeof value === "string" && /^[a-f0-9]{64}$/.test(value);
+}
+function decimalByteLength(value: string): boolean {
+  return /^(0|[1-9]\d*)$/.test(value) && Number(value) <= PORTABLE_LIMITS.maxBatchBytes;
 }
 
 /**
@@ -131,7 +143,7 @@ export class PortableIndex {
         CREATE TABLE records(
           domain TEXT NOT NULL, locator TEXT NOT NULL, ordinal INTEGER NOT NULL DEFAULT -1,
           sort_key BLOB NOT NULL, order_json TEXT NOT NULL, identity_sha TEXT NOT NULL,
-          record_sha TEXT NOT NULL, PRIMARY KEY(domain,locator),
+          record_sha TEXT NOT NULL, byte_length INTEGER NOT NULL DEFAULT -1, PRIMARY KEY(domain,locator),
           UNIQUE(domain,identity_sha), UNIQUE(domain,sort_key));
         CREATE INDEX records_ordinals ON records(domain,ordinal);
         CREATE TABLE dependencies(domain TEXT NOT NULL, identity_sha TEXT NOT NULL);
@@ -200,10 +212,11 @@ export class PortableIndex {
     if (!PORTABLE_RECORD_DOMAIN_ORDER.includes(domain)) throw new PortableTransferError("invalid-input");
   }
 
-  add(locator: string, record: PortableRecord): void {
+  add(locator: string, record: PortableRecord, byteLength?: string): void {
     this.#check();
     this.#domain(record.domain);
-    if (typeof locator !== "string" || !hash(record.identitySha256) || !hash(record.recordSha256)) {
+    if (typeof locator !== "string" || !hash(record.identitySha256) || !hash(record.recordSha256)
+      || (byteLength !== undefined && !decimalByteLength(byteLength))) {
       throw new PortableTransferError("invalid-input");
     }
     this.#metadata(locator, record.order, record.dependencies);
@@ -212,8 +225,9 @@ export class PortableIndex {
       const status = this.#db.prepare("SELECT finalized FROM domains WHERE domain=?").get(record.domain);
       if (status?.finalized === 1) throw new PortableTransferError("invalid-input");
       this.#db.prepare("INSERT OR IGNORE INTO domains(domain) VALUES(?)").run(record.domain);
-      this.#db.prepare(`INSERT INTO records(domain,locator,sort_key,order_json,identity_sha,record_sha)
-        VALUES(?,?,?,?,?,?)`).run(record.domain, locator, sortKey, JSON.stringify(record.order), record.identitySha256, record.recordSha256);
+      this.#db.prepare(`INSERT INTO records(domain,locator,sort_key,order_json,identity_sha,record_sha,byte_length)
+        VALUES(?,?,?,?,?,?,?)`).run(record.domain, locator, sortKey, JSON.stringify(record.order), record.identitySha256, record.recordSha256,
+        byteLength === undefined ? -1 : Number(byteLength));
       for (const dependency of record.dependencies) {
         this.#domain(dependency.domain);
         if (!hash(dependency.identitySha256)) throw new PortableTransferError("invalid-input");

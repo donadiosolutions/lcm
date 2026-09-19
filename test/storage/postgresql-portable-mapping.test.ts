@@ -182,6 +182,38 @@ it("bounds scoped header and payload queries for every native family including j
   for(const limit of [0,501,1.5]) await expect(mapping.listConversationMessageHeaders(db,projectId,"1",null,limit)).rejects.toThrow();
 });
 
+it("batches canonical row reads by locator instead of one query per record",async()=>{
+  const locators=[0,1,2].map(index=>JSON.stringify(["key"+index]));
+  const {db,query}=executor([
+    {test:"payload-0",__locator:locators[0]},
+    {test:"payload-2",__locator:locators[2]},
+  ]);
+  const found=await mapping.readCanonicalContentRows(db,projectId,"machines",locators);
+  expect(query.mock.calls).toHaveLength(1);
+  expect(query.mock.calls[0][0].text).toContain("= ANY($2::text[])");
+  expect(query.mock.calls[0][0].values?.[1]).toEqual(locators);
+  expect(found.size).toBe(2);
+  expect(found.get(locators[0]!)).toEqual({test:"payload-0"});
+  expect(found.get(locators[2]!)).toEqual({test:"payload-2"});
+  expect(found.has(locators[1]!)).toBe(false);
+});
+it("returns an empty map without querying when there are no locators to check",async()=>{
+  const {db,query}=executor([]);
+  expect(await mapping.readCanonicalContentRows(db,projectId,"machines",[])).toEqual(new Map());
+  expect(query).not.toHaveBeenCalled();
+});
+it("refuses batches larger than the shared portable batch-record bound",async()=>{
+  const {db}=executor([]);
+  const {PORTABLE_LIMITS}=await import("../../src/storage/portable-record.js");
+  const oversized=Array.from({length:PORTABLE_LIMITS.maxBatchRecords+1},(_,index)=>JSON.stringify(["key"+index]));
+  await expect(mapping.readCanonicalContentRows(db,projectId,"machines",oversized)).rejects.toThrow();
+});
+it("refuses a malformed locator in a batch before issuing SQL",async()=>{
+  const {db,query}=executor([]);
+  for(const bad of ["bad",'{}','[]','[1]']) await expect(mapping.readCanonicalContentRows(db,projectId,"messages",[bad])).rejects.toThrow();
+  expect(query).not.toHaveBeenCalled();
+});
+
 it("refuses missing decode evidence instead of inventing parent identities or duplicate occurrences",()=>{
   const context={projectIdentity:{scope:"shared" as const,projectId}};
   expect(()=>mapping.decodeCanonicalRow("messages",{},context)).toThrow();
