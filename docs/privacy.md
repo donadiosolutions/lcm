@@ -572,8 +572,9 @@ The `Security` section of the doctor output shows:
   recognized `scheme://` token is not consumed as the local path. Private
   slash paths in later ampersand-separated parameters remain covered by the
   same handoff. When an ampersand is immediately followed by an ordinary
-  public `scheme://` URL, the quoted-query handoff expires before that URL, so
-  its scheme, authority, and path remain byte-identical. A later
+  public `scheme://` URL while that handoff is active, the quoted-query
+  handoff expires before that URL, so its scheme, authority, and path remain
+  byte-identical. A later
   ampersand-separated word-bearing private path resumes the surrounding quoted
   file query's handoff. Named public URL parameters such as `&next=/public`
   remain part of that public URL. A nested exact `file://` literal still starts

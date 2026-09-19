@@ -625,7 +625,7 @@ describe("Codecov configuration", () => {
     expect(ownershipCounts.size).toBe(243);
   });
 
-  test("keeps response-fence and #681/#700/#701/#703/#705/#709/#710/#713/#756/#726/#734/#737/#742/#760/#763/#804/#805/#824/#825/#833/#888/#864/#866/#722/#786/#952/#814/#882/#930/#969/#989/#1003/#1049/#964/#1106/#1191/#1196/#1229/#1321/#1338/#1347/#1353/#1354/#1356/#1357/#1358 files in their intended components", () => {
+  test("keeps response-fence and #681/#700/#701/#703/#705/#709/#710/#713/#756/#726/#734/#737/#742/#760/#763/#804/#805/#824/#825/#833/#888/#864/#866/#722/#786/#952/#814/#882/#930/#969/#989/#1003/#1049/#964/#1106/#1191/#1196/#1229/#1321/#1338/#1347/#1353/#1354/#1356/#1357/#1358/#1374 files in their intended components", () => {
     const config = readCodecovConfig();
     expect(config).toBeDefined();
     if (config === undefined) {
@@ -758,6 +758,9 @@ describe("Codecov configuration", () => {
       // #1343 and #1348 widen nested-public handoff ownership in the error
       // sanitizer. This is a material change that retains its existing owner,
       // as in #1195 and #1203.
+      // #1374 replaces that ownership layer with a bracket-group and span
+      // pre-pass classification. The file keeps this existing owner because the
+      // change is internal to error sanitization.
       ["src/daemon/safe-error.ts", "unit-daemon-core"],
       ["src/import.ts", "unit-transcripts-import"],
       // #1358 also drops the redundant residual scrub pass for strings the

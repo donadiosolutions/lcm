@@ -3011,9 +3011,9 @@ describe("sanitizeError", () => {
     expect(sanitizeError(sanitizeError(sanitizeError(input)))).toBe(input);
   });
 
-  it("preserves deferred Bug #1332 contextual over-redaction", () => {
+  it("keeps a literal-only wrapper named Windows value (#1374)", () => {
     const input = "file://h?x=[value|later=\\Users\\bob\\secret.db]";
-    const expected = "file://h?x=[value|later=<path>]";
+    const expected = input;
     const first = sanitizeError(input);
 
     expect(first).toBe(expected);
@@ -3352,11 +3352,11 @@ describe("sanitizeError", () => {
     expect(sanitizeError(sanitizeError(first))).toBe(first);
   });
 
-  it("preserves deferred direct-relative successor over-redaction", () => {
+  it("keeps the direct-relative successor after a nested file child (#1374)", () => {
     const input =
       "file://h?x=[https://o.test/t&/Users/o/one&file:///Users/a/two&relative/path]";
     const expected =
-      "file://h?x=[https://o.test/t&<path>&file://<path>&relative<path>]";
+      "file://h?x=[https://o.test/t&<path>&file://<path>&relative/path]";
     const first = sanitizeError(input);
 
     expect(first).toBe(expected);
@@ -3420,21 +3420,21 @@ describe("sanitizeError", () => {
       "query",
       "file://h?x=[https://e.test/t&file:///Users/a/one?key=/public&relative/path]",
       "file://h?x=[https://e.test/t&file://<path>?key=<path>&relative/path]",
-      "file://h?x=[https://e.test/t&file://<path>?key=<path>&relative<path>]",
+      "file://h?x=[https://e.test/t&file://<path>?key=<path>&relative/path]",
     ],
     [
       "fragment",
       "file://h?x=[https://e.test/t&file:///Users/a/one#key=/public&docs/readme/more]",
       "file://h?x=[https://e.test/t&file://<path>#key=<path>&docs/readme/more]",
-      "file://h?x=[https://e.test/t&file://<path>#key=<path>&docs<path>]",
+      "file://h?x=[https://e.test/t&file://<path>#key=<path>&docs/readme/more]",
     ],
     [
       "incomplete Users root",
       "file://h?x=[https://e.test/t&file:///Users/a/one?key=/public&later/Users]",
       "file://h?x=[https://e.test/t&file://<path>?key=<path>&later/Users]",
-      "file://h?x=[https://e.test/t&file://<path>?key=<path>&later<path>]",
+      "file://h?x=[https://e.test/t&file://<path>?key=<path>&later/Users]",
     ],
-  ] as const)("preserves deferred Bug #1336 %s pass sequence", (_name, input, firstExpected, stableExpected) => {
+  ] as const)("keeps Bug #1336 %s convergent on the first pass (#1374)", (_name, input, firstExpected, stableExpected) => {
     const first = sanitizeError(input);
     const second = sanitizeError(first);
 
@@ -3683,9 +3683,9 @@ describe("sanitizeError", () => {
       "file://h?x=[https://[::1]/p|<path>|<path>",
     ],
     [
-      "deferred Bug #1332",
+      "Bug #1332 literal-only named Windows value (#1374)",
       "file://h?x=[value|later=\\Users\\bob\\secret.db]",
-      "file://h?x=[value|later=<path>]",
+      "file://h?x=[value|later=\\Users\\bob\\secret.db]",
     ],
   ] as const)("preserves post-review 5 %s control", (_name, input, expected) => {
     const first = sanitizeError(input);
@@ -3813,9 +3813,9 @@ describe("sanitizeError", () => {
     expect(sanitizeError(sanitizeError(first))).toBe(first);
   });
 
-  it("preserves deferred Bug #1332 contextual over-redaction after the pipe-handoff fix", () => {
+  it("keeps the literal-only wrapper value through the pipe handoff (#1374)", () => {
     const input = "file://h?x=[value|later=\\Users\\bob\\secret.db]";
-    const expected = "file://h?x=[value|later=<path>]";
+    const expected = input;
     const first = sanitizeError(input);
 
     expect(first).toBe(expected);
@@ -3823,11 +3823,11 @@ describe("sanitizeError", () => {
     expect(sanitizeError(sanitizeError(first))).toBe(first);
   });
 
-  it("preserves deferred Bug #1336 root anchor after the pipe-handoff fix", () => {
+  it("keeps the Bug #1336 relative successor after the pipe handoff (#1374)", () => {
     const input =
       "file://h?x=[https://e.test/t&/Users/a/one&file:///Users/b/two&relative/path]";
     const expected =
-      "file://h?x=[https://e.test/t&<path>&file://<path>&relative<path>]";
+      "file://h?x=[https://e.test/t&<path>&file://<path>&relative/path]";
     const first = sanitizeError(input);
 
     expect(first).toBe(expected);
@@ -3899,14 +3899,14 @@ describe("sanitizeError", () => {
     [
       "ampersand nested child",
       "file://h?x=[[https://e.test/t&file://host?key=/public]\\Users\\SECRET\\x]",
-      "file://h?x=[[https://e.test/t&file://host?key=<path>]\\Users\\SECRET\\x]",
+      "file://h?x=[[https://e.test/t&file://host?key=<path>]<path>]",
     ],
     [
       "pipe nested child",
       "file://h?x=[[https://e.test/t|file://host?key=/public]\\Users\\SECRET\\x]",
-      "file://h?x=[[https://e.test/t|file://host?key=<path>]\\Users\\SECRET\\x]",
+      "file://h?x=[[https://e.test/t|file://host?key=<path>]<path>]",
     ],
-  ] as const)("keeps the query-only nested-file handoff scoped inside its own bracket for %s", (_name, input, expected) => {
+  ] as const)("redacts the bracket-close tail owned by the enclosing wrapper for %s (#1374)", (_name, input, expected) => {
     const first = sanitizeError(input);
 
     expect(first).toBe(expected);
@@ -4057,6 +4057,342 @@ describe("sanitizeError", () => {
     expect(first).toBe(expected);
     expect(sanitizeError(first)).toBe(first);
     expect(sanitizeError(sanitizeError(first))).toBe(first);
+  });
+
+  describe("Bug #1374 ownership pre-pass regression corpus", () => {
+    // Every row below names the exact disclosure or control it pins. The eight
+    // ownership defects introduced across the six withdrawn PR #1368 review
+    // rounds are labelled D1-D8; the two convergence defects of the withdrawn
+    // design itself are K1 and K2. Rows in this first group are already correct
+    // on main and must stay correct: the withdrawn work broke each of them
+    // while repairing the next one.
+    it.each([
+      [
+        "D1 glued named value after a quoted nested public URL",
+        "file://h?x=['https://e.test/t'name=\\Users\\SECRET\\x",
+        "file://h?x=['https://e.test/t'name=<path>",
+      ],
+      [
+        "D2 glued named value after a double-quoted nested public URL",
+        'file://h?x=["https://e.test/t"name=\\Users\\SECRET\\x',
+        'file://h?x=["https://e.test/t"name=<path>',
+      ],
+      [
+        "D3 restarted scanner keeps ownership independent of suspension",
+        "file://h?x=[[[https://e.test/t|file://host?key=/public]]|name=\\Users\\SECRET\\x]",
+        "file://h?x=[[[https://e.test/t|file://host?key=<path>]]|name=<path>]",
+      ],
+      [
+        "D4 a later public URL restores wrapper ownership",
+        "file://h?x=[value|https://e.test/t|name=\\Users\\SECRET\\x]",
+        "file://h?x=[value|https://e.test/t|name=<path>]",
+      ],
+      [
+        "D5a an opaque mailto scheme makes its wrapper URL-bearing",
+        "file://h?x=[mailto:a@b|name=\\Users\\SECRET\\x]",
+        "file://h?x=[mailto:a@b|name=<path>]",
+      ],
+      [
+        "D5b a single-slash file scheme makes its wrapper URL-bearing",
+        "file://h?x=[file:/x|name=\\Users\\SECRET\\x]",
+        "file://h?x=[file:<path>|name=<path>]",
+      ],
+      [
+        "D7a an absolute Windows prose path stays one private span",
+        "C:\\tmp\\private[https://public.test/x]secret.db",
+        "<path>",
+      ],
+      [
+        "D7b an absolute POSIX prose path stays one private span",
+        "/tmp/private[https://public.test/x]secret.db",
+        "<path>",
+      ],
+      [
+        "D7c a mid-prose absolute path stays one private span",
+        "error C:\\tmp\\private[https://public.test/x]secret.db suffix",
+        "error <path> suffix",
+      ],
+      [
+        "D8 control a drive value still redacts through the global rules",
+        "file://h?x=[value|C:\\Users\\S1]",
+        "file://h?x=[value|<path>]",
+      ],
+      [
+        "Bug #1332 control a UNC value still redacts in a literal-only wrapper",
+        "file://h?x=[value|\\\\server\\share\\secret]",
+        "file://h?x=[value|<path>]",
+      ],
+      [
+        "Bug #1332 control whitespace ends wrapper ownership",
+        "file://h?x=[value|https://e.test/t] later=\\Users\\bob\\x",
+        "file://h?x=[value|https://e.test/t] later=\\Users\\bob\\x",
+      ],
+      [
+        "Bug #1332 control a pipe outside any URL keeps its Windows value",
+        "prose |\\Users\\bob\\x",
+        "prose |\\Users\\bob\\x",
+      ],
+      [
+        "Bug #1346 control ampersand sibling successors redact globally",
+        "file://h?x=[file://a?key=/pub&\\Users\\S1\\x]&[file://b?key2=/pub2&\\Users\\S2\\y]",
+        "file://h?x=[file://a?key=<path>&<path>]&[file://b?key2=<path>&<path>]",
+      ],
+      [
+        "Bug #1346 control a POSIX tail after a wrapper close already redacts",
+        "file://h?x=[file://host?key=/public]/Users/FIRST/x",
+        "file://h?x=[file://host?key=<path>]<path>",
+      ],
+      [
+        "Bug #1344 control a double-quoted nested file child hands off",
+        'file://h?x=["file://host?key=/public"|\\Users\\SECRET\\x]',
+        'file://h?x=["file://host?key=<path>"|<path>]',
+      ],
+      [
+        "Bug #1349 control an ampersand returns from a path-bearing child",
+        "file://h?x=[file:///Users/CHILD/x&later/Users/alice/secret.db]",
+        "file://h?x=[file://<path>&later<path>]",
+      ],
+      [
+        "Bug #1349 control a query-only child keeps its relative tail",
+        "file://h?x=[https://e.test/t&file://host?key=/public&later/Users/secret]",
+        "file://h?x=[https://e.test/t&file://host?key=<path>&later/Users/secret]",
+      ],
+      [
+        "Bug #917 control an adjacent scheme quote redacts a spaced tail",
+        "https://outer.test/x?next='file://host.invalid/Users/canary/My Files/private.db'",
+        "https://outer.test/x?next='file://host.invalid<path>'",
+      ],
+      [
+        "Bug #917 control a spaceless outer-quoted tail already redacts",
+        "'https://outer.test/x?next=file://host.invalid/Users/canary/private.db'",
+        "'https://outer.test/x?next=file://host.invalid<path>'",
+      ],
+      [
+        "Bug #917 control an unquoted outer URL keeps its #859 residual",
+        "https://outer.test/x?next=file://host.invalid/Users/canary/My Files/private.db",
+        "https://outer.test/x?next=file://host.invalid<path> Files/private.db",
+      ],
+      [
+        "Bug #1374 control an unmatched close ends a query-only child region",
+        "file://h?x=file://g?y=]a&later/Users/secret",
+        "file://h?x=file://g?y=]a&later<path>",
+      ],
+      [
+        "Bug #1374 control an unterminated bracket authority is not a child",
+        "file://h?x=[file://[::1?key=/public&later/Users/secret]",
+        "file://h?x=[file://[::1?key=<path>&later<path>]",
+      ],
+      [
+        "Bug #1374 control a non-hex bracket authority is not a child",
+        "file://h?x=[file://[g::1]?key=/public&later/Users/secret]",
+        "file://h?x=[file://[g::1]?key=<path>&later<path>]",
+      ],
+      [
+        "Bug #1374 control an empty bracket authority is not a child",
+        "file://h?x=[file://[]?key=/public&later/Users/secret]",
+        "file://h?x=[file://[]?key=<path>&later<path>]",
+      ],
+      [
+        "Bug #1374 control a non-hex zone identifier is not a child",
+        "file://h?x=[file://[fe80::1%25eth0]?key=/public&later/Users/secret]",
+        "file://h?x=[file://[fe80::1%25eth0]?key=<path>&later<path>]",
+      ],
+      [
+        "Bug #1374 control a bracket authority truncated at end of message",
+        "file://h?x=file://[",
+        "file://h?x=file://[",
+      ],
+    ] as const)("keeps %s byte-stable", (_name, input, expected) => {
+      const first = sanitizeError(input);
+
+      expect(first).toBe(expected);
+      expect(sanitizeError(first)).toBe(first);
+      expect(sanitizeError(sanitizeError(first))).toBe(first);
+    });
+
+    // These rows are the disclosures and non-convergences this issue exists to
+    // close. Each one is red on main at 99c3b558.
+    it.each([
+      [
+        "D6 an outward handoff crossing every child close",
+        "file://h?x=[[[https://e.test/t|file://host?key=/public]]|\\Users\\SECRET\\x]",
+        "file://h?x=[[[https://e.test/t|file://host?key=<path>]]|<path>]",
+      ],
+      [
+        "D8 a drive colon that must not make its wrapper URL-bearing",
+        "file://h?x=[value|C:\\Users\\S1&name=\\Users\\S2\\y]",
+        "file://h?x=[value|<path>&name=\\Users\\S2\\y]",
+      ],
+      [
+        "D8 a forward-slash drive colon that must not make its wrapper URL-bearing",
+        "file://h?x=[value|C:/Users/S1&name=\\Users\\S2\\y]",
+        "file://h?x=[value|C:<path>&name=\\Users\\S2\\y]",
+      ],
+      [
+        "K1 a bracket-close tail that keeps the following public URL intact",
+        "file://h?x=[file://host?key=/public]\\Users\\FIRST\\x[https://host?key=/Users/SECOND/secret]",
+        "file://h?x=[file://host?key=<path>]<path>[https://host?key=/Users/SECOND/secret]",
+      ],
+      [
+        "K2 a word-bearing private root returning to its file-query owner",
+        "file://h?x=[file://host?key=/public&'https://e.test/t'&later/Users/secret]",
+        "file://h?x=[file://host?key=<path>&'https://e.test/t'&later<path>]",
+      ],
+      [
+        "Bug #1332 a literal-only wrapper keeping its named Windows value",
+        "file://h?x=[value|later=\\Users\\bob\\secret.db]",
+        "file://h?x=[value|later=\\Users\\bob\\secret.db]",
+      ],
+      [
+        "Bug #1332 the same wrapper followed by a query tail",
+        "file://h?x=[value|later=\\Users\\bob\\secret.db]?y=1",
+        "file://h?x=[value|later=\\Users\\bob\\secret.db]?y=1",
+      ],
+      [
+        "Bug #1332 the same wrapper followed by a fragment tail",
+        "file://h?x=[value|later=\\Users\\bob\\secret.db]#z",
+        "file://h?x=[value|later=\\Users\\bob\\secret.db]#z",
+      ],
+      [
+        "Bug #1332 a second named successor in the same wrapper",
+        "file://h?x=[value|later=\\Users\\bob\\secret.db&name=\\Users\\c\\d]",
+        "file://h?x=[value|later=\\Users\\bob\\secret.db&name=\\Users\\c\\d]",
+      ],
+      [
+        "Bug #1336 a direct relative successor after a nested file child",
+        "file://h?x=[https://e.test/t&/Users/a/one&file:///Users/b/two&relative/path]",
+        "file://h?x=[https://e.test/t&<path>&file://<path>&relative/path]",
+      ],
+      [
+        "Bug #1336 a relative successor after a query-bearing file child",
+        "file://h?x=[https://e.test/t&file:///Users/a/one?key=/public&relative/path]",
+        "file://h?x=[https://e.test/t&file://<path>?key=<path>&relative/path]",
+      ],
+      [
+        "Bug #1336 a relative successor after a fragment-bearing file child",
+        "file://h?x=[https://e.test/t&file:///Users/a/one#key=/public&docs/readme/more]",
+        "file://h?x=[https://e.test/t&file://<path>#key=<path>&docs/readme/more]",
+      ],
+      [
+        "Bug #1336 an incomplete Users root after a query-bearing file child",
+        "file://h?x=[https://e.test/t&file:///Users/a/one?key=/public&later/Users]",
+        "file://h?x=[https://e.test/t&file://<path>?key=<path>&later/Users]",
+      ],
+      [
+        "Bug #1344 an apostrophe-quoted public URL before a pipe handoff",
+        "file://h?x=['https://e.test/t'|\\Users\\SECRET\\x]",
+        "file://h?x=['https://e.test/t'|<path>]",
+      ],
+      [
+        "Bug #1344 an apostrophe-quoted public URL before an ampersand handoff",
+        "file://h?x=['https://e.test/t'&\\Users\\SECRET\\x]",
+        "file://h?x=['https://e.test/t'&<path>]",
+      ],
+      [
+        "Bug #1346 shape 1 the second sibling wrapper owning its pipe successor",
+        "file://h?x=[file://a?key=/pub&\\Users\\S1\\x]&[file://b?key2=/pub2|\\Users\\S2\\y]",
+        "file://h?x=[file://a?key=<path>&<path>]&[file://b?key2=<path>|<path>]",
+      ],
+      [
+        "Bug #1346 shape 2a a bare Windows tail after a deeper child close",
+        "file://h?x=[[https://e.test/t|file://host?key=/public]\\Users\\SECRET\\x]",
+        "file://h?x=[[https://e.test/t|file://host?key=<path>]<path>]",
+      ],
+      [
+        "Bug #1346 shape 2a the ampersand form of the same deeper child close",
+        "file://h?x=[[https://e.test/t&file://host?key=/public]\\Users\\SECRET\\x]",
+        "file://h?x=[[https://e.test/t&file://host?key=<path>]<path>]",
+      ],
+      [
+        "Bug #1346 shape 2b a bare Windows tail after the wrapper close",
+        "file://h?x=[file://host?key=/Users/a/private]|\\Users\\SECRET\\x",
+        "file://h?x=[file://host?key=<path>]|<path>",
+      ],
+      [
+        "Bug #1349 a pipe returning from a path-bearing nested file child",
+        "file://h?x=[file:///Users/CHILD/x|later/Users/alice/secret.db]",
+        "file://h?x=[file://<path>|later<path>]",
+      ],
+      [
+        "Bug #1374 an ancestor union across four bracket levels",
+        "file://h?x=[[[[https://e.test/t]]]]|name=\\Users\\S\\x",
+        "file://h?x=[[[[https://e.test/t]]]]|name=<path>",
+      ],
+      [
+        "Bug #1346 ownership surviving a non-owning sibling close",
+        "file://h?x=[[file://host?key=/public]x[a]]|\\Users\\SECRET\\x]",
+        "file://h?x=[[file://host?key=<path>]x[a]]|<path>]",
+      ],
+      [
+        "Bug #917 an outer apostrophe bounding a spaced nested file tail",
+        "'https://outer.test/x?next=file://host.invalid/Users/canary/My Files/private.db'",
+        "'https://outer.test/x?next=file://host.invalid<path>'",
+      ],
+      [
+        "Bug #917 an outer double quote bounding a spaced nested file tail",
+        '"https://outer.test/x?next=file://host.invalid/Users/canary/My Files/private.db"',
+        '"https://outer.test/x?next=file://host.invalid<path>"',
+      ],
+      [
+        "Bug #917 a bounded tail stopping before unrelated outer query text",
+        "'https://outer.test/x?next=file://host.invalid/Users/canary/My Files/private.db&other=1'",
+        "'https://outer.test/x?next=file://host.invalid<path>&other=1'",
+      ],
+      [
+        "Bug #917 an unquoted nested scheme keeping the enclosing quote",
+        "'https://outer.test/x?a=1|https://inner.test/x&file://host.invalid/Users/canary/My Files/private.db'",
+        "'https://outer.test/x?a=1|https://inner.test/x&file://host.invalid<path>'",
+      ],
+      [
+        "Bug #917 a piped nested file child keeping the enclosing quote",
+        "'https://outer.test/x?a=1|https://inner.test/x|file://host.invalid/Users/canary/My Files/private.db'",
+        "'https://outer.test/x?a=1|https://inner.test/x|file://host.invalid<path>'",
+      ],
+      [
+        "Bug #1374 an IPv6 authority child keeping its relative tail",
+        "file://h?x=[file://[::1]?key=/public&later/Users/secret]",
+        "file://h?x=[file://[::1]?key=<path>&later/Users/secret]",
+      ],
+      [
+        "Bug #1374 an IPv4-mapped IPv6 authority child keeping its tail",
+        "file://h?x=[file://[::ffff:1.2.3.4]?key=/public&later/Users/secret]",
+        "file://h?x=[file://[::ffff:1.2.3.4]?key=<path>&later/Users/secret]",
+      ],
+    ] as const)("resolves %s in one pass", (_name, input, expected) => {
+      const first = sanitizeError(input);
+
+      expect(first).toBe(expected);
+      expect(sanitizeError(first)).toBe(first);
+      expect(sanitizeError(sanitizeError(first))).toBe(first);
+    });
+
+    it("classifies a long word run without rescanning it per character", () => {
+      // Each character used to re-measure the word run it started, so a plain
+      // 32 KB run took 17.8 seconds. The budget is deliberately loose: it fails
+      // only if growth returns to superlinear, not on ordinary host variance.
+      const run = "a".repeat(128_000);
+      const input = `${run}/Users/canary/secret.db`;
+      const started = performance.now();
+
+      const result = sanitizeError(input);
+
+      expect(result).toBe(input);
+      expect(performance.now() - started).toBeLessThan(5_000);
+    });
+
+    it("classifies nested query-only children without rescanning suffixes", () => {
+      // Every nested file child used to walk the whole remaining message, so a
+      // deeply nested query-only chain cost one suffix scan per child.
+      // At this depth the rescanning version measured 6.7s against 0.2s here.
+      const depth = 20_000;
+      const input = `${"file://h?x=[".repeat(depth)}t${"]".repeat(depth)}`;
+      const started = performance.now();
+
+      const result = sanitizeError(input);
+
+      expect(result).toBe(input);
+      expect(performance.now() - started).toBeLessThan(5_000);
+    });
   });
 
   it("replaces SQLite constraint details with generic message", () => {
