@@ -642,12 +642,29 @@ failures that byte-for-byte content equality cannot see:
   activation, even though every canonical digest for that domain is
   identical to a correctly migrated destination -- this is why the check
   exists as its own class rather than folding into the census.
-- **`sample`**: the step-5 public-read probe runs the ordered-listing query
-  through the real `PostgreSqlConversationRepository` production read path,
-  not a hand-written re-implementation of it, and compares the result
-  against the source's own canonical `createdAt` ordering captured while
-  streaming the source. A repository bug in filtering, ordering, or row
-  count shows up here even when the underlying copied bytes are correct.
+- **`sample`**: the step-5 public reads run two probes through the real
+  production read paths, never a hand-written re-implementation of either.
+  The ordered-listing probe runs `PostgreSqlConversationRepository`'s
+  production read and compares the result against the source's own
+  canonical `createdAt` ordering captured while streaming the source; a
+  repository bug in filtering, ordering, or row count shows up here even
+  when the underlying copied bytes are correct. The search self-match
+  probe runs `PostgreSqlLexicalSearchRepository.searchMessages` against
+  `lcm.search_v1`, walking a small, seeded pool of source message
+  candidates until one candidate's own content produces a non-empty
+  destination search result -- a message finding itself, never a
+  cross-engine comparison against the source's own search behaviour,
+  since SQLite and PostgreSQL tokenize differently and reproducing
+  PostgreSQL's tokenization in this driver would be exactly the kind of
+  second implementation this item has rejected elsewhere. If every
+  candidate in the pool exhausts without a match, the probe cannot tell
+  "search is broken" apart from "the sampled candidates happen not to
+  index to anything" and does not guess: it marks itself not-run with its
+  reason, the `sample` class's classCoverage bit is false, and
+  `activationEligible` cannot be true for that pass even though nothing
+  is recorded as a mismatch. On a real project with real message content
+  this does not trigger; it exists to catch a `search_v1` configuration
+  that is wrong in a way no digest comparison can see.
 
 ### The public-probe sampling skew
 

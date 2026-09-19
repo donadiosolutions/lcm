@@ -8,6 +8,7 @@ import {
   readPostgreSqlPortableWitness,
 } from "../storage/postgresql/portable-source.js";
 import { PostgreSqlConversationRepository } from "../storage/postgresql/conversation-repository.js";
+import { PostgreSqlLexicalSearchRepository } from "../storage/postgresql/lexical-search-repository.js";
 import { probePostgreSqlPortableDestination } from "../storage/postgresql/portable-destination.js";
 import type { PostgreSqlSnapshotSession } from "../storage/postgresql/snapshot-session.js";
 import type { PostgreSqlConnectionSettings, PostgreSqlQueryExecutor } from "../storage/postgresql/contracts.js";
@@ -61,9 +62,25 @@ export const DRIVER_IMPLEMENTED_MISMATCH_CLASSES: ReadonlySet<MigrationMismatchC
   "count", "digest", "identity", "sequence", "schema", "sample", "relation", "ledger",
 ]);
 
-function buildClassCoverageVector(): MigrationClassCoverageVector {
+/**
+ * Round-2 P1 (X2): "sample" is the one class whose ran bit this driver
+ * derives from what actually happened this pass, via searchProbeRan,
+ * rather than from DRIVER_IMPLEMENTED_MISMATCH_CLASSES alone.
+ * DRIVER_IMPLEMENTED_MISMATCH_CLASSES still says the driver has a
+ * mechanism for "sample" (the listing probe unconditionally runs; the
+ * search probe has a real implementation below it), but "mechanism
+ * exists in code" and "ran this specific pass" are different claims --
+ * conflating them for "sample" was exactly how a destination whose
+ * search path was never touched could still publish as
+ * activationEligible. Every other class here keeps the static
+ * declaration: unlike search, none of them has a reachable per-run
+ * "could not evaluate" outcome distinct from either running cleanly or
+ * producing a mismatch.
+ */
+function buildClassCoverageVector(searchProbeRan: boolean): MigrationClassCoverageVector {
   return MIGRATION_MISMATCH_CLASSES.map((mismatchClass) => ({
-    class: mismatchClass, ran: DRIVER_IMPLEMENTED_MISMATCH_CLASSES.has(mismatchClass),
+    class: mismatchClass,
+    ran: mismatchClass === "sample" ? searchProbeRan : DRIVER_IMPLEMENTED_MISMATCH_CLASSES.has(mismatchClass),
   }));
 }
 
@@ -268,6 +285,32 @@ function truncateToMillisecondIso(value: string): string {
 export type MigrationPublicListingSourceEntry = Readonly<{ createdAt: string; identitySha256: string }>;
 
 /**
+ * One source "messages" record's search-probe candidate projection: its
+ * position in the canonical forward-pass stream (0-indexed, the first
+ * message encountered is ordinal 0) and its content, which the step 5
+ * search probe uses as a self-match query against the destination. Only
+ * the first MIGRATION_SEARCH_PROBE_CANDIDATE_POOL_SIZE messages ever
+ * become candidates -- see StreamedSourceCheckpoints.searchProbeCandidates
+ * for why capturing every message's content for the whole domain is not
+ * done.
+ */
+export type MigrationSearchProbeSourceEntry = Readonly<{ ordinal: number; identitySha256: string; content: string }>;
+
+/**
+ * Bound on how many "messages" records become search-probe candidates.
+ * Capturing every message's content for the whole domain in memory would
+ * materially add to the exact per-record read cost this item measured
+ * and documented as dominant (docs/migration-cutover.md's census-cost
+ * section): a project's messages domain is its largest in practice (the
+ * measured fixture alone has 4,502). A small, fixed-size candidate pool
+ * keeps this probe's cost negligible regardless of project size, at the
+ * cost of only ever considering the first of a project's messages as
+ * candidates -- acceptable because the probe only needs *some* content
+ * known to be present, not a representative sample of the whole domain.
+ */
+export const MIGRATION_SEARCH_PROBE_CANDIDATE_POOL_SIZE = 25;
+
+/**
  * The step 5 ordered-listing probe now runs through the real repository
  * (PostgreSqlConversationRepository.listConversations, the exact production
  * read path -- not hand-written SQL that would only re-test a copy of the
@@ -337,6 +380,62 @@ async function runOrderedListingProbe(
       // digest plus its canonical ordinal, and nothing else.
       identitySha256: migrationWitnessSha256(["sample", sampledRecord.identitySha256, ordinal]),
     },
+  };
+}
+
+/**
+ * Outcome of the step 5 lcm.search_v1 search probe: "ran" when some
+ * candidate's own content produced a non-empty search_v1 result on the
+ * destination (self-match, proving the search path and configuration
+ * actually find content independently known to be present); "not run"
+ * when every candidate in the pool exhausted the attempt cap without a
+ * single non-empty result. This is an attributed absence, not a
+ * mismatch: a probe with no ground truth on which candidates *should*
+ * tokenize to a searchable term cannot distinguish "search is broken"
+ * from "every sampled candidate's content happens not to index to
+ * anything", so it does not guess. It reports what it could not
+ * evaluate and lets classCoverage's sample bit -- driven by this
+ * outcome, not a static declaration -- refuse eligibility instead.
+ */
+export type MigrationSearchProbeOutcome =
+  | Readonly<{ ran: true; chosenOrdinal: number; notRunReason: null }>
+  | Readonly<{ ran: false; chosenOrdinal: null; notRunReason: string }>;
+
+/**
+ * Runs before the window, through the real
+ * PostgreSqlLexicalSearchRepository (never hand-written SQL), exactly
+ * like the listing probe above uses the real conversation repository.
+ * Walks the candidate pool starting at an index derived from
+ * seedBasisSha256 (giving sampleParameters' bound seed a real purpose
+ * rather than the decorative one round-2 review found), wrapping within
+ * the pool, trying each candidate's own content as a project-scoped
+ * full-text query until one comes back non-empty. No cross-engine
+ * ground truth is needed or computed: this asserts a message finds
+ * itself, not that this driver's own re-derivation of lcm.search_v1's
+ * tokenization agrees with PostgreSQL's -- exactly the second-
+ * implementation drift this item has rejected twice for other classes.
+ */
+export async function runSearchSelfMatchProbe(
+  executor: PostgreSqlRuntime, projectId: string,
+  candidates: readonly MigrationSearchProbeSourceEntry[], seedBasisSha256: string, signal?: AbortSignal,
+): Promise<MigrationSearchProbeOutcome> {
+  if (candidates.length === 0) {
+    return { ran: false, chosenOrdinal: null, notRunReason: "no source messages are available to search-probe" };
+  }
+  const repository = new PostgreSqlLexicalSearchRepository(executor, projectId);
+  const seedIndex = Number.parseInt(seedBasisSha256.slice(0, 8), 16) % candidates.length;
+  for (let attempt = 0; attempt < candidates.length; attempt += 1) {
+    const candidate = candidates[(seedIndex + attempt) % candidates.length]!;
+    const results = await repository.searchMessages({
+      query: candidate.content, mode: "full_text" as const, limit: 1,
+    });
+    if (results.length > 0) {
+      return { ran: true, chosenOrdinal: candidate.ordinal, notRunReason: null };
+    }
+  }
+  return {
+    ran: false, chosenOrdinal: null,
+    notRunReason: `no candidate among ${candidates.length} produced a non-empty search_v1 result within the attempt cap`,
   };
 }
 
@@ -864,6 +963,15 @@ export interface StreamedSourceCheckpoints {
    * at a real row.
    */
   readonly dependencyEdges: ReadonlyMap<PortableDomain, ReadonlySet<string>>;
+  /**
+   * Up to MIGRATION_SEARCH_PROBE_CANDIDATE_POOL_SIZE "messages" records
+   * from the start of canonical order, each with its own position
+   * (ordinal) and content. The step 5 search probe walks this pool,
+   * starting from an index derived from sampleParameters.seedBasisSha256,
+   * searching the destination for each candidate's own content until one
+   * produces a non-empty result or the pool is exhausted.
+   */
+  readonly searchProbeCandidates: readonly MigrationSearchProbeSourceEntry[];
 }
 
 export async function streamSourceCheckpoints(
@@ -872,6 +980,8 @@ export async function streamSourceCheckpoints(
   const checkpoints = new Map<PortableDomain, PortableCheckpoint>();
   const conversationEntries: Array<{ createdAt: string; identitySha256: string }> = [];
   const dependencyEdges = new Map<PortableDomain, Set<string>>();
+  const searchProbeCandidates: MigrationSearchProbeSourceEntry[] = [];
+  let messageOrdinal = 0;
   for (const domain of PORTABLE_RECORD_DOMAIN_ORDER) {
     const edgeSet = new Set<string>();
     dependencyEdges.set(domain, edgeSet);
@@ -884,6 +994,15 @@ export async function streamSourceCheckpoints(
           conversationEntries.push({
             createdAt: truncateToMillisecondIso(value.createdAt), identitySha256: record.identitySha256,
           });
+        }
+      }
+      if (domain === "messages") {
+        for (const record of batch.records) {
+          if (searchProbeCandidates.length < MIGRATION_SEARCH_PROBE_CANDIDATE_POOL_SIZE) {
+            const value = record.value as PortableRecordValueByDomain["messages"];
+            searchProbeCandidates.push({ ordinal: messageOrdinal, identitySha256: record.identitySha256, content: value.content });
+          }
+          messageOrdinal += 1;
         }
       }
       for (const record of batch.records) collectDependencyEdges(record, edgeSet);
@@ -900,6 +1019,7 @@ export async function streamSourceCheckpoints(
     checkpoints,
     conversationsPublicOrder: conversationEntries,
     dependencyEdges,
+    searchProbeCandidates,
   };
 }
 
@@ -1164,6 +1284,7 @@ async function computeVerificationReport(
     await copySource.reauthenticate();
     const {
       checkpoints: sourceCheckpoints, conversationsPublicOrder, dependencyEdges: sourceDependencyEdges,
+      searchProbeCandidates,
     } = await streamSourceCheckpoints(copySource.stream, input.signal);
     await dependencies._afterSourceCheckpointsForTesting?.();
     await copySource.reauthenticate();
@@ -1213,6 +1334,9 @@ async function computeVerificationReport(
       const { mismatch: publicListingMismatch, publicListingSha256 } = await runOrderedListingProbe(
         runtime, input.expectedIdentity.id, conversationsPublicOrder, input.signal,
       );
+      const searchProbeOutcome = await runSearchSelfMatchProbe(
+        runtime, input.expectedIdentity.id, searchProbeCandidates, input.sampleParameters.seedBasisSha256, input.signal,
+      );
 
       const session = await runtime.openReadOnlySnapshot({ projectId: input.expectedIdentity.id, signal: input.signal });
       let destinationRead: MigrationFencedDestinationRead;
@@ -1244,10 +1368,23 @@ async function computeVerificationReport(
       const relationDanglingMismatches = readRelationDanglingReferenceMismatches(
         destinationRead.dependencyEdges, destinationRead.recordIdentities,
       );
-      const domainOrder = [...PORTABLE_RECORD_DOMAIN_ORDER, "schema", "ledger", "public-listing", "public-search"] as const;
+      const domainOrder = [...PORTABLE_RECORD_DOMAIN_ORDER, "schema", "ledger", "public-listing"] as const;
+      // classCoverage's own construction-time validator refuses any
+      // mismatch total naming a class the coverage vector marks as
+      // not-run: "not-run" must mean zero evidence for the whole class,
+      // never a partial state. sample.ran is false exactly when the
+      // search probe could not evaluate this pass, so a listing mismatch
+      // found in that same pass cannot be recorded under class "sample"
+      // without contradicting that declaration -- it is suppressed here
+      // rather than crashing report construction. classCoverage's
+      // sample: false already refuses activation eligibility on its
+      // own, so no evidence is silently accepted as clean; the specific
+      // listing-drift detail is simply not the evidence carried this
+      // pass when the search probe itself could not run.
+      const sampleMismatches = searchProbeOutcome.ran && publicListingMismatch ? [publicListingMismatch] : [];
       const allMismatches = [
         ...countMismatches, ...sequenceMismatches, ...relationEdgeMismatches, ...relationDanglingMismatches,
-        ...ledgerMismatches, ...(publicListingMismatch ? [publicListingMismatch] : []),
+        ...ledgerMismatches, ...sampleMismatches,
       ];
       const fullMismatches = sortMismatches(allMismatches, domainOrder);
       // Totals must reflect the full (untruncated) evidence: truncation is
@@ -1272,13 +1409,20 @@ async function computeVerificationReport(
       ]);
       const publicProbeSha256 = migrationWitnessSha256([
         "lcm-migration-verification-public-probe-v1", MIGRATION_PUBLIC_PROBE_ORDERING_SHA256, publicListingSha256,
+        // The search probe's outcome folds in here so a report can never
+        // again record and discard it: ran plus the chosen candidate's
+        // ordinal when it ran, or the not-run reason when it did not --
+        // never the candidate's content, and never a query string.
+        searchProbeOutcome.ran
+          ? ["search-self-match", true, searchProbeOutcome.chosenOrdinal]
+          : ["search-self-match", false, searchProbeOutcome.notRunReason],
       ]);
       const reportInput: CreateMigrationVerificationReportInput = {
         generationId: input.generationId, targetGenerationId: input.targetGenerationId, bindingSha256,
         manifestRevision: input.manifestRevision, manifestChecksumSha256: input.manifestChecksumSha256,
         sourceWitness, destinationIdentity, destinationSchemaWitness,
         projectMapWitnessSha256: input.projectMapWitnessSha256, queueClassificationWitness: input.queueClassificationWitness,
-        censusVector, canonicalDelta, classCoverage: buildClassCoverageVector(),
+        censusVector, canonicalDelta, classCoverage: buildClassCoverageVector(searchProbeOutcome.ran),
         publicProbeSha256, sampleParameters: input.sampleParameters,
         mismatches, mismatchTotals,
       };

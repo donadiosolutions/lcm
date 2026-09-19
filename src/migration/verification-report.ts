@@ -92,12 +92,19 @@ function deepFreeze<T>(value: T): T {
 
 // --- Frozen mismatch vocabulary and domain ordinal ---------------------------
 
+// Round-2 review (X8): "public-search" was a mismatch-domain token no
+// code path could ever populate, since the search self-match probe
+// (verify-generation.ts's runSearchSelfMatchProbe) never emits a
+// MigrationVerificationMismatch -- its outcome folds into
+// publicProbeSha256 and classCoverage's sample bit instead. A domain
+// value nothing can ever construct is exactly the declaration-without-
+// execution shape this round exists to remove; removed rather than kept
+// as decoration.
 export const MIGRATION_RECONCILIATION_DOMAIN_ORDER = Object.freeze([
   ...PORTABLE_RECORD_DOMAIN_ORDER,
   "schema",
   "ledger",
   "public-listing",
-  "public-search",
 ] as const);
 export type MigrationReconciliationDomain = (typeof MIGRATION_RECONCILIATION_DOMAIN_ORDER)[number];
 

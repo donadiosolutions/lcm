@@ -19,9 +19,14 @@ Reconciliation now includes a sequence self-consistency bound (an identity
 sequence's on-disk state must not allow the next allocation to collide with
 a copied row, distinguishing a privilege gap from a genuinely never-called
 sequence rather than collapsing both into the same refusal), and the
-step-5 public-read probe runs through the real PostgreSQL repository path
-and is compared against the source's own canonical ordering rather than
-being recorded and discarded.
+step-5 public reads run two probes through the real PostgreSQL repository
+paths: an ordered-listing probe compared against the source's own canonical
+ordering, and a search self-match probe that finds a sampled message by its
+own content through `lcm.search_v1`. If no sampled message can be found
+this way, the sample class is marked not-run and activation eligibility is
+refused for that pass rather than silently treated as a pass, since a
+search configuration wrong in a way no digest comparison can see is exactly
+what this probe exists to catch.
 
 Reconciliation also includes a foreign-key edge-set equality check (a
 `relation`-class mismatch names the child record whose reference no

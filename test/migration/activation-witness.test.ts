@@ -253,7 +253,7 @@ describe("MigrationCanonicalDelta", () => {
   it("rejects a pseudo-domain outside the frozen 22-entry portable domain order", () => {
     // Guards the invariant that the census/delta equality class can never
     // vary by a reconciliation-report classification choice (e.g. the
-    // "schema"/"ledger"/"public-listing"/"public-search" pseudo-domains
+    // "schema"/"ledger"/"public-listing" pseudo-domains
     // verification-report.ts adds for cross-cutting mismatch classes).
     const raw = domainVector((domain, index) => ({
       domain: index === 0 ? "schema" : domain, recordCount: index, terminalIdentitySha256: HASH_A,

@@ -26,6 +26,7 @@ import {
   readRelationDanglingReferenceMismatches,
   reconcileDependencyEdges,
   readSequenceSelfConsistencyMismatches,
+  MIGRATION_SEARCH_PROBE_CANDIDATE_POOL_SIZE,
   reconcileCounts,
   SEQUENCE_BACKED_IDENTITY_COLUMN,
   sortMismatches,
@@ -178,13 +179,31 @@ function fakeConversationRecord(createdAt: string, identitySeed: string) {
   };
 }
 
+function fakeMessageRecord(content: string, identitySeed: string) {
+  return {
+    version: 1, domain: "messages" as const, domainVersion: 1, ordinal: 0, order: [],
+    identitySha256: fakeHash(`message-identity-${identitySeed}`),
+    dependencies: [],
+    value: {
+      conversationIdentitySha256: fakeHash(`conv-${identitySeed}`), seq: 1, role: "user" as const,
+      content, tokenCount: 1, createdAt: timestamp,
+    },
+    recordSha256: fakeHash(`message-record-${identitySeed}`),
+  };
+}
+
 function fakeStream(
   recordCounts: Partial<Record<PortableDomain, number>> = {},
   conversationsRecords: ReadonlyArray<ReturnType<typeof fakeConversationRecord>> = [],
+  // Round-2 P1: the search self-match probe needs at least one candidate
+  // with real content, or every test using the default fixture would
+  // see searchProbeCandidates.length === 0 and sample.ran would always
+  // be false regardless of what the test is actually exercising.
+  messagesRecords: ReadonlyArray<ReturnType<typeof fakeMessageRecord>> = [fakeMessageRecord("a routine diagnostic message body", "default")],
 ) {
   return {
     readBatch: vi.fn(async ({ domain }: { domain: PortableDomain }) => {
-      const records = domain === "conversations" ? conversationsRecords : [];
+      const records = domain === "conversations" ? conversationsRecords : domain === "messages" ? messagesRecords : [];
       const recordCount = recordCounts[domain] ?? 0;
       return {
         version: 1, manifestSha256: HASH_A, domain, records, framedBytes: 0, complete: true,
@@ -200,9 +219,10 @@ function fakeStream(
 function fakeCopySource(overrides: {
   recordCounts?: Partial<Record<PortableDomain, number>>;
   conversationsRecords?: ReadonlyArray<ReturnType<typeof fakeConversationRecord>>;
+  messagesRecords?: ReadonlyArray<ReturnType<typeof fakeMessageRecord>>;
   reauthenticate?: () => Promise<void>;
 } = {}) {
-  const stream = fakeStream(overrides.recordCounts, overrides.conversationsRecords);
+  const stream = fakeStream(overrides.recordCounts, overrides.conversationsRecords, overrides.messagesRecords);
   return {
     homeDir: "/home", stream, snapshot: {}, sourceWitness: {
       version: 1, backend: "sqlite", identitySha256: HASH_A, schemaSha256: HASH_A, contentSha256: HASH_A, capturedAt: timestamp,
@@ -315,8 +335,19 @@ function fakeSession(overrides: {
 function fakeRuntime(overrides: {
   session?: ReturnType<typeof fakeSession>;
   conversationsRows?: ReadonlyArray<Record<string, unknown>>;
+  searchRows?: ReadonlyArray<Record<string, unknown>>;
 } = {}) {
   const session = overrides.session ?? fakeSession();
+  // Default: one well-formed match, so the search self-match probe
+  // reports ran: true (finds itself) on the default fixture, exactly
+  // like the census/collation defaults elsewhere in this file assume a
+  // sound destination unless a test overrides them. Shaped to satisfy
+  // PostgreSqlLexicalSearchRepository's row decoding
+  // (messageFromRow/decodeCombinedRows): match_phase 0 is "primary".
+  const defaultSearchRows = overrides.searchRows ?? [{
+    message_id: 1, conversation_id: 1, role: "user", snippet: "match",
+    created_at: "2026-01-01T00:00:00.000Z", rank: 1, match_phase: 0,
+  }];
   return {
     health: vi.fn(async () => ({ status: "healthy", backend: "postgresql", tls: true, serverMajorVersion: 18, serverEncoding: "UTF8" })),
     query: vi.fn(async (config: { text: string }) => {
@@ -336,7 +367,18 @@ function fakeRuntime(overrides: {
       return { rows: [{ system_identifier: "7123456789" }] };
     }),
     transaction: vi.fn(async (callback: (executor: unknown) => Promise<unknown>) => callback({
-      query: vi.fn(async () => ({ rows: [] })),
+      // Round-2 P1: the search self-match probe runs
+      // PostgreSqlLexicalSearchRepository.searchMessages through
+      // runtime.transaction, which itself issues a statement_timeout
+      // read/write pair (withBoundedSearch) around the actual search
+      // query -- all three must be routed distinctly, or the timeout
+      // read fails validation before the search query ever runs.
+      query: vi.fn(async (config: { text: string }) => {
+        if (config.text.includes("current_setting('statement_timeout')")) return { rows: [{ previous_timeout: "0" }] };
+        if (config.text.includes("set_config(")) return { rows: [] };
+        if (config.text.includes("WITH input AS MATERIALIZED")) return { rows: defaultSearchRows };
+        return { rows: [] };
+      }),
     })),
     openReadOnlySnapshot: vi.fn(async () => session),
     close: vi.fn(async () => { /* fake */ }),
@@ -884,7 +926,7 @@ describe("sortMismatches", () => {
     // destination the operator-evidence path exists to serve. This test
     // goes through the real report-body constructor, not just the sort
     // function in isolation.
-    const order = [...PORTABLE_RECORD_DOMAIN_ORDER, "schema", "ledger", "public-listing", "public-search"] as const;
+    const order = [...PORTABLE_RECORD_DOMAIN_ORDER, "schema", "ledger", "public-listing"] as const;
     const mismatches = sortMismatches([
       { domain: "messages" as const, class: "ledger" as const, identitySha256: fakeHash("ledger-mismatch") },
       { domain: "messages" as const, class: "relation" as const, identitySha256: fakeHash("relation-mismatch") },
@@ -1581,7 +1623,7 @@ describe("truncateMismatchesPerClass", () => {
       identitySha256: fakeHash(`relation-machines-${String(index).padStart(4, "0")}`),
     }));
     const projectMismatches = [{ domain: "project" as const, class: "relation" as const, identitySha256: fakeHash("relation-project-0") }];
-    const order = [...PORTABLE_RECORD_DOMAIN_ORDER, "schema", "ledger", "public-listing", "public-search"] as const;
+    const order = [...PORTABLE_RECORD_DOMAIN_ORDER, "schema", "ledger", "public-listing"] as const;
     const fullMismatches = sortMismatches([...machinesMismatches, ...projectMismatches], order);
     const mismatchTotals = sortMismatches(
       totalsFor(fullMismatches) as unknown as typeof fullMismatches, order,
@@ -1809,5 +1851,109 @@ describe("verifyMigrationGeneration: public listing probe", () => {
       domain: "public-listing", class: "sample",
       identitySha256: migrationWitnessSha256(["sample-empty-source", 1]),
     });
+  }, 15000);
+});
+
+describe("verifyMigrationGeneration: search self-match probe (round-2 P1)", () => {
+  it("round-2 P1 red case: a destination whose search configuration is wrong -- everything else intact -- marks sample not-run and refuses eligibility, without throwing", async () => {
+    // The owner's own fixture: search_v1 is broken in a way that leaves
+    // every digest comparison agreeing (no listing drift, no census
+    // drift, nothing else touched), so the ONLY signal a real operator
+    // would have that something is wrong is that classCoverage's sample
+    // bit is false and activationEligible is false, on an otherwise
+    // "clean" (zero-mismatch) report.
+    stubDestinationPrimitives();
+    const recordCounts = Object.fromEntries(PORTABLE_RECORD_DOMAIN_ORDER.map((domain, index) => [domain, index])) as Partial<Record<PortableDomain, number>>;
+    const copySource = fakeCopySource({ recordCounts });
+    // searchRows: [] means every search_v1 query -- for every candidate
+    // in the pool, regardless of content -- returns nothing, simulating
+    // a broken or misconfigured search path while every other read
+    // (schema, census, ledger, sequence) is untouched.
+    const runtime = fakeRuntime({ searchRows: [] });
+    const dependencies = dependenciesFor(copySource, runtime);
+    const result = await verifyMigrationGeneration(baseInput({ homeDir: "/tmp/lcm-verify-search-broken" }), dependencies);
+    expect(result.outcome).toBe("clean");
+    expect(result.report.mismatches).toEqual([]);
+    expect(result.report.body.classCoverage).toContainEqual({ class: "sample", ran: false });
+    expect(result.report.activationEligible).toBe(false);
+  }, 15000);
+
+  it("finds a message searching for its own content and marks sample ran, folding the outcome into publicProbeSha256", async () => {
+    stubDestinationPrimitives();
+    const recordCounts = Object.fromEntries(PORTABLE_RECORD_DOMAIN_ORDER.map((domain, index) => [domain, index])) as Partial<Record<PortableDomain, number>>;
+    // Two distinct candidates so a different seed can land on a
+    // different one: HASH_A's leading hex ("aaaaaaaa") is even, landing
+    // on ordinal 0; "b" x 64's leading hex ("bbbbbbbb") is odd, landing
+    // on ordinal 1 -- both match on the first try against the default
+    // fakeRuntime, which returns a hit for any query.
+    const messagesRecords = [fakeMessageRecord("first candidate body", "one"), fakeMessageRecord("second candidate body", "two")];
+    const copySource = fakeCopySource({ recordCounts, messagesRecords });
+    const runtime = fakeRuntime();
+    const dependencies = dependenciesFor(copySource, runtime);
+    const result = await verifyMigrationGeneration(baseInput({ homeDir: "/tmp/lcm-verify-search-self-match" }), dependencies);
+    expect(result.report.body.classCoverage).toContainEqual({ class: "sample", ran: true });
+    expect(result.report.activationEligible).toBe(true);
+    // Changing which candidate the walk lands on (via a different
+    // seedBasisSha256) changes the digest: the outcome is genuinely
+    // folded in, not a constant regardless of what happened.
+    stubDestinationPrimitives();
+    const differentSeed = await verifyMigrationGeneration(
+      baseInput({ homeDir: "/tmp/lcm-verify-search-self-match-2", sampleParameters: { version: 1, strideOrdinal: 97, sampleCount: 32, seedBasisSha256: "b".repeat(64) } }),
+      dependenciesFor(fakeCopySource({ recordCounts, messagesRecords }), fakeRuntime()),
+    );
+    expect(differentSeed.report.body.publicProbeSha256).not.toBe(result.report.body.publicProbeSha256);
+  }, 15000);
+
+  it("marks the search probe not-run, with a distinct reason, when the source has no messages to probe with at all", async () => {
+    stubDestinationPrimitives();
+    const recordCounts = Object.fromEntries(PORTABLE_RECORD_DOMAIN_ORDER.map((domain, index) => [domain, index])) as Partial<Record<PortableDomain, number>>;
+    const copySource = fakeCopySource({ recordCounts, messagesRecords: [] });
+    const runtime = fakeRuntime();
+    const dependencies = dependenciesFor(copySource, runtime);
+    const result = await verifyMigrationGeneration(baseInput({ homeDir: "/tmp/lcm-verify-search-no-messages" }), dependencies);
+    expect(result.report.body.classCoverage).toContainEqual({ class: "sample", ran: false });
+    expect(result.report.activationEligible).toBe(false);
+  }, 15000);
+
+  it("caps the search-probe candidate pool at MIGRATION_SEARCH_PROBE_CANDIDATE_POOL_SIZE, still finding a match among the first N", async () => {
+    stubDestinationPrimitives();
+    const recordCounts = Object.fromEntries(PORTABLE_RECORD_DOMAIN_ORDER.map((domain, index) => [domain, index])) as Partial<Record<PortableDomain, number>>;
+    // One more message than the pool size: the (pool size + 1)-th
+    // message must be counted (advancing messageOrdinal) but never
+    // stored as a candidate, exercising the pool-size boundary the
+    // single-message default fixture never reaches.
+    const messagesRecords = Array.from(
+      { length: MIGRATION_SEARCH_PROBE_CANDIDATE_POOL_SIZE + 1 },
+      (_, index) => fakeMessageRecord(`candidate body ${index}`, `pool-${index}`),
+    );
+    const copySource = fakeCopySource({ recordCounts, messagesRecords });
+    const runtime = fakeRuntime();
+    const dependencies = dependenciesFor(copySource, runtime);
+    const result = await verifyMigrationGeneration(baseInput({ homeDir: "/tmp/lcm-verify-search-pool-cap" }), dependencies);
+    expect(result.report.body.classCoverage).toContainEqual({ class: "sample", ran: true });
+  }, 15000);
+
+  it("round-2 P1 red case: a listing mismatch alongside a not-run search probe does not crash report construction", async () => {
+    // Compound failure the validator's own rule ("a not-run class must
+    // have zero evidence") would otherwise reject at construction: a
+    // genuine listing drift and a broken search path happening in the
+    // same pass. The listing mismatch is suppressed from the persisted
+    // evidence rather than crashing, since classCoverage already refuses
+    // eligibility on sample: false alone.
+    stubDestinationPrimitives();
+    const recordCounts = Object.fromEntries(PORTABLE_RECORD_DOMAIN_ORDER.map((domain, index) => [domain, index])) as Partial<Record<PortableDomain, number>>;
+    const conversationsRecords = [fakeConversationRecord("2026-01-01T00:00:00.111000Z", "first")];
+    const copySource = fakeCopySource({ recordCounts, conversationsRecords });
+    const runtime = fakeRuntime({
+      searchRows: [],
+      conversationsRows: [
+        { conversation_id: "1", session_id: "different", title: null, bootstrapped_at: null, created_at: "2026-02-02T00:00:00.222Z", updated_at: "2026-02-02T00:00:00.222Z" },
+      ],
+    });
+    const dependencies = dependenciesFor(copySource, runtime);
+    const result = await verifyMigrationGeneration(baseInput({ homeDir: "/tmp/lcm-verify-search-and-listing-both-broken" }), dependencies);
+    expect(result.report.mismatches.some((mismatch) => mismatch.domain === "public-listing")).toBe(false);
+    expect(result.report.body.classCoverage).toContainEqual({ class: "sample", ran: false });
+    expect(result.report.activationEligible).toBe(false);
   }, 15000);
 });

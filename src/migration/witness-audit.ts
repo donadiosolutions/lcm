@@ -237,6 +237,13 @@ export const MIGRATION_WITNESS_AUDIT: readonly MigrationWitnessAuditEntry[] = Ob
     mismatchClasses: ["sample"],
   },
   {
+    id: "search-self-match-probe", bodyField: "publicProbeSha256",
+    description: "The plan-v4 step 5 lcm.search_v1 search probe: PostgreSqlLexicalSearchRepository.searchMessages, run before the window through the real repository, walking a bounded pool of source message candidates starting at an index derived from sampleParameters.seedBasisSha256 until one candidate's own content produces a non-empty destination search result (a self-match, never a cross-engine comparison against SQLite's own search behaviour).",
+    comparison: "compared-live",
+    consequence: "when a match is found, folds ran plus the chosen candidate's canonical ordinal into publicProbeSha256, and the sample class's classCoverage bit is true; when every candidate in the pool is exhausted without a match, folds the not-run reason into publicProbeSha256 instead, the sample class's classCoverage bit is false, and activationEligible cannot be true this pass -- an attributed absence per the frozen absence rule, not a mismatch and not a silent pass",
+    mismatchClasses: ["sample"],
+  },
+  {
     id: "project-map-witness", bodyField: "projectMapWitnessSha256",
     description: "Caller-supplied project-map witness digest.",
     comparison: "accepted-trust-boundary",
@@ -266,9 +273,9 @@ export const MIGRATION_WITNESS_AUDIT: readonly MigrationWitnessAuditEntry[] = Ob
   },
   {
     id: "sample-parameters", bodyField: "sampleParameters",
-    description: "Caller-supplied frozen sample stride/count/seed-basis parameters.",
+    description: "Caller-supplied frozen sample stride/count/seed-basis parameters. seedBasisSha256 now drives search-self-match-probe's candidate walk (see that entry); strideOrdinal and sampleCount remain unused by any per-record stride sampler, which this driver pass does not implement.",
     comparison: "accepted-trust-boundary",
-    missingComparison: "a per-record stride sampler is not implemented anywhere in this driver pass; bound into the report identity but does not yet drive any sampling read",
+    missingComparison: "strideOrdinal and sampleCount do not drive any per-record stride sampler, which this driver pass does not implement; bound into the report identity but otherwise inert",
     owningItem: "plan-v4's sampling scope, not yet implemented",
   },
 ]);

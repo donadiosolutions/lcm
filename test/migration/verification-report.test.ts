@@ -95,9 +95,9 @@ function baseInput(overrides: Partial<CreateMigrationVerificationReportInput> = 
 }
 
 describe("frozen mismatch vocabulary", () => {
-  it("carries 22 portable domains plus four pseudo-domains", () => {
-    expect(MIGRATION_RECONCILIATION_DOMAIN_ORDER.length).toBe(PORTABLE_RECORD_DOMAIN_ORDER.length + 4);
-    expect(MIGRATION_RECONCILIATION_DOMAIN_ORDER.slice(-4)).toEqual(["schema", "ledger", "public-listing", "public-search"]);
+  it("carries 22 portable domains plus three pseudo-domains", () => {
+    expect(MIGRATION_RECONCILIATION_DOMAIN_ORDER.length).toBe(PORTABLE_RECORD_DOMAIN_ORDER.length + 3);
+    expect(MIGRATION_RECONCILIATION_DOMAIN_ORDER.slice(-3)).toEqual(["schema", "ledger", "public-listing"]);
   });
   it("carries exactly eight closed mismatch classes", () => {
     expect(MIGRATION_MISMATCH_CLASSES).toEqual([
