@@ -266,9 +266,7 @@ describe("CI workflow", () => {
       const job = workflow.jobs[jobName];
       const setupStep = job.steps.find((step) => step.uses === "./.github/actions/setup-node");
       expect(setupStep).toBeDefined();
-      expect(setupStep?.with).toEqual(jobName === "macos-launchd"
-        ? { "node-version": "25.9.0", "cache-node-modules": "false" }
-        : { "node-version": "25.9.0" });
+      expect(setupStep?.with).toEqual({ "node-version": "25.9.0", "cache-node-modules": "false" });
       expect(job.steps.some((step) => step.uses?.startsWith("actions/setup-node@"))).toBe(false);
     }
     expect(source).not.toMatch(/\bnpm (?:ci|run)|\bnpx\b/u);
@@ -559,7 +557,7 @@ describe("CI workflow", () => {
     expect(setup).toEqual({
       name: "Set up Node.js and dependencies",
       uses: "./.github/actions/setup-node",
-      with: { "node-version": "25.9.0" },
+      with: { "node-version": "25.9.0", "cache-node-modules": "false" },
     });
     expect(build?.run).toBe("pnpm run build");
     expect(integration?.env).toEqual({

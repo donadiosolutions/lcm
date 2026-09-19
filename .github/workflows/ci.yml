@@ -214,6 +214,8 @@ jobs:
         with:
           # OS service integration runs on the latest runtime, not the floor.
           node-version: "25.9.0"
+          # GitHub-hosted runners never shared the Blacksmith node_modules cache; install from the store.
+          cache-node-modules: "false"
 
       - name: Build package
         run: pnpm run build

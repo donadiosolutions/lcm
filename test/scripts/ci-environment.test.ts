@@ -100,9 +100,16 @@ describe("CI environment cache metadata", () => {
   it("derives exact platform-specific keys without fallback prefixes", () => {
     const metadata = cacheMetadata({ RUNNER_OS: "Linux", RUNNER_ARCH: "X64" });
 
+    // The node_modules key follows the running Node version so a job that
+    // overrides the composite runtime cannot share a key with floor jobs.
     expect(metadata.nodeModulesKey).toMatch(
-      new RegExp(`^lcm-node-modules-${NODE_DEPENDENCY_CACHE_FORMAT}-linux-x64-node-${NODE_VERSION}-[0-9a-f]{64}$`, "u"),
+      new RegExp(`^lcm-node-modules-${NODE_DEPENDENCY_CACHE_FORMAT}-linux-x64-node-${process.versions.node}-[0-9a-f]{64}$`, "u"),
     );
+    expect(cacheMetadata({ RUNNER_OS: "Linux", RUNNER_ARCH: "X64" }, "25.9.0").nodeModulesKey).toMatch(
+      new RegExp(`^lcm-node-modules-${NODE_DEPENDENCY_CACHE_FORMAT}-linux-x64-node-25\\.9\\.0-[0-9a-f]{64}$`, "u"),
+    );
+    expect(cacheMetadata({ RUNNER_OS: "Linux", RUNNER_ARCH: "X64" }, "25.9.0").nodeModulesKey)
+      .not.toBe(cacheMetadata({ RUNNER_OS: "Linux", RUNNER_ARCH: "X64" }, NODE_VERSION).nodeModulesKey);
     expect(metadata.imagesKey).toMatch(
       new RegExp(`^lcm-postgresql-images-${CI_CACHE_FORMAT}-linux-x64-[0-9a-f]{64}$`, "u"),
     );

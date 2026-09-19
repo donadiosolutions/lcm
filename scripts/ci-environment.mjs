@@ -75,7 +75,10 @@ export function compareInventoryNames(left, right) {
   return 0;
 }
 
-export function cacheMetadata(environment = process.env) {
+// The node_modules key follows the runtime that installs and validates the
+// cache, so a job that overrides the composite's Node version never shares a
+// key with the floor-runtime jobs. NODE_VERSION remains the declared floor.
+export function cacheMetadata(environment = process.env, nodeVersion = process.versions.node) {
   const runnerOs = normalizedRunnerValue(environment.RUNNER_OS, process.platform);
   const runnerArch = normalizedRunnerValue(environment.RUNNER_ARCH, process.arch);
   const dependencyDigest = sha256Files(NODE_DEPENDENCY_INPUT_PATHS);
@@ -85,7 +88,7 @@ export function cacheMetadata(environment = process.env) {
     dependencyDigest,
     imageDigest,
     templateDigest,
-    nodeModulesKey: `lcm-node-modules-${NODE_DEPENDENCY_CACHE_FORMAT}-${runnerOs}-${runnerArch}-node-${NODE_VERSION}-${dependencyDigest}`,
+    nodeModulesKey: `lcm-node-modules-${NODE_DEPENDENCY_CACHE_FORMAT}-${runnerOs}-${runnerArch}-node-${nodeVersion}-${dependencyDigest}`,
     imagesKey: `lcm-postgresql-images-${CI_CACHE_FORMAT}-${runnerOs}-${runnerArch}-${imageDigest}`,
     templateKey: `lcm-postgresql-template-${CI_CACHE_FORMAT}-${runnerOs}-${runnerArch}-${templateDigest}`,
   };

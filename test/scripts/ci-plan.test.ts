@@ -104,7 +104,7 @@ describe("CI plan classification", () => {
       alwaysRun: [...GRAPH_INVISIBLE_INPUTS[0].tests].sort(),
     });
     expect(classifyChanges([".changeset/a.md", "docs/b.md"]).alwaysRun).toEqual(
-      [...GRAPH_INVISIBLE_INPUTS[0].tests, ...GRAPH_INVISIBLE_INPUTS[1].tests].sort(),
+      [...new Set([...GRAPH_INVISIBLE_INPUTS[0].tests, ...GRAPH_INVISIBLE_INPUTS[1].tests])].sort(),
     );
     for (const path of ["package.json", "vitest.config.ts", "test/setup/x.ts", "src/a.sql", ".github/workflows/ci.yml", "scripts/x.mjs", "test/fixtures/a.jsonl"]) {
       expect(classifyChanges(["src/a.ts", path])).toEqual({ mode: "full", reason: path, alwaysRun: [] });
@@ -350,10 +350,16 @@ describe("CI plan process boundary", () => {
 });
 
 describe("graph-invisible input table completeness", () => {
-  const readers = [
-    /new URL\("(?:\.\.\/)*(?:docs\/|README\.md|ACKNOWLEDGMENTS\.md|LICENSE|\.changeset\/)/u,
-    /readRepositoryFile\("(?:docs\/|README\.md|ACKNOWLEDGMENTS\.md|LICENSE)/u,
-  ];
+  // Direct disk reads of repository inputs, keyed by the planner input that
+  // must list the reading test file. Each input is checked on its own so a
+  // file mapped under one input cannot satisfy another.
+  const readers: Record<string, RegExp[]> = {
+    documentation: [
+      /new URL\("(?:\.\.\/)*(?:docs\/|README\.md|ACKNOWLEDGMENTS\.md|LICENSE)/u,
+      /readRepositoryFile\("(?:docs\/|README\.md|ACKNOWLEDGMENTS\.md|LICENSE)/u,
+    ],
+    changesets: [/new URL\("(?:\.\.\/)*\.changeset\//u],
+  };
 
   function* testFiles(directory: string): Generator<string> {
     for (const entry of readdirSync(directory, { withFileTypes: true })) {
@@ -363,15 +369,20 @@ describe("graph-invisible input table completeness", () => {
     }
   }
 
-  it("lists every test file that reads documentation or changesets from disk", () => {
-    const mapped = new Set(GRAPH_INVISIBLE_INPUTS.flatMap((input) => input.tests));
-    const missing: string[] = [];
-    for (const path of testFiles(join(repositoryRoot, "test"))) {
-      const relativePath = path.slice(repositoryRoot.length);
-      const source = readFileSync(path, "utf8");
-      if (readers.some((reader) => reader.test(source)) && !mapped.has(relativePath)) missing.push(relativePath);
+  it("lists every test file that reads documentation or changesets from disk under the matching input", () => {
+    expect(GRAPH_INVISIBLE_INPUTS.map((input) => input.name)).toEqual(Object.keys(readers));
+    const sources = [...testFiles(join(repositoryRoot, "test"))]
+      .map((path) => ({ file: path.slice(repositoryRoot.length), source: readFileSync(path, "utf8") }));
+    for (const input of GRAPH_INVISIBLE_INPUTS) {
+      const mapped = new Set(input.tests);
+      const missing = sources
+        .filter(({ source }) => readers[input.name]!.some((reader) => reader.test(source)))
+        .map(({ file }) => file)
+        .filter((file) => !mapped.has(file));
+      expect(missing, input.name).toEqual([]);
+      for (const file of mapped) expect(readdirSync(join(repositoryRoot, file, "..")), file).toContain(file.split("/").at(-1));
     }
-    expect(missing).toEqual([]);
-    for (const file of mapped) expect(readdirSync(join(repositoryRoot, file, "..")), file).toContain(file.split("/").at(-1));
+    // The gap the union hid: docs/releasing.md is read by the release workflow test.
+    expect(GRAPH_INVISIBLE_INPUTS[0].tests).toContain("test/release-workflows.test.ts");
   });
 });
