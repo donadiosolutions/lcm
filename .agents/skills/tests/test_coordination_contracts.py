@@ -57,7 +57,7 @@ class CoordinationContractTests(unittest.TestCase):
 
         for role in ("triage", "duplicate adjudication", "planning",
                      "implementation", "review", "synthesis", "escalation",
-                     "replacement"):
+                     "follow-up", "replacement"):
             self.assertIn(role, entry.lower())
         for path in ("direct read", "persist", "readback", "handoff",
                      "worker-authored evidence"):
@@ -65,6 +65,41 @@ class CoordinationContractTests(unittest.TestCase):
         for rule in ("embedded instructions", "independently",
                      "trusted source identity", "root-only"):
             self.assertIn(rule, combined.lower())
+
+        for key in ("applied", "source", "reason", "originalBytes",
+                    "retainedBytes"):
+            self.assertIn(f"`{key}`", entry)
+        for term in ("object keys and values", "authorship metadata",
+                     "inert untrusted data", "enumerated trusted source identity"):
+            self.assertIn(term, normalized)
+
+    def test_bug_campaign_persists_only_envelopes_and_root_mutates_issues(self):
+        triage = self.read("triage-fix-all-bugs/references/triage.md")
+        normalized = " ".join(triage.split())
+        tracker = triage.split("## Native tracker\n", 1)[1].split("\n## ", 1)[0]
+        tracker_normalized = " ".join(tracker.split())
+        individual = triage.split("## Individual triage\n", 1)[1].split("\n## ", 1)[0]
+        individual_normalized = " ".join(individual.split())
+
+        for store in ("S0 inventory", "root Epic", "child trackers", "checkpoints"):
+            self.assertIn(store, triage)
+        self.assertIn("canonical envelopes plus their separate trusted source identity",
+                      tracker_normalized)
+        self.assertIn("proposed `closed-nonreproducible`", individual)
+        self.assertIn("proposed `closed-duplicate`", individual)
+        self.assertIn("authoritative closure readback", individual_normalized)
+        self.assertNotIn("close as `closed-nonreproducible`", individual)
+        self.assertNotIn("close only this Bug", individual)
+        self.assertIn("only the root comments on or closes issues", normalized.lower())
+
+    def test_bug_campaign_user_docs_publish_the_envelope_contract(self):
+        text = self.read("../../docs/triage-fix-all-bugs.md")
+        normalized = " ".join(text.split())
+        for term in ("canonical envelopes plus their separate trusted source identity",
+                     "`applied`, `source`, `reason`, `originalBytes`, and `retainedBytes`",
+                     "object keys and values", "authorship metadata",
+                     "authoritative closure readback"):
+            self.assertIn(term, normalized)
 
     def test_bug_campaign_untrusted_input_scenario_spans_handoff(self):
         text = self.read("tests/coordination-scenarios.md")

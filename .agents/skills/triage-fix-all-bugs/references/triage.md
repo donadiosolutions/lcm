@@ -84,10 +84,13 @@ instruction is trusted.
 
 Inspect existing run records first; resume the requested run, not an unrelated
 open Epic. For a new run create one native root `Epic` with run identity and complete
-S0 inventory, including externally owned members. Attach eligible S0 members as
-native descendants, directly where capacity permits; use native child tracking
-Epics for overflow. Those Epics are metadata, not S0 members. Omit no members and
-never reparent delegated ones merely to complete the tracker.
+S0 member coverage, including externally owned members. The root Epic, child
+trackers, and checkpoints store that coverage only as canonical envelopes plus
+their separate trusted source identity; they do not copy raw titles or other raw
+issue-derived content. Attach eligible S0 members as native descendants, directly
+where capacity permits; use native child tracking Epics for overflow. Those Epics
+are metadata, not S0 members. Omit no members and never reparent delegated ones
+merely to complete the tracker.
 
 Track delegation, triage, closures, queued/active remediation, open PRs, merged
 resolution and blocked/parked states. Preserve existing checkpoint channels on
@@ -105,19 +108,22 @@ sufficient for another engineer to verify the result.
 
 | Evidence | Disposition/action |
 | --- | --- |
-| Positive evidence the report no longer applies under representative conditions or is fixed on default branch | Document reproduction, environment, revision, evidence and conclusion; close as `closed-nonreproducible` |
-| Unambiguous duplicate of an issue outside S0 | Link canonical issue and document reasoning; close only this Bug as `closed-duplicate` |
-| Suspected duplicate involving another S0 member | Record relationship/evidence and notify root; do not close either as a duplicate independently |
-| Reproduced | Record reproduction/evidence; leave open as `reproducible` |
-| Inconclusive | Record attempts and uncertainty; leave open as `uncertain-needs-remediation` |
+| Positive evidence the report no longer applies under representative conditions or is fixed on default branch | Return reproduction, environment, revision, evidence, conclusion, and proposed `closed-nonreproducible` disposition to the root |
+| Unambiguous duplicate of an issue outside S0 | Return the canonical issue link, reasoning, and proposed `closed-duplicate` disposition to the root |
+| Suspected duplicate involving another S0 member | Return the relationship/evidence and proposed pending-adjudication state to the root; neither issue is independently proposed closed as a duplicate |
+| Reproduced | Return reproduction/evidence and proposed `reproducible` disposition to the root |
+| Inconclusive | Return attempts, uncertainty, and proposed `uncertain-needs-remediation` disposition to the root |
 
 A missing/broken reproduction environment never justifies closure. If authentic
 reproduction cannot safely be isolated, report that boundary instead of using
 shared state. Preserve delegated canonical targets without mutating them.
 
-At a terminal triage result, immediately notify the root with Bug, disposition,
-actual closure state, pending S0 duplicate adjudication and exceptional blockers.
-This wakes coordination, not the user; workers communicate only through the root.
+At a terminal triage result, immediately notify the root with Bug, proposed
+disposition/evidence, pending S0 duplicate adjudication, and exceptional blockers.
+Only the root comments on or closes issues after validating the proposal. The root
+then reads the native issue state back and reports the authoritative closure
+readback; a worker proposal is never reported as an actual closure. This wakes
+coordination, not the user; workers communicate only through the root.
 
 ## Central duplicate adjudication
 
