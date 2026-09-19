@@ -1547,8 +1547,73 @@ describe("identity/order schema-lock", () => {
   // "projectId" directly; buildRecordShape confirms both use the exact same
   // key array at runtime. Strip that one nested-path prefix before comparing
   // so the naming convention does not masquerade as a semantic divergence.
-  function stripIdentityPrefix(fieldNames: readonly string[]): readonly string[] {
+  // Scoped to "project" only: no other domain uses a nested "identity."
+  // path today, and blanket-stripping would silently hide a real
+  // divergence if a future domain happened to name a field "identity.x".
+  function stripIdentityPrefix(domain: PortableDomain, fieldNames: readonly string[]): readonly string[] {
+    if (domain !== "project") return fieldNames;
     return fieldNames.map(name => (name.startsWith("identity.") ? name.slice("identity.".length) : name));
+  }
+
+  // Per-domain fixtures for proving, against real construction behavior,
+  // that a domain's logicalKey is hash-derived: buildRecordShape reads a
+  // stored hash field (e.g. conversationFingerprint) as the logical key,
+  // and createPortableRecord rejects a record whose stored hash field
+  // disagrees with the identity recomputed from its order/context. This is
+  // a genuine independent oracle on buildRecordShape's real behavior, not
+  // a comparison between two fields of the same hand-authored descriptor.
+  const HASH_ENFORCEMENT_BY_DOMAIN: Partial<Record<PortableDomain, {
+    readonly buildContext: (order: readonly unknown[]) => unknown;
+    readonly corrupt: (raw: Record<string, unknown>) => Record<string, unknown>;
+  }>> = {
+    conversations: {
+      buildContext: () => ({ projectIdentity: LOCAL_PROJECT_IDENTITY }),
+      corrupt: raw => ({ ...raw, conversationFingerprint: "f".repeat(64) }),
+    },
+    messages: {
+      buildContext: order => ({ conversationOrder: order.slice(0, 6).map(unwrapTaggedScalar) }),
+      corrupt: raw => ({ ...raw, conversationIdentitySha256: "f".repeat(64) }),
+    },
+    "message-parts": {
+      buildContext: order => ({ messageOrder: order.slice(0, 7).map(unwrapTaggedScalar) }),
+      corrupt: raw => ({ ...raw, messageIdentitySha256: "f".repeat(64) }),
+    },
+    "context-items": {
+      buildContext: order => ({ conversationOrder: order.slice(0, 6).map(unwrapTaggedScalar) }),
+      corrupt: raw => ({ ...raw, conversationIdentitySha256: "f".repeat(64) }),
+    },
+  };
+
+  function hashEnforcementFor(domain: PortableDomain) {
+    const entry = HASH_ENFORCEMENT_BY_DOMAIN[domain];
+    if (!entry) throw new Error(`no hash-enforcement fixture registered for domain ${domain}`);
+    return entry;
+  }
+
+  // Builds one real record for domain via the production construction path
+  // and reports whether createPortableRecord actually rejects it once its
+  // stored hash field is corrupted -- the real, runtime-observable
+  // property that makes a domain "hash-derived", independent of anything
+  // declared in the schema descriptor.
+  function hashEnforcementHolds(
+    domain: PortableDomain,
+    buildContext: (order: readonly unknown[]) => unknown,
+    corrupt: (raw: Record<string, unknown>) => Record<string, unknown>,
+  ): boolean {
+    const generation = createGeneration(sqliteUnboundGeneration());
+    const record = recordsOf(generation.records, domain)[0]!;
+    const rawValue = Object.fromEntries(
+      Object.entries(record.value as Record<string, unknown>).map(
+        ([key, value]) => [key, unwrapTaggedScalar(value)],
+      ),
+    );
+    const context = buildContext(record.order);
+    try {
+      createPortableRecord({ domain, ordinal: record.ordinal, value: corrupt(rawValue), context } as never);
+      return false;
+    } catch {
+      return true;
+    }
   }
 
   it("has exactly the four known hash-derived domains among the rest", () => {
@@ -1558,7 +1623,7 @@ describe("identity/order schema-lock", () => {
     });
     const hashDerivedDomains = equalLengthDomains.filter(domain => {
       const entry = schemaEntry(domain);
-      return canonicalJson(stripIdentityPrefix(entry.logicalKey)) !== canonicalJson(entry.identityOrderPrefix);
+      return canonicalJson(stripIdentityPrefix(domain, entry.logicalKey)) !== canonicalJson(entry.identityOrderPrefix);
     });
     expect(new Set(hashDerivedDomains)).toEqual(new Set(KNOWN_HASH_DERIVED_DOMAINS));
     // Every remaining equal-length domain must use identityOrderPrefix as its
@@ -1568,51 +1633,33 @@ describe("identity/order schema-lock", () => {
     for (const domain of equalLengthDomains) {
       if (KNOWN_HASH_DERIVED_DOMAINS.includes(domain)) continue;
       const entry = schemaEntry(domain);
-      expect(stripIdentityPrefix(entry.logicalKey)).toEqual(entry.identityOrderPrefix);
+      expect(stripIdentityPrefix(domain, entry.logicalKey)).toEqual(entry.identityOrderPrefix);
+    }
+    // Independent oracle: buildRecordShape must actually enforce the hash
+    // relationship this descriptor claims for every domain the filter
+    // above just classified as hash-derived. If a future change stops
+    // validating the stored hash field for one of these domains, this
+    // assertion fails even though the descriptor's field-name lists above
+    // would still agree with themselves.
+    for (const domain of KNOWN_HASH_DERIVED_DOMAINS) {
+      const { buildContext, corrupt } = hashEnforcementFor(domain);
+      expect(hashEnforcementHolds(domain, buildContext, corrupt)).toBe(true);
     }
   });
 
-  const HASH_ENFORCEMENT_CASES: ReadonlyArray<{
-    readonly domain: PortableDomain;
-    readonly buildContext: (order: readonly unknown[]) => unknown;
-    readonly corrupt: (raw: Record<string, unknown>) => Record<string, unknown>;
-  }> = [
-    {
-      domain: "conversations",
-      buildContext: () => ({ projectIdentity: LOCAL_PROJECT_IDENTITY }),
-      corrupt: raw => ({ ...raw, conversationFingerprint: "f".repeat(64) }),
-    },
-    {
-      domain: "messages",
-      buildContext: order => ({ conversationOrder: order.slice(0, 6).map(unwrapTaggedScalar) }),
-      corrupt: raw => ({ ...raw, conversationIdentitySha256: "f".repeat(64) }),
-    },
-    {
-      domain: "message-parts",
-      buildContext: order => ({ messageOrder: order.slice(0, 7).map(unwrapTaggedScalar) }),
-      corrupt: raw => ({ ...raw, messageIdentitySha256: "f".repeat(64) }),
-    },
-    {
-      domain: "context-items",
-      buildContext: order => ({ conversationOrder: order.slice(0, 6).map(unwrapTaggedScalar) }),
-      corrupt: raw => ({ ...raw, conversationIdentitySha256: "f".repeat(64) }),
-    },
-  ];
+  // Derived from KNOWN_HASH_DERIVED_DOMAINS rather than re-listing the
+  // four domains: adding or removing a domain from that frozen list without
+  // registering a matching HASH_ENFORCEMENT_BY_DOMAIN fixture now fails at
+  // module load instead of silently drifting out of sync.
+  const HASH_ENFORCEMENT_CASES = KNOWN_HASH_DERIVED_DOMAINS.map(domain => ({
+    domain,
+    ...hashEnforcementFor(domain),
+  }));
 
   it.each(HASH_ENFORCEMENT_CASES)(
     "enforces $domain's identity-from-order check",
     ({ domain, buildContext, corrupt }) => {
-      const generation = createGeneration(sqliteUnboundGeneration());
-      const record = recordsOf(generation.records, domain)[0]!;
-      const rawValue = Object.fromEntries(
-        Object.entries(record.value as Record<string, unknown>).map(
-          ([key, value]) => [key, unwrapTaggedScalar(value)],
-        ),
-      );
-      const context = buildContext(record.order);
-      expect(() => createPortableRecord({
-        domain, ordinal: record.ordinal, value: corrupt(rawValue), context,
-      } as never)).toThrow();
+      expect(hashEnforcementHolds(domain, buildContext, corrupt)).toBe(true);
     },
   );
 });

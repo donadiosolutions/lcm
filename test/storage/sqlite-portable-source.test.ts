@@ -358,7 +358,9 @@ describe("SQLite supplied canonical generation", () => {
   it("uses keyset scanning after 500 main instruction rows and returns exact point records",async()=>{
     const source=await open(fixture(db=>{
       const insert=db.prepare("INSERT INTO session_instruction_cache VALUES(?,?,'codex','session','/worktree','/cwd','content','eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee','2026-09-06 00:00:00')");
+      db.exec("BEGIN");
       for(let n=0;n<503;n++)insert.run(identity.projectId,n.toString(16).padStart(64,"0"));
+      db.exec("COMMIT");
     }));
     expect((await source.readDomainPage(page("session-instructions"))).records).toHaveLength(500);
     expect((await source.readDomainPage(page("session-instructions",{afterOrdinal:500}))).records).toHaveLength(3);

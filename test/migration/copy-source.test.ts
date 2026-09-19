@@ -1,10 +1,8 @@
-import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, openSync, renameSync, statSync } from "node:fs";
-import { tmpdir } from "node:os";
+import { mkdirSync } from "node:fs";
 import { join } from "node:path";
 import { DatabaseSync } from "node:sqlite";
-import { afterEach, describe, expect, it, vi } from "vitest";
+import { expect, it, vi } from "vitest";
 import {
-  BackendPublicationCoordinator,
   BackendPublicationJournalError,
   assertBackendPublicationConsumerAccess,
   withBackendPublicationAppendBarrier,
@@ -12,7 +10,6 @@ import {
   type BackendPublicationLockToken,
   type BackendPublicationDriver,
 } from "../../src/storage/backend-publication.js";
-import { SQLiteLocalHookOutboxFactory } from "../../src/storage/local-hook-outbox.js";
 import {
   assertMigrationReplayAdmission,
   prepareSqliteMigrationEnrollment,
@@ -24,10 +21,7 @@ import {
   dryRunAuthenticatedSqliteMigrationSource,
   type SqliteMigrationEnrollmentInput,
 } from "../../src/migration/maintenance.js";
-import { loadDaemonConfig } from "../../src/daemon/config.js";
-import { localProjectIdentity } from "../../src/daemon/project.js";
 import { writeFileSync } from "node:fs";
-import { SqliteStorageBackendFactory } from "../../src/storage/sqlite/factory.js";
 import * as identityApi from "../../src/machine-identity.js";
 import * as publicationApi from "../../src/storage/backend-publication.js";
 import * as identityService from "../../src/identity-service.js";
