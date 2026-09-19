@@ -108,6 +108,57 @@ describe("MigrationVerificationReportStore", () => {
     expect(second.report).toEqual(report);
   });
 
+  it("round-4 P1-adjacent: defaults expectedUid to the current process uid rather than leaving the descriptor-owner check disabled", () => {
+    // Before this fix, an omitted expectedUid stayed undefined and was
+    // passed straight through to readBoundedRegularFileWithStat, whose
+    // own check is skipped entirely when expectedUid is undefined --
+    // manifest-store.ts defaults this to the current process uid for
+    // exactly this reason, and this store had silently drifted from
+    // that pattern. beforeEach's default `store` (no expectedUid
+    // passed) already proves the happy path -- a real file this test
+    // process itself wrote reads back fine under the new default -- so
+    // this test proves the other half: that the default now actually
+    // enforces ownership rather than merely not breaking anything. It
+    // patches process.getuid so a fresh store's captured #expectedUid
+    // disagrees with the file's real owner (this test process, which
+    // wrote it through the unpatched default store above), which is the
+    // only way to produce a genuine mismatch without real multi-user
+    // file ownership.
+    const report = createMigrationVerificationReport(baseInput());
+    store.persist("generation-1", report);
+    const descriptor = Object.getOwnPropertyDescriptor(process, "getuid");
+    const real = typeof process.getuid === "function" ? process.getuid() : undefined;
+    if (real === undefined) return; // no getuid on this platform: nothing to mismatch against.
+    try {
+      Object.defineProperty(process, "getuid", { value: () => real + 1, configurable: true });
+      const mismatchedStore = new MigrationVerificationReportStore({ homeDir });
+      expect(() => mismatchedStore.read("generation-1", report.reportSha256)).toThrow("file owner is not trusted");
+    } finally {
+      if (descriptor === undefined) delete (process as { getuid?: unknown }).getuid;
+      else Object.defineProperty(process, "getuid", descriptor);
+    }
+  });
+
+  it("leaves expectedUid undefined, rather than throwing, on a platform with no process.getuid", () => {
+    // The other half of currentUid()'s own branch: a platform without
+    // process.getuid (this store's fallback, matching manifest-store.ts's
+    // identical function) must not fail construction, and the resulting
+    // store must still work -- just without an ownership check to
+    // default, which is the same behaviour this store always had before
+    // this fix on such a platform.
+    const descriptor = Object.getOwnPropertyDescriptor(process, "getuid");
+    try {
+      Object.defineProperty(process, "getuid", { value: undefined, configurable: true });
+      const noGetuidStore = new MigrationVerificationReportStore({ homeDir });
+      const report = createMigrationVerificationReport(baseInput());
+      expect(() => noGetuidStore.persist("generation-1", report)).not.toThrow();
+      expect(noGetuidStore.read("generation-1", report.reportSha256)).toEqual(report);
+    } finally {
+      if (descriptor === undefined) delete (process as { getuid?: unknown }).getuid;
+      else Object.defineProperty(process, "getuid", descriptor);
+    }
+  });
+
   it("two distinct reports for the same generation coexist under their own identities", () => {
     const clean = createMigrationVerificationReport(baseInput());
     const dirty = createMigrationVerificationReport(baseInput({

@@ -64,6 +64,20 @@ function assertGenerationId(generationId: string): void {
   }
 }
 
+/**
+ * Round-4 P1-adjacent: matches manifest-store.ts's own local copy of
+ * this exact function. Without a default, the constructor left
+ * #expectedUid undefined whenever a caller omitted it (every real
+ * caller in this codebase does), which this module then passed
+ * explicitly as undefined to every readBoundedRegularFileWithStat call
+ * -- disabling that helper's descriptor-owner check entirely rather
+ * than pinning it to the current process, so a mode-0600 report file
+ * owned by a different uid was silently accepted as authentic.
+ */
+function currentUid(): number | undefined {
+  return typeof process.getuid === "function" ? process.getuid() : undefined;
+}
+
 function assertReportSha256(reportSha256: string): void {
   if (typeof reportSha256 !== "string" || !SHA256_PATTERN.test(reportSha256)) {
     storeError("invalid-input", "migration verification report identity is invalid");
@@ -137,7 +151,7 @@ export class MigrationVerificationReportStore {
 
   constructor(options: MigrationVerificationStoreOptions = {}) {
     this.#homeDir = options.homeDir;
-    this.#expectedUid = options.expectedUid;
+    this.#expectedUid = options.expectedUid ?? currentUid();
   }
 
   /**
