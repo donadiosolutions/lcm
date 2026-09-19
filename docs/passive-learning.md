@@ -263,6 +263,11 @@ its whole lifetime, so when the configured backend changes underneath it the
 admission refuses, the daemon halts exactly as it does for promotion, and no
 event is uploaded to a backend the daemon has already lost.
 
+Each pass releases its project outbox when it finishes. The local outbox
+factory registers every repository it opens and drops one only when that
+repository closes, so a daemon holds one SQLite connection per project while
+that project is replicating and none between passes.
+
 `lcm status` reports what replication has done under `passiveEvents`: whether
 it is `enabled` at all, the `lastPassAt` timestamp, how many passes and
 projects were attempted, and how many events were uploaded, applied,

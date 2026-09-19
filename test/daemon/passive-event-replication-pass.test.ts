@@ -1,5 +1,12 @@
 import { describe, expect, it, vi } from "vitest";
+import { mkdtempSync, rmSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 import { loadDaemonConfig } from "../../src/daemon/config.js";
+import {
+  SQLiteLocalHookOutboxFactory,
+  type LocalHookOutboxRepository,
+} from "../../src/storage/local-hook-outbox.js";
 import {
   applyReplicatedPassiveEvent,
   createPassiveEventReplicationPass,
@@ -10,6 +17,14 @@ import {
 } from "../../src/daemon/passive-event-replication-pass.js";
 
 type Modules = PassiveEventReplicationModules;
+
+/**
+ * The factory keeps every repository it opens until it is closed, so the only
+ * honest measure of "the sweep leaks nothing" is its own retained set.
+ */
+function retainedRepositories(factory: SQLiteLocalHookOutboxFactory): number {
+  return (factory as unknown as { repositories: ReadonlySet<unknown> }).repositories.size;
+}
 
 function sqliteConfig() {
   return loadDaemonConfig("/nonexistent", { daemon: { port: 0 }, llm: { provider: "disabled" } });
@@ -32,7 +47,9 @@ function modules(overrides: Partial<Modules> = {}): { modules: Modules; runtime:
     close: vi.fn().mockResolvedValue(undefined),
   };
   const factory = {
-    open: vi.fn().mockResolvedValue({}),
+    open: vi.fn().mockImplementation(async () => ({
+      close: vi.fn().mockResolvedValue(undefined),
+    })),
     close: vi.fn().mockResolvedValue(undefined),
   };
   return {
@@ -320,5 +337,65 @@ describe("passive-event replication pass", () => {
     // A closed pass reopens cleanly rather than reusing a dead connection.
     await pass.run("/proj");
     expect(harness.modules.createRuntime).toHaveBeenCalledTimes(2);
+  });
+
+  // The five-minute sweep opens one outbox per project per pass. The factory
+  // registers each repository and only drops it when that repository closes,
+  // so a pass that returns without closing grows the daemon's SQLite
+  // connection set forever — the same unbounded-growth defect #1383 exists
+  // to remove.
+  it("retains no sidecar outbox once its pass has finished", async () => {
+    const directory = mkdtempSync(join(tmpdir(), "lcm-replication-outbox-"));
+    const factory = new SQLiteLocalHookOutboxFactory();
+    const opened: LocalHookOutboxRepository[] = [];
+    const harness = modules({
+      createOutboxFactory: () => factory,
+      eventsDbPath: (cwd: string) => join(directory, `${cwd.replaceAll("/", "_")}.db`),
+    });
+    const pass = createPassiveEventReplicationPass(postgresConfig(), {
+      processId: "lcm-daemon:test",
+      loadModules: async () => harness.modules,
+      createWorker: dependencies => {
+        opened.push(dependencies.local);
+        return { runOnce: async () => summary };
+      },
+    });
+
+    try {
+      for (let sweep = 0; sweep < 3; sweep += 1) {
+        await expect(pass.run("/alpha")).resolves.toEqual(summary);
+        await expect(pass.run("/beta")).resolves.toEqual(summary);
+      }
+
+      // Six real repositories were opened, and none of them is still held.
+      expect(opened).toHaveLength(6);
+      expect(new Set(opened).size).toBe(6);
+      expect(retainedRepositories(factory)).toBe(0);
+      for (const repository of opened) {
+        await expect(repository.getUnprocessed()).rejects
+          .toMatchObject({ code: "STORAGE_CLOSED" });
+      }
+    } finally {
+      await pass.close();
+      rmSync(directory, { recursive: true, force: true });
+    }
+  });
+
+  it("reports a failing outbox close without losing the pass result", async () => {
+    const failure = new Error("outbox close failed");
+    const harness = modules();
+    harness.factory.open.mockResolvedValue({
+      close: vi.fn().mockRejectedValue(failure),
+    });
+    const onError = vi.fn();
+    const pass = createPassiveEventReplicationPass(postgresConfig(), {
+      processId: "lcm-daemon:test",
+      loadModules: async () => harness.modules,
+      onError,
+      createWorker: () => ({ runOnce: vi.fn().mockResolvedValue(summary) }),
+    });
+
+    await expect(pass.run("/proj")).resolves.toEqual(summary);
+    expect(onError).toHaveBeenCalledWith(failure);
   });
 });

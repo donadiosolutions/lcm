@@ -173,17 +173,30 @@ export function createPassiveEventReplicationPass(
 
         outboxFactory ??= loaded.createOutboxFactory();
         const local = await outboxFactory.open(loaded.eventsDbPath(cwd));
-        const remote = loaded.createRepository(runtime, remoteProjectId, machineId);
-        const dependencies: PassiveEventReplicationDependencies = {
-          local,
-          remote,
-          applyEvent: applyReplicatedPassiveEvent,
-          onError: report,
-        };
-        const worker = options.createWorker === undefined
-          ? new PassiveEventReplicationWorker(dependencies, { processId: options.processId })
-          : options.createWorker(dependencies, options.processId);
-        return await worker.runOnce(signal);
+        try {
+          const remote = loaded.createRepository(runtime, remoteProjectId, machineId);
+          const dependencies: PassiveEventReplicationDependencies = {
+            local,
+            remote,
+            applyEvent: applyReplicatedPassiveEvent,
+            onError: report,
+          };
+          const worker = options.createWorker === undefined
+            ? new PassiveEventReplicationWorker(dependencies, { processId: options.processId })
+            : options.createWorker(dependencies, options.processId);
+          return await worker.runOnce(signal);
+        } finally {
+          // The factory registers every repository it opens and only releases
+          // one when that repository closes, so a sweep that kept its outbox
+          // would add a SQLite connection per project every five minutes for
+          // the life of the daemon. Releasing here cannot fail the pass: the
+          // durable work is already committed by the time we get here.
+          try {
+            await local.close();
+          } catch (error) {
+            await report(error);
+          }
+        }
       } catch (error) {
         await report(error);
         return null;
