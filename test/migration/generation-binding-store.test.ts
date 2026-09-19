@@ -11,6 +11,7 @@ import {
   rmSync,
   statSync,
   symlinkSync,
+  utimesSync,
   writeFileSync,
 } from "node:fs";
 import { tmpdir } from "node:os";
@@ -1439,9 +1440,57 @@ describe("completeInterruptedScratchUnlink / reconcileWriterScratchTwin: interna
     expect(readFileSync(finalPath, "utf8")).toBe(cleanBytes);
   });
 
+  it("completeInterruptedScratchUnlink: swallows an ENOENT raised by the unlink call itself, not only by the" +
+    " earlier lstat -- the doc comment's stated invariant (\"the twin already being gone is not an error\")" +
+    " previously held only at the lstat, leaving a real gap in the narrower window between this function's own" +
+    " lstat and its unlink, where a concurrent retry can complete the removal first", () => {
+    const homeDir = home();
+    const binding = selectionBinding();
+    const cleanBytes = captureCleanSelectionBytes(binding);
+    const { finalPath, scratchPath } = buildCrashTwin(homeDir, GENERATION_ID, "selection-activation.binding", cleanBytes);
+    const realUnlinkSync = (createRequire(import.meta.url)("node:fs") as { unlinkSync: (p: string) => void }).unlinkSync;
+    expect(() =>
+      withPatchedFs("unlinkSync", ((path: string) => {
+        if (path === scratchPath) {
+          // A concurrent retry completes the removal first, in the window
+          // between this function's own lstat (already run, above, and
+          // authenticated the twin) and this unlink call. The subsequent
+          // real unlinkSync call below then raises a genuine ENOENT rather
+          // than a hand-built one.
+          rmSync(scratchPath, { force: true });
+        }
+        return realUnlinkSync(path);
+      }) as never, () =>
+        recordMigrationSelectionBinding({ homeDir, generationId: GENERATION_ID, binding }),
+      ),
+    ).not.toThrow();
+    expect(existsSync(scratchPath)).toBe(false);
+    expect(readFileSync(finalPath, "utf8")).toBe(cleanBytes);
+  });
+
+  it("completeInterruptedScratchUnlink: propagates a genuine, non-ENOENT unlink failure unchanged rather than" +
+    " swallowing it -- only ENOENT is the documented recovered-first-by-another-retry case; any other unlink" +
+    " failure is a real problem the caller must see", () => {
+    const homeDir = home();
+    const binding = selectionBinding();
+    const cleanBytes = captureCleanSelectionBytes(binding);
+    const { scratchPath } = buildCrashTwin(homeDir, GENERATION_ID, "selection-activation.binding", cleanBytes);
+    const boom = Object.assign(new Error("permission denied for testing"), { code: "EACCES" });
+    const realUnlinkSync = (createRequire(import.meta.url)("node:fs") as { unlinkSync: (p: string) => void }).unlinkSync;
+    expect(() =>
+      withPatchedFs("unlinkSync", ((path: string) => {
+        if (path === scratchPath) throw boom;
+        return realUnlinkSync(path);
+      }) as never, () =>
+        recordMigrationSelectionBinding({ homeDir, generationId: GENERATION_ID, binding }),
+      ),
+    ).toThrow(boom);
+  });
+
   it("reconcileWriterScratchTwin: is unresolvable when the final path's own re-read (without" +
-    " requireSingleLink) no longer reports nlink=2 -- a genuine two-read race, reached only through disclosed" +
-    " dependency injection", () => {
+    " requireSingleLink) reports absent (ENOENT) rather than present -- a genuine two-read race, reached only" +
+    " through disclosed dependency injection; this pins only the first disjunct of the guard" +
+    " (finalOutcome.kind !== \"present\"), see the sibling nlink !== \"2\" test below for the second", () => {
     const homeDir = home();
     const binding = selectionBinding();
     const cleanBytes = captureCleanSelectionBytes(binding);
@@ -1462,6 +1511,53 @@ describe("completeInterruptedScratchUnlink / reconcileWriterScratchTwin: interna
               const error = new Error("ENOENT") as NodeJS.ErrnoException;
               error.code = "ENOENT";
               throw error;
+            }
+            return readBoundedRegularFileWithStat(path, options);
+          },
+        },
+      ),
+    ).toThrow(MigrationBindingUnresolvableError);
+  });
+
+  it("reconcileWriterScratchTwin: is unresolvable when the final path's own re-read (without" +
+    " requireSingleLink) reports present but with nlink no longer exactly \"2\" -- a genuine third-link race" +
+    " between the requireSingleLink read that triggered recovery and this re-read, immediately before the" +
+    " destructive unlink runs, reached only through disclosed dependency injection; this pins the second" +
+    " disjunct of the guard (finalOutcome.value.nlink !== \"2\") that the sibling ENOENT test above does not" +
+    " reach", () => {
+    const homeDir = home();
+    const binding = selectionBinding();
+    const cleanBytes = captureCleanSelectionBytes(binding);
+    const { finalPath } = buildCrashTwin(homeDir, GENERATION_ID, "selection-activation.binding", cleanBytes);
+    expect(() =>
+      recordMigrationSelectionBinding(
+        { homeDir, generationId: GENERATION_ID, binding },
+        {
+          readWithStat: (path: string, options: BoundedFileOptions) => {
+            if (path === finalPath && options.requireSingleLink === true) {
+              throw new Error("file has multiple hard links");
+            }
+            if (path === finalPath) {
+              // A third link appears between the requireSingleLink read
+              // that triggered recovery and this re-read: present, but
+              // nlink is no longer exactly "2". Rebuilt field-by-field
+              // (never via object-spread) because several BoundedFileResult
+              // fields, including nlink itself, are non-enumerable.
+              const real = readBoundedRegularFileWithStat(path, options);
+              return {
+                content: real.content,
+                mtimeMs: real.mtimeMs,
+                dev: real.dev,
+                ino: real.ino,
+                mode: real.mode,
+                uid: real.uid,
+                gid: real.gid,
+                nlink: "3",
+                parentDev: real.parentDev,
+                parentIno: real.parentIno,
+                exactDev: real.exactDev,
+                exactIno: real.exactIno,
+              };
             }
             return readBoundedRegularFileWithStat(path, options);
           },
@@ -1554,6 +1650,93 @@ describe("completeInterruptedScratchUnlink / reconcileWriterScratchTwin: interna
     // what correctly passes over it, not the name filter.
     const decoyName = "." + "selection-activation.binding" + "." + randomBytes(12).toString("hex") + ".tmp";
     writeFileSync(join(directory, decoyName), "not the same content at all\n", { mode: 0o600 });
+    expect(() =>
+      recordMigrationSelectionBinding({ homeDir, generationId: GENERATION_ID, binding }),
+    ).toThrow(MigrationBindingUnresolvableError);
+  });
+
+  it("reconcileWriterScratchTwin: refuses to treat a name-matching candidate as a genuine scratch twin when" +
+    " ANY error escapes reading it -- here a symlink raising ELOOP at open(2) (O_NOFOLLOW) -- fail-closed by" +
+    " construction rather than by enumerating recognised codes, so an unrecognised failure from an untrusted" +
+    " scan candidate becomes MigrationBindingUnresolvableError instead of escaping raw and wedging the retry" +
+    " permanently", () => {
+    const homeDir = home();
+    const binding = selectionBinding();
+    const directory = migrationGenerationBindingDirectory(homeDir, GENERATION_ID);
+    mkdirSync(directory, { recursive: true, mode: 0o700 });
+    const finalPath = join(directory, "selection-activation.binding");
+    // nlink=2 comes from an UNRELATED name (never matches the scratch
+    // pattern), exactly as the decoy test above, so the twin search's only
+    // name-matching candidate is the symlink below.
+    const unrelatedPath = join(directory, "unrelated-hardlink-name-eloop");
+    writeFileSync(unrelatedPath, "not a writer scratch file\n", { mode: 0o600 });
+    linkSync(unrelatedPath, finalPath);
+    expect(statSync(finalPath).nlink).toBe(2);
+    // A name-matching scan candidate that is a live symlink rather than a
+    // regular file. readBoundedRegularFileWithStat opens with O_NOFOLLOW,
+    // so this raises a genuine ELOOP at open(2) -- a real .code the
+    // classifier still does not recognise (it is not ENOENT/ENOTDIR,
+    // EACCES/EPERM, or "file has multiple hard links"), which is exactly
+    // why enumerating codes could never close this gap.
+    const symlinkName = "." + "selection-activation.binding" + "." + randomBytes(12).toString("hex") + ".tmp";
+    symlinkSync(unrelatedPath, join(directory, symlinkName));
+    expect(() =>
+      recordMigrationSelectionBinding({ homeDir, generationId: GENERATION_ID, binding }),
+    ).toThrow(MigrationBindingUnresolvableError);
+  });
+
+  it("reconcileWriterScratchTwin: refuses a full-metadata clone (a separate inode carrying its own nlink=2," +
+    " byte-identical content, and identical mode, uid, gid and mtime) as a genuine twin -- the only geometry" +
+    " where exactWriterLinkPair's dev/ino fields are the sole discriminator, since every other compared field" +
+    " is forced equal, so this is the one fixture that actually proves those fields matter rather than being" +
+    " redundant with content or nlink", () => {
+    const homeDir = home();
+    const binding = selectionBinding();
+    const cleanBytes = captureCleanSelectionBytes(binding);
+    const directory = migrationGenerationBindingDirectory(homeDir, GENERATION_ID);
+    mkdirSync(directory, { recursive: true, mode: 0o700 });
+    const finalPath = join(directory, "selection-activation.binding");
+    // final gets nlink=2 via an UNRELATED sibling link (never matches the
+    // scratch pattern), so no genuine twin exists for the scan to find --
+    // only the clone below is a name-matching candidate.
+    const finalContentPath = join(directory, "final-content-source-clone-geometry");
+    writeFileSync(finalContentPath, cleanBytes, { mode: 0o600 });
+    linkSync(finalContentPath, finalPath);
+
+    // The clone: a SEPARATE inode (its own independent write), given its
+    // own nlink=2 via its own second link, byte-identical content, and
+    // identical mode -- and, set explicitly via utimesSync rather than
+    // left to chance, identical mtime. uid/gid match automatically: the
+    // same test process wrote both files.
+    const clonePath = join(
+      directory,
+      "." + "selection-activation.binding" + "." + randomBytes(12).toString("hex") + ".tmp",
+    );
+    writeFileSync(clonePath, cleanBytes, { mode: 0o600 });
+    const cloneSiblingLinkPath = join(directory, "clone-sibling-link");
+    linkSync(clonePath, cloneSiblingLinkPath);
+    // Round-tripping an EXISTING file's stat through utimesSync loses
+    // sub-millisecond precision (a Date carries only whole milliseconds),
+    // which would make the two mtimes merely close rather than the exact
+    // equality exactWriterLinkPair requires. Setting BOTH files to the
+    // identical explicit integer-second value sidesteps that: there is no
+    // pre-existing fractional component to round away on either side.
+    const fixedMtimeSeconds = 1_700_000_000;
+    utimesSync(finalPath, fixedMtimeSeconds, fixedMtimeSeconds);
+    utimesSync(clonePath, fixedMtimeSeconds, fixedMtimeSeconds);
+    const finalStat = statSync(finalPath);
+    expect(finalStat.nlink).toBe(2);
+    const cloneStat = statSync(clonePath);
+    expect(cloneStat.nlink).toBe(2);
+    expect(cloneStat.ino).not.toBe(finalStat.ino);
+    expect(cloneStat.mtimeMs).toBe(finalStat.mtimeMs);
+    expect(cloneStat.mode).toBe(finalStat.mode);
+
+    // Every field exactWriterLinkPair compares is now equal between final
+    // and clone except dev/ino identity, so a refusal here can only be
+    // caused by the inode-fields comparison -- not by content, nlink,
+    // parent identity, mode, uid, gid or mtime, each of which is already
+    // forced equal above.
     expect(() =>
       recordMigrationSelectionBinding({ homeDir, generationId: GENERATION_ID, binding }),
     ).toThrow(MigrationBindingUnresolvableError);

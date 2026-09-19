@@ -606,7 +606,19 @@ function completeInterruptedScratchUnlink(scratchPath: string, publishedIdentity
   ) {
     return;
   }
-  unlinkSync(scratchPath);
+  try {
+    unlinkSync(scratchPath);
+  } catch (error) {
+    // The twin already being gone (ENOENT) here is not an error either --
+    // another retry may have completed the unlink in the window between
+    // this function's own lstat above and this unlink, the exact
+    // invariant this function's doc comment states. Any other failure
+    // propagates raw rather than being swallowed, mirroring
+    // consumeBoundedRegularFile's identical ENOENT-after-unlink handling
+    // in security-files.ts.
+    if ((error as NodeJS.ErrnoException).code === "ENOENT") return;
+    throw error;
+  }
 }
 
 type ReconcileDecision = "reused" | "conflict";
@@ -669,7 +681,20 @@ function reconcileWriterScratchTwin(
   let twinPath: string | undefined;
   for (const entry of entries) {
     if (!namePattern.test(entry)) continue;
-    const candidateOutcome = readAt(join(directory, entry));
+    // A scan candidate is a directory entry this module did not create and
+    // cannot vouch for, so its error surface is open-ended: a symlink
+    // raises ELOOP at open(2) (O_NOFOLLOW), and a socket or any other
+    // exotic file type could raise something else again. Enumerating
+    // codes or messages can never cover an open-ended surface, so any
+    // read of a scan candidate that does not produce a trusted
+    // present-or-absent outcome -- recognised or not -- is fail-closed
+    // here rather than left to escape raw.
+    let candidateOutcome: ReturnType<typeof readAt>;
+    try {
+      candidateOutcome = readAt(join(directory, entry));
+    } catch {
+      return unresolvable();
+    }
     if (candidateOutcome.kind === "unresolvable") return unresolvable();
     if (candidateOutcome.kind === "absent") continue;
     if (!exactWriterLinkPair(finalOutcome.value, candidateOutcome.value)) continue;
