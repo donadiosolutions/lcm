@@ -1,0 +1,85 @@
+name: Set up Node.js and dependencies
+description: Provision the pinned Node.js, verified pnpm, the exact pnpm store cache, and validated node_modules.
+
+inputs:
+  node-version:
+    description: Node.js version to install. The default is the declared engines floor and must match NODE_VERSION in scripts/ci-environment.mjs.
+    required: false
+    default: "25.4.0"
+  cache-node-modules:
+    description: Restore and validate the exact node_modules cache. Requires Linux; other platforms install from the pnpm store.
+    required: false
+    default: "true"
+
+outputs:
+  node-modules-cache-hit:
+    description: Whether the exact node_modules cache was restored.
+    value: ${{ steps.restore-node-modules.outputs.cache-hit }}
+
+runs:
+  using: composite
+  steps:
+    - name: Set up Node
+      uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+      with:
+        node-version: ${{ inputs.node-version }}
+
+    - name: Bootstrap verified pnpm
+      shell: bash
+      run: |
+        set -Eeuo pipefail
+        bootstrap_root="$(mktemp -d "$RUNNER_TEMP/lcm-pnpm.XXXXXX")"
+        pnpm_bin="$(node scripts/bootstrap-pnpm.mjs --destination "$bootstrap_root/pnpm")"
+        printf '%s\n' "$pnpm_bin" >> "$GITHUB_PATH"
+        printf 'npm_config_store_dir=%s\n' "$RUNNER_TEMP/lcm-pnpm-store" >> "$GITHUB_ENV"
+
+    - name: Locate pnpm store
+      id: pnpm-store
+      shell: bash
+      run: |
+        set -Eeuo pipefail
+        store_path="$(pnpm store path)"
+        printf 'path=%s\n' "$store_path" >> "$GITHUB_OUTPUT"
+
+    - name: Cache pnpm store
+      uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+      with:
+        path: ${{ steps.pnpm-store.outputs.path }}
+        key: pnpm-store-v1-${{ runner.os }}-${{ runner.arch }}-node-${{ inputs.node-version }}-${{ hashFiles('package.json', 'pnpm-lock.yaml', '.npmrc', 'pnpm-workspace.yaml', 'scripts/bootstrap-pnpm.mjs') }}
+
+    - name: Derive exact cache keys
+      if: ${{ inputs.cache-node-modules == 'true' }}
+      id: cache-metadata
+      shell: bash
+      run: node scripts/ci-environment.mjs cache-metadata >> "$GITHUB_OUTPUT"
+
+    - name: Restore installed Node dependencies
+      if: ${{ inputs.cache-node-modules == 'true' }}
+      id: restore-node-modules
+      uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+      with:
+        path: node_modules
+        key: ${{ steps.cache-metadata.outputs.node-modules-key }}
+
+    - name: Install or validate Node dependencies
+      shell: bash
+      env:
+        CACHE_NODE_MODULES: ${{ inputs.cache-node-modules }}
+        NODE_MODULES_CACHE_HIT: ${{ steps.restore-node-modules.outputs.cache-hit }}
+      run: |
+        set -Eeuo pipefail
+        if [[ "$CACHE_NODE_MODULES" != "true" ]]; then
+          pnpm install --frozen-lockfile
+        elif [[ "$NODE_MODULES_CACHE_HIT" == "true" ]]; then
+          node scripts/ci-environment.mjs validate-node-modules node_modules
+        else
+          pnpm install --frozen-lockfile
+          node scripts/ci-environment.mjs write-node-modules-stamp node_modules
+        fi
+
+    - name: Save installed Node dependencies
+      if: ${{ inputs.cache-node-modules == 'true' && steps.restore-node-modules.outputs.cache-hit != 'true' }}
+      uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+      with:
+        path: node_modules
+        key: ${{ steps.cache-metadata.outputs.node-modules-key }}

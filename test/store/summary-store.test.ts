@@ -7,6 +7,7 @@ import { getLcmConnection, closeLcmConnection } from "../../src/db/connection.js
 import { runLcmMigrations } from "../../src/db/migration.js";
 import { SummaryStore } from "../../src/store/summary-store.js";
 import { ConversationStore } from "../../src/store/conversation-store.js";
+import { REGEX_SNIPPET_REDACTION_FALLBACK } from "../../src/store/regex-snippet.js";
 
 const tempDirs: string[] = [];
 
@@ -385,6 +386,8 @@ describe("SummaryStore — context items", () => {
 // ── searchSummaries — regex mode ──────────────────────────────────────────────
 
 describe("SummaryStore — searchSummaries regex", () => {
+  const truncationMarker = "…[truncated]";
+
   it("finds summaries matching a regex pattern", async () => {
     const db = makeDb();
     const store = makeStore(db);
@@ -396,6 +399,86 @@ describe("SummaryStore — searchSummaries regex", () => {
     const results = await store.searchSummaries({ query: "hook", mode: "regex" });
     expect(results.length).toBeGreaterThanOrEqual(1);
     expect(results.some((r) => r.summaryId === "sreg-1")).toBe(true);
+  });
+
+  it("redacts and bounds whole-row snippets while preserving zero-width matches", async () => {
+    const db = makeDb();
+    const store = makeStore(db);
+    const convId = await makeConversation(db);
+    await store.insertSummary({
+      summaryId: "regex-summary-secret",
+      conversationId: convId,
+      kind: "leaf",
+      content: `prefix token=ghp_${"A".repeat(36)} ${"s".repeat(600)}`,
+      tokenCount: 1,
+    });
+
+    const [wholeRow] = await store.searchSummaries({
+      conversationId: convId,
+      query: "[\\s\\S]*",
+      mode: "regex",
+    });
+    const [empty] = await store.searchSummaries({
+      conversationId: convId,
+      query: "^",
+      mode: "regex",
+    });
+    const [short] = await store.searchSummaries({
+      conversationId: convId,
+      query: "prefix",
+      mode: "regex",
+    });
+
+    expect(Array.from(wholeRow.snippet)).toHaveLength(512);
+    expect(wholeRow.snippet).toContain("[REDACTED]");
+    expect(wholeRow.snippet).not.toContain("ghp_");
+    expect(wholeRow.snippet.endsWith(truncationMarker)).toBe(true);
+    expect(empty.snippet).toBe("");
+    expect(short.snippet).toBe("prefix");
+  });
+
+  it("prevents compositional credential disclosure across regex queries", async () => {
+    const db = makeDb();
+    const store = makeStore(db);
+    const convId = await makeConversation(db);
+    const canary = `ghp_${"B".repeat(36)}`;
+    await store.insertSummary({
+      summaryId: "regex-summary-compositional",
+      conversationId: convId,
+      kind: "leaf",
+      content: `safe-summary-sentinel token=${canary} ordinary-summary-term`,
+      tokenCount: 1,
+    });
+
+    const [firstHalf] = await store.searchSummaries({
+      conversationId: convId,
+      query: "ghp_[A-Za-z0-9]{18}",
+      mode: "regex",
+    });
+    const [secondHalf] = await store.searchSummaries({
+      conversationId: convId,
+      query: "(?<=ghp_[A-Za-z0-9]{18})[A-Za-z0-9]{18}",
+      mode: "regex",
+    });
+    const [wholeRow] = await store.searchSummaries({
+      conversationId: convId,
+      query: "[\\s\\S]*",
+      mode: "regex",
+    });
+    const [ordinary] = await store.searchSummaries({
+      conversationId: convId,
+      query: "ordinary-summary-term",
+      mode: "regex",
+    });
+
+    expect(firstHalf.snippet).toBe(REGEX_SNIPPET_REDACTION_FALLBACK);
+    expect(secondHalf.snippet).toBe(REGEX_SNIPPET_REDACTION_FALLBACK);
+    expect(firstHalf.snippet + secondHalf.snippet).not.toContain(canary);
+    expect(wholeRow.snippet).toContain("safe-summary-sentinel");
+    expect(wholeRow.snippet).toContain(REGEX_SNIPPET_REDACTION_FALLBACK);
+    expect(wholeRow.snippet).not.toBe(REGEX_SNIPPET_REDACTION_FALLBACK);
+    expect(wholeRow.snippet).not.toContain(canary);
+    expect(ordinary.snippet).toBe("ordinary-summary-term");
   });
 
   it("returns empty when no summary matches regex", async () => {
@@ -415,6 +498,41 @@ describe("SummaryStore — searchSummaries regex", () => {
     ).rejects.toThrow(/unsafe/i);
   });
 
+  it("throws on invalid regex syntax", async () => {
+    const store = makeStore(makeDb());
+    await expect(store.searchSummaries({ query: "[", mode: "regex" })).rejects.toThrow();
+  });
+
+  it("validates regex before returning no results for nonpositive limits", async () => {
+    const db = makeDb();
+    const store = makeStore(db);
+    await expect(
+      store.searchSummaries({ query: nestedQuantifierFixture(), mode: "regex", limit: 0 }),
+    ).rejects.toThrow(/unsafe/i);
+    await expect(
+      store.searchSummaries({ query: "[", mode: "regex", limit: 0 }),
+    ).rejects.toThrow();
+
+    const convId = await makeConversation(db);
+    await store.insertSummary({
+      summaryId: "nonpositive-regex-limit",
+      conversationId: convId,
+      kind: "leaf",
+      content: "visible regex summary",
+      tokenCount: 1,
+    });
+
+    for (const limit of [0, -1]) {
+      const results = await store.searchSummaries({
+        conversationId: convId,
+        query: "visible",
+        mode: "regex",
+        limit,
+      });
+      expect(results).toEqual([]);
+    }
+  });
+
   it("respects limit in regex search", async () => {
     const db = makeDb();
     const store = makeStore(db);
@@ -425,6 +543,48 @@ describe("SummaryStore — searchSummaries regex", () => {
     }
     const results = await store.searchSummaries({ query: "item", mode: "regex", limit: 2 });
     expect(results).toHaveLength(2);
+  });
+
+  it("streams past newer non-matches and limits newest matching summaries", async () => {
+    const db = makeDb();
+    const store = makeStore(db);
+    const convId = await makeConversation(db);
+    await store.insertSummary({
+      summaryId: "stream-oldest",
+      conversationId: convId,
+      kind: "leaf",
+      content: "target oldest",
+      tokenCount: 1,
+    });
+    await store.insertSummary({
+      summaryId: "stream-newest-match",
+      conversationId: convId,
+      kind: "leaf",
+      content: "target newest",
+      tokenCount: 1,
+    });
+    await store.insertSummary({
+      summaryId: "stream-newest-row",
+      conversationId: convId,
+      kind: "leaf",
+      content: "skip newest row",
+      tokenCount: 1,
+    });
+    db.prepare("UPDATE summaries SET created_at = ? WHERE summary_id = ?")
+      .run("2026-01-01 00:00:01", "stream-oldest");
+    db.prepare("UPDATE summaries SET created_at = ? WHERE summary_id = ?")
+      .run("2026-01-01 00:00:02", "stream-newest-match");
+    db.prepare("UPDATE summaries SET created_at = ? WHERE summary_id = ?")
+      .run("2026-01-01 00:00:03", "stream-newest-row");
+
+    const results = await store.searchSummaries({
+      conversationId: convId,
+      query: "target",
+      mode: "regex",
+      limit: 1,
+    });
+
+    expect(results).toMatchObject([{ summaryId: "stream-newest-match", snippet: "target" }]);
   });
 
   it("filters by conversationId in regex search", async () => {
