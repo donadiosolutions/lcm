@@ -20,7 +20,7 @@ import { createPortableIndex, type PortableIndex } from '../portable-index.js';
 import type { PostgreSqlConnectionSettings, PostgreSqlQueryExecutor, PostgreSqlQueryOptions } from './contracts.js';
 import { buildPostgreSqlClientConfig } from './client-config.js';
 import { verifyPostgreSqlTransferSchema } from './runtime-readiness.js';
-import { assertPostgreSqlRecordCapability, insertCanonicalRecord, listCanonicalHeaders, readCanonicalRow, assertPostgreSqlExistingConstraints, listPostgreSqlRecordUniqueKeys, validatePostgreSqlRecordRelations } from './portable-mapping.js';
+import { assertPostgreSqlRecordCapability, insertCanonicalRecord, listCanonicalHeaders, readCanonicalRow, readCanonicalContentRows, canonicalRowContentSha256, assertPostgreSqlExistingConstraints, listPostgreSqlRecordUniqueKeys, validatePostgreSqlRecordRelations } from './portable-mapping.js';
 import { createPostgreSqlPortableSource, readPostgreSqlPortableWitness } from './portable-source.js';
 
 export interface PostgreSqlPortableDestinationInput {
@@ -370,7 +370,26 @@ export async function applyPortableBatchInTransaction(executor:PostgreSqlQueryEx
       const mapping=await executor.query<{native_key:string}>({text:'SELECT native_key FROM lcm.transfer_identities WHERE run_id=$1 AND domain=$2 AND identity_sha256=$3',values:[state.input.runId,domain,identity]},options(state,signal));
       if(mapping.rows.length!==1)fail('checkpoint-mismatch');return mapping.rows[0]!.native_key;
     },signal);
-    await executor.query({text:'INSERT INTO lcm.transfer_identities (run_id,domain,identity_sha256,ordinal,native_key,record_sha256) VALUES ($1,$2,$3,$4,$5,$6)',values:[state.input.runId,record.domain,record.identitySha256,String(record.ordinal),key,record.recordSha256]},options(state,signal));
+    // IDENTITY_DOMAINS rows are admission-time identity references this
+    // run looks up rather than writes, and readCanonicalRow's scope for
+    // machines requires a linking row (alias/session/transcript/etc.)
+    // that may not exist yet when the machine identity itself is
+    // processed. There is no new canonical content to fingerprint for
+    // these domains, so record_sha256 (already authenticated identity
+    // evidence) stands in; completePortableDestinationInTransaction
+    // excludes IDENTITY_DOMAINS from the re-verification that depends on
+    // this column.
+    const contentSha256=IDENTITY_DOMAINS.includes(record.domain as typeof IDENTITY_DOMAINS[number])
+      ? record.recordSha256
+      : canonicalRowContentSha256(
+        // Read back inside this same fenced transaction, immediately
+        // after the write, so content_sha256 fingerprints what this
+        // transaction actually committed rather than a value asserted
+        // from outside it.
+        await readCanonicalRow(executor,state.input.expectedIdentity.id,record.domain,key,signal)
+          ?? fail('checkpoint-mismatch'),
+      );
+    await executor.query({text:'INSERT INTO lcm.transfer_identities (run_id,domain,identity_sha256,ordinal,native_key,record_sha256,content_sha256) VALUES ($1,$2,$3,$4,$5,$6,$7)',values:[state.input.runId,record.domain,record.identitySha256,String(record.ordinal),key,record.recordSha256,contentSha256]},options(state,signal));
   }
   const checkpointBytes=Buffer.from(serializePortableCheckpoint(batch.checkpoint));
   await executor.query({text:'INSERT INTO lcm.transfer_batches (run_id,domain,prior_checkpoint_sha256,batch_sha256,checkpoint_bytes,checkpoint_sha256,first_ordinal,next_ordinal) VALUES ($1,$2,$3,$4,$5,$6,$7,$8)',values:[state.input.runId,batch.domain,batch.priorCheckpointSha256??INITIAL,batchDigest(batch),checkpointBytes,batch.checkpoint.checkpointSha256,String(prior?.nextOrdinal??0),String(batch.checkpoint.nextOrdinal)]},options(state,signal));
@@ -431,6 +450,39 @@ async function verifiedCompletionState(executor:PostgreSqlQueryExecutor,authorit
   if(!row||!runMatches(state,row,proof.manifest))fail('destination-conflict');
   const saved=await progress(state,proof.manifest.manifestSha256,signal,executor);
   if(canonicalJson(saved.checkpoints.map(checkpoint=>checkpoint.checkpointSha256))!==canonicalJson(proof.checkpoints))fail('verification-failed');
+  // The checkpoint-chain recheck above only proves this run's own
+  // batch-apply bookkeeping has not moved; it says nothing about the
+  // canonical rows those batches wrote. A canonical mutation made through
+  // any other path (a second run, promotion/dedup, compaction, a direct
+  // edit) would leave transfer_batches untouched while still changing
+  // what verify() actually fingerprinted. Re-derive the same per-row
+  // content fingerprint captured at write time (see
+  // applyPortableBatchInTransaction) for every record this run wrote, and
+  // fail closed on any row that no longer matches or has disappeared.
+  // Batched via readCanonicalContentRows: one query per
+  // PORTABLE_LIMITS.maxBatchRecords locators per domain, not one query per
+  // record.
+  const identities=await executor.query<{domain:string;native_key:string;content_sha256:string}>({text:'SELECT domain,native_key,content_sha256 FROM lcm.transfer_identities WHERE run_id=$1 ORDER BY domain,native_key',values:[state.input.runId]},options(state,signal));
+  const byDomain=new Map<PortableDomain,{locator:string;expected:string}[]>();
+  for(const identity of identities.rows){
+    // IDENTITY_DOMAINS rows carry no independently re-derivable content
+    // fingerprint (see applyPortableBatchInTransaction); they stay
+    // authenticated by the identity checks this pipeline already runs.
+    if(IDENTITY_DOMAINS.includes(identity.domain as typeof IDENTITY_DOMAINS[number]))continue;
+    const list=byDomain.get(identity.domain as PortableDomain)??[];
+    list.push({locator:identity.native_key,expected:identity.content_sha256});
+    byDomain.set(identity.domain as PortableDomain,list);
+  }
+  for(const [domain,entries] of byDomain){
+    for(let offset=0;offset<entries.length;offset+=PORTABLE_LIMITS.maxBatchRecords){
+      const chunk=entries.slice(offset,offset+PORTABLE_LIMITS.maxBatchRecords);
+      const current=await readCanonicalContentRows(executor,state.input.expectedIdentity.id,domain,chunk.map(entry=>entry.locator),signal);
+      for(const entry of chunk){
+        const row=current.get(entry.locator);
+        if(!row||canonicalRowContentSha256(row)!==entry.expected)fail('verification-failed');
+      }
+    }
+  }
   return {state,row};
 }
 export async function completePortableDestinationInTransaction(executor:PostgreSqlQueryExecutor,authority:PortableRecordWriter,verification:PortableDestinationVerification,signal?:AbortSignal):Promise<void>{

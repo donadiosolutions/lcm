@@ -961,6 +961,36 @@ this migration: the SQLite adapter already performs direct raw-content
 equality, and the public `findExactContent` contract is unchanged for both
 backends.
 
-The latest snapshot covers 27 tables, 101 indexes, 204 constraints, 254
+The 0007 snapshot covered 27 tables, 101 indexes, 204 constraints, 254
 column ACLs, and 883 definition objects. Previous migration snapshots remain
+pinned for safe incremental upgrades.
+
+## Transfer identity content fingerprint
+
+Migration `0008_transfer_identity_content_digest.sql` adds an ordinary,
+required `content_sha256` `text` column to `lcm.transfer_identities`,
+checked against the same lowercase-hex-SHA-256 pattern as `record_sha256`.
+`applyPortableBatchInTransaction` populates it inside the same fenced
+transaction that writes the identity row: for every domain outside
+`IDENTITY_DOMAINS` (machines, project, project-aliases), it reads the row
+back through the same connection immediately after writing it and
+fingerprints the exact SQL projection `readCanonicalRow` returns.
+`IDENTITY_DOMAINS` rows carry no independently re-derivable canonical
+content — they are admission-time identity lookups, not writes — so they
+reuse `record_sha256` there and are excluded from the completion recheck
+below.
+
+`completePortableDestinationInTransaction` now re-derives this fingerprint
+for every non-identity row the run wrote, batched through
+`readCanonicalContentRows` at up to `PORTABLE_LIMITS.maxBatchRecords`
+(500) locators per query, and fails completion closed if any row's current
+content no longer matches what was captured at write time or the row is
+gone. This closes the gap where `verifyPortableDestinationComplete` reads
+the live destination entirely outside any lease-held transaction: without
+this recheck, completion only re-validated its own `transfer_batches`
+checkpoint chain, which a canonical mutation from any other path (a second
+run, promotion/dedup, compaction, a direct edit) would leave untouched.
+
+The latest snapshot covers 27 tables, 101 indexes, 205 constraints, 255
+column ACLs, and 886 definition objects. Previous migration snapshots remain
 pinned for safe incremental upgrades.

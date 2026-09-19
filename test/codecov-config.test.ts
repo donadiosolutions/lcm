@@ -837,7 +837,14 @@ describe("Codecov configuration", () => {
       // #1195 checksummed packaged migration loading remains schema-owned.
       // #1306 adds the 0007 promoted-content digest migration and its
       // schema snapshot, keeping the packaged migration manifest here.
+      // #1378 adds the 0008 transfer-identity content-digest migration
+      // and its regenerated schema snapshot; ownership is unchanged.
       ["src/storage/postgresql/migrations.ts", "integration-postgresql-schema"],
+      // #1378 reads back each written record inside the same fenced
+      // transaction and stores its content fingerprint; both files keep
+      // their established owner.
+      ["src/storage/postgresql/portable-destination.ts", "integration-postgresql-portable"],
+      ["src/storage/postgresql/portable-mapping.ts", "integration-postgresql-portable"],
       // #1306 indexes owner exact-content lookup by a generated SHA-256
       // digest, retaining the raw-equality residual it always used.
       // #1354 adds the promoted-memory decision serializer beside the
