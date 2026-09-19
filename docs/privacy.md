@@ -650,14 +650,25 @@ The `Security` section of the doctor output shows:
   ownership remains independent from a nested public-URL child, allowing every
   immediate bare path and later word-bearing private parameter to redact on the
   same pass. A nested exact file URL retains its own path/query classification
-  while bound to the observable enclosing owner; after the child span ends, a
-  depth-keyed returned-parent set classifies every later same-wrapper bare or
-  word-bearing private value. Closing an inner wrapper removes only that depth,
-  preserving still-open outer owners until their matching close or a hard
-  reset. URL syntax owns only the text that follows it, so a URL at the end of
+  while bound to the observable enclosing owner; after the child span ends, the
+  ownership facts recorded for that wrapper classify every later same-wrapper
+  bare or word-bearing private value. Those facts move outward only when a
+  group closes, so closing an inner wrapper leaves still-open outer owners
+  intact until their matching close or a hard reset.
+  URL syntax owns only the text that follows it, so a URL at the end of
   a whitespace-delimited group does not make an earlier named Windows value in
   that group a path, while the same value written after the URL is still
-  redacted. A nested file child that does not own a query region returns
+  redacted. This holds for a nested `file://` child exactly as it does for an
+  ordinary public URL, so a trailing file URL never reaches back over a value
+  written before it. A one-character scheme such as `a://host` is URL syntax
+  like any longer scheme; only a Windows drive root, which has a single slash
+  after its colon rather than two, is excluded. Query or fragment punctuation
+  inside a bracket group is ownership evidence only within a span that already
+  carries URL syntax, so bracketed prose whose only URL-shaped character is a
+  `?` leaves a named Windows value unchanged. A named root-relative Windows
+  value following a nested file child's path is redacted on the first pass, so
+  a message that crosses several forwarding layers keeps the same bytes.
+  A nested file child that does not own a query region returns
   ownership to the wrapper containing its brackets, so bracketing such a child
   no longer changes how a following `&` or `|` successor is classified; that
   return still expires at the wrapper's own matching close.

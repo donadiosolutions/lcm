@@ -18,3 +18,11 @@ Sanitizing an error message twice now gives the same result for a nested file
 URL whose path is followed by a delimiter and a private root, because ownership
 no longer reads a `<path>` marker from an earlier pass as evidence about the
 child that produced it.
+
+A one-character URL scheme such as `a://host` is recognized as URL syntax, so a
+private value written after one is redacted instead of being left in clear,
+while a Windows drive root is still a private path. A named Windows value after
+a nested file path is redacted on the first pass, so forwarding an already
+sanitized message no longer changes its bytes. Bracketed prose whose only
+URL-shaped character is a question mark keeps its named Windows value, and a
+quote around a URL stops bridging whitespace after a single gap.
