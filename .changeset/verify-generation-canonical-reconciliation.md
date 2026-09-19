@@ -23,6 +23,19 @@ step-5 public-read probe runs through the real PostgreSQL repository path
 and is compared against the source's own canonical ordering rather than
 being recorded and discarded.
 
+Reconciliation also includes a foreign-key edge-set equality check (a
+`relation`-class mismatch names the child record whose reference no
+longer matches the source, catching a remapped-to-the-wrong-parent
+identity that an ordinary dangling-reference check cannot see) and a
+transfer-ledger check (a `ledger`-class mismatch when the destination's
+recorded transfer run, batch checkpoints or identity mapping disagree
+with the manifest or the census). The destination-schema witness now
+verifies the destination's own applied-migrations history rather than
+the currently running binary's compiled-in migration bundle, and a
+hand-maintained map of which columns have an identity sequence to bound
+is itself checked against the live schema on every run, refusing rather
+than silently under-covering a column a future migration adds.
+
 Verification cost scales with the row count in scope: the census reads and
 re-hashes each row individually, so its wall time is roughly linear in row
 count rather than a flat per-domain cost, and the census, sequence check and
