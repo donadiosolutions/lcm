@@ -526,7 +526,11 @@ The `Security` section of the doctor output shows:
   preserve their scheme and authority spelling while replacing a non-root path
   after the authority with `<path>`, including an initial Windows drive. A quote
   immediately before the `file` scheme lets the redacted path contain spaces
-  until the matching quote or a newline. Empty and root-only file URLs remain
+  until the matching quote or a newline. That quote also bounds every later
+  nested file URL inside the same quoted span, including one reached after a
+  space, and a nested URL carrying a quote of its own does not replace it. The
+  quote bridges a single whitespace gap; a second gap, a line break, or the
+  matching quote ends it. Empty and root-only file URLs remain
   unchanged. Unmatched or path-wrapping brackets in file URLs do not stop path
   redaction; valid bracketed IPv6 authorities, including zone IDs, remain
   intact. When a closing path-wrapping bracket is immediately followed by a
@@ -650,7 +654,14 @@ The `Security` section of the doctor output shows:
   depth-keyed returned-parent set classifies every later same-wrapper bare or
   word-bearing private value. Closing an inner wrapper removes only that depth,
   preserving still-open outer owners until their matching close or a hard
-  reset. Within a child query or fragment, an ampersand word-bearing `Users`
+  reset. URL syntax owns only the text that follows it, so a URL at the end of
+  a whitespace-delimited group does not make an earlier named Windows value in
+  that group a path, while the same value written after the URL is still
+  redacted. A nested file child that does not own a query region returns
+  ownership to the wrapper containing its brackets, so bracketing such a child
+  no longer changes how a following `&` or `|` successor is classified; that
+  return still expires at the wrapper's own matching close.
+  Within a child query or fragment, an ampersand word-bearing `Users`
   root returns to the retained parent and redacts on the same pass. The same
   narrow handoff remains available after an intervening public URL child while
   that wrapper depth is retained, including a named root-relative Windows
@@ -659,9 +670,10 @@ The `Security` section of the doctor output shows:
   word-bearing `Users` root, or named Windows/drive/UNC value returns to the
   quoted-file parent and restores that parent for later children. This does not
   trust marker text, classify ordinary relative values as private on the
-  returned-parent transition, or make backslashes global. The direct-relative
-  nested-file query/fragment family remains deferred: its first pass preserves
-  the relative bytes and its next stable pass conservatively redacts them.
+  returned-parent transition, or make backslashes global. A direct relative
+  successor of a nested file child keeps its bytes unchanged, on the first pass
+  and on every later pass, whether that child carried a path, a query, or a
+  fragment.
   An unquoted exact file wrapper immediately followed by an ampersand-separated
   public URL is recognized from that observable syntax on every pass. The
   doubled-bracket pathless policy retains the observable scheme, authority, and
@@ -670,9 +682,11 @@ The `Security` section of the doctor output shows:
   retained URL syntax. A literal `<path>` followed directly by `?` or `#` carries
   no provenance; slash-bearing values in that ambiguous form are conservatively
   redacted. The observable outer brackets of a pathless file query or fragment
-  remain the owner across arbitrary literal text, so a query or fragment value
-  beginning with a root-relative Windows backslash is also redacted while that
-  wrapper remains open. This does not make a single backslash a path start in
+  remain the owner across arbitrary literal text, so a bare query or fragment
+  value beginning with a root-relative Windows backslash is also redacted while
+  that wrapper remains open. A named value such as `later=\Users\bob\secret.db`
+  in a wrapper whose remaining content is only literal text is not treated as a
+  path and stays unchanged. This does not make a single backslash a path start in
   ordinary prose or non-file URLs. Separately quoted wrappers retain their
   conservative unspaced-URL behavior. These boundaries make the first sanitized
   result stable without treating an arbitrary `<path>` marker as trusted context.
