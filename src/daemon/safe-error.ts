@@ -122,7 +122,7 @@ function wordBearingWindowsValuePathStart(
 interface BracketGroupIndex {
   groupOf: Int32Array;
   depth: Int32Array;
-  urlBearing: Uint8Array;
+  urlBearingBefore: Uint8Array;
   fileChildBearing: Uint8Array;
   filePathChildBearing: Uint8Array;
   childCloseOwner: Uint8Array;
@@ -220,6 +220,11 @@ function classifyBracketGroups(chars: readonly string[]): BracketGroupIndex {
   // questions in constant time instead of rescanning the run each time.
   const wordRunEnds = computeWordRunEnds(chars);
   const urlBearing: number[] = [0];
+  // URL syntax is recorded per position as well as per group, because a URL
+  // cannot own a sibling value that precedes it. The per-group flag still
+  // carries facts outward on close; this records whether the group already
+  // carried URL syntax when each position was reached.
+  const urlBearingBefore = new Uint8Array(chars.length);
   const fileChildBearing: number[] = [0];
   // A child that reached a path returns ownership to every wrapper that
   // outlives it, unlike fileChildBearing, which expires with the wrapper that
@@ -253,6 +258,7 @@ function classifyBracketGroups(chars: readonly string[]): BracketGroupIndex {
         const held = stack[stack.length - 1];
         groupOf[index] = held;
         depth[index] = stack.length - 1;
+        if (urlBearing[held] === 1) urlBearingBefore[index] = 1;
         continue;
       }
       // Whitespace is a hard ownership boundary, matching the scanner reset, so
@@ -294,6 +300,7 @@ function classifyBracketGroups(chars: readonly string[]): BracketGroupIndex {
     const current = stack[stack.length - 1];
     groupOf[index] = current;
     depth[index] = stack.length - 1;
+    if (urlBearing[current] === 1) urlBearingBefore[index] = 1;
     if (pathlessChildQueryStarts[index] === 1) pathlessQueryActive[current] = 1;
     if (pathlessQueryActive[current] === 1) {
       // The region is held on the group that opened it, so a sibling wrapper
@@ -365,7 +372,7 @@ function classifyBracketGroups(chars: readonly string[]): BracketGroupIndex {
     queryBearing: Uint8Array.from(queryBearing),
     whitespace,
     wordRunEnds,
-    urlBearing: Uint8Array.from(urlBearing),
+    urlBearingBefore,
     fileChildBearing: Uint8Array.from(fileChildBearing),
     filePathChildBearing: Uint8Array.from(filePathChildBearing),
   };
@@ -379,10 +386,11 @@ function findUrlPathStarts(chars: readonly string[]): UrlPathStarts {
   const nestedFileSchemeStarts = new Uint8Array(chars.length);
   const spacedFileTail = new Uint8Array(chars.length);
   const groups = classifyBracketGroups(chars);
-  // Ownership is a property of the enclosing bracket group, asked at read time,
-  // so no ownership decision depends on the order in which flags were written.
+  // Ownership is asked at read time rather than mutated, so no decision depends
+  // on the order in which flags were written. URL syntax owns only the text
+  // that follows it, so a trailing URL cannot claim an earlier sibling value.
   const ownsRootedSuccessors = (index: number): boolean =>
-    groups.urlBearing[groups.groupOf[index]] === 1 ||
+    groups.urlBearingBefore[index] === 1 ||
     groups.fileChildBearing[groups.groupOf[index]] === 1;
   // Facts propagate outward on close, so an enclosing group already carries
   // everything its children carried. Checking the adjacent close is therefore

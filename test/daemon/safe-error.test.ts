@@ -4414,6 +4414,36 @@ describe("sanitizeError", () => {
         "file://h?x=[[file://<path>]&later<path>]&later/Users/outside",
       ],
       [
+        "Bug #1332 a trailing URL not owning an earlier named value",
+        "name=\\Users\\literal|https://e.test/t",
+        "name=\\Users\\literal|https://e.test/t",
+      ],
+      [
+        "Bug #1332 the ampersand form of that trailing URL",
+        "name=\\Users\\literal&https://e.test/t",
+        "name=\\Users\\literal&https://e.test/t",
+      ],
+      [
+        "Bug #1332 a bracketed group whose only URL trails the value",
+        "[name=\\Users\\literal|https://e.test/t]",
+        "[name=\\Users\\literal|https://e.test/t]",
+      ],
+      [
+        "Bug #1332 control a leading URL still owns the later named value",
+        "https://e.test/t|name=\\Users\\literal",
+        "https://e.test/t|name=<path>",
+      ],
+      [
+        "Bug #1332 control the bracketed form of that leading URL",
+        "[https://e.test/t|name=\\Users\\literal]",
+        "[https://e.test/t|name=<path>]",
+      ],
+      [
+        "Bug #1332 control a drive value still redacts before a trailing URL",
+        "name=C:\\Temp\\x|https://e.test/t",
+        "name=<path>|https://e.test/t",
+      ],
+      [
         "Bug #917 a quoted span keeping bracket ownership across a space",
         "'https://outer.test/x?next=[[file://one/Users/a/My Files/one.db]&later/Users/secret]'",
         "'https://outer.test/x?next=[[file://one<path>]&later<path>]'",
