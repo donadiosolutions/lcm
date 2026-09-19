@@ -21,24 +21,33 @@ configuration. SQLite remains the default. With `storage.backend` set to
 `postgresql`, reads, writes, native session import, compaction, and promoted
 knowledge transfer use that PostgreSQL database. Each selected project must
 already be linked to a registered remote project and the local machine must
-be registered. Missing bindings or database failures stop the operation;
-commands never fall back to a local SQLite database. Backend selection applies
-to the configured home and daemon, rather than individual projects.
+be registered. A machine-wide identity or publication refusal, or a database
+failure while a project's storage is open, stops the operation; commands
+never fall back to a local SQLite database. An `--all` enumeration is the one
+exception: a single project's missing PostgreSQL binding is reported for that
+project while every other selected project still continues, as described
+below. Backend selection applies to the configured home and daemon, rather
+than individual projects.
 
-`lcm export --all`, `lcm promote --all`, and `lcm compact --all` enumerate authenticated locally known
-project paths and bindings, including bindings that have no SQLite database or
-`meta.json`. Aliases of the same selected project are processed once. This does
-not enumerate every project hosted by the PostgreSQL server. An unbound local
-project requires `lcm project create` or `lcm project link <project-id>` before
-it can be selected with PostgreSQL.
+`lcm export --all`, `lcm promote --all`, `lcm import --all`, and
+`lcm compact --all` enumerate authenticated locally known project paths and
+bindings, including bindings that have no SQLite database or `meta.json`.
+Aliases of the same selected project are processed once. This does not
+enumerate every project hosted by the PostgreSQL server. With
+`storage.backend` set to `postgresql`, an unbound local project is still
+enumerated rather than aborting the run: it is reported as that project's own
+failure, carrying the `lcm project create` or `lcm project link <project-id>`
+remedy, while every other selected project is still processed. This condition
+is specific to the PostgreSQL backend; SQLite has no binding to check.
 
 `lcm promote --all` processes the canonical paths from those bindings even when
 no local `meta.json` exists. `--verbose` reports each project's counts and
 `--dry-run` previews the same selected projects. Progress and summaries go to
 stderr. A failed project request is reported and makes the command exit with
-status 1; other admitted projects may still complete. Identity or publication
-refusals stop the command, and no successful empty-result message hides a failed
-scan.
+status 1; other admitted projects may still complete. A machine-wide identity
+or publication admission refusal stops the command entirely; a single
+project's own failure, including an unbound PostgreSQL binding, does not, and
+no successful empty-result message hides a failed scan.
 
 Unbound-project errors explain how to run `lcm project create` or
 `lcm project link <project-id>`. Missing local storage errors direct you to
