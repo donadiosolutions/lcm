@@ -663,6 +663,67 @@ describe("MigrationActivationWitness", () => {
       "unexpected-state",
     );
   });
+  it("round-4 P2 red case: rejects a hand-built activation payload carrying rollback-only evidence, even with a checksum recomputed to match", () => {
+    // createMigrationActivationWitness would refuse to construct this
+    // combination at all, but before this fix the parser only checked
+    // that the checksum matched whatever content was handed to it --
+    // never that the content obeyed the same discriminated-union rule
+    // the constructor enforces. A payload built by hand (never through
+    // the constructor) with kind "activation" but real rollback fields
+    // attached, and its checksum honestly recomputed over that exact
+    // tampered content, passed the checksum check with nothing else to
+    // catch it.
+    const e = epoch(0);
+    const a = attempt({ epochId: e.epochId, deltaSeed: 0, censusSeed: 0 });
+    const tamperedPayload = {
+      version: 1 as const,
+      kind: "activation" as const,
+      epochId: e.epochId,
+      attemptId: a.attemptId,
+      censusMatchVerdict: true,
+      postEpochDelta: canonicalDelta(0),
+      postEpochCensus: censusVector(0),
+      rollbackMode: "pre-write" as const,
+    };
+    const tampered = { ...tamperedPayload, checksumSha256: migrationWitnessSha256(tamperedPayload) };
+    expectWitnessError(() => parseMigrationActivationWitness(tampered), "invalid-input");
+  });
+  it("round-4 P2: rejects a hand-built rollback payload missing its required evidence, even with a checksum recomputed to match", () => {
+    const e = epoch(0);
+    const a = attempt({ epochId: e.epochId });
+    const missingDelta = {
+      version: 1 as const,
+      kind: "rollback" as const,
+      epochId: e.epochId,
+      attemptId: a.attemptId,
+      censusMatchVerdict: false,
+      postEpochDelta: null,
+      postEpochCensus: null,
+      rollbackMode: null,
+    };
+    expectWitnessError(
+      () => parseMigrationActivationWitness({ ...missingDelta, checksumSha256: migrationWitnessSha256(missingDelta) }),
+      "invalid-input",
+    );
+    // The OR's other half: postEpochDelta present, but rollbackMode
+    // absent -- a different way to be missing required evidence, and
+    // the only way to reach this branch without also tripping the
+    // first half of the same condition.
+    const missingMode = {
+      version: 1 as const,
+      kind: "rollback" as const,
+      epochId: e.epochId,
+      attemptId: a.attemptId,
+      censusMatchVerdict: false,
+      postEpochDelta: canonicalDelta(0),
+      postEpochCensus: null,
+      rollbackMode: null,
+    };
+    expectWitnessError(
+      () => parseMigrationActivationWitness({ ...missingMode, checksumSha256: migrationWitnessSha256(missingMode) }),
+      "invalid-input",
+    );
+  });
   it("parses postEpochDelta and postEpochCensus payloads on a rollback witness", () => {
     const e = epoch(0);
     const a = attempt({ epochId: e.epochId, deltaSeed: 0, censusSeed: 0 });

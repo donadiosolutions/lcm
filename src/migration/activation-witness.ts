@@ -744,6 +744,24 @@ export function parseMigrationActivationWitness(value: unknown): MigrationActiva
   }
   const postEpochDelta = record.postEpochDelta === null ? null : parseMigrationCanonicalDelta(record.postEpochDelta);
   const postEpochCensus = record.postEpochCensus === null ? null : parseMigrationCensusVector(record.postEpochCensus);
+  // Round-4 P2: mirrors createMigrationActivationWitness's own
+  // discriminated-union rule, which this parser previously left
+  // unenforced -- a hand-built "activation" payload carrying rollback-
+  // only evidence (or a "rollback" payload missing its required
+  // evidence), with a checksum recomputed to match that exact
+  // combination, passed the checksum check below with no other guard
+  // to catch it. classifyMigrationRollbackMode's own cross-check
+  // against epoch/attempt is not repeated here, since neither is part
+  // of this serialized witness to re-derive it from; this closes the
+  // half of the constructor's validation that depends only on the
+  // witness's own fields.
+  if (record.kind === "activation") {
+    if (postEpochDelta !== null || postEpochCensus !== null || record.rollbackMode !== null) {
+      witnessError("invalid-input", "activation witness carries rollback-only evidence");
+    }
+  } else if (postEpochDelta === null || (record.rollbackMode !== "pre-write" && record.rollbackMode !== "post-write")) {
+    witnessError("invalid-input", "rollback witness is missing required evidence");
+  }
   const payload = {
     version: 1 as const,
     kind: record.kind as MigrationActivationWitness["kind"],
