@@ -625,7 +625,7 @@ describe("Codecov configuration", () => {
     expect(ownershipCounts.size).toBe(243);
   });
 
-  test("keeps response-fence and #681/#700/#701/#703/#705/#709/#710/#713/#756/#726/#734/#737/#742/#760/#763/#804/#805/#824/#825/#833/#888/#864/#866/#722/#786/#952/#814/#882/#930/#969/#989/#1003/#1049/#964/#1106/#1191/#1196/#1229/#1321/#1338/#1353/#1358 files in their intended components", () => {
+  test("keeps response-fence and #681/#700/#701/#703/#705/#709/#710/#713/#756/#726/#734/#737/#742/#760/#763/#804/#805/#824/#825/#833/#888/#864/#866/#722/#786/#952/#814/#882/#930/#969/#989/#1003/#1049/#964/#1106/#1191/#1196/#1229/#1321/#1338/#1353/#1354/#1358 files in their intended components", () => {
     const config = readCodecovConfig();
     expect(config).toBeDefined();
     if (config === undefined) {
@@ -738,6 +738,11 @@ describe("Codecov configuration", () => {
       ["src/daemon/passive-event-processor.ts", "unit-daemon-events"],
       // #1153 exact identity and #1158 backend-guarded owner scope remain
       // within the existing promotion component.
+      // #1354 serializes promoted-memory deduplication decisions with a
+      // project-scoped transaction advisory lock. The change is confined to
+      // existing files and adds no production file, so every touched file
+      // keeps its established owner and the component topology is unchanged;
+      // these pins record that decision.
       ["src/promotion/dedup.ts", "unit-promotion"],
       // #1106/#618 keep discovery-related files in their established owners.
       ["src/daemon/server.ts", "unit-daemon-core"],
@@ -801,6 +806,10 @@ describe("Codecov configuration", () => {
       ["src/migration/sqlite-snapshot.ts", "unit-migration-cutover"],
       ["src/storage/contracts.ts", "unit-storage-abstractions"],
       ["src/storage/portable-record-stream.ts", "unit-storage-abstractions"],
+      // #1354 supplies the promoted-memory decision serializer only from the
+      // PostgreSQL transaction scope. A component path regex already matched
+      // this file, but the owner list had never named it.
+      ["src/storage/postgresql/project-storage.ts", "unit-storage-abstractions"],
       ["src/storage/postgresql/factory.ts", "integration-postgresql-runtime"],
       // #1195 checksummed packaged migration loading remains schema-owned.
       // #1306 adds the 0007 promoted-content digest migration and its
@@ -808,6 +817,8 @@ describe("Codecov configuration", () => {
       ["src/storage/postgresql/migrations.ts", "integration-postgresql-schema"],
       // #1306 indexes owner exact-content lookup by a generated SHA-256
       // digest, retaining the raw-equality residual it always used.
+      // #1354 adds the promoted-memory decision serializer beside the
+      // repositories it serializes.
       ["src/storage/postgresql/memory-repositories.ts", "integration-postgresql-memory"],
       ["src/storage/postgresql/summary-context-repositories.ts", "integration-postgresql-memory"],
       // #989 event-sidecar parent authentication stays local-persistence-owned.
