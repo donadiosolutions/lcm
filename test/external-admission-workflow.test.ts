@@ -161,6 +161,36 @@ const acceptedEventFixtures: EventFixture[] = [
       repository: { full_name: REPOSITORY },
     },
   }),
+  makeEventFixture("managed Copilot requested", "workflow_run", true, {
+    action: "requested",
+    workflowRun: {
+      event: "dynamic",
+      head_sha: HEAD_SHA,
+      name: "Running Copilot Code Review",
+      path: "dynamic/agents/copilot-pull-request-reviewer",
+      repository: { full_name: REPOSITORY },
+    },
+  }),
+  makeEventFixture("managed Copilot in_progress", "workflow_run", true, {
+    action: "in_progress",
+    workflowRun: {
+      event: "dynamic",
+      head_sha: HEAD_SHA,
+      name: "Running Copilot Code Review",
+      path: "dynamic/agents/copilot-pull-request-reviewer",
+      repository: { full_name: REPOSITORY },
+    },
+  }),
+  makeEventFixture("managed Copilot completed", "workflow_run", true, {
+    action: "completed",
+    workflowRun: {
+      event: "dynamic",
+      head_sha: HEAD_SHA,
+      name: "Running Copilot Code Review",
+      path: "dynamic/agents/copilot-pull-request-reviewer",
+      repository: { full_name: REPOSITORY },
+    },
+  }),
   makeEventFixture("DCO created", "check_run", true, {
     action: "created",
     checkRun: {
@@ -195,6 +225,36 @@ const acceptedEventFixtures: EventFixture[] = [
 ];
 
 const rejectedEventFixtures: EventFixture[] = [
+  makeEventFixture("managed Copilot wrong dynamic path", "workflow_run", false, {
+    action: "requested",
+    workflowRun: {
+      event: "dynamic",
+      head_sha: HEAD_SHA,
+      name: "Running Copilot Code Review",
+      path: "dynamic/agents/untrusted-review",
+      repository: { full_name: REPOSITORY },
+    },
+  }),
+  makeEventFixture("managed Copilot spoofed run name", "workflow_run", false, {
+    action: "requested",
+    workflowRun: {
+      event: "dynamic",
+      head_sha: HEAD_SHA,
+      name: "Copilot",
+      path: "dynamic/agents/copilot-pull-request-reviewer",
+      repository: { full_name: REPOSITORY },
+    },
+  }),
+  makeEventFixture("repository workflow named Copilot", "workflow_run", false, {
+    action: "requested",
+    workflowRun: {
+      event: "pull_request",
+      head_sha: HEAD_SHA,
+      name: "Copilot",
+      path: ".github/workflows/copilot.yml",
+      repository: { full_name: REPOSITORY },
+    },
+  }),
   makeEventFixture("CI wrong workflow path", "workflow_run", false, {
     workflowRun: {
       event: "pull_request",
@@ -440,6 +500,11 @@ type AdmissionScenario =
   | "equal-dco-created"
   | "equal-dco-rerequested"
   | "equal-dco-completed"
+  | "review-requested-newer"
+  | "review-in-progress-equal"
+  | "review-completed-equal"
+  | "review-completed-newer"
+  | "review-completed-terminal"
   | "no-unique-pr"
   | "protected-main"
   | "protected-maintenance"
@@ -567,6 +632,7 @@ function runAdmissionScenario(
   let eventSource = "repository_dispatch";
   let eventWorkflowRunId = "";
   let eventWorkflowRunAction = "";
+  let eventWorkflowRunPath = "";
   let eventCheckRunId = "";
   let eventCheckRunAction = "";
 
@@ -575,21 +641,25 @@ function runAdmissionScenario(
       eventSource = "workflow_run";
       eventWorkflowRunId = "99";
       eventWorkflowRunAction = "completed";
+      eventWorkflowRunPath = ".github/workflows/ci.yml";
       break;
     case "newer-workflow-run":
       eventSource = "workflow_run";
       eventWorkflowRunId = "124";
       eventWorkflowRunAction = "completed";
+      eventWorkflowRunPath = ".github/workflows/ci.yml";
       break;
     case "in-progress-workflow-run":
       eventSource = "workflow_run";
       eventWorkflowRunId = "99";
       eventWorkflowRunAction = "in_progress";
+      eventWorkflowRunPath = ".github/workflows/ci.yml";
       break;
     case "equal-in-progress-workflow-run":
       eventSource = "workflow_run";
       eventWorkflowRunId = ciRunId;
       eventWorkflowRunAction = "in_progress";
+      eventWorkflowRunPath = ".github/workflows/ci.yml";
       break;
     case "equal-dco-created":
       eventSource = "check_run";
@@ -605,6 +675,50 @@ function runAdmissionScenario(
       eventSource = "check_run";
       eventCheckRunId = "11";
       eventCheckRunAction = "completed";
+      break;
+    case "review-requested-newer":
+      eventSource = "workflow_run";
+      eventWorkflowRunId = "457";
+      eventWorkflowRunAction = "requested";
+      eventWorkflowRunPath = "dynamic/agents/copilot-pull-request-reviewer";
+      pullRequestFiles = [[{ filename: "package.json", status: "modified" }]];
+      checkRuns = [ciCheckRun, dcoCheckRun, reviewCheckRun];
+      break;
+    case "review-in-progress-equal":
+      eventSource = "workflow_run";
+      eventWorkflowRunId = "456";
+      eventWorkflowRunAction = "in_progress";
+      eventWorkflowRunPath = "dynamic/agents/copilot-pull-request-reviewer";
+      pullRequestFiles = [[{ filename: "package.json", status: "modified" }]];
+      checkRuns = [ciCheckRun, dcoCheckRun, reviewCheckRun];
+      break;
+    case "review-completed-equal":
+      eventSource = "workflow_run";
+      eventWorkflowRunId = "456";
+      eventWorkflowRunAction = "completed";
+      eventWorkflowRunPath = "dynamic/agents/copilot-pull-request-reviewer";
+      pullRequestFiles = [[{ filename: "package.json", status: "modified" }]];
+      checkRuns = [ciCheckRun, dcoCheckRun, reviewCheckRun];
+      break;
+    case "review-completed-newer":
+      eventSource = "workflow_run";
+      eventWorkflowRunId = "457";
+      eventWorkflowRunAction = "completed";
+      eventWorkflowRunPath = "dynamic/agents/copilot-pull-request-reviewer";
+      pullRequestFiles = [[{ filename: "package.json", status: "modified" }]];
+      checkRuns = [ciCheckRun, dcoCheckRun, reviewCheckRun];
+      break;
+    case "review-completed-terminal":
+      eventSource = "workflow_run";
+      eventWorkflowRunId = "456";
+      eventWorkflowRunAction = "completed";
+      eventWorkflowRunPath = "dynamic/agents/copilot-pull-request-reviewer";
+      pullRequestFiles = [[{ filename: "package.json", status: "modified" }]];
+      checkRuns = [
+        ciCheckRun,
+        dcoCheckRun,
+        { ...reviewCheckRun, conclusion: "failure" },
+      ];
       break;
     case "no-unique-pr":
       associatedPullRequests = [];
@@ -886,6 +1000,7 @@ exit 99
         EVENT_CHECK_RUN_ID: eventCheckRunId,
         EVENT_WORKFLOW_RUN_ACTION: eventWorkflowRunAction,
         EVENT_WORKFLOW_RUN_ID: eventWorkflowRunId,
+        EVENT_WORKFLOW_RUN_PATH: eventWorkflowRunPath,
         FILE_CALLS: fileCallsPath,
         PATH: `${directory}:${process.env.PATH ?? ""}`,
         PULL_CALLS: pullCallsPath,
@@ -956,6 +1071,31 @@ describe("external admission workflow", () => {
     const { result, statuses } = runAdmissionScenario("equal-dco-completed");
     expect(result.status).toBe(0);
     expect(statuses.at(-1)?.split("\t", 1)[0]).toBe("success");
+  });
+
+  it.each([
+    "review-requested-newer",
+    "review-in-progress-equal",
+    "review-completed-newer",
+  ] as const)("keeps managed review freshness scenario %s pending", (scenario) => {
+    const { result, statuses } = runAdmissionScenario(scenario);
+    expect(result.status, `${scenario}\n${result.stdout}\n${result.stderr}`).toBe(0);
+    expect(statuses.at(-1)?.split("\t", 1)[0]).toBe("pending");
+    expect(statuses.some((status) => status.startsWith("success\t"))).toBe(false);
+  });
+
+  it("reconciles an equal completed managed review event", () => {
+    const { result, statuses } = runAdmissionScenario("review-completed-equal");
+    expect(result.status, `${result.stdout}\n${result.stderr}`).toBe(0);
+    expect(statuses.at(-1)?.split("\t", 1)[0]).toBe("success");
+    expect(statuses.at(-1)).toContain("Copilot");
+  });
+
+  it("terminalizes an equal completed managed review failure", () => {
+    const { result, statuses } = runAdmissionScenario("review-completed-terminal");
+    expect(result.status, `${result.stdout}\n${result.stderr}`).toBe(0);
+    expect(statuses.at(-1)?.split("\t", 1)[0]).toBe("failure");
+    expect(statuses.some((status) => status.startsWith("success\t"))).toBe(false);
   });
 
   it("terminalizes an exact head with no unique eligible pull request", () => {
@@ -1144,7 +1284,7 @@ describe("external admission workflow", () => {
       check_run: { types: ["created", "rerequested", "completed"] },
       repository_dispatch: { types: ["external-admission-reconcile"] },
       workflow_run: {
-        workflows: ["CI"],
+        workflows: ["CI", "Copilot"],
         types: ["requested", "in_progress", "completed"],
       },
     });
@@ -1212,7 +1352,19 @@ describe("external admission workflow", () => {
     }
   });
 
-  it("starts only for authenticated DCO, canonical pull-request CI, or reconciliation", () => {
+  it("revokes stale success for a managed review rerun before trusted checkout", () => {
+    const fixture = acceptedEventFixtures.find(({ name }) => name === "managed Copilot requested");
+    expect(fixture).toBeDefined();
+    expect(simulateWorkflowFixture(fixture!)).toEqual({
+      evaluatorReached: true,
+      jobRuns: true,
+      statusWrites: 1,
+    });
+    expect(job.steps[0]?.name).toBe("Revoke stale external admission");
+    expect(job.steps[1]?.name).toBe("Check out trusted admission evaluator");
+  });
+
+  it("starts only for trusted DCO, CI, managed Copilot, or reconciliation", () => {
     for (const value of ["DCO", "1861", "dco"]) expect(job.if).toContain(value);
     expect(job.if).toContain("github.event_name == 'repository_dispatch'");
     expect(job.if).toContain("github.event.action == 'external-admission-reconcile'");
@@ -1220,6 +1372,11 @@ describe("external admission workflow", () => {
     expect(job.if).toContain("github.event.workflow_run.name == 'CI'");
     expect(job.if).toContain("github.event.workflow_run.event == 'pull_request'");
     expect(job.if).toContain("github.event.workflow_run.path == '.github/workflows/ci.yml'");
+    expect(job.if).toContain("github.event.workflow_run.name == 'Running Copilot Code Review'");
+    expect(job.if).toContain("github.event.workflow_run.event == 'dynamic'");
+    expect(job.if).toContain(
+      "github.event.workflow_run.path == 'dynamic/agents/copilot-pull-request-reviewer'",
+    );
     expect(job.if).toContain(
       "github.event.workflow_run.repository.full_name == github.repository",
     );
@@ -1251,7 +1408,7 @@ describe("external admission workflow", () => {
       .toHaveLength(2);
   });
 
-  it("isolates rejected CI workflow runs from exact-SHA concurrency", () => {
+  it("isolates rejected CI and Copilot workflow runs from exact-SHA concurrency", () => {
     const group = workflow.concurrency.group;
     expect(workflow.concurrency["cancel-in-progress"]).toBe(true);
     for (const condition of [
@@ -1268,6 +1425,18 @@ describe("external admission workflow", () => {
     );
     expect(group).toMatch(
       /github\.event_name == 'workflow_run'\s+&&\s+format\('workflow-run-\{0\}', github\.run_id\)/u,
+    );
+    for (const condition of [
+      "github.event.workflow_run.name == 'Running Copilot Code Review'",
+      "github.event.workflow_run.event == 'dynamic'",
+      "github.event.workflow_run.path == 'dynamic/agents/copilot-pull-request-reviewer'",
+      "github.event.workflow_run.repository.full_name == github.repository",
+    ]) {
+      expect(group).toContain(condition);
+      expect(job.if).toContain(condition);
+    }
+    expect(group).toMatch(
+      /github\.event\.workflow_run\.path == 'dynamic\/agents\/copilot-pull-request-reviewer'\s+&&\s+github\.event\.workflow_run\.repository\.full_name == github\.repository\s+&&\s+github\.event\.workflow_run\.head_sha/u,
     );
   });
 
@@ -1290,6 +1459,7 @@ describe("external admission workflow", () => {
     expect(evaluator).toContain("external-admission-policy.mjs evaluate-ci-run");
     expect(evaluator).toContain('if [[ "$EVENT_SOURCE" == workflow_run');
     expect(evaluator).toContain("EVENT_WORKFLOW_RUN_ACTION");
+    expect(evaluator).toContain("EVENT_WORKFLOW_RUN_PATH");
     expect(evaluator).toContain("EVENT_CHECK_RUN_ACTION");
     expect(evaluator).toContain("EVENT_CHECK_RUN_ID");
     expect(evaluator).toContain("classification_fingerprint");

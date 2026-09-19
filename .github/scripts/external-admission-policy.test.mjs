@@ -245,6 +245,7 @@ test("authenticates only an exact successful Copilot dynamic check and run", () 
     assert.equal(result.ready, false, String(status));
     assert.equal(result.pending, true, String(status));
     assert.equal(result.terminalFailure, undefined, String(status));
+    assert.equal(result.runId, "123", String(status));
   }
   for (const conclusion of [
     "neutral", "skipped", "cancelled", "timed_out", "action_required", "failure",
@@ -258,6 +259,7 @@ test("authenticates only an exact successful Copilot dynamic check and run", () 
     assert.equal(result.ready, false, conclusion);
     assert.equal(result.pending, false, conclusion);
     assert.equal(result.terminalFailure, "review-run", conclusion);
+    assert.equal(result.runId, "123", conclusion);
   }
   assert.equal(evaluateReviewCheck({
     checkRuns: [reviewCheck({ details_url: "https://example.invalid/run/123" })],
@@ -556,6 +558,7 @@ test("enforces arbitrary-precision freshness lower bounds for trusted events", (
         eventSource: "workflow_run",
         workflowRunAction: "requested",
         workflowRunId: "99",
+        workflowRunPath: ".github/workflows/ci.yml",
         ciRunId: "100",
       },
       { ready: true },
@@ -566,6 +569,7 @@ test("enforces arbitrary-precision freshness lower bounds for trusted events", (
         eventSource: "workflow_run",
         workflowRunAction: "completed",
         workflowRunId: "100",
+        workflowRunPath: ".github/workflows/ci.yml",
         ciRunId: "100",
       },
       { ready: true },
@@ -576,6 +580,7 @@ test("enforces arbitrary-precision freshness lower bounds for trusted events", (
         eventSource: "workflow_run",
         workflowRunAction: "requested",
         workflowRunId: "100",
+        workflowRunPath: ".github/workflows/ci.yml",
         ciRunId: "100",
       },
       { ready: false, pending: true, reason: "event-freshness" },
@@ -586,6 +591,7 @@ test("enforces arbitrary-precision freshness lower bounds for trusted events", (
         eventSource: "workflow_run",
         workflowRunAction: "in_progress",
         workflowRunId: "100",
+        workflowRunPath: ".github/workflows/ci.yml",
         ciRunId: "100",
       },
       { ready: false, pending: true, reason: "event-freshness" },
@@ -596,7 +602,63 @@ test("enforces arbitrary-precision freshness lower bounds for trusted events", (
         eventSource: "workflow_run",
         workflowRunAction: "completed",
         workflowRunId: hugeEventId,
+        workflowRunPath: ".github/workflows/ci.yml",
         ciRunId: hugeVisibleId,
+      },
+      { ready: false, pending: true, reason: "event-freshness" },
+    ],
+    [
+      "older managed review event is superseded by newer visible evidence",
+      {
+        eventSource: "workflow_run",
+        workflowRunAction: "requested",
+        workflowRunId: "99",
+        workflowRunPath: "dynamic/agents/copilot-pull-request-reviewer",
+        reviewRunId: "100",
+      },
+      { ready: true },
+    ],
+    [
+      "equal completed managed review event can reconcile current evidence",
+      {
+        eventSource: "workflow_run",
+        workflowRunAction: "completed",
+        workflowRunId: "100",
+        workflowRunPath: "dynamic/agents/copilot-pull-request-reviewer",
+        reviewRunId: "100",
+      },
+      { ready: true },
+    ],
+    [
+      "equal requested managed review event remains pending",
+      {
+        eventSource: "workflow_run",
+        workflowRunAction: "requested",
+        workflowRunId: "100",
+        workflowRunPath: "dynamic/agents/copilot-pull-request-reviewer",
+        reviewRunId: "100",
+      },
+      { ready: false, pending: true, reason: "event-freshness" },
+    ],
+    [
+      "equal in-progress managed review event remains pending",
+      {
+        eventSource: "workflow_run",
+        workflowRunAction: "in_progress",
+        workflowRunId: "100",
+        workflowRunPath: "dynamic/agents/copilot-pull-request-reviewer",
+        reviewRunId: "100",
+      },
+      { ready: false, pending: true, reason: "event-freshness" },
+    ],
+    [
+      "newer managed review event remains pending until its run is visible",
+      {
+        eventSource: "workflow_run",
+        workflowRunAction: "completed",
+        workflowRunId: hugeEventId,
+        workflowRunPath: "dynamic/agents/copilot-pull-request-reviewer",
+        reviewRunId: hugeVisibleId,
       },
       { ready: false, pending: true, reason: "event-freshness" },
     ],
@@ -664,8 +726,9 @@ test("enforces arbitrary-precision freshness lower bounds for trusted events", (
 
 test("fails closed for malformed or unauthenticated freshness metadata", () => {
   const malformedCases = [
-    { eventSource: "workflow_run", workflowRunAction: "completed", workflowRunId: "0", ciRunId: "1" },
-    { eventSource: "workflow_run", workflowRunAction: "unknown", workflowRunId: "1", ciRunId: "1" },
+    { eventSource: "workflow_run", workflowRunAction: "completed", workflowRunId: "0", workflowRunPath: ".github/workflows/ci.yml", ciRunId: "1" },
+    { eventSource: "workflow_run", workflowRunAction: "unknown", workflowRunId: "1", workflowRunPath: ".github/workflows/ci.yml", ciRunId: "1" },
+    { eventSource: "workflow_run", workflowRunAction: "completed", workflowRunId: "1", workflowRunPath: ".github/workflows/copilot.yml", reviewRunId: "1" },
     { eventSource: "check_run", checkRunAction: "completed", checkRunId: "not-an-id", dcoCheckRunId: "1" },
     { eventSource: "check_run", checkRunAction: "unknown", checkRunId: "1", dcoCheckRunId: "1" },
     { eventSource: "unexpected", workflowRunAction: "completed", workflowRunId: "1", ciRunId: "1" },
@@ -682,6 +745,7 @@ test("fails closed for malformed or unauthenticated freshness metadata", () => {
     eventSource: "workflow_run",
     workflowRunAction: "completed",
     workflowRunId: "1",
+    workflowRunPath: "dynamic/agents/copilot-pull-request-reviewer",
   }), { ready: false, pending: true, reason: "event-freshness" });
 });
 
@@ -762,7 +826,7 @@ test("exposes the complete policy through deterministic CLI commands", () => {
   )), { eligible: false, reason: "unprotected-base" });
   assert.deepEqual(JSON.parse(runPolicyCommand(
     "evaluate-freshness",
-    ["workflow_run", "completed", "100", "", "", "100", ""],
+    ["workflow_run", "completed", "100", ".github/workflows/ci.yml", "", "", "100", "", ""],
     "{}",
   )), { ready: true });
 

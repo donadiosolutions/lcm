@@ -5,14 +5,18 @@ head only after authenticated CI and DCO checks succeed. A pull request that
 changes an input capable of influencing that CI result must also provide an
 authenticated exact-head Copilot dynamic run.
 
-Normal admission is automatic: every accepted authenticated DCO `check_run`
-event, canonical pull-request CI `workflow_run` event, or default-branch
-recovery dispatch wakes the reducer, which evaluates the latest exact-head
-snapshot without polling on a runner. Copilot is evidence, not a new trigger.
-Event IDs are never state authority. An accepted CI or DCO event ID also imposes
-a freshness lower bound: older visible evidence may be superseded, but newer or
-equal non-terminal event evidence remains pending until the corresponding
-current check or run is visible.
+Normal admission is automatic: every accepted authenticated DCO `check_run`,
+canonical pull-request CI `workflow_run`, exact managed Copilot dynamic
+`workflow_run`, or default-branch recovery dispatch wakes the reducer, which
+evaluates the latest exact-head snapshot without polling on a runner. The
+registered `Copilot` trigger is narrowed to run name `Running Copilot Code
+Review`, event `dynamic`, path `dynamic/agents/copilot-pull-request-reviewer`,
+and the exact repository. A repository workflow merely named `Copilot` is
+skipped before any status write. Event IDs are never state authority. Accepted
+CI, DCO, and managed Copilot event IDs impose a freshness lower bound: older
+visible evidence may be superseded, but newer or equal non-terminal event
+evidence remains pending until the corresponding current check or run is
+visible.
 
 DCO can also report against GitHub synthetic commits with an empty suite branch
 or a `gh-readonly-queue/` ref. External admission requires a non-empty suite
@@ -20,9 +24,9 @@ branch and rejects the reserved queue prefix before writing a legacy commit
 status because the permissionless `external-admission-merge-group.yml`
 workflow owns the synthetic SHA.
 
-Use repository-dispatch recovery only when an expected DCO or CI event was
-delayed or lost. Recovery re-evaluates current GitHub state; it does not bypass,
-replace, or manufacture any required check.
+Use repository-dispatch recovery only when an expected DCO, CI, or managed
+Copilot event was delayed or lost. Recovery re-evaluates current GitHub state;
+it does not bypass, replace, or manufacture any required check.
 
 ## Prerequisites and permissions
 
@@ -147,11 +151,13 @@ and the `external-admission` status on `HEAD_SHA`.
   three-snapshot evaluation. Sensitive changes also remain pending while an
   exact Copilot check or backing dynamic run is missing, queued, requested,
   in progress, pending, or waiting. A newer event ID than the visible evidence,
-  an equal `requested`/`in_progress` CI event, or an equal DCO `created` or
-  `rerequested` event also remains pending. Transient branch-protection API
-  failures and PR-file API transport failures remain pending so recovery can
-  retry them. A successful but malformed PR-file response, incomplete file
-  count, or invalid classification remains a terminal policy failure.
+  an equal `requested`/`in_progress` CI or managed Copilot event, or an equal
+  DCO `created` or `rerequested` event also remains pending. A completed event
+  may reconcile only once its matching current run is visible. Transient
+  branch-protection API failures and PR-file API transport failures remain
+  pending so recovery can retry them. A successful but malformed PR-file
+  response, incomplete file count, or invalid classification remains a terminal
+  policy failure.
 - **Success:** three consecutive fresh snapshots prove authenticated CI and DCO
   success on the same exact head, while live base protection and pull-request
   eligibility remain valid. Exactly one open, non-draft pull request in the
@@ -245,9 +251,11 @@ only the commit SHA to evaluate and is never used as a checkout ref or executed
 as code.
 
 Every accepted event revokes stale admission before checkout or PR association,
-then evaluates the latest exact-head snapshot. Stale event IDs are wake-up
-context only; accepted CI/DCO IDs additionally impose the freshness lower bound
-described above. The evaluator paginates commit-associated pull requests, PR
+then evaluates the latest exact-head snapshot. This makes a managed Copilot
+rerun revoke stale success even before the trusted checkout. Event IDs are
+wake-up context only; accepted CI, DCO, and managed Copilot IDs additionally
+impose the path-specific freshness lower bound described above. The evaluator
+paginates commit-associated pull requests, PR
 files, and check runs. It rejects incomplete counts, duplicate destination
 filenames, malformed rename/copy records, and the 3,000-file policy cap. It
 authenticates exact check names and application identities, reads live

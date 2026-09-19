@@ -10,6 +10,7 @@ fi
 EVENT_SOURCE="${EVENT_SOURCE:-}"
 EVENT_WORKFLOW_RUN_ACTION="${EVENT_WORKFLOW_RUN_ACTION:-}"
 EVENT_WORKFLOW_RUN_ID="${EVENT_WORKFLOW_RUN_ID:-}"
+EVENT_WORKFLOW_RUN_PATH="${EVENT_WORKFLOW_RUN_PATH:-}"
 EVENT_CHECK_RUN_ACTION="${EVENT_CHECK_RUN_ACTION:-}"
 EVENT_CHECK_RUN_ID="${EVENT_CHECK_RUN_ID:-}"
 
@@ -303,14 +304,17 @@ evaluate_sensitive_admission() {
 
 evaluate_event_freshness() {
   local ci_run_id="$1"
-  local dco_check_run_id="$2"
+  local review_run_id="$2"
+  local dco_check_run_id="$3"
   node .github/scripts/external-admission-policy.mjs evaluate-freshness \
     "$EVENT_SOURCE" \
     "$EVENT_WORKFLOW_RUN_ACTION" \
     "$EVENT_WORKFLOW_RUN_ID" \
+    "$EVENT_WORKFLOW_RUN_PATH" \
     "$EVENT_CHECK_RUN_ACTION" \
     "$EVENT_CHECK_RUN_ID" \
     "$ci_run_id" \
+    "$review_run_id" \
     "$dco_check_run_id" <<< '{}'
 }
 
@@ -372,7 +376,7 @@ validate_required_snapshot() {
   local ci_run ci_evaluation
   local ci_terminal_failure ci_ready ci_state freshness freshness_pending freshness_failure
   local changed_file_count file_pages classification sensitive classification_fingerprint
-  local review_check_evaluation review_check_ready review_run_id review_run review_run_evaluation
+  local review_check_evaluation review_check_ready visible_review_run_id review_run_id review_run review_run_evaluation
   local review_run_ready review_pending review_evidence admission_input admission_evaluation
   local admission_ready admission_pending admission_terminal_failure evidence_class selected_evidence_fingerprint
 
@@ -399,15 +403,19 @@ validate_required_snapshot() {
   ci_check_run_id="$(jq -r '.ciCheckRunId // empty' <<<"$evaluation")"
   dco_check_run_id="$(jq -r '.dcoCheckRunId // empty' <<<"$evaluation")"
   ci_run_id="$(jq -r '.ciRunId // empty' <<<"$evaluation")"
+  review_check_evaluation="$(evaluate_review_check <<<"$check_run_pages")" || return $?
+  visible_review_run_id="$(jq -r '.runId // empty' <<<"$review_check_evaluation")" || return $?
   terminal_failure="$(jq -r '.terminalFailure // empty' <<<"$evaluation")"
   if [[ -n "$terminal_failure" ]]; then
     echo "$phase required check reported an invalid or terminal state: $terminal_failure" >&2
     return 2
   fi
   if [[ "$EVENT_SOURCE" == workflow_run && -n "$EVENT_WORKFLOW_RUN_ID" ]]; then
-    echo "$phase workflow event ID $EVENT_WORKFLOW_RUN_ID is wake-up context only and does not authorize state; canonical CI evidence is evaluated separately." >&2
+    echo "$phase workflow event ID $EVENT_WORKFLOW_RUN_ID is wake-up context only and does not authorize state; current trusted run evidence is evaluated separately." >&2
   fi
-  freshness="$(evaluate_event_freshness "$ci_run_id" "$dco_check_run_id")" || return $?
+  freshness="$(
+    evaluate_event_freshness "$ci_run_id" "$visible_review_run_id" "$dco_check_run_id"
+  )" || return $?
   freshness_failure="$(jq -r '.terminalFailure // empty' <<<"$freshness")"
   if [[ -n "$freshness_failure" ]]; then
     echo "$phase event freshness metadata is invalid: $freshness_failure" >&2
@@ -445,7 +453,6 @@ validate_required_snapshot() {
 
   review_evidence='{"ready":false,"pending":false,"terminalFailure":"review-not-evaluated"}'
   if [[ "$sensitive" == true ]]; then
-    review_check_evaluation="$(evaluate_review_check <<<"$check_run_pages")" || return $?
     review_check_ready="$(jq -r '.ready' <<<"$review_check_evaluation")" || return $?
     if [[ "$review_check_ready" == true ]]; then
       review_run_id="$(jq -r '.runId' <<<"$review_check_evaluation")" || return $?

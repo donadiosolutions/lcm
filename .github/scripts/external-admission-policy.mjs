@@ -36,6 +36,7 @@ const WAITING_CI_RUN_STATES = new Set([
 const MAINTENANCE_BASE = /^maintenance\/[0-9]+\.[0-9]+\.x$/u;
 const WORKFLOW_RUN_ACTIONS = new Set(["requested", "in_progress", "completed"]);
 const CHECK_RUN_ACTIONS = new Set(["created", "rerequested", "completed"]);
+const CI_WORKFLOW_PATH = ".github/workflows/ci.yml";
 const REVIEW_WORKFLOW_PATH = "dynamic/agents/copilot-pull-request-reviewer";
 const PULL_REQUEST_FILE_STATUSES = new Set([
   "added",
@@ -318,20 +319,22 @@ export function evaluateReviewCheck({
   const review = latestAuthenticatedCheck(checkRuns, CHECK_IDENTITIES.review, headSha);
   const state = checkState(review);
   const pending = WAITING_CHECK_STATES.has(state);
+  const checkRunId = review === undefined
+    ? undefined
+    : positiveId(review.id, "review check run ID").toString();
+  const runId = review === undefined
+    ? undefined
+    : parseActionsRunId(review.details_url, { repository, serverUrl });
   if (state !== "success") {
     return {
       state,
       ready: false,
       pending,
       terminalFailure: pending ? undefined : "review-run",
-      checkRunId: review === undefined
-        ? undefined
-        : positiveId(review.id, "review check run ID").toString(),
-      runId: undefined,
+      checkRunId,
+      runId,
     };
   }
-  const checkRunId = positiveId(review.id, "review check run ID").toString();
-  const runId = parseActionsRunId(review.details_url, { repository, serverUrl });
   return {
     state,
     ready: runId !== undefined,
@@ -344,7 +347,7 @@ export function evaluateReviewCheck({
 
 export function evaluateCiActionsRun(
   run,
-  { runId, headSha, repository, workflowPath = ".github/workflows/ci.yml" },
+  { runId, headSha, repository, workflowPath = CI_WORKFLOW_PATH },
 ) {
   const trustedProvenance = run !== null
     && typeof run === "object"
@@ -459,17 +462,23 @@ export function evaluateEventFreshness({
   eventSource,
   workflowRunAction = "",
   workflowRunId = "",
+  workflowRunPath = "",
   checkRunAction = "",
   checkRunId = "",
   ciRunId,
+  reviewRunId,
   dcoCheckRunId,
 }) {
   if (eventSource === "repository_dispatch") return { ready: true };
   if (eventSource === "workflow_run") {
     if (!WORKFLOW_RUN_ACTIONS.has(workflowRunAction)) return invalidFreshness();
+    let visibleRunId;
+    if (workflowRunPath === CI_WORKFLOW_PATH) visibleRunId = ciRunId;
+    else if (workflowRunPath === REVIEW_WORKFLOW_PATH) visibleRunId = reviewRunId;
+    else return invalidFreshness();
     return compareFreshness(
       workflowRunId,
-      ciRunId,
+      visibleRunId,
       workflowRunAction === "completed",
     );
   }
@@ -540,15 +549,27 @@ export function runPolicyCommand(command, args, input) {
       baseProtected: baseProtected === "true",
     }));
   }
-  if (command === "evaluate-freshness" && args.length === 7) {
-    const [eventSource, workflowRunAction, workflowRunId, checkRunAction, checkRunId, ciRunId, dcoCheckRunId] = args;
+  if (command === "evaluate-freshness" && args.length === 9) {
+    const [
+      eventSource,
+      workflowRunAction,
+      workflowRunId,
+      workflowRunPath,
+      checkRunAction,
+      checkRunId,
+      ciRunId,
+      reviewRunId,
+      dcoCheckRunId,
+    ] = args;
     return JSON.stringify(evaluateEventFreshness({
       eventSource,
       workflowRunAction,
       workflowRunId,
+      workflowRunPath,
       checkRunAction,
       checkRunId,
       ciRunId: ciRunId || undefined,
+      reviewRunId: reviewRunId || undefined,
       dcoCheckRunId: dcoCheckRunId || undefined,
     }));
   }
