@@ -101,6 +101,11 @@ S0-frozen campaign covering every currently open native GitHub Bug issue. It
 performs inventory agreement, duplicate adjudication, and triage before handing
 accepted work to [procedural development](procedural-development.md).
 
+Use [triage-security-issues](triage-security-issues.md) for existing Dependabot,
+Code Scanning, Secret Scanning and Codex Security cloud alerts. It invokes the
+existing assessment and delivery skills after complete triage and cross-source
+grouping, with private campaign records and Daybreak Blue security workers.
+
 Use [procedural development](procedural-development.md) for a direct GitHub
 issue or a bounded inventory supplied by a caller. It defines the shared role
 defaults, override rules, exact-SHA reviews, and candidate-round outcomes.
