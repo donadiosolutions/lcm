@@ -73,7 +73,7 @@
   },
   "devDependencies": {
     "@anthropic-ai/sdk": "0.124.0",
-    "@changesets/cli": "2.31.1",
+    "@changesets/cli": "3.0.2",
     "@modelcontextprotocol/sdk": "1.30.0",
     "@types/js-yaml": "4.0.9",
     "@types/node": "26.5.0",
