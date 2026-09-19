@@ -328,7 +328,10 @@ releases it, so waiting would only burn the sweep deadline. This exception
 does not bypass another frame using the same live publication token while
 that frame is still queued in tail admission: those queued frames remain
 ordered, and the later frame waits for the earlier admitted frame before it
-attempts the fail-fast local append lock. A same-token call made after the
+attempts the fail-fast local append lock. An intermediate same-token frame
+that times out or is cancelled while waiting does not release the frames
+behind it: the unresolved earlier admitted frame is carried forward, so a
+later frame still waits for it. A same-token call made after the
 earlier frame's append callback has already started does not wait: it takes
 the reentrant fast path and runs nested under the earlier frame's held
 append lock, so the two callbacks can overlap. Serializing that post-entry

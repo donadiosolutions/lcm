@@ -2129,15 +2129,20 @@ export async function withBackendPublicationAppendBarrierAsync<T>(
     && holdsActivePublicationLock(contextualToken, homeDir);
   const predecessor = appendBarrierTails.get(key);
   const previous = predecessor?.tail ?? Promise.resolve();
+  const previousAdmittedFrame = predecessor?.latestAdmittedFrame;
   let release!: () => void;
   const current = new Promise<void>((resolve): void => { release = resolve; });
   const tail = previous.then(() => current);
   const entry: AppendBarrierTail = {
     tail,
     holdsPublicationAdmission,
+    // Chain an admitted frame behind its unresolved admitted predecessor so
+    // an intermediate frame that times out or aborts before admission cannot
+    // settle the chain early: its own frame resolves in `finally`, but the
+    // published frame stays pending until the predecessor settles.
     latestAdmittedFrame: holdsPublicationAdmission
-      ? current
-      : predecessor?.latestAdmittedFrame,
+      ? (previousAdmittedFrame?.then(() => current) ?? current)
+      : previousAdmittedFrame,
   };
   appendBarrierTails.set(key, entry);
   void tail.then(() => {
@@ -2247,15 +2252,20 @@ export async function withBackendPublicationRetainedAppendAdmissionAsync<T>(
   const key = rootPath(homeDir);
   const predecessor = appendBarrierTails.get(key);
   const previous = predecessor?.tail ?? Promise.resolve();
+  const previousAdmittedFrame = predecessor?.latestAdmittedFrame;
   let release!: () => void;
   const current = new Promise<void>((resolve): void => { release = resolve; });
   const tail = previous.then(() => current);
   const entry: AppendBarrierTail = {
     tail,
     holdsPublicationAdmission,
+    // Chain an admitted frame behind its unresolved admitted predecessor so
+    // an intermediate frame that times out or aborts before admission cannot
+    // settle the chain early: its own frame resolves in `finally`, but the
+    // published frame stays pending until the predecessor settles.
     latestAdmittedFrame: holdsPublicationAdmission
-      ? current
-      : predecessor?.latestAdmittedFrame,
+      ? (previousAdmittedFrame?.then(() => current) ?? current)
+      : previousAdmittedFrame,
   };
   appendBarrierTails.set(key, entry);
   void tail.then(() => {

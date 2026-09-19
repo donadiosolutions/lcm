@@ -6440,9 +6440,68 @@ describe("revocable mutation permits", () => {
         { status: "fulfilled", value: "first" },
         { status: "fulfilled", value: "second" },
       ]);
-      expect(secondState).toBe("fulfilled");
+    expect(secondState).toBe("fulfilled");
     });
     expect(order).toEqual(["first", "second"]);
+  });
+
+  it("carries an unresolved admitted predecessor past a timed-out intermediate frame", async () => {
+    const home = makeHome();
+    const order: string[] = [];
+    let releaseFirst!: () => void;
+    let firstEntered!: () => void;
+    const entered = new Promise<void>(resolve => { firstEntered = resolve; });
+    await withBackendPublicationConsumerLockAsync(home, async token => {
+      // Install all three frames before the first frame reaches its append
+      // lock: none of them may take the reentrant fast path, so the
+      // intermediate frame really waits for the first frame and the later
+      // frame really waits for the intermediate one.
+      const first = withBackendPublicationAppendBarrierAsync(home, async () => {
+        order.push("first");
+        firstEntered();
+        await new Promise<void>(resolve => { releaseFirst = resolve; });
+        return "first";
+      }, token);
+      let now = 0;
+      const timedOut = withBackendPublicationAppendBarrierAsync(home, async () => {
+        throw new Error("timed-out intermediate frame must not run");
+      }, token, {
+        contentionWaitMs: 10,
+        _now: () => now,
+        _wait: async () => { now = 10; },
+      });
+      let thirdState: "pending" | "fulfilled" | "contention" | "rejected" = "pending";
+      const third = withBackendPublicationRetainedAppendAdmissionAsync(home, async () => {
+        order.push("third");
+        return "third";
+      }, token, { contentionWaitMs: 5_000, externalLockAttempts: 1 }).then(value => {
+        thirdState = "fulfilled";
+        return value;
+      }, (error: unknown) => {
+        thirdState = error instanceof PrivateMutationLockContentionError
+          ? "contention"
+          : "rejected";
+        throw error;
+      });
+      await entered;
+      // The intermediate frame times out through the real bounded deadline
+      // path while the first frame still holds the append lock.
+      await expect(timedOut).rejects.toMatchObject({ name: "BackendPublicationAppendBarrierTimeoutError" });
+      for (let turn = 0; turn < 20; turn += 1) await Promise.resolve();
+      try {
+        // The later frame must still wait for the unresolved first frame
+        // instead of observing the settled intermediate frame: it must
+        // neither run early nor fail its single append-lock attempt.
+        expect(thirdState).toBe("pending");
+        expect(order).toEqual(["first"]);
+      } finally {
+        releaseFirst();
+      }
+      await expect(first).resolves.toBe("first");
+      await expect(third).resolves.toBe("third");
+      expect(thirdState).toBe("fulfilled");
+      expect(order).toEqual(["first", "third"]);
+    });
   });
 
   it("keeps queuing later entrants behind an admitted token holder", async () => {

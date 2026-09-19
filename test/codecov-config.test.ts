@@ -795,9 +795,12 @@ describe("Codecov configuration", () => {
       // participants stays storage-abstractions-owned.
       // #1347 lets a caller that already holds publication admission skip the
       // in-process append tail wait while still taking the append file lock
-      // and the maintenance-phase check. The change is confined to this
-      // existing file, so it keeps its established owner and the component
-      // topology is unchanged; this pin records that decision.
+      // and the maintenance-phase check, and chains an admitted frame behind
+      // its unresolved admitted predecessor so a timed-out intermediate
+      // frame cannot release later same-token frames early. The change is
+      // confined to this existing file, so it keeps its established owner
+      // and the component topology is unchanged; this pin records that
+      // decision.
       ["src/storage/backend-publication.ts", "unit-storage-abstractions"],
       // #1229 local outbox diagnostic admission stays local-event-storage-owned.
       ["src/storage/local-hook-outbox.ts", "unit-local-event-storage"],
