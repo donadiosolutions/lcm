@@ -343,3 +343,54 @@ it('retains historical source machine authority across unrelated registration, r
     }finally{await destination?.close();await source?.close();rmSync(root,{recursive:true,force:true});}
   }));
 },120000);
+
+/**
+ * Poll for the fate of the canonical writer launched inside the completion
+ * transaction: either it is waiting on the project advisory fence, or it
+ * already committed while completion was still open.
+ */
+async function observeCanonicalWriter(targetDb:PostgreSqlTestDatabase,settled:{value:boolean}):Promise<'blocked'|'committed'|'absent'>{
+  for(let attempt=0;attempt<120;attempt+=1){
+    if(settled.value)return 'committed';
+    const waiting=await targetDb.migrator.query<{waiting:number}>({text:"SELECT count(*)::int AS waiting FROM pg_catalog.pg_stat_activity WHERE datname=pg_catalog.current_database() AND wait_event_type='Lock' AND pid<>pg_catalog.pg_backend_pid()"},context);
+    if((waiting.rows[0]?.waiting??0)>0)return 'blocked';
+    await new Promise(resolve=>setTimeout(resolve,25));
+  }
+  return 'absent';
+}
+
+it('fences a project-scoped canonical writer between the completion recheck and COMMIT',async()=>{
+  await withPostgreSqlTestDatabase('fence-source',async sourceDb=>withPostgreSqlTestDatabase('fence-target',async targetDb=>{
+    const {source,destination}=await setup(sourceDb,targetDb);
+    const settled={value:false};
+    let drift:Promise<unknown>=Promise.resolve();
+    let injected=false;
+    let observed:'blocked'|'committed'|'absent'|'unreached'='unreached';
+    try{
+      const manifest=source.describe();
+      await destination.admit(manifest,await destination.preflight(manifest,source));
+      await applyEveryDomain(source,destination);
+      const original=Client.prototype.query;
+      const spy=vi.spyOn(Client.prototype,'query').mockImplementation(function(this:Client,...args:unknown[]){
+        const promise=Reflect.apply(original,this,args) as Promise<unknown>;
+        const statement=(args[0] as {text?:string})?.text;
+        if(injected||typeof statement!=='string'||!statement.includes('__locator')||!statement.includes('FROM lcm.conversations r'))return promise as never;
+        injected=true;
+        return promise.then(async result=>{
+          drift=targetDb.migrator.query({text:"UPDATE lcm.conversations SET title='fence-canary'"},{...context,projectId:PORTABLE_POSTGRESQL_FIXTURE.projectId});
+          void drift.catch(()=>undefined).finally(()=>{settled.value=true;});
+          observed=await observeCanonicalWriter(targetDb,settled);
+          return result;
+        }) as never;
+      });
+      try{await expect(destination.verifyComplete(manifest)).resolves.toMatchObject({complete:true});}
+      finally{spy.mockRestore();}
+      expect(injected).toBe(true);
+      expect(observed).toBe('blocked');
+    }finally{
+      await drift.catch(()=>undefined);
+      await destination.close();
+      await source.close();
+    }
+  }));
+},120000);

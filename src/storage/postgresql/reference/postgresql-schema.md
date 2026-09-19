@@ -961,6 +961,66 @@ this migration: the SQLite adapter already performs direct raw-content
 equality, and the public `findExactContent` contract is unchanged for both
 backends.
 
-The latest snapshot covers 27 tables, 101 indexes, 204 constraints, 254
+The 0007 snapshot covered 27 tables, 101 indexes, 204 constraints, 254
 column ACLs, and 883 definition objects. Previous migration snapshots remain
+pinned for safe incremental upgrades.
+
+## Transfer identity content fingerprint
+
+Migration `0008_transfer_identity_content_digest.sql` adds an ordinary,
+required `content_sha256` `text` column to `lcm.transfer_identities`,
+checked against the same lowercase-hex-SHA-256 pattern as `record_sha256`.
+The ledger retains its rows — 0006 restricts deletion and the transfer role
+holds only `SELECT` and `INSERT` on it — so an installation that has already
+copied once still holds identity rows when this migration runs. Adding the
+column as `NOT NULL` in a single statement aborts with SQLSTATE `23502` on
+those rows and leaves the installation unable to apply the migration at all.
+The migration therefore adds the column nullable, backfills existing rows
+with the explicit unknown-content sentinel
+`sha256('lcm-transfer-identity-content-unknown-v1')`, and only then applies
+`SET NOT NULL`. That sentinel cannot equal the fingerprint of any real row
+projection, and `verifiedCompletionState` recognises it and refuses to
+complete a run that still carries one, so the upgrade admits pre-existing
+rows without letting an unverifiable row pass and without weakening the
+requirement for every row written afterwards.
+`applyPortableBatchInTransaction` populates it inside the same fenced
+transaction that writes the identity row: for every domain outside
+`IDENTITY_DOMAINS` (machines, project, project-aliases), it reads the row
+back through the same connection immediately after writing it and
+fingerprints the exact SQL projection `readCanonicalRow` returns.
+`IDENTITY_DOMAINS` rows carry no independently re-derivable canonical
+content — they are admission-time identity lookups, not writes — so they
+reuse `record_sha256` there and are excluded from the completion recheck
+below.
+
+`completePortableDestinationInTransaction` now re-derives this fingerprint
+for every non-identity row the run wrote, batched through
+`readCanonicalContentRows` at up to `PORTABLE_LIMITS.maxBatchRecords`
+(500) locators per query, and fails completion closed if any row's current
+content no longer matches what was captured at write time or the row is
+gone. This closes the gap where `verifyPortableDestinationComplete` reads
+the live destination entirely outside any lease-held transaction: without
+this recheck, completion only re-validated its own `transfer_batches`
+checkpoint chain, which a canonical mutation from any other path (a second
+run, promotion/dedup, compaction, a direct edit) would leave untouched.
+
+The recheck runs in the same READ COMMITTED transaction that writes
+`transfer_runs.state`, and reading the rows does not by itself fence that
+write: an unlocked `SELECT` lets a canonical writer modify or delete a row
+the recheck just returned and commit before the completion `UPDATE`. Raising
+the isolation level does not close this. Measured against the integration
+harness, READ COMMITTED, REPEATABLE READ and SERIALIZABLE all admit the
+interleaving, because a canonical writer never reads what the completion
+writes and so forms no dependency cycle for SSI to detect. Completion
+therefore takes the project publication advisory lock exclusively before it
+reads anything. Every project-scoped runtime transaction already takes that
+same lock in shared mode for its whole duration, so completion waits out the
+writers already in flight and blocks new ones until it commits; the blocking
+window is the re-verification itself. The fence covers modification and
+deletion of the rows this run wrote. It does not cover a writer inserting new
+canonical rows between the end of verification streaming and the start of the
+completion transaction, which remains outside the recheck's scope.
+
+The latest snapshot covers 27 tables, 101 indexes, 205 constraints, 255
+column ACLs, and 886 definition objects. Previous migration snapshots remain
 pinned for safe incremental upgrades.

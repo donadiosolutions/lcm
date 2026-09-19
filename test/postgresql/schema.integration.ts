@@ -297,9 +297,9 @@ describe("PostgreSQL schema baseline", () => {
       const normalizedConstraints = constraints.rows
         .map((row) => `${row.table_name}|${row.constraint_type}|${row.definition}`)
         .join("\n");
-      expect(constraints.rowCount).toBe(204);
+      expect(constraints.rowCount).toBe(205);
       expect(createHash("sha256").update(normalizedConstraints).digest("hex"))
-        .toBe("ccabebba36d9d2e1d5187dcdf4daa5d7301e90708f4ed34953f58f5b56c8c5fa");
+        .toBe("c05610399a2b75a7196794abcd963c3ef723180950e0496c11a02d82a2545ea4");
 
       const deleteActions = await database.migrator.query<{
         table_name: string;

@@ -12,7 +12,8 @@ import { createGeneration, createFixtureSource, postgresGeneration, MACHINE_A_UU
 
 const boundaries = vi.hoisted(() => ({
   runtime: vi.fn(), client: vi.fn(), config: vi.fn(), schema: vi.fn(), witness: vi.fn(),
-  headers: vi.fn(), row: vi.fn(), insert: vi.fn(), capability: vi.fn(), source: vi.fn(),
+  headers: vi.fn(), row: vi.fn(), insert: vi.fn(), capability: vi.fn(), source: vi.fn(), contentRows: vi.fn(),
+  contentSizes: vi.fn(),
 }));
 vi.mock('../../src/storage/postgresql/runtime.js', () => ({ PostgreSqlRuntime: class { constructor() { return boundaries.runtime(); } } }));
 vi.mock('pg', () => ({ Client: class { constructor() { return boundaries.client(); } } }));
@@ -22,6 +23,7 @@ vi.mock('../../src/storage/postgresql/portable-mapping.js', async importOriginal
   ...await importOriginal<typeof import('../../src/storage/postgresql/portable-mapping.js')>(),
   listCanonicalHeaders: boundaries.headers, readCanonicalRow: boundaries.row,
   insertCanonicalRecord: boundaries.insert, assertPostgreSqlRecordCapability: boundaries.capability,
+  readCanonicalContentRows: boundaries.contentRows, readCanonicalContentSizes: boundaries.contentSizes,
 }));
 vi.mock('../../src/storage/postgresql/portable-source.js', () => ({
   readPostgreSqlPortableWitness: boundaries.witness, createPostgreSqlPortableSource: boundaries.source,
@@ -29,7 +31,8 @@ vi.mock('../../src/storage/postgresql/portable-source.js', () => ({
 
 type Row = Record<string, unknown>;
 type Receipt = Row & { domain: PortableDomain; prior: string; checkpoint_sha256: string; checkpoint_bytes: Uint8Array; next_ordinal: number };
-type Saved = { run?: Row; receipts: Receipt[]; identities: Map<string, string>; records: Map<PortableDomain, PortableRecord[]> };
+type IdentityLedgerRow = { domain: string; identity_sha256: string; native_key: string; content_sha256: string };
+type Saved = { run?: Row; receipts: Receipt[]; identities: Map<string, string>; identityLedger: IdentityLedgerRow[]; records: Map<PortableDomain, PortableRecord[]> };
 
 // Model durable data separately from transaction-local changes. SQL is accepted
 // only at the adapter's documented ledger seams; unexpected queries fail closed.
@@ -37,6 +40,7 @@ class Database {
   run?: Row;
   receipts: Receipt[] = [];
   identities = new Map<string, string>();
+  identityLedger: IdentityLedgerRow[] = [];
   records = new Map<PortableDomain, PortableRecord[]>();
   transaction?: Saved;
   foreignRows: Row[] = [];
@@ -57,10 +61,10 @@ class Database {
   connectFailure = false;
 
   snapshot(): Saved {
-    return { run: this.run && structuredClone(this.run), receipts: structuredClone(this.receipts), identities: new Map(this.identities), records: new Map([...this.records].map(([domain, rows]) => [domain, [...rows]])) };
+    return { run: this.run && structuredClone(this.run), receipts: structuredClone(this.receipts), identities: new Map(this.identities), identityLedger: structuredClone(this.identityLedger), records: new Map([...this.records].map(([domain, rows]) => [domain, [...rows]])) };
   }
   restore(saved: Saved): void {
-    this.run = saved.run; this.receipts = saved.receipts; this.identities = saved.identities; this.records = saved.records;
+    this.run = saved.run; this.receipts = saved.receipts; this.identities = saved.identities; this.identityLedger = saved.identityLedger; this.records = saved.records;
   }
   async query(config: QueryConfig): Promise<{ rows: Row[]; rowCount: number }> {
     const text = config.text;
@@ -91,6 +95,8 @@ class Database {
     }
     if (text.includes("current_setting('server_version_num')")) return result(this.safety);
     if (text.includes('pg_try_advisory_lock')) return result([{ held: this.lock }]);
+    // Completion fences the project against canonical writers before reading.
+    if (text.includes('pg_advisory_xact_lock')) return result([{}]);
     if (text.includes('JOIN lcm.project_aliases')) return result(this.binding);
     if (text.includes('FROM lcm.machines WHERE identity_key=$1')) return result(this.sourceMachineRows ?? this.machines.filter(row => row.identity_key === values[0]));
     if (text.includes('FROM lcm.machines WHERE')) {
@@ -112,11 +118,25 @@ class Database {
       return result(rows.sort((a, b) => b.next_ordinal - a.next_ordinal).slice(0, 1));
     }
     if (text.includes('FROM lcm.transfer_identities')) {
+      if (text.includes('ORDER BY domain,identity_sha256')) {
+        // Keyset page over the ledger's primary key, exactly as PostgreSQL
+        // answers it: everything after the cursor, capped by the requested
+        // LIMIT. The ordering and the cursor predicate must agree, so both
+        // compare code units rather than locale.
+        const after = (row: IdentityLedgerRow) => row.domain > String(values[1])
+          || (row.domain === String(values[1]) && row.identity_sha256 > String(values[2]));
+        const order = (left: string, right: string) => left < right ? -1 : left > right ? 1 : 0;
+        return result([...this.identityLedger].filter(after).sort((a, b) => a.domain === b.domain
+          ? order(a.identity_sha256, b.identity_sha256)
+          : order(a.domain, b.domain)).slice(0, Number(values[3])));
+      }
       const key = this.identities.get(`${values[1]}:${values[2]}`);
       return result(key === undefined ? [] : [{ native_key: key }]);
     }
     if (text.startsWith('INSERT INTO lcm.transfer_identities')) {
-      this.identities.set(`${values[1]}:${values[2]}`, values[4]); return result([], 1);
+      this.identities.set(`${values[1]}:${values[2]}`, values[4]);
+      this.identityLedger.push({ domain: values[1] as string, identity_sha256: values[2] as string, native_key: values[4] as string, content_sha256: values[6] as string });
+      return result([], 1);
     }
     if (text.startsWith('INSERT INTO lcm.transfer_batches')) {
       this.receipts.push({ domain: values[1], prior: values[2], batch_sha256: values[3], checkpoint_bytes: values[4], checkpoint_sha256: values[5], next_ordinal: Number(values[7]) });
@@ -177,7 +197,30 @@ beforeEach(() => {
   boundaries.schema.mockResolvedValue(undefined);
   boundaries.witness.mockResolvedValue('f'.repeat(64));
   boundaries.headers.mockImplementation(async (_executor, _project, domain: PortableDomain, after: string | null) => (db.records.get(domain) ?? []).filter(row => after === null || String(row.ordinal).padStart(8, '0') > after).slice(0, 1).map(row => ({ locator: String(row.ordinal).padStart(8, '0'), byteLength: '128' })));
-  boundaries.row.mockImplementation(async (_executor, _project, domain: PortableDomain, locator: string) => { if(boundaries.row.mock.calls.length>10000) throw new Error('fake header runaway'); return db.records.get(domain)?.[Number(locator)]?.value; });
+  boundaries.row.mockImplementation(async (_executor, _project, domain: PortableDomain, locator: string) => {
+    if (boundaries.row.mock.calls.length > 10000) throw new Error('fake header runaway');
+    const records = db.records.get(domain) ?? [];
+    const index = Number(locator);
+    if (Number.isInteger(index)) return records[index]?.value;
+    // insertCanonicalRecord's fixture locator is "domain:identitySha256",
+    // used when a caller reads back the row it just wrote in the same
+    // transaction instead of walking headers by ordinal.
+    const identitySha256 = locator.slice(locator.indexOf(':') + 1);
+    return records.find(record => record.identitySha256 === identitySha256)?.value;
+  });
+  boundaries.contentRows.mockImplementation(async (_executor, _project, domain: PortableDomain, locators: readonly string[]) => {
+    const records = db.records.get(domain) ?? [];
+    const found = new Map<string, unknown>();
+    for (const locator of locators) {
+      const identitySha256 = locator.slice(locator.indexOf(':') + 1);
+      const record = records.find(candidate => candidate.identitySha256 === identitySha256);
+      if (record) found.set(locator, record.value);
+    }
+    return found;
+  });
+  // Default sizing keeps every locator inside one aggregate-bounded group.
+  // Tests that exercise the byte budget override this.
+  boundaries.contentSizes.mockImplementation(async (_executor, _project, _domain: PortableDomain, locators: readonly string[]) => new Map(locators.map(locator => [locator, 1n])));
   boundaries.insert.mockImplementation(async (_executor, _project, record: PortableRecord, resolve: (domain: PortableDomain, identity: string) => Promise<string>) => {
     if (!identityDomains.has(record.domain)) {
       for (const dependency of record.dependencies) await resolve(dependency.domain, dependency.identitySha256);
@@ -827,6 +870,183 @@ it('separates actual verification from fenced completion and refuses a changed t
   last.checkpoint_bytes = saved;
   await db.query({text:'ROLLBACK'});
   expect(db.run?.state).toBe('active');
+});
+
+it('refuses completion when a canonical row changed outside this run since verification', async () => {
+  const api = await import('../../src/storage/postgresql/portable-destination.js');
+  const { writer, stream, manifest } = await admitted();
+  await transferAll(writer, stream);
+  const verified = await api.verifyPortableDestinationComplete(writer, manifest);
+  expect(db.run?.state).toBe('active');
+  const executor = { transactionScope: 'active' as const, query: db.query.bind(db) as never };
+  const messages = db.records.get('messages')!;
+  const tamperedIndex = messages.findIndex(record => !identityDomains.has(record.domain));
+  if (tamperedIndex === -1) throw new Error('fixture missing a messages record to tamper with');
+  const original = messages[tamperedIndex]!;
+  await db.query({ text: 'BEGIN' });
+  // A canonical mutation made through any other path than this run's own
+  // applyPortableBatchInTransaction (a second run, promotion/dedup,
+  // compaction, a direct edit) leaves transfer_batches untouched but must
+  // still be caught: the completion transaction re-derives each written
+  // record's current content fingerprint and compares it against the one
+  // captured at write time.
+  messages[tamperedIndex] = { ...original, value: { ...(original.value as object), tampered: true } } as typeof original;
+  await expect(api.completePortableDestinationInTransaction(executor, writer, verified)).rejects.toMatchObject({ code: 'verification-failed' });
+  expect(db.run?.state).toBe('active');
+  messages[tamperedIndex] = original;
+  await api.completePortableDestinationInTransaction(executor, writer, verified);
+  expect(db.run?.state).toBe('completed');
+  await db.query({ text: 'ROLLBACK' });
+});
+
+it('refuses completion when a canonical row this run wrote has disappeared', async () => {
+  const api = await import('../../src/storage/postgresql/portable-destination.js');
+  const { writer, stream, manifest } = await admitted();
+  await transferAll(writer, stream);
+  const verified = await api.verifyPortableDestinationComplete(writer, manifest);
+  const executor = { transactionScope: 'active' as const, query: db.query.bind(db) as never };
+  const messages = db.records.get('messages')!;
+  const removed = messages.pop();
+  if (removed === undefined) throw new Error('fixture missing a messages record to remove');
+  await db.query({ text: 'BEGIN' });
+  await expect(api.completePortableDestinationInTransaction(executor, writer, verified)).rejects.toMatchObject({ code: 'verification-failed' });
+  messages.push(removed);
+  await api.completePortableDestinationInTransaction(executor, writer, verified);
+  expect(db.run?.state).toBe('completed');
+  await db.query({ text: 'ROLLBACK' });
+});
+
+it('refuses completion for a ledger row carried over from before the digest existed', async () => {
+  const api = await import('../../src/storage/postgresql/portable-destination.js');
+  const { writer, stream, manifest } = await admitted();
+  await transferAll(writer, stream);
+  const verified = await api.verifyPortableDestinationComplete(writer, manifest);
+  const executor = { transactionScope: 'active' as const, query: db.query.bind(db) as never };
+  const legacy = db.identityLedger.find(entry => !identityDomains.has(entry.domain));
+  if (legacy === undefined) throw new Error('fixture missing a non-identity ledger row');
+  const captured = legacy.content_sha256;
+  await db.query({ text: 'BEGIN' });
+  // Migration 0008 backfills rows written before the column existed with this
+  // sentinel. Their content can never be re-derived, so completion has to
+  // refuse outright rather than compare the sentinel against a live row.
+  legacy.content_sha256 = api.UNKNOWN_TRANSFER_CONTENT_SHA256;
+  await expect(api.completePortableDestinationInTransaction(executor, writer, verified)).rejects.toMatchObject({ code: 'verification-failed' });
+  expect(db.run?.state).toBe('active');
+  legacy.content_sha256 = captured;
+  await api.completePortableDestinationInTransaction(executor, writer, verified);
+  expect(db.run?.state).toBe('completed');
+  await db.query({ text: 'ROLLBACK' });
+});
+
+it('walks the transfer ledger in bounded keyset pages instead of one unbounded read', async () => {
+  const api = await import('../../src/storage/postgresql/portable-destination.js');
+  const { writer, stream, manifest } = await admitted();
+  await transferAll(writer, stream);
+  const verified = await api.verifyPortableDestinationComplete(writer, manifest);
+  const executor = { transactionScope: 'active' as const, query: db.query.bind(db) as never };
+  const template = db.identityLedger.find(entry => !identityDomains.has(entry.domain));
+  if (template === undefined) throw new Error('fixture missing a non-identity ledger row');
+  // A page holds PORTABLE_LIMITS.maxBatchRecords rows, so crossing a page
+  // boundary needs a run larger than the fixture. These synthetic ledger rows
+  // point at the same canonical row, which keeps every content comparison
+  // real while forcing the walk to continue past its first page.
+  for (let index = 0; index < PORTABLE_LIMITS.maxBatchRecords; index += 1) {
+    db.identityLedger.push({ ...template, identity_sha256: `synthetic-${String(index).padStart(6, '0')}` });
+  }
+  await db.query({ text: 'BEGIN' });
+  db.queryLog.length = 0;
+  await api.completePortableDestinationInTransaction(executor, writer, verified);
+  expect(db.run?.state).toBe('completed');
+  const pages = db.queryLog.filter(statement => statement.includes('FROM lcm.transfer_identities WHERE run_id='));
+  expect(pages.length).toBeGreaterThan(1);
+  for (const page of pages) expect(page).toContain('LIMIT $4');
+  await db.query({ text: 'ROLLBACK' });
+});
+
+it('bounds every canonical content read by an aggregate byte budget', async () => {
+  const api = await import('../../src/storage/postgresql/portable-destination.js');
+  const { writer, stream, manifest } = await admitted();
+  await transferAll(writer, stream);
+  const verified = await api.verifyPortableDestinationComplete(writer, manifest);
+  const executor = { transactionScope: 'active' as const, query: db.query.bind(db) as never };
+  // Each row reports two thirds of the batch byte budget, so no two of them
+  // may be projected by the same query however many share a ledger page.
+  const size = BigInt(PORTABLE_LIMITS.maxBatchBytes) / 3n * 2n;
+  boundaries.contentSizes.mockImplementation(async (_executor, _project, _domain: PortableDomain, locators: readonly string[]) => new Map(locators.map(locator => [locator, size])));
+  // Without grouping, a domain holding more than one ledger entry is read in
+  // a single query, so this fixture has to contain one for the assertion
+  // below to mean anything.
+  const perDomain = new Map<string, number>();
+  for (const entry of db.identityLedger.filter(entry => !identityDomains.has(entry.domain))) {
+    perDomain.set(entry.domain, (perDomain.get(entry.domain) ?? 0) + 1);
+  }
+  expect([...perDomain.values()].some(count => count > 1)).toBe(true);
+  await db.query({ text: 'BEGIN' });
+  boundaries.contentRows.mockClear();
+  await api.completePortableDestinationInTransaction(executor, writer, verified);
+  expect(db.run?.state).toBe('completed');
+  expect(boundaries.contentRows.mock.calls.length).toBeGreaterThan(0);
+  for (const call of boundaries.contentRows.mock.calls) expect((call[3] as readonly string[]).length).toBe(1);
+  await db.query({ text: 'ROLLBACK' });
+});
+
+it('compares a locator the size read omitted instead of skipping it', async () => {
+  const api = await import('../../src/storage/postgresql/portable-destination.js');
+  const { writer, stream, manifest } = await admitted();
+  await transferAll(writer, stream);
+  const verified = await api.verifyPortableDestinationComplete(writer, manifest);
+  const executor = { transactionScope: 'active' as const, query: db.query.bind(db) as never };
+  // A row that vanished between the size read and the content read reports no
+  // size at all. It still belongs to a group, so the content read is what
+  // decides, not the absent size.
+  boundaries.contentSizes.mockImplementation(async () => new Map());
+  const messages = db.records.get('messages')!;
+  const original = messages[0]!;
+  messages[0] = { ...original, value: { ...(original.value as object), tampered: true } } as typeof original;
+  await db.query({ text: 'BEGIN' });
+  await expect(api.completePortableDestinationInTransaction(executor, writer, verified)).rejects.toMatchObject({ code: 'verification-failed' });
+  expect(db.run?.state).toBe('active');
+  messages[0] = original;
+  await api.completePortableDestinationInTransaction(executor, writer, verified);
+  expect(db.run?.state).toBe('completed');
+  await db.query({ text: 'ROLLBACK' });
+});
+
+it('reads a completed run back without failing on content that moved after completion', async () => {
+  const api = await import('../../src/storage/postgresql/portable-destination.js');
+  const { writer, stream, manifest } = await admitted();
+  await transferAll(writer, stream);
+  const verified = await api.verifyPortableDestinationComplete(writer, manifest);
+  const executor = { transactionScope: 'active' as const, query: db.query.bind(db) as never };
+  await db.query({ text: 'BEGIN' });
+  await api.completePortableDestinationInTransaction(executor, writer, verified);
+  expect(db.run?.state).toBe('completed');
+  // The completion fence is released when that transaction commits, so a
+  // canonical writer may legitimately move a row before the settlement
+  // readback runs. The readback proves the run reached 'completed'; it must
+  // not report a failed settlement for a migration that in fact completed.
+  const messages = db.records.get('messages')!;
+  const original = messages[0]!;
+  messages[0] = { ...original, value: { ...(original.value as object), moved: true } } as typeof original;
+  expect(await api.readPortableCompletedRunInTransaction(executor, writer, verified)).toBe(true);
+  messages[0] = original;
+  await db.query({ text: 'ROLLBACK' });
+});
+
+it('refuses to record an identity mapping whose own row is unreadable right after writing it', async () => {
+  const { writer, stream } = await admitted();
+  const conversationsIndex = PORTABLE_RECORD_DOMAIN_ORDER.indexOf('conversations');
+  for (const domain of PORTABLE_RECORD_DOMAIN_ORDER.slice(0, conversationsIndex)) await writer.applyBatch(await batch(stream, domain));
+  const base = boundaries.row.getMockImplementation()!;
+  // The fixture's write-time readback locator is "domain:identitySha256";
+  // header-driven reads elsewhere use a zero-padded ordinal with no colon.
+  // Only intercept the former so unrelated preflight/header reads still work.
+  boundaries.row.mockImplementation(async (...args) => {
+    const locator = args[3] as string;
+    if (locator.includes(':')) return undefined;
+    return base(...args as Parameters<typeof base>);
+  });
+  await expect(writer.applyBatch(await batch(stream, 'conversations'))).rejects.toMatchObject({ code: 'checkpoint-mismatch' });
 });
 
 it('probes a target without holding the transfer session lock before opening a writer', async () => {

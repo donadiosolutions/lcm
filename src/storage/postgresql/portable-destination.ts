@@ -20,8 +20,9 @@ import { createPortableIndex, type PortableIndex } from '../portable-index.js';
 import type { PostgreSqlConnectionSettings, PostgreSqlQueryExecutor, PostgreSqlQueryOptions } from './contracts.js';
 import { buildPostgreSqlClientConfig } from './client-config.js';
 import { verifyPostgreSqlTransferSchema } from './runtime-readiness.js';
-import { assertPostgreSqlRecordCapability, insertCanonicalRecord, listCanonicalHeaders, readCanonicalRow, assertPostgreSqlExistingConstraints, listPostgreSqlRecordUniqueKeys, validatePostgreSqlRecordRelations } from './portable-mapping.js';
+import { assertPostgreSqlRecordCapability, insertCanonicalRecord, listCanonicalHeaders, readCanonicalRow, readCanonicalContentRows, readCanonicalContentSizes, canonicalRowContentSha256, assertPostgreSqlExistingConstraints, listPostgreSqlRecordUniqueKeys, validatePostgreSqlRecordRelations } from './portable-mapping.js';
 import { createPostgreSqlPortableSource, readPostgreSqlPortableWitness } from './portable-source.js';
+import { acquirePostgreSqlProjectPublicationLock } from './publication-guard.js';
 
 export interface PostgreSqlPortableDestinationInput {
   readonly settings: PostgreSqlConnectionSettings;
@@ -64,6 +65,13 @@ const preflights = new WeakMap<PortablePreflight, {state:DestinationState; index
 const completions = new WeakMap<PortableDestinationVerification,{state:DestinationState;manifest:PortableManifest;checkpoints:readonly string[]}>();
 const INITIAL = sha256('lcm-portable-initial-v1');
 export const IDENTITY_DOMAINS = ['machines','project','project-aliases'] as const;
+/**
+ * Digest recorded by migration 0008 for transfer_identities rows written
+ * before the column existed. Those rows predate the write-time capture, so no
+ * real content fingerprint can be reconstructed for them; completion treats
+ * the sentinel as an unverifiable row and fails closed.
+ */
+export const UNKNOWN_TRANSFER_CONTENT_SHA256 = sha256('lcm-transfer-identity-content-unknown-v1');
 const UUID7 = /^[0-9a-f]{8}-[0-9a-f]{4}-7[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/u;
 
 function fail(code: ConstructorParameters<typeof PortableTransferError>[0]): never {
@@ -370,7 +378,26 @@ export async function applyPortableBatchInTransaction(executor:PostgreSqlQueryEx
       const mapping=await executor.query<{native_key:string}>({text:'SELECT native_key FROM lcm.transfer_identities WHERE run_id=$1 AND domain=$2 AND identity_sha256=$3',values:[state.input.runId,domain,identity]},options(state,signal));
       if(mapping.rows.length!==1)fail('checkpoint-mismatch');return mapping.rows[0]!.native_key;
     },signal);
-    await executor.query({text:'INSERT INTO lcm.transfer_identities (run_id,domain,identity_sha256,ordinal,native_key,record_sha256) VALUES ($1,$2,$3,$4,$5,$6)',values:[state.input.runId,record.domain,record.identitySha256,String(record.ordinal),key,record.recordSha256]},options(state,signal));
+    // IDENTITY_DOMAINS rows are admission-time identity references this
+    // run looks up rather than writes, and readCanonicalRow's scope for
+    // machines requires a linking row (alias/session/transcript/etc.)
+    // that may not exist yet when the machine identity itself is
+    // processed. There is no new canonical content to fingerprint for
+    // these domains, so record_sha256 (already authenticated identity
+    // evidence) stands in; completePortableDestinationInTransaction
+    // excludes IDENTITY_DOMAINS from the re-verification that depends on
+    // this column.
+    const contentSha256=IDENTITY_DOMAINS.includes(record.domain as typeof IDENTITY_DOMAINS[number])
+      ? record.recordSha256
+      : canonicalRowContentSha256(
+        // Read back inside this same fenced transaction, immediately
+        // after the write, so content_sha256 fingerprints what this
+        // transaction actually committed rather than a value asserted
+        // from outside it.
+        await readCanonicalRow(executor,state.input.expectedIdentity.id,record.domain,key,signal)
+          ?? fail('checkpoint-mismatch'),
+      );
+    await executor.query({text:'INSERT INTO lcm.transfer_identities (run_id,domain,identity_sha256,ordinal,native_key,record_sha256,content_sha256) VALUES ($1,$2,$3,$4,$5,$6,$7)',values:[state.input.runId,record.domain,record.identitySha256,String(record.ordinal),key,record.recordSha256,contentSha256]},options(state,signal));
   }
   const checkpointBytes=Buffer.from(serializePortableCheckpoint(batch.checkpoint));
   await executor.query({text:'INSERT INTO lcm.transfer_batches (run_id,domain,prior_checkpoint_sha256,batch_sha256,checkpoint_bytes,checkpoint_sha256,first_ordinal,next_ordinal) VALUES ($1,$2,$3,$4,$5,$6,$7,$8)',values:[state.input.runId,batch.domain,batch.priorCheckpointSha256??INITIAL,batchDigest(batch),checkpointBytes,batch.checkpoint.checkpointSha256,String(prior?.nextOrdinal??0),String(batch.checkpoint.nextOrdinal)]},options(state,signal));
@@ -427,16 +454,122 @@ async function verifiedCompletionState(executor:PostgreSqlQueryExecutor,authorit
   const proof=completions.get(verification);
   if(!proof||proof.state!==state)fail('verification-failed');
   await assertTransaction(state,executor,signal);
+  // Fence the whole re-verification against concurrent canonical writers
+  // before reading anything. Every project-scoped runtime transaction takes
+  // this same advisory lock in shared mode for its entire duration
+  // (PostgreSqlRuntime.runTransaction), so taking it exclusively here waits
+  // out every in-flight project writer and blocks new ones until this
+  // transaction commits. Without it the rechecked rows are read under READ
+  // COMMITTED with no row lock, and a writer can modify one and commit in
+  // the window before the completion UPDATE, which is exactly the drift the
+  // recheck exists to catch. Row-locking the rechecked rows instead is not
+  // available under the reviewed grant profile: SELECT ... FOR SHARE needs
+  // UPDATE on the table, and the profile grants UPDATE only on the ten
+  // canonical tables that are actually mutable. Probing all 22 domains
+  // against the harness, a locking read is accepted for exactly those ten
+  // and rejected for the twelve append-only ones (messages, message parts,
+  // large files, summaries and their link tables, memory tags, recall
+  // surfacings, native transcripts and their links, projects), so fencing
+  // by row lock would mean widening the exact profile
+  // verifyPostgreSqlTransferSchema admits.
+  await acquirePostgreSqlProjectPublicationLock(executor,state.input.expectedIdentity.id,options(state,signal));
   const row=await runRow(state,executor,true,signal);
   if(!row||!runMatches(state,row,proof.manifest))fail('destination-conflict');
   const saved=await progress(state,proof.manifest.manifestSha256,signal,executor);
   if(canonicalJson(saved.checkpoints.map(checkpoint=>checkpoint.checkpointSha256))!==canonicalJson(proof.checkpoints))fail('verification-failed');
   return {state,row};
 }
+/**
+ * Re-derive the per-row content fingerprint captured at write time (see
+ * applyPortableBatchInTransaction) for every record this run wrote, and
+ * fail closed on any row that no longer matches or has disappeared. The
+ * checkpoint-chain recheck in verifiedCompletionState only proves this
+ * run's own batch-apply bookkeeping has not moved; it says nothing about
+ * the canonical rows those batches wrote. A canonical mutation made
+ * through any other path (a second run, promotion/dedup, compaction, a
+ * direct edit) leaves transfer_batches untouched while still changing
+ * what verify() actually fingerprinted.
+ *
+ * The ledger is walked in keyset pages over its primary key
+ * (run_id,domain,identity_sha256) instead of being selected whole. A
+ * manifest record count has no practical bound beyond safe-integer
+ * validation, so one unbounded SELECT would make node-postgres
+ * materialise the entire run, plus a second per-domain copy of it, while
+ * this transaction holds the exclusive project publication lock.
+ */
+async function assertRunContentUnchanged(state:DestinationState,executor:PostgreSqlQueryExecutor,signal?:AbortSignal):Promise<void>{
+  let afterDomain='';
+  let afterIdentity='';
+  for(;;){
+    abort(signal);
+    const page=await executor.query<{domain:string;identity_sha256:string;native_key:string;content_sha256:string}>({text:'SELECT domain,identity_sha256,native_key,content_sha256 FROM lcm.transfer_identities WHERE run_id=$1 AND (domain,identity_sha256)>($2::text,$3::text) ORDER BY domain,identity_sha256 LIMIT $4',values:[state.input.runId,afterDomain,afterIdentity,PORTABLE_LIMITS.maxBatchRecords]},options(state,signal));
+    if(page.rows.length===0)return;
+    const last=page.rows[page.rows.length-1]!;
+    afterDomain=last.domain;afterIdentity=last.identity_sha256;
+    const byDomain=new Map<PortableDomain,{locator:string;expected:string}[]>();
+    for(const identity of page.rows){
+      // IDENTITY_DOMAINS rows carry no independently re-derivable content
+      // fingerprint (see applyPortableBatchInTransaction); they stay
+      // authenticated by the identity checks this pipeline already runs.
+      if(IDENTITY_DOMAINS.includes(identity.domain as typeof IDENTITY_DOMAINS[number]))continue;
+      // Migration 0008 backfills rows written before the write-time capture
+      // existed with UNKNOWN_TRANSFER_CONTENT_SHA256. Those rows can never
+      // be re-derived, so refuse the completion instead of comparing a
+      // sentinel against live content.
+      if(identity.content_sha256===UNKNOWN_TRANSFER_CONTENT_SHA256)fail('verification-failed');
+      const list=byDomain.get(identity.domain as PortableDomain)??[];
+      list.push({locator:identity.native_key,expected:identity.content_sha256});
+      byDomain.set(identity.domain as PortableDomain,list);
+    }
+    for(const [domain,entries] of byDomain)await assertDomainContentUnchanged(state,executor,domain,entries,signal);
+  }
+}
+/**
+ * Compare one ledger page's locators for a single domain. Rows are read in
+ * groups bounded by PORTABLE_LIMITS.maxBatchBytes in aggregate rather than
+ * per row: the ledger walk regroups locators across the batches that
+ * originally wrote them, so the transfer's own per-batch byte budget does
+ * not bound what a group of locators projects. Sizes come first from the
+ * same rows without their payloads, which costs one extra round trip per
+ * group and keeps every payload result set bounded.
+ */
+async function assertDomainContentUnchanged(state:DestinationState,executor:PostgreSqlQueryExecutor,domain:PortableDomain,entries:readonly {locator:string;expected:string}[],signal?:AbortSignal):Promise<void>{
+  const sizes=await readCanonicalContentSizes(executor,state.input.expectedIdentity.id,domain,entries.map(entry=>entry.locator),signal);
+  const budget=BigInt(PORTABLE_LIMITS.maxBatchBytes);
+  let group:{locator:string;expected:string}[]=[];
+  let bytes=0n;
+  const compare=async():Promise<void>=>{
+    const current=await readCanonicalContentRows(executor,state.input.expectedIdentity.id,domain,group.map(entry=>entry.locator),signal);
+    for(const entry of group){
+      const row=current.get(entry.locator);
+      if(!row||canonicalRowContentSha256(row)!==entry.expected)fail('verification-failed');
+    }
+    group=[];bytes=0n;
+  };
+  for(const entry of entries){
+    // A locator missing from the size read was deleted or is no longer
+    // projectable. Keep it in a group so the content read reports it as
+    // the mismatch it is instead of dropping it here.
+    const size=sizes.get(entry.locator)??0n;
+    if(group.length>0&&bytes+size>budget)await compare();
+    group.push(entry);bytes+=size;
+  }
+  await compare();
+}
 export async function completePortableDestinationInTransaction(executor:PostgreSqlQueryExecutor,authority:PortableRecordWriter,verification:PortableDestinationVerification,signal?:AbortSignal):Promise<void>{
   const {state}=await verifiedCompletionState(executor,authority,verification,signal);
+  await assertRunContentUnchanged(state,executor,signal);
   await executor.query({text:"UPDATE lcm.transfer_runs SET state='completed' WHERE run_id=$1",values:[state.input.runId]},options(state,signal));
 }
+/**
+ * Readback of an already-settled completion. It re-proves identity, the
+ * witness, the run match and the exact checkpoint chain under the same
+ * fence, and deliberately stops there. The content recheck belongs to the
+ * active-to-completed transition: once that transaction has committed and
+ * released the fence, a legitimate canonical writer may change a row at
+ * any time, and failing the readback for that would report a failed
+ * settlement for a migration that in fact completed.
+ */
 export async function readPortableCompletedRunInTransaction(executor:PostgreSqlQueryExecutor,authority:PortableRecordWriter,verification:PortableDestinationVerification,signal?:AbortSignal):Promise<boolean>{
   const {row}=await verifiedCompletionState(executor,authority,verification,signal);
   if(row.state!=='active'&&row.state!=='completed')fail('destination-conflict');
