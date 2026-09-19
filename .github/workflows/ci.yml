@@ -1,5 +1,18 @@
 name: CI
 
+# Job graph (see docs/development.md, "Continuous integration"):
+#
+#   plan ─┬─ checks ────────────────────────────┐
+#         ├─ unit (matrix from plan) ─ report ──┼─ ci
+#         │                             └─ codecov (main/release only)
+#         ├─ postgresql (when planned) ─────────┤
+#         ├─ linux-systemd (when planned) ──────┤
+#         └─ macos-launchd (when planned) ──────┘
+#
+# `plan` decides the mode: pushes to main/release run every test file with
+# coverage and the merged report must reach 100% per file; pull requests and
+# merge-queue entries run only the test files related to the change.
+
 on:
   push:
     branches:
@@ -18,28 +31,45 @@ concurrency:
   cancel-in-progress: true
 
 jobs:
-  environment:
-    name: Initialize CI environment
+  plan:
+    name: Plan
     runs-on: blacksmith-4vcpu-ubuntu-2404
     outputs:
-      node-modules-cache-hit: ${{ steps.setup.outputs.node-modules-cache-hit }}
-      images-cache-hit: ${{ steps.setup.outputs.images-cache-hit }}
-      postgresql-template-cache-hit: ${{ steps.setup.outputs.postgresql-template-cache-hit }}
+      mode: ${{ steps.plan.outputs.mode }}
+      coverage: ${{ steps.plan.outputs.coverage }}
+      unit: ${{ steps.plan.outputs.unit }}
+      postgresql: ${{ steps.plan.outputs.postgresql }}
+      systemd: ${{ steps.plan.outputs.systemd }}
+      launchd: ${{ steps.plan.outputs.launchd }}
+      shards: ${{ steps.plan.outputs.shards }}
+      expected-file-count: ${{ steps.plan.outputs.expected-file-count }}
     steps:
       - name: Checkout
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
+          # The planner needs the merge base of the change.
+          fetch-depth: 0
 
-      - name: Initialize and seed CI environment
-        id: setup
-        uses: ./.github/actions/setup-ci
-        with:
-          stage-postgresql: "true"
+      - name: Set up Node.js and dependencies
+        uses: ./.github/actions/setup-node
 
-  core:
-    name: Core CI
-    needs: environment
+      - name: Plan the run
+        id: plan
+        env:
+          EVENT_NAME: ${{ github.event_name }}
+          REF: ${{ github.ref }}
+          BASE_SHA: ${{ github.event.pull_request.base.sha || github.event.merge_group.base_sha || '' }}
+          HEAD_SHA: ${{ github.sha }}
+        run: node scripts/ci-plan.mjs --event "$EVENT_NAME" --ref "$REF" --base "$BASE_SHA" --head "$HEAD_SHA"
+
+      - name: Seed PostgreSQL harness caches
+        if: ${{ steps.plan.outputs.postgresql == 'true' }}
+        uses: ./.github/actions/stage-postgresql
+
+  checks:
+    name: Checks
+    needs: plan
     runs-on: blacksmith-8vcpu-ubuntu-2404
     steps:
       - name: Checkout
@@ -47,22 +77,93 @@ jobs:
         with:
           persist-credentials: false
 
-      - name: Initialize CI environment
-        uses: ./.github/actions/setup-ci
+      - name: Set up Node.js and dependencies
+        uses: ./.github/actions/setup-node
 
       - name: Type-check
         run: pnpm run typecheck
 
-      - name: Run tests
-        run: pnpm run test:ci
-        env:
-          LCM_TEST_ARTIFACT_ROOT: ${{ runner.temp }}/lcm-vitest-${{ github.run_id }}-${{ github.run_attempt }}
+      - name: Build
+        run: pnpm run build
 
       - name: Test GitHub policy modules
         run: node --test .github/scripts/*.test.mjs
 
       - name: Test helper regressions
         run: python3 -B -m unittest discover -s .agents/skills/tests -v
+
+      - name: Check for workspace artifacts
+        run: bash .github/scripts/check-workspace-clean.sh
+
+  unit:
+    name: Unit (${{ matrix.name }})
+    needs: plan
+    if: ${{ needs.plan.outputs.unit == 'true' }}
+    runs-on: ${{ matrix.runner }}
+    strategy:
+      fail-fast: false
+      matrix: ${{ fromJSON(needs.plan.outputs.shards) }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Set up Node.js and dependencies
+        uses: ./.github/actions/setup-node
+
+      - name: Run Vitest shard
+        uses: ./.github/actions/vitest-shard
+        with:
+          name: ${{ matrix.name }}
+          projects: ${{ matrix.projects }}
+          files: ${{ matrix.files }}
+          coverage: ${{ needs.plan.outputs.coverage }}
+          artifact-root: ${{ runner.temp }}/lcm-vitest-${{ github.run_id }}-${{ github.run_attempt }}
+
+  report:
+    name: Report
+    needs:
+      - plan
+      - unit
+    runs-on: blacksmith-4vcpu-ubuntu-2404
+    permissions:
+      # Download the shard blobs produced by this workflow run.
+      actions: read
+      contents: read
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Set up Node.js and dependencies
+        uses: ./.github/actions/setup-node
+
+      - name: Download shard blobs
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPOSITORY: ${{ github.repository }}
+        run: |
+          set -Eeuo pipefail
+          download_root="$RUNNER_TEMP/lcm-blob-downloads"
+          blob_root="$RUNNER_TEMP/lcm-blobs"
+          mkdir -p "$download_root" "$blob_root"
+          gh run download "$GITHUB_RUN_ID" \
+            --repo "$REPOSITORY" \
+            --pattern 'vitest-blob-*' \
+            --dir "$download_root"
+          # gh nests each artifact in its own directory; accept a flat layout too.
+          find "$download_root" -type f -name '*.json' -exec mv -t "$blob_root" -- {} +
+          ls -l "$blob_root"
+
+      - name: Merge shard reports
+        env:
+          LCM_TEST_ARTIFACT_ROOT: ${{ runner.temp }}/lcm-vitest-${{ github.run_id }}-${{ github.run_attempt }}
+          LCM_CI_BLOB_DIRECTORY: ${{ runner.temp }}/lcm-blobs
+          LCM_CI_COVERAGE: ${{ needs.plan.outputs.coverage }}
+          LCM_CI_EXPECTED_FILE_COUNT: ${{ needs.plan.outputs.expected-file-count }}
+        run: node scripts/ci-vitest.mjs report
 
       - name: Upload Vitest reports
         if: ${{ !cancelled() }}
@@ -73,54 +174,36 @@ jobs:
             ${{ runner.temp }}/lcm-vitest-${{ github.run_id }}-${{ github.run_attempt }}/coverage/
             ${{ runner.temp }}/lcm-vitest-${{ github.run_id }}-${{ github.run_attempt }}/test-report.junit.xml
           if-no-files-found: warn
-
-      - name: Build
-        run: pnpm run build
+          # A re-run of this job must be able to replace the reports it uploaded.
+          overwrite: true
 
       - name: Check for workspace artifacts
-        run: |
-          if [ -e coverage ] || [ -e test-report.junit.xml ]; then
-            echo "Tests or build left legacy checkout artifacts:"
-            [ ! -e coverage ] || echo "coverage"
-            [ ! -e test-report.junit.xml ] || echo "test-report.junit.xml"
-            exit 1
-          fi
-          git diff --exit-code
-          UNTRACKED=$(git status --porcelain | grep "^??" | grep -vE "^\?\? (node_modules|dist|coverage)/|^\?\? test-report\.junit\.xml$" || true)
-          if [ -n "$UNTRACKED" ]; then
-            echo "❌ Tests or build left unexpected untracked files in the workspace:"
-            echo "$UNTRACKED"
-            echo ""
-            echo "Ensure all temp files go to os.tmpdir(), not process.cwd(). Tests must clean up after themselves."
-            exit 1
-          fi
-          echo "✅ Workspace is clean"
+        run: bash .github/scripts/check-workspace-clean.sh
 
   postgresql:
-    name: PostgreSQL 18 conformance (${{ matrix.run }})
-    needs: environment
-    runs-on: blacksmith-4vcpu-ubuntu-2404
-    strategy:
-      fail-fast: false
-      matrix:
-        run: [1, 2]
+    name: PostgreSQL 18 conformance
+    needs: plan
+    if: ${{ needs.plan.outputs.postgresql == 'true' }}
+    runs-on: blacksmith-8vcpu-ubuntu-2404
     steps:
       - name: Checkout
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
 
-      - name: Initialize CI environment
-        uses: ./.github/actions/setup-ci
-        with:
-          stage-postgresql: "true"
+      - name: Set up Node.js and dependencies
+        uses: ./.github/actions/setup-node
+
+      - name: Stage PostgreSQL harness
+        uses: ./.github/actions/stage-postgresql
 
       - name: Run isolated PostgreSQL 18 conformance harness
         run: pnpm run test:postgresql
 
   linux-systemd:
     name: Linux Ubuntu 24.04 user-systemd integration
-    needs: environment
+    needs: plan
+    if: ${{ needs.plan.outputs.systemd == 'true' }}
     runs-on: ubuntu-24.04
     timeout-minutes: 15
     steps:
@@ -129,36 +212,13 @@ jobs:
         with:
           persist-credentials: false
 
-      - name: Set up Node.js 25.9.0
-        uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+      - name: Set up Node.js and dependencies
+        uses: ./.github/actions/setup-node
         with:
+          # OS service integration runs on the latest runtime, not the floor.
           node-version: "25.9.0"
-
-      - name: Bootstrap verified pnpm
-        shell: bash
-        run: |
-          set -Eeuo pipefail
-          bootstrap_root="$(mktemp -d "$RUNNER_TEMP/lcm-pnpm.XXXXXX")"
-          pnpm_bin="$(node scripts/bootstrap-pnpm.mjs --destination "$bootstrap_root/pnpm")"
-          printf '%s\n' "$pnpm_bin" >> "$GITHUB_PATH"
-          printf 'npm_config_store_dir=%s\n' "$RUNNER_TEMP/lcm-pnpm-store" >> "$GITHUB_ENV"
-
-      - name: Locate pnpm store
-        id: pnpm-store
-        shell: bash
-        run: |
-          set -Eeuo pipefail
-          store_path="$(pnpm store path)"
-          printf 'path=%s\n' "$store_path" >> "$GITHUB_OUTPUT"
-
-      - name: Cache pnpm store
-        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
-        with:
-          path: ${{ steps.pnpm-store.outputs.path }}
-          key: pnpm-store-v1-${{ runner.os }}-${{ runner.arch }}-node-25.9.0-${{ hashFiles('package.json', 'pnpm-lock.yaml', '.npmrc', 'pnpm-workspace.yaml', 'scripts/bootstrap-pnpm.mjs') }}
-
-      - name: Install dependencies
-        run: pnpm install --frozen-lockfile
+          # GitHub-hosted runners never shared the Blacksmith node_modules cache; install from the store.
+          cache-node-modules: "false"
 
       - name: Build package
         run: pnpm run build
@@ -173,49 +233,12 @@ jobs:
           LCM_LIFECYCLE_EXPECTED_SCOPES: "1"
           LCM_RUNTIME_PATHS_SYSTEMD_INTEGRATION: "1"
           LCM_RUNTIME_PATHS_SYSTEMD_RUN_ROOT: ${{ runner.temp }}/lcm-runtime-paths-${{ github.run_id }}-${{ github.run_attempt }}
-        run: |
-          set -Eeuo pipefail
-          barrier_dir="$LCM_LIFECYCLE_SYSTEMD_BARRIER_DIR"
-          runtime_root="$LCM_RUNTIME_PATHS_SYSTEMD_RUN_ROOT"
-          sudo install -d -o root -g root -m 1777 -- "$runtime_root"
-          cleanup() {
-            set +e
-            if [[ -d "$barrier_dir" ]]; then
-              while IFS= read -r marker; do
-                [[ -f "$marker" ]] || continue
-                unit_name="$(node -e 'const fs = require("node:fs"); const value = JSON.parse(fs.readFileSync(process.argv[1], "utf8")); process.stdout.write(value.unitName ?? "");' "$marker" 2>/dev/null)"
-                if [[ "$unit_name" =~ ^lcm-daemon-[0-9a-f]{20}\.service$ ]]; then
-                  systemctl --user stop "$unit_name" || true
-                  systemctl --user reset-failed "$unit_name" || true
-                else
-                  echo "Refusing cleanup for unexpected systemd unit: $unit_name" >&2
-                fi
-              done < <(find "$barrier_dir" -maxdepth 1 -type f -name '*.ready' -print)
-              rm -rf -- "$barrier_dir"
-            fi
-            if [[ -d "$runtime_root" ]]; then
-              sudo rm -rf -- "$runtime_root"
-            fi
-          }
-          trap cleanup EXIT
-          systemd_state="$(systemctl --user is-system-running || true)"
-          case "$systemd_state" in
-            running|degraded) ;;
-            *) echo "Unexpected user-systemd state: $systemd_state" >&2; exit 1 ;;
-          esac
-          pnpm exec vitest run \
-            test/daemon/lifecycle-isolation.test.ts \
-            test/daemon/lifecycle-systemd.integration.test.ts \
-            test/daemon/systemd-credential-loader.test.ts \
-            --testNamePattern "uses and removes one exact run-owned transient unit|starts and admits a healthy managed unit with exact identity and cleanup|restarts a wedged registered unit through systemd without legacy signal fallback|recreates a terminal clean-exit unit after a registered-not-running observation|refuses stale manager identity before mutation and never falls back to legacy signals|refuses clean-environment drift before admitting an existing unit"
-          pnpm exec vitest run test/runtime-paths-systemd.integration.test.ts
-          pnpm exec vitest run \
-            test/daemon/systemd-credential-loader.test.ts \
-            --testNamePattern "observes the real user-systemd LoadCredential modes"
+        run: bash .github/scripts/systemd-integration.sh
 
   macos-launchd:
     name: macOS 15 launchd feasibility
-    needs: environment
+    needs: plan
+    if: ${{ needs.plan.outputs.launchd == 'true' }}
     runs-on: macos-15
     timeout-minutes: 15
     steps:
@@ -224,36 +247,13 @@ jobs:
         with:
           persist-credentials: false
 
-      - name: Set up Node.js 25.9.0
-        uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+      - name: Set up Node.js and dependencies
+        uses: ./.github/actions/setup-node
         with:
+          # OS service integration runs on the latest runtime, not the floor.
           node-version: "25.9.0"
-
-      - name: Bootstrap verified pnpm
-        shell: bash
-        run: |
-          set -Eeuo pipefail
-          bootstrap_root="$(mktemp -d "$RUNNER_TEMP/lcm-pnpm.XXXXXX")"
-          pnpm_bin="$(node scripts/bootstrap-pnpm.mjs --destination "$bootstrap_root/pnpm")"
-          printf '%s\n' "$pnpm_bin" >> "$GITHUB_PATH"
-          printf 'npm_config_store_dir=%s\n' "$RUNNER_TEMP/lcm-pnpm-store" >> "$GITHUB_ENV"
-
-      - name: Locate pnpm store
-        id: pnpm-store
-        shell: bash
-        run: |
-          set -Eeuo pipefail
-          store_path="$(pnpm store path)"
-          printf 'path=%s\n' "$store_path" >> "$GITHUB_OUTPUT"
-
-      - name: Cache pnpm store
-        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
-        with:
-          path: ${{ steps.pnpm-store.outputs.path }}
-          key: pnpm-store-v1-${{ runner.os }}-${{ runner.arch }}-node-25.9.0-${{ hashFiles('package.json', 'pnpm-lock.yaml', '.npmrc', 'pnpm-workspace.yaml', 'scripts/bootstrap-pnpm.mjs') }}
-
-      - name: Install dependencies
-        run: pnpm install --frozen-lockfile
+          # The exact node_modules inventory needs Linux /proc; macOS installs from the store cache.
+          cache-node-modules: "false"
 
       - name: Probe descriptor-relative runtime migration
         run: pnpm exec vitest run test/runtime-paths.test.ts --testNamePattern "uses actual platform semantics for nested legacy migration"
@@ -264,199 +264,49 @@ jobs:
           LCM_LAUNCHD_SCOPE_ID: ci-${{ github.run_id }}-${{ github.run_attempt }}
           LCM_LAUNCHD_RESOURCE_ROOT: ${{ runner.temp }}/lcm-launchd-${{ github.run_id }}-${{ github.run_attempt }}
           LCM_LAUNCHD_LABEL: com.donadiosolutions.lcm.ci.${{ github.run_id }}.${{ github.run_attempt }}
-        run: |
-          set -Eeuo pipefail
-          resource_root="$LCM_LAUNCHD_RESOURCE_ROOT"
-          label="$LCM_LAUNCHD_LABEL"
-          ready_file="$resource_root/launchd.label"
-          out_file="$resource_root/launchd.out"
-          # Current-run evidence binds every launchd artifact to this workflow
-          # run and to nothing else. A fresh unpredictable UUID is generated
-          # here and passed to the integration worker exclusively through the
-          # environment, never logged or echoed. The worker must prove current
-          # run ownership by writing one 0600 marker whose content is exactly
-          # "<uuid> <derived-product-label>". A stale or planted marker cannot
-          # know this fresh token, so it cannot satisfy the trap or the
-          # post-run validation.
-          evidence_token="$(uuidgen)"
-          export LCM_LAUNCHD_EVIDENCE_TOKEN="$evidence_token"
-          # No current-run evidence is trusted until it is validated below.
-          validated_ready_label=""
-          cleanup() {
-            set +e
-            if [[ -f "$ready_file" ]]; then
-              ready_line="$(<"$ready_file")"
-              ready_token="${ready_line%% *}"
-              ready_label="${ready_line#* }"
-              # Bootout is authorized only when the marker was written by this
-              # current workflow run (fresh token match) and carries the exact
-              # validated derived product label admitted below. Any stale,
-              # replanted, malformed, or manifest-mismatched marker refuses to
-              # bootout and never falls back to a broad label sweep or a
-              # native/PID kill.
-              if [[ -z "$ready_token" || -z "$ready_label" || "$ready_line" != "$ready_token $ready_label" ]]; then
-                echo "Refusing cleanup for malformed launchd evidence marker" >&2
-              elif [[ "$ready_token" == "$evidence_token" \
-                && "$ready_line" == "$evidence_token $validated_ready_label" \
-                && "$ready_label" == "$validated_ready_label" \
-                && "$ready_label" =~ ^com\.donadiosolutions\.lcm\.daemon\.[0-9a-f]{20}$ \
-                && "$(stat -f '%Lp' "$ready_file" 2>/dev/null)" == "600" ]]; then
-                launchctl bootout "gui/$(id -u)/$ready_label" || true
-              else
-                echo "Refusing cleanup for unexpected launchd label: $ready_label" >&2
-              fi
-            fi
-            rm -rf -- "$resource_root"
-          }
-          trap cleanup EXIT
-          # Fail closed on any pre-existing launchd evidence. The run-scoped
-          # root must start empty so a leftover marker or trapped output from an
-          # earlier retry cannot be inherited as this run's proof.
-          rm -rf -- "$resource_root"
-          mkdir -p -- "$resource_root"
-          chmod 0700 "$resource_root"
-          pnpm exec vitest run test/daemon/lifecycle-launchd.integration.test.ts 2>&1 \
-            | tee "$out_file"
-          # After the worker exits, the marker must hold the exact current-run
-          # evidence and the single derived product label, or nothing is
-          # trusted for cleanup and the job fails hard.
-          if [[ ! -f "$ready_file" ]]; then
-            echo "launchd integration produced no fresh current-run marker (missing: $ready_file)" >&2
-            exit 1
-          fi
-          ready_line="$(<"$ready_file")"
-          ready_token="${ready_line%% *}"
-          ready_label="${ready_line#* }"
-          if [[ -z "$ready_token" || -z "$ready_label" || "$ready_line" != "$ready_token $ready_label" ]]; then
-            echo "launchd integration marker must contain exactly one current-run token and one derived product label" >&2
-            exit 1
-          fi
-          if [[ "$ready_token" != "$evidence_token" ]]; then
-            echo "launchd integration marker does not carry the current run evidence token" >&2
-            exit 1
-          fi
-          if [[ ! "$ready_label" =~ ^com\.donadiosolutions\.lcm\.[A-Za-z0-9.-]+$ ]]; then
-            echo "launchd integration did not derive a validated scoped product label: $ready_label" >&2
-            exit 1
-          fi
-          if [[ "$(stat -f '%Lp' "$ready_file" 2>/dev/null)" != "600" ]]; then
-            echo "launchd integration marker does not have mode 0600" >&2
-            exit 1
-          fi
-          if [[ "$ready_label" == "$label" ]]; then
-            # The derived product label can never be this run's static CI
-            # manifest label; an equality gate here would make cleanup dead by
-            # construction, so we reject it instead.
-            echo "launchd integration derived product label must not equal the CI manifest label" >&2
-            exit 1
-          fi
-          if [[ ! "$ready_label" =~ ^com\.donadiosolutions\.lcm\.daemon\.[0-9a-f]{20}$ ]]; then
-            echo "launchd integration derived product label must match the exact run-owned daemon identity" >&2
-            exit 1
-          fi
-          # Ownership proven by the token plus the derived product label; only
-          # now may the EXIT trap consider a bootout on failure teardown.
-          validated_ready_label="$ready_label"
-          # Parse only a fresh normalized copy. Strip only CSI SGR sequences;
-          # any other escape or C0 control byte remains evidence corruption.
-          normalized_out_file="$resource_root/launchd.normalized.out"
-          LC_ALL=C sed $'s/\033\\[[0-9;]*m//g' "$out_file" > "$normalized_out_file"
-          if LC_ALL=C od -An -v -tu1 "$normalized_out_file" | awk '
-            {
-              for (i = 1; i <= NF; i++) {
-                if ($i <= 8 || ($i >= 11 && $i <= 31) || $i == 127) {
-                  found = 1
-                }
-              }
-            }
-            END {
-              if (found) {
-                exit 0
-              }
-              exit 1
-            }
-          '
-          then
-            echo "launchd integration output contains residual ESC/C0 control bytes" >&2
-            exit 1
-          fi
-          # Fail hard when the fresh output does not contain exactly one
-          # unambiguous Vitest Tests summary. Never select a first match from
-          # duplicate or ambiguous evidence.
-          tests_summary_count="$(LC_ALL=C grep -Ec '^[[:space:]]*Tests([[:space:]]|$)' "$normalized_out_file" || true)"
-          if [[ "$tests_summary_count" != "1" ]]; then
-            echo "launchd integration requires exactly one Tests summary (count=$tests_summary_count)" >&2
-            exit 1
-          fi
-          tests_summary="$(LC_ALL=C grep -E '^[[:space:]]*Tests([[:space:]]|$)' "$normalized_out_file")"
-          tests_summary_pattern='^[[:space:]]*Tests[[:space:]]+[[:digit:]]+[[:space:]]+(passed|skipped)([[:space:]]*\|[[:space:]]+[[:digit:]]+[[:space:]]+(passed|skipped))*[[:space:]]+\([[:digit:]]+\)[[:space:]]*$'
-          if [[ ! "$tests_summary" =~ $tests_summary_pattern ]]; then
-            echo "launchd integration produced an ambiguous Tests summary" >&2
-            exit 1
-          fi
-          passed_match_count="$(printf '%s\n' "$tests_summary" | LC_ALL=C grep -oE '[[:digit:]]+[[:space:]]+passed' | awk 'END { print NR + 0 }' || true)"
-          skipped_match_count="$(printf '%s\n' "$tests_summary" | LC_ALL=C grep -oE '[[:digit:]]+[[:space:]]+skipped' | awk 'END { print NR + 0 }' || true)"
-          if [[ "$passed_match_count" != "1" || "$skipped_match_count" -gt 1 ]]; then
-            echo "launchd integration produced ambiguous passed/skipped counts" >&2
-            exit 1
-          fi
-          if [[ "$tests_summary" =~ ([[:digit:]]+)[[:space:]]+passed ]]; then
-            passed_count="${BASH_REMATCH[1]}"
-          else
-            passed_count=""
-          fi
-          skipped_count=0
-          if [[ "$tests_summary" =~ ([[:digit:]]+)[[:space:]]+skipped ]]; then
-            skipped_count="${BASH_REMATCH[1]}"
-          fi
-          if [[ "${skipped_count:-0}" != "0" || "${passed_count:-0}" == "0" || -z "${passed_count:-}" ]]; then
-            echo "launchd integration produced no current-run passed evidence (skipped=${skipped_count:-0} passed=${passed_count:-0})" >&2
-            exit 1
-          fi
-          # The integration emits exactly one fixed, bounded sentinel only
-          # after a child has answered exact health through launchd. This is
-          # fresh manager activity evidence, not a test-name or credential
-          # echo, and duplicate/missing sentinels fail closed.
-          sentinel_count="$(LC_ALL=C grep -c '^launchd-user$' "$normalized_out_file" || true)"
-          if [[ "$sentinel_count" != "1" ]]; then
-            echo "launchd integration produced no single manager-activity sentinel (count=$sentinel_count)" >&2
-            exit 1
-          fi
+        run: bash .github/scripts/launchd-integration.sh
 
   ci:
     name: ci
     needs:
-      - environment
-      - core
+      - plan
+      - checks
+      - unit
+      - report
       - postgresql
       - linux-systemd
       - macos-launchd
     if: ${{ always() }}
     runs-on: ubuntu-latest
     steps:
-      - name: Require every CI suite
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+          sparse-checkout: .github/scripts/ci-gate.mjs
+          sparse-checkout-cone-mode: false
+
+      - name: Require every planned CI job
         env:
-          ENVIRONMENT_RESULT: ${{ needs.environment.result }}
-          CORE_RESULT: ${{ needs.core.result }}
+          PLAN_UNIT: ${{ needs.plan.outputs.unit }}
+          PLAN_POSTGRESQL: ${{ needs.plan.outputs.postgresql }}
+          PLAN_SYSTEMD: ${{ needs.plan.outputs.systemd }}
+          PLAN_LAUNCHD: ${{ needs.plan.outputs.launchd }}
+          PLAN_RESULT: ${{ needs.plan.result }}
+          CHECKS_RESULT: ${{ needs.checks.result }}
+          UNIT_RESULT: ${{ needs.unit.result }}
+          REPORT_RESULT: ${{ needs.report.result }}
           POSTGRESQL_RESULT: ${{ needs.postgresql.result }}
           LINUX_SYSTEMD_RESULT: ${{ needs.linux-systemd.result }}
           MACOS_LAUNCHD_RESULT: ${{ needs.macos-launchd.result }}
-        run: |
-          set -Eeuo pipefail
-          if [[ "$ENVIRONMENT_RESULT" != success || "$CORE_RESULT" != success || "$POSTGRESQL_RESULT" != success || "$LINUX_SYSTEMD_RESULT" != success || "$MACOS_LAUNCHD_RESULT" != success ]]; then
-            echo "Environment result: $ENVIRONMENT_RESULT" >&2
-            echo "Core CI result: $CORE_RESULT" >&2
-            echo "PostgreSQL matrix result: $POSTGRESQL_RESULT" >&2
-            echo "Linux user-systemd result: $LINUX_SYSTEMD_RESULT" >&2
-            echo "macOS launchd result: $MACOS_LAUNCHD_RESULT" >&2
-            exit 1
-          fi
-          echo "Environment, Core CI, every PostgreSQL matrix run, Linux user-systemd integration, and macOS launchd integration passed."
+        run: node .github/scripts/ci-gate.mjs
 
   codecov:
     name: Codecov upload
-    needs: ci
-    if: ${{ !cancelled() && github.event_name != 'merge_group' && (github.event_name == 'push' || (github.event_name == 'pull_request' && github.event.pull_request.head.repo.full_name == github.repository)) }}
+    needs:
+      - plan
+      - report
+    if: ${{ !cancelled() && needs.plan.outputs.coverage == 'true' && needs.report.result == 'success' }}
     runs-on: ubuntu-latest
     permissions:
       # Download the fixed report artifact produced by this workflow run.
@@ -506,7 +356,6 @@ jobs:
         uses: codecov/codecov-action@fb8b3582c8e4def4969c97caa2f19720cb33a72f # v7.0.0
         with:
           use_oidc: true
-          override_pr: ${{ github.event_name == 'pull_request' && github.event.pull_request.number || '' }}
           files: coverage/lcov.info
           disable_search: true
           binary: ${{ runner.temp }}/codecov
@@ -516,75 +365,6 @@ jobs:
         uses: codecov/codecov-action@fb8b3582c8e4def4969c97caa2f19720cb33a72f # v7.0.0
         with:
           use_oidc: true
-          override_pr: ${{ github.event_name == 'pull_request' && github.event.pull_request.number || '' }}
-          files: test-report.junit.xml
-          disable_search: true
-          report_type: test_results
-          binary: ${{ runner.temp }}/codecov
-          fail_ci_if_error: true
-
-  codecov-fork:
-    name: Codecov upload (fork)
-    needs: ci
-    if: ${{ !cancelled() && github.event_name == 'pull_request' && github.event.pull_request.head.repo.full_name != github.repository }}
-    runs-on: ubuntu-latest
-    permissions:
-      # Download the fixed report artifact produced by this workflow run.
-      actions: read
-      # Make the artifact-producing tree available for Codecov path reconciliation.
-      contents: read
-    steps:
-      - name: Checkout source for Codecov
-        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-        with:
-          repository: ${{ github.repository }}
-          ref: ${{ github.sha }}
-          persist-credentials: false
-
-      - name: Download Vitest reports
-        env:
-          GH_TOKEN: ${{ github.token }}
-          REPOSITORY: ${{ github.repository }}
-        run: |
-          set -Eeuo pipefail
-          gh run download "$GITHUB_RUN_ID" \
-            --repo "$REPOSITORY" \
-            --name vitest-reports \
-            --dir .
-
-      - name: Download verified Codecov CLI
-        env:
-          GH_TOKEN: ${{ github.token }}
-          CODECOV_CLI_REPOSITORY: codecov/codecov-cli
-          CODECOV_CLI_TAG: v11.2.6
-          CODECOV_CLI_ASSET: codecovcli_linux
-          CODECOV_CLI_SHA256: fd34214e2b2c738e48e3ac90b2c23ec4e975d0e9aee51f2cebe81b5704af3f6c
-        run: |
-          set -Eeuo pipefail
-          CODECOV_CLI_PATH="$RUNNER_TEMP/codecov"
-          gh release download "$CODECOV_CLI_TAG" \
-            --repo "$CODECOV_CLI_REPOSITORY" \
-            --pattern "$CODECOV_CLI_ASSET" \
-            --output "$CODECOV_CLI_PATH"
-          printf '%s  %s\n' "$CODECOV_CLI_SHA256" "$CODECOV_CLI_PATH" \
-            | sha256sum --check --strict
-          chmod 0755 "$CODECOV_CLI_PATH"
-
-      - name: Upload coverage to Codecov
-        uses: codecov/codecov-action@fb8b3582c8e4def4969c97caa2f19720cb33a72f # v7.0.0
-        with:
-          use_oidc: false
-          override_pr: ${{ github.event.pull_request.number }}
-          files: coverage/lcov.info
-          disable_search: true
-          binary: ${{ runner.temp }}/codecov
-          fail_ci_if_error: true
-
-      - name: Upload test results to Codecov
-        uses: codecov/codecov-action@fb8b3582c8e4def4969c97caa2f19720cb33a72f # v7.0.0
-        with:
-          use_oidc: false
-          override_pr: ${{ github.event.pull_request.number }}
           files: test-report.junit.xml
           disable_search: true
           report_type: test_results
