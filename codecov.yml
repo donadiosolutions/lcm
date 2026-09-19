@@ -21,6 +21,9 @@ component_management:
         - "bin/"
         - "src/cli/"
         - "^src/cli-help\\.ts$"
+        # #1356/#1357 keep CLI admission of an authenticated project-map
+        # identity, and the unauthenticated marker that project list and
+        # project show now print, in this existing owner.
         - "^src/cli-storage\\.ts$"
     - component_id: "unit-installation"
       name: "Unit - Installation"
@@ -63,6 +66,9 @@ component_management:
         # and retained parent after destination authorization in this owner.
         # PR #791 keeps generated Gitleaks hostname-literal normalization in
         # this existing configuration-security owner.
+        # #1358 keeps the collapsed nested lazy prefixes and the structurally
+        # verified, fail-closed Gitleaks keyword prefilter in that same owner,
+        # for both the scrub engine and its generated pattern table.
         - "^src/config-manager\\.ts$"
         - "^src/config-projection\\.ts$"
         - "^src/generated-patterns\\.ts$"
@@ -237,6 +243,9 @@ component_management:
         # in local persistence; this change does not alter component ownership.
         # #1084/#1085/#1092 keep SQLite UTC timestamp parsing in this owner.
         # #1203 keeps selected SQLite recall evidence and its owned query tokenizer here.
+        # #1356/#1357 keep the events-sidecar probe here: it treats a map
+        # key no local evidence authenticates as no identity and falls
+        # back to the canonical path sidecar.
         - "src/db/"
         # Captured UTF-8 decoding and immutable-file authority remain local-persistence-owned.
         # #618 optional receipt schema admission stays local-persistence-owned.
@@ -322,6 +331,8 @@ component_management:
         - "^src/transcript-provider\\.ts$"
         - "^src/transcript\\.ts$"
         - "^src/storage/local-transcript-quarantine\\.ts$"
+        # #1358 keeps the removal of the redundant residual scrub pass, for
+        # strings the first pass left unchanged, in this existing import owner.
         - "^src/storage/native-transcript-ingest\\.ts$"
         - "^src/storage/native-transcripts\\.ts$"
     - component_id: "unit-memory-retrieval"
@@ -375,6 +386,9 @@ component_management:
         # existing component; no taxonomy, status, or policy change.
         # #1270/#1283 keep exact project-fence classification and deterministic
         # local successor renewal in this existing project/worktree component.
+        # #1356/#1357 keep project-map key authentication in this owner:
+        # a key is admitted only as the canonical path hash, a fenced
+        # renewal successor, or a legacy hash its own metadata corroborates.
         - "^src/project-map\\.ts$"
         - "^src/worktree-reconciliation-fence\\.ts$"
         # #1044 keeps the existing owner; no taxonomy, status, or policy change.
@@ -473,6 +487,8 @@ component_management:
     - component_id: "integration-postgresql-identity"
       name: "Integration - PostgreSQL Identity"
       paths:
+        # #1356/#1357 keep local project listing and show, which mark an
+        # identity storage will refuse rather than hiding it, in this owner.
         - "^src/identity-service\\.ts$"
         - "^src/storage/postgresql/identity-repository\\.ts$"
     - component_id: "integration-postgresql-memory"

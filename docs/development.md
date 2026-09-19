@@ -101,6 +101,11 @@ S0-frozen campaign covering every currently open native GitHub Bug issue. It
 performs inventory agreement, duplicate adjudication, and triage before handing
 accepted work to [procedural development](procedural-development.md).
 
+Use [triage-security-issues](triage-security-issues.md) for existing Dependabot,
+Code Scanning, Secret Scanning and Codex Security cloud alerts. It invokes the
+existing assessment and delivery skills after complete triage and cross-source
+grouping, with private campaign records and Daybreak Blue security workers.
+
 Use [procedural development](procedural-development.md) for a direct GitHub
 issue or a bounded inventory supplied by a caller. It defines the shared role
 defaults, override rules, exact-SHA reviews, and candidate-round outcomes.
@@ -163,13 +168,14 @@ directory and therefore does not sweep pre-existing orphans in the ambient
 temporary root. On a host with a valid ambient `.git`, tests no longer share
 that repository identity.
 
-The two large portable-record boundary test files run in the ordered
+The portable boundary test files run in the ordered
 `unit-portable-boundaries` Vitest project after the ordinary unit project. The
 project uses `fileParallelism: false`, so Vitest admits one worker for the
-128 MiB record and 144 MiB batch fixtures even when the command enables more
-workers for other projects. This prevents those two memory-heavy files from
-overlapping with each other or with ordinary unit workers while preserving
-their exact limits and deadlines. Serial admission does not reduce the bytes
+128 MiB record and 144 MiB batch fixtures, and for the two `sqlite-portable`
+files that build migrated databases and stream whole-file digests, even when
+the command enables more workers for other projects. This prevents those
+memory- and fsync-heavy files from overlapping with each other or with
+ordinary unit workers while preserving their exact limits and deadlines. Serial admission does not reduce the bytes
 allocated by an individual test and cannot guarantee immunity from external
 CPU or memory starvation.
 

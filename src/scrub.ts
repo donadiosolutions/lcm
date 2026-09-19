@@ -460,6 +460,10 @@ export interface ScrubCounts {
   project: number;
 }
 
+export interface ScrubEngineOptions {
+  useGitleaksPrefilter?: boolean;
+}
+
 /** Gitleaks sync date extracted from generated file header (ISO string or null). */
 export function getGitleaksSyncDate(): string | null {
   // Import the generated file's header comment to extract the sync date.
@@ -477,6 +481,8 @@ export class ScrubEngine {
    * Gitleaks patterns are always "spanning" (applied to full text regardless of isSpanningPattern).
    */
   private readonly _spanningOrigIdx: number[] = [];
+  /** Lowercase required keywords for each prefiltered gitleaks spanning pattern. */
+  private readonly _spanningRequiredKeywords: Array<readonly string[] | null> = [];
   /** Original index for each token pattern. */
   private readonly _tokenOrigIdx: number[] = [];
   /** Number of gitleaks patterns at the start of the combined array. */
@@ -485,17 +491,40 @@ export class ScrubEngine {
   private readonly _nativeCount: number;
   /** Number of global patterns (for category accounting). */
   private readonly _globalPatternCount: number;
+  private readonly _useGitleaksPrefilter: boolean;
   readonly invalidPatterns: string[] = [];
 
-  constructor(globalPatterns: string[], projectPatterns: string[]) {
+  constructor(
+    globalPatterns: string[],
+    projectPatterns: string[],
+    options: ScrubEngineOptions = {},
+  ) {
     this._gitleaksCount = GITLEAKS_PATTERNS.length;
     this._nativeCount = NATIVE_PATTERNS.length;
     this._globalPatternCount = globalPatterns.length;
+    this._useGitleaksPrefilter = options.useGitleaksPrefilter ?? true;
 
     // Merge order: gitleaks → native → global → project
-    const trustedPatterns: Array<{ source: string; isGitleaks: boolean; flags: string }> = [
-      ...GITLEAKS_PATTERNS.map((p) => ({ source: p.regex, isGitleaks: true, flags: p.flags })),
-      ...NATIVE_PATTERNS.map((p) => ({ source: p, isGitleaks: false, flags: "" })),
+    const trustedPatterns: Array<{
+      source: string;
+      isGitleaks: boolean;
+      flags: string;
+      requiredKeywords: readonly string[] | null;
+    }> = [
+      ...GITLEAKS_PATTERNS.map((p) => ({
+        source: p.regex,
+        isGitleaks: true,
+        flags: p.flags,
+        requiredKeywords: p.prefilter
+          ? p.keywords.map((keyword) => keyword.toLowerCase())
+          : null,
+      })),
+      ...NATIVE_PATTERNS.map((p) => ({
+        source: p,
+        isGitleaks: false,
+        flags: "",
+        requiredKeywords: null,
+      })),
     ];
     const userPatterns: Array<{ source: string; isGitleaks: false; flags: string }> = [
       ...globalPatterns.map((p) => ({ source: p, isGitleaks: false as const, flags: "" })),
@@ -507,7 +536,7 @@ export class ScrubEngine {
         ? normalizeGitleaksRegex(original.source, original.flags)
         : { source: original.source, flags: original.flags };
       const { source, flags } = converted;
-      const { isGitleaks } = original;
+      const { isGitleaks, requiredKeywords } = original;
       try {
         const regex = new RegExp(source, "g" + flags);
         const pattern = { source, regex, plan: createRegexCollectionPlan(regex) };
@@ -515,6 +544,9 @@ export class ScrubEngine {
         if (isGitleaks || isSpanningPattern(source)) {
           this.spanningPatterns.push(pattern);
           this._spanningOrigIdx.push(i);
+          this._spanningRequiredKeywords.push(
+            isGitleaks && this._useGitleaksPrefilter ? requiredKeywords : null,
+          );
         } else {
           this.tokenPatterns.push(pattern);
           this._tokenOrigIdx.push(i);
@@ -533,6 +565,7 @@ export class ScrubEngine {
         if (isSpanningPattern(source)) {
           this.spanningPatterns.push(pattern);
           this._spanningOrigIdx.push(originalIndex);
+          this._spanningRequiredKeywords.push(null);
         } else {
           this.tokenPatterns.push(pattern);
           this._tokenOrigIdx.push(originalIndex);
@@ -574,7 +607,16 @@ export class ScrubEngine {
       textTokenRanges ??= nonWhitespaceRanges(text);
       return textTokenRanges;
     };
+    const lowercaseText = this._useGitleaksPrefilter ? text.toLowerCase() : null;
     for (let pi = 0; pi < this.spanningPatterns.length; pi++) {
+      const requiredKeywords = this._spanningRequiredKeywords[pi];
+      if (
+        requiredKeywords !== null
+        && lowercaseText !== null
+        && !requiredKeywords.some((keyword) => lowercaseText.includes(keyword))
+      ) {
+        continue;
+      }
       const pattern = this.spanningPatterns[pi];
       collectConsumingRanges(text, pattern, getTextTokenRanges, (range) => {
         addTaggedRange(range, this._spanningOrigIdx[pi]);
