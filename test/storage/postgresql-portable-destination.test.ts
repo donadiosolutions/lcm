@@ -50,6 +50,7 @@ class Database {
   lock = true;
   isolation: Row[] = [{ isolation: 'read committed', readonly: 'off' }];
   cas = true;
+  ledgerTallyFailure = false;
   extraRuns = false;
   commitFailure: 'before' | 'after' | undefined;
   rollbackFailure = false;
@@ -91,6 +92,7 @@ class Database {
     }
     if (text.includes("current_setting('server_version_num')")) return result(this.safety);
     if (text.includes('pg_try_advisory_lock')) return result([{ held: this.lock }]);
+    if (text.includes('pg_advisory_xact_lock(')) return result([]);
     if (text.includes('JOIN lcm.project_aliases')) return result(this.binding);
     if (text.includes('FROM lcm.machines WHERE identity_key=$1')) return result(this.sourceMachineRows ?? this.machines.filter(row => row.identity_key === values[0]));
     if (text.includes('FROM lcm.machines WHERE')) {
@@ -110,6 +112,13 @@ class Database {
       if (text.includes('prior_checkpoint_sha256=$3')) return result(rows.filter(row => row.prior === values[2]));
       if (text.includes('checkpoint_sha256=$3')) return result(rows.filter(row => row.checkpoint_sha256 === values[2]));
       return result(rows.sort((a, b) => b.next_ordinal - a.next_ordinal).slice(0, 1));
+    }
+    if (text.startsWith('SELECT COUNT(*) AS count FROM lcm.transfer_identities')) {
+      if (this.ledgerTallyFailure) return result([{ count: 7 }]);
+      const prefix = `${values[1]}:`;
+      let tallied = 0;
+      for (const key of this.identities.keys()) if (key.startsWith(prefix)) tallied++;
+      return result([{ count: String(tallied) }]);
     }
     if (text.includes('FROM lcm.transfer_identities')) {
       const key = this.identities.get(`${values[1]}:${values[2]}`);
@@ -871,8 +880,65 @@ it('binds completion proofs to the writer, matching run and exact terminal prefi
  await expect(api.completePortableDestinationInTransaction(executor,writer,proof)).rejects.toMatchObject({code:'destination-conflict'});
  db.run={...saved,manifest_sha256:'0'.repeat(64)};await expect(api.completePortableDestinationInTransaction(executor,writer,proof)).rejects.toMatchObject({code:'destination-conflict'});
  db.run={...saved,state:'invalid'};await expect(api.readPortableCompletedRunInTransaction(executor,writer,proof)).rejects.toMatchObject({code:'destination-conflict'});
- db.run=saved;expect(await api.readPortableCompletedRunInTransaction(executor,writer,proof)).toBe(false);
- db.receipts.pop();await expect(api.completePortableDestinationInTransaction(executor,writer,proof)).rejects.toMatchObject({code:'verification-failed'});
+db.run=saved;expect(await api.readPortableCompletedRunInTransaction(executor,writer,proof)).toBe(false);
+db.receipts.pop();await expect(api.completePortableDestinationInTransaction(executor,writer,proof)).rejects.toMatchObject({code:'verification-failed'});
+});
+it('refuses canonical rows inserted after verification with a distinct membership code',async()=>{
+ const api=await import('../../src/storage/postgresql/portable-destination.js');
+ const {writer,stream,manifest}=await admitted();await transferAll(writer,stream);
+ const verified=await api.verifyPortableDestinationComplete(writer,manifest);
+ const executor={transactionScope:'active' as const,query:db.query.bind(db) as never};
+ await db.query({text:'BEGIN'});
+ // A second writer commits a canonical row after the verification stream closed:
+ // no ledger entry names it, so the checkpoint recheck cannot see it.
+ db.records.get('conversations')!.push({ordinal:999999} as never);
+ await expect(api.completePortableDestinationInTransaction(executor,writer,verified)).rejects.toMatchObject({code:'destination-unexpected-rows'});
+ expect(db.run?.state).toBe('active');
+ expect(db.queryLog.some(sql=>sql.includes('pg_advisory_xact_lock('))).toBe(true);
+ db.records.get('conversations')!.pop();
+ await api.completePortableDestinationInTransaction(executor,writer,verified);
+ expect(db.run?.state).toBe('completed');
+ await db.query({text:'ROLLBACK'});
+ expect(db.run?.state).toBe('active');
+});
+it('refuses canonical rows deleted after verification as failed verification',async()=>{
+ const api=await import('../../src/storage/postgresql/portable-destination.js');
+ const {writer,stream,manifest}=await admitted();await transferAll(writer,stream);
+ const verified=await api.verifyPortableDestinationComplete(writer,manifest);
+ const executor={transactionScope:'active' as const,query:db.query.bind(db) as never};
+ await db.query({text:'BEGIN'});
+ const removed=db.records.get('conversations')!.pop()!;
+ await expect(api.completePortableDestinationInTransaction(executor,writer,verified)).rejects.toMatchObject({code:'verification-failed'});
+ expect(db.run?.state).toBe('active');
+ db.records.get('conversations')!.push(removed);
+ await api.completePortableDestinationInTransaction(executor,writer,verified);
+ expect(db.run?.state).toBe('completed');
+ await db.query({text:'ROLLBACK'});
+});
+it('excludes identity domains from the completion membership tally',async()=>{
+ const api=await import('../../src/storage/postgresql/portable-destination.js');
+ const {writer,stream,manifest}=await admitted();await transferAll(writer,stream);
+ const verified=await api.verifyPortableDestinationComplete(writer,manifest);
+ const executor={transactionScope:'active' as const,query:db.query.bind(db) as never};
+ await db.query({text:'BEGIN'});
+ // Identity ledger rows are admission-time lookups rather than writes, and
+ // machines are project-linked rather than project-owned: extra identity rows
+ // must not refuse a completion whose non-identity tally still matches.
+ db.records.get('machines')!.push({ordinal:999999} as never);
+ await api.completePortableDestinationInTransaction(executor,writer,verified);
+ expect(db.run?.state).toBe('completed');
+ await db.query({text:'ROLLBACK'});
+});
+it('refuses an unreadable ledger tally without trusting it',async()=>{
+ const api=await import('../../src/storage/postgresql/portable-destination.js');
+ const {writer,stream,manifest}=await admitted();await transferAll(writer,stream);
+ const verified=await api.verifyPortableDestinationComplete(writer,manifest);
+ const executor={transactionScope:'active' as const,query:db.query.bind(db) as never};
+ await db.query({text:'BEGIN'});
+ db.ledgerTallyFailure=true;
+ await expect(api.completePortableDestinationInTransaction(executor,writer,verified)).rejects.toMatchObject({code:'destination-uncertain'});
+ expect(db.run?.state).toBe('active');
+ await db.query({text:'ROLLBACK'});
 });
 it.each(['missing','tls','version','encoding','close','primary-close'] as const)('fails a read-only target probe safely on %s',async fault=>{
  boundaries.runtime.mockReturnValue({query:db.query.bind(db),transaction:async(fn:(executor:unknown)=>unknown)=>fn({query:db.query.bind(db)}),close:async()=>{if(fault.includes('close'))throw new Error('private close');}});

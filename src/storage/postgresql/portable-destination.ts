@@ -22,6 +22,7 @@ import { buildPostgreSqlClientConfig } from './client-config.js';
 import { verifyPostgreSqlTransferSchema } from './runtime-readiness.js';
 import { assertPostgreSqlRecordCapability, insertCanonicalRecord, listCanonicalHeaders, readCanonicalRow, assertPostgreSqlExistingConstraints, listPostgreSqlRecordUniqueKeys, validatePostgreSqlRecordRelations } from './portable-mapping.js';
 import { createPostgreSqlPortableSource, readPostgreSqlPortableWitness } from './portable-source.js';
+import { acquirePostgreSqlProjectPublicationLock } from './publication-guard.js';
 
 export interface PostgreSqlPortableDestinationInput {
   readonly settings: PostgreSqlConnectionSettings;
@@ -421,16 +422,61 @@ async function canonicalVerification(state:DestinationState,manifest:PortableMan
   finally{try{if(stream)await stream.close();else await source.close();}catch{if(primary===undefined)fail('close-failed');}}
 }
 
+/**
+ * Set-membership half of the completion proof for #1426. The checkpoint recheck
+ * only covers this run's own batch bookkeeping, so a canonical row that another
+ * writer committed after verification streamed the destination is invisible to
+ * it: the row has no entry in this run's identity ledger. Admission proved every
+ * non-identity domain empty and the apply path records exactly one
+ * lcm.transfer_identities row per applied record, so under the project
+ * publication fence held by our caller any live surplus over the ledger is a row
+ * this run did not write. Identity domains are excluded on purpose: their ledger
+ * rows are admission-time lookups rather than writes, and machines are
+ * project-linked rather than project-owned, so a ledger tally is meaningless for
+ * them. The live tally pages through listCanonicalHeaders, the same visibility
+ * function the verification stream reads, so the counted set is definitionally
+ * the verified set. A surplus refuses as destination-unexpected-rows, kept
+ * distinct from verification-failed (content mismatch) on purpose; a deficit
+ * refuses as verification-failed, matching the missing-row treatment the fenced
+ * per-row re-derivation in PR #1422 gives the same shape.
+ */
+async function assertNoForeignCanonicalRows(executor:PostgreSqlQueryExecutor,state:DestinationState,signal?:AbortSignal):Promise<void>{
+  for(const domain of PORTABLE_RECORD_DOMAIN_ORDER.filter(domain=>!(IDENTITY_DOMAINS as readonly string[]).includes(domain))){
+    const ledger=await executor.query<{count:string}>({text:'SELECT COUNT(*) AS count FROM lcm.transfer_identities WHERE run_id=$1 AND domain=$2',values:[state.input.runId,domain]},options(state,signal));
+    const tally=ledger.rows[0]?.count;
+    const expected=typeof tally==='string'?Number(tally):NaN;
+    if(!Number.isSafeInteger(expected))fail('destination-uncertain');
+    let live=0;let after:string|null=null;
+    for(;;){
+      const page=await listCanonicalHeaders(executor,state.input.expectedIdentity.id,domain,after,PORTABLE_LIMITS.maxBatchRecords,signal);
+      if(page.length===0)break;
+      live+=page.length;after=page[page.length-1]!.locator;
+    }
+    if(live>expected)fail('destination-unexpected-rows');
+    if(live<expected)fail('verification-failed');
+  }
+}
+
 /** Completes only the exact terminal prefix authenticated by canonical verification. */
 async function verifiedCompletionState(executor:PostgreSqlQueryExecutor,authority:PortableRecordWriter,verification:PortableDestinationVerification,signal?:AbortSignal):Promise<{state:DestinationState;row:RunRow}>{
   const state=checkedState(authority);
   const proof=completions.get(verification);
   if(!proof||proof.state!==state)fail('verification-failed');
   await assertTransaction(state,executor,signal);
+  // Fence the whole completion check against concurrent canonical writers before
+  // reading anything else. Every project-scoped runtime transaction holds this
+  // same advisory lock shared for its entire duration, so taking it exclusively
+  // here waits out in-flight project writers and blocks new ones until this
+  // transaction commits. Without it the checks below read under READ COMMITTED
+  // with no row lock, and a writer can commit in the window before the run
+  // UPDATE. This is the same fence PR #1422 takes; both PRs must sequence so
+  // only one acquisition survives the merge.
+  await acquirePostgreSqlProjectPublicationLock(executor,state.input.expectedIdentity.id,options(state,signal));
   const row=await runRow(state,executor,true,signal);
   if(!row||!runMatches(state,row,proof.manifest))fail('destination-conflict');
   const saved=await progress(state,proof.manifest.manifestSha256,signal,executor);
   if(canonicalJson(saved.checkpoints.map(checkpoint=>checkpoint.checkpointSha256))!==canonicalJson(proof.checkpoints))fail('verification-failed');
+  await assertNoForeignCanonicalRows(executor,state,signal);
   return {state,row};
 }
 export async function completePortableDestinationInTransaction(executor:PostgreSqlQueryExecutor,authority:PortableRecordWriter,verification:PortableDestinationVerification,signal?:AbortSignal):Promise<void>{

@@ -295,6 +295,7 @@ filesystem path or record payload.
 | `destination-conflict` | Correct target ownership, identity or existing-state conflict; never clear unrelated data automatically. |
 | `destination-uncertain` | Retain evidence and reconcile the exact run receipt before resuming. |
 | `checkpoint-mismatch`, `verification-failed` | Stop; investigate the manifest, progress or actual destination data. |
+| `destination-unexpected-rows` | Stop; the destination holds canonical rows the run did not write. Another writer committed between verification and completion; investigate the extra rows before retrying. |
 | `zero-progress` | Correct the adapter or batch request; no checkpoint was accepted. |
 | `aborted` | Retain the target; retry only with the same valid source generation and target authority. |
 | `close-failed` | Cleanup failed after the operation; do not report overall success. |
