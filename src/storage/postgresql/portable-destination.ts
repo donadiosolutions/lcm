@@ -22,6 +22,7 @@ import { buildPostgreSqlClientConfig } from './client-config.js';
 import { verifyPostgreSqlTransferSchema } from './runtime-readiness.js';
 import { assertPostgreSqlRecordCapability, insertCanonicalRecord, listCanonicalHeaders, readCanonicalRow, readCanonicalContentRows, canonicalRowContentSha256, assertPostgreSqlExistingConstraints, listPostgreSqlRecordUniqueKeys, validatePostgreSqlRecordRelations } from './portable-mapping.js';
 import { createPostgreSqlPortableSource, readPostgreSqlPortableWitness } from './portable-source.js';
+import { acquirePostgreSqlProjectPublicationLock } from './publication-guard.js';
 
 export interface PostgreSqlPortableDestinationInput {
   readonly settings: PostgreSqlConnectionSettings;
@@ -453,6 +454,25 @@ async function verifiedCompletionState(executor:PostgreSqlQueryExecutor,authorit
   const proof=completions.get(verification);
   if(!proof||proof.state!==state)fail('verification-failed');
   await assertTransaction(state,executor,signal);
+  // Fence the whole re-verification against concurrent canonical writers
+  // before reading anything. Every project-scoped runtime transaction takes
+  // this same advisory lock in shared mode for its entire duration
+  // (PostgreSqlRuntime.runTransaction), so taking it exclusively here waits
+  // out every in-flight project writer and blocks new ones until this
+  // transaction commits. Without it the rechecked rows are read under READ
+  // COMMITTED with no row lock, and a writer can modify one and commit in
+  // the window before the completion UPDATE, which is exactly the drift the
+  // recheck exists to catch. Row-locking the rechecked rows instead is not
+  // available under the reviewed grant profile: SELECT ... FOR SHARE needs
+  // UPDATE on the table, and the profile grants UPDATE only on the ten
+  // canonical tables that are actually mutable. Probing all 22 domains
+  // against the harness, a locking read is accepted for exactly those ten
+  // and rejected for the twelve append-only ones (messages, message parts,
+  // large files, summaries and their link tables, memory tags, recall
+  // surfacings, native transcripts and their links, projects), so fencing
+  // by row lock would mean widening the exact profile
+  // verifyPostgreSqlTransferSchema admits.
+  await acquirePostgreSqlProjectPublicationLock(executor,state.input.expectedIdentity.id,options(state,signal));
   const row=await runRow(state,executor,true,signal);
   if(!row||!runMatches(state,row,proof.manifest))fail('destination-conflict');
   const saved=await progress(state,proof.manifest.manifestSha256,signal,executor);

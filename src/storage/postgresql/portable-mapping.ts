@@ -129,6 +129,16 @@ export function canonicalRowContentSha256(row:Row):string {
  * shape this avoids). A locator absent from the source table is simply
  * absent from the returned map; callers must treat that as a content
  * mismatch, not skip it.
+ *
+ * This read takes no row locks and does not fence anything by itself. A
+ * caller that re-verifies content and then commits must already hold a
+ * writer fence for the project, because its transaction is READ COMMITTED
+ * and another transaction may otherwise modify a returned row and commit
+ * first. Measured against the harness, raising the isolation level does not
+ * help: READ COMMITTED, REPEATABLE READ and SERIALIZABLE all permit that
+ * interleaving, since a canonical writer never reads what the caller writes
+ * and so completes no dependency cycle for SSI to detect. See
+ * verifiedCompletionState for the fence the transfer completion uses.
  */
 export async function readCanonicalContentRows(executor:PostgreSqlQueryExecutor,projectId:string,domain:PortableDomain,locators:readonly string[],signal?:AbortSignal):Promise<ReadonlyMap<string,Row>> {
   if (locators.length===0) return new Map();

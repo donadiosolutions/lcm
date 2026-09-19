@@ -1004,6 +1004,23 @@ this recheck, completion only re-validated its own `transfer_batches`
 checkpoint chain, which a canonical mutation from any other path (a second
 run, promotion/dedup, compaction, a direct edit) would leave untouched.
 
+The recheck runs in the same READ COMMITTED transaction that writes
+`transfer_runs.state`, and reading the rows does not by itself fence that
+write: an unlocked `SELECT` lets a canonical writer modify or delete a row
+the recheck just returned and commit before the completion `UPDATE`. Raising
+the isolation level does not close this. Measured against the integration
+harness, READ COMMITTED, REPEATABLE READ and SERIALIZABLE all admit the
+interleaving, because a canonical writer never reads what the completion
+writes and so forms no dependency cycle for SSI to detect. Completion
+therefore takes the project publication advisory lock exclusively before it
+reads anything. Every project-scoped runtime transaction already takes that
+same lock in shared mode for its whole duration, so completion waits out the
+writers already in flight and blocks new ones until it commits; the blocking
+window is the re-verification itself. The fence covers modification and
+deletion of the rows this run wrote. It does not cover a writer inserting new
+canonical rows between the end of verification streaming and the start of the
+completion transaction, which remains outside the recheck's scope.
+
 The latest snapshot covers 27 tables, 101 indexes, 205 constraints, 255
 column ACLs, and 886 definition objects. Previous migration snapshots remain
 pinned for safe incremental upgrades.

@@ -94,6 +94,8 @@ class Database {
     }
     if (text.includes("current_setting('server_version_num')")) return result(this.safety);
     if (text.includes('pg_try_advisory_lock')) return result([{ held: this.lock }]);
+    // Completion fences the project against canonical writers before reading.
+    if (text.includes('pg_advisory_xact_lock')) return result([{}]);
     if (text.includes('JOIN lcm.project_aliases')) return result(this.binding);
     if (text.includes('FROM lcm.machines WHERE identity_key=$1')) return result(this.sourceMachineRows ?? this.machines.filter(row => row.identity_key === values[0]));
     if (text.includes('FROM lcm.machines WHERE')) {
