@@ -215,7 +215,9 @@ describe("CI workflow", () => {
       runs: { steps: WorkflowStep[] };
     };
     const steps = setup.runs.steps;
-    expect(setup.inputs["node-version"].default).toBe("25.9.0");
+    // The default is the declared engines floor; the OS integration jobs
+    // override it with the latest runtime (see test/node-engine-floor.test.ts).
+    expect(setup.inputs["node-version"].default).toBe("25.4.0");
     expect(steps.map((step) => step.name)).toEqual([
       "Set up Node",
       "Bootstrap verified pnpm",
@@ -250,9 +252,23 @@ describe("CI workflow", () => {
     expect(install?.run).toContain("validate-node-modules node_modules");
     expect(install?.run).toContain("write-node-modules-stamp node_modules");
     expect(install?.run).not.toMatch(/(?:npm ls|pnpm list)/u);
+    // The exact node_modules inventory needs Linux /proc; other platforms
+    // opt out and install from the pnpm store cache instead.
+    expect(setup.inputs["cache-node-modules"].default).toBe("true");
+    expect(install?.run).toMatch(/if \[\[ "\$CACHE_NODE_MODULES" != "true" \]\]; then\n\s*pnpm install --frozen-lockfile/u);
+    for (const name of ["Derive exact cache keys", "Restore installed Node dependencies"]) {
+      expect(steps.find((step) => step.name === name)?.if).toBe("${{ inputs.cache-node-modules == 'true' }}");
+    }
+    expect(steps.find((step) => step.name === "Save installed Node dependencies")?.if).toBe(
+      "${{ inputs.cache-node-modules == 'true' && steps.restore-node-modules.outputs.cache-hit != 'true' }}",
+    );
     for (const jobName of ["linux-systemd", "macos-launchd"]) {
       const job = workflow.jobs[jobName];
-      expect(job.steps.some((step) => step.uses === "./.github/actions/setup-node")).toBe(true);
+      const setupStep = job.steps.find((step) => step.uses === "./.github/actions/setup-node");
+      expect(setupStep).toBeDefined();
+      expect(setupStep?.with).toEqual(jobName === "macos-launchd"
+        ? { "node-version": "25.9.0", "cache-node-modules": "false" }
+        : { "node-version": "25.9.0" });
       expect(job.steps.some((step) => step.uses?.startsWith("actions/setup-node@"))).toBe(false);
     }
     expect(source).not.toMatch(/\bnpm (?:ci|run)|\bnpx\b/u);
@@ -543,6 +559,7 @@ describe("CI workflow", () => {
     expect(setup).toEqual({
       name: "Set up Node.js and dependencies",
       uses: "./.github/actions/setup-node",
+      with: { "node-version": "25.9.0" },
     });
     expect(build?.run).toBe("pnpm run build");
     expect(integration?.env).toEqual({
@@ -638,6 +655,7 @@ describe("CI workflow", () => {
     expect(setup).toEqual({
       name: "Set up Node.js and dependencies",
       uses: "./.github/actions/setup-node",
+      with: { "node-version": "25.9.0", "cache-node-modules": "false" },
     });
     expect(descriptorProbe?.run).toBe(
       'pnpm exec vitest run test/runtime-paths.test.ts --testNamePattern "uses actual platform semantics for nested legacy migration"',

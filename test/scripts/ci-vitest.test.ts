@@ -75,7 +75,7 @@ describe("CI shard execution", () => {
     const withCoverage = shardArguments(shardOptions(shardEnvironment()));
     expect(withCoverage).toEqual([
       "node_modules/vitest/vitest.mjs", "run", "--dir", "test", "--project", "unit-parallel",
-      "--reporter=blob", `--outputFile.blob=${root}/${BLOB_DIRECTORY}/unit-1.json`,
+      "--reporter=default", "--reporter=blob", `--outputFile.blob=${root}/${BLOB_DIRECTORY}/unit-1.json`,
       "--reporter=json", `--outputFile.json=${root}/shard-unit-1.json`,
       ...SHARD_COVERAGE_ARGUMENTS,
       "test/a.test.ts", "test/b.test.ts",

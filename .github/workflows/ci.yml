@@ -211,6 +211,9 @@ jobs:
 
       - name: Set up Node.js and dependencies
         uses: ./.github/actions/setup-node
+        with:
+          # OS service integration runs on the latest runtime, not the floor.
+          node-version: "25.9.0"
 
       - name: Build package
         run: pnpm run build
@@ -241,6 +244,11 @@ jobs:
 
       - name: Set up Node.js and dependencies
         uses: ./.github/actions/setup-node
+        with:
+          # OS service integration runs on the latest runtime, not the floor.
+          node-version: "25.9.0"
+          # The exact node_modules inventory needs Linux /proc; macOS installs from the store cache.
+          cache-node-modules: "false"
 
       - name: Probe descriptor-relative runtime migration
         run: pnpm exec vitest run test/runtime-paths.test.ts --testNamePattern "uses actual platform semantics for nested legacy migration"

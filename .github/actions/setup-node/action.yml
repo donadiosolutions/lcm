@@ -3,9 +3,13 @@ description: Provision the pinned Node.js, verified pnpm, the exact pnpm store c
 
 inputs:
   node-version:
-    description: Node.js version to install. Must match NODE_VERSION in scripts/ci-environment.mjs.
+    description: Node.js version to install. The default is the declared engines floor and must match NODE_VERSION in scripts/ci-environment.mjs.
     required: false
-    default: "25.9.0"
+    default: "25.4.0"
+  cache-node-modules:
+    description: Restore and validate the exact node_modules cache. Requires Linux; other platforms install from the pnpm store.
+    required: false
+    default: "true"
 
 outputs:
   node-modules-cache-hit:
@@ -44,11 +48,13 @@ runs:
         key: pnpm-store-v1-${{ runner.os }}-${{ runner.arch }}-node-${{ inputs.node-version }}-${{ hashFiles('package.json', 'pnpm-lock.yaml', '.npmrc', 'pnpm-workspace.yaml', 'scripts/bootstrap-pnpm.mjs') }}
 
     - name: Derive exact cache keys
+      if: ${{ inputs.cache-node-modules == 'true' }}
       id: cache-metadata
       shell: bash
       run: node scripts/ci-environment.mjs cache-metadata >> "$GITHUB_OUTPUT"
 
     - name: Restore installed Node dependencies
+      if: ${{ inputs.cache-node-modules == 'true' }}
       id: restore-node-modules
       uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
       with:
@@ -58,10 +64,13 @@ runs:
     - name: Install or validate Node dependencies
       shell: bash
       env:
+        CACHE_NODE_MODULES: ${{ inputs.cache-node-modules }}
         NODE_MODULES_CACHE_HIT: ${{ steps.restore-node-modules.outputs.cache-hit }}
       run: |
         set -Eeuo pipefail
-        if [[ "$NODE_MODULES_CACHE_HIT" == "true" ]]; then
+        if [[ "$CACHE_NODE_MODULES" != "true" ]]; then
+          pnpm install --frozen-lockfile
+        elif [[ "$NODE_MODULES_CACHE_HIT" == "true" ]]; then
           node scripts/ci-environment.mjs validate-node-modules node_modules
         else
           pnpm install --frozen-lockfile
@@ -69,7 +78,7 @@ runs:
         fi
 
     - name: Save installed Node dependencies
-      if: ${{ steps.restore-node-modules.outputs.cache-hit != 'true' }}
+      if: ${{ inputs.cache-node-modules == 'true' && steps.restore-node-modules.outputs.cache-hit != 'true' }}
       uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
       with:
         path: node_modules

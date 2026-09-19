@@ -94,6 +94,7 @@ export function shardArguments(options) {
     "--dir",
     "test",
     ...options.projects.flatMap((project) => ["--project", project]),
+    "--reporter=default",
     "--reporter=blob",
     `--outputFile.blob=${join(options.root, BLOB_DIRECTORY, `${options.name}.json`)}`,
     "--reporter=json",
