@@ -178,3 +178,47 @@ export function attributeNullableValue<T>(
   }
   return { kind: "present", value };
 }
+
+/**
+ * Async twin of attributeNullableRead for a read that itself returns a
+ * Promise (e.g. a network or database round trip such as a PostgreSQL
+ * query). The classifier contract, the three outcomes, and the
+ * never-guess rule for an unrecognized error are all identical to the
+ * sync form above; only the mechanics of observing the outcome differ.
+ *
+ * This function is the single attribution boundary for an async read: it
+ * awaits read() itself and classifies whatever it throws, in the same
+ * try/catch. Resolving a promise first and classifying its rejection
+ * afterward, outside this function, is not equivalent -- that pattern
+ * either loses the rejection's original shape before a classifier ever
+ * sees it, or forces the caller to hand-roll a second, separately
+ * maintained catch that duplicates classifyError's job and will drift
+ * from it over time. Every async nullable read in this codebase should
+ * go through this one boundary rather than reimplementing it.
+ */
+export function attributeNullableReadAsync<T>(
+  read: () => Promise<T>,
+  options: NullableReadOptions<T> & Readonly<{ whenNull: Readonly<{ cause: string; detail: string }> }>,
+): Promise<NullableReadOutcome<NonNullable<T>>>;
+export function attributeNullableReadAsync<T>(
+  read: () => Promise<T>,
+  options?: NullableReadOptions<T>,
+): Promise<NullableReadOutcome<T>>;
+export async function attributeNullableReadAsync<T>(
+  read: () => Promise<T>,
+  options: NullableReadOptions<T> = {},
+): Promise<NullableReadOutcome<T>> {
+  const classify = options.classifyError ?? classifyNodeFsAbsence();
+  let value: T;
+  try {
+    value = await read();
+  } catch (error) {
+    const classified = classify(error);
+    if (classified === undefined) throw error;
+    return { kind: classified.kind, cause: classified.cause, detail: classified.detail };
+  }
+  if (options.whenNull !== undefined && value === null) {
+    return { kind: "absent", cause: options.whenNull.cause, detail: options.whenNull.detail };
+  }
+  return { kind: "present", value };
+}
