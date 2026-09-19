@@ -67,6 +67,11 @@ function trustedInstallationDirectory(
   const canonicalDirectory = requireCanonicalHome && installationRoot
     ? canonicalPath(directory)
     : directory;
+  if (
+    requireCanonicalHome
+    && synthesizedNpmBin
+    && canonicalDirectory?.includes(delimiter)
+  ) return undefined;
   const canonicalInstallationRoot = requireCanonicalHome && canonicalDirectory && installationRoot
     ? homeScopedInstallationRoot(canonicalDirectory, synthesizedNpmBin)
     : installationRoot;

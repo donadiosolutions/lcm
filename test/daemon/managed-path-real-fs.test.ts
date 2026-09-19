@@ -80,4 +80,33 @@ describe("stable managed daemon PATH canonicalization", () => {
         .not.toContain(join(checkout, ".local/bin"));
     },
   );
+
+  it("rejects a canonical stable bin whose realpath introduces the PATH delimiter", () => {
+    const root = mkdtempSync(join(tmpdir(), "lcm-managed-path-real-fs-"));
+    fixtureRoots.push(root);
+    const canonicalHome = join(root, "home:canonical");
+    const homeAlias = join(root, "home-alias");
+    mkdirSync(join(canonicalHome, ".local", "bin"), { recursive: true });
+    mkdirSync(
+      join(canonicalHome, ".local", "lib", "node_modules", "@donadiosolutions", "lcm", "dist"),
+      { recursive: true },
+    );
+    symlinkSync(canonicalHome, homeAlias, "dir");
+
+    const managedPath = managedDaemonPathForStableLaunch(
+      "/usr/bin/node",
+      [
+        join(
+          homeAlias,
+          ".local/lib/node_modules/@donadiosolutions/lcm/dist/lcm.mjs",
+        ),
+        "daemon",
+        "start",
+      ],
+      join(root, "state"),
+      homeAlias,
+    );
+
+    expect(managedPath).toBe(SYSTEMD_DAEMON_PATH);
+  });
 });

@@ -30,10 +30,7 @@ import {
   type DaemonLifecycleHermeticTestSeams,
   type DaemonLifecycleTestScope,
 } from "../../src/daemon/lifecycle-scope.js";
-import {
-  managedDaemonPathForStableLaunch,
-  SYSTEMD_DAEMON_PATH,
-} from "../../src/daemon/managed-path.js";
+import { SYSTEMD_DAEMON_PATH } from "../../src/daemon/managed-path.js";
 import {
   createSupervisor,
   managedLaunchEnvironmentDigest,
