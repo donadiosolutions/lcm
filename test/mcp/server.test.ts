@@ -438,6 +438,79 @@ describe("handleDaemonRequest", () => {
     });
 
     it.each([
+      ["separator-bearing value", "Password={alpha;bravo,charlie}"],
+      ["quote-bearing value", `Password={alpha;'bravo',\"charlie\"}`],
+      ["escaped closing brace", "Password={alpha}}bravo;charlie}"],
+      ["whitespace-bearing value", "Password={alpha bravo;charlie}"],
+      ["complete JSON-shaped value", `Password={\"token\":\"alpha;bravo,charlie\"}`],
+    ])("redacts a complete bounded brace-delimited %s", (_label, assignment) => {
+      const rendered = safeMcpError(new Error(`auth failed: ${assignment}; retry later`));
+
+      expect(rendered).toBe("lcm error: auth failed: Password=<redacted>; retry later");
+      expect(rendered).not.toMatch(/alpha|bravo|charlie|token/iu);
+    });
+
+    it.each([
+      ["PassWord", "PassWord"],
+      ["PASSWD", "PASSWD"],
+      ["pwd", "pwd"],
+      ["Token", "Token"],
+      ["SECRET", "SECRET"],
+      ["api-key", "api-key"],
+      ["API_KEY", "API_KEY"],
+      ["api key", "api key"],
+      ["Authorization", "Authorization"],
+      ["UID", "UID"],
+      ["User", "User"],
+      ["Username", "Username"],
+      ["User Id", "User Id"],
+      ["api\tkey", "api key"],
+    ])("redacts complete and malformed brace assignments for %s", (label, renderedLabel) => {
+      const complete = safeMcpError(new Error(`auth failed: ${label}={alpha;bravo,charlie}; retry later`));
+      const malformed = safeMcpError(new Error(`auth failed: ${label}={alpha;bravo,charlie; trailing detail`));
+
+      expect(complete).toBe(`lcm error: auth failed: ${renderedLabel}=<redacted>; retry later`);
+      expect(complete).not.toMatch(/alpha|bravo|charlie/iu);
+      expect(malformed).toBe(`lcm error: auth failed: ${renderedLabel}=<redacted>`);
+      expect(malformed).not.toMatch(/alpha|bravo|charlie|trailing detail/iu);
+    });
+
+    it("preserves context after brace payloads at the UTF-16 scan limit", () => {
+      const exactPayload = "x".repeat(256);
+      const escapedPairPayload = `${"x".repeat(254)}}}`;
+      const astralPayload = "🚀".repeat(128);
+
+      for (const payload of [exactPayload, escapedPairPayload, astralPayload]) {
+        const rendered = safeMcpError(new Error(`auth failed: Password={${payload}}; retry later`));
+        expect(rendered).toBe("lcm error: auth failed: Password=<redacted>; retry later");
+        expect(rendered).not.toContain(payload);
+      }
+    });
+
+    it.each([
+      ["first over-limit value", `${"x".repeat(257)}}; trailing detail`],
+      ["escaped pair straddling the limit", `${"x".repeat(256)}}}; trailing detail`],
+      ["missing closing brace", "alpha;bravo,charlie; trailing detail"],
+      ["trailing escaped brace pair", "alpha;bravo}}; trailing detail"],
+      ["unterminated escaped pair", "alpha}}bravo"],
+      ["unterminated escaped pair with separators", "alpha}}bravo;charlie"],
+      ["unbalanced JSON-shaped value", `\"token\":\"alpha;bravo,charlie\"; trailing detail`],
+      ["astral value over the UTF-16 limit", `${"🚀".repeat(128)}x}; trailing detail`],
+    ])("fails closed for a brace-delimited %s", (_label, payloadAndTail) => {
+      const rendered = safeMcpError(new Error(`auth failed: Password={${payloadAndTail}`));
+
+      expect(rendered).toBe("lcm error: auth failed: Password=<redacted>");
+      expect(rendered).not.toMatch(/alpha|bravo|charlie|token|trailing detail|🚀/iu);
+    });
+
+    it("uses ODBC doubled braces rather than quoted-value backslash escaping", () => {
+      const rendered = safeMcpError(new Error("auth failed: Password={foo\\}}bar}; trailing detail"));
+
+      expect(rendered).toBe("lcm error: auth failed: Password=<redacted>; trailing detail");
+      expect(rendered).not.toMatch(/foo|bar/iu);
+    });
+
+    it.each([
       ["postgres URI with inline credentials", `connect postgres://svc:${SYNTHETIC_CREDENTIAL}@db.internal.example:5432/lcm?sslmode=require failed`],
       ["http URI with inline credentials", `fetch https://svc:${SYNTHETIC_CREDENTIAL}@db.internal.example/v1?token=${SYNTHETIC_TOKEN} failed`],
       ["connection-string assignment", `Server=db.internal.example;Database=lcm;User Id=svc;Password=${SYNTHETIC_CREDENTIAL};`],

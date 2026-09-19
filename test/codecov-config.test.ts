@@ -718,6 +718,7 @@ describe("Codecov configuration", () => {
       // fencing remain installer-owned.
       ["installer/install.ts", "unit-installation"],
       // #1201 observation parser/client, allowlist and server retain daemon-core ownership.
+      // Prompt-search publication dispatch remains daemon-core-owned.
       ["src/daemon/client.ts", "unit-daemon-core"],
       ["src/daemon/http-url.ts", "unit-daemon-core"],
       ["src/daemon/config.ts", "unit-daemon-core"],
@@ -732,7 +733,9 @@ describe("Codecov configuration", () => {
       ["src/daemon/routes/session-complete.ts", "unit-daemon-routes"],
       ["src/daemon/routes/review-stale.ts", "unit-daemon-routes"],
       // #1148 keeps promoted created_at UTC parsing in the existing daemon
-      // routes owner; prompt-search and restore retain their route ownership.
+      // routes owner; prompt-search publication errors and restore retain their
+      // route ownership.
+      ["src/daemon/routes/prompt-search.ts", "unit-daemon-routes"],
       // #1203 adds native recall evidence without changing component topology.
       ["src/db/promoted-recall-evidence.ts", "unit-local-persistence"],
       ["src/storage/postgresql/tsquery-evidence.ts", "integration-postgresql-search"],
