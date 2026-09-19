@@ -257,12 +257,20 @@ A SQLite-backed daemon fails the first check and never opens a PostgreSQL
 connection, so its behaviour is unchanged. Replication is still not started by
 a hook, and it remains separate from the selected `ProjectStorage` route.
 
+Every project is admitted through the same publication check that promotion
+uses, immediately before it replicates. A daemon keeps its startup backend for
+its whole lifetime, so when the configured backend changes underneath it the
+admission refuses, the daemon halts exactly as it does for promotion, and no
+event is uploaded to a backend the daemon has already lost.
+
 `lcm status` reports what replication has done under `passiveEvents`: whether
 it is `enabled` at all, the `lastPassAt` timestamp, how many passes and
 projects were attempted, and how many events were uploaded, applied,
 acknowledged, pruned, retried and quarantined. A daemon that has never
 replicated reports `enabled: false` with zero counters, which distinguishes
-"nothing to do" from "never ran". Counts only; no payloads or project paths.
+"nothing to do" from "never ran". A SQLite daemon reports `enabled: false`
+permanently and records no passes, because replication is not something it can
+ever do. Counts only; no payloads or project paths.
 
 The staged operator commands are:
 

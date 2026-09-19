@@ -140,7 +140,13 @@ export class PassiveEventProcessor {
       promoteOneBatch(config, cwd, sidecarPath, deps.storageFactory, publicationLockToken, context);
     this.withPublicationAdmission = deps.withPublicationAdmission;
     this.scanSidecars = deps.collectEventSidecars ?? collectEventSidecars;
-    this.replicatePassiveEvents = deps.replicatePassiveEvents;
+    // A daemon whose selected backend cannot replicate must not report
+    // replication as enabled, and must not record five-minute passes it never
+    // made (#1383). The startup backend is frozen for this process, so this
+    // decision is settled once here rather than re-asked every sweep.
+    this.replicatePassiveEvents = config.storage.backend === "postgresql"
+      ? deps.replicatePassiveEvents
+      : undefined;
     this.setTimer = deps.setTimeout ?? setTimeout;
     this.clearTimer = deps.clearTimeout ?? clearTimeout;
     this.setRepeating = deps.setInterval ?? setInterval;
@@ -269,6 +275,12 @@ export class PassiveEventProcessor {
    * promoted locally yet still be undelivered, and only this pass can advance
    * a row to the acknowledged-and-remote-pruned state that local retention
    * requires. Projects without a PostgreSQL binding skip quietly.
+   *
+   * Each project is admitted before it replicates. Replication resolves its
+   * backend from this daemon's frozen startup configuration, and the promotion
+   * loop above skips any sidecar with no unprocessed events, so without this
+   * admission a settled daemon would keep uploading to a backend that
+   * publication has already moved away from (#1384).
    */
   private async replicateSidecars(
     sidecars: readonly Awaited<ReturnType<typeof collectEventSidecars>>[number][],
@@ -280,7 +292,18 @@ export class PassiveEventProcessor {
     for (const sidecar of sidecars) {
       if (this.stopped || this.haltedReason !== null) return;
       if (sidecar.scanError || sidecar.scanSkipped || !sidecar.cwd) continue;
-      const result = await replicate(sidecar.cwd, this.backgroundSignal);
+      let result: PassiveEventReplicationResult | null;
+      try {
+        await this.withPublicationAdmission(() => undefined);
+        result = await replicate(sidecar.cwd, this.backgroundSignal);
+      } catch (error) {
+        if (isFrozenBackendMismatch(error)) {
+          await this.haltForBackendMismatch(error);
+          return;
+        }
+        await this.logError("passive-event-processor", error, { cwd: sidecar.cwd });
+        continue;
+      }
       if (result === null) continue;
       this.replication.projects += 1;
       this.replication.uploaded += result.uploaded;
