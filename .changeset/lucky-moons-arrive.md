@@ -11,9 +11,13 @@ local retention depends on, so a project's event table only grew.
 
 A pass runs for a project only when the backend is PostgreSQL, a machine
 identity is registered, the project is linked to a remote project id, and
-PostgreSQL reports healthy. Each unmet condition is a quiet skip, and a
-SQLite-backed daemon never opens a PostgreSQL connection, so its behaviour is
-unchanged.
+PostgreSQL reports healthy. The first three are quiet skips; an unhealthy
+backend and a machine identity that exists but cannot be read are reported
+instead. A SQLite-backed daemon never opens a PostgreSQL connection, so
+its behaviour is unchanged.
+
+Each sweep phase runs under its own short publication admission, so hook
+appends proceed between phases instead of waiting behind a whole sweep.
 
 `lcm status` now reports what replication has done under `passiveEvents`:
 whether it is enabled, when the last pass ran, and how many events were

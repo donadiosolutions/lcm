@@ -264,11 +264,16 @@ imported, so it never opens a PostgreSQL connection and its behaviour is
 unchanged. Replication is still not started by a hook, and it remains separate
 from the selected `ProjectStorage` route.
 
-Every project is admitted through the same publication check that promotion
-uses, immediately before it replicates. A daemon keeps its startup backend for
-its whole lifetime, so when the configured backend changes underneath it the
-admission refuses, the daemon halts exactly as it does for promotion, and no
-event is uploaded to a backend the daemon has already lost.
+Every project replicates in admitted phases rather than inside one admission
+held across the whole pass. The upload runs under one admission, the claim
+fetch under the next, each renew-and-apply under its own, and reconcile and
+prune each under their own, using the same publication check that promotion
+uses. The consumer lock is released between phases so hook appends can
+proceed instead of waiting behind a whole sweep. A daemon keeps its startup
+backend for its whole lifetime, so when the configured backend changes
+underneath it the next phase admission refuses, the daemon halts exactly as
+it does for promotion, and no further event is uploaded to a backend the
+daemon has already lost.
 
 Each pass releases its project outbox when it finishes. The local outbox
 factory registers every repository it opens and drops one only when that
@@ -286,9 +291,11 @@ is unavailable. A SQLite daemon reports `enabled: false` permanently, because
 replication is not something it can ever do. `passes` and `lastPassAt` are
 what separate a daemon that has never replicated from one that has: they stay
 at `0` and `null` until the first sweep and advance on every sweep afterwards,
-whether or not a project was admitted. `projects` counts the projects that got
-past all four checks, so an enabled daemon with passes recorded and no projects
-is skipping rather than idle. Counts only; no payloads or project paths.
+whether or not a project was admitted. `projects` counts the passes that
+returned a replication result: gate skips return nothing, and a project
+whose batch throws mid-way returns nothing either, so an enabled daemon
+with passes recorded and no projects is skipping or failing rather than
+idle. Counts only; no payloads or project paths.
 
 The staged operator commands are:
 
@@ -344,8 +351,11 @@ When a pattern crosses the reinforcement threshold, `reinforcementBoost` is adde
 - **Sidecar DB**: `~/.lcm/events/<sha256-of-project-path>.db`
   - Per-project SQLite database in WAL mode
   - Local promotion state and remote delivery state are independent
-  - Processed events are pruned after 7 days only when remote delivery is
-    acknowledged and any remote applied row is proven pruned
+  - Processed events are pruned after 7 days. On a PostgreSQL install only
+    when remote delivery is acknowledged and any remote applied row is
+    proven pruned; on a SQLite install on age alone for rows that never
+    entered the remote pipeline, with full drained proof still required
+    for any row carrying remote state
   - Unprocessed and replayable events are never discarded by age or row-count
     retention guards; a maintenance diagnostic records guard breaches
   - Schema versioned for future migrations (currently v5)
@@ -371,7 +381,12 @@ inspects, and closes the local sidecar. A concurrent publication causes this
 best-effort maintenance and its promotion trigger to be skipped; the later
 restore proceeds only if its own short publication admission succeeds.
 Publication-journal errors remain fail-closed. Daemon startup and network
-requests do not retain the maintenance lock.
+requests do not retain the maintenance lock. Upgrading a SQLite install
+reclaims the backlog on the first SessionStart: processed events older than
+seven days that were never claimed for remote delivery are deleted,
+including everything accumulated since the replication gate made the prune
+a no-op (2026-07-30). That prune runs under this same fence, so a large
+backlog also lengthens this hold on the first start after upgrading.
 
 The passive sidecar sweep applies the same boundary to orphan cleanup. For each
 sidecar that may be deleted, LCM retains publication admission while it
