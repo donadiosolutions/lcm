@@ -140,3 +140,36 @@ describe("round 1 F3: publication-failed is reserved for a confirmed abort", () 
     expect(records(f).selection).not.toBeNull();
   });
 });
+
+describe("round 1 F4: successor tokens are attributed per member", () => {
+  it("two rows taken over after the freeze report their distinct tokens on their own members; a settled retry reports none", async () => {
+    const f = await fixture();
+    await crashAt(f, "after-selection-frozen");
+    for (const member of f.members) f.guard.expire(member.remoteProjectId);
+    const outcome = await f.run();
+    expectActivated(f, outcome, "selection-frozen");
+    if (outcome.status !== "activated") return;
+    const tokens = outcome.members.map((member) => member.successorFencingToken);
+    expect(tokens.every((token) => typeof token === "string")).toBe(true);
+    expect(new Set(tokens).size).toBe(f.members.length);
+    for (const [index, member] of f.members.entries()) {
+      expect(outcome.members[index]).toMatchObject({ generationId: member.generationId, successorFencingToken: f.guard.rows.get(member.remoteProjectId)!.fencingToken.toString(10) });
+    }
+    const settled = await f.run();
+    expect(settled).toMatchObject({ status: "activated", resumedFrom: "settled-active" });
+    if (settled.status === "activated") expect(settled.members.every((member) => member.successorFencingToken === null)).toBe(true);
+    expectAllNew(f);
+  });
+
+  it("a takeover during the lease continuation after the selection is attributed to that member only", async () => {
+    const f = await fixture();
+    const [a, b] = f.members;
+    await crashAt(f, "after-selection-completed");
+    f.guard.expireNextFor = a!.remoteProjectId;
+    const outcome = await f.run();
+    expectActivated(f, outcome, "selection-completed");
+    if (outcome.status !== "activated") return;
+    expect(outcome.members[0]).toMatchObject({ generationId: a!.generationId, successorFencingToken: f.guard.rows.get(a!.remoteProjectId)!.fencingToken.toString(10) });
+    expect(outcome.members[1]).toMatchObject({ generationId: b!.generationId, successorFencingToken: null });
+  });
+});

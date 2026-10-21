@@ -36,7 +36,7 @@ describe("activateCutoverSet: one publication for every member", () => {
     expect(compose.mock.calls[0]![0].bindings.map((b) => b.localProjectId)).toEqual(f.members.map((m) => m.localProjectId));
     expect(f.deps.prepareCalls).toBe(1);
     if (outcome.status !== "activated") return;
-    expect(outcome.successorFencingToken).toBeNull();
+    expect(outcome.members.every((member) => member.successorFencingToken === null)).toBe(true);
     expect(outcome.members.map((member) => member.manifest)).toEqual(["active", "active"]);
     // Every remote guard row carried its own copy binding under the shared publication id.
     for (const member of f.members) {
