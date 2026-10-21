@@ -1696,6 +1696,22 @@ export function readProjectMapIdentity(opts: {
   return identityForMatches(map, lookupPath, normalized, opts.homeDir);
 }
 
+/**
+ * The persisted canonical path of one project hash, and nothing else (#1548):
+ * a strict parse of the map file with no consumer lock, mutation lock,
+ * backfill, write or cache update, so it works while a maintenance hold
+ * (including an entering one) fences every consumer read. `null` when the
+ * map or the entry is absent; an invalid map throws.
+ */
+export function readProjectMapCanonicalPath(opts: {
+  readonly homeDir: string;
+  readonly hash: string;
+}): string | null {
+  const file = readMapFile(projectMapPath(opts.homeDir));
+  if (file === null) return null;
+  return parseProjectMap(file.content)[opts.hash]?.canonical ?? null;
+}
+
 export function listProjectMapEntries(
   homeDir?: string,
   publicationLockToken?: BackendPublicationLockToken,
