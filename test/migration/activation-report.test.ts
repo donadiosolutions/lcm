@@ -1,6 +1,6 @@
 import { afterEach, describe, expect, it } from "vitest";
 import { createRequire, syncBuiltinESMExports } from "node:module";
-import { chmodSync, existsSync, linkSync, mkdirSync, mkdtempSync, readFileSync, rmSync, statSync, writeFileSync } from "node:fs";
+import { chmodSync, existsSync, linkSync, mkdirSync, mkdtempSync, readFileSync, renameSync, rmSync, statSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import {
@@ -629,6 +629,48 @@ describe("probeMigrationActivationReportPresence: three-valued (#1549 F1)", () =
     } finally {
       if (descriptor === undefined) delete (process as { getuid?: unknown }).getuid;
       else Object.defineProperty(process, "getuid", descriptor);
+    }
+  });
+
+  it("is unresolvable (directory-changed), never absent, when an authenticated ancestor is replaced before the next level is looked up (#1660)", () => {
+    const homeDir = home();
+    persisted(homeDir);
+    const store = migrationActivationReportStoreDirectory(homeDir);
+    const generationDirectory = migrationActivationReportDirectory(homeDir, GENERATION);
+    mkdirSync(store + ".empty", { mode: 0o700 });
+    const swapStore = () => { renameSync(store, store + ".swapped"); renameSync(store + ".empty", store); renameSync(store + ".swapped", store + ".empty"); };
+    const nodeFs = createRequire(import.meta.url)("node:fs") as Record<string, unknown>;
+    const realFs = nodeFs as unknown as typeof import("node:fs");
+    const originalOpen = realFs.openSync;
+    const originalStat = realFs.statSync;
+    const canonicalLeaf = realFs.realpathSync(generationDirectory);
+    // Before the leaf is looked up: the store directory authenticated one level up is swapped for an empty sibling.
+    nodeFs.openSync = ((path: Parameters<typeof originalOpen>[0], ...rest: unknown[]) => {
+      if (path === generationDirectory) swapStore();
+      return (originalOpen as unknown as (...args: unknown[]) => number)(path, ...rest);
+    }) as unknown;
+    syncBuiltinESMExports();
+    try {
+      expect(probeMigrationActivationReportPresence({ homeDir, generationId: GENERATION }))
+        .toMatchObject({ state: "unresolvable", reason: "directory-changed" });
+    } finally {
+      nodeFs.openSync = originalOpen;
+      syncBuiltinESMExports();
+    }
+    swapStore();
+    // After the leaf authenticated (its pathname stat is the last step): the same swap is caught by the re-assertion, never "present".
+    nodeFs.statSync = ((path: Parameters<typeof originalStat>[0], ...rest: unknown[]) => {
+      const value = (originalStat as unknown as (...args: unknown[]) => unknown)(path, ...rest);
+      if (path === canonicalLeaf) swapStore();
+      return value;
+    }) as unknown;
+    syncBuiltinESMExports();
+    try {
+      expect(probeMigrationActivationReportPresence({ homeDir, generationId: GENERATION }))
+        .toMatchObject({ state: "unresolvable", reason: "directory-changed" });
+    } finally {
+      nodeFs.statSync = originalStat;
+      syncBuiltinESMExports();
     }
   });
 });

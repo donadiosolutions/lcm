@@ -596,18 +596,21 @@ export function readMigrationActivationReport(
 export type MigrationActivationReportPresenceResult = Readonly<
   | { state: "present"; detail: string }
   | { state: "authoritatively-absent"; detail: string }
-  | { state: "unresolvable"; reason: Extract<MigrationActivationReportUnresolvableReason, "root-unauthenticated" | "directory-unauthenticated">; detail: string }
+  | { state: "unresolvable"; reason: Extract<MigrationActivationReportUnresolvableReason, "root-unauthenticated" | "directory-unauthenticated" | "directory-changed">; detail: string }
 >;
 
 /**
  * Whether any activation report may exist for a generation, three-valued
  * (#1549 F1). The private LCM root, the store directory and the
- * per-generation directory are authenticated in turn: only a genuinely
- * absent level (ENOENT) is "authoritatively-absent", an existing
- * per-generation directory is "present" whatever it holds, and a level
- * that cannot be authenticated is "unresolvable". No report is read and no
- * report identity is guessed: a caller that needs positive absence of
- * every report must treat "present" and "unresolvable" alike.
+ * per-generation directory are authenticated in turn and every handle is
+ * retained until the answer is known, then re-asserted against its
+ * pathname and witness (#1660): only a genuinely absent level (ENOENT)
+ * under still-authenticated ancestors is "authoritatively-absent", an
+ * existing per-generation directory under still-authenticated ancestors
+ * is "present" whatever it holds, and a level that cannot be
+ * authenticated or that changed meanwhile is "unresolvable". No report is
+ * read and no report identity is guessed: a caller that needs positive
+ * absence of every report must treat "present" and "unresolvable" alike.
  */
 export function probeMigrationActivationReportPresence(
   input: Readonly<{ homeDir: string; generationId: string }>,
@@ -622,22 +625,33 @@ export function probeMigrationActivationReportPresence(
     [migrationActivationReportStoreDirectory(homeDir), "activation report store directory"],
     [migrationActivationReportDirectory(homeDir, generationId), "per-generation activation report directory"],
   ];
-  let depth = 0;
-  for (const [path, describe] of levels) {
-    let handle: PrivateDirectoryHandle | undefined;
+  const handles: Array<readonly [PrivateDirectoryHandle, string]> = [];
+  const settled = (result: MigrationActivationReportPresenceResult): MigrationActivationReportPresenceResult => {
     try {
-      handle = openPrivateDirectoryIfExists(path, { expectedUid });
+      for (const [handle, levelPath] of handles) assertPrivateDirectory(handle, levelPath, handle.witness, expectedUid);
     } catch (error) {
-      return {
-        state: "unresolvable",
-        reason: depth === 0 ? "root-unauthenticated" : "directory-unauthenticated",
-        detail: "cannot authenticate the " + describe + " " + path + ": " + (error as Error).message,
-      };
+      return { state: "unresolvable", reason: "directory-changed", detail: "an activation report directory changed during the probe: " + (error as Error).message };
     }
-    if (handle === undefined) return { state: "authoritatively-absent", detail: "the " + describe + " " + path + " does not exist" };
-    handle.close();
-    depth += 1;
+    return result;
+  };
+  try {
+    for (const [path, describe] of levels) {
+      let handle: PrivateDirectoryHandle | undefined;
+      try {
+        handle = openPrivateDirectoryIfExists(path, { expectedUid });
+      } catch (error) {
+        return {
+          state: "unresolvable",
+          reason: handles.length === 0 ? "root-unauthenticated" : "directory-unauthenticated",
+          detail: "cannot authenticate the " + describe + " " + path + ": " + (error as Error).message,
+        };
+      }
+      if (handle === undefined) return settled({ state: "authoritatively-absent", detail: "the " + describe + " " + path + " does not exist" });
+      handles.push([handle, path]);
+    }
+    return settled({ state: "present", detail: "the per-generation activation report directory " + levels[2]![0] + " exists" });
+  } finally {
+    for (const [handle] of handles) handle.close();
   }
-  return { state: "present", detail: "the per-generation activation report directory " + levels[2]![0] + " exists" };
 }
 
