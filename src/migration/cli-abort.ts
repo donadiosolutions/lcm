@@ -214,7 +214,8 @@ function finishAbort(input: Readonly<{
     return {
       status: "refuse",
       reason: classified.reason,
-      evidence: result.evidence,
+      // The reason is classified from the bare evidence; a set refusal then names the member it concerns.
+      evidence: result.member === undefined ? result.evidence : `${result.member}:${result.evidence}`,
       ...(result.mutated ? { applied: true as const } : {}),
       // A pending copy effect that began after routing is resume's: abort names it.
       ...(classified.reason === "abort-manifest-needs-resume" ? { next: "resume" } : {}),

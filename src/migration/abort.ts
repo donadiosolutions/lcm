@@ -114,7 +114,13 @@ export type MigrationAbortResult =
    * either manifest write) was made before this refusal, so a caller never
    * has to guess whether state moved (round-1 A-2).
    */
-  | Readonly<{ status: "refuse"; evidence: string; mutated: boolean }>;
+  | Readonly<{
+    status: "refuse";
+    evidence: string;
+    mutated: boolean;
+    /** The failing member generation of a cutover-set abort; absent for journal-wide failures and single generations. */
+    member?: string;
+  }>;
 
 function abortEffectId(generationId: string): string {
   return backendPublicationCanonicalSha256({ kind: "migration-abort-effect", generationId });
@@ -214,6 +220,10 @@ export async function performMigrationAbort(input: Readonly<{
     return { status: "refuse", evidence: `journal-${journal.phase}`, mutated: false };
   }
 
+  // A set abort names the failing member; a single generation keeps its bare evidence byte-for-byte.
+  const member = (generationId: string): { member?: string } =>
+    input.journal.cutoverSet === undefined ? {} : { member: generationId };
+
   // Everything below up to the first write is read-only. A cutover-set
   // journal settles every member generation (#1548 C8): all of them are
   // classified before the first write, so one member that cannot be
@@ -223,14 +233,14 @@ export async function performMigrationAbort(input: Readonly<{
   for (const generationId of abortManifestGenerationIds(journal)) {
     const presence = store.probeManifestPresence(generationId);
     if (presence.status === "unresolvable") {
-      return { status: "refuse", evidence: `manifest-${presence.reason}`, mutated: false };
+      return { status: "refuse", evidence: `manifest-${presence.reason}`, mutated: false, ...member(generationId) };
     }
     if (presence.status === "absent") continue;
     let manifest: MigrationManifest;
     try {
       manifest = store.read(generationId);
     } catch (error) {
-      return { status: "refuse", evidence: manifestFailureEvidence(error), mutated: false };
+      return { status: "refuse", evidence: manifestFailureEvidence(error), mutated: false, ...member(generationId) };
     }
     const recovery = classifyMigrationRecovery(manifest);
     if (recovery.action === "settled") continue;
@@ -242,11 +252,11 @@ export async function performMigrationAbort(input: Readonly<{
     // exact member id and aborted-journal input are what an uninterrupted run would have begun.
     const pending = manifest.pendingEffect!;
     if (journal.cutoverSet === undefined || journalNeedsWrite || pending.kind !== "abort") {
-      return { status: "refuse", evidence: `manifest-${recovery.action}`, mutated: false };
+      return { status: "refuse", evidence: `manifest-${recovery.action}`, mutated: false, ...member(generationId) };
     }
     if (journal.abortEvidenceSha256 === null || pending.effectId !== abortEffectId(generationId)
       || pending.inputSha256 !== journal.checksumSha256) {
-      return { status: "refuse", evidence: "carried-effect-mismatch", mutated: false };
+      return { status: "refuse", evidence: "carried-effect-mismatch", mutated: false, ...member(generationId) };
     }
     settling.push({ generationId, manifest, carried: true });
   }
@@ -278,7 +288,7 @@ export async function performMigrationAbort(input: Readonly<{
           abortCompletion(generationId, effectId, journal.abortEvidenceSha256!, pending.startedAt),
         ));
       } catch (error) {
-        return { status: "refuse", evidence: manifestFailureEvidence(error), mutated };
+        return { status: "refuse", evidence: manifestFailureEvidence(error), mutated, ...member(generationId) };
       }
       mutated = true;
       continue;
@@ -292,24 +302,24 @@ export async function performMigrationAbort(input: Readonly<{
         startedAt: now,
       });
     } catch (error) {
-      return { status: "refuse", evidence: manifestFailureEvidence(error), mutated };
+      return { status: "refuse", evidence: manifestFailureEvidence(error), mutated, ...member(generationId) };
     }
     try {
       store.update(generationId, manifest.checksumSha256, () => begun);
     } catch (error) {
-      return { status: "refuse", evidence: manifestFailureEvidence(error), mutated };
+      return { status: "refuse", evidence: manifestFailureEvidence(error), mutated, ...member(generationId) };
     }
     mutated = true;
     let candidate: MigrationManifest;
     try {
       candidate = completeEffect(begun, abortCompletion(generationId, effectId, input.abortEvidenceSha256, now));
     } catch (error) {
-      return { status: "refuse", evidence: manifestFailureEvidence(error), mutated };
+      return { status: "refuse", evidence: manifestFailureEvidence(error), mutated, ...member(generationId) };
     }
     try {
       store.update(generationId, begun.checksumSha256, () => candidate);
     } catch (error) {
-      return { status: "refuse", evidence: manifestFailureEvidence(error), mutated };
+      return { status: "refuse", evidence: manifestFailureEvidence(error), mutated, ...member(generationId) };
     }
   }
   return { status: "completed", mutated };

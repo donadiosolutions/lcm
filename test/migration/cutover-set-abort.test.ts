@@ -14,6 +14,7 @@ import { performMigrationAbortCommand } from "../../src/migration/cli-abort.js";
 import { MigrationManifestStore } from "../../src/migration/manifest-store.js";
 import {
   beginMigrationEffect,
+  completeMigrationEffect,
   createMigrationManifest,
   MigrationProtocolError,
   type MigrationManifest,
@@ -151,7 +152,7 @@ describe("performMigrationAbort over a set hold", () => {
     const result = await performMigrationAbort({
       homeDir: home, coordinator: coordinatorFor(home), journal: held, abortEvidenceSha256: "c".repeat(64), manifestStore: store,
     });
-    expect(result).toEqual({ status: "refuse", evidence: "manifest-resume", mutated: false });
+    expect(result).toEqual({ status: "refuse", evidence: "manifest-resume", mutated: false, member: "member-generation-2" });
     expect(readBackendMaintenanceJournal(home)!.phase).toBe("maintenance-held");
     expect(store.read(MEMBERS[0]).checksumSha256).toBe(before);
   });
@@ -165,7 +166,7 @@ describe("performMigrationAbort over a set hold", () => {
     } as unknown as MigrationManifestStore;
     expect(await performMigrationAbort({
       homeDir: home, coordinator: coordinatorFor(home), journal: held, abortEvidenceSha256: "c".repeat(64), manifestStore: store,
-    })).toEqual({ status: "refuse", evidence: "manifest-checksum-mismatch", mutated: false });
+    })).toEqual({ status: "refuse", evidence: "manifest-checksum-mismatch", mutated: false, member: "member-generation-2" });
     expect(readBackendMaintenanceJournal(home)!.phase).toBe("maintenance-held");
   });
 
@@ -192,7 +193,7 @@ describe("performMigrationAbort over a set hold", () => {
       homeDir: home, coordinator: coordinatorFor(home), journal: held, abortEvidenceSha256: "c".repeat(64), manifestStore: store,
       _operationsForTesting: { completeEffect: () => { throw new MigrationProtocolError("invalid-input", "injected"); } },
     });
-    expect(interrupted).toEqual({ status: "refuse", evidence: "manifest-invalid-input", mutated: true });
+    expect(interrupted).toEqual({ status: "refuse", evidence: "manifest-invalid-input", mutated: true, member: "member-generation-1" });
     const aborted = readBackendMaintenanceJournal(home)!;
     expect(aborted.phase).toBe("maintenance-aborted");
     expect(store.read(MEMBERS[0]).pendingEffect?.kind).toBe("abort");
@@ -234,7 +235,7 @@ describe("performMigrationAbort over a set hold", () => {
     const base = { homeDir: home, coordinator: coordinatorFor(home), abortEvidenceSha256: "c".repeat(64), manifestStore: store, _operationsForTesting: failing };
     await performMigrationAbort({ ...base, journal: held });
     expect(await performMigrationAbort({ ...base, journal: readBackendMaintenanceJournal(home)! }))
-      .toEqual({ status: "refuse", evidence: "manifest-invalid-input", mutated: false });
+      .toEqual({ status: "refuse", evidence: "manifest-invalid-input", mutated: false, member: "member-generation-1" });
   });
 
   it("refuses every write when a carried abort names another effect or another journal checksum", async () => {
@@ -251,11 +252,11 @@ describe("performMigrationAbort over a set hold", () => {
     store.update(MEMBERS[1], planned.checksumSha256, () => beginMigrationEffect(planned, {
       effectId: "9".repeat(64), kind: "abort", inputSha256: aborted.checksumSha256, startedAt: CREATED_AT,
     }));
-    expect(await performMigrationAbort(input)).toEqual({ status: "refuse", evidence: "carried-effect-mismatch", mutated: false });
+    expect(await performMigrationAbort(input)).toEqual({ status: "refuse", evidence: "carried-effect-mismatch", mutated: false, member: "member-generation-2" });
     expect(store.read(MEMBERS[0]).phase).toBe("planned");
     // A journal that records no abort evidence cannot complete a carried effect either.
     expect(await performMigrationAbort({ ...input, journal: { ...aborted, abortEvidenceSha256: null } }))
-      .toEqual({ status: "refuse", evidence: "carried-effect-mismatch", mutated: false });
+      .toEqual({ status: "refuse", evidence: "carried-effect-mismatch", mutated: false, member: "member-generation-2" });
   });
 
   it("refuses a carried abort whose input digest is not the aborted journal checksum", async () => {
@@ -277,7 +278,7 @@ describe("performMigrationAbort over a set hold", () => {
     expect(await performMigrationAbort({
       homeDir: home, coordinator: coordinatorFor(home), journal: { ...aborted, checksumSha256: "d".repeat(64) },
       abortEvidenceSha256: "c".repeat(64), manifestStore: store,
-    })).toEqual({ status: "refuse", evidence: "carried-effect-mismatch", mutated: false });
+    })).toEqual({ status: "refuse", evidence: "carried-effect-mismatch", mutated: false, member: "member-generation-1" });
     expect(planned.generationId).toBe(MEMBERS[0]);
   });
 
@@ -307,7 +308,7 @@ describe("performMigrationAbort over a set hold", () => {
     expect(await performMigrationAbort({
       homeDir: home, coordinator: coordinatorFor(home), journal: held, abortEvidenceSha256: "c".repeat(64), manifestStore: store,
       _operationsForTesting: { beginEffect: () => { throw new MigrationProtocolError("invalid-input", "injected"); } },
-    })).toEqual({ status: "refuse", evidence: "manifest-invalid-input", mutated: true });
+    })).toEqual({ status: "refuse", evidence: "manifest-invalid-input", mutated: true, member: "member-generation-1" });
   });
 });
 
@@ -358,7 +359,7 @@ describe("migration abort command over a set", () => {
     expect(await performMigrationAbortCommand({ homeDir: home, confirmGenerationId: MEMBERS[1] }))
       .toMatchObject({ status: "refuse", reason: "abort-confirmation-moved", generationId: SET_ID });
     expect(await performMigrationAbortCommand({ homeDir: home, confirmGenerationId: SET_ID }))
-      .toEqual({ status: "refuse", reason: "abort-manifest-needs-resume", evidence: "manifest-resume", next: "resume" });
+      .toEqual({ status: "refuse", reason: "abort-manifest-needs-resume", evidence: "member-generation-2:manifest-resume", next: "resume" });
     expect(readBackendMaintenanceJournal(home)).toEqual(held);
   });
 
@@ -406,5 +407,80 @@ describe("migration abort command over a set", () => {
         return { status: "completed", mutated: true };
       } },
     })).toEqual({ status: "refuse", reason: "abort-unresolvable", evidence, applied: true });
+  });
+});
+
+describe("member attribution of set abort refusals (F2)", () => {
+  const failFor = (generationId: string) => ({
+    completeEffect: ((begun: MigrationManifest, completion: Parameters<typeof completeMigrationEffect>[1]) => {
+      if (begun.generationId === generationId) throw new MigrationProtocolError("invalid-input", "injected");
+      return completeMigrationEffect(begun, completion);
+    }) as typeof completeMigrationEffect,
+  });
+
+  it("names the failing member after an earlier member was already settled", async () => {
+    const home = makeHome();
+    const held = await heldSet(home);
+    const store = new MigrationManifestStore({ homeDir: home });
+    create(store, MEMBERS[0]);
+    create(store, MEMBERS[1]);
+    const result = await performMigrationAbort({
+      homeDir: home, coordinator: coordinatorFor(home), journal: held, abortEvidenceSha256: "c".repeat(64), manifestStore: store,
+      _operationsForTesting: failFor(MEMBERS[1]),
+    });
+    expect(result).toEqual({ status: "refuse", evidence: "manifest-invalid-input", mutated: true, member: MEMBERS[1] });
+    // Member 1 was settled before the failure; member 2 holds its begun, uncompleted abort effect.
+    expect(store.read(MEMBERS[0]).phase).toBe("aborted");
+    expect(store.read(MEMBERS[1]).pendingEffect?.kind).toBe("abort");
+  });
+
+  it("keeps journal-wide failures unattributed", async () => {
+    const home = makeHome();
+    const held = await heldSet(home);
+    const stale = { ...held, checksumSha256: "f".repeat(64) };
+    expect(await performMigrationAbort({
+      homeDir: home, coordinator: coordinatorFor(home), journal: stale, abortEvidenceSha256: "c".repeat(64),
+    })).toEqual({ status: "refuse", evidence: "journal-unexpected-state", mutated: false });
+  });
+
+  it("reports the member and keeps the reason and next step through the command", async () => {
+    const home = makeHome();
+    const held = await heldSet(home);
+    const store = new MigrationManifestStore({ homeDir: home });
+    create(store, MEMBERS[0]);
+    createPendingDryRun(store, MEMBERS[2]);
+    expect(await performMigrationAbortCommand({ homeDir: home, confirmGenerationId: SET_ID }))
+      .toEqual({ status: "refuse", reason: "abort-manifest-needs-resume", evidence: "member-generation-3:manifest-resume", next: "resume" });
+    expect(readBackendMaintenanceJournal(home)).toEqual(held);
+    expect(store.read(MEMBERS[0]).phase).toBe("planned");
+  });
+
+  it("keeps the carried-effect reason through the command and writes nothing", async () => {
+    const home = makeHome();
+    const held = await heldSet(home);
+    const store = new MigrationManifestStore({ homeDir: home });
+    const planned = create(store, MEMBERS[1]);
+    await coordinatorFor(home).abortMaintenance({
+      expectedChecksumSha256: held.checksumSha256, sourceSelectionSha256: held.sourceSelectionSha256, abortEvidenceSha256: "c".repeat(64),
+    });
+    store.update(MEMBERS[1], planned.checksumSha256, () => beginMigrationEffect(planned, {
+      effectId: "9".repeat(64), kind: "abort", inputSha256: "8".repeat(64), startedAt: CREATED_AT,
+    }));
+    const before = store.read(MEMBERS[1]);
+    expect(await performMigrationAbortCommand({ homeDir: home, confirmGenerationId: SET_ID }))
+      .toEqual({ status: "refuse", reason: "abort-carried-effect-mismatch", evidence: "member-generation-2:carried-effect-mismatch" });
+    expect(store.read(MEMBERS[1])).toEqual(before);
+  });
+
+  it("reports the failing member and the earlier write through the command", async () => {
+    const home = makeHome();
+    await heldSet(home);
+    const store = new MigrationManifestStore({ homeDir: home });
+    create(store, MEMBERS[0]);
+    create(store, MEMBERS[1]);
+    expect(await performMigrationAbortCommand({
+      homeDir: home, confirmGenerationId: SET_ID,
+      _operationsForTesting: { performAbort: (input) => performMigrationAbort({ ...input, _operationsForTesting: failFor(MEMBERS[1]) }) },
+    })).toEqual({ status: "refuse", reason: "abort-unresolvable", evidence: "member-generation-2:manifest-invalid-input", applied: true });
   });
 });
