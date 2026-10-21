@@ -104,3 +104,39 @@ describe("round 1 F2: a set member's binding is only an index", () => {
       .toEqual({ backend: "postgresql", disposition: "selected" });
   });
 });
+
+describe("round 1 F3: publication-failed is reserved for a confirmed abort", () => {
+  it.each<[ActivationPublicationStatus, string]>([
+    ["fence-unsatisfied", "lease-lost"],
+    ["publication-collision", "journal-unexpected"],
+  ])("a %s driver result interrupts at S13b as %s, keeps the selection and completes no member; the retry succeeds", async (status, cause) => {
+    const f = await fixture();
+    let inject = true;
+    const drive = f.deps.drive;
+    const outcome = await f.run({ drive: async (guard, coordinator, input) => {
+      if (!inject) return drive(guard, coordinator, input);
+      inject = false;
+      return { status, detail: "injected " + status, journal: null, fenceChecks: [], dispatch: null };
+    } });
+    expect(outcome).toMatchObject({ status: "interrupted", step: "S13b", cause, detail: expect.stringContaining("injected " + status) });
+    expect(records(f).selection).not.toBeNull();
+    for (const member of f.members) expect(f.manifestStore.read(member.generationId).phase).toBe("activating");
+    expectAllOld(f);
+    expectActivated(f, await f.run(), "selection-completed");
+  });
+
+  it.each<[ActivationPublicationStatus, string]>([
+    ["fence-unresolvable", "lease-unresolvable"],
+    ["artifact-missing", "artifact-unresolvable"],
+    ["artifact-unresolvable", "artifact-unresolvable"],
+    ["artifact-identity-mismatch", "artifact-identity-mismatch"],
+    ["duplicate-publication-input", "journal-unexpected"],
+    ["publication-unresolvable", "state-unresolvable"],
+    ["maintenance-in-flight", "journal-unexpected"],
+  ])("a %s driver result interrupts at S13b as %s", async (status, cause) => {
+    const f = await fixture();
+    const outcome = await f.run({ drive: async () => ({ status, detail: "injected", journal: null, fenceChecks: [], dispatch: null }) });
+    expect(outcome).toMatchObject({ status: "interrupted", step: "S13b", cause, effectBegun: true, detail: expect.stringContaining(status) });
+    expect(records(f).selection).not.toBeNull();
+  });
+});
