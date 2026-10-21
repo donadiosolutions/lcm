@@ -278,6 +278,10 @@ export async function performMigrationAbort(input: Readonly<{
   }
 
   const now = (input.now ?? new Date()).toISOString();
+  // A set member seals to the aborted journal's persisted evidence: a retry's caller digests the
+  // already-aborted journal, which an uninterrupted run never saw. A single generation keeps the
+  // caller's evidence byte-for-byte (Bug #1659).
+  const memberEvidence = input.journal.cutoverSet === undefined ? input.abortEvidenceSha256 : journal.abortEvidenceSha256!;
   for (const { generationId, manifest, carried } of settling) {
     const effectId = abortEffectId(generationId);
     if (carried) {
@@ -312,7 +316,7 @@ export async function performMigrationAbort(input: Readonly<{
     mutated = true;
     let candidate: MigrationManifest;
     try {
-      candidate = completeEffect(begun, abortCompletion(generationId, effectId, input.abortEvidenceSha256, now));
+      candidate = completeEffect(begun, abortCompletion(generationId, effectId, memberEvidence, now));
     } catch (error) {
       return { status: "refuse", evidence: manifestFailureEvidence(error), mutated, ...member(generationId) };
     }

@@ -1,7 +1,7 @@
 import { mkdirSync, mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { afterEach, describe, expect, it } from "vitest";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import {
   abortManifestGenerationIds,
   abortSetMemberGenerationIds,
@@ -21,6 +21,7 @@ import {
 } from "../../src/migration/protocol.js";
 import {
   BackendPublicationCoordinator,
+  backendPublicationCanonicalSha256,
   readBackendMaintenanceJournal,
   type BackendMaintenanceJournal,
   type BackendPublicationDriver,
@@ -482,5 +483,78 @@ describe("member attribution of set abort refusals (F2)", () => {
       homeDir: home, confirmGenerationId: SET_ID,
       _operationsForTesting: { performAbort: (input) => performMigrationAbort({ ...input, _operationsForTesting: failFor(MEMBERS[1]) }) },
     })).toEqual({ status: "refuse", reason: "abort-unresolvable", evidence: "member-generation-2:manifest-invalid-input", applied: true });
+  });
+});
+
+describe("set member abort evidence across retries (PR #1658 thread)", () => {
+  // The journal stamps its own clock, so two homes only agree byte-for-byte under a pinned Date.
+  const NOW = new Date("2026-08-12T12:30:00.000Z");
+  beforeEach(() => {
+    vi.useFakeTimers({ toFake: ["Date"] });
+    vi.setSystemTime(NOW);
+  });
+  afterEach(() => vi.useRealTimers());
+
+  const pair = async (): Promise<{ home: string; store: MigrationManifestStore }> => {
+    const home = makeHome();
+    await coordinatorFor(home).enterMaintenance(cutoverSetMaintenanceEntry(setManifest(2)));
+    const store = new MigrationManifestStore({ homeDir: home });
+    create(store, MEMBERS[0]);
+    create(store, MEMBERS[1]);
+    return { home, store };
+  };
+  const abortCommand = (home: string, operations?: Parameters<typeof performMigrationAbort>[0]["_operationsForTesting"]) =>
+    performMigrationAbortCommand({
+      homeDir: home, confirmGenerationId: SET_ID, now: NOW,
+      ...(operations === undefined ? {} : {
+        _operationsForTesting: { performAbort: (input) => performMigrationAbort({ ...input, _operationsForTesting: operations }) },
+      }),
+    });
+  const failingFor = <T extends (manifest: MigrationManifest, ...rest: never[]) => MigrationManifest>(generationId: string, real: T): T =>
+    ((manifest: MigrationManifest, ...rest: never[]) => {
+      if (manifest.generationId === generationId) throw new MigrationProtocolError("invalid-input", "injected");
+      return real(manifest, ...rest);
+    }) as T;
+  const uninterrupted = async (): Promise<MigrationManifest> => {
+    const { home, store } = await pair();
+    expect(await abortCommand(home)).toMatchObject({ status: "ok", applied: true });
+    return store.read(MEMBERS[1]);
+  };
+
+  it("seals a member begun only by the retry to the journal's persisted evidence", async () => {
+    const expected = await uninterrupted();
+    const { home, store } = await pair();
+    // The first abort terminalizes the journal, settles member 1 and dies before member 2's begin.
+    expect(await abortCommand(home, { beginEffect: failingFor(MEMBERS[1], beginMigrationEffect) }))
+      .toEqual({ status: "refuse", reason: "abort-unresolvable", evidence: "member-generation-2:manifest-invalid-input", applied: true });
+    const aborted = readBackendMaintenanceJournal(home)!;
+    expect([aborted.phase, store.read(MEMBERS[0]).phase, store.read(MEMBERS[1]).phase]).toEqual(["maintenance-aborted", "aborted", "planned"]);
+    // The retry's caller digests the aborted journal, which is not the evidence the journal persisted.
+    const retryEvidence = backendPublicationCanonicalSha256({
+      version: 1, kind: "migration-abort-cli-request", generationId: SET_ID, checksumSha256: aborted.checksumSha256,
+    });
+    expect(retryEvidence).not.toBe(aborted.abortEvidenceSha256);
+
+    expect(await abortCommand(home)).toMatchObject({ status: "ok", applied: true });
+    const settled = store.read(MEMBERS[1]);
+    expect(settled).toEqual(expected);
+    expect(settled.reports.find((report) => report.kind === "abort")!.reportSha256).toBe(backendPublicationCanonicalSha256({
+      version: 1, kind: "migration-abort-report", generationId: MEMBERS[1],
+      abortEvidenceSha256: aborted.abortEvidenceSha256, completedAt: NOW.toISOString(),
+    }));
+  });
+
+  it("completes a member begun by the retry and carried into a third invocation identically", async () => {
+    const expected = await uninterrupted();
+    const { home, store } = await pair();
+    expect(await abortCommand(home, { beginEffect: failingFor(MEMBERS[1], beginMigrationEffect) })).toMatchObject({ status: "refuse", applied: true });
+    // The retry begins member 2's effect and dies before completing it.
+    expect(await abortCommand(home, { completeEffect: failingFor(MEMBERS[1], completeMigrationEffect) }))
+      .toEqual({ status: "refuse", reason: "abort-unresolvable", evidence: "member-generation-2:manifest-invalid-input", applied: true });
+    const carried = store.read(MEMBERS[1]).pendingEffect!;
+    expect([carried.kind, carried.inputSha256]).toEqual(["abort", readBackendMaintenanceJournal(home)!.checksumSha256]);
+
+    expect(await abortCommand(home)).toMatchObject({ status: "ok", applied: true });
+    expect(store.read(MEMBERS[1])).toEqual(expected);
   });
 });
