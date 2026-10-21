@@ -27,7 +27,7 @@ import {
   type ActivationLeaseFence,
   type ActivationLeasePublicationGuard,
 } from "./activation-lease.js";
-import { checkActivationWriterQuiescence } from "./activation-quiescence.js";
+import { checkActivationWriterQuiescence, checkCutoverSetActivationWriterQuiescence } from "./activation-quiescence.js";
 import {
   createMigrationActivationWitness,
   createMigrationQuiescenceFence,
@@ -142,6 +142,10 @@ export interface RollbackSessionDependencies {
   createStream: typeof createPortableRecordStream;
   checkQuiescence: typeof checkActivationWriterQuiescence;
   checkRecoveryAdmission: typeof checkRollbackRecoveryAdmission;
+  /** Set-member quiescence under the rollback hold (#1550 D4); the set-aware activation check when omitted. */
+  checkSetQuiescence?: typeof checkCutoverSetActivationWriterQuiescence;
+  /** Set recovery admission (#1550 D4); {@link checkCutoverSetRollbackRecoveryAdmission} when omitted. */
+  checkSetRecoveryAdmission?: typeof checkCutoverSetRollbackRecoveryAdmission;
   /** Renewal cadence of a fenced read in flight; defaults to {@link ROLLBACK_LEASE_RENEWAL_INTERVAL_MS}. */
   renewalIntervalMs?: number;
 }
@@ -215,6 +219,18 @@ type LeaseRenewalKeeper = Readonly<{
   stop(): Promise<void>;
 }>;
 
+/**
+ * Lifetime ownership of a session (#1550 C8). A single-generation session
+ * owns its runtime and runs its own renewal keeper across every long read
+ * (the defaults). A set member session receives the set service's shared
+ * runtime, which it never closes, and defers renewal to the service's one
+ * set-wide keeper: its own periodic keeper is suppressed so two renewals
+ * never run against the same lease, while the keeper's signal (passed as
+ * the session's signal) still aborts a read in flight when a renewal fails.
+ */
+type SessionLifetime = Readonly<{ ownsRuntime: boolean; suppressKeeper: boolean }>;
+const OWNING_LIFETIME: SessionLifetime = { ownsRuntime: true, suppressKeeper: false };
+
 class FencedRollbackSession implements RollbackProductionSession {
   readonly selectionAuthority: MigrationSelectionAuthority;
   /** Sealed once quiescence is observed, before the session is handed out. */
@@ -235,6 +251,7 @@ class FencedRollbackSession implements RollbackProductionSession {
     private readonly scratchParent: string,
     private readonly signal: AbortSignal | undefined,
     private readonly dependencies: RollbackSessionDependencies,
+    private readonly lifetime: SessionLifetime = OWNING_LIFETIME,
   ) {
     this.fence = fence;
     // Field for field the lease row the fence acquired: its resource coordinates, its token, and
@@ -250,6 +267,11 @@ class FencedRollbackSession implements RollbackProductionSession {
 
   markCoordinatorAcquired(): void {
     this.coordinatorAcquired = true;
+  }
+
+  /** The lease fence this session currently holds (its token advances on renewal). */
+  get currentFence(): ActivationLeaseFence {
+    return this.fence;
   }
 
   async renew(): Promise<void> {
@@ -277,9 +299,10 @@ class FencedRollbackSession implements RollbackProductionSession {
     const onExternalAbort = (): void => controller.abort(external?.reason);
     if (external?.aborted) controller.abort(external.reason);
     else external?.addEventListener("abort", onExternalAbort, { once: true });
-    if (this.target.settings.poolMax <= 1) {
+    if (this.target.settings.poolMax <= 1 || this.lifetime.suppressKeeper) {
       // Inert (no periodic renewal), but owned like an active keeper: session cleanup of an export whose stream
-      // was never closed must still detach the caller-signal listener (E11).
+      // was never closed must still detach the caller-signal listener (E11). A set member session is inert by
+      // construction: the set service's one keeper renews every member's lease (#1550 C8).
       const inert: LeaseRenewalKeeper = {
         signal: controller.signal,
         assertFenced: () => undefined,
@@ -513,7 +536,9 @@ class FencedRollbackSession implements RollbackProductionSession {
     for (const snapshot of [...this.snapshots]) {
       try { await this.closeSnapshot(snapshot); } catch (error) { failures.push(error); }
     }
-    try { await this.runtime.close(); } catch (error) { failures.push(error); }
+    if (this.lifetime.ownsRuntime) {
+      try { await this.runtime.close(); } catch (error) { failures.push(error); }
+    }
     if (failures.length > 0) throw failures[0];
   }
 
@@ -527,9 +552,155 @@ class FencedRollbackSession implements RollbackProductionSession {
     for (const keeper of [...this.keepers]) await attempt(() => keeper.stop());
     for (const snapshot of [...this.snapshots]) await attempt(() => this.closeSnapshot(snapshot));
     await attempt(() => (this.coordinatorAcquired ? this.verifyReleased() : this.releaseLease()));
-    await attempt(() => this.runtime.close());
+    if (this.lifetime.ownsRuntime) await attempt(() => this.runtime.close());
     if (failures.length > 0) throw failures[0];
   }
+}
+
+/** A set member session: the fenced session plus its current fence, for the service's set-wide renewal. */
+export interface CutoverSetRollbackMemberSession extends RollbackProductionSession {
+  readonly currentFence: ActivationLeaseFence;
+}
+
+export type OpenCutoverSetRollbackFencedSessionInput = Readonly<{
+  homeDir: string;
+  /** The retained append-barrier token of the rollback window. */
+  lockToken: BackendPublicationLockToken;
+  /** The ORIGINAL member generation whose binding view is fenced. */
+  generationId: string;
+  /** The rollback hold's set id, shared by every member's lease and by the reverse publication. */
+  publicationId: string;
+  /** The set service's one runtime; the session never closes it. */
+  runtime: RollbackSessionRuntime;
+  scratchParent?: string;
+  signal?: AbortSignal;
+  /** Admit this rollback's own later journal phases and keep the lease on failure (as the single-generation recovery open). */
+  recovery?: true;
+}>;
+
+/**
+ * Open one member's fenced session under a set rollback hold (#1550 D4,
+ * C8): the same lease tuple the reverse coordinator adopts for that member
+ * (its remote project, this machine, the rollback set id as publication,
+ * target sqlite, the member's rollback project evidence derived from its
+ * ORIGINAL generation and the shared publication), then the set-aware
+ * member quiescence under the retained token, or the set recovery admission
+ * for a resumed hold. The runtime is the service's and is never closed here;
+ * the session's own renewal keeper is suppressed in favor of the service's
+ * set keeper. A failure after the lease was acquired releases it (best
+ * effort) unless this is a recovery open, which keeps it.
+ * openRollbackFencedSession's defaults and outputs are unchanged.
+ */
+export async function openCutoverSetRollbackFencedSession(
+  input: OpenCutoverSetRollbackFencedSessionInput,
+  target: RollbackSessionTarget,
+  dependencies: RollbackSessionDependencies = DEFAULT_ROLLBACK_SESSION_DEPENDENCIES,
+): Promise<CutoverSetRollbackMemberSession> {
+  const tuple: LeaseTuple = {
+    projectId: target.remoteProjectId,
+    machineId: target.machineId,
+    publicationId: input.publicationId,
+    targetBackend: "sqlite",
+    evidenceSha256: deriveRollbackProjectEvidenceSha256({
+      generationId: input.generationId,
+      publicationId: input.publicationId,
+      localProjectId: target.localProjectId,
+      remoteProjectId: target.remoteProjectId,
+    }),
+  };
+  const guard = input.runtime.backendPublicationGuard();
+  const fence = await acquireRollbackLease(guard, tuple, input.signal);
+  const session = new FencedRollbackSession(
+    input.runtime, guard, tuple, fence, target, input.scratchParent ?? tmpdir(), input.signal, dependencies,
+    { ownsRuntime: false, suppressKeeper: true },
+  );
+  try {
+    const quiescence = input.recovery === true
+      ? await (dependencies.checkSetRecoveryAdmission ?? checkCutoverSetRollbackRecoveryAdmission)({
+        homeDir: input.homeDir, lockToken: input.lockToken, setId: input.publicationId,
+        generationId: input.generationId, machineId: target.machineId,
+      })
+      : await (dependencies.checkSetQuiescence ?? checkCutoverSetActivationWriterQuiescence)({
+        homeDir: input.homeDir, lockToken: input.lockToken, generationId: input.generationId,
+      });
+    if (quiescence.status !== "satisfied") {
+      throw new RollbackSessionError("quiescence-unsatisfied", quiescence.detail);
+    }
+    const sealed = createMigrationQuiescenceFence({
+      kind: quiescence.quiescenceFence!.kind, payload: quiescence.quiescenceFence!.payload,
+    });
+    session.quiescenceFenceEvidenceSha256 = sealed.evidenceSha256;
+    return session;
+  } catch (error) {
+    await (input.recovery === true ? session.closeKeepingLease() : session.release()).catch(() => undefined);
+    throw error;
+  }
+}
+
+const SET_RECOVERY_ADMISSION_KIND = "lcm-cutover-set-rollback-recovery-admission-v1";
+
+/**
+ * Admission of a set member's recovery session (#1550 D4). A set rollback's
+ * first open asserts the set-aware member quiescence under the freshly held
+ * rollback hold. A recovery runs after the rollback attempted its one
+ * selection, so the journal is in a later phase. This check accepts exactly
+ * the journals the set rollback itself leaves behind, under the same retained
+ * local append barrier, and nothing else:
+ *
+ * - the rollback hold (a cutover-set maintenance journal whose set and
+ *   publication id are the rollback set id) targeting sqlite, at
+ *   selection-prepared or selection-completed, whose manifest names the
+ *   member and whose member roster is this machine alone; or
+ * - no maintenance journal and a non-terminal publication journal with the
+ *   rollback set id (the coordinator archived the hold when it prepared the
+ *   reverse publication), including one the coordinator aborted; the set
+ *   rollback proves the composition, the restored source and the frozen
+ *   evidence itself before it composes the publication again.
+ */
+export async function checkCutoverSetRollbackRecoveryAdmission(input: Readonly<{
+  homeDir: string;
+  lockToken: BackendPublicationLockToken;
+  setId: string;
+  generationId: string;
+  machineId: string;
+}>): Promise<RollbackRecoveryAdmissionResult> {
+  return withBackendPublicationRetainedAppendAdmissionAsync(input.homeDir, (): RollbackRecoveryAdmissionResult => {
+    const refuse = (detail: string): RollbackRecoveryAdmissionResult => ({ status: "unsatisfied", detail, quiescenceFence: null });
+    const admit = (journal: "maintenance" | "publication", phase: string, checksumSha256: string): RollbackRecoveryAdmissionResult => ({
+      status: "satisfied",
+      detail: "recovery of this set rollback's own " + journal + " journal at " + phase,
+      quiescenceFence: {
+        kind: SET_RECOVERY_ADMISSION_KIND,
+        payload: canonicalJson({
+          version: 1, journal, phase, checksumSha256, setId: input.setId, generationId: input.generationId, machineId: input.machineId,
+        }),
+      },
+    });
+    const maintenance = readBackendMaintenanceJournal(input.homeDir);
+    if (maintenance !== null) {
+      if (
+        maintenance.cutoverSet === undefined
+        || maintenance.generationId !== input.setId
+        || maintenance.publicationId !== input.setId
+        || maintenance.sourceBackend !== "postgresql"
+        || maintenance.targetBackend !== "sqlite"
+      ) {
+        return refuse("the maintenance journal (phase " + maintenance.phase + ") is not this set rollback's attempted selection");
+      }
+      const index = maintenance.cutoverSet.manifest.members.findIndex((member) => member.generationId === input.generationId);
+      if (index < 0) return refuse("the rollback hold does not name generation " + input.generationId);
+      const roster = maintenance.cutoverSet.bindings[index]!.roster;
+      if (roster.length !== 1 || roster[0]!.machineId !== input.machineId) {
+        return refuse("the member's roster is not this machine alone");
+      }
+      return admit("maintenance", maintenance.phase, maintenance.checksumSha256);
+    }
+    const publication = readBackendPublicationJournal(input.homeDir);
+    if (publication === null || publication.publicationId !== input.setId || publication.phase === "completed") {
+      return refuse("no journal of this set rollback's attempted selection or in-flight publication remains");
+    }
+    return admit("publication", publication.phase, publication.checksumSha256);
+  }, input.lockToken);
 }
 
 /**

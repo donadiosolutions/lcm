@@ -9,7 +9,7 @@ import { loadPostgreSqlMigrations } from "../storage/postgresql/migrations.js";
 import { IDENTITY_DOMAINS } from "../storage/postgresql/portable-destination.js";
 import { PORTABLE_RECORD_DOMAIN_ORDER, canonicalSha256, canonicalJson } from "../storage/portable-record.js";
 import { createPortableRecordStream, type PortableRecordStream } from "../storage/portable-record-stream.js";
-import { openSqlitePortableSource } from "../storage/sqlite/portable-source.js";
+import { openSqlitePortableSource, type SqlitePortableIdentityFacts, type SqlitePortableRecordSource } from "../storage/sqlite/portable-source.js";
 import { authenticateSqliteMigrationSource } from "./maintenance.js";
 import { inspectAuthenticatedSqliteMigrationSnapshot, type AuthenticatedSqliteMigrationSnapshot } from "./queue-evidence.js";
 import type { MigrationStorageWitness } from "./protocol.js";
@@ -21,17 +21,29 @@ export interface MigrationCopySourceInput {
     readonly signal?: AbortSignal;
 }
 function refuse(): never { throw new Error("migration copy source authority does not match"); }
-/** Captures are authenticated by #622; only its validated role paths are opened. */
-export async function openMigrationCopySource(input: MigrationCopySourceInput) {
-    const allowedKeys = ['generationId', 'homeDir', 'expectedIdentity', 'scratchParent', 'signal'];
-    const hasUnexpectedKey = Reflect.ownKeys(input).some(
-        key => typeof key !== 'string' || !allowedKeys.includes(key),
-    );
-    if (hasUnexpectedKey) refuse();
-    const snapshot = await inspectAuthenticatedSqliteMigrationSnapshot(input.generationId, input.homeDir);
+/** The preserved snapshot's portable source, derived from the authenticated snapshot alone (#1550 C1). */
+export type PreservedSqliteSource = Readonly<{
+    facts: SqlitePortableIdentityFacts;
+    extraInstructionAbsenceSha256: string;
+    sourceWitness: MigrationStorageWitness;
+    /** Opens the raw portable source over the sealed snapshot files; the caller streams and closes it. */
+    open(options: Readonly<{ scratchParent: string; signal?: AbortSignal }>): Promise<SqlitePortableRecordSource>;
+}>;
+/**
+ * The narrow raw-source seam (#1550 C1): from an ALREADY authenticated preserved snapshot and the expected project
+ * identity it derives exactly the roles, aliases and facts, file hashes and absent-extra-instructions evidence the
+ * forward copy source uses, and opens the sealed snapshot's portable source. It performs no live-source or hold
+ * check: openMigrationCopySource keeps those around it, and a set rollback (whose members are no longer held
+ * forward) authenticates the snapshot against its own frozen evidence instead.
+ */
+export function derivePreservedSqliteSource(
+    snapshot: AuthenticatedSqliteMigrationSnapshot,
+    expectedIdentity: StorageIdentityContext,
+    homeDir: string,
+): PreservedSqliteSource {
     const artifact = snapshot.artifact;
     const authority = artifact.authority;
-    const expected = { ...input.expectedIdentity };
+    const expected = { ...expectedIdentity };
     const paths = [authority.canonicalPath, ...authority.aliases];
     const facts = {
         sourceLocalProjectId: authority.physicalProjectId,
@@ -49,6 +61,32 @@ export async function openMigrationCopySource(input: MigrationCopySourceInput) {
         kind: "migration-extra-instruction-captures-absent", topology: "current-single-project-database",
         snapshotSha256: snapshot.checksumSha256, projectRoleSha256: project.checksumSha256,
         machineIdentityKey: authority.machineIdentity.identityKey, capturedRoles: artifact.roles.map(role => role.role) });
+    const sourceWitness: MigrationStorageWitness = { version: 1, backend: "sqlite", identitySha256: artifact.sourceSelectionSha256,
+        schemaSha256: artifact.schemaSha256, contentSha256: artifact.contentSha256, capturedAt: artifact.capturedAt };
+    const directory = join(homeDir, ".lcm", "migration-snapshots", "generations", artifact.generationId);
+    const open = (options: Readonly<{ scratchParent: string; signal?: AbortSignal }>) => openSqlitePortableSource({
+        databasePath: join(directory, project.normalizedMain.relativePath), expectedFileSha256: project.normalizedMain.sha256,
+        projectIdentity: { scope: "shared", projectId: expected.id }, sourceLocalProjectId: authority.physicalProjectId,
+        identityFacts: facts, expectedFactsSha256: canonicalSha256(facts), machineIdentityKey: authority.machineIdentity.identityKey,
+        capturedSidecars: { events: { databasePath: join(directory, events.normalizedMain.relativePath),
+                expectedFileSha256: events.normalizedMain.sha256, machineIdentityKey: authority.machineIdentity.identityKey },
+            instructions: { absent: true, evidenceSha256: extraInstructionAbsenceSha256 } },
+        capturedAt: artifact.capturedAt.replace(/\.(\d{3})Z$/u, ".$1000Z"), scratchParent: options.scratchParent, signal: options.signal,
+    });
+    return { facts, extraInstructionAbsenceSha256, sourceWitness, open };
+}
+/** Captures are authenticated by #622; only its validated role paths are opened. */
+export async function openMigrationCopySource(input: MigrationCopySourceInput) {
+    const allowedKeys = ['generationId', 'homeDir', 'expectedIdentity', 'scratchParent', 'signal'];
+    const hasUnexpectedKey = Reflect.ownKeys(input).some(
+        key => typeof key !== 'string' || !allowedKeys.includes(key),
+    );
+    if (hasUnexpectedKey) refuse();
+    const snapshot = await inspectAuthenticatedSqliteMigrationSnapshot(input.generationId, input.homeDir);
+    const artifact = snapshot.artifact;
+    const authority = artifact.authority;
+    const preserved = derivePreservedSqliteSource(snapshot, input.expectedIdentity, input.homeDir);
+    const { facts, extraInstructionAbsenceSha256, sourceWitness } = preserved;
     const reauthenticateHeld = async (token: BackendPublicationLockToken): Promise<void> => {
         if (input.signal?.aborted)
             throw new Error("migration copy cancelled");
@@ -77,22 +115,11 @@ export async function openMigrationCopySource(input: MigrationCopySourceInput) {
     };
     const reauthenticate = () => withBackendPublicationAppendBarrierAsync(input.homeDir, reauthenticateHeld);
     await reauthenticate();
-    const directory = join(input.homeDir, ".lcm", "migration-snapshots", "generations", artifact.generationId);
-    const raw = await openSqlitePortableSource({
-        databasePath: join(directory, project.normalizedMain.relativePath), expectedFileSha256: project.normalizedMain.sha256,
-        projectIdentity: { scope: "shared", projectId: expected.id }, sourceLocalProjectId: authority.physicalProjectId,
-        identityFacts: facts, expectedFactsSha256: canonicalSha256(facts), machineIdentityKey: authority.machineIdentity.identityKey,
-        capturedSidecars: { events: { databasePath: join(directory, events.normalizedMain.relativePath),
-                expectedFileSha256: events.normalizedMain.sha256, machineIdentityKey: authority.machineIdentity.identityKey },
-            instructions: { absent: true, evidenceSha256: extraInstructionAbsenceSha256 } },
-        capturedAt: artifact.capturedAt.replace(/\.(\d{3})Z$/u, ".$1000Z"), scratchParent: input.scratchParent, signal: input.signal,
-    });
+    const raw = await preserved.open({ scratchParent: input.scratchParent, signal: input.signal });
     let stream: PortableRecordStream | undefined;
     try {
         stream = await createPortableRecordStream(raw);
         await reauthenticate();
-        const sourceWitness: MigrationStorageWitness = { version: 1, backend: "sqlite", identitySha256: artifact.sourceSelectionSha256,
-            schemaSha256: artifact.schemaSha256, contentSha256: artifact.contentSha256, capturedAt: artifact.capturedAt };
         return { homeDir: input.homeDir, stream, snapshot, sourceWitness, facts, extraInstructionAbsenceSha256, reauthenticate, reauthenticateHeld };
     }
     catch (error) {
