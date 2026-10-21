@@ -14,9 +14,9 @@ import {
   type MachineIdentity,
 } from "../machine-identity.js";
 import { projectMapPath, readProjectMapSnapshot } from "../project-map.js";
-import { resolveMigrationWitnessBindings } from "./generation-binding-store.js";
+import { resolveMigrationWitnessBindings, type MigrationSelectionBinding } from "./generation-binding-store.js";
 import { MigrationManifestStore } from "./manifest-store.js";
-import { MigrationProtocolError } from "./protocol.js";
+import { MigrationProtocolError, type MigrationManifest } from "./protocol.js";
 import { lcmHomeDir } from "../runtime-paths.js";
 import { readBoundedRegularFileWithStat } from "../security-files.js";
 import { assertStorageBackendPublication } from "../storage/backend.js";
@@ -25,9 +25,12 @@ import {
   BackendPublicationJournalError,
   isTerminalBackendMaintenancePhase,
   readBackendMaintenanceJournal,
+  readBackendPublicationJournal,
   rebindBackendMaintenanceCutoff,
   resolveBackendMaintenanceGenerationBinding,
   withBackendPublicationAppendBarrierAsync,
+  type BackendMaintenanceJournal,
+  type BackendPublicationJournal,
   type BackendPublicationLockToken,
 } from "../storage/backend-publication.js";
 import type { StorageBackendName } from "../storage/contracts.js";
@@ -67,6 +70,12 @@ import {
   type CutoverSetMemberAuthorityOutcome,
   type CutoverSetMemberAuthorityResolution,
 } from "./cutover-set.js";
+import {
+  resolveCutoverSetActivationSelection,
+  type CutoverSetActivationSelectionResolution,
+} from "./cutover-set-activation-store.js";
+import { deriveActivationPublicationId } from "./activation-publication-id.js";
+import { readMigrationActivationReport } from "./activation-report.js";
 
 type PostgreSqlConfig = Extract<ResolvedStorageConfig, { backend: "postgresql" }>;
 
@@ -389,6 +398,15 @@ export function assertMigrationReplayAdmission(input: Readonly<{
       "migration maintenance has no authoritative terminal replay state",
     );
   }
+  // 0b (#1549). A set at selection-completed is an aggregate target intent without a completed
+  // publication: the handoff is fenced for every generation, including historical bindings, until the
+  // coordinator archives this journal under the set's version-2 publication.
+  if (journal?.cutoverSet !== undefined && journal.phase === "selection-completed") {
+    throw new BackendPublicationJournalError(
+      "unresolved-publication",
+      "migration maintenance has no authoritative terminal replay state",
+    );
+  }
   const live = journal !== null && journal.generationId === input.generationId ? journal : null;
   // 1. A live, non-terminal maintenance of this generation: its selection is still pending.
   if (live !== null && !isTerminalBackendMaintenancePhase(live.phase)) {
@@ -413,6 +431,17 @@ export function assertMigrationReplayAdmission(input: Readonly<{
         "unresolved-publication",
         "migration maintenance has no authoritative terminal replay state",
       );
+    }
+    if (last.kind === "activation" && last.publicationId !== deriveActivationPublicationId(input.generationId)) {
+      // #1549. A set member's selection binding names the set publication. Its generation link is written
+      // before any set selection binding (S11 precedes S13a), so an unlinked generation is not a set member
+      // and keeps the single-generation semantics; a linked one is decided by the aggregate below.
+      const aggregate = resolveCutoverSetActivationSelection({
+        homeDir: input.homeDir, generationId: input.generationId, publicationId: last.publicationId,
+      });
+      if (aggregate.state !== "absent" || aggregate.cause !== "unlinked") {
+        return assertCutoverSetReplayAdmission(input, last, journal, aggregate);
+      }
     }
     return { backend: last.kind === "activation" ? "postgresql" : "sqlite", disposition: "selected" };
   }
@@ -453,6 +482,87 @@ export function assertMigrationReplayAdmission(input: Readonly<{
     "unresolved-publication",
     "migration maintenance has no authoritative terminal replay state",
   );
+}
+
+function replayRefusal(detail: string): never {
+  throw new BackendPublicationJournalError("unresolved-publication", "cutover-set replay is not admitted: " + detail);
+}
+
+/**
+ * Set member replay (#1549, plan-v2 C2). The member's activation selection
+ * binding names a set publication (its id is not the generation's own
+ * single-generation id), so the binding is an index only: the authenticated
+ * aggregate (checkpoint, frozen selection, this member's row and the exact
+ * artifact) must agree with it, and then the live slot decides. The set's
+ * own completed version-2 publication admits when its project coverage is
+ * exactly the artifact's; its own non-completed or aborted publication
+ * refuses every member. When the slot is absent, foreign or occupied by a
+ * later maintenance journal, only the member's active manifest and its
+ * authenticated activation report naming this set publication, identity
+ * digest and witness admit; a report-only activating member refuses. No
+ * archived journal is read and no store is scanned.
+ */
+function assertCutoverSetReplayAdmission(
+  input: Readonly<{ homeDir: string; generationId: string; evidenceSha256: string }>,
+  binding: MigrationSelectionBinding,
+  maintenance: BackendMaintenanceJournal | null,
+  aggregate: CutoverSetActivationSelectionResolution,
+): Readonly<{ backend: StorageBackendName; disposition: "selected" }> {
+  if (aggregate.state !== "resolved") {
+    replayRefusal(aggregate.state === "absent" ? aggregate.detail : aggregate.reason);
+  }
+  const member = aggregate.member;
+  if (
+    member.witnessChecksumSha256 !== input.evidenceSha256
+    || member.epochId !== binding.epochId
+    || member.attemptId !== binding.attemptId
+    || member.epochManifestRevision !== binding.manifestRevision
+  ) {
+    replayRefusal("the member's selection binding does not restate its row of the set selection");
+  }
+  // The version-3 reader returns null for a version-2 journal; the version-2 reader refuses a live
+  // version-3 one, so the slot is read as a publication only when no maintenance journal occupies it.
+  const publication: BackendPublicationJournal | null = maintenance === null ? readBackendPublicationJournal(input.homeDir) : null;
+  if (publication !== null && publication.publicationId === aggregate.setId) {
+    if (publication.phase !== "completed") {
+      replayRefusal("the set publication is at phase " + publication.phase + ", not completed");
+    }
+    const rows = aggregate.artifact.projects;
+    const covered = publication.projects.length === rows.length && publication.projects.every((project, index) => {
+      const expected = rows[index]!;
+      return project.localProjectId === expected.localProjectId
+        && project.remoteProjectId === expected.remoteProjectId
+        && project.evidenceSha256 === expected.evidenceSha256;
+    });
+    if (!covered) replayRefusal("the completed set publication does not cover exactly the set artifact's projects");
+    return { backend: "postgresql", disposition: "selected" };
+  }
+  let manifest: MigrationManifest;
+  try {
+    manifest = new MigrationManifestStore({ homeDir: input.homeDir }).read(input.generationId);
+  } catch (error) {
+    replayRefusal("the member manifest cannot be read: " + (error as Error).message);
+  }
+  if (manifest.phase !== "active") {
+    replayRefusal("the member manifest is at phase " + manifest.phase + " and no completed set publication occupies the slot");
+  }
+  const reports = manifest.reports.filter((report) => report.kind === "activation");
+  const reference = reports[reports.length - 1]!;
+  const read = readMigrationActivationReport({ homeDir: input.homeDir, generationId: input.generationId, reportSha256: reference.reportSha256 });
+  if (read.state !== "resolved") replayRefusal("the member's activation report is " + read.state + ": " + read.detail);
+  const body = read.report.body;
+  const named = canonicalJson({
+    publicationId: body.publicationId, identityDigest: body.identityDigest, witnessChecksumSha256: body.witnessChecksumSha256,
+    epochId: body.epochId, attemptId: body.attemptId,
+  });
+  const expected = canonicalJson({
+    publicationId: aggregate.setId, identityDigest: aggregate.selection.identityDigest, witnessChecksumSha256: input.evidenceSha256,
+    epochId: member.epochId, attemptId: member.attemptId,
+  });
+  if (named !== expected) {
+    replayRefusal("the member's activation report does not name this set publication, identity digest and witness");
+  }
+  return { backend: "postgresql", disposition: "selected" };
 }
 
 type StaticSourceSelection = Readonly<{

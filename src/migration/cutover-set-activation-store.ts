@@ -428,8 +428,8 @@ export type CutoverSetActivationSelectionResolution =
     member: BackendCutoverSetSelectionMember;
     artifact: ActivationArtifactRecoveryMaterial;
   }>
-  /** The generation has no link, or its link names its own single-generation publication. */
-  | Readonly<{ state: "absent"; detail: string }>
+  /** The generation has no link (unlinked), or its link names its own single-generation publication. */
+  | Readonly<{ state: "absent"; cause: "unlinked" | "single-generation"; detail: string }>
   | Readonly<{ state: "unresolvable"; reason: string }>;
 
 export type ResolveCutoverSetActivationSelectionDependencies = Readonly<{
@@ -462,9 +462,9 @@ export function resolveCutoverSetActivationSelection(
 
   const link = readLink({ homeDir, generationId });
   if (link.state === "unresolvable") return unresolvable("the generation link is unresolvable: " + link.detail);
-  if (link.state === "authoritatively-absent") return { state: "absent", detail: "the generation has no activation link" };
+  if (link.state === "authoritatively-absent") return { state: "absent", cause: "unlinked", detail: "the generation has no activation link" };
   if (link.link.publicationId === deriveActivationPublicationId(generationId)) {
-    return { state: "absent", detail: "the generation link names its single-generation publication" };
+    return { state: "absent", cause: "single-generation", detail: "the generation link names its single-generation publication" };
   }
   if (input.publicationId !== undefined && link.link.publicationId !== input.publicationId) {
     return unresolvable("the generation link names publication " + link.link.publicationId + ", not " + input.publicationId);
