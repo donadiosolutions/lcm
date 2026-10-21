@@ -3,6 +3,7 @@ import { chmodSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, rmSync, s
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import {
+  BACKEND_PUBLICATION_MAX_JOURNAL_BYTES,
   backendCutoverSetManifestSha256,
   backendCutoverSetSelectionSha256,
   type BackendCutoverSetManifest,
@@ -400,3 +401,10 @@ describe("resolveCutoverSetActivationSelection", () => {
   });
 });
 
+
+describe("record byte limit (#1549 F5)", () => {
+  it("is the storage module's journal limit, shared rather than spelled twice", () => {
+    expect(MAX_CUTOVER_SET_ACTIVATION_RECORD_BYTES).toBe(BACKEND_PUBLICATION_MAX_JOURNAL_BYTES);
+    expect(MAX_CUTOVER_SET_ACTIVATION_RECORD_BYTES).toBe(1024 * 1024);
+  });
+});

@@ -41,7 +41,9 @@ import {
   restoreHomeLockTopologyMode,
 } from "./home-lock-topology.js";
 
-const MAX_JOURNAL_BYTES = 1 * 1024 * 1024;
+/** The readable journal bound every set record is admitted under as well (#1549). */
+export const BACKEND_PUBLICATION_MAX_JOURNAL_BYTES = 1 * 1024 * 1024;
+const MAX_JOURNAL_BYTES = BACKEND_PUBLICATION_MAX_JOURNAL_BYTES;
 const MAX_MATERIAL_BYTES = 8 * 1024 * 1024;
 const MAX_RECOVERY_FILE_BYTES = 4 * 1024 * 1024;
 const HASH_PATTERN = /^[0-9a-f]{64}$/u;

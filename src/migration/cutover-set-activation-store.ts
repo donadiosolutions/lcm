@@ -1,5 +1,6 @@
 import { canonicalJson } from "../storage/portable-record.js";
 import {
+  BACKEND_PUBLICATION_MAX_JOURNAL_BYTES,
   backendCutoverSetManifestSha256,
   backendPublicationCanonicalSha256,
   parseBackendCutoverSetManifest,
@@ -72,10 +73,11 @@ const SELECTION_FILE = "selection.json";
  * Both records are bounded by the readable set journal: the selection tuple is
  * embedded verbatim in the journal at the selection phases, and the checkpoint
  * carries the same manifest with narrower member rows, so neither can exceed
- * the 1 MiB journal limit a set was admitted under (C6). The single
- * generation binding's 4096-byte cap is not inherited.
+ * the journal limit a set was admitted under (C6), shared from the storage
+ * module rather than spelled twice. The single generation binding's
+ * 4096-byte cap is not inherited.
  */
-export const MAX_CUTOVER_SET_ACTIVATION_RECORD_BYTES = 1024 * 1024;
+export const MAX_CUTOVER_SET_ACTIVATION_RECORD_BYTES = BACKEND_PUBLICATION_MAX_JOURNAL_BYTES;
 
 const CUTOVER_SET_ACTIVATION_STORE: GenerationScopedStore = {
   subdirectory: CUTOVER_SET_ACTIVATION_SUBDIRECTORY,
