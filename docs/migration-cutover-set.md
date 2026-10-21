@@ -105,6 +105,9 @@ commands (#1551) will expose; nothing here is reachable from the CLI yet.
    becomes occupied (for example by an aborted attempt that captured it), its
    ordinal advances and the set id changes, so an old confirmation is refused
    with `confirmation-generation-moved` before anything is written.
+   While a set is already entering or held, the preview returns its persisted
+   set and member ids as they are, without recomputing them; preparing then
+   refuses a different target (`cutover-set-target-changed`).
 2. **Confirm, then hold.** The confirmed set id is compared first. Only then
    is each member's destination identity resolved (this can create the
    destination project and is reported per member), the sources are
@@ -160,7 +163,11 @@ that member and a reason, later members are not started, the hold stays, and
 every member's durable evidence is preserved. Typical reasons are
 `member-verification-failed` (the report is kept; the manifest stays
 `copied`), `member-snapshot-partial`, `member-snapshot-tampered`,
-`cutover-set-membership-drift`, `capture-contention`, `copy-failed` and
+`member-authority-drifted` (the member's source selection changed between the
+held-authority check and its capture), `member-binding-drifted` (its sealed
+snapshot no longer carries its current binding),
+`cutover-set-membership-drift` (a capture found the stored-data projects
+changed under the hold), `capture-contention`, `copy-failed` and
 `member-state-unexpected`. Fix the cause and call the preparation again, or
 release the hold as described below.
 
@@ -176,8 +183,9 @@ with or without `--generation <set id>`. The confirmation is always the set
 id, never a member's generation id. The journal records the abort and keeps the
 source backend selected, and the same invocation settles every member
 manifest: all members are classified before the first write, a member with a
-pending copy effect refuses the abort with that member's evidence (finish it
-with a preparation resume first), and the journal is terminalized only if it is
+pending copy effect refuses the abort with that member's evidence, written as
+`<member generation id>:<evidence>` and keeping the usual reason and the
+`resume` next step (finish it with a preparation resume first), and the journal is terminalized only if it is
 not already. Running the abort again after an interruption converges the
 members it left unsettled, including a member whose abort effect was begun and
 not completed. The command reports success only after every member is absent
