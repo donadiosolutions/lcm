@@ -27,6 +27,8 @@ import {
 } from "./cli-existing.js";
 import type { MigrationEvidence } from "./envelope.js";
 import type { ExistingGenerationInput } from "./existing-generation.js";
+import type { StorageIdentityContext } from "../storage/contracts.js";
+import type { PostgreSqlConnectionSettings } from "../storage/postgresql/contracts.js";
 
 /**
  * The `verify` command's CLI orchestration (plan-v4 section 5 as amended by
@@ -78,7 +80,7 @@ export type MigrationVerifyCommandOutcome =
     applied?: true;
   }>;
 
-type VerifyRefusal = Extract<MigrationVerifyCommandOutcome, { status: "refuse" }>;
+export type VerifyRefusal = Extract<MigrationVerifyCommandOutcome, { status: "refuse" }>;
 
 export type MigrationVerifyCommandOperations = Readonly<{
   completePending: typeof completePendingMigrationVerification;
@@ -127,7 +129,7 @@ function persistedEvidenceRefusal(generationId: string, reason: string, evidence
  * reference naming a persisted report that is activation-eligible. Returns the
  * evidence for an ok outcome or a refusal.
  */
-function readVerifiedEvidence(
+export function readVerifiedEvidence(
   generationId: string,
   manifestStore: MigrationManifestStore,
   reportStore: MigrationVerificationReportStore,
@@ -213,7 +215,11 @@ export const DEFAULT_MIGRATION_VERIFY_LEASE_TTL_MS = 300_000;
 
 const VERIFY_COORDINATION_EFFECTS = "verification-lease,source-append-barrier";
 
-type FreshInputsResult =
+function verifyRefusal(generationId: string, reason: string, evidence?: string): VerifyRefusal {
+  return { status: "refuse", reason, generationId, ...(evidence === undefined ? {} : { evidence }) };
+}
+
+export type FreshInputsResult =
   | Readonly<{ status: "ready"; input: Omit<VerifyMigrationGenerationInput, "scratchParent"> }>
   | VerifyRefusal;
 
@@ -229,16 +235,42 @@ async function buildFreshInputs(args: Readonly<{
   ops: Partial<MigrationVerifyCommandOperations> | undefined;
 }>): Promise<FreshInputsResult> {
   const { input, generationId, manifest, ops } = args;
-  const refuse = (reason: string, evidence?: string): VerifyRefusal =>
-    ({ status: "refuse", reason, generationId, ...(evidence === undefined ? {} : { evidence }) });
-
   // A manifest written before the copy recorded the cluster identifier cannot
   // be verified, and no identifier is invented in its place.
+  if (manifest.destination.systemIdentifier === undefined) return verifyRefusal(generationId, "verify-destination-drift", "system-identifier-absent");
+  const destination = await (ops?.resolveDestination ?? resolveMigrationDestination)({ cwd: input.cwd, homeDir: input.homeDir });
+  if (destination.status === "refuse") return verifyRefusal(generationId, destination.reason, destination.evidence);
+  return buildVerificationInputs({
+    homeDir: input.homeDir, generationId, manifest, destination,
+    ...(input.leaseTtlMs === undefined ? {} : { leaseTtlMs: input.leaseTtlMs }), ops,
+  });
+}
+
+/**
+ * Every input of the fresh computation that follows the destination
+ * resolution, shared with the cutover-set preparation (#1548 C7), which
+ * supplies one member's destination from its already resolved target instead
+ * of rereading the disk configuration. Nothing here writes; PostgreSQL is not
+ * contacted.
+ */
+export async function buildVerificationInputs(args: Readonly<{
+  homeDir: string;
+  generationId: string;
+  manifest: MigrationManifest;
+  destination: Readonly<{
+    settings: PostgreSqlConnectionSettings;
+    expectedOwner: string;
+    expectedIdentity: StorageIdentityContext;
+  }>;
+  leaseTtlMs?: number;
+  ops: Partial<MigrationVerifyCommandOperations> | undefined;
+}>): Promise<FreshInputsResult> {
+  const { homeDir, generationId, manifest, destination, ops } = args;
+  const refuse = (reason: string, evidence?: string): VerifyRefusal => verifyRefusal(generationId, reason, evidence);
+
   const expectedSystemIdentifier = manifest.destination.systemIdentifier;
   if (expectedSystemIdentifier === undefined) return refuse("verify-destination-drift", "system-identifier-absent");
 
-  const destination = await (ops?.resolveDestination ?? resolveMigrationDestination)({ cwd: input.cwd, homeDir: input.homeDir });
-  if (destination.status === "refuse") return refuse(destination.reason, destination.evidence);
   const { expectedIdentity } = destination;
   const { localProjectId, remoteProjectId } = expectedIdentity;
   // A resolved identity always names its local project; this guards the type, not a reachable state.
@@ -248,7 +280,7 @@ async function buildFreshInputs(args: Readonly<{
 
   let receipt;
   try {
-    receipt = (await (ops?.inspectSnapshot ?? inspectAuthenticatedSqliteMigrationSnapshot)(generationId, input.homeDir)).receiptReference;
+    receipt = (await (ops?.inspectSnapshot ?? inspectAuthenticatedSqliteMigrationSnapshot)(generationId, homeDir)).receiptReference;
   } catch {
     return refuse("snapshot-unresolvable");
   }
@@ -265,9 +297,9 @@ async function buildFreshInputs(args: Readonly<{
   try {
     // Under a maintenance hold the project map is read under the source append barrier's token,
     // exactly as the activation reads the same witness; without it the consumer lock is fenced.
-    projectMapWitnessSha256 = await withBackendPublicationAppendBarrierAsync(input.homeDir, (token) =>
+    projectMapWitnessSha256 = await withBackendPublicationAppendBarrierAsync(homeDir, (token) =>
       (ops?.computeProjectMapWitness ?? computeMigrationProjectMapWitnessSha256)({
-        homeDir: input.homeDir,
+        homeDir,
         localProjectId,
         remoteProjectId,
         mode: "pre-publication",
@@ -287,12 +319,12 @@ async function buildFreshInputs(args: Readonly<{
     input: {
       generationId,
       targetGenerationId: migrationCopyTargetGeneration(generationId),
-      homeDir: input.homeDir,
+      homeDir,
       expectedIdentity,
       destinationSettings: destination.settings,
       expectedOwner: destination.expectedOwner,
       ownerProcessId: (ops?.mintOwnerProcessId ?? randomUUID)(),
-      leaseTtlMs: input.leaseTtlMs ?? DEFAULT_MIGRATION_VERIFY_LEASE_TTL_MS,
+      leaseTtlMs: args.leaseTtlMs ?? DEFAULT_MIGRATION_VERIFY_LEASE_TTL_MS,
       manifestRevision: manifest.revision,
       manifestChecksumSha256: manifest.checksumSha256,
       destinationMigrationsSha256: manifest.destination.schemaSha256,
