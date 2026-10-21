@@ -234,7 +234,7 @@ export type CutoverSetRollbackMemberResult = Readonly<{
   physicalProjectId: string;
   /** The ORIGINAL member generation. */
   generationId: string;
-  remoteProjectId: string | null;
+  remoteProjectId: string;
   /** The durable manifest phase last read for the member, or unknown. */
   manifest: string;
   mode: "pre-write" | "post-write" | null;
@@ -305,6 +305,7 @@ export type CutoverSetRollbackDependencies = Readonly<{
   readActivationRecords: typeof readCutoverSetActivationRecords;
   readRollbackRecords: typeof readCutoverSetRollbackRecords;
   rollbackJournalCapacity: typeof backendCutoverSetRollbackJournalCapacity;
+  rebindCutoff: typeof rebindBackendMaintenanceCutoff;
   recordCheckpoint: typeof recordCutoverSetRollbackCheckpoint;
   recordInstall: typeof recordCutoverSetRollbackInstall;
   recordSelection: typeof recordCutoverSetRollbackSelection;
@@ -357,6 +358,7 @@ export function createCutoverSetRollbackDependencies(input: Readonly<{ homeDir: 
     readActivationRecords: readCutoverSetActivationRecords,
     readRollbackRecords: readCutoverSetRollbackRecords,
     rollbackJournalCapacity: backendCutoverSetRollbackJournalCapacity,
+    rebindCutoff: rebindBackendMaintenanceCutoff,
     recordCheckpoint: recordCutoverSetRollbackCheckpoint,
     recordInstall: recordCutoverSetRollbackInstall,
     recordSelection: recordCutoverSetRollbackSelection,
@@ -447,7 +449,7 @@ type SetKeeper = Readonly<{
   signal: AbortSignal;
   /** Renew every open member lease now, serially; throws the first failure (which also aborts the signal). */
   sweep(): Promise<void>;
-  assertFenced(): void;
+  /** Stops the cadence and waits for a sweep in flight; never throws. */
   stop(): Promise<void>;
 }>;
 
@@ -501,7 +503,7 @@ function memberResults(ctx: Context): readonly CutoverSetRollbackMemberResult[] 
   return ctx.members.map((member) => ({
     physicalProjectId: member.physicalProjectId,
     generationId: member.generationId,
-    remoteProjectId: member.remoteProjectId === "" ? null : member.remoteProjectId,
+    remoteProjectId: member.remoteProjectId,
     manifest: member.manifest?.phase ?? "unknown",
     mode: member.mode,
     installedGenerationId: member.install?.installedGenerationId ?? member.built?.generationId ?? null,
@@ -655,13 +657,18 @@ async function storageForCheckpoint(ctx: Context, checkpoint: CutoverSetRollback
   return storage;
 }
 
+/** Best-effort cleanup never masks the outcome it follows. */
+function ignore(): undefined {
+  return undefined;
+}
+
 async function closeResources(ctx: Context): Promise<void> {
-  if (ctx.keeper !== null) await ctx.keeper.stop().catch(() => undefined);
+  if (ctx.keeper !== null) await ctx.keeper.stop();
   for (const member of ctx.members) {
-    if (member.session !== null) await member.session.closeKeepingLease().catch(() => undefined);
+    if (member.session !== null) await member.session.closeKeepingLease().catch(ignore);
     member.session = null;
   }
-  if (ctx.runtime !== null) await ctx.runtime.close().catch(() => undefined);
+  if (ctx.runtime !== null) await ctx.runtime.close().catch(ignore);
   ctx.runtime = null;
 }
 
@@ -687,7 +694,7 @@ function headsPositivelyUnbegun(ctx: Context): boolean {
 async function withPreEffectLeasesReleased(ctx: Context, outcome: CutoverSetRollbackResult): Promise<CutoverSetRollbackResult> {
   const releasable = (outcome.status === "refused" || outcome.status === "blocked") && headsPositivelyUnbegun(ctx);
   if (!releasable) return outcome;
-  if (ctx.keeper !== null) { await ctx.keeper.stop().catch(() => undefined); ctx.keeper = null; }
+  if (ctx.keeper !== null) { await ctx.keeper.stop(); ctx.keeper = null; }
   const failures: string[] = [];
   for (const member of ctx.members) {
     if (member.session === null) continue;
@@ -1195,40 +1202,36 @@ function startSetKeeper(ctx: Context): SetKeeper {
   const onExternalAbort = (): void => controller.abort(external?.reason);
   if (external?.aborted) controller.abort(external.reason);
   else external?.addEventListener("abort", onExternalAbort, { once: true });
-  let failure: unknown;
   let pending: Promise<void> | null = null;
   const sweepOnce = async (): Promise<void> => {
-    for (const member of ctx.members) {
-      if (member.session === null) continue;
-      await member.session.renew();
-    }
+    for (const session of ctx.members.map((member) => member.session).filter((session) => session !== null)) await session.renew();
   };
+  // One sweep at a time: a caller joins the sweep in flight. A failure clears the cadence and aborts the signal;
+  // every later sweep runs again and fails again (fail closed), never consumed as fenced.
   const sweep = (): Promise<void> => {
-    if (pending !== null) return pending;
-    if (failure !== undefined) return Promise.reject(failure);
-    pending = sweepOnce().then(
-      () => { pending = null; },
-      (error: unknown) => {
-        pending = null;
-        failure = error;
-        clearInterval(timer);
-        controller.abort(error);
-        throw error;
-      },
-    );
+    if (pending === null) {
+      pending = sweepOnce().then(
+        () => { pending = null; },
+        (error: unknown) => {
+          pending = null;
+          clearInterval(timer);
+          controller.abort(error);
+          throw error;
+        },
+      );
+    }
     return pending;
   };
   const periodic = ctx.storage!.postgresql.poolMax > 1;
-  const timer = setInterval(() => { if (periodic) void sweep().catch(() => undefined); }, ctx.deps.renewalIntervalMs);
+  const timer = setInterval(() => { if (periodic) sweep().catch(ignore); }, ctx.deps.renewalIntervalMs);
   timer.unref?.();
   return {
     signal: controller.signal,
     sweep,
-    assertFenced: () => { if (failure !== undefined) throw failure; },
     stop: async () => {
       clearInterval(timer);
       external?.removeEventListener("abort", onExternalAbort);
-      if (pending !== null) await pending.catch(() => undefined);
+      await Promise.allSettled([pending]);
     },
   };
 }
@@ -1244,7 +1247,6 @@ function memberTarget(ctx: Context, member: Member): RollbackSessionTarget {
 async function openSessions(ctx: Context, recovery: boolean): Promise<Exit | null> {
   if (ctx.keeper === null) ctx.keeper = startSetKeeper(ctx);
   for (const member of ctx.members) {
-    if (member.session !== null || member.manifest!.phase === "rolled-back") continue;
     if (ctx.input.signal?.aborted === true) return blocked(ctx, "sessions", member, "cancelled", "the rollback was cancelled before the member's session was opened");
     try {
       member.session = await ctx.deps.openMemberSession({
@@ -1265,7 +1267,7 @@ async function sweepLeases(ctx: Context, step: CutoverSetRollbackStep, member: M
     await ctx.keeper!.sweep();
   } catch (error) {
     const failure = sessionFailure(error);
-    return blocked(ctx, step, member, failure.reason === "lease-conflict" ? "lease-lost" : failure.reason, failure.detail);
+    return blocked(ctx, step, member, failure.reason, failure.detail);
   }
   return null;
 }
@@ -1295,7 +1297,7 @@ function bindCutoffs(ctx: Context, held: BackendMaintenanceJournal): Step<Backen
       continue;
     }
     try {
-      journal = rebindBackendMaintenanceCutoff({
+      journal = ctx.deps.rebindCutoff({
         homeDir: ctx.homeDir, expectedChecksumSha256: view.checksumSha256, generationId: member.generationId,
         sourceSelectionSha256: member.sourceSelectionSha256, queueEvidenceSha256: artifact.sourceByteWitnessSha256, roster,
       }, ctx.token);
@@ -1323,7 +1325,6 @@ function pendingWitnessMode(ctx: Context, member: Member): Step<"pre-write" | "p
 
 async function classifyMembers(ctx: Context): Promise<Exit | null> {
   for (const member of ctx.members) {
-    if (ctx.input.signal?.aborted === true) return blocked(ctx, "classify", member, "cancelled", "the rollback was cancelled before the member's readback");
     const stored = pendingWitnessMode(ctx, member);
     if (isExit(stored)) return stored;
     let observation: RollbackEligibilityObservation;
@@ -1562,7 +1563,7 @@ function buildSelection(ctx: Context): BackendCutoverSetRollbackSelection {
 
 async function preSelection(ctx: Context, held: BackendMaintenanceJournal, membersResolved = false): Promise<CutoverSetRollbackResult> {
   if (!membersResolved) {
-    const members = await resolveMembers(ctx, "held");
+    const members = await resolveMembers(ctx, ctx.selection === null ? "held" : "frozen");
     if (members !== null) return members.exit;
     const target = await probeTarget(ctx);
     if (target !== null) return target.exit;
@@ -1614,15 +1615,13 @@ async function preSelection(ctx: Context, held: BackendMaintenanceJournal, membe
   return finishAfterSelection(ctx, null);
 }
 
-/** Adopt the frozen tuple for every member: its mode, witness and authenticated installation record; nothing is rebuilt. */
+/** Adopt the frozen tuple for every member (its manifest was classified against it): mode, witness and authenticated installation record; nothing is rebuilt. */
 function adoptFrozenSelection(ctx: Context): Exit | null {
   for (const member of ctx.members) {
     member.frozen = ctx.selection!.members[member.index]!;
     member.mode = member.frozen.mode;
     member.terminalEvidenceSha256 = member.frozen.witnessChecksumSha256;
     member.install = ctx.rollback!.installs.get(member.generationId)!;
-    const classified = classifyMemberManifest(ctx, member, "frozen", member.manifest!);
-    if (classified !== null) return classified;
     const failure = installRecordAuthenticates(member);
     if (failure !== null) return interrupted(ctx, "install", "readback-mismatch", at(member, failure));
   }
@@ -1650,9 +1649,6 @@ async function stepSelection(ctx: Context, current: BackendMaintenanceJournal): 
   } catch (error) {
     if (error instanceof BackendPublicationJournalError) return interrupted(ctx, "selection", "journal-unexpected", error.message);
     throw error;
-  }
-  if (journal.phase !== "selection-completed" || journal.terminalEvidenceSha256 !== selection.checksumSha256) {
-    return interrupted(ctx, "selection", "journal-unexpected", "the maintenance journal is at phase " + journal.phase + " and is not this rollback's completed selection");
   }
   return ok(journal);
 }
@@ -1682,7 +1678,6 @@ async function postSelection(ctx: Context, v3: BackendMaintenanceJournal | null,
   if (v3 !== null && v3.phase === "selection-prepared") {
     // F1: a prepared selection is completed only if a fresh readback still reproduces every frozen witness.
     for (const member of ctx.members) {
-      if (member.manifest!.phase === "rolled-back") continue;
       const revalidated = await revalidateFrozenMember(ctx, member);
       if (revalidated !== null) return revalidated.exit;
     }
@@ -1864,8 +1859,6 @@ function settleMember(ctx: Context, member: Member, sealedDigest: string): Exit 
   if (manifest.phase !== "rolling-back" || pending?.kind !== "publish-rollback" || pending.effectId !== publishEffectId(member.terminalEvidenceSha256!)) {
     return interrupted(ctx, "completion", "readback-mismatch", at(member, "the manifest is not rolling back with this rollback's pending publish-rollback"));
   }
-  const failure = installRecordAuthenticates(member);
-  if (failure !== null) return interrupted(ctx, "completion", "readback-mismatch", at(member, failure));
   let report: ReturnType<typeof writeRollbackReport>;
   try {
     report = ctx.deps.writeReport(ctx.homeDir, {
@@ -1892,7 +1885,7 @@ function settleMember(ctx: Context, member: Member, sealedDigest: string): Exit 
   return null;
 }
 
-/** An already rolled-back member authenticates against its frozen row: mode, the rollback report of the frozen witness's effect, its installation. */
+/** An already rolled-back member authenticates against its frozen row: mode and the rollback report of the frozen witness's effect (its installation was authenticated when the tuple was adopted). */
 function verifyRolledBackMember(ctx: Context, member: Member): Exit | null {
   const manifest = member.manifest!;
   if (manifest.rollbackLineage.mode !== member.mode) return interrupted(ctx, "completion", "readback-mismatch", at(member, "the rolled-back mode is not the frozen one"));
@@ -1908,8 +1901,6 @@ function verifyRolledBackMember(ctx: Context, member: Member): Exit | null {
     || report.kind !== "rollback" || report.mode !== member.mode || report.epochId !== member.selectionRow.epochId || report.attemptId !== member.selectionRow.attemptId) {
     return interrupted(ctx, "completion", "readback-mismatch", at(member, "the rollback report does not name the frozen witness, mode, epoch and attempt"));
   }
-  const failure = installRecordAuthenticates(member);
-  if (failure !== null) return interrupted(ctx, "completion", "readback-mismatch", at(member, failure));
   return null;
 }
 
@@ -1968,7 +1959,7 @@ async function settledFromRecords(ctx: Context, v2: BackendPublicationJournal | 
   }
   const pending = ctx.members.filter((member) => member.manifest!.phase !== "rolled-back");
   if (pending.length > 0) {
-    return interrupted(ctx, "completion", "state-unresolvable", "the rollback's journal slot is " + (v2 === null ? "empty" : v2.publicationId === ctx.setId ? "its own completed publication" : "occupied by publication " + v2.publicationId)
+    return interrupted(ctx, "completion", "state-unresolvable", "the rollback's journal slot is " + (v2 === null ? "empty" : "occupied by publication " + v2.publicationId)
       + " and " + pending.map((member) => member.generationId).join(", ") + " " + (pending.length === 1 ? "is" : "are") + " not rolled back; nothing is republished").exit;
   }
   for (const member of ctx.members) {

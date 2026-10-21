@@ -1,11 +1,12 @@
 import { afterEach, describe, expect, it, vi } from "vitest";
-import { chmodSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { chmodSync, readFileSync, renameSync, rmSync, statSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { lcmHomeDir } from "../../src/runtime-paths.js";
 import { projectMapPath, clearProjectMapCache } from "../../src/project-map.js";
-import { readBackendMaintenanceJournal, readBackendPublicationJournal } from "../../src/storage/backend-publication.js";
+import { backendPublicationJournalPath, readBackendMaintenanceJournal, readBackendPublicationJournal } from "../../src/storage/backend-publication.js";
 import { performMigrationAbort } from "../../src/migration/abort.js";
 import { prepareCutoverSet, resolveCutoverSetCandidate } from "../../src/migration/cutover-set-prepare.js";
+import { activationArtifactPath } from "../../src/migration/activation-artifact-store.js";
 import { readCutoverSetActivationRecords } from "../../src/migration/cutover-set-activation-store.js";
 import { migrationCutoverSetRollbackDirectory, readCutoverSetRollbackRecords } from "../../src/migration/cutover-set-rollback-store.js";
 import { migrationSelectionBindingPath, recordMigrationSelectionBinding } from "../../src/migration/generation-binding-store.js";
@@ -181,6 +182,74 @@ describe("replay across a set rollback", () => {
     writeFileSync(path, content);
     chmodSync(path, 0o400);
     admitted(f, 0, witness, "sqlite");
+  });
+
+  it("refuses an aborted rollback hold, a reverse publication whose artifact is unresolvable, absent or not covered, and a member-evidence fallback whose manifest, report or installation cannot be trusted", async () => {
+    const f = await rollbackFixture();
+    await crashAt(f, "after-selection-frozen");
+    const held = readBackendMaintenanceJournal(f.homeDir)!;
+    await f.activation.coordinator().abortMaintenance({ expectedChecksumSha256: held.checksumSha256, sourceSelectionSha256: held.sourceSelectionSha256, abortEvidenceSha256: "e".repeat(64) });
+    refused(f, 0, rollbackWitness(f, 0)!, "rollback hold is at phase maintenance-aborted");
+    const g = await rollbackFixture();
+    await crashAt(g, "after-drive");
+    const witness = rollbackWitness(g, 0)!;
+    const projects = (JSON.parse(readFileSync(backendPublicationJournalPath(g.homeDir), "utf8")) as { projects: unknown[] }).projects;
+    g.activation.rewriteJournal((payload) => { payload.projects = projects.slice(0, 1); });
+    refused(g, 0, witness, "does not cover exactly the reverse artifact's projects");
+    g.activation.rewriteJournal((payload) => { payload.projects = projects; });
+    admitted(g, 0, witness, "sqlite");
+    const rollbackRecords = readCutoverSetRollbackRecords({ homeDir: g.homeDir, originalSetId: g.originalSetId });
+    if (rollbackRecords.state !== "resolved") throw new Error("rollback records missing");
+    const artifact = activationArtifactPath(g.homeDir, rollbackRecords.checkpoint.identityDigest);
+    const sealed = readFileSync(artifact);
+    const mode = statSync(artifact).mode & 0o777;
+    chmodSync(artifact, 0o600);
+    writeFileSync(artifact, "not an artifact\n");
+    chmodSync(artifact, mode);
+    refused(g, 0, witness, "reverse artifact is unresolvable");
+    renameSync(artifact, artifact + ".away");
+    refused(g, 0, witness, "reverse artifact is absent");
+    renameSync(artifact + ".away", artifact);
+    chmodSync(artifact, 0o600);
+    writeFileSync(artifact, sealed);
+    chmodSync(artifact, mode);
+    admitted(g, 0, witness, "sqlite");
+    const h = await rollbackFixture();
+    expectRolledBack(h, await h.run(), "fresh");
+    const own = rollbackWitness(h, 0)!;
+    await h.activation.coordinator().enterMaintenance({
+      publicationId: "later-generation", generationId: "later-generation", sourceSelectionSha256: "a".repeat(64), queueEvidenceSha256: "b".repeat(64),
+      roster: [{ machineId: MACHINE, queueCutoff: null, evidenceSha256: "b".repeat(64) }], now: new Date("2026-10-22T00:00:00.000Z"),
+    });
+    admitted(h, 0, own, "sqlite");
+    const generation = join(lcmHomeDir(h.homeDir), "migrations", h.members[1]!.generationId);
+    const generationMode = statSync(generation).mode & 0o777;
+    chmodSync(generation, 0);
+    refused(h, 0, own, "manifest cannot be read");
+    chmodSync(generation, generationMode);
+    // Member 1's report path carrying member 0's (self-consistent) report names another witness.
+    const reportPath = (index: number) => {
+      const manifest = h.activation.manifestStore.read(h.members[index]!.generationId);
+      const ref = manifest.reports.filter((report) => report.kind === "rollback").at(-1)!;
+      return join(lcmHomeDir(h.homeDir), "migration-reports", h.members[index]!.generationId, ref.reportId + ".json");
+    };
+    const original = readFileSync(reportPath(1));
+    chmodSync(reportPath(1), 0o600);
+    writeFileSync(reportPath(1), readFileSync(reportPath(0)));
+    chmodSync(reportPath(1), 0o400);
+    refused(h, 0, own, "does not name its frozen witness");
+    chmodSync(reportPath(1), 0o600);
+    writeFileSync(reportPath(1), original);
+    chmodSync(reportPath(1), 0o400);
+    admitted(h, 0, own, "sqlite");
+    const config = join(lcmHomeDir(h.homeDir), "config.json");
+    writeFileSync(config, "{}\n", { mode: 0o600 });
+    refused(h, 0, own, "the configuration selects , not the restored sqlite installation");
+    chmodSync(config, 0o200);
+    refused(h, 0, own, "selected installation cannot be read");
+    chmodSync(config, 0o600);
+    writeConfig(h.homeDir, "sqlite");
+    admitted(h, 0, own, "sqlite");
   });
 });
 
