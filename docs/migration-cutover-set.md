@@ -5,14 +5,15 @@ more than one project. One maintenance hold covers the whole set, and every
 project in it is captured under that hold. This page defines the set, the
 refusals that keep it all-or-nothing, and how a capture is bound to it.
 
-> **Status.** This page describes the contract and the preparation service
-> behind it. No `lcm migration` command enters or prepares a set yet: the
-> operator commands to prepare, activate and roll back a set arrive with later
-> children of the multi-project cutover epic (#1544). Until then, activation
-> and rollback keep their single-project refusals
-> (`uncovered-projects`, `multiple-remote-projects`), and a machine
-> with data for one project behaves exactly as described in
-> [Reversible migration and cutover journal](migration-cutover.md).
+> **Status.** This page describes the contract and the preparation and
+> activation services behind it. No `lcm migration` command enters, prepares
+> or activates a set yet: the operator commands to prepare, activate and roll
+> back a set arrive with later children of the multi-project cutover epic
+> (#1544). Until then, the single-generation activation and rollback commands
+> keep their single-project refusals (`uncovered-projects`,
+> `multiple-remote-projects`), a member of a held set cannot be activated
+> through them, and a machine with data for one project behaves exactly as
+> described in [Reversible migration and cutover journal](migration-cutover.md).
 
 ## What a set contains
 
@@ -75,11 +76,13 @@ While the set is held:
 - its queue-evidence hash is derived from the member bindings and moves as
   members are captured; it is never an independent value.
 
-Selection of a backend is not defined for a set yet: a set journal cannot enter
-the selection phases, and activation writer quiescence reports
-`cutover-set-unsupported`. Replay admission refuses every generation while a
-set hold is live, so a member's earlier selection can never admit a replay
-under an unsettled set.
+A set selects its backend as one complete tuple (see
+[Activating a set](#activating-a-set)): the journal enters the selection phases
+only with the tuple that names every member's selected evidence, and the
+single-generation writer quiescence check still reports
+`cutover-set-unsupported` for a set hold. Replay admission refuses every
+generation while a set hold is live or selected but not yet published, so a
+member's earlier selection can never admit a replay under an unsettled set.
 
 ## Per-member queue-cutoff evidence
 
@@ -176,9 +179,139 @@ single-generation hold, an unsettled earlier set, a builder refusal, a moved
 confirmation) leave the set unheld; any identity writes made before a later
 refusal are reported per member and are not undone.
 
+## Activating a set
+
+Activation takes a prepared set and binds every member to PostgreSQL in one
+publication. The service is internal until #1551 exposes it; it is called with
+the home, the confirmed set id and the one resolved target, whose migration
+role is the activation role (the runtime grants are applied, and the migration
+grants revoked, after activation, as for a single generation).
+
+### Every member is revalidated first
+
+Before any member's manifest moves, the whole set is checked under one
+publication barrier, and the set is refused on the first failing condition of
+the home or, for member conditions, with every failing member named:
+
+- the set must be held (an entering set must finish its preparation; an aborted
+  set is never revived, even if an earlier activation attempt left a
+  checkpoint behind);
+- the stored-data projects must still be exactly the held members with the
+  source selections the hold bound (`cutover-set-membership-drift`,
+  `cutover-set-authority-drifted`), and project-map coverage must hold;
+- a set that was held before the selection tuple existed and could outgrow the
+  journal read limit once selected is refused (`cutover-set-too-large`) and
+  stays abortable;
+- for each member: its persisted project-map path, its destination project, its
+  generation family under the supplied target, its captured queue cutoff, its
+  sealed snapshot, a verified and eligible manifest with its matching report,
+  its generation link, the project-map witness, the copy binding read back
+  from the destination transfer ledger, the live destination identity, one
+  activation lease per destination project under the set id, writer
+  quiescence attributed to that member's own binding, target health, and a
+  fresh read-only census of its destination project compared with its report.
+
+A member whose evidence is missing, no longer eligible or disagrees with its
+report is `stale`; one whose source, map, identity or binding changed is
+`drifted`; one whose state cannot be read or fenced is `unverifiable`; a
+member with no manifest or no capture is `absent`. The refusal reason is the
+selection rule's (`cutover-set-member-evidence-stale`,
+`cutover-set-member-evidence-drifted`,
+`cutover-set-member-evidence-unverifiable`,
+`cutover-set-member-evidence-absent`), with each member's own reason beside it.
+A refusal begins no member effect, leaves the hold and every member's
+evidence intact, and releases the leases it acquired; the composed activation
+artifact may already be persisted (it is reused byte-identically by the next
+call) and the coverage check may have reconciled the project map. No member's
+evidence is ever inferred from another's, and no time, count or heuristic
+decides eligibility.
+
+### One checkpoint, member effects, one selection, one publication
+
+Once every member passes, the publication material is composed once for all
+members and sealed as one activation artifact, and an immutable **activation
+checkpoint** records the set manifest, the held journal checksum, the shared
+publication id (the set id), the artifact identity and, per member, its
+destination project, held binding digest, copy binding, frozen verified
+manifest revision and verification report. After the checkpoint nothing is
+recomposed: a resume reads the checkpoint and the artifact it names.
+
+Each member then receives its own activation effects in manifest order
+(prepare-activation, publish-activation, its generation link to the shared
+artifact, its epoch, attempt, witness and witness binding), never derived from
+a sibling. With every member pending, the **selection tuple** is frozen: the
+complete list of every member's selected epoch, attempt and witness, bound to
+the checkpoint by digest. The journal then enters `selection-prepared` and
+`selection-completed` carrying that tuple; its terminal evidence is the
+tuple's checksum, and a held member binding digest, a single witness or a
+rehashed tuple is never accepted in its place. Each member's selection
+binding is written as an index onto the tuple, and the existing publication
+driver runs exactly once with every project, acquiring and releasing the
+members' fences itself.
+
+Between `selection-completed` and the completed publication the home is in a
+fenced handoff: the configuration and project map are still the old ones,
+ordinary consumers that derive the backend from the configuration refuse the
+unresolved publication, and no member replays. The effective home is therefore
+always complete-old, complete-new or explicitly unresolved, never one project
+on each backend. A running daemon keeps its prior backend until it restarts,
+as for a single generation.
+
+### After the publication
+
+Target health is observed once. An unhealthy target returns
+`post-publication-unhealthy` before any member report is stored: the selected
+backend and every member's evidence stay, and the next call settles the
+members. Otherwise each member's post-publication project-map witness is
+compared with its verified witness, its deterministic activation report is
+stored and its publish-activation effect completes. A witness mismatch, a
+report conflict or an uncertain write stops with an interruption that keeps
+the completed publication and the selection; `publication-failed` names only
+a publication the driver confirmed aborted, after which every member's replay
+stays unresolved despite its selection index (the only automatic re-prepare is
+the driver's pre-seal aborted shape). Any other driver outcome (an unsatisfied
+or unresolvable fence, a colliding journal, missing or unreadable artifact
+material, a publication that cannot be attributed) is an interruption that
+keeps the selection, the member evidence and the journal for the next call.
+
+### Crash recovery
+
+Calling the activation again with the same set id resumes from durable state
+and never admits a mixed selection:
+
+| Interrupted at | Resume |
+| --- | --- |
+| Any check, lease or the artifact before the checkpoint | nothing moved; the orphan artifact is reused byte-identically |
+| After the checkpoint, before or between member effects | every member is revalidated; begun effects and their leases are kept, missing steps finish |
+| After the frozen tuple, before or at the selection phases | the frozen attempts are adopted, never re-minted; the same tuple is prepared and completed |
+| `selection-completed`, before or during the publication | member indexes are repaired from the tuple and the one publication is driven on |
+| After the completed publication | members settle from their own evidence; an already active member authenticates its report and is skipped |
+| The set journal gone before the first publication write (empty slot) | with every member pending and its activation report directory positively absent, the frozen artifact is prepared fresh; with every member active the activation is reported from their reports; anything mixed, any report present or a report directory that cannot be authenticated is interrupted and nothing is republished |
+| The slot occupied by another hold or publication | with every member active the activation is reported from their reports; otherwise it is interrupted and nothing is prepared over the occupant |
+
+A lease that expires before the tuple is frozen is taken over and that
+member's attempt re-minted; after the freeze a takeover keeps the frozen
+attempts and reports that member's successor token on its own member row. A
+lost lease or an unreadable state is an interruption that preserves evidence,
+never a fresh refusal claiming nothing happened. Leases are released by a
+refusal and by an interruption whose members are all positively unbegun (no
+member manifest moved); once any member effect exists the leases are retained
+for the roll-forward.
+
+### Replay after a set activation
+
+A member's replay evidence is admitted only through the set's records: the
+member's selection index must restate its row of the frozen tuple, and then
+either the set's completed publication must cover exactly the artifact's
+projects, or, once a later publication has replaced that journal, the member's
+own active manifest and its activation report must name this set's
+publication, artifact and witness. A bare index, a report-only member and an
+aborted set publication refuse.
+
 ## Releasing a set hold
 
-A set hold is released with `lcm migration abort --confirm-generation <set id>`,
+A set hold is released, before its selection, with
+`lcm migration abort --confirm-generation <set id>`,
 with or without `--generation <set id>`. The confirmation is always the set
 id, never a member's generation id. The journal records the abort and keeps the
 source backend selected, and the same invocation settles every member
@@ -188,7 +321,9 @@ pending copy effect refuses the abort with that member's evidence, written as
 `resume` next step (finish it with a preparation resume first), and the journal is terminalized only if it is
 not already. Running the abort again after an interruption converges the
 members it left unsettled, including a member whose abort effect was begun and
-not completed. The command reports success only after every member is absent
+not completed. A set whose members already carry activation effects, or whose
+journal has reached the selection phases, refuses the abort rather than
+deleting activation evidence; resume the activation instead. The command reports success only after every member is absent
 or aborted with nothing pending, and a new preparation or single-generation
 apply is refused (`abort-or-resume-required`) while a member of an earlier set
 is not settled.

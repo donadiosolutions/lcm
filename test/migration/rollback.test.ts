@@ -64,6 +64,7 @@ import {
 } from "../../src/migration/generation-binding-store.js";
 import { originalRollbackPreemption, readRollbackPreemptionRecord } from "../../src/migration/rollback-install.js";
 import { assertMigrationReplayAdmission } from "../../src/migration/maintenance.js";
+import { deriveActivationPublicationId } from "../../src/migration/activation-publication-id.js";
 import {
   FIXTURE_LOCAL_PROJECT_ID,
   FIXTURE_REMOTE_PROJECT_ID,
@@ -1543,6 +1544,7 @@ describe("donadiosolutions/lcm#1431: selection-completes-but-binding-not-yet-wri
     const census = fixtureCensusVector("a16-census");
     const scenarioFor = (generationId: string) => fixtureActivationScenario({
       generationId, destinationIdentity, censusVector: census, canonicalDeltaBaseline: baseline,
+      publicationId: deriveActivationPublicationId(generationId),
     });
     const unchangedSession = async () => fakeSession({
       observations: [{
@@ -1566,11 +1568,13 @@ describe("donadiosolutions/lcm#1431: selection-completes-but-binding-not-yet-wri
       recordMigrationSelectionBinding({ homeDir, generationId, binding: scenario.selection });
       return scenario;
     }
-    /** Real stores and real recorders throughout; a coordinator, a session and overrides vary. */
+    /** Real stores and real recorders throughout; a coordinator, a session and overrides vary. The retained
+     * publication names the derived activation publication id the scenario's binding carries. */
     const depsFor = (homeDir: string, extra: Partial<RunMigrationRollbackDependencies> = {}): RunMigrationRollbackDependencies => ({
       coordinator: coordinatorFor(homeDir),
       recordActivationWitness: recordMigrationActivationWitness,
       openFencedSession: unchangedSession,
+      readRetainedMaterial: () => retainedActivationPublication(deriveActivationPublicationId(GEN)),
       ...extra,
     });
     const realUnlinkSync = (createRequire(import.meta.url)("node:fs") as { unlinkSync: (p: string) => void }).unlinkSync;

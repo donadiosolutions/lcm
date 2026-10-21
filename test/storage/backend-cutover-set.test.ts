@@ -7,13 +7,18 @@ import {
   BackendPublicationJournalError,
   backendCutoverSetJournalCapacity,
   backendCutoverSetManifestSha256,
+  backendCutoverSetSelectionSha256,
+  backendCutoverSetSelectionWorstCase,
   backendMaintenanceQueueEvidenceSentinel,
   backendPublicationCanonicalSha256,
   backendPublicationJournalPath,
+  parseBackendCutoverSetSelection,
   readBackendMaintenanceJournal,
   rebindBackendMaintenanceCutoff,
   resolveBackendMaintenanceGenerationBinding,
   withBackendPublicationAppendBarrierAsync,
+  type BackendCutoverSetManifest,
+  type BackendCutoverSetSelection,
   type BackendMaintenanceJournal,
   type BackendPublicationDriver,
 } from "../../src/storage/backend-publication.js";
@@ -511,3 +516,333 @@ describe("cutover-set journal", () => {
     });
   });
 });
+
+
+// ---------------------------------------------------------------------------
+// #1549: the complete set selection tuple and the selection transitions.
+// ---------------------------------------------------------------------------
+
+const REMOTE_A = "018f22c4-6d2a-7f10-8a4c-6b8d3e5f9001";
+const REMOTE_B = "018f22c4-6d2a-7f10-8a4c-6b8d3e5f9002";
+const REMOTE_C = "018f22c4-6d2a-7f10-8a4c-6b8d3e5f9003";
+const HEX = (value: string) => value.repeat(64);
+
+type SelectionBody = Omit<BackendCutoverSetSelection, "checksumSha256">;
+
+/** A complete tuple for the manifest, with a reproduced checksum (unless overridden after sealing). */
+function selectionFor(manifest: BackendCutoverSetManifest, edit: (body: Record<string, any>) => void = () => undefined): BackendCutoverSetSelection {
+  const body: Record<string, any> = {
+    version: 1,
+    kind: "cutover-set-selection",
+    checkpointSha256: HEX("c"),
+    setId: manifest.setId,
+    manifestSha256: backendCutoverSetManifestSha256(manifest),
+    publicationId: manifest.setId,
+    identityDigest: HEX("d"),
+    sourceBackend: "sqlite",
+    targetBackend: "postgresql",
+    members: manifest.members.map((member, index) => ({
+      physicalProjectId: member.physicalProjectId,
+      generationId: member.generationId,
+      remoteProjectId: [REMOTE_A, REMOTE_B, REMOTE_C][index]!,
+      copyBindingSha256: HEX(String(index + 1)),
+      epochId: HEX("e"),
+      attemptId: HEX("a"),
+      epochManifestRevision: 8,
+      epochManifestChecksumSha256: HEX("b"),
+      witnessChecksumSha256: HEX(String(index + 4)),
+    })),
+  };
+  edit(body);
+  return { ...(body as SelectionBody), checksumSha256: backendCutoverSetSelectionSha256(body as SelectionBody) };
+}
+
+/** Bind every member off its sentinel so the hold looks like a prepared set. */
+async function boundSet(homeDir: string, count = 3): Promise<BackendMaintenanceJournal> {
+  const { held } = await enterSet(homeDir, count);
+  let current = held;
+  for (const member of held.cutoverSet!.manifest.members) {
+    const view = resolveBackendMaintenanceGenerationBinding(current, member.generationId)!;
+    current = await rebind(homeDir, current, member.generationId, view.checksumSha256);
+  }
+  return current;
+}
+
+function prepareInput(journal: BackendMaintenanceJournal, selection: BackendCutoverSetSelection, overrides: Record<string, unknown> = {}) {
+  return {
+    expectedChecksumSha256: journal.checksumSha256,
+    generationId: journal.generationId,
+    targetBackend: "postgresql" as const,
+    terminalEvidenceSha256: selection.checksumSha256,
+    cutoverSetSelection: selection,
+    ...overrides,
+  } as Parameters<BackendPublicationCoordinator["prepareMaintenanceSelection"]>[0];
+}
+
+describe("cutover-set selection tuple (#1549)", () => {
+  it("prepares one selection-prepared journal carrying every member, then completes the same tuple", async () => {
+    const homeDir = home();
+    const held = await boundSet(homeDir);
+    const manifest = held.cutoverSet!.manifest;
+    const selection = selectionFor(manifest);
+    const prepared = await coordinator(homeDir).prepareMaintenanceSelection(prepareInput(held, selection));
+    expect(prepared).toMatchObject({
+      phase: "selection-prepared", targetBackend: "postgresql", selectedGenerationId: SET_ID,
+      terminalEvidenceSha256: selection.checksumSha256, abortEvidenceSha256: null,
+    });
+    expect(prepared.cutoverSet!.selection).toEqual(selection);
+    expect(prepared.cutoverSet!.bindings).toEqual(held.cutoverSet!.bindings);
+    expect(readBackendMaintenanceJournal(homeDir)).toEqual(prepared);
+    // The held member digests are no longer the live member digests, and the live digest is not selection input.
+    for (const member of manifest.members) {
+      expect(resolveBackendMaintenanceGenerationBinding(prepared, member.generationId)!.checksumSha256)
+        .not.toBe(resolveBackendMaintenanceGenerationBinding(held, member.generationId)!.checksumSha256);
+    }
+    const completed = await coordinator(homeDir).completeMaintenanceSelection({
+      expectedChecksumSha256: prepared.checksumSha256, generationId: SET_ID, terminalEvidenceSha256: selection.checksumSha256,
+    });
+    expect(completed).toMatchObject({ phase: "selection-completed", terminalEvidenceSha256: selection.checksumSha256 });
+    expect(completed.cutoverSet).toEqual(prepared.cutoverSet);
+    expect(readBackendMaintenanceJournal(homeDir)).toEqual(completed);
+    // A later hold archives the terminal set journal exactly as an aborted one.
+    const next = await coordinator(homeDir).enterMaintenance({
+      publicationId: "migration-generation-2", generationId: "generation-2", sourceSelectionSha256: HASH_A,
+      queueEvidenceSha256: HASH_B, roster: [{ machineId: SET_MACHINE_ID, queueCutoff: null, evidenceSha256: HASH_B }], now: NOW,
+    });
+    expect("cutoverSet" in next).toBe(false);
+  });
+
+  it("never accepts a held member binding digest, a bare witness or a rehashed tuple as the selection", async () => {
+    const homeDir = home();
+    const held = await boundSet(homeDir);
+    const manifest = held.cutoverSet!.manifest;
+    const selection = selectionFor(manifest);
+    const heldDigest = resolveBackendMaintenanceGenerationBinding(held, manifest.members[0]!.generationId)!.checksumSha256;
+    // The held digest offered as the terminal evidence of a valid tuple contradicts the tuple.
+    await expect(coordinator(homeDir).prepareMaintenanceSelection(prepareInput(held, selection, { terminalEvidenceSha256: heldDigest })))
+      .rejects.toMatchObject({ reason: "invalid-input", message: expect.stringContaining("contradicts") });
+    // The held digest, or any member witness, offered as the tuple checksum does not reproduce the tuple.
+    for (const forged of [heldDigest, selection.members[0]!.witnessChecksumSha256]) {
+      const tuple = { ...selection, checksumSha256: forged };
+      await expect(coordinator(homeDir).prepareMaintenanceSelection(prepareInput(held, tuple)))
+        .rejects.toMatchObject({ reason: "invalid-input", message: expect.stringContaining("checksum does not match") });
+    }
+    // A tuple-less prepare on a set hold keeps refusing; a tuple on a single-generation hold is contradictory input.
+    await expect(coordinator(homeDir).prepareMaintenanceSelection({
+      expectedChecksumSha256: held.checksumSha256, generationId: SET_ID, targetBackend: "postgresql", terminalEvidenceSha256: selection.checksumSha256,
+    })).rejects.toMatchObject({ reason: "unexpected-state" });
+    expect(readBackendMaintenanceJournal(homeDir)).toEqual(held);
+    const single = home();
+    const singleHeld = await coordinator(single).enterMaintenance({
+      publicationId: "migration-generation-1", generationId: "generation-1", sourceSelectionSha256: HASH_A, queueEvidenceSha256: HASH_B,
+      roster: [{ machineId: SET_MACHINE_ID, queueCutoff: "0000000000000000012", evidenceSha256: HASH_A }], now: NOW,
+    });
+    await expect(coordinator(single).prepareMaintenanceSelection({
+      expectedChecksumSha256: singleHeld.checksumSha256, generationId: "generation-1", targetBackend: "postgresql",
+      terminalEvidenceSha256: selection.checksumSha256, cutoverSetSelection: selection,
+    })).rejects.toMatchObject({ reason: "invalid-input", message: expect.stringContaining("single-generation") });
+    expect(readBackendMaintenanceJournal(single)).toEqual(singleHeld);
+  });
+
+  it("refuses every contradictory prepare input and preserves the CAS and phase classification", async () => {
+    const homeDir = home();
+    const held = await boundSet(homeDir);
+    const manifest = held.cutoverSet!.manifest;
+    const selection = selectionFor(manifest);
+    const run = (overrides: Record<string, unknown>) => coordinator(homeDir).prepareMaintenanceSelection(prepareInput(held, selection, overrides));
+    await expect(run({ generationId: manifest.members[0]!.generationId })).rejects.toMatchObject({ reason: "invalid-input", message: expect.stringContaining("contradicts") });
+    await expect(run({ targetBackend: "sqlite" })).rejects.toMatchObject({ reason: "invalid-input", message: expect.stringContaining("contradicts") });
+    await expect(run({ terminalEvidenceSha256: HASH_B })).rejects.toMatchObject({ reason: "invalid-input", message: expect.stringContaining("contradicts") });
+    await expect(run({ cutoverSetSelection: { ...selection, extra: 1 } })).rejects.toMatchObject({ reason: "invalid-input", message: expect.stringContaining("malformed") });
+    await expect(run({ terminalEvidenceSha256: "nope" })).rejects.toMatchObject({ reason: "invalid-input", message: expect.stringContaining("selection input is malformed") });
+    await expect(run({ expectedChecksumSha256: HASH_A })).rejects.toMatchObject({ reason: "unexpected-state", message: expect.stringContaining("held state") });
+    expect(readBackendMaintenanceJournal(homeDir)).toEqual(held);
+    const prepared = await coordinator(homeDir).prepareMaintenanceSelection(prepareInput(held, selection));
+    await expect(coordinator(homeDir).prepareMaintenanceSelection(prepareInput(prepared, selection)))
+      .rejects.toMatchObject({ reason: "unexpected-state" });
+    await expect(coordinator(homeDir).completeMaintenanceSelection({
+      expectedChecksumSha256: prepared.checksumSha256, generationId: SET_ID, terminalEvidenceSha256: HASH_B,
+    })).rejects.toMatchObject({ reason: "unexpected-state" });
+    await expect(coordinator(homeDir).abortMaintenance({
+      expectedChecksumSha256: prepared.checksumSha256, sourceSelectionSha256: prepared.sourceSelectionSha256, abortEvidenceSha256: HASH_B,
+    })).rejects.toMatchObject({ reason: "unexpected-state" });
+    expect(readBackendMaintenanceJournal(homeDir)).toEqual(prepared);
+  });
+
+  describe("parser", () => {
+    const manifest = setManifest(3);
+    const cases: readonly (readonly [string, RegExp, (body: Record<string, any>) => void])[] = [
+      ["an extra key", /selection is malformed/, (b) => { b.extra = 1; }],
+      ["a missing key", /selection is malformed/, (b) => { delete b.identityDigest; }],
+      ["another set id", /selection is malformed/, (b) => { b.setId = "cutover-set-2"; }],
+      ["another manifest digest", /selection is malformed/, (b) => { b.manifestSha256 = HASH_A; }],
+      ["a publication id that is not the set id", /selection is malformed/, (b) => { b.publicationId = "other"; }],
+      ["a postgresql source", /selection is malformed/, (b) => { b.sourceBackend = "postgresql"; }],
+      ["a sqlite target", /selection is malformed/, (b) => { b.targetBackend = "sqlite"; }],
+      ["a missing member", /selection is malformed/, (b) => { b.members.pop(); }],
+      ["an extra member", /selection is malformed/, (b) => { b.members.push({ ...b.members[0] }); }],
+      ["a duplicate member", /member\[1\] is malformed/, (b) => { b.members[1] = { ...b.members[0] }; }],
+      ["reordered members", /member\[0\] is malformed/, (b) => { b.members.reverse(); }],
+      ["a wrong generation", /member\[2\] is malformed/, (b) => { b.members[2].generationId = "member-generation-9"; }],
+      ["a wrong project", /member\[0\] is malformed/, (b) => { b.members[0].physicalProjectId = HASH_A; }],
+      ["a malformed remote id", /member\[0\] is malformed/, (b) => { b.members[0].remoteProjectId = "not-a-uuid"; }],
+      ["a repeated remote id", /remote projects are not unique/, (b) => { b.members[1].remoteProjectId = b.members[0].remoteProjectId; }],
+      ["a negative revision", /member\[0\] is malformed/, (b) => { b.members[0].epochManifestRevision = -1; }],
+      ["a fractional revision", /member\[0\] is malformed/, (b) => { b.members[0].epochManifestRevision = 1.5; }],
+      ["a member key missing", /member\[1\] is malformed/, (b) => { delete b.members[1].attemptId; }],
+      ["a short witness checksum", /member\[1\] is malformed/, (b) => { b.members[1].witnessChecksumSha256 = "abc"; }],
+    ];
+    for (const [label, pattern, edit] of cases) {
+      it("refuses " + label, () => {
+        expect(() => parseBackendCutoverSetSelection(selectionFor(manifest, edit), manifest))
+          .toThrow(expect.objectContaining({ reason: "malformed-journal", message: expect.stringMatching(pattern) }));
+      });
+    }
+    it("refuses a tampered field whose checksum was not recomputed, and accepts the reproduced tuple", () => {
+      const selection = selectionFor(manifest);
+      expect(() => parseBackendCutoverSetSelection({ ...selection, members: selection.members.map((m, i) => i === 0 ? { ...m, attemptId: HASH_B } : m) }, manifest))
+        .toThrow(expect.objectContaining({ message: expect.stringMatching(/checksum does not match/) }));
+      expect(parseBackendCutoverSetSelection(selection, manifest)).toEqual(selection);
+      expect(parseBackendCutoverSetSelection(JSON.parse(JSON.stringify(selection)), manifest)).toEqual(selection);
+    });
+  });
+
+  describe("journal invariants", () => {
+    it("refuses a selection at a held phase, a selection phase without one, and top-level disagreement", async () => {
+      const homeDir = home();
+      const held = await boundSet(homeDir);
+      const selection = selectionFor(held.cutoverSet!.manifest);
+      const expectMalformed = (edit: (p: Payload) => void) => {
+        rewrite(homeDir, edit);
+        expect(() => readBackendMaintenanceJournal(homeDir)).toThrow(expect.objectContaining({ reason: "malformed-journal" }));
+      };
+      const snapshot = journalFile(homeDir);
+      const restore = () => { writeFileSync(backendPublicationJournalPath(homeDir), JSON.stringify(snapshot)); };
+      expectMalformed((p) => { p.cutoverSet.selection = selection; });
+      restore();
+      const selected = (p: Payload) => {
+        p.phase = "selection-completed"; p.targetBackend = "postgresql"; p.selectedGenerationId = SET_ID;
+        p.terminalEvidenceSha256 = selection.checksumSha256; p.cutoverSet.selection = selection;
+      };
+      expectMalformed((p) => { selected(p); delete p.cutoverSet.selection; });
+      restore();
+      expectMalformed((p) => { selected(p); p.terminalEvidenceSha256 = HASH_B; });
+      restore();
+      expectMalformed((p) => { selected(p); p.targetBackend = "sqlite"; });
+      restore();
+      expectMalformed((p) => { selected(p); p.sourceBackend = "postgresql"; });
+      restore();
+      expectMalformed((p) => { p.phase = "maintenance-aborted"; p.abortEvidenceSha256 = HASH_B; p.cutoverSet.selection = selection; });
+      restore();
+      rewrite(homeDir, selected);
+      expect(readBackendMaintenanceJournal(homeDir)).toMatchObject({ phase: "selection-completed", cutoverSet: { selection } });
+    });
+  });
+
+  describe("capacity", () => {
+    /** The worst case with a real manifest digest, distinct remote ids and a reproduced checksum: same width, parseable. */
+    function widestSelection(manifest: BackendCutoverSetManifest): BackendCutoverSetSelection {
+      const worst = backendCutoverSetSelectionWorstCase(manifest);
+      const body = {
+        ...worst,
+        manifestSha256: backendCutoverSetManifestSha256(manifest),
+        members: worst.members.map((member, index) => ({ ...member, remoteProjectId: "ffffffff-ffff-7fff-bfff-" + index.toString(16).padStart(12, "0") })),
+      };
+      return { ...body, checksumSha256: backendCutoverSetSelectionSha256(body) };
+    }
+
+    function abortWorstBytes(manifest: BackendCutoverSetManifest): number {
+      const hex = "f".repeat(64);
+      return Buffer.byteLength(JSON.stringify({
+        version: 3, publicationId: manifest.setId, sourceBackend: "postgresql", targetBackend: null, phase: "maintenance-aborted",
+        createdAt: "+275760-09-13T00:00:00.000Z", updatedAt: "+275760-09-13T00:00:00.000Z", generationId: manifest.setId,
+        sourceSelectionSha256: hex, queueEvidenceSha256: hex,
+        roster: [{ machineId: manifest.machineId, queueCutoff: null, evidenceSha256: hex }],
+        selectedGenerationId: null, terminalEvidenceSha256: null, abortEvidenceSha256: hex,
+        cutoverSet: { manifest, bindings: manifest.members.map((m) => ({ generationId: m.generationId, queueEvidenceSha256: hex,
+          roster: [{ machineId: manifest.machineId, queueCutoff: "9223372036854775807", evidenceSha256: hex }] })) },
+        checksumSha256: hex,
+      })) + 1;
+    }
+
+    it("reserves the larger of the abort and the complete-selection shapes", () => {
+      const manifest = setManifest(3);
+      const entry = cutoverSetMaintenanceEntry(manifest);
+      const capacity = backendCutoverSetJournalCapacity(entry.cutoverSet);
+      const selectionBytes = Buffer.byteLength(JSON.stringify(backendCutoverSetSelectionWorstCase(manifest)));
+      expect(capacity.worstCaseBytes).toBeGreaterThan(abortWorstBytes(manifest));
+      expect(capacity.worstCaseBytes).toBeGreaterThan(selectionBytes);
+      expect(backendCutoverSetSelectionWorstCase(manifest).members).toHaveLength(3);
+      // The widest parseable tuple has exactly the worst case's byte length.
+      expect(Buffer.byteLength(JSON.stringify(widestSelection(manifest)))).toBe(selectionBytes);
+      expect(parseBackendCutoverSetSelection(widestSelection(manifest), manifest)).toEqual(widestSelection(manifest));
+    });
+
+    it("admits the largest membership whose complete selection is readable and refuses one more", async () => {
+      const entryFor = (size: number) => cutoverSetMaintenanceEntry({ ...setManifest(2), members: manyMembers(size) });
+      let low = 2;
+      let high = 3000;
+      while (low < high) {
+        const mid = Math.ceil((low + high) / 2);
+        if (backendCutoverSetJournalCapacity(entryFor(mid).cutoverSet).worstCaseBytes <= LIMIT) low = mid; else high = mid - 1;
+      }
+      const homeDir = home();
+      const held = await coordinator(homeDir).enterMaintenance({ ...entryFor(low), now: NOW });
+      await expect(coordinator(home()).enterMaintenance({ ...entryFor(low + 1), now: NOW }))
+        .rejects.toMatchObject({ reason: "invalid-input", message: expect.stringContaining("cutover-set-too-large") });
+      // Bind every member at the maximum cutoff and select with full-width hashes: both writes stay readable.
+      rewrite(homeDir, (payload) => {
+        payload.cutoverSet.bindings = payload.cutoverSet.bindings.map((binding: Payload) => ({
+          ...binding, queueEvidenceSha256: "f".repeat(64),
+          roster: [{ machineId: SET_MACHINE_ID, queueCutoff: "9223372036854775807", evidenceSha256: "f".repeat(64) }],
+        }));
+        payload.queueEvidenceSha256 = backendPublicationCanonicalSha256({
+          version: 1, kind: "cutover-set-queue-evidence",
+          bindings: payload.cutoverSet.bindings.map((b: Payload) => ({ generationId: b.generationId, queueEvidenceSha256: b.queueEvidenceSha256 })),
+        });
+      });
+      const bound = readBackendMaintenanceJournal(homeDir)!;
+      expect(bound.cutoverSet!.manifest).toEqual(held.cutoverSet!.manifest);
+      const selection = widestSelection(bound.cutoverSet!.manifest);
+      const prepared = await coordinator(homeDir).prepareMaintenanceSelection(prepareInput(bound, selection));
+      expect(readBackendMaintenanceJournal(homeDir)).toEqual(prepared);
+      const completed = await coordinator(homeDir).completeMaintenanceSelection({
+        expectedChecksumSha256: prepared.checksumSha256, generationId: SET_ID, terminalEvidenceSha256: selection.checksumSha256,
+      });
+      expect(readBackendMaintenanceJournal(homeDir)).toMatchObject({ phase: "selection-completed", cutoverSet: { selection } });
+      expect(completed.cutoverSet!.selection!.members).toHaveLength(low);
+    }, 120_000);
+
+    it("refuses to select a legacy held set that cannot fit its selection, which stays abortable", async () => {
+      const entryFor = (size: number) => cutoverSetMaintenanceEntry({ ...setManifest(2), members: manyMembers(size) });
+      // The largest membership whose abort shape fits although its complete selection does not.
+      let low = 2;
+      let high = 3000;
+      while (low < high) {
+        const mid = Math.ceil((low + high) / 2);
+        if (abortWorstBytes(entryFor(mid).cutoverSet.manifest) <= LIMIT) low = mid; else high = mid - 1;
+      }
+      const entry = entryFor(low);
+      expect(backendCutoverSetJournalCapacity(entry.cutoverSet).worstCaseBytes).toBeGreaterThan(LIMIT);
+      const homeDir = home();
+      await enterSet(homeDir, 2);
+      rewrite(homeDir, (payload) => {
+        payload.cutoverSet = entry.cutoverSet;
+        payload.sourceSelectionSha256 = entry.sourceSelectionSha256;
+        payload.queueEvidenceSha256 = entry.queueEvidenceSha256;
+        payload.roster = entry.roster;
+      });
+      const legacy = readBackendMaintenanceJournal(homeDir)!;
+      const selection = widestSelection(legacy.cutoverSet!.manifest);
+      await expect(coordinator(homeDir).prepareMaintenanceSelection(prepareInput(legacy, selection)))
+        .rejects.toMatchObject({ reason: "invalid-input", message: expect.stringContaining("cutover-set-too-large") });
+      expect(readBackendMaintenanceJournal(homeDir)).toEqual(legacy);
+      const aborted = await coordinator(homeDir).abortMaintenance({
+        expectedChecksumSha256: legacy.checksumSha256, sourceSelectionSha256: legacy.sourceSelectionSha256, abortEvidenceSha256: HASH_B,
+      });
+      expect(readBackendMaintenanceJournal(homeDir)).toEqual(aborted);
+      expect(aborted.phase).toBe("maintenance-aborted");
+    }, 120_000);
+  });
+});
+

@@ -41,7 +41,9 @@ import {
   restoreHomeLockTopologyMode,
 } from "./home-lock-topology.js";
 
-const MAX_JOURNAL_BYTES = 1 * 1024 * 1024;
+/** The readable journal bound every set record is admitted under as well (#1549). */
+export const BACKEND_PUBLICATION_MAX_JOURNAL_BYTES = 1 * 1024 * 1024;
+const MAX_JOURNAL_BYTES = BACKEND_PUBLICATION_MAX_JOURNAL_BYTES;
 const MAX_MATERIAL_BYTES = 8 * 1024 * 1024;
 const MAX_RECOVERY_FILE_BYTES = 4 * 1024 * 1024;
 const HASH_PATTERN = /^[0-9a-f]{64}$/u;
@@ -228,9 +230,46 @@ export type BackendCutoverSetBinding = Readonly<{
   roster: readonly BackendMaintenanceRosterEntry[];
 }>;
 
+/** One member row of the complete selection tuple a set binds (#1549). */
+export type BackendCutoverSetSelectionMember = Readonly<{
+  physicalProjectId: string;
+  generationId: string;
+  remoteProjectId: string;
+  copyBindingSha256: string;
+  epochId: string;
+  attemptId: string;
+  epochManifestRevision: number;
+  epochManifestChecksumSha256: string;
+  witnessChecksumSha256: string;
+}>;
+
+/**
+ * The complete terminal tuple of a set selection (#1549): every member's
+ * selected epoch, attempt and witness, aligned with the manifest, plus the
+ * shared publication and artifact identity and the activation checkpoint
+ * it descends from. Present only at the selection phases; its checksum is
+ * the journal's terminalEvidenceSha256, and the held member binding digest
+ * (cutoverMemberBindingChecksum) is never accepted in its place.
+ */
+export type BackendCutoverSetSelection = Readonly<{
+  version: 1;
+  kind: "cutover-set-selection";
+  checkpointSha256: string;
+  setId: string;
+  manifestSha256: string;
+  publicationId: string;
+  identityDigest: string;
+  sourceBackend: "sqlite";
+  targetBackend: "postgresql";
+  members: readonly BackendCutoverSetSelectionMember[];
+  checksumSha256: string;
+}>;
+
 export type BackendCutoverSet = Readonly<{
   manifest: BackendCutoverSetManifest;
   bindings: readonly BackendCutoverSetBinding[];
+  /** Present only while the journal is at selection-prepared or selection-completed. */
+  selection?: BackendCutoverSetSelection;
 }>;
 
 /** The fields a capture validates for one generation of a maintenance hold. */
@@ -283,6 +322,8 @@ export type PrepareBackendMaintenanceSelectionInput = Readonly<{
   generationId: string;
   targetBackend: StorageBackendName;
   terminalEvidenceSha256: string;
+  /** Required for a cutover-set hold and refused for a single-generation one (#1549). */
+  cutoverSetSelection?: BackendCutoverSetSelection;
 }>;
 
 export type AbortBackendMaintenanceInput = Readonly<{
@@ -1383,11 +1424,115 @@ function parseCutoverSetBindings(
 
 /** Strictly parse a cutover set (manifest plus aligned per-member bindings). */
 export function parseBackendCutoverSet(value: unknown): BackendCutoverSet {
-  if (!isRecord(value) || !exactKeys(value, ["bindings", "manifest"])) {
+  if (!isRecord(value) || !exactKeys(value, ["bindings", "manifest", ...(value.selection === undefined ? [] : ["selection"])])) {
     return fail("malformed-journal", "backend cutover set is malformed");
   }
   const manifest = parseBackendCutoverSetManifest(value.manifest);
-  return { manifest, bindings: parseCutoverSetBindings(value.bindings, manifest) };
+  const bindings = parseCutoverSetBindings(value.bindings, manifest);
+  if (value.selection === undefined) return { manifest, bindings };
+  return { manifest, bindings, selection: parseBackendCutoverSetSelection(value.selection, manifest) };
+}
+
+const SELECTION_MEMBER_KEYS = [
+  "attemptId", "copyBindingSha256", "epochId", "epochManifestChecksumSha256", "epochManifestRevision",
+  "generationId", "physicalProjectId", "remoteProjectId", "witnessChecksumSha256",
+] as const;
+const SELECTION_KEYS = [
+  "checkpointSha256", "checksumSha256", "identityDigest", "kind", "manifestSha256", "members",
+  "publicationId", "setId", "sourceBackend", "targetBackend", "version",
+] as const;
+
+/** The digest of a complete set selection tuple over every field but its own checksum. */
+export function backendCutoverSetSelectionSha256(
+  selection: Omit<BackendCutoverSetSelection, "checksumSha256">,
+): string {
+  const { checksumSha256: _checksum, ...body } = selection as
+    Omit<BackendCutoverSetSelection, "checksumSha256"> & Partial<Pick<BackendCutoverSetSelection, "checksumSha256">>;
+  return backendPublicationCanonicalSha256(body);
+}
+
+/**
+ * Strictly parse a complete set selection tuple against its manifest: every
+ * field present and well-formed, the members exactly the manifest's members
+ * in manifest order (no missing, extra, duplicate or reordered row), the set,
+ * manifest and publication identities those of the manifest, the backends
+ * sqlite -> postgresql, and the checksum reproduced. A tuple that does not
+ * reproduce its digest, or any other 64-hex string offered as one, is refused.
+ */
+export function parseBackendCutoverSetSelection(
+  value: unknown,
+  manifest: BackendCutoverSetManifest,
+): BackendCutoverSetSelection {
+  if (
+    !isRecord(value)
+    || !exactKeys(value, SELECTION_KEYS)
+    || value.version !== 1
+    || value.kind !== "cutover-set-selection"
+    || !HASH_PATTERN.test(String(value.checkpointSha256))
+    || !HASH_PATTERN.test(String(value.checksumSha256))
+    || !HASH_PATTERN.test(String(value.identityDigest))
+    || value.setId !== manifest.setId
+    || value.manifestSha256 !== backendCutoverSetManifestSha256(manifest)
+    || value.publicationId !== manifest.setId
+    || value.sourceBackend !== "sqlite"
+    || value.targetBackend !== "postgresql"
+    || !Array.isArray(value.members)
+    || value.members.length !== manifest.members.length
+  ) {
+    return fail("malformed-journal", "backend cutover-set selection is malformed");
+  }
+  const members = value.members.map((item, index): BackendCutoverSetSelectionMember => {
+    const expected = manifest.members[index]!;
+    if (
+      !isRecord(item)
+      || !exactKeys(item, SELECTION_MEMBER_KEYS)
+      || item.physicalProjectId !== expected.physicalProjectId
+      || item.generationId !== expected.generationId
+      || typeof item.remoteProjectId !== "string"
+      || !CANONICAL_UUID.test(item.remoteProjectId)
+      || !HASH_PATTERN.test(String(item.copyBindingSha256))
+      || !HASH_PATTERN.test(String(item.epochId))
+      || !HASH_PATTERN.test(String(item.attemptId))
+      || !HASH_PATTERN.test(String(item.epochManifestChecksumSha256))
+      || !HASH_PATTERN.test(String(item.witnessChecksumSha256))
+      || typeof item.epochManifestRevision !== "number"
+      || !Number.isSafeInteger(item.epochManifestRevision)
+      || item.epochManifestRevision < 0
+    ) {
+      return fail("malformed-journal", `backend cutover-set selection member[${index}] is malformed`);
+    }
+    return {
+      physicalProjectId: item.physicalProjectId,
+      generationId: item.generationId,
+      remoteProjectId: item.remoteProjectId,
+      copyBindingSha256: item.copyBindingSha256 as string,
+      epochId: item.epochId as string,
+      attemptId: item.attemptId as string,
+      epochManifestRevision: item.epochManifestRevision,
+      epochManifestChecksumSha256: item.epochManifestChecksumSha256 as string,
+      witnessChecksumSha256: item.witnessChecksumSha256 as string,
+    };
+  });
+  if (new Set(members.map((member) => member.remoteProjectId)).size !== members.length) {
+    return fail("malformed-journal", "backend cutover-set selection remote projects are not unique");
+  }
+  const selection: BackendCutoverSetSelection = {
+    version: 1,
+    kind: "cutover-set-selection",
+    checkpointSha256: value.checkpointSha256 as string,
+    setId: manifest.setId,
+    manifestSha256: value.manifestSha256 as string,
+    publicationId: manifest.setId,
+    identityDigest: value.identityDigest as string,
+    sourceBackend: "sqlite",
+    targetBackend: "postgresql",
+    members,
+    checksumSha256: value.checksumSha256 as string,
+  };
+  if (backendCutoverSetSelectionSha256(selection) !== selection.checksumSha256) {
+    return fail("malformed-journal", "backend cutover-set selection checksum does not match");
+  }
+  return selection;
 }
 
 export function backendCutoverSetEntryRoster(manifest: BackendCutoverSetManifest): readonly BackendMaintenanceRosterEntry[] {
@@ -1405,33 +1550,76 @@ export function backendCutoverSetEntryRoster(manifest: BackendCutoverSetManifest
 function assertCutoverSetJournal(
   journal: Omit<BackendMaintenanceJournal, "checksumSha256"> & Readonly<{ cutoverSet: BackendCutoverSet }>,
 ): void {
-  const { manifest, bindings } = journal.cutoverSet;
+  const { manifest, bindings, selection } = journal.cutoverSet;
+  const selectionPhase = journal.phase === "selection-prepared" || journal.phase === "selection-completed";
   if (
     journal.generationId !== manifest.setId
     || journal.publicationId !== manifest.setId
     || journal.sourceSelectionSha256 !== backendCutoverSetManifestSha256(manifest)
     || journal.queueEvidenceSha256 !== backendCutoverSetQueueEvidenceSha256(bindings)
     || !sameValue(journal.roster, backendCutoverSetEntryRoster(manifest))
-    || journal.phase === "selection-prepared"
-    || journal.phase === "selection-completed"
+    || selectionPhase !== (selection !== undefined)
+    || (selection !== undefined && (
+      journal.sourceBackend !== selection.sourceBackend
+      || journal.targetBackend !== selection.targetBackend
+      || journal.selectedGenerationId !== manifest.setId
+      || journal.terminalEvidenceSha256 !== selection.checksumSha256
+    ))
   ) {
     return fail("malformed-journal", "backend cutover-set journal is inconsistent with its set");
   }
 }
 
 const LONGEST_ISO_TIMESTAMP = "+275760-09-13T00:00:00.000Z";
+const LONGEST_CANONICAL_UUID = "ffffffff-ffff-7fff-bfff-ffffffffffff";
+
+/** The largest selection tuple this manifest can carry: every hash at full
+ * width, the widest canonical UUID and the largest safe manifest revision. */
+export function backendCutoverSetSelectionWorstCase(manifest: BackendCutoverSetManifest): BackendCutoverSetSelection {
+  const hex = "f".repeat(64);
+  const body = {
+    version: 1 as const,
+    kind: "cutover-set-selection" as const,
+    checkpointSha256: hex,
+    setId: manifest.setId,
+    manifestSha256: hex,
+    publicationId: manifest.setId,
+    identityDigest: hex,
+    sourceBackend: "sqlite" as const,
+    targetBackend: "postgresql" as const,
+    members: manifest.members.map((member): BackendCutoverSetSelectionMember => ({
+      physicalProjectId: member.physicalProjectId,
+      generationId: member.generationId,
+      remoteProjectId: LONGEST_CANONICAL_UUID,
+      copyBindingSha256: hex,
+      epochId: hex,
+      attemptId: hex,
+      epochManifestRevision: Number.MAX_SAFE_INTEGER,
+      epochManifestChecksumSha256: hex,
+      witnessChecksumSha256: hex,
+    })),
+  };
+  return { ...body, checksumSha256: hex };
+}
 
 /**
  * The serialized size of the largest journal this set can reach: every member
- * cutoff bound, a terminal abort recorded, and the longest timestamps. A set
- * whose worst case exceeds the read limit would persist an unreadable hold.
+ * cutoff bound and the longest timestamps, under the larger of its two
+ * terminal shapes (a recorded abort, or a completed selection carrying the
+ * complete tuple; the two never coexist). A set whose worst case exceeds the
+ * read limit would persist an unreadable hold.
  */
 export function backendCutoverSetJournalCapacity(cutoverSet: BackendCutoverSet): Readonly<{
   worstCaseBytes: number;
   limitBytes: number;
 }> {
   const hex = "f".repeat(64);
-  const worst = {
+  const bindings = cutoverSet.bindings.map((binding) => ({
+    generationId: binding.generationId,
+    queueEvidenceSha256: hex,
+    roster: [{ machineId: cutoverSet.manifest.machineId, queueCutoff: "9223372036854775807", evidenceSha256: hex }],
+  }));
+  const aborted = {
     version: BACKEND_MAINTENANCE_VERSION,
     publicationId: cutoverSet.manifest.setId,
     sourceBackend: "postgresql",
@@ -1446,17 +1634,24 @@ export function backendCutoverSetJournalCapacity(cutoverSet: BackendCutoverSet):
     selectedGenerationId: null,
     terminalEvidenceSha256: null,
     abortEvidenceSha256: hex,
-    cutoverSet: {
-      manifest: cutoverSet.manifest,
-      bindings: cutoverSet.bindings.map((binding) => ({
-        generationId: binding.generationId,
-        queueEvidenceSha256: hex,
-        roster: [{ machineId: cutoverSet.manifest.machineId, queueCutoff: "9223372036854775807", evidenceSha256: hex }],
-      })),
-    },
+    cutoverSet: { manifest: cutoverSet.manifest, bindings },
     checksumSha256: hex,
   };
-  return { worstCaseBytes: Buffer.byteLength(`${canonicalJson(worst)}\n`), limitBytes: MAX_JOURNAL_BYTES };
+  const selected = {
+    ...aborted,
+    sourceBackend: "sqlite",
+    targetBackend: "postgresql",
+    phase: "selection-completed",
+    selectedGenerationId: cutoverSet.manifest.setId,
+    terminalEvidenceSha256: hex,
+    abortEvidenceSha256: null,
+    cutoverSet: { manifest: cutoverSet.manifest, bindings, selection: backendCutoverSetSelectionWorstCase(cutoverSet.manifest) },
+  };
+  const worstCaseBytes = Math.max(
+    Buffer.byteLength(`${canonicalJson(aborted)}\n`),
+    Buffer.byteLength(`${canonicalJson(selected)}\n`),
+  );
+  return { worstCaseBytes, limitBytes: MAX_JOURNAL_BYTES };
 }
 
 function assertCutoverSetJournalBytes(journal: BackendMaintenanceJournal): void {
@@ -4217,8 +4412,11 @@ export class BackendPublicationCoordinator {
     return this.#locked(async (directoryHandle) => {
       const journal = readMaintenanceJournalFromDirectory(this.#homeDir, directoryHandle);
       if (journal === null) return fail("publication-evidence-missing", "backend maintenance journal is missing");
-      if (journal.cutoverSet !== undefined) {
-        return fail("unexpected-state", "backend cutover-set selection is not supported yet");
+      if (journal.cutoverSet !== undefined && input.cutoverSetSelection === undefined) {
+        return fail("unexpected-state", "backend cutover-set selection is not supported yet without its complete selection tuple");
+      }
+      if (journal.cutoverSet === undefined && input.cutoverSetSelection !== undefined) {
+        return fail("invalid-input", "backend cutover-set selection tuple was supplied for a single-generation journal");
       }
       if (
         !HASH_PATTERN.test(input.expectedChecksumSha256)
@@ -4227,6 +4425,25 @@ export class BackendPublicationCoordinator {
         || (input.targetBackend !== "sqlite" && input.targetBackend !== "postgresql")
       ) {
         return fail("invalid-input", "backend maintenance selection input is malformed");
+      }
+      let selection: BackendCutoverSetSelection | undefined;
+      if (journal.cutoverSet !== undefined) {
+        // The set branch (#1549): the complete tuple is parsed against the held
+        // manifest (the parser refuses only through fail(), so every failure is
+        // malformed input here), and the top-level fields must restate it exactly.
+        try {
+          selection = parseBackendCutoverSetSelection(input.cutoverSetSelection, journal.cutoverSet.manifest);
+        } catch (error) {
+          return fail("invalid-input", `backend cutover-set selection tuple is malformed: ${(error as Error).message}`);
+        }
+        if (
+          input.generationId !== selection.setId
+          || input.targetBackend !== selection.targetBackend
+          || input.terminalEvidenceSha256 !== selection.checksumSha256
+          || journal.sourceBackend !== selection.sourceBackend
+        ) {
+          return fail("invalid-input", "backend cutover-set selection input contradicts its tuple");
+        }
       }
       if (
         journal.phase !== "maintenance-held"
@@ -4242,6 +4459,7 @@ export class BackendPublicationCoordinator {
         selectedGenerationId: input.generationId,
         terminalEvidenceSha256: input.terminalEvidenceSha256,
         updatedAt: new Date().toISOString(),
+        ...(selection === undefined ? {} : { cutoverSet: { ...journal.cutoverSet!, selection } }),
       });
       writeMaintenanceJournal(this.#homeDir, directoryHandle, prepared, journal.checksumSha256);
       return prepared;
