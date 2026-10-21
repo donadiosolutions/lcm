@@ -10,6 +10,7 @@ import {
   completePendingMigrationAbort,
   performMigrationAbort,
   classifyMigrationAbortRefusal,
+  abortManifestGenerationIds,
 } from "./abort.js";
 import { admitExistingMigrationCommand, refuseUnlessConfirmed } from "./cli-existing.js";
 import type { ExistingGenerationInput } from "./existing-generation.js";
@@ -171,7 +172,9 @@ async function runMigrationAbortCommand(input: MigrationAbortCommandInput): Prom
   // Row 5 (owner ruling R8): the journal is already maintenance-aborted and
   // the manifest is absent or aborted. Abort is a read-only confirmation:
   // nothing is written, and the settled pair is read back.
-  if (context.route.row === 5) return readback(false);
+  // A set journal never has a manifest of its own, so row 5 is no evidence
+  // about its members: it converges them before the readback (#1548 C8).
+  if (context.route.row === 5 && journal.cutoverSet === undefined) return readback(false);
 
   // Row 6 (owner ruling R10): the journal is aborted and the manifest carries
   // the abort effect an earlier run began. Complete that carried effect; the
@@ -257,34 +260,37 @@ function readbackSettledAbort(input: Readonly<{
     return readbackRefusal("abort-readback-mismatch");
   }
 
-  const presence = store.probeManifestPresence(journal.generationId);
-  if (presence.status === "unresolvable") {
-    return readbackRefusal("abort-unresolvable", `manifest-${presence.reason}`);
-  }
-  if (presence.status === "absent") {
+  // Every generation the journal settles (its own, or each set member) must be
+  // absent or settled with no pending effect.
+  const phases = new Set<string>();
+  for (const generationId of abortManifestGenerationIds(journal)) {
+    const presence = store.probeManifestPresence(generationId);
+    if (presence.status === "unresolvable") {
+      return readbackRefusal("abort-unresolvable", `manifest-${presence.reason}`);
+    }
     // Genuinely absent is a legitimate terminal state (aborted before
     // capture ever reached genesis), not a readback failure.
-    return { status: "ok", generationId: journal.generationId, journalPhase: finalJournal.phase, manifestPhase: null, applied };
-  }
-
-  let manifest;
-  try {
-    manifest = store.read(journal.generationId);
-  } catch (error) {
-    return readbackRefusal("abort-unresolvable", manifestProtocolEvidence(error));
-  }
-  const recovery = classifyMigrationRecovery(manifest);
-  if (recovery.action !== "settled") {
-    // performMigrationAbort itself would not have reported "completed"
-    // with an unsettled manifest, so this is a genuine readback
-    // disagreement rather than an expected state.
-    return readbackRefusal("abort-readback-mismatch");
+    if (presence.status === "absent") continue;
+    let manifest;
+    try {
+      manifest = store.read(generationId);
+    } catch (error) {
+      return readbackRefusal("abort-unresolvable", manifestProtocolEvidence(error));
+    }
+    const recovery = classifyMigrationRecovery(manifest);
+    if (recovery.action !== "settled") {
+      // performMigrationAbort itself would not have reported "completed"
+      // with an unsettled manifest, so this is a genuine readback
+      // disagreement rather than an expected state.
+      return readbackRefusal("abort-readback-mismatch");
+    }
+    phases.add(recovery.phase);
   }
   return {
     status: "ok",
     generationId: journal.generationId,
     journalPhase: finalJournal.phase,
-    manifestPhase: recovery.phase,
+    manifestPhase: phases.size === 0 ? null : [...phases].sort().join(","),
     applied,
   };
 }

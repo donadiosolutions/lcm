@@ -28,7 +28,7 @@ import {
 } from "./hold-entry.js";
 import { classifySqliteSnapshotArtifact } from "./sqlite-snapshot.js";
 import { PrivateMutationLockContentionError } from "../private-mutation-lock.js";
-import { classifyMigrationAbortGate } from "./abort.js";
+import { abortSetMemberGenerationIds, classifyMigrationAbortGate } from "./abort.js";
 import { MigrationManifestStore } from "./manifest-store.js";
 import type { AuthenticatedSqliteMigrationSnapshot } from "./queue-evidence.js";
 import type { MigrationExpectedIdentityResult } from "./cli-preflight.js";
@@ -458,6 +458,7 @@ async function continueUnderBarrier(
     const gate = classifyMigrationAbortGate({
       journalTerminal: true,
       generationId: journal.generationId,
+      generationIds: abortSetMemberGenerationIds(journal),
       manifestStore,
     });
     if (gate.status === "unresolvable") {
