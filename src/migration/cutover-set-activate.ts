@@ -1142,10 +1142,11 @@ async function preSelection(ctx: Context, held: BackendMaintenanceJournal): Prom
   }
   const bound = gate(ctx, "S0");
   if (bound !== null) return bound.exit;
-  // S2: one lease per remote project, in manifest order, all under the set id.
+  // S2: one lease per remote project, in manifest order, all under the set id. Every member is tried so the
+  // refusal names each independently failing one (F7); the gate releases whatever was acquired.
   for (const member of ctx.members) {
     const failure = await acquireMemberLease(ctx, member);
-    if (failure !== null) { fail(member, "unverifiable", failure.startsWith("lease-conflict") ? "lease-conflict" : "lease-unresolvable", failure); break; }
+    if (failure !== null) fail(member, "unverifiable", failure.startsWith("lease-conflict") ? "lease-conflict" : "lease-unresolvable", failure);
   }
   const leased = gate(ctx, "S2");
   if (leased !== null) return leased.exit;
@@ -1580,12 +1581,12 @@ async function finishAfterSelection(ctx: Context, ownV2: BackendPublicationJourn
   if (result.status === "aborted") {
     return { status: "publication-failed", setId: ctx.setId, publicationId: ctx.setId, publication: result, members: memberResults(ctx) };
   }
-  // S15: observed once for the home, never refused; an unhealthy target stops before any member report or completion (C4).
   if (result.status !== "completed") {
     // C4 (F3): only a confirmed abort is publication-failed. Any other driver outcome left the selection, the member
     // evidence and the journal as they were; the next call resumes from them.
     return interrupted(ctx, "S13b", DRIVE_INTERRUPTION_CAUSES[result.status], "the publication driver returned " + result.status + ": " + result.detail).exit;
   }
+  // S15: observed once for the home, never refused; an unhealthy target stops before any member report or completion (C4).
   const health = await observeHealth(ctx);
   const restart = await restartVerdict(ctx);
   if (health.status !== "healthy") {
@@ -1611,7 +1612,6 @@ async function finishAfterSelection(ctx: Context, ownV2: BackendPublicationJourn
   };
 }
 
-/** Whether a member's active manifest carries an authenticated activation report of this set's publication and witness. */
 /** How each non-terminal driver outcome is attributed when the set's publication did not complete or abort (F3). */
 const DRIVE_INTERRUPTION_CAUSES: Record<Exclude<ActivationPublicationStatus, "completed" | "aborted">, MigrationActivationInterruptionCause> = {
   "fence-unsatisfied": "lease-lost",
@@ -1625,6 +1625,7 @@ const DRIVE_INTERRUPTION_CAUSES: Record<Exclude<ActivationPublicationStatus, "co
   "maintenance-in-flight": "journal-unexpected",
 };
 
+/** Whether a member's active manifest carries an authenticated activation report of this set's publication and witness. */
 function activeReportAuthenticates(ctx: Context, member: Member, witnessChecksumSha256: string): string | null {
   const ref = latestReport(member.manifest!, "activation");
   const read = ctx.deps.readReport({ homeDir: ctx.homeDir, generationId: member.generationId, reportSha256: ref.reportSha256 });

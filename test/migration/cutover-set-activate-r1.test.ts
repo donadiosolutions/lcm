@@ -173,3 +173,27 @@ describe("round 1 F4: successor tokens are attributed per member", () => {
     expect(outcome.members[1]).toMatchObject({ generationId: b!.generationId, successorFencingToken: null });
   });
 });
+
+describe("round 1 F7: the lease span names every failing member", () => {
+  it("two members that conflict at acquire are both reported, no effect begins, and the lease acquired in between is released", async () => {
+    const f = await fixture({ members: 3 });
+    const [a, b, c] = f.members;
+    f.guard.seed({ projectId: a!.remoteProjectId, publicationId: "stranger-a" });
+    f.guard.seed({ projectId: c!.remoteProjectId, publicationId: "stranger-c" });
+    const outcome = await f.run();
+    expect(outcome).toMatchObject({
+      status: "refused", step: "S2", reason: "cutover-set-member-evidence-unverifiable", effectBegun: false,
+      members: [
+        expect.objectContaining({ generationId: a!.generationId, reason: "lease-conflict" }),
+        expect.objectContaining({ generationId: b!.generationId, reason: null }),
+        expect.objectContaining({ generationId: c!.generationId, reason: "lease-conflict" }),
+      ],
+    });
+    if (outcome.status === "refused") expect(outcome.failures.map((failure) => failure.generationId).sort()).toEqual([a!.generationId, c!.generationId].sort());
+    expect(f.guard.rows.get(b!.remoteProjectId)).toMatchObject({ publicationId: f.setId, releasedAt: expect.any(String) });
+    expect(f.guard.rows.get(a!.remoteProjectId)).toMatchObject({ publicationId: "stranger-a", releasedAt: null });
+    expect(f.guard.rows.get(c!.remoteProjectId)).toMatchObject({ publicationId: "stranger-c", releasedAt: null });
+    for (const member of f.members) expect(f.manifestStore.read(member.generationId).phase).toBe("verified");
+    expect(readCutoverSetActivationRecords({ homeDir: f.homeDir, setId: f.setId })).toEqual({ state: "authoritatively-absent" });
+  });
+});

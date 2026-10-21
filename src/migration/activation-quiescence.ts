@@ -319,7 +319,7 @@ export async function checkActivationWriterQuiescence(
       return buildResult(
         "unsatisfied",
         "cutover-set-unsupported",
-        "the maintenance journal binds a cutover set; set-aware writer quiescence is not defined yet, so this single-generation check refuses",
+        "the maintenance journal binds a cutover set; this single-generation check refuses a set hold, whose members are checked by the set-aware entry point",
         null,
       );
     }
