@@ -210,6 +210,11 @@ export async function performMigrationAbort(input: Readonly<{
   const beginEffect = input._operationsForTesting?.beginEffect ?? beginMigrationEffect;
   const completeEffect = input._operationsForTesting?.completeEffect ?? completeMigrationEffect;
   let journal = input.journal;
+  // #1550 (C4, D7): a postgresql-origin set hold is a set rollback in progress; the migration abort never touches
+  // its journal or its members' rollback effects (no set rollback abort exists in #1550).
+  if (journal.cutoverSet !== undefined && journal.sourceBackend === "postgresql") {
+    return { status: "refuse", evidence: "journal-rollback-hold", mutated: false };
+  }
   const journalNeedsWrite = !isTerminalBackendMaintenancePhase(journal.phase);
   if (journalNeedsWrite) {
     if (journal.phase !== "maintenance-held" && journal.phase !== "maintenance-entering") {

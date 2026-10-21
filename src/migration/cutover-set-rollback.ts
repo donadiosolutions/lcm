@@ -304,6 +304,7 @@ export type CutoverSetRollbackDependencies = Readonly<{
   machineId: (homeDir: string) => string;
   readActivationRecords: typeof readCutoverSetActivationRecords;
   readRollbackRecords: typeof readCutoverSetRollbackRecords;
+  rollbackJournalCapacity: typeof backendCutoverSetRollbackJournalCapacity;
   recordCheckpoint: typeof recordCutoverSetRollbackCheckpoint;
   recordInstall: typeof recordCutoverSetRollbackInstall;
   recordSelection: typeof recordCutoverSetRollbackSelection;
@@ -355,6 +356,7 @@ export function createCutoverSetRollbackDependencies(input: Readonly<{ homeDir: 
     machineId: (homeDir) => requireMachineIdentity(homeDir).machineId,
     readActivationRecords: readCutoverSetActivationRecords,
     readRollbackRecords: readCutoverSetRollbackRecords,
+    rollbackJournalCapacity: backendCutoverSetRollbackJournalCapacity,
     recordCheckpoint: recordCutoverSetRollbackCheckpoint,
     recordInstall: recordCutoverSetRollbackInstall,
     recordSelection: recordCutoverSetRollbackSelection,
@@ -612,7 +614,14 @@ async function recoverEnteringBeforeBarrier(ctx: Context): Promise<CutoverSetRol
   if (backendCutoverSetManifestSha256(journal.cutoverSet.manifest) !== backendCutoverSetManifestSha256(records.checkpoint.manifest)) {
     return interrupted(ctx, "hold", "journal-unexpected", "the entering rollback hold does not carry the checkpointed manifest").exit;
   }
-  const runtime = ctx.deps.createRuntime(connectionSettings(await storageForCheckpoint(ctx, records.checkpoint)));
+  let storage: Extract<ResolvedStorageConfig, { backend: "postgresql" }>;
+  try {
+    storage = await storageForCheckpoint(ctx, records.checkpoint);
+  } catch (error) {
+    if (error instanceof BackendPublicationJournalError) return interrupted(ctx, "hold", "artifact-unresolvable", error.message).exit;
+    throw error;
+  }
+  const runtime = ctx.deps.createRuntime(connectionSettings(storage));
   try {
     const coordinator = ctx.deps.createCoordinator({ homeDir: ctx.homeDir, guard: runtime.backendPublicationGuard(), machineId: ctx.deps.machineId(ctx.homeDir) });
     await coordinator.enterMaintenance({
@@ -630,7 +639,12 @@ async function recoverEnteringBeforeBarrier(ctx: Context): Promise<CutoverSetRol
 
 /** The PostgreSQL configuration the rollback runs against: the live one before the checkpoint, the sealed source after it. */
 async function storageForCheckpoint(ctx: Context, checkpoint: CutoverSetRollbackCheckpoint): Promise<Extract<ResolvedStorageConfig, { backend: "postgresql" }>> {
-  const artifact = ctx.deps.readArtifact({ homeDir: ctx.homeDir, identityDigest: checkpoint.identityDigest });
+  let artifact: ActivationArtifactRecoveryMaterial | null;
+  try {
+    artifact = ctx.deps.readArtifact({ homeDir: ctx.homeDir, identityDigest: checkpoint.identityDigest });
+  } catch (error) {
+    throw new BackendPublicationJournalError("publication-evidence-missing", "the rollback checkpoint's reverse artifact is unresolvable: " + (error as Error).message);
+  }
   if (artifact === null || artifact.source.config.presence !== "present") {
     throw new BackendPublicationJournalError("publication-evidence-missing", "the rollback checkpoint's reverse artifact is absent or sealed no source configuration");
   }
@@ -739,7 +753,7 @@ async function runUnderBarrier(ctx: Context): Promise<CutoverSetRollbackResult> 
     return interrupted(ctx, "records", "evidence-conflict", "the rollback checkpoint does not descend from the stored activation records").exit;
   }
   ctx.members = activation.checkpoint.members.map((row, index) => newMember(ctx, index, row));
-  const capacity = backendCutoverSetRollbackJournalCapacity(cutoverSetMaintenanceEntry(ctx.manifest).cutoverSet, ctx.originalSetId);
+  const capacity = ctx.deps.rollbackJournalCapacity(cutoverSetMaintenanceEntry(ctx.manifest).cutoverSet, ctx.originalSetId);
   if (capacity.worstCaseBytes > capacity.limitBytes) {
     return refused(ctx, "records", "cutover-set-too-large", "the rollback hold journal could reach " + capacity.worstCaseBytes
       + " bytes with its selection; the readable limit is " + capacity.limitBytes).exit;
@@ -755,6 +769,8 @@ async function runUnderBarrier(ctx: Context): Promise<CutoverSetRollbackResult> 
   if (v3 !== null) {
     const own = v3.cutoverSet !== undefined && v3.generationId === ctx.setId;
     if (!own) {
+      // A later hold over a completed rollback: the members settle from their own evidence, nothing is republished.
+      if (ctx.selection !== null) return settledFromRecords(ctx, null);
       return refused(ctx, "slot", v3.generationId === ctx.originalSetId ? "activation-not-completed" : "maintenance-held-by-other",
         "the maintenance journal is held for " + v3.generationId + " at phase " + v3.phase).exit;
     }
@@ -1229,6 +1245,7 @@ async function openSessions(ctx: Context, recovery: boolean): Promise<Exit | nul
   if (ctx.keeper === null) ctx.keeper = startSetKeeper(ctx);
   for (const member of ctx.members) {
     if (member.session !== null || member.manifest!.phase === "rolled-back") continue;
+    if (ctx.input.signal?.aborted === true) return blocked(ctx, "sessions", member, "cancelled", "the rollback was cancelled before the member's session was opened");
     try {
       member.session = await ctx.deps.openMemberSession({
         homeDir: ctx.homeDir, lockToken: ctx.token, generationId: member.generationId, publicationId: ctx.setId, runtime: ctx.runtime!,
@@ -1498,12 +1515,16 @@ function installMember(ctx: Context, member: Member): Exit | null {
     outcome = ctx.deps.installGeneration({
       homeDir: ctx.homeDir, generationId: built.generationId, rollbackGenerationId: member.generationId, canonicalPath: member.canonicalPath, verifiedDatabasePath: built.databasePath,
     });
-    crash(ctx, "after-install:" + member.generationId);
-    sidecars = ctx.deps.materializeSidecars({ homeDir: ctx.homeDir, databasePath: outcome.canonicalPath, localProjectId: member.physicalProjectId, machineId: ctx.machineId });
-    crash(ctx, "after-sidecars:" + member.generationId);
   } catch (error) {
     return blocked(ctx, "install", member, "install-failed", (error as Error).message);
   }
+  crash(ctx, "after-install:" + member.generationId);
+  try {
+    sidecars = ctx.deps.materializeSidecars({ homeDir: ctx.homeDir, databasePath: outcome.canonicalPath, localProjectId: member.physicalProjectId, machineId: ctx.machineId });
+  } catch (error) {
+    return blocked(ctx, "install", member, "install-failed", (error as Error).message);
+  }
+  crash(ctx, "after-sidecars:" + member.generationId);
   const record = createCutoverSetRollbackInstallRecord({
     originalSetId: ctx.originalSetId, setId: ctx.setId, generationId: member.generationId, installedGenerationId: built.generationId, mode: member.mode!,
     buildWitnessChecksumSha256: built.witness.checksumSha256, buildManifestSha256: built.manifestSha256, buildContentSha256: built.contentSha256,
@@ -1853,21 +1874,21 @@ function settleMember(ctx: Context, member: Member, sealedDigest: string): Exit 
       epochId: member.selectionRow.epochId, attemptId: member.selectionRow.attemptId, sealedPublicationMaterialDigestSha256: sealedDigest,
       reason: null, selectionBindingManifestRevision: manifest.revision,
     });
-    crash(ctx, "after-report:" + member.generationId);
   } catch (error) {
     return interrupted(ctx, "completion", "evidence-conflict", at(member, "the rollback report could not be written: " + (error as Error).message));
   }
+  crash(ctx, "after-report:" + member.generationId);
   try {
     member.manifest = ctx.deps.manifestStore.update(member.generationId, manifest.checksumSha256, (head) =>
       completeMigrationEffect(head, {
         effectId: pending.effectId, completedAt: ctx.now().toISOString(),
         report: { kind: "rollback", reportId: report.reportId, reportSha256: report.checksumSha256, createdAt: ctx.now().toISOString() }, rollbackMode: member.mode!,
       }));
-    crash(ctx, "after-complete:" + member.generationId);
   } catch (error) {
     if (error instanceof MigrationProtocolError) return interrupted(ctx, "completion", "state-unresolvable", at(member, "publish-rollback could not be completed: " + error.message));
     throw error;
   }
+  crash(ctx, "after-complete:" + member.generationId);
   return null;
 }
 

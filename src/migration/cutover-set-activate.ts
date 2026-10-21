@@ -100,6 +100,7 @@ import {
   type CutoverSetActivationCheckpoint,
   type CutoverSetActivationRecords,
 } from "./cutover-set-activation-store.js";
+import { readCutoverSetRollbackRecords } from "./cutover-set-rollback-store.js";
 import {
   computeMigrationGenerationBase,
   DEFAULT_MAX_PROBE_ORDINAL,
@@ -177,6 +178,7 @@ export type CutoverSetActivationRefusalReason =
   | "cutover-set-target-changed"
   | "cutover-set-member-unmapped"
   | "cutover-set-member-identity"
+  | "cutover-set-rollback-committed"
   | "machine-identity-unregistered"
   | "cancelled";
 
@@ -547,6 +549,14 @@ async function runUnderBarrier(ctx: Context): Promise<CutoverSetActivateResult> 
   const records = ctx.deps.readRecords({ homeDir: ctx.homeDir, setId: ctx.setId });
   if (records.state === "unresolvable") {
     return interrupted(ctx, "S9", "state-unresolvable", "the set activation records are unresolvable: " + records.reason).exit;
+  }
+  // #1550 (D7): a rollback commitment for this set (its checkpoint, at any later state) fences the activation
+  // for good: nothing is adopted, re-driven or reported as activated after a rollback begins.
+  const rollback = readCutoverSetRollbackRecords({ homeDir: ctx.homeDir, originalSetId: ctx.setId });
+  if (rollback.state !== "authoritatively-absent") {
+    return refused(ctx, "S0", "cutover-set-rollback-committed", rollback.state === "resolved"
+      ? "the set is committed to a rollback (checkpoint " + rollback.checkpoint.checksumSha256 + "); it is never republished"
+      : "the set rollback records are unresolvable: " + rollback.reason).exit;
   }
   ctx.records = records.state === "resolved" ? records : null;
   ctx.checkpoint = ctx.records?.checkpoint ?? null;
