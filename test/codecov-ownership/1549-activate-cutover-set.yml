@@ -9,11 +9,14 @@ rationale: >-
   admission; each keeps its existing migration owner. The storage
   journal gains the complete set selection tuple, its parser and the
   selection transitions for a set hold, and keeps its storage
-  abstractions owner. No file is removed, moved or re-owned.
+  abstractions owner. The activation report store gains the three-valued
+  report presence probe the set activation routes an empty slot on, and
+  keeps its owner. No file is removed, moved or re-owned.
 pins:
   - ["src/migration/cutover-set-activate.ts", "unit-migration-cutover"]
   - ["src/migration/cutover-set-activation-store.ts", "unit-migration-cutover"]
   - ["src/migration/activation-quiescence.ts", "unit-migration-cutover"]
   - ["src/migration/maintenance.ts", "unit-migration-cutover"]
+  - ["src/migration/activation-report.ts", "unit-migration-cutover"]
   - ["src/storage/backend-publication.ts", "unit-storage-abstractions"]
 

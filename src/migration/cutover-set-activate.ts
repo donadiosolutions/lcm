@@ -65,6 +65,7 @@ import {
   createMigrationActivationReport,
   migrationActivationReportReference,
   MigrationActivationReportError,
+  probeMigrationActivationReportPresence,
   type MigrationActivationReportPersistResult,
 } from "./activation-report.js";
 import type { ActivationRestartCheckResult } from "./activation-restart-check.js";
@@ -276,6 +277,7 @@ export type CutoverSetActivateDependencies = MigrationActivationDependencies & R
   recordCheckpoint: typeof recordCutoverSetActivationCheckpoint;
   recordSelection: typeof recordCutoverSetActivationSelection;
 }>;
+  probeReportPresence: typeof probeMigrationActivationReportPresence;
 
 export function createCutoverSetActivateDependencies(input: Readonly<{ homeDir: string }>): CutoverSetActivateDependencies {
   return {
@@ -289,6 +291,7 @@ export function createCutoverSetActivateDependencies(input: Readonly<{ homeDir: 
     recordCheckpoint: recordCutoverSetActivationCheckpoint,
     recordSelection: recordCutoverSetActivationSelection,
   };
+    probeReportPresence: probeMigrationActivationReportPresence,
 }
 
 // ---------------------------------------------------------------------------
@@ -1775,9 +1778,11 @@ async function classifySettlement(ctx: Context): Promise<Step<"all-active" | "al
   let pending = 0;
   for (const member of ctx.members) {
     if (member.manifest!.phase === "active") { active += 1; continue; }
-    // A pending member with any stored activation report is report-only state: not positively unpublished.
-    const probe = ctx.deps.readReport({ homeDir: ctx.homeDir, generationId: member.generationId, reportSha256: "0".repeat(64) });
-    if (probe.state === "authoritatively-absent" && probe.detail.includes("does not exist")) pending += 1;
+    // A pending member with any stored activation report is report-only state: not positively unpublished. Only an
+    // authenticated, positively absent report directory counts as pending; a present directory or one that cannot
+    // be authenticated is mixed state (F1).
+    const presence = ctx.deps.probeReportPresence({ homeDir: ctx.homeDir, generationId: member.generationId });
+    if (presence.state === "authoritatively-absent") pending += 1;
   }
   if (active === ctx.members.length) return ok("all-active");
   if (pending === ctx.members.length) return ok("all-pending");
