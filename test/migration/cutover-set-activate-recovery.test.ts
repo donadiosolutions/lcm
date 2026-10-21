@@ -6,7 +6,6 @@ import {
   readBackendPublicationJournal,
   withBackendPublicationAppendBarrierAsync,
 } from "../../src/storage/backend-publication.js";
-import { activateCutoverSet } from "../../src/migration/cutover-set-activate.js";
 import { readCutoverSetActivationRecords, migrationCutoverSetActivationDirectory } from "../../src/migration/cutover-set-activation-store.js";
 import { readActivationGenerationLink } from "../../src/migration/activation-artifact-store.js";
 import { migrationActivationReportDirectory } from "../../src/migration/activation-report.js";

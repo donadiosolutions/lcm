@@ -8,7 +8,6 @@ import {
 } from "../../src/storage/backend-publication.js";
 import { readCutoverSetActivationRecords } from "../../src/migration/cutover-set-activation-store.js";
 import { activationGenerationLinkPath } from "../../src/migration/activation-artifact-store.js";
-import { migrationActivationReportDirectory } from "../../src/migration/activation-report.js";
 import { assertMigrationReplayAdmission } from "../../src/migration/maintenance.js";
 import type { ActivationPublicationStatus } from "../../src/migration/activation-publication.js";
 import { cleanupRoots, expectActivated, expectAllNew, expectAllOld, fixture, type Fixture } from "./cutover-set-activate-fixture.js";
