@@ -641,3 +641,131 @@ describe("optional inputs and remaining branches", () => {
     await expect(prepareCutoverSet(prepareInput(env, setId, { manifestStore: proxy }))).rejects.toThrow("late");
   }, 60000);
 });
+
+describe("the held-authority fence (F1)", () => {
+  type Resolve = CutoverSetPrepareOperations["resolveAuthorities"];
+  const viaReal = async (mutate: (real: Awaited<ReturnType<Resolve>>) => ReturnType<Resolve>): Promise<{ resolveAuthorities: Resolve; tokens: unknown[] }> => {
+    const { resolveCutoverSetMemberAuthorities } = await import("../../src/migration/maintenance.js");
+    const tokens: unknown[] = [];
+    return {
+      tokens,
+      resolveAuthorities: ((input: Parameters<Resolve>[0]) => {
+        tokens.push(input.lockToken);
+        return mutate(resolveCutoverSetMemberAuthorities(input));
+      }) as Resolve,
+    };
+  };
+  const outcomesOf = (real: Awaited<ReturnType<Resolve>>) =>
+    (real as Extract<typeof real, { status: "resolved" }>).outcomes;
+
+  /** A verified (complete snapshot, verified manifest), B blocked before any manifest: resumable. */
+  async function verifiedThenResumable() {
+    const env = await makeEnv();
+    const setId = await candidateSetId(env);
+    const ids = (await resolveCutoverSetCandidate({ homeDir: env.homeDir, targetConfig: targetConfig() }) as { members: { generationId: string }[] }).members.map((m) => m.generationId);
+    env.failDryRun.add(ids[1]!);
+    expect((await prepareCutoverSet(prepareInput(env, setId))).status).toBe("blocked");
+    env.failDryRun.clear();
+    env.calls.length = 0;
+    return { env, setId, ids };
+  }
+  const memberCalls = (env: Env) => env.calls.filter((call) => !call.startsWith("identity"));
+
+  it("refuses a changed source selection before any member work, even for a verified member", async () => {
+    const { env, setId, ids } = await verifiedThenResumable();
+    const before = env.store.read(ids[0]!);
+    const { resolveAuthorities } = await viaReal((real) => ({
+      status: "resolved",
+      outcomes: outcomesOf(real).map((outcome, index) => index === 0 && outcome.status === "authenticated"
+        ? { ...outcome, authority: { ...outcome.authority, sourceSelectionSha256: HASH } } : outcome),
+    }));
+    const result = await prepareCutoverSet(prepareInput(env, setId, {}, { resolveAuthorities }));
+    expect(result).toEqual({
+      status: "refuse", reason: "cutover-set-authority-drifted", projects: [env.projects[0]!.id], setId, identityMutation: [],
+    });
+    expect(memberCalls(env)).toEqual([]);
+    expect(env.store.read(ids[0]!)).toEqual(before);
+    expect(env.store.probeManifestPresence(ids[1]!)).toEqual({ status: "absent" });
+  }, 90000);
+
+  it.each([
+    ["an extra stored-data project", (outcomes: ReturnType<typeof outcomesOf>) =>
+      [...outcomes, { ...outcomes[0]!, physicalProjectId: "e".repeat(64) }], "e".repeat(64)],
+    ["a missing stored-data project", (outcomes: ReturnType<typeof outcomesOf>) => outcomes.slice(1), null],
+  ])("refuses %s before any member work, with every snapshot complete", async (_name, change, extra) => {
+    const { env, setId, ids } = await verifiedThenResumable();
+    const { resolveAuthorities } = await viaReal((real) => ({ status: "resolved", outcomes: change(outcomesOf(real)) }));
+    const result = await prepareCutoverSet(prepareInput(env, setId, {}, { resolveAuthorities }));
+    expect(result).toMatchObject({
+      status: "refuse", reason: "cutover-set-membership-drift", projects: [extra ?? env.projects[0]!.id], setId,
+    });
+    expect(memberCalls(env)).toEqual([]);
+    expect(env.store.read(ids[0]!).phase).toBe("verified");
+  }, 90000);
+
+  it.each([
+    ["an unresolvable enumeration", () => ({ status: "unresolvable", reason: "events-directory-unresolvable", detail: "EACCES" }) as never,
+      { reason: "cutover-set-enumeration-unresolvable", evidence: "events-directory-unresolvable: EACCES" }],
+    ["an uncovered project", (real: Awaited<ReturnType<Resolve>>) => ({
+      status: "resolved",
+      outcomes: outcomesOf(real).map((outcome, index) => index === 1
+        ? { physicalProjectId: outcome.physicalProjectId, status: "uncovered", detail: "no entry" } : outcome),
+    }) as never, { reason: "cutover-set-member-unverifiable" }],
+    ["an unverifiable project", (real: Awaited<ReturnType<Resolve>>) => ({
+      status: "resolved",
+      outcomes: outcomesOf(real).map((outcome, index) => index === 0
+        ? { physicalProjectId: outcome.physicalProjectId, status: "unverifiable", detail: "metadata" } : outcome),
+    }) as never, { reason: "cutover-set-member-unverifiable" }],
+  ])("refuses %s without starting any member", async (_name, mutate, expected) => {
+    const { env, setId } = await verifiedThenResumable();
+    const { resolveAuthorities } = await viaReal(mutate);
+    const result = await prepareCutoverSet(prepareInput(env, setId, {}, { resolveAuthorities }));
+    expect(result).toMatchObject({ status: "refuse", ...expected, setId });
+    expect(memberCalls(env)).toEqual([]);
+  }, 90000);
+
+  it("enumerates under a token after an entering recovery reaches held, and refuses drift before member work", async () => {
+    const env = await makeEnv();
+    const { setId } = await blockedAtFirstGenesis(env);
+    const held = heldJournal(env);
+    const order: string[] = [];
+    const entering: BackendMaintenanceJournal = { ...held, phase: "maintenance-entering", checksumSha256: "e".repeat(64) };
+    const coordinator = { enterMaintenance: async () => { order.push("recover"); return held; } } as unknown as BackendPublicationCoordinator;
+    const { resolveAuthorities, tokens } = await viaReal((real) => {
+      order.push("enumerate");
+      return { status: "resolved", outcomes: outcomesOf(real).slice(1) };
+    });
+    const result = await prepareCutoverSet(prepareInput(env, setId, { coordinator }, {
+      observeJournal: () => ({ kind: "hold", journal: entering }) as never, resolveAuthorities,
+    }));
+    expect(order).toEqual(["recover", "enumerate"]);
+    expect(tokens).toHaveLength(1);
+    expect(tokens[0]).toBeDefined();
+    expect(result).toMatchObject({ status: "refuse", reason: "cutover-set-membership-drift", setId });
+    expect(memberCalls(env)).toEqual([]);
+  }, 90000);
+
+  it("never enumerates when the entering recovery itself is refused", async () => {
+    const env = await makeEnv();
+    const { setId } = await blockedAtFirstGenesis(env);
+    const entering: BackendMaintenanceJournal = { ...heldJournal(env), phase: "maintenance-entering" };
+    const coordinator = { enterMaintenance: async () => { throw new BackendPublicationJournalError("unexpected-state", "moved"); } } as unknown as BackendPublicationCoordinator;
+    const { resolveAuthorities, tokens } = await viaReal((real) => real);
+    expect(await prepareCutoverSet(prepareInput(env, setId, { coordinator }, {
+      observeJournal: () => ({ kind: "hold", journal: entering }) as never, resolveAuthorities,
+    }))).toMatchObject({ status: "refuse", reason: "entering-recovery-precondition" });
+    expect(tokens).toEqual([]);
+  }, 90000);
+
+  it("enumerates under a token on an unchanged resume and still skips the verified member untouched", async () => {
+    const { env, setId, ids } = await verifiedThenResumable();
+    const before = env.store.read(ids[0]!);
+    const { resolveAuthorities, tokens } = await viaReal((real) => real);
+    const result = await prepareCutoverSet(prepareInput(env, setId, {}, { resolveAuthorities }));
+    expect(result.status).toBe("prepared");
+    expect(tokens).toHaveLength(1);
+    expect(tokens[0]).toBeDefined();
+    expect(env.store.read(ids[0]!)).toEqual(before);
+    expect(memberCalls(env).some((call) => call.includes(ids[0]!))).toBe(false);
+  }, 90000);
+});

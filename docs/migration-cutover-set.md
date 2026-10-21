@@ -140,6 +140,19 @@ project, path and the supplied target produce), when a member has no
 persisted project-map entry, or when its destination project is missing. It
 never mints under a live hold.
 
+Once the hold is held (freshly entered, resumed, or recovered from an
+entering state, never while it is still entering) and before any member is
+touched, one append-barrier span enumerates and authenticates every
+stored-data project again. The preparation refuses, with the hold and all
+evidence preserved and no member started, when the enumeration cannot be
+read (`cutover-set-enumeration-unresolvable`), a project cannot be
+authenticated (`cutover-set-member-unverifiable`), the stored-data projects
+are not exactly the held members (`cutover-set-membership-drift`, naming the
+projects that differ), or a project's source selection is not the one the hold
+bound (`cutover-set-authority-drifted`). Nothing is recaptured and no source
+bytes are recomputed for this check; a verified member is still validated and
+skipped afterwards.
+
 ### When a member is blocked
 
 The first member that cannot proceed stops the preparation. The result names

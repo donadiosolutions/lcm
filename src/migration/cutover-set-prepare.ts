@@ -639,6 +639,7 @@ async function runMembers(
 ): Promise<CutoverSetPrepareResult> {
   const setId = journal.generationId;
   const members = memberRefs(journal);
+  await assertHeldAuthorities(ctx, journal);
   const reports: CutoverSetPrepareMember[] = members.map(({ physicalProjectId, generationId }) =>
     ({ physicalProjectId, generationId, state: "pending" }));
   for (const [index, member] of members.entries()) {
@@ -661,6 +662,41 @@ async function runMembers(
     reports[index] = { physicalProjectId: member.physicalProjectId, generationId: member.generationId, state: "verified" };
   }
   return { status: "prepared", setId, members: reports, identityMutation: mutationOf(effects) };
+}
+
+/**
+ * The held-authority fence (C5): once the hold is held - freshly entered,
+ * resumed, or recovered from entering, never while entering - and before any
+ * member work (capture, genesis, copy, verification, verified skip), one
+ * append-barrier span enumerates and authenticates every stored-data project.
+ * The set must be exactly the held members and each authority's source
+ * selection must be the one the hold bound. Nothing is recaptured and no
+ * source bytes are recomputed; a refusal leaves the hold and all evidence.
+ */
+async function assertHeldAuthorities(ctx: Context, journal: BackendMaintenanceJournal): Promise<void> {
+  const setId = journal.generationId;
+  const resolution = await withBackendPublicationAppendBarrierAsync(ctx.homeDir, async (token) =>
+    (ctx.ops.resolveAuthorities ?? resolveCutoverSetMemberAuthorities)({ homeDir: ctx.homeDir, lockToken: token }));
+  if (resolution.status === "unresolvable") {
+    throw new Refused("cutover-set-enumeration-unresolvable", { evidence: `${resolution.reason}: ${resolution.detail}`, setId });
+  }
+  const unusable = resolution.outcomes.filter((outcome) => outcome.status !== "authenticated");
+  if (unusable.length > 0) {
+    throw new Refused("cutover-set-member-unverifiable", {
+      evidence: unusable.map((outcome) => `${outcome.physicalProjectId} (${outcome.status})`).join("; "),
+      projects: unusable.map((outcome) => outcome.physicalProjectId).sort(),
+      setId,
+    });
+  }
+  const authenticated = resolution.outcomes as readonly Authenticated[];
+  const held = new Map(memberRefs(journal).map((member) => [member.physicalProjectId, member.sourceSelectionSha256]));
+  const present = new Set(authenticated.map((outcome) => outcome.physicalProjectId));
+  const drifted = [...new Set([...held.keys(), ...present])].filter((id) => held.has(id) !== present.has(id)).sort();
+  if (drifted.length > 0) throw new Refused("cutover-set-membership-drift", { projects: drifted, setId });
+  const moved = authenticated
+    .filter((outcome) => outcome.authority.sourceSelectionSha256 !== held.get(outcome.physicalProjectId))
+    .map((outcome) => outcome.physicalProjectId).sort();
+  if (moved.length > 0) throw new Refused("cutover-set-authority-drifted", { projects: moved, setId });
 }
 
 function captureFailure(error: unknown): MemberBlocked {
