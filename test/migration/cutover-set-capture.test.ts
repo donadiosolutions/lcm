@@ -30,6 +30,7 @@ import * as coverageApi from "../../src/migration/activation-coverage.js";
 import { performMigrationAbortCommand } from "../../src/migration/cli-abort.js";
 import { SqliteSnapshotError, captureSqliteSnapshotArtifact } from "../../src/migration/sqlite-snapshot.js";
 import { recordMigrationSelectionBinding } from "../../src/migration/generation-binding-store.js";
+import { deriveActivationPublicationId } from "../../src/migration/activation-publication-id.js";
 import { checkActivationWriterQuiescence } from "../../src/migration/activation-quiescence.js";
 import { localProjectIdentity } from "../../src/daemon/project.js";
 import { closeLcmConnection } from "../../src/db/connection.js";
@@ -341,7 +342,7 @@ describe("cutover-set gates", () => {
     const member = held.cutoverSet!.manifest.members[0]!.generationId;
     recordMigrationSelectionBinding({
       homeDir, generationId: member,
-      binding: { kind: "activation", epochId: "epoch-1", attemptId: "attempt-1", manifestRevision: 5, witnessChecksumSha256: HASH_B, publicationId: "publication-activation" },
+      binding: { kind: "activation", epochId: "epoch-1", attemptId: "attempt-1", manifestRevision: 5, witnessChecksumSha256: HASH_B, publicationId: deriveActivationPublicationId(member) },
     });
     for (const generationId of [member, "unrelated-generation", SET_ID]) {
       expect(() => assertMigrationReplayAdmission({ homeDir, generationId, evidenceSha256: HASH_B }))

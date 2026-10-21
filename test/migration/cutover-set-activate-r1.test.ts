@@ -69,3 +69,38 @@ describe("round 1 F1: empty-slot routing authenticates report absence", () => {
     expectActivated(f, await f.run(), "slot-replaced");
   });
 });
+
+describe("round 1 F2: a set member's binding is only an index", () => {
+  it("own aborted v2 with one member's link deleted: that member and its siblings refuse replay", async () => {
+    const f = await fixture();
+    const crashing = f.coordinator((event) => { if (event === "before-material-seal") throw new Error("crash before seal"); });
+    await expect(f.run({ createCoordinator: () => crashing })).rejects.toThrow("crash before seal");
+    await withBackendPublicationAppendBarrierAsync(f.homeDir, async (token) => { await f.coordinator().abort(token); });
+    expect(readBackendPublicationJournal(f.homeDir)?.phase).toBe("aborted");
+    const selection = records(f).selection!;
+    const [unlinked, ...siblings] = selection.members;
+    rmSync(activationGenerationLinkPath(f.homeDir, unlinked!.generationId));
+    for (const row of [unlinked!, ...siblings]) {
+      expect(() => assertMigrationReplayAdmission({ homeDir: f.homeDir, generationId: row.generationId, evidenceSha256: row.witnessChecksumSha256 }))
+        .toThrow(expect.objectContaining({ reason: "unresolved-publication" }));
+    }
+  });
+
+  it("a completed set whose slot was archived by a later publication: a deleted link refuses that member", async () => {
+    const f = await fixture();
+    expectActivated(f, await f.run(), "fresh");
+    const selection = records(f).selection!;
+    const [a, b] = selection.members;
+    rmSync(activationGenerationLinkPath(f.homeDir, a!.generationId));
+    expect(() => assertMigrationReplayAdmission({ homeDir: f.homeDir, generationId: a!.generationId, evidenceSha256: a!.witnessChecksumSha256 }))
+      .toThrow(expect.objectContaining({ reason: "unresolved-publication", message: expect.stringContaining("link") }));
+    expect(assertMigrationReplayAdmission({ homeDir: f.homeDir, generationId: b!.generationId, evidenceSha256: b!.witnessChecksumSha256 }))
+      .toEqual({ backend: "postgresql", disposition: "selected" });
+    // The slot now belongs to a later hold: the deleted link still refuses while the linked sibling replays from its active manifest.
+    rmSync(backendPublicationJournalPath(f.homeDir));
+    expect(() => assertMigrationReplayAdmission({ homeDir: f.homeDir, generationId: a!.generationId, evidenceSha256: a!.witnessChecksumSha256 }))
+      .toThrow(expect.objectContaining({ reason: "unresolved-publication", message: expect.stringContaining("link") }));
+    expect(assertMigrationReplayAdmission({ homeDir: f.homeDir, generationId: b!.generationId, evidenceSha256: b!.witnessChecksumSha256 }))
+      .toEqual({ backend: "postgresql", disposition: "selected" });
+  });
+});

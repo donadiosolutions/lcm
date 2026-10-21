@@ -433,15 +433,14 @@ export function assertMigrationReplayAdmission(input: Readonly<{
       );
     }
     if (last.kind === "activation" && last.publicationId !== deriveActivationPublicationId(input.generationId)) {
-      // #1549. A set member's selection binding names the set publication. Its generation link is written
-      // before any set selection binding (S11 precedes S13a), so an unlinked generation is not a set member
-      // and keeps the single-generation semantics; a linked one is decided by the aggregate below.
+      // #1549 (F2). A single-generation activation always names deriveActivationPublicationId(generationId);
+      // any other activation publication id is a set publication, and a set member's binding is only an
+      // index: the aggregate decides, and a missing or single-generation link refuses rather than admitting
+      // the bare index (a missing link cannot prove legacy provenance).
       const aggregate = resolveCutoverSetActivationSelection({
         homeDir: input.homeDir, generationId: input.generationId, publicationId: last.publicationId,
       });
-      if (aggregate.state !== "absent" || aggregate.cause !== "unlinked") {
-        return assertCutoverSetReplayAdmission(input, last, journal, aggregate);
-      }
+      return assertCutoverSetReplayAdmission(input, last, journal, aggregate);
     }
     return { backend: last.kind === "activation" ? "postgresql" : "sqlite", disposition: "selected" };
   }
