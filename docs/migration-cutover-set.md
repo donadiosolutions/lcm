@@ -219,9 +219,12 @@ selection rule's (`cutover-set-member-evidence-stale`,
 `cutover-set-member-evidence-drifted`,
 `cutover-set-member-evidence-unverifiable`,
 `cutover-set-member-evidence-absent`), with each member's own reason beside it.
-A refusal writes nothing, leaves the hold and every member's evidence intact,
-and releases the leases it acquired. No member's evidence is ever inferred
-from another's, and no time, count or heuristic decides eligibility.
+A refusal begins no member effect, leaves the hold and every member's
+evidence intact, and releases the leases it acquired; the composed activation
+artifact may already be persisted (it is reused byte-identically by the next
+call) and the coverage check may have reconciled the project map. No member's
+evidence is ever inferred from another's, and no time, count or heuristic
+decides eligibility.
 
 ### One checkpoint, member effects, one selection, one publication
 
@@ -266,7 +269,10 @@ report conflict or an uncertain write stops with an interruption that keeps
 the completed publication and the selection; `publication-failed` names only
 a publication the driver confirmed aborted, after which every member's replay
 stays unresolved despite its selection index (the only automatic re-prepare is
-the driver's pre-seal aborted shape).
+the driver's pre-seal aborted shape). Any other driver outcome (an unsatisfied
+or unresolvable fence, a colliding journal, missing or unreadable artifact
+material, a publication that cannot be attributed) is an interruption that
+keeps the selection, the member evidence and the journal for the next call.
 
 ### Crash recovery
 
@@ -280,13 +286,17 @@ and never admits a mixed selection:
 | After the frozen tuple, before or at the selection phases | the frozen attempts are adopted, never re-minted; the same tuple is prepared and completed |
 | `selection-completed`, before or during the publication | member indexes are repaired from the tuple and the one publication is driven on |
 | After the completed publication | members settle from their own evidence; an already active member authenticates its report and is skipped |
-| The set journal gone or replaced before the first publication write | with every member pending and no report, the frozen artifact is prepared fresh; with every member active the activation is reported from their reports; anything mixed is interrupted and nothing is republished |
+| The set journal gone before the first publication write (empty slot) | with every member pending and its activation report directory positively absent, the frozen artifact is prepared fresh; with every member active the activation is reported from their reports; anything mixed, any report present or a report directory that cannot be authenticated is interrupted and nothing is republished |
+| The slot occupied by another hold or publication | with every member active the activation is reported from their reports; otherwise it is interrupted and nothing is prepared over the occupant |
 
 A lease that expires before the tuple is frozen is taken over and that
 member's attempt re-minted; after the freeze a takeover keeps the frozen
-attempts and reports the successor token. A lost lease or an unreadable
-state is an interruption that preserves evidence, never a fresh refusal
-claiming nothing happened.
+attempts and reports that member's successor token on its own member row. A
+lost lease or an unreadable state is an interruption that preserves evidence,
+never a fresh refusal claiming nothing happened. Leases are released by a
+refusal and by an interruption whose members are all positively unbegun (no
+member manifest moved); once any member effect exists the leases are retained
+for the roll-forward.
 
 ### Replay after a set activation
 
