@@ -370,6 +370,14 @@ function materializePassiveEvents(
   return { count, highestSequence };
 }
 
+const SQLITE_OR_PORTABLE_TIMESTAMP = /^(\d{4}-\d{2}-\d{2})[T ](\d{2}:\d{2}:\d{2})(?:\.(\d{1,6}))?Z?$/;
+
+/** Rewrites SQLite `datetime('now')` text or portable timestamp text to `YYYY-MM-DDTHH:MM:SS.ffffffZ`, else null. */
+function canonicalTimestamp(text: string): string | null {
+  const match = SQLITE_OR_PORTABLE_TIMESTAMP.exec(text);
+  return match === null ? null : `${match[1]}T${match[2]}.${(match[3] ?? "").padEnd(6, "0")}Z`;
+}
+
 type PassiveEventReadbackRow = Readonly<{
   event_version: number;
   machine_id: string | null;
@@ -401,7 +409,8 @@ type PassiveEventReadbackRow = Readonly<{
  * replication worker has since acknowledged are both applied, so an existing acknowledged row keeps its
  * remote_inbox_id and acknowledgement and is not rewritten; materializePassiveEvents gives it the processing
  * marker a fresh applied insert carries so the SQLite consumer does not replay it (E2). A row whose content or
- * disposition differs from the archive still refuses.
+ * disposition differs from the archive still refuses. created_at is compared by instant in canonical form, because a
+ * row the hook outbox wrote keeps SQLite's `YYYY-MM-DD HH:MM:SS` text while the archive carries the portable form.
  *
  * The two sets are accounted for separately. The live local outbox legitimately holds appends made after the
  * cutoff that the archive never saw. The events table's own state model (hooks/events-db.ts) marks a row as
@@ -451,7 +460,8 @@ export function verifyPassiveEventsAgainstArchive(
       || stored.data !== v.data
       || BigInt(stored.priority) !== requireInteger(v.priority, "passive-events.priority")
       || stored.source_hook !== v.sourceHook
-      || stored.created_at !== createdAt
+      || canonicalTimestamp(stored.created_at) === null
+      || canonicalTimestamp(stored.created_at) !== canonicalTimestamp(createdAt)
       || stored.disposition !== v.disposition
     ) {
       throw new RollbackSidecarError(
