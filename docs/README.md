@@ -42,7 +42,9 @@ detail you need.
   rollback preserves, what each refusal means, and how to recover after an
   interrupted attempt.
 - [Cutover sets](migration-cutover-set.md) — understand the contract for
-  moving every project of a machine under one maintenance hold.
+  moving every project of a machine under one maintenance hold, how a set is
+  prepared and activated through one publication, and how an interrupted
+  activation resumes.
 - [Optional FTS5 setup](fts5.md) — enable faster ranked local full-text search
   when the active Node.js runtime does not include FTS5.
 - [VS Code and Codex setup](vscode-codex.md) — connect LCM to Codex or GitHub
