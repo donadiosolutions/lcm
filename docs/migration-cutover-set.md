@@ -5,11 +5,12 @@ more than one project. One maintenance hold covers the whole set, and every
 project in it is captured under that hold. This page defines the set, the
 refusals that keep it all-or-nothing, and how a capture is bound to it.
 
-> **Status.** This page describes the contract only. No `lcm migration`
-> command enters a set hold yet: the operator commands to prepare, activate and
-> roll back a set arrive with later children of the multi-project cutover
-> epic (#1544). Until then, activation and rollback keep their single-project
-> refusals (`uncovered-projects`, `multiple-remote-projects`), and a machine
+> **Status.** This page describes the contract and the preparation service
+> behind it. No `lcm migration` command enters or prepares a set yet: the
+> operator commands to prepare, activate and roll back a set arrive with later
+> children of the multi-project cutover epic (#1544). Until then, activation
+> and rollback keep their single-project refusals
+> (`uncovered-projects`, `multiple-remote-projects`), and a machine
 > with data for one project behaves exactly as described in
 > [Reversible migration and cutover journal](migration-cutover.md).
 
@@ -90,10 +91,104 @@ and the immutable hold fields, and excludes other members and the update time,
 so capturing one member does not invalidate another member's capture.
 Nothing is copied or inferred from a different member.
 
+## Preparing a set
+
+Preparation takes one hold and then, member by member, captures, copies and
+verifies every project under it. The service is the internal contract the set
+commands (#1551) will expose; nothing here is reachable from the CLI yet.
+
+1. **Preview.** The candidate names the set id and each member's generation
+   id without writing anything. Each member's id comes from that member's own
+   base (project, canonical path and the target's host, port and database)
+   plus the first free ordinal, and the set id is derived from the target and
+   those `(project, generation)` pairs. If a member's earlier generation
+   becomes occupied (for example by an aborted attempt that captured it), its
+   ordinal advances and the set id changes, so an old confirmation is refused
+   with `confirmation-generation-moved` before anything is written.
+   While a set is already entering or held, the preview returns its persisted
+   set and member ids as they are, without recomputing them; preparing then
+   refuses a different target (`cutover-set-target-changed`).
+2. **Confirm, then hold.** The confirmed set id is compared first. Only then
+   is each member's destination identity resolved (this can create the
+   destination project and is reported per member), the sources are
+   authenticated again, the set is rebuilt, every selected id is checked free
+   once more, and the hold is entered with a single write. No member snapshot
+   exists before that write, and the hold fences every writer for the whole
+   home.
+3. **Per member, in manifest order.** Each step rereads the journal and that
+   member's own binding: capture (when its snapshot is absent), genesis and
+   the dry-run effect, copy, and verification against the one resolved
+   target. Another member's evidence is never used for it.
+
+A preparation finishes only when every member's manifest is `verified`, no
+effect is pending and its persisted verification report is eligible.
+
+### Resuming
+
+Calling the preparation again with the same set id continues from each
+member's durable state, so a verified member is validated and skipped, not
+copied again. A member that stopped
+
+- before capture is captured; with a complete snapshot and no manifest it
+  starts at genesis;
+- inside genesis (a planned manifest, with or without its dry-run effect
+  pending) completes the dry run with the effect id it carried;
+- in the copy continues the copy; in a copied state it is verified;
+- after verification began finishes that verification from its persisted
+  report, without reopening the destination.
+
+A resume refuses, before it touches any member, when the target changed
+(`cutover-set-target-changed`: a held member id is not in the family its
+project, path and the supplied target produce), when a member has no
+persisted project-map entry, or when its destination project is missing. It
+never mints under a live hold.
+
+Once the hold is held (freshly entered, resumed, or recovered from an
+entering state, never while it is still entering) and before any member is
+touched, one append-barrier span enumerates and authenticates every
+stored-data project again. The preparation refuses, with the hold and all
+evidence preserved and no member started, when the enumeration cannot be
+read (`cutover-set-enumeration-unresolvable`), a project cannot be
+authenticated (`cutover-set-member-unverifiable`), the stored-data projects
+are not exactly the held members (`cutover-set-membership-drift`, naming the
+projects that differ), or a project's source selection is not the one the hold
+bound (`cutover-set-authority-drifted`). Nothing is recaptured and no source
+bytes are recomputed for this check; a verified member is still validated and
+skipped afterwards.
+
+### When a member is blocked
+
+The first member that cannot proceed stops the preparation. The result names
+that member and a reason, later members are not started, the hold stays, and
+every member's durable evidence is preserved. Typical reasons are
+`member-verification-failed` (the report is kept; the manifest stays
+`copied`), `member-snapshot-partial`, `member-snapshot-tampered`,
+`member-authority-drifted` (the member's source selection changed between the
+held-authority check and its capture), `member-binding-drifted` (its sealed
+snapshot no longer carries its current binding),
+`cutover-set-membership-drift` (a capture found the stored-data projects
+changed under the hold), `capture-contention`, `copy-failed` and
+`member-state-unexpected`. Fix the cause and call the preparation again, or
+release the hold as described below.
+
+Refusals that precede the hold (a publication in the journal slot, a
+single-generation hold, an unsettled earlier set, a builder refusal, a moved
+confirmation) leave the set unheld; any identity writes made before a later
+refusal are reported per member and are not undone.
+
 ## Releasing a set hold
 
-A set hold whose members were only captured is released with
-`lcm migration abort --confirm-generation <set id>`, with or without
-`--generation <set id>`. The journal records the abort and keeps the source
-backend selected. Settling per-member manifests and partial copies is part of
-the later set commands.
+A set hold is released with `lcm migration abort --confirm-generation <set id>`,
+with or without `--generation <set id>`. The confirmation is always the set
+id, never a member's generation id. The journal records the abort and keeps the
+source backend selected, and the same invocation settles every member
+manifest: all members are classified before the first write, a member with a
+pending copy effect refuses the abort with that member's evidence, written as
+`<member generation id>:<evidence>` and keeping the usual reason and the
+`resume` next step (finish it with a preparation resume first), and the journal is terminalized only if it is
+not already. Running the abort again after an interruption converges the
+members it left unsettled, including a member whose abort effect was begun and
+not completed. The command reports success only after every member is absent
+or aborted with nothing pending, and a new preparation or single-generation
+apply is refused (`abort-or-resume-required`) while a member of an earlier set
+is not settled.

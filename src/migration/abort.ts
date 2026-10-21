@@ -49,17 +49,37 @@ export type MigrationAbortGateStatus =
 export function classifyMigrationAbortGate(input: Readonly<{
   journalTerminal: boolean;
   generationId: string;
+  /**
+   * A terminal cutover-set journal names no manifest of its own: its set id
+   * is never a generation. The member generations are consulted instead, in
+   * manifest order, and a refusal names the member in its evidence (#1548).
+   */
+  generationIds?: readonly string[] | undefined;
   manifestStore: MigrationManifestStore;
 }>): MigrationAbortGateStatus {
   if (!input.journalTerminal) return { status: "ready" };
-  const presence = input.manifestStore.probeManifestPresence(input.generationId);
+  const members = input.generationIds;
+  for (const generationId of members ?? [input.generationId]) {
+    const member = classifyMigrationAbortGateManifest(generationId, input.manifestStore);
+    if (member.status !== "ready") {
+      return members === undefined ? member : { ...member, evidence: `${generationId}:${member.evidence}` };
+    }
+  }
+  return { status: "ready" };
+}
+
+function classifyMigrationAbortGateManifest(
+  generationId: string,
+  manifestStore: MigrationManifestStore,
+): MigrationAbortGateStatus {
+  const presence = manifestStore.probeManifestPresence(generationId);
   if (presence.status === "unresolvable") {
     return { status: "unresolvable", evidence: `manifest-${presence.reason}` };
   }
   if (presence.status === "absent") return { status: "ready" };
   let manifest: MigrationManifest;
   try {
-    manifest = input.manifestStore.read(input.generationId);
+    manifest = manifestStore.read(generationId);
   } catch (error) {
     return {
       status: "unresolvable",
@@ -71,6 +91,20 @@ export function classifyMigrationAbortGate(input: Readonly<{
   return { status: "incomplete-pair", evidence: `manifest-${recovery.action}` };
 }
 
+/**
+ * The member generations a cutover-set journal's abort settles, in manifest
+ * order; `undefined` for a single-generation journal, which settles only its
+ * own generation.
+ */
+export function abortSetMemberGenerationIds(journal: BackendMaintenanceJournal): readonly string[] | undefined {
+  return journal.cutoverSet?.manifest.members.map((member) => member.generationId);
+}
+
+/** Every generation whose manifest the journal's abort must settle. */
+export function abortManifestGenerationIds(journal: BackendMaintenanceJournal): readonly string[] {
+  return abortSetMemberGenerationIds(journal) ?? [journal.generationId];
+}
+
 export type MigrationAbortResult =
   /** `mutated` is false for an idempotent repeat that found both writes already made. */
   | Readonly<{ status: "completed"; mutated: boolean }>
@@ -80,7 +114,13 @@ export type MigrationAbortResult =
    * either manifest write) was made before this refusal, so a caller never
    * has to guess whether state moved (round-1 A-2).
    */
-  | Readonly<{ status: "refuse"; evidence: string; mutated: boolean }>;
+  | Readonly<{
+    status: "refuse";
+    evidence: string;
+    mutated: boolean;
+    /** The failing member generation of a cutover-set abort; absent for journal-wide failures and single generations. */
+    member?: string;
+  }>;
 
 function abortEffectId(generationId: string): string {
   return backendPublicationCanonicalSha256({ kind: "migration-abort-effect", generationId });
@@ -180,25 +220,45 @@ export async function performMigrationAbort(input: Readonly<{
     return { status: "refuse", evidence: `journal-${journal.phase}`, mutated: false };
   }
 
-  // Everything below up to the first write is read-only.
+  // A set abort names the failing member; a single generation keeps its bare evidence byte-for-byte.
+  const member = (generationId: string): { member?: string } =>
+    input.journal.cutoverSet === undefined ? {} : { member: generationId };
+
+  // Everything below up to the first write is read-only. A cutover-set
+  // journal settles every member generation (#1548 C8): all of them are
+  // classified before the first write, so one member that cannot be
+  // settled refuses the whole abort with the journal untouched.
   const store = input.manifestStore ?? new MigrationManifestStore({ homeDir: input.homeDir });
-  const presence = store.probeManifestPresence(journal.generationId);
-  if (presence.status === "unresolvable") {
-    return { status: "refuse", evidence: `manifest-${presence.reason}`, mutated: false };
-  }
-  let manifest: MigrationManifest | null = null;
-  if (presence.status === "present") {
+  const settling: { generationId: string; manifest: MigrationManifest; carried: boolean }[] = [];
+  for (const generationId of abortManifestGenerationIds(journal)) {
+    const presence = store.probeManifestPresence(generationId);
+    if (presence.status === "unresolvable") {
+      return { status: "refuse", evidence: `manifest-${presence.reason}`, mutated: false, ...member(generationId) };
+    }
+    if (presence.status === "absent") continue;
+    let manifest: MigrationManifest;
     try {
-      manifest = store.read(journal.generationId);
+      manifest = store.read(generationId);
     } catch (error) {
-      return { status: "refuse", evidence: manifestFailureEvidence(error), mutated: false };
+      return { status: "refuse", evidence: manifestFailureEvidence(error), mutated: false, ...member(generationId) };
     }
     const recovery = classifyMigrationRecovery(manifest);
-    if (recovery.action === "settled") {
-      manifest = null;
-    } else if (recovery.action !== "ready") {
-      return { status: "refuse", evidence: `manifest-${recovery.action}`, mutated: false };
+    if (recovery.action === "settled") continue;
+    if (recovery.action === "ready") {
+      settling.push({ generationId, manifest, carried: false });
+      continue;
     }
+    // Only a set abort resumes a carried abort effect: the journal is already aborted, so the effect's
+    // exact member id and aborted-journal input are what an uninterrupted run would have begun.
+    const pending = manifest.pendingEffect!;
+    if (journal.cutoverSet === undefined || journalNeedsWrite || pending.kind !== "abort") {
+      return { status: "refuse", evidence: `manifest-${recovery.action}`, mutated: false, ...member(generationId) };
+    }
+    if (journal.abortEvidenceSha256 === null || pending.effectId !== abortEffectId(generationId)
+      || pending.inputSha256 !== journal.checksumSha256) {
+      return { status: "refuse", evidence: "carried-effect-mismatch", mutated: false, ...member(generationId) };
+    }
+    settling.push({ generationId, manifest, carried: true });
   }
 
   if (input.dryRun === true) return { status: "dry-run" };
@@ -216,48 +276,66 @@ export async function performMigrationAbort(input: Readonly<{
       return { status: "refuse", evidence: journalFailureEvidence(error), mutated: false };
     }
   }
-  if (manifest === null) return { status: "completed", mutated };
 
   const now = (input.now ?? new Date()).toISOString();
-  const effectId = abortEffectId(journal.generationId);
-  let begun: MigrationManifest;
-  try {
-    begun = beginEffect(manifest, {
-      effectId,
-      kind: "abort",
-      inputSha256: journal.checksumSha256,
-      startedAt: now,
-    });
-  } catch (error) {
-    return { status: "refuse", evidence: manifestFailureEvidence(error), mutated };
+  // A set member seals to the aborted journal's persisted evidence: a retry's caller digests the
+  // already-aborted journal, which an uninterrupted run never saw. A single generation keeps the
+  // caller's evidence byte-for-byte (Bug #1659).
+  const memberEvidence = input.journal.cutoverSet === undefined ? input.abortEvidenceSha256 : journal.abortEvidenceSha256!;
+  for (const { generationId, manifest, carried } of settling) {
+    const effectId = abortEffectId(generationId);
+    if (carried) {
+      const pending = manifest.pendingEffect!;
+      try {
+        store.update(generationId, manifest.checksumSha256, (current) => completeEffect(
+          current,
+          abortCompletion(generationId, effectId, journal.abortEvidenceSha256!, pending.startedAt),
+        ));
+      } catch (error) {
+        return { status: "refuse", evidence: manifestFailureEvidence(error), mutated, ...member(generationId) };
+      }
+      mutated = true;
+      continue;
+    }
+    let begun: MigrationManifest;
+    try {
+      begun = beginEffect(manifest, {
+        effectId,
+        kind: "abort",
+        inputSha256: journal.checksumSha256,
+        startedAt: now,
+      });
+    } catch (error) {
+      return { status: "refuse", evidence: manifestFailureEvidence(error), mutated, ...member(generationId) };
+    }
+    try {
+      store.update(generationId, manifest.checksumSha256, () => begun);
+    } catch (error) {
+      return { status: "refuse", evidence: manifestFailureEvidence(error), mutated, ...member(generationId) };
+    }
+    mutated = true;
+    let candidate: MigrationManifest;
+    try {
+      candidate = completeEffect(begun, abortCompletion(generationId, effectId, memberEvidence, now));
+    } catch (error) {
+      return { status: "refuse", evidence: manifestFailureEvidence(error), mutated, ...member(generationId) };
+    }
+    try {
+      store.update(generationId, begun.checksumSha256, () => candidate);
+    } catch (error) {
+      return { status: "refuse", evidence: manifestFailureEvidence(error), mutated, ...member(generationId) };
+    }
   }
-  try {
-    store.update(journal.generationId, manifest.checksumSha256, () => begun);
-  } catch (error) {
-    return { status: "refuse", evidence: manifestFailureEvidence(error), mutated };
-  }
-  mutated = true;
-  let candidate: MigrationManifest;
-  try {
-    candidate = completeEffect(begun, abortCompletion(journal.generationId, effectId, input.abortEvidenceSha256, now));
-  } catch (error) {
-    return { status: "refuse", evidence: manifestFailureEvidence(error), mutated };
-  }
-  try {
-    store.update(journal.generationId, begun.checksumSha256, () => candidate);
-  } catch (error) {
-    return { status: "refuse", evidence: manifestFailureEvidence(error), mutated };
-  }
-  return { status: "completed", mutated: true };
+  return { status: "completed", mutated };
 }
 
 /**
  * Completes an `abort` effect that an earlier invocation began and did not
  * finish (router row 6: the journal is already `maintenance-aborted` and the
  * manifest carries a pending `abort`). `performMigrationAbort` cannot do
- * this: `classifyMigrationRecovery` calls the pending effect `resume` and it
- * refuses. It never touches the journal, so `abortMaintenance` is not called
- * again.
+ * this for a single generation: `classifyMigrationRecovery` calls the pending
+ * effect `resume` and it refuses. It never touches the journal, so
+ * `abortMaintenance` is not called again.
  *
  * The carried effect is checked against what `performMigrationAbort` would
  * have begun for this journal: the same effect id, and an input digest equal

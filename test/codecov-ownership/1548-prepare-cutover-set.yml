@@ -1,0 +1,23 @@
+references: ["#1548", "#1544"]
+rationale: >-
+  #1548 prepares a cutover set under one maintenance hold. The new
+  preparation service joins the migration capture, copy and cutover owner
+  next to the cutover-set contract, capture, copy and verification code it
+  composes. The copy source resolves its maintenance binding through the
+  member view, abort, its command and the apply and candidate abort gate
+  settle every member manifest of a set, the generation identity module
+  gains the set base and the family check, and the verify command exports
+  its input composition; each keeps its existing migration owner.
+  src/project-map.ts gains one lock-free read of a persisted canonical path
+  and keeps its project-worktrees owner. No file is removed, moved or
+  re-owned.
+pins:
+  - ["src/migration/cutover-set-prepare.ts", "unit-migration-cutover"]
+  - ["src/migration/copy-source.ts", "unit-migration-cutover"]
+  - ["src/migration/abort.ts", "unit-migration-cutover"]
+  - ["src/migration/cli-abort.ts", "unit-migration-cutover"]
+  - ["src/migration/apply.ts", "unit-migration-cutover"]
+  - ["src/migration/candidate.ts", "unit-migration-cutover"]
+  - ["src/migration/generation-identity.ts", "unit-migration-cutover"]
+  - ["src/migration/cli-verify.ts", "unit-migration-cutover"]
+  - ["src/project-map.ts", "unit-project-worktrees"]

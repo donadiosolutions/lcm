@@ -34,6 +34,7 @@ const IDENTIFIER_PATTERN = /^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$/u;
 const MAX_IDENTIFIER_LENGTH = 128;
 const SEPARATOR = "-";
 const BASE_LABEL = "sqlite-postgresql-migration";
+const SET_BASE_LABEL = "cutover-set";
 
 /**
  * The bound on how many candidate ordinals `apply` will probe before
@@ -124,11 +125,7 @@ export function computeMigrationGenerationBase(input: MigrationGenerationBaseInp
   if (typeof input.canonicalPath !== "string" || input.canonicalPath.length === 0) {
     invalid("migration base identity requires a canonical path");
   }
-  const { host, port, database } = input.target ?? invalid("migration base identity requires a target");
-  if (typeof host !== "string" || host.length === 0 || typeof database !== "string" || database.length === 0
-    || !Number.isInteger(port) || port <= 0 || port > 65535) {
-    invalid("migration base identity target coordinates are invalid");
-  }
+  const { host, port, database } = validatedTargetCoordinates(input.target);
   const digest = backendPublicationCanonicalSha256({
     version: 1,
     kind: "migration-generation-base-identity",
@@ -137,6 +134,70 @@ export function computeMigrationGenerationBase(input: MigrationGenerationBaseInp
     target: { host, port, database },
   });
   return `${BASE_LABEL}${SEPARATOR}${digest}`;
+}
+
+function validatedTargetCoordinates(target: NonSecretPostgreSqlTarget | undefined): NonSecretPostgreSqlTarget {
+  const { host, port, database } = target ?? invalid("migration base identity requires a target");
+  if (typeof host !== "string" || host.length === 0 || typeof database !== "string" || database.length === 0
+    || !Number.isInteger(port) || port <= 0 || port > 65535) {
+    invalid("migration base identity target coordinates are invalid");
+  }
+  return { host, port, database };
+}
+
+export type CutoverSetBaseMember = Readonly<{ physicalProjectId: string; generationId: string }>;
+
+/**
+ * The cutover-set base identity (#1548 C3): a versioned digest of the
+ * target's non-secret coordinates and the sorted (project, member
+ * generation) pairs. Because each member generation id carries its own
+ * probe ordinal, a member whose earlier generation became occupied moves
+ * the set base, and with it the set id an operator confirmed. Like the
+ * single-generation base it excludes every clock, random value and live
+ * capture; the set id is this base plus the probe ordinal that
+ * {@link resolveMigrationGenerationId} appends.
+ */
+export function computeCutoverSetBase(input: Readonly<{
+  target: NonSecretPostgreSqlTarget;
+  members: readonly CutoverSetBaseMember[];
+}>): string {
+  const target = validatedTargetCoordinates(input?.target);
+  if (!Array.isArray(input.members) || input.members.length === 0) {
+    invalid("cutover set base identity requires members");
+  }
+  const members = input.members.map(({ physicalProjectId, generationId }) => {
+    if (typeof physicalProjectId !== "string" || physicalProjectId.length === 0
+      || typeof generationId !== "string" || generationId.length === 0) {
+      invalid("cutover set base identity members require a project id and a generation id");
+    }
+    return { physicalProjectId, generationId };
+  }).sort((left, right) => (left.physicalProjectId < right.physicalProjectId ? -1 : 1));
+  if (new Set(members.map((member) => member.physicalProjectId)).size !== members.length) {
+    invalid("cutover set base identity members must be distinct projects");
+  }
+  const digest = backendPublicationCanonicalSha256({
+    version: 1,
+    kind: "cutover-set-base-identity",
+    target,
+    members,
+  });
+  return `${SET_BASE_LABEL}${SEPARATOR}${digest}`;
+}
+
+/**
+ * Whether `generationId` is exactly `base` plus the separator and a
+ * canonical probe ordinal within the bound. A held member that is not in its
+ * own base family was allocated for a different target or path.
+ */
+export function generationIdBelongsToBase(
+  base: string,
+  generationId: string,
+  maxProbeOrdinal: number = DEFAULT_MAX_PROBE_ORDINAL,
+): boolean {
+  const prefix = `${base}${SEPARATOR}`;
+  if (!generationId.startsWith(prefix)) return false;
+  const ordinal = generationId.slice(prefix.length);
+  return /^(0|[1-9][0-9]*)$/u.test(ordinal) && Number(ordinal) <= maxProbeOrdinal;
 }
 
 export type MigrationCandidateOccupancy =

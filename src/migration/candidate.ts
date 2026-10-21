@@ -10,7 +10,7 @@ import {
   type MigrationHoldCandidate,
 } from "./hold-continuation.js";
 import { resolveMigrationGenerationId, MigrationIdentityError } from "./generation-identity.js";
-import { classifyMigrationAbortGate } from "./abort.js";
+import { abortSetMemberGenerationIds, classifyMigrationAbortGate } from "./abort.js";
 import { MigrationManifestStore } from "./manifest-store.js";
 
 /**
@@ -153,6 +153,7 @@ export async function resolveMigrationApplyCandidate(
       const gate = classifyMigrationAbortGate({
         journalTerminal: true,
         generationId: journal.generationId,
+        generationIds: abortSetMemberGenerationIds(journal),
         manifestStore,
       });
       if (gate.status === "unresolvable") {
