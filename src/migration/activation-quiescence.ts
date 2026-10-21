@@ -81,6 +81,7 @@ export type ActivationQuiescenceReason =
   | "maintenance-journal-absent"
   | "maintenance-journal-unresolvable"
   | "maintenance-not-held"
+  | "cutover-set-unsupported"
   | "roster-not-single-machine"
   | "machine-identity-unavailable"
   | "roster-row-absent";
@@ -255,6 +256,15 @@ export async function checkActivationWriterQuiescence(
         "unsatisfied",
         "maintenance-not-held",
         `the maintenance journal is in phase ${journal.phase}; writer quiescence is only attributable while maintenance is held (phase maintenance-held)`,
+        null,
+      );
+    }
+
+    if (journal.cutoverSet !== undefined) {
+      return buildResult(
+        "unsatisfied",
+        "cutover-set-unsupported",
+        "the maintenance journal binds a cutover set; set-aware writer quiescence is not defined yet, so this single-generation check refuses",
         null,
       );
     }

@@ -1019,7 +1019,9 @@ from an earlier pass:
   is refused as `maintenance-not-held`;
 - the stored data on this machine belongs to exactly one project, the one
   being migrated. Activation of a machine with data for several projects
-  refuses with `uncovered-projects`; multi-project cutover is out of scope;
+  refuses with `uncovered-projects`; multi-project cutover is out of scope
+  here (see [Cutover sets](migration-cutover-set.md) for the contract that
+  later releases build on);
 - the destination identity, the project-map binding, the transfer-ledger copy
   binding and the destination census all match the verification report, and
   the PostgreSQL target passes the authenticated health check for the

@@ -1,0 +1,16 @@
+references: ["#1547", "#1544"]
+rationale: >-
+  #1547 adds the cutover-set contract for multi-project cutover. The new
+  pure contract module joins the migration owner next to the capture,
+  snapshot and queue-evidence code it binds. The maintenance journal gains
+  an optional set binding in the storage-abstractions owner that already
+  holds the journal. Capture, snapshot assertion, hold-entry sentinel
+  delegation and the writer-quiescence refusal keep their existing
+  migration owner. No file is removed, moved or re-owned.
+pins:
+  - ["src/migration/cutover-set.ts", "unit-migration-cutover"]
+  - ["src/migration/maintenance.ts", "unit-migration-cutover"]
+  - ["src/migration/sqlite-snapshot.ts", "unit-migration-cutover"]
+  - ["src/migration/hold-entry.ts", "unit-migration-cutover"]
+  - ["src/migration/activation-quiescence.ts", "unit-migration-cutover"]
+  - ["src/storage/backend-publication.ts", "unit-storage-abstractions"]

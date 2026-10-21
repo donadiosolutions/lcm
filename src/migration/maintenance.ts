@@ -26,6 +26,7 @@ import {
   isTerminalBackendMaintenancePhase,
   readBackendMaintenanceJournal,
   rebindBackendMaintenanceCutoff,
+  resolveBackendMaintenanceGenerationBinding,
   withBackendPublicationAppendBarrierAsync,
   type BackendPublicationLockToken,
 } from "../storage/backend-publication.js";
@@ -60,6 +61,12 @@ import {
   type AuthenticatedSqliteMigrationSnapshot,
 } from "./queue-evidence.js";
 import { canonicalJson } from "../storage/portable-record.js";
+import { enumerateStoredDataProjectHashes } from "./activation-coverage.js";
+import {
+  CutoverSetCaptureError,
+  type CutoverSetMemberAuthorityOutcome,
+  type CutoverSetMemberAuthorityResolution,
+} from "./cutover-set.js";
 
 type PostgreSqlConfig = Extract<ResolvedStorageConfig, { backend: "postgresql" }>;
 
@@ -165,6 +172,43 @@ function assertAuthenticatedAuthority(
   }
 }
 
+/**
+ * The per-project authority outcomes for a cutover set (#1547): every
+ * stored-data project, from the locked enumeration, is authenticated through
+ * its project-map canonical path or reported uncovered / unverifiable. There
+ * is no by-hash authenticator, so no project is omitted or bypassed.
+ */
+export function resolveCutoverSetMemberAuthorities(input: Readonly<{
+  homeDir: string;
+  lockToken: BackendPublicationLockToken;
+}>): CutoverSetMemberAuthorityResolution {
+  const enumeration = enumerateStoredDataProjectHashes({
+    homeDir: input.homeDir,
+    publicationLockToken: input.lockToken,
+  });
+  if (enumeration.status === "unresolvable") {
+    return { status: "unresolvable", reason: enumeration.reason, detail: enumeration.detail };
+  }
+  const map = readProjectMapSnapshot(input.homeDir, input.lockToken);
+  const outcomes = enumeration.projectHashes.map((physicalProjectId): CutoverSetMemberAuthorityOutcome => {
+    const entry = map[physicalProjectId];
+    if (entry === undefined) {
+      return { physicalProjectId, status: "uncovered", detail: "the project map has no entry for this project" };
+    }
+    let authority: AuthenticatedSqliteSnapshotAuthority;
+    try {
+      authority = authenticateSqliteMigrationSource(entry.canonical, input.homeDir, input.lockToken);
+    } catch (error) {
+      return { physicalProjectId, status: "unverifiable", detail: (error as Error).message };
+    }
+    if (authority.physicalProjectId !== physicalProjectId) {
+      return { physicalProjectId, status: "uncovered", detail: "canonical path authenticates a different project" };
+    }
+    return { physicalProjectId, status: "authenticated", authority };
+  });
+  return { status: "resolved", outcomes };
+}
+
 export async function captureAuthenticatedSqliteMigrationSource(
   authority: AuthenticatedSqliteSnapshotAuthority,
   options: SqliteSnapshotOptions,
@@ -177,17 +221,49 @@ export async function captureAuthenticatedSqliteMigrationSource(
     const revalidate = (): void => {
       const current = authenticateSqliteMigrationSource(authority.canonicalPath, options.homeDir, token);
       const journal = readBackendMaintenanceJournal(options.homeDir);
+      const view = resolveBackendMaintenanceGenerationBinding(journal, options.generationId);
+      if (journal?.cutoverSet !== undefined && journal.phase === "maintenance-held"
+        && (view === null || view.sourceSelectionSha256 !== authority.sourceSelectionSha256)) {
+        throw new CutoverSetCaptureError(
+          "cutover-set-member-unbound",
+          "the requested generation is not a member of the held set for this source authority",
+        );
+      }
       if (canonicalJson(current) !== expected
         || authenticatedAuthorities.get(current) !== authenticatedAuthorities.get(authority) || journal?.phase !== "maintenance-held"
-        || journal.checksumSha256 !== captureOptions.maintenanceChecksumSha256
-        || journal.generationId !== options.generationId) {
+        || view === null || view.checksumSha256 !== captureOptions.maintenanceChecksumSha256) {
         throw new Error("SQLite migration source authority changed before seal");
       }
     };
     revalidate();
+    const held = readBackendMaintenanceJournal(options.homeDir)!;
+    if (held.cutoverSet !== undefined) {
+      // Membership is the exact stored-data set under the barrier; a project that gained or lost data
+      // since entry drifts the set. Enumeration may reconcile the project map, so authority is revalidated.
+      const enumeration = enumerateStoredDataProjectHashes({ homeDir: options.homeDir, publicationLockToken: token });
+      if (enumeration.status === "unresolvable") {
+        throw new CutoverSetCaptureError(
+          "cutover-set-enumeration-unresolvable",
+          `${enumeration.reason}: ${enumeration.detail}`,
+        );
+      }
+      const members = held.cutoverSet.manifest.members.map((member) => member.physicalProjectId);
+      if (canonicalJson(enumeration.projectHashes) !== canonicalJson(members)) {
+        throw new CutoverSetCaptureError(
+          "cutover-set-membership-drift",
+          "the stored-data projects differ from the held set members",
+          [...new Set([...members, ...enumeration.projectHashes])].filter((hash) =>
+            members.includes(hash) !== enumeration.projectHashes.includes(hash)).sort(),
+        );
+      }
+      revalidate();
+    }
     const existing = await classifySqliteSnapshotArtifact(options.generationId, options);
     if (existing.state === "absent") {
-      const maintenance = readBackendMaintenanceJournal(options.homeDir)!;
+      const maintenance = resolveBackendMaintenanceGenerationBinding(
+        readBackendMaintenanceJournal(options.homeDir)!,
+        options.generationId,
+      )!;
       if (maintenance.sourceSelectionSha256 !== authority.sourceSelectionSha256) {
         throw new Error("SQLite migration capture request does not match held binding");
       }
@@ -209,11 +285,18 @@ export async function captureAuthenticatedSqliteMigrationSource(
         roster: [{ machineId: authority.machineIdentity.machineId, queueCutoff: binding.queueCutoff,
           evidenceSha256: binding.expectedSourceBytes.checksumSha256 }],
       }, token);
-      captureOptions = { ...options, expectedSourceBytes: binding.expectedSourceBytes, maintenanceChecksumSha256: bound.checksumSha256 };
+      captureOptions = {
+        ...options,
+        expectedSourceBytes: binding.expectedSourceBytes,
+        maintenanceChecksumSha256: resolveBackendMaintenanceGenerationBinding(bound, options.generationId)!.checksumSha256,
+      };
     }
     const artifact = await captureSqliteSnapshotArtifact(authority, { ...captureOptions, lockToken: token });
     revalidate();
-    const maintenance = readBackendMaintenanceJournal(options.homeDir)!;
+    const maintenance = resolveBackendMaintenanceGenerationBinding(
+      readBackendMaintenanceJournal(options.homeDir)!,
+      options.generationId,
+    )!;
     const result = await withMigrationQueueEvidence(options.homeDir, artifact, maintenance, (reference, records) =>
       sealMigrationQueueEvidence(options.homeDir, artifact, reference, records, revalidate));
     revalidate();
@@ -298,6 +381,14 @@ export function assertMigrationReplayAdmission(input: Readonly<{
   disposition: "selected" | "source-abort";
 }> {
   const journal = readBackendMaintenanceJournal(input.homeDir);
+  // 0. A live, non-terminal cutover-set hold fences replay for every generation before any historical
+  // selection binding is consulted: a member's old binding must not admit replay under an unsettled set.
+  if (journal?.cutoverSet !== undefined && !isTerminalBackendMaintenancePhase(journal.phase)) {
+    throw new BackendPublicationJournalError(
+      "unresolved-publication",
+      "migration maintenance has no authoritative terminal replay state",
+    );
+  }
   const live = journal !== null && journal.generationId === input.generationId ? journal : null;
   // 1. A live, non-terminal maintenance of this generation: its selection is still pending.
   if (live !== null && !isTerminalBackendMaintenancePhase(live.phase)) {

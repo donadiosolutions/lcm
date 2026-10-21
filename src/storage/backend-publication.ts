@@ -206,6 +206,42 @@ export type BackendMaintenanceRosterEntry = Readonly<{
   evidenceSha256: string;
 }>;
 
+/** One project generation named by a cutover-set manifest (#1547). */
+export type BackendCutoverSetMember = Readonly<{
+  physicalProjectId: string;
+  generationId: string;
+  sourceSelectionSha256: string;
+}>;
+
+/** The immutable, version-1 membership of one held cutover set. */
+export type BackendCutoverSetManifest = Readonly<{
+  version: 1;
+  setId: string;
+  machineId: string;
+  members: readonly BackendCutoverSetMember[];
+}>;
+
+/** The per-member queue-cutoff evidence recorded under a set hold. */
+export type BackendCutoverSetBinding = Readonly<{
+  generationId: string;
+  queueEvidenceSha256: string;
+  roster: readonly BackendMaintenanceRosterEntry[];
+}>;
+
+export type BackendCutoverSet = Readonly<{
+  manifest: BackendCutoverSetManifest;
+  bindings: readonly BackendCutoverSetBinding[];
+}>;
+
+/** The fields a capture validates for one generation of a maintenance hold. */
+export type BackendMaintenanceGenerationBinding = Readonly<{
+  generationId: string;
+  sourceSelectionSha256: string;
+  queueEvidenceSha256: string;
+  roster: readonly BackendMaintenanceRosterEntry[];
+  checksumSha256: string;
+}>;
+
 export type BackendMaintenanceJournal = Readonly<{
   version: typeof BACKEND_MAINTENANCE_VERSION;
   publicationId: string;
@@ -222,6 +258,8 @@ export type BackendMaintenanceJournal = Readonly<{
   selectedGenerationId: string | null;
   terminalEvidenceSha256: string | null;
   abortEvidenceSha256: string | null;
+  /** Present only for a cutover-set hold; absent keeps single-generation journals byte-identical. */
+  cutoverSet?: BackendCutoverSet;
   checksumSha256: string;
 }>;
 
@@ -231,6 +269,8 @@ export type EnterBackendMaintenanceInput = Readonly<{
   sourceSelectionSha256: string;
   queueEvidenceSha256: string;
   roster: readonly BackendMaintenanceRosterEntry[];
+  /** A cutover-set hold: unbound sentinel bindings, with the set-derived top-level fields. */
+  cutoverSet?: BackendCutoverSet;
   now?: Date;
   /** Exact entering journal observed during crash recovery. */
   expectedChecksumSha256?: string;
@@ -1234,6 +1274,303 @@ function parseMaintenanceRoster(value: unknown): readonly BackendMaintenanceRost
   return roster;
 }
 
+/** The unbound entry sentinel of one generation; domain-separated from real queue evidence by shape. */
+export function backendMaintenanceQueueEvidenceSentinel(input: Readonly<{
+  generationId: string;
+  sourceSelectionSha256: string;
+}>): string {
+  return backendPublicationCanonicalSha256({
+    version: 1,
+    kind: "queue-evidence-unbound",
+    generationId: input.generationId,
+    sourceSelectionSha256: input.sourceSelectionSha256,
+  });
+}
+
+/** The manifest digest a set journal records as its source-selection hash. */
+export function backendCutoverSetManifestSha256(manifest: BackendCutoverSetManifest): string {
+  return backendPublicationCanonicalSha256(manifest);
+}
+
+/** The derived top-level queue evidence of a set journal; it is never independent of the member bindings. */
+export function backendCutoverSetQueueEvidenceSha256(
+  bindings: readonly BackendCutoverSetBinding[],
+): string {
+  return backendPublicationCanonicalSha256({
+    version: 1,
+    kind: "cutover-set-queue-evidence",
+    bindings: bindings.map(({ generationId, queueEvidenceSha256 }) => ({ generationId, queueEvidenceSha256 })),
+  });
+}
+
+/** Strictly parse a cutover-set manifest; the one validator shared by storage and migration. */
+export function parseBackendCutoverSetManifest(value: unknown): BackendCutoverSetManifest {
+  if (
+    !isRecord(value)
+    || !exactKeys(value, ["machineId", "members", "setId", "version"])
+    || value.version !== 1
+    || typeof value.setId !== "string"
+    || !PUBLICATION_ID_PATTERN.test(value.setId)
+    || typeof value.machineId !== "string"
+    || !CANONICAL_UUID.test(value.machineId)
+    || !Array.isArray(value.members)
+    || value.members.length < 2
+  ) {
+    return fail("malformed-journal", "backend cutover-set manifest is malformed");
+  }
+  const setId = value.setId;
+  const members = value.members.map((item, index): BackendCutoverSetMember => {
+    if (
+      !isRecord(item)
+      || !exactKeys(item, ["generationId", "physicalProjectId", "sourceSelectionSha256"])
+      || typeof item.physicalProjectId !== "string"
+      || !HASH_PATTERN.test(item.physicalProjectId)
+      || typeof item.generationId !== "string"
+      || !PUBLICATION_ID_PATTERN.test(item.generationId)
+      || typeof item.sourceSelectionSha256 !== "string"
+      || !HASH_PATTERN.test(item.sourceSelectionSha256)
+    ) {
+      return fail("malformed-journal", `backend cutover-set member[${index}] is malformed`);
+    }
+    return {
+      physicalProjectId: item.physicalProjectId,
+      generationId: item.generationId,
+      sourceSelectionSha256: item.sourceSelectionSha256,
+    };
+  });
+  if (members.some((member, index) => index > 0 && members[index - 1]!.physicalProjectId >= member.physicalProjectId)) {
+    return fail("malformed-journal", "backend cutover-set members are not uniquely sorted by project");
+  }
+  const generationIds = new Set(members.map((member) => member.generationId));
+  if (generationIds.size !== members.length || generationIds.has(setId)) {
+    return fail("malformed-journal", "backend cutover-set generation ids are not unique");
+  }
+  return { version: 1, setId, machineId: value.machineId, members };
+}
+
+function parseCutoverSetBindings(
+  value: unknown,
+  manifest: BackendCutoverSetManifest,
+): readonly BackendCutoverSetBinding[] {
+  if (!Array.isArray(value) || value.length !== manifest.members.length) {
+    return fail("malformed-journal", "backend cutover-set bindings do not align with the manifest");
+  }
+  return value.map((item, index): BackendCutoverSetBinding => {
+    if (
+      !isRecord(item)
+      || !exactKeys(item, ["generationId", "queueEvidenceSha256", "roster"])
+      || item.generationId !== manifest.members[index]!.generationId
+      || typeof item.queueEvidenceSha256 !== "string"
+      || !HASH_PATTERN.test(item.queueEvidenceSha256)
+    ) {
+      return fail("malformed-journal", `backend cutover-set binding[${index}] is malformed`);
+    }
+    const roster = parseMaintenanceRoster(item.roster);
+    if (
+      roster.length !== 1
+      || roster[0]!.machineId !== manifest.machineId
+      || roster[0]!.evidenceSha256 !== item.queueEvidenceSha256
+    ) {
+      return fail("malformed-journal", `backend cutover-set binding[${index}] roster is inconsistent`);
+    }
+    return {
+      generationId: item.generationId,
+      queueEvidenceSha256: item.queueEvidenceSha256,
+      roster,
+    };
+  });
+}
+
+/** Strictly parse a cutover set (manifest plus aligned per-member bindings). */
+export function parseBackendCutoverSet(value: unknown): BackendCutoverSet {
+  if (!isRecord(value) || !exactKeys(value, ["bindings", "manifest"])) {
+    return fail("malformed-journal", "backend cutover set is malformed");
+  }
+  const manifest = parseBackendCutoverSetManifest(value.manifest);
+  return { manifest, bindings: parseCutoverSetBindings(value.bindings, manifest) };
+}
+
+export function backendCutoverSetEntryRoster(manifest: BackendCutoverSetManifest): readonly BackendMaintenanceRosterEntry[] {
+  return [{
+    machineId: manifest.machineId,
+    queueCutoff: null,
+    evidenceSha256: backendMaintenanceQueueEvidenceSentinel({
+      generationId: manifest.setId,
+      sourceSelectionSha256: backendCutoverSetManifestSha256(manifest),
+    }),
+  }];
+}
+
+/** The relationships a set journal's top-level fields must keep with its set. */
+function assertCutoverSetJournal(
+  journal: Omit<BackendMaintenanceJournal, "checksumSha256"> & Readonly<{ cutoverSet: BackendCutoverSet }>,
+): void {
+  const { manifest, bindings } = journal.cutoverSet;
+  if (
+    journal.generationId !== manifest.setId
+    || journal.publicationId !== manifest.setId
+    || journal.sourceSelectionSha256 !== backendCutoverSetManifestSha256(manifest)
+    || journal.queueEvidenceSha256 !== backendCutoverSetQueueEvidenceSha256(bindings)
+    || !sameValue(journal.roster, backendCutoverSetEntryRoster(manifest))
+    || journal.phase === "selection-prepared"
+    || journal.phase === "selection-completed"
+  ) {
+    return fail("malformed-journal", "backend cutover-set journal is inconsistent with its set");
+  }
+}
+
+const LONGEST_ISO_TIMESTAMP = "+275760-09-13T00:00:00.000Z";
+
+/**
+ * The serialized size of the largest journal this set can reach: every member
+ * cutoff bound, a terminal abort recorded, and the longest timestamps. A set
+ * whose worst case exceeds the read limit would persist an unreadable hold.
+ */
+export function backendCutoverSetJournalCapacity(cutoverSet: BackendCutoverSet): Readonly<{
+  worstCaseBytes: number;
+  limitBytes: number;
+}> {
+  const hex = "f".repeat(64);
+  const worst = {
+    version: BACKEND_MAINTENANCE_VERSION,
+    publicationId: cutoverSet.manifest.setId,
+    sourceBackend: "postgresql",
+    targetBackend: null,
+    phase: "maintenance-aborted",
+    createdAt: LONGEST_ISO_TIMESTAMP,
+    updatedAt: LONGEST_ISO_TIMESTAMP,
+    generationId: cutoverSet.manifest.setId,
+    sourceSelectionSha256: hex,
+    queueEvidenceSha256: hex,
+    roster: [{ machineId: cutoverSet.manifest.machineId, queueCutoff: null, evidenceSha256: hex }],
+    selectedGenerationId: null,
+    terminalEvidenceSha256: null,
+    abortEvidenceSha256: hex,
+    cutoverSet: {
+      manifest: cutoverSet.manifest,
+      bindings: cutoverSet.bindings.map((binding) => ({
+        generationId: binding.generationId,
+        queueEvidenceSha256: hex,
+        roster: [{ machineId: cutoverSet.manifest.machineId, queueCutoff: "9223372036854775807", evidenceSha256: hex }],
+      })),
+    },
+    checksumSha256: hex,
+  };
+  return { worstCaseBytes: Buffer.byteLength(`${canonicalJson(worst)}\n`), limitBytes: MAX_JOURNAL_BYTES };
+}
+
+function assertCutoverSetJournalBytes(journal: BackendMaintenanceJournal): void {
+  if (Buffer.byteLength(`${canonicalJson(journal)}\n`) > MAX_JOURNAL_BYTES) {
+    return fail("invalid-input", "cutover-set-too-large: the set journal would exceed the readable journal size");
+  }
+}
+
+/** The digest a capture binds for one member; excludes updatedAt, sibling members and the aggregate. */
+function cutoverMemberBindingChecksum(
+  journal: BackendMaintenanceJournal,
+  cutoverSet: BackendCutoverSet,
+  member: BackendCutoverSetMember,
+  binding: BackendCutoverSetBinding,
+): string {
+  return backendPublicationCanonicalSha256({
+    version: 1,
+    kind: "cutover-set-member-binding",
+    publicationId: journal.publicationId,
+    setId: cutoverSet.manifest.setId,
+    manifestSha256: backendCutoverSetManifestSha256(cutoverSet.manifest),
+    phase: journal.phase,
+    createdAt: journal.createdAt,
+    sourceBackend: journal.sourceBackend,
+    member,
+    binding,
+  });
+}
+
+/**
+ * The generation-scoped view of a maintenance hold. A single-generation
+ * journal is its own view (its checksum is the journal checksum); a set
+ * journal yields the member's own binding, or null for any other id.
+ */
+export function resolveBackendMaintenanceGenerationBinding(
+  journal: BackendMaintenanceJournal | null,
+  generationId: string,
+): BackendMaintenanceGenerationBinding | null {
+  if (journal === null) return null;
+  const cutoverSet = journal.cutoverSet;
+  if (cutoverSet === undefined) {
+    return journal.generationId === generationId
+      ? {
+        generationId: journal.generationId,
+        sourceSelectionSha256: journal.sourceSelectionSha256,
+        queueEvidenceSha256: journal.queueEvidenceSha256,
+        roster: journal.roster,
+        checksumSha256: journal.checksumSha256,
+      }
+      : null;
+  }
+  const index = cutoverSet.manifest.members.findIndex((member) => member.generationId === generationId);
+  if (index < 0) return null;
+  const member = cutoverSet.manifest.members[index]!;
+  const binding = cutoverSet.bindings[index]!;
+  return {
+    generationId,
+    sourceSelectionSha256: member.sourceSelectionSha256,
+    queueEvidenceSha256: binding.queueEvidenceSha256,
+    roster: binding.roster,
+    checksumSha256: cutoverMemberBindingChecksum(journal, cutoverSet, member, binding),
+  };
+}
+
+/** Rewrite only one member's binding, the derived aggregate and updatedAt. */
+function reboundCutoverSetJournal(
+  journal: BackendMaintenanceJournal,
+  cutoverSet: BackendCutoverSet,
+  generationId: string,
+  queueEvidenceSha256: string,
+  roster: readonly BackendMaintenanceRosterEntry[],
+): BackendMaintenanceJournal {
+  const rebound = parseBackendCutoverSet({
+    manifest: cutoverSet.manifest,
+    bindings: cutoverSet.bindings.map((binding) => binding.generationId === generationId
+      ? { generationId, queueEvidenceSha256, roster }
+      : binding),
+  });
+  return withMaintenanceChecksum({
+    ...journal,
+    cutoverSet: rebound,
+    queueEvidenceSha256: backendCutoverSetQueueEvidenceSha256(rebound.bindings),
+    updatedAt: new Date().toISOString(),
+  });
+}
+
+/** Entry-only checks: a set hold starts from the manifest-derived, unbound sentinel bindings. */
+function assertCutoverSetEntryInput(
+  input: EnterBackendMaintenanceInput,
+  cutoverSet: BackendCutoverSet,
+  roster: readonly BackendMaintenanceRosterEntry[],
+): void {
+  const { manifest, bindings } = cutoverSet;
+  if (
+    input.publicationId !== manifest.setId
+    || input.generationId !== manifest.setId
+    || input.sourceSelectionSha256 !== backendCutoverSetManifestSha256(manifest)
+    || input.queueEvidenceSha256 !== backendCutoverSetQueueEvidenceSha256(bindings)
+    || !sameValue(roster, backendCutoverSetEntryRoster(manifest))
+  ) {
+    return fail("invalid-input", "backend cutover-set maintenance input does not match its manifest");
+  }
+  if (bindings.some((binding, index) => binding.roster[0]!.queueCutoff !== null
+    || binding.queueEvidenceSha256 !== backendMaintenanceQueueEvidenceSentinel({
+      generationId: binding.generationId,
+      sourceSelectionSha256: manifest.members[index]!.sourceSelectionSha256,
+    }))) {
+    return fail("invalid-input", "backend cutover-set entry bindings are not the unbound sentinel");
+  }
+  if (backendCutoverSetJournalCapacity(cutoverSet).worstCaseBytes > MAX_JOURNAL_BYTES) {
+    return fail("invalid-input", "cutover-set-too-large: the set journal would exceed the readable journal size");
+  }
+}
+
 function parseMaintenanceJournal(value: Record<string, unknown>): BackendMaintenanceJournal {
   if (
     !exactKeys(value, [
@@ -1241,6 +1578,7 @@ function parseMaintenanceJournal(value: Record<string, unknown>): BackendMainten
       "phase", "publicationId", "queueEvidenceSha256", "roster",
       "selectedGenerationId", "sourceBackend", "sourceSelectionSha256",
       "targetBackend", "terminalEvidenceSha256", "updatedAt", "version",
+      ...(value.cutoverSet === undefined ? [] : ["cutoverSet"]),
     ])
   ) {
     return fail("malformed-journal", "backend maintenance journal has unknown fields");
@@ -1277,7 +1615,12 @@ function parseMaintenanceJournal(value: Record<string, unknown>): BackendMainten
     return fail("malformed-journal", "backend maintenance journal fields are malformed");
   }
   const roster = parseMaintenanceRoster(value.roster);
-  const journal = { ...value, roster } as unknown as BackendMaintenanceJournal;
+  let journal = { ...value, roster } as unknown as BackendMaintenanceJournal;
+  if (value.cutoverSet !== undefined) {
+    const cutoverSet = parseBackendCutoverSet(value.cutoverSet);
+    journal = { ...journal, cutoverSet };
+    assertCutoverSetJournal({ ...journal, cutoverSet });
+  }
   if (
     (journal.phase === "maintenance-entering" || journal.phase === "maintenance-held")
       && (journal.targetBackend !== null || journal.selectedGenerationId !== null
@@ -1356,6 +1699,7 @@ function writeMaintenanceJournal(
   replaceTerminalPublication = false,
 ): void {
   assertBackendPublicationCheckpointDirectory(homeDir, directoryHandle);
+  if (journal.cutoverSet !== undefined) assertCutoverSetJournalBytes(journal);
   const current = replaceTerminalPublication
     ? withBackendPublicationDirectoryRead(homeDir, (freshHandle) =>
       readMaintenanceJournalFromDirectory(homeDir, freshHandle) ?? readJournalFromDirectory(homeDir, freshHandle))
@@ -2354,14 +2698,17 @@ export function rebindBackendMaintenanceCutoff(
     const journal = readMaintenanceJournalFromDirectory(input.homeDir, directoryHandle);
     if (journal === null) return fail("publication-evidence-missing", "backend maintenance journal is missing");
     const roster = parseMaintenanceRoster(input.roster);
-    if (journal.phase !== "maintenance-held" || journal.checksumSha256 !== input.expectedChecksumSha256
-      || journal.generationId !== input.generationId || journal.sourceSelectionSha256 !== input.sourceSelectionSha256
+    const view = resolveBackendMaintenanceGenerationBinding(journal, input.generationId);
+    if (journal.phase !== "maintenance-held" || view === null || view.checksumSha256 !== input.expectedChecksumSha256
+      || view.sourceSelectionSha256 !== input.sourceSelectionSha256
       || !HASH_PATTERN.test(input.queueEvidenceSha256)
-      || canonicalJson(journal.roster.map((row) => row.machineId)) !== canonicalJson(roster.map((row) => row.machineId))) {
+      || canonicalJson(view.roster.map((row) => row.machineId)) !== canonicalJson(roster.map((row) => row.machineId))) {
       return fail("unexpected-state", "backend maintenance capture does not match held state");
     }
-    if (journal.queueEvidenceSha256 === input.queueEvidenceSha256 && canonicalJson(journal.roster) === canonicalJson(roster)) return journal;
-    const bound = withMaintenanceChecksum({ ...journal, queueEvidenceSha256: input.queueEvidenceSha256, roster, updatedAt: new Date().toISOString() });
+    if (view.queueEvidenceSha256 === input.queueEvidenceSha256 && canonicalJson(view.roster) === canonicalJson(roster)) return journal;
+    const bound = journal.cutoverSet === undefined
+      ? withMaintenanceChecksum({ ...journal, queueEvidenceSha256: input.queueEvidenceSha256, roster, updatedAt: new Date().toISOString() })
+      : reboundCutoverSetJournal(journal, journal.cutoverSet, input.generationId, input.queueEvidenceSha256, roster);
     writeMaintenanceJournal(input.homeDir, directoryHandle!, bound, journal.checksumSha256);
     return bound;
   });
@@ -3799,6 +4146,8 @@ export class BackendPublicationCoordinator {
         return fail("invalid-input", "backend maintenance input is malformed");
       }
       const roster = parseMaintenanceRoster(input.roster);
+      const cutoverSet = input.cutoverSet === undefined ? undefined : parseBackendCutoverSet(input.cutoverSet);
+      if (cutoverSet !== undefined) assertCutoverSetEntryInput(input, cutoverSet, roster);
       if (maintenance?.phase === "maintenance-entering") {
         if (maintenance.publicationId !== input.publicationId
           || maintenance.generationId !== input.generationId
@@ -3806,6 +4155,7 @@ export class BackendPublicationCoordinator {
           || maintenance.sourceSelectionSha256 !== input.sourceSelectionSha256
           || maintenance.queueEvidenceSha256 !== input.queueEvidenceSha256
           || canonicalJson(maintenance.roster) !== canonicalJson(roster)
+          || canonicalJson(maintenance.cutoverSet ?? null) !== canonicalJson(cutoverSet ?? null)
           || (input.now !== undefined && input.now.toISOString() !== maintenance.createdAt)
           || (input.expectedChecksumSha256 !== undefined && input.expectedChecksumSha256 !== maintenance.checksumSha256)) {
           return fail("unexpected-state", "backend maintenance recovery request does not match entering state");
@@ -3840,6 +4190,7 @@ export class BackendPublicationCoordinator {
         selectedGenerationId: null,
         terminalEvidenceSha256: null,
         abortEvidenceSha256: null,
+        ...(cutoverSet === undefined ? {} : { cutoverSet }),
       });
       writeMaintenanceJournal(this.#homeDir, directoryHandle, entering, existing?.checksumSha256, existing !== null);
       const held = withMaintenanceChecksum({
@@ -3866,6 +4217,9 @@ export class BackendPublicationCoordinator {
     return this.#locked(async (directoryHandle) => {
       const journal = readMaintenanceJournalFromDirectory(this.#homeDir, directoryHandle);
       if (journal === null) return fail("publication-evidence-missing", "backend maintenance journal is missing");
+      if (journal.cutoverSet !== undefined) {
+        return fail("unexpected-state", "backend cutover-set selection is not supported yet");
+      }
       if (
         !HASH_PATTERN.test(input.expectedChecksumSha256)
         || !HASH_PATTERN.test(input.terminalEvidenceSha256)

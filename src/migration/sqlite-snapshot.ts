@@ -36,8 +36,10 @@ import { canonicalJson } from "../storage/portable-record.js";
 import {
   backendPublicationCanonicalSha256,
   readBackendMaintenanceJournal,
+  resolveBackendMaintenanceGenerationBinding,
   withBackendPublicationAppendBarrierAsync,
   withBackendPublicationConsumerLockAsync,
+  type BackendMaintenanceGenerationBinding,
   type BackendPublicationLockToken,
 } from "../storage/backend-publication.js";
 
@@ -1026,19 +1028,20 @@ function requestSha256(authority: AuthenticatedSqliteSnapshotAuthority, generati
   return sha256(canonicalJson({ version: 1, generationId, sourceSelectionSha256: authority.sourceSelectionSha256, maintenanceChecksumSha256 }));
 }
 
-function assertMaintenance(context: Context, authority: AuthenticatedSqliteSnapshotAuthority): ReturnType<typeof readBackendMaintenanceJournal> & object {
+function assertMaintenance(context: Context, authority: AuthenticatedSqliteSnapshotAuthority): BackendMaintenanceGenerationBinding {
   const journal = readBackendMaintenanceJournal(context.homeDir);
+  const view = resolveBackendMaintenanceGenerationBinding(journal, context.generationId);
   if (
     journal === null
     || journal.version !== 3
     || journal.phase !== "maintenance-held"
     || journal.sourceBackend !== "sqlite"
     || journal.targetBackend !== null
-    || journal.generationId !== context.generationId
-    || journal.sourceSelectionSha256 !== authority.sourceSelectionSha256
-    || journal.checksumSha256 !== context.maintenanceChecksumSha256
+    || view === null
+    || view.sourceSelectionSha256 !== authority.sourceSelectionSha256
+    || view.checksumSha256 !== context.maintenanceChecksumSha256
   ) throw new SqliteSnapshotError("maintenance-mismatch");
-  return journal;
+  return view;
 }
 
 function roleInputs(authority: AuthenticatedSqliteSnapshotAuthority): readonly Readonly<{ role: SqliteSnapshotRole; path: string }>[] {

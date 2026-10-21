@@ -1,5 +1,5 @@
 import {
-  backendPublicationCanonicalSha256,
+  backendMaintenanceQueueEvidenceSentinel,
   BackendPublicationJournalError,
   type BackendMaintenanceJournal,
   type BackendMaintenanceRosterEntry,
@@ -29,12 +29,7 @@ export function migrationQueueEvidenceSentinel(input: Readonly<{
   generationId: string;
   sourceSelectionSha256: string;
 }>): string {
-  return backendPublicationCanonicalSha256({
-    version: 1,
-    kind: "queue-evidence-unbound",
-    generationId: input.generationId,
-    sourceSelectionSha256: input.sourceSelectionSha256,
-  });
+  return backendMaintenanceQueueEvidenceSentinel(input);
 }
 
 /**
