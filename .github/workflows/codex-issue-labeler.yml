@@ -385,7 +385,7 @@ jobs:
   classify:
     needs: [collect, preflight-write]
     if: ${{ needs.collect.outputs.has_work == 'true' && needs.preflight-write.result == 'success' }}
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     permissions: {}
     outputs:
       result: ${{ steps.codex.outputs.final-message }}
@@ -800,7 +800,7 @@ jobs:
   classify-security:
     needs: collect-security
     if: ${{ needs.collect-security.outputs.has_work == 'true' }}
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     permissions: {}
     outputs:
       result: ${{ steps.codex.outputs.final-message }}
@@ -1163,7 +1163,7 @@ jobs:
   classify-duplicates:
     needs: [preflight-write, apply-security, collect-duplicates]
     if: ${{ always() && needs.preflight-write.result == 'success' && needs.apply-security.outputs.has_bugs == 'true' && needs.collect-duplicates.outputs.has_issues == 'true' && needs.collect-duplicates.outputs.evidence != '' && needs.collect-duplicates.outputs.prompt != '' && needs.collect-duplicates.outputs.schema != '' }}
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     permissions: {}
     outputs:
       result: ${{ steps.codex.outputs.final-message }}
