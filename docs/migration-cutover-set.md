@@ -427,13 +427,16 @@ rollback report of its frozen witness while the selected installation is
 SQLite with every member unbound. The old activation witness, a bare index
 whose commitment vanished, an aborted or in-flight reverse publication, a
 rolled-back set under a PostgreSQL configuration and a rebound member all
-refuse. Original member manifests settle to rolled-back and keep their
-history; they never become replay authority for the replacement database.
+refuse. The replay key is the original member generation id together with
+that member's frozen rollback witness, admitted only after the aggregate
+reverse publication or the later-slot proof holds; the new physical
+build id is installation evidence, not a replay key. Original member
+manifests settle to rolled-back and keep their history.
 
 
 ## Releasing a set hold
 
-A set hold is released, before its selection, with
+A forward (SQLite-origin) set hold is released, before its selection, with
 `lcm migration abort --confirm-generation <set id>`,
 with or without `--generation <set id>`. The confirmation is always the set
 id, never a member's generation id. The journal records the abort and keeps the
@@ -450,3 +453,7 @@ deleting activation evidence; resume the activation instead. The command reports
 or aborted with nothing pending, and a new preparation or single-generation
 apply is refused (`abort-or-resume-required`) while a member of an earlier set
 is not settled.
+
+A PostgreSQL-origin rollback hold is not released this way: #1550 ships no
+set rollback abort, and `lcm migration abort` refuses that hold with
+`journal-rollback-hold`. Call the rollback again to resume it.
