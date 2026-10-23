@@ -502,11 +502,135 @@ function truncatePromptCodeUnits(value, maximum) {
   return bounded;
 }
 
-export function redactPromptText(value, maximum = 8_000) {
+const URL_SCHEME_START = /^[a-z]$/iu;
+const URL_SCHEME_CHARACTER = /^[a-z0-9+.-]$/iu;
+const URL_CREDENTIAL_WHITESPACE = /\s/u;
+
+function isUrlCredentialTerminator(character) {
+  return character === "/" || character === "@" || URL_CREDENTIAL_WHITESPACE.test(character);
+}
+
+function scanUrlCredentialScheme(value, index, schemeStart) {
+  const character = value[index];
+  if (URL_SCHEME_CHARACTER.test(character)) {
+    if (schemeStart === -1 && URL_SCHEME_START.test(character)) return index;
+    return schemeStart;
+  }
+  return -1;
+}
+
+function redactUrlCredentials(value, onUrlCredentialCodeUnit) {
+  const chunks = [];
+  let copiedUntil = 0;
+  let schemeStart = -1;
+  let candidate;
+
+  for (let index = 0; index < value.length;) {
+    if (onUrlCredentialCodeUnit) onUrlCredentialCodeUnit();
+    const character = value[index];
+    if (
+      character === ":"
+      && value[index + 1] === "/"
+      && value[index + 2] === "/"
+      && schemeStart !== -1
+    ) {
+      if (onUrlCredentialCodeUnit) {
+        onUrlCredentialCodeUnit();
+        onUrlCredentialCodeUnit();
+      }
+      candidate = { state: "username", userStart: index + 3 };
+      schemeStart = -1;
+      index += 3;
+      continue;
+    }
+
+    schemeStart = scanUrlCredentialScheme(value, index, schemeStart);
+    if (candidate?.state === "username") {
+      if (character === ":") {
+        candidate = { state: "password", passwordStart: index + 1 };
+      } else if (isUrlCredentialTerminator(character)) {
+        candidate = undefined;
+      }
+    } else if (candidate) {
+      if (character === "@") {
+        if (index > candidate.passwordStart) {
+          chunks.push(value.slice(copiedUntil, candidate.passwordStart), "[REDACTED]@");
+          copiedUntil = index + 1;
+        }
+        candidate = undefined;
+      } else if (character === "/" || URL_CREDENTIAL_WHITESPACE.test(character)) {
+        candidate = undefined;
+      }
+    }
+    index += 1;
+  }
+
+  if (chunks.length === 0) return value;
+  chunks.push(value.slice(copiedUntil));
+  return chunks.join("");
+}
+
+function redactTrailingUrlCredential(value, onUrlCredentialCodeUnit) {
+  let schemeStart = -1;
+  let candidate;
+
+  for (let index = 0; index < value.length;) {
+    if (onUrlCredentialCodeUnit) onUrlCredentialCodeUnit();
+    const character = value[index];
+    if (
+      character === ":"
+      && value[index + 1] === "/"
+      && value[index + 2] === "/"
+      && schemeStart !== -1
+    ) {
+      if (onUrlCredentialCodeUnit) {
+        onUrlCredentialCodeUnit();
+        onUrlCredentialCodeUnit();
+      }
+      candidate = { state: "username", userStart: index + 3 };
+      schemeStart = -1;
+      index += 3;
+      continue;
+    }
+
+    schemeStart = scanUrlCredentialScheme(value, index, schemeStart);
+    if (candidate?.state === "username") {
+      if (character === ":") {
+        candidate = {
+          state: "password",
+          passwordStart: index + 1,
+          hasUsername: index > candidate.userStart,
+        };
+      } else if (isUrlCredentialTerminator(character)) {
+        candidate = undefined;
+      }
+    } else if (candidate && (
+      character === "@"
+      || character === "/"
+      || URL_CREDENTIAL_WHITESPACE.test(character)
+    )) {
+      candidate = undefined;
+    }
+    index += 1;
+  }
+
+  if (
+    candidate?.state === "password"
+    && (candidate.hasUsername || value.length > candidate.passwordStart)
+  ) {
+    return `${value.slice(0, candidate.passwordStart)}[REDACTED]`;
+  }
+  return value;
+}
+
+export function redactPromptText(value, maximum = 8_000, instrumentation = undefined) {
   if (!Number.isSafeInteger(maximum) || maximum < 0) {
     throw new TypeError("Maximum prompt text length must be a non-negative integer");
   }
-  const redacted = String(value ?? "")
+  const observer = instrumentation?.onUrlCredentialCodeUnit;
+  const onUrlCredentialCodeUnit =
+    typeof observer === "function" ? observer : undefined;
+  let redacted = String(value ?? "")
     .replace(
       /-----BEGIN [A-Z0-9 ]{0,72}PRIVATE KEY-----[\s\S]*?-----END [A-Z0-9 ]{0,72}PRIVATE KEY-----/gu,
       "[REDACTED]",
@@ -526,16 +650,12 @@ export function redactPromptText(value, maximum = 8_000) {
     .replace(
       /(\b(?:password|passwd|token|secret|api[_-]?key|authorization)\s*[:=]\s*)(?:"[^"\r\n]+"|'[^'\r\n]+'|[^\s,;]+)/giu,
       "$1[REDACTED]",
-    )
-    .replace(
-      /([a-z][a-z0-9+.-]*:\/\/[^:\s/@]+:)[^@\s/]+@/giu,
-      "$1[REDACTED]@",
     );
+  redacted = redactUrlCredentials(redacted, onUrlCredentialCodeUnit);
   const wasTruncated = redacted.length > maximum;
   let bounded = truncatePromptCodeUnits(redacted, maximum);
   if (wasTruncated) {
-    bounded = truncatePromptCodeUnits(
-      bounded
+    let truncatedRedacted = bounded
       .replace(
         /\b(?:github_pat_[A-Za-z0-9_]*|gh[pousr]_[A-Za-z0-9_]*|sk-[A-Za-z0-9_-]*|AKIA[A-Z0-9]*)$/gu,
         "[REDACTED]",
@@ -547,13 +667,12 @@ export function redactPromptText(value, maximum = 8_000) {
       .replace(
         /(\b(?:password|passwd|token|secret|api[_-]?key|authorization)\s*[:=]\s*)(?:"[^"\r\n]*|'[^'\r\n]*|[^\s,;]*)$/giu,
         "$1[REDACTED]",
-      )
-      .replace(
-        /([a-z][a-z0-9+.-]*:\/\/[^:\s/@]+:)[^@\s/]*$/giu,
-        "$1[REDACTED]",
-      ),
-      maximum,
-    )
+      );
+    truncatedRedacted = redactTrailingUrlCredential(
+      truncatedRedacted,
+      onUrlCredentialCodeUnit,
+    );
+    bounded = truncatePromptCodeUnits(truncatedRedacted, maximum)
       .replace(/\[R(?:E(?:D(?:A(?:C(?:T(?:E(?:D)?)?)?)?)?)?)?$/u, "");
   }
   return bounded;

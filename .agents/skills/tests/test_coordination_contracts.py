@@ -35,6 +35,137 @@ class CoordinationContractTests(unittest.TestCase):
         self.assertIn("../procedural-development/references/worker-execution.md", text)
         self.assertIn("before triage dispatch", " ".join(text.split()))
 
+    def test_bug_campaign_requires_canonical_untrusted_issue_envelopes(self):
+        entry = self.read("triage-fix-all-bugs/SKILL.md")
+        triage = self.read("triage-fix-all-bugs/references/triage.md")
+        combined = entry + "\n" + triage
+        normalized = " ".join(combined.split())
+
+        for marker in ("<<<LCM_UNTRUSTED_ISSUE_DATA>>>",
+                       "<<<END_LCM_UNTRUSTED_ISSUE_DATA>>>",
+                       "[REDACTED_UNTRUSTED_DELIMITER]"):
+            self.assertIn(marker, entry)
+        self.assertRegex(
+            entry,
+            r"`title`, `body`, `comments`, `reproduction`, `evidence`",
+        )
+        for term in ("every nested string", "UTF-8 JSON", "65,536 UTF-8 bytes",
+                     "redactPromptText()", "before byte budgeting",
+                     "stable source order", "UTF-8 code-point boundary",
+                     "explicit truncation metadata", "fail closed"):
+            self.assertIn(term, normalized)
+
+        for role in ("triage", "duplicate adjudication", "planning",
+                     "implementation", "review", "synthesis", "escalation",
+                     "follow-up", "replacement"):
+            self.assertIn(role, entry.lower())
+        for path in ("direct read", "persist", "readback", "handoff",
+                     "worker-authored evidence"):
+            self.assertIn(path, combined.lower())
+        for rule in ("embedded instructions", "independently",
+                     "trusted source identity", "root-only"):
+            self.assertIn(rule, combined.lower())
+
+        for key in ("applied", "source", "reason", "originalBytes",
+                    "retainedBytes"):
+            self.assertIn(f"`{key}`", entry)
+        for term in ("object keys and values", "authorship metadata",
+                     "inert untrusted data", "enumerated trusted source identity"):
+            self.assertIn(term, normalized)
+
+    def test_bug_campaign_persists_only_envelopes_and_root_mutates_issues(self):
+        triage = self.read("triage-fix-all-bugs/references/triage.md")
+        normalized = " ".join(triage.split())
+        self.assertIn("## Native tracker\n", triage)
+        tracker = triage.split("## Native tracker\n", 1)[1].split("\n## ", 1)[0]
+        tracker_normalized = " ".join(tracker.split())
+        self.assertIn("## Individual triage\n", triage)
+        individual = triage.split("## Individual triage\n", 1)[1].split("\n## ", 1)[0]
+        individual_normalized = " ".join(individual.split())
+
+        for store in ("S0 inventory", "root Epic", "child trackers", "checkpoints"):
+            self.assertIn(store, triage)
+        self.assertIn("canonical envelopes plus their separate trusted source identity",
+                      tracker_normalized)
+        self.assertIn("proposed `closed-nonreproducible`", individual)
+        self.assertIn("proposed `closed-duplicate`", individual)
+        self.assertIn("authoritative closure readback", individual_normalized)
+        self.assertNotIn("close as `closed-nonreproducible`", individual)
+        self.assertNotIn("close only this Bug", individual)
+        self.assertIn("only the root comments on or closes issues", normalized.lower())
+
+    def test_bug_campaign_user_docs_publish_the_envelope_contract(self):
+        text = self.read("../../docs/triage-fix-all-bugs.md")
+        normalized = " ".join(text.split())
+        for term in ("canonical envelopes plus their separate trusted source identity",
+                     "`applied`, `source`, `reason`, `originalBytes`, and `retainedBytes`",
+                     "object keys and values", "authorship metadata",
+                     "authoritative closure readback"):
+            self.assertIn(term, normalized)
+
+    def test_bug_campaign_untrusted_input_scenario_spans_handoff(self):
+        text = self.read("tests/coordination-scenarios.md")
+        self.assertIn("| C16 |", text)
+        for term in ("delimiter injection", "eventual truncation boundary",
+                     "safe projection cannot be produced", "triage",
+                     "remediation", "canonical envelope", "independently"):
+            self.assertIn(term, text.lower())
+
+    def test_bug_campaign_uses_union_redaction_without_helper_pretruncation(self):
+        entry = self.read("triage-fix-all-bugs/SKILL.md")
+        triage = self.read("triage-fix-all-bugs/references/triage.md")
+        combined = " ".join((entry + "\n" + triage).split())
+        for term in ("union", "NATIVE_PATTERNS", "../../../src/scrub.ts",
+                     "GITLEAKS_PATTERNS", "../../../src/generated-patterns.ts",
+                     "Number.MAX_SAFE_INTEGER", "8,000 UTF-16 code units",
+                     "canonical projector owns all truncation",
+                     "all redacted content", "unavoidable earlier loss"):
+            self.assertIn(term, combined)
+
+        scenario = self.read("tests/coordination-scenarios.md")
+        self.assertIn("| C17 |", scenario)
+        for token in ("npm_0123456789abcdefghijklmnopqrstuvwxyz",
+                      "glpat-0123456789abcdefghij",
+                      "xoxb-123456789-abcdefghij",
+                      "sk_live_51J3kxABCDEFghijKLMNop",
+                      "AIzaSyA1234567890abcdefghijklmnopqrstuv",
+                      "SG.AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"):
+            self.assertIn(token, scenario)
+        for term in ("9,001-byte", "below the 65,536-byte envelope limit",
+                     "preserve all 9,001 bytes", "truncation.applied=false"):
+            self.assertIn(term, scenario)
+
+    def test_bug_campaign_projects_api_reads_before_model_exposure(self):
+        entry = self.read("triage-fix-all-bugs/SKILL.md")
+        triage = self.read("triage-fix-all-bugs/references/triage.md")
+        docs = self.read("../../docs/triage-fix-all-bugs.md")
+        combined = " ".join((entry + "\n" + triage + "\n" + docs).split())
+
+        for term in ("trusted transport-side projector",
+                     "before raw issue content enters tool output or model context",
+                     "projection after worker exposure is too late",
+                     "fail closed without reading"):
+            self.assertIn(term, combined)
+        for term in ("bug-campaign-intake.mjs", "gh issue view",
+                     "trustedIssue", "untrustedIssueData"):
+            self.assertIn(term, combined)
+
+    def test_bug_campaign_bounds_the_complete_wrapped_envelope(self):
+        entry = self.read("triage-fix-all-bugs/SKILL.md")
+        triage = self.read("triage-fix-all-bugs/references/triage.md")
+        docs = self.read("../../docs/triage-fix-all-bugs.md")
+        combined = " ".join((entry + "\n" + triage + "\n" + docs).split())
+
+        for term in ("complete wrapped envelope", "both delimiter lines",
+                     "two separating LF bytes", "including the JSON"):
+            self.assertIn(term, combined)
+
+        scenario = self.read("tests/coordination-scenarios.md")
+        for term in ("JSON alone is exactly 65,536 UTF-8 bytes",
+                     "complete wrapper exceeds the ceiling",
+                     "complete wrapped envelope is at most 65,536 UTF-8 bytes"):
+            self.assertIn(term, scenario)
+
     def test_engine_requires_both_lifecycle_contracts(self):
         text = self.read("procedural-development/SKILL.md")
         self.assertIn("references/root-lifecycle.md", text)
@@ -124,7 +255,7 @@ class CoordinationContractTests(unittest.TestCase):
 
     def test_behavioral_scenarios_cover_reported_failures_and_recovery(self):
         text = self.read("tests/coordination-scenarios.md")
-        for number in range(1, 16):
+        for number in range(1, 18):
             self.assertIn(f"| C{number:02d} |", text)
         self.assertIn("not executed", text)
         self.assertIn("tool calls", text)
