@@ -70,6 +70,7 @@ import { readCutoverSetActivationRecords, type CutoverSetActivationCheckpointMem
 import {
   createCutoverSetRollbackCheckpoint,
   createCutoverSetRollbackInstallRecord,
+  cutoverSetRollbackRecordCapacity,
   deriveCutoverSetRollbackSetId,
   readCutoverSetRollbackRecords,
   recordCutoverSetRollbackCheckpoint,
@@ -305,6 +306,7 @@ export type CutoverSetRollbackDependencies = Readonly<{
   readActivationRecords: typeof readCutoverSetActivationRecords;
   readRollbackRecords: typeof readCutoverSetRollbackRecords;
   rollbackJournalCapacity: typeof backendCutoverSetRollbackJournalCapacity;
+  recordCapacity: typeof cutoverSetRollbackRecordCapacity;
   rebindCutoff: typeof rebindBackendMaintenanceCutoff;
   recordCheckpoint: typeof recordCutoverSetRollbackCheckpoint;
   recordInstall: typeof recordCutoverSetRollbackInstall;
@@ -358,6 +360,7 @@ export function createCutoverSetRollbackDependencies(input: Readonly<{ homeDir: 
     readActivationRecords: readCutoverSetActivationRecords,
     readRollbackRecords: readCutoverSetRollbackRecords,
     rollbackJournalCapacity: backendCutoverSetRollbackJournalCapacity,
+    recordCapacity: cutoverSetRollbackRecordCapacity,
     rebindCutoff: rebindBackendMaintenanceCutoff,
     recordCheckpoint: recordCutoverSetRollbackCheckpoint,
     recordInstall: recordCutoverSetRollbackInstall,
@@ -764,6 +767,12 @@ async function runUnderBarrier(ctx: Context): Promise<CutoverSetRollbackResult> 
   if (capacity.worstCaseBytes > capacity.limitBytes) {
     return refused(ctx, "records", "cutover-set-too-large", "the rollback hold journal could reach " + capacity.worstCaseBytes
       + " bytes with its selection; the readable limit is " + capacity.limitBytes).exit;
+  }
+  // C2: the checkpoint aggregate, its member records and the frozen tuple must be representable too, before any settlement or write.
+  const records = ctx.deps.recordCapacity({ originalSetId: ctx.originalSetId, manifest: ctx.manifest });
+  if (records.checkpointBytes > records.limitBytes || records.selectionBytes > records.limitBytes || records.memberRecordBytes > records.memberLimitBytes) {
+    return refused(ctx, "records", "cutover-set-too-large", "the rollback records could reach " + records.checkpointBytes + " (checkpoint), "
+      + records.memberRecordBytes + " (member) and " + records.selectionBytes + " (selection) bytes; the limits are " + records.limitBytes + " and " + records.memberLimitBytes).exit;
   }
   let v3: BackendMaintenanceJournal | null;
   let v2: BackendPublicationJournal | null = null;

@@ -2,6 +2,7 @@ import { canonicalJson, canonicalSha256 } from "../storage/portable-record.js";
 import {
   BACKEND_PUBLICATION_MAX_JOURNAL_BYTES,
   backendCutoverSetManifestSha256,
+  backendCutoverSetRollbackSelectionWorstCase,
   backendPublicationCanonicalSha256,
   parseBackendCutoverSetManifest,
   parseBackendCutoverSetRollbackSelection,
@@ -29,7 +30,7 @@ import {
  * authentication, durable create-only writes, crash-twin recovery, read-only
  * scan), exactly as the activation records are.
  *
- * checkpoint.json is the rollback commitment, written after every pending
+ * The checkpoint is the rollback commitment, written after every pending
  * activation effect was settled and before the rollback hold archives the
  * completed activation publication: the rollback hold manifest (the original
  * members under the derived rollback set id), the activation records it
@@ -37,8 +38,18 @@ import {
  * journal checksum, operability fact), the sealed reverse artifact identity
  * and, per member in manifest order, the authenticated preserved snapshot,
  * the forward held binding, the activation epoch, attempt and witness, the
- * settled active head and the rollback lease evidence. From the moment it
- * exists every member's old activation evidence is fenced for replay.
+ * settled active head and the rollback lease evidence. On disk it is a thin
+ * aggregate (checkpoint.json: everything but the member evidence, which it
+ * references by digest in manifest order) over bounded per-member records
+ * (member-<index>.json), so that every membership the activation budget
+ * admits is representable within the shared record limit (C2); in memory it
+ * is the one CutoverSetRollbackCheckpoint whose digest covers every member.
+ * The member records are written first and the aggregate last: member
+ * records alone are not a commitment (the activation publication is still
+ * live and the next call re-derives the same bytes), while an aggregate
+ * that cannot be assembled from its members is unresolvable. From the moment
+ * the aggregate exists every member's old activation evidence is fenced for
+ * replay.
  *
  * install-<index>.json is one member's installation evidence, written after
  * its new SQLite generation was installed at the canonical path and its
@@ -68,15 +79,17 @@ const RECORD_WIRE_VERSION = 1 as const;
 const CHECKPOINT_FILE = "checkpoint.json";
 const SELECTION_FILE = "selection.json";
 const INSTALL_FILE_PATTERN = /^install-([0-9]{6})\.json$/u;
-/** The checkpoint and the thin tuple share the set journal's limit (C2); an installation record is small. */
+const MEMBER_FILE_PATTERN = /^member-([0-9]{6})\.json$/u;
+/** The checkpoint aggregate and the thin tuple share the set journal's limit (C2); a member or installation record is small. */
 export const MAX_CUTOVER_SET_ROLLBACK_RECORD_BYTES = BACKEND_PUBLICATION_MAX_JOURNAL_BYTES;
 export const MAX_CUTOVER_SET_ROLLBACK_INSTALL_RECORD_BYTES = 64 * 1024;
+export const MAX_CUTOVER_SET_ROLLBACK_MEMBER_RECORD_BYTES = 8 * 1024;
 
 const CUTOVER_SET_ROLLBACK_STORE: GenerationScopedStore = {
   subdirectory: CUTOVER_SET_ROLLBACK_SUBDIRECTORY,
   noun: "cutover-set rollback record",
   maxFileBytes: MAX_CUTOVER_SET_ROLLBACK_RECORD_BYTES,
-  isFinalFileName: (name) => name === CHECKPOINT_FILE || name === SELECTION_FILE || INSTALL_FILE_PATTERN.test(name),
+  isFinalFileName: (name) => name === CHECKPOINT_FILE || name === SELECTION_FILE || INSTALL_FILE_PATTERN.test(name) || MEMBER_FILE_PATTERN.test(name),
 };
 
 const HASH_PATTERN = /^[0-9a-f]{64}$/u;
@@ -92,6 +105,10 @@ const CHECKPOINT_MEMBER_KEYS = [
   "manifestChecksumSha256", "manifestRevision", "physicalProjectId", "queueCutoff", "queueEvidenceSha256", "remoteProjectId",
   "snapshotChecksumSha256", "sourceByteWitnessSha256", "sourceSelectionSha256",
 ] as const;
+const CHECKPOINT_MEMBER_RECORD_KEYS = ["checksumSha256", "index", "kind", "member", "originalSetId", "setId", "version"] as const;
+/** Every canonical UUID is 36 characters; the widest cutoff and revision the parsers admit. */
+const WIDEST_UUID = "ffffffff-ffff-7fff-bfff-ffffffffffff";
+const WIDEST_QUEUE_CUTOFF = "9223372036854775807";
 const INSTALL_KEYS = [
   "buildContentSha256", "buildManifestSha256", "buildWitnessChecksumSha256", "canonicalPath", "checksumSha256", "database",
   "exportEvidenceSha256", "generationId", "installedGenerationId", "kind", "mode", "originalSetId", "preemption", "setId", "sidecars", "version",
@@ -336,6 +353,159 @@ export function createCutoverSetRollbackCheckpoint(input: CreateCutoverSetRollba
   return parseCutoverSetRollbackCheckpoint({ ...body, checksumSha256: cutoverSetRollbackCheckpointSha256(body) });
 }
 
+/** One member's stored checkpoint evidence: the member row under its manifest index, sealed on its own (C2). */
+export type CutoverSetRollbackCheckpointMemberRecord = Readonly<{
+  version: 1;
+  kind: "cutover-set-rollback-checkpoint-member";
+  originalSetId: string;
+  setId: string;
+  index: number;
+  member: CutoverSetRollbackCheckpointMember;
+  checksumSha256: string;
+}>;
+
+/** The thin aggregate stored as checkpoint.json: the checkpoint with its members replaced by their record digests. */
+type CheckpointAggregate = Omit<CutoverSetRollbackCheckpoint, "members"> & Readonly<{ members: readonly string[] }>;
+
+/** The member record digest: canonical sha256 over every field but its own checksum. */
+export function cutoverSetRollbackCheckpointMemberRecordSha256(record: Omit<CutoverSetRollbackCheckpointMemberRecord, "checksumSha256">): string {
+  const { checksumSha256: _checksum, ...body } = record as
+    Omit<CutoverSetRollbackCheckpointMemberRecord, "checksumSha256"> & Partial<Pick<CutoverSetRollbackCheckpointMemberRecord, "checksumSha256">>;
+  return backendPublicationCanonicalSha256(body);
+}
+
+/** The sealed member record of a checkpoint's member at its manifest index. */
+export function cutoverSetRollbackCheckpointMemberRecord(checkpoint: CutoverSetRollbackCheckpoint, index: number): CutoverSetRollbackCheckpointMemberRecord {
+  const member = checkpoint.members[index];
+  if (member === undefined) invalid("cutover-set rollback checkpoint has no member at index " + index);
+  const body = {
+    version: 1 as const, kind: "cutover-set-rollback-checkpoint-member" as const,
+    originalSetId: checkpoint.originalSetId, setId: checkpoint.setId, index, member,
+  };
+  return { ...body, checksumSha256: cutoverSetRollbackCheckpointMemberRecordSha256(body) };
+}
+
+/** The thin aggregate of a checkpoint: its members referenced by their record digests, in manifest order. */
+export function cutoverSetRollbackCheckpointAggregate(checkpoint: CutoverSetRollbackCheckpoint): Readonly<Record<string, unknown>> {
+  return { ...checkpoint, members: checkpoint.members.map((_, index) => cutoverSetRollbackCheckpointMemberRecord(checkpoint, index).checksumSha256) };
+}
+
+/** Strictly parse a stored member record: shape, set ids, index and reproduced checksum; the row itself is validated once the checkpoint is assembled. */
+function parseCheckpointMemberRecord(value: unknown, originalSetId: string): CutoverSetRollbackCheckpointMemberRecord {
+  if (
+    !isRecord(value)
+    || !exactKeys(value, CHECKPOINT_MEMBER_RECORD_KEYS)
+    || value.version !== 1
+    || value.kind !== "cutover-set-rollback-checkpoint-member"
+    || value.originalSetId !== originalSetId
+    || value.setId !== deriveCutoverSetRollbackSetId(originalSetId)
+    || !isCount(value.index)
+    || !isRecord(value.member)
+    || !exactKeys(value.member, CHECKPOINT_MEMBER_KEYS)
+    || !isHash(value.checksumSha256)
+  ) {
+    invalid("cutover-set rollback checkpoint member record is malformed");
+  }
+  const record = {
+    version: 1 as const, kind: "cutover-set-rollback-checkpoint-member" as const, originalSetId, setId: value.setId as string,
+    index: value.index, member: value.member as unknown as CutoverSetRollbackCheckpointMember, checksumSha256: value.checksumSha256,
+  };
+  if (cutoverSetRollbackCheckpointMemberRecordSha256(record) !== record.checksumSha256) {
+    invalid("cutover-set rollback checkpoint member record checksum does not match");
+  }
+  return record;
+}
+
+/** Strictly parse the stored aggregate's own shape (the manifest through storage's validator, every digest well-formed, one member digest per manifest member). */
+function parseCheckpointAggregate(value: unknown): CheckpointAggregate {
+  if (
+    !isRecord(value)
+    || !exactKeys(value, CHECKPOINT_KEYS)
+    || value.version !== 1
+    || value.kind !== "cutover-set-rollback-checkpoint"
+    || typeof value.originalSetId !== "string"
+    || !IDENTIFIER_PATTERN.test(value.originalSetId)
+    || !isHash(value.originalCheckpointSha256)
+    || !isHash(value.originalSelectionSha256)
+    || !isHash(value.activationIdentityDigest)
+    || !isHash(value.activationJournalChecksumSha256)
+    || !isHash(value.operabilityFactValueSha256)
+    || !isHash(value.identityDigest)
+    || !isHash(value.checksumSha256)
+    || !Array.isArray(value.members)
+    || !value.members.every(isHash)
+  ) {
+    invalid("cutover-set rollback checkpoint aggregate is malformed");
+  }
+  let manifest: BackendCutoverSetManifest;
+  try {
+    manifest = parseBackendCutoverSetManifest(value.manifest);
+  } catch (error) {
+    invalid("cutover-set rollback checkpoint manifest is malformed: " + (error as Error).message);
+  }
+  if (
+    manifest.setId !== deriveCutoverSetRollbackSetId(value.originalSetId)
+    || value.setId !== manifest.setId
+    || value.publicationId !== manifest.setId
+    || value.members.length !== manifest.members.length
+  ) {
+    invalid("cutover-set rollback checkpoint aggregate does not restate its manifest");
+  }
+  return {
+    version: 1, kind: "cutover-set-rollback-checkpoint", originalSetId: value.originalSetId, setId: manifest.setId, manifest, publicationId: manifest.setId,
+    originalCheckpointSha256: value.originalCheckpointSha256, originalSelectionSha256: value.originalSelectionSha256,
+    activationIdentityDigest: value.activationIdentityDigest, activationJournalChecksumSha256: value.activationJournalChecksumSha256,
+    operabilityFactValueSha256: value.operabilityFactValueSha256, identityDigest: value.identityDigest,
+    members: value.members as string[], checksumSha256: value.checksumSha256,
+  };
+}
+
+/** Assemble the checkpoint from its aggregate and member records: every digest reproduced, then the whole checkpoint re-parsed. */
+function assembleCheckpoint(aggregate: CheckpointAggregate, records: ReadonlyMap<number, CutoverSetRollbackCheckpointMemberRecord>): CutoverSetRollbackCheckpoint {
+  const members = aggregate.members.map((digest, index) => {
+    const record = records.get(index);
+    if (record === undefined) invalid("cutover-set rollback checkpoint member record " + index + " is missing");
+    if (record.checksumSha256 !== digest) invalid("cutover-set rollback checkpoint member record " + index + " is not the aggregate's");
+    return record.member;
+  });
+  return parseCutoverSetRollbackCheckpoint({ ...aggregate, members });
+}
+
+/**
+ * The widest wire sizes the rollback records of a manifest can reach (C2):
+ * the checkpoint aggregate, one member record and the frozen tuple, each in
+ * its canonical envelope with the widest values the parsers admit, beside
+ * the limits they are written under. The service refuses a set these exceed
+ * before any write; the storage capacity proves that no membership the
+ * activation budget admits does.
+ */
+export function cutoverSetRollbackRecordCapacity(
+  input: Readonly<{ originalSetId: string; manifest: BackendCutoverSetManifest }>,
+): Readonly<{ checkpointBytes: number; memberRecordBytes: number; selectionBytes: number; limitBytes: number; memberLimitBytes: number }> {
+  const hex = "f".repeat(64);
+  const widest = (member: BackendCutoverSetManifest["members"][number]): CutoverSetRollbackCheckpointMember => ({
+    physicalProjectId: member.physicalProjectId, generationId: member.generationId, remoteProjectId: WIDEST_UUID,
+    heldMemberChecksumSha256: hex, snapshotChecksumSha256: hex, sourceSelectionSha256: member.sourceSelectionSha256, queueEvidenceSha256: hex,
+    queueCutoff: WIDEST_QUEUE_CUTOFF, sourceByteWitnessSha256: hex, epochId: hex, attemptId: hex, activationWitnessChecksumSha256: hex,
+    manifestRevision: Number.MAX_SAFE_INTEGER, manifestChecksumSha256: hex, evidenceSha256: hex,
+  });
+  const aggregate: CheckpointAggregate = {
+    version: 1, kind: "cutover-set-rollback-checkpoint", originalSetId: input.originalSetId, setId: input.manifest.setId, manifest: input.manifest,
+    publicationId: input.manifest.setId, originalCheckpointSha256: hex, originalSelectionSha256: hex, activationIdentityDigest: hex,
+    activationJournalChecksumSha256: hex, operabilityFactValueSha256: hex, identityDigest: hex, members: input.manifest.members.map(() => hex), checksumSha256: hex,
+  };
+  const memberRecordBytes = input.manifest.members.reduce((widestBytes, member, index) => Math.max(widestBytes, Buffer.byteLength(wireContent(input.originalSetId, {
+    version: 1, kind: "cutover-set-rollback-checkpoint-member", originalSetId: input.originalSetId, setId: input.manifest.setId, index, member: widest(member), checksumSha256: hex,
+  }))), 0);
+  return {
+    checkpointBytes: Buffer.byteLength(wireContent(input.originalSetId, aggregate)),
+    memberRecordBytes,
+    selectionBytes: Buffer.byteLength(wireContent(input.originalSetId, backendCutoverSetRollbackSelectionWorstCase(input.manifest, input.originalSetId))),
+    limitBytes: MAX_CUTOVER_SET_ROLLBACK_RECORD_BYTES,
+    memberLimitBytes: MAX_CUTOVER_SET_ROLLBACK_MEMBER_RECORD_BYTES,
+  };
+}
+
 /** The installation record digest: canonical sha256 over every field but its own checksum. */
 export function cutoverSetRollbackInstallRecordSha256(record: Omit<CutoverSetRollbackInstallRecord, "checksumSha256">): string {
   const { checksumSha256: _checksum, ...body } = record as
@@ -431,6 +601,10 @@ function installFileName(index: number): string {
   return "install-" + String(index).padStart(6, "0") + ".json";
 }
 
+function memberFileName(index: number): string {
+  return "member-" + String(index).padStart(6, "0") + ".json";
+}
+
 /**
  * Prove the thin tuple descends from the checkpoint and the installation
  * records: same checkpoint digest, hold, publication, original set, original
@@ -521,7 +695,9 @@ function parseStoredRecord(name: string, content: string, originalSetId: string)
 /**
  * Read and verify the records of one rollback: "authoritatively-absent" has
  * the binding store's meaning (positively no store, no set directory, or an
- * authenticated empty one); any record without its checkpoint, a record that
+ * authenticated empty one, or only member records of a checkpoint whose
+ * aggregate was never written); any other record without the checkpoint
+ * aggregate, an aggregate without one of its member records, a record that
  * does not re-derive its checksum, an envelope naming another set, an
  * installation record whose index or member is not the checkpoint's, or a
  * selection that does not descend from the records is "unresolvable".
@@ -538,23 +714,35 @@ export function readCutoverSetRollbackRecords(
   if (read.kind === "unresolvable") return { state: "unresolvable", reason: read.reason };
   let currentFile = "";
   try {
-    let checkpoint: CutoverSetRollbackCheckpoint | null = null;
+    let aggregate: CheckpointAggregate | null = null;
+    const memberRecords = new Map<number, CutoverSetRollbackCheckpointMemberRecord>();
     const others: { name: string; record: unknown }[] = [];
     for (const file of read.files) {
       currentFile = file.name;
       const record = parseStoredRecord(file.name, file.content, originalSetId);
       if (file.name === CHECKPOINT_FILE) {
-        checkpoint = parseCutoverSetRollbackCheckpoint(record);
-        if (checkpoint.originalSetId !== originalSetId) invalid("checkpoint names another set");
+        aggregate = parseCheckpointAggregate(record);
+        if (aggregate.originalSetId !== originalSetId) invalid("checkpoint names another set");
+      } else if (MEMBER_FILE_PATTERN.test(file.name)) {
+        const index = Number(MEMBER_FILE_PATTERN.exec(file.name)![1]);
+        const memberRecord = parseCheckpointMemberRecord(record, originalSetId);
+        if (memberRecord.index !== index) invalid("checkpoint member record is stored under another index");
+        memberRecords.set(index, memberRecord);
       } else {
         others.push({ name: file.name, record });
       }
     }
-    if (checkpoint === null) {
-      // A present read holds at least one file, and none of them was the checkpoint.
+    if (aggregate === null) {
+      // Member records alone are a checkpoint whose aggregate was never written: no commitment exists yet.
+      if (others.length === 0) return { state: "authoritatively-absent" };
       currentFile = others[0]!.name;
       throw new CutoverSetRollbackRecordError("checkpoint-missing", "a rollback record is stored without its checkpoint");
     }
+    currentFile = CHECKPOINT_FILE;
+    if (memberRecords.size !== aggregate.members.length) {
+      invalid("the checkpoint aggregate references " + aggregate.members.length + " member records and " + memberRecords.size + " are stored");
+    }
+    const checkpoint = assembleCheckpoint(aggregate, memberRecords);
     const installs = new Map<string, CutoverSetRollbackInstallRecord>();
     let selectionValue: unknown;
     let selectionPresent = false;
@@ -599,10 +787,12 @@ function requireRecords(
 }
 
 /**
- * Durably record the rollback checkpoint, or reuse a byte-identical stored
- * one. The input is re-parsed (the checksum is re-derived) before any write;
- * different stored bytes are a MigrationBindingConflictError, never an
- * overwrite. Synchronous. First record of the rollback.
+ * Durably record the rollback checkpoint (its member records in manifest
+ * order, then its aggregate), or reuse byte-identical stored ones. The input
+ * is re-parsed (the checksum is re-derived) and every record's wire size is
+ * checked before any write; different stored bytes are a
+ * MigrationBindingConflictError, never an overwrite. Synchronous. First
+ * record of the rollback.
  */
 export function recordCutoverSetRollbackCheckpoint(
   input: Readonly<{ homeDir: string; checkpoint: CutoverSetRollbackCheckpoint }>,
@@ -610,7 +800,16 @@ export function recordCutoverSetRollbackCheckpoint(
 ): void {
   const homeDir = validateHomeDir(input.homeDir);
   const checkpoint = parseCutoverSetRollbackCheckpoint(input.checkpoint);
-  recordFile(homeDir, checkpoint.originalSetId, CHECKPOINT_FILE, checkpoint, MAX_CUTOVER_SET_ROLLBACK_RECORD_BYTES, dependencies);
+  const memberRecords = checkpoint.members.map((_, index) => cutoverSetRollbackCheckpointMemberRecord(checkpoint, index));
+  const aggregate = { ...checkpoint, members: memberRecords.map((record) => record.checksumSha256) };
+  // A parsed member record is bounded far below its limit (recordFile re-checks it); the aggregate grows with the manifest.
+  if (Buffer.byteLength(wireContent(checkpoint.originalSetId, aggregate)) > MAX_CUTOVER_SET_ROLLBACK_RECORD_BYTES) {
+    invalid("cutover-set rollback record " + CHECKPOINT_FILE + " exceeds " + MAX_CUTOVER_SET_ROLLBACK_RECORD_BYTES + " bytes");
+  }
+  for (const [index, record] of memberRecords.entries()) {
+    recordFile(homeDir, checkpoint.originalSetId, memberFileName(index), record, MAX_CUTOVER_SET_ROLLBACK_MEMBER_RECORD_BYTES, dependencies);
+  }
+  recordFile(homeDir, checkpoint.originalSetId, CHECKPOINT_FILE, aggregate, MAX_CUTOVER_SET_ROLLBACK_RECORD_BYTES, dependencies);
 }
 
 /**

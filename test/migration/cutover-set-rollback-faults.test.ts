@@ -107,6 +107,12 @@ describe("rollbackCutoverSet refusals before any durable rollback state", () => 
     refusal(await f.run({ readMaintenanceJournal: () => { throw new Error("unreadable"); } }), "slot", "activation-unresolvable", "unreadable");
     interruption(await f.run({ readRollbackRecords: () => ({ state: "unresolvable", reason: "corrupt" }) }), "records", "state-unresolvable", "corrupt");
     refusal(await f.run({ rollbackJournalCapacity: () => ({ worstCaseBytes: 2, limitBytes: 1 }) }), "records", "cutover-set-too-large");
+    // C2: a checkpoint aggregate, member record or frozen tuple that could not be represented refuses before any settlement or write.
+    const fits = { checkpointBytes: 1, memberRecordBytes: 1, selectionBytes: 1, limitBytes: 2, memberLimitBytes: 2 };
+    refusal(await f.run({ recordCapacity: () => ({ ...fits, checkpointBytes: 3 }) }), "records", "cutover-set-too-large", "3 (checkpoint)");
+    refusal(await f.run({ recordCapacity: () => ({ ...fits, selectionBytes: 3 }) }), "records", "cutover-set-too-large", "3 (selection)");
+    refusal(await f.run({ recordCapacity: () => ({ ...fits, memberRecordBytes: 3 }) }), "records", "cutover-set-too-large", "3 (member)");
+    expect(f.deps.recordCapacity({ originalSetId: f.originalSetId, manifest: { ...f.checkpoint.manifest, setId: f.setId } })).toMatchObject({ limitBytes: 1024 * 1024, memberLimitBytes: 8 * 1024 });
     expect(readCutoverSetRollbackRecords({ homeDir: f.homeDir, originalSetId: f.originalSetId })).toEqual({ state: "authoritatively-absent" });
   });
 
