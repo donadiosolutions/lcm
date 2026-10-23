@@ -71,7 +71,17 @@ fingerprint preflight is the failed contract, then rerun readiness.
 
 ## Run the conformance harness
 
-Docker and the runner-provided OpenSSL must be available. From a clean checkout
+Local runs require the Docker CLI, OpenSSL, and by default rootless Podman.
+Enable the user's Podman API socket once with
+`systemctl --user enable --now podman.socket`. Outside GitHub Actions, the
+harness and `scripts/ci-environment.mjs` point the Docker CLI at
+`$XDG_RUNTIME_DIR/podman/podman.sock` through `DOCKER_HOST`, overriding any
+other engine, and fail before creating resources when that socket is absent.
+To use Docker instead, set `LCM_TEST_CONTAINER_ENGINE=docker`; the Docker CLI
+then keeps whatever engine its own `DOCKER_HOST` or context selects. `podman`
+and `docker` are the only accepted values. GitHub Actions ignores the
+setting and keeps its runner-provided Docker engine and OpenSSL. From a clean
+checkout
 with the [verified pnpm toolchain](../../../../docs/development.md) bootstrapped
 and dependencies installed using `pnpm install --frozen-lockfile`, run:
 
@@ -209,7 +219,8 @@ restore container is still running.
 
 A failed ownership or database-sentinel guard intentionally leaves resources
 for inspection. Never delete them by a broad name glob. Inspect the exact
-labels first:
+labels first, with `DOCKER_HOST=unix://$XDG_RUNTIME_DIR/podman/podman.sock`
+exported for local Podman runs:
 
 ```bash
 docker ps -a --filter label=com.donadiosolutions.lcm.postgresql-test-run

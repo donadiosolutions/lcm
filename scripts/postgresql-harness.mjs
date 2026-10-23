@@ -27,6 +27,7 @@ import {
 } from "./postgresql-images.mjs";
 import {
   POSTGRES_TEMPLATE_MARKER,
+  containerEngineEnvironment,
   validatePostgreSqlTemplateArchive,
 } from "./ci-environment.mjs";
 import {
@@ -1996,6 +1997,13 @@ if (process.argv[1] && fileURLToPath(import.meta.url) === process.argv[1]) {
   const consumerProbe = process.argv.includes("--consumer-signal-probe");
   const forkConsumerProbe = process.argv.includes("--fork-consumer-signal-probe");
   const allocationFailureProbe = process.argv.includes("--allocation-failure-probe");
+  try {
+    // Every docker child, including nested Vitest and signal probes, inherits this.
+    Object.assign(process.env, containerEngineEnvironment(process.env));
+  } catch (error) {
+    process.stderr.write(`PostgreSQL harness startup failed: ${error.message}\n`);
+    process.exit(1);
+  }
   runHarness(allocationFailureProbe ? {
     afterRunAllocation: () => {
       throw new Error("injected pre-readiness failure");
