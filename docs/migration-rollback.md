@@ -325,6 +325,14 @@ cutoff: once the selection is back on SQLite, the daemon's passive sweep
 drains it (see [Passive learning](passive-learning.md)). Until that sweep
 has run, the backlog stays preserved and correctly routed.
 
+An archived passive event can already be in the local outbox when rollback
+runs. Rollback checks that row against the archive and compares its
+timestamp by instant rather than as text. The local outbox stores SQLite's
+`YYYY-MM-DD HH:MM:SS` form, while the archive stores the portable ISO form
+(`YYYY-MM-DDTHH:MM:SS.ffffffZ`), so both forms of the same instant match and
+rollback proceeds. A malformed timestamp, or one that names a different
+instant, still refuses the run.
+
 ## Running it: `lcm migration rollback`
 
 Rollback publishes its configuration and project map through the same
