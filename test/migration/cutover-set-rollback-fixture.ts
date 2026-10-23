@@ -8,7 +8,7 @@ import type { ResolvedStorageConfig } from "../../src/daemon/config.js";
 import { lcmHomeDir } from "../../src/runtime-paths.js";
 import { projectMapPath } from "../../src/project-map.js";
 import { readBackendMaintenanceJournal, readBackendPublicationJournal } from "../../src/storage/backend-publication.js";
-import { canonicalSha256, PORTABLE_RECORD_DOMAIN_ORDER } from "../../src/storage/portable-record.js";
+import { canonicalSha256 } from "../../src/storage/portable-record.js";
 import { openSqlitePortableSource, sqlitePortableFileSha256 } from "../../src/storage/sqlite/portable-source.js";
 import type { PostgreSqlSnapshotSession } from "../../src/storage/postgresql/snapshot-session.js";
 import { migrationWitnessSha256 } from "../../src/migration/activation-witness.js";

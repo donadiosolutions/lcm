@@ -18,7 +18,7 @@ import { migrationCutoverSetRollbackDirectory, readCutoverSetRollbackRecords } f
 import { rollbackCutoverSet, type CutoverSetRollbackDependencies, type CutoverSetRollbackResult } from "../../src/migration/cutover-set-rollback.js";
 import { MigrationProtocolError } from "../../src/migration/protocol.js";
 import { MACHINE, cleanupRoots, expectActivated } from "./cutover-set-activate-fixture.js";
-import { driftedCensus, expectAllPostgreSql, expectRolledBack, rollbackFixture, sqliteDatabase, writeConfig, type RollbackFixture } from "./cutover-set-rollback-fixture.js";
+import { driftedCensus, expectAllPostgreSql, expectRolledBack, rollbackFixture, sqliteDatabase, type RollbackFixture } from "./cutover-set-rollback-fixture.js";
 
 /**
  * Refusals before any durable rollback state (nothing moves, every lease
