@@ -320,6 +320,70 @@ describe("after the selection", () => {
     expectRolledBack(f, await f.run(), "publication-journal");
   });
 
+  it("revalidates every frozen witness under reacquired fences before preparing again after an abort (PR #1668 P1)", async () => {
+    const f = await rollbackFixture();
+    const [a, b] = f.members;
+    await crashAt(f, "after-prepare");
+    const frozen = readCutoverSetRollbackRecords({ homeDir: f.homeDir, originalSetId: f.originalSetId });
+    const installed = f.members.map((member) => readFileSync(join(lcmHomeDir(f.homeDir), "projects", member.localProjectId, "db.sqlite")));
+    const unchanged = () => {
+      expect(readBackendPublicationJournal(f.homeDir)).toMatchObject({ phase: "aborted", publicationId: f.setId });
+      expectAllPostgreSql(f);
+      expect(readCutoverSetRollbackRecords({ homeDir: f.homeDir, originalSetId: f.originalSetId })).toEqual(frozen);
+      for (const [index, member] of f.members.entries()) {
+        expect(readFileSync(join(lcmHomeDir(f.homeDir), "projects", member.localProjectId, "db.sqlite"))).toEqual(installed[index]);
+        expect(f.activation.manifestStore.read(member.generationId)).toMatchObject({ phase: "rolling-back", pendingEffect: expect.objectContaining({ kind: "publish-rollback" }) });
+      }
+    };
+    // Something else aborted the sealed publication: PostgreSQL is selected again and the fences are released, so writes resume.
+    await f.activation.coordinator().abort();
+    expect(readBackendPublicationJournal(f.homeDir)).toMatchObject({ phase: "aborted", publicationId: f.setId });
+    expect(readBackendPublicationJournal(f.homeDir)!.recoveryReference).not.toBeNull();
+    // The reacquired sessions are recovery sessions: the set recovery admission gates them.
+    blockedAt(await f.run({ sessionDependencies: { ...f.deps.sessionDependencies, checkSetRecoveryAdmission: async () => ({ status: "unsatisfied", detail: "another journal", quiescenceFence: null }) } }), "sessions", a!.generationId, "quiescence-unsatisfied", "another journal");
+    unchanged();
+    expect(f.deps.prepareCalls).toBe(1);
+    // The destination of B (post-write) accepted writes after the abort: its frozen witness is no longer reproduced.
+    const sealedB = f.liveCensus.get(b!.remoteProjectId)!;
+    f.liveCensus.set(b!.remoteProjectId, sealedB.map((entry) => ({ ...entry, prefixSha256: "9".repeat(64) })));
+    blockedAt(await f.run(), "revalidate", b!.generationId, "pending-evidence-drift", "not prepared again");
+    unchanged();
+    expect(f.deps.prepareCalls).toBe(1);
+    f.liveCensus.set(b!.remoteProjectId, sealedB);
+    // The destination of A (pre-write) shows writes now: another mode than the frozen one.
+    const sealedA = f.liveCensus.get(a!.remoteProjectId)!;
+    f.liveCensus.set(a!.remoteProjectId, sealedA.map((entry) => ({ ...entry, prefixSha256: "9".repeat(64) })));
+    blockedAt(await f.run(), "revalidate", a!.generationId, "pending-evidence-drift");
+    unchanged();
+    f.liveCensus.set(a!.remoteProjectId, sealedA);
+    // A readback that fails blocks at the same step.
+    blockedAt(await f.run({ sessionDependencies: { ...f.deps.sessionDependencies, readFencedDestinationCensus: async () => { throw new Error("readback lost"); } } }), "revalidate", a!.generationId, "target-unreachable", "readback lost");
+    unchanged();
+    // Unchanged destinations converge: the sealed material is prepared exactly once more.
+    expectRolledBack(f, await f.run(), "publication-journal");
+    expect(f.deps.prepareCalls).toBe(2);
+    // Through the abort-path phases the abort is finished first, then the fences are reacquired and the witnesses revalidated.
+    const g = await rollbackFixture();
+    const [, gb] = g.members;
+    await crashAt(g, "after-prepare");
+    let crashed = false;
+    const abortCrashing = createBackendPublicationCoordinator({
+      homeDir: g.homeDir, remoteGuard: { mode: "delegated", provider: createPostgreSqlBackendPublicationRemoteGuard({ guard: g.activation.guard, machineId: MACHINE, ttlMs: 60_000 }) },
+      observer: (event) => { if (!crashed && event === "after-journal-write" && readBackendPublicationJournal(g.homeDir)?.phase === "aborting") { crashed = true; throw new Error("crash while aborting"); } },
+    });
+    await expect(abortCrashing.abort()).rejects.toThrow("crash while aborting");
+    expect(readBackendPublicationJournal(g.homeDir)?.phase).toBe("aborting");
+    const sealedGb = g.liveCensus.get(gb!.remoteProjectId)!;
+    g.liveCensus.set(gb!.remoteProjectId, sealedGb.map((entry) => ({ ...entry, prefixSha256: "9".repeat(64) })));
+    blockedAt(await g.run(), "revalidate", gb!.generationId, "pending-evidence-drift");
+    expect(readBackendPublicationJournal(g.homeDir)).toMatchObject({ phase: "aborted", publicationId: g.setId });
+    expectAllPostgreSql(g);
+    expect(g.deps.prepareCalls).toBe(1);
+    g.liveCensus.set(gb!.remoteProjectId, sealedGb);
+    expectRolledBack(g, await g.run(), "publication-journal");
+    expect(g.deps.prepareCalls).toBe(2);
+  });
+
   it("interrupts when the completed reverse publication, the selected installation or a member's completion cannot be verified", async () => {
     const f = await rollbackFixture();
     const [a] = f.members;

@@ -1587,7 +1587,7 @@ async function preSelection(ctx: Context, held: BackendMaintenanceJournal, membe
     const sessions = await openSessions(ctx, false);
     if (sessions !== null) return sessions.exit;
     for (const member of ctx.members) {
-      const revalidated = await revalidateFrozenMember(ctx, member);
+      const revalidated = await revalidateFrozenMember(ctx, member, "the prepared selection is not completed");
       if (revalidated !== null) return revalidated.exit;
     }
     const selected = await stepSelection(ctx, held);
@@ -1686,8 +1686,9 @@ async function postSelection(ctx: Context, v3: BackendMaintenanceJournal | null,
   }
   const target = await probeTarget(ctx);
   if (target !== null) return target.exit;
-  // A recovery session per pending member while the coordinator still drives the fence (or the selection is not yet completed).
-  const needsSessions = ownV2 === null || FENCE_DRIVING_PHASES.has(ownV2.phase) || isAbortedUnsealed(ownV2);
+  // A recovery session per pending member while the coordinator still drives the fence (or the selection is not yet
+  // completed); a journal on or past its abort path reacquires them once the abort is settled (publishReverse).
+  const needsSessions = ownV2 === null || FENCE_DRIVING_PHASES.has(ownV2.phase);
   if (needsSessions) {
     const sessions = await openSessions(ctx, true);
     if (sessions !== null) return sessions.exit;
@@ -1695,7 +1696,7 @@ async function postSelection(ctx: Context, v3: BackendMaintenanceJournal | null,
   if (v3 !== null && v3.phase === "selection-prepared") {
     // F1: a prepared selection is completed only if a fresh readback still reproduces every frozen witness.
     for (const member of ctx.members) {
-      const revalidated = await revalidateFrozenMember(ctx, member);
+      const revalidated = await revalidateFrozenMember(ctx, member, "the prepared selection is not completed");
       if (revalidated !== null) return revalidated.exit;
     }
     const selected = await stepSelection(ctx, v3);
@@ -1704,8 +1705,8 @@ async function postSelection(ctx: Context, v3: BackendMaintenanceJournal | null,
   return finishAfterSelection(ctx, ownV2);
 }
 
-/** A frozen member's fresh readback must reproduce its frozen witness exactly; a contradiction blocks and leaves everything as it is. */
-async function revalidateFrozenMember(ctx: Context, member: Member): Promise<Exit | null> {
+/** A frozen member's fresh readback must reproduce its frozen witness exactly; a contradiction blocks (with the stated consequence) and leaves everything as it is. */
+async function revalidateFrozenMember(ctx: Context, member: Member, consequence: string): Promise<Exit | null> {
   let observation: RollbackEligibilityObservation;
   try {
     observation = await member.session!.captureReadback({ canonicalDeltaBaseline: member.authority!.attempt.canonicalDeltaBaseline, requireCensus: member.mode === "post-write" });
@@ -1717,9 +1718,15 @@ async function revalidateFrozenMember(ctx: Context, member: Member): Promise<Exi
   if (decision.eligibility === "refused") return blocked(ctx, "revalidate", member, "revalidation-drift", decision.reason);
   const evidence = member.session!.computeRollbackTerminalEvidenceSha256({ epoch: member.authority!.epoch, attempt: member.authority!.attempt, observation, mode: decision.mode });
   if (decision.mode !== member.mode || evidence !== member.terminalEvidenceSha256) {
-    return blocked(ctx, "revalidate", member, "pending-evidence-drift", "the destination no longer reproduces the frozen witness; the prepared selection is not completed");
+    return blocked(ctx, "revalidate", member, "pending-evidence-drift", "the destination no longer reproduces the frozen witness; " + consequence);
   }
   return null;
+}
+
+/** The sessions of a call are opened once: a re-prepare after an abort reacquires them when the abort was settled without them. */
+async function ensureSessions(ctx: Context): Promise<Exit | null> {
+  if (ctx.keeper !== null) return null;
+  return openSessions(ctx, true);
 }
 
 
@@ -1787,12 +1794,16 @@ function assertLiveSourceEqualsSealed(ctx: Context): Exit | null {
  * missing-material exit (preparing without sealed material, or aborted
  * without a reference) is settled and the publication prepared again; a
  * journal aborted after it sealed its material (something else aborted it)
- * has its abort finished through the coordinator alone, its restored source
- * proven equal to the sealed source, and is then prepared again under the
- * recovery sessions. Any other composition under the rollback's id refuses.
+ * has its abort finished through the coordinator alone. An abort restored
+ * PostgreSQL and released the fences, so writes may have resumed: before the
+ * sealed material is prepared again, every member's fence is reacquired and
+ * its fresh readback must reproduce its frozen witness, and the restored
+ * source must equal the sealed source. Any other composition under the
+ * rollback's id refuses.
  */
 async function publishReverse(ctx: Context, ownV2: BackendPublicationJournal | null): Promise<Step<string>> {
   let journal: BackendPublicationJournal | null = ownV2;
+  let abortSettled = false;
   if (journal !== null) {
     if (!journalIsReverseComposition(ctx, journal)) return interrupted(ctx, "publication", "publication-mismatch", "the publication in the live slot carries this rollback's id but is not its reverse composition");
     if (ABORT_PATH_PHASES.has(journal.phase)) {
@@ -1809,6 +1820,7 @@ async function publishReverse(ctx: Context, ownV2: BackendPublicationJournal | n
         return interrupted(ctx, "publication", "publication-aborted", "the aborted reverse publication records an unreleased fence");
       }
       journal = null;
+      abortSettled = true;
     } else if (journal.phase === "preparing" && journal.recoveryReference === null) {
       // E6/E8: prepare() died before sealing the material; the coordinator's own exit for this state is the missing-material abort.
       try {
@@ -1819,6 +1831,15 @@ async function publishReverse(ctx: Context, ownV2: BackendPublicationJournal | n
         throw error;
       }
       journal = null;
+      abortSettled = true;
+    }
+  }
+  if (abortSettled) {
+    const sessions = await ensureSessions(ctx);
+    if (sessions !== null) return sessions;
+    for (const member of ctx.members) {
+      const revalidated = await revalidateFrozenMember(ctx, member, "the reverse publication is not prepared again");
+      if (revalidated !== null) return revalidated;
     }
   }
   try {
