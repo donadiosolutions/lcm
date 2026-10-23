@@ -1,5 +1,5 @@
 import { createHash } from "node:crypto";
-import { mkdtempSync, rmSync, statSync } from "node:fs";
+import { lstatSync, mkdtempSync, rmSync, statSync } from "node:fs";
 import { join } from "node:path";
 import { parseDaemonConfig, readDaemonConfigSnapshot, resolveDaemonConfigEnv, type ResolvedStorageConfig } from "../daemon/config.js";
 import { MachineIdentityFileError, requireMachineIdentity } from "../machine-identity.js";
@@ -1396,10 +1396,26 @@ function fileWitness(path: string): Readonly<{ sha256: string; size: string }> {
   return { sha256: streamSha256(path, Number(size)), size: size.toString(10) };
 }
 
-/** An installation record authenticates when the canonical database still is the post-sidecar database it witnessed. */
-function installRecordAuthenticates(member: Member): string | null {
+/**
+ * An installation record authenticates when it names the member's canonical
+ * path and, while the installation is still an unpublished candidate, the
+ * canonical database still is the post-sidecar database it witnessed. Once
+ * the reverse publication completed, SQLite consumers write that database
+ * legitimately: the frozen tuple names the record by digest (the store proves
+ * it) and the record names the installed generation; only a plain regular
+ * file at the path is still required.
+ */
+function installRecordAuthenticates(member: Member, published: boolean): string | null {
   const record = member.install!;
   if (record.canonicalPath !== member.canonicalPath) return "the installation record names another canonical path";
+  if (published) {
+    try {
+      if (!lstatSync(member.canonicalPath).isFile()) return "the canonical database is not a plain regular file";
+    } catch (error) {
+      return "the canonical database cannot be read: " + (error as Error).message;
+    }
+    return null;
+  }
   let witness: Readonly<{ sha256: string; size: string }>;
   try {
     witness = fileWitness(member.canonicalPath);
@@ -1413,7 +1429,7 @@ function installRecordAuthenticates(member: Member): string | null {
 /** Step 9 for one member: build a fresh verified candidate from its fenced export (post-write) or its preserved snapshot (pre-write, C1). */
 async function buildMember(ctx: Context, member: Member): Promise<Exit | null> {
   if (member.install !== null) {
-    const failure = installRecordAuthenticates(member);
+    const failure = installRecordAuthenticates(member, false);
     if (failure !== null) return blocked(ctx, "build", member, "install-mismatch", failure);
     member.mode = member.install.mode;
     return null;
@@ -1582,7 +1598,7 @@ async function preSelection(ctx: Context, held: BackendMaintenanceJournal, membe
     // call's fences may have lapsed since, so every member's session is reacquired under the hold and its fresh
     // readback must reproduce the frozen witness before the selection is prepared and completed (round-1 F1);
     // a contradiction blocks with the tuple and the installations preserved.
-    const adopted = adoptFrozenSelection(ctx);
+    const adopted = adoptFrozenSelection(ctx, false);
     if (adopted !== null) return adopted.exit;
     const sessions = await openSessions(ctx, false);
     if (sessions !== null) return sessions.exit;
@@ -1633,14 +1649,14 @@ async function preSelection(ctx: Context, held: BackendMaintenanceJournal, membe
   return finishAfterSelection(ctx, null);
 }
 
-/** Adopt the frozen tuple for every member (its manifest was classified against it): mode, witness and authenticated installation record; nothing is rebuilt. */
-function adoptFrozenSelection(ctx: Context): Exit | null {
+/** Adopt the frozen tuple for every member (its manifest was classified against it): mode, witness and authenticated installation record (its bytes only until the publication completed); nothing is rebuilt. */
+function adoptFrozenSelection(ctx: Context, published: boolean): Exit | null {
   for (const member of ctx.members) {
     member.frozen = ctx.selection!.members[member.index]!;
     member.mode = member.frozen.mode;
     member.terminalEvidenceSha256 = member.frozen.witnessChecksumSha256;
     member.install = ctx.rollback!.installs.get(member.generationId)!;
-    const failure = installRecordAuthenticates(member);
+    const failure = installRecordAuthenticates(member, published);
     if (failure !== null) return interrupted(ctx, "install", "readback-mismatch", at(member, failure));
   }
   return null;
@@ -1679,7 +1695,7 @@ async function postSelection(ctx: Context, v3: BackendMaintenanceJournal | null,
   ctx.resumedFrom = ownV2 !== null ? "publication-journal" : v3!.phase === "selection-prepared" ? "selection-prepared" : "selection-completed";
   const members = await resolveMembers(ctx, "frozen");
   if (members !== null) return members.exit;
-  const adopted = adoptFrozenSelection(ctx);
+  const adopted = adoptFrozenSelection(ctx, ownV2 !== null && ownV2.phase === "completed");
   if (adopted !== null) return adopted.exit;
   if (ctx.members.every((member) => member.manifest!.phase === "rolled-back") && (ownV2 === null || ownV2.phase === "completed")) {
     return settledFromRecords(ctx, ownV2);
@@ -1992,7 +2008,8 @@ async function settledFromRecords(ctx: Context, v2: BackendPublicationJournal | 
   if (ctx.members.some((member) => member.manifest === null)) {
     const members = await resolveMembers(ctx, "frozen");
     if (members !== null) return members.exit;
-    const adopted = adoptFrozenSelection(ctx);
+    // The slot moved past this rollback's publication: an installation is no longer an unpublished candidate.
+    const adopted = adoptFrozenSelection(ctx, true);
     if (adopted !== null) return adopted.exit;
   }
   const pending = ctx.members.filter((member) => member.manifest!.phase !== "rolled-back");

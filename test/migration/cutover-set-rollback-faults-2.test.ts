@@ -1,6 +1,7 @@
 import { afterEach, describe, expect, it, vi } from "vitest";
-import { readFileSync, rmSync, writeFileSync } from "node:fs";
+import { readFileSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
+import { DatabaseSync } from "node:sqlite";
 import { lcmHomeDir } from "../../src/runtime-paths.js";
 import { clearProjectMapCache, projectMapPath } from "../../src/project-map.js";
 import {
@@ -60,6 +61,17 @@ function readingAs(f: RollbackFixture, generationId: string, edit: (head: Migrat
 function nth<T extends (...args: never[]) => unknown>(real: T, after: number, replacement: T): T {
   let calls = 0;
   return ((...args: Parameters<T>) => (++calls > after ? replacement(...args) : real(...args))) as T;
+}
+
+/** A SQLite consumer's write to an installed database (as the daemon writes once SQLite is selected); returns the bytes it left. */
+function consumerWrite(path: string, sessionId: string): Buffer {
+  const db = new DatabaseSync(path);
+  try {
+    db.exec("INSERT INTO conversations (session_id) VALUES ('" + sessionId + "')");
+  } finally {
+    db.close();
+  }
+  return readFileSync(path);
 }
 
 describe("the default dependencies", () => {
@@ -401,8 +413,9 @@ describe("after the selection", () => {
     interruption(await f.run({ manifestStore: readingAs(f, a!.generationId, (head) => ({ ...head, pendingEffect: null }), 1) }), "completion", "readback-mismatch", "not rolling back");
     const path = join(lcmHomeDir(f.homeDir), "projects", a!.localProjectId, "db.sqlite");
     const installed = readFileSync(path);
-    sqliteDatabase(path);
-    interruption(await f.run(), "install", "readback-mismatch", "sidecar-complete");
+    // The publication completed: the installed bytes are the consumers' now, but the database must be present.
+    rmSync(path);
+    interruption(await f.run(), "install", "readback-mismatch", "cannot be read");
     writeFileSync(path, installed, { mode: 0o600 });
     interruption(await f.run({ writeReport: () => { throw new Error("report conflict"); } }), "completion", "evidence-conflict", "report conflict");
     interruption(await f.run({ manifestStore: storeWith(f, { update: () => { throw new MigrationProtocolError("unexpected-state", "illegal"); } }) }), "completion", "state-unresolvable", "illegal");
@@ -421,8 +434,8 @@ describe("after the selection", () => {
     interruption(await f.run({ readReport: () => null }), "completion", "readback-mismatch", "does not name the frozen witness");
     const path = join(lcmHomeDir(f.homeDir), "projects", a!.localProjectId, "db.sqlite");
     const installed = readFileSync(path);
-    sqliteDatabase(path);
-    interruption(await f.run(), "install", "readback-mismatch", "sidecar-complete");
+    rmSync(path);
+    interruption(await f.run(), "install", "readback-mismatch", "cannot be read");
     writeFileSync(path, installed, { mode: 0o600 });
     expectRolledBack(f, await f.run(), "publication-journal");
     // Under a later hold the same verification applies to the settled set.
@@ -435,9 +448,45 @@ describe("after the selection", () => {
     writeConfig(f.homeDir, "postgresql");
     interruption(await f.run({ readStorageConfig: () => TARGET_CONFIG as never }), "completion", "readback-mismatch", "selects postgresql");
     writeConfig(f.homeDir, "sqlite");
-    sqliteDatabase(join(lcmHomeDir(f.homeDir), "projects", b!.localProjectId, "db.sqlite"));
-    interruption(await f.run(), "install", "readback-mismatch");
+    rmSync(join(lcmHomeDir(f.homeDir), "projects", b!.localProjectId, "db.sqlite"));
+    interruption(await f.run(), "install", "readback-mismatch", "cannot be read");
     expect(readBackendMaintenanceJournal(f.homeDir)?.generationId).toBe("later-generation");
+  });
+
+  it("recovers the completion after legitimate SQLite writes once the reverse publication completed (PR #1668 P2)", async () => {
+    const f = await rollbackFixture();
+    const [a, b] = f.members;
+    const paths = f.members.map((member) => join(lcmHomeDir(f.homeDir), "projects", member.localProjectId, "db.sqlite"));
+    await crashAt(f, "after-complete:" + a!.generationId);
+    // SQLite is selected and every member unbound: consumers write to both installed databases before B's manifest settles.
+    const written = paths.map((path, index) => consumerWrite(path, "after-completion-" + index));
+    expect(f.activation.manifestStore.read(b!.generationId).phase).toBe("rolling-back");
+    expectRolledBack(f, await f.run(), "publication-journal");
+    for (const [index, path] of paths.entries()) expect(readFileSync(path)).toEqual(written[index]);
+    // The rolled-back set stays reportable after further use, and from the member evidence under a later hold.
+    const used = paths.map((path, index) => consumerWrite(path, "after-rollback-" + index));
+    expectRolledBack(f, await f.run(), "settled");
+    for (const [index, path] of paths.entries()) expect(readFileSync(path)).toEqual(used[index]);
+    await f.activation.coordinator().enterMaintenance({
+      publicationId: "later-generation", generationId: "later-generation", sourceSelectionSha256: "a".repeat(64), queueEvidenceSha256: "b".repeat(64),
+      roster: [{ machineId: MACHINE, queueCutoff: null, evidenceSha256: "b".repeat(64) }], now: new Date("2026-10-22T00:00:00.000Z"),
+    });
+    consumerWrite(paths[1]!, "under-later-hold");
+    expect((await f.run()).status).toBe("rolled-back");
+    // The record must still name a present canonical database: a missing or non-regular file at the path interrupts.
+    const kept = readFileSync(paths[0]!);
+    rmSync(paths[0]!);
+    interruption(await f.run(), "install", "readback-mismatch", "cannot be read");
+    symlinkSync(paths[1]!, paths[0]!);
+    interruption(await f.run(), "install", "readback-mismatch", "not a plain regular file");
+    rmSync(paths[0]!);
+    writeFileSync(paths[0]!, kept, { mode: 0o600 });
+    expect((await f.run()).status).toBe("rolled-back");
+    // Before the publication completed the installed bytes are still required: a written candidate is not republished.
+    const g = await rollbackFixture();
+    await crashAt(g, "after-selection-completed");
+    consumerWrite(join(lcmHomeDir(g.homeDir), "projects", g.members[0]!.localProjectId, "db.sqlite"), "premature");
+    interruption(await g.run(), "install", "readback-mismatch", "sidecar-complete");
   });
 
   it("settles under a foreign publication only when every member is rolled back, and interrupts a frozen selection beside the live activation", async () => {
