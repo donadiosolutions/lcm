@@ -1252,9 +1252,9 @@ function memberTarget(ctx: Context, member: Member): RollbackSessionTarget {
   };
 }
 
-/** Open every member's fenced session in manifest order (lease, then set quiescence or recovery admission); the keeper spans them. */
+/** Open every member's fenced session in manifest order (lease, then set quiescence or recovery admission); the keeper spans them. Every route opens the sessions once per call. */
 async function openSessions(ctx: Context, recovery: boolean): Promise<Exit | null> {
-  if (ctx.keeper === null) ctx.keeper = startSetKeeper(ctx);
+  ctx.keeper = startSetKeeper(ctx);
   for (const member of ctx.members) {
     if (ctx.input.signal?.aborted === true) return blocked(ctx, "sessions", member, "cancelled", "the rollback was cancelled before the member's session was opened");
     try {
@@ -1657,13 +1657,12 @@ async function stepSelection(ctx: Context, current: BackendMaintenanceJournal): 
       }, ctx.token);
       crash(ctx, "after-selection-prepared");
     }
-    if (journal.phase === "selection-prepared") {
-      if (journal.terminalEvidenceSha256 !== selection.checksumSha256) return interrupted(ctx, "selection", "journal-unexpected", "the prepared selection carries another tuple's checksum");
-      journal = await ctx.coordinator!.completeMaintenanceSelection(
-        { expectedChecksumSha256: journal.checksumSha256, generationId: ctx.setId, terminalEvidenceSha256: selection.checksumSha256 }, ctx.token,
-      );
-      crash(ctx, "after-selection-completed");
-    }
+    // The journal is selection-prepared here: prepared just now, or admitted as such by the resume route.
+    if (journal.terminalEvidenceSha256 !== selection.checksumSha256) return interrupted(ctx, "selection", "journal-unexpected", "the prepared selection carries another tuple's checksum");
+    journal = await ctx.coordinator!.completeMaintenanceSelection(
+      { expectedChecksumSha256: journal.checksumSha256, generationId: ctx.setId, terminalEvidenceSha256: selection.checksumSha256 }, ctx.token,
+    );
+    crash(ctx, "after-selection-completed");
   } catch (error) {
     if (error instanceof BackendPublicationJournalError) return interrupted(ctx, "selection", "journal-unexpected", error.message);
     throw error;

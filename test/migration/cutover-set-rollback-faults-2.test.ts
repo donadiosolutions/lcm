@@ -222,6 +222,13 @@ describe("under the hold", () => {
     const blocked = await g.run({ renewalIntervalMs: 1, readStorageConfig: (dir) => (g.deps.readStorageConfig(dir).backend === "sqlite" ? { backend: "sqlite" } : pooled) as never, parseSealedStorageConfig: () => pooled as never });
     expect(blocked.status).toBe("blocked");
     expect(blocked.status === "blocked" && blocked.reason).toBe("lease-lost");
+    // With a single-connection pool the cadence is inert: its ticks run no renewal, so only the explicit sweeps renew.
+    const h = await rollbackFixture();
+    expect((await h.run()).status).toBe("rolled-back");
+    const explicit = h.activation.guard.calls.filter((call) => call.startsWith("renew:")).length;
+    const k = await rollbackFixture();
+    expect((await k.run({ renewalIntervalMs: 1 })).status).toBe("rolled-back");
+    expect(k.activation.guard.calls.filter((call) => call.startsWith("renew:")).length).toBe(explicit);
   });
 });
 
