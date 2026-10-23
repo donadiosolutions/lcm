@@ -1578,9 +1578,18 @@ async function preSelection(ctx: Context, held: BackendMaintenanceJournal, membe
     if (target !== null) return target.exit;
   }
   if (ctx.selection !== null) {
-    // The crash between the frozen tuple and the journal's selection phases: adopt, never rebuild.
+    // The crash between the frozen tuple and the journal's selection phases: adopt, never rebuild. The previous
+    // call's fences may have lapsed since, so every member's session is reacquired under the hold and its fresh
+    // readback must reproduce the frozen witness before the selection is prepared and completed (round-1 F1);
+    // a contradiction blocks with the tuple and the installations preserved.
     const adopted = adoptFrozenSelection(ctx);
     if (adopted !== null) return adopted.exit;
+    const sessions = await openSessions(ctx, false);
+    if (sessions !== null) return sessions.exit;
+    for (const member of ctx.members) {
+      const revalidated = await revalidateFrozenMember(ctx, member);
+      if (revalidated !== null) return revalidated.exit;
+    }
     const selected = await stepSelection(ctx, held);
     if (isExit(selected)) return selected.exit;
     return finishAfterSelection(ctx, null);

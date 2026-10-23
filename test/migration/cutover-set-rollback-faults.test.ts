@@ -280,6 +280,41 @@ describe("rollbackCutoverSet blocked members keep the hold and every piece of ev
     expectRolledBack(f, await f.run(), "held");
   });
 
+  it("completes a frozen selection resumed from the held journal only after every member's fresh readback reproduces its frozen witness (round-1 F1)", async () => {
+    const f = await rollbackFixture();
+    const [a, b] = f.members;
+    await crashAt(f, "after-selection-frozen");
+    const frozen = readCutoverSetRollbackRecords({ homeDir: f.homeDir, originalSetId: f.originalSetId });
+    expect(frozen).toMatchObject({ state: "resolved", selection: expect.objectContaining({ members: expect.any(Array) }) });
+    const installed = f.members.map((member) => readFileSync(join(lcmHomeDir(f.homeDir), "projects", member.localProjectId, "db.sqlite")));
+    // The reacquired sessions are the ordinary set sessions under the hold: the set quiescence admission gates them, as on the first call.
+    blockedAt(await f.run({ sessionDependencies: { ...f.deps.sessionDependencies, checkSetQuiescence: async () => ({ status: "unsatisfied", reason: "quiescence-not-observed", detail: "a writer is active", quiescenceFence: null }) as never } }), "sessions", a!.generationId, "quiescence-unsatisfied", "writer is active");
+    expect(readBackendMaintenanceJournal(f.homeDir)).toMatchObject({ phase: "maintenance-held", generationId: f.setId, sourceBackend: "postgresql" });
+    expect(readCutoverSetRollbackRecords({ homeDir: f.homeDir, originalSetId: f.originalSetId })).toEqual(frozen);
+    // The destination of B (post-write) moved after the interruption: its frozen witness is no longer reproduced.
+    const sealedB = f.liveCensus.get(b!.remoteProjectId)!;
+    f.liveCensus.set(b!.remoteProjectId, sealedB.map((entry) => ({ ...entry, prefixSha256: "9".repeat(64) })));
+    blockedAt(await f.run(), "revalidate", b!.generationId, "pending-evidence-drift", "frozen witness");
+    expect(readBackendMaintenanceJournal(f.homeDir)).toMatchObject({ phase: "maintenance-held", generationId: f.setId, sourceBackend: "postgresql" });
+    expectAllPostgreSql(f);
+    expect(readCutoverSetRollbackRecords({ homeDir: f.homeDir, originalSetId: f.originalSetId })).toEqual(frozen);
+    for (const [index, member] of f.members.entries()) {
+      expect(readFileSync(join(lcmHomeDir(f.homeDir), "projects", member.localProjectId, "db.sqlite"))).toEqual(installed[index]);
+      expect(f.activation.manifestStore.read(member.generationId)).toMatchObject({ phase: "rolling-back", pendingEffect: expect.objectContaining({ kind: "publish-rollback" }) });
+    }
+    f.liveCensus.set(b!.remoteProjectId, sealedB);
+    // The destination of A (pre-write) shows writes now: another mode than the frozen one.
+    const sealedA = f.liveCensus.get(a!.remoteProjectId)!;
+    f.liveCensus.set(a!.remoteProjectId, sealedA.map((entry) => ({ ...entry, prefixSha256: "9".repeat(64) })));
+    blockedAt(await f.run(), "revalidate", a!.generationId, "pending-evidence-drift");
+    expect(readBackendMaintenanceJournal(f.homeDir)).toMatchObject({ phase: "maintenance-held", generationId: f.setId });
+    expect(readCutoverSetRollbackRecords({ homeDir: f.homeDir, originalSetId: f.originalSetId })).toEqual(frozen);
+    f.liveCensus.set(a!.remoteProjectId, sealedA);
+    // An unchanged destination converges: the same tuple is prepared, completed and published.
+    expectRolledBack(f, await f.run(), "selection-frozen");
+    expect(readCutoverSetRollbackRecords({ homeDir: f.homeDir, originalSetId: f.originalSetId })).toEqual(frozen);
+  });
+
   it("blocks on a failed install or sidecars, and on an installed database that no longer matches its record", async () => {
     const f = await rollbackFixture();
     const [a] = f.members;
