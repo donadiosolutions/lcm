@@ -113,9 +113,19 @@ describe("replay across a set rollback", () => {
     expect(readBackendMaintenanceJournal(f.homeDir)).toMatchObject({ generationId: "later-generation" });
     admitted(f, 0, witness, "sqlite");
     refused(f, 0, activationWitness(f, 0));
-    // A later postgresql selection, or a rebound member, refuses the old rollback replay.
-    writeConfig(f.homeDir, "postgresql");
-    refused(f, 0, witness, "selects postgresql");
+    // A later postgresql selection (parsed as the daemon parses it, so with its connection settings), or a rebound
+    // member, refuses the old rollback replay.
+    const caFile = join(f.homeDir, "ca.pem");
+    writeFileSync(caFile, "-----BEGIN CERTIFICATE-----\n", { mode: 0o600 });
+    vi.stubEnv("LCM_POSTGRES_URL", "postgresql://user:secret@db.example.invalid/lcm");
+    vi.stubEnv("LCM_POSTGRES_CA_FILE", caFile);
+    vi.stubEnv("LCM_POSTGRES_MIGRATION_ROLE", "lcm_owner");
+    try {
+      writeConfig(f.homeDir, "postgresql");
+      refused(f, 0, witness, "selects postgresql");
+    } finally {
+      vi.unstubAllEnvs();
+    }
     writeConfig(f.homeDir, "sqlite");
     const map = JSON.parse(readFileSync(projectMapPath(f.homeDir), "utf8")) as Record<string, Record<string, unknown>>;
     const rebound = { ...map, [f.members[1]!.localProjectId]: { ...map[f.members[1]!.localProjectId], remoteProjectId: f.members[1]!.remoteProjectId } };
@@ -243,8 +253,16 @@ describe("replay across a set rollback", () => {
     chmodSync(reportPath(1), 0o400);
     admitted(h, 0, own, "sqlite");
     const config = join(lcmHomeDir(h.homeDir), "config.json");
+    // The configuration is read and parsed as the daemon reads it (round-1 F3), the reader the service's own
+    // completion readback uses: a file without a storage section selects the daemon's default, sqlite, and admits
+    // every member; a 0644 file is still refused, by the project-map publication guard, not by the config reader.
     writeFileSync(config, "{}\n", { mode: 0o600 });
-    refused(h, 0, own, "the configuration selects , not the restored sqlite installation");
+    admitted(h, 0, own, "sqlite");
+    admitted(h, 1, rollbackWitness(h, 1)!, "sqlite");
+    writeConfig(h.homeDir, "sqlite");
+    chmodSync(config, 0o644);
+    refused(h, 0, own, "selected installation cannot be read: file mode is not trusted");
+    chmodSync(config, 0o600);
     chmodSync(config, 0o200);
     refused(h, 0, own, "selected installation cannot be read");
     chmodSync(config, 0o600);

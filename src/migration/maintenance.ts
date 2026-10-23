@@ -663,11 +663,8 @@ function assertCutoverSetRollbackReplayAdmission(
   let backend: string;
   let map: ReturnType<typeof readProjectMapSnapshot>;
   try {
-    const lcm = lcmHomeDir(input.homeDir);
-    const config = readBoundedRegularFileWithStat(join(lcm, "config.json"), {
-      allowedRoot: lcm, maxBytes: 4 * 1024 * 1024, allowedModes: [0o400, 0o600], requireSingleLink: true,
-    });
-    backend = (JSON.parse(Buffer.from(config.content).toString("utf8")) as { storage?: { backend?: string } }).storage?.backend ?? "";
+    // The configuration as the daemon reads and parses it (the service's completion readback uses the same reader).
+    backend = readDaemonConfigSnapshot(join(lcmHomeDir(input.homeDir), "config.json")).config.storage.backend;
     map = withBackendPublicationConsumerLock(input.homeDir, (token) => readProjectMapSnapshot(input.homeDir, token), { allowUnresolved: true });
   } catch (error) {
     rollbackReplayRefusal("the selected installation cannot be read: " + (error as Error).message);
