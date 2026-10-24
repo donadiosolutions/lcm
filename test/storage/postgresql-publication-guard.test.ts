@@ -458,6 +458,22 @@ describe("PostgreSQL publication admission", () => {
     }
   });
 
+  it("reads the row of any generation for release reconciliation, keeping corrupt rows invalid (Bug #1651)", async () => {
+    const reconcile = (rows: Record<string, unknown>[], input: Record<string, unknown> = { projectId: PROJECT }) =>
+      new PostgreSqlBackendPublicationGuard(executor({ transactionQuery: () => result([]), readbackRows: rows }))
+        .readForReleaseReconciliation(input as never);
+    await expect(reconcile([])).resolves.toBeNull();
+    // A decodable row naming another target backend or evidence is returned, where read() refuses it.
+    await expect(reconcile([leaseRow({ evidenceSha256: "b".repeat(64) })])).resolves.toMatchObject({ evidenceSha256: "b".repeat(64), fencingToken: 7n });
+    await expect(reconcile([leaseRow({ targetBackend: "sqlite" })])).resolves.toMatchObject({ targetBackend: "sqlite" });
+    await expect(reconcile([{ ...leaseRow(), operation: "other" }])).rejects.toMatchObject({ reason: "invalid-row" });
+    await expect(reconcile([leaseRow(), leaseRow()])).rejects.toMatchObject({ reason: "invalid-row" });
+    await expect(reconcile([], { projectId: "nope" })).rejects.toMatchObject({ reason: "invalid-input" });
+    const withSignal = executor({ transactionQuery: () => result([]), readbackRows: [] });
+    await new PostgreSqlBackendPublicationGuard(withSignal).readForReleaseReconciliation({ projectId: PROJECT });
+    expect(withSignal.readbackOptions[0]).not.toHaveProperty("machineId");
+  });
+
   it("renews and releases only the exact live fence", async () => {
     const normal = executor({ transactionQuery: () => result([leaseRow()]) });
     await expect(new PostgreSqlBackendPublicationGuard(normal).renew({

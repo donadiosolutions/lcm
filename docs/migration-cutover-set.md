@@ -5,15 +5,79 @@ more than one project. One maintenance hold covers the whole set, and every
 project in it is captured under that hold. This page defines the set, the
 refusals that keep it all-or-nothing, and how a capture is bound to it.
 
-> **Status.** This page describes the contract and the preparation,
-> activation and rollback services behind it. No `lcm migration` command
-> enters, prepares, activates or rolls back a set yet: the operator commands
-> arrive with a later child of the multi-project cutover epic (#1544). Until
-> then, the single-generation activation and rollback commands keep their
-> single-project refusals (`uncovered-projects`,
-> `multiple-remote-projects`), a member of a held set cannot be activated
-> through them, and a machine with data for one project behaves exactly as
-> described in [Reversible migration and cutover journal](migration-cutover.md).
+> **Status.** This page describes the contract, the preparation, activation
+> and rollback services behind it, and the `--set` mode of the nine
+> `lcm migration` commands that runs them. The single-generation commands
+> (without `--set`) keep their single-project refusals
+> (`uncovered-projects`, `multiple-remote-projects`), a member of a held set
+> cannot be activated through them, and a machine with data for one project
+> behaves exactly as described in
+> [Reversible migration and cutover journal](migration-cutover.md).
+
+## Running a set with `lcm migration --set`
+
+Every `lcm migration` command accepts `--set`. It is an explicit choice of
+scope: the home, not the current directory, is the unit, and a home with fewer
+than two stored-data projects is refused (`cutover-set-single-project`). The
+flags, previews, exit classes and states are listed in
+[Migration operations: cutover sets](migration-operations.md#cutover-sets-the---set-mode);
+this section is the sequence and what to expect at each step.
+
+```bash
+lcm migration plan --set --json                        # prints the set id as "generation"
+lcm migration apply --set --confirm-generation <set-id> --json
+lcm migration report --set --generation <set-id> --json
+lcm migration verify --set --generation <set-id> --confirm-generation <set-id> --json
+lcm migration activate --set --generation <set-id> --confirm-generation <set-id> \
+  --confirm-backend postgresql --json
+# swap the grants (add the runtime grants, revoke the transfer grants), then start the daemon
+lcm migration report --set --generation <set-id> --json   # until it exits 0
+```
+
+1. **Plan.** `plan --set` resolves the target, daemon presence and TLS/role
+   reachability, then names the set id and every member's generation id
+   without writing anything. It predicts ids; a held set is only a named
+   continuation, not a prediction that preparation will succeed.
+2. **Prepare.** `apply --set --confirm-generation <set-id>` compares the
+   exact id against a fresh candidate and only then prepares: one hold, then
+   capture, copy and verification of every member. It exits 0 only when every
+   member reads `verified` with nothing pending, a complete snapshot and an
+   eligible report. A stopped preparation is not a failure of the set:
+   `resume --set` continues from each member's durable state.
+3. **Confirm.** `verify --set` confirms that persisted evidence; it does not
+   recompute a verification. Its `--dry-run` never exits 0.
+4. **Activate.** `activate --set` revalidates every member and publishes the
+   set once. After exit 0 the grants are swapped and the daemon started as for
+   a single generation; the operator steps are in
+   [the cutover section](migration-operations.md#the-cutover-activate-and-the-grant-swap).
+   The run exits 8 when a live daemon still holds the old backend.
+5. **Roll back, if needed.** `rollback --set` with the **original** set id.
+6. **Release a held preparation.** `abort --set --confirm-generation <set-id>`.
+
+Three rules keep the identifiers straight. The id every command takes is the
+original aggregate set id, including for `rollback` and for resuming one. The
+rollback hold's derived id is printed as `rollbackSetId` and is refused if
+passed (`set-original-generation-required`). A member's generation id is never
+a set id, and a rollback's new physical SQLite generation (`installedGenerationId`
+on the member row) is installation evidence, not an identifier any command
+accepts: replay is keyed by the original member generation and its rollback
+witness, and a report row never grants replay admission.
+
+`resume --set` drives exactly the one service the durable state admits (the
+preparation, the activation, the rollback or the whole-set abort), never two in
+a row. It refuses a preparation that cannot continue before running anything:
+a partial or replaced snapshot names `abort --set`, and a tampered or
+unreadable snapshot is evidence (exit 5). Exit 6 is emitted only when the state
+read again after a service returned still admits that same service.
+
+Everything an interrupted operation left is preserved: the hold, the
+snapshots, the checkpoints and every member's manifest. There is no offline
+restoration, no manual unbinding of members and no abort once a rollback's
+checkpoint is written. `report --set` prints each member as flat
+`member.<n>.*` evidence (indexes in manifest order, to be sorted numerically)
+and states a missing rollback checkpoint as "no committed rollback checkpoint",
+which does not prove that no write happened (#1667). It does not repair the
+immediate readback attribution of `abort` (#1657).
 
 ## What a set contains
 
@@ -97,8 +161,8 @@ Nothing is copied or inferred from a different member.
 ## Preparing a set
 
 Preparation takes one hold and then, member by member, captures, copies and
-verifies every project under it. The service is the internal contract the set
-commands (#1551) will expose; nothing here is reachable from the CLI yet.
+verifies every project under it. `apply --set` and `resume --set` call this
+service once per invocation.
 
 1. **Preview.** The candidate names the set id and each member's generation
    id without writing anything. Each member's id comes from that member's own
@@ -182,7 +246,7 @@ refusal are reported per member and are not undone.
 ## Activating a set
 
 Activation takes a prepared set and binds every member to PostgreSQL in one
-publication. The service is internal until #1551 exposes it; it is called with
+publication. `activate --set` and `resume --set` call it with
 the home, the confirmed set id and the one resolved target, whose migration
 role is the activation role (the runtime grants are applied, and the migration
 grants revoked, after activation, as for a single generation).
@@ -322,8 +386,7 @@ rollback rules in [Replay across a set rollback](#replay-across-a-set-rollback).
 Rolling an activated set back restores every member to a **new** SQLite
 generation under one PostgreSQL-origin hold and publishes the complete home
 back to SQLite once. The rollback service (`rollbackCutoverSet`) takes the
-original activated set id; no `lcm migration` command reaches it until the
-operator commands of #1551, and no release metadata changes here. The
+original activated set id; `rollback --set` and `resume --set` reach it. The
 single-generation rollback keeps its own behavior (including its no-copy
 pre-write reversal) and its refusal of a member of a held set.
 
@@ -437,7 +500,8 @@ manifests settle to rolled-back and keep their history.
 ## Releasing a set hold
 
 A forward (SQLite-origin) set hold is released, before its selection, with
-`lcm migration abort --confirm-generation <set id>`,
+`lcm migration abort --set --confirm-generation <set id>` (the form without
+`--set` keeps working with its original output),
 with or without `--generation <set id>`. The confirmation is always the set
 id, never a member's generation id. The journal records the abort and keeps the
 source backend selected, and the same invocation settles every member

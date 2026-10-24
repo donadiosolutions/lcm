@@ -780,6 +780,21 @@ failures that byte-for-byte content equality cannot see:
   `search_v1` configuration that is wrong in a way no digest comparison
   can see.
 
+  A project with no messages has no candidate to find, so the probe takes
+  an empty-source path instead. After the same completed-transfer-run
+  lookup, it sends one fixed query through the production
+  `searchMessages` and requires zero rows; a search error is reported as
+  an error, never as a pass. The search then earns its receipt only when
+  the source's messages checkpoint and the fenced destination census both
+  report zero messages, so an empty candidate pool on its own never
+  qualifies. If the transfer run is missing or not completed, if the search
+  returns any row, or if either count is non-zero, the probe is not-run with
+  its reason and `activationEligible` stays false. This witness proves
+  that the production search returned no rows for one constant query while
+  both portable message counts were zero. It does not prove that messages
+  written after cutover will be indexed; the pinned `search_v1`
+  configuration digest is a separate existing check.
+
   The search self-match candidate pool draws from a fixed-size, early
   slice of the source's canonical message order (the first
   `MIGRATION_SEARCH_PROBE_CANDIDATE_POOL_SIZE` messages), not the whole
@@ -798,7 +813,8 @@ failures that byte-for-byte content equality cannot see:
   than to sample the domain exhaustively.
 
   The ordered-listing probe's own `ran` state (it completed) and the search
-  probe's own `ran` state (a correlated self-match was confirmed) are tracked
+  probe's own `ran` state (a correlated self-match was confirmed, or the
+  empty-source witness held) are tracked
   independently (`publicProbeCoverage`, one
   entry per probe), never folded into a single `sample`-class coverage
   bit: a genuine listing-ordering mismatch stays recorded as evidence
@@ -1018,10 +1034,11 @@ from an earlier pass:
   a window a rollback entered from PostgreSQL is not an activation window and
   is refused as `maintenance-not-held`;
 - the stored data on this machine belongs to exactly one project, the one
-  being migrated. Activation of a machine with data for several projects
-  refuses with `uncovered-projects`; multi-project cutover is out of scope
-  here (see [Cutover sets](migration-cutover-set.md) for the contract that
-  later releases build on);
+  being migrated. This single-generation activation of a machine with data
+  for several projects refuses with `uncovered-projects`; such a machine is
+  moved with the `--set` mode of the same commands, which activates every
+  project through one publication (see
+  [Cutover sets](migration-cutover-set.md#running-a-set-with-lcm-migration---set));
 - the destination identity, the project-map binding, the transfer-ledger copy
   binding and the destination census all match the verification report, and
   the PostgreSQL target passes the authenticated health check for the
@@ -1036,6 +1053,15 @@ too, distinct from a definite "no". A PostgreSQL failure while the census
 reads the destination (a lost connection, a refused privilege, a schema
 mismatch on the transfer session) is attributed exactly as the health check
 attributes it, `target-unhealthy` or `target-unresolvable` at `S7`.
+
+The destination identity query that compares the live destination with the
+sealed manifest (at `S0`, `S5` and `S7`) is attributed the same way. A
+definite server refusal (authentication, missing privilege) is reported as
+`target-unhealthy`; a connection or transport failure is reported as
+`target-unresolvable`. Both are refusals at the step that ran the query, or,
+when an effect has already begun and the run is re-entered, an interruption of
+the step in flight. Neither rejects the whole activation. A cancelled
+activation is still rejected, not classified.
 
 ### The activation role
 
@@ -1123,6 +1149,16 @@ publication, the outcome is `post-publication-unhealthy` with the restart
 verdict; the selection stands, and the next run completes once the target is
 healthy again. Reversal is a separate, explicit rollback.
 
+Three conditions are classified rather than thrown. On an LCM home that was
+never initialized, activation refuses at `S0` with `manifest-absent` and
+creates nothing on disk. A machine identity that cannot be read or is not
+registered refuses at `S0` with `state-unresolvable` (an interruption of the
+step in flight when it happens on re-entry after an effect began); run
+`lcm machine register` (see [Project identity](project-identity.md)) and run
+activation again. A failure to allocate the census scratch directory refuses at
+`S7` with `state-unresolvable`; check the free space and permissions of the
+LCM home, then run activation again.
+
 ### The lease and the unavailable window
 
 Activation holds the project's fenced publication lease from the first check
@@ -1140,6 +1176,19 @@ or a cancelled run can still leave the row behind, and a write whose result
 is uncertain keeps it; the same generation recovers by taking the row over
 on its next run. Once an effect has begun the lease is kept for the next run
 to continue.
+
+A crash after the coordinator released the remote fence but before it
+recorded that locally can leave the publication journal at `releasing`
+(or `abort-releasing`) while another home's publication has already acquired the
+released row. The retry admits that decodable foreign row, never renews,
+releases or takes it over, and lets the coordinator finish its release: a row
+of another identity with a greater fencing token proves this publication's
+fence was released (see "The remote guard provider" in the backend publication
+guide). An aborting run reports `publication-failed` with the aborted
+publication. A corrupt or ambiguous row, an unattributable read, or a guard
+that cannot prove the release still ends in `lease-lost`,
+`lease-unresolvable` or a coordinator refusal and leaves the journal at
+`releasing`. The same applies to each member of a cutover set.
 
 ### The daemon restart
 

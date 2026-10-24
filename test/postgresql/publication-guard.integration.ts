@@ -279,4 +279,54 @@ describe("PostgreSQL publication remote guard provider", () => {
       expect(released?.releasedAt).not.toBeNull();
     });
   });
+
+  it("reads a successor publication's row after release, with a strictly greater token (Bug #1651)", async () => {
+    await withPostgreSqlTestDatabase("publication-remote-guard-successor", async (database) => {
+      const fixture = await publicationFixture(database, "remote-guard-successor");
+      const provider = createPostgreSqlBackendPublicationRemoteGuard({
+        guard: fixture.guard,
+        machineId: fixture.mutation.machineId,
+        ttlMs: 60_000,
+      });
+      const context = {
+        homeDir: undefined,
+        journal: {
+          publicationId: fixture.mutation.publicationId,
+          targetBackend: fixture.mutation.targetBackend,
+        },
+        project: {
+          localProjectId: "c".repeat(64),
+          remoteProjectId: fixture.mutation.projectId,
+          evidenceSha256: EVIDENCE,
+          fence: null,
+        },
+      } as never;
+      await fixture.guard.release(fixture.mutation);
+      // A later publication of another evidence digest rebinds the released row.
+      const successor = await fixture.guard.acquire({
+        projectId: fixture.mutation.projectId,
+        machineId: fixture.mutation.machineId,
+        publicationId: "publication-successor",
+        targetBackend: "postgresql",
+        evidenceSha256: "c".repeat(64),
+        ttlMs: 60_000,
+      });
+      expect(successor.fencingToken > fixture.fence.fencingToken).toBe(true);
+
+      // The ordinary release read refuses a row of another evidence digest...
+      await expect(provider.readRemoteGuard(context, "release")).rejects.toMatchObject({
+        reason: "fence-mismatch",
+      });
+      // ...while the reconciliation read returns it for the coordinator's proof.
+      const reconciled = await provider.readRemoteGuardForReleaseReconciliation!(context);
+      expect(reconciled).toMatchObject({
+        publicationId: "publication-successor",
+        evidenceSha256: "c".repeat(64),
+        fencingToken: successor.fencingToken.toString(),
+        releasedAt: null,
+        databaseExpired: false,
+      });
+      expect(BigInt(reconciled!.fencingToken) > fixture.fence.fencingToken).toBe(true);
+    });
+  });
 });

@@ -1,0 +1,16 @@
+references: ["#1678"]
+rationale: >-
+  #1678 makes the migration apply identity step mint the project-map aliases
+  with the destination project and reconcile them on a reused project. The
+  alias derivation shared with the source authority is the new file
+  src/migration/map-aliases.ts, which joins the directory-level migration
+  cutover owner with the identity step in target-identity.ts, cli-preflight.ts
+  and the source authority in maintenance.ts. The identity repository gains
+  the single-transaction ensureProjectAliases and keeps its PostgreSQL
+  identity owner. No file moves; no topology change.
+pins:
+  - ["src/migration/map-aliases.ts", "unit-migration-cutover"]
+  - ["src/migration/target-identity.ts", "unit-migration-cutover"]
+  - ["src/migration/cli-preflight.ts", "unit-migration-cutover"]
+  - ["src/migration/maintenance.ts", "unit-migration-cutover"]
+  - ["src/storage/postgresql/identity-repository.ts", "integration-postgresql-identity"]

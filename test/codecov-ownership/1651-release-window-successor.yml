@@ -1,0 +1,20 @@
+references: ["#1651"]
+rationale: >-
+  A migration activation or cutover-set retry now finishes when a crash left
+  the backend publication journal at releasing or abort-releasing after the
+  remote fence was released and another home acquired the released lease row.
+  The PostgreSQL publication guard and remote guard gain a release
+  reconciliation read, the publication driver declares it, the coordinator
+  treats a successor row with a strictly greater fencing token as proof of
+  release. The activation lease resolver marks a corrupt row, and the
+  activation and cutover-set orchestrators admit a successor row during the
+  release window only when it is not corrupt. Every file keeps its existing
+  owner; no production file is added, removed, moved, or re-owned.
+pins:
+  - ["src/migration/activate-generation.ts", "unit-migration-cutover"]
+  - ["src/migration/activation-lease.ts", "unit-migration-cutover"]
+  - ["src/migration/cutover-set-activate.ts", "unit-migration-cutover"]
+  - ["src/storage/backend-publication-driver.ts", "unit-storage-abstractions"]
+  - ["src/storage/backend-publication.ts", "unit-storage-abstractions"]
+  - ["src/storage/postgresql/publication-guard.ts", "integration-postgresql-coordination"]
+  - ["src/storage/postgresql/publication-remote-guard.ts", "integration-postgresql-coordination"]
