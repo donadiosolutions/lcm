@@ -4,6 +4,7 @@ import { join } from "node:path";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { performMigrationAbortCommand } from "../../src/migration/cli-abort.js";
 import { performMigrationAbort } from "../../src/migration/abort.js";
+import { observeMigrationMaintenanceJournal } from "../../src/migration/journal-observation.js";
 import { renderMigrationAbortEnvelope } from "../../src/migration/cli-render.js";
 import {
   createFixtureManifest,
@@ -704,6 +705,125 @@ describe("performMigrationAbortCommand: routed through rows 4 to 9 and the R7 ro
     expect(result).toEqual({ status: "refuse", reason: "route-contradiction", generationId: held.generationId, next: null });
     expect(performAbort).not.toHaveBeenCalled();
     expect(completePending).not.toHaveBeenCalled();
+  });
+
+  describe("a pending effect that appears after the first route is classified again (#1652)", () => {
+    const partialSnapshot = async () => ({ state: "partial" as const });
+    const refusalFromAbort = { status: "refuse" as const, evidence: "manifest-resume", mutated: false };
+
+    /** Begins a verify-dry-run effect on the planned manifest, as a concurrent resume would. */
+    function beginLateEffect(store: MigrationManifestStore, generationId: string): void {
+      const planned = store.read(generationId);
+      store.update(generationId, planned.checksumSha256, (current) =>
+        beginMigrationEffect(current, { effectId: "late-effect", kind: "verify-dry-run", inputSha256: "f".repeat(64), startedAt: CREATED_AT }));
+    }
+
+    it("row 8 to 7: an aborted journal beside a late pending effect is operator-required, exit 7, with no resume next and no writes", async () => {
+      const { home, held, store } = await crashFixture("planned", { abortJournal: true });
+      let before: Record<string, string> | undefined;
+      const result = await abortCommand({
+        homeDir: home, confirmGenerationId: held.generationId,
+        _operationsForTesting: {
+          performAbort: async (input) => {
+            beginLateEffect(store, held.generationId);
+            before = snapshotHome(home);
+            return performMigrationAbort(input);
+          },
+        },
+      });
+      expect(result).toMatchObject({ status: "refuse", reason: "route-operator-required", generationId: held.generationId, next: null });
+      expect(result).not.toHaveProperty("applied");
+      expect(renderMigrationAbortEnvelope(result)).toMatchObject({ exitCode: 7 });
+      expect(snapshotHome(home)).toEqual(before);
+    });
+
+    it("row 17 to 18: a held journal with a broken snapshot beside a late pending effect is operator-required, exit 7, with no writes", async () => {
+      const { home, held, store } = await crashFixture("planned");
+      let before: Record<string, string> | undefined;
+      const result = await abortCommand({
+        homeDir: home, confirmGenerationId: held.generationId,
+        _resolution: { _operationsForTesting: { classifySnapshot: partialSnapshot as never } },
+        _operationsForTesting: {
+          performAbort: async (input) => {
+            beginLateEffect(store, held.generationId);
+            before = snapshotHome(home);
+            return performMigrationAbort(input);
+          },
+        },
+      });
+      expect(result).toMatchObject({ status: "refuse", reason: "route-operator-required", generationId: held.generationId, next: null });
+      expect(renderMigrationAbortEnvelope(result)).toMatchObject({ exitCode: 7 });
+      expect(snapshotHome(home)).toEqual(before);
+    });
+
+    it("row 4: an explicit other generation does not hide the live hold's late effect; the refusal names the live hold", async () => {
+      const { home, held, store } = await crashFixture("planned");
+      createFixtureManifest(store, "rolled-back", { generationId: "generation-9" });
+      const result = await abortCommand({
+        homeDir: home, generation: "generation-9", confirmGenerationId: held.generationId,
+        _resolution: { _operationsForTesting: { classifySnapshot: partialSnapshot as never } },
+        _operationsForTesting: {
+          performAbort: async (input) => {
+            beginLateEffect(store, held.generationId);
+            return performMigrationAbort(input);
+          },
+        },
+      });
+      expect(result).toMatchObject({ status: "refuse", reason: "route-operator-required", generationId: held.generationId, next: null });
+      expect(renderMigrationAbortEnvelope(result)).toMatchObject({ exitCode: 7 });
+    });
+
+    it("a fresh route that lets resume run the late effect still answers exit 6 naming resume", async () => {
+      const { home, held, store } = await crashFixture("planned");
+      const result = await abortCommand({
+        homeDir: home, confirmGenerationId: held.generationId,
+        _operationsForTesting: {
+          performAbort: async (input) => {
+            beginLateEffect(store, held.generationId);
+            return performMigrationAbort(input);
+          },
+        },
+      });
+      expect(result).toMatchObject({ status: "refuse", reason: "abort-manifest-needs-resume", next: "resume" });
+      expect(renderMigrationAbortEnvelope(result)).toMatchObject({ exitCode: 6, next: "resume" });
+    });
+
+    it("returns the resolver's refusal when the fresh resolution refuses", async () => {
+      const { home, held, store } = await crashFixture("planned");
+      const observeJournal = vi.fn(observeMigrationMaintenanceJournal);
+      let broken = false;
+      const flaky = {
+        probeManifestPresence: (id: string) => {
+          if (broken) throw new MigrationProtocolError("invalid-input", "malformed id");
+          return store.probeManifestPresence(id);
+        },
+        read: (id: string) => store.read(id),
+      } as unknown as MigrationManifestStore;
+      const result = await abortCommand({
+        homeDir: home, confirmGenerationId: held.generationId, manifestStore: store,
+        _resolution: { manifestStore: flaky },
+        _operationsForTesting: {
+          observeJournal,
+          performAbort: async () => { broken = true; return refusalFromAbort; },
+        },
+      });
+      expect(result).toEqual({ status: "refuse", reason: "generation-invalid" });
+      expect(observeJournal).toHaveBeenCalledTimes(2);
+    });
+
+    it.each([false, true])("abort-journal-moved when abort is admitted again (mutated %s), without a next", async (mutated) => {
+      const { home, held } = await crashFixture("copied");
+      const before = snapshotHome(home);
+      const result = await abortCommand({
+        homeDir: home, confirmGenerationId: held.generationId,
+        _operationsForTesting: { performAbort: async () => ({ ...refusalFromAbort, mutated }) },
+      });
+      expect(result).toEqual({
+        status: "refuse", reason: "abort-journal-moved", evidence: "manifest-resume", generationId: held.generationId,
+        ...(mutated ? { applied: true } : {}),
+      });
+      expect(snapshotHome(home)).toEqual(before);
+    });
   });
 
   it("a terminal journal of another generation is refused exit 2 when a different --generation is named, writing nothing", async () => {

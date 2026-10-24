@@ -13,7 +13,11 @@ import {
   abortManifestGenerationIds,
 } from "./abort.js";
 import { admitExistingMigrationCommand, refuseUnlessConfirmed } from "./cli-existing.js";
-import type { ExistingGenerationInput } from "./existing-generation.js";
+import {
+  refuseUnlessRouted,
+  resolveExistingMigrationGeneration,
+  type ExistingGenerationInput,
+} from "./existing-generation.js";
 import { MigrationManifestStore } from "./manifest-store.js";
 import { classifyMigrationRecovery, MigrationProtocolError } from "./protocol.js";
 import { maintenanceOnlyDriver } from "./apply.js";
@@ -200,7 +204,59 @@ async function runMigrationAbortCommand(input: MigrationAbortCommandInput): Prom
     now: input.now,
     dryRun: input.dryRun,
   });
-  return finishAbort({ result, journal, readback });
+  const outcome = finishAbort({ result, journal, readback });
+  // A pending effect that appeared after the first route is classified again.
+  // Only a single generation is re-routed: a set refusal names a member, and a
+  // set journal has no manifest of its own to route.
+  if (
+    outcome.status === "refuse" && outcome.reason === "abort-manifest-needs-resume"
+    && journal.cutoverSet === undefined
+  ) {
+    return rerouteLatePendingEffect({
+      homeDir: input.homeDir, journal, outcome, observeJournal,
+      manifestStore: input._resolution?.manifestStore ?? store,
+      operations: input._resolution?._operationsForTesting,
+    });
+  }
+  return outcome;
+}
+
+/**
+ * Re-routes the journal's own generation (not the explicitly named one, which
+ * router row 4 admits while abort acts on the live hold) from a fresh journal
+ * observation, so the refusal names resume only when resume may run the late
+ * effect and otherwise carries the router's own refusal.
+ */
+async function rerouteLatePendingEffect(input: Readonly<{
+  homeDir: string;
+  journal: BackendMaintenanceJournal;
+  outcome: Extract<MigrationAbortCommandOutcome, { status: "refuse" }>;
+  observeJournal: typeof observeMigrationMaintenanceJournal;
+  manifestStore: MigrationManifestStore;
+  operations: ExistingGenerationInput["_operationsForTesting"];
+}>): Promise<MigrationAbortCommandOutcome> {
+  const { journal, outcome } = input;
+  const resolution = await resolveExistingMigrationGeneration({
+    homeDir: input.homeDir,
+    generation: journal.generationId,
+    manifestStore: input.manifestStore,
+    _operationsForTesting: { ...input.operations, observeJournal: input.observeJournal },
+  });
+  if (resolution.status === "refuse") return resolution;
+  const { route } = resolution.context;
+  if (refuseUnlessRouted("resume", route) === null) return outcome;
+  const applied = outcome.applied === true ? { applied: true as const } : {};
+  const refused = refuseUnlessRouted("abort", route);
+  if (refused !== null) {
+    return {
+      status: "refuse", reason: refused.reason, evidence: outcome.evidence,
+      generationId: journal.generationId, next: refused.next, ...applied,
+    };
+  }
+  return {
+    status: "refuse", reason: "abort-journal-moved", evidence: outcome.evidence,
+    generationId: journal.generationId, ...applied,
+  };
 }
 
 function finishAbort(input: Readonly<{
