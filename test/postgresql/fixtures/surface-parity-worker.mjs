@@ -20,6 +20,7 @@ import { capturePreparedMetadata, createPreparedCallRecorder, capturePreparedInp
 import { captureJournalInputs, discoveryForJournal, assertJournalInputTransition } from '../../surface-parity/journal-inputs.mjs';
 import { resolveGitProjectAnchor } from '../../../dist/src/git-project.js';
 import { drainFailureId, isolateAsyncBoundary } from '../../surface-parity/async-isolation.mjs';
+import { failure } from './surface-parity-failure.mjs';
 import { classifyHomeParent, parseHomeParentWitness, witnessPayload } from '../../../dist/src/home-parent-auth.js';
 import { readBoundedRegularFileWithStat } from '../../../dist/src/security-files.js';
 import { semanticDigest } from '../../surface-parity/assertions.mjs';
@@ -84,19 +85,6 @@ const admittedBindings = new Map(backend === 'postgresql' ? [
 let observedBookkeeping = new Map();
 const streamLimit = 32768;
 
-function failure(error) {
-  const message = String(error?.message ?? error);
-  const symbolic = message.match(/^(?:surface[-\w]*:)[a-zA-Z0-9:._-]+/u)?.[0];
-  const knownNames = new Set(['ConfigValidationError', 'BackendPublicationJournalError', 'PrivateMutationLockContentionError', 'TypeError', 'SyntaxError', 'StorageOperationError', 'PostgreSqlStorageOperationError']);
-  const errorName = knownNames.has(error?.name) ? error.name : knownNames.has(error?.constructor?.name) ? error.constructor.name : undefined;
-  const knownCodes = new Set(['ENOENT', 'ENOTDIR', 'EACCES', 'EPERM', 'EBADF', 'EBUSY', 'EAGAIN', 'ESTALE', 'ERR_INVALID_STATE', 'ERR_INVALID_ARG_TYPE', 'ERR_SQLITE_ERROR']);
-  const fallbackId = errorName ? `surface-worker:${errorName}` : knownCodes.has(error?.code) ? `surface-worker:${error.code}` : 'surface-worker:assertion';
-  const frame = String(error?.stack ?? '').match(/(surface-parity-[a-z-]+\.mjs):(\d+):\d+/u);
-  const field = typeof error?.surfacePreparedField === 'string' && /^[a-zA-Z.]{1,64}$/u.test(error.surfacePreparedField) ? `:${error.surfacePreparedField}` : '';
-  const detail = preparedFailureContext ? `${preparedFailureContext}:${(symbolic ?? fallbackId).replace(/^surface[-\w]*:/u, '')}${field}`
-    : `${symbolic ?? fallbackId}${frame ? `:${frame[1]}:${frame[2]}` : ''}`;
-  return { id: detail.slice(0, 110), digest: error?.surfaceEvidence?.stdoutErrorDigest ?? error?.surfaceEvidence?.stderrDigest ?? createHash('sha256').update(message).digest('hex') };
-}
 function send(message) {
   const json = JSON.stringify(message);
   assert.ok(Buffer.byteLength(json) <= 262144, 'surface-worker:ipc-bound');
@@ -309,7 +297,7 @@ async function quiesceReadState() {
   // Drain the fixture's own queued hooks before observing a read-only stage.
   // This setup never changes or retries the public operation under assertion.
   const drained = await request('POST', '/promote-events', { cwd: projectPath, drain: true });
-  assert.equal(drained.status, 200, 'surface-worker:quiescence-drain-status');
+  assert.equal(drained.status, 200, drainFailureId('surface-worker:quiescence-drain-status', drained));
   assert.equal(drained.body.errors, 0, 'surface-worker:quiescence-drain-errors');
   let before = await context.snapshot();
   const deadline = performance.now() + 3000;
@@ -842,7 +830,7 @@ async function cleanup() {
 process.on('message', message => {
   if (message?.type === 'admin-result' || message?.type === 'admin-failed') {
     const pending = adminPending.get(message.seq);
-    if (!pending) return void send({ type: 'failed', backend, scenario: activeScenario, error: failure(new Error('surface-worker:unknown-admin-reply')) });
+    if (!pending) return void send({ type: 'failed', backend, scenario: activeScenario, error: failure(new Error('surface-worker:unknown-admin-reply'), preparedFailureContext) });
     if (message.type === 'admin-failed' || message.error) pending.reject(new Error('surface-worker:admin-failed'));
     else pending.resolve(message.result);
     return;
@@ -890,7 +878,7 @@ process.on('message', message => {
     send({ type: 'result', seq: message.seq, backend, scenario: message.scenario, ...result, bookkeeping: bookkeepingResult() });
   })().catch(error => {
     try { closeSnapshotReaders(); } catch { /* Preserve the primary failure; final cleanup also fails closed. */ }
-    send({ type: 'failed', seq: message?.seq, backend, scenario: activeScenario, error: failure(admission.fail(error)) });
+    send({ type: 'failed', seq: message?.seq, backend, scenario: activeScenario, error: failure(admission.fail(error), preparedFailureContext) });
   })
     .finally(() => { busy = false; });
 });
@@ -943,6 +931,6 @@ try {
   await assertNoFallback();
   send({ type: 'ready', backend, routes, tools });
 } catch (error) {
-  send({ type: 'failed', backend, scenario: 'startup', error: failure(error) });
+  send({ type: 'failed', backend, scenario: 'startup', error: failure(error, preparedFailureContext) });
   try { await cleanup(); } finally { process.disconnect(); }
 }
