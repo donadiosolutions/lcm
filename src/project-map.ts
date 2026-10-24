@@ -159,6 +159,10 @@ export function withProjectMapReconciliationLock<T>(
   ) => T,
   homeDir?: string,
   publicationLockToken?: BackendPublicationLockToken,
+  options: Readonly<{
+    /** Hand the callback the map with metadata backfill held in memory, writing nothing. */
+    suppressMetadataBackfill?: boolean;
+  }> = {},
 ): T {
   return withProjectMapMutationLock(
     (nestedPublicationLockToken) => callback(
@@ -166,6 +170,7 @@ export function withProjectMapReconciliationLock<T>(
         strict: true,
         reload: true,
         homeDir,
+        _suppressMetadataBackfill: options.suppressMetadataBackfill,
         _publicationLockToken: nestedPublicationLockToken,
       }),
       homeDir,
