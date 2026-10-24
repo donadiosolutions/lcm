@@ -522,9 +522,11 @@ export function verifyPassiveEventsAgainstArchive(
  * untouched, so a genuine divergence between a live row and its archive row refuses while the manifest is still
  * resumable instead of after publish-rollback began and the canonical database was replaced. It applies
  * verifyPassiveEventsAgainstArchive's per-row checks (and so shares passiveEventDispositionCompatible) to the live
- * events database, opened read-only and never created. A missing database, or one not yet at the current schema
- * (materialization migrates it first), has nothing to compare yet and is tolerated: the post-install verification
- * stays the authoritative check.
+ * events database, opened read-only and never created. Schema version 4 has the same events columns as the current
+ * version (its migration only adds the missing_cwd_state table and indexes), so versions 4 and 5 are both compared.
+ * A missing database, or one without a schema_version row or older than version 4 (materialization migrates it
+ * first), has nothing to compare yet and is tolerated: the post-install verification stays the authoritative check.
+ * A database newer than this build understands refuses here, as materialization would after install.
  */
 export function assertRollbackSidecarsCompatible(input: MaterializeRollbackSidecarsInput): void {
   const eventsDbPath = join(eventsDir(input.homeDir), `${input.localProjectId}.db`);
@@ -535,7 +537,13 @@ export function assertRollbackSidecarsCompatible(input: MaterializeRollbackSidec
     try {
       const versioned = eventsDb.prepare("SELECT name FROM sqlite_master WHERE type = 'table' AND name = 'schema_version'").get();
       const version = versioned === undefined ? undefined : (eventsDb.prepare("SELECT version FROM schema_version").get() as { version: number } | undefined)?.version;
-      if (version !== EVENTS_SCHEMA_VERSION) return;
+      if (version === undefined || version < EVENTS_SCHEMA_VERSION - 1) return;
+      if (version > EVENTS_SCHEMA_VERSION) {
+        throw new RollbackSidecarError(
+          "verification-failed",
+          `events database schema version ${version} is newer than this build supports (${EVENTS_SCHEMA_VERSION})`,
+        );
+      }
       verifyPassiveEventsAgainstArchive(db, eventsDb, readMachineIdByIdentityKey(db), input.machineId, { preflight: true });
     } finally {
       eventsDb.close();

@@ -1287,11 +1287,29 @@ describe("assertRollbackSidecarsCompatible (#1681)", () => {
     expect(() => preflight(homeDir, path)).toThrow(expect.objectContaining({ reason: "invalid-input", message: expect.stringContaining("ghost-machine") }));
   });
 
-  it("leaves a live database that is not at the current schema to materialization and the post-install verification", () => {
+  it("compares a version-4 live database, which has the current events columns, and refuses its divergent row", () => {
+    const { homeDir, path } = liveHome((live) => {
+      live.exec("UPDATE events SET data = '{\"other\":true}'");
+      live.exec("UPDATE schema_version SET version = 4");
+    });
+    expect(() => preflight(homeDir, path)).toThrow(expect.objectContaining({ reason: "verification-failed", message: expect.stringContaining("diverges from its archive row") }));
+  });
+
+  it("accepts a matching version-4 live database", () => {
+    const { homeDir, path } = liveHome((live) => { live.exec("UPDATE schema_version SET version = 4"); });
+    expect(() => preflight(homeDir, path)).not.toThrow();
+  });
+
+  it("refuses a live database whose schema is newer than this build supports", () => {
+    const { homeDir, path } = liveHome((live) => { live.exec("UPDATE schema_version SET version = 6"); });
+    expect(() => preflight(homeDir, path)).toThrow(expect.objectContaining({ reason: "verification-failed", message: expect.stringContaining("newer than this build") }));
+  });
+
+  it("leaves a live database without a schema_version row, or older than version 4, to materialization and the post-install verification", () => {
     for (const edit of [
       "DROP TABLE schema_version",
       "DELETE FROM schema_version",
-      "UPDATE schema_version SET version = version - 1",
+      "UPDATE schema_version SET version = 3",
     ]) {
       const { homeDir, path } = liveHome((live) => { live.exec("UPDATE events SET data = '{\"other\":true}'"); live.exec(edit); });
       expect(() => preflight(homeDir, path)).not.toThrow();
