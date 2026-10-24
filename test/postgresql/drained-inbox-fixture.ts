@@ -1,4 +1,3 @@
-import { join } from "node:path";
 import { DatabaseSync } from "node:sqlite";
 import { applyReplicatedPassiveEvent } from "../../src/daemon/passive-event-replication-pass.js";
 import { PassiveEventReplicationWorker } from "../../src/daemon/passive-event-replication.js";
