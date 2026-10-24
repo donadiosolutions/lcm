@@ -1,4 +1,4 @@
-import { mkdirSync, rmSync } from "node:fs";
+import { existsSync, mkdirSync, renameSync, rmSync, writeFileSync } from "node:fs";
 import { homedir } from "node:os";
 import { join } from "node:path";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
@@ -554,8 +554,23 @@ describe("lcm migration command group", () => {
 
   describe("root bootstrap (#1674)", () => {
     const legacyHome = (): string => join(homedir(), LEGACY_LCM_HOME_DIRNAME);
+    const activeRoot = (): string => join(homedir(), ".lcm");
+    const parkedRoot = (): string => join(homedir(), ".lcm-parked-by-test");
+    const restore = (): void => {
+      rmSync(legacyHome(), { recursive: true, force: true });
+      if (existsSync(parkedRoot())) {
+        rmSync(activeRoot(), { recursive: true, force: true });
+        renameSync(parkedRoot(), activeRoot());
+      }
+    };
+    const withoutActiveRoot = (): void => renameSync(activeRoot(), parkedRoot());
+    const planOnce = async (): Promise<void> => {
+      state.plan.mockResolvedValueOnce({ status: "refuse", reason: "machine-identity-unregistered" });
+      vi.spyOn(process.stdout, "write").mockImplementation(() => true);
+      await invoke("migration", "plan", "--json");
+    };
 
-    afterEach(() => rmSync(legacyHome(), { recursive: true, force: true }));
+    afterEach(restore);
 
     it.each([
       ["report", () => state.report.mockResolvedValueOnce({ generationId: "gen-1", manifestPhase: "copied", next: "verify", evidence: {}, restart: null })],
@@ -568,12 +583,24 @@ describe("lcm migration command group", () => {
       expect(migrateLegacyHomeIfNeeded).not.toHaveBeenCalled();
     });
 
-    it("keeps the bootstrap for a migration command while a legacy home still waits to be moved", async () => {
+    it("skips the bootstrap when a finished migration left its legacy directory beside the active root", async () => {
       mkdirSync(legacyHome(), { recursive: true, mode: 0o700 });
-      state.plan.mockResolvedValueOnce({ status: "refuse", reason: "machine-identity-unregistered" });
-      vi.spyOn(process.stdout, "write").mockImplementation(() => true);
-      await invoke("migration", "plan", "--json");
+      await planOnce();
+      expect(migrateLegacyHomeIfNeeded).not.toHaveBeenCalled();
+    });
+
+    it("keeps the bootstrap while a legacy directory waits to be moved into an absent active root", async () => {
+      mkdirSync(legacyHome(), { recursive: true, mode: 0o700 });
+      withoutActiveRoot();
+      await planOnce();
       expect(migrateLegacyHomeIfNeeded).toHaveBeenCalledTimes(1);
+    });
+
+    it("does not treat a legacy path that is not a directory as a home to move", async () => {
+      writeFileSync(legacyHome(), "not a directory");
+      withoutActiveRoot();
+      await planOnce();
+      expect(migrateLegacyHomeIfNeeded).not.toHaveBeenCalled();
     });
   });
 });
