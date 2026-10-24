@@ -1018,10 +1018,11 @@ from an earlier pass:
   a window a rollback entered from PostgreSQL is not an activation window and
   is refused as `maintenance-not-held`;
 - the stored data on this machine belongs to exactly one project, the one
-  being migrated. Activation of a machine with data for several projects
-  refuses with `uncovered-projects`; multi-project cutover is out of scope
-  here (see [Cutover sets](migration-cutover-set.md) for the contract that
-  later releases build on);
+  being migrated. This single-generation activation of a machine with data
+  for several projects refuses with `uncovered-projects`; such a machine is
+  moved with the `--set` mode of the same commands, which activates every
+  project through one publication (see
+  [Cutover sets](migration-cutover-set.md#running-a-set-with-lcm-migration---set));
 - the destination identity, the project-map binding, the transfer-ledger copy
   binding and the destination census all match the verification report, and
   the PostgreSQL target passes the authenticated health check for the

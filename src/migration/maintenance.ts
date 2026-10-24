@@ -197,10 +197,13 @@ function assertAuthenticatedAuthority(
 export function resolveCutoverSetMemberAuthorities(input: Readonly<{
   homeDir: string;
   lockToken: BackendPublicationLockToken;
+  /** Resolve without publishing a project-map metadata backfill (a pre-confirmation lookup writes nothing). */
+  suppressMetadataBackfill?: boolean;
 }>): CutoverSetMemberAuthorityResolution {
   const enumeration = enumerateStoredDataProjectHashes({
     homeDir: input.homeDir,
     publicationLockToken: input.lockToken,
+    suppressMetadataBackfill: input.suppressMetadataBackfill,
   });
   if (enumeration.status === "unresolvable") {
     return { status: "unresolvable", reason: enumeration.reason, detail: enumeration.detail };
