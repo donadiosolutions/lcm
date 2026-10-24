@@ -260,7 +260,7 @@ describe("printHelp — per-command detail", () => {
     expect(migrationText).toContain("--confirm-generation <id>");
     expect(migrationText).toContain("Complete whichever recovery write");
     expect(migrationText).toContain("--confirm-backend postgresql");
-    expect(migrationText).toContain("swap the grants");
+    expect(migrationText).toContain("revoke the transfer grants");
     expect(migrationText).toContain("--confirm-backend sqlite");
     expect(migrationText).toContain("remotely bound");
     expect(migrationText).toContain("Never a silent fallback");

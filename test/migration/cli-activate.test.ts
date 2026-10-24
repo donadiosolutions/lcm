@@ -7,7 +7,11 @@ import {
   type MigrationActivationOutcome,
 } from "../../src/migration/activate-generation.js";
 import type { ActivationRestartCheckResult } from "../../src/migration/activation-restart-check.js";
-import { performMigrationActivateCommand, type MigrationActivateCommandOperations } from "../../src/migration/cli-activate.js";
+import {
+  performMigrationActivateCommand,
+  resolveMigrationActivationRuntimeSettings,
+  type MigrationActivateCommandOperations,
+} from "../../src/migration/cli-activate.js";
 import type { MigrationDaemonPresence } from "../../src/migration/daemon-presence.js";
 import { MigrationManifestStore } from "../../src/migration/manifest-store.js";
 import type { MigrationJournalObservation } from "../../src/migration/journal-observation.js";
@@ -29,6 +33,7 @@ const IDENTITY = {
   localProjectId: H("a"), machineId: "m-1", canonical: "/work/project", selectedPath: "/work/project",
 };
 const SETTINGS = { url: "postgresql://t", caFile: "/ca.pem", poolMax: 1, connectionTimeoutMs: 1, idleTimeoutMs: 1, statementTimeoutMs: 1, snapshotIdleTimeoutMs: 1 };
+const RUNTIME_SETTINGS = { ...SETTINGS, url: "postgresql://runtime" };
 const complete = async () => ({ state: "complete" as const, witness: {} as never });
 const link = (publicationId: string) => ({
   state: "resolved" as const, path: "/ignored",
@@ -73,6 +78,7 @@ const activated = (overrides: Record<string, unknown> = {}): MigrationActivation
 function ops(overrides: Partial<MigrationActivateCommandOperations> = {}): Partial<MigrationActivateCommandOperations> {
   return {
     resolveDestination: async () => ({ status: "resolved", settings: SETTINGS, expectedOwner: "lcm_migration", expectedIdentity: IDENTITY }),
+    resolveRuntimeSettings: () => ({ status: "resolved", settings: RUNTIME_SETTINGS }),
     classifyPresence: async () => ABSENT,
     ...overrides,
   };
@@ -106,10 +112,12 @@ describe("activate: admission and the two fences (exit 3, nothing read beyond th
     const { home, resolution } = await verified();
     const before = snapshotHome(home);
     const resolveDestination = vi.fn();
+    const resolveRuntimeSettings = vi.fn();
     const runActivation = vi.fn();
-    const result = await run(home, resolution, { ...extra, _operationsForTesting: ops({ resolveDestination, run: runActivation }) });
+    const result = await run(home, resolution, { ...extra, _operationsForTesting: ops({ resolveDestination, resolveRuntimeSettings, run: runActivation }) });
     expect(result).toEqual({ status: "refuse", reason, generationId: FIXTURE_GENERATION });
     expect(resolveDestination).not.toHaveBeenCalled();
+    expect(resolveRuntimeSettings).not.toHaveBeenCalled();
     expect(runActivation).not.toHaveBeenCalled();
     expect(snapshotHome(home)).toEqual(before);
   });
@@ -131,12 +139,13 @@ describe("activate --dry-run: previewMigrationActivation, which is never predict
     const { home, resolution } = await verified();
     const before = snapshotHome(home);
     const resolveDestination = vi.fn();
+    const resolveRuntimeSettings = vi.fn();
     const preview = vi.fn(async () => ({
       predictive: false as const,
       checks: [{ name: "manifest" as const, status: "ok" as const, detail: "phase verified" }, { name: "link" as const, status: "unresolvable" as const, detail: "/secret/path" }],
       notEvaluated: ["quiescence", "coverage", "g8", "lease", "health", "census"] as const,
     }));
-    const result = await run(home, resolution, { dryRun: true, _operationsForTesting: ops({ preview, resolveDestination }) });
+    const result = await run(home, resolution, { dryRun: true, _operationsForTesting: ops({ preview, resolveDestination, resolveRuntimeSettings }) });
     expect(result).toEqual({
       status: "refuse", reason: "activation-dry-run-not-predictive", generationId: FIXTURE_GENERATION,
       next: "activate (drop --dry-run to run it)",
@@ -147,6 +156,7 @@ describe("activate --dry-run: previewMigrationActivation, which is never predict
     });
     expect(preview).toHaveBeenCalledWith({ homeDir: home, generationId: FIXTURE_GENERATION });
     expect(resolveDestination).not.toHaveBeenCalled();
+    expect(resolveRuntimeSettings).not.toHaveBeenCalled();
     expect(snapshotHome(home)).toEqual(before);
   });
 
@@ -163,17 +173,17 @@ describe("activate --dry-run: previewMigrationActivation, which is never predict
 });
 
 describe("activate: the inputs of runMigrationActivation", () => {
-  it("passes one transfer-role settings object as both transferSettings and ordinarySettings, with the resolved identity and owner", async () => {
+  it("passes distinct transfer and runtime settings with the resolved identity and owner", async () => {
     const { home, resolution } = await verified();
     const controller = new AbortController();
     const runActivation = vi.fn(async (_input: unknown) => ({ status: "refused", step: "S0", reason: "manifest-not-eligible", detail: "x", effectBegun: false }) as never);
     await run(home, resolution, { signal: controller.signal, _operationsForTesting: ops({ run: runActivation }) });
     const input = runActivation.mock.calls[0]![0] as Record<string, unknown>;
     expect(input).toEqual({
-      homeDir: home, generationId: FIXTURE_GENERATION, transferSettings: SETTINGS, ordinarySettings: SETTINGS,
+      homeDir: home, generationId: FIXTURE_GENERATION, transferSettings: SETTINGS, ordinarySettings: RUNTIME_SETTINGS,
       expectedIdentity: IDENTITY, expectedOwner: "lcm_migration", signal: controller.signal,
     });
-    expect(input.ordinarySettings).toBe(input.transferSettings);
+    expect(input.ordinarySettings).not.toBe(input.transferSettings);
   });
 
   it("omits the signal when none is given", async () => {
@@ -194,11 +204,128 @@ describe("activate: the inputs of runMigrationActivation", () => {
     expect(runActivation).not.toHaveBeenCalled();
   });
 
+  it("refuses a missing or invalid runtime URL before activation without exposing its value", async () => {
+    const { home, resolution } = await verified();
+    const secret = "postgresql://runtime:do-not-echo@example.invalid/lcm?sslmode=disable";
+    const runActivation = vi.fn();
+    const result = await run(home, resolution, {
+      _operationsForTesting: ops({
+        resolveRuntimeSettings: () => ({
+          status: "refuse",
+          reason: "activation-runtime-target-missing",
+        }),
+        run: runActivation,
+      }),
+    });
+
+    expect(result).toEqual({
+      status: "refuse",
+      reason: "activation-runtime-target-missing",
+      generationId: FIXTURE_GENERATION,
+    });
+    expect(JSON.stringify(result)).not.toContain(secret);
+    expect(runActivation).not.toHaveBeenCalled();
+  });
+
+  it("strictly resolves the activate-only runtime URL while reusing destination TLS and tuning", async () => {
+    const { home } = await verified();
+    const caFile = join(home, "runtime-ca.pem");
+    writeFileSync(caFile, "test-ca\n", { mode: 0o600 });
+    const transferSettings = { ...SETTINGS, caFile };
+    const secret = "postgresql://runtime:secret@example.invalid/lcm";
+
+    expect(resolveMigrationActivationRuntimeSettings({
+      transferSettings,
+      expectedOwner: "lcm_migration",
+      env: { LCM_POSTGRES_RUNTIME_URL: secret },
+    })).toEqual({
+      status: "resolved",
+      settings: { ...transferSettings, url: secret },
+    });
+    const { snapshotIdleTimeoutMs: _snapshotIdleTimeoutMs, ...withoutSnapshotIdleTimeout } = transferSettings;
+    expect(resolveMigrationActivationRuntimeSettings({
+      transferSettings: withoutSnapshotIdleTimeout,
+      expectedOwner: "lcm_migration",
+      env: { LCM_POSTGRES_RUNTIME_URL: secret },
+    })).toMatchObject({
+      status: "resolved",
+      settings: { snapshotIdleTimeoutMs: 300_000 },
+    });
+    for (const value of [
+      undefined,
+      "not-a-url",
+      `${secret}?sslmode=disable`,
+      `${secret}#fragment`,
+    ]) {
+      const resolution = resolveMigrationActivationRuntimeSettings({
+        transferSettings,
+        expectedOwner: "lcm_migration",
+        env: { LCM_POSTGRES_RUNTIME_URL: value },
+      });
+      expect(resolution).toEqual({
+        status: "refuse",
+        reason: "activation-runtime-target-missing",
+      });
+      expect(JSON.stringify(resolution)).not.toContain(secret);
+    }
+  });
+
+  it("does not misclassify an unexpected runtime-settings failure as missing input", () => {
+    const failure = new RangeError("injected resolver failure");
+    const transferSettings = new Proxy(SETTINGS, {
+      get() { throw failure; },
+    });
+    expect(() => resolveMigrationActivationRuntimeSettings({
+      transferSettings,
+      expectedOwner: "lcm_migration",
+      env: { LCM_POSTGRES_RUNTIME_URL: "postgresql://runtime:secret@example.invalid/lcm" },
+    })).toThrow(failure);
+  });
+
+  it("uses the real activate-only resolver and process environment when no seam is supplied", async () => {
+    const { home, resolution } = await verified();
+    const caFile = join(home, "runtime-process-ca.pem");
+    writeFileSync(caFile, "test-ca\n", { mode: 0o600 });
+    const runtimeUrl = "postgresql://runtime:secret@example.invalid/lcm";
+    vi.stubEnv("LCM_POSTGRES_RUNTIME_URL", runtimeUrl);
+    try {
+      const runActivation = vi.fn(async () => ({
+        status: "refused",
+        step: "S0",
+        reason: "manifest-not-eligible",
+        detail: "x",
+        effectBegun: false,
+      }) as never);
+      await run(home, resolution, {
+        _operationsForTesting: {
+          resolveDestination: async () => ({
+            status: "resolved",
+            settings: { ...SETTINGS, caFile },
+            expectedOwner: "lcm_migration",
+            expectedIdentity: IDENTITY,
+          }),
+          run: runActivation,
+        },
+      });
+      expect(runActivation.mock.calls[0]![0]).toMatchObject({
+        ordinarySettings: { url: runtimeUrl, caFile },
+      });
+    } finally {
+      vi.unstubAllEnvs();
+    }
+  });
+
   it("uses the real destination resolution and the real call when none are injected (an empty home has no target)", async () => {
     const { home, resolution } = await verified();
     expect(await run(home, resolution)).toMatchObject({ status: "refuse", reason: "migration-target-missing" });
     // The real call, pre-cancelled, refuses or fails closed at its first step; it never reads as success.
-    const real = await run(home, resolution, { signal: AbortSignal.abort(), _operationsForTesting: { resolveDestination: ops().resolveDestination! } });
+    const real = await run(home, resolution, {
+      signal: AbortSignal.abort(),
+      _operationsForTesting: {
+        resolveDestination: ops().resolveDestination!,
+        resolveRuntimeSettings: ops().resolveRuntimeSettings!,
+      },
+    });
     expect(real.status).toBe("refuse");
   });
 });
@@ -393,15 +520,15 @@ describe("activate: the activated outcome (exit 0 needs identity, manifest read-
   const okOps = (outcome = activated(), presence: MigrationDaemonPresence = ABSENT) =>
     ops({ run: async () => outcome, classifyPresence: async () => presence });
 
-  it("exits 0 with the report, the identity, the grant-swap instruction and the restart observation", async () => {
+  it("exits 0 with the report, the identity, the transfer-revoke instruction and the restart observation", async () => {
     const { home, resolution } = settledActive();
     const result = await run(home, resolution, { _operationsForTesting: okOps() });
     expect(result).toEqual({
-      status: "ok", generationId: FIXTURE_GENERATION, manifestPhase: "active", applied: true, next: "swap-grants-then-start-daemon",
+      status: "ok", generationId: FIXTURE_GENERATION, manifestPhase: "active", applied: true, next: "revoke-transfer-grants-then-start-daemon",
       restart: { answer: "satisfied", presence: "absent" },
       evidence: {
         cell: 10, publicationId: PUBLICATION_ID, manifestRevision: 9, reportId: "activation-report", reportSha256: H("b"),
-        resumedFrom: "fresh", successorFencingTokenAdvanced: false, grantSwap: "required-before-daemon-start",
+        resumedFrom: "fresh", successorFencingTokenAdvanced: false, transferGrantRevocation: "required-before-daemon-start",
         selectedBackend: "postgresql", restartCheckReason: "backend-matches",
       },
     });
@@ -433,7 +560,7 @@ describe("activate: the activated outcome (exit 0 needs identity, manifest read-
     const result = await run(home, resolution, { _operationsForTesting: okOps(activated({ restart: restartVerdict, resumedFrom: "fresh" }), presence) });
     expect(result).toMatchObject({
       status: "refuse", reason, generationId: FIXTURE_GENERATION, applied: true,
-      next: reason === "cutover-restart-required" ? "swap-grants-then-start-daemon" : "report",
+      next: reason === "cutover-restart-required" ? "revoke-transfer-grants-then-start-daemon" : "report",
     });
     expect((result as { restart: unknown }).restart).not.toBeNull();
   });
@@ -485,7 +612,11 @@ describe("activate: the activated outcome (exit 0 needs identity, manifest read-
     await new Promise<void>((resolve) => server.close(() => resolve()));
     writeFileSync(join(home, ".lcm", "config.json"), JSON.stringify({ daemon: { port: address.port } }), { mode: 0o600 });
     const result = await run(home, resolution, {
-      _operationsForTesting: { resolveDestination: ops().resolveDestination!, run: async () => activated() },
+      _operationsForTesting: {
+        resolveDestination: ops().resolveDestination!,
+        resolveRuntimeSettings: ops().resolveRuntimeSettings!,
+        run: async () => activated(),
+      },
     });
     expect(result).toMatchObject({ status: "ok", restart: { answer: "satisfied", presence: "absent" } });
   });

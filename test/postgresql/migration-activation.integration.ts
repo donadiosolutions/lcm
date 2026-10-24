@@ -33,20 +33,13 @@
  * "released", removes the released fence row, and proves the retry drives the
  * journal to completed: the release tail needs no own fence (plan-v7 A3).
  *
- * Role topology follows plan-v7.2 B1/B3: activation runs entirely under ONE
- * transfer-profile role, provisioned here under a per-run unique name with
- * the reviewed runtime grant scripts plus the transfer grant script (exactly
- * what portable-fixture.ts installs on lcm_test_runtime), and its settings
- * are passed as both transferSettings and ordinarySettings. Production
- * readiness admits exactly one grantee per database and the runtime and
- * transfer manifests are exclusive on one role, so this is the only grant
- * shape under which S0/S7 (transfer reads) and S2/S6/S15 (lease and health,
- * admitted through the transfer verifier since B2) all pass in one run. The
- * same exclusivity is why the harness's baseline USAGE grant to
- * lcm_test_runtime is revoked in this database: a second grantee on schema
- * lcm is an acl-shape refusal. The daemon's own runtime profile is NOT
- * proven by activation (docs/migration-cutover.md, "After activation");
- * the last assertions make that explicit. #1607 is the later improvement.
+ * Role topology follows #1607: distinct per-run runtime and transfer login
+ * roles receive the real reference grant scripts. S2/S6/S15 use the runtime
+ * role and admit the discovered transfer role as one canonical peer; S0/S7
+ * use the transfer role and admit the discovered runtime role reciprocally.
+ * The harness's baseline lcm_test_runtime grant stays revoked except for the
+ * explicit third-grantee refusal assertion. The final assertions revoke the
+ * transfer role's grants and prove ordinary no-peer daemon readiness passes.
  *
  * The activation runs without the daemon's storage secrets: the harness
  * forbids LCM_POSTGRES_URL and LCM_POSTGRES_CA_FILE in the runner
@@ -60,9 +53,11 @@ import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { beforeAll, expect, it, vi } from "vitest";
-import { assertHarnessReady, withPostgreSqlTestDatabase, type PostgreSqlTestDatabase } from "./harness.js";
+import { assertHarnessReady, settings, withPostgreSqlTestDatabase, type PostgreSqlTestDatabase } from "./harness.js";
 import { PostgreSqlRuntime } from "../../src/storage/postgresql/runtime.js";
-import { verifyPostgreSqlTransferSchema } from "../../src/storage/postgresql/runtime-readiness.js";
+import {
+  verifyPostgreSqlRuntimeSchema,
+} from "../../src/storage/postgresql/runtime-readiness.js";
 import type { PostgreSqlConnectionSettings } from "../../src/storage/postgresql/contracts.js";
 import { readBackendMaintenanceJournal, readBackendPublicationJournal, type BackendPublicationObserver } from "../../src/storage/backend-publication.js";
 import { createBackendPublicationCoordinator } from "../../src/storage/backend-publication-driver.js";
@@ -79,7 +74,7 @@ import { readMigrationActivationReport } from "../../src/migration/activation-re
 import { resolveMigrationWitnessBindings } from "../../src/migration/generation-binding-store.js";
 import { MigrationManifestStore } from "../../src/migration/manifest-store.js";
 import { checkMigrationTargetHealth } from "../../src/migration/target-health.js";
-import { EXPECTED_OWNER, ACTIVATION_ROLE, GENERATION_ID, readProjectMapFile, readConfigBackend, provisionActivationRole, dropActivationRole, prepareVerifiedInstallation } from "./migration-activation-fixture.js";
+import { EXPECTED_OWNER, RUNTIME_ROLE, TRANSFER_ROLE, GENERATION_ID, readProjectMapFile, readConfigBackend, provisionActivationRole, grantRuntimeActivationRole, dropActivationRole, prepareVerifiedInstallation } from "./migration-activation-fixture.js";
 
 beforeAll(assertHarnessReady);
 
@@ -88,7 +83,7 @@ beforeAll(assertHarnessReady);
  * displaces an unreleased row of another generation, so this is the proof that
  * an abandoned run freed the project. */
 async function expectProjectAcquirableByAnotherGeneration(
-  db: PostgreSqlTestDatabase, deps: MigrationActivationDependencies, home: string, remoteProjectId: string, transfer: PostgreSqlConnectionSettings,
+  db: PostgreSqlTestDatabase, deps: MigrationActivationDependencies, home: string, remoteProjectId: string, runtimeSettings: PostgreSqlConnectionSettings,
 ): Promise<void> {
   const leases = await db.migrator.query<{ released: boolean }>({
     text: "SELECT released_at IS NOT NULL AS released FROM lcm.fenced_leases "
@@ -96,7 +91,7 @@ async function expectProjectAcquirableByAnotherGeneration(
     values: [remoteProjectId],
   }, { domain: "factory", operation: "activationIntegration" });
   expect(leases.rows).toEqual([{ released: true }]);
-  const otherRuntime = deps.createOrdinaryRuntime(transfer);
+  const otherRuntime = deps.createOrdinaryRuntime(runtimeSettings);
   try {
     const guard = otherRuntime.backendPublicationGuard();
     const otherGeneration = {
@@ -124,8 +119,9 @@ it("activates a real verified SQLite copy through the production dependencies: r
     expect(process.env.LCM_POSTGRES_CA_FILE).toBeUndefined();
     try {
       // Inside the cleanup scope: a failure after CREATE ROLE still drops the role.
-      const transfer = await provisionActivationRole(db);
-      const installation = await prepareVerifiedInstallation(db, home, transfer);
+      const roles = await provisionActivationRole(db);
+      const installation = await prepareVerifiedInstallation(db, home, roles.transfer, roles.runtime);
+      await grantRuntimeActivationRole(db);
       const publicationId = deriveActivationPublicationId(GENERATION_ID);
       const deps = createMigrationActivationDependencies({ homeDir: home });
 
@@ -143,7 +139,7 @@ it("activates a real verified SQLite copy through the production dependencies: r
         ...deps,
         readDestinationCensus: async () => { controller.abort(new Error("cancelled by the caller")); throw controller.signal.reason; },
       })).rejects.toThrow("cancelled by the caller");
-      await expectProjectAcquirableByAnotherGeneration(db, deps, home, installation.remoteProjectId, transfer);
+      await expectProjectAcquirableByAnotherGeneration(db, deps, home, installation.remoteProjectId, roles.runtime);
 
       // A second project with stored data: G8's single-project verdict refuses
       // (#1544 owns the multi-project cutover). Nothing durable is touched.
@@ -161,12 +157,48 @@ it("activates a real verified SQLite copy through the production dependencies: r
       expect(readMigrationActivationEvidence({ homeDir: home, generationId: GENERATION_ID })).toEqual({ state: "authoritatively-absent" });
       expect(readConfigBackend(home)).toBe("sqlite");
       // The refused run released its S2 lease row (PR #1628 review).
-      await expectProjectAcquirableByAnotherGeneration(db, deps, home, installation.remoteProjectId, transfer);
+      await expectProjectAcquirableByAnotherGeneration(db, deps, home, installation.remoteProjectId, roles.runtime);
       rmSync(join(projectsDir(home), otherHash), { recursive: true });
       writeFileSync(projectMapPath(home), JSON.stringify(map) + "\n", { mode: 0o600 });
       clearProjectMapCache();
 
-      const outcome = await runMigrationActivation(installation.input, deps);
+      // A real third grantee is refused even when its only direct grant is a
+      // canonical-looking schema privilege and the canonical transfer peer
+      // is explicitly admitted.
+      await db.migrator.query(
+        { text: "GRANT USAGE ON SCHEMA lcm TO lcm_test_runtime" },
+        { domain: "factory", operation: "activationIntegrationThirdGrantee" },
+      );
+      const thirdGranteeProbe = new PostgreSqlRuntime(roles.runtime);
+      try {
+        await expect(verifyPostgreSqlRuntimeSchema(thirdGranteeProbe, {
+          expectedOwner: EXPECTED_OWNER,
+          admittedPeer: { role: TRANSFER_ROLE },
+        })).rejects.toMatchObject({ reason: "acl-shape" });
+      } finally {
+        await thirdGranteeProbe.close();
+        await db.migrator.query(
+          { text: "REVOKE USAGE ON SCHEMA lcm FROM lcm_test_runtime" },
+          { domain: "factory", operation: "activationIntegrationThirdGranteeCleanup" },
+        );
+      }
+
+      const runtimeAdmissions: string[] = [];
+      const transferAdmissions: string[] = [];
+      const auditedDeps: MigrationActivationDependencies = {
+        ...deps,
+        verifyRuntimeSchema: async (executor, options) => {
+          const readiness = await deps.verifyRuntimeSchema(executor, options);
+          runtimeAdmissions.push(readiness.runtimeRole);
+          return readiness;
+        },
+        verifyTransferSchema: async (executor, options) => {
+          const readiness = await deps.verifyTransferSchema(executor, options);
+          transferAdmissions.push(readiness.runtimeRole);
+          return readiness;
+        },
+      };
+      const outcome = await runMigrationActivation(installation.input, auditedDeps);
       expect(outcome.status, JSON.stringify(outcome)).toBe("activated");
       expect(outcome).toMatchObject({
         status: "activated", resumedFrom: "fresh", successorFencingToken: null,
@@ -174,6 +206,8 @@ it("activates a real verified SQLite copy through the production dependencies: r
         restart: { status: "satisfied" },
       });
       if (outcome.status !== "activated") return;
+      expect(runtimeAdmissions).toEqual([RUNTIME_ROLE, RUNTIME_ROLE]);
+      expect(transferAdmissions).toEqual([TRANSFER_ROLE]);
 
       // The version-3 selection became the completed version-2 publication of postgresql.
       expect(readBackendMaintenanceJournal(home)).toBeNull();
@@ -217,22 +251,43 @@ it("activates a real verified SQLite copy through the production dependencies: r
         selections: [{ kind: "activation", publicationId, witnessChecksumSha256: stored.report.body.witnessChecksumSha256 }],
       });
 
-      // The target is healthy under the published selection for the
-      // activation role, admitted through the transfer verifier exactly as
-      // S6/S15 admitted it (B2). The daemon's own runtime verifier refuses
-      // that same role (the transfer extras are outside the runtime manifest):
-      // a successful activation does not prove the daemon can start; the
-      // operator's grant swap in docs/migration-cutover.md comes next.
-      const runtime = new PostgreSqlRuntime(transfer);
+      // Runtime health passes with the canonical transfer peer admitted, but
+      // ordinary daemon readiness remains strict until that peer is revoked.
+      const runtime = new PostgreSqlRuntime(roles.runtime);
       try {
         expect(await checkMigrationTargetHealth(
           { runtime, expectedOwner: EXPECTED_OWNER },
-          { verifyRuntimeSchema: verifyPostgreSqlTransferSchema },
-        )).toMatchObject({ status: "healthy", readiness: { runtimeRole: ACTIVATION_ROLE, expectedOwner: EXPECTED_OWNER } });
+          { verifyRuntimeSchema: (executor, options) => verifyPostgreSqlRuntimeSchema(executor, {
+            ...options,
+            admittedPeer: { role: TRANSFER_ROLE },
+          }) },
+        )).toMatchObject({ status: "healthy", readiness: { runtimeRole: RUNTIME_ROLE, expectedOwner: EXPECTED_OWNER } });
         expect(await checkMigrationTargetHealth({ runtime, expectedOwner: EXPECTED_OWNER }))
           .toMatchObject({ status: "unhealthy", reason: "schema-mismatch" });
       } finally {
         await runtime.close();
+      }
+
+      const administrator = new PostgreSqlRuntime(settings(db.adminUrl));
+      try {
+        await administrator.query(
+          { text: "DROP OWNED BY " + TRANSFER_ROLE },
+          { domain: "factory", operation: "activationIntegrationRevokeTransfer" },
+        );
+      } finally {
+        await administrator.close();
+      }
+      const daemonRuntime = new PostgreSqlRuntime(roles.runtime);
+      try {
+        expect(await checkMigrationTargetHealth({
+          runtime: daemonRuntime,
+          expectedOwner: EXPECTED_OWNER,
+        })).toMatchObject({
+          status: "healthy",
+          readiness: { runtimeRole: RUNTIME_ROLE },
+        });
+      } finally {
+        await daemonRuntime.close();
       }
       // The activation's fenced lease on the project was taken and released by the drive's release phase.
       const leases = await db.migrator.query<{ operation: string; released: boolean }>({
@@ -280,8 +335,9 @@ it("drives a publication that crashed at released, with its fence row gone, to c
     vi.stubEnv("HOME", home);
     vi.stubEnv("USERPROFILE", home);
     try {
-      const transfer = await provisionActivationRole(db);
-      const installation = await prepareVerifiedInstallation(db, home, transfer);
+      const roles = await provisionActivationRole(db);
+      const installation = await prepareVerifiedInstallation(db, home, roles.transfer, roles.runtime);
+      await grantRuntimeActivationRole(db);
       const publicationId = deriveActivationPublicationId(GENERATION_ID);
       const deps = createMigrationActivationDependencies({ homeDir: home });
 

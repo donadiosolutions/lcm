@@ -20,7 +20,7 @@ touches local storage as a consumer — are fenced and will refuse or retry rath
 The cutover is a sequence, and every step is its own command:
 
 ```text
-plan -> apply -> resume (until copied) -> verify -> activate -> swap the grants -> start the daemon
+plan -> apply -> resume (until copied) -> verify -> grant runtime -> activate -> revoke transfer -> start daemon
                        \-> abort   (before activation: leaves the hold, discards the attempt)
 activated generation -> rollback   (returns to SQLite)
 ```
@@ -29,11 +29,11 @@ activated generation -> rollback   (returns to SQLite)
 nine commands are registered: `plan`, `dry-run`, `apply`, `resume`, `verify`, `report`, `abort`,
 `activate` and `rollback`.
 
-- **`activate` completes the cutover.** It switches the installation to the copied PostgreSQL data
-  and releases the hold. It runs entirely under the PostgreSQL **transfer role**, so after it
-  succeeds you must swap the grants **before starting the daemon**: add the runtime grants to the
-  daemon's runtime role, then revoke the transfer grants. See "The cutover: activate and the grant
-  swap" below.
+- **`activate` completes the cutover.** Apply the runtime grants first and set
+  `LCM_POSTGRES_RUNTIME_URL`. Activation runs health as that runtime role while admitting the live
+  transfer role as one canonical peer, switches the installation, and releases the hold. After it
+  succeeds, revoke the transfer grants before starting the daemon. See "The cutover: activate and
+  revoke transfer grants" below.
 - **`abort` leaves the hold before activation.** It discards the hold and the captured snapshot's
   standing and returns your installation to normal, unfenced SQLite operation. Nothing about your
   PostgreSQL destination is affected by `abort`; the copy, if it reached PostgreSQL, is simply not
@@ -295,12 +295,13 @@ re-entry at cell 10 (the generation's own completed publication and an `active` 
 algorithm of its own: it supplies the inputs the activation orchestration asks for and maps what it
 returns.
 
-**Inputs.** The PostgreSQL connection is the transfer-role connection that `verify` opens, resolved
-from `storage.postgresql` and its environment fallbacks, and it is passed as **both** of activation's
-settings, because activation runs entirely under the transfer role. The expected owner is the
-configured migration role and the expected identity is the persisted local identity with a read of
-the destination project. Nothing is written to `config.json`, and an input that cannot be resolved
-refuses before the call.
+**Inputs.** The transfer-role connection is the destination that `verify` used.
+`LCM_POSTGRES_RUNTIME_URL` supplies the daemon runtime role through the same strict PostgreSQL URL
+validation, with the destination's CA and tuning settings. The expected owner is the configured
+migration role and the expected identity is the persisted local identity with a read of the
+destination project. Neither URL is written to `config.json` or rendered in output. Missing or
+invalid runtime input refuses as `activation-runtime-target-missing` before orchestration.
+`--dry-run` does not read this variable.
 
 **Fences.** `--confirm-generation` and `--confirm-backend postgresql` (see "Commands" above).
 
@@ -308,8 +309,8 @@ refuses before the call.
 
 | Outcome | Exit | Meaning and next step |
 | --- | --- | --- |
-| activated, restart cell satisfied | 0 | The manifest reads `active` with nothing pending, the result names this generation, and no daemon holds a stale backend. **Next: swap the grants, then start the daemon.** |
-| activated, a running daemon holds the previous backend | 8 | The selection is durable and correct. Swap the grants, restart the daemon, run `report`. |
+| activated, restart cell satisfied | 0 | The manifest reads `active` with nothing pending, the result names this generation, and no daemon holds a stale backend. **Next: revoke the transfer grants, then start the daemon.** |
+| activated, a running daemon holds the previous backend | 8 | The selection is durable and correct. Revoke the transfer grants, restart the daemon, run `report`. |
 | activated, the restart check and the presence observation disagree or cannot be made | 5 | `cutover-restart-contradiction` / `cutover-restart-unresolvable`. Run `lcm daemon status`, resolve it, run `report`. |
 | refused before any effect | 2, 4, 5 or 6 | `activation-refused-precondition` (2), `-contention` (4), `-evidence` (5), `-resume` (6); the evidence names the step (`S0`-`S8`) and the reason. Nothing changed. |
 | interrupted after an effect began | 6 | `activation-interrupted`. Run `activate` again with the same confirmations. The evidence names the step, the cause, what is known to have been applied and whether the report was stored. |
@@ -323,7 +324,7 @@ The refusal classes by reason (each reason has exactly one): **exit 2** `manifes
 `manifest-not-eligible`, `maintenance-not-held`, `quiescence-unsatisfied`, `coverage-unsatisfied`,
 `uncovered-projects` (a machine with stored data for more than one project is out of scope here),
 `verification-stale`, `identity-drift`, `project-map-drift`, `target-unhealthy`, `census-drift`,
-`class-coverage-incomplete`, `verification-mismatch`; **exit 4** `lease-conflict`; **exit 5**
+`class-coverage-incomplete`, `verification-mismatch`, `activation-runtime-target-missing`; **exit 4** `lease-conflict`; **exit 5**
 `manifest-unresolvable`, `maintenance-unresolvable`, `lease-unresolvable`, `quiescence-unresolvable`,
 `coverage-unresolvable`, `verification-unresolvable`, `target-unresolvable`, `evidence-unresolvable`,
 `state-unresolvable`; **exit 6** `pending-effect-foreign` when `resume` owns that pending effect, exit 2
@@ -336,13 +337,12 @@ project-coverage refusal, the lease, target health and the census. Those are the
 an activation, so the preview can never say it would succeed: it always refuses
 `activation-dry-run-not-predictive` (exit 5). No coordination effect is taken.
 
-**Grants.** Activation runs under the transfer role and never touches grants. After exit 0, swap the
-grants before starting the daemon: add the runtime grants to the daemon's runtime role, then revoke
-the transfer grants (the steps are in "The cutover: activate and the grant swap"). #1607 is the
-later improvement that will let the daemon's readiness admit the transfer role.
+**Grants.** Apply runtime grants before activation. Activation never changes grants; it proves the
+runtime profile while admitting exactly the canonical transfer role. After exit 0, revoke the
+transfer grants (see "The cutover: activate and revoke transfer grants").
 
-**After the grant swap, use `report`, not `activate`.** `activate` runs under the transfer role and
-the swap revokes that role's grants, so a repeat is not meant to be run once the swap is done.
+**After revoking transfer grants, use `report`, not `activate`.** A repeat activation needs the
+transfer role's canonical grants for reciprocal admission.
 `lcm migration report` reads the settled state without a connection.
 
 Exit 0 postcondition: the manifest reads `active` with nothing pending, the identity the call
@@ -533,34 +533,39 @@ identity -- retrying after `abort` computes a fresh, later ordinal rather than r
 one, so a project that aborts many attempts will see its candidate generation numbers climb; this is
 expected and not a sign of a leak.
 
-## The cutover: activate and the grant swap
+## The cutover: activate and revoke transfer grants
 
 Once `verify` has left the generation `verified`, the cutover finishes in this order. Do not reorder
 it.
 
-1. `lcm migration activate --confirm-generation <id> --confirm-backend postgresql`. It runs under the
-   transfer role and, on exit 0, the selection is durable and the hold is released.
-2. **Swap the grants, before starting the daemon.** Activation proves that the transfer role could publish the selection; it does
-   not prove that the daemon can start, because the daemon enforces its exact runtime privilege
-   profile when it starts and that profile rejects the transfer grants. Add the reviewed runtime
-   grants to the daemon's runtime role, then revoke the transfer grants from the transfer role (or
-   drop it), so the runtime role is the schema's only non-owner grantee. Applying the runtime grants
-   before revoking the transfer grants is harmless, because readiness is evaluated only when the
-   daemon starts. The scripts and the procedure are in
-   [Migration cutover: after activation](migration-cutover.md#after-activation-the-grant-swap-and-the-daemon).
-   A later improvement, #1607, will let the daemon's readiness admit the transfer role next to the
-   runtime role; until then the swap is your step.
-3. Start (or restart) the daemon. It performs its own readiness check against the runtime role and
+1. Apply the reviewed runtime grants to the daemon runtime role. Set
+   `LCM_POSTGRES_RUNTIME_URL` to that role's URL. A generation verified by an older build also needs
+   these inputs before the current build can activate it.
+2. `lcm migration activate --confirm-generation <id> --confirm-backend postgresql`. It binds both
+   live sessions to the same destination, proves the runtime profile with the transfer peer, and,
+   on exit 0, leaves the selection durable and the hold released.
+3. **Revoke the transfer grants before starting the daemon**, or drop the transfer role. The scripts
+   and procedure are in [Migration cutover: after activation](migration-cutover.md#after-activation-revoke-transfer-grants-and-start-the-daemon).
+4. Start (or restart) the daemon. It performs its own readiness check against the runtime role and
    refuses to serve until it passes.
-4. Run `lcm migration report` until it exits 0 (see "Restarting the daemon after a selection").
+5. Run `lcm migration report` until it exits 0 (see "Restarting the daemon after a selection").
 
-Between steps 2 and 3, change the connection in the shell and service environment you will use from
-here on: `LCM_POSTGRES_URL` must name the daemon's **runtime role** (activation used the transfer
-role's URL), and `storage.postgresql.migrationRole` stays the schema owner. Both the daemon and a
-later `rollback` read these settings.
+Before step 4, change the shell and service environment: `LCM_POSTGRES_URL` must name the same daemon
+**runtime role** supplied through `LCM_POSTGRES_RUNTIME_URL`, and
+`storage.postgresql.migrationRole` stays the schema owner. Both the daemon and a later `rollback`
+read `LCM_POSTGRES_URL`; neither reads the activate-only variable.
 
-`activate` prints the swap as its next step on exit 0 (`next` is `swap-grants-then-start-daemon` and
-the evidence carries `grantSwap: required-before-daemon-start`), and its exit 8 refusal repeats it.
+`activate` prints the revoke as its next step on exit 0 (`next` is
+`revoke-transfer-grants-then-start-daemon` and the evidence carries
+`transferGrantRevocation: required-before-daemon-start`), and its exit 8 refusal repeats it.
+
+During the grant-first window, fresh `verify`, copy resume, and target reachability remain no-peer
+transfer checks and refuse until runtime grants are revoked. Revoke runtime grants before returning
+to those pre-activate recovery paths. Rollback, factory readiness, and diagnostics remain no-peer
+runtime checks and refuse until transfer grants are revoked. Interrupted activation resumes through
+the peer-aware `activate` command. Cutover-set activation remains transfer-only. PostgreSQL default
+privileges are not admission evidence; any unexpected grant they later materialize is refused when
+readiness inspects the live object ACL.
 
 ## Rollback and its limits
 
@@ -578,10 +583,10 @@ pre-checks nor softens it. Moving several projects at once is separate, planned 
 (`uncovered-projects`).
 
 **Which role it connects as.** `rollback` opens PostgreSQL with the configured `storage.postgresql`
-settings and holds them to the daemon's readiness rules, so it is meant to run after the grant swap,
+settings and holds them to the daemon's readiness rules, so it is meant to run after transfer-grant revocation,
 as the runtime role: set `LCM_POSTGRES_URL` to the runtime role's connection and keep
 `migrationRole` equal to the schema owner (do not change it to the runtime role). A role that does
-not pass that readiness check, such as the transfer role before the swap or an activation-shell URL
+not pass that readiness check, such as the transfer role before revocation or an activation-shell URL
 left in place, makes it refuse `rollback-refused-evidence` (the evidence names
 `unexpected-state`) with nothing changed.
 
@@ -637,7 +642,7 @@ first row:
 | unresolvable | any | 5 |
 
 If either observation cannot be made, `report`, `activate` and `rollback` exit 5. The loop is: after an
-activation, swap the grants first (see "The cutover: activate and the grant swap"); run
+activation, revoke the transfer grants first (see "The cutover: activate and revoke transfer grants"); run
 `lcm migration report`; on exit 8 run `lcm daemon restart`; run `report` again until it exits 0.
 
 ## What is preserved, and what the probe bound means
@@ -1347,6 +1352,11 @@ block marks implemented. `canEmit` is the closed set of exit classes the command
       "remedy": "Activation was refused before it began any effect: the evidence names the step and the reason. Fix that condition, then run `lcm migration activate` again. `lcm migration report` shows the current state."
     },
     {
+      "reason": "activation-runtime-target-missing",
+      "exitClass": "refused-precondition",
+      "remedy": "Activation requires LCM_POSTGRES_RUNTIME_URL for the daemon runtime role. Set it to a strict postgresql:// URL for the verified destination, without query parameters or a fragment, then retry."
+    },
+    {
       "reason": "activation-refused-contention",
       "exitClass": "refused-contention",
       "remedy": "Another actor holds the activation lease. Nothing was changed; wait for it to finish or expire, then run `lcm migration activate` again."
@@ -1409,7 +1419,7 @@ block marks implemented. `canEmit` is the closed set of exit classes the command
     {
       "reason": "cutover-restart-required",
       "exitClass": "restart-required",
-      "remedy": "The durable selection is correct, but a running daemon still holds the previous startup backend. Swap the grants first (add the runtime grants, revoke the transfer grants), restart the daemon, then run `lcm migration report`."
+      "remedy": "The durable selection is correct, but a running daemon still holds the previous startup backend. Revoke the transfer grants, restart the daemon with LCM_POSTGRES_URL set to the proven runtime role, then run `lcm migration report`."
     },
     {
       "reason": "cutover-restart-contradiction",

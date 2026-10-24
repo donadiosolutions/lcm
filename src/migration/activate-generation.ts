@@ -32,7 +32,12 @@ import {
 } from "../storage/postgresql/publication-guard.js";
 import { createPostgreSqlBackendPublicationRemoteGuard } from "../storage/postgresql/publication-remote-guard.js";
 import { PostgreSqlRuntime } from "../storage/postgresql/runtime.js";
-import { verifyPostgreSqlTransferSchema, type PostgreSqlRuntimeReadiness } from "../storage/postgresql/runtime-readiness.js";
+import {
+  verifyPostgreSqlRuntimeSchema,
+  verifyPostgreSqlTransferSchema,
+  type PostgreSqlRuntimeReadiness,
+  type PostgreSqlRuntimeReadinessOptions,
+} from "../storage/postgresql/runtime-readiness.js";
 import type { PostgreSqlSnapshotSession } from "../storage/postgresql/snapshot-session.js";
 import {
   ActivationArtifactIdentityMismatchError,
@@ -208,14 +213,14 @@ import {
  * - S3 quiescence, S4 coverage then G8, S4b (amendment 1) compose material
  *   and freeze the verified manifest's revision/checksum IN MEMORY; the
  *   link is written only after the artifact at S11.
- * - S5 report freshness: activationEligible, id/sha match the manifest
- *   ref, live destination identity, pre-publication projectMapWitness.
- * - S6 G7 health on the ordinary runtime, admitted through the transfer
- *   verifier (plan-v7.2 B2: activation runs under the transfer role alone,
- *   so both settings carry that role; see MigrationActivationInput). S7
- *   census on a NEW transfer snapshot after the transfer schema check
- *   (amendment 4). S8: every class ran, mismatch totals zero, recomputed
- *   census equals the report's.
+ * - Before S2, the live ordinary destination identity is rebound and both
+ *   sessions prove distinct current_user/session_user role identities. S5
+ *   then retains report freshness and pre-publication projectMapWitness.
+ * - S6 G7 health runs on the ordinary runtime profile while admitting the
+ *   discovered transfer role as one caller-scoped peer. S7 census runs on a
+ *   NEW transfer snapshot after transfer-profile admission with the ordinary
+ *   role as its peer (amendment 4). S8: every class ran, mismatch totals
+ *   zero, recomputed census equals the report's.
  * - S9/S10 prepare-activation (inputSha256 = sha(epochId)) and
  *   publish-activation begin. S11 artifact -> link -> epoch -> attempt ->
  *   witness -> witness binding (mandatory order, plan-v6 section 7).
@@ -369,19 +374,13 @@ export const MIGRATION_ACTIVATION_LEASE_CLEANUP_TIMEOUT_MS = 30 * 1000;
 export type MigrationActivationInput = Readonly<{
   homeDir: string;
   generationId: string;
-  /** Transfer-role settings (A5 copy-binding read and the S7 census); #627
-   * supplies them. Activation runs entirely under the transfer role
-   * (plan-v7.2 B1): ordinarySettings MUST carry these same transfer-role
-   * settings, and #627 passes the same object twice. */
+  /** Transfer-role settings (A5 copy-binding read and the S7 census). S7
+   * admits the live ordinary role as its one caller-scoped canonical peer. */
   transferSettings: PostgreSqlConnectionSettings;
-  /** Settings for the S2 lease guard and the S6/S15 health probes; #627
-   * supplies them (R4). These are the SAME transfer-role settings as
-   * transferSettings (plan-v7.2 B1), not the daemon's runtime role: S6 and
-   * S15 admit this role through the transfer verifier, so a caller that
-   * passes runtime-only settings fails closed at S6 (target-unhealthy,
-   * schema-mismatch) before any effect. Applying the runtime grants and
-   * revoking the transfer grants is the operator's step after activation
-   * (docs/migration-cutover.md); #1607 is the later readiness improvement. */
+  /** Daemon runtime-role settings for the S2 lease guard and S6/S15 health.
+   * Health uses runtime admission with the live transfer role as its one
+   * caller-scoped canonical peer. The two sessions must name distinct roles
+   * on the same sealed destination before any ordinary-runtime effect. */
   ordinarySettings: PostgreSqlConnectionSettings;
   /** The destination project identity #627 resolved for verify: id, canonical,
    * remoteProjectId (PostgreSQL UUIDv7) and localProjectId (project hash).
@@ -411,6 +410,13 @@ export type MigrationActivationTransferRuntime = PostgreSqlQueryExecutor & Reado
 
 export type MigrationActivationSnapshot = PostgreSqlQueryExecutor & Readonly<{
   close(): Promise<void>;
+}>;
+
+export type MigrationActivationRoleIdentityRead = Readonly<{
+  currentUser: string;
+  sessionUser: string;
+  oid: string;
+  tls: boolean;
 }>;
 
 /** The coordinator surface this module drives: maintenance selection plus
@@ -469,11 +475,21 @@ export interface MigrationActivationDependencies {
   readonly readVerificationReport: (generationId: string, reportSha256: string) => MigrationVerificationReport;
   readonly createOrdinaryRuntime: (settings: PostgreSqlConnectionSettings) => MigrationActivationOrdinaryRuntime;
   readonly createTransferRuntime: (settings: PostgreSqlConnectionSettings) => MigrationActivationTransferRuntime;
-  /** The transfer-profile admission (verifyPostgreSqlTransferSchema): S7's
-   * schema check, and the verifier S6/S15 hand to checkTargetHealth (B2). */
+  readonly readRoleIdentity: (
+    executor: PostgreSqlQueryExecutor,
+    signal?: AbortSignal,
+  ) => Promise<MigrationActivationRoleIdentityRead>;
+  /** Runtime-profile admission used by S6/S15 with the discovered transfer
+   * role as the one caller-scoped peer. */
+  readonly verifyRuntimeSchema: (
+    executor: PostgreSqlQueryExecutor,
+    options: PostgreSqlRuntimeReadinessOptions,
+  ) => Promise<PostgreSqlRuntimeReadiness>;
+  /** Transfer-profile admission used by S7 with the discovered runtime role
+   * as the one caller-scoped peer. */
   readonly verifyTransferSchema: (
     executor: PostgreSqlQueryExecutor,
-    options: { readonly expectedOwner: string; readonly signal?: AbortSignal },
+    options: PostgreSqlRuntimeReadinessOptions,
   ) => Promise<PostgreSqlRuntimeReadiness>;
   readonly checkTargetHealth: typeof checkMigrationTargetHealth;
   readonly readCopyBinding: typeof readMigrationCopyBindingSha256;
@@ -538,6 +554,37 @@ export function createMigrationActivationDependencies(
     readVerificationReport: (generationId, reportSha256) => verificationStore.read(generationId, reportSha256),
     createOrdinaryRuntime: (settings) => new PostgreSqlRuntime(settings),
     createTransferRuntime: (settings) => new PostgreSqlRuntime(settings) as unknown as MigrationActivationTransferRuntime,
+    readRoleIdentity: async (executor, signal) => {
+      const result = await executor.query<{
+        readonly current_user_name: string;
+        readonly session_user_name: string;
+        readonly role_oid: string;
+        readonly tls: boolean;
+      }>({
+        text: `SELECT CURRENT_USER::pg_catalog.text AS current_user_name,
+                      SESSION_USER::pg_catalog.text AS session_user_name,
+                      role.oid::pg_catalog.text AS role_oid,
+                      COALESCE((
+                        SELECT ssl
+                        FROM pg_catalog.pg_stat_ssl
+                        WHERE pid OPERATOR(pg_catalog.=) pg_catalog.pg_backend_pid()
+                      ), false) AS tls
+               FROM pg_catalog.pg_roles AS role
+               WHERE role.rolname OPERATOR(pg_catalog.=) CURRENT_USER`,
+      }, {
+        domain: "factory",
+        operation: "readMigrationActivationRoleIdentity",
+        ...(signal === undefined ? {} : { signal }),
+      });
+      const row = result.rows[0];
+      return {
+        currentUser: row?.current_user_name ?? "",
+        sessionUser: row?.session_user_name ?? "",
+        oid: row?.role_oid ?? "",
+        tls: row?.tls ?? false,
+      };
+    },
+    verifyRuntimeSchema: (executor, options) => verifyPostgreSqlRuntimeSchema(executor, options),
     verifyTransferSchema: (executor, options) => verifyPostgreSqlTransferSchema(executor, options),
     checkTargetHealth: checkMigrationTargetHealth,
     readCopyBinding: readMigrationCopyBindingSha256,
@@ -694,6 +741,8 @@ type Context = {
   effectBegun: boolean;
   resumedFrom: MigrationActivationResumePoint;
   ordinary: MigrationActivationOrdinaryRuntime | null;
+  ordinaryRole: Readonly<{ role: string; oid: string }> | null;
+  transferRole: Readonly<{ role: string; oid: string }> | null;
   guard: ActivationLeasePublicationGuard | null;
   coordinator: MigrationActivationCoordinator | null;
   evidenceSha256: string | null;
@@ -1001,6 +1050,64 @@ async function identityCheck(ctx: Context, executor: PostgreSqlQueryExecutor, st
   return ok(live);
 }
 
+function validRoleIdentityRead(value: MigrationActivationRoleIdentityRead): boolean {
+  return typeof value.currentUser === "string"
+    && Buffer.byteLength(value.currentUser, "utf8") > 0
+    && Buffer.byteLength(value.currentUser, "utf8") <= 63
+    && typeof value.sessionUser === "string"
+    && value.currentUser === value.sessionUser
+    && typeof value.oid === "string"
+    && /^[0-9]+$/u.test(value.oid)
+    && value.tls === true;
+}
+
+async function discoverActivationRoles(ctx: Context): Promise<Step<true>> {
+  const transfer = ctx.deps.createTransferRuntime(ctx.input.transferSettings);
+  try {
+    let ordinary: MigrationActivationRoleIdentityRead;
+    let transferIdentity: MigrationActivationRoleIdentityRead;
+    try {
+      ordinary = await ctx.deps.readRoleIdentity(ctx.ordinary!, ctx.input.signal);
+      transferIdentity = await ctx.deps.readRoleIdentity(transfer, ctx.input.signal);
+    } catch (error) {
+      if (error instanceof StorageOperationError) {
+        const attributed = classifyMigrationTargetFailure(error, "activation role discovery");
+        return refused(
+          ctx,
+          "S6",
+          attributed.status === "unhealthy" ? "target-unhealthy" : "target-unresolvable",
+          attributed.reason + ": activation role discovery failed",
+        );
+      }
+      return refused(ctx, "S6", "target-unresolvable", "connection-failed: activation role discovery failed");
+    }
+    if (
+      !validRoleIdentityRead(ordinary)
+      || !validRoleIdentityRead(transferIdentity)
+      || ordinary.oid === transferIdentity.oid
+      || ordinary.currentUser === transferIdentity.currentUser
+    ) {
+      return refused(
+        ctx,
+        "S6",
+        "target-unhealthy",
+        "schema-mismatch: activation requires distinct unswitched runtime and transfer role sessions",
+      );
+    }
+    ctx.ordinaryRole = { role: ordinary.currentUser, oid: ordinary.oid };
+    ctx.transferRole = { role: transferIdentity.currentUser, oid: transferIdentity.oid };
+    return ok(true);
+  } finally {
+    await transfer.close();
+  }
+}
+
+async function prepareActivationSessions(ctx: Context): Promise<Step<true>> {
+  const identity = await identityCheck(ctx, ctx.ordinary!, "S5");
+  if (isExit(identity)) return identity;
+  return discoverActivationRoles(ctx);
+}
+
 /** S2 fresh acquire (pre-selection). An expired same-generation row is taken over. */
 async function stepLeaseAcquire(ctx: Context): Promise<Step<ActivationLeaseFence>> {
   const base = {
@@ -1223,14 +1330,17 @@ function projectMapWitness(ctx: Context, mode: "pre-publication" | "post-publica
   }
 }
 
-/** S6/S15 (plan-v7.2 B2): the health probe is the factory's, but the schema
- * admission is the transfer verifier, because the activation role holds the
- * transfer profile. checkMigrationTargetHealth's own default (the runtime
- * verifier) is untouched for its other callers. */
+/** S6/S15: health runs on the daemon runtime role and admits only the live,
+ * catalog-checked transfer role as its caller-scoped canonical peer. */
 function observeHealth(ctx: Context): Promise<MigrationTargetHealthResult> {
   return ctx.deps.checkTargetHealth(
     { runtime: ctx.ordinary!, expectedOwner: ctx.input.expectedOwner, signal: ctx.input.signal },
-    { verifyRuntimeSchema: ctx.deps.verifyTransferSchema },
+    {
+      verifyRuntimeSchema: (executor, options) => ctx.deps.verifyRuntimeSchema(executor, {
+        ...options,
+        admittedPeer: { role: ctx.transferRole!.role },
+      }),
+    },
   );
 }
 
@@ -1260,7 +1370,11 @@ async function stepCensus(ctx: Context, scratchParent: string): Promise<Step<{ c
   try {
     let session: MigrationActivationSnapshot;
     try {
-      await ctx.deps.verifyTransferSchema(transfer, { expectedOwner: ctx.input.expectedOwner, signal: ctx.input.signal });
+      await ctx.deps.verifyTransferSchema(transfer, {
+        expectedOwner: ctx.input.expectedOwner,
+        signal: ctx.input.signal,
+        admittedPeer: { role: ctx.ordinaryRole!.role },
+      });
       session = await transfer.openReadOnlySnapshot({ projectId: ctx.input.expectedIdentity.id, signal: ctx.input.signal });
     } catch (error) {
       return targetFailure(ctx, error, "S7 transfer schema check and snapshot open");
@@ -1710,7 +1824,7 @@ export async function runMigrationActivation(
     verificationRef: null as unknown as MigrationReportReference,
     effectBegun: false,
     resumedFrom: "fresh",
-    ordinary: null, guard: null, coordinator: null,
+    ordinary: null, ordinaryRole: null, transferRole: null, guard: null, coordinator: null,
     evidenceSha256: null, fence: null, successorFencingToken: null, quiescence: null,
     pair: null, material: null, identityDigest: null, artifact: null, link: null,
     censusVector: null, canonicalDelta: null, epoch: null, attempt: null, witness: null, pendingStartedAt: null,
@@ -1826,6 +1940,8 @@ async function runUnderBarrier(ctx: Context, scratchParent: string): Promise<Mig
     const adopted = adoptStoredAttempt(ctx, v3, ownV2);
     if (isExit(adopted)) return adopted.exit;
     ctx.resumedFrom = ownV2 !== null ? "publication-journal" : v3!.phase === "selection-prepared" ? "selection-prepared" : "selection-completed-unbound";
+    const preparedSessions = await prepareActivationSessions(ctx);
+    if (isExit(preparedSessions)) return preparedSessions.exit;
     const own = await readOwnFence(ctx);
     if (own.kind === "own") {
       ctx.fence = own.fence;
@@ -1865,6 +1981,9 @@ async function runUnderBarrier(ctx: Context, scratchParent: string): Promise<Mig
   } else if (ctx.manifest.pendingEffect !== null) {
     ctx.resumedFrom = "prepare-activation-pending";
   }
+
+  const preparedSessions = await prepareActivationSessions(ctx);
+  if (isExit(preparedSessions)) return preparedSessions.exit;
 
   // S0: evidence digest (A5) unless the artifact already carries it.
   if (ctx.evidenceSha256 === null) {
@@ -1923,9 +2042,8 @@ async function runUnderBarrier(ctx: Context, scratchParent: string): Promise<Mig
       return interrupted(ctx, "S11", "artifact-identity-mismatch", "an artifact under the recomputed digest was sealed under another publicationId").exit;
     }
   }
-  // S5 (identity; the project-map predicate ran above)
-  const identity = await identityCheck(ctx, ctx.ordinary!, "S5");
-  if (isExit(identity)) return identity.exit;
+  // S5 destination identity was bound before S2; the project-map predicate
+  // above is the remaining S5 check.
   // S6
   const health = await stepHealth(ctx);
   if (isExit(health)) return health.exit;

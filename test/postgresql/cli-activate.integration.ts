@@ -6,6 +6,7 @@ import { assertHarnessReady, withPostgreSqlTestDatabase } from "./harness.js";
 import {
   GENERATION_ID,
   dropActivationRole,
+  grantRuntimeActivationRole,
   prepareVerifiedInstallation,
   provisionActivationRole,
   readConfigBackend,
@@ -25,7 +26,7 @@ beforeAll(assertHarnessReady);
 /**
  * `lcm migration verify`, `activate`, `report` and `rollback --dry-run` through the CLI
  * commands against real PostgreSQL, with nothing seamed: the real SQLite
- * installation, the real copy, the transfer-profile role of plan-v7.2 B1, the
+ * installation, the real copy, distinct canonical transfer and runtime roles, the
  * real configuration resolution (the destination secrets arrive as the
  * operator supplies them, through the environment, and are never written to
  * config.json), the real held identity, the real project-map witness, the
@@ -36,21 +37,27 @@ beforeAll(assertHarnessReady);
  * and rollback evidence back through the lock-free readers.
  */
 it(
-  "verifies a copied generation fresh, then activates it, through the CLI commands: every fence, the closed outcome table's exit 0, the grant-swap instruction, the settled re-entry and the report's evidence readers",
+  "verifies a copied generation fresh, then activates it through distinct real transfer and runtime roles",
   async () => {
     await withPostgreSqlTestDatabase("cli-activate-roundtrip", async (db) => {
       const home = mkdtempSync(join(tmpdir(), "cli-activate-roundtrip-"));
       vi.stubEnv("HOME", home);
       vi.stubEnv("USERPROFILE", home);
       try {
-        const transfer = await provisionActivationRole(db);
-        const installation = await prepareVerifiedInstallation(db, home, transfer, { stopAfterCopy: true });
+        const roles = await provisionActivationRole(db);
+        const installation = await prepareVerifiedInstallation(
+          db,
+          home,
+          roles.transfer,
+          roles.runtime,
+          { stopAfterCopy: true },
+        );
         const cwd = installation.cwd;
         const manifests = new MigrationManifestStore({ homeDir: home });
         expect(manifests.read(GENERATION_ID).phase).toBe("copied");
         // The operator supplies the destination as the environment; nothing is in config.json.
-        vi.stubEnv("LCM_POSTGRES_URL", transfer.url);
-        vi.stubEnv("LCM_POSTGRES_CA_FILE", transfer.caFile);
+        vi.stubEnv("LCM_POSTGRES_URL", roles.transfer.url);
+        vi.stubEnv("LCM_POSTGRES_CA_FILE", roles.transfer.caFile);
         const common = { cwd, homeDir: home, generation: GENERATION_ID, confirmGenerationId: GENERATION_ID };
 
         // report names verify.
@@ -81,6 +88,8 @@ it(
         // The second call is the idempotent confirmation (cell 24), writing nothing.
         expect(await performMigrationVerifyCommand(common)).toMatchObject({ status: "ok", applied: false, evidence: { cell: 24 } });
 
+        await grantRuntimeActivationRole(db);
+
         expect(await performMigrationReportCommand({ homeDir: home })).toMatchObject({ next: "activate", evidence: { cell: 24 } });
 
         // Both fences refuse before anything runs.
@@ -103,21 +112,29 @@ it(
         expect(await performMigrationRollbackCommand({ homeDir: home, ...{ generation: GENERATION_ID, confirmGenerationId: GENERATION_ID }, confirmBackend: "sqlite", dryRun: true }))
           .toMatchObject({ status: "refuse", reason: "rollback-dry-run-not-predictive", sections: { cell: 24 } });
 
-        // activate: the real orchestration under the transfer role, passed as both settings.
+        expect(await performMigrationActivateCommand(activate)).toMatchObject({
+          status: "refuse",
+          reason: "activation-runtime-target-missing",
+        });
+        vi.stubEnv("LCM_POSTGRES_RUNTIME_URL", roles.runtime.url);
+
+        // activate: transfer copy/census plus runtime lease and health.
         const activated = await performMigrationActivateCommand(activate);
         expect(activated, JSON.stringify(activated)).toMatchObject({
           status: "ok", generationId: GENERATION_ID, manifestPhase: "active", applied: true,
-          next: "swap-grants-then-start-daemon", restart: { answer: "satisfied", presence: "absent" },
-          evidence: { grantSwap: "required-before-daemon-start", resumedFrom: "fresh", selectedBackend: "postgresql" },
+          next: "revoke-transfer-grants-then-start-daemon", restart: { answer: "satisfied", presence: "absent" },
+          evidence: { transferGrantRevocation: "required-before-daemon-start", resumedFrom: "fresh", selectedBackend: "postgresql" },
         });
         const envelope = renderMigrationActivateEnvelope(activated);
-        expect(envelope).toMatchObject({ command: "activate", exitCode: 0, outcome: "ok", next: "swap-grants-then-start-daemon" });
+        expect(envelope).toMatchObject({ command: "activate", exitCode: 0, outcome: "ok", next: "revoke-transfer-grants-then-start-daemon" });
         expect(manifests.read(GENERATION_ID)).toMatchObject({ phase: "active", pendingEffect: null });
         expect(readBackendMaintenanceJournal(home)).toBeNull();
         expect(readConfigBackend(home)).toBe("postgresql");
         expect(readProjectMapFile(home)[installation.localProjectId]!.remoteProjectId).toBe(installation.remoteProjectId);
         // The secrets never reached config.json.
-        expect(readFileSync(join(home, ".lcm", "config.json"), "utf8")).not.toContain(transfer.url);
+        const storedConfig = readFileSync(join(home, ".lcm", "config.json"), "utf8");
+        expect(storedConfig).not.toContain(roles.transfer.url);
+        expect(storedConfig).not.toContain(roles.runtime.url);
 
         // Re-running settles from durable state: nothing is re-driven.
         expect(await performMigrationActivateCommand(activate)).toMatchObject({
@@ -137,7 +154,7 @@ it(
         });
 
         // rollback runs the production entry point against the configured role. The transfer role does not
-        // pass the daemon's readiness (the grant swap has not been done), so it refuses closed and changes
+        // pass the daemon's readiness (transfer grants remain), so it refuses closed and changes
         // nothing: the manifest stays active and no write is claimed.
         const rollback = await performMigrationRollbackCommand({
           homeDir: home, generation: GENERATION_ID, confirmGenerationId: GENERATION_ID, confirmBackend: "sqlite",

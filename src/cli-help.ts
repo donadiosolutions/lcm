@@ -164,7 +164,7 @@ const HELP: Record<string, CommandHelp> = {
       ["verify [--generation <id>] --confirm-generation <id> [--dry-run] [--lease-ttl-ms <n>] [--json]", "Verify a copied generation against PostgreSQL, finish a pending verification from persisted evidence, or confirm a verified one; --dry-run computes without recording"],
       ["report [--generation <id>] [--json]", "Read-only account of one generation: its state, its owner, the next command, and the daemon restart check"],
       ["abort [--generation <id>] --confirm-generation <id> [--dry-run] [--json]", "Complete whichever recovery write (journal or manifest) is missing; repeating it only confirms"],
-      ["activate [--generation <id>] --confirm-generation <id> --confirm-backend postgresql [--dry-run] [--json]", "Switch a verified generation to PostgreSQL; afterwards swap the grants (add the runtime grants, revoke the transfer grants), then start the daemon; --dry-run never exits 0"],
+      ["activate [--generation <id>] --confirm-generation <id> --confirm-backend postgresql [--dry-run] [--json]", "Switch a verified generation to PostgreSQL after runtime grants are applied; afterwards revoke the transfer grants, then start the daemon; --dry-run never exits 0"],
       ["rollback [--generation <id>] --confirm-generation <id> --confirm-backend sqlite [--dry-run] [--json]", "Return an activated generation to SQLite; run it with LCM_POSTGRES_URL set to the runtime role (migrationRole stays the schema owner); refuses while any other project is remotely bound; --dry-run never exits 0"],
     ],
     examples: [
@@ -174,7 +174,7 @@ const HELP: Record<string, CommandHelp> = {
       ["lcm migration report", "See where the held generation is and which command to run next"],
       ["lcm migration resume --confirm-generation <id>", "Run the one step report named for a held generation"],
       ["lcm migration abort --confirm-generation <id>", "Abort the held or entering migration whose generation id you pass"],
-      ["lcm migration activate --confirm-generation <id> --confirm-backend postgresql", "Switch the verified generation to PostgreSQL, then swap the grants before starting the daemon"],
+      ["lcm migration activate --confirm-generation <id> --confirm-backend postgresql", "Switch the verified generation to PostgreSQL, then revoke the transfer grants before starting the daemon"],
       ["lcm migration rollback --confirm-generation <id> --confirm-backend sqlite", "Return the activated generation to SQLite"],
     ],
     notes: "This project must not be linked to a PostgreSQL project through `lcm project create` or `lcm project link` before you migrate: migration resolves or creates the destination identity itself, and a linked project makes apply refuse multi-machine-installation. apply refuses unless --confirm-generation exactly matches the candidate a fresh plan resolves at the moment apply runs; a stale or missing token refuses rather than proceeding. Never a silent fallback: an unresolvable or unverified target, an unresolvable daemon presence, or a state that does not admit the operation all refuse with a distinct, closed reason. See docs/migration-operations.md for the full exit-class table, every refusal's remedy, and the fencing residue.",

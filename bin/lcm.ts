@@ -2312,7 +2312,7 @@ export function registerMigrationCommand(program: Command): void {
 
   migrationCmd
     .command("activate")
-    .description("Switch a verified generation to PostgreSQL. Afterwards swap the grants, then start the daemon")
+    .description("Switch a verified generation to PostgreSQL. Afterwards revoke the transfer grants, then start the daemon")
     .option("--generation <id>", "The generation to activate (default: the live maintenance hold)")
     .option("--confirm-generation <id>", "The resolved generation id")
     .option("--confirm-backend <backend>", "The backend activation switches to: postgresql")

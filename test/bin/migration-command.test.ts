@@ -416,8 +416,8 @@ describe("lcm migration command group", () => {
 
   it("activate: passes the generation, both confirmations and --dry-run through, and prints the grant-swap next step", async () => {
     state.activate.mockResolvedValueOnce({
-      status: "ok", generationId: "gen-1", manifestPhase: "active", applied: true, next: "swap-grants-then-start-daemon",
-      evidence: { grantSwap: "required-before-daemon-start" }, restart: { answer: "satisfied", presence: "absent" },
+      status: "ok", generationId: "gen-1", manifestPhase: "active", applied: true, next: "revoke-transfer-grants-then-start-daemon",
+      evidence: { transferGrantRevocation: "required-before-daemon-start" }, restart: { answer: "satisfied", presence: "absent" },
     });
     const out = vi.spyOn(process.stdout, "write").mockImplementation(() => true);
     await invoke("migration", "activate", "--generation", "gen-1", "--confirm-generation", "gen-1", "--confirm-backend", "postgresql", "--dry-run", "--json");
@@ -426,13 +426,13 @@ describe("lcm migration command group", () => {
     }));
     expect(process.exitCode).toBe(0);
     expect(JSON.parse(stdoutText(out))).toMatchObject({
-      command: "activate", manifestPhase: "active", next: "swap-grants-then-start-daemon", restart: { answer: "satisfied", presence: "absent" },
+      command: "activate", manifestPhase: "active", next: "revoke-transfer-grants-then-start-daemon", restart: { answer: "satisfied", presence: "absent" },
     });
   });
 
   it("activate: a stale running daemon exits 8, an interrupted activation exits 6, and a human summary still prints the next step", async () => {
     state.activate.mockResolvedValueOnce({
-      status: "refuse", reason: "cutover-restart-required", generationId: "gen-1", applied: true, next: "swap-grants-then-start-daemon",
+      status: "refuse", reason: "cutover-restart-required", generationId: "gen-1", applied: true, next: "revoke-transfer-grants-then-start-daemon",
       restart: { answer: "unsatisfied", presence: "running" },
     });
     const out = vi.spyOn(process.stdout, "write").mockImplementation(() => true);
