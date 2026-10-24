@@ -1,5 +1,18 @@
-import { expect, it, vi } from "vitest";
+import { chmodSync, mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
+import { afterAll, expect, it, vi } from "vitest";
 import { LOCAL_ISOLATION_UNAVAILABLE, UNSHARE_FLAGS, findUnshare, probeUnshare, workerLaunchOptions } from "./local-isolation.mjs";
+
+const stubs = mkdtempSync(join(tmpdir(), "lcm-local-isolation-"));
+afterAll(() => rmSync(stubs, { recursive: true }));
+
+function stub(name: string, script: string): string {
+  const path = join(stubs, name);
+  writeFileSync(path, `#!/bin/sh\n${script}\n`);
+  chmodSync(path, 0o755);
+  return path;
+}
 
 it("forks the worker directly when no user manager is visible", () => {
   const probe = vi.fn(() => true);
@@ -24,13 +37,17 @@ it("names denied user namespaces", () => {
     .toThrow(`${LOCAL_ISOLATION_UNAVAILABLE}:user-namespace-denied`);
 });
 
-it("falls back to the standard system directories when unshare is not on the search path", () => {
-  expect(findUnshare("/nonexistent-lcm-path")).toMatch(/\/unshare$/u);
-  expect(findUnshare("")).toMatch(/\/unshare$/u);
+it("finds an executable unshare on the supplied search path", () => {
+  const directory = join(stubs, "bin");
+  mkdirSync(directory);
+  const path = join(directory, "unshare");
+  writeFileSync(path, "#!/bin/sh\n");
+  chmodSync(path, 0o755);
+  expect(findUnshare(`/nonexistent-lcm-path:${directory}`)).toBe(path);
 });
 
 it("probes by the command's exit status", () => {
-  expect(probeUnshare("/usr/bin/true")).toBe(true);
-  expect(probeUnshare("/usr/bin/false")).toBe(false);
+  expect(probeUnshare(stub("pass", "exit 0"))).toBe(true);
+  expect(probeUnshare(stub("fail", "exit 1"))).toBe(false);
   expect(probeUnshare("/nonexistent-lcm-unshare")).toBe(false);
 });
