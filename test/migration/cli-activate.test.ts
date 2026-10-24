@@ -346,6 +346,26 @@ describe("activate: refused outcomes (S0-S8, effectBegun false) map to a class b
   const refused = (reason: string, extra: Record<string, unknown> = {}): MigrationActivationOutcome =>
     ({ status: "refused", step: "S4", reason, detail: "x", effectBegun: false, ...extra }) as never;
 
+  it.each([
+    ["target-unhealthy", "activation-refused-precondition"],
+    ["target-unresolvable", "activation-refused-evidence"],
+  ])("maps a fresh S6 %s identity failure through the closed activation class", async (reason, expected) => {
+    const { home, resolution } = await verified();
+    const result = await run(home, resolution, {
+      _operationsForTesting: ops({
+        run: async () => ({
+          status: "refused",
+          step: "S6",
+          reason,
+          detail: "ordinary identity probe failed",
+          effectBegun: false,
+        }) as never,
+      }),
+    });
+    expect(result).toMatchObject({ status: "refuse", reason: expected });
+    expect(result.reason).not.toBe("unexpected-failure");
+  });
+
   it.each(EXPECTED)("%s is class %s, never applied, with the step and reason as evidence", async (reason, refusalClass) => {
     const { home, resolution } = await verified();
     const result = await run(home, resolution, { _operationsForTesting: ops({ run: async () => refused(reason) }) });

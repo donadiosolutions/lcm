@@ -162,11 +162,11 @@ it("activates a real verified SQLite copy through the production dependencies: r
       writeFileSync(projectMapPath(home), JSON.stringify(map) + "\n", { mode: 0o600 });
       clearProjectMapCache();
 
-      // A real third grantee is refused even when its only direct grant is a
-      // canonical-looking schema privilege and the canonical transfer peer
-      // is explicitly admitted.
+      // A real third grantee holding a transfer-canonical column privilege is
+      // refused by the OID-bound schema fingerprint while the canonical
+      // transfer peer is explicitly admitted.
       await db.migrator.query(
-        { text: "GRANT USAGE ON SCHEMA lcm TO lcm_test_runtime" },
+        { text: "GRANT SELECT (project_id) ON TABLE lcm.message_parts TO lcm_test_runtime" },
         { domain: "factory", operation: "activationIntegrationThirdGrantee" },
       );
       const thirdGranteeProbe = new PostgreSqlRuntime(roles.runtime);
@@ -174,11 +174,11 @@ it("activates a real verified SQLite copy through the production dependencies: r
         await expect(verifyPostgreSqlRuntimeSchema(thirdGranteeProbe, {
           expectedOwner: EXPECTED_OWNER,
           admittedPeer: { role: TRANSFER_ROLE },
-        })).rejects.toMatchObject({ reason: "acl-shape" });
+        })).rejects.toMatchObject({ reason: "schema-fingerprint" });
       } finally {
         await thirdGranteeProbe.close();
         await db.migrator.query(
-          { text: "REVOKE USAGE ON SCHEMA lcm FROM lcm_test_runtime" },
+          { text: "REVOKE SELECT (project_id) ON TABLE lcm.message_parts FROM lcm_test_runtime" },
           { domain: "factory", operation: "activationIntegrationThirdGranteeCleanup" },
         );
       }

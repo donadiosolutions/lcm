@@ -705,6 +705,38 @@ describe("runMigrationActivation: refusals (no effect begun)", () => {
     expect(f.guard.calls).not.toContain("acquire");
   });
 
+  it.each([
+    ["authentication refusal", "28P01", false, "target-unhealthy", "authentication-refused"],
+    ["insufficient privilege", "42501", false, "target-unhealthy", "insufficient-privilege"],
+    ["retryable transport failure", null, true, "target-unresolvable", "connection-failed"],
+  ] as const)(
+    "classifies an ordinary identity %s at S6 before any lease write",
+    async (_label, sqlState, retryable, reason, detail) => {
+      const f = await fixture();
+      const readRoleIdentity = vi.fn(f.deps.readRoleIdentity);
+      const error = new PostgreSqlStorageOperationError(
+        "STORAGE_OPERATION_FAILED",
+        { domain: "factory", operation: "captureDestinationIdentity" },
+        sqlState,
+        retryable,
+      );
+      const outcome = await f.run({
+        captureDestinationIdentity: async () => { throw error; },
+        readRoleIdentity,
+      });
+
+      expect(outcome).toMatchObject({
+        status: "refused",
+        step: "S6",
+        reason,
+        effectBegun: false,
+        detail: expect.stringContaining(detail),
+      });
+      expect(readRoleIdentity).not.toHaveBeenCalled();
+      expect(f.guard.calls).not.toContain("acquire");
+    },
+  );
+
   it("refuses identical or session-switched activation roles at S6 before any effect", async () => {
     const identical = await fixture();
     const identicalOutcome = await identical.run({
@@ -753,7 +785,12 @@ describe("runMigrationActivation: refusals (no effect begun)", () => {
     const unavailable = await fixture();
     const unavailableOutcome = await unavailable.run({
       readRoleIdentity: async () => {
-        throw new PostgreSqlStorageOperationError("factory", "roleIdentity", "unavailable", "injected");
+        throw new PostgreSqlStorageOperationError(
+          "STORAGE_OPERATION_FAILED",
+          { domain: "factory", operation: "roleIdentity" },
+          null,
+          true,
+        );
       },
     });
     expect(unavailableOutcome).toMatchObject({
@@ -1023,6 +1060,35 @@ it("reports post-selection role rediscovery failure as a roll-forward interrupti
   });
   expect(outcome).toMatchObject({ status: "interrupted", effectBegun: true });
 });
+
+it.each([
+  ["authentication refusal", "28P01", false, "target-unhealthy", "authentication-refused"],
+  ["insufficient privilege", "42501", false, "target-unhealthy", "insufficient-privilege"],
+  ["retryable transport failure", null, true, "target-unresolvable", "connection-failed"],
+] as const)(
+  "classifies a post-selection ordinary identity %s as a roll-forward interruption",
+  async (_label, sqlState, retryable, reason, detail) => {
+    const f = await fixture();
+    await stopAt(f, "after-selection-completed");
+    const error = new PostgreSqlStorageOperationError(
+      "STORAGE_OPERATION_FAILED",
+      { domain: "factory", operation: "captureDestinationIdentity" },
+      sqlState,
+      retryable,
+    );
+    const outcome = await f.run({
+      captureDestinationIdentity: async () => { throw error; },
+    });
+
+    expect(outcome).toMatchObject({
+      status: "interrupted",
+      step: "S11",
+      cause: "state-unresolvable",
+      effectBegun: true,
+      detail: expect.stringContaining(`S6 ${reason} on roll-forward: ${detail}`),
+    });
+  },
+);
 
 function namedError(name: string, message = name): Error {
   const error = new Error(message);

@@ -1103,7 +1103,12 @@ async function discoverActivationRoles(ctx: Context): Promise<Step<true>> {
 }
 
 async function prepareActivationSessions(ctx: Context): Promise<Step<true>> {
-  const identity = await identityCheck(ctx, ctx.ordinary!, "S5");
+  let identity: Step<MigrationDestinationIdentity>;
+  try {
+    identity = await identityCheck(ctx, ctx.ordinary!, "S5");
+  } catch (error) {
+    return targetFailureAtStep(ctx, error, "S6", "ordinary destination identity check");
+  }
   if (isExit(identity)) return identity;
   return discoverActivationRoles(ctx);
 }
@@ -1356,10 +1361,19 @@ async function stepHealth(ctx: Context): Promise<Step<MigrationTargetHealthResul
  * exactly as S6 attributes the same failures, becomes the S6 refusal
  * vocabulary (target-unhealthy / target-unresolvable). Anything else is
  * not a target condition and is thrown. */
-function targetFailure(ctx: Context, error: unknown, stage: string): Exit {
+function targetFailureAtStep(
+  ctx: Context,
+  error: unknown,
+  step: MigrationActivationRefusalStep,
+  stage: string,
+): Exit {
   if (!(error instanceof StorageOperationError)) throw error;
   const attributed = classifyMigrationTargetFailure(error, stage);
-  return refused(ctx, "S7", attributed.status === "unhealthy" ? "target-unhealthy" : "target-unresolvable", attributed.reason + ": " + attributed.detail);
+  return refused(ctx, step, attributed.status === "unhealthy" ? "target-unhealthy" : "target-unresolvable", attributed.reason + ": " + attributed.detail);
+}
+
+function targetFailure(ctx: Context, error: unknown, stage: string): Exit {
+  return targetFailureAtStep(ctx, error, "S7", stage);
 }
 
 /** S7: a NEW transfer snapshot, after the transfer schema check (amendment 4).
