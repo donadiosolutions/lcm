@@ -141,7 +141,7 @@ interface UploadReadback {
   readonly differs: boolean;
 }
 
-function sameEnvelope(
+export function sameEnvelope(
   local: LocalHookEventRow,
   remote: PostgreSqlPassiveEventRecord,
 ): boolean {

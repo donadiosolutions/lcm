@@ -835,10 +835,12 @@ processed to completion by any specific point in the migration sequence. **The d
 follows activation is what resumes processing** of anything still pending, not the
 migration commands themselves. Do not assume a pending backlog is empty because `apply` succeeded.
 
-A pending hook event that crossed the cutover is delivered once, by the first replication pass after
-that restart. The migration copy and the replication upload record its creation time in two textual
-forms, and replication treats both forms of the same instant as the same event, so the copy already
-in the project is adopted and acknowledged rather than rejected as a conflicting duplicate.
+A pending hook event whose copy the migration left pending in the project is delivered once, by the first
+replication pass after that restart. The migration copy and the replication upload record its creation time in
+two textual forms, and replication treats both forms of the same instant as the same event, so the copy already
+in the project is adopted and processed rather than rejected as a conflicting duplicate. A copy that was
+already applied is acknowledged without a second apply. The machine-local `previousEventId` is ignored when
+only one side carries it; when both carry it, the values must be equal as JSON values.
 
 ## Fencing residue: what this command group does not protect against
 
