@@ -28,7 +28,7 @@ import { createPostgreSqlBackendPublicationRemoteGuard } from "../../src/storage
 import { PostgreSqlRuntimeReadinessError, type PostgreSqlRuntimeReadiness } from "../../src/storage/postgresql/runtime-readiness.js";
 import { PostgreSqlStorageOperationError } from "../../src/storage/postgresql/errors.js";
 import { StorageOperationError } from "../../src/storage/errors.js";
-import { PORTABLE_RECORD_DOMAIN_ORDER, type PortableDomain } from "../../src/storage/portable-record.js";
+import { PORTABLE_RECORD_DOMAIN_ORDER, PortableStreamError, type PortableDomain } from "../../src/storage/portable-record.js";
 import {
   MIGRATION_ACTIVATION_LEASE_CLEANUP_TIMEOUT_MS,
   MigrationActivationError,
@@ -2147,6 +2147,92 @@ describe("runMigrationActivation: S7 classifies target failures like S6 (PR #162
     expect(outcome).toMatchObject({ status: "interrupted", step: "S9", cause: "state-unresolvable", effectBegun: true, detail: expect.stringMatching(/^S7 target-unhealthy on roll-forward: schema-mismatch: /u) });
     expect(row(f).releasedAt).toBeNull();
     expectActivated(f, await f.run(), "prepare-activation-pending");
+  });
+
+  const portableUnavailable = (cause: unknown) => new PortableStreamError("source-unavailable", { cause });
+  /** A captureDestinationIdentity that rejects on its nth call (0 = S0, 1 = S5, 2 = S7) and otherwise answers the sealed identity. */
+  const identityFailingAt = (f: Fixture, nth: number, error: unknown) => {
+    const answer = f.deps.captureDestinationIdentity;
+    let calls = 0;
+    return (...args: Parameters<typeof answer>) => (calls++ === nth ? Promise.reject(error) : answer(...args));
+  };
+
+  it.each([
+    ["a lost connection (SQLSTATE 08006)", pgError("08006"), "target-unresolvable", /^connection-failed: S7 census read was lost/u],
+    ["a refused privilege (SQLSTATE 42501)", pgError("42501"), "target-unhealthy", /^insufficient-privilege: S7 census read: /u],
+  ] as const)("the production census reader's PortableStreamError(source-unavailable) wrapping %s is unwrapped and refuses S7", async (_name, cause, reason, detail) => {
+    const f = await fixture();
+    const outcome = await f.run({ readDestinationCensus: async () => { throw portableUnavailable(cause); } });
+    expect(outcome).toMatchObject({ status: "refused", step: "S7", reason, effectBegun: false });
+    expect((outcome as { detail: string }).detail).toMatch(detail);
+    expect(row(f).releasedAt).not.toBeNull();
+  });
+
+  it("an effect-begun re-entry turns the unwrapped census failure into the roll-forward interruption and keeps the lease", async () => {
+    const f = await fixture();
+    await stopAt(f, "after-prepare-begin");
+    const outcome = await f.run({ readDestinationCensus: async () => { throw portableUnavailable(pgError("08006")); } });
+    expect(outcome).toMatchObject({ status: "interrupted", step: "S9", cause: "state-unresolvable", effectBegun: true, detail: expect.stringMatching(/^S7 target-unresolvable on roll-forward: connection-failed: /u) });
+    expect(row(f).releasedAt).toBeNull();
+    expectActivated(f, await f.run(), "prepare-activation-pending");
+  });
+
+  it("a PortableStreamError that is not source-unavailable, or has no storage cause, is not a target condition and is rethrown", async () => {
+    const f = await fixture();
+    await expect(f.run({ readDestinationCensus: async () => { throw new PortableStreamError("source-invalid"); } })).rejects.toMatchObject({ name: "PortableStreamError", code: "source-invalid" });
+    expect(row(f).releasedAt).not.toBeNull();
+    const g = await fixture();
+    await expect(g.run({ readDestinationCensus: async () => { throw portableUnavailable(new RangeError("raw cause")); } })).rejects.toMatchObject({ name: "PortableStreamError", code: "source-unavailable" });
+    const h = await fixture();
+    await expect(h.run({ readDestinationCensus: async () => { throw new PortableStreamError("source-unavailable"); } })).rejects.toMatchObject({ code: "source-unavailable" });
+  });
+
+  it("an aborted census read is a cancellation and rejects, even when the error carries a storage cause", async () => {
+    const f = await fixture();
+    await expect(f.run({ readDestinationCensus: async () => { throw new PortableStreamError("aborted", { cause: pgError("08006") }); } })).rejects.toMatchObject({ name: "PortableStreamError", code: "aborted" });
+    expect(row(f).releasedAt).not.toBeNull();
+    const g = await fixture();
+    await stopAt(g, "after-prepare-begin");
+    await expect(g.run({ readDestinationCensus: async () => { throw new PortableStreamError("aborted"); } })).rejects.toMatchObject({ code: "aborted" });
+    expect(row(g).releasedAt).toBeNull();
+  });
+
+  it.each([
+    ["S0", "a lost connection (SQLSTATE 08006)", 0, pgError("08006"), "target-unresolvable", /^connection-failed: S0 destination identity query was lost/u],
+    ["S0", "a refused privilege (SQLSTATE 42501)", 0, pgError("42501"), "target-unhealthy", /^insufficient-privilege: S0 destination identity query: /u],
+    ["S5", "a lost connection (SQLSTATE 08006)", 1, pgError("08006"), "target-unresolvable", /^connection-failed: S5 destination identity query was lost/u],
+    ["S5", "a refused privilege (SQLSTATE 42501)", 1, pgError("42501"), "target-unhealthy", /^insufficient-privilege: S5 destination identity query: /u],
+    ["S7", "a lost connection (SQLSTATE 08006)", 2, pgError("08006"), "target-unresolvable", /^connection-failed: S7 destination identity query was lost/u],
+    ["S7", "a refused privilege (SQLSTATE 42501)", 2, pgError("42501"), "target-unhealthy", /^insufficient-privilege: S7 destination identity query: /u],
+  ] as const)("the %s destination identity query failing with %s refuses that step and releases the pre-effect lease", async (step, _name, nth, error, reason, detail) => {
+    const f = await fixture();
+    const outcome = await f.run({ captureDestinationIdentity: identityFailingAt(f, nth, error) });
+    expect(outcome).toMatchObject({ status: "refused", step, reason, effectBegun: false });
+    expect((outcome as { detail: string }).detail).toMatch(detail);
+    if (step !== "S0") expect(row(f).releasedAt).not.toBeNull();
+    expect(f.manifestStore.read(GENERATION).phase).toBe("verified");
+  });
+
+  it.each([
+    ["S5", 1],
+    ["S7", 2],
+  ] as const)("on an effect-begun re-entry the %s identity query failure is the roll-forward interruption and keeps the lease", async (step, nth) => {
+    const f = await fixture();
+    await stopAt(f, "after-prepare-begin");
+    const outcome = await f.run({ captureDestinationIdentity: identityFailingAt(f, nth, pgError("08006")) });
+    expect(outcome).toMatchObject({ status: "interrupted", step: "S9", cause: "state-unresolvable", effectBegun: true, detail: expect.stringMatching(new RegExp("^" + step + " target-unresolvable on roll-forward: connection-failed: " + step + " destination identity query was lost", "u")) });
+    expect(row(f).releasedAt).toBeNull();
+    expectActivated(f, await f.run(), "prepare-activation-pending");
+  });
+
+  it("an identity query failing with a wrapped storage error is attributed, and with an unknown or aborted error is rethrown", async () => {
+    const f = await fixture();
+    expect(await f.run({ captureDestinationIdentity: identityFailingAt(f, 2, portableUnavailable(pgError("42501"))) })).toMatchObject({ status: "refused", step: "S7", reason: "target-unhealthy" });
+    const g = await fixture();
+    await expect(g.run({ captureDestinationIdentity: identityFailingAt(g, 2, new RangeError("raw")) })).rejects.toBeInstanceOf(RangeError);
+    expect(row(g).releasedAt).not.toBeNull();
+    const h = await fixture();
+    await expect(h.run({ captureDestinationIdentity: identityFailingAt(h, 2, new PortableStreamError("aborted")) })).rejects.toMatchObject({ code: "aborted" });
   });
 });
 
