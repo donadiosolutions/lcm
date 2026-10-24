@@ -1600,18 +1600,18 @@ function remoteEnvelopeProblems(name: string, row: InboxRow, entry: LedgerEntry,
 
 /**
  * The running PostgreSQL daemon replicates (its sidecar target is PostgreSQL): the status route reports replication enabled and
- * at least one pass. The daemon replicates only in its start-up sweep and every five minutes, so the delivery join itself is
+ * at least one pass that reached the bound project through the PostgreSQL gates (identity, binding, health) and ran the worker. The daemon replicates only in its start-up sweep and every five minutes, so the delivery join itself is
  * driven in process (replicateWithWitness) where the prune can be observed deterministically.
  */
 export async function assertDaemonReplicates(c: RehearsalCase, daemon: RunningDaemon): Promise<void> {
   const status = await daemon.client.post<{ passiveEvents?: { replication?: Record<string, unknown> } }>("/status", { cwd: c.h.cwd }, { timeoutMs: 30_000 });
   const replication = status.passiveEvents?.replication;
-  if (replication?.enabled !== true || Number(replication.passes) < 1) {
+  if (replication?.enabled !== true || Number(replication.passes) < 1 || Number(replication.projects) < 1) {
     c.invariants.I3 ??= { status: "pass", evidenceRefs: [] };
     c.invariants.I3.status = "fail";
     throw new Error("the daemon reports no replication pass: " + JSON.stringify(replication));
   }
-  c.mark("I3", "daemon-replication:passes=" + String(replication.passes));
+  c.mark("I3", "daemon-replication:passes=" + String(replication.passes) + ",projects=" + String(replication.projects));
 }
 
 /**

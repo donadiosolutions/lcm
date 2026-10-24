@@ -3016,7 +3016,7 @@
       ],
       "knownLimits": [],
       "id": "F10",
-      "title": "A SQLite daemon alive across activation: the restart verifier refuses until it is stopped and a PostgreSQL daemon starts",
+      "title": "A SQLite daemon alive across activation: the restart verifier refuses until it is stopped and a PostgreSQL daemon starts and replicates",
       "fixture": "PM",
       "requirement": "Fault list: stale daemon (restart verifier is real)",
       "steps": [
@@ -3110,7 +3110,7 @@
         "I5": "na:no unreachable-target step in this row; disclosure scan still runs on every step",
         "I6": "required"
       },
-      "notes": "A real SQLite daemon alive across the cutover: activate and report exit 8 restart-required until it is stopped (#1683 fixed on main). Environment restriction: this daemon is started with the operator's PostgreSQL connection variables (LCM_POSTGRES_URL and LCM_POSTGRES_CA_FILE); a daemon started without them still gives exit 5 cutover-restart-contradiction because its observe route answers 503, tracked by https://github.com/donadiosolutions/lcm/issues/1696 and asserted by the pending row F10-no-target-env. After the restart the new daemon reports PostgreSQL, one bounded drain delivers an input acknowledged after the old daemon stopped (an administrator-owned trigger records the applied inbox row before the production prune, so the receipt is authenticated from that durable witness), and the SQLite project database is never written by either daemon."
+      "notes": "A real SQLite daemon alive across the cutover: activate and report exit 8 restart-required until it is stopped (#1683 fixed on main). Environment restriction: this daemon is started with the operator's PostgreSQL connection variables (LCM_POSTGRES_URL and LCM_POSTGRES_CA_FILE); a daemon started without them still gives exit 5 cutover-restart-contradiction because its observe route answers 503, tracked by https://github.com/donadiosolutions/lcm/issues/1696 and asserted by the pending row F10-no-target-env. After the restart the new daemon reports PostgreSQL, an input acknowledged after the old daemon stopped is delivered once by the production replication worker, driven in process so the applied inbox row is captured before the production prune and authenticates every canonical envelope field, and the new daemon reports a replication pass, and the SQLite project database is never written by either daemon."
     },
     {
       "profiles": [
@@ -3123,7 +3123,7 @@
       ],
       "knownLimits": [],
       "id": "F10-no-target-env",
-      "title": "A SQLite daemon started without the PostgreSQL connection variables alive across activation: exit 8 restart-required, then restart and delivery",
+      "title": "A SQLite daemon started without the PostgreSQL connection variables alive across activation: exit 8 restart-required, then restart and replication",
       "fixture": "PM",
       "requirement": "Fault list: stale daemon (restart verifier is real)",
       "steps": [
@@ -3355,13 +3355,7 @@
         "I5": "na:no unreachable-target step in this row; disclosure scan still runs on every step",
         "I6": "required"
       },
-      "notes": "Pending the #1693 fix on main: events that crossed the cutover are copied into the PostgreSQL inbox with a different createdAt encoding than the replication worker uploads, so the first post-cutover replication pass fails with an idempotency collision and the batch stays in retry. The row asserts the success end state: every drained input is acknowledged locally and has one terminal remote disposition. The join authenticates every canonical envelope field against the ledger from a durable receipt recorded when the inbox row applies.",
-      "gate": {
-        "status": "pending",
-        "pendingOn": [
-          "https://github.com/donadiosolutions/lcm/issues/1693"
-        ]
-      }
+      "notes": "Asserts the delivery end state: every drained input is acknowledged locally, has one terminal remote disposition, and the join authenticates every canonical envelope field against the ledger from the applied inbox row captured before the production prune. The production replication worker is driven in process because the daemon replicates only in its start-up sweep and every five minutes."
     },
     {
       "profiles": [
@@ -3621,11 +3615,11 @@
         "I5": "na:no unreachable-target step in this row; disclosure scan still runs on every step",
         "I6": "required"
       },
-      "notes": "Pending the #1693 fix on main: events that crossed the cutover are copied into the PostgreSQL inbox with a different createdAt encoding than the replication worker uploads, so the first post-cutover replication pass fails with an idempotency collision and the batch stays in retry. The row asserts the success end state: every drained input is acknowledged locally and has one terminal remote disposition. The join authenticates every canonical envelope field against the ledger from a durable receipt recorded when the inbox row applies.",
+      "notes": "Pending the https://github.com/donadiosolutions/lcm/issues/1698 fix on main: once the production replication has delivered and pruned the drained events, the rollback refuses (rollback-sidecars.ts treats a local row with remote_inbox_id that the PostgreSQL archive no longer holds as a contradiction, and ignores remote_pruned_at). The inbox is empty at the rollback, so #1694 (resident uploaded rows) does not apply. The row asserts the success end state: every drained input is acknowledged locally and has one terminal remote disposition, the join authenticates every canonical envelope field against the ledger from the applied inbox row captured before the production prune, and the rollback succeeds and retains them. The production replication worker is driven in process because the daemon replicates only in its start-up sweep and every five minutes.",
       "gate": {
         "status": "pending",
         "pendingOn": [
-          "https://github.com/donadiosolutions/lcm/issues/1693"
+          "https://github.com/donadiosolutions/lcm/issues/1698"
         ]
       }
     },

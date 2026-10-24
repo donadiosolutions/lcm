@@ -10,7 +10,7 @@ import { appendLocalHookEvents } from "../../src/hooks/local-enqueue.js";
 import { projectMapPath } from "../../src/project-map.js";
 import { readBackendPublicationJournal } from "../../src/storage/backend-publication.js";
 import {
-  RehearsalCase, NO_HOME, createRole, OWNED_CHILDREN, DaemonExitedBeforeReady, roleHasNoPrivileges, addProject, readAuthority, type RehearsalHome, acknowledgeEvents, assertEventsJoined, inboxRows, recordRepresented, applyWithResponseLoss, competingLease, competingPublicationFence, staleTokenRefused, interruptActivation, type ActivationInterruption, interruptRollback, prepareGuardedWriter, type RollbackInterruption, targetConfigFor, memberGenerations, withProject, assertAllOrNoneBound, interruptSetActivation, interruptSetRollback, interruptSetPrepare, destinationProjectId, capturePartialSnapshot, expireCopyLease, killWorkerAtSeam, readEventRows, activeProfile, assertLedgerRetained, assertDaemonReplicates, replicateWithWitness, uploadResidentEvents, acknowledgeHeldGap, ledgerEntryOf, recordInstructionLedger, assertWritesRestored, assertNativeAllocationSafe, createHome, damageSnapshot, enrollProject, guardedWrite, loadManifest,
+  RehearsalCase, NO_HOME, createRole, OWNED_CHILDREN, DaemonExitedBeforeReady, roleHasNoPrivileges, addProject, readAuthority, type RehearsalHome, acknowledgeEvents, assertEventsJoined, inboxRows, recordRepresented, applyWithResponseLoss, competingLease, competingPublicationFence, staleTokenRefused, interruptActivation, type ActivationInterruption, interruptRollback, prepareGuardedWriter, type RollbackInterruption, targetConfigFor, memberGenerations, withProject, assertAllOrNoneBound, interruptSetActivation, interruptSetRollback, interruptSetPrepare, destinationProjectId, capturePartialSnapshot, expireCopyLease, killWorkerAtSeam, readEventRows, activeProfile, assertLedgerRetained, assertDaemonReplicates, replicateWithWitness, type InboxRow, uploadResidentEvents, acknowledgeHeldGap, ledgerEntryOf, recordInstructionLedger, assertWritesRestored, assertNativeAllocationSafe, createHome, damageSnapshot, enrollProject, guardedWrite, loadManifest,
   postgresDomainDigests, provisionRole, seedNative, sha256, sqliteDomainDigests, swapGrants, unusedPort,
   withHome, writeEvidence, type DomainDigests, type ScenarioSpec,
 } from "./cutover-rehearsal/fixture.js";
@@ -165,10 +165,14 @@ const eventsThroughRollback = (options: { readonly drain: boolean; readonly deli
   assertLedgerRetained(c, "after-activate");
   c.compareDomains("postgresql-after-activate", baseline, await postgresDomainDigests(c.db, c.h.cwd, c.signal));
   await swapGrants(c.db, c.role, "runtime", c.signal);
+  let deliveredReceipts: readonly InboxRow[] | undefined;
   if (options.drain) {
     // Inputs that exist when the one bounded drain is requested must reach PostgreSQL; the later input only has to be retained.
     const eligible = c.ledger.map((entry) => entry.data).filter((name) => !name.startsWith("f6-represented"));
-    if (options.deliver) await assertEventsJoined(c, "after-drain", eligible, await replicateWithWitness(c, eligible));
+    if (options.deliver) {
+      deliveredReceipts = await replicateWithWitness(c, eligible);
+      await assertEventsJoined(c, "after-drain", eligible, deliveredReceipts);
+    }
     await c.daemon(async (daemon) => {
       const drained = await c.promote(daemon, "events-promote");
       if (drained.errors !== 0) throw new Error("the drain reported errors: " + JSON.stringify(drained));
@@ -183,7 +187,14 @@ const eventsThroughRollback = (options: { readonly drain: boolean; readonly deli
   const represented = new Set(readEventRows(c.h).filter((row) => row.data.startsWith("f6-represented")).map((row) => row.event_uuid));
   // Represented events crossed as exactly one already-applied remote disposition each; nothing re-pended or replayed them.
   const machineId = c.ledger[0]!.machineId;
-  const representedRows = (await inboxRows(c.db, c.signal)).filter((row) => row.machine_id === machineId && represented.has(row.event_id));
+  // After a delivery pass the production replication acknowledges and prunes them: the receipts captured before that prune
+  // hold the one applied disposition each, and none remains in the inbox.
+  const representedRows = deliveredReceipts !== undefined
+    ? deliveredReceipts.filter((row) => row.machine_id === machineId && represented.has(row.event_id))
+    : (await inboxRows(c.db, c.signal)).filter((row) => row.machine_id === machineId && represented.has(row.event_id));
+  if (deliveredReceipts !== undefined && (await inboxRows(c.db, c.signal)).some((row) => represented.has(row.event_id))) {
+    throw new Error("a represented event is still in the inbox after the delivery pass pruned it");
+  }
   if (representedRows.length !== represented.size || representedRows.some((row) => row.status !== "applied")) {
     throw new Error("represented events are not exactly one applied remote disposition each: " + JSON.stringify(representedRows.map((row) => row.status)));
   }
