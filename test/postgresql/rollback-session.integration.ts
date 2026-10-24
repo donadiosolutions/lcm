@@ -80,6 +80,8 @@ import { fixtureActivationScenario } from "../fixtures/migration-activation-reco
 import { assertHarnessReady, settings, withPostgreSqlTestDatabase, type PostgreSqlTestDatabase } from "./harness.js";
 import { applyAllRuntimeGrants } from "./operational-fixture.js";
 import { PORTABLE_POSTGRESQL_FIXTURE, seedPortablePostgreSql } from "./portable-fixture.js";
+import { eventsDir } from "../../src/db/events-path.js";
+import { readOutboxPrevEventIds, replicateIntoInbox } from "./replicated-inbox-fixture.js";
 
 beforeAll(assertHarnessReady);
 
@@ -571,6 +573,40 @@ describe("production rollback against PostgreSQL 18", { timeout: 240_000 }, () =
         installed.close();
       }
       expect((await leaseRow(database))!.released).toBe(true);
+    });
+  });
+
+  it("#1694: a post-write rollback completes with rows a real replication pass uploaded resident in the inbox", async () => {
+    await withPostgreSqlTestDatabase("rollback-session-replicated-inbox", async (database) => {
+      const { homeDir, canonicalPath } = await prepared(database, "gen-replicated");
+      // The local machine's own outbox, at the path the rollback reconciles; the worker leaves its rows
+      // quarantined (inbox and local), retry and pending (inbox) with a replicated local row, never acknowledged.
+      const outboxPath = join(eventsDir(homeDir), `${fixture.localProjectId}.db`);
+      const replicated = await replicateIntoInbox(database, homeDir, {
+        projectId: fixture.projectId, machineId: fixture.machineId, outboxPath,
+      });
+      await replicated.close();
+      await insertConversation(database, "raced-session-replicated");
+      const states = async () => (await database.migrator.query<{ data: string; status: string }>({
+        text: "SELECT payload->>'data' AS data, status FROM lcm.passive_event_inbox WHERE payload->>'data' LIKE 'replicated-%' ORDER BY machine_sequence",
+      }, factoryContext)).rows;
+      const before = [
+        { data: "replicated-0", status: "quarantined" }, { data: "replicated-1", status: "retry" },
+        { data: "replicated-2", status: "pending" },
+      ];
+      expect(await states()).toEqual(before);
+      const prevEventIds = new Map(replicated.events.map((event) => [event.data, event.prevEventId]));
+      expect(readOutboxPrevEventIds(outboxPath)).toEqual(prevEventIds);
+
+      const outcome = await runRollback({ homeDir, generationId: "gen-replicated", canonicalPath, database });
+      expect(outcome.manifest.rollbackLineage.mode).toBe("post-write");
+      expectRollbackPublished(homeDir, "gen-replicated");
+      expect((await leaseRow(database))!.released).toBe(true);
+      // The upload stays resident, and the resident local rows keep their previous-event pointers.
+      expect(await states()).toEqual(before);
+      // The rollback also materializes the fixture's own archived rows next to them.
+      const after = [...readOutboxPrevEventIds(outboxPath)].filter(([data]) => data.startsWith("replicated-"));
+      expect(new Map(after)).toEqual(prevEventIds);
     });
   });
 
