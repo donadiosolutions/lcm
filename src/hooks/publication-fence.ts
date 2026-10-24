@@ -18,6 +18,10 @@ import {
   type PrivateDirectoryWitness,
 } from "../security-files.js";
 import { BackendPublicationJournalError } from "../storage/backend-publication.js";
+import {
+  createLockContentionWaitBudget,
+  retryWhileLiveLockContended,
+} from "../private-mutation-lock.js";
 
 const MAX_HOOK_EVIDENCE_BYTES = 4 * 1024 * 1024;
 
@@ -311,4 +315,38 @@ export function isBackendPublicationEvidenceMissing(error: unknown): boolean {
 
 export function rethrowBackendPublicationJournalError(error: unknown): void {
   if (isBackendPublicationJournalError(error)) throw error;
+}
+
+/** A pre-effect lock-acquiring step, run once or retried across live contention. */
+export type HookAdmissionRetry = <T>(step: () => T | Promise<T>) => Promise<T>;
+
+/** Cumulative time one hook invocation may wait for a live lock owner. */
+export const HOOK_CONTENTION_WAIT_MS = 5_000;
+
+/**
+ * Session-end runs under a short host timeout that the installed hook does not
+ * set, so its allowance is small (20% of an assumed 1.5 second host timeout).
+ */
+export const HOOK_SESSION_END_CONTENTION_WAIT_MS = 300;
+
+/** Run the step exactly once: the behavior of every hook that does not opt in. */
+export const NO_HOOK_ADMISSION_RETRY: HookAdmissionRetry = async (step) => await step();
+
+/**
+ * Retry short admission steps while a live process holds the publication
+ * lock. All steps run through one returned function share one finite
+ * allowance, so a hook never waits longer than `totalMs` in total. Callers
+ * pass only pre-effect steps (a fence assertion or a configuration load).
+ */
+export function hookAdmissionRetry(options: Readonly<{
+  totalMs?: number;
+  signal?: AbortSignal;
+  _wait?: (milliseconds: number, signal?: AbortSignal) => Promise<void>;
+}> = {}): HookAdmissionRetry {
+  const budget = createLockContentionWaitBudget(options.totalMs ?? HOOK_CONTENTION_WAIT_MS);
+  return (step) => retryWhileLiveLockContended(step, {
+    budget,
+    ...(options.signal === undefined ? {} : { signal: options.signal }),
+    ...(options._wait === undefined ? {} : { _wait: options._wait }),
+  });
 }

@@ -10,6 +10,8 @@ import { loadDaemonConfig } from "../../../src/daemon/config.js";
 import { projectDbPath } from "../../../src/daemon/project.js";
 import { createDaemon, type DaemonInstance, type DaemonOptions } from "../../../src/daemon/server.js";
 import { clearProjectMapCache } from "../../../src/project-map.js";
+import { PrivateMutationLockContentionError } from "../../../src/private-mutation-lock.js";
+import { withBackendPublicationConsumerLockAsync } from "../../../src/storage/backend-publication.js";
 import { createStorageBackendFactory } from "../../../src/storage/index.js";
 
 type Gate = { promise: Promise<void>; open: () => void };
@@ -183,6 +185,56 @@ const body = (fixture: Pick<Fixture, "cwd" | "transcript">, extra: Record<string
 });
 
 describe("POST /ingest/terminal", () => {
+  const liveContention = (): PrivateMutationLockContentionError => new PrivateMutationLockContentionError(
+    "backend publication mutation is already in progress (owned by live PID)",
+    {
+      contendedLock: {
+        path: "/lcm/publication.lock",
+        owner: { version: 1, pid: process.pid + 1, processStartTime: null, nonce: "owner" },
+      },
+    },
+  );
+
+  it("ingests exactly once after a live process releases the publication lock following the 202", async () => {
+    let armed = false;
+    let refused = 0;
+    const lock: typeof withBackendPublicationConsumerLockAsync = (...args) => {
+      if (armed && refused < 3) {
+        refused += 1;
+        throw liveContention();
+      }
+      return withBackendPublicationConsumerLockAsync(...args);
+    };
+    await withTerminalDaemon({ daemonOptions: { _withBackendPublicationConsumerLockAsync: lock } }, async (fixture) => {
+      armed = true;
+      expect((await bounded(fixture.post(body(fixture)))).status).toBe(202);
+      await vi.waitFor(() => expect(fixture.messageCount()).toBe(2), { timeout: 5_000 });
+      await vi.waitFor(() => expect(fixture.events.filter((event) => event === "project.close:end")).toHaveLength(1), { timeout: 5_000 });
+      expect(refused).toBe(3);
+      expect(fixture.events.filter((event) => event === "open:start")).toHaveLength(1);
+    });
+  });
+
+  it("stops waiting for the publication lock when the daemon shuts down", async () => {
+    let armed = false;
+    let refused = 0;
+    const lock: typeof withBackendPublicationConsumerLockAsync = (...args) => {
+      if (!armed) return withBackendPublicationConsumerLockAsync(...args);
+      refused += 1;
+      throw liveContention();
+    };
+    await withTerminalDaemon({ daemonOptions: { _withBackendPublicationConsumerLockAsync: lock } }, async (fixture) => {
+      armed = true;
+      expect((await bounded(fixture.post(body(fixture)))).status).toBe(202);
+      await vi.waitFor(() => expect(refused).toBeGreaterThanOrEqual(2), { timeout: 5_000 });
+
+      await bounded(fixture.daemon.stop());
+
+      expect(fixture.events).not.toContain("open:start");
+      expect(fixture.messageCount()).toBe(0);
+    });
+  });
+
   it("answers 202 while ordinary publication work is running and ingests once it finishes", async () => {
     await withTerminalDaemon({}, async (fixture) => {
       const hold = await fixture.holdPublication();

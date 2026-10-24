@@ -29,7 +29,7 @@ import { createDescribeHandler } from "./routes/describe.js";
 import { createStoreHandler } from "./routes/store.js";
 import { createRecentHandler } from "./routes/recent.js";
 import { createIngestHandler } from "./routes/ingest.js";
-import { createTerminalIngestQueue } from "./routes/ingest-terminal.js";
+import { createTerminalIngestQueue, TERMINAL_INGEST_DEADLINE_MS } from "./routes/ingest-terminal.js";
 import { settleProjectStorageExecutions } from "./routes/storage-lifecycle.js";
 import { createPromptSearchHandler } from "./routes/prompt-search.js";
 import { createStatusHandler } from "./routes/status.js";
@@ -50,7 +50,12 @@ import { createReviewStaleHandler } from "./routes/review-stale.js";
 import { createInvocationControlHandler } from "./routes/invocation-control.js";
 import { composeAbortSignals, throwIfAborted } from "./cancellation.js";
 import { createPublicationQueue } from "./publication-queue.js";
-import { PrivateMutationLockContentionError } from "../private-mutation-lock.js";
+import {
+  createLockContentionWaitBudget,
+  PrivateMutationLockContentionError,
+  retryWhileLiveLockContended,
+  type LockContentionWaitBudget,
+} from "../private-mutation-lock.js";
 import {
   createInvocationCoordinator,
   type InvocationCoordinator,
@@ -172,6 +177,8 @@ export type DaemonOptions = {
   _onRequestLifecycle?: (event: RequestLifecycleEvent, signal: AbortSignal) => void;
   /** @internal Queue-wait budget for a PostgreSQL read's admitted retry, in milliseconds. */
   _readAdmissionWaitMs?: number;
+  /** @internal Wait for a live lock owner shared by one capture request's admissions, in milliseconds. */
+  _routeAdmissionWaitMs?: number;
   /** @internal Test-only observer for the closed built-in route registry. */
   _onBuiltInRouteRegistered?: (
     key: string,
@@ -184,6 +191,9 @@ const MAX_BODY_BYTES = 10 * 1024 * 1024; // 10 MB
 const MAX_REQUEST_CONFIG_BYTES = 4 * 1024 * 1024;
 const MAX_BUFFERED_RESPONSE_BYTES = MAX_BODY_BYTES;
 const READ_ADMISSION_WAIT_MS = 1000;
+/** Shared wait for a live lock owner across one capture request's admissions. */
+const ROUTE_ADMISSION_CONTENTION_WAIT_MS = 3000;
+const ADMISSION_RETRY_ROUTES: ReadonlySet<string> = new Set(["POST /ingest", "POST /restore"]);
 
 export function claudeProjectDirName(cwd: string): string {
   const sanitized = cwd
@@ -597,17 +607,37 @@ export async function createDaemon(config: DaemonConfig, options?: DaemonOptions
     assertDaemonRequestStorageAdmission(config, publicationConfigPath, lockToken);
   };
   const enqueuePublication = createPublicationQueue();
-  const publicationAdmission = (signal: AbortSignal): RoutePublicationAdmission => async (operation, operationSignal) => {
+  /**
+   * With a wait budget, acquiring the consumer lock waits for a live foreign
+   * owner (a hook's short fence, for example) instead of failing the request.
+   * Only the acquisition is retried; an operation callback is never replayed.
+   */
+  const publicationAdmission = (
+    signal: AbortSignal,
+    contentionBudget?: LockContentionWaitBudget,
+  ): RoutePublicationAdmission => async (operation, operationSignal) => {
     const cancellation = composeAbortSignals([signal, operationSignal]);
     try {
       return await enqueuePublication(() => {
         throwIfAborted(cancellation.signal);
-        return withConsumerPublicationLockAsync(publicationHome, async publicationLockToken => {
-          throwIfAborted(cancellation.signal);
-          assertRequestAdmission(publicationLockToken);
-          throwIfAborted(cancellation.signal);
-          return operation(publicationLockToken);
-        });
+        let entered = false;
+        const acquire = () => {
+          entered = false;
+          return withConsumerPublicationLockAsync(publicationHome, async publicationLockToken => {
+            entered = true;
+            throwIfAborted(cancellation.signal);
+            assertRequestAdmission(publicationLockToken);
+            throwIfAborted(cancellation.signal);
+            return operation(publicationLockToken);
+          });
+        };
+        return contentionBudget === undefined
+          ? acquire()
+          : retryWhileLiveLockContended(acquire, {
+            budget: contentionBudget,
+            signal: cancellation.signal,
+            canRetry: () => !entered,
+          });
       }, cancellation.signal);
     } finally {
       cancellation.cleanup();
@@ -934,7 +964,12 @@ export async function createDaemon(config: DaemonConfig, options?: DaemonOptions
   const ingestHandler = createIngestHandler(config, storageFactory);
   const terminalIngestQueue = createTerminalIngestQueue({
     ingest: ingestHandler,
-    publicationAdmission,
+    // An accepted hand-off outlives the hook that sent it: its admission waits
+    // for a live lock owner for as long as the entry's own deadline allows.
+    publicationAdmission: signal => publicationAdmission(
+      signal,
+      createLockContentionWaitBudget(TERMINAL_INGEST_DEADLINE_MS),
+    ),
     shutdownSignal: shutdownController.signal,
     onDrained: resetIdleTimer,
   });
@@ -1090,7 +1125,14 @@ export async function createDaemon(config: DaemonConfig, options?: DaemonOptions
         }
         if (route.publicationMode === "operation-scoped") {
           assertDaemonNotShuttingDown();
-          const withPublicationAdmission = publicationAdmission(requestSignal);
+          // Capture requests wait briefly for a live lock owner rather than
+          // dropping the hook's hand-off; the hook's own client gives up at 5 s.
+          const withPublicationAdmission = publicationAdmission(
+            requestSignal,
+            ADMISSION_RETRY_ROUTES.has(key)
+              ? createLockContentionWaitBudget(options?._routeAdmissionWaitMs ?? ROUTE_ADMISSION_CONTENTION_WAIT_MS)
+              : undefined,
+          );
           await withPublicationAdmission(() => undefined);
           throwIfAborted(requestSignal);
           if (route.responseMode === "buffered") {

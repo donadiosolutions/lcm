@@ -14,6 +14,10 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import {
+  createLockContentionWaitBudget,
+  isLiveForeignLockContention,
+  LIVE_LOCK_RETRY_DELAY_MS,
+  retryWhileLiveLockContended,
   PrivateMutationLockContentionError,
   PrivateMutationPermitRevokedError,
   processStartTime,
@@ -994,5 +998,192 @@ describe("private mutation lock process-birth helpers", () => {
     });
     expect(active).toBe(true);
     expect(permit?.active).toBe(false);
+  });
+});
+
+describe("retrying a lock that a live foreign process holds", () => {
+  const liveContention = (pid = process.pid + 1): PrivateMutationLockContentionError =>
+    new PrivateMutationLockContentionError("busy", {
+      contendedLock: {
+        path: "/lcm/mutation.lock",
+        owner: { version: 1, pid, processStartTime: null, nonce: "owner" },
+      },
+    });
+  const waits: number[] = [];
+  const recordWait = async (milliseconds: number): Promise<void> => {
+    waits.push(milliseconds);
+  };
+
+  afterEach(() => {
+    waits.length = 0;
+    vi.useRealTimers();
+    vi.restoreAllMocks();
+  });
+
+  it("spends a budget down to zero and never below", () => {
+    const budget = createLockContentionWaitBudget(120);
+    budget.spend(50);
+    expect(budget.remainingMs()).toBe(70);
+    budget.spend(500);
+    expect(budget.remainingMs()).toBe(0);
+    expect(createLockContentionWaitBudget(-5).remainingMs()).toBe(0);
+  });
+
+  it("recognizes only a live owner in another process", () => {
+    expect(isLiveForeignLockContention(liveContention())).toBe(true);
+    expect(isLiveForeignLockContention(liveContention(process.pid))).toBe(false);
+    expect(isLiveForeignLockContention(new PrivateMutationLockContentionError("ambiguous owner"))).toBe(false);
+    class TimeoutContention extends PrivateMutationLockContentionError {}
+    expect(isLiveForeignLockContention(new TimeoutContention("timed out"))).toBe(false);
+    expect(isLiveForeignLockContention(new Error("other"))).toBe(false);
+    expect(isLiveForeignLockContention("busy")).toBe(false);
+  });
+
+  it("returns the step result without waiting when the lock is free", async () => {
+    const result = await retryWhileLiveLockContended(async () => "done", {
+      budget: createLockContentionWaitBudget(1000),
+      _wait: recordWait,
+    });
+    expect(result).toBe("done");
+    expect(waits).toEqual([]);
+  });
+
+  it("retries a synchronous step after each live contention", async () => {
+    let attempts = 0;
+    const result = await retryWhileLiveLockContended(() => {
+      attempts += 1;
+      if (attempts < 3) throw liveContention();
+      return attempts;
+    }, { budget: createLockContentionWaitBudget(1000), _wait: recordWait });
+    expect(result).toBe(3);
+    expect(waits).toEqual([LIVE_LOCK_RETRY_DELAY_MS, LIVE_LOCK_RETRY_DELAY_MS]);
+  });
+
+  it.each([
+    ["ambiguous contention", new PrivateMutationLockContentionError("ambiguous owner")],
+    ["contention with this process", liveContention(process.pid)],
+    ["another error", new Error("journal blocked")],
+  ])("does not retry %s", async (_name, error) => {
+    let attempts = 0;
+    await expect(retryWhileLiveLockContended(() => {
+      attempts += 1;
+      throw error;
+    }, { budget: createLockContentionWaitBudget(1000), _wait: recordWait })).rejects.toBe(error);
+    expect(attempts).toBe(1);
+    expect(waits).toEqual([]);
+  });
+
+  it("rethrows the last contention error once the budget is spent", async () => {
+    const errors: PrivateMutationLockContentionError[] = [];
+    const budget = createLockContentionWaitBudget(120);
+    const thrown = await retryWhileLiveLockContended(() => {
+      const error = liveContention();
+      errors.push(error);
+      throw error;
+    }, { budget, _wait: recordWait }).catch((error: unknown) => error);
+    expect(errors).toHaveLength(4);
+    expect(thrown).toBe(errors[3]);
+    expect(waits).toEqual([50, 50, 20]);
+    expect(budget.remainingMs()).toBe(0);
+  });
+
+  it("shares one budget across separate retries", async () => {
+    const budget = createLockContentionWaitBudget(100);
+    const failing = (): never => { throw liveContention(); };
+    await expect(retryWhileLiveLockContended(failing, { budget, _wait: recordWait })).rejects.toThrow("busy");
+    await expect(retryWhileLiveLockContended(failing, { budget, _wait: recordWait })).rejects.toThrow("busy");
+    expect(waits).toEqual([50, 50]);
+  });
+
+  it("charges the measured time when a wait overruns the delay", async () => {
+    const clock = vi.spyOn(performance, "now");
+    clock.mockReturnValueOnce(10).mockReturnValueOnce(100);
+    const budget = createLockContentionWaitBudget(200);
+    let attempts = 0;
+    await retryWhileLiveLockContended(() => {
+      attempts += 1;
+      if (attempts === 1) throw liveContention();
+    }, { budget, _wait: recordWait });
+    expect(budget.remainingMs()).toBe(110);
+  });
+
+  it("stops before waiting when the signal is already aborted", async () => {
+    const controller = new AbortController();
+    controller.abort();
+    await expect(retryWhileLiveLockContended(() => { throw liveContention(); }, {
+      budget: createLockContentionWaitBudget(1000),
+      signal: controller.signal,
+      _wait: recordWait,
+    })).rejects.toThrow("busy");
+    expect(waits).toEqual([]);
+  });
+
+  it("stops retrying when the signal aborts during a wait", async () => {
+    const controller = new AbortController();
+    let attempts = 0;
+    await expect(retryWhileLiveLockContended(() => {
+      attempts += 1;
+      throw liveContention();
+    }, {
+      budget: createLockContentionWaitBudget(1000),
+      signal: controller.signal,
+      _wait: async () => { controller.abort(); },
+    })).rejects.toThrow("busy");
+    expect(attempts).toBe(1);
+  });
+
+  it("does not retry once the caller reports that effects started", async () => {
+    let attempts = 0;
+    await expect(retryWhileLiveLockContended(() => {
+      attempts += 1;
+      throw liveContention();
+    }, {
+      budget: createLockContentionWaitBudget(1000),
+      canRetry: () => false,
+      _wait: recordWait,
+    })).rejects.toThrow("busy");
+    expect(attempts).toBe(1);
+  });
+
+  it("keeps retrying while the caller allows it", async () => {
+    let attempts = 0;
+    await retryWhileLiveLockContended(() => {
+      attempts += 1;
+      if (attempts === 1) throw liveContention();
+    }, {
+      budget: createLockContentionWaitBudget(1000),
+      canRetry: () => true,
+      _wait: recordWait,
+    });
+    expect(attempts).toBe(2);
+  });
+
+  it("waits on a real timer between attempts", async () => {
+    vi.useFakeTimers();
+    let attempts = 0;
+    const pending = retryWhileLiveLockContended(() => {
+      attempts += 1;
+      if (attempts === 1) throw liveContention();
+      return "released";
+    }, { budget: createLockContentionWaitBudget(1000) });
+    await vi.advanceTimersByTimeAsync(LIVE_LOCK_RETRY_DELAY_MS - 1);
+    expect(attempts).toBe(1);
+    await vi.advanceTimersByTimeAsync(1);
+    await expect(pending).resolves.toBe("released");
+  });
+
+  it("ends a real timer wait as soon as the signal aborts", async () => {
+    vi.useFakeTimers();
+    const controller = new AbortController();
+    let attempts = 0;
+    const pending = retryWhileLiveLockContended(() => {
+      attempts += 1;
+      throw liveContention();
+    }, { budget: createLockContentionWaitBudget(1000), signal: controller.signal });
+    const outcome = expect(pending).rejects.toThrow("busy");
+    await vi.advanceTimersByTimeAsync(10);
+    controller.abort();
+    await outcome;
+    expect(attempts).toBe(1);
   });
 });

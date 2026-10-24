@@ -2155,6 +2155,7 @@ export async function ensureDaemon(opts: EnsureDaemonOptions): Promise<EnsureDae
     },
   });
   let childConvergence: PublicationConvergence | undefined;
+  let childDaemonPid: number | undefined;
   const evidence = admissionEvidence;
   if (
     evidence !== undefined
@@ -2164,6 +2165,7 @@ export async function ensureDaemon(opts: EnsureDaemonOptions): Promise<EnsureDae
     && result.pid === evidence.health.pid
     && !opts._abortSignal?.aborted
   ) {
+    childDaemonPid = evidence.health.pid;
     childConvergence = createLifecyclePublicationConvergence(opts, {
       pid: evidence.health.pid!,
       version: evidence.expectedVersion,
@@ -2180,9 +2182,26 @@ export async function ensureDaemon(opts: EnsureDaemonOptions): Promise<EnsureDae
       readOwner: evidence.readOwner,
     });
   }
-  const finalWrap = childConvergence === undefined
+  // The running daemon's own lock holds converge through the child wrapper.
+  // Contention owned by any other process is not the child's to settle, so
+  // only the final assertion falls back to the caller's wrapper for it. The
+  // lifecycle itself is never rerun.
+  const finalWrap: PublicationAdmissionWrapper = childConvergence === undefined
     ? wrap
-    : abortPreservingPublicationWrapper(opts, childConvergence);
+    : async (step) => {
+      try {
+        return await abortPreservingPublicationWrapper(opts, childConvergence)(step);
+      } catch (error) {
+        if (
+          !(error instanceof PrivateMutationLockContentionError)
+          || error.contendedLock === undefined
+          || error.contendedLock.owner.pid === childDaemonPid
+          || opts._withPublicationAdmissionRetry === undefined
+          || opts._abortSignal?.aborted
+        ) throw error;
+        return await wrap(step);
+      }
+    };
   await finalWrap(() => assertLifecycleBackendPublication(opts));
   return result;
 }

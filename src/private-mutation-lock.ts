@@ -711,3 +711,86 @@ export async function withPrivateMutationLocksAsync<T>(
   };
   return acquireNext();
 }
+
+/** Pause between attempts to acquire a lock that another live process holds. */
+export const LIVE_LOCK_RETRY_DELAY_MS = 50;
+
+/** Finite wait time that every retry sharing the budget draws from. */
+export type LockContentionWaitBudget = Readonly<{
+  remainingMs: () => number;
+  spend: (milliseconds: number) => void;
+}>;
+
+export function createLockContentionWaitBudget(totalMs: number): LockContentionWaitBudget {
+  let remaining = Math.max(0, totalMs);
+  return {
+    remainingMs: () => remaining,
+    spend: (milliseconds) => {
+      remaining = Math.max(0, remaining - milliseconds);
+    },
+  };
+}
+
+/**
+ * True only when another live process owns the lock. Contention with an
+ * ambiguous owner, with this process, or one of the timeout subclasses carries
+ * no live foreign owner and is never worth waiting for.
+ */
+export function isLiveForeignLockContention(error: unknown): boolean {
+  return error instanceof PrivateMutationLockContentionError
+    && error.contendedLock !== undefined
+    && error.contendedLock.owner.pid !== process.pid;
+}
+
+export type LiveLockRetryOptions = Readonly<{
+  budget: LockContentionWaitBudget;
+  /** Ends the wait early; the last contention error is then rethrown. */
+  signal?: AbortSignal;
+  /** Consulted before each wait; return false once the step has had effects. */
+  canRetry?: () => boolean;
+  /** @internal Awaited pause used by tests to avoid real timers. */
+  _wait?: (milliseconds: number, signal?: AbortSignal) => Promise<void>;
+}>;
+
+function pause(milliseconds: number, signal?: AbortSignal): Promise<void> {
+  return new Promise((resolve) => {
+    const finish = (): void => {
+      clearTimeout(timer);
+      signal?.removeEventListener("abort", finish);
+      resolve();
+    };
+    const timer = setTimeout(finish, milliseconds);
+    // The caller has just seen the signal unaborted, so this listener cannot miss it.
+    signal?.addEventListener("abort", finish, { once: true });
+  });
+}
+
+/**
+ * Repeat one lock-acquiring step while a live foreign process holds the lock.
+ *
+ * The step must be a pre-effect, idempotent acquisition or check: nothing is
+ * held during a wait, and only live foreign contention is retried. Every other
+ * error is rethrown at once. When the shared budget is spent or the signal
+ * aborts, the last contention error is rethrown so the caller's existing
+ * contention handling remains the final fallback.
+ */
+export async function retryWhileLiveLockContended<T>(
+  step: () => T | Promise<T>,
+  options: LiveLockRetryOptions,
+): Promise<T> {
+  const wait = options._wait ?? pause;
+  const aborted = (): boolean => options.signal?.aborted === true;
+  for (;;) {
+    try {
+      return await step();
+    } catch (error) {
+      if (!isLiveForeignLockContention(error) || options.canRetry?.() === false) throw error;
+      const delay = Math.min(LIVE_LOCK_RETRY_DELAY_MS, options.budget.remainingMs());
+      if (delay <= 0 || aborted()) throw error;
+      const started = performance.now();
+      await wait(delay, options.signal);
+      options.budget.spend(Math.max(delay, performance.now() - started));
+      if (aborted()) throw error;
+    }
+  }
+}

@@ -1,0 +1,22 @@
+references: ["#1634", "#1635"]
+rationale: >-
+  #1634 and #1635 make hooks and the daemon wait briefly for a publication
+  lock held by another live process. The wait primitive is added to the
+  existing src/private-mutation-lock.ts, and the hook allowance helper to
+  src/hooks/publication-fence.ts. src/hooks/dispatch.ts creates the shared
+  allowance and src/hooks/restore.ts, src/hooks/compact.ts,
+  src/hooks/session-snapshot.ts and src/hooks/terminal-snapshot.ts spend it at
+  their pre-effect admissions. src/bootstrap.ts accepts the retry for endpoint
+  admission and src/daemon/server.ts uses the primitive in request admission
+  for the ingest, restore and terminal-ingest paths. No production file is
+  added, removed, moved or re-owned.
+pins:
+  - ["src/private-mutation-lock.ts", "unit-configuration-security"]
+  - ["src/hooks/publication-fence.ts", "unit-hooks"]
+  - ["src/hooks/dispatch.ts", "unit-hooks"]
+  - ["src/hooks/restore.ts", "unit-hooks"]
+  - ["src/hooks/compact.ts", "unit-hooks"]
+  - ["src/hooks/session-snapshot.ts", "unit-hooks"]
+  - ["src/hooks/terminal-snapshot.ts", "unit-hooks"]
+  - ["src/bootstrap.ts", "unit-installation"]
+  - ["src/daemon/server.ts", "unit-daemon-core"]
