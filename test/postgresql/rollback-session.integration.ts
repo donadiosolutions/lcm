@@ -50,6 +50,7 @@ import {
   resolveMigrationWitnessBindings,
 } from "../../src/migration/generation-binding-store.js";
 import { assertMigrationReplayAdmission } from "../../src/migration/maintenance.js";
+import { drainIntoPrunedState, forgetLocalPrune, readDeliveryRows } from "./drained-inbox-fixture.js";
 import {
   beginMigrationEffect,
   completeMigrationEffect,
@@ -911,6 +912,58 @@ describe("production rollback against PostgreSQL 18", { timeout: 240_000 }, () =
       })).rejects.toMatchObject({ reason: "drift", message: expect.stringContaining("census differs") });
       expect(existsSync(canonicalPath)).toBe(false);
       expect(readBackendMaintenanceJournal(homeDir)?.phase).toBe("maintenance-held");
+    });
+  });
+
+  it("#1698: a post-write rollback completes after a real replication pass delivered, acknowledged and pruned the local rows", async () => {
+    await withPostgreSqlTestDatabase("rollback-session-drained-pruned", async (database) => {
+      const { homeDir, canonicalPath } = await prepared(database, "gen-drained");
+      const outboxPath = join(eventsDir(homeDir), `${fixture.localProjectId}.db`);
+      const drained = await drainIntoPrunedState(database, {
+        projectId: fixture.projectId, machineId: fixture.machineId, outboxPath,
+      });
+      await insertConversation(database, "raced-session-drained");
+      // The steady state after a drain: no inbox row left in PostgreSQL, every local row acknowledged and pruned.
+      const inboxRows = async () => (await database.migrator.query<{ n: string }>({
+        text: "SELECT count(*)::text AS n FROM lcm.passive_event_inbox WHERE payload->>'data' LIKE 'drained-%'",
+      }, factoryContext)).rows[0]!.n;
+      expect(await inboxRows()).toBe("0");
+      const before = readDeliveryRows(outboxPath);
+      expect(before.map((row) => row.data)).toEqual(drained.data);
+      expect(before.every((row) => row.delivery_state === "acknowledged" && row.remote_inbox_id !== null && row.remote_pruned_at !== null)).toBe(true);
+
+      const outcome = await runRollback({ homeDir, generationId: "gen-drained", canonicalPath, database });
+      expect(outcome.manifest.rollbackLineage.mode).toBe("post-write");
+      expectRollbackPublished(homeDir, "gen-drained");
+      expect((await leaseRow(database))!.released).toBe(true);
+      // The local rows keep their delivery state, inbox id, prune marker and (unset) processing marker: the daemon's
+      // remote apply does nothing, so the SQLite consumer still promotes them.
+      expect(before.every((row) => row.processed_at === null)).toBe(true);
+      expect(readDeliveryRows(outboxPath)).toEqual(before);
+    });
+  });
+
+  it("#1698: a post-write rollback still refuses before publishing when a delivered row's prune was never recorded locally", async () => {
+    await withPostgreSqlTestDatabase("rollback-session-drained-unpruned", async (database) => {
+      const { homeDir, canonicalPath } = await prepared(database, "gen-unpruned");
+      const outboxPath = join(eventsDir(homeDir), `${fixture.localProjectId}.db`);
+      const drained = await drainIntoPrunedState(database, {
+        projectId: fixture.projectId, machineId: fixture.machineId, outboxPath,
+      });
+      forgetLocalPrune(outboxPath, drained.data[1]!);
+      await insertConversation(database, "raced-session-unpruned");
+      const before = readDeliveryRows(outboxPath);
+      await expect(runRollback({ homeDir, generationId: "gen-unpruned", canonicalPath, database }))
+        .rejects.toMatchObject({ name: "MigrationRollbackError", reason: "unexpected-state" });
+      // Nothing was published or installed; the manifest is still resumable and PostgreSQL stays authoritative.
+      expect(existsSync(canonicalPath)).toBe(false);
+      expect(readBackendMaintenanceJournal(homeDir)?.phase).toBe("maintenance-held");
+      expect(rollbackBinding(homeDir, "gen-unpruned")).toBeUndefined();
+      expect(readConfigBackend(homeDir)).toBe("postgresql");
+      const manifest = new MigrationManifestStore({ homeDir }).read("gen-unpruned");
+      expect(manifest.phase).toBe("rolling-back");
+      expect(manifest.pendingEffect).toBeNull();
+      expect(readDeliveryRows(outboxPath)).toEqual(before);
     });
   });
 });
