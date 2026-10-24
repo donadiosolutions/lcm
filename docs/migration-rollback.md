@@ -42,6 +42,10 @@ create in the same run.
   aside to a lineage path, never truncated, replaced in place, or unlinked.
   It is checkpointed and witnessed by content hash both before and after the
   move, so the preserved copy is provably byte-identical to what was live.
+- Rollback does not delete the destination project or its alias rows in
+  PostgreSQL: the canonical path and every project-map alias that `apply`
+  migrated stay there, and the local project map keeps listing the same
+  aliases.
 
 ## A generation that never activated cannot be rolled back
 

@@ -16,6 +16,7 @@ import {
 import { projectMapPath, readProjectMapSnapshot } from "../project-map.js";
 import { resolveMigrationWitnessBindings, type MigrationSelectionBinding } from "./generation-binding-store.js";
 import { MigrationManifestStore } from "./manifest-store.js";
+import { authorizedMapAliasPaths } from "./map-aliases.js";
 import { MigrationProtocolError, type MigrationManifest } from "./protocol.js";
 import { lcmHomeDir } from "../runtime-paths.js";
 import { readBoundedRegularFileWithStat } from "../security-files.js";
@@ -139,9 +140,7 @@ export function authenticateSqliteMigrationSource(
   const map = readProjectMapSnapshot(homeDir, publicationLockToken);
   const entry = map[local.id];
   const canonicalPath = resolve(entry?.canonical ?? local.canonical);
-  const aliases = [...new Set((entry?.aliases ?? []).map((path) => resolve(path)))]
-    .filter((path) => path !== canonicalPath)
-    .sort();
+  const aliases = authorizedMapAliasPaths(canonicalPath, entry?.aliases ?? []);
   const machineIdentity = requireMachineIdentity(homeDir);
   const lcm = lcmHomeDir(homeDir);
   const projectDir = join(lcm, "projects", local.id);

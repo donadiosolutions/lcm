@@ -1,7 +1,7 @@
-import { mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { mkdirSync, mkdtempSync, readFileSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { beforeAll, expect, it, vi } from "vitest";
+import { beforeAll, describe, expect, it, vi } from "vitest";
 import { assertHarnessReady, settings, withPostgreSqlTestDatabase, type PostgreSqlTestDatabase } from "./harness.js";
 import { grantPortablePostgreSql } from "./portable-fixture.js";
 import { prepareSqliteMigrationEnrollment } from "../../src/migration/maintenance.js";
@@ -17,6 +17,7 @@ import { performMigrationApply } from "../../src/migration/cli-apply.js";
 import { MigrationManifestStore } from "../../src/migration/manifest-store.js";
 import { classifyMigrationRecovery } from "../../src/migration/protocol.js";
 import { closeLcmConnection } from "../../src/db/connection.js";
+import { readBackendMaintenanceJournal } from "../../src/storage/backend-publication.js";
 
 beforeAll(assertHarnessReady);
 
@@ -46,6 +47,7 @@ beforeAll(assertHarnessReady);
  */
 async function preparedApplyTarget(
   db: PostgreSqlTestDatabase,
+  options: Readonly<{ aliases?: (home: string) => readonly string[] }> = {},
 ): Promise<{ home: string; cwd: string; pgSettings: ReturnType<typeof settings> }> {
   await grantPortablePostgreSql(db, { transfer: true });
   const home = mkdtempSync(join(tmpdir(), "cli-apply-roundtrip-"));
@@ -62,6 +64,13 @@ async function preparedApplyTarget(
   mkdirSync(projectDir, { recursive: true, mode: 0o700 });
   mkdirSync(join(home, ".lcm", "events"), { mode: 0o700 });
   writeFileSync(join(projectDir, "meta.json"), `${JSON.stringify({ cwd })}\n`, { mode: 0o600 });
+
+  if (options.aliases !== undefined) {
+    // The project-map entry carries extra alias paths before enrollment (#1678).
+    writeFileSync(projectMapPath(home), `${JSON.stringify({
+      [local.id]: { canonical: local.canonical, aliases: [...options.aliases(home)] },
+    })}\n`, { mode: 0o600 });
+  }
 
   const pgSettings = settings(db.runtimeUrl);
   await prepareSqliteMigrationEnrollment({
@@ -298,3 +307,161 @@ it(
   180000,
 );
 
+async function projectAliasRows(db: PostgreSqlTestDatabase): Promise<Array<{ path: string; normalized_path: string }>> {
+  const result = await db.migrator.query<{ path: string; normalized_path: string }>({
+    text: "SELECT path, normalized_path FROM lcm.project_aliases ORDER BY path",
+  }, { domain: "factory", operation: "diagnosticFixture" });
+  return result.rows;
+}
+
+type AliasRowSet = Array<{ path: string; normalized_path: string }>;
+
+function aliasRowSet(...paths: string[]): AliasRowSet {
+  return paths.map((path) => ({ path, normalized_path: normalizeProjectPath(path) }))
+    .sort((left, right) => (left.path < right.path ? -1 : 1));
+}
+
+/**
+ * Runs a real `apply` for a project whose map entry carries `aliases` (built from the home so each case owns
+ * its paths). `seed` may create destination state first, from the same preflight apply will take its identity from.
+ */
+async function applyWithMapAliases(
+  label: string,
+  aliases: (home: string) => string[],
+  scenario: (context: {
+    db: PostgreSqlTestDatabase; home: string; cwd: string; canonical: string;
+    preflight: Extract<Awaited<ReturnType<typeof resolveMigrationPreflight>>, { status: "ready" }>;
+    apply: () => ReturnType<typeof performMigrationApply>;
+  }) => Promise<void>,
+  prepare: (home: string) => void = () => undefined,
+): Promise<void> {
+  await withPostgreSqlTestDatabase(label, async (db) => {
+    const { home, cwd, pgSettings } = await preparedApplyTarget(db, { aliases });
+    try {
+      prepare(home);
+      vi.stubEnv("LCM_POSTGRES_URL", pgSettings.url);
+      vi.stubEnv("LCM_POSTGRES_CA_FILE", pgSettings.caFile);
+      let preflight;
+      try {
+        preflight = await resolveMigrationPreflight({
+          cwd, homeDir: home, _operationsForTesting: { classifyPresence: async () => presentPresence() },
+        });
+      } finally {
+        vi.unstubAllEnvs();
+      }
+      expect(preflight.status).toBe("ready");
+      if (preflight.status !== "ready") throw new Error("unreachable");
+      await scenario({
+        db, home, cwd, canonical: preflight.local.canonical, preflight,
+        apply: () => performMigrationApply({
+          cwd, homeDir: home, confirmGenerationId: preflight.candidate.generationId, _preflight: async () => preflight,
+        }),
+      });
+    } finally {
+      closeLcmConnection();
+      rmSync(home, { recursive: true, force: true });
+    }
+  });
+}
+
+const ALIAS_CONFLICT_REFUSAL = {
+  status: "refuse", reason: "migration-target-identity-unresolvable", evidence: "alias-conflict",
+};
+
+it.each([
+  ["a non-existent path", (home: string) => join(home, "moved-project"), false],
+  ["an existing empty directory", (home: string) => join(home, "empty-alias"), true],
+])(
+  "apply carries a project-map alias (%s) to the copied state and mints exactly the source alias set (#1678)",
+  async (_label, aliasPath, createDirectory) => {
+    await applyWithMapAliases("cli-apply-alias", (home) => [aliasPath(home)], async ({ db, home, canonical, preflight, apply }) => {
+      const result = await apply();
+      expect(result).toEqual({
+        status: "ok", generationId: preflight.candidate.generationId, applied: true, phase: "copied",
+        daemonPresence: presentPresence(),
+      });
+      expect(new MigrationManifestStore({ homeDir: home }).read(preflight.candidate.generationId).phase).toBe("copied");
+      expect(await projectAliasRows(db)).toEqual(aliasRowSet(canonical, aliasPath(home)));
+    }, (home) => { if (createDirectory) mkdirSync(aliasPath(home), { mode: 0o700 }); });
+  },
+  180000,
+);
+
+it(
+  "apply stores an alias under a symlinked parent with its lexical path and its different real path (#1678)",
+  async () => {
+    const lexical = (home: string) => join(home, "link", "moved");
+    await applyWithMapAliases("cli-apply-alias-parent", (home) => [lexical(home)], async ({ db, home, canonical, apply }) => {
+      expect(await apply()).toMatchObject({ status: "ok", phase: "copied" });
+      const rows = await projectAliasRows(db);
+      expect(rows).toEqual(aliasRowSet(canonical, lexical(home)));
+      const stored = rows.find((row) => row.path === lexical(home))!;
+      expect(stored.normalized_path).toBe(join(normalizeProjectPath(home), "real", "moved"));
+      expect(stored.path).not.toBe(stored.normalized_path);
+    }, (home) => {
+      mkdirSync(join(home, "real", "moved"), { recursive: true, mode: 0o700 });
+      symlinkSync(join(home, "real"), join(home, "link"));
+    });
+  },
+  180000,
+);
+
+it(
+  "apply refuses before the hold, writing nothing, when an alias is a symlink to the canonical path (#1678)",
+  async () => {
+    await applyWithMapAliases("cli-apply-alias-collision", (home) => [join(home, "project-link")], async ({ db, home, apply }) => {
+      const result = await apply();
+      expect(result).toMatchObject(ALIAS_CONFLICT_REFUSAL);
+      expect(await projectCounts(db)).toEqual({ projects: "0", aliases: "0" });
+      expect(readBackendMaintenanceJournal(home)).toBeNull();
+    }, (home) => { symlinkSync(join(home, "project"), join(home, "project-link")); });
+  },
+  180000,
+);
+
+describe("apply against a destination project that already exists (#1678)", () => {
+  const moved = (home: string) => join(home, "moved-project");
+  const create = async (db: PostgreSqlTestDatabase, machineId: string, paths: string[]) => {
+    const [first, ...rest] = paths as [string, ...string[]];
+    await new PostgreSqlIdentityRepository(db.runtime).createProject({
+      machineId, displayName: "project", path: first, normalizedPath: normalizeProjectPath(first),
+      aliases: [first, ...rest].map((path) => ({ path, normalizedPath: normalizeProjectPath(path) })),
+    });
+  };
+
+  it("an equal alias set is reused unchanged and the copy completes", async () => {
+    await applyWithMapAliases("cli-apply-alias-equal", (home) => [moved(home)], async ({ db, home, canonical, preflight, apply }) => {
+      await create(db, preflight.machineId, [canonical, moved(home)]);
+      expect(await apply()).toMatchObject({ status: "ok", phase: "copied" });
+      expect(await projectAliasRows(db)).toEqual(aliasRowSet(canonical, moved(home)));
+      expect((await projectCounts(db)).projects).toBe("1");
+    });
+  });
+
+  it("a proper subset (a retry after the canonical alias alone was minted) gains the missing aliases and the copy completes", async () => {
+    await applyWithMapAliases("cli-apply-alias-subset", (home) => [moved(home), join(home, "second")], async ({ db, home, canonical, preflight, apply }) => {
+      await create(db, preflight.machineId, [canonical]);
+      expect(await apply()).toMatchObject({ status: "ok", phase: "copied" });
+      expect(await projectAliasRows(db)).toEqual(aliasRowSet(canonical, moved(home), join(home, "second")));
+      expect((await projectCounts(db)).projects).toBe("1");
+    });
+  });
+
+  it("a foreign extra alias refuses as alias-conflict and inserts nothing", async () => {
+    await applyWithMapAliases("cli-apply-alias-foreign", (home) => [moved(home)], async ({ db, home, canonical, preflight, apply }) => {
+      await create(db, preflight.machineId, [canonical, join(home, "stranger")]);
+      expect(await apply()).toMatchObject(ALIAS_CONFLICT_REFUSAL);
+      expect(await projectAliasRows(db)).toEqual(aliasRowSet(canonical, join(home, "stranger")));
+      expect(readBackendMaintenanceJournal(home)).toBeNull();
+    });
+  });
+
+  it("a map alias already bound to another project refuses as alias-conflict and inserts nothing", async () => {
+    await applyWithMapAliases("cli-apply-alias-owned", (home) => [moved(home)], async ({ db, home, canonical, preflight, apply }) => {
+      await create(db, preflight.machineId, [moved(home)]);
+      expect(await apply()).toMatchObject(ALIAS_CONFLICT_REFUSAL);
+      expect(await projectAliasRows(db)).toEqual(aliasRowSet(moved(home)));
+      expect(canonical).not.toBe(moved(home));
+    });
+  });
+});

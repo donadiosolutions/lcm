@@ -172,6 +172,22 @@ mint under a hold. Run every command on an existing generation from the migrated
 directory: the persisted identity is read from the current directory, so another directory reports
 `local-identity-not-persisted`.
 
+**Project-map aliases migrate with the project.** When the project's map entry lists extra alias
+paths (a moved or symlinked directory, for example), `apply` creates the destination project with
+the canonical path and every one of those aliases, so the copy carries the same alias set the
+source has. If the project already exists in PostgreSQL (a retry after an interrupted `apply`),
+`apply` adds only the missing aliases, in one transaction, and leaves a matching set untouched.
+`apply` refuses with `migration-target-identity-unresolvable` (exit 5) and evidence
+`alias-conflict`, before it takes the hold and without writing any alias, when two of the
+project's paths resolve to the same real path (an alias that is a symlink to the canonical path),
+when an alias is already bound to a different project on this machine, or when the existing
+destination project holds an alias the map does not list. Fix the map (`lcm project link` and
+`lcm project unlink`) or the conflicting destination rows, then run `plan` and `apply` again. A generation
+that an earlier version already held and failed in the copy stays on `resume`, which never
+creates identity; run `abort`, then a fresh `plan` and `apply`, which adds the missing aliases.
+Rollback leaves the destination project and its alias rows in place and keeps the aliases in the
+local map.
+
 `--dry-run` stops immediately after the confirmation fence, before the hold is taken or anything is
 captured. The emitted envelope reports the confirmed candidate with `applied: false`.
 
