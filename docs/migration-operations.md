@@ -554,7 +554,10 @@ existing-set commands read their selector, confirmations and route first and tou
 to run the preparation or the activation. `report`, `verify` and `abort` never open a transfer
 preflight, and `rollback --set` resolves its own runtime connection.
 
-**What `--dry-run` means with `--set`.**
+**What `--dry-run` means with `--set`.** These previews run after the selector, the confirmations and
+the read-only route have been checked, so a missing id, an unconfirmed or moved id, or a state that
+belongs to another command is refused first (and `verify --set` refuses an incomplete preparation
+before it previews).
 
 | Command | `--dry-run` |
 | --- | --- |
@@ -609,9 +612,13 @@ string is reported as `unrecognized` and is never copied into the output.
 | `set-confirmation-missing`, `set-confirmation-moved` | 3 | `--confirm-generation` is absent or is not the aggregate set id. |
 
 **Exit 6.** A service returning a recoverable-looking result is not enough: the command reads the
-durable state again and emits `set-incomplete` only when that state still admits the same service.
-Otherwise the result is exit 4, 5 or 7 according to the closed reason. Success is always read back
-from the member manifests and the aggregate records, never taken from the service result.
+durable state again and emits `set-incomplete` only when that state still admits the same service,
+that is when the journal slot still holds the set's own live hold (not an aborted, empty or foreign
+one) or its own publication carrying the frozen selection. Otherwise the result is exit 2, 4, 5 or 7
+according to the closed reason. Success is always read back from the member manifests and the
+aggregate records, never taken from the service result, and a settled state counts only with the
+frozen selection that produced it. `report --set` exits 5 when a member's manifest, snapshot or
+referenced verification report cannot be read.
 
 **After a set activation.** Do the grant swap and start the daemon exactly as in "The cutover:
 activate and the grant swap": `activate --set` runs entirely under the transfer role, so add the
