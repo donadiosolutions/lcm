@@ -58,6 +58,7 @@ vi.mock("../../src/storage/postgresql/coordination.js", () => ({
 import {
   PostgreSqlPassiveEventDataError,
   PostgreSqlPassiveEventRepository,
+  samePassiveEventPayload,
   type PostgreSqlPassiveEventRecord,
   type PostgreSqlPassiveEventRepositoryExecutor,
 } from "../../src/storage/postgresql/passive-event-repository.js";
@@ -1047,6 +1048,98 @@ describe("PostgreSqlPassiveEventRepository", () => {
         )).rejects.toMatchObject(expectDataError("duplicate_batch_event_id"));
         expect(execution.query).not.toHaveBeenCalled();
       });
+    });
+  });
+
+  describe("an inbox row copied by the migration (#1693)", () => {
+    const COPIED_PAYLOAD = {
+      sessionId: "session",
+      sessionSequence: 1,
+      category: "decision",
+      data: "SQLite",
+      priority: 1,
+      sourceHook: "PostToolUse",
+      createdAt: "2026-10-24T10:24:01.000000Z",
+    };
+    const UPLOAD_PAYLOAD = {
+      ...COPIED_PAYLOAD,
+      previousEventId: null,
+      createdAt: "2026-10-24 10:24:01",
+    };
+    const input = (payload: Record<string, unknown>) => ({
+      machineId: MACHINE_ID,
+      eventId: EVENT_ID,
+      eventVersion: 1,
+      machineSequence: 9_223_372_036_854_775_807n,
+      eventType: "choice",
+      payload,
+    });
+    const stored = (payload: Record<string, unknown>) => eventRow({ payload });
+    const insertWith = (payload: Record<string, unknown>) => repository(async (config) =>
+      config.text.includes("INSERT INTO") ? queryResult([], 0) : queryResult([stored(payload)]));
+
+    it.each([
+      ["a null previous event id", UPLOAD_PAYLOAD],
+      ["a set previous event id", { ...UPLOAD_PAYLOAD, previousEventId: 12 }],
+      ["a fractional SQLite-equivalent instant", { ...UPLOAD_PAYLOAD, createdAt: "2026-10-24 10:24:01.000000" }],
+    ])("is the same event as the upload with %s", async (_label, upload) => {
+      const { repository: subject } = insertWith(COPIED_PAYLOAD);
+      const records = await subject.insertEvents([input(upload)]);
+      expect(records).toHaveLength(1);
+      expect(records[0].payload).toEqual(COPIED_PAYLOAD);
+    });
+
+    it.each([
+      ["data", { ...UPLOAD_PAYLOAD, data: "other" }],
+      ["category", { ...UPLOAD_PAYLOAD, category: "other" }],
+      ["priority", { ...UPLOAD_PAYLOAD, priority: 2 }],
+      ["session sequence", { ...UPLOAD_PAYLOAD, sessionSequence: 2 }],
+      ["instant", { ...UPLOAD_PAYLOAD, createdAt: "2026-10-24 10:24:02" }],
+      ["extra key", { ...UPLOAD_PAYLOAD, unexpected: true }],
+    ])("still collides when the upload's %s differs", async (_label, upload) => {
+      const { repository: subject } = insertWith(COPIED_PAYLOAD);
+      await expect(subject.insertEvents([input(upload)]))
+        .rejects.toMatchObject(expectDataError("idempotency_collision"));
+    });
+
+    it("still collides when both sides carry a different previous event id", async () => {
+      const { repository: subject } = insertWith({ ...UPLOAD_PAYLOAD, previousEventId: 3 });
+      await expect(subject.insertEvents([input({ ...UPLOAD_PAYLOAD, previousEventId: 12 })]))
+        .rejects.toMatchObject(expectDataError("idempotency_collision"));
+    });
+
+    it.each([
+      ["zero-padded and fractional forms of one instant", "2026-10-24T10:24:01.5Z", "2026-10-24 10:24:01.500000", true],
+      ["a sub-second difference", "2026-10-24T10:24:01.5Z", "2026-10-24 10:24:01.6", false],
+      ["a non-timestamp string, compared raw", "yesterday", "yesterday", true],
+      ["a non-timestamp string against an instant", "yesterday", "2026-10-24 10:24:01", false],
+      ["a non-string value, compared raw", 5, 5, true],
+      ["a non-string value against an instant", 5, "2026-10-24 10:24:01", false],
+    ])("compares createdAt by instant: %s", (_label, left, right, expected) => {
+      expect(samePassiveEventPayload({ createdAt: left }, { createdAt: right })).toBe(expected);
+    });
+
+    it("ignores previousEventId only when exactly one side lacks it", () => {
+      expect(samePassiveEventPayload({ data: "x", previousEventId: 3 }, { data: "x" })).toBe(true);
+      expect(samePassiveEventPayload({ data: "x" }, { data: "x", previousEventId: 3 })).toBe(true);
+      expect(samePassiveEventPayload({ data: "x", previousEventId: 3 }, { data: "x", previousEventId: 3 })).toBe(true);
+      expect(samePassiveEventPayload({ data: "x", previousEventId: null }, { data: "x", previousEventId: 3 })).toBe(false);
+      expect(samePassiveEventPayload({ previousEventId: 3 }, { data: "x" })).toBe(false);
+      expect(samePassiveEventPayload({ data: "x" }, { data: "x", other: 1 })).toBe(false);
+    });
+
+    it("recognizes the upload form of a copy held by another project", async () => {
+      const OTHER = "0195d250-0000-7000-8000-000000000009";
+      const { repository: subject } = repository(async (config) => {
+        if (config.text.includes("FOR UPDATE")) {
+          return queryResult([{ ...stored(COPIED_PAYLOAD), project_id: OTHER, claim_stale: false }]);
+        }
+        return queryResult([{ inbox_id: "41" }]);
+      });
+      await expect(subject.releaseFromOtherProjects(
+        [{ ...input(UPLOAD_PAYLOAD), inboxId: 41n }],
+        { staleClaimMs: 1_000 },
+      )).resolves.toEqual([{ eventId: EVENT_ID, outcome: "released" }]);
     });
   });
 });
