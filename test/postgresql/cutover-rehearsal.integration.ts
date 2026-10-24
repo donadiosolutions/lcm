@@ -4,15 +4,21 @@ import { join } from "node:path";
 import { afterAll, beforeAll, expect, it } from "vitest";
 import { assertHarnessReady, withPostgreSqlTestDatabase } from "./harness.js";
 import { validateEvidence } from "./cutover-rehearsal/check-evidence.js";
+import { captureProvenance, type Provenance } from "./cutover-rehearsal/provenance.js";
+import { scenarioProblems } from "./cutover-rehearsal/semantics.js";
 import { appendLocalHookEvents } from "../../src/hooks/local-enqueue.js";
 import { projectMapPath } from "../../src/project-map.js";
+import { readBackendPublicationJournal } from "../../src/storage/backend-publication.js";
 import {
-  RehearsalCase, addProject, readAuthority, type RehearsalHome, acknowledgeEvents, assertEventsJoined, inboxRows, recordRepresented, applyWithResponseLoss, competingLease, competingPublicationFence, staleTokenRefused, interruptActivation, type ActivationInterruption, interruptRollback, prepareGuardedWriter, type RollbackInterruption, targetConfigFor, memberGenerations, withProject, assertAllOrNoneBound, interruptSetActivation, interruptSetRollback, interruptSetPrepare, destinationProjectId, capturePartialSnapshot, expireCopyLease, killWorkerAtSeam, envelopeHash, readEventRows, activeProfile, adminSql, assertLedgerRetained, createHome, damageSnapshot, enrollProject, guardedWrite, loadManifest,
+  RehearsalCase, OWNED_CHILDREN, DaemonExitedBeforeReady, roleHasNoPrivileges, addProject, readAuthority, type RehearsalHome, acknowledgeEvents, assertEventsJoined, inboxRows, recordRepresented, applyWithResponseLoss, competingLease, competingPublicationFence, staleTokenRefused, interruptActivation, type ActivationInterruption, interruptRollback, prepareGuardedWriter, type RollbackInterruption, targetConfigFor, memberGenerations, withProject, assertAllOrNoneBound, interruptSetActivation, interruptSetRollback, interruptSetPrepare, destinationProjectId, capturePartialSnapshot, expireCopyLease, killWorkerAtSeam, readEventRows, activeProfile, adminSql, assertLedgerRetained, awaitDelivery, acknowledgeHeldGap, ledgerEntryOf, recordInstructionLedger, assertWritesRestored, assertNativeAllocationSafe, createHome, damageSnapshot, enrollProject, guardedWrite, loadManifest,
   postgresDomainDigests, provisionRole, seedNative, sha256, sqliteDomainDigests, swapGrants, unusedPort,
   withHome, writeEvidence, type DomainDigests, type ScenarioSpec,
 } from "./cutover-rehearsal/fixture.js";
 
-beforeAll(assertHarnessReady, 120_000);
+beforeAll(async () => {
+  await assertHarnessReady();
+  provenanceStart = tryCaptureProvenance();
+}, 120_000);
 
 const { manifest, sha256: manifestSha256 } = loadManifest();
 const profile = activeProfile();
@@ -21,6 +27,13 @@ const pending = manifest.scenarios.filter((spec) => spec.gate?.status === "pendi
 const selected = manifest.scenarios.filter((spec) => spec.gate === undefined && spec.profiles.includes(profile) && (only === undefined || only.includes(spec.id)));
 const results: Record<string, unknown>[] = [];
 let database: { serverVersion: string; serverVersionNum: string } | null = null;
+const homeRoots: string[] = [];
+
+/** The tested commit and input/artifact digests bound at execution time; null where git is unavailable. */
+function tryCaptureProvenance(): Provenance | null {
+  try { return captureProvenance(process.cwd()); } catch { return null; }
+}
+let provenanceStart: Provenance | null = null;
 
 const projectDb = (c: RehearsalCase): string => join(c.h.projectDir, "db.sqlite");
 
@@ -51,6 +64,7 @@ async function rollbackTail(c: RehearsalCase, expected: DomainDigests): Promise<
   c.authority("rolled-back");
   c.sealCheck("after-rollback");
   c.compareDomains("sqlite-after-rollback", expected, sqliteDomainDigests(projectDb(c)));
+  assertWritesRestored(c, projectDb(c), "after-rollback");
   await c.step("report-rolled-back");
   await c.step("rollback-repeat");
 }
@@ -93,6 +107,7 @@ const roundTrip = (options: { readonly write: boolean; readonly apply?: string }
     if (expected.conversations!.count !== baseline.conversations!.count + 1) throw new Error("guarded write did not land");
   }
   await rollbackTail(c, expected);
+  if (options.write) assertNativeAllocationSafe(c, projectDb(c));
 };
 
 /** Destroy a stage's outcome before it can be activated, then prove the source survives the abort. */
@@ -117,7 +132,7 @@ const damagedSnapshot = (how: "tamper" | "replace"): Handler => async (c) => {
  * Represented and retained pending receipt-era events through activation, the PostgreSQL daemon and a rollback.
  * With drain the daemon delivers once before the rollback (gated on the rollback-after-drain Bug).
  */
-const eventsThroughRollback = (options: { readonly drain: boolean }): Handler => async (c) => {
+const eventsThroughRollback = (options: { readonly drain: boolean; readonly deliver: boolean }): Handler => async (c) => {
   const baseline = sqliteDomainDigests(projectDb(c));
   await acknowledgeEvents(c, "f6", ["f6-represented-applied", "f6-represented-noeffect", "f6-pending"]);
   recordRepresented(c, ["f6-represented-applied", "f6-represented-noeffect"]);
@@ -134,10 +149,15 @@ const eventsThroughRollback = (options: { readonly drain: boolean }): Handler =>
   c.compareDomains("postgresql-after-activate", baseline, await postgresDomainDigests(c.db, c.h.cwd));
   await swapGrants(c.db, c.role, "runtime");
   if (options.drain) {
+    // Inputs that exist when the one bounded drain is requested must reach PostgreSQL; the later input only has to be retained.
+    const eligible = c.ledger.map((entry) => entry.data).filter((name) => !name.startsWith("f6-represented"));
     await c.daemon(async (daemon) => {
-      await c.promote(daemon, "events-promote");
-      await acknowledgeEvents(c, "f6-post", ["f6-post-pending"]);
+      const drained = await c.promote(daemon, "events-promote");
+      if (drained.errors !== 0) throw new Error("the drain reported errors: " + JSON.stringify(drained));
+      if (options.deliver) await awaitDelivery(c, daemon, eligible);
     });
+    await assertEventsJoined(c, "after-drain", options.deliver ? eligible : []);
+    await acknowledgeEvents(c, "f6-post", ["f6-post-pending"]);
   } else {
     // No daemon runs before the rollback: its start-up sweep would deliver retained events asynchronously (#1681).
     await acknowledgeEvents(c, "f6-post", ["f6-post-pending"]);
@@ -145,7 +165,8 @@ const eventsThroughRollback = (options: { readonly drain: boolean }): Handler =>
   await assertEventsJoined(c, "after-cutover");
   const represented = new Set(readEventRows(c.h).filter((row) => row.data.startsWith("f6-represented")).map((row) => row.event_uuid));
   // Represented events crossed as exactly one already-applied remote disposition each; nothing re-pended or replayed them.
-  const representedRows = (await inboxRows(c.db)).filter((row) => represented.has(row.event_id));
+  const machineId = c.ledger[0]!.machineId;
+  const representedRows = (await inboxRows(c.db)).filter((row) => row.machine_id === machineId && represented.has(row.event_id));
   if (representedRows.length !== represented.size || representedRows.some((row) => row.status !== "applied")) {
     throw new Error("represented events are not exactly one applied remote disposition each: " + JSON.stringify(representedRows.map((row) => row.status)));
   }
@@ -173,6 +194,7 @@ const interruptedRollback = (interruption: RollbackInterruption): Handler => asy
   c.authority("rolled-back");
   c.sealCheck("after-rollback");
   c.compareDomains("sqlite-after-rollback", expected, sqliteDomainDigests(projectDb(c)));
+  assertWritesRestored(c, projectDb(c), "after-rollback");
   await c.step("report-rolled-back");
   await c.step("rollback-repeat");
 };
@@ -209,7 +231,7 @@ async function prepareSet(c: RehearsalCase): Promise<string[]> {
 const setRoundTrip: Handler = async (c) => {
   const base = setBaselines(c);
   await acknowledgeEvents(c, "s1", ["s1-pending-a"]);
-  await prepareSet(c);
+  const members = await prepareSet(c);
   await c.step("set-resume-dry-run");
   await c.step("set-activate-dry-run");
   await c.step("set-activate");
@@ -221,15 +243,18 @@ const setRoundTrip: Handler = async (c) => {
   assertLedgerRetained(c, "after-activate");
   await swapGrants(c.db, c.role, "runtime");
   await c.step("set-report-active");
-  await withProject(c, secondOf(c), () => guardedWrite(c, "s1-post-write-b"));
-  const written = await setPostgres(c);
-  if (written.b.conversations!.count !== base.b.conversations!.count + 1) throw new Error("the member B write did not land");
   await c.step("set-rollback-dry-run");
-  await c.step("set-rollback");
+  const rolledBack = (await c.step("set-rollback")).envelope.evidence as Record<string, unknown>;
   c.authority("rolled-back");
+  // Two new physical generations (neither is an original member) under the one reverse publication.
+  const installed = [rolledBack["member.0.installedGenerationId"], rolledBack["member.1.installedGenerationId"]];
+  if (new Set(installed).size !== 2 || installed.some((id) => typeof id !== "string" || members.includes(id))) throw new Error("the rollback did not install two new generations");
+  if (readBackendPublicationJournal(c.h.home)?.publicationId !== rolledBack.rollbackSetId || rolledBack.publicationId !== rolledBack.rollbackSetId) throw new Error("the members were not rolled back under one reverse publication");
+  c.mark("I1", "one-reverse-publication");
   c.sealCheck("after-rollback");
-  c.compareDomains("sqlite-a-after-rollback", written.a, sqliteDomainDigests(projectDb(c)));
-  c.compareDomains("sqlite-b-after-rollback", written.b, sqliteDomainDigests(projectDbOf(secondOf(c))));
+  // No write followed the activation: both members come back as their exact pre-activation states.
+  c.compareDomains("sqlite-a-after-rollback", base.a, sqliteDomainDigests(projectDb(c)));
+  c.compareDomains("sqlite-b-after-rollback", base.b, sqliteDomainDigests(projectDbOf(secondOf(c))));
   assertLedgerRetained(c, "after-rollback");
   await c.step("set-report-rolled-back");
   await c.step("set-rollback-repeat");
@@ -311,6 +336,7 @@ const setInterruptionChain: Handler = async (c) => {
   c.sealCheck("after-rollback");
   c.compareDomains("sqlite-a-after-rollback", written.a, sqliteDomainDigests(projectDb(c)));
   c.compareDomains("sqlite-b-after-rollback", written.b, sqliteDomainDigests(projectDbOf(secondOf(c))));
+  assertWritesRestored(c, projectDbOf(secondOf(c)), "after-rollback");
   assertLedgerRetained(c, "after-rollback");
   await c.step("set-report-rolled-back");
   await c.step("set-rollback-repeat");
@@ -359,10 +385,44 @@ const setRollbackInstallFailure: Handler = async (c) => {
   await c.step("set-report-rollback-blocked");
   await c.step("set-rollback");
   c.authority("rolled-back");
+  c.sealCheck("after-rollback");
   c.compareDomains("sqlite-a-after-rollback", written.a, sqliteDomainDigests(projectDb(c)));
   c.compareDomains("sqlite-b-after-rollback", written.b, sqliteDomainDigests(projectDbOf(secondOf(c))));
+  assertWritesRestored(c, projectDbOf(secondOf(c)), "after-rollback");
   assertLedgerRetained(c, "after-rollback");
   await c.step("set-report-rolled-back");
+};
+
+/** Events around the hold. With deliver, the drained inputs must also reach PostgreSQL through the daemon's replication (pending on #1693). */
+const eventsAroundHold = (options: { readonly deliver: boolean }): Handler => async (c) => {
+  const baseline = sqliteDomainDigests(projectDb(c));
+  await acknowledgeEvents(c, "f5-pre", ["f5-pre-1", "f5-pre-2"]);
+  const plan = await c.step("plan");
+  c.vars.gen = plan.envelope.generation as string;
+  await c.step("apply");
+  c.authority("held");
+  c.sealBaseline();
+  // The held gap: the local durable enqueue is open during the hold. The only allowed refusal is the closed
+  // LocalHookDurabilityTimeoutError (nothing acknowledged); any other failure, including a ledger readback error, fails the row.
+  const gap = await acknowledgeHeldGap(c, "f5-gap", ["f5-gap-1"]);
+  c.mark("I3", "hold-gap-append:" + gap);
+  await c.step("verify");
+  assertLedgerRetained(c, "after-verify");
+  await c.step("activate");
+  c.authority("activated");
+  c.sealCheck("after-activate");
+  assertLedgerRetained(c, "after-activate");
+  c.compareDomains("postgresql-after-activate", baseline, await postgresDomainDigests(c.db, c.h.cwd));
+  await swapGrants(c.db, c.role, "runtime");
+  await acknowledgeEvents(c, "f5-post", ["f5-post-1"]);
+  const eligible = c.ledger.map((entry) => entry.data);
+  await c.daemon(async (daemon) => {
+    // One bounded awaited drain request; the daemon's own sweep may already have delivered some inputs.
+    const drained = await c.promote(daemon, "events-promote");
+    if (drained.errors !== 0) throw new Error("the drain reported errors: " + JSON.stringify(drained));
+    if (options.deliver) await awaitDelivery(c, daemon, eligible);
+  });
+  await assertEventsJoined(c, "after-drain", options.deliver ? eligible : []);
 };
 
 const handlers: Record<string, Handler> = {
@@ -379,10 +439,11 @@ const handlers: Record<string, Handler> = {
     const sourceBefore = sha256(await import("node:fs").then((fs) => fs.readFileSync(projectDb(c))));
     await c.daemon(async (daemon) => {
       if ((daemon.health as { storageBackend?: string }).storageBackend !== "postgresql") throw new Error("daemon started on the wrong backend");
-      c.authority("daemon-running");
       await c.step("report-daemon");
       c.mark("I1", "daemon-health:postgresql");
     });
+    // Consumer admission is read once the daemon has stopped: its start-up sweep holds the publication lock for a moment.
+    c.authority("after-daemon");
     const sourceAfter = sha256(await import("node:fs").then((fs) => fs.readFileSync(projectDb(c))));
     if (sourceBefore !== sourceAfter) throw new Error("the daemon wrote the SQLite project database");
     c.sealCheck("after-daemon");
@@ -475,7 +536,8 @@ const handlers: Record<string, Handler> = {
   },
   "F10": async (c) => {
     const baseline = sqliteDomainDigests(projectDb(c));
-    const sqliteEnv = Object.fromEntries(Object.entries(c.h.env).filter(([name]) => !name.startsWith("LCM_POSTGRES_")));
+    // The stale daemon was started from the same operator environment (PostgreSQL variables included) while the config still selected SQLite.
+    const sqliteEnv = c.h.env;
     const sourceBefore = sha256(readFileSync(projectDb(c)));
     await c.daemon(async (daemon) => {
       if ((daemon.health as { storageBackend?: string }).storageBackend !== "sqlite") throw new Error("the old daemon did not start on SQLite");
@@ -492,45 +554,27 @@ const handlers: Record<string, Handler> = {
     c.sealCheck("after-old-daemon-stop");
     c.compareDomains("postgresql-after-activate", baseline, await postgresDomainDigests(c.db, c.h.cwd));
     await swapGrants(c.db, c.role, "runtime");
+    // A hook input acknowledged after the old daemon stopped is retained by the sidecar and, once the restarted daemon
+    // answers one bounded drain, reaches PostgreSQL exactly once: the restarted daemon's sidecar target is PostgreSQL.
+    await acknowledgeEvents(c, "f10-post", ["f10-post-1"]);
     await c.daemon(async (daemon) => {
       if ((daemon.health as { storageBackend?: string }).storageBackend !== "postgresql") throw new Error("the restarted daemon did not start on PostgreSQL");
       await c.step("report-active");
       c.mark("I1", "restarted-daemon-health:postgresql");
+      const drained = await c.promote(daemon, "events-promote");
+      if (drained.errors !== 0) throw new Error("the drain reported errors: " + JSON.stringify(drained));
+      await awaitDelivery(c, daemon, ["f10-post-1"]);
     });
+    await assertEventsJoined(c, "after-restart-drain", ["f10-post-1"]);
     // Neither daemon wrote the SQLite project database after the cutover.
     if (sha256(readFileSync(projectDb(c))) !== sourceBefore) throw new Error("a daemon wrote the SQLite project database");
     c.mark("I2", "sqlite-project-database-unchanged");
   },
-  "F5": async (c) => {
-    const baseline = sqliteDomainDigests(projectDb(c));
-    await acknowledgeEvents(c, "f5-pre", ["f5-pre-1", "f5-pre-2"]);
-    const plan = await c.step("plan");
-    c.vars.gen = plan.envelope.generation as string;
-    await c.step("apply");
-    c.authority("held");
-    c.sealBaseline();
-    // The held gap: a hook append is either refused (no acknowledgement, nothing to lose) or retained above the sealed cutoff.
-    let gap: "accepted" | "refused" = "accepted";
-    try { await acknowledgeEvents(c, "f5-gap", ["f5-gap-1"]); } catch { gap = "refused"; }
-    c.mark("I3", "hold-gap-append:" + gap);
-    await c.step("verify");
-    assertLedgerRetained(c, "after-verify");
-    await c.step("activate");
-    c.authority("activated");
-    c.sealCheck("after-activate");
-    assertLedgerRetained(c, "after-activate");
-    c.compareDomains("postgresql-after-activate", baseline, await postgresDomainDigests(c.db, c.h.cwd));
-    await swapGrants(c.db, c.role, "runtime");
-    await c.daemon(async (daemon) => {
-      await acknowledgeEvents(c, "f5-post", ["f5-post-1"]);
-      // One bounded awaited drain request, twice; no sleeps and no retry loop.
-      await c.promote(daemon, "events-promote");
-      await c.promote(daemon, "events-promote-again");
-    });
-    await assertEventsJoined(c, "after-drain");
-  },
-  "F6": eventsThroughRollback({ drain: false }),
-  "F6b": eventsThroughRollback({ drain: true }),
+  "F5": eventsAroundHold({ deliver: false }),
+  "F5-delivery": eventsAroundHold({ deliver: true }),
+  "F6": eventsThroughRollback({ drain: false, deliver: false }),
+  "F6b": eventsThroughRollback({ drain: true, deliver: false }),
+  "F6b-delivery": eventsThroughRollback({ drain: true, deliver: true }),
   "R6a": interruptedRollback({ kind: "after-install-sync" }),
   "R6b": interruptedRollback({ kind: "publication-phase", phase: "map-published" }),
   "R5": async (c) => {
@@ -551,6 +595,7 @@ const handlers: Record<string, Handler> = {
     assertLedgerRetained(c, "after-rollback");
     c.sealCheck("after-rollback");
     c.compareDomains("sqlite-after-rollback", expected, sqliteDomainDigests(projectDb(c)));
+    assertWritesRestored(c, projectDb(c), "after-rollback");
     await c.step("report-rolled-back");
     const rows = readEventRows(c.h);
     const acknowledged = rows.filter((row) => row.delivery_state === "acknowledged").length;
@@ -574,6 +619,9 @@ const handlers: Record<string, Handler> = {
     c.sealCheck("after-rollback");
     const restored = sqliteDomainDigests(projectDb(c));
     if (restored.conversations!.count !== baseline.conversations!.count + 1) throw new Error("the write before the fence was not carried by the rollback");
+    // Exact content, not just the count: the restored SQLite equals the destination that carried the write.
+    c.compareDomains("sqlite-after-rollback", await postgresDomainDigests(c.db, c.h.cwd), restored);
+    assertWritesRestored(c, projectDb(c), "after-rollback");
     c.mark("I4", "write-before-fence-carried");
     await c.step("report-rolled-back");
     await c.step("rollback-repeat");
@@ -737,23 +785,30 @@ handlersMore["I5"] = async (c) => {
   await forward(c, baseline);
   const sourceBefore = sha256(readFileSync(projectDb(c)));
   const databasesBefore = readdirSync(join(c.h.home, ".lcm", "projects")).sort();
-  // Only this row's owned role loses its permission: the selected PostgreSQL becomes unreachable for the operator.
+  // Only this row's owned role loses its permission: the selected PostgreSQL becomes unusable for the operator.
   await swapGrants(c.db, c.role, "none");
-  c.injections.push({ surface: "module-seam", boundary: "owned role permission revoked after selection", kind: "unreachable-target", hitCount: 1 });
-  await c.step("report-unreachable");
-  let daemonOutcome = "started";
   try {
-    await c.daemon(async (daemon) => { daemonOutcome = "healthy:" + String((daemon.health as { storageBackend?: string }).storageBackend); });
-  } catch (error) {
-    daemonOutcome = "refused:" + (error instanceof Error ? error.message.slice(0, 40) : "unknown");
+    c.injections.push({ surface: "module-seam", boundary: "owned role permission revoked after selection", kind: "unreachable-target", hitCount: 1 });
+    if (!await roleHasNoPrivileges(c.db, c.role)) throw new Error("the owned role still holds privileges on the selected schema");
+    await c.step("report-unreachable");
+    // The daemon must refuse to start by exiting on its own. A timeout, a disclosure, a surviving process group or a
+    // listening port still fails the row (they throw from the daemon harness); a healthy daemon fails it here.
+    let refusal: string | null = null;
+    try {
+      await c.daemon(async () => { throw new Error("the daemon became healthy against a target it cannot use"); });
+    } catch (error) {
+      if (!(error instanceof DaemonExitedBeforeReady) || error.exitCode === null || error.exitCode === 0) throw error;
+      refusal = "daemon-exited-before-ready:" + String(error.exitCode) + ":role-privileges-none";
+    }
+    if (refusal === null) throw new Error("no start refusal was observed");
+    c.note("daemon-start-unreachable", "cli", [refusal]);
+    c.authority("activated");
+    if (sha256(readFileSync(projectDb(c))) !== sourceBefore) throw new Error("a canonical write reached the SQLite project database");
+    if (JSON.stringify(readdirSync(join(c.h.home, ".lcm", "projects")).sort()) !== JSON.stringify(databasesBefore)) throw new Error("a new project database appeared");
+    c.mark("I5", "explicit-start-refusal-no-sqlite-fallback:" + refusal);
+  } finally {
+    await swapGrants(c.db, c.role, "runtime");
   }
-  c.note("daemon-start-unreachable", "cli", [daemonOutcome]);
-  if (!daemonOutcome.startsWith("refused:")) throw new Error("the daemon did not refuse an unreachable selected PostgreSQL: " + daemonOutcome);
-  c.authority("activated");
-  if (sha256(readFileSync(projectDb(c))) !== sourceBefore) throw new Error("a canonical write reached the SQLite project database");
-  if (JSON.stringify(readdirSync(join(c.h.home, ".lcm", "projects")).sort()) !== JSON.stringify(databasesBefore)) throw new Error("a new project database appeared");
-  c.mark("I5", "explicit-failure-no-sqlite-fallback:" + daemonOutcome);
-  await swapGrants(c.db, c.role, "runtime");
   await c.step("report-active-restored");
 };
 Object.assign(handlers, handlersMore);
@@ -769,7 +824,7 @@ async function prepare(c: RehearsalCase): Promise<void> {
     }));
     const events = new DatabaseSync(join(c.h.home, ".lcm", "events", c.h.localProjectId + ".db"));
     try { events.exec("UPDATE events SET processed_at = datetime('now') WHERE data = 'legacy-processed'"); } finally { events.close(); }
-    c.ledger.push(...readEventRows(c.h).map((row) => ({ eventUuid: row.event_uuid, machineSequence: row.machine_sequence, envelopeSha256: envelopeHash(row) })));
+    c.ledger.push(...readEventRows(c.h).map((row) => ledgerEntryOf(c.h, row)));
   }
   if (fixture === "A") {
     const aliases = Array.from({ length: manifest.workload.bounds.aliasFixture.aliasPathsPerProject }, (_unused, index) => join(c.h.root, "alias", "worktree-" + String(index).padStart(3, "0")));
@@ -798,37 +853,52 @@ async function prepare(c: RehearsalCase): Promise<void> {
     case "E0": break;
     default: throw new Error("unknown fixture " + fixture);
   }
+  if (fixture !== "E" && fixture !== "E0") recordInstructionLedger(c);
 }
 
+/** Time kept back from a row's Vitest timeout so cancellation and cleanup finish before the row is abandoned. */
+const CLEANUP_MARGIN_MS = 60_000;
+
 async function runScenario(spec: ScenarioSpec, index: number): Promise<void> {
-  await withPostgreSqlTestDatabase("rh" + String(index), async (db) => {
-    const role = await provisionRole(db);
-    if (database === null) {
-      const observed = await adminSql(db, "SELECT version() AS version, current_setting('server_version_num') AS number");
-      database = { serverVersion: String(observed[0]!.version), serverVersionNum: String(observed[0]!.number) };
-    }
-    const port = await unusedPort();
-    const h = createHome(spec.id, role, port);
-    const c = new RehearsalCase(spec, manifest, db, role, h);
-    c.daemonPort = port;
-    let failure: string | undefined;
-    try {
-      await prepare(c);
-      const handler = handlers[spec.id];
-      if (handler === undefined) throw new Error("no handler for manifest row " + spec.id);
-      await handler(c);
-      c.mark("I5", "disclosure-scan:" + String(c.steps.length));
-    } catch (error) {
-      failure = error instanceof Error ? error.message : String(error);
-      throw error;
-    } finally {
-      await c.cleanup();
-      const failed = failure !== undefined || Object.values(c.invariants).some((entry) => entry.status === "fail");
-      const record = c.record(failed ? "fail" : spec.knownLimits.length > 0 ? "pass-with-documented-limits" : "pass", failure);
-      results.push(record);
-      writeEvidence("scenarios/" + spec.id + ".json", record);
-    }
-  });
+  const budget = new AbortController();
+  const timer = setTimeout(() => budget.abort(new Error("scenario execution budget spent: " + spec.id)), Math.max(1_000, spec.timeoutMs - CLEANUP_MARGIN_MS));
+  try {
+    await withPostgreSqlTestDatabase("rh" + String(index), async (db) => {
+      const role = await provisionRole(db);
+      if (database === null) {
+        const observed = await adminSql(db, "SELECT version() AS version, current_setting('server_version_num') AS number");
+        database = { serverVersion: String(observed[0]!.version), serverVersionNum: String(observed[0]!.number) };
+      }
+      const port = await unusedPort();
+      const h = createHome(spec.id, role, port);
+      const c = new RehearsalCase(spec, manifest, db, role, h);
+      c.daemonPort = port;
+      c.signal = budget.signal;
+      let failure: string | undefined;
+      let problems: string[] = [];
+      try {
+        await prepare(c);
+        const handler = handlers[spec.id];
+        if (handler === undefined) throw new Error("no handler for manifest row " + spec.id);
+        await handler(c);
+        c.mark("I5", "disclosure-scan:" + String(c.steps.length));
+      } catch (error) {
+        failure = error instanceof Error ? error.message : String(error);
+        throw error;
+      } finally {
+        // Evidence is finalized once, after cleanup, and survives a failure or a cleanup problem.
+        try { await c.cleanup(); } catch (error) { c.cleanupProblems.push("cleanup threw: " + (error instanceof Error ? error.name : "error")); }
+        const final = c.record(failure);
+        problems = final.problems;
+        homeRoots.push(...c.homeRoots);
+        results.push(final.record);
+        writeEvidence("scenarios/" + spec.id + ".json", final.record);
+      }
+      if (problems.length > 0) throw new Error("required invariants did not pass for " + spec.id + ": " + problems.join("; "));
+    });
+  } finally {
+    clearTimeout(timer);
+  }
 }
 
 selected.forEach((spec, index) => {
@@ -838,16 +908,30 @@ selected.forEach((spec, index) => {
 afterAll(() => {
   const missing = selected.filter((spec) => !results.some((record) => record.id === spec.id)).map((spec) => spec.id);
   const allHomesAbsent = results.length > 0 && results.every((record) => (record.invariants as Record<string, { status: string }>).I6?.status === "pass");
+  const finished = tryCaptureProvenance();
+  const expectedRows = manifest.scenarios.filter((spec) => spec.gate === undefined && spec.profiles.includes(profile)).map((spec) => spec.id);
+  const unchanged = provenanceStart !== null && finished !== null
+    && provenanceStart.testedInputsSha256 === finished.testedInputsSha256 && provenanceStart.cliSha256 === finished.cliSha256 && provenanceStart.testedCommit === finished.testedCommit;
   const aggregate = {
-    schemaVersion: 1, manifestSha256, profile, workers: 1, selection: selected.map((spec) => spec.id), pending, missing,
+    schemaVersion: 1, manifestSha256, profile, workers: 1, focused: only !== undefined,
+    runtime: process.env.LCM_TEST_CONTAINER_CLI ?? null, runId: process.env.LCM_TEST_POSTGRES_RUN_ID ?? null,
+    expectedRows, selection: selected.map((spec) => spec.id), pending, missing,
     ...(database === null ? {} : { database }),
+    provenance: provenanceStart === null ? null : { ...provenanceStart, unchangedAfterRun: unchanged },
+    ownedProcesses: [...OWNED_CHILDREN], homeRoots,
     scenarios: results, cleanup: { scenarioHomes: allHomesAbsent ? "verified-absent" : "incomplete", harnessResources: "pending-outer-audit" }, verdict: "incomplete",
   };
   writeEvidence("rehearsal.json", aggregate);
-  // The serialized record must conform to the committed schema (the supported subset check), and every selected manifest row must be present.
+  // The serialized record must conform to the committed schema (the supported subset check).
   const schema = JSON.parse(readFileSync(join(process.cwd(), "test/postgresql/cutover-rehearsal/evidence-schema.json"), "utf8")) as Record<string, unknown>;
-  const readBack = JSON.parse(JSON.stringify(aggregate)) as unknown;
-  expect(validateEvidence(schema, readBack, "#/$defs/rehearsal")).toEqual([]);
-  expect(selected.map((spec) => spec.id).sort()).toEqual(manifest.scenarios.filter((spec) => spec.gate === undefined && spec.profiles.includes(profile) && (only === undefined || only.includes(spec.id))).map((spec) => spec.id).sort());
+  expect(validateEvidence(schema, JSON.parse(JSON.stringify(aggregate)) as unknown, "#/$defs/rehearsal")).toEqual([]);
+  // Membership is judged against the checked-in manifest, never against the (possibly filtered) selection.
+  expect(new Set(results.map((record) => record.id)).size).toBe(results.length);
+  if (only === undefined) expect([...results.map((record) => record.id as string)].sort()).toEqual([...expectedRows].sort());
+  else expect(selected.every((spec) => expectedRows.includes(spec.id))).toBe(true);
+  const semantic = results.flatMap((record) => scenarioProblems(record as unknown as Parameters<typeof scenarioProblems>[0], manifest.scenarios.find((spec) => spec.id === record.id) as unknown as Parameters<typeof scenarioProblems>[1]));
+  expect(semantic).toEqual([]);
+  if (provenanceStart !== null) expect(unchanged).toBe(true);
+  if (profile === "full" && only === undefined) expect(provenanceStart).not.toBeNull();
   expect(missing).toEqual([]);
 });

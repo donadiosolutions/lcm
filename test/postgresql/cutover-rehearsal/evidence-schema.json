@@ -138,6 +138,7 @@
       "required": [
         "checkpoint",
         "lastCommittedBackend",
+        "journalIdentitySha256",
         "consumerAdmission",
         "witnesses"
       ],
@@ -151,6 +152,13 @@
             "sqlite",
             "postgresql"
           ]
+        },
+        "journalIdentitySha256": {
+          "type": [
+            "string",
+            "null"
+          ],
+          "pattern": "^[0-9a-f]{64}$"
         },
         "consumerAdmission": {
           "enum": [
@@ -432,9 +440,16 @@
         "manifestSha256",
         "profile",
         "workers",
+        "focused",
+        "runtime",
+        "runId",
+        "expectedRows",
         "selection",
         "pending",
         "missing",
+        "provenance",
+        "ownedProcesses",
+        "homeRoots",
         "scenarios",
         "cleanup",
         "verdict"
@@ -455,6 +470,31 @@
         },
         "workers": {
           "const": 1
+        },
+        "focused": {
+          "type": "boolean"
+        },
+        "runtime": {
+          "type": [
+            "string",
+            "null"
+          ],
+          "maxLength": 32
+        },
+        "runId": {
+          "type": [
+            "string",
+            "null"
+          ],
+          "pattern": "^[0-9a-f]{32}$"
+        },
+        "expectedRows": {
+          "type": "array",
+          "maxItems": 64,
+          "items": {
+            "type": "string",
+            "maxLength": 48
+          }
         },
         "selection": {
           "type": "array",
@@ -523,6 +563,71 @@
             }
           }
         },
+        "provenance": {
+          "type": [
+            "object",
+            "null"
+          ],
+          "additionalProperties": false,
+          "required": [
+            "testedCommit",
+            "dirty",
+            "testedInputsSha256",
+            "testedInputsCount",
+            "lockfileSha256",
+            "cliSha256",
+            "node",
+            "unchangedAfterRun"
+          ],
+          "properties": {
+            "testedCommit": {
+              "type": "string",
+              "pattern": "^[0-9a-f]{40}$"
+            },
+            "dirty": {
+              "type": "boolean"
+            },
+            "testedInputsSha256": {
+              "type": "string",
+              "pattern": "^[0-9a-f]{64}$"
+            },
+            "testedInputsCount": {
+              "type": "integer",
+              "minimum": 1
+            },
+            "lockfileSha256": {
+              "type": "string",
+              "pattern": "^[0-9a-f]{64}$"
+            },
+            "cliSha256": {
+              "type": "string",
+              "pattern": "^[0-9a-f]{64}$"
+            },
+            "node": {
+              "type": "string",
+              "maxLength": 64
+            },
+            "unchangedAfterRun": {
+              "type": "boolean"
+            }
+          }
+        },
+        "ownedProcesses": {
+          "type": "array",
+          "maxItems": 4096,
+          "items": {
+            "type": "string",
+            "maxLength": 48
+          }
+        },
+        "homeRoots": {
+          "type": "array",
+          "maxItems": 512,
+          "items": {
+            "type": "string",
+            "maxLength": 300
+          }
+        },
         "cleanup": {
           "type": "object",
           "additionalProperties": false,
@@ -553,6 +658,7 @@
       "type": "object",
       "additionalProperties": false,
       "required": [
+        "runtime",
         "runIds",
         "containers",
         "networks",
@@ -564,6 +670,10 @@
         "verdict"
       ],
       "properties": {
+        "runtime": {
+          "type": "string",
+          "maxLength": 32
+        },
         "runIds": {
           "type": "array",
           "maxItems": 16,
@@ -658,6 +768,7 @@
       "required": [
         "schemaVersion",
         "source",
+        "problems",
         "database",
         "workload",
         "commands",
@@ -714,6 +825,14 @@
               "type": "string",
               "maxLength": 64
             }
+          }
+        },
+        "problems": {
+          "type": "array",
+          "maxItems": 64,
+          "items": {
+            "type": "string",
+            "maxLength": 300
           }
         },
         "database": {

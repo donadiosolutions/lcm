@@ -8,7 +8,7 @@ import { tmpdir } from "node:os";
 import { join, relative } from "node:path";
 import { vi } from "vitest";
 import { harnessEnvironment, settings, type PostgreSqlTestDatabase } from "../harness.js";
-import { appendLocalHookEvents } from "../../../src/hooks/local-enqueue.js";
+import { appendLocalHookEvents, LocalHookDurabilityTimeoutError } from "../../../src/hooks/local-enqueue.js";
 import { createBackendPublicationCoordinator } from "../../../src/storage/backend-publication-driver.js";
 import { createPostgreSqlBackendPublicationRemoteGuard } from "../../../src/storage/postgresql/publication-remote-guard.js";
 import { resolveMigrationDestination } from "../../../src/migration/cli-destination.js";
@@ -41,6 +41,20 @@ import { createCutoverSetRollbackDependencies, rollbackCutoverSet, type CutoverS
 export const MIGRATION_ROLE = "lcm_test_migrator";
 export const CLI_ENTRYPOINT = join(process.cwd(), "dist/lcm.mjs");
 const OUTPUT_CAP = 64 * 1024;
+
+/** Owned child processes (pid:start ticks) spawned by this run; the post-exit receipt proves each is gone. */
+export const OWNED_CHILDREN: string[] = [];
+function processStart(pid: number): string {
+  try {
+    const stat = readFileSync("/proc/" + String(pid) + "/stat", "utf8");
+    return stat.slice(stat.lastIndexOf(")") + 2).split(" ")[19] ?? "unknown";
+  } catch {
+    return "exited";
+  }
+}
+function registerChild(pid: number | undefined): void {
+  if (pid !== undefined && OWNED_CHILDREN.length < 4096) OWNED_CHILDREN.push(String(pid) + ":" + processStart(pid));
+}
 
 export const sha256 = (value: string | Uint8Array): string => createHash("sha256").update(value).digest("hex");
 
@@ -211,7 +225,9 @@ export interface CliResult {
 /** Run one real 'lcm migration' child, owning its process group to terminal close. */
 export async function runCli(h: RehearsalHome, args: readonly string[], options: {
   readonly deadlineMs?: number; readonly secrets?: readonly string[]; readonly env?: NodeJS.ProcessEnv; readonly raw?: boolean;
+  readonly signal?: AbortSignal;
 } = {}): Promise<CliResult> {
+  options.signal?.throwIfAborted();
   const started = Date.now();
   const child = spawn(process.execPath, [CLI_ENTRYPOINT, ...(options.raw === true ? args : ["migration", ...args, "--json"])], {
     cwd: h.cwd, env: options.env ?? h.env, stdio: ["ignore", "pipe", "pipe"], detached: true,
@@ -222,6 +238,9 @@ export async function runCli(h: RehearsalHome, args: readonly string[], options:
       if ((error as NodeJS.ErrnoException).code !== "ESRCH") throw error;
     }
   };
+  registerChild(child.pid);
+  const cancel = (): void => signalGroup("SIGKILL");
+  options.signal?.addEventListener("abort", cancel, { once: true });
   let stdout = "";
   let stderr = "";
   let overflow = false;
@@ -242,8 +261,10 @@ export async function runCli(h: RehearsalHome, args: readonly string[], options:
     outcome = await closed;
   } finally {
     clearTimeout(deadline);
+    options.signal?.removeEventListener("abort", cancel);
     signalGroup("SIGKILL");
   }
+  options.signal?.throwIfAborted();
   if (child.pid !== undefined) {
     try { process.kill(-child.pid, 0); throw new Error("CLI process group survived"); } catch (error) {
       if ((error as NodeJS.ErrnoException).code !== "ESRCH") throw error;
@@ -339,19 +360,38 @@ function digestRows(rows: readonly (readonly unknown[])[]): { count: number; sha
 
 const numeric = (value: unknown): string => Number(value).toFixed(6);
 
-/** Independent per-domain digests from the native SQLite tables (fixture-known identities and content). */
+/** One canonical UTC rendering with microseconds for the SQLite text and PostgreSQL timestamptz representations. */
+function normalizeTimestamp(value: unknown): string {
+  if (value === null || value === undefined) return "null";
+  const text = String(value);
+  const match = /^(\d{4}-\d{2}-\d{2})[T ](\d{2}:\d{2}:\d{2})(?:\.(\d{1,9}))?(?:Z|\+00(?::?00)?)?$/u.exec(text);
+  if (match === null) return "unparsed:" + text;
+  return match[1] + "T" + match[2] + "." + (match[3] ?? "").padEnd(6, "0").slice(0, 6) + "Z";
+}
+
+const PG_TS = "to_char(%C AT TIME ZONE 'UTC', 'YYYY-MM-DD\"T\"HH24:MI:SS.US\"Z\"')";
+const pgTs = (column: string, alias = "stamp"): string => PG_TS.replace("%C", column) + " AS " + alias;
+
+/** Independent per-domain digests from the native SQLite tables (fixture-known identities, content, timestamps and links). */
 export function sqliteDomainDigests(databasePath: string): DomainDigests {
   const db = new DatabaseSync(databasePath, { readOnly: true });
   try {
     const rows = (sql: string): (readonly unknown[])[] =>
       (db.prepare(sql).all() as Record<string, unknown>[]).map((record) => Object.values(record));
-    const memories = (db.prepare("SELECT id,content,depth,confidence,archived_at IS NOT NULL AS archived FROM promoted").all() as Record<string, unknown>[])
-      .map((r) => [r.id, r.content, String(r.depth), numeric(r.confidence), String(Number(r.archived) === 1)]);
+    const stamped = (list: (readonly unknown[])[], ...columns: number[]): (readonly unknown[])[] =>
+      list.map((row) => row.map((value, index) => columns.includes(index) ? normalizeTimestamp(value) : value));
+    const memories = (db.prepare("SELECT id,content,depth,confidence,archived_at IS NOT NULL AS archived,created_at FROM promoted").all() as Record<string, unknown>[])
+      .map((r) => [r.id, r.content, String(r.depth), numeric(r.confidence), String(Number(r.archived) === 1), normalizeTimestamp(r.created_at)]);
     return {
-      conversations: digestRows(rows("SELECT session_id,title FROM conversations")),
-      messages: digestRows(rows("SELECT c.session_id,CAST(m.seq AS TEXT),m.role,m.content,CAST(m.token_count AS TEXT) FROM messages m JOIN conversations c ON c.conversation_id=m.conversation_id")),
-      parts: digestRows(rows("SELECT p.part_id,p.part_type,p.text_content FROM message_parts p")),
-      summaries: digestRows(rows("SELECT summary_id,kind,CAST(depth AS TEXT),content,CAST(token_count AS TEXT) FROM summaries")),
+      conversations: digestRows(stamped(rows("SELECT session_id,title,created_at,updated_at FROM conversations"), 2, 3)),
+      messages: digestRows(stamped(rows("SELECT c.session_id,CAST(m.seq AS TEXT),m.role,m.content,CAST(m.token_count AS TEXT),m.created_at FROM messages m JOIN conversations c ON c.conversation_id=m.conversation_id"), 5)),
+      parts: digestRows(rows("SELECT c.session_id,CAST(m.seq AS TEXT),CAST(p.ordinal AS TEXT),p.part_id,p.part_type,p.text_content FROM message_parts p JOIN messages m ON m.message_id=p.message_id JOIN conversations c ON c.conversation_id=m.conversation_id")),
+      summaries: digestRows(stamped(rows("SELECT s.summary_id,c.session_id,s.kind,CAST(s.depth AS TEXT),s.content,CAST(s.token_count AS TEXT),s.created_at FROM summaries s JOIN conversations c ON c.conversation_id=s.conversation_id"), 6)),
+      summaryEdges: digestRows([
+        ...rows("SELECT 'message',sm.summary_id,c.session_id || '/' || CAST(m.seq AS TEXT),CAST(sm.ordinal AS TEXT) FROM summary_messages sm JOIN messages m ON m.message_id=sm.message_id JOIN conversations c ON c.conversation_id=m.conversation_id"),
+        ...rows("SELECT 'parent',summary_id,parent_summary_id,CAST(ordinal AS TEXT) FROM summary_parents"),
+      ]),
+      contextItems: digestRows(stamped(rows("SELECT c.session_id,CAST(i.ordinal AS TEXT),i.item_type,COALESCE((SELECT c2.session_id || '/' || CAST(m.seq AS TEXT) FROM messages m JOIN conversations c2 ON c2.conversation_id=m.conversation_id WHERE m.message_id=i.message_id),''),COALESCE(i.summary_id,''),i.created_at FROM context_items i JOIN conversations c ON c.conversation_id=i.conversation_id"), 5)),
       memories: digestRows(memories),
       instructions: digestRows(rows("SELECT scope_hash,client_name,session_id,content FROM session_instruction_cache")),
     };
@@ -373,13 +413,19 @@ export async function postgresDomainDigests(db: PostgreSqlTestDatabase, normaliz
       const result = await administrator.query({ text, values: [projectId] }, { domain: "factory", operation: "rehearsalDigest" });
       return result.rows.map((record: Record<string, unknown>) => Object.values(record));
     };
-    const memories = (await rows("SELECT memory_id,content,depth,confidence::text,(archived_at IS NOT NULL)::text FROM lcm.promoted_memories WHERE project_id=$1"))
-      .map((r) => [r[0], r[1], String(r[2]), numeric(r[3]), String(r[4] === "true")]);
+    const memories = (await rows("SELECT memory_id,content,depth,confidence::text,(archived_at IS NOT NULL)::text," + pgTs("created_at") + " FROM lcm.promoted_memories WHERE project_id=$1"))
+      .map((r) => [r[0], r[1], String(r[2]), numeric(r[3]), String(r[4] === "true"), r[5]]);
+    const messageAt = "(SELECT c2.session_id || '/' || m2.seq::text FROM lcm.messages m2 JOIN lcm.conversations c2 ON c2.project_id=m2.project_id AND c2.conversation_id=m2.conversation_id WHERE m2.project_id=%P AND m2.message_id=%M)";
     return {
-      conversations: digestRows(await rows("SELECT session_id,title FROM lcm.conversations WHERE project_id=$1")),
-      messages: digestRows(await rows("SELECT c.session_id,m.seq::text,m.role,m.content,m.token_count::text FROM lcm.messages m JOIN lcm.conversations c ON c.project_id=m.project_id AND c.conversation_id=m.conversation_id WHERE m.project_id=$1")),
-      parts: digestRows(await rows("SELECT part_id::text,part_type,text_content FROM lcm.message_parts WHERE project_id=$1")),
-      summaries: digestRows(await rows("SELECT summary_id,kind,depth::text,content,token_count::text FROM lcm.summaries WHERE project_id=$1")),
+      conversations: digestRows(await rows("SELECT session_id,title," + pgTs("created_at", "created") + "," + pgTs("updated_at", "updated") + " FROM lcm.conversations WHERE project_id=$1")),
+      messages: digestRows(await rows("SELECT c.session_id,m.seq::text,m.role,m.content,m.token_count::text," + pgTs("m.created_at") + " FROM lcm.messages m JOIN lcm.conversations c ON c.project_id=m.project_id AND c.conversation_id=m.conversation_id WHERE m.project_id=$1")),
+      parts: digestRows(await rows("SELECT c.session_id,m.seq::text,p.ordinal::text,p.part_id::text,p.part_type,p.text_content FROM lcm.message_parts p JOIN lcm.messages m ON m.project_id=p.project_id AND m.conversation_id=p.conversation_id AND m.message_id=p.message_id JOIN lcm.conversations c ON c.project_id=m.project_id AND c.conversation_id=m.conversation_id WHERE p.project_id=$1")),
+      summaries: digestRows(await rows("SELECT s.summary_id,c.session_id,s.kind,s.depth::text,s.content,s.token_count::text," + pgTs("s.created_at") + " FROM lcm.summaries s JOIN lcm.conversations c ON c.project_id=s.project_id AND c.conversation_id=s.conversation_id WHERE s.project_id=$1")),
+      summaryEdges: digestRows([
+        ...await rows("SELECT 'message' AS kind,s.summary_id AS owner,c.session_id || '/' || m.seq::text AS target,sm.ordinal::text AS position FROM lcm.summary_messages sm JOIN lcm.summaries s ON s.project_id=sm.project_id AND s.summary_key=sm.summary_key JOIN lcm.messages m ON m.project_id=sm.project_id AND m.conversation_id=sm.conversation_id AND m.message_id=sm.message_id JOIN lcm.conversations c ON c.project_id=m.project_id AND c.conversation_id=m.conversation_id WHERE sm.project_id=$1"),
+        ...await rows("SELECT 'parent' AS kind,s.summary_id AS owner,p.summary_id AS target,sp.ordinal::text AS position FROM lcm.summary_parents sp JOIN lcm.summaries s ON s.project_id=sp.project_id AND s.summary_key=sp.summary_key JOIN lcm.summaries p ON p.project_id=sp.project_id AND p.summary_key=sp.parent_summary_key WHERE sp.project_id=$1"),
+      ]),
+      contextItems: digestRows(await rows("SELECT c.session_id AS session,i.ordinal::text AS position,i.item_type AS item,COALESCE(" + messageAt.replace("%P", "i.project_id").replace("%M", "i.message_id") + ",'') AS message,COALESCE(s.summary_id,'') AS summary," + pgTs("i.created_at") + " FROM lcm.context_items i JOIN lcm.conversations c ON c.project_id=i.project_id AND c.conversation_id=i.conversation_id LEFT JOIN lcm.summaries s ON s.project_id=i.project_id AND s.summary_key=i.summary_key WHERE i.project_id=$1")),
       memories: digestRows(memories),
       instructions: digestRows(await rows("SELECT scope_hash,client_name,session_id,content FROM lcm.session_instructions WHERE project_id=$1")),
     };
@@ -391,6 +437,10 @@ export async function postgresDomainDigests(db: PostgreSqlTestDatabase, normaliz
 // ─── Oracles ───────────────────────────────────────────────────────────────
 
 export interface AuthorityObservation {
+  /** The backend the authenticated journals (or, with none, the config) name as last committed. */
+  readonly committedBackend: string;
+  /** sha256 over the authenticated journal kind and checksum, or null when no journal is present. */
+  readonly journalIdentitySha256: string | null;
   readonly configBackend: string;
   readonly boundProjects: number;
   readonly maintenancePhase: string | null;
@@ -413,17 +463,33 @@ export function readAuthority(h: RehearsalHome): AuthenticatedAuthority {
   const config = JSON.parse(readFileSync(configPath(h.home), "utf8")) as { storage?: { backend?: string } };
   let map: Record<string, { remoteProjectId?: string }> = {};
   try { map = JSON.parse(readFileSync(projectMapPath(h.home), "utf8")) as typeof map; } catch { /* absent map */ }
+  let maintenance: ReturnType<typeof readBackendMaintenanceJournal> = null;
   let maintenancePhase: string | null = null;
-  try { maintenancePhase = readBackendMaintenanceJournal(h.home)?.phase ?? null; } catch { maintenancePhase = "unreadable"; }
+  try { maintenance = readBackendMaintenanceJournal(h.home); maintenancePhase = maintenance?.phase ?? null; } catch { maintenancePhase = "unreadable"; }
+  let publication: ReturnType<typeof readBackendPublicationJournal> = null;
   let publicationPhase: string | null = null;
   let publicationTarget: string | null = null;
   try {
-    const journal = readBackendPublicationJournal(h.home);
-    publicationPhase = journal?.phase ?? null;
-    publicationTarget = journal?.targetBackend ?? null;
+    publication = readBackendPublicationJournal(h.home);
+    publicationPhase = publication?.phase ?? null;
+    publicationTarget = publication?.targetBackend ?? null;
   } catch { publicationPhase = "unreadable"; }
+  // The journal slot holds either a maintenance hold or a publication; each reader is authenticated and refuses the other kind.
+  // A hold's committed backend is the one selected when it was entered, except a completed selection; a publication commits at completed.
+  let committedBackend = config.storage?.backend ?? "sqlite";
+  let journalIdentitySha256: string | null = null;
+  if (maintenance !== null) {
+    committedBackend = maintenance.phase === "selection-completed" ? (maintenance.targetBackend ?? maintenance.sourceBackend) : maintenance.sourceBackend;
+    journalIdentitySha256 = sha256("maintenance\0" + maintenance.checksumSha256);
+  } else if (publication !== null) {
+    committedBackend = publication.phase === "completed" ? publication.targetBackend : publication.sourceBackend;
+    journalIdentitySha256 = sha256("publication\0" + publication.checksumSha256);
+  } else if (maintenancePhase === "unreadable" && publicationPhase === "unreadable") {
+    committedBackend = "unreadable";
+  }
   const admitted = (["sqlite", "postgresql"] as const).filter((backend) => admits(h.home, backend));
   return {
+    committedBackend, journalIdentitySha256,
     configBackend: config.storage?.backend ?? "sqlite",
     boundProjects: Object.values(map).filter((entry) => entry.remoteProjectId !== undefined).length,
     maintenancePhase, publicationPhase, publicationTarget, admitted,
@@ -576,6 +642,12 @@ export class RehearsalCase {
   readonly secrets: string[];
   private seals: { generation: string; artifacts: readonly ArtifactWitness[] }[] = [];
   second: RehearsalHome | null = null;
+  /** The scenario's execution budget: aborted before Vitest's own timeout so cleanup can still finish. */
+  signal: AbortSignal = new AbortController().signal;
+  /** Cleanup problems recorded instead of suppressed. */
+  readonly cleanupProblems: string[] = [];
+  /** Throws when the scenario budget is spent. */
+  checkpoint(): void { this.signal.throwIfAborted(); }
   private started = Date.now();
 
   constructor(
@@ -612,7 +684,7 @@ export class RehearsalCase {
     const spec = this.resolve(id);
     if (spec.args === undefined || spec.exit === undefined) throw new Error("incomplete manifest step " + id);
     const args = this.expand(spec.args);
-    const result = await runCli(home, args, { secrets: this.secrets, env: extra.env, deadlineMs: extra.deadlineMs ?? spec.deadlineMs });
+    const result = await runCli(home, args, { secrets: this.secrets, env: extra.env, deadlineMs: extra.deadlineMs ?? spec.deadlineMs, signal: this.signal });
     const envelope = result.envelope;
     const refusal = envelope.refusal as { reason?: string } | null;
     const observed = {
@@ -648,7 +720,7 @@ export class RehearsalCase {
 
   /** A non-migration operator command that prints one JSON document (for example 'events promote --json'). */
   async rawCli(id: string, args: readonly string[], expectedExit: number, home: RehearsalHome = this.h): Promise<Record<string, unknown>> {
-    const result = await runCli(home, args, { raw: true, secrets: this.secrets });
+    const result = await runCli(home, args, { raw: true, secrets: this.secrets, signal: this.signal });
     this.steps.push({ id, surface: "cli", command: args, exitCode: result.exitCode, outcome: null, reason: null, envelopeSha256: result.envelopeSha256, checkpointRef: null });
     if (result.exitCode !== expectedExit) {
       throw new Error("command " + id + " exited " + String(result.exitCode) + " != " + String(expectedExit) + " | " + JSON.stringify(result.envelope).slice(0, 600));
@@ -663,19 +735,24 @@ export class RehearsalCase {
 
   /** I1: the pinned authority checkpoint, with independent consumer admission. */
   authority(checkpoint: string, home: RehearsalHome = this.h): AuthenticatedAuthority {
+    this.checkpoint();
     const expected = this.spec.authority.find((entry) => entry.checkpoint === checkpoint);
     if (expected === undefined) throw new Error("scenario " + this.spec.id + " has no authority checkpoint " + checkpoint);
     const observed = readAuthority(home);
     const failures: string[] = [];
     if (observed.admitted.length > 1) failures.push("mixed admission " + observed.admitted.join(","));
     if (!sameJson([...observed.admitted].sort(), [...expected.admitted].sort())) failures.push("admitted " + observed.admitted.join(",") + " != " + expected.admitted.join(","));
+    if (observed.committedBackend !== expected.lastCommittedBackend) failures.push("committed backend " + observed.committedBackend + " != " + expected.lastCommittedBackend);
     if (expected.configBackend !== undefined && observed.configBackend !== expected.configBackend) failures.push("config " + observed.configBackend);
     if (expected.boundProjects !== undefined && observed.boundProjects !== expected.boundProjects) failures.push("bound " + String(observed.boundProjects));
     this.authorities.push({
-      checkpoint, lastCommittedBackend: expected.lastCommittedBackend,
+      checkpoint, lastCommittedBackend: observed.committedBackend, journalIdentitySha256: observed.journalIdentitySha256,
       consumerAdmission: observed.admitted.length === 0 ? "fenced" : "admitted",
       witnesses: [observed.configBackend, observed.maintenancePhase ?? "none", observed.publicationPhase ?? "none"],
     });
+    this.invariants.I1 ??= { status: "pass", evidenceRefs: [] };
+    if (failures.length > 0) this.invariants.I1.status = "fail";
+    else this.invariants.I1.evidenceRefs.push(checkpoint + ":" + observed.committedBackend);
     if (failures.length > 0) throw new Error("authority " + this.spec.id + "/" + checkpoint + ": " + failures.join("; ") + " observed=" + JSON.stringify(observed));
     return observed;
   }
@@ -711,6 +788,7 @@ export class RehearsalCase {
 
   /** I4: canonical per-domain digests must be identical between two independent native reads. */
   compareDomains(label: string, expected: DomainDigests, actual: DomainDigests): void {
+    this.checkpoint();
     this.canonicalDomainDigests.push({ label, domains: actual });
     this.invariants.I4 ??= { status: "pass", evidenceRefs: [] };
     this.invariants.I4.evidenceRefs.push(label);
@@ -726,13 +804,32 @@ export class RehearsalCase {
     this.invariants[invariant]!.evidenceRefs.push(ref);
   }
 
-  /** I6 for this scenario: the private home is removed and proven absent; the owned role is dropped. */
+  /**
+   * I6 for this scenario: private homes are removed and proven absent, and the owned role is dropped and proven absent.
+   * Every failure is recorded (never suppressed) and never prevents the remaining steps.
+   */
   async cleanup(): Promise<void> {
     const homes = [this.h, ...this.extraHomes];
-    const absent = homes.map((home) => removeHome(home));
-    try { await dropRole(this.db, this.role); } catch { /* the database drop removes the role grants; the role is dropped below */ }
-    this.invariants.I6 = { status: absent.every(Boolean) ? "pass" : "fail", evidenceRefs: ["homes-absent:" + String(absent.length)] };
+    const roots = homes.map((home) => home.root);
+    const absent: boolean[] = [];
+    for (const home of homes) {
+      try { absent.push(removeHome(home)); } catch (error) { absent.push(false); this.cleanupProblems.push("home removal failed: " + (error instanceof Error ? error.name : "error")); }
+    }
+    let roleAbsent = false;
+    try { await dropRole(this.db, this.role); } catch (error) { this.cleanupProblems.push("role drop failed: " + (error instanceof Error ? error.name : "error")); }
+    try {
+      roleAbsent = (await adminSql(this.db, "SELECT 1 AS present FROM pg_catalog.pg_roles WHERE rolname = $1", [this.role.name])).length === 0;
+    } catch (error) { this.cleanupProblems.push("role absence query failed: " + (error instanceof Error ? error.name : "error")); }
+    if (!roleAbsent) this.cleanupProblems.push("owned role still present");
+    if (!absent.every(Boolean)) this.cleanupProblems.push("a private home is still present");
+    this.homeRoots.push(...roots);
+    this.invariants.I6 = {
+      status: this.cleanupProblems.length === 0 ? "pass" : "fail",
+      evidenceRefs: ["homes-absent:" + String(absent.length), "owned-role-absent:" + String(roleAbsent)],
+      ...(this.cleanupProblems.length === 0 ? {} : { reason: this.cleanupProblems.join("; ").slice(0, 280) }),
+    };
   }
+  readonly homeRoots: string[] = [];
 
   /** The most recent error the daemon recorded for the route (closed text from its sidecar error log). */
   private lastPromoteRefusal(): string {
@@ -767,29 +864,53 @@ export class RehearsalCase {
 
   /** Run the foreground daemon for the callback with the case's disclosure secrets. */
   daemon<T>(callback: (daemon: RunningDaemon) => Promise<T>, options: { readonly env?: NodeJS.ProcessEnv } = {}): Promise<T> {
-    return withDaemon(this.h, this.daemonPort, callback, { ...options, secrets: this.secrets });
+    return withDaemon(this.h, this.daemonPort, callback, { ...options, secrets: this.secrets, signal: this.signal });
   }
 
   extraHomes: RehearsalHome[] = [];
   daemonPort = 0;
   readonly ledger: LedgerEntry[] = [];
+  readonly mutations: MutationEntry[] = [];
 
-  record(verdict: Verdict, failure?: string): Record<string, unknown> {
+  /**
+   * Finalize I1-I6 once and choose the verdict from them. A required invariant must have been asserted and passed; a
+   * not-applicable one carries the manifest's reason. Any problem (or a thrown failure) makes the verdict fail, so a
+   * required invariant that was never asserted can no longer ride along with a passing row.
+   */
+  record(failure?: string): { readonly record: Record<string, unknown>; readonly problems: string[] } {
     const invariants: Record<string, InvariantRecord> = {};
+    const problems: string[] = [];
     for (const key of ["I1", "I2", "I3", "I4", "I5", "I6"] as const) {
       const declared = this.spec.invariants[key];
-      invariants[key] = this.invariants[key] ?? (declared.startsWith("na:")
-        ? { status: "not-applicable", evidenceRefs: [], reason: declared.slice(3) }
-        : { status: "fail", evidenceRefs: [], reason: "not asserted" });
+      const asserted = this.invariants[key];
+      if (declared.startsWith("na:")) {
+        invariants[key] = asserted ?? { status: "not-applicable", evidenceRefs: [], reason: declared.slice(3) };
+      } else if (asserted === undefined) {
+        invariants[key] = { status: "fail", evidenceRefs: [], reason: "not asserted" };
+      } else {
+        invariants[key] = asserted;
+      }
+      if (invariants[key]!.status === "fail") problems.push(key + ":" + (invariants[key]!.reason ?? "failed"));
     }
+    const verdict: Verdict = failure !== undefined || problems.length > 0 ? "fail" : this.spec.knownLimits.length > 0 ? "pass-with-documented-limits" : "pass";
     return {
-      id: this.spec.id, fixture: this.spec.fixture, parameters: {}, supportingTests: this.spec.supportingTests,
-      steps: this.steps, injections: this.injections, authority: this.authorities, invariants,
-      acknowledgedInputDigest: sha256(JSON.stringify(this.canonicalDomainDigests)),
-      canonicalDomainDigests: this.canonicalDomainDigests.map((entry) => ({ label: entry.label, domains: entry.domains })),
-      knownLimits: this.spec.knownLimits, artifacts: this.artifacts, elapsedMs: Date.now() - this.started,
-      verdict, ...(failure === undefined ? {} : { failure: failure.slice(0, 600) }),
+      problems,
+      record: {
+        id: this.spec.id, fixture: this.spec.fixture, parameters: {}, supportingTests: this.spec.supportingTests,
+        steps: this.steps, injections: this.injections, authority: this.authorities, invariants,
+        acknowledgedInputDigest: this.acknowledgedInputDigest(),
+        canonicalDomainDigests: this.canonicalDomainDigests.map((entry) => ({ label: entry.label, domains: entry.domains })),
+        knownLimits: this.spec.knownLimits, artifacts: this.artifacts, elapsedMs: Date.now() - this.started,
+        verdict, ...(failure === undefined ? {} : { failure: failure.slice(0, 600) }),
+      },
     };
+  }
+
+  /** The deterministic digest of the acknowledged-input ledger (scoped events and explicit mutations), sorted. */
+  acknowledgedInputDigest(): string {
+    const events = this.ledger.map((entry) => ["event", entry.projectId, entry.machineId, entry.eventUuid, entry.machineSequence, entry.envelopeSha256].join("\0"));
+    const mutations = this.mutations.map((entry) => ["mutation", entry.domain, entry.identitySha256, entry.beforeSha256, entry.afterSha256].join("\0"));
+    return sha256([...events, ...mutations].sort().join("\n"));
   }
 }
 
@@ -806,6 +927,11 @@ export function writeEvidence(file: string, value: unknown): void {
 }
 
 // ─── Foreground daemon (private, owned process group) ─────────────────────
+
+/** The daemon process exited by itself before it reported ready (a start refusal, not a timeout). */
+export class DaemonExitedBeforeReady extends Error {
+  constructor(readonly exitCode: number | null) { super("daemon exited before ready"); this.name = "DaemonExitedBeforeReady"; }
+}
 
 export interface RunningDaemon {
   readonly port: number;
@@ -827,11 +953,13 @@ async function portListening(port: number): Promise<boolean> {
 /** Run the installed CLI daemon in the foreground for the callback, then prove its process group and port are gone. */
 export async function withDaemon<T>(
   h: RehearsalHome, port: number, callback: (daemon: RunningDaemon) => Promise<T>,
-  options: { readonly env?: NodeJS.ProcessEnv; readonly deadlineMs?: number; readonly secrets?: readonly string[] } = {},
+  options: { readonly env?: NodeJS.ProcessEnv; readonly deadlineMs?: number; readonly secrets?: readonly string[]; readonly signal?: AbortSignal } = {},
 ): Promise<T> {
+  options.signal?.throwIfAborted();
   const child = spawn(process.execPath, [CLI_ENTRYPOINT, "daemon", "start", "--foreground"], {
     cwd: h.cwd, env: options.env ?? h.env, stdio: ["ignore", "pipe", "pipe"], detached: true,
   });
+  registerChild(child.pid);
   const signalGroup = (signal: NodeJS.Signals): void => {
     if (child.pid === undefined) return;
     try { process.kill(-child.pid, signal); } catch (error) {
@@ -845,13 +973,16 @@ export async function withDaemon<T>(
       if (output.length < OUTPUT_CAP) output += chunk.toString().slice(0, OUTPUT_CAP - output.length);
     });
   }
+  let exitCode: number | null = null;
   const closed = new Promise<void>((resolve, reject) => {
     child.once("error", reject);
-    child.once("close", () => resolve());
+    child.once("close", (code) => { exitCode = code; resolve(); });
   });
   let exited = false;
   void closed.then(() => { exited = true; });
   const deadline = setTimeout(() => signalGroup("SIGKILL"), options.deadlineMs ?? 90_000);
+  const cancel = (): void => signalGroup("SIGKILL");
+  options.signal?.addEventListener("abort", cancel, { once: true });
   try {
     const tokenPath = join(h.home, ".lcm", "daemon.token");
     let started: { client: DaemonClient; health: DaemonHealth } | null = null;
@@ -863,10 +994,14 @@ export async function withDaemon<T>(
       }
       if (started === null) await delay(100);
     }
-    if (started === null) throw new Error("rehearsal daemon did not become healthy: " + sha256(output).slice(0, 12));
+    if (started === null) {
+      if (exited) throw new DaemonExitedBeforeReady(exitCode);
+      throw new Error("rehearsal daemon did not become healthy: " + sha256(output).slice(0, 12));
+    }
     return await callback({ port, pid: child.pid!, health: started.health, client: started.client });
   } finally {
     clearTimeout(deadline);
+    options.signal?.removeEventListener("abort", cancel);
     signalGroup("SIGTERM");
     const backstop = setTimeout(() => signalGroup("SIGKILL"), 5000);
     try { await closed; } finally { clearTimeout(backstop); signalGroup("SIGKILL"); }
@@ -905,8 +1040,9 @@ export async function destinationProjectId(db: PostgreSqlTestDatabase, cwd: stri
 export async function guardedWrite(c: RehearsalCase, sessionId: string): Promise<void> {
   const runtime = new PostgreSqlRuntime(settings(c.role.url));
   try {
-    const repository = new PostgreSqlConversationRepository(runtime, await destinationProjectId(c.db, c.h.cwd));
-    await repository.createConversation({ sessionId });
+    const projectId = await destinationProjectId(c.db, c.h.cwd);
+    const repository = new PostgreSqlConversationRepository(runtime, projectId);
+    recordConversationWrite(c, projectId, await repository.createConversation({ sessionId }));
   } finally {
     await runtime.close();
   }
@@ -932,12 +1068,20 @@ export function damageSnapshot(h: RehearsalHome, generation: string, file: strin
 
 // ─── Acknowledged-input ledger (I3) ────────────────────────────────────────
 
-export interface LedgerEntry { readonly eventUuid: string; readonly machineSequence: string; readonly envelopeSha256: string }
+export interface LedgerEntry {
+  readonly projectId: string; readonly machineId: string; readonly eventUuid: string;
+  readonly machineSequence: string; readonly envelopeSha256: string; readonly data: string;
+}
+/** A non-event acknowledged input: an explicit guarded mutation or a native instruction, with before/after content digests. */
+export interface MutationEntry {
+  readonly domain: "conversation" | "instruction"; readonly identitySha256: string; readonly locator: string;
+  readonly beforeSha256: string; readonly afterSha256: string;
+}
 export interface EventRow {
   readonly event_uuid: string; readonly event_version: number; readonly machine_sequence: string; readonly session_id: string;
   readonly seq: number; readonly type: string; readonly category: string; readonly data: string; readonly priority: number;
   readonly source_hook: string; readonly created_at: string; readonly processed_at: string | null; readonly delivery_state: string;
-  readonly remote_inbox_id: string | null;
+  readonly remote_inbox_id: string | null; readonly remote_pruned_at: string | null;
 }
 
 export function envelopeHash(row: EventRow): string {
@@ -949,7 +1093,7 @@ export function readEventRows(h: RehearsalHome): EventRow[] {
   const path = join(h.home, ".lcm", "events", h.localProjectId + ".db");
   const db = new DatabaseSync(path, { readOnly: true });
   try {
-    return db.prepare("SELECT event_uuid,event_version,machine_sequence,session_id,seq,type,category,data,priority,source_hook,created_at,processed_at,delivery_state,remote_inbox_id FROM events ORDER BY machine_sequence").all() as unknown as EventRow[];
+    return db.prepare("SELECT event_uuid,event_version,machine_sequence,session_id,seq,type,category,data,priority,source_hook,created_at,processed_at,delivery_state,remote_inbox_id,remote_pruned_at FROM events ORDER BY machine_sequence").all() as unknown as EventRow[];
   } finally {
     db.close();
   }
@@ -963,30 +1107,124 @@ export async function acknowledgeEvents(c: RehearsalCase, label: string, data: r
     cwd: c.h.cwd, sessionId: "rehearsal-" + label, sourceHook: "SessionStart",
     events: data.map((entry) => ({ type: "decision", category: "decision", data: entry, priority: 1 })),
   }));
-  const added = readEventRows(c.h).filter((row) => !before.has(row.event_uuid))
-    .map((row) => ({ eventUuid: row.event_uuid, machineSequence: row.machine_sequence, envelopeSha256: envelopeHash(row) }));
+  const added = readEventRows(c.h).filter((row) => !before.has(row.event_uuid)).map((row) => ledgerEntryOf(c.h, row));
   if (added.length !== data.length) throw new Error("acknowledged events were not retained by the durable enqueue");
   c.ledger.push(...added);
   return added;
+}
+
+/** The scoped ledger identity of one retained event: project, machine, UUID, sequence and canonical envelope. */
+/** Legacy events acknowledged before the machine was enrolled carry no machine identity; their sequence facts are still ledgered. */
+const PRE_EPOCH_MACHINE = "pre-epoch";
+
+export function ledgerEntryOf(h: RehearsalHome, row: EventRow): LedgerEntry {
+  return {
+    projectId: h.localProjectId, machineId: readMachineIdentity(h.home)?.machineId ?? PRE_EPOCH_MACHINE, eventUuid: row.event_uuid,
+    machineSequence: row.machine_sequence, envelopeSha256: envelopeHash(row), data: row.data,
+  };
+}
+
+/**
+ * Acknowledge events while the maintenance hold is up. The enqueue stays open during a hold, so the expected result is
+ * "accepted": the input is ledgered and its machine sequence is proved above the hold's sealed queue cutoff. The one
+ * closed, identifiable refusal (the append barrier timing out) is reported as "refused" and acknowledges nothing; every
+ * other failure propagates.
+ */
+export async function acknowledgeHeldGap(c: RehearsalCase, label: string, data: readonly string[]): Promise<"accepted" | "refused"> {
+  let added: LedgerEntry[];
+  try {
+    added = await acknowledgeEvents(c, label, data);
+  } catch (error) {
+    if (error instanceof LocalHookDurabilityTimeoutError && error.retryRequired) return "refused";
+    throw error;
+  }
+  const machineId = readMachineIdentity(c.h.home)!.machineId!;
+  const cutoff = readBackendMaintenanceJournal(c.h.home)?.roster.find((entry) => entry.machineId === machineId)?.queueCutoff;
+  if (cutoff === undefined || cutoff === null) throw new Error("the hold carries no sealed queue cutoff for this machine");
+  for (const entry of added) {
+    if (BigInt(entry.machineSequence) <= BigInt(cutoff)) {
+      c.invariants.I3 ??= { status: "pass", evidenceRefs: [] };
+      c.invariants.I3.status = "fail";
+      throw new Error("a held-gap input was sequenced inside the sealed cutoff: " + entry.machineSequence + " <= " + cutoff);
+    }
+  }
+  c.mark("I3", "held-gap-above-cutoff:" + cutoff);
+  return "accepted";
 }
 
 function readEventRowsSafe(h: RehearsalHome): EventRow[] {
   try { return readEventRows(h); } catch { return []; }
 }
 
-/** Every acknowledged input must still be retained locally with an identical envelope. */
+/** Every acknowledged input of the focused project must still be retained with an identical scoped envelope and content. */
 export function assertLedgerRetained(c: RehearsalCase, label: string): void {
   const rows = new Map(readEventRows(c.h).map((row) => [row.event_uuid, row]));
-  const missing = c.ledger.filter((entry) => {
+  const scoped = c.ledger.filter((entry) => entry.projectId === c.h.localProjectId);
+  const machineId = readMachineIdentity(c.h.home)!.machineId!;
+  const missing = scoped.filter((entry) => {
     const row = rows.get(entry.eventUuid);
-    return row === undefined || envelopeHash(row) !== entry.envelopeSha256 || row.machine_sequence !== entry.machineSequence;
+    return row === undefined || (entry.machineId !== PRE_EPOCH_MACHINE && entry.machineId !== machineId) || envelopeHash(row) !== entry.envelopeSha256 || row.machine_sequence !== entry.machineSequence;
   });
+  const changedInstructions = c.mutations.filter((entry) => entry.domain === "instruction" && !instructionRetained(c, entry));
   c.invariants.I3 ??= { status: "pass", evidenceRefs: [] };
-  c.invariants.I3.evidenceRefs.push(label + ":" + String(c.ledger.length));
-  if (missing.length > 0) {
+  c.invariants.I3.evidenceRefs.push(label + ":" + String(scoped.length) + "+" + String(c.mutations.length));
+  if (missing.length > 0 || changedInstructions.length > 0) {
     c.invariants.I3.status = "fail";
-    throw new Error("I3 acknowledged input lost or changed at " + label + ": " + String(missing.length));
+    throw new Error("I3 acknowledged input lost or changed at " + label + ": " + String(missing.length) + " events, " + String(changedInstructions.length) + " instructions");
   }
+}
+
+const instructionContent = (row: { scope_hash: string; client_name: string; session_id: string; content: string }): string => sha256(JSON.stringify([row.scope_hash, row.client_name, row.session_id, row.content]));
+
+/** Record the natively seeded instruction rows as acknowledged inputs (identity plus content digest). */
+export function recordInstructionLedger(c: RehearsalCase): void {
+  const db = new DatabaseSync(join(c.h.projectDir, "db.sqlite"), { readOnly: true });
+  try {
+    const rows = db.prepare("SELECT scope_hash,client_name,session_id,content FROM session_instruction_cache").all() as { scope_hash: string; client_name: string; session_id: string; content: string }[];
+    for (const row of rows) {
+      const content = instructionContent(row);
+      c.mutations.push({ domain: "instruction", identitySha256: sha256(["instruction", c.h.localProjectId, row.scope_hash, row.client_name, row.session_id].join("\0")), locator: row.scope_hash + "\0" + row.client_name + "\0" + row.session_id, beforeSha256: content, afterSha256: content });
+    }
+  } finally {
+    db.close();
+  }
+}
+
+function instructionRetained(c: RehearsalCase, entry: MutationEntry): boolean {
+  const [scope, client, session] = entry.locator.split("\0") as [string, string, string];
+  const db = new DatabaseSync(join(c.h.projectDir, "db.sqlite"), { readOnly: true });
+  try {
+    const row = db.prepare("SELECT scope_hash,client_name,session_id,content FROM session_instruction_cache WHERE scope_hash=? AND client_name=? AND session_id=?").get(scope, client, session) as { scope_hash: string; client_name: string; session_id: string; content: string } | undefined;
+    return row !== undefined && instructionContent(row) === entry.afterSha256;
+  } finally {
+    db.close();
+  }
+}
+
+/** Record one explicit guarded canonical write (absent before, the returned canonical row after). */
+export function recordConversationWrite(c: RehearsalCase, projectId: string, record: { readonly sessionId: string; readonly title: string | null }): void {
+  c.mutations.push({
+    domain: "conversation", identitySha256: sha256(["conversation", projectId, record.sessionId].join("\0")), locator: record.sessionId,
+    beforeSha256: sha256("absent"), afterSha256: sha256(JSON.stringify([record.sessionId, record.title])),
+  });
+}
+
+/** After a rollback: every guarded write is present in the restored SQLite project with its recorded content. */
+export function assertWritesRestored(c: RehearsalCase, databasePath: string, label: string): void {
+  const db = new DatabaseSync(databasePath, { readOnly: true });
+  try {
+    for (const entry of c.mutations.filter((candidate) => candidate.domain === "conversation")) {
+      const row = db.prepare("SELECT session_id,title FROM conversations WHERE session_id = ?").get(entry.locator) as { session_id: string; title: string | null } | undefined;
+      if (row === undefined || sha256(JSON.stringify([row.session_id, row.title])) !== entry.afterSha256) {
+        c.invariants.I3 ??= { status: "pass", evidenceRefs: [] };
+        c.invariants.I3.status = "fail";
+        throw new Error("I3 guarded write not restored at " + label);
+      }
+    }
+  } finally {
+    db.close();
+  }
+  c.mark("I3", "guarded-writes-restored:" + label);
 }
 
 // ─── Genuine process kill at a named existing seam ─────────────────────────
@@ -995,9 +1233,11 @@ const WORKER_PATH = join(process.cwd(), "test/postgresql/fixtures/cutover-rehear
 
 /** Fork the rehearsal worker, wait for its readiness message at the named seam, SIGKILL exactly that process group, await close. */
 export async function killWorkerAtSeam(c: RehearsalCase, boundary: string): Promise<{ readonly signal: string | null; readonly generationId: string }> {
+  c.checkpoint();
   const child = fork(WORKER_PATH, [], {
     cwd: c.h.cwd, env: { ...c.h.env, LCM_REHEARSAL_WORKER_BOUNDARY: boundary }, stdio: ["ignore", "pipe", "pipe", "ipc"], detached: true,
   });
+  registerChild(child.pid);
   const signalGroup = (signal: NodeJS.Signals): void => {
     if (child.pid === undefined) return;
     try { process.kill(-child.pid, signal); } catch (error) {
@@ -1020,6 +1260,8 @@ export async function killWorkerAtSeam(c: RehearsalCase, boundary: string): Prom
     child.once("close", () => reject(new Error("rehearsal worker exited before reaching the seam")));
   });
   const deadline = setTimeout(() => signalGroup("SIGKILL"), 30_000);
+  const cancel = (): void => signalGroup("SIGKILL");
+  c.signal.addEventListener("abort", cancel, { once: true });
   try {
     const reached = await ready;
     signalGroup("SIGKILL");
@@ -1028,6 +1270,7 @@ export async function killWorkerAtSeam(c: RehearsalCase, boundary: string): Prom
     return { signal: outcome.signal, generationId: reached.generationId };
   } finally {
     clearTimeout(deadline);
+    c.signal.removeEventListener("abort", cancel);
     signalGroup("SIGKILL");
     await closed;
     if (child.pid !== undefined) {
@@ -1086,13 +1329,14 @@ export async function interruptActivation(c: RehearsalCase, interruption: Activa
       }),
     };
   const label = interruption.kind === "crash-point" ? interruption.point : interruption.phase;
+  c.checkpoint();
   const outcome = await withOperatorEnv(c, home, async () => {
     const destination = await resolveMigrationDestination({ cwd: home.cwd, homeDir: home.home });
     if (destination.status === "refuse") throw new Error("rehearsal destination did not resolve: " + destination.reason);
     try {
       const result = await runMigrationActivation({
         homeDir: home.home, generationId: c.gen, transferSettings: destination.settings, ordinarySettings: destination.settings,
-        expectedIdentity: destination.expectedIdentity, expectedOwner: destination.expectedOwner,
+        expectedIdentity: destination.expectedIdentity, expectedOwner: destination.expectedOwner, signal: c.signal,
       }, deps);
       return "returned:" + result.status;
     } catch (error) {
@@ -1175,6 +1419,7 @@ export async function competingPublicationFence(c: RehearsalCase): Promise<Compe
  * connection: the real COMMIT is awaited first, then ECONNRESET is raised, exactly as migration-copy.integration.ts does.
  */
 export async function applyWithResponseLoss(c: RehearsalCase): Promise<{ readonly lost: boolean; readonly status: string }> {
+  c.checkpoint();
   return withOperatorEnv(c, c.h, async () => {
     const cwd = c.h.cwd;
     const homeDir = c.h.home;
@@ -1247,34 +1492,115 @@ export function recordRepresented(c: RehearsalCase, data: readonly string[]): vo
   }
 }
 
-export interface InboxRow { readonly event_id: string; readonly status: string; readonly machine_sequence: string }
+export interface InboxRow {
+  readonly inbox_id: string; readonly project_id: string; readonly machine_id: string; readonly event_id: string; readonly event_version: number;
+  readonly machine_sequence: string; readonly event_type: string; readonly status: string; readonly payload: Record<string, unknown>;
+}
 
 /** PostgreSQL inbox disposition per event: the remote half of the I3 join. */
 export async function inboxRows(db: PostgreSqlTestDatabase): Promise<InboxRow[]> {
-  return await adminSql(db, "SELECT event_id::text AS event_id, status, machine_sequence::text AS machine_sequence FROM lcm.passive_event_inbox ORDER BY machine_sequence") as unknown as InboxRow[];
+  return await adminSql(db, "SELECT inbox_id::text AS inbox_id, project_id::text AS project_id, machine_id::text AS machine_id, event_id::text AS event_id, event_version, machine_sequence::text AS machine_sequence, event_type, status, payload FROM lcm.passive_event_inbox ORDER BY machine_sequence") as unknown as InboxRow[];
+}
+
+/** The canonical envelope fields a payload carries, flattened one level. */
+function payloadFields(payload: Record<string, unknown>): Record<string, unknown> {
+  const nested = payload.event;
+  return nested !== null && typeof nested === "object" && !Array.isArray(nested) ? { ...payload, ...(nested as Record<string, unknown>) } : payload;
 }
 
 /**
- * I3 join after a bounded drain: every acknowledged input is still retained locally with an identical envelope, no
- * PostgreSQL inbox row is foreign to the ledger, and no event has more than one remote disposition. Remote delivery is
- * asynchronous with backoff, so the observed dispositions are recorded as evidence, not required to be terminal.
+ * Wait, for a bounded budget and against a directly observable state, until the running daemon's replication has
+ * delivered every named input: the local sidecar row is acknowledged and points at its inbox row. The daemon's own
+ * replication diagnostics (from its status route) are recorded as evidence; nothing is retried or forced.
  */
-export async function assertEventsJoined(c: RehearsalCase, label: string): Promise<void> {
+export async function awaitDelivery(c: RehearsalCase, daemon: RunningDaemon, names: readonly string[], budgetMs = 60_000): Promise<void> {
+  const deadline = Date.now() + budgetMs;
+  const delivered = (): boolean => {
+    const rows = readEventRows(c.h);
+    return names.every((name) => {
+      const row = rows.find((candidate) => candidate.data === name);
+      return row !== undefined && row.delivery_state === "acknowledged" && row.remote_inbox_id !== null;
+    });
+  };
+  for (;;) {
+    c.checkpoint();
+    if (delivered()) break;
+    if (Date.now() > deadline) {
+      c.invariants.I3 ??= { status: "pass", evidenceRefs: [] };
+      c.invariants.I3.status = "fail";
+      const events = new DatabaseSync(join(c.h.home, ".lcm", "events", c.h.localProjectId + ".db"), { readOnly: true });
+      let states: string[];
+      try {
+        states = (events.prepare("SELECT data, delivery_state, delivery_attempts, delivery_last_error FROM events").all() as { data: string; delivery_state: string; delivery_attempts: number; delivery_last_error: string | null }[])
+          .filter((row) => names.includes(row.data)).map((row) => row.data + "=" + row.delivery_state + "/" + String(row.delivery_attempts) + "/" + String(row.delivery_last_error).slice(0, 80));
+      } finally { events.close(); }
+      throw new Error("the daemon did not deliver the drained inputs within the budget: " + states.join(","));
+    }
+    await delay(500);
+  }
+  const status = await daemon.client.post<{ passiveEvents?: { replication?: Record<string, unknown> } }>("/status", { cwd: c.h.cwd }, { timeoutMs: 30_000 });
+  const replication = status.passiveEvents?.replication;
+  if (replication?.enabled !== true || Number(replication.passes) < 1 || Number(replication.acknowledged) < names.length) {
+    c.invariants.I3 ??= { status: "pass", evidenceRefs: [] };
+    c.invariants.I3.status = "fail";
+    throw new Error("the daemon reports no replication pass: " + JSON.stringify(replication));
+  }
+  c.mark("I3", "replication:passes=" + String(replication.passes) + ",acknowledged=" + String(replication.acknowledged));
+}
+
+/**
+ * I3 join after a bounded drain. Every acknowledged input of the focused project is still retained locally with an
+ * identical scoped envelope; the PostgreSQL inbox holds no row that is foreign to the ledger and at most one per
+ * (machine, event); and each event named in "eligible" (the inputs that existed when the drain was requested) has exactly
+ * one terminal "applied" disposition for the right project, machine, sequence and canonical envelope, with the local row
+ * pointing at that inbox row. Inputs appended after the drain are only required to be retained.
+ */
+export async function assertEventsJoined(c: RehearsalCase, label: string, eligible: readonly string[] = []): Promise<void> {
   assertLedgerRetained(c, label);
   const rows = await inboxRows(c.db);
-  const known = new Set(c.ledger.map((entry) => entry.eventUuid));
+  const projectId = await destinationProjectId(c.db, c.h.cwd);
+  const scoped = c.ledger.filter((entry) => entry.projectId === c.h.localProjectId);
+  const keyOf = (machineId: string, eventId: string): string => machineId + ":" + eventId;
+  const known = new Map(scoped.map((entry) => [keyOf(entry.machineId, entry.eventUuid), entry]));
+  const ofProject = rows.filter((row) => row.project_id === projectId);
   const counts = new Map<string, number>();
-  for (const row of rows) counts.set(row.event_id, (counts.get(row.event_id) ?? 0) + 1);
-  const foreign = rows.filter((row) => !known.has(row.event_id)).length;
+  for (const row of ofProject) counts.set(keyOf(row.machine_id, row.event_id), (counts.get(keyOf(row.machine_id, row.event_id)) ?? 0) + 1);
+  const foreign = ofProject.filter((row) => !known.has(keyOf(row.machine_id, row.event_id))).length;
   const duplicated = [...counts.values()].filter((count) => count > 1).length;
   const byStatus: Record<string, number> = {};
-  for (const row of rows) byStatus[row.status] = (byStatus[row.status] ?? 0) + 1;
+  for (const row of ofProject) byStatus[row.status] = (byStatus[row.status] ?? 0) + 1;
   c.invariants.I3 ??= { status: "pass", evidenceRefs: [] };
   c.invariants.I3.evidenceRefs.push(label + ":inbox=" + JSON.stringify(byStatus));
-  if (foreign > 0 || duplicated > 0) {
-    c.invariants.I3.status = "fail";
-    throw new Error("I3 remote join failed at " + label + ": foreign=" + String(foreign) + " duplicated=" + String(duplicated));
+  const problems: string[] = [];
+  if (foreign > 0 || duplicated > 0) problems.push("foreign=" + String(foreign) + " duplicated=" + String(duplicated));
+  const local = new Map(readEventRows(c.h).map((row) => [row.event_uuid, row]));
+  for (const name of eligible) {
+    const entry = scoped.find((candidate) => candidate.data === name);
+    if (entry === undefined) { problems.push("eligible input not in the ledger: " + name); continue; }
+    const matches = ofProject.filter((row) => keyOf(row.machine_id, row.event_id) === keyOf(entry.machineId, entry.eventUuid));
+    const localRow = local.get(entry.eventUuid);
+    if (matches.length === 0) {
+      // Delivered events are acknowledged locally and their inbox row is pruned afterwards: that is one terminal disposition.
+      if (localRow === undefined || localRow.delivery_state !== "acknowledged" || localRow.remote_inbox_id === null || localRow.remote_pruned_at === null) {
+        problems.push(name + ": no remote disposition and not acknowledged-and-pruned locally (" + String(localRow?.delivery_state) + ")");
+      }
+      continue;
+    }
+    const row = matches[0]!;
+    if (matches.length !== 1) { problems.push(name + ": " + String(matches.length) + " remote dispositions"); continue; }
+    const fields = payloadFields(row.payload);
+    if (row.status !== "applied") problems.push(name + ": remote status " + row.status);
+    if (row.machine_sequence !== entry.machineSequence) problems.push(name + ": remote sequence " + row.machine_sequence);
+    if (row.event_type !== localRow?.type) problems.push(name + ": remote type " + row.event_type);
+    if (fields.data !== entry.data) problems.push(name + ": payload data differs");
+    for (const key of ["category", "priority"] as const) if (key in fields && fields[key] !== localRow?.[key]) problems.push(name + ": payload " + key);
+    if (localRow === undefined || localRow.remote_inbox_id === null || String(localRow.remote_inbox_id) !== row.inbox_id) problems.push(name + ": local row does not point at inbox row " + row.inbox_id);
   }
+  if (problems.length > 0) {
+    c.invariants.I3.status = "fail";
+    throw new Error("I3 remote join failed at " + label + ": " + problems.join("; "));
+  }
+  if (eligible.length > 0) c.mark("I3", label + ":drained=" + String(eligible.length));
 }
 
 // ─── In-process module-seam interruption of the production rollback ───────
@@ -1286,7 +1612,7 @@ export async function prepareGuardedWriter(c: RehearsalCase): Promise<(sessionId
   return async (sessionId: string): Promise<void> => {
     const runtime = new PostgreSqlRuntime(connection);
     try {
-      await new PostgreSqlConversationRepository(runtime, projectId).createConversation({ sessionId });
+      recordConversationWrite(c, projectId, await new PostgreSqlConversationRepository(runtime, projectId).createConversation({ sessionId }));
     } finally {
       await runtime.close();
     }
@@ -1341,7 +1667,7 @@ export async function interruptRollback(c: RehearsalCase, interruption: Rollback
   const label = interruption.kind === "publication-phase" ? interruption.phase : interruption.kind;
   const outcome = await withOperatorEnv(c, home, async () => {
     try {
-      const result = await runMigrationRollbackFromHome({ homeDir: home.home, generationId: c.gen }, dependencies);
+      const result = await runMigrationRollbackFromHome({ homeDir: home.home, generationId: c.gen, signal: c.signal }, dependencies);
       return "returned:" + result.manifest.phase;
     } catch (error) {
       return "threw:" + (error instanceof Error ? error.name : "unknown");
@@ -1406,7 +1732,7 @@ export async function interruptSetActivation(c: RehearsalCase, interruption: Set
         }),
       };
     try {
-      const result = await activateCutoverSet({ homeDir: c.h.home, confirmSetId: c.gen, targetConfig }, dependencies);
+      const result = await activateCutoverSet({ homeDir: c.h.home, confirmSetId: c.gen, targetConfig, signal: c.signal }, dependencies);
       return "returned:" + result.status;
     } catch (error) {
       if (error instanceof InjectedInterruption) return "interrupted";
@@ -1449,7 +1775,7 @@ export async function interruptSetRollback(c: RehearsalCase, interruption: SetRo
       dependencies = { ...base, installGeneration: (...args: Parameters<typeof base.installGeneration>) => { if (!fired) { fired = true; throw new Error("rehearsal install failure"); } return base.installGeneration(...args); } };
     }
     try {
-      const result = await rollbackCutoverSet({ homeDir: c.h.home, confirmSetId: c.gen }, dependencies);
+      const result = await rollbackCutoverSet({ homeDir: c.h.home, confirmSetId: c.gen, signal: c.signal }, dependencies);
       return "returned:" + result.status;
     } catch (error) {
       if (error instanceof InjectedInterruption) return "interrupted";
@@ -1470,7 +1796,7 @@ export async function interruptSetPrepare(c: RehearsalCase, targetConfig: Return
     const candidate = await resolveCutoverSetCandidate({ homeDir: c.h.home, targetConfig });
     if (candidate.status !== "candidate" || candidate.setId !== c.gen) throw new Error("rehearsal set candidate did not resolve to the planned set");
     const result = await prepareCutoverSet({
-      homeDir: c.h.home, confirmSetId: candidate.setId, targetConfig, maxRecords: 1, maxBytes: 16 * 1024 * 1024,
+      homeDir: c.h.home, confirmSetId: candidate.setId, targetConfig, maxRecords: 1, maxBytes: 16 * 1024 * 1024, signal: c.signal,
       copyTesting: { observe: async (boundary) => {
         if (boundary === "before-source") sources += 1;
         if (sources === 2 && boundary === "after-checkpoint") { fired = true; throw new InjectedInterruption("second-member-after-checkpoint"); }
@@ -1489,6 +1815,7 @@ export async function interruptSetPrepare(c: RehearsalCase, targetConfig: Return
  * journal with a partial snapshot. The third project copy is the artifact capture itself.
  */
 export async function capturePartialSnapshot(c: RehearsalCase): Promise<string> {
+  c.checkpoint();
   const outcome = await withOperatorEnv(c, c.h, async () => {
     const cwd = c.h.cwd;
     const homeDir = c.h.home;
@@ -1519,4 +1846,24 @@ export async function capturePartialSnapshot(c: RehearsalCase): Promise<string> 
   c.injections.push({ surface: "module-seam", boundary: "source copy of the artifact capture", kind: "injected-capture-failure", hitCount: 1, outcome });
   c.note("interrupt-capture", "module-seam", ["after-source-copy:project:3"]);
   return outcome;
+}
+
+/** Structural proof that the row's owned role has lost every privilege on the selected schema (no exception text involved). */
+export async function roleHasNoPrivileges(db: PostgreSqlTestDatabase, role: RehearsalRole): Promise<boolean> {
+  const rows = await adminSql(db, "SELECT has_schema_privilege($1, 'lcm', 'USAGE') AS usage, has_table_privilege($1, 'lcm.projects', 'SELECT') AS selectable", [role.name]);
+  return rows[0]?.usage === false && rows[0]?.selectable === false;
+}
+
+/** One bounded native allocation in the restored SQLite database: the next identifier must not collide with a restored one. */
+export function assertNativeAllocationSafe(c: RehearsalCase, databasePath: string): void {
+  const db = new DatabaseSync(databasePath);
+  try {
+    const before = (db.prepare("SELECT MAX(conversation_id) AS maximum FROM conversations").get() as { maximum: number | bigint | null }).maximum;
+    const stamp = "2026-10-24 00:00:00.000001";
+    const inserted = db.prepare("INSERT INTO conversations(session_id,title,created_at,updated_at) VALUES('rehearsal-native-allocation',NULL,?,?)").run(stamp, stamp);
+    if (before !== null && BigInt(inserted.lastInsertRowid) <= BigInt(before)) throw new Error("the native allocation collided with a restored identifier");
+    c.mark("I4", "native-allocation-after-recovery:" + String(inserted.lastInsertRowid));
+  } finally {
+    db.close();
+  }
 }

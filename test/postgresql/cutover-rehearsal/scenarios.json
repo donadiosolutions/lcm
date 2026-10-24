@@ -706,7 +706,7 @@
         "I5": "na:no unreachable-target step in this row; disclosure scan still runs on every step",
         "I6": "required"
       },
-      "notes": "Plan-v1 F1-empty (no user rows) is replaced by a one-conversation, one-message home because an empty enrolled project cannot reach activation eligibility (#1676); the empty refusal is row F1-empty-refusal."
+      "notes": "F1-empty keeps a one-conversation, one-message home so the smallest non-empty flow stays in the default profile; the empty enrolled project has its own success row, F1-empty-project (#1676 fixed on main)."
     },
     {
       "profiles": [
@@ -903,7 +903,7 @@
           "boundProjects": 1
         },
         {
-          "checkpoint": "daemon-running",
+          "checkpoint": "after-daemon",
           "lastCommittedBackend": "postgresql",
           "configBackend": "postgresql",
           "admitted": [
@@ -1510,8 +1510,9 @@
       "injections": [
         {
           "surface": "module-seam",
-          "boundary": "rename an identical copy over the sealed normalized project snapshot",
-          "kind": "owned-file-replacement"
+          "boundary": "third project source copy of the artifact capture (existing source-copy observer)",
+          "kind": "injected-capture-failure",
+          "note": "the capture fails after its registration is durable and leaves a held journal with a partial snapshot; an unwinding, not an OS crash"
         }
       ],
       "knownLimits": [],
@@ -2139,7 +2140,7 @@
       "invariants": {
         "I1": "required",
         "I2": "required",
-        "I3": "na:no acknowledged hook input in this row; covered by F5/F6",
+        "I3": "required",
         "I4": "required",
         "I5": "na:no unreachable-target step in this row; disclosure scan still runs on every step",
         "I6": "required"
@@ -2235,7 +2236,7 @@
       "invariants": {
         "I1": "required",
         "I2": "required",
-        "I3": "na:no acknowledged hook input in this row; covered by F5/F6",
+        "I3": "required",
         "I4": "required",
         "I5": "na:no unreachable-target step in this row; disclosure scan still runs on every step",
         "I6": "required"
@@ -2331,7 +2332,7 @@
       "invariants": {
         "I1": "required",
         "I2": "required",
-        "I3": "na:no acknowledged hook input in this row; covered by F5/F6",
+        "I3": "required",
         "I4": "required",
         "I5": "na:no unreachable-target step in this row; disclosure scan still runs on every step",
         "I6": "required"
@@ -2429,7 +2430,7 @@
       "invariants": {
         "I1": "required",
         "I2": "required",
-        "I3": "na:no acknowledged hook input in this row; covered by F5/F6",
+        "I3": "required",
         "I4": "required",
         "I5": "na:no unreachable-target step in this row; disclosure scan still runs on every step",
         "I6": "required"
@@ -2937,7 +2938,7 @@
           "reason": "cutover-restart-required",
           "manifestPhase": null,
           "applied": true,
-          "next": "report",
+          "next": "swap-grants-then-start-daemon",
           "restartAnswer": "unsatisfied"
         },
         {
@@ -2990,18 +2991,12 @@
       "invariants": {
         "I1": "required",
         "I2": "required",
-        "I3": "na:no acknowledged hook input in this row; covered by F5/F6",
+        "I3": "required",
         "I4": "required",
         "I5": "na:no unreachable-target step in this row; disclosure scan still runs on every step",
         "I6": "required"
       },
-      "notes": "Pending the #1683 fix on main: the real stale SQLite daemon answers /health 503 once the hold starts, so activate and report currently exit 5 cutover-restart-contradiction. The row asserts the documented exit 8 restart-required and, after the old daemon stops and a PostgreSQL daemon starts, report exit 0.",
-      "gate": {
-        "status": "pending",
-        "pendingOn": [
-          "https://github.com/donadiosolutions/lcm/issues/1683"
-        ]
-      }
+      "notes": "A real SQLite daemon alive across the cutover: activate and report exit 8 restart-required until it is stopped (#1683 fixed on main). After the restart the new daemon reports PostgreSQL, one bounded drain delivers an input acknowledged after the old daemon stopped, and the SQLite project database is never written by either daemon."
     },
     {
       "profiles": [
@@ -3067,7 +3062,79 @@
         "I5": "na:no unreachable-target step in this row; disclosure scan still runs on every step",
         "I6": "required"
       },
-      "notes": "The single bounded drain request may race the daemon's own sweep and be answered 500 already-in-progress (https://github.com/donadiosolutions/lcm/issues/1684); the harness allows exactly one awaited retry for that refusal and records it in the step command (retried-once-after-lock-contention). Remote delivery is asynchronous, so the row asserts the safety join (retained locally with identical envelopes, no foreign or duplicated remote disposition), not a terminal remote state."
+      "notes": "Retention, held-gap and join-safety assertions; delivery of events that crossed the cutover is asserted by F5-delivery (pending on #1693)."
+    },
+    {
+      "profiles": [
+        "full"
+      ],
+      "timeoutMs": 300000,
+      "supportingTests": [
+        "test/postgresql/passive-event-replication.integration.ts",
+        "test/postgresql/daemon-runtime.integration.ts"
+      ],
+      "knownLimits": [],
+      "id": "F5-delivery",
+      "title": "Hook events around the hold are delivered to PostgreSQL exactly once by the daemon after the cutover",
+      "fixture": "P",
+      "requirement": "Snapshot-to-selection gap; pending queues",
+      "steps": [
+        {
+          "id": "plan",
+          "use": "plan"
+        },
+        {
+          "id": "apply",
+          "use": "apply"
+        },
+        {
+          "id": "verify",
+          "use": "verify"
+        },
+        {
+          "id": "activate",
+          "use": "activate"
+        }
+      ],
+      "injections": [
+        {
+          "surface": "module-seam",
+          "boundary": "real durable hook enqueue during the held gap",
+          "kind": "hook-append-during-hold"
+        }
+      ],
+      "authority": [
+        {
+          "checkpoint": "held",
+          "lastCommittedBackend": "sqlite",
+          "configBackend": "sqlite",
+          "admitted": []
+        },
+        {
+          "checkpoint": "activated",
+          "lastCommittedBackend": "postgresql",
+          "configBackend": "postgresql",
+          "admitted": [
+            "postgresql"
+          ],
+          "boundProjects": 1
+        }
+      ],
+      "invariants": {
+        "I1": "required",
+        "I2": "required",
+        "I3": "required",
+        "I4": "required",
+        "I5": "na:no unreachable-target step in this row; disclosure scan still runs on every step",
+        "I6": "required"
+      },
+      "notes": "Pending the #1693 fix on main: events that crossed the cutover are copied into the PostgreSQL inbox with a different createdAt encoding than the replication worker uploads, so the first post-cutover replication pass fails with an idempotency collision and the batch stays in retry. The row asserts the success end state: every drained input is acknowledged locally and has one terminal remote disposition.",
+      "gate": {
+        "status": "pending",
+        "pendingOn": [
+          "https://github.com/donadiosolutions/lcm/issues/1693"
+        ]
+      }
     },
     {
       "profiles": [
@@ -3166,7 +3233,7 @@
       ],
       "knownLimits": [],
       "id": "F6b",
-      "title": "Drain before the rollback: delivered and retained events survive the rollback",
+      "title": "Drain before the rollback: the drain succeeds, the rollback succeeds and every acknowledged input is retained (#1681 fixed on main)",
       "fixture": "P",
       "requirement": "Pending queues; both rollback modes (post-write with later events)",
       "steps": [
@@ -3240,13 +3307,100 @@
         "I5": "na:no unreachable-target step in this row; disclosure scan still runs on every step",
         "I6": "required"
       },
+      "notes": "Delivery of the drained events to PostgreSQL is asserted by F6b-delivery (pending on #1693)."
+    },
+    {
+      "profiles": [
+        "full"
+      ],
+      "timeoutMs": 300000,
+      "supportingTests": [
+        "test/postgresql/passive-event-replication.integration.ts",
+        "test/migration/receipts.test.ts"
+      ],
+      "knownLimits": [],
+      "id": "F6b-delivery",
+      "title": "Drain before the rollback: the drained events are delivered to PostgreSQL once, then the rollback succeeds",
+      "fixture": "P",
+      "requirement": "Pending queues; both rollback modes (post-write with later events)",
+      "steps": [
+        {
+          "id": "plan",
+          "use": "plan"
+        },
+        {
+          "id": "apply",
+          "use": "apply"
+        },
+        {
+          "id": "verify",
+          "use": "verify"
+        },
+        {
+          "id": "activate",
+          "use": "activate"
+        },
+        {
+          "id": "rollback",
+          "use": "rollback",
+          "evidence": {
+            "cell": 10,
+            "selectedBackend": "sqlite"
+          }
+        },
+        {
+          "id": "report-rolled-back",
+          "use": "report-rolled-back"
+        }
+      ],
+      "injections": [
+        {
+          "surface": "module-seam",
+          "boundary": "exact-envelope receipts recorded for two acknowledged events",
+          "kind": "represented-events"
+        }
+      ],
+      "authority": [
+        {
+          "checkpoint": "held",
+          "lastCommittedBackend": "sqlite",
+          "configBackend": "sqlite",
+          "admitted": []
+        },
+        {
+          "checkpoint": "activated",
+          "lastCommittedBackend": "postgresql",
+          "configBackend": "postgresql",
+          "admitted": [
+            "postgresql"
+          ],
+          "boundProjects": 1
+        },
+        {
+          "checkpoint": "rolled-back",
+          "lastCommittedBackend": "sqlite",
+          "configBackend": "sqlite",
+          "admitted": [
+            "sqlite"
+          ],
+          "boundProjects": 0
+        }
+      ],
+      "invariants": {
+        "I1": "required",
+        "I2": "required",
+        "I3": "required",
+        "I4": "required",
+        "I5": "na:no unreachable-target step in this row; disclosure scan still runs on every step",
+        "I6": "required"
+      },
+      "notes": "Pending the #1693 fix on main: events that crossed the cutover are copied into the PostgreSQL inbox with a different createdAt encoding than the replication worker uploads, so the first post-cutover replication pass fails with an idempotency collision and the batch stays in retry. The row asserts the success end state: every drained input is acknowledged locally and has one terminal remote disposition.",
       "gate": {
         "status": "pending",
         "pendingOn": [
-          "https://github.com/donadiosolutions/lcm/issues/1681"
+          "https://github.com/donadiosolutions/lcm/issues/1693"
         ]
-      },
-      "notes": "Pending #1681: after a bounded drain request the rollback currently refuses with rollback-refused-evidence/unexpected-state (local processed disposition vs a still-pending remote archive row). The row asserts the successful end state."
+      }
     },
     {
       "profiles": [
@@ -3939,9 +4093,9 @@
       "injections": [],
       "knownLimits": [],
       "id": "S1",
-      "title": "Two-project set: plan, previews, apply, verify, activate, grant swap, report and rollback (A pre-write, B post-write)",
+      "title": "Two-project set: plan, previews, apply, verify, activate, grant swap, report and a clean whole-set rollback to both pre-activation states",
       "fixture": "M",
-      "requirement": "Multi-project installation; both rollback modes in one set",
+      "requirement": "Multi-project installation; whole-set pre-write rollback (the post-write set rollback is S3)",
       "steps": [
         {
           "id": "set-plan",
@@ -4000,7 +4154,13 @@
         },
         {
           "id": "set-rollback",
-          "use": "set-rollback"
+          "use": "set-rollback",
+          "evidence": {
+            "memberCount": 2,
+            "selectedBackend": "sqlite",
+            "member.0.mode": "pre-write",
+            "member.1.mode": "pre-write"
+          }
         },
         {
           "id": "set-report-rolled-back",
@@ -4301,7 +4461,7 @@
         },
         {
           "checkpoint": "activation-selection-completed",
-          "lastCommittedBackend": "sqlite",
+          "lastCommittedBackend": "postgresql",
           "admitted": [
             "postgresql"
           ],

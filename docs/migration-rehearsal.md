@@ -6,8 +6,9 @@ against an isolated PostgreSQL 18 container started by the PostgreSQL test harne
 sanitized evidence. It answers one question: when something is interrupted, refused or lost, is
 authority still held by exactly one backend, and is every acknowledged input still there?
 
-It is test infrastructure. It adds no command and changes no runtime behavior. The result of the
-last complete run is in [Rehearsal gate](migration-rehearsal-gate.md).
+It is test infrastructure. It adds no command and changes no runtime behavior. The gate report for a
+complete run is assembled after the full-profile run and committed on its own; until it exists, this
+page describes the rehearsal and its reproduction only.
 
 ## What it proves
 
@@ -24,8 +25,8 @@ manifest.
 | I2 | Every sealed snapshot and evidence file is byte-identical before and after each later step, except a file the row damaged on purpose. |
 | I3 | Every acknowledged hook event is still retained with the same envelope. After a join, no event is duplicated or foreign. |
 | I4 | Canonical data read independently from SQLite and PostgreSQL (per domain count and digest) matches what the row expects after activation, abort and rollback. |
-| I5 | An unreachable selected PostgreSQL fails explicitly and never falls back to SQLite. Raw URLs, passwords and private paths never appear in command output. |
-| I6 | The row's private homes, child processes and owned role are removed; the harness resources are audited after the harness exits. |
+| I5 | A selected PostgreSQL the operator can no longer use fails explicitly (the daemon refuses to start) and never falls back to SQLite. Raw URLs, passwords and private paths never appear in command output. |
+| I6 | The row's private homes and owned role are removed and proved absent (a failed role drop is recorded, not suppressed), its child processes are gone, and the harness resources are audited after the harness exits. |
 
 ## Rows
 
@@ -90,17 +91,27 @@ node test/postgresql/cutover-rehearsal/check-evidence.ts \
   test/postgresql/cutover-rehearsal/evidence-schema.json /private/evidence/rehearsal.json '#/$defs/rehearsal'
 ```
 
-The harness cannot audit itself while it is still running. After it exits, assemble the outer
-cleanup receipt and the gate record, which re-run the label-filtered Podman queries for each
-allocated run id and bind the result to the tested commit:
+Each run also records, when it starts and again when it ends, the tested commit, whether the tree was dirty,
+a digest of the tracked inputs (every tracked path except the two gate files), the lockfile digest and the
+digest of the built `dist/lcm.mjs`, together with the container runtime and harness run id it executed under.
+A run whose inputs or CLI changed while it ran, or whose tree was dirty, cannot become a complete gate.
+
+The harness cannot audit itself while it is still running. After it exits, assemble the outer cleanup
+receipt and the gate record. Name the container runtime explicitly (there is no default) and pass the
+harness run id the run printed (`PostgreSQL harness allocated run: <id>`):
 
 ```bash
-node test/postgresql/cutover-rehearsal/assemble-gate.ts --evidence /private/evidence \
-  --run-id <32-hex harness run id> --harness-exit 0 --out /private/evidence/gate.json
+LCM_TEST_CONTAINER_CLI=podman node test/postgresql/cutover-rehearsal/assemble-gate.ts \
+  --evidence /private/evidence --run-id <32-hex harness run id> --harness-exit 0 --out /private/evidence/gate.json
 ```
 
-A query that fails counts as unverified, never as absent. A labelled container, network or volume
-that remains makes the verdict `incomplete`.
+The assembler re-checks the evidence instead of trusting its verdicts. It requires every row's required
+invariants to have passed and every authority checkpoint to agree with the manifest; the full profile,
+no row filter, no pending row and exactly the checked-in manifest's full-profile rows; the run id and
+runtime that executed the run; a checkout and CLI that still match the run's recorded witnesses; the
+label-filtered container, network and volume queries for the run id (a query that fails counts as
+unverified, never as absent); the private home roots and recorded child processes being gone; and the
+pinned database image digest. Anything missing makes the verdict `incomplete`; a failed row makes it `fail`.
 
 ## Verdicts
 
