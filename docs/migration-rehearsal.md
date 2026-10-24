@@ -23,9 +23,9 @@ manifest.
 | --- | --- |
 | I1 | Durable authority (config, project map, journals) and independent consumer admission name one backend, or none while a hold fences both. Never two. |
 | I2 | Every sealed snapshot and evidence file is byte-identical before and after each later step, except a file the row damaged on purpose. |
-| I3 | Every acknowledged hook event is still retained with the same envelope. After a join, no event is duplicated or foreign. |
+| I3 | Every acknowledged hook event is still retained with the same envelope. After a delivery join, each event the drain could reach has exactly one applied PostgreSQL receipt carrying the full canonical envelope (authenticated against the acknowledged digest); no event is duplicated or foreign. |
 | I4 | Canonical data read independently from SQLite and PostgreSQL (per domain count and digest) matches what the row expects after activation, abort and rollback. |
-| I5 | A selected PostgreSQL the operator can no longer use fails explicitly (the daemon refuses to start) and never falls back to SQLite. Raw URLs, passwords and private paths never appear in command output. |
+| I5 | A selected PostgreSQL the operator can no longer use fails explicitly and never falls back to SQLite: the CLI reports the closed, structured permission class (not a message) and the daemon exits on its own before it is ready. A row whose manifest declares I5 not applicable records it as not applicable with that reason. The disclosure scan of every step's output is recorded as evidence, not as an I5 pass. |
 | I6 | The row's private homes and owned role are removed and proved absent (a failed role drop is recorded, not suppressed), its child processes are gone, and the harness resources are audited after the harness exits. |
 
 ## Rows
@@ -44,7 +44,8 @@ the exact exit class, refusal reason and `next` the executable prints.
 | F7a, F7b, F7c, F7d | Activation interrupted after prepare completes, with the selection prepared, with the project map published but not the config, and after the drive: `report` names `activate` and the retry settles. |
 | F8 | A competing verification fence and a competing publication fence are refused as contention; a superseded fencing token is refused. |
 | F9, H2 | A second registered installation: the first migrates on its own and the second is untouched; a second installation with its own history for a shared project is refused. |
-| F10 | A SQLite daemon alive across activation. |
+| F10 | A SQLite daemon alive across activation: `activate` and `report` answer restart-required until it is stopped, then a PostgreSQL daemon delivers an input once. |
+| R3-replicated | A post-write rollback after replication uploaded an input that is still resident in the PostgreSQL inbox. |
 | F11-tampered, F11-replaced, F11-partial | A damaged, replaced or partial sealed snapshot is classified, refused for resume and activation, and aborted without touching the source. |
 | R1 to R6b | Rollback before activation (refused), before and after a guarded write, writers around the rollback fence, an interrupted rollback and a retry. |
 | L1 | A prepared rollback selection with an out-of-band destination change: refused as drift, nothing forced (known limit, #1529). |
@@ -53,7 +54,20 @@ the exact exit class, refusal reason and `next` the executable prints.
 
 Rows whose expected end state needs a product fix that is not on `main` yet carry a `gate`
 field in the manifest. They are listed under `pending` in the evidence and are not generated. When
-the fix is on `main`, remove the `gate` field; the row already asserts the successful end state.
+the fix is on `main`, remove the `gate` field; the row already asserts the successful end state. The
+assembler derives the pending rows from the manifest and requires the recorded pending list to equal them.
+
+A delivery join needs a receipt that survives the production prune. The daemon replicates only in its
+start-up sweep and every five minutes, so the row drives the production replication worker in process
+(production repositories and apply step, one pass, no retry). A proxy around the remote repository reads
+the applied inbox rows immediately before the worker's prune call, so the join compares the row as
+replication applied it. No trigger or other catalog object is added; the runtime readiness fingerprint
+refuses one. The PostgreSQL daemon still starts afterwards and must report a replication pass.
+
+Every row runs under one execution budget that cancels its administrative statements, grant swaps,
+the in-process module seams that accept a signal and the harness waits; cleanup then runs on its own
+bounded budget. Two boundaries cannot be cancelled precisely: an in-process module call that takes no
+signal finishes its current statement first, and the harness `withPostgreSqlTestDatabase` itself.
 
 Injected interruptions that unwind with an error (`InjectedInterruption`) model a process that
 stopped at that boundary, not an operating-system crash. The one real kill (F2's copy worker, SIGKILL) is recorded as such in the row's `injections`.

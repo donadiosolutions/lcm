@@ -297,6 +297,7 @@
         "injections",
         "authority",
         "invariants",
+        "disclosureScan",
         "acknowledgedInputDigest",
         "canonicalDomainDigests",
         "knownLimits",
@@ -377,6 +378,20 @@
             },
             "I6": {
               "$ref": "#/$defs/invariant"
+            }
+          }
+        },
+        "disclosureScan": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": [
+            "cliSteps"
+          ],
+          "properties": {
+            "cliSteps": {
+              "type": "integer",
+              "minimum": 0,
+              "maximum": 4096
             }
           }
         },

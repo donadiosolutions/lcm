@@ -27,6 +27,10 @@ import { syncPrivateDirectory } from "../../../src/security-files.js";
 import { DaemonClient, type DaemonHealth } from "../../../src/daemon/client.js";
 import { PostgreSqlConversationRepository } from "../../../src/storage/postgresql/conversation-repository.js";
 import { PostgreSqlRuntime } from "../../../src/storage/postgresql/runtime.js";
+import { PassiveEventReplicationWorker } from "../../../src/daemon/passive-event-replication.js";
+import { applyReplicatedPassiveEvent } from "../../../src/daemon/passive-event-replication-pass.js";
+import { SQLiteLocalHookOutboxFactory } from "../../../src/storage/local-hook-outbox.js";
+import { PostgreSqlPassiveEventRepository } from "../../../src/storage/postgresql/passive-event-repository.js";
 import { closeLcmConnection } from "../../../src/db/connection.js";
 import { runLcmMigrations } from "../../../src/db/migration.js";
 import { localProjectIdentity } from "../../../src/daemon/project.js";
@@ -90,10 +94,10 @@ export interface RehearsalRole {
   profile: GrantProfile;
 }
 
-async function applyProfile(db: PostgreSqlTestDatabase, role: string, profile: GrantProfile): Promise<void> {
+async function applyProfile(db: PostgreSqlTestDatabase, role: string, profile: GrantProfile, signal?: AbortSignal): Promise<void> {
   const administrator = new PostgreSqlRuntime(settings(db.adminUrl));
   try {
-    const run = (text: string, operation: string) => administrator.query({ text }, { domain: "factory", operation });
+    const run = (text: string, operation: string) => administrator.query({ text }, { domain: "factory", operation, ...(signal === undefined ? {} : { signal }) });
     await run("DROP OWNED BY " + role, "rehearsalRevokeRole");
     if (profile === "none") return;
     await run('GRANT CONNECT ON DATABASE "' + db.name + '" TO ' + role, "rehearsalGrantConnect");
@@ -109,36 +113,49 @@ async function applyProfile(db: PostgreSqlTestDatabase, role: string, profile: G
   }
 }
 
-/** A dedicated login role holding the transfer profile, as an operator provisions the canonical transfer role. */
-export async function provisionRole(db: PostgreSqlTestDatabase): Promise<RehearsalRole> {
+/**
+ * Create the row's dedicated login role. The caller owns the returned role from this point on, so a later provisioning
+ * failure still drops it (the role is cluster-wide and outside the harness's labelled-resource audit).
+ */
+export async function createRole(db: PostgreSqlTestDatabase, signal?: AbortSignal): Promise<RehearsalRole> {
   const name = "lcm_rh_" + randomBytes(6).toString("hex");
   const password = randomBytes(18).toString("hex");
   const administrator = new PostgreSqlRuntime(settings(db.adminUrl));
+  const context = (operation: string) => ({ domain: "factory" as const, operation, ...(signal === undefined ? {} : { signal }) });
   try {
-    await administrator.query({ text: "CREATE ROLE " + name + " LOGIN PASSWORD '" + password + "'" }, { domain: "factory", operation: "rehearsalCreateRole" });
-    await administrator.query({ text: "REVOKE USAGE ON SCHEMA lcm FROM lcm_test_runtime" }, { domain: "factory", operation: "rehearsalRevokeBaseline" });
+    await administrator.query({ text: "CREATE ROLE " + name + " LOGIN PASSWORD '" + password + "'" }, context("rehearsalCreateRole"));
   } finally {
     await administrator.close();
   }
   const url = new URL(db.runtimeUrl);
   url.username = name;
   url.password = password;
-  const role: RehearsalRole = { name, url: url.toString(), profile: "transfer" };
-  await applyProfile(db, name, "transfer");
-  return role;
+  return { name, url: url.toString(), profile: "none" };
+}
+
+/** Give the created role the transfer profile, as an operator provisions the canonical transfer role. */
+export async function provisionRole(db: PostgreSqlTestDatabase, role: RehearsalRole, signal?: AbortSignal): Promise<void> {
+  const administrator = new PostgreSqlRuntime(settings(db.adminUrl));
+  try {
+    await administrator.query({ text: "REVOKE USAGE ON SCHEMA lcm FROM lcm_test_runtime" }, { domain: "factory", operation: "rehearsalRevokeBaseline", ...(signal === undefined ? {} : { signal }) });
+  } finally {
+    await administrator.close();
+  }
+  await applyProfile(db, role.name, "transfer", signal);
+  role.profile = "transfer";
 }
 
 /** The operator's grant swap (and its reverse): drop the role's grants and install the other profile. */
-export async function swapGrants(db: PostgreSqlTestDatabase, role: RehearsalRole, profile: GrantProfile): Promise<void> {
-  await applyProfile(db, role.name, profile);
+export async function swapGrants(db: PostgreSqlTestDatabase, role: RehearsalRole, profile: GrantProfile, signal?: AbortSignal): Promise<void> {
+  await applyProfile(db, role.name, profile, signal);
   role.profile = profile;
 }
 
-export async function dropRole(db: PostgreSqlTestDatabase, role: RehearsalRole): Promise<void> {
+export async function dropRole(db: PostgreSqlTestDatabase, role: RehearsalRole, signal?: AbortSignal): Promise<void> {
   const administrator = new PostgreSqlRuntime(settings(db.adminUrl));
   try {
-    await administrator.query({ text: "DROP OWNED BY " + role.name }, { domain: "factory", operation: "rehearsalDropOwned" });
-    await administrator.query({ text: "DROP ROLE " + role.name }, { domain: "factory", operation: "rehearsalDropRole" });
+    await administrator.query({ text: "DROP OWNED BY " + role.name }, { domain: "factory", operation: "rehearsalDropOwned", ...(signal === undefined ? {} : { signal }) });
+    await administrator.query({ text: "DROP ROLE " + role.name }, { domain: "factory", operation: "rehearsalDropRole", ...(signal === undefined ? {} : { signal }) });
   } finally {
     await administrator.close();
   }
@@ -185,14 +202,22 @@ export async function unusedPort(): Promise<number> {
 export function createHome(label: string, role: RehearsalRole, daemonPort: number, projectName = "project"): RehearsalHome {
   const root = mkdtempSync(join(tmpdir(), "lcm-rh-" + label.toLowerCase().replace(/[^a-z0-9]+/gu, "") + "-"));
   const home = join(root, "home");
-  mkdirSync(join(home, ".lcm"), { recursive: true, mode: 0o700 });
-  writeFileSync(configPath(home), JSON.stringify({
-    storage: { backend: "sqlite", postgresql: { migrationRole: MIGRATION_ROLE } },
-    daemon: { port: daemonPort },
-  }) + "\n", { mode: 0o600 });
-  const env = childEnvironment(root, home, role);
-  return addProject({ root, home, cwd: "", localProjectId: "", projectDir: "", env }, projectName);
+  try {
+    mkdirSync(join(home, ".lcm"), { recursive: true, mode: 0o700 });
+    writeFileSync(configPath(home), JSON.stringify({
+      storage: { backend: "sqlite", postgresql: { migrationRole: MIGRATION_ROLE } },
+      daemon: { port: daemonPort },
+    }) + "\n", { mode: 0o600 });
+    const env = childEnvironment(root, home, role);
+    return addProject({ root, home, cwd: "", localProjectId: "", projectDir: "", env }, projectName);
+  } catch (error) {
+    rmSync(root, { recursive: true });
+    throw error;
+  }
 }
+
+/** The home of a row whose setup failed before any home was created; cleanup skips it. */
+export const NO_HOME: RehearsalHome = { root: "", home: "", cwd: "", localProjectId: "", projectDir: "", env: {} };
 
 export function addProject(base: RehearsalHome, projectName: string): RehearsalHome {
   const cwd = join(base.root, projectName);
@@ -401,16 +426,18 @@ export function sqliteDomainDigests(databasePath: string): DomainDigests {
 }
 
 /** The same domains from PostgreSQL for the project bound to the given normalized path. */
-export async function postgresDomainDigests(db: PostgreSqlTestDatabase, normalizedPath: string): Promise<DomainDigests> {
+export async function postgresDomainDigests(db: PostgreSqlTestDatabase, normalizedPath: string, signal?: AbortSignal): Promise<DomainDigests> {
   const administrator = new PostgreSqlRuntime(settings(db.adminUrl));
   try {
+    const context = (operation: string) => ({ domain: "factory" as const, operation, ...(signal === undefined ? {} : { signal }) });
     const found = await administrator.query<{ project_id: string }>({
       text: "SELECT project_id FROM lcm.project_aliases WHERE normalized_path = $1 LIMIT 1", values: [normalizedPath],
-    }, { domain: "factory", operation: "rehearsalFindProject" });
+    }, context("rehearsalFindProject"));
     const projectId = found.rows[0]?.project_id;
     if (projectId === undefined) throw new Error("rehearsal destination project is absent");
     const rows = async (text: string): Promise<(readonly unknown[])[]> => {
-      const result = await administrator.query({ text, values: [projectId] }, { domain: "factory", operation: "rehearsalDigest" });
+      signal?.throwIfAborted();
+      const result = await administrator.query({ text, values: [projectId] }, context("rehearsalDigest"));
       return result.rows.map((record: Record<string, unknown>) => Object.values(record));
     };
     const memories = (await rows("SELECT memory_id,content,depth,confidence::text,(archived_at IS NOT NULL)::text," + pgTs("created_at") + " FROM lcm.promoted_memories WHERE project_id=$1"))
@@ -526,6 +553,7 @@ export function artifactSetSha256(artifacts: readonly ArtifactWitness[]): string
 
 /** I6: tear a home down and prove it absent. */
 export function removeHome(h: RehearsalHome): boolean {
+  if (h.root === "") return true; // setup failed before the home existed
   closeLcmConnection();
   rmSync(h.root, { recursive: true });
   return !existsSync(h.root);
@@ -648,6 +676,8 @@ export class RehearsalCase {
   readonly cleanupProblems: string[] = [];
   /** Throws when the scenario budget is spent. */
   checkpoint(): void { this.signal.throwIfAborted(); }
+  /** One administrative statement in the isolated database, bound to the scenario budget. */
+  sql(text: string, values: unknown[] = []): Promise<Record<string, unknown>[]> { return adminSql(this.db, text, values, this.signal); }
   private started = Date.now();
 
   constructor(
@@ -808,7 +838,9 @@ export class RehearsalCase {
    * I6 for this scenario: private homes are removed and proven absent, and the owned role is dropped and proven absent.
    * Every failure is recorded (never suppressed) and never prevents the remaining steps.
    */
-  async cleanup(): Promise<void> {
+  async cleanup(signal?: AbortSignal): Promise<void> {
+    // Cleanup runs on its own bounded budget: the execution budget may already be spent.
+    if (signal !== undefined) this.signal = signal;
     const homes = [this.h, ...this.extraHomes];
     const roots = homes.map((home) => home.root);
     const absent: boolean[] = [];
@@ -816,13 +848,13 @@ export class RehearsalCase {
       try { absent.push(removeHome(home)); } catch (error) { absent.push(false); this.cleanupProblems.push("home removal failed: " + (error instanceof Error ? error.name : "error")); }
     }
     let roleAbsent = false;
-    try { await dropRole(this.db, this.role); } catch (error) { this.cleanupProblems.push("role drop failed: " + (error instanceof Error ? error.name : "error")); }
+    try { await dropRole(this.db, this.role, this.signal); } catch (error) { this.cleanupProblems.push("role drop failed: " + (error instanceof Error ? error.name : "error")); }
     try {
-      roleAbsent = (await adminSql(this.db, "SELECT 1 AS present FROM pg_catalog.pg_roles WHERE rolname = $1", [this.role.name])).length === 0;
+      roleAbsent = (await this.sql("SELECT 1 AS present FROM pg_catalog.pg_roles WHERE rolname = $1", [this.role.name])).length === 0;
     } catch (error) { this.cleanupProblems.push("role absence query failed: " + (error instanceof Error ? error.name : "error")); }
     if (!roleAbsent) this.cleanupProblems.push("owned role still present");
     if (!absent.every(Boolean)) this.cleanupProblems.push("a private home is still present");
-    this.homeRoots.push(...roots);
+    this.homeRoots.push(...roots.filter((root) => root !== ""));
     this.invariants.I6 = {
       status: this.cleanupProblems.length === 0 ? "pass" : "fail",
       evidenceRefs: ["homes-absent:" + String(absent.length), "owned-role-absent:" + String(roleAbsent)],
@@ -884,7 +916,10 @@ export class RehearsalCase {
       const declared = this.spec.invariants[key];
       const asserted = this.invariants[key];
       if (declared.startsWith("na:")) {
-        invariants[key] = asserted ?? { status: "not-applicable", evidenceRefs: [], reason: declared.slice(3) };
+        // The manifest's declaration decides: a not-applicable invariant stays not-applicable (a later mark() cannot turn it into
+        // a pass) unless the row actually failed it, and a row that asserts an invariant it declared not applicable is inconsistent.
+        invariants[key] = asserted?.status === "fail" ? asserted : { status: "not-applicable", evidenceRefs: [], reason: declared.slice(3) };
+        if (asserted?.status === "pass") problems.push(key + ":asserted although the manifest declares it not applicable");
       } else if (asserted === undefined) {
         invariants[key] = { status: "fail", evidenceRefs: [], reason: "not asserted" };
       } else {
@@ -898,6 +933,8 @@ export class RehearsalCase {
       record: {
         id: this.spec.id, fixture: this.spec.fixture, parameters: {}, supportingTests: this.spec.supportingTests,
         steps: this.steps, injections: this.injections, authority: this.authorities, invariants,
+        // The disclosure scan runs on every command step; it is evidence, not an I5 assertion.
+        disclosureScan: { cliSteps: this.steps.filter((step) => step.surface === "cli" && step.exitCode !== null).length },
         acknowledgedInputDigest: this.acknowledgedInputDigest(),
         canonicalDomainDigests: this.canonicalDomainDigests.map((entry) => ({ label: entry.label, domains: entry.domains })),
         knownLimits: this.spec.knownLimits, artifacts: this.artifacts, elapsedMs: Date.now() - this.started,
@@ -1020,17 +1057,17 @@ export async function withDaemon<T>(
 // ─── Case helpers: guarded write, administrative mutation, snapshot damage ──
 
 /** Run one administrative statement in the case's isolated database (the injected, unguarded mutation). */
-export async function adminSql(db: PostgreSqlTestDatabase, text: string, values: unknown[] = []): Promise<Record<string, unknown>[]> {
+export async function adminSql(db: PostgreSqlTestDatabase, text: string, values: unknown[] = [], signal?: AbortSignal): Promise<Record<string, unknown>[]> {
   const administrator = new PostgreSqlRuntime(settings(db.adminUrl));
   try {
-    return (await administrator.query({ text, values }, { domain: "factory", operation: "rehearsalAdminSql" })).rows as Record<string, unknown>[];
+    return (await administrator.query({ text, values }, { domain: "factory", operation: "rehearsalAdminSql", ...(signal === undefined ? {} : { signal }) })).rows as Record<string, unknown>[];
   } finally {
     await administrator.close();
   }
 }
 
-export async function destinationProjectId(db: PostgreSqlTestDatabase, cwd: string): Promise<string> {
-  const rows = await adminSql(db, "SELECT project_id FROM lcm.project_aliases WHERE normalized_path = $1 LIMIT 1", [cwd]);
+export async function destinationProjectId(db: PostgreSqlTestDatabase, cwd: string, signal?: AbortSignal): Promise<string> {
+  const rows = await adminSql(db, "SELECT project_id FROM lcm.project_aliases WHERE normalized_path = $1 LIMIT 1", [cwd], signal);
   const id = rows[0]?.project_id;
   if (typeof id !== "string") throw new Error("rehearsal destination project is absent");
   return id;
@@ -1040,7 +1077,7 @@ export async function destinationProjectId(db: PostgreSqlTestDatabase, cwd: stri
 export async function guardedWrite(c: RehearsalCase, sessionId: string): Promise<void> {
   const runtime = new PostgreSqlRuntime(settings(c.role.url));
   try {
-    const projectId = await destinationProjectId(c.db, c.h.cwd);
+    const projectId = await destinationProjectId(c.db, c.h.cwd, c.signal);
     const repository = new PostgreSqlConversationRepository(runtime, projectId);
     recordConversationWrite(c, projectId, await repository.createConversation({ sessionId }));
   } finally {
@@ -1081,19 +1118,39 @@ export interface EventRow {
   readonly event_uuid: string; readonly event_version: number; readonly machine_sequence: string; readonly session_id: string;
   readonly seq: number; readonly type: string; readonly category: string; readonly data: string; readonly priority: number;
   readonly source_hook: string; readonly created_at: string; readonly processed_at: string | null; readonly delivery_state: string;
-  readonly remote_inbox_id: string | null; readonly remote_pruned_at: string | null;
+  readonly remote_inbox_id: string | null; readonly remote_pruned_at: string | null; readonly prev_event_id: number | null;
+}
+
+/** One canonical instant for the SQLite text form ("YYYY-MM-DD HH:MM:SS", UTC) and the ISO form; null when unparsable. */
+export function instantOf(value: unknown): string | null {
+  if (typeof value !== "string") return null;
+  const iso = /(?:Z|[+-]\d{2}:?\d{2})$/u.test(value) ? value : value.replace(" ", "T") + "Z";
+  const time = Date.parse(iso);
+  return Number.isNaN(time) ? null : new Date(time).toISOString();
+}
+
+/** The canonical envelope digest: identity, version, sequence, session facts, content and the creation instant. */
+export function canonicalEnvelopeSha256(fields: {
+  readonly eventUuid: string; readonly eventVersion: number; readonly machineSequence: string | bigint; readonly sessionId: unknown;
+  readonly sessionSequence: unknown; readonly type: unknown; readonly category: unknown; readonly data: unknown; readonly priority: unknown;
+  readonly sourceHook: unknown; readonly createdAt: unknown;
+}): string {
+  return sha256(JSON.stringify([fields.eventUuid.toLowerCase(), fields.eventVersion, BigInt(fields.machineSequence).toString(), fields.sessionId, fields.sessionSequence,
+    fields.type, fields.category, fields.data, fields.priority, fields.sourceHook, instantOf(fields.createdAt)]));
 }
 
 export function envelopeHash(row: EventRow): string {
-  return sha256(JSON.stringify([row.event_uuid, row.event_version, row.machine_sequence, row.session_id, row.seq, row.type,
-    row.category, row.data, row.priority, row.source_hook, row.created_at]));
+  return canonicalEnvelopeSha256({
+    eventUuid: row.event_uuid, eventVersion: row.event_version, machineSequence: row.machine_sequence, sessionId: row.session_id, sessionSequence: row.seq,
+    type: row.type, category: row.category, data: row.data, priority: row.priority, sourceHook: row.source_hook, createdAt: row.created_at,
+  });
 }
 
 export function readEventRows(h: RehearsalHome): EventRow[] {
   const path = join(h.home, ".lcm", "events", h.localProjectId + ".db");
   const db = new DatabaseSync(path, { readOnly: true });
   try {
-    return db.prepare("SELECT event_uuid,event_version,machine_sequence,session_id,seq,type,category,data,priority,source_hook,created_at,processed_at,delivery_state,remote_inbox_id,remote_pruned_at FROM events ORDER BY machine_sequence").all() as unknown as EventRow[];
+    return db.prepare("SELECT event_uuid,event_version,machine_sequence,session_id,seq,type,category,data,priority,source_hook,created_at,processed_at,delivery_state,remote_inbox_id,remote_pruned_at,prev_event_id FROM events ORDER BY machine_sequence").all() as unknown as EventRow[];
   } finally {
     db.close();
   }
@@ -1166,6 +1223,8 @@ export function assertLedgerRetained(c: RehearsalCase, label: string): void {
     return row === undefined || (entry.machineId !== PRE_EPOCH_MACHINE && entry.machineId !== machineId) || envelopeHash(row) !== entry.envelopeSha256 || row.machine_sequence !== entry.machineSequence;
   });
   const changedInstructions = c.mutations.filter((entry) => entry.domain === "instruction" && !instructionRetained(c, entry));
+  // A row with no acknowledged input has nothing to retain: it asserts nothing (and keeps its not-applicable declaration).
+  if (scoped.length === 0 && c.mutations.length === 0) return;
   c.invariants.I3 ??= { status: "pass", evidenceRefs: [] };
   c.invariants.I3.evidenceRefs.push(label + ":" + String(scoped.length) + "+" + String(c.mutations.length));
   if (missing.length > 0 || changedInstructions.length > 0) {
@@ -1211,6 +1270,7 @@ export function recordConversationWrite(c: RehearsalCase, projectId: string, rec
 
 /** After a rollback: every guarded write is present in the restored SQLite project with its recorded content. */
 export function assertWritesRestored(c: RehearsalCase, databasePath: string, label: string): void {
+  if (!c.mutations.some((candidate) => candidate.domain === "conversation")) return;
   const db = new DatabaseSync(databasePath, { readOnly: true });
   try {
     for (const entry of c.mutations.filter((candidate) => candidate.domain === "conversation")) {
@@ -1282,8 +1342,8 @@ export async function killWorkerAtSeam(c: RehearsalCase, boundary: string): Prom
 }
 
 /** Deterministically expire the dead worker's copy lease (isolated owned row; no wall-clock wait). */
-export async function expireCopyLease(db: PostgreSqlTestDatabase): Promise<number> {
-  const rows = await adminSql(db, "UPDATE lcm.fenced_leases SET acquired_at = acquired_at - interval '2 hours', renewed_at = renewed_at - interval '2 hours', expires_at = expires_at - interval '2 hours' WHERE resource_type = 'migration-copy' AND released_at IS NULL RETURNING 1 AS n");
+export async function expireCopyLease(db: PostgreSqlTestDatabase, signal?: AbortSignal): Promise<number> {
+  const rows = await adminSql(db, "UPDATE lcm.fenced_leases SET acquired_at = acquired_at - interval '2 hours', renewed_at = renewed_at - interval '2 hours', expires_at = expires_at - interval '2 hours' WHERE resource_type = 'migration-copy' AND released_at IS NULL RETURNING 1 AS n", [], signal);
   return rows.length;
 }
 
@@ -1362,7 +1422,7 @@ export interface CompetingLease { readonly fencingToken: string; release(): Prom
 /** Another actor takes a fenced lease on the destination project under its own process id. */
 export async function competingLease(c: RehearsalCase, resourceType: string, resourceKey: string, ttlMs = 600_000): Promise<CompetingLease> {
   const runtime = new PostgreSqlRuntime(settings(c.role.url));
-  const projectId = await destinationProjectId(c.db, c.h.cwd);
+  const projectId = await destinationProjectId(c.db, c.h.cwd, c.signal);
   const machineId = readMachineIdentity(c.h.home)!.machineId!;
   const repository = new PostgreSqlCoordinationRepository(runtime, projectId, machineId);
   const lease = await repository.acquireLease({ resourceType, resourceKey, processId: OWNER, operation: OPERATION, ttlMs });
@@ -1380,11 +1440,11 @@ export async function staleTokenRefused(c: RehearsalCase): Promise<{ readonly st
   const resourceType = "rehearsal-fence";
   const resourceKey = "f8-takeover";
   const first = await competingLease(c, resourceType, resourceKey, 1_000);
-  await adminSql(c.db, "UPDATE lcm.fenced_leases SET acquired_at = acquired_at - interval '2 hours', renewed_at = renewed_at - interval '2 hours', expires_at = expires_at - interval '2 hours' WHERE resource_type = $1", [resourceType]);
+  await c.sql("UPDATE lcm.fenced_leases SET acquired_at = acquired_at - interval '2 hours', renewed_at = renewed_at - interval '2 hours', expires_at = expires_at - interval '2 hours' WHERE resource_type = $1", [resourceType]);
   const second = await competingLease(c, resourceType, resourceKey);
   const runtime = new PostgreSqlRuntime(settings(c.role.url));
   try {
-    const projectId = await destinationProjectId(c.db, c.h.cwd);
+    const projectId = await destinationProjectId(c.db, c.h.cwd, c.signal);
     const machineId = readMachineIdentity(c.h.home)!.machineId!;
     const assertFence = (token: string) => runtime.transaction(async (executor) => {
       await new PostgreSqlWorkCoordinator(executor, projectId, machineId).assertLeaseFence({ resourceType, resourceKey, processId: OWNER, operation: OPERATION, fencingToken: BigInt(token) });
@@ -1403,12 +1463,12 @@ export async function staleTokenRefused(c: RehearsalCase): Promise<{ readonly st
 
 /** Another actor holds the reserved publication fence: an unexpired row owned by a foreign process id (isolated owned database). */
 export async function competingPublicationFence(c: RehearsalCase): Promise<CompetingLease> {
-  const projectId = await destinationProjectId(c.db, c.h.cwd);
+  const projectId = await destinationProjectId(c.db, c.h.cwd, c.signal);
   const machineId = readMachineIdentity(c.h.home)!.machineId!;
-  const rows = await adminSql(c.db, "INSERT INTO lcm.fenced_leases (project_id, resource_type, resource_key, owner_machine_id, owner_process_id, operation, expires_at) VALUES ($1, 'backend-publication', 'selection', $2, $3, $4, statement_timestamp() + interval '10 minutes') RETURNING fencing_token::text AS token", [projectId, machineId, OWNER, FOREIGN_PUBLICATION_OPERATION]);
+  const rows = await c.sql("INSERT INTO lcm.fenced_leases (project_id, resource_type, resource_key, owner_machine_id, owner_process_id, operation, expires_at) VALUES ($1, 'backend-publication', 'selection', $2, $3, $4, statement_timestamp() + interval '10 minutes') RETURNING fencing_token::text AS token", [projectId, machineId, OWNER, FOREIGN_PUBLICATION_OPERATION]);
   return {
     fencingToken: String(rows[0]!.token),
-    release: async () => { await adminSql(c.db, "DELETE FROM lcm.fenced_leases WHERE project_id = $1 AND resource_type = 'backend-publication' AND owner_process_id = $2", [projectId, OWNER]); },
+    release: async () => { await c.sql("DELETE FROM lcm.fenced_leases WHERE project_id = $1 AND resource_type = 'backend-publication' AND owner_process_id = $2", [projectId, OWNER]); },
   };
 }
 
@@ -1445,7 +1505,7 @@ export async function applyWithResponseLoss(c: RehearsalCase): Promise<{ readonl
       const outcome = await performMigrationApplyGenesisAndCopy({
         homeDir, generationId: captured.generationId, maintenanceChecksumSha256: captured.maintenanceChecksumSha256,
         settings: preflight.targetConfig.postgresql, expectedOwner: preflight.targetConfig.postgresql.migrationRole,
-        expectedIdentity: identity.expectedIdentity, ownerProcessId: "cutover-rehearsal-response-loss", maxRecords: 1, maxBytes: 150994944,
+        expectedIdentity: identity.expectedIdentity, ownerProcessId: "cutover-rehearsal-response-loss", maxRecords: 1, maxBytes: 150994944, signal: c.signal,
       });
       c.injections.push({ surface: "module-seam", boundary: "post-server-commit-response-loss", kind: "uncertain-commit", hitCount: lost ? 1 : 0 });
       c.note("apply-with-response-loss", "module-seam", ["performMigrationApplyGenesisAndCopy", "ECONNRESET after COMMIT"]);
@@ -1498,8 +1558,8 @@ export interface InboxRow {
 }
 
 /** PostgreSQL inbox disposition per event: the remote half of the I3 join. */
-export async function inboxRows(db: PostgreSqlTestDatabase): Promise<InboxRow[]> {
-  return await adminSql(db, "SELECT inbox_id::text AS inbox_id, project_id::text AS project_id, machine_id::text AS machine_id, event_id::text AS event_id, event_version, machine_sequence::text AS machine_sequence, event_type, status, payload FROM lcm.passive_event_inbox ORDER BY machine_sequence") as unknown as InboxRow[];
+export async function inboxRows(db: PostgreSqlTestDatabase, signal?: AbortSignal): Promise<InboxRow[]> {
+  return await adminSql(db, "SELECT inbox_id::text AS inbox_id, project_id::text AS project_id, machine_id::text AS machine_id, event_id::text AS event_id, event_version, machine_sequence::text AS machine_sequence, event_type, status, payload FROM lcm.passive_event_inbox ORDER BY machine_sequence", [], signal) as unknown as InboxRow[];
 }
 
 /** The canonical envelope fields a payload carries, flattened one level. */
@@ -1509,43 +1569,49 @@ function payloadFields(payload: Record<string, unknown>): Record<string, unknown
 }
 
 /**
- * Wait, for a bounded budget and against a directly observable state, until the running daemon's replication has
- * delivered every named input: the local sidecar row is acknowledged and points at its inbox row. The daemon's own
- * replication diagnostics (from its status route) are recorded as evidence; nothing is retried or forced.
+ * Every canonical envelope field of the remote copy must be present and agree with the acknowledged input, matching the
+ * production replication comparison (sameEnvelope): version, session id and sequence, source hook, category, priority, data,
+ * the creation instant, and the previous event id (absent and null are the same). The digest is checked against the ledger.
  */
-export async function awaitDelivery(c: RehearsalCase, daemon: RunningDaemon, names: readonly string[], budgetMs = 60_000): Promise<void> {
-  const deadline = Date.now() + budgetMs;
-  const delivered = (): boolean => {
-    const rows = readEventRows(c.h);
-    return names.every((name) => {
-      const row = rows.find((candidate) => candidate.data === name);
-      return row !== undefined && row.delivery_state === "acknowledged" && row.remote_inbox_id !== null;
-    });
+function remoteEnvelopeProblems(name: string, row: InboxRow, entry: LedgerEntry, local: EventRow | undefined): string[] {
+  const problems: string[] = [];
+  const fields = payloadFields(row.payload);
+  const present = (key: string, kind: "string" | "number"): boolean => {
+    if (typeof fields[key] === kind) return true;
+    problems.push(name + ": payload field " + key + " is missing or malformed");
+    return false;
   };
-  for (;;) {
-    c.checkpoint();
-    if (delivered()) break;
-    if (Date.now() > deadline) {
-      c.invariants.I3 ??= { status: "pass", evidenceRefs: [] };
-      c.invariants.I3.status = "fail";
-      const events = new DatabaseSync(join(c.h.home, ".lcm", "events", c.h.localProjectId + ".db"), { readOnly: true });
-      let states: string[];
-      try {
-        states = (events.prepare("SELECT data, delivery_state, delivery_attempts, delivery_last_error FROM events").all() as { data: string; delivery_state: string; delivery_attempts: number; delivery_last_error: string | null }[])
-          .filter((row) => names.includes(row.data)).map((row) => row.data + "=" + row.delivery_state + "/" + String(row.delivery_attempts) + "/" + String(row.delivery_last_error).slice(0, 80));
-      } finally { events.close(); }
-      throw new Error("the daemon did not deliver the drained inputs within the budget: " + states.join(","));
-    }
-    await delay(500);
-  }
+  const complete = [present("sessionId", "string"), present("category", "string"), present("data", "string"), present("sourceHook", "string"),
+    present("createdAt", "string"), present("sessionSequence", "number"), present("priority", "number")].every(Boolean);
+  if (local === undefined) { problems.push(name + ": the local row is gone"); return problems; }
+  if (row.event_version !== local.event_version) problems.push(name + ": remote event version " + String(row.event_version));
+  if (row.event_type !== local.type) problems.push(name + ": remote type " + row.event_type);
+  if (BigInt(row.machine_sequence) !== BigInt(local.machine_sequence)) problems.push(name + ": remote sequence " + row.machine_sequence);
+  if (!complete) return problems;
+  const remoteDigest = canonicalEnvelopeSha256({
+    eventUuid: row.event_id, eventVersion: row.event_version, machineSequence: row.machine_sequence, sessionId: fields.sessionId, sessionSequence: fields.sessionSequence,
+    type: row.event_type, category: fields.category, data: fields.data, priority: fields.priority, sourceHook: fields.sourceHook, createdAt: fields.createdAt,
+  });
+  if (remoteDigest !== entry.envelopeSha256) problems.push(name + ": the remote envelope differs from the acknowledged envelope");
+  if (instantOf(fields.createdAt) === null) problems.push(name + ": createdAt is not an instant");
+  if ((fields.previousEventId ?? null) !== (local.prev_event_id ?? null)) problems.push(name + ": previousEventId differs");
+  return problems;
+}
+
+/**
+ * The running PostgreSQL daemon replicates (its sidecar target is PostgreSQL): the status route reports replication enabled and
+ * at least one pass. The daemon replicates only in its start-up sweep and every five minutes, so the delivery join itself is
+ * driven in process (replicateWithWitness) where the prune can be observed deterministically.
+ */
+export async function assertDaemonReplicates(c: RehearsalCase, daemon: RunningDaemon): Promise<void> {
   const status = await daemon.client.post<{ passiveEvents?: { replication?: Record<string, unknown> } }>("/status", { cwd: c.h.cwd }, { timeoutMs: 30_000 });
   const replication = status.passiveEvents?.replication;
-  if (replication?.enabled !== true || Number(replication.passes) < 1 || Number(replication.acknowledged) < names.length) {
+  if (replication?.enabled !== true || Number(replication.passes) < 1) {
     c.invariants.I3 ??= { status: "pass", evidenceRefs: [] };
     c.invariants.I3.status = "fail";
     throw new Error("the daemon reports no replication pass: " + JSON.stringify(replication));
   }
-  c.mark("I3", "replication:passes=" + String(replication.passes) + ",acknowledged=" + String(replication.acknowledged));
+  c.mark("I3", "daemon-replication:passes=" + String(replication.passes));
 }
 
 /**
@@ -1555,10 +1621,10 @@ export async function awaitDelivery(c: RehearsalCase, daemon: RunningDaemon, nam
  * one terminal "applied" disposition for the right project, machine, sequence and canonical envelope, with the local row
  * pointing at that inbox row. Inputs appended after the drain are only required to be retained.
  */
-export async function assertEventsJoined(c: RehearsalCase, label: string, eligible: readonly string[] = []): Promise<void> {
+export async function assertEventsJoined(c: RehearsalCase, label: string, eligible: readonly string[] = [], receipts?: readonly InboxRow[]): Promise<void> {
   assertLedgerRetained(c, label);
-  const rows = await inboxRows(c.db);
-  const projectId = await destinationProjectId(c.db, c.h.cwd);
+  const rows = await inboxRows(c.db, c.signal);
+  const projectId = await destinationProjectId(c.db, c.h.cwd, c.signal);
   const scoped = c.ledger.filter((entry) => entry.projectId === c.h.localProjectId);
   const keyOf = (machineId: string, eventId: string): string => machineId + ":" + eventId;
   const known = new Map(scoped.map((entry) => [keyOf(entry.machineId, entry.eventUuid), entry]));
@@ -1574,27 +1640,27 @@ export async function assertEventsJoined(c: RehearsalCase, label: string, eligib
   const problems: string[] = [];
   if (foreign > 0 || duplicated > 0) problems.push("foreign=" + String(foreign) + " duplicated=" + String(duplicated));
   const local = new Map(readEventRows(c.h).map((row) => [row.event_uuid, row]));
+  if (eligible.length > 0 && receipts === undefined) throw new Error("a delivery join needs the receipts captured before the prune (replicateWithWitness)");
+  const witnesses = receipts ?? [];
   for (const name of eligible) {
     const entry = scoped.find((candidate) => candidate.data === name);
     if (entry === undefined) { problems.push("eligible input not in the ledger: " + name); continue; }
-    const matches = ofProject.filter((row) => keyOf(row.machine_id, row.event_id) === keyOf(entry.machineId, entry.eventUuid));
+    const key = keyOf(entry.machineId, entry.eventUuid);
     const localRow = local.get(entry.eventUuid);
-    if (matches.length === 0) {
-      // Delivered events are acknowledged locally and their inbox row is pruned afterwards: that is one terminal disposition.
-      if (localRow === undefined || localRow.delivery_state !== "acknowledged" || localRow.remote_inbox_id === null || localRow.remote_pruned_at === null) {
-        problems.push(name + ": no remote disposition and not acknowledged-and-pruned locally (" + String(localRow?.delivery_state) + ")");
-      }
-      continue;
+    // The terminal receipt: the applied inbox row as replication applied it, captured before the prune (replicateWithWitness). The
+    // production replication applies no further canonical effect (applyReplicatedPassiveEvent is deliberately empty), so this
+    // applied row is the one canonical receipt and must occur once.
+    const witnessed = witnesses.filter((row) => row.project_id === projectId && keyOf(row.machine_id, row.event_id) === key);
+    if (witnessed.length !== 1) { problems.push(name + ": " + String(witnessed.length) + " terminal receipts"); continue; }
+    const receipt = witnessed[0]!;
+    if (receipt.status !== "applied") problems.push(name + ": receipt status " + receipt.status);
+    problems.push(...remoteEnvelopeProblems(name, receipt, entry, localRow));
+    const current = ofProject.filter((row) => keyOf(row.machine_id, row.event_id) === key);
+    if (current.length > 1 || (current[0] !== undefined && (current[0].inbox_id !== receipt.inbox_id || current[0].status !== "applied"))) problems.push(name + ": the live inbox row differs from the receipt");
+    if (current.length === 0 && (localRow === undefined || localRow.remote_pruned_at === null)) problems.push(name + ": no live inbox row and the prune is not recorded locally");
+    if (localRow === undefined || localRow.delivery_state !== "acknowledged" || localRow.remote_inbox_id === null || String(localRow.remote_inbox_id) !== receipt.inbox_id) {
+      problems.push(name + ": local row is not acknowledged against receipt " + receipt.inbox_id);
     }
-    const row = matches[0]!;
-    if (matches.length !== 1) { problems.push(name + ": " + String(matches.length) + " remote dispositions"); continue; }
-    const fields = payloadFields(row.payload);
-    if (row.status !== "applied") problems.push(name + ": remote status " + row.status);
-    if (row.machine_sequence !== entry.machineSequence) problems.push(name + ": remote sequence " + row.machine_sequence);
-    if (row.event_type !== localRow?.type) problems.push(name + ": remote type " + row.event_type);
-    if (fields.data !== entry.data) problems.push(name + ": payload data differs");
-    for (const key of ["category", "priority"] as const) if (key in fields && fields[key] !== localRow?.[key]) problems.push(name + ": payload " + key);
-    if (localRow === undefined || localRow.remote_inbox_id === null || String(localRow.remote_inbox_id) !== row.inbox_id) problems.push(name + ": local row does not point at inbox row " + row.inbox_id);
   }
   if (problems.length > 0) {
     c.invariants.I3.status = "fail";
@@ -1608,7 +1674,7 @@ export async function assertEventsJoined(c: RehearsalCase, label: string, eligib
 /** Settings and project resolved while the harness environment is unambiguous, for writes made inside an operator-environment window. */
 export async function prepareGuardedWriter(c: RehearsalCase): Promise<(sessionId: string) => Promise<void>> {
   const connection = settings(c.role.url);
-  const projectId = await destinationProjectId(c.db, c.h.cwd);
+  const projectId = await destinationProjectId(c.db, c.h.cwd, c.signal);
   return async (sessionId: string): Promise<void> => {
     const runtime = new PostgreSqlRuntime(connection);
     try {
@@ -1849,8 +1915,8 @@ export async function capturePartialSnapshot(c: RehearsalCase): Promise<string> 
 }
 
 /** Structural proof that the row's owned role has lost every privilege on the selected schema (no exception text involved). */
-export async function roleHasNoPrivileges(db: PostgreSqlTestDatabase, role: RehearsalRole): Promise<boolean> {
-  const rows = await adminSql(db, "SELECT has_schema_privilege($1, 'lcm', 'USAGE') AS usage, has_table_privilege($1, 'lcm.projects', 'SELECT') AS selectable", [role.name]);
+export async function roleHasNoPrivileges(db: PostgreSqlTestDatabase, role: RehearsalRole, signal?: AbortSignal): Promise<boolean> {
+  const rows = await adminSql(db, "SELECT has_schema_privilege($1, 'lcm', 'USAGE') AS usage, has_table_privilege($1, 'lcm.projects', 'SELECT') AS selectable", [role.name], signal);
   return rows[0]?.usage === false && rows[0]?.selectable === false;
 }
 
@@ -1866,4 +1932,98 @@ export function assertNativeAllocationSafe(c: RehearsalCase, databasePath: strin
   } finally {
     db.close();
   }
+}
+
+/**
+ * Run the production replication worker once so it uploads the named acknowledged inputs, with the apply step deferred: the
+ * production daemon's apply is a no-op that settles a row at once, so a worker whose apply defers is the only way to leave
+ * an uploaded row resident in the inbox (pending, retry or claimed). Returns the resident rows; fails when nothing uploaded.
+ */
+export async function uploadResidentEvents(c: RehearsalCase, names: readonly string[]): Promise<InboxRow[]> {
+  const entries = names.map((name) => {
+    const entry = c.ledger.find((candidate) => candidate.projectId === c.h.localProjectId && candidate.data === name);
+    if (entry === undefined) throw new Error("cannot replicate an input that is not in the ledger: " + name);
+    return entry;
+  });
+  const projectId = await destinationProjectId(c.db, c.h.cwd, c.signal);
+  const runtime = new PostgreSqlRuntime(settings(c.role.url));
+  const factory = new SQLiteLocalHookOutboxFactory();
+  try {
+    await withHome(c.h.home, async () => {
+      const local = await factory.openExisting(join(c.h.home, ".lcm", "events", c.h.localProjectId + ".db"));
+      if (local === null) throw new Error("the sidecar events database is missing");
+      const worker = new PassiveEventReplicationWorker({
+        local,
+        remote: new PostgreSqlPassiveEventRepository(runtime, projectId, entries[0]!.machineId),
+        applyEvent: async () => { throw new Error("apply deferred by the rehearsal"); },
+      }, { processId: "rehearsal-replication", retryBaseMs: 60_000, retryMaxMs: 60_000, quarantineAfterAttempts: 50 });
+      const pass = await worker.runOnce(c.signal);
+      c.injections.push({ surface: "module-seam", boundary: "production replication worker with the apply step deferred", kind: "deferred-apply", hitCount: 1 });
+      if (pass.uploaded < names.length) throw new Error("replication uploaded " + String(pass.uploaded) + " of " + String(names.length) + " inputs");
+    });
+  } finally {
+    await factory.close();
+    await runtime.close();
+  }
+  const resident = (await inboxRows(c.db, c.signal)).filter((row) => row.project_id === projectId && entries.some((entry) => entry.eventUuid === row.event_id) && ["pending", "retry", "claimed"].includes(row.status));
+  if (resident.length === 0) throw new Error("no uploaded input is resident in the inbox");
+  c.mark("I3", "uploaded-resident:" + resident.map((row) => row.status).join(","));
+  return resident;
+}
+
+/**
+ * Deliver the named acknowledged inputs through the production replication worker (the production no-op apply, the production
+ * repositories) and capture the durable terminal witness: the proxy around the remote repository reads the applied inbox rows
+ * immediately before the worker's one prune call deletes them, so the receipts are the rows as replication applied them.
+ * One pass, no retry: every input must be acknowledged against its inbox row and pruned by it.
+ */
+export async function replicateWithWitness(c: RehearsalCase, names: readonly string[]): Promise<InboxRow[]> {
+  const entries = names.map((name) => {
+    const entry = c.ledger.find((candidate) => candidate.projectId === c.h.localProjectId && candidate.data === name);
+    if (entry === undefined) throw new Error("cannot replicate an input that is not in the ledger: " + name);
+    return entry;
+  });
+  const projectId = await destinationProjectId(c.db, c.h.cwd, c.signal);
+  const runtime = new PostgreSqlRuntime(settings(c.role.url));
+  const factory = new SQLiteLocalHookOutboxFactory();
+  const receipts: InboxRow[] = [];
+  try {
+    await withHome(c.h.home, async () => {
+      const local = await factory.openExisting(join(c.h.home, ".lcm", "events", c.h.localProjectId + ".db"));
+      if (local === null) throw new Error("the sidecar events database is missing");
+      const bound = new PostgreSqlPassiveEventRepository(runtime, projectId, entries[0]!.machineId);
+      const remote = new Proxy(bound, {
+        get: (target, property) => {
+          if (property === "pruneApplied") {
+            return async (keys: readonly { eventId: string; machineId: string }[], signal?: AbortSignal) => {
+              const pruning = new Set(keys.map((key) => key.machineId + ":" + key.eventId));
+              receipts.push(...(await inboxRows(c.db, c.signal)).filter((row) => row.project_id === projectId && row.status === "applied" && pruning.has(row.machine_id + ":" + row.event_id)));
+              return await target.pruneApplied(keys as never, signal);
+            };
+          }
+          const value: unknown = Reflect.get(target, property, target);
+          return typeof value === "function" ? value.bind(target) : value;
+        },
+      });
+      const worker = new PassiveEventReplicationWorker({ local, remote, applyEvent: applyReplicatedPassiveEvent }, { processId: "rehearsal-replication" });
+      const pass = await worker.runOnce(c.signal);
+      c.injections.push({ surface: "module-seam", boundary: "production replication worker; remote prune observed to capture the applied receipts", kind: "receipt-witness", hitCount: 1 });
+      await local.close();
+      if (pass.uploaded < names.length || pass.pruned < names.length) throw new Error("replication did not deliver every input in one pass: " + JSON.stringify(pass));
+    });
+  } finally {
+    await factory.close();
+    await runtime.close();
+  }
+  const rows = readEventRows(c.h);
+  for (const name of names) {
+    const row = rows.find((candidate) => candidate.data === name);
+    if (row === undefined || row.delivery_state !== "acknowledged" || row.remote_inbox_id === null || row.remote_pruned_at === null) {
+      c.invariants.I3 ??= { status: "pass", evidenceRefs: [] };
+      c.invariants.I3.status = "fail";
+      throw new Error("the input was not delivered and pruned by the replication pass: " + name);
+    }
+  }
+  c.mark("I3", "replicated-pass:inputs=" + String(names.length) + ",receipts=" + String(receipts.length));
+  return receipts;
 }

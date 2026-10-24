@@ -1216,10 +1216,130 @@
       "invariants": {
         "I1": "required",
         "I2": "required",
-        "I3": "na:no acknowledged hook input in this row; covered by F5/F6",
+        "I3": "required",
         "I4": "required",
         "I5": "na:no unreachable-target step in this row; disclosure scan still runs on every step",
         "I6": "required"
+      }
+    },
+    {
+      "profiles": [
+        "full"
+      ],
+      "timeoutMs": 300000,
+      "supportingTests": [
+        "test/postgresql/rollback-session.integration.ts",
+        "test/postgresql/rollback-census-drift.integration.ts"
+      ],
+      "injections": [],
+      "knownLimits": [],
+      "id": "R3-replicated",
+      "title": "Post-write rollback while an uploaded passive event is still resident in the PostgreSQL inbox",
+      "fixture": "P",
+      "requirement": "Rollback mode post-write with replicated passive events",
+      "steps": [
+        {
+          "id": "plan",
+          "use": "plan"
+        },
+        {
+          "id": "dry-run",
+          "use": "dry-run"
+        },
+        {
+          "id": "apply",
+          "use": "apply"
+        },
+        {
+          "id": "report-copied",
+          "use": "report-copied"
+        },
+        {
+          "id": "verify",
+          "use": "verify"
+        },
+        {
+          "id": "verify-repeat",
+          "use": "verify-repeat"
+        },
+        {
+          "id": "activate",
+          "use": "activate"
+        },
+        {
+          "id": "activate-repeat",
+          "use": "activate-repeat"
+        },
+        {
+          "id": "report-active",
+          "use": "report-active"
+        },
+        {
+          "id": "rollback",
+          "use": "rollback",
+          "evidence": {
+            "cell": 10,
+            "selectedBackend": "sqlite",
+            "rollbackMode": "post-write"
+          }
+        },
+        {
+          "id": "report-rolled-back",
+          "use": "report-rolled-back"
+        },
+        {
+          "id": "rollback-repeat",
+          "use": "rollback-repeat"
+        }
+      ],
+      "authority": [
+        {
+          "checkpoint": "before-apply",
+          "lastCommittedBackend": "sqlite",
+          "configBackend": "sqlite",
+          "admitted": [
+            "sqlite"
+          ]
+        },
+        {
+          "checkpoint": "held",
+          "lastCommittedBackend": "sqlite",
+          "configBackend": "sqlite",
+          "admitted": []
+        },
+        {
+          "checkpoint": "activated",
+          "lastCommittedBackend": "postgresql",
+          "configBackend": "postgresql",
+          "admitted": [
+            "postgresql"
+          ],
+          "boundProjects": 1
+        },
+        {
+          "checkpoint": "rolled-back",
+          "lastCommittedBackend": "sqlite",
+          "configBackend": "sqlite",
+          "admitted": [
+            "sqlite"
+          ],
+          "boundProjects": 0
+        }
+      ],
+      "invariants": {
+        "I1": "required",
+        "I2": "required",
+        "I3": "required",
+        "I4": "required",
+        "I5": "na:no unreachable-target step in this row; disclosure scan still runs on every step",
+        "I6": "required"
+      },
+      "notes": "Pending the https://github.com/donadiosolutions/lcm/issues/1694 fix on main: the portable export refuses uploaded inbox rows that are still resident (pending, retry or claimed) because their previousEventId breaks the 7-key envelope, so the rollback cannot succeed. The row acknowledges an input after activation, lets the production replication worker upload it with the apply step deferred, asserts it is resident, then requires the post-write rollback to succeed and retain the input.",
+      "gate": {
+        "status": "pending",
+        "pendingOn": [
+          "https://github.com/donadiosolutions/lcm/issues/1694"
+        ]
       }
     },
     {
@@ -1712,18 +1832,12 @@
       "invariants": {
         "I1": "required",
         "I2": "required",
-        "I3": "required",
+        "I3": "na:no acknowledged hook input in this row; covered by F5/F6",
         "I4": "required",
         "I5": "na:no unreachable-target step in this row; disclosure scan still runs on every step",
         "I6": "required"
       },
-      "notes": "Pending the #1678 fix on main: apply currently fails with copy-failed when the local map entry carries any extra alias. The row asserts the successful end state.",
-      "gate": {
-        "status": "pending",
-        "pendingOn": [
-          "https://github.com/donadiosolutions/lcm/issues/1678"
-        ]
-      }
+      "notes": "128 same-project aliases and tied timestamps form one logical destination project: the full round trip completes and the rollback restores the alias set (#1678 fixed on main)."
     },
     {
       "profiles": [
@@ -1835,7 +1949,7 @@
       "invariants": {
         "I1": "required",
         "I2": "required",
-        "I3": "na:no acknowledged hook input in this row; covered by F5/F6",
+        "I3": "required",
         "I4": "required",
         "I5": "na:no unreachable-target step in this row; disclosure scan still runs on every step",
         "I6": "required"
@@ -2996,7 +3110,120 @@
         "I5": "na:no unreachable-target step in this row; disclosure scan still runs on every step",
         "I6": "required"
       },
-      "notes": "A real SQLite daemon alive across the cutover: activate and report exit 8 restart-required until it is stopped (#1683 fixed on main). After the restart the new daemon reports PostgreSQL, one bounded drain delivers an input acknowledged after the old daemon stopped, and the SQLite project database is never written by either daemon."
+      "notes": "A real SQLite daemon alive across the cutover: activate and report exit 8 restart-required until it is stopped (#1683 fixed on main). Environment restriction: this daemon is started with the operator's PostgreSQL connection variables (LCM_POSTGRES_URL and LCM_POSTGRES_CA_FILE); a daemon started without them still gives exit 5 cutover-restart-contradiction because its observe route answers 503, tracked by https://github.com/donadiosolutions/lcm/issues/1696 and asserted by the pending row F10-no-target-env. After the restart the new daemon reports PostgreSQL, one bounded drain delivers an input acknowledged after the old daemon stopped (an administrator-owned trigger records the applied inbox row before the production prune, so the receipt is authenticated from that durable witness), and the SQLite project database is never written by either daemon."
+    },
+    {
+      "profiles": [
+        "full"
+      ],
+      "timeoutMs": 300000,
+      "supportingTests": [
+        "test/migration/cli-restart.test.ts",
+        "test/migration/activation-restart-check.test.ts"
+      ],
+      "knownLimits": [],
+      "id": "F10-no-target-env",
+      "title": "A SQLite daemon started without the PostgreSQL connection variables alive across activation: exit 8 restart-required, then restart and delivery",
+      "fixture": "PM",
+      "requirement": "Fault list: stale daemon (restart verifier is real)",
+      "steps": [
+        {
+          "id": "plan",
+          "use": "plan",
+          "evidence": {
+            "daemonPresent": true
+          }
+        },
+        {
+          "id": "apply",
+          "use": "apply"
+        },
+        {
+          "id": "verify",
+          "use": "verify"
+        },
+        {
+          "id": "activate",
+          "surface": "cli",
+          "args": [
+            "activate",
+            "--generation",
+            "{gen}",
+            "--confirm-generation",
+            "{gen}",
+            "--confirm-backend",
+            "postgresql"
+          ],
+          "exit": 8,
+          "outcome": "restart-required",
+          "reason": "cutover-restart-required",
+          "manifestPhase": null,
+          "applied": true,
+          "next": "swap-grants-then-start-daemon",
+          "restartAnswer": "unsatisfied"
+        },
+        {
+          "id": "report-restart-required",
+          "surface": "cli",
+          "args": [
+            "report",
+            "--generation",
+            "{gen}"
+          ],
+          "exit": 8,
+          "outcome": "restart-required",
+          "reason": "report-restart-required",
+          "manifestPhase": "active",
+          "restartAnswer": "unsatisfied"
+        },
+        {
+          "id": "report-active",
+          "use": "report-active",
+          "evidence": {
+            "cell": 10,
+            "selectedBackend": "postgresql"
+          }
+        }
+      ],
+      "injections": [
+        {
+          "surface": "cli",
+          "boundary": "real foreground daemon on the SQLite backend across the cutover",
+          "kind": "stale-daemon"
+        }
+      ],
+      "authority": [
+        {
+          "checkpoint": "held",
+          "lastCommittedBackend": "sqlite",
+          "configBackend": "sqlite",
+          "admitted": []
+        },
+        {
+          "checkpoint": "activated",
+          "lastCommittedBackend": "postgresql",
+          "configBackend": "postgresql",
+          "admitted": [
+            "postgresql"
+          ],
+          "boundProjects": 1
+        }
+      ],
+      "invariants": {
+        "I1": "required",
+        "I2": "required",
+        "I3": "required",
+        "I4": "required",
+        "I5": "na:no unreachable-target step in this row; disclosure scan still runs on every step",
+        "I6": "required"
+      },
+      "notes": "Pending the https://github.com/donadiosolutions/lcm/issues/1696 fix on main (a follow-up of #1683): identity-only observation must authenticate the config and journal without requiring the selected backend's connection secrets. The row starts the stale SQLite daemon without LCM_POSTGRES_URL and LCM_POSTGRES_CA_FILE and asserts exit 8 restart-required on activate and report, followed by the restart and the delivery assertions of F10.",
+      "gate": {
+        "status": "pending",
+        "pendingOn": [
+          "https://github.com/donadiosolutions/lcm/issues/1696"
+        ]
+      }
     },
     {
       "profiles": [
@@ -3009,7 +3236,7 @@
       ],
       "knownLimits": [],
       "id": "F5",
-      "title": "Hook events around the hold are retained, joined once to PostgreSQL after the restart, and never lost or duplicated",
+      "title": "Hook events around the hold are retained across the cutover, the held-gap input is sequenced above the sealed cutoff, and the join with PostgreSQL has no foreign or duplicate rows",
       "fixture": "P",
       "requirement": "Snapshot-to-selection gap; pending queues",
       "steps": [
@@ -3128,7 +3355,7 @@
         "I5": "na:no unreachable-target step in this row; disclosure scan still runs on every step",
         "I6": "required"
       },
-      "notes": "Pending the #1693 fix on main: events that crossed the cutover are copied into the PostgreSQL inbox with a different createdAt encoding than the replication worker uploads, so the first post-cutover replication pass fails with an idempotency collision and the batch stays in retry. The row asserts the success end state: every drained input is acknowledged locally and has one terminal remote disposition.",
+      "notes": "Pending the #1693 fix on main: events that crossed the cutover are copied into the PostgreSQL inbox with a different createdAt encoding than the replication worker uploads, so the first post-cutover replication pass fails with an idempotency collision and the batch stays in retry. The row asserts the success end state: every drained input is acknowledged locally and has one terminal remote disposition. The join authenticates every canonical envelope field against the ledger from a durable receipt recorded when the inbox row applies.",
       "gate": {
         "status": "pending",
         "pendingOn": [
@@ -3394,7 +3621,7 @@
         "I5": "na:no unreachable-target step in this row; disclosure scan still runs on every step",
         "I6": "required"
       },
-      "notes": "Pending the #1693 fix on main: events that crossed the cutover are copied into the PostgreSQL inbox with a different createdAt encoding than the replication worker uploads, so the first post-cutover replication pass fails with an idempotency collision and the batch stays in retry. The row asserts the success end state: every drained input is acknowledged locally and has one terminal remote disposition.",
+      "notes": "Pending the #1693 fix on main: events that crossed the cutover are copied into the PostgreSQL inbox with a different createdAt encoding than the replication worker uploads, so the first post-cutover replication pass fails with an idempotency collision and the batch stays in retry. The row asserts the success end state: every drained input is acknowledged locally and has one terminal remote disposition. The join authenticates every canonical envelope field against the ledger from a durable receipt recorded when the inbox row applies.",
       "gate": {
         "status": "pending",
         "pendingOn": [
@@ -3533,7 +3760,7 @@
       "invariants": {
         "I1": "required",
         "I2": "required",
-        "I3": "na:no acknowledged hook input in this row; covered by F5/F6",
+        "I3": "required",
         "I4": "required",
         "I5": "na:no unreachable-target step in this row; disclosure scan still runs on every step",
         "I6": "required"
@@ -3669,7 +3896,7 @@
       "invariants": {
         "I1": "required",
         "I2": "required",
-        "I3": "na:no acknowledged hook input in this row; covered by F5/F6",
+        "I3": "required",
         "I4": "required",
         "I5": "na:no unreachable-target step in this row; disclosure scan still runs on every step",
         "I6": "required"
@@ -3911,7 +4138,7 @@
       "invariants": {
         "I1": "required",
         "I2": "required",
-        "I3": "na:no acknowledged hook input in this row; covered by F5/F6",
+        "I3": "required",
         "I4": "required",
         "I5": "na:no unreachable-target step in this row; disclosure scan still runs on every step",
         "I6": "required"
@@ -4865,7 +5092,7 @@
         "I5": "required",
         "I6": "required"
       },
-      "notes": "With only this row's owned role permission revoked, the daemon refuses to start on the selected PostgreSQL (explicit failure, no SQLite fallback). 'migration report' reads durable local evidence and does not probe the target, so it still reports the active selection. The row asserts the daemon refusal, unchanged SQLite bytes, no new project database, PostgreSQL authority and recovery once the permission returns."
+      "notes": "With only this row's owned role permission revoked (proved with has_schema_privilege and has_table_privilege), the product's backend diagnostic (lcm stats --pool --json) classifies the selected PostgreSQL as permission-denied and the daemon refuses to start by exiting on its own: explicit failure, no SQLite fallback. 'migration report' reads durable local evidence and does not probe the target, so it still reports the active selection. The row also asserts unchanged SQLite bytes, no new project database, PostgreSQL authority and recovery once the permission returns."
     }
   ]
 }

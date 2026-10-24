@@ -4,7 +4,7 @@
  */
 export interface ManifestSpec {
   readonly id: string;
-  readonly gate?: unknown;
+  readonly gate?: { readonly status?: string };
   readonly profiles: readonly string[];
   readonly knownLimits: readonly unknown[];
   readonly invariants: Readonly<Record<string, string>>;
@@ -24,7 +24,7 @@ export interface RehearsalShape {
   readonly focused: boolean;
   readonly runtime: string | null;
   readonly runId: string | null;
-  readonly pending: readonly unknown[];
+  readonly pending: readonly { readonly id: string }[];
   readonly missing: readonly string[];
   readonly scenarios: readonly ScenarioRecord[];
   readonly provenance: { readonly dirty: boolean; readonly unchangedAfterRun: boolean } | null;
@@ -41,7 +41,7 @@ export function scenarioProblems(record: ScenarioRecord, spec: ManifestSpec | un
     if (actual === undefined) { problems.push(record.id + " " + key + ": missing"); continue; }
     if (actual.status === "fail") problems.push(record.id + " " + key + ": failed");
     else if (declared === "required" && actual.status !== "pass") problems.push(record.id + " " + key + ": required but " + actual.status);
-    else if (declared.startsWith("na:") && actual.status === "not-applicable" && actual.reason !== declared.slice(3)) problems.push(record.id + " " + key + ": reason differs from the manifest");
+    else if (declared.startsWith("na:") && (actual.status !== "not-applicable" || actual.reason !== declared.slice(3))) problems.push(record.id + " " + key + ": differs from the manifest's not-applicable declaration");
   }
   for (const entry of record.authority) {
     const pinned = spec.authority.find((candidate) => candidate.checkpoint === entry.checkpoint);
@@ -59,7 +59,10 @@ export function completenessProblems(rehearsal: RehearsalShape, manifest: Manife
   const problems: string[] = [];
   if (rehearsal.profile !== "full") problems.push("profile " + rehearsal.profile + " is not the full profile");
   if (rehearsal.focused) problems.push("the run was restricted to selected rows");
-  if (rehearsal.pending.length > 0) problems.push(String(rehearsal.pending.length) + " required rows are still pending");
+  // Pending rows come from the checked-in manifest, never from the run's own record of them.
+  const manifestPending = manifest.scenarios.filter((spec) => spec.gate?.status === "pending").map((spec) => spec.id).sort();
+  if (manifestPending.length > 0) problems.push("the checked-in manifest still lists pending rows: " + manifestPending.join(","));
+  if (JSON.stringify(rehearsal.pending.map((entry) => entry.id).sort()) !== JSON.stringify(manifestPending)) problems.push("the recorded pending rows differ from the checked-in manifest");
   if (rehearsal.missing.length > 0) problems.push("selected rows produced no result: " + rehearsal.missing.join(","));
   if (rehearsal.manifestSha256 !== manifestSha256) problems.push("the run used a different manifest than the checked-in one");
   const expected = manifest.scenarios.filter((spec) => spec.gate === undefined && spec.profiles.includes("full")).map((spec) => spec.id).sort();
