@@ -361,6 +361,8 @@ export function observedRows(observation: SetObservation): readonly SetEvidenceR
  * same service to continue, which is what exit 6 claims. A record naming the
  * service is not enough: the journal slot must still hold the set's own live
  * (not aborted) hold, or its own publication carrying the frozen selection.
+ * A hold in a selection phase counts only with that selection too: both
+ * services answer it with state-unresolvable when the record is absent.
  * This under-claims where admission cannot be shown without mirroring the
  * service's slot table; the service stays the authority for every mutation.
  */
@@ -369,17 +371,21 @@ export function admitsResume(observation: SetObservation, service: "prepare" | "
   const live = (id: string, phases: readonly string[]): boolean =>
     journal.kind === "hold" && journal.journal.cutoverSet?.manifest.setId === id && phases.includes(journal.journal.phase);
   const published = (id: string): boolean => journal.kind === "publication" && journal.publicationId === id;
+  const selected = service === "activate"
+    ? observation.activation.state === "resolved" && observation.activation.selection !== null
+    : observation.rollback.state === "resolved" && observation.rollback.selection !== null;
+  const selectionPhases = selected ? ["selection-prepared", "selection-completed"] : [];
   if (service === "prepare") return observation.route === "prepare" && observation.prepareBlock === null;
   if (service === "activate") {
     if (observation.route === "prepared") return true;
     return observation.route === "activate" && (
-      live(observation.setId, ["maintenance-held", "selection-prepared", "selection-completed"])
-      || (published(observation.setId) && observation.activation.state === "resolved" && observation.activation.selection !== null)
+      live(observation.setId, ["maintenance-held", ...selectionPhases])
+      || (published(observation.setId) && selected)
     );
   }
   return observation.route === "rollback" && (
-    live(observation.rollbackSetId, ["maintenance-entering", "maintenance-held", "selection-prepared", "selection-completed"])
-    || (published(observation.rollbackSetId) && observation.rollback.state === "resolved" && observation.rollback.selection !== null)
+    live(observation.rollbackSetId, ["maintenance-entering", "maintenance-held", ...selectionPhases])
+    || (published(observation.rollbackSetId) && selected)
   );
 }
 

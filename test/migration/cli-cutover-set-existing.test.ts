@@ -23,7 +23,7 @@ function envelope(command: MigrationCommandName, outcome: MigrationSetOutcome) {
 
 const PREPARED: Parts = { journal: holdJournal() };
 const PREPARING: Parts = { journal: holdJournal(), eligible: false };
-const ACTIVATING: Parts = { journal: holdJournal({ phase: "selection-prepared" }), activation: resolvedActivation(false) };
+const ACTIVATING: Parts = { journal: holdJournal({ phase: "selection-prepared" }), activation: resolvedActivation(true) };
 const ACTIVATED: Parts = { journal: publicationJournal(), activation: resolvedActivation() };
 const ROLLING_BACK: Parts = { journal: publicationJournal(REVERSE_ID), activation: resolvedActivation(), rollback: resolvedRollback(false) };
 const ROLLING_BACK_OWNED: Parts = { journal: holdJournal({ setId: REVERSE_ID, sourceBackend: "postgresql" }), activation: resolvedActivation(), rollback: resolvedRollback(false) };

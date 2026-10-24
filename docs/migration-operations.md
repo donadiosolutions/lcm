@@ -554,10 +554,11 @@ existing-set commands read their selector, confirmations and route first and tou
 to run the preparation or the activation. `report`, `verify` and `abort` never open a transfer
 preflight, and `rollback --set` resolves its own runtime connection.
 
-**What `--dry-run` means with `--set`.** These previews run after the selector, the confirmations and
-the read-only route have been checked, so a missing id, an unconfirmed or moved id, or a state that
-belongs to another command is refused first (and `verify --set` refuses an incomplete preparation
-before it previews).
+**What `--dry-run` means with `--set`.** `apply --set --dry-run` stops after the candidate
+confirmation (below). The previews of `resume`, `verify`, `activate` and `rollback` run after the
+selector, the confirmations and the read-only route have been checked, so a missing id, an
+unconfirmed or moved id, or a state that belongs to another command is refused first (and
+`verify --set` refuses an incomplete preparation before it previews).
 
 | Command | `--dry-run` |
 | --- | --- |
@@ -583,9 +584,9 @@ next step; `activate --set` revalidates every member itself.
 | `prepare` | a forward hold whose members are not all verified | `resume --set` (or `apply --set`) |
 | `prepared` | a forward hold, every member verified | `activate --set` |
 | `activate` | activation records exist, members not all active | `resume --set` or `activate --set` |
-| `settled-activated` | every member active, nothing pending | `report --set` (grant swap, restart) |
+| `settled-activated` | every member active, nothing pending, and the frozen activation selection recorded | `report --set` (grant swap, restart) |
 | `rollback` | rollback records exist, members not all rolled back | `resume --set` or `rollback --set` |
-| `settled-rolled-back` | every member rolled back, nothing pending | `report --set` |
+| `settled-rolled-back` | every member rolled back, nothing pending, and the frozen rollback selection recorded | `report --set` |
 | `abort` | an aborted hold with unsettled members | `resume --set` or `abort --set` |
 | `settled-aborted`, `unknown` | nothing left to settle, or nothing names the set | `plan --set` |
 | `single-generation-held`, `foreign`, `reverse-id`, `contradiction`, `unresolvable` | not this set's to act on, or unreadable | refused, nothing changed |
@@ -614,7 +615,8 @@ string is reported as `unrecognized` and is never copied into the output.
 **Exit 6.** A service returning a recoverable-looking result is not enough: the command reads the
 durable state again and emits `set-incomplete` only when that state still admits the same service,
 that is when the journal slot still holds the set's own live hold (not an aborted, empty or foreign
-one) or its own publication carrying the frozen selection. Otherwise the result is exit 2, 4, 5 or 7
+one; a hold in a selection phase only with the frozen selection) or its own publication carrying the
+frozen selection. Otherwise the result is exit 2, 4, 5 or 7
 according to the closed reason. Success is always read back from the member manifests and the
 aggregate records, never taken from the service result, and a settled state counts only with the
 frozen selection that produced it. `report --set` exits 5 when a member's manifest, snapshot or

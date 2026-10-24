@@ -104,6 +104,10 @@ describe("F3: exit 6 needs a durable state that admits the same service", () => 
     expect(envelope("rollback", await rollbackAfter(owned))).toMatchObject({ refusal: { reason: "set-incomplete" } });
     const published = { journal: publicationJournal(REVERSE_ID), activation: resolvedActivation(), rollback: resolvedRollback(true) };
     expect(envelope("rollback", await rollbackAfter(published))).toMatchObject({ exitCode: 6 });
+    for (const phase of ["maintenance-entering", "selection-prepared", "selection-completed"]) {
+      expect(envelope("rollback", await rollbackAfter({ ...owned, journal: reverseHold(phase), rollback: resolvedRollback(phase !== "maintenance-entering") })))
+        .toMatchObject({ exitCode: 6 });
+    }
   });
 
   it.each([
@@ -111,6 +115,8 @@ describe("F3: exit 6 needs a durable state that admits the same service", () => 
     ["another hold", { journal: holdJournal({ setId: "other" }) }],
     ["an aborted own hold", { journal: reverseHold("maintenance-aborted") }],
     ["a reverse publication without the frozen selection", { journal: publicationJournal(REVERSE_ID) }],
+    ["a selection-prepared hold without the frozen selection", { journal: reverseHold("selection-prepared") }],
+    ["a selection-completed hold without the frozen selection", { journal: reverseHold("selection-completed") }],
   ])("does not claim exit 6 for a blocked rollback once %s replaced the hold", async (_name, slot) => {
     const result = envelope("rollback", await rollbackAfter({ ...owned, ...slot }));
     expect(result).toMatchObject({ exitCode: 5, next: null, refusal: { reason: "set-refused-evidence" } });
@@ -127,7 +133,10 @@ describe("F3: exit 6 needs a durable state that admits the same service", () => 
   const activating: Parts = { journal: holdJournal({ phase: "selection-prepared" }), activation: resolvedActivation(false) };
 
   it("keeps exit 6 for an interrupted activation that still owns a live hold or a selected publication", async () => {
-    expect(envelope("activate", await activateAfter(activating, activating))).toMatchObject({ exitCode: 6 });
+    const selected = { journal: holdJournal({ phase: "selection-prepared" }), activation: resolvedActivation(true) };
+    expect(envelope("activate", await activateAfter(activating, selected))).toMatchObject({ exitCode: 6 });
+    const completed = { journal: holdJournal({ phase: "selection-completed" }), activation: resolvedActivation(true) };
+    expect(envelope("activate", await activateAfter(activating, completed))).toMatchObject({ exitCode: 6 });
     expect(envelope("activate", await activateAfter({ journal: holdJournal() }, { journal: holdJournal() }))).toMatchObject({ exitCode: 6 });
     const published = { journal: publicationJournal(), activation: resolvedActivation(true) };
     expect(envelope("activate", await activateAfter(activating, published))).toMatchObject({ exitCode: 6 });
@@ -138,6 +147,8 @@ describe("F3: exit 6 needs a durable state that admits the same service", () => 
     ["another hold", { journal: holdJournal({ setId: "other" }), activation: resolvedActivation(false) }],
     ["an aborted own hold", { journal: holdJournal({ phase: "maintenance-aborted" }), activation: resolvedActivation(false) }],
     ["a publication without the frozen selection", { journal: publicationJournal(), activation: resolvedActivation(false) }],
+    ["a selection-prepared hold without the frozen selection", { journal: holdJournal({ phase: "selection-prepared" }), activation: resolvedActivation(false) }],
+    ["a selection-completed hold without the frozen selection", { journal: holdJournal({ phase: "selection-completed" }), activation: resolvedActivation(false) }],
   ])("does not claim exit 6 for an interrupted activation with %s", async (_name, after) => {
     const result = envelope("activate", await activateAfter(activating, after));
     expect(result).toMatchObject({ exitCode: 4, next: null });
@@ -180,6 +191,11 @@ describe("F4: applied reports the effects of this invocation", () => {
   it.each(["artifact", "build", "install"])("cannot exclude a write at step %s even when every record is unchanged", async (step) => {
     const result = envelope("rollback", await run(blocked(step), null));
     expect(result).toMatchObject({ applied: true, evidence: { writeObservation: "unresolvable" } });
+  });
+
+  it("cannot exclude a write when a re-entry is interrupted at completion with every record unchanged", async () => {
+    const result = envelope("rollback", await run(interrupted("completion", true), null));
+    expect(result).toMatchObject({ exitCode: 7, applied: true, evidence: { writeObservation: "unresolvable" } });
   });
 
   it("is true for a settled success only when something changed, and keeps a changed readback true", async () => {

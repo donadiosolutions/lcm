@@ -730,8 +730,11 @@ async function admitted(homeDir: string, setId: string, ops: Ops, service: "prep
   return admitsResume(await observationOf({ homeDir, setId, ops }), service);
 }
 
-/** Rollback steps that write outside what the fingerprint observes (the reverse artifact, candidates, installed databases). */
-const UNFENCED_ROLLBACK_STEPS: ReadonlySet<string> = new Set(["artifact", "build", "install"]);
+/**
+ * Rollback steps that write outside what the fingerprint observes: the reverse artifact, candidates, installed
+ * databases, and completion (member selection bindings and rollback reports precede the manifest update).
+ */
+const UNFENCED_ROLLBACK_STEPS: ReadonlySet<string> = new Set(["artifact", "build", "install", "completion"]);
 
 async function mapActivate(args: Readonly<{
   homeDir: string;
