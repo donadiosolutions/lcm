@@ -64,6 +64,7 @@ const ROW_CELLS: ReadonlyArray<readonly [string, MigrationRouteInput, Expectatio
   ["13 rolled-back manifest", cell({ manifest: manifest("rolled-back"), journal: held("selection-completed") }), { row: 13, primary: "none", allowed: ["rollback"], exit: 2, next: "report" }],
   ["13 rolled-back manifest beside the completed rollback publication (#1675)", cell({ journal: publication("completed", ROLLBACK_PUB), manifest: manifest("rolled-back"), link: OWN_LINK }), { row: 13, primary: "none", allowed: ["rollback"], exit: 2, next: "report" }],
   ["12 rolling-back manifest beside its in-flight rollback publication (#1675)", cell({ journal: publication("map-publishing", ROLLBACK_PUB), manifest: manifest("rolling-back"), link: OWN_LINK }), { row: 12, primary: "rollback", allowed: ["resume"], exit: 6 }],
+  ["12 rolling-back manifest beside its aborted rollback publication (#1675)", cell({ journal: publication("aborted", ROLLBACK_PUB), manifest: manifest("rolling-back"), link: OWN_LINK }), { row: 12, primary: "rollback", allowed: ["resume"], exit: 6 }],
   ["3 rolled-back manifest beside an unrelated completed publication stays foreign (#1675)", cell({ journal: publication("completed", "other"), manifest: manifest("rolled-back"), link: OWN_LINK }), { row: 3, primary: "none", allowed: [], exit: 5 }],
   ["25 a completed rollback publication is not an activation beside an active manifest (#1675)", cell({ journal: publication("completed", ROLLBACK_PUB), manifest: manifest("active"), link: OWN_LINK }), { row: 25, primary: "none", allowed: [], exit: 5 }],
   ["25 an in-flight rollback publication is not an activation beside a verified manifest (#1675)", cell({ journal: publication("map-publishing", ROLLBACK_PUB), manifest: manifest("verified"), link: OWN_LINK }), { row: 25, primary: "none", allowed: [], exit: 5 }],
@@ -140,7 +141,7 @@ const SNAPSHOTS: readonly MigrationRouteSnapshot[] = ["absent", "partial", "comp
 function* everyCell(): Generator<MigrationRouteInput> {
   const journals: MigrationRouteJournal[] = [{ kind: "unresolvable" }, { kind: "absent" }];
   for (const phase of HOLD_PHASES) journals.push(held(phase), held(phase, "other"));
-  for (const phase of PUBLICATION_PHASES) journals.push(publication(phase));
+  for (const phase of PUBLICATION_PHASES) journals.push(publication(phase), publication(phase, ROLLBACK_PUB));
   const manifests: MigrationRouteManifest[] = [ABSENT, { kind: "unresolvable" }];
   for (const phase of PHASES_MANIFEST) {
     manifests.push(manifest(phase));
@@ -178,7 +179,10 @@ describe("totality: every cell of journal x manifest x snapshot x link maps to a
       }
       if (route.row !== 1 && journal.kind === "publication") {
         const own = link.kind === "present" && link.publicationId === journal.publicationId;
-        if (!own) {
+        if (journal.publicationId === ROLLBACK_PUB) {
+          // The generation's own derived rollback publication is never foreign; only rows 12, 13 and 25 can follow it.
+          expect([12, 13, 25]).toContain(route.row);
+        } else if (!own) {
           expect(route.row).toBe(journal.phase === "completed" || journal.phase === "aborted" ? 3 : 2);
         } else {
           expect([10, 11, 12, 13, 25]).toContain(route.row);
@@ -200,7 +204,7 @@ describe("totality: every cell of journal x manifest x snapshot x link maps to a
       expect(route.primary).not.toBe("report");
       expect(route.allowed).not.toContain("report");
     }
-    expect(cells).toBe((2 + HOLD_PHASES.length * 2 + PUBLICATION_PHASES.length) * (2 + PHASES_MANIFEST.length * (1 + EFFECTS.length)) * SNAPSHOTS.length * 4);
+    expect(cells).toBe((2 + HOLD_PHASES.length * 2 + PUBLICATION_PHASES.length * 2) * (2 + PHASES_MANIFEST.length * (1 + EFFECTS.length)) * SNAPSHOTS.length * 4);
     // An exhaustive in-process enumeration (about 69,000 cells), so it is given an explicit budget
     // rather than the 5 s default, which coverage instrumentation exceeds.
   }, 120_000);

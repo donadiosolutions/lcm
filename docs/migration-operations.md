@@ -659,8 +659,8 @@ cell 12 it exits 6. The same router decides for all of them, so they cannot disa
 | 10 | the generation's own completed publication | any | `active`, nothing pending | none -- settled; `report` | `activate` (settled re-entry), `rollback` |
 | 11 | the generation's own publication in flight or aborted, or a `selection-prepared`/`selection-completed` hold | any | `verified`, `activating`, or a pending activation effect | `activate` | `resume` |
 | 12 | not aborted | any | `rolling-back`, or a pending rollback effect | `rollback` | `resume` |
-| 13 | not aborted | any | `rolled-back`, nothing pending | none -- settled; `report` | `rollback` (settled re-entry) |
-| 2, 3 | a v2 publication | any | any | none -- exit 4 while in flight, exit 5 when foreign and finished | -- |
+| 13 | not aborted, including the generation's own completed rollback publication | any | `rolled-back`, nothing pending | none -- settled; `report` | `rollback` (settled re-entry) |
+| 2, 3 | a v2 publication that is neither this generation's activation publication nor its own derived rollback publication | any | any | none -- exit 4 while in flight, exit 5 when foreign and finished | -- |
 | 1, 25 | unresolvable, or no row matches | -- | -- | none -- exit 5 | -- |
 
 A generation classifying `partial` or `replaced` is **never deleted**. Every failed or abandoned
