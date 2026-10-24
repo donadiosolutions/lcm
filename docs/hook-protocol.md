@@ -164,7 +164,24 @@ Codex runs the hook for the sources `startup`, `resume`, `clear`, `compact`, and
   `$CODEX_HOME/archived_sessions`, default `~/.codex`) holds a developer message
   starting with the marker line after the last `compacted` record and the last
   `thread_rolled_back` event. A line that is not valid JSON counts as a reset.
-  Only the last 64 MiB of the rollout is read; any read failure prints.
+  Only the newest 64 MiB of the history is read; any read failure prints.
+- A referenced (paginated-history) fork holds a pointer instead of a copy:
+  its first record is a `session_meta` whose `history_base` names the parent
+  rollout (`thread_id`, a rollout id), `end_ordinal_exclusive` and
+  `end_byte_offset`. The hook reads the history the fork inherited, which is the
+  parent's bytes before `end_byte_offset` followed by the fork's own records, and
+  applies the same marker, `compacted`, rollback and invalid-line rules across
+  them, so a marker inherited from the parent suppresses the second block unless
+  the fork's own records reset it. The parent is the one canonical
+  `rollout-<timestamp>-<id>.jsonl` (or `rollout-<timestamp>-<thread-id>_<id>.jsonl`)
+  file under `$CODEX_HOME/sessions` or `archived_sessions`, opened with the same
+  safety checks; the last record before `end_byte_offset` must carry the top-level
+  `ordinal` `end_ordinal_exclusive - 1`. A parent that is itself a referenced fork
+  is followed the same way, up to four files in all. The first parent that is
+  missing, ambiguous, a symlink, compressed, unreadable, repeated or
+  inconsistent with its cutoff ends the walk: the history older than the part
+  already checked is a gap, so only a marker in the checked part can suppress
+  the block. Looking a parent up visits at most 20,000 directory entries.
 - For `compact`, the daemon returns the full memory (recent summaries, promoted
   project knowledge, passive insights, and the stored project-instructions row)
   instead of orientation only, and never rewrites stored instructions. For Codex,
@@ -173,9 +190,10 @@ Codex runs the hook for the sources `startup`, `resume`, `clear`, `compact`, and
 - The hook writes no state files. The per-session lock is released when the hook
   returns.
 
-Limits: referenced forks, rollouts outside `$CODEX_HOME`, unreadable rollouts,
-and restorations from earlier LCM versions print a fresh restoration, which can
-duplicate an existing one; restorations carried only inside compaction
+Limits: referenced forks whose parent history cannot be found or checked (see
+above, including a parent that exists only compressed), rollouts outside
+`$CODEX_HOME`, unreadable rollouts, and restorations from earlier LCM versions
+print a fresh restoration, which can duplicate an existing one; restorations carried only inside compaction
 replacement history are not detected; and if Codex fails to write the
 compaction record (or other history) to its rollout, the post-compaction hook can
 see the pre-compaction restoration and skip, and the live continuation can lack

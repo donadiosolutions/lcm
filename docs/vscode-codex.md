@@ -238,7 +238,7 @@ sections where available.
 |---|---|---|---|
 | Session start (`startup`; `clear` via app-server `sessionStartSource`) | `SessionStart` | A restoration block (marker `<!-- lcm-restoration -->`) is added to the model input before the first request. See [restoration](#memory-after-compaction-and-in-forked-conversations). | Verified for small fixture restorations; larger output Best-effort. A 21,579-byte restoration reached the model truncated to 8,192 bytes ([#1636](https://github.com/donadiosolutions/lcm/issues/1636)); no safe size boundary was established. TUI `/clear` Unverified |
 | Resume | `SessionStart` | A conversation that still holds a live restoration gets no second block, including after repeated resumes. | Verified |
-| Fork | `SessionStart` | New Codex 0.163.0 threads default to paginated history when non-ephemeral and the thread store supports it. Their forks reference the parent's history, so the fork receives a second block once while the inherited one stays in context ([#1632](https://github.com/donadiosolutions/lcm/issues/1632)). Forks of legacy-history threads copy the history and get no second block. | Best-effort |
+| Fork | `SessionStart` | New Codex 0.163.0 threads default to paginated history when non-ephemeral and the thread store supports it. Their forks reference the parent's history instead of copying it. The hook reads the parent history the fork inherited and gives the fork no second block while that history holds a live restoration; if the parent history cannot be found or checked, the fork receives a fresh block. Forks of legacy-history threads copy the history and are deduplicated from their own rollout. | Unit-verified for referenced forks; Best-effort in a live Codex |
 | Compaction (manual, and automatic before a turn) | `PreCompact`, `SessionStart` (`compact`) | The transcript tail is saved first. A fresh restoration reaches the first request after compaction. After the manual compact call, restoration runs when the next turn starts. In the observed automatic pre-turn path, restoration runs in that same turn after compaction and before `UserPromptSubmit`. Repeated compactions produce one block. Mid-turn, Guardian and post-turn paths remain Unverified. | Verified; other compaction paths Unverified |
 | Prompt submission | `UserPromptSubmit` | Prompt-time hints appear as a `<memory-context>` block when memory matches, bounded by `restoration.maxInjectedMemoryBytes` and `maxInjectedMemoryItems`. | Verified |
 | Tool completion | `PostToolUse` | Shell commands, `apply_patch`, `update_plan` (needs `[tools.update_plan] enabled = true` and an explanation), `spawn_agent`, `request_user_input` (Plan mode only) and MCP calls (by name; verified with the MCP bundle) are recorded in the local outbox, which does not wait for the daemon. See [capture boundary](#codex-posttooluse-capture-boundary). | Verified |
@@ -409,18 +409,19 @@ on Linux only for now.
 ### Memory after compaction and in forked conversations
 
 Codex drops hook-injected context when it compacts a conversation. Forks of
-its default paginated threads reference the parent's history; forks of
-legacy-history threads copy it. The `SessionStart` hook also runs after
+its default paginated threads reference the parent's history, which the hook
+reads to deduplicate; forks of legacy-history threads copy it. The `SessionStart` hook also runs after
 compaction (`compact`) and when a conversation is forked (`fork`), and restores
 recent summaries, promoted project knowledge, passive insights, and stored
 project instructions.
 
 Each restoration starts with the line `<!-- lcm-restoration -->`. On `resume`,
 `fork`, and `compact`, the hook reads the session's own rollout under
-`$CODEX_HOME` (default `~/.codex`) and prints nothing when a restoration since
-the latest compaction or rollback is still in the conversation, so a resumed
-conversation, or a fork that carries a copy of its parent's history, does not
-receive the same block twice. `startup` and `clear` always print.
+`$CODEX_HOME` (default `~/.codex`), and for a referenced fork the parent history it
+points to, and prints nothing when a restoration since the latest compaction or
+rollback is still in the conversation, so a resumed conversation, or a fork that
+carries or references its parent's history, does not receive the same block
+twice. `startup` and `clear` always print.
 
 Existing installs keep the old `startup|resume|clear` matcher until you re-run
 `lcm connectors install codex`. If the LCM restore hook has its own
@@ -438,12 +439,14 @@ Codex asks you to trust the hook again.
 Known limits:
 
 - Forks of Codex 0.163.0's default (paginated) threads are referenced forks:
-  the fork's rollout holds only a pointer to the parent's history, so the first
-  `SessionStart` of the fork prints a fresh restoration while the inherited one
-  is still in context. This is the default fork path in the app-server and
-  `codex exec fork` (one duplicate block per fork,
-  [#1632](https://github.com/donadiosolutions/lcm/issues/1632)); threads created
-  with legacy history copy the parent's history and are deduplicated.
+  the fork's rollout holds only a pointer (`history_base`) to the parent's history.
+  The hook follows it to the parent rollout under `sessions/` or
+  `archived_sessions/` (up to four files in a chain) and deduplicates against the
+  restoration found there. A parent that is missing, ambiguous, a symlink, only
+  available compressed (`.jsonl.zst`), unreadable or inconsistent with the fork's
+  recorded cutoff is not used, and the fork then prints a fresh restoration
+  (one duplicate block). Referenced-fork deduplication is verified with unit
+  fixtures; the native app-server fixture was not rerun for it.
 - Rollouts outside `$CODEX_HOME`, unreadable rollouts, and restorations printed
   by earlier LCM versions (no marker line) print a fresh restoration, which can
   duplicate an existing one once per event.
