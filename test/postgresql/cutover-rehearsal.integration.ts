@@ -645,20 +645,6 @@ const handlers: Record<string, Handler> = {
     c.sealCheck("after-abort");
     c.compareDomains("sqlite-after-abort", baseline, sqliteDomainDigests(projectDb(c)));
   },
-  "F1-empty-refusal": async (c) => {
-    const baseline = sqliteDomainDigests(projectDb(c));
-    const plan = await c.step("plan");
-    c.vars.gen = plan.envelope.generation as string;
-    await c.step("apply");
-    c.authority("held");
-    c.sealBaseline();
-    await c.step("verify");
-    await c.step("activate");
-    await c.step("abort");
-    c.authority("aborted");
-    c.sealCheck("after-abort");
-    c.compareDomains("sqlite-after-abort", baseline, sqliteDomainDigests(projectDb(c)));
-  },
   "F11-tampered": damagedSnapshot("tamper"),
   "F11-replaced": damagedSnapshot("replace"),
   "F1-legacy": async (c) => {

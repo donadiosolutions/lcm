@@ -35,12 +35,12 @@ the exact exit class, refusal reason and `next` the executable prints.
 
 | Rows | Covers |
 | --- | --- |
-| F1-empty, F1-representative, F1-large, F1-legacy | Smallest non-empty home, a representative home with the runtime daemon on PostgreSQL, a bounded large home with small copy batches, and a home with pre-epoch hook events. |
+| F1-empty, F1-empty-project, F1-representative, F1-large, F1-legacy | Smallest non-empty home, an empty enrolled project, a representative home with the runtime daemon on PostgreSQL, a bounded large home with small copy batches, and a home with pre-epoch hook events. |
 | F2 | The copy worker is killed with SIGKILL after its first committed batch; `report`, `resume`, `verify` and `activate` recover. |
 | F3 | A server-committed copy response is lost once; the batch settles positively without a duplicate receipt. |
 | F4 | The destination is changed after the copy: verification marks the generation ineligible and `abort` restores SQLite. |
 | F5, F6 | Hook events around the hold, after activation and across the rollback: retained, joined once, never lost. |
-| F7b, F7c | Activation interrupted with the selection prepared and with the project map published but not the config. |
+| F7a, F7b, F7c, F7d | Activation interrupted after prepare completes, with the selection prepared, with the project map published but not the config, and after the drive: `report` names `activate` and the retry settles. |
 | F8 | A competing verification fence and a competing publication fence are refused as contention; a superseded fencing token is refused. |
 | F9, H2 | A second registered installation: the first migrates on its own and the second is untouched; a second installation with its own history for a shared project is refused. |
 | F10 | A SQLite daemon alive across activation. |
@@ -105,7 +105,7 @@ that remains makes the verdict `incomplete`.
 ## Verdicts
 
 `pass`, `pass-with-documented-limits`, `fail` and `incomplete`. `pass-with-documented-limits`
-means every blocking oracle passed and the row names the limit it documents (L1, F9, H2, F1-empty-refusal).
+means every blocking oracle passed and the row names the limit it documents (L1, F9, H2).
 A limit never absorbs an unexpected failed authority, preservation, data or cleanup assertion.
 
 ## What this does not claim

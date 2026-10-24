@@ -719,7 +719,7 @@
       "injections": [],
       "knownLimits": [],
       "id": "F1-empty-project",
-      "title": "Empty enrolled project: full forward flow, then pre-write rollback",
+      "title": "Empty enrolled project: full forward flow (verified as activation eligible), then pre-write rollback",
       "fixture": "E0",
       "requirement": "Scope fixture: empty home",
       "steps": [
@@ -818,13 +818,6 @@
         "I4": "required",
         "I5": "na:no unreachable-target step in this row; disclosure scan still runs on every step",
         "I6": "required"
-      },
-      "notes": "Pending the #1676 fix on main (PR #1685): an empty enrolled project is not activation-eligible today (see F1-empty-refusal). The row asserts the success end state.",
-      "gate": {
-        "status": "pending",
-        "pendingOn": [
-          "https://github.com/donadiosolutions/lcm/issues/1676"
-        ]
       }
     },
     {
@@ -1272,85 +1265,6 @@
         {
           "id": "report-copied",
           "use": "report-copied"
-        },
-        {
-          "id": "abort",
-          "use": "abort"
-        }
-      ],
-      "authority": [
-        {
-          "checkpoint": "before-apply",
-          "lastCommittedBackend": "sqlite",
-          "configBackend": "sqlite",
-          "admitted": [
-            "sqlite"
-          ]
-        },
-        {
-          "checkpoint": "held",
-          "lastCommittedBackend": "sqlite",
-          "configBackend": "sqlite",
-          "admitted": []
-        },
-        {
-          "checkpoint": "aborted",
-          "lastCommittedBackend": "sqlite",
-          "configBackend": "sqlite",
-          "admitted": [
-            "sqlite"
-          ],
-          "boundProjects": 0
-        }
-      ],
-      "invariants": {
-        "I1": "required",
-        "I2": "required",
-        "I3": "na:no acknowledged hook input in this row; covered by F5/F6",
-        "I4": "required",
-        "I5": "na:no unreachable-target step in this row; disclosure scan still runs on every step",
-        "I6": "required"
-      }
-    },
-    {
-      "profiles": [
-        "full"
-      ],
-      "timeoutMs": 300000,
-      "supportingTests": [],
-      "injections": [],
-      "knownLimits": [
-        {
-          "issue": "https://github.com/donadiosolutions/lcm/issues/1676",
-          "expectedRefusal": "verify-not-eligible (coverage-incomplete)",
-          "preservedAuthority": "sqlite",
-          "safetyEvidence": "source database and sealed snapshot unchanged; abort releases the hold",
-          "unavailable": "activation of an empty project"
-        }
-      ],
-      "id": "F1-empty-refusal",
-      "title": "Empty enrolled project verifies clean but can never be activation-eligible",
-      "fixture": "E0",
-      "requirement": "Known limit #1676",
-      "steps": [
-        {
-          "id": "plan",
-          "use": "plan"
-        },
-        {
-          "id": "apply",
-          "use": "apply"
-        },
-        {
-          "id": "verify",
-          "use": "verify-ineligible",
-          "evidence": {
-            "detail": "coverage-incomplete"
-          }
-        },
-        {
-          "id": "activate",
-          "use": "activate-not-owner"
         },
         {
           "id": "abort",
@@ -2229,13 +2143,6 @@
         "I4": "required",
         "I5": "na:no unreachable-target step in this row; disclosure scan still runs on every step",
         "I6": "required"
-      },
-      "notes": "Pending the #1679 fix on main: the router currently returns cell 25 route-contradiction for this window. The row asserts recovery with an activate retry exit 0 and settled authority.",
-      "gate": {
-        "status": "pending",
-        "pendingOn": [
-          "https://github.com/donadiosolutions/lcm/issues/1679"
-        ]
       }
     },
     {
@@ -2526,13 +2433,6 @@
         "I4": "required",
         "I5": "na:no unreachable-target step in this row; disclosure scan still runs on every step",
         "I6": "required"
-      },
-      "notes": "Pending the #1679 fix on main: the router currently returns cell 25 route-contradiction for this window. The row asserts recovery with an activate retry exit 0 and settled authority.",
-      "gate": {
-        "status": "pending",
-        "pendingOn": [
-          "https://github.com/donadiosolutions/lcm/issues/1679"
-        ]
       }
     },
     {
@@ -2988,7 +2888,7 @@
         "I5": "na:no unreachable-target step in this row; disclosure scan still runs on every step",
         "I6": "required"
       },
-      "notes": "Required second-machine history contract is a documented refusal: no merge or automatic join of an independent SQLite history into a shared project is attempted. Installation B keeps its history and queue. The refused single apply reports applied=true because apply mints the destination identity before the multi-machine check (docs/migration-operations.md describes apply as resolving or creating the destination identity itself); no hold, journal or SQLite change results."
+      "notes": "Required second-machine history contract is a documented refusal: no merge or automatic join of an independent SQLite history into a shared project is attempted. Installation B keeps its history and queue. The refused single apply reports applied=true because apply mints the destination identity before the multi-machine check (docs/migration-operations.md describes apply as resolving or creating the destination identity itself); no hold, journal or SQLite change results. The ordering is tracked as the non-blocking Bug https://github.com/donadiosolutions/lcm/issues/1689; flip b-apply to applied=false if it is changed."
     },
     {
       "profiles": [
