@@ -1,13 +1,13 @@
 import { beforeEach, describe, expect, it } from "vitest";
 import {
-  performSetAbort, performSetActivate, performSetReport, performSetResume, performSetRollback, performSetVerify,
+  performSetActivate, performSetResume, performSetRollback, performSetVerify,
   type MigrationSetOperations, type MigrationSetOutcome,
 } from "../../src/migration/cli-cutover-set.js";
 import { renderMigrationSetEnvelope } from "../../src/migration/cli-render.js";
 import { migrationCommandContract, type MigrationCommandName } from "../../src/migration/exit-classes.js";
 import { deriveCutoverSetRollbackSetId } from "../../src/migration/cutover-set-rollback-store.js";
 import {
-  ABSENT_JOURNAL, GENERATIONS, PROJECTS, SET_ID, craftedHome, holdJournal, publicationJournal, resolvedActivation,
+  GENERATIONS, PROJECTS, SET_ID, craftedHome, holdJournal, publicationJournal, resolvedActivation,
   resolvedRollback, setOperations,
 } from "../fixtures/cli-cutover-set.js";
 

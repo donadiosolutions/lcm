@@ -1235,7 +1235,7 @@ export function performSetAbort(input: MigrationSetAbortInput): Promise<Migratio
     const store = manifestStoreOf(input.homeDir);
     // A set hold always names its members; a manifest that was never created is a legitimate settled state.
     const rows: SetEvidenceRow[] = (hold?.cutoverSet?.manifest.members ?? []).map((member) => {
-      let state = "absent";
+      let state: string;
       try {
         const presence = store.probeManifestPresence(member.generationId);
         state = presence.status === "present" ? store.read(member.generationId).phase : presence.status;
