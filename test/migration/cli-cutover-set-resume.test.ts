@@ -3,7 +3,7 @@ import {
   performSetAbort, performSetReport, performSetResume, type MigrationSetOperations, type MigrationSetOutcome,
 } from "../../src/migration/cli-cutover-set.js";
 import { renderMigrationSetEnvelope } from "../../src/migration/cli-render.js";
-import type { MigrationCommandName } from "../../src/migration/exit-classes.js";
+import { migrationCommandContract, type MigrationCommandName } from "../../src/migration/exit-classes.js";
 import { deriveCutoverSetRollbackSetId } from "../../src/migration/cutover-set-rollback-store.js";
 import {
   GENERATIONS, PROJECTS, SET_ID, craftedHome, holdJournal, publicationJournal, resolvedActivation, resolvedRollback, setOperations,
@@ -12,8 +12,11 @@ import {
 const REVERSE_ID = deriveCutoverSetRollbackSetId(SET_ID);
 type Parts = Parameters<typeof setOperations>[1];
 
+/** Renders the outcome and holds it to the command's frozen exit contract. */
 function envelope(command: MigrationCommandName, outcome: MigrationSetOutcome) {
-  return renderMigrationSetEnvelope(command, outcome);
+  const rendered = renderMigrationSetEnvelope(command, outcome);
+  expect(migrationCommandContract(command).canEmit).toContain(rendered.exitCode);
+  return rendered;
 }
 
 const PREPARED: Parts = { journal: holdJournal() };
@@ -127,7 +130,7 @@ describe("report --set", () => {
   });
 
   it.each([
-    ["a preparing set", { journal: holdJournal(), eligible: false }, "resume --set"],
+    ["a preparing set", { journal: holdJournal(), snapshot: "partial" }, "resume --set"],
     ["an activation in flight", ACTIVATING, "resume --set"],
     ["a rollback in flight", ROLLING_BACK, "resume --set"],
     ["an abort to finish", ABORTED, "resume --set"],

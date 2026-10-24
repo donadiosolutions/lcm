@@ -61,6 +61,8 @@ export type SetMember = Readonly<{
   snapshot: string | null;
   /** Verified, nothing pending and an eligible persisted report. */
   eligible: boolean;
+  /** A closed marker when the member's own evidence could not be read; null for any legitimate state. */
+  evidenceFailure: string | null;
 }>;
 
 export type SetRoute =
@@ -190,7 +192,11 @@ async function observeMember(
       eligible = false;
     }
   }
-  return { index, physicalProjectId: ref.physicalProjectId, generationId, manifest, pending, revision, settled, snapshot, eligible };
+  // A verified manifest always names an eligible persisted report, so a refusal reading it is lost evidence.
+  const evidenceFailure = manifest === "unresolvable" ? "manifest-unresolvable"
+    : snapshot === "unresolvable" ? "snapshot-unresolvable"
+      : manifest === "verified" && pending === null && !eligible ? "verification-evidence" : null;
+  return { index, physicalProjectId: ref.physicalProjectId, generationId, manifest, pending, revision, settled, snapshot, eligible, evidenceFailure };
 }
 
 function prepareBlockOf(members: readonly SetMember[]): SetPrepareBlock | null {
@@ -222,12 +228,15 @@ function decideRoute(
   }
   if (members.some((member) => member.manifest === "unresolvable") && relation !== "forward") return "unresolvable";
   const all = (phase: string): boolean => members.length > 0 && members.every((member) => member.manifest === phase && member.pending === null);
+  // A settlement is terminal only with the frozen selection that produced it.
   if (rollback.state === "resolved") {
-    return all("rolled-back") ? "settled-rolled-back" : "rollback";
+    if (all("rolled-back")) return rollback.selection === null ? "contradiction" : "settled-rolled-back";
+    return "rollback";
   }
   if (activation.state === "resolved") {
     if (relation === "rollback" || relation === "publication-rollback") return "contradiction";
-    return all("active") ? "settled-activated" : "activate";
+    if (all("active")) return activation.selection === null ? "contradiction" : "settled-activated";
+    return "activate";
   }
   // The set id names a rollback hold or publication (the reverse id), never the original set.
   if (relation === "reverse-hold" || relation === "publication-forward") return "reverse-id";
@@ -305,7 +314,7 @@ export function closedToken(value: string | null | undefined): string {
   return typeof value === "string" && CLOSED_TOKEN.test(value) ? value : "unrecognized";
 }
 
-/** One flattened row; the indexes sort numerically, never lexically. */
+/** One flattened row. Indexes are in manifest order; the envelope sorts keys lexically, so consumers sort them numerically. */
 export type SetEvidenceRow = Readonly<{
   projectId?: string | null;
   generationId?: string | null;
@@ -343,7 +352,35 @@ export function observedRows(observation: SetObservation): readonly SetEvidenceR
     state: member.manifest,
     pending: member.pending,
     snapshot: member.snapshot,
+    reason: member.evidenceFailure,
   }));
+}
+
+/**
+ * Whether the durable state read after a service returned still admits that
+ * same service to continue, which is what exit 6 claims. A record naming the
+ * service is not enough: the journal slot must still hold the set's own live
+ * (not aborted) hold, or its own publication carrying the frozen selection.
+ * This under-claims where admission cannot be shown without mirroring the
+ * service's slot table; the service stays the authority for every mutation.
+ */
+export function admitsResume(observation: SetObservation, service: "prepare" | "activate" | "rollback"): boolean {
+  const { journal } = observation;
+  const live = (id: string, phases: readonly string[]): boolean =>
+    journal.kind === "hold" && journal.journal.cutoverSet?.manifest.setId === id && phases.includes(journal.journal.phase);
+  const published = (id: string): boolean => journal.kind === "publication" && journal.publicationId === id;
+  if (service === "prepare") return observation.route === "prepare" && observation.prepareBlock === null;
+  if (service === "activate") {
+    if (observation.route === "prepared") return true;
+    return observation.route === "activate" && (
+      live(observation.setId, ["maintenance-held", "selection-prepared", "selection-completed"])
+      || (published(observation.setId) && observation.activation.state === "resolved" && observation.activation.selection !== null)
+    );
+  }
+  return observation.route === "rollback" && (
+    live(observation.rollbackSetId, ["maintenance-entering", "maintenance-held", "selection-prepared", "selection-completed"])
+    || (published(observation.rollbackSetId) && observation.rollback.state === "resolved" && observation.rollback.selection !== null)
+  );
 }
 
 export function journalSections(journal: MigrationJournalObservation): MigrationEvidence {

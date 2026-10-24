@@ -4,14 +4,17 @@ import {
   performSetApply, performSetDryRun, performSetPlan, type MigrationSetOperations, type MigrationSetOutcome,
 } from "../../src/migration/cli-cutover-set.js";
 import { renderMigrationSetEnvelope } from "../../src/migration/cli-render.js";
-import type { MigrationCommandName } from "../../src/migration/exit-classes.js";
+import { migrationCommandContract, type MigrationCommandName } from "../../src/migration/exit-classes.js";
 import { MIGRATION_REFUSAL_REASONS } from "../../src/migration/refusal-mapping.js";
 import { GENERATIONS, PROJECTS, SET_ID, craftedHome, holdJournal, setOperations } from "../fixtures/cli-cutover-set.js";
 
 type Parts = Parameters<typeof setOperations>[1];
 
+/** Renders the outcome and holds it to the command's frozen exit contract. */
 function envelope(command: MigrationCommandName, outcome: MigrationSetOutcome) {
-  return renderMigrationSetEnvelope(command, outcome);
+  const rendered = renderMigrationSetEnvelope(command, outcome);
+  expect(migrationCommandContract(command).canEmit).toContain(rendered.exitCode);
+  return rendered;
 }
 
 const PREPARED: Parts = { journal: holdJournal() };
@@ -73,7 +76,7 @@ describe("plan --set and the unexpected-failure boundary", () => {
     ["cutover-set-single-project", 2, "set-refused-precondition", "cutover-set-single-project"],
     ["publication-occupies-slot", 4, "set-refused-contention", "publication-occupies-slot"],
     ["journal-unresolvable", 5, "set-refused-evidence", "journal-unresolvable"],
-    ["capture-failed", 7, "set-operator-required", "capture-failed"],
+    ["capture-failed", 5, "set-refused-evidence", "capture-failed"],
     ["hold-entry-precondition", 2, "set-refused-precondition", "hold-entry-precondition"],
     ["confirmation-missing", 5, "set-refused-evidence", "unrecognized"],
     ["something-brand-new", 5, "set-refused-evidence", "unrecognized"],

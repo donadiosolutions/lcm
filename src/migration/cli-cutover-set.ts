@@ -11,6 +11,7 @@ import { combineCutoverRestart, CUTOVER_RESTART_REASONS, observeCutoverRestart }
 import { ACTIVATE_NEXT_AFTER_SUCCESS } from "./cli-activate.js";
 import { refuseUnlessBackendConfirmed, refuseUnlessConfirmed } from "./cli-existing.js";
 import {
+  admitsResume,
   closedToken,
   journalSections,
   nextForRoute,
@@ -195,6 +196,22 @@ const PREPARE_REASON_BUCKETS: Readonly<Record<string, Bucket>> = {
   cancelled: "incomplete",
 };
 
+/** Every reason a member row may carry; any other service string is shown as unrecognized, never copied. */
+function knownReasons(): ReadonlySet<string> {
+  return new Set([
+    ...Object.keys(PREPARE_REASON_BUCKETS),
+    ...Object.keys(ACTIVATION_REFUSAL_BUCKETS),
+    ...Object.keys(ROLLBACK_REFUSAL_BUCKETS),
+    ...Object.keys(ROLLBACK_BLOCKED_BUCKETS),
+    ...MIGRATION_REFUSAL_REASONS.map((entry) => entry.reason),
+  ]);
+}
+
+function rowReason(reason: string | null | undefined): string | null {
+  if (reason === undefined || reason === null) return null;
+  return KNOWN_REASONS.has(reason) ? reason : "unrecognized";
+}
+
 /** An inherited single-generation reason classifies by its table entry; anything else is evidence, undisclosed. */
 function serviceBucket(reason: string): Readonly<{ bucket: Bucket; known: boolean }> {
   const own = PREPARE_REASON_BUCKETS[reason];
@@ -344,6 +361,8 @@ const ROLLBACK_INTERRUPTION_BUCKETS = {
   "lease-lost": "contention",
 } as const satisfies Record<CutoverSetRollbackInterruptionCause, Bucket>;
 
+const KNOWN_REASONS = knownReasons();
+
 /** A table lookup that fails closed on an unknown runtime value (the type check covers the declared unions). */
 function closedBucket<T extends string>(kind: string, table: Readonly<Record<T, Bucket>>, value: unknown): Bucket {
   if (typeof value !== "string" || !Object.hasOwn(table, value)) {
@@ -374,24 +393,31 @@ function serviceRefusal(args: Readonly<{
   command: "plan" | "prepare" | "activate" | "rollback" | "abort" | "dry-run" | "verify" | "resume" | "report";
   reason: string;
   bucket?: Bucket;
+  /** Whether the reason belongs to a closed vocabulary; by default an explicit bucket vouches for it. */
+  known?: boolean;
   setId?: string | null;
   projects?: readonly string[];
   applied?: boolean;
   next?: string | null;
   sections?: MigrationEvidence;
 }>): MigrationSetOutcome {
-  const classified = args.bucket === undefined ? serviceBucket(args.reason) : { bucket: args.bucket, known: true };
+  const classified = serviceBucket(args.reason);
+  const known = args.known ?? (args.bucket !== undefined || classified.known);
   if (args.reason === "confirmation-generation-moved") {
     return refuse(SET_CONFIRMATION_REASONS.moved, { generationId: args.setId, next: "plan --set" });
   }
-  return refuse(BUCKET_REASONS[classified.bucket], {
+  // plan and dry-run cannot emit the mutation classes (frozen contract): fold them into evidence.
+  const requested = args.bucket ?? classified.bucket;
+  const readOnly = args.command === "plan" || args.command === "dry-run";
+  const bucket = readOnly && (requested === "operator" || requested === "incomplete") ? "evidence" : requested;
+  return refuse(BUCKET_REASONS[bucket], {
     generationId: args.setId ?? null,
     ...(args.applied === true ? { applied: true } : {}),
     next: args.next ?? null,
     sections: {
       scope: "cutover-set",
       serviceCommand: args.command,
-      serviceReason: classified.known ? args.reason : "unrecognized",
+      serviceReason: known ? args.reason : "unrecognized",
       ...projectSections(args.projects),
       ...args.sections,
     },
@@ -404,9 +430,16 @@ function commonPhase(rows: readonly SetEvidenceRow[]): string | null {
 }
 
 /** True when a durable write by this invocation is proven or cannot be excluded; the flag says which. */
-function writeObservation(before: string, after: string, signal: boolean): Readonly<{ applied: boolean; unresolvable: boolean }> {
+function writeObservation(
+  before: string,
+  after: string,
+  signal: boolean,
+  uncertain = false,
+): Readonly<{ applied: boolean; unresolvable: boolean }> {
   if (before === "unresolvable" || after === "unresolvable") return { applied: true, unresolvable: true };
-  return { applied: signal || before !== after, unresolvable: false };
+  if (signal || before !== after) return { applied: true, unresolvable: false };
+  // Nothing observed moved, but the step may have written outside what the fingerprint covers.
+  return { applied: uncertain, unresolvable: uncertain };
 }
 
 function writeSections(observed: Readonly<{ unresolvable: boolean }>): MigrationEvidence {
@@ -588,7 +621,7 @@ function fingerprintOf(homeDir: string, setId: string, generationIds: readonly s
 function preparationRows(result: CutoverSetPrepareResult): readonly SetEvidenceRow[] {
   if (result.status === "refuse") return [];
   return result.members.map((member) => ({
-    projectId: member.physicalProjectId, generationId: member.generationId, state: member.state, reason: member.reason,
+    projectId: member.physicalProjectId, generationId: member.generationId, state: member.state, reason: rowReason(member.reason),
   }));
 }
 
@@ -617,11 +650,10 @@ async function mapPrepare(args: Readonly<{
     const classified = serviceBucket(result.reason);
     let bucket = classified.bucket;
     if (bucket === "incomplete") {
-      const again = await observationOf({ homeDir, setId, ops });
-      bucket = again.route === "prepare" && again.prepareBlock === null ? "incomplete" : "evidence";
+      bucket = await admitted(homeDir, setId, ops, "prepare") ? "incomplete" : "evidence";
     }
     return serviceRefusal({
-      command: "prepare", reason: result.reason, bucket, setId, applied: written.applied,
+      command: "prepare", reason: result.reason, bucket, known: classified.known, setId, applied: written.applied,
       next: bucket === "incomplete" || bucket === "contention" ? "resume --set" : bucket === "precondition" ? "abort --set" : null,
       sections: { ...base, blockedProjectId: result.blockedProject },
     });
@@ -634,7 +666,7 @@ async function mapPrepare(args: Readonly<{
       sections: { ...base, ...setSections(observed), ...setRowsEvidence(observedRows(observed)) },
     });
   }
-  const readRows = observedRows(observed).map((row) => ({ ...row, state: row.state }));
+  const readRows = observedRows(observed);
   return {
     status: "ok", generationId: setId, manifestPhase: commonPhase(readRows), applied: written.applied, next: "activate --set",
     evidence: { ...setSections(observed), ...setRowsEvidence(readRows), ...writeSections(written) },
@@ -682,21 +714,24 @@ export function performSetApply(input: MigrationSetApplyInput): Promise<Migratio
 
 function activationRows(result: Exclude<CutoverSetActivateResult, never>): readonly SetEvidenceRow[] {
   return result.members.map((member) => ({
-    projectId: member.physicalProjectId, generationId: member.generationId, state: member.manifest, reason: member.reason,
+    projectId: member.physicalProjectId, generationId: member.generationId, state: member.manifest, reason: rowReason(member.reason),
   }));
 }
 
 function rollbackRows(result: CutoverSetRollbackResult): readonly SetEvidenceRow[] {
   return result.members.map((member) => ({
     projectId: member.physicalProjectId, generationId: member.generationId, state: member.manifest,
-    reason: member.reason, mode: member.mode, installedGenerationId: member.installedGenerationId,
+    reason: rowReason(member.reason), mode: member.mode, installedGenerationId: member.installedGenerationId,
   }));
 }
 
-async function admits(homeDir: string, setId: string, ops: Ops, routes: readonly SetRoute[]): Promise<boolean> {
-  const again = await observationOf({ homeDir, setId, ops });
-  return routes.includes(again.route) && again.prepareBlock === null;
+/** Exit 6 needs the durable state, read again, to admit the same service (see admitsResume). */
+async function admitted(homeDir: string, setId: string, ops: Ops, service: "prepare" | "activate" | "rollback"): Promise<boolean> {
+  return admitsResume(await observationOf({ homeDir, setId, ops }), service);
 }
+
+/** Rollback steps that write outside what the fingerprint observes (the reverse artifact, candidates, installed databases). */
+const UNFENCED_ROLLBACK_STEPS: ReadonlySet<string> = new Set(["artifact", "build", "install"]);
 
 async function mapActivate(args: Readonly<{
   homeDir: string;
@@ -745,7 +780,7 @@ async function mapActivate(args: Readonly<{
         sections: { ...common, serviceStep: result.step, serviceCause: result.cause, effectBegun: false, ...writeEvidence },
       });
     }
-    if (result.cause === "lease-lost" && await admits(homeDir, setId, ops, ["prepared", "activate"])) bucket = "incomplete";
+    if (result.cause === "lease-lost" && await admitted(homeDir, setId, ops, "activate")) bucket = "incomplete";
     return refuse(BUCKET_REASONS[bucket], {
       generationId: setId, applied: true, next: bucket === "incomplete" ? "resume --set" : null,
       sections: {
@@ -785,10 +820,10 @@ async function mapActivate(args: Readonly<{
     });
   }
   const restart = await ops.combineRestart({ homeDir, verdict: result.restart, selected: "postgresql" });
-  const applied = result.resumedFrom !== "settled-active";
+  const applied = written.applied;
   const evidence: MigrationEvidence = {
     ...setSections(observed), ...setRowsEvidence(observedRows(observed)), publicationId: result.publicationId,
-    resumedFrom: result.resumedFrom, grantSwap: "required-before-daemon-start", ...restart.evidence,
+    resumedFrom: result.resumedFrom, grantSwap: "required-before-daemon-start", ...restart.evidence, ...writeEvidence,
   };
   if (restart.reason !== undefined) {
     return refuse(restart.reason, {
@@ -824,13 +859,15 @@ async function mapRollback(args: Readonly<{
     return serviceRefusal({ command: "rollback", reason: result.reason, bucket, setId, sections: { ...common, serviceStep: result.step } });
   }
   const after = await fingerprintOf(homeDir, setId, args.generationIds, ops);
-  const written = writeObservation(args.before, after, true);
+  const signal = result.status === "rolled-back" && result.resumedFrom !== "settled";
+  const uncertain = result.status !== "rolled-back" && UNFENCED_ROLLBACK_STEPS.has(result.step);
+  const written = writeObservation(args.before, after, signal, uncertain);
   const writeEvidence = writeSections(written);
   if (result.status === "blocked") {
     let bucket = closedBucket("blocked reason", ROLLBACK_BLOCKED_BUCKETS, result.reason);
-    if (bucket === "incomplete" && !(await admits(homeDir, setId, ops, ["rollback"]))) bucket = "evidence";
+    if (bucket === "incomplete" && !(await admitted(homeDir, setId, ops, "rollback"))) bucket = "evidence";
     return refuse(BUCKET_REASONS[bucket], {
-      generationId: setId, applied: true, next: bucket === "incomplete" ? "resume --set" : null,
+      generationId: setId, applied: written.applied, next: bucket === "incomplete" ? "resume --set" : null,
       sections: {
         ...common, serviceCommand: "rollback", serviceStep: result.step, serviceReason: result.reason,
         blockedProjectId: result.member, ...writeEvidence,
@@ -839,9 +876,9 @@ async function mapRollback(args: Readonly<{
   }
   if (result.status === "interrupted") {
     let bucket = closedBucket("interruption cause", ROLLBACK_INTERRUPTION_BUCKETS, result.cause);
-    if (bucket === "incomplete" && !(await admits(homeDir, setId, ops, ["rollback"]))) bucket = "evidence";
+    if (bucket === "incomplete" && !(await admitted(homeDir, setId, ops, "rollback"))) bucket = "evidence";
     return refuse(BUCKET_REASONS[bucket], {
-      generationId: setId, applied: true, next: bucket === "incomplete" ? "resume --set" : null,
+      generationId: setId, applied: written.applied, next: bucket === "incomplete" ? "resume --set" : null,
       sections: {
         ...common, serviceCommand: "rollback", serviceStep: result.step, serviceCause: result.cause,
         effectBegun: result.effectBegun, ...writeEvidence,
@@ -856,8 +893,10 @@ async function mapRollback(args: Readonly<{
     });
   }
   const restart = await ops.observeRestart({ homeDir, selected: "sqlite" });
-  const applied = result.resumedFrom !== "settled";
-  const evidence: MigrationEvidence = { ...common, publicationId: result.publicationId, resumedFrom: result.resumedFrom, ...restart.evidence };
+  const applied = written.applied;
+  const evidence: MigrationEvidence = {
+    ...common, publicationId: result.publicationId, resumedFrom: result.resumedFrom, ...restart.evidence, ...writeEvidence,
+  };
   if (restart.reason !== undefined) {
     return refuse(restart.reason, {
       generationId: setId, ...(applied ? { applied: true } : {}), next: "report --set", sections: evidence, restart: restart.restart,
@@ -1138,6 +1177,10 @@ export function performSetReport(input: MigrationSetReportInput): Promise<Migrat
     if (route === "foreign") return refuse("route-foreign-publication", { generationId: setId, sections: evidence });
     if (route === "single-generation-held") {
       return serviceRefusal({ command: "report", reason: "cutover-set-single-generation-held", bucket: "precondition", setId, sections: evidence });
+    }
+    // Lost member evidence is a failure of the report itself, whatever the owner route is.
+    if (observation.members.some((member) => member.evidenceFailure !== null)) {
+      return refuse("report-evidence-unresolvable", { generationId: setId, next, sections: evidence });
     }
     let restart: MigrationEnvelopeRestart | null = null;
     let restartEvidence: MigrationEvidence = {};

@@ -6,7 +6,7 @@ import {
   type MigrationSetOperations, type MigrationSetOutcome,
 } from "../../src/migration/cli-cutover-set.js";
 import { renderMigrationSetEnvelope } from "../../src/migration/cli-render.js";
-import type { MigrationCommandName } from "../../src/migration/exit-classes.js";
+import { migrationCommandContract, type MigrationCommandName } from "../../src/migration/exit-classes.js";
 import { prepareCutoverSet, resolveCutoverSetCandidate } from "../../src/migration/cutover-set-prepare.js";
 import { heldJournal, makeEnv, memberIds, prepareInput, targetConfig, type Env } from "../fixtures/cutover-set-prepare.js";
 
@@ -21,8 +21,11 @@ function operations(env: Env, extra: Partial<MigrationSetOperations> = {}): Part
   };
 }
 
+/** Renders the outcome and holds it to the command's frozen exit contract. */
 function envelope(command: MigrationCommandName, outcome: MigrationSetOutcome) {
-  return renderMigrationSetEnvelope(command, outcome);
+  const rendered = renderMigrationSetEnvelope(command, outcome);
+  expect(migrationCommandContract(command).canEmit).toContain(rendered.exitCode);
+  return rendered;
 }
 
 /** Every file under the LCM home but lock files, with its bytes. */

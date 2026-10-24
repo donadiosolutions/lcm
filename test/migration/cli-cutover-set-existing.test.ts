@@ -4,7 +4,7 @@ import {
   type MigrationSetOperations, type MigrationSetOutcome,
 } from "../../src/migration/cli-cutover-set.js";
 import { renderMigrationSetEnvelope } from "../../src/migration/cli-render.js";
-import type { MigrationCommandName } from "../../src/migration/exit-classes.js";
+import { migrationCommandContract, type MigrationCommandName } from "../../src/migration/exit-classes.js";
 import { deriveCutoverSetRollbackSetId } from "../../src/migration/cutover-set-rollback-store.js";
 import {
   ABSENT_JOURNAL, GENERATIONS, PROJECTS, SET_ID, craftedHome, holdJournal, publicationJournal, resolvedActivation,
@@ -14,8 +14,11 @@ import {
 const REVERSE_ID = deriveCutoverSetRollbackSetId(SET_ID);
 type Parts = Parameters<typeof setOperations>[1];
 
+/** Renders the outcome and holds it to the command's frozen exit contract. */
 function envelope(command: MigrationCommandName, outcome: MigrationSetOutcome) {
-  return renderMigrationSetEnvelope(command, outcome);
+  const rendered = renderMigrationSetEnvelope(command, outcome);
+  expect(migrationCommandContract(command).canEmit).toContain(rendered.exitCode);
+  return rendered;
 }
 
 const PREPARED: Parts = { journal: holdJournal() };
@@ -23,6 +26,8 @@ const PREPARING: Parts = { journal: holdJournal(), eligible: false };
 const ACTIVATING: Parts = { journal: holdJournal({ phase: "selection-prepared" }), activation: resolvedActivation(false) };
 const ACTIVATED: Parts = { journal: publicationJournal(), activation: resolvedActivation() };
 const ROLLING_BACK: Parts = { journal: publicationJournal(REVERSE_ID), activation: resolvedActivation(), rollback: resolvedRollback(false) };
+const ROLLING_BACK_OWNED: Parts = { journal: holdJournal({ setId: REVERSE_ID, sourceBackend: "postgresql" }), activation: resolvedActivation(), rollback: resolvedRollback(false) };
+const ROLLING_BACK_SELECTED: Parts = { journal: publicationJournal(REVERSE_ID), activation: resolvedActivation(), rollback: resolvedRollback(true) };
 const ROLLED_BACK: Parts = { journal: publicationJournal(REVERSE_ID), activation: resolvedActivation(), rollback: resolvedRollback() };
 
 const SATISFIED = { restart: { answer: "satisfied", presence: "absent" } as const, evidence: { selectedBackend: "postgresql" } };
@@ -184,8 +189,6 @@ describe("activate --set", () => {
     expect(contradiction).toMatchObject({ exitCode: 5, next: "report --set", applied: false });
     const mismatch = envelope("activate", await run(ACTIVATING, activated("fresh"), {}, {}, prepared));
     expect(mismatch).toMatchObject({ exitCode: 5, applied: true, evidence: { serviceReason: "readback-mismatch" } });
-    const unselected = envelope("activate", await run({ journal: publicationJournal(), activation: resolvedActivation(false) }, activated("fresh"), {}, {}, active));
-    expect(unselected).toMatchObject({ exitCode: 5, evidence: { serviceReason: "readback-mismatch" } });
   });
 
   it("fails closed on an unknown status, reason, cause or publication status", async () => {
@@ -230,13 +233,13 @@ describe("rollback --set", () => {
     expect(envelope("rollback", await run(ACTIVATED, blocked("lease-lost")))).toMatchObject({ exitCode: 4, applied: true, evidence: { blockedProjectId: GENERATIONS[0] } });
     expect(envelope("rollback", await run(ACTIVATED, blocked("not-eligible")))).toMatchObject({ exitCode: 2 });
     expect(envelope("rollback", await run(ACTIVATED, blocked("install-mismatch")))).toMatchObject({ exitCode: 5 });
-    expect(envelope("rollback", await run(ROLLING_BACK, blocked("build-failed")))).toMatchObject({ exitCode: 6, next: "resume --set" });
+    expect(envelope("rollback", await run(ROLLING_BACK_OWNED, blocked("build-failed")))).toMatchObject({ exitCode: 6, next: "resume --set" });
     expect(envelope("rollback", await run(ACTIVATED, blocked("install-failed")))).toMatchObject({ exitCode: 5, next: null });
   });
 
   it("maps an interruption", async () => {
     const interrupted = (cause: string) => ({ ...base, status: "interrupted", step: "publication", cause, detail: "d", effectBegun: true });
-    expect(envelope("rollback", await run(ROLLING_BACK, interrupted("publication-aborted")))).toMatchObject({ exitCode: 6, applied: true, next: "resume --set" });
+    expect(envelope("rollback", await run(ROLLING_BACK_SELECTED, interrupted("publication-aborted")))).toMatchObject({ exitCode: 6, applied: false, next: "resume --set" });
     expect(envelope("rollback", await run(ACTIVATED, interrupted("publication-aborted")))).toMatchObject({ exitCode: 5 });
     expect(envelope("rollback", await run(ACTIVATED, interrupted("hold-gone")))).toMatchObject({ exitCode: 7 });
     expect(envelope("rollback", await run(ACTIVATED, interrupted("lease-lost")))).toMatchObject({ exitCode: 4 });
