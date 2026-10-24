@@ -1,0 +1,8 @@
+references: ["#1679"]
+rationale: >-
+  Extends the existing row 11 of the migration state router so the two
+  interrupted activation windows resume with activate instead of falling to
+  row 25. Only src/migration/routing.ts changes, and it stays in the
+  directory-level migration cutover owner; no file is added, removed or moved.
+pins:
+  - ["src/migration/routing.ts", "unit-migration-cutover"]

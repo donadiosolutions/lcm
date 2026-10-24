@@ -1,4 +1,6 @@
 import {
+  PostgreSqlIdentityAliasNormalizedPathConflictError,
+  PostgreSqlIdentityAliasPathConflictError,
   PostgreSqlIdentityConflictError,
   type PostgreSqlIdentityRepository,
 } from "../storage/postgresql/identity-repository.js";
@@ -141,7 +143,29 @@ export type MigrationTargetIdentityResolution =
 export type MigrationTargetIdentityOperations = Readonly<{
   resolveProject: PostgreSqlIdentityRepository["resolveProject"];
   createProject: PostgreSqlIdentityRepository["createProject"];
+  ensureProjectAliases: PostgreSqlIdentityRepository["ensureProjectAliases"];
 }>;
+
+const ALIAS_CONFLICT = Object.freeze({
+  status: "refuse",
+  reason: "migration-target-identity-unresolvable",
+  evidence: "alias-conflict",
+} as const);
+
+function isAliasConflict(error: unknown): boolean {
+  return error instanceof PostgreSqlIdentityConflictError
+    || error instanceof PostgreSqlIdentityAliasPathConflictError
+    || error instanceof PostgreSqlIdentityAliasNormalizedPathConflictError;
+}
+
+/**
+ * The destination alias rows the source stream carries for this project: the
+ * canonical path first, then every authorized map alias, each with the
+ * normalized path the source derives for it (#1678).
+ */
+function authorizedAliasRows(canonicalPath: string, aliases: readonly string[]) {
+  return [canonicalPath, ...aliases].map((path) => ({ path, normalizedPath: normalizeProjectPath(path) }));
+}
 
 export async function resolveMigrationTargetProjectId(input: Readonly<{
   repository: PostgreSqlIdentityRepository;
@@ -153,6 +177,14 @@ export async function resolveMigrationTargetProjectId(input: Readonly<{
    */
   authorityCanonicalPath: string;
   /**
+   * The project-map aliases the source stream will carry besides the
+   * canonical path (`authorizedMapAliasPaths`). They are minted with the
+   * project so the destination holds exactly the source's alias set; a
+   * collision between two of them, or with a row already bound elsewhere,
+   * refuses as `alias-conflict`.
+   */
+  aliases?: readonly string[];
+  /**
    * @internal Deterministic failure-injection seam for tests only,
    * matching the `_operationsForTesting` convention used elsewhere in
    * `src/migration/`.
@@ -163,10 +195,27 @@ export async function resolveMigrationTargetProjectId(input: Readonly<{
     ?? input.repository.resolveProject.bind(input.repository);
   const createProject = input._operationsForTesting?.createProject
     ?? input.repository.createProject.bind(input.repository);
+  const ensureProjectAliases = input._operationsForTesting?.ensureProjectAliases
+    ?? input.repository.ensureProjectAliases.bind(input.repository);
   const normalizedPath = normalizeProjectPath(input.authorityCanonicalPath);
+  const rows = authorizedAliasRows(input.authorityCanonicalPath, input.aliases ?? []);
+  if (new Set(rows.map((row) => row.normalizedPath)).size !== rows.length
+    || new Set(rows.map((row) => row.path)).size !== rows.length) return ALIAS_CONFLICT;
+
+  // An existing project must hold exactly the authorized alias set: missing
+  // rows are added in one transaction, anything else is a conflict.
+  const adopt = async (projectId: string): Promise<MigrationTargetIdentityResolution> => {
+    try {
+      if (await ensureProjectAliases({ machineId: input.machineId, projectId, aliases: rows }) === null) return ALIAS_CONFLICT;
+    } catch (error) {
+      if (!isAliasConflict(error)) throw error;
+      return ALIAS_CONFLICT;
+    }
+    return { status: "resolved", projectId, effect: "reused" };
+  };
 
   const existing = await resolveProject(input.machineId, normalizedPath);
-  if (existing !== null) return { status: "resolved", projectId: existing.projectId, effect: "reused" };
+  if (existing !== null) return adopt(existing.projectId);
 
   try {
     const created = await createProject({
@@ -174,23 +223,24 @@ export async function resolveMigrationTargetProjectId(input: Readonly<{
       displayName: input.displayName,
       path: input.authorityCanonicalPath,
       normalizedPath,
+      aliases: rows,
     });
     return { status: "resolved", projectId: created.projectId, effect: "created" };
   } catch (error) {
-    if (!(error instanceof PostgreSqlIdentityConflictError)) throw error;
+    if (!isAliasConflict(error)) throw error;
+    if (!(error instanceof PostgreSqlIdentityConflictError)) return ALIAS_CONFLICT;
     // The losing side of a real concurrent race: createProject's own
     // transaction has already rolled back cleanly. Re-read rather than
     // refuse -- the winner's commit is what "resolved" means here.
     const resolved = await resolveProject(input.machineId, normalizedPath);
-    if (resolved !== null) return { status: "resolved", projectId: resolved.projectId, effect: "reused" };
-    // Unreachable in practice: PostgreSqlIdentityConflictError itself
-    // proves a row exists at this exact key. An absent re-read here is
-    // unresolvable evidence, never a signal to guess or retry blindly.
-    return {
-      status: "refuse",
-      reason: "migration-target-identity-unresolvable",
-      evidence: "post-conflict-reread-absent",
-    };
+    if (resolved !== null) return adopt(resolved.projectId);
+    // Without extra aliases a conflict proves a row exists at the canonical
+    // key, so an absent re-read is unresolvable evidence, never a signal to
+    // guess or retry blindly. With extra aliases the conflicting row is one
+    // of them, bound to another project.
+    return rows.length === 1
+      ? { status: "refuse", reason: "migration-target-identity-unresolvable", evidence: "post-conflict-reread-absent" }
+      : ALIAS_CONFLICT;
   }
 }
 

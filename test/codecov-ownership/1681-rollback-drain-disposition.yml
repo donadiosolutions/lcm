@@ -1,0 +1,10 @@
+references: ["#1681"]
+rationale: >-
+  The rollback sidecar verifier accepts a locally processed passive event
+  whose archive row is still pending, and gains a read-only preflight that
+  rollback.ts runs before publish-rollback begins. Both changes stay inside the
+  existing rollback modules in the migration cutover owner; no file is added,
+  removed, moved or re-owned.
+pins:
+  - ["src/migration/rollback-sidecars.ts", "unit-migration-cutover"]
+  - ["src/migration/rollback.ts", "unit-migration-cutover"]

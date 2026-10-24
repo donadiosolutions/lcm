@@ -388,6 +388,13 @@ export const MIGRATION_SEARCH_PROBE_CANDIDATE_POOL_SIZE = 25;
 const SEARCH_PROBE_RESULT_WINDOW = 50;
 
 /**
+ * Fixed query the empty-source path sends through the production search
+ * (#1676). It must not normalize to empty, or searchMessages would return
+ * before any SQL and the path would prove nothing.
+ */
+const EMPTY_SOURCE_SEARCH_PROBE_QUERY = "lcm migration empty source probe";
+
+/**
  * The step 5 ordered-listing probe now runs through the real repository
  * (PostgreSqlConversationRepository.listConversations, the exact production
  * read path -- not hand-written SQL that would only re-test a copy of the
@@ -598,10 +605,17 @@ export async function runOrderedListingProbe(
  * anything", so it does not guess. It reports what it could not
  * evaluate and lets classCoverage's sample bit -- driven by this
  * outcome, not a static declaration -- refuse eligibility instead.
+ *
+ * The third variant (#1676) is an empty candidate pool for which the
+ * production search, sent one fixed query, returned no rows. It is
+ * never "ran" on its own: the driver upgrades it to the public-search
+ * receipt only when the source messages checkpoint and the fenced
+ * destination census both report zero messages.
  */
 export type MigrationSearchProbeOutcome =
   | Readonly<{ ran: true; chosenOrdinal: number; notRunReason: null }>
-  | Readonly<{ ran: false; chosenOrdinal: null; notRunReason: string }>;
+  | Readonly<{ ran: false; chosenOrdinal: null; notRunReason: string }>
+  | Readonly<{ ran: false; chosenOrdinal: null; notRunReason: null; emptySource: true }>;
 
 /**
  * Runs before the window, through the real
@@ -654,9 +668,6 @@ export async function runSearchSelfMatchProbe(
   executor: PostgreSqlRuntime, projectId: string, targetGenerationId: string,
   candidates: readonly MigrationSearchProbeSourceEntry[], seedBasisSha256: string, signal?: AbortSignal,
 ): Promise<MigrationSearchProbeOutcome> {
-  if (candidates.length === 0) {
-    return { ran: false, chosenOrdinal: null, notRunReason: "no source messages are available to search-probe" };
-  }
   // Round-4 P2: the run lookup used to have no state filter, so an
   // in-progress copy's incomplete run correlated candidates against a
   // ledger that is not yet the final one, and the not-run reason said
@@ -688,6 +699,20 @@ export async function runSearchSelfMatchProbe(
   }
   const runId = run.run_id;
   const repository = new PostgreSqlLexicalSearchRepository(executor, projectId);
+  if (candidates.length === 0) {
+    // #1676: with no candidate there is no self-match to confirm, so run
+    // the production search once on a fixed query and require no rows. A
+    // search error propagates; it is never folded into a pass.
+    const rows = await repository.searchMessages({
+      query: EMPTY_SOURCE_SEARCH_PROBE_QUERY, mode: "full_text" as const, limit: SEARCH_PROBE_RESULT_WINDOW,
+    });
+    return rows.length === 0
+      ? { ran: false, chosenOrdinal: null, notRunReason: null, emptySource: true }
+      : {
+        ran: false, chosenOrdinal: null,
+        notRunReason: "the source has no search-probe candidates, but the production search returned rows for the empty-source query",
+      };
+  }
   const seedIndex = Number.parseInt(seedBasisSha256.slice(0, 8), 16) % candidates.length;
   let unattributedAttempts = 0;
   let unconfirmedAttempts = 0;
@@ -1739,7 +1764,8 @@ function buildClassCoverageVector(receipts: ReadonlySet<MigrationVerificationRec
  * not-run search probe in the same pass have an honest joint
  * representation. Each probe's bit is the receipt of its own run: the
  * listing probe's is that runOrderedListingProbe completed, the search
- * probe's is that a correlated self-match was confirmed.
+ * probe's is that a correlated self-match was confirmed or, for an empty
+ * project, that the empty-source witness held (#1676).
  */
 function buildPublicProbeCoverageVector(
   receipts: ReadonlySet<MigrationVerificationReceiptId>,
@@ -1756,6 +1782,25 @@ const SKIPPED_PUBLIC_LISTING = {
 const SKIPPED_SEARCH_PROBE_OUTCOME: MigrationSearchProbeOutcome = {
   ran: false, chosenOrdinal: null, notRunReason: "the search probe was not invoked",
 };
+
+/**
+ * #1676: why an empty-source search outcome does not earn the public-search
+ * receipt, or null when the source stream and the fenced census both report
+ * zero messages. Both are required: an empty candidate pool alone proves
+ * nothing, since the pool is capped and fed from the yielded records.
+ */
+function emptySourceWitnessRefusal(
+  sourceCheckpoints: ReadonlyMap<PortableDomain, PortableCheckpoint>,
+  destinationCensus: readonly MigrationVerificationDomainCensus[],
+): string | null {
+  if (sourceCheckpoints.get("messages")!.recordCount !== 0) {
+    return "the source messages checkpoint does not report zero records, so an empty candidate pool does not show an empty project";
+  }
+  if (destinationCensus.find((entry) => entry.domain === "messages")!.recordCount !== 0) {
+    return "the fenced destination census does not report zero messages";
+  }
+  return null;
+}
 
 export interface VerifyMigrationGenerationInput {
   readonly generationId: string;
@@ -2082,6 +2127,22 @@ async function computeVerificationReport(
       // so the driver truncates here rather than letting construction throw.
       const mismatches = truncateMismatchesPerClass(fullMismatches);
 
+      // The search outcome folds into the digest so a report can never
+      // record and discard it: ran, the fixed candidate pool size and the
+      // chosen candidate's ordinal; or, for an empty project that earned
+      // the receipt (#1676), a constant tuple; or the not-run reason --
+      // never candidate content, a query string or a measured count.
+      let searchProbeFold: readonly unknown[];
+      if (searchProbeOutcome.ran) {
+        searchProbeFold = ["search-self-match", true, MIGRATION_SEARCH_PROBE_CANDIDATE_POOL_SIZE, searchProbeOutcome.chosenOrdinal];
+      } else if ("emptySource" in searchProbeOutcome) {
+        const refusal = emptySourceWitnessRefusal(sourceCheckpoints, destinationCensus);
+        if (refusal === null) receipts.add("public-search");
+        searchProbeFold = refusal === null ? ["search-self-match", "empty-source"] : ["search-self-match", false, refusal];
+      } else {
+        searchProbeFold = ["search-self-match", false, searchProbeOutcome.notRunReason];
+      }
+
       const sourceWitness: MigrationSourceWitnessDigests = {
         version: 1, identitySha256: copySource.sourceWitness.identitySha256,
         schemaSha256: copySource.sourceWitness.schemaSha256, contentSha256: copySource.sourceWitness.contentSha256,
@@ -2091,15 +2152,7 @@ async function computeVerificationReport(
       ]);
       const publicProbeSha256 = migrationWitnessSha256([
         "lcm-migration-verification-public-probe-v1", MIGRATION_PUBLIC_PROBE_ORDERING_SHA256, publicListingSha256,
-        // The search probe's outcome folds in here so a report can never
-        // again record and discard it: ran, the fixed candidate pool
-        // size and the chosen candidate's ordinal when it ran (both
-        // needed to reproduce which candidate was tried without reading
-        // the driver's own constant), or the not-run reason when it did
-        // not -- never the candidate's content, and never a query string.
-        searchProbeOutcome.ran
-          ? ["search-self-match", true, MIGRATION_SEARCH_PROBE_CANDIDATE_POOL_SIZE, searchProbeOutcome.chosenOrdinal]
-          : ["search-self-match", false, searchProbeOutcome.notRunReason],
+        searchProbeFold,
       ]);
       const reportInput: CreateMigrationVerificationReportInput = {
         generationId: input.generationId, targetGenerationId: input.targetGenerationId, bindingSha256,

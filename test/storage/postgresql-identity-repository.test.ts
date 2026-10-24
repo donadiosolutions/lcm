@@ -1635,4 +1635,90 @@ describe("PostgreSQL identity repository", () => {
     const missing = new PostgreSqlIdentityRepository(executor(() => result([])));
     await expect(missing.getProject(projectRow.project_id)).resolves.toBeNull();
   });
+
+  describe("ensureProjectAliases", () => {
+    const machineId = machineRow.machine_id;
+    const projectId = projectRow.project_id;
+    const moved = { path: "/work/moved", normalizedPath: "/real/moved" };
+    const wanted = [
+      { path: aliasRow.path, normalizedPath: aliasRow.normalized_path },
+      moved,
+    ];
+    const movedRow = { ...aliasRow, path: moved.path, normalized_path: moved.normalizedPath };
+    const ensure = async (
+      current: Array<typeof aliasRow>,
+      insertRows: typeof aliasRow[] = [movedRow],
+      reread?: Array<typeof aliasRow>,
+    ) => {
+      const inserts: unknown[][] = [];
+      const statements: string[] = [];
+      const db = executor((config) => {
+        statements.push(config.text.trim().split("\n")[0]!);
+        if (config.text.startsWith("LOCK TABLE")) return result([]);
+        if (config.text.includes("SELECT project_id FROM")) return result([{ project_id: projectId }]);
+        if (config.text.includes("INSERT INTO lcm.project_aliases")) {
+          inserts.push(config.values as unknown[]);
+          return result(insertRows);
+        }
+        if (config.text.includes("FROM lcm.project_aliases") && config.text.includes("OR (")) return result(current);
+        if (config.text.includes("FROM lcm.project_aliases")) return result(reread ?? [...current, ...insertRows]);
+        throw new Error(`unexpected SQL: ${config.text}`);
+      });
+      const outcome = await new PostgreSqlIdentityRepository(db).ensureProjectAliases({ machineId, projectId, aliases: wanted });
+      return { outcome, inserts, db, statements };
+    };
+
+    it("writes nothing when the project already holds exactly the requested set", async () => {
+      const { outcome, inserts, db } = await ensure([aliasRow, movedRow]);
+      expect(outcome).toEqual({ inserted: 0 });
+      expect(inserts).toEqual([]);
+      expect(db.transaction).toHaveBeenCalledTimes(1);
+      expect(db.query.mock.calls[1]![0]).toMatchObject({
+        values: [projectId, machineId, [aliasRow.normalized_path, moved.normalizedPath], [aliasRow.path, moved.path]],
+      });
+    });
+
+    it("inserts exactly the missing rows in the one transaction", async () => {
+      const { outcome, inserts, db } = await ensure([aliasRow]);
+      expect(outcome).toEqual({ inserted: 1 });
+      expect(inserts).toEqual([[projectId, machineId, moved.path, moved.normalizedPath]]);
+      expect(db.transaction).toHaveBeenCalledTimes(1);
+      expect((await ensure([], [aliasRow, movedRow])).outcome).toEqual({ inserted: 2 });
+    });
+
+    it.each([
+      ["an alias outside the set", [aliasRow, { ...aliasRow, path: "/work/extra", normalized_path: "/real/extra" }]],
+      ["an alias of another machine", [{ ...aliasRow, machine_id: "018f22c4-6d2a-7f10-8a4c-6b8d3e5f9099" }]],
+      ["a requested alias owned by another project", [{ ...aliasRow, project_id: "018f22c4-6d2a-7f10-8a4c-6b8d3e5f9021" }]],
+      ["a requested alias stored under another path", [{ ...aliasRow, path: "/work/other-spelling" }]],
+      ["a requested path stored under another normalized path", [{ ...aliasRow, normalized_path: "/real/other" }]],
+    ])("returns null and writes nothing for %s", async (_label, current) => {
+      const { outcome, inserts } = await ensure(current);
+      expect(outcome).toBeNull();
+      expect(inserts).toEqual([]);
+    });
+
+    it("locks the alias table before it reads and re-reads the whole project after writing", async () => {
+      const { statements } = await ensure([aliasRow]);
+      expect(statements[0]).toBe("LOCK TABLE lcm.project_aliases IN SHARE ROW EXCLUSIVE MODE");
+      expect(statements.filter((statement) => statement.startsWith("SELECT project_id, machine_id")).length).toBe(2);
+      const equal = await ensure([aliasRow, movedRow]);
+      expect(equal.statements.filter((statement) => statement.startsWith("SELECT project_id, machine_id")).length).toBe(1);
+    });
+
+    it.each([
+      ["an unrelated alias committed meanwhile", [aliasRow, movedRow, { ...aliasRow, path: "/work/stranger", normalized_path: "/real/stranger" }]],
+      ["the canonical alias removed meanwhile", [movedRow]],
+      ["a requested alias re-pointed meanwhile", [aliasRow, { ...movedRow, path: "/work/other" }]],
+      ["a requested alias taken over by another machine meanwhile", [aliasRow, { ...movedRow, machine_id: "018f22c4-6d2a-7f10-8a4c-6b8d3e5f9099" }]],
+    ])("throws an alias conflict, so the inserts roll back, when the re-read shows %s", async (_label, reread) => {
+      const failure = await ensure([aliasRow], [movedRow], reread).catch((error: unknown) => error);
+      expect(failure).toBeInstanceOf(PostgreSqlIdentityConflictError);
+    });
+
+    it("propagates a link failure so the whole transaction rolls back", async () => {
+      const failure = await ensure([aliasRow], []).catch((error: unknown) => error);
+      expect(failure).toBeInstanceOf(PostgreSqlIdentityNotFoundError);
+    });
+  });
 });
