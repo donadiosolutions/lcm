@@ -144,22 +144,24 @@ export const MIGRATION_REFUSAL_REASONS: readonly MigrationRefusalMapping[] = Obj
   // --- Section 4.4/4.9: hold entry ---
   // Round-1 B-5/A-11: the fresh hold entry's failures are classified by
   // reason, each with a remedy that matches the fact. None of them names
-  // `abort`: no hold of ours exists yet at this point.
+  // `abort`: a failed entry can still leave its own `maintenance-entering`
+  // hold (the envelope then reports `applied: true`), which the operator
+  // inspects with `lcm migration report` before recovering.
   Object.freeze({
     reason: "hold-entry-contention", exitClass: "refused-contention",
-    remedy: "Another actor holds the publication lock, so the maintenance hold was not entered. Wait, then retry `lcm migration apply`.",
+    remedy: "Another actor holds the publication lock, so the maintenance hold was not entered. Wait, then retry `lcm migration apply`. If the envelope reports `applied: true`, the failed entry left a `maintenance-entering` hold: run `lcm migration report` and inspect it before recovering.",
   }),
   Object.freeze({
     reason: "hold-entry-slot-occupied", exitClass: "refused-contention",
-    remedy: "A publication or another maintenance hold occupies the journal slot. Wait for it to finish, then re-run `lcm migration plan`.",
+    remedy: "A publication or another maintenance hold occupies the journal slot. Wait for it to finish, then re-run `lcm migration plan`. If the envelope reports `applied: true`, the failed entry left a `maintenance-entering` hold: run `lcm migration report` and inspect it before recovering.",
   }),
   Object.freeze({
     reason: "hold-entry-precondition", exitClass: "refused-precondition",
-    remedy: "The maintenance journal changed while the hold was being entered. Re-run `lcm migration plan` and confirm the id it prints.",
+    remedy: "The maintenance journal changed while the hold was being entered. Re-run `lcm migration plan` and confirm the id it prints. If the envelope reports `applied: true`, the failed entry left a `maintenance-entering` hold: run `lcm migration report` and inspect it before recovering.",
   }),
   Object.freeze({
     reason: "hold-entry-evidence", exitClass: "refused-evidence",
-    remedy: "The maintenance journal could not be read or verified while entering the hold. Run `lcm doctor` before retrying.",
+    remedy: "The maintenance journal could not be read or verified while entering the hold. Run `lcm doctor` before retrying. If the envelope reports `applied: true`, the failed entry left a `maintenance-entering` hold: run `lcm migration report` and inspect it before recovering.",
   }),
   Object.freeze({
     reason: "hold-entry-readback-mismatch", exitClass: "refused-evidence",
@@ -447,10 +449,6 @@ export const MIGRATION_REFUSAL_REASONS: readonly MigrationRefusalMapping[] = Obj
   Object.freeze({
     reason: "abort-carried-effect-mismatch", exitClass: "refused-evidence",
     remedy: "The pending abort effect on the manifest is not the one an abort of this generation begins. Nothing was changed; run `lcm doctor` and inspect the evidence.",
-  }),
-  Object.freeze({
-    reason: "abort-other-generation", exitClass: "refused-precondition",
-    remedy: "The terminal maintenance journal belongs to a different generation than the one named. Nothing was changed; omit --generation to act on the journal's own generation.",
   }),
   Object.freeze({
     reason: "abort-readback-mismatch", exitClass: "failed-operator-required",

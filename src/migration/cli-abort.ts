@@ -1,7 +1,6 @@
 import {
   BackendPublicationCoordinator,
   backendPublicationCanonicalSha256,
-  isTerminalBackendMaintenancePhase,
   readBackendMaintenanceJournal,
   type BackendMaintenanceJournal,
 } from "../storage/backend-publication.js";
@@ -148,13 +147,6 @@ async function runMigrationAbortCommand(input: MigrationAbortCommandInput): Prom
   });
   if (admission.status === "refuse") return admission;
   const { context } = admission;
-
-  // A terminal journal belongs to the generation that wrote it. A live hold
-  // of another generation is router row 4, where abort is the owner and acts
-  // on that live hold.
-  if (isTerminalBackendMaintenancePhase(journal.phase) && context.generationId !== journal.generationId) {
-    return { status: "refuse", reason: "abort-other-generation", generationId: journal.generationId };
-  }
 
   // Section 9's fence: the token is compared against the generation of the
   // journal this invocation just observed, before any write. A missing and a

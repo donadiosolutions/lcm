@@ -182,16 +182,16 @@ const ROWS: readonly Row[] = [
   { row: 4, primary: "abort", allowed: [], exit: fixed(2),
     matches: (i) => holdPhaseIn(i, ENTERING_OR_HELD) && !holdMatches(i, ENTERING_OR_HELD) },
   { row: 5, primary: "none", allowed: ["apply", "abort"], exit: fixed(2), nextAction: "apply",
-    matches: (i) => holdPhaseIn(i, ["maintenance-aborted"])
+    matches: (i) => holdMatches(i, ["maintenance-aborted"])
       && (i.manifest.kind === "absent"
         || (present(i)?.phase === "aborted" && present(i)?.pending === null)) },
   { row: 6, primary: "abort", allowed: ["resume"], exit: fixed(6),
-    matches: (i) => holdPhaseIn(i, ["maintenance-aborted"]) && present(i)?.pending === "abort" },
+    matches: (i) => holdMatches(i, ["maintenance-aborted"]) && present(i)?.pending === "abort" },
   { row: 7, primary: "none", allowed: [], exit: fixed(7),
-    matches: (i) => holdPhaseIn(i, ["maintenance-aborted"])
+    matches: (i) => holdMatches(i, ["maintenance-aborted"])
       && ["verify-dry-run", "copy-batch", "complete-copy", "verify-generation"].includes(present(i)?.pending ?? "") },
   { row: 8, primary: "abort", allowed: [], exit: fixed(2),
-    matches: (i) => holdPhaseIn(i, ["maintenance-aborted"])
+    matches: (i) => holdMatches(i, ["maintenance-aborted"])
       && present(i) !== null && present(i)!.pending === null && ABORTABLE_PHASES.includes(present(i)!.phase) },
   { row: 9, primary: "none", allowed: [], exit: fixed(5),
     matches: (i) => holdPhaseIn(i, ["maintenance-aborted"]) },
