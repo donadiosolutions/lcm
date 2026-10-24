@@ -1764,6 +1764,57 @@ describe("filesystem native transcript source", () => {
     });
   });
 
+  it("checks the locator even when the change cookie did not move", async () => {
+    const original = '{"value":"original"}\n';
+    const openCoalesced = async (root: string) =>
+      createFileNativeTranscriptSource(root, "source.jsonl", {
+        _forceMetadataUnchangedForTesting: true,
+      }).openSnapshot();
+
+    const unlinkRoot = temporaryDirectory();
+    const unlinkPath = join(unlinkRoot, "source.jsonl");
+    writeFileSync(unlinkPath, original);
+    const unlinked = await openCoalesced(unlinkRoot);
+    await expect(unlinked.assertUnchanged()).resolves.toBeUndefined();
+    unlinkSync(unlinkPath);
+    await expect(unlinked.assertUnchanged()).rejects.toThrowError(
+      NativeTranscriptSourceChangedError,
+    );
+    await unlinked.close();
+
+    const renameRoot = temporaryDirectory();
+    const renamePath = join(renameRoot, "source.jsonl");
+    writeFileSync(renamePath, original);
+    const renamed = await openCoalesced(renameRoot);
+    renameSync(renamePath, join(renameRoot, "detached.jsonl"));
+    await expect(renamed.assertUnchanged()).rejects.toThrowError(
+      NativeTranscriptSourceChangedError,
+    );
+    await renamed.close();
+
+    const replaceRoot = temporaryDirectory();
+    const replacePath = join(replaceRoot, "source.jsonl");
+    writeFileSync(replacePath, original);
+    const replaced = await openCoalesced(replaceRoot);
+    renameSync(replacePath, join(replaceRoot, "original.jsonl"));
+    writeFileSync(replacePath, '{"value":"replacement"}\n');
+    await expect(replaced.assertUnchanged()).resolves.toBeUndefined();
+    await replaced.close();
+
+    const rewriteRoot = temporaryDirectory();
+    const rewritePath = join(rewriteRoot, "source.jsonl");
+    writeFileSync(rewritePath, original);
+    const rewritten = await openCoalesced(rewriteRoot);
+    writeFileSync(rewritePath, '{"value":"eno"}\n');
+    await expect(rewritten.assertUnchanged()).resolves.toBeUndefined();
+    await expect(rewritten.assertByteRangesUnchanged([{
+      startByteOffset: 0,
+      endByteOffset: Buffer.byteLength(original),
+      rangeSha256: digest(original),
+    }])).rejects.toThrowError(NativeTranscriptSourceChangedError);
+    await rewritten.close();
+  });
+
   it("fails closed on rewrite, append, and truncate races before destination access", async () => {
     const root = temporaryDirectory();
     const path = join(root, "source.jsonl");
