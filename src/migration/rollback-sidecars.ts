@@ -119,10 +119,11 @@
  */
 
 import { DatabaseSync } from "node:sqlite";
+import { existsSync } from "node:fs";
 import { join } from "node:path";
 import { ensurePrivateDirectory } from "../security-files.js";
 import { eventsDir, eventSequenceDbPath } from "../db/events-path.js";
-import { EventsDb } from "../hooks/events-db.js";
+import { EventsDb, EVENTS_SCHEMA_VERSION } from "../hooks/events-db.js";
 import {
   LocalHookEventSequenceAllocator,
   formatLocalHookMachineSequence,
@@ -390,8 +391,27 @@ type PassiveEventReadbackRow = Readonly<{
   priority: number;
   source_hook: string;
   created_at: string;
+  processed_at: string | null;
   disposition: "applied" | "pending" | "quarantined";
 }>;
+
+type PassiveEventDisposition = "applied" | "pending" | "quarantined";
+
+/**
+ * Whether a live local row's disposition is compatible with its archive row's (#1681). Equal dispositions are. The
+ * one further case is an archive row PostgreSQL's inbox still lists as pending (its own consumer has not run) whose
+ * local row the daemon has already processed (processed_at set): the local promotion applied the event, its effect
+ * is in the generation being installed, and the row's marker keeps the SQLite consumer from replaying it. This keys
+ * on processed_at itself, not on the collapsed 'applied' label, which an acknowledgement alone also produces: an
+ * acknowledged row with no processed_at against a pending archive row is a genuine contradiction and still refuses.
+ */
+function passiveEventDispositionCompatible(
+  archived: PassiveEventDisposition,
+  stored: PassiveEventDisposition,
+  processedAt: string | null,
+): boolean {
+  return stored === archived || (archived === "pending" && processedAt !== null);
+}
 
 /**
  * Independently verifies every archived passive event actually reached
@@ -409,7 +429,9 @@ type PassiveEventReadbackRow = Readonly<{
  * replication worker has since acknowledged are both applied, so an existing acknowledged row keeps its
  * remote_inbox_id and acknowledgement and is not rewritten; materializePassiveEvents gives it the processing
  * marker a fresh applied insert carries so the SQLite consumer does not replay it (E2). A row whose content or
- * disposition differs from the archive still refuses. created_at is compared by instant in canonical form, because a
+ * disposition differs from the archive still refuses, except that a row the daemon already processed is accepted
+ * untouched while the archive still lists it as pending (passiveEventDispositionCompatible, #1681). created_at is
+ * compared by instant in canonical form, because a
  * row the hook outbox wrote keeps SQLite's `YYYY-MM-DD HH:MM:SS` text while the archive carries the portable form.
  *
  * The two sets are accounted for separately. The live local outbox legitimately holds appends made after the
@@ -421,6 +443,10 @@ type PassiveEventReadbackRow = Readonly<{
  * pending, retrying, claimed or quarantined. Such a row absent from the archive is preserved untouched and
  * counted. A row absent from the archive that claims either marker contradicts the archive (a delivered event
  * PostgreSQL does not hold) and refuses.
+ *
+ * With `preflight` the same per-row checks run before the rollback materializes anything, against the live events
+ * database as it is: an archived event the live database does not hold yet is tolerated (materialization inserts it),
+ * and an archived event of an unknown machine identity key refuses as materialization would.
  */
 /** @internal Exported for direct unit testing only; not part of the module's public surface. */
 export function verifyPassiveEventsAgainstArchive(
@@ -428,10 +454,11 @@ export function verifyPassiveEventsAgainstArchive(
   eventsDb: DatabaseSync,
   machineIds: ReadonlyMap<string, string | null>,
   localMachineId: string,
+  options: Readonly<{ preflight?: boolean }> = {},
 ): Readonly<{ verifiedImported: number; preservedPending: number }> {
   const select = eventsDb.prepare(
     `SELECT event_version, machine_id, machine_sequence, session_id, seq, type, category, data,
-            priority, source_hook, created_at,
+            priority, source_hook, created_at, processed_at,
             CASE WHEN processed_at IS NOT NULL OR delivery_state = 'acknowledged' THEN 'applied'
                  WHEN delivery_state = 'quarantined' THEN 'quarantined'
                  ELSE 'pending' END AS disposition
@@ -441,6 +468,9 @@ export function verifyPassiveEventsAgainstArchive(
   const archivedEventIds = new Set<string>();
   for (const row of readArchiveDomain(db, "passive-events")) {
     const v = row.value;
+    if (options.preflight === true && !machineIds.has(v.machineIdentityKey)) {
+      throw new RollbackSidecarError("invalid-input", `passive event references unknown machine identity key ${v.machineIdentityKey}`);
+    }
     const machineId = machineIds.get(v.machineIdentityKey);
     if (machineId !== localMachineId) continue;
     archiveCount++;
@@ -448,6 +478,7 @@ export function verifyPassiveEventsAgainstArchive(
     const sequence = requireInteger(v.machineSequence, "passive-events.machineSequence");
     const createdAt = requireTimestamp(v.createdAt, "passive-events.createdAt");
     const stored = select.get(v.eventId) as PassiveEventReadbackRow | undefined;
+    if (!stored && options.preflight === true) continue;
     if (
       !stored
       || BigInt(stored.event_version) !== requireInteger(v.eventVersion, "passive-events.eventVersion")
@@ -462,7 +493,7 @@ export function verifyPassiveEventsAgainstArchive(
       || stored.source_hook !== v.sourceHook
       || canonicalTimestamp(stored.created_at) === null
       || canonicalTimestamp(stored.created_at) !== canonicalTimestamp(createdAt)
-      || stored.disposition !== v.disposition
+      || !passiveEventDispositionCompatible(v.disposition, stored.disposition, stored.processed_at)
     ) {
       throw new RollbackSidecarError(
         "verification-failed",
@@ -483,6 +514,35 @@ export function verifyPassiveEventsAgainstArchive(
     }
   }
   return { verifiedImported: archiveCount, preservedPending: others.length };
+}
+
+/**
+ * Read-only preflight of the post-install passive-event verification (#1681). rollback.ts calls it before the
+ * rollback publishes anything, with the verified generation still unreferenced and the live events database
+ * untouched, so a genuine divergence between a live row and its archive row refuses while the manifest is still
+ * resumable instead of after publish-rollback began and the canonical database was replaced. It applies
+ * verifyPassiveEventsAgainstArchive's per-row checks (and so shares passiveEventDispositionCompatible) to the live
+ * events database, opened read-only and never created. A missing database, or one not yet at the current schema
+ * (materialization migrates it first), has nothing to compare yet and is tolerated: the post-install verification
+ * stays the authoritative check.
+ */
+export function assertRollbackSidecarsCompatible(input: MaterializeRollbackSidecarsInput): void {
+  const eventsDbPath = join(eventsDir(input.homeDir), `${input.localProjectId}.db`);
+  if (!existsSync(eventsDbPath)) return;
+  const db = new DatabaseSync(input.databasePath, { readOnly: true });
+  try {
+    const eventsDb = new DatabaseSync(eventsDbPath, { readOnly: true });
+    try {
+      const versioned = eventsDb.prepare("SELECT name FROM sqlite_master WHERE type = 'table' AND name = 'schema_version'").get();
+      const version = versioned === undefined ? undefined : (eventsDb.prepare("SELECT version FROM schema_version").get() as { version: number } | undefined)?.version;
+      if (version !== EVENTS_SCHEMA_VERSION) return;
+      verifyPassiveEventsAgainstArchive(db, eventsDb, readMachineIdByIdentityKey(db), input.machineId, { preflight: true });
+    } finally {
+      eventsDb.close();
+    }
+  } finally {
+    db.close();
+  }
 }
 
 /**
