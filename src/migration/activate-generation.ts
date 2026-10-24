@@ -29,6 +29,7 @@ import {
 } from "../storage/backend-publication-material.js";
 import type { StorageIdentityContext } from "../storage/contracts.js";
 import { StorageOperationError } from "../storage/errors.js";
+import { PortableStreamError } from "../storage/portable-record.js";
 import type { PostgreSqlConnectionSettings, PostgreSqlQueryExecutor, PostgreSqlRuntimeHealth } from "../storage/postgresql/contracts.js";
 import {
   POSTGRESQL_BACKEND_PUBLICATION_RESOURCE_KEY,
@@ -1077,7 +1078,7 @@ async function identityCheck(ctx: Context, executor: PostgreSqlQueryExecutor, st
     if (error instanceof Error && error.name === "MigrationVerificationDriverError") {
       return refused(ctx, step, "identity-drift", "the live destination identity does not match the sealed manifest: " + error.message);
     }
-    throw error;
+    return targetFailure(ctx, error, step, step + " destination identity query");
   }
   if (live.sealedWitnessSha256 !== ctx.report.body.destinationIdentity.sealedWitnessSha256) {
     return refused(ctx, step, "identity-drift", "the live destination identity does not match the verification report");
@@ -1337,15 +1338,20 @@ async function stepHealth(ctx: Context): Promise<Step<MigrationTargetHealthResul
   return refused(ctx, "S6", health.status === "unhealthy" ? "target-unhealthy" : "target-unresolvable", health.reason + ": " + health.detail);
 }
 
-/** A target failure observed by S7 (the transfer schema check, the snapshot
- * open, the census read): the StorageOperationError family, attributed
- * exactly as S6 attributes the same failures, becomes the S6 refusal
- * vocabulary (target-unhealthy / target-unresolvable). Anything else is
- * not a target condition and is thrown. */
-function targetFailure(ctx: Context, error: unknown, stage: string): Exit {
-  if (!(error instanceof StorageOperationError)) throw error;
-  const attributed = classifyMigrationTargetFailure(error, stage);
-  return refused(ctx, "S7", attributed.status === "unhealthy" ? "target-unhealthy" : "target-unresolvable", attributed.reason + ": " + attributed.detail);
+/** A target failure observed at `step` (the S0, S5 and S7 destination
+ * identity queries; the S7 transfer schema check, snapshot open and census
+ * read): the StorageOperationError family, attributed exactly as S6
+ * attributes the same failures, becomes the S6 refusal vocabulary
+ * (target-unhealthy / target-unresolvable). The PostgreSQL portable source
+ * normalizes a storage failure to PortableStreamError("source-unavailable")
+ * carrying the storage error as its cause; that wrapper alone is unwrapped.
+ * PortableStreamError "aborted" is a cancellation, not a target condition;
+ * it and every other error are thrown. */
+function targetFailure(ctx: Context, error: unknown, step: MigrationActivationRefusalStep, stage: string): Exit {
+  const failure = error instanceof PortableStreamError && error.code === "source-unavailable" ? error.cause : error;
+  if (!(failure instanceof StorageOperationError)) throw error;
+  const attributed = classifyMigrationTargetFailure(failure, stage);
+  return refused(ctx, step, attributed.status === "unhealthy" ? "target-unhealthy" : "target-unresolvable", attributed.reason + ": " + attributed.detail);
 }
 
 /** S7: a NEW transfer snapshot, after the transfer schema check (amendment 4).
@@ -1359,7 +1365,7 @@ async function stepCensus(ctx: Context): Promise<Step<{ censusVector: MigrationC
       await ctx.deps.verifyTransferSchema(transfer, { expectedOwner: ctx.input.expectedOwner, signal: ctx.input.signal });
       session = await transfer.openReadOnlySnapshot({ projectId: ctx.input.expectedIdentity.id, signal: ctx.input.signal });
     } catch (error) {
-      return targetFailure(ctx, error, "S7 transfer schema check and snapshot open");
+      return targetFailure(ctx, error, "S7", "S7 transfer schema check and snapshot open");
     }
     try {
       const identity = await identityCheck(ctx, session, "S7");
@@ -1380,7 +1386,7 @@ async function stepCensus(ctx: Context): Promise<Step<{ censusVector: MigrationC
           signal: ctx.input.signal,
         });
       } catch (error) {
-        return targetFailure(ctx, error, "S7 census read");
+        return targetFailure(ctx, error, "S7", "S7 census read");
       } finally {
         rmSync(scratchParent, { recursive: true, force: true });
       }

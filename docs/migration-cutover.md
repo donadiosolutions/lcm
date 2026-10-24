@@ -1054,6 +1054,15 @@ reads the destination (a lost connection, a refused privilege, a schema
 mismatch on the transfer session) is attributed exactly as the health check
 attributes it, `target-unhealthy` or `target-unresolvable` at `S7`.
 
+The destination identity query that compares the live destination with the
+sealed manifest (at `S0`, `S5` and `S7`) is attributed the same way. A
+definite server refusal (authentication, missing privilege) is reported as
+`target-unhealthy`; a connection or transport failure is reported as
+`target-unresolvable`. Both are refusals at the step that ran the query, or,
+when an effect has already begun and the run is re-entered, an interruption of
+the step in flight. Neither rejects the whole activation. A cancelled
+activation is still rejected, not classified.
+
 ### The activation role
 
 Activation connects to PostgreSQL as the **transfer role**: the role that
