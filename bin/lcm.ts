@@ -92,6 +92,7 @@ import { BACKEND_PUBLICATION_ADMISSION_DIAGNOSTIC } from "../src/hooks/publicati
 import { sanitizeTerminalText } from "../src/terminal-sanitize.js";
 import { resolveLcmConfig } from "../src/db/config.js";
 import { isDaemonTransportFailure } from "../src/daemon/http-url.js";
+import { sameEnvelope } from "../src/daemon/passive-event-replication.js";
 import {
   clearDaemonRemediation,
   isDaemonRefusalReason,
@@ -1654,26 +1655,6 @@ async function withPassiveEventOperatorSession<T>(
   } finally {
     await session.close();
   }
-}
-
-function passiveEventReadbackMatches(
-  local: LocalHookEventRow,
-  remote: PostgreSqlPassiveEventRecord,
-): boolean {
-  const payload = remote.payload as Record<string, unknown>;
-  return local.machine_id === remote.machineId
-    && local.event_uuid === remote.eventId
-    && local.event_version === remote.eventVersion
-    && BigInt(local.machine_sequence) === remote.machineSequence
-    && local.type === remote.eventType
-    && payload.sessionId === local.session_id
-    && payload.sessionSequence === local.seq
-    && payload.category === local.category
-    && payload.data === local.data
-    && payload.priority === local.priority
-    && payload.sourceHook === local.source_hook
-    && payload.previousEventId === local.prev_event_id
-    && payload.createdAt === local.created_at;
 }
 
 function serializablePassiveEvent(record: PostgreSqlPassiveEventRecord): Record<string, unknown> {
@@ -3894,7 +3875,7 @@ export async function runCli(
           for (const event of events) {
             const record = byId.get(event.event_uuid);
             if (!record) missing.push(event.event_uuid);
-            else if (!passiveEventReadbackMatches(event, record)) {
+            else if (!sameEnvelope(event, record)) {
               mismatched.push(event.event_uuid);
             } else {
               matched += 1;
