@@ -7,6 +7,7 @@ import {
 import {
   PostgreSqlPassiveEventDataError,
   PostgreSqlPassiveEventRepository,
+  samePassiveEventPayload,
   type PostgreSqlPassiveEventInput,
   type PostgreSqlPassiveEventRecord,
   type PostgreSqlPassiveEventReleaseResult,
@@ -140,24 +141,16 @@ interface UploadReadback {
   readonly differs: boolean;
 }
 
-function sameEnvelope(
+export function sameEnvelope(
   local: LocalHookEventRow,
   remote: PostgreSqlPassiveEventRecord,
 ): boolean {
-  const payload = remote.payload as Record<string, unknown>;
   return local.machine_id === remote.machineId
     && local.event_uuid === remote.eventId
     && local.event_version === remote.eventVersion
     && BigInt(local.machine_sequence) === remote.machineSequence
     && local.type === remote.eventType
-    && payload.sessionId === local.session_id
-    && payload.sessionSequence === local.seq
-    && payload.category === local.category
-    && payload.data === local.data
-    && payload.priority === local.priority
-    && payload.sourceHook === local.source_hook
-    && payload.previousEventId === local.prev_event_id
-    && payload.createdAt === local.created_at;
+    && samePassiveEventPayload(eventPayload(local), remote.payload);
 }
 
 function supportsEnvelopeVersion(version: number): boolean {
