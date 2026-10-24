@@ -3516,7 +3516,7 @@
         "I5": "na:no unreachable-target step in this row; disclosure scan still runs on every step",
         "I6": "required"
       },
-      "notes": "Delivery of the drained events to PostgreSQL is asserted by F6b-delivery (pending on #1698)."
+      "notes": "Delivery of the drained events to PostgreSQL is asserted by F6b-delivery."
     },
     {
       "profiles": [
@@ -3603,13 +3603,7 @@
         "I5": "na:no unreachable-target step in this row; disclosure scan still runs on every step",
         "I6": "required"
       },
-      "notes": "Pending the https://github.com/donadiosolutions/lcm/issues/1698 fix on main: once the production replication has delivered and pruned the drained events, the rollback refuses (rollback-sidecars.ts treats a local row with remote_inbox_id that the PostgreSQL archive no longer holds as a contradiction, and ignores remote_pruned_at). The inbox is empty at the rollback, so #1694 (resident uploaded rows) does not apply. The row asserts the success end state: every drained input is acknowledged locally and has one terminal remote disposition, the join authenticates every canonical envelope field against the ledger from the applied inbox row captured before the production prune, and the rollback succeeds and retains them. The production replication worker is driven in process because the daemon replicates only in its start-up sweep and every five minutes.",
-      "gate": {
-        "status": "pending",
-        "pendingOn": [
-          "https://github.com/donadiosolutions/lcm/issues/1698"
-        ]
-      }
+      "notes": "Fixed by https://github.com/donadiosolutions/lcm/issues/1698: the rollback accepts delivered events whose remote inbox rows replication pruned. The row asserts every drained input is acknowledged locally and has one terminal remote disposition, the join authenticates every canonical envelope field against the ledger from the applied inbox row captured before the production prune, and the rollback succeeds and retains them. The production replication worker is driven in process because the daemon replicates only in its start-up sweep and every five minutes."
     },
     {
       "profiles": [
