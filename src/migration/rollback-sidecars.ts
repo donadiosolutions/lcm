@@ -442,7 +442,11 @@ function passiveEventDispositionCompatible(
  * and acknowledged_at needs no read of its own. A row without one is still a local append awaiting replication, whether it is
  * pending, retrying, claimed or quarantined. Such a row absent from the archive is preserved untouched and
  * counted. A row absent from the archive that claims either marker contradicts the archive (a delivered event
- * PostgreSQL does not hold) and refuses.
+ * PostgreSQL does not hold) and refuses, unless its remote_pruned_at is set (#1698): the replication worker records
+ * that once the remote inbox row is gone (its delete succeeded, or a readback found the row missing because an
+ * earlier delete had committed), so such a delivered and pruned row is the normal steady state after a drain. It is accepted untouched and not counted as pending. Its
+ * processed_at is left as it is: the daemon's remote apply does nothing (the event's effect is its local promotion),
+ * so an unprocessed pruned row is still replayed by the SQLite consumer.
  *
  * With `preflight` the same per-row checks run before the rollback materializes anything, against the live events
  * database as it is: an archived event the live database does not hold yet is tolerated (materialization inserts it),
@@ -502,18 +506,24 @@ export function verifyPassiveEventsAgainstArchive(
     }
   }
   const others = (eventsDb.prepare(
-    "SELECT event_uuid, remote_inbox_id FROM events",
-  ).all() as Array<{ event_uuid: string; remote_inbox_id: string | null }>)
+    "SELECT event_uuid, remote_inbox_id, remote_pruned_at FROM events",
+  ).all() as Array<{ event_uuid: string; remote_inbox_id: string | null; remote_pruned_at: string | null }>)
     .filter((stored) => !archivedEventIds.has(stored.event_uuid));
+  let preservedPending = 0;
   for (const stored of others) {
+    // A recorded remote prune means the worker found PostgreSQL's inbox row gone, by its own delete or a readback
+    // proving an earlier one (#1698): the drained steady state, so the archive legitimately lacks it. The schema's CHECK ties remote_pruned_at to an
+    // acknowledged state with a remote_inbox_id, so the marker alone decides.
+    if (stored.remote_pruned_at !== null) continue;
     if (stored.remote_inbox_id !== null) {
       throw new RollbackSidecarError(
         "verification-failed",
         `events table holds delivered event ${stored.event_uuid} that the archive does not contain`,
       );
     }
+    preservedPending++;
   }
-  return { verifiedImported: archiveCount, preservedPending: others.length };
+  return { verifiedImported: archiveCount, preservedPending };
 }
 
 /**

@@ -1316,3 +1316,111 @@ describe("assertRollbackSidecarsCompatible (#1681)", () => {
     }
   });
 });
+
+describe("#1698: a delivered event whose remote inbox row was pruned is the drained steady state", () => {
+  const PRUNED_ID = "018f7769-4c00-7f77-9b32-4a2f8f5c1698";
+  const PENDING_ID = "018f7769-4c00-7f77-9b32-4a2f8f5c1699";
+  const preflight = (homeDir: string, databasePath: string): void =>
+    assertRollbackSidecarsCompatible({ homeDir, databasePath, localProjectId: LOCAL_PROJECT_ID, machineId: MACHINE_A_UUID });
+  const materialize = (homeDir: string, databasePath: string) =>
+    materializeRollbackSidecars({ homeDir, databasePath, localProjectId: LOCAL_PROJECT_ID, machineId: MACHINE_A_UUID });
+
+  /** The columns a worker drain leaves: uploaded, remote applied, locally acknowledged, then the remote row pruned. */
+  const PRUNED = "delivery_state, remote_inbox_id, acknowledged_at, remote_pruned_at";
+  const PRUNED_VALUES = "'acknowledged', 'inbox-1698', '2026-01-03T00:00:00.000000Z', '2026-01-03 00:00:01'";
+
+  /** A home whose live events database was materialized from the generation, then given a local row the archive does not hold. */
+  function liveHomeWithLocalRow(eventId: string, sequence: bigint, columns: string, values: string, processedAt: string | null) {
+    const homeDir = tempHome();
+    const { path } = seedGeneration();
+    const first = materialize(homeDir, path);
+    const live = new DatabaseSync(first.eventsDbPath);
+    try {
+      live.exec(
+        "INSERT INTO events (event_uuid, event_version, machine_sequence, session_id, type, category, data, source_hook, processed_at, " + columns
+        + ") VALUES ('" + eventId + "', 1, '" + formatLocalHookMachineSequence(sequence)
+        + "', 'drained', 'drained.event', 'intent', '{}', 'Test', " + (processedAt === null ? "NULL" : "'" + processedAt + "'")
+        + ", " + values + ")",
+      );
+    } finally {
+      live.close();
+    }
+    return { homeDir, path, eventsDbPath: first.eventsDbPath };
+  }
+
+  it.each([
+    ["processed", "2026-01-03T00:00:02.000000Z"],
+    ["unprocessed", null],
+  ])("(a)/(b) materialization accepts and keeps a delivered and pruned %s row the archive does not hold", (_label, processedAt) => {
+    const { homeDir, path, eventsDbPath } = liveHomeWithLocalRow(PRUNED_ID, 999n, PRUNED, PRUNED_VALUES, processedAt);
+    const before = readEventRow(eventsDbPath, PRUNED_ID);
+    const outcome = materialize(homeDir, path);
+    // Delivered rows are not undelivered local appends, so they are not counted as preserved pending.
+    expect(outcome.passiveEventsPreservedPending).toBe(0);
+    // Byte-identical: the delivery columns and the processing marker are all left as the drain wrote them.
+    expect(readEventRow(eventsDbPath, PRUNED_ID)).toEqual(before);
+    expect(readEventRow(eventsDbPath, PRUNED_ID)).toMatchObject({
+      delivery_state: "acknowledged", remote_inbox_id: "inbox-1698", remote_pruned_at: "2026-01-03 00:00:01", processed_at: processedAt,
+    });
+    // The daemon's remote apply does nothing, so only a locally processed row is done: an unprocessed one is still replayed.
+    const edb = new EventsDb(eventsDbPath);
+    try {
+      const unprocessed = edb.getUnprocessed().map((row) => row.event_uuid);
+      expect(unprocessed.includes(PRUNED_ID)).toBe(processedAt === null);
+    } finally {
+      edb.close();
+    }
+  });
+
+  it("(a) verification counts only the undelivered local append beside a pruned row", () => {
+    const { path, eventsDbPath } = liveHomeWithLocalRow(PRUNED_ID, 999n, PRUNED, PRUNED_VALUES, "2026-01-03T00:00:02.000000Z");
+    const live = new DatabaseSync(eventsDbPath);
+    const db = new DatabaseSync(path);
+    try {
+      live.exec(
+        "INSERT INTO events (event_uuid, event_version, machine_sequence, session_id, type, category, data, source_hook) VALUES ('"
+        + PENDING_ID + "', 1, '" + formatLocalHookMachineSequence(1000n) + "', 'drained', 'drained.event', 'intent', '{}', 'Test')",
+      );
+      expect(verifyPassiveEventsAgainstArchive(db, live, readMachineIdByIdentityKey(db), MACHINE_A_UUID).preservedPending).toBe(1);
+    } finally {
+      db.close();
+      live.close();
+    }
+  });
+
+  it("(a) keeps counting only the undelivered local append beside a pruned row", () => {
+    const { homeDir, path, eventsDbPath } = liveHomeWithLocalRow(PRUNED_ID, 999n, PRUNED, PRUNED_VALUES, "2026-01-03T00:00:02.000000Z");
+    const live = new DatabaseSync(eventsDbPath);
+    try {
+      live.exec(
+        "INSERT INTO events (event_uuid, event_version, machine_sequence, session_id, type, category, data, source_hook) VALUES ('"
+        + PENDING_ID + "', 1, '" + formatLocalHookMachineSequence(1000n) + "', 'drained', 'drained.event', 'intent', '{}', 'Test')",
+      );
+    } finally {
+      live.close();
+    }
+    expect(materialize(homeDir, path).passiveEventsPreservedPending).toBe(1);
+  });
+
+  it.each([
+    ["processed", "2026-01-03T00:00:02.000000Z"],
+    ["unprocessed", null],
+  ])("(c) the read-only preflight accepts a delivered and pruned %s row and writes nothing", (_label, processedAt) => {
+    const { homeDir, path, eventsDbPath } = liveHomeWithLocalRow(PRUNED_ID, 999n, PRUNED, PRUNED_VALUES, processedAt);
+    const before = readEventRow(eventsDbPath, PRUNED_ID);
+    expect(() => preflight(homeDir, path)).not.toThrow();
+    expect(readEventRow(eventsDbPath, PRUNED_ID)).toEqual(before);
+  });
+
+  it.each([
+    ["replicated with an inbox id", "delivery_state, remote_inbox_id", "'replicated', 'inbox-1698'"],
+    ["acknowledged and not pruned", "delivery_state, remote_inbox_id, acknowledged_at", "'acknowledged', 'inbox-1698', '2026-01-03T00:00:00.000000Z'"],
+  ])("(d) still refuses a delivered row the archive does not hold that is %s, before and after install", (_label, columns, values) => {
+    const { homeDir, path, eventsDbPath } = liveHomeWithLocalRow(PRUNED_ID, 999n, columns, values, null);
+    const before = readEventRow(eventsDbPath, PRUNED_ID);
+    const delivered = expect.objectContaining({ reason: "verification-failed", message: expect.stringContaining("delivered event") });
+    expect(() => preflight(homeDir, path)).toThrow(delivered);
+    expect(() => materialize(homeDir, path)).toThrow(delivered);
+    expect(readEventRow(eventsDbPath, PRUNED_ID)).toEqual(before);
+  });
+});
