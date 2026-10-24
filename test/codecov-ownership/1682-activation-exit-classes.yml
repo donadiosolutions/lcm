@@ -1,0 +1,11 @@
+references: ["#1682", "#1683"]
+rationale: >-
+  #1682 maps an undecodable fenced-lease row to the existing lease-unresolvable
+  refusal in the activation lease helpers and classifies the takeover read in
+  the activation orchestrator; #1683 lets the daemon's identity-only observe
+  route answer across a startup versus on-disk backend divergence. All three
+  files keep their existing owners.
+pins:
+  - ["src/migration/activation-lease.ts", "unit-migration-cutover"]
+  - ["src/migration/activate-generation.ts", "unit-migration-cutover"]
+  - ["src/daemon/server.ts", "unit-daemon-core"]

@@ -53,7 +53,7 @@ beforeAll(assertHarnessReady);
  * and frozen witnesses, and the final state is idempotent and refuses the
  * forward activation.
  */
-async function twoProjectHome(db: PostgreSqlTestDatabase) {
+async function twoProjectHome(db: PostgreSqlTestDatabase, options: Readonly<{ firstMemberAlias?: boolean }> = {}) {
   await grantPortablePostgreSql(db, { transfer: true });
   const home = mkdtempSync(join(tmpdir(), "cutover-set-rollback-"));
   mkdirSync(join(home, ".lcm"), { mode: 0o700 });
@@ -70,8 +70,13 @@ async function twoProjectHome(db: PostgreSqlTestDatabase) {
     const projectDir = join(home, ".lcm", "projects", local.id);
     mkdirSync(projectDir, { recursive: true, mode: 0o700 });
     writeFileSync(join(projectDir, "meta.json"), JSON.stringify({ cwd }) + "\n", { mode: 0o600 });
-    return { cwd, id: local.id };
+    return { cwd, id: local.id, canonical: local.canonical };
   }).sort((left, right) => (left.id < right.id ? -1 : 1));
+  // #1678: the first member's project-map entry carries one extra alias path before enrollment.
+  const alias = join(home, "moved-project-a");
+  if (options.firstMemberAlias === true) {
+    writeFileSync(projectMapPath(home), JSON.stringify({ [projects[0]!.id]: { canonical: projects[0]!.canonical, aliases: [alias] } }) + "\n", { mode: 0o600 });
+  }
   const remotes = new Map<string, string>();
   for (const project of projects) {
     const enrolled = await prepareSqliteMigrationEnrollment({ cwd: project.cwd, homeDir: home, targetConfig });
@@ -120,11 +125,11 @@ async function twoProjectHome(db: PostgreSqlTestDatabase) {
     }
   }
   closeLcmConnection();
-  return { home, projects, remotes, targetConfig };
+  return { home, projects, remotes, targetConfig, alias };
 }
 
-async function activatedSet(db: PostgreSqlTestDatabase) {
-  const installation = await twoProjectHome(db);
+async function activatedSet(db: PostgreSqlTestDatabase, options: Readonly<{ firstMemberAlias?: boolean }> = {}) {
+  const installation = await twoProjectHome(db, options);
   const candidate = await resolveCutoverSetCandidate({ homeDir: installation.home, targetConfig: installation.targetConfig });
   if (candidate.status !== "candidate") throw new Error("expected a candidate: " + JSON.stringify(candidate));
   const prepared = await prepareCutoverSet({
@@ -341,6 +346,46 @@ it("rolls an activated two-project set back into new sqlite generations through 
       expect(await activateCutoverSet({ homeDir: home, confirmSetId: setId, targetConfig }, createCutoverSetActivateDependencies({ homeDir: home })))
         .toMatchObject({ status: "refused", reason: "cutover-set-rollback-committed", effectBegun: false });
       expect(effectiveHome(home, projects, remotes)).toEqual({ backend: "sqlite", bound: [false, false] });
+    } finally {
+      if (previous.url === undefined) delete process.env.LCM_POSTGRES_URL; else process.env.LCM_POSTGRES_URL = previous.url;
+      if (previous.caFile === undefined) delete process.env.LCM_POSTGRES_CA_FILE; else process.env.LCM_POSTGRES_CA_FILE = previous.caFile;
+      if (previous.role === undefined) delete process.env.LCM_POSTGRES_MIGRATION_ROLE; else process.env.LCM_POSTGRES_MIGRATION_ROLE = previous.role;
+      closeLcmConnection();
+      rmSync(home, { recursive: true, force: true });
+    }
+  });
+}, 900000);
+
+it("rolls back an activated set whose member carries a project-map alias: the alias is minted by prepare, keeps the lifecycle passing, stays in the local map, and the destination rows are left in place (#1678)", async () => {
+  await withPostgreSqlTestDatabase("cutover-set-rollback-alias", async (db) => {
+    const { home, projects, remotes, setId, members, alias } = await activatedSet(db, { firstMemberAlias: true });
+    const previous = { url: process.env.LCM_POSTGRES_URL, caFile: process.env.LCM_POSTGRES_CA_FILE, role: process.env.LCM_POSTGRES_MIGRATION_ROLE };
+    const connection = settings(db.runtimeUrl);
+    process.env.LCM_POSTGRES_URL = connection.url;
+    if (connection.caFile === undefined) delete process.env.LCM_POSTGRES_CA_FILE; else process.env.LCM_POSTGRES_CA_FILE = connection.caFile;
+    process.env.LCM_POSTGRES_MIGRATION_ROLE = "lcm_test_migrator";
+    try {
+      const [a] = members as [typeof members[number], typeof members[number]];
+      const aliasedProject = projects[0]!;
+      expect(a.physicalProjectId).toBe(aliasedProject.id);
+      const remoteA = remotes.get(aliasedProject.id)!;
+      const aliasRows = async () => (await db.migrator.query<{ path: string; normalized_path: string }>({
+        text: "SELECT path, normalized_path FROM lcm.project_aliases WHERE project_id = $1 ORDER BY path",
+        values: [remoteA],
+      }, { domain: "factory", operation: "cutoverSetRollbackAlias" })).rows;
+      const expected = [aliasedProject.canonical, alias].sort().map((path) => ({ path, normalized_path: path }));
+      // prepare (the fresh mint added the alias to the existing project), verify and activate passed; the project is bound.
+      expect(await aliasRows()).toEqual(expected);
+      expect(effectiveHome(home, projects, remotes)).toEqual({ backend: "postgresql", bound: [true, true] });
+      const readMapAliases = () => (JSON.parse(readFileSync(projectMapPath(home), "utf8")) as Record<string, { aliases: string[] }>)[aliasedProject.id]!.aliases;
+      expect(readMapAliases()).toEqual([alias]);
+
+      const deps = createCutoverSetRollbackDependencies({ homeDir: home });
+      expect(await rollbackCutoverSet({ homeDir: home, confirmSetId: setId }, deps)).toMatchObject({ status: "rolled-back" });
+      expect(effectiveHome(home, projects, remotes)).toEqual({ backend: "sqlite", bound: [false, false] });
+      // After rollback the local map still lists the alias, and rollback leaves the destination project and its alias rows in place.
+      expect(readMapAliases()).toEqual([alias]);
+      expect(await aliasRows()).toEqual(expected);
     } finally {
       if (previous.url === undefined) delete process.env.LCM_POSTGRES_URL; else process.env.LCM_POSTGRES_URL = previous.url;
       if (previous.caFile === undefined) delete process.env.LCM_POSTGRES_CA_FILE; else process.env.LCM_POSTGRES_CA_FILE = previous.caFile;

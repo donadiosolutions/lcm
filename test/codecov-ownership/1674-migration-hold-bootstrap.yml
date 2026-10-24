@@ -1,0 +1,8 @@
+references: ["#1674"]
+rationale: >-
+  #1674 stops the root legacy-home bootstrap from running before the lcm
+  migration subcommands, which a maintenance hold made unrunnable. The change
+  is one predicate in bin/lcm.ts, which stays in the CLI owner; no file is
+  added, moved or re-owned.
+pins:
+  - ["bin/lcm.ts", "unit-cli"]

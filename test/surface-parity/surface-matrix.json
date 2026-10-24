@@ -2541,6 +2541,20 @@
         {
           "choices": null,
           "default": null,
+          "flags": "--set",
+          "hidden": false,
+          "long": "--set",
+          "mandatory": false,
+          "negate": false,
+          "optional": false,
+          "preset": null,
+          "required": false,
+          "short": null,
+          "variadic": false
+        },
+        {
+          "choices": null,
+          "default": null,
           "flags": "--dry-run",
           "hidden": false,
           "long": "--dry-run",
@@ -2649,6 +2663,20 @@
         {
           "choices": null,
           "default": null,
+          "flags": "--set",
+          "hidden": false,
+          "long": "--set",
+          "mandatory": false,
+          "negate": false,
+          "optional": false,
+          "preset": null,
+          "required": false,
+          "short": null,
+          "variadic": false
+        },
+        {
+          "choices": null,
+          "default": null,
           "flags": "--dry-run",
           "hidden": false,
           "long": "--dry-run",
@@ -2723,6 +2751,20 @@
           "optional": false,
           "preset": null,
           "required": true,
+          "short": null,
+          "variadic": false
+        },
+        {
+          "choices": null,
+          "default": null,
+          "flags": "--set",
+          "hidden": false,
+          "long": "--set",
+          "mandatory": false,
+          "negate": false,
+          "optional": false,
+          "preset": null,
+          "required": false,
           "short": null,
           "variadic": false
         },
@@ -2823,6 +2865,20 @@
         {
           "choices": null,
           "default": null,
+          "flags": "--set",
+          "hidden": false,
+          "long": "--set",
+          "mandatory": false,
+          "negate": false,
+          "optional": false,
+          "preset": null,
+          "required": false,
+          "short": null,
+          "variadic": false
+        },
+        {
+          "choices": null,
+          "default": null,
           "flags": "--json",
           "hidden": false,
           "long": "--json",
@@ -2872,6 +2928,20 @@
       "handler": true,
       "name": "plan",
       "options": [
+        {
+          "choices": null,
+          "default": null,
+          "flags": "--set",
+          "hidden": false,
+          "long": "--set",
+          "mandatory": false,
+          "negate": false,
+          "optional": false,
+          "preset": null,
+          "required": false,
+          "short": null,
+          "variadic": false
+        },
         {
           "choices": null,
           "default": null,
@@ -2935,6 +3005,20 @@
           "optional": false,
           "preset": null,
           "required": true,
+          "short": null,
+          "variadic": false
+        },
+        {
+          "choices": null,
+          "default": null,
+          "flags": "--set",
+          "hidden": false,
+          "long": "--set",
+          "mandatory": false,
+          "negate": false,
+          "optional": false,
+          "preset": null,
+          "required": false,
           "short": null,
           "variadic": false
         },
@@ -3015,6 +3099,20 @@
           "optional": false,
           "preset": null,
           "required": true,
+          "short": null,
+          "variadic": false
+        },
+        {
+          "choices": null,
+          "default": null,
+          "flags": "--set",
+          "hidden": false,
+          "long": "--set",
+          "mandatory": false,
+          "negate": false,
+          "optional": false,
+          "preset": null,
+          "required": false,
           "short": null,
           "variadic": false
         },
@@ -3157,6 +3255,20 @@
         {
           "choices": null,
           "default": null,
+          "flags": "--set",
+          "hidden": false,
+          "long": "--set",
+          "mandatory": false,
+          "negate": false,
+          "optional": false,
+          "preset": null,
+          "required": false,
+          "short": null,
+          "variadic": false
+        },
+        {
+          "choices": null,
+          "default": null,
           "flags": "--dry-run",
           "hidden": false,
           "long": "--dry-run",
@@ -3245,6 +3357,20 @@
           "optional": false,
           "preset": null,
           "required": true,
+          "short": null,
+          "variadic": false
+        },
+        {
+          "choices": null,
+          "default": null,
+          "flags": "--set",
+          "hidden": false,
+          "long": "--set",
+          "mandatory": false,
+          "negate": false,
+          "optional": false,
+          "preset": null,
+          "required": false,
           "short": null,
           "variadic": false
         },

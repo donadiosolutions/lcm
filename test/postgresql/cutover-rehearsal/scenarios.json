@@ -1,0 +1,5074 @@
+{
+  "schemaVersion": 1,
+  "workload": {
+    "workers": 1,
+    "profiles": {
+      "default": [
+        "F1-empty",
+        "F2",
+        "R3"
+      ],
+      "full": "every generated row"
+    },
+    "bounds": {
+      "largeFixture": {
+        "conversations": 300,
+        "messagesPerConversation": 15,
+        "messages": 4500,
+        "parts": 4500,
+        "otherRecords": 8,
+        "plannedRecords": 9308,
+        "maxPortableRecords": 10000,
+        "applyMaxRecords": 500,
+        "applyMaxBytes": 16777216
+      },
+      "setFixture": {
+        "projects": 2,
+        "secondProjectConversations": 1,
+        "secondProjectMessages": 2
+      },
+      "aliasFixture": {
+        "aliasPathsPerProject": 128
+      },
+      "maxHookEventsPerRow": 32,
+      "cliChildDeadlineMs": 110000,
+      "cliOutputCapBytes": 65536,
+      "daemonDeadlineMs": 90000
+    },
+    "thresholds": {
+      "harnessTimeoutMinutes": 75,
+      "rowTimeoutMs": {
+        "default": 300000,
+        "large": 900000,
+        "set": 900000
+      },
+      "verdictRequires": "every generated row passes, every pending row is listed, cleanup receipt is clean"
+    }
+  },
+  "templates": [
+    {
+      "id": "plan",
+      "surface": "cli",
+      "args": [
+        "plan"
+      ],
+      "exit": 0,
+      "outcome": "ok",
+      "next": "apply",
+      "applied": false
+    },
+    {
+      "id": "dry-run",
+      "surface": "cli",
+      "args": [
+        "dry-run"
+      ],
+      "exit": 0,
+      "outcome": "ok",
+      "applied": false
+    },
+    {
+      "id": "apply",
+      "surface": "cli",
+      "args": [
+        "apply",
+        "--confirm-generation",
+        "{gen}"
+      ],
+      "exit": 0,
+      "outcome": "ok",
+      "manifestPhase": "copied",
+      "applied": true
+    },
+    {
+      "id": "report-copied",
+      "surface": "cli",
+      "args": [
+        "report"
+      ],
+      "exit": 0,
+      "outcome": "ok",
+      "manifestPhase": "copied",
+      "next": "verify",
+      "applied": false,
+      "evidence": {
+        "cell": 22
+      }
+    },
+    {
+      "id": "verify",
+      "surface": "cli",
+      "args": [
+        "verify",
+        "--generation",
+        "{gen}",
+        "--confirm-generation",
+        "{gen}"
+      ],
+      "exit": 0,
+      "outcome": "ok",
+      "manifestPhase": "verified",
+      "next": "activate",
+      "applied": true,
+      "evidence": {
+        "cell": 22,
+        "activationEligible": true
+      }
+    },
+    {
+      "id": "verify-repeat",
+      "surface": "cli",
+      "args": [
+        "verify",
+        "--generation",
+        "{gen}",
+        "--confirm-generation",
+        "{gen}"
+      ],
+      "exit": 0,
+      "outcome": "ok",
+      "manifestPhase": "verified",
+      "applied": false,
+      "evidence": {
+        "cell": 24
+      }
+    },
+    {
+      "id": "activate",
+      "surface": "cli",
+      "args": [
+        "activate",
+        "--generation",
+        "{gen}",
+        "--confirm-generation",
+        "{gen}",
+        "--confirm-backend",
+        "postgresql"
+      ],
+      "exit": 0,
+      "outcome": "ok",
+      "manifestPhase": "active",
+      "next": "swap-grants-then-start-daemon",
+      "applied": true,
+      "restartAnswer": "satisfied",
+      "evidence": {
+        "cell": 24,
+        "selectedBackend": "postgresql",
+        "resumedFrom": "fresh"
+      }
+    },
+    {
+      "id": "activate-repeat",
+      "surface": "cli",
+      "args": [
+        "activate",
+        "--generation",
+        "{gen}",
+        "--confirm-generation",
+        "{gen}",
+        "--confirm-backend",
+        "postgresql"
+      ],
+      "exit": 0,
+      "outcome": "ok",
+      "manifestPhase": "active",
+      "applied": false,
+      "evidence": {
+        "cell": 10,
+        "resumedFrom": "settled-active"
+      }
+    },
+    {
+      "id": "report-active",
+      "surface": "cli",
+      "args": [
+        "report",
+        "--generation",
+        "{gen}"
+      ],
+      "exit": 0,
+      "outcome": "ok",
+      "manifestPhase": "active",
+      "next": "report",
+      "applied": false,
+      "restartAnswer": "satisfied",
+      "evidence": {
+        "cell": 10,
+        "selectedBackend": "postgresql"
+      }
+    },
+    {
+      "id": "rollback",
+      "surface": "cli",
+      "args": [
+        "rollback",
+        "--generation",
+        "{gen}",
+        "--confirm-generation",
+        "{gen}",
+        "--confirm-backend",
+        "sqlite"
+      ],
+      "exit": 0,
+      "outcome": "ok",
+      "manifestPhase": "rolled-back",
+      "next": "report",
+      "applied": true,
+      "restartAnswer": "satisfied",
+      "evidence": {
+        "cell": 10,
+        "selectedBackend": "sqlite"
+      }
+    },
+    {
+      "id": "report-rolled-back",
+      "surface": "cli",
+      "args": [
+        "report",
+        "--generation",
+        "{gen}"
+      ],
+      "exit": 0,
+      "outcome": "ok",
+      "manifestPhase": "rolled-back",
+      "applied": false,
+      "restartAnswer": "satisfied",
+      "evidence": {
+        "cell": 13,
+        "selectedBackend": "sqlite"
+      }
+    },
+    {
+      "id": "rollback-repeat",
+      "surface": "cli",
+      "args": [
+        "rollback",
+        "--generation",
+        "{gen}",
+        "--confirm-generation",
+        "{gen}",
+        "--confirm-backend",
+        "sqlite"
+      ],
+      "exit": 0,
+      "outcome": "ok",
+      "manifestPhase": "rolled-back",
+      "applied": false
+    },
+    {
+      "id": "abort",
+      "surface": "cli",
+      "args": [
+        "abort",
+        "--generation",
+        "{gen}",
+        "--confirm-generation",
+        "{gen}"
+      ],
+      "exit": 0,
+      "outcome": "ok",
+      "applied": true
+    },
+    {
+      "id": "abort-repeat",
+      "surface": "cli",
+      "args": [
+        "abort",
+        "--generation",
+        "{gen}",
+        "--confirm-generation",
+        "{gen}"
+      ],
+      "exit": 0,
+      "outcome": "ok",
+      "applied": false
+    },
+    {
+      "id": "apply-large",
+      "surface": "cli",
+      "args": [
+        "apply",
+        "--confirm-generation",
+        "{gen}",
+        "--max-records",
+        "500",
+        "--max-bytes",
+        "16777216"
+      ],
+      "exit": 0,
+      "outcome": "ok",
+      "manifestPhase": "copied",
+      "applied": true
+    },
+    {
+      "id": "rollback-unactivated",
+      "surface": "cli",
+      "args": [
+        "rollback",
+        "--generation",
+        "{gen}",
+        "--confirm-generation",
+        "{gen}",
+        "--confirm-backend",
+        "sqlite"
+      ],
+      "exit": 5,
+      "outcome": "refused-evidence",
+      "reason": "rollback-refused-evidence",
+      "evidence": {
+        "rollbackReason": "input-unresolvable"
+      }
+    },
+    {
+      "id": "verify-ineligible",
+      "surface": "cli",
+      "args": [
+        "verify",
+        "--generation",
+        "{gen}",
+        "--confirm-generation",
+        "{gen}"
+      ],
+      "exit": 5,
+      "outcome": "refused-evidence",
+      "reason": "verify-not-eligible"
+    },
+    {
+      "id": "activate-not-owner",
+      "surface": "cli",
+      "args": [
+        "activate",
+        "--generation",
+        "{gen}",
+        "--confirm-generation",
+        "{gen}",
+        "--confirm-backend",
+        "postgresql"
+      ],
+      "exit": 2,
+      "outcome": "refused-precondition",
+      "reason": "route-not-owner",
+      "next": "verify",
+      "applied": false
+    },
+    {
+      "id": "set-plan",
+      "surface": "cli",
+      "args": [
+        "plan",
+        "--set"
+      ],
+      "exit": 0,
+      "outcome": "ok",
+      "applied": false,
+      "next": "apply --set",
+      "evidence": {
+        "memberCount": 2,
+        "scope": "cutover-set"
+      }
+    },
+    {
+      "id": "set-apply-dry-run",
+      "surface": "cli",
+      "args": [
+        "apply",
+        "--set",
+        "--confirm-generation",
+        "{gen}",
+        "--dry-run"
+      ],
+      "exit": 0,
+      "outcome": "ok",
+      "applied": false,
+      "next": "apply --set (drop --dry-run to prepare for real)"
+    },
+    {
+      "id": "set-apply",
+      "surface": "cli",
+      "args": [
+        "apply",
+        "--set",
+        "--confirm-generation",
+        "{gen}"
+      ],
+      "exit": 0,
+      "outcome": "ok",
+      "applied": true,
+      "manifestPhase": "verified",
+      "next": "activate --set",
+      "evidence": {
+        "memberCount": 2,
+        "setState": "prepared"
+      }
+    },
+    {
+      "id": "set-report",
+      "surface": "cli",
+      "args": [
+        "report",
+        "--set",
+        "--generation",
+        "{gen}"
+      ],
+      "exit": 0,
+      "outcome": "ok",
+      "applied": false
+    },
+    {
+      "id": "set-verify",
+      "surface": "cli",
+      "args": [
+        "verify",
+        "--set",
+        "--generation",
+        "{gen}",
+        "--confirm-generation",
+        "{gen}"
+      ],
+      "exit": 0,
+      "outcome": "ok",
+      "manifestPhase": "verified",
+      "next": "activate --set",
+      "applied": false,
+      "evidence": {
+        "setState": "prepared"
+      }
+    },
+    {
+      "id": "set-resume",
+      "surface": "cli",
+      "args": [
+        "resume",
+        "--set",
+        "--generation",
+        "{gen}",
+        "--confirm-generation",
+        "{gen}"
+      ],
+      "exit": 0,
+      "outcome": "ok",
+      "manifestPhase": "verified",
+      "next": "activate --set",
+      "applied": true
+    },
+    {
+      "id": "set-resume-dry-run",
+      "surface": "cli",
+      "args": [
+        "resume",
+        "--set",
+        "--generation",
+        "{gen}",
+        "--confirm-generation",
+        "{gen}",
+        "--dry-run"
+      ],
+      "exit": 0,
+      "outcome": "ok"
+    },
+    {
+      "id": "set-activate",
+      "surface": "cli",
+      "args": [
+        "activate",
+        "--set",
+        "--generation",
+        "{gen}",
+        "--confirm-generation",
+        "{gen}",
+        "--confirm-backend",
+        "postgresql"
+      ],
+      "exit": 0,
+      "outcome": "ok",
+      "manifestPhase": "active",
+      "next": "swap-grants-then-start-daemon",
+      "applied": true,
+      "restartAnswer": "satisfied",
+      "evidence": {
+        "memberCount": 2,
+        "selectedBackend": "postgresql",
+        "setState": "settled-activated"
+      }
+    },
+    {
+      "id": "set-activate-dry-run",
+      "surface": "cli",
+      "args": [
+        "activate",
+        "--set",
+        "--generation",
+        "{gen}",
+        "--confirm-generation",
+        "{gen}",
+        "--confirm-backend",
+        "postgresql",
+        "--dry-run"
+      ],
+      "exit": 5,
+      "outcome": "refused-evidence",
+      "reason": "set-preview-not-predictive",
+      "next": "activate --set (drop --dry-run to run it)",
+      "applied": false
+    },
+    {
+      "id": "set-rollback",
+      "surface": "cli",
+      "args": [
+        "rollback",
+        "--set",
+        "--generation",
+        "{gen}",
+        "--confirm-generation",
+        "{gen}",
+        "--confirm-backend",
+        "sqlite"
+      ],
+      "exit": 0,
+      "outcome": "ok",
+      "manifestPhase": "rolled-back",
+      "next": "report --set",
+      "applied": true,
+      "restartAnswer": "satisfied",
+      "evidence": {
+        "memberCount": 2,
+        "selectedBackend": "sqlite"
+      }
+    },
+    {
+      "id": "set-rollback-dry-run",
+      "surface": "cli",
+      "args": [
+        "rollback",
+        "--set",
+        "--generation",
+        "{gen}",
+        "--confirm-generation",
+        "{gen}",
+        "--confirm-backend",
+        "sqlite",
+        "--dry-run"
+      ],
+      "exit": 5,
+      "outcome": "refused-evidence",
+      "reason": "set-preview-not-predictive",
+      "next": "rollback --set (drop --dry-run to run it)",
+      "applied": false
+    },
+    {
+      "id": "set-abort",
+      "surface": "cli",
+      "args": [
+        "abort",
+        "--set",
+        "--confirm-generation",
+        "{gen}"
+      ],
+      "exit": 0,
+      "outcome": "ok",
+      "manifestPhase": "aborted",
+      "next": "plan --set",
+      "applied": true,
+      "evidence": {
+        "journalPhase": "maintenance-aborted",
+        "memberCount": 2
+      }
+    },
+    {
+      "id": "set-abort-dry-run",
+      "surface": "cli",
+      "args": [
+        "abort",
+        "--set",
+        "--confirm-generation",
+        "{gen}",
+        "--dry-run"
+      ],
+      "exit": 0,
+      "outcome": "ok",
+      "manifestPhase": "verified",
+      "applied": false,
+      "evidence": {
+        "journalPhase": "maintenance-held"
+      }
+    }
+  ],
+  "scenarios": [
+    {
+      "profiles": [
+        "default",
+        "full"
+      ],
+      "timeoutMs": 300000,
+      "supportingTests": [
+        "test/postgresql/cli-activate.integration.ts"
+      ],
+      "injections": [],
+      "knownLimits": [],
+      "id": "F1-empty",
+      "title": "Smallest non-empty home: full forward flow, then pre-write rollback",
+      "fixture": "E",
+      "requirement": "F1 variants; both rollback modes (pre-write)",
+      "steps": [
+        {
+          "id": "plan",
+          "use": "plan"
+        },
+        {
+          "id": "dry-run",
+          "use": "dry-run"
+        },
+        {
+          "id": "apply",
+          "use": "apply"
+        },
+        {
+          "id": "report-copied",
+          "use": "report-copied"
+        },
+        {
+          "id": "verify",
+          "use": "verify"
+        },
+        {
+          "id": "verify-repeat",
+          "use": "verify-repeat"
+        },
+        {
+          "id": "activate",
+          "use": "activate"
+        },
+        {
+          "id": "activate-repeat",
+          "use": "activate-repeat"
+        },
+        {
+          "id": "report-active",
+          "use": "report-active"
+        },
+        {
+          "id": "rollback",
+          "use": "rollback",
+          "evidence": {
+            "cell": 10,
+            "selectedBackend": "sqlite",
+            "rollbackMode": "pre-write"
+          }
+        },
+        {
+          "id": "report-rolled-back",
+          "use": "report-rolled-back"
+        },
+        {
+          "id": "rollback-repeat",
+          "use": "rollback-repeat"
+        }
+      ],
+      "authority": [
+        {
+          "checkpoint": "before-apply",
+          "lastCommittedBackend": "sqlite",
+          "configBackend": "sqlite",
+          "admitted": [
+            "sqlite"
+          ]
+        },
+        {
+          "checkpoint": "held",
+          "lastCommittedBackend": "sqlite",
+          "configBackend": "sqlite",
+          "admitted": []
+        },
+        {
+          "checkpoint": "activated",
+          "lastCommittedBackend": "postgresql",
+          "configBackend": "postgresql",
+          "admitted": [
+            "postgresql"
+          ],
+          "boundProjects": 1
+        },
+        {
+          "checkpoint": "rolled-back",
+          "lastCommittedBackend": "sqlite",
+          "configBackend": "sqlite",
+          "admitted": [
+            "sqlite"
+          ],
+          "boundProjects": 0
+        }
+      ],
+      "invariants": {
+        "I1": "required",
+        "I2": "required",
+        "I3": "na:no acknowledged hook input in this row; covered by F5/F6",
+        "I4": "required",
+        "I5": "na:no unreachable-target step in this row; disclosure scan still runs on every step",
+        "I6": "required"
+      },
+      "notes": "F1-empty keeps a one-conversation, one-message home so the smallest non-empty flow stays in the default profile; the empty enrolled project has its own success row, F1-empty-project (#1676 fixed on main)."
+    },
+    {
+      "profiles": [
+        "full"
+      ],
+      "timeoutMs": 300000,
+      "supportingTests": [
+        "test/postgresql/cli-activate.integration.ts"
+      ],
+      "injections": [],
+      "knownLimits": [],
+      "id": "F1-empty-project",
+      "title": "Empty enrolled project: full forward flow (verified as activation eligible), then pre-write rollback",
+      "fixture": "E0",
+      "requirement": "Scope fixture: empty home",
+      "steps": [
+        {
+          "id": "plan",
+          "use": "plan"
+        },
+        {
+          "id": "dry-run",
+          "use": "dry-run"
+        },
+        {
+          "id": "apply",
+          "use": "apply"
+        },
+        {
+          "id": "report-copied",
+          "use": "report-copied"
+        },
+        {
+          "id": "verify",
+          "use": "verify"
+        },
+        {
+          "id": "verify-repeat",
+          "use": "verify-repeat"
+        },
+        {
+          "id": "activate",
+          "use": "activate"
+        },
+        {
+          "id": "activate-repeat",
+          "use": "activate-repeat"
+        },
+        {
+          "id": "report-active",
+          "use": "report-active"
+        },
+        {
+          "id": "rollback",
+          "use": "rollback",
+          "evidence": {
+            "cell": 10,
+            "selectedBackend": "sqlite",
+            "rollbackMode": "pre-write"
+          }
+        },
+        {
+          "id": "report-rolled-back",
+          "use": "report-rolled-back"
+        },
+        {
+          "id": "rollback-repeat",
+          "use": "rollback-repeat"
+        }
+      ],
+      "authority": [
+        {
+          "checkpoint": "before-apply",
+          "lastCommittedBackend": "sqlite",
+          "configBackend": "sqlite",
+          "admitted": [
+            "sqlite"
+          ]
+        },
+        {
+          "checkpoint": "held",
+          "lastCommittedBackend": "sqlite",
+          "configBackend": "sqlite",
+          "admitted": []
+        },
+        {
+          "checkpoint": "activated",
+          "lastCommittedBackend": "postgresql",
+          "configBackend": "postgresql",
+          "admitted": [
+            "postgresql"
+          ],
+          "boundProjects": 1
+        },
+        {
+          "checkpoint": "rolled-back",
+          "lastCommittedBackend": "sqlite",
+          "configBackend": "sqlite",
+          "admitted": [
+            "sqlite"
+          ],
+          "boundProjects": 0
+        }
+      ],
+      "invariants": {
+        "I1": "required",
+        "I2": "required",
+        "I3": "na:no acknowledged hook input in this row; covered by F5/F6",
+        "I4": "required",
+        "I5": "na:no unreachable-target step in this row; disclosure scan still runs on every step",
+        "I6": "required"
+      }
+    },
+    {
+      "profiles": [
+        "full"
+      ],
+      "timeoutMs": 300000,
+      "supportingTests": [
+        "test/postgresql/cli-activate.integration.ts",
+        "test/postgresql/packaged-startup.integration.ts"
+      ],
+      "injections": [],
+      "knownLimits": [],
+      "id": "F1-representative",
+      "title": "Representative native home: forward flow, runtime daemon on PostgreSQL, no new SQLite write",
+      "fixture": "P",
+      "requirement": "F1 variants; fresh daemon health matches the committed backend",
+      "steps": [
+        {
+          "id": "plan",
+          "use": "plan"
+        },
+        {
+          "id": "dry-run",
+          "use": "dry-run"
+        },
+        {
+          "id": "apply",
+          "use": "apply"
+        },
+        {
+          "id": "report-copied",
+          "use": "report-copied"
+        },
+        {
+          "id": "verify",
+          "use": "verify"
+        },
+        {
+          "id": "verify-repeat",
+          "use": "verify-repeat"
+        },
+        {
+          "id": "activate",
+          "use": "activate"
+        },
+        {
+          "id": "activate-repeat",
+          "use": "activate-repeat"
+        },
+        {
+          "id": "report-active",
+          "use": "report-active"
+        },
+        {
+          "id": "report-daemon",
+          "use": "report-active",
+          "restartAnswer": "satisfied"
+        }
+      ],
+      "authority": [
+        {
+          "checkpoint": "before-apply",
+          "lastCommittedBackend": "sqlite",
+          "configBackend": "sqlite",
+          "admitted": [
+            "sqlite"
+          ]
+        },
+        {
+          "checkpoint": "held",
+          "lastCommittedBackend": "sqlite",
+          "configBackend": "sqlite",
+          "admitted": []
+        },
+        {
+          "checkpoint": "activated",
+          "lastCommittedBackend": "postgresql",
+          "configBackend": "postgresql",
+          "admitted": [
+            "postgresql"
+          ],
+          "boundProjects": 1
+        },
+        {
+          "checkpoint": "after-daemon",
+          "lastCommittedBackend": "postgresql",
+          "configBackend": "postgresql",
+          "admitted": [
+            "postgresql"
+          ],
+          "boundProjects": 1
+        }
+      ],
+      "invariants": {
+        "I1": "required",
+        "I2": "required",
+        "I3": "na:no acknowledged hook input in this row; covered by F5/F6",
+        "I4": "required",
+        "I5": "na:no unreachable-target step in this row; disclosure scan still runs on every step",
+        "I6": "required"
+      }
+    },
+    {
+      "profiles": [
+        "full"
+      ],
+      "timeoutMs": 300000,
+      "supportingTests": [
+        "test/migration/rollback.test.ts"
+      ],
+      "injections": [],
+      "knownLimits": [],
+      "id": "R1",
+      "title": "Verified but never activated: public rollback is a documented refusal",
+      "fixture": "P",
+      "requirement": "Rollback of an unactivated generation (D7)",
+      "steps": [
+        {
+          "id": "plan",
+          "use": "plan"
+        },
+        {
+          "id": "apply",
+          "use": "apply"
+        },
+        {
+          "id": "verify",
+          "use": "verify"
+        },
+        {
+          "id": "rollback",
+          "use": "rollback-unactivated"
+        },
+        {
+          "id": "abort",
+          "use": "abort"
+        },
+        {
+          "id": "abort-repeat",
+          "use": "abort-repeat"
+        }
+      ],
+      "authority": [
+        {
+          "checkpoint": "before-apply",
+          "lastCommittedBackend": "sqlite",
+          "configBackend": "sqlite",
+          "admitted": [
+            "sqlite"
+          ]
+        },
+        {
+          "checkpoint": "held",
+          "lastCommittedBackend": "sqlite",
+          "configBackend": "sqlite",
+          "admitted": []
+        },
+        {
+          "checkpoint": "aborted",
+          "lastCommittedBackend": "sqlite",
+          "configBackend": "sqlite",
+          "admitted": [
+            "sqlite"
+          ],
+          "boundProjects": 0
+        }
+      ],
+      "invariants": {
+        "I1": "required",
+        "I2": "required",
+        "I3": "na:no acknowledged hook input in this row; covered by F5/F6",
+        "I4": "required",
+        "I5": "na:no unreachable-target step in this row; disclosure scan still runs on every step",
+        "I6": "required"
+      },
+      "notes": "Internal unactivated rollback exists but the public entry requires a selected PostgreSQL backend (rollback-inputs.ts); the supported public result is the refusal, with the source untouched."
+    },
+    {
+      "profiles": [
+        "full"
+      ],
+      "timeoutMs": 300000,
+      "supportingTests": [
+        "test/postgresql/rollback-session.integration.ts"
+      ],
+      "injections": [],
+      "knownLimits": [],
+      "id": "R2",
+      "title": "Pre-write rollback after activation with no later write",
+      "fixture": "P",
+      "requirement": "Rollback mode pre-write",
+      "steps": [
+        {
+          "id": "plan",
+          "use": "plan"
+        },
+        {
+          "id": "dry-run",
+          "use": "dry-run"
+        },
+        {
+          "id": "apply",
+          "use": "apply"
+        },
+        {
+          "id": "report-copied",
+          "use": "report-copied"
+        },
+        {
+          "id": "verify",
+          "use": "verify"
+        },
+        {
+          "id": "verify-repeat",
+          "use": "verify-repeat"
+        },
+        {
+          "id": "activate",
+          "use": "activate"
+        },
+        {
+          "id": "activate-repeat",
+          "use": "activate-repeat"
+        },
+        {
+          "id": "report-active",
+          "use": "report-active"
+        },
+        {
+          "id": "rollback",
+          "use": "rollback",
+          "evidence": {
+            "cell": 10,
+            "selectedBackend": "sqlite",
+            "rollbackMode": "pre-write"
+          }
+        },
+        {
+          "id": "report-rolled-back",
+          "use": "report-rolled-back"
+        },
+        {
+          "id": "rollback-repeat",
+          "use": "rollback-repeat"
+        }
+      ],
+      "authority": [
+        {
+          "checkpoint": "before-apply",
+          "lastCommittedBackend": "sqlite",
+          "configBackend": "sqlite",
+          "admitted": [
+            "sqlite"
+          ]
+        },
+        {
+          "checkpoint": "held",
+          "lastCommittedBackend": "sqlite",
+          "configBackend": "sqlite",
+          "admitted": []
+        },
+        {
+          "checkpoint": "activated",
+          "lastCommittedBackend": "postgresql",
+          "configBackend": "postgresql",
+          "admitted": [
+            "postgresql"
+          ],
+          "boundProjects": 1
+        },
+        {
+          "checkpoint": "rolled-back",
+          "lastCommittedBackend": "sqlite",
+          "configBackend": "sqlite",
+          "admitted": [
+            "sqlite"
+          ],
+          "boundProjects": 0
+        }
+      ],
+      "invariants": {
+        "I1": "required",
+        "I2": "required",
+        "I3": "na:no acknowledged hook input in this row; covered by F5/F6",
+        "I4": "required",
+        "I5": "na:no unreachable-target step in this row; disclosure scan still runs on every step",
+        "I6": "required"
+      }
+    },
+    {
+      "profiles": [
+        "default",
+        "full"
+      ],
+      "timeoutMs": 300000,
+      "supportingTests": [
+        "test/postgresql/rollback-session.integration.ts",
+        "test/postgresql/rollback-census-drift.integration.ts"
+      ],
+      "injections": [],
+      "knownLimits": [],
+      "id": "R3",
+      "title": "Post-write rollback after a guarded canonical write",
+      "fixture": "P",
+      "requirement": "Rollback mode post-write",
+      "steps": [
+        {
+          "id": "plan",
+          "use": "plan"
+        },
+        {
+          "id": "dry-run",
+          "use": "dry-run"
+        },
+        {
+          "id": "apply",
+          "use": "apply"
+        },
+        {
+          "id": "report-copied",
+          "use": "report-copied"
+        },
+        {
+          "id": "verify",
+          "use": "verify"
+        },
+        {
+          "id": "verify-repeat",
+          "use": "verify-repeat"
+        },
+        {
+          "id": "activate",
+          "use": "activate"
+        },
+        {
+          "id": "activate-repeat",
+          "use": "activate-repeat"
+        },
+        {
+          "id": "report-active",
+          "use": "report-active"
+        },
+        {
+          "id": "rollback",
+          "use": "rollback",
+          "evidence": {
+            "cell": 10,
+            "selectedBackend": "sqlite",
+            "rollbackMode": "post-write"
+          }
+        },
+        {
+          "id": "report-rolled-back",
+          "use": "report-rolled-back"
+        },
+        {
+          "id": "rollback-repeat",
+          "use": "rollback-repeat"
+        }
+      ],
+      "authority": [
+        {
+          "checkpoint": "before-apply",
+          "lastCommittedBackend": "sqlite",
+          "configBackend": "sqlite",
+          "admitted": [
+            "sqlite"
+          ]
+        },
+        {
+          "checkpoint": "held",
+          "lastCommittedBackend": "sqlite",
+          "configBackend": "sqlite",
+          "admitted": []
+        },
+        {
+          "checkpoint": "activated",
+          "lastCommittedBackend": "postgresql",
+          "configBackend": "postgresql",
+          "admitted": [
+            "postgresql"
+          ],
+          "boundProjects": 1
+        },
+        {
+          "checkpoint": "rolled-back",
+          "lastCommittedBackend": "sqlite",
+          "configBackend": "sqlite",
+          "admitted": [
+            "sqlite"
+          ],
+          "boundProjects": 0
+        }
+      ],
+      "invariants": {
+        "I1": "required",
+        "I2": "required",
+        "I3": "required",
+        "I4": "required",
+        "I5": "na:no unreachable-target step in this row; disclosure scan still runs on every step",
+        "I6": "required"
+      }
+    },
+    {
+      "profiles": [
+        "full"
+      ],
+      "timeoutMs": 300000,
+      "supportingTests": [
+        "test/postgresql/rollback-session.integration.ts",
+        "test/postgresql/rollback-census-drift.integration.ts"
+      ],
+      "injections": [],
+      "knownLimits": [],
+      "id": "R3-replicated",
+      "title": "Post-write rollback while an uploaded passive event is still resident in the PostgreSQL inbox",
+      "fixture": "P",
+      "requirement": "Rollback mode post-write with replicated passive events",
+      "steps": [
+        {
+          "id": "plan",
+          "use": "plan"
+        },
+        {
+          "id": "dry-run",
+          "use": "dry-run"
+        },
+        {
+          "id": "apply",
+          "use": "apply"
+        },
+        {
+          "id": "report-copied",
+          "use": "report-copied"
+        },
+        {
+          "id": "verify",
+          "use": "verify"
+        },
+        {
+          "id": "verify-repeat",
+          "use": "verify-repeat"
+        },
+        {
+          "id": "activate",
+          "use": "activate"
+        },
+        {
+          "id": "activate-repeat",
+          "use": "activate-repeat"
+        },
+        {
+          "id": "report-active",
+          "use": "report-active"
+        },
+        {
+          "id": "rollback",
+          "use": "rollback",
+          "evidence": {
+            "cell": 10,
+            "selectedBackend": "sqlite",
+            "rollbackMode": "post-write"
+          }
+        },
+        {
+          "id": "report-rolled-back",
+          "use": "report-rolled-back"
+        },
+        {
+          "id": "rollback-repeat",
+          "use": "rollback-repeat"
+        }
+      ],
+      "authority": [
+        {
+          "checkpoint": "before-apply",
+          "lastCommittedBackend": "sqlite",
+          "configBackend": "sqlite",
+          "admitted": [
+            "sqlite"
+          ]
+        },
+        {
+          "checkpoint": "held",
+          "lastCommittedBackend": "sqlite",
+          "configBackend": "sqlite",
+          "admitted": []
+        },
+        {
+          "checkpoint": "activated",
+          "lastCommittedBackend": "postgresql",
+          "configBackend": "postgresql",
+          "admitted": [
+            "postgresql"
+          ],
+          "boundProjects": 1
+        },
+        {
+          "checkpoint": "rolled-back",
+          "lastCommittedBackend": "sqlite",
+          "configBackend": "sqlite",
+          "admitted": [
+            "sqlite"
+          ],
+          "boundProjects": 0
+        }
+      ],
+      "invariants": {
+        "I1": "required",
+        "I2": "required",
+        "I3": "required",
+        "I4": "required",
+        "I5": "na:no unreachable-target step in this row; disclosure scan still runs on every step",
+        "I6": "required"
+      },
+      "notes": "Fixed by https://github.com/donadiosolutions/lcm/issues/1694: the portable export carries replicated inbox rows that are still resident (pending, retry or claimed). The row acknowledges an input after activation, lets the production replication worker upload it with the apply step deferred, asserts it is resident, then requires the post-write rollback to succeed and retain the input."
+    },
+    {
+      "profiles": [
+        "full"
+      ],
+      "timeoutMs": 300000,
+      "supportingTests": [
+        "test/postgresql/migration-verification.integration.ts"
+      ],
+      "injections": [
+        {
+          "surface": "module-seam",
+          "boundary": "isolated administrative SQL on the destination copy",
+          "kind": "destination-mutation"
+        }
+      ],
+      "knownLimits": [],
+      "id": "F4",
+      "title": "Destination drift before verification: ineligible, nothing activated, abort preserves SQLite",
+      "fixture": "P",
+      "requirement": "Fault list: verification mismatch",
+      "steps": [
+        {
+          "id": "plan",
+          "use": "plan"
+        },
+        {
+          "id": "apply",
+          "use": "apply"
+        },
+        {
+          "id": "verify",
+          "use": "verify-ineligible",
+          "evidence": {
+            "detail": "mismatches"
+          }
+        },
+        {
+          "id": "activate",
+          "use": "activate-not-owner"
+        },
+        {
+          "id": "report-copied",
+          "use": "report-copied"
+        },
+        {
+          "id": "abort",
+          "use": "abort"
+        }
+      ],
+      "authority": [
+        {
+          "checkpoint": "before-apply",
+          "lastCommittedBackend": "sqlite",
+          "configBackend": "sqlite",
+          "admitted": [
+            "sqlite"
+          ]
+        },
+        {
+          "checkpoint": "held",
+          "lastCommittedBackend": "sqlite",
+          "configBackend": "sqlite",
+          "admitted": []
+        },
+        {
+          "checkpoint": "aborted",
+          "lastCommittedBackend": "sqlite",
+          "configBackend": "sqlite",
+          "admitted": [
+            "sqlite"
+          ],
+          "boundProjects": 0
+        }
+      ],
+      "invariants": {
+        "I1": "required",
+        "I2": "required",
+        "I3": "na:no acknowledged hook input in this row; covered by F5/F6",
+        "I4": "required",
+        "I5": "na:no unreachable-target step in this row; disclosure scan still runs on every step",
+        "I6": "required"
+      }
+    },
+    {
+      "profiles": [
+        "full"
+      ],
+      "timeoutMs": 300000,
+      "supportingTests": [],
+      "injections": [
+        {
+          "surface": "module-seam",
+          "boundary": "flip the last byte of the sealed normalized project snapshot",
+          "kind": "owned-file-damage"
+        }
+      ],
+      "knownLimits": [],
+      "id": "F11-tampered",
+      "title": "Tampered sealed snapshot: classified, resume and activation refused, source preserved",
+      "fixture": "P",
+      "requirement": "Fault list: snapshot damage",
+      "steps": [
+        {
+          "id": "plan",
+          "use": "plan"
+        },
+        {
+          "id": "apply",
+          "use": "apply"
+        },
+        {
+          "id": "report-damaged",
+          "surface": "cli",
+          "args": [
+            "report"
+          ],
+          "exit": 0,
+          "outcome": "ok",
+          "manifestPhase": "copied",
+          "next": "abort",
+          "applied": false,
+          "evidence": {
+            "cell": 17,
+            "snapshot": "tampered"
+          }
+        },
+        {
+          "id": "resume-damaged",
+          "surface": "cli",
+          "args": [
+            "resume",
+            "--generation",
+            "{gen}",
+            "--confirm-generation",
+            "{gen}"
+          ],
+          "exit": 2,
+          "outcome": "refused-precondition",
+          "reason": "route-not-owner",
+          "next": "abort",
+          "applied": false
+        },
+        {
+          "id": "abort",
+          "use": "abort"
+        }
+      ],
+      "authority": [
+        {
+          "checkpoint": "before-apply",
+          "lastCommittedBackend": "sqlite",
+          "configBackend": "sqlite",
+          "admitted": [
+            "sqlite"
+          ]
+        },
+        {
+          "checkpoint": "held",
+          "lastCommittedBackend": "sqlite",
+          "configBackend": "sqlite",
+          "admitted": []
+        },
+        {
+          "checkpoint": "aborted",
+          "lastCommittedBackend": "sqlite",
+          "configBackend": "sqlite",
+          "admitted": [
+            "sqlite"
+          ],
+          "boundProjects": 0
+        }
+      ],
+      "invariants": {
+        "I1": "required",
+        "I2": "required",
+        "I3": "na:no acknowledged hook input in this row; covered by F5/F6",
+        "I4": "required",
+        "I5": "na:no unreachable-target step in this row; disclosure scan still runs on every step",
+        "I6": "required"
+      }
+    },
+    {
+      "profiles": [
+        "full"
+      ],
+      "timeoutMs": 300000,
+      "supportingTests": [],
+      "injections": [
+        {
+          "surface": "module-seam",
+          "boundary": "rename an identical copy over the sealed normalized project snapshot",
+          "kind": "owned-file-replacement"
+        }
+      ],
+      "knownLimits": [],
+      "id": "F11-replaced",
+      "title": "Replaced sealed snapshot directory: classified, resume refused, original bytes preserved beside it, source preserved",
+      "fixture": "P",
+      "requirement": "Fault list: snapshot damage",
+      "steps": [
+        {
+          "id": "plan",
+          "use": "plan"
+        },
+        {
+          "id": "apply",
+          "use": "apply"
+        },
+        {
+          "id": "report-damaged",
+          "surface": "cli",
+          "args": [
+            "report"
+          ],
+          "exit": 0,
+          "outcome": "ok",
+          "manifestPhase": "copied",
+          "next": "abort",
+          "applied": false,
+          "evidence": {
+            "cell": 17,
+            "snapshot": "replaced"
+          }
+        },
+        {
+          "id": "resume-damaged",
+          "surface": "cli",
+          "args": [
+            "resume",
+            "--generation",
+            "{gen}",
+            "--confirm-generation",
+            "{gen}"
+          ],
+          "exit": 2,
+          "outcome": "refused-precondition",
+          "reason": "route-not-owner",
+          "next": "abort",
+          "applied": false
+        },
+        {
+          "id": "abort",
+          "use": "abort"
+        }
+      ],
+      "authority": [
+        {
+          "checkpoint": "before-apply",
+          "lastCommittedBackend": "sqlite",
+          "configBackend": "sqlite",
+          "admitted": [
+            "sqlite"
+          ]
+        },
+        {
+          "checkpoint": "held",
+          "lastCommittedBackend": "sqlite",
+          "configBackend": "sqlite",
+          "admitted": []
+        },
+        {
+          "checkpoint": "aborted",
+          "lastCommittedBackend": "sqlite",
+          "configBackend": "sqlite",
+          "admitted": [
+            "sqlite"
+          ],
+          "boundProjects": 0
+        }
+      ],
+      "invariants": {
+        "I1": "required",
+        "I2": "required",
+        "I3": "na:no acknowledged hook input in this row; covered by F5/F6",
+        "I4": "required",
+        "I5": "na:no unreachable-target step in this row; disclosure scan still runs on every step",
+        "I6": "required"
+      }
+    },
+    {
+      "profiles": [
+        "full"
+      ],
+      "timeoutMs": 300000,
+      "supportingTests": [],
+      "injections": [
+        {
+          "surface": "module-seam",
+          "boundary": "third project source copy of the artifact capture (existing source-copy observer)",
+          "kind": "injected-capture-failure",
+          "note": "the capture fails after its registration is durable and leaves a held journal with a partial snapshot; an unwinding, not an OS crash"
+        }
+      ],
+      "knownLimits": [],
+      "id": "F11-partial",
+      "title": "Partial snapshot after an interrupted capture: classified, apply and resume refused, abort restores SQLite authority",
+      "fixture": "P",
+      "requirement": "Fault list: snapshot damage (partial)",
+      "steps": [
+        {
+          "id": "plan",
+          "use": "plan"
+        },
+        {
+          "id": "report-partial",
+          "surface": "cli",
+          "args": [
+            "report"
+          ],
+          "exit": 0,
+          "outcome": "ok",
+          "applied": false,
+          "next": "abort",
+          "evidence": {
+            "cell": 17,
+            "snapshot": "partial"
+          }
+        },
+        {
+          "id": "apply-partial",
+          "surface": "cli",
+          "args": [
+            "apply",
+            "--confirm-generation",
+            "{gen}"
+          ],
+          "exit": 2,
+          "outcome": "refused-precondition",
+          "reason": "continuation-partial-snapshot",
+          "applied": false
+        },
+        {
+          "id": "resume-partial",
+          "surface": "cli",
+          "args": [
+            "resume",
+            "--generation",
+            "{gen}",
+            "--confirm-generation",
+            "{gen}"
+          ],
+          "exit": 2,
+          "outcome": "refused-precondition",
+          "reason": "route-not-owner",
+          "next": "abort",
+          "applied": false
+        },
+        {
+          "id": "abort",
+          "use": "abort"
+        }
+      ],
+      "authority": [
+        {
+          "checkpoint": "before-apply",
+          "lastCommittedBackend": "sqlite",
+          "configBackend": "sqlite",
+          "admitted": [
+            "sqlite"
+          ]
+        },
+        {
+          "checkpoint": "held",
+          "lastCommittedBackend": "sqlite",
+          "configBackend": "sqlite",
+          "admitted": []
+        },
+        {
+          "checkpoint": "aborted",
+          "lastCommittedBackend": "sqlite",
+          "configBackend": "sqlite",
+          "admitted": [
+            "sqlite"
+          ],
+          "boundProjects": 0
+        }
+      ],
+      "invariants": {
+        "I1": "required",
+        "I2": "na:the snapshot is partial by construction and never sealed; source preservation is proved by the I4 comparison",
+        "I3": "required",
+        "I4": "required",
+        "I5": "na:no unreachable-target step in this row; disclosure scan still runs on every step",
+        "I6": "required"
+      }
+    },
+    {
+      "profiles": [
+        "full"
+      ],
+      "timeoutMs": 300000,
+      "supportingTests": [],
+      "injections": [],
+      "knownLimits": [],
+      "id": "F1-alias",
+      "title": "128 same-project aliases and tied timestamps: one logical project, full round trip",
+      "fixture": "A",
+      "requirement": "F1 variants: alias set",
+      "steps": [
+        {
+          "id": "plan",
+          "use": "plan"
+        },
+        {
+          "id": "dry-run",
+          "use": "dry-run"
+        },
+        {
+          "id": "apply",
+          "use": "apply"
+        },
+        {
+          "id": "report-copied",
+          "use": "report-copied"
+        },
+        {
+          "id": "verify",
+          "use": "verify"
+        },
+        {
+          "id": "verify-repeat",
+          "use": "verify-repeat"
+        },
+        {
+          "id": "activate",
+          "use": "activate"
+        },
+        {
+          "id": "activate-repeat",
+          "use": "activate-repeat"
+        },
+        {
+          "id": "report-active",
+          "use": "report-active"
+        },
+        {
+          "id": "rollback",
+          "use": "rollback",
+          "evidence": {
+            "cell": 10,
+            "selectedBackend": "sqlite",
+            "rollbackMode": "pre-write"
+          }
+        },
+        {
+          "id": "report-rolled-back",
+          "use": "report-rolled-back"
+        },
+        {
+          "id": "rollback-repeat",
+          "use": "rollback-repeat"
+        }
+      ],
+      "authority": [
+        {
+          "checkpoint": "before-apply",
+          "lastCommittedBackend": "sqlite",
+          "configBackend": "sqlite",
+          "admitted": [
+            "sqlite"
+          ]
+        },
+        {
+          "checkpoint": "held",
+          "lastCommittedBackend": "sqlite",
+          "configBackend": "sqlite",
+          "admitted": []
+        },
+        {
+          "checkpoint": "activated",
+          "lastCommittedBackend": "postgresql",
+          "configBackend": "postgresql",
+          "admitted": [
+            "postgresql"
+          ],
+          "boundProjects": 1
+        },
+        {
+          "checkpoint": "rolled-back",
+          "lastCommittedBackend": "sqlite",
+          "configBackend": "sqlite",
+          "admitted": [
+            "sqlite"
+          ],
+          "boundProjects": 0
+        }
+      ],
+      "invariants": {
+        "I1": "required",
+        "I2": "required",
+        "I3": "na:no acknowledged hook input in this row; covered by F5/F6",
+        "I4": "required",
+        "I5": "na:no unreachable-target step in this row; disclosure scan still runs on every step",
+        "I6": "required"
+      },
+      "notes": "128 same-project aliases and tied timestamps form one logical destination project: the full round trip completes and the rollback restores the alias set (#1678 fixed on main)."
+    },
+    {
+      "profiles": [
+        "full"
+      ],
+      "timeoutMs": 900000,
+      "supportingTests": [
+        "test/postgresql/migration-verification-census-cost.integration.ts"
+      ],
+      "injections": [],
+      "knownLimits": [],
+      "id": "F1-large",
+      "title": "Bounded large home: forward flow with small batches, guarded mutation, post-write rollback",
+      "fixture": "B",
+      "requirement": "F1 variants: large home (opt-in)",
+      "steps": [
+        {
+          "id": "plan",
+          "use": "plan"
+        },
+        {
+          "id": "dry-run",
+          "use": "dry-run"
+        },
+        {
+          "id": "apply",
+          "use": "apply-large",
+          "deadlineMs": 600000
+        },
+        {
+          "id": "report-copied",
+          "use": "report-copied"
+        },
+        {
+          "id": "verify",
+          "use": "verify",
+          "deadlineMs": 300000
+        },
+        {
+          "id": "verify-repeat",
+          "use": "verify-repeat"
+        },
+        {
+          "id": "activate",
+          "use": "activate",
+          "deadlineMs": 300000
+        },
+        {
+          "id": "activate-repeat",
+          "use": "activate-repeat"
+        },
+        {
+          "id": "report-active",
+          "use": "report-active"
+        },
+        {
+          "id": "rollback",
+          "use": "rollback",
+          "evidence": {
+            "cell": 10,
+            "selectedBackend": "sqlite",
+            "rollbackMode": "post-write"
+          },
+          "deadlineMs": 300000
+        },
+        {
+          "id": "report-rolled-back",
+          "use": "report-rolled-back"
+        },
+        {
+          "id": "rollback-repeat",
+          "use": "rollback-repeat"
+        }
+      ],
+      "authority": [
+        {
+          "checkpoint": "before-apply",
+          "lastCommittedBackend": "sqlite",
+          "configBackend": "sqlite",
+          "admitted": [
+            "sqlite"
+          ]
+        },
+        {
+          "checkpoint": "held",
+          "lastCommittedBackend": "sqlite",
+          "configBackend": "sqlite",
+          "admitted": []
+        },
+        {
+          "checkpoint": "activated",
+          "lastCommittedBackend": "postgresql",
+          "configBackend": "postgresql",
+          "admitted": [
+            "postgresql"
+          ],
+          "boundProjects": 1
+        },
+        {
+          "checkpoint": "rolled-back",
+          "lastCommittedBackend": "sqlite",
+          "configBackend": "sqlite",
+          "admitted": [
+            "sqlite"
+          ],
+          "boundProjects": 0
+        }
+      ],
+      "invariants": {
+        "I1": "required",
+        "I2": "required",
+        "I3": "required",
+        "I4": "required",
+        "I5": "na:no unreachable-target step in this row; disclosure scan still runs on every step",
+        "I6": "required"
+      }
+    },
+    {
+      "profiles": [
+        "full"
+      ],
+      "timeoutMs": 300000,
+      "supportingTests": [],
+      "injections": [],
+      "knownLimits": [],
+      "id": "F1-legacy",
+      "title": "Pre-epoch hook events: capture refuses and everything is preserved",
+      "fixture": "L",
+      "requirement": "F1 variants: legacy queue rows",
+      "steps": [
+        {
+          "id": "plan",
+          "use": "plan"
+        },
+        {
+          "id": "apply",
+          "surface": "cli",
+          "args": [
+            "apply",
+            "--confirm-generation",
+            "{gen}"
+          ],
+          "exit": 7,
+          "outcome": "failed-operator-required",
+          "reason": "capture-failed",
+          "applied": true,
+          "evidence": {
+            "detail": "Error"
+          }
+        },
+        {
+          "id": "report-held",
+          "surface": "cli",
+          "args": [
+            "report"
+          ],
+          "exit": 0,
+          "outcome": "ok",
+          "next": "apply",
+          "applied": false,
+          "evidence": {
+            "cell": 16
+          }
+        },
+        {
+          "id": "abort",
+          "use": "abort",
+          "manifestPhase": null
+        }
+      ],
+      "authority": [
+        {
+          "checkpoint": "before-apply",
+          "lastCommittedBackend": "sqlite",
+          "configBackend": "sqlite",
+          "admitted": [
+            "sqlite"
+          ]
+        },
+        {
+          "checkpoint": "after-refusal",
+          "lastCommittedBackend": "sqlite",
+          "configBackend": "sqlite",
+          "admitted": []
+        },
+        {
+          "checkpoint": "aborted",
+          "lastCommittedBackend": "sqlite",
+          "configBackend": "sqlite",
+          "admitted": [
+            "sqlite"
+          ],
+          "boundProjects": 0
+        }
+      ],
+      "invariants": {
+        "I1": "required",
+        "I2": "required",
+        "I3": "required",
+        "I4": "required",
+        "I5": "na:no unreachable-target step in this row; disclosure scan still runs on every step",
+        "I6": "required"
+      },
+      "notes": "Plan C1 expected evidence.detail SqliteSnapshotError; the executable reports the generic detail Error (the classified cause stays private)."
+    },
+    {
+      "profiles": [
+        "default",
+        "full"
+      ],
+      "timeoutMs": 300000,
+      "supportingTests": [
+        "test/postgresql/cli-apply.integration.ts"
+      ],
+      "knownLimits": [],
+      "id": "F2",
+      "title": "Worker killed after the first committed copy batch; report, resume, verify and activate recover",
+      "fixture": "P",
+      "requirement": "Fault list: interrupted copy (the one genuine process kill)",
+      "steps": [
+        {
+          "id": "plan",
+          "use": "plan"
+        },
+        {
+          "id": "report-killed",
+          "surface": "cli",
+          "args": [
+            "report"
+          ],
+          "exit": 0,
+          "outcome": "ok",
+          "next": "resume",
+          "applied": false,
+          "evidence": {
+            "cell": 21,
+            "pendingEffect": "copy-batch"
+          }
+        },
+        {
+          "id": "resume",
+          "surface": "cli",
+          "args": [
+            "resume",
+            "--generation",
+            "{gen}",
+            "--confirm-generation",
+            "{gen}"
+          ],
+          "exit": 0,
+          "outcome": "ok",
+          "manifestPhase": "copied",
+          "applied": true,
+          "evidence": {
+            "cell": 21
+          }
+        },
+        {
+          "id": "report-copied",
+          "use": "report-copied"
+        },
+        {
+          "id": "verify",
+          "use": "verify"
+        },
+        {
+          "id": "verify-repeat",
+          "use": "verify-repeat"
+        },
+        {
+          "id": "activate",
+          "use": "activate"
+        },
+        {
+          "id": "report-active",
+          "use": "report-active"
+        }
+      ],
+      "injections": [
+        {
+          "surface": "module-seam",
+          "boundary": "after-batch-readback",
+          "kind": "process-kill",
+          "note": "dedicated worker imports the production apply entries; the parent SIGKILLs that exact process group after its readiness message"
+        }
+      ],
+      "authority": [
+        {
+          "checkpoint": "before-apply",
+          "lastCommittedBackend": "sqlite",
+          "configBackend": "sqlite",
+          "admitted": [
+            "sqlite"
+          ]
+        },
+        {
+          "checkpoint": "after-kill",
+          "lastCommittedBackend": "sqlite",
+          "configBackend": "sqlite",
+          "admitted": []
+        },
+        {
+          "checkpoint": "held",
+          "lastCommittedBackend": "sqlite",
+          "configBackend": "sqlite",
+          "admitted": []
+        },
+        {
+          "checkpoint": "activated",
+          "lastCommittedBackend": "postgresql",
+          "configBackend": "postgresql",
+          "admitted": [
+            "postgresql"
+          ],
+          "boundProjects": 1
+        }
+      ],
+      "invariants": {
+        "I1": "required",
+        "I2": "required",
+        "I3": "required",
+        "I4": "required",
+        "I5": "na:no unreachable-target step in this row; disclosure scan still runs on every step",
+        "I6": "required"
+      }
+    },
+    {
+      "profiles": [
+        "full"
+      ],
+      "timeoutMs": 300000,
+      "supportingTests": [
+        "test/migration/activate-generation.test.ts",
+        "test/postgresql/migration-activation.integration.ts"
+      ],
+      "knownLimits": [],
+      "id": "F7a",
+      "title": "Activation interrupted after prepare completes",
+      "fixture": "P",
+      "requirement": "Fault list: interrupted activation (after-prepare-complete)",
+      "steps": [
+        {
+          "id": "plan",
+          "use": "plan"
+        },
+        {
+          "id": "apply",
+          "use": "apply"
+        },
+        {
+          "id": "verify",
+          "use": "verify"
+        },
+        {
+          "id": "report-interrupted",
+          "surface": "cli",
+          "args": [
+            "report",
+            "--generation",
+            "{gen}"
+          ],
+          "exit": 0,
+          "outcome": "ok",
+          "manifestPhase": "activating",
+          "next": "activate",
+          "applied": false,
+          "evidence": {
+            "cell": 11
+          }
+        },
+        {
+          "id": "activate-retry",
+          "use": "activate",
+          "evidence": {
+            "selectedBackend": "postgresql"
+          }
+        },
+        {
+          "id": "report-active",
+          "use": "report-active"
+        }
+      ],
+      "injections": [
+        {
+          "surface": "module-seam",
+          "boundary": "after-prepare-complete",
+          "kind": "injected-interruption",
+          "note": "thrown at an existing named boundary of the production activation; an unwinding, not an OS crash"
+        }
+      ],
+      "authority": [
+        {
+          "checkpoint": "held",
+          "lastCommittedBackend": "sqlite",
+          "configBackend": "sqlite",
+          "admitted": []
+        },
+        {
+          "checkpoint": "interrupted",
+          "lastCommittedBackend": "sqlite",
+          "configBackend": "sqlite",
+          "admitted": []
+        },
+        {
+          "checkpoint": "activated",
+          "lastCommittedBackend": "postgresql",
+          "configBackend": "postgresql",
+          "admitted": [
+            "postgresql"
+          ],
+          "boundProjects": 1
+        }
+      ],
+      "invariants": {
+        "I1": "required",
+        "I2": "required",
+        "I3": "required",
+        "I4": "required",
+        "I5": "na:no unreachable-target step in this row; disclosure scan still runs on every step",
+        "I6": "required"
+      }
+    },
+    {
+      "profiles": [
+        "full"
+      ],
+      "timeoutMs": 300000,
+      "supportingTests": [
+        "test/migration/activate-generation.test.ts",
+        "test/postgresql/migration-activation.integration.ts"
+      ],
+      "knownLimits": [],
+      "id": "F7b",
+      "title": "Activation interrupted with the selection prepared",
+      "fixture": "P",
+      "requirement": "Fault list: interrupted activation (after-selection-prepared)",
+      "steps": [
+        {
+          "id": "plan",
+          "use": "plan"
+        },
+        {
+          "id": "apply",
+          "use": "apply"
+        },
+        {
+          "id": "verify",
+          "use": "verify"
+        },
+        {
+          "id": "report-interrupted",
+          "surface": "cli",
+          "args": [
+            "report",
+            "--generation",
+            "{gen}"
+          ],
+          "exit": 0,
+          "outcome": "ok",
+          "applied": false,
+          "manifestPhase": "activating",
+          "next": "activate",
+          "evidence": {
+            "cell": 11
+          }
+        },
+        {
+          "id": "activate-retry",
+          "use": "activate",
+          "evidence": {
+            "selectedBackend": "postgresql"
+          }
+        },
+        {
+          "id": "report-active",
+          "use": "report-active"
+        }
+      ],
+      "injections": [
+        {
+          "surface": "module-seam",
+          "boundary": "after-selection-prepared",
+          "kind": "injected-interruption",
+          "note": "thrown at an existing named boundary of the production activation; an unwinding, not an OS crash"
+        }
+      ],
+      "authority": [
+        {
+          "checkpoint": "held",
+          "lastCommittedBackend": "sqlite",
+          "configBackend": "sqlite",
+          "admitted": []
+        },
+        {
+          "checkpoint": "interrupted",
+          "lastCommittedBackend": "sqlite",
+          "configBackend": "sqlite",
+          "admitted": []
+        },
+        {
+          "checkpoint": "activated",
+          "lastCommittedBackend": "postgresql",
+          "configBackend": "postgresql",
+          "admitted": [
+            "postgresql"
+          ],
+          "boundProjects": 1
+        }
+      ],
+      "invariants": {
+        "I1": "required",
+        "I2": "required",
+        "I3": "required",
+        "I4": "required",
+        "I5": "na:no unreachable-target step in this row; disclosure scan still runs on every step",
+        "I6": "required"
+      }
+    },
+    {
+      "profiles": [
+        "full"
+      ],
+      "timeoutMs": 300000,
+      "supportingTests": [
+        "test/migration/activate-generation.test.ts",
+        "test/postgresql/migration-activation.integration.ts"
+      ],
+      "knownLimits": [],
+      "id": "F7c",
+      "title": "Activation interrupted with the project map published and the config not",
+      "fixture": "P",
+      "requirement": "Fault list: interrupted activation (map-published)",
+      "steps": [
+        {
+          "id": "plan",
+          "use": "plan"
+        },
+        {
+          "id": "apply",
+          "use": "apply"
+        },
+        {
+          "id": "verify",
+          "use": "verify"
+        },
+        {
+          "id": "report-interrupted",
+          "surface": "cli",
+          "args": [
+            "report",
+            "--generation",
+            "{gen}"
+          ],
+          "exit": 0,
+          "outcome": "ok",
+          "applied": false,
+          "manifestPhase": "activating",
+          "next": "activate",
+          "evidence": {
+            "cell": 11
+          }
+        },
+        {
+          "id": "activate-retry",
+          "use": "activate",
+          "evidence": {
+            "selectedBackend": "postgresql"
+          }
+        },
+        {
+          "id": "report-active",
+          "use": "report-active"
+        }
+      ],
+      "injections": [
+        {
+          "surface": "module-seam",
+          "boundary": "map-published",
+          "kind": "injected-interruption",
+          "note": "thrown at an existing named boundary of the production activation; an unwinding, not an OS crash"
+        }
+      ],
+      "authority": [
+        {
+          "checkpoint": "held",
+          "lastCommittedBackend": "sqlite",
+          "configBackend": "sqlite",
+          "admitted": []
+        },
+        {
+          "checkpoint": "interrupted",
+          "lastCommittedBackend": "sqlite",
+          "configBackend": "sqlite",
+          "admitted": []
+        },
+        {
+          "checkpoint": "activated",
+          "lastCommittedBackend": "postgresql",
+          "configBackend": "postgresql",
+          "admitted": [
+            "postgresql"
+          ],
+          "boundProjects": 1
+        }
+      ],
+      "invariants": {
+        "I1": "required",
+        "I2": "required",
+        "I3": "required",
+        "I4": "required",
+        "I5": "na:no unreachable-target step in this row; disclosure scan still runs on every step",
+        "I6": "required"
+      }
+    },
+    {
+      "profiles": [
+        "full"
+      ],
+      "timeoutMs": 300000,
+      "supportingTests": [
+        "test/migration/activate-generation.test.ts",
+        "test/postgresql/migration-activation.integration.ts"
+      ],
+      "knownLimits": [],
+      "id": "F7d",
+      "title": "Activation interrupted after the drive, before the report",
+      "fixture": "P",
+      "requirement": "Fault list: interrupted activation (after-drive)",
+      "steps": [
+        {
+          "id": "plan",
+          "use": "plan"
+        },
+        {
+          "id": "apply",
+          "use": "apply"
+        },
+        {
+          "id": "verify",
+          "use": "verify"
+        },
+        {
+          "id": "report-interrupted",
+          "surface": "cli",
+          "args": [
+            "report",
+            "--generation",
+            "{gen}"
+          ],
+          "exit": 0,
+          "outcome": "ok",
+          "manifestPhase": "activating",
+          "next": "activate",
+          "applied": false,
+          "evidence": {
+            "cell": 11
+          }
+        },
+        {
+          "id": "activate-retry",
+          "use": "activate",
+          "evidence": {
+            "selectedBackend": "postgresql"
+          }
+        },
+        {
+          "id": "report-active",
+          "use": "report-active"
+        }
+      ],
+      "injections": [
+        {
+          "surface": "module-seam",
+          "boundary": "after-drive",
+          "kind": "injected-interruption",
+          "note": "thrown at an existing named boundary of the production activation; an unwinding, not an OS crash"
+        }
+      ],
+      "authority": [
+        {
+          "checkpoint": "held",
+          "lastCommittedBackend": "sqlite",
+          "configBackend": "sqlite",
+          "admitted": []
+        },
+        {
+          "checkpoint": "interrupted",
+          "lastCommittedBackend": "postgresql",
+          "configBackend": "postgresql",
+          "admitted": [
+            "postgresql"
+          ]
+        },
+        {
+          "checkpoint": "activated",
+          "lastCommittedBackend": "postgresql",
+          "configBackend": "postgresql",
+          "admitted": [
+            "postgresql"
+          ],
+          "boundProjects": 1
+        }
+      ],
+      "invariants": {
+        "I1": "required",
+        "I2": "required",
+        "I3": "required",
+        "I4": "required",
+        "I5": "na:no unreachable-target step in this row; disclosure scan still runs on every step",
+        "I6": "required"
+      }
+    },
+    {
+      "profiles": [
+        "full"
+      ],
+      "timeoutMs": 300000,
+      "supportingTests": [
+        "test/postgresql/activation-lease.integration.ts",
+        "test/postgresql/migration-copy.integration.ts"
+      ],
+      "knownLimits": [],
+      "id": "F8",
+      "title": "Competing verification and publication fences refuse with contention; a superseded token is refused after takeover",
+      "fixture": "P",
+      "requirement": "Fault list: stale and competing fences",
+      "steps": [
+        {
+          "id": "plan",
+          "use": "plan"
+        },
+        {
+          "id": "apply",
+          "use": "apply"
+        },
+        {
+          "id": "verify-contended",
+          "surface": "cli",
+          "args": [
+            "verify",
+            "--generation",
+            "{gen}",
+            "--confirm-generation",
+            "{gen}"
+          ],
+          "exit": 4,
+          "outcome": "refused-contention",
+          "reason": "verify-contention",
+          "applied": false
+        },
+        {
+          "id": "report-copied",
+          "use": "report-copied"
+        },
+        {
+          "id": "verify",
+          "use": "verify"
+        },
+        {
+          "id": "activate-contended",
+          "surface": "cli",
+          "args": [
+            "activate",
+            "--generation",
+            "{gen}",
+            "--confirm-generation",
+            "{gen}",
+            "--confirm-backend",
+            "postgresql"
+          ],
+          "exit": 4,
+          "outcome": "refused-contention",
+          "reason": "activation-refused-contention",
+          "applied": false,
+          "evidence": {
+            "activationReason": "lease-conflict",
+            "activationStep": "S2",
+            "effectBegun": false
+          }
+        },
+        {
+          "id": "activate",
+          "use": "activate"
+        }
+      ],
+      "injections": [
+        {
+          "surface": "module-seam",
+          "boundary": "competing fenced lease held by another process id",
+          "kind": "foreign-lease"
+        },
+        {
+          "surface": "module-seam",
+          "boundary": "isolated lease row shifted into the past, then a fresh owner takes over",
+          "kind": "stale-fencing-token"
+        }
+      ],
+      "authority": [
+        {
+          "checkpoint": "held",
+          "lastCommittedBackend": "sqlite",
+          "configBackend": "sqlite",
+          "admitted": []
+        },
+        {
+          "checkpoint": "verified-contended",
+          "lastCommittedBackend": "sqlite",
+          "configBackend": "sqlite",
+          "admitted": []
+        },
+        {
+          "checkpoint": "activated",
+          "lastCommittedBackend": "postgresql",
+          "configBackend": "postgresql",
+          "admitted": [
+            "postgresql"
+          ],
+          "boundProjects": 1
+        }
+      ],
+      "invariants": {
+        "I1": "required",
+        "I2": "required",
+        "I3": "na:no acknowledged hook input in this row; covered by F5/F6",
+        "I4": "required",
+        "I5": "na:no unreachable-target step in this row; disclosure scan still runs on every step",
+        "I6": "required"
+      },
+      "notes": "A foreign holder of the publication fence (a decodable backend-publication row owned by another process) refuses activation as contention (exit 4 lease-conflict); authority stays SQLite and fenced, and the retry after release activates (exit 0)."
+    },
+    {
+      "profiles": [
+        "full"
+      ],
+      "timeoutMs": 300000,
+      "supportingTests": [
+        "test/postgresql/migration-copy.integration.ts",
+        "test/postgresql/passive-event-replication.integration.ts"
+      ],
+      "knownLimits": [],
+      "id": "F3",
+      "title": "Server-committed copy response lost once: the batch settles positively and the public flow completes",
+      "fixture": "P",
+      "requirement": "Fault list: uncertain commit",
+      "steps": [
+        {
+          "id": "plan",
+          "use": "plan"
+        },
+        {
+          "id": "report-copied",
+          "use": "report-copied"
+        },
+        {
+          "id": "verify",
+          "use": "verify"
+        },
+        {
+          "id": "activate",
+          "use": "activate"
+        },
+        {
+          "id": "report-active",
+          "use": "report-active"
+        }
+      ],
+      "injections": [
+        {
+          "surface": "module-seam",
+          "boundary": "ECONNRESET raised after the awaited COMMIT on the receipt-owning connection",
+          "kind": "uncertain-commit",
+          "note": "the real server commit happened; the injected transport error is private evidence, not an alternative runtime outcome"
+        }
+      ],
+      "authority": [
+        {
+          "checkpoint": "before-apply",
+          "lastCommittedBackend": "sqlite",
+          "configBackend": "sqlite",
+          "admitted": [
+            "sqlite"
+          ]
+        },
+        {
+          "checkpoint": "held",
+          "lastCommittedBackend": "sqlite",
+          "configBackend": "sqlite",
+          "admitted": []
+        },
+        {
+          "checkpoint": "activated",
+          "lastCommittedBackend": "postgresql",
+          "configBackend": "postgresql",
+          "admitted": [
+            "postgresql"
+          ],
+          "boundProjects": 1
+        }
+      ],
+      "invariants": {
+        "I1": "required",
+        "I2": "required",
+        "I3": "required",
+        "I4": "required",
+        "I5": "na:no unreachable-target step in this row; disclosure scan still runs on every step",
+        "I6": "required"
+      }
+    },
+    {
+      "profiles": [
+        "full"
+      ],
+      "timeoutMs": 300000,
+      "supportingTests": [
+        "test/postgresql/rollback-session.integration.ts"
+      ],
+      "injections": [],
+      "knownLimits": [
+        {
+          "issue": "docs/migration-operations.md#fencing-residue-what-this-command-group-does-not-protect-against",
+          "expectedRefusal": "none: the first installation completes",
+          "preservedAuthority": "sqlite (second installation)",
+          "safetyEvidence": "second installation SQLite and authority unchanged",
+          "unavailable": "detection of a disconnected installation that writes concurrently"
+        }
+      ],
+      "id": "F9",
+      "title": "A second registered installation never started: the first installation migrates and rolls back on its own and the second is left untouched",
+      "fixture": "P",
+      "requirement": "Disconnected registered machine (documented limit: no exclusion across installations)",
+      "steps": [
+        {
+          "id": "plan",
+          "use": "plan"
+        },
+        {
+          "id": "dry-run",
+          "use": "dry-run"
+        },
+        {
+          "id": "apply",
+          "use": "apply"
+        },
+        {
+          "id": "report-copied",
+          "use": "report-copied"
+        },
+        {
+          "id": "verify",
+          "use": "verify"
+        },
+        {
+          "id": "verify-repeat",
+          "use": "verify-repeat"
+        },
+        {
+          "id": "activate",
+          "use": "activate"
+        },
+        {
+          "id": "activate-repeat",
+          "use": "activate-repeat"
+        },
+        {
+          "id": "report-active",
+          "use": "report-active"
+        },
+        {
+          "id": "rollback",
+          "use": "rollback",
+          "evidence": {
+            "cell": 10,
+            "selectedBackend": "sqlite",
+            "rollbackMode": "pre-write"
+          }
+        },
+        {
+          "id": "report-rolled-back",
+          "use": "report-rolled-back"
+        },
+        {
+          "id": "rollback-repeat",
+          "use": "rollback-repeat"
+        }
+      ],
+      "authority": [
+        {
+          "checkpoint": "before-apply",
+          "lastCommittedBackend": "sqlite",
+          "configBackend": "sqlite",
+          "admitted": [
+            "sqlite"
+          ]
+        },
+        {
+          "checkpoint": "held",
+          "lastCommittedBackend": "sqlite",
+          "configBackend": "sqlite",
+          "admitted": []
+        },
+        {
+          "checkpoint": "activated",
+          "lastCommittedBackend": "postgresql",
+          "configBackend": "postgresql",
+          "admitted": [
+            "postgresql"
+          ],
+          "boundProjects": 1
+        },
+        {
+          "checkpoint": "rolled-back",
+          "lastCommittedBackend": "sqlite",
+          "configBackend": "sqlite",
+          "admitted": [
+            "sqlite"
+          ],
+          "boundProjects": 0
+        }
+      ],
+      "invariants": {
+        "I1": "required",
+        "I2": "required",
+        "I3": "na:no acknowledged hook input in this row; covered by F5/F6",
+        "I4": "required",
+        "I5": "na:no unreachable-target step in this row; disclosure scan still runs on every step",
+        "I6": "required"
+      },
+      "notes": "Documented limit: migration fences same-host LCM processes of the migrating installation only; it does not detect or prevent a writer of another installation (docs/migration-operations.md \"Fencing residue\"). The row proves the registered second installation is neither read nor changed and the first installation completes; the operator remains responsible for quiescing others."
+    },
+    {
+      "profiles": [
+        "full"
+      ],
+      "timeoutMs": 300000,
+      "supportingTests": [
+        "test/postgresql/rollback-session.integration.ts"
+      ],
+      "injections": [],
+      "knownLimits": [
+        {
+          "issue": "docs/migration-operations.md#fencing-residue-what-this-command-group-does-not-protect-against",
+          "expectedRefusal": "multi-machine-installation (single apply) and member-not-local (set)",
+          "preservedAuthority": "sqlite (second installation)",
+          "safetyEvidence": "second installation history unchanged",
+          "unavailable": "joining an independent SQLite history into a shared project"
+        }
+      ],
+      "id": "H2",
+      "title": "Second installation with its own history for a shared project: single apply and set planning are refused and its SQLite history is preserved",
+      "fixture": "P",
+      "requirement": "Second machine independent history (documented refusal)",
+      "steps": [
+        {
+          "id": "plan",
+          "use": "plan"
+        },
+        {
+          "id": "dry-run",
+          "use": "dry-run"
+        },
+        {
+          "id": "apply",
+          "use": "apply"
+        },
+        {
+          "id": "report-copied",
+          "use": "report-copied"
+        },
+        {
+          "id": "verify",
+          "use": "verify"
+        },
+        {
+          "id": "verify-repeat",
+          "use": "verify-repeat"
+        },
+        {
+          "id": "activate",
+          "use": "activate"
+        },
+        {
+          "id": "activate-repeat",
+          "use": "activate-repeat"
+        },
+        {
+          "id": "report-active",
+          "use": "report-active"
+        },
+        {
+          "id": "b-plan",
+          "use": "plan"
+        },
+        {
+          "id": "b-apply",
+          "use": "apply",
+          "exit": 2,
+          "outcome": "refused-precondition",
+          "reason": "multi-machine-installation",
+          "manifestPhase": null,
+          "applied": true
+        },
+        {
+          "id": "b-set-plan",
+          "use": "set-plan",
+          "exit": 2,
+          "outcome": "refused-precondition",
+          "reason": "set-refused-precondition",
+          "next": null,
+          "evidence": {
+            "serviceReason": "cutover-set-member-not-local"
+          }
+        },
+        {
+          "id": "b-set-apply",
+          "use": "set-apply",
+          "exit": 2,
+          "outcome": "refused-precondition",
+          "reason": "set-refused-precondition",
+          "manifestPhase": null,
+          "next": null,
+          "applied": false,
+          "evidence": {}
+        }
+      ],
+      "authority": [
+        {
+          "checkpoint": "before-apply",
+          "lastCommittedBackend": "sqlite",
+          "configBackend": "sqlite",
+          "admitted": [
+            "sqlite"
+          ]
+        },
+        {
+          "checkpoint": "held",
+          "lastCommittedBackend": "sqlite",
+          "configBackend": "sqlite",
+          "admitted": []
+        },
+        {
+          "checkpoint": "activated",
+          "lastCommittedBackend": "postgresql",
+          "configBackend": "postgresql",
+          "admitted": [
+            "postgresql"
+          ],
+          "boundProjects": 1
+        },
+        {
+          "checkpoint": "b-sqlite",
+          "lastCommittedBackend": "sqlite",
+          "configBackend": "sqlite",
+          "admitted": [
+            "sqlite"
+          ]
+        }
+      ],
+      "invariants": {
+        "I1": "required",
+        "I2": "required",
+        "I3": "na:no acknowledged hook input in this row; covered by F5/F6",
+        "I4": "required",
+        "I5": "na:no unreachable-target step in this row; disclosure scan still runs on every step",
+        "I6": "required"
+      },
+      "notes": "Required second-machine history contract is a documented refusal: no merge or automatic join of an independent SQLite history into a shared project is attempted. Installation B keeps its history and queue. The refused single apply reports applied=true because apply mints the destination identity before the multi-machine check (docs/migration-operations.md describes apply as resolving or creating the destination identity itself); no hold, journal or SQLite change results. The ordering is tracked as the non-blocking Bug https://github.com/donadiosolutions/lcm/issues/1689; flip b-apply to applied=false if it is changed."
+    },
+    {
+      "profiles": [
+        "full"
+      ],
+      "timeoutMs": 300000,
+      "supportingTests": [
+        "test/migration/cli-restart.test.ts",
+        "test/migration/activation-restart-check.test.ts"
+      ],
+      "knownLimits": [],
+      "id": "F10",
+      "title": "A SQLite daemon alive across activation: the restart verifier refuses until it is stopped and a PostgreSQL daemon starts and replicates",
+      "fixture": "PM",
+      "requirement": "Fault list: stale daemon (restart verifier is real)",
+      "steps": [
+        {
+          "id": "plan",
+          "use": "plan",
+          "evidence": {
+            "daemonPresent": true
+          }
+        },
+        {
+          "id": "apply",
+          "use": "apply"
+        },
+        {
+          "id": "verify",
+          "use": "verify"
+        },
+        {
+          "id": "activate",
+          "surface": "cli",
+          "args": [
+            "activate",
+            "--generation",
+            "{gen}",
+            "--confirm-generation",
+            "{gen}",
+            "--confirm-backend",
+            "postgresql"
+          ],
+          "exit": 8,
+          "outcome": "restart-required",
+          "reason": "cutover-restart-required",
+          "manifestPhase": null,
+          "applied": true,
+          "next": "swap-grants-then-start-daemon",
+          "restartAnswer": "unsatisfied"
+        },
+        {
+          "id": "report-restart-required",
+          "surface": "cli",
+          "args": [
+            "report",
+            "--generation",
+            "{gen}"
+          ],
+          "exit": 8,
+          "outcome": "restart-required",
+          "reason": "report-restart-required",
+          "manifestPhase": "active",
+          "restartAnswer": "unsatisfied"
+        },
+        {
+          "id": "report-active",
+          "use": "report-active",
+          "evidence": {
+            "cell": 10,
+            "selectedBackend": "postgresql"
+          }
+        }
+      ],
+      "injections": [
+        {
+          "surface": "cli",
+          "boundary": "real foreground daemon on the SQLite backend across the cutover",
+          "kind": "stale-daemon"
+        }
+      ],
+      "authority": [
+        {
+          "checkpoint": "held",
+          "lastCommittedBackend": "sqlite",
+          "configBackend": "sqlite",
+          "admitted": []
+        },
+        {
+          "checkpoint": "activated",
+          "lastCommittedBackend": "postgresql",
+          "configBackend": "postgresql",
+          "admitted": [
+            "postgresql"
+          ],
+          "boundProjects": 1
+        }
+      ],
+      "invariants": {
+        "I1": "required",
+        "I2": "required",
+        "I3": "required",
+        "I4": "required",
+        "I5": "na:no unreachable-target step in this row; disclosure scan still runs on every step",
+        "I6": "required"
+      },
+      "notes": "A real SQLite daemon alive across the cutover: activate and report exit 8 restart-required until it is stopped (#1683 fixed on main). Environment restriction: this daemon is started with the operator's PostgreSQL connection variables (LCM_POSTGRES_URL and LCM_POSTGRES_CA_FILE); a daemon started without them still gives exit 5 cutover-restart-contradiction because its observe route answers 503, tracked by https://github.com/donadiosolutions/lcm/issues/1696 and asserted by the pending row F10-no-target-env. After the restart the new daemon reports PostgreSQL, an input acknowledged after the old daemon stopped is delivered once by the production replication worker, driven in process so the applied inbox row is captured before the production prune and authenticates every canonical envelope field, and a second input acknowledged before the restart is delivered by the restarted daemon itself: its start-up sweep must report a pass that acknowledged at least one event and leave that input acknowledged locally against its inbox row (and pruned when the pass pruned); the SQLite project database is never written by either daemon."
+    },
+    {
+      "profiles": [
+        "full"
+      ],
+      "timeoutMs": 300000,
+      "supportingTests": [
+        "test/migration/cli-restart.test.ts",
+        "test/migration/activation-restart-check.test.ts"
+      ],
+      "knownLimits": [],
+      "id": "F10-no-target-env",
+      "title": "A SQLite daemon started without the PostgreSQL connection variables alive across activation: exit 8 restart-required, then restart and replication",
+      "fixture": "PM",
+      "requirement": "Fault list: stale daemon (restart verifier is real)",
+      "steps": [
+        {
+          "id": "plan",
+          "use": "plan",
+          "evidence": {
+            "daemonPresent": true
+          }
+        },
+        {
+          "id": "apply",
+          "use": "apply"
+        },
+        {
+          "id": "verify",
+          "use": "verify"
+        },
+        {
+          "id": "activate",
+          "surface": "cli",
+          "args": [
+            "activate",
+            "--generation",
+            "{gen}",
+            "--confirm-generation",
+            "{gen}",
+            "--confirm-backend",
+            "postgresql"
+          ],
+          "exit": 8,
+          "outcome": "restart-required",
+          "reason": "cutover-restart-required",
+          "manifestPhase": null,
+          "applied": true,
+          "next": "swap-grants-then-start-daemon",
+          "restartAnswer": "unsatisfied"
+        },
+        {
+          "id": "report-restart-required",
+          "surface": "cli",
+          "args": [
+            "report",
+            "--generation",
+            "{gen}"
+          ],
+          "exit": 8,
+          "outcome": "restart-required",
+          "reason": "report-restart-required",
+          "manifestPhase": "active",
+          "restartAnswer": "unsatisfied"
+        },
+        {
+          "id": "report-active",
+          "use": "report-active",
+          "evidence": {
+            "cell": 10,
+            "selectedBackend": "postgresql"
+          }
+        }
+      ],
+      "injections": [
+        {
+          "surface": "cli",
+          "boundary": "real foreground daemon on the SQLite backend across the cutover",
+          "kind": "stale-daemon"
+        }
+      ],
+      "authority": [
+        {
+          "checkpoint": "held",
+          "lastCommittedBackend": "sqlite",
+          "configBackend": "sqlite",
+          "admitted": []
+        },
+        {
+          "checkpoint": "activated",
+          "lastCommittedBackend": "postgresql",
+          "configBackend": "postgresql",
+          "admitted": [
+            "postgresql"
+          ],
+          "boundProjects": 1
+        }
+      ],
+      "invariants": {
+        "I1": "required",
+        "I2": "required",
+        "I3": "required",
+        "I4": "required",
+        "I5": "na:no unreachable-target step in this row; disclosure scan still runs on every step",
+        "I6": "required"
+      },
+      "notes": "Fixed by https://github.com/donadiosolutions/lcm/issues/1696 (a follow-up of #1683): identity-only observation authenticates the config and journal without the selected backend connection secrets. The row starts the stale SQLite daemon without LCM_POSTGRES_URL and LCM_POSTGRES_CA_FILE and asserts exit 8 restart-required on activate and report, followed by the restart and the delivery assertions of F10."
+    },
+    {
+      "profiles": [
+        "full"
+      ],
+      "timeoutMs": 300000,
+      "supportingTests": [
+        "test/postgresql/passive-event-replication.integration.ts",
+        "test/postgresql/daemon-runtime.integration.ts"
+      ],
+      "knownLimits": [],
+      "id": "F5",
+      "title": "Hook events around the hold are retained across the cutover, the held-gap input is sequenced above the sealed cutoff, and the join with PostgreSQL has no foreign or duplicate rows",
+      "fixture": "P",
+      "requirement": "Snapshot-to-selection gap; pending queues",
+      "steps": [
+        {
+          "id": "plan",
+          "use": "plan"
+        },
+        {
+          "id": "apply",
+          "use": "apply"
+        },
+        {
+          "id": "verify",
+          "use": "verify"
+        },
+        {
+          "id": "activate",
+          "use": "activate"
+        }
+      ],
+      "injections": [
+        {
+          "surface": "module-seam",
+          "boundary": "real durable hook enqueue during the held gap",
+          "kind": "hook-append-during-hold"
+        }
+      ],
+      "authority": [
+        {
+          "checkpoint": "held",
+          "lastCommittedBackend": "sqlite",
+          "configBackend": "sqlite",
+          "admitted": []
+        },
+        {
+          "checkpoint": "activated",
+          "lastCommittedBackend": "postgresql",
+          "configBackend": "postgresql",
+          "admitted": [
+            "postgresql"
+          ],
+          "boundProjects": 1
+        }
+      ],
+      "invariants": {
+        "I1": "required",
+        "I2": "required",
+        "I3": "required",
+        "I4": "required",
+        "I5": "na:no unreachable-target step in this row; disclosure scan still runs on every step",
+        "I6": "required"
+      },
+      "notes": "Retention, held-gap and join-safety assertions; delivery of events that crossed the cutover is asserted by F5-delivery."
+    },
+    {
+      "profiles": [
+        "full"
+      ],
+      "timeoutMs": 300000,
+      "supportingTests": [
+        "test/postgresql/passive-event-replication.integration.ts",
+        "test/postgresql/daemon-runtime.integration.ts"
+      ],
+      "knownLimits": [],
+      "id": "F5-delivery",
+      "title": "Hook events around the hold are delivered to PostgreSQL exactly once after the cutover: the production replication worker in process with captured receipts, then the daemon's own start-up sweep for a later input",
+      "fixture": "P",
+      "requirement": "Snapshot-to-selection gap; pending queues",
+      "steps": [
+        {
+          "id": "plan",
+          "use": "plan"
+        },
+        {
+          "id": "apply",
+          "use": "apply"
+        },
+        {
+          "id": "verify",
+          "use": "verify"
+        },
+        {
+          "id": "activate",
+          "use": "activate"
+        }
+      ],
+      "injections": [
+        {
+          "surface": "module-seam",
+          "boundary": "real durable hook enqueue during the held gap",
+          "kind": "hook-append-during-hold"
+        }
+      ],
+      "authority": [
+        {
+          "checkpoint": "held",
+          "lastCommittedBackend": "sqlite",
+          "configBackend": "sqlite",
+          "admitted": []
+        },
+        {
+          "checkpoint": "activated",
+          "lastCommittedBackend": "postgresql",
+          "configBackend": "postgresql",
+          "admitted": [
+            "postgresql"
+          ],
+          "boundProjects": 1
+        }
+      ],
+      "invariants": {
+        "I1": "required",
+        "I2": "required",
+        "I3": "required",
+        "I4": "required",
+        "I5": "na:no unreachable-target step in this row; disclosure scan still runs on every step",
+        "I6": "required"
+      },
+      "notes": "Asserts the delivery end state: every drained input is acknowledged locally, has one terminal remote disposition, and the join authenticates every canonical envelope field against the ledger from the applied inbox row captured before the production prune. The production replication worker is driven in process because the daemon replicates only in its start-up sweep and every five minutes. One more input acknowledged after that pass is left for the daemon: its start-up sweep must report a pass that acknowledged at least one event and leave that input acknowledged locally against its inbox row (and pruned when the pass pruned)."
+    },
+    {
+      "profiles": [
+        "full"
+      ],
+      "timeoutMs": 300000,
+      "supportingTests": [
+        "test/postgresql/passive-event-replication.integration.ts",
+        "test/migration/receipts.test.ts"
+      ],
+      "knownLimits": [],
+      "id": "F6",
+      "title": "Represented and pending receipt-era events survive the cutover and the rollback (no daemon delivery before the rollback)",
+      "fixture": "P",
+      "requirement": "Pending queues; both rollback modes (post-write with later events)",
+      "steps": [
+        {
+          "id": "plan",
+          "use": "plan"
+        },
+        {
+          "id": "apply",
+          "use": "apply"
+        },
+        {
+          "id": "verify",
+          "use": "verify"
+        },
+        {
+          "id": "activate",
+          "use": "activate"
+        },
+        {
+          "id": "rollback",
+          "use": "rollback",
+          "evidence": {
+            "cell": 10,
+            "selectedBackend": "sqlite"
+          }
+        },
+        {
+          "id": "report-rolled-back",
+          "use": "report-rolled-back"
+        }
+      ],
+      "injections": [
+        {
+          "surface": "module-seam",
+          "boundary": "exact-envelope receipts recorded for two acknowledged events",
+          "kind": "represented-events"
+        }
+      ],
+      "authority": [
+        {
+          "checkpoint": "held",
+          "lastCommittedBackend": "sqlite",
+          "configBackend": "sqlite",
+          "admitted": []
+        },
+        {
+          "checkpoint": "activated",
+          "lastCommittedBackend": "postgresql",
+          "configBackend": "postgresql",
+          "admitted": [
+            "postgresql"
+          ],
+          "boundProjects": 1
+        },
+        {
+          "checkpoint": "rolled-back",
+          "lastCommittedBackend": "sqlite",
+          "configBackend": "sqlite",
+          "admitted": [
+            "sqlite"
+          ],
+          "boundProjects": 0
+        }
+      ],
+      "invariants": {
+        "I1": "required",
+        "I2": "required",
+        "I3": "required",
+        "I4": "required",
+        "I5": "na:no unreachable-target step in this row; disclosure scan still runs on every step",
+        "I6": "required"
+      }
+    },
+    {
+      "profiles": [
+        "full"
+      ],
+      "timeoutMs": 300000,
+      "supportingTests": [
+        "test/postgresql/passive-event-replication.integration.ts",
+        "test/migration/receipts.test.ts"
+      ],
+      "knownLimits": [],
+      "id": "F6b",
+      "title": "Drain before the rollback: the drain succeeds, the rollback succeeds and every acknowledged input is retained (#1681 fixed on main)",
+      "fixture": "P",
+      "requirement": "Pending queues; both rollback modes (post-write with later events)",
+      "steps": [
+        {
+          "id": "plan",
+          "use": "plan"
+        },
+        {
+          "id": "apply",
+          "use": "apply"
+        },
+        {
+          "id": "verify",
+          "use": "verify"
+        },
+        {
+          "id": "activate",
+          "use": "activate"
+        },
+        {
+          "id": "rollback",
+          "use": "rollback",
+          "evidence": {
+            "cell": 10,
+            "selectedBackend": "sqlite"
+          }
+        },
+        {
+          "id": "report-rolled-back",
+          "use": "report-rolled-back"
+        }
+      ],
+      "injections": [
+        {
+          "surface": "module-seam",
+          "boundary": "exact-envelope receipts recorded for two acknowledged events",
+          "kind": "represented-events"
+        }
+      ],
+      "authority": [
+        {
+          "checkpoint": "held",
+          "lastCommittedBackend": "sqlite",
+          "configBackend": "sqlite",
+          "admitted": []
+        },
+        {
+          "checkpoint": "activated",
+          "lastCommittedBackend": "postgresql",
+          "configBackend": "postgresql",
+          "admitted": [
+            "postgresql"
+          ],
+          "boundProjects": 1
+        },
+        {
+          "checkpoint": "rolled-back",
+          "lastCommittedBackend": "sqlite",
+          "configBackend": "sqlite",
+          "admitted": [
+            "sqlite"
+          ],
+          "boundProjects": 0
+        }
+      ],
+      "invariants": {
+        "I1": "required",
+        "I2": "required",
+        "I3": "required",
+        "I4": "required",
+        "I5": "na:no unreachable-target step in this row; disclosure scan still runs on every step",
+        "I6": "required"
+      },
+      "notes": "Delivery of the drained events to PostgreSQL is asserted by F6b-delivery."
+    },
+    {
+      "profiles": [
+        "full"
+      ],
+      "timeoutMs": 300000,
+      "supportingTests": [
+        "test/postgresql/passive-event-replication.integration.ts",
+        "test/migration/receipts.test.ts"
+      ],
+      "knownLimits": [],
+      "id": "F6b-delivery",
+      "title": "Drain before the rollback: the drained events are delivered to PostgreSQL once, then the rollback succeeds",
+      "fixture": "P",
+      "requirement": "Pending queues; both rollback modes (post-write with later events)",
+      "steps": [
+        {
+          "id": "plan",
+          "use": "plan"
+        },
+        {
+          "id": "apply",
+          "use": "apply"
+        },
+        {
+          "id": "verify",
+          "use": "verify"
+        },
+        {
+          "id": "activate",
+          "use": "activate"
+        },
+        {
+          "id": "rollback",
+          "use": "rollback",
+          "evidence": {
+            "cell": 10,
+            "selectedBackend": "sqlite"
+          }
+        },
+        {
+          "id": "report-rolled-back",
+          "use": "report-rolled-back"
+        }
+      ],
+      "injections": [
+        {
+          "surface": "module-seam",
+          "boundary": "exact-envelope receipts recorded for two acknowledged events",
+          "kind": "represented-events"
+        }
+      ],
+      "authority": [
+        {
+          "checkpoint": "held",
+          "lastCommittedBackend": "sqlite",
+          "configBackend": "sqlite",
+          "admitted": []
+        },
+        {
+          "checkpoint": "activated",
+          "lastCommittedBackend": "postgresql",
+          "configBackend": "postgresql",
+          "admitted": [
+            "postgresql"
+          ],
+          "boundProjects": 1
+        },
+        {
+          "checkpoint": "rolled-back",
+          "lastCommittedBackend": "sqlite",
+          "configBackend": "sqlite",
+          "admitted": [
+            "sqlite"
+          ],
+          "boundProjects": 0
+        }
+      ],
+      "invariants": {
+        "I1": "required",
+        "I2": "required",
+        "I3": "required",
+        "I4": "required",
+        "I5": "na:no unreachable-target step in this row; disclosure scan still runs on every step",
+        "I6": "required"
+      },
+      "notes": "Fixed by https://github.com/donadiosolutions/lcm/issues/1698: the rollback accepts delivered events whose remote inbox rows replication pruned. The row asserts every drained input is acknowledged locally and has one terminal remote disposition, the join authenticates every canonical envelope field against the ledger from the applied inbox row captured before the production prune, and the rollback succeeds and retains them. The production replication worker is driven in process because the daemon replicates only in its start-up sweep and every five minutes."
+    },
+    {
+      "profiles": [
+        "full"
+      ],
+      "timeoutMs": 300000,
+      "knownLimits": [],
+      "id": "R6a",
+      "title": "Post-write rollback interrupted after the real install flush; the public retry completes it",
+      "fixture": "P",
+      "requirement": "Rollback mode post-write; interrupted install",
+      "supportingTests": [
+        "test/migration/rollback-install.test.ts",
+        "test/migration/rollback-recovery.test.ts"
+      ],
+      "steps": [
+        {
+          "id": "plan",
+          "use": "plan"
+        },
+        {
+          "id": "dry-run",
+          "use": "dry-run"
+        },
+        {
+          "id": "apply",
+          "use": "apply"
+        },
+        {
+          "id": "report-copied",
+          "use": "report-copied"
+        },
+        {
+          "id": "verify",
+          "use": "verify"
+        },
+        {
+          "id": "verify-repeat",
+          "use": "verify-repeat"
+        },
+        {
+          "id": "activate",
+          "use": "activate"
+        },
+        {
+          "id": "activate-repeat",
+          "use": "activate-repeat"
+        },
+        {
+          "id": "report-active",
+          "use": "report-active"
+        },
+        {
+          "id": "report-rollback-interrupted",
+          "surface": "cli",
+          "args": [
+            "report",
+            "--generation",
+            "{gen}"
+          ],
+          "exit": 0,
+          "outcome": "ok",
+          "applied": false
+        },
+        {
+          "id": "rollback",
+          "use": "rollback",
+          "evidence": {
+            "cell": 12,
+            "selectedBackend": "sqlite",
+            "rollbackMode": "post-write"
+          }
+        },
+        {
+          "id": "report-rolled-back",
+          "use": "report-rolled-back"
+        },
+        {
+          "id": "rollback-repeat",
+          "use": "rollback-repeat"
+        }
+      ],
+      "injections": [
+        {
+          "surface": "module-seam",
+          "boundary": "syncDirectory: the real flush runs, then one interruption",
+          "kind": "injected-interruption"
+        }
+      ],
+      "authority": [
+        {
+          "checkpoint": "before-apply",
+          "lastCommittedBackend": "sqlite",
+          "configBackend": "sqlite",
+          "admitted": [
+            "sqlite"
+          ]
+        },
+        {
+          "checkpoint": "held",
+          "lastCommittedBackend": "sqlite",
+          "configBackend": "sqlite",
+          "admitted": []
+        },
+        {
+          "checkpoint": "activated",
+          "lastCommittedBackend": "postgresql",
+          "configBackend": "postgresql",
+          "admitted": [
+            "postgresql"
+          ],
+          "boundProjects": 1
+        },
+        {
+          "checkpoint": "rollback-interrupted",
+          "lastCommittedBackend": "postgresql",
+          "configBackend": "postgresql",
+          "admitted": []
+        },
+        {
+          "checkpoint": "rolled-back",
+          "lastCommittedBackend": "sqlite",
+          "configBackend": "sqlite",
+          "admitted": [
+            "sqlite"
+          ],
+          "boundProjects": 0
+        }
+      ],
+      "invariants": {
+        "I1": "required",
+        "I2": "required",
+        "I3": "required",
+        "I4": "required",
+        "I5": "na:no unreachable-target step in this row; disclosure scan still runs on every step",
+        "I6": "required"
+      }
+    },
+    {
+      "profiles": [
+        "full"
+      ],
+      "timeoutMs": 300000,
+      "knownLimits": [],
+      "id": "R6b",
+      "title": "Post-write rollback interrupted with the project map published; the public retry completes it",
+      "fixture": "P",
+      "requirement": "Rollback mode post-write; interrupted publication",
+      "supportingTests": [
+        "test/migration/rollback-recovery.test.ts"
+      ],
+      "steps": [
+        {
+          "id": "plan",
+          "use": "plan"
+        },
+        {
+          "id": "dry-run",
+          "use": "dry-run"
+        },
+        {
+          "id": "apply",
+          "use": "apply"
+        },
+        {
+          "id": "report-copied",
+          "use": "report-copied"
+        },
+        {
+          "id": "verify",
+          "use": "verify"
+        },
+        {
+          "id": "verify-repeat",
+          "use": "verify-repeat"
+        },
+        {
+          "id": "activate",
+          "use": "activate"
+        },
+        {
+          "id": "activate-repeat",
+          "use": "activate-repeat"
+        },
+        {
+          "id": "report-active",
+          "use": "report-active"
+        },
+        {
+          "id": "report-rollback-interrupted",
+          "surface": "cli",
+          "args": [
+            "report",
+            "--generation",
+            "{gen}"
+          ],
+          "exit": 0,
+          "outcome": "ok",
+          "applied": false
+        },
+        {
+          "id": "rollback",
+          "use": "rollback",
+          "evidence": {
+            "cell": 12,
+            "selectedBackend": "sqlite",
+            "rollbackMode": "post-write"
+          }
+        },
+        {
+          "id": "report-rolled-back",
+          "use": "report-rolled-back"
+        },
+        {
+          "id": "rollback-repeat",
+          "use": "rollback-repeat"
+        }
+      ],
+      "injections": [
+        {
+          "surface": "module-seam",
+          "boundary": "publication journal map-published",
+          "kind": "injected-interruption"
+        }
+      ],
+      "authority": [
+        {
+          "checkpoint": "before-apply",
+          "lastCommittedBackend": "sqlite",
+          "configBackend": "sqlite",
+          "admitted": [
+            "sqlite"
+          ]
+        },
+        {
+          "checkpoint": "held",
+          "lastCommittedBackend": "sqlite",
+          "configBackend": "sqlite",
+          "admitted": []
+        },
+        {
+          "checkpoint": "activated",
+          "lastCommittedBackend": "postgresql",
+          "configBackend": "postgresql",
+          "admitted": [
+            "postgresql"
+          ],
+          "boundProjects": 1
+        },
+        {
+          "checkpoint": "rollback-interrupted",
+          "lastCommittedBackend": "postgresql",
+          "configBackend": "postgresql",
+          "admitted": []
+        },
+        {
+          "checkpoint": "rolled-back",
+          "lastCommittedBackend": "sqlite",
+          "configBackend": "sqlite",
+          "admitted": [
+            "sqlite"
+          ],
+          "boundProjects": 0
+        }
+      ],
+      "invariants": {
+        "I1": "required",
+        "I2": "required",
+        "I3": "required",
+        "I4": "required",
+        "I5": "na:no unreachable-target step in this row; disclosure scan still runs on every step",
+        "I6": "required"
+      }
+    },
+    {
+      "profiles": [
+        "full"
+      ],
+      "timeoutMs": 300000,
+      "knownLimits": [],
+      "id": "R5",
+      "title": "Queue through an interrupted post-write rollback: pending rows survive, represented rows are not replayed",
+      "fixture": "P",
+      "requirement": "Pending queues; both rollback modes; resume after interruption",
+      "supportingTests": [
+        "test/postgresql/passive-event-replication.integration.ts",
+        "test/migration/rollback-sidecars.test.ts"
+      ],
+      "steps": [
+        {
+          "id": "plan",
+          "use": "plan"
+        },
+        {
+          "id": "dry-run",
+          "use": "dry-run"
+        },
+        {
+          "id": "apply",
+          "use": "apply"
+        },
+        {
+          "id": "report-copied",
+          "use": "report-copied"
+        },
+        {
+          "id": "verify",
+          "use": "verify"
+        },
+        {
+          "id": "verify-repeat",
+          "use": "verify-repeat"
+        },
+        {
+          "id": "activate",
+          "use": "activate"
+        },
+        {
+          "id": "activate-repeat",
+          "use": "activate-repeat"
+        },
+        {
+          "id": "report-active",
+          "use": "report-active"
+        },
+        {
+          "id": "report-rollback-interrupted",
+          "surface": "cli",
+          "args": [
+            "report",
+            "--generation",
+            "{gen}"
+          ],
+          "exit": 0,
+          "outcome": "ok",
+          "applied": false
+        },
+        {
+          "id": "rollback",
+          "use": "rollback",
+          "evidence": {
+            "cell": 12,
+            "selectedBackend": "sqlite",
+            "rollbackMode": "post-write"
+          }
+        },
+        {
+          "id": "report-rolled-back",
+          "use": "report-rolled-back"
+        }
+      ],
+      "injections": [
+        {
+          "surface": "module-seam",
+          "boundary": "completeMaintenanceSelection",
+          "kind": "injected-interruption"
+        }
+      ],
+      "authority": [
+        {
+          "checkpoint": "before-apply",
+          "lastCommittedBackend": "sqlite",
+          "configBackend": "sqlite",
+          "admitted": [
+            "sqlite"
+          ]
+        },
+        {
+          "checkpoint": "held",
+          "lastCommittedBackend": "sqlite",
+          "configBackend": "sqlite",
+          "admitted": []
+        },
+        {
+          "checkpoint": "activated",
+          "lastCommittedBackend": "postgresql",
+          "configBackend": "postgresql",
+          "admitted": [
+            "postgresql"
+          ],
+          "boundProjects": 1
+        },
+        {
+          "checkpoint": "rollback-interrupted",
+          "lastCommittedBackend": "postgresql",
+          "configBackend": "postgresql",
+          "admitted": []
+        },
+        {
+          "checkpoint": "rolled-back",
+          "lastCommittedBackend": "sqlite",
+          "configBackend": "sqlite",
+          "admitted": [
+            "sqlite"
+          ],
+          "boundProjects": 0
+        }
+      ],
+      "invariants": {
+        "I1": "required",
+        "I2": "required",
+        "I3": "required",
+        "I4": "required",
+        "I5": "na:no unreachable-target step in this row; disclosure scan still runs on every step",
+        "I6": "required"
+      }
+    },
+    {
+      "profiles": [
+        "full"
+      ],
+      "timeoutMs": 300000,
+      "knownLimits": [],
+      "id": "R4",
+      "title": "Writers around the rollback fence: a write before it is carried (post-write), a writer after it is refused",
+      "fixture": "P",
+      "requirement": "Stale fences; both rollback modes",
+      "supportingTests": [
+        "test/postgresql/rollback-session.integration.ts"
+      ],
+      "steps": [
+        {
+          "id": "plan",
+          "use": "plan"
+        },
+        {
+          "id": "dry-run",
+          "use": "dry-run"
+        },
+        {
+          "id": "apply",
+          "use": "apply"
+        },
+        {
+          "id": "report-copied",
+          "use": "report-copied"
+        },
+        {
+          "id": "verify",
+          "use": "verify"
+        },
+        {
+          "id": "verify-repeat",
+          "use": "verify-repeat"
+        },
+        {
+          "id": "activate",
+          "use": "activate"
+        },
+        {
+          "id": "activate-repeat",
+          "use": "activate-repeat"
+        },
+        {
+          "id": "report-active",
+          "use": "report-active"
+        },
+        {
+          "id": "report-rolled-back",
+          "use": "report-rolled-back"
+        },
+        {
+          "id": "rollback-repeat",
+          "use": "rollback-repeat"
+        }
+      ],
+      "injections": [
+        {
+          "surface": "module-seam",
+          "boundary": "openFencedSession: a guarded write before it and a guarded write right after it",
+          "kind": "fence-adjacent-writers"
+        }
+      ],
+      "authority": [
+        {
+          "checkpoint": "before-apply",
+          "lastCommittedBackend": "sqlite",
+          "configBackend": "sqlite",
+          "admitted": [
+            "sqlite"
+          ]
+        },
+        {
+          "checkpoint": "held",
+          "lastCommittedBackend": "sqlite",
+          "configBackend": "sqlite",
+          "admitted": []
+        },
+        {
+          "checkpoint": "activated",
+          "lastCommittedBackend": "postgresql",
+          "configBackend": "postgresql",
+          "admitted": [
+            "postgresql"
+          ],
+          "boundProjects": 1
+        },
+        {
+          "checkpoint": "rolled-back",
+          "lastCommittedBackend": "sqlite",
+          "configBackend": "sqlite",
+          "admitted": [
+            "sqlite"
+          ],
+          "boundProjects": 0
+        }
+      ],
+      "invariants": {
+        "I1": "required",
+        "I2": "required",
+        "I3": "required",
+        "I4": "required",
+        "I5": "na:no unreachable-target step in this row; disclosure scan still runs on every step",
+        "I6": "required"
+      }
+    },
+    {
+      "profiles": [
+        "full"
+      ],
+      "timeoutMs": 300000,
+      "knownLimits": [
+        {
+          "issue": "https://github.com/donadiosolutions/lcm/issues/1529",
+          "expectedRefusal": "rollback-refused-evidence (rollbackReason drift) on every retry; abort refused with route-resume-required",
+          "preservedAuthority": "postgresql",
+          "safetyEvidence": "destination data kept with the injected change, no selector forced, sealed evidence unchanged",
+          "unavailable": "authenticated abort / completion of a prepared selection whose destination drifted"
+        }
+      ],
+      "id": "L1",
+      "title": "Prepared selection with an out-of-band destination change: refused as drift, nothing forced, abort cannot release it",
+      "fixture": "P",
+      "requirement": "Selection-prepared recovery limit (#1529)",
+      "supportingTests": [
+        "test/postgresql/rollback-session.integration.ts"
+      ],
+      "steps": [
+        {
+          "id": "plan",
+          "use": "plan"
+        },
+        {
+          "id": "dry-run",
+          "use": "dry-run"
+        },
+        {
+          "id": "apply",
+          "use": "apply"
+        },
+        {
+          "id": "report-copied",
+          "use": "report-copied"
+        },
+        {
+          "id": "verify",
+          "use": "verify"
+        },
+        {
+          "id": "verify-repeat",
+          "use": "verify-repeat"
+        },
+        {
+          "id": "activate",
+          "use": "activate"
+        },
+        {
+          "id": "activate-repeat",
+          "use": "activate-repeat"
+        },
+        {
+          "id": "report-active",
+          "use": "report-active"
+        },
+        {
+          "id": "rollback-drift",
+          "surface": "cli",
+          "args": [
+            "rollback",
+            "--generation",
+            "{gen}",
+            "--confirm-generation",
+            "{gen}",
+            "--confirm-backend",
+            "sqlite"
+          ],
+          "exit": 5,
+          "outcome": "refused-evidence",
+          "reason": "rollback-refused-evidence",
+          "evidence": {
+            "rollbackReason": "drift"
+          }
+        },
+        {
+          "id": "rollback-drift-again",
+          "surface": "cli",
+          "args": [
+            "rollback",
+            "--generation",
+            "{gen}",
+            "--confirm-generation",
+            "{gen}",
+            "--confirm-backend",
+            "sqlite"
+          ],
+          "exit": 5,
+          "outcome": "refused-evidence",
+          "reason": "rollback-refused-evidence",
+          "evidence": {
+            "rollbackReason": "drift"
+          }
+        },
+        {
+          "id": "abort-refused",
+          "surface": "cli",
+          "args": [
+            "abort",
+            "--generation",
+            "{gen}",
+            "--confirm-generation",
+            "{gen}"
+          ],
+          "exit": 6,
+          "outcome": "incomplete-recoverable",
+          "reason": "route-resume-required"
+        }
+      ],
+      "injections": [
+        {
+          "surface": "module-seam",
+          "boundary": "completeMaintenanceSelection",
+          "kind": "injected-interruption"
+        },
+        {
+          "surface": "module-seam",
+          "boundary": "unguarded destination change",
+          "kind": "destination-mutation"
+        }
+      ],
+      "authority": [
+        {
+          "checkpoint": "before-apply",
+          "lastCommittedBackend": "sqlite",
+          "configBackend": "sqlite",
+          "admitted": [
+            "sqlite"
+          ]
+        },
+        {
+          "checkpoint": "held",
+          "lastCommittedBackend": "sqlite",
+          "configBackend": "sqlite",
+          "admitted": []
+        },
+        {
+          "checkpoint": "activated",
+          "lastCommittedBackend": "postgresql",
+          "configBackend": "postgresql",
+          "admitted": [
+            "postgresql"
+          ],
+          "boundProjects": 1
+        },
+        {
+          "checkpoint": "rollback-interrupted",
+          "lastCommittedBackend": "postgresql",
+          "configBackend": "postgresql",
+          "admitted": []
+        }
+      ],
+      "invariants": {
+        "I1": "required",
+        "I2": "required",
+        "I3": "na:no acknowledged hook input in this row; covered by F5/F6",
+        "I4": "required",
+        "I5": "na:no unreachable-target step in this row; disclosure scan still runs on every step",
+        "I6": "required"
+      }
+    },
+    {
+      "profiles": [
+        "full"
+      ],
+      "timeoutMs": 900000,
+      "supportingTests": [
+        "test/postgresql/migration-cutover-set-prepare.integration.ts",
+        "test/postgresql/migration-cutover-set-activation.integration.ts",
+        "test/postgresql/migration-cutover-set-rollback.integration.ts"
+      ],
+      "injections": [],
+      "knownLimits": [],
+      "id": "S1",
+      "title": "Two-project set: plan, previews, apply, verify, activate, grant swap, report and a clean whole-set rollback to both pre-activation states",
+      "fixture": "M",
+      "requirement": "Multi-project installation; whole-set pre-write rollback (the post-write set rollback is S3)",
+      "steps": [
+        {
+          "id": "set-plan",
+          "use": "set-plan"
+        },
+        {
+          "id": "set-apply-dry-run",
+          "use": "set-apply-dry-run"
+        },
+        {
+          "id": "set-apply",
+          "use": "set-apply"
+        },
+        {
+          "id": "set-report-prepared",
+          "use": "set-report",
+          "manifestPhase": "verified",
+          "next": "activate --set",
+          "evidence": {
+            "activationRecords": "absent",
+            "setState": "prepared"
+          }
+        },
+        {
+          "id": "set-verify",
+          "use": "set-verify"
+        },
+        {
+          "id": "set-resume-dry-run",
+          "use": "set-resume-dry-run",
+          "next": "activate --set",
+          "applied": false
+        },
+        {
+          "id": "set-activate-dry-run",
+          "use": "set-activate-dry-run"
+        },
+        {
+          "id": "set-activate",
+          "use": "set-activate"
+        },
+        {
+          "id": "set-report-active",
+          "use": "set-report",
+          "manifestPhase": "active",
+          "next": null,
+          "restartAnswer": "satisfied",
+          "evidence": {
+            "activationRecords": "present",
+            "setState": "settled-activated"
+          }
+        },
+        {
+          "id": "set-rollback-dry-run",
+          "use": "set-rollback-dry-run"
+        },
+        {
+          "id": "set-rollback",
+          "use": "set-rollback",
+          "evidence": {
+            "memberCount": 2,
+            "selectedBackend": "sqlite",
+            "member.0.mode": "pre-write",
+            "member.1.mode": "pre-write"
+          }
+        },
+        {
+          "id": "set-report-rolled-back",
+          "use": "set-report",
+          "manifestPhase": "rolled-back",
+          "next": null,
+          "restartAnswer": "satisfied",
+          "evidence": {
+            "rollbackRecords": "present",
+            "setState": "settled-rolled-back"
+          }
+        },
+        {
+          "id": "set-rollback-repeat",
+          "use": "set-rollback",
+          "applied": false
+        }
+      ],
+      "authority": [
+        {
+          "checkpoint": "before-apply",
+          "lastCommittedBackend": "sqlite",
+          "admitted": [
+            "sqlite"
+          ],
+          "configBackend": "sqlite",
+          "boundProjects": 0
+        },
+        {
+          "checkpoint": "held",
+          "lastCommittedBackend": "sqlite",
+          "admitted": [],
+          "configBackend": "sqlite"
+        },
+        {
+          "checkpoint": "activated",
+          "lastCommittedBackend": "postgresql",
+          "admitted": [
+            "postgresql"
+          ],
+          "configBackend": "postgresql",
+          "boundProjects": 2
+        },
+        {
+          "checkpoint": "rolled-back",
+          "lastCommittedBackend": "sqlite",
+          "admitted": [
+            "sqlite"
+          ],
+          "configBackend": "sqlite",
+          "boundProjects": 0
+        }
+      ],
+      "invariants": {
+        "I1": "required",
+        "I2": "required",
+        "I3": "required",
+        "I4": "required",
+        "I5": "na:no unreachable-target step in this row; disclosure scan still runs on every step",
+        "I6": "required"
+      }
+    },
+    {
+      "profiles": [
+        "full"
+      ],
+      "timeoutMs": 900000,
+      "supportingTests": [
+        "test/postgresql/migration-cutover-set-prepare.integration.ts",
+        "test/postgresql/migration-cutover-set-activation.integration.ts",
+        "test/postgresql/migration-cutover-set-rollback.integration.ts"
+      ],
+      "injections": [],
+      "knownLimits": [],
+      "id": "S2",
+      "title": "Set preparation interrupted while the second member copies; the public resume completes it and one whole-set abort restores SQLite",
+      "fixture": "M",
+      "requirement": "Multi-project installation; interrupted preparation",
+      "steps": [
+        {
+          "id": "set-plan",
+          "use": "set-plan"
+        },
+        {
+          "id": "set-report-partial",
+          "use": "set-report",
+          "next": "resume --set",
+          "evidence": {
+            "activationRecords": "absent",
+            "setState": "prepare"
+          }
+        },
+        {
+          "id": "set-resume",
+          "use": "set-resume",
+          "manifestPhase": "verified"
+        },
+        {
+          "id": "set-report-prepared",
+          "use": "set-report",
+          "manifestPhase": "verified",
+          "next": "activate --set",
+          "evidence": {
+            "activationRecords": "absent",
+            "setState": "prepared"
+          }
+        },
+        {
+          "id": "set-verify",
+          "use": "set-verify"
+        },
+        {
+          "id": "set-abort-dry-run",
+          "use": "set-abort-dry-run"
+        },
+        {
+          "id": "set-abort",
+          "use": "set-abort"
+        },
+        {
+          "id": "set-abort-repeat",
+          "use": "set-abort",
+          "manifestPhase": "aborted",
+          "next": null,
+          "applied": false
+        }
+      ],
+      "authority": [
+        {
+          "checkpoint": "before-apply",
+          "lastCommittedBackend": "sqlite",
+          "admitted": [
+            "sqlite"
+          ],
+          "configBackend": "sqlite",
+          "boundProjects": 0
+        },
+        {
+          "checkpoint": "held",
+          "lastCommittedBackend": "sqlite",
+          "admitted": [],
+          "configBackend": "sqlite"
+        },
+        {
+          "checkpoint": "aborted",
+          "lastCommittedBackend": "sqlite",
+          "admitted": [
+            "sqlite"
+          ],
+          "configBackend": "sqlite",
+          "boundProjects": 0
+        }
+      ],
+      "invariants": {
+        "I1": "required",
+        "I2": "required",
+        "I3": "required",
+        "I4": "required",
+        "I5": "na:no unreachable-target step in this row; disclosure scan still runs on every step",
+        "I6": "required"
+      },
+      "notes": "Attribution of a post-readback abort error is the known diagnostic limit https://github.com/donadiosolutions/lcm/issues/1657; this row asserts a successful whole-set abort only."
+    },
+    {
+      "profiles": [
+        "full"
+      ],
+      "timeoutMs": 900000,
+      "supportingTests": [
+        "test/postgresql/migration-cutover-set-prepare.integration.ts",
+        "test/postgresql/migration-cutover-set-activation.integration.ts",
+        "test/postgresql/migration-cutover-set-rollback.integration.ts"
+      ],
+      "injections": [],
+      "knownLimits": [],
+      "id": "S3",
+      "title": "Set activation and set rollback interrupted at their named boundaries on one home; the public resume completes each without a mixed selection",
+      "fixture": "M",
+      "requirement": "Multi-project installation; interrupted set activation and rollback",
+      "steps": [
+        {
+          "id": "set-plan",
+          "use": "set-plan"
+        },
+        {
+          "id": "set-apply-dry-run",
+          "use": "set-apply-dry-run"
+        },
+        {
+          "id": "set-apply",
+          "use": "set-apply"
+        },
+        {
+          "id": "set-report-prepared",
+          "use": "set-report",
+          "manifestPhase": "verified",
+          "next": "activate --set",
+          "evidence": {
+            "activationRecords": "absent",
+            "setState": "prepared"
+          }
+        },
+        {
+          "id": "set-verify",
+          "use": "set-verify"
+        },
+        {
+          "id": "set-report-activation-interrupted",
+          "use": "set-report",
+          "next": "resume --set",
+          "evidence": {
+            "activationRecords": "present"
+          }
+        },
+        {
+          "id": "set-resume-activation",
+          "use": "set-resume",
+          "applied": true,
+          "manifestPhase": "active",
+          "next": "swap-grants-then-start-daemon",
+          "restartAnswer": "satisfied",
+          "evidence": {
+            "memberCount": 2,
+            "selectedBackend": "postgresql",
+            "setState": "settled-activated"
+          }
+        },
+        {
+          "id": "set-report-active",
+          "use": "set-report",
+          "manifestPhase": "active",
+          "next": null,
+          "restartAnswer": "satisfied",
+          "evidence": {
+            "activationRecords": "present",
+            "setState": "settled-activated"
+          }
+        },
+        {
+          "id": "set-report-rollback-interrupted",
+          "use": "set-report",
+          "next": "resume --set",
+          "evidence": {
+            "rollbackRecords": "present"
+          }
+        },
+        {
+          "id": "set-resume-rollback",
+          "use": "set-resume",
+          "applied": true,
+          "manifestPhase": "rolled-back",
+          "next": "report --set",
+          "restartAnswer": "satisfied",
+          "evidence": {
+            "memberCount": 2,
+            "selectedBackend": "sqlite"
+          }
+        },
+        {
+          "id": "set-report-rolled-back",
+          "use": "set-report",
+          "manifestPhase": "rolled-back",
+          "next": null,
+          "restartAnswer": "satisfied",
+          "evidence": {
+            "rollbackRecords": "present",
+            "setState": "settled-rolled-back"
+          }
+        },
+        {
+          "id": "set-rollback-repeat",
+          "use": "set-rollback",
+          "applied": false
+        }
+      ],
+      "authority": [
+        {
+          "checkpoint": "before-apply",
+          "lastCommittedBackend": "sqlite",
+          "admitted": [
+            "sqlite"
+          ],
+          "configBackend": "sqlite",
+          "boundProjects": 0
+        },
+        {
+          "checkpoint": "held",
+          "lastCommittedBackend": "sqlite",
+          "admitted": [],
+          "configBackend": "sqlite"
+        },
+        {
+          "checkpoint": "activation-after-link",
+          "lastCommittedBackend": "sqlite",
+          "admitted": [],
+          "configBackend": "sqlite",
+          "boundProjects": 0
+        },
+        {
+          "checkpoint": "activation-selection-completed",
+          "lastCommittedBackend": "postgresql",
+          "admitted": [
+            "postgresql"
+          ],
+          "configBackend": "sqlite",
+          "boundProjects": 0
+        },
+        {
+          "checkpoint": "activation-map-published",
+          "lastCommittedBackend": "sqlite",
+          "admitted": [],
+          "configBackend": "sqlite",
+          "boundProjects": 2
+        },
+        {
+          "checkpoint": "activation-first-member-active",
+          "lastCommittedBackend": "postgresql",
+          "admitted": [
+            "postgresql"
+          ],
+          "configBackend": "postgresql",
+          "boundProjects": 2
+        },
+        {
+          "checkpoint": "activated",
+          "lastCommittedBackend": "postgresql",
+          "admitted": [
+            "postgresql"
+          ],
+          "configBackend": "postgresql",
+          "boundProjects": 2
+        },
+        {
+          "checkpoint": "rollback-first-install-record",
+          "lastCommittedBackend": "postgresql",
+          "admitted": [],
+          "configBackend": "postgresql",
+          "boundProjects": 2
+        },
+        {
+          "checkpoint": "rollback-map-published",
+          "lastCommittedBackend": "postgresql",
+          "admitted": [],
+          "configBackend": "postgresql",
+          "boundProjects": 0
+        },
+        {
+          "checkpoint": "rollback-first-member-complete",
+          "lastCommittedBackend": "sqlite",
+          "admitted": [
+            "sqlite"
+          ],
+          "configBackend": "sqlite",
+          "boundProjects": 0
+        },
+        {
+          "checkpoint": "rolled-back",
+          "lastCommittedBackend": "sqlite",
+          "admitted": [
+            "sqlite"
+          ],
+          "configBackend": "sqlite",
+          "boundProjects": 0
+        }
+      ],
+      "invariants": {
+        "I1": "required",
+        "I2": "required",
+        "I3": "required",
+        "I4": "required",
+        "I5": "na:no unreachable-target step in this row; disclosure scan still runs on every step",
+        "I6": "required"
+      },
+      "notes": "The partial member rollback checkpoint limitation https://github.com/donadiosolutions/lcm/issues/1667 and the unreachable branch https://github.com/donadiosolutions/lcm/issues/1669 are not exercised. The set settles on the documented aggregate records only. At selection-completed the consumer admission already names PostgreSQL (the journal carries the frozen selection) while the config and map still name SQLite; admission never names two backends at any checkpoint."
+    },
+    {
+      "profiles": [
+        "full"
+      ],
+      "timeoutMs": 900000,
+      "supportingTests": [
+        "test/postgresql/migration-cutover-set-prepare.integration.ts",
+        "test/postgresql/migration-cutover-set-activation.integration.ts",
+        "test/postgresql/migration-cutover-set-rollback.integration.ts"
+      ],
+      "injections": [],
+      "knownLimits": [],
+      "id": "S4",
+      "title": "One member destination drifts after verification: set activation is refused with SQLite authority, then the whole set aborts",
+      "fixture": "M",
+      "requirement": "Multi-project installation; member verification drift",
+      "steps": [
+        {
+          "id": "set-plan",
+          "use": "set-plan"
+        },
+        {
+          "id": "set-apply-dry-run",
+          "use": "set-apply-dry-run"
+        },
+        {
+          "id": "set-apply",
+          "use": "set-apply"
+        },
+        {
+          "id": "set-report-prepared",
+          "use": "set-report",
+          "manifestPhase": "verified",
+          "next": "activate --set",
+          "evidence": {
+            "activationRecords": "absent",
+            "setState": "prepared"
+          }
+        },
+        {
+          "id": "set-verify",
+          "use": "set-verify"
+        },
+        {
+          "id": "set-activate-drifted",
+          "use": "set-activate",
+          "exit": 2,
+          "outcome": "refused-precondition",
+          "reason": "set-refused-precondition",
+          "applied": false,
+          "next": null,
+          "evidence": {
+            "serviceReason": "cutover-set-member-evidence-stale",
+            "serviceStep": "S8",
+            "failure.0.reason": "cutover-set-member-evidence-stale"
+          },
+          "manifestPhase": null,
+          "restartAnswer": null
+        },
+        {
+          "id": "set-report-prepared-drifted",
+          "use": "set-report",
+          "manifestPhase": "verified",
+          "next": "activate --set",
+          "evidence": {
+            "activationRecords": "absent",
+            "setState": "prepared"
+          }
+        },
+        {
+          "id": "set-abort",
+          "use": "set-abort"
+        }
+      ],
+      "authority": [
+        {
+          "checkpoint": "before-apply",
+          "lastCommittedBackend": "sqlite",
+          "admitted": [
+            "sqlite"
+          ],
+          "configBackend": "sqlite",
+          "boundProjects": 0
+        },
+        {
+          "checkpoint": "held",
+          "lastCommittedBackend": "sqlite",
+          "admitted": [],
+          "configBackend": "sqlite"
+        },
+        {
+          "checkpoint": "aborted",
+          "lastCommittedBackend": "sqlite",
+          "admitted": [
+            "sqlite"
+          ],
+          "configBackend": "sqlite",
+          "boundProjects": 0
+        }
+      ],
+      "invariants": {
+        "I1": "required",
+        "I2": "required",
+        "I3": "required",
+        "I4": "required",
+        "I5": "na:no unreachable-target step in this row; disclosure scan still runs on every step",
+        "I6": "required"
+      }
+    },
+    {
+      "profiles": [
+        "full"
+      ],
+      "timeoutMs": 900000,
+      "supportingTests": [
+        "test/postgresql/migration-cutover-set-prepare.integration.ts",
+        "test/postgresql/migration-cutover-set-activation.integration.ts",
+        "test/postgresql/migration-cutover-set-rollback.integration.ts"
+      ],
+      "injections": [],
+      "knownLimits": [],
+      "id": "S4b",
+      "title": "One member install fails during set rollback: PostgreSQL stays authoritative and fenced, and the public retry completes the set",
+      "fixture": "M",
+      "requirement": "Multi-project installation; member failure during rollback",
+      "steps": [
+        {
+          "id": "set-plan",
+          "use": "set-plan"
+        },
+        {
+          "id": "set-apply-dry-run",
+          "use": "set-apply-dry-run"
+        },
+        {
+          "id": "set-apply",
+          "use": "set-apply"
+        },
+        {
+          "id": "set-report-prepared",
+          "use": "set-report",
+          "manifestPhase": "verified",
+          "next": "activate --set",
+          "evidence": {
+            "activationRecords": "absent",
+            "setState": "prepared"
+          }
+        },
+        {
+          "id": "set-verify",
+          "use": "set-verify"
+        },
+        {
+          "id": "set-activate",
+          "use": "set-activate"
+        },
+        {
+          "id": "set-report-rollback-blocked",
+          "use": "set-report",
+          "manifestPhase": "rolling-back",
+          "next": "resume --set",
+          "evidence": {
+            "rollbackRecords": "present",
+            "setState": "rollback"
+          }
+        },
+        {
+          "id": "set-rollback",
+          "use": "set-rollback"
+        },
+        {
+          "id": "set-report-rolled-back",
+          "use": "set-report",
+          "manifestPhase": "rolled-back",
+          "next": null,
+          "restartAnswer": "satisfied",
+          "evidence": {
+            "rollbackRecords": "present",
+            "setState": "settled-rolled-back"
+          }
+        }
+      ],
+      "authority": [
+        {
+          "checkpoint": "before-apply",
+          "lastCommittedBackend": "sqlite",
+          "admitted": [
+            "sqlite"
+          ],
+          "configBackend": "sqlite",
+          "boundProjects": 0
+        },
+        {
+          "checkpoint": "held",
+          "lastCommittedBackend": "sqlite",
+          "admitted": [],
+          "configBackend": "sqlite"
+        },
+        {
+          "checkpoint": "activated",
+          "lastCommittedBackend": "postgresql",
+          "admitted": [
+            "postgresql"
+          ],
+          "configBackend": "postgresql",
+          "boundProjects": 2
+        },
+        {
+          "checkpoint": "rollback-blocked",
+          "lastCommittedBackend": "postgresql",
+          "admitted": [],
+          "configBackend": "postgresql",
+          "boundProjects": 2
+        },
+        {
+          "checkpoint": "rolled-back",
+          "lastCommittedBackend": "sqlite",
+          "admitted": [
+            "sqlite"
+          ],
+          "configBackend": "sqlite",
+          "boundProjects": 0
+        }
+      ],
+      "invariants": {
+        "I1": "required",
+        "I2": "required",
+        "I3": "required",
+        "I4": "required",
+        "I5": "na:no unreachable-target step in this row; disclosure scan still runs on every step",
+        "I6": "required"
+      }
+    },
+    {
+      "profiles": [
+        "full"
+      ],
+      "timeoutMs": 300000,
+      "supportingTests": [
+        "test/postgresql/rollback-session.integration.ts"
+      ],
+      "injections": [],
+      "knownLimits": [],
+      "id": "I5",
+      "title": "Selected PostgreSQL unreachable: operator commands fail explicitly, SQLite is neither written nor silently selected, and recovery after the permission returns",
+      "fixture": "P",
+      "requirement": "No silent fallback after selection",
+      "steps": [
+        {
+          "id": "plan",
+          "use": "plan"
+        },
+        {
+          "id": "dry-run",
+          "use": "dry-run"
+        },
+        {
+          "id": "apply",
+          "use": "apply"
+        },
+        {
+          "id": "report-copied",
+          "use": "report-copied"
+        },
+        {
+          "id": "verify",
+          "use": "verify"
+        },
+        {
+          "id": "verify-repeat",
+          "use": "verify-repeat"
+        },
+        {
+          "id": "activate",
+          "use": "activate"
+        },
+        {
+          "id": "activate-repeat",
+          "use": "activate-repeat"
+        },
+        {
+          "id": "report-active",
+          "use": "report-active"
+        },
+        {
+          "id": "report-unreachable",
+          "use": "report-active",
+          "evidence": {
+            "cell": 10
+          }
+        },
+        {
+          "id": "report-active-restored",
+          "use": "report-active"
+        }
+      ],
+      "authority": [
+        {
+          "checkpoint": "before-apply",
+          "lastCommittedBackend": "sqlite",
+          "configBackend": "sqlite",
+          "admitted": [
+            "sqlite"
+          ]
+        },
+        {
+          "checkpoint": "held",
+          "lastCommittedBackend": "sqlite",
+          "configBackend": "sqlite",
+          "admitted": []
+        },
+        {
+          "checkpoint": "activated",
+          "lastCommittedBackend": "postgresql",
+          "configBackend": "postgresql",
+          "admitted": [
+            "postgresql"
+          ],
+          "boundProjects": 1
+        }
+      ],
+      "invariants": {
+        "I1": "required",
+        "I2": "required",
+        "I3": "na:no acknowledged hook input in this row; covered by F5/F6",
+        "I4": "required",
+        "I5": "required",
+        "I6": "required"
+      },
+      "notes": "With only this row's owned role permission revoked (proved with has_schema_privilege and has_table_privilege), the product's backend diagnostic (lcm stats --pool --json) classifies the selected PostgreSQL as permission-denied and the daemon refuses to start by exiting on its own: explicit failure, no SQLite fallback. 'migration report' reads durable local evidence and does not probe the target, so it still reports the active selection. The row also asserts unchanged SQLite bytes, no new project database, PostgreSQL authority and recovery once the permission returns."
+    }
+  ]
+}

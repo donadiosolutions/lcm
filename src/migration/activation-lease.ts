@@ -368,6 +368,13 @@ export async function acquireActivationLease(
             + "not confirm it",
         };
       }
+      if (error.reason === "invalid-row") {
+        return {
+          status: "unresolvable",
+          detail: "the fenced-lease row for project " + input.projectId + " is corrupt or ambiguous and cannot be "
+            + "attributed to any publication generation",
+        };
+      }
     }
     throw error;
   }
@@ -587,6 +594,13 @@ export async function takeoverActivationLease(
           status: "unresolvable",
           detail: `the takeover commit outcome for project ${input.projectId} is ambiguous and readback did `
             + "not confirm it",
+        };
+      }
+      if (error.reason === "invalid-row") {
+        return {
+          status: "unresolvable",
+          detail: "the fenced-lease row for project " + input.projectId + " is corrupt or ambiguous and cannot be "
+            + "attributed to any publication generation",
         };
       }
     }
