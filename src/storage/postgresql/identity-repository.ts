@@ -579,6 +579,15 @@ export class PostgreSqlIdentityRepository {
    * written, when the project holds any alias outside the set (another
    * machine, another path) or any requested alias is owned by another project
    * or stored under a different path or normalized path.
+   *
+   * The transaction first takes a SHARE ROW EXCLUSIVE lock on
+   * `lcm.project_aliases`: it blocks every concurrent alias insert, update
+   * and delete (including a new unrelated alias of this project, which a row
+   * lock cannot see) until commit. The runtime role cannot lock the
+   * `lcm.projects` row (no UPDATE privilege), and DELETE is enough for LOCK
+   * TABLE. After writing, the project's rows are read again and anything but
+   * exactly the requested set throws, so the inserts roll back; a `null`
+   * return after a write would commit them.
    */
   async ensureProjectAliases(input: {
     readonly machineId: string;
@@ -586,6 +595,9 @@ export class PostgreSqlIdentityRepository {
     readonly aliases: readonly RemoteProjectAliasInput[];
   }): Promise<{ readonly inserted: number } | null> {
     return this.executor.transaction(async (transaction) => {
+      await transaction.query({
+        text: "LOCK TABLE lcm.project_aliases IN SHARE ROW EXCLUSIVE MODE",
+      }, projectScopeOptions("ensureProjectAliases", [input.projectId]));
       const current = await transaction.query<AliasRow>({
         text: `SELECT project_id, machine_id, path, normalized_path, linked_at
                FROM lcm.project_aliases
@@ -616,6 +628,27 @@ export class PostgreSqlIdentityRepository {
           ...alias,
         });
         inserted += 1;
+      }
+      if (inserted > 0) {
+        const final = await transaction.query<AliasRow>({
+          text: `SELECT project_id, machine_id, path, normalized_path, linked_at
+                 FROM lcm.project_aliases
+                 WHERE project_id = $1`,
+          values: [input.projectId],
+        }, projectScopeOptions("ensureProjectAliases", [input.projectId]));
+        const exact = final.rows.length === input.aliases.length && final.rows.every((row) => {
+          const alias = row.machine_id === input.machineId ? wanted.get(row.normalized_path) : undefined;
+          return alias !== undefined && alias.path === row.path;
+        });
+        if (!exact) {
+          // Thrown, never returned: a return would commit the inserts above.
+          throw new PostgreSqlIdentityConflictError(
+            input.machineId,
+            input.aliases[0]!.normalizedPath,
+            input.projectId,
+            input.projectId,
+          );
+        }
       }
       return { inserted };
     }, projectScopeOptions("ensureProjectAliases", [input.projectId]));

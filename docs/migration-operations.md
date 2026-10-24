@@ -185,6 +185,8 @@ destination project holds an alias the map does not list. Fix the map (`lcm proj
 `lcm project unlink`) or the conflicting destination rows, then run `plan` and `apply` again. A generation
 that an earlier version already held and failed in the copy stays on `resume`, which never
 creates identity; run `abort`, then a fresh `plan` and `apply`, which adds the missing aliases.
+Rollback leaves the destination project and its alias rows in place and keeps the aliases in the
+local map.
 
 `--dry-run` stops immediately after the confirmation fence, before the hold is taken or anything is
 captured. The emitted envelope reports the confirmed candidate with `applied: false`.
