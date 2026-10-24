@@ -443,8 +443,8 @@ function passiveEventDispositionCompatible(
  * pending, retrying, claimed or quarantined. Such a row absent from the archive is preserved untouched and
  * counted. A row absent from the archive that claims either marker contradicts the archive (a delivered event
  * PostgreSQL does not hold) and refuses, unless its remote_pruned_at is set (#1698): the replication worker records
- * that only after the remote applied readback and the deletion of the remote inbox row, so such a delivered and
- * pruned row is the normal steady state after a drain. It is accepted untouched and not counted as pending. Its
+ * that once the remote inbox row is gone (its delete succeeded, or a readback found the row missing because an
+ * earlier delete had committed), so such a delivered and pruned row is the normal steady state after a drain. It is accepted untouched and not counted as pending. Its
  * processed_at is left as it is: the daemon's remote apply does nothing (the event's effect is its local promotion),
  * so an unprocessed pruned row is still replayed by the SQLite consumer.
  *
@@ -511,8 +511,8 @@ export function verifyPassiveEventsAgainstArchive(
     .filter((stored) => !archivedEventIds.has(stored.event_uuid));
   let preservedPending = 0;
   for (const stored of others) {
-    // A recorded remote prune means the delivery completed and PostgreSQL's inbox row was deleted afterwards (#1698):
-    // the drained steady state, so the archive legitimately lacks it. The schema's CHECK ties remote_pruned_at to an
+    // A recorded remote prune means the worker found PostgreSQL's inbox row gone, by its own delete or a readback
+    // proving an earlier one (#1698): the drained steady state, so the archive legitimately lacks it. The schema's CHECK ties remote_pruned_at to an
     // acknowledged state with a remote_inbox_id, so the marker alone decides.
     if (stored.remote_pruned_at !== null) continue;
     if (stored.remote_inbox_id !== null) {
