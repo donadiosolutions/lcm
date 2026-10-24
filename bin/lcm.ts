@@ -64,6 +64,7 @@ import {
   projectsDir as lcmProjectsDir,
 } from "../src/runtime-paths.js";
 import type { ProgressState } from "../src/cli/progress-state.js";
+import { writeHookOutput } from "../src/cli/hook-output.js";
 import { CliProjectStorageMissingError } from "../src/cli-storage.js";
 import { StorageIdentityConfigurationError, TransportedUnboundProjectError, UNBOUND_POSTGRESQL_PROJECT_MESSAGE } from "../src/storage/identity-context.js";
 import { MachineIdentityFileError } from "../src/machine-identity.js";
@@ -3332,7 +3333,7 @@ export async function runCli(
       }
       const input = withHookOverrides(await readStdin(), opts.client, reasoningEffort, requestPolicy, fastMode);
       const r = await dispatchHook("compact", input);
-      if (r.stdout) stdout.write(r.stdout);
+      await writeHookOutput(stdout, r.stdout);
       exit(r.exitCode);
     });
 
@@ -3350,7 +3351,7 @@ export async function runCli(
       }
       const input = withHookClient(await readStdin(), opts.client);
       const r = await dispatchObservedHook("restore", input, opts.client);
-      if (r.stdout) stdout.write(r.stdout);
+      await writeHookOutput(stdout, r.stdout);
       exit(r.exitCode);
     });
 
@@ -3369,7 +3370,7 @@ export async function runCli(
       const { dispatchHook } = await import("../src/hooks/dispatch.js");
       const input = withHookClient(await readStdin(), opts.client);
       const r = await dispatchHook("session-end", input);
-      if (r.stdout) stdout.write(r.stdout);
+      await writeHookOutput(stdout, r.stdout);
       exit(r.exitCode);
     });
 
@@ -3388,7 +3389,7 @@ export async function runCli(
       }
       const input = withHookClient(await readStdin(), opts.client);
       const r = await dispatchObservedHook("user-prompt", input, opts.client, { transport: opts.transport });
-      if (r.stdout) stdout.write(r.stdout);
+      await writeHookOutput(stdout, r.stdout);
       exit(r.exitCode);
     });
 
@@ -3406,7 +3407,7 @@ export async function runCli(
       }
       const input = withHookClient(await readStdin(), opts.client);
       const r = await dispatchObservedHook("post-tool", input, opts.client);
-      if (r.stdout) stdout.write(r.stdout);
+      await writeHookOutput(stdout, r.stdout);
       exit(r.exitCode);
     });
 
@@ -3424,7 +3425,7 @@ export async function runCli(
       }
       const input = withHookClient(await readStdin(), opts.client);
       const r = await dispatchObservedHook("pre-tool", input, opts.client);
-      if (r.stdout) stdout.write(r.stdout);
+      await writeHookOutput(stdout, r.stdout);
       exit(r.exitCode);
     });
 
@@ -3454,7 +3455,7 @@ export async function runCli(
       }
       const input = withHookClient(await readStdin(), opts.client);
       const r = await dispatchObservedHook("session-snapshot", input, opts.client);
-      if (r.stdout) stdout.write(r.stdout);
+      await writeHookOutput(stdout, r.stdout);
       exit(r.exitCode);
     });
 
