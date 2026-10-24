@@ -311,6 +311,10 @@ function classifyEntry(ctx: Context): Entry {
   if (journal.cutoverSet === undefined) {
     throw new Refused("cutover-set-single-generation-held", { evidence: journal.generationId });
   }
+  // #1550 (C4): a postgresql-origin set hold is a rollback in progress, never forward preparation to resume.
+  if (journal.sourceBackend !== "sqlite") {
+    throw new Refused("cutover-set-rollback-held", { evidence: journal.generationId });
+  }
   return { kind: "set", journal };
 }
 

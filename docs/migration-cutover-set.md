@@ -5,12 +5,12 @@ more than one project. One maintenance hold covers the whole set, and every
 project in it is captured under that hold. This page defines the set, the
 refusals that keep it all-or-nothing, and how a capture is bound to it.
 
-> **Status.** This page describes the contract and the preparation and
-> activation services behind it. No `lcm migration` command enters, prepares
-> or activates a set yet: the operator commands to prepare, activate and roll
-> back a set arrive with later children of the multi-project cutover epic
-> (#1544). Until then, the single-generation activation and rollback commands
-> keep their single-project refusals (`uncovered-projects`,
+> **Status.** This page describes the contract and the preparation,
+> activation and rollback services behind it. No `lcm migration` command
+> enters, prepares, activates or rolls back a set yet: the operator commands
+> arrive with a later child of the multi-project cutover epic (#1544). Until
+> then, the single-generation activation and rollback commands keep their
+> single-project refusals (`uncovered-projects`,
 > `multiple-remote-projects`), a member of a held set cannot be activated
 > through them, and a machine with data for one project behaves exactly as
 > described in [Reversible migration and cutover journal](migration-cutover.md).
@@ -308,9 +308,135 @@ own active manifest and its activation report must name this set's
 publication, artifact and witness. A bare index, a report-only member and an
 aborted set publication refuse.
 
+A rollback commitment is the one exception to both the report-derived
+activation success above and this admission: once a set rollback has written
+its checkpoint (see below), the activation records of that set, the member's
+active manifest and its activation report no longer admit anything, whether
+or not the activation publication is still in the live slot, and
+`activateCutoverSet` refuses the set (`cutover-set-rollback-committed`)
+instead of adopting, re-driving or reporting it. Replay then follows the
+rollback rules in [Replay across a set rollback](#replay-across-a-set-rollback).
+
+## Rolling a set back
+
+Rolling an activated set back restores every member to a **new** SQLite
+generation under one PostgreSQL-origin hold and publishes the complete home
+back to SQLite once. The rollback service (`rollbackCutoverSet`) takes the
+original activated set id; no `lcm migration` command reaches it until the
+operator commands of #1551, and no release metadata changes here. The
+single-generation rollback keeps its own behavior (including its no-copy
+pre-write reversal) and its refusal of a member of a held set.
+
+### What is admitted
+
+| Durable state | Route |
+| --- | --- |
+| The set's completed activation publication (target PostgreSQL) is live, every member is active, or activating with the set's pending publish-activation | eligible: the pending activation bookkeeping is settled first, then the rollback commits |
+| The activation is held, prepared, frozen but not published, or its publication is not completed | refused (`activation-not-completed`); resume or abort the activation first |
+| The slot is empty or holds another publication or hold, and no rollback record exists | refused (`activation-not-live` / `maintenance-held-by-other`) |
+| A member is not an authenticated active member (manifest, link, frozen epoch/attempt/witness, preserved snapshot, project map binding) | refused before anything moves, naming the member |
+| PostgreSQL is unreachable, or a member's live destination identity differs from its activation epoch | refused (`target-unreachable` / `target-identity-drift`) |
+
+A completed, authenticated activation whose later target health check failed
+(`post-publication-unhealthy`) stays eligible: the record proves the
+selection, not daemon health. The rollback still needs reachable PostgreSQL,
+one fenced lease per member and a fresh identity, schema, delta and census
+readback for every member; an unavailable destination blocks the whole set
+and preserves everything. There is no offline restoration.
+
+### Commitment, hold, one new generation per member
+
+Under one retained append barrier the service revalidates every member,
+settles any pending activation bookkeeping from the completed publication,
+composes and seals the reverse publication material (every member unbound,
+SQLite selected) and writes the **rollback checkpoint**, keyed by the
+original set id: the rollback hold manifest (the original members under the
+derived rollback set id), the activation records it unwinds, the reverse
+artifact identity and, per member, its preserved snapshot, forward held
+binding, activation epoch, attempt and witness, settled head and lease
+evidence. From this record on the rollback is committed: every member's old
+activation evidence is fenced for replay, and later failures are blocked
+members or interruptions that keep the hold and the evidence.
+
+The hold is then entered from PostgreSQL under the rollback set id, each
+member's rollback cutoff is bound from its authenticated preserved snapshot
+(the forward held binding is authenticated separately against the activation
+checkpoint), one PostgreSQL runtime is opened and every member gets a fenced
+session on the same lease tuple the reverse coordinator will adopt, with one
+set-wide renewal keeper. Every member is classified independently from its own
+readback (pre-write: nothing was written after activation; post-write:
+something was) before any member effect; a refused member blocks the set.
+
+Each member then moves through prepare-rollback and gets a fresh physical
+SQLite candidate: a post-write member is exported from its fenced PostgreSQL
+snapshot, a pre-write member is rebuilt from its preserved snapshot (its
+source witness must be the member manifest's verified source). Every
+candidate is independently verified, then every member is revalidated under a
+new snapshot (unchanged mode; for post-write the export's delta and census
+reproduced), its rollback witness recorded and bound and its publish-rollback
+begun. Only then is each candidate installed at the member's canonical
+database path (the original is preserved read-only beside the candidate and
+named in the member's installation record), its sidecars materialized and its
+installation record written. The thin selection tuple (one row per member:
+mode, epoch, attempt, rollback witness and the installation record's digest)
+is frozen, the one selection is prepared and completed, each member's rollback
+binding is recorded under the shared rollback publication id, the sealed
+reverse material is compared with the live source and prepared, and the one
+publication is driven to completion. Each member's deterministic rollback
+report is stored and its publish-rollback completed; the result is
+`rolled-back` with every member's mode and installed generation.
+
+A blocked member (lease conflict, refused quiescence, an ineligible or drifted
+readback, a failed or quarantined build, a preserved source that is not the
+verified one, a failed install, an installed database that no longer matches
+its record, a cancelled call) blocks the whole set: the hold, the checkpoint,
+every preserved source, every verified or quarantined candidate and every
+record stay; calling again resumes. Leases are released only while no member
+manifest moved. There is no set rollback abort in #1550: the forward set
+abort refuses a PostgreSQL-origin hold (`journal-rollback-hold`), and so
+does the set preparation (`cutover-set-rollback-held`).
+
+### Crash recovery of a rollback
+
+| Interrupted at | Resume |
+| --- | --- |
+| Before the checkpoint | nothing moved; an orphan reverse artifact is reused byte-identically; PostgreSQL stays selected and old replay evidence is admitted |
+| After the checkpoint, before the hold | the activation publication is still live and PostgreSQL selected; old replay evidence is already fenced; the same hold is entered |
+| Entering the hold | the exact entering journal is completed before the barrier, then the hold resumes |
+| Held, between cutoffs, classification, prepare, build, revalidation or install | missing cutoffs are bound, every member is classified again, pending effects must reproduce their frozen input, candidates are rebuilt where no installation record exists (earlier candidates stay preserved, the first preempted original is never rewritten), recorded installations are authenticated and adopted |
+| After the frozen tuple, before or at the selection phases | the tuple and every installation are adopted, never rebuilt; a prepared selection is completed only once every member's readback still reproduces its frozen witness |
+| `selection-completed`, before or during the reverse publication | member bindings are repaired and the one publication is prepared (after proving the live source equals the sealed source) or resumed; a publication the coordinator left unsealed or aborted is settled first, then, because the abort restored PostgreSQL and released the fences, every member's fence is reacquired and its fresh readback must still reproduce its frozen witness before the sealed material is prepared again (a drifted member blocks with everything preserved) |
+| After the completed reverse publication | SQLite is selected and its consumers write the installed databases legitimately, so the installed bytes are no longer required (only the recorded installation and a present database at the canonical path); members settle from their own evidence; an already rolled-back member authenticates its report and installation record |
+| The rollback hold aborted, or gone before the selection was frozen | interrupted: nothing restarts automatically and nothing is deleted |
+| A later hold or publication replaced the completed reverse journal | with every member rolled back the rollback is reported from member evidence and the selected SQLite installation; otherwise it is interrupted and nothing is republished |
+
+After every row the effective home is complete-PostgreSQL, complete-SQLite or
+explicitly unresolved (the reverse publication in flight), never one project
+on each backend.
+
+### Replay across a set rollback
+
+A member's replay commitment is located from its own activation link to the
+rollback records; no store is scanned. From the checkpoint until the reverse
+publication completes every member refuses, whatever evidence it presents.
+Afterwards only the member's rollback witness (its row of the frozen tuple)
+is admitted, as SQLite: through the rollback's completed publication covering
+exactly the reverse artifact's projects, or, once a later publication or hold
+replaced that journal, through every member being rolled back with the
+rollback report of its frozen witness while the selected installation is
+SQLite with every member unbound. The old activation witness, a bare index
+whose commitment vanished, an aborted or in-flight reverse publication, a
+rolled-back set under a PostgreSQL configuration and a rebound member all
+refuse. The replay key is the original member generation id together with
+that member's frozen rollback witness, admitted only after the aggregate
+reverse publication or the later-slot proof holds; the new physical
+build id is installation evidence, not a replay key. Original member
+manifests settle to rolled-back and keep their history.
+
+
 ## Releasing a set hold
 
-A set hold is released, before its selection, with
+A forward (SQLite-origin) set hold is released, before its selection, with
 `lcm migration abort --confirm-generation <set id>`,
 with or without `--generation <set id>`. The confirmation is always the set
 id, never a member's generation id. The journal records the abort and keeps the
@@ -327,3 +453,7 @@ deleting activation evidence; resume the activation instead. The command reports
 or aborted with nothing pending, and a new preparation or single-generation
 apply is refused (`abort-or-resume-required`) while a member of an earlier set
 is not settled.
+
+A PostgreSQL-origin rollback hold is not released this way: #1550 ships no
+set rollback abort, and `lcm migration abort` refuses that hold with
+`journal-rollback-hold`. Call the rollback again to resume it.

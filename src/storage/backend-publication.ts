@@ -269,8 +269,56 @@ export type BackendCutoverSet = Readonly<{
   manifest: BackendCutoverSetManifest;
   bindings: readonly BackendCutoverSetBinding[];
   /** Present only while the journal is at selection-prepared or selection-completed. */
-  selection?: BackendCutoverSetSelection;
+  selection?: BackendCutoverSetAnySelection;
 }>;
+
+/** One member row of the thin reverse selection tuple a set rollback binds (#1550). */
+export type BackendCutoverSetRollbackSelectionMember = Readonly<{
+  physicalProjectId: string;
+  /** The ORIGINAL member generation; its new physical SQLite candidate lives in the rollback store record. */
+  generationId: string;
+  remoteProjectId: string;
+  mode: "pre-write" | "post-write";
+  epochId: string;
+  attemptId: string;
+  /** The member's rollback witness checksum: the evidence its replay presents. */
+  witnessChecksumSha256: string;
+  /** The checksum of the member's installation record in the rollback store. */
+  installEvidenceSha256: string;
+}>;
+
+/**
+ * The thin terminal tuple of a set rollback (#1550, plan-v2 C2): every member
+ * keyed by its ORIGINAL generation with its mode, rollback epoch, attempt and
+ * witness and a fixed-size reference to its installation record, plus the
+ * rollback hold, the original set and selection it unwinds, the rollback
+ * checkpoint and the reverse artifact identity. Direction is fixed:
+ * postgresql back to sqlite. Detailed build, install and sidecar evidence
+ * stays in the rollback store, so every manifest the activation capacity
+ * admits also fits this tuple.
+ */
+export type BackendCutoverSetRollbackSelection = Readonly<{
+  version: 1;
+  kind: "cutover-set-rollback-selection";
+  /** The rollback hold's set id (also its publication id). */
+  setId: string;
+  manifestSha256: string;
+  publicationId: string;
+  originalSetId: string;
+  /** The activation selection tuple's checksum, which names the activation checkpoint. */
+  originalSelectionSha256: string;
+  /** The rollback checkpoint's checksum. */
+  checkpointSha256: string;
+  /** The reverse artifact's identity digest. */
+  identityDigest: string;
+  sourceBackend: "postgresql";
+  targetBackend: "sqlite";
+  members: readonly BackendCutoverSetRollbackSelectionMember[];
+  checksumSha256: string;
+}>;
+
+/** Either selection tuple a set journal may carry at its selection phases; callers narrow on kind. */
+export type BackendCutoverSetAnySelection = BackendCutoverSetSelection | BackendCutoverSetRollbackSelection;
 
 /** The fields a capture validates for one generation of a maintenance hold. */
 export type BackendMaintenanceGenerationBinding = Readonly<{
@@ -323,7 +371,7 @@ export type PrepareBackendMaintenanceSelectionInput = Readonly<{
   targetBackend: StorageBackendName;
   terminalEvidenceSha256: string;
   /** Required for a cutover-set hold and refused for a single-generation one (#1549). */
-  cutoverSetSelection?: BackendCutoverSetSelection;
+  cutoverSetSelection?: BackendCutoverSetAnySelection;
 }>;
 
 export type AbortBackendMaintenanceInput = Readonly<{
@@ -1430,7 +1478,7 @@ export function parseBackendCutoverSet(value: unknown): BackendCutoverSet {
   const manifest = parseBackendCutoverSetManifest(value.manifest);
   const bindings = parseCutoverSetBindings(value.bindings, manifest);
   if (value.selection === undefined) return { manifest, bindings };
-  return { manifest, bindings, selection: parseBackendCutoverSetSelection(value.selection, manifest) };
+  return { manifest, bindings, selection: parseBackendCutoverSetAnySelection(value.selection, manifest) };
 }
 
 const SELECTION_MEMBER_KEYS = [
@@ -1533,6 +1581,121 @@ export function parseBackendCutoverSetSelection(
     return fail("malformed-journal", "backend cutover-set selection checksum does not match");
   }
   return selection;
+}
+
+const ROLLBACK_SELECTION_MEMBER_KEYS = [
+  "attemptId", "epochId", "generationId", "installEvidenceSha256", "mode", "physicalProjectId", "remoteProjectId",
+  "witnessChecksumSha256",
+] as const;
+const ROLLBACK_SELECTION_KEYS = [
+  "checkpointSha256", "checksumSha256", "identityDigest", "kind", "manifestSha256", "members", "originalSelectionSha256",
+  "originalSetId", "publicationId", "setId", "sourceBackend", "targetBackend", "version",
+] as const;
+
+/** The digest of a complete set rollback tuple over every field but its own checksum. */
+export function backendCutoverSetRollbackSelectionSha256(
+  selection: Omit<BackendCutoverSetRollbackSelection, "checksumSha256">,
+): string {
+  const { checksumSha256: _checksum, ...body } = selection as
+    Omit<BackendCutoverSetRollbackSelection, "checksumSha256"> & Partial<Pick<BackendCutoverSetRollbackSelection, "checksumSha256">>;
+  return backendPublicationCanonicalSha256({ domain: "cutover-set-rollback-selection", ...body });
+}
+
+/**
+ * Strictly parse a complete set rollback tuple against the rollback hold's
+ * manifest (#1550): every field present and well-formed, the members exactly
+ * the manifest's in manifest order with a closed mode, distinct remote
+ * projects, the set and publication identities those of the manifest, the
+ * original set another identifier than the hold's, the backends postgresql ->
+ * sqlite, and the domain-separated checksum reproduced.
+ */
+export function parseBackendCutoverSetRollbackSelection(
+  value: unknown,
+  manifest: BackendCutoverSetManifest,
+): BackendCutoverSetRollbackSelection {
+  if (
+    !isRecord(value)
+    || !exactKeys(value, ROLLBACK_SELECTION_KEYS)
+    || value.version !== 1
+    || value.kind !== "cutover-set-rollback-selection"
+    || !HASH_PATTERN.test(String(value.checkpointSha256))
+    || !HASH_PATTERN.test(String(value.checksumSha256))
+    || !HASH_PATTERN.test(String(value.identityDigest))
+    || !HASH_PATTERN.test(String(value.originalSelectionSha256))
+    || typeof value.originalSetId !== "string"
+    || !PUBLICATION_ID_PATTERN.test(value.originalSetId)
+    || value.originalSetId === manifest.setId
+    || value.setId !== manifest.setId
+    || value.manifestSha256 !== backendCutoverSetManifestSha256(manifest)
+    || value.publicationId !== manifest.setId
+    || value.sourceBackend !== "postgresql"
+    || value.targetBackend !== "sqlite"
+    || !Array.isArray(value.members)
+    || value.members.length !== manifest.members.length
+  ) {
+    return fail("malformed-journal", "backend cutover-set rollback selection is malformed");
+  }
+  const members = value.members.map((item, index): BackendCutoverSetRollbackSelectionMember => {
+    const expected = manifest.members[index]!;
+    if (
+      !isRecord(item)
+      || !exactKeys(item, ROLLBACK_SELECTION_MEMBER_KEYS)
+      || item.physicalProjectId !== expected.physicalProjectId
+      || item.generationId !== expected.generationId
+      || typeof item.remoteProjectId !== "string"
+      || !CANONICAL_UUID.test(item.remoteProjectId)
+      || (item.mode !== "pre-write" && item.mode !== "post-write")
+      || !HASH_PATTERN.test(String(item.epochId))
+      || !HASH_PATTERN.test(String(item.attemptId))
+      || !HASH_PATTERN.test(String(item.witnessChecksumSha256))
+      || !HASH_PATTERN.test(String(item.installEvidenceSha256))
+    ) {
+      return fail("malformed-journal", `backend cutover-set rollback selection member[${index}] is malformed`);
+    }
+    return {
+      physicalProjectId: item.physicalProjectId,
+      generationId: item.generationId,
+      remoteProjectId: item.remoteProjectId,
+      mode: item.mode,
+      epochId: item.epochId as string,
+      attemptId: item.attemptId as string,
+      witnessChecksumSha256: item.witnessChecksumSha256 as string,
+      installEvidenceSha256: item.installEvidenceSha256 as string,
+    };
+  });
+  if (new Set(members.map((member) => member.remoteProjectId)).size !== members.length) {
+    return fail("malformed-journal", "backend cutover-set rollback selection remote projects are not unique");
+  }
+  const selection: BackendCutoverSetRollbackSelection = {
+    version: 1,
+    kind: "cutover-set-rollback-selection",
+    setId: manifest.setId,
+    manifestSha256: value.manifestSha256 as string,
+    publicationId: manifest.setId,
+    originalSetId: value.originalSetId,
+    originalSelectionSha256: value.originalSelectionSha256 as string,
+    checkpointSha256: value.checkpointSha256 as string,
+    identityDigest: value.identityDigest as string,
+    sourceBackend: "postgresql",
+    targetBackend: "sqlite",
+    members,
+    checksumSha256: value.checksumSha256 as string,
+  };
+  if (backendCutoverSetRollbackSelectionSha256(selection) !== selection.checksumSha256) {
+    return fail("malformed-journal", "backend cutover-set rollback selection checksum does not match");
+  }
+  return selection;
+}
+
+/** Dispatch on the tuple's kind: the activation tuple keeps its exact parser; the rollback tuple has its own. */
+export function parseBackendCutoverSetAnySelection(
+  value: unknown,
+  manifest: BackendCutoverSetManifest,
+): BackendCutoverSetAnySelection {
+  if (isRecord(value) && value.kind === "cutover-set-rollback-selection") {
+    return parseBackendCutoverSetRollbackSelection(value, manifest);
+  }
+  return parseBackendCutoverSetSelection(value, manifest);
 }
 
 export function backendCutoverSetEntryRoster(manifest: BackendCutoverSetManifest): readonly BackendMaintenanceRosterEntry[] {
@@ -1646,6 +1809,92 @@ export function backendCutoverSetJournalCapacity(cutoverSet: BackendCutoverSet):
     terminalEvidenceSha256: hex,
     abortEvidenceSha256: null,
     cutoverSet: { manifest: cutoverSet.manifest, bindings, selection: backendCutoverSetSelectionWorstCase(cutoverSet.manifest) },
+  };
+  const worstCaseBytes = Math.max(
+    Buffer.byteLength(`${canonicalJson(aborted)}\n`),
+    Buffer.byteLength(`${canonicalJson(selected)}\n`),
+  );
+  return { worstCaseBytes, limitBytes: MAX_JOURNAL_BYTES };
+}
+
+/** The largest rollback tuple a rollback hold manifest can carry (#1550): every hash at full width, the widest UUID and mode. */
+export function backendCutoverSetRollbackSelectionWorstCase(
+  manifest: BackendCutoverSetManifest,
+  originalSetId: string,
+): BackendCutoverSetRollbackSelection {
+  const hex = "f".repeat(64);
+  const body = {
+    version: 1 as const,
+    kind: "cutover-set-rollback-selection" as const,
+    setId: manifest.setId,
+    manifestSha256: hex,
+    publicationId: manifest.setId,
+    originalSetId,
+    originalSelectionSha256: hex,
+    checkpointSha256: hex,
+    identityDigest: hex,
+    sourceBackend: "postgresql" as const,
+    targetBackend: "sqlite" as const,
+    members: manifest.members.map((member): BackendCutoverSetRollbackSelectionMember => ({
+      physicalProjectId: member.physicalProjectId,
+      generationId: member.generationId,
+      remoteProjectId: LONGEST_CANONICAL_UUID,
+      mode: "post-write",
+      epochId: hex,
+      attemptId: hex,
+      witnessChecksumSha256: hex,
+      installEvidenceSha256: hex,
+    })),
+  };
+  return { ...body, checksumSha256: hex };
+}
+
+/**
+ * The serialized size of the largest journal a rollback hold of this set can
+ * reach (#1550): the aborted shape and the selection-completed shape carrying
+ * the complete rollback tuple, with every member cutoff bound. The activation
+ * budget (backendCutoverSetJournalCapacity) is unchanged; a set rollback
+ * checks this budget before its first effect.
+ */
+export function backendCutoverSetRollbackJournalCapacity(
+  cutoverSet: BackendCutoverSet,
+  originalSetId: string,
+): Readonly<{ worstCaseBytes: number; limitBytes: number }> {
+  const hex = "f".repeat(64);
+  const bindings = cutoverSet.bindings.map((binding) => ({
+    generationId: binding.generationId,
+    queueEvidenceSha256: hex,
+    roster: [{ machineId: cutoverSet.manifest.machineId, queueCutoff: "9223372036854775807", evidenceSha256: hex }],
+  }));
+  const aborted = {
+    version: BACKEND_MAINTENANCE_VERSION,
+    publicationId: cutoverSet.manifest.setId,
+    sourceBackend: "postgresql",
+    targetBackend: null,
+    phase: "maintenance-aborted",
+    createdAt: LONGEST_ISO_TIMESTAMP,
+    updatedAt: LONGEST_ISO_TIMESTAMP,
+    generationId: cutoverSet.manifest.setId,
+    sourceSelectionSha256: hex,
+    queueEvidenceSha256: hex,
+    roster: [{ machineId: cutoverSet.manifest.machineId, queueCutoff: null, evidenceSha256: hex }],
+    selectedGenerationId: null,
+    terminalEvidenceSha256: null,
+    abortEvidenceSha256: hex,
+    cutoverSet: { manifest: cutoverSet.manifest, bindings },
+    checksumSha256: hex,
+  };
+  const selected = {
+    ...aborted,
+    targetBackend: "sqlite",
+    phase: "selection-completed",
+    selectedGenerationId: cutoverSet.manifest.setId,
+    terminalEvidenceSha256: hex,
+    abortEvidenceSha256: null,
+    cutoverSet: {
+      manifest: cutoverSet.manifest, bindings,
+      selection: backendCutoverSetRollbackSelectionWorstCase(cutoverSet.manifest, originalSetId),
+    },
   };
   const worstCaseBytes = Math.max(
     Buffer.byteLength(`${canonicalJson(aborted)}\n`),
@@ -4426,13 +4675,13 @@ export class BackendPublicationCoordinator {
       ) {
         return fail("invalid-input", "backend maintenance selection input is malformed");
       }
-      let selection: BackendCutoverSetSelection | undefined;
+      let selection: BackendCutoverSetAnySelection | undefined;
       if (journal.cutoverSet !== undefined) {
         // The set branch (#1549): the complete tuple is parsed against the held
         // manifest (the parser refuses only through fail(), so every failure is
         // malformed input here), and the top-level fields must restate it exactly.
         try {
-          selection = parseBackendCutoverSetSelection(input.cutoverSetSelection, journal.cutoverSet.manifest);
+          selection = parseBackendCutoverSetAnySelection(input.cutoverSetSelection, journal.cutoverSet.manifest);
         } catch (error) {
           return fail("invalid-input", `backend cutover-set selection tuple is malformed: ${(error as Error).message}`);
         }

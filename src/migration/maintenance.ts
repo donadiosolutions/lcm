@@ -29,6 +29,7 @@ import {
   rebindBackendMaintenanceCutoff,
   resolveBackendMaintenanceGenerationBinding,
   withBackendPublicationAppendBarrierAsync,
+  withBackendPublicationConsumerLock,
   type BackendMaintenanceJournal,
   type BackendPublicationJournal,
   type BackendPublicationLockToken,
@@ -74,7 +75,13 @@ import {
   resolveCutoverSetActivationSelection,
   type CutoverSetActivationSelectionResolution,
 } from "./cutover-set-activation-store.js";
+import {
+  resolveCutoverSetRollbackCommitment,
+  type CutoverSetRollbackCommitmentResolution,
+} from "./cutover-set-rollback-store.js";
+import { readActivationArtifact } from "./activation-artifact-store.js";
 import { deriveActivationPublicationId } from "./activation-publication-id.js";
+import { readRollbackReport } from "./rollback.js";
 import { readMigrationActivationReport } from "./activation-report.js";
 
 type PostgreSqlConfig = Extract<ResolvedStorageConfig, { backend: "postgresql" }>;
@@ -424,6 +431,15 @@ export function assertMigrationReplayAdmission(input: Readonly<{
       "migration selection bindings cannot be resolved: " + bindings.reason,
     );
   }
+  // 1b (#1550, C3). A set member's rollback commitment, located from its own activation link, decides before any
+  // binding: from the checkpoint on, the member's old activation evidence is fenced, and only the completed reverse
+  // publication (or, later, the members' own rolled-back evidence under the selected sqlite installation) admits
+  // the member's rollback witness. Positive absence falls through; an unresolvable commitment refuses.
+  const commitment = resolveCutoverSetRollbackCommitment({ homeDir: input.homeDir, generationId: input.generationId });
+  if (commitment.state === "unresolvable") {
+    throw new BackendPublicationJournalError("unresolved-publication", "cutover-set rollback commitment cannot be resolved: " + commitment.reason);
+  }
+  if (commitment.state === "resolved") return assertCutoverSetRollbackReplayAdmission(input, commitment, journal);
   if (bindings.state === "resolved" && bindings.selections.length > 0) {
     const last = bindings.selections[bindings.selections.length - 1]!;
     if (last.witnessChecksumSha256 !== input.evidenceSha256) {
@@ -431,6 +447,12 @@ export function assertMigrationReplayAdmission(input: Readonly<{
         "unresolved-publication",
         "migration maintenance has no authoritative terminal replay state",
       );
+    }
+    if (last.kind === "rollback" && commitment.cause === "no-rollback") {
+      // #1550 (D7.5). A set member (its link names a set publication) whose rollback binding survives without
+      // the commitment it indexes admits nothing; the bare rollback -> sqlite answer stays the unlinked
+      // single-generation rollback's alone.
+      replayRefusal("the member's rollback binding indexes a set rollback whose commitment is absent: " + commitment.detail);
     }
     if (last.kind === "activation" && last.publicationId !== deriveActivationPublicationId(input.generationId)) {
       // #1549 (F2). A single-generation activation always names deriveActivationPublicationId(generationId);
@@ -562,6 +584,97 @@ function assertCutoverSetReplayAdmission(
     replayRefusal("the member's activation report does not name this set publication, identity digest and witness");
   }
   return { backend: "postgresql", disposition: "selected" };
+}
+
+/**
+ * Set member replay under a rollback commitment (#1550, C3). The commitment
+ * (the rollback checkpoint found from the member's activation link) fences
+ * every member's old activation evidence at once. Until the rollback's
+ * selection is frozen nothing is admitted. The frozen tuple's row for the
+ * member must carry the presented evidence (its rollback witness; the old
+ * activation witness never matches). Then the live slot decides: the
+ * rollback hold at any phase refuses; the rollback's own completed reverse
+ * publication admits when it covers exactly the reverse artifact's projects;
+ * its own non-completed or aborted publication refuses. When the slot is
+ * absent, foreign or a later hold, every member must be rolled back with the
+ * rollback report of its frozen witness and the currently selected
+ * installation must be sqlite with every member unbound; then sqlite is
+ * admitted. No archived journal is read and no store is scanned.
+ */
+function rollbackReplayRefusal(detail: string): never {
+  throw new BackendPublicationJournalError("unresolved-publication", "cutover-set rollback replay is not admitted: " + detail);
+}
+
+function assertCutoverSetRollbackReplayAdmission(
+  input: Readonly<{ homeDir: string; generationId: string; evidenceSha256: string }>,
+  commitment: Extract<CutoverSetRollbackCommitmentResolution, { state: "resolved" }>,
+  maintenance: BackendMaintenanceJournal | null,
+): Readonly<{ backend: "sqlite"; disposition: "selected" }> {
+  const { checkpoint, selection } = commitment.records;
+  if (selection === null) rollbackReplayRefusal("set " + commitment.originalSetId + " is committed to roll back and its selection is not frozen");
+  const row = selection.members.find((candidate) => candidate.generationId === input.generationId);
+  if (row === undefined || row.witnessChecksumSha256 !== input.evidenceSha256) {
+    rollbackReplayRefusal("the presented evidence is not the member's rollback witness");
+  }
+  if (maintenance !== null && maintenance.generationId === checkpoint.setId) {
+    rollbackReplayRefusal("the rollback hold is at phase " + maintenance.phase + "; the reverse publication has not completed");
+  }
+  const publication: BackendPublicationJournal | null = maintenance === null ? readBackendPublicationJournal(input.homeDir) : null;
+  if (publication !== null && publication.publicationId === checkpoint.setId) {
+    if (publication.phase !== "completed") rollbackReplayRefusal("the reverse publication is at phase " + publication.phase + ", not completed");
+    let artifact;
+    try {
+      artifact = readActivationArtifact({ homeDir: input.homeDir, identityDigest: checkpoint.identityDigest });
+    } catch (error) {
+      rollbackReplayRefusal("the reverse artifact is unresolvable: " + (error as Error).message);
+    }
+    if (artifact === null || artifact.publicationId !== checkpoint.setId) rollbackReplayRefusal("the reverse artifact is absent or sealed under another publication");
+    const rows = artifact.projects;
+    const covered = publication.projects.length === rows.length && publication.projects.every((project, index) => {
+      const expected = rows[index]!;
+      return project.localProjectId === expected.localProjectId && project.remoteProjectId === expected.remoteProjectId && project.evidenceSha256 === expected.evidenceSha256;
+    });
+    if (!covered) rollbackReplayRefusal("the completed reverse publication does not cover exactly the reverse artifact's projects");
+    return { backend: "sqlite", disposition: "selected" };
+  }
+  const store = new MigrationManifestStore({ homeDir: input.homeDir });
+  for (const member of selection.members) {
+    let manifest: MigrationManifest;
+    try {
+      manifest = store.read(member.generationId);
+    } catch (error) {
+      rollbackReplayRefusal("member " + member.generationId + "'s manifest cannot be read: " + (error as Error).message);
+    }
+    if (manifest.phase !== "rolled-back" || manifest.rollbackLineage.mode !== member.mode) {
+      rollbackReplayRefusal("member " + member.generationId + " is at phase " + manifest.phase + " and no completed reverse publication occupies the slot");
+    }
+    const reference = [...manifest.reports].reverse().find((candidate) => candidate.kind === "rollback")!;
+    let report;
+    try {
+      report = readRollbackReport(input.homeDir, member.generationId, reference.reportId);
+    } catch (error) {
+      rollbackReplayRefusal("member " + member.generationId + "'s rollback report cannot be read: " + (error as Error).message);
+    }
+    if (report === null || report.checksumSha256 !== reference.reportSha256 || report.effectId !== "rollback-publish-" + member.witnessChecksumSha256
+      || report.epochId !== member.epochId || report.attemptId !== member.attemptId || report.mode !== member.mode) {
+      rollbackReplayRefusal("member " + member.generationId + "'s rollback report does not name its frozen witness, epoch, attempt and mode");
+    }
+  }
+  let backend: string;
+  let map: ReturnType<typeof readProjectMapSnapshot>;
+  try {
+    // The configuration as the daemon reads and parses it (the service's completion readback uses the same reader).
+    backend = readDaemonConfigSnapshot(join(lcmHomeDir(input.homeDir), "config.json")).config.storage.backend;
+    map = withBackendPublicationConsumerLock(input.homeDir, (token) => readProjectMapSnapshot(input.homeDir, token), { allowUnresolved: true });
+  } catch (error) {
+    rollbackReplayRefusal("the selected installation cannot be read: " + (error as Error).message);
+  }
+  if (backend !== "sqlite") rollbackReplayRefusal("the configuration selects " + backend + ", not the restored sqlite installation");
+  for (const member of selection.members) {
+    const entry = map[member.physicalProjectId];
+    if (entry === undefined || entry.remoteProjectId !== undefined) rollbackReplayRefusal("member " + member.generationId + " is still bound to a destination project");
+  }
+  return { backend: "sqlite", disposition: "selected" };
 }
 
 type StaticSourceSelection = Readonly<{

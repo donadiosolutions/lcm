@@ -1614,7 +1614,8 @@ function rollbackGenerationBuildRoot(homeDir: string): string {
 }
 
 const ROLLBACK_GENERATION_BUILD_ATTEMPT_ORDINAL_PATTERN = /^[1-9][0-9]*$/u;
-const MAX_ROLLBACK_GENERATION_BUILD_ATTEMPT_ENTRIES = 100_000;
+/** The bounded scan of the build root (#1550 C6: shared with the set rollback, unchanged). */
+export const MAX_ROLLBACK_GENERATION_BUILD_ATTEMPT_ENTRIES = 100_000;
 /** The generation-id limit the manifest store and the rollback generation builder both enforce. */
 const MAX_GENERATION_ID_LENGTH = 128;
 /**
@@ -1661,8 +1662,11 @@ export function rollbackGenerationBuildBase(baseGenerationId: string): string {
  * so a differently-shaped generationId that happens to share a textual
  * prefix (including one containing "-rb" itself) can never be mistaken
  * for one of THIS generationId/revision pair's own attempts.
+ *
+ * Exported unchanged for the set rollback (#1550 C6), which allocates its members' fresh physical attempts
+ * through this same bounded enumeration and build base.
  */
-function highestRollbackGenerationBuildAttempt(
+export function highestRollbackGenerationBuildAttempt(
   homeDir: string,
   baseGenerationId: string,
   revision: number,
