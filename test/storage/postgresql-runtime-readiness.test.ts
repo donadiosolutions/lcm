@@ -2559,4 +2559,123 @@ describe("PostgreSQL transfer readiness", () => {
       })).rejects.toMatchObject({ reason: "acl-shape" });
     },
   );
+
+  describe("message_parts transcript column grants", () => {
+    const TRANSCRIPT_COLUMNS = ["project_id", "conversation_id", "message_id", "part_type"];
+    const isTranscriptColumn = (object: string, kept: readonly string[] = []): boolean => (
+      TRANSCRIPT_COLUMNS.some((column) => (
+        object === `lcm.message_parts|${column}` && !kept.includes(column)
+      ))
+    );
+    const withoutTranscriptColumnAcls = (
+      kept: readonly string[] = [],
+    ): ReadyExecutorOverride => mutateRows((rows) => {
+      const remaining = rows.filter(({ object_identity: object, privilege_type: privilege }) => (
+        !(privilege === "SELECT" && typeof object === "string" && isTranscriptColumn(object, kept))
+      ));
+      rows.splice(0, rows.length, ...remaining);
+    });
+    const withTranscriptGrantMutation = (
+      mutate: (row: QueryResultRow) => void,
+    ): ReadyExecutorOverride => mutateRows((rows) => {
+      const row = rows.find((candidate) => (
+        candidate.object_identity === "lcm.message_parts|part_type"
+        && candidate.privilege_type === "SELECT"
+      ));
+      if (row === undefined) throw new Error("message_parts part_type grant missing");
+      mutate(row);
+    });
+    const transferWith = (override: ReadyExecutorOverride, operation = "inspectColumnAcl") => (
+      readyExecutor({
+        manifest: POSTGRESQL_TRANSFER_PRIVILEGE_MANIFEST,
+        operationOverrides: { [operation]: override },
+      })
+    );
+
+    it("admits a transfer role provisioned before the column grants and still expects effective SELECT", async () => {
+      const transfer = transferWith(withoutTranscriptColumnAcls());
+
+      await expect(verifyPostgreSqlTransferSchema(transfer.seam, {
+        expectedOwner: EXPECTED_OWNER,
+      })).resolves.toMatchObject({ runtimeRole: "lcm_test_runtime" });
+      const effective = transfer.queries.find(({ options }) => (
+        options.operation === "inspectEffectivePrivileges"
+      ))!;
+      const values = (effective.config as { values: unknown[] }).values;
+      const objects = values[10] as string[];
+      const columns = values[11] as string[];
+      const privileges = values[12] as string[];
+      const expected = values[13] as boolean[];
+      for (const column of TRANSCRIPT_COLUMNS) {
+        const index = objects.findIndex((object, i) => (
+          object === "lcm.message_parts" && columns[i] === column && privileges[i] === "SELECT"
+        ));
+        expect(index).toBeGreaterThanOrEqual(0);
+        expect(expected[index]).toBe(true);
+      }
+    });
+
+    it("admits a transfer role holding only some of the column grants", async () => {
+      const transfer = transferWith(withoutTranscriptColumnAcls(["project_id"]));
+
+      await expect(verifyPostgreSqlTransferSchema(transfer.seam, {
+        expectedOwner: EXPECTED_OWNER,
+      })).resolves.toMatchObject({ runtimeRole: "lcm_test_runtime" });
+    });
+
+    it("rejects a legacy transfer role without effective message_parts column SELECT", async () => {
+      const transfer = readyExecutor({
+        manifest: POSTGRESQL_TRANSFER_PRIVILEGE_MANIFEST,
+        operationOverrides: {
+          inspectColumnAcl: withoutTranscriptColumnAcls(),
+          inspectEffectivePrivileges: mutateRows((rows) => {
+            const row = rows.find((candidate) => (
+              candidate.privilege_kind === "column"
+              && candidate.object_identity === "lcm.message_parts"
+              && candidate.column_name === "part_type"
+              && candidate.privilege_type === "SELECT"
+            ));
+            if (row === undefined) throw new Error("message_parts part_type row missing");
+            row.effective = false;
+          }),
+        },
+      });
+
+      await expect(verifyPostgreSqlTransferSchema(transfer.seam, {
+        expectedOwner: EXPECTED_OWNER,
+      })).rejects.toMatchObject({ reason: "effective-privilege" });
+    });
+
+    it("rejects a legacy transfer role without message_parts table SELECT", async () => {
+      const transfer = readyExecutor({
+        manifest: POSTGRESQL_TRANSFER_PRIVILEGE_MANIFEST,
+        operationOverrides: {
+          inspectColumnAcl: withoutTranscriptColumnAcls(),
+          inspectRelationAcl: mutateRows((rows) => {
+            const remaining = rows.filter((row) => !(
+              row.object_identity === "table|message_parts"
+              && row.privilege_type === "SELECT"
+              && row.grantee_name === "lcm_test_runtime"
+            ));
+            rows.splice(0, rows.length, ...remaining);
+          }),
+        },
+      });
+
+      await expect(verifyPostgreSqlTransferSchema(transfer.seam, {
+        expectedOwner: EXPECTED_OWNER,
+      })).rejects.toMatchObject({ reason: "acl-shape" });
+    });
+
+    it.each([
+      ["grantable", (row: QueryResultRow) => { row.is_grantable = true; }],
+      ["foreign grantor", (row: QueryResultRow) => { row.grantor_is_owner = false; }],
+    ])("rejects a tolerated transfer column grant that is %s", async (_label, mutate) => {
+      const transfer = transferWith(withTranscriptGrantMutation(mutate));
+
+      await expect(verifyPostgreSqlTransferSchema(transfer.seam, {
+        expectedOwner: EXPECTED_OWNER,
+      })).rejects.toMatchObject({ reason: "acl-shape" });
+    });
+  });
 });
