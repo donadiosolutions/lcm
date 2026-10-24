@@ -1,0 +1,9 @@
+references: ["#1642"]
+rationale: >-
+  Transfer readiness no longer requires the four direct message_parts column
+  SELECT grants when the role holds the table-level SELECT that already covers
+  those reads, so a transfer role provisioned before the column grants stays
+  admitted. The readiness verifier keeps its PostgreSQL schema owner. No
+  production file is added, removed, moved, or re-owned.
+pins:
+  - ["src/storage/postgresql/runtime-readiness.ts", "integration-postgresql-schema"]

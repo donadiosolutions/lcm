@@ -1913,6 +1913,7 @@ function settleMember(ctx: Context, member: Member, sealedDigest: string): Exit 
   if (manifest.phase !== "rolling-back" || pending?.kind !== "publish-rollback" || pending.effectId !== publishEffectId(member.terminalEvidenceSha256!)) {
     return interrupted(ctx, "completion", "readback-mismatch", at(member, "the manifest is not rolling back with this rollback's pending publish-rollback"));
   }
+  const reportCreatedAt = ctx.now().toISOString();
   let report: ReturnType<typeof writeRollbackReport>;
   try {
     report = ctx.deps.writeReport(ctx.homeDir, {
@@ -1929,7 +1930,7 @@ function settleMember(ctx: Context, member: Member, sealedDigest: string): Exit 
     member.manifest = ctx.deps.manifestStore.update(member.generationId, manifest.checksumSha256, (head) =>
       completeMigrationEffect(head, {
         effectId: pending.effectId, completedAt: ctx.now().toISOString(),
-        report: { kind: "rollback", reportId: report.reportId, reportSha256: report.checksumSha256, createdAt: ctx.now().toISOString() }, rollbackMode: member.mode!,
+        report: { kind: "rollback", reportId: report.reportId, reportSha256: report.checksumSha256, createdAt: reportCreatedAt }, rollbackMode: member.mode!,
       }));
   } catch (error) {
     if (error instanceof MigrationProtocolError) return interrupted(ctx, "completion", "state-unresolvable", at(member, "publish-rollback could not be completed: " + error.message));

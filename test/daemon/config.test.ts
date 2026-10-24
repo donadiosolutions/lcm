@@ -29,6 +29,7 @@ import {
   __configTestUtils,
   daemonConfigSnapshotWitnessEqual,
   loadDaemonConfig,
+  readDaemonConfigBackendSnapshot,
   readDaemonConfigSnapshot,
   parseDaemonConfig,
   parseLlmRequestPolicyConfig,
@@ -1623,5 +1624,84 @@ describe("deepMerge", () => {
     expect(result.a).toBe(1);
     expect((result.b as any).c).toBe(2);
     expect((result.b as any).d).toBe(3);
+  });
+});
+
+describe("readDaemonConfigBackendSnapshot", () => {
+  function withConfig(config: unknown, run: (path: string, root: string) => void): void {
+    const root = mkdtempSync(join(tmpdir(), "lcm-config-backend-snapshot-"));
+    try {
+      const path = join(root, "config.json");
+      writeFileSync(path, JSON.stringify(config), { mode: 0o600 });
+      run(path, root);
+    } finally {
+      rmSync(root, { recursive: true, force: true });
+    }
+  }
+
+  it("returns only the backend and witness for SQLite and for a missing file", () => {
+    withConfig({}, (path, root) => {
+      const snapshot = readDaemonConfigBackendSnapshot(path, {});
+      expect(snapshot).toEqual({
+        backend: "sqlite",
+        witness: readDaemonConfigSnapshot(path, {}).witness,
+      });
+      expect(Object.keys(snapshot).sort()).toEqual(["backend", "witness"]);
+      expect(readDaemonConfigBackendSnapshot(join(root, "missing.json"), {}).witness).toMatchObject({ presence: "absent" });
+    });
+  });
+
+  it("defers a PostgreSQL URL, CA file, and migration role that are all absent", () => {
+    withConfig({ storage: { backend: "postgresql" } }, path => {
+      expect(() => readDaemonConfigSnapshot(path, {})).toThrow(ConfigValidationError);
+      expect(readDaemonConfigBackendSnapshot(path, {})).toMatchObject({ backend: "postgresql", witness: { presence: "present" } });
+    });
+  });
+
+  it.each(["LCM_POSTGRES_URL", "LCM_POSTGRES_CA_FILE", "LCM_POSTGRES_MIGRATION_ROLE"])(
+    "treats a whitespace-only %s as absent",
+    name => {
+      withConfig({ storage: { backend: "postgresql" } }, path => {
+        expect(readDaemonConfigBackendSnapshot(path, { [name]: "  " }).backend).toBe("postgresql");
+      });
+    },
+  );
+
+  it("accepts present valid values from the environment and from the config file", () => {
+    const root = mkdtempSync(join(tmpdir(), "lcm-config-backend-valid-"));
+    try {
+      const ca = join(root, "ca.pem");
+      writeFileSync(ca, "-----BEGIN CERTIFICATE-----\ntest\n-----END CERTIFICATE-----\n", { mode: 0o600 });
+      const path = join(root, "config.json");
+      writeFileSync(path, JSON.stringify({ storage: { backend: "postgresql", postgresql: { migrationRole: "lcm_migrator" } } }));
+      const env = { LCM_POSTGRES_URL: "postgresql://user:secret@db.example.test/lcm", LCM_POSTGRES_CA_FILE: ca };
+      expect(readDaemonConfigBackendSnapshot(path, env).backend).toBe("postgresql");
+      writeFileSync(path, JSON.stringify({ storage: { backend: "postgresql" } }));
+      expect(readDaemonConfigBackendSnapshot(path, { ...env, LCM_POSTGRES_MIGRATION_ROLE: "lcm_migrator" }).backend).toBe("postgresql");
+    } finally {
+      rmSync(root, { recursive: true, force: true });
+    }
+  });
+
+  it.each([
+    ["LCM_POSTGRES_URL", "mysql://user:secret@db.example.test/lcm"],
+    ["LCM_POSTGRES_CA_FILE", "relative-ca.pem"],
+    ["LCM_POSTGRES_MIGRATION_ROLE", "r".repeat(64)],
+  ])("still validates a present %s", (name, value) => {
+    withConfig({ storage: { backend: "postgresql" } }, path => {
+      expect(() => readDaemonConfigBackendSnapshot(path, { [name]: value })).toThrow(ConfigValidationError);
+    });
+  });
+
+  it("still validates a present migration role in the config file", () => {
+    withConfig({ storage: { backend: "postgresql", postgresql: { migrationRole: "r".repeat(64) } } }, path => {
+      expect(() => readDaemonConfigBackendSnapshot(path, {})).toThrow(ConfigValidationError);
+    });
+  });
+
+  it("still validates the rest of the configuration", () => {
+    withConfig({ storage: { backend: "postgresql" }, llm: { provider: "not-a-provider" } }, path => {
+      expect(() => readDaemonConfigBackendSnapshot(path, {})).toThrow(ConfigValidationError);
+    });
   });
 });

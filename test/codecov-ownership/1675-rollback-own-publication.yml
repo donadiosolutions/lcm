@@ -1,0 +1,8 @@
+references: ["#1675"]
+rationale: >-
+  #1675 lets the migration router recognise the generation's own rollback
+  publication next to its activation publication. The change is inside the
+  existing router module, which keeps its migration cutover owner; no file is
+  added, moved or re-owned.
+pins:
+  - ["src/migration/routing.ts", "unit-migration-cutover"]

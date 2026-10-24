@@ -23,7 +23,7 @@ const MAX_TTL_MS = 24 * 60 * 60 * 1000;
 export type PostgreSqlBackendPublicationRemoteGuardPort = Pick<
   PostgreSqlBackendPublicationGuard,
   "acquire" | "read" | "release"
->;
+> & Partial<Pick<PostgreSqlBackendPublicationGuard, "readForReleaseReconciliation">>;
 
 export type CreatePostgreSqlBackendPublicationRemoteGuardOptions = Readonly<{
   guard: PostgreSqlBackendPublicationRemoteGuardPort;
@@ -105,7 +105,8 @@ function identityOf(context: BackendPublicationRemoteContext) {
  * different generation, not a failed read: it is treated as no usable
  * own-generation row, so a released one is replaced and an unreleased one
  * ends in the guard's `publication-conflict`. The same mismatch propagates
- * when the coordinator reads for release.
+ * when the coordinator reads for release, except through the reconciliation
+ * read described below.
  *
  * A row that another machine holds, is still active and names this
  * publication, target backend and evidence is refused by this provider, so a
@@ -114,6 +115,17 @@ function identityOf(context: BackendPublicationRemoteContext) {
  * `guard.acquire` replaces a released row; an expired but unreleased foreign
  * row ends in the guard's `publication-conflict`, and the coordinator fails
  * closed.
+ *
+ * When the guard offers `readForReleaseReconciliation`, the provider also
+ * declares `readRemoteGuardForReleaseReconciliation`. It
+ * returns the project's row whichever generation it names (including another
+ * target backend or evidence) without refusing a foreign machine, and the
+ * coordinator uses it only to finish its own release: a row of another
+ * identity with a strictly greater fencing token proves the persisted fence
+ * was released before a later publication rebound the row. The guard rebinds
+ * only released rows and always assigns a greater token, which is what makes
+ * that inference sound. A guard without the method leaves the capability
+ * absent and the coordinator keeps failing closed.
  */
 export function createPostgreSqlBackendPublicationRemoteGuard(
   options: CreatePostgreSqlBackendPublicationRemoteGuardOptions,
@@ -174,7 +186,16 @@ export function createPostgreSqlBackendPublicationRemoteGuard(
     && fence.targetBackend === context.journal.targetBackend
     && fence.evidenceSha256 === context.project.evidenceSha256;
 
+  const reconcile = guard.readForReleaseReconciliation?.bind(guard);
+
   return {
+    ...(reconcile === undefined ? {} : {
+      async readRemoteGuardForReleaseReconciliation(context: BackendPublicationRemoteContext) {
+        const fence = await reconcile({ projectId: context.project.remoteProjectId });
+        return fence === null ? null : toFenceRecord(fence);
+      },
+    }),
+
     async readRemoteGuard(context, operation) {
       const fence = operation === "acquire"
         ? await readForAcquire(context)
