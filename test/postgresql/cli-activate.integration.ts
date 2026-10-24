@@ -158,3 +158,58 @@ it(
   300_000,
 );
 
+
+it(
+  "refuses a foreign publication lease before any write: a decodable row is exit 4 refused-contention, an undecodable row is exit 5 refused-evidence, and neither claims applied",
+  async () => {
+    await withPostgreSqlTestDatabase("cli-activate-lease", async (db) => {
+      const home = mkdtempSync(join(tmpdir(), "cli-activate-lease-"));
+      vi.stubEnv("HOME", home);
+      vi.stubEnv("USERPROFILE", home);
+      try {
+        const transfer = await provisionActivationRole(db);
+        const installation = await prepareVerifiedInstallation(db, home, transfer);
+        vi.stubEnv("LCM_POSTGRES_URL", transfer.url);
+        vi.stubEnv("LCM_POSTGRES_CA_FILE", transfer.caFile);
+        const manifests = new MigrationManifestStore({ homeDir: home });
+        const activate = { cwd: installation.cwd, homeDir: home, generation: GENERATION_ID, confirmGenerationId: GENERATION_ID, confirmBackend: "postgresql" };
+        const seedForeign = (operation: string, publicationId: string) => db.migrator.query({
+          text: "INSERT INTO lcm.fenced_leases (project_id, resource_type, resource_key, owner_machine_id, owner_process_id, operation, expires_at) "
+            + "VALUES ($1, 'backend-publication', 'selection', $2, $3, $4, statement_timestamp() + interval '10 minutes') "
+            + "ON CONFLICT (project_id, resource_type, resource_key) DO UPDATE SET owner_process_id = EXCLUDED.owner_process_id, operation = EXCLUDED.operation",
+          values: [installation.remoteProjectId, installation.machineId, publicationId, operation],
+        }, { domain: "factory", operation: "seedForeignPublicationLease" });
+        const expectUntouched = () => {
+          expect(manifests.read(GENERATION_ID)).toMatchObject({ phase: "verified", pendingEffect: null });
+          expect(readConfigBackend(home)).toBe("sqlite");
+        };
+
+        // A decodable unreleased lease of another publication generation: the documented contention class.
+        await seedForeign("backend-publication:postgresql:" + "f".repeat(64), "someone-else");
+        const contended = await performMigrationActivateCommand(activate);
+        expect(contended, JSON.stringify(contended)).toMatchObject({
+          status: "refuse", reason: "activation-refused-contention", sections: { activationStep: "S2", activationReason: "lease-conflict", effectBegun: false },
+        });
+        expect(contended).not.toHaveProperty("applied");
+        expect(renderMigrationActivateEnvelope(contended).exitCode).toBe(4);
+        expectUntouched();
+
+        // The same row with an operation the guard cannot decode (the #628 rehearsal shape): refused-evidence, not an unexpected failure.
+        await seedForeign("rehearsal-contention", "rehearsal-competing-owner");
+        const undecodable = await performMigrationActivateCommand(activate);
+        expect(undecodable, JSON.stringify(undecodable)).toMatchObject({
+          status: "refuse", reason: "activation-refused-evidence", sections: { activationStep: "S2", activationReason: "lease-unresolvable", effectBegun: false },
+        });
+        expect(undecodable).not.toHaveProperty("applied");
+        expect(renderMigrationActivateEnvelope(undecodable).exitCode).toBe(5);
+        expectUntouched();
+      } finally {
+        closeLcmConnection();
+        vi.unstubAllEnvs();
+        rmSync(home, { recursive: true, force: true });
+        await dropActivationRole(db);
+      }
+    });
+  },
+  300_000,
+);

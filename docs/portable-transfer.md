@@ -238,9 +238,13 @@ An unsupported corpus fails as a whole. The adapters do not silently replace
 identities, coerce incompatible values, discard unsupported domains or export
 a partial manifest as complete. Correct the source or choose a compatible
 new generation before retrying a non-retryable refusal. PostgreSQL passive-event
-envelopes must have the supported seven keys and their native field types;
-unknown envelope fields are refused rather than silently discarded. The `data`
-string stays opaque, and event disposition normalization remains unchanged.
+envelopes must have the supported seven keys and their native field types. An
+envelope may also carry the replication pointer `previousEventId`, absent, JSON
+null or a positive integer; the export accepts it and leaves it out of the
+portable record, as the SQLite source omits its local pointer. Any other
+unknown envelope field, or another pointer value, is refused rather than
+silently discarded. The `data` string stays opaque, and event disposition
+normalization remains unchanged.
 
 Readers use an owned disk index for ordering, logical identities, dependency
 checks and duplicate conversation occurrence assignment. The index stores

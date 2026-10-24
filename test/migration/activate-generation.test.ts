@@ -1,9 +1,9 @@
 import { afterEach, describe, expect, it, vi } from "vitest";
-import { mkdirSync, mkdtempSync, readFileSync, readdirSync, rmSync, statSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, rmSync, statSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { ConfigValidationError, DEFAULT_DAEMON_PORT, readDaemonConfigSnapshot } from "../../src/daemon/config.js";
-import { ensurePendingMachineIdentity, finalizeMachineIdentity } from "../../src/machine-identity.js";
+import { MachineIdentityFileError, ensurePendingMachineIdentity, finalizeMachineIdentity } from "../../src/machine-identity.js";
 import { clearProjectMapCache, hashProjectPath, normalizeProjectPath, projectMapPath } from "../../src/project-map.js";
 import { configPath, lcmHomeDir, projectsDir } from "../../src/runtime-paths.js";
 import {
@@ -19,8 +19,10 @@ import { createBackendPublicationCoordinator } from "../../src/storage/backend-p
 import type { StorageIdentityContext } from "../../src/storage/contracts.js";
 import type { PostgreSqlConnectionSettings, PostgreSqlRuntimeHealth } from "../../src/storage/postgresql/contracts.js";
 import {
+  PostgreSqlBackendPublicationGuard,
   PostgreSqlBackendPublicationGuardError,
   type PostgreSqlBackendPublicationAcquireInput,
+  type PostgreSqlBackendPublicationControlExecutor,
   type PostgreSqlBackendPublicationFence,
   type PostgreSqlBackendPublicationMutationInput,
 } from "../../src/storage/postgresql/publication-guard.js";
@@ -93,6 +95,8 @@ import {
   type MigrationVerificationReport,
 } from "../../src/migration/verification-report.js";
 import { MigrationVerificationReportStore } from "../../src/migration/verification-store.js";
+import { performMigrationActivateCommand } from "../../src/migration/cli-activate.js";
+import { admitExistingMigrationCommand } from "../../src/migration/cli-existing.js";
 import {
   buildMigrationCanonicalDelta,
   buildMigrationCensusVector,
@@ -764,6 +768,47 @@ describe("runMigrationActivation: crash rows (plan-v5 section 7 / synthesis amen
   });
 });
 
+/**
+ * Bug #1679: a crash anywhere between the end of prepare-activation and the
+ * manifest settle used to leave the router on cell 25 (route-contradiction),
+ * so the CLI refused `activate` before the orchestrator, which resumes every
+ * one of these windows, ever ran. Here the real router reads the real home the
+ * crashed orchestrator left behind, and the real orchestrator then finishes it
+ * through the CLI command.
+ */
+describe("activate CLI admission of the interrupted activation windows (Bug #1679)", () => {
+  const resolution = { _operationsForTesting: { classifySnapshot: async () => ({ state: "complete" }) } } as never;
+
+  it.each([
+    ["after-prepare-begin", "prepare-activation-pending", 6],
+    ["after-prepare-complete", "activating-no-effect", 2],
+    ["after-publish-begin", "publish-pending-before-artifact", 6],
+    ["after-link", "publish-pending-after-link", 6],
+    ["after-drive", "publication-journal", 6],
+    ["after-report", "publication-journal", 6],
+  ])("a crash at %s routes to activate (row 11) and the CLI finishes it", async (point, resumedFrom, exitIfRefused) => {
+    const f = await fixture();
+    await expect(f.run({ crashPoint: (p) => { if (p === point) throw new Error("injected crash at " + point); } })).rejects.toThrow("injected crash at " + point);
+
+    const admission = await admitExistingMigrationCommand({ command: "activate", homeDir: f.homeDir, generation: GENERATION, resolution });
+    expect(admission.status === "refuse" ? admission.reason : "admitted").toBe("admitted");
+    if (admission.status !== "admitted") return;
+    expect(admission.context.route).toMatchObject({ row: 11, primary: "activate", exitIfRefused });
+
+    const outcome = await performMigrationActivateCommand({
+      cwd: f.canonical, homeDir: f.homeDir, generation: GENERATION, confirmGenerationId: GENERATION, confirmBackend: "postgresql",
+      _resolution: resolution,
+      _operationsForTesting: {
+        resolveDestination: async () => ({ status: "resolved", settings: SETTINGS, expectedOwner: "lcm_migrator", expectedIdentity: f.input.expectedIdentity }),
+        run: (input) => runMigrationActivation({ ...input, now: f.input.now }, f.deps),
+        classifyPresence: async () => ({ status: "authoritatively-absent" }),
+      },
+    });
+    expect(outcome).toMatchObject({ status: "ok", generationId: GENERATION, manifestPhase: "active", evidence: { cell: 11, resumedFrom } });
+    expect(f.manifestStore.read(GENERATION)).toMatchObject({ phase: "active", pendingEffect: null });
+  });
+});
+
 describe("runMigrationActivation: lease continuation (A2)", () => {
   it("renews after S7, before S12 and before S13b", async () => {
     const f = await fixture();
@@ -968,6 +1013,56 @@ describe("runMigrationActivation: classification refusals and interruptions", ()
     let reads = 0;
     j.guard.read = async (input) => (reads++ === 0 ? null : read(input));
     expect(await j.run()).toMatchObject({ status: "refused", step: "S2", reason: "lease-unresolvable" });
+  });
+
+  it("S2: a fence row the real guard cannot decode refuses lease-unresolvable, a decodable foreign row refuses lease-conflict", async () => {
+    const row = (operation: string, publication: string) => ({
+      project_id: REMOTE, owner_machine_id: MACHINE, owner_process_id: publication, operation, fencing_token: "1",
+      acquired_at: "2026-10-16T00:00:00.000Z", renewed_at: "2026-10-16T00:00:00.000Z", expires_at: "2999-01-01T00:00:00.000Z",
+      released_at: null, expired: false,
+    });
+    const realGuardOver = (stored: ReturnType<typeof row>) => {
+      const query = async () => ({ rows: [stored] });
+      return new PostgreSqlBackendPublicationGuard({
+        projectPublicationTransaction: async (_projectId: string, callback: (scope: unknown) => Promise<unknown>) => callback({
+          transactionScope: "active", query, savepoint: async (inner: (scope: { query: typeof query }) => Promise<unknown>) => inner({ query }),
+        }),
+        projectPublicationReadback: async () => ({ rows: [stored] }),
+      } as unknown as PostgreSqlBackendPublicationControlExecutor);
+    };
+    const runWith = async (stored: ReturnType<typeof row>) => {
+      const f = await fixture();
+      const guard = realGuardOver(stored);
+      const outcome = await f.run({ createOrdinaryRuntime: (settings) => ({ ...f.deps.createOrdinaryRuntime(settings), backendPublicationGuard: () => guard }) });
+      return { f, outcome };
+    };
+    // The #628 rehearsal row: this machine, an undecodable operation string.
+    const undecodable = await runWith(row("rehearsal-contention", "rehearsal-competing-owner"));
+    expect(undecodable.outcome).toMatchObject({ status: "refused", step: "S2", reason: "lease-unresolvable" });
+    expect(undecodable.f.manifestStore.read(GENERATION).phase).toBe("verified");
+    const foreign = await runWith(row("backend-publication:postgresql:" + "f".repeat(64), "someone-else"));
+    expect(foreign.outcome).toMatchObject({ status: "refused", step: "S2", reason: "lease-conflict" });
+  });
+
+  it("S2: the takeover read classifies a different generation as lease-conflict, an undecodable row as lease-unresolvable, and rethrows anything else", async () => {
+    const failRead = async (error: unknown) => {
+      const f = await fixture();
+      f.guard.seed({ projectId: REMOTE, publicationId: f.publicationId, databaseExpired: true });
+      f.guard.read = async () => { throw error; };
+      return f.run();
+    };
+    expect(await failRead(new PostgreSqlBackendPublicationGuardError(REMOTE, "read", "fence-mismatch"))).toMatchObject({ status: "refused", step: "S2", reason: "lease-conflict" });
+    expect(await failRead(new PostgreSqlBackendPublicationGuardError(REMOTE, "read", "invalid-row"))).toMatchObject({ status: "refused", step: "S2", reason: "lease-unresolvable" });
+    await expect(failRead(new PostgreSqlBackendPublicationGuardError(REMOTE, "read", "invalid-input"))).rejects.toMatchObject({ reason: "invalid-input" });
+    await expect(failRead(new Error("read exploded"))).rejects.toThrow("read exploded");
+    const g = await fixture();
+    g.guard.seed({ projectId: REMOTE, publicationId: g.publicationId, databaseExpired: true });
+    const acquire = g.guard.acquire.bind(g.guard);
+    g.guard.acquire = async (input) => {
+      if (input.expectedFencingToken !== undefined) throw new PostgreSqlBackendPublicationGuardError(input.projectId, "acquire", "invalid-row");
+      return acquire(input);
+    };
+    expect(await g.run()).toMatchObject({ status: "refused", step: "S2", reason: "lease-unresolvable" });
   });
 
   it("renew after S7: a stale caller token is renewed with the returned token; a vanished row refuses lease-conflict; an ambiguous renew refuses lease-unresolvable", async () => {
@@ -1596,10 +1691,11 @@ describe("runMigrationActivation: S13b and S16 readback rows", () => {
 
   it("S16: the manifest re-read fails or is not this activation's publish-activation", async () => {
     const f = await fixture();
+    // Manifest reads: 1 is the pre-barrier absence probe, 2 is step C, 3 is the S16 re-read.
     await stopAt(f, "after-drive");
-    expect(await f.run({ manifestStore: countedStore(f, { readAt: [2, () => { throw new Error("re-read failed"); }] }) })).toMatchObject({ status: "interrupted", step: "S16", cause: "state-unresolvable", applied: "yes", reportStored: "no" });
-    expect(await f.run({ manifestStore: countedStore(f, { readAt: [2, (m) => ({ ...m, phase: "verified" as const })] }) })).toMatchObject({ status: "interrupted", step: "S16", cause: "readback-mismatch" });
-    expect(await f.run({ manifestStore: countedStore(f, { readAt: [2, (m) => ({ ...m, pendingEffect: { ...m.pendingEffect!, effectId: "publish-activation-other" } })] }) })).toMatchObject({ status: "interrupted", step: "S16", cause: "readback-mismatch" });
+    expect(await f.run({ manifestStore: countedStore(f, { readAt: [3, () => { throw new Error("re-read failed"); }] }) })).toMatchObject({ status: "interrupted", step: "S16", cause: "state-unresolvable", applied: "yes", reportStored: "no" });
+    expect(await f.run({ manifestStore: countedStore(f, { readAt: [3, (m) => ({ ...m, phase: "verified" as const })] }) })).toMatchObject({ status: "interrupted", step: "S16", cause: "readback-mismatch" });
+    expect(await f.run({ manifestStore: countedStore(f, { readAt: [3, (m) => ({ ...m, pendingEffect: { ...m.pendingEffect!, effectId: "publish-activation-other" } })] }) })).toMatchObject({ status: "interrupted", step: "S16", cause: "readback-mismatch" });
   });
 
   it("S16: the publication journal re-read fails or is not this publication's completed journal", async () => {
@@ -2156,6 +2252,127 @@ describe("runMigrationActivation: S7 classifies target failures like S6 (PR #162
     expectActivated(f, await f.run(), "prepare-activation-pending");
   });
 });
+
+describe("runMigrationActivation: classification before initialization (#1618)", () => {
+  const scratchEntries = (f: Fixture) => readdirSync(lcmHomeDir(f.homeDir)).filter((name) => name.startsWith("activation-scratch-"));
+  const row = (f: Fixture) => f.guard.rows.get(REMOTE)!;
+
+  it("production dependencies on a home without .lcm, or without the home itself, refuse manifest-absent and create nothing", async () => {
+    const f = await fixture();
+    const parent = mkdtempSync(join(tmpdir(), "lcm-activate-generation-uninitialized-"));
+    roots.push(parent);
+    const bare = join(parent, "bare");
+    mkdirSync(bare, { mode: 0o700 });
+    const missing = join(parent, "missing");
+    for (const homeDir of [bare, missing]) {
+      const outcome = await runMigrationActivation({ ...f.input, homeDir });
+      expect(outcome).toEqual({ status: "refused", step: "S0", reason: "manifest-absent", detail: expect.stringContaining(GENERATION), effectBegun: false });
+    }
+    expect(readdirSync(bare)).toEqual([]);
+    expect(existsSync(missing)).toBe(false);
+  });
+
+  it("a manifest that vanishes between the pre-barrier probe and step C is still the S0 manifest-absent refusal", async () => {
+    const f = await fixture();
+    const vanished = countedStore(f, { readAt: [2, () => { throw new MigrationProtocolError("unexpected-state", "migration manifest head is absent"); }] });
+    expect(await f.run({ manifestStore: vanished })).toMatchObject({ status: "refused", step: "S0", reason: "manifest-absent", effectBegun: false });
+  });
+
+  it("an unregistered, pending or unreadable machine identity refuses S0 state-unresolvable before any runtime opens; other errors rethrow", async () => {
+    const f = await fixture();
+    const createOrdinaryRuntime = vi.fn(f.deps.createOrdinaryRuntime);
+    const failures: Array<[unknown, RegExp]> = [
+      [new MachineIdentityFileError("machine identity is not registered", "Run lcm machine register"), /not registered/u],
+      [Object.assign(new Error("EACCES: permission denied"), { code: "EACCES" }), /EACCES/u],
+    ];
+    for (const [error, detail] of failures) {
+      const outcome = await f.run({ createOrdinaryRuntime, machineId: () => { throw error; } });
+      expect(outcome).toMatchObject({ status: "refused", step: "S0", reason: "state-unresolvable", effectBegun: false });
+      expect((outcome as { detail: string }).detail).toMatch(detail);
+    }
+    expect(createOrdinaryRuntime).not.toHaveBeenCalled();
+    expect(f.guard.rows.size).toBe(0);
+    expect(f.manifestStore.read(GENERATION).phase).toBe("verified");
+    await expect(f.run({ machineId: () => { throw new RangeError("not a file error"); } })).rejects.toBeInstanceOf(RangeError);
+    await expect(f.run({ machineId: () => { throw "not an error"; } })).rejects.toBe("not an error");
+  });
+
+  it("the production identity read maps an unregistered identity the same way", async () => {
+    const f = await fixture();
+    rmSync(join(lcmHomeDir(f.homeDir), "machine.json"));
+    const outcome = await f.run({ machineId: createMigrationActivationDependencies({ homeDir: f.homeDir }).machineId });
+    expect(outcome).toMatchObject({ status: "refused", step: "S0", reason: "state-unresolvable", detail: expect.stringMatching(/machine identity is not registered/u) });
+  });
+
+  it("an identity failure on an effect-begun re-entry is the roll-forward interruption", async () => {
+    const f = await fixture();
+    await stopAt(f, "after-prepare-begin");
+    const outcome = await f.run({ machineId: () => { throw new MachineIdentityFileError("machine registration is pending", "Run lcm machine register"); } });
+    expect(outcome).toMatchObject({ status: "interrupted", step: "S9", cause: "state-unresolvable", effectBegun: true, detail: expect.stringMatching(/^S0 state-unresolvable on roll-forward: .*registration is pending/u) });
+    expectActivated(f, await f.run(), "prepare-activation-pending");
+  });
+
+  it("the settled-active path does not need the machine identity", async () => {
+    const f = await fixture();
+    expectActivated(f, await f.run(), "fresh");
+    const second = await f.run({ machineId: () => { throw new Error("must not read the identity"); } });
+    expect(second).toMatchObject({ status: "activated", resumedFrom: "settled-active" });
+  });
+
+  it("an ordinary refusal before S7 never allocates the census scratch directory", async () => {
+    const f = await fixture({ held: false });
+    const allocateScratch = vi.fn(f.deps.allocateScratch);
+    expect(await f.run({ allocateScratch })).toMatchObject({ status: "refused", step: "S3", reason: "maintenance-not-held" });
+    expect(allocateScratch).not.toHaveBeenCalled();
+    expect(scratchEntries(f)).toEqual([]);
+  });
+
+  it("S7 allocates its scratch directory immediately before the census read and removes it on success and on census failure", async () => {
+    const f = await fixture();
+    const allocated: string[] = [];
+    const seen: boolean[] = [];
+    const allocateScratch = (home: string) => { const dir = f.deps.allocateScratch(home); allocated.push(dir); return dir; };
+    const readDestinationCensus: typeof f.deps.readDestinationCensus = async (session, input) => {
+      seen.push(input.scratchParent === allocated[0] && existsSync(input.scratchParent) && scratchEntries(f).length === 1);
+      return f.deps.readDestinationCensus(session, input);
+    };
+    expectActivated(f, await f.run({ allocateScratch, readDestinationCensus }), "fresh");
+    expect(seen).toEqual([true]);
+    expect(allocated).toHaveLength(1);
+    expect(existsSync(allocated[0]!)).toBe(false);
+    expect(scratchEntries(f)).toEqual([]);
+
+    const g = await fixture();
+    const dirs: string[] = [];
+    const failed = await g.run({
+      allocateScratch: (home) => { const dir = g.deps.allocateScratch(home); dirs.push(dir); return dir; },
+      readDestinationCensus: async () => { throw new StorageOperationError("STORAGE_CLOSED", "postgresql", undefined, "factory", "census"); },
+    });
+    expect(failed).toMatchObject({ status: "refused", step: "S7", reason: "target-unresolvable" });
+    expect(dirs).toHaveLength(1);
+    expect(existsSync(dirs[0]!)).toBe(false);
+    expect(scratchEntries(g)).toEqual([]);
+  });
+
+  it("a scratch allocation failure refuses S7 state-unresolvable without reading the census, releasing the lease; on re-entry it interrupts and keeps it", async () => {
+    const f = await fixture();
+    const readDestinationCensus = vi.fn(f.deps.readDestinationCensus);
+    const allocateScratch = () => { throw Object.assign(new Error("EACCES: scratch"), { code: "EACCES" }); };
+    const outcome = await f.run({ allocateScratch, readDestinationCensus });
+    expect(outcome).toMatchObject({ status: "refused", step: "S7", reason: "state-unresolvable", effectBegun: false, detail: expect.stringMatching(/scratch directory could not be allocated: EACCES: scratch/u) });
+    expect(readDestinationCensus).not.toHaveBeenCalled();
+    expect(row(f).releasedAt).not.toBeNull();
+    expect(f.manifestStore.read(GENERATION).phase).toBe("verified");
+
+    const g = await fixture();
+    await stopAt(g, "after-prepare-begin");
+    const resumed = await g.run({ allocateScratch });
+    expect(resumed).toMatchObject({ status: "interrupted", step: "S9", cause: "state-unresolvable", effectBegun: true, detail: expect.stringMatching(/^S7 state-unresolvable on roll-forward: /u) });
+    expect(row(g).releasedAt).toBeNull();
+    expectActivated(g, await g.run(), "prepare-activation-pending");
+  });
+});
+
 
 describe("runMigrationActivation: the release tail and the abort family are driven without an own fence (PR #1628 review)", () => {
   const row = (f: Fixture) => f.guard.rows.get(REMOTE);

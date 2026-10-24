@@ -1,0 +1,12 @@
+references: ["#1693"]
+rationale: >-
+  #1693 makes the passive-event repository and the replication worker share one
+  payload equivalence for a pending event copied by the cutover. Both files
+  keep their existing PostgreSQL passive-event owner; no file is added, removed
+  or moved. The events validate command now reuses the daemon envelope
+  comparison, so bin/lcm.ts changes behavior and keeps its existing unit-cli
+  owner.
+pins:
+  - ["src/storage/postgresql/passive-event-repository.ts", "integration-postgresql-passive-events"]
+  - ["src/daemon/passive-event-replication.ts", "integration-postgresql-passive-events"]
+  - ["bin/lcm.ts", "unit-cli"]

@@ -1,0 +1,10 @@
+references: ["#1618"]
+rationale: >-
+  Migration activation classifies an uninitialized LCM home as the S0
+  manifest-absent refusal before the append barrier can create the home, reads
+  the machine identity only once an ordinary runtime is about to open, and
+  reports an unreadable identity or a census scratch allocation failure as a
+  state-unresolvable refusal. The orchestrator stays in migration cutover. No
+  production file is added, removed, moved, or re-owned.
+pins:
+  - ["src/migration/activate-generation.ts", "unit-migration-cutover"]

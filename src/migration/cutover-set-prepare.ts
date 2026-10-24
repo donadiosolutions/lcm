@@ -360,7 +360,13 @@ type FreshPlan = Readonly<{
  * is written.
  */
 async function planFresh(ctx: Context, token: BackendPublicationLockToken, confirmed: boolean): Promise<FreshPlan> {
-  const resolution = (ctx.ops.resolveAuthorities ?? resolveCutoverSetMemberAuthorities)({ homeDir: ctx.homeDir, lockToken: token });
+  // Both callers precede the confirmation comparison, so the lookup publishes nothing (#1670); the
+  // post-confirmation rebuild in enterFresh still resolves and publishes normally.
+  const resolution = (ctx.ops.resolveAuthorities ?? resolveCutoverSetMemberAuthorities)({
+    homeDir: ctx.homeDir,
+    lockToken: token,
+    suppressMetadataBackfill: true,
+  });
   const outcomes = resolution.status === "resolved" ? [...resolution.outcomes].sort(byProject) : [];
   const authenticated = outcomes.filter((outcome): outcome is Authenticated => outcome.status === "authenticated");
   const ids = new Map<string, string>();
