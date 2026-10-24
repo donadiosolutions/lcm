@@ -1,0 +1,9 @@
+references: ["#1676"]
+rationale: >-
+  #1676 lets an empty enrolled project verify as activation eligible through an
+  empty-source search witness. The verification driver gains the witness and
+  its audit description gains matching text; both stay with their existing
+  migration cutover owner.
+pins:
+  - ["src/migration/verify-generation.ts", "unit-migration-cutover"]
+  - ["src/migration/witness-audit.ts", "unit-migration-cutover"]
