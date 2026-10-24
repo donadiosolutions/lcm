@@ -252,6 +252,10 @@ function readbackSettledAbort(input: Readonly<{
     ...(evidence === undefined ? {} : { evidence }),
     ...(applied ? { applied: true as const } : {}),
   });
+  // A set abort names the member whose manifest could not be read back; a
+  // single-generation abort keeps its bare evidence.
+  const memberEvidence = (generationId: string, evidence: string): string =>
+    journal.cutoverSet === undefined ? evidence : `${generationId}:${evidence}`;
   const finalJournal = input.readJournal(input.homeDir);
   // The postcondition is this generation's aborted journal, read back. Any
   // other terminal journal (a later generation that entered and settled
@@ -267,7 +271,7 @@ function readbackSettledAbort(input: Readonly<{
   for (const generationId of abortManifestGenerationIds(journal)) {
     const presence = store.probeManifestPresence(generationId);
     if (presence.status === "unresolvable") {
-      return readbackRefusal("abort-unresolvable", `manifest-${presence.reason}`);
+      return readbackRefusal("abort-unresolvable", memberEvidence(generationId, `manifest-${presence.reason}`));
     }
     // Genuinely absent is a legitimate terminal state (aborted before
     // capture ever reached genesis), not a readback failure.
@@ -276,7 +280,7 @@ function readbackSettledAbort(input: Readonly<{
     try {
       manifest = store.read(generationId);
     } catch (error) {
-      return readbackRefusal("abort-unresolvable", manifestProtocolEvidence(error));
+      return readbackRefusal("abort-unresolvable", memberEvidence(generationId, manifestProtocolEvidence(error)));
     }
     const recovery = classifyMigrationRecovery(manifest);
     if (recovery.action !== "settled") {
