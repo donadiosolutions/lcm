@@ -572,6 +572,55 @@ export class PostgreSqlIdentityRepository {
     }
   }
 
+  /**
+   * Brings an existing project's alias set to exactly `aliases` for one
+   * machine in a single transaction: inserts the missing rows and writes
+   * nothing when the set already matches. Returns `null`, with nothing
+   * written, when the project holds any alias outside the set (another
+   * machine, another path) or any requested alias is owned by another project
+   * or stored under a different path or normalized path.
+   */
+  async ensureProjectAliases(input: {
+    readonly machineId: string;
+    readonly projectId: string;
+    readonly aliases: readonly RemoteProjectAliasInput[];
+  }): Promise<{ readonly inserted: number } | null> {
+    return this.executor.transaction(async (transaction) => {
+      const current = await transaction.query<AliasRow>({
+        text: `SELECT project_id, machine_id, path, normalized_path, linked_at
+               FROM lcm.project_aliases
+               WHERE project_id = $1
+                  OR (
+                    machine_id = $2
+                    AND (normalized_path = ANY($3::text[]) OR path = ANY($4::text[]))
+                  )`,
+        values: [
+          input.projectId,
+          input.machineId,
+          input.aliases.map(({ normalizedPath }) => normalizedPath),
+          input.aliases.map(({ path }) => path),
+        ],
+      }, projectScopeOptions("ensureProjectAliases", [input.projectId]));
+      const wanted = new Map(input.aliases.map((alias) => [alias.normalizedPath, alias]));
+      for (const row of current.rows) {
+        const alias = row.machine_id === input.machineId ? wanted.get(row.normalized_path) : undefined;
+        if (row.project_id !== input.projectId || alias === undefined || alias.path !== row.path) return null;
+      }
+      const present = new Set(current.rows.map((row) => row.normalized_path));
+      let inserted = 0;
+      for (const alias of input.aliases) {
+        if (present.has(alias.normalizedPath)) continue;
+        await this.linkWithExecutor(transaction, {
+          machineId: input.machineId,
+          projectId: input.projectId,
+          ...alias,
+        });
+        inserted += 1;
+      }
+      return { inserted };
+    }, projectScopeOptions("ensureProjectAliases", [input.projectId]));
+  }
+
   async replaceProjectAlias(input: {
     readonly machineId: string;
     readonly expectedPriorProjectId: string;
