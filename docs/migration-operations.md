@@ -835,6 +835,11 @@ processed to completion by any specific point in the migration sequence. **The d
 follows activation is what resumes processing** of anything still pending, not the
 migration commands themselves. Do not assume a pending backlog is empty because `apply` succeeded.
 
+A pending hook event that crossed the cutover is delivered once, by the first replication pass after
+that restart. The migration copy and the replication upload record its creation time in two textual
+forms, and replication treats both forms of the same instant as the same event, so the copy already
+in the project is adopted and acknowledged rather than rejected as a conflicting duplicate.
+
 ## Fencing residue: what this command group does not protect against
 
 The maintenance hold and every refusal in this command group fence **same-host LCM processes only**.

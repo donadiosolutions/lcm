@@ -1,0 +1,9 @@
+references: ["#1693"]
+rationale: >-
+  #1693 makes the passive-event repository and the replication worker share one
+  payload equivalence for a pending event copied by the cutover. Both files
+  keep their existing PostgreSQL passive-event owner; no file is added, removed
+  or moved.
+pins:
+  - ["src/storage/postgresql/passive-event-repository.ts", "integration-postgresql-passive-events"]
+  - ["src/daemon/passive-event-replication.ts", "integration-postgresql-passive-events"]
