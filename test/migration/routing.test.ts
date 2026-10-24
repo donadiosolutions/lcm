@@ -122,6 +122,51 @@ describe("rows 11, 12 and 24 are live: the non-owner exit is 6 when a pending ef
   });
 });
 
+/** Bug #1679: the two interrupted activation windows that used to fall through to row 25. */
+describe("row 11 also owns the interrupted activation windows (Bug #1679)", () => {
+  const HELD_COMPLETE = { snapshot: "complete" } as const;
+  const OWNER = { primary: "activate", allowed: ["resume"] };
+
+  it.each([
+    ["held, complete snapshot, verified + pending prepare-activation (crash after-prepare-begin)", cell({ ...HELD_COMPLETE, manifest: manifest("verified", "prepare-activation") }), 6],
+    ["held, complete snapshot, activating + nothing pending (crash after-prepare-complete)", cell({ ...HELD_COMPLETE, manifest: manifest("activating") }), 2],
+    ["held, complete snapshot, activating + pending publish-activation, link absent (crash after-publish-begin)", cell({ ...HELD_COMPLETE, manifest: manifest("activating", "publish-activation") }), 6],
+    ["held, complete snapshot, activating + pending publish-activation, link present (crash after-link)", cell({ ...HELD_COMPLETE, manifest: manifest("activating", "publish-activation"), link: OWN_LINK }), 6],
+    ["own completed publication, activating + pending publish-activation (crash after-drive or after-report)", cell({ journal: publication("completed"), link: OWN_LINK, manifest: manifest("activating", "publish-activation") }), 6],
+  ])("%s -> row 11", (_name, input, exit) => {
+    const route = routeMigrationGeneration(input);
+    expect(route.row).toBe(11);
+    expect(route.primary).toBe(OWNER.primary);
+    expect([...route.allowed]).toEqual(OWNER.allowed);
+    expect(route.exitIfRefused).toBe(exit);
+  });
+
+  it.each([
+    ["activating + prepare-rollback stays the rollback owner", cell({ ...HELD_COMPLETE, manifest: manifest("activating", "prepare-rollback") }), 12],
+    ["activating + publish-rollback stays the rollback owner", cell({ ...HELD_COMPLETE, manifest: manifest("activating", "publish-rollback") }), 12],
+    ["rolling-back + prepare-activation stays the rollback owner", cell({ ...HELD_COMPLETE, manifest: manifest("rolling-back", "prepare-activation") }), 12],
+    ["rolling-back + publish-activation stays the rollback owner", cell({ ...HELD_COMPLETE, manifest: manifest("rolling-back", "publish-activation") }), 12],
+    ["activating + verify-dry-run stays row 20", cell({ ...HELD_COMPLETE, manifest: manifest("activating", "verify-dry-run") }), 20],
+    ["activating + copy-batch stays row 21", cell({ ...HELD_COMPLETE, manifest: manifest("activating", "copy-batch") }), 21],
+    ["activating + verify-generation stays row 23", cell({ ...HELD_COMPLETE, manifest: manifest("activating", "verify-generation") }), 23],
+    ["verified with nothing pending stays row 24", cell({ ...HELD_COMPLETE, manifest: manifest("verified") }), 24],
+    ["a hold for another generation still wins at row 4", cell({ ...HELD_COMPLETE, journal: held("maintenance-held", "other"), manifest: manifest("activating") }), 4],
+    ["an absent snapshot is never row 11 (activating, nothing pending)", cell({ snapshot: "absent", manifest: manifest("activating") }), 25],
+    ["an absent snapshot is never row 11 (verified + prepare-activation)", cell({ snapshot: "absent", manifest: manifest("verified", "prepare-activation") }), 25],
+    ["a tampered snapshot with verified and nothing pending stays row 17", cell({ snapshot: "tampered", manifest: manifest("verified") }), 17],
+    ["a partial snapshot with activating + publish-activation stays row 18", cell({ snapshot: "partial", manifest: manifest("activating", "publish-activation") }), 18],
+    ["a partial snapshot with activating and nothing pending stays row 25", cell({ snapshot: "partial", manifest: manifest("activating") }), 25],
+    ["own completed publication + active manifest stays row 10", cell({ journal: publication("completed"), link: OWN_LINK, manifest: manifest("active") }), 10],
+    ["own completed publication + rolling-back stays row 12", cell({ journal: publication("completed"), link: OWN_LINK, manifest: manifest("rolling-back") }), 12],
+    ["own completed publication + active + prepare-rollback stays row 12", cell({ journal: publication("completed"), link: OWN_LINK, manifest: manifest("active", "prepare-rollback") }), 12],
+    ["own completed publication + rolled-back stays row 13", cell({ journal: publication("completed"), link: OWN_LINK, manifest: manifest("rolled-back") }), 13],
+    ["own completed publication + activating with nothing pending stays row 25", cell({ journal: publication("completed"), link: OWN_LINK, manifest: manifest("activating") }), 25],
+    ["a foreign completed publication + activating + publish-activation stays row 3", cell({ journal: publication("completed"), manifest: manifest("activating", "publish-activation") }), 3],
+  ])("%s", (_name, input, row) => {
+    expect(routeMigrationGeneration(input).row).toBe(row);
+  });
+});
+
 const PHASES_MANIFEST: readonly MigrationPhase[] = [
   "planned", "dry-run-verified", "copying", "copied", "verified", "activating", "active", "rolling-back", "rolled-back", "aborted",
 ];
