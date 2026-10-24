@@ -123,7 +123,7 @@ describe("round-1 classified reasons (B-5, A-9, A-11, A-7)", () => {
     expect(migrationRefusalMapping(reason).exitClass).toBe(exitClass);
   });
 
-  it("the hold-entry reasons never tell the operator to abort: a failed entry can leave only a maintenance-entering hold, inspected with report (A-11)", () => {
+  it("the hold-entry reasons never tell the operator to abort: applied: true means a maintenance hold may remain, inspected with report before recovery (A-11)", () => {
     const holdEntry = MIGRATION_REFUSAL_REASONS.filter((entry) => entry.reason.startsWith("hold-entry-") && entry.reason !== "hold-entry-readback-mismatch");
     expect(holdEntry.map((entry) => entry.reason).sort()).toEqual([
       "hold-entry-contention", "hold-entry-evidence", "hold-entry-precondition", "hold-entry-slot-occupied",

@@ -144,24 +144,25 @@ export const MIGRATION_REFUSAL_REASONS: readonly MigrationRefusalMapping[] = Obj
   // --- Section 4.4/4.9: hold entry ---
   // Round-1 B-5/A-11: the fresh hold entry's failures are classified by
   // reason, each with a remedy that matches the fact. None of them names
-  // `abort`: a failed entry can still leave its own `maintenance-entering`
-  // hold (the envelope then reports `applied: true`), which the operator
-  // inspects with `lcm migration report` before recovering.
+  // `abort`: `applied: true` means the invocation changed or may have
+  // changed state (an identity mutation, a hold write observed on readback,
+  // or a readback that failed), so a maintenance hold may remain and the
+  // operator inspects `lcm migration report` before recovering.
   Object.freeze({
     reason: "hold-entry-contention", exitClass: "refused-contention",
-    remedy: "Another actor holds the publication lock, so the maintenance hold was not entered. Wait, then retry `lcm migration apply`. If the envelope reports `applied: true`, the failed entry left a `maintenance-entering` hold: run `lcm migration report` and inspect it before recovering.",
+    remedy: "Another actor holds the publication lock, so the maintenance hold was not entered. Wait, then retry `lcm migration apply`. If the envelope reports `applied: true`, this invocation changed or may have changed state and a maintenance hold (`maintenance-entering` or `maintenance-held`) may remain: inspect `lcm migration report` and the identity evidence before recovering.",
   }),
   Object.freeze({
     reason: "hold-entry-slot-occupied", exitClass: "refused-contention",
-    remedy: "A publication or another maintenance hold occupies the journal slot. Wait for it to finish, then re-run `lcm migration plan`. If the envelope reports `applied: true`, the failed entry left a `maintenance-entering` hold: run `lcm migration report` and inspect it before recovering.",
+    remedy: "A publication or another maintenance hold occupies the journal slot. Wait for it to finish, then re-run `lcm migration plan`. If the envelope reports `applied: true`, this invocation changed or may have changed state and a maintenance hold (`maintenance-entering` or `maintenance-held`) may remain: inspect `lcm migration report` and the identity evidence before recovering.",
   }),
   Object.freeze({
     reason: "hold-entry-precondition", exitClass: "refused-precondition",
-    remedy: "The maintenance journal changed while the hold was being entered. Re-run `lcm migration plan` and confirm the id it prints. If the envelope reports `applied: true`, the failed entry left a `maintenance-entering` hold: run `lcm migration report` and inspect it before recovering.",
+    remedy: "The maintenance journal changed while the hold was being entered. Re-run `lcm migration plan` and confirm the id it prints. If the envelope reports `applied: true`, this invocation changed or may have changed state and a maintenance hold (`maintenance-entering` or `maintenance-held`) may remain: inspect `lcm migration report` and the identity evidence before recovering.",
   }),
   Object.freeze({
     reason: "hold-entry-evidence", exitClass: "refused-evidence",
-    remedy: "The maintenance journal could not be read or verified while entering the hold. Run `lcm doctor` before retrying. If the envelope reports `applied: true`, the failed entry left a `maintenance-entering` hold: run `lcm migration report` and inspect it before recovering.",
+    remedy: "The maintenance journal could not be read or verified while entering the hold. Run `lcm doctor` before retrying. If the envelope reports `applied: true`, this invocation changed or may have changed state and a maintenance hold (`maintenance-entering` or `maintenance-held`) may remain: inspect `lcm migration report` and the identity evidence before recovering.",
   }),
   Object.freeze({
     reason: "hold-entry-readback-mismatch", exitClass: "refused-evidence",

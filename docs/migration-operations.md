@@ -396,10 +396,11 @@ knowing by name:
   immediately before it takes the hold. If another local actor occupied your candidate generation
   in between, the second check refuses `confirmation-generation-moved` and nothing is written.
 - `hold-entry-contention` / `hold-entry-slot-occupied` (exit 4), `hold-entry-precondition`
-  (exit 2), `hold-entry-evidence` (exit 5): the maintenance hold was not completed. A failure
-  between the hold's two journal writes can leave a `maintenance-entering` hold; the envelope then
-  reports `applied: true` (it also does when the journal cannot be read back to tell). Run
-  `lcm migration report` and inspect the journal before recovering. With `applied: false`
+  (exit 2), `hold-entry-evidence` (exit 5): the maintenance hold was not completed. With
+  `applied: true` the invocation changed or may have changed state: a failure between the hold's two
+  journal writes can leave a `maintenance-entering` hold, a `maintenance-held` hold may remain, the
+  identity step may have written, or the journal could not be read back to tell. Run
+  `lcm migration report` and inspect the journal and the identity evidence before recovering. With `applied: false`
   nothing was written and there is nothing of yours to `abort`: wait for the other actor, or
   re-run `plan`, or run `lcm doctor`, as the remedy says.
 - `capture-contention` (exit 4) / `capture-unresolvable` (exit 5): capture was interrupted after the
@@ -992,22 +993,22 @@ block marks implemented. `canEmit` is the closed set of exit classes the command
     {
       "reason": "hold-entry-contention",
       "exitClass": "refused-contention",
-      "remedy": "Another actor holds the publication lock, so the maintenance hold was not entered. Wait, then retry `lcm migration apply`. If the envelope reports `applied: true`, the failed entry left a `maintenance-entering` hold: run `lcm migration report` and inspect it before recovering."
+      "remedy": "Another actor holds the publication lock, so the maintenance hold was not entered. Wait, then retry `lcm migration apply`. If the envelope reports `applied: true`, this invocation changed or may have changed state and a maintenance hold (`maintenance-entering` or `maintenance-held`) may remain: inspect `lcm migration report` and the identity evidence before recovering."
     },
     {
       "reason": "hold-entry-slot-occupied",
       "exitClass": "refused-contention",
-      "remedy": "A publication or another maintenance hold occupies the journal slot. Wait for it to finish, then re-run `lcm migration plan`. If the envelope reports `applied: true`, the failed entry left a `maintenance-entering` hold: run `lcm migration report` and inspect it before recovering."
+      "remedy": "A publication or another maintenance hold occupies the journal slot. Wait for it to finish, then re-run `lcm migration plan`. If the envelope reports `applied: true`, this invocation changed or may have changed state and a maintenance hold (`maintenance-entering` or `maintenance-held`) may remain: inspect `lcm migration report` and the identity evidence before recovering."
     },
     {
       "reason": "hold-entry-precondition",
       "exitClass": "refused-precondition",
-      "remedy": "The maintenance journal changed while the hold was being entered. Re-run `lcm migration plan` and confirm the id it prints. If the envelope reports `applied: true`, the failed entry left a `maintenance-entering` hold: run `lcm migration report` and inspect it before recovering."
+      "remedy": "The maintenance journal changed while the hold was being entered. Re-run `lcm migration plan` and confirm the id it prints. If the envelope reports `applied: true`, this invocation changed or may have changed state and a maintenance hold (`maintenance-entering` or `maintenance-held`) may remain: inspect `lcm migration report` and the identity evidence before recovering."
     },
     {
       "reason": "hold-entry-evidence",
       "exitClass": "refused-evidence",
-      "remedy": "The maintenance journal could not be read or verified while entering the hold. Run `lcm doctor` before retrying. If the envelope reports `applied: true`, the failed entry left a `maintenance-entering` hold: run `lcm migration report` and inspect it before recovering."
+      "remedy": "The maintenance journal could not be read or verified while entering the hold. Run `lcm doctor` before retrying. If the envelope reports `applied: true`, this invocation changed or may have changed state and a maintenance hold (`maintenance-entering` or `maintenance-held`) may remain: inspect `lcm migration report` and the identity evidence before recovering."
     },
     {
       "reason": "hold-entry-readback-mismatch",
