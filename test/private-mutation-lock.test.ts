@@ -14,6 +14,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import {
+  createLockContentionDeadlineBudget,
   createLockContentionWaitBudget,
   isLiveForeignLockContention,
   LIVE_LOCK_RETRY_DELAY_MS,
@@ -1027,6 +1028,43 @@ describe("retrying a lock that a live foreign process holds", () => {
     budget.spend(500);
     expect(budget.remainingMs()).toBe(0);
     expect(createLockContentionWaitBudget(-5).remainingMs()).toBe(0);
+  });
+
+  it("starts a deadline budget on the first wait and counts all later time against it", async () => {
+    let now = 1_000;
+    const budget = createLockContentionDeadlineBudget(120, () => now);
+    expect(budget.remainingMs()).toBe(120);
+    now += 500;
+    expect(budget.remainingMs()).toBe(120);
+
+    let attempts = 0;
+    await retryWhileLiveLockContended(() => {
+      attempts += 1;
+      if (attempts === 1) throw liveContention();
+    }, { budget, _wait: async (milliseconds) => { waits.push(milliseconds); } });
+    // The first wait began the clock at 1,500; waiting itself costs the budget nothing extra.
+    expect(budget.remainingMs()).toBe(120);
+    expect(waits).toEqual([50]);
+
+    now += 100;
+    expect(budget.remainingMs()).toBe(20);
+    // Work between waits shortens the next pause and then ends the retries.
+    let later = 0;
+    await expect(retryWhileLiveLockContended(() => {
+      later += 1;
+      throw liveContention();
+    }, { budget, _wait: async (milliseconds) => { waits.push(milliseconds); now += milliseconds; } })).rejects.toThrow("busy");
+    expect(waits).toEqual([50, 20]);
+    expect(later).toBe(2);
+    expect(budget.remainingMs()).toBe(0);
+  });
+
+  it("clamps a negative deadline budget to nothing and defaults to the monotonic clock", () => {
+    expect(createLockContentionDeadlineBudget(-1).remainingMs()).toBe(0);
+    const budget = createLockContentionDeadlineBudget(10_000);
+    budget.begin!();
+    budget.spend(5);
+    expect(budget.remainingMs()).toBeGreaterThan(9_000);
   });
 
   it("recognizes only a live owner in another process", () => {

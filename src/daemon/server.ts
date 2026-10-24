@@ -51,6 +51,7 @@ import { createInvocationControlHandler } from "./routes/invocation-control.js";
 import { composeAbortSignals, throwIfAborted } from "./cancellation.js";
 import { createPublicationQueue } from "./publication-queue.js";
 import {
+  createLockContentionDeadlineBudget,
   createLockContentionWaitBudget,
   PrivateMutationLockContentionError,
   retryWhileLiveLockContended,
@@ -177,8 +178,10 @@ export type DaemonOptions = {
   _onRequestLifecycle?: (event: RequestLifecycleEvent, signal: AbortSignal) => void;
   /** @internal Queue-wait budget for a PostgreSQL read's admitted retry, in milliseconds. */
   _readAdmissionWaitMs?: number;
-  /** @internal Wait for a live lock owner shared by one capture request's admissions, in milliseconds. */
+  /** @internal Length of a capture request's wait for a live lock owner, counted from its first wait, in milliseconds. */
   _routeAdmissionWaitMs?: number;
+  /** @internal Monotonic clock for that wait. */
+  _routeAdmissionNow?: () => number;
   /** @internal Test-only observer for the closed built-in route registry. */
   _onBuiltInRouteRegistered?: (
     key: string,
@@ -191,7 +194,7 @@ const MAX_BODY_BYTES = 10 * 1024 * 1024; // 10 MB
 const MAX_REQUEST_CONFIG_BYTES = 4 * 1024 * 1024;
 const MAX_BUFFERED_RESPONSE_BYTES = MAX_BODY_BYTES;
 const READ_ADMISSION_WAIT_MS = 1000;
-/** Shared wait for a live lock owner across one capture request's admissions. */
+/** Deadline, from the first wait, for a live lock owner across one capture request's admissions. */
 const ROUTE_ADMISSION_CONTENTION_WAIT_MS = 3000;
 const ADMISSION_RETRY_ROUTES: ReadonlySet<string> = new Set(["POST /ingest", "POST /restore"]);
 
@@ -1130,7 +1133,10 @@ export async function createDaemon(config: DaemonConfig, options?: DaemonOptions
           const withPublicationAdmission = publicationAdmission(
             requestSignal,
             ADMISSION_RETRY_ROUTES.has(key)
-              ? createLockContentionWaitBudget(options?._routeAdmissionWaitMs ?? ROUTE_ADMISSION_CONTENTION_WAIT_MS)
+              ? createLockContentionDeadlineBudget(
+                options?._routeAdmissionWaitMs ?? ROUTE_ADMISSION_CONTENTION_WAIT_MS,
+                options?._routeAdmissionNow,
+              )
               : undefined,
           );
           await withPublicationAdmission(() => undefined);

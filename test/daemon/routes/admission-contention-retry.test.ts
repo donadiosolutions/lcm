@@ -23,7 +23,8 @@ const liveContention = (): PrivateMutationLockContentionError => new PrivateMuta
 type Harness = {
   daemon: DaemonInstance;
   lockCalls: () => number;
-  post: (path: string) => Promise<Response>;
+  cwd: string;
+  post: (path: string, body?: Record<string, unknown>) => Promise<Response>;
 };
 
 /**
@@ -47,6 +48,8 @@ async function withDaemon(
   mkdirSync(lcmDir, { recursive: true, mode: 0o700 });
   const configPath = join(lcmDir, "config.json");
   writeFileSync(configPath, "{}\n", { mode: 0o600 });
+  const cwd = join(home, "project");
+  mkdirSync(cwd, { mode: 0o700 });
   let attempts = 0;
   let daemon: DaemonInstance | undefined;
   try {
@@ -70,10 +73,11 @@ async function withDaemon(
     await scenario({
       daemon: running,
       lockCalls: () => attempts,
-      post: (path) => fetch("http://127.0.0.1:" + running.address().port + path, {
+      cwd,
+      post: (path, body = {}) => fetch("http://127.0.0.1:" + running.address().port + path, {
         method: "POST",
         headers: { "Content-Type": "application/json" },
-        body: "{}",
+        body: JSON.stringify(body),
       }),
     });
   } finally {
@@ -100,14 +104,57 @@ describe("capture route admission while a live process holds the publication loc
   });
 
   it.each(["/ingest", "/restore"])("stops waiting for %s once its allowance is spent", async (path) => {
+    // Each refused attempt moves the clock 50 ms, as one pause would.
+    let now = 0;
     await withDaemon({
-      refusal: () => liveContention(),
-      options: { _routeAdmissionWaitMs: 100 },
+      refusal: () => {
+        now += 50;
+        return liveContention();
+      },
+      options: { _routeAdmissionWaitMs: 100, _routeAdmissionNow: () => now },
     }, async (harness) => {
       const response = await harness.post(path);
 
       expect(response.status).toBe(500);
       expect(harness.lockCalls()).toBe(3);
+    });
+  });
+
+  it("counts the allowance from the first wait across the preflight and the handler admission", async () => {
+    let now = 0;
+    await withDaemon({
+      refusal: (attempt) => {
+        // Attempt 1 is refused (the clock starts), attempt 2 is the preflight's
+        // admission. The handler's admission comes after 5 s of request work.
+        if (attempt === 2) return undefined;
+        if (attempt >= 3) now += 5_000;
+        return liveContention();
+      },
+      options: { _routeAdmissionNow: () => now },
+    }, async (harness) => {
+      await harness.post("/restore", { cwd: harness.cwd, session_id: "s1" });
+
+      // The deadline passed during the request work, so the handler gets no pause.
+      expect(harness.lockCalls()).toBe(3);
+    });
+  });
+
+  it("still waits in a later scope while the deadline from the first wait has not passed", async () => {
+    let now = 0;
+    await withDaemon({
+      refusal: (attempt) => {
+        if (attempt === 1 || attempt === 3 || attempt === 4) {
+          now += 100;
+          return liveContention();
+        }
+        return undefined;
+      },
+      options: { _routeAdmissionNow: () => now },
+    }, async (harness) => {
+      await harness.post("/restore", { cwd: harness.cwd, session_id: "s1" });
+
+      // Preflight: refused then admitted; handler: refused twice, then admitted.
+      expect(harness.lockCalls()).toBeGreaterThanOrEqual(5);
     });
   });
 

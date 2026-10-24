@@ -324,8 +324,11 @@ export type HookAdmissionRetry = <T>(step: () => T | Promise<T>) => Promise<T>;
 export const HOOK_CONTENTION_WAIT_MS = 5_000;
 
 /**
- * Session-end runs under a short host timeout that the installed hook does not
- * set, so its allowance is small (20% of an assumed 1.5 second host timeout).
+ * Claude Code gives SessionEnd hooks 1.5 seconds by default (overridable per
+ * hook and with CLAUDE_CODE_SESSIONEND_HOOKS_TIMEOUT_MS, see
+ * https://code.claude.com/docs/en/hooks#sessionend-input) and the installed
+ * hook sets no timeout, so the allowance is 20% of that default. It bounds
+ * only the contention pauses, not the rest of the handler.
  */
 export const HOOK_SESSION_END_CONTENTION_WAIT_MS = 300;
 

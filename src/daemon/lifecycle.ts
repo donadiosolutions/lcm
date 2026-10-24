@@ -2183,23 +2183,34 @@ export async function ensureDaemon(opts: EnsureDaemonOptions): Promise<EnsureDae
     });
   }
   // The running daemon's own lock holds converge through the child wrapper.
-  // Contention owned by any other process is not the child's to settle, so
-  // only the final assertion falls back to the caller's wrapper for it. The
-  // lifecycle itself is never rerun.
+  // Every failed final attempt is classified again: contention owned by a
+  // live process that is not the child falls back to the caller's wrapper
+  // for one pause, after which the assertion returns to the child wrapper, so
+  // a daemon-owned lock never spends the caller's allowance. The lifecycle
+  // itself is never rerun.
   const finalWrap: PublicationAdmissionWrapper = childConvergence === undefined
     ? wrap
     : async (step) => {
-      try {
-        return await abortPreservingPublicationWrapper(opts, childConvergence)(step);
-      } catch (error) {
-        if (
-          !(error instanceof PrivateMutationLockContentionError)
-          || error.contendedLock === undefined
-          || error.contendedLock.owner.pid === childDaemonPid
-          || opts._withPublicationAdmissionRetry === undefined
-          || opts._abortSignal?.aborted
-        ) throw error;
-        return await wrap(step);
+      const convergent = abortPreservingPublicationWrapper(opts, childConvergence);
+      for (;;) {
+        try {
+          return await convergent(step);
+        } catch (error) {
+          if (
+            !(error instanceof PrivateMutationLockContentionError)
+            || error.contendedLock === undefined
+            || error.contendedLock.owner.pid === childDaemonPid
+            || opts._withPublicationAdmissionRetry === undefined
+            || opts._abortSignal?.aborted
+          ) throw error;
+          let refused = false;
+          await wrap(() => {
+            if (!refused) {
+              refused = true;
+              throw error;
+            }
+          });
+        }
       }
     };
   await finalWrap(() => assertLifecycleBackendPublication(opts));

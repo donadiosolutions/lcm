@@ -719,6 +719,8 @@ export const LIVE_LOCK_RETRY_DELAY_MS = 50;
 export type LockContentionWaitBudget = Readonly<{
   remainingMs: () => number;
   spend: (milliseconds: number) => void;
+  /** Called before each delay is computed; a deadline budget starts its clock on the first call. */
+  begin?: () => void;
 }>;
 
 export function createLockContentionWaitBudget(totalMs: number): LockContentionWaitBudget {
@@ -728,6 +730,25 @@ export function createLockContentionWaitBudget(totalMs: number): LockContentionW
     spend: (milliseconds) => {
       remaining = Math.max(0, remaining - milliseconds);
     },
+  };
+}
+
+/**
+ * A budget that is an absolute monotonic deadline, set when the first wait
+ * begins and reused by every later retry that shares it. Time spent between
+ * waits, in other admissions or in request work, counts against it.
+ */
+export function createLockContentionDeadlineBudget(
+  totalMs: number,
+  now: () => number = () => performance.now(),
+): LockContentionWaitBudget {
+  let deadline: number | undefined;
+  return {
+    begin: () => {
+      deadline ??= now() + Math.max(0, totalMs);
+    },
+    remainingMs: () => (deadline === undefined ? Math.max(0, totalMs) : Math.max(0, deadline - now())),
+    spend: () => undefined,
   };
 }
 
@@ -785,6 +806,7 @@ export async function retryWhileLiveLockContended<T>(
       return await step();
     } catch (error) {
       if (!isLiveForeignLockContention(error) || options.canRetry?.() === false) throw error;
+      options.budget.begin?.();
       const delay = Math.min(LIVE_LOCK_RETRY_DELAY_MS, options.budget.remainingMs());
       if (delay <= 0 || aborted()) throw error;
       const started = performance.now();

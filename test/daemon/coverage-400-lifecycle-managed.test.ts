@@ -1171,8 +1171,57 @@ describe("issue 400 managed ensure admission matrix", () => {
 
       await expect(ensureDaemon(options)).resolves.toMatchObject({ connected: true, pid: 4242 });
 
-      // Only the final assertion is rerun by the caller's wrapper: refused once, then admitted.
+      // Only the final assertion is rerun, one caller pause per refusal, then admitted.
       expect(publicationAssertions).toBe(4);
+      expect(waits).toEqual([50, 50]);
+    });
+
+    it("hands a lock that moves from a hook to the daemon back to child convergence", async () => {
+      let publicationAssertions = 0;
+      const waits: number[] = [];
+      let now = 0;
+      const fixture = createFixture({
+        isAlive: () => true,
+        fetch: sequenceFetch([
+          healthy(4242, "/tmp/lcm-daemon-entrypoint.mjs", { runtimeDigest: "a".repeat(64) }),
+          healthy(4242, "/tmp/lcm-daemon-entrypoint.mjs", { runtimeDigest: "a".repeat(64) }),
+          response({ totalConnections: 0 }),
+          healthy(4242, "/tmp/lcm-daemon-entrypoint.mjs", { runtimeDigest: "a".repeat(64) }),
+        ]),
+        sleep: async (ms) => { now += ms; },
+      });
+      setRunningProbe(fixture, 4242);
+      writeFileSync(fixture.tokenPath, "managed-token", { mode: 0o600 });
+      const options = optionsFor(fixture, {
+        expectedRuntimeDigest: "a".repeat(64),
+        _managedOperationAuthorized: true,
+        _managedOperationManagerPid: 4242,
+        _monotonicNowOverride: () => now,
+        _sleepOverride: async (ms) => { now += ms; },
+        _withPublicationAdmissionRetry: waitingRetry(waits),
+        _assertBackendPublication: () => {
+          publicationAssertions += 1;
+          // A hook holds the lock first, then the daemon does; both are refused once.
+          if (publicationAssertions === 2) throw foreignHolder("a hook holds the publication lock");
+          if (publicationAssertions === 3) {
+            throw new PrivateMutationLockContentionError("the daemon sweep now holds the publication lock");
+          }
+        },
+      });
+      Object.assign(options, {
+        _processStartTimeForTesting: () => "birth",
+        _readPrivateMutationLockOwnerForTesting: () => ({
+          version: 1,
+          pid: 4242,
+          processStartTime: "birth",
+          nonce: "a".repeat(32),
+        }),
+      });
+
+      await expect(ensureDaemon(options)).resolves.toMatchObject({ connected: true, pid: 4242 });
+
+      expect(publicationAssertions).toBe(4);
+      // Only the hook-owned refusal used the caller's allowance.
       expect(waits).toEqual([50]);
     });
 
