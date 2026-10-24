@@ -760,6 +760,18 @@ const MESSAGE_PARTS_TRANSCRIPT_COLUMNS = [
   "part_type",
 ] as const;
 
+// Roles provisioned before the message_parts transcript column grants hold
+// table-level SELECT on lcm.message_parts, which already covers these reads.
+// Canonical transfer lists the column grants as required, but their direct
+// absence is tolerated (presence stays sanctioned). inspectRelationAcl runs
+// before inspectColumnAcl and already requires the table-level SELECT, and
+// the effective-privilege check still proves the read.
+const LEGACY_TOLERATED_COLUMN_KEYS: ReadonlySet<string> = new Set(
+  MESSAGE_PARTS_TRANSCRIPT_COLUMNS.map((column) => (
+    privilegeKey(columnEntry("message_parts", column, "SELECT"))
+  )),
+);
+
 const OPTIONAL_COLUMN_PRIVILEGES: readonly ColumnPrivilegeSpec[] = [
   ["conversations", "project_id", "SELECT"],
   ["conversations", "conversation_id", "SELECT"],
@@ -2772,12 +2784,13 @@ async function inspectColumnAcl(
     values: [snapshot.tableIdentities.map((table) => `table|${table}`)],
   }, readinessOptions("inspectColumnAcl", signal));
   const requiredIdentities = new Map<string, string>();
+  const presentRequiredIdentities: string[] = [];
   for (const entry of manifest.required) {
     if (entry.kind !== "column" || entry.column === undefined) continue;
-    requiredIdentities.set(
-      privilegeKey(entry),
-      ["column", `${entry.object}|${entry.column}`, "runtime", "owner", entry.privilege, false].join("|"),
-    );
+    const key = privilegeKey(entry);
+    const identity = ["column", `${entry.object}|${entry.column}`, "runtime", "owner", entry.privilege, false].join("|");
+    requiredIdentities.set(key, identity);
+    if (!LEGACY_TOLERATED_COLUMN_KEYS.has(key)) presentRequiredIdentities.push(identity);
   }
   const optionalIdentities = new Map<string, string>();
   for (const entry of manifest.optional) {
@@ -2799,7 +2812,7 @@ async function inspectColumnAcl(
   }
   if (
     [...actual].some((entry) => !allowedIdentities.has(entry))
-    || [...requiredIdentities.values()].some((entry) => !actual.has(entry))
+    || presentRequiredIdentities.some((entry) => !actual.has(entry))
   ) {
     throw readinessError("acl-shape", "inspectColumnAcl");
   }

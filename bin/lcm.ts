@@ -1,6 +1,6 @@
 #!/usr/bin/env node
 import { randomUUID } from "node:crypto";
-import { realpathSync } from "node:fs";
+import { lstatSync, realpathSync } from "node:fs";
 import { argv, exit, kill as processKill, stdin, stdout } from "node:process";
 import { homedir } from "node:os";
 import { isAbsolute, join, relative, resolve } from "node:path";
@@ -24,6 +24,17 @@ import { performMigrationReportCommand } from "../src/migration/cli-report.js";
 import { performMigrationActivateCommand } from "../src/migration/cli-activate.js";
 import { performMigrationRollbackCommand } from "../src/migration/cli-rollback.js";
 import {
+  performSetAbort,
+  performSetActivate,
+  performSetApply,
+  performSetDryRun,
+  performSetPlan,
+  performSetReport,
+  performSetResume,
+  performSetRollback,
+  performSetVerify,
+} from "../src/migration/cli-cutover-set.js";
+import {
   renderMigrationPlanEnvelope,
   renderMigrationDryRunEnvelope,
   renderMigrationApplyEnvelope,
@@ -33,6 +44,7 @@ import {
   renderMigrationReportEnvelope,
   renderMigrationActivateEnvelope,
   renderMigrationRollbackEnvelope,
+  renderMigrationSetEnvelope,
   renderMigrationUnexpectedFailureEnvelope,
 } from "../src/migration/cli-render.js";
 import type { MigrationCommandName } from "../src/migration/exit-classes.js";
@@ -60,6 +72,7 @@ import {
   daemonPidPath,
   daemonTokenPath,
   lcmHomeDir,
+  legacyLcmHomeDir,
   migrateLegacyHomeIfNeeded,
   projectsDir as lcmProjectsDir,
 } from "../src/runtime-paths.js";
@@ -79,6 +92,7 @@ import { BACKEND_PUBLICATION_ADMISSION_DIAGNOSTIC } from "../src/hooks/publicati
 import { sanitizeTerminalText } from "../src/terminal-sanitize.js";
 import { resolveLcmConfig } from "../src/db/config.js";
 import { isDaemonTransportFailure } from "../src/daemon/http-url.js";
+import { sameEnvelope } from "../src/daemon/passive-event-replication.js";
 import {
   clearDaemonRemediation,
   isDaemonRefusalReason,
@@ -1267,6 +1281,14 @@ function isNestedUnderRoot(actionCommand: Command, parentName: string, actionNam
 
 function shouldRunRootBootstrapMigration(actionCommand: Command): boolean {
   if (isNestedUnderRoot(actionCommand, "daemon", "restart")) return false;
+  // Each migration subcommand owns a state of the cutover, including the ones that leave a
+  // maintenance hold, and the bootstrap's publication admission refuses while the hold exists.
+  // The bootstrap can only still do work when a legacy home waits to be moved into an absent
+  // active root; a completed migration keeps the legacy directory as evidence and does not count.
+  if (isNestedUnderRoot(actionCommand, "migration")) {
+    const stat = (path: string) => { try { return lstatSync(path); } catch { return undefined; } };
+    return stat(legacyLcmHomeDir())?.isDirectory() === true && stat(lcmHomeDir()) === undefined;
+  }
   const action = actionCommand.name();
   const topLevel = actionCommand.parent?.name() === "lcm";
   if (topLevel && (
@@ -1633,26 +1655,6 @@ async function withPassiveEventOperatorSession<T>(
   } finally {
     await session.close();
   }
-}
-
-function passiveEventReadbackMatches(
-  local: LocalHookEventRow,
-  remote: PostgreSqlPassiveEventRecord,
-): boolean {
-  const payload = remote.payload as Record<string, unknown>;
-  return local.machine_id === remote.machineId
-    && local.event_uuid === remote.eventId
-    && local.event_version === remote.eventVersion
-    && BigInt(local.machine_sequence) === remote.machineSequence
-    && local.type === remote.eventType
-    && payload.sessionId === local.session_id
-    && payload.sessionSequence === local.seq
-    && payload.category === local.category
-    && payload.data === local.data
-    && payload.priority === local.priority
-    && payload.sourceHook === local.source_hook
-    && payload.previousEventId === local.prev_event_id
-    && payload.createdAt === local.created_at;
 }
 
 function serializablePassiveEvent(record: PostgreSqlPassiveEventRecord): Record<string, unknown> {
@@ -2153,7 +2155,7 @@ function emitMigrationEnvelope(
 }
 
 export function registerMigrationCommand(program: Command): void {
-  type MigrationJsonOptions = { help?: boolean; json?: boolean };
+  type MigrationJsonOptions = { help?: boolean; json?: boolean; set?: boolean };
   type MigrationApplyOptions = MigrationJsonOptions & {
     confirmGeneration?: string;
     confirmBackend?: string;
@@ -2175,10 +2177,17 @@ export function registerMigrationCommand(program: Command): void {
   migrationCmd
     .command("plan")
     .description("Preview the next migration generation without mutating anything")
+    .option("--set", "Operate on every project of this home as one cutover set (see docs/migration-cutover-set.md)")
     .option("--json", "Output structured JSON")
     .helpOption(false).option("-h, --help", "Show help")
     .action(async (opts: MigrationJsonOptions) => {
       writeCliError("Resolving migration preflight...\n");
+      if (opts.set === true) {
+        const setOutcome = await performSetPlan({ homeDir: homedir() });
+        writeCliError("Migration plan finished.\n");
+        emitMigrationEnvelope("plan", () => renderMigrationSetEnvelope("plan", setOutcome), opts.json);
+        return;
+      }
       const outcome = await performMigrationPlan({ cwd: process.cwd(), homeDir: homedir() });
       writeCliError("Migration plan finished.\n");
       emitMigrationEnvelope("plan", () => renderMigrationPlanEnvelope(outcome), opts.json);
@@ -2187,10 +2196,17 @@ export function registerMigrationCommand(program: Command): void {
   migrationCmd
     .command("dry-run")
     .description("Check the SQLite migration source without touching PostgreSQL or the journal")
+    .option("--set", "Operate on every project of this home as one cutover set (see docs/migration-cutover-set.md)")
     .option("--json", "Output structured JSON")
     .helpOption(false).option("-h, --help", "Show help")
     .action(async (opts: MigrationJsonOptions) => {
       writeCliError("Checking the SQLite migration source...\n");
+      if (opts.set === true) {
+        const setOutcome = await performSetDryRun({ homeDir: homedir() });
+        writeCliError("Migration dry-run finished.\n");
+        emitMigrationEnvelope("dry-run", () => renderMigrationSetEnvelope("dry-run", setOutcome), opts.json);
+        return;
+      }
       const outcome = await performMigrationDryRunCheck({ cwd: process.cwd(), homeDir: homedir() });
       writeCliError("Migration dry-run finished.\n");
       emitMigrationEnvelope("dry-run", () => renderMigrationDryRunEnvelope(outcome), opts.json);
@@ -2199,7 +2215,8 @@ export function registerMigrationCommand(program: Command): void {
   migrationCmd
     .command("apply")
     .description("Apply the confirmed migration generation: capture, manifest genesis and copy")
-    .option("--confirm-generation <id>", "The exact generation id `lcm migration plan` printed")
+    .option("--confirm-generation <id>", "The exact generation id `lcm migration plan` printed (the set id with --set)")
+    .option("--set", "Operate on every project of this home as one cutover set (see docs/migration-cutover-set.md)")
     .option("--dry-run", "Stop after the confirmation fence; do not capture, copy, or mutate anything")
     .option("--max-records <n>", "Maximum records per copy batch")
     .option("--max-bytes <n>", "Maximum bytes per copy batch")
@@ -2209,6 +2226,18 @@ export function registerMigrationCommand(program: Command): void {
       const maxRecords = opts.maxRecords === undefined ? undefined : parsePositiveInteger(opts.maxRecords, "--max-records");
       const maxBytes = opts.maxBytes === undefined ? undefined : parsePositiveInteger(opts.maxBytes, "--max-bytes");
       writeCliError("Resolving migration preflight...\n");
+      if (opts.set === true) {
+        const setOutcome = await performSetApply({
+          homeDir: homedir(),
+          confirmGenerationId: opts.confirmGeneration,
+          dryRun: opts.dryRun,
+          maxRecords,
+          maxBytes,
+        });
+        writeCliError("Migration apply finished.\n");
+        emitMigrationEnvelope("apply", () => renderMigrationSetEnvelope("apply", setOutcome), opts.json);
+        return;
+      }
       const outcome = await performMigrationApply({
         cwd: process.cwd(),
         homeDir: homedir(),
@@ -2229,8 +2258,9 @@ export function registerMigrationCommand(program: Command): void {
   migrationCmd
     .command("resume")
     .description("Run the next step of a held generation: genesis and dry-run, copy, or finishing a carried effect")
-    .option("--generation <id>", "The generation to resume (default: the live maintenance hold)")
-    .option("--confirm-generation <id>", "The resolved generation id")
+    .option("--generation <id>", "The generation to resume (default: the live maintenance hold); the original set id with --set")
+    .option("--confirm-generation <id>", "The resolved generation id (the set id with --set)")
+    .option("--set", "Operate on every project of this home as one cutover set (see docs/migration-cutover-set.md)")
     .option("--dry-run", "Name the step resume would run; run nothing and predict nothing")
     .option("--max-records <n>", "Maximum records per copy batch")
     .option("--max-bytes <n>", "Maximum bytes per copy batch")
@@ -2240,6 +2270,19 @@ export function registerMigrationCommand(program: Command): void {
       const maxRecords = opts.maxRecords === undefined ? undefined : parsePositiveInteger(opts.maxRecords, "--max-records");
       const maxBytes = opts.maxBytes === undefined ? undefined : parsePositiveInteger(opts.maxBytes, "--max-bytes");
       writeCliError("Resolving the generation to resume...\n");
+      if (opts.set === true) {
+        const setOutcome = await performSetResume({
+          homeDir: homedir(),
+          generation: opts.generation,
+          confirmGenerationId: opts.confirmGeneration,
+          dryRun: opts.dryRun,
+          maxRecords,
+          maxBytes,
+        });
+        writeCliError("Migration resume finished.\n");
+        emitMigrationEnvelope("resume", () => renderMigrationSetEnvelope("resume", setOutcome), opts.json);
+        return;
+      }
       const outcome = await performMigrationResumeCommand({
         cwd: process.cwd(),
         homeDir: homedir(),
@@ -2256,15 +2299,31 @@ export function registerMigrationCommand(program: Command): void {
   migrationCmd
     .command("verify")
     .description("Verify a copied generation against PostgreSQL, finish a pending verification, or confirm a verified one")
-    .option("--generation <id>", "The generation to verify (default: the live maintenance hold)")
-    .option("--confirm-generation <id>", "The resolved generation id")
-    .option("--dry-run", "Compute the verification without recording it (takes and releases the verification lease)")
+    .option("--generation <id>", "The generation to verify (default: the live maintenance hold); the original set id with --set")
+    .option("--confirm-generation <id>", "The resolved generation id (the set id with --set)")
+    .option("--set", "Operate on every project of this home as one cutover set (see docs/migration-cutover-set.md)")
+    .option("--dry-run", "Compute the verification without recording it (takes and releases the verification lease); with --set a persisted-only preview that never exits 0")
     .option("--lease-ttl-ms <n>", "Verification lease time to live in milliseconds (default 300000)")
     .option("--json", "Output structured JSON")
     .helpOption(false).option("-h, --help", "Show help")
     .action(async (opts: MigrationApplyOptions) => {
       const leaseTtlMs = opts.leaseTtlMs === undefined ? undefined : parsePositiveInteger(opts.leaseTtlMs, "--lease-ttl-ms");
+      if (opts.set === true && leaseTtlMs !== undefined) {
+        console.error("--lease-ttl-ms does not apply to --set: set verification takes no lease");
+        exit(1);
+      }
       writeCliError("Verifying the migration generation...\n");
+      if (opts.set === true) {
+        const setOutcome = await performSetVerify({
+          homeDir: homedir(),
+          generation: opts.generation,
+          confirmGenerationId: opts.confirmGeneration,
+          dryRun: opts.dryRun,
+        });
+        writeCliError("Migration verify finished.\n");
+        emitMigrationEnvelope("verify", () => renderMigrationSetEnvelope("verify", setOutcome), opts.json);
+        return;
+      }
       const outcome = await performMigrationVerifyCommand({
         cwd: process.cwd(),
         homeDir: homedir(),
@@ -2280,11 +2339,18 @@ export function registerMigrationCommand(program: Command): void {
   migrationCmd
     .command("report")
     .description("Read-only account of one generation: what exists, what owns it, and what to run next")
-    .option("--generation <id>", "The generation to report (default: the live or terminal journal's own)")
+    .option("--generation <id>", "The generation to report (default: the live or terminal journal's own); the original set id with --set")
+    .option("--set", "Operate on every project of this home as one cutover set (see docs/migration-cutover-set.md)")
     .option("--json", "Output structured JSON")
     .helpOption(false).option("-h, --help", "Show help")
     .action(async (opts: MigrationApplyOptions) => {
       writeCliError("Reading the migration generation...\n");
+      if (opts.set === true) {
+        const setOutcome = await performSetReport({ homeDir: homedir(), generation: opts.generation });
+        writeCliError("Migration report finished.\n");
+        emitMigrationEnvelope("report", () => renderMigrationSetEnvelope("report", setOutcome), opts.json);
+        return;
+      }
       const outcome = await performMigrationReportCommand({ homeDir: homedir(), generation: opts.generation });
       writeCliError("Migration report finished.\n");
       emitMigrationEnvelope("report", () => renderMigrationReportEnvelope(outcome), opts.json);
@@ -2294,12 +2360,24 @@ export function registerMigrationCommand(program: Command): void {
     .command("abort")
     .description("Abort a held or entering migration, completing whichever recovery write is missing")
     .option("--generation <id>", "The generation to abort (default: the journal's own generation)")
-    .option("--confirm-generation <id>", "The generation id of the live maintenance hold")
+    .option("--confirm-generation <id>", "The generation id of the live maintenance hold (the set id of a set hold)")
+    .option("--set", "Operate on every project of this home as one cutover set (see docs/migration-cutover-set.md)")
     .option("--dry-run", "Run every read and check, then stop before changing anything")
     .option("--json", "Output structured JSON")
     .helpOption(false).option("-h, --help", "Show help")
     .action(async (opts: MigrationApplyOptions) => {
       writeCliError("Aborting the migration hold...\n");
+      if (opts.set === true) {
+        const setOutcome = await performSetAbort({
+          homeDir: homedir(),
+          generation: opts.generation,
+          confirmGenerationId: opts.confirmGeneration,
+          dryRun: opts.dryRun,
+        });
+        writeCliError("Migration abort finished.\n");
+        emitMigrationEnvelope("abort", () => renderMigrationSetEnvelope("abort", setOutcome), opts.json);
+        return;
+      }
       const outcome = await performMigrationAbortCommand({
         homeDir: homedir(),
         generation: opts.generation,
@@ -2313,14 +2391,27 @@ export function registerMigrationCommand(program: Command): void {
   migrationCmd
     .command("activate")
     .description("Switch a verified generation to PostgreSQL. Afterwards swap the grants, then start the daemon")
-    .option("--generation <id>", "The generation to activate (default: the live maintenance hold)")
-    .option("--confirm-generation <id>", "The resolved generation id")
+    .option("--generation <id>", "The generation to activate (default: the live maintenance hold); the original set id with --set")
+    .option("--confirm-generation <id>", "The resolved generation id (the set id with --set)")
     .option("--confirm-backend <backend>", "The backend activation switches to: postgresql")
+    .option("--set", "Operate on every project of this home as one cutover set (see docs/migration-cutover-set.md)")
     .option("--dry-run", "Read the persisted state; evaluates nothing, so it never exits 0")
     .option("--json", "Output structured JSON")
     .helpOption(false).option("-h, --help", "Show help")
     .action(async (opts: MigrationApplyOptions) => {
       writeCliError("Activating the migration generation...\n");
+      if (opts.set === true) {
+        const setOutcome = await performSetActivate({
+          homeDir: homedir(),
+          generation: opts.generation,
+          confirmGenerationId: opts.confirmGeneration,
+          confirmBackend: opts.confirmBackend,
+          dryRun: opts.dryRun,
+        });
+        writeCliError("Migration activate finished.\n");
+        emitMigrationEnvelope("activate", () => renderMigrationSetEnvelope("activate", setOutcome), opts.json);
+        return;
+      }
       const outcome = await performMigrationActivateCommand({
         cwd: process.cwd(),
         homeDir: homedir(),
@@ -2336,14 +2427,27 @@ export function registerMigrationCommand(program: Command): void {
   migrationCmd
     .command("rollback")
     .description("Return an activated generation to SQLite, using the runtime-role LCM_POSTGRES_URL. Refuses while any other project is remotely bound")
-    .option("--generation <id>", "The generation to roll back (default: the live maintenance hold)")
-    .option("--confirm-generation <id>", "The resolved generation id")
+    .option("--generation <id>", "The generation to roll back (default: the live maintenance hold); always the original set id with --set")
+    .option("--confirm-generation <id>", "The resolved generation id (the original set id with --set)")
     .option("--confirm-backend <backend>", "The backend rollback switches to: sqlite")
+    .option("--set", "Operate on every project of this home as one cutover set (see docs/migration-cutover-set.md)")
     .option("--dry-run", "Read the route and the manifest; evaluates nothing, so it never exits 0")
     .option("--json", "Output structured JSON")
     .helpOption(false).option("-h, --help", "Show help")
     .action(async (opts: MigrationApplyOptions) => {
       writeCliError("Rolling back the migration generation...\n");
+      if (opts.set === true) {
+        const setOutcome = await performSetRollback({
+          homeDir: homedir(),
+          generation: opts.generation,
+          confirmGenerationId: opts.confirmGeneration,
+          confirmBackend: opts.confirmBackend,
+          dryRun: opts.dryRun,
+        });
+        writeCliError("Migration rollback finished.\n");
+        emitMigrationEnvelope("rollback", () => renderMigrationSetEnvelope("rollback", setOutcome), opts.json);
+        return;
+      }
       const outcome = await performMigrationRollbackCommand({
         homeDir: homedir(),
         generation: opts.generation,
@@ -3771,7 +3875,7 @@ export async function runCli(
           for (const event of events) {
             const record = byId.get(event.event_uuid);
             if (!record) missing.push(event.event_uuid);
-            else if (!passiveEventReadbackMatches(event, record)) {
+            else if (!sameEnvelope(event, record)) {
               mismatched.push(event.event_uuid);
             } else {
               matched += 1;
