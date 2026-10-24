@@ -6,12 +6,16 @@ import { requireMachineIdentity } from "../machine-identity.js";
 import { configPath, daemonPidPath, lcmHomeDir } from "../runtime-paths.js";
 import { PRIVATE_FILE_MODE, readBoundedRegularFileWithStat } from "../security-files.js";
 import {
+  backendPublicationCanonicalSha256,
+  backendPublicationConfigSha256,
+  backendPublicationProjectMapSha256,
   readBackendMaintenanceJournal,
   readBackendPublicationJournal,
   withBackendPublicationAppendBarrierAsync,
   type BackendMaintenanceJournal,
   type BackendPublicationJournal,
   type BackendPublicationLockToken,
+  type BackendPublicationRecoveryFile,
   type CompleteBackendMaintenanceSelectionInput,
   type PrepareBackendMaintenanceSelectionInput,
   type PrepareBackendPublicationInput,
@@ -288,6 +292,9 @@ export type MigrationActivationInterruptionCause =
 
 export type MigrationActivationTriState = "no" | "yes" | "unknown";
 
+/** The live config and project map digests an interruption's `applied` readback compares against witnesses. */
+export type MigrationActivationSelectionDigests = Readonly<{ configSha256: string; projectMapSha256: string }>;
+
 /** {generationId, publicationId?, manifestRevision?}: fields only when evidenced (amendment 2). */
 export type MigrationActivationIdentity = Readonly<{
   generationId: string;
@@ -511,6 +518,8 @@ export interface MigrationActivationDependencies {
   readonly drive: typeof driveActivationPublication;
   readonly readMaintenanceJournal: (homeDir: string) => BackendMaintenanceJournal | null;
   readonly readPublicationJournal: (homeDir: string) => BackendPublicationJournal | null;
+  /** The live selection: sha256 of the config bytes and the canonical project map digest (the journal's witness convention). */
+  readonly readSelectionDigests: (homeDir: string) => MigrationActivationSelectionDigests;
   readonly persistReport: typeof persistMigrationActivationReport;
   readonly readReport: typeof readMigrationActivationReport;
   readonly machineId: (homeDir: string) => string;
@@ -575,6 +584,10 @@ export function createMigrationActivationDependencies(
     drive: driveActivationPublication,
     readMaintenanceJournal: (homeDir) => readBackendMaintenanceJournal(homeDir),
     readPublicationJournal: (homeDir) => readBackendPublicationJournal(homeDir),
+    readSelectionDigests: (homeDir) => ({
+      configSha256: backendPublicationConfigSha256(homeDir),
+      projectMapSha256: backendPublicationProjectMapSha256(homeDir),
+    }),
     persistReport: persistMigrationActivationReport,
     readReport: readMigrationActivationReport,
     machineId: (homeDir) => requireMachineIdentity(homeDir).machineId,
@@ -725,26 +738,66 @@ function projectBinding(ctx: Context): ProjectBinding {
 // Evidence for interruptions (amendment 2) and identity
 // ---------------------------------------------------------------------------
 
+/** The own journal records the config as published: yes needs the live selection to match it. */
 const APPLIED_YES_PHASES: readonly BackendPublicationJournal["phase"][] = ["config-published", "releasing", "released", "completed"];
+/** The write may be in flight: never proven either way, even when the live selection equals the source. */
+const APPLIED_IN_FLIGHT_PHASES: readonly BackendPublicationJournal["phase"][] = ["map-publishing", "map-published", "config-publishing"];
 
+function digestsMatch(live: MigrationActivationSelectionDigests, configSha256: string, projectMapSha256: string): boolean {
+  return live.configSha256 === configSha256 && live.projectMapSha256 === projectMapSha256;
+}
+
+/** The digest of a recovery file under the journal convention: raw bytes for the config, canonical JSON for the map, {} when absent. */
+function recoveryFileDigests(config: BackendPublicationRecoveryFile, projectMap: BackendPublicationRecoveryFile): MigrationActivationSelectionDigests {
+  return {
+    configSha256: createHash("sha256").update(config.presence === "present" ? config.content : "{}").digest("hex"),
+    projectMapSha256: backendPublicationCanonicalSha256(
+      projectMap.presence === "present" ? JSON.parse(Buffer.from(projectMap.content).toString("utf8")) : {},
+    ),
+  };
+}
+
+/** "no" only when the live selection still equals this activation's pre-publication source witness; otherwise "unknown". */
+function classifyAgainstSource(ctx: Context): MigrationActivationTriState {
+  // The witness enters the context at compose or at the stored artifact load;
+  // an interruption before either has no source proof.
+  const source = ctx.material?.material.source ?? ctx.artifact?.source;
+  if (source === undefined) return "unknown";
+  const witness = recoveryFileDigests(source.config, source.projectMap);
+  return digestsMatch(ctx.deps.readSelectionDigests(ctx.homeDir), witness.configSha256, witness.projectMapSha256) ? "no" : "unknown";
+}
+
+/**
+ * applied is evidence-derived (amendment 2): the journal phase says what was
+ * attempted, and an independent readback of the live config and project map
+ * must agree before it is reported. yes needs the published witnesses; no
+ * needs the pre-publication witnesses (the journal's expected digests, or the
+ * source material when the journal is absent, foreign or v3). Everything else,
+ * including any readback failure, is unknown. Never throws.
+ */
 function classifyApplied(ctx: Context): MigrationActivationTriState {
-  let journal: BackendPublicationJournal | null;
   try {
     // A live version-3 maintenance journal entered from sqlite means no
-    // version-2 publication has been prepared for this generation: nothing
-    // can have been applied. A window entered from another backend is a
-    // rollback (#626) that superseded whatever this activation published.
+    // version-2 publication has been prepared for this generation. A window
+    // entered from another backend is a rollback (#626) that superseded
+    // whatever this activation published.
     const maintenance = ctx.deps.readMaintenanceJournal(ctx.homeDir);
-    if (maintenance !== null) return isActivationMaintenance(maintenance) ? "no" : "unknown";
-    journal = ctx.deps.readPublicationJournal(ctx.homeDir);
+    if (maintenance !== null) return isActivationMaintenance(maintenance) ? classifyAgainstSource(ctx) : "unknown";
+    const journal = ctx.deps.readPublicationJournal(ctx.homeDir);
+    if (journal === null || journal.publicationId !== ctx.publicationId) return classifyAgainstSource(ctx);
+    if (APPLIED_IN_FLIGHT_PHASES.includes(journal.phase)) return "unknown";
+    const live = ctx.deps.readSelectionDigests(ctx.homeDir);
+    if (APPLIED_YES_PHASES.includes(journal.phase)) {
+      const { publishedConfigSha256, publishedProjectMapSha256 } = journal;
+      return publishedConfigSha256 !== null && publishedProjectMapSha256 !== null && digestsMatch(live, publishedConfigSha256, publishedProjectMapSha256) ? "yes" : "unknown";
+    }
+    // preparing through guarded and the abort family: no configuration or map
+    // mutation is recorded before map-publishing, but the phase alone is not
+    // proof, and a restore may be incomplete.
+    return digestsMatch(live, journal.expectedConfigSha256, journal.expectedProjectMapSha256) ? "no" : "unknown";
   } catch {
     return "unknown";
   }
-  if (journal === null || journal.publicationId !== ctx.publicationId) return "no";
-  if (APPLIED_YES_PHASES.includes(journal.phase)) return "yes";
-  // preparing through config-publishing, and the abort family before a
-  // completed restore readback: the publication may or may not have landed.
-  return "unknown";
 }
 
 /**

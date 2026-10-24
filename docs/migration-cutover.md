@@ -1105,9 +1105,16 @@ A failure after step 1 is an **interruption**, not a refusal: an effect has
 begun. The outcome names the step (`S9` through `S16`), a closed cause, and
 three facts an operator can act on: whether an effect began, whether the
 publication is known to have been applied (`yes`, `no` or `unknown`), and
-whether an activation report is known to be stored. `unknown` is reported
-honestly when the journal or report store cannot be read; it is never
-collapsed into a guess.
+whether an activation report is known to be stored. `applied` is confirmed
+against the live selection, not the journal alone: `yes` needs the
+publication journal to record the configuration as published and the live
+configuration and project map to match the published witnesses; `no` needs
+the live configuration and project map to still match the pre-publication
+source (the journal's expected witnesses, or the activation's source
+material when no journal of this activation exists). A publication that may
+be mid-write, a selection that disagrees with the journal, or a journal or
+selection that cannot be read is `unknown`. `reportStored` is `unknown`
+when the report store cannot be read; neither is collapsed into a guess.
 
 Recovery is to run activation again. The run resumes from the durable
 evidence it finds (the manifest, the link and artifact, the stored attempt,
