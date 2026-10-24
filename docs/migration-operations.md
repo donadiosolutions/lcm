@@ -359,7 +359,8 @@ evidence and nothing more. A fenced-lease row that cannot be decoded (it names n
 generation) is `lease-unresolvable`, exit 5 `activation-refused-evidence`, with nothing changed and
 no `applied` claim; `lease-conflict` (exit 4) is a decodable lease held by another publication. A
 running daemon that holds the previous backend is now seen as present, so `activate`, `rollback` and
-`report` give exit 8; a daemon binary from before this behavior still gives exit 5
+`report` give exit 8, even when that daemon started on SQLite without the PostgreSQL URL, CA file or
+migration role in its environment; a daemon binary from before this behavior still gives exit 5
 `cutover-restart-contradiction`, and the remedy is unchanged: run `lcm daemon status`, resolve it, run
 `report`.
 
