@@ -610,7 +610,10 @@ observed empty database.
 `lcm status`, `lcm stats --pool`, and `lcm doctor` authenticate an existing
 daemon through the internal `GET /health/observe` endpoint. It reports process
 identity with `observation: "identity-only"` and `storage.status: "unverified"`;
-it never opens project storage or runs the active readiness probe. Diagnostics
+it never opens project storage or runs the active readiness probe. It still
+answers when the daemon's startup backend differs from the backend now selected
+on disk, so a daemon left running across a migration cutover remains
+identifiable; every other admission check applies as before. Diagnostics
 require the exact installed version, backend, entrypoint, runtime digest, and
 unchanged configuration witness. An old daemon without this endpoint, malformed
 response, missing credentials, or mismatched identity refuses observation;

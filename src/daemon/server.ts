@@ -488,6 +488,7 @@ function assertDaemonReadStorageAdmission(
   publicationHome: string | undefined,
   assertBackendPublicationOverride?: DaemonOptions["_assertBackendPublication"],
   readSnapshot: typeof readDaemonConfigSnapshot = readDaemonConfigSnapshot,
+  tolerateStartupBackendDivergence = false,
 ): DaemonReadStorageAdmissionWitness {
   if (assertBackendPublicationOverride !== undefined) {
     const publicationWitness = assertBackendPublicationOverride(publicationHome, startupConfig.storage.backend);
@@ -513,7 +514,7 @@ function assertDaemonReadStorageAdmission(
     };
     assertReadRoot();
     const first = readSnapshot(publicationConfigPath);
-    if (first.config.storage.backend !== startupConfig.storage.backend) {
+    if (!tolerateStartupBackendDivergence && first.config.storage.backend !== startupConfig.storage.backend) {
       throw new BackendPublicationJournalError(
         "unexpected-state",
         "daemon request backend differs from the authenticated startup backend",
@@ -526,7 +527,7 @@ function assertDaemonReadStorageAdmission(
     );
     const second = readSnapshot(publicationConfigPath);
     if (
-      second.config.storage.backend !== startupConfig.storage.backend
+      (!tolerateStartupBackendDivergence && second.config.storage.backend !== startupConfig.storage.backend)
       || !daemonConfigSnapshotWitnessEqual(first.witness, second.witness)
     ) {
       throw new BackendPublicationJournalError(
@@ -1131,6 +1132,7 @@ export async function createDaemon(config: DaemonConfig, options?: DaemonOptions
             publicationHome,
             options?._assertBackendPublication,
             options?._readDaemonConfigSnapshot,
+            key === "GET /health/observe",
           );
           await route.handler(req, bufferedResponse as unknown as ServerResponse, body, {
             signal: requestSignal,
@@ -1145,6 +1147,7 @@ export async function createDaemon(config: DaemonConfig, options?: DaemonOptions
             publicationHome,
             options?._assertBackendPublication,
             options?._readDaemonConfigSnapshot,
+            key === "GET /health/observe",
           );
           if (!daemonReadStorageAdmissionWitnessEqual(admissionWitness, finalWitness)) {
             throw new BackendPublicationJournalError(

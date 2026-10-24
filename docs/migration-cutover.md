@@ -780,6 +780,21 @@ failures that byte-for-byte content equality cannot see:
   `search_v1` configuration that is wrong in a way no digest comparison
   can see.
 
+  A project with no messages has no candidate to find, so the probe takes
+  an empty-source path instead. After the same completed-transfer-run
+  lookup, it sends one fixed query through the production
+  `searchMessages` and requires zero rows; a search error is reported as
+  an error, never as a pass. The search then earns its receipt only when
+  the source's messages checkpoint and the fenced destination census both
+  report zero messages, so an empty candidate pool on its own never
+  qualifies. If the transfer run is missing or not completed, if the search
+  returns any row, or if either count is non-zero, the probe is not-run with
+  its reason and `activationEligible` stays false. This witness proves
+  that the production search returned no rows for one constant query while
+  both portable message counts were zero. It does not prove that messages
+  written after cutover will be indexed; the pinned `search_v1`
+  configuration digest is a separate existing check.
+
   The search self-match candidate pool draws from a fixed-size, early
   slice of the source's canonical message order (the first
   `MIGRATION_SEARCH_PROBE_CANDIDATE_POOL_SIZE` messages), not the whole
@@ -798,7 +813,8 @@ failures that byte-for-byte content equality cannot see:
   than to sample the domain exhaustively.
 
   The ordered-listing probe's own `ran` state (it completed) and the search
-  probe's own `ran` state (a correlated self-match was confirmed) are tracked
+  probe's own `ran` state (a correlated self-match was confirmed, or the
+  empty-source witness held) are tracked
   independently (`publicProbeCoverage`, one
   entry per probe), never folded into a single `sample`-class coverage
   bit: a genuine listing-ordering mismatch stays recorded as evidence
