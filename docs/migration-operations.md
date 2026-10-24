@@ -298,7 +298,11 @@ read back after the operation, not assumed from the operation reporting success.
 
 Mutating. Switches a verified generation to PostgreSQL and releases the maintenance hold. It owns
 cell 24 (held, `verified`), cell 11 (an activation that was begun and not finished) and the settled
-re-entry at cell 10 (the generation's own completed publication and an `active` manifest). It adds no
+re-entry at cell 10 (the generation's own completed publication and an `active` manifest). Cell 11
+covers an interruption at any point after the activation began, including before the selection (the
+hold is still `held`, SQLite is still authoritative and nothing is published) and after the
+publication completed but before the manifest settled to `active`; run `activate` again and it
+finishes from where it stopped. It adds no
 algorithm of its own: it supplies the inputs the activation orchestration asks for and maps what it
 returns.
 
@@ -658,6 +662,8 @@ cell 12 it exits 6. The same router decides for all of them, so they cannot disa
 | 9 | `maintenance-aborted` | any | anything else | none -- exit 5; `abort` is never called | -- |
 | 10 | the generation's own completed publication | any | `active`, nothing pending | none -- settled; `report` | `activate` (settled re-entry), `rollback` |
 | 11 | the generation's own publication in flight or aborted, or a `selection-prepared`/`selection-completed` hold | any | `verified`, `activating`, or a pending activation effect | `activate` | `resume` |
+| 11 | `held`, matching (activation begun, no selection yet) | complete | `verified` with a pending `prepare-activation`, or `activating` with nothing pending or a pending `publish-activation` | `activate` | `resume` |
+| 11 | the generation's own completed publication (the manifest has not settled yet) | any | `activating` with a pending `publish-activation` | `activate` | `resume` |
 | 12 | not aborted | any | `rolling-back`, or a pending rollback effect | `rollback` | `resume` |
 | 13 | not aborted | any | `rolled-back`, nothing pending | none -- settled; `report` | `rollback` (settled re-entry) |
 | 2, 3 | a v2 publication | any | any | none -- exit 4 while in flight, exit 5 when foreign and finished | -- |

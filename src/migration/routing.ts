@@ -201,7 +201,14 @@ const ROWS: readonly Row[] = [
   { row: 11, primary: "activate", allowed: ["resume"],
     exit: (i) => present(i)?.pending !== null ? 6 : 2,
     matches: (i) => ((isOwnPublication(i) && (publicationInFlight(i) || (i.journal.kind === "publication" && i.journal.phase === "aborted")))
-        || holdPhaseIn(i, ["selection-prepared", "selection-completed"]))
+        || holdPhaseIn(i, ["selection-prepared", "selection-completed"])
+        // Activation begun before any selection (S9 to S11): SQLite is still authoritative and the hold is maintenance-held.
+        || (holdMatches(i, ["maintenance-held"]) && i.snapshot === "complete" && present(i) !== null
+          && ((present(i)!.phase === "verified" && present(i)!.pending === "prepare-activation")
+            || (present(i)!.phase === "activating" && (present(i)!.pending === null || present(i)!.pending === "publish-activation"))))
+        // The publication drive is done but the manifest has not settled to active (S13b done, S16 not).
+        || (isOwnPublication(i) && i.journal.kind === "publication" && i.journal.phase === "completed"
+          && present(i)?.phase === "activating" && present(i)?.pending === "publish-activation"))
       && present(i) !== null
       && ((present(i)!.phase === "verified" && present(i)!.pending === null)
         || present(i)!.phase === "activating"

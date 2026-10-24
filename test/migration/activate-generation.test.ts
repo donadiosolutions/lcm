@@ -93,6 +93,8 @@ import {
   type MigrationVerificationReport,
 } from "../../src/migration/verification-report.js";
 import { MigrationVerificationReportStore } from "../../src/migration/verification-store.js";
+import { performMigrationActivateCommand } from "../../src/migration/cli-activate.js";
+import { admitExistingMigrationCommand } from "../../src/migration/cli-existing.js";
 import {
   buildMigrationCanonicalDelta,
   buildMigrationCensusVector,
@@ -754,6 +756,47 @@ describe("runMigrationActivation: crash rows (plan-v5 section 7 / synthesis amen
     expectActivated(f, outcome, "publication-journal");
     expect(persistReport).toHaveBeenCalledTimes(1);
     expect(persistReport.mock.results[0]!.value).toMatchObject({ outcome: "reused" });
+  });
+});
+
+/**
+ * Bug #1679: a crash anywhere between the end of prepare-activation and the
+ * manifest settle used to leave the router on cell 25 (route-contradiction),
+ * so the CLI refused `activate` before the orchestrator, which resumes every
+ * one of these windows, ever ran. Here the real router reads the real home the
+ * crashed orchestrator left behind, and the real orchestrator then finishes it
+ * through the CLI command.
+ */
+describe("activate CLI admission of the interrupted activation windows (Bug #1679)", () => {
+  const resolution = { _operationsForTesting: { classifySnapshot: async () => ({ state: "complete" }) } } as never;
+
+  it.each([
+    ["after-prepare-begin", "prepare-activation-pending", 6],
+    ["after-prepare-complete", "activating-no-effect", 2],
+    ["after-publish-begin", "publish-pending-before-artifact", 6],
+    ["after-link", "publish-pending-after-link", 6],
+    ["after-drive", "publication-journal", 6],
+    ["after-report", "publication-journal", 6],
+  ])("a crash at %s routes to activate (row 11) and the CLI finishes it", async (point, resumedFrom, exitIfRefused) => {
+    const f = await fixture();
+    await expect(f.run({ crashPoint: (p) => { if (p === point) throw new Error("injected crash at " + point); } })).rejects.toThrow("injected crash at " + point);
+
+    const admission = await admitExistingMigrationCommand({ command: "activate", homeDir: f.homeDir, generation: GENERATION, resolution });
+    expect(admission.status === "refuse" ? admission.reason : "admitted").toBe("admitted");
+    if (admission.status !== "admitted") return;
+    expect(admission.context.route).toMatchObject({ row: 11, primary: "activate", exitIfRefused });
+
+    const outcome = await performMigrationActivateCommand({
+      cwd: f.canonical, homeDir: f.homeDir, generation: GENERATION, confirmGenerationId: GENERATION, confirmBackend: "postgresql",
+      _resolution: resolution,
+      _operationsForTesting: {
+        resolveDestination: async () => ({ status: "resolved", settings: SETTINGS, expectedOwner: "lcm_migrator", expectedIdentity: f.input.expectedIdentity }),
+        run: (input) => runMigrationActivation({ ...input, now: f.input.now }, f.deps),
+        classifyPresence: async () => ({ status: "authoritatively-absent" }),
+      },
+    });
+    expect(outcome).toMatchObject({ status: "ok", generationId: GENERATION, manifestPhase: "active", evidence: { cell: 11, resumedFrom } });
+    expect(f.manifestStore.read(GENERATION)).toMatchObject({ phase: "active", pendingEffect: null });
   });
 });
 
