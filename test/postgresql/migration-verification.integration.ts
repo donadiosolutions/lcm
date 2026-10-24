@@ -352,6 +352,50 @@ it("the search probe's ledger correlation and real search both run as live SQL a
   });
 }, 60000);
 
+/**
+ * #1676: the empty-source path of the search probe runs the production
+ * full-text search live, on a fixed query, with an empty candidate pool.
+ * The probe itself only owns the search half of the empty-source witness
+ * (the source and census counts are checked by the driver and covered by
+ * the unit tests), so this uses the seeded project: its content never
+ * matches the fixed query, and a planted message that does is returned.
+ */
+it("the empty-source search probe runs live: no matching row is vacuous, a planted matching row is withheld", async () => {
+  await withPostgreSqlTestDatabase("migration-verification-empty-source-search", async (db) => {
+    const seeded = await seedPortablePostgreSql(db.migrator);
+    await grantPortablePostgreSql(db, { transfer: true });
+    const runtime = new PostgreSqlRuntime(settings(db.runtimeUrl));
+    try {
+      const targetGenerationId = "live-empty-source-target";
+      await db.migrator.query({
+        text: "INSERT INTO lcm.transfer_runs "
+          + "(run_id, target_generation, project_id, manifest_bytes, manifest_sha256, schema_sha256, project_sha256, source_sha256, source_witness_sha256, state) "
+          + "VALUES ($1, $2, $3, $4, $5, $5, $5, $5, $5, 'completed')",
+        values: ["live-empty-source-run", targetGenerationId, seeded.expectedIdentity.id, Buffer.from("{}"), "d".repeat(64)],
+      }, { domain: "factory", operation: "seedLiveEmptySourceRun" });
+
+      expect(await runSearchSelfMatchProbe(runtime, seeded.expectedIdentity.id, targetGenerationId, [], "a".repeat(64)))
+        .toEqual({ ran: false, chosenOrdinal: null, notRunReason: null, emptySource: true });
+
+      const noRun = await runSearchSelfMatchProbe(runtime, seeded.expectedIdentity.id, "live-empty-source-no-run", [], "a".repeat(64));
+      expect(noRun.ran).toBe(false);
+      expect(typeof noRun.notRunReason).toBe("string");
+
+      await db.migrator.query({
+        text: "INSERT INTO lcm.messages (project_id, conversation_id, seq, role, content, token_count) "
+          + "VALUES ($1, $2, 1, 'user', 'lcm migration empty source probe', 1)",
+        values: [seeded.expectedIdentity.id, seeded.conversationId],
+      }, { domain: "factory", operation: "seedLiveEmptySourcePlantedMessage" });
+      const planted = await runSearchSelfMatchProbe(runtime, seeded.expectedIdentity.id, targetGenerationId, [], "a".repeat(64));
+      expect(planted.ran).toBe(false);
+      expect(planted).not.toHaveProperty("emptySource");
+      expect(planted.notRunReason).toContain("returned 1 row");
+    } finally {
+      await runtime.close();
+    }
+  });
+}, 60000);
+
 it("a write committed by a second connection during the fenced window is invisible to the census, and is caught once observed", async () => {
   await withPostgreSqlTestDatabase("migration-verification-mid-pass-write", async (db) => {
     const seeded = await seedPortablePostgreSql(db.migrator);
