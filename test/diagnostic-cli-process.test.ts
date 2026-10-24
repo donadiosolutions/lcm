@@ -7,6 +7,7 @@ import { join, resolve } from "node:path";
 import { tmpdir } from "node:os";
 import { runLcmMigrations } from "../src/db/migration.js";
 import { ConversationStore } from "../src/store/conversation-store.js";
+import { BackendPublicationCoordinator, withBackendPublicationAppendBarrierAsync, type BackendPublicationDriver } from "../src/storage/backend-publication.js";
 
 let root: string;
 let executable: string;
@@ -71,5 +72,26 @@ describe("packaged diagnostic process observation", () => {
       expect(result.stdout).not.toContain("never-display-transcript-canary");
       expect(witness(path)).toEqual(before);
     } finally { db.close(); }
+  });
+});
+describe("packaged migration commands under a maintenance hold", () => {
+  it("prints the migration envelope while a hold exists instead of failing at the root bootstrap (#1674)", async () => {
+    const home = join(root, "hold-home");
+    mkdirSync(join(home, ".lcm"), { recursive: true, mode: 0o700 });
+    writeFileSync(join(home, ".lcm", "config.json"), "{}", { mode: 0o600 });
+    const unavailable = async (): Promise<never> => { throw new Error("no publication"); };
+    const driver: BackendPublicationDriver = {
+      observeLocalState: unavailable, publishProjectMap: unavailable, publishConfig: unavailable,
+      restoreConfig: unavailable, restoreProjectMap: unavailable,
+    };
+    await withBackendPublicationAppendBarrierAsync(home, (token) => new BackendPublicationCoordinator({ homeDir: home, driver }).enterMaintenance({
+      publicationId: "a".repeat(64), generationId: "hold-child-1",
+      sourceSelectionSha256: "b".repeat(64), queueEvidenceSha256: "c".repeat(64),
+      roster: [{ machineId: "01990000-0000-7000-8000-000000000001", queueCutoff: "0000000000000000002", evidenceSha256: "d".repeat(64) }],
+    }, token));
+    const result = run(home, ["migration", "report", "--json"]);
+    expect(result.error).toBeUndefined();
+    expect(result.stderr).not.toContain("admission blocked");
+    expect(JSON.parse(result.stdout)).toMatchObject({ schemaVersion: 1, command: "report", generation: "hold-child-1" });
   });
 });

@@ -1,6 +1,6 @@
 #!/usr/bin/env node
 import { randomUUID } from "node:crypto";
-import { realpathSync } from "node:fs";
+import { existsSync, realpathSync } from "node:fs";
 import { argv, exit, kill as processKill, stdin, stdout } from "node:process";
 import { homedir } from "node:os";
 import { isAbsolute, join, relative, resolve } from "node:path";
@@ -72,6 +72,7 @@ import {
   daemonPidPath,
   daemonTokenPath,
   lcmHomeDir,
+  legacyLcmHomeDir,
   migrateLegacyHomeIfNeeded,
   projectsDir as lcmProjectsDir,
 } from "../src/runtime-paths.js";
@@ -1279,6 +1280,11 @@ function isNestedUnderRoot(actionCommand: Command, parentName: string, actionNam
 
 function shouldRunRootBootstrapMigration(actionCommand: Command): boolean {
   if (isNestedUnderRoot(actionCommand, "daemon", "restart")) return false;
+  // Each migration subcommand owns a state of the cutover, including the ones that leave a
+  // maintenance hold. The bootstrap's publication admission refuses while the hold exists, so
+  // running it first would make every one of them unrunnable. Only a legacy home that still
+  // waits to be moved needs the bootstrap before a migration command reads the active root.
+  if (isNestedUnderRoot(actionCommand, "migration")) return existsSync(legacyLcmHomeDir());
   const action = actionCommand.name();
   const topLevel = actionCommand.parent?.name() === "lcm";
   if (topLevel && (
