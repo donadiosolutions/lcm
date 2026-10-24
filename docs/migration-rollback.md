@@ -355,6 +355,14 @@ timestamp by instant rather than as text. The local outbox stores SQLite's
 rollback proceeds. A malformed timestamp, or one that names a different
 instant, still refuses the run.
 
+A passive event the daemon already drained (its `processed_at` is set) can
+still be listed as pending in PostgreSQL's inbox, because that inbox applies
+events asynchronously. Rollback accepts such a row and leaves it as it is, so
+the SQLite consumer does not replay it. A row that genuinely contradicts the
+archive, for example one that is acknowledged but not processed, refuses the
+run before rollback publishes anything: the canonical database is not
+replaced and the same rollback can be retried once the row is resolved.
+
 ## Running it: `lcm migration rollback`
 
 Rollback publishes its configuration and project map through the same

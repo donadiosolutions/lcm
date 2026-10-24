@@ -222,8 +222,14 @@ describe("acquireActivationLease", () => {
     expect(result.status).toBe("unresolvable");
   });
 
+  it("reports unresolvable, fail-closed, for a corrupt or ambiguous row (invalid-row)", async () => {
+    const guard = fakeGuard({ acquire: vi.fn(async () => { throw guardError("invalid-row"); }) });
+    const result = await acquireActivationLease(guard, acquireInput);
+    expect(result).toMatchObject({ status: "unresolvable", detail: expect.stringContaining("corrupt or ambiguous") });
+  });
+
   it("rethrows an unrecognized guard error reason unchanged", async () => {
-    const boom = guardError("invalid-row");
+    const boom = guardError("invalid-input");
     const guard = fakeGuard({ acquire: vi.fn(async () => { throw boom; }) });
     await expect(acquireActivationLease(guard, acquireInput)).rejects.toThrow(boom);
   });
@@ -363,8 +369,14 @@ describe("takeoverActivationLease", () => {
     expect(result.status).toBe("unresolvable");
   });
 
+  it("reports unresolvable, fail-closed, for a corrupt or ambiguous row (invalid-row)", async () => {
+    const guard = fakeGuard({ acquire: vi.fn(async () => { throw guardError("invalid-row"); }) });
+    const result = await takeoverActivationLease(guard, takeoverInput);
+    expect(result).toMatchObject({ status: "unresolvable", detail: expect.stringContaining("corrupt or ambiguous") });
+  });
+
   it("rethrows an unrecognized guard error reason unchanged", async () => {
-    const boom = guardError("invalid-row");
+    const boom = guardError("invalid-input");
     const guard = fakeGuard({ acquire: vi.fn(async () => { throw boom; }) });
     await expect(takeoverActivationLease(guard, takeoverInput)).rejects.toThrow(boom);
   });

@@ -314,7 +314,11 @@ read back after the operation, not assumed from the operation reporting success.
 
 Mutating. Switches a verified generation to PostgreSQL and releases the maintenance hold. It owns
 cell 24 (held, `verified`), cell 11 (an activation that was begun and not finished) and the settled
-re-entry at cell 10 (the generation's own completed publication and an `active` manifest). It adds no
+re-entry at cell 10 (the generation's own completed publication and an `active` manifest). Cell 11
+covers an interruption at any point after the activation began, including before the selection (the
+hold is still `held`, SQLite is still authoritative and nothing is published) and after the
+publication completed but before the manifest settled to `active`; run `activate` again and it
+finishes from where it stopped. It adds no
 algorithm of its own: it supplies the inputs the activation orchestration asks for and maps what it
 returns.
 
@@ -351,7 +355,13 @@ The refusal classes by reason (each reason has exactly one): **exit 2** `manifes
 `coverage-unresolvable`, `verification-unresolvable`, `target-unresolvable`, `evidence-unresolvable`,
 `state-unresolvable`; **exit 6** `pending-effect-foreign` when `resume` owns that pending effect, exit 2
 otherwise. A failed best-effort release of the lease is shown as `leaseReleaseFailed` in the
-evidence and nothing more.
+evidence and nothing more. A fenced-lease row that cannot be decoded (it names no publication
+generation) is `lease-unresolvable`, exit 5 `activation-refused-evidence`, with nothing changed and
+no `applied` claim; `lease-conflict` (exit 4) is a decodable lease held by another publication. A
+running daemon that holds the previous backend is now seen as present, so `activate`, `rollback` and
+`report` give exit 8; a daemon binary from before this behavior still gives exit 5
+`cutover-restart-contradiction`, and the remedy is unchanged: run `lcm daemon status`, resolve it, run
+`report`.
 
 **`--dry-run`** reads the persisted state (the manifest, the verification report, the journals, the
 link, the artifact and the restart check) and lists `notEvaluated`: quiescence, coverage, the
@@ -674,6 +684,8 @@ cell 12 it exits 6. The same router decides for all of them, so they cannot disa
 | 9 | `maintenance-aborted` | any | anything else | none -- exit 5; `abort` is never called | -- |
 | 10 | the generation's own completed publication | any | `active`, nothing pending | none -- settled; `report` | `activate` (settled re-entry), `rollback` |
 | 11 | the generation's own publication in flight or aborted, or a `selection-prepared`/`selection-completed` hold | any | `verified`, `activating`, or a pending activation effect | `activate` | `resume` |
+| 11 | `held`, matching (activation begun, no selection yet) | complete | `verified` with a pending `prepare-activation`, or `activating` with nothing pending or a pending `publish-activation` | `activate` | `resume` |
+| 11 | the generation's own completed publication (the manifest has not settled yet) | any | `activating` with a pending `publish-activation` | `activate` | `resume` |
 | 12 | not aborted | any | `rolling-back`, or a pending rollback effect | `rollback` | `resume` |
 | 13 | not aborted | any | `rolled-back`, nothing pending | none -- settled; `report` | `rollback` (settled re-entry) |
 | 2, 3 | a v2 publication | any | any | none -- exit 4 while in flight, exit 5 when foreign and finished | -- |
