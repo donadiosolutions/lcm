@@ -8,11 +8,13 @@ import {
   type MigrationRouteManifest,
   type MigrationRouteSnapshot,
 } from "../../src/migration/routing.js";
+import { deriveRollbackPublicationId } from "../../src/migration/rollback.js";
 import type { BackendMaintenancePhase, BackendPublicationPhase } from "../../src/storage/backend-publication.js";
 import type { MigrationEffectKind, MigrationPhase } from "../../src/migration/protocol.js";
 
 const GEN = "generation-1";
 const PUB = "publication-1";
+const ROLLBACK_PUB = deriveRollbackPublicationId(GEN);
 
 const held = (phase: BackendMaintenancePhase, generationId = GEN): MigrationRouteJournal => ({ kind: "hold", phase, generationId });
 const publication = (phase: BackendPublicationPhase, publicationId = PUB): MigrationRouteJournal => ({ kind: "publication", publicationId, phase });
@@ -60,6 +62,11 @@ const ROW_CELLS: ReadonlyArray<readonly [string, MigrationRouteInput, Expectatio
   ["12 rolling-back manifest", cell({ manifest: manifest("rolling-back"), journal: held("selection-completed") }), { row: 12, primary: "rollback", allowed: ["resume"], exit: 6 }],
   ["12 pending prepare-rollback", cell({ manifest: manifest("verified", "prepare-rollback") }), { row: 12, primary: "rollback", allowed: ["resume"], exit: 6 }],
   ["13 rolled-back manifest", cell({ manifest: manifest("rolled-back"), journal: held("selection-completed") }), { row: 13, primary: "none", allowed: ["rollback"], exit: 2, next: "report" }],
+  ["13 rolled-back manifest beside the completed rollback publication (#1675)", cell({ journal: publication("completed", ROLLBACK_PUB), manifest: manifest("rolled-back"), link: OWN_LINK }), { row: 13, primary: "none", allowed: ["rollback"], exit: 2, next: "report" }],
+  ["12 rolling-back manifest beside its in-flight rollback publication (#1675)", cell({ journal: publication("map-publishing", ROLLBACK_PUB), manifest: manifest("rolling-back"), link: OWN_LINK }), { row: 12, primary: "rollback", allowed: ["resume"], exit: 6 }],
+  ["3 rolled-back manifest beside an unrelated completed publication stays foreign (#1675)", cell({ journal: publication("completed", "other"), manifest: manifest("rolled-back"), link: OWN_LINK }), { row: 3, primary: "none", allowed: [], exit: 5 }],
+  ["25 a completed rollback publication is not an activation beside an active manifest (#1675)", cell({ journal: publication("completed", ROLLBACK_PUB), manifest: manifest("active"), link: OWN_LINK }), { row: 25, primary: "none", allowed: [], exit: 5 }],
+  ["25 an in-flight rollback publication is not an activation beside a verified manifest (#1675)", cell({ journal: publication("map-publishing", ROLLBACK_PUB), manifest: manifest("verified"), link: OWN_LINK }), { row: 25, primary: "none", allowed: [], exit: 5 }],
   ["14 entering hold, no manifest, no snapshot", cell({ journal: held("maintenance-entering") }), { row: 14, primary: "apply", allowed: ["abort"], exit: 2 }],
   ["14 entering hold, no manifest, complete snapshot", cell({ journal: held("maintenance-entering"), snapshot: "complete" }), { row: 14, primary: "apply", allowed: ["abort"], exit: 2 }],
   ["15 held, no manifest, no snapshot", cell({}), { row: 15, primary: "apply", allowed: ["abort"], exit: 2 }],
