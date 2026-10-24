@@ -19,7 +19,7 @@ import { assertSelectedBackend } from '../../surface-parity/backend-observation.
 import { capturePreparedMetadata, createPreparedCallRecorder, capturePreparedInputs, validatePreparedInputs, createAdmissionLedger, preparedCase, runPreparedCase, validatePreparedBundle, validatePreparedDelta } from '../../surface-parity/prepared-projects.mjs';
 import { captureJournalInputs, discoveryForJournal, assertJournalInputTransition } from '../../surface-parity/journal-inputs.mjs';
 import { resolveGitProjectAnchor } from '../../../dist/src/git-project.js';
-import { isolateAsyncBoundary } from '../../surface-parity/async-isolation.mjs';
+import { drainFailureId, isolateAsyncBoundary } from '../../surface-parity/async-isolation.mjs';
 import { classifyHomeParent, parseHomeParentWitness, witnessPayload } from '../../../dist/src/home-parent-auth.js';
 import { readBoundedRegularFileWithStat } from '../../../dist/src/security-files.js';
 import { semanticDigest } from '../../surface-parity/assertions.mjs';
@@ -656,7 +656,8 @@ async function settlePrepared() {
     }
     if (sidecar.unprocessed > 0) {
       const result = await request('POST', '/promote-events', { cwd: sidecar.cwd, drain: true });
-      assert.ok(result.status === 200 && result.body.errors === 0 && result.body.incomplete !== true, 'surface-prepared:drain');
+      assert.ok(result.status === 200 && result.body.errors === 0 && result.body.incomplete !== true,
+        result.status === 200 ? 'surface-prepared:drain' : drainFailureId('surface-prepared:drain', result));
     }
   }
   assert.ok((await readPassiveSidecars()).every(row => row.unprocessed === 0), 'surface-prepared:settled');

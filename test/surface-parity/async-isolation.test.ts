@@ -1,5 +1,5 @@
 import { expect, it, vi } from "vitest";
-import { isolateAsyncBoundary } from "./async-isolation.mjs";
+import { drainFailureId, isolateAsyncBoundary } from "./async-isolation.mjs";
 
 function fixture() {
   const calls: string[] = [];
@@ -54,6 +54,38 @@ it.each([
   expect(f.operations.drain).toHaveBeenCalledTimes(1);
   expect(f.operations.stop).not.toHaveBeenCalled();
   expect(f.operations.start).not.toHaveBeenCalled();
+});
+
+it.each([
+  { status: 503, body: { status: "blocked", error: "canary-free-text" }, id: "503:blocked" },
+  { status: 503, body: { code: "STORAGE_OPERATION_FAILED", message: "canary-free-text", projectId: "canary" }, id: "503:storage-STORAGE_OPERATION_FAILED" },
+  { status: 409, body: { code: "STORAGE_IDENTITY_REQUIRED", reason: "canary-free-text" }, id: "409:storage-STORAGE_IDENTITY_REQUIRED" },
+  { status: 500, body: { error: "canary-free-text" }, id: "500:other" },
+  { status: 500, body: { code: "contains canary free text" }, id: "500:other" },
+  { status: 500, body: { code: "A".repeat(41) }, id: "500:other" },
+  { status: 500, body: null, id: "500:other" },
+  { status: "503 canary", body: { code: "STORAGE_OPERATION_FAILED" }, id: "invalid:storage-STORAGE_OPERATION_FAILED" },
+  { status: 1000, body: undefined, id: "invalid:other" },
+])("reports a symbolic drain status without response text %#", async ({ status, body, id }) => {
+  const f = fixture();
+  f.operations.drain.mockResolvedValue({ status, body });
+  const error = await isolateAsyncBoundary(f.operations).then(() => undefined, (caught: unknown) => caught as Error);
+  // The worker relays only this symbolic prefix of the message (failure() in surface-parity-worker.mjs).
+  const relayed = error?.message.match(/^(?:surface[-\w]*:)[a-zA-Z0-9:._-]+/u)?.[0];
+  expect(relayed).toBe(`surface-isolation:drain-status:${id}`);
+  expect(f.operations.stop).not.toHaveBeenCalled();
+});
+
+it("keeps the worst-case drain id inside the worker's 110-character failure slice", () => {
+  const body = { status: "blocked", code: "A".repeat(40) };
+  const worst = drainFailureId("surface-prepared:drain", { status: 503, body: { code: "A".repeat(40) } });
+  expect(worst).toBe(`surface-prepared:drain:503:storage-${"A".repeat(40)}`);
+  // The worker strips the "surface-prepared:" prefix and prepends "<case>:<phase>:".
+  const prepared = `import-collisions:call12-before:${worst.replace(/^surface[-\w]*:/u, "")}`;
+  expect(prepared.length).toBeLessThanOrEqual(110);
+  expect(drainFailureId("surface-isolation:drain-status", { status: 503, body })).toBe("surface-isolation:drain-status:503:blocked");
+  // The unprepared id keeps status and kind ahead of the worker's file:line frame suffix.
+  expect(drainFailureId("surface-isolation:drain-status", { status: 503, body: { code: "A".repeat(40) } }).length).toBeLessThan(110 - 20);
 });
 
 it.each([{ unprocessed: 1 }, { scanError: "private diagnostic" }, { scanSkipped: "bounded scan" }])(
