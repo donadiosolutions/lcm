@@ -595,54 +595,71 @@ export function sanitizeHarnessText(value, secrets) {
     .replace(/-----BEGIN [^-]+-----[\s\S]*?-----END [^-]+-----/gu, "[REDACTED PEM]");
 }
 
-const PEM_BEGIN_MARKER = "-----BEGIN ";
-const PEM_END_MARKER = "-----END ";
-const PEM_BEGIN_LINE = /-----BEGIN [^-]+-----/u;
-const PEM_END_LINE = /-----END [^-]+-----/u;
+const PEM_MARKER = /-----(BEGIN|END) [^-]{1,64}-----/gu;
+// A complete marker is at most 80 characters, so a carry of 79 reassembles any
+// marker split across two writes of dropped text.
+const PEM_CARRY_CHARS = 79;
+
+// Walks complete BEGIN and END markers left to right, starting at nesting
+// depth `depth`. Returns the text outside PEM blocks, with each block replaced
+// by a marker, and the depth after the last marker. A BEGIN with no later END
+// leaves the block open; an END while no block is open is ordinary text. Only
+// markers ending after `minEnd` count, so a carried prefix is not counted twice.
+function scanPemMarkers(text, depth, minEnd = 0) {
+  let output = "";
+  let cursor = 0;
+  let open = depth;
+  for (const match of text.matchAll(PEM_MARKER)) {
+    const end = match.index + match[0].length;
+    if (end <= minEnd) continue;
+    if (match[1] === "BEGIN") {
+      if (open === 0) output += text.slice(cursor, match.index) + "[REDACTED PEM]";
+      open += 1;
+    } else if (open > 0) {
+      open -= 1;
+      if (open === 0) cursor = end;
+    }
+  }
+  if (open === 0) output += text.slice(cursor);
+  return { output, depth: open };
+}
 
 // Redacts a child stream one complete line at a time, so every byte passes
 // through secret, URL, and PEM redaction with full state before the bounded
-// capture ring may discard any of it. A PEM block is dropped from its BEGIN line
-// through its END line, also when the stream ends inside it. The unterminated
-// trailing line is held in a buffer bounded by MAX_CAPTURED_OUTPUT_BYTES; a
-// longer line is dropped and replaced by a marker, and a PEM BEGIN inside it
-// keeps the following lines redacted until an END line. Returns undefined when
-// a secret spans lines, which line-wise redaction cannot cover.
+// capture ring may discard any of it. A PEM block is dropped from its BEGIN
+// marker through its END marker, also when the stream ends inside it. A line
+// longer than MAX_CAPTURED_OUTPUT_BYTES is dropped and replaced by a marker,
+// however the chunks divide it; only its PEM state is kept, through a bounded
+// carry. dropped() reports that any line was dropped, which callers treat as
+// capture truncation. Returns undefined when a secret spans lines, which
+// line-wise redaction cannot cover.
 export function createStreamRedactor(secrets) {
   const needles = secrets.filter(Boolean);
   if (needles.some((secret) => String(secret).includes("\n"))) return undefined;
   const decoder = new StringDecoder("utf8");
   let pending = "";
   let discarding = false;
-  let inPem = false;
-  let droppedInPem = false;
-  let droppedTail = "";
+  let anyDropped = false;
+  let depth = 0;
+  let carry = "";
   const redactLine = (line) => {
-    if (inPem) {
-      if (PEM_END_LINE.test(line)) inPem = false;
-      return undefined;
-    }
+    const startedInPem = depth > 0;
     let redacted = line;
     for (const secret of needles) redacted = redacted.split(secret).join("[REDACTED]");
-    redacted = redacted.replace(/-----BEGIN [^-]+-----[\s\S]*?-----END [^-]+-----/gu, "[REDACTED PEM]");
-    if (PEM_BEGIN_LINE.test(redacted)) {
-      inPem = true;
-      return "[REDACTED PEM]";
-    }
-    return redacted.replace(/postgresql:\/\/[^\s]+/giu, "postgresql://[REDACTED]");
+    const scanned = scanPemMarkers(redacted, depth);
+    depth = scanned.depth;
+    if (startedInPem && scanned.output === "") return undefined;
+    return scanned.output.replace(/postgresql:\/\/[^\s]+/giu, "postgresql://[REDACTED]");
   };
-  const noteDropped = (text) => {
-    const window = droppedTail + text;
-    const begin = window.lastIndexOf(PEM_BEGIN_MARKER);
-    const end = window.lastIndexOf(PEM_END_MARKER);
-    if (begin >= 0 || end >= 0) droppedInPem = begin > end;
-    droppedTail = window.slice(-(PEM_BEGIN_MARKER.length - 1));
+  const scanDropped = (text) => {
+    const window = carry + text;
+    depth = scanPemMarkers(window, depth, carry.length).depth;
+    carry = window.slice(-PEM_CARRY_CHARS);
   };
-  const finishDropped = () => {
-    if (droppedInPem) inPem = true;
+  const dropLine = () => {
+    anyDropped = true;
     discarding = false;
-    droppedInPem = false;
-    droppedTail = "";
+    carry = "";
     return `[redacted: output line exceeded ${MAX_CAPTURED_OUTPUT_BYTES} bytes]`;
   };
   const consume = (text) => {
@@ -653,8 +670,11 @@ export function createStreamRedactor(secrets) {
       start = newline + 1;
       let emitted;
       if (discarding) {
-        noteDropped(line);
-        emitted = finishDropped();
+        scanDropped(line);
+        emitted = dropLine();
+      } else if (Buffer.byteLength(line) > MAX_CAPTURED_OUTPUT_BYTES) {
+        scanDropped(line);
+        emitted = dropLine();
       } else {
         emitted = redactLine(line);
       }
@@ -663,7 +683,7 @@ export function createStreamRedactor(secrets) {
     const rest = text.slice(start);
     if (discarding || Buffer.byteLength(rest) > MAX_CAPTURED_OUTPUT_BYTES) {
       discarding = true;
-      noteDropped(rest);
+      scanDropped(rest);
       pending = "";
     } else {
       pending = rest;
@@ -672,16 +692,21 @@ export function createStreamRedactor(secrets) {
   };
   return {
     write(chunk) {
-      return consume(pending + (typeof chunk === "string" ? chunk : decoder.write(chunk)));
+      const text = pending + (typeof chunk === "string" ? chunk : decoder.write(chunk));
+      pending = "";
+      return consume(text);
     },
     end() {
       const text = pending + decoder.end();
       pending = "";
-      if (discarding) {
-        noteDropped(text);
-        return finishDropped();
+      if (discarding || Buffer.byteLength(text) > MAX_CAPTURED_OUTPUT_BYTES) {
+        scanDropped(text);
+        return dropLine();
       }
       return text === "" ? "" : redactLine(text) ?? "";
+    },
+    dropped() {
+      return anyDropped;
     },
   };
 }
@@ -721,14 +746,18 @@ export function runProcess(command, args, options = {}) {
     const redacted = stdoutRedactor !== undefined;
     const appendTail = (current, chunk) => {
       const next = Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk);
+      // A truncated tail starts on a code point boundary, never inside a character.
+      const cut = (value) => value.subarray(utf8TailStart(value, 0));
       if (next.length >= maxCapturedOutputBytes) {
-        return { value: next.subarray(-maxCapturedOutputBytes), truncated: current.length > 0 || next.length > maxCapturedOutputBytes };
+        const truncated = current.length > 0 || next.length > maxCapturedOutputBytes;
+        const value = next.subarray(-maxCapturedOutputBytes);
+        return { value: truncated ? cut(value) : value, truncated };
       }
       if (current.length + next.length <= maxCapturedOutputBytes) {
         return { value: Buffer.concat([current, next]), truncated: false };
       }
       return {
-        value: Buffer.concat([current.subarray(current.length + next.length - maxCapturedOutputBytes), next]),
+        value: cut(Buffer.concat([current.subarray(current.length + next.length - maxCapturedOutputBytes), next])),
         truncated: true,
       };
     };
@@ -756,6 +785,9 @@ export function runProcess(command, args, options = {}) {
         const flushedStderr = appendTail(stderr, stderrRedactor.end());
         stderr = flushedStderr.value;
         stderrTruncated ||= flushedStderr.truncated;
+        // A dropped overlong line is capture truncation, whatever the exit status.
+        stdoutTruncated ||= stdoutRedactor.dropped();
+        stderrTruncated ||= stderrRedactor.dropped();
       }
       const capturedStdout = stdout.toString("utf8");
       const capturedStderr = stderr.toString("utf8");

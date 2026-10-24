@@ -3620,6 +3620,139 @@ describe("PostgreSQL harness utilities", () => {
     });
   });
 
+  describe("PEM markers and overlong lines through the capture path", () => {
+    const begin = "-----BEGIN PRIVATE KEY-----";
+    const end = "-----END PRIVATE KEY-----";
+
+    async function captureChunks(chunks: string[], code = 1) {
+      const child = fakeChild();
+      const running = runProcess("node", ["vitest.mjs"], { spawnProcess: () => child, redactSecrets: [] })
+        .catch((reason: unknown) => reason) as Promise<{
+          stdout: string;
+          stdoutTruncated: boolean;
+          redacted?: boolean;
+        }>;
+      for (const chunk of chunks) child.stdout.emit("data", Buffer.from(chunk));
+      child.emit("close", code, null);
+      return running;
+    }
+
+    it.each([
+      ["adjacent", "", "[REDACTED PEM]\n[REDACTED PEM]\nafter\n"],
+      ["space separated", " ", "[REDACTED PEM]\n [REDACTED PEM]\nafter\n"],
+    ])("redacts a block that opens right after an END (%s)", async (_label, separator, expected) => {
+      const result = await captureChunks([`${begin}\nBODY_ONE\n${end}${separator}${begin}\nCANARY_SECOND\n${end}\nafter\n`]);
+      expect(result.stdout).toBe(expected);
+    });
+
+    it("keeps a BEGIN nested before the first END open until its own END", async () => {
+      const result = await captureChunks([
+        `-----BEGIN CERTIFICATE----- ${begin} inner -----END CERTIFICATE-----\nCANARY_NESTED\n${end}\nafter\n`,
+      ]);
+      expect(result.stdout).toBe("[REDACTED PEM]\nafter\n");
+    });
+
+    it.each(["-----END ", "-----END incomplete"])("never closes a block on the prefix %j of an overlong line", async (prefix) => {
+      const result = await captureChunks([
+        `${begin}${"p".repeat(limit + 1)}${prefix}`,
+        `\nCANARY_OPEN_BODY\n${end}\nafter\n`,
+      ]);
+      expect(result.stdout).not.toContain("CANARY_OPEN_BODY");
+      expect(result.stdout).toBe(`${droppedLine}\nafter\n`);
+      expect(result.stdoutTruncated).toBe(true);
+    });
+
+    it("closes a block opened on an earlier line when the END is on an overlong line", async () => {
+      for (const chunks of [
+        [`${begin}\n${"a".repeat(limit + 1)}${end}\nFAILURE_AFTER_END\n`],
+        [`${begin}\n`, "a".repeat(limit + 1), `${end}\nFAILURE_AFTER_END\n`],
+      ]) {
+        const result = await captureChunks(chunks);
+        expect(result.stdout).toBe(`[REDACTED PEM]\n${droppedLine}\nFAILURE_AFTER_END\n`);
+        expect(result.stdoutTruncated).toBe(true);
+      }
+    });
+
+    it("recognises complete markers split at every position of a normal line", () => {
+      for (let cut = 1; cut < begin.length; cut += 1) {
+        const opening = createStreamRedactor([])!;
+        const opened = opening.write(begin.slice(0, cut))
+          + opening.write(`${begin.slice(cut)}\nBODY_${cut}\n${end}\nAFTER_${cut}\n`) + opening.end();
+        expect(opened).toBe(`[REDACTED PEM]\nAFTER_${cut}\n`);
+      }
+      for (let cut = 1; cut < end.length; cut += 1) {
+        const closing = createStreamRedactor([])!;
+        const closed = closing.write(`${begin}\nBODY\n${end.slice(0, cut)}`)
+          + closing.write(`${end.slice(cut)}\nAFTER_${cut}\n`) + closing.end();
+        expect(closed).toBe(`[REDACTED PEM]\nAFTER_${cut}\n`);
+      }
+    });
+
+    it("recognises complete markers split at every position of dropped text", () => {
+      for (let cut = 1; cut < end.length; cut += 1) {
+        const closing = createStreamRedactor([])!;
+        const closed = closing.write(`${begin}\n${"a".repeat(limit + 1)}${end.slice(0, cut)}`)
+          + closing.write(`${end.slice(cut)}\nFAILURE_${cut}\n`) + closing.end();
+        expect(closed).toContain(`FAILURE_${cut}`);
+      }
+      for (let cut = 1; cut < begin.length; cut += 1) {
+        const opening = createStreamRedactor([])!;
+        const opened = opening.write(`${"z".repeat(limit + 1)}${begin.slice(0, cut)}`)
+          + opening.write(`${begin.slice(cut)}\nCANARY_${cut}\n${end}\nAFTER_${cut}\n`) + opening.end();
+        expect(opened).not.toContain(`CANARY_${cut}`);
+        expect(opened).toContain(`AFTER_${cut}`);
+      }
+    });
+
+    it("treats a label longer than a marker allows as ordinary text", () => {
+      const redactor = createStreamRedactor([])!;
+      const output = redactor.write(`-----BEGIN ${"L".repeat(65)}-----\nplain\n`) + redactor.end();
+      expect(output).toBe(`-----BEGIN ${"L".repeat(65)}-----\nplain\n`);
+    });
+
+    it("keeps the retained ring on a character boundary", async () => {
+      const bytes = Buffer.alloc(limit + 2);
+      bytes[0] = 0x58;
+      for (let index = 1; index + 1 < bytes.length; index += 2) Buffer.from("é").copy(bytes, index);
+      bytes[bytes.length - 1] = 0x0a;
+      const child = fakeChild();
+      const running = runProcess("node", ["x"], { spawnProcess: () => child, redactSecrets: [] })
+        .catch((reason: unknown) => reason) as Promise<{ stdout: string; stdoutTruncated: boolean }>;
+      child.stdout.emit("data", bytes);
+      child.emit("close", 1, null);
+      const result = await running;
+      expect(result.stdoutTruncated).toBe(true);
+      expect(result.stdout).not.toContain("\ufffd");
+      expect(Buffer.byteLength(result.stdout)).toBeLessThanOrEqual(limit);
+    });
+
+    it.each([
+      ["one chunk", ["z".repeat(limit + 10) + "\nLAST_LINE\n"]],
+      ["newline in the overflow chunk", ["z".repeat(limit), "z".repeat(10) + "\nLAST_LINE\n"]],
+      ["newline in a later chunk", ["z".repeat(limit), "z".repeat(10), "\nLAST_LINE\n"]],
+      ["two chunks forming one line", ["m".repeat(40 * 1024), "m".repeat(40 * 1024) + "\nLAST_LINE\n"]],
+    ])("rejects a successful child whose overlong line was dropped (%s)", async (_label, chunks) => {
+      const child = fakeChild();
+      const running = runSanitizedProcess("node", ["vitest.mjs"], {
+        processRunner: (command: string, args: string[], options: Record<string, unknown>) =>
+          runProcess(command, args, { ...options, spawnProcess: () => child }),
+        stdout: { write: vi.fn() },
+        stderr: { write: vi.fn() },
+      }).then(
+        () => ({ resolved: true } as const),
+        (error: Error & { stderr: string }) => ({ resolved: false, error } as const),
+      );
+      for (const chunk of chunks) child.stdout.emit("data", Buffer.from(chunk));
+      child.emit("close", 0, null);
+      const outcome = await running;
+      expect(outcome.resolved).toBe(false);
+      if (outcome.resolved) return;
+      expect(outcome.error.message).toBe("PostgreSQL harness child output exceeded the safe capture limit");
+      expect(outcome.error.stderr).toContain("LAST_LINE");
+      expect(outcome.error.stderr).toContain(droppedLine);
+    });
+  });
+
   describe("raw truncated output", () => {
     it("omits a raw truncated stderr from the harness details", () => {
       const raw = Object.assign(new Error("docker failed"), {
