@@ -221,19 +221,52 @@ function validHandler(handler: unknown, notIntegerToken: (field: string) => bool
     && optionalCount(handler, "additionalContextLimit", notIntegerToken);
 }
 
-/** The objects Codex deserializes into typed structs: the root, hooks, each group and each handler. */
-function typedObjectPath(path: CodexHooksJsonPath): boolean {
+/**
+ * The members each handler variant's Codex struct knows (HookHandlerConfig in codex-rs/config/src/hook_config.rs),
+ * plus the "type" tag. Both spellings of commandWindows are listed because serde maps them to one field. Codex's
+ * prompt and agent variants are empty structs, so only the tag is known there.
+ */
+const KNOWN_HANDLER_MEMBERS: ReadonlyMap<string, ReadonlySet<string>> = new Map([
+  ["command", new Set(["type", "command", "commandWindows", "command_windows", "timeout", "async", "statusMessage", "additionalContextLimit"])],
+  ["mcp_tool", new Set(["type", "server", "tool", "input", "timeout", "statusMessage"])],
+  ["prompt", new Set(["type"])],
+  ["agent", new Set(["type"])],
+]);
+
+/** The value the parsed document holds at path, or undefined when a repeated ancestor member replaced it. */
+function valueAt(root: unknown, path: CodexHooksJsonPath): unknown {
+  let node = root;
+  for (const segment of path) {
+    node = Array.isArray(node) || isRecord(node) ? (node as Record<string | number, unknown>)[segment] : undefined;
+  }
+  return node;
+}
+
+/**
+ * True when a member repeated inside a typed object is one Codex's serde struct for that object knows, which makes
+ * its derived visitor fail with duplicate_field. A repeated member it does not know is discarded without a check,
+ * so Codex loads the file. The root is the exception: HooksFile denies unknown fields, so any root repeat fails.
+ * Repeats below an unknown event are discarded with the rest of that event, and a repeat under a shape Codex
+ * cannot deserialize is already rejected by the shape validation that follows.
+ */
+function repeatsKnownMember(root: unknown, { path, name }: { readonly path: CodexHooksJsonPath; readonly name: string }): boolean {
   if (path.length === 0) return true;
   if (path[0] !== "hooks") return false;
-  return path.length === 1
-    || (path.length === 3 && typeof path[2] === "number")
-    || (path.length === 5 && typeof path[2] === "number" && path[3] === "hooks" && typeof path[4] === "number");
+  if (path.length === 1) return Object.hasOwn(EVENT_SNAKE, name);
+  const event = path[1];
+  if (typeof event !== "string" || !Object.hasOwn(EVENT_SNAKE, event)) return false;
+  if (path.length === 3) return name === "matcher" || name === "hooks";
+  if (path.length !== 5 || path[3] !== "hooks") return false;
+  const handler = valueAt(root, path);
+  // A repeated "type" is always a duplicate_field error, so the final tag below is not ambiguous.
+  if (!isRecord(handler) || typeof handler.type !== "string") return false;
+  return KNOWN_HANDLER_MEMBERS.get(handler.type)?.has(name) === true;
 }
 
 /** Parse hooks.json with the strictness of Codex's typed schema; undefined means Codex would reject it. */
 function parseInstalledHandlers(content: string): InstalledHandler[] | undefined {
   const strict = parseCodexHooksJson(content);
-  if (strict === undefined || strict.duplicates.some(({ path }) => typedObjectPath(path))) return undefined;
+  if (strict === undefined || strict.duplicates.some((duplicate) => repeatsKnownMember(strict.value, duplicate))) return undefined;
   const value = strict.value;
   if (!isRecord(value)) return undefined;
   if (Object.keys(value).some((key) => key !== "hooks" && key !== "description")) return undefined;
