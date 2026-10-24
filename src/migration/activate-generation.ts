@@ -1062,7 +1062,7 @@ async function continueLease(ctx: Context): Promise<LeaseContinuation> {
 type OwnFenceRead =
   | Readonly<{ kind: "own"; fence: ActivationLeaseFence }>
   | Readonly<{ kind: "absent"; detail: string }>
-  | Readonly<{ kind: "foreign"; detail: string }>
+  | Readonly<{ kind: "foreign"; detail: string; corrupt: boolean }>
   | Readonly<{ kind: "unresolvable"; detail: string }>;
 
 /** Re-read the lease row to continue from (re-entry): the row this
@@ -1072,9 +1072,9 @@ type OwnFenceRead =
 async function readOwnFence(ctx: Context): Promise<OwnFenceRead> {
   const resolved = await resolveActivationLeaseFence(ctx.guard!, { projectId: ctx.remoteProjectId, targetBackend: "postgresql", evidenceSha256: ctx.evidenceSha256!, signal: ctx.input.signal });
   if (resolved.kind === "absent") return { kind: "absent", detail: "no fenced lease row exists for this generation" };
-  if (resolved.kind === "identity-mismatch") return { kind: "foreign", detail: resolved.detail };
+  if (resolved.kind === "identity-mismatch") return { kind: "foreign", detail: resolved.detail, corrupt: resolved.corrupt === true };
   if (resolved.kind === "unresolvable") return { kind: "unresolvable", detail: resolved.detail };
-  if (resolved.fence.publicationId !== ctx.publicationId) return { kind: "foreign", detail: "the fenced lease row names another publication" };
+  if (resolved.fence.publicationId !== ctx.publicationId) return { kind: "foreign", detail: "the fenced lease row names another publication", corrupt: false };
   return { kind: "own", fence: resolved.fence };
 }
 
@@ -1098,11 +1098,21 @@ const NO_OWN_FENCE_PHASES: ReadonlySet<BackendPublicationJournal["phase"]> = new
  * home) may legitimately have acquired the released row, and only local
  * authenticated finalization (released) or the terminal report (completed)
  * remains; neither the drive nor S16 renews, releases, acquires or takes
- * over that row. At releasing the coordinator still has to authenticate its
- * own release from the row, and the abort family unwinds through it, so a
- * foreign row stays lease-lost there.
+ * over that row.
  */
 const SUCCESSOR_ROW_PHASES: ReadonlySet<BackendPublicationJournal["phase"]> = new Set(["released", "completed"]);
+
+/**
+ * The release window (Bug #1651): the remote release may already have
+ * committed while the journal still reads releasing (or abort-releasing), so
+ * a successor publication may hold the released row. A decodable foreign row
+ * is admitted so the coordinator can finish its release tail, which is the
+ * only proof that this publication's fence was released; the drive neither
+ * renews, releases, acquires nor takes over that row. A corrupt or ambiguous
+ * row is never admitted, and a coordinator whose guard cannot prove the
+ * release still fails closed.
+ */
+const RELEASE_WINDOW_PHASES: ReadonlySet<BackendPublicationJournal["phase"]> = new Set(["releasing", "abort-releasing"]);
 
 /**
  * Release the S2 lease of a run that ends before any durable effect (the
@@ -1831,12 +1841,16 @@ async function runUnderBarrier(ctx: Context, scratchParent: string): Promise<Mig
       ctx.fence = own.fence;
     } else if (own.kind === "unresolvable") {
       return interrupted(ctx, "S13b", "lease-unresolvable", own.detail).exit;
-    } else if (!(ownV2 !== null && (own.kind === "foreign" ? SUCCESSOR_ROW_PHASES : NO_OWN_FENCE_PHASES).has(ownV2.phase))) {
+    } else if (!(ownV2 !== null && (own.kind === "foreign"
+      ? SUCCESSOR_ROW_PHASES.has(ownV2.phase) || (RELEASE_WINDOW_PHASES.has(ownV2.phase) && !own.corrupt)
+      : NO_OWN_FENCE_PHASES.has(ownV2.phase)))) {
       // An absent row is lost unless the coordinator owns the fences for
       // this phase (NO_OWN_FENCE_PHASES); a row of another publication is
       // lost unless this publication has already released its own
-      // (SUCCESSOR_ROW_PHASES). Otherwise ctx.fence stays null and stepDrive
-      // continues without one, never touching a successor's row.
+      // (SUCCESSOR_ROW_PHASES) or is finishing that release
+      // (RELEASE_WINDOW_PHASES, decodable rows only). Otherwise ctx.fence
+      // stays null and stepDrive continues without one, never touching a
+      // successor's row.
       return interrupted(ctx, "S13b", "lease-lost", own.detail).exit;
     }
     // A selection is recorded only after S10 began publish-activation, and

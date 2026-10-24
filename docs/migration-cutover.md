@@ -1141,6 +1141,19 @@ is uncertain keeps it; the same generation recovers by taking the row over
 on its next run. Once an effect has begun the lease is kept for the next run
 to continue.
 
+A crash after the coordinator released the remote fence but before it
+recorded that locally can leave the publication journal at `releasing`
+(or `abort-releasing`) while another home's publication has already acquired the
+released row. The retry admits that decodable foreign row, never renews,
+releases or takes it over, and lets the coordinator finish its release: a row
+of another identity with a greater fencing token proves this publication's
+fence was released (see "The remote guard provider" in the backend publication
+guide). An aborting run reports `publication-failed` with the aborted
+publication. A corrupt or ambiguous row, an unattributable read, or a guard
+that cannot prove the release still ends in `lease-lost`,
+`lease-unresolvable` or a coordinator refusal and leaves the journal at
+`releasing`. The same applies to each member of a cutover set.
+
 ### The daemon restart
 
 Publication changes the selection the daemon reads at startup. A daemon that
