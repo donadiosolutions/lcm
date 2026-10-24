@@ -229,6 +229,20 @@ describe("report: rows with no owner and no way forward exit non-zero but still 
     expect(result).toMatchObject({ reason: "route-contradiction", generationId: FIXTURE_GENERATION, next: null, evidence: { cell: 9, selectedBackend: null } });
   });
 
+  it.each(["active", "rolled-back"] as const)("a foreign aborted hold beside an %s manifest is cell 9 with no selected backend and no restart check", async (phase) => {
+    const home = makeFixtureHome(roots);
+    await abortedFixtureJournal(home, "generation-2");
+    createFixtureManifest(new MigrationManifestStore({ homeDir: home }), phase);
+    const checkRestart = vi.fn(async () => verdict("satisfied"));
+    const result = await performMigrationReportCommand({
+      homeDir: home, generation: FIXTURE_GENERATION, _resolution: resolution,
+      _operationsForTesting: { ...restartOps(verdict("satisfied"), ABSENT), checkRestart },
+    });
+    expect(result).toMatchObject({ reason: "route-contradiction", generationId: FIXTURE_GENERATION, next: null, evidence: { cell: 9, selectedBackend: null } });
+    expect(result.restart).toBeNull();
+    expect(checkRestart).not.toHaveBeenCalled();
+  });
+
   it("row 25 (anything else) exits as a contradiction", async () => {
     const home = makeFixtureHome(roots);
     await heldFixtureJournal(home);

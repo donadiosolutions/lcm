@@ -5,11 +5,13 @@ rationale: >-
   fresh hold entry reads the journal back and reports `applied: true` when a
   hold may remain, and routing rows 5-8 require the maintenance-aborted hold to
   belong to the routed generation (the unreachable abort-other-generation
-  refusal is removed). They all live under src/migration/ and stay in the
+  refusal is removed), and report names no selected backend for a foreign
+  aborted hold. They all live under src/migration/ and stay in the
   directory-level migration cutover owner; no topology change.
 pins:
   - ["src/migration/apply.ts", "unit-migration-cutover"]
   - ["src/migration/cli-abort.ts", "unit-migration-cutover"]
   - ["src/migration/cli-apply.ts", "unit-migration-cutover"]
+  - ["src/migration/cli-report.ts", "unit-migration-cutover"]
   - ["src/migration/refusal-mapping.ts", "unit-migration-cutover"]
   - ["src/migration/routing.ts", "unit-migration-cutover"]
