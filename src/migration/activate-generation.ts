@@ -29,6 +29,7 @@ import type { PostgreSqlConnectionSettings, PostgreSqlQueryExecutor, PostgreSqlR
 import {
   POSTGRESQL_BACKEND_PUBLICATION_RESOURCE_KEY,
   POSTGRESQL_BACKEND_PUBLICATION_RESOURCE_TYPE,
+  PostgreSqlBackendPublicationGuardError,
 } from "../storage/postgresql/publication-guard.js";
 import { createPostgreSqlBackendPublicationRemoteGuard } from "../storage/postgresql/publication-remote-guard.js";
 import { PostgreSqlRuntime } from "../storage/postgresql/runtime.js";
@@ -1016,7 +1017,19 @@ async function stepLeaseAcquire(ctx: Context): Promise<Step<ActivationLeaseFence
   if (acquired.status === "acquired") return ok(acquired.fence);
   if (acquired.status === "conflict") return refused(ctx, "S2", "lease-conflict", acquired.detail);
   if (acquired.status === "unresolvable") return refused(ctx, "S2", "lease-unresolvable", acquired.detail);
-  const current = await ctx.guard!.read({ projectId: ctx.remoteProjectId, targetBackend: "postgresql", evidenceSha256: ctx.evidenceSha256!, signal: ctx.input.signal });
+  let current: ActivationLeaseFence | null;
+  try {
+    current = await ctx.guard!.read({ projectId: ctx.remoteProjectId, targetBackend: "postgresql", evidenceSha256: ctx.evidenceSha256!, signal: ctx.input.signal });
+  } catch (error) {
+    // A decodable row naming another generation is a routine conflict; an undecodable row is data damage.
+    if (error instanceof PostgreSqlBackendPublicationGuardError && error.reason === "fence-mismatch") {
+      return refused(ctx, "S2", "lease-conflict", "the expired lease row was taken by a different publication generation before takeover");
+    }
+    if (error instanceof PostgreSqlBackendPublicationGuardError && error.reason === "invalid-row") {
+      return refused(ctx, "S2", "lease-unresolvable", "the expired lease row is corrupt or ambiguous and cannot be attributed to any publication generation");
+    }
+    throw error;
+  }
   if (current === null) return refused(ctx, "S2", "lease-unresolvable", "the expired lease row vanished before takeover");
   const took: ActivationLeaseTakeoverResult = await takeoverActivationLease(ctx.guard!, { ...base, expectedFencingToken: current.fencingToken });
   if (took.status === "took-over") return ok(took.fence);

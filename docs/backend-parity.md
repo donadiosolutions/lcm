@@ -134,7 +134,9 @@ It does not relax the observational contracts for CLI `stats`, `status`, or
 cannot use a readiness receipt to permit sidecar removal or identity changes.
 The separately inventoried authenticated `GET /health/observe` endpoint reports
 process identity with storage status `unverified`. It supports diagnostic
-identity checks without probing active storage readiness. Its assertions require
+identity checks without probing active storage readiness, and it alone tolerates
+a startup backend that differs from the on-disk selection while every other
+admission check still applies. Its assertions require
 authentication, stable identity, and the strict read-only contract; it cannot
 use the active-health bookkeeping allowance or certify storage readiness.
 Failure scenarios check unavailable or exhausted storage, cancellation, cleanup,

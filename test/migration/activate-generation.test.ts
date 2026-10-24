@@ -19,8 +19,10 @@ import { createBackendPublicationCoordinator } from "../../src/storage/backend-p
 import type { StorageIdentityContext } from "../../src/storage/contracts.js";
 import type { PostgreSqlConnectionSettings, PostgreSqlRuntimeHealth } from "../../src/storage/postgresql/contracts.js";
 import {
+  PostgreSqlBackendPublicationGuard,
   PostgreSqlBackendPublicationGuardError,
   type PostgreSqlBackendPublicationAcquireInput,
+  type PostgreSqlBackendPublicationControlExecutor,
   type PostgreSqlBackendPublicationFence,
   type PostgreSqlBackendPublicationMutationInput,
 } from "../../src/storage/postgresql/publication-guard.js";
@@ -1004,6 +1006,56 @@ describe("runMigrationActivation: classification refusals and interruptions", ()
     let reads = 0;
     j.guard.read = async (input) => (reads++ === 0 ? null : read(input));
     expect(await j.run()).toMatchObject({ status: "refused", step: "S2", reason: "lease-unresolvable" });
+  });
+
+  it("S2: a fence row the real guard cannot decode refuses lease-unresolvable, a decodable foreign row refuses lease-conflict", async () => {
+    const row = (operation: string, publication: string) => ({
+      project_id: REMOTE, owner_machine_id: MACHINE, owner_process_id: publication, operation, fencing_token: "1",
+      acquired_at: "2026-10-16T00:00:00.000Z", renewed_at: "2026-10-16T00:00:00.000Z", expires_at: "2999-01-01T00:00:00.000Z",
+      released_at: null, expired: false,
+    });
+    const realGuardOver = (stored: ReturnType<typeof row>) => {
+      const query = async () => ({ rows: [stored] });
+      return new PostgreSqlBackendPublicationGuard({
+        projectPublicationTransaction: async (_projectId: string, callback: (scope: unknown) => Promise<unknown>) => callback({
+          transactionScope: "active", query, savepoint: async (inner: (scope: { query: typeof query }) => Promise<unknown>) => inner({ query }),
+        }),
+        projectPublicationReadback: async () => ({ rows: [stored] }),
+      } as unknown as PostgreSqlBackendPublicationControlExecutor);
+    };
+    const runWith = async (stored: ReturnType<typeof row>) => {
+      const f = await fixture();
+      const guard = realGuardOver(stored);
+      const outcome = await f.run({ createOrdinaryRuntime: (settings) => ({ ...f.deps.createOrdinaryRuntime(settings), backendPublicationGuard: () => guard }) });
+      return { f, outcome };
+    };
+    // The #628 rehearsal row: this machine, an undecodable operation string.
+    const undecodable = await runWith(row("rehearsal-contention", "rehearsal-competing-owner"));
+    expect(undecodable.outcome).toMatchObject({ status: "refused", step: "S2", reason: "lease-unresolvable" });
+    expect(undecodable.f.manifestStore.read(GENERATION).phase).toBe("verified");
+    const foreign = await runWith(row("backend-publication:postgresql:" + "f".repeat(64), "someone-else"));
+    expect(foreign.outcome).toMatchObject({ status: "refused", step: "S2", reason: "lease-conflict" });
+  });
+
+  it("S2: the takeover read classifies a different generation as lease-conflict, an undecodable row as lease-unresolvable, and rethrows anything else", async () => {
+    const failRead = async (error: unknown) => {
+      const f = await fixture();
+      f.guard.seed({ projectId: REMOTE, publicationId: f.publicationId, databaseExpired: true });
+      f.guard.read = async () => { throw error; };
+      return f.run();
+    };
+    expect(await failRead(new PostgreSqlBackendPublicationGuardError(REMOTE, "read", "fence-mismatch"))).toMatchObject({ status: "refused", step: "S2", reason: "lease-conflict" });
+    expect(await failRead(new PostgreSqlBackendPublicationGuardError(REMOTE, "read", "invalid-row"))).toMatchObject({ status: "refused", step: "S2", reason: "lease-unresolvable" });
+    await expect(failRead(new PostgreSqlBackendPublicationGuardError(REMOTE, "read", "invalid-input"))).rejects.toMatchObject({ reason: "invalid-input" });
+    await expect(failRead(new Error("read exploded"))).rejects.toThrow("read exploded");
+    const g = await fixture();
+    g.guard.seed({ projectId: REMOTE, publicationId: g.publicationId, databaseExpired: true });
+    const acquire = g.guard.acquire.bind(g.guard);
+    g.guard.acquire = async (input) => {
+      if (input.expectedFencingToken !== undefined) throw new PostgreSqlBackendPublicationGuardError(input.projectId, "acquire", "invalid-row");
+      return acquire(input);
+    };
+    expect(await g.run()).toMatchObject({ status: "refused", step: "S2", reason: "lease-unresolvable" });
   });
 
   it("renew after S7: a stale caller token is renewed with the returned token; a vanished row refuses lease-conflict; an ambiguous renew refuses lease-unresolvable", async () => {
