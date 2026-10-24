@@ -710,7 +710,7 @@ export async function runSearchSelfMatchProbe(
       ? { ran: false, chosenOrdinal: null, notRunReason: null, emptySource: true }
       : {
         ran: false, chosenOrdinal: null,
-        notRunReason: `the source has no search-probe candidates, but the production search returned ${rows.length} row(s) for the empty-source query`,
+        notRunReason: "the source has no search-probe candidates, but the production search returned rows for the empty-source query",
       };
   }
   const seedIndex = Number.parseInt(seedBasisSha256.slice(0, 8), 16) % candidates.length;

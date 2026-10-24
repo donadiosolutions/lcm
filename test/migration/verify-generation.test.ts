@@ -3258,7 +3258,9 @@ describe("verifyMigrationGeneration: search self-match probe (round-2 P1)", () =
     stubDestinationPrimitives();
     const recordCounts = Object.fromEntries(PORTABLE_RECORD_DOMAIN_ORDER.map((domain, index) => [domain, index])) as Partial<Record<PortableDomain, number>>;
     const copySource = fakeCopySource({ recordCounts, messagesRecords: [] });
-    const runtime = fakeRuntime();
+    // searchRows: [] so the empty-source search is clean and only the
+    // non-zero checkpoint and census can refuse the receipt.
+    const runtime = fakeRuntime({ searchRows: [] });
     const dependencies = dependenciesFor(copySource, runtime);
     const result = await verifyMigrationGeneration(baseInput({ homeDir: "/tmp/lcm-verify-search-no-messages" }), dependencies);
     expect(result.report.body.publicProbeCoverage).toContainEqual({ probe: "public-search", ran: false });
@@ -3363,6 +3365,22 @@ describe("verifyMigrationGeneration: search self-match probe (round-2 P1)", () =
       expect(result.report.body.publicProbeCoverage).toContainEqual({ probe: "public-search", ran: false });
       expect(result.report.activationEligible).toBe(false);
     }, 15000);
+
+    it("withholds the receipt when the source checkpoint is non-zero even though the census is zero and the search is clean", async () => {
+      const result = await verifyEmptyProject({ home: "/tmp/lcm-verify-empty-checkpoint-only", sourceMessageCount: 3, censusMessageCount: 0 });
+      expect(result.report.body.publicProbeCoverage).toContainEqual({ probe: "public-search", ran: false });
+      expect(result.report.activationEligible).toBe(false);
+    }, 15000);
+
+    it("does not let the number of returned rows reach publicProbeSha256", async () => {
+      const second = { ...SEARCH_HIT_ROW, message_id: 2 };
+      const one = await verifyEmptyProject({ home: "/tmp/lcm-verify-empty-one-row", runtime: { searchRows: [SEARCH_HIT_ROW] } });
+      const two = await verifyEmptyProject({ home: "/tmp/lcm-verify-empty-two-rows", runtime: { searchRows: [SEARCH_HIT_ROW, second] } });
+      for (const result of [one, two]) {
+        expect(result.report.body.publicProbeCoverage).toContainEqual({ probe: "public-search", ran: false });
+      }
+      expect(two.report.body.publicProbeSha256).toBe(one.report.body.publicProbeSha256);
+    }, 30000);
 
     it("propagates a search error instead of folding it into a pass", async () => {
       const runtime = fakeRuntime({ session: fakeSession(), searchRows: [] });

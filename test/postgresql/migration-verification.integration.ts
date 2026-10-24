@@ -389,7 +389,7 @@ it("the empty-source search probe runs live: no matching row is vacuous, a plant
       const planted = await runSearchSelfMatchProbe(runtime, seeded.expectedIdentity.id, targetGenerationId, [], "a".repeat(64));
       expect(planted.ran).toBe(false);
       expect(planted).not.toHaveProperty("emptySource");
-      expect(planted.notRunReason).toContain("returned 1 row");
+      expect(planted.notRunReason).toContain("returned rows");
     } finally {
       await runtime.close();
     }
