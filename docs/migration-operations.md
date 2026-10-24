@@ -106,6 +106,13 @@ and set `predictive: false`, because completing the step is what performs the ch
 and what they did not evaluate, and exit 5. A preview that could not evaluate the checks that decide
 the outcome must not read as a yes.
 
+**`--set`.** Every command also accepts `--set`, which runs it on every project of the home as one
+cutover set instead of on the current directory's project. The flag is explicit: without it each
+command keeps exactly its single-generation behavior, and a home that holds data for several
+projects is refused by the single-generation `activate` (`uncovered-projects`). With `--set`,
+`--generation` and `--confirm-generation` take the aggregate **set id**, never a member generation
+id. See "Cutover sets: the `--set` mode" below for the sequence, the previews and the states.
+
 ### `lcm migration plan [--json]`
 
 Non-mutating. Checks every precondition `apply` will check — target configuration, PostgreSQL
@@ -321,7 +328,7 @@ refuses before the call.
 
 The refusal classes by reason (each reason has exactly one): **exit 2** `manifest-absent`,
 `manifest-not-eligible`, `maintenance-not-held`, `quiescence-unsatisfied`, `coverage-unsatisfied`,
-`uncovered-projects` (a machine with stored data for more than one project is out of scope here),
+`uncovered-projects` (a machine with stored data for more than one project is moved with `--set` instead),
 `verification-stale`, `identity-drift`, `project-map-drift`, `target-unhealthy`, `census-drift`,
 `class-coverage-incomplete`, `verification-mismatch`; **exit 4** `lease-conflict`; **exit 5**
 `manifest-unresolvable`, `maintenance-unresolvable`, `lease-unresolvable`, `quiescence-unresolvable`,
@@ -493,6 +500,128 @@ an absolute path or a credentialed URL, or is longer than 256 characters, makes 
 the closed `unexpected-failure` instead of leaking it. The refusal reasons are in "Machine-readable
 inventory"; each carries its exit class and its remedy.
 
+With `--set` the envelope keeps these eleven fields. `generation` is the **original** set id (also
+for `rollback`, where the evidence's `rollbackSetId` prints the derived rollback hold id
+separately), and `manifestPhase` is the phase every member shares, or `null` when they differ or
+none is known. A member is a group of flat `member.<n>.*` evidence keys (`projectId`, `generationId`,
+`state`, and `pending`, `snapshot`, `reason`, `mode` or `installedGenerationId` where they apply);
+the indexes are in manifest order, so a consumer sorts them numerically (`member.10` follows
+`member.9`), not as the sorted JSON keys appear. When a mutating command cannot read the state
+around a service call to prove it wrote nothing, `applied` is `true` and `evidence.writeObservation`
+is `unresolvable`.
+
+## Cutover sets: the `--set` mode
+
+A home that stores data for more than one project moves as one cutover set: one maintenance hold,
+one verified copy per project, one publication that selects PostgreSQL for all of them, and one
+publication that returns all of them to SQLite. The contract is in
+[Cutover sets](migration-cutover-set.md); this section is the operator view. A home with a single
+stored-data project is not a set: `--set` refuses it (`set-refused-precondition` with
+`serviceReason: cutover-set-single-project`) and the commands without `--set` apply.
+
+```text
+plan --set -> apply --set -> resume --set (until prepared) -> verify --set -> activate --set
+   -> swap the grants -> start the daemon -> report --set
+prepared or held set -> abort --set        activated set -> rollback --set
+```
+
+```bash
+lcm migration plan --set --json
+lcm migration apply --set --confirm-generation <set-id> --dry-run --json
+lcm migration apply --set --confirm-generation <set-id> --json
+lcm migration report --set --generation <set-id> --json
+lcm migration verify --set --generation <set-id> --confirm-generation <set-id> --json
+lcm migration activate --set --generation <set-id> --confirm-generation <set-id> --confirm-backend postgresql --json
+lcm migration report --set --generation <set-id> --json
+lcm migration rollback --set --generation <set-id> --confirm-generation <set-id> --confirm-backend sqlite --json
+lcm migration resume --set --generation <set-id> --confirm-generation <set-id> --json
+lcm migration abort --set --confirm-generation <set-id> --json
+```
+
+**Which id.** `plan --set` prints the aggregate set id as `generation`. Every later command takes
+that id, always the **original** one, also to roll back or to resume a rollback. `resume`, `verify`,
+`report`, `activate` and `rollback` require an explicit `--generation <set-id>`: the id is never
+inferred from the live hold and no store is scanned for it. A mutating command and `verify` also
+need the matching `--confirm-generation`; `report` is read-only and needs none. The id of a rollback
+hold or publication is refused (`set-original-generation-required`, exit 2). `abort --set` keeps the
+abort selection: the journal's own set, confirmed with `--confirm-generation <set-id>`. A member's
+generation id is never accepted as a set id.
+
+**Preflight order.** `plan --set` and `apply --set` resolve the PostgreSQL target configuration,
+establish daemon presence, verify the real TLS and migration-role connection, and then resolve the
+candidate; `apply --set` compares the exact confirmed set id before it calls the preparation. The
+existing-set commands read their selector, confirmations and route first and touch the target only
+to run the preparation or the activation. `report`, `verify` and `abort` never open a transfer
+preflight, and `rollback --set` resolves its own runtime connection.
+
+**What `--dry-run` means with `--set`.**
+
+| Command | `--dry-run` |
+| --- | --- |
+| `apply --set` | Stops after the exact confirmation, before any hold, capture or copy. Exit 0 means the confirmation matched, not that anything was prepared. |
+| `resume --set` | Names the service the durable state admits and runs nothing. Exit 0 means the route was read. |
+| `verify --set` | Always exit 5 `set-preview-not-predictive` with `predictive: false`: set verification only confirms persisted evidence, so there is nothing to compute. |
+| `activate --set`, `rollback --set` | Exit 5 `set-preview-not-predictive`, never 0; the evidence lists what was not evaluated. |
+| `abort --set` | The abort's own dry run. |
+
+`plan --set` and the standalone `dry-run --set` write nothing: the planning lookup holds any project-map
+metadata backfill in memory, and `dry-run --set` only checks each stored-data project's SQLite source
+(no PostgreSQL, no journal). Their short coordination locks are the same ones the single commands take.
+
+**What `verify --set` is.** It confirms, from persisted evidence and without writing, that every
+member is `verified` with nothing pending, a complete snapshot and an activation-eligible report.
+It does not recompute a verification. An incomplete preparation is refused with `resume --set` as the
+next step; `activate --set` revalidates every member itself.
+
+**States and owners.** `evidence.setState` names the observed state and `next` the command that owns it.
+
+| `setState` | Durable state | Owner |
+| --- | --- | --- |
+| `prepare` | a forward hold whose members are not all verified | `resume --set` (or `apply --set`) |
+| `prepared` | a forward hold, every member verified | `activate --set` |
+| `activate` | activation records exist, members not all active | `resume --set` or `activate --set` |
+| `settled-activated` | every member active, nothing pending | `report --set` (grant swap, restart) |
+| `rollback` | rollback records exist, members not all rolled back | `resume --set` or `rollback --set` |
+| `settled-rolled-back` | every member rolled back, nothing pending | `report --set` |
+| `abort` | an aborted hold with unsettled members | `resume --set` or `abort --set` |
+| `settled-aborted`, `unknown` | nothing left to settle, or nothing names the set | `plan --set` |
+| `single-generation-held`, `foreign`, `reverse-id`, `contradiction`, `unresolvable` | not this set's to act on, or unreadable | refused, nothing changed |
+
+`resume --set` drives exactly one service for that state: the preparation, the activation, the
+rollback, or the whole-set abort. It never chains one operation into the next, and a prepared set is
+reported, not activated. A preparation that cannot continue is named before any service runs: a
+partial or replaced snapshot is exit 2 with `abort --set` as the next step, a tampered or unreadable
+snapshot, or a manifest beside an absent snapshot, is exit 5.
+
+**The refusal buckets.** The service reason, step and cause, and the owning command, are in the
+evidence (`serviceCommand`, `serviceReason`, `serviceStep`, `serviceCause`); an unrecognized service
+string is reported as `unrecognized` and is never copied into the output.
+
+| Reason | Exit | Meaning |
+| --- | --- | --- |
+| `set-refused-precondition` | 2 | The state, scope or capacity does not admit the command. |
+| `set-refused-contention` | 4 | Another actor holds a lock, lease or journal slot. |
+| `set-refused-evidence` | 5 | A needed fact could not be established, or the evidence contradicts the set. |
+| `set-incomplete` | 6 | Durably begun and the state still admits the same service; `resume --set` finishes it. |
+| `set-operator-required` | 7 | No automatic command settles it. |
+| `set-preview-not-predictive` | 5 | A `--dry-run` that cannot predict the outcome. |
+| `set-generation-required`, `set-generation-invalid`, `set-original-generation-required` | 2, 1, 2 | The selector is missing, malformed, or names the rollback hold. |
+| `set-confirmation-missing`, `set-confirmation-moved` | 3 | `--confirm-generation` is absent or is not the aggregate set id. |
+
+**Exit 6.** A service returning a recoverable-looking result is not enough: the command reads the
+durable state again and emits `set-incomplete` only when that state still admits the same service.
+Otherwise the result is exit 4, 5 or 7 according to the closed reason. Success is always read back
+from the member manifests and the aggregate records, never taken from the service result.
+
+**After a set activation.** Do the grant swap and start the daemon exactly as in "The cutover:
+activate and the grant swap": `activate --set` runs entirely under the transfer role, so add the
+runtime grants and revoke the transfer grants before starting the daemon, then run `report --set`
+until it exits 0.
+
+**Known diagnostic limits.** `report --set` does not repair `abort`'s immediate readback attribution
+(#1657). A rollback checkpoint that is absent means no committed rollback checkpoint, not that no
+write happened (#1667). Report rows are evidence for an operator and never grant replay admission.
+
 ## State routing: which command owns which situation
 
 This table exists so that every state your installation can be in has exactly one command that
@@ -573,7 +702,9 @@ rollback orchestration and reported, never chosen by the CLI.
 the installation, so unwinding it for one project would also switch every other project that is
 bound to PostgreSQL back to SQLite. The refusal arrives as `rollback-refused-precondition` or
 `rollback-refused-evidence` (the evidence names `not-eligible` or `drift`), and the CLI neither
-pre-checks nor softens it. Moving several projects at once is separate, planned work (#1544);
+pre-checks nor softens it. Several projects move together with the `--set` form (see "Cutover sets:
+the `--set` mode"), which rolls every member back through one publication; the rule above is the
+single-generation rollback's, and you do not unbind projects by hand to get around it. Without `--set`,
 `activate` likewise refuses a machine that has stored data for more than one project
 (`uncovered-projects`).
 
@@ -1450,6 +1581,61 @@ block marks implemented. `canEmit` is the closed set of exit classes the command
       "reason": "rollback-dry-run-not-predictive",
       "exitClass": "refused-evidence",
       "remedy": "The rollback preview reads only the route and the manifest. It does not evaluate eligibility, mode, quiescence, the lease, drift, remote bindings or the restart check, so it cannot say rollback would succeed."
+    },
+    {
+      "reason": "set-refused-precondition",
+      "exitClass": "refused-precondition",
+      "remedy": "The cutover set's state, scope or capacity does not admit this command, and nothing it owns was changed: the evidence names the owning command and the closed reason. Fix that condition, or run the command the evidence names, always with --set."
+    },
+    {
+      "reason": "set-refused-contention",
+      "exitClass": "refused-contention",
+      "remedy": "Another actor holds a lock, lease or journal slot this set command needs. Wait for it to finish or expire, then run the same command again with --set; the evidence names the closed reason."
+    },
+    {
+      "reason": "set-refused-evidence",
+      "exitClass": "refused-evidence",
+      "remedy": "The cutover set command could not establish or confirm a fact it needs, or found evidence that contradicts the set: the evidence names the owning command and the closed reason. Run `lcm doctor` and `lcm migration report --set --generation <set-id>` and inspect it before retrying."
+    },
+    {
+      "reason": "set-incomplete",
+      "exitClass": "incomplete-recoverable",
+      "remedy": "The cutover set operation was durably begun and `lcm migration resume --set --generation <set-id> --confirm-generation <set-id>` can finish it. Use the original set id the plan printed; the evidence names the closed reason."
+    },
+    {
+      "reason": "set-operator-required",
+      "exitClass": "failed-operator-required",
+      "remedy": "No automatic command settles this cutover set. Run `lcm migration report --set --generation <set-id>` and inspect the evidence; `lcm migration abort --set` releases a held preparation and keeps its evidence."
+    },
+    {
+      "reason": "set-preview-not-predictive",
+      "exitClass": "refused-evidence",
+      "remedy": "The --set preview reads persisted state and names the route; it does not evaluate the checks that decide the command, so it cannot say the command would succeed. Verify only confirms persisted evidence. The evidence lists what was read and what was not."
+    },
+    {
+      "reason": "set-generation-required",
+      "exitClass": "refused-precondition",
+      "remedy": "Pass --generation with the original cutover set id that `lcm migration plan --set` printed. Nothing is inferred from the live hold, and nothing was read or changed."
+    },
+    {
+      "reason": "set-generation-invalid",
+      "exitClass": "usage",
+      "remedy": "The value passed to --generation is not a valid cutover set id. Nothing was read or changed."
+    },
+    {
+      "reason": "set-original-generation-required",
+      "exitClass": "refused-precondition",
+      "remedy": "The id names the rollback hold or publication, not the original activated set. Pass the original set id that plan --set or activate --set printed; nothing was changed."
+    },
+    {
+      "reason": "set-confirmation-missing",
+      "exitClass": "refused-confirmation",
+      "remedy": "Pass --confirm-generation with the aggregate set id this refusal reports (never a member generation id); nothing was changed."
+    },
+    {
+      "reason": "set-confirmation-moved",
+      "exitClass": "refused-confirmation",
+      "remedy": "--confirm-generation does not match the set. Pass the aggregate set id this refusal reports, or re-run plan --set if the candidate moved (never a member generation id); nothing was changed."
     }
   ]
 }
@@ -1460,6 +1646,8 @@ block marks implemented. `canEmit` is the closed set of exit classes the command
 - `docs/migration-cutover.md` -- the internal design of the checksum-sealed migration journal and
   capture protocol this command group drives. Read this document (the operator runbook) first;
   that one is for understanding the mechanism, not for running commands.
+- `docs/migration-cutover-set.md` -- the cutover-set contract behind the `--set` mode: membership,
+  the one hold, preparation, activation and rollback of every project together.
 - `docs/backend-publication.md` -- the backend publication and maintenance-journal protocol
   `apply`'s hold is built on, including why a live daemon's frozen startup backend is a separate
   gate from durable state correctness.

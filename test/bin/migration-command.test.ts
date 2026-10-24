@@ -13,6 +13,15 @@ const state = vi.hoisted(() => ({
   report: vi.fn(),
   activate: vi.fn(),
   rollback: vi.fn(),
+  setPlan: vi.fn(),
+  setDryRun: vi.fn(),
+  setApply: vi.fn(),
+  setResume: vi.fn(),
+  setVerify: vi.fn(),
+  setReport: vi.fn(),
+  setAbort: vi.fn(),
+  setActivate: vi.fn(),
+  setRollback: vi.fn(),
 }));
 
 vi.mock("node:process", async (importOriginal) => ({
@@ -61,6 +70,18 @@ vi.mock("../../src/migration/cli-activate.js", () => ({
 
 vi.mock("../../src/migration/cli-rollback.js", () => ({
   performMigrationRollbackCommand: state.rollback,
+}));
+
+vi.mock("../../src/migration/cli-cutover-set.js", () => ({
+  performSetPlan: state.setPlan,
+  performSetDryRun: state.setDryRun,
+  performSetApply: state.setApply,
+  performSetResume: state.setResume,
+  performSetVerify: state.setVerify,
+  performSetReport: state.setReport,
+  performSetAbort: state.setAbort,
+  performSetActivate: state.setActivate,
+  performSetRollback: state.setRollback,
 }));
 
 const { runCli } = await import("../../bin/lcm.js");
@@ -464,6 +485,60 @@ describe("lcm migration command group", () => {
     await invoke("migration", "rollback", "--confirm-generation", "gen-1", "--confirm-backend", "sqlite");
     expect(process.exitCode).toBe(2);
     expect(stdoutText(out)).toContain("rollback-refused-precondition");
+  });
+
+  describe("--set", () => {
+    const HOME = { homeDir: expect.any(String) };
+    const SET = ["--generation", "set-1", "--confirm-generation", "set-1"];
+    const cases: ReadonlyArray<readonly [string, readonly string[], () => ReturnType<typeof vi.fn>, object]> = [
+      ["plan", [], () => state.setPlan, HOME],
+      ["dry-run", [], () => state.setDryRun, HOME],
+      ["apply", ["--confirm-generation", "set-1", "--dry-run", "--max-records", "5", "--max-bytes", "6"], () => state.setApply, { ...HOME, confirmGenerationId: "set-1", dryRun: true, maxRecords: 5, maxBytes: 6 }],
+      ["resume", [...SET, "--dry-run", "--max-records", "7", "--max-bytes", "8"], () => state.setResume, { ...HOME, generation: "set-1", confirmGenerationId: "set-1", dryRun: true, maxRecords: 7, maxBytes: 8 }],
+      ["verify", [...SET, "--dry-run"], () => state.setVerify, { ...HOME, generation: "set-1", confirmGenerationId: "set-1", dryRun: true }],
+      ["report", ["--generation", "set-1"], () => state.setReport, { ...HOME, generation: "set-1" }],
+      ["abort", [...SET, "--dry-run"], () => state.setAbort, { ...HOME, generation: "set-1", confirmGenerationId: "set-1", dryRun: true }],
+      ["activate", [...SET, "--confirm-backend", "postgresql", "--dry-run"], () => state.setActivate, { ...HOME, generation: "set-1", confirmGenerationId: "set-1", confirmBackend: "postgresql", dryRun: true }],
+      ["rollback", [...SET, "--confirm-backend", "sqlite"], () => state.setRollback, { ...HOME, generation: "set-1", confirmGenerationId: "set-1", confirmBackend: "sqlite" }],
+    ];
+
+    it.each(cases)("%s --set calls only the set adapter and prints its envelope", async (command, args, adapter, expected) => {
+      adapter().mockResolvedValueOnce({
+        status: "ok", generationId: "set-1", manifestPhase: "verified", applied: false, next: command + " --set", evidence: { scope: "cutover-set" },
+      });
+      const out = vi.spyOn(process.stdout, "write").mockImplementation(() => true);
+      await invoke("migration", command, "--set", ...args, "--json");
+      expect(adapter()).toHaveBeenCalledTimes(1);
+      expect(adapter()).toHaveBeenCalledWith(expect.objectContaining(expected));
+      for (const single of [state.plan, state.dryRun, state.apply, state.resume, state.verify, state.report, state.abort, state.activate, state.rollback]) {
+        expect(single).not.toHaveBeenCalled();
+      }
+      expect(out).toHaveBeenCalledTimes(1);
+      expect(JSON.parse(stdoutText(out))).toMatchObject({ schemaVersion: 1, command, outcome: "ok", exitCode: 0, generation: "set-1", evidence: { scope: "cutover-set" } });
+      expect(process.exitCode).toBe(0);
+    });
+
+    it("a set refusal keeps its class and the human line names the bucket", async () => {
+      state.setActivate.mockResolvedValueOnce({ status: "refuse", reason: "set-refused-contention", generationId: "set-1", applied: true });
+      const out = vi.spyOn(process.stdout, "write").mockImplementation(() => true);
+      await invoke("migration", "activate", "--set", ...SET, "--confirm-backend", "postgresql");
+      expect(process.exitCode).toBe(4);
+      expect(stdoutText(out)).toContain("Refused (refused-contention, exit 4): set-refused-contention [generation=set-1]");
+    });
+
+    it("without --set the single-generation adapters still run", async () => {
+      state.report.mockResolvedValueOnce({ generationId: "gen-1", manifestPhase: "verified", next: null, evidence: {}, restart: null });
+      vi.spyOn(process.stdout, "write").mockImplementation(() => true);
+      await invoke("migration", "report", "--generation", "gen-1");
+      expect(state.report).toHaveBeenCalledTimes(1);
+      expect(state.setReport).not.toHaveBeenCalled();
+    });
+
+    it("rejects a verification lease option that set verification would ignore", async () => {
+      vi.spyOn(console, "error").mockImplementation(() => undefined);
+      await expect(invoke("migration", "verify", "--set", ...SET, "--lease-ttl-ms", "100")).rejects.toThrow("exit:1");
+      expect(state.setVerify).not.toHaveBeenCalled();
+    });
   });
 
   it("lcm migration --help routes to the custom help page rather than any subcommand action", async () => {

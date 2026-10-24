@@ -76,9 +76,27 @@ the project map, it would be silently stranded on a backend it no longer
 routes to. Rollback therefore refuses (`multiple-remote-projects`) unless the covered project is the only one bound to
 PostgreSQL. A local-only entry never blocks. The check runs before maintenance
 is entered and again right before the selection is prepared. Unbind or migrate
-the other projects first. Installation-wide (multi-project) rollback is tracked
-by [#1544](https://github.com/donadiosolutions/lcm/issues/1544); until then the
-refusal stands.
+the other projects first. This is the single-generation rollback's rule.
+A home whose projects moved together as a cutover set is rolled back with the
+set form, which returns every member to SQLite through one publication, so
+the global selection is never split:
+
+```bash
+lcm migration rollback --set --generation <original-set-id> \
+  --confirm-generation <original-set-id> --confirm-backend sqlite
+```
+
+Always pass the **original** activated set id, also to resume an interrupted
+set rollback; the rollback hold has its own derived id, which the report
+prints as `rollbackSetId` and no command accepts. Every member gets a new SQLite
+generation and the original member generations are kept as history. The set
+rollback uses the runtime-role `LCM_POSTGRES_URL` as above, needs PostgreSQL
+reachable (there is no offline restoration), and has no abort once its
+checkpoint is written. Do not unbind projects by hand to get past the
+single-generation refusal: it protects the members of a set from a split
+selection. See
+[Cutover sets: rolling a set back](migration-cutover-set.md#rolling-a-set-back)
+and [the operator runbook](migration-cutover-set.md#running-a-set-with-lcm-migration---set).
 
 ## What activation evidence rollback relies on
 
