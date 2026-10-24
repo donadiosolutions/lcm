@@ -237,6 +237,13 @@ class FakeLeaseGuard implements ActivationLeasePublicationGuard {
     return released;
   }
 
+  /** The release-reconciliation read (Bug #1651): the row whichever generation it names, like the real guard's. */
+  async readForReleaseReconciliation(input: Pick<PostgreSqlBackendPublicationMutationInput, "projectId" | "signal">): Promise<PostgreSqlBackendPublicationFence | null> {
+    this.calls.push("read");
+    this.admit("read", input.signal);
+    return this.rows.get(input.projectId) ?? null;
+  }
+
   async read(input: Pick<PostgreSqlBackendPublicationMutationInput, "projectId" | "targetBackend" | "evidenceSha256" | "signal">): Promise<PostgreSqlBackendPublicationFence | null> {
     this.calls.push("read");
     this.admit("read", input.signal);
@@ -2526,23 +2533,93 @@ describe("runMigrationActivation: the release tail and the abort family are driv
     expect(row(f)).toEqual(successor);
   });
 
-  it("a fence of another publication or evidence digest stays lease-lost at releasing; an unattributable read is lease-unresolvable", async () => {
+  /** The fence the journal recorded before the crash, then the remote release and a successor's acquisition of the released row. */
+  const releasedThenSuccessor = async (f: Fixture, phase: string, overrides: Partial<PostgreSqlBackendPublicationFence> = {}) => {
+    await crashCoordinatorAt(f, phase);
+    const persisted = readBackendPublicationJournal(f.homeDir)!.projects[0]!.fence!;
+    foreignRow(f, overrides);
+    return { persisted, successor: { ...row(f)! }, mutations: f.guard.calls.filter((c) => c !== "read").length };
+  };
+
+  it("crash at releasing with a successor publication's row present (Bug #1651): the coordinator proves the release and finishes without touching that row", async () => {
     const f = await fixture();
-    await crashCoordinatorAt(f, "releasing");
-    foreignRow(f);
-    expect(await f.run()).toMatchObject({ status: "interrupted", step: "S13b", cause: "lease-lost", effectBegun: true, detail: "the fenced lease row names another publication" });
-    foreignRow(f, { publicationId: f.publicationId, evidenceSha256: "d".repeat(64) });
-    expect(await f.run()).toMatchObject({ status: "interrupted", step: "S13b", cause: "lease-lost", detail: expect.stringContaining("does not match the expected") });
-    f.guard.read = async (input) => { throw new PostgreSqlStorageOperationError("STORAGE_OPERATION_FAILED", { domain: "factory", operation: "read" }, "08006", true); };
+    const { persisted, successor, mutations } = await releasedThenSuccessor(f, "releasing");
+    expect(successor.fencingToken > BigInt(persisted.fencingToken)).toBe(true);
+    const outcome = await f.run();
+    expectActivated(f, outcome, "publication-journal");
+    expect(f.guard.calls.filter((c) => c !== "read")).toHaveLength(mutations);
+    expect(row(f)).toEqual(successor);
+    const journal = readBackendPublicationJournal(f.homeDir)!;
+    expect(journal.phase).toBe("completed");
+    // The successor's fence is never journalled; the persisted one is marked released.
+    expect(journal.projects[0]!.fence).toEqual({ ...persisted, releasedAt: successor.acquiredAt });
+  });
+
+  it("crash at releasing with a successor of another evidence digest or machine present (Bug #1651): the same proof applies", async () => {
+    for (const overrides of [{ publicationId: "x", evidenceSha256: "d".repeat(64) }, { machineId: "018f0b5d-ffff-7abc-8def-1234567890ab", publicationId: "x" }] as const) {
+      const f = await fixture();
+      const { successor, mutations } = await releasedThenSuccessor(f, "releasing", overrides);
+      expectActivated(f, await f.run(), "publication-journal");
+      expect(f.guard.calls.filter((c) => c !== "read")).toHaveLength(mutations);
+      expect(row(f)).toEqual(successor);
+    }
+  });
+
+  it("at releasing a successor that is not provably later, an unproven guard, a corrupt row and an unattributable read all fail closed", async () => {
+    // A foreign row whose token does not exceed the journalled fence proves nothing: the coordinator refuses.
+    const lower = await fixture();
+    const first = await releasedThenSuccessor(lower, "releasing", { fencingToken: 1n });
+    expect(BigInt(first.persisted.fencingToken) >= 1n).toBe(true);
+    await expect(lower.run()).rejects.toThrow(/remote fence identity does not match/);
+    expect(readBackendPublicationJournal(lower.homeDir)?.phase).toBe("releasing");
+    expect(row(lower)).toEqual(first.successor);
+
+    // A guard that does not declare the reconciliation read keeps today's failure.
+    const unproven = await fixture();
+    const second = await releasedThenSuccessor(unproven, "releasing");
+    (unproven.guard as { readForReleaseReconciliation?: unknown }).readForReleaseReconciliation = undefined;
+    await expect(unproven.run()).rejects.toThrow();
+    expect(readBackendPublicationJournal(unproven.homeDir)?.phase).toBe("releasing");
+    expect(row(unproven)).toEqual(second.successor);
+
+    // A corrupt or ambiguous row is not admitted and never reaches the drive.
+    const f = await fixture();
+    await releasedThenSuccessor(f, "releasing");
+    const read = f.guard.read.bind(f.guard);
+    f.guard.read = async () => { throw new PostgreSqlBackendPublicationGuardError(REMOTE, "read", "invalid-row"); };
+    expect(await f.run()).toMatchObject({ status: "interrupted", step: "S13b", cause: "lease-lost", effectBegun: true, detail: expect.stringContaining("corrupt or ambiguous") });
+    // An unattributable read is lease-unresolvable.
+    f.guard.read = async () => { throw new PostgreSqlStorageOperationError("STORAGE_OPERATION_FAILED", { domain: "factory", operation: "read" }, "08006", true); };
     expect(await f.run()).toMatchObject({ status: "interrupted", step: "S13b", cause: "lease-unresolvable" });
+    f.guard.read = read;
     expect(readBackendPublicationJournal(f.homeDir)?.phase).toBe("releasing");
   });
+
+  it("crash at abort-releasing with a successor publication's row present (Bug #1651): the retry finishes the abort without touching that row", async () => {
+    const f = await fixture();
+    await crashCoordinatorAt(f, "prepared");
+    let crashed = false;
+    const crashing = f.coordinator((event) => {
+      if (crashed || event !== "after-journal-write") return;
+      if (readBackendPublicationJournal(f.homeDir)?.phase === "abort-releasing") { crashed = true; throw new Error("injected coordinator crash at abort-releasing"); }
+    });
+    await expect(crashing.abort()).rejects.toThrow("injected coordinator crash at abort-releasing");
+    foreignRow(f);
+    const successor = { ...row(f)! };
+    const mutations = f.guard.calls.filter((c) => c !== "read").length;
+    expect(await f.run()).toMatchObject({ status: "publication-failed", publication: { status: "aborted", dispatch: "abort-completion" } });
+    expect(readBackendPublicationJournal(f.homeDir)?.phase).toBe("aborted");
+    expect(f.guard.calls.filter((c) => c !== "read")).toHaveLength(mutations);
+    expect(row(f)).toEqual(successor);
+  });
+
   it("the abort family is handled like the release tail: an absent own fence at abort-releasing reaches the drive without a lease continuation", async () => {
     const f = await fixture();
     await crashCoordinatorAt(f, "prepared");
     f.guard.rows.delete(REMOTE);
     const read = f.deps.readPublicationJournal;
-    const unwinding = (h: string) => { const j = read(h); return j === null ? null : { ...j, phase: "abort-releasing" as const }; };
+    const unwindingAt = (phase: "abort-releasing" | "aborting") => (h: string) => { const j = read(h); return j === null ? null : { ...j, phase }; };
+    const unwinding = unwindingAt("abort-releasing");
     const renews = f.guard.calls.filter((c) => c === "renew").length;
     const outcome = await f.run({
       readPublicationJournal: unwinding,
@@ -2550,9 +2627,9 @@ describe("runMigrationActivation: the release tail and the abort family are driv
     });
     expect(outcome).toMatchObject({ status: "publication-failed", publication: { status: "aborted", dispatch: "abort-completion" } });
     expect(f.guard.calls.filter((c) => c === "renew")).toHaveLength(renews);
-    // A foreign row in the same phase is still a lost lease.
+    // A foreign row before the release window (aborting) is still a lost lease.
     foreignRow(f);
-    expect(await f.run({ readPublicationJournal: unwinding })).toMatchObject({ status: "interrupted", step: "S13b", cause: "lease-lost" });
+    expect(await f.run({ readPublicationJournal: unwindingAt("aborting") })).toMatchObject({ status: "interrupted", step: "S13b", cause: "lease-lost" });
     // Outside those phases (prepared), an absent row is still a lost lease.
     f.guard.rows.delete(REMOTE);
     expect(await f.run()).toMatchObject({ status: "interrupted", step: "S13b", cause: "lease-lost", detail: "no fenced lease row exists for this generation" });
