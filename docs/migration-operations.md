@@ -335,7 +335,13 @@ The refusal classes by reason (each reason has exactly one): **exit 2** `manifes
 `coverage-unresolvable`, `verification-unresolvable`, `target-unresolvable`, `evidence-unresolvable`,
 `state-unresolvable`; **exit 6** `pending-effect-foreign` when `resume` owns that pending effect, exit 2
 otherwise. A failed best-effort release of the lease is shown as `leaseReleaseFailed` in the
-evidence and nothing more.
+evidence and nothing more. A fenced-lease row that cannot be decoded (it names no publication
+generation) is `lease-unresolvable`, exit 5 `activation-refused-evidence`, with nothing changed and
+no `applied` claim; `lease-conflict` (exit 4) is a decodable lease held by another publication. A
+running daemon that holds the previous backend is now seen as present, so `activate`, `rollback` and
+`report` give exit 8; a daemon binary from before this behavior still gives exit 5
+`cutover-restart-contradiction`, and the remedy is unchanged: run `lcm daemon status`, resolve it, run
+`report`.
 
 **`--dry-run`** reads the persisted state (the manifest, the verification report, the journals, the
 link, the artifact and the restart check) and lists `notEvaluated`: quiescence, coverage, the
