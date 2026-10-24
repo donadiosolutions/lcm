@@ -5,15 +5,19 @@
  * project must still represent those rows, so the rows below come from a real
  * replication pass, not from hand-written payloads.
  */
-import { mkdtempSync, rmSync } from "node:fs";
+import { createHash } from "node:crypto";
+import { chmodSync, copyFileSync, mkdtempSync, readFileSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, beforeAll, describe, expect, it } from "vitest";
+import { DatabaseSync } from "node:sqlite";
 import { createPortableRecordStream } from "../../src/storage/portable-record-stream.js";
 import { createPostgreSqlPortableSource } from "../../src/storage/postgresql/portable-source.js";
 import { assertHarnessReady, settings, type PostgreSqlTestDatabase, withPostgreSqlTestDatabase } from "./harness.js";
 import { grantPortablePostgreSql, PORTABLE_POSTGRESQL_FIXTURE, seedPortablePostgreSql } from "./portable-fixture.js";
+import { sqliteSource } from "./portable-corpus.js";
 import { replicateIntoInbox } from "./replicated-inbox-fixture.js";
+import { seedPortableSqlite } from "../storage/sqlite-portable-fixture.js";
 
 beforeAll(assertHarnessReady);
 
@@ -50,6 +54,50 @@ async function exportPassiveEvents(database: PostgreSqlTestDatabase) {
 
 async function exportError(database: PostgreSqlTestDatabase): Promise<unknown> {
   return openSource(database).then(async (source) => { await source.close(); return undefined; }, (error: unknown) => error);
+}
+
+/**
+ * The canonical passive-events records the SQLite portable source emits for the same local outbox, captured as its
+ * events sidecar for the machine that replicated them.
+ */
+async function sqliteExportOfOutbox(outboxPath: string): Promise<Array<Record<string, unknown>>> {
+  const directory = tempDirectory();
+  const captured = join(directory, "events.sqlite");
+  copyFileSync(outboxPath, captured);
+  chmodSync(captured, 0o600);
+  const connection = new DatabaseSync(captured);
+  try { connection.exec("PRAGMA wal_checkpoint(TRUNCATE); PRAGMA journal_mode=DELETE"); } finally { connection.close(); }
+  const native = seedPortableSqlite(join(directory, "native.sqlite"), {
+    projectIdentity: { scope: "shared", projectId: fixture.projectId },
+    identityFacts: {
+      machines: [
+        { identityKey: fixture.machineIdentityKey, machineId: fixture.machineId },
+        { identityKey: fixture.secondaryMachineIdentityKey, machineId: fixture.secondaryMachineId },
+      ],
+      aliases: [],
+    },
+  });
+  const stream = await sqliteSource(join(directory, "native.sqlite"), fixture.expectedIdentity, directory, {
+    ...native,
+    capturedSidecars: {
+      ...native.capturedSidecars,
+      events: {
+        databasePath: captured,
+        machineIdentityKey: fixture.secondaryMachineIdentityKey,
+        expectedFileSha256: createHash("sha256").update(readFileSync(captured)).digest("hex"),
+      },
+    },
+  });
+  try {
+    const batch = await stream.readBatch({ domain: "passive-events", maxRecords: 500, maxBytes: 150994944 });
+    return batch.records.map((record) => record.value as Record<string, unknown>);
+  } finally {
+    await stream.close();
+  }
+}
+
+function byEventId(values: Array<Record<string, unknown>>): Array<Record<string, unknown>> {
+  return [...values].sort((left, right) => String(left.eventId).localeCompare(String(right.eventId)));
 }
 
 /** The seeded project plus a real replication pass by its secondary machine. */
@@ -102,6 +150,14 @@ describe("PostgreSQL 18 portable export of replicated inbox rows (#1694)", { tim
         }
         // The seeded fixture rows ride along in the same export.
         expect(exported).toHaveLength(6);
+
+        // The SQLite source emits the complete canonical record for the same local events: identity, machine,
+        // version, sequence, envelope fields and disposition all match. Nothing is excluded, because both
+        // backends build the value from the same canonical fields and the pointer is omitted by both.
+        await replicated.close();
+        const sqliteRecords = byEventId(await sqliteExportOfOutbox(replicated.outboxPath));
+        expect(sqliteRecords).toHaveLength(3);
+        expect(byEventId(uploaded)).toEqual(sqliteRecords);
       } finally {
         await replicated.close();
       }
@@ -142,7 +198,7 @@ describe("PostgreSQL 18 portable export of replicated inbox rows (#1694)", { tim
 
         await mutate("$1::jsonb || '{\"extraEnvelope\":1}'::jsonb", null);
         await refused();
-        for (const invalid of ['"1"', "true", "0", "-1", "1.5", "1.0", "{}", "[]"]) {
+        for (const invalid of ['"1"', "true", "0", "-1", "1.5", "1.0", "1e-2", "{}", "[]"]) {
           await mutate("jsonb_set($1::jsonb, '{previousEventId}', $2::jsonb)", invalid);
           await refused();
         }
@@ -155,6 +211,9 @@ describe("PostgreSQL 18 portable export of replicated inbox rows (#1694)", { tim
         await mutate("jsonb_set($1::jsonb, '{previousEventId}', $2::jsonb)", "null");
         expect(await exportError(database)).toBeUndefined();
         await mutate("jsonb_set($1::jsonb, '{previousEventId}', $2::jsonb)", "9007199254");
+        expect(await exportError(database)).toBeUndefined();
+        // The boundary is the stored jsonb value: 1e2 is stored as 100, so it is a positive integer.
+        await mutate("jsonb_set($1::jsonb, '{previousEventId}', $2::jsonb)", "1e2");
         expect(await exportError(database)).toBeUndefined();
 
         // Restoring the uploaded envelope makes the project exportable again.
