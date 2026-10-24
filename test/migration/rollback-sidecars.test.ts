@@ -19,7 +19,7 @@
  * directly -- never a mock standing in for corruption.
  */
 
-import { mkdtempSync, mkdirSync, writeFileSync, rmSync, chmodSync } from "node:fs";
+import { existsSync, mkdtempSync, mkdirSync, writeFileSync, rmSync, chmodSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { DatabaseSync } from "node:sqlite";
@@ -54,6 +54,7 @@ import { promoteEventsForCwd } from "../../src/daemon/routes/promote-events.js";
 import { SqliteStorageBackendFactory } from "../../src/storage/sqlite/factory.js";
 import { LocalHookEventSequenceAllocator, formatLocalHookMachineSequence, parseLocalHookMachineSequence } from "../../src/storage/local-hook-event-sequence.js";
 import {
+  assertRollbackSidecarsCompatible,
   materializeRollbackSidecars,
   RollbackSidecarError,
   requireInteger,
@@ -841,7 +842,6 @@ describe("verifyPassiveEventsAgainstArchive", () => {
   it("F12: an existing row whose disposition contradicts the archive refuses, in either direction", () => {
     const contradictions: ReadonlyArray<readonly [string, string]> = [
       ["applied", "processed_at = NULL, delivery_state = 'pending'"],
-      ["pending", "delivery_state = 'replicated', remote_inbox_id = 'inbox-1', processed_at = '2026-01-01T00:00:00.000000Z'"],
       // Acknowledged locally (applied remotely) with no processed_at, while the archive still holds it as pending.
       ["pending", "delivery_state = 'acknowledged', remote_inbox_id = '1', acknowledged_at = '2026-01-03T00:00:00.000000Z', processed_at = NULL"],
       ["quarantined", "delivery_state = 'pending', quarantine_reason = NULL"],
@@ -860,6 +860,32 @@ describe("verifyPassiveEventsAgainstArchive", () => {
       }
       expect(() => materializeRollbackSidecars({ homeDir, databasePath: path, localProjectId: LOCAL_PROJECT_ID, machineId: MACHINE_A_UUID }))
         .toThrow(expect.objectContaining({ reason: "verification-failed", message: expect.stringContaining(target.value.eventId) }));
+    }
+  });
+
+  it("#1681: a row the daemon drained (processed_at set) while the archive still lists it as pending is accepted untouched", () => {
+    const homeDir = tempHome();
+    const { path, passiveEventRecords } = seedGeneration();
+    const first = materializeRollbackSidecars({ homeDir, databasePath: path, localProjectId: LOCAL_PROJECT_ID, machineId: MACHINE_A_UUID });
+    const target = passiveEventRecords.find((record) => record.value.disposition === "pending")!;
+    const drained = "delivery_state = 'replicated', remote_inbox_id = 'inbox-1', processed_at = '2026-01-01T00:00:00.000000Z'";
+    const local = new DatabaseSync(first.eventsDbPath);
+    try {
+      local.exec("UPDATE events SET " + drained + " WHERE event_uuid = '" + target.value.eventId + "'");
+    } finally {
+      local.close();
+    }
+    const before = readEventRow(first.eventsDbPath, target.value.eventId);
+    const outcome = materializeRollbackSidecars({ homeDir, databasePath: path, localProjectId: LOCAL_PROJECT_ID, machineId: MACHINE_A_UUID });
+    expect(outcome.passiveEventsMaterialized).toBe(0);
+    const after = readEventRow(outcome.eventsDbPath, target.value.eventId);
+    expect(after).toEqual(before);
+    expect(after).toMatchObject({ processed_at: "2026-01-01T00:00:00.000000Z", remote_inbox_id: "inbox-1" });
+    const consumer = new EventsDb(outcome.eventsDbPath);
+    try {
+      expect(consumer.getUnprocessed().map((event) => event.event_uuid)).not.toContain(target.value.eventId);
+    } finally {
+      consumer.close();
     }
   });
 
@@ -1143,3 +1169,150 @@ describe("#1663: a live outbox row's SQLite timestamp text verifies against the 
   });
 });
 
+
+describe("assertRollbackSidecarsCompatible (#1681)", () => {
+  const preflight = (homeDir: string, databasePath: string): void =>
+    assertRollbackSidecarsCompatible({ homeDir, databasePath, localProjectId: LOCAL_PROJECT_ID, machineId: MACHINE_A_UUID });
+
+  /** A home whose live events database was materialized from the generation, then edited with real SQL. */
+  function liveHome(edit?: (live: DatabaseSync, passiveEventRecords: readonly PortableRecord<"passive-events">[]) => void) {
+    const homeDir = tempHome();
+    const { path, passiveEventRecords } = seedGeneration();
+    const first = materializeRollbackSidecars({ homeDir, databasePath: path, localProjectId: LOCAL_PROJECT_ID, machineId: MACHINE_A_UUID });
+    const live = new DatabaseSync(first.eventsDbPath);
+    try {
+      edit?.(live, passiveEventRecords);
+    } finally {
+      live.close();
+    }
+    return { homeDir, path, eventsDbPath: first.eventsDbPath, passiveEventRecords };
+  }
+  const idOf = (records: readonly PortableRecord<"passive-events">[], disposition: string): string =>
+    records.find((record) => record.value.disposition === disposition)!.value.eventId;
+
+  it("tolerates a missing live events database without creating it", () => {
+    const homeDir = tempHome();
+    const { path } = seedGeneration();
+    expect(() => preflight(homeDir, path)).not.toThrow();
+    expect(existsSync(eventsDir(homeDir))).toBe(false);
+  });
+
+  it("accepts a live database that matches the archive and does not write to it", () => {
+    const { homeDir, path, eventsDbPath, passiveEventRecords } = liveHome();
+    const before = readEventRow(eventsDbPath, idOf(passiveEventRecords, "pending"));
+    expect(() => preflight(homeDir, path)).not.toThrow();
+    expect(readEventRow(eventsDbPath, idOf(passiveEventRecords, "pending"))).toEqual(before);
+  });
+
+  it("accepts a row the daemon drained while the archive still lists it as pending, untouched", () => {
+    const { homeDir, path, eventsDbPath, passiveEventRecords } = liveHome((live, records) => {
+      live.exec(
+        "UPDATE events SET delivery_state = 'replicated', remote_inbox_id = 'inbox-1', processed_at = '2026-01-01T00:00:00.000000Z' WHERE event_uuid = '"
+        + idOf(records, "pending") + "'",
+      );
+    });
+    const before = readEventRow(eventsDbPath, idOf(passiveEventRecords, "pending"));
+    expect(() => preflight(homeDir, path)).not.toThrow();
+    expect(readEventRow(eventsDbPath, idOf(passiveEventRecords, "pending"))).toEqual(before);
+  });
+
+  it("tolerates an archived event the live database does not hold yet, and does not insert it", () => {
+    const { homeDir, path, eventsDbPath, passiveEventRecords } = liveHome((live, records) => {
+      live.exec("DELETE FROM events WHERE event_uuid = '" + idOf(records, "pending") + "'");
+    });
+    expect(() => preflight(homeDir, path)).not.toThrow();
+    const live = new DatabaseSync(eventsDbPath, { readOnly: true });
+    try {
+      expect(live.prepare("SELECT count(*) AS n FROM events WHERE event_uuid = ?").get(idOf(passiveEventRecords, "pending"))).toEqual({ n: 0 });
+    } finally {
+      live.close();
+    }
+  });
+
+  it("refuses a divergent live row with verification-failed", () => {
+    const { homeDir, path } = liveHome((live) => { live.exec("UPDATE events SET data = '{\"other\":true}'"); });
+    expect(() => preflight(homeDir, path)).toThrow(expect.objectContaining({ reason: "verification-failed" }));
+  });
+
+  it("still refuses a pending archive row whose live row is acknowledged but not processed", () => {
+    const { homeDir, path } = liveHome((live, records) => {
+      live.exec(
+        "UPDATE events SET delivery_state = 'acknowledged', remote_inbox_id = '1', acknowledged_at = '2026-01-03T00:00:00.000000Z', processed_at = NULL WHERE event_uuid = '"
+        + idOf(records, "pending") + "'",
+      );
+    });
+    expect(() => preflight(homeDir, path)).toThrow(expect.objectContaining({ reason: "verification-failed" }));
+  });
+
+  it("still refuses an applied archive row whose live row is replicated and unprocessed", () => {
+    const { homeDir, path } = liveHome((live, records) => {
+      live.exec(
+        "UPDATE events SET delivery_state = 'replicated', remote_inbox_id = 'inbox-1', processed_at = NULL WHERE event_uuid = '"
+        + idOf(records, "applied") + "'",
+      );
+    });
+    expect(() => preflight(homeDir, path)).toThrow(expect.objectContaining({ reason: "verification-failed" }));
+  });
+
+  it("refuses a delivered live row the archive does not hold", () => {
+    const { homeDir, path } = liveHome((live) => {
+      live.exec(
+        "INSERT INTO events (event_uuid, event_version, machine_sequence, session_id, type, category, data, source_hook, delivery_state, remote_inbox_id) "
+        + "VALUES ('018f7769-4c00-7f77-9b32-4a2f8f5cbeef', 1, '" + formatLocalHookMachineSequence(999n) + "', 'orphan', 'orphan.event', 'intent', '{}', 'Test', 'replicated', 'inbox-9')",
+      );
+    });
+    expect(() => preflight(homeDir, path)).toThrow(expect.objectContaining({ reason: "verification-failed", message: expect.stringContaining("delivered event") }));
+  });
+
+  it("refuses an archived event of an unknown machine identity key", () => {
+    const { homeDir } = liveHome();
+    const { path } = tempGenerationPath();
+    const db = new DatabaseSync(path);
+    try {
+      runLcmMigrations(db, { fts5Available: false });
+      initializePortableArchive(db);
+      writePortableArchiveRecord(db, createPortableRecord({
+        domain: "passive-events",
+        ordinal: 0,
+        value: {
+          machineIdentityKey: "ghost-machine", eventId: "018f7769-4c00-7f77-9b32-4a2f8f5cffff", eventVersion: 1, machineSequence: 0,
+          eventType: "session.compacted", sessionId: "session-x", sessionSequence: 0, category: "intent", data: "{}", priority: 5,
+          sourceHook: "PreCompact", createdAt: "2026-01-01T00:00:00.000000Z", disposition: "pending",
+        },
+        context: { projectIdentity: { scope: "local", projectId: "a".repeat(64) } },
+      }));
+    } finally {
+      db.close();
+    }
+    expect(() => preflight(homeDir, path)).toThrow(expect.objectContaining({ reason: "invalid-input", message: expect.stringContaining("ghost-machine") }));
+  });
+
+  it("compares a version-4 live database, which has the current events columns, and refuses its divergent row", () => {
+    const { homeDir, path } = liveHome((live) => {
+      live.exec("UPDATE events SET data = '{\"other\":true}'");
+      live.exec("UPDATE schema_version SET version = 4");
+    });
+    expect(() => preflight(homeDir, path)).toThrow(expect.objectContaining({ reason: "verification-failed", message: expect.stringContaining("diverges from its archive row") }));
+  });
+
+  it("accepts a matching version-4 live database", () => {
+    const { homeDir, path } = liveHome((live) => { live.exec("UPDATE schema_version SET version = 4"); });
+    expect(() => preflight(homeDir, path)).not.toThrow();
+  });
+
+  it("refuses a live database whose schema is newer than this build supports", () => {
+    const { homeDir, path } = liveHome((live) => { live.exec("UPDATE schema_version SET version = 6"); });
+    expect(() => preflight(homeDir, path)).toThrow(expect.objectContaining({ reason: "verification-failed", message: expect.stringContaining("newer than this build") }));
+  });
+
+  it("leaves a live database without a schema_version row, or older than version 4, to materialization and the post-install verification", () => {
+    for (const edit of [
+      "DROP TABLE schema_version",
+      "DELETE FROM schema_version",
+      "UPDATE schema_version SET version = 3",
+    ]) {
+      const { homeDir, path } = liveHome((live) => { live.exec("UPDATE events SET data = '{\"other\":true}'"); live.exec(edit); });
+      expect(() => preflight(homeDir, path)).not.toThrow();
+    }
+  });
+});
