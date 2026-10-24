@@ -1140,6 +1140,16 @@ publication, the outcome is `post-publication-unhealthy` with the restart
 verdict; the selection stands, and the next run completes once the target is
 healthy again. Reversal is a separate, explicit rollback.
 
+Three conditions are classified rather than thrown. On an LCM home that was
+never initialized, activation refuses at `S0` with `manifest-absent` and
+creates nothing on disk. A machine identity that cannot be read or is not
+registered refuses at `S0` with `state-unresolvable` (an interruption of the
+step in flight when it happens on re-entry after an effect began); run
+`lcm machine register` (see [Project identity](project-identity.md)) and run
+activation again. A failure to allocate the census scratch directory refuses at
+`S7` with `state-unresolvable`; check the free space and permissions of the
+LCM home, then run activation again.
+
 ### The lease and the unavailable window
 
 Activation holds the project's fenced publication lease from the first check
