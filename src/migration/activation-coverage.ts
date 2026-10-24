@@ -294,7 +294,10 @@ export function checkActivationProjectCoverage(
  * only (G8 is a pre-selection refusal).
  */
 export function enumerateStoredDataProjectHashes(
-  input: ActivationCoverageInput = {},
+  input: ActivationCoverageInput & Readonly<{
+    /** Enumerate without publishing a project-map metadata backfill (a preview must write nothing). */
+    suppressMetadataBackfill?: boolean;
+  }> = {},
   dependencies: ActivationCoverageDependencies = {},
 ): StoredDataProjectEnumeration {
   const readProjectDirectoryEntries = dependencies.readProjectDirectoryEntries
@@ -306,7 +309,7 @@ export function enumerateStoredDataProjectHashes(
     join(lcmHomeDir(input.homeDir), "events"),
     readProjectDirectoryEntries,
     readEventsDirectoryEntries,
-  ), input.homeDir, input.publicationLockToken);
+  ), input.homeDir, input.publicationLockToken, { suppressMetadataBackfill: input.suppressMetadataBackfill });
 }
 
 export type ActivationSingleProjectReason =

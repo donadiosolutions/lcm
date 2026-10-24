@@ -528,6 +528,7 @@ describe("resolveMigrationExpectedIdentity (the minting step, taken only after a
       readLocalIdentity: vi.fn(() => ({ id: "c".repeat(64), canonical: "/projects/persisted" }) as { id: string; canonical: string } | null),
       resolveTargetIdentity: vi.fn(async () => ({ status: "resolved" as const, projectId: "minted-project", effect: "created" as const })),
       lookupTargetProject: vi.fn(async () => "existing-project" as string | null),
+      readAuthorizedAliases: vi.fn(() => [] as string[]),
       ...extra,
     };
   }
@@ -549,6 +550,26 @@ describe("resolveMigrationExpectedIdentity (the minting step, taken only after a
     expect(ops.readLocalIdentity).toHaveBeenCalledWith({ homeDir: "/h", cwd: "/c" });
     expect(ops.lookupTargetProject).not.toHaveBeenCalled();
     expect(effects).toEqual([{ stage: "local", outcome: "persisted" }, { stage: "destination", outcome: "created" }]);
+  });
+
+  it("fresh: mints the destination with the map entry's authorized aliases, read for the resolved local project under the caller's admission (#1678)", async () => {
+    const token = {} as never;
+    const readAuthorizedAliases = vi.fn(() => ["/projects/moved"]);
+    const ops = mintOps({ readAuthorizedAliases });
+    await resolveMigrationExpectedIdentity({ preflight: readyPreview("fresh"), cwd: "/c", homeDir: "/h", publicationLockToken: token, _operationsForTesting: ops });
+    expect(readAuthorizedAliases).toHaveBeenCalledWith({
+      homeDir: "/h", localProjectId: "b".repeat(64), canonicalPath: "/projects/minted", publicationLockToken: token,
+    });
+    expect(ops.resolveTargetIdentity).toHaveBeenCalledWith(expect.objectContaining({ authorityCanonicalPath: "/projects/minted", aliases: ["/projects/moved"] }));
+  });
+
+  it("fresh: without a caller admission the alias read takes its own, and a held step never reads aliases", async () => {
+    const ops = mintOps();
+    await resolveMigrationExpectedIdentity({ preflight: readyPreview("fresh"), cwd: "/c", homeDir: "/h", _operationsForTesting: ops });
+    expect(ops.readAuthorizedAliases).toHaveBeenCalledWith({ homeDir: "/h", localProjectId: "b".repeat(64), canonicalPath: "/projects/minted" });
+    const held = mintOps();
+    await resolveMigrationExpectedIdentity({ preflight: readyPreview("continue-held"), cwd: "/c", homeDir: "/h", _operationsForTesting: held });
+    expect(held.readAuthorizedAliases).not.toHaveBeenCalled();
   });
 
   it("fresh: an entry and a destination a concurrent actor already wrote are reported reused, never as this step's mint (round-3 synthesis P2)", async () => {

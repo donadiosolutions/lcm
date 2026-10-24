@@ -562,6 +562,54 @@ export const MIGRATION_REFUSAL_REASONS: readonly MigrationRefusalMapping[] = Obj
     reason: "rollback-dry-run-not-predictive", exitClass: "refused-evidence",
     remedy: "The rollback preview reads only the route and the manifest. It does not evaluate eligibility, mode, quiescence, the lease, drift, remote bindings or the restart check, so it cannot say rollback would succeed.",
   }),
+  // --- The cutover-set commands (`--set`, #1551): one shared bucket per
+  // exit class. The closed service reason, step and cause, and the owning
+  // command, travel in the evidence; the remedy names only `--set` and the
+  // aggregate confirmation. ---
+  Object.freeze({
+    reason: "set-refused-precondition", exitClass: "refused-precondition",
+    remedy: "The cutover set's state, scope or capacity does not admit this command, and nothing it owns was changed: the evidence names the owning command and the closed reason. Fix that condition, or run the command the evidence names, always with --set.",
+  }),
+  Object.freeze({
+    reason: "set-refused-contention", exitClass: "refused-contention",
+    remedy: "Another actor holds a lock, lease or journal slot this set command needs. Wait for it to finish or expire, then run the same command again with --set; the evidence names the closed reason.",
+  }),
+  Object.freeze({
+    reason: "set-refused-evidence", exitClass: "refused-evidence",
+    remedy: "The cutover set command could not establish or confirm a fact it needs, or found evidence that contradicts the set: the evidence names the owning command and the closed reason. Run `lcm doctor` and `lcm migration report --set --generation <set-id>` and inspect it before retrying.",
+  }),
+  Object.freeze({
+    reason: "set-incomplete", exitClass: "incomplete-recoverable",
+    remedy: "The cutover set operation was durably begun and `lcm migration resume --set --generation <set-id> --confirm-generation <set-id>` can finish it. Use the original set id the plan printed; the evidence names the closed reason.",
+  }),
+  Object.freeze({
+    reason: "set-operator-required", exitClass: "failed-operator-required",
+    remedy: "No automatic command settles this cutover set. Run `lcm migration report --set --generation <set-id>` and inspect the evidence; `lcm migration abort --set` releases a held preparation and keeps its evidence.",
+  }),
+  Object.freeze({
+    reason: "set-preview-not-predictive", exitClass: "refused-evidence",
+    remedy: "The --set preview reads persisted state and names the route; it does not evaluate the checks that decide the command, so it cannot say the command would succeed. Verify only confirms persisted evidence. The evidence lists what was read and what was not.",
+  }),
+  Object.freeze({
+    reason: "set-generation-required", exitClass: "refused-precondition",
+    remedy: "Pass --generation with the original cutover set id that `lcm migration plan --set` printed. Nothing is inferred from the live hold, and nothing was read or changed.",
+  }),
+  Object.freeze({
+    reason: "set-generation-invalid", exitClass: "usage",
+    remedy: "The value passed to --generation is not a valid cutover set id. Nothing was read or changed.",
+  }),
+  Object.freeze({
+    reason: "set-original-generation-required", exitClass: "refused-precondition",
+    remedy: "The id names the rollback hold or publication, not the original activated set. Pass the original set id that plan --set or activate --set printed; nothing was changed.",
+  }),
+  Object.freeze({
+    reason: "set-confirmation-missing", exitClass: "refused-confirmation",
+    remedy: "Pass --confirm-generation with the aggregate set id this refusal reports (never a member generation id); nothing was changed.",
+  }),
+  Object.freeze({
+    reason: "set-confirmation-moved", exitClass: "refused-confirmation",
+    remedy: "--confirm-generation does not match the set. Pass the aggregate set id this refusal reports, or re-run plan --set if the candidate moved (never a member generation id); nothing was changed.",
+  }),
 ] satisfies MigrationRefusalMapping[]);
 
 const REFUSAL_BY_REASON: ReadonlyMap<string, MigrationRefusalMapping> = new Map(

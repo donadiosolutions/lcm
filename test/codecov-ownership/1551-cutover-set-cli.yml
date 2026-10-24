@@ -1,0 +1,18 @@
+references: ["#1551", "#1544"]
+rationale: >-
+  #1551 exposes the cutover-set services through the existing lcm migration
+  commands behind --set. The two new modules, the shared set state and the
+  command adapters, live under src/migration/ and stay in the directory-level
+  migration cutover owner; no topology change. cli-render.ts gains the one
+  set renderer and refusal-mapping.ts the shared set refusal buckets, both in
+  that owner. bin/lcm.ts only registers --set and dispatches to the adapters,
+  and src/cli-help.ts only describes it; both remain in the CLI owner. The
+  project-map, enumeration, authority and preparation changes that keep the
+  preview from writing belong to #1670 and are pinned by its own fragment.
+pins:
+  - ["bin/lcm.ts", "unit-cli"]
+  - ["src/cli-help.ts", "unit-cli"]
+  - ["src/migration/cli-cutover-set-state.ts", "unit-migration-cutover"]
+  - ["src/migration/cli-cutover-set.ts", "unit-migration-cutover"]
+  - ["src/migration/cli-render.ts", "unit-migration-cutover"]
+  - ["src/migration/refusal-mapping.ts", "unit-migration-cutover"]
