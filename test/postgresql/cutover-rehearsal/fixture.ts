@@ -477,11 +477,18 @@ export interface AuthorityObservation {
 }
 
 function admits(home: string, backend: "sqlite" | "postgresql"): boolean {
-  try {
-    assertBackendPublicationConsumerAccess({ backend, homeDir: home });
-    return true;
-  } catch {
-    return false;
+  // A live daemon's background sweep can hold the publication mutation lock for a moment; that contention is not an admission
+  // verdict, so it is awaited for a bounded time (10 s) and any other refusal is the answer.
+  const deadline = Date.now() + 10_000;
+  for (;;) {
+    try {
+      assertBackendPublicationConsumerAccess({ backend, homeDir: home });
+      return true;
+    } catch (error) {
+      const contended = error instanceof Error && /mutation is already in progress/u.test(error.message);
+      if (!contended || Date.now() > deadline) return false;
+      Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, 100);
+    }
   }
 }
 

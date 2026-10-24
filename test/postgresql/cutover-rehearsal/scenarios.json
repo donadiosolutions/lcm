@@ -1334,13 +1334,7 @@
         "I5": "na:no unreachable-target step in this row; disclosure scan still runs on every step",
         "I6": "required"
       },
-      "notes": "Pending the https://github.com/donadiosolutions/lcm/issues/1694 fix on main: the portable export refuses uploaded inbox rows that are still resident (pending, retry or claimed) because their previousEventId breaks the 7-key envelope, so the rollback cannot succeed. The row acknowledges an input after activation, lets the production replication worker upload it with the apply step deferred, asserts it is resident, then requires the post-write rollback to succeed and retain the input.",
-      "gate": {
-        "status": "pending",
-        "pendingOn": [
-          "https://github.com/donadiosolutions/lcm/issues/1694"
-        ]
-      }
+      "notes": "Fixed by https://github.com/donadiosolutions/lcm/issues/1694: the portable export carries replicated inbox rows that are still resident (pending, retry or claimed). The row acknowledges an input after activation, lets the production replication worker upload it with the apply step deferred, asserts it is resident, then requires the post-write rollback to succeed and retain the input."
     },
     {
       "profiles": [
@@ -3217,13 +3211,7 @@
         "I5": "na:no unreachable-target step in this row; disclosure scan still runs on every step",
         "I6": "required"
       },
-      "notes": "Pending the https://github.com/donadiosolutions/lcm/issues/1696 fix on main (a follow-up of #1683): identity-only observation must authenticate the config and journal without requiring the selected backend's connection secrets. The row starts the stale SQLite daemon without LCM_POSTGRES_URL and LCM_POSTGRES_CA_FILE and asserts exit 8 restart-required on activate and report, followed by the restart and the delivery assertions of F10.",
-      "gate": {
-        "status": "pending",
-        "pendingOn": [
-          "https://github.com/donadiosolutions/lcm/issues/1696"
-        ]
-      }
+      "notes": "Fixed by https://github.com/donadiosolutions/lcm/issues/1696 (a follow-up of #1683): identity-only observation authenticates the config and journal without the selected backend connection secrets. The row starts the stale SQLite daemon without LCM_POSTGRES_URL and LCM_POSTGRES_CA_FILE and asserts exit 8 restart-required on activate and report, followed by the restart and the delivery assertions of F10."
     },
     {
       "profiles": [
