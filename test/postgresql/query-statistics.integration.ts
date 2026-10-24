@@ -173,6 +173,7 @@ describe("PostgreSQL 18 query statistics", () => {
           return result.family;
         };
         let previous = await observe();
+        const baselineDealloc = previous.statementsDeallocTotal;
         const drive = async (expected: readonly string[], action: () => Promise<unknown>) => {
           await action();
           const next = await observe();
@@ -216,8 +217,22 @@ describe("PostgreSQL 18 query statistics", () => {
           repositories.promoted.getById(randomUUID()));
 
         expect(previous.operations?.map(operation => operation.operation)).toEqual(QUERY_OPERATION_IDS);
-        expect(previous.operations?.every(operation =>
-          typeof operation.values.queryCallsTotal === "number")).toBe(true);
+        const withoutCalls = (previous.operations ?? [])
+          .filter(operation => typeof operation.values.queryCallsTotal !== "number")
+          .map(operation => ({
+            operation: operation.operation,
+            omitted: [...new Set(Object.values(operation.omitted))].sort(),
+          }));
+        // A missing counter is either a mapping gap or a pg_stat_statements entry
+        // deallocated by cluster-wide pressure; report enough to tell them apart.
+        expect(withoutCalls, JSON.stringify({
+          status: previous.status,
+          familyOmitted: previous.omitted,
+          statementsDeallocTotal: previous.statementsDeallocTotal,
+          statementsDeallocDelta: previous.statementsDeallocTotal === undefined
+            || baselineDealloc === undefined
+            ? undefined : previous.statementsDeallocTotal - baselineDealloc,
+        })).toEqual([]);
 
         const sensitive = {
           summary: "summary-content-canary",
