@@ -978,13 +978,35 @@ describe("PostgreSQL 18 machine and project identities", () => {
         writerInserted();
         await writerMayCommit;
       }, scope);
-      await writerHasInserted;
+      let ensuring: Promise<{ readonly inserted: number } | null> | undefined;
       let settled = false;
-      const ensuring = repository.ensureProjectAliases({ machineId: machine.machineId, projectId: project.projectId, aliases: wanted })
-        .finally(() => { settled = true; });
-      await delay(750);
-      expect(settled).toBe(false);
-      commitWriter();
+      try {
+        // A writer that fails before inserting ends the wait instead of hanging it.
+        await Promise.race([writerHasInserted, writer.then(() => { throw new Error("the writer ended before it inserted"); })]);
+        ensuring = repository.ensureProjectAliases({ machineId: machine.machineId, projectId: project.projectId, aliases: wanted })
+          .finally(() => { settled = true; });
+        void ensuring.catch(() => undefined);
+        // The reconcile is provably waiting on the alias table lock held back by the writer, not merely slow.
+        const deadline = Date.now() + 15_000;
+        for (;;) {
+          const waiting = await database.migrator.query<{ waiting: string }>({
+            text: `SELECT pg_catalog.count(*)::text AS waiting
+                   FROM pg_catalog.pg_locks AS lock
+                   JOIN pg_catalog.pg_class AS relation ON relation.oid = lock.relation
+                   WHERE NOT lock.granted
+                     AND lock.mode = 'ShareRowExclusiveLock'
+                     AND relation.oid = 'lcm.project_aliases'::pg_catalog.regclass`,
+          }, { domain: "factory", operation: "ensureProjectAliasesRace" });
+          if (waiting.rows[0]!.waiting !== "0") break;
+          if (settled) throw new Error("ensureProjectAliases finished without waiting on the alias table lock");
+          if (Date.now() > deadline) throw new Error("ensureProjectAliases never waited on the alias table lock");
+          await delay(50);
+        }
+        expect(settled).toBe(false);
+      } finally {
+        commitWriter();
+        await Promise.allSettled([writer, ...(ensuring === undefined ? [] : [ensuring])]);
+      }
       await writer;
       await expect(ensuring).resolves.toBeNull();
       const rows = await database.migrator.query<{ path: string }>({
