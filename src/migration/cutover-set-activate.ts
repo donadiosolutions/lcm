@@ -1525,6 +1525,8 @@ const NO_OWN_FENCE_PHASES: ReadonlySet<BackendPublicationJournal["phase"]> = new
   "releasing", "released", "completed", "aborting", "config-restoring", "map-restoring", "abort-releasing", "aborted",
 ]);
 const SUCCESSOR_ROW_PHASES: ReadonlySet<BackendPublicationJournal["phase"]> = new Set(["released", "completed"]);
+/** The release window (Bug #1651): see activate-generation.ts RELEASE_WINDOW_PHASES. */
+const RELEASE_WINDOW_PHASES: ReadonlySet<BackendPublicationJournal["phase"]> = new Set(["releasing", "abort-releasing"]);
 
 /** S13a for one member: its selection binding, an index onto the aggregate selection. */
 function recordMemberSelectionBinding(ctx: Context, member: Member): Exit | null {
@@ -1781,7 +1783,8 @@ async function postSelection(ctx: Context, v3: BackendMaintenanceJournal | null,
  * Re-read each pending member's lease row to continue from: the row this
  * set holds, positively no row (lost unless the coordinator owns the fences
  * for this publication phase), or a row of another publication (lost unless
- * this publication already released its own). Never acquires or takes over.
+ * this publication already released its own or is finishing that release).
+ * Never acquires or takes over.
  */
 async function resolveMemberFences(ctx: Context, ownV2: BackendPublicationJournal | null): Promise<Exit | null> {
   openOrdinary(ctx);
@@ -1793,7 +1796,10 @@ async function resolveMemberFences(ctx: Context, ownV2: BackendPublicationJourna
     if (resolved.kind === "unresolvable") return interrupted(ctx, "S13b", "lease-unresolvable", at(member, resolved.detail));
     const foreign = resolved.kind === "identity-mismatch" || (resolved.kind === "present" && resolved.fence.publicationId !== ctx.setId);
     if (resolved.kind === "present" && !foreign) { member.fence = resolved.fence; continue; }
-    const admitted = ownV2 !== null && (foreign ? SUCCESSOR_ROW_PHASES : NO_OWN_FENCE_PHASES).has(ownV2.phase);
+    const corrupt = resolved.kind === "identity-mismatch" && resolved.corrupt === true;
+    const admitted = ownV2 !== null && (foreign
+      ? SUCCESSOR_ROW_PHASES.has(ownV2.phase) || (RELEASE_WINDOW_PHASES.has(ownV2.phase) && !corrupt)
+      : NO_OWN_FENCE_PHASES.has(ownV2.phase));
     if (!admitted) {
       return interrupted(ctx, "S13b", "lease-lost", at(member, foreign ? "the fenced lease row names another publication" : "no fenced lease row exists for this member"));
     }

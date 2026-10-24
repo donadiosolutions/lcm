@@ -422,6 +422,14 @@ export interface BackendPublicationDriver {
   releaseRemoteGuard?(input: BackendPublicationRemoteContext & Readonly<{
     fence: BackendPublicationFenceRecord;
   }>): Promise<void>;
+  /**
+   * Optional capability, see BackendPublicationRemoteGuardProvider. Present
+   * only for a guard that rebinds a row to another identity solely after it
+   * was released, always with a strictly greater fencing token.
+   */
+  readRemoteGuardForReleaseReconciliation?(
+    input: BackendPublicationRemoteContext,
+  ): Promise<BackendPublicationFenceRecord | null>;
   retainCompletedMaterial?(input: BackendPublicationDriverContext): Promise<void>;
   cleanupAbortedMaterial?(input: Readonly<{
     homeDir: string | undefined;
@@ -4540,6 +4548,28 @@ function sameFenceIdentity(left: BackendPublicationFenceRecord, right: BackendPu
     && left.evidenceSha256 === right.evidenceSha256;
 }
 
+/**
+ * Bug #1651: the authoritative row names another identity and a strictly
+ * greater fencing token than the journalled fence. A guard that declares
+ * readRemoteGuardForReleaseReconciliation rebinds a row only after it was
+ * released and always assigns a greater token, so this proves the
+ * journalled fence was released before the row was rebound. Anything else
+ * (same identity, equal or lower token, other project, malformed token) is
+ * not proof and keeps the caller's existing failure.
+ */
+function supersededByReleasedSuccessor(
+  persisted: BackendPublicationFenceRecord,
+  authoritative: BackendPublicationFenceRecord,
+  project: BackendPublicationProjectRecord,
+): boolean {
+  return persisted.projectId === project.remoteProjectId
+    && authoritative.projectId === project.remoteProjectId
+    && /^[1-9]\d*$/u.test(persisted.fencingToken)
+    && /^[1-9]\d*$/u.test(authoritative.fencingToken)
+    && !sameFenceIdentity(persisted, authoritative)
+    && BigInt(authoritative.fencingToken) > BigInt(persisted.fencingToken);
+}
+
 function assertFence(fence: BackendPublicationFenceRecord, journal: BackendPublicationJournal, project: BackendPublicationProjectRecord): void {
   if (
     fence.publicationId !== journal.publicationId
@@ -4985,6 +5015,45 @@ export class BackendPublicationCoordinator {
     return transition(current, "guarded", directoryHandle, this.#homeDir, this.#observer);
   }
 
+  /**
+   * The release evidence read: the reconciliation read when the driver
+   * declares it (it also returns a row another publication rebound), else
+   * the ordinary release read.
+   */
+  async #readReleaseEvidence(
+    journal: BackendPublicationJournal,
+    project: BackendPublicationProjectRecord,
+  ): Promise<BackendPublicationFenceRecord | null> {
+    const context = { homeDir: this.#homeDir, journal, project };
+    return this.#driver.readRemoteGuardForReleaseReconciliation !== undefined
+      ? this.#driver.readRemoteGuardForReleaseReconciliation(context)
+      : this.#driver.readRemoteGuard!(context, "release");
+  }
+
+  /**
+   * Bug #1651: this project's fence was released and a later publication
+   * rebound the row (supersededByReleasedSuccessor). The release is proven,
+   * so nothing is released, renewed or acquired and the successor's fence is
+   * never journalled. The journalled fence is marked released no later than
+   * the successor's acquisition, because a terminal journal may not retain
+   * an active fence; it is not rewritten once it is already released.
+   */
+  #recordSupersededRelease(
+    journal: BackendPublicationJournal,
+    phase: "releasing" | "abort-releasing",
+    index: number,
+    successor: BackendPublicationFenceRecord,
+    directoryHandle: BackendPublicationDirectoryHandle,
+  ): BackendPublicationJournal {
+    const persisted = journal.projects[index]!.fence!;
+    if (persisted.releasedAt !== null) return journal;
+    return transition(journal, phase, directoryHandle, this.#homeDir, this.#observer, {
+      projects: journal.projects.map((entry, entryIndex) => entryIndex === index
+        ? { ...entry, fence: { ...persisted, releasedAt: successor.acquiredAt } }
+        : entry),
+    });
+  }
+
   async #releaseAll(
     journal: BackendPublicationJournal,
     aborting: boolean,
@@ -5007,12 +5076,17 @@ export class BackendPublicationCoordinator {
         ? current
         : transition(current, "released", directoryHandle, this.#homeDir, this.#observer);
     }
+    const reconciling = this.#driver.readRemoteGuardForReleaseReconciliation !== undefined;
     for (let index = 0; index < current.projects.length; index += 1) {
       let project = current.projects[index]!;
       let persisted = project.fence;
       if (persisted === null) continue;
-      let authoritative = await this.#driver.readRemoteGuard({ homeDir: this.#homeDir, journal: current, project }, "release");
+      let authoritative = await this.#readReleaseEvidence(current, project);
       if (authoritative === null) return fail("unexpected-state", "remote release evidence is missing");
+      if (reconciling && supersededByReleasedSuccessor(persisted, authoritative, project)) {
+        current = this.#recordSupersededRelease(current, phase, index, authoritative, directoryHandle);
+        continue;
+      }
       assertFence(authoritative, current, project);
       if (!sameFenceIdentity(persisted, authoritative)) return fail("unexpected-state", "remote release fence identity changed");
       if (BigInt(authoritative.fencingToken) < BigInt(persisted.fencingToken)) {
@@ -5034,7 +5108,7 @@ export class BackendPublicationCoordinator {
             return fail("unexpected-state", "expired remote release fence cannot be reacquired");
           }
           await this.#driver.acquireRemoteGuard({ homeDir: this.#homeDir, journal: current, project });
-          authoritative = await this.#driver.readRemoteGuard({ homeDir: this.#homeDir, journal: current, project }, "release");
+          authoritative = await this.#readReleaseEvidence(current, project);
           if (authoritative === null || authoritative.releasedAt !== null || authoritative.databaseExpired) {
             return fail("unexpected-state", "remote release successor is not active");
           }
@@ -5051,7 +5125,11 @@ export class BackendPublicationCoordinator {
         this.#observer("before-release", project.remoteProjectId);
         await this.#driver.releaseRemoteGuard({ homeDir: this.#homeDir, journal: current, project, fence: authoritative });
         this.#observer("after-release", project.remoteProjectId);
-        authoritative = await this.#driver.readRemoteGuard({ homeDir: this.#homeDir, journal: current, project }, "release");
+        authoritative = await this.#readReleaseEvidence(current, project);
+        if (authoritative !== null && reconciling && supersededByReleasedSuccessor(persisted, authoritative, project)) {
+          current = this.#recordSupersededRelease(current, phase, index, authoritative, directoryHandle);
+          continue;
+        }
         if (authoritative === null || authoritative.releasedAt === null) return fail("unexpected-state", "remote release lacks authoritative readback");
         assertFence(authoritative, current, project);
       }

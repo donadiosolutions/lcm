@@ -56,6 +56,7 @@
     "test:surface-parity:inventory": "node scripts/generate-surface-parity-inventory.mjs",
     "test:postgresql": "pnpm run build && node scripts/postgresql-harness.mjs",
     "test:postgresql:census-cost": "pnpm run build && LCM_TEST_POSTGRES_CENSUS_COST=true node scripts/postgresql-harness.mjs",
+    "test:postgresql:cutover-rehearsal": "pnpm run build && LCM_TEST_POSTGRES_CUTOVER_REHEARSAL=true node scripts/postgresql-harness.mjs",
     "typecheck": "tsc --noEmit && tsc --project tsconfig.postgresql-conformance.json && tsc --project tsconfig.promotion-type-regression.json && tsc --project tsconfig.identity-binding-type-regression.json",
     "verify:consumer-topology": "node scripts/verify-consumer-topology.mjs",
     "verify:native-transcript-package": "node scripts/verify-native-transcript-package.mjs && tsc --project tsconfig.native-transcript-package.json",

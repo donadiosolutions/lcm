@@ -1,0 +1,8 @@
+references: ["#1694"]
+rationale: >-
+  #1694 lets the PostgreSQL portable passive-events mapping accept the
+  previousEventId pointer that replication uploads, so a project holding
+  uploaded inbox rows exports and rolls back. The changed file keeps its
+  current owner.
+pins:
+  - ["src/storage/postgresql/portable-mapping.ts", "integration-postgresql-portable"]

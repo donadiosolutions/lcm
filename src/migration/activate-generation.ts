@@ -2,7 +2,7 @@ import { join } from "node:path";
 import { createHash } from "node:crypto";
 import { mkdtempSync, rmSync } from "node:fs";
 import { DEFAULT_DAEMON_PORT, parseStoredConfig, readDaemonConfigRawSnapshot } from "../daemon/config.js";
-import { requireMachineIdentity } from "../machine-identity.js";
+import { MachineIdentityFileError, requireMachineIdentity } from "../machine-identity.js";
 import { configPath, daemonPidPath, lcmHomeDir } from "../runtime-paths.js";
 import { PRIVATE_FILE_MODE, readBoundedRegularFileWithStat } from "../security-files.js";
 import {
@@ -25,10 +25,12 @@ import {
 } from "../storage/backend-publication-material.js";
 import type { StorageIdentityContext } from "../storage/contracts.js";
 import { StorageOperationError } from "../storage/errors.js";
+import { PortableStreamError } from "../storage/portable-record.js";
 import type { PostgreSqlConnectionSettings, PostgreSqlQueryExecutor, PostgreSqlRuntimeHealth } from "../storage/postgresql/contracts.js";
 import {
   POSTGRESQL_BACKEND_PUBLICATION_RESOURCE_KEY,
   POSTGRESQL_BACKEND_PUBLICATION_RESOURCE_TYPE,
+  PostgreSqlBackendPublicationGuardError,
 } from "../storage/postgresql/publication-guard.js";
 import { createPostgreSqlBackendPublicationRemoteGuard } from "../storage/postgresql/publication-remote-guard.js";
 import { PostgreSqlRuntime } from "../storage/postgresql/runtime.js";
@@ -149,8 +151,10 @@ import {
 /**
  * The migration activation orchestrator (#625, plan-v7.1): one entry point
  * for a fresh activation and for crash recovery, runMigrationActivation.
- * It classifies durable state first (step C), enters the matching row of
- * plan-v5 section 7, and runs the S0-S16 sequence under one retained
+ * It classifies durable state first (step C; an absent manifest is refused
+ * before the append barrier, which would create the LCM home, and the machine
+ * identity is read only once an ordinary runtime is about to open), enters the
+ * matching row of plan-v5 section 7, and runs the S0-S16 sequence under one retained
  * append-barrier token (I5), publishing the version-2 backend selection
  * for exactly one verified generation.
  *
@@ -487,6 +491,9 @@ export interface MigrationActivationDependencies {
       scratchParent: string; signal?: AbortSignal;
     }>,
   ) => Promise<Readonly<{ census: readonly MigrationVerificationDomainCensus[] }>>;
+  /** Allocates S7's census scratch directory (default: mkdtemp under the LCM
+   * home). Called only at S7, so refusals before it never touch the disk. */
+  readonly allocateScratch: (homeDir: string) => string;
   readonly census: MigrationActivationCensusSeam;
   readonly withAppendBarrier: typeof withBackendPublicationAppendBarrierAsync;
   readonly checkQuiescence: typeof checkActivationWriterQuiescence;
@@ -578,6 +585,7 @@ export function createMigrationActivationDependencies(
     persistReport: persistMigrationActivationReport,
     readReport: readMigrationActivationReport,
     machineId: (homeDir) => requireMachineIdentity(homeDir).machineId,
+    allocateScratch: (home) => mkdtempSync(join(lcmHomeDir(home), "activation-scratch-")),
     daemonPort: storedDaemonPort,
     checkRestart: checkActivationRestartAdmission,
     leaseTtlMs: MIGRATION_ACTIVATION_LEASE_TTL_MS,
@@ -686,7 +694,9 @@ type Context = {
   readonly localProjectId: string;
   readonly remoteProjectId: string;
   readonly now: () => Date;
-  readonly machineId: string;
+  /** Null until resolveMachineId runs, immediately before openOrdinary; every
+   * consumer (openOrdinary, S2 and the lease helpers) runs after it. */
+  machineId: string | null;
   token: BackendPublicationLockToken;
   manifest: MigrationManifest;
   report: MigrationVerificationReport;
@@ -806,12 +816,16 @@ function isManifestAbsent(error: unknown): boolean {
   return error instanceof MigrationProtocolError && error.reason === "unexpected-state" && /head is absent/u.test(error.message);
 }
 
+function manifestAbsentRefusal(generationId: string): Exit {
+  return refusal("S0", "manifest-absent", "no migration manifest exists for generation " + generationId);
+}
+
 function readManifest(ctx: Context): Step<MigrationManifest> {
   try {
     return ok(ctx.deps.manifestStore.read(ctx.generationId));
   } catch (error) {
     if (isManifestAbsent(error)) {
-      return refused(ctx, "S0", "manifest-absent", "no migration manifest exists for generation " + ctx.generationId);
+      return manifestAbsentRefusal(ctx.generationId);
     }
     if (error instanceof MigrationProtocolError) {
       return refused(ctx, "S0", "manifest-unresolvable", "the migration manifest could not be read: " + error.message);
@@ -954,7 +968,25 @@ function attemptFor(ctx: Context): MigrationActivationAttempt {
 function openOrdinary(ctx: Context): void {
   ctx.ordinary = ctx.deps.createOrdinaryRuntime(ctx.input.ordinarySettings);
   ctx.guard = ctx.ordinary.backendPublicationGuard();
-  ctx.coordinator = ctx.deps.createCoordinator({ homeDir: ctx.homeDir, guard: ctx.guard, machineId: ctx.machineId });
+  ctx.coordinator = ctx.deps.createCoordinator({ homeDir: ctx.homeDir, guard: ctx.guard, machineId: ctx.machineId! });
+}
+
+/**
+ * The registered machine identity, read only once the run needs it (an
+ * uninitialized home must still reach the S0 classification). An identity
+ * the file cannot supply (unregistered, pending, malformed) or a filesystem
+ * error from reading it is unresolvable state; anything else rethrows.
+ */
+function resolveMachineId(ctx: Context): Exit | null {
+  try {
+    ctx.machineId = ctx.deps.machineId(ctx.homeDir);
+    return null;
+  } catch (error) {
+    if (error instanceof MachineIdentityFileError || (error instanceof Error && typeof (error as NodeJS.ErrnoException).code === "string")) {
+      return refused(ctx, "S0", "state-unresolvable", "the machine identity could not be resolved: " + error.message);
+    }
+    throw error;
+  }
 }
 
 /** S0 (A5): evidenceSha256 from the completed transfer run, on its own
@@ -993,7 +1025,7 @@ async function identityCheck(ctx: Context, executor: PostgreSqlQueryExecutor, st
     if (error instanceof Error && error.name === "MigrationVerificationDriverError") {
       return refused(ctx, step, "identity-drift", "the live destination identity does not match the sealed manifest: " + error.message);
     }
-    throw error;
+    return targetFailure(ctx, error, step, step + " destination identity query");
   }
   if (live.sealedWitnessSha256 !== ctx.report.body.destinationIdentity.sealedWitnessSha256) {
     return refused(ctx, step, "identity-drift", "the live destination identity does not match the verification report");
@@ -1005,7 +1037,7 @@ async function identityCheck(ctx: Context, executor: PostgreSqlQueryExecutor, st
 async function stepLeaseAcquire(ctx: Context): Promise<Step<ActivationLeaseFence>> {
   const base = {
     projectId: ctx.remoteProjectId,
-    machineId: ctx.machineId,
+    machineId: ctx.machineId!,
     publicationId: ctx.publicationId,
     targetBackend: "postgresql" as const,
     evidenceSha256: ctx.evidenceSha256!,
@@ -1016,7 +1048,19 @@ async function stepLeaseAcquire(ctx: Context): Promise<Step<ActivationLeaseFence
   if (acquired.status === "acquired") return ok(acquired.fence);
   if (acquired.status === "conflict") return refused(ctx, "S2", "lease-conflict", acquired.detail);
   if (acquired.status === "unresolvable") return refused(ctx, "S2", "lease-unresolvable", acquired.detail);
-  const current = await ctx.guard!.read({ projectId: ctx.remoteProjectId, targetBackend: "postgresql", evidenceSha256: ctx.evidenceSha256!, signal: ctx.input.signal });
+  let current: ActivationLeaseFence | null;
+  try {
+    current = await ctx.guard!.read({ projectId: ctx.remoteProjectId, targetBackend: "postgresql", evidenceSha256: ctx.evidenceSha256!, signal: ctx.input.signal });
+  } catch (error) {
+    // A decodable row naming another generation is a routine conflict; an undecodable row is data damage.
+    if (error instanceof PostgreSqlBackendPublicationGuardError && error.reason === "fence-mismatch") {
+      return refused(ctx, "S2", "lease-conflict", "the expired lease row was taken by a different publication generation before takeover");
+    }
+    if (error instanceof PostgreSqlBackendPublicationGuardError && error.reason === "invalid-row") {
+      return refused(ctx, "S2", "lease-unresolvable", "the expired lease row is corrupt or ambiguous and cannot be attributed to any publication generation");
+    }
+    throw error;
+  }
   if (current === null) return refused(ctx, "S2", "lease-unresolvable", "the expired lease row vanished before takeover");
   const took: ActivationLeaseTakeoverResult = await takeoverActivationLease(ctx.guard!, { ...base, expectedFencingToken: current.fencingToken });
   if (took.status === "took-over") return ok(took.fence);
@@ -1038,7 +1082,7 @@ type LeaseContinuation =
 async function continueLease(ctx: Context): Promise<LeaseContinuation> {
   const mutation = {
     projectId: ctx.remoteProjectId,
-    machineId: ctx.machineId,
+    machineId: ctx.machineId!,
     publicationId: ctx.publicationId,
     targetBackend: "postgresql" as const,
     evidenceSha256: ctx.evidenceSha256!,
@@ -1062,7 +1106,7 @@ async function continueLease(ctx: Context): Promise<LeaseContinuation> {
 type OwnFenceRead =
   | Readonly<{ kind: "own"; fence: ActivationLeaseFence }>
   | Readonly<{ kind: "absent"; detail: string }>
-  | Readonly<{ kind: "foreign"; detail: string }>
+  | Readonly<{ kind: "foreign"; detail: string; corrupt: boolean }>
   | Readonly<{ kind: "unresolvable"; detail: string }>;
 
 /** Re-read the lease row to continue from (re-entry): the row this
@@ -1072,9 +1116,9 @@ type OwnFenceRead =
 async function readOwnFence(ctx: Context): Promise<OwnFenceRead> {
   const resolved = await resolveActivationLeaseFence(ctx.guard!, { projectId: ctx.remoteProjectId, targetBackend: "postgresql", evidenceSha256: ctx.evidenceSha256!, signal: ctx.input.signal });
   if (resolved.kind === "absent") return { kind: "absent", detail: "no fenced lease row exists for this generation" };
-  if (resolved.kind === "identity-mismatch") return { kind: "foreign", detail: resolved.detail };
+  if (resolved.kind === "identity-mismatch") return { kind: "foreign", detail: resolved.detail, corrupt: resolved.corrupt === true };
   if (resolved.kind === "unresolvable") return { kind: "unresolvable", detail: resolved.detail };
-  if (resolved.fence.publicationId !== ctx.publicationId) return { kind: "foreign", detail: "the fenced lease row names another publication" };
+  if (resolved.fence.publicationId !== ctx.publicationId) return { kind: "foreign", detail: "the fenced lease row names another publication", corrupt: false };
   return { kind: "own", fence: resolved.fence };
 }
 
@@ -1098,11 +1142,21 @@ const NO_OWN_FENCE_PHASES: ReadonlySet<BackendPublicationJournal["phase"]> = new
  * home) may legitimately have acquired the released row, and only local
  * authenticated finalization (released) or the terminal report (completed)
  * remains; neither the drive nor S16 renews, releases, acquires or takes
- * over that row. At releasing the coordinator still has to authenticate its
- * own release from the row, and the abort family unwinds through it, so a
- * foreign row stays lease-lost there.
+ * over that row.
  */
 const SUCCESSOR_ROW_PHASES: ReadonlySet<BackendPublicationJournal["phase"]> = new Set(["released", "completed"]);
+
+/**
+ * The release window (Bug #1651): the remote release may already have
+ * committed while the journal still reads releasing (or abort-releasing), so
+ * a successor publication may hold the released row. A decodable foreign row
+ * is admitted so the coordinator can finish its release tail, which is the
+ * only proof that this publication's fence was released; the drive neither
+ * renews, releases, acquires nor takes over that row. A corrupt or ambiguous
+ * row is never admitted, and a coordinator whose guard cannot prove the
+ * release still fails closed.
+ */
+const RELEASE_WINDOW_PHASES: ReadonlySet<BackendPublicationJournal["phase"]> = new Set(["releasing", "abort-releasing"]);
 
 /**
  * Release the S2 lease of a run that ends before any durable effect (the
@@ -1121,7 +1175,7 @@ const SUCCESSOR_ROW_PHASES: ReadonlySet<BackendPublicationJournal["phase"]> = ne
 async function releaseAbandonedLease(ctx: Context): Promise<string | null> {
   const mutation = {
     projectId: ctx.remoteProjectId,
-    machineId: ctx.machineId,
+    machineId: ctx.machineId!,
     publicationId: ctx.publicationId,
     targetBackend: "postgresql" as const,
     evidenceSha256: ctx.evidenceSha256!,
@@ -1241,21 +1295,26 @@ async function stepHealth(ctx: Context): Promise<Step<MigrationTargetHealthResul
   return refused(ctx, "S6", health.status === "unhealthy" ? "target-unhealthy" : "target-unresolvable", health.reason + ": " + health.detail);
 }
 
-/** A target failure observed by S7 (the transfer schema check, the snapshot
- * open, the census read): the StorageOperationError family, attributed
- * exactly as S6 attributes the same failures, becomes the S6 refusal
- * vocabulary (target-unhealthy / target-unresolvable). Anything else is
- * not a target condition and is thrown. */
-function targetFailure(ctx: Context, error: unknown, stage: string): Exit {
-  if (!(error instanceof StorageOperationError)) throw error;
-  const attributed = classifyMigrationTargetFailure(error, stage);
-  return refused(ctx, "S7", attributed.status === "unhealthy" ? "target-unhealthy" : "target-unresolvable", attributed.reason + ": " + attributed.detail);
+/** A target failure observed at `step` (the S0, S5 and S7 destination
+ * identity queries; the S7 transfer schema check, snapshot open and census
+ * read): the StorageOperationError family, attributed exactly as S6
+ * attributes the same failures, becomes the S6 refusal vocabulary
+ * (target-unhealthy / target-unresolvable). The PostgreSQL portable source
+ * normalizes a storage failure to PortableStreamError("source-unavailable")
+ * carrying the storage error as its cause; that wrapper alone is unwrapped.
+ * PortableStreamError "aborted" is a cancellation, not a target condition;
+ * it and every other error are thrown. */
+function targetFailure(ctx: Context, error: unknown, step: MigrationActivationRefusalStep, stage: string): Exit {
+  const failure = error instanceof PortableStreamError && error.code === "source-unavailable" ? error.cause : error;
+  if (!(failure instanceof StorageOperationError)) throw error;
+  const attributed = classifyMigrationTargetFailure(failure, stage);
+  return refused(ctx, step, attributed.status === "unhealthy" ? "target-unhealthy" : "target-unresolvable", attributed.reason + ": " + attributed.detail);
 }
 
 /** S7: a NEW transfer snapshot, after the transfer schema check (amendment 4).
  * Close failures still surface (plan-v7 S7); they are outside the attributed
  * stages. */
-async function stepCensus(ctx: Context, scratchParent: string): Promise<Step<{ censusVector: MigrationCensusVector; canonicalDelta: MigrationCanonicalDelta }>> {
+async function stepCensus(ctx: Context): Promise<Step<{ censusVector: MigrationCensusVector; canonicalDelta: MigrationCanonicalDelta }>> {
   const transfer = ctx.deps.createTransferRuntime(ctx.input.transferSettings);
   try {
     let session: MigrationActivationSnapshot;
@@ -1263,11 +1322,17 @@ async function stepCensus(ctx: Context, scratchParent: string): Promise<Step<{ c
       await ctx.deps.verifyTransferSchema(transfer, { expectedOwner: ctx.input.expectedOwner, signal: ctx.input.signal });
       session = await transfer.openReadOnlySnapshot({ projectId: ctx.input.expectedIdentity.id, signal: ctx.input.signal });
     } catch (error) {
-      return targetFailure(ctx, error, "S7 transfer schema check and snapshot open");
+      return targetFailure(ctx, error, "S7", "S7 transfer schema check and snapshot open");
     }
     try {
       const identity = await identityCheck(ctx, session, "S7");
       if (isExit(identity)) return identity;
+      let scratchParent: string;
+      try {
+        scratchParent = ctx.deps.allocateScratch(ctx.homeDir);
+      } catch (error) {
+        return refused(ctx, "S7", "state-unresolvable", "the census scratch directory could not be allocated: " + (error as Error).message);
+      }
       let read: Awaited<ReturnType<MigrationActivationDependencies["readDestinationCensus"]>>;
       try {
         read = await ctx.deps.readDestinationCensus(session, {
@@ -1278,7 +1343,9 @@ async function stepCensus(ctx: Context, scratchParent: string): Promise<Step<{ c
           signal: ctx.input.signal,
         });
       } catch (error) {
-        return targetFailure(ctx, error, "S7 census read");
+        return targetFailure(ctx, error, "S7", "S7 census read");
+      } finally {
+        rmSync(scratchParent, { recursive: true, force: true });
       }
       return ok({
         censusVector: ctx.deps.census.buildMigrationCensusVector(read.census),
@@ -1703,7 +1770,7 @@ export async function runMigrationActivation(
     localProjectId: input.expectedIdentity.localProjectId!,
     remoteProjectId: input.expectedIdentity.remoteProjectId!,
     now: input.now ?? (() => new Date()),
-    machineId: deps.machineId(input.homeDir),
+    machineId: null,
     token: {} as BackendPublicationLockToken,
     manifest: null as unknown as MigrationManifest,
     report: null as unknown as MigrationVerificationReport,
@@ -1715,27 +1782,30 @@ export async function runMigrationActivation(
     pair: null, material: null, identityDigest: null, artifact: null, link: null,
     censusVector: null, canonicalDelta: null, epoch: null, attempt: null, witness: null, pendingStartedAt: null,
   };
-  const scratchParent = mkdtempSync(join(lcmHomeDir(input.homeDir), "activation-scratch-"));
+  // The append barrier creates the LCM home, so an uninitialized home must be
+  // classified before entering it. Only the absent case exits here; every
+  // other read result is classified by the in-barrier read (step C).
   try {
-    return await deps.withAppendBarrier(input.homeDir, async (token) => {
-      ctx.token = token;
-      try {
-        return await withPreEffectLeaseReleased(ctx, await runUnderBarrier(ctx, scratchParent));
-      } catch (error) {
-        // Best effort, only when readback proves no effect began (a commit
-        // that then threw keeps its lease): the original error is the outcome.
-        if (ctx.fence !== null && headPositivelyUnbegun(ctx)) await releaseAbandonedLease(ctx);
-        throw error;
-      } finally {
-        if (ctx.ordinary !== null) await ctx.ordinary.close();
-      }
-    });
-  } finally {
-    rmSync(scratchParent, { recursive: true, force: true });
+    deps.manifestStore.read(input.generationId);
+  } catch (error) {
+    if (isManifestAbsent(error)) return manifestAbsentRefusal(input.generationId).exit;
   }
+  return deps.withAppendBarrier(input.homeDir, async (token) => {
+    ctx.token = token;
+    try {
+      return await withPreEffectLeaseReleased(ctx, await runUnderBarrier(ctx));
+    } catch (error) {
+      // Best effort, only when readback proves no effect began (a commit
+      // that then threw keeps its lease): the original error is the outcome.
+      if (ctx.fence !== null && headPositivelyUnbegun(ctx)) await releaseAbandonedLease(ctx);
+      throw error;
+    } finally {
+      if (ctx.ordinary !== null) await ctx.ordinary.close();
+    }
+  });
 }
 
-async function runUnderBarrier(ctx: Context, scratchParent: string): Promise<MigrationActivationOutcome> {
+async function runUnderBarrier(ctx: Context): Promise<MigrationActivationOutcome> {
   // --- C: manifest and verification report ---------------------------------
   const manifest = readManifest(ctx);
   if (isExit(manifest)) return manifest.exit;
@@ -1814,6 +1884,8 @@ async function runUnderBarrier(ctx: Context, scratchParent: string): Promise<Mig
     ctx.evidenceSha256 = artifact.projects[0]!.evidenceSha256;
   }
 
+  const machine = resolveMachineId(ctx);
+  if (machine !== null) return machine.exit;
   openOrdinary(ctx);
 
   // --- Post-selection re-entry (v2 journal, or v3 selection-prepared/completed) ---
@@ -1831,12 +1903,16 @@ async function runUnderBarrier(ctx: Context, scratchParent: string): Promise<Mig
       ctx.fence = own.fence;
     } else if (own.kind === "unresolvable") {
       return interrupted(ctx, "S13b", "lease-unresolvable", own.detail).exit;
-    } else if (!(ownV2 !== null && (own.kind === "foreign" ? SUCCESSOR_ROW_PHASES : NO_OWN_FENCE_PHASES).has(ownV2.phase))) {
+    } else if (!(ownV2 !== null && (own.kind === "foreign"
+      ? SUCCESSOR_ROW_PHASES.has(ownV2.phase) || (RELEASE_WINDOW_PHASES.has(ownV2.phase) && !own.corrupt)
+      : NO_OWN_FENCE_PHASES.has(ownV2.phase)))) {
       // An absent row is lost unless the coordinator owns the fences for
       // this phase (NO_OWN_FENCE_PHASES); a row of another publication is
       // lost unless this publication has already released its own
-      // (SUCCESSOR_ROW_PHASES). Otherwise ctx.fence stays null and stepDrive
-      // continues without one, never touching a successor's row.
+      // (SUCCESSOR_ROW_PHASES) or is finishing that release
+      // (RELEASE_WINDOW_PHASES, decodable rows only). Otherwise ctx.fence
+      // stays null and stepDrive continues without one, never touching a
+      // successor's row.
       return interrupted(ctx, "S13b", "lease-lost", own.detail).exit;
     }
     // A selection is recorded only after S10 began publish-activation, and
@@ -1930,7 +2006,7 @@ async function runUnderBarrier(ctx: Context, scratchParent: string): Promise<Mig
   const health = await stepHealth(ctx);
   if (isExit(health)) return health.exit;
   // S7
-  const census = await stepCensus(ctx, scratchParent);
+  const census = await stepCensus(ctx);
   if (isExit(census)) return census.exit;
   ctx.censusVector = census.value.censusVector;
   ctx.canonicalDelta = census.value.canonicalDelta;
