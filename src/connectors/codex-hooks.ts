@@ -228,17 +228,47 @@ export interface CodexHooksJson {
   readonly duplicates: ReadonlyArray<{ readonly path: CodexHooksJsonPath; readonly name: string }>;
   /**
    * True when the number written at path is not an unsigned integer token (a sign, fraction or exponent).
-   * Only paths up to TRACKED_PATH_DEPTH segments (the handler count fields) are tracked; deeper ones are false.
+   * Only the handler count fields are tracked, at ["hooks", <event>, <group index>, "hooks", <handler index>,
+   * "timeout" | "additionalContextLimit"]; every other path is false. A field written more than once is true
+   * when any of its occurrences is not an unsigned integer token.
    */
   readonly nonIntegerNumberAt: (path: CodexHooksJsonPath) => boolean;
 }
 
 const UNSIGNED_INTEGER_TOKEN = /^(?:0|[1-9][0-9]*)$/;
 const NUMBER_TOKEN_CHAR = /[0-9eE+\-.]/;
-/** hooks / event / group / hooks / handler / field: the deepest number the connector reads. */
-const TRACKED_PATH_DEPTH = 6;
+/** hooks / event / group / hooks / handler / field: the only numbers the connector reads. */
+const HANDLER_FIELD_PATH_DEPTH = 6;
+const HANDLER_COUNT_FIELDS: ReadonlySet<string> = new Set(["timeout", "additionalContextLimit"]);
 /** root, hooks, group and handler objects: the deepest object path the connector checks. */
 const TYPED_OBJECT_PATH_DEPTH = 5;
+
+type Segment = string | number;
+type Frame = { readonly object: boolean; readonly names: Set<string>; key: string; index: number; expectKey: boolean };
+/** event -> group index -> handler index -> count fields written with a non-integer spelling. */
+type NonIntegerFields = Map<Segment, Map<Segment, Map<Segment, Set<Segment>>>>;
+
+function entryOf<Key, Value>(map: Map<Key, Value>, key: Key, create: () => Value): Value {
+  const found = map.get(key);
+  if (found !== undefined) return found;
+  const created = create();
+  map.set(key, created);
+  return created;
+}
+
+/**
+ * The handler count field a number is being read for, decided from the open frames alone:
+ * object (root) / object (hooks) / array (groups) / object (group) / array (handlers) / object (handler).
+ */
+function handlerCountField(stack: readonly Frame[]): string | undefined {
+  if (stack.length !== HANDLER_FIELD_PATH_DEPTH) return undefined;
+  const [root, hooks, groups, group, handlers, handler] = stack;
+  if (!root.object || !hooks.object || groups.object || !group.object || handlers.object || !handler.object) {
+    return undefined;
+  }
+  if (root.key !== "hooks" || group.key !== "hooks") return undefined;
+  return HANDLER_COUNT_FIELDS.has(handler.key) ? handler.key : undefined;
+}
 
 /**
  * Read hooks.json text with JSON.parse for syntax and values, then walk the same text
@@ -252,12 +282,11 @@ export function parseCodexHooksJson(content: string): CodexHooksJson | undefined
   } catch {
     return undefined;
   }
-  type Frame = { readonly object: boolean; readonly names: Set<string>; key: string; index: number; expectKey: boolean };
   const segment = (frame: Frame): string | number => (frame.object ? frame.key : frame.index);
   const stack: Frame[] = [];
   const duplicates: Array<{ path: CodexHooksJsonPath; name: string }> = [];
   let deepDuplicateSeen = false;
-  const nonInteger = new Set<string>();
+  const nonInteger: NonIntegerFields = new Map();
   let at = 0;
   while (at < content.length) {
     const char = content[at];
@@ -289,8 +318,12 @@ export function parseCodexHooksJson(content: string): CodexHooksJson | undefined
     } else if (char === "-" || (char >= "0" && char <= "9")) {
       let end = at + 1;
       while (end < content.length && NUMBER_TOKEN_CHAR.test(content[end])) end += 1;
-      if (stack.length <= TRACKED_PATH_DEPTH && !UNSIGNED_INTEGER_TOKEN.test(content.slice(at, end))) {
-        nonInteger.add(JSON.stringify(stack.map(segment)));
+      const field = handlerCountField(stack);
+      if (field !== undefined && !UNSIGNED_INTEGER_TOKEN.test(content.slice(at, end))) {
+        const [, hooks, groups, , handlers] = stack;
+        const groupsOfEvent = entryOf(nonInteger, hooks.key, () => new Map());
+        const handlersOfGroup = entryOf(groupsOfEvent, groups.index, () => new Map());
+        entryOf(handlersOfGroup, handlers.index, () => new Set()).add(field);
       }
       at = end;
     } else {
@@ -300,7 +333,11 @@ export function parseCodexHooksJson(content: string): CodexHooksJson | undefined
   return {
     value,
     duplicates,
-    nonIntegerNumberAt: (path) => path.length <= TRACKED_PATH_DEPTH && nonInteger.has(JSON.stringify(path)),
+    nonIntegerNumberAt: (path) => {
+      const [root, event, group, hooks, handler, field] = path;
+      if (path.length !== HANDLER_FIELD_PATH_DEPTH || root !== "hooks" || hooks !== "hooks") return false;
+      return nonInteger.get(event)?.get(group)?.get(handler)?.has(field) === true;
+    },
   };
 }
 
