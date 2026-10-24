@@ -166,6 +166,7 @@ const HELP: Record<string, CommandHelp> = {
       ["abort [--generation <id>] --confirm-generation <id> [--dry-run] [--json]", "Complete whichever recovery write (journal or manifest) is missing; repeating it only confirms"],
       ["activate [--generation <id>] --confirm-generation <id> --confirm-backend postgresql [--dry-run] [--json]", "Switch a verified generation to PostgreSQL; afterwards swap the grants (add the runtime grants, revoke the transfer grants), then start the daemon; --dry-run never exits 0"],
       ["rollback [--generation <id>] --confirm-generation <id> --confirm-backend sqlite [--dry-run] [--json]", "Return an activated generation to SQLite; run it with LCM_POSTGRES_URL set to the runtime role (migrationRole stays the schema owner); refuses while any other project is remotely bound; --dry-run never exits 0"],
+      ["<command> --set", "Run any of the nine commands on every project of this home as one cutover set. --generation and --confirm-generation take the aggregate set id (the original one, also for rollback), never a member generation id. verify --set confirms persisted evidence, and its --dry-run, activate --set --dry-run and rollback --set --dry-run never exit 0"],
     ],
     examples: [
       ["lcm migration plan", "Print the candidate generation id to confirm with apply"],
@@ -176,8 +177,11 @@ const HELP: Record<string, CommandHelp> = {
       ["lcm migration abort --confirm-generation <id>", "Abort the held or entering migration whose generation id you pass"],
       ["lcm migration activate --confirm-generation <id> --confirm-backend postgresql", "Switch the verified generation to PostgreSQL, then swap the grants before starting the daemon"],
       ["lcm migration rollback --confirm-generation <id> --confirm-backend sqlite", "Return the activated generation to SQLite"],
+      ["lcm migration plan --set", "Print the set id to confirm when the home holds more than one project"],
+      ["lcm migration activate --set --generation <set-id> --confirm-generation <set-id> --confirm-backend postgresql", "Switch every project of the prepared set through one publication, then swap the grants before starting the daemon"],
+      ["lcm migration report --set --generation <set-id>", "Aggregate status of the set: state, members, owner and the next command"],
     ],
-    notes: "This project must not be linked to a PostgreSQL project through `lcm project create` or `lcm project link` before you migrate: migration resolves or creates the destination identity itself, and a linked project makes apply refuse multi-machine-installation. apply refuses unless --confirm-generation exactly matches the candidate a fresh plan resolves at the moment apply runs; a stale or missing token refuses rather than proceeding. Never a silent fallback: an unresolvable or unverified target, an unresolvable daemon presence, or a state that does not admit the operation all refuse with a distinct, closed reason. See docs/migration-operations.md for the full exit-class table, every refusal's remedy, and the fencing residue.",
+    notes: "This project must not be linked to a PostgreSQL project through `lcm project create` or `lcm project link` before you migrate: migration resolves or creates the destination identity itself, and a linked project makes apply refuse multi-machine-installation. apply refuses unless --confirm-generation exactly matches the candidate a fresh plan resolves at the moment apply runs; a stale or missing token refuses rather than proceeding. Never a silent fallback: an unresolvable or unverified target, an unresolvable daemon presence, or a state that does not admit the operation all refuse with a distinct, closed reason. A home with several projects moves only through --set (see docs/migration-cutover-set.md); without --set the commands keep their single-project behavior and refuse a home that holds other projects' data. See docs/migration-operations.md for the full exit-class table, every refusal's remedy, and the fencing residue.",
   },
 
   search: {

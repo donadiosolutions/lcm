@@ -17,6 +17,7 @@ import type { MigrationVerifyCommandOutcome } from "./cli-verify.js";
 import type { MigrationResumeCommandOutcome } from "./cli-resume.js";
 import type { MigrationReportOutcome } from "./cli-report.js";
 import type { MigrationCutoverCommandOutcome } from "./cli-cutover.js";
+import type { MigrationSetOutcome } from "./cli-cutover-set.js";
 import { MIGRATION_UNEXPECTED_FAILURE_REASON, unexpectedFailureEvidence } from "./boundary.js";
 
 /**
@@ -325,4 +326,34 @@ export function renderMigrationActivateEnvelope(outcome: MigrationCutoverCommand
 
 export function renderMigrationRollbackEnvelope(outcome: MigrationCutoverCommandOutcome): MigrationEnvelope {
   return renderCutoverEnvelope("rollback", outcome);
+}
+
+/**
+ * Every `--set` command renders through the one envelope: the aggregate set
+ * id is `generation`, the member rows are flat `member.<n>.*` evidence, and a
+ * refusal keeps every section the command read.
+ */
+export function renderMigrationSetEnvelope(command: MigrationCommandName, outcome: MigrationSetOutcome): MigrationEnvelope {
+  if (outcome.status === "refuse") {
+    return refusalEnvelope({
+      command,
+      reason: outcome.reason,
+      evidenceDetail: outcome.evidence,
+      applied: outcome.applied ?? false,
+      generation: outcome.generationId ?? null,
+      manifestPhase: outcome.manifestPhase ?? null,
+      next: outcome.next ?? null,
+      sections: outcome.sections,
+      restart: outcome.restart,
+    });
+  }
+  return okEnvelope({
+    command,
+    applied: outcome.applied,
+    generation: outcome.generationId,
+    manifestPhase: outcome.manifestPhase,
+    next: outcome.next,
+    evidence: outcome.evidence,
+    restart: outcome.restart,
+  });
 }
