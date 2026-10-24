@@ -3110,7 +3110,7 @@
         "I5": "na:no unreachable-target step in this row; disclosure scan still runs on every step",
         "I6": "required"
       },
-      "notes": "A real SQLite daemon alive across the cutover: activate and report exit 8 restart-required until it is stopped (#1683 fixed on main). Environment restriction: this daemon is started with the operator's PostgreSQL connection variables (LCM_POSTGRES_URL and LCM_POSTGRES_CA_FILE); a daemon started without them still gives exit 5 cutover-restart-contradiction because its observe route answers 503, tracked by https://github.com/donadiosolutions/lcm/issues/1696 and asserted by the pending row F10-no-target-env. After the restart the new daemon reports PostgreSQL, an input acknowledged after the old daemon stopped is delivered once by the production replication worker, driven in process so the applied inbox row is captured before the production prune and authenticates every canonical envelope field, and the new daemon reports a replication pass, and the SQLite project database is never written by either daemon."
+      "notes": "A real SQLite daemon alive across the cutover: activate and report exit 8 restart-required until it is stopped (#1683 fixed on main). Environment restriction: this daemon is started with the operator's PostgreSQL connection variables (LCM_POSTGRES_URL and LCM_POSTGRES_CA_FILE); a daemon started without them still gives exit 5 cutover-restart-contradiction because its observe route answers 503, tracked by https://github.com/donadiosolutions/lcm/issues/1696 and asserted by the pending row F10-no-target-env. After the restart the new daemon reports PostgreSQL, an input acknowledged after the old daemon stopped is delivered once by the production replication worker, driven in process so the applied inbox row is captured before the production prune and authenticates every canonical envelope field, and a second input acknowledged before the restart is delivered by the restarted daemon itself: its start-up sweep must report a pass that acknowledged at least one event and leave that input acknowledged locally against its inbox row (and pruned when the pass pruned); the SQLite project database is never written by either daemon."
     },
     {
       "profiles": [
@@ -3289,7 +3289,7 @@
         "I5": "na:no unreachable-target step in this row; disclosure scan still runs on every step",
         "I6": "required"
       },
-      "notes": "Retention, held-gap and join-safety assertions; delivery of events that crossed the cutover is asserted by F5-delivery (pending on #1693)."
+      "notes": "Retention, held-gap and join-safety assertions; delivery of events that crossed the cutover is asserted by F5-delivery."
     },
     {
       "profiles": [
@@ -3302,7 +3302,7 @@
       ],
       "knownLimits": [],
       "id": "F5-delivery",
-      "title": "Hook events around the hold are delivered to PostgreSQL exactly once by the daemon after the cutover",
+      "title": "Hook events around the hold are delivered to PostgreSQL exactly once after the cutover: the production replication worker in process with captured receipts, then the daemon's own start-up sweep for a later input",
       "fixture": "P",
       "requirement": "Snapshot-to-selection gap; pending queues",
       "steps": [
@@ -3355,7 +3355,7 @@
         "I5": "na:no unreachable-target step in this row; disclosure scan still runs on every step",
         "I6": "required"
       },
-      "notes": "Asserts the delivery end state: every drained input is acknowledged locally, has one terminal remote disposition, and the join authenticates every canonical envelope field against the ledger from the applied inbox row captured before the production prune. The production replication worker is driven in process because the daemon replicates only in its start-up sweep and every five minutes."
+      "notes": "Asserts the delivery end state: every drained input is acknowledged locally, has one terminal remote disposition, and the join authenticates every canonical envelope field against the ledger from the applied inbox row captured before the production prune. The production replication worker is driven in process because the daemon replicates only in its start-up sweep and every five minutes. One more input acknowledged after that pass is left for the daemon: its start-up sweep must report a pass that acknowledged at least one event and leave that input acknowledged locally against its inbox row (and pruned when the pass pruned)."
     },
     {
       "profiles": [
@@ -3528,7 +3528,7 @@
         "I5": "na:no unreachable-target step in this row; disclosure scan still runs on every step",
         "I6": "required"
       },
-      "notes": "Delivery of the drained events to PostgreSQL is asserted by F6b-delivery (pending on #1693)."
+      "notes": "Delivery of the drained events to PostgreSQL is asserted by F6b-delivery (pending on #1698)."
     },
     {
       "profiles": [

@@ -27,10 +27,10 @@ import { syncPrivateDirectory } from "../../../src/security-files.js";
 import { DaemonClient, type DaemonHealth } from "../../../src/daemon/client.js";
 import { PostgreSqlConversationRepository } from "../../../src/storage/postgresql/conversation-repository.js";
 import { PostgreSqlRuntime } from "../../../src/storage/postgresql/runtime.js";
-import { PassiveEventReplicationWorker } from "../../../src/daemon/passive-event-replication.js";
+import { PassiveEventReplicationWorker, sameEnvelope } from "../../../src/daemon/passive-event-replication.js";
 import { applyReplicatedPassiveEvent } from "../../../src/daemon/passive-event-replication-pass.js";
-import { SQLiteLocalHookOutboxFactory } from "../../../src/storage/local-hook-outbox.js";
-import { PostgreSqlPassiveEventRepository } from "../../../src/storage/postgresql/passive-event-repository.js";
+import { SQLiteLocalHookOutboxFactory, type LocalHookEventRow } from "../../../src/storage/local-hook-outbox.js";
+import { PostgreSqlPassiveEventRepository, type PostgreSqlPassiveEventRecord } from "../../../src/storage/postgresql/passive-event-repository.js";
 import { closeLcmConnection } from "../../../src/db/connection.js";
 import { runLcmMigrations } from "../../../src/db/migration.js";
 import { localProjectIdentity } from "../../../src/daemon/project.js";
@@ -1114,12 +1114,8 @@ export interface MutationEntry {
   readonly domain: "conversation" | "instruction"; readonly identitySha256: string; readonly locator: string;
   readonly beforeSha256: string; readonly afterSha256: string;
 }
-export interface EventRow {
-  readonly event_uuid: string; readonly event_version: number; readonly machine_sequence: string; readonly session_id: string;
-  readonly seq: number; readonly type: string; readonly category: string; readonly data: string; readonly priority: number;
-  readonly source_hook: string; readonly created_at: string; readonly processed_at: string | null; readonly delivery_state: string;
-  readonly remote_inbox_id: string | null; readonly remote_pruned_at: string | null; readonly prev_event_id: number | null;
-}
+/** The local sidecar row exactly as the production outbox reads it (SELECT *), so production comparisons accept it. */
+export type EventRow = LocalHookEventRow;
 
 /** One canonical instant for the SQLite text form ("YYYY-MM-DD HH:MM:SS", UTC) and the ISO form; null when unparsable. */
 export function instantOf(value: unknown): string | null {
@@ -1150,7 +1146,7 @@ export function readEventRows(h: RehearsalHome): EventRow[] {
   const path = join(h.home, ".lcm", "events", h.localProjectId + ".db");
   const db = new DatabaseSync(path, { readOnly: true });
   try {
-    return db.prepare("SELECT event_uuid,event_version,machine_sequence,session_id,seq,type,category,data,priority,source_hook,created_at,processed_at,delivery_state,remote_inbox_id,remote_pruned_at,prev_event_id FROM events ORDER BY machine_sequence").all() as unknown as EventRow[];
+    return db.prepare("SELECT * FROM events ORDER BY machine_sequence").all() as unknown as EventRow[];
   } finally {
     db.close();
   }
@@ -1562,20 +1558,16 @@ export async function inboxRows(db: PostgreSqlTestDatabase, signal?: AbortSignal
   return await adminSql(db, "SELECT inbox_id::text AS inbox_id, project_id::text AS project_id, machine_id::text AS machine_id, event_id::text AS event_id, event_version, machine_sequence::text AS machine_sequence, event_type, status, payload FROM lcm.passive_event_inbox ORDER BY machine_sequence", [], signal) as unknown as InboxRow[];
 }
 
-/** The canonical envelope fields a payload carries, flattened one level. */
-function payloadFields(payload: Record<string, unknown>): Record<string, unknown> {
-  const nested = payload.event;
-  return nested !== null && typeof nested === "object" && !Array.isArray(nested) ? { ...payload, ...(nested as Record<string, unknown>) } : payload;
-}
-
 /**
- * Every canonical envelope field of the remote copy must be present and agree with the acknowledged input, matching the
- * production replication comparison (sameEnvelope): version, session id and sequence, source hook, category, priority, data,
- * the creation instant, and the previous event id (absent and null are the same). The digest is checked against the ledger.
+ * The remote copy must be the acknowledged input by the production replication comparison itself (sameEnvelope: identity,
+ * version, sequence, type, and the payload with createdAt as one instant in either form, previousEventId ignored only when one
+ * side lacks it, every other key equal and no extra key), and its canonical fields must reproduce the ledger digest.
  */
-function remoteEnvelopeProblems(name: string, row: InboxRow, entry: LedgerEntry, local: EventRow | undefined): string[] {
+function remoteEnvelopeProblems(name: string, receipt: PostgreSqlPassiveEventRecord, entry: LedgerEntry, local: EventRow | undefined): string[] {
   const problems: string[] = [];
-  const fields = payloadFields(row.payload);
+  if (local === undefined) return [name + ": the local row is gone"];
+  if (!sameEnvelope(local, receipt)) problems.push(name + ": the remote copy is not the acknowledged event by the production comparison");
+  const fields: Record<string, unknown> = receipt.payload;
   const present = (key: string, kind: "string" | "number"): boolean => {
     if (typeof fields[key] === kind) return true;
     problems.push(name + ": payload field " + key + " is missing or malformed");
@@ -1583,35 +1575,53 @@ function remoteEnvelopeProblems(name: string, row: InboxRow, entry: LedgerEntry,
   };
   const complete = [present("sessionId", "string"), present("category", "string"), present("data", "string"), present("sourceHook", "string"),
     present("createdAt", "string"), present("sessionSequence", "number"), present("priority", "number")].every(Boolean);
-  if (local === undefined) { problems.push(name + ": the local row is gone"); return problems; }
-  if (row.event_version !== local.event_version) problems.push(name + ": remote event version " + String(row.event_version));
-  if (row.event_type !== local.type) problems.push(name + ": remote type " + row.event_type);
-  if (BigInt(row.machine_sequence) !== BigInt(local.machine_sequence)) problems.push(name + ": remote sequence " + row.machine_sequence);
   if (!complete) return problems;
   const remoteDigest = canonicalEnvelopeSha256({
-    eventUuid: row.event_id, eventVersion: row.event_version, machineSequence: row.machine_sequence, sessionId: fields.sessionId, sessionSequence: fields.sessionSequence,
-    type: row.event_type, category: fields.category, data: fields.data, priority: fields.priority, sourceHook: fields.sourceHook, createdAt: fields.createdAt,
+    eventUuid: receipt.eventId, eventVersion: receipt.eventVersion, machineSequence: receipt.machineSequence, sessionId: fields.sessionId, sessionSequence: fields.sessionSequence,
+    type: receipt.eventType, category: fields.category, data: fields.data, priority: fields.priority, sourceHook: fields.sourceHook, createdAt: fields.createdAt,
   });
   if (remoteDigest !== entry.envelopeSha256) problems.push(name + ": the remote envelope differs from the acknowledged envelope");
   if (instantOf(fields.createdAt) === null) problems.push(name + ": createdAt is not an instant");
-  if ((fields.previousEventId ?? null) !== (local.prev_event_id ?? null)) problems.push(name + ": previousEventId differs");
   return problems;
 }
 
+/** A replication counter the daemon reports: a finite number of at least one; anything else is not progress. */
+const countsProgress = (value: unknown): value is number => typeof value === "number" && Number.isFinite(value) && value >= 1;
+
 /**
- * The running PostgreSQL daemon replicates (its sidecar target is PostgreSQL): the status route reports replication enabled and
- * at least one pass that reached the bound project through the PostgreSQL gates (identity, binding, health) and ran the worker. The daemon replicates only in its start-up sweep and every five minutes, so the delivery join itself is
- * driven in process (replicateWithWitness) where the prune can be observed deterministically.
+ * The restarted PostgreSQL daemon itself delivers: the named input was acknowledged and left undelivered before the daemon
+ * started, so only its start-up sweep can move it (the daemon replicates only there and every five minutes). Wait, bounded by
+ * the daemon window and the scenario budget, until the status route reports replication enabled and a pass that acknowledged
+ * at least one event, then require that input's local row acknowledged against a remote inbox id, and pruned when the pass
+ * pruned. The daemon's counters are the only pass evidence; an enabled pass that acknowledged nothing is not delivery.
  */
-export async function assertDaemonReplicates(c: RehearsalCase, daemon: RunningDaemon): Promise<void> {
-  const status = await daemon.client.post<{ passiveEvents?: { replication?: Record<string, unknown> } }>("/status", { cwd: c.h.cwd }, { timeoutMs: 30_000 });
-  const replication = status.passiveEvents?.replication;
-  if (replication?.enabled !== true || Number(replication.passes) < 1 || Number(replication.projects) < 1) {
+export async function assertDaemonReplicates(c: RehearsalCase, daemon: RunningDaemon, name: string): Promise<void> {
+  const entry = c.ledger.find((candidate) => candidate.projectId === c.h.localProjectId && candidate.data === name);
+  if (entry === undefined) throw new Error("the daemon-owned input is not in the ledger: " + name);
+  const failure = (message: string): Error => {
     c.invariants.I3 ??= { status: "pass", evidenceRefs: [] };
     c.invariants.I3.status = "fail";
-    throw new Error("the daemon reports no replication pass: " + JSON.stringify(replication));
+    return new Error(message);
+  };
+  const deadline = Date.now() + 45_000;
+  let replication: Record<string, unknown>;
+  for (;;) {
+    c.checkpoint();
+    const status = await daemon.client.post<{ passiveEvents?: { replication?: Record<string, unknown> } }>("/status", { cwd: c.h.cwd }, { timeoutMs: 30_000 });
+    const reported = status.passiveEvents?.replication;
+    if (reported?.enabled !== true) throw failure("the daemon does not report replication enabled: " + JSON.stringify(reported));
+    replication = reported;
+    if (countsProgress(replication.acknowledged)) break;
+    if (Date.now() >= deadline) throw failure("the daemon's start-up sweep acknowledged no event within the bound: " + JSON.stringify(replication));
+    await delay(250);
   }
-  c.mark("I3", "daemon-replication:passes=" + String(replication.passes) + ",projects=" + String(replication.projects));
+  if (!countsProgress(replication.passes) || !countsProgress(replication.projects)) throw failure("the daemon acknowledged an event without counting a pass over a project: " + JSON.stringify(replication));
+  const row = readEventRows(c.h).find((candidate) => candidate.event_uuid === entry.eventUuid);
+  if (row === undefined || row.delivery_state !== "acknowledged" || row.remote_inbox_id === null) throw failure("the daemon-owned input is not acknowledged locally against a remote inbox row: " + name);
+  const pruned = countsProgress(replication.pruned);
+  if (pruned && row.remote_pruned_at === null) throw failure("the daemon pruned, but the daemon-owned input does not record its prune: " + name);
+  c.mark("I3", "daemon-replication:passes=" + String(replication.passes) + ",projects=" + String(replication.projects) + ",acknowledged=" + String(replication.acknowledged)
+    + ",pruned=" + String(replication.pruned) + ";input=" + name + ":acknowledged,inbox=" + row.remote_inbox_id + (pruned ? ",pruned" : ""));
 }
 
 /**
@@ -1621,7 +1631,7 @@ export async function assertDaemonReplicates(c: RehearsalCase, daemon: RunningDa
  * one terminal "applied" disposition for the right project, machine, sequence and canonical envelope, with the local row
  * pointing at that inbox row. Inputs appended after the drain are only required to be retained.
  */
-export async function assertEventsJoined(c: RehearsalCase, label: string, eligible: readonly string[] = [], receipts?: readonly InboxRow[]): Promise<void> {
+export async function assertEventsJoined(c: RehearsalCase, label: string, eligible: readonly string[] = [], receipts?: readonly PostgreSqlPassiveEventRecord[]): Promise<void> {
   assertLedgerRetained(c, label);
   const rows = await inboxRows(c.db, c.signal);
   const projectId = await destinationProjectId(c.db, c.h.cwd, c.signal);
@@ -1647,19 +1657,20 @@ export async function assertEventsJoined(c: RehearsalCase, label: string, eligib
     if (entry === undefined) { problems.push("eligible input not in the ledger: " + name); continue; }
     const key = keyOf(entry.machineId, entry.eventUuid);
     const localRow = local.get(entry.eventUuid);
-    // The terminal receipt: the applied inbox row as replication applied it, captured before the prune (replicateWithWitness). The
-    // production replication applies no further canonical effect (applyReplicatedPassiveEvent is deliberately empty), so this
-    // applied row is the one canonical receipt and must occur once.
-    const witnessed = witnesses.filter((row) => row.project_id === projectId && keyOf(row.machine_id, row.event_id) === key);
+    // The terminal receipt: the applied inbox row as replication applied it and as the production repository reads it, captured
+    // before the prune (replicateWithWitness). The production replication applies no further canonical effect
+    // (applyReplicatedPassiveEvent is deliberately empty), so this applied row is the one canonical receipt and must occur once.
+    const witnessed = witnesses.filter((record) => record.projectId === projectId && keyOf(record.machineId, record.eventId) === key);
     if (witnessed.length !== 1) { problems.push(name + ": " + String(witnessed.length) + " terminal receipts"); continue; }
     const receipt = witnessed[0]!;
+    const receiptInboxId = receipt.inboxId.toString();
     if (receipt.status !== "applied") problems.push(name + ": receipt status " + receipt.status);
     problems.push(...remoteEnvelopeProblems(name, receipt, entry, localRow));
     const current = ofProject.filter((row) => keyOf(row.machine_id, row.event_id) === key);
-    if (current.length > 1 || (current[0] !== undefined && (current[0].inbox_id !== receipt.inbox_id || current[0].status !== "applied"))) problems.push(name + ": the live inbox row differs from the receipt");
+    if (current.length > 1 || (current[0] !== undefined && (current[0].inbox_id !== receiptInboxId || current[0].status !== "applied"))) problems.push(name + ": the live inbox row differs from the receipt");
     if (current.length === 0 && (localRow === undefined || localRow.remote_pruned_at === null)) problems.push(name + ": no live inbox row and the prune is not recorded locally");
-    if (localRow === undefined || localRow.delivery_state !== "acknowledged" || localRow.remote_inbox_id === null || String(localRow.remote_inbox_id) !== receipt.inbox_id) {
-      problems.push(name + ": local row is not acknowledged against receipt " + receipt.inbox_id);
+    if (localRow === undefined || localRow.delivery_state !== "acknowledged" || localRow.remote_inbox_id === null || String(localRow.remote_inbox_id) !== receiptInboxId) {
+      problems.push(name + ": local row is not acknowledged against receipt " + receiptInboxId);
     }
   }
   if (problems.length > 0) {
@@ -1974,10 +1985,11 @@ export async function uploadResidentEvents(c: RehearsalCase, names: readonly str
 /**
  * Deliver the named acknowledged inputs through the production replication worker (the production no-op apply, the production
  * repositories) and capture the durable terminal witness: the proxy around the remote repository reads the applied inbox rows
- * immediately before the worker's one prune call deletes them, so the receipts are the rows as replication applied them.
- * One pass, no retry: every input must be acknowledged against its inbox row and pruned by it.
+ * immediately before the worker's one prune call deletes them, through the production repository's own read, so the receipts
+ * are the rows as replication applied them and as production parses them. One pass, no retry: every input must be
+ * acknowledged against its inbox row and pruned by it.
  */
-export async function replicateWithWitness(c: RehearsalCase, names: readonly string[]): Promise<InboxRow[]> {
+export async function replicateWithWitness(c: RehearsalCase, names: readonly string[]): Promise<PostgreSqlPassiveEventRecord[]> {
   const entries = names.map((name) => {
     const entry = c.ledger.find((candidate) => candidate.projectId === c.h.localProjectId && candidate.data === name);
     if (entry === undefined) throw new Error("cannot replicate an input that is not in the ledger: " + name);
@@ -1986,7 +1998,7 @@ export async function replicateWithWitness(c: RehearsalCase, names: readonly str
   const projectId = await destinationProjectId(c.db, c.h.cwd, c.signal);
   const runtime = new PostgreSqlRuntime(settings(c.role.url));
   const factory = new SQLiteLocalHookOutboxFactory();
-  const receipts: InboxRow[] = [];
+  const receipts: PostgreSqlPassiveEventRecord[] = [];
   try {
     await withHome(c.h.home, async () => {
       const local = await factory.openExisting(join(c.h.home, ".lcm", "events", c.h.localProjectId + ".db"));
@@ -1996,8 +2008,7 @@ export async function replicateWithWitness(c: RehearsalCase, names: readonly str
         get: (target, property) => {
           if (property === "pruneApplied") {
             return async (keys: readonly { eventId: string; machineId: string }[], signal?: AbortSignal) => {
-              const pruning = new Set(keys.map((key) => key.machineId + ":" + key.eventId));
-              receipts.push(...(await inboxRows(c.db, c.signal)).filter((row) => row.project_id === projectId && row.status === "applied" && pruning.has(row.machine_id + ":" + row.event_id)));
+              receipts.push(...(await target.readEvents(keys.map((key) => ({ eventId: key.eventId, machineId: key.machineId })), c.signal)).filter((record) => record.status === "applied"));
               return await target.pruneApplied(keys as never, signal);
             };
           }

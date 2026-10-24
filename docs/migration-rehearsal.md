@@ -44,7 +44,7 @@ the exact exit class, refusal reason and `next` the executable prints.
 | F7a, F7b, F7c, F7d | Activation interrupted after prepare completes, with the selection prepared, with the project map published but not the config, and after the drive: `report` names `activate` and the retry settles. |
 | F8 | A competing verification fence and a competing publication fence are refused as contention; a superseded fencing token is refused. |
 | F9, H2 | A second registered installation: the first migrates on its own and the second is untouched; a second installation with its own history for a shared project is refused. |
-| F10 | A SQLite daemon alive across activation: `activate` and `report` answer restart-required until it is stopped, then a PostgreSQL daemon delivers an input once. |
+| F10 | A SQLite daemon alive across activation: `activate` and `report` answer restart-required until it is stopped; then the production replication worker, driven in process, delivers one input with its receipt captured, and the restarted PostgreSQL daemon's own start-up sweep delivers a second. |
 | R3-replicated | A post-write rollback after replication uploaded an input that is still resident in the PostgreSQL inbox. |
 | F11-tampered, F11-replaced, F11-partial | A damaged, replaced or partial sealed snapshot is classified, refused for resume and activation, and aborted without touching the source. |
 | R1 to R6b | Rollback before activation (refused), before and after a guarded write, writers around the rollback fence, an interrupted rollback and a retry. |
@@ -61,8 +61,12 @@ A delivery join needs a receipt that survives the production prune. The daemon r
 start-up sweep and every five minutes, so the row drives the production replication worker in process
 (production repositories and apply step, one pass, no retry). A proxy around the remote repository reads
 the applied inbox rows immediately before the worker's prune call, so the join compares the row as
-replication applied it. No trigger or other catalog object is added; the runtime readiness fingerprint
-refuses one. The PostgreSQL daemon still starts afterwards and must report a replication pass.
+replication applied it, through the production repository's read and the production envelope comparison.
+No trigger or other catalog object is added; the runtime readiness fingerprint refuses one. Where the
+row requires delivery (F5-delivery, F10), one more input is acknowledged after that pass and left
+undelivered; the PostgreSQL daemon then starts and its own start-up sweep must deliver it: the row waits,
+bounded, until the daemon's status reports a pass that acknowledged at least one event, and requires that
+input acknowledged locally against its inbox row (and pruned when the pass pruned).
 
 Every row runs under one execution budget that cancels its administrative statements, grant swaps,
 the in-process module seams that accept a signal and the harness waits; cleanup then runs on its own
