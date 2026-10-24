@@ -121,7 +121,7 @@ it("activates a real verified SQLite copy through the production dependencies: r
       // Inside the cleanup scope: a failure after CREATE ROLE still drops the role.
       const roles = await provisionActivationRole(db);
       const installation = await prepareVerifiedInstallation(db, home, roles.transfer, roles.runtime);
-      await grantRuntimeActivationRole(db);
+      await grantRuntimeActivationRole(db, roles.transfer);
       const publicationId = deriveActivationPublicationId(GENERATION_ID);
       const deps = createMigrationActivationDependencies({ homeDir: home });
 
@@ -337,7 +337,7 @@ it("drives a publication that crashed at released, with its fence row gone, to c
     try {
       const roles = await provisionActivationRole(db);
       const installation = await prepareVerifiedInstallation(db, home, roles.transfer, roles.runtime);
-      await grantRuntimeActivationRole(db);
+      await grantRuntimeActivationRole(db, roles.transfer);
       const publicationId = deriveActivationPublicationId(GENERATION_ID);
       const deps = createMigrationActivationDependencies({ homeDir: home });
 

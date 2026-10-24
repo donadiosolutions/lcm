@@ -649,10 +649,11 @@ aggregate records, never taken from the service result, and a settled state coun
 frozen selection that produced it. `report --set` exits 5 when a member's manifest, snapshot or
 referenced verification report cannot be read.
 
-**After a set activation.** Do the grant swap and start the daemon exactly as in "The cutover:
-activate and the grant swap": `activate --set` runs entirely under the transfer role, so add the
-runtime grants and revoke the transfer grants before starting the daemon, then run `report --set`
-until it exits 0.
+**After a set activation.** Follow the grant swap in
+[Migration cutover sets](migration-cutover-set.md): `activate --set` runs entirely under the
+transfer role, so add the runtime grants and revoke the transfer grants before starting the daemon,
+then run `report --set` until it exits 0. This differs from single-generation activation, which
+applies runtime grants before activate and leaves only transfer-grant revocation afterward.
 
 **Known diagnostic limits.** `report --set` does not repair `abort`'s immediate readback attribution
 (#1657). A rollback checkpoint that is absent means no committed rollback checkpoint, not that no

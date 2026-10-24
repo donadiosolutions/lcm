@@ -124,6 +124,10 @@ const HASH_C = "c".repeat(64);
 const SETTINGS: PostgreSqlConnectionSettings = {
   url: "postgresql://unused", caFile: "/dev/null", poolMax: 1, connectionTimeoutMs: 1000, idleTimeoutMs: 1000, statementTimeoutMs: 1000,
 };
+const RUNTIME_SETTINGS: PostgreSqlConnectionSettings = {
+  ...SETTINGS,
+  url: "postgresql://runtime-unused",
+};
 /** What the (fake) transfer verifier admits; the activation role holds the transfer profile (plan-v7.2 B1). */
 const READINESS: PostgreSqlRuntimeReadiness = {
   currentMigrationIds: [], expectedOwner: "lcm_migrator", runtimeRole: "lcm", managedObjectCount: 0, definitionObjectCount: 0, privilegeManifestVersion: 1,
@@ -1015,6 +1019,7 @@ describe("activate CLI admission of the interrupted activation windows (Bug #167
       _resolution: resolution,
       _operationsForTesting: {
         resolveDestination: async () => ({ status: "resolved", settings: SETTINGS, expectedOwner: "lcm_migrator", expectedIdentity: f.input.expectedIdentity }),
+        resolveRuntimeSettings: () => ({ status: "resolved", settings: RUNTIME_SETTINGS }),
         run: (input) => runMigrationActivation({ ...input, now: f.input.now }, f.deps),
         classifyPresence: async () => ({ status: "authoritatively-absent" }),
       },

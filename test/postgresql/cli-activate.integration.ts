@@ -88,7 +88,7 @@ it(
         // The second call is the idempotent confirmation (cell 24), writing nothing.
         expect(await performMigrationVerifyCommand(common)).toMatchObject({ status: "ok", applied: false, evidence: { cell: 24 } });
 
-        await grantRuntimeActivationRole(db);
+        await grantRuntimeActivationRole(db, roles.transfer);
 
         expect(await performMigrationReportCommand({ homeDir: home })).toMatchObject({ next: "activate", evidence: { cell: 24 } });
 
@@ -184,10 +184,12 @@ it(
       vi.stubEnv("HOME", home);
       vi.stubEnv("USERPROFILE", home);
       try {
-        const transfer = await provisionActivationRole(db);
-        const installation = await prepareVerifiedInstallation(db, home, transfer);
-        vi.stubEnv("LCM_POSTGRES_URL", transfer.url);
-        vi.stubEnv("LCM_POSTGRES_CA_FILE", transfer.caFile);
+        const roles = await provisionActivationRole(db);
+        const installation = await prepareVerifiedInstallation(db, home, roles.transfer, roles.runtime);
+        await grantRuntimeActivationRole(db, roles.transfer);
+        vi.stubEnv("LCM_POSTGRES_URL", roles.transfer.url);
+        vi.stubEnv("LCM_POSTGRES_CA_FILE", roles.transfer.caFile);
+        vi.stubEnv("LCM_POSTGRES_RUNTIME_URL", roles.runtime.url);
         const manifests = new MigrationManifestStore({ homeDir: home });
         const activate = { cwd: installation.cwd, homeDir: home, generation: GENERATION_ID, confirmGenerationId: GENERATION_ID, confirmBackend: "postgresql" };
         const seedForeign = (operation: string, publicationId: string) => db.migrator.query({

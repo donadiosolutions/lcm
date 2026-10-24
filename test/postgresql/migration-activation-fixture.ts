@@ -123,8 +123,11 @@ export async function provisionActivationRole(db: PostgreSqlTestDatabase): Promi
 
 /** Apply the runtime profile after verification and immediately before
  * activation, matching the documented grant-first cutover order. */
-export async function grantRuntimeActivationRole(db: PostgreSqlTestDatabase): Promise<void> {
-  const administrator = new PostgreSqlRuntime(settings(db.adminUrl));
+export async function grantRuntimeActivationRole(
+  db: PostgreSqlTestDatabase,
+  connectionTemplate: PostgreSqlConnectionSettings,
+): Promise<void> {
+  const administrator = new PostgreSqlRuntime({ ...connectionTemplate, url: db.adminUrl });
   try {
     for (const script of RUNTIME_PROFILE_GRANT_SCRIPTS) {
       const sql = readFileSync(join(process.cwd(), "src/storage/postgresql/reference", script), "utf8")

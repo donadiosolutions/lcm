@@ -8,7 +8,6 @@ import { MIGRATION_UNEXPECTED_FAILURE_REASON, unexpectedFailureEvidence, withMig
 import { performMigrationAbortCommand } from "./cli-abort.js";
 import { DEFAULT_MIGRATION_APPLY_MAX_BYTES, DEFAULT_MIGRATION_APPLY_MAX_RECORDS } from "./cli-apply.js";
 import { combineCutoverRestart, CUTOVER_RESTART_REASONS, observeCutoverRestart } from "./cli-cutover.js";
-import { ACTIVATE_NEXT_AFTER_SUCCESS } from "./cli-activate.js";
 import { refuseUnlessBackendConfirmed, refuseUnlessConfirmed } from "./cli-existing.js";
 import {
   admitsResume,
@@ -50,6 +49,8 @@ import { dryRunAuthenticatedSqliteMigrationSource } from "./maintenance.js";
 import { resolveMigrationTargetConfig } from "./target-config.js";
 import { verifyMigrationTargetReachability } from "./target-reachability.js";
 import type { ResolvedPostgreSqlConfig } from "../daemon/config.js";
+
+const CUTOVER_SET_ACTIVATE_NEXT_AFTER_SUCCESS = "swap-grants-then-start-daemon";
 
 /**
  * The `--set` mode of the nine `lcm migration` commands (#1551): thin
@@ -831,12 +832,12 @@ async function mapActivate(args: Readonly<{
   if (restart.reason !== undefined) {
     return refuse(restart.reason, {
       generationId: setId, ...(applied ? { applied: true } : {}),
-      next: restart.reason === CUTOVER_RESTART_REASONS.required ? ACTIVATE_NEXT_AFTER_SUCCESS : "report --set",
+      next: restart.reason === CUTOVER_RESTART_REASONS.required ? CUTOVER_SET_ACTIVATE_NEXT_AFTER_SUCCESS : "report --set",
       sections: evidence, restart: restart.restart,
     });
   }
   return {
-    status: "ok", generationId: setId, manifestPhase: "active", applied, next: ACTIVATE_NEXT_AFTER_SUCCESS, evidence, restart: restart.restart,
+    status: "ok", generationId: setId, manifestPhase: "active", applied, next: CUTOVER_SET_ACTIVATE_NEXT_AFTER_SUCCESS, evidence, restart: restart.restart,
   };
 }
 
