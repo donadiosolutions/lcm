@@ -613,7 +613,9 @@ identity with `observation: "identity-only"` and `storage.status: "unverified"`;
 it never opens project storage or runs the active readiness probe. It still
 answers when the daemon's startup backend differs from the backend now selected
 on disk, so a daemon left running across a migration cutover remains
-identifiable; every other admission check applies as before. Diagnostics
+identifiable, including when its own environment lacks the PostgreSQL URL, CA
+file, or migration role of the newly selected backend (values that are present
+are still validated); every other admission check applies as before. Diagnostics
 require the exact installed version, backend, entrypoint, runtime digest, and
 unchanged configuration witness. An old daemon without this endpoint, malformed
 response, missing credentials, or mismatched identity refuses observation;
