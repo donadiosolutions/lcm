@@ -1,0 +1,8 @@
+references: ["#1639"]
+rationale: >-
+  #1639 gates the extensions runtime health family on the presence of
+  extension records, so a health failure without records keeps its classified
+  failure reason. The change stays inside the existing diagnostics collector
+  and its owner.
+pins:
+  - ["src/storage/diagnostics.ts", "unit-diagnostics"]

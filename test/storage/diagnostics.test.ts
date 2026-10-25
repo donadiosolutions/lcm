@@ -818,6 +818,24 @@ describe('runtime health telemetry lifecycle', () => {
     expect(dependencies.readMigrationHistory).not.toHaveBeenCalled();
     expect(dependencies.readQueue).not.toHaveBeenCalled();
   });
+  it.each([['42501','permission-denied'],['57014','timeout'],['08006','unavailable']] as const)('reports the classified failure %s for extensions when health() carries none', async (code, status) => {
+    const {dependencies,health}=fixture();
+    Object.assign(health,{status:'unavailable',error:typedFailure(code),extensions:undefined});
+    const result=await collectBackendDiagnostics({_dependencies:dependencies});
+    expect(result.classification).toBe(status);
+    expect(result.telemetry.pool).toMatchObject({status:'observed'});
+    expect(result.telemetry.extensions).toEqual({status,observedAt:expect.any(Number),health:'unavailable',entries:[],remediation:RUNTIME_HEALTH_ACTIONS.unavailable,
+      omitted:['pg_stat_statements','pg_trgm','pgcrypto','unaccent'].map(field=>({field,reason:status}))});
+  });
+  it.each(['healthy','degraded'] as const)('mirrors a later classified failure in extensions when %s health() carries none', async healthStatus => {
+    const {dependencies,health}=fixture();
+    Object.assign(health,{status:healthStatus,extensions:undefined});
+    dependencies.readMetrics=vi.fn(async()=>{throw typedFailure('42501');});
+    const result=await collectBackendDiagnostics({_dependencies:dependencies});
+    expect(result.classification).toBe('permission-denied');
+    expect(result.telemetry.extensions).toMatchObject({status:'permission-denied',health:'unavailable',entries:[],remediation:RUNTIME_HEALTH_ACTIONS.unavailable});
+    expect((result.telemetry.extensions as {omitted:unknown[]}).omitted).toHaveLength(4);
+  });
   it('keeps extensions when reading the probe pool throws', async () => {
     const {dependencies,runtime}=fixture(); runtime.poolDiagnostics=()=>{throw new Error('private pool');};
     const result=await collectBackendDiagnostics({_dependencies:dependencies});
