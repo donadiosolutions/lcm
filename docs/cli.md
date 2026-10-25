@@ -20,9 +20,9 @@ The `lcm migration` group (`plan`, `dry-run`, `apply`, `resume`, `verify`, `repo
 `abort`, `activate`, `rollback`) performs the
 reversible SQLite-to-PostgreSQL cutover. Read the operator runbook,
 [Migration operations](migration-operations.md), before running `apply`: it leaves a
-maintenance hold that only `activate` or `abort` can release. For one generation, apply the runtime
-grants before `activate`, then revoke the transfer grants before starting the daemon. The `--set`
-flow remains transfer-only and uses the grant swap in its dedicated runbook.
+maintenance hold that only `activate` or `abort` can release. For one generation or a cutover set,
+apply the runtime grants before `activate`, then revoke the transfer grants before starting the
+daemon.
 
 Storage-backed commands use the backend selected in the authenticated LCM
 configuration. SQLite remains the default. With `storage.backend` set to

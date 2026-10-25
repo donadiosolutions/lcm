@@ -4,7 +4,6 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { beforeAll, expect, it } from "vitest";
 import { assertHarnessReady, settings, withPostgreSqlTestDatabase, type PostgreSqlTestDatabase } from "./harness.js";
-import { grantPortablePostgreSql } from "./portable-fixture.js";
 import type { ResolvedPostgreSqlConfig } from "../../src/daemon/config.js";
 import { localProjectIdentity } from "../../src/daemon/project.js";
 import { closeLcmConnection } from "../../src/db/connection.js";
@@ -26,6 +25,19 @@ import { readMachineIdentity } from "../../src/machine-identity.js";
 import { lcmHomeDir } from "../../src/runtime-paths.js";
 import { projectMapPath } from "../../src/project-map.js";
 import { seedPortableSqlite } from "../storage/sqlite-portable-fixture.js";
+import { applyAllRuntimeGrants } from "./operational-fixture.js";
+import { PostgreSqlRuntime } from "../../src/storage/postgresql/runtime.js";
+import { verifyPostgreSqlRuntimeSchema } from "../../src/storage/postgresql/runtime-readiness.js";
+import { checkMigrationTargetHealth } from "../../src/migration/target-health.js";
+import {
+  EXPECTED_OWNER,
+  RUNTIME_ROLE,
+  TRANSFER_ROLE,
+  dropActivationRole,
+  grantRuntimeActivationRole,
+  provisionActivationRole,
+  revokeTransferActivationRole,
+} from "./migration-activation-fixture.js";
 
 beforeAll(assertHarnessReady);
 
@@ -49,7 +61,7 @@ beforeAll(assertHarnessReady);
  * a destination census mutation refuses the whole set before any effect.
  */
 async function twoProjectHome(db: PostgreSqlTestDatabase) {
-  await grantPortablePostgreSql(db, { transfer: true });
+  const roles = await provisionActivationRole(db);
   const home = mkdtempSync(join(tmpdir(), "cutover-set-activate-"));
   mkdirSync(join(home, ".lcm"), { mode: 0o700 });
   mkdirSync(join(home, ".lcm", "events"), { mode: 0o700 });
@@ -57,7 +69,7 @@ async function twoProjectHome(db: PostgreSqlTestDatabase) {
   writeFileSync(join(lcmHomeDir(home), "config.json"), JSON.stringify({ storage: { backend: "sqlite" }, daemon: { port: 47331 } }) + "\n", { mode: 0o600 });
   const targetConfig = {
     backend: "postgresql",
-    postgresql: { ...settings(db.runtimeUrl), snapshotIdleTimeoutMs: 300_000, migrationRole: "lcm_test_migrator" },
+    postgresql: { ...roles.transfer, snapshotIdleTimeoutMs: 300_000, migrationRole: "lcm_test_migrator" },
   } as unknown as ResolvedPostgreSqlConfig;
   const projects = ["project-a", "project-b"].map((name) => {
     const cwd = join(home, name);
@@ -69,9 +81,10 @@ async function twoProjectHome(db: PostgreSqlTestDatabase) {
     return { cwd, id: local.id };
   }).sort((left, right) => (left.id < right.id ? -1 : 1));
   const remotes = new Map<string, string>();
+  const transferRuntime = new PostgreSqlRuntime(roles.transfer);
   for (const project of projects) {
     const enrolled = await prepareSqliteMigrationEnrollment({ cwd: project.cwd, homeDir: home, targetConfig });
-    const remote = await new PostgreSqlIdentityRepository(db.runtime).createProject({
+    const remote = await new PostgreSqlIdentityRepository(transferRuntime).createProject({
       machineId: enrolled.identity.machineId, displayName: "cutover set " + project.id.slice(0, 8), path: project.cwd, normalizedPath: project.cwd,
     });
     remotes.set(project.id, remote.projectId);
@@ -98,6 +111,7 @@ async function twoProjectHome(db: PostgreSqlTestDatabase) {
     }
     if ("databasePath" in seed.capturedSidecars!.events) rmSync(seed.capturedSidecars!.events.databasePath);
   }
+  await transferRuntime.close();
   const outboxes = new SQLiteLocalHookOutboxFactory();
   for (const project of projects) {
     const outbox = await outboxes.open(join(home, ".lcm", "events", project.id + ".db"));
@@ -105,7 +119,7 @@ async function twoProjectHome(db: PostgreSqlTestDatabase) {
   }
   await outboxes.close();
   closeLcmConnection();
-  return { home, projects, remotes, targetConfig };
+  return { home, projects, remotes, targetConfig, roles };
 }
 
 async function preparedSet(db: PostgreSqlTestDatabase) {
@@ -116,6 +130,7 @@ async function preparedSet(db: PostgreSqlTestDatabase) {
     homeDir: installation.home, confirmSetId: candidate.setId, targetConfig: installation.targetConfig, maxRecords: 500, maxBytes: 16 * 1024 * 1024,
   });
   if (prepared.status !== "prepared") throw new Error("preparation did not finish: " + JSON.stringify(prepared));
+  await grantRuntimeActivationRole(db, installation.roles.runtime);
   return { ...installation, setId: candidate.setId, members: candidate.members };
 }
 
@@ -143,14 +158,29 @@ async function fencedLeases(db: PostgreSqlTestDatabase, remoteProjectId: string)
 
 it("activates a prepared two-project set through one publication, resuming identically after every injected crash", async () => {
   await withPostgreSqlTestDatabase("cutover-set-activate", async (db) => {
-    const { home, projects, remotes, targetConfig, setId, members } = await preparedSet(db);
+    const { home, projects, remotes, targetConfig, roles, setId, members } = await preparedSet(db);
     try {
       const deps = createCutoverSetActivateDependencies({ homeDir: home });
-      const input = { homeDir: home, confirmSetId: setId, targetConfig };
+      const runtimeAdmissions: string[] = [];
+      const transferAdmissions: string[] = [];
+      const auditedDeps: CutoverSetActivateDependencies = {
+        ...deps,
+        verifyRuntimeSchema: async (executor, options) => {
+          const readiness = await deps.verifyRuntimeSchema(executor, options);
+          runtimeAdmissions.push(readiness.runtimeRole);
+          return readiness;
+        },
+        verifyTransferSchema: async (executor, options) => {
+          const readiness = await deps.verifyTransferSchema(executor, options);
+          transferAdmissions.push(readiness.runtimeRole);
+          return readiness;
+        },
+      };
+      const input = { homeDir: home, confirmSetId: setId, targetConfig, ordinarySettings: roles.runtime };
       const [a, b] = members as [typeof members[number], typeof members[number]];
       const manifests = new MigrationManifestStore({ homeDir: home });
       const crashAt = async (point: string, overrides: Partial<CutoverSetActivateDependencies> = {}) => {
-        await expect(activateCutoverSet(input, { ...deps, ...overrides, crashPoint: (p) => { if (p === point) throw new Error("crash at " + point); } }))
+        await expect(activateCutoverSet(input, { ...auditedDeps, ...overrides, crashPoint: (p) => { if (p === point) throw new Error("crash at " + point); } }))
           .rejects.toThrow("crash at " + point);
         expectNotMixed(home, projects, remotes);
       };
@@ -191,7 +221,7 @@ it("activates a prepared two-project set through one publication, resuming ident
           remoteGuard: { mode: "delegated", provider: createPostgreSqlBackendPublicationRemoteGuard({ guard, machineId, ttlMs: 15 * 60 * 1000 }) },
         });
       };
-      await expect(activateCutoverSet(input, { ...deps, createCoordinator: crashingCoordinator })).rejects.toThrow("crash at map-published");
+      await expect(activateCutoverSet(input, { ...auditedDeps, createCoordinator: crashingCoordinator })).rejects.toThrow("crash at map-published");
       expect(readBackendPublicationJournal(home)?.phase).toBe("map-published");
       // The fenced handoff: the map is published and the config is not, the publication is unresolved, and
       // no member replays; this is the explicitly unresolved state, never an admitted mixed selection.
@@ -211,7 +241,7 @@ it("activates a prepared two-project set through one publication, resuming ident
       // (e) B's report written, its effect not completed: the report is reused.
       await crashAt("after-report:" + b.generationId);
 
-      const outcome = await activateCutoverSet(input, deps);
+      const outcome = await activateCutoverSet(input, auditedDeps);
       expect(outcome).toMatchObject({ status: "activated", setId, publicationId: setId, resumedFrom: "publication-journal" });
       expect(effectiveHome(home, projects, remotes)).toEqual({ backend: "postgresql", bound: [true, true] });
       expect(readBackendMaintenanceJournal(home)).toBeNull();
@@ -242,8 +272,31 @@ it("activates a prepared two-project set through one publication, resuming ident
       // Both destination projects exist, and a second call settles from durable state.
       const count = await db.migrator.query<{ projects: string }>({ text: "SELECT pg_catalog.count(*)::text AS projects FROM lcm.projects" }, { domain: "factory", operation: "diagnosticFixture" });
       expect(count.rows[0]!.projects).toBe("2");
-      expect(await activateCutoverSet(input, deps)).toMatchObject({ status: "activated", resumedFrom: "settled-active" });
+      expect(await activateCutoverSet(input, auditedDeps)).toMatchObject({ status: "activated", resumedFrom: "settled-active" });
+      expect(runtimeAdmissions.length).toBeGreaterThanOrEqual(2);
+      expect(runtimeAdmissions.every((role) => role === RUNTIME_ROLE)).toBe(true);
+      expect(transferAdmissions.length).toBeGreaterThanOrEqual(members.length);
+      expect(transferAdmissions.length % members.length).toBe(0);
+      expect(transferAdmissions.every((role) => role === TRANSFER_ROLE)).toBe(true);
+
+      const beforeRevoke = new PostgreSqlRuntime(roles.runtime);
+      try {
+        expect(await checkMigrationTargetHealth({ runtime: beforeRevoke, expectedOwner: EXPECTED_OWNER }))
+          .toMatchObject({ status: "unhealthy", reason: "schema-mismatch" });
+      } finally {
+        await beforeRevoke.close();
+      }
+      await revokeTransferActivationRole(db);
+      const afterRevoke = new PostgreSqlRuntime(roles.runtime);
+      try {
+        expect(await checkMigrationTargetHealth({ runtime: afterRevoke, expectedOwner: EXPECTED_OWNER }, {
+          verifyRuntimeSchema: verifyPostgreSqlRuntimeSchema,
+        })).toMatchObject({ status: "healthy", readiness: { runtimeRole: RUNTIME_ROLE } });
+      } finally {
+        await afterRevoke.close();
+      }
     } finally {
+      await dropActivationRole(db);
       rmSync(home, { recursive: true, force: true });
     }
   });
@@ -251,7 +304,7 @@ it("activates a prepared two-project set through one publication, resuming ident
 
 it("refuses the whole set before any effect when one member's destination census moved, and releases both leases", async () => {
   await withPostgreSqlTestDatabase("cutover-set-activate-refuse", async (db) => {
-    const { home, projects, remotes, targetConfig, setId, members } = await preparedSet(db);
+    const { home, projects, remotes, targetConfig, roles, setId, members } = await preparedSet(db);
     try {
       const b = members[1]!;
       const remoteB = remotes.get(b.physicalProjectId)!;
@@ -260,7 +313,12 @@ it("refuses the whole set before any effect when one member's destination census
         text: "INSERT INTO lcm.conversations(project_id, session_id, title) VALUES ($1, 'drift-session', 'Drift')",
         values: [remoteB],
       }, { domain: "factory", operation: "cutoverSetActivationDrift" });
-      const outcome = await activateCutoverSet({ homeDir: home, confirmSetId: setId, targetConfig }, createCutoverSetActivateDependencies({ homeDir: home }));
+      const outcome = await activateCutoverSet({
+        homeDir: home,
+        confirmSetId: setId,
+        targetConfig,
+        ordinarySettings: roles.runtime,
+      }, createCutoverSetActivateDependencies({ homeDir: home }));
       expect(outcome).toMatchObject({
         status: "refused", step: "S8", reason: "cutover-set-member-evidence-stale", effectBegun: false,
         failures: [{ generationId: b.generationId, reason: "cutover-set-member-evidence-stale" }],
@@ -276,6 +334,36 @@ it("refuses the whole set before any effect when one member's destination census
         expect(leases.every((lease) => lease.released)).toBe(true);
       }
     } finally {
+      await dropActivationRole(db);
+      rmSync(home, { recursive: true, force: true });
+    }
+  });
+}, 900000);
+
+it("refuses a third runtime-profile grantee at S6 before leaving a lease", async () => {
+  await withPostgreSqlTestDatabase("cutover-set-activate-third-role", async (db) => {
+    const { home, remotes, targetConfig, roles, setId, members } = await preparedSet(db);
+    try {
+      await applyAllRuntimeGrants(db);
+      const outcome = await activateCutoverSet({
+        homeDir: home,
+        confirmSetId: setId,
+        targetConfig,
+        ordinarySettings: roles.runtime,
+      }, createCutoverSetActivateDependencies({ homeDir: home }));
+      expect(outcome).toMatchObject({
+        status: "refused",
+        step: "S6",
+        reason: "target-unhealthy",
+        effectBegun: false,
+      });
+      for (const member of members) {
+        const leases = await fencedLeases(db, remotes.get(member.physicalProjectId)!);
+        expect(leases.length).toBeGreaterThan(0);
+        expect(leases.every((lease) => lease.released)).toBe(true);
+      }
+    } finally {
+      await dropActivationRole(db);
       rmSync(home, { recursive: true, force: true });
     }
   });

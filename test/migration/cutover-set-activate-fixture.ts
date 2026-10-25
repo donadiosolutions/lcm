@@ -104,6 +104,10 @@ export const TARGET_CONFIG = {
     snapshotIdleTimeoutMs: 1000, migrationRole: "lcm_migrator",
   },
 } as unknown as ResolvedPostgreSqlConfig;
+export const ORDINARY_SETTINGS = {
+  ...TARGET_CONFIG.postgresql,
+  url: "postgresql://lcm_runtime@db.example.test:5432/lcm",
+};
 
 export const roots: string[] = [];
 export function cleanupRoots(): void {
@@ -424,6 +428,10 @@ export async function fixture(options: FixtureOptions = {}): Promise<Fixture> {
     health, identity, transferRows, destinationCensus, snapshotChecksumOverride, identityOverride, sourceSelectionOverride, prepareCalls: 0,
     createOrdinaryRuntime: ordinary,
     createTransferRuntime: transfer,
+    readRoleIdentity: async (executor) => "backendPublicationGuard" in executor
+      ? { currentUser: "lcm_runtime", sessionUser: "lcm_runtime", oid: "101", tls: true }
+      : { currentUser: "lcm_transfer", sessionUser: "lcm_transfer", oid: "202", tls: true },
+    verifyRuntimeSchema: async () => ({ ...READINESS, runtimeRole: "lcm_runtime" }),
     verifyTransferSchema: async () => READINESS,
     checkTargetHealth: async () => health.shift() ?? ({ status: "healthy", readiness: READINESS }),
     captureDestinationIdentity: async () => ({ version: 1, ...identity }),
@@ -464,7 +472,13 @@ export async function fixture(options: FixtureOptions = {}): Promise<Fixture> {
       } as unknown as Awaited<ReturnType<CutoverSetActivateDependencies["inspectSnapshot"]>>;
     },
   };
-  const input: CutoverSetActivateInput = { homeDir, confirmSetId: setId, targetConfig: TARGET_CONFIG, now: () => new Date("2026-10-16T13:00:00.000Z") };
+  const input: CutoverSetActivateInput = {
+    homeDir,
+    confirmSetId: setId,
+    targetConfig: TARGET_CONFIG,
+    ordinarySettings: ORDINARY_SETTINGS,
+    now: () => new Date("2026-10-16T13:00:00.000Z"),
+  };
   const rewriteJournal = (edit: (payload: Record<string, any>) => void): void => {
     const { checksumSha256: _checksum, ...payload } = JSON.parse(readFileSync(backendPublicationJournalPath(homeDir), "utf8")) as Record<string, any>;
     edit(payload);

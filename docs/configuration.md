@@ -660,8 +660,8 @@ export LCM_POSTGRES_CA_FILE='/absolute/path/to/ca-certificate.crt'
 export LCM_POSTGRES_MIGRATION_ROLE='lcm_migration'
 ```
 
-`LCM_POSTGRES_RUNTIME_URL` is used only by `lcm migration activate` (including
-`lcm migration resume` when it continues an interrupted activation). Set it
+`LCM_POSTGRES_RUNTIME_URL` is used only by `lcm migration activate`, including
+`activate --set` and `lcm migration resume` when it continues an interrupted activation. Set it
 after applying the runtime grant scripts and before activation so `S6` and
 `S15` prove the same restricted role the daemon will use. Activate validates
 it with the same URL rules as `LCM_POSTGRES_URL` and reuses the resolved CA

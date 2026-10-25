@@ -32,11 +32,13 @@ import {
   APPLIED_IN_FLIGHT_PHASES,
   createMigrationActivationDependencies,
   digestsMatch,
+  discoverMigrationActivationRoles,
   MigrationActivationError,
   type MigrationActivationDependencies,
   type MigrationActivationInterruptionCause,
   type MigrationActivationInterruptionStep,
   type MigrationActivationOrdinaryRuntime,
+  type MigrationActivationRole,
   type MigrationActivationRefusalReason,
   type MigrationActivationRefusalStep,
   type MigrationActivationSnapshot,
@@ -267,6 +269,8 @@ export type CutoverSetActivateInput = Readonly<{
   confirmSetId: string;
   /** The one resolved target every member was copied to; its migration role is the activation role (#627). */
   targetConfig: ResolvedPostgreSqlConfig;
+  /** The daemon runtime role used by S5, S6 and S15. */
+  ordinarySettings: PostgreSqlConnectionSettings;
   maxProbeOrdinal?: number;
   signal?: AbortSignal;
   now?: () => Date;
@@ -354,7 +358,8 @@ type Context = {
   readonly deps: CutoverSetActivateDependencies;
   readonly homeDir: string;
   readonly setId: string;
-  readonly settings: PostgreSqlConnectionSettings;
+  readonly transferSettings: PostgreSqlConnectionSettings;
+  readonly ordinarySettings: PostgreSqlConnectionSettings;
   readonly expectedOwner: string;
   readonly coordinates: NonSecretPostgreSqlTarget;
   readonly maxProbeOrdinal: number;
@@ -373,6 +378,8 @@ type Context = {
   ordinary: MigrationActivationOrdinaryRuntime | null;
   guard: ActivationLeasePublicationGuard | null;
   coordinator: ReturnType<MigrationActivationDependencies["createCoordinator"]> | null;
+  ordinaryRole: MigrationActivationRole | null;
+  transferRole: MigrationActivationRole | null;
   effectBegun: boolean;
   resumedFrom: CutoverSetActivationResumePoint;
 };
@@ -494,6 +501,7 @@ function validateInput(input: CutoverSetActivateInput): void {
     || typeof input.confirmSetId !== "string" || !SET_ID_PATTERN.test(input.confirmSetId)
     || typeof input.targetConfig !== "object" || input.targetConfig === null
     || typeof input.targetConfig.postgresql !== "object" || input.targetConfig.postgresql === null
+    || typeof input.ordinarySettings !== "object" || input.ordinarySettings === null
     || typeof input.targetConfig.postgresql.migrationRole !== "string" || input.targetConfig.postgresql.migrationRole.length === 0
   ) {
     throw new MigrationActivationError("invalid-input", "cutover-set activation input is invalid");
@@ -519,12 +527,14 @@ export async function activateCutoverSet(
   }
   const ctx: Context = {
     input, deps, homeDir: input.homeDir, setId: input.confirmSetId,
-    settings: connectionSettings(input.targetConfig), expectedOwner: input.targetConfig.postgresql.migrationRole,
+    transferSettings: connectionSettings(input.targetConfig), ordinarySettings: input.ordinarySettings,
+    expectedOwner: input.targetConfig.postgresql.migrationRole,
     coordinates, maxProbeOrdinal: input.maxProbeOrdinal ?? DEFAULT_MAX_PROBE_ORDINAL,
     now: input.now ?? (() => new Date()),
     machineId: "", token: {} as BackendPublicationLockToken, manifest: null, members: [], journal: null, records: null,
     checkpoint: null, selection: null, artifact: null, material: null, identityDigest: null,
-    ordinary: null, guard: null, coordinator: null, effectBegun: false, resumedFrom: "fresh",
+    ordinary: null, guard: null, coordinator: null, ordinaryRole: null, transferRole: null,
+    effectBegun: false, resumedFrom: "fresh",
   };
   // The append barrier itself refuses a maintenance-entering journal, so that
   // row of the routing table is classified before the barrier (as the
@@ -771,9 +781,30 @@ function readMemberLink(ctx: Context, member: Member): string | null {
 }
 
 function openOrdinary(ctx: Context): void {
-  ctx.ordinary = ctx.deps.createOrdinaryRuntime(ctx.settings);
+  ctx.ordinary = ctx.deps.createOrdinaryRuntime(ctx.ordinarySettings);
   ctx.guard = ctx.ordinary.backendPublicationGuard();
   ctx.coordinator = ctx.deps.createCoordinator({ homeDir: ctx.homeDir, guard: ctx.guard, machineId: ctx.machineId });
+}
+
+async function discoverActivationRoles(ctx: Context): Promise<Exit | null> {
+  const discovery = await discoverMigrationActivationRoles({
+    ordinary: ctx.ordinary!,
+    transferSettings: ctx.transferSettings,
+    createTransferRuntime: ctx.deps.createTransferRuntime,
+    readRoleIdentity: ctx.deps.readRoleIdentity,
+    signal: ctx.input.signal,
+  });
+  if (discovery.status !== "resolved") {
+    return refused(
+      ctx,
+      "S6",
+      discovery.status === "unhealthy" ? "target-unhealthy" : "target-unresolvable",
+      discovery.detail,
+    );
+  }
+  ctx.ordinaryRole = discovery.ordinaryRole;
+  ctx.transferRole = discovery.transferRole;
+  return null;
 }
 
 // ---------------------------------------------------------------------------
@@ -974,11 +1005,15 @@ function targetFailure(error: unknown, stage: string): TargetFailure {
 
 /** S7 for one member: a new transfer snapshot of that member's destination project, after the transfer schema check. */
 async function memberCensus(ctx: Context, member: Member): Promise<void> {
-  const transfer = ctx.deps.createTransferRuntime(ctx.settings);
+  const transfer = ctx.deps.createTransferRuntime(ctx.transferSettings);
   try {
     let session: MigrationActivationSnapshot;
     try {
-      await ctx.deps.verifyTransferSchema(transfer, { expectedOwner: ctx.expectedOwner, signal: ctx.input.signal });
+      await ctx.deps.verifyTransferSchema(transfer, {
+        expectedOwner: ctx.expectedOwner,
+        signal: ctx.input.signal,
+        admittedPeer: { role: ctx.ordinaryRole!.role },
+      });
       session = await transfer.openReadOnlySnapshot({ projectId: member.identity!.id, signal: ctx.input.signal });
     } catch (error) {
       const failure = targetFailure(error, "S7 transfer schema check and snapshot open");
@@ -997,7 +1032,7 @@ async function memberCensus(ctx: Context, member: Member): Promise<void> {
       let read: Awaited<ReturnType<MigrationActivationDependencies["readDestinationCensus"]>>;
       try {
         read = await ctx.deps.readDestinationCensus(session, {
-          settings: ctx.settings, expectedOwner: ctx.expectedOwner, expectedIdentity: member.identity!,
+          settings: ctx.transferSettings, expectedOwner: ctx.expectedOwner, expectedIdentity: member.identity!,
           scratchParent, signal: ctx.input.signal,
         });
       } catch (error) {
@@ -1181,10 +1216,19 @@ async function preSelection(ctx: Context, held: BackendMaintenanceJournal): Prom
   const local = gate(ctx, "S5");
   if (local !== null) return local.exit;
   openOrdinary(ctx);
+  // S5 binds the daemon runtime session before any member lease can be
+  // written. Role discovery then supplies the reciprocal S6/S7 peers once.
+  for (const member of ctx.members) {
+    recordIdentity(member, await identityCheck(ctx, member, ctx.ordinary!, "S5"));
+  }
+  const identified = gate(ctx, "S5");
+  if (identified !== null) return identified.exit;
+  const roles = await discoverActivationRoles(ctx);
+  if (roles !== null) return roles.exit;
   // S0 per member: the copy binding digest read back from the transfer ledger, on its own transfer session.
   for (const member of ctx.members) {
     const row = ctx.checkpoint?.members.find((candidate) => candidate.generationId === member.generationId) ?? null;
-    const transfer = ctx.deps.createTransferRuntime(ctx.settings);
+    const transfer = ctx.deps.createTransferRuntime(ctx.transferSettings);
     try {
       const read: MigrationCopyBindingReadResult = await ctx.deps.readCopyBinding({
         executor: transfer, projectId: member.remoteProjectId, generationId: member.generationId, signal: ctx.input.signal,
@@ -1224,12 +1268,7 @@ async function preSelection(ctx: Context, held: BackendMaintenanceJournal): Prom
   }
   const quiet = gate(ctx, "S3");
   if (quiet !== null) return quiet.exit;
-  // S5 (identity on the ordinary session) and S6 (health, once for the one target).
-  for (const member of ctx.members) {
-    recordIdentity(member, await identityCheck(ctx, member, ctx.ordinary!, "S5"));
-  }
-  const identified = gate(ctx, "S5");
-  if (identified !== null) return identified.exit;
+  // S6: health once for the one target.
   const health = await observeHealth(ctx);
   if (health.status !== "healthy") {
     return refused(ctx, "S6", health.status === "unhealthy" ? "target-unhealthy" : "target-unresolvable", health.reason + ": " + health.detail).exit;
@@ -1249,7 +1288,12 @@ async function preSelection(ctx: Context, held: BackendMaintenanceJournal): Prom
 function observeHealth(ctx: Context): Promise<MigrationTargetHealthResult> {
   return ctx.deps.checkTargetHealth(
     { runtime: ctx.ordinary!, expectedOwner: ctx.expectedOwner, signal: ctx.input.signal },
-    { verifyRuntimeSchema: ctx.deps.verifyTransferSchema },
+    {
+      verifyRuntimeSchema: (executor, options) => ctx.deps.verifyRuntimeSchema(executor, {
+        ...options,
+        admittedPeer: { role: ctx.transferRole!.role },
+      }),
+    },
   );
 }
 
@@ -1840,6 +1884,14 @@ async function postSelection(ctx: Context, v3: BackendMaintenanceJournal | null,
  */
 async function resolveMemberFences(ctx: Context, ownV2: BackendPublicationJournal | null): Promise<Exit | null> {
   openOrdinary(ctx);
+  for (const member of ctx.members) {
+    if (member.manifest!.phase === "active") continue;
+    recordIdentity(member, await identityCheck(ctx, member, ctx.ordinary!, "S5"));
+  }
+  const identified = gate(ctx, "S5");
+  if (identified !== null) return identified;
+  const roles = await discoverActivationRoles(ctx);
+  if (roles !== null) return roles;
   for (const member of ctx.members) {
     if (member.manifest!.phase === "active") continue;
     const resolved = await resolveActivationLeaseFence(ctx.guard!, {

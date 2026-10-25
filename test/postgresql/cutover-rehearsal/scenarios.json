@@ -482,7 +482,7 @@
       "exit": 0,
       "outcome": "ok",
       "manifestPhase": "active",
-      "next": "swap-grants-then-start-daemon",
+      "next": "revoke-transfer-grants-then-start-daemon",
       "applied": true,
       "restartAnswer": "satisfied",
       "evidence": {
@@ -4296,7 +4296,7 @@
       "injections": [],
       "knownLimits": [],
       "id": "S1",
-      "title": "Two-project set: plan, previews, apply, verify, activate, grant swap, report and a clean whole-set rollback to both pre-activation states",
+      "title": "Two-project set: plan, previews, apply, verify, grant-first activate, transfer revoke, report and a clean whole-set rollback to both pre-activation states",
       "fixture": "M",
       "requirement": "Multi-project installation; whole-set pre-write rollback (the post-write set rollback is S3)",
       "steps": [
@@ -4583,7 +4583,7 @@
           "use": "set-resume",
           "applied": true,
           "manifestPhase": "active",
-          "next": "swap-grants-then-start-daemon",
+          "next": "revoke-transfer-grants-then-start-daemon",
           "restartAnswer": "satisfied",
           "evidence": {
             "memberCount": 2,

@@ -66,7 +66,12 @@ function storageError(sqlState: string, retryable: boolean): PostgreSqlStorageOp
 describe("activateCutoverSet faults: entry, records and journals", () => {
   it("uses the wall clock when no clock is supplied, and refuses a single-generation entering journal", async () => {
     const f = await fixture();
-    const outcome = await activateCutoverSet({ homeDir: f.homeDir, confirmSetId: f.setId, targetConfig: f.input.targetConfig }, f.deps);
+    const outcome = await activateCutoverSet({
+      homeDir: f.homeDir,
+      confirmSetId: f.setId,
+      targetConfig: f.input.targetConfig,
+      ordinarySettings: f.input.ordinarySettings,
+    }, f.deps);
     expect(outcome.status).toBe("activated");
     const single = await fixture({ held: false });
     await single.coordinator().enterMaintenance({
@@ -234,9 +239,9 @@ describe("activateCutoverSet faults: member classification", () => {
     const f = await fixture();
     const [a] = f.members;
     expect(await f.run({ readVerificationReport: (id, sha) => { const r = f.deps.readVerificationReport(id, sha); return id === a!.generationId ? { ...r, body: { ...r.body, destinationIdentity: { ...r.body.destinationIdentity, sealedWitnessSha256: HASH_A } } } : r; } }))
-      .toMatchObject({ status: "refused", step: "S0", members: [expect.objectContaining({ reason: "identity-drift", detail: expect.stringContaining("verification report") }), expect.anything()] });
+      .toMatchObject({ status: "refused", step: "S5", members: [expect.objectContaining({ reason: "identity-drift", detail: expect.stringContaining("verification report") }), expect.anything()] });
     let captures = 0;
-    expect(await f.run({ captureDestinationIdentity: async () => { captures += 1; return captures === 3 ? { version: 1, sealedWitnessSha256: HASH_A, systemIdentifier: "712345" } : { version: 1, ...f.deps.identity }; } }))
+    expect(await f.run({ captureDestinationIdentity: async () => { captures += 1; return captures === 1 ? { version: 1, sealedWitnessSha256: HASH_A, systemIdentifier: "712345" } : { version: 1, ...f.deps.identity }; } }))
       .toMatchObject({ status: "refused", step: "S5", members: [expect.objectContaining({ reason: "identity-drift" }), expect.anything()] });
     captures = 0;
     expect(await f.run({ captureDestinationIdentity: async () => { captures += 1; return captures === 6 ? { version: 1, sealedWitnessSha256: HASH_A, systemIdentifier: "712345" } : { version: 1, ...f.deps.identity }; } }))

@@ -92,8 +92,8 @@ export type GrantProfile = "transfer" | "runtime" | "none";
 /**
  * One of a row's login roles. A single-generation row owns two: the transfer role that copy and verification use
  * (`LCM_POSTGRES_URL`) and the distinct daemon runtime role that activation proves (`LCM_POSTGRES_RUNTIME_URL`),
- * in the documented grant-first order. A set row owns the same pair but swaps the transfer role's grants, as
- * `activate --set` is still transfer-only.
+ * in the documented grant-first order. A set row owns the same pair: it grants the runtime profile before
+ * activation proves that role, then revokes the transfer role after activation succeeds.
  */
 export interface RehearsalRole {
   readonly name: string;
@@ -164,7 +164,7 @@ export async function provisionRole(db: PostgreSqlTestDatabase, role: RehearsalR
   role.profile = "transfer";
 }
 
-/** The operator's grant swap (the set rows' swap, and its reverse): drop the role's grants and install the other profile. */
+/** Replace one test role's grants with the requested profile. */
 export async function swapGrants(db: PostgreSqlTestDatabase, role: RehearsalRole, profile: GrantProfile, signal?: AbortSignal): Promise<void> {
   await applyProfile(db, role.name, profile, signal);
   role.profile = profile;
@@ -712,9 +712,9 @@ export class RehearsalCase {
     readonly spec: ScenarioSpec,
     readonly manifest: Manifest,
     readonly db: PostgreSqlTestDatabase,
-    /** The transfer role (a set row's one swapped role). */
+    /** The transfer role used through verification and revoked after activation. */
     readonly role: RehearsalRole,
-    /** The distinct daemon runtime role a single-generation activation proves; a set row never grants it. */
+    /** The distinct daemon runtime role granted before and proved by activation. */
     readonly runtime: RehearsalRole,
     public h: RehearsalHome,
   ) {
@@ -1851,6 +1851,7 @@ export type SetActivationInterruption =
 export async function interruptSetActivation(c: RehearsalCase, interruption: SetActivationInterruption, targetConfig: ReturnType<typeof targetConfigFor>): Promise<string> {
   let fired = false;
   const label = interruption.kind === "crash-point" ? interruption.point : interruption.phase;
+  const ordinarySettings = { ...settings(c.role.url), url: c.runtime.url };
   const outcome = await withOperatorEnv(c, c.h, async () => {
     const base = createCutoverSetActivateDependencies({ homeDir: c.h.home });
     const dependencies: CutoverSetActivateDependencies = interruption.kind === "crash-point"
@@ -1867,7 +1868,13 @@ export async function interruptSetActivation(c: RehearsalCase, interruption: Set
         }),
       };
     try {
-      const result = await activateCutoverSet({ homeDir: c.h.home, confirmSetId: c.gen, targetConfig, signal: c.signal }, dependencies);
+      const result = await activateCutoverSet({
+        homeDir: c.h.home,
+        confirmSetId: c.gen,
+        targetConfig,
+        ordinarySettings,
+        signal: c.signal,
+      }, dependencies);
       return "returned:" + result.status;
     } catch (error) {
       if (error instanceof InjectedInterruption) return "interrupted";

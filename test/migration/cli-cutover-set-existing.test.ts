@@ -141,6 +141,58 @@ describe("activate --set", () => {
     expect(calls).toBe(0);
   });
 
+  it("requires the runtime URL only when set activation actually runs", async () => {
+    let calls = 0;
+    const activate = async () => { calls += 1; return activated("fresh"); };
+    const missing = envelope("activate", await run(PREPARED, {}, {
+      activate: activate as never,
+      resolveRuntimeSettings: () => ({ status: "refuse", reason: "activation-runtime-target-missing" }),
+    }));
+    expect(missing).toMatchObject({ exitCode: 2, refusal: { reason: "activation-runtime-target-missing" } });
+    expect(calls).toBe(0);
+
+    const preview = envelope("activate", await run(PREPARED, {}, {
+      activate: activate as never,
+      resolveRuntimeSettings: () => { throw new Error("runtime URL must not be read for dry-run"); },
+    }, { dryRun: true }));
+    expect(preview).toMatchObject({ exitCode: 5, refusal: { reason: "set-preview-not-predictive" } });
+    expect(calls).toBe(0);
+  });
+
+  it("passes a strictly resolved runtime URL without rendering its secret", async () => {
+    const secret = "postgresql://runtime:set-secret@example.invalid/lcm";
+    let ordinaryUrl: string | undefined;
+    const result = envelope("activate", await run(PREPARED, {
+      status: "refused",
+      setId: SET_ID,
+      step: "S6",
+      reason: "target-unhealthy",
+      detail: "schema-mismatch",
+      failures: [],
+      members: members("verified"),
+      effectBegun: false,
+    }, {
+      resolveRuntimeSettings: ({ transferSettings }) => ({
+        status: "resolved",
+        settings: { ...transferSettings, url: secret },
+      }),
+      activate: (async (input: Parameters<MigrationSetOperations["activate"]>[0]) => {
+        ordinaryUrl = input.ordinarySettings.url;
+        return {
+          status: "refused", setId: SET_ID, step: "S6", reason: "target-unhealthy",
+          detail: "schema-mismatch", failures: [], members: members("verified"), effectBegun: false,
+        };
+      }) as never,
+    }));
+    expect(ordinaryUrl).toBe(secret);
+    expect(JSON.stringify(result)).not.toContain("set-secret");
+
+    const invalid = envelope("activate", await run(PREPARED, {}, {
+      resolveRuntimeSettings: () => ({ status: "refuse", reason: "activation-runtime-target-missing" }),
+    }));
+    expect(invalid).toMatchObject({ exitCode: 2, refusal: { reason: "activation-runtime-target-missing" } });
+  });
+
   it("maps a refusal into its bucket and keeps every failing member", async () => {
     const refused = (reason: string, extra: object = {}) => ({ status: "refused", setId: SET_ID, step: "S2", reason, detail: "x", failures, members: members("verified"), effectBegun: false, ...extra });
     const stale = envelope("activate", await run(PREPARED, refused("cutover-set-member-evidence-stale")));
@@ -179,18 +231,16 @@ describe("activate --set", () => {
   it("reads every member back before success and applies the restart matrix", async () => {
     const fresh = envelope("activate", await run(ACTIVATED, activated("fresh"), {}, {}, active));
     expect(fresh).toMatchObject({
-      exitCode: 0, applied: true, manifestPhase: "active", next: "swap-grants-then-start-daemon", restart: { answer: "satisfied", presence: "absent" },
-      evidence: { setState: "settled-activated", publicationId: "pub-1", resumedFrom: "fresh", grantSwap: "required-before-daemon-start", "member.0.state": "active" },
+      exitCode: 0, applied: true, manifestPhase: "active", next: "revoke-transfer-grants-then-start-daemon", restart: { answer: "satisfied", presence: "absent" },
+      evidence: { setState: "settled-activated", publicationId: "pub-1", resumedFrom: "fresh", transferGrantRevocation: "required-before-daemon-start", "member.0.state": "active" },
     });
     expect(envelope("activate", await run(ACTIVATED, activated("settled-active"), {}, {}, active))).toMatchObject({ exitCode: 0, applied: false });
     const stale = envelope("activate", await run(ACTIVATED, activated("fresh"), { combineRestart: async () => STALE as never }, {}, active));
-    // The set's exit 8 renders the set swap remedy (runtime grants added, then transfer grants revoked), never the
-    // single-generation revoke-only remedy of the shared restart reason.
     expect(stale).toMatchObject({
-      exitCode: 8, next: "swap-grants-then-start-daemon", applied: true,
-      refusal: { reason: "set-restart-required", remedy: expect.stringMatching(/^The set's durable selection is correct.*add the runtime grants to the daemon runtime role, then revoke the transfer grants.*report --set/u) },
+      exitCode: 8, next: "revoke-transfer-grants-then-start-daemon", applied: true,
+      refusal: { reason: "set-restart-required", remedy: expect.stringMatching(/^The set's durable selection is correct.*revoke the transfer grants.*report --set/iu) },
     });
-    expect((stale.refusal as { remedy: string }).remedy).not.toMatch(/proven runtime role/u);
+    expect((stale.refusal as { remedy: string }).remedy).toMatch(/proven runtime role/u);
     const contradiction = envelope("activate", await run(ACTIVATED, activated("settled-active"), { combineRestart: async () => CONTRADICTION as never }, {}, active));
     expect(contradiction).toMatchObject({ exitCode: 5, next: "report --set", applied: false });
     const mismatch = envelope("activate", await run(ACTIVATING, activated("fresh"), {}, {}, prepared));

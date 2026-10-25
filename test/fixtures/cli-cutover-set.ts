@@ -101,6 +101,7 @@ export function setOperations(
     observeJournal: () => parts?.journal ?? ABSENT_JOURNAL,
     observation: observation(parts),
     resolveTargetConfig: () => ({ status: "resolved", config: targetConfig() }),
+    resolveRuntimeSettings: ({ transferSettings }) => ({ status: "resolved", settings: transferSettings }),
     classifyPresence: async () => ({ status: "authoritatively-absent" }),
     verifyReachability: async () => ({ status: "verified" }),
     ...extra,

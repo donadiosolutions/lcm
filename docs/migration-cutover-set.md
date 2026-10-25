@@ -28,9 +28,10 @@ lcm migration plan --set --json                        # prints the set id as "g
 lcm migration apply --set --confirm-generation <set-id> --json
 lcm migration report --set --generation <set-id> --json
 lcm migration verify --set --generation <set-id> --confirm-generation <set-id> --json
+# apply the reviewed runtime grants and set LCM_POSTGRES_RUNTIME_URL
 lcm migration activate --set --generation <set-id> --confirm-generation <set-id> \
   --confirm-backend postgresql --json
-# swap the grants (add the runtime grants, revoke the transfer grants), then start the daemon
+# revoke the transfer grants, set LCM_POSTGRES_URL to the proven runtime role, then start the daemon
 lcm migration report --set --generation <set-id> --json   # until it exits 0
 ```
 
@@ -46,13 +47,24 @@ lcm migration report --set --generation <set-id> --json   # until it exits 0
    `resume --set` continues from each member's durable state.
 3. **Confirm.** `verify --set` confirms that persisted evidence; it does not
    recompute a verification. Its `--dry-run` never exits 0.
-4. **Activate.** `activate --set` revalidates every member and publishes the
-   set once. After exit 0 the grants are swapped and the daemon started as for
+4. **Activate.** Apply the runtime grants, set `LCM_POSTGRES_RUNTIME_URL`, then
+   run `activate --set`; it revalidates every member, proves the runtime role,
+   and publishes the set once. After exit 0 revoke the transfer grants and
+   start the daemon as for
    a single generation; the operator steps are in
-   [the cutover section](migration-operations.md#the-cutover-activate-and-the-grant-swap).
+   [the cutover section](migration-operations.md#the-cutover-activate-and-revoke-transfer-grants).
    The run exits 8 when a live daemon still holds the old backend.
 5. **Roll back, if needed.** `rollback --set` with the **original** set id.
 6. **Release a held preparation.** `abort --set --confirm-generation <set-id>`.
+
+A set prepared or interrupted by an older LCM build needs the reviewed runtime
+grants and `LCM_POSTGRES_RUNTIME_URL` before the current build can activate or
+roll it forward. During the grant-first window, no-peer runtime callers such as
+the daemon, diagnostics, and the set rollback target check refuse until the
+transfer grants are revoked. `resume --set` reads the runtime URL only when its
+durable route continues activation; settled, prepare, rollback, and abort routes
+do not require it. A direct `activate --set` still invokes activation for an
+already settled set and therefore requires the URL.
 
 Three rules keep the identifiers straight. The id every command takes is the
 original aggregate set id, including for `rollback` and for resuming one. The

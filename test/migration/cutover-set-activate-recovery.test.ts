@@ -145,6 +145,53 @@ describe("activateCutoverSet: crash at every boundary resumes to all-old or all-
     expect(g.deps.prepareCalls).toBe(1);
   });
 
+  it("post-selection role discovery interrupts before the first fence read", async () => {
+    const f = await fixture();
+    await expect(f.run({
+      crashPoint: (point) => { if (point === "after-selection-completed") throw new Error("boom"); },
+    })).rejects.toThrow("boom");
+    f.guard.calls.length = 0;
+    const outcome = await f.run({
+      readRoleIdentity: async () => ({
+        currentUser: "lcm_runtime",
+        sessionUser: "lcm_runtime",
+        oid: "101",
+        tls: true,
+      }),
+    });
+    expect(outcome).toMatchObject({
+      status: "interrupted",
+      step: "S9",
+      cause: "state-unresolvable",
+      effectBegun: true,
+      detail: expect.stringContaining("S6 target-unhealthy"),
+    });
+    expect(f.guard.calls).toEqual([]);
+  });
+
+  it("post-selection ordinary binding interrupts before the first fence read", async () => {
+    const f = await fixture();
+    await expect(f.run({
+      crashPoint: (point) => { if (point === "after-selection-completed") throw new Error("boom"); },
+    })).rejects.toThrow("boom");
+    f.guard.calls.length = 0;
+    const outcome = await f.run({
+      captureDestinationIdentity: async () => ({
+        version: 1,
+        sealedWitnessSha256: HASH_A,
+        systemIdentifier: f.deps.identity.systemIdentifier,
+      }),
+    });
+    expect(outcome).toMatchObject({
+      status: "interrupted",
+      step: "S9",
+      cause: "state-unresolvable",
+      effectBegun: true,
+      detail: expect.stringContaining("S5"),
+    });
+    expect(f.guard.calls).toEqual([]);
+  });
+
   it("the coordinator crashes mid-publication (map published, config not): the version-2 journal resumes, never a second prepare", async () => {
     const f = await fixture();
     let crashed = false;

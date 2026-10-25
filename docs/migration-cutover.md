@@ -1096,8 +1096,8 @@ strict. Fresh `verify`, copy resume, and target reachability refuse while the
 runtime grants exist; revoke the runtime grants before using those pre-activate
 recovery paths. Runtime-profile callers such as rollback, diagnostics, and
 daemon readiness refuse until the transfer grants are removed. An interrupted
-activation resumes through `activate`, which remains peer-aware. Cutover-set
-activation is still transfer-only and does not use this ordering yet.
+activation, including a cutover-set activation, resumes through `activate`,
+which remains peer-aware.
 
 Readiness evaluates live ACLs. PostgreSQL default privileges are not admission
 evidence and are not inspected here; if they materialize an unexpected grant

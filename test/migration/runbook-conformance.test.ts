@@ -1,4 +1,5 @@
 import { readFileSync } from "node:fs";
+import { join } from "node:path";
 import { Command } from "commander";
 import { describe, expect, it, vi } from "vitest";
 import {
@@ -152,6 +153,17 @@ describe("runbook prose: the obligations the cutover commands add (no mechanical
     }
     expect(cutover.indexOf("Apply the reviewed runtime grants")).toBeLessThan(cutover.indexOf("lcm migration activate"));
     expect(cutover.indexOf("Revoke the transfer grants")).toBeLessThan(cutover.indexOf("Start (or restart) the daemon"));
+  });
+
+  it("uses the same grant-first order for cutover sets", () => {
+    const setRunbook = readFileSync(join(process.cwd(), "docs/migration-cutover-set.md"), "utf8");
+    const runtime = setRunbook.indexOf("apply the reviewed runtime grants");
+    const activate = setRunbook.indexOf("lcm migration activate --set");
+    const revoke = setRunbook.indexOf("revoke the transfer grants");
+    expect(runtime).toBeGreaterThan(-1);
+    expect(runtime).toBeLessThan(activate);
+    expect(activate).toBeLessThan(revoke);
+    expect(setRunbook).toContain("LCM_POSTGRES_RUNTIME_URL");
   });
 
   it("states rollback's remote-binding refusal (A14) in the rollback reference and the limits section", () => {
