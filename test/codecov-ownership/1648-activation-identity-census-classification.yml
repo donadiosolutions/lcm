@@ -1,0 +1,10 @@
+references: ["#1648"]
+rationale: >-
+  Migration activation attributes a failed destination identity query at S0,
+  S5 and S7, and a failed S7 census read, to the target-unhealthy or
+  target-unresolvable refusal vocabulary (or an interruption on re-entry)
+  instead of rejecting the activation; cancellations still reject. The
+  orchestrator stays in migration cutover. No production file is added,
+  removed, moved, or re-owned.
+pins:
+  - ["src/migration/activate-generation.ts", "unit-migration-cutover"]

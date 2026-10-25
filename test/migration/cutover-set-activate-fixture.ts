@@ -207,6 +207,13 @@ export class FakeLeaseGuard implements ActivationLeasePublicationGuard {
     return released;
   }
 
+  /** The release-reconciliation read (Bug #1651): the row whichever generation it names, like the real guard's. */
+  async readForReleaseReconciliation(input: Pick<PostgreSqlBackendPublicationMutationInput, "projectId" | "signal">): Promise<PostgreSqlBackendPublicationFence | null> {
+    this.calls.push("read:" + input.projectId);
+    this.admit("read", input.signal);
+    return this.rows.get(input.projectId) ?? null;
+  }
+
   async read(input: Pick<PostgreSqlBackendPublicationMutationInput, "projectId" | "targetBackend" | "evidenceSha256" | "signal">): Promise<PostgreSqlBackendPublicationFence | null> {
     this.calls.push("read:" + input.projectId);
     this.admit("read", input.signal);

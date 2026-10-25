@@ -3,8 +3,13 @@ import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { ensureAuthToken, readAuthToken } from "../../../src/daemon/auth.js";
-import { loadDaemonConfig, readDaemonConfigSnapshot } from "../../../src/daemon/config.js";
+import { loadDaemonConfig, readDaemonConfigBackendSnapshot, readDaemonConfigSnapshot } from "../../../src/daemon/config.js";
 import { createDaemon, type DaemonInstance, type DaemonOptions } from "../../../src/daemon/server.js";
+import { checkActivationRestartAdmission } from "../../../src/migration/activation-restart-check.js";
+import { combineMigrationRestart } from "../../../src/migration/cli-restart.js";
+import { classifyMigrationDaemonPresence } from "../../../src/migration/daemon-presence.js";
+import { daemonPidPath } from "../../../src/runtime-paths.js";
+import { createBackendPublicationCoordinator } from "../../../src/storage/backend-publication-driver.js";
 import { createStorageBackendFactory } from "../../../src/storage/factory.js";
 import { makeStagedPostgreSqlStorageFactory } from "./mock-storage-factory.js";
 
@@ -161,6 +166,151 @@ describe("authenticated daemon identity observation", () => {
     expect(health).toHaveBeenCalledTimes(1);
   });
 
+  /** Publish a real PostgreSQL selection under the fixture home while the daemon keeps its startup SQLite backend. */
+  async function selectPostgreSqlOnDisk(port?: number, extra: Record<string, unknown> = {}) {
+    const caPath = join(home, "ca.pem");
+    writeFileSync(caPath, "-----BEGIN CERTIFICATE-----\ntest\n-----END CERTIFICATE-----\n", { mode: 0o600 });
+    vi.stubEnv("LCM_POSTGRES_URL", "postgresql://user:secret@db.example.test/lcm");
+    vi.stubEnv("LCM_POSTGRES_CA_FILE", caPath);
+    vi.stubEnv("LCM_POSTGRES_MIGRATION_ROLE", "lcm_test_migrator");
+    writeFileSync(configPath, JSON.stringify({ storage: { backend: "postgresql" }, ...(port === undefined ? {} : { daemon: { port } }), ...extra }) + "\n", { mode: 0o600 });
+    const coordinator = createBackendPublicationCoordinator({ homeDir: home, remoteGuard: { mode: "absent", acknowledged: true } });
+    const held = await coordinator.enterMaintenance({
+      publicationId: "observe-divergence",
+      generationId: "observe-generation",
+      sourceSelectionSha256: "a".repeat(64),
+      queueEvidenceSha256: "b".repeat(64),
+      roster: [{ machineId: "018f0b5d-1234-7abc-8def-1234567890ab", queueCutoff: null, evidenceSha256: "a".repeat(64) }],
+    });
+    const prepared = await coordinator.prepareMaintenanceSelection({
+      expectedChecksumSha256: held.checksumSha256,
+      generationId: held.generationId,
+      targetBackend: "postgresql",
+      terminalEvidenceSha256: "c".repeat(64),
+    });
+    await coordinator.completeMaintenanceSelection({
+      expectedChecksumSha256: prepared.checksumSha256,
+      generationId: prepared.generationId,
+      terminalEvidenceSha256: prepared.terminalEvidenceSha256!,
+    });
+  }
+
+  it("answers identity while the on-disk backend diverges from the startup backend after a completed selection", async () => {
+    const url = await start();
+    await selectPostgreSqlOnDisk();
+    const response = await fetch(`${url}/health/observe`, { headers });
+    expect(response.status).toBe(200);
+    expect(await response.json()).toMatchObject({
+      observation: "identity-only", storageBackend: "sqlite", storage: { status: "unverified" },
+    });
+    const other = await fetch(`${url}/status`, { method: "POST", headers, body: "{}" });
+    expect(other.status).toBe(503);
+  });
+
+  it("lets the migration restart matrix classify a stale daemon as restart-required", async () => {
+    const url = await start();
+    const port = Number(new URL(url).port);
+    await selectPostgreSqlOnDisk(port);
+    writeFileSync(daemonPidPath(home), String(process.pid) + "\n", { mode: 0o600 });
+    const presence = await classifyMigrationDaemonPresence({ homeDir: home });
+    expect(presence).toMatchObject({ status: "present", storageBackend: "sqlite", pid: process.pid });
+    const verdict = await checkActivationRestartAdmission({ selectedBackend: "postgresql", pidFilePath: daemonPidPath(home), port });
+    expect(verdict).toMatchObject({ status: "unsatisfied", reason: "backend-stale", observedBackend: "sqlite" });
+    expect(combineMigrationRestart(verdict, presence, "postgresql").class).toBe("required");
+  });
+
+  /** The stale daemon started on SQLite before the operator exported the PostgreSQL URL, CA file and migration role. */
+  function withoutPostgreSqlSecrets(): void {
+    vi.stubEnv("LCM_POSTGRES_URL", undefined);
+    vi.stubEnv("LCM_POSTGRES_CA_FILE", undefined);
+    vi.stubEnv("LCM_POSTGRES_MIGRATION_ROLE", undefined);
+  }
+
+  it("answers identity for the composer-shaped on-disk PostgreSQL selection when the stale daemon lacks every PostgreSQL secret", async () => {
+    const url = await start();
+    await selectPostgreSqlOnDisk();
+    withoutPostgreSqlSecrets();
+    const response = await fetch(url + "/health/observe", { headers });
+    expect(response.status).toBe(200);
+    expect(await response.json()).toMatchObject({
+      observation: "identity-only", storageBackend: "sqlite", storage: { status: "unverified" },
+    });
+    const other = await fetch(url + "/status", { method: "POST", headers, body: "{}" });
+    expect(other.status).toBe(503);
+  });
+
+  it("lets the migration restart matrix classify a stale daemon without PostgreSQL secrets as restart-required", async () => {
+    // The operator shell (this process) exports the secrets; only the stale daemon's own environment lacks them.
+    const url = await start({
+      _readDaemonConfigSnapshot: path => readDaemonConfigSnapshot(path, {}),
+      _readDaemonConfigBackendSnapshot: path => readDaemonConfigBackendSnapshot(path, {}),
+    });
+    const port = Number(new URL(url).port);
+    await selectPostgreSqlOnDisk(port);
+    writeFileSync(daemonPidPath(home), String(process.pid) + "\n", { mode: 0o600 });
+    const presence = await classifyMigrationDaemonPresence({ homeDir: home });
+    expect(presence).toMatchObject({ status: "present", storageBackend: "sqlite", pid: process.pid });
+    const verdict = await checkActivationRestartAdmission({ selectedBackend: "postgresql", pidFilePath: daemonPidPath(home), port });
+    expect(verdict).toMatchObject({ status: "unsatisfied", reason: "backend-stale", observedBackend: "sqlite" });
+    expect(combineMigrationRestart(verdict, presence, "postgresql").class).toBe("required");
+  });
+
+  it("still refuses identity without publication evidence when the daemon lacks PostgreSQL secrets", async () => {
+    const url = await start();
+    writeFileSync(configPath, '{"storage":{"backend":"postgresql"}}\n', { mode: 0o600 });
+    withoutPostgreSqlSecrets();
+    const response = await fetch(url + "/health/observe", { headers });
+    expect(response.status).toBe(503);
+    expect(await response.json()).toEqual({ status: "blocked", error: "backend publication admission blocked" });
+  });
+
+  it.each([
+    ["LCM_POSTGRES_URL", "mysql://user:secret@db.example.test/lcm"],
+    ["LCM_POSTGRES_CA_FILE", "relative-ca.pem"],
+    ["LCM_POSTGRES_MIGRATION_ROLE", "r".repeat(64)],
+  ])("still validates a present %s while answering identity", async (name, value) => {
+    const url = await start();
+    await selectPostgreSqlOnDisk();
+    withoutPostgreSqlSecrets();
+    vi.stubEnv(name, value);
+    const response = await fetch(url + "/health/observe", { headers });
+    expect(response.status).toBe(500);
+    expect(await response.json()).toHaveProperty("error");
+  });
+
+  it("still refuses identity when another config section is malformed", async () => {
+    const url = await start();
+    await selectPostgreSqlOnDisk(undefined, { llm: { provider: "not-a-provider" } });
+    withoutPostgreSqlSecrets();
+    const response = await fetch(url + "/health/observe", { headers });
+    expect(response.status).toBe(500);
+    expect(await response.json()).toHaveProperty("error");
+  });
+
+  it("still refuses identity when the on-disk backend has no publication evidence", async () => {
+    const url = await start();
+    vi.stubEnv("LCM_POSTGRES_URL", "postgresql://user:secret@db.example.test/lcm");
+    vi.stubEnv("LCM_POSTGRES_CA_FILE", join(home, "ca.pem"));
+    vi.stubEnv("LCM_POSTGRES_MIGRATION_ROLE", "lcm_test_migrator");
+    writeFileSync(join(home, "ca.pem"), "-----BEGIN CERTIFICATE-----\ntest\n-----END CERTIFICATE-----\n", { mode: 0o600 });
+    writeFileSync(configPath, '{"storage":{"backend":"postgresql"}}\n', { mode: 0o600 });
+    const response = await fetch(url + "/health/observe", { headers });
+    expect(response.status).toBe(503);
+    expect(await response.json()).toEqual({ status: "blocked", error: "backend publication admission blocked" });
+  });
+
+  it("refuses identity when the diverged config changes during observation", async () => {
+    let reads = 0;
+    const url = await start({ _readDaemonConfigBackendSnapshot: path => {
+      if (++reads === 3) writeFileSync(configPath, '{"storage":{"backend":"postgresql"}} \n', { mode: 0o600 });
+      return readDaemonConfigBackendSnapshot(path);
+    } });
+    await selectPostgreSqlOnDisk();
+    const response = await fetch(url + "/health/observe", { headers });
+    expect(response.status).toBe(503);
+    expect(await response.json()).toEqual({ status: "blocked", error: "backend publication admission blocked" });
+  });
+
   it("refuses a malformed publication journal without returning observed identity", async () => {
     const url = await start();
     const publication = join(home, ".lcm", "backend-publication");
@@ -185,9 +335,9 @@ describe("authenticated daemon identity observation", () => {
 
   it.each(["before", "after"])("refuses a config witness changed %s observation", async when => {
     let reads = 0;
-    const url = await start({ _readDaemonConfigSnapshot: path => {
+    const url = await start({ _readDaemonConfigBackendSnapshot: path => {
       if (++reads === 3 && when === "after") writeFileSync(configPath, "{ }\n", { mode: 0o600 });
-      return readDaemonConfigSnapshot(path);
+      return readDaemonConfigBackendSnapshot(path);
     } });
     if (when === "before") writeFileSync(configPath, "invalid config", { mode: 0o600 });
     const response = await fetch(`${url}/health/observe`, { headers });
