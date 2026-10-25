@@ -248,9 +248,9 @@ sections where available.
 | Turn end | `Stop` | The transcript delta is ingested synchronously, at most once per `hooks.snapshotIntervalSec` (default 60 s, see [configuration](configuration.md#snapshot-throttle-codex)) for a session. A `Stop` inside the interval skips ingestion; a later eligible `Stop` or `PreCompact` can attempt to ingest the remaining delta, and `Interrupt` and `SessionEnd` make a best-effort terminal hand-off. `SubagentStop` bypasses the throttle for the child's own transcript only. Initial ingestion, throttle skipping, `PreCompact` recovery and `SessionEnd` recovery (in the exercised runs) were observed; recovery by a later `Stop` or by `Interrupt` was not isolated. | Verified (ordinary snapshot/throttle); recovery Best-effort |
 | Interruption | `Interrupt` | The interrupted turn's text and abort marker are saved. See [terminal hooks](#saving-memory-when-a-turn-is-interrupted-or-a-session-ends). | Verified |
 | Session end | `SessionEnd` | Saved when Codex unloads an idle thread, exits `codex exec`, or shuts down gracefully (with a running turn: `Interrupt`, then `SessionEnd`). Crash and `kill -9` recovery were not exercised and have no guaranteed final terminal capture; transcript data since the last successful save may be lost. | Verified (graceful); crash Not covered |
-| Subagent start | `SubagentStart` | The child's first request normally carries a restoration block, but it can be skipped when the hook overlaps the parent's `PostToolUse` hook: 3 of 6 spawns missed it natively ([#1635](https://github.com/donadiosolutions/lcm/issues/1635)). | Best-effort |
+| Subagent start | `SubagentStart` | The child's first request normally carries a restoration block. When the hook overlaps the parent's `PostToolUse` hook, it waits for the publication lock for up to 5 seconds in total, and the daemon waits up to 3 seconds for the same lock before it builds the restoration. Before this wait, 3 of 6 native spawns missed the block ([#1635](https://github.com/donadiosolutions/lcm/issues/1635)). The wait was verified with injected contention, not natively. A lock held for longer than the wait still skips the restoration without output. | Best-effort |
 | Subagent stop | `SubagentStop` | The child is stored as its own session with its parent recorded (6 of 6). `Interrupt` and `SessionEnd` do not run for subagents. | Verified |
-| Several sessions at once in one project | all | Under backend-publication lock contention a `Stop` ingest or `SessionEnd` hand-off can be skipped without retry. Some skipped `Stop` captures appeared later by `SessionEnd`, but at least one paired-session run and one four-way terminal run left a session absent at final readback ([#1634](https://github.com/donadiosolutions/lcm/issues/1634)). `PostToolUse` observations were retained for the exercised tool calls. A later successful snapshot may recover remaining transcript data; import recovery was not exercised here. | Best-effort |
+| Several sessions at once in one project | all | When another process holds the backend-publication lock, a `Stop` or `SubagentStop` snapshot waits for it for up to 5 seconds in total, and the daemon waits up to 3 seconds before it ingests; an `Interrupt` or `SessionEnd` hand-off waits for up to half of its remaining time budget, and the daemon waits up to 30 seconds before it ingests an accepted hand-off. A lock held for longer than that window still drops the snapshot or hand-off without a retry. Before this wait, some skipped `Stop` captures appeared later by `SessionEnd`, but at least one paired-session run and one four-way terminal run left a session absent at final readback ([#1634](https://github.com/donadiosolutions/lcm/issues/1634)). `PostToolUse` observations were retained for the exercised tool calls. A later successful snapshot may recover remaining transcript data; import recovery was not exercised here. | Best-effort |
 | MCP bundle | same hooks | Startup, prompt hints, MCP tool capture, `Stop` and `SessionEnd` were verified; the hook definitions match the CLI bundle except the `UserPromptSubmit` command. Compaction, fork, subagent and interrupt were not run with MCP. | Verified (subset); rest Unverified |
 | Desktop and IDE builds, macOS, Windows, profile or session-flag hook trust | all | Not exercised; `lcm connectors doctor codex` checks only the base user config. | Unverified |
 
@@ -346,7 +346,9 @@ kills the process group at the limit. The command therefore never starts, repair
 or configures the daemon. It checks that the daemon already running for this
 installation is the expected one (process, listener, version, storage backend,
 program and runtime digest, and your token), then hands the transcript path to it
-and exits. The daemon reads, scrubs and stores the transcript after the command
+and exits. If another process holds the publication lock at that moment, the command
+pauses briefly and tries again for up to half of the time it has left to send, then
+logs `publication-refused`. The daemon reads, scrubs and stores the transcript after the command
 has gone, using the same ingest as every other snapshot. Nothing is compacted,
 promoted or marked complete by these hooks; Codex's `SessionEnd` does not use
 `lcm session-end`.
@@ -360,7 +362,7 @@ directory) under the event name `Interrupt`, `SessionEnd` or `TerminalSnapshot`:
 | `transcript-unavailable` | Codex gave no transcript, or it is not a readable regular file |
 | `invalid-input` | The hook payload was malformed, incomplete or over 1 MiB |
 | `daemon-unavailable` | No running, expected daemon could be verified in time; nothing was started |
-| `publication-refused` | Backend publication admission blocked the hand-off; nothing was sent |
+| `publication-refused` | Backend publication admission blocked the hand-off, or another process kept the publication lock for the whole time the hook was willing to wait; nothing was sent |
 | `deadline-exhausted` | The hook ran out of its time budget before it could send |
 | `ingest-failed` | The daemon refused the request or answered with an error |
 | `unconfirmed` | The request was sent but no acknowledgment arrived in time; the daemon may or may not have received it |
@@ -369,7 +371,9 @@ No line means the daemon acknowledged the request (HTTP 202). From that point th
 daemon owns the work: it keeps running the ingest even if Codex has killed the
 hook, and it stays running until accepted work finishes. Accepted work can still be
 lost if the daemon itself is stopped or killed first, or if it cannot finish within
-30 seconds of being accepted or while the daemon is shutting down. The daemon
+30 seconds of being accepted or while the daemon is shutting down. The 30 seconds
+include any time the daemon waits for another process to release the publication
+lock before it starts. The daemon
 accepts at most eight sessions at a time and answers 503 beyond that; an `Interrupt`
 followed closely by `SessionEnd` for one session is combined so the newest
 transcript tail is read once more rather than duplicated.

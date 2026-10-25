@@ -32,7 +32,15 @@ compaction) when `LCM_ENABLED=false`; see
   preflight still do.
 - Ordinary publication-lock contention follows each hook's own bounded policy.
   Admission fences and the pre-handler configuration load treat it as a
-  best-effort outcome (exit `0`). UserPromptSubmit's durable local enqueue is
+  best-effort outcome (exit `0`). Restore (`SessionStart`, `SubagentStart`),
+  compact and session-snapshot (`Stop`, `SubagentStop`, `PreCompact`) first
+  wait for a lock held by another live process: the pre-handler configuration
+  load, daemon admission and the fences before each daemon request share one
+  allowance of 5 seconds, in pauses of 50 ms, and only then take the best-effort
+  outcome. Session-end, which runs under a much shorter host timeout, shares
+  an allowance of 300 ms. Contention without a live owner in another process
+  and journal errors never wait. The Codex terminal `Interrupt` and `SessionEnd`
+  hand-off waits inside its own time budget (see below). UserPromptSubmit's durable local enqueue is
   retry-required: it exits non-zero if its append barrier stays busy past the
   bounded wait.
 - Malformed, tampered, or unresolved publication evidence still fails closed
@@ -664,6 +672,10 @@ cannot change the outcome. The exit code is always `0`, stdout is always empty, 
 every outcome except accepted writes one line to `~/.lcm/logs/events.log` with the
 reason (`transcript-unavailable`, `invalid-input`, `daemon-unavailable`,
 `publication-refused`, `deadline-exhausted`, `ingest-failed`, `unconfirmed`).
+The publication fence before the request waits for a lock held by another live
+process in pauses of 50 ms, for at most half of the time left in the post phase,
+so the request and the outcome reserve keep their budget; a lock still held after
+that logs `publication-refused`.
 
 ### POST /ingest/terminal
 
@@ -682,7 +694,12 @@ for a key that is already running is kept as one pending request and re-run afte
 the current one finishes, so the newest transcript tail is read; repeated requests
 combine. Each accepted request has an absolute 30 second cancellation deadline
 counted from acceptance, and daemon shutdown cancels it; both are best-effort
-cancellation, not a guarantee that the work stops at that instant. The daemon does
+cancellation, not a guarantee that the work stops at that instant. If another
+process holds the backend-publication lock, the run waits for it inside that
+deadline instead of failing, and it never repeats work that has started. The
+ordinary `POST /ingest` and `POST /restore` routes wait the same way until
+3 seconds after the request's first wait, across all of its admissions, before
+they fail. The daemon does
 not become idle while accepted work remains, and shutdown waits for the queue
 before it closes shared storage. The outcome of each deferred run (captured, no
 new observations, cancelled, blocked, failed or expired) is logged by the daemon

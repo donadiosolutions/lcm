@@ -32,7 +32,9 @@ import {
   isBackendPublicationJournalError,
   hookPublicationHome,
   hookPublicationBackend,
+  NO_HOOK_ADMISSION_RETRY,
   withHookPublicationFenceAsync,
+  type HookAdmissionRetry,
 } from "./publication-fence.js";
 import { withBackendPublicationAppendBarrierAsync } from "../storage/backend-publication.js";
 import { resolveHookSessionScope } from "./subagent-scope.js";
@@ -208,6 +210,7 @@ export async function handleSessionStart(
   client: Pick<DaemonClient, "post">,
   port?: number,
   storage: StorageBackendSelection = { backend: "sqlite" },
+  admissionRetry?: HookAdmissionRetry,
 ): Promise<{ exitCode: number; stdout: string }> {
   const parsed: unknown = JSON.parse(stdin || "{}");
   if (parsed === null || typeof parsed !== "object" || Array.isArray(parsed)) {
@@ -222,7 +225,8 @@ export async function handleSessionStart(
   const daemonPort = port ?? 3737;
   const pidFilePath = daemonPidPath();
   try {
-    assertHookPublicationFence();
+    // Pre-effect check: a live publication-lock owner is waited for briefly.
+    await (admissionRetry ?? NO_HOOK_ADMISSION_RETRY)(() => assertHookPublicationFence());
   } catch (error) {
     if (isBackendPublicationEvidenceMissing(error)) {
       emitAdmissionNotice(undefined, "ambiguous");
@@ -241,7 +245,7 @@ export async function handleSessionStart(
   }
 
   try {
-    return await runSessionStart(input, scope, client, daemonPort, pidFilePath, storage);
+    return await runSessionStart(input, scope, client, daemonPort, pidFilePath, storage, admissionRetry);
   } finally {
     if (sessionId) releaseSessionLock(sessionId);
   }
@@ -254,6 +258,7 @@ async function runSessionStart(
   daemonPort: number,
   pidFilePath: string,
   storage: StorageBackendSelection,
+  admissionRetry: HookAdmissionRetry | undefined,
 ): Promise<{ exitCode: number; stdout: string }> {
   let ensureResult: EnsureResultWithRefusal;
   try {
@@ -263,6 +268,7 @@ async function runSessionStart(
       spawnTimeoutMs: 5000,
       expectedStorageBackend: storage.backend,
       enforceUserManagerParent: true,
+      ...(admissionRetry === undefined ? {} : { _withPublicationAdmissionRetry: admissionRetry }),
     });
   } catch (error) {
     if (isBackendPublicationEvidenceMissing(error)) {
@@ -338,7 +344,7 @@ async function runSessionStart(
 
     // The client owns its network lifecycle; perform only a short admission
     // check immediately before the request and do not retain the lock over it.
-    assertHookPublicationFence();
+    await (admissionRetry ?? NO_HOOK_ADMISSION_RETRY)(() => assertHookPublicationFence());
     const result = await client.post<{ context: string; insights?: Array<{ content: string; confidence: number; tags: string[] }> }>(
       "/restore",
       scope.isSubagent ? { ...input, session_id: scope.sessionId } : input,

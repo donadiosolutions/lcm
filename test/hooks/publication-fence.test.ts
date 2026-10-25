@@ -11,6 +11,9 @@ import {
   withHookPublicationFence,
   withHookPublicationFenceAsync,
   assertHookPublicationFenceToken,
+  HOOK_CONTENTION_WAIT_MS,
+  hookAdmissionRetry,
+  NO_HOOK_ADMISSION_RETRY,
 } from "../../src/hooks/publication-fence.js";
 import {
   BackendPublicationJournalError,
@@ -407,5 +410,58 @@ describe("hook publication fence", () => {
     expect(isBackendPublicationEvidenceMissing(new Error("ordinary"))).toBe(false);
     expect(() => rethrowBackendPublicationJournalError(new Error("ordinary"))).not.toThrow();
     expect(() => rethrowBackendPublicationJournalError(publicationError)).toThrow(publicationError);
+  });
+});
+
+describe("hook admission retry", () => {
+  const liveContention = (): PrivateMutationLockContentionError => new PrivateMutationLockContentionError(
+    "publication lock is busy",
+    {
+      contendedLock: {
+        path: "/lcm/publication.lock",
+        owner: { version: 1, pid: process.pid + 1, processStartTime: null, nonce: "owner" },
+      },
+    },
+  );
+
+  it("runs a step exactly once when nothing opted in", async () => {
+    let attempts = 0;
+    await expect(NO_HOOK_ADMISSION_RETRY(() => {
+      attempts += 1;
+      throw liveContention();
+    })).rejects.toThrow("busy");
+    expect(attempts).toBe(1);
+    await expect(NO_HOOK_ADMISSION_RETRY(() => "value")).resolves.toBe("value");
+  });
+
+  it("allows five seconds of cumulative waiting by default", async () => {
+    const waits: number[] = [];
+    const retry = hookAdmissionRetry({ _wait: async (milliseconds) => { waits.push(milliseconds); } });
+    const failing = (): never => { throw liveContention(); };
+    await expect(retry(failing)).rejects.toThrow("busy");
+    await expect(retry(failing)).rejects.toThrow("busy");
+    expect(HOOK_CONTENTION_WAIT_MS).toBe(5000);
+    expect(waits.reduce((total, milliseconds) => total + milliseconds, 0)).toBe(5000);
+  });
+
+  it("shares the allowance between steps and honors a smaller total", async () => {
+    const waits: number[] = [];
+    const retry = hookAdmissionRetry({ totalMs: 120, _wait: async (milliseconds) => { waits.push(milliseconds); } });
+    let first = 0;
+    await retry(() => { if (++first < 3) throw liveContention(); });
+    const failing = (): never => { throw liveContention(); };
+    await expect(retry(failing)).rejects.toThrow("busy");
+    expect(waits).toEqual([50, 50, 20]);
+  });
+
+  it("stops waiting when its signal aborts", async () => {
+    const controller = new AbortController();
+    controller.abort();
+    let attempts = 0;
+    await expect(hookAdmissionRetry({ signal: controller.signal })(() => {
+      attempts += 1;
+      throw liveContention();
+    })).rejects.toThrow("busy");
+    expect(attempts).toBe(1);
   });
 });

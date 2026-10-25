@@ -33,6 +33,13 @@ import type { VerifiedRunningDaemon, VerifyRunningDaemonOptions } from "./daemon
 
 const MAX_CONFIG_BYTES = 4 * 1024 * 1024;
 
+type PublicationAdmissionRetry = <T>(step: () => T | Promise<T>) => Promise<T>;
+
+/** A caller-supplied retry replaces the dependency's own; none leaves it unchanged. */
+function withAdmissionRetry<D extends EnsureCoreDeps>(deps: D, retry?: PublicationAdmissionRetry): D {
+  return retry === undefined ? deps : { ...deps, _withPublicationAdmissionRetry: retry };
+}
+
 export interface EnsureCoreDeps {
   configPath: string;
   settingsPath: string;
@@ -85,7 +92,11 @@ function defaultDeps(): EnsureCoreDeps {
 
 export type VerifiedCoreEndpoint = { connected: boolean; port: number };
 
-export async function ensureCoreEndpoint(deps: EnsureCoreDeps = defaultDeps()): Promise<VerifiedCoreEndpoint> {
+export async function ensureCoreEndpoint(
+  initialDeps: EnsureCoreDeps = defaultDeps(),
+  admissionRetry?: PublicationAdmissionRetry,
+): Promise<VerifiedCoreEndpoint> {
+  const deps = withAdmissionRetry(initialDeps, admissionRetry);
   const binaryPath = deps.binaryPath ?? packageExecutable(import.meta.url, 2);
   const publicationHome = backendPublicationHomeForConfigPath(deps.configPath);
   if (publicationHome === undefined) {
@@ -259,8 +270,10 @@ function defaultBootstrapDeps(): BootstrapDeps {
 
 export async function ensureBootstrapped(
   sessionId: string,
-  deps: BootstrapDeps = defaultBootstrapDeps(),
+  initialDeps: BootstrapDeps = defaultBootstrapDeps(),
+  admissionRetry?: PublicationAdmissionRetry,
 ): Promise<boolean> {
+  const deps = withAdmissionRetry(initialDeps, admissionRetry);
   const safeId = sessionId.replace(/[^a-zA-Z0-9_-]/g, "_");
   const flagDir = lcmTmpDir();
   const flagPath = join(flagDir, `bootstrapped-${safeId}.flag`);
