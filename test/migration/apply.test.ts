@@ -996,6 +996,81 @@ describe("performMigrationApplyThroughCapture, round-1 fixes (A-3/B-2, A-7, B-5,
     expect(result).toEqual({ status: "refuse", reason, evidence });
   });
 
+  /** Records the hold it was asked to enter, then fails like a write that died between the two journal writes. */
+  class RecordingThrowingEnterCoordinator extends BackendPublicationCoordinator {
+    entered: Parameters<BackendPublicationCoordinator["enterMaintenance"]>[0] | undefined;
+    constructor(homeDir: string, private readonly failure: Error) {
+      super({ homeDir, driver: maintenanceOnlyDriver() });
+    }
+    override async enterMaintenance(input: Parameters<BackendPublicationCoordinator["enterMaintenance"]>[0]): Promise<BackendMaintenanceJournal> {
+      this.entered = input;
+      throw this.failure;
+    }
+  }
+
+  /** The live journal as a failed entry could leave it, bound to the hold the coordinator was just asked for. */
+  const liveJournalFor = (
+    coordinator: RecordingThrowingEnterCoordinator,
+    overrides: Partial<BackendMaintenanceJournal>,
+  ): BackendMaintenanceJournal => ({
+    generationId: coordinator.entered!.generationId,
+    sourceSelectionSha256: coordinator.entered!.sourceSelectionSha256,
+    queueEvidenceSha256: coordinator.entered!.queueEvidenceSha256,
+    phase: "maintenance-entering",
+    ...overrides,
+  }) as BackendMaintenanceJournal;
+
+  it.each([
+    ["a maintenance-entering journal bound to this hold", { phase: "maintenance-entering" as const }, true],
+    ["a maintenance-held journal bound to this hold", { phase: "maintenance-held" as const }, true],
+    ["a journal of another generation", { generationId: "generation-other" }, false],
+    ["a terminal journal bound to this hold", { phase: "maintenance-aborted" as const }, false],
+    ["a journal with another source selection", { sourceSelectionSha256: "f".repeat(64) }, false],
+    ["a journal with other queue evidence", { queueEvidenceSha256: "e".repeat(64) }, false],
+  ])("a failed fresh hold entry reports applied only when the live journal is this hold (%s)", async (_name, overrides, applied) => {
+    const fixture = await enrolled();
+    const coordinator = new RecordingThrowingEnterCoordinator(fixture.homeDir, new PrivateMutationLockContentionError("contended"));
+    const result = await capture({
+      cwd: fixture.cwd, homeDir: fixture.homeDir, base: fixture.base, coordinator,
+      _operationsForTesting: { readJournal: () => liveJournalFor(coordinator, overrides) },
+    });
+    expect(result).toStrictEqual({
+      status: "refuse", reason: "hold-entry-contention", evidence: "lock-contention", ...(applied ? { applied: true } : {}),
+    });
+  });
+
+  it("a failed fresh hold entry reports applied when the journal cannot be read back, and none when the slot is empty", async () => {
+    const fixture = await enrolled();
+    const unreadable = await capture({
+      cwd: fixture.cwd, homeDir: fixture.homeDir, base: fixture.base,
+      coordinator: new RecordingThrowingEnterCoordinator(fixture.homeDir, new BackendPublicationJournalError("unsafe-storage", "unsafe")),
+      _operationsForTesting: { readJournal: () => { throw new Error("unreadable"); } },
+    });
+    expect(unreadable).toStrictEqual({ status: "refuse", reason: "hold-entry-evidence", evidence: "journal-unsafe-storage", applied: true });
+    const empty = await capture({
+      cwd: fixture.cwd, homeDir: fixture.homeDir, base: fixture.base,
+      coordinator: new RecordingThrowingEnterCoordinator(fixture.homeDir, new PrivateMutationLockContentionError("contended")),
+      _operationsForTesting: { readJournal: () => null },
+    });
+    expect(empty).toStrictEqual({ status: "refuse", reason: "hold-entry-contention", evidence: "lock-contention" });
+  });
+
+  it("a hold entry that writes the journal and then fails is reported applied from the real journal on disk", async () => {
+    const fixture = await enrolled();
+    class WriteThenFailCoordinator extends BackendPublicationCoordinator {
+      override async enterMaintenance(input: Parameters<BackendPublicationCoordinator["enterMaintenance"]>[0], lockToken?: Parameters<BackendPublicationCoordinator["enterMaintenance"]>[1]): Promise<BackendMaintenanceJournal> {
+        await super.enterMaintenance(input, lockToken);
+        throw new PrivateMutationLockContentionError("contended");
+      }
+    }
+    const result = await capture({
+      cwd: fixture.cwd, homeDir: fixture.homeDir, base: fixture.base,
+      coordinator: new WriteThenFailCoordinator({ homeDir: fixture.homeDir, driver: maintenanceOnlyDriver() }),
+    });
+    expect(result).toStrictEqual({ status: "refuse", reason: "hold-entry-contention", evidence: "lock-contention", applied: true });
+    expect(readBackendMaintenanceJournal(fixture.homeDir)).toMatchObject({ phase: "maintenance-held" });
+  });
+
   it.each([
     ["lock contention", new PrivateMutationLockContentionError("contended"), "capture-contention", "lock-contention"],
     ["an unresolved publication", new BackendPublicationJournalError("unresolved-publication", "held"), "capture-contention", "journal-unresolved-publication"],

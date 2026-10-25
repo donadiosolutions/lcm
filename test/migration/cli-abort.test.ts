@@ -763,12 +763,12 @@ describe("performMigrationAbortCommand: routed through rows 4 to 9 and the R7 ro
     expect(completePending).not.toHaveBeenCalled();
   });
 
-  it("a terminal journal of another generation is refused exit 2 when a different --generation is named, writing nothing", async () => {
+  it("a terminal journal of another generation is a router row 9 route-contradiction when a different --generation is named, writing nothing", async () => {
     const { home, held, store } = await crashFixture("copied", { abortJournal: true });
     createFixtureManifest(store, "copied", { generationId: "generation-9" });
     const before = snapshotHome(home);
     const result = await abortCommand({ homeDir: home, generation: "generation-9", confirmGenerationId: "generation-9" });
-    expect(result).toEqual({ status: "refuse", reason: "abort-other-generation", generationId: held.generationId });
+    expect(result).toEqual({ status: "refuse", reason: "route-contradiction", generationId: "generation-9", next: null });
     expect(snapshotHome(home)).toEqual(before);
   });
 
