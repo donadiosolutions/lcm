@@ -1,0 +1,7 @@
+references: ["#1659"]
+rationale: >-
+  Seals a retried migration abort's manifest report to the evidence the
+  aborted journal persisted. The abort routine stays in the migration
+  cutover owner.
+pins:
+  - ["src/migration/abort.ts", "unit-migration-cutover"]

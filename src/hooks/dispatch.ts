@@ -3,7 +3,10 @@ import { resolveLcmConfig } from "../db/config.js";
 import { configPath as defaultConfigPath } from "../runtime-paths.js";
 import { PrivateMutationLockContentionError } from "../private-mutation-lock.js";
 import {
+  HOOK_SESSION_END_CONTENTION_WAIT_MS,
+  hookAdmissionRetry,
   rethrowBackendPublicationJournalError,
+  type HookAdmissionRetry,
 } from "./publication-fence.js";
 import type { ConnectorTransport } from "../connectors/types.js";
 import { resolveHookSessionScope } from "./subagent-scope.js";
@@ -15,6 +18,11 @@ export type HookExecutionContext = Readonly<{
   transport?: ConnectorTransport;
   /** Present only for Codex Interrupt and SessionEnd snapshots. */
   terminal?: TerminalHookContext;
+  /**
+   * Shared contention allowance of one invocation. Dispatch creates it for the
+   * hooks that opt in; a caller may supply one, which tests use to avoid timers.
+   */
+  admissionRetry?: HookAdmissionRetry;
 }>;
 
 // Event names used when the dispatch-level config load is skipped by lock
@@ -67,6 +75,15 @@ export async function dispatchHook(
     return handlePreToolUse(stdinText);
   }
 
+  // Restore, compact and session snapshots have Codex timeouts of 30 seconds
+  // (Claude's defaults are not shorter), so they wait briefly for a live
+  // publication-lock owner. One allowance covers every pre-effect admission
+  // of the invocation. Session-end runs under a much shorter host timeout and
+  // gets a proportionally smaller allowance.
+  const admissionRetry = context.admissionRetry ?? hookAdmissionRetry(
+    command === "session-end" ? { totalMs: HOOK_SESSION_END_CONTENTION_WAIT_MS } : {},
+  );
+
   // Skip bootstrap for compact because SessionStart already ensured the daemon.
   // UserPromptSubmit owns its ordering: persist the local SQLite outbox first,
   // then preflight storage and ensure the daemon from inside its handler.
@@ -82,8 +99,10 @@ export async function dispatchHook(
         // Session snapshots contain transcript paths and payload data, so they
         // reverify the current endpoint even when this session has a bootstrap
         // flag from an earlier healthy daemon.
-        const endpoint = command === "session-snapshot" ? await ensureCoreEndpoint() : undefined;
-        const verified = endpoint?.connected ?? await ensureBootstrapped(session_id);
+        const endpoint = command === "session-snapshot"
+          ? await ensureCoreEndpoint(undefined, admissionRetry)
+          : undefined;
+        const verified = endpoint?.connected ?? await ensureBootstrapped(session_id, undefined, admissionRetry);
         if (command === "session-snapshot" && !verified) {
           return { exitCode: 0, stdout: "" };
         }
@@ -116,9 +135,12 @@ export async function dispatchHook(
   // so they must not wait on the publication lock for a config projection.
   if (command === "session-snapshot") {
     const { handleSessionSnapshot } = await import("./session-snapshot.js");
-    return verifiedSnapshotPort === undefined
-      ? handleSessionSnapshot(stdinText)
-      : handleSessionSnapshot(stdinText, { verifiedPort: verifiedSnapshotPort });
+    return handleSessionSnapshot(
+      stdinText,
+      verifiedSnapshotPort === undefined
+        ? { admissionRetry }
+        : { verifiedPort: verifiedSnapshotPort, admissionRetry },
+    );
   }
   const { DaemonClient } = await import("../daemon/client.js");
   const { loadHookConfig } = await import("./config.js");
@@ -126,7 +148,7 @@ export async function dispatchHook(
   const { homedir } = await import("node:os");
   let config: ReturnType<typeof loadHookConfig>;
   try {
-    config = loadHookConfig(defaultConfigPath());
+    config = await admissionRetry(() => loadHookConfig(defaultConfigPath()));
   } catch (error) {
     // Ordinary publication-lock contention is a best-effort hook outcome, the
     // same one each handler's own publication fence produces. Journal errors
@@ -142,15 +164,15 @@ export async function dispatchHook(
   switch (command) {
     case "compact": {
       const { handlePreCompact } = await import("./compact.js");
-      return handlePreCompact(stdinText, client, port, config.storage);
+      return handlePreCompact(stdinText, client, port, config.storage, admissionRetry);
     }
     case "restore": {
       const { handleSessionStart } = await import("./restore.js");
-      return handleSessionStart(stdinText, client, port, config.storage);
+      return handleSessionStart(stdinText, client, port, config.storage, admissionRetry);
     }
     case "session-end": {
       const { handleSessionEnd } = await import("./session-end.js");
-      return handleSessionEnd(stdinText, client, port, config.storage);
+      return handleSessionEnd(stdinText, client, port, config.storage, admissionRetry);
     }
     default:
       throw new Error(`Unknown hook command: ${command}`);

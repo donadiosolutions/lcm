@@ -147,6 +147,9 @@ function verificationEvidence(
 
 /** The backend a durable selection names, `null` when none is durable, or `"unresolvable"`. */
 function selectedBackend(context: ExistingGenerationContext): StorageBackend | null | "unresolvable" {
+  // A terminal hold of another generation is not this generation's selection, whatever its manifest says.
+  if (context.journal.kind === "hold" && context.journal.journal.phase === "maintenance-aborted"
+    && context.journal.journal.generationId !== context.generationId) return null;
   const phase = context.manifest?.phase;
   if (phase === "active") return "postgresql";
   if (phase === "rolled-back" || context.route.row === 5) return "sqlite";

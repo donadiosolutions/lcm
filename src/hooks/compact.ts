@@ -18,6 +18,8 @@ import {
   assertHookPublicationFence,
   isBackendPublicationEvidenceMissing,
   isBackendPublicationJournalError,
+  NO_HOOK_ADMISSION_RETRY,
+  type HookAdmissionRetry,
 } from "./publication-fence.js";
 
 type EnsureResultWithRefusal = Readonly<{ connected: boolean; refusalReason?: unknown }>;
@@ -49,12 +51,14 @@ export async function handlePreCompact(
   client: DaemonClient,
   port?: number,
   storage: StorageBackendSelection = { backend: "sqlite" },
+  admissionRetry?: HookAdmissionRetry,
 ): Promise<{ exitCode: number; stdout: string }> {
+  const retry = admissionRetry ?? NO_HOOK_ADMISSION_RETRY;
   const daemonPort = port ?? 3737;
   const pidFilePath = daemonPidPath();
   let ensureResult: EnsureResultWithRefusal;
   try {
-    assertHookPublicationFence();
+    await retry(() => assertHookPublicationFence());
   } catch (error) {
     if (isBackendPublicationJournalError(error)
       && !isBackendPublicationEvidenceMissing(error)
@@ -75,6 +79,7 @@ export async function handlePreCompact(
       spawnTimeoutMs: 5000,
       expectedStorageBackend: storage.backend,
       enforceUserManagerParent: true,
+      ...(admissionRetry === undefined ? {} : { _withPublicationAdmissionRetry: admissionRetry }),
     });
   } catch (error) {
     if (isBackendPublicationJournalError(error)) return { exitCode: 0, stdout: "" };
@@ -92,7 +97,7 @@ export async function handlePreCompact(
     const clientName = normalizeTranscriptClient(input.client ?? process.env.LCM_CLIENT);
     // Check immediately before the daemon request, then release the lock so
     // the daemon's own config/lifecycle admission cannot self-contention.
-    assertHookPublicationFence();
+    await retry(() => assertHookPublicationFence());
     const result = await client.post<{ summary: string; latestSummaryContent?: string }>("/compact", {
       ...input,
       client: clientName,

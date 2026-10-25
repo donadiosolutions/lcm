@@ -32,7 +32,15 @@ compaction) when `LCM_ENABLED=false`; see
   preflight still do.
 - Ordinary publication-lock contention follows each hook's own bounded policy.
   Admission fences and the pre-handler configuration load treat it as a
-  best-effort outcome (exit `0`). UserPromptSubmit's durable local enqueue is
+  best-effort outcome (exit `0`). Restore (`SessionStart`, `SubagentStart`),
+  compact and session-snapshot (`Stop`, `SubagentStop`, `PreCompact`) first
+  wait for a lock held by another live process: the pre-handler configuration
+  load, daemon admission and the fences before each daemon request share one
+  allowance of 5 seconds, in pauses of 50 ms, and only then take the best-effort
+  outcome. Session-end, which runs under a much shorter host timeout, shares
+  an allowance of 300 ms. Contention without a live owner in another process
+  and journal errors never wait. The Codex terminal `Interrupt` and `SessionEnd`
+  hand-off waits inside its own time budget (see below). UserPromptSubmit's durable local enqueue is
   retry-required: it exits non-zero if its append barrier stays busy past the
   bounded wait.
 - Malformed, tampered, or unresolved publication evidence still fails closed
@@ -164,7 +172,25 @@ Codex runs the hook for the sources `startup`, `resume`, `clear`, `compact`, and
   `$CODEX_HOME/archived_sessions`, default `~/.codex`) holds a developer message
   starting with the marker line after the last `compacted` record and the last
   `thread_rolled_back` event. A line that is not valid JSON counts as a reset.
-  Only the last 64 MiB of the rollout is read; any read failure prints.
+  Only the newest 64 MiB of the history is read; a failure to read the
+  session's own rollout prints.
+- A referenced (paginated-history) fork holds a pointer instead of a copy:
+  its first record is a `session_meta` whose `history_base` names the parent
+  rollout (`thread_id`, a rollout id), `end_ordinal_exclusive` and
+  `end_byte_offset`. The hook reads the history the fork inherited, which is the
+  parent's bytes before `end_byte_offset` followed by the fork's own records, and
+  applies the same marker, `compacted`, rollback and invalid-line rules across
+  them, so a marker inherited from the parent suppresses the second block unless
+  the fork's own records reset it. The parent is the one canonical
+  `rollout-<timestamp>-<id>.jsonl` (or `rollout-<timestamp>-<thread-id>_<id>.jsonl`)
+  file under `$CODEX_HOME/sessions` or `archived_sessions`, opened with the same
+  safety checks; the last record before `end_byte_offset` must carry the top-level
+  `ordinal` `end_ordinal_exclusive - 1`. A parent that is itself a referenced fork
+  is followed the same way, up to four files in all. The first parent that is
+  missing, ambiguous, a symlink, compressed, unreadable, repeated or
+  inconsistent with its cutoff ends the walk: the history older than the part
+  already checked is a gap, so only a marker in the checked part can suppress
+  the block. Looking a parent up visits at most 20,000 directory entries.
 - For `compact`, the daemon returns the full memory (recent summaries, promoted
   project knowledge, passive insights, and the stored project-instructions row)
   instead of orientation only, and never rewrites stored instructions. For Codex,
@@ -173,10 +199,12 @@ Codex runs the hook for the sources `startup`, `resume`, `clear`, `compact`, and
 - The hook writes no state files. The per-session lock is released when the hook
   returns.
 
-Limits: referenced forks, rollouts outside `$CODEX_HOME`, unreadable rollouts,
-and restorations from earlier LCM versions print a fresh restoration, which can
-duplicate an existing one; restorations carried only inside compaction
-replacement history are not detected; and if Codex fails to write the
+Limits: referenced forks whose parent history cannot be found or checked (see
+above, including a parent that exists only compressed), rollouts outside
+`$CODEX_HOME`, unreadable rollouts, and restorations from earlier LCM versions
+print a fresh restoration, which can duplicate an existing one;
+restorations carried only inside compaction replacement history are not
+detected; and if Codex fails to write the
 compaction record (or other history) to its rollout, the post-compaction hook can
 see the pre-compaction restoration and skip, and the live continuation can lack
 restored memory while those write failures persist.
@@ -664,6 +692,10 @@ cannot change the outcome. The exit code is always `0`, stdout is always empty, 
 every outcome except accepted writes one line to `~/.lcm/logs/events.log` with the
 reason (`transcript-unavailable`, `invalid-input`, `daemon-unavailable`,
 `publication-refused`, `deadline-exhausted`, `ingest-failed`, `unconfirmed`).
+The publication fence before the request waits for a lock held by another live
+process in pauses of 50 ms, for at most half of the time left in the post phase,
+so the request and the outcome reserve keep their budget; a lock still held after
+that logs `publication-refused`.
 
 ### POST /ingest/terminal
 
@@ -682,7 +714,12 @@ for a key that is already running is kept as one pending request and re-run afte
 the current one finishes, so the newest transcript tail is read; repeated requests
 combine. Each accepted request has an absolute 30 second cancellation deadline
 counted from acceptance, and daemon shutdown cancels it; both are best-effort
-cancellation, not a guarantee that the work stops at that instant. The daemon does
+cancellation, not a guarantee that the work stops at that instant. If another
+process holds the backend-publication lock, the run waits for it inside that
+deadline instead of failing, and it never repeats work that has started. The
+ordinary `POST /ingest` and `POST /restore` routes wait the same way until
+3 seconds after the request's first wait, across all of its admissions, before
+they fail. The daemon does
 not become idle while accepted work remains, and shutdown waits for the queue
 before it closes shared storage. The outcome of each deferred run (captured, no
 new observations, cancelled, blocked, failed or expired) is logged by the daemon

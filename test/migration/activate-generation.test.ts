@@ -1,5 +1,6 @@
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { existsSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, rmSync, statSync, writeFileSync } from "node:fs";
+import { createHash } from "node:crypto";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { ConfigValidationError, DEFAULT_DAEMON_PORT, readDaemonConfigSnapshot } from "../../src/daemon/config.js";
@@ -9,6 +10,7 @@ import { configPath, lcmHomeDir, projectsDir } from "../../src/runtime-paths.js"
 import {
   BackendPublicationCoordinator,
   backendPublicationDirectory,
+  backendPublicationCanonicalSha256,
   backendPublicationJournalPath,
   readBackendMaintenanceJournal,
   readBackendPublicationJournal,
@@ -30,7 +32,7 @@ import { createPostgreSqlBackendPublicationRemoteGuard } from "../../src/storage
 import { PostgreSqlRuntimeReadinessError, type PostgreSqlRuntimeReadiness } from "../../src/storage/postgresql/runtime-readiness.js";
 import { PostgreSqlStorageOperationError } from "../../src/storage/postgresql/errors.js";
 import { StorageOperationError } from "../../src/storage/errors.js";
-import { PORTABLE_RECORD_DOMAIN_ORDER, type PortableDomain } from "../../src/storage/portable-record.js";
+import { PORTABLE_RECORD_DOMAIN_ORDER, PortableStreamError, type PortableDomain } from "../../src/storage/portable-record.js";
 import {
   MIGRATION_ACTIVATION_LEASE_CLEANUP_TIMEOUT_MS,
   MigrationActivationError,
@@ -239,6 +241,13 @@ class FakeLeaseGuard implements ActivationLeasePublicationGuard {
     const released = { ...row, releasedAt: "2026-10-16T00:00:02.000Z" };
     this.rows.set(input.projectId, released);
     return released;
+  }
+
+  /** The release-reconciliation read (Bug #1651): the row whichever generation it names, like the real guard's. */
+  async readForReleaseReconciliation(input: Pick<PostgreSqlBackendPublicationMutationInput, "projectId" | "signal">): Promise<PostgreSqlBackendPublicationFence | null> {
+    this.calls.push("read");
+    this.admit("read", input.signal);
+    return this.rows.get(input.projectId) ?? null;
   }
 
   async read(input: Pick<PostgreSqlBackendPublicationMutationInput, "projectId" | "targetBackend" | "evidenceSha256" | "signal">): Promise<PostgreSqlBackendPublicationFence | null> {
@@ -1793,11 +1802,11 @@ describe("runMigrationActivation: the restart verdict observes without daemon se
 });
 
 describe("runMigrationActivation: applied / reportStored classifiers (amendment 2)", () => {
-  it("applied is no when no journal exists for a begun effect, unknown when the journal cannot be read, and unknown for a version-2 journal before config-published", async () => {
+  it("applied is unknown when no journal exists before any source witness or the journal cannot be read, and no for a prepared version-2 journal whose selection is unchanged", async () => {
     const f = await fixture();
     await stopAt(f, "after-prepare-begin");
     rmSync(backendPublicationJournalPath(f.homeDir));
-    expect(await f.run()).toMatchObject({ status: "interrupted", step: "S12", cause: "journal-unexpected", effectBegun: true, applied: "no" });
+    expect(await f.run()).toMatchObject({ status: "interrupted", step: "S12", cause: "journal-unexpected", effectBegun: true, applied: "unknown" });
     const g = await fixture();
     await stopAt(g, "after-drive");
     expect(await g.run({ readPublicationJournal: () => { throw new Error("journal read failed"); } })).toMatchObject({ status: "interrupted", step: "S12", cause: "journal-unexpected", effectBegun: true, applied: "unknown" });
@@ -1805,13 +1814,119 @@ describe("runMigrationActivation: applied / reportStored classifiers (amendment 
     await crashCoordinatorAt(h, "prepared");
     const row = [...h.guard.rows.values()][0]!;
     h.guard.rows.set(REMOTE, { ...row, releasedAt: "2026-10-16T13:00:00.000Z" });
-    expect(await h.run()).toMatchObject({ status: "interrupted", step: "S13b", cause: "lease-lost", applied: "unknown" });
+    expect(await h.run()).toMatchObject({ status: "interrupted", step: "S13b", cause: "lease-lost", applied: "no" });
   });
 
   it("a journal that cannot be read before any effect refuses maintenance-unresolvable", async () => {
     const f = await fixture();
     expect(await f.run({ readMaintenanceJournal: () => { throw new Error("journal read failed"); } })).toMatchObject({ status: "refused", step: "S0", reason: "maintenance-unresolvable", effectBegun: false });
     expect(f.manifestStore.read(GENERATION).phase).toBe("verified");
+  });
+
+  describe("amendment 2 readback of the live config and project map (#1617)", () => {
+    const unreadable: Partial<MigrationActivationDependencies> = { readReport: () => ({ state: "unresolvable", reason: "read-unresolvable", detail: "x" }) };
+    const EMPTY_SELECTION = { configSha256: createHash("sha256").update("{}").digest("hex"), projectMapSha256: backendPublicationCanonicalSha256({}) };
+
+    /** A settled-active re-entry reports a completed own journal and has no source witness in its context. */
+    async function settled(): Promise<Fixture> {
+      const f = await fixture();
+      await f.run();
+      return f;
+    }
+
+    /** A lease released after the selection binding: the v3 window is live and the artifact carries the source witness. */
+    async function beforePublication(): Promise<Fixture> {
+      const f = await fixture();
+      await expect(f.run({ crashPoint: (p) => { if (p === "after-selection-binding") throw new Error("boom"); } })).rejects.toThrow("boom");
+      const row = [...f.guard.rows.values()][0]!;
+      f.guard.rows.set(REMOTE, { ...row, releasedAt: "2026-10-16T13:00:00.000Z" });
+      return f;
+    }
+
+    const lease = { status: "interrupted", step: "S13b", cause: "lease-lost" } as const;
+
+    it("a completed journal is yes while the live selection equals the published witnesses and unknown when either digest disagrees", async () => {
+      const f = await settled();
+      expect(await f.run(unreadable)).toMatchObject({ applied: "yes" });
+      const live = f.deps.readSelectionDigests(f.homeDir);
+      expect(await f.run({ ...unreadable, readSelectionDigests: () => ({ ...live, configSha256: "0".repeat(64) }) })).toMatchObject({ applied: "unknown" });
+      expect(await f.run({ ...unreadable, readSelectionDigests: () => ({ ...live, projectMapSha256: "0".repeat(64) }) })).toMatchObject({ applied: "unknown" });
+    });
+
+    it("the selection restored out of band after a completed publication is unknown", async () => {
+      const f = await settled();
+      const published = f.deps.readSelectionDigests(f.homeDir);
+      writeFileSync(configPath(f.homeDir), JSON.stringify({ storage: { backend: "sqlite" }, daemon: { port: 4321 } }) + "\n", { mode: 0o600 });
+      expect(f.deps.readSelectionDigests(f.homeDir)).not.toEqual(published);
+      expect(await f.run(unreadable)).toMatchObject({ applied: "unknown" });
+    });
+
+    it("a journal in a yes phase without both published witnesses is unknown", async () => {
+      const f = await settled();
+      const read = f.deps.readPublicationJournal;
+      for (const lacking of [{ publishedConfigSha256: null }, { publishedProjectMapSha256: null }]) {
+        expect(await f.run({ ...unreadable, readPublicationJournal: (h) => { const j = read(h); return j === null ? null : { ...j, ...lacking }; } })).toMatchObject({ applied: "unknown" });
+      }
+    });
+
+    it("a failing selection readback is unknown", async () => {
+      const f = await settled();
+      expect(await f.run({ ...unreadable, readSelectionDigests: () => { throw new Error("readback failed"); } })).toMatchObject({ applied: "unknown" });
+    });
+
+    it("the in-flight phases are unknown even when the live selection equals the source", async () => {
+      const f = await settled();
+      const read = f.deps.readPublicationJournal;
+      const sourceSelection = (h: string) => { const j = read(h)!; return { configSha256: j.expectedConfigSha256, projectMapSha256: j.expectedProjectMapSha256 }; };
+      for (const phase of ["map-publishing", "map-published", "config-publishing"] as const) {
+        expect(await f.run({ ...unreadable, readPublicationJournal: (h) => ({ ...read(h)!, phase }), readSelectionDigests: sourceSelection })).toMatchObject({ applied: "unknown" });
+      }
+    });
+
+    it("the pre-publication and abort phases are no only when the live selection equals the expected witnesses", async () => {
+      const f = await settled();
+      const read = f.deps.readPublicationJournal;
+      const expected = (h: string) => { const j = read(h)!; return { configSha256: j.expectedConfigSha256, projectMapSha256: j.expectedProjectMapSha256 }; };
+      for (const phase of ["preparing", "prepared", "acquiring", "guarded", "aborting", "config-restoring", "map-restoring", "abort-releasing", "aborted"] as const) {
+        const at = { ...unreadable, readPublicationJournal: (h: string) => ({ ...read(h)!, phase }) };
+        expect(await f.run({ ...at, readSelectionDigests: expected })).toMatchObject({ applied: "no" });
+        expect(await f.run(at)).toMatchObject({ applied: "unknown" });
+      }
+    });
+
+    it("an absent or foreign journal without a source witness in the context is unknown", async () => {
+      const f = await settled();
+      const read = f.deps.readPublicationJournal;
+      expect(await f.run({ ...unreadable, readPublicationJournal: () => null })).toMatchObject({ applied: "unknown" });
+      expect(await f.run({ ...unreadable, readPublicationJournal: (h) => ({ ...read(h)!, publicationId: "other-pub" }) })).toMatchObject({ applied: "unknown" });
+    });
+
+    it("a live activation window is no only while the live selection equals the source witness", async () => {
+      const f = await beforePublication();
+      const live = f.deps.readSelectionDigests(f.homeDir);
+      expect(await f.run()).toMatchObject({ ...lease, applied: "no" });
+      expect(await f.run({ readSelectionDigests: () => ({ ...live, projectMapSha256: "0".repeat(64) }) })).toMatchObject({ ...lease, applied: "unknown" });
+      expect(await f.run({ readSelectionDigests: () => { throw new Error("readback failed"); } })).toMatchObject({ ...lease, applied: "unknown" });
+    });
+
+    it("an absent source config and project map hash as the empty documents", async () => {
+      const f = await beforePublication();
+      const read = f.deps.readArtifact;
+      const absent = (a: Parameters<typeof read>[0]) => { const r = read(a); return r === null ? null : { ...r, source: { config: { presence: "absent" as const }, projectMap: { presence: "absent" as const } } }; };
+      expect(await f.run({ readArtifact: absent, readSelectionDigests: () => EMPTY_SELECTION })).toMatchObject({ ...lease, applied: "no" });
+      expect(await f.run({ readArtifact: absent })).toMatchObject({ ...lease, applied: "unknown" });
+    });
+
+    it("a source project map that is not JSON is unknown", async () => {
+      const f = await beforePublication();
+      const read = f.deps.readArtifact;
+      const broken = (a: Parameters<typeof read>[0]) => {
+        const r = read(a);
+        if (r === null || r.source.projectMap.presence !== "present") return r;
+        return { ...r, source: { ...r.source, projectMap: { ...r.source.projectMap, content: Buffer.from("not json") } } };
+      };
+      expect(await f.run({ readArtifact: broken })).toMatchObject({ ...lease, applied: "unknown" });
+    });
   });
 
   it("reportStored before the report identity is known: unknown when the reader throws or is unresolvable or names an unattributed absence; no for an absent root", async () => {
@@ -1843,7 +1958,7 @@ describe("runMigrationActivation: verified-manifest lineage on re-entry without 
     const head = f.manifestStore.read(GENERATION);
     const previous = JSON.parse(readFileSync(revisionPath(f, head.revision - 1, head.previousManifestSha256!), "utf8")) as MigrationManifest;
     writeFileSync(revisionPath(f, previous.revision - 1, previous.previousManifestSha256!), "{not json\n", { mode: 0o600 });
-    expect(await f.run()).toMatchObject({ status: "interrupted", step: "S9", cause: "state-unresolvable", effectBegun: true, applied: "no" });
+    expect(await f.run()).toMatchObject({ status: "interrupted", step: "S9", cause: "state-unresolvable", effectBegun: true, applied: "unknown" });
     expect(f.manifestStore.read(GENERATION)).toMatchObject({ phase: "activating", pendingEffect: { kind: "publish-activation" } });
   });
 
@@ -1887,7 +2002,7 @@ describe("runMigrationActivation: step C sub-state rows", () => {
   it("a generation link naming another publication is interrupted link-conflict at S11", async () => {
     const f = await fixture();
     recordActivationGenerationLink({ homeDir: f.homeDir, generationId: GENERATION, publicationId: deriveActivationPublicationId("generation-9"), identityDigest: "0".repeat(64), epochManifestRevision: 8, epochManifestChecksumSha256: HASH_A });
-    expect(await f.run()).toMatchObject({ status: "interrupted", step: "S11", cause: "link-conflict", applied: "no" });
+    expect(await f.run()).toMatchObject({ status: "interrupted", step: "S11", cause: "link-conflict", applied: "unknown" });
   });
 
   it("a linked artifact that is absent or unresolvable is interrupted state-unresolvable at S11; a raw store error surfaces", async () => {
@@ -2005,7 +2120,7 @@ describe("runMigrationActivation: S13b and S16 readback rows", () => {
     await crashCoordinatorAt(f, "prepared");
     const read = f.deps.readPublicationJournal;
     let reads = 0;
-    expect(await f.run({ readPublicationJournal: (h) => { if (++reads === 2) throw new Error("journal read failed"); return read(h); } })).toMatchObject({ status: "interrupted", step: "S13b", cause: "journal-unexpected", applied: "unknown" });
+    expect(await f.run({ readPublicationJournal: (h) => { if (++reads === 2) throw new Error("journal read failed"); return read(h); } })).toMatchObject({ status: "interrupted", step: "S13b", cause: "journal-unexpected", applied: "no" });
   });
 
   it("S16: the manifest re-read fails or is not this activation's publish-activation", async () => {
@@ -2365,7 +2480,7 @@ describe("runMigrationActivation: an S0-S8 re-check that fails on an effect-begu
     await stopAt(f, "after-prepare-begin");
     const outcome = await f.run({ enumerateStoredData: () => ({ status: "enumerated", projectHashes: [f.localProjectId, HASH_B] }) });
     expect(outcome).toMatchObject({
-      status: "interrupted", step: "S9", cause: "state-unresolvable", effectBegun: true, applied: "no", reportStored: "no",
+      status: "interrupted", step: "S9", cause: "state-unresolvable", effectBegun: true, applied: "unknown", reportStored: "no",
       identity: { generationId: GENERATION, publicationId: f.publicationId },
     });
     expect((outcome as { detail: string }).detail).toMatch(/^S4 uncovered-projects on roll-forward: /u);
@@ -2570,6 +2685,97 @@ describe("runMigrationActivation: S7 classifies target failures like S6 (PR #162
     expect(row(f).releasedAt).toBeNull();
     expectActivated(f, await f.run(), "prepare-activation-pending");
   });
+
+  const portableUnavailable = (cause: unknown) => new PortableStreamError("source-unavailable", { cause });
+  /**
+   * A captureDestinationIdentity that rejects on its nth call and otherwise answers the sealed identity. The ordinary
+   * runtime's probe runs first (#1607: before S0, attributed to S6), then S0's transfer query, then S7's.
+   */
+  const identityFailingAt = (f: Fixture, nth: number, error: unknown) => {
+    const answer = f.deps.captureDestinationIdentity;
+    let calls = 0;
+    return (...args: Parameters<typeof answer>) => (calls++ === nth ? Promise.reject(error) : answer(...args));
+  };
+
+  it.each([
+    ["a lost connection (SQLSTATE 08006)", pgError("08006"), "target-unresolvable", /^connection-failed: S7 census read was lost/u],
+    ["a refused privilege (SQLSTATE 42501)", pgError("42501"), "target-unhealthy", /^insufficient-privilege: S7 census read: /u],
+  ] as const)("the production census reader's PortableStreamError(source-unavailable) wrapping %s is unwrapped and refuses S7", async (_name, cause, reason, detail) => {
+    const f = await fixture();
+    const outcome = await f.run({ readDestinationCensus: async () => { throw portableUnavailable(cause); } });
+    expect(outcome).toMatchObject({ status: "refused", step: "S7", reason, effectBegun: false });
+    expect((outcome as { detail: string }).detail).toMatch(detail);
+    expect(row(f).releasedAt).not.toBeNull();
+  });
+
+  it("an effect-begun re-entry turns the unwrapped census failure into the roll-forward interruption and keeps the lease", async () => {
+    const f = await fixture();
+    await stopAt(f, "after-prepare-begin");
+    const outcome = await f.run({ readDestinationCensus: async () => { throw portableUnavailable(pgError("08006")); } });
+    expect(outcome).toMatchObject({ status: "interrupted", step: "S9", cause: "state-unresolvable", effectBegun: true, detail: expect.stringMatching(/^S7 target-unresolvable on roll-forward: connection-failed: /u) });
+    expect(row(f).releasedAt).toBeNull();
+    expectActivated(f, await f.run(), "prepare-activation-pending");
+  });
+
+  it("a PortableStreamError that is not source-unavailable, or has no storage cause, is not a target condition and is rethrown", async () => {
+    const f = await fixture();
+    await expect(f.run({ readDestinationCensus: async () => { throw new PortableStreamError("source-invalid"); } })).rejects.toMatchObject({ name: "PortableStreamError", code: "source-invalid" });
+    expect(row(f).releasedAt).not.toBeNull();
+    const g = await fixture();
+    await expect(g.run({ readDestinationCensus: async () => { throw portableUnavailable(new RangeError("raw cause")); } })).rejects.toMatchObject({ name: "PortableStreamError", code: "source-unavailable" });
+    const h = await fixture();
+    await expect(h.run({ readDestinationCensus: async () => { throw new PortableStreamError("source-unavailable"); } })).rejects.toMatchObject({ code: "source-unavailable" });
+  });
+
+  it("an aborted census read is a cancellation and rejects, even when the error carries a storage cause", async () => {
+    const f = await fixture();
+    await expect(f.run({ readDestinationCensus: async () => { throw new PortableStreamError("aborted", { cause: pgError("08006") }); } })).rejects.toMatchObject({ name: "PortableStreamError", code: "aborted" });
+    expect(row(f).releasedAt).not.toBeNull();
+    const g = await fixture();
+    await stopAt(g, "after-prepare-begin");
+    await expect(g.run({ readDestinationCensus: async () => { throw new PortableStreamError("aborted"); } })).rejects.toMatchObject({ code: "aborted" });
+    expect(row(g).releasedAt).toBeNull();
+  });
+
+  it.each([
+    ["S6", "a lost connection (SQLSTATE 08006)", 0, pgError("08006"), "target-unresolvable", /^connection-failed: S6 destination identity query was lost/u],
+    ["S6", "a refused privilege (SQLSTATE 42501)", 0, pgError("42501"), "target-unhealthy", /^insufficient-privilege: S6 destination identity query: /u],
+    ["S0", "a lost connection (SQLSTATE 08006)", 1, pgError("08006"), "target-unresolvable", /^connection-failed: S0 destination identity query was lost/u],
+    ["S0", "a refused privilege (SQLSTATE 42501)", 1, pgError("42501"), "target-unhealthy", /^insufficient-privilege: S0 destination identity query: /u],
+    ["S7", "a lost connection (SQLSTATE 08006)", 2, pgError("08006"), "target-unresolvable", /^connection-failed: S7 destination identity query was lost/u],
+    ["S7", "a refused privilege (SQLSTATE 42501)", 2, pgError("42501"), "target-unhealthy", /^insufficient-privilege: S7 destination identity query: /u],
+  ] as const)("the %s destination identity query failing with %s refuses that step and releases the pre-effect lease", async (step, _name, nth, error, reason, detail) => {
+    const f = await fixture();
+    const outcome = await f.run({ captureDestinationIdentity: identityFailingAt(f, nth, error) });
+    expect(outcome).toMatchObject({ status: "refused", step, reason, effectBegun: false });
+    expect((outcome as { detail: string }).detail).toMatch(detail);
+    // The ordinary probe and S0 both run before the S2 lease is written; S7 runs under it.
+    if (step === "S7") expect(row(f).releasedAt).not.toBeNull();
+    else expect(f.guard.calls).not.toContain("acquire");
+    expect(f.manifestStore.read(GENERATION).phase).toBe("verified");
+  });
+
+  it.each([
+    ["S6", 0],
+    ["S7", 2],
+  ] as const)("on an effect-begun re-entry the %s identity query failure is the roll-forward interruption and keeps the lease", async (step, nth) => {
+    const f = await fixture();
+    await stopAt(f, "after-prepare-begin");
+    const outcome = await f.run({ captureDestinationIdentity: identityFailingAt(f, nth, pgError("08006")) });
+    expect(outcome).toMatchObject({ status: "interrupted", step: "S9", cause: "state-unresolvable", effectBegun: true, detail: expect.stringMatching(new RegExp("^" + step + " target-unresolvable on roll-forward: connection-failed: " + step + " destination identity query was lost", "u")) });
+    expect(row(f).releasedAt).toBeNull();
+    expectActivated(f, await f.run(), "prepare-activation-pending");
+  });
+
+  it("an identity query failing with a wrapped storage error is attributed, and with an unknown or aborted error is rethrown", async () => {
+    const f = await fixture();
+    expect(await f.run({ captureDestinationIdentity: identityFailingAt(f, 2, portableUnavailable(pgError("42501"))) })).toMatchObject({ status: "refused", step: "S7", reason: "target-unhealthy" });
+    const g = await fixture();
+    await expect(g.run({ captureDestinationIdentity: identityFailingAt(g, 2, new RangeError("raw")) })).rejects.toBeInstanceOf(RangeError);
+    expect(row(g).releasedAt).not.toBeNull();
+    const h = await fixture();
+    await expect(h.run({ captureDestinationIdentity: identityFailingAt(h, 2, new PortableStreamError("aborted")) })).rejects.toMatchObject({ code: "aborted" });
+  });
 });
 
 describe("runMigrationActivation: classification before initialization (#1618)", () => {
@@ -2766,23 +2972,93 @@ describe("runMigrationActivation: the release tail and the abort family are driv
     expect(row(f)).toEqual(successor);
   });
 
-  it("a fence of another publication or evidence digest stays lease-lost at releasing; an unattributable read is lease-unresolvable", async () => {
+  /** The fence the journal recorded before the crash, then the remote release and a successor's acquisition of the released row. */
+  const releasedThenSuccessor = async (f: Fixture, phase: string, overrides: Partial<PostgreSqlBackendPublicationFence> = {}) => {
+    await crashCoordinatorAt(f, phase);
+    const persisted = readBackendPublicationJournal(f.homeDir)!.projects[0]!.fence!;
+    foreignRow(f, overrides);
+    return { persisted, successor: { ...row(f)! }, mutations: f.guard.calls.filter((c) => c !== "read").length };
+  };
+
+  it("crash at releasing with a successor publication's row present (Bug #1651): the coordinator proves the release and finishes without touching that row", async () => {
     const f = await fixture();
-    await crashCoordinatorAt(f, "releasing");
-    foreignRow(f);
-    expect(await f.run()).toMatchObject({ status: "interrupted", step: "S13b", cause: "lease-lost", effectBegun: true, detail: "the fenced lease row names another publication" });
-    foreignRow(f, { publicationId: f.publicationId, evidenceSha256: "d".repeat(64) });
-    expect(await f.run()).toMatchObject({ status: "interrupted", step: "S13b", cause: "lease-lost", detail: expect.stringContaining("does not match the expected") });
-    f.guard.read = async (input) => { throw new PostgreSqlStorageOperationError("STORAGE_OPERATION_FAILED", { domain: "factory", operation: "read" }, "08006", true); };
+    const { persisted, successor, mutations } = await releasedThenSuccessor(f, "releasing");
+    expect(successor.fencingToken > BigInt(persisted.fencingToken)).toBe(true);
+    const outcome = await f.run();
+    expectActivated(f, outcome, "publication-journal");
+    expect(f.guard.calls.filter((c) => c !== "read")).toHaveLength(mutations);
+    expect(row(f)).toEqual(successor);
+    const journal = readBackendPublicationJournal(f.homeDir)!;
+    expect(journal.phase).toBe("completed");
+    // The successor's fence is never journalled; the persisted one is marked released.
+    expect(journal.projects[0]!.fence).toEqual({ ...persisted, releasedAt: successor.acquiredAt });
+  });
+
+  it("crash at releasing with a successor of another evidence digest or machine present (Bug #1651): the same proof applies", async () => {
+    for (const overrides of [{ publicationId: "x", evidenceSha256: "d".repeat(64) }, { machineId: "018f0b5d-ffff-7abc-8def-1234567890ab", publicationId: "x" }] as const) {
+      const f = await fixture();
+      const { successor, mutations } = await releasedThenSuccessor(f, "releasing", overrides);
+      expectActivated(f, await f.run(), "publication-journal");
+      expect(f.guard.calls.filter((c) => c !== "read")).toHaveLength(mutations);
+      expect(row(f)).toEqual(successor);
+    }
+  });
+
+  it("at releasing a successor that is not provably later, an unproven guard, a corrupt row and an unattributable read all fail closed", async () => {
+    // A foreign row whose token does not exceed the journalled fence proves nothing: the coordinator refuses.
+    const lower = await fixture();
+    const first = await releasedThenSuccessor(lower, "releasing", { fencingToken: 1n });
+    expect(BigInt(first.persisted.fencingToken) >= 1n).toBe(true);
+    await expect(lower.run()).rejects.toThrow(/remote fence identity does not match/);
+    expect(readBackendPublicationJournal(lower.homeDir)?.phase).toBe("releasing");
+    expect(row(lower)).toEqual(first.successor);
+
+    // A guard that does not declare the reconciliation read keeps today's failure.
+    const unproven = await fixture();
+    const second = await releasedThenSuccessor(unproven, "releasing");
+    (unproven.guard as { readForReleaseReconciliation?: unknown }).readForReleaseReconciliation = undefined;
+    await expect(unproven.run()).rejects.toThrow();
+    expect(readBackendPublicationJournal(unproven.homeDir)?.phase).toBe("releasing");
+    expect(row(unproven)).toEqual(second.successor);
+
+    // A corrupt or ambiguous row is not admitted and never reaches the drive.
+    const f = await fixture();
+    await releasedThenSuccessor(f, "releasing");
+    const read = f.guard.read.bind(f.guard);
+    f.guard.read = async () => { throw new PostgreSqlBackendPublicationGuardError(REMOTE, "read", "invalid-row"); };
+    expect(await f.run()).toMatchObject({ status: "interrupted", step: "S13b", cause: "lease-lost", effectBegun: true, detail: expect.stringContaining("corrupt or ambiguous") });
+    // An unattributable read is lease-unresolvable.
+    f.guard.read = async () => { throw new PostgreSqlStorageOperationError("STORAGE_OPERATION_FAILED", { domain: "factory", operation: "read" }, "08006", true); };
     expect(await f.run()).toMatchObject({ status: "interrupted", step: "S13b", cause: "lease-unresolvable" });
+    f.guard.read = read;
     expect(readBackendPublicationJournal(f.homeDir)?.phase).toBe("releasing");
   });
+
+  it("crash at abort-releasing with a successor publication's row present (Bug #1651): the retry finishes the abort without touching that row", async () => {
+    const f = await fixture();
+    await crashCoordinatorAt(f, "prepared");
+    let crashed = false;
+    const crashing = f.coordinator((event) => {
+      if (crashed || event !== "after-journal-write") return;
+      if (readBackendPublicationJournal(f.homeDir)?.phase === "abort-releasing") { crashed = true; throw new Error("injected coordinator crash at abort-releasing"); }
+    });
+    await expect(crashing.abort()).rejects.toThrow("injected coordinator crash at abort-releasing");
+    foreignRow(f);
+    const successor = { ...row(f)! };
+    const mutations = f.guard.calls.filter((c) => c !== "read").length;
+    expect(await f.run()).toMatchObject({ status: "publication-failed", publication: { status: "aborted", dispatch: "abort-completion" } });
+    expect(readBackendPublicationJournal(f.homeDir)?.phase).toBe("aborted");
+    expect(f.guard.calls.filter((c) => c !== "read")).toHaveLength(mutations);
+    expect(row(f)).toEqual(successor);
+  });
+
   it("the abort family is handled like the release tail: an absent own fence at abort-releasing reaches the drive without a lease continuation", async () => {
     const f = await fixture();
     await crashCoordinatorAt(f, "prepared");
     f.guard.rows.delete(REMOTE);
     const read = f.deps.readPublicationJournal;
-    const unwinding = (h: string) => { const j = read(h); return j === null ? null : { ...j, phase: "abort-releasing" as const }; };
+    const unwindingAt = (phase: "abort-releasing" | "aborting") => (h: string) => { const j = read(h); return j === null ? null : { ...j, phase }; };
+    const unwinding = unwindingAt("abort-releasing");
     const renews = f.guard.calls.filter((c) => c === "renew").length;
     const outcome = await f.run({
       readPublicationJournal: unwinding,
@@ -2790,9 +3066,9 @@ describe("runMigrationActivation: the release tail and the abort family are driv
     });
     expect(outcome).toMatchObject({ status: "publication-failed", publication: { status: "aborted", dispatch: "abort-completion" } });
     expect(f.guard.calls.filter((c) => c === "renew")).toHaveLength(renews);
-    // A foreign row in the same phase is still a lost lease.
+    // A foreign row before the release window (aborting) is still a lost lease.
     foreignRow(f);
-    expect(await f.run({ readPublicationJournal: unwinding })).toMatchObject({ status: "interrupted", step: "S13b", cause: "lease-lost" });
+    expect(await f.run({ readPublicationJournal: unwindingAt("aborting") })).toMatchObject({ status: "interrupted", step: "S13b", cause: "lease-lost" });
     // Outside those phases (prepared), an absent row is still a lost lease.
     f.guard.rows.delete(REMOTE);
     expect(await f.run()).toMatchObject({ status: "interrupted", step: "S13b", cause: "lease-lost", detail: "no fenced lease row exists for this generation" });

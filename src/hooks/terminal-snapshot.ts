@@ -3,7 +3,7 @@ import { stdin } from "node:process";
 import { daemonJsonResponse } from "../daemon/http-url.js";
 import { createTerminalDeadline, type TerminalDeadline } from "../cli/terminal-deadline.js";
 import { readTerminalStdin } from "../cli/terminal-stdin.js";
-import { assertHookPublicationFence } from "./publication-fence.js";
+import { assertHookPublicationFence, hookAdmissionRetry } from "./publication-fence.js";
 
 /**
  * Codex Interrupt and SessionEnd hooks have at most three seconds, so they
@@ -133,14 +133,19 @@ async function submit(
   }
   if (endpoint === null) return "daemon-unavailable";
 
-  try {
-    deps.assertPublicationFence();
-  } catch {
-    return "publication-refused";
-  }
-
+  // The fence retry runs inside the post phase, so its AbortSignal and budget
+  // bound the wait and the outcome reserve stays untouched. Half of the budget
+  // may go to waiting, which leaves the rest for the request itself.
   const postScope = deadline.openPhase("post");
   try {
+    try {
+      await hookAdmissionRetry({
+        totalMs: Math.floor(Math.max(0, postScope.budgetMs) / 2),
+        signal: postScope.signal,
+      })(() => deps.assertPublicationFence());
+    } catch {
+      return "publication-refused";
+    }
     if (postScope.budgetMs <= 0) return "deadline-exhausted";
     const response = await deps.post(
       endpoint,

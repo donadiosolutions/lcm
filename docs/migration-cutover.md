@@ -1055,6 +1055,16 @@ reads the destination (a lost connection, a refused privilege, a schema
 mismatch on the transfer session) is attributed exactly as the health check
 attributes it, `target-unhealthy` or `target-unresolvable` at `S7`.
 
+The destination identity query that compares the live destination with the
+sealed manifest (at `S0` and `S7` on the transfer session, and on the
+ordinary runtime session before any lease write, attributed to `S6`) is
+classified the same way. A definite server refusal (authentication, missing
+privilege) is reported as `target-unhealthy`; a connection or transport
+failure is reported as `target-unresolvable`. Both are refusals at the step
+that ran the query, or, when an effect has already begun and the run is
+re-entered, an interruption of the step in flight. Neither rejects the whole
+activation. A cancelled activation is still rejected, not classified.
+
 ### The activation role
 
 Activation uses two PostgreSQL connections to the same sealed destination:
@@ -1133,9 +1143,16 @@ A failure after step 1 is an **interruption**, not a refusal: an effect has
 begun. The outcome names the step (`S9` through `S16`), a closed cause, and
 three facts an operator can act on: whether an effect began, whether the
 publication is known to have been applied (`yes`, `no` or `unknown`), and
-whether an activation report is known to be stored. `unknown` is reported
-honestly when the journal or report store cannot be read; it is never
-collapsed into a guess.
+whether an activation report is known to be stored. `applied` is confirmed
+against the live selection, not the journal alone: `yes` needs the
+publication journal to record the configuration as published and the live
+configuration and project map to match the published witnesses; `no` needs
+the live configuration and project map to still match the pre-publication
+source (the journal's expected witnesses, or the activation's source
+material when no journal of this activation exists). A publication that may
+be mid-write, a selection that disagrees with the journal, or a journal or
+selection that cannot be read is `unknown`. `reportStored` is `unknown`
+when the report store cannot be read; neither is collapsed into a guess.
 
 Recovery is to run activation again. The run resumes from the durable
 evidence it finds (the manifest, the link and artifact, the stored attempt,
@@ -1178,6 +1195,19 @@ or a cancelled run can still leave the row behind, and a write whose result
 is uncertain keeps it; the same generation recovers by taking the row over
 on its next run. Once an effect has begun the lease is kept for the next run
 to continue.
+
+A crash after the coordinator released the remote fence but before it
+recorded that locally can leave the publication journal at `releasing`
+(or `abort-releasing`) while another home's publication has already acquired the
+released row. The retry admits that decodable foreign row, never renews,
+releases or takes it over, and lets the coordinator finish its release: a row
+of another identity with a greater fencing token proves this publication's
+fence was released (see "The remote guard provider" in the backend publication
+guide). An aborting run reports `publication-failed` with the aborted
+publication. A corrupt or ambiguous row, an unattributable read, or a guard
+that cannot prove the release still ends in `lease-lost`,
+`lease-unresolvable` or a coordinator refusal and leaves the journal at
+`releasing`. The same applies to each member of a cutover set.
 
 ### The daemon restart
 

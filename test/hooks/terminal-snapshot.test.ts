@@ -7,6 +7,7 @@ import { join } from "node:path";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { createTerminalDeadline, type TerminalDeadline } from "../../src/cli/terminal-deadline.js";
 import { TERMINAL_STDIN_MAX_BYTES } from "../../src/cli/terminal-stdin.js";
+import { PrivateMutationLockContentionError } from "../../src/private-mutation-lock.js";
 import {
   handleTerminalSnapshot,
   reportTerminalOutcome,
@@ -156,6 +157,45 @@ describe("Codex terminal snapshot handler", () => {
     await expect(run(payload())).resolves.toEqual(SILENT);
     expect(loggedReasons()).toEqual(["publication-refused"]);
     expect(post).not.toHaveBeenCalled();
+  });
+
+  describe("when another process holds the publication lock", () => {
+    const liveContention = (): PrivateMutationLockContentionError => new PrivateMutationLockContentionError(
+      "publication lock is busy",
+      {
+        contendedLock: {
+          path: "/lcm/publication.lock",
+          owner: { version: 1, pid: process.pid + 1, processStartTime: null, nonce: "owner" },
+        },
+      },
+    );
+
+    it("posts once the owner releases the lock within the post phase", async () => {
+      fence
+        .mockImplementationOnce(() => { throw liveContention(); })
+        .mockImplementationOnce(() => { throw liveContention(); });
+      await expect(run(payload())).resolves.toEqual(SILENT);
+      expect(fence).toHaveBeenCalledTimes(3);
+      expect(post).toHaveBeenCalledOnce();
+      expect(logError).not.toHaveBeenCalled();
+    });
+
+    it("logs publication-refused when the owner outlasts the share of the post phase set aside for waiting", async () => {
+      // 100 ms of post budget leave 50 ms of waiting: one pause, then the refusal.
+      elapsed = 1250;
+      fence.mockImplementation(() => { throw liveContention(); });
+      await expect(run(payload())).resolves.toEqual(SILENT);
+      expect(fence).toHaveBeenCalledTimes(2);
+      expect(loggedReasons()).toEqual(["publication-refused"]);
+      expect(post).not.toHaveBeenCalled();
+    });
+
+    it("does not wait for contention without a live owner", async () => {
+      fence.mockImplementation(() => { throw new PrivateMutationLockContentionError("ambiguous owner"); });
+      await run(payload());
+      expect(fence).toHaveBeenCalledOnce();
+      expect(loggedReasons()).toEqual(["publication-refused"]);
+    });
   });
 
   it.each([400, 401, 500, 503, 200, 204])("logs ingest-failed for HTTP %i", async (statusCode) => {
