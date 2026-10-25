@@ -428,9 +428,19 @@ describe("inspectCodexReadiness statuses", () => {
     rejected(command('"additionalContextLimit":2500.0'));
     rejected('{"type":"mcp_tool","server":"s","tool":"t","timeout":30.0}');
     rejected('{"type":"mcp_tool","server":"s","tool":"t","timeout":3e1}');
-    // Codex ignores the timeout of prompt and agent handlers, so only the base safe-integer check applies.
-    rejected('{"type":"prompt","timeout":-1}');
-    rejected('{"type":"agent","timeout":1.5}');
+    // Codex ignores every member but the tag on prompt and agent handlers, so no timeout or statusMessage there is rejected.
+    accepted('{"type":"prompt","timeout":-1}');
+    accepted('{"type":"agent","timeout":1.5}');
+    accepted('{"type":"prompt","statusMessage":7}');
+    accepted('{"type":"agent","timeout":"x","statusMessage":null}');
+    accepted('{"type":"agent","timeout":{"a":1}}');
+    accepted('{"type":"prompt","timeout":true,"statusMessage":{"a":1}}');
+    // The same members stay validated on command and mcp_tool handlers (null stays absent).
+    for (const statusMessage of ["7", "true", '{"a":1}']) {
+      rejected(command('"statusMessage":' + statusMessage));
+      rejected('{"type":"mcp_tool","server":"s","tool":"t","statusMessage":' + statusMessage + "}");
+    }
+    accepted('{"type":"mcp_tool","server":"s","tool":"t","statusMessage":null}');
     accepted('{"type":"prompt","timeout":3e1}');
     accepted('{"type":"agent","timeout":-0}');
     accepted('{"type":"agent","timeout":30.0}');

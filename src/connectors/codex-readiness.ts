@@ -201,17 +201,14 @@ function optionalCount(handler: Record<string, unknown>, field: string, notInteg
 
 function validHandler(handler: unknown, notIntegerToken: (field: string) => boolean): handler is Record<string, unknown> {
   if (!isRecord(handler) || typeof handler.type !== "string" || !KNOWN_HANDLER_TYPES.has(handler.type)) return false;
-  // Codex defines prompt and agent handlers as empty variants and ignores their timeout, so only
-  // command and mcp_tool timeouts need the integer token.
-  const timeoutValid = handler.type === "command" || handler.type === "mcp_tool"
-    ? optionalCount(handler, "timeout", notIntegerToken)
-    : optional(handler.timeout, isCount);
-  if (!timeoutValid || !optional(handler.statusMessage, isString)) return false;
+  // Codex defines prompt and agent handlers as empty variants without deny_unknown_fields, so it ignores
+  // every other member there (timeout and statusMessage included) and loads the file.
+  if (handler.type === "prompt" || handler.type === "agent") return true;
+  if (!optionalCount(handler, "timeout", notIntegerToken) || !optional(handler.statusMessage, isString)) return false;
   if (handler.type === "mcp_tool") {
     return isString(handler.server) && isString(handler.tool)
       && (handler.input === undefined || (isRecord(handler.input) && tomlRepresentable(handler.input)));
   }
-  if (handler.type !== "command") return true;
   // commandWindows and its command_windows alias map to one field: both present is a duplicate.
   return isString(handler.command)
     && optional(handler.commandWindows, isString)
