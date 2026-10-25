@@ -46,6 +46,14 @@ export const OWNER_SCOPE_LABEL = "com.donadiosolutions.lcm.postgresql-test-owner
 export const RESOURCE_KIND_LABEL = "com.donadiosolutions.lcm.postgresql-test-resource-kind";
 export const OWNER_SCHEMA_VERSION = "2";
 export const MAX_CAPTURED_OUTPUT_BYTES = 64 * 1024;
+// One harness cluster serves every test database of a run, and each database
+// adds roughly 200 distinct statements; the complete suite reaches about 58,000
+// entries, past the stock cap of 5,000, which evicts statements that
+// query-statistics.integration.ts still expects to see. PostgreSQL sizes the
+// statistics hash at postmaster start, so the cap costs shared memory up front
+// (measured: shared_memory_size rises from 152 MB to 194 MB, about 0.45 KiB per
+// entry); query text lives in a file.
+export const PG_STAT_STATEMENTS_MAX = 100_000;
 export const MAX_DOCKER_REMOVE_ATTEMPTS = 3;
 export const ORPHAN_WORKER_STABILITY_DELAY_MS = 250;
 export const HARNESS_CLEANUP_RETRY_DELAYS_MS = Object.freeze([
@@ -1680,7 +1688,7 @@ export function createDatabaseContainerArgs(context) {
     "--entrypoint", "/bin/bash",
     POSTGRES_IMAGE,
     "-ceu",
-    "install -d -o postgres -g postgres -m 0700 /var/lib/postgresql/certs /run/lcm-private; install -o postgres -g postgres -m 0600 /run/lcm-harness/server.key /var/lib/postgresql/certs/server.key; install -o postgres -g postgres -m 0644 /run/lcm-harness/server.crt /run/lcm-harness/ca.crt /var/lib/postgresql/certs/; install -o postgres -g postgres -m 0600 /run/lcm-harness/admin-password /run/lcm-harness/migrator-password /run/lcm-harness/runtime-password /run/lcm-harness/run-id /run/lcm-harness/database-name /run/lcm-private/; exec /usr/local/bin/docker-entrypoint.sh postgres -c ssl=on -c ssl_cert_file=/var/lib/postgresql/certs/server.crt -c ssl_key_file=/var/lib/postgresql/certs/server.key -c ssl_ca_file=/var/lib/postgresql/certs/ca.crt -c shared_preload_libraries=pg_stat_statements -c listen_addresses=* -c password_encryption=scram-sha-256 -c timezone=UTC",
+    "install -d -o postgres -g postgres -m 0700 /var/lib/postgresql/certs /run/lcm-private; install -o postgres -g postgres -m 0600 /run/lcm-harness/server.key /var/lib/postgresql/certs/server.key; install -o postgres -g postgres -m 0644 /run/lcm-harness/server.crt /run/lcm-harness/ca.crt /var/lib/postgresql/certs/; install -o postgres -g postgres -m 0600 /run/lcm-harness/admin-password /run/lcm-harness/migrator-password /run/lcm-harness/runtime-password /run/lcm-harness/run-id /run/lcm-harness/database-name /run/lcm-private/; exec /usr/local/bin/docker-entrypoint.sh postgres -c ssl=on -c ssl_cert_file=/var/lib/postgresql/certs/server.crt -c ssl_key_file=/var/lib/postgresql/certs/server.key -c ssl_ca_file=/var/lib/postgresql/certs/ca.crt -c shared_preload_libraries=pg_stat_statements -c pg_stat_statements.max=" + PG_STAT_STATEMENTS_MAX + " -c listen_addresses=* -c password_encryption=scram-sha-256 -c timezone=UTC",
   );
   return args;
 }
