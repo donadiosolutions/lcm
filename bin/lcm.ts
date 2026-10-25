@@ -3771,9 +3771,16 @@ export async function runCli(
       const all: boolean = opts.all ?? false;
       const jsonFlag: boolean = opts.json ?? false;
       const client = await createDaemonClientOrExit();
-      const result = all
-        ? await client.post<any>("/promote-events/all", {})
-        : await client.post<any>("/promote-events", { cwd: process.cwd(), drain: true });
+      let result: any;
+      try {
+        result = all
+          ? await client.post<any>("/promote-events/all", {})
+          : await client.post<any>("/promote-events", { cwd: process.cwd(), drain: true });
+      } catch (error) {
+        // A busy daemon answers 503 with a retry message; show it instead of the generic failure.
+        if ((error as { statusCode?: number } | null)?.statusCode !== 503) throw error;
+        return passiveOperatorError(error, jsonFlag);
+      }
       const failed = all
         ? ((result.errors ?? 0) > 0 || (result.failedProjects ?? 0) > 0)
         : ((result.errors ?? 0) > 0 || result.incomplete === true);
