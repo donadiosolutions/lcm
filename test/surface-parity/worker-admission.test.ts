@@ -46,6 +46,7 @@ function actualWorkerFixture() {
       throw Object.assign(new Error("owned group absent"), { code: "ESRCH" });
     } },
     fork: () => child,
+    workerLaunchOptions: () => ({ execArgv: [] }),
     createAdmissionLedger,
     // VM objects have another prototype; IPC JSON values do not. Recreate that
     // real IPC boundary before invoking the unchanged semantic comparator.

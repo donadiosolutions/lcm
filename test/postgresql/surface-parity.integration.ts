@@ -15,6 +15,7 @@ import { assertCompleteReport, assertSemanticEqual, compareBackendReports, seman
 import { createAdmissionLedger, preparedCase, validatePreparedCatalog } from "../surface-parity/prepared-projects.mjs";
 import { partitionFencedLeases, settleHeldLeases } from "../surface-parity/passive-leases.mjs";
 import { createGitFixture } from "../surface-parity/git-fixture.mjs";
+import { workerLaunchOptions } from "../surface-parity/local-isolation.mjs";
 import { FAULT_ASSERTION_OWNERS, type SurfaceRow } from "../surface-parity/inventory.js";
 import { expectedSurfaceObservations } from "./fixtures/surface-parity-workflows.mjs";
 import { assertHarnessReady, createPostgreSqlTestDatabase, harnessEnvironment, settings, type PostgreSqlTestDatabase } from "./harness.js";
@@ -554,7 +555,7 @@ class FixedBackendWorker {
   constructor(readonly backend: Backend, env: NodeJS.ProcessEnv, private administrator: OwnedAdministrator) {
     if (backend === "postgresql") administrator.setPreparedPaths({ homeDir: env.HOME!, projectPath: env.LCM_SURFACE_PROJECT_PATH!, secondaryProjectPath: env.LCM_SURFACE_SECONDARY_PROJECT_PATH! });
     this.child = fork(join(process.cwd(), "test/postgresql/fixtures/surface-parity-worker.mjs"), [], {
-      cwd: process.cwd(), env, execArgv: [], detached: true,
+      cwd: process.cwd(), env, detached: true, ...workerLaunchOptions(),
       stdio: ["ignore", "pipe", "pipe", "ipc"],
     });
     for (const stream of [this.child.stdout, this.child.stderr]) {
