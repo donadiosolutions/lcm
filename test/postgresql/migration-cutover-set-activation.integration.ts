@@ -27,10 +27,16 @@ import { projectMapPath } from "../../src/project-map.js";
 import { seedPortableSqlite } from "../storage/sqlite-portable-fixture.js";
 import { applyAllRuntimeGrants } from "./operational-fixture.js";
 import { PostgreSqlRuntime } from "../../src/storage/postgresql/runtime.js";
+import { verifyPostgreSqlRuntimeSchema } from "../../src/storage/postgresql/runtime-readiness.js";
+import { checkMigrationTargetHealth } from "../../src/migration/target-health.js";
 import {
+  EXPECTED_OWNER,
+  RUNTIME_ROLE,
+  TRANSFER_ROLE,
   dropActivationRole,
   grantRuntimeActivationRole,
   provisionActivationRole,
+  revokeTransferActivationRole,
 } from "./migration-activation-fixture.js";
 
 beforeAll(assertHarnessReady);
@@ -155,11 +161,26 @@ it("activates a prepared two-project set through one publication, resuming ident
     const { home, projects, remotes, targetConfig, roles, setId, members } = await preparedSet(db);
     try {
       const deps = createCutoverSetActivateDependencies({ homeDir: home });
+      const runtimeAdmissions: string[] = [];
+      const transferAdmissions: string[] = [];
+      const auditedDeps: CutoverSetActivateDependencies = {
+        ...deps,
+        verifyRuntimeSchema: async (executor, options) => {
+          const readiness = await deps.verifyRuntimeSchema(executor, options);
+          runtimeAdmissions.push(readiness.runtimeRole);
+          return readiness;
+        },
+        verifyTransferSchema: async (executor, options) => {
+          const readiness = await deps.verifyTransferSchema(executor, options);
+          transferAdmissions.push(readiness.runtimeRole);
+          return readiness;
+        },
+      };
       const input = { homeDir: home, confirmSetId: setId, targetConfig, ordinarySettings: roles.runtime };
       const [a, b] = members as [typeof members[number], typeof members[number]];
       const manifests = new MigrationManifestStore({ homeDir: home });
       const crashAt = async (point: string, overrides: Partial<CutoverSetActivateDependencies> = {}) => {
-        await expect(activateCutoverSet(input, { ...deps, ...overrides, crashPoint: (p) => { if (p === point) throw new Error("crash at " + point); } }))
+        await expect(activateCutoverSet(input, { ...auditedDeps, ...overrides, crashPoint: (p) => { if (p === point) throw new Error("crash at " + point); } }))
           .rejects.toThrow("crash at " + point);
         expectNotMixed(home, projects, remotes);
       };
@@ -200,7 +221,7 @@ it("activates a prepared two-project set through one publication, resuming ident
           remoteGuard: { mode: "delegated", provider: createPostgreSqlBackendPublicationRemoteGuard({ guard, machineId, ttlMs: 15 * 60 * 1000 }) },
         });
       };
-      await expect(activateCutoverSet(input, { ...deps, createCoordinator: crashingCoordinator })).rejects.toThrow("crash at map-published");
+      await expect(activateCutoverSet(input, { ...auditedDeps, createCoordinator: crashingCoordinator })).rejects.toThrow("crash at map-published");
       expect(readBackendPublicationJournal(home)?.phase).toBe("map-published");
       // The fenced handoff: the map is published and the config is not, the publication is unresolved, and
       // no member replays; this is the explicitly unresolved state, never an admitted mixed selection.
@@ -220,7 +241,7 @@ it("activates a prepared two-project set through one publication, resuming ident
       // (e) B's report written, its effect not completed: the report is reused.
       await crashAt("after-report:" + b.generationId);
 
-      const outcome = await activateCutoverSet(input, deps);
+      const outcome = await activateCutoverSet(input, auditedDeps);
       expect(outcome).toMatchObject({ status: "activated", setId, publicationId: setId, resumedFrom: "publication-journal" });
       expect(effectiveHome(home, projects, remotes)).toEqual({ backend: "postgresql", bound: [true, true] });
       expect(readBackendMaintenanceJournal(home)).toBeNull();
@@ -251,7 +272,29 @@ it("activates a prepared two-project set through one publication, resuming ident
       // Both destination projects exist, and a second call settles from durable state.
       const count = await db.migrator.query<{ projects: string }>({ text: "SELECT pg_catalog.count(*)::text AS projects FROM lcm.projects" }, { domain: "factory", operation: "diagnosticFixture" });
       expect(count.rows[0]!.projects).toBe("2");
-      expect(await activateCutoverSet(input, deps)).toMatchObject({ status: "activated", resumedFrom: "settled-active" });
+      expect(await activateCutoverSet(input, auditedDeps)).toMatchObject({ status: "activated", resumedFrom: "settled-active" });
+      expect(runtimeAdmissions.length).toBeGreaterThanOrEqual(2);
+      expect(runtimeAdmissions.every((role) => role === RUNTIME_ROLE)).toBe(true);
+      expect(transferAdmissions.length).toBeGreaterThanOrEqual(members.length);
+      expect(transferAdmissions.length % members.length).toBe(0);
+      expect(transferAdmissions.every((role) => role === TRANSFER_ROLE)).toBe(true);
+
+      const beforeRevoke = new PostgreSqlRuntime(roles.runtime);
+      try {
+        expect(await checkMigrationTargetHealth({ runtime: beforeRevoke, expectedOwner: EXPECTED_OWNER }))
+          .toMatchObject({ status: "unhealthy", reason: "schema-mismatch" });
+      } finally {
+        await beforeRevoke.close();
+      }
+      await revokeTransferActivationRole(db);
+      const afterRevoke = new PostgreSqlRuntime(roles.runtime);
+      try {
+        expect(await checkMigrationTargetHealth({ runtime: afterRevoke, expectedOwner: EXPECTED_OWNER }, {
+          verifyRuntimeSchema: verifyPostgreSqlRuntimeSchema,
+        })).toMatchObject({ status: "healthy", readiness: { runtimeRole: RUNTIME_ROLE } });
+      } finally {
+        await afterRevoke.close();
+      }
     } finally {
       await dropActivationRole(db);
       rmSync(home, { recursive: true, force: true });

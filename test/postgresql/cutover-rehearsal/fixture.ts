@@ -92,8 +92,8 @@ export type GrantProfile = "transfer" | "runtime" | "none";
 /**
  * One of a row's login roles. A single-generation row owns two: the transfer role that copy and verification use
  * (`LCM_POSTGRES_URL`) and the distinct daemon runtime role that activation proves (`LCM_POSTGRES_RUNTIME_URL`),
- * in the documented grant-first order. A set row owns the same pair but swaps the transfer role's grants, as
- * set activation proves the same distinct runtime role as one-generation activation.
+ * in the documented grant-first order. A set row owns the same pair: it grants the runtime profile before
+ * activation proves that role, then revokes the transfer role after activation succeeds.
  */
 export interface RehearsalRole {
   readonly name: string;
@@ -712,9 +712,9 @@ export class RehearsalCase {
     readonly spec: ScenarioSpec,
     readonly manifest: Manifest,
     readonly db: PostgreSqlTestDatabase,
-    /** The transfer role (a set row's one swapped role). */
+    /** The transfer role used through verification and revoked after activation. */
     readonly role: RehearsalRole,
-    /** The distinct daemon runtime role a single-generation activation proves; a set row never grants it. */
+    /** The distinct daemon runtime role granted before and proved by activation. */
     readonly runtime: RehearsalRole,
     public h: RehearsalHome,
   ) {

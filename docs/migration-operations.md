@@ -222,8 +222,8 @@ again, or follow `report`'s `next`, to continue.
 At cells 11 and 12 `resume --confirm-generation` is the fence; the backend literal `activate` and
 `rollback` ask for is read from the manifest, because the re-entry of a cutover that has already
 begun has no direction left to confirm. The outcome, including the restart observation and the
-grant-swap instruction, is the one `activate` or `rollback` would have printed, under `resume`'s
-name.
+transfer-revocation instruction, is the one `activate` or `rollback` would have printed, under
+`resume`'s name.
 
 The destination identity is the held one: the persisted local project identity and a read of the
 existing destination project. `resume` never creates either. `--dry-run` names the cell and runs
@@ -474,8 +474,8 @@ knowing by name:
   `--confirm-backend`.
 - `activation-*` and `rollback-*` (exits 2, 4, 5, 6): the closed outcome tables of `activate` and
   `rollback`, in their command sections above. `cutover-restart-required` (exit 8) is the one
-  that means the cutover is durable and a running daemon still holds the previous backend; swap the
-  grants if you have not, restart the daemon, and run `report`. `cutover-restart-contradiction` and
+  that means the cutover is durable and a running daemon still holds the previous backend; revoke
+  the transfer grants if you have not, restart the daemon, and run `report`. `cutover-restart-contradiction` and
   `cutover-restart-unresolvable` (exit 5) mean the two restart observations could not be trusted.
 - `verify-contention` (exit 4): the verification lease or the source append barrier is held
   elsewhere, or the lease was lost; no effect was begun. `verify-not-eligible` (exit 5): the fresh

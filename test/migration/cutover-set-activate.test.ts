@@ -264,6 +264,39 @@ describe("activateCutoverSet: whole-set refusals before any effect", () => {
     expect(f.guard.calls.some((call) => call.startsWith("acquire:"))).toBe(false);
   });
 
+  it("attributes second-member ordinary drift before any lease mutation", async () => {
+    const f = await fixture();
+    let ordinaryRuntime: ReturnType<typeof f.deps.createOrdinaryRuntime> | null = null;
+    let ordinaryCaptures = 0;
+    const outcome = await f.run({
+      createOrdinaryRuntime: (settings) => {
+        ordinaryRuntime = f.deps.createOrdinaryRuntime(settings);
+        return ordinaryRuntime;
+      },
+      captureDestinationIdentity: async (executor) => {
+        if (executor !== ordinaryRuntime) return { version: 1, ...f.deps.identity };
+        ordinaryCaptures += 1;
+        return {
+          version: 1,
+          sealedWitnessSha256: DEST_IDENTITY,
+          systemIdentifier: ordinaryCaptures === 2 ? "999" : SYSTEM_ID,
+        };
+      },
+    });
+
+    expect(outcome).toMatchObject({
+      status: "refused",
+      step: "S5",
+      reason: "cutover-set-member-evidence-drifted",
+      effectBegun: false,
+      members: [
+        expect.objectContaining({ evidence: null, reason: null }),
+        expect.objectContaining({ evidence: "drifted", reason: "identity-drift" }),
+      ],
+    });
+    expect(f.guard.calls.filter((call) => /^(?:acquire|renew|release|takeover):/u.test(call))).toEqual([]);
+  });
+
   it("refuses when no set is held, when the hold belongs to another set, and when the slot holds a publication", async () => {
     const unheld = await fixture({ held: false });
     expect(await unheld.run()).toMatchObject({ status: "refused", step: "S3", reason: "maintenance-not-held", effectBegun: false });
