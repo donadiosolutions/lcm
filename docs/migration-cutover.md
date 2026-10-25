@@ -1073,10 +1073,11 @@ check with the discovered runtime role. Any third grantee, role membership,
 grant option, foreign grantor, missing grant, or extra grant still refuses.
 Ordinary daemon readiness never supplies this peer option.
 
-The runtime URL is an activate-only secret. `verify`, `--dry-run`, the daemon,
-and supervisors do not read `LCM_POSTGRES_RUNTIME_URL`, and LCM never stores
-or prints it. It must be a strict `postgresql://` URL without query parameters
-or a fragment; the CA and tuning settings come from the verified destination.
+The runtime URL is an activate-only secret (`resume` reads it when it continues
+an interrupted activation). `verify`, `--dry-run`, the daemon, and supervisors
+do not read `LCM_POSTGRES_RUNTIME_URL`, and LCM never stores or prints it. It
+must be a strict `postgresql://` URL without query parameters or a fragment;
+the CA and tuning settings come from the verified destination.
 A generation verified by an older LCM build needs the runtime grants and this
 variable before the current build can activate it.
 

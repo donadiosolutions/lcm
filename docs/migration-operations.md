@@ -638,6 +638,7 @@ string is reported as `unrecognized` and is never copied into the output.
 | `set-preview-not-predictive` | 5 | A `--dry-run` that cannot predict the outcome. |
 | `set-generation-required`, `set-generation-invalid`, `set-original-generation-required` | 2, 1, 2 | The selector is missing, malformed, or names the rollback hold. |
 | `set-confirmation-missing`, `set-confirmation-moved` | 3 | `--confirm-generation` is absent or is not the aggregate set id. |
+| `set-restart-required` | 8 | `activate --set` left the selection durable, but a running daemon still holds the previous backend. Swap the grants, restart the daemon, then `report --set`. |
 
 **Exit 6.** A service returning a recoverable-looking result is not enough: the command reads the
 durable state again and emits `set-incomplete` only when that state still admits the same service,
@@ -652,8 +653,11 @@ referenced verification report cannot be read.
 **After a set activation.** Follow the grant swap in
 [Migration cutover sets](migration-cutover-set.md): `activate --set` runs entirely under the
 transfer role, so add the runtime grants and revoke the transfer grants before starting the daemon,
-then run `report --set` until it exits 0. This differs from single-generation activation, which
-applies runtime grants before activate and leaves only transfer-grant revocation afterward.
+then run `report --set` until it exits 0. `activate --set` names that swap as its next step on exit 0
+(`swap-grants-then-start-daemon`, with `grantSwap: required-before-daemon-start` in the evidence), and
+its exit 8 refusal (`set-restart-required`) repeats it. This differs from single-generation
+activation, which applies runtime grants before activate and leaves only transfer-grant revocation
+afterward.
 
 **Known diagnostic limits.** `report --set` does not repair `abort`'s immediate readback attribution
 (#1657). A rollback checkpoint that is absent means no committed rollback checkpoint, not that no
@@ -1692,6 +1696,11 @@ block marks implemented. `canEmit` is the closed set of exit classes the command
       "reason": "set-confirmation-moved",
       "exitClass": "refused-confirmation",
       "remedy": "--confirm-generation does not match the set. Pass the aggregate set id this refusal reports, or re-run plan --set if the candidate moved (never a member generation id); nothing was changed."
+    },
+    {
+      "reason": "set-restart-required",
+      "exitClass": "restart-required",
+      "remedy": "The set's durable selection is correct, but a running daemon still holds the previous startup backend. Swap the grants (add the runtime grants to the daemon runtime role, then revoke the transfer grants), restart the daemon with LCM_POSTGRES_URL set to that runtime role, then run `lcm migration report --set --generation <set-id>`."
     }
   ]
 }

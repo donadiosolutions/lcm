@@ -29,7 +29,7 @@ describe("the closed set refusal buckets", () => {
       ["set-operator-required", "failed-operator-required"], ["set-preview-not-predictive", "refused-evidence"],
       ["set-generation-required", "refused-precondition"], ["set-generation-invalid", "usage"],
       ["set-original-generation-required", "refused-precondition"], ["set-confirmation-missing", "refused-confirmation"],
-      ["set-confirmation-moved", "refused-confirmation"],
+      ["set-confirmation-moved", "refused-confirmation"], ["set-restart-required", "restart-required"],
     ]);
     for (const entry of MIGRATION_REFUSAL_REASONS.filter((candidate) => candidate.reason.startsWith("set-"))) {
       expect(entry.remedy).not.toMatch(/\$\{/u);

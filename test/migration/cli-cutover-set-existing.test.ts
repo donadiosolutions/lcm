@@ -184,7 +184,13 @@ describe("activate --set", () => {
     });
     expect(envelope("activate", await run(ACTIVATED, activated("settled-active"), {}, {}, active))).toMatchObject({ exitCode: 0, applied: false });
     const stale = envelope("activate", await run(ACTIVATED, activated("fresh"), { combineRestart: async () => STALE as never }, {}, active));
-    expect(stale).toMatchObject({ exitCode: 8, next: "swap-grants-then-start-daemon", applied: true });
+    // The set's exit 8 renders the set swap remedy (runtime grants added, then transfer grants revoked), never the
+    // single-generation revoke-only remedy of the shared restart reason.
+    expect(stale).toMatchObject({
+      exitCode: 8, next: "swap-grants-then-start-daemon", applied: true,
+      refusal: { reason: "set-restart-required", remedy: expect.stringMatching(/^The set's durable selection is correct.*add the runtime grants to the daemon runtime role, then revoke the transfer grants.*report --set/u) },
+    });
+    expect((stale.refusal as { remedy: string }).remedy).not.toMatch(/proven runtime role/u);
     const contradiction = envelope("activate", await run(ACTIVATED, activated("settled-active"), { combineRestart: async () => CONTRADICTION as never }, {}, active));
     expect(contradiction).toMatchObject({ exitCode: 5, next: "report --set", applied: false });
     const mismatch = envelope("activate", await run(ACTIVATING, activated("fresh"), {}, {}, prepared));

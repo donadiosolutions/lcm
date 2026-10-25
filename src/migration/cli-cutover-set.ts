@@ -51,6 +51,8 @@ import { verifyMigrationTargetReachability } from "./target-reachability.js";
 import type { ResolvedPostgreSqlConfig } from "../daemon/config.js";
 
 const CUTOVER_SET_ACTIVATE_NEXT_AFTER_SUCCESS = "swap-grants-then-start-daemon";
+/** The set's own exit-8 reason: the transfer-only set activation still needs the full grant swap, not the revoke alone. */
+const CUTOVER_SET_RESTART_REQUIRED = "set-restart-required";
 
 /**
  * The `--set` mode of the nine `lcm migration` commands (#1551): thin
@@ -830,9 +832,10 @@ async function mapActivate(args: Readonly<{
     resumedFrom: result.resumedFrom, grantSwap: "required-before-daemon-start", ...restart.evidence, ...writeEvidence,
   };
   if (restart.reason !== undefined) {
-    return refuse(restart.reason, {
+    const required = restart.reason === CUTOVER_RESTART_REASONS.required;
+    return refuse(required ? CUTOVER_SET_RESTART_REQUIRED : restart.reason, {
       generationId: setId, ...(applied ? { applied: true } : {}),
-      next: restart.reason === CUTOVER_RESTART_REASONS.required ? CUTOVER_SET_ACTIVATE_NEXT_AFTER_SUCCESS : "report --set",
+      next: required ? CUTOVER_SET_ACTIVATE_NEXT_AFTER_SUCCESS : "report --set",
       sections: evidence, restart: restart.restart,
     });
   }

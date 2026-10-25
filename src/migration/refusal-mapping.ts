@@ -610,6 +610,12 @@ export const MIGRATION_REFUSAL_REASONS: readonly MigrationRefusalMapping[] = Obj
     reason: "set-confirmation-moved", exitClass: "refused-confirmation",
     remedy: "--confirm-generation does not match the set. Pass the aggregate set id this refusal reports, or re-run plan --set if the candidate moved (never a member generation id); nothing was changed.",
   }),
+  // `activate --set` is still transfer-only: its restart refusal names the
+  // full grant swap, where the single-generation one names the revoke alone.
+  Object.freeze({
+    reason: "set-restart-required", exitClass: "restart-required",
+    remedy: "The set's durable selection is correct, but a running daemon still holds the previous startup backend. Swap the grants (add the runtime grants to the daemon runtime role, then revoke the transfer grants), restart the daemon with LCM_POSTGRES_URL set to that runtime role, then run `lcm migration report --set --generation <set-id>`.",
+  }),
 ] satisfies MigrationRefusalMapping[]);
 
 const REFUSAL_BY_REASON: ReadonlyMap<string, MigrationRefusalMapping> = new Map(

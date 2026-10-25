@@ -12,6 +12,7 @@ import { appendLocalHookEvents, LocalHookDurabilityTimeoutError } from "../../..
 import { createBackendPublicationCoordinator } from "../../../src/storage/backend-publication-driver.js";
 import { createPostgreSqlBackendPublicationRemoteGuard } from "../../../src/storage/postgresql/publication-remote-guard.js";
 import { resolveMigrationDestination } from "../../../src/migration/cli-destination.js";
+import { resolveMigrationActivationRuntimeSettings } from "../../../src/migration/cli-activate.js";
 import { runMigrationActivation, type MigrationActivationDependencies } from "../../../src/migration/activate-generation.js";
 import { readMachineIdentity } from "../../../src/machine-identity.js";
 import { PostgreSqlCoordinationRepository } from "../../../src/storage/postgresql/memory-repositories.js";
@@ -88,6 +89,12 @@ const TRANSFER_SCRIPTS = [...RUNTIME_SCRIPTS, "postgresql-transfer-grants.sql"] 
 
 export type GrantProfile = "transfer" | "runtime" | "none";
 
+/**
+ * One of a row's login roles. A single-generation row owns two: the transfer role that copy and verification use
+ * (`LCM_POSTGRES_URL`) and the distinct daemon runtime role that activation proves (`LCM_POSTGRES_RUNTIME_URL`),
+ * in the documented grant-first order. A set row owns the same pair but swaps the transfer role's grants, as
+ * `activate --set` is still transfer-only.
+ */
 export interface RehearsalRole {
   readonly name: string;
   readonly url: string;
@@ -133,6 +140,18 @@ export async function createRole(db: PostgreSqlTestDatabase, signal?: AbortSigna
   return { name, url: url.toString(), profile: "none" };
 }
 
+/** Both login roles of a row; a failure creating the second still drops the first (the caller owns both afterwards). */
+export async function createRoles(db: PostgreSqlTestDatabase, signal?: AbortSignal): Promise<{ readonly transfer: RehearsalRole; readonly runtime: RehearsalRole }> {
+  const transfer = await createRole(db, signal);
+  try {
+    return { transfer, runtime: await createRole(db, signal) };
+  } catch (error) {
+    // The creation failure is the one reported; a drop failure here would only hide it.
+    try { await dropRole(db, transfer, signal); } catch { /* reported through the thrown creation failure */ }
+    throw error;
+  }
+}
+
 /** Give the created role the transfer profile, as an operator provisions the canonical transfer role. */
 export async function provisionRole(db: PostgreSqlTestDatabase, role: RehearsalRole, signal?: AbortSignal): Promise<void> {
   const administrator = new PostgreSqlRuntime(settings(db.adminUrl));
@@ -145,7 +164,7 @@ export async function provisionRole(db: PostgreSqlTestDatabase, role: RehearsalR
   role.profile = "transfer";
 }
 
-/** The operator's grant swap (and its reverse): drop the role's grants and install the other profile. */
+/** The operator's grant swap (the set rows' swap, and its reverse): drop the role's grants and install the other profile. */
 export async function swapGrants(db: PostgreSqlTestDatabase, role: RehearsalRole, profile: GrantProfile, signal?: AbortSignal): Promise<void> {
   await applyProfile(db, role.name, profile, signal);
   role.profile = profile;
@@ -170,7 +189,8 @@ export interface RehearsalHome {
   readonly env: NodeJS.ProcessEnv;
 }
 
-export function childEnvironment(root: string, home: string, role: RehearsalRole): NodeJS.ProcessEnv {
+/** The operator's shell: `LCM_POSTGRES_URL` names the transfer role; the activate-only runtime URL is present when the row has a runtime role. */
+export function childEnvironment(root: string, home: string, role: RehearsalRole, runtime: RehearsalRole | null = null): NodeJS.ProcessEnv {
   const environment: NodeJS.ProcessEnv = {
     PATH: process.env.PATH, LANG: process.env.LANG, LC_ALL: process.env.LC_ALL, TZ: "UTC",
     HOME: home, USERPROFILE: home,
@@ -178,6 +198,7 @@ export function childEnvironment(root: string, home: string, role: RehearsalRole
     XDG_STATE_HOME: join(root, "xdg-state"), XDG_RUNTIME_DIR: join(root, "xdg-run"), TMPDIR: join(root, "tmp"),
     LCM_POSTGRES_URL: role.url, LCM_POSTGRES_CA_FILE: harnessEnvironment().LCM_TEST_POSTGRES_CA_FILE,
     LCM_POSTGRES_MIGRATION_ROLE: MIGRATION_ROLE,
+    ...(runtime === null ? {} : { LCM_POSTGRES_RUNTIME_URL: runtime.url }),
   };
   for (const name of ["XDG_CONFIG_HOME", "XDG_CACHE_HOME", "XDG_STATE_HOME", "XDG_RUNTIME_DIR", "TMPDIR"]) {
     mkdirSync(environment[name]!, { recursive: true, mode: 0o700 });
@@ -199,7 +220,7 @@ export async function unusedPort(): Promise<number> {
   return address.port;
 }
 
-export function createHome(label: string, role: RehearsalRole, daemonPort: number, projectName = "project"): RehearsalHome {
+export function createHome(label: string, role: RehearsalRole, daemonPort: number, projectName = "project", runtime: RehearsalRole | null = null): RehearsalHome {
   const root = mkdtempSync(join(tmpdir(), "lcm-rh-" + label.toLowerCase().replace(/[^a-z0-9]+/gu, "") + "-"));
   const home = join(root, "home");
   try {
@@ -208,7 +229,7 @@ export function createHome(label: string, role: RehearsalRole, daemonPort: numbe
       storage: { backend: "sqlite", postgresql: { migrationRole: MIGRATION_ROLE } },
       daemon: { port: daemonPort },
     }) + "\n", { mode: 0o600 });
-    const env = childEnvironment(root, home, role);
+    const env = childEnvironment(root, home, role, runtime);
     return addProject({ root, home, cwd: "", localProjectId: "", projectDir: "", env }, projectName);
   } catch (error) {
     rmSync(root, { recursive: true });
@@ -691,11 +712,18 @@ export class RehearsalCase {
     readonly spec: ScenarioSpec,
     readonly manifest: Manifest,
     readonly db: PostgreSqlTestDatabase,
+    /** The transfer role (a set row's one swapped role). */
     readonly role: RehearsalRole,
+    /** The distinct daemon runtime role a single-generation activation proves; a set row never grants it. */
+    readonly runtime: RehearsalRole,
     public h: RehearsalHome,
   ) {
-    this.secrets = [role.url, new URL(role.url).password];
+    this.secrets = [role.url, new URL(role.url).password, runtime.url, new URL(runtime.url).password];
+    this.operator = role;
   }
+
+  /** The role the operator's `LCM_POSTGRES_URL` names now: the transfer role until a single-generation activation hands over to the runtime role. */
+  operator: RehearsalRole;
 
   get gen(): string { return this.vars.gen!; }
 
@@ -854,17 +882,19 @@ export class RehearsalCase {
     for (const home of homes) {
       try { absent.push(removeHome(home)); } catch (error) { absent.push(false); this.cleanupProblems.push("home removal failed: " + (error instanceof Error ? error.name : "error")); }
     }
-    let roleAbsent = false;
-    try { await dropRole(this.db, this.role, this.signal); } catch (error) { this.cleanupProblems.push("role drop failed: " + (error instanceof Error ? error.name : "error")); }
-    try {
-      roleAbsent = (await this.sql("SELECT 1 AS present FROM pg_catalog.pg_roles WHERE rolname = $1", [this.role.name])).length === 0;
-    } catch (error) { this.cleanupProblems.push("role absence query failed: " + (error instanceof Error ? error.name : "error")); }
-    if (!roleAbsent) this.cleanupProblems.push("owned role still present");
+    let rolesAbsent = 0;
+    for (const role of [this.role, this.runtime]) {
+      try { await dropRole(this.db, role, this.signal); } catch (error) { this.cleanupProblems.push("role drop failed: " + (error instanceof Error ? error.name : "error")); }
+      try {
+        if ((await this.sql("SELECT 1 AS present FROM pg_catalog.pg_roles WHERE rolname = $1", [role.name])).length === 0) rolesAbsent += 1;
+      } catch (error) { this.cleanupProblems.push("role absence query failed: " + (error instanceof Error ? error.name : "error")); }
+    }
+    if (rolesAbsent !== 2) this.cleanupProblems.push("an owned role is still present");
     if (!absent.every(Boolean)) this.cleanupProblems.push("a private home is still present");
     this.homeRoots.push(...roots.filter((root) => root !== ""));
     this.invariants.I6 = {
       status: this.cleanupProblems.length === 0 ? "pass" : "fail",
-      evidenceRefs: ["homes-absent:" + String(absent.length), "owned-role-absent:" + String(roleAbsent)],
+      evidenceRefs: ["homes-absent:" + String(absent.length), "owned-roles-absent:" + String(rolesAbsent) + "/2"],
       ...(this.cleanupProblems.length === 0 ? {} : { reason: this.cleanupProblems.join("; ").slice(0, 280) }),
     };
   }
@@ -1080,9 +1110,9 @@ export async function destinationProjectId(db: PostgreSqlTestDatabase, cwd: stri
   return id;
 }
 
-/** A canonical write through the project-guarded repository under the ordinary runtime role (after the grant swap). */
+/** A canonical write through the project-guarded repository under the role the operator now holds (the runtime role after the handover). */
 export async function guardedWrite(c: RehearsalCase, sessionId: string): Promise<void> {
-  const runtime = new PostgreSqlRuntime(settings(c.role.url));
+  const runtime = new PostgreSqlRuntime(settings(c.operator.url));
   try {
     const projectId = await destinationProjectId(c.db, c.h.cwd, c.signal);
     const repository = new PostgreSqlConversationRepository(runtime, projectId);
@@ -1356,10 +1386,14 @@ export class InjectedInterruption extends Error {
   constructor(readonly point: string) { super("rehearsal-interruption:" + point); this.name = "InjectedInterruption"; }
 }
 
-/** Operator environment for in-process production entries: private HOME plus the destination variables. */
+/**
+ * Operator environment for in-process production entries: private HOME plus the destination variables, `LCM_POSTGRES_URL`
+ * naming the role the operator holds now and the activate-only runtime URL beside it.
+ */
 export async function withOperatorEnv<T>(c: RehearsalCase, home: RehearsalHome, callback: () => Promise<T>): Promise<T> {
   const caFile = harnessEnvironment().LCM_TEST_POSTGRES_CA_FILE;
-  vi.stubEnv("LCM_POSTGRES_URL", c.role.url);
+  vi.stubEnv("LCM_POSTGRES_URL", c.operator.url);
+  vi.stubEnv("LCM_POSTGRES_RUNTIME_URL", c.runtime.url);
   vi.stubEnv("LCM_POSTGRES_CA_FILE", caFile);
   vi.stubEnv("LCM_POSTGRES_MIGRATION_ROLE", MIGRATION_ROLE);
   try {
@@ -1367,6 +1401,21 @@ export async function withOperatorEnv<T>(c: RehearsalCase, home: RehearsalHome, 
   } finally {
     vi.unstubAllEnvs();
   }
+}
+
+/** The documented grant-first step: the runtime role receives the runtime profile after verification, immediately before `activate`. */
+export async function grantRuntimeRole(c: RehearsalCase): Promise<void> {
+  await swapGrants(c.db, c.runtime, "runtime", c.signal);
+}
+
+/**
+ * The operator's one privilege step after a successful single-generation activation: revoke the transfer grants, then hand
+ * `LCM_POSTGRES_URL` to the proven runtime role for the daemon, guarded writes and a later rollback.
+ */
+export async function revokeTransferGrants(c: RehearsalCase): Promise<void> {
+  await swapGrants(c.db, c.role, "none", c.signal);
+  c.operator = c.runtime;
+  c.h.env.LCM_POSTGRES_URL = c.runtime.url;
 }
 
 export type ActivationInterruption =
@@ -1396,9 +1445,11 @@ export async function interruptActivation(c: RehearsalCase, interruption: Activa
   const outcome = await withOperatorEnv(c, home, async () => {
     const destination = await resolveMigrationDestination({ cwd: home.cwd, homeDir: home.home });
     if (destination.status === "refuse") throw new Error("rehearsal destination did not resolve: " + destination.reason);
+    const runtime = resolveMigrationActivationRuntimeSettings({ transferSettings: destination.settings, expectedOwner: destination.expectedOwner });
+    if (runtime.status === "refuse") throw new Error("rehearsal runtime target did not resolve: " + runtime.reason);
     try {
       const result = await runMigrationActivation({
-        homeDir: home.home, generationId: c.gen, transferSettings: destination.settings, ordinarySettings: destination.settings,
+        homeDir: home.home, generationId: c.gen, transferSettings: destination.settings, ordinarySettings: runtime.settings,
         expectedIdentity: destination.expectedIdentity, expectedOwner: destination.expectedOwner, signal: c.signal,
       }, deps);
       return "returned:" + result.status;
@@ -1424,7 +1475,7 @@ export interface CompetingLease { readonly fencingToken: string; release(): Prom
 
 /** Another actor takes a fenced lease on the destination project under its own process id. */
 export async function competingLease(c: RehearsalCase, resourceType: string, resourceKey: string, ttlMs = 600_000): Promise<CompetingLease> {
-  const runtime = new PostgreSqlRuntime(settings(c.role.url));
+  const runtime = new PostgreSqlRuntime(settings(c.operator.url));
   const projectId = await destinationProjectId(c.db, c.h.cwd, c.signal);
   const machineId = readMachineIdentity(c.h.home)!.machineId!;
   const repository = new PostgreSqlCoordinationRepository(runtime, projectId, machineId);
@@ -1445,7 +1496,7 @@ export async function staleTokenRefused(c: RehearsalCase): Promise<{ readonly st
   const first = await competingLease(c, resourceType, resourceKey, 1_000);
   await c.sql("UPDATE lcm.fenced_leases SET acquired_at = acquired_at - interval '2 hours', renewed_at = renewed_at - interval '2 hours', expires_at = expires_at - interval '2 hours' WHERE resource_type = $1", [resourceType]);
   const second = await competingLease(c, resourceType, resourceKey);
-  const runtime = new PostgreSqlRuntime(settings(c.role.url));
+  const runtime = new PostgreSqlRuntime(settings(c.operator.url));
   try {
     const projectId = await destinationProjectId(c.db, c.h.cwd, c.signal);
     const machineId = readMachineIdentity(c.h.home)!.machineId!;
@@ -1691,7 +1742,7 @@ export async function assertEventsJoined(c: RehearsalCase, label: string, eligib
 
 /** Settings and project resolved while the harness environment is unambiguous, for writes made inside an operator-environment window. */
 export async function prepareGuardedWriter(c: RehearsalCase): Promise<(sessionId: string) => Promise<void>> {
-  const connection = settings(c.role.url);
+  const connection = settings(c.operator.url);
   const projectId = await destinationProjectId(c.db, c.h.cwd, c.signal);
   return async (sessionId: string): Promise<void> => {
     const runtime = new PostgreSqlRuntime(connection);
@@ -1964,7 +2015,7 @@ export async function uploadResidentEvents(c: RehearsalCase, names: readonly str
     return entry;
   });
   const projectId = await destinationProjectId(c.db, c.h.cwd, c.signal);
-  const runtime = new PostgreSqlRuntime(settings(c.role.url));
+  const runtime = new PostgreSqlRuntime(settings(c.operator.url));
   const factory = new SQLiteLocalHookOutboxFactory();
   try {
     await withHome(c.h.home, async () => {
@@ -2003,7 +2054,7 @@ export async function replicateWithWitness(c: RehearsalCase, names: readonly str
     return entry;
   });
   const projectId = await destinationProjectId(c.db, c.h.cwd, c.signal);
-  const runtime = new PostgreSqlRuntime(settings(c.role.url));
+  const runtime = new PostgreSqlRuntime(settings(c.operator.url));
   const factory = new SQLiteLocalHookOutboxFactory();
   const receipts: PostgreSqlPassiveEventRecord[] = [];
   try {
