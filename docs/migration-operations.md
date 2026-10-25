@@ -293,6 +293,8 @@ manifest is absent or aborted, `abort` writes nothing, exits 0 with `applied: fa
 settled pair back. A crash between the two writes is finished by running `abort` again: with the
 journal aborted and the manifest copied, planned or similar, it settles the manifest; with the abort
 effect already begun, it completes that carried effect without aborting the journal a second time.
+When an interrupted abort is re-run, the manifest's abort report is sealed to the evidence persisted
+in the aborted journal, so an interrupted and an uninterrupted abort produce the same manifest.
 
 `abort` writes nothing unless it can finish the whole recovery. A manifest with a begun effect that
 `resume` (or `verify`) owns — a pending copy, dry-run or verification effect — is refused
