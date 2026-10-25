@@ -76,6 +76,14 @@ export const GRAPH_INVISIBLE_INPUTS = Object.freeze([
     pattern: /^src\/memory\/index\.ts$/u,
     tests: Object.freeze(["test/memory/search-type-contract.test.ts"]),
   }),
+  // Test sources a test reads from disk and evaluates instead of importing. The
+  // completeness test only proves a reading test is listed; a new disk-read
+  // source needs its own pattern and entry.
+  Object.freeze({
+    name: "extracted-sources",
+    pattern: /^test\/postgresql\/surface-parity\.integration\.ts$/u,
+    tests: Object.freeze(["test/surface-parity/worker-admission.test.ts"]),
+  }),
   // Codecov ownership fragments the contract test reads from disk.
   Object.freeze({
     name: "codecov-ownership",
