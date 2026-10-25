@@ -1041,8 +1041,9 @@ from an earlier pass:
   [Cutover sets](migration-cutover-set.md#running-a-set-with-lcm-migration---set));
 - the destination identity, the project-map binding, the transfer-ledger copy
   binding and the destination census all match the verification report, and
-  the PostgreSQL target passes the authenticated health check for the
-  transfer role (see [The activation role](#the-activation-role)).
+  PostgreSQL health passes as the daemon runtime role while admitting exactly
+  the live canonical transfer role as its caller-scoped peer (see
+  [The activation role](#the-activation-role)).
 
 A failed precondition is a **refusal**. A refusal begins no effect and leaves
 nothing to recover: fix the named condition and run again. Refusals name the
@@ -1055,55 +1056,66 @@ mismatch on the transfer session) is attributed exactly as the health check
 attributes it, `target-unhealthy` or `target-unresolvable` at `S7`.
 
 The destination identity query that compares the live destination with the
-sealed manifest (at `S0`, `S5` and `S7`) is attributed the same way. A
-definite server refusal (authentication, missing privilege) is reported as
-`target-unhealthy`; a connection or transport failure is reported as
-`target-unresolvable`. Both are refusals at the step that ran the query, or,
-when an effect has already begun and the run is re-entered, an interruption of
-the step in flight. Neither rejects the whole activation. A cancelled
-activation is still rejected, not classified.
+sealed manifest (at `S0` and `S7` on the transfer session, and on the
+ordinary runtime session before any lease write, attributed to `S6`) is
+classified the same way. A definite server refusal (authentication, missing
+privilege) is reported as `target-unhealthy`; a connection or transport
+failure is reported as `target-unresolvable`. Both are refusals at the step
+that ran the query, or, when an effect has already begun and the run is
+re-entered, an interruption of the step in flight. Neither rejects the whole
+activation. A cancelled activation is still rejected, not classified.
 
 ### The activation role
 
-Activation connects to PostgreSQL as the **transfer role**: the role that
-holds the reviewed runtime grants plus the
-[transfer grant script](../src/storage/postgresql/reference/postgresql-transfer-grants.sql),
-the same role the copy and the verification used. Every activation step runs
-under it, including the lease, the health checks and the census; the health
-check admits the role through the transfer readiness check, not the daemon's
-runtime readiness check. There is no second connection as the daemon's
-runtime role: PostgreSQL readiness admits exactly one grantee per database,
-and the runtime and transfer privilege profiles are exclusive on one role, so
-a database cannot admit both profiles at once. Callers therefore supply the
-transfer role's connection settings for both of activation's settings
-fields. A caller that supplies runtime-only settings is refused at `S6` with
-`target-unhealthy` before any effect begins.
+Activation uses two PostgreSQL connections to the same sealed destination:
 
-### After activation: the grant swap and the daemon
+- `LCM_POSTGRES_URL` remains the transfer role used by copy and verification;
+- `LCM_POSTGRES_RUNTIME_URL` is the daemon runtime role used for the lease and
+  the `S6`/`S15` health checks.
 
-A successful activation proves that the transfer role could publish the
-selection; it does **not** prove that the daemon can start. The daemon
-enforces its exact runtime privilege profile when it starts, and that profile
-rejects the transfer grants. Before starting the daemon on the new backend:
+Before `activate`, apply the reviewed runtime grant scripts to the runtime
+role. Activation reads `current_user`, `session_user`, and the role OID from
+both live sessions, refuses switched or identical roles, and binds the runtime
+connection to the same destination identity before it can write the lease.
+Runtime readiness then admits exactly the discovered transfer role as the
+other canonical profile. The `S7` transfer check performs the reciprocal
+check with the discovered runtime role. Any third grantee, role membership,
+grant option, foreign grantor, missing grant, or extra grant still refuses.
+Ordinary daemon readiness never supplies this peer option.
 
-1. apply the reviewed runtime grant scripts to the daemon's runtime role (see
-   [Provisioning a PostgreSQL database](configuration.md#provisioning-a-postgresql-database));
-2. revoke the transfer grants from the transfer role (or drop that role) so
-   the runtime role is the schema's only non-owner grantee;
-3. start (or restart) the daemon, which performs its own readiness check
-   against the runtime role and refuses to serve until it passes.
+The runtime URL is an activate-only secret (`resume` reads it when it continues
+an interrupted activation). `verify`, `--dry-run`, the daemon, and supervisors
+do not read `LCM_POSTGRES_RUNTIME_URL`, and LCM never stores or prints it. It
+must be a strict `postgresql://` URL without query parameters or a fragment;
+the CA and tuning settings come from the verified destination.
+A generation verified by an older LCM build needs the runtime grants and this
+variable before the current build can activate it.
 
-Also switch `LCM_POSTGRES_URL` from the transfer role's URL used for
-activation to the runtime role's URL before starting the daemon or running a
-rollback, and leave `migrationRole` naming the schema owner.
+During the short grant-first window, no-peer commands remain deliberately
+strict. Fresh `verify`, copy resume, and target reachability refuse while the
+runtime grants exist; revoke the runtime grants before using those pre-activate
+recovery paths. Runtime-profile callers such as rollback, diagnostics, and
+daemon readiness refuse until the transfer grants are removed. An interrupted
+activation resumes through `activate`, which remains peer-aware. Cutover-set
+activation is still transfer-only and does not use this ordering yet.
 
-Leaving the transfer grants in place makes the daemon's readiness refuse the
-database as `acl-shape` or `schema-fingerprint`; applying the runtime grants
-before revoking the transfer grants is harmless, because readiness is only
-evaluated when the daemon starts. A later improvement, #1607, teaches
-readiness to admit the canonical transfer role next to the runtime role so
-that activation can prove the daemon's own pair; until then the swap is the
-operator's step.
+Readiness evaluates live ACLs. PostgreSQL default privileges are not admission
+evidence and are not inspected here; if they materialize an unexpected grant
+on a later object, the next readiness check refuses that live grant.
+
+### After activation: revoke transfer grants and start the daemon
+
+A successful activation has already proved the daemon runtime role's exact
+grants. One manual privilege step remains:
+
+1. revoke the transfer grants from the transfer role, or drop that role;
+2. set the daemon/service `LCM_POSTGRES_URL` to the same runtime-role URL that
+   `LCM_POSTGRES_RUNTIME_URL` supplied to activation;
+3. start or restart the daemon, whose ordinary readiness admits no peer.
+
+Leaving the transfer grants in place makes daemon readiness refuse with
+`acl-shape` or `schema-fingerprint`. Keep `migrationRole` naming the schema
+owner. The URL handoff is still required, but it is not another grant step.
 
 ### What activation writes, in order
 

@@ -142,17 +142,16 @@ describe("runbook prose: the obligations the cutover commands add (no mechanical
     return runbookText.slice(start, next === -1 ? undefined : next);
   }
 
-  it("tells the operator to swap the grants before starting the daemon, in the activate reference and the cutover section, and cites #1607 as the later improvement", () => {
+  it("puts runtime grants before activation and transfer revocation before daemon start", () => {
     const activate = section("### `lcm migration activate");
-    const cutover = section("## The cutover: activate and the grant swap");
+    const cutover = section("## The cutover: activate and revoke transfer grants");
     for (const text of [activate, cutover]) {
-      expect(text).toMatch(/swap\s+the\s+grants/iu);
       expect(text).toMatch(/runtime\s+grants/u);
       expect(text).toMatch(/revoke\s+the\s+transfer\s+grants/iu);
-      expect(text).toMatch(/before\s+(starting|you\s+start)\s+the\s+daemon/iu);
+      expect(text).toContain("LCM_POSTGRES_RUNTIME_URL");
     }
-    expect(cutover).toContain("#1607");
-    expect(cutover.indexOf("Swap the grants")).toBeLessThan(cutover.indexOf("Start (or restart) the daemon"));
+    expect(cutover.indexOf("Apply the reviewed runtime grants")).toBeLessThan(cutover.indexOf("lcm migration activate"));
+    expect(cutover.indexOf("Revoke the transfer grants")).toBeLessThan(cutover.indexOf("Start (or restart) the daemon"));
   });
 
   it("states rollback's remote-binding refusal (A14) in the rollback reference and the limits section", () => {

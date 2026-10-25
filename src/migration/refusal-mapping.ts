@@ -471,6 +471,10 @@ export const MIGRATION_REFUSAL_REASONS: readonly MigrationRefusalMapping[] = Obj
     remedy: "Activation was refused before it began any effect: the evidence names the step and the reason. Fix that condition, then run `lcm migration activate` again. `lcm migration report` shows the current state.",
   }),
   Object.freeze({
+    reason: "activation-runtime-target-missing", exitClass: "refused-precondition",
+    remedy: "Activation requires LCM_POSTGRES_RUNTIME_URL for the daemon runtime role. Set it to a strict postgresql:// URL for the verified destination, without query parameters or a fragment, then retry.",
+  }),
+  Object.freeze({
     reason: "activation-refused-contention", exitClass: "refused-contention",
     remedy: "Another actor holds the activation lease. Nothing was changed; wait for it to finish or expire, then run `lcm migration activate` again.",
   }),
@@ -520,7 +524,7 @@ export const MIGRATION_REFUSAL_REASONS: readonly MigrationRefusalMapping[] = Obj
   }),
   Object.freeze({
     reason: "cutover-restart-required", exitClass: "restart-required",
-    remedy: "The durable selection is correct, but a running daemon still holds the previous startup backend. Swap the grants first (add the runtime grants, revoke the transfer grants), restart the daemon, then run `lcm migration report`.",
+    remedy: "The durable selection is correct, but a running daemon still holds the previous startup backend. Revoke the transfer grants, restart the daemon with LCM_POSTGRES_URL set to the proven runtime role, then run `lcm migration report`.",
   }),
   Object.freeze({
     reason: "cutover-restart-contradiction", exitClass: "refused-evidence",
@@ -604,6 +608,12 @@ export const MIGRATION_REFUSAL_REASONS: readonly MigrationRefusalMapping[] = Obj
   Object.freeze({
     reason: "set-confirmation-moved", exitClass: "refused-confirmation",
     remedy: "--confirm-generation does not match the set. Pass the aggregate set id this refusal reports, or re-run plan --set if the candidate moved (never a member generation id); nothing was changed.",
+  }),
+  // `activate --set` is still transfer-only: its restart refusal names the
+  // full grant swap, where the single-generation one names the revoke alone.
+  Object.freeze({
+    reason: "set-restart-required", exitClass: "restart-required",
+    remedy: "The set's durable selection is correct, but a running daemon still holds the previous startup backend. Swap the grants (add the runtime grants to the daemon runtime role, then revoke the transfer grants), restart the daemon with LCM_POSTGRES_URL set to that runtime role, then run `lcm migration report --set --generation <set-id>`.",
   }),
 ] satisfies MigrationRefusalMapping[]);
 

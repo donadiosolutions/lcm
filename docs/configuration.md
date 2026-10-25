@@ -655,9 +655,21 @@ configuration commands:
 
 ```bash
 export LCM_POSTGRES_URL='postgresql://USER:PASSWORD@HOST:25060/DATABASE'
+export LCM_POSTGRES_RUNTIME_URL='postgresql://RUNTIME_USER:RUNTIME_PASSWORD@HOST:25060/DATABASE'
 export LCM_POSTGRES_CA_FILE='/absolute/path/to/ca-certificate.crt'
 export LCM_POSTGRES_MIGRATION_ROLE='lcm_migration'
 ```
+
+`LCM_POSTGRES_RUNTIME_URL` is used only by `lcm migration activate` (including
+`lcm migration resume` when it continues an interrupted activation). Set it
+after applying the runtime grant scripts and before activation so `S6` and
+`S15` prove the same restricted role the daemon will use. Activate validates
+it with the same URL rules as `LCM_POSTGRES_URL` and reuses the resolved CA
+and pool/time-out settings. `lcm migration verify`, `activate --dry-run`, the
+daemon, MCP, systemd, and launchd do not read it; it is never written to
+`config.json` or included in output. After activation, set the daemon's
+`LCM_POSTGRES_URL` to this same runtime-role URL and unset the activate-only
+variable when it is no longer needed.
 
 `migrationRole` is the expected owner of the database, the `lcm` schema, and
 all managed schema objects. It is an authorization identity, not a credential,
@@ -1062,7 +1074,7 @@ failure if either cleanup fails. This explicit lifecycle is also the cleanup
 model used by daemon route operations and does not change SQLite's active
 default.
 
-Before opening project storage, restore
+Before opening project storage, set
 `LCM_POSTGRES_URL` to the restricted runtime-role URL, run `lcm machine
 register`, pair projects explicitly, and complete backend publication. Factory
 construction fails closed on unhealthy TLS/runtime state, ownership or schema

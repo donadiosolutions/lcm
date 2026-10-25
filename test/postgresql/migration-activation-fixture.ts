@@ -35,9 +35,10 @@ import { seedPortableSqlite } from "../storage/sqlite-portable-fixture.js";
  */
 
 export const EXPECTED_OWNER = "lcm_test_migrator";
-/** The activation role (transfer profile). Cluster-wide, so unique per run: a
- * parallel or stale run never shares or drops another run's role. */
-export const ACTIVATION_ROLE = "lcm_test_transfer_" + randomBytes(6).toString("hex");
+/** The activation roles are cluster-wide and unique per run, so a parallel
+ * or stale run never shares or drops another run's roles. */
+export const TRANSFER_ROLE = "lcm_test_transfer_" + randomBytes(6).toString("hex");
+export const RUNTIME_ROLE = "lcm_test_activation_runtime_" + randomBytes(6).toString("hex");
 export const GENERATION_ID = "activation-e2e-1";
 /** A port nothing in the runner listens on: the restart admission must find no daemon. */
 export const DAEMON_PORT = 47331;
@@ -52,9 +53,7 @@ export function readConfigBackend(homeDir: string): string {
   return (JSON.parse(readFileSync(configPath(homeDir), "utf8")) as { storage: { backend: string } }).storage.backend;
 }
 
-/** The reviewed runtime scripts plus the transfer script: the transfer profile
- * (POSTGRESQL_TRANSFER_PRIVILEGE_MANIFEST), as portable-fixture.ts installs it. */
-const TRANSFER_PROFILE_GRANT_SCRIPTS = [
+const RUNTIME_PROFILE_GRANT_SCRIPTS = [
   "postgresql-runtime-readiness-grants.sql",
   "postgresql-runtime-identity-grants.sql",
   "postgresql-runtime-conversation-grants.sql",
@@ -63,8 +62,18 @@ const TRANSFER_PROFILE_GRANT_SCRIPTS = [
   "postgresql-runtime-search-grants.sql",
   "postgresql-runtime-coordination-grants.sql",
   "postgresql-runtime-transcript-grants.sql",
+] as const;
+
+/** The reviewed runtime scripts plus the transfer script. */
+const TRANSFER_PROFILE_GRANT_SCRIPTS = [
+  ...RUNTIME_PROFILE_GRANT_SCRIPTS,
   "postgresql-transfer-grants.sql",
 ] as const;
+
+export type ActivationRoles = Readonly<{
+  transfer: PostgreSqlConnectionSettings;
+  runtime: PostgreSqlConnectionSettings;
+}>;
 
 /**
  * The activation role, provisioned as an operator would provision the
@@ -74,33 +83,61 @@ const TRANSFER_PROFILE_GRANT_SCRIPTS = [
  * schema's only non-owner grantee (see the module comment). Returns the
  * role's connection settings for the test database.
  */
-export async function provisionActivationRole(db: PostgreSqlTestDatabase): Promise<PostgreSqlConnectionSettings> {
-  const password = randomBytes(18).toString("hex");
+export async function provisionActivationRole(db: PostgreSqlTestDatabase): Promise<ActivationRoles> {
+  const transferPassword = randomBytes(18).toString("hex");
+  const runtimePassword = randomBytes(18).toString("hex");
   const administrator = new PostgreSqlRuntime(settings(db.adminUrl));
   try {
     const run = (text: string, operation: string) => administrator.query({ text }, { domain: "factory", operation });
-    await run(
-      "DO $$ BEGIN IF NOT EXISTS (SELECT 1 FROM pg_catalog.pg_roles WHERE rolname = '" + ACTIVATION_ROLE + "') THEN "
-        + "CREATE ROLE " + ACTIVATION_ROLE + " LOGIN; END IF; END $$",
-      "createActivationRole",
-    );
-    await run("ALTER ROLE " + ACTIVATION_ROLE + " LOGIN PASSWORD '" + password + "'", "setActivationRolePassword");
-    await run("GRANT CONNECT ON DATABASE \"" + db.name + "\" TO " + ACTIVATION_ROLE, "grantActivationRoleConnect");
+    for (const [role, password] of [[TRANSFER_ROLE, transferPassword], [RUNTIME_ROLE, runtimePassword]] as const) {
+      await run(
+        "DO $$ BEGIN IF NOT EXISTS (SELECT 1 FROM pg_catalog.pg_roles WHERE rolname = '" + role + "') THEN "
+          + "CREATE ROLE " + role + " LOGIN; END IF; END $$",
+        "createActivationRole",
+      );
+      await run("ALTER ROLE " + role + " LOGIN PASSWORD '" + password + "'", "setActivationRolePassword");
+      await run("GRANT CONNECT ON DATABASE \"" + db.name + "\" TO " + role, "grantActivationRoleConnect");
+    }
     await run("REVOKE USAGE ON SCHEMA lcm FROM lcm_test_runtime", "revokeHarnessRuntimeBaseline");
     for (const script of TRANSFER_PROFILE_GRANT_SCRIPTS) {
       const sql = readFileSync(join(process.cwd(), "src/storage/postgresql/reference", script), "utf8")
         .split("\n").filter((line) => !line.startsWith("\\")).join("\n")
-        .replaceAll(':"lcm_runtime_role"', '"' + ACTIVATION_ROLE + '"')
-        .replaceAll(':"lcm_transfer_role"', '"' + ACTIVATION_ROLE + '"');
+        .replaceAll(':"lcm_runtime_role"', '"' + TRANSFER_ROLE + '"')
+        .replaceAll(':"lcm_transfer_role"', '"' + TRANSFER_ROLE + '"');
       await run(sql, "grantActivationRole");
     }
   } finally {
     await administrator.close();
   }
-  const url = new URL(db.runtimeUrl);
-  url.username = ACTIVATION_ROLE;
-  url.password = password;
-  return settings(url.toString());
+  const roleSettings = (role: string, password: string): PostgreSqlConnectionSettings => {
+    const url = new URL(db.runtimeUrl);
+    url.username = role;
+    url.password = password;
+    return settings(url.toString());
+  };
+  return {
+    transfer: roleSettings(TRANSFER_ROLE, transferPassword),
+    runtime: roleSettings(RUNTIME_ROLE, runtimePassword),
+  };
+}
+
+/** Apply the runtime profile after verification and immediately before
+ * activation, matching the documented grant-first cutover order. */
+export async function grantRuntimeActivationRole(
+  db: PostgreSqlTestDatabase,
+  connectionTemplate: PostgreSqlConnectionSettings,
+): Promise<void> {
+  const administrator = new PostgreSqlRuntime({ ...connectionTemplate, url: db.adminUrl });
+  try {
+    for (const script of RUNTIME_PROFILE_GRANT_SCRIPTS) {
+      const sql = readFileSync(join(process.cwd(), "src/storage/postgresql/reference", script), "utf8")
+        .split("\n").filter((line) => !line.startsWith("\\")).join("\n")
+        .replaceAll(':"lcm_runtime_role"', '"' + RUNTIME_ROLE + '"');
+      await administrator.query({ text: sql }, { domain: "factory", operation: "grantRuntimeActivationRole" });
+    }
+  } finally {
+    await administrator.close();
+  }
 }
 
 /**
@@ -114,13 +151,15 @@ export async function provisionActivationRole(db: PostgreSqlTestDatabase): Promi
 export async function dropActivationRole(db: PostgreSqlTestDatabase): Promise<void> {
   const administrator = new PostgreSqlRuntime(settings(db.adminUrl));
   try {
-    const exists = await administrator.query<{ present: boolean }>(
-      { text: "SELECT EXISTS (SELECT 1 FROM pg_catalog.pg_roles WHERE rolname = $1) AS present", values: [ACTIVATION_ROLE] },
-      { domain: "factory", operation: "activationRoleExists" },
-    );
-    if (exists.rows[0]?.present !== true) return;
-    await administrator.query({ text: "DROP OWNED BY " + ACTIVATION_ROLE }, { domain: "factory", operation: "dropActivationRoleOwned" });
-    await administrator.query({ text: "DROP ROLE " + ACTIVATION_ROLE }, { domain: "factory", operation: "dropActivationRole" });
+    for (const role of [TRANSFER_ROLE, RUNTIME_ROLE]) {
+      const exists = await administrator.query<{ present: boolean }>(
+        { text: "SELECT EXISTS (SELECT 1 FROM pg_catalog.pg_roles WHERE rolname = $1) AS present", values: [role] },
+        { domain: "factory", operation: "activationRoleExists" },
+      );
+      if (exists.rows[0]?.present !== true) continue;
+      await administrator.query({ text: "DROP OWNED BY " + role }, { domain: "factory", operation: "dropActivationRoleOwned" });
+      await administrator.query({ text: "DROP ROLE " + role }, { domain: "factory", operation: "dropActivationRole" });
+    }
   } finally {
     await administrator.close();
   }
@@ -146,6 +185,7 @@ export async function prepareVerifiedInstallation(
   db: PostgreSqlTestDatabase,
   home: string,
   transfer: PostgreSqlConnectionSettings,
+  runtime: PostgreSqlConnectionSettings,
   options: Readonly<{ stopAfterCopy?: boolean }> = {},
 ): Promise<VerifiedInstallation> {
   mkdirSync(join(home, ".lcm"), { mode: 0o700 });
@@ -294,7 +334,7 @@ export async function prepareVerifiedInstallation(
     return {
       home, cwd, localProjectId: local.id, remoteProjectId: remote.projectId, machineId: enrolled.identity.machineId,
       input: {
-        homeDir: home, generationId: GENERATION_ID, transferSettings: transfer, ordinarySettings: transfer,
+        homeDir: home, generationId: GENERATION_ID, transferSettings: transfer, ordinarySettings: runtime,
         expectedIdentity, expectedOwner: EXPECTED_OWNER,
       },
     };
@@ -341,8 +381,7 @@ export async function prepareVerifiedInstallation(
     home, cwd, localProjectId: local.id, remoteProjectId: remote.projectId, machineId: enrolled.identity.machineId,
     input: {
       homeDir: home, generationId: GENERATION_ID,
-      // B1: the same transfer-role settings twice, exactly as #627 will pass them.
-      transferSettings: transfer, ordinarySettings: transfer,
+      transferSettings: transfer, ordinarySettings: runtime,
       expectedIdentity, expectedOwner: EXPECTED_OWNER,
     },
   };

@@ -126,6 +126,10 @@ const HASH_C = "c".repeat(64);
 const SETTINGS: PostgreSqlConnectionSettings = {
   url: "postgresql://unused", caFile: "/dev/null", poolMax: 1, connectionTimeoutMs: 1000, idleTimeoutMs: 1000, statementTimeoutMs: 1000,
 };
+const RUNTIME_SETTINGS: PostgreSqlConnectionSettings = {
+  ...SETTINGS,
+  url: "postgresql://runtime-unused",
+};
 /** What the (fake) transfer verifier admits; the activation role holds the transfer profile (plan-v7.2 B1). */
 const READINESS: PostgreSqlRuntimeReadiness = {
   currentMigrationIds: [], expectedOwner: "lcm_migrator", runtimeRole: "lcm", managedObjectCount: 0, definitionObjectCount: 0, privilegeManifestVersion: 1,
@@ -442,7 +446,11 @@ async function fixture(options: { held?: boolean; rosterMachine?: string; extraP
     destinationCensus: domainCensus("census"),
     createOrdinaryRuntime: ordinary,
     createTransferRuntime: transfer,
-    verifyTransferSchema: async () => READINESS,
+    readRoleIdentity: async (executor) => "backendPublicationGuard" in executor
+      ? { currentUser: "lcm_runtime", sessionUser: "lcm_runtime", oid: "101", tls: true }
+      : { currentUser: "lcm_transfer", sessionUser: "lcm_transfer", oid: "202", tls: true },
+    verifyRuntimeSchema: async () => ({ ...READINESS, runtimeRole: "lcm_runtime" }),
+    verifyTransferSchema: async () => ({ ...READINESS, runtimeRole: "lcm_transfer" }),
     checkTargetHealth: async () => health.shift() ?? ({ status: "healthy", readiness: READINESS }),
     captureDestinationIdentity: async () => ({ version: 1, ...identity }),
     readDestinationCensus: async () => ({ census: deps.destinationCensus }),
@@ -570,6 +578,19 @@ describe("runMigrationActivation: refusals (no effect begun)", () => {
     const f = await fixture();
     f.deps.identity.sealedWitnessSha256 = "f".repeat(64);
     const outcome = await f.run();
+    expect(outcome).toMatchObject({ status: "refused", step: "S5", reason: "identity-drift" });
+  });
+
+  it("refuses identity drift discovered on the transfer copy-binding session at S0", async () => {
+    const f = await fixture();
+    let calls = 0;
+    const outcome = await f.run({
+      captureDestinationIdentity: async () => ({
+        version: 1,
+        sealedWitnessSha256: DEST_IDENTITY,
+        systemIdentifier: calls++ === 0 ? SYSTEM_ID : "999",
+      }),
+    });
     expect(outcome).toMatchObject({ status: "refused", step: "S0", reason: "identity-drift" });
   });
 
@@ -612,12 +633,12 @@ describe("runMigrationActivation: refusals (no effect begun)", () => {
     expect(outcome).toMatchObject({ status: "refused", step: "S8", reason: "census-drift" });
   });
 
-  it("S6 admits the activation role through the transfer verifier (plan-v7.2 B2): a transfer-profile refusal is target-unhealthy before any effect", async () => {
+  it("S6 admits the runtime role with the transfer peer before any effect", async () => {
     const f = await fixture();
     const executors: unknown[] = [];
     const outcome = await f.run({
       checkTargetHealth: checkMigrationTargetHealth,
-      verifyTransferSchema: async (executor) => { executors.push(executor); throw new PostgreSqlRuntimeReadinessError("acl-shape", "inspectSchemaAcl"); },
+      verifyRuntimeSchema: async (executor) => { executors.push(executor); throw new PostgreSqlRuntimeReadinessError("acl-shape", "inspectSchemaAcl"); },
     });
     expect(outcome).toMatchObject({ status: "refused", step: "S6", reason: "target-unhealthy", effectBegun: false });
     if (outcome.status !== "refused") return;
@@ -628,6 +649,211 @@ describe("runMigrationActivation: refusals (no effect begun)", () => {
     expect((executors[0] as MigrationActivationOrdinaryRuntime).backendPublicationGuard).toBeTypeOf("function");
     expect(f.manifestStore.read(GENERATION).phase).toBe("verified");
     expect(readActivationGenerationLink({ homeDir: f.homeDir, generationId: GENERATION }).state).toBe("authoritatively-absent");
+  });
+
+  it("runs S6 and S15 as the runtime role while S7 admits that role as the transfer peer", async () => {
+    const f = await fixture();
+    const runtimeSettings = { ...SETTINGS, url: "postgresql://runtime-unused" };
+    const transferSettings = { ...SETTINGS, url: "postgresql://transfer-unused" };
+    let ordinaryRuntime: MigrationActivationOrdinaryRuntime | null = null;
+    const createOrdinaryRuntime = f.deps.createOrdinaryRuntime;
+    const runtimeAdmissions: unknown[] = [];
+    const transferAdmissions: unknown[] = [];
+
+    const outcome = await runMigrationActivation({
+      ...f.input,
+      ordinarySettings: runtimeSettings,
+      transferSettings,
+    }, {
+      ...f.deps,
+      createOrdinaryRuntime: (settings) => {
+        expect(settings).toBe(runtimeSettings);
+        ordinaryRuntime = createOrdinaryRuntime(settings);
+        return ordinaryRuntime;
+      },
+      createTransferRuntime: (settings) => {
+        expect(settings).toBe(transferSettings);
+        return f.deps.createTransferRuntime(settings);
+      },
+      readRoleIdentity: async (executor) => executor === ordinaryRuntime
+        ? { currentUser: "lcm_runtime", sessionUser: "lcm_runtime", oid: "101", tls: true }
+        : { currentUser: "lcm_transfer", sessionUser: "lcm_transfer", oid: "202", tls: true },
+      checkTargetHealth: checkMigrationTargetHealth,
+      verifyRuntimeSchema: async (_executor, options) => {
+        runtimeAdmissions.push(options);
+        return { ...READINESS, runtimeRole: "lcm_runtime" };
+      },
+      verifyTransferSchema: async (_executor, options) => {
+        transferAdmissions.push(options);
+        return { ...READINESS, runtimeRole: "lcm_transfer" };
+      },
+    } as MigrationActivationDependencies);
+
+    expectActivated(f, outcome, "fresh");
+    expect(runtimeAdmissions).toEqual([
+      expect.objectContaining({ admittedPeer: { role: "lcm_transfer" } }),
+      expect.objectContaining({ admittedPeer: { role: "lcm_transfer" } }),
+    ]);
+    expect(transferAdmissions).toEqual([
+      expect.objectContaining({ admittedPeer: { role: "lcm_runtime" } }),
+    ]);
+  });
+
+  it("binds the ordinary runtime to the verified destination before acquiring a lease", async () => {
+    const f = await fixture();
+    let ordinaryRuntime: MigrationActivationOrdinaryRuntime | null = null;
+    const createOrdinaryRuntime = f.deps.createOrdinaryRuntime;
+    const outcome = await f.run({
+      createOrdinaryRuntime: (settings) => {
+        ordinaryRuntime = createOrdinaryRuntime(settings);
+        return ordinaryRuntime;
+      },
+      readRoleIdentity: async (executor) => executor === ordinaryRuntime
+        ? { currentUser: "lcm_runtime", sessionUser: "lcm_runtime", oid: "101", tls: true }
+        : { currentUser: "lcm_transfer", sessionUser: "lcm_transfer", oid: "202", tls: true },
+      captureDestinationIdentity: async (executor) => ({
+        version: 1,
+        sealedWitnessSha256: DEST_IDENTITY,
+        systemIdentifier: executor === ordinaryRuntime ? "999" : SYSTEM_ID,
+      }),
+    } as Partial<MigrationActivationDependencies>);
+
+    expect(outcome).toMatchObject({ status: "refused", step: "S5", reason: "identity-drift" });
+    expect(f.guard.calls).not.toContain("acquire");
+  });
+
+  it.each([
+    ["authentication refusal", "28P01", false, "target-unhealthy", "authentication-refused"],
+    ["insufficient privilege", "42501", false, "target-unhealthy", "insufficient-privilege"],
+    ["retryable transport failure", null, true, "target-unresolvable", "connection-failed"],
+  ] as const)(
+    "classifies an ordinary identity %s at S6 before any lease write",
+    async (_label, sqlState, retryable, reason, detail) => {
+      const f = await fixture();
+      const readRoleIdentity = vi.fn(f.deps.readRoleIdentity);
+      const error = new PostgreSqlStorageOperationError(
+        "STORAGE_OPERATION_FAILED",
+        { domain: "factory", operation: "captureDestinationIdentity" },
+        sqlState,
+        retryable,
+      );
+      const outcome = await f.run({
+        captureDestinationIdentity: async () => { throw error; },
+        readRoleIdentity,
+      });
+
+      expect(outcome).toMatchObject({
+        status: "refused",
+        step: "S6",
+        reason,
+        effectBegun: false,
+        detail: expect.stringContaining(detail),
+      });
+      expect(readRoleIdentity).not.toHaveBeenCalled();
+      expect(f.guard.calls).not.toContain("acquire");
+    },
+  );
+
+  it("refuses identical or session-switched activation roles at S6 before any effect", async () => {
+    const identical = await fixture();
+    const identicalOutcome = await identical.run({
+      readRoleIdentity: async () => ({ currentUser: "lcm_runtime", sessionUser: "lcm_runtime", oid: "101", tls: true }),
+    } as Partial<MigrationActivationDependencies>);
+    expect(identicalOutcome).toMatchObject({
+      status: "refused",
+      step: "S6",
+      reason: "target-unhealthy",
+      effectBegun: false,
+    });
+    expect(identical.guard.calls).not.toContain("acquire");
+
+    const switched = await fixture();
+    let reads = 0;
+    const switchedOutcome = await switched.run({
+      readRoleIdentity: async () => reads++ === 0
+        ? { currentUser: "lcm_runtime", sessionUser: "lcm_runtime", oid: "101", tls: true }
+        : { currentUser: "lcm_transfer", sessionUser: "session_owner", oid: "202", tls: true },
+    } as Partial<MigrationActivationDependencies>);
+    expect(switchedOutcome).toMatchObject({
+      status: "refused",
+      step: "S6",
+      reason: "target-unhealthy",
+      effectBegun: false,
+    });
+    expect(switched.guard.calls).not.toContain("acquire");
+
+    const insecure = await fixture();
+    let insecureReads = 0;
+    const insecureOutcome = await insecure.run({
+      readRoleIdentity: async () => insecureReads++ === 0
+        ? { currentUser: "lcm_runtime", sessionUser: "lcm_runtime", oid: "101", tls: true }
+        : { currentUser: "lcm_transfer", sessionUser: "lcm_transfer", oid: "202", tls: false },
+    });
+    expect(insecureOutcome).toMatchObject({
+      status: "refused",
+      step: "S6",
+      reason: "target-unhealthy",
+      effectBegun: false,
+    });
+    expect(insecure.guard.calls).not.toContain("acquire");
+  });
+
+  it("classifies role discovery failures before any effect", async () => {
+    const unavailable = await fixture();
+    const unavailableOutcome = await unavailable.run({
+      readRoleIdentity: async () => {
+        throw new PostgreSqlStorageOperationError(
+          "STORAGE_OPERATION_FAILED",
+          { domain: "factory", operation: "roleIdentity" },
+          null,
+          true,
+        );
+      },
+    });
+    expect(unavailableOutcome).toMatchObject({
+      status: "refused",
+      step: "S6",
+      reason: "target-unresolvable",
+      effectBegun: false,
+    });
+
+    const unhealthy = await fixture();
+    const unhealthyOutcome = await unhealthy.run({
+      readRoleIdentity: async () => {
+        throw new PostgreSqlRuntimeReadinessError("acl-shape", "inspectSchemaAcl");
+      },
+    });
+    expect(unhealthyOutcome).toMatchObject({
+      status: "refused",
+      step: "S6",
+      reason: "target-unhealthy",
+      effectBegun: false,
+    });
+
+    const malformed = await fixture();
+    let reads = 0;
+    const malformedOutcome = await malformed.run({
+      readRoleIdentity: async () => reads++ === 0
+        ? { currentUser: "lcm_runtime", sessionUser: "lcm_runtime", oid: "101", tls: true }
+        : { currentUser: "", sessionUser: "", oid: "", tls: true },
+    });
+    expect(malformedOutcome).toMatchObject({
+      status: "refused",
+      step: "S6",
+      reason: "target-unhealthy",
+      effectBegun: false,
+    });
+
+    const unexpected = await fixture();
+    const unexpectedOutcome = await unexpected.run({
+      readRoleIdentity: async () => { throw new RangeError("raw"); },
+    });
+    expect(unexpectedOutcome).toMatchObject({
+      status: "refused",
+      step: "S6",
+      reason: "target-unresolvable",
+      effectBegun: false,
+    });
   });
 });
 
@@ -802,6 +1028,7 @@ describe("activate CLI admission of the interrupted activation windows (Bug #167
       _resolution: resolution,
       _operationsForTesting: {
         resolveDestination: async () => ({ status: "resolved", settings: SETTINGS, expectedOwner: "lcm_migrator", expectedIdentity: f.input.expectedIdentity }),
+        resolveRuntimeSettings: () => ({ status: "resolved", settings: RUNTIME_SETTINGS }),
         run: (input) => runMigrationActivation({ ...input, now: f.input.now }, f.deps),
         classifyPresence: async () => ({ status: "authoritatively-absent" }),
       },
@@ -866,6 +1093,62 @@ async function stopAt(f: Fixture, point: string): Promise<void> {
   await expect(f.run({ crashPoint: (p) => { if (p === point) throw new Error("stop at " + point); } })).rejects.toThrow("stop at " + point);
 }
 
+it("rediscovers both live roles and rechecks the ordinary destination before post-selection lease use", async () => {
+  const f = await fixture();
+  await stopAt(f, "after-selection-completed");
+  const observed: string[] = [];
+  const outcome = await f.run({
+    readRoleIdentity: async (executor) => {
+      const role = "backendPublicationGuard" in executor ? "runtime" : "transfer";
+      observed.push(role);
+      return role === "runtime"
+        ? { currentUser: "lcm_runtime", sessionUser: "lcm_runtime", oid: "101", tls: true }
+        : { currentUser: "lcm_transfer", sessionUser: "lcm_transfer", oid: "202", tls: true };
+    },
+  });
+
+  expectActivated(f, outcome, "selection-completed-unbound");
+  expect(observed).toEqual(["runtime", "transfer"]);
+});
+
+it("reports post-selection role rediscovery failure as a roll-forward interruption", async () => {
+  const f = await fixture();
+  await stopAt(f, "after-selection-completed");
+  const outcome = await f.run({
+    readRoleIdentity: async () => ({ currentUser: "", sessionUser: "", oid: "", tls: true }),
+  });
+  expect(outcome).toMatchObject({ status: "interrupted", effectBegun: true });
+});
+
+it.each([
+  ["authentication refusal", "28P01", false, "target-unhealthy", "authentication-refused"],
+  ["insufficient privilege", "42501", false, "target-unhealthy", "insufficient-privilege"],
+  ["retryable transport failure", null, true, "target-unresolvable", "connection-failed"],
+] as const)(
+  "classifies a post-selection ordinary identity %s as a roll-forward interruption",
+  async (_label, sqlState, retryable, reason, detail) => {
+    const f = await fixture();
+    await stopAt(f, "after-selection-completed");
+    const error = new PostgreSqlStorageOperationError(
+      "STORAGE_OPERATION_FAILED",
+      { domain: "factory", operation: "captureDestinationIdentity" },
+      sqlState,
+      retryable,
+    );
+    const outcome = await f.run({
+      captureDestinationIdentity: async () => { throw error; },
+    });
+
+    expect(outcome).toMatchObject({
+      status: "interrupted",
+      step: "S11",
+      cause: "state-unresolvable",
+      effectBegun: true,
+      detail: expect.stringContaining(`S6 ${reason} on roll-forward: ${detail}`),
+    });
+  },
+);
+
 function namedError(name: string, message = name): Error {
   const error = new Error(message);
   error.name = name;
@@ -916,7 +1199,7 @@ describe("runMigrationActivation: classification refusals and interruptions", ()
     const f = await fixture();
     const real = f.deps.readVerificationReport;
     const outcome = await f.run({ readVerificationReport: (g, sha) => { const r = real(g, sha); return { ...r, body: { ...r.body, destinationIdentity: { ...r.body.destinationIdentity, sealedWitnessSha256: "f".repeat(64) } } }; } });
-    expect(outcome).toMatchObject({ status: "refused", step: "S0", reason: "identity-drift" });
+    expect(outcome).toMatchObject({ status: "refused", step: "S5", reason: "identity-drift" });
   });
 
   it("refuses at S8 for a report whose classes did not all run or that records mismatches (injected past the parser)", async () => {
@@ -1146,19 +1429,24 @@ describe("runMigrationActivation: classification refusals and interruptions", ()
     expectActivated(f, await f.run(), "publication-journal");
   });
 
-  it("S15 admits through the transfer verifier too (plan-v7.2 B2): a transfer-profile refusal after publication is post-publication-unhealthy", async () => {
+  it("S15 repeats runtime admission with the transfer peer after publication", async () => {
     const f = await fixture();
-    let admissions = 0;
+    let runtimeAdmissions = 0;
+    let transferAdmissions = 0;
     const outcome = await f.run({
       checkTargetHealth: checkMigrationTargetHealth,
-      // Admission 1 is S6, admission 2 is S7's own transfer schema check, admission 3 is S15.
+      verifyRuntimeSchema: async () => {
+        runtimeAdmissions += 1;
+        if (runtimeAdmissions === 2) throw new PostgreSqlRuntimeReadinessError("effective-privilege", "inspectEffectivePrivileges");
+        return READINESS;
+      },
       verifyTransferSchema: async () => {
-        admissions += 1;
-        if (admissions === 3) throw new PostgreSqlRuntimeReadinessError("effective-privilege", "inspectEffectivePrivileges");
+        transferAdmissions += 1;
         return READINESS;
       },
     });
-    expect(admissions).toBe(3);
+    expect(runtimeAdmissions).toBe(2);
+    expect(transferAdmissions).toBe(1);
     expect(outcome).toMatchObject({
       status: "post-publication-unhealthy",
       health: { status: "unhealthy", reason: "schema-mismatch", detail: expect.stringContaining("effective-privilege") },
@@ -1371,6 +1659,45 @@ describe("runMigrationActivation: input validation, production defaults and the 
     const transfer = deps.createTransferRuntime(settings);
     await transfer.close();
     const failing = { query: async () => { throw new RangeError("no database"); } } as unknown as MigrationActivationTransferRuntime;
+    const signal = new AbortController().signal;
+    const roleExecutor = {
+      query: vi.fn(async () => ({
+        command: "SELECT",
+        rowCount: 1,
+        oid: 0,
+        fields: [],
+        rows: [{
+          current_user_name: "lcm_runtime",
+          session_user_name: "lcm_runtime",
+          role_oid: "101",
+          tls: true,
+        }],
+      })),
+    } as unknown as MigrationActivationTransferRuntime;
+    await expect(deps.readRoleIdentity(roleExecutor, signal)).resolves.toEqual({
+      currentUser: "lcm_runtime",
+      sessionUser: "lcm_runtime",
+      oid: "101",
+      tls: true,
+    });
+    expect(roleExecutor.query).toHaveBeenCalledWith(
+      expect.objectContaining({ text: expect.stringContaining("CURRENT_USER") }),
+      expect.objectContaining({
+        domain: "factory",
+        operation: "readMigrationActivationRoleIdentity",
+        signal,
+      }),
+    );
+    const missingRole = {
+      query: async () => ({ command: "SELECT", rowCount: 0, oid: 0, fields: [], rows: [] }),
+    } as unknown as MigrationActivationTransferRuntime;
+    await expect(deps.readRoleIdentity(missingRole)).resolves.toEqual({
+      currentUser: "",
+      sessionUser: "",
+      oid: "",
+      tls: false,
+    });
+    await expect(deps.verifyRuntimeSchema(failing, { expectedOwner: "lcm_migrator" })).rejects.toBeInstanceOf(Error);
     await expect(deps.verifyTransferSchema(failing, { expectedOwner: "lcm_migrator" })).rejects.toBeInstanceOf(Error);
     // S6/S15 reach checkMigrationTargetHealth itself (whose own default stays the runtime verifier; see target-health.test.ts).
     expect(deps.checkTargetHealth).toBe(checkMigrationTargetHealth);
@@ -1731,8 +2058,7 @@ describe("runMigrationActivation: refusal rows reached only through injected che
   it("S5 refuses project-map-drift when the recomputed pre-publication witness differs from the report, and identity-drift when the ordinary identity differs", async () => {
     const f = await fixture();
     expect(await f.run({ computeProjectMapWitness: () => "0".repeat(64) })).toMatchObject({ status: "refused", step: "S5", reason: "project-map-drift" });
-    let calls = 0;
-    expect(await f.run({ captureDestinationIdentity: async () => ({ version: 1, sealedWitnessSha256: DEST_IDENTITY, systemIdentifier: calls++ < 1 ? SYSTEM_ID : "999" }) })).toMatchObject({ status: "refused", step: "S5", reason: "identity-drift" });
+    expect(await f.run({ captureDestinationIdentity: async () => ({ version: 1, sealedWitnessSha256: DEST_IDENTITY, systemIdentifier: "999" }) })).toMatchObject({ status: "refused", step: "S5", reason: "identity-drift" });
     await expect(f.run({ captureDestinationIdentity: async () => { throw new RangeError("raw"); } })).rejects.toBeInstanceOf(RangeError);
   });
 
@@ -2361,7 +2687,10 @@ describe("runMigrationActivation: S7 classifies target failures like S6 (PR #162
   });
 
   const portableUnavailable = (cause: unknown) => new PortableStreamError("source-unavailable", { cause });
-  /** A captureDestinationIdentity that rejects on its nth call (0 = S0, 1 = S5, 2 = S7) and otherwise answers the sealed identity. */
+  /**
+   * A captureDestinationIdentity that rejects on its nth call and otherwise answers the sealed identity. The ordinary
+   * runtime's probe runs first (#1607: before S0, attributed to S6), then S0's transfer query, then S7's.
+   */
   const identityFailingAt = (f: Fixture, nth: number, error: unknown) => {
     const answer = f.deps.captureDestinationIdentity;
     let calls = 0;
@@ -2409,10 +2738,10 @@ describe("runMigrationActivation: S7 classifies target failures like S6 (PR #162
   });
 
   it.each([
-    ["S0", "a lost connection (SQLSTATE 08006)", 0, pgError("08006"), "target-unresolvable", /^connection-failed: S0 destination identity query was lost/u],
-    ["S0", "a refused privilege (SQLSTATE 42501)", 0, pgError("42501"), "target-unhealthy", /^insufficient-privilege: S0 destination identity query: /u],
-    ["S5", "a lost connection (SQLSTATE 08006)", 1, pgError("08006"), "target-unresolvable", /^connection-failed: S5 destination identity query was lost/u],
-    ["S5", "a refused privilege (SQLSTATE 42501)", 1, pgError("42501"), "target-unhealthy", /^insufficient-privilege: S5 destination identity query: /u],
+    ["S6", "a lost connection (SQLSTATE 08006)", 0, pgError("08006"), "target-unresolvable", /^connection-failed: S6 destination identity query was lost/u],
+    ["S6", "a refused privilege (SQLSTATE 42501)", 0, pgError("42501"), "target-unhealthy", /^insufficient-privilege: S6 destination identity query: /u],
+    ["S0", "a lost connection (SQLSTATE 08006)", 1, pgError("08006"), "target-unresolvable", /^connection-failed: S0 destination identity query was lost/u],
+    ["S0", "a refused privilege (SQLSTATE 42501)", 1, pgError("42501"), "target-unhealthy", /^insufficient-privilege: S0 destination identity query: /u],
     ["S7", "a lost connection (SQLSTATE 08006)", 2, pgError("08006"), "target-unresolvable", /^connection-failed: S7 destination identity query was lost/u],
     ["S7", "a refused privilege (SQLSTATE 42501)", 2, pgError("42501"), "target-unhealthy", /^insufficient-privilege: S7 destination identity query: /u],
   ] as const)("the %s destination identity query failing with %s refuses that step and releases the pre-effect lease", async (step, _name, nth, error, reason, detail) => {
@@ -2420,12 +2749,14 @@ describe("runMigrationActivation: S7 classifies target failures like S6 (PR #162
     const outcome = await f.run({ captureDestinationIdentity: identityFailingAt(f, nth, error) });
     expect(outcome).toMatchObject({ status: "refused", step, reason, effectBegun: false });
     expect((outcome as { detail: string }).detail).toMatch(detail);
-    if (step !== "S0") expect(row(f).releasedAt).not.toBeNull();
+    // The ordinary probe and S0 both run before the S2 lease is written; S7 runs under it.
+    if (step === "S7") expect(row(f).releasedAt).not.toBeNull();
+    else expect(f.guard.calls).not.toContain("acquire");
     expect(f.manifestStore.read(GENERATION).phase).toBe("verified");
   });
 
   it.each([
-    ["S5", 1],
+    ["S6", 0],
     ["S7", 2],
   ] as const)("on an effect-begun re-entry the %s identity query failure is the roll-forward interruption and keeps the lease", async (step, nth) => {
     const f = await fixture();

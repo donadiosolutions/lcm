@@ -1,0 +1,8 @@
+references: ["#1607", "origin-main-merge-c3"]
+rationale: >-
+  Keeps the newly merged cutover-set CLI on its transfer-only grant-swap
+  contract while single-generation activation retains #1607's revoke-only
+  post-activation step. The set adapter stays in its existing migration
+  cutover component; no file is added, removed, moved, or re-owned.
+pins:
+  - ["src/migration/cli-cutover-set.ts", "unit-migration-cutover"]

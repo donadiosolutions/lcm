@@ -148,7 +148,7 @@
       "exit": 0,
       "outcome": "ok",
       "manifestPhase": "active",
-      "next": "swap-grants-then-start-daemon",
+      "next": "revoke-transfer-grants-then-start-daemon",
       "applied": true,
       "restartAnswer": "satisfied",
       "evidence": {
@@ -3046,7 +3046,7 @@
           "reason": "cutover-restart-required",
           "manifestPhase": null,
           "applied": true,
-          "next": "swap-grants-then-start-daemon",
+          "next": "revoke-transfer-grants-then-start-daemon",
           "restartAnswer": "unsatisfied"
         },
         {
@@ -3153,7 +3153,7 @@
           "reason": "cutover-restart-required",
           "manifestPhase": null,
           "applied": true,
-          "next": "swap-grants-then-start-daemon",
+          "next": "revoke-transfer-grants-then-start-daemon",
           "restartAnswer": "unsatisfied"
         },
         {

@@ -12,6 +12,12 @@ import {
   type MigrationActivationTriState,
 } from "./activate-generation.js";
 import type { ActivationPublicationStatus } from "./activation-publication.js";
+import {
+  ConfigValidationError,
+  resolvePostgreSqlStorageSettings,
+} from "../daemon/config.js";
+import { connectionSettings } from "../storage/postgresql/factory.js";
+import type { PostgreSqlConnectionSettings } from "../storage/postgresql/contracts.js";
 import { resolveMigrationDestination } from "./cli-destination.js";
 import {
   admitExistingMigrationCommand,
@@ -34,13 +40,11 @@ import type { ExistingGenerationInput } from "./existing-generation.js";
  * row 10, and it adds no migration algorithm: it supplies the inputs
  * `runMigrationActivation` asks for and maps the closed outcome it returns.
  *
- * **Inputs, none invented.** The transfer-role `connectionSettings` object
- * verify resolves is passed as both `transferSettings` and
- * `ordinarySettings` (decision B: activation runs entirely under the
- * transfer role), with the held-safe identity as `expectedIdentity` and the
- * resolved migration role as `expectedOwner`. No `LCM_POSTGRES_*` variable is
- * needed and no secret is written to `config.json`. An input that cannot be
- * resolved refuses before the call.
+ * **Inputs, none invented.** Verify's destination resolution supplies the
+ * transfer role. Activate additionally resolves `LCM_POSTGRES_RUNTIME_URL`
+ * through the same strict PostgreSQL validator, while reusing the resolved
+ * CA and tuning settings, for the ordinary daemon-runtime connection. The
+ * secret is never an argument, output field, or config.json value.
  *
  * **Fences.** `--confirm-generation` (the resolved id) and
  * `--confirm-backend`, which must equal `manifest.destination.backend`
@@ -59,10 +63,10 @@ import type { ExistingGenerationInput } from "./existing-generation.js";
  * selected backend). A stale live daemon is exit 8; an unresolvable verdict
  * or a contradiction is exit 5.
  *
- * **Grants.** Activation runs under the transfer role and never touches the
- * grants. After it, the operator adds the runtime grants and revokes the
- * transfer grants, and only then starts the daemon. The success output and
- * the runbook say so; #1607 is the later improvement.
+ * **Grants.** The runtime grants exist before activation. After success, the
+ * operator's one remaining privilege step is revoking the transfer grants
+ * (or dropping that role), then handing `LCM_POSTGRES_URL` to the proven
+ * runtime role before starting the daemon.
  */
 
 export type MigrationActivateCommandOutcome = MigrationCutoverCommandOutcome;
@@ -70,10 +74,49 @@ export type MigrationActivateCommandOutcome = MigrationCutoverCommandOutcome;
 export type MigrationActivateCommandOperations = Readonly<{
   admit: typeof admitExistingMigrationCommand;
   resolveDestination: typeof resolveMigrationDestination;
+  resolveRuntimeSettings: typeof resolveMigrationActivationRuntimeSettings;
   run: typeof runMigrationActivation;
   preview: typeof previewMigrationActivation;
   classifyPresence: typeof classifyMigrationDaemonPresence;
 }>;
+
+export type MigrationActivationRuntimeSettingsResolution =
+  | Readonly<{ status: "resolved"; settings: PostgreSqlConnectionSettings }>
+  | Readonly<{ status: "refuse"; reason: "activation-runtime-target-missing" }>;
+
+export function resolveMigrationActivationRuntimeSettings(input: Readonly<{
+  transferSettings: PostgreSqlConnectionSettings;
+  expectedOwner: string;
+  env?: Record<string, string | undefined>;
+}>): MigrationActivationRuntimeSettingsResolution {
+  const env = input.env ?? process.env;
+  try {
+    const postgresql = resolvePostgreSqlStorageSettings({
+      postgresql: {
+        caFile: input.transferSettings.caFile,
+        migrationRole: input.expectedOwner,
+        poolMax: input.transferSettings.poolMax,
+        connectionTimeoutMs: input.transferSettings.connectionTimeoutMs,
+        idleTimeoutMs: input.transferSettings.idleTimeoutMs,
+        statementTimeoutMs: input.transferSettings.statementTimeoutMs,
+        ...(input.transferSettings.snapshotIdleTimeoutMs === undefined
+          ? {}
+          : { snapshotIdleTimeoutMs: input.transferSettings.snapshotIdleTimeoutMs }),
+      },
+    }, {
+      LCM_POSTGRES_URL: env.LCM_POSTGRES_RUNTIME_URL,
+    });
+    return {
+      status: "resolved",
+      settings: connectionSettings({ backend: "postgresql", postgresql }),
+    };
+  } catch (error) {
+    if (error instanceof ConfigValidationError) {
+      return { status: "refuse", reason: "activation-runtime-target-missing" };
+    }
+    throw error;
+  }
+}
 
 export type MigrationActivateCommandInput = Readonly<{
   cwd: string;
@@ -202,7 +245,7 @@ function leaseEvidence(detail: string): MigrationEvidence {
 // ---------------------------------------------------------------------------
 
 /** The next command after `activate` succeeds, and the operator step it must not skip. */
-export const ACTIVATE_NEXT_AFTER_SUCCESS = "swap-grants-then-start-daemon";
+export const ACTIVATE_NEXT_AFTER_SUCCESS = "revoke-transfer-grants-then-start-daemon";
 
 async function runMigrationActivateCommand(input: MigrationActivateCommandInput): Promise<MigrationActivateCommandOutcome> {
   const ops = input._operationsForTesting;
@@ -236,15 +279,21 @@ async function runMigrationActivateCommand(input: MigrationActivateCommandInput)
       ...(destination.evidence === undefined ? {} : { evidence: destination.evidence }),
     };
   }
+  const runtime = (ops?.resolveRuntimeSettings ?? resolveMigrationActivationRuntimeSettings)({
+    transferSettings: destination.settings,
+    expectedOwner: destination.expectedOwner,
+  });
+  if (runtime.status === "refuse") {
+    return { status: "refuse", reason: runtime.reason, generationId };
+  }
 
   let outcome: MigrationActivationOutcome;
   try {
     outcome = await (ops?.run ?? runMigrationActivation)({
       homeDir: input.homeDir,
       generationId,
-      // The same transfer-role object twice (decision B).
       transferSettings: destination.settings,
-      ordinarySettings: destination.settings,
+      ordinarySettings: runtime.settings,
       expectedIdentity: destination.expectedIdentity,
       expectedOwner: destination.expectedOwner,
       ...(input.signal === undefined ? {} : { signal: input.signal }),
@@ -391,13 +440,13 @@ async function mapActivationOutcome(args: Readonly<{
     reportSha256: outcome.report.reportSha256,
     resumedFrom: outcome.resumedFrom,
     successorFencingTokenAdvanced: outcome.successorFencingToken !== null,
-    grantSwap: "required-before-daemon-start",
+    transferGrantRevocation: "required-before-daemon-start",
     ...restart.evidence,
   };
   if (restart.reason !== undefined) {
     return {
       status: "refuse", reason: restart.reason, generationId, ...(applied ? { applied: true as const } : {}),
-      // The grant swap and daemon start fix only a positively observed stale daemon.
+      // Transfer-grant revocation and daemon start fix only a positively observed stale daemon.
       next: restart.reason === CUTOVER_RESTART_REASONS.required ? ACTIVATE_NEXT_AFTER_SUCCESS : "report",
       sections: evidence, restart: restart.restart,
     };
