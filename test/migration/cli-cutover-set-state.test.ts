@@ -200,6 +200,18 @@ describe("the write fingerprint", () => {
     expect(await setWriteFingerprint({ ...base, generationIds: [...ids, "never-created"] }, stable)).not.toBe(first);
   });
 
+  it("moves with the member records of an uncommitted rollback checkpoint", async () => {
+    const home = craftedHome(["verified", "verified"]);
+    const base = { homeDir: home.homeDir, setId: SET_ID, generationIds: ids, manifestStore: home.store };
+    const fingerprint = (rollback: object) => setWriteFingerprint(base, observation({ journal: holdJournal(), rollback: rollback as never }));
+    const incomplete = (memberRecords: number) => ({ state: "authoritatively-absent", cause: "checkpoint-incomplete", memberRecords });
+    const empty = await fingerprint({ state: "authoritatively-absent", cause: "empty" });
+    const one = await fingerprint(incomplete(1));
+    expect(one).not.toBe(empty);
+    expect(await fingerprint(incomplete(2))).not.toBe(one);
+    expect(await fingerprint(incomplete(1))).toBe(one);
+  });
+
   it("is unresolvable whenever the state cannot be read", async () => {
     const home = craftedHome(["verified", "verified"]);
     const base = { homeDir: home.homeDir, setId: SET_ID, generationIds: ids };

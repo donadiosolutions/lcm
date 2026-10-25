@@ -448,7 +448,7 @@ export async function setWriteFingerprint(
         checkpoint: observation.rollback.checkpoint.checksumSha256, installs: observation.rollback.installs.size,
         selected: observation.rollback.selection !== null,
       }
-      : observation.rollback.state,
+      : observation.rollback,
     heads,
   });
 }
