@@ -265,24 +265,134 @@ describe("inspectCodexReadiness statuses", () => {
     accepted(withForeign(mcp({ a: 2 ** 62, b: -(2 ** 62), c: 1.5, d: 1e-7, e: [0, -1, 4611686018427387904], f: { g: 123456789 } })));
   });
 
-  it("rejects repeated member names in typed hooks.json objects, including escaped spellings, beside trusted LCM hooks", () => {
+  // Codex's HooksFile denies unknown fields, but the hooks object, matcher groups and handler variants ignore
+  // unknown members without a duplicate check. Only a repeat of a member the struct knows is a duplicate_field error.
+  describe("repeated member names in hooks.json", () => {
     const rawRows = (content: string) => inspectCodexReadiness(input({ hooks: { state: "content", content, mtimeMs: 1000 } }));
     const sessionStart = (report: ReturnType<typeof inspectCodexReadiness>) => report.rows.find((row) => row.event === "SessionStart")?.status;
-    expect(sessionStart(rawRows(FULL_HOOKS))).toBe("ready");
-    const handler = (members: string) => '{"hooks":{"Stop":[{"hooks":[{"type":"command",' + members + "}]}]}}";
-    for (const content of [
-      FULL_HOOKS.slice(0, -1) + ',"hooks":{}}',
-      '{"description":"a","description":"b","hooks":{}}',
-      '{"extra":{"a":1,"a":2}}',
-      '{"hooks":{"Stop":[],"Stop":[]}}',
-      '{"hooks":{"Stop":[{"matcher":"a","matcher":"b","hooks":[]}]}}',
-      '{"hooks":{"Stop":[{"hooks":[],"hooks":[]}]}}',
-      handler('"command":"echo a","command":"echo b"'),
-      handler('"command":"echo a","\\u0063ommand":"echo b"'),
-      handler('"command":"echo a","timeout":1,"timeout":2'),
-    ]) {
+    // Places raw JSON text beside the trusted LCM hooks: as a foreign group, a foreign handler or a hooks-object member.
+    const withRaw = (kind: "group" | "handler" | "event", raw: string) => {
+      const hooks = JSON.parse(FULL_HOOKS).hooks as Record<string, any>;
+      if (kind === "group") hooks.PostToolUse.push("__RAW__");
+      else if (kind === "handler") hooks.PostToolUse.push({ hooks: ["__RAW__"] });
+      else hooks.__RAW__ = 0;
+      const marker = kind === "event" ? '"__RAW__":0' : '"__RAW__"';
+      return JSON.stringify({ hooks }).replace(marker, raw);
+    };
+    const handler = (raw: string) => withRaw("handler", raw);
+    const command = (members: string) => handler('{"type":"command","command":"echo f",' + members + "}");
+    const mcp = (members: string) => handler('{"type":"mcp_tool","server":"s","tool":"t",' + members + "}");
+    const unreadable = (content: string) =>
       expect(new Set(rawRows(content).rows.map((row) => row.status)), content).toEqual(new Set(["hooks-file-unreadable"]));
-    }
+    const readable = (content: string) => expect(sessionStart(rawRows(content)), content).toBe("ready");
+
+    it("starts from a readable file", () => {
+      readable(FULL_HOOKS);
+    });
+
+    it("rejects every repeated root member, because Codex denies unknown root fields", () => {
+      for (const content of [
+        FULL_HOOKS.slice(0, -1) + ',"hooks":{}}',
+        '{"description":"a","description":"b","hooks":{}}',
+        '{"extra":{"a":1,"a":2}}',
+        '{"extra":1,"extra":2}',
+        '{"hooks":{},"extra":1,"extra":2}',
+      ]) unreadable(content);
+    });
+
+    it("rejects a repeated event name in the hooks object and ignores a repeated unknown one", () => {
+      unreadable('{"hooks":{"Stop":[],"Stop":[]}}');
+      unreadable('{"hooks":{"\\u0053top":[],"Stop":[]}}');
+      unreadable(withRaw("event", '"Interrupt":[],"Interrupt":[]'));
+      readable(withRaw("event", '"Bogus":1,"Bogus":2'));
+      // The whole subtree of an unknown event is discarded, including repeats of names that are known under a real event.
+      readable(withRaw("event", '"Bogus":[{"matcher":"a","matcher":"b","hooks":[{"type":"command","type":"command","command":"a","command":"b"}]}]'));
+      readable(withRaw("event", '"Bogus":[{"hooks":[]}],"Bogus":[{"hooks":[]}]'));
+    });
+
+    it("rejects a repeated matcher or hooks member in a group and ignores a repeated unknown one", () => {
+      unreadable('{"hooks":{"Stop":[{"matcher":"a","matcher":"b","hooks":[]}]}}');
+      unreadable('{"hooks":{"Stop":[{"hooks":[],"hooks":[]}]}}');
+      unreadable(withRaw("group", '{"matcher":"a","hooks":[],"matcher":"b"}'));
+      readable(withRaw("group", '{"hooks":[],"note":1,"note":2}'));
+      readable(withRaw("group", '{"hooks":[],"note":{"a":1,"a":2},"\\u006eote":3}'));
+      readable(withRaw("group", '{"hooks":[],"note":[{"a":1,"a":2}]}'));
+    });
+
+    it("rejects a repeated command handler member Codex knows, including both spellings of commandWindows", () => {
+      for (const members of [
+        '"command":"echo b"',
+        '"\\u0063ommand":"echo b"',
+        '"timeout":1,"timeout":2',
+        '"async":true,"async":false',
+        '"statusMessage":"a","statusMessage":"b"',
+        '"additionalContextLimit":1,"additionalContextLimit":2',
+        '"type":"command"',
+        '"commandWindows":"a","commandWindows":"b"',
+        '"command_windows":"a","command_windows":"b"',
+      ]) unreadable(command(members));
+      // The alias spellings name one field, so having both is a duplicate even without a repeated spelling.
+      unreadable(command('"commandWindows":"a","command_windows":"b"'));
+    });
+
+    it("ignores a repeated command handler member Codex does not know, including names the other variants use", () => {
+      for (const members of [
+        '"extra":1,"extra":2',
+        '"extra":{"a":1},"extra":[1,2]',
+        '"\\u0065xtra":1,"extra":2',
+        '"server":"a","server":"b","tool":"a","tool":"b"',
+        '"input":{},"input":{}',
+        '"commandwindows":"a","commandwindows":"b"',
+        '"Type":"a","Type":"b"',
+      ]) readable(command(members));
+    });
+
+    it("rejects a repeated mcp_tool handler member Codex knows and ignores the command-only ones", () => {
+      for (const members of [
+        '"server":"b"',
+        '"tool":"b"',
+        '"input":{},"input":{}',
+        '"timeout":1,"timeout":2',
+        '"statusMessage":"a","statusMessage":"b"',
+        '"type":"mcp_tool"',
+      ]) unreadable(mcp(members));
+      for (const members of [
+        '"extra":1,"extra":2',
+        '"command":"a","command":"b"',
+        '"commandWindows":"a","commandWindows":"b"',
+        '"command_windows":"a","command_windows":"b"',
+        '"async":true,"async":false',
+        '"additionalContextLimit":1,"additionalContextLimit":2',
+      ]) readable(mcp(members));
+    });
+
+    it("rejects only a repeated type on the empty prompt and agent variants", () => {
+      for (const variant of ["prompt", "agent"]) {
+        unreadable(handler('{"type":"' + variant + '","type":"' + variant + '"}'));
+        readable(handler('{"type":"' + variant + '","extra":1,"extra":2,"command":"a","command":"b","server":"a","server":"b","timeout":1,"timeout":2,"statusMessage":"a","statusMessage":"b"}'));
+      }
+    });
+
+    it("rejects a repeated type, however the repeated values compare", () => {
+      unreadable(handler('{"type":"command","command":"echo f","type":"command"}'));
+      unreadable(handler('{"type":"command","command":"echo f","type":"prompt"}'));
+      unreadable(handler('{"type":"prompt","type":"command","command":"echo f"}'));
+    });
+
+    it("still rejects an invalid handler, whatever its repeated members", () => {
+      unreadable(handler('{"type":"bogus","extra":1,"extra":2}'));
+      unreadable(handler('{"type":5,"extra":1,"extra":2}'));
+      unreadable(handler('{"extra":1,"extra":2}'));
+      unreadable(handler('{"type":"command","extra":1,"extra":2}'));
+    });
+
+    it("rejects a repeated known ancestor even when a repeat below it replaces the ancestor's value", () => {
+      unreadable('{"hooks":{"Stop":[{"hooks":[{"type":"command","command":"a","e":1,"e":2}]}],"Stop":5}}');
+    });
+
+    it("leaves a repeat inside a hooks member that is not an object to the shape validation", () => {
+      unreadable('{"hooks":[{"a":1,"a":2}]}');
+    });
   });
 
   it("keeps a repeated member name below the typed hooks.json objects readable", () => {
