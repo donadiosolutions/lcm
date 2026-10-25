@@ -93,6 +93,8 @@ describe("CI plan classification", () => {
     expect(graphInvisibleTests(".changeset/x.md")).toEqual([...GRAPH_INVISIBLE_INPUTS[1].tests]);
     expect(graphInvisibleTests("test/timezone-fixture.test.ts")).toEqual(["test/timezone-fixture-runner.test.ts"]);
     expect(graphInvisibleTests("src/memory/index.ts")).toEqual(["test/memory/search-type-contract.test.ts"]);
+    expect(graphInvisibleTests("test/postgresql/surface-parity.integration.ts")).toEqual(["test/surface-parity/worker-admission.test.ts"]);
+    expect(graphInvisibleTests("test/postgresql/other.integration.ts")).toEqual([]);
     expect(graphInvisibleTests("test/codecov-ownership/1403-unbound-enumeration.yml")).toEqual(["test/codecov-config.test.ts"]);
     expect(graphInvisibleTests("src/memory/other.ts")).toEqual([]);
     expect(graphInvisibleTests("package.json")).toEqual([]);
@@ -120,6 +122,13 @@ describe("CI plan classification", () => {
       mode: "selective",
       reason: undefined,
       alwaysRun: ["test/timezone-fixture-runner.test.ts"],
+    });
+    // The surface-parity integration file is also read from disk by the
+    // worker-admission unit test, so a change to it alone selects that test.
+    expect(classifyChanges(["test/postgresql/surface-parity.integration.ts"])).toEqual({
+      mode: "selective",
+      reason: undefined,
+      alwaysRun: ["test/surface-parity/worker-admission.test.ts"],
     });
     for (const path of ["package.json", "vitest.config.ts", "test/setup/x.ts", "src/a.sql", ".github/workflows/ci.yml", "scripts/x.mjs", "test/fixtures/a.jsonl"]) {
       expect(classifyChanges(["src/a.ts", path])).toEqual({ mode: "full", reason: path, alwaysRun: [] });
@@ -379,6 +388,9 @@ describe("graph-invisible input table completeness", () => {
     "spawned-tests": [/"run", "test\/timezone-fixture\.test\.ts"/u],
     // A source file resolved for the TypeScript compiler API rather than imported.
     "compiled-sources": [/resolve\(process\.cwd\(\), "src\/[^"]+\.ts"\)/u],
+    // A test source read from disk and evaluated. This only proves a reading
+    // test is listed; a new disk-read source needs its own pattern and entry.
+    "extracted-sources": [/new URL\("(?:\.{1,2}\/)*postgresql\/[^"]+\.ts"/u],
     // Ownership fragments read from disk by the Codecov contract test.
     "codecov-ownership": [/join\(projectRoot, "test", "codecov-ownership"\)/u],
   };
