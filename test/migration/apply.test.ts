@@ -1182,6 +1182,68 @@ describe("performMigrationApplyThroughCapture, the identity step inside the span
     })).toEqual({ status: "refuse", reason: "local-identity-not-persisted" });
   });
 
+  it("a shared-scope project refuses multi-machine-installation before the identity step runs: no destination project is resolved or created and the project map is untouched (#1689)", async () => {
+    const fixture = await enrolled();
+    closeLcmConnection();
+    const sharedMap = JSON.stringify({
+      [fixture.local.id]: { canonical: fixture.cwd, aliases: [], remoteProjectId: REGISTERED_MACHINE },
+    });
+    writeFileSync(projectMapPath(fixture.homeDir), sharedMap, { mode: 0o600 });
+    clearProjectMapCache();
+    const identity = recorder();
+    const resolveTargetIdentity = vi.fn(async () => ({ status: "resolved" as const, projectId: "minted-project" }));
+    const result = await capture({
+      cwd: fixture.cwd, homeDir: fixture.homeDir, base: fixture.base, coordinator: coordinatorFor(fixture.homeDir),
+      resolveExpectedIdentity: async (step) => {
+        await identity.resolve(step);
+        return resolveMigrationExpectedIdentity({
+          preflight: {
+            targetConfig: fixture.request.targetConfig, machineId: REGISTERED_MACHINE,
+            candidate: { disposition: "fresh" },
+          },
+          cwd: fixture.cwd, homeDir: fixture.homeDir, ...(step.path === "fresh" ? { publicationLockToken: step.token } : {}),
+          _operationsForTesting: { createIdentityRuntime: () => ({ close: async () => undefined }) as never, resolveTargetIdentity },
+        });
+      },
+    });
+    expect(result).toEqual({ status: "refuse", reason: "multi-machine-installation" });
+    expect(identity.calls).toEqual([]);
+    expect(resolveTargetIdentity).not.toHaveBeenCalled();
+    expect(readFileSync(projectMapPath(fixture.homeDir), "utf8")).toBe(sharedMap);
+    expect(readBackendMaintenanceJournal(fixture.homeDir)).toBeNull();
+  });
+
+  it("a project bound to a destination while the identity step runs is still refused multi-machine-installation after it, before any hold (defence in depth)", async () => {
+    const fixture = await enrolled();
+    closeLcmConnection();
+    const identity = recorder();
+    const result = await capture({
+      cwd: fixture.cwd, homeDir: fixture.homeDir, base: fixture.base, coordinator: coordinatorFor(fixture.homeDir),
+      resolveExpectedIdentity: async (step) => {
+        await identity.resolve(step);
+        writeFileSync(projectMapPath(fixture.homeDir), JSON.stringify({
+          [fixture.local.id]: { canonical: fixture.cwd, aliases: [], remoteProjectId: REGISTERED_MACHINE },
+        }), { mode: 0o600 });
+        clearProjectMapCache();
+        return { status: "resolved", expectedIdentity: IDENTITY };
+      },
+    });
+    expect(result).toEqual({ status: "refuse", reason: "multi-machine-installation" });
+    expect(identity.calls.map((call) => call.path)).toEqual(["fresh"]);
+    expect(readBackendMaintenanceJournal(fixture.homeDir)).toBeNull();
+  });
+
+  it("a local project reaches the fresh identity step exactly once (control for the shared-scope pre-check)", async () => {
+    const fixture = await enrolled();
+    const identity = recorder({ status: "refuse", reason: "local-identity-not-persisted" });
+    const result = await capture({
+      cwd: fixture.cwd, homeDir: fixture.homeDir, base: fixture.base, coordinator: coordinatorFor(fixture.homeDir),
+      resolveExpectedIdentity: identity.resolve,
+    });
+    expect(result).toEqual({ status: "refuse", reason: "local-identity-not-persisted" });
+    expect(identity.calls.map((call) => call.path)).toEqual(["fresh"]);
+  });
+
   it("the real fresh mint runs under the barrier token: the map entry appears, the hold and capture bind to the minted selection, and the captured outcome carries the identity", async () => {
     const fixture = await enrolled();
     expect(readProjectMapIdentity({ homeDir: fixture.homeDir, cwd: fixture.cwd })).toBeNull();

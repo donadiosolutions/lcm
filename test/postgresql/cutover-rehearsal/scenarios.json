@@ -2931,7 +2931,7 @@
           "outcome": "refused-precondition",
           "reason": "multi-machine-installation",
           "manifestPhase": null,
-          "applied": true
+          "applied": false
         },
         {
           "id": "b-set-plan",
@@ -2997,7 +2997,7 @@
         "I5": "na:no unreachable-target step in this row; disclosure scan still runs on every step",
         "I6": "required"
       },
-      "notes": "Required second-machine history contract is a documented refusal: no merge or automatic join of an independent SQLite history into a shared project is attempted. Installation B keeps its history and queue. The refused single apply reports applied=true because apply mints the destination identity before the multi-machine check (docs/migration-operations.md describes apply as resolving or creating the destination identity itself); no hold, journal or SQLite change results. The ordering is tracked as the non-blocking Bug https://github.com/donadiosolutions/lcm/issues/1689; flip b-apply to applied=false if it is changed."
+      "notes": "Required second-machine history contract is a documented refusal: no merge or automatic join of an independent SQLite history into a shared project is attempted. Installation B keeps its history and queue. The refused single apply reports applied=false because apply decides the shared-project refusal from the project map before it mints any identity (https://github.com/donadiosolutions/lcm/issues/1689); no destination project, hold, journal or SQLite change results."
     },
     {
       "profiles": [

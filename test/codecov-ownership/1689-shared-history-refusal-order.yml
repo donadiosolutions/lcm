@@ -1,0 +1,10 @@
+references: ["#1689"]
+rationale: >-
+  A fresh `lcm migration apply` now refuses a shared (project-map linked)
+  project from a read-only project-map read before the identity step mints a
+  local entry or a destination project. The new read lives beside the source
+  scope derivation in maintenance.ts and is called from apply.ts; both stay in
+  the existing migration cutover owner, no topology change.
+pins:
+  - ["src/migration/apply.ts", "unit-migration-cutover"]
+  - ["src/migration/maintenance.ts", "unit-migration-cutover"]
