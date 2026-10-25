@@ -866,8 +866,8 @@ async function mapRollback(args: Readonly<{
     if (result.step !== "checkpoint") {
       return serviceRefusal({ command: "rollback", reason: result.reason, bucket, setId, sections: { ...common, serviceStep: result.step } });
     }
-    // The checkpoint step can durably write member records before it refuses: report that write.
-    const refusedWrite = writeObservation(args.before, await fingerprintOf(homeDir, setId, args.generationIds, ops), false);
+    // The checkpoint step can durably write member records, or the reverse artifact (stated by the service), before it refuses.
+    const refusedWrite = writeObservation(args.before, await fingerprintOf(homeDir, setId, args.generationIds, ops), result.artifactPublished === true);
     return serviceRefusal({
       command: "rollback", reason: result.reason, bucket, setId, applied: refusedWrite.applied,
       sections: { ...common, serviceStep: result.step, ...writeSections(refusedWrite) },

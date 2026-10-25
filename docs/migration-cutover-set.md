@@ -485,7 +485,7 @@ does the set preparation (`cutover-set-rollback-held`).
 
 | Interrupted at | Resume |
 | --- | --- |
-| Before the checkpoint | nothing moved; an orphan reverse artifact is reused byte-identically; PostgreSQL stays selected and old replay evidence is admitted |
+| Before the checkpoint | no member, selection or checkpoint effect; the reverse artifact may already be stored, and an orphan one is reused byte-identically; PostgreSQL stays selected and old replay evidence is admitted. When a refusal at the checkpoint step follows this call's own artifact write, `rollback --set` reports `applied: yes` |
 | After the checkpoint, before the hold | the activation publication is still live and PostgreSQL selected; old replay evidence is already fenced; the same hold is entered |
 | Entering the hold | the exact entering journal is completed before the barrier, then the hold resumes |
 | Held, between cutoffs, classification, prepare, build, revalidation or install | missing cutoffs are bound, every member is classified again, pending effects must reproduce their frozen input, candidates are rebuilt where no installation record exists (earlier candidates stay preserved, the first preempted original is never rewritten), recorded installations are authenticated and adopted |
