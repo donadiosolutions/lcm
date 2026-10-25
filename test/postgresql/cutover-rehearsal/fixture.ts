@@ -26,6 +26,7 @@ import { DEFAULT_ROLLBACK_ENTRY_DEPENDENCIES, runMigrationRollbackFromHome, type
 import { runMigrationRollback } from "../../../src/migration/rollback.js";
 import { syncPrivateDirectory } from "../../../src/security-files.js";
 import { DaemonClient, type DaemonHealth } from "../../../src/daemon/client.js";
+import { PROMOTE_EVENTS_BUSY_BODY } from "../../../src/daemon/routes/promote-events.js";
 import { PostgreSqlConversationRepository } from "../../../src/storage/postgresql/conversation-repository.js";
 import { PostgreSqlRuntime } from "../../../src/storage/postgresql/runtime.js";
 import { PassiveEventReplicationWorker, sameEnvelope } from "../../../src/daemon/passive-event-replication.js";
@@ -900,30 +901,17 @@ export class RehearsalCase {
   }
   readonly homeRoots: string[] = [];
 
-  /** The most recent error the daemon recorded for the route (closed text from its sidecar error log). */
-  private lastPromoteRefusal(): string {
-    const events = new DatabaseSync(join(this.h.home, ".lcm", "events", this.h.localProjectId + ".db"), { readOnly: true });
-    try {
-      const row = events.prepare("SELECT error FROM error_log WHERE hook = 'promote-events' ORDER BY id DESC LIMIT 1").get() as { error?: string } | undefined;
-      return row?.error ?? "";
-    } finally {
-      events.close();
-    }
-  }
-
   /** One bounded awaited drain request to the running daemon: the same POST that 'lcm events promote' issues. */
   async promote(daemon: RunningDaemon, id: string): Promise<Record<string, unknown>> {
-    // The daemon's own background sweep can hold the publication mutation lock; the route answers 500 "retry after the
-    // active operation completes". One awaited retry is allowed for exactly that refusal; any other failure is fatal.
+    // The daemon's own background sweep can hold the publication lock; the route answers 503 with
+    // PROMOTE_EVENTS_BUSY_BODY. One awaited retry is allowed for exactly that answer; any other failure is fatal.
     const request = (): Promise<Record<string, unknown>> => daemon.client.post<Record<string, unknown>>("/promote-events", { cwd: this.h.cwd, drain: true }, { timeoutMs: 60_000 });
     let retried = false;
     let result: Record<string, unknown>;
     try {
       result = await request();
     } catch (error) {
-      if (!(error instanceof Error) || !/failed to promote events/u.test(error.message)) throw error;
-      const reason = this.lastPromoteRefusal();
-      if (!/already in progress/u.test(reason)) throw new Error("promote failed: " + reason);
+      if (!(error instanceof Error) || (error as Error & { statusCode?: number }).statusCode !== 503 || error.message !== PROMOTE_EVENTS_BUSY_BODY.error) throw error;
       retried = true;
       result = await request();
     }
