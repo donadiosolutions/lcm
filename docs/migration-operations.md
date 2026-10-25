@@ -459,7 +459,10 @@ knowing by name:
   is running. Run `lcm daemon status`, resolve the failure, and retry. A daemon that genuinely is
   not running is **not** a refusal here — see "Daemon presence" below.
 - `multi-machine-installation` (exit 2): this project is already linked to a PostgreSQL project
-  (see "Configuration" above). Migration requires an unlinked, single-machine project.
+  (see "Configuration" above). Migration requires an unlinked, single-machine project. A fresh
+  `apply` decides this from the local project map before it creates a local project entry or a
+  destination project, takes a hold or captures anything, so the refusal reports `applied: false`
+  and leaves PostgreSQL, the project map and the SQLite history untouched; there is nothing to clean up.
 - `route-not-owner` (exit 2), `route-resume-required` (exit 6), `route-publication-in-flight` (exit 4),
   `route-operator-required` (exit 7),
   `route-unresolvable` / `route-foreign-publication` / `route-contradiction` (exit 5): the router

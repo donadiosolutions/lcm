@@ -12,6 +12,7 @@ import {
   authenticateSqliteMigrationSource,
   authenticateSqliteMigrationSourceBytes,
   captureAuthenticatedSqliteMigrationSource,
+  readSqliteMigrationSourceScope,
 } from "./maintenance.js";
 import { observeMigrationMaintenanceJournal } from "./journal-observation.js";
 import {
@@ -345,6 +346,14 @@ async function freshCutoverUnderBarrier(
   // generation the operator never confirmed.
   if (resolution.generationId !== input.confirmGenerationId) {
     return { status: "refuse", reason: "confirmation-generation-moved" };
+  }
+
+  // A shared project is refused from the project map alone, before the
+  // identity step can mint a local entry or a destination project (#1689).
+  // Section 4.4: a multi-machine installation is refused with a distinct
+  // reason, not silently fenced (#625's D-625-4).
+  if (readSqliteMigrationSourceScope(input.cwd, input.homeDir, token) !== "local") {
+    return { status: "refuse", reason: "multi-machine-installation" };
   }
 
   // Plan-v5 Part B (3): only now, with the confirmed candidate re-checked

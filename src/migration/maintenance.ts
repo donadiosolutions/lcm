@@ -112,6 +112,35 @@ export type SqliteMigrationEnrollmentDependencies = Readonly<{
 
 const authenticatedAuthorities = new WeakMap<object, string>();
 
+type SqliteMigrationSourceProjectIdentity = AuthenticatedSqliteSnapshotAuthority["projectIdentity"];
+
+/** The one derivation of a migration source's scope: shared the moment its project-map entry carries a `remoteProjectId`. */
+function sqliteMigrationSourceProjectIdentity(
+  physicalProjectId: string,
+  entry: Readonly<{ remoteProjectId?: string }> | undefined,
+): SqliteMigrationSourceProjectIdentity {
+  return entry?.remoteProjectId === undefined
+    ? { scope: "local", projectId: physicalProjectId }
+    : { scope: "shared", projectId: entry.remoteProjectId };
+}
+
+/**
+ * The source's scope from the project map alone (a read-only snapshot under
+ * the retained token: no backfill, no write), so a shared-history refusal can
+ * be decided before apply mints any identity (#1689).
+ */
+export function readSqliteMigrationSourceScope(
+  cwd: string,
+  homeDir: string,
+  publicationLockToken: BackendPublicationLockToken,
+): SqliteMigrationSourceProjectIdentity["scope"] {
+  const local = localProjectIdentity(cwd, homeDir);
+  return sqliteMigrationSourceProjectIdentity(
+    local.id,
+    readProjectMapSnapshot(homeDir, publicationLockToken)[local.id],
+  ).scope;
+}
+
 function digestFile(path: string, allowedRoot: string): string {
   const value = readBoundedRegularFileWithStat(path, {
     allowedRoot,
@@ -149,9 +178,7 @@ export function authenticateSqliteMigrationSource(
   const body: Omit<AuthenticatedSqliteSnapshotAuthority, "sourceSelectionSha256"> = {
     version: 1,
     physicalProjectId: local.id,
-    projectIdentity: entry?.remoteProjectId === undefined
-      ? { scope: "local", projectId: local.id }
-      : { scope: "shared", projectId: entry.remoteProjectId },
+    projectIdentity: sqliteMigrationSourceProjectIdentity(local.id, entry),
     canonicalPath,
     aliases,
     projectDbPath,
