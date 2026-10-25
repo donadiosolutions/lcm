@@ -762,23 +762,8 @@ export class PostgreSqlBackendPublicationGuard {
     const projectId = uuidV7(input.projectId, input.projectId, operation);
     const target = targetBackend(input.targetBackend, projectId, operation);
     const evidence = evidenceSha256(input.evidenceSha256, projectId, operation);
-    const result = await this.executor.projectPublicationReadback<PublicationRow>(
-      {
-        text: selectLeaseSql(),
-        values: leaseKeyValues(projectId),
-      },
-      context(projectId, operation, input.signal),
-    );
-    if (result.rows.length > 1) {
-      return publicationError(projectId, operation, "invalid-row");
-    }
-    const row = result.rows[0];
-    if (row === undefined) return null;
-    // Decode before comparing identity so a genuinely corrupt row keeps
-    // invalid-row: only a decodable row that names a different generation
-    // reports fence-mismatch, which callers can handle as a routine
-    // conflict instead of data damage.
-    const fence = storedFenceFromRow(row, projectId, operation);
+    const fence = await this.readStoredFence(projectId, operation, input.signal);
+    if (fence === null) return null;
     if (
       fence.targetBackend !== target
       || fence.evidenceSha256 !== evidence
@@ -786,6 +771,53 @@ export class PostgreSqlBackendPublicationGuard {
       return publicationError(projectId, operation, "fence-mismatch");
     }
     return fence;
+  }
+
+  /**
+   * Read the project's publication row whichever generation it names.
+   *
+   * {@link read} refuses a decodable row of another target backend or
+   * evidence digest. A coordinator finishing the release of its own fence
+   * needs that row, because the only way another generation can hold it is
+   * by rebinding a RELEASED row: acquire replaces a row only when
+   * released_at is set, an unreleased foreign row is a publication-conflict
+   * even when expired, and every rebinding takes a strictly greater
+   * fencing_token from the identity sequence. Only the holder's exact
+   * machine, publication, operation identity and token can release a row.
+   * A row that differs in identity and carries a greater token than the
+   * caller's persisted fence therefore proves the persisted fence was
+   * released. A corrupt or ambiguous row still throws invalid-row.
+   */
+  async readForReleaseReconciliation(
+    input: Pick<PostgreSqlBackendPublicationMutationInput, "projectId" | "signal">,
+    operation = "readBackendPublicationForReleaseReconciliation",
+  ): Promise<PostgreSqlBackendPublicationFence | null> {
+    const projectId = uuidV7(input.projectId, input.projectId, operation);
+    return this.readStoredFence(projectId, operation, input.signal);
+  }
+
+  private async readStoredFence(
+    projectId: string,
+    operation: string,
+    signal: AbortSignal | undefined,
+  ): Promise<PostgreSqlBackendPublicationFence | null> {
+    const result = await this.executor.projectPublicationReadback<PublicationRow>(
+      {
+        text: selectLeaseSql(),
+        values: leaseKeyValues(projectId),
+      },
+      context(projectId, operation, signal),
+    );
+    if (result.rows.length > 1) {
+      return publicationError(projectId, operation, "invalid-row");
+    }
+    const row = result.rows[0];
+    if (row === undefined) return null;
+    // Decode before any identity comparison so a genuinely corrupt row keeps
+    // invalid-row: only a decodable row that names a different generation
+    // reports fence-mismatch, which callers can handle as a routine
+    // conflict instead of data damage.
+    return storedFenceFromRow(row, projectId, operation);
   }
 
   private async mutateExact(

@@ -2,6 +2,7 @@ import { createHash } from "node:crypto";
 import { mkdirSync, mkdtempSync, readFileSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import { setTimeout as delay } from "node:timers/promises";
 import { beforeAll, describe, expect, it } from "vitest";
 import type { ResolvedStorageConfig } from "../../src/daemon/config.js";
 import {
@@ -948,6 +949,78 @@ describe("PostgreSQL 18 machine and project identities", () => {
           projectId: project.projectId,
           alias: { path: firstHome.path },
         });
+    });
+  });
+
+  it("ensureProjectAliases waits for a concurrent alias writer and refuses on the set it finds, inserting nothing (#1678)", async () => {
+    await withPostgreSqlTestDatabase("identity-ensure-aliases", async (database) => {
+      await grantIdentityRuntimePrivileges(database);
+      const repository = new PostgreSqlIdentityRepository(database.runtime);
+      const machine = await repository.registerMachine(`machine:${"7".repeat(64)}`, "Machine ensure");
+      const project = await repository.createProject({
+        machineId: machine.machineId, displayName: "Ensure target", path: "/work/ensure-root", normalizedPath: "/work/ensure-root",
+      });
+      const wanted = [
+        { path: "/work/ensure-root", normalizedPath: "/work/ensure-root" },
+        { path: "/work/ensure-moved", normalizedPath: "/work/ensure-moved" },
+      ];
+      const scope = { domain: "identity" as const, operation: "ensureProjectAliasesRace", projectId: project.projectId, projectIds: [project.projectId] };
+      let writerInserted!: () => void;
+      const writerHasInserted = new Promise<void>((resolve) => { writerInserted = resolve; });
+      let commitWriter!: () => void;
+      const writerMayCommit = new Promise<void>((resolve) => { commitWriter = resolve; });
+      // An unrelated alias of the same project, inserted and still uncommitted.
+      const writer = database.runtime.transaction(async (transaction) => {
+        await transaction.query({
+          text: "INSERT INTO lcm.project_aliases (project_id, machine_id, path, normalized_path) VALUES ($1, $2, '/work/ensure-stranger', '/work/ensure-stranger')",
+          values: [project.projectId, machine.machineId],
+        }, scope);
+        writerInserted();
+        await writerMayCommit;
+      }, scope);
+      let ensuring: Promise<{ readonly inserted: number } | null> | undefined;
+      let settled = false;
+      try {
+        // A writer that fails before inserting ends the wait instead of hanging it.
+        await Promise.race([writerHasInserted, writer.then(() => { throw new Error("the writer ended before it inserted"); })]);
+        ensuring = repository.ensureProjectAliases({ machineId: machine.machineId, projectId: project.projectId, aliases: wanted })
+          .finally(() => { settled = true; });
+        void ensuring.catch(() => undefined);
+        // The reconcile is provably waiting on the alias table lock held back by the writer, not merely slow.
+        const deadline = Date.now() + 15_000;
+        for (;;) {
+          const waiting = await database.migrator.query<{ waiting: string }>({
+            text: `SELECT pg_catalog.count(*)::text AS waiting
+                   FROM pg_catalog.pg_locks AS lock
+                   JOIN pg_catalog.pg_class AS relation ON relation.oid = lock.relation
+                   WHERE NOT lock.granted
+                     AND lock.mode = 'ShareRowExclusiveLock'
+                     AND relation.oid = 'lcm.project_aliases'::pg_catalog.regclass`,
+          }, { domain: "factory", operation: "ensureProjectAliasesRace" });
+          if (waiting.rows[0]!.waiting !== "0") break;
+          if (settled) throw new Error("ensureProjectAliases finished without waiting on the alias table lock");
+          if (Date.now() > deadline) throw new Error("ensureProjectAliases never waited on the alias table lock");
+          await delay(50);
+        }
+        expect(settled).toBe(false);
+      } finally {
+        commitWriter();
+        await Promise.allSettled([writer, ...(ensuring === undefined ? [] : [ensuring])]);
+      }
+      await writer;
+      await expect(ensuring).resolves.toBeNull();
+      const rows = await database.migrator.query<{ path: string }>({
+        text: "SELECT path FROM lcm.project_aliases WHERE project_id = $1 ORDER BY path",
+        values: [project.projectId],
+      }, { domain: "factory", operation: "ensureProjectAliasesRace" });
+      expect(rows.rows.map((row) => row.path)).toEqual(["/work/ensure-root", "/work/ensure-stranger"]);
+
+      // With the stranger gone, the same call fills in exactly the missing alias and a repeat writes nothing.
+      await repository.unlinkPath(machine.machineId, "/work/ensure-stranger");
+      await expect(repository.ensureProjectAliases({ machineId: machine.machineId, projectId: project.projectId, aliases: wanted }))
+        .resolves.toEqual({ inserted: 1 });
+      await expect(repository.ensureProjectAliases({ machineId: machine.machineId, projectId: project.projectId, aliases: wanted }))
+        .resolves.toEqual({ inserted: 0 });
     });
   });
 });

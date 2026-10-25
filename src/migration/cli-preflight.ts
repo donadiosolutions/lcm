@@ -12,6 +12,7 @@ import { resolveMigrationTargetConfig } from "./target-config.js";
 import { classifyMigrationDaemonPresence, type MigrationDaemonPresence } from "./daemon-presence.js";
 import { verifyMigrationTargetReachability } from "./target-reachability.js";
 import { lookupMigrationTargetProjectId, resolveMigrationTargetProjectId } from "./target-identity.js";
+import { readAuthorizedMapAliasPaths } from "./map-aliases.js";
 import { unexpectedFailureEvidence } from "./boundary.js";
 import {
   computeMigrationGenerationBase,
@@ -273,6 +274,7 @@ export type MigrationExpectedIdentityOperations = Readonly<{
   readLocalIdentity: typeof readProjectMapIdentity;
   resolveTargetIdentity: typeof resolveMigrationTargetProjectId;
   lookupTargetProject: typeof lookupMigrationTargetProjectId;
+  readAuthorizedAliases: typeof readAuthorizedMapAliasPaths;
 }>;
 
 export type MigrationExpectedIdentityResult =
@@ -342,6 +344,7 @@ export async function resolveMigrationExpectedIdentity(input: Readonly<{
   const readLocalIdentity = input._operationsForTesting?.readLocalIdentity ?? readProjectMapIdentity;
   const resolveTargetIdentity = input._operationsForTesting?.resolveTargetIdentity ?? resolveMigrationTargetProjectId;
   const lookupTargetProject = input._operationsForTesting?.lookupTargetProject ?? lookupMigrationTargetProjectId;
+  const readAuthorizedAliases = input._operationsForTesting?.readAuthorizedAliases ?? readAuthorizedMapAliasPaths;
   const { preflight } = input;
   const fresh = preflight.candidate.disposition === "fresh";
 
@@ -385,6 +388,13 @@ export async function resolveMigrationExpectedIdentity(input: Readonly<{
         machineId: preflight.machineId,
         displayName: basename(local.canonical),
         authorityCanonicalPath: local.canonical,
+        // The map entry the fresh step just resolved, under the same admission.
+        aliases: readAuthorizedAliases({
+          homeDir: input.homeDir,
+          localProjectId: local.id,
+          canonicalPath: local.canonical,
+          ...(input.publicationLockToken === undefined ? {} : { publicationLockToken: input.publicationLockToken }),
+        }),
       });
       if (resolution.status === "refuse") {
         return { status: "refuse", reason: resolution.reason, evidence: resolution.evidence };

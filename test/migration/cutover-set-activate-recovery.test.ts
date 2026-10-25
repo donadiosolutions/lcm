@@ -13,6 +13,7 @@ import { readMigrationActivationEvidence } from "../../src/migration/activation-
 import { assertMigrationReplayAdmission } from "../../src/migration/maintenance.js";
 import { performMigrationAbortCommand } from "../../src/migration/cli-abort.js";
 import { MigrationProjectMapWitnessError } from "../../src/migration/project-map-witness.js";
+import { PostgreSqlBackendPublicationGuardError } from "../../src/storage/postgresql/publication-guard.js";
 import { migrationSelectionBindingPath } from "../../src/migration/generation-binding-store.js";
 import {
   HASH_A,
@@ -251,6 +252,33 @@ describe("activateCutoverSet: lease continuation across members", () => {
     f.guard.seed({ projectId: a!.remoteProjectId, publicationId: "stranger", evidenceSha256: a!.copyBindingSha256 });
     expect(await f.run()).toMatchObject({ status: "interrupted", step: "S13b", cause: "lease-lost", detail: expect.stringContaining("another publication") });
     expectAllOld(f);
+  });
+
+  it("a crash at releasing with successor publications' rows present finishes without touching them; a corrupt row stays lease-lost (Bug #1651)", async () => {
+    const f = await fixture();
+    let crashed = false;
+    const crashing = f.coordinator((event) => {
+      if (crashed || event !== "after-journal-write") return;
+      if (readBackendPublicationJournal(f.homeDir)?.phase === "releasing") { crashed = true; throw new Error("injected coordinator crash at releasing"); }
+    });
+    await expect(f.run({ createCoordinator: () => crashing })).rejects.toThrow("injected coordinator crash at releasing");
+    // The remote releases committed; other homes then acquired every released row.
+    for (const member of f.members) {
+      f.guard.rows.delete(member.remoteProjectId);
+      f.guard.seed({ projectId: member.remoteProjectId, publicationId: "another-publication" });
+    }
+    const successors = f.members.map((member) => ({ ...f.guard.rows.get(member.remoteProjectId)! }));
+    const read = f.guard.read.bind(f.guard);
+    f.guard.read = async () => { throw new PostgreSqlBackendPublicationGuardError(f.members[0]!.remoteProjectId, "read", "invalid-row"); };
+    expect(await f.run()).toMatchObject({ status: "interrupted", step: "S13b", cause: "lease-lost" });
+    expect(readBackendPublicationJournal(f.homeDir)?.phase).toBe("releasing");
+    f.guard.read = read;
+    const mutations = f.guard.calls.filter((call) => !call.startsWith("read:")).length;
+    expect(await f.run()).toMatchObject({ status: "activated", resumedFrom: "publication-journal" });
+    for (const member of f.members) expect(f.manifestStore.read(member.generationId).phase).toBe("active");
+    expect(f.guard.calls.filter((call) => !call.startsWith("read:"))).toHaveLength(mutations);
+    expect(f.members.map((member) => f.guard.rows.get(member.remoteProjectId))).toEqual(successors);
+    expect(readBackendPublicationJournal(f.homeDir)?.phase).toBe("completed");
   });
 
   it("a lease lost before the freeze is a roll-forward interruption that keeps every member's evidence, and a lost lease before any effect is a refusal", async () => {

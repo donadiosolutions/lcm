@@ -50,6 +50,7 @@ import {
   resolveMigrationWitnessBindings,
 } from "../../src/migration/generation-binding-store.js";
 import { assertMigrationReplayAdmission } from "../../src/migration/maintenance.js";
+import { drainIntoPrunedState, forgetLocalPrune, readDeliveryRows } from "./drained-inbox-fixture.js";
 import {
   beginMigrationEffect,
   completeMigrationEffect,
@@ -80,6 +81,8 @@ import { fixtureActivationScenario } from "../fixtures/migration-activation-reco
 import { assertHarnessReady, settings, withPostgreSqlTestDatabase, type PostgreSqlTestDatabase } from "./harness.js";
 import { applyAllRuntimeGrants } from "./operational-fixture.js";
 import { PORTABLE_POSTGRESQL_FIXTURE, seedPortablePostgreSql } from "./portable-fixture.js";
+import { eventsDir } from "../../src/db/events-path.js";
+import { readOutboxPrevEventIds, replicateIntoInbox } from "./replicated-inbox-fixture.js";
 
 beforeAll(assertHarnessReady);
 
@@ -574,6 +577,40 @@ describe("production rollback against PostgreSQL 18", { timeout: 240_000 }, () =
     });
   });
 
+  it("#1694: a post-write rollback completes with rows a real replication pass uploaded resident in the inbox", async () => {
+    await withPostgreSqlTestDatabase("rollback-session-replicated-inbox", async (database) => {
+      const { homeDir, canonicalPath } = await prepared(database, "gen-replicated");
+      // The local machine's own outbox, at the path the rollback reconciles; the worker leaves its rows
+      // quarantined (inbox and local), retry and pending (inbox) with a replicated local row, never acknowledged.
+      const outboxPath = join(eventsDir(homeDir), `${fixture.localProjectId}.db`);
+      const replicated = await replicateIntoInbox(database, homeDir, {
+        projectId: fixture.projectId, machineId: fixture.machineId, outboxPath,
+      });
+      await replicated.close();
+      await insertConversation(database, "raced-session-replicated");
+      const states = async () => (await database.migrator.query<{ data: string; status: string }>({
+        text: "SELECT payload->>'data' AS data, status FROM lcm.passive_event_inbox WHERE payload->>'data' LIKE 'replicated-%' ORDER BY machine_sequence",
+      }, factoryContext)).rows;
+      const before = [
+        { data: "replicated-0", status: "quarantined" }, { data: "replicated-1", status: "retry" },
+        { data: "replicated-2", status: "pending" },
+      ];
+      expect(await states()).toEqual(before);
+      const prevEventIds = new Map(replicated.events.map((event) => [event.data, event.prevEventId]));
+      expect(readOutboxPrevEventIds(outboxPath)).toEqual(prevEventIds);
+
+      const outcome = await runRollback({ homeDir, generationId: "gen-replicated", canonicalPath, database });
+      expect(outcome.manifest.rollbackLineage.mode).toBe("post-write");
+      expectRollbackPublished(homeDir, "gen-replicated");
+      expect((await leaseRow(database))!.released).toBe(true);
+      // The upload stays resident, and the resident local rows keep their previous-event pointers.
+      expect(await states()).toEqual(before);
+      // The rollback also materializes the fixture's own archived rows next to them.
+      const after = [...readOutboxPrevEventIds(outboxPath)].filter(([data]) => data.startsWith("replicated-"));
+      expect(new Map(after)).toEqual(prevEventIds);
+    });
+  });
+
   it("F4: a post-write rollback completes with poolMax=1, because the export snapshot is closed with its stream", async () => {
     await withPostgreSqlTestDatabase("rollback-session-pool-one", async (database) => {
       const { homeDir, canonicalPath } = await prepared(database, "gen-pool-one", { poolMax: 1 });
@@ -875,6 +912,58 @@ describe("production rollback against PostgreSQL 18", { timeout: 240_000 }, () =
       })).rejects.toMatchObject({ reason: "drift", message: expect.stringContaining("census differs") });
       expect(existsSync(canonicalPath)).toBe(false);
       expect(readBackendMaintenanceJournal(homeDir)?.phase).toBe("maintenance-held");
+    });
+  });
+
+  it("#1698: a post-write rollback completes after a real replication pass delivered, acknowledged and pruned the local rows", async () => {
+    await withPostgreSqlTestDatabase("rollback-session-drained-pruned", async (database) => {
+      const { homeDir, canonicalPath } = await prepared(database, "gen-drained");
+      const outboxPath = join(eventsDir(homeDir), `${fixture.localProjectId}.db`);
+      const drained = await drainIntoPrunedState(database, {
+        projectId: fixture.projectId, machineId: fixture.machineId, outboxPath,
+      });
+      await insertConversation(database, "raced-session-drained");
+      // The steady state after a drain: no inbox row left in PostgreSQL, every local row acknowledged and pruned.
+      const inboxRows = async () => (await database.migrator.query<{ n: string }>({
+        text: "SELECT count(*)::text AS n FROM lcm.passive_event_inbox WHERE payload->>'data' LIKE 'drained-%'",
+      }, factoryContext)).rows[0]!.n;
+      expect(await inboxRows()).toBe("0");
+      const before = readDeliveryRows(outboxPath);
+      expect(before.map((row) => row.data)).toEqual(drained.data);
+      expect(before.every((row) => row.delivery_state === "acknowledged" && row.remote_inbox_id !== null && row.remote_pruned_at !== null)).toBe(true);
+
+      const outcome = await runRollback({ homeDir, generationId: "gen-drained", canonicalPath, database });
+      expect(outcome.manifest.rollbackLineage.mode).toBe("post-write");
+      expectRollbackPublished(homeDir, "gen-drained");
+      expect((await leaseRow(database))!.released).toBe(true);
+      // The local rows keep their delivery state, inbox id, prune marker and (unset) processing marker: the daemon's
+      // remote apply does nothing, so the SQLite consumer still promotes them.
+      expect(before.every((row) => row.processed_at === null)).toBe(true);
+      expect(readDeliveryRows(outboxPath)).toEqual(before);
+    });
+  });
+
+  it("#1698: a post-write rollback still refuses before publishing when a delivered row's prune was never recorded locally", async () => {
+    await withPostgreSqlTestDatabase("rollback-session-drained-unpruned", async (database) => {
+      const { homeDir, canonicalPath } = await prepared(database, "gen-unpruned");
+      const outboxPath = join(eventsDir(homeDir), `${fixture.localProjectId}.db`);
+      const drained = await drainIntoPrunedState(database, {
+        projectId: fixture.projectId, machineId: fixture.machineId, outboxPath,
+      });
+      forgetLocalPrune(outboxPath, drained.data[1]!);
+      await insertConversation(database, "raced-session-unpruned");
+      const before = readDeliveryRows(outboxPath);
+      await expect(runRollback({ homeDir, generationId: "gen-unpruned", canonicalPath, database }))
+        .rejects.toMatchObject({ name: "MigrationRollbackError", reason: "unexpected-state" });
+      // Nothing was published or installed; the manifest is still resumable and PostgreSQL stays authoritative.
+      expect(existsSync(canonicalPath)).toBe(false);
+      expect(readBackendMaintenanceJournal(homeDir)?.phase).toBe("maintenance-held");
+      expect(rollbackBinding(homeDir, "gen-unpruned")).toBeUndefined();
+      expect(readConfigBackend(homeDir)).toBe("postgresql");
+      const manifest = new MigrationManifestStore({ homeDir }).read("gen-unpruned");
+      expect(manifest.phase).toBe("rolling-back");
+      expect(manifest.pendingEffect).toBeNull();
+      expect(readDeliveryRows(outboxPath)).toEqual(before);
     });
   });
 });

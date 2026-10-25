@@ -1,0 +1,8 @@
+references: ["#1680"]
+rationale: >-
+  #1680 takes the cutover-set rollback report timestamp once, before the
+  report is written, so it never falls after the member completion timestamp.
+  The change stays inside the existing cutover-set rollback module and keeps
+  its migration cutover owner.
+pins:
+  - ["src/migration/cutover-set-rollback.ts", "unit-migration-cutover"]
