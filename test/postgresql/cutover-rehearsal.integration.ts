@@ -269,6 +269,7 @@ const setRoundTrip: Handler = async (c) => {
   const members = await prepareSet(c);
   await c.step("set-resume-dry-run");
   await c.step("set-activate-dry-run");
+  await grantRuntimeRole(c);
   await c.step("set-activate");
   c.authority("activated");
   c.sealCheck("after-activate");
@@ -276,7 +277,7 @@ const setRoundTrip: Handler = async (c) => {
   c.compareDomains("postgresql-a-after-activate", base.a, activated.a);
   c.compareDomains("postgresql-b-after-activate", base.b, activated.b);
   assertLedgerRetained(c, "after-activate");
-  await swapGrants(c.db, c.role, "runtime", c.signal);
+  await revokeTransferGrants(c);
   await c.step("set-report-active");
   await c.step("set-rollback-dry-run");
   const rolledBack = (await c.step("set-rollback")).envelope.evidence as Record<string, unknown>;
@@ -337,6 +338,7 @@ const setInterruptionChain: Handler = async (c) => {
     ["activation-map-published", { kind: "publication-phase", phase: "map-published" }],
     ["activation-first-member-active", { kind: "crash-point", point: "after-complete:" + a }],
   ];
+  await grantRuntimeRole(c);
   for (const [checkpoint, interruption] of checkpoints) {
     await interruptSetActivation(c, interruption, targetConfig);
     c.authority(checkpoint);
@@ -350,7 +352,7 @@ const setInterruptionChain: Handler = async (c) => {
   const activated = await setPostgres(c);
   c.compareDomains("postgresql-a-after-activate", base.a, activated.a);
   c.compareDomains("postgresql-b-after-activate", base.b, activated.b);
-  await swapGrants(c.db, c.role, "runtime", c.signal);
+  await revokeTransferGrants(c);
   await c.step("set-report-active");
   await withProject(c, secondOf(c), () => guardedWrite(c, "s3-post-write-b"));
   const written = await setPostgres(c);
@@ -385,12 +387,14 @@ const setMemberDrift: Handler = async (c) => {
   const remoteB = await destinationProjectId(c.db, secondOf(c).cwd, c.signal);
   await c.sql("INSERT INTO lcm.conversations(project_id, session_id, title) VALUES ($1, 'drift-session', 'Drift')", [remoteB]);
   c.injections.push({ surface: "module-seam", boundary: "member B destination census after verification", kind: "destination-mutation", hitCount: 1 });
+  await grantRuntimeRole(c);
   await c.step("set-activate-drifted");
   c.authority("held");
   assertAllOrNoneBound(c, 2);
   c.sealCheck("after-refusal");
   assertLedgerRetained(c, "after-refusal");
   await c.step("set-report-prepared-drifted");
+  await swapGrants(c.db, c.runtime, "none", c.signal);
   await c.step("set-abort");
   c.authority("aborted");
   c.sealCheck("after-abort");
@@ -404,12 +408,13 @@ const setRollbackInstallFailure: Handler = async (c) => {
   const base = setBaselines(c);
   await acknowledgeEvents(c, "s4b", ["s4b-pending-a"]);
   await prepareSet(c);
+  await grantRuntimeRole(c);
   await c.step("set-activate");
   c.authority("activated");
   const activated = await setPostgres(c);
   c.compareDomains("postgresql-a-after-activate", base.a, activated.a);
   c.compareDomains("postgresql-b-after-activate", base.b, activated.b);
-  await swapGrants(c.db, c.role, "runtime", c.signal);
+  await revokeTransferGrants(c);
   await withProject(c, secondOf(c), () => guardedWrite(c, "s4b-post-write-b"));
   const written = await setPostgres(c);
   const outcome = await interruptSetRollback(c, { kind: "install-failure" });

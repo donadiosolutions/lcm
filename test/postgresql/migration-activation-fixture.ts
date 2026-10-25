@@ -140,6 +140,20 @@ export async function grantRuntimeActivationRole(
   }
 }
 
+/** Revoke every database-local privilege from the transfer role after
+ * activation, matching the documented handoff to the proven runtime role. */
+export async function revokeTransferActivationRole(db: PostgreSqlTestDatabase): Promise<void> {
+  const administrator = new PostgreSqlRuntime(settings(db.adminUrl));
+  try {
+    await administrator.query(
+      { text: "DROP OWNED BY " + TRANSFER_ROLE },
+      { domain: "factory", operation: "revokeTransferActivationRole" },
+    );
+  } finally {
+    await administrator.close();
+  }
+}
+
 /**
  * Remove the run's activation role before the harness drops the database: DROP
  * OWNED revokes its grants in this database and on the database itself, which

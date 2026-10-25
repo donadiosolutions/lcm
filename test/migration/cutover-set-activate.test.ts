@@ -1,5 +1,6 @@
 import { afterEach, describe, expect, it, vi } from "vitest";
-import { readFileSync, writeFileSync } from "node:fs";
+import { mkdirSync, readFileSync, writeFileSync } from "node:fs";
+import { join } from "node:path";
 import { clearProjectMapCache, projectMapPath } from "../../src/project-map.js";
 import { readBackendMaintenanceJournal, readBackendPublicationJournal } from "../../src/storage/backend-publication.js";
 import { MigrationActivationError } from "../../src/migration/activate-generation.js";
@@ -13,8 +14,16 @@ import { backendCutoverSetJournalCapacity } from "../../src/storage/backend-publ
 import { MigrationProjectMapWitnessError } from "../../src/migration/project-map-witness.js";
 import { activateCutoverSet } from "../../src/migration/cutover-set-activate.js";
 import {
+  createCutoverSetRollbackCheckpoint,
+  deriveCutoverSetRollbackSetId,
+  migrationCutoverSetRollbackDirectory,
+  recordCutoverSetRollbackCheckpoint,
+} from "../../src/migration/cutover-set-rollback-store.js";
+import {
+  DEST_IDENTITY,
   HASH_A,
   REMOTES,
+  SYSTEM_ID,
   TARGET_CONFIG,
   cleanupRoots,
   domainCensus,
@@ -78,7 +87,7 @@ describe("activateCutoverSet: one publication for every member", () => {
 
   it("rejects invalid input before touching anything", async () => {
     const f = await fixture();
-    for (const bad of [null, { ...f.input, homeDir: "" }, { ...f.input, confirmSetId: "../x" }, { ...f.input, targetConfig: null }, { ...f.input, targetConfig: { postgresql: { migrationRole: "" } } }]) {
+    for (const bad of [null, { ...f.input, homeDir: "" }, { ...f.input, confirmSetId: "../x" }, { ...f.input, targetConfig: null }, { ...f.input, ordinarySettings: null }, { ...f.input, targetConfig: { postgresql: { migrationRole: "" } } }]) {
       await expect(activateCutoverSet(bad as never, f.deps)).rejects.toBeInstanceOf(MigrationActivationError);
     }
     await expect(activateCutoverSet({ ...f.input, targetConfig: { ...TARGET_CONFIG, postgresql: { ...TARGET_CONFIG.postgresql, url: "not a url" } } }, f.deps))
@@ -88,6 +97,173 @@ describe("activateCutoverSet: one publication for every member", () => {
 });
 
 describe("activateCutoverSet: whole-set refusals before any effect", () => {
+  it("proves distinct runtime and transfer roles with reciprocal caller admission", async () => {
+    const f = await fixture();
+    const ordinarySettings = {
+      url: "postgresql://lcm_runtime@db.example.test:5432/lcm",
+      caFile: "/dev/null",
+      poolMax: 1,
+      connectionTimeoutMs: 1000,
+      idleTimeoutMs: 1000,
+      statementTimeoutMs: 1000,
+      snapshotIdleTimeoutMs: 1000,
+    };
+    const ordinaryUrls: string[] = [];
+    const transferUrls: string[] = [];
+    const roleReads: unknown[] = [];
+    const runtimeAdmissions: unknown[] = [];
+    const transferAdmissions: unknown[] = [];
+    let ordinaryRuntime: ReturnType<typeof f.deps.createOrdinaryRuntime> | null = null;
+
+    const outcome = await activateCutoverSet({ ...f.input, ordinarySettings } as never, {
+      ...f.deps,
+      createOrdinaryRuntime: (settings) => {
+        ordinaryUrls.push(settings.url);
+        ordinaryRuntime = f.deps.createOrdinaryRuntime(settings);
+        return ordinaryRuntime;
+      },
+      createTransferRuntime: (settings) => {
+        transferUrls.push(settings.url);
+        return f.deps.createTransferRuntime(settings);
+      },
+      readRoleIdentity: async (executor) => {
+        roleReads.push(executor);
+        return executor === ordinaryRuntime
+          ? { currentUser: "lcm_runtime", sessionUser: "lcm_runtime", oid: "101", tls: true }
+          : { currentUser: "lcm_transfer", sessionUser: "lcm_transfer", oid: "202", tls: true };
+      },
+      checkTargetHealth: async (input, dependencies) => ({
+        status: "healthy",
+        readiness: await dependencies.verifyRuntimeSchema!(input.runtime, {
+          expectedOwner: input.expectedOwner,
+          signal: input.signal,
+        }),
+      }),
+      verifyRuntimeSchema: async (_executor, options) => {
+        runtimeAdmissions.push(options);
+        return { ...f.deps.health[0]?.readiness, runtimeRole: "lcm_runtime" } as never;
+      },
+      verifyTransferSchema: async (_executor, options) => {
+        transferAdmissions.push(options);
+        return { ...f.deps.health[0]?.readiness, runtimeRole: "lcm_transfer" } as never;
+      },
+    });
+
+    expectActivated(f, outcome, "fresh");
+    expect({
+      ordinaryUrls,
+      transferUrlsAreTransfer: transferUrls.every((url) => url === TARGET_CONFIG.postgresql.url),
+      roleReadCount: roleReads.length,
+      runtimeAdmissions,
+      transferAdmissions,
+    }).toEqual({
+      ordinaryUrls: [ordinarySettings.url],
+      transferUrlsAreTransfer: true,
+      roleReadCount: 2,
+      runtimeAdmissions: [
+        expect.objectContaining({ admittedPeer: { role: "lcm_transfer" } }),
+        expect.objectContaining({ admittedPeer: { role: "lcm_transfer" } }),
+      ],
+      transferAdmissions: [
+        expect.objectContaining({ admittedPeer: { role: "lcm_runtime" } }),
+        expect.objectContaining({ admittedPeer: { role: "lcm_runtime" } }),
+      ],
+    });
+  });
+
+  it("refuses identical activation roles before acquiring any member lease", async () => {
+    const f = await fixture();
+    const outcome = await activateCutoverSet({
+      ...f.input,
+      ordinarySettings: { ...TARGET_CONFIG.postgresql, url: "postgresql://lcm_runtime@db.example.test:5432/lcm" },
+    } as never, {
+      ...f.deps,
+      readRoleIdentity: async () => ({
+        currentUser: "lcm_runtime",
+        sessionUser: "lcm_runtime",
+        oid: "101",
+        tls: true,
+      }),
+    });
+
+    expect(outcome).toMatchObject({
+      status: "refused",
+      step: "S6",
+      reason: "target-unhealthy",
+      effectBegun: false,
+    });
+    expect(f.guard.calls.some((call) => call.startsWith("acquire:"))).toBe(false);
+  });
+
+  it("refuses switched or insecure activation role sessions before any lease", async () => {
+    for (const kind of ["switched", "insecure"] as const) {
+      const f = await fixture();
+      let reads = 0;
+      const outcome = await f.run({
+        readRoleIdentity: async () => reads++ === 0
+          ? { currentUser: "lcm_runtime", sessionUser: "lcm_runtime", oid: "101", tls: true }
+          : kind === "switched"
+            ? { currentUser: "lcm_transfer", sessionUser: "session_owner", oid: "202", tls: true }
+            : { currentUser: "lcm_transfer", sessionUser: "lcm_transfer", oid: "202", tls: false },
+      });
+      expect(outcome).toMatchObject({
+        status: "refused",
+        step: "S6",
+        reason: "target-unhealthy",
+        effectBegun: false,
+      });
+      expect(f.guard.calls.some((call) => call.startsWith("acquire:"))).toBe(false);
+    }
+  });
+
+  it("classifies an unavailable activation-role query before any lease", async () => {
+    const f = await fixture();
+    const outcome = await f.run({ readRoleIdentity: async () => { throw new Error("unavailable"); } });
+    expect(outcome).toMatchObject({
+      status: "refused",
+      step: "S6",
+      reason: "target-unresolvable",
+      effectBegun: false,
+      detail: expect.stringContaining("connection-failed"),
+    });
+    expect(f.guard.calls.some((call) => call.startsWith("acquire:"))).toBe(false);
+  });
+
+  it("binds the ordinary runtime to the sealed destination before acquiring a member lease", async () => {
+    const f = await fixture();
+    let ordinaryRuntime: ReturnType<typeof f.deps.createOrdinaryRuntime> | null = null;
+    const outcome = await activateCutoverSet({
+      ...f.input,
+      ordinarySettings: { ...TARGET_CONFIG.postgresql, url: "postgresql://lcm_runtime@db.example.test:5432/lcm" },
+    } as never, {
+      ...f.deps,
+      createOrdinaryRuntime: (settings) => {
+        ordinaryRuntime = f.deps.createOrdinaryRuntime(settings);
+        return ordinaryRuntime;
+      },
+      readRoleIdentity: async (executor) => executor === ordinaryRuntime
+        ? { currentUser: "lcm_runtime", sessionUser: "lcm_runtime", oid: "101", tls: true }
+        : { currentUser: "lcm_transfer", sessionUser: "lcm_transfer", oid: "202", tls: true },
+      captureDestinationIdentity: async (executor) => ({
+        version: 1,
+        sealedWitnessSha256: DEST_IDENTITY,
+        systemIdentifier: executor === ordinaryRuntime ? "999" : SYSTEM_ID,
+      }),
+    });
+
+    expect(outcome).toMatchObject({
+      status: "refused",
+      step: "S5",
+      reason: "cutover-set-member-evidence-drifted",
+      effectBegun: false,
+      members: [
+        expect.objectContaining({ reason: "identity-drift" }),
+        expect.objectContaining({ reason: "identity-drift" }),
+      ],
+    });
+    expect(f.guard.calls.some((call) => call.startsWith("acquire:"))).toBe(false);
+  });
+
   it("refuses when no set is held, when the hold belongs to another set, and when the slot holds a publication", async () => {
     const unheld = await fixture({ held: false });
     expect(await unheld.run()).toMatchObject({ status: "refused", step: "S3", reason: "maintenance-not-held", effectBegun: false });
@@ -125,6 +301,65 @@ describe("activateCutoverSet: whole-set refusals before any effect", () => {
     const rollback = await fixture();
     rollback.rewriteJournal((payload) => { payload.sourceBackend = "postgresql"; });
     expect(await rollback.run()).toMatchObject({ status: "refused", step: "S3", reason: "maintenance-not-held", detail: expect.stringContaining("postgresql") });
+  });
+
+  it("refuses unresolvable rollback records before any set activation effect", async () => {
+    const f = await fixture();
+    const directory = migrationCutoverSetRollbackDirectory(f.homeDir, f.setId);
+    mkdirSync(directory, { recursive: true, mode: 0o700 });
+    writeFileSync(join(directory, "checkpoint.json"), "{}\n", { mode: 0o600 });
+    expect(await f.run()).toMatchObject({
+      status: "refused",
+      step: "S0",
+      reason: "cutover-set-rollback-committed",
+      detail: expect.stringContaining("rollback records are unresolvable"),
+      effectBegun: false,
+    });
+    expectNoEffects(f);
+  });
+
+  it("refuses a resolved rollback commitment before any set activation effect", async () => {
+    const f = await fixture();
+    const hex = (value: string) => value.repeat(64);
+    const rollbackManifest = { ...f.manifest, setId: deriveCutoverSetRollbackSetId(f.setId) };
+    const checkpoint = createCutoverSetRollbackCheckpoint({
+      originalSetId: f.setId,
+      setId: rollbackManifest.setId,
+      manifest: rollbackManifest,
+      publicationId: rollbackManifest.setId,
+      originalCheckpointSha256: hex("1"),
+      originalSelectionSha256: hex("2"),
+      activationIdentityDigest: hex("3"),
+      activationJournalChecksumSha256: hex("4"),
+      operabilityFactValueSha256: hex("5"),
+      identityDigest: hex("d"),
+      members: f.members.map((member, index) => ({
+        physicalProjectId: member.localProjectId,
+        generationId: member.generationId,
+        remoteProjectId: member.remoteProjectId,
+        heldMemberChecksumSha256: hex("6"),
+        snapshotChecksumSha256: hex("7"),
+        sourceSelectionSha256: rollbackManifest.members[index]!.sourceSelectionSha256,
+        queueEvidenceSha256: hex("8"),
+        queueCutoff: null,
+        sourceByteWitnessSha256: hex("9"),
+        epochId: hex("e"),
+        attemptId: hex("a"),
+        activationWitnessChecksumSha256: hex("c"),
+        manifestRevision: 12,
+        manifestChecksumSha256: hex("b"),
+        evidenceSha256: hex(String(index + 1)),
+      })),
+    });
+    recordCutoverSetRollbackCheckpoint({ homeDir: f.homeDir, checkpoint });
+    expect(await f.run()).toMatchObject({
+      status: "refused",
+      step: "S0",
+      reason: "cutover-set-rollback-committed",
+      detail: expect.stringContaining("checkpoint " + checkpoint.checksumSha256),
+      effectBegun: false,
+    });
+    expectNoEffects(f);
   });
 
   it("refuses membership drift, authority drift, unverifiable and unresolvable enumerations", async () => {
@@ -293,7 +528,7 @@ describe("activateCutoverSet: per-member refusals name every failing member", ()
     expect(await f.run()).toMatchObject({ status: "refused", step: "S0", reason: "cutover-set-member-evidence-unverifiable", members: [expect.anything(), expect.objectContaining({ reason: "verification-unresolvable" })] });
     f.deps.transferRows.set(f.members[1]!.remoteProjectId, [{ run_id: "migration-copy-" + f.members[1]!.copyBindingSha256, state: "completed" }]);
     f.deps.identity.sealedWitnessSha256 = "f".repeat(64);
-    expect(await f.run()).toMatchObject({ status: "refused", step: "S0", reason: "cutover-set-member-evidence-drifted", members: [expect.objectContaining({ reason: "identity-drift" }), expect.objectContaining({ reason: "identity-drift" })] });
+    expect(await f.run()).toMatchObject({ status: "refused", step: "S5", reason: "cutover-set-member-evidence-drifted", members: [expect.objectContaining({ reason: "identity-drift" }), expect.objectContaining({ reason: "identity-drift" })] });
     f.deps.identity.sealedWitnessSha256 = "d".repeat(64);
     f.guard.seed({ projectId: f.members[1]!.remoteProjectId, publicationId: "someone-else" });
     const conflict = await f.run();

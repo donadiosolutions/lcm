@@ -49,9 +49,12 @@ import { dryRunAuthenticatedSqliteMigrationSource } from "./maintenance.js";
 import { resolveMigrationTargetConfig } from "./target-config.js";
 import { verifyMigrationTargetReachability } from "./target-reachability.js";
 import type { ResolvedPostgreSqlConfig } from "../daemon/config.js";
+import { connectionSettings } from "../storage/postgresql/factory.js";
+import {
+  ACTIVATE_NEXT_AFTER_SUCCESS,
+  resolveMigrationActivationRuntimeSettings,
+} from "./cli-activate.js";
 
-const CUTOVER_SET_ACTIVATE_NEXT_AFTER_SUCCESS = "swap-grants-then-start-daemon";
-/** The set's own exit-8 reason: the transfer-only set activation still needs the full grant swap, not the revoke alone. */
 const CUTOVER_SET_RESTART_REQUIRED = "set-restart-required";
 
 /**
@@ -90,6 +93,7 @@ export type MigrationSetOutcome =
 
 export type MigrationSetOperations = Readonly<{
   resolveTargetConfig: typeof resolveMigrationTargetConfig;
+  resolveRuntimeSettings: typeof resolveMigrationActivationRuntimeSettings;
   classifyPresence: typeof classifyMigrationDaemonPresence;
   verifyReachability: typeof verifyMigrationTargetReachability;
   resolveCandidate: typeof resolveCutoverSetCandidate;
@@ -108,6 +112,7 @@ export type MigrationSetOperations = Readonly<{
 
 const DEFAULT_OPERATIONS: MigrationSetOperations = {
   resolveTargetConfig: resolveMigrationTargetConfig,
+  resolveRuntimeSettings: resolveMigrationActivationRuntimeSettings,
   classifyPresence: classifyMigrationDaemonPresence,
   verifyReachability: verifyMigrationTargetReachability,
   resolveCandidate: resolveCutoverSetCandidate,
@@ -829,18 +834,18 @@ async function mapActivate(args: Readonly<{
   const applied = written.applied;
   const evidence: MigrationEvidence = {
     ...setSections(observed), ...setRowsEvidence(observedRows(observed)), publicationId: result.publicationId,
-    resumedFrom: result.resumedFrom, grantSwap: "required-before-daemon-start", ...restart.evidence, ...writeEvidence,
+    resumedFrom: result.resumedFrom, transferGrantRevocation: "required-before-daemon-start", ...restart.evidence, ...writeEvidence,
   };
   if (restart.reason !== undefined) {
     const required = restart.reason === CUTOVER_RESTART_REASONS.required;
     return refuse(required ? CUTOVER_SET_RESTART_REQUIRED : restart.reason, {
       generationId: setId, ...(applied ? { applied: true } : {}),
-      next: required ? CUTOVER_SET_ACTIVATE_NEXT_AFTER_SUCCESS : "report --set",
+      next: required ? ACTIVATE_NEXT_AFTER_SUCCESS : "report --set",
       sections: evidence, restart: restart.restart,
     });
   }
   return {
-    status: "ok", generationId: setId, manifestPhase: "active", applied, next: CUTOVER_SET_ACTIVATE_NEXT_AFTER_SUCCESS, evidence, restart: restart.restart,
+    status: "ok", generationId: setId, manifestPhase: "active", applied, next: ACTIVATE_NEXT_AFTER_SUCCESS, evidence, restart: restart.restart,
   };
 }
 
@@ -1050,9 +1055,19 @@ function targetConfigOf(homeDir: string, ops: Ops): Readonly<{ status: "ready"; 
 async function runActivation(homeDir: string, setId: string, observation: SetObservation, ops: Ops): Promise<MigrationSetOutcome> {
   const target = targetConfigOf(homeDir, ops);
   if (target.status === "refuse") return target.outcome;
+  const ordinary = ops.resolveRuntimeSettings({
+    transferSettings: connectionSettings(target.config),
+    expectedOwner: target.config.postgresql.migrationRole,
+  });
+  if (ordinary.status === "refuse") return refuse(ordinary.reason);
   const generationIds = observation.members.map((member) => member.generationId);
   const before = await fingerprintOf(homeDir, setId, generationIds, ops);
-  const result = await ops.activate({ homeDir, confirmSetId: setId, targetConfig: target.config });
+  const result = await ops.activate({
+    homeDir,
+    confirmSetId: setId,
+    targetConfig: target.config,
+    ordinarySettings: ordinary.settings,
+  });
   return mapActivate({ homeDir, result, before, generationIds, setId, ops });
 }
 

@@ -11,7 +11,7 @@ import { PostgreSqlStorageOperationError } from "../../src/storage/postgresql/er
 import { activateCutoverSet, createCutoverSetActivateDependencies } from "../../src/migration/cutover-set-activate.js";
 import { MigrationBindingUnresolvableError } from "../../src/migration/generation-binding-store.js";
 import { MigrationProjectMapWitnessError } from "../../src/migration/project-map-witness.js";
-import { cleanupRoots, expectNoEffects, fixture, HASH_A, roots, TARGET_CONFIG, type Fixture } from "./cutover-set-activate-fixture.js";
+import { cleanupRoots, expectNoEffects, fixture, HASH_A, ORDINARY_SETTINGS, roots, TARGET_CONFIG, type Fixture } from "./cutover-set-activate-fixture.js";
 import { readCutoverSetActivationRecords } from "../../src/migration/cutover-set-activation-store.js";
 
 afterEach(cleanupRoots);
@@ -61,7 +61,12 @@ describe("activateCutoverSet: scratch is allocated only for a member census (#16
     roots.push(homeDir);
     const defaults = createCutoverSetActivateDependencies({ homeDir });
     const allocateScratch = vi.fn(defaults.allocateScratch);
-    const outcome = await activateCutoverSet({ homeDir, confirmSetId: "cutover-set-1", targetConfig: TARGET_CONFIG }, { ...defaults, allocateScratch });
+    const outcome = await activateCutoverSet({
+      homeDir,
+      confirmSetId: "cutover-set-1",
+      targetConfig: TARGET_CONFIG,
+      ordinarySettings: ORDINARY_SETTINGS,
+    }, { ...defaults, allocateScratch });
     expect(outcome).toMatchObject({ status: "refused", step: "S0", reason: "machine-identity-unregistered", effectBegun: false });
     expect(allocateScratch).not.toHaveBeenCalled();
     expect(scratchDirs(homeDir)).toEqual([]);
@@ -106,8 +111,8 @@ describe("activateCutoverSet: scratch is allocated only for a member census (#16
 
 describe("activateCutoverSet: identity and census storage failures are classified per member (#1673, #1648)", () => {
   it.each([
-    ["S0", 1, "S0"],
-    ["S5", 3, "S5"],
+    ["S5", 1, "S5"],
+    ["S0", 3, "S0"],
     ["S7", 5, "S8"],
   ] as const)("a StorageOperationError from the %s destination identity query refuses with the target vocabulary", async (stage, call, step) => {
     for (const [make, reason] of [[UNHEALTHY, "target-unhealthy"], [UNRESOLVABLE, "target-unresolvable"]] as const) {
@@ -171,14 +176,14 @@ describe("activateCutoverSet: remaining classification seams (#1673)", () => {
     await expect(f.run({ machineId: () => { throw new Error("uncoded"); } })).rejects.toThrow("uncoded");
   });
 
-  it("a member's identity storage failure does not mask a later member's checkpoint conflict", async () => {
+  it("a checkpointed member identity failure interrupts before later S0 conflicts", async () => {
     const f = await fixture();
     const [, b] = f.members;
     await crashAt(f, "after-checkpoint");
     f.deps.transferRows.set(b!.remoteProjectId, [{ run_id: "migration-copy-" + HASH_A, state: "completed" }]);
     let captures = 0;
     expect(await f.run({ captureDestinationIdentity: async () => { captures += 1; if (captures === 1) throw UNHEALTHY(); return { version: 1, ...f.deps.identity }; } }))
-      .toMatchObject({ status: "interrupted", step: "S9", cause: "evidence-conflict", effectBegun: true, detail: expect.stringContaining("copy binding digest differs") });
+      .toMatchObject({ status: "interrupted", step: "S9", cause: "state-unresolvable", effectBegun: true, detail: expect.stringContaining("S5") });
   });
 });
 

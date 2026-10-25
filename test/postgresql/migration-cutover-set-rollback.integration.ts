@@ -4,8 +4,6 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { beforeAll, expect, it } from "vitest";
 import { assertHarnessReady, settings, withPostgreSqlTestDatabase, type PostgreSqlTestDatabase } from "./harness.js";
-import { grantPortablePostgreSql } from "./portable-fixture.js";
-import { applyAllRuntimeGrants } from "./operational-fixture.js";
 import type { ResolvedPostgreSqlConfig } from "../../src/daemon/config.js";
 import { localProjectIdentity } from "../../src/daemon/project.js";
 import { closeLcmConnection } from "../../src/db/connection.js";
@@ -28,6 +26,12 @@ import { readMachineIdentity } from "../../src/machine-identity.js";
 import { lcmHomeDir } from "../../src/runtime-paths.js";
 import { projectMapPath } from "../../src/project-map.js";
 import { seedPortableSqlite } from "../storage/sqlite-portable-fixture.js";
+import {
+  dropActivationRole,
+  grantRuntimeActivationRole,
+  provisionActivationRole,
+  revokeTransferActivationRole,
+} from "./migration-activation-fixture.js";
 
 beforeAll(assertHarnessReady);
 
@@ -54,14 +58,14 @@ beforeAll(assertHarnessReady);
  * forward activation.
  */
 async function twoProjectHome(db: PostgreSqlTestDatabase, options: Readonly<{ firstMemberAlias?: boolean }> = {}) {
-  await grantPortablePostgreSql(db, { transfer: true });
+  const roles = await provisionActivationRole(db);
   const home = mkdtempSync(join(tmpdir(), "cutover-set-rollback-"));
   mkdirSync(join(home, ".lcm"), { mode: 0o700 });
   mkdirSync(join(home, ".lcm", "events"), { mode: 0o700 });
   writeFileSync(join(lcmHomeDir(home), "config.json"), JSON.stringify({ storage: { backend: "sqlite" }, daemon: { port: 47332 } }) + "\n", { mode: 0o600 });
   const targetConfig = {
     backend: "postgresql",
-    postgresql: { ...settings(db.runtimeUrl), snapshotIdleTimeoutMs: 300_000, migrationRole: "lcm_test_migrator" },
+    postgresql: { ...roles.transfer, snapshotIdleTimeoutMs: 300_000, migrationRole: "lcm_test_migrator" },
   } as unknown as ResolvedPostgreSqlConfig;
   const projects = ["project-a", "project-b"].map((name) => {
     const cwd = join(home, name);
@@ -78,9 +82,10 @@ async function twoProjectHome(db: PostgreSqlTestDatabase, options: Readonly<{ fi
     writeFileSync(projectMapPath(home), JSON.stringify({ [projects[0]!.id]: { canonical: projects[0]!.canonical, aliases: [alias] } }) + "\n", { mode: 0o600 });
   }
   const remotes = new Map<string, string>();
+  const transferRuntime = new PostgreSqlRuntime(roles.transfer);
   for (const project of projects) {
     const enrolled = await prepareSqliteMigrationEnrollment({ cwd: project.cwd, homeDir: home, targetConfig });
-    const remote = await new PostgreSqlIdentityRepository(db.runtime).createProject({
+    const remote = await new PostgreSqlIdentityRepository(transferRuntime).createProject({
       machineId: enrolled.identity.machineId, displayName: "cutover set " + project.id.slice(0, 8), path: project.cwd, normalizedPath: project.cwd,
     });
     remotes.set(project.id, remote.projectId);
@@ -107,6 +112,7 @@ async function twoProjectHome(db: PostgreSqlTestDatabase, options: Readonly<{ fi
     }
     if ("databasePath" in seed.capturedSidecars!.events) rmSync(seed.capturedSidecars!.events.databasePath);
   }
+  await transferRuntime.close();
   const outboxes = new SQLiteLocalHookOutboxFactory();
   for (const project of projects) {
     const outbox = await outboxes.open(join(home, ".lcm", "events", project.id + ".db"));
@@ -125,7 +131,7 @@ async function twoProjectHome(db: PostgreSqlTestDatabase, options: Readonly<{ fi
     }
   }
   closeLcmConnection();
-  return { home, projects, remotes, targetConfig, alias };
+  return { home, projects, remotes, targetConfig, alias, roles };
 }
 
 async function activatedSet(db: PostgreSqlTestDatabase, options: Readonly<{ firstMemberAlias?: boolean }> = {}) {
@@ -136,32 +142,20 @@ async function activatedSet(db: PostgreSqlTestDatabase, options: Readonly<{ firs
     homeDir: installation.home, confirmSetId: candidate.setId, targetConfig: installation.targetConfig, maxRecords: 500, maxBytes: 16 * 1024 * 1024,
   });
   if (prepared.status !== "prepared") throw new Error("preparation did not finish: " + JSON.stringify(prepared));
+  await grantRuntimeActivationRole(db, installation.roles.runtime);
   const activated = await activateCutoverSet(
-    { homeDir: installation.home, confirmSetId: candidate.setId, targetConfig: installation.targetConfig },
+    {
+      homeDir: installation.home,
+      confirmSetId: candidate.setId,
+      targetConfig: installation.targetConfig,
+      ordinarySettings: installation.roles.runtime,
+    },
     createCutoverSetActivateDependencies({ homeDir: installation.home }),
   );
   if (activated.status !== "activated") throw new Error("activation did not finish: " + JSON.stringify(activated));
   closeLcmConnection();
-  await restoreRuntimeProfile(db);
+  await revokeTransferActivationRole(db);
   return { ...installation, setId: candidate.setId, members: candidate.members };
-}
-
-/**
- * The harness grants the transfer profile to the one test role the activation copied through. Production rolls a
- * set back through the ordinary runtime role selected by config.json, whose readiness rejects exactly those extra
- * privileges, so the test role returns to the reviewed runtime profile once the activation is published.
- */
-async function restoreRuntimeProfile(db: PostgreSqlTestDatabase): Promise<void> {
-  const revoke = readFileSync(join(process.cwd(), "src/storage/postgresql/reference", "postgresql-transfer-grants.sql"), "utf8")
-    .split("\n").filter((line) => !line.startsWith("\\")).join("\n")
-    .replaceAll("GRANT ", "REVOKE ").replaceAll('TO :"lcm_runtime_role"', 'FROM "lcm_test_runtime"');
-  const administrator = new PostgreSqlRuntime(settings(db.adminUrl));
-  try {
-    await administrator.query({ text: revoke }, { domain: "factory", operation: "revokeTransferGrants" });
-  } finally {
-    await administrator.close();
-  }
-  await applyAllRuntimeGrants(db);
 }
 
 function effectiveHome(home: string, projects: readonly { id: string }[], remotes: Map<string, string>) {
@@ -188,11 +182,11 @@ async function fencedLeases(db: PostgreSqlTestDatabase, remoteProjectId: string)
 
 it("rolls an activated two-project set back into new sqlite generations through one reverse publication, resuming identically after every injected crash", async () => {
   await withPostgreSqlTestDatabase("cutover-set-rollback", async (db) => {
-    const { home, projects, remotes, targetConfig, setId, members } = await activatedSet(db);
+    const { home, projects, remotes, targetConfig, roles, setId, members } = await activatedSet(db);
     // The connection secrets never live in config.json: the rollback reads the selected postgresql configuration
     // from the home and its secrets from the environment, as the daemon does.
     const previous = { url: process.env.LCM_POSTGRES_URL, caFile: process.env.LCM_POSTGRES_CA_FILE, role: process.env.LCM_POSTGRES_MIGRATION_ROLE };
-    const connection = settings(db.runtimeUrl);
+    const connection = roles.runtime;
     process.env.LCM_POSTGRES_URL = connection.url;
     if (connection.caFile === undefined) delete process.env.LCM_POSTGRES_CA_FILE; else process.env.LCM_POSTGRES_CA_FILE = connection.caFile;
     process.env.LCM_POSTGRES_MIGRATION_ROLE = "lcm_test_migrator";
@@ -343,7 +337,12 @@ it("rolls an activated two-project set back into new sqlite generations through 
       expect(remoteA).not.toBe(remoteB);
       // A second call settles from durable state, and the forward activation refuses the rolled-back set without touching it.
       expect(await rollbackCutoverSet(input, deps)).toMatchObject({ status: "rolled-back", resumedFrom: "settled" });
-      expect(await activateCutoverSet({ homeDir: home, confirmSetId: setId, targetConfig }, createCutoverSetActivateDependencies({ homeDir: home })))
+      expect(await activateCutoverSet({
+        homeDir: home,
+        confirmSetId: setId,
+        targetConfig,
+        ordinarySettings: roles.runtime,
+      }, createCutoverSetActivateDependencies({ homeDir: home })))
         .toMatchObject({ status: "refused", reason: "cutover-set-rollback-committed", effectBegun: false });
       expect(effectiveHome(home, projects, remotes)).toEqual({ backend: "sqlite", bound: [false, false] });
     } finally {
@@ -351,6 +350,7 @@ it("rolls an activated two-project set back into new sqlite generations through 
       if (previous.caFile === undefined) delete process.env.LCM_POSTGRES_CA_FILE; else process.env.LCM_POSTGRES_CA_FILE = previous.caFile;
       if (previous.role === undefined) delete process.env.LCM_POSTGRES_MIGRATION_ROLE; else process.env.LCM_POSTGRES_MIGRATION_ROLE = previous.role;
       closeLcmConnection();
+      await dropActivationRole(db);
       rmSync(home, { recursive: true, force: true });
     }
   });
@@ -358,9 +358,9 @@ it("rolls an activated two-project set back into new sqlite generations through 
 
 it("rolls back an activated set whose member carries a project-map alias: the alias is minted by prepare, keeps the lifecycle passing, stays in the local map, and the destination rows are left in place (#1678)", async () => {
   await withPostgreSqlTestDatabase("cutover-set-rollback-alias", async (db) => {
-    const { home, projects, remotes, setId, members, alias } = await activatedSet(db, { firstMemberAlias: true });
+    const { home, projects, remotes, roles, setId, members, alias } = await activatedSet(db, { firstMemberAlias: true });
     const previous = { url: process.env.LCM_POSTGRES_URL, caFile: process.env.LCM_POSTGRES_CA_FILE, role: process.env.LCM_POSTGRES_MIGRATION_ROLE };
-    const connection = settings(db.runtimeUrl);
+    const connection = roles.runtime;
     process.env.LCM_POSTGRES_URL = connection.url;
     if (connection.caFile === undefined) delete process.env.LCM_POSTGRES_CA_FILE; else process.env.LCM_POSTGRES_CA_FILE = connection.caFile;
     process.env.LCM_POSTGRES_MIGRATION_ROLE = "lcm_test_migrator";
@@ -391,6 +391,7 @@ it("rolls back an activated set whose member carries a project-map alias: the al
       if (previous.caFile === undefined) delete process.env.LCM_POSTGRES_CA_FILE; else process.env.LCM_POSTGRES_CA_FILE = previous.caFile;
       if (previous.role === undefined) delete process.env.LCM_POSTGRES_MIGRATION_ROLE; else process.env.LCM_POSTGRES_MIGRATION_ROLE = previous.role;
       closeLcmConnection();
+      await dropActivationRole(db);
       rmSync(home, { recursive: true, force: true });
     }
   });

@@ -439,7 +439,7 @@ describe("lcm migration command group", () => {
     expect(stdoutText(out)).toContain("report-restart-required");
   });
 
-  it("activate: passes the generation, both confirmations and --dry-run through, and prints the grant-swap next step", async () => {
+  it("activate: passes the generation, both confirmations and --dry-run through, and prints the transfer-revoke next step", async () => {
     state.activate.mockResolvedValueOnce({
       status: "ok", generationId: "gen-1", manifestPhase: "active", applied: true, next: "revoke-transfer-grants-then-start-daemon",
       evidence: { transferGrantRevocation: "required-before-daemon-start" }, restart: { answer: "satisfied", presence: "absent" },

@@ -554,6 +554,77 @@ export interface MigrationActivationDependencies {
   readonly crashPoint?: MigrationActivationCrashPoint;
 }
 
+export type MigrationActivationRole = Readonly<{ role: string; oid: string }>;
+
+export type MigrationActivationRoleDiscovery =
+  | Readonly<{
+    status: "resolved";
+    ordinaryRole: MigrationActivationRole;
+    transferRole: MigrationActivationRole;
+  }>
+  | Readonly<{
+    status: "unhealthy" | "unresolvable";
+    detail: string;
+  }>;
+
+function validRoleIdentityRead(value: MigrationActivationRoleIdentityRead): boolean {
+  return typeof value.currentUser === "string"
+    && Buffer.byteLength(value.currentUser, "utf8") > 0
+    && Buffer.byteLength(value.currentUser, "utf8") <= 63
+    && typeof value.sessionUser === "string"
+    && value.currentUser === value.sessionUser
+    && typeof value.oid === "string"
+    && /^[0-9]+$/u.test(value.oid)
+    && value.tls === true;
+}
+
+/** Discover the two live login roles once without coupling their validation
+ * to either activation orchestrator's refusal vocabulary. */
+export async function discoverMigrationActivationRoles(input: Readonly<{
+  ordinary: PostgreSqlQueryExecutor;
+  transferSettings: PostgreSqlConnectionSettings;
+  createTransferRuntime: MigrationActivationDependencies["createTransferRuntime"];
+  readRoleIdentity: MigrationActivationDependencies["readRoleIdentity"];
+  signal?: AbortSignal;
+}>): Promise<MigrationActivationRoleDiscovery> {
+  const transfer = input.createTransferRuntime(input.transferSettings);
+  try {
+    let ordinary: MigrationActivationRoleIdentityRead;
+    let transferIdentity: MigrationActivationRoleIdentityRead;
+    try {
+      ordinary = await input.readRoleIdentity(input.ordinary, input.signal);
+      transferIdentity = await input.readRoleIdentity(transfer, input.signal);
+    } catch (error) {
+      if (error instanceof StorageOperationError) {
+        const attributed = classifyMigrationTargetFailure(error, "activation role discovery");
+        return {
+          status: attributed.status,
+          detail: attributed.reason + ": activation role discovery failed",
+        };
+      }
+      return { status: "unresolvable", detail: "connection-failed: activation role discovery failed" };
+    }
+    if (
+      !validRoleIdentityRead(ordinary)
+      || !validRoleIdentityRead(transferIdentity)
+      || ordinary.oid === transferIdentity.oid
+      || ordinary.currentUser === transferIdentity.currentUser
+    ) {
+      return {
+        status: "unhealthy",
+        detail: "schema-mismatch: activation requires distinct unswitched runtime and transfer role sessions",
+      };
+    }
+    return {
+      status: "resolved",
+      ordinaryRole: { role: ordinary.currentUser, oid: ordinary.oid },
+      transferRole: { role: transferIdentity.currentUser, oid: transferIdentity.oid },
+    };
+  } finally {
+    await transfer.close();
+  }
+}
+
 /**
  * Production dependencies for one home. Every boundary is built here and
  * nowhere else; the CLI never touches a coordinator, guard or runtime. The
@@ -1143,56 +1214,25 @@ async function identityCheck(
   return ok(live);
 }
 
-function validRoleIdentityRead(value: MigrationActivationRoleIdentityRead): boolean {
-  return typeof value.currentUser === "string"
-    && Buffer.byteLength(value.currentUser, "utf8") > 0
-    && Buffer.byteLength(value.currentUser, "utf8") <= 63
-    && typeof value.sessionUser === "string"
-    && value.currentUser === value.sessionUser
-    && typeof value.oid === "string"
-    && /^[0-9]+$/u.test(value.oid)
-    && value.tls === true;
-}
-
 async function discoverActivationRoles(ctx: Context): Promise<Step<true>> {
-  const transfer = ctx.deps.createTransferRuntime(ctx.input.transferSettings);
-  try {
-    let ordinary: MigrationActivationRoleIdentityRead;
-    let transferIdentity: MigrationActivationRoleIdentityRead;
-    try {
-      ordinary = await ctx.deps.readRoleIdentity(ctx.ordinary!, ctx.input.signal);
-      transferIdentity = await ctx.deps.readRoleIdentity(transfer, ctx.input.signal);
-    } catch (error) {
-      if (error instanceof StorageOperationError) {
-        const attributed = classifyMigrationTargetFailure(error, "activation role discovery");
-        return refused(
-          ctx,
-          "S6",
-          attributed.status === "unhealthy" ? "target-unhealthy" : "target-unresolvable",
-          attributed.reason + ": activation role discovery failed",
-        );
-      }
-      return refused(ctx, "S6", "target-unresolvable", "connection-failed: activation role discovery failed");
-    }
-    if (
-      !validRoleIdentityRead(ordinary)
-      || !validRoleIdentityRead(transferIdentity)
-      || ordinary.oid === transferIdentity.oid
-      || ordinary.currentUser === transferIdentity.currentUser
-    ) {
-      return refused(
-        ctx,
-        "S6",
-        "target-unhealthy",
-        "schema-mismatch: activation requires distinct unswitched runtime and transfer role sessions",
-      );
-    }
-    ctx.ordinaryRole = { role: ordinary.currentUser, oid: ordinary.oid };
-    ctx.transferRole = { role: transferIdentity.currentUser, oid: transferIdentity.oid };
-    return ok(true);
-  } finally {
-    await transfer.close();
+  const discovery = await discoverMigrationActivationRoles({
+    ordinary: ctx.ordinary!,
+    transferSettings: ctx.input.transferSettings,
+    createTransferRuntime: ctx.deps.createTransferRuntime,
+    readRoleIdentity: ctx.deps.readRoleIdentity,
+    signal: ctx.input.signal,
+  });
+  if (discovery.status !== "resolved") {
+    return refused(
+      ctx,
+      "S6",
+      discovery.status === "unhealthy" ? "target-unhealthy" : "target-unresolvable",
+      discovery.detail,
+    );
   }
+  ctx.ordinaryRole = discovery.ordinaryRole;
+  ctx.transferRole = discovery.transferRole;
+  return ok(true);
 }
 
 async function prepareActivationSessions(ctx: Context): Promise<Step<true>> {

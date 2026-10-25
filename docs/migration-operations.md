@@ -566,8 +566,8 @@ stored-data project is not a set: `--set` refuses it (`set-refused-precondition`
 `serviceReason: cutover-set-single-project`) and the commands without `--set` apply.
 
 ```text
-plan --set -> apply --set -> resume --set (until prepared) -> verify --set -> activate --set
-   -> swap the grants -> start the daemon -> report --set
+plan --set -> apply --set -> resume --set (until prepared) -> verify --set
+   -> apply runtime grants -> activate --set -> revoke transfer grants -> start the daemon -> report --set
 prepared or held set -> abort --set        activated set -> rollback --set
 ```
 
@@ -630,7 +630,7 @@ next step; `activate --set` revalidates every member itself.
 | `prepare` | a forward hold whose members are not all verified | `resume --set` (or `apply --set`) |
 | `prepared` | a forward hold, every member verified | `activate --set` |
 | `activate` | activation records exist, members not all active | `resume --set` or `activate --set` |
-| `settled-activated` | every member active, nothing pending, and the frozen activation selection recorded | `report --set` (grant swap, restart) |
+| `settled-activated` | every member active, nothing pending, and the frozen activation selection recorded | `report --set` (transfer revoke, restart) |
 | `rollback` | a committed rollback checkpoint exists, members not all rolled back | `resume --set` or `rollback --set` |
 | `settled-rolled-back` | every member rolled back, nothing pending, and the frozen rollback selection recorded | `report --set` |
 | `abort` | an aborted hold with unsettled members | `resume --set` or `abort --set` |
@@ -657,7 +657,7 @@ string is reported as `unrecognized` and is never copied into the output.
 | `set-preview-not-predictive` | 5 | A `--dry-run` that cannot predict the outcome. |
 | `set-generation-required`, `set-generation-invalid`, `set-original-generation-required` | 2, 1, 2 | The selector is missing, malformed, or names the rollback hold. |
 | `set-confirmation-missing`, `set-confirmation-moved` | 3 | `--confirm-generation` is absent or is not the aggregate set id. |
-| `set-restart-required` | 8 | `activate --set` left the selection durable, but a running daemon still holds the previous backend. Swap the grants, restart the daemon, then `report --set`. |
+| `set-restart-required` | 8 | `activate --set` left the selection durable, but a running daemon still holds the previous backend. Revoke the transfer grants, restart the daemon, then `report --set`. |
 
 **Exit 6.** A service returning a recoverable-looking result is not enough: the command reads the
 durable state again and emits `set-incomplete` only when that state still admits the same service,
@@ -669,14 +669,13 @@ aggregate records, never taken from the service result, and a settled state coun
 frozen selection that produced it. `report --set` exits 5 when a member's manifest, snapshot or
 referenced verification report cannot be read.
 
-**After a set activation.** Follow the grant swap in
-[Migration cutover sets](migration-cutover-set.md): `activate --set` runs entirely under the
-transfer role, so add the runtime grants and revoke the transfer grants before starting the daemon,
-then run `report --set` until it exits 0. `activate --set` names that swap as its next step on exit 0
-(`swap-grants-then-start-daemon`, with `grantSwap: required-before-daemon-start` in the evidence), and
-its exit 8 refusal (`set-restart-required`) repeats it. This differs from single-generation
-activation, which applies runtime grants before activate and leaves only transfer-grant revocation
-afterward.
+**After a set activation.** Follow the same grant-first order as one generation in
+[Migration cutover sets](migration-cutover-set.md): apply runtime grants and set
+`LCM_POSTGRES_RUNTIME_URL` before `activate --set`; after exit 0 revoke the transfer grants before
+starting the daemon, then run `report --set` until it exits 0. The command names that step
+`revoke-transfer-grants-then-start-daemon`, with
+`transferGrantRevocation: required-before-daemon-start` in the evidence. Its exit 8 refusal
+(`set-restart-required`) repeats the revoke-only handoff.
 
 **Known diagnostic limits.** `report --set` does not repair `abort`'s immediate readback attribution
 (#1657). `rollbackRecords: incomplete` means member records of a rollback checkpoint that was never
@@ -767,7 +766,7 @@ During the grant-first window, fresh `verify`, copy resume, and target reachabil
 transfer checks and refuse until runtime grants are revoked. Revoke runtime grants before returning
 to those pre-activate recovery paths. Rollback, factory readiness, and diagnostics remain no-peer
 runtime checks and refuse until transfer grants are revoked. Interrupted activation resumes through
-the peer-aware `activate` command. Cutover-set activation remains transfer-only. PostgreSQL default
+the peer-aware `activate` command, including cutover-set activation. PostgreSQL default
 privileges are not admission evidence; any unexpected grant they later materialize is refused when
 readiness inspects the live object ACL.
 
@@ -1727,7 +1726,7 @@ block marks implemented. `canEmit` is the closed set of exit classes the command
     {
       "reason": "set-restart-required",
       "exitClass": "restart-required",
-      "remedy": "The set's durable selection is correct, but a running daemon still holds the previous startup backend. Swap the grants (add the runtime grants to the daemon runtime role, then revoke the transfer grants), restart the daemon with LCM_POSTGRES_URL set to that runtime role, then run `lcm migration report --set --generation <set-id>`."
+      "remedy": "The set's durable selection is correct, but a running daemon still holds the previous startup backend. Revoke the transfer grants, restart the daemon with LCM_POSTGRES_URL set to the proven runtime role, then run `lcm migration report --set --generation <set-id>`."
     }
   ]
 }
