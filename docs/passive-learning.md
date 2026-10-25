@@ -172,6 +172,19 @@ promotion retries the pending events on a later run. An `lcm events promote
 the blocked response has no aggregate counts, and later sidecars remain
 available for the next retry.
 
+Promotion through `lcm events promote` (and `--all`) needs the backend
+publication lock briefly. If another process, such as a hook, holds the lock,
+the daemon waits up to about 3 seconds for it to be released and then
+promotes. The wait does not cover the daemon's own work: while the background
+sweep (for example its sidecar scan) or an earlier promotion's cleanup holds
+the lock, or when the wait is exhausted, the daemon answers `503` with
+`status: "busy"` instead of a server error, and the command exits non-zero
+with "backend publication work is in progress; retry the promotion". Retry the
+command; nothing is lost and pending events stay queued. This differs from the
+`503` `status: "blocked"` response above, which means the backend itself is
+not admitting work. For `--all`, projects promoted before the busy response
+stay promoted, but the response carries no aggregate counts.
+
 While a larger passive-learning batch is running, the daemon can remain alive
 and own its configured listener even if bounded health checks cannot complete.
 Lifecycle admission preserves that exact likely-LCM process and its PID/token

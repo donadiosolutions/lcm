@@ -36,7 +36,11 @@ import { settleProjectStorageExecutions } from "./routes/storage-lifecycle.js";
 import { createPromptSearchHandler } from "./routes/prompt-search.js";
 import { createStatusHandler } from "./routes/status.js";
 import { createSessionCompleteHandler } from "./routes/session-complete.js";
-import { createPromoteAllEventsHandler, createPromoteEventsHandler } from "./routes/promote-events.js";
+import {
+  createPromoteAllEventsHandler,
+  createPromoteEventsHandler,
+  PROMOTE_EVENTS_BUSY_BODY,
+} from "./routes/promote-events.js";
 import {
   createPromoteEventsNotifyHandler,
   PASSIVE_EVENT_PROCESSOR_DEFAULTS,
@@ -200,7 +204,14 @@ const MAX_BUFFERED_RESPONSE_BYTES = MAX_BODY_BYTES;
 const READ_ADMISSION_WAIT_MS = 1000;
 /** Deadline, from the first wait, for a live lock owner across one capture request's admissions. */
 const ROUTE_ADMISSION_CONTENTION_WAIT_MS = 3000;
-const ADMISSION_RETRY_ROUTES: ReadonlySet<string> = new Set(["POST /ingest", "POST /restore"]);
+const ADMISSION_RETRY_ROUTES: ReadonlySet<string> = new Set([
+  "POST /ingest",
+  "POST /restore",
+  "POST /promote-events",
+  "POST /promote-events/all",
+]);
+/** Routes that answer a retryable 503 `busy` instead of a 500 when the publication lock stays contended. */
+const PROMOTE_EVENTS_BUSY_ROUTES: ReadonlySet<string> = new Set(["POST /promote-events", "POST /promote-events/all"]);
 
 export function claudeProjectDirName(cwd: string): string {
   const sanitized = cwd
@@ -1103,8 +1114,8 @@ export async function createDaemon(config: DaemonConfig, options?: DaemonOptions
     const requestSignal = cancellation.signal;
     let bufferedResponse: BufferedServerResponse | undefined;
     const diagnosticRoute = ["GET /stats", "GET /stats/pool", "POST /status"].includes(`${req.method} ${req.url?.split("?")[0]}`);
+    const key = `${req.method} ${req.url?.split("?")[0]}`;
     try {
-      const key = `${req.method} ${req.url?.split("?")[0]}`;
       const route = routes.get(key);
       if (!route) {
         sendJsonIfWritable(res, 404, { error: "not found" });
@@ -1249,6 +1260,10 @@ export async function createDaemon(config: DaemonConfig, options?: DaemonOptions
           status: "blocked",
           error: "backend publication admission blocked",
         });
+        return;
+      }
+      if (err instanceof PrivateMutationLockContentionError && PROMOTE_EVENTS_BUSY_ROUTES.has(key)) {
+        sendJsonIfWritable(res, 503, PROMOTE_EVENTS_BUSY_BODY);
         return;
       }
       const { status, message } = requestErrorResponse(err);

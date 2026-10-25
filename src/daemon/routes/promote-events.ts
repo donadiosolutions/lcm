@@ -29,6 +29,13 @@ import {
   withProjectStorage,
 } from "./storage-lifecycle.js";
 import { StorageOperationError } from "../../storage/errors.js";
+import { PrivateMutationLockContentionError } from "../../private-mutation-lock.js";
+
+/** Retryable answer while publication work (a hook, the sweep, another process) holds the lock. */
+export const PROMOTE_EVENTS_BUSY_BODY = Object.freeze({
+  status: "busy",
+  error: "backend publication work is in progress; retry the promotion",
+});
 
 const AUTO_TAGS: Record<string, string> = {
   decision: "type:preference",
@@ -394,6 +401,10 @@ export function createPromoteEventsHandler(
         });
         return;
       }
+      if (error instanceof PrivateMutationLockContentionError) {
+        sendJson(res, 503, PROMOTE_EVENTS_BUSY_BODY);
+        return;
+      }
       // Log detailed failure but avoid exposing internal error/stack info to the client
       await safeLogError("promote-events", error, { cwd });
       const storageFailure = storageRouteFailureResponse(
@@ -518,6 +529,7 @@ export function createPromoteAllEventsHandler(
           });
         } catch (error) {
           if (error instanceof BackendPublicationJournalError) throw error;
+          if (error instanceof PrivateMutationLockContentionError) throw error;
           if (storageRouteFailureResponse(config.storage.backend, error, "promote-events-all", activeFactory)) {
             throw error;
           }
@@ -545,6 +557,10 @@ export function createPromoteAllEventsHandler(
           status: "blocked",
           error: "backend publication admission blocked",
         });
+        return;
+      }
+      if (error instanceof PrivateMutationLockContentionError) {
+        sendJson(res, 503, PROMOTE_EVENTS_BUSY_BODY);
         return;
       }
       await safeLogError("promote-events", error, {});

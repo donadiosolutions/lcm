@@ -3169,6 +3169,26 @@ describe("runCli failure and alternate presentation branches", () => {
     expect(process.exitCode).toBe(1);
   });
 
+  it("presents a busy promotion as a retry message and exits non-zero (#1684)", async () => {
+    const stderr = vi.spyOn(console, "error").mockImplementation(() => undefined);
+    const stdout = vi.spyOn(process.stdout, "write").mockImplementation(() => true);
+    const message = "backend publication work is in progress; retry the promotion";
+    const busy = (): Error => Object.assign(new Error(message), { statusCode: 503 });
+
+    state.post.mockRejectedValueOnce(busy());
+    expect((await invoke(["events", "promote"]))?.message).toBe("exit:1");
+    expect(stderr).toHaveBeenCalledWith(`Error: ${message}`);
+    state.post.mockRejectedValueOnce(busy());
+    expect((await invoke(["events", "promote", "--all", "--json"]))?.message).toBe("exit:1");
+    expect(JSON.parse(String(stdout.mock.calls.at(-1)?.[0]))).toEqual({ error: message });
+
+    // Other failures are not presented here; they reach the top-level handler.
+    stderr.mockClear();
+    state.post.mockRejectedValueOnce(Object.assign(new Error("boom"), { statusCode: 500 }));
+    expect((await invoke(["events", "promote"]))?.message).toBe("boom");
+    expect(stderr).not.toHaveBeenCalledWith("Error: boom");
+  });
+
   it("covers connector alternate and failure outcomes", async () => {
     state.installResult = { manual: "manual steps" };
     expect(await invoke(["connectors", "install", "codex", "--global"])).toBeUndefined();
