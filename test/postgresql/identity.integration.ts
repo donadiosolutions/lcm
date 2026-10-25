@@ -10,8 +10,10 @@ import {
   type IdentityRepository,
 } from "../../src/identity-service.js";
 import { recoverMachineIdentity } from "../../src/machine-identity.js";
+import { resolveMigrationTargetProjectId } from "../../src/migration/target-identity.js";
 import { clearProjectMapCache, resolveProjectIdentity } from "../../src/project-map.js";
 import {
+  PostgreSqlIdentityAliasLockTimeoutError,
   PostgreSqlIdentityAliasNormalizedPathConflictError,
   PostgreSqlIdentityAliasPathConflictError,
   PostgreSqlIdentityCreateOutcomeUnknownError,
@@ -19,8 +21,10 @@ import {
   PostgreSqlIdentityRepository,
 } from "../../src/storage/postgresql/identity-repository.js";
 import { PostgreSqlCommitOutcomeUnknownError } from "../../src/storage/postgresql/errors.js";
+import { PostgreSqlRuntime } from "../../src/storage/postgresql/runtime.js";
 import {
   assertHarnessReady,
+  settings,
   type PostgreSqlTestDatabase,
   withPostgreSqlTestDatabase,
 } from "./harness.js";
@@ -1023,4 +1027,77 @@ describe("PostgreSQL 18 machine and project identities", () => {
         .resolves.toEqual({ inserted: 0 });
     });
   });
+
+  it("a migration target alias reconcile blocked by an uncommitted alias writer refuses as alias-lock-timeout and writes nothing (#1691)", async () => {
+    await withPostgreSqlTestDatabase("identity-alias-lock-timeout", async (database) => {
+      await grantIdentityRuntimePrivileges(database);
+      // The harness runtime cancels statements and idle transactions after 5 s, which would race the 5 s lock wait.
+      const runtime = new PostgreSqlRuntime(settings(database.runtimeUrl, { statementTimeoutMs: 30_000 }));
+      try {
+        const repository = new PostgreSqlIdentityRepository(runtime);
+        const machine = await repository.registerMachine(`machine:${"8".repeat(64)}`, "Machine lock timeout");
+        const project = await repository.createProject({
+          machineId: machine.machineId, displayName: "Lock timeout target", path: "/work/lock-root", normalizedPath: "/work/lock-root",
+        });
+        const scope = { domain: "identity" as const, operation: "aliasLockTimeoutWriter", projectId: project.projectId, projectIds: [project.projectId] };
+        let writerInserted!: () => void;
+        const writerHasInserted = new Promise<void>((resolve) => { writerInserted = resolve; });
+        let releaseWriter!: () => void;
+        const writerMayRelease = new Promise<void>((resolve) => { releaseWriter = resolve; });
+        const writer = runtime.transaction(async (transaction) => {
+          await transaction.query({
+            text: "INSERT INTO lcm.project_aliases (project_id, machine_id, path, normalized_path) VALUES ($1, $2, '/work/lock-stranger', '/work/lock-stranger')",
+            values: [project.projectId, machine.machineId],
+          }, scope);
+          writerInserted();
+          await writerMayRelease;
+          throw new Error("roll the blocking alias write back");
+        }, scope).catch(() => undefined);
+        const wanted = [
+          { path: "/work/lock-root", normalizedPath: "/work/lock-root" },
+          { path: "/work/lock-moved", normalizedPath: "/work/lock-moved" },
+        ];
+        let direct: unknown;
+        let directMs = 0;
+        let outcome: unknown;
+        let timer: NodeJS.Timeout | undefined;
+        try {
+          await Promise.race([writerHasInserted, writer.then(() => { throw new Error("the writer ended before it inserted"); })]);
+          const startedAt = Date.now();
+          direct = await repository.ensureProjectAliases({ machineId: machine.machineId, projectId: project.projectId, aliases: wanted })
+            .catch((error: unknown) => error);
+          directMs = Date.now() - startedAt;
+          const resolving = resolveMigrationTargetProjectId({
+            repository, machineId: machine.machineId, displayName: "Lock timeout target",
+            authorityCanonicalPath: "/work/lock-root", aliases: ["/work/lock-moved"],
+          }).catch((error: unknown) => error);
+          // The bounded wait ends well inside the 30 s statement timeout; a hang here is the defect.
+          const deadline = new Promise<string>((resolve) => { timer = setTimeout(() => resolve("still blocked on the alias table lock"), 15_000); });
+          outcome = await Promise.race([resolving, deadline]);
+        } finally {
+          clearTimeout(timer);
+          releaseWriter();
+          await writer;
+        }
+        expect(direct).toBeInstanceOf(PostgreSqlIdentityAliasLockTimeoutError);
+        expect(directMs).toBeGreaterThanOrEqual(4_000);
+        expect(directMs).toBeLessThan(15_000);
+        expect(outcome).toEqual({
+          status: "refuse",
+          reason: "migration-target-identity-unresolvable",
+          evidence: "alias-lock-timeout",
+        });
+        const rows = await database.migrator.query<{ path: string }>({
+          text: "SELECT path FROM lcm.project_aliases WHERE project_id = $1 ORDER BY path",
+          values: [project.projectId],
+        }, { domain: "factory", operation: "aliasLockTimeoutRows" });
+        expect(rows.rows.map((row) => row.path)).toEqual(["/work/lock-root"]);
+        // With the blocker gone the same reconcile completes.
+        await expect(repository.ensureProjectAliases({ machineId: machine.machineId, projectId: project.projectId, aliases: wanted }))
+          .resolves.toEqual({ inserted: 1 });
+      } finally {
+        await runtime.close();
+      }
+    });
+  }, 60_000);
 });

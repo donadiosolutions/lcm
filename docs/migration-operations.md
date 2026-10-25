@@ -188,6 +188,12 @@ creates identity; run `abort`, then a fresh `plan` and `apply`, which adds the m
 Rollback leaves the destination project and its alias rows in place and keeps the aliases in the
 local map.
 
+Adding aliases to an existing destination project waits for other sessions that are writing
+project aliases. If that write is still uncommitted after about 5 seconds, `apply` refuses with
+`migration-target-identity-unresolvable` (exit 5) and evidence `alias-lock-timeout`, before it
+takes the hold and without writing any alias. Run `apply` again once the other session has
+finished.
+
 `--dry-run` stops immediately after the confirmation fence, before the hold is taken or anything is
 captured. The emitted envelope reports the confirmed candidate with `applied: false`.
 
