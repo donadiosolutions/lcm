@@ -293,6 +293,8 @@ manifest is absent or aborted, `abort` writes nothing, exits 0 with `applied: fa
 settled pair back. A crash between the two writes is finished by running `abort` again: with the
 journal aborted and the manifest copied, planned or similar, it settles the manifest; with the abort
 effect already begun, it completes that carried effect without aborting the journal a second time.
+When an interrupted abort is re-run, the manifest's abort report is sealed to the evidence persisted
+in the aborted journal, so an interrupted and an uninterrupted abort produce the same manifest.
 
 `abort` writes nothing unless it can finish the whole recovery. A manifest with a begun effect that
 `resume` (or `verify`) owns — a pending copy, dry-run or verification effect — is refused
@@ -434,9 +436,13 @@ knowing by name:
   immediately before it takes the hold. If another local actor occupied your candidate generation
   in between, the second check refuses `confirmation-generation-moved` and nothing is written.
 - `hold-entry-contention` / `hold-entry-slot-occupied` (exit 4), `hold-entry-precondition`
-  (exit 2), `hold-entry-evidence` (exit 5): the maintenance hold was **not** entered, so there is
-  nothing of yours to `abort`. Wait for the other actor, or re-run `plan`, or run `lcm doctor`,
-  as the remedy says.
+  (exit 2), `hold-entry-evidence` (exit 5): the maintenance hold was not completed. With
+  `applied: true` the invocation changed or may have changed state: a failure between the hold's two
+  journal writes can leave a `maintenance-entering` hold, a `maintenance-held` hold may remain, the
+  identity step may have written, or the journal could not be read back to tell. Run
+  `lcm migration report` and inspect the journal and the identity evidence before recovering. With `applied: false`
+  nothing was written and there is nothing of yours to `abort`: wait for the other actor, or
+  re-run `plan`, or run `lcm doctor`, as the remedy says.
 - `capture-contention` (exit 4) / `capture-unresolvable` (exit 5): capture was interrupted after the
   hold was taken. The hold is still in place; re-run `apply` with the same `--confirm-generation` to
   continue, or `abort` to release it. `capture-failed` (exit 7) is reserved for capture's own
@@ -682,11 +688,11 @@ cell 12 it exits 6. The same router decides for all of them, so they cannot disa
 | 23 | `held` | any | pending verification effect | `verify` | `resume` |
 | 24 | `held` | complete | `verified` | `activate` | `verify` (confirms), `rollback`, `abort` |
 | 4 | `entering`/`held`, another generation | any | any | `abort` (acts on that live hold) | -- |
-| 5 | `maintenance-aborted` | any | absent or `aborted` | none -- settled; `apply` starts a fresh cutover | `abort` (confirms only) |
-| 6 | `maintenance-aborted` | any | pending abort effect | `abort` | `resume` |
-| 7 | `maintenance-aborted` | any | pending copy, dry-run or verification effect | none -- exit 7 | -- |
-| 8 | `maintenance-aborted` | any | begun-nothing phase before `verified` | `abort` (settles the manifest) | -- |
-| 9 | `maintenance-aborted` | any | anything else | none -- exit 5; `abort` is never called | -- |
+| 5 | `maintenance-aborted`, matching | any | absent or `aborted` | none -- settled; `apply` starts a fresh cutover | `abort` (confirms only) |
+| 6 | `maintenance-aborted`, matching | any | pending abort effect | `abort` | `resume` |
+| 7 | `maintenance-aborted`, matching | any | pending copy, dry-run or verification effect | none -- exit 7 | -- |
+| 8 | `maintenance-aborted`, matching | any | begun-nothing phase before `verified` | `abort` (settles the manifest) | -- |
+| 9 | `maintenance-aborted` (any generation) | any | anything else, including a journal that belongs to another generation | none -- exit 5; `abort` is never called | -- |
 | 10 | the generation's own completed publication | any | `active`, nothing pending | none -- settled; `report` | `activate` (settled re-entry), `rollback` |
 | 11 | the generation's own publication in flight or aborted, or a `selection-prepared`/`selection-completed` hold | any | `verified`, `activating`, or a pending activation effect | `activate` | `resume` |
 | 11 | `held`, matching (activation begun, no selection yet) | complete | `verified` with a pending `prepare-activation`, or `activating` with nothing pending or a pending `publish-activation` | `activate` | `resume` |
@@ -695,6 +701,11 @@ cell 12 it exits 6. The same router decides for all of them, so they cannot disa
 | 13 | not aborted, including the generation's own completed rollback publication | any | `rolled-back`, nothing pending | none -- settled; `report` | `rollback` (settled re-entry) |
 | 2, 3 | a v2 publication that is neither this generation's activation publication nor its own derived rollback publication | any | any | none -- exit 4 while in flight, exit 5 when foreign and finished | -- |
 | 1, 25 | unresolvable, or no row matches | -- | -- | none -- exit 5 | -- |
+
+A `maintenance-aborted` journal that belongs to another generation lands on cell 9 beside any
+manifest of the generation you named: it is never attributed to that generation, and `report`
+shows no selected backend and no next command. The members of a cutover set are not independently
+routable while the set's journal occupies the slot.
 
 A generation classifying `partial` or `replaced` is **never deleted**. Every failed or abandoned
 capture attempt is preserved on disk exactly as-is; `abort` releases the hold without touching that
@@ -1164,22 +1175,22 @@ block marks implemented. `canEmit` is the closed set of exit classes the command
     {
       "reason": "hold-entry-contention",
       "exitClass": "refused-contention",
-      "remedy": "Another actor holds the publication lock, so the maintenance hold was not entered. Wait, then retry `lcm migration apply`."
+      "remedy": "Another actor holds the publication lock, so the maintenance hold was not entered. Wait, then retry `lcm migration apply`. If the envelope reports `applied: true`, this invocation changed or may have changed state and a maintenance hold (`maintenance-entering` or `maintenance-held`) may remain: inspect `lcm migration report` and the identity evidence before recovering."
     },
     {
       "reason": "hold-entry-slot-occupied",
       "exitClass": "refused-contention",
-      "remedy": "A publication or another maintenance hold occupies the journal slot. Wait for it to finish, then re-run `lcm migration plan`."
+      "remedy": "A publication or another maintenance hold occupies the journal slot. Wait for it to finish, then re-run `lcm migration plan`. If the envelope reports `applied: true`, this invocation changed or may have changed state and a maintenance hold (`maintenance-entering` or `maintenance-held`) may remain: inspect `lcm migration report` and the identity evidence before recovering."
     },
     {
       "reason": "hold-entry-precondition",
       "exitClass": "refused-precondition",
-      "remedy": "The maintenance journal changed while the hold was being entered. Re-run `lcm migration plan` and confirm the id it prints."
+      "remedy": "The maintenance journal changed while the hold was being entered. Re-run `lcm migration plan` and confirm the id it prints. If the envelope reports `applied: true`, this invocation changed or may have changed state and a maintenance hold (`maintenance-entering` or `maintenance-held`) may remain: inspect `lcm migration report` and the identity evidence before recovering."
     },
     {
       "reason": "hold-entry-evidence",
       "exitClass": "refused-evidence",
-      "remedy": "The maintenance journal could not be read or verified while entering the hold. Run `lcm doctor` before retrying."
+      "remedy": "The maintenance journal could not be read or verified while entering the hold. Run `lcm doctor` before retrying. If the envelope reports `applied: true`, this invocation changed or may have changed state and a maintenance hold (`maintenance-entering` or `maintenance-held`) may remain: inspect `lcm migration report` and the identity evidence before recovering."
     },
     {
       "reason": "hold-entry-readback-mismatch",
@@ -1500,11 +1511,6 @@ block marks implemented. `canEmit` is the closed set of exit classes the command
       "reason": "abort-carried-effect-mismatch",
       "exitClass": "refused-evidence",
       "remedy": "The pending abort effect on the manifest is not the one an abort of this generation begins. Nothing was changed; run `lcm doctor` and inspect the evidence."
-    },
-    {
-      "reason": "abort-other-generation",
-      "exitClass": "refused-precondition",
-      "remedy": "The terminal maintenance journal belongs to a different generation than the one named. Nothing was changed; omit --generation to act on the journal's own generation."
     },
     {
       "reason": "abort-readback-mismatch",

@@ -1224,7 +1224,10 @@ export function createFileNativeTranscriptSource(
     readonly _beforeStreamForTesting?: () => void;
     /** @internal Deterministic mid-stream mutation seam. */
     readonly _afterChunkForTesting?: (chunkOrdinal: number) => void;
-    /** @internal Simulates filesystem change-cookie coalescing. */
+    /**
+     * @internal Simulates a filesystem whose descriptor metadata and ctime
+     * change cookie did not move; locator checks still run.
+     */
     readonly _forceMetadataUnchangedForTesting?: boolean;
   } = {},
 ): NativeTranscriptByteSource {
@@ -1254,32 +1257,41 @@ export function createFileNativeTranscriptSource(
       };
       const assertUnchanged = (): void => {
         assertOpen();
-        if (options._forceMetadataUnchangedForTesting) return;
-        const current = fstatSync(opened.fd, { bigint: true });
-        const descriptorChanged =
-          current.dev !== opened.device
-          || current.ino !== opened.inode
-          || current.mode !== opened.mode
-          || current.uid !== opened.userId
-          || current.gid !== opened.groupId
-          || current.size !== opened.sizeBytesExact
-          || current.mtimeNs !== opened.modifiedAtNs;
-        if (descriptorChanged) {
+        const current = options._forceMetadataUnchangedForTesting
+          ? undefined
+          : fstatSync(opened.fd, { bigint: true });
+        if (
+          current !== undefined
+          && (
+            current.dev !== opened.device
+            || current.ino !== opened.inode
+            || current.mode !== opened.mode
+            || current.uid !== opened.userId
+            || current.gid !== opened.groupId
+            || current.size !== opened.sizeBytesExact
+            || current.mtimeNs !== opened.modifiedAtNs
+          )
+        ) {
           throw new NativeTranscriptSourceChangedError();
         }
-        if (current.ctimeNs !== opened.changedAtNs) {
-          let locatorStillNamesOpenedFile = true;
-          try {
-            const locatorStat = statSync(sourcePath, { bigint: true });
-            locatorStillNamesOpenedFile =
-              locatorStat.dev === opened.device
-              && locatorStat.ino === opened.inode;
-          } catch {
-            // A missing or unreadable locator does not prove atomic replacement.
-          }
-          if (locatorStillNamesOpenedFile) {
-            throw new NativeTranscriptSourceChangedError();
-          }
+        // Filesystems such as ZFS can coalesce ctime, so the locator is
+        // checked on every call rather than only after a ctime change.
+        let locatorStat;
+        try {
+          locatorStat = statSync(sourcePath, { bigint: true });
+        } catch {
+          // A missing or unreadable locator does not prove atomic replacement.
+          throw new NativeTranscriptSourceChangedError();
+        }
+        if (
+          locatorStat.dev !== opened.device
+          || locatorStat.ino !== opened.inode
+        ) {
+          // Atomic replacement: the opened descriptor remains the bound source.
+          return;
+        }
+        if (current !== undefined && current.ctimeNs !== opened.changedAtNs) {
+          throw new NativeTranscriptSourceChangedError();
         }
       };
       const snapshot: NativeTranscriptSourceSnapshot = {

@@ -41,15 +41,143 @@ describe("parseCodexHooksJson", () => {
     ]);
   });
 
-  it("tells integer tokens from other number spellings by path", () => {
-    const parsed = parseCodexHooksJson('{"t":30.0,"u":3e1,"v":-0,"w":30,"x":[0.5,7,0],"y":0,"z":1E1,"n":-0.0,"s":"1.5","h":{"k":2500}}')!;
-    const nonInteger = (...path: Array<string | number>) => parsed.nonIntegerNumberAt(path);
-    for (const path of [["t"], ["u"], ["v"], ["x", 0], ["z"], ["n"]]) {
-      expect(nonInteger(...path), JSON.stringify(path)).toBe(true);
+  const handlerDocument = (handler: string) => '{"hooks":{"Stop":[{"hooks":[' + handler + "]}]}}";
+  const handlerPath = (field: string | number): Array<string | number> => ["hooks", "Stop", 0, "hooks", 0, field];
+
+  it("tells integer tokens from other number spellings at the handler count fields", () => {
+    for (const field of ["timeout", "additionalContextLimit"]) {
+      for (const token of ["1.5", "30.0", "3e1", "1E1", "1e+2", "-0", "-0.0", "-5"]) {
+        const parsed = parseCodexHooksJson(handlerDocument('{"' + field + '":' + token + "}"))!;
+        expect(parsed.nonIntegerNumberAt(handlerPath(field)), field + " " + token).toBe(true);
+      }
+      for (const token of ["0", "30", "2500"]) {
+        const parsed = parseCodexHooksJson(handlerDocument('{"' + field + '":' + token + "}"))!;
+        expect(parsed.nonIntegerNumberAt(handlerPath(field)), field + " " + token).toBe(false);
+      }
     }
-    for (const path of [["w"], ["x", 1], ["x", 2], ["y"], ["s"], ["h", "k"], ["missing"]]) {
-      expect(nonInteger(...path), JSON.stringify(path)).toBe(false);
+  });
+
+  it("marks a repeated count field when any occurrence is not an unsigned integer", () => {
+    const spelled = (first: string, second: string) =>
+      parseCodexHooksJson(handlerDocument('{"timeout":' + first + ',"timeout":' + second + "}"))!.nonIntegerNumberAt(handlerPath("timeout"));
+    expect(spelled("1.5", "2")).toBe(true);
+    expect(spelled("2", "1.5")).toBe(true);
+    expect(spelled("2", "3")).toBe(false);
+  });
+
+  it("answers per event, group, handler and field", () => {
+    const parsed = parseCodexHooksJson(
+      '{"hooks":{"Stop":[{"hooks":[{"timeout":1.5},{"timeout":2,"additionalContextLimit":0.5}]},'
+        + '{"hooks":[{"timeout":3},{"timeout":2.5}]}],"SessionStart":[{"hooks":[{"timeout":4.5}]}]}}',
+    )!;
+    const recorded = [
+      ["Stop", 0, 0, "timeout"],
+      ["Stop", 0, 1, "additionalContextLimit"],
+      ["Stop", 1, 1, "timeout"],
+      ["SessionStart", 0, 0, "timeout"],
+    ] as const;
+    for (const [event, group, handler, field] of recorded) {
+      expect(parsed.nonIntegerNumberAt(["hooks", event, group, "hooks", handler, field]), field).toBe(true);
     }
+    const unrecorded: Array<Array<string | number>> = [
+      ["hooks", "Stop", 0, "hooks", 0, "additionalContextLimit"],
+      ["hooks", "Stop", 0, "hooks", 1, "timeout"],
+      ["hooks", "Stop", 1, "hooks", 0, "timeout"],
+      ["hooks", "Stop", 2, "hooks", 0, "timeout"],
+      ["hooks", "Stop", 0, "hooks", 2, "timeout"],
+      ["hooks", "SessionStart", 0, "hooks", 1, "timeout"],
+      ["hooks", "PreToolUse", 0, "hooks", 0, "timeout"],
+      ["hooks", 5, 0, "hooks", 0, "timeout"],
+      ["hooks", "Stop", "0", "hooks", 0, "timeout"],
+      ["hooks", "Stop", 0, "hooks", "0", "timeout"],
+      ["hooks", "Stop", 0, "hooks", 0, 0],
+      ["hooks", "Stop", 0, "hooks", 0, "statusMessage"],
+      ["hooks", "Stop", 0, "hooks", 0],
+      ["hooks", "Stop", 0, "hooks"],
+      ["hooks", "Stop", 0, "hooks", 0, "timeout", "x"],
+      [],
+      ["x", "Stop", 0, "hooks", 0, "timeout"],
+      ["hooks", "Stop", 0, "x", 0, "timeout"],
+    ];
+    for (const path of unrecorded) expect(parsed.nonIntegerNumberAt(path), JSON.stringify(path)).toBe(false);
+  });
+
+  it("tracks nothing but the handler count fields", () => {
+    const parsed = parseCodexHooksJson(
+      '{"t":1.5,"hooks":{"Stop":[{"matcher":2.5,"hooks":[{"timeout":1.5,"statusMessage":3.5,"input":{"x":2.5,"y":[3.5]},"z":[4.5]}]}]}}',
+    )!;
+    expect(parsed.nonIntegerNumberAt(handlerPath("timeout"))).toBe(true);
+    for (const path of [
+      ["t"],
+      ["hooks", "Stop", 0, "matcher"],
+      handlerPath("statusMessage"),
+      [...handlerPath("input"), "x"],
+      [...handlerPath("input"), "y", 0],
+      [...handlerPath("z"), 0],
+    ]) {
+      expect(parsed.nonIntegerNumberAt(path), JSON.stringify(path)).toBe(false);
+    }
+  });
+
+  it("records a count field only inside the object, array, object, array, object nesting under root hooks", () => {
+    const impostors: Array<[string, string]> = [
+      ["an array root", '[{"Stop":[{"hooks":[{"timeout":1.5}]}]}]'],
+      ["an array where the hooks object belongs", '{"hooks":[[{"hooks":[{"timeout":1.5}]}]]}'],
+      ["an object where the groups array belongs", '{"hooks":{"Stop":{"x":{"hooks":[{"timeout":1.5}]}}}}'],
+      ["an array where the group object belongs", '{"hooks":{"Stop":[[[{"timeout":1.5}]]]}}'],
+      ["an object where the handlers array belongs", '{"hooks":{"Stop":[{"hooks":{"x":{"timeout":1.5}}}]}}'],
+      ["an array where the handler object belongs", '{"hooks":{"Stop":[{"hooks":[[1.5]]}]}}'],
+      ["a root member other than hooks", '{"x":{"Stop":[{"hooks":[{"timeout":1.5}]}]}}'],
+      ["a group member other than hooks", '{"hooks":{"Stop":[{"matcher":[{"timeout":1.5}]}]}}'],
+      ["a handler member that is not a count field", '{"hooks":{"Stop":[{"hooks":[{"statusMessage":1.5}]}]}}'],
+      ["a number in place of a handler", '{"hooks":{"Stop":[{"hooks":[1.5]}]}}'],
+      ["a number below a count field", '{"hooks":{"Stop":[{"hooks":[{"timeout":[1.5]}]}]}}'],
+    ];
+    const paths: Array<Array<string | number>> = [
+      handlerPath("timeout"),
+      handlerPath(0),
+      handlerPath("statusMessage"),
+      [0, "Stop", 0, "hooks", 0, "timeout"],
+      ["hooks", 0, 0, "hooks", 0, 0],
+      ["x", "Stop", 0, "hooks", 0, "timeout"],
+      ["hooks", "Stop", 0, "matcher", 0, "timeout"],
+      ["hooks", "Stop", 0, "hooks", "x", "timeout"],
+      ["hooks", "x", "Stop", 0, "hooks", 0, "timeout"],
+    ];
+    for (const [name, content] of impostors) {
+      const parsed = parseCodexHooksJson(content)!;
+      for (const path of paths) expect(parsed.nonIntegerNumberAt(path), name + " " + JSON.stringify(path)).toBe(false);
+    }
+  });
+
+  it("records nothing for floats under a long ignored member name", () => {
+    const key = "k".repeat(8192);
+    const floats = Array.from({ length: 128 }, () => "1.5").join(",");
+    const documents: Array<[string, string, Array<string | number>]> = [
+      ["the top level", '{"hooks":{},"x":{"' + key + '":[' + floats + "]}}", ["x", key]],
+      ["a group member", '{"hooks":{"Stop":[{"' + key + '":[' + floats + '],"hooks":[{"timeout":1.5}]}]}}', ["hooks", "Stop", 0, key]],
+      ["a handler member", '{"hooks":{"Stop":[{"hooks":[{"' + key + '":[' + floats + '],"timeout":1.5}]}]}}', [...handlerPath(key)]],
+      [
+        "a handler input",
+        '{"hooks":{"Stop":[{"hooks":[{"input":{"' + key + '":[' + floats + '],"x":1.5},"timeout":1.5}]}]}}',
+        [...handlerPath("input"), key],
+      ],
+    ];
+    for (const [name, content, base] of documents) {
+      const parsed = parseCodexHooksJson(content)!;
+      for (let index = 0; index < 128; index += 1) {
+        expect(parsed.nonIntegerNumberAt([...base, index]), name + " " + index).toBe(false);
+      }
+      expect(parsed.nonIntegerNumberAt([...base.slice(0, -1), "x"]), name).toBe(false);
+      expect(parsed.nonIntegerNumberAt(handlerPath("timeout")), name).toBe(name === "the top level" ? false : true);
+    }
+  });
+
+  it("answers for an event named by a long key", () => {
+    const key = "k".repeat(8192);
+    const parsed = parseCodexHooksJson('{"hooks":{"' + key + '":[{"hooks":[{"timeout":1.5},{"timeout":2}]}]}}')!;
+    expect(parsed.nonIntegerNumberAt(["hooks", key, 0, "hooks", 0, "timeout"])).toBe(true);
+    expect(parsed.nonIntegerNumberAt(["hooks", key, 0, "hooks", 1, "timeout"])).toBe(false);
   });
 
   it("walks deep nesting without recursion", () => {
