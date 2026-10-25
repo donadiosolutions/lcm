@@ -20,8 +20,9 @@ The `lcm migration` group (`plan`, `dry-run`, `apply`, `resume`, `verify`, `repo
 `abort`, `activate`, `rollback`) performs the
 reversible SQLite-to-PostgreSQL cutover. Read the operator runbook,
 [Migration operations](migration-operations.md), before running `apply`: it leaves a
-maintenance hold that only `activate` or `abort` can release. After `activate`, swap the
-PostgreSQL grants (add the runtime grants, revoke the transfer grants) before starting the daemon.
+maintenance hold that only `activate` or `abort` can release. For one generation, apply the runtime
+grants before `activate`, then revoke the transfer grants before starting the daemon. The `--set`
+flow remains transfer-only and uses the grant swap in its dedicated runbook.
 
 Storage-backed commands use the backend selected in the authenticated LCM
 configuration. SQLite remains the default. With `storage.backend` set to
@@ -610,7 +611,12 @@ observed empty database.
 `lcm status`, `lcm stats --pool`, and `lcm doctor` authenticate an existing
 daemon through the internal `GET /health/observe` endpoint. It reports process
 identity with `observation: "identity-only"` and `storage.status: "unverified"`;
-it never opens project storage or runs the active readiness probe. Diagnostics
+it never opens project storage or runs the active readiness probe. It still
+answers when the daemon's startup backend differs from the backend now selected
+on disk, so a daemon left running across a migration cutover remains
+identifiable, including when its own environment lacks the PostgreSQL URL, CA
+file, or migration role of the newly selected backend (values that are present
+are still validated); every other admission check applies as before. Diagnostics
 require the exact installed version, backend, entrypoint, runtime digest, and
 unchanged configuration witness. An old daemon without this endpoint, malformed
 response, missing credentials, or mismatched identity refuses observation;

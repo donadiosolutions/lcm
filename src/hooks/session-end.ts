@@ -22,7 +22,9 @@ import {
   assertHookPublicationFenceToken,
   isBackendPublicationEvidenceMissing,
   isBackendPublicationJournalError,
+  NO_HOOK_ADMISSION_RETRY,
   rethrowBackendPublicationJournalError,
+  type HookAdmissionRetry,
   type HookPublicationLockToken,
   withHookPublicationFence,
 } from "./publication-fence.js";
@@ -160,7 +162,9 @@ export async function handleSessionEnd(
   client: DaemonClient,
   port?: number,
   storage: StorageBackendSelection = { backend: "sqlite" },
+  admissionRetry?: HookAdmissionRetry,
 ): Promise<{ exitCode: number; stdout: string }> {
+  const retry = admissionRetry ?? NO_HOOK_ADMISSION_RETRY;
   const daemonPort = port ?? 3737;
   const pidFilePath = daemonPidPath();
   let admitted: Readonly<{
@@ -176,7 +180,7 @@ export async function handleSessionEnd(
   }>;
   try {
     try {
-      assertHookPublicationFence();
+      await retry(() => assertHookPublicationFence());
     } catch (error) {
       if (isBackendPublicationJournalError(error) && !isBackendPublicationEvidenceMissing(error)) throw error;
       await safeLogError(
@@ -197,6 +201,7 @@ export async function handleSessionEnd(
         spawnTimeoutMs: 5000,
         expectedStorageBackend: storage.backend,
         enforceUserManagerParent: true,
+        ...(admissionRetry === undefined ? {} : { _withPublicationAdmissionRetry: admissionRetry }),
       });
     } catch (error) {
       if (isBackendPublicationJournalError(error)) throw error;
@@ -214,11 +219,11 @@ export async function handleSessionEnd(
       const clientName = normalizeTranscriptClient(input.client ?? process.env.LCM_CLIENT);
       // Snapshot settings before ingest can trigger concurrent daemon writes.
       // The authenticated config load releases its lock before network work.
-      const config = loadDaemonConfig(defaultConfigPath());
+      const config = await retry(() => loadDaemonConfig(defaultConfigPath()));
       const disableCompact = config.hooks?.disableAutoCompact ?? false;
       // The daemon client owns its own admission at the lifecycle boundary;
       // perform a fresh read-only check without holding it across the request.
-      assertHookPublicationFence();
+      await retry(() => assertHookPublicationFence());
       const ingestResult = await client.post<{
         ingested: number;
         totalTokens?: number;

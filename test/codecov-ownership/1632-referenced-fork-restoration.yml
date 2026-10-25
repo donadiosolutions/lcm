@@ -1,0 +1,8 @@
+references: ["#1632"]
+rationale: >-
+  Codex referenced (paginated-history) forks stop receiving a second LCM
+  restoration block. src/codex-transcript.ts (history_base walk over the
+  parent rollouts, cutoff validation and byte budget) keeps its transcript
+  import owner. No file is added, removed, moved or re-owned.
+pins:
+  - ["src/codex-transcript.ts", "unit-transcripts-import"]

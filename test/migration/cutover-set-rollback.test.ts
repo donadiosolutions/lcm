@@ -1,6 +1,8 @@
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { readBackendMaintenanceJournal } from "../../src/storage/backend-publication.js";
 import { assertMigrationReplayAdmission } from "../../src/migration/maintenance.js";
+import { readMigrationManifestRevision } from "../../src/migration/activate-generation.js";
+import { rollbackCutoverSet } from "../../src/migration/cutover-set-rollback.js";
 import { cleanupRoots } from "./cutover-set-activate-fixture.js";
 import { expectRolledBack, rollbackFixture } from "./cutover-set-rollback-fixture.js";
 
@@ -28,6 +30,22 @@ describe("rollbackCutoverSet", () => {
     const again = await f.run();
     expectRolledBack(f, again, "settled");
     expect(f.deps.prepareCalls).toBe(1);
+  });
+
+  it("completes every member when the clock advances between the rollback report timestamp and the completion", async () => {
+    const f = await rollbackFixture();
+    let step = -1;
+    const now = (): Date => new Date(Date.parse("2026-10-21T10:00:00.000Z") + ++step);
+    const outcome = await rollbackCutoverSet({ ...f.input, now }, f.deps);
+    expectRolledBack(f, outcome, "fresh");
+    for (const member of f.members) {
+      const head = f.activation.manifestStore.read(member.generationId);
+      const predecessor = readMigrationManifestRevision({ homeDir: f.homeDir, generationId: member.generationId, revision: head.revision - 1, checksumSha256: head.previousManifestSha256! });
+      expect(predecessor.pendingEffect?.kind).toBe("publish-rollback");
+      const createdAt = Date.parse(head.reports.filter((report) => report.kind === "rollback").at(-1)!.createdAt);
+      expect(Date.parse(predecessor.pendingEffect!.startedAt)).toBeLessThanOrEqual(createdAt);
+      expect(createdAt).toBeLessThanOrEqual(Date.parse(head.updatedAt));
+    }
   });
 });
 

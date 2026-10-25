@@ -87,7 +87,7 @@ describe("MIGRATION_REFUSAL_REASONS (section 12's single exported constant)", ()
 
   it("only the reasons whose state a re-run finishes claim exit class incomplete-recoverable (exit 6): the router's pending effect that resume finishes, and the activation whose re-entry finishes it (section 5's exit-6 rule)", () => {
     expect(MIGRATION_REFUSAL_REASONS.filter((entry) => entry.exitClass === "incomplete-recoverable").map((entry) => entry.reason))
-      .toEqual(["abort-manifest-needs-resume", "route-resume-required", "activation-refused-resume", "activation-interrupted"]);
+      .toEqual(["abort-manifest-needs-resume", "route-resume-required", "activation-refused-resume", "activation-interrupted", "set-incomplete"]);
   });
 
   it.each(REASONS_APPLY_TS_AND_CANDIDATE_TS_CAN_EMIT)(
@@ -123,7 +123,7 @@ describe("round-1 classified reasons (B-5, A-9, A-11, A-7)", () => {
     expect(migrationRefusalMapping(reason).exitClass).toBe(exitClass);
   });
 
-  it("the hold-entry reasons never tell the operator to abort: no hold of ours exists when entry fails (A-11)", () => {
+  it("the hold-entry reasons never tell the operator to abort: applied: true means a maintenance hold may remain, inspected with report before recovery (A-11)", () => {
     const holdEntry = MIGRATION_REFUSAL_REASONS.filter((entry) => entry.reason.startsWith("hold-entry-") && entry.reason !== "hold-entry-readback-mismatch");
     expect(holdEntry.map((entry) => entry.reason).sort()).toEqual([
       "hold-entry-contention", "hold-entry-evidence", "hold-entry-precondition", "hold-entry-slot-occupied",

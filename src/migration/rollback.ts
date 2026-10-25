@@ -147,7 +147,7 @@ import {
 } from "./rollback-eligibility.js";
 import { buildRollbackGeneration, type RollbackGenerationOutcome } from "./rollback-generation.js";
 import { installRollbackGeneration } from "./rollback-install.js";
-import { materializeRollbackSidecars } from "./rollback-sidecars.js";
+import { assertRollbackSidecarsCompatible, materializeRollbackSidecars } from "./rollback-sidecars.js";
 
 const MAX_REPORT_BYTES = 64 * 1024;
 
@@ -1878,6 +1878,18 @@ async function runPostPrepareSequence(
   if (exportEvidence !== null) {
     const drift = describeExportDrift(exportEvidence, revalidated);
     if (drift !== null) throw new RollbackOrchestrationError("drift", drift);
+  }
+
+  // #1681: a live passive-event row that genuinely contradicts the verified generation's archive refuses here, with
+  // the manifest still resumable at rolling-back, instead of after publish-rollback began and the canonical database
+  // was replaced. A resumed publication (pending effect) keeps the post-install verification below.
+  if (mode === "post-write" && working.pendingEffect === null) {
+    assertRollbackSidecarsCompatible({
+      homeDir: input.homeDir,
+      databasePath: built!.databasePath,
+      localProjectId: input.localProjectId,
+      machineId: input.roster[0]!.machineId,
+    });
   }
 
   const epochId = authority.selection.epochId;

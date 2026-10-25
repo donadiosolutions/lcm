@@ -58,6 +58,30 @@ export interface PostgreSqlRuntimeReadiness {
   readonly privilegeManifestVersion: number;
 }
 
+export interface PostgreSqlAdmittedPeer {
+  readonly role: string;
+}
+
+export interface PostgreSqlRuntimeReadinessOptions {
+  readonly expectedOwner: string;
+  readonly signal?: AbortSignal;
+  readonly admittedPeer?: PostgreSqlAdmittedPeer;
+}
+
+interface RoleIdentity {
+  readonly role: string;
+  readonly oid: string;
+}
+
+interface AdmittedPeerContext extends RoleIdentity {
+  readonly manifest: PostgreSqlRuntimePrivilegeManifest;
+}
+
+interface OptionalPrivilegeObservations {
+  readonly runtime: ReadonlySet<string>;
+  readonly peer: ReadonlySet<string>;
+}
+
 type RelationPrivilegeSpec = readonly [string, readonly string[]];
 type ColumnPrivilegeSpec = readonly [string, string, string];
 
@@ -760,6 +784,18 @@ const MESSAGE_PARTS_TRANSCRIPT_COLUMNS = [
   "part_type",
 ] as const;
 
+// Roles provisioned before the message_parts transcript column grants hold
+// table-level SELECT on lcm.message_parts, which already covers these reads.
+// Canonical transfer lists the column grants as required, but their direct
+// absence is tolerated (presence stays sanctioned). inspectRelationAcl runs
+// before inspectColumnAcl and already requires the table-level SELECT, and
+// the effective-privilege check still proves the read.
+const LEGACY_TOLERATED_COLUMN_KEYS: ReadonlySet<string> = new Set(
+  MESSAGE_PARTS_TRANSCRIPT_COLUMNS.map((column) => (
+    privilegeKey(columnEntry("message_parts", column, "SELECT"))
+  )),
+);
+
 const OPTIONAL_COLUMN_PRIVILEGES: readonly ColumnPrivilegeSpec[] = [
   ["conversations", "project_id", "SELECT"],
   ["conversations", "conversation_id", "SELECT"],
@@ -949,6 +985,7 @@ export class PostgreSqlRuntimeReadinessError extends StorageOperationError {
 
 interface RolePolicyRow extends QueryResultRow {
   readonly current_user_name: unknown;
+  readonly current_user_oid: unknown;
   readonly session_user_name: unknown;
   readonly role_exists: unknown;
   readonly superuser: unknown;
@@ -967,6 +1004,24 @@ interface RolePolicyRow extends QueryResultRow {
   readonly database_owner_oid_count: unknown;
   readonly database_owner_oid: unknown;
   readonly database_owner_match: unknown;
+}
+
+interface AdmittedPeerRolePolicyRow extends QueryResultRow {
+  readonly peer_name: unknown;
+  readonly peer_oid: unknown;
+  readonly role_exists: unknown;
+  readonly superuser: unknown;
+  readonly create_role: unknown;
+  readonly create_database: unknown;
+  readonly database_create_privilege: unknown;
+  readonly session_replication_role_set_privilege: unknown;
+  readonly replication: unknown;
+  readonly bypass_rls: unknown;
+  readonly can_login: unknown;
+  readonly member_of_count: unknown;
+  readonly has_members_count: unknown;
+  readonly expected_owner_match: unknown;
+  readonly current_role_match: unknown;
 }
 
 interface ServerReadinessRow extends QueryResultRow {
@@ -1129,6 +1184,7 @@ interface MigrationRow extends QueryResultRow {
 interface AclRow extends QueryResultRow {
   readonly object_identity: unknown;
   readonly grantee_is_owner: unknown;
+  readonly grantee_oid: unknown;
   readonly grantee_name: unknown;
   readonly grantor_is_owner: unknown;
   readonly privilege_type: unknown;
@@ -1193,6 +1249,10 @@ function isSafeCount(value: unknown): value is number {
   return typeof value === "number" && Number.isSafeInteger(value) && value >= 0;
 }
 
+function isOidText(value: unknown): value is string {
+  return typeof value === "string" && /^[0-9]+$/u.test(value);
+}
+
 function isRoleName(value: unknown): value is string {
   return typeof value === "string"
     && Buffer.byteLength(value, "utf8") > 0
@@ -1211,11 +1271,19 @@ function assertExpectedOwner(expectedOwner: unknown): asserts expectedOwner is s
   if (!isRoleName(expectedOwner)) throw readinessError("invalid-expected-owner", "validateExpectedOwner");
 }
 
+function assertAdmittedPeer(
+  admittedPeer: PostgreSqlAdmittedPeer | undefined,
+): void {
+  if (admittedPeer !== undefined && !isRoleName(admittedPeer.role)) {
+    throw readinessError("runtime-role-policy", "inspectAdmittedPeerRolePolicy");
+  }
+}
+
 async function inspectRolePolicy(
   executor: PostgreSqlQueryExecutor,
   expectedOwner: string,
   signal: AbortSignal | undefined,
-): Promise<string> {
+): Promise<RoleIdentity> {
   const result = await executor.query<RolePolicyRow, [string]>({
     text: `WITH RECURSIVE expected_owner AS (
              SELECT role.oid
@@ -1268,6 +1336,7 @@ async function inspectRolePolicy(
              FROM database_owner
            )
            SELECT runtime_role.current_user_name,
+                  runtime_role.oid::pg_catalog.text AS current_user_oid,
                   runtime_role.session_user_name,
                   runtime_role.oid IS NOT NULL AS role_exists,
                   runtime_role.rolsuper AS superuser,
@@ -1307,10 +1376,12 @@ async function inspectRolePolicy(
   }, readinessOptions("inspectRuntimeRolePolicy", signal));
   const row = result.rows[0];
   const runtimeRole = row?.current_user_name;
+  const runtimeRoleOid = row?.current_user_oid;
   if (
     result.rows.length !== 1
     || !row
     || !isRoleName(runtimeRole)
+    || !isOidText(runtimeRoleOid)
     || !isRoleName(row.session_user_name)
     || runtimeRole !== row.session_user_name
     || runtimeRole === expectedOwner
@@ -1327,20 +1398,98 @@ async function inspectRolePolicy(
     || row.expected_owner_match !== false
     || !isSafeCount(row.expected_owner_count)
     || row.expected_owner_count !== 1
-    || typeof row.expected_owner_oid !== "string"
-    || !/^[0-9]+$/u.test(row.expected_owner_oid)
+    || !isOidText(row.expected_owner_oid)
     || !isSafeCount(row.database_owner_count)
     || row.database_owner_count !== 1
     || !isSafeCount(row.database_owner_oid_count)
     || row.database_owner_oid_count !== 1
-    || typeof row.database_owner_oid !== "string"
-    || !/^[0-9]+$/u.test(row.database_owner_oid)
+    || !isOidText(row.database_owner_oid)
     || !isBoolean(row.database_owner_match)
     || row.database_owner_match !== true
   ) {
     throw readinessError("runtime-role-policy", "inspectRuntimeRolePolicy");
   }
-  return runtimeRole;
+  return { role: runtimeRole, oid: runtimeRoleOid };
+}
+
+async function inspectAdmittedPeerRolePolicy(
+  executor: PostgreSqlQueryExecutor,
+  admittedPeer: PostgreSqlAdmittedPeer,
+  expectedOwner: string,
+  runtimeRole: RoleIdentity,
+  signal: AbortSignal | undefined,
+): Promise<RoleIdentity> {
+  const result = await executor.query<AdmittedPeerRolePolicyRow, [string, string, string]>({
+    text: `WITH peer_role AS (
+             SELECT role.oid,
+                    role.rolname::pg_catalog.text AS peer_name,
+                    role.rolsuper,
+                    role.rolcreaterole,
+                    role.rolcreatedb,
+                    role.rolreplication,
+                    role.rolbypassrls,
+                    role.rolcanlogin
+             FROM pg_catalog.pg_roles AS role
+             WHERE role.rolname OPERATOR(pg_catalog.=) $1
+           )
+           SELECT peer_role.peer_name,
+                  peer_role.oid::pg_catalog.text AS peer_oid,
+                  peer_role.oid IS NOT NULL AS role_exists,
+                  peer_role.rolsuper AS superuser,
+                  peer_role.rolcreaterole AS create_role,
+                  peer_role.rolcreatedb AS create_database,
+                  pg_catalog.has_database_privilege(
+                    peer_role.oid,
+                    pg_catalog.current_database(),
+                    'CREATE'
+                  ) AS database_create_privilege,
+                  pg_catalog.has_parameter_privilege(
+                    peer_role.oid,
+                    'session_replication_role',
+                    'SET'
+                  ) AS session_replication_role_set_privilege,
+                  peer_role.rolreplication AS replication,
+                  peer_role.rolbypassrls AS bypass_rls,
+                  peer_role.rolcanlogin AS can_login,
+                  (SELECT pg_catalog.count(*)::pg_catalog.int4
+                   FROM pg_catalog.pg_auth_members AS membership
+                   WHERE membership.member OPERATOR(pg_catalog.=) peer_role.oid)
+                    AS member_of_count,
+                  (SELECT pg_catalog.count(*)::pg_catalog.int4
+                   FROM pg_catalog.pg_auth_members AS membership
+                   WHERE membership.roleid OPERATOR(pg_catalog.=) peer_role.oid)
+                    AS has_members_count,
+                  peer_role.peer_name OPERATOR(pg_catalog.=) $2 AS expected_owner_match,
+                  peer_role.peer_name OPERATOR(pg_catalog.=) $3 AS current_role_match
+           FROM peer_role`,
+    values: [admittedPeer.role, expectedOwner, runtimeRole.role],
+  }, readinessOptions("inspectAdmittedPeerRolePolicy", signal));
+  const row = result.rows[0];
+  if (
+    result.rows.length !== 1
+    || !row
+    || row.peer_name !== admittedPeer.role
+    || !isRoleName(row.peer_name)
+    || row.peer_name.startsWith("pg_")
+    || !isOidText(row.peer_oid)
+    || row.peer_oid === runtimeRole.oid
+    || row.role_exists !== true
+    || row.superuser !== false
+    || row.create_role !== false
+    || row.create_database !== false
+    || row.database_create_privilege !== false
+    || row.session_replication_role_set_privilege !== false
+    || row.replication !== false
+    || row.bypass_rls !== false
+    || row.can_login !== true
+    || row.member_of_count !== 0
+    || row.has_members_count !== 0
+    || row.expected_owner_match !== false
+    || row.current_role_match !== false
+  ) {
+    throw readinessError("runtime-role-policy", "inspectAdmittedPeerRolePolicy");
+  }
+  return { role: row.peer_name, oid: row.peer_oid };
 }
 
 async function inspectServerReadiness(
@@ -2546,8 +2695,9 @@ function effectivePrivilegeKey(
 
 function actualAclIdentity(
   row: AclRow,
-  runtimeRole: string,
+  runtimeRole: RoleIdentity,
   kind: PostgreSqlRuntimePrivilegeKind,
+  admittedPeer: AdmittedPeerContext | undefined,
 ): string | null {
   if (
     typeof row.object_identity !== "string"
@@ -2556,11 +2706,23 @@ function actualAclIdentity(
     || !isBoolean(row.grantor_is_owner)
     || !isBoolean(row.is_grantable)
   ) return null;
+  if (admittedPeer !== undefined) {
+    const grantee = row.grantee_is_owner
+      ? "owner"
+      : row.grantee_oid === "0"
+        ? "public"
+        : row.grantee_oid === runtimeRole.oid
+          ? "runtime"
+          : row.grantee_oid === admittedPeer.oid ? "peer" : null;
+    if (grantee === null) return null;
+    const grantor = row.grantor_is_owner ? "owner" : "foreign";
+    return [kind, row.object_identity, grantee, grantor, row.privilege_type, row.is_grantable].join("|");
+  }
   const grantee = row.grantee_is_owner
     ? "owner"
     : row.grantee_name === null
       ? "public"
-      : row.grantee_name === runtimeRole
+      : row.grantee_name === runtimeRole.role
         ? "runtime"
         : typeof row.grantee_name === "string" ? row.grantee_name : null;
   const grantor = row.grantor_is_owner ? "owner" : "foreign";
@@ -2571,7 +2733,8 @@ function actualAclIdentity(
 async function inspectSchemaAcl(
   executor: PostgreSqlQueryExecutor,
   manifest: PostgreSqlRuntimePrivilegeManifest,
-  runtimeRole: string,
+  runtimeRole: RoleIdentity,
+  admittedPeer: AdmittedPeerContext | undefined,
   signal: AbortSignal | undefined,
 ): Promise<void> {
   const result = await executor.query<SchemaAclRow, [readonly string[]]>({
@@ -2592,6 +2755,7 @@ async function inspectSchemaAcl(
            SELECT metadata.schema_name,
                   privilege.grantee OPERATOR(pg_catalog.=) metadata.nspowner
                     AS grantee_is_owner,
+                  privilege.grantee::pg_catalog.text AS grantee_oid,
                   grantee.rolname::text AS grantee_name,
                   privilege.grantor OPERATOR(pg_catalog.=) metadata.nspowner
                     AS grantor_is_owner,
@@ -2617,6 +2781,9 @@ async function inspectSchemaAcl(
   for (const entry of entries.filter(({ kind }) => kind === "schema")) {
     required.add(["schema", entry.object, "runtime", "owner", entry.privilege, false].join("|"));
   }
+  for (const entry of admittedPeer?.manifest.required.filter(({ kind }) => kind === "schema") ?? []) {
+    required.add(["schema", entry.object, "peer", "owner", entry.privilege, false].join("|"));
+  }
   for (const entry of required) allowed.add(entry);
   allowed.add(["schema", "public", "public", "owner", "USAGE", false].join("|"));
   const actual = new Set<string>();
@@ -2626,6 +2793,7 @@ async function inspectSchemaAcl(
       { ...row, object_identity: schemaName },
       runtimeRole,
       "schema",
+      admittedPeer,
     );
     if (typeof schemaName !== "string" || identity === null) {
       throw readinessError("acl-shape", "inspectSchemaAcl");
@@ -2643,10 +2811,11 @@ async function inspectSchemaAcl(
 async function inspectRelationAcl(
   executor: PostgreSqlQueryExecutor,
   manifest: PostgreSqlRuntimePrivilegeManifest,
-  runtimeRole: string,
+  runtimeRole: RoleIdentity,
+  admittedPeer: AdmittedPeerContext | undefined,
   snapshot: PostgreSqlSchemaSnapshot,
   signal: AbortSignal | undefined,
-): Promise<ReadonlySet<string>> {
+): Promise<OptionalPrivilegeObservations> {
   const result = await executor.query<AclRow, [readonly string[]]>({
     text: `SELECT pg_catalog.concat(
                     CASE relation.relkind WHEN 'r' THEN 'table|' WHEN 'S' THEN 'sequence|' END,
@@ -2654,6 +2823,7 @@ async function inspectRelationAcl(
                   ) AS object_identity,
                   privilege.grantee OPERATOR(pg_catalog.=) relation.relowner
                     AS grantee_is_owner,
+                  privilege.grantee::pg_catalog.text AS grantee_oid,
                   grantee.rolname::text AS grantee_name,
                   privilege.grantor OPERATOR(pg_catalog.=) relation.relowner
                     AS grantor_is_owner,
@@ -2710,17 +2880,38 @@ async function inspectRelationAcl(
       ["relation", objectIdentity, "runtime", "owner", entry.privilege, false].join("|"),
     );
   }
+  const peerRequiredIdentities = new Map<string, string>();
+  const peerOptionalIdentities = new Map<string, string>();
+  for (const entry of admittedPeer?.manifest.required ?? []) {
+    if (entry.kind !== "relation" && entry.kind !== "sequence") continue;
+    const relationKind = entry.kind === "relation" ? "table" : "sequence";
+    const objectIdentity = `${relationKind}|${entry.object.replace(/^lcm\./u, "")}`;
+    peerRequiredIdentities.set(
+      privilegeKey(entry),
+      ["relation", objectIdentity, "peer", "owner", entry.privilege, false].join("|"),
+    );
+  }
+  for (const entry of admittedPeer?.manifest.optional ?? []) {
+    if (entry.kind !== "relation") continue;
+    const objectIdentity = `table|${entry.object.replace(/^lcm\./u, "")}`;
+    peerOptionalIdentities.set(
+      privilegeKey(entry),
+      ["relation", objectIdentity, "peer", "owner", entry.privilege, false].join("|"),
+    );
+  }
   const mandatoryIdentities = new Set([
     ...ownerIdentities,
     ...requiredIdentities.values(),
+    ...peerRequiredIdentities.values(),
   ]);
   const allowedIdentities = new Set([
     ...mandatoryIdentities,
     ...optionalIdentities.values(),
+    ...peerOptionalIdentities.values(),
   ]);
   const actual = new Set<string>();
   for (const row of result.rows) {
-    const identity = actualAclIdentity(row, runtimeRole, "relation");
+    const identity = actualAclIdentity(row, runtimeRole, "relation", admittedPeer);
     if (identity === null) throw readinessError("acl-shape", "inspectRelationAcl");
     actual.add(identity);
   }
@@ -2730,25 +2921,34 @@ async function inspectRelationAcl(
   ) {
     throw readinessError("acl-shape", "inspectRelationAcl");
   }
-  return new Set(
-    [...optionalIdentities]
-      .filter(([, identity]) => actual.has(identity))
-      .map(([key]) => key),
-  );
+  return {
+    runtime: new Set(
+      [...optionalIdentities]
+        .filter(([, identity]) => actual.has(identity))
+        .map(([key]) => key),
+    ),
+    peer: new Set(
+      [...peerOptionalIdentities]
+        .filter(([, identity]) => actual.has(identity))
+        .map(([key]) => key),
+    ),
+  };
 }
 
 async function inspectColumnAcl(
   executor: PostgreSqlQueryExecutor,
   manifest: PostgreSqlRuntimePrivilegeManifest,
-  runtimeRole: string,
+  runtimeRole: RoleIdentity,
+  admittedPeer: AdmittedPeerContext | undefined,
   snapshot: PostgreSqlSchemaSnapshot,
   signal: AbortSignal | undefined,
-): Promise<ReadonlySet<string>> {
+): Promise<OptionalPrivilegeObservations> {
   const result = await executor.query<AclRow, [readonly string[]]>({
     text: `SELECT pg_catalog.concat('lcm.', relation.relname, '|', attribute.attname)
                     AS object_identity,
                   privilege.grantee OPERATOR(pg_catalog.=) relation.relowner
                     AS grantee_is_owner,
+                  privilege.grantee::pg_catalog.text AS grantee_oid,
                   grantee.rolname::text AS grantee_name,
                   privilege.grantor OPERATOR(pg_catalog.=) relation.relowner
                     AS grantor_is_owner,
@@ -2772,12 +2972,13 @@ async function inspectColumnAcl(
     values: [snapshot.tableIdentities.map((table) => `table|${table}`)],
   }, readinessOptions("inspectColumnAcl", signal));
   const requiredIdentities = new Map<string, string>();
+  const presentRequiredIdentities: string[] = [];
   for (const entry of manifest.required) {
     if (entry.kind !== "column" || entry.column === undefined) continue;
-    requiredIdentities.set(
-      privilegeKey(entry),
-      ["column", `${entry.object}|${entry.column}`, "runtime", "owner", entry.privilege, false].join("|"),
-    );
+    const key = privilegeKey(entry);
+    const identity = ["column", `${entry.object}|${entry.column}`, "runtime", "owner", entry.privilege, false].join("|");
+    requiredIdentities.set(key, identity);
+    if (!LEGACY_TOLERATED_COLUMN_KEYS.has(key)) presentRequiredIdentities.push(identity);
   }
   const optionalIdentities = new Map<string, string>();
   for (const entry of manifest.optional) {
@@ -2787,33 +2988,61 @@ async function inspectColumnAcl(
       ["column", `${entry.object}|${entry.column}`, "runtime", "owner", entry.privilege, false].join("|"),
     );
   }
+  const peerRequiredIdentities = new Map<string, string>();
+  const presentPeerRequiredIdentities: string[] = [];
+  for (const entry of admittedPeer?.manifest.required ?? []) {
+    if (entry.kind !== "column" || entry.column === undefined) continue;
+    const key = privilegeKey(entry);
+    const identity = ["column", `${entry.object}|${entry.column}`, "peer", "owner", entry.privilege, false].join("|");
+    peerRequiredIdentities.set(key, identity);
+    if (!LEGACY_TOLERATED_COLUMN_KEYS.has(key)) presentPeerRequiredIdentities.push(identity);
+  }
+  const peerOptionalIdentities = new Map<string, string>();
+  for (const entry of admittedPeer?.manifest.optional ?? []) {
+    if (entry.kind !== "column" || entry.column === undefined) continue;
+    peerOptionalIdentities.set(
+      privilegeKey(entry),
+      ["column", `${entry.object}|${entry.column}`, "peer", "owner", entry.privilege, false].join("|"),
+    );
+  }
   const allowedIdentities = new Set([
     ...requiredIdentities.values(),
     ...optionalIdentities.values(),
+    ...peerRequiredIdentities.values(),
+    ...peerOptionalIdentities.values(),
   ]);
   const actual = new Set<string>();
   for (const row of result.rows) {
-    const identity = actualAclIdentity(row, runtimeRole, "column");
+    const identity = actualAclIdentity(row, runtimeRole, "column", admittedPeer);
     if (identity === null) throw readinessError("acl-shape", "inspectColumnAcl");
     actual.add(identity);
   }
   if (
     [...actual].some((entry) => !allowedIdentities.has(entry))
-    || [...requiredIdentities.values()].some((entry) => !actual.has(entry))
+    || presentRequiredIdentities.some((entry) => !actual.has(entry))
+    || presentPeerRequiredIdentities.some((entry) => !actual.has(entry))
   ) {
     throw readinessError("acl-shape", "inspectColumnAcl");
   }
-  return new Set(
-    [...optionalIdentities]
-      .filter(([, identity]) => actual.has(identity))
-      .map(([key]) => key),
-  );
+  return {
+    runtime: new Set(
+      [...optionalIdentities]
+        .filter(([, identity]) => actual.has(identity))
+        .map(([key]) => key),
+    ),
+    peer: new Set(
+      [...peerOptionalIdentities]
+        .filter(([, identity]) => actual.has(identity))
+        .map(([key]) => key),
+    ),
+  };
 }
 
 async function inspectFunctionAcl(
   executor: PostgreSqlQueryExecutor,
   manifest: PostgreSqlRuntimePrivilegeManifest,
-  runtimeRole: string,
+  runtimeRole: RoleIdentity,
+  admittedPeer: AdmittedPeerContext | undefined,
   snapshot: PostgreSqlSchemaSnapshot,
   signal: AbortSignal | undefined,
 ): Promise<void> {
@@ -2825,6 +3054,9 @@ async function inspectFunctionAcl(
         return `lcm.${name}(${args})`;
       }),
     ...manifest.required
+      .filter(({ kind }) => kind === "function")
+      .map(({ object }) => object),
+    ...(admittedPeer?.manifest.required ?? [])
       .filter(({ kind }) => kind === "function")
       .map(({ object }) => object),
   ];
@@ -2842,6 +3074,7 @@ async function inspectFunctionAcl(
                   ) AS function_identity,
                   privilege.grantee OPERATOR(pg_catalog.=) procedure.proowner
                     AS grantee_is_owner,
+                  privilege.grantee::pg_catalog.text AS grantee_oid,
                   grantee.rolname::text AS grantee_name,
                   privilege.grantor OPERATOR(pg_catalog.=) procedure.proowner
                     AS grantor_is_owner,
@@ -2882,11 +3115,18 @@ async function inspectFunctionAcl(
     ...manifest.required,
     ...manifest.optional,
   ].filter(({ kind }) => kind === "function");
+  const peerEntries = [
+    ...(admittedPeer?.manifest.required ?? []),
+    ...(admittedPeer?.manifest.optional ?? []),
+  ].filter(({ kind }) => kind === "function");
   const expectedExtensions = new Map<string, string | null>();
   for (const functionIdentity of functionIdentities) {
     expectedExtensions.set(functionIdentity, null);
   }
   for (const entry of entries) {
+    expectedExtensions.set(entry.object, entry.extension ?? null);
+  }
+  for (const entry of peerEntries) {
     expectedExtensions.set(entry.object, entry.extension ?? null);
   }
   const required = new Set<string>();
@@ -2896,6 +3136,9 @@ async function inspectFunctionAcl(
   }
   for (const entry of entries) {
     required.add(["function", entry.object, "runtime", "owner", "EXECUTE", false].join("|"));
+  }
+  for (const entry of peerEntries) {
+    required.add(["function", entry.object, "peer", "owner", "EXECUTE", false].join("|"));
   }
   for (const entry of required) allowed.add(entry);
   for (const entry of entries) {
@@ -2916,6 +3159,7 @@ async function inspectFunctionAcl(
       { ...row, object_identity: row.function_identity },
       runtimeRole,
       "function",
+      admittedPeer,
     );
     if (identity === null) {
       throw readinessError("acl-shape", "inspectFunctionAcl");
@@ -2932,8 +3176,9 @@ async function inspectFunctionAcl(
 
 function definitionQuery(
   snapshot: PostgreSqlSchemaSnapshot,
-  runtimeRole: string,
+  runtimeRole: RoleIdentity,
   manifest: PostgreSqlRuntimePrivilegeManifest,
+  admittedPeer: AdmittedPeerContext | undefined,
 ): QueryConfig<unknown[]> {
   const expectations = getPostgreSqlSchemaSnapshotExpectations(snapshot);
   const relationSanctions = manifest.required
@@ -2946,6 +3191,18 @@ function definitionQuery(
     ));
   const columnSanctions = manifest.required
     .concat(manifest.optional)
+    .filter(({ kind }) => kind === "column")
+    .map((entry) => `${entry.object.replace(/^lcm\./u, "")}|${entry.column}|${entry.privilege}`);
+  const peerRelationSanctions = (admittedPeer?.manifest.required ?? [])
+    .concat(admittedPeer?.manifest.optional ?? [])
+    .filter(({ kind }) => kind === "relation" || kind === "sequence")
+    .map((entry) => (
+      `${entry.kind === "relation" ? "table" : "sequence"}|${
+        entry.object.replace(/^lcm\./u, "")
+      }|${entry.privilege}`
+    ));
+  const peerColumnSanctions = (admittedPeer?.manifest.required ?? [])
+    .concat(admittedPeer?.manifest.optional ?? [])
     .filter(({ kind }) => kind === "column")
     .map((entry) => `${entry.object.replace(/^lcm\./u, "")}|${entry.column}|${entry.privilege}`);
   return {
@@ -3383,12 +3640,21 @@ function definitionQuery(
              CROSS JOIN LATERAL pg_catalog.aclexplode(acl_relations.effective_acl) AS privilege
              WHERE acl_relations.object_identity OPERATOR(pg_catalog.=) ANY ($4::pg_catalog.text[])
                AND NOT (
-                 privilege.grantee OPERATOR(pg_catalog.=)
+                 ${admittedPeer === undefined ? `privilege.grantee OPERATOR(pg_catalog.=)
                    (SELECT role.oid FROM pg_catalog.pg_roles AS role WHERE role.rolname OPERATOR(pg_catalog.=) $10)
-                 AND privilege.grantor OPERATOR(pg_catalog.=) acl_relations.owner_oid
-                 AND privilege.is_grantable OPERATOR(pg_catalog.=) false
-                 AND pg_catalog.concat(acl_relations.object_identity, '|', privilege.privilege_type)
-                   OPERATOR(pg_catalog.=) ANY ($11::pg_catalog.text[])
+                   AND privilege.grantor OPERATOR(pg_catalog.=) acl_relations.owner_oid
+                   AND privilege.is_grantable OPERATOR(pg_catalog.=) false
+                   AND pg_catalog.concat(acl_relations.object_identity, '|', privilege.privilege_type)
+                     OPERATOR(pg_catalog.=) ANY ($11::pg_catalog.text[])` : `(privilege.grantee OPERATOR(pg_catalog.=) $10::pg_catalog.oid
+                   AND privilege.grantor OPERATOR(pg_catalog.=) acl_relations.owner_oid
+                   AND privilege.is_grantable OPERATOR(pg_catalog.=) false
+                   AND pg_catalog.concat(acl_relations.object_identity, '|', privilege.privilege_type)
+                     OPERATOR(pg_catalog.=) ANY ($11::pg_catalog.text[]))
+                 OR (privilege.grantee OPERATOR(pg_catalog.=) $13::pg_catalog.oid
+                   AND privilege.grantor OPERATOR(pg_catalog.=) acl_relations.owner_oid
+                   AND privilege.is_grantable OPERATOR(pg_catalog.=) false
+                   AND pg_catalog.concat(acl_relations.object_identity, '|', privilege.privilege_type)
+                     OPERATOR(pg_catalog.=) ANY ($14::pg_catalog.text[]))`}
                )
            ),
            raw_column_acls AS (
@@ -3404,8 +3670,15 @@ function definitionQuery(
                       AND privilege.grantee OPERATOR(pg_catalog.<>) relation.relowner
                       AND privilege.grantor OPERATOR(pg_catalog.=) relation.relowner
                       AND privilege.is_grantable OPERATOR(pg_catalog.=) false
-                      AND pg_catalog.concat(relation.relname, '|', attribute.attname, '|', privilege.privilege_type)
-                        OPERATOR(pg_catalog.=) ANY ($12::pg_catalog.text[]),
+                      AND ${admittedPeer === undefined ? `pg_catalog.concat(relation.relname, '|', attribute.attname, '|', privilege.privilege_type)
+                        OPERATOR(pg_catalog.=) ANY ($12::pg_catalog.text[])` : `(
+                        (privilege.grantee OPERATOR(pg_catalog.=) $10::pg_catalog.oid
+                         AND pg_catalog.concat(relation.relname, '|', attribute.attname, '|', privilege.privilege_type)
+                           OPERATOR(pg_catalog.=) ANY ($12::pg_catalog.text[]))
+                        OR (privilege.grantee OPERATOR(pg_catalog.=) $13::pg_catalog.oid
+                         AND pg_catalog.concat(relation.relname, '|', attribute.attname, '|', privilege.privilege_type)
+                           OPERATOR(pg_catalog.=) ANY ($15::pg_catalog.text[]))
+                      )`},
                       false
                     ) AS sanctioned
              FROM pg_catalog.pg_attribute AS attribute
@@ -3537,9 +3810,14 @@ function definitionQuery(
       expectations.definitionGroupKinds,
       expectations.definitionGroupCounts,
       expectations.definitionGroupHashes,
-      runtimeRole,
+      admittedPeer === undefined ? runtimeRole.role : runtimeRole.oid,
       relationSanctions,
       columnSanctions,
+      ...(admittedPeer === undefined ? [] : [
+        admittedPeer.oid,
+        peerRelationSanctions,
+        peerColumnSanctions,
+      ]),
     ],
   };
 }
@@ -3547,12 +3825,13 @@ function definitionQuery(
 async function inspectDefinitions(
   executor: PostgreSqlQueryExecutor,
   manifest: PostgreSqlRuntimePrivilegeManifest,
-  runtimeRole: string,
+  runtimeRole: RoleIdentity,
+  admittedPeer: AdmittedPeerContext | undefined,
   snapshot: PostgreSqlSchemaSnapshot,
   signal: AbortSignal | undefined,
 ): Promise<number> {
   const result = await executor.query<DefinitionRow, unknown[]>(
-    definitionQuery(snapshot, runtimeRole, manifest),
+    definitionQuery(snapshot, runtimeRole, manifest, admittedPeer),
     readinessOptions("inspectSchemaDefinitions", signal),
   );
   const row = result.rows[0];
@@ -3898,12 +4177,36 @@ async function inspectEffectivePrivileges(
   }
 }
 
+function optionalPrivilegesPresent(
+  manifest: PostgreSqlRuntimePrivilegeManifest,
+  observedPrivileges: ReadonlySet<string>,
+): boolean {
+  const observed = new Set(observedPrivileges);
+  if (observed.size !== 0) {
+    for (const column of MESSAGE_PARTS_TRANSCRIPT_COLUMNS) {
+      observed.add(privilegeKey(columnEntry("message_parts", column, "SELECT")));
+    }
+  }
+  const exactOptionalKeys = new Set(manifest.optional.map(privilegeKey));
+  if (
+    observed.size !== 0
+    && (
+      observed.size !== exactOptionalKeys.size
+      || [...exactOptionalKeys].some((key) => !observed.has(key))
+    )
+  ) {
+    throw readinessError("acl-shape", "inspectOptionalPrivileges");
+  }
+  return observed.size > 0;
+}
+
 async function verifyPostgreSqlSchema(
   executor: PostgreSqlQueryExecutor,
   manifest: PostgreSqlRuntimePrivilegeManifest,
-  options: { readonly expectedOwner: string; readonly signal?: AbortSignal },
+  options: PostgreSqlRuntimeReadinessOptions,
 ): Promise<PostgreSqlRuntimeReadiness> {
   assertExpectedOwner(options.expectedOwner);
+  assertAdmittedPeer(options.admittedPeer);
   const signal = options.signal;
   try {
     const migrations = loadPostgreSqlMigrations();
@@ -3912,6 +4215,23 @@ async function verifyPostgreSqlSchema(
     validatePostgreSqlSchemaSnapshotRegistry(migrations, snapshots);
     await inspectServerReadiness(executor, signal);
     const runtimeRole = await inspectRolePolicy(executor, options.expectedOwner, signal);
+    const admittedPeerIdentity = options.admittedPeer === undefined
+      ? undefined
+      : await inspectAdmittedPeerRolePolicy(
+        executor,
+        options.admittedPeer,
+        options.expectedOwner,
+        runtimeRole,
+        signal,
+      );
+    const admittedPeer: AdmittedPeerContext | undefined = admittedPeerIdentity === undefined
+      ? undefined
+      : {
+        ...admittedPeerIdentity,
+        manifest: manifest === POSTGRESQL_RUNTIME_PRIVILEGE_MANIFEST
+          ? POSTGRESQL_TRANSFER_PRIVILEGE_MANIFEST
+          : POSTGRESQL_RUNTIME_PRIVILEGE_MANIFEST,
+      };
     await assertRequiredPostgreSqlExtensionsReady(executor, {
       operation: "runtimeReadinessExtensions",
       signal,
@@ -3948,12 +4268,20 @@ async function verifyPostgreSqlSchema(
       throw readinessError("migration-ledger", "readMigrations");
     }
     const ownership = await inspectOwnership(executor, options.expectedOwner, snapshot, signal);
-    const definitionObjectCount = await inspectDefinitions(executor, manifest, runtimeRole, snapshot, signal);
-    await inspectSchemaAcl(executor, manifest, runtimeRole, signal);
+    const definitionObjectCount = await inspectDefinitions(
+      executor,
+      manifest,
+      runtimeRole,
+      admittedPeer,
+      snapshot,
+      signal,
+    );
+    await inspectSchemaAcl(executor, manifest, runtimeRole, admittedPeer, signal);
     const relationOptionalPrivileges = await inspectRelationAcl(
       executor,
       manifest,
       runtimeRole,
+      admittedPeer,
       snapshot,
       signal,
     );
@@ -3961,47 +4289,34 @@ async function verifyPostgreSqlSchema(
       executor,
       manifest,
       runtimeRole,
+      admittedPeer,
       snapshot,
       signal,
     );
-    const observed = new Set([
-      ...relationOptionalPrivileges,
-      ...columnOptionalPrivileges,
+    const runtimeObserved = new Set([
+      ...relationOptionalPrivileges.runtime,
+      ...columnOptionalPrivileges.runtime,
     ]);
-    if (observed.size !== 0) {
-      // A transcript role granted before these column grants existed reads
-      // them through its conversation table SELECT; the effective-privilege
-      // check below still proves that read.
-      for (const column of MESSAGE_PARTS_TRANSCRIPT_COLUMNS) {
-        observed.add(privilegeKey(columnEntry("message_parts", column, "SELECT")));
-      }
+    const optionalPrivilegesArePresent = optionalPrivilegesPresent(manifest, runtimeObserved);
+    if (admittedPeer !== undefined) {
+      optionalPrivilegesPresent(admittedPeer.manifest, new Set([
+        ...relationOptionalPrivileges.peer,
+        ...columnOptionalPrivileges.peer,
+      ]));
     }
-    const exactOptionalKeys = new Set(
-      manifest.optional.map(privilegeKey),
-    );
-    if (
-      observed.size !== 0
-      && (
-        observed.size !== exactOptionalKeys.size
-        || [...exactOptionalKeys].some((key) => !observed.has(key))
-      )
-    ) {
-      throw readinessError("acl-shape", "inspectOptionalPrivileges");
-    }
-    const optionalPrivilegesPresent = observed.size > 0;
-    await inspectFunctionAcl(executor, manifest, runtimeRole, snapshot, signal);
+    await inspectFunctionAcl(executor, manifest, runtimeRole, admittedPeer, snapshot, signal);
     await inspectEffectivePrivileges(
       executor,
       manifest,
-      runtimeRole,
+      runtimeRole.role,
       snapshot,
-      optionalPrivilegesPresent,
+      optionalPrivilegesArePresent,
       signal,
     );
     return Object.freeze({
       currentMigrationIds: Object.freeze([...currentMigrationIds]),
       expectedOwner: options.expectedOwner,
-      runtimeRole,
+      runtimeRole: runtimeRole.role,
       managedObjectCount: ownership.managedObjectCount,
       definitionObjectCount,
       privilegeManifestVersion: manifest.version,
@@ -4024,7 +4339,7 @@ async function verifyPostgreSqlSchema(
 /** Catalog-only admission for the exact ordinary runtime privilege profile. */
 export async function verifyPostgreSqlRuntimeSchema(
   executor: PostgreSqlQueryExecutor,
-  options: { readonly expectedOwner: string; readonly signal?: AbortSignal },
+  options: PostgreSqlRuntimeReadinessOptions,
 ): Promise<PostgreSqlRuntimeReadiness> {
   return verifyPostgreSqlSchema(executor, POSTGRESQL_RUNTIME_PRIVILEGE_MANIFEST, options);
 }
@@ -4032,7 +4347,7 @@ export async function verifyPostgreSqlRuntimeSchema(
 /** Catalog-only admission for a separately provisioned canonical transfer role. */
 export async function verifyPostgreSqlTransferSchema(
   executor: PostgreSqlQueryExecutor,
-  options: { readonly expectedOwner: string; readonly signal?: AbortSignal },
+  options: PostgreSqlRuntimeReadinessOptions,
 ): Promise<PostgreSqlRuntimeReadiness> {
   return verifyPostgreSqlSchema(executor, POSTGRESQL_TRANSFER_PRIVILEGE_MANIFEST, options);
 }

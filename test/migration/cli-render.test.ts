@@ -371,11 +371,11 @@ describe("every command's ok and refusal envelopes keep outcome/exitCode agreeme
 describe("renderMigrationActivateEnvelope (and the cutover renderer rollback shares)", () => {
   it("builds an ok envelope that carries the applied flag, the next step, the evidence and the restart observation", () => {
     expect(renderMigrationActivateEnvelope({
-      status: "ok", generationId: "gen-1", manifestPhase: "active", applied: true, next: "swap-grants-then-start-daemon",
-      evidence: { grantSwap: "required-before-daemon-start" }, restart: { answer: "satisfied", presence: "absent" },
+      status: "ok", generationId: "gen-1", manifestPhase: "active", applied: true, next: "revoke-transfer-grants-then-start-daemon",
+      evidence: { transferGrantRevocation: "required-before-daemon-start" }, restart: { answer: "satisfied", presence: "absent" },
     })).toMatchObject({
       command: "activate", outcome: "ok", exitCode: 0, generation: "gen-1", manifestPhase: "active", applied: true,
-      next: "swap-grants-then-start-daemon", evidence: { grantSwap: "required-before-daemon-start" }, restart: { answer: "satisfied", presence: "absent" },
+      next: "revoke-transfer-grants-then-start-daemon", evidence: { transferGrantRevocation: "required-before-daemon-start" }, restart: { answer: "satisfied", presence: "absent" },
     });
   });
 
@@ -417,11 +417,11 @@ describe("renderMigrationActivateEnvelope (and the cutover renderer rollback sha
 
   it("keeps every section the command read, the restart observation, the next action and the applied flag on a refusal", () => {
     const envelope = renderMigrationActivateEnvelope({
-      status: "refuse", reason: "cutover-restart-required", generationId: "gen-1", applied: true, next: "swap-grants-then-start-daemon",
+      status: "refuse", reason: "cutover-restart-required", generationId: "gen-1", applied: true, next: "revoke-transfer-grants-then-start-daemon",
       evidence: "manifest-active", sections: { cell: 10, selectedBackend: "postgresql" }, restart: { answer: "unsatisfied", presence: "running" },
     });
     expect(envelope).toMatchObject({
-      exitCode: 8, applied: true, next: "swap-grants-then-start-daemon",
+      exitCode: 8, applied: true, next: "revoke-transfer-grants-then-start-daemon",
       evidence: { cell: 10, selectedBackend: "postgresql", detail: "manifest-active" }, restart: { answer: "unsatisfied", presence: "running" },
     });
   });

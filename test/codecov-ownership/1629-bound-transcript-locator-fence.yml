@@ -1,0 +1,7 @@
+references: ["#1629"]
+rationale: >-
+  #1629 changes the bound native transcript source fence so assertUnchanged
+  resolves the source locator on every call instead of only after a ctime
+  change. The file keeps its existing transcript-import component owner.
+pins:
+  - ["src/storage/native-transcript-ingest.ts", "unit-transcripts-import"]

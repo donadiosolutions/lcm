@@ -1,0 +1,9 @@
+references: ["#1631", "#1608"]
+rationale: >-
+  Changes the Codex readiness check (src/connectors/codex-readiness.ts) so
+  doctor rejects a repeated hooks.json member only when Codex's own struct
+  for that object knows it. The file stays in the connectors owner, matched by
+  the existing src/connectors/ path, so codecov.yml is unchanged. No file was
+  added, removed, moved or re-owned.
+pins:
+  - ["src/connectors/codex-readiness.ts", "unit-connectors"]

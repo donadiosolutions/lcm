@@ -10,6 +10,7 @@ import {
   DEFAULT_MIGRATION_APPLY_MAX_BYTES,
 } from "../../src/migration/cli-apply.js";
 import type { MigrationApplyThroughCaptureOutcome } from "../../src/migration/apply.js";
+import { renderMigrationApplyEnvelope } from "../../src/migration/cli-render.js";
 import { resolveMigrationExpectedIdentity, type MigrationIdentityEffects, type MigrationPreflightResult } from "../../src/migration/cli-preflight.js";
 import type { MigrationManifestStore } from "../../src/migration/manifest-store.js";
 import { MigrationProtocolError } from "../../src/migration/protocol.js";
@@ -277,6 +278,20 @@ describe("performMigrationApply: the boundary catch (round-1 B-4)", () => {
       cwd: "/tmp/project", homeDir: "/tmp/home", confirmGenerationId: "generation-0", ...overrides,
     });
     expect(result).toEqual({ status: "refuse", reason: "unexpected-failure", evidence: "TypeError" });
+  });
+
+  it("a throw during a dry run reports applied false, because a dry run never reaches a write; the same throw without --dry-run still reports applied true", async () => {
+    const dryRun = await performMigrationApply({
+      cwd: "/tmp/project", homeDir: "/tmp/home", confirmGenerationId: "generation-0", dryRun: true,
+      _preflight: async () => { throw new TypeError("boom"); },
+    });
+    expect(dryRun).toEqual({ status: "refuse", reason: "unexpected-failure", evidence: "TypeError", applied: false });
+    expect(renderMigrationApplyEnvelope(dryRun).applied).toBe(false);
+    const real = await performMigrationApply({
+      cwd: "/tmp/project", homeDir: "/tmp/home", confirmGenerationId: "generation-0",
+      _preflight: async () => { throw new TypeError("boom"); },
+    });
+    expect(renderMigrationApplyEnvelope(real).applied).toBe(true);
   });
 });
 

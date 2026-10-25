@@ -175,7 +175,9 @@ describe("performMigrationApplyGenesisAndCopy (section 8's genesis-and-copy row)
         // Racing the expected checksum here forces MigrationManifestStore's
         // own optimistic-concurrency refusal, which surfaces through this
         // function's genesis-dry-run-complete-failed mapping.
-        return realUpdate.call(this, generationId, `${expectedChecksumSha256.slice(0, -1)}0`, mutate);
+        // Flip the final hex digit so the raced checksum always differs.
+        const raced = `${expectedChecksumSha256.slice(0, -1)}${expectedChecksumSha256.endsWith("0") ? "1" : "0"}`;
+        return realUpdate.call(this, generationId, raced, mutate);
       }
       return realUpdate.call(this, generationId, expectedChecksumSha256, mutate);
     });

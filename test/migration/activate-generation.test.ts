@@ -1,14 +1,16 @@
 import { afterEach, describe, expect, it, vi } from "vitest";
-import { mkdirSync, mkdtempSync, readFileSync, readdirSync, rmSync, statSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, rmSync, statSync, writeFileSync } from "node:fs";
+import { createHash } from "node:crypto";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { ConfigValidationError, DEFAULT_DAEMON_PORT, readDaemonConfigSnapshot } from "../../src/daemon/config.js";
-import { ensurePendingMachineIdentity, finalizeMachineIdentity } from "../../src/machine-identity.js";
+import { MachineIdentityFileError, ensurePendingMachineIdentity, finalizeMachineIdentity } from "../../src/machine-identity.js";
 import { clearProjectMapCache, hashProjectPath, normalizeProjectPath, projectMapPath } from "../../src/project-map.js";
 import { configPath, lcmHomeDir, projectsDir } from "../../src/runtime-paths.js";
 import {
   BackendPublicationCoordinator,
   backendPublicationDirectory,
+  backendPublicationCanonicalSha256,
   backendPublicationJournalPath,
   readBackendMaintenanceJournal,
   readBackendPublicationJournal,
@@ -19,8 +21,10 @@ import { createBackendPublicationCoordinator } from "../../src/storage/backend-p
 import type { StorageIdentityContext } from "../../src/storage/contracts.js";
 import type { PostgreSqlConnectionSettings, PostgreSqlRuntimeHealth } from "../../src/storage/postgresql/contracts.js";
 import {
+  PostgreSqlBackendPublicationGuard,
   PostgreSqlBackendPublicationGuardError,
   type PostgreSqlBackendPublicationAcquireInput,
+  type PostgreSqlBackendPublicationControlExecutor,
   type PostgreSqlBackendPublicationFence,
   type PostgreSqlBackendPublicationMutationInput,
 } from "../../src/storage/postgresql/publication-guard.js";
@@ -28,7 +32,7 @@ import { createPostgreSqlBackendPublicationRemoteGuard } from "../../src/storage
 import { PostgreSqlRuntimeReadinessError, type PostgreSqlRuntimeReadiness } from "../../src/storage/postgresql/runtime-readiness.js";
 import { PostgreSqlStorageOperationError } from "../../src/storage/postgresql/errors.js";
 import { StorageOperationError } from "../../src/storage/errors.js";
-import { PORTABLE_RECORD_DOMAIN_ORDER, type PortableDomain } from "../../src/storage/portable-record.js";
+import { PORTABLE_RECORD_DOMAIN_ORDER, PortableStreamError, type PortableDomain } from "../../src/storage/portable-record.js";
 import {
   MIGRATION_ACTIVATION_LEASE_CLEANUP_TIMEOUT_MS,
   MigrationActivationError,
@@ -93,6 +97,8 @@ import {
   type MigrationVerificationReport,
 } from "../../src/migration/verification-report.js";
 import { MigrationVerificationReportStore } from "../../src/migration/verification-store.js";
+import { performMigrationActivateCommand } from "../../src/migration/cli-activate.js";
+import { admitExistingMigrationCommand } from "../../src/migration/cli-existing.js";
 import {
   buildMigrationCanonicalDelta,
   buildMigrationCensusVector,
@@ -119,6 +125,10 @@ const HASH_B = "b".repeat(64);
 const HASH_C = "c".repeat(64);
 const SETTINGS: PostgreSqlConnectionSettings = {
   url: "postgresql://unused", caFile: "/dev/null", poolMax: 1, connectionTimeoutMs: 1000, idleTimeoutMs: 1000, statementTimeoutMs: 1000,
+};
+const RUNTIME_SETTINGS: PostgreSqlConnectionSettings = {
+  ...SETTINGS,
+  url: "postgresql://runtime-unused",
 };
 /** What the (fake) transfer verifier admits; the activation role holds the transfer profile (plan-v7.2 B1). */
 const READINESS: PostgreSqlRuntimeReadiness = {
@@ -231,6 +241,13 @@ class FakeLeaseGuard implements ActivationLeasePublicationGuard {
     const released = { ...row, releasedAt: "2026-10-16T00:00:02.000Z" };
     this.rows.set(input.projectId, released);
     return released;
+  }
+
+  /** The release-reconciliation read (Bug #1651): the row whichever generation it names, like the real guard's. */
+  async readForReleaseReconciliation(input: Pick<PostgreSqlBackendPublicationMutationInput, "projectId" | "signal">): Promise<PostgreSqlBackendPublicationFence | null> {
+    this.calls.push("read");
+    this.admit("read", input.signal);
+    return this.rows.get(input.projectId) ?? null;
   }
 
   async read(input: Pick<PostgreSqlBackendPublicationMutationInput, "projectId" | "targetBackend" | "evidenceSha256" | "signal">): Promise<PostgreSqlBackendPublicationFence | null> {
@@ -429,7 +446,11 @@ async function fixture(options: { held?: boolean; rosterMachine?: string; extraP
     destinationCensus: domainCensus("census"),
     createOrdinaryRuntime: ordinary,
     createTransferRuntime: transfer,
-    verifyTransferSchema: async () => READINESS,
+    readRoleIdentity: async (executor) => "backendPublicationGuard" in executor
+      ? { currentUser: "lcm_runtime", sessionUser: "lcm_runtime", oid: "101", tls: true }
+      : { currentUser: "lcm_transfer", sessionUser: "lcm_transfer", oid: "202", tls: true },
+    verifyRuntimeSchema: async () => ({ ...READINESS, runtimeRole: "lcm_runtime" }),
+    verifyTransferSchema: async () => ({ ...READINESS, runtimeRole: "lcm_transfer" }),
     checkTargetHealth: async () => health.shift() ?? ({ status: "healthy", readiness: READINESS }),
     captureDestinationIdentity: async () => ({ version: 1, ...identity }),
     readDestinationCensus: async () => ({ census: deps.destinationCensus }),
@@ -557,6 +578,19 @@ describe("runMigrationActivation: refusals (no effect begun)", () => {
     const f = await fixture();
     f.deps.identity.sealedWitnessSha256 = "f".repeat(64);
     const outcome = await f.run();
+    expect(outcome).toMatchObject({ status: "refused", step: "S5", reason: "identity-drift" });
+  });
+
+  it("refuses identity drift discovered on the transfer copy-binding session at S0", async () => {
+    const f = await fixture();
+    let calls = 0;
+    const outcome = await f.run({
+      captureDestinationIdentity: async () => ({
+        version: 1,
+        sealedWitnessSha256: DEST_IDENTITY,
+        systemIdentifier: calls++ === 0 ? SYSTEM_ID : "999",
+      }),
+    });
     expect(outcome).toMatchObject({ status: "refused", step: "S0", reason: "identity-drift" });
   });
 
@@ -599,12 +633,12 @@ describe("runMigrationActivation: refusals (no effect begun)", () => {
     expect(outcome).toMatchObject({ status: "refused", step: "S8", reason: "census-drift" });
   });
 
-  it("S6 admits the activation role through the transfer verifier (plan-v7.2 B2): a transfer-profile refusal is target-unhealthy before any effect", async () => {
+  it("S6 admits the runtime role with the transfer peer before any effect", async () => {
     const f = await fixture();
     const executors: unknown[] = [];
     const outcome = await f.run({
       checkTargetHealth: checkMigrationTargetHealth,
-      verifyTransferSchema: async (executor) => { executors.push(executor); throw new PostgreSqlRuntimeReadinessError("acl-shape", "inspectSchemaAcl"); },
+      verifyRuntimeSchema: async (executor) => { executors.push(executor); throw new PostgreSqlRuntimeReadinessError("acl-shape", "inspectSchemaAcl"); },
     });
     expect(outcome).toMatchObject({ status: "refused", step: "S6", reason: "target-unhealthy", effectBegun: false });
     if (outcome.status !== "refused") return;
@@ -615,6 +649,211 @@ describe("runMigrationActivation: refusals (no effect begun)", () => {
     expect((executors[0] as MigrationActivationOrdinaryRuntime).backendPublicationGuard).toBeTypeOf("function");
     expect(f.manifestStore.read(GENERATION).phase).toBe("verified");
     expect(readActivationGenerationLink({ homeDir: f.homeDir, generationId: GENERATION }).state).toBe("authoritatively-absent");
+  });
+
+  it("runs S6 and S15 as the runtime role while S7 admits that role as the transfer peer", async () => {
+    const f = await fixture();
+    const runtimeSettings = { ...SETTINGS, url: "postgresql://runtime-unused" };
+    const transferSettings = { ...SETTINGS, url: "postgresql://transfer-unused" };
+    let ordinaryRuntime: MigrationActivationOrdinaryRuntime | null = null;
+    const createOrdinaryRuntime = f.deps.createOrdinaryRuntime;
+    const runtimeAdmissions: unknown[] = [];
+    const transferAdmissions: unknown[] = [];
+
+    const outcome = await runMigrationActivation({
+      ...f.input,
+      ordinarySettings: runtimeSettings,
+      transferSettings,
+    }, {
+      ...f.deps,
+      createOrdinaryRuntime: (settings) => {
+        expect(settings).toBe(runtimeSettings);
+        ordinaryRuntime = createOrdinaryRuntime(settings);
+        return ordinaryRuntime;
+      },
+      createTransferRuntime: (settings) => {
+        expect(settings).toBe(transferSettings);
+        return f.deps.createTransferRuntime(settings);
+      },
+      readRoleIdentity: async (executor) => executor === ordinaryRuntime
+        ? { currentUser: "lcm_runtime", sessionUser: "lcm_runtime", oid: "101", tls: true }
+        : { currentUser: "lcm_transfer", sessionUser: "lcm_transfer", oid: "202", tls: true },
+      checkTargetHealth: checkMigrationTargetHealth,
+      verifyRuntimeSchema: async (_executor, options) => {
+        runtimeAdmissions.push(options);
+        return { ...READINESS, runtimeRole: "lcm_runtime" };
+      },
+      verifyTransferSchema: async (_executor, options) => {
+        transferAdmissions.push(options);
+        return { ...READINESS, runtimeRole: "lcm_transfer" };
+      },
+    } as MigrationActivationDependencies);
+
+    expectActivated(f, outcome, "fresh");
+    expect(runtimeAdmissions).toEqual([
+      expect.objectContaining({ admittedPeer: { role: "lcm_transfer" } }),
+      expect.objectContaining({ admittedPeer: { role: "lcm_transfer" } }),
+    ]);
+    expect(transferAdmissions).toEqual([
+      expect.objectContaining({ admittedPeer: { role: "lcm_runtime" } }),
+    ]);
+  });
+
+  it("binds the ordinary runtime to the verified destination before acquiring a lease", async () => {
+    const f = await fixture();
+    let ordinaryRuntime: MigrationActivationOrdinaryRuntime | null = null;
+    const createOrdinaryRuntime = f.deps.createOrdinaryRuntime;
+    const outcome = await f.run({
+      createOrdinaryRuntime: (settings) => {
+        ordinaryRuntime = createOrdinaryRuntime(settings);
+        return ordinaryRuntime;
+      },
+      readRoleIdentity: async (executor) => executor === ordinaryRuntime
+        ? { currentUser: "lcm_runtime", sessionUser: "lcm_runtime", oid: "101", tls: true }
+        : { currentUser: "lcm_transfer", sessionUser: "lcm_transfer", oid: "202", tls: true },
+      captureDestinationIdentity: async (executor) => ({
+        version: 1,
+        sealedWitnessSha256: DEST_IDENTITY,
+        systemIdentifier: executor === ordinaryRuntime ? "999" : SYSTEM_ID,
+      }),
+    } as Partial<MigrationActivationDependencies>);
+
+    expect(outcome).toMatchObject({ status: "refused", step: "S5", reason: "identity-drift" });
+    expect(f.guard.calls).not.toContain("acquire");
+  });
+
+  it.each([
+    ["authentication refusal", "28P01", false, "target-unhealthy", "authentication-refused"],
+    ["insufficient privilege", "42501", false, "target-unhealthy", "insufficient-privilege"],
+    ["retryable transport failure", null, true, "target-unresolvable", "connection-failed"],
+  ] as const)(
+    "classifies an ordinary identity %s at S6 before any lease write",
+    async (_label, sqlState, retryable, reason, detail) => {
+      const f = await fixture();
+      const readRoleIdentity = vi.fn(f.deps.readRoleIdentity);
+      const error = new PostgreSqlStorageOperationError(
+        "STORAGE_OPERATION_FAILED",
+        { domain: "factory", operation: "captureDestinationIdentity" },
+        sqlState,
+        retryable,
+      );
+      const outcome = await f.run({
+        captureDestinationIdentity: async () => { throw error; },
+        readRoleIdentity,
+      });
+
+      expect(outcome).toMatchObject({
+        status: "refused",
+        step: "S6",
+        reason,
+        effectBegun: false,
+        detail: expect.stringContaining(detail),
+      });
+      expect(readRoleIdentity).not.toHaveBeenCalled();
+      expect(f.guard.calls).not.toContain("acquire");
+    },
+  );
+
+  it("refuses identical or session-switched activation roles at S6 before any effect", async () => {
+    const identical = await fixture();
+    const identicalOutcome = await identical.run({
+      readRoleIdentity: async () => ({ currentUser: "lcm_runtime", sessionUser: "lcm_runtime", oid: "101", tls: true }),
+    } as Partial<MigrationActivationDependencies>);
+    expect(identicalOutcome).toMatchObject({
+      status: "refused",
+      step: "S6",
+      reason: "target-unhealthy",
+      effectBegun: false,
+    });
+    expect(identical.guard.calls).not.toContain("acquire");
+
+    const switched = await fixture();
+    let reads = 0;
+    const switchedOutcome = await switched.run({
+      readRoleIdentity: async () => reads++ === 0
+        ? { currentUser: "lcm_runtime", sessionUser: "lcm_runtime", oid: "101", tls: true }
+        : { currentUser: "lcm_transfer", sessionUser: "session_owner", oid: "202", tls: true },
+    } as Partial<MigrationActivationDependencies>);
+    expect(switchedOutcome).toMatchObject({
+      status: "refused",
+      step: "S6",
+      reason: "target-unhealthy",
+      effectBegun: false,
+    });
+    expect(switched.guard.calls).not.toContain("acquire");
+
+    const insecure = await fixture();
+    let insecureReads = 0;
+    const insecureOutcome = await insecure.run({
+      readRoleIdentity: async () => insecureReads++ === 0
+        ? { currentUser: "lcm_runtime", sessionUser: "lcm_runtime", oid: "101", tls: true }
+        : { currentUser: "lcm_transfer", sessionUser: "lcm_transfer", oid: "202", tls: false },
+    });
+    expect(insecureOutcome).toMatchObject({
+      status: "refused",
+      step: "S6",
+      reason: "target-unhealthy",
+      effectBegun: false,
+    });
+    expect(insecure.guard.calls).not.toContain("acquire");
+  });
+
+  it("classifies role discovery failures before any effect", async () => {
+    const unavailable = await fixture();
+    const unavailableOutcome = await unavailable.run({
+      readRoleIdentity: async () => {
+        throw new PostgreSqlStorageOperationError(
+          "STORAGE_OPERATION_FAILED",
+          { domain: "factory", operation: "roleIdentity" },
+          null,
+          true,
+        );
+      },
+    });
+    expect(unavailableOutcome).toMatchObject({
+      status: "refused",
+      step: "S6",
+      reason: "target-unresolvable",
+      effectBegun: false,
+    });
+
+    const unhealthy = await fixture();
+    const unhealthyOutcome = await unhealthy.run({
+      readRoleIdentity: async () => {
+        throw new PostgreSqlRuntimeReadinessError("acl-shape", "inspectSchemaAcl");
+      },
+    });
+    expect(unhealthyOutcome).toMatchObject({
+      status: "refused",
+      step: "S6",
+      reason: "target-unhealthy",
+      effectBegun: false,
+    });
+
+    const malformed = await fixture();
+    let reads = 0;
+    const malformedOutcome = await malformed.run({
+      readRoleIdentity: async () => reads++ === 0
+        ? { currentUser: "lcm_runtime", sessionUser: "lcm_runtime", oid: "101", tls: true }
+        : { currentUser: "", sessionUser: "", oid: "", tls: true },
+    });
+    expect(malformedOutcome).toMatchObject({
+      status: "refused",
+      step: "S6",
+      reason: "target-unhealthy",
+      effectBegun: false,
+    });
+
+    const unexpected = await fixture();
+    const unexpectedOutcome = await unexpected.run({
+      readRoleIdentity: async () => { throw new RangeError("raw"); },
+    });
+    expect(unexpectedOutcome).toMatchObject({
+      status: "refused",
+      step: "S6",
+      reason: "target-unresolvable",
+      effectBegun: false,
+    });
   });
 });
 
@@ -757,6 +996,48 @@ describe("runMigrationActivation: crash rows (plan-v5 section 7 / synthesis amen
   });
 });
 
+/**
+ * Bug #1679: a crash anywhere between the end of prepare-activation and the
+ * manifest settle used to leave the router on cell 25 (route-contradiction),
+ * so the CLI refused `activate` before the orchestrator, which resumes every
+ * one of these windows, ever ran. Here the real router reads the real home the
+ * crashed orchestrator left behind, and the real orchestrator then finishes it
+ * through the CLI command.
+ */
+describe("activate CLI admission of the interrupted activation windows (Bug #1679)", () => {
+  const resolution = { _operationsForTesting: { classifySnapshot: async () => ({ state: "complete" }) } } as never;
+
+  it.each([
+    ["after-prepare-begin", "prepare-activation-pending", 6],
+    ["after-prepare-complete", "activating-no-effect", 2],
+    ["after-publish-begin", "publish-pending-before-artifact", 6],
+    ["after-link", "publish-pending-after-link", 6],
+    ["after-drive", "publication-journal", 6],
+    ["after-report", "publication-journal", 6],
+  ])("a crash at %s routes to activate (row 11) and the CLI finishes it", async (point, resumedFrom, exitIfRefused) => {
+    const f = await fixture();
+    await expect(f.run({ crashPoint: (p) => { if (p === point) throw new Error("injected crash at " + point); } })).rejects.toThrow("injected crash at " + point);
+
+    const admission = await admitExistingMigrationCommand({ command: "activate", homeDir: f.homeDir, generation: GENERATION, resolution });
+    expect(admission.status === "refuse" ? admission.reason : "admitted").toBe("admitted");
+    if (admission.status !== "admitted") return;
+    expect(admission.context.route).toMatchObject({ row: 11, primary: "activate", exitIfRefused });
+
+    const outcome = await performMigrationActivateCommand({
+      cwd: f.canonical, homeDir: f.homeDir, generation: GENERATION, confirmGenerationId: GENERATION, confirmBackend: "postgresql",
+      _resolution: resolution,
+      _operationsForTesting: {
+        resolveDestination: async () => ({ status: "resolved", settings: SETTINGS, expectedOwner: "lcm_migrator", expectedIdentity: f.input.expectedIdentity }),
+        resolveRuntimeSettings: () => ({ status: "resolved", settings: RUNTIME_SETTINGS }),
+        run: (input) => runMigrationActivation({ ...input, now: f.input.now }, f.deps),
+        classifyPresence: async () => ({ status: "authoritatively-absent" }),
+      },
+    });
+    expect(outcome).toMatchObject({ status: "ok", generationId: GENERATION, manifestPhase: "active", evidence: { cell: 11, resumedFrom } });
+    expect(f.manifestStore.read(GENERATION)).toMatchObject({ phase: "active", pendingEffect: null });
+  });
+});
+
 describe("runMigrationActivation: lease continuation (A2)", () => {
   it("renews after S7, before S12 and before S13b", async () => {
     const f = await fixture();
@@ -812,6 +1093,62 @@ async function stopAt(f: Fixture, point: string): Promise<void> {
   await expect(f.run({ crashPoint: (p) => { if (p === point) throw new Error("stop at " + point); } })).rejects.toThrow("stop at " + point);
 }
 
+it("rediscovers both live roles and rechecks the ordinary destination before post-selection lease use", async () => {
+  const f = await fixture();
+  await stopAt(f, "after-selection-completed");
+  const observed: string[] = [];
+  const outcome = await f.run({
+    readRoleIdentity: async (executor) => {
+      const role = "backendPublicationGuard" in executor ? "runtime" : "transfer";
+      observed.push(role);
+      return role === "runtime"
+        ? { currentUser: "lcm_runtime", sessionUser: "lcm_runtime", oid: "101", tls: true }
+        : { currentUser: "lcm_transfer", sessionUser: "lcm_transfer", oid: "202", tls: true };
+    },
+  });
+
+  expectActivated(f, outcome, "selection-completed-unbound");
+  expect(observed).toEqual(["runtime", "transfer"]);
+});
+
+it("reports post-selection role rediscovery failure as a roll-forward interruption", async () => {
+  const f = await fixture();
+  await stopAt(f, "after-selection-completed");
+  const outcome = await f.run({
+    readRoleIdentity: async () => ({ currentUser: "", sessionUser: "", oid: "", tls: true }),
+  });
+  expect(outcome).toMatchObject({ status: "interrupted", effectBegun: true });
+});
+
+it.each([
+  ["authentication refusal", "28P01", false, "target-unhealthy", "authentication-refused"],
+  ["insufficient privilege", "42501", false, "target-unhealthy", "insufficient-privilege"],
+  ["retryable transport failure", null, true, "target-unresolvable", "connection-failed"],
+] as const)(
+  "classifies a post-selection ordinary identity %s as a roll-forward interruption",
+  async (_label, sqlState, retryable, reason, detail) => {
+    const f = await fixture();
+    await stopAt(f, "after-selection-completed");
+    const error = new PostgreSqlStorageOperationError(
+      "STORAGE_OPERATION_FAILED",
+      { domain: "factory", operation: "captureDestinationIdentity" },
+      sqlState,
+      retryable,
+    );
+    const outcome = await f.run({
+      captureDestinationIdentity: async () => { throw error; },
+    });
+
+    expect(outcome).toMatchObject({
+      status: "interrupted",
+      step: "S11",
+      cause: "state-unresolvable",
+      effectBegun: true,
+      detail: expect.stringContaining(`S6 ${reason} on roll-forward: ${detail}`),
+    });
+  },
+);
+
 function namedError(name: string, message = name): Error {
   const error = new Error(message);
   error.name = name;
@@ -862,7 +1199,7 @@ describe("runMigrationActivation: classification refusals and interruptions", ()
     const f = await fixture();
     const real = f.deps.readVerificationReport;
     const outcome = await f.run({ readVerificationReport: (g, sha) => { const r = real(g, sha); return { ...r, body: { ...r.body, destinationIdentity: { ...r.body.destinationIdentity, sealedWitnessSha256: "f".repeat(64) } } }; } });
-    expect(outcome).toMatchObject({ status: "refused", step: "S0", reason: "identity-drift" });
+    expect(outcome).toMatchObject({ status: "refused", step: "S5", reason: "identity-drift" });
   });
 
   it("refuses at S8 for a report whose classes did not all run or that records mismatches (injected past the parser)", async () => {
@@ -963,6 +1300,56 @@ describe("runMigrationActivation: classification refusals and interruptions", ()
     expect(await j.run()).toMatchObject({ status: "refused", step: "S2", reason: "lease-unresolvable" });
   });
 
+  it("S2: a fence row the real guard cannot decode refuses lease-unresolvable, a decodable foreign row refuses lease-conflict", async () => {
+    const row = (operation: string, publication: string) => ({
+      project_id: REMOTE, owner_machine_id: MACHINE, owner_process_id: publication, operation, fencing_token: "1",
+      acquired_at: "2026-10-16T00:00:00.000Z", renewed_at: "2026-10-16T00:00:00.000Z", expires_at: "2999-01-01T00:00:00.000Z",
+      released_at: null, expired: false,
+    });
+    const realGuardOver = (stored: ReturnType<typeof row>) => {
+      const query = async () => ({ rows: [stored] });
+      return new PostgreSqlBackendPublicationGuard({
+        projectPublicationTransaction: async (_projectId: string, callback: (scope: unknown) => Promise<unknown>) => callback({
+          transactionScope: "active", query, savepoint: async (inner: (scope: { query: typeof query }) => Promise<unknown>) => inner({ query }),
+        }),
+        projectPublicationReadback: async () => ({ rows: [stored] }),
+      } as unknown as PostgreSqlBackendPublicationControlExecutor);
+    };
+    const runWith = async (stored: ReturnType<typeof row>) => {
+      const f = await fixture();
+      const guard = realGuardOver(stored);
+      const outcome = await f.run({ createOrdinaryRuntime: (settings) => ({ ...f.deps.createOrdinaryRuntime(settings), backendPublicationGuard: () => guard }) });
+      return { f, outcome };
+    };
+    // The #628 rehearsal row: this machine, an undecodable operation string.
+    const undecodable = await runWith(row("rehearsal-contention", "rehearsal-competing-owner"));
+    expect(undecodable.outcome).toMatchObject({ status: "refused", step: "S2", reason: "lease-unresolvable" });
+    expect(undecodable.f.manifestStore.read(GENERATION).phase).toBe("verified");
+    const foreign = await runWith(row("backend-publication:postgresql:" + "f".repeat(64), "someone-else"));
+    expect(foreign.outcome).toMatchObject({ status: "refused", step: "S2", reason: "lease-conflict" });
+  });
+
+  it("S2: the takeover read classifies a different generation as lease-conflict, an undecodable row as lease-unresolvable, and rethrows anything else", async () => {
+    const failRead = async (error: unknown) => {
+      const f = await fixture();
+      f.guard.seed({ projectId: REMOTE, publicationId: f.publicationId, databaseExpired: true });
+      f.guard.read = async () => { throw error; };
+      return f.run();
+    };
+    expect(await failRead(new PostgreSqlBackendPublicationGuardError(REMOTE, "read", "fence-mismatch"))).toMatchObject({ status: "refused", step: "S2", reason: "lease-conflict" });
+    expect(await failRead(new PostgreSqlBackendPublicationGuardError(REMOTE, "read", "invalid-row"))).toMatchObject({ status: "refused", step: "S2", reason: "lease-unresolvable" });
+    await expect(failRead(new PostgreSqlBackendPublicationGuardError(REMOTE, "read", "invalid-input"))).rejects.toMatchObject({ reason: "invalid-input" });
+    await expect(failRead(new Error("read exploded"))).rejects.toThrow("read exploded");
+    const g = await fixture();
+    g.guard.seed({ projectId: REMOTE, publicationId: g.publicationId, databaseExpired: true });
+    const acquire = g.guard.acquire.bind(g.guard);
+    g.guard.acquire = async (input) => {
+      if (input.expectedFencingToken !== undefined) throw new PostgreSqlBackendPublicationGuardError(input.projectId, "acquire", "invalid-row");
+      return acquire(input);
+    };
+    expect(await g.run()).toMatchObject({ status: "refused", step: "S2", reason: "lease-unresolvable" });
+  });
+
   it("renew after S7: a stale caller token is renewed with the returned token; a vanished row refuses lease-conflict; an ambiguous renew refuses lease-unresolvable", async () => {
     const f = await fixture();
     const renew = f.guard.renew.bind(f.guard);
@@ -1042,19 +1429,24 @@ describe("runMigrationActivation: classification refusals and interruptions", ()
     expectActivated(f, await f.run(), "publication-journal");
   });
 
-  it("S15 admits through the transfer verifier too (plan-v7.2 B2): a transfer-profile refusal after publication is post-publication-unhealthy", async () => {
+  it("S15 repeats runtime admission with the transfer peer after publication", async () => {
     const f = await fixture();
-    let admissions = 0;
+    let runtimeAdmissions = 0;
+    let transferAdmissions = 0;
     const outcome = await f.run({
       checkTargetHealth: checkMigrationTargetHealth,
-      // Admission 1 is S6, admission 2 is S7's own transfer schema check, admission 3 is S15.
+      verifyRuntimeSchema: async () => {
+        runtimeAdmissions += 1;
+        if (runtimeAdmissions === 2) throw new PostgreSqlRuntimeReadinessError("effective-privilege", "inspectEffectivePrivileges");
+        return READINESS;
+      },
       verifyTransferSchema: async () => {
-        admissions += 1;
-        if (admissions === 3) throw new PostgreSqlRuntimeReadinessError("effective-privilege", "inspectEffectivePrivileges");
+        transferAdmissions += 1;
         return READINESS;
       },
     });
-    expect(admissions).toBe(3);
+    expect(runtimeAdmissions).toBe(2);
+    expect(transferAdmissions).toBe(1);
     expect(outcome).toMatchObject({
       status: "post-publication-unhealthy",
       health: { status: "unhealthy", reason: "schema-mismatch", detail: expect.stringContaining("effective-privilege") },
@@ -1267,6 +1659,45 @@ describe("runMigrationActivation: input validation, production defaults and the 
     const transfer = deps.createTransferRuntime(settings);
     await transfer.close();
     const failing = { query: async () => { throw new RangeError("no database"); } } as unknown as MigrationActivationTransferRuntime;
+    const signal = new AbortController().signal;
+    const roleExecutor = {
+      query: vi.fn(async () => ({
+        command: "SELECT",
+        rowCount: 1,
+        oid: 0,
+        fields: [],
+        rows: [{
+          current_user_name: "lcm_runtime",
+          session_user_name: "lcm_runtime",
+          role_oid: "101",
+          tls: true,
+        }],
+      })),
+    } as unknown as MigrationActivationTransferRuntime;
+    await expect(deps.readRoleIdentity(roleExecutor, signal)).resolves.toEqual({
+      currentUser: "lcm_runtime",
+      sessionUser: "lcm_runtime",
+      oid: "101",
+      tls: true,
+    });
+    expect(roleExecutor.query).toHaveBeenCalledWith(
+      expect.objectContaining({ text: expect.stringContaining("CURRENT_USER") }),
+      expect.objectContaining({
+        domain: "factory",
+        operation: "readMigrationActivationRoleIdentity",
+        signal,
+      }),
+    );
+    const missingRole = {
+      query: async () => ({ command: "SELECT", rowCount: 0, oid: 0, fields: [], rows: [] }),
+    } as unknown as MigrationActivationTransferRuntime;
+    await expect(deps.readRoleIdentity(missingRole)).resolves.toEqual({
+      currentUser: "",
+      sessionUser: "",
+      oid: "",
+      tls: false,
+    });
+    await expect(deps.verifyRuntimeSchema(failing, { expectedOwner: "lcm_migrator" })).rejects.toBeInstanceOf(Error);
     await expect(deps.verifyTransferSchema(failing, { expectedOwner: "lcm_migrator" })).rejects.toBeInstanceOf(Error);
     // S6/S15 reach checkMigrationTargetHealth itself (whose own default stays the runtime verifier; see target-health.test.ts).
     expect(deps.checkTargetHealth).toBe(checkMigrationTargetHealth);
@@ -1371,11 +1802,11 @@ describe("runMigrationActivation: the restart verdict observes without daemon se
 });
 
 describe("runMigrationActivation: applied / reportStored classifiers (amendment 2)", () => {
-  it("applied is no when no journal exists for a begun effect, unknown when the journal cannot be read, and unknown for a version-2 journal before config-published", async () => {
+  it("applied is unknown when no journal exists before any source witness or the journal cannot be read, and no for a prepared version-2 journal whose selection is unchanged", async () => {
     const f = await fixture();
     await stopAt(f, "after-prepare-begin");
     rmSync(backendPublicationJournalPath(f.homeDir));
-    expect(await f.run()).toMatchObject({ status: "interrupted", step: "S12", cause: "journal-unexpected", effectBegun: true, applied: "no" });
+    expect(await f.run()).toMatchObject({ status: "interrupted", step: "S12", cause: "journal-unexpected", effectBegun: true, applied: "unknown" });
     const g = await fixture();
     await stopAt(g, "after-drive");
     expect(await g.run({ readPublicationJournal: () => { throw new Error("journal read failed"); } })).toMatchObject({ status: "interrupted", step: "S12", cause: "journal-unexpected", effectBegun: true, applied: "unknown" });
@@ -1383,13 +1814,119 @@ describe("runMigrationActivation: applied / reportStored classifiers (amendment 
     await crashCoordinatorAt(h, "prepared");
     const row = [...h.guard.rows.values()][0]!;
     h.guard.rows.set(REMOTE, { ...row, releasedAt: "2026-10-16T13:00:00.000Z" });
-    expect(await h.run()).toMatchObject({ status: "interrupted", step: "S13b", cause: "lease-lost", applied: "unknown" });
+    expect(await h.run()).toMatchObject({ status: "interrupted", step: "S13b", cause: "lease-lost", applied: "no" });
   });
 
   it("a journal that cannot be read before any effect refuses maintenance-unresolvable", async () => {
     const f = await fixture();
     expect(await f.run({ readMaintenanceJournal: () => { throw new Error("journal read failed"); } })).toMatchObject({ status: "refused", step: "S0", reason: "maintenance-unresolvable", effectBegun: false });
     expect(f.manifestStore.read(GENERATION).phase).toBe("verified");
+  });
+
+  describe("amendment 2 readback of the live config and project map (#1617)", () => {
+    const unreadable: Partial<MigrationActivationDependencies> = { readReport: () => ({ state: "unresolvable", reason: "read-unresolvable", detail: "x" }) };
+    const EMPTY_SELECTION = { configSha256: createHash("sha256").update("{}").digest("hex"), projectMapSha256: backendPublicationCanonicalSha256({}) };
+
+    /** A settled-active re-entry reports a completed own journal and has no source witness in its context. */
+    async function settled(): Promise<Fixture> {
+      const f = await fixture();
+      await f.run();
+      return f;
+    }
+
+    /** A lease released after the selection binding: the v3 window is live and the artifact carries the source witness. */
+    async function beforePublication(): Promise<Fixture> {
+      const f = await fixture();
+      await expect(f.run({ crashPoint: (p) => { if (p === "after-selection-binding") throw new Error("boom"); } })).rejects.toThrow("boom");
+      const row = [...f.guard.rows.values()][0]!;
+      f.guard.rows.set(REMOTE, { ...row, releasedAt: "2026-10-16T13:00:00.000Z" });
+      return f;
+    }
+
+    const lease = { status: "interrupted", step: "S13b", cause: "lease-lost" } as const;
+
+    it("a completed journal is yes while the live selection equals the published witnesses and unknown when either digest disagrees", async () => {
+      const f = await settled();
+      expect(await f.run(unreadable)).toMatchObject({ applied: "yes" });
+      const live = f.deps.readSelectionDigests(f.homeDir);
+      expect(await f.run({ ...unreadable, readSelectionDigests: () => ({ ...live, configSha256: "0".repeat(64) }) })).toMatchObject({ applied: "unknown" });
+      expect(await f.run({ ...unreadable, readSelectionDigests: () => ({ ...live, projectMapSha256: "0".repeat(64) }) })).toMatchObject({ applied: "unknown" });
+    });
+
+    it("the selection restored out of band after a completed publication is unknown", async () => {
+      const f = await settled();
+      const published = f.deps.readSelectionDigests(f.homeDir);
+      writeFileSync(configPath(f.homeDir), JSON.stringify({ storage: { backend: "sqlite" }, daemon: { port: 4321 } }) + "\n", { mode: 0o600 });
+      expect(f.deps.readSelectionDigests(f.homeDir)).not.toEqual(published);
+      expect(await f.run(unreadable)).toMatchObject({ applied: "unknown" });
+    });
+
+    it("a journal in a yes phase without both published witnesses is unknown", async () => {
+      const f = await settled();
+      const read = f.deps.readPublicationJournal;
+      for (const lacking of [{ publishedConfigSha256: null }, { publishedProjectMapSha256: null }]) {
+        expect(await f.run({ ...unreadable, readPublicationJournal: (h) => { const j = read(h); return j === null ? null : { ...j, ...lacking }; } })).toMatchObject({ applied: "unknown" });
+      }
+    });
+
+    it("a failing selection readback is unknown", async () => {
+      const f = await settled();
+      expect(await f.run({ ...unreadable, readSelectionDigests: () => { throw new Error("readback failed"); } })).toMatchObject({ applied: "unknown" });
+    });
+
+    it("the in-flight phases are unknown even when the live selection equals the source", async () => {
+      const f = await settled();
+      const read = f.deps.readPublicationJournal;
+      const sourceSelection = (h: string) => { const j = read(h)!; return { configSha256: j.expectedConfigSha256, projectMapSha256: j.expectedProjectMapSha256 }; };
+      for (const phase of ["map-publishing", "map-published", "config-publishing"] as const) {
+        expect(await f.run({ ...unreadable, readPublicationJournal: (h) => ({ ...read(h)!, phase }), readSelectionDigests: sourceSelection })).toMatchObject({ applied: "unknown" });
+      }
+    });
+
+    it("the pre-publication and abort phases are no only when the live selection equals the expected witnesses", async () => {
+      const f = await settled();
+      const read = f.deps.readPublicationJournal;
+      const expected = (h: string) => { const j = read(h)!; return { configSha256: j.expectedConfigSha256, projectMapSha256: j.expectedProjectMapSha256 }; };
+      for (const phase of ["preparing", "prepared", "acquiring", "guarded", "aborting", "config-restoring", "map-restoring", "abort-releasing", "aborted"] as const) {
+        const at = { ...unreadable, readPublicationJournal: (h: string) => ({ ...read(h)!, phase }) };
+        expect(await f.run({ ...at, readSelectionDigests: expected })).toMatchObject({ applied: "no" });
+        expect(await f.run(at)).toMatchObject({ applied: "unknown" });
+      }
+    });
+
+    it("an absent or foreign journal without a source witness in the context is unknown", async () => {
+      const f = await settled();
+      const read = f.deps.readPublicationJournal;
+      expect(await f.run({ ...unreadable, readPublicationJournal: () => null })).toMatchObject({ applied: "unknown" });
+      expect(await f.run({ ...unreadable, readPublicationJournal: (h) => ({ ...read(h)!, publicationId: "other-pub" }) })).toMatchObject({ applied: "unknown" });
+    });
+
+    it("a live activation window is no only while the live selection equals the source witness", async () => {
+      const f = await beforePublication();
+      const live = f.deps.readSelectionDigests(f.homeDir);
+      expect(await f.run()).toMatchObject({ ...lease, applied: "no" });
+      expect(await f.run({ readSelectionDigests: () => ({ ...live, projectMapSha256: "0".repeat(64) }) })).toMatchObject({ ...lease, applied: "unknown" });
+      expect(await f.run({ readSelectionDigests: () => { throw new Error("readback failed"); } })).toMatchObject({ ...lease, applied: "unknown" });
+    });
+
+    it("an absent source config and project map hash as the empty documents", async () => {
+      const f = await beforePublication();
+      const read = f.deps.readArtifact;
+      const absent = (a: Parameters<typeof read>[0]) => { const r = read(a); return r === null ? null : { ...r, source: { config: { presence: "absent" as const }, projectMap: { presence: "absent" as const } } }; };
+      expect(await f.run({ readArtifact: absent, readSelectionDigests: () => EMPTY_SELECTION })).toMatchObject({ ...lease, applied: "no" });
+      expect(await f.run({ readArtifact: absent })).toMatchObject({ ...lease, applied: "unknown" });
+    });
+
+    it("a source project map that is not JSON is unknown", async () => {
+      const f = await beforePublication();
+      const read = f.deps.readArtifact;
+      const broken = (a: Parameters<typeof read>[0]) => {
+        const r = read(a);
+        if (r === null || r.source.projectMap.presence !== "present") return r;
+        return { ...r, source: { ...r.source, projectMap: { ...r.source.projectMap, content: Buffer.from("not json") } } };
+      };
+      expect(await f.run({ readArtifact: broken })).toMatchObject({ ...lease, applied: "unknown" });
+    });
   });
 
   it("reportStored before the report identity is known: unknown when the reader throws or is unresolvable or names an unattributed absence; no for an absent root", async () => {
@@ -1421,7 +1958,7 @@ describe("runMigrationActivation: verified-manifest lineage on re-entry without 
     const head = f.manifestStore.read(GENERATION);
     const previous = JSON.parse(readFileSync(revisionPath(f, head.revision - 1, head.previousManifestSha256!), "utf8")) as MigrationManifest;
     writeFileSync(revisionPath(f, previous.revision - 1, previous.previousManifestSha256!), "{not json\n", { mode: 0o600 });
-    expect(await f.run()).toMatchObject({ status: "interrupted", step: "S9", cause: "state-unresolvable", effectBegun: true, applied: "no" });
+    expect(await f.run()).toMatchObject({ status: "interrupted", step: "S9", cause: "state-unresolvable", effectBegun: true, applied: "unknown" });
     expect(f.manifestStore.read(GENERATION)).toMatchObject({ phase: "activating", pendingEffect: { kind: "publish-activation" } });
   });
 
@@ -1465,7 +2002,7 @@ describe("runMigrationActivation: step C sub-state rows", () => {
   it("a generation link naming another publication is interrupted link-conflict at S11", async () => {
     const f = await fixture();
     recordActivationGenerationLink({ homeDir: f.homeDir, generationId: GENERATION, publicationId: deriveActivationPublicationId("generation-9"), identityDigest: "0".repeat(64), epochManifestRevision: 8, epochManifestChecksumSha256: HASH_A });
-    expect(await f.run()).toMatchObject({ status: "interrupted", step: "S11", cause: "link-conflict", applied: "no" });
+    expect(await f.run()).toMatchObject({ status: "interrupted", step: "S11", cause: "link-conflict", applied: "unknown" });
   });
 
   it("a linked artifact that is absent or unresolvable is interrupted state-unresolvable at S11; a raw store error surfaces", async () => {
@@ -1521,8 +2058,7 @@ describe("runMigrationActivation: refusal rows reached only through injected che
   it("S5 refuses project-map-drift when the recomputed pre-publication witness differs from the report, and identity-drift when the ordinary identity differs", async () => {
     const f = await fixture();
     expect(await f.run({ computeProjectMapWitness: () => "0".repeat(64) })).toMatchObject({ status: "refused", step: "S5", reason: "project-map-drift" });
-    let calls = 0;
-    expect(await f.run({ captureDestinationIdentity: async () => ({ version: 1, sealedWitnessSha256: DEST_IDENTITY, systemIdentifier: calls++ < 1 ? SYSTEM_ID : "999" }) })).toMatchObject({ status: "refused", step: "S5", reason: "identity-drift" });
+    expect(await f.run({ captureDestinationIdentity: async () => ({ version: 1, sealedWitnessSha256: DEST_IDENTITY, systemIdentifier: "999" }) })).toMatchObject({ status: "refused", step: "S5", reason: "identity-drift" });
     await expect(f.run({ captureDestinationIdentity: async () => { throw new RangeError("raw"); } })).rejects.toBeInstanceOf(RangeError);
   });
 
@@ -1584,15 +2120,16 @@ describe("runMigrationActivation: S13b and S16 readback rows", () => {
     await crashCoordinatorAt(f, "prepared");
     const read = f.deps.readPublicationJournal;
     let reads = 0;
-    expect(await f.run({ readPublicationJournal: (h) => { if (++reads === 2) throw new Error("journal read failed"); return read(h); } })).toMatchObject({ status: "interrupted", step: "S13b", cause: "journal-unexpected", applied: "unknown" });
+    expect(await f.run({ readPublicationJournal: (h) => { if (++reads === 2) throw new Error("journal read failed"); return read(h); } })).toMatchObject({ status: "interrupted", step: "S13b", cause: "journal-unexpected", applied: "no" });
   });
 
   it("S16: the manifest re-read fails or is not this activation's publish-activation", async () => {
     const f = await fixture();
+    // Manifest reads: 1 is the pre-barrier absence probe, 2 is step C, 3 is the S16 re-read.
     await stopAt(f, "after-drive");
-    expect(await f.run({ manifestStore: countedStore(f, { readAt: [2, () => { throw new Error("re-read failed"); }] }) })).toMatchObject({ status: "interrupted", step: "S16", cause: "state-unresolvable", applied: "yes", reportStored: "no" });
-    expect(await f.run({ manifestStore: countedStore(f, { readAt: [2, (m) => ({ ...m, phase: "verified" as const })] }) })).toMatchObject({ status: "interrupted", step: "S16", cause: "readback-mismatch" });
-    expect(await f.run({ manifestStore: countedStore(f, { readAt: [2, (m) => ({ ...m, pendingEffect: { ...m.pendingEffect!, effectId: "publish-activation-other" } })] }) })).toMatchObject({ status: "interrupted", step: "S16", cause: "readback-mismatch" });
+    expect(await f.run({ manifestStore: countedStore(f, { readAt: [3, () => { throw new Error("re-read failed"); }] }) })).toMatchObject({ status: "interrupted", step: "S16", cause: "state-unresolvable", applied: "yes", reportStored: "no" });
+    expect(await f.run({ manifestStore: countedStore(f, { readAt: [3, (m) => ({ ...m, phase: "verified" as const })] }) })).toMatchObject({ status: "interrupted", step: "S16", cause: "readback-mismatch" });
+    expect(await f.run({ manifestStore: countedStore(f, { readAt: [3, (m) => ({ ...m, pendingEffect: { ...m.pendingEffect!, effectId: "publish-activation-other" } })] }) })).toMatchObject({ status: "interrupted", step: "S16", cause: "readback-mismatch" });
   });
 
   it("S16: the publication journal re-read fails or is not this publication's completed journal", async () => {
@@ -1943,7 +2480,7 @@ describe("runMigrationActivation: an S0-S8 re-check that fails on an effect-begu
     await stopAt(f, "after-prepare-begin");
     const outcome = await f.run({ enumerateStoredData: () => ({ status: "enumerated", projectHashes: [f.localProjectId, HASH_B] }) });
     expect(outcome).toMatchObject({
-      status: "interrupted", step: "S9", cause: "state-unresolvable", effectBegun: true, applied: "no", reportStored: "no",
+      status: "interrupted", step: "S9", cause: "state-unresolvable", effectBegun: true, applied: "unknown", reportStored: "no",
       identity: { generationId: GENERATION, publicationId: f.publicationId },
     });
     expect((outcome as { detail: string }).detail).toMatch(/^S4 uncovered-projects on roll-forward: /u);
@@ -2148,7 +2685,219 @@ describe("runMigrationActivation: S7 classifies target failures like S6 (PR #162
     expect(row(f).releasedAt).toBeNull();
     expectActivated(f, await f.run(), "prepare-activation-pending");
   });
+
+  const portableUnavailable = (cause: unknown) => new PortableStreamError("source-unavailable", { cause });
+  /**
+   * A captureDestinationIdentity that rejects on its nth call and otherwise answers the sealed identity. The ordinary
+   * runtime's probe runs first (#1607: before S0, attributed to S6), then S0's transfer query, then S7's.
+   */
+  const identityFailingAt = (f: Fixture, nth: number, error: unknown) => {
+    const answer = f.deps.captureDestinationIdentity;
+    let calls = 0;
+    return (...args: Parameters<typeof answer>) => (calls++ === nth ? Promise.reject(error) : answer(...args));
+  };
+
+  it.each([
+    ["a lost connection (SQLSTATE 08006)", pgError("08006"), "target-unresolvable", /^connection-failed: S7 census read was lost/u],
+    ["a refused privilege (SQLSTATE 42501)", pgError("42501"), "target-unhealthy", /^insufficient-privilege: S7 census read: /u],
+  ] as const)("the production census reader's PortableStreamError(source-unavailable) wrapping %s is unwrapped and refuses S7", async (_name, cause, reason, detail) => {
+    const f = await fixture();
+    const outcome = await f.run({ readDestinationCensus: async () => { throw portableUnavailable(cause); } });
+    expect(outcome).toMatchObject({ status: "refused", step: "S7", reason, effectBegun: false });
+    expect((outcome as { detail: string }).detail).toMatch(detail);
+    expect(row(f).releasedAt).not.toBeNull();
+  });
+
+  it("an effect-begun re-entry turns the unwrapped census failure into the roll-forward interruption and keeps the lease", async () => {
+    const f = await fixture();
+    await stopAt(f, "after-prepare-begin");
+    const outcome = await f.run({ readDestinationCensus: async () => { throw portableUnavailable(pgError("08006")); } });
+    expect(outcome).toMatchObject({ status: "interrupted", step: "S9", cause: "state-unresolvable", effectBegun: true, detail: expect.stringMatching(/^S7 target-unresolvable on roll-forward: connection-failed: /u) });
+    expect(row(f).releasedAt).toBeNull();
+    expectActivated(f, await f.run(), "prepare-activation-pending");
+  });
+
+  it("a PortableStreamError that is not source-unavailable, or has no storage cause, is not a target condition and is rethrown", async () => {
+    const f = await fixture();
+    await expect(f.run({ readDestinationCensus: async () => { throw new PortableStreamError("source-invalid"); } })).rejects.toMatchObject({ name: "PortableStreamError", code: "source-invalid" });
+    expect(row(f).releasedAt).not.toBeNull();
+    const g = await fixture();
+    await expect(g.run({ readDestinationCensus: async () => { throw portableUnavailable(new RangeError("raw cause")); } })).rejects.toMatchObject({ name: "PortableStreamError", code: "source-unavailable" });
+    const h = await fixture();
+    await expect(h.run({ readDestinationCensus: async () => { throw new PortableStreamError("source-unavailable"); } })).rejects.toMatchObject({ code: "source-unavailable" });
+  });
+
+  it("an aborted census read is a cancellation and rejects, even when the error carries a storage cause", async () => {
+    const f = await fixture();
+    await expect(f.run({ readDestinationCensus: async () => { throw new PortableStreamError("aborted", { cause: pgError("08006") }); } })).rejects.toMatchObject({ name: "PortableStreamError", code: "aborted" });
+    expect(row(f).releasedAt).not.toBeNull();
+    const g = await fixture();
+    await stopAt(g, "after-prepare-begin");
+    await expect(g.run({ readDestinationCensus: async () => { throw new PortableStreamError("aborted"); } })).rejects.toMatchObject({ code: "aborted" });
+    expect(row(g).releasedAt).toBeNull();
+  });
+
+  it.each([
+    ["S6", "a lost connection (SQLSTATE 08006)", 0, pgError("08006"), "target-unresolvable", /^connection-failed: S6 destination identity query was lost/u],
+    ["S6", "a refused privilege (SQLSTATE 42501)", 0, pgError("42501"), "target-unhealthy", /^insufficient-privilege: S6 destination identity query: /u],
+    ["S0", "a lost connection (SQLSTATE 08006)", 1, pgError("08006"), "target-unresolvable", /^connection-failed: S0 destination identity query was lost/u],
+    ["S0", "a refused privilege (SQLSTATE 42501)", 1, pgError("42501"), "target-unhealthy", /^insufficient-privilege: S0 destination identity query: /u],
+    ["S7", "a lost connection (SQLSTATE 08006)", 2, pgError("08006"), "target-unresolvable", /^connection-failed: S7 destination identity query was lost/u],
+    ["S7", "a refused privilege (SQLSTATE 42501)", 2, pgError("42501"), "target-unhealthy", /^insufficient-privilege: S7 destination identity query: /u],
+  ] as const)("the %s destination identity query failing with %s refuses that step and releases the pre-effect lease", async (step, _name, nth, error, reason, detail) => {
+    const f = await fixture();
+    const outcome = await f.run({ captureDestinationIdentity: identityFailingAt(f, nth, error) });
+    expect(outcome).toMatchObject({ status: "refused", step, reason, effectBegun: false });
+    expect((outcome as { detail: string }).detail).toMatch(detail);
+    // The ordinary probe and S0 both run before the S2 lease is written; S7 runs under it.
+    if (step === "S7") expect(row(f).releasedAt).not.toBeNull();
+    else expect(f.guard.calls).not.toContain("acquire");
+    expect(f.manifestStore.read(GENERATION).phase).toBe("verified");
+  });
+
+  it.each([
+    ["S6", 0],
+    ["S7", 2],
+  ] as const)("on an effect-begun re-entry the %s identity query failure is the roll-forward interruption and keeps the lease", async (step, nth) => {
+    const f = await fixture();
+    await stopAt(f, "after-prepare-begin");
+    const outcome = await f.run({ captureDestinationIdentity: identityFailingAt(f, nth, pgError("08006")) });
+    expect(outcome).toMatchObject({ status: "interrupted", step: "S9", cause: "state-unresolvable", effectBegun: true, detail: expect.stringMatching(new RegExp("^" + step + " target-unresolvable on roll-forward: connection-failed: " + step + " destination identity query was lost", "u")) });
+    expect(row(f).releasedAt).toBeNull();
+    expectActivated(f, await f.run(), "prepare-activation-pending");
+  });
+
+  it("an identity query failing with a wrapped storage error is attributed, and with an unknown or aborted error is rethrown", async () => {
+    const f = await fixture();
+    expect(await f.run({ captureDestinationIdentity: identityFailingAt(f, 2, portableUnavailable(pgError("42501"))) })).toMatchObject({ status: "refused", step: "S7", reason: "target-unhealthy" });
+    const g = await fixture();
+    await expect(g.run({ captureDestinationIdentity: identityFailingAt(g, 2, new RangeError("raw")) })).rejects.toBeInstanceOf(RangeError);
+    expect(row(g).releasedAt).not.toBeNull();
+    const h = await fixture();
+    await expect(h.run({ captureDestinationIdentity: identityFailingAt(h, 2, new PortableStreamError("aborted")) })).rejects.toMatchObject({ code: "aborted" });
+  });
 });
+
+describe("runMigrationActivation: classification before initialization (#1618)", () => {
+  const scratchEntries = (f: Fixture) => readdirSync(lcmHomeDir(f.homeDir)).filter((name) => name.startsWith("activation-scratch-"));
+  const row = (f: Fixture) => f.guard.rows.get(REMOTE)!;
+
+  it("production dependencies on a home without .lcm, or without the home itself, refuse manifest-absent and create nothing", async () => {
+    const f = await fixture();
+    const parent = mkdtempSync(join(tmpdir(), "lcm-activate-generation-uninitialized-"));
+    roots.push(parent);
+    const bare = join(parent, "bare");
+    mkdirSync(bare, { mode: 0o700 });
+    const missing = join(parent, "missing");
+    for (const homeDir of [bare, missing]) {
+      const outcome = await runMigrationActivation({ ...f.input, homeDir });
+      expect(outcome).toEqual({ status: "refused", step: "S0", reason: "manifest-absent", detail: expect.stringContaining(GENERATION), effectBegun: false });
+    }
+    expect(readdirSync(bare)).toEqual([]);
+    expect(existsSync(missing)).toBe(false);
+  });
+
+  it("a manifest that vanishes between the pre-barrier probe and step C is still the S0 manifest-absent refusal", async () => {
+    const f = await fixture();
+    const vanished = countedStore(f, { readAt: [2, () => { throw new MigrationProtocolError("unexpected-state", "migration manifest head is absent"); }] });
+    expect(await f.run({ manifestStore: vanished })).toMatchObject({ status: "refused", step: "S0", reason: "manifest-absent", effectBegun: false });
+  });
+
+  it("an unregistered, pending or unreadable machine identity refuses S0 state-unresolvable before any runtime opens; other errors rethrow", async () => {
+    const f = await fixture();
+    const createOrdinaryRuntime = vi.fn(f.deps.createOrdinaryRuntime);
+    const failures: Array<[unknown, RegExp]> = [
+      [new MachineIdentityFileError("machine identity is not registered", "Run lcm machine register"), /not registered/u],
+      [Object.assign(new Error("EACCES: permission denied"), { code: "EACCES" }), /EACCES/u],
+    ];
+    for (const [error, detail] of failures) {
+      const outcome = await f.run({ createOrdinaryRuntime, machineId: () => { throw error; } });
+      expect(outcome).toMatchObject({ status: "refused", step: "S0", reason: "state-unresolvable", effectBegun: false });
+      expect((outcome as { detail: string }).detail).toMatch(detail);
+    }
+    expect(createOrdinaryRuntime).not.toHaveBeenCalled();
+    expect(f.guard.rows.size).toBe(0);
+    expect(f.manifestStore.read(GENERATION).phase).toBe("verified");
+    await expect(f.run({ machineId: () => { throw new RangeError("not a file error"); } })).rejects.toBeInstanceOf(RangeError);
+    await expect(f.run({ machineId: () => { throw "not an error"; } })).rejects.toBe("not an error");
+  });
+
+  it("the production identity read maps an unregistered identity the same way", async () => {
+    const f = await fixture();
+    rmSync(join(lcmHomeDir(f.homeDir), "machine.json"));
+    const outcome = await f.run({ machineId: createMigrationActivationDependencies({ homeDir: f.homeDir }).machineId });
+    expect(outcome).toMatchObject({ status: "refused", step: "S0", reason: "state-unresolvable", detail: expect.stringMatching(/machine identity is not registered/u) });
+  });
+
+  it("an identity failure on an effect-begun re-entry is the roll-forward interruption", async () => {
+    const f = await fixture();
+    await stopAt(f, "after-prepare-begin");
+    const outcome = await f.run({ machineId: () => { throw new MachineIdentityFileError("machine registration is pending", "Run lcm machine register"); } });
+    expect(outcome).toMatchObject({ status: "interrupted", step: "S9", cause: "state-unresolvable", effectBegun: true, detail: expect.stringMatching(/^S0 state-unresolvable on roll-forward: .*registration is pending/u) });
+    expectActivated(f, await f.run(), "prepare-activation-pending");
+  });
+
+  it("the settled-active path does not need the machine identity", async () => {
+    const f = await fixture();
+    expectActivated(f, await f.run(), "fresh");
+    const second = await f.run({ machineId: () => { throw new Error("must not read the identity"); } });
+    expect(second).toMatchObject({ status: "activated", resumedFrom: "settled-active" });
+  });
+
+  it("an ordinary refusal before S7 never allocates the census scratch directory", async () => {
+    const f = await fixture({ held: false });
+    const allocateScratch = vi.fn(f.deps.allocateScratch);
+    expect(await f.run({ allocateScratch })).toMatchObject({ status: "refused", step: "S3", reason: "maintenance-not-held" });
+    expect(allocateScratch).not.toHaveBeenCalled();
+    expect(scratchEntries(f)).toEqual([]);
+  });
+
+  it("S7 allocates its scratch directory immediately before the census read and removes it on success and on census failure", async () => {
+    const f = await fixture();
+    const allocated: string[] = [];
+    const seen: boolean[] = [];
+    const allocateScratch = (home: string) => { const dir = f.deps.allocateScratch(home); allocated.push(dir); return dir; };
+    const readDestinationCensus: typeof f.deps.readDestinationCensus = async (session, input) => {
+      seen.push(input.scratchParent === allocated[0] && existsSync(input.scratchParent) && scratchEntries(f).length === 1);
+      return f.deps.readDestinationCensus(session, input);
+    };
+    expectActivated(f, await f.run({ allocateScratch, readDestinationCensus }), "fresh");
+    expect(seen).toEqual([true]);
+    expect(allocated).toHaveLength(1);
+    expect(existsSync(allocated[0]!)).toBe(false);
+    expect(scratchEntries(f)).toEqual([]);
+
+    const g = await fixture();
+    const dirs: string[] = [];
+    const failed = await g.run({
+      allocateScratch: (home) => { const dir = g.deps.allocateScratch(home); dirs.push(dir); return dir; },
+      readDestinationCensus: async () => { throw new StorageOperationError("STORAGE_CLOSED", "postgresql", undefined, "factory", "census"); },
+    });
+    expect(failed).toMatchObject({ status: "refused", step: "S7", reason: "target-unresolvable" });
+    expect(dirs).toHaveLength(1);
+    expect(existsSync(dirs[0]!)).toBe(false);
+    expect(scratchEntries(g)).toEqual([]);
+  });
+
+  it("a scratch allocation failure refuses S7 state-unresolvable without reading the census, releasing the lease; on re-entry it interrupts and keeps it", async () => {
+    const f = await fixture();
+    const readDestinationCensus = vi.fn(f.deps.readDestinationCensus);
+    const allocateScratch = () => { throw Object.assign(new Error("EACCES: scratch"), { code: "EACCES" }); };
+    const outcome = await f.run({ allocateScratch, readDestinationCensus });
+    expect(outcome).toMatchObject({ status: "refused", step: "S7", reason: "state-unresolvable", effectBegun: false, detail: expect.stringMatching(/scratch directory could not be allocated: EACCES: scratch/u) });
+    expect(readDestinationCensus).not.toHaveBeenCalled();
+    expect(row(f).releasedAt).not.toBeNull();
+    expect(f.manifestStore.read(GENERATION).phase).toBe("verified");
+
+    const g = await fixture();
+    await stopAt(g, "after-prepare-begin");
+    const resumed = await g.run({ allocateScratch });
+    expect(resumed).toMatchObject({ status: "interrupted", step: "S9", cause: "state-unresolvable", effectBegun: true, detail: expect.stringMatching(/^S7 state-unresolvable on roll-forward: /u) });
+    expect(row(g).releasedAt).toBeNull();
+    expectActivated(g, await g.run(), "prepare-activation-pending");
+  });
+});
+
 
 describe("runMigrationActivation: the release tail and the abort family are driven without an own fence (PR #1628 review)", () => {
   const row = (f: Fixture) => f.guard.rows.get(REMOTE);
@@ -2223,23 +2972,93 @@ describe("runMigrationActivation: the release tail and the abort family are driv
     expect(row(f)).toEqual(successor);
   });
 
-  it("a fence of another publication or evidence digest stays lease-lost at releasing; an unattributable read is lease-unresolvable", async () => {
+  /** The fence the journal recorded before the crash, then the remote release and a successor's acquisition of the released row. */
+  const releasedThenSuccessor = async (f: Fixture, phase: string, overrides: Partial<PostgreSqlBackendPublicationFence> = {}) => {
+    await crashCoordinatorAt(f, phase);
+    const persisted = readBackendPublicationJournal(f.homeDir)!.projects[0]!.fence!;
+    foreignRow(f, overrides);
+    return { persisted, successor: { ...row(f)! }, mutations: f.guard.calls.filter((c) => c !== "read").length };
+  };
+
+  it("crash at releasing with a successor publication's row present (Bug #1651): the coordinator proves the release and finishes without touching that row", async () => {
     const f = await fixture();
-    await crashCoordinatorAt(f, "releasing");
-    foreignRow(f);
-    expect(await f.run()).toMatchObject({ status: "interrupted", step: "S13b", cause: "lease-lost", effectBegun: true, detail: "the fenced lease row names another publication" });
-    foreignRow(f, { publicationId: f.publicationId, evidenceSha256: "d".repeat(64) });
-    expect(await f.run()).toMatchObject({ status: "interrupted", step: "S13b", cause: "lease-lost", detail: expect.stringContaining("does not match the expected") });
-    f.guard.read = async (input) => { throw new PostgreSqlStorageOperationError("STORAGE_OPERATION_FAILED", { domain: "factory", operation: "read" }, "08006", true); };
+    const { persisted, successor, mutations } = await releasedThenSuccessor(f, "releasing");
+    expect(successor.fencingToken > BigInt(persisted.fencingToken)).toBe(true);
+    const outcome = await f.run();
+    expectActivated(f, outcome, "publication-journal");
+    expect(f.guard.calls.filter((c) => c !== "read")).toHaveLength(mutations);
+    expect(row(f)).toEqual(successor);
+    const journal = readBackendPublicationJournal(f.homeDir)!;
+    expect(journal.phase).toBe("completed");
+    // The successor's fence is never journalled; the persisted one is marked released.
+    expect(journal.projects[0]!.fence).toEqual({ ...persisted, releasedAt: successor.acquiredAt });
+  });
+
+  it("crash at releasing with a successor of another evidence digest or machine present (Bug #1651): the same proof applies", async () => {
+    for (const overrides of [{ publicationId: "x", evidenceSha256: "d".repeat(64) }, { machineId: "018f0b5d-ffff-7abc-8def-1234567890ab", publicationId: "x" }] as const) {
+      const f = await fixture();
+      const { successor, mutations } = await releasedThenSuccessor(f, "releasing", overrides);
+      expectActivated(f, await f.run(), "publication-journal");
+      expect(f.guard.calls.filter((c) => c !== "read")).toHaveLength(mutations);
+      expect(row(f)).toEqual(successor);
+    }
+  });
+
+  it("at releasing a successor that is not provably later, an unproven guard, a corrupt row and an unattributable read all fail closed", async () => {
+    // A foreign row whose token does not exceed the journalled fence proves nothing: the coordinator refuses.
+    const lower = await fixture();
+    const first = await releasedThenSuccessor(lower, "releasing", { fencingToken: 1n });
+    expect(BigInt(first.persisted.fencingToken) >= 1n).toBe(true);
+    await expect(lower.run()).rejects.toThrow(/remote fence identity does not match/);
+    expect(readBackendPublicationJournal(lower.homeDir)?.phase).toBe("releasing");
+    expect(row(lower)).toEqual(first.successor);
+
+    // A guard that does not declare the reconciliation read keeps today's failure.
+    const unproven = await fixture();
+    const second = await releasedThenSuccessor(unproven, "releasing");
+    (unproven.guard as { readForReleaseReconciliation?: unknown }).readForReleaseReconciliation = undefined;
+    await expect(unproven.run()).rejects.toThrow();
+    expect(readBackendPublicationJournal(unproven.homeDir)?.phase).toBe("releasing");
+    expect(row(unproven)).toEqual(second.successor);
+
+    // A corrupt or ambiguous row is not admitted and never reaches the drive.
+    const f = await fixture();
+    await releasedThenSuccessor(f, "releasing");
+    const read = f.guard.read.bind(f.guard);
+    f.guard.read = async () => { throw new PostgreSqlBackendPublicationGuardError(REMOTE, "read", "invalid-row"); };
+    expect(await f.run()).toMatchObject({ status: "interrupted", step: "S13b", cause: "lease-lost", effectBegun: true, detail: expect.stringContaining("corrupt or ambiguous") });
+    // An unattributable read is lease-unresolvable.
+    f.guard.read = async () => { throw new PostgreSqlStorageOperationError("STORAGE_OPERATION_FAILED", { domain: "factory", operation: "read" }, "08006", true); };
     expect(await f.run()).toMatchObject({ status: "interrupted", step: "S13b", cause: "lease-unresolvable" });
+    f.guard.read = read;
     expect(readBackendPublicationJournal(f.homeDir)?.phase).toBe("releasing");
   });
+
+  it("crash at abort-releasing with a successor publication's row present (Bug #1651): the retry finishes the abort without touching that row", async () => {
+    const f = await fixture();
+    await crashCoordinatorAt(f, "prepared");
+    let crashed = false;
+    const crashing = f.coordinator((event) => {
+      if (crashed || event !== "after-journal-write") return;
+      if (readBackendPublicationJournal(f.homeDir)?.phase === "abort-releasing") { crashed = true; throw new Error("injected coordinator crash at abort-releasing"); }
+    });
+    await expect(crashing.abort()).rejects.toThrow("injected coordinator crash at abort-releasing");
+    foreignRow(f);
+    const successor = { ...row(f)! };
+    const mutations = f.guard.calls.filter((c) => c !== "read").length;
+    expect(await f.run()).toMatchObject({ status: "publication-failed", publication: { status: "aborted", dispatch: "abort-completion" } });
+    expect(readBackendPublicationJournal(f.homeDir)?.phase).toBe("aborted");
+    expect(f.guard.calls.filter((c) => c !== "read")).toHaveLength(mutations);
+    expect(row(f)).toEqual(successor);
+  });
+
   it("the abort family is handled like the release tail: an absent own fence at abort-releasing reaches the drive without a lease continuation", async () => {
     const f = await fixture();
     await crashCoordinatorAt(f, "prepared");
     f.guard.rows.delete(REMOTE);
     const read = f.deps.readPublicationJournal;
-    const unwinding = (h: string) => { const j = read(h); return j === null ? null : { ...j, phase: "abort-releasing" as const }; };
+    const unwindingAt = (phase: "abort-releasing" | "aborting") => (h: string) => { const j = read(h); return j === null ? null : { ...j, phase }; };
+    const unwinding = unwindingAt("abort-releasing");
     const renews = f.guard.calls.filter((c) => c === "renew").length;
     const outcome = await f.run({
       readPublicationJournal: unwinding,
@@ -2247,9 +3066,9 @@ describe("runMigrationActivation: the release tail and the abort family are driv
     });
     expect(outcome).toMatchObject({ status: "publication-failed", publication: { status: "aborted", dispatch: "abort-completion" } });
     expect(f.guard.calls.filter((c) => c === "renew")).toHaveLength(renews);
-    // A foreign row in the same phase is still a lost lease.
+    // A foreign row before the release window (aborting) is still a lost lease.
     foreignRow(f);
-    expect(await f.run({ readPublicationJournal: unwinding })).toMatchObject({ status: "interrupted", step: "S13b", cause: "lease-lost" });
+    expect(await f.run({ readPublicationJournal: unwindingAt("aborting") })).toMatchObject({ status: "interrupted", step: "S13b", cause: "lease-lost" });
     // Outside those phases (prepared), an absent row is still a lost lease.
     f.guard.rows.delete(REMOTE);
     expect(await f.run()).toMatchObject({ status: "interrupted", step: "S13b", cause: "lease-lost", detail: "no fenced lease row exists for this generation" });

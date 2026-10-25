@@ -2415,6 +2415,57 @@ describe("runCli orchestration actions", () => {
     expect((await invoke(args))?.message).toBe("exit:0");
   });
 
+  it.each([
+    [["restore", "--client", "codex"]],
+    [["session-end", "--client", "codex"]],
+    [["user-prompt", "--client", "codex"]],
+    [["post-tool", "--client", "codex"]],
+    [["pre-tool", "--client", "codex"]],
+    [["session-snapshot", "--client", "codex"]],
+    [["compact", "--hook", "--client", "codex"]],
+  ] as const)("exits from hook action %j only after its output has been flushed", async (args) => {
+    fakeStdin.isTTY = false;
+    fakeStdin.on.mockImplementation((event: string, callback: (chunk?: Buffer) => void) => {
+      if (event === "data") queueMicrotask(() => callback(Buffer.from('{"session_id":"one"}')));
+      if (event === "end") queueMicrotask(() => callback());
+      return fakeStdin;
+    });
+    state.dispatchHook.mockResolvedValueOnce({ stdout: "x".repeat(21579), exitCode: 3 });
+    let flushed: ((error?: Error | null) => void) | undefined;
+    const write = vi.spyOn(process.stdout, "write").mockImplementation(((_chunk: unknown, callback?: unknown) => {
+      flushed = callback as (error?: Error | null) => void;
+      return true;
+    }) as typeof process.stdout.write);
+
+    const outcome = invoke([...args]);
+    await vi.waitFor(() => expect(write).toHaveBeenCalledOnce());
+    await new Promise<void>(resolve => setImmediate(resolve));
+    expect(write.mock.calls[0]?.[0]).toBe("x".repeat(21579));
+    expect(state.exit).not.toHaveBeenCalled();
+
+    flushed?.();
+    expect((await outcome)?.message).toBe("exit:3");
+  });
+
+  it("keeps the hook exit code when its output cannot be delivered", async () => {
+    fakeStdin.isTTY = false;
+    fakeStdin.on.mockImplementation((event: string, callback: (chunk?: Buffer) => void) => {
+      if (event === "data") queueMicrotask(() => callback(Buffer.from('{"session_id":"one"}')));
+      if (event === "end") queueMicrotask(() => callback());
+      return fakeStdin;
+    });
+    state.dispatchHook.mockResolvedValueOnce({ stdout: "hook-output", exitCode: 2 });
+    const failure = Object.assign(new Error("write EPIPE"), { code: "EPIPE" });
+    vi.spyOn(process.stdout, "write").mockImplementation(((_chunk: unknown, callback?: unknown) => {
+      (callback as (error?: Error | null) => void)(failure);
+      process.nextTick(() => process.stdout.emit("error", failure));
+      return false;
+    }) as typeof process.stdout.write);
+
+    expect((await invoke(["restore", "--client", "codex"]))?.message).toBe("exit:2");
+    expect(process.stdout.listenerCount("error")).toBe(0);
+  });
+
   it("runs the hidden --terminal snapshot through its own entry and always exits 0 with no output", async () => {
     const write = vi.spyOn(process.stdout, "write");
     state.dispatchHook.mockClear();

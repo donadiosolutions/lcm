@@ -258,7 +258,7 @@ export async function readActivationLeaseFence(
 export type ActivationLeaseFenceResolution =
   | Readonly<{ kind: "present"; fence: ActivationLeaseFence }>
   | Readonly<{ kind: "absent"; detail: string }>
-  | Readonly<{ kind: "identity-mismatch"; detail: string }>
+  | Readonly<{ kind: "identity-mismatch"; detail: string; corrupt?: true }>
   | Readonly<{ kind: "unresolvable"; detail: string }>;
 
 /**
@@ -318,6 +318,7 @@ export async function resolveActivationLeaseFence(
         kind: "identity-mismatch",
         detail: `the fenced-lease row for project ${input.projectId} is corrupt or ambiguous and cannot be `
           + "trusted as the expected generation's fence",
+        corrupt: true,
       };
     }
     throw error;
@@ -366,6 +367,13 @@ export async function acquireActivationLease(
           status: "unresolvable",
           detail: `the acquire commit outcome for project ${input.projectId} is ambiguous and readback did `
             + "not confirm it",
+        };
+      }
+      if (error.reason === "invalid-row") {
+        return {
+          status: "unresolvable",
+          detail: "the fenced-lease row for project " + input.projectId + " is corrupt or ambiguous and cannot be "
+            + "attributed to any publication generation",
         };
       }
     }
@@ -587,6 +595,13 @@ export async function takeoverActivationLease(
           status: "unresolvable",
           detail: `the takeover commit outcome for project ${input.projectId} is ambiguous and readback did `
             + "not confirm it",
+        };
+      }
+      if (error.reason === "invalid-row") {
+        return {
+          status: "unresolvable",
+          detail: "the fenced-lease row for project " + input.projectId + " is corrupt or ambiguous and cannot be "
+            + "attributed to any publication generation",
         };
       }
     }
