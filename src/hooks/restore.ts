@@ -192,8 +192,9 @@ const TRANSCRIPT_PROOF_SOURCES: readonly unknown[] = ["resume", "fork", "compact
 
 /**
  * Codex prints a leading marker so later sessions can recognize the block in
- * their rollout. A resumed, forked or compacted session whose own rollout
- * already holds a live restoration prints nothing.
+ * their rollout. A resumed, forked or compacted session whose own rollout, or
+ * the parent history a referenced fork points to, already holds a live
+ * restoration prints nothing.
  */
 function codexRestorationOutput(input: RestoreHookInput, stdout: string): string {
   if (!stdout) return "";

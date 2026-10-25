@@ -759,11 +759,8 @@ function resolveHistorySegments(
     if (parent === undefined) break;
     owned.push(parent);
     const key = `${parent.dev}:${parent.ino}`;
-    const parentRead = readHistoryBase(parent);
-    if (
-      seenFiles.has(key) || endByte > parent.size || parentRead.kind === "headless"
-      || readCutoffOrdinal(parent, endByte) !== endOrdinal - 1
-    ) break;
+    const parentRead = validateAncestor(parent, endByte, endOrdinal, seenFiles.has(key));
+    if (parentRead === undefined) break;
     seenFiles.add(key);
     keep(parent, endByte);
     read = parentRead;
@@ -771,20 +768,57 @@ function resolveHistorySegments(
   return segments;
 }
 
-/** Scan the segments oldest to newest, carrying the live state between them. */
-function scanHistorySegments(segments: readonly HistorySegment[]): boolean {
-  let live = false;
-  for (const segment of segments) {
-    const length = segment.endByte - segment.start;
-    const buffer = Buffer.alloc(length);
-    const read = readSync(segment.file.fd, buffer, 0, length, segment.start);
-    let raw = buffer.subarray(0, read).toString("utf8");
-    if (segment.start > 0) {
-      const newline = raw.indexOf("\n");
-      raw = newline === -1 ? "" : raw.slice(newline + 1);
-    }
-    live = scanLiveCodexRestoration(raw, live);
+/**
+ * The history_base of an ancestor whose recorded cutoff holds, or undefined
+ * when the link fails: a repeated file, a cutoff past the end, a rollout
+ * without a session_meta, a last record before the cutoff that does not carry
+ * the ordinal just before end_ordinal_exclusive, or a read error. A failed
+ * link only ends the walk; the newer history already kept still counts.
+ */
+function validateAncestor(
+  parent: OpenRollout,
+  endByte: number,
+  endOrdinal: number,
+  repeated: boolean,
+): HistoryBaseRead | undefined {
+  try {
+    if (repeated || endByte > parent.size) return undefined;
+    const parentRead = readHistoryBase(parent);
+    if (parentRead.kind === "headless" || readCutoffOrdinal(parent, endByte) !== endOrdinal - 1) return undefined;
+    return parentRead;
+  } catch {
+    return undefined;
   }
+}
+
+/** The complete records of a segment; a clipped start drops its first partial line. */
+function readSegmentText(segment: HistorySegment): string {
+  const length = segment.endByte - segment.start;
+  const buffer = Buffer.alloc(length);
+  const read = readSync(segment.file.fd, buffer, 0, length, segment.start);
+  const raw = buffer.subarray(0, read).toString("utf8");
+  if (segment.start === 0) return raw;
+  const newline = raw.indexOf("\n");
+  return newline === -1 ? "" : raw.slice(newline + 1);
+}
+
+/**
+ * Scan the segments oldest to newest, carrying the live state between them.
+ * The rollout's own (newest) segment is read first and its read error
+ * propagates. An ancestor that cannot be read ends the walk like any failed
+ * link: the history older than the segments read so far is a gap.
+ */
+function scanHistorySegments(segments: readonly HistorySegment[]): boolean {
+  const texts: string[] = [readSegmentText(segments[segments.length - 1] as HistorySegment)];
+  try {
+    for (let index = segments.length - 2; index >= 0; index -= 1) {
+      texts.unshift(readSegmentText(segments[index] as HistorySegment));
+    }
+  } catch {
+    // Keep the newer segments already read.
+  }
+  let live = false;
+  for (const text of texts) live = scanLiveCodexRestoration(text, live);
   return live;
 }
 
@@ -828,7 +862,6 @@ export function readLiveCodexRestoration(
     for (const file of owned) closeSync(file.fd);
   }
 }
-
 
 // ---------------------------------------------------------------------------
 // Session discovery

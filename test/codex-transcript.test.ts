@@ -1191,18 +1191,38 @@ const forkAll = (home: string, id: number, parent: RolloutFixture, own: Array<Re
   writeFork(home, id, parent, parent.offsets.length, own);
 
 describe("readLiveCodexRestoration for referenced forks", () => {
-  it("gives no proof when reading the history fails", () => {
+  it("treats a read error on an ancestor as a failed link and one on the fork's own file as no proof", () => {
     const home = makeTmpDir();
-    const parent = writeRollout(home, { rolloutId: uuid(1), items: [metaItem(uuid(1)), markerItem] });
-    const fork = forkAll(home, 2, parent, []);
-    expect(liveIn(home, fork)).toBe(true);
-    fsSeam.beforeRead = () => {
-      throw new Error("EIO");
+    const marked = writeRollout(home, { rolloutId: uuid(1), items: [metaItem(uuid(1)), markerItem] });
+    const bare = writeRollout(home, { rolloutId: uuid(2), items: [metaItem(uuid(2)), fillerItem()] });
+    const inherited = forkAll(home, 3, marked, [fillerItem()]);
+    const own = forkAll(home, 4, bare, [markerItem]);
+    expect(liveIn(home, inherited)).toBe(true);
+    expect(liveIn(home, own)).toBe(true);
+
+    // Reads in order: the fork's head, the parent's head, the parent's cutoff record,
+    // the fork's records, the parent's records.
+    const failingRead = (fork: RolloutFixture, failing: number): boolean => {
+      let reads = 0;
+      fsSeam.beforeRead = () => {
+        reads += 1;
+        if (reads === failing) throw new Error("EIO");
+      };
+      try {
+        return liveIn(home, fork);
+      } finally {
+        fsSeam.beforeRead = undefined;
+      }
     };
-    try {
-      expect(liveIn(home, fork)).toBe(false);
-    } finally {
-      fsSeam.beforeRead = undefined;
+    // The fork's own head or records cannot be read: no proof.
+    for (const failing of [1, 4]) {
+      expect(failingRead(inherited, failing)).toBe(false);
+      expect(failingRead(own, failing)).toBe(false);
+    }
+    // An ancestor cannot be read: the fork's own marker still proves, an inherited one does not.
+    for (const failing of [2, 3, 5]) {
+      expect(failingRead(inherited, failing)).toBe(false);
+      expect(failingRead(own, failing)).toBe(true);
     }
   });
 
@@ -1455,7 +1475,7 @@ describe("readLiveCodexRestoration for referenced forks", () => {
     expect(liveIn(home, writeFork(home, 37, parent, 1, []))).toBe(false);
   });
 
-  it("validates an ancestor's last record when it spans several read chunks", () => {
+  it("keeps the validated parent prefix when the grandparent link fails", () => {
     const home = makeTmpDir();
     const grandparent = writeRollout(home, { rolloutId: uuid(1), items: [metaItem(uuid(1)), markerItem] });
     const parent = forkAll(home, 2, grandparent, [markerItem]);
@@ -1593,4 +1613,3 @@ describe("readLiveCodexRestoration for referenced forks", () => {
     expect(liveIn(home, plain, { maxBytes: 0 })).toBe(false);
   });
 });
-

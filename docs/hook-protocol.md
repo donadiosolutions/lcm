@@ -164,7 +164,8 @@ Codex runs the hook for the sources `startup`, `resume`, `clear`, `compact`, and
   `$CODEX_HOME/archived_sessions`, default `~/.codex`) holds a developer message
   starting with the marker line after the last `compacted` record and the last
   `thread_rolled_back` event. A line that is not valid JSON counts as a reset.
-  Only the newest 64 MiB of the history is read; any read failure prints.
+  Only the newest 64 MiB of the history is read; a failure to read the
+  session's own rollout prints.
 - A referenced (paginated-history) fork holds a pointer instead of a copy:
   its first record is a `session_meta` whose `history_base` names the parent
   rollout (`thread_id`, a rollout id), `end_ordinal_exclusive` and
@@ -193,8 +194,9 @@ Codex runs the hook for the sources `startup`, `resume`, `clear`, `compact`, and
 Limits: referenced forks whose parent history cannot be found or checked (see
 above, including a parent that exists only compressed), rollouts outside
 `$CODEX_HOME`, unreadable rollouts, and restorations from earlier LCM versions
-print a fresh restoration, which can duplicate an existing one; restorations carried only inside compaction
-replacement history are not detected; and if Codex fails to write the
+print a fresh restoration, which can duplicate an existing one;
+restorations carried only inside compaction replacement history are not
+detected; and if Codex fails to write the
 compaction record (or other history) to its rollout, the post-compaction hook can
 see the pre-compaction restoration and skip, and the live continuation can lack
 restored memory while those write failures persist.

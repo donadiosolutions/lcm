@@ -444,9 +444,12 @@ Known limits:
   `archived_sessions/` (up to four files in a chain) and deduplicates against the
   restoration found there. A parent that is missing, ambiguous, a symlink, only
   available compressed (`.jsonl.zst`), unreadable or inconsistent with the fork's
-  recorded cutoff is not used, and the fork then prints a fresh restoration
-  (one duplicate block). Referenced-fork deduplication is verified with unit
-  fixtures; the native app-server fixture was not rerun for it.
+  recorded cutoff is not used, and a restoration older than that parent is
+  unknown, so the fork prints a fresh restoration (one duplicate block) unless
+  a marker in the history already checked proves it. Looking a parent up visits
+  at most 20,000 directory entries, so a larger session store has the same
+  effect. Referenced-fork deduplication is verified with unit fixtures; the
+  native app-server fixture was not rerun for it.
 - Rollouts outside `$CODEX_HOME`, unreadable rollouts, and restorations printed
   by earlier LCM versions (no marker line) print a fresh restoration, which can
   duplicate an existing one once per event.
