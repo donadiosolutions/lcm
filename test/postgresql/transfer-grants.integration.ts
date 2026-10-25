@@ -93,6 +93,17 @@ describe("PostgreSQL 18 canonical transfer grants", () => {
             .rejects.toMatchObject({ code: "STORAGE_OPERATION_FAILED", sqlState: "42501" });
         }
 
+        // A role provisioned before the message_parts column grants keeps
+        // table-level SELECT, so transfer readiness must still admit it.
+        await administrator.query({
+          text: "REVOKE SELECT (project_id, conversation_id, message_id, part_type) ON lcm.message_parts FROM lcm_test_runtime",
+        }, queryOptions);
+        await expect(verifyPostgreSqlTransferSchema(database.runtime, options))
+          .resolves.toMatchObject({ runtimeRole: "lcm_test_runtime" });
+        await applyGrantScript(administrator, "postgresql-runtime-transcript-grants.sql");
+        await expect(verifyPostgreSqlTransferSchema(database.runtime, options))
+          .resolves.toMatchObject({ runtimeRole: "lcm_test_runtime" });
+
         await administrator.query({
           text: "REVOKE UPDATE (checkpoint_sha256) ON lcm.transfer_runs FROM lcm_test_runtime",
         }, queryOptions);

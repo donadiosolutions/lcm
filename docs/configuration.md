@@ -1218,7 +1218,14 @@ health response.
 Diagnostic commands `lcm doctor`, `lcm status`, and `lcm stats --pool` instead use
 internal `GET /health/observe`. It requires the daemon bearer token, including
 refusing tokenless embedded servers with `401`, and remains subject to the
-normal configuration, publication, and shutdown admission checks. Its HTTP 200
+normal configuration, publication, and shutdown admission checks, except that it
+still answers when the daemon's startup backend differs from the backend now
+selected on disk (for example after a migration cutover), so the stale daemon
+stays identifiable; the private-root, publication-evidence, and configuration
+witness checks still apply to the on-disk backend. A daemon that started on
+SQLite also answers when it lacks the PostgreSQL URL, CA file, or migration role
+of the newly selected backend, since it never needed them; any of those values
+that is present is still validated. Its HTTP 200
 JSON has `status: "ok"`, `observation: "identity-only"`, and
 `storage: { "status": "unverified" }`, with version, selected backend, uptime,
 PID, entrypoint, daemon generation, and the actual runtime digest when available.

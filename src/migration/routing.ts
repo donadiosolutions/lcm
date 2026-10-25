@@ -1,5 +1,6 @@
 import type { BackendMaintenancePhase, BackendPublicationPhase } from "../storage/backend-publication.js";
 import type { MigrationEffectKind, MigrationPhase } from "./protocol.js";
+import { deriveRollbackPublicationId } from "./rollback.js";
 
 /**
  * Owner rulings recorded here (owner ruling R7/R8, plan-v5 amendment):
@@ -141,6 +142,12 @@ function isOwnPublication(input: MigrationRouteInput): boolean {
     && input.link.publicationId === input.journal.publicationId;
 }
 
+/** A rollback leaves its own publication in the slot; the activation link never names it. */
+function isRollbackPublication(input: MigrationRouteInput): boolean {
+  return input.journal.kind === "publication"
+    && input.journal.publicationId === deriveRollbackPublicationId(input.resolvedGenerationId);
+}
+
 function publicationInFlight(input: MigrationRouteInput): boolean {
   return input.journal.kind === "publication"
     && input.journal.phase !== "completed" && input.journal.phase !== "aborted";
@@ -176,9 +183,9 @@ const ROWS: readonly Row[] = [
     matches: (i) => i.journal.kind === "unresolvable" || i.manifest.kind === "unresolvable"
       || i.snapshot === "unresolvable" || i.link.kind === "unresolvable" },
   { row: 2, primary: "none", allowed: [], exit: fixed(4),
-    matches: (i) => i.journal.kind === "publication" && !isOwnPublication(i) && publicationInFlight(i) },
+    matches: (i) => i.journal.kind === "publication" && !isOwnPublication(i) && !isRollbackPublication(i) && publicationInFlight(i) },
   { row: 3, primary: "none", allowed: [], exit: fixed(5),
-    matches: (i) => i.journal.kind === "publication" && !isOwnPublication(i) },
+    matches: (i) => i.journal.kind === "publication" && !isOwnPublication(i) && !isRollbackPublication(i) },
   { row: 4, primary: "abort", allowed: [], exit: fixed(2),
     matches: (i) => holdPhaseIn(i, ENTERING_OR_HELD) && !holdMatches(i, ENTERING_OR_HELD) },
   { row: 5, primary: "none", allowed: ["apply", "abort"], exit: fixed(2), nextAction: "apply",
@@ -201,7 +208,14 @@ const ROWS: readonly Row[] = [
   { row: 11, primary: "activate", allowed: ["resume"],
     exit: (i) => present(i)?.pending !== null ? 6 : 2,
     matches: (i) => ((isOwnPublication(i) && (publicationInFlight(i) || (i.journal.kind === "publication" && i.journal.phase === "aborted")))
-        || holdPhaseIn(i, ["selection-prepared", "selection-completed"]))
+        || holdPhaseIn(i, ["selection-prepared", "selection-completed"])
+        // Activation begun before any selection (S9 to S11): SQLite is still authoritative and the hold is maintenance-held.
+        || (holdMatches(i, ["maintenance-held"]) && i.snapshot === "complete" && present(i) !== null
+          && ((present(i)!.phase === "verified" && present(i)!.pending === "prepare-activation")
+            || (present(i)!.phase === "activating" && (present(i)!.pending === null || present(i)!.pending === "publish-activation"))))
+        // The publication drive is done but the manifest has not settled to active (S13b done, S16 not).
+        || (isOwnPublication(i) && i.journal.kind === "publication" && i.journal.phase === "completed"
+          && present(i)?.phase === "activating" && present(i)?.pending === "publish-activation"))
       && present(i) !== null
       && ((present(i)!.phase === "verified" && present(i)!.pending === null)
         || present(i)!.phase === "activating"
