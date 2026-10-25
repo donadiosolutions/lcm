@@ -640,6 +640,11 @@ export async function createDaemon(config: DaemonConfig, options?: DaemonOptions
             budget: contentionBudget,
             signal: cancellation.signal,
             canRetry: () => !entered,
+          }).catch((error: unknown) => {
+            // A wait ended by shutdown or by the request's own deadline is a
+            // cancellation, as it was before the wait existed.
+            if (!entered) throwIfAborted(cancellation.signal);
+            throw error;
           });
       }, cancellation.signal);
     } finally {

@@ -223,6 +223,7 @@ describe("POST /ingest/terminal", () => {
       refused += 1;
       throw liveContention();
     };
+    const warn = vi.spyOn(console, "warn").mockImplementation(() => undefined);
     await withTerminalDaemon({ daemonOptions: { _withBackendPublicationConsumerLockAsync: lock } }, async (fixture) => {
       armed = true;
       expect((await bounded(fixture.post(body(fixture)))).status).toBe(202);
@@ -232,6 +233,9 @@ describe("POST /ingest/terminal", () => {
 
       expect(fixture.events).not.toContain("open:start");
       expect(fixture.messageCount()).toBe(0);
+      // A wait ended by shutdown is a cancellation, not a failed ingest.
+      expect(warn).toHaveBeenCalledWith("[lcm] terminal ingest cancelled");
+      expect(warn).not.toHaveBeenCalledWith("[lcm] terminal ingest failed");
     });
   });
 

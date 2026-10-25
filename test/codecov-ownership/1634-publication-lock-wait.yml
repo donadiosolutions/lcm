@@ -5,8 +5,11 @@ rationale: >-
   existing src/private-mutation-lock.ts, and the hook allowance helper to
   src/hooks/publication-fence.ts. src/hooks/dispatch.ts creates the shared
   allowance and src/hooks/restore.ts, src/hooks/compact.ts,
-  src/hooks/session-snapshot.ts and src/hooks/terminal-snapshot.ts spend it at
-  their pre-effect admissions. src/bootstrap.ts accepts the retry for endpoint
+  src/hooks/session-snapshot.ts, src/hooks/session-end.ts (a smaller allowance)
+  and src/hooks/terminal-snapshot.ts spend it at their pre-effect admissions.
+  src/daemon/lifecycle.ts reclassifies the lock owner at the final ensureDaemon
+  admission and lets the caller's wrapper pause only for a live process that
+  is not the daemon. src/bootstrap.ts accepts the retry for endpoint
   admission and src/daemon/server.ts uses the primitive in request admission
   for the ingest, restore and terminal-ingest paths. No production file is
   added, removed, moved or re-owned.
@@ -17,6 +20,8 @@ pins:
   - ["src/hooks/restore.ts", "unit-hooks"]
   - ["src/hooks/compact.ts", "unit-hooks"]
   - ["src/hooks/session-snapshot.ts", "unit-hooks"]
+  - ["src/hooks/session-end.ts", "unit-hooks"]
+  - ["src/daemon/lifecycle.ts", "integration-service-managers"]
   - ["src/hooks/terminal-snapshot.ts", "unit-hooks"]
   - ["src/bootstrap.ts", "unit-installation"]
   - ["src/daemon/server.ts", "unit-daemon-core"]
