@@ -174,6 +174,44 @@ describe("rollbackCutoverSet refusals before any durable rollback state", () => 
     refusal(await f.run({ readPublicationJournal: () => ({ ...completed, projects: completed.projects.slice(0, 1) }) }), "slot", "activation-not-completed", "does not cover");
     expectNoEffects(f);
   });
+
+  it("states that a checkpoint refusal published the reverse artifact and wrote no checkpoint or member record (#1746)", async () => {
+    const f = await rollbackFixture();
+    const publish = vi.fn(f.deps.publishArtifact);
+    const failing = { publishArtifact: publish, recordCheckpoint: () => { throw new Error("disk full"); } };
+    const first = await f.run(failing);
+    refusal(first, "checkpoint", "activation-unresolvable", "disk full");
+    expect(publish).toHaveBeenCalledTimes(1);
+    expect(publish.mock.results[0]!.value).toMatchObject({ outcome: "written" });
+    expect(first).toMatchObject({ artifactPublished: true });
+    expectNoEffects(f);
+    const retry = await f.run(failing);
+    refusal(retry, "checkpoint", "activation-unresolvable", "disk full");
+    expect(retry).not.toHaveProperty("artifactPublished");
+    expect(publish).toHaveBeenCalledTimes(1);
+    expectNoEffects(f);
+  });
+
+  it("omits the published statement when the publish only reused an artifact that appeared after the absence read (#1746)", async () => {
+    const f = await rollbackFixture();
+    const publish = vi.fn((request: Parameters<typeof f.deps.publishArtifact>[0]) => ({ ...f.deps.publishArtifact(request), outcome: "reused" as const }));
+    const outcome = await f.run({ publishArtifact: publish, recordCheckpoint: () => { throw new Error("disk full"); } });
+    refusal(outcome, "checkpoint", "activation-unresolvable", "disk full");
+    expect(publish).toHaveBeenCalledTimes(1);
+    expect(outcome).not.toHaveProperty("artifactPublished");
+    expectNoEffects(f);
+  });
+
+  it("omits the published statement when the artifact was already stored by an earlier call (#1746)", async () => {
+    const f = await rollbackFixture();
+    await crashAt(f, "after-artifact");
+    const publish = vi.fn(f.deps.publishArtifact);
+    const outcome = await f.run({ publishArtifact: publish, recordCheckpoint: () => { throw new Error("disk full"); } });
+    refusal(outcome, "checkpoint", "activation-unresolvable", "disk full");
+    expect(publish).not.toHaveBeenCalled();
+    expect(outcome).not.toHaveProperty("artifactPublished");
+    expectNoEffects(f);
+  });
 });
 
 describe("rollbackCutoverSet blocked members keep the hold and every piece of evidence", () => {

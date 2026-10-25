@@ -249,6 +249,19 @@ describe("a checkpoint refusal reports the member records it wrote (#1667)", () 
     const result = envelope("rollback", await run(settled(EMPTY), refused("records", "activation-not-completed"), settled(incomplete(1))));
     expect(result).toMatchObject({ exitCode: 2, applied: false });
   });
+
+  it("is applied, without the unresolvable marker, when the refusal states it published the reverse artifact (#1746)", async () => {
+    const published = { ...checkpoint, artifactPublished: true };
+    const result = envelope("rollback", await run(settled(EMPTY), published, settled(EMPTY)));
+    expect(result).toMatchObject({ exitCode: 5, applied: true, evidence: { serviceStep: "checkpoint" } });
+    expect(result.evidence).not.toHaveProperty("writeObservation");
+  });
+
+  it("keeps the unresolvable marker for a refusal that states an artifact write when the records cannot be read (#1746)", async () => {
+    const published = { ...checkpoint, artifactPublished: true };
+    const result = envelope("rollback", await run(settled(EMPTY), published, settled({ state: "unresolvable", reason: "r" })));
+    expect(result).toMatchObject({ exitCode: 5, applied: true, evidence: { writeObservation: "unresolvable" } });
+  });
 });
 
 describe("F5: an explicit bucket never whitelists an unknown reason", () => {

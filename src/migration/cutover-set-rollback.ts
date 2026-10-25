@@ -263,6 +263,11 @@ export type CutoverSetRollbackResult =
     detail: string;
     members: readonly CutoverSetRollbackMemberResult[];
     effectBegun: false;
+    /**
+     * Only on a `checkpoint` refusal: this invocation durably wrote the reverse activation artifact before the
+     * checkpoint could be recorded. A reused artifact (an earlier call's orphan) never sets it.
+     */
+    artifactPublished?: true;
   }>
   | Readonly<{
     status: "blocked";
@@ -516,9 +521,14 @@ function memberResults(ctx: Context): readonly CutoverSetRollbackMemberResult[] 
 }
 
 /** A refusal before any durable rollback state; once the checkpoint exists the same failure is an interruption. */
-function refused(ctx: Context, step: CutoverSetRollbackStep, reason: CutoverSetRollbackRefusalReason, detail: string): Exit {
+function refused(ctx: Context, step: CutoverSetRollbackStep, reason: CutoverSetRollbackRefusalReason, detail: string, artifactPublished = false): Exit {
   if (ctx.effectBegun) return interrupted(ctx, step, "state-unresolvable", reason + " on roll-forward: " + detail);
-  return { exit: { status: "refused", originalSetId: ctx.originalSetId, setId: ctx.setId, step, reason, detail, members: memberResults(ctx), effectBegun: false } };
+  return {
+    exit: {
+      status: "refused", originalSetId: ctx.originalSetId, setId: ctx.setId, step, reason, detail, members: memberResults(ctx), effectBegun: false,
+      ...(artifactPublished ? { artifactPublished: true as const } : {}),
+    },
+  };
 }
 
 function blocked(ctx: Context, step: CutoverSetRollbackStep, member: Member, reason: CutoverSetRollbackBlockedReason, detail: string): Exit {
@@ -1151,10 +1161,17 @@ async function preHold(ctx: Context, activationJournal: BackendPublicationJourna
     if (existing !== null && !artifactCoversMembers(ctx, existing, ctx.setId, (member) => member.evidenceSha256)) {
       return refused(ctx, "artifact", "activation-unresolvable", "an artifact under the recomputed identity digest was sealed under another publication").exit;
     }
-    ctx.artifact = existing ?? ctx.deps.publishArtifact({
-      homeDir: ctx.homeDir,
-      material: { version: 1, publicationId: ctx.setId, source: composed.material.source, target: composed.material.target, projects: bindings },
-    }).material;
+    let artifactWritten = false;
+    if (existing === null) {
+      const published = ctx.deps.publishArtifact({
+        homeDir: ctx.homeDir,
+        material: { version: 1, publicationId: ctx.setId, source: composed.material.source, target: composed.material.target, projects: bindings },
+      });
+      artifactWritten = published.outcome === "written";
+      ctx.artifact = published.material;
+    } else {
+      ctx.artifact = existing;
+    }
     crash(ctx, "after-artifact");
     const checkpoint = createCutoverSetRollbackCheckpoint({
       originalSetId: ctx.originalSetId, setId: ctx.setId, manifest: ctx.manifest!, publicationId: ctx.setId,
@@ -1173,7 +1190,7 @@ async function preHold(ctx: Context, activationJournal: BackendPublicationJourna
     try {
       ctx.deps.recordCheckpoint({ homeDir: ctx.homeDir, checkpoint });
     } catch (error) {
-      return refused(ctx, "checkpoint", "activation-unresolvable", "the rollback checkpoint could not be recorded: " + (error as Error).message).exit;
+      return refused(ctx, "checkpoint", "activation-unresolvable", "the rollback checkpoint could not be recorded: " + (error as Error).message, artifactWritten).exit;
     }
     ctx.checkpoint = checkpoint;
     ctx.effectBegun = true;
