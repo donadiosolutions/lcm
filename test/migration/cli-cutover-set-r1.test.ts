@@ -212,6 +212,45 @@ describe("F4: applied reports the effects of this invocation", () => {
   });
 });
 
+describe("a checkpoint refusal reports the member records it wrote (#1667)", () => {
+  let active!: ReturnType<typeof craftedHome>;
+  beforeEach(() => { active = craftedHome(["active", "active"]); });
+  const EMPTY = { state: "authoritatively-absent", cause: "empty" } as never;
+  const incomplete = (memberRecords: number) => ({ state: "authoritatively-absent", cause: "checkpoint-incomplete", memberRecords }) as never;
+  const settled = (rollback: unknown): Parts => ({ journal: publicationJournal(), activation: resolvedActivation(), rollback: rollback as never });
+  const refused = (step: string, reason: string) => ({ originalSetId: SET_ID, setId: REVERSE_ID, status: "refused", step, reason, detail: "d", members: rollbackMembers("active"), effectBegun: false });
+  const run = (start: Parts, result: object, after: Parts) => {
+    const state: Parts = { ...start };
+    return performSetRollback({
+      homeDir: active.homeDir, ...select, confirmBackend: "sqlite",
+      _operationsForTesting: setOperations(active, state, { rollback: (async () => { Object.assign(state, after); return result; }) as never }),
+    });
+  };
+  const checkpoint = refused("checkpoint", "activation-unresolvable");
+
+  it("is applied when the refused call left member records of an uncommitted checkpoint", async () => {
+    const result = envelope("rollback", await run(settled(EMPTY), checkpoint, settled(incomplete(1))));
+    expect(result).toMatchObject({ exitCode: 5, applied: true, evidence: { serviceStep: "checkpoint" } });
+    expect(result.evidence).not.toHaveProperty("writeObservation");
+    expect(envelope("rollback", await run(settled(incomplete(1)), checkpoint, settled(incomplete(2))))).toMatchObject({ applied: true });
+  });
+
+  it("is not applied when the refused call left the stored records as they were", async () => {
+    expect(envelope("rollback", await run(settled(EMPTY), checkpoint, settled(EMPTY)))).toMatchObject({ exitCode: 5, applied: false });
+    expect(envelope("rollback", await run(settled(incomplete(1)), checkpoint, settled(incomplete(1))))).toMatchObject({ applied: false });
+  });
+
+  it("is applied with the unresolvable marker when the records after the refusal cannot be read", async () => {
+    const result = envelope("rollback", await run(settled(EMPTY), checkpoint, settled({ state: "unresolvable", reason: "r" })));
+    expect(result).toMatchObject({ applied: true, evidence: { writeObservation: "unresolvable" } });
+  });
+
+  it("keeps the unobserved fast path for a refusal at any other step", async () => {
+    const result = envelope("rollback", await run(settled(EMPTY), refused("records", "activation-not-completed"), settled(incomplete(1))));
+    expect(result).toMatchObject({ exitCode: 2, applied: false });
+  });
+});
+
 describe("F5: an explicit bucket never whitelists an unknown reason", () => {
   let home!: ReturnType<typeof craftedHome>;
   beforeEach(() => { home = craftedHome(["absent", "absent"]); });

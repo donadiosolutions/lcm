@@ -863,7 +863,15 @@ async function mapRollback(args: Readonly<{
   };
   if (result.status === "refused") {
     const bucket = closedBucket("refusal reason", ROLLBACK_REFUSAL_BUCKETS, result.reason);
-    return serviceRefusal({ command: "rollback", reason: result.reason, bucket, setId, sections: { ...common, serviceStep: result.step } });
+    if (result.step !== "checkpoint") {
+      return serviceRefusal({ command: "rollback", reason: result.reason, bucket, setId, sections: { ...common, serviceStep: result.step } });
+    }
+    // The checkpoint step can durably write member records before it refuses: report that write.
+    const refusedWrite = writeObservation(args.before, await fingerprintOf(homeDir, setId, args.generationIds, ops), false);
+    return serviceRefusal({
+      command: "rollback", reason: result.reason, bucket, setId, applied: refusedWrite.applied,
+      sections: { ...common, serviceStep: result.step, ...writeSections(refusedWrite) },
+    });
   }
   const after = await fingerprintOf(homeDir, setId, args.generationIds, ops);
   const signal = result.status === "rolled-back" && result.resumedFrom !== "settled";
@@ -1172,7 +1180,9 @@ export function performSetReport(input: MigrationSetReportInput): Promise<Migrat
       ...journalSections(observation.journal),
       activationRecords: observation.activation.state === "resolved" ? "present" : observation.activation.state === "unresolvable" ? "unresolvable" : "absent",
       activationSelection: observation.activation.state === "resolved" ? observation.activation.selection !== null : false,
-      rollbackRecords: observation.rollback.state === "resolved" ? "present" : observation.rollback.state === "unresolvable" ? "unresolvable" : "absent",
+      rollbackRecords: observation.rollback.state === "resolved" ? "present"
+        : observation.rollback.state === "unresolvable" ? "unresolvable"
+        : observation.rollback.cause === "checkpoint-incomplete" ? "incomplete" : "absent",
       rollbackSelection: observation.rollback.state === "resolved" ? observation.rollback.selection !== null : false,
       ...setRowsEvidence(observedRows(observation)),
     };

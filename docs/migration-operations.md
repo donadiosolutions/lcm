@@ -622,7 +622,7 @@ next step; `activate --set` revalidates every member itself.
 | `prepared` | a forward hold, every member verified | `activate --set` |
 | `activate` | activation records exist, members not all active | `resume --set` or `activate --set` |
 | `settled-activated` | every member active, nothing pending, and the frozen activation selection recorded | `report --set` (grant swap, restart) |
-| `rollback` | rollback records exist, members not all rolled back | `resume --set` or `rollback --set` |
+| `rollback` | a committed rollback checkpoint exists, members not all rolled back | `resume --set` or `rollback --set` |
 | `settled-rolled-back` | every member rolled back, nothing pending, and the frozen rollback selection recorded | `report --set` |
 | `abort` | an aborted hold with unsettled members | `resume --set` or `abort --set` |
 | `settled-aborted`, `unknown` | nothing left to settle, or nothing names the set | `plan --set` |
@@ -670,8 +670,16 @@ activation, which applies runtime grants before activate and leaves only transfe
 afterward.
 
 **Known diagnostic limits.** `report --set` does not repair `abort`'s immediate readback attribution
-(#1657). A rollback checkpoint that is absent means no committed rollback checkpoint, not that no
-write happened (#1667). Report rows are evidence for an operator and never grant replay admission.
+(#1657). `rollbackRecords: incomplete` means member records of a rollback checkpoint that was never
+committed: no rollback commitment exists and re-running `rollback --set` completes it by reusing
+byte-identical records. `absent` means nothing is stored. A stored record that differs from what
+`rollback --set` would write is refused before any member record is written when the directory can
+be read and authenticated; the records are preserved, activation is not fenced, `rollback --set` is
+admitted and refused at the checkpoint step, and the records need inspection. An I/O failure, a
+concurrent change or an untrusted directory (for example, a lone scratch file) can still leave
+partial, uncommitted member records; an untrusted directory is refused by `rollback --set` at route
+admission and fences `activate --set`. Report rows are evidence for an operator and never grant
+replay admission.
 
 ## State routing: which command owns which situation
 

@@ -156,6 +156,12 @@ describe("report --set", () => {
     expect(result.evidence).toMatchObject({ scope: "cutover-set", setId: SET_ID });
   });
 
+  it("distinguishes member records of an uncommitted checkpoint from an empty store", async () => {
+    const result = envelope("report", await run({ rollback: { state: "authoritatively-absent", cause: "checkpoint-incomplete", memberRecords: 1 } as never }));
+    expect(result.evidence).toMatchObject({ rollbackRecords: "incomplete" });
+    expect(envelope("report", await run({ rollback: { state: "authoritatively-absent", cause: "empty" } as never })).evidence).toMatchObject({ rollbackRecords: "absent" });
+  });
+
   it("marks unreadable record stores as unresolvable evidence", async () => {
     const result = envelope("report", await run({ activation: { state: "unresolvable", reason: "r" }, rollback: { state: "unresolvable", reason: "r" } }));
     expect(result.evidence).toMatchObject({ activationRecords: "unresolvable", rollbackRecords: "unresolvable" });

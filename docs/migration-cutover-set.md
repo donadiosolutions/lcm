@@ -75,9 +75,20 @@ snapshots, the checkpoints and every member's manifest. There is no offline
 restoration, no manual unbinding of members and no abort once a rollback's
 checkpoint is written. `report --set` prints each member as flat
 `member.<n>.*` evidence (indexes in manifest order, to be sorted numerically)
-and states a missing rollback checkpoint as "no committed rollback checkpoint",
-which does not prove that no write happened (#1667). It does not repair the
-immediate readback attribution of `abort` (#1657).
+and states `rollbackRecords` as `present` (a committed rollback checkpoint),
+`incomplete` (member records of a rollback checkpoint that was never
+committed: there is no rollback commitment, and re-running `rollback --set`
+completes it) or `absent` (nothing stored). When the stored records can be
+read and authenticated, a stored record that differs from what a new
+`rollback --set` would write is refused before any member record is written
+and the stored records are preserved; the retry does not converge and the
+records need inspection. Create-only reconciliation still protects every
+record, but an I/O failure, a concurrent change or an untrusted directory can
+still leave partial, uncommitted member records. A byte-identical retry reuses
+the records and completes the checkpoint. A directory that cannot be trusted
+(for example, a lone scratch file) is refused by `rollback --set` at route
+admission and fences `activate --set` although nothing was committed. It does
+not repair the immediate readback attribution of `abort` (#1657).
 
 ## What a set contains
 
