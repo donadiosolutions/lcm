@@ -3434,6 +3434,9 @@ describe("PostgreSQL harness container engine selection", () => {
     expect(tail.slice(0, 4)).toEqual(["--entrypoint", "/bin/bash", POSTGRES_IMAGE, "-ceu"]);
     expect(tail).toHaveLength(5);
     expect(tail[4]).toContain("exec /usr/local/bin/docker-entrypoint.sh postgres -c ssl=on");
+    expect(tail[4]).toContain(
+      "-c shared_preload_libraries=pg_stat_statements -c pg_stat_statements.max=100000 -c listen_addresses=*",
+    );
   });
 
   it("mounts only private relabelled sources under Podman", () => {
