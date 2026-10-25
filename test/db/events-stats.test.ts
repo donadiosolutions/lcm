@@ -499,6 +499,27 @@ describe("read-only sidecar oldest pending capture time", () => {
     expect(stats.oldestPendingAt).toBe("not-a-timestamp");
     expect(localPendingAgeRead(stats.oldestPendingAt, Date.UTC(2026, 1, 3, 12, 0, 0))).toEqual({ reason: "out-of-range" });
   });
+  it.each(["not-a-timestamp", "2026-02-30 10:00:00", "2026-03-01 24:00:00"])(
+    "reports invalid pending capture time %s even when a valid row sorts earlier in the same sidecar",
+    async (invalid) => {
+      seed("mixed.db", [["2026-02-03 11:59:00", "pending"], [invalid, "pending"]]);
+      const [sidecar] = await collectEventSidecars({ pruneOrphanSidecars: false });
+      expect(sidecar!.oldestPendingAt).toBe(invalid);
+      const stats = await collectEventStats({ pruneOrphanSidecars: false });
+      expect(stats.oldestPendingAt).toBe(invalid);
+      expect(localPendingAgeRead(stats.oldestPendingAt, Date.UTC(2026, 2, 2, 12, 0, 0))).toEqual({ reason: "out-of-range" });
+    },
+  );
+  it("counts an invalid retry-state capture time", async () => {
+    seed("retry.db", [["2026-02-03 11:59:00", "pending"], ["2026-02-30 10:00:00", "retry"]]);
+    const [sidecar] = await collectEventSidecars({ pruneOrphanSidecars: false });
+    expect(sidecar!.oldestPendingAt).toBe("2026-02-30 10:00:00");
+  });
+  it("ignores an invalid capture time on a non-pending row", async () => {
+    seed("quarantined.db", [["2026-02-03 11:59:00", "pending"], ["not-a-timestamp", "quarantined"]]);
+    const [sidecar] = await collectEventSidecars({ pruneOrphanSidecars: false });
+    expect(sidecar!.oldestPendingAt).toBe("2026-02-03 11:59:00");
+  });
   it("leaves the value unknown on the writable scan path", async () => {
     seed("writable.db", [["2026-02-03 10:00:00", "pending"]]);
     const [sidecar] = await collectEventSidecars({ pruneOrphanSidecars: true });
