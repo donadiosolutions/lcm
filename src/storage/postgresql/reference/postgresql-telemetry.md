@@ -2,9 +2,11 @@
 
 This guide is the normative contract that issues #637, #638, #639, and #640
 implement for PostgreSQL operational observations. #637 implements the query
-fingerprint family described below; the remaining families are still contracts
-for their owning issues. The implemented surface is the sanitized backend
-snapshot described in
+fingerprint (statement statistics) family, #638 implements the runtime health
+families `pool`, `migration`, `extensions`, and `queue`, and #639
+implements the incident diagnostics runbook and sanitization canaries. The
+#640 production-shaped load certification is still a contract. The implemented
+surface is the sanitized backend snapshot described in
 [observational diagnostics](../../../../docs/cli.md#observational-diagnostics).
 Each implementing issue encodes its rules in code and tests and updates this
 guide when it adds a metric, label, or status.
