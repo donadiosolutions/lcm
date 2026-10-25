@@ -2724,7 +2724,7 @@ function actualAclIdentity(
       ? "public"
       : row.grantee_name === runtimeRole.role
         ? "runtime"
-        : typeof row.grantee_name === "string" ? row.grantee_name : null;
+        : typeof row.grantee_name === "string" ? `role:${row.grantee_name}` : null;
   const grantor = row.grantor_is_owner ? "owner" : "foreign";
   if (grantee === null) return null;
   return [kind, row.object_identity, grantee, grantor, row.privilege_type, row.is_grantable].join("|");
