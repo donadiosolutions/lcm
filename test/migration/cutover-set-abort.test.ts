@@ -390,11 +390,11 @@ describe("migration abort command over a set", () => {
   });
 
   it.each([
-    ["established", { probeManifestPresence: () => ({ status: "unresolvable" as const, reason: "internal-error" as const }) }, "manifest-internal-error"],
+    ["established", { probeManifestPresence: () => ({ status: "unresolvable" as const, reason: "internal-error" as const }) }, "member-generation-1:manifest-internal-error"],
     ["read", {
       probeManifestPresence: () => ({ status: "present" as const }),
       read: () => { throw new MigrationProtocolError("checksum-mismatch", "damaged"); },
-    }, "manifest-checksum-mismatch"],
+    }, "member-generation-1:manifest-checksum-mismatch"],
   ])("refuses a readback when a member manifest cannot be %s", async (_name, readback, evidence) => {
     const home = makeHome();
     await heldSet(home);
