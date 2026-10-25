@@ -1,5 +1,6 @@
 // src/db/events-stats.ts
 import { collectEventSidecars, type EventSidecarScanOptions } from "./event-sidecars.js";
+import { sqliteUtcMs } from "../storage/runtime-health.js";
 
 export interface EventStats {
   captured: number;
@@ -56,14 +57,21 @@ export interface DetailedEventStats extends EventStats {
 
 export type EventStatsOptions = number | EventSidecarScanOptions;
 
-/** An unread source makes the aggregate unknown; unknown never becomes "none". */
+/**
+ * An unread source makes the aggregate unknown; unknown never becomes "none".
+ * An invalid reported timestamp is sticky so a valid sibling cannot mask it;
+ * the read-side age check then reports it as out of range.
+ */
 function foldOldestPendingAt(
   current: string | null | undefined,
   next: string | null | undefined,
 ): string | null | undefined {
   if (current === undefined || next === undefined) return undefined;
   if (next === null) return current;
-  return current === null || next < current ? next : current;
+  if (current === null) return next;
+  if (sqliteUtcMs(current) === undefined) return current;
+  if (sqliteUtcMs(next) === undefined) return next;
+  return next < current ? next : current;
 }
 
 function normalizeStatsOptions(options: EventStatsOptions = {}): EventSidecarScanOptions {
