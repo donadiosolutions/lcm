@@ -3704,26 +3704,118 @@ describe("PostgreSQL harness utilities", () => {
       }
     });
 
-    it("treats a label longer than a marker allows as ordinary text", () => {
-      const redactor = createStreamRedactor([])!;
-      const output = redactor.write(`-----BEGIN ${"L".repeat(65)}-----\nplain\n`) + redactor.end();
-      expect(output).toBe(`-----BEGIN ${"L".repeat(65)}-----\nplain\n`);
+    describe("labels of any length", () => {
+      const longLabel = "L".repeat(70);
+      const beginLong = `-----BEGIN ${longLabel}-----`;
+      const endLong = `-----END ${longLabel}-----`;
+      const marker64 = (kind: string) => `-----${kind} ${"M".repeat(64)}-----`;
+
+      async function surface(chunks: string[], code = 1) {
+        const child = fakeChild();
+        let surfaced = "";
+        const sink = { write: (text: string) => { surfaced += text; } };
+        const running = runSanitizedProcess("node", ["vitest.mjs"], {
+          processRunner: (command: string, args: string[], options: Record<string, unknown>) =>
+            runProcess(command, args, { ...options, spawnProcess: () => child }),
+          stdout: sink,
+          stderr: sink,
+        }).then(
+          (result) => ({ stderr: result.stderr, stdout: result.stdout }),
+          (error: Error & { stderr: string }) => ({ stderr: error.stderr, stdout: "" }),
+        );
+        for (const chunk of chunks) child.stdout.emit("data", Buffer.from(chunk));
+        child.emit("close", code, null);
+        const settled = await running;
+        return { surfaced, ...settled };
+      }
+
+      it("redacts a complete block with a long label in one chunk", async () => {
+        const chunks = [`${beginLong}\nCANARY_LONG_BODY\n${endLong}\nafter\n`];
+        expect((await captureChunks(chunks)).stdout).toBe("[REDACTED PEM]\nafter\n");
+        const seen = await surface(chunks);
+        expect(seen.surfaced).not.toContain("CANARY_LONG_BODY");
+        expect(seen.surfaced).toContain("after");
+        expect(seen.stderr + seen.stdout).not.toContain("CANARY_LONG_BODY");
+      });
+
+      it("redacts a long-label block whose BEGIN marker is split across chunks", async () => {
+        for (let cut = 1; cut < beginLong.length; cut += 1) {
+          const result = await captureChunks([
+            beginLong.slice(0, cut),
+            `${beginLong.slice(cut)}\nCANARY_LONG_BODY\n${endLong}\nafter\n`,
+          ]);
+          expect(result.stdout).toBe("[REDACTED PEM]\nafter\n");
+        }
+      });
+
+      it("keeps a long-label block redacted when its BEGIN line is dropped", async () => {
+        const chunks = [
+          `${"p".repeat(limit + 1)}${beginLong}`, `\nCANARY_LONG_BODY\n${endLong}\nafter\n`,
+        ];
+        const result = await captureChunks(chunks);
+        expect(result.stdout).toBe(`${droppedLine}\nafter\n`);
+        expect(result.stdoutTruncated).toBe(true);
+        const seen = await surface(chunks);
+        expect(seen.surfaced).not.toContain("CANARY_LONG_BODY");
+        expect(seen.stderr).not.toContain("CANARY_LONG_BODY");
+        expect(seen.stderr).toContain("after");
+      });
+
+      it("reassembles markers of up to 64 and over 64 label characters split across dropped writes", async () => {
+        const markers = [marker64("BEGIN"), beginLong];
+        const ends = [marker64("END"), endLong];
+        for (const [index, beginMarker] of markers.entries()) {
+          for (let cut = 1; cut < beginMarker.length; cut += 1) {
+            const result = await captureChunks([
+              `${"p".repeat(limit + 1)}${beginMarker.slice(0, cut)}`,
+              `${beginMarker.slice(cut)}\nCANARY_BEGIN_${cut}\n${ends[index]}\nAFTER_${cut}\n`,
+            ]);
+            expect(result.stdout).toBe(`${droppedLine}\nAFTER_${cut}\n`);
+          }
+          for (let cut = 1; cut < ends[index].length; cut += 1) {
+            const result = await captureChunks([
+              `${beginMarker}\n${"p".repeat(limit + 1)}${ends[index].slice(0, cut)}`,
+              `${ends[index].slice(cut)}\nAFTER_${cut}\n`,
+            ]);
+            expect(result.stdout).toBe(`[REDACTED PEM]\n${droppedLine}\nAFTER_${cut}\n`);
+          }
+        }
+      });
+
+      it("does not close a block on a hyphen run inside a dropped label", async () => {
+        const result = await captureChunks([
+          `${begin}\n${"p".repeat(limit + 1)}-----END A--B-----`, `\nCANARY_STILL_OPEN\n${end}\nafter\n`,
+        ]);
+        expect(result.stdout).not.toContain("CANARY_STILL_OPEN");
+        expect(result.stdout.endsWith("after\n")).toBe(true);
+      });
     });
 
     it("keeps the retained ring on a character boundary", async () => {
-      const bytes = Buffer.alloc(limit + 2);
-      bytes[0] = 0x58;
-      for (let index = 1; index + 1 < bytes.length; index += 2) Buffer.from("é").copy(bytes, index);
-      bytes[bytes.length - 1] = 0x0a;
-      const child = fakeChild();
-      const running = runProcess("node", ["x"], { spawnProcess: () => child, redactSecrets: [] })
-        .catch((reason: unknown) => reason) as Promise<{ stdout: string; stdoutTruncated: boolean }>;
-      child.stdout.emit("data", bytes);
-      child.emit("close", 1, null);
-      const result = await running;
-      expect(result.stdoutTruncated).toBe(true);
-      expect(result.stdout).not.toContain("\ufffd");
-      expect(Buffer.byteLength(result.stdout)).toBeLessThanOrEqual(limit);
+      const retained: number[] = [];
+      for (const character of ["é", "€", "😀"]) {
+        for (let prefix = 0; prefix < 4; prefix += 1) {
+          const lines = ["a".repeat(prefix) + character.repeat(2_000)];
+          const lineCount = Math.ceil(70_000 / Buffer.byteLength(character.repeat(2_000)));
+          for (let index = 1; index < lineCount; index += 1) lines.push(character.repeat(2_000));
+          const child = fakeChild();
+          const running = runProcess("node", ["x"], { spawnProcess: () => child, redactSecrets: [] })
+            .catch((reason: unknown) => reason) as Promise<{ stdout: string; stdoutTruncated: boolean; redacted?: boolean }>;
+          for (const line of lines) {
+            expect(Buffer.byteLength(line)).toBeLessThan(limit);
+            child.stdout.emit("data", Buffer.from(line + "\n"));
+          }
+          child.emit("close", 1, null);
+          const result = await running;
+          expect(result.stdoutTruncated).toBe(true);
+          expect(result.stdout).toContain(character);
+          expect(result.stdout).not.toContain("\ufffd");
+          expect(Buffer.byteLength(result.stdout)).toBeLessThanOrEqual(limit);
+          retained.push(Buffer.byteLength(result.stdout));
+        }
+      }
+      // Some phases put the cut inside a character, so the ring started later than the byte cap.
+      expect(retained.some((bytes) => bytes < limit)).toBe(true);
     });
 
     it.each([

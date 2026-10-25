@@ -603,23 +603,22 @@ export function sanitizeHarnessText(value, secrets) {
     .replace(/-----BEGIN [^-]+-----[\s\S]*?-----END [^-]+-----/gu, "[REDACTED PEM]");
 }
 
-const PEM_MARKER = /-----(BEGIN|END) [^-]{1,64}-----/gu;
-// A complete marker is at most 80 characters, so a carry of 79 reassembles any
-// marker split across two writes of dropped text.
-const PEM_CARRY_CHARS = 79;
+// Same marker grammar as sanitizeHarnessText: any non-empty hyphen-free label.
+const PEM_MARKER = /-----(BEGIN|END) [^-]+-----/gu;
+const PEM_KEYWORD = /-----(BEGIN|END) /gu;
+// The longest keyword prefix that is not yet a complete keyword ("-----BEGIN").
+const PEM_KEYWORD_PREFIX_CHARS = 10;
 
 // Walks complete BEGIN and END markers left to right, starting at nesting
 // depth `depth`. Returns the text outside PEM blocks, with each block replaced
 // by a marker, and the depth after the last marker. A BEGIN with no later END
-// leaves the block open; an END while no block is open is ordinary text. Only
-// markers ending after `minEnd` count, so a carried prefix is not counted twice.
-function scanPemMarkers(text, depth, minEnd = 0) {
+// leaves the block open; an END while no block is open is ordinary text.
+function scanPemMarkers(text, depth) {
   let output = "";
   let cursor = 0;
   let open = depth;
   for (const match of text.matchAll(PEM_MARKER)) {
     const end = match.index + match[0].length;
-    if (end <= minEnd) continue;
     if (match[1] === "BEGIN") {
       if (open === 0) output += text.slice(cursor, match.index) + "[REDACTED PEM]";
       open += 1;
@@ -637,10 +636,10 @@ function scanPemMarkers(text, depth, minEnd = 0) {
 // capture ring may discard any of it. A PEM block is dropped from its BEGIN
 // marker through its END marker, also when the stream ends inside it. A line
 // longer than MAX_CAPTURED_OUTPUT_BYTES is dropped and replaced by a marker,
-// however the chunks divide it; only its PEM state is kept, through a bounded
-// carry. dropped() reports that any line was dropped, which callers treat as
-// capture truncation. Returns undefined when a secret spans lines, which
-// line-wise redaction cannot cover.
+// however the chunks divide it; only its PEM state is kept, by a streaming
+// marker scanner that needs no buffer for the label. dropped() reports that
+// any line was dropped, which callers treat as capture truncation. Returns
+// undefined when a secret spans lines, which line-wise redaction cannot cover.
 export function createStreamRedactor(secrets) {
   const needles = secrets.filter(Boolean);
   if (needles.some((secret) => String(secret).includes("\n"))) return undefined;
@@ -650,6 +649,7 @@ export function createStreamRedactor(secrets) {
   let anyDropped = false;
   let depth = 0;
   let carry = "";
+  let label;
   const redactLine = (line) => {
     const startedInPem = depth > 0;
     let redacted = line;
@@ -659,15 +659,62 @@ export function createStreamRedactor(secrets) {
     if (startedInPem && scanned.output === "") return undefined;
     return scanned.output.replace(/postgresql:\/\/[^\s]+/giu, "postgresql://[REDACTED]");
   };
+  // Scans text that is being dropped, so markers may span writes and have a
+  // label of any length. A BEGIN keyword opens a block at once, whether or not
+  // its closing hyphens are ever confirmed (fail closed); only a confirmed END
+  // marker closes one. State is a bounded keyword-prefix carry plus, inside a
+  // label, the marker kind, whether the label is non-empty and the hyphen run.
   const scanDropped = (text) => {
-    const window = carry + text;
-    depth = scanPemMarkers(window, depth, carry.length).depth;
-    carry = window.slice(-PEM_CARRY_CHARS);
+    let rest = text;
+    while (rest !== "" || label === undefined) {
+      if (label) {
+        let index = 0;
+        let failed = false;
+        while (index < rest.length) {
+          if (rest[index] !== "-") {
+            if (label.dashes > 0) {
+              failed = true;
+              break;
+            }
+            label.named = true;
+            index += 1;
+            continue;
+          }
+          label.dashes += 1;
+          index += 1;
+          if (label.dashes === 5 && label.named) {
+            if (label.kind === "END") depth = Math.max(0, depth - 1);
+            label = undefined;
+            break;
+          }
+        }
+        if (failed) {
+          // The hyphens may begin the next keyword, so rescan them.
+          carry = "-".repeat(Math.min(label.dashes, PEM_KEYWORD_PREFIX_CHARS));
+          label = undefined;
+        }
+        rest = rest.slice(index);
+        if (label) return;
+        continue;
+      }
+      const window = carry + rest;
+      PEM_KEYWORD.lastIndex = 0;
+      const match = PEM_KEYWORD.exec(window);
+      if (!match) {
+        carry = window.slice(-PEM_KEYWORD_PREFIX_CHARS);
+        return;
+      }
+      rest = window.slice(match.index + match[0].length);
+      carry = "";
+      label = { kind: match[1], named: false, dashes: 0 };
+      if (label.kind === "BEGIN") depth += 1;
+    }
   };
   const dropLine = () => {
     anyDropped = true;
     discarding = false;
     carry = "";
+    label = undefined;
     return `[redacted: output line exceeded ${MAX_CAPTURED_OUTPUT_BYTES} bytes]`;
   };
   const consume = (text) => {
