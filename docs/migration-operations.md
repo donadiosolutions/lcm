@@ -172,6 +172,22 @@ mint under a hold. Run every command on an existing generation from the migrated
 directory: the persisted identity is read from the current directory, so another directory reports
 `local-identity-not-persisted`.
 
+**Project-map aliases migrate with the project.** When the project's map entry lists extra alias
+paths (a moved or symlinked directory, for example), `apply` creates the destination project with
+the canonical path and every one of those aliases, so the copy carries the same alias set the
+source has. If the project already exists in PostgreSQL (a retry after an interrupted `apply`),
+`apply` adds only the missing aliases, in one transaction, and leaves a matching set untouched.
+`apply` refuses with `migration-target-identity-unresolvable` (exit 5) and evidence
+`alias-conflict`, before it takes the hold and without writing any alias, when two of the
+project's paths resolve to the same real path (an alias that is a symlink to the canonical path),
+when an alias is already bound to a different project on this machine, or when the existing
+destination project holds an alias the map does not list. Fix the map (`lcm project link` and
+`lcm project unlink`) or the conflicting destination rows, then run `plan` and `apply` again. A generation
+that an earlier version already held and failed in the copy stays on `resume`, which never
+creates identity; run `abort`, then a fresh `plan` and `apply`, which adds the missing aliases.
+Rollback leaves the destination project and its alias rows in place and keeps the aliases in the
+local map.
+
 `--dry-run` stops immediately after the confirmation fence, before the hold is taken or anything is
 captured. The emitted envelope reports the confirmed candidate with `applied: false`.
 
@@ -298,7 +314,11 @@ read back after the operation, not assumed from the operation reporting success.
 
 Mutating. Switches a verified generation to PostgreSQL and releases the maintenance hold. It owns
 cell 24 (held, `verified`), cell 11 (an activation that was begun and not finished) and the settled
-re-entry at cell 10 (the generation's own completed publication and an `active` manifest). It adds no
+re-entry at cell 10 (the generation's own completed publication and an `active` manifest). Cell 11
+covers an interruption at any point after the activation began, including before the selection (the
+hold is still `held`, SQLite is still authoritative and nothing is published) and after the
+publication completed but before the manifest settled to `active`; run `activate` again and it
+finishes from where it stopped. It adds no
 algorithm of its own: it supplies the inputs the activation orchestration asks for and maps what it
 returns.
 
@@ -335,7 +355,14 @@ The refusal classes by reason (each reason has exactly one): **exit 2** `manifes
 `coverage-unresolvable`, `verification-unresolvable`, `target-unresolvable`, `evidence-unresolvable`,
 `state-unresolvable`; **exit 6** `pending-effect-foreign` when `resume` owns that pending effect, exit 2
 otherwise. A failed best-effort release of the lease is shown as `leaseReleaseFailed` in the
-evidence and nothing more.
+evidence and nothing more. A fenced-lease row that cannot be decoded (it names no publication
+generation) is `lease-unresolvable`, exit 5 `activation-refused-evidence`, with nothing changed and
+no `applied` claim; `lease-conflict` (exit 4) is a decodable lease held by another publication. A
+running daemon that holds the previous backend is now seen as present, so `activate`, `rollback` and
+`report` give exit 8, even when that daemon started on SQLite without the PostgreSQL URL, CA file or
+migration role in its environment; a daemon binary from before this behavior still gives exit 5
+`cutover-restart-contradiction`, and the remedy is unchanged: run `lcm daemon status`, resolve it, run
+`report`.
 
 **`--dry-run`** reads the persisted state (the manifest, the verification report, the journals, the
 link, the artifact and the restart check) and lists `notEvaluated`: quiescence, coverage, the
@@ -658,9 +685,11 @@ cell 12 it exits 6. The same router decides for all of them, so they cannot disa
 | 9 | `maintenance-aborted` | any | anything else | none -- exit 5; `abort` is never called | -- |
 | 10 | the generation's own completed publication | any | `active`, nothing pending | none -- settled; `report` | `activate` (settled re-entry), `rollback` |
 | 11 | the generation's own publication in flight or aborted, or a `selection-prepared`/`selection-completed` hold | any | `verified`, `activating`, or a pending activation effect | `activate` | `resume` |
+| 11 | `held`, matching (activation begun, no selection yet) | complete | `verified` with a pending `prepare-activation`, or `activating` with nothing pending or a pending `publish-activation` | `activate` | `resume` |
+| 11 | the generation's own completed publication (the manifest has not settled yet) | any | `activating` with a pending `publish-activation` | `activate` | `resume` |
 | 12 | not aborted | any | `rolling-back`, or a pending rollback effect | `rollback` | `resume` |
-| 13 | not aborted | any | `rolled-back`, nothing pending | none -- settled; `report` | `rollback` (settled re-entry) |
-| 2, 3 | a v2 publication | any | any | none -- exit 4 while in flight, exit 5 when foreign and finished | -- |
+| 13 | not aborted, including the generation's own completed rollback publication | any | `rolled-back`, nothing pending | none -- settled; `report` | `rollback` (settled re-entry) |
+| 2, 3 | a v2 publication that is neither this generation's activation publication nor its own derived rollback publication | any | any | none -- exit 4 while in flight, exit 5 when foreign and finished | -- |
 | 1, 25 | unresolvable, or no row matches | -- | -- | none -- exit 5 | -- |
 
 A generation classifying `partial` or `replaced` is **never deleted**. Every failed or abandoned
@@ -806,6 +835,13 @@ same as draining them -- nothing in this Epic currently guarantees that a retain
 processed to completion by any specific point in the migration sequence. **The daemon restart that
 follows activation is what resumes processing** of anything still pending, not the
 migration commands themselves. Do not assume a pending backlog is empty because `apply` succeeded.
+
+A pending hook event whose copy the migration left pending in the project is delivered once, by the first
+replication pass after that restart. The migration copy and the replication upload record its creation time in
+two textual forms, and replication treats both forms of the same instant as the same event, so the copy already
+in the project is adopted and processed rather than rejected as a conflicting duplicate. A copy that was
+already applied is acknowledged without a second apply. The machine-local `previousEventId` is ignored when
+only one side carries it; when both carry it, the values must be equal as JSON values.
 
 ## Fencing residue: what this command group does not protect against
 

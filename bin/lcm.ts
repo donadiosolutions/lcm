@@ -1,6 +1,6 @@
 #!/usr/bin/env node
 import { randomUUID } from "node:crypto";
-import { realpathSync } from "node:fs";
+import { lstatSync, realpathSync } from "node:fs";
 import { argv, exit, kill as processKill, stdin, stdout } from "node:process";
 import { homedir } from "node:os";
 import { isAbsolute, join, relative, resolve } from "node:path";
@@ -72,6 +72,7 @@ import {
   daemonPidPath,
   daemonTokenPath,
   lcmHomeDir,
+  legacyLcmHomeDir,
   migrateLegacyHomeIfNeeded,
   projectsDir as lcmProjectsDir,
 } from "../src/runtime-paths.js";
@@ -92,6 +93,7 @@ import { BACKEND_PUBLICATION_ADMISSION_DIAGNOSTIC } from "../src/hooks/publicati
 import { sanitizeTerminalText } from "../src/terminal-sanitize.js";
 import { resolveLcmConfig } from "../src/db/config.js";
 import { isDaemonTransportFailure } from "../src/daemon/http-url.js";
+import { sameEnvelope } from "../src/daemon/passive-event-replication.js";
 import {
   clearDaemonRemediation,
   isDaemonRefusalReason,
@@ -1280,6 +1282,14 @@ function isNestedUnderRoot(actionCommand: Command, parentName: string, actionNam
 
 function shouldRunRootBootstrapMigration(actionCommand: Command): boolean {
   if (isNestedUnderRoot(actionCommand, "daemon", "restart")) return false;
+  // Each migration subcommand owns a state of the cutover, including the ones that leave a
+  // maintenance hold, and the bootstrap's publication admission refuses while the hold exists.
+  // The bootstrap can only still do work when a legacy home waits to be moved into an absent
+  // active root; a completed migration keeps the legacy directory as evidence and does not count.
+  if (isNestedUnderRoot(actionCommand, "migration")) {
+    const stat = (path: string) => { try { return lstatSync(path); } catch { return undefined; } };
+    return stat(legacyLcmHomeDir())?.isDirectory() === true && stat(lcmHomeDir()) === undefined;
+  }
   const action = actionCommand.name();
   const topLevel = actionCommand.parent?.name() === "lcm";
   if (topLevel && (
@@ -1646,26 +1656,6 @@ async function withPassiveEventOperatorSession<T>(
   } finally {
     await session.close();
   }
-}
-
-function passiveEventReadbackMatches(
-  local: LocalHookEventRow,
-  remote: PostgreSqlPassiveEventRecord,
-): boolean {
-  const payload = remote.payload as Record<string, unknown>;
-  return local.machine_id === remote.machineId
-    && local.event_uuid === remote.eventId
-    && local.event_version === remote.eventVersion
-    && BigInt(local.machine_sequence) === remote.machineSequence
-    && local.type === remote.eventType
-    && payload.sessionId === local.session_id
-    && payload.sessionSequence === local.seq
-    && payload.category === local.category
-    && payload.data === local.data
-    && payload.priority === local.priority
-    && payload.sourceHook === local.source_hook
-    && payload.previousEventId === local.prev_event_id
-    && payload.createdAt === local.created_at;
 }
 
 function serializablePassiveEvent(record: PostgreSqlPassiveEventRecord): Record<string, unknown> {
@@ -3886,7 +3876,7 @@ export async function runCli(
           for (const event of events) {
             const record = byId.get(event.event_uuid);
             if (!record) missing.push(event.event_uuid);
-            else if (!passiveEventReadbackMatches(event, record)) {
+            else if (!sameEnvelope(event, record)) {
               mismatched.push(event.event_uuid);
             } else {
               matched += 1;

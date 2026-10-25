@@ -1,0 +1,954 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "$id": "lcm-cutover-rehearsal-evidence-v1",
+  "title": "LCM cutover rehearsal evidence (schema version 1)",
+  "$comment": "Supported subset: type, enum, const, pattern, min/maxLength, minimum, maximum, min/maxItems, maxProperties, required, properties, additionalProperties, items, $ref. Checked by test/postgresql/cutover-rehearsal/check-evidence.ts. Roots: #/$defs/rehearsal, #/$defs/scenario, #/$defs/gate.",
+  "$defs": {
+    "sha256": {
+      "type": "string",
+      "pattern": "^[0-9a-f]{64}$"
+    },
+    "verdict": {
+      "enum": [
+        "pass",
+        "pass-with-documented-limits",
+        "fail",
+        "incomplete"
+      ]
+    },
+    "step": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "id",
+        "surface",
+        "command",
+        "exitCode",
+        "outcome",
+        "reason",
+        "envelopeSha256",
+        "checkpointRef"
+      ],
+      "properties": {
+        "id": {
+          "type": "string",
+          "maxLength": 96
+        },
+        "surface": {
+          "enum": [
+            "cli",
+            "http",
+            "module-seam",
+            "documentation"
+          ]
+        },
+        "command": {
+          "type": "array",
+          "maxItems": 64,
+          "items": {
+            "type": "string",
+            "maxLength": 300
+          }
+        },
+        "exitCode": {
+          "type": [
+            "integer",
+            "null"
+          ],
+          "minimum": 0,
+          "maximum": 255
+        },
+        "outcome": {
+          "type": [
+            "string",
+            "null"
+          ],
+          "maxLength": 64
+        },
+        "reason": {
+          "type": [
+            "string",
+            "null"
+          ],
+          "maxLength": 96
+        },
+        "envelopeSha256": {
+          "type": [
+            "string",
+            "null"
+          ],
+          "pattern": "^[0-9a-f]{64}$"
+        },
+        "checkpointRef": {
+          "type": [
+            "string",
+            "null"
+          ],
+          "maxLength": 128
+        }
+      }
+    },
+    "injection": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "surface",
+        "boundary",
+        "kind"
+      ],
+      "properties": {
+        "surface": {
+          "enum": [
+            "cli",
+            "http",
+            "module-seam",
+            "os-signal"
+          ]
+        },
+        "boundary": {
+          "type": "string",
+          "maxLength": 200
+        },
+        "kind": {
+          "type": "string",
+          "maxLength": 64
+        },
+        "hitCount": {
+          "type": "integer",
+          "minimum": 1,
+          "maximum": 1000
+        },
+        "outcome": {
+          "type": "string",
+          "maxLength": 200
+        },
+        "signal": {
+          "type": "string",
+          "maxLength": 16
+        },
+        "note": {
+          "type": "string",
+          "maxLength": 400
+        }
+      }
+    },
+    "authority": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "checkpoint",
+        "lastCommittedBackend",
+        "journalIdentitySha256",
+        "consumerAdmission",
+        "witnesses"
+      ],
+      "properties": {
+        "checkpoint": {
+          "type": "string",
+          "maxLength": 96
+        },
+        "lastCommittedBackend": {
+          "enum": [
+            "sqlite",
+            "postgresql"
+          ]
+        },
+        "journalIdentitySha256": {
+          "type": [
+            "string",
+            "null"
+          ],
+          "pattern": "^[0-9a-f]{64}$"
+        },
+        "consumerAdmission": {
+          "enum": [
+            "fenced",
+            "admitted"
+          ]
+        },
+        "witnesses": {
+          "type": "array",
+          "maxItems": 16,
+          "items": {
+            "type": "string",
+            "maxLength": 64
+          }
+        }
+      }
+    },
+    "invariant": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "status",
+        "evidenceRefs"
+      ],
+      "properties": {
+        "status": {
+          "enum": [
+            "pass",
+            "fail",
+            "not-applicable"
+          ]
+        },
+        "evidenceRefs": {
+          "type": "array",
+          "maxItems": 256,
+          "items": {
+            "type": "string",
+            "maxLength": 200
+          }
+        },
+        "reason": {
+          "type": "string",
+          "maxLength": 300
+        }
+      }
+    },
+    "knownLimit": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "issue",
+        "expectedRefusal",
+        "preservedAuthority",
+        "safetyEvidence",
+        "unavailable"
+      ],
+      "properties": {
+        "issue": {
+          "type": "string",
+          "maxLength": 300
+        },
+        "expectedRefusal": {
+          "type": "string",
+          "maxLength": 300
+        },
+        "preservedAuthority": {
+          "type": "string",
+          "maxLength": 200
+        },
+        "safetyEvidence": {
+          "type": "string",
+          "maxLength": 400
+        },
+        "unavailable": {
+          "type": "string",
+          "maxLength": 300
+        }
+      }
+    },
+    "artifact": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "path",
+        "sha256",
+        "bytes"
+      ],
+      "properties": {
+        "path": {
+          "type": "string",
+          "maxLength": 300,
+          "pattern": "^[^/][^\\0]*$"
+        },
+        "sha256": {
+          "type": "string",
+          "pattern": "^[0-9a-f]{64}$"
+        },
+        "bytes": {
+          "type": "integer",
+          "minimum": 0
+        }
+      }
+    },
+    "domainDigests": {
+      "type": "object",
+      "additionalProperties": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": [
+          "count",
+          "sha256"
+        ],
+        "properties": {
+          "count": {
+            "type": "integer",
+            "minimum": 0,
+            "maximum": 1000000
+          },
+          "sha256": {
+            "type": "string",
+            "pattern": "^[0-9a-f]{64}$"
+          }
+        }
+      },
+      "maxProperties": 16
+    },
+    "scenario": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "id",
+        "fixture",
+        "parameters",
+        "supportingTests",
+        "steps",
+        "injections",
+        "authority",
+        "invariants",
+        "disclosureScan",
+        "acknowledgedInputDigest",
+        "canonicalDomainDigests",
+        "knownLimits",
+        "artifacts",
+        "elapsedMs",
+        "verdict"
+      ],
+      "properties": {
+        "id": {
+          "type": "string",
+          "maxLength": 48,
+          "pattern": "^[A-Za-z0-9-]+$"
+        },
+        "fixture": {
+          "type": "string",
+          "maxLength": 8
+        },
+        "parameters": {
+          "type": "object",
+          "additionalProperties": false,
+          "properties": {}
+        },
+        "supportingTests": {
+          "type": "array",
+          "maxItems": 32,
+          "items": {
+            "type": "string",
+            "maxLength": 200
+          }
+        },
+        "steps": {
+          "type": "array",
+          "maxItems": 64,
+          "items": {
+            "$ref": "#/$defs/step"
+          }
+        },
+        "injections": {
+          "type": "array",
+          "maxItems": 32,
+          "items": {
+            "$ref": "#/$defs/injection"
+          }
+        },
+        "authority": {
+          "type": "array",
+          "maxItems": 32,
+          "items": {
+            "$ref": "#/$defs/authority"
+          }
+        },
+        "invariants": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": [
+            "I1",
+            "I2",
+            "I3",
+            "I4",
+            "I5",
+            "I6"
+          ],
+          "properties": {
+            "I1": {
+              "$ref": "#/$defs/invariant"
+            },
+            "I2": {
+              "$ref": "#/$defs/invariant"
+            },
+            "I3": {
+              "$ref": "#/$defs/invariant"
+            },
+            "I4": {
+              "$ref": "#/$defs/invariant"
+            },
+            "I5": {
+              "$ref": "#/$defs/invariant"
+            },
+            "I6": {
+              "$ref": "#/$defs/invariant"
+            }
+          }
+        },
+        "disclosureScan": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": [
+            "cliSteps"
+          ],
+          "properties": {
+            "cliSteps": {
+              "type": "integer",
+              "minimum": 0,
+              "maximum": 4096
+            }
+          }
+        },
+        "acknowledgedInputDigest": {
+          "type": "string",
+          "pattern": "^[0-9a-f]{64}$"
+        },
+        "canonicalDomainDigests": {
+          "type": "array",
+          "maxItems": 32,
+          "items": {
+            "type": "object",
+            "additionalProperties": false,
+            "required": [
+              "label",
+              "domains"
+            ],
+            "properties": {
+              "label": {
+                "type": "string",
+                "maxLength": 96
+              },
+              "domains": {
+                "$ref": "#/$defs/domainDigests"
+              }
+            }
+          }
+        },
+        "knownLimits": {
+          "type": "array",
+          "maxItems": 8,
+          "items": {
+            "$ref": "#/$defs/knownLimit"
+          }
+        },
+        "artifacts": {
+          "type": "array",
+          "maxItems": 64,
+          "items": {
+            "$ref": "#/$defs/artifact"
+          }
+        },
+        "elapsedMs": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "verdict": {
+          "$ref": "#/$defs/verdict"
+        },
+        "failure": {
+          "type": "string",
+          "maxLength": 600
+        }
+      }
+    },
+    "rehearsal": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "schemaVersion",
+        "manifestSha256",
+        "profile",
+        "workers",
+        "focused",
+        "runtime",
+        "runId",
+        "expectedRows",
+        "selection",
+        "pending",
+        "missing",
+        "provenance",
+        "ownedProcesses",
+        "homeRoots",
+        "scenarios",
+        "cleanup",
+        "verdict"
+      ],
+      "properties": {
+        "schemaVersion": {
+          "const": 1
+        },
+        "manifestSha256": {
+          "type": "string",
+          "pattern": "^[0-9a-f]{64}$"
+        },
+        "profile": {
+          "enum": [
+            "default",
+            "full"
+          ]
+        },
+        "workers": {
+          "const": 1
+        },
+        "focused": {
+          "type": "boolean"
+        },
+        "runtime": {
+          "type": [
+            "string",
+            "null"
+          ],
+          "maxLength": 32
+        },
+        "runId": {
+          "type": [
+            "string",
+            "null"
+          ],
+          "pattern": "^[0-9a-f]{32}$"
+        },
+        "expectedRows": {
+          "type": "array",
+          "maxItems": 64,
+          "items": {
+            "type": "string",
+            "maxLength": 48
+          }
+        },
+        "selection": {
+          "type": "array",
+          "maxItems": 64,
+          "items": {
+            "type": "string",
+            "maxLength": 48
+          }
+        },
+        "pending": {
+          "type": "array",
+          "maxItems": 32,
+          "items": {
+            "type": "object",
+            "additionalProperties": false,
+            "required": [
+              "id",
+              "pendingOn"
+            ],
+            "properties": {
+              "id": {
+                "type": "string",
+                "maxLength": 48
+              },
+              "pendingOn": {
+                "type": "array",
+                "maxItems": 8,
+                "items": {
+                  "type": "string",
+                  "maxLength": 200
+                }
+              }
+            }
+          }
+        },
+        "missing": {
+          "type": "array",
+          "maxItems": 64,
+          "items": {
+            "type": "string",
+            "maxLength": 48
+          }
+        },
+        "scenarios": {
+          "type": "array",
+          "maxItems": 64,
+          "items": {
+            "$ref": "#/$defs/scenario"
+          }
+        },
+        "database": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": [
+            "serverVersion",
+            "serverVersionNum"
+          ],
+          "properties": {
+            "serverVersion": {
+              "type": "string",
+              "maxLength": 200
+            },
+            "serverVersionNum": {
+              "type": "string",
+              "maxLength": 16
+            }
+          }
+        },
+        "provenance": {
+          "type": [
+            "object",
+            "null"
+          ],
+          "additionalProperties": false,
+          "required": [
+            "testedCommit",
+            "dirty",
+            "testedInputsSha256",
+            "testedInputsCount",
+            "lockfileSha256",
+            "cliSha256",
+            "node",
+            "unchangedAfterRun"
+          ],
+          "properties": {
+            "testedCommit": {
+              "type": "string",
+              "pattern": "^[0-9a-f]{40}$"
+            },
+            "dirty": {
+              "type": "boolean"
+            },
+            "testedInputsSha256": {
+              "type": "string",
+              "pattern": "^[0-9a-f]{64}$"
+            },
+            "testedInputsCount": {
+              "type": "integer",
+              "minimum": 1
+            },
+            "lockfileSha256": {
+              "type": "string",
+              "pattern": "^[0-9a-f]{64}$"
+            },
+            "cliSha256": {
+              "type": "string",
+              "pattern": "^[0-9a-f]{64}$"
+            },
+            "node": {
+              "type": "string",
+              "maxLength": 64
+            },
+            "unchangedAfterRun": {
+              "type": "boolean"
+            }
+          }
+        },
+        "ownedProcesses": {
+          "type": "array",
+          "maxItems": 4096,
+          "items": {
+            "type": "string",
+            "maxLength": 48
+          }
+        },
+        "homeRoots": {
+          "type": "array",
+          "maxItems": 512,
+          "items": {
+            "type": "string",
+            "maxLength": 300
+          }
+        },
+        "cleanup": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": [
+            "scenarioHomes",
+            "harnessResources"
+          ],
+          "properties": {
+            "scenarioHomes": {
+              "enum": [
+                "verified-absent",
+                "incomplete"
+              ]
+            },
+            "harnessResources": {
+              "enum": [
+                "pending-outer-audit"
+              ]
+            }
+          }
+        },
+        "verdict": {
+          "$ref": "#/$defs/verdict"
+        }
+      }
+    },
+    "cleanupReceipt": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "runtime",
+        "runIds",
+        "containers",
+        "networks",
+        "volumes",
+        "queries",
+        "harnessExited",
+        "tempRootsAbsent",
+        "ownedProcessesExited",
+        "verdict"
+      ],
+      "properties": {
+        "runtime": {
+          "type": "string",
+          "maxLength": 32
+        },
+        "runIds": {
+          "type": "array",
+          "maxItems": 16,
+          "items": {
+            "type": "string",
+            "pattern": "^[0-9a-f]{32}$"
+          }
+        },
+        "containers": {
+          "type": "array",
+          "maxItems": 64,
+          "items": {
+            "type": "string",
+            "maxLength": 128
+          }
+        },
+        "networks": {
+          "type": "array",
+          "maxItems": 64,
+          "items": {
+            "type": "string",
+            "maxLength": 128
+          }
+        },
+        "volumes": {
+          "type": "array",
+          "maxItems": 64,
+          "items": {
+            "type": "string",
+            "maxLength": 128
+          }
+        },
+        "queries": {
+          "type": "array",
+          "maxItems": 64,
+          "items": {
+            "type": "object",
+            "additionalProperties": false,
+            "required": [
+              "runId",
+              "resource",
+              "exitCode",
+              "remaining"
+            ],
+            "properties": {
+              "runId": {
+                "type": "string",
+                "maxLength": 32
+              },
+              "resource": {
+                "enum": [
+                  "container",
+                  "network",
+                  "volume"
+                ]
+              },
+              "exitCode": {
+                "type": "integer"
+              },
+              "remaining": {
+                "type": "array",
+                "maxItems": 64,
+                "items": {
+                  "type": "string",
+                  "maxLength": 128
+                }
+              }
+            }
+          }
+        },
+        "harnessExited": {
+          "type": "boolean"
+        },
+        "tempRootsAbsent": {
+          "type": "boolean"
+        },
+        "ownedProcessesExited": {
+          "type": "boolean"
+        },
+        "verdict": {
+          "enum": [
+            "clean",
+            "residue",
+            "unverified"
+          ]
+        }
+      }
+    },
+    "gate": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "schemaVersion",
+        "source",
+        "problems",
+        "database",
+        "workload",
+        "commands",
+        "rehearsal",
+        "cleanup",
+        "verdict"
+      ],
+      "properties": {
+        "schemaVersion": {
+          "const": 1
+        },
+        "source": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": [
+            "testedCommit",
+            "dirty",
+            "testedInputsSha256",
+            "testedInputsCount",
+            "lockfileSha256",
+            "cliSha256",
+            "node",
+            "pnpm"
+          ],
+          "properties": {
+            "testedCommit": {
+              "type": "string",
+              "pattern": "^[0-9a-f]{40}$"
+            },
+            "dirty": {
+              "const": false
+            },
+            "testedInputsSha256": {
+              "type": "string",
+              "pattern": "^[0-9a-f]{64}$"
+            },
+            "testedInputsCount": {
+              "type": "integer",
+              "minimum": 1
+            },
+            "lockfileSha256": {
+              "type": "string",
+              "pattern": "^[0-9a-f]{64}$"
+            },
+            "cliSha256": {
+              "type": "string",
+              "pattern": "^[0-9a-f]{64}$"
+            },
+            "node": {
+              "type": "string",
+              "maxLength": 64
+            },
+            "pnpm": {
+              "type": "string",
+              "maxLength": 64
+            }
+          }
+        },
+        "problems": {
+          "type": "array",
+          "maxItems": 64,
+          "items": {
+            "type": "string",
+            "maxLength": 300
+          }
+        },
+        "database": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": [
+            "imageReference",
+            "observedImageDigest",
+            "serverVersion",
+            "serverVersionNum"
+          ],
+          "properties": {
+            "imageReference": {
+              "type": "string",
+              "maxLength": 200,
+              "pattern": "@sha256:[0-9a-f]{64}$"
+            },
+            "observedImageDigest": {
+              "type": "string",
+              "maxLength": 80
+            },
+            "serverVersion": {
+              "type": "string",
+              "maxLength": 200
+            },
+            "serverVersionNum": {
+              "type": "string",
+              "maxLength": 16
+            }
+          }
+        },
+        "workload": {
+          "type": "object",
+          "additionalProperties": true,
+          "required": [
+            "profile",
+            "workers",
+            "bounds",
+            "thresholds"
+          ],
+          "properties": {
+            "profile": {
+              "enum": [
+                "default",
+                "full"
+              ]
+            },
+            "workers": {
+              "const": 1
+            },
+            "bounds": {
+              "type": "object",
+              "additionalProperties": true
+            },
+            "thresholds": {
+              "type": "object",
+              "additionalProperties": true
+            }
+          }
+        },
+        "commands": {
+          "type": "array",
+          "maxItems": 16,
+          "items": {
+            "type": "object",
+            "additionalProperties": false,
+            "required": [
+              "command",
+              "exitCode",
+              "elapsedSeconds",
+              "runId"
+            ],
+            "properties": {
+              "command": {
+                "type": "string",
+                "maxLength": 500
+              },
+              "exitCode": {
+                "type": "integer"
+              },
+              "elapsedSeconds": {
+                "type": "integer",
+                "minimum": 0
+              },
+              "runId": {
+                "type": "string",
+                "pattern": "^[0-9a-f]{32}$"
+              }
+            }
+          }
+        },
+        "rehearsal": {
+          "$ref": "#/$defs/rehearsal"
+        },
+        "cleanup": {
+          "$ref": "#/$defs/cleanupReceipt"
+        },
+        "verdict": {
+          "$ref": "#/$defs/verdict"
+        }
+      }
+    }
+  }
+}

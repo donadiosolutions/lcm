@@ -11,9 +11,11 @@ import { dirname } from "node:path";
 import {
   daemonConfigSnapshotWitnessEqual,
   parseDaemonConfig,
+  readDaemonConfigBackendSnapshot,
   readDaemonConfigSnapshot,
   resolveDaemonConfigEnv,
   type DaemonConfig,
+  type DaemonConfigBackendSnapshot,
   type DaemonConfigSnapshotWitness,
 } from "./config.js";
 import { sanitizeError } from "./safe-error.js";
@@ -157,6 +159,8 @@ export type DaemonOptions = {
   _createStorageBackendFactory?: typeof createStorageBackendFactory;
   /** @internal Deterministic config-snapshot seam for daemon read-admission tests. */
   _readDaemonConfigSnapshot?: typeof readDaemonConfigSnapshot;
+  /** @internal Deterministic backend-snapshot seam for identity-only observation admission tests. */
+  _readDaemonConfigBackendSnapshot?: typeof readDaemonConfigBackendSnapshot;
   /** @internal Deterministic daemon UUID seam for invocation-control tests. */
   _daemonInstanceId?: string;
   /** Canonical daemon config path used for request-time publication admission. */
@@ -488,6 +492,8 @@ function assertDaemonReadStorageAdmission(
   publicationHome: string | undefined,
   assertBackendPublicationOverride?: DaemonOptions["_assertBackendPublication"],
   readSnapshot: typeof readDaemonConfigSnapshot = readDaemonConfigSnapshot,
+  tolerateStartupBackendDivergence = false,
+  readBackendSnapshot: typeof readDaemonConfigBackendSnapshot = readDaemonConfigBackendSnapshot,
 ): DaemonReadStorageAdmissionWitness {
   if (assertBackendPublicationOverride !== undefined) {
     const publicationWitness = assertBackendPublicationOverride(publicationHome, startupConfig.storage.backend);
@@ -512,8 +518,13 @@ function assertDaemonReadStorageAdmission(
       assertPrivateDirectory(privateRoot, publicationRoot, privateRoot.witness);
     };
     assertReadRoot();
-    const first = readSnapshot(publicationConfigPath);
-    if (first.config.storage.backend !== startupConfig.storage.backend) {
+    const readBackend = (): DaemonConfigBackendSnapshot => {
+      if (tolerateStartupBackendDivergence) return readBackendSnapshot(publicationConfigPath);
+      const snapshot = readSnapshot(publicationConfigPath);
+      return { backend: snapshot.config.storage.backend, witness: snapshot.witness };
+    };
+    const first = readBackend();
+    if (!tolerateStartupBackendDivergence && first.backend !== startupConfig.storage.backend) {
       throw new BackendPublicationJournalError(
         "unexpected-state",
         "daemon request backend differs from the authenticated startup backend",
@@ -521,12 +532,12 @@ function assertDaemonReadStorageAdmission(
     }
     const publicationWitness = assertBackendPublicationConfigReadAccess(
       publicationConfigPath,
-      first.config.storage.backend,
+      first.backend,
       first.witness,
     );
-    const second = readSnapshot(publicationConfigPath);
+    const second = readBackend();
     if (
-      second.config.storage.backend !== startupConfig.storage.backend
+      (!tolerateStartupBackendDivergence && second.backend !== startupConfig.storage.backend)
       || !daemonConfigSnapshotWitnessEqual(first.witness, second.witness)
     ) {
       throw new BackendPublicationJournalError(
@@ -1131,6 +1142,8 @@ export async function createDaemon(config: DaemonConfig, options?: DaemonOptions
             publicationHome,
             options?._assertBackendPublication,
             options?._readDaemonConfigSnapshot,
+            key === "GET /health/observe",
+            options?._readDaemonConfigBackendSnapshot,
           );
           await route.handler(req, bufferedResponse as unknown as ServerResponse, body, {
             signal: requestSignal,
@@ -1145,6 +1158,8 @@ export async function createDaemon(config: DaemonConfig, options?: DaemonOptions
             publicationHome,
             options?._assertBackendPublication,
             options?._readDaemonConfigSnapshot,
+            key === "GET /health/observe",
+            options?._readDaemonConfigBackendSnapshot,
           );
           if (!daemonReadStorageAdmissionWitnessEqual(admissionWitness, finalWitness)) {
             throw new BackendPublicationJournalError(
