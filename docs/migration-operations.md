@@ -276,7 +276,11 @@ effect already begun, it completes that carried effect without aborting the jour
 `route-resume-required` (exit 6, `next` names the command) while the hold is still intact, rather
 than releasing the hold and leaving a manifest nothing can settle. `abort` settles both sides from
 `planned`, `dry-run-verified`, `copying` and `copied` (nothing pending) and from a hold with no
-manifest yet. An aborted journal beside a pending copy effect is `route-operator-required` (exit 7). A pending effect that appears after the first route is classified again: the refusal is exit 6 naming `resume` only when `resume` may run it, and otherwise the router's own refusal for the new state (for example exit 7).
+manifest yet. An aborted journal beside a pending copy effect is `route-operator-required` (exit 7).
+A pending effect that appears after `abort`'s first route is classified again, with one of three
+outcomes: exit 6 naming `resume` when `resume` may run it; otherwise the router's refusal for the new
+state (for example exit 7, operator required); or `abort-journal-moved` with no `next` when `abort` is
+still admitted, in which case re-run `abort`.
 
 `--confirm-generation <id>` must equal the generation id of the journal. Omitting it refuses
 `abort-confirmation-missing` and a different id refuses `abort-confirmation-moved` (both exit 3,

@@ -224,8 +224,9 @@ async function runMigrationAbortCommand(input: MigrationAbortCommandInput): Prom
 /**
  * Re-routes the journal's own generation (not the explicitly named one, which
  * router row 4 admits while abort acts on the live hold) from a fresh journal
- * observation, so the refusal names resume only when resume may run the late
- * effect and otherwise carries the router's own refusal.
+ * observation. The refusal names resume only when resume may run the late
+ * effect; otherwise it carries the router's own refusal, or abort-journal-moved
+ * (no next) when abort is still admitted.
  */
 async function rerouteLatePendingEffect(input: Readonly<{
   homeDir: string;
