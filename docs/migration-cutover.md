@@ -1102,6 +1102,9 @@ activation is still transfer-only and does not use this ordering yet.
 Readiness evaluates live ACLs. PostgreSQL default privileges are not admission
 evidence and are not inspected here; if they materialize an unexpected grant
 on a later object, the next readiness check refuses that live grant.
+Grantees are matched by role, so an unrelated role whose name is `runtime`,
+`owner`, or `public` is not mistaken for the sanctioned grants and is
+refused.
 
 ### After activation: revoke transfer grants and start the daemon
 

@@ -2577,6 +2577,68 @@ describe("PostgreSQL transfer readiness", () => {
     },
   );
 
+  it.each([
+    ["runtime", "lcm", "USAGE"],
+    ["owner", "lcm", "USAGE"],
+    ["owner", "lcm", "CREATE"],
+    ["public", "public", "USAGE"],
+  ] as const)(
+    "rejects an extra schema grantee named %s that is not a sanctioned grantee",
+    async (role, schema, privilege) => {
+      const fake = readyExecutor({
+        operationOverrides: {
+          inspectSchemaAcl: mutateRows((rows) => {
+            rows.push({
+              schema_name: schema,
+              object_identity: schema,
+              privilege_type: privilege,
+              grantee_is_owner: false,
+              grantee_oid: "303",
+              grantee_name: role,
+              grantor_is_owner: true,
+              is_grantable: false,
+            });
+          }),
+        },
+      });
+
+      await expect(verifyPostgreSqlRuntimeSchema(fake.seam, { expectedOwner: EXPECTED_OWNER }))
+        .rejects.toMatchObject({ reason: "acl-shape", operation: "inspectSchemaAcl" });
+    },
+  );
+
+  it.each([
+    ["inspectRelationAcl", { object_identity: "table|schema_migrations", privilege_type: "SELECT" }],
+    ["inspectColumnAcl", { object_identity: "lcm.message_parts|project_id", privilege_type: "SELECT" }],
+    ["inspectFunctionAcl", {
+      function_identity: "public.digest(text, text)",
+      object_identity: "public.digest(text, text)",
+      extension_name: "pgcrypto",
+      privilege_type: "EXECUTE",
+    }],
+  ] as const)(
+    "rejects an extra grantee named runtime in %s",
+    async (operation, row) => {
+      const fake = readyExecutor({
+        operationOverrides: {
+          [operation]: mutateRows((rows) => {
+            rows.push({
+              ...row,
+              grantee_is_owner: false,
+              grantee_oid: "303",
+              grantee_name: "runtime",
+              grantor_is_owner: true,
+              is_grantable: false,
+            });
+          }),
+        },
+      });
+
+      await expect(verifyPostgreSqlRuntimeSchema(fake.seam, { expectedOwner: EXPECTED_OWNER }))
+        .rejects.toMatchObject({ reason: "acl-shape", operation });
+    },
+  );
+
   it("requires transfer grants and keeps ordinary readiness strict", async () => {
     await expect(verifyPostgreSqlTransferSchema(readyExecutor().seam, {
       expectedOwner: EXPECTED_OWNER,
