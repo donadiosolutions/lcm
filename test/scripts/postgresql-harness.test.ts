@@ -25,7 +25,9 @@ import {
   RUN_LABEL,
   SIGNAL_CLEANUP_FAILURE_MARKER,
   SIGNAL_DIAGNOSTIC_FLUSH_TIMEOUT_MS,
+  appendContainerLogs,
   auditHarnessRunResources,
+  boundedDiagnosticExcerpt,
   classifyOwnerIdentity,
   cleanupHarnessResources,
   completeSignalExit,
@@ -39,6 +41,7 @@ import {
   createRunNames,
   createSignalCleanupDiagnosticParser,
   createSingleFlightOperation,
+  createStreamRedactor,
   discoverHarnessRuns,
   harnessErrorDetails,
   harnessDirectoryFromRecord,
@@ -62,6 +65,7 @@ import {
   runProcess,
   runSanitizedProcess,
   sanitizeHarnessText,
+  sanitizedHarnessErrorDetails,
   signalCleanupFailed,
   stageHarnessScripts,
   validateRunNames,
@@ -1482,7 +1486,7 @@ describe("PostgreSQL harness utilities", () => {
     expect(stderr.write.mock.calls.flat().join(" ")).not.toContain(secret);
   });
 
-  it("fails closed without surfacing truncated or expanded sanitized output", async () => {
+  it("fails closed on unredacted truncated output and reports a bounded excerpt of expanded output", async () => {
     const stdout = { write: vi.fn() };
     const stderr = { write: vi.fn() };
     const truncatedRunner = vi.fn().mockResolvedValue({
@@ -1506,14 +1510,20 @@ describe("PostgreSQL harness utilities", () => {
       stdoutTruncated: false,
       stderrTruncated: false,
     });
-    await expect(runSanitizedProcess("docker", ["start", "--attach", "runner"], {
+    const expanded = await runSanitizedProcess("docker", ["start", "--attach", "runner"], {
       processRunner: expandedRunner,
       secrets: ["x"],
       stdout,
       stderr,
-    })).rejects.toThrow("sanitized output exceeded");
+    }).catch((reason: unknown) => reason) as Error & { stdout: string; stderr: string };
+    expect(expanded).toBeInstanceOf(Error);
+    expect(expanded.message).toContain("sanitized output exceeded");
+    expect(expanded.stdout).toBe("");
+    expect(expanded.stderr).toContain("showing the sanitized tail of each stream");
+    expect(expanded.stderr.endsWith("[REDACTED]")).toBe(true);
+    expect(Buffer.byteLength(expanded.stderr)).toBeLessThan(MAX_CAPTURED_OUTPUT_BYTES / 2);
     expect(stdout.write).not.toHaveBeenCalled();
-    expect(stderr.write).not.toHaveBeenCalled();
+    expect(stderr.write).toHaveBeenCalledExactlyOnceWith(`${expanded.stderr}\n`);
   });
 
   it("captures attached runner output and propagates output-stream errors", async () => {
@@ -1535,7 +1545,7 @@ describe("PostgreSQL harness utilities", () => {
     expect(processRunner).toHaveBeenCalledWith(
       "docker",
       ["start", "--attach", "lcm-pg-runner"],
-      {},
+      { redactSecrets: [] },
     );
     expect(stdout.write).toHaveBeenCalledWith("attached runner passed\n");
     expect(stderr.write).not.toHaveBeenCalled();
@@ -3283,6 +3293,588 @@ describe("PostgreSQL harness utilities", () => {
     expect(sanitized).not.toContain(password);
   });
 });
+
++describe("PostgreSQL harness failure diagnostics", () => {
+  const limit = MAX_CAPTURED_OUTPUT_BYTES;
+  const secret = "Q9#zx!k7@wv~m3";
+  const secretWindows = Array.from({ length: secret.length - 2 }, (_, index) => secret.slice(index, index + 3));
+  const droppedLine = `[redacted: output line exceeded ${limit} bytes]`;
+
+  function fakeChild() {
+    return Object.assign(new EventEmitter(), { stdout: new EventEmitter(), stderr: new EventEmitter() });
+  }
+
+  function leaksSecret(text: string) {
+    return secretWindows.some((window) => text.includes(window));
+  }
+
+  describe("bounded excerpt of the final diagnostic", () => {
+    it("returns short text unchanged and bounds long text to its head and tail", () => {
+      expect(boundedDiagnosticExcerpt("short")).toBe("short");
+      const details = sanitizedHarnessErrorDetails(
+        new Error(`FAILURE-ANCHOR ${"x".repeat(limit + 1)}\nFINAL-LINE`),
+        [],
+      );
+      expect(Buffer.byteLength(details)).toBeLessThanOrEqual(limit);
+      expect(details).toContain("[PostgreSQL harness diagnostic truncated: ");
+      expect(details).toContain("FAILURE-ANCHOR");
+      expect(details.endsWith("FINAL-LINE")).toBe(true);
+      expect(details).not.toContain("exceeded the safe capture limit");
+    });
+
+    it("never splits a multibyte character at either cut", () => {
+      for (let head = 0; head < 9; head += 1) {
+        for (let tail = 0; tail < 9; tail += 1) {
+          const value = `HEAD-ANCHOR\n${"a".repeat(head)}${"€é😀".repeat(30_000)}${"a".repeat(tail)}\nTAIL-ANCHOR`;
+          const excerpt = boundedDiagnosticExcerpt(value);
+          expect(Buffer.byteLength(excerpt)).toBeLessThanOrEqual(limit);
+          expect(excerpt).not.toContain("\ufffd");
+          expect(excerpt).toContain(`truncated: ${Buffer.byteLength(value)} bytes`);
+          expect(excerpt).toContain("HEAD-ANCHOR");
+          expect(excerpt.endsWith("TAIL-ANCHOR")).toBe(true);
+        }
+      }
+    });
+
+    it("redacts a secret placed on either cut before truncating", () => {
+      const sanitizedLength = 2 * limit;
+      const probe = boundedDiagnosticExcerpt("a".repeat(sanitizedLength));
+      const [, head, tail] = /showing first (\d+) and last (\d+)/u.exec(probe)!.map(Number);
+      const marker = "[REDACTED]".length;
+      const cuts = [head, sanitizedLength - tail];
+      for (const cut of cuts) {
+        for (let start = cut - marker - 2; start <= cut + 2; start += 1) {
+          const text = `${"a".repeat(start)}${secret}${"b".repeat(sanitizedLength - start - marker)}`;
+          const details = sanitizedHarnessErrorDetails(new Error(text), [secret]);
+          expect(Buffer.byteLength(details)).toBeLessThanOrEqual(limit);
+          expect(leaksSecret(details)).toBe(false);
+        }
+      }
+    });
+
+    it("reports the failure when startup fails with an oversized diagnostic", async () => {
+      const scratch = mkdtempSync(join(tmpdir(), "lcm-postgresql-oversized-startup-"));
+      const cli = join(scratch, "docker");
+      writeFileSync(cli, "#!/bin/bash\nexit 0\n");
+      chmodSync(cli, 0o755);
+      const write = vi.spyOn(process.stderr, "write").mockImplementation(() => true);
+      vi.stubEnv("GITHUB_ACTIONS", "");
+      vi.stubEnv("LCM_POSTGRES_TEMPLATE_ARCHIVE", "");
+      vi.stubEnv("LCM_TEST_CONTAINER_CLI", cli);
+      try {
+        await expect(runHarness({
+          ci: false,
+          afterRunAllocation() {
+            throw new Error(`FAILURE-ANCHOR ${"x".repeat(limit + 1)}\nFINAL-LINE`);
+          },
+        })).rejects.toThrow("FAILURE-ANCHOR");
+        const startup = write.mock.calls.map(([chunk]) => String(chunk))
+          .find((chunk) => chunk.startsWith("PostgreSQL harness startup failed: "))!;
+        expect(startup).toContain("FAILURE-ANCHOR");
+        expect(startup).toContain("FINAL-LINE");
+        expect(startup).not.toContain("exceeded the safe capture limit");
+        expect(Buffer.byteLength(startup)).toBeLessThanOrEqual(limit + 64);
+      } finally {
+        vi.unstubAllEnvs();
+        write.mockRestore();
+        rmSync(scratch, { recursive: true, force: true });
+      }
+    });
+  });
+
+  describe("createStreamRedactor", () => {
+    it("declines secrets that span lines and ignores empty secrets", () => {
+      expect(createStreamRedactor(["first\nsecond"])).toBeUndefined();
+      const redactor = createStreamRedactor([""])!;
+      expect(redactor.write("plain\n")).toBe("plain\n");
+    });
+
+    it("redacts secrets and URLs split across chunk boundaries", () => {
+      const redactor = createStreamRedactor([secret])!;
+      const output = [
+        redactor.write("login Q9#zx!"),
+        redactor.write("k7@wv~m3 ok postgre"),
+        redactor.write("sql://user:pw@host/db tail\n"),
+        redactor.end(),
+      ].join("");
+      expect(output).toBe("login [REDACTED] ok postgresql://[REDACTED] tail\n");
+    });
+
+    it("decodes multibyte characters split across chunks", () => {
+      const redactor = createStreamRedactor([])!;
+      const bytes = Buffer.from("€ ok\n");
+      expect(redactor.write(bytes.subarray(0, 2))).toBe("");
+      expect(redactor.write(bytes.subarray(2))).toBe("€ ok\n");
+    });
+
+    it("holds the unterminated line and redacts it when the stream ends", () => {
+      const redactor = createStreamRedactor([secret])!;
+      expect(redactor.write("partial " + secret)).toBe("");
+      expect(redactor.end()).toBe("partial [REDACTED]");
+      expect(redactor.end()).toBe("");
+    });
+
+    it("drops PEM blocks from BEGIN through END, including open and repeated blocks", () => {
+      const redactor = createStreamRedactor([])!;
+      expect(redactor.write(
+        "before\n-----BEGIN PRIVATE KEY-----\nbody-1\nbody-2\n-----END PRIVATE KEY-----\nbetween\n"
+        + "-----BEGIN CERTIFICATE-----\nbody-3\n",
+      )).toBe("before\n[REDACTED PEM]\nbetween\n[REDACTED PEM]\n");
+      expect(redactor.write("body-4\npartial body-5")).toBe("");
+      expect(redactor.end()).toBe("");
+      const single = createStreamRedactor([])!;
+      expect(single.write("a -----BEGIN X-----k-----END X----- b\n")).toBe("a [REDACTED PEM] b\n");
+    });
+
+    it("drops an overlong line and keeps a PEM begun inside it redacted", () => {
+      const plain = createStreamRedactor([])!;
+      expect(plain.write("y".repeat(limit + 1))).toBe("");
+      expect(plain.write("y".repeat(limit))).toBe("");
+      expect(plain.end()).toBe(droppedLine);
+
+      const redactor = createStreamRedactor([])!;
+      expect(redactor.write(`ok\n-----BEGIN PRIVATE KEY-----${"k".repeat(limit)}`)).toBe("ok\n");
+      expect(redactor.write("kkk\nbody\n-----END PRIVATE KEY-----\nafter\n")).toBe(`${droppedLine}\nafter\n`);
+
+      const split = createStreamRedactor([])!;
+      expect(split.write(`${"z".repeat(limit + 1)}-----BEG`)).toBe("");
+      expect(split.write("IN X-----more")).toBe("");
+      expect(split.write("\nbody\n-----END X-----\nafter\n")).toBe(`${droppedLine}\nafter\n`);
+
+      const closed = createStreamRedactor([])!;
+      expect(closed.write(`${"w".repeat(limit + 1)}-----BEGIN A-----k-----END A-----`)).toBe("");
+      expect(closed.write("\nnext\n")).toBe(`${droppedLine}\nnext\n`);
+    });
+  });
+
+  describe("runProcess with redacted capture", () => {
+    function capture(child: ReturnType<typeof fakeChild>, redactSecrets: string[] = [secret]) {
+      return runProcess("node", ["vitest.mjs"], { spawnProcess: () => child, redactSecrets })
+        .catch((reason: unknown) => reason) as Promise<{
+          stdout: string;
+          stderr: string;
+          stdoutTruncated: boolean;
+          stderrTruncated: boolean;
+          redacted?: boolean;
+        }>;
+    }
+
+    it("never retains a fragment of a secret cut by the ring", async () => {
+      for (let offset = 0; offset < 32; offset += 1) {
+        const child = fakeChild();
+        const captured = capture(child);
+        child.stdout.emit("data", Buffer.from("prefix Q9#zx"));
+        child.stdout.emit("data", Buffer.from("!k7@wv~m3 suffix\n"));
+        child.stdout.emit("data", Buffer.from(`${"f".repeat(limit - offset - 1)}\n`));
+        child.stderr.emit("data", `stderr ${secret}`);
+        child.emit("close", 1, null);
+        const result = await captured;
+        expect(result.redacted).toBe(true);
+        expect(result.stdoutTruncated).toBe(offset < "prefix [REDACTED] suffix\n".length);
+        expect(leaksSecret(result.stdout)).toBe(false);
+        expect(result.stderr).toBe("stderr [REDACTED]");
+        expect(Buffer.byteLength(result.stdout)).toBeLessThanOrEqual(limit);
+      }
+    });
+
+    it("keeps only the redaction marker for a buffer wholly inside an unterminated PEM", async () => {
+      const child = fakeChild();
+      const captured = capture(child);
+      child.stdout.emit("data", "-----BEGIN PRIVATE KEY-----\n");
+      for (let index = 0; index < 24; index += 1) {
+        child.stdout.emit("data", `${"k".repeat(8_191)}\n`);
+      }
+      child.emit("close", 1, null);
+      const result = await captured;
+      expect(result).toMatchObject({ stdout: "[REDACTED PEM]\n", stdoutTruncated: false, redacted: true });
+    });
+
+    it("drops evicted PEM bodies and recovers after each END", async () => {
+      const child = fakeChild();
+      const captured = capture(child);
+      for (let block = 0; block < 2; block += 1) {
+        child.stdout.emit("data", "-----BEGIN PRIVATE KEY-----\n");
+        for (let index = 0; index < 20; index += 1) child.stdout.emit("data", `${"k".repeat(8_191)}\n`);
+        child.stdout.emit("data", "-----END PRIVATE KEY-----\nafter-" + block + "\n");
+      }
+      child.emit("close", 0, null);
+      const result = await captured;
+      expect(result.stdout).toBe("[REDACTED PEM]\nafter-0\n[REDACTED PEM]\nafter-1");
+      expect(result.stdoutTruncated).toBe(false);
+    });
+
+    it("leaves raw capture in place when a secret spans lines", async () => {
+      const child = fakeChild();
+      const captured = capture(child, ["first\nsecond"]);
+      child.stdout.emit("data", Buffer.alloc(limit + 8, "x"));
+      child.emit("close", 1, null);
+      const result = await captured;
+      expect(result.redacted).toBeUndefined();
+      expect(result.stdoutTruncated).toBe(true);
+    });
+  });
+
+  describe("runSanitizedProcess with truncated output", () => {
+    function runnerFor(child: ReturnType<typeof fakeChild>) {
+      return vi.fn((command: string, args: string[], options: Record<string, unknown>) =>
+        runProcess(command, args, { ...options, spawnProcess: () => child }));
+    }
+
+    function overflow(child: ReturnType<typeof fakeChild>) {
+      for (let index = 0; index < 24; index += 1) child.stdout.emit("data", `${"noise ".repeat(1_000)}\n`);
+      child.stdout.emit("data", `FAIL test/x.test.ts > case\nAssertionError: expected 1 to be 2 ${secret}\n`);
+      child.stderr.emit("data", "stderr-note\n");
+    }
+
+    it("fails with a redacted excerpt instead of discarding a truncated failure", async () => {
+      const child = fakeChild();
+      const stdout = { write: vi.fn() };
+      const stderr = { write: vi.fn() };
+      const processRunner = runnerFor(child);
+      const running = runSanitizedProcess("node", ["vitest.mjs"], {
+        processRunner,
+        secrets: [secret],
+        stdout,
+        stderr,
+      }).catch((reason: unknown) => reason) as Promise<Error & Record<string, unknown>>;
+      overflow(child);
+      child.emit("close", 1, null);
+      const error = await running;
+
+      expect(processRunner.mock.calls[0]![2]).toMatchObject({ redactSecrets: [secret] });
+      expect(error).toMatchObject({
+        message: "node failed",
+        code: 1,
+        stdout: "",
+        stdoutTruncated: false,
+        stderrTruncated: false,
+      });
+      const diagnostic = error.stderr as string;
+      expect(diagnostic).toContain("child output exceeded the safe capture limit");
+      expect(diagnostic).toContain("[stdout tail]\n");
+      expect(diagnostic).toContain("FAIL test/x.test.ts > case\nAssertionError: expected 1 to be 2 [REDACTED]");
+      expect(diagnostic).toContain("[stderr tail]\nstderr-note");
+      expect(leaksSecret(diagnostic)).toBe(false);
+      expect(Buffer.byteLength(diagnostic)).toBeLessThanOrEqual(24 * 1024);
+      expect(harnessErrorDetails(error)).toBe(diagnostic);
+      expect(stdout.write).not.toHaveBeenCalled();
+      expect(stderr.write).toHaveBeenCalledExactlyOnceWith(`${diagnostic}\n`);
+    });
+
+    it("rejects a successful child whose output was truncated and never returns the excerpt", async () => {
+      const child = fakeChild();
+      const stderr = { write: vi.fn() };
+      const running = runSanitizedProcess("node", ["vitest.mjs"], {
+        processRunner: runnerFor(child),
+        secrets: [secret],
+        stdout: { write: vi.fn() },
+        stderr,
+      }).catch((reason: unknown) => reason) as Promise<Error & Record<string, unknown>>;
+      overflow(child);
+      child.emit("close", 0, null);
+      const error = await running;
+
+      expect(error).toBeInstanceOf(Error);
+      expect(error.message).toBe("PostgreSQL harness child output exceeded the safe capture limit");
+      expect(error.stderr).toContain("AssertionError: expected 1 to be 2 [REDACTED]");
+      expect(leaksSecret(error.stderr as string)).toBe(false);
+    });
+
+    it("reports a real failing child whose output overflows the ring", async () => {
+      const script = [
+        "for (let index = 0; index < 400; index += 1) process.stdout.write('noise '.repeat(100) + '\\n');",
+        `process.stdout.write('FAIL real.test.ts ${secret}\\n');`,
+        "process.exitCode = 3;",
+      ].join("");
+      const error = await runSanitizedProcess(process.execPath, ["-e", script], {
+        secrets: [secret],
+        stdout: { write: vi.fn() },
+        stderr: { write: vi.fn() },
+      }).catch((reason: unknown) => reason) as Error & { code: number; stderr: string };
+      expect(error.code).toBe(3);
+      expect(error.stderr).toContain("FAIL real.test.ts [REDACTED]");
+      expect(leaksSecret(error.stderr)).toBe(false);
+    });
+
+    it("keeps the child excerpt in the head of the final diagnostic with the container log tail", async () => {
+      const child = fakeChild();
+      const running = runSanitizedProcess("node", ["vitest.mjs"], {
+        processRunner: runnerFor(child),
+        secrets: [secret],
+        stdout: { write: vi.fn() },
+        stderr: { write: vi.fn() },
+      }).catch((reason: unknown) => reason) as Promise<Error>;
+      overflow(child);
+      child.emit("close", 1, null);
+      const error = await running;
+      appendContainerLogs(error, {
+        stdout: `${"log line\n".repeat(20_000)}LAST-LOG-LINE`,
+        stderr: "",
+        redacted: true,
+      });
+      const details = sanitizedHarnessErrorDetails(error, [secret]);
+      expect(Buffer.byteLength(details)).toBeLessThanOrEqual(limit);
+      expect(details).toContain("FAIL test/x.test.ts > case");
+      expect(details).toContain("[stderr tail]\nstderr-note");
+      expect(details.trimEnd().endsWith("LAST-LOG-LINE")).toBe(true);
+    });
+  });
+
+  describe("PEM markers and overlong lines through the capture path", () => {
+    const begin = "-----BEGIN PRIVATE KEY-----";
+    const end = "-----END PRIVATE KEY-----";
+
+    async function captureChunks(chunks: string[], code = 1) {
+      const child = fakeChild();
+      const running = runProcess("node", ["vitest.mjs"], { spawnProcess: () => child, redactSecrets: [] })
+        .catch((reason: unknown) => reason) as Promise<{
+          stdout: string;
+          stdoutTruncated: boolean;
+          redacted?: boolean;
+        }>;
+      for (const chunk of chunks) child.stdout.emit("data", Buffer.from(chunk));
+      child.emit("close", code, null);
+      return running;
+    }
+
+    it.each([
+      ["adjacent", "", "[REDACTED PEM]\n[REDACTED PEM]\nafter\n"],
+      ["space separated", " ", "[REDACTED PEM]\n [REDACTED PEM]\nafter\n"],
+    ])("redacts a block that opens right after an END (%s)", async (_label, separator, expected) => {
+      const result = await captureChunks([`${begin}\nBODY_ONE\n${end}${separator}${begin}\nCANARY_SECOND\n${end}\nafter\n`]);
+      expect(result.stdout).toBe(expected);
+    });
+
+    it("keeps a BEGIN nested before the first END open until its own END", async () => {
+      const result = await captureChunks([
+        `-----BEGIN CERTIFICATE----- ${begin} inner -----END CERTIFICATE-----\nCANARY_NESTED\n${end}\nafter\n`,
+      ]);
+      expect(result.stdout).toBe("[REDACTED PEM]\nafter\n");
+    });
+
+    it.each(["-----END ", "-----END incomplete"])("never closes a block on the prefix %j of an overlong line", async (prefix) => {
+      const result = await captureChunks([
+        `${begin}${"p".repeat(limit + 1)}${prefix}`,
+        `\nCANARY_OPEN_BODY\n${end}\nafter\n`,
+      ]);
+      expect(result.stdout).not.toContain("CANARY_OPEN_BODY");
+      expect(result.stdout).toBe(`${droppedLine}\nafter\n`);
+      expect(result.stdoutTruncated).toBe(true);
+    });
+
+    it("closes a block opened on an earlier line when the END is on an overlong line", async () => {
+      for (const chunks of [
+        [`${begin}\n${"a".repeat(limit + 1)}${end}\nFAILURE_AFTER_END\n`],
+        [`${begin}\n`, "a".repeat(limit + 1), `${end}\nFAILURE_AFTER_END\n`],
+      ]) {
+        const result = await captureChunks(chunks);
+        expect(result.stdout).toBe(`[REDACTED PEM]\n${droppedLine}\nFAILURE_AFTER_END\n`);
+        expect(result.stdoutTruncated).toBe(true);
+      }
+    });
+
+    it("recognises complete markers split at every position of a normal line", () => {
+      for (let cut = 1; cut < begin.length; cut += 1) {
+        const opening = createStreamRedactor([])!;
+        const opened = opening.write(begin.slice(0, cut))
+          + opening.write(`${begin.slice(cut)}\nBODY_${cut}\n${end}\nAFTER_${cut}\n`) + opening.end();
+        expect(opened).toBe(`[REDACTED PEM]\nAFTER_${cut}\n`);
+      }
+      for (let cut = 1; cut < end.length; cut += 1) {
+        const closing = createStreamRedactor([])!;
+        const closed = closing.write(`${begin}\nBODY\n${end.slice(0, cut)}`)
+          + closing.write(`${end.slice(cut)}\nAFTER_${cut}\n`) + closing.end();
+        expect(closed).toBe(`[REDACTED PEM]\nAFTER_${cut}\n`);
+      }
+    });
+
+    it("recognises complete markers split at every position of dropped text", () => {
+      for (let cut = 1; cut < end.length; cut += 1) {
+        const closing = createStreamRedactor([])!;
+        const closed = closing.write(`${begin}\n${"a".repeat(limit + 1)}${end.slice(0, cut)}`)
+          + closing.write(`${end.slice(cut)}\nFAILURE_${cut}\n`) + closing.end();
+        expect(closed).toContain(`FAILURE_${cut}`);
+      }
+      for (let cut = 1; cut < begin.length; cut += 1) {
+        const opening = createStreamRedactor([])!;
+        const opened = opening.write(`${"z".repeat(limit + 1)}${begin.slice(0, cut)}`)
+          + opening.write(`${begin.slice(cut)}\nCANARY_${cut}\n${end}\nAFTER_${cut}\n`) + opening.end();
+        expect(opened).not.toContain(`CANARY_${cut}`);
+        expect(opened).toContain(`AFTER_${cut}`);
+      }
+    });
+
+    describe("labels of any length", () => {
+      const longLabel = "L".repeat(70);
+      const beginLong = `-----BEGIN ${longLabel}-----`;
+      const endLong = `-----END ${longLabel}-----`;
+      const marker64 = (kind: string) => `-----${kind} ${"M".repeat(64)}-----`;
+
+      async function surface(chunks: string[], code = 1) {
+        const child = fakeChild();
+        let surfaced = "";
+        const sink = { write: (text: string) => { surfaced += text; } };
+        const running = runSanitizedProcess("node", ["vitest.mjs"], {
+          processRunner: (command: string, args: string[], options: Record<string, unknown>) =>
+            runProcess(command, args, { ...options, spawnProcess: () => child }),
+          stdout: sink,
+          stderr: sink,
+        }).then(
+          (result) => ({ stderr: result.stderr, stdout: result.stdout }),
+          (error: Error & { stderr: string }) => ({ stderr: error.stderr, stdout: "" }),
+        );
+        for (const chunk of chunks) child.stdout.emit("data", Buffer.from(chunk));
+        child.emit("close", code, null);
+        const settled = await running;
+        return { surfaced, ...settled };
+      }
+
+      it("redacts a complete block with a long label in one chunk", async () => {
+        const chunks = [`${beginLong}\nCANARY_LONG_BODY\n${endLong}\nafter\n`];
+        expect((await captureChunks(chunks)).stdout).toBe("[REDACTED PEM]\nafter\n");
+        const seen = await surface(chunks);
+        expect(seen.surfaced).not.toContain("CANARY_LONG_BODY");
+        expect(seen.surfaced).toContain("after");
+        expect(seen.stderr + seen.stdout).not.toContain("CANARY_LONG_BODY");
+      });
+
+      it("redacts a long-label block whose BEGIN marker is split across chunks", async () => {
+        for (let cut = 1; cut < beginLong.length; cut += 1) {
+          const result = await captureChunks([
+            beginLong.slice(0, cut),
+            `${beginLong.slice(cut)}\nCANARY_LONG_BODY\n${endLong}\nafter\n`,
+          ]);
+          expect(result.stdout).toBe("[REDACTED PEM]\nafter\n");
+        }
+      });
+
+      it("keeps a long-label block redacted when its BEGIN line is dropped", async () => {
+        const chunks = [
+          `${"p".repeat(limit + 1)}${beginLong}`, `\nCANARY_LONG_BODY\n${endLong}\nafter\n`,
+        ];
+        const result = await captureChunks(chunks);
+        expect(result.stdout).toBe(`${droppedLine}\nafter\n`);
+        expect(result.stdoutTruncated).toBe(true);
+        const seen = await surface(chunks);
+        expect(seen.surfaced).not.toContain("CANARY_LONG_BODY");
+        expect(seen.stderr).not.toContain("CANARY_LONG_BODY");
+        expect(seen.stderr).toContain("after");
+      });
+
+      it("reassembles markers of up to 64 and over 64 label characters split across dropped writes", async () => {
+        const markers = [marker64("BEGIN"), beginLong];
+        const ends = [marker64("END"), endLong];
+        for (const [index, beginMarker] of markers.entries()) {
+          for (let cut = 1; cut < beginMarker.length; cut += 1) {
+            const result = await captureChunks([
+              `${"p".repeat(limit + 1)}${beginMarker.slice(0, cut)}`,
+              `${beginMarker.slice(cut)}\nCANARY_BEGIN_${cut}\n${ends[index]}\nAFTER_${cut}\n`,
+            ]);
+            expect(result.stdout).toBe(`${droppedLine}\nAFTER_${cut}\n`);
+          }
+          for (let cut = 1; cut < ends[index].length; cut += 1) {
+            const result = await captureChunks([
+              `${beginMarker}\n${"p".repeat(limit + 1)}${ends[index].slice(0, cut)}`,
+              `${ends[index].slice(cut)}\nAFTER_${cut}\n`,
+            ]);
+            expect(result.stdout).toBe(`[REDACTED PEM]\n${droppedLine}\nAFTER_${cut}\n`);
+          }
+        }
+      });
+
+      it("does not close a block on a hyphen run inside a dropped label", async () => {
+        const result = await captureChunks([
+          `${begin}\n${"p".repeat(limit + 1)}-----END A--B-----`, `\nCANARY_STILL_OPEN\n${end}\nafter\n`,
+        ]);
+        expect(result.stdout).not.toContain("CANARY_STILL_OPEN");
+        expect(result.stdout.endsWith("after\n")).toBe(true);
+      });
+    });
+
+    it("keeps the retained ring on a character boundary", async () => {
+      const retained: number[] = [];
+      for (const character of ["é", "€", "😀"]) {
+        for (let prefix = 0; prefix < 4; prefix += 1) {
+          const lines = ["a".repeat(prefix) + character.repeat(2_000)];
+          const lineCount = Math.ceil(70_000 / Buffer.byteLength(character.repeat(2_000)));
+          for (let index = 1; index < lineCount; index += 1) lines.push(character.repeat(2_000));
+          const child = fakeChild();
+          const running = runProcess("node", ["x"], { spawnProcess: () => child, redactSecrets: [] })
+            .catch((reason: unknown) => reason) as Promise<{ stdout: string; stdoutTruncated: boolean; redacted?: boolean }>;
+          for (const line of lines) {
+            expect(Buffer.byteLength(line)).toBeLessThan(limit);
+            child.stdout.emit("data", Buffer.from(line + "\n"));
+          }
+          child.emit("close", 1, null);
+          const result = await running;
+          expect(result.stdoutTruncated).toBe(true);
+          expect(result.stdout).toContain(character);
+          expect(result.stdout).not.toContain("\ufffd");
+          expect(Buffer.byteLength(result.stdout)).toBeLessThanOrEqual(limit);
+          retained.push(Buffer.byteLength(result.stdout));
+        }
+      }
+      // Some phases put the cut inside a character, so the ring started later than the byte cap.
+      expect(retained.some((bytes) => bytes < limit)).toBe(true);
+    });
+
+    it.each([
+      ["one chunk", ["z".repeat(limit + 10) + "\nLAST_LINE\n"]],
+      ["newline in the overflow chunk", ["z".repeat(limit), "z".repeat(10) + "\nLAST_LINE\n"]],
+      ["newline in a later chunk", ["z".repeat(limit), "z".repeat(10), "\nLAST_LINE\n"]],
+      ["two chunks forming one line", ["m".repeat(40 * 1024), "m".repeat(40 * 1024) + "\nLAST_LINE\n"]],
+    ])("rejects a successful child whose overlong line was dropped (%s)", async (_label, chunks) => {
+      const child = fakeChild();
+      const running = runSanitizedProcess("node", ["vitest.mjs"], {
+        processRunner: (command: string, args: string[], options: Record<string, unknown>) =>
+          runProcess(command, args, { ...options, spawnProcess: () => child }),
+        stdout: { write: vi.fn() },
+        stderr: { write: vi.fn() },
+      }).then(
+        () => ({ resolved: true } as const),
+        (error: Error & { stderr: string }) => ({ resolved: false, error } as const),
+      );
+      for (const chunk of chunks) child.stdout.emit("data", Buffer.from(chunk));
+      child.emit("close", 0, null);
+      const outcome = await running;
+      expect(outcome.resolved).toBe(false);
+      if (outcome.resolved) return;
+      expect(outcome.error.message).toBe("PostgreSQL harness child output exceeded the safe capture limit");
+      expect(outcome.error.stderr).toContain("LAST_LINE");
+      expect(outcome.error.stderr).toContain(droppedLine);
+    });
+  });
+
+  describe("raw truncated output", () => {
+    it("omits a raw truncated stderr from the harness details", () => {
+      const raw = Object.assign(new Error("docker failed"), {
+        stderr: `tail ${secret}`,
+        stderrTruncated: true,
+      });
+      expect(harnessErrorDetails(raw)).toContain("raw child output omitted");
+      expect(harnessErrorDetails(raw)).not.toContain("tail");
+      expect(harnessErrorDetails(Object.assign(new Error("x"), { stderr: "kept", stderrTruncated: true, redacted: true })))
+        .toBe("kept");
+    });
+
+    it("appends redacted container logs and omits raw truncated ones", () => {
+      const redacted = appendContainerLogs(
+        Object.assign(new Error("failed"), { stderr: "failure" }),
+        { stdout: "out", stderr: "err", redacted: true, stdoutTruncated: true },
+      );
+      expect(redacted).toMatchObject({ stderr: "failure\nout\nerr", stderrTruncated: false });
+
+      const raw = appendContainerLogs(
+        Object.assign(new Error("failed"), { stderr: `partial ${secret}`, stderrTruncated: true }),
+        { stdout: "tail", stderr: "", stderrTruncated: true },
+      );
+      expect(raw.stderr.match(/raw child output omitted/gu)).toHaveLength(2);
+      expect(leaksSecret(raw.stderr)).toBe(false);
+      expect(appendContainerLogs(new Error("no stderr"), { stdout: "", stderr: "" }).stderr).toBe("\n\n");
+    });
+  });
+});
+
 
 describe("PostgreSQL harness container engine selection", () => {
   const owner = { pid: 42, birth: `linux:${testBootId}:123`, scope: testOwnerScope };
