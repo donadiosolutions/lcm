@@ -238,7 +238,7 @@ sections where available.
 
 | Lifecycle edge | LCM hook | What you can rely on | Level |
 |---|---|---|---|
-| Session start (`startup`; `clear` via app-server `sessionStartSource`) | `SessionStart` | A restoration block (marker `<!-- lcm-restoration -->`) is added to the model input before the first request. See [restoration](#memory-after-compaction-and-in-forked-conversations). | Verified for small fixture restorations; larger output Best-effort. A 21,579-byte restoration reached the model truncated to 8,192 bytes ([#1636](https://github.com/donadiosolutions/lcm/issues/1636)); no safe size boundary was established. TUI `/clear` Unverified |
+| Session start (`startup`; `clear` via app-server `sessionStartSource`) | `SessionStart` | A restoration block (marker `<!-- lcm-restoration -->`) is added to the model input before the first request. See [restoration](#memory-after-compaction-and-in-forked-conversations). | Verified for small fixture restorations; larger output Best-effort. Before [#1636](https://github.com/donadiosolutions/lcm/issues/1636) was fixed, a 21,579-byte restoration reached the model truncated to 8,192 bytes because the hook exited before the pipe was drained; the hook now waits for its output to be delivered, and a native Codex run with the fix has not been repeated. No safe size boundary was established. TUI `/clear` Unverified |
 | Resume | `SessionStart` | A conversation that still holds a live restoration gets no second block, including after repeated resumes. | Verified |
 | Fork | `SessionStart` | New Codex 0.163.0 threads default to paginated history when non-ephemeral and the thread store supports it. Their forks reference the parent's history, so the fork receives a second block once while the inherited one stays in context ([#1632](https://github.com/donadiosolutions/lcm/issues/1632)). Forks of legacy-history threads copy the history and get no second block. | Best-effort |
 | Compaction (manual, and automatic before a turn) | `PreCompact`, `SessionStart` (`compact`) | The transcript tail is saved first. A fresh restoration reaches the first request after compaction. After the manual compact call, restoration runs when the next turn starts. In the observed automatic pre-turn path, restoration runs in that same turn after compaction and before `UserPromptSubmit`. Repeated compactions produce one block. Mid-turn, Guardian and post-turn paths remain Unverified. | Verified; other compaction paths Unverified |
@@ -293,13 +293,13 @@ above about 2,500 tokens (default `additionalContextLimit`; `0` disables it): th
 sees a head and tail preview plus a path, and the full text is written to
 `<temp dir>/hook_outputs/<thread id>/<uuid>.txt` on the local disk, so memory text can
 persist in the operating-system temporary directory. The native spill test used a
-foreign 34,823-byte handler. LCM's oversized restoration was cut to 8,192 bytes
-before reaching the spill threshold in these runs, so no LCM restoration spill was
-observed. This truncation is nondeterministic and does not guarantee that LCM memory
-cannot reach Codex's spill path; memory delivered above the effective limit can
-persist there. Large LCM output can be cut before Codex reads it
-([#1636](https://github.com/donadiosolutions/lcm/issues/1636)); 8,192 bytes was the
-observed native result, not a configured cap.
+foreign 34,823-byte handler. Those runs predate the
+[#1636](https://github.com/donadiosolutions/lcm/issues/1636) fix: the hook exited
+before its pipe was drained, so LCM's oversized restoration was cut to 8,192 bytes
+before reaching the spill threshold and no LCM restoration spill was observed. The
+hook now delivers its complete output, so a large restoration can reach Codex's
+spill path; memory delivered above the effective limit can persist there. The
+native spill test has not been repeated with the fix.
 
 **Diagnostics.** `lcm connectors doctor codex` shows whether Codex can run each
 hook (see [readiness](#codex-hook-readiness)). Failures of the hooks themselves
