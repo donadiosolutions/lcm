@@ -59,8 +59,11 @@ describe("activateCutoverSet: scratch is allocated only for a member census (#16
   it("an uninitialized home is classified as a refusal instead of throwing from the scratch allocation", async () => {
     const homeDir = mkdtempSync(join(tmpdir(), "lcm-cutover-set-empty-"));
     roots.push(homeDir);
-    const outcome = await activateCutoverSet({ homeDir, confirmSetId: "cutover-set-1", targetConfig: TARGET_CONFIG });
-    expect(outcome).toMatchObject({ status: "refused", effectBegun: false });
+    const defaults = createCutoverSetActivateDependencies({ homeDir });
+    const allocateScratch = vi.fn(defaults.allocateScratch);
+    const outcome = await activateCutoverSet({ homeDir, confirmSetId: "cutover-set-1", targetConfig: TARGET_CONFIG }, { ...defaults, allocateScratch });
+    expect(outcome).toMatchObject({ status: "refused", step: "S0", reason: "machine-identity-unregistered", effectBegun: false });
+    expect(allocateScratch).not.toHaveBeenCalled();
     expect(scratchDirs(homeDir)).toEqual([]);
   });
 
