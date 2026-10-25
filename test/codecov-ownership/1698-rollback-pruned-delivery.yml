@@ -1,0 +1,8 @@
+references: ["#1698"]
+rationale: >-
+  The rollback sidecar verifier now accepts a local passive event whose remote
+  inbox row was pruned after delivery. The change stays inside the existing
+  rollback module in the migration cutover owner; no file is added, removed,
+  moved or re-owned.
+pins:
+  - ["src/migration/rollback-sidecars.ts", "unit-migration-cutover"]

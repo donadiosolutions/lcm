@@ -47,6 +47,21 @@ export interface BackendPublicationRemoteGuardProvider {
     input: BackendPublicationRemoteContext
       & Readonly<{ fence: BackendPublicationFenceRecord }>,
   ): Promise<void>;
+  /**
+   * Optional capability: read the project's row whichever generation it
+   * names, without refusing another target backend, evidence or machine.
+   *
+   * Declaring it asserts the provider's guard only ever rebinds a RELEASED
+   * row to a different identity and gives every rebinding a strictly greater
+   * fencing token. The coordinator then treats a row of another identity
+   * with a greater token as proof that the journalled fence was released
+   * before a later publication acquired the row (Bug #1651), and finishes
+   * its own release tail without touching that row. Absent, the coordinator
+   * keeps failing closed on any changed identity.
+   */
+  readRemoteGuardForReleaseReconciliation?(
+    input: BackendPublicationRemoteContext,
+  ): Promise<BackendPublicationFenceRecord | null>;
 }
 
 /**
@@ -103,6 +118,12 @@ function assertRemoteGuardChoice(
           `backend publication remote guard provider is missing required method: ${method}`,
         );
       }
+    }
+    const reconcile = provider.readRemoteGuardForReleaseReconciliation;
+    if (reconcile !== undefined && typeof reconcile !== "function") {
+      throw new TypeError(
+        "backend publication remote guard provider readRemoteGuardForReleaseReconciliation must be a function when present",
+      );
     }
     return;
   }
@@ -183,6 +204,10 @@ export function createBackendPublicationDriver(
       acquireRemoteGuard: (input) => provider.acquireRemoteGuard(input),
       readRemoteGuard: (input, operation) => provider.readRemoteGuard(input, operation),
       releaseRemoteGuard: (input) => provider.releaseRemoteGuard(input),
+      ...(provider.readRemoteGuardForReleaseReconciliation === undefined ? {} : {
+        readRemoteGuardForReleaseReconciliation: (input: BackendPublicationRemoteContext) =>
+          provider.readRemoteGuardForReleaseReconciliation!(input),
+      }),
     };
   }
   return driver;

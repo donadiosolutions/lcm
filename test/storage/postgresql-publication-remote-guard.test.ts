@@ -491,6 +491,44 @@ describe("createPostgreSqlBackendPublicationRemoteGuard against a guard double",
   });
 });
 
+describe("createPostgreSqlBackendPublicationRemoteGuard release reconciliation read (Bug #1651)", () => {
+  it("returns the row whichever generation it names, without refusing another machine", async () => {
+    const provider = providerOver(new FenceTable());
+    await expect(provider.readRemoteGuardForReleaseReconciliation!(context())).resolves.toBeNull();
+
+    const table = new FenceTable();
+    for (const row of [
+      { machineId: OTHER_MACHINE, publicationId: OTHER_PUBLICATION },
+      { evidenceSha256: OTHER_EVIDENCE },
+      { targetBackend: "sqlite" as const },
+      { machineId: OTHER_MACHINE },
+      { releasedAtMs: table.nowMs },
+    ]) {
+      table.seed(row);
+      const fence = await providerOver(table).readRemoteGuardForReleaseReconciliation!(context());
+      expect(fence).toMatchObject({
+        projectId: PROJECT,
+        machineId: row.machineId ?? MACHINE,
+        fencingToken: String(table.row!.token),
+        releasedAt: "releasedAtMs" in row ? "2026-08-01T00:00:00.000Z" : null,
+      });
+    }
+  });
+
+  it("declares the capability only when the guard offers the read, and passes the remote project id", async () => {
+    const base = { acquire: vi.fn(), read: vi.fn(), release: vi.fn() };
+    const without = createPostgreSqlBackendPublicationRemoteGuard({ guard: base as never, machineId: MACHINE, ttlMs: TTL_MS });
+    expect("readRemoteGuardForReleaseReconciliation" in without).toBe(false);
+
+    const readForReleaseReconciliation = vi.fn(async () => null);
+    const guard = { ...base, readForReleaseReconciliation };
+    const provider = createPostgreSqlBackendPublicationRemoteGuard({ guard: guard as never, machineId: MACHINE, ttlMs: TTL_MS });
+    await expect(provider.readRemoteGuardForReleaseReconciliation!(context())).resolves.toBeNull();
+    expect(readForReleaseReconciliation).toHaveBeenCalledWith({ projectId: PROJECT });
+    expect(base.read).not.toHaveBeenCalled();
+  });
+});
+
 describe("createPostgreSqlBackendPublicationRemoteGuard construction", () => {
   const guard = (): PostgreSqlBackendPublicationRemoteGuardPort => ({
     acquire: vi.fn(),
@@ -688,13 +726,18 @@ describe("composition: real coordinator, driver, provider and guard over a fence
     const home = makeHome();
     const table = new FenceTable();
     const provider = providerOver(table);
+    const lapse = () => {
+      if (table.row !== null && table.row.releasedAtMs === null && table.row.token === 1) table.expire();
+    };
     const lapsing = {
       ...provider,
       readRemoteGuard: async (ctx: BackendPublicationRemoteContext, operation: "acquire" | "release") => {
-        if (operation === "release" && table.row !== null && table.row.releasedAtMs === null && table.row.token === 1) {
-          table.expire();
-        }
+        if (operation === "release") lapse();
         return provider.readRemoteGuard(ctx, operation);
+      },
+      readRemoteGuardForReleaseReconciliation: async (ctx: BackendPublicationRemoteContext) => {
+        lapse();
+        return provider.readRemoteGuardForReleaseReconciliation!(ctx);
       },
     };
     const coordinator = createBackendPublicationCoordinator({
@@ -783,5 +826,48 @@ describe("composition: real coordinator, driver, provider and guard over a fence
     expect(read(home, "map.json")[HASH_A].remoteProjectId).toBeUndefined();
     expect(table.row).toMatchObject({ publicationId: OTHER_PUBLICATION, releasedAtMs: null });
     expect(existsSync(join(home, ".lcm", "config.json"))).toBe(true);
+  });
+
+  it("finishes the release tail when a later publication rebound the released row (Bug #1651)", async () => {
+    const home = makeHome();
+    const table = new FenceTable();
+    const crashing = createBackendPublicationCoordinator({
+      homeDir: home,
+      observer: (event) => { if (event === "after-release") throw new Error("crash:after-release"); },
+      remoteGuard: { mode: "delegated", provider: providerOver(table) },
+    });
+    const composed = composeBackendPublicationMaterial({ homeDir: home, targetBackend: "postgresql", bindings: [binding] });
+    await crashing.prepare({
+      publicationId: PUBLICATION,
+      sourceBackend: composed.sourceBackend,
+      targetBackend: composed.targetBackend,
+      material: composed.material,
+      projects: composed.projects,
+    });
+    await expect(crashing.resume()).rejects.toThrow("crash:after-release");
+    expect(table.row?.releasedAtMs).not.toBeNull();
+
+    // Another home's publication acquires the released row before the local released checkpoint.
+    const guard = new PostgreSqlBackendPublicationGuard(table.executor());
+    const successor = await guard.acquire({
+      projectId: PROJECT,
+      machineId: OTHER_MACHINE,
+      publicationId: OTHER_PUBLICATION,
+      targetBackend: "postgresql",
+      evidenceSha256: OTHER_EVIDENCE,
+      ttlMs: TTL_MS,
+    });
+    expect(successor.fencingToken).toBe(2n);
+    const writes = table.writes;
+
+    const recovering = createBackendPublicationCoordinator({
+      homeDir: home,
+      remoteGuard: { mode: "delegated", provider: providerOver(table) },
+    });
+    const completed = await recovering.recoverPending();
+    expect(completed?.phase).toBe("completed");
+    expect(table.writes).toBe(writes);
+    expect(table.row).toMatchObject({ machineId: OTHER_MACHINE, publicationId: OTHER_PUBLICATION, token: 2, releasedAtMs: null });
+    expect(completed?.projects[0]?.fence?.fencingToken).toBe("1");
   });
 });

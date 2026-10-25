@@ -42,6 +42,10 @@ create in the same run.
   aside to a lineage path, never truncated, replaced in place, or unlinked.
   It is checkpointed and witnessed by content hash both before and after the
   move, so the preserved copy is provably byte-identical to what was live.
+- Rollback does not delete the destination project or its alias rows in
+  PostgreSQL: the canonical path and every project-map alias that `apply`
+  migrated stay there, and the local project map keeps listing the same
+  aliases.
 
 ## A generation that never activated cannot be rolled back
 
@@ -350,6 +354,25 @@ timestamp by instant rather than as text. The local outbox stores SQLite's
 (`YYYY-MM-DDTHH:MM:SS.ffffffZ`), so both forms of the same instant match and
 rollback proceeds. A malformed timestamp, or one that names a different
 instant, still refuses the run.
+
+A passive event the daemon already drained (its `processed_at` is set) can
+still be listed as pending in PostgreSQL's inbox, because that inbox applies
+events asynchronously. Rollback accepts such a row and leaves it as it is, so
+the SQLite consumer does not replay it. A row the archive
+still holds that genuinely contradicts it, for example one that is
+acknowledged but not processed, refuses the run before rollback publishes
+anything: the canonical database is not replaced and the same rollback can be
+retried once the row is resolved.
+
+After a drain, the replication worker deletes PostgreSQL's inbox row for each
+delivered event and records that locally (`remote_pruned_at`). The archive no
+longer lists such an event, and that is the normal state after a drain, so
+rollback accepts the row and keeps it unchanged. It is not replayed only if its
+`processed_at` was already set; the remote delivery itself applies nothing, so
+a pruned row that was never processed is still promoted by the SQLite
+consumer. A delivered row without that prune record, whose inbox row
+PostgreSQL should still hold but the archive lacks, still refuses the run
+before rollback publishes anything.
 
 ## Running it: `lcm migration rollback`
 
