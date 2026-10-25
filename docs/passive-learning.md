@@ -416,10 +416,10 @@ pass.
 A row can also have reached the previous project without the local outbox
 recording it: the upload committed but the local record was lost, so the row is
 still pending locally with no remote inbox id. The previous project's copy then
-makes every upload of that row to the new project fail, and the failure takes
-the rest of its batch with it. When an upload fails and the new project lacks
-some of the rows, the same recovery runs for those rows right away, and the
-batch is uploaded once more without the rows that cannot go:
+makes every upload of that row to the new project fail, and a batch holding it
+fails as a whole. When an upload fails and the new project lacks some of the
+rows, the same recovery runs for those rows right away, and the batch is
+uploaded once more without the rows that cannot go:
 
 - an undelivered copy is withdrawn and the row is uploaded to the new project
   in the same pass;
@@ -430,6 +430,16 @@ batch is uploaded once more without the rows that cannot go:
 - a copy that differs from the row is never changed. One error naming the rows
   is reported, and once the row has been attempted the configured number of
   times it is quarantined locally.
+
+The same holds for a row whose copy in the project the machine is bound to
+differs from it (the same event identity with other content), which is what
+makes an upload fail when the batch holds it. That row is retried with backoff
+on its own, and quarantined locally once it has been attempted the configured
+number of times, whichever row of the batch the failed upload named. One error
+naming the differing rows is reported per pass. The other rows of the batch are
+uploaded in the same pass instead of waiting for it. If the extra upload then
+fails because another copy differs, the rows of that upload are retried with
+backoff and the next pass settles the differing rows again.
 
 The other rows of that batch are normally uploaded in the same pass instead of
 waiting for the row that failed it. If the new upload fails again, or the
