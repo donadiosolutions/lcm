@@ -5,6 +5,7 @@ import { join } from "node:path";
 import { fileURLToPath } from "node:url";
 import { buildSync } from "esbuild";
 import { afterAll, beforeAll, describe, expect, it } from "vitest";
+import { writeHookOutput } from "../../src/cli/hook-output.js";
 
 // #1636: a real OS pipe whose reader is slower than the writer. Without the
 // helper the child's exit() discards the output still queued in the pipe.
@@ -73,6 +74,12 @@ afterAll(() => {
 });
 
 describe("hook output over a real pipe", () => {
+  // The child bundles the helper from source; this import is what relates the
+  // test to src/cli/hook-output.ts in Vitest's module graph for PR test selection.
+  it("exercises the helper the hooks use", () => {
+    expect(writeHookOutput).toBeTypeOf("function");
+  });
+
   it("loses output when the process exits right after write(), which is what the helper prevents", async () => {
     const result = await run(withoutHelper, "slow");
     expect(result.code).toBe(7);

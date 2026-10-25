@@ -3,6 +3,8 @@ rationale: >-
   #1636 makes the hook commands wait for their stdout to be flushed before
   exiting. The helper that writes the output is a new file under src/cli/,
   which the existing CLI owner already covers, so it stays with the hook
-  entrypoints it serves.
+  entrypoints it serves. bin/lcm.ts only awaits the helper before exiting
+  from the seven hook actions and keeps its existing CLI owner.
 pins:
   - ["src/cli/hook-output.ts", "unit-cli"]
+  - ["bin/lcm.ts", "unit-cli"]
