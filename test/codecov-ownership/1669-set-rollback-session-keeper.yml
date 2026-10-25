@@ -1,0 +1,8 @@
+references: ["#1669"]
+rationale: >-
+  #1669 stops and clears the cutover-set rollback's set keeper when opening
+  the member sessions fails, so a keeper that is set always means every
+  member session of the call is open. The change stays inside the existing
+  cutover-set rollback module and keeps its migration cutover owner.
+pins:
+  - ["src/migration/cutover-set-rollback.ts", "unit-migration-cutover"]

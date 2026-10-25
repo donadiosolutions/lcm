@@ -1252,11 +1252,20 @@ function memberTarget(ctx: Context, member: Member): RollbackSessionTarget {
   };
 }
 
-/** Open every member's fenced session in manifest order (lease, then set quiescence or recovery admission); the keeper spans them. Every route opens the sessions once per call. */
+/**
+ * Open every member's fenced session in manifest order (lease, then set quiescence or recovery admission); the keeper spans them. Every route opens the sessions once per call.
+ * A blocked exit stops and clears the keeper, leaving any sessions already opened on their members for the call's cleanup to release or close.
+ * From the return until that cleanup, `ctx.keeper !== null` iff every member session of this call is open; the keeper is set while the opens are in progress.
+ * `blocked()` records the member's reason and detail; it does not use the keeper.
+ */
 async function openSessions(ctx: Context, recovery: boolean): Promise<Exit | null> {
   ctx.keeper = startSetKeeper(ctx);
   for (const member of ctx.members) {
-    if (ctx.input.signal?.aborted === true) return blocked(ctx, "sessions", member, "cancelled", "the rollback was cancelled before the member's session was opened");
+    if (ctx.input.signal?.aborted === true) {
+      await ctx.keeper.stop();
+      ctx.keeper = null;
+      return blocked(ctx, "sessions", member, "cancelled", "the rollback was cancelled before the member's session was opened");
+    }
     try {
       member.session = await ctx.deps.openMemberSession({
         homeDir: ctx.homeDir, lockToken: ctx.token, generationId: member.generationId, publicationId: ctx.setId, runtime: ctx.runtime!,
@@ -1264,6 +1273,8 @@ async function openSessions(ctx: Context, recovery: boolean): Promise<Exit | nul
       }, memberTarget(ctx, member), ctx.deps.sessionDependencies);
     } catch (error) {
       const failure = sessionFailure(error);
+      await ctx.keeper.stop();
+      ctx.keeper = null;
       return blocked(ctx, "sessions", member, failure.reason, failure.detail);
     }
   }
@@ -1739,7 +1750,10 @@ async function revalidateFrozenMember(ctx: Context, member: Member, consequence:
   return null;
 }
 
-/** The sessions of a call are opened once: a re-prepare after an abort reacquires them when the abort was settled without them. */
+/**
+ * The sessions of a call are opened once: a re-prepare after an abort reacquires them when the abort was settled without them.
+ * A route that continued after a partial open would have to close or skip the surviving sessions first: reopening would drop an open session object.
+ */
 async function ensureSessions(ctx: Context): Promise<Exit | null> {
   if (ctx.keeper !== null) return null;
   return openSessions(ctx, true);
