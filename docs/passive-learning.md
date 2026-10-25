@@ -242,7 +242,7 @@ When the daemon processes queued events, it applies three promotion tiers:
 
 **Tier 2 — Batch promotion** (priority 2): Git and environment events are promoted with moderate confidence (0.3).
 
-**Tier 3 — Pattern reinforcement** (priority 3): File access and tool usage events start as low-confidence signals. A one-off event is skipped unless it matches an existing entry in the promoted store. To bootstrap a new promotion without a seed, the same pattern must appear at least three times across at least two distinct sessions in recent sidecar history. Within one batch, successful reinforcement lookups are reused. A transient lookup failure leaves only that event unprocessed and retryable; a later sibling with the same pattern performs an independent retry. The reinforcement boost only applies on the insert path for a new memory, not when re-confirming an already-promoted entry.
+**Tier 3 — Pattern reinforcement** (priority 3): File access and tool usage events start as low-confidence signals. A one-off event is skipped unless lexical search finds a related entry in the promoted store; it is then stored as a new memory unless its text is exactly the same as an existing one. To bootstrap a new promotion without a seed, the same pattern must appear at least three times across at least two distinct sessions in recent sidecar history. Within one batch, successful reinforcement lookups are reused. A transient lookup failure leaves only that event unprocessed and retryable; a later sibling with the same pattern performs an independent retry. The reinforcement boost only applies on the insert path for a new memory, not when re-confirming an already-promoted entry.
 
 With PostgreSQL selected, passive promotion searches the current owner's promoted
 knowledge across its provenance values. This lets an event converge with a
@@ -553,6 +553,8 @@ described above are intentionally not part of this configuration:
 
 When a pattern crosses the reinforcement threshold, `reinforcementBoost` is added to the base pattern confidence, capped by `maxConfidence`, only when bootstrapping a new promoted entry.
 
+`compaction.promotionThresholds.dedupBm25Threshold` is still accepted for compatibility but no longer causes different text to merge; only exactly the same text is deduplicated.
+
 ## Data Storage
 
 - **Sidecar DB**: `~/.lcm/events/<sha256-of-project-path>.db`
@@ -650,7 +652,7 @@ no sidecar is deleted underneath it.
 - **Promoted store**: Events promoted via `deduplicateAndInsert()` into the main LCM database
   - Tagged with `source:passive-capture` and `hook:<PostToolUse|UserPromptSubmit>`
   - Searchable via `lcm search` and `lcm grep`
-  - Deduplicated via BM25 matching
+  - Deduplicated by exact text: only an event whose text is exactly the same as an active memory merges into it
 
 ## Negative-Match Guards
 

@@ -619,16 +619,15 @@ describe("PostgreSQL lexical-search repository", () => {
       thresholds: { dedupBm25Threshold: 0.2, dedupCandidateLimit: 10 },
     };
 
-    await expect(deduplicateAndInsert(input)).resolves.toBe(memoryId);
-    expect(update).toHaveBeenLastCalledWith(memoryId, {
-      confidence: 0.8,
-      tags: ["existing", "incoming"],
-    });
-    expect(insert).not.toHaveBeenCalled();
+    // A nonidentical candidate never merges, even when its primary rank
+    // clears the configured threshold.
+    await expect(deduplicateAndInsert(input)).resolves.toBe(thirdMemoryId);
+    expect(update).not.toHaveBeenCalled();
+    expect(insert).toHaveBeenCalledTimes(1);
 
     candidates = [fallbackCandidate];
     await expect(deduplicateAndInsert(input)).resolves.toBe(thirdMemoryId);
-    expect(insert).toHaveBeenCalledTimes(1);
+    expect(insert).toHaveBeenCalledTimes(2);
 
     candidates = [{ ...fallbackCandidate, content: input.content }];
     await expect(deduplicateAndInsert(input)).resolves.toBe(secondMemoryId);

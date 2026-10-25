@@ -659,7 +659,7 @@ describe("portable-knowledge — import", () => {
     const content = "red two collapse race content";
     const r1Id = store.insert({ content, tags: ["r1-tag"], projectId: projId, confidence: 0.5 });
     store.update(r1Id, { metadata: { r1: "keep", [IMPORT_DIGESTS_KEY]: ["b".repeat(64)] } });
-    const r2Content = "red two collapse race content variant fuzzy";
+    const r2Content = content;
     const r2Id = store.insert({ content: r2Content, tags: ["r2-tag"], projectId: projId, confidence: 0.4 });
     store.update(r2Id, { metadata: { r2: "retain", r1: "loses", [IMPORT_DIGESTS_KEY]: ["c".repeat(64)] } });
     const foreignId = store.insert({
@@ -678,6 +678,9 @@ describe("portable-knowledge — import", () => {
       return scanCalls === 1 ? rows.filter((row) => row.id !== r2Id) : rows;
     });
     const search = vi.spyOn(PromotedStore.prototype, "search").mockImplementation(() => [{
+      id: r1Id, content, tags: ["r1-tag"], projectId: projId,
+      sessionId: null, confidence: 0.5, createdAt: "2026-01-01T00:00:00.000Z", rank: -20,
+    }, {
       id: r2Id, content: r2Content, tags: ["r2-tag"], projectId: projId,
       sessionId: null, confidence: 0.4, createdAt: "2026-01-01T00:00:00.000Z", rank: -20,
     }]);
@@ -752,7 +755,7 @@ describe("portable-knowledge — import", () => {
     const content = "collapsed row absent canonical content";
     const r1Id = store.insert({ content, tags: ["r1"], projectId: projId, confidence: 0.5 });
     store.update(r1Id, { metadata: { r1: "keep" } });
-    const r2Content = "collapsed row absent fuzzy variant content";
+    const r2Content = content;
     const r2Id = store.insert({ content: r2Content, tags: ["r2"], projectId: projId, confidence: 0.4 });
     store.update(r2Id, { metadata: { r2: "would-be-lost" } });
 
@@ -1001,9 +1004,12 @@ describe("portable-knowledge — import", () => {
     try {
       const store = new PromotedStore(db);
       const rows = store.getAll();
-      store.update(rows[0].id, { metadata: { ...JSON.parse(rows[0].metadata), canonicalNote: "keep", ...JSON.parse('{"__proto__":{"preserved":"metadata"}}') } });
-      store.update(rows[1].id, { metadata: { ...JSON.parse(rows[1].metadata), collapsedNote: "retain" } });
-      const search = vi.spyOn(PromotedStore.prototype, "search").mockImplementation(() => rows.map((row) => ({
+      // Only byte-identical content collapses: give both rows the incoming text
+      // while keeping the import-digest metadata the first import recorded.
+      store.update(rows[0].id, { content: "combined note", metadata: { ...JSON.parse(rows[0].metadata), canonicalNote: "keep", ...JSON.parse('{"__proto__":{"preserved":"metadata"}}') } });
+      store.update(rows[1].id, { content: "combined note", metadata: { ...JSON.parse(rows[1].metadata), collapsedNote: "retain" } });
+      const collapsing = store.getAll();
+      const search = vi.spyOn(PromotedStore.prototype, "search").mockImplementation(() => collapsing.map((row) => ({
         id: row.id, content: row.content, tags: JSON.parse(row.tags), projectId: row.project_id,
         sessionId: row.session_id, confidence: row.confidence, createdAt: row.created_at, rank: -20,
       })));
