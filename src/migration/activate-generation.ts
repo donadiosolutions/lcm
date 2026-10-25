@@ -800,14 +800,14 @@ function projectBinding(ctx: Context): ProjectBinding {
 /** The own journal records the config as published: yes needs the live selection to match it. */
 const APPLIED_YES_PHASES: readonly BackendPublicationJournal["phase"][] = ["config-published", "releasing", "released", "completed"];
 /** The write may be in flight: never proven either way, even when the live selection equals the source. */
-const APPLIED_IN_FLIGHT_PHASES: readonly BackendPublicationJournal["phase"][] = ["map-publishing", "map-published", "config-publishing"];
+export const APPLIED_IN_FLIGHT_PHASES: readonly BackendPublicationJournal["phase"][] = ["map-publishing", "map-published", "config-publishing"];
 
-function digestsMatch(live: MigrationActivationSelectionDigests, configSha256: string, projectMapSha256: string): boolean {
+export function digestsMatch(live: MigrationActivationSelectionDigests, configSha256: string, projectMapSha256: string): boolean {
   return live.configSha256 === configSha256 && live.projectMapSha256 === projectMapSha256;
 }
 
 /** The digest of a recovery file under the journal convention: raw bytes for the config, canonical JSON for the map, {} when absent. */
-function recoveryFileDigests(config: BackendPublicationRecoveryFile, projectMap: BackendPublicationRecoveryFile): MigrationActivationSelectionDigests {
+export function recoveryFileDigests(config: BackendPublicationRecoveryFile, projectMap: BackendPublicationRecoveryFile): MigrationActivationSelectionDigests {
   return {
     configSha256: createHash("sha256").update(config.presence === "present" ? config.content : "{}").digest("hex"),
     projectMapSha256: backendPublicationCanonicalSha256(

@@ -102,7 +102,7 @@ describe("activateCutoverSet faults: entry, records and journals", () => {
     await crashAt(f, "after-checkpoint");
     reads = 0;
     expect(await f.run({ readMaintenanceJournal: (homeDir) => { reads += 1; if (reads === 2) throw new Error("injected under barrier"); return journal(homeDir); } }))
-      .toMatchObject({ status: "interrupted", step: "S12", cause: "journal-unexpected", applied: "no" });
+      .toMatchObject({ status: "interrupted", step: "S12", cause: "journal-unexpected", applied: "unknown" });
   });
 
   it("classifies applied from the journals when an interruption is reported", async () => {
@@ -113,9 +113,9 @@ describe("activateCutoverSet faults: entry, records and journals", () => {
     // The journal read inside classifyApplied throws: applied is unknown.
     expect(await f.run({ readMaintenanceJournal: (homeDir) => { reads += 1; if (reads > 2) throw new Error("later read"); return journal(homeDir); }, readArtifact: () => null }))
       .toMatchObject({ status: "interrupted", applied: "unknown" });
-    // A live publication of another id, and an in-flight own publication.
+    // A live publication of another id with no source witness in the context, and an in-flight own publication.
     expect(await f.run({ readArtifact: () => null, readMaintenanceJournal: () => null, readPublicationJournal: () => ({ publicationId: "other", phase: "completed" }) as never }))
-      .toMatchObject({ status: "interrupted", applied: "no" });
+      .toMatchObject({ status: "interrupted", applied: "unknown" });
     expect(await f.run({ readArtifact: () => null, readMaintenanceJournal: () => null, readPublicationJournal: () => ({ publicationId: f.setId, phase: "map-published" }) as never }))
       .toMatchObject({ status: "interrupted", applied: "unknown" });
   });
