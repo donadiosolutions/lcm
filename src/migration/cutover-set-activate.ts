@@ -21,6 +21,7 @@ import {
 import type { ComposeBackendPublicationMaterialResult } from "../storage/backend-publication-material.js";
 import type { StorageIdentityContext } from "../storage/contracts.js";
 import { StorageOperationError } from "../storage/errors.js";
+import { PortableStreamError } from "../storage/portable-record.js";
 import type { PostgreSqlConnectionSettings, PostgreSqlQueryExecutor } from "../storage/postgresql/contracts.js";
 import { connectionSettings } from "../storage/postgresql/factory.js";
 import {
@@ -28,7 +29,9 @@ import {
   POSTGRESQL_BACKEND_PUBLICATION_RESOURCE_TYPE,
 } from "../storage/postgresql/publication-guard.js";
 import {
+  APPLIED_IN_FLIGHT_PHASES,
   createMigrationActivationDependencies,
+  digestsMatch,
   MigrationActivationError,
   type MigrationActivationDependencies,
   type MigrationActivationInterruptionCause,
@@ -37,6 +40,7 @@ import {
   type MigrationActivationRefusalReason,
   type MigrationActivationRefusalStep,
   type MigrationActivationSnapshot,
+  recoveryFileDigests,
   type MigrationActivationTriState,
 } from "./activate-generation.js";
 import {
@@ -284,6 +288,7 @@ export type CutoverSetActivateDependencies = MigrationActivationDependencies & R
 export function createCutoverSetActivateDependencies(input: Readonly<{ homeDir: string }>): CutoverSetActivateDependencies {
   return {
     ...createMigrationActivationDependencies(input),
+    allocateScratch: (home) => mkdtempSync(join(lcmHomeDir(home), "cutover-set-activation-scratch-")),
     resolveAuthorities: resolveCutoverSetMemberAuthorities,
     readCanonicalPath: readProjectMapCanonicalPath,
     resolveExpectedIdentity: resolveMigrationExpectedIdentity,
@@ -354,7 +359,6 @@ type Context = {
   readonly coordinates: NonSecretPostgreSqlTarget;
   readonly maxProbeOrdinal: number;
   readonly now: () => Date;
-  readonly scratchParent: string;
   machineId: string;
   token: BackendPublicationLockToken;
   manifest: BackendCutoverSetManifest | null;
@@ -422,20 +426,41 @@ function refused(
   return { exit: { status: "refused", setId: ctx.setId, step, reason, detail, failures, members: memberResults(ctx), effectBegun: false } };
 }
 
+/** The own journal records the config as published: yes needs the live selection to match it. */
 const APPLIED_YES_PHASES: readonly BackendPublicationJournal["phase"][] = ["config-published", "releasing", "released", "completed"];
 
+/** "no" only when the live selection still equals the set's pre-publication source witness; otherwise "unknown". */
+function classifyAgainstSource(ctx: Context): MigrationActivationTriState {
+  // The witness enters the context at compose or at the stored artifact load;
+  // an interruption before either has no source proof.
+  const source = ctx.material?.material.source ?? ctx.artifact?.source;
+  if (source === undefined) return "unknown";
+  const witness = recoveryFileDigests(source.config, source.projectMap);
+  return digestsMatch(ctx.deps.readSelectionDigests(ctx.homeDir), witness.configSha256, witness.projectMapSha256) ? "no" : "unknown";
+}
+
+/**
+ * applied is evidence-derived: the journal phase says what was attempted, and
+ * an independent readback of the live config and project map must agree
+ * before it is reported (the single-generation rules of activate-generation.ts).
+ * Everything else, including any readback failure, is unknown. Never throws.
+ */
 function classifyApplied(ctx: Context): MigrationActivationTriState {
-  let journal: BackendPublicationJournal | null;
   try {
     const maintenance = ctx.deps.readMaintenanceJournal(ctx.homeDir);
-    if (maintenance !== null) return maintenance.sourceBackend === "sqlite" ? "no" : "unknown";
-    journal = ctx.deps.readPublicationJournal(ctx.homeDir);
+    if (maintenance !== null) return maintenance.sourceBackend === "sqlite" ? classifyAgainstSource(ctx) : "unknown";
+    const journal = ctx.deps.readPublicationJournal(ctx.homeDir);
+    if (journal === null || journal.publicationId !== ctx.setId) return classifyAgainstSource(ctx);
+    if (APPLIED_IN_FLIGHT_PHASES.includes(journal.phase)) return "unknown";
+    const live = ctx.deps.readSelectionDigests(ctx.homeDir);
+    if (APPLIED_YES_PHASES.includes(journal.phase)) {
+      const { publishedConfigSha256, publishedProjectMapSha256 } = journal;
+      return publishedConfigSha256 !== null && publishedProjectMapSha256 !== null && digestsMatch(live, publishedConfigSha256, publishedProjectMapSha256) ? "yes" : "unknown";
+    }
+    return digestsMatch(live, journal.expectedConfigSha256, journal.expectedProjectMapSha256) ? "no" : "unknown";
   } catch {
     return "unknown";
   }
-  if (journal === null || journal.publicationId !== ctx.setId) return "no";
-  if (APPLIED_YES_PHASES.includes(journal.phase)) return "yes";
-  return "unknown";
 }
 
 function interrupted(
@@ -492,37 +517,32 @@ export async function activateCutoverSet(
     // The coordinates helper refuses only through its typed MigrationIdentityError.
     throw new MigrationActivationError("invalid-input", "cutover-set activation target is invalid: " + (error as Error).message);
   }
-  const scratchParent = mkdtempSync(join(lcmHomeDir(input.homeDir), "cutover-set-activation-scratch-"));
   const ctx: Context = {
     input, deps, homeDir: input.homeDir, setId: input.confirmSetId,
     settings: connectionSettings(input.targetConfig), expectedOwner: input.targetConfig.postgresql.migrationRole,
     coordinates, maxProbeOrdinal: input.maxProbeOrdinal ?? DEFAULT_MAX_PROBE_ORDINAL,
-    now: input.now ?? (() => new Date()), scratchParent,
+    now: input.now ?? (() => new Date()),
     machineId: "", token: {} as BackendPublicationLockToken, manifest: null, members: [], journal: null, records: null,
     checkpoint: null, selection: null, artifact: null, material: null, identityDigest: null,
     ordinary: null, guard: null, coordinator: null, effectBegun: false, resumedFrom: "fresh",
   };
-  try {
-    // The append barrier itself refuses a maintenance-entering journal, so that
-    // row of the routing table is classified before the barrier (as the
-    // preparation classifies its entry); every other row is read again under it.
-    const entering = classifyEnteringBeforeBarrier(ctx);
-    if (entering !== null) return entering;
-    return await deps.withAppendBarrier(input.homeDir, async (token) => {
-      ctx.token = token;
-      try {
-        return await withPreEffectLeasesReleased(ctx, await runUnderBarrier(ctx));
-      } catch (error) {
-        // Best effort, only when readback proves no member effect began: the original error is the outcome.
-        if (ctx.guard !== null && headsPositivelyUnbegun(ctx)) await releaseAcquiredLeases(ctx);
-        throw error;
-      } finally {
-        if (ctx.ordinary !== null) await ctx.ordinary.close();
-      }
-    });
-  } finally {
-    rmSync(scratchParent, { recursive: true, force: true });
-  }
+  // The append barrier itself refuses a maintenance-entering journal, so that
+  // row of the routing table is classified before the barrier (as the
+  // preparation classifies its entry); every other row is read again under it.
+  const entering = classifyEnteringBeforeBarrier(ctx);
+  if (entering !== null) return entering;
+  return await deps.withAppendBarrier(input.homeDir, async (token) => {
+    ctx.token = token;
+    try {
+      return await withPreEffectLeasesReleased(ctx, await runUnderBarrier(ctx));
+    } catch (error) {
+      // Best effort, only when readback proves no member effect began: the original error is the outcome.
+      if (ctx.guard !== null && headsPositivelyUnbegun(ctx)) await releaseAcquiredLeases(ctx);
+      throw error;
+    } finally {
+      if (ctx.ordinary !== null) await ctx.ordinary.close();
+    }
+  });
 }
 
 function classifyEnteringBeforeBarrier(ctx: Context): CutoverSetActivateResult | null {
@@ -543,8 +563,12 @@ async function runUnderBarrier(ctx: Context): Promise<CutoverSetActivateResult> 
   try {
     ctx.machineId = ctx.deps.machineId(ctx.homeDir);
   } catch (error) {
-    if (!(error instanceof MachineIdentityFileError)) throw error;
-    return refused(ctx, "S0", "machine-identity-unregistered", error.message).exit;
+    if (error instanceof MachineIdentityFileError) return refused(ctx, "S0", "machine-identity-unregistered", error.message).exit;
+    // A filesystem error reading the identity file is unresolvable state; anything else is not a classified condition.
+    if (error instanceof Error && typeof (error as NodeJS.ErrnoException).code === "string") {
+      return refused(ctx, "S0", "state-unresolvable", "the machine identity could not be resolved: " + error.message).exit;
+    }
+    throw error;
   }
   const records = ctx.deps.readRecords({ homeDir: ctx.homeDir, setId: ctx.setId });
   if (records.state === "unresolvable") {
@@ -895,7 +919,12 @@ function gate(ctx: Context, step: MigrationActivationRefusalStep): Exit | null {
   return refused(ctx, step, decision.reason, detail, decision.failures);
 }
 
-async function identityCheck(ctx: Context, member: Member, executor: PostgreSqlQueryExecutor): Promise<string | null> {
+type TargetFailure = Readonly<{ reason: string; detail: string }>;
+
+/** A destination identity check: null when it matches, else a drift or a target failure to record on the member. */
+type IdentityOutcome = Readonly<{ kind: "drift"; detail: string }> | Readonly<{ kind: "target"; failure: TargetFailure }> | null;
+
+async function identityCheck(ctx: Context, member: Member, executor: PostgreSqlQueryExecutor, step: string): Promise<IdentityOutcome> {
   let live: MigrationDestinationIdentity;
   try {
     live = await ctx.deps.captureDestinationIdentity(executor, member.remoteProjectId, ctx.input.signal);
@@ -910,19 +939,36 @@ async function identityCheck(ctx: Context, member: Member, executor: PostgreSqlQ
     );
   } catch (error) {
     if (error instanceof Error && error.name === "MigrationVerificationDriverError") {
-      return "the live destination identity does not match the sealed manifest: " + error.message;
+      return { kind: "drift", detail: "the live destination identity does not match the sealed manifest: " + error.message };
     }
-    throw error;
+    return { kind: "target", failure: targetFailure(error, step + " destination identity query") };
   }
   if (live.sealedWitnessSha256 !== member.report!.body.destinationIdentity.sealedWitnessSha256) {
-    return "the live destination identity does not match the verification report";
+    return { kind: "drift", detail: "the live destination identity does not match the verification report" };
   }
   return null;
 }
 
-function targetFailure(error: unknown, stage: string): Readonly<{ reason: string; detail: string }> {
-  if (!(error instanceof StorageOperationError)) throw error;
-  const attributed = classifyMigrationTargetFailure(error, stage);
+/** Record an identity outcome on the member; true when the member failed. */
+function recordIdentity(member: Member, outcome: IdentityOutcome): boolean {
+  if (outcome === null) return false;
+  if (outcome.kind === "drift") fail(member, "drifted", "identity-drift", outcome.detail);
+  else fail(member, "unverifiable", outcome.failure.reason, outcome.failure.detail);
+  return true;
+}
+
+/**
+ * A target failure observed by S0, S5 or S7: the StorageOperationError
+ * family, attributed exactly as S6 attributes the same failures. The
+ * PostgreSQL portable source normalizes a storage failure to
+ * PortableStreamError("source-unavailable") carrying the storage error as its
+ * cause; that wrapper alone is unwrapped. Cancellation and every other error
+ * are thrown.
+ */
+function targetFailure(error: unknown, stage: string): TargetFailure {
+  const failure = error instanceof PortableStreamError && error.code === "source-unavailable" ? error.cause : error;
+  if (!(failure instanceof StorageOperationError)) throw error;
+  const attributed = classifyMigrationTargetFailure(failure, stage);
   return { reason: attributed.status === "unhealthy" ? "target-unhealthy" : "target-unresolvable", detail: attributed.reason + ": " + attributed.detail };
 }
 
@@ -940,18 +986,26 @@ async function memberCensus(ctx: Context, member: Member): Promise<void> {
       return;
     }
     try {
-      const drift = await identityCheck(ctx, member, session);
-      if (drift !== null) { fail(member, "drifted", "identity-drift", drift); return; }
+      if (recordIdentity(member, await identityCheck(ctx, member, session, "S7"))) return;
+      let scratchParent: string;
+      try {
+        scratchParent = ctx.deps.allocateScratch(ctx.homeDir);
+      } catch (error) {
+        fail(member, "unverifiable", "state-unresolvable", "the census scratch directory could not be allocated: " + (error as Error).message);
+        return;
+      }
       let read: Awaited<ReturnType<MigrationActivationDependencies["readDestinationCensus"]>>;
       try {
         read = await ctx.deps.readDestinationCensus(session, {
           settings: ctx.settings, expectedOwner: ctx.expectedOwner, expectedIdentity: member.identity!,
-          scratchParent: ctx.scratchParent, signal: ctx.input.signal,
+          scratchParent, signal: ctx.input.signal,
         });
       } catch (error) {
         const failure = targetFailure(error, "S7 census read");
         fail(member, "unverifiable", failure.reason, failure.detail);
         return;
+      } finally {
+        rmSync(scratchParent, { recursive: true, force: true });
       }
       member.censusVector = ctx.deps.census.buildMigrationCensusVector(read.census);
       member.canonicalDelta = ctx.deps.census.buildMigrationCanonicalDelta(read.census);
@@ -1143,8 +1197,7 @@ async function preSelection(ctx: Context, held: BackendMaintenanceJournal): Prom
       if (row !== null && row.copyBindingSha256 !== read.evidenceSha256) {
         return interrupted(ctx, "S9", "evidence-conflict", at(member, "the copy binding digest differs from the checkpointed one")).exit;
       }
-      const drift = await identityCheck(ctx, member, transfer);
-      if (drift !== null) fail(member, "drifted", "identity-drift", drift);
+      recordIdentity(member, await identityCheck(ctx, member, transfer, "S0"));
     } finally {
       await transfer.close();
     }
@@ -1173,8 +1226,7 @@ async function preSelection(ctx: Context, held: BackendMaintenanceJournal): Prom
   if (quiet !== null) return quiet.exit;
   // S5 (identity on the ordinary session) and S6 (health, once for the one target).
   for (const member of ctx.members) {
-    const drift = await identityCheck(ctx, member, ctx.ordinary!);
-    if (drift !== null) fail(member, "drifted", "identity-drift", drift);
+    recordIdentity(member, await identityCheck(ctx, member, ctx.ordinary!, "S5"));
   }
   const identified = gate(ctx, "S5");
   if (identified !== null) return identified.exit;

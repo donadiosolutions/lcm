@@ -301,6 +301,17 @@ call) and the coverage check may have reconciled the project map. No member's
 evidence is ever inferred from another's, and no time, count or heuristic
 decides eligibility.
 
+The set activation follows the single-generation rules for scratch space,
+target failures and the `applied` answer of an interruption (see
+[Migration activation](migration-cutover.md#migration-activation)). A member's
+census scratch directory is allocated only when that member's census is read
+and is removed afterwards, so an early refusal allocates no census scratch
+directory. A storage failure of a member's destination identity query or census
+read is attributed to that member as `target-unhealthy` or `target-unresolvable`, and
+the set is refused naming it. An interrupted outcome reports `applied` as `yes`
+or `no` only when the live configuration and project map agree with the
+publication journal or the set's pre-publication source, otherwise `unknown`.
+
 ### One checkpoint, member effects, one selection, one publication
 
 Once every member passes, the publication material is composed once for all

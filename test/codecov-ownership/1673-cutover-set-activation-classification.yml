@@ -1,0 +1,11 @@
+references: ["#1673"]
+rationale: >-
+  Cutover-set activation allocates census scratch per member census, classifies
+  destination identity and census storage failures per member, and confirms an
+  interrupted run as applied against the live selection, reusing the
+  single-generation helpers that activate-generation.ts now exports. Both files
+  stay in migration cutover. No production file is added, removed, moved, or
+  re-owned.
+pins:
+  - ["src/migration/cutover-set-activate.ts", "unit-migration-cutover"]
+  - ["src/migration/activate-generation.ts", "unit-migration-cutover"]
