@@ -5,6 +5,7 @@ import { join } from "node:path";
 import { describe, expect, it, vi } from "vitest";
 import { lookupMigrationTargetProjectId, resolveMigrationTargetProjectId } from "../../src/migration/target-identity.js";
 import {
+  PostgreSqlIdentityAliasLockTimeoutError,
   PostgreSqlIdentityAliasNormalizedPathConflictError,
   PostgreSqlIdentityAliasPathConflictError,
   PostgreSqlIdentityConflictError,
@@ -172,6 +173,35 @@ describe("resolveMigrationTargetProjectId", () => {
         ...base,
       });
       expect(result).toEqual(conflict);
+    });
+
+    const lockTimeout = {
+      status: "refuse",
+      reason: "migration-target-identity-unresolvable",
+      evidence: "alias-lock-timeout",
+    };
+
+    it("reuse: an alias lock wait that timed out refuses as alias-lock-timeout before any hold (#1691)", async () => {
+      const result = await resolveMigrationTargetProjectId({
+        repository: repositoryStub({
+          resolveProject: vi.fn(async () => ({ projectId: "project-1", alias: {} as never })),
+          ensureProjectAliases: vi.fn(async () => { throw new PostgreSqlIdentityAliasLockTimeoutError("project-1"); }),
+        }),
+        ...base,
+      });
+      expect(result).toEqual(lockTimeout);
+    });
+
+    it("created: losing the canonical race, then timing out on the winner's alias lock, refuses as alias-lock-timeout (#1691)", async () => {
+      const result = await resolveMigrationTargetProjectId({
+        repository: repositoryStub({
+          resolveProject: vi.fn().mockResolvedValueOnce(null).mockResolvedValueOnce({ projectId: "winner", alias: {} as never }),
+          createProject: vi.fn(async () => { throw new PostgreSqlIdentityConflictError(MACHINE_ID, "/tmp/project", "winner", "loser"); }),
+          ensureProjectAliases: vi.fn(async () => { throw new PostgreSqlIdentityAliasLockTimeoutError("winner"); }),
+        }),
+        ...base,
+      });
+      expect(result).toEqual(lockTimeout);
     });
 
     it.each([

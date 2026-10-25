@@ -1,4 +1,5 @@
 import {
+  PostgreSqlIdentityAliasLockTimeoutError,
   PostgreSqlIdentityAliasNormalizedPathConflictError,
   PostgreSqlIdentityAliasPathConflictError,
   PostgreSqlIdentityConflictError,
@@ -152,6 +153,12 @@ const ALIAS_CONFLICT = Object.freeze({
   evidence: "alias-conflict",
 } as const);
 
+const ALIAS_LOCK_TIMEOUT = Object.freeze({
+  status: "refuse",
+  reason: "migration-target-identity-unresolvable",
+  evidence: "alias-lock-timeout",
+} as const);
+
 function isAliasConflict(error: unknown): boolean {
   return error instanceof PostgreSqlIdentityConflictError
     || error instanceof PostgreSqlIdentityAliasPathConflictError
@@ -208,6 +215,7 @@ export async function resolveMigrationTargetProjectId(input: Readonly<{
     try {
       if (await ensureProjectAliases({ machineId: input.machineId, projectId, aliases: rows }) === null) return ALIAS_CONFLICT;
     } catch (error) {
+      if (error instanceof PostgreSqlIdentityAliasLockTimeoutError) return ALIAS_LOCK_TIMEOUT;
       if (!isAliasConflict(error)) throw error;
       return ALIAS_CONFLICT;
     }
