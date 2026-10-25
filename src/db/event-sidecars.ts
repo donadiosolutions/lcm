@@ -41,9 +41,10 @@ export interface EventSidecarSummary {
   deliveryQuarantined: number;
   oldestDeliveryAt: string | null;
   /**
-   * Internal diagnostic input; never serialized. A string is the oldest
-   * pending or retry capture time, null is a complete read with no such row,
-   * and an absent value means the source was not read.
+   * Internal diagnostic input; never serialized. A string is an invalid
+   * pending or retry capture time when any exists, otherwise the oldest valid
+   * one; null is a complete read with no such row, and an absent value means
+   * the source was not read.
    */
   oldestPendingAt?: string | null;
   recentErrors?: Array<{ created_at: string; hook: string; error: string }>;
@@ -76,6 +77,13 @@ const DEFAULT_TIMEOUT_MS = 2000;
 const DEFAULT_MAX_DBS = 50;
 const DEFAULT_PRUNE_ORPHAN_SIDECAR_AGE_DAYS = 30;
 const PROJECT_HASH_SIDECAR_RE = /^([a-f0-9]{64})\.db$/u;
+/**
+ * SQLite predicate for a calendar-valid "YYYY-MM-DD HH:MM:SS" capture time.
+ * datetime() normalizes impossible dates and keeps hour 24, so the shape,
+ * round-trip, and hour guards are all required.
+ */
+const VALID_CREATED_AT_SQL = `created_at GLOB '[0-9][0-9][0-9][0-9]-[0-9][0-9]-[0-9][0-9] [0-9][0-9]:[0-9][0-9]:[0-9][0-9]'
+              AND created_at IS datetime(created_at) AND substr(created_at, 12, 2) < '24'`;
 
 type StablePrivateDirectoryWitness = Readonly<Omit<PrivateDirectoryWitness, "nlink">>;
 
@@ -146,7 +154,10 @@ function readOnlySidecarFactory(
             COUNT(*) FILTER (WHERE delivery_state = 'acknowledged' AND remote_inbox_id IS NOT NULL AND remote_pruned_at IS NULL) AS deliveryAwaitingRemotePrune,
             COUNT(*) FILTER (WHERE delivery_state = 'quarantined') AS deliveryQuarantined,
             MIN(created_at) FILTER (WHERE delivery_state <> 'acknowledged') AS oldestDeliveryAt,
-            MIN(created_at) FILTER (WHERE delivery_state IN ('pending', 'retry')) AS oldestPendingAt
+            COALESCE(
+              MIN(created_at) FILTER (WHERE delivery_state IN ('pending', 'retry') AND NOT (${VALID_CREATED_AT_SQL})),
+              MIN(created_at) FILTER (WHERE delivery_state IN ('pending', 'retry'))
+            ) AS oldestPendingAt
           FROM events
         `,
       }, {

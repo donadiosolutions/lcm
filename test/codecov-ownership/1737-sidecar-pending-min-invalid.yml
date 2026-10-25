@@ -1,0 +1,7 @@
+references: ["#1737"]
+rationale: >-
+  The read-only sidecar scanner computes the per-sidecar oldest pending
+  capture time; the fix stays in the local persistence owner that holds the
+  scanner.
+pins:
+  - ["src/db/event-sidecars.ts", "unit-local-persistence"]
