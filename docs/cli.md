@@ -470,7 +470,8 @@ under `telemetry`: `pool`, `migration`, `extensions`, and `queue`. Each reports 
 (`observed`, `partial`, `unavailable`, `permission-denied`, or `timeout`), the time it
 was observed, a health of `healthy`, `degraded`, or `unavailable`, the fields it could
 not observe with a reason, and one fixed next action. SQLite reports all four
-as `not-applicable`. A family that could not be observed is `unavailable`, which is
+as `not-applicable`. A family that could not be observed reports `unavailable`, or the
+classified `permission-denied` or `timeout` failure, which is
 different from an observed unhealthy condition, and a partial observation never
 claims `healthy`. A degraded family raises a `healthy` snapshot to `degraded` and
 never changes any other classification.
