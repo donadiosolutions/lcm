@@ -12,6 +12,7 @@ import {
   authenticateSqliteMigrationSource,
   authenticateSqliteMigrationSourceBytes,
   captureAuthenticatedSqliteMigrationSource,
+  readSqliteMigrationSourceScope,
 } from "./maintenance.js";
 import { observeMigrationMaintenanceJournal } from "./journal-observation.js";
 import {
@@ -127,7 +128,13 @@ export type MigrationApplyThroughCaptureOutcome =
     /** The identity step's answer, present whenever `resolveExpectedIdentity` was given. */
     expectedIdentity?: StorageIdentityContext;
   }>
-  | Readonly<{ status: "refuse"; reason: string; evidence?: string }>;
+  | Readonly<{
+    status: "refuse";
+    reason: string;
+    evidence?: string;
+    /** Set only when a failed fresh hold entry demonstrably (or possibly) left its own journal write behind. */
+    applied?: true;
+  }>;
 
 /**
  * Which span the identity step runs in: `fresh` mints (plan-v5 Part B (3)),
@@ -150,6 +157,7 @@ export type MigrationApplyOperations = Readonly<{
   observeJournal: typeof observeMigrationMaintenanceJournal;
   captureSource: typeof captureAuthenticatedSqliteMigrationSource;
   classifySnapshot: typeof classifySqliteSnapshotArtifact;
+  readJournal: typeof readBackendMaintenanceJournal;
 }>;
 
 export type MigrationApplyThroughCaptureInput = Readonly<{
@@ -340,6 +348,14 @@ async function freshCutoverUnderBarrier(
     return { status: "refuse", reason: "confirmation-generation-moved" };
   }
 
+  // A shared project is refused from the project map alone, before the
+  // identity step can mint a local entry or a destination project (#1689).
+  // Section 4.4: a multi-machine installation is refused with a distinct
+  // reason, not silently fenced (#625's D-625-4).
+  if (readSqliteMigrationSourceScope(input.cwd, input.homeDir, token) !== "local") {
+    return { status: "refuse", reason: "multi-machine-installation" };
+  }
+
   // Plan-v5 Part B (3): only now, with the confirmed candidate re-checked
   // and nothing else left to refuse before the hold needs the map, may the
   // identity be minted. The authenticated read below must see the minted
@@ -374,7 +390,15 @@ async function freshCutoverUnderBarrier(
     }, token);
   } catch (error) {
     const failure = classifyHoldEntryFailure(error);
-    return { status: "refuse", reason: `hold-entry-${failure.class}`, evidence: failure.evidence };
+    const refusal = { status: "refuse" as const, reason: `hold-entry-${failure.class}`, evidence: failure.evidence };
+    // enterMaintenance writes maintenance-entering before maintenance-held, so
+    // a failure between the two leaves this invocation's own entering hold on
+    // disk. The live journal is read back: a binding match, or a readback that
+    // cannot answer, reports applied; a prior, foreign or terminal journal
+    // is not a write of this invocation.
+    return wroteOwnEnteringHold(input, resolution.generationId, authority.sourceSelectionSha256, sentinel)
+      ? { ...refusal, applied: true as const }
+      : refusal;
   }
   // Readback follows every write (section 4.4): a write is not evidence of
   // its own effect.
@@ -383,6 +407,25 @@ async function freshCutoverUnderBarrier(
   }
 
   return captureUnderBarrier(input, heldJournal.generationId, heldJournal.checksumSha256, token, identity);
+}
+
+function wroteOwnEnteringHold(
+  input: MigrationApplyThroughCaptureInput,
+  generationId: string,
+  sourceSelectionSha256: string,
+  queueEvidenceSha256: string,
+): boolean {
+  const readJournal = input._operationsForTesting?.readJournal ?? readBackendMaintenanceJournal;
+  try {
+    const live = readJournal(input.homeDir);
+    return live !== null
+      && live.generationId === generationId
+      && (live.phase === "maintenance-entering" || live.phase === "maintenance-held")
+      && live.sourceSelectionSha256 === sourceSelectionSha256
+      && live.queueEvidenceSha256 === queueEvidenceSha256;
+  } catch {
+    return true;
+  }
 }
 
 /**

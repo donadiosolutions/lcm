@@ -17,11 +17,13 @@
  */
 
 import {
+  type Dir,
   closeSync,
   constants,
   existsSync,
   fstatSync,
   lstatSync,
+  opendirSync,
   openSync,
   readSync,
   readdirSync,
@@ -470,8 +472,8 @@ function messageText(content: unknown): string {
  * Valid JSON of any other shape is inert: it never throws and never counts as
  * a marker.
  */
-export function scanLiveCodexRestoration(raw: string): boolean {
-  let live = false;
+export function scanLiveCodexRestoration(raw: string, initialLive = false): boolean {
+  let live = initialLive;
   for (const line of raw.split("\n")) {
     const trimmed = line.trim();
     if (!trimmed) continue;
@@ -514,42 +516,350 @@ function isCodexRolloutPath(real: string, codexHome: string): boolean {
   });
 }
 
+/** A rollout file opened through the safety checks of readLiveCodexRestoration. */
+interface OpenRollout {
+  readonly fd: number;
+  readonly size: number;
+  readonly dev: number;
+  readonly ino: number;
+}
+
 /**
- * Prove from a session's own rollout file that a live LCM restoration exists.
- * Opens the given path once (a symlink leaf fails to open), then requires the
+ * Open a rollout once (a symlink leaf fails to open), then require the
  * descriptor to be a regular file whose identity matches the path's realpath
- * under CODEX_HOME (default ~/.codex) sessions or archived_sessions. Reads at
- * most the last 64 MiB. Any failure or mismatch yields false.
+ * under CODEX_HOME sessions or archived_sessions. The caller closes the
+ * descriptor of a returned file; any failure closes it here.
+ */
+function openRollout(path: string, codexHome: string): OpenRollout | undefined {
+  let fd: number | undefined;
+  try {
+    fd = openSync(path, constants.O_RDONLY | constants.O_NOFOLLOW | constants.O_NONBLOCK);
+    const stat = fstatSync(fd);
+    const real = stat.isFile() ? realpathSync(path) : undefined;
+    if (real !== undefined && isCodexRolloutPath(real, codexHome)) {
+      const current = statSync(real);
+      if (current.dev === stat.dev && current.ino === stat.ino) {
+        return { fd, size: stat.size, dev: stat.dev, ino: stat.ino };
+      }
+    }
+  } catch {
+    // Fall through to close the descriptor and report no file.
+  }
+  if (fd !== undefined) closeSync(fd);
+  return undefined;
+}
+
+/**
+ * Most rollout files one referenced history may span, the fork included. A
+ * longer chain is cut at its oldest reachable file and the rest is unknown.
+ */
+const MAX_REFERENCED_HISTORY_FILES = 4;
+
+/** Directory entries one lookup may visit across all ancestors of a fork. */
+const MAX_ROLLOUT_DIRECTORY_ENTRIES = 20_000;
+
+const UUID_SOURCE = "[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}";
+const ROLLOUT_ID = new RegExp(`^${UUID_SOURCE}$`, "iu");
+/** Canonical Codex rollout basename: rollout-<timestamp>-<thread-id>[_<rollout-id>].jsonl */
+const ROLLOUT_FILE_NAME = new RegExp(
+  `^rollout-\\d{4}-\\d{2}-\\d{2}T\\d{2}-\\d{2}-\\d{2}-(${UUID_SOURCE})(?:_(${UUID_SOURCE}))?\\.jsonl$`,
+  "iu",
+);
+/** Directory names of the sessions/YYYY/MM/DD layout, by depth below the root. */
+const ROLLOUT_DATE_DIRECTORIES = [/^\d{4}$/u, /^\d{2}$/u, /^\d{2}$/u];
+
+/** What a fork's session_meta says about the history it references. */
+type HistoryBaseRead =
+  | { readonly kind: "none" }
+  | { readonly kind: "headless" }
+  | { readonly kind: "invalid" }
+  | {
+    readonly kind: "base";
+    readonly rolloutId: string;
+    readonly endOrdinal: number;
+    readonly endByte: number;
+  };
+
+function isPositiveSafeInteger(value: unknown): value is number {
+  return typeof value === "number" && Number.isSafeInteger(value) && value >= 1;
+}
+
+/**
+ * Read session_meta.history_base from the bounded head of an open rollout. The
+ * first line must be complete inside the bound. A base is valid only with a
+ * UUID rollout id and positive safe integer cutoffs (Codex never writes an
+ * ordinal of 0 because the prefix always holds the parent's session_meta).
+ */
+function readHistoryBase(file: OpenRollout): HistoryBaseRead {
+  const length = Math.min(file.size, MAX_CODEX_SESSION_META_PREFIX_BYTES);
+  const buffer = Buffer.alloc(length);
+  const read = readSync(file.fd, buffer, 0, length, 0);
+  const meta = firstSessionMetaPayload(buffer.subarray(0, read).toString("utf8"));
+  if (meta === undefined) return { kind: "headless" };
+  const base = meta.history_base;
+  if (base === undefined || base === null) return { kind: "none" };
+  if (!isRecord(base)) return { kind: "invalid" };
+  const { thread_id: rolloutId, end_ordinal_exclusive: endOrdinal, end_byte_offset: endByte } = base;
+  if (
+    typeof rolloutId !== "string" || !ROLLOUT_ID.test(rolloutId)
+    || !isPositiveSafeInteger(endOrdinal) || !isPositiveSafeInteger(endByte)
+  ) return { kind: "invalid" };
+  return { kind: "base", rolloutId: rolloutId.toLowerCase(), endOrdinal, endByte };
+}
+
+/** The rollout id a canonical rollout basename carries, lower-cased. */
+function rolloutIdOfFileName(name: string): string | undefined {
+  const match = ROLLOUT_FILE_NAME.exec(name);
+  if (match === null) return undefined;
+  const [, threadId = "", rolloutId = threadId] = match;
+  return rolloutId.toLowerCase();
+}
+
+interface RolloutSearch {
+  remaining: number;
+  exhausted: boolean;
+  readonly matches: string[];
+}
+
+/**
+ * Collect plain rollout files named for one rollout id below a root, walking
+ * only the root and its YYYY/MM/DD directories and never following symlinks.
+ * Entries are counted as they are read, and the walk stops once a second match
+ * proves ambiguity, the entry budget is spent or a directory cannot be read.
+ */
+function searchRolloutDirectory(directory: string, level: number, rolloutId: string, search: RolloutSearch): void {
+  let handle: Dir | undefined;
+  try {
+    handle = opendirSync(directory);
+    for (let entry = handle.readSync(); entry !== null; entry = handle.readSync()) {
+      if (search.matches.length > 1 || search.exhausted) return;
+      if (search.remaining === 0) {
+        search.exhausted = true;
+        return;
+      }
+      search.remaining -= 1;
+      if (entry.isDirectory()) {
+        if (ROLLOUT_DATE_DIRECTORIES[level]?.test(entry.name)) {
+          searchRolloutDirectory(join(directory, entry.name), level + 1, rolloutId, search);
+        }
+      } else if (entry.isFile() && rolloutIdOfFileName(entry.name) === rolloutId) {
+        search.matches.push(join(directory, entry.name));
+      }
+    }
+  } catch {
+    search.exhausted = true;
+  } finally {
+    handle?.closeSync();
+  }
+}
+
+/**
+ * Find the one plain rollout file for a rollout id under sessions/ and
+ * archived_sessions/. The id is only compared with parsed basenames and never
+ * joined into a path. No match, several matches or an exhausted entry budget
+ * give no path. Compressed rollouts are not read.
+ */
+function locateRollout(codexHome: string, rolloutId: string, budget: { remaining: number }): string | undefined {
+  const search: RolloutSearch = { remaining: budget.remaining, exhausted: false, matches: [] };
+  for (const root of ["sessions", "archived_sessions"]) {
+    const directory = join(codexHome, root);
+    if (existsSync(directory)) searchRolloutDirectory(directory, 0, rolloutId, search);
+  }
+  budget.remaining = search.remaining;
+  return search.matches.length === 1 && !search.exhausted ? search.matches[0] : undefined;
+}
+
+/** One contiguous range of the effective history, read from one rollout file. */
+interface HistorySegment {
+  readonly file: OpenRollout;
+  /** The range is bytes [start, endByte) of the file. */
+  readonly start: number;
+  readonly endByte: number;
+}
+
+const CUTOFF_CHUNK_BYTES = 64 * 1024;
+
+function isJsonWhitespace(byte: number): boolean {
+  return byte === 0x20 || byte === 0x09 || byte === 0x0a || byte === 0x0d;
+}
+
+/**
+ * The top-level ordinal of the last non-blank line that ends at or before
+ * endByte, or undefined when that line is not a JSON object with a safe
+ * ordinal or is longer than a native record may be. The bytes before endByte
+ * need not end with a newline: a cutoff in the middle of a record leaves an
+ * incomplete line, which does not parse.
+ */
+function readCutoffOrdinal(file: OpenRollout, endByte: number): number | undefined {
+  let tail = Buffer.alloc(0);
+  let position = endByte;
+  for (;;) {
+    let end = tail.length;
+    while (end > 0 && isJsonWhitespace(tail[end - 1] as number)) end -= 1;
+    const lineStart = end === 0 ? -1 : tail.lastIndexOf(0x0a, end - 1);
+    if (lineStart !== -1 || position === 0) {
+      if (end === 0) return undefined;
+      try {
+        const record: unknown = JSON.parse(tail.subarray(lineStart + 1, end).toString("utf8"));
+        return isRecord(record) && isCodexOrdinal(record.ordinal) ? record.ordinal : undefined;
+      } catch {
+        return undefined;
+      }
+    }
+    if (tail.length > NATIVE_RECORD_BYTE_LIMIT) return undefined;
+    const length = Math.min(CUTOFF_CHUNK_BYTES, position);
+    position -= length;
+    const chunk = Buffer.alloc(length);
+    readSync(file.fd, chunk, 0, length, position);
+    tail = Buffer.concat([chunk, tail]);
+  }
+}
+
+/**
+ * The ranges of a rollout's effective history, oldest first and ending with
+ * the rollout itself. The walk goes backward from the rollout and gives the
+ * byte budget to the newest history first, so the ranges form one contiguous
+ * newest suffix; the oldest range may start part way through its file.
+ *
+ * Every ancestor link must hold: the parent is located uniquely and opened
+ * safely, is not a repeat, is at least as long as the cutoff, has a
+ * session_meta, and its last record before end_byte_offset carries the ordinal
+ * just before end_ordinal_exclusive. The first link that fails (or the byte
+ * budget running out) stops the walk. The history older than the ranges
+ * already kept is unexamined, and the scan enters their oldest range with no
+ * proof.
+ */
+function resolveHistorySegments(
+  own: OpenRollout,
+  codexHome: string,
+  maxBytes: number,
+  maxDirectoryEntries: number,
+  owned: OpenRollout[],
+): HistorySegment[] {
+  const segments: HistorySegment[] = [];
+  let remaining = maxBytes;
+  const keep = (file: OpenRollout, endByte: number): void => {
+    const take = Math.min(endByte, remaining);
+    segments.unshift({ file, start: endByte - take, endByte });
+    remaining -= take;
+  };
+  keep(own, own.size);
+  const seenIds = new Set<string>();
+  const seenFiles = new Set<string>([`${own.dev}:${own.ino}`]);
+  const budget = { remaining: maxDirectoryEntries };
+  let read = readHistoryBase(own);
+  while (
+    read.kind === "base" && remaining > 0
+    && segments.length < MAX_REFERENCED_HISTORY_FILES && !seenIds.has(read.rolloutId)
+  ) {
+    const { rolloutId, endOrdinal, endByte } = read;
+    seenIds.add(rolloutId);
+    const path = locateRollout(codexHome, rolloutId, budget);
+    const parent = path === undefined ? undefined : openRollout(path, codexHome);
+    if (parent === undefined) break;
+    owned.push(parent);
+    const key = `${parent.dev}:${parent.ino}`;
+    const parentRead = validateAncestor(parent, endByte, endOrdinal, seenFiles.has(key));
+    if (parentRead === undefined) break;
+    seenFiles.add(key);
+    keep(parent, endByte);
+    read = parentRead;
+  }
+  return segments;
+}
+
+/**
+ * The history_base of an ancestor whose recorded cutoff holds, or undefined
+ * when the link fails: a repeated file, a cutoff past the end, a rollout
+ * without a session_meta, a last record before the cutoff that does not carry
+ * the ordinal just before end_ordinal_exclusive, or a read error. A failed
+ * link only ends the walk; the newer history already kept still counts.
+ */
+function validateAncestor(
+  parent: OpenRollout,
+  endByte: number,
+  endOrdinal: number,
+  repeated: boolean,
+): HistoryBaseRead | undefined {
+  try {
+    if (repeated || endByte > parent.size) return undefined;
+    const parentRead = readHistoryBase(parent);
+    if (parentRead.kind === "headless" || readCutoffOrdinal(parent, endByte) !== endOrdinal - 1) return undefined;
+    return parentRead;
+  } catch {
+    return undefined;
+  }
+}
+
+/** The complete records of a segment; a clipped start drops its first partial line. */
+function readSegmentText(segment: HistorySegment): string {
+  const length = segment.endByte - segment.start;
+  const buffer = Buffer.alloc(length);
+  const read = readSync(segment.file.fd, buffer, 0, length, segment.start);
+  const raw = buffer.subarray(0, read).toString("utf8");
+  if (segment.start === 0) return raw;
+  const newline = raw.indexOf("\n");
+  return newline === -1 ? "" : raw.slice(newline + 1);
+}
+
+/**
+ * Scan the segments oldest to newest, carrying the live state between them.
+ * The rollout's own (newest) segment is read first and its read error
+ * propagates. An ancestor that cannot be read ends the walk like any failed
+ * link: the history older than the segments read so far is a gap.
+ */
+function scanHistorySegments(segments: readonly HistorySegment[]): boolean {
+  const texts: string[] = [readSegmentText(segments[segments.length - 1] as HistorySegment)];
+  try {
+    for (let index = segments.length - 2; index >= 0; index -= 1) {
+      texts.unshift(readSegmentText(segments[index] as HistorySegment));
+    }
+  } catch {
+    // Keep the newer segments already read.
+  }
+  let live = false;
+  for (const text of texts) live = scanLiveCodexRestoration(text, live);
+  return live;
+}
+
+/**
+ * Prove from a session's rollout that a live LCM restoration exists. Opens the
+ * given path once (a symlink leaf fails to open), then requires the descriptor
+ * to be a regular file whose identity matches the path's realpath under
+ * CODEX_HOME (default ~/.codex) sessions or archived_sessions.
+ *
+ * A referenced (paginated-history) fork holds only a pointer to its parent's
+ * history in session_meta.history_base: the parent rollout's bytes before
+ * end_byte_offset are part of the fork's history. The parent is found by
+ * rollout id among the canonical rollout basenames and read with the same
+ * safety checks, then its parent in turn, up to four files. The effective
+ * history is the ancestors' prefixes followed by the fork's own records.
+ *
+ * At most the newest 64 MiB of the effective history is read; when that cuts
+ * the history short, the scan starts with no proof at the first complete
+ * record. The first ancestor that cannot be found, is ambiguous, is compressed
+ * or disagrees with its recorded cutoff ends the walk: the history older than
+ * the ranges already validated is a gap, and only a marker inside those ranges
+ * can prove. Any other failure or mismatch yields false.
  */
 export function readLiveCodexRestoration(
   transcriptPath: unknown,
-  options: { codexHome?: string; maxBytes?: number } = {},
+  options: { codexHome?: string; maxBytes?: number; maxDirectoryEntries?: number } = {},
 ): boolean {
   if (typeof transcriptPath !== "string" || !transcriptPath) return false;
   const codexHome = options.codexHome ?? (process.env.CODEX_HOME || join(homedir(), ".codex"));
   const maxBytes = options.maxBytes ?? MAX_LIVE_RESTORATION_WINDOW_BYTES;
-  let fd: number | undefined;
+  const maxDirectoryEntries = options.maxDirectoryEntries ?? MAX_ROLLOUT_DIRECTORY_ENTRIES;
+  const owned: OpenRollout[] = [];
   try {
-    fd = openSync(transcriptPath, constants.O_RDONLY | constants.O_NOFOLLOW | constants.O_NONBLOCK);
-    const stat = fstatSync(fd);
-    if (!stat.isFile()) return false;
-    const real = realpathSync(transcriptPath);
-    if (!isCodexRolloutPath(real, codexHome)) return false;
-    const current = statSync(real);
-    if (current.dev !== stat.dev || current.ino !== stat.ino) return false;
-    const start = Math.max(0, stat.size - maxBytes);
-    const buffer = Buffer.alloc(stat.size - start);
-    const read = readSync(fd, buffer, 0, buffer.length, start);
-    let raw = buffer.subarray(0, read).toString("utf8");
-    if (start > 0) {
-      const newline = raw.indexOf("\n");
-      raw = newline === -1 ? "" : raw.slice(newline + 1);
-    }
-    return scanLiveCodexRestoration(raw);
+    const own = openRollout(transcriptPath, codexHome);
+    if (own === undefined) return false;
+    owned.push(own);
+    return scanHistorySegments(resolveHistorySegments(own, codexHome, maxBytes, maxDirectoryEntries, owned));
   } catch {
     return false;
   } finally {
-    if (fd !== undefined) closeSync(fd);
+    for (const file of owned) closeSync(file.fd);
   }
 }
 

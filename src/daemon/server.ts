@@ -11,9 +11,11 @@ import { dirname } from "node:path";
 import {
   daemonConfigSnapshotWitnessEqual,
   parseDaemonConfig,
+  readDaemonConfigBackendSnapshot,
   readDaemonConfigSnapshot,
   resolveDaemonConfigEnv,
   type DaemonConfig,
+  type DaemonConfigBackendSnapshot,
   type DaemonConfigSnapshotWitness,
 } from "./config.js";
 import { sanitizeError } from "./safe-error.js";
@@ -29,12 +31,16 @@ import { createDescribeHandler } from "./routes/describe.js";
 import { createStoreHandler } from "./routes/store.js";
 import { createRecentHandler } from "./routes/recent.js";
 import { createIngestHandler } from "./routes/ingest.js";
-import { createTerminalIngestQueue } from "./routes/ingest-terminal.js";
+import { createTerminalIngestQueue, TERMINAL_INGEST_DEADLINE_MS } from "./routes/ingest-terminal.js";
 import { settleProjectStorageExecutions } from "./routes/storage-lifecycle.js";
 import { createPromptSearchHandler } from "./routes/prompt-search.js";
 import { createStatusHandler } from "./routes/status.js";
 import { createSessionCompleteHandler } from "./routes/session-complete.js";
-import { createPromoteAllEventsHandler, createPromoteEventsHandler } from "./routes/promote-events.js";
+import {
+  createPromoteAllEventsHandler,
+  createPromoteEventsHandler,
+  PROMOTE_EVENTS_BUSY_BODY,
+} from "./routes/promote-events.js";
 import {
   createPromoteEventsNotifyHandler,
   PASSIVE_EVENT_PROCESSOR_DEFAULTS,
@@ -50,7 +56,13 @@ import { createReviewStaleHandler } from "./routes/review-stale.js";
 import { createInvocationControlHandler } from "./routes/invocation-control.js";
 import { composeAbortSignals, throwIfAborted } from "./cancellation.js";
 import { createPublicationQueue } from "./publication-queue.js";
-import { PrivateMutationLockContentionError } from "../private-mutation-lock.js";
+import {
+  createLockContentionDeadlineBudget,
+  createLockContentionWaitBudget,
+  PrivateMutationLockContentionError,
+  retryWhileLiveLockContended,
+  type LockContentionWaitBudget,
+} from "../private-mutation-lock.js";
 import {
   createInvocationCoordinator,
   type InvocationCoordinator,
@@ -157,6 +169,8 @@ export type DaemonOptions = {
   _createStorageBackendFactory?: typeof createStorageBackendFactory;
   /** @internal Deterministic config-snapshot seam for daemon read-admission tests. */
   _readDaemonConfigSnapshot?: typeof readDaemonConfigSnapshot;
+  /** @internal Deterministic backend-snapshot seam for identity-only observation admission tests. */
+  _readDaemonConfigBackendSnapshot?: typeof readDaemonConfigBackendSnapshot;
   /** @internal Deterministic daemon UUID seam for invocation-control tests. */
   _daemonInstanceId?: string;
   /** Canonical daemon config path used for request-time publication admission. */
@@ -172,6 +186,10 @@ export type DaemonOptions = {
   _onRequestLifecycle?: (event: RequestLifecycleEvent, signal: AbortSignal) => void;
   /** @internal Queue-wait budget for a PostgreSQL read's admitted retry, in milliseconds. */
   _readAdmissionWaitMs?: number;
+  /** @internal Length of a capture request's wait for a live lock owner, counted from its first wait, in milliseconds. */
+  _routeAdmissionWaitMs?: number;
+  /** @internal Monotonic clock for that wait. */
+  _routeAdmissionNow?: () => number;
   /** @internal Test-only observer for the closed built-in route registry. */
   _onBuiltInRouteRegistered?: (
     key: string,
@@ -184,6 +202,16 @@ const MAX_BODY_BYTES = 10 * 1024 * 1024; // 10 MB
 const MAX_REQUEST_CONFIG_BYTES = 4 * 1024 * 1024;
 const MAX_BUFFERED_RESPONSE_BYTES = MAX_BODY_BYTES;
 const READ_ADMISSION_WAIT_MS = 1000;
+/** Deadline, from the first wait, for a live lock owner across one capture request's admissions. */
+const ROUTE_ADMISSION_CONTENTION_WAIT_MS = 3000;
+const ADMISSION_RETRY_ROUTES: ReadonlySet<string> = new Set([
+  "POST /ingest",
+  "POST /restore",
+  "POST /promote-events",
+  "POST /promote-events/all",
+]);
+/** Routes that answer a retryable 503 `busy` instead of a 500 when the publication lock stays contended. */
+const PROMOTE_EVENTS_BUSY_ROUTES: ReadonlySet<string> = new Set(["POST /promote-events", "POST /promote-events/all"]);
 
 export function claudeProjectDirName(cwd: string): string {
   const sanitized = cwd
@@ -488,6 +516,8 @@ function assertDaemonReadStorageAdmission(
   publicationHome: string | undefined,
   assertBackendPublicationOverride?: DaemonOptions["_assertBackendPublication"],
   readSnapshot: typeof readDaemonConfigSnapshot = readDaemonConfigSnapshot,
+  tolerateStartupBackendDivergence = false,
+  readBackendSnapshot: typeof readDaemonConfigBackendSnapshot = readDaemonConfigBackendSnapshot,
 ): DaemonReadStorageAdmissionWitness {
   if (assertBackendPublicationOverride !== undefined) {
     const publicationWitness = assertBackendPublicationOverride(publicationHome, startupConfig.storage.backend);
@@ -512,8 +542,13 @@ function assertDaemonReadStorageAdmission(
       assertPrivateDirectory(privateRoot, publicationRoot, privateRoot.witness);
     };
     assertReadRoot();
-    const first = readSnapshot(publicationConfigPath);
-    if (first.config.storage.backend !== startupConfig.storage.backend) {
+    const readBackend = (): DaemonConfigBackendSnapshot => {
+      if (tolerateStartupBackendDivergence) return readBackendSnapshot(publicationConfigPath);
+      const snapshot = readSnapshot(publicationConfigPath);
+      return { backend: snapshot.config.storage.backend, witness: snapshot.witness };
+    };
+    const first = readBackend();
+    if (!tolerateStartupBackendDivergence && first.backend !== startupConfig.storage.backend) {
       throw new BackendPublicationJournalError(
         "unexpected-state",
         "daemon request backend differs from the authenticated startup backend",
@@ -521,12 +556,12 @@ function assertDaemonReadStorageAdmission(
     }
     const publicationWitness = assertBackendPublicationConfigReadAccess(
       publicationConfigPath,
-      first.config.storage.backend,
+      first.backend,
       first.witness,
     );
-    const second = readSnapshot(publicationConfigPath);
+    const second = readBackend();
     if (
-      second.config.storage.backend !== startupConfig.storage.backend
+      (!tolerateStartupBackendDivergence && second.backend !== startupConfig.storage.backend)
       || !daemonConfigSnapshotWitnessEqual(first.witness, second.witness)
     ) {
       throw new BackendPublicationJournalError(
@@ -597,17 +632,42 @@ export async function createDaemon(config: DaemonConfig, options?: DaemonOptions
     assertDaemonRequestStorageAdmission(config, publicationConfigPath, lockToken);
   };
   const enqueuePublication = createPublicationQueue();
-  const publicationAdmission = (signal: AbortSignal): RoutePublicationAdmission => async (operation, operationSignal) => {
+  /**
+   * With a wait budget, acquiring the consumer lock waits for a live foreign
+   * owner (a hook's short fence, for example) instead of failing the request.
+   * Only the acquisition is retried; an operation callback is never replayed.
+   */
+  const publicationAdmission = (
+    signal: AbortSignal,
+    contentionBudget?: LockContentionWaitBudget,
+  ): RoutePublicationAdmission => async (operation, operationSignal) => {
     const cancellation = composeAbortSignals([signal, operationSignal]);
     try {
       return await enqueuePublication(() => {
         throwIfAborted(cancellation.signal);
-        return withConsumerPublicationLockAsync(publicationHome, async publicationLockToken => {
-          throwIfAborted(cancellation.signal);
-          assertRequestAdmission(publicationLockToken);
-          throwIfAborted(cancellation.signal);
-          return operation(publicationLockToken);
-        });
+        let entered = false;
+        const acquire = () => {
+          entered = false;
+          return withConsumerPublicationLockAsync(publicationHome, async publicationLockToken => {
+            entered = true;
+            throwIfAborted(cancellation.signal);
+            assertRequestAdmission(publicationLockToken);
+            throwIfAborted(cancellation.signal);
+            return operation(publicationLockToken);
+          });
+        };
+        return contentionBudget === undefined
+          ? acquire()
+          : retryWhileLiveLockContended(acquire, {
+            budget: contentionBudget,
+            signal: cancellation.signal,
+            canRetry: () => !entered,
+          }).catch((error: unknown) => {
+            // A wait ended by shutdown or by the request's own deadline is a
+            // cancellation, as it was before the wait existed.
+            if (!entered) throwIfAborted(cancellation.signal);
+            throw error;
+          });
       }, cancellation.signal);
     } finally {
       cancellation.cleanup();
@@ -934,7 +994,12 @@ export async function createDaemon(config: DaemonConfig, options?: DaemonOptions
   const ingestHandler = createIngestHandler(config, storageFactory);
   const terminalIngestQueue = createTerminalIngestQueue({
     ingest: ingestHandler,
-    publicationAdmission,
+    // An accepted hand-off outlives the hook that sent it: its admission waits
+    // for a live lock owner for as long as the entry's own deadline allows.
+    publicationAdmission: signal => publicationAdmission(
+      signal,
+      createLockContentionWaitBudget(TERMINAL_INGEST_DEADLINE_MS),
+    ),
     shutdownSignal: shutdownController.signal,
     onDrained: resetIdleTimer,
   });
@@ -1049,8 +1114,8 @@ export async function createDaemon(config: DaemonConfig, options?: DaemonOptions
     const requestSignal = cancellation.signal;
     let bufferedResponse: BufferedServerResponse | undefined;
     const diagnosticRoute = ["GET /stats", "GET /stats/pool", "POST /status"].includes(`${req.method} ${req.url?.split("?")[0]}`);
+    const key = `${req.method} ${req.url?.split("?")[0]}`;
     try {
-      const key = `${req.method} ${req.url?.split("?")[0]}`;
       const route = routes.get(key);
       if (!route) {
         sendJsonIfWritable(res, 404, { error: "not found" });
@@ -1090,7 +1155,17 @@ export async function createDaemon(config: DaemonConfig, options?: DaemonOptions
         }
         if (route.publicationMode === "operation-scoped") {
           assertDaemonNotShuttingDown();
-          const withPublicationAdmission = publicationAdmission(requestSignal);
+          // Capture requests wait briefly for a live lock owner rather than
+          // dropping the hook's hand-off; the hook's own client gives up at 5 s.
+          const withPublicationAdmission = publicationAdmission(
+            requestSignal,
+            ADMISSION_RETRY_ROUTES.has(key)
+              ? createLockContentionDeadlineBudget(
+                options?._routeAdmissionWaitMs ?? ROUTE_ADMISSION_CONTENTION_WAIT_MS,
+                options?._routeAdmissionNow,
+              )
+              : undefined,
+          );
           await withPublicationAdmission(() => undefined);
           throwIfAborted(requestSignal);
           if (route.responseMode === "buffered") {
@@ -1131,6 +1206,8 @@ export async function createDaemon(config: DaemonConfig, options?: DaemonOptions
             publicationHome,
             options?._assertBackendPublication,
             options?._readDaemonConfigSnapshot,
+            key === "GET /health/observe",
+            options?._readDaemonConfigBackendSnapshot,
           );
           await route.handler(req, bufferedResponse as unknown as ServerResponse, body, {
             signal: requestSignal,
@@ -1145,6 +1222,8 @@ export async function createDaemon(config: DaemonConfig, options?: DaemonOptions
             publicationHome,
             options?._assertBackendPublication,
             options?._readDaemonConfigSnapshot,
+            key === "GET /health/observe",
+            options?._readDaemonConfigBackendSnapshot,
           );
           if (!daemonReadStorageAdmissionWitnessEqual(admissionWitness, finalWitness)) {
             throw new BackendPublicationJournalError(
@@ -1181,6 +1260,10 @@ export async function createDaemon(config: DaemonConfig, options?: DaemonOptions
           status: "blocked",
           error: "backend publication admission blocked",
         });
+        return;
+      }
+      if (err instanceof PrivateMutationLockContentionError && PROMOTE_EVENTS_BUSY_ROUTES.has(key)) {
+        sendJsonIfWritable(res, 503, PROMOTE_EVENTS_BUSY_BODY);
         return;
       }
       const { status, message } = requestErrorResponse(err);

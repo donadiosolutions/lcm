@@ -38,7 +38,7 @@ function expectNoEffects(f: RollbackFixture): void {
     expect(manifest.pendingEffect).toBeNull();
   }
   expectAllPostgreSql(f);
-  expect(readCutoverSetRollbackRecords({ homeDir: f.homeDir, originalSetId: f.originalSetId })).toEqual({ state: "authoritatively-absent" });
+  expect(readCutoverSetRollbackRecords({ homeDir: f.homeDir, originalSetId: f.originalSetId })).toEqual({ state: "authoritatively-absent", cause: "empty" });
   expect(readBackendMaintenanceJournal(f.homeDir)).toBeNull();
   for (const row of f.activation.guard.rows.values()) expect(row.releasedAt).not.toBeNull();
 }
@@ -113,7 +113,7 @@ describe("rollbackCutoverSet refusals before any durable rollback state", () => 
     refusal(await f.run({ recordCapacity: () => ({ ...fits, selectionBytes: 3 }) }), "records", "cutover-set-too-large", "3 (selection)");
     refusal(await f.run({ recordCapacity: () => ({ ...fits, memberRecordBytes: 3 }) }), "records", "cutover-set-too-large", "3 (member)");
     expect(f.deps.recordCapacity({ originalSetId: f.originalSetId, manifest: { ...f.checkpoint.manifest, setId: f.setId } })).toMatchObject({ limitBytes: 1024 * 1024, memberLimitBytes: 8 * 1024 });
-    expect(readCutoverSetRollbackRecords({ homeDir: f.homeDir, originalSetId: f.originalSetId })).toEqual({ state: "authoritatively-absent" });
+    expect(readCutoverSetRollbackRecords({ homeDir: f.homeDir, originalSetId: f.originalSetId })).toEqual({ state: "authoritatively-absent", cause: "empty" });
   });
 
   it("refuses every member that is not an authenticated active member of the activation, releasing nothing", async () => {

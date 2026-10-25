@@ -16,6 +16,7 @@ import {
 import { projectMapPath, readProjectMapSnapshot } from "../project-map.js";
 import { resolveMigrationWitnessBindings, type MigrationSelectionBinding } from "./generation-binding-store.js";
 import { MigrationManifestStore } from "./manifest-store.js";
+import { authorizedMapAliasPaths } from "./map-aliases.js";
 import { MigrationProtocolError, type MigrationManifest } from "./protocol.js";
 import { lcmHomeDir } from "../runtime-paths.js";
 import { readBoundedRegularFileWithStat } from "../security-files.js";
@@ -111,6 +112,35 @@ export type SqliteMigrationEnrollmentDependencies = Readonly<{
 
 const authenticatedAuthorities = new WeakMap<object, string>();
 
+type SqliteMigrationSourceProjectIdentity = AuthenticatedSqliteSnapshotAuthority["projectIdentity"];
+
+/** The one derivation of a migration source's scope: shared the moment its project-map entry carries a `remoteProjectId`. */
+function sqliteMigrationSourceProjectIdentity(
+  physicalProjectId: string,
+  entry: Readonly<{ remoteProjectId?: string }> | undefined,
+): SqliteMigrationSourceProjectIdentity {
+  return entry?.remoteProjectId === undefined
+    ? { scope: "local", projectId: physicalProjectId }
+    : { scope: "shared", projectId: entry.remoteProjectId };
+}
+
+/**
+ * The source's scope from the project map alone (a read-only snapshot under
+ * the retained token: no backfill, no write), so a shared-history refusal can
+ * be decided before apply mints any identity (#1689).
+ */
+export function readSqliteMigrationSourceScope(
+  cwd: string,
+  homeDir: string,
+  publicationLockToken: BackendPublicationLockToken,
+): SqliteMigrationSourceProjectIdentity["scope"] {
+  const local = localProjectIdentity(cwd, homeDir);
+  return sqliteMigrationSourceProjectIdentity(
+    local.id,
+    readProjectMapSnapshot(homeDir, publicationLockToken)[local.id],
+  ).scope;
+}
+
 function digestFile(path: string, allowedRoot: string): string {
   const value = readBoundedRegularFileWithStat(path, {
     allowedRoot,
@@ -139,9 +169,7 @@ export function authenticateSqliteMigrationSource(
   const map = readProjectMapSnapshot(homeDir, publicationLockToken);
   const entry = map[local.id];
   const canonicalPath = resolve(entry?.canonical ?? local.canonical);
-  const aliases = [...new Set((entry?.aliases ?? []).map((path) => resolve(path)))]
-    .filter((path) => path !== canonicalPath)
-    .sort();
+  const aliases = authorizedMapAliasPaths(canonicalPath, entry?.aliases ?? []);
   const machineIdentity = requireMachineIdentity(homeDir);
   const lcm = lcmHomeDir(homeDir);
   const projectDir = join(lcm, "projects", local.id);
@@ -150,9 +178,7 @@ export function authenticateSqliteMigrationSource(
   const body: Omit<AuthenticatedSqliteSnapshotAuthority, "sourceSelectionSha256"> = {
     version: 1,
     physicalProjectId: local.id,
-    projectIdentity: entry?.remoteProjectId === undefined
-      ? { scope: "local", projectId: local.id }
-      : { scope: "shared", projectId: entry.remoteProjectId },
+    projectIdentity: sqliteMigrationSourceProjectIdentity(local.id, entry),
     canonicalPath,
     aliases,
     projectDbPath,
@@ -197,10 +223,13 @@ function assertAuthenticatedAuthority(
 export function resolveCutoverSetMemberAuthorities(input: Readonly<{
   homeDir: string;
   lockToken: BackendPublicationLockToken;
+  /** Resolve without publishing a project-map metadata backfill (a pre-confirmation lookup writes nothing). */
+  suppressMetadataBackfill?: boolean;
 }>): CutoverSetMemberAuthorityResolution {
   const enumeration = enumerateStoredDataProjectHashes({
     homeDir: input.homeDir,
     publicationLockToken: input.lockToken,
+    suppressMetadataBackfill: input.suppressMetadataBackfill,
   });
   if (enumeration.status === "unresolvable") {
     return { status: "unresolvable", reason: enumeration.reason, detail: enumeration.detail };

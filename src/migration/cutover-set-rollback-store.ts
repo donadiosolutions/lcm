@@ -13,6 +13,7 @@ import { readActivationGenerationLink } from "./activation-artifact-store.js";
 import { deriveActivationPublicationId } from "./activation-publication-id.js";
 import {
   generationScopedDirectory,
+  MigrationBindingConflictError,
   readGenerationScopedFiles,
   recordGenerationScopedFile,
   validateGenerationId,
@@ -675,7 +676,14 @@ export type CutoverSetRollbackRecords =
     installs: ReadonlyMap<string, CutoverSetRollbackInstallRecord>;
     selection: BackendCutoverSetRollbackSelection | null;
   }>
-  | Readonly<{ state: "authoritatively-absent" }>
+  /**
+   * No rollback commitment exists. "empty": nothing is stored. "checkpoint-incomplete":
+   * only member records of a checkpoint whose aggregate (the commit point) was never
+   * written; memberRecords counts them. Records are create-only, so durable progress
+   * strictly increases the count.
+   */
+  | Readonly<{ state: "authoritatively-absent"; cause: "empty" }>
+  | Readonly<{ state: "authoritatively-absent"; cause: "checkpoint-incomplete"; memberRecords: number }>
   | Readonly<{ state: "unresolvable"; reason: string }>;
 
 function parseStoredRecord(name: string, content: string, originalSetId: string): unknown {
@@ -695,8 +703,10 @@ function parseStoredRecord(name: string, content: string, originalSetId: string)
 /**
  * Read and verify the records of one rollback: "authoritatively-absent" has
  * the binding store's meaning (positively no store, no set directory, or an
- * authenticated empty one, or only member records of a checkpoint whose
- * aggregate was never written); any other record without the checkpoint
+ * authenticated empty one: cause "empty") or only member records of a
+ * checkpoint whose aggregate was never written (cause
+ * "checkpoint-incomplete", with their count: no commitment exists, and a retry
+ * completes the checkpoint); any other record without the checkpoint
  * aggregate, an aggregate without one of its member records, a record that
  * does not re-derive its checksum, an envelope naming another set, an
  * installation record whose index or member is not the checkpoint's, or a
@@ -710,7 +720,7 @@ export function readCutoverSetRollbackRecords(
   const homeDir = validateHomeDir(input.homeDir);
   const originalSetId = validateGenerationId(input.originalSetId);
   const read = readGenerationScopedFiles(CUTOVER_SET_ROLLBACK_STORE, { homeDir, generationId: originalSetId }, dependencies);
-  if (read.kind === "absent") return { state: "authoritatively-absent" };
+  if (read.kind === "absent") return { state: "authoritatively-absent", cause: "empty" };
   if (read.kind === "unresolvable") return { state: "unresolvable", reason: read.reason };
   let currentFile = "";
   try {
@@ -734,7 +744,9 @@ export function readCutoverSetRollbackRecords(
     }
     if (aggregate === null) {
       // Member records alone are a checkpoint whose aggregate was never written: no commitment exists yet.
-      if (others.length === 0) return { state: "authoritatively-absent" };
+      if (others.length === 0) {
+        return { state: "authoritatively-absent", cause: "checkpoint-incomplete", memberRecords: memberRecords.size };
+      }
       currentFile = others[0]!.name;
       throw new CutoverSetRollbackRecordError("checkpoint-missing", "a rollback record is stored without its checkpoint");
     }
@@ -791,8 +803,9 @@ function requireRecords(
  * order, then its aggregate), or reuse byte-identical stored ones. The input
  * is re-parsed (the checksum is re-derived) and every record's wire size is
  * checked before any write; different stored bytes are a
- * MigrationBindingConflictError, never an overwrite. Synchronous. First
- * record of the rollback.
+ * MigrationBindingConflictError, never an overwrite, and when the stored
+ * files can be read one is raised before any member record is written.
+ * Synchronous. First record of the rollback.
  */
 export function recordCutoverSetRollbackCheckpoint(
   input: Readonly<{ homeDir: string; checkpoint: CutoverSetRollbackCheckpoint }>,
@@ -805,6 +818,26 @@ export function recordCutoverSetRollbackCheckpoint(
   // A parsed member record is bounded far below its limit (recordFile re-checks it); the aggregate grows with the manifest.
   if (Buffer.byteLength(wireContent(checkpoint.originalSetId, aggregate)) > MAX_CUTOVER_SET_ROLLBACK_RECORD_BYTES) {
     invalid("cutover-set rollback record " + CHECKPOINT_FILE + " exceeds " + MAX_CUTOVER_SET_ROLLBACK_RECORD_BYTES + " bytes");
+  }
+  // Early all-or-nothing conflict check: when the set directory can be read, a stored file that differs from what
+  // this call would write is refused before any member record is written. recordFile's create-only reconcile stays
+  // the race-safe authority; an unreadable directory falls through to it unchanged.
+  const read = readGenerationScopedFiles(CUTOVER_SET_ROLLBACK_STORE, { homeDir, generationId: checkpoint.originalSetId }, dependencies);
+  if (read.kind === "present") {
+    const stored = new Map(read.files.map((file) => [file.name, file.content]));
+    const planned = [
+      ...memberRecords.map((record, index) => [memberFileName(index), wireContent(checkpoint.originalSetId, record)] as const),
+      [CHECKPOINT_FILE, wireContent(checkpoint.originalSetId, aggregate)] as const,
+    ];
+    for (const [name, content] of planned) {
+      const existing = stored.get(name);
+      if (existing !== undefined && existing !== content) {
+        throw new MigrationBindingConflictError(
+          "a " + CUTOVER_SET_ROLLBACK_STORE.noun + " already exists at " + name
+            + " and does not reconcile with the candidate; refusing to write any rollback checkpoint record",
+        );
+      }
+    }
   }
   for (const [index, record] of memberRecords.entries()) {
     recordFile(homeDir, checkpoint.originalSetId, memberFileName(index), record, MAX_CUTOVER_SET_ROLLBACK_MEMBER_RECORD_BYTES, dependencies);
@@ -895,7 +928,7 @@ export function resolveCutoverSetRollbackCommitment(
   const originalSetId = link.link.publicationId;
   const records = readRecords({ homeDir, originalSetId });
   if (records.state === "unresolvable") return { state: "unresolvable", reason: "the set rollback records are unresolvable: " + records.reason };
-  if (records.state === "authoritatively-absent") return { state: "absent", cause: "no-rollback", detail: "no rollback checkpoint is stored for set " + originalSetId };
+  if (records.state === "authoritatively-absent") return { state: "absent", cause: "no-rollback", detail: "no committed rollback checkpoint is stored for set " + originalSetId };
   const member = records.checkpoint.members.find((candidate) => candidate.generationId === generationId);
   if (member === undefined) return { state: "unresolvable", reason: "the rollback checkpoint of set " + originalSetId + " has no row for generation " + generationId };
   return { state: "resolved", originalSetId, records, member };

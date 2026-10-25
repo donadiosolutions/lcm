@@ -331,22 +331,31 @@ export function failedServerQueueReads(status: TelemetryFailureStatus): Pick<Que
 }
 const SQLITE_UTC = /^([0-9]{4})-([0-9]{2})-([0-9]{2}) ([0-9]{2}):([0-9]{2}):([0-9]{2})$/u;
 /**
- * Age in whole seconds of a SQLite UTC timestamp. Undefined means the source
- * was not read, null means a complete read found no qualifying row.
+ * Epoch milliseconds of a strictly formatted, calendar-valid SQLite UTC
+ * timestamp; undefined for anything else. Epoch zero is a valid result.
  */
-export function localPendingAgeRead(value: unknown, nowMs: number): FieldRead {
-  if (value === undefined) return { reason: "unavailable" };
-  if (value === null) return { reason: "no-entry" };
+export function sqliteUtcMs(value: unknown): number | undefined {
   const match = typeof value === "string" ? SQLITE_UTC.exec(value) : null;
-  if (match === null) return { reason: "out-of-range" };
+  if (match === null) return undefined;
   const [year, month, day, hour, minute, second] = match.slice(1).map(Number) as [number, number, number, number, number, number];
   const date = new Date(0);
   date.setUTCFullYear(year, month - 1, day);
   date.setUTCHours(hour, minute, second, 0);
   const exact = date.getUTCFullYear() === year && date.getUTCMonth() === month - 1 && date.getUTCDate() === day
     && date.getUTCHours() === hour && date.getUTCMinutes() === minute && date.getUTCSeconds() === second;
-  const elapsed = nowMs - date.getTime();
-  return exact && elapsed >= 0 ? { value: Math.floor(elapsed / 1000) } : { reason: "out-of-range" };
+  return exact ? date.getTime() : undefined;
+}
+/**
+ * Age in whole seconds of a SQLite UTC timestamp. Undefined means the source
+ * was not read, null means a complete read found no qualifying row.
+ */
+export function localPendingAgeRead(value: unknown, nowMs: number): FieldRead {
+  if (value === undefined) return { reason: "unavailable" };
+  if (value === null) return { reason: "no-entry" };
+  const ms = sqliteUtcMs(value);
+  if (ms === undefined) return { reason: "out-of-range" };
+  const elapsed = nowMs - ms;
+  return elapsed >= 0 ? { value: Math.floor(elapsed / 1000) } : { reason: "out-of-range" };
 }
 export interface QueueFacts {
   inboxQuarantined?: number; localQuarantined?: number; outboxOldestPendingAgeSeconds?: number; replayLagSeconds?: number;

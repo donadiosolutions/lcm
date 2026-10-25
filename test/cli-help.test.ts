@@ -260,9 +260,13 @@ describe("printHelp — per-command detail", () => {
     expect(migrationText).toContain("--confirm-generation <id>");
     expect(migrationText).toContain("Complete whichever recovery write");
     expect(migrationText).toContain("--confirm-backend postgresql");
-    expect(migrationText).toContain("swap the grants");
+    expect(migrationText).toContain("revoke the transfer grants");
     expect(migrationText).toContain("--confirm-backend sqlite");
     expect(migrationText).toContain("remotely bound");
+    expect(migrationText).toContain("<command> --set");
+    expect(migrationText).toContain("never a member generation id");
+    expect(migrationText).toContain("lcm migration report --set --generation <set-id>");
+    expect(migrationText).toContain("docs/migration-cutover-set.md");
     expect(migrationText).toContain("Never a silent fallback");
     expect(migrationText).toContain("docs/migration-operations.md");
   });

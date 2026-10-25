@@ -780,6 +780,21 @@ failures that byte-for-byte content equality cannot see:
   `search_v1` configuration that is wrong in a way no digest comparison
   can see.
 
+  A project with no messages has no candidate to find, so the probe takes
+  an empty-source path instead. After the same completed-transfer-run
+  lookup, it sends one fixed query through the production
+  `searchMessages` and requires zero rows; a search error is reported as
+  an error, never as a pass. The search then earns its receipt only when
+  the source's messages checkpoint and the fenced destination census both
+  report zero messages, so an empty candidate pool on its own never
+  qualifies. If the transfer run is missing or not completed, if the search
+  returns any row, or if either count is non-zero, the probe is not-run with
+  its reason and `activationEligible` stays false. This witness proves
+  that the production search returned no rows for one constant query while
+  both portable message counts were zero. It does not prove that messages
+  written after cutover will be indexed; the pinned `search_v1`
+  configuration digest is a separate existing check.
+
   The search self-match candidate pool draws from a fixed-size, early
   slice of the source's canonical message order (the first
   `MIGRATION_SEARCH_PROBE_CANDIDATE_POOL_SIZE` messages), not the whole
@@ -798,7 +813,8 @@ failures that byte-for-byte content equality cannot see:
   than to sample the domain exhaustively.
 
   The ordered-listing probe's own `ran` state (it completed) and the search
-  probe's own `ran` state (a correlated self-match was confirmed) are tracked
+  probe's own `ran` state (a correlated self-match was confirmed, or the
+  empty-source witness held) are tracked
   independently (`publicProbeCoverage`, one
   entry per probe), never folded into a single `sample`-class coverage
   bit: a genuine listing-ordering mismatch stays recorded as evidence
@@ -1018,14 +1034,16 @@ from an earlier pass:
   a window a rollback entered from PostgreSQL is not an activation window and
   is refused as `maintenance-not-held`;
 - the stored data on this machine belongs to exactly one project, the one
-  being migrated. Activation of a machine with data for several projects
-  refuses with `uncovered-projects`; multi-project cutover is out of scope
-  here (see [Cutover sets](migration-cutover-set.md) for the contract that
-  later releases build on);
+  being migrated. This single-generation activation of a machine with data
+  for several projects refuses with `uncovered-projects`; such a machine is
+  moved with the `--set` mode of the same commands, which activates every
+  project through one publication (see
+  [Cutover sets](migration-cutover-set.md#running-a-set-with-lcm-migration---set));
 - the destination identity, the project-map binding, the transfer-ledger copy
   binding and the destination census all match the verification report, and
-  the PostgreSQL target passes the authenticated health check for the
-  transfer role (see [The activation role](#the-activation-role)).
+  PostgreSQL health passes as the daemon runtime role while admitting exactly
+  the live canonical transfer role as its caller-scoped peer (see
+  [The activation role](#the-activation-role)).
 
 A failed precondition is a **refusal**. A refusal begins no effect and leaves
 nothing to recover: fix the named condition and run again. Refusals name the
@@ -1037,47 +1055,70 @@ reads the destination (a lost connection, a refused privilege, a schema
 mismatch on the transfer session) is attributed exactly as the health check
 attributes it, `target-unhealthy` or `target-unresolvable` at `S7`.
 
+The destination identity query that compares the live destination with the
+sealed manifest (at `S0` and `S7` on the transfer session, and on the
+ordinary runtime session before any lease write, attributed to `S6`) is
+classified the same way. A definite server refusal (authentication, missing
+privilege) is reported as `target-unhealthy`; a connection or transport
+failure is reported as `target-unresolvable`. Both are refusals at the step
+that ran the query, or, when an effect has already begun and the run is
+re-entered, an interruption of the step in flight. Neither rejects the whole
+activation. A cancelled activation is still rejected, not classified.
+
 ### The activation role
 
-Activation connects to PostgreSQL as the **transfer role**: the role that
-holds the reviewed runtime grants plus the
-[transfer grant script](../src/storage/postgresql/reference/postgresql-transfer-grants.sql),
-the same role the copy and the verification used. Every activation step runs
-under it, including the lease, the health checks and the census; the health
-check admits the role through the transfer readiness check, not the daemon's
-runtime readiness check. There is no second connection as the daemon's
-runtime role: PostgreSQL readiness admits exactly one grantee per database,
-and the runtime and transfer privilege profiles are exclusive on one role, so
-a database cannot admit both profiles at once. Callers therefore supply the
-transfer role's connection settings for both of activation's settings
-fields. A caller that supplies runtime-only settings is refused at `S6` with
-`target-unhealthy` before any effect begins.
+Activation uses two PostgreSQL connections to the same sealed destination:
 
-### After activation: the grant swap and the daemon
+- `LCM_POSTGRES_URL` remains the transfer role used by copy and verification;
+- `LCM_POSTGRES_RUNTIME_URL` is the daemon runtime role used for the lease and
+  the `S6`/`S15` health checks.
 
-A successful activation proves that the transfer role could publish the
-selection; it does **not** prove that the daemon can start. The daemon
-enforces its exact runtime privilege profile when it starts, and that profile
-rejects the transfer grants. Before starting the daemon on the new backend:
+Before `activate`, apply the reviewed runtime grant scripts to the runtime
+role. Activation reads `current_user`, `session_user`, and the role OID from
+both live sessions, refuses switched or identical roles, and binds the runtime
+connection to the same destination identity before it can write the lease.
+Runtime readiness then admits exactly the discovered transfer role as the
+other canonical profile. The `S7` transfer check performs the reciprocal
+check with the discovered runtime role. Any third grantee, role membership,
+grant option, foreign grantor, missing grant, or extra grant still refuses.
+Ordinary daemon readiness never supplies this peer option.
 
-1. apply the reviewed runtime grant scripts to the daemon's runtime role (see
-   [Provisioning a PostgreSQL database](configuration.md#provisioning-a-postgresql-database));
-2. revoke the transfer grants from the transfer role (or drop that role) so
-   the runtime role is the schema's only non-owner grantee;
-3. start (or restart) the daemon, which performs its own readiness check
-   against the runtime role and refuses to serve until it passes.
+The runtime URL is an activate-only secret (`resume` reads it when it continues
+an interrupted activation). `verify`, `--dry-run`, the daemon, and supervisors
+do not read `LCM_POSTGRES_RUNTIME_URL`, and LCM never stores or prints it. It
+must be a strict `postgresql://` URL without query parameters or a fragment;
+the CA and tuning settings come from the verified destination.
+A generation verified by an older LCM build needs the runtime grants and this
+variable before the current build can activate it.
 
-Also switch `LCM_POSTGRES_URL` from the transfer role's URL used for
-activation to the runtime role's URL before starting the daemon or running a
-rollback, and leave `migrationRole` naming the schema owner.
+During the short grant-first window, no-peer commands remain deliberately
+strict. Fresh `verify`, copy resume, and target reachability refuse while the
+runtime grants exist; revoke the runtime grants before using those pre-activate
+recovery paths. Runtime-profile callers such as rollback, diagnostics, and
+daemon readiness refuse until the transfer grants are removed. An interrupted
+activation resumes through `activate`, which remains peer-aware. Cutover-set
+activation is still transfer-only and does not use this ordering yet.
 
-Leaving the transfer grants in place makes the daemon's readiness refuse the
-database as `acl-shape` or `schema-fingerprint`; applying the runtime grants
-before revoking the transfer grants is harmless, because readiness is only
-evaluated when the daemon starts. A later improvement, #1607, teaches
-readiness to admit the canonical transfer role next to the runtime role so
-that activation can prove the daemon's own pair; until then the swap is the
-operator's step.
+Readiness evaluates live ACLs. PostgreSQL default privileges are not admission
+evidence and are not inspected here; if they materialize an unexpected grant
+on a later object, the next readiness check refuses that live grant.
+Grantees are matched by role, so an unrelated role whose name is `runtime`,
+`owner`, or `public` is not mistaken for the sanctioned grants and is
+refused.
+
+### After activation: revoke transfer grants and start the daemon
+
+A successful activation has already proved the daemon runtime role's exact
+grants. One manual privilege step remains:
+
+1. revoke the transfer grants from the transfer role, or drop that role;
+2. set the daemon/service `LCM_POSTGRES_URL` to the same runtime-role URL that
+   `LCM_POSTGRES_RUNTIME_URL` supplied to activation;
+3. start or restart the daemon, whose ordinary readiness admits no peer.
+
+Leaving the transfer grants in place makes daemon readiness refuse with
+`acl-shape` or `schema-fingerprint`. Keep `migrationRole` naming the schema
+owner. The URL handoff is still required, but it is not another grant step.
 
 ### What activation writes, in order
 
@@ -1105,9 +1146,16 @@ A failure after step 1 is an **interruption**, not a refusal: an effect has
 begun. The outcome names the step (`S9` through `S16`), a closed cause, and
 three facts an operator can act on: whether an effect began, whether the
 publication is known to have been applied (`yes`, `no` or `unknown`), and
-whether an activation report is known to be stored. `unknown` is reported
-honestly when the journal or report store cannot be read; it is never
-collapsed into a guess.
+whether an activation report is known to be stored. `applied` is confirmed
+against the live selection, not the journal alone: `yes` needs the
+publication journal to record the configuration as published and the live
+configuration and project map to match the published witnesses; `no` needs
+the live configuration and project map to still match the pre-publication
+source (the journal's expected witnesses, or the activation's source
+material when no journal of this activation exists). A publication that may
+be mid-write, a selection that disagrees with the journal, or a journal or
+selection that cannot be read is `unknown`. `reportStored` is `unknown`
+when the report store cannot be read; neither is collapsed into a guess.
 
 Recovery is to run activation again. The run resumes from the durable
 evidence it finds (the manifest, the link and artifact, the stored attempt,
@@ -1122,6 +1170,16 @@ reversed automatically. If the published target turns out unhealthy after
 publication, the outcome is `post-publication-unhealthy` with the restart
 verdict; the selection stands, and the next run completes once the target is
 healthy again. Reversal is a separate, explicit rollback.
+
+Three conditions are classified rather than thrown. On an LCM home that was
+never initialized, activation refuses at `S0` with `manifest-absent` and
+creates nothing on disk. A machine identity that cannot be read or is not
+registered refuses at `S0` with `state-unresolvable` (an interruption of the
+step in flight when it happens on re-entry after an effect began); run
+`lcm machine register` (see [Project identity](project-identity.md)) and run
+activation again. A failure to allocate the census scratch directory refuses at
+`S7` with `state-unresolvable`; check the free space and permissions of the
+LCM home, then run activation again.
 
 ### The lease and the unavailable window
 
@@ -1140,6 +1198,19 @@ or a cancelled run can still leave the row behind, and a write whose result
 is uncertain keeps it; the same generation recovers by taking the row over
 on its next run. Once an effect has begun the lease is kept for the next run
 to continue.
+
+A crash after the coordinator released the remote fence but before it
+recorded that locally can leave the publication journal at `releasing`
+(or `abort-releasing`) while another home's publication has already acquired the
+released row. The retry admits that decodable foreign row, never renews,
+releases or takes it over, and lets the coordinator finish its release: a row
+of another identity with a greater fencing token proves this publication's
+fence was released (see "The remote guard provider" in the backend publication
+guide). An aborting run reports `publication-failed` with the aborted
+publication. A corrupt or ambiguous row, an unattributable read, or a guard
+that cannot prove the release still ends in `lease-lost`,
+`lease-unresolvable` or a coordinator refusal and leaves the journal at
+`releasing`. The same applies to each member of a cutover set.
 
 ### The daemon restart
 

@@ -570,6 +570,42 @@ function canonicalJson(value: unknown): string {
   return JSON.stringify(value);
 }
 
+const PASSIVE_EVENT_TIMESTAMP =
+  /^(\d{4}-\d{2}-\d{2})[T ](\d{2}:\d{2}:\d{2})(?:\.(\d{1,6}))?Z?$/;
+
+/** SQLite `datetime` text and portable text of one instant share one form. */
+function canonicalInstant(value: unknown): unknown {
+  if (typeof value !== "string") return value;
+  const match = PASSIVE_EVENT_TIMESTAMP.exec(value);
+  return match === null
+    ? value
+    : `${match[1]}T${match[2]}.${(match[3] ?? "").padEnd(6, "0")}Z`;
+}
+
+function comparablePayload(payload: JsonObject, other: JsonObject): JsonObject {
+  return Object.fromEntries(
+    Object.entries(payload)
+      .filter(([key]) => key !== "previousEventId" || Object.hasOwn(other, key))
+      .map(([key, value]) => [key, key === "createdAt" ? canonicalInstant(value) : value]),
+  ) as JsonObject;
+}
+
+/**
+ * Whether two passive-event payloads describe one event. The migration copy
+ * writes the portable envelope (an ISO `createdAt`, no `previousEventId`),
+ * while replication uploads the local SQLite row (SQLite `createdAt`, always
+ * a `previousEventId`). A `createdAt` of the same instant in either form
+ * matches, and `previousEventId`, a machine-local row id, is ignored when
+ * only one side has it. Every other difference still separates the events.
+ */
+export function samePassiveEventPayload(
+  left: JsonObject,
+  right: JsonObject,
+): boolean {
+  return canonicalJson(comparablePayload(left, right))
+    === canonicalJson(comparablePayload(right, left));
+}
+
 function sameEvent(
   expected: PostgreSqlPassiveEventInput,
   actual: PostgreSqlPassiveEventRecord,
@@ -579,7 +615,7 @@ function sameEvent(
     && actual.eventVersion === expected.eventVersion
     && actual.machineSequence === expected.machineSequence
     && actual.eventType === expected.eventType
-    && canonicalJson(actual.payload) === canonicalJson(expected.payload);
+    && samePassiveEventPayload(actual.payload, expected.payload);
 }
 
 function assertSameEvent(

@@ -21,7 +21,10 @@ import {
 
 // Test seam: runs a callback just before the module under test resolves a
 // path, so a race between its open and its containment check is deterministic.
-const fsSeam = vi.hoisted(() => ({ beforeRealpath: undefined as ((path: string) => void) | undefined }));
+const fsSeam = vi.hoisted(() => ({
+  beforeRealpath: undefined as ((path: string) => void) | undefined,
+  beforeRead: undefined as (() => void) | undefined,
+}));
 vi.mock("node:fs", async (importOriginal) => {
   const actual = await importOriginal<typeof import("node:fs")>();
   const realpathSync = ((path: string, options?: never) => {
@@ -29,7 +32,11 @@ vi.mock("node:fs", async (importOriginal) => {
     return actual.realpathSync(path, options);
   }) as typeof actual.realpathSync;
   realpathSync.native = actual.realpathSync.native;
-  return { ...actual, realpathSync };
+  const readSync = ((...args: Parameters<typeof actual.readSync>) => {
+    fsSeam.beforeRead?.();
+    return actual.readSync(...args);
+  }) as typeof actual.readSync;
+  return { ...actual, realpathSync, readSync };
 });
 
 // ---------------------------------------------------------------------------
@@ -960,6 +967,7 @@ describe("readLiveCodexRestoration", () => {
   const previousCodexHome = process.env.CODEX_HOME;
   afterEach(() => {
     fsSeam.beforeRealpath = undefined;
+    fsSeam.beforeRead = undefined;
     if (previousCodexHome === undefined) delete process.env.CODEX_HOME;
     else process.env.CODEX_HOME = previousCodexHome;
   });
@@ -1072,5 +1080,536 @@ describe("readLiveCodexRestoration", () => {
 
     // The whole file is scanned when it fits.
     expect(readLiveCodexRestoration(compactedAbove.path, { codexHome: compactedAbove.home })).toBe(true);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Referenced (paginated-history) forks
+// ---------------------------------------------------------------------------
+
+const uuid = (n: number): string => `01980000-0000-7000-8000-${String(n).padStart(12, "0")}`;
+
+interface RolloutFixture {
+  readonly path: string;
+  readonly rolloutId: string;
+  readonly startOrdinal: number;
+  /** Byte offset after each line, so offsets[k - 1] ends the first k lines. */
+  readonly offsets: number[];
+}
+
+const developerItem = (text: string): Record<string, unknown> => ({
+  type: "response_item",
+  payload: { type: "message", role: "developer", content: [{ type: "input_text", text }] },
+});
+const markerItem = developerItem(blockText);
+const compactedItem = { type: "compacted", payload: { message: "", replacement_history: [] } };
+const rolledBackItem = { type: "event_msg", payload: { type: "thread_rolled_back", num_turns: 1 } };
+const fillerItem = (size = 400): Record<string, unknown> => developerItem("x".repeat(size));
+const metaItem = (threadId: string, historyBase?: unknown, extra: Record<string, unknown> = {}): Record<string, unknown> => ({
+  type: "session_meta",
+  payload: {
+    id: threadId,
+    cwd: "/p",
+    history_mode: "paginated",
+    ...(historyBase === undefined ? {} : { history_base: historyBase }),
+    ...extra,
+  },
+});
+
+/**
+ * Write a paginated rollout. Items are stamped with consecutive ordinals from
+ * startOrdinal; a string item is written verbatim.
+ */
+function writeRollout(home: string, spec: {
+  rolloutId: string;
+  threadId?: string;
+  items: Array<Record<string, unknown> | string>;
+  startOrdinal?: number;
+  root?: string;
+  day?: string;
+}): RolloutFixture {
+  const { rolloutId, threadId = rolloutId, items, startOrdinal = 0, root = "sessions", day = "2026/01/01" } = spec;
+  const directory = join(home, root, ...(root === "sessions" ? day.split("/") : []));
+  mkdirSync(directory, { recursive: true });
+  const suffix = rolloutId === threadId ? "" : `_${rolloutId}`;
+  const path = join(directory, `rollout-2026-01-01T00-00-00-${threadId}${suffix}.jsonl`);
+  const offsets: number[] = [];
+  let content = "";
+  items.forEach((item, index) => {
+    const line = typeof item === "string"
+      ? item
+      : JSON.stringify({ timestamp: "2026-01-01T00:00:00.000Z", ordinal: startOrdinal + index, ...item });
+    content += `${line}\n`;
+    offsets.push(Buffer.byteLength(content));
+  });
+  writeFileSync(path, content);
+  return { path, rolloutId, startOrdinal, offsets };
+}
+
+/** The history_base of a fork taken after the first count lines of a parent. */
+function baseAfter(parent: RolloutFixture, count: number): Record<string, unknown> {
+  return {
+    thread_id: parent.rolloutId,
+    end_ordinal_exclusive: parent.startOrdinal + count,
+    end_byte_offset: parent.offsets[count - 1],
+  };
+}
+
+/** A fork of the first count lines of parent whose own records follow its session_meta. */
+function writeFork(
+  home: string,
+  id: number,
+  parent: RolloutFixture,
+  count: number,
+  own: Array<Record<string, unknown> | string>,
+  metaExtra: Record<string, unknown> = {},
+): RolloutFixture {
+  return writeRollout(home, {
+    rolloutId: uuid(id),
+    startOrdinal: parent.startOrdinal + count,
+    items: [metaItem(uuid(id), baseAfter(parent, count), metaExtra), ...own],
+  });
+}
+
+const liveIn = (home: string, fork: RolloutFixture, options: { maxBytes?: number; maxDirectoryEntries?: number } = {}): boolean =>
+  readLiveCodexRestoration(fork.path, { codexHome: home, ...options });
+
+describe("scanLiveCodexRestoration with an inherited state", () => {
+  it("starts from the given live state and still resets on later records", () => {
+    expect(scanLiveCodexRestoration("", true)).toBe(true);
+    expect(scanLiveCodexRestoration("", false)).toBe(false);
+    expect(scanLiveCodexRestoration(makeEventLine("token_count"), true)).toBe(true);
+    expect(scanLiveCodexRestoration(compacted, true)).toBe(false);
+    expect(scanLiveCodexRestoration(rolledBack, true)).toBe(false);
+    expect(scanLiveCodexRestoration("{not json", true)).toBe(false);
+    expect(scanLiveCodexRestoration(`{not json\n${block}`, true)).toBe(true);
+  });
+});
+
+/** A fork of every line currently in parent. */
+const forkAll = (home: string, id: number, parent: RolloutFixture, own: Array<Record<string, unknown> | string>): RolloutFixture =>
+  writeFork(home, id, parent, parent.offsets.length, own);
+
+describe("readLiveCodexRestoration for referenced forks", () => {
+  it("treats a read error on an ancestor as a failed link and one on the fork's own file as no proof", () => {
+    const home = makeTmpDir();
+    const marked = writeRollout(home, { rolloutId: uuid(1), items: [metaItem(uuid(1)), markerItem] });
+    const bare = writeRollout(home, { rolloutId: uuid(2), items: [metaItem(uuid(2)), fillerItem()] });
+    const inherited = forkAll(home, 3, marked, [fillerItem()]);
+    const own = forkAll(home, 4, bare, [markerItem]);
+    expect(liveIn(home, inherited)).toBe(true);
+    expect(liveIn(home, own)).toBe(true);
+
+    // Reads in order: the fork's head, the parent's head, the parent's cutoff record,
+    // the fork's records, the parent's records.
+    const failingRead = (fork: RolloutFixture, failing: number): boolean => {
+      let reads = 0;
+      fsSeam.beforeRead = () => {
+        reads += 1;
+        if (reads === failing) throw new Error("EIO");
+      };
+      try {
+        return liveIn(home, fork);
+      } finally {
+        fsSeam.beforeRead = undefined;
+      }
+    };
+    // The fork's own head or records cannot be read: no proof.
+    for (const failing of [1, 4]) {
+      expect(failingRead(inherited, failing)).toBe(false);
+      expect(failingRead(own, failing)).toBe(false);
+    }
+    // An ancestor cannot be read: the fork's own marker still proves, an inherited one does not.
+    for (const failing of [2, 3, 5]) {
+      expect(failingRead(inherited, failing)).toBe(false);
+      expect(failingRead(own, failing)).toBe(true);
+    }
+  });
+
+  it("proves a marker held by the parent prefix before the fork position", () => {
+    const home = makeTmpDir();
+    const parent = writeRollout(home, { rolloutId: uuid(1), items: [metaItem(uuid(1)), markerItem, fillerItem()] });
+    expect(liveIn(home, forkAll(home, 2, parent, [fillerItem()]))).toBe(true);
+    // The same fork without any inherited marker proves nothing.
+    const bare = writeRollout(home, { rolloutId: uuid(3), items: [metaItem(uuid(3)), fillerItem(), fillerItem()] });
+    expect(liveIn(home, forkAll(home, 4, bare, [fillerItem()]))).toBe(false);
+  });
+
+  it("does not prove a marker that only follows the fork position in the parent", () => {
+    const home = makeTmpDir();
+    const parent = writeRollout(home, {
+      rolloutId: uuid(1),
+      items: [metaItem(uuid(1)), fillerItem(), markerItem, compactedItem, rolledBackItem],
+    });
+    expect(liveIn(home, writeFork(home, 2, parent, 2, [fillerItem()]))).toBe(false);
+    // A marker live at the cutoff survives resets that only come after it in the parent.
+    const grown = writeRollout(home, {
+      rolloutId: uuid(3),
+      items: [metaItem(uuid(3)), markerItem, fillerItem(), compactedItem, rolledBackItem, "{not json"],
+    });
+    expect(liveIn(home, writeFork(home, 4, grown, 3, []))).toBe(true);
+  });
+
+  it("applies the fork's own compaction, rollback and unparsable records after an inherited marker", () => {
+    const home = makeTmpDir();
+    const parent = writeRollout(home, { rolloutId: uuid(1), items: [metaItem(uuid(1)), markerItem] });
+    expect(liveIn(home, forkAll(home, 2, parent, [fillerItem()]))).toBe(true);
+    expect(liveIn(home, forkAll(home, 3, parent, [compactedItem]))).toBe(false);
+    expect(liveIn(home, forkAll(home, 4, parent, [rolledBackItem]))).toBe(false);
+    expect(liveIn(home, forkAll(home, 5, parent, ["{not json"]))).toBe(false);
+    expect(liveIn(home, forkAll(home, 6, parent, [compactedItem, markerItem]))).toBe(true);
+  });
+
+  it("treats a parent compaction or rollback after the marker but before the cutoff as a reset", () => {
+    const home = makeTmpDir();
+    const parent = writeRollout(home, { rolloutId: uuid(1), items: [metaItem(uuid(1)), markerItem, compactedItem, fillerItem()] });
+    expect(liveIn(home, forkAll(home, 2, parent, []))).toBe(false);
+    const rolled = writeRollout(home, { rolloutId: uuid(3), items: [metaItem(uuid(3)), markerItem, rolledBackItem] });
+    expect(liveIn(home, forkAll(home, 4, rolled, []))).toBe(false);
+  });
+
+  it("keeps a fork's own marker when the parent is missing", () => {
+    const home = makeTmpDir();
+    const parent = writeRollout(home, { rolloutId: uuid(1), items: [metaItem(uuid(1)), markerItem] });
+    const marked = forkAll(home, 2, parent, [markerItem]);
+    const bare = forkAll(home, 3, parent, [fillerItem()]);
+    rmSync(parent.path);
+    expect(liveIn(home, marked)).toBe(true);
+    expect(liveIn(home, bare)).toBe(false);
+  });
+
+  it("finds an archived parent and a reverted parent named for a distinct rollout id", () => {
+    const home = makeTmpDir();
+    const archived = writeRollout(home, { rolloutId: uuid(1), items: [metaItem(uuid(1)), markerItem], root: "archived_sessions" });
+    expect(liveIn(home, forkAll(home, 2, archived, []))).toBe(true);
+
+    // thread/revert keeps the thread id but starts a new rollout file for it.
+    const reverted = writeRollout(home, { rolloutId: uuid(4), threadId: uuid(3), items: [metaItem(uuid(3)), markerItem] });
+    expect(liveIn(home, forkAll(home, 5, reverted, []))).toBe(true);
+    // The thread id is not the rollout id, so a base naming it finds nothing.
+    const wrong = writeRollout(home, {
+      rolloutId: uuid(6),
+      startOrdinal: 2,
+      items: [metaItem(uuid(6), { ...baseAfter(reverted, 2), thread_id: uuid(3) })],
+    });
+    expect(liveIn(home, wrong)).toBe(false);
+  });
+
+  it("uses history_base rather than the logical fork boundary", () => {
+    const home = makeTmpDir();
+    const parent = writeRollout(home, { rolloutId: uuid(1), items: [metaItem(uuid(1)), fillerItem(), markerItem] });
+    const after = writeFork(home, 2, parent, 3, [], { forked_from_id: uuid(1), forked_from_ordinal_exclusive: 1 });
+    expect(liveIn(home, after)).toBe(true);
+    const before = writeFork(home, 3, parent, 2, [], { forked_from_id: uuid(1), forked_from_ordinal_exclusive: 3 });
+    expect(liveIn(home, before)).toBe(false);
+  });
+
+  it("follows a chain of referenced forks to the grandparent", () => {
+    const home = makeTmpDir();
+    const grandparent = writeRollout(home, { rolloutId: uuid(1), items: [metaItem(uuid(1)), markerItem, fillerItem()] });
+    const parent = forkAll(home, 2, grandparent, [fillerItem()]);
+    expect(liveIn(home, forkAll(home, 3, parent, [fillerItem()]))).toBe(true);
+    // A compaction in the parent's own records resets the grandparent's marker.
+    const reset = forkAll(home, 4, grandparent, [compactedItem]);
+    expect(liveIn(home, forkAll(home, 5, reset, []))).toBe(false);
+    // A cutoff inside the grandparent bypasses the parent.
+    expect(liveIn(home, writeFork(home, 6, grandparent, 2, []))).toBe(true);
+  });
+
+  it("follows at most four files", () => {
+    const home = makeTmpDir();
+    let tip = writeRollout(home, { rolloutId: uuid(1), items: [metaItem(uuid(1)), markerItem] });
+    for (let id = 2; id <= 4; id += 1) tip = forkAll(home, id, tip, [fillerItem()]);
+    // The fork, two forks between and the root: four files reach the root marker.
+    expect(liveIn(home, tip)).toBe(true);
+    expect(liveIn(home, forkAll(home, 5, tip, [fillerItem()]))).toBe(false);
+  });
+
+  it("stops at a parent that names itself or names the fork back", () => {
+    const home = makeTmpDir();
+    const self = writeRollout(home, {
+      rolloutId: uuid(1),
+      startOrdinal: 1,
+      items: [metaItem(uuid(1), { thread_id: uuid(1), end_ordinal_exclusive: 1, end_byte_offset: 1 }), markerItem],
+    });
+    expect(liveIn(home, forkAll(home, 2, self, []))).toBe(true);
+
+    const loop = writeRollout(home, {
+      rolloutId: uuid(3),
+      startOrdinal: 1,
+      items: [metaItem(uuid(3), { thread_id: uuid(4), end_ordinal_exclusive: 1, end_byte_offset: 1 }), markerItem],
+    });
+    const fork = forkAll(home, 4, loop, [fillerItem()]);
+    expect(liveIn(home, fork)).toBe(true);
+  });
+
+  it("gives no proof when the parent is ambiguous, symlinked, compressed or outside the sessions layout", () => {
+    const home = makeTmpDir();
+    const parent = writeRollout(home, { rolloutId: uuid(1), items: [metaItem(uuid(1)), markerItem], day: "2026/02/01" });
+    const fork = forkAll(home, 2, parent, []);
+    expect(liveIn(home, fork)).toBe(true);
+
+    // The same rollout id twice, across date directories or across roots.
+    const copy = writeRollout(home, { rolloutId: uuid(1), items: [metaItem(uuid(1)), markerItem], day: "2026/02/02" });
+    expect(liveIn(home, fork)).toBe(false);
+    rmSync(copy.path);
+    const archivedCopy = writeRollout(home, { rolloutId: uuid(1), items: [metaItem(uuid(1)), markerItem], root: "archived_sessions" });
+    expect(liveIn(home, fork)).toBe(false);
+    rmSync(archivedCopy.path);
+    expect(liveIn(home, fork)).toBe(true);
+
+    // A symlinked parent file is never followed.
+    const outside = makeTmpDir();
+    const moved = join(outside, "parent.jsonl");
+    renameSync(parent.path, moved);
+    symlinkSync(moved, parent.path);
+    expect(liveIn(home, fork)).toBe(false);
+    rmSync(parent.path);
+
+    // Neither is a symlinked date directory.
+    const dateDirectory = join(home, "sessions", "2026", "02", "01");
+    const elsewhere = join(outside, "day");
+    mkdirSync(elsewhere);
+    renameSync(moved, join(elsewhere, basename(parent.path)));
+    rmSync(dateDirectory, { recursive: true });
+    symlinkSync(elsewhere, dateDirectory);
+    expect(liveIn(home, fork)).toBe(false);
+    rmSync(dateDirectory);
+
+    // A parent that only exists compressed is not read.
+    mkdirSync(dateDirectory);
+    renameSync(join(elsewhere, basename(parent.path)), `${join(dateDirectory, basename(parent.path))}.zst`);
+    expect(liveIn(home, fork)).toBe(false);
+  });
+
+  it("matches only canonical rollout names while walking the sessions layout", () => {
+    const home = makeTmpDir();
+    const parent = writeRollout(home, { rolloutId: uuid(1), items: [metaItem(uuid(1)), markerItem] });
+    const sessions = join(home, "sessions");
+    mkdirSync(join(sessions, "notes"));
+    mkdirSync(join(sessions, "2026", "01", "01", "nested"));
+    mkdirSync(join(sessions, "2026", "extra-dir"));
+    writeFileSync(join(sessions, "2026", "01", "01", "notes.txt"), "x");
+    writeFileSync(join(sessions, "rollout-not-canonical.jsonl"), "x");
+    symlinkSync(sessions, join(sessions, "2027"));
+    expect(liveIn(home, forkAll(home, 2, parent, []))).toBe(true);
+  });
+
+  it("gives no proof when the lookup exceeds its directory entry budget or a root cannot be read", () => {
+    const home = makeTmpDir();
+    const parent = writeRollout(home, { rolloutId: uuid(1), items: [metaItem(uuid(1)), markerItem] });
+    const fork = forkAll(home, 2, parent, []);
+    // sessions holds the year, month and day directories and the two rollouts: five entries.
+    expect(liveIn(home, fork, { maxDirectoryEntries: 5 })).toBe(true);
+    expect(liveIn(home, fork, { maxDirectoryEntries: 4 })).toBe(false);
+    expect(liveIn(home, fork, { maxDirectoryEntries: 0 })).toBe(false);
+
+    writeFileSync(join(home, "archived_sessions"), "not a directory");
+    expect(liveIn(home, fork)).toBe(false);
+  });
+
+  it("stops at the first failed ancestor link and keeps the validated newer history", () => {
+    const home = makeTmpDir();
+    const grandparent = writeRollout(home, { rolloutId: uuid(40), items: [metaItem(uuid(40)), markerItem] });
+    const brokenLink = { ...baseAfter(grandparent, 2), end_ordinal_exclusive: 5 };
+    const withOwnMarker = writeRollout(home, {
+      rolloutId: uuid(41),
+      startOrdinal: 2,
+      items: [metaItem(uuid(41), brokenLink), markerItem],
+    });
+    const bare = writeRollout(home, {
+      rolloutId: uuid(42),
+      startOrdinal: 2,
+      items: [metaItem(uuid(42), brokenLink), fillerItem()],
+    });
+    // The failing link ends the walk, but the validated newer segment still proves its marker.
+    expect(liveIn(home, forkAll(home, 43, withOwnMarker, []))).toBe(true);
+    expect(liveIn(home, forkAll(home, 44, withOwnMarker, [fillerItem()]))).toBe(true);
+    // The marker behind the failing link is unknown, so it cannot carry in.
+    expect(liveIn(home, forkAll(home, 45, bare, []))).toBe(false);
+    // A reset in the validated newer segment still applies.
+    const reset = writeRollout(home, {
+      rolloutId: uuid(46),
+      startOrdinal: 2,
+      items: [metaItem(uuid(46), brokenLink), markerItem, compactedItem],
+    });
+    expect(liveIn(home, forkAll(home, 47, reset, []))).toBe(false);
+  });
+
+  it("rejects a parent that does not match its recorded cutoff", () => {
+    const home = makeTmpDir();
+    const parent = writeRollout(home, { rolloutId: uuid(1), items: [metaItem(uuid(1)), markerItem, fillerItem()] });
+    const forkWith = (base: Record<string, unknown>): boolean => liveIn(home, writeRollout(home, {
+      rolloutId: uuid(2),
+      startOrdinal: 3,
+      items: [metaItem(uuid(2), base)],
+    }));
+    expect(forkWith(baseAfter(parent, 3))).toBe(true);
+    // Past the end of the file.
+    expect(forkWith({ ...baseAfter(parent, 3), end_byte_offset: (parent.offsets[2] as number) + 1 })).toBe(false);
+    // In the middle of a record.
+    expect(forkWith({ ...baseAfter(parent, 3), end_byte_offset: (parent.offsets[1] as number) + 5 })).toBe(false);
+    // Another ordinal than the one after the last record before the offset.
+    expect(forkWith({ ...baseAfter(parent, 3), end_ordinal_exclusive: 4 })).toBe(false);
+    expect(forkWith({ ...baseAfter(parent, 3), end_ordinal_exclusive: 2 })).toBe(false);
+
+    // The last record is not an ordered object or not JSON at all.
+    for (const last of ["{broken", "[]", JSON.stringify({ type: "x" }), JSON.stringify({ ordinal: -1 })]) {
+      const odd = writeRollout(home, { rolloutId: uuid(30), items: [metaItem(uuid(30)), markerItem, last] });
+      expect(liveIn(home, forkAll(home, 31, odd, []))).toBe(false);
+    }
+
+    // A legacy parent has no ordinals.
+    const legacy = writeRollout(home, {
+      rolloutId: uuid(32),
+      items: [JSON.stringify(metaItem(uuid(32))), JSON.stringify(markerItem)],
+    });
+    expect(liveIn(home, forkAll(home, 33, legacy, []))).toBe(false);
+
+    // A parent without session_meta is not a rollout.
+    const headless = writeRollout(home, { rolloutId: uuid(34), items: [markerItem] });
+    expect(liveIn(home, forkAll(home, 35, headless, []))).toBe(false);
+
+    // A cutoff after the first record holds only the parent's session_meta.
+    expect(liveIn(home, writeFork(home, 36, parent, 1, [markerItem]))).toBe(true);
+    expect(liveIn(home, writeFork(home, 37, parent, 1, []))).toBe(false);
+  });
+
+  it("keeps the validated parent prefix when the grandparent link fails", () => {
+    const home = makeTmpDir();
+    const grandparent = writeRollout(home, { rolloutId: uuid(1), items: [metaItem(uuid(1)), markerItem] });
+    const parent = forkAll(home, 2, grandparent, [markerItem]);
+    const fork = forkAll(home, 3, parent, [fillerItem()]);
+    expect(liveIn(home, fork)).toBe(true);
+    // The grandparent cannot be found: the parent's prefix still proves.
+    rmSync(grandparent.path);
+    expect(liveIn(home, fork)).toBe(true);
+    // An unusable history_base on the parent ends the walk there.
+    const strange = writeRollout(home, {
+      rolloutId: uuid(4),
+      startOrdinal: 2,
+      items: [metaItem(uuid(4), "bad"), markerItem],
+    });
+    expect(liveIn(home, forkAll(home, 5, strange, []))).toBe(true);
+    // Without a marker after the gap nothing is proven.
+    const empty = forkAll(home, 6, forkAll(home, 7, grandparent, [fillerItem()]), [fillerItem()]);
+    expect(liveIn(home, empty)).toBe(false);
+  });
+
+  it("reads the cutoff record without needing a newline after it", () => {
+    const home = makeTmpDir();
+    const parent = writeRollout(home, { rolloutId: uuid(1), items: [metaItem(uuid(1)), markerItem, "", "  ", fillerItem()] });
+    const cutoff = (byte: number, ordinal: number): boolean => liveIn(home, writeRollout(home, {
+      rolloutId: uuid(2),
+      startOrdinal: ordinal,
+      items: [metaItem(uuid(2), { thread_id: parent.rolloutId, end_ordinal_exclusive: ordinal, end_byte_offset: byte })],
+    }));
+    // Right after the marker record, with and without its newline, and past trailing blank lines.
+    expect(cutoff((parent.offsets[1] as number) - 1, 2)).toBe(true);
+    expect(cutoff(parent.offsets[1] as number, 2)).toBe(true);
+    expect(cutoff(parent.offsets[3] as number, 2)).toBe(true);
+    // In the middle of a record, or with another ordinal.
+    expect(cutoff((parent.offsets[1] as number) - 5, 2)).toBe(false);
+    expect(cutoff(parent.offsets[3] as number, 3)).toBe(false);
+    // Only blank lines before the offset.
+    const blank = writeRollout(home, { rolloutId: uuid(3), items: ["", "  ", metaItem(uuid(3))] });
+    expect(liveIn(home, writeRollout(home, {
+      rolloutId: uuid(4),
+      items: [metaItem(uuid(4), { thread_id: blank.rolloutId, end_ordinal_exclusive: 1, end_byte_offset: blank.offsets[1] })],
+    }))).toBe(false);
+  });
+
+  it("does not read a cutoff record longer than a native record may be", () => {
+    const home = makeTmpDir();
+    const parent = writeRollout(home, {
+      rolloutId: uuid(1),
+      items: [metaItem(uuid(1)), markerItem, fillerItem(11 * 1024 * 1024)],
+    });
+    expect(liveIn(home, forkAll(home, 2, parent, []))).toBe(false);
+  });
+
+  it("validates an ancestor's last record when it spans several read chunks", () => {
+    const home = makeTmpDir();
+    const parent = writeRollout(home, { rolloutId: uuid(1), items: [metaItem(uuid(1)), markerItem, fillerItem(150_000)] });
+    expect(liveIn(home, forkAll(home, 2, parent, []))).toBe(true);
+    expect(liveIn(home, writeFork(home, 3, parent, 2, []))).toBe(true);
+  });
+
+  it("ignores a history_base that is invalid or whose first line is not complete in the head", () => {
+    const home = makeTmpDir();
+    const parent = writeRollout(home, { rolloutId: uuid(1), items: [metaItem(uuid(1)), markerItem] });
+    const good = baseAfter(parent, 2);
+    const control = writeRollout(home, { rolloutId: uuid(99), startOrdinal: 2, items: [metaItem(uuid(99), good)] });
+    expect(liveIn(home, control)).toBe(true);
+
+    const attempts: unknown[] = [
+      "base",
+      [],
+      { ...good, thread_id: undefined },
+      { ...good, thread_id: 7 },
+      { ...good, thread_id: "../../../../etc/passwd" },
+      { ...good, thread_id: `${parent.rolloutId}/../x` },
+      { ...good, thread_id: parent.rolloutId.replaceAll("-", "") },
+      { ...good, end_ordinal_exclusive: 0 },
+      { ...good, end_ordinal_exclusive: -1 },
+      { ...good, end_ordinal_exclusive: 1.5 },
+      { ...good, end_ordinal_exclusive: "2" },
+      { ...good, end_ordinal_exclusive: 2 ** 60 },
+      { ...good, end_byte_offset: 0 },
+      { ...good, end_byte_offset: undefined },
+      { ...good, end_byte_offset: 2 ** 60 },
+    ];
+    attempts.forEach((base, index) => {
+      const fork = writeRollout(home, { rolloutId: uuid(100 + index), startOrdinal: 2, items: [metaItem(uuid(100 + index), base)] });
+      expect(liveIn(home, fork)).toBe(false);
+      const marked = writeRollout(home, { rolloutId: uuid(200 + index), startOrdinal: 2, items: [metaItem(uuid(200 + index), base), markerItem] });
+      expect(liveIn(home, marked)).toBe(true);
+    });
+
+    // A null base is an ordinary rollout; a first line beyond the head bound hides the base.
+    const plain = writeRollout(home, { rolloutId: uuid(300), items: [metaItem(uuid(300), null), markerItem] });
+    expect(liveIn(home, plain)).toBe(true);
+    const oversized = writeRollout(home, {
+      rolloutId: uuid(301),
+      startOrdinal: 2,
+      items: [metaItem(uuid(301), good, { base_instructions: "x".repeat(300 * 1024) })],
+    });
+    expect(liveIn(home, oversized)).toBe(false);
+    const empty = join(home, "sessions", "2026", "01", "01", "rollout-empty.jsonl");
+    writeFileSync(empty, "");
+    expect(readLiveCodexRestoration(empty, { codexHome: home })).toBe(false);
+  });
+
+  it("starts the scan with no proof when the byte budget cuts the effective history", () => {
+    const home = makeTmpDir();
+    const parent = writeRollout(home, {
+      rolloutId: uuid(1),
+      items: [metaItem(uuid(1)), markerItem, fillerItem(), fillerItem()],
+    });
+    const lineBytes = (fixture: RolloutFixture, index: number): number =>
+      (fixture.offsets[index] as number) - ((fixture.offsets[index - 1] ?? 0) as number);
+    const total = (fixture: RolloutFixture): number => fixture.offsets[fixture.offsets.length - 1] as number;
+    const plain = forkAll(home, 2, parent, [fillerItem(), fillerItem()]);
+    const reset = forkAll(home, 3, parent, [compactedItem, fillerItem(), fillerItem()]);
+
+    // Everything fits.
+    expect(liveIn(home, plain)).toBe(true);
+    expect(liveIn(home, reset)).toBe(false);
+
+    // Only the fork fits: the parent's marker does not carry across the cut.
+    expect(liveIn(home, plain, { maxBytes: total(plain) })).toBe(false);
+    // Only the fork's tail fits, so its compaction is not seen and nothing inherited carries in.
+    expect(liveIn(home, reset, { maxBytes: lineBytes(reset, 2) + lineBytes(reset, 3) + 20 })).toBe(false);
+
+    // The suffix reaches into the parent: a marker inside it proves, one above it does not.
+    const reaching = total(plain) + lineBytes(parent, 1) + lineBytes(parent, 2) + lineBytes(parent, 3) + 20;
+    expect(liveIn(home, plain, { maxBytes: reaching })).toBe(true);
+    const above = total(plain) + lineBytes(parent, 2) + lineBytes(parent, 3) + 20;
+    expect(liveIn(home, plain, { maxBytes: above })).toBe(false);
+
+    // A window that starts inside the parent's last record holds no complete record.
+    expect(liveIn(home, plain, { maxBytes: total(plain) + 10 })).toBe(false);
+    expect(liveIn(home, plain, { maxBytes: total(plain) + 1 })).toBe(false);
+    expect(liveIn(home, plain, { maxBytes: 0 })).toBe(false);
   });
 });

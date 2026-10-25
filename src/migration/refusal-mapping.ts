@@ -144,22 +144,25 @@ export const MIGRATION_REFUSAL_REASONS: readonly MigrationRefusalMapping[] = Obj
   // --- Section 4.4/4.9: hold entry ---
   // Round-1 B-5/A-11: the fresh hold entry's failures are classified by
   // reason, each with a remedy that matches the fact. None of them names
-  // `abort`: no hold of ours exists yet at this point.
+  // `abort`: `applied: true` means the invocation changed or may have
+  // changed state (an identity mutation, a hold write observed on readback,
+  // or a readback that failed), so a maintenance hold may remain and the
+  // operator inspects `lcm migration report` before recovering.
   Object.freeze({
     reason: "hold-entry-contention", exitClass: "refused-contention",
-    remedy: "Another actor holds the publication lock, so the maintenance hold was not entered. Wait, then retry `lcm migration apply`.",
+    remedy: "Another actor holds the publication lock, so the maintenance hold was not entered. Wait, then retry `lcm migration apply`. If the envelope reports `applied: true`, this invocation changed or may have changed state and a maintenance hold (`maintenance-entering` or `maintenance-held`) may remain: inspect `lcm migration report` and the identity evidence before recovering.",
   }),
   Object.freeze({
     reason: "hold-entry-slot-occupied", exitClass: "refused-contention",
-    remedy: "A publication or another maintenance hold occupies the journal slot. Wait for it to finish, then re-run `lcm migration plan`.",
+    remedy: "A publication or another maintenance hold occupies the journal slot. Wait for it to finish, then re-run `lcm migration plan`. If the envelope reports `applied: true`, this invocation changed or may have changed state and a maintenance hold (`maintenance-entering` or `maintenance-held`) may remain: inspect `lcm migration report` and the identity evidence before recovering.",
   }),
   Object.freeze({
     reason: "hold-entry-precondition", exitClass: "refused-precondition",
-    remedy: "The maintenance journal changed while the hold was being entered. Re-run `lcm migration plan` and confirm the id it prints.",
+    remedy: "The maintenance journal changed while the hold was being entered. Re-run `lcm migration plan` and confirm the id it prints. If the envelope reports `applied: true`, this invocation changed or may have changed state and a maintenance hold (`maintenance-entering` or `maintenance-held`) may remain: inspect `lcm migration report` and the identity evidence before recovering.",
   }),
   Object.freeze({
     reason: "hold-entry-evidence", exitClass: "refused-evidence",
-    remedy: "The maintenance journal could not be read or verified while entering the hold. Run `lcm doctor` before retrying.",
+    remedy: "The maintenance journal could not be read or verified while entering the hold. Run `lcm doctor` before retrying. If the envelope reports `applied: true`, this invocation changed or may have changed state and a maintenance hold (`maintenance-entering` or `maintenance-held`) may remain: inspect `lcm migration report` and the identity evidence before recovering.",
   }),
   Object.freeze({
     reason: "hold-entry-readback-mismatch", exitClass: "refused-evidence",
@@ -449,10 +452,6 @@ export const MIGRATION_REFUSAL_REASONS: readonly MigrationRefusalMapping[] = Obj
     remedy: "The pending abort effect on the manifest is not the one an abort of this generation begins. Nothing was changed; run `lcm doctor` and inspect the evidence.",
   }),
   Object.freeze({
-    reason: "abort-other-generation", exitClass: "refused-precondition",
-    remedy: "The terminal maintenance journal belongs to a different generation than the one named. Nothing was changed; omit --generation to act on the journal's own generation.",
-  }),
-  Object.freeze({
     reason: "abort-readback-mismatch", exitClass: "failed-operator-required",
     remedy: "The abort appeared to complete but its terminal state could not be confirmed on readback. Run `lcm doctor` and inspect the maintenance journal and manifest directly.",
   }),
@@ -470,6 +469,10 @@ export const MIGRATION_REFUSAL_REASONS: readonly MigrationRefusalMapping[] = Obj
   Object.freeze({
     reason: "activation-refused-precondition", exitClass: "refused-precondition",
     remedy: "Activation was refused before it began any effect: the evidence names the step and the reason. Fix that condition, then run `lcm migration activate` again. `lcm migration report` shows the current state.",
+  }),
+  Object.freeze({
+    reason: "activation-runtime-target-missing", exitClass: "refused-precondition",
+    remedy: "Activation requires LCM_POSTGRES_RUNTIME_URL for the daemon runtime role. Set it to a strict postgresql:// URL for the verified destination, without query parameters or a fragment, then retry.",
   }),
   Object.freeze({
     reason: "activation-refused-contention", exitClass: "refused-contention",
@@ -521,7 +524,7 @@ export const MIGRATION_REFUSAL_REASONS: readonly MigrationRefusalMapping[] = Obj
   }),
   Object.freeze({
     reason: "cutover-restart-required", exitClass: "restart-required",
-    remedy: "The durable selection is correct, but a running daemon still holds the previous startup backend. Swap the grants first (add the runtime grants, revoke the transfer grants), restart the daemon, then run `lcm migration report`.",
+    remedy: "The durable selection is correct, but a running daemon still holds the previous startup backend. Revoke the transfer grants, restart the daemon with LCM_POSTGRES_URL set to the proven runtime role, then run `lcm migration report`.",
   }),
   Object.freeze({
     reason: "cutover-restart-contradiction", exitClass: "refused-evidence",
@@ -557,6 +560,60 @@ export const MIGRATION_REFUSAL_REASONS: readonly MigrationRefusalMapping[] = Obj
   Object.freeze({
     reason: "rollback-dry-run-not-predictive", exitClass: "refused-evidence",
     remedy: "The rollback preview reads only the route and the manifest. It does not evaluate eligibility, mode, quiescence, the lease, drift, remote bindings or the restart check, so it cannot say rollback would succeed.",
+  }),
+  // --- The cutover-set commands (`--set`, #1551): one shared bucket per
+  // exit class. The closed service reason, step and cause, and the owning
+  // command, travel in the evidence; the remedy names only `--set` and the
+  // aggregate confirmation. ---
+  Object.freeze({
+    reason: "set-refused-precondition", exitClass: "refused-precondition",
+    remedy: "The cutover set's state, scope or capacity does not admit this command, and nothing it owns was changed: the evidence names the owning command and the closed reason. Fix that condition, or run the command the evidence names, always with --set.",
+  }),
+  Object.freeze({
+    reason: "set-refused-contention", exitClass: "refused-contention",
+    remedy: "Another actor holds a lock, lease or journal slot this set command needs. Wait for it to finish or expire, then run the same command again with --set; the evidence names the closed reason.",
+  }),
+  Object.freeze({
+    reason: "set-refused-evidence", exitClass: "refused-evidence",
+    remedy: "The cutover set command could not establish or confirm a fact it needs, or found evidence that contradicts the set: the evidence names the owning command and the closed reason. Run `lcm doctor` and `lcm migration report --set --generation <set-id>` and inspect it before retrying.",
+  }),
+  Object.freeze({
+    reason: "set-incomplete", exitClass: "incomplete-recoverable",
+    remedy: "The cutover set operation was durably begun and `lcm migration resume --set --generation <set-id> --confirm-generation <set-id>` can finish it. Use the original set id the plan printed; the evidence names the closed reason.",
+  }),
+  Object.freeze({
+    reason: "set-operator-required", exitClass: "failed-operator-required",
+    remedy: "No automatic command settles this cutover set. Run `lcm migration report --set --generation <set-id>` and inspect the evidence; `lcm migration abort --set` releases a held preparation and keeps its evidence.",
+  }),
+  Object.freeze({
+    reason: "set-preview-not-predictive", exitClass: "refused-evidence",
+    remedy: "The --set preview reads persisted state and names the route; it does not evaluate the checks that decide the command, so it cannot say the command would succeed. Verify only confirms persisted evidence. The evidence lists what was read and what was not.",
+  }),
+  Object.freeze({
+    reason: "set-generation-required", exitClass: "refused-precondition",
+    remedy: "Pass --generation with the original cutover set id that `lcm migration plan --set` printed. Nothing is inferred from the live hold, and nothing was read or changed.",
+  }),
+  Object.freeze({
+    reason: "set-generation-invalid", exitClass: "usage",
+    remedy: "The value passed to --generation is not a valid cutover set id. Nothing was read or changed.",
+  }),
+  Object.freeze({
+    reason: "set-original-generation-required", exitClass: "refused-precondition",
+    remedy: "The id names the rollback hold or publication, not the original activated set. Pass the original set id that plan --set or activate --set printed; nothing was changed.",
+  }),
+  Object.freeze({
+    reason: "set-confirmation-missing", exitClass: "refused-confirmation",
+    remedy: "Pass --confirm-generation with the aggregate set id this refusal reports (never a member generation id); nothing was changed.",
+  }),
+  Object.freeze({
+    reason: "set-confirmation-moved", exitClass: "refused-confirmation",
+    remedy: "--confirm-generation does not match the set. Pass the aggregate set id this refusal reports, or re-run plan --set if the candidate moved (never a member generation id); nothing was changed.",
+  }),
+  // `activate --set` is still transfer-only: its restart refusal names the
+  // full grant swap, where the single-generation one names the revoke alone.
+  Object.freeze({
+    reason: "set-restart-required", exitClass: "restart-required",
+    remedy: "The set's durable selection is correct, but a running daemon still holds the previous startup backend. Swap the grants (add the runtime grants to the daemon runtime role, then revoke the transfer grants), restart the daemon with LCM_POSTGRES_URL set to that runtime role, then run `lcm migration report --set --generation <set-id>`.",
   }),
 ] satisfies MigrationRefusalMapping[]);
 

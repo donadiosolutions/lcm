@@ -75,6 +75,11 @@ function executor(): {
 
 interface ReadyExecutorOptions {
   readonly manifest?: PostgreSqlRuntimePrivilegeManifest;
+  readonly admittedPeer?: {
+    readonly role: string;
+    readonly oid?: string;
+    readonly manifest: PostgreSqlRuntimePrivilegeManifest;
+  };
   readonly includeSequenceRuntimeGrant?: boolean;
   readonly omitLcmPublicDefault?: boolean;
   readonly omitPublicSchemaUsage?: boolean;
@@ -630,6 +635,8 @@ function readyExecutor(fixtureOptions: ReadyExecutorOptions = {}): {
   const snapshot = loadPostgreSqlSchemaSnapshots().at(-1)!;
   const expectations = getPostgreSqlSchemaSnapshotExpectations(snapshot);
   const runtimeRole = "lcm_test_runtime";
+  const runtimeRoleOid = "101";
+  const admittedPeer = fixtureOptions.admittedPeer;
   const includeSequenceRuntimeGrant = fixtureOptions.includeSequenceRuntimeGrant ?? true;
   const optionalRelationEntries = manifest.optional
     .filter(({ kind }) => kind === "relation");
@@ -654,13 +661,23 @@ function readyExecutor(fixtureOptions: ReadyExecutorOptions = {}): {
   };
   const runtimeRow = {
     grantee_is_owner: false,
+    grantee_oid: runtimeRoleOid,
     grantee_name: runtimeRole,
     grantor_is_owner: true,
     is_grantable: false,
   };
   const publicRow = {
     grantee_is_owner: false,
+    grantee_oid: "0",
     grantee_name: null,
+    grantor_is_owner: true,
+    is_grantable: false,
+  };
+  const ownerRowWithOid = { ...ownerRow, grantee_oid: "100" };
+  const peerRow = admittedPeer === undefined ? null : {
+    grantee_is_owner: false,
+    grantee_oid: admittedPeer.oid ?? "202",
+    grantee_name: admittedPeer.role,
     grantor_is_owner: true,
     is_grantable: false,
   };
@@ -693,6 +710,7 @@ function readyExecutor(fixtureOptions: ReadyExecutorOptions = {}): {
     if (operation === "inspectRuntimeRolePolicy") {
       return applyOverride(result([{
         current_user_name: runtimeRole,
+        current_user_oid: runtimeRoleOid,
         session_user_name: runtimeRole,
         role_exists: true,
         superuser: false,
@@ -711,6 +729,25 @@ function readyExecutor(fixtureOptions: ReadyExecutorOptions = {}): {
         database_owner_oid_count: 1,
         database_owner_oid: "100",
         database_owner_match: true,
+      }]));
+    }
+    if (operation === "inspectAdmittedPeerRolePolicy") {
+      return applyOverride(result(admittedPeer === undefined ? [] : [{
+        peer_name: admittedPeer.role,
+        peer_oid: admittedPeer.oid ?? "202",
+        role_exists: true,
+        superuser: false,
+        create_role: false,
+        create_database: false,
+        database_create_privilege: false,
+        session_replication_role_set_privilege: false,
+        replication: false,
+        bypass_rls: false,
+        can_login: true,
+        member_of_count: 0,
+        has_members_count: 0,
+        expected_owner_match: false,
+        current_role_match: false,
       }]));
     }
     if (operation === "runtimeReadinessExtensions") {
@@ -793,8 +830,8 @@ function readyExecutor(fixtureOptions: ReadyExecutorOptions = {}): {
     if (operation === "inspectSchemaAcl") {
       return applyOverride(result([
         ...["lcm", "public"].flatMap((schema_name) => [
-          { schema_name, object_identity: schema_name, privilege_type: "CREATE", ...ownerRow },
-          { schema_name, object_identity: schema_name, privilege_type: "USAGE", ...ownerRow },
+          { schema_name, object_identity: schema_name, privilege_type: "CREATE", ...ownerRowWithOid },
+          { schema_name, object_identity: schema_name, privilege_type: "USAGE", ...ownerRowWithOid },
           ...(!(omitLcmPublicDefault && schema_name === "lcm")
             && !(fixtureOptions.omitPublicSchemaUsage && schema_name === "public")
             ? [{ schema_name, object_identity: schema_name, privilege_type: "USAGE", ...publicRow }]
@@ -802,6 +839,14 @@ function readyExecutor(fixtureOptions: ReadyExecutorOptions = {}): {
         ]),
         { schema_name: "lcm", object_identity: "lcm", privilege_type: "USAGE", ...runtimeRow },
         { schema_name: "public", object_identity: "public", privilege_type: "USAGE", ...runtimeRow },
+        ...(peerRow === null ? [] : admittedPeer!.manifest.required
+          .filter(({ kind }) => kind === "schema")
+          .map(({ object, privilege }) => ({
+            schema_name: object,
+            object_identity: object,
+            privilege_type: privilege,
+            ...peerRow,
+          }))),
       ]));
     }
     if (operation === "inspectRelationAcl") {
@@ -814,7 +859,7 @@ function readyExecutor(fixtureOptions: ReadyExecutorOptions = {}): {
       const objects = (config as { values?: unknown[] }).values?.[0] as string[];
       const rows = [
         ...objects.flatMap((object) => [
-          ...ownerPrivileges(object).map((privilege_type) => ({ object_identity: object, privilege_type, ...ownerRow })),
+          ...ownerPrivileges(object).map((privilege_type) => ({ object_identity: object, privilege_type, ...ownerRowWithOid })),
           ...required
             .filter((entry) => (
               entry.kind === "relation"
@@ -824,6 +869,21 @@ function readyExecutor(fixtureOptions: ReadyExecutorOptions = {}): {
                   : false
             ))
             .map(({ privilege }) => ({ object_identity: object, privilege_type: privilege, ...runtimeRow })),
+          ...(peerRow === null ? [] : admittedPeer!.manifest.required
+            .filter((entry) => (
+              entry.kind === "relation"
+                ? `table|${entry.object.replace(/^lcm\./u, "")}` === object
+                : entry.kind === "sequence"
+                  ? `sequence|${entry.object.replace(/^lcm\./u, "")}` === object
+                  : false
+            ))
+            .map(({ privilege }) => ({ object_identity: object, privilege_type: privilege, ...peerRow }))),
+          ...(peerRow === null ? [] : admittedPeer!.manifest.optional
+            .filter((entry) => (
+              entry.kind === "relation"
+              && `table|${entry.object.replace(/^lcm\./u, "")}` === object
+            ))
+            .map(({ privilege }) => ({ object_identity: object, privilege_type: privilege, ...peerRow }))),
           ...selectedOptionalRelationEntries
             .filter(({ object: entryObject }) => (
               `table|${entryObject.replace(/^lcm\./u, "")}` === object
@@ -842,7 +902,14 @@ function readyExecutor(fixtureOptions: ReadyExecutorOptions = {}): {
         object_identity: `${entry.object}|${entry.column}`,
         privilege_type: entry.privilege,
         ...runtimeRow,
-      }))));
+      })).concat(peerRow === null ? [] : admittedPeer!.manifest.required
+        .concat(admittedPeer!.manifest.optional)
+        .filter(({ kind }) => kind === "column")
+        .map((entry) => ({
+          object_identity: `${entry.object}|${entry.column}`,
+          privilege_type: entry.privilege,
+          ...peerRow,
+        })))));
     }
     if (operation === "inspectFunctionAcl") {
       const identities = [...new Set([
@@ -873,6 +940,11 @@ function readyExecutor(fixtureOptions: ReadyExecutorOptions = {}): {
               ...(entry.extension !== undefined && !fixtureOptions.omitPublicFunctionExecute
                 ? [{ function_identity, object_identity: function_identity, extension_name, privilege_type: "EXECUTE", ...publicRow }]
                 : []),
+              ...(peerRow === null || !admittedPeer!.manifest.required.some((candidate) => (
+                candidate.kind === "function" && candidate.object === function_identity
+              )) ? [] : [
+                { function_identity, object_identity: function_identity, extension_name, privilege_type: "EXECUTE", ...peerRow },
+              ]),
             ]),
           ];
         }),
@@ -2505,6 +2577,68 @@ describe("PostgreSQL transfer readiness", () => {
     },
   );
 
+  it.each([
+    ["runtime", "lcm", "USAGE"],
+    ["owner", "lcm", "USAGE"],
+    ["owner", "lcm", "CREATE"],
+    ["public", "public", "USAGE"],
+  ] as const)(
+    "rejects an extra schema grantee named %s that is not a sanctioned grantee",
+    async (role, schema, privilege) => {
+      const fake = readyExecutor({
+        operationOverrides: {
+          inspectSchemaAcl: mutateRows((rows) => {
+            rows.push({
+              schema_name: schema,
+              object_identity: schema,
+              privilege_type: privilege,
+              grantee_is_owner: false,
+              grantee_oid: "303",
+              grantee_name: role,
+              grantor_is_owner: true,
+              is_grantable: false,
+            });
+          }),
+        },
+      });
+
+      await expect(verifyPostgreSqlRuntimeSchema(fake.seam, { expectedOwner: EXPECTED_OWNER }))
+        .rejects.toMatchObject({ reason: "acl-shape", operation: "inspectSchemaAcl" });
+    },
+  );
+
+  it.each([
+    ["inspectRelationAcl", { object_identity: "table|schema_migrations", privilege_type: "SELECT" }],
+    ["inspectColumnAcl", { object_identity: "lcm.message_parts|project_id", privilege_type: "SELECT" }],
+    ["inspectFunctionAcl", {
+      function_identity: "public.digest(text, text)",
+      object_identity: "public.digest(text, text)",
+      extension_name: "pgcrypto",
+      privilege_type: "EXECUTE",
+    }],
+  ] as const)(
+    "rejects an extra grantee named runtime in %s",
+    async (operation, row) => {
+      const fake = readyExecutor({
+        operationOverrides: {
+          [operation]: mutateRows((rows) => {
+            rows.push({
+              ...row,
+              grantee_is_owner: false,
+              grantee_oid: "303",
+              grantee_name: "runtime",
+              grantor_is_owner: true,
+              is_grantable: false,
+            });
+          }),
+        },
+      });
+
+      await expect(verifyPostgreSqlRuntimeSchema(fake.seam, { expectedOwner: EXPECTED_OWNER }))
+        .rejects.toMatchObject({ reason: "acl-shape", operation });
+    },
+  );
+
   it("requires transfer grants and keeps ordinary readiness strict", async () => {
     await expect(verifyPostgreSqlTransferSchema(readyExecutor().seam, {
       expectedOwner: EXPECTED_OWNER,
@@ -2516,6 +2650,453 @@ describe("PostgreSQL transfer readiness", () => {
     await expect(verifyPostgreSqlRuntimeSchema(transfer.seam, {
       expectedOwner: EXPECTED_OWNER,
     })).rejects.toMatchObject({ reason: "acl-shape" });
+  });
+
+  it("admits one named canonical transfer peer only for an opted-in runtime check", async () => {
+    const withPeer = readyExecutor({
+      admittedPeer: {
+        role: "lcm_test_transfer",
+        manifest: POSTGRESQL_TRANSFER_PRIVILEGE_MANIFEST,
+      },
+    });
+
+    await expect(verifyPostgreSqlRuntimeSchema(withPeer.seam, {
+      expectedOwner: EXPECTED_OWNER,
+      admittedPeer: { role: "lcm_test_transfer" },
+    })).resolves.toMatchObject({ runtimeRole: "lcm_test_runtime" });
+
+    const withoutOptIn = readyExecutor({
+      admittedPeer: {
+        role: "lcm_test_transfer",
+        manifest: POSTGRESQL_TRANSFER_PRIVILEGE_MANIFEST,
+      },
+    });
+    await expect(verifyPostgreSqlRuntimeSchema(withoutOptIn.seam, {
+      expectedOwner: EXPECTED_OWNER,
+    })).rejects.toMatchObject({ reason: "acl-shape" });
+  });
+
+  it("admits one named canonical runtime peer for an opted-in transfer check", async () => {
+    const withPeer = readyExecutor({
+      manifest: POSTGRESQL_TRANSFER_PRIVILEGE_MANIFEST,
+      admittedPeer: {
+        role: "lcm_test_ordinary",
+        manifest: POSTGRESQL_RUNTIME_PRIVILEGE_MANIFEST,
+      },
+    });
+
+    await expect(verifyPostgreSqlTransferSchema(withPeer.seam, {
+      expectedOwner: EXPECTED_OWNER,
+      admittedPeer: { role: "lcm_test_ordinary" },
+    })).resolves.toMatchObject({ runtimeRole: "lcm_test_runtime" });
+  });
+
+  it("rejects a third grantee by OID before a sentinel-like role name can collide", async () => {
+    const withThird = readyExecutor({
+      admittedPeer: {
+        role: "lcm_test_transfer",
+        manifest: POSTGRESQL_TRANSFER_PRIVILEGE_MANIFEST,
+      },
+      operationOverrides: {
+        inspectSchemaAcl: mutateRows((rows) => {
+          rows.push({
+            schema_name: "lcm",
+            object_identity: "lcm",
+            privilege_type: "USAGE",
+            grantee_is_owner: false,
+            grantee_oid: "303",
+            grantee_name: "runtime",
+            grantor_is_owner: true,
+            is_grantable: false,
+          });
+        }),
+      },
+    });
+
+    await expect(verifyPostgreSqlRuntimeSchema(withThird.seam, {
+      expectedOwner: EXPECTED_OWNER,
+      admittedPeer: { role: "lcm_test_transfer" },
+    })).rejects.toMatchObject({ reason: "acl-shape" });
+  });
+
+  it.each(["runtime", "owner", "public", "lcm_test_transfer"])(
+    "rejects a third grantee named %s by OID on the admitted-peer path",
+    async (role) => {
+      const withThird = readyExecutor({
+        admittedPeer: {
+          role: "lcm_test_transfer",
+          manifest: POSTGRESQL_TRANSFER_PRIVILEGE_MANIFEST,
+        },
+        operationOverrides: {
+          inspectSchemaAcl: mutateRows((rows) => {
+            rows.push({
+              schema_name: "lcm",
+              object_identity: "lcm",
+              privilege_type: "USAGE",
+              grantee_is_owner: false,
+              grantee_oid: "303",
+              grantee_name: role,
+              grantor_is_owner: true,
+              is_grantable: false,
+            });
+          }),
+        },
+      });
+
+      await expect(verifyPostgreSqlRuntimeSchema(withThird.seam, {
+        expectedOwner: EXPECTED_OWNER,
+        admittedPeer: { role: "lcm_test_transfer" },
+      })).rejects.toMatchObject({ reason: "acl-shape" });
+    },
+  );
+
+  it.each([
+    ["runtime", "relation"],
+    ["runtime", "column"],
+    ["runtime", "function"],
+    ["transfer", "relation"],
+    ["transfer", "column"],
+    ["transfer", "function"],
+  ] as const)("rejects a third grantee in a %s-direction %s ACL", async (direction, kind) => {
+    const operation = kind === "relation"
+      ? "inspectRelationAcl"
+      : kind === "column" ? "inspectColumnAcl" : "inspectFunctionAcl";
+    const row = kind === "relation"
+      ? { object_identity: "table|schema_migrations", privilege_type: "SELECT" }
+      : kind === "column"
+        ? { object_identity: "lcm.message_parts|project_id", privilege_type: "SELECT" }
+        : {
+          function_identity: "public.digest(text, text)",
+          object_identity: "public.digest(text, text)",
+          extension_name: "pgcrypto",
+          privilege_type: "EXECUTE",
+        };
+    const peer = direction === "runtime"
+      ? { role: "lcm_test_transfer", manifest: POSTGRESQL_TRANSFER_PRIVILEGE_MANIFEST }
+      : { role: "lcm_test_ordinary", manifest: POSTGRESQL_RUNTIME_PRIVILEGE_MANIFEST };
+    const fake = readyExecutor({
+      ...(direction === "transfer" ? { manifest: POSTGRESQL_TRANSFER_PRIVILEGE_MANIFEST } : {}),
+      admittedPeer: peer,
+      operationOverrides: {
+        [operation]: mutateRows((rows) => {
+          rows.push({
+            ...row,
+            grantee_is_owner: false,
+            grantee_oid: "303",
+            grantee_name: "lcm_test_third",
+            grantor_is_owner: true,
+            is_grantable: false,
+          });
+        }),
+      },
+    });
+    const verification = direction === "runtime"
+      ? verifyPostgreSqlRuntimeSchema(fake.seam, {
+        expectedOwner: EXPECTED_OWNER,
+        admittedPeer: { role: peer.role },
+      })
+      : verifyPostgreSqlTransferSchema(fake.seam, {
+        expectedOwner: EXPECTED_OWNER,
+        admittedPeer: { role: peer.role },
+      });
+
+    await expect(verification).rejects.toMatchObject({ reason: "acl-shape" });
+  });
+
+  it("keeps a complete transfer peer from filling a partial current runtime optional bundle", async () => {
+    const fake = readyExecutor({
+      partialOptionalDirectGrants: true,
+      admittedPeer: {
+        role: "lcm_test_transfer",
+        manifest: POSTGRESQL_TRANSFER_PRIVILEGE_MANIFEST,
+      },
+    });
+
+    await expect(verifyPostgreSqlRuntimeSchema(fake.seam, {
+      expectedOwner: EXPECTED_OWNER,
+      admittedPeer: { role: "lcm_test_transfer" },
+    })).rejects.toMatchObject({ reason: "acl-shape" });
+  });
+
+  it("rejects an extra PUBLIC relation privilege while a canonical peer is admitted", async () => {
+    const fake = readyExecutor({
+      admittedPeer: {
+        role: "lcm_test_transfer",
+        manifest: POSTGRESQL_TRANSFER_PRIVILEGE_MANIFEST,
+      },
+      operationOverrides: {
+        inspectRelationAcl: mutateRows((rows) => {
+          rows.push({
+            object_identity: "table|schema_migrations",
+            privilege_type: "SELECT",
+            grantee_is_owner: false,
+            grantee_oid: "0",
+            grantee_name: null,
+            grantor_is_owner: true,
+            is_grantable: false,
+          });
+        }),
+      },
+    });
+
+    await expect(verifyPostgreSqlRuntimeSchema(fake.seam, {
+      expectedOwner: EXPECTED_OWNER,
+      admittedPeer: { role: "lcm_test_transfer" },
+    })).rejects.toMatchObject({ reason: "acl-shape" });
+  });
+
+  it.each([
+    ["role missing", "role_exists", false],
+    ["superuser", "superuser", true],
+    ["create role", "create_role", true],
+    ["create database", "create_database", true],
+    ["database CREATE", "database_create_privilege", true],
+    ["session replication role SET", "session_replication_role_set_privilege", true],
+    ["replication", "replication", true],
+    ["bypass RLS", "bypass_rls", true],
+    ["cannot log in", "can_login", false],
+    ["member of another role", "member_of_count", 1],
+    ["has a member", "has_members_count", 1],
+    ["is the owner", "expected_owner_match", true],
+    ["is the current role", "current_role_match", true],
+  ])("rejects an admitted peer whose policy has %s", async (_label, field, value) => {
+    const fake = readyExecutor({
+      admittedPeer: {
+        role: "lcm_test_transfer",
+        manifest: POSTGRESQL_TRANSFER_PRIVILEGE_MANIFEST,
+      },
+      operationOverrides: {
+        inspectAdmittedPeerRolePolicy: mutateFirstField(field, value),
+      },
+    });
+
+    await expect(verifyPostgreSqlRuntimeSchema(fake.seam, {
+      expectedOwner: EXPECTED_OWNER,
+      admittedPeer: { role: "lcm_test_transfer" },
+    })).rejects.toMatchObject({
+      reason: "runtime-role-policy",
+      operation: "inspectAdmittedPeerRolePolicy",
+    });
+  });
+
+  it("rejects a missing, malformed, or predefined admitted peer", async () => {
+    const missing = readyExecutor({
+      admittedPeer: {
+        role: "lcm_test_transfer",
+        manifest: POSTGRESQL_TRANSFER_PRIVILEGE_MANIFEST,
+      },
+      operationOverrides: { inspectAdmittedPeerRolePolicy: [] },
+    });
+    await expect(verifyPostgreSqlRuntimeSchema(missing.seam, {
+      expectedOwner: EXPECTED_OWNER,
+      admittedPeer: { role: "lcm_test_transfer" },
+    })).rejects.toMatchObject({ reason: "runtime-role-policy" });
+
+    const malformed = readyExecutor();
+    await expect(verifyPostgreSqlRuntimeSchema(malformed.seam, {
+      expectedOwner: EXPECTED_OWNER,
+      admittedPeer: { role: "" },
+    })).rejects.toMatchObject({ reason: "runtime-role-policy" });
+    expect(malformed.queries).toHaveLength(0);
+
+    const predefined = readyExecutor({
+      admittedPeer: {
+        role: "pg_read_all_data",
+        manifest: POSTGRESQL_TRANSFER_PRIVILEGE_MANIFEST,
+      },
+    });
+    await expect(verifyPostgreSqlRuntimeSchema(predefined.seam, {
+      expectedOwner: EXPECTED_OWNER,
+      admittedPeer: { role: "pg_read_all_data" },
+    })).rejects.toMatchObject({ reason: "runtime-role-policy" });
+  });
+
+  it.each([
+    ["grantable", { is_grantable: true }],
+    ["foreign grantor", { grantor_is_owner: false }],
+  ])("rejects a peer relation grant that is %s", async (_label, mutation) => {
+    const fake = readyExecutor({
+      admittedPeer: {
+        role: "lcm_test_transfer",
+        manifest: POSTGRESQL_TRANSFER_PRIVILEGE_MANIFEST,
+      },
+      operationOverrides: {
+        inspectRelationAcl: mutateRows((rows) => {
+          const row = rows.find((candidate) => (
+            candidate.grantee_oid === "202"
+            && candidate.object_identity === "table|transfer_runs"
+            && candidate.privilege_type === "SELECT"
+          ));
+          if (row === undefined) throw new Error("peer transfer grant missing");
+          Object.assign(row, mutation);
+        }),
+      },
+    });
+
+    await expect(verifyPostgreSqlRuntimeSchema(fake.seam, {
+      expectedOwner: EXPECTED_OWNER,
+      admittedPeer: { role: "lcm_test_transfer" },
+    })).rejects.toMatchObject({ reason: "acl-shape" });
+  });
+
+  it("rejects a peer with a missing or extra direct privilege", async () => {
+    const missing = readyExecutor({
+      admittedPeer: {
+        role: "lcm_test_transfer",
+        manifest: POSTGRESQL_TRANSFER_PRIVILEGE_MANIFEST,
+      },
+      operationOverrides: {
+        inspectRelationAcl: mutateRows((rows) => {
+          const remaining = rows.filter((row) => !(
+            row.grantee_oid === "202"
+            && row.object_identity === "table|transfer_runs"
+            && row.privilege_type === "SELECT"
+          ));
+          rows.splice(0, rows.length, ...remaining);
+        }),
+      },
+    });
+    await expect(verifyPostgreSqlRuntimeSchema(missing.seam, {
+      expectedOwner: EXPECTED_OWNER,
+      admittedPeer: { role: "lcm_test_transfer" },
+    })).rejects.toMatchObject({ reason: "acl-shape" });
+
+    const extra = readyExecutor({
+      manifest: POSTGRESQL_TRANSFER_PRIVILEGE_MANIFEST,
+      admittedPeer: {
+        role: "lcm_test_ordinary",
+        manifest: POSTGRESQL_RUNTIME_PRIVILEGE_MANIFEST,
+      },
+      operationOverrides: {
+        inspectRelationAcl: mutateRows((rows) => {
+          rows.push({
+            object_identity: "table|transfer_runs",
+            privilege_type: "SELECT",
+            grantee_is_owner: false,
+            grantee_oid: "202",
+            grantee_name: "lcm_test_ordinary",
+            grantor_is_owner: true,
+            is_grantable: false,
+          });
+        }),
+      },
+    });
+    await expect(verifyPostgreSqlTransferSchema(extra.seam, {
+      expectedOwner: EXPECTED_OWNER,
+      admittedPeer: { role: "lcm_test_ordinary" },
+    })).rejects.toMatchObject({ reason: "acl-shape" });
+  });
+
+  it("keeps optional and legacy privilege evaluation separate for each grantee", async () => {
+    const runtimeOptionalRelations = new Set(
+      POSTGRESQL_RUNTIME_PRIVILEGE_MANIFEST.optional
+        .filter(({ kind }) => kind === "relation")
+        .map((entry) => `table|${entry.object.replace(/^lcm\./u, "")}|${entry.privilege}`),
+    );
+    const runtimeOptionalColumns = new Set(
+      POSTGRESQL_RUNTIME_PRIVILEGE_MANIFEST.optional
+        .filter(({ kind }) => kind === "column")
+        .map((entry) => `${entry.object}|${entry.column}|${entry.privilege}`),
+    );
+    const runtimePeer = (overrides: Readonly<Record<string, ReadyExecutorOverride>>) => readyExecutor({
+      manifest: POSTGRESQL_TRANSFER_PRIVILEGE_MANIFEST,
+      admittedPeer: {
+        role: "lcm_test_ordinary",
+        manifest: POSTGRESQL_RUNTIME_PRIVILEGE_MANIFEST,
+      },
+      operationOverrides: overrides,
+    });
+
+    const noOptional = runtimePeer({
+      inspectRelationAcl: mutateRows((rows) => {
+        const remaining = rows.filter((row) => row.grantee_oid !== "202" || !runtimeOptionalRelations.has(
+          `${String(row.object_identity)}|${String(row.privilege_type)}`,
+        ));
+        rows.splice(0, rows.length, ...remaining);
+      }),
+      inspectColumnAcl: mutateRows((rows) => {
+        const remaining = rows.filter((row) => row.grantee_oid !== "202" || !runtimeOptionalColumns.has(
+          `${String(row.object_identity)}|${String(row.privilege_type)}`,
+        ));
+        rows.splice(0, rows.length, ...remaining);
+      }),
+    });
+    await expect(verifyPostgreSqlTransferSchema(noOptional.seam, {
+      expectedOwner: EXPECTED_OWNER,
+      admittedPeer: { role: "lcm_test_ordinary" },
+    })).resolves.toBeDefined();
+
+    const partial = runtimePeer({
+      inspectRelationAcl: mutateRows((rows) => {
+        const index = rows.findIndex((row) => (
+          row.grantee_oid === "202"
+          && row.object_identity === "table|native_transcripts"
+          && row.privilege_type === "SELECT"
+        ));
+        rows.splice(index, 1);
+      }),
+    });
+    await expect(verifyPostgreSqlTransferSchema(partial.seam, {
+      expectedOwner: EXPECTED_OWNER,
+      admittedPeer: { role: "lcm_test_ordinary" },
+    })).rejects.toMatchObject({ reason: "acl-shape" });
+
+    const withoutLegacyColumns = (rows: QueryResultRow[]): void => {
+      const legacyColumns = new Set(["project_id", "conversation_id", "message_id", "part_type"]);
+      const remaining = rows.filter((row) => !(
+        row.grantee_oid === "202"
+        && row.privilege_type === "SELECT"
+        && typeof row.object_identity === "string"
+        && row.object_identity.startsWith("lcm.message_parts|")
+        && legacyColumns.has(row.object_identity.split("|")[1] ?? "")
+      ));
+      rows.splice(0, rows.length, ...remaining);
+    };
+    const legacyRuntime = runtimePeer({
+      inspectColumnAcl: mutateRows(withoutLegacyColumns),
+    });
+    await expect(verifyPostgreSqlTransferSchema(legacyRuntime.seam, {
+      expectedOwner: EXPECTED_OWNER,
+      admittedPeer: { role: "lcm_test_ordinary" },
+    })).resolves.toBeDefined();
+
+    const legacyTransfer = readyExecutor({
+      admittedPeer: {
+        role: "lcm_test_transfer",
+        manifest: POSTGRESQL_TRANSFER_PRIVILEGE_MANIFEST,
+      },
+      operationOverrides: {
+        inspectColumnAcl: mutateRows(withoutLegacyColumns),
+      },
+    });
+    await expect(verifyPostgreSqlRuntimeSchema(legacyTransfer.seam, {
+      expectedOwner: EXPECTED_OWNER,
+      admittedPeer: { role: "lcm_test_transfer" },
+    })).resolves.toBeDefined();
+  });
+
+  it("binds definition sanctions to the two admitted role OIDs and their own profiles", async () => {
+    const fake = readyExecutor({
+      admittedPeer: {
+        role: "lcm_test_transfer",
+        manifest: POSTGRESQL_TRANSFER_PRIVILEGE_MANIFEST,
+      },
+    });
+
+    await verifyPostgreSqlRuntimeSchema(fake.seam, {
+      expectedOwner: EXPECTED_OWNER,
+      admittedPeer: { role: "lcm_test_transfer" },
+    });
+    const definitions = fake.queries.find(({ options }) => (
+      options.operation === "inspectSchemaDefinitions"
+    ))!;
+    const config = definitions.config as { text: string; values: unknown[] };
+    expect(config.values[9]).toBe("101");
+    expect(config.values[12]).toBe("202");
+    expect(config.text).toContain("$10::pg_catalog.oid");
+    expect(config.text).toContain("$13::pg_catalog.oid");
+    expect(config.text).toContain("$14::pg_catalog.text[]");
+    expect(config.text).toContain("$15::pg_catalog.text[]");
   });
 
   it("rejects a missing transfer run checkpoint grant", async () => {
@@ -2559,4 +3140,123 @@ describe("PostgreSQL transfer readiness", () => {
       })).rejects.toMatchObject({ reason: "acl-shape" });
     },
   );
+
+  describe("message_parts transcript column grants", () => {
+    const TRANSCRIPT_COLUMNS = ["project_id", "conversation_id", "message_id", "part_type"];
+    const isTranscriptColumn = (object: string, kept: readonly string[] = []): boolean => (
+      TRANSCRIPT_COLUMNS.some((column) => (
+        object === `lcm.message_parts|${column}` && !kept.includes(column)
+      ))
+    );
+    const withoutTranscriptColumnAcls = (
+      kept: readonly string[] = [],
+    ): ReadyExecutorOverride => mutateRows((rows) => {
+      const remaining = rows.filter(({ object_identity: object, privilege_type: privilege }) => (
+        !(privilege === "SELECT" && typeof object === "string" && isTranscriptColumn(object, kept))
+      ));
+      rows.splice(0, rows.length, ...remaining);
+    });
+    const withTranscriptGrantMutation = (
+      mutate: (row: QueryResultRow) => void,
+    ): ReadyExecutorOverride => mutateRows((rows) => {
+      const row = rows.find((candidate) => (
+        candidate.object_identity === "lcm.message_parts|part_type"
+        && candidate.privilege_type === "SELECT"
+      ));
+      if (row === undefined) throw new Error("message_parts part_type grant missing");
+      mutate(row);
+    });
+    const transferWith = (override: ReadyExecutorOverride, operation = "inspectColumnAcl") => (
+      readyExecutor({
+        manifest: POSTGRESQL_TRANSFER_PRIVILEGE_MANIFEST,
+        operationOverrides: { [operation]: override },
+      })
+    );
+
+    it("admits a transfer role provisioned before the column grants and still expects effective SELECT", async () => {
+      const transfer = transferWith(withoutTranscriptColumnAcls());
+
+      await expect(verifyPostgreSqlTransferSchema(transfer.seam, {
+        expectedOwner: EXPECTED_OWNER,
+      })).resolves.toMatchObject({ runtimeRole: "lcm_test_runtime" });
+      const effective = transfer.queries.find(({ options }) => (
+        options.operation === "inspectEffectivePrivileges"
+      ))!;
+      const values = (effective.config as { values: unknown[] }).values;
+      const objects = values[10] as string[];
+      const columns = values[11] as string[];
+      const privileges = values[12] as string[];
+      const expected = values[13] as boolean[];
+      for (const column of TRANSCRIPT_COLUMNS) {
+        const index = objects.findIndex((object, i) => (
+          object === "lcm.message_parts" && columns[i] === column && privileges[i] === "SELECT"
+        ));
+        expect(index).toBeGreaterThanOrEqual(0);
+        expect(expected[index]).toBe(true);
+      }
+    });
+
+    it("admits a transfer role holding only some of the column grants", async () => {
+      const transfer = transferWith(withoutTranscriptColumnAcls(["project_id"]));
+
+      await expect(verifyPostgreSqlTransferSchema(transfer.seam, {
+        expectedOwner: EXPECTED_OWNER,
+      })).resolves.toMatchObject({ runtimeRole: "lcm_test_runtime" });
+    });
+
+    it("rejects a legacy transfer role without effective message_parts column SELECT", async () => {
+      const transfer = readyExecutor({
+        manifest: POSTGRESQL_TRANSFER_PRIVILEGE_MANIFEST,
+        operationOverrides: {
+          inspectColumnAcl: withoutTranscriptColumnAcls(),
+          inspectEffectivePrivileges: mutateRows((rows) => {
+            const row = rows.find((candidate) => (
+              candidate.privilege_kind === "column"
+              && candidate.object_identity === "lcm.message_parts"
+              && candidate.column_name === "part_type"
+              && candidate.privilege_type === "SELECT"
+            ));
+            if (row === undefined) throw new Error("message_parts part_type row missing");
+            row.effective = false;
+          }),
+        },
+      });
+
+      await expect(verifyPostgreSqlTransferSchema(transfer.seam, {
+        expectedOwner: EXPECTED_OWNER,
+      })).rejects.toMatchObject({ reason: "effective-privilege" });
+    });
+
+    it("rejects a legacy transfer role without message_parts table SELECT", async () => {
+      const transfer = readyExecutor({
+        manifest: POSTGRESQL_TRANSFER_PRIVILEGE_MANIFEST,
+        operationOverrides: {
+          inspectColumnAcl: withoutTranscriptColumnAcls(),
+          inspectRelationAcl: mutateRows((rows) => {
+            const remaining = rows.filter((row) => !(
+              row.object_identity === "table|message_parts"
+              && row.privilege_type === "SELECT"
+              && row.grantee_name === "lcm_test_runtime"
+            ));
+            rows.splice(0, rows.length, ...remaining);
+          }),
+        },
+      });
+
+      await expect(verifyPostgreSqlTransferSchema(transfer.seam, {
+        expectedOwner: EXPECTED_OWNER,
+      })).rejects.toMatchObject({ reason: "acl-shape" });
+    });
+
+    it.each([
+      ["grantable", (row: QueryResultRow) => { row.is_grantable = true; }],
+      ["foreign grantor", (row: QueryResultRow) => { row.grantor_is_owner = false; }],
+    ])("rejects a tolerated transfer column grant that is %s", async (_label, mutate) => {
+      const transfer = transferWith(withTranscriptGrantMutation(mutate));
+
+      await expect(verifyPostgreSqlTransferSchema(transfer.seam, {
+        expectedOwner: EXPECTED_OWNER,
+      })).rejects.toMatchObject({ reason: "acl-shape" });
+    });
+  });
 });

@@ -86,7 +86,10 @@ vi.mock("../../src/storage/local-hook-outbox.js", () => ({
   },
 }));
 
-vi.mock("../../src/storage/postgresql/passive-event-repository.js", () => ({
+vi.mock("../../src/storage/postgresql/passive-event-repository.js", async (importOriginal) => ({
+  samePassiveEventPayload: (
+    await importOriginal<typeof import("../../src/storage/postgresql/passive-event-repository.js")>()
+  ).samePassiveEventPayload,
   PostgreSqlPassiveEventRepository: class {
     readonly machineId = state.machineId;
     getDiagnostics = state.getDiagnostics;
@@ -493,6 +496,42 @@ describe("lcm events staged PostgreSQL operator commands", () => {
       { machineId: MACHINE_ID, eventId: third.event_uuid },
     ]);
     expect(state.listAwaitingRemote).toHaveBeenCalledWith(3, true);
+  });
+
+  it("validates a row copied by the migration in its portable form (#1693)", async () => {
+    const copied = localEvent({ prev_event_id: 5 });
+    const different = localEvent({
+      event_id: 2,
+      event_uuid: "87654321-4321-5abc-8def-123456789abc",
+      machine_sequence: "0000000000000000008",
+    });
+    const portable = (data: string) => ({
+      sessionId: "session",
+      sessionSequence: 1,
+      category: "decision",
+      data,
+      priority: 1,
+      sourceHook: "PostToolUse",
+      createdAt: "2026-07-29T12:00:00.000000Z",
+    });
+    state.listAwaitingRemote.mockResolvedValue([copied, different]);
+    state.readEvents.mockResolvedValue([
+      remoteEvent({ payload: portable("SQLite") }),
+      remoteEvent({
+        inboxId: 42n,
+        eventId: different.event_uuid,
+        machineSequence: 8n,
+        payload: portable("other"),
+      }),
+    ]);
+    const stdout = vi.spyOn(process.stdout, "write").mockImplementation(() => true);
+    await invoke("events", "validate", "--limit", "2", "--json");
+    expect(JSON.parse(stdoutText(stdout))).toEqual({
+      checked: 2,
+      matched: 1,
+      missing: [],
+      mismatched: [different.event_uuid],
+    });
   });
 
   it("validates an empty queue without issuing PostgreSQL readback", async () => {

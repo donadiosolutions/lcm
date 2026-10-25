@@ -44,6 +44,38 @@ function makeDeps(overrides: Partial<EnsureCoreDeps> = {}): EnsureCoreDeps {
 }
 
 describe("ensureCore", () => {
+  it("lets a caller-supplied admission retry replace the dependency's own for endpoint and bootstrap", async () => {
+    const own = vi.fn(async <T>(step: () => T | Promise<T>) => await step());
+    const supplied = vi.fn(async <T>(step: () => T | Promise<T>) => await step());
+    const ensureDaemon = vi.fn().mockResolvedValue({ connected: true });
+    const flagDir = join(publicationRoot, "tmp");
+    const makeBootstrapDeps = () => ({
+      ...makeDeps({
+        ensureRuntimeHome: vi.fn(),
+        _withPublicationAdmissionRetry: own,
+        ensureDaemon,
+      }),
+      flagExists: vi.fn().mockReturnValue(false),
+      writeFlag: vi.fn(),
+    });
+    const { ensureCoreEndpoint, ensureBootstrapped } = await import("../src/bootstrap.js");
+    mkdirSync(flagDir, { recursive: true, mode: 0o700 });
+
+    await expect(ensureCoreEndpoint(makeDeps({
+      ensureRuntimeHome: vi.fn(),
+      _withPublicationAdmissionRetry: own,
+      ensureDaemon,
+    }), supplied)).resolves.toMatchObject({ connected: true });
+    expect(supplied).toHaveBeenCalledTimes(3);
+    expect(own).not.toHaveBeenCalled();
+
+    supplied.mockClear();
+    await expect(ensureBootstrapped("retry-session", makeBootstrapDeps(), supplied)).resolves.toBe(true);
+    expect(supplied).toHaveBeenCalledTimes(3);
+    expect(own).not.toHaveBeenCalled();
+    expect(ensureDaemon).toHaveBeenLastCalledWith(expect.objectContaining({ _withPublicationAdmissionRetry: supplied }));
+  });
+
   it("threads one publication admission wrapper through every core edge", async () => {
     const admission = vi.fn(async <T>(step: () => T | Promise<T>) => await step());
     const ensureRuntimeHome = vi.fn();

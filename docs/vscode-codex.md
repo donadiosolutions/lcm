@@ -174,7 +174,7 @@ Codex can actually run it. The report appears when you name the agent
 | modified | The hook definition differs from the one you trusted, so Codex requires a new review. | Review and trust it again in Codex `/hooks` |
 | state unknown | `config.toml` is not valid TOML, or its hook state uses a form LCM cannot read. | Check Codex `/hooks` |
 | feature disabled | `[features] hooks` is `false`; no LCM lifecycle hook can run. LCM leaves your setting unchanged. | Enable the feature if you want LCM hooks |
-| hooks file unreadable | `hooks.json` is unreadable or does not match the schema Codex expects. That includes a key repeated in the file, in a group, or in a handler, and a `timeout` or `additionalContextLimit` written as anything other than a whole number such as `30` (not `30.0` or `3e1`). | Fix the file (or move it aside), then reinstall |
+| hooks file unreadable | `hooks.json` is unreadable or does not match the schema Codex expects. That includes a repeated member Codex itself rejects (a top-level key, an event name, a group's `matcher` or `hooks`, or a handler field its type defines, such as `command` or `timeout`), and a `timeout` or `additionalContextLimit` written as anything other than a whole number such as `30` (not `30.0` or `3e1`). A repeated member Codex ignores, such as an extra note on a group or handler, is not a problem. | Fix the file (or move it aside), then reinstall |
 | failing / degraded | A recent LCM-local observation (below) shows a nonzero exit, a thrown error, or logged hook errors. | Run `lcm doctor` and check `~/.lcm/logs/events.log` |
 
 When several statuses apply, the first of these wins: hooks file unreadable,
@@ -207,7 +207,9 @@ JSON (for example a trailing comma) or repeats a key anywhere in the file,
 because rewriting it would discard your other hooks. The message names the
 reason; fix the file or move it aside, then rerun
 `lcm connectors install codex`. An empty or whitespace-only file is treated
-as having no hooks. Uninstall leaves such a file unchanged as well.
+as having no hooks. Uninstall leaves such a file unchanged as well. Install
+refuses every repeated key, including ones Codex ignores; doctor reports only
+the repeats Codex rejects.
 
 When Codex runs an LCM hook, LCM also persists the outcome of a completed run
 for each event under `~/.lcm/state/codex-hooks/` (outcome and time only, no
@@ -236,9 +238,9 @@ sections where available.
 
 | Lifecycle edge | LCM hook | What you can rely on | Level |
 |---|---|---|---|
-| Session start (`startup`; `clear` via app-server `sessionStartSource`) | `SessionStart` | A restoration block (marker `<!-- lcm-restoration -->`) is added to the model input before the first request. See [restoration](#memory-after-compaction-and-in-forked-conversations). | Verified for small fixture restorations; larger output Best-effort. A 21,579-byte restoration reached the model truncated to 8,192 bytes ([#1636](https://github.com/donadiosolutions/lcm/issues/1636)); no safe size boundary was established. TUI `/clear` Unverified |
+| Session start (`startup`; `clear` via app-server `sessionStartSource`) | `SessionStart` | A restoration block (marker `<!-- lcm-restoration -->`) is added to the model input before the first request. See [restoration](#memory-after-compaction-and-in-forked-conversations). | Verified for small fixture restorations; larger output Best-effort. Before [#1636](https://github.com/donadiosolutions/lcm/issues/1636) was fixed, a 21,579-byte restoration reached the model truncated to 8,192 bytes because the hook exited before the pipe was drained; the hook now waits for its output to be delivered, and a native Codex run with the fix has not been repeated. No safe size boundary was established. TUI `/clear` Unverified |
 | Resume | `SessionStart` | A conversation that still holds a live restoration gets no second block, including after repeated resumes. | Verified |
-| Fork | `SessionStart` | New Codex 0.163.0 threads default to paginated history when non-ephemeral and the thread store supports it. Their forks reference the parent's history, so the fork receives a second block once while the inherited one stays in context ([#1632](https://github.com/donadiosolutions/lcm/issues/1632)). Forks of legacy-history threads copy the history and get no second block. | Best-effort |
+| Fork | `SessionStart` | New Codex 0.163.0 threads default to paginated history when non-ephemeral and the thread store supports it. Their forks reference the parent's history instead of copying it. The hook reads the parent history the fork inherited and gives the fork no second block while that history holds a live restoration; if the parent history cannot be found or checked, the fork receives a fresh block. Forks of legacy-history threads copy the history and are deduplicated from their own rollout. | Unit-verified for referenced forks; Best-effort in a live Codex |
 | Compaction (manual, and automatic before a turn) | `PreCompact`, `SessionStart` (`compact`) | The transcript tail is saved first. A fresh restoration reaches the first request after compaction. After the manual compact call, restoration runs when the next turn starts. In the observed automatic pre-turn path, restoration runs in that same turn after compaction and before `UserPromptSubmit`. Repeated compactions produce one block. Mid-turn, Guardian and post-turn paths remain Unverified. | Verified; other compaction paths Unverified |
 | Prompt submission | `UserPromptSubmit` | Prompt-time hints appear as a `<memory-context>` block when memory matches, bounded by `restoration.maxInjectedMemoryBytes` and `maxInjectedMemoryItems`. | Verified |
 | Tool completion | `PostToolUse` | Shell commands, `apply_patch`, `update_plan` (needs `[tools.update_plan] enabled = true` and an explanation), `spawn_agent`, `request_user_input` (Plan mode only) and MCP calls (by name; verified with the MCP bundle) are recorded in the local outbox, which does not wait for the daemon. See [capture boundary](#codex-posttooluse-capture-boundary). | Verified |
@@ -246,9 +248,9 @@ sections where available.
 | Turn end | `Stop` | The transcript delta is ingested synchronously, at most once per `hooks.snapshotIntervalSec` (default 60 s, see [configuration](configuration.md#snapshot-throttle-codex)) for a session. A `Stop` inside the interval skips ingestion; a later eligible `Stop` or `PreCompact` can attempt to ingest the remaining delta, and `Interrupt` and `SessionEnd` make a best-effort terminal hand-off. `SubagentStop` bypasses the throttle for the child's own transcript only. Initial ingestion, throttle skipping, `PreCompact` recovery and `SessionEnd` recovery (in the exercised runs) were observed; recovery by a later `Stop` or by `Interrupt` was not isolated. | Verified (ordinary snapshot/throttle); recovery Best-effort |
 | Interruption | `Interrupt` | The interrupted turn's text and abort marker are saved. See [terminal hooks](#saving-memory-when-a-turn-is-interrupted-or-a-session-ends). | Verified |
 | Session end | `SessionEnd` | Saved when Codex unloads an idle thread, exits `codex exec`, or shuts down gracefully (with a running turn: `Interrupt`, then `SessionEnd`). Crash and `kill -9` recovery were not exercised and have no guaranteed final terminal capture; transcript data since the last successful save may be lost. | Verified (graceful); crash Not covered |
-| Subagent start | `SubagentStart` | The child's first request normally carries a restoration block, but it can be skipped when the hook overlaps the parent's `PostToolUse` hook: 3 of 6 spawns missed it natively ([#1635](https://github.com/donadiosolutions/lcm/issues/1635)). | Best-effort |
+| Subagent start | `SubagentStart` | The child's first request normally carries a restoration block. When the hook overlaps the parent's `PostToolUse` hook, it waits for the publication lock for up to 5 seconds in total, and the daemon waits up to 3 seconds for the same lock before it builds the restoration. Before this wait, 3 of 6 native spawns missed the block ([#1635](https://github.com/donadiosolutions/lcm/issues/1635)). The wait was verified with injected contention, not natively. A lock held for longer than the wait still skips the restoration without output. | Best-effort |
 | Subagent stop | `SubagentStop` | The child is stored as its own session with its parent recorded (6 of 6). `Interrupt` and `SessionEnd` do not run for subagents. | Verified |
-| Several sessions at once in one project | all | Under backend-publication lock contention a `Stop` ingest or `SessionEnd` hand-off can be skipped without retry. Some skipped `Stop` captures appeared later by `SessionEnd`, but at least one paired-session run and one four-way terminal run left a session absent at final readback ([#1634](https://github.com/donadiosolutions/lcm/issues/1634)). `PostToolUse` observations were retained for the exercised tool calls. A later successful snapshot may recover remaining transcript data; import recovery was not exercised here. | Best-effort |
+| Several sessions at once in one project | all | When another process holds the backend-publication lock, a `Stop` or `SubagentStop` snapshot waits for it for up to 5 seconds in total, and the daemon waits up to 3 seconds before it ingests; an `Interrupt` or `SessionEnd` hand-off waits for up to half of its remaining time budget, and the daemon waits up to 30 seconds before it ingests an accepted hand-off. A lock held for longer than that window still drops the snapshot or hand-off without a retry. Before this wait, some skipped `Stop` captures appeared later by `SessionEnd`, but at least one paired-session run and one four-way terminal run left a session absent at final readback ([#1634](https://github.com/donadiosolutions/lcm/issues/1634)). `PostToolUse` observations were retained for the exercised tool calls. A later successful snapshot may recover remaining transcript data; import recovery was not exercised here. | Best-effort |
 | MCP bundle | same hooks | Startup, prompt hints, MCP tool capture, `Stop` and `SessionEnd` were verified; the hook definitions match the CLI bundle except the `UserPromptSubmit` command. Compaction, fork, subagent and interrupt were not run with MCP. | Verified (subset); rest Unverified |
 | Desktop and IDE builds, macOS, Windows, profile or session-flag hook trust | all | Not exercised; `lcm connectors doctor codex` checks only the base user config. | Unverified |
 
@@ -291,13 +293,13 @@ above about 2,500 tokens (default `additionalContextLimit`; `0` disables it): th
 sees a head and tail preview plus a path, and the full text is written to
 `<temp dir>/hook_outputs/<thread id>/<uuid>.txt` on the local disk, so memory text can
 persist in the operating-system temporary directory. The native spill test used a
-foreign 34,823-byte handler. LCM's oversized restoration was cut to 8,192 bytes
-before reaching the spill threshold in these runs, so no LCM restoration spill was
-observed. This truncation is nondeterministic and does not guarantee that LCM memory
-cannot reach Codex's spill path; memory delivered above the effective limit can
-persist there. Large LCM output can be cut before Codex reads it
-([#1636](https://github.com/donadiosolutions/lcm/issues/1636)); 8,192 bytes was the
-observed native result, not a configured cap.
+foreign 34,823-byte handler. Those runs predate the
+[#1636](https://github.com/donadiosolutions/lcm/issues/1636) fix: the hook exited
+before its pipe was drained, so LCM's oversized restoration was cut to 8,192 bytes
+before reaching the spill threshold and no LCM restoration spill was observed. The
+hook now delivers its complete output, so a large restoration can reach Codex's
+spill path; memory delivered above the effective limit can persist there. The
+native spill test has not been repeated with the fix.
 
 **Diagnostics.** `lcm connectors doctor codex` shows whether Codex can run each
 hook (see [readiness](#codex-hook-readiness)). Failures of the hooks themselves
@@ -344,7 +346,9 @@ kills the process group at the limit. The command therefore never starts, repair
 or configures the daemon. It checks that the daemon already running for this
 installation is the expected one (process, listener, version, storage backend,
 program and runtime digest, and your token), then hands the transcript path to it
-and exits. The daemon reads, scrubs and stores the transcript after the command
+and exits. If another process holds the publication lock at that moment, the command
+pauses briefly and tries again for up to half of the time it has left to send, then
+logs `publication-refused`. The daemon reads, scrubs and stores the transcript after the command
 has gone, using the same ingest as every other snapshot. Nothing is compacted,
 promoted or marked complete by these hooks; Codex's `SessionEnd` does not use
 `lcm session-end`.
@@ -358,7 +362,7 @@ directory) under the event name `Interrupt`, `SessionEnd` or `TerminalSnapshot`:
 | `transcript-unavailable` | Codex gave no transcript, or it is not a readable regular file |
 | `invalid-input` | The hook payload was malformed, incomplete or over 1 MiB |
 | `daemon-unavailable` | No running, expected daemon could be verified in time; nothing was started |
-| `publication-refused` | Backend publication admission blocked the hand-off; nothing was sent |
+| `publication-refused` | Backend publication admission blocked the hand-off, or another process kept the publication lock for the whole time the hook was willing to wait; nothing was sent |
 | `deadline-exhausted` | The hook ran out of its time budget before it could send |
 | `ingest-failed` | The daemon refused the request or answered with an error |
 | `unconfirmed` | The request was sent but no acknowledgment arrived in time; the daemon may or may not have received it |
@@ -367,7 +371,9 @@ No line means the daemon acknowledged the request (HTTP 202). From that point th
 daemon owns the work: it keeps running the ingest even if Codex has killed the
 hook, and it stays running until accepted work finishes. Accepted work can still be
 lost if the daemon itself is stopped or killed first, or if it cannot finish within
-30 seconds of being accepted or while the daemon is shutting down. The daemon
+30 seconds of being accepted or while the daemon is shutting down. The 30 seconds
+include any time the daemon waits for another process to release the publication
+lock before it starts. The daemon
 accepts at most eight sessions at a time and answers 503 beyond that; an `Interrupt`
 followed closely by `SessionEnd` for one session is combined so the newest
 transcript tail is read once more rather than duplicated.
@@ -409,18 +415,19 @@ on Linux only for now.
 ### Memory after compaction and in forked conversations
 
 Codex drops hook-injected context when it compacts a conversation. Forks of
-its default paginated threads reference the parent's history; forks of
-legacy-history threads copy it. The `SessionStart` hook also runs after
+its default paginated threads reference the parent's history, which the hook
+reads to deduplicate; forks of legacy-history threads copy it. The `SessionStart` hook also runs after
 compaction (`compact`) and when a conversation is forked (`fork`), and restores
 recent summaries, promoted project knowledge, passive insights, and stored
 project instructions.
 
 Each restoration starts with the line `<!-- lcm-restoration -->`. On `resume`,
 `fork`, and `compact`, the hook reads the session's own rollout under
-`$CODEX_HOME` (default `~/.codex`) and prints nothing when a restoration since
-the latest compaction or rollback is still in the conversation, so a resumed
-conversation, or a fork that carries a copy of its parent's history, does not
-receive the same block twice. `startup` and `clear` always print.
+`$CODEX_HOME` (default `~/.codex`), and for a referenced fork the parent history it
+points to, and prints nothing when a restoration since the latest compaction or
+rollback is still in the conversation, so a resumed conversation, or a fork that
+carries or references its parent's history, does not receive the same block
+twice. `startup` and `clear` always print.
 
 Existing installs keep the old `startup|resume|clear` matcher until you re-run
 `lcm connectors install codex`. If the LCM restore hook has its own
@@ -438,12 +445,17 @@ Codex asks you to trust the hook again.
 Known limits:
 
 - Forks of Codex 0.163.0's default (paginated) threads are referenced forks:
-  the fork's rollout holds only a pointer to the parent's history, so the first
-  `SessionStart` of the fork prints a fresh restoration while the inherited one
-  is still in context. This is the default fork path in the app-server and
-  `codex exec fork` (one duplicate block per fork,
-  [#1632](https://github.com/donadiosolutions/lcm/issues/1632)); threads created
-  with legacy history copy the parent's history and are deduplicated.
+  the fork's rollout holds only a pointer (`history_base`) to the parent's history.
+  The hook follows it to the parent rollout under `sessions/` or
+  `archived_sessions/` (up to four files in a chain) and deduplicates against the
+  restoration found there. A parent that is missing, ambiguous, a symlink, only
+  available compressed (`.jsonl.zst`), unreadable or inconsistent with the fork's
+  recorded cutoff is not used, and a restoration older than that parent is
+  unknown, so the fork prints a fresh restoration (one duplicate block) unless
+  a marker in the history already checked proves it. Looking a parent up visits
+  at most 20,000 directory entries, so a larger session store has the same
+  effect. Referenced-fork deduplication is verified with unit fixtures; the
+  native app-server fixture was not rerun for it.
 - Rollouts outside `$CODEX_HOME`, unreadable rollouts, and restorations printed
   by earlier LCM versions (no marker line) print a fresh restoration, which can
   duplicate an existing one once per event.

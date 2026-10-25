@@ -15,8 +15,15 @@ const repositoryRequire = createRequire(import.meta.url);
 const sdkServer = repositoryRequire.resolve("@modelcontextprotocol/sdk/server/index.js");
 const ajvManifest = createRequire(sdkServer).resolve("ajv/package.json");
 const nestedFastUri = createRequire(ajvManifest)("fast-uri") as typeof fastUri;
-const PACKAGE_INVENTORY_TEST_TIMEOUT_MS = 45_000;
 const PACKAGE_COMMAND_TIMEOUT_MS = 30_000;
+const PACKAGE_BUILD_TIMEOUT_MS = 120_000;
+const PACKAGE_VERIFY_MARGIN_MS = 60_000;
+// A test that calls npmPackInventory() may first build the missing dist
+// (PACKAGE_BUILD_TIMEOUT_MS) and then run one or two npm pack commands, so its
+// own timeout must cover the build, both packs, verification and a margin.
+const PACKAGE_INVENTORY_TEST_TIMEOUT_MS =
+  PACKAGE_BUILD_TIMEOUT_MS + 2 * PACKAGE_COMMAND_TIMEOUT_MS + PACKAGE_VERIFY_MARGIN_MS;
+const BUILD_STDERR_TAIL_CHARS = 4_000;
 const FRESH_BUILD_TEST_TIMEOUT_MS = 90_000;
 const POSTGRESQL_REFERENCE_FILES = [
   "postgresql-coordination.md",
@@ -38,25 +45,39 @@ const POSTGRESQL_REFERENCE_FILES = [
   "postgresql-transfer-grants.sql",
 ] as const;
 
-function npmPackInventory(): string[] {
-  const transcriptRuntime = resolve(
-    repositoryRoot,
+// Memoises build readiness only; the pack inventory is always computed afresh.
+let generatedPackageFilesReady = false;
+
+function ensureGeneratedPackageFiles(): void {
+  if (generatedPackageFilesReady) return;
+  const generatedFiles = [
     "dist/src/storage/native-transcripts.js",
-  );
-  const postgresqlRuntime = resolve(
-    repositoryRoot,
     "dist/src/storage/postgresql.js",
-  );
-  if (!existsSync(transcriptRuntime) || !existsSync(postgresqlRuntime)
-      || !existsSync(resolve(repositoryRoot, "dist/src/storage/portable.js"))) {
-    execFileSync("pnpm", ["run", "build"], {
-      cwd: repositoryRoot,
-      encoding: "utf8",
-      stdio: "pipe",
-      maxBuffer: 32 * 1024 * 1024,
-      timeout: PACKAGE_COMMAND_TIMEOUT_MS,
-    });
+    "dist/src/storage/portable.js",
+  ].map((file) => resolve(repositoryRoot, file));
+  if (!generatedFiles.every((file) => existsSync(file))) {
+    try {
+      execFileSync("pnpm", ["run", "build"], {
+        cwd: repositoryRoot,
+        encoding: "utf8",
+        stdio: "pipe",
+        maxBuffer: 32 * 1024 * 1024,
+        timeout: PACKAGE_BUILD_TIMEOUT_MS,
+      });
+    } catch (error) {
+      const failure = error as { code?: unknown; signal?: unknown; stderr?: unknown };
+      const stderr = String(failure.stderr ?? "").slice(-BUILD_STDERR_TAIL_CHARS);
+      throw new Error(
+        `"pnpm run build" failed (timeout ${PACKAGE_BUILD_TIMEOUT_MS} ms, code ${String(failure.code)}, signal ${String(failure.signal)}): ${stderr}`,
+        { cause: error },
+      );
+    }
   }
+  generatedPackageFilesReady = true;
+}
+
+function npmPackInventory(): string[] {
+  ensureGeneratedPackageFiles();
 
   const output = execFileSync(
     "npm",
@@ -113,7 +134,7 @@ describe("package.json", () => {
     expect(pkg.dependencies).toHaveProperty("@types/pg", "8.23.1");
     expect(pkg.devDependencies).not.toHaveProperty("@types/pg");
   });
-  it("imports and typechecks portable APIs from an offline extracted tarball", { timeout: 120_000 }, () => {
+  it("imports and typechecks portable APIs from an offline extracted tarball", { timeout: PACKAGE_INVENTORY_TEST_TIMEOUT_MS }, () => {
     npmPackInventory();
     const scratch = mkdtempSync(join(tmpdir(), "lcm-portable-package-"));
     try {

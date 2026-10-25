@@ -8,6 +8,8 @@ import {
   assertHookPublicationFence,
   assertHookRootEstablished,
   isBackendPublicationJournalError,
+  NO_HOOK_ADMISSION_RETRY,
+  type HookAdmissionRetry,
 } from "./publication-fence.js";
 import { resolveHookSessionScope } from "./subagent-scope.js";
 
@@ -17,6 +19,8 @@ export interface SnapshotDeps {
   snapshotIntervalSec: number;
   post: (path: string, body: Record<string, unknown>) => Promise<unknown>;
   verifiedPort?: number;
+  /** Waits for a live publication-lock owner before each pre-effect admission. */
+  admissionRetry?: HookAdmissionRetry;
 }
 
 function defaultStatSync(path: string): { mtimeMs: number } | null {
@@ -52,6 +56,7 @@ export async function handleSessionSnapshot(
     }
     const clientName = normalizeTranscriptClient(input.client ?? process.env.LCM_CLIENT);
 
+    const retry = deps?.admissionRetry ?? NO_HOOK_ADMISSION_RETRY;
     const safeSessionId = session_id.replace(/[^a-zA-Z0-9_-]/g, "_");
     // Bootstrap/install owns root creation. Authenticate the established root
     // before creating the cursor directory so a missing or unsafe root cannot
@@ -65,7 +70,7 @@ export async function handleSessionSnapshot(
     if (intervalSec === undefined) {
       const { loadDaemonConfig } = await import("../daemon/config.js");
       const { homedir } = await import("node:os");
-      const config = loadDaemonConfig(defaultConfigPath());
+      const config = await retry(() => loadDaemonConfig(defaultConfigPath()));
       intervalSec = config.hooks?.snapshotIntervalSec ?? 60;
     }
     const forceSnapshot = input.hook_event_name === "PreCompact" || isSubagentStop;
@@ -86,12 +91,12 @@ export async function handleSessionSnapshot(
     let ingestResult: { totalTokens?: number } | undefined;
     const _post = deps?.post;
     if (_post) {
-      assertHookPublicationFence();
+      await retry(() => assertHookPublicationFence());
       ingestResult = await _post("/ingest", { session_id, cwd, transcript_path, client: clientName }) as { totalTokens?: number };
     } else {
       const { loadDaemonConfig } = await import("../daemon/config.js");
       const { readFileSync: _readFileSync } = await import("node:fs");
-      const config = loadDaemonConfig(defaultConfigPath());
+      const config = await retry(() => loadDaemonConfig(defaultConfigPath()));
       const port = deps?.verifiedPort ?? normalizeDaemonPort(config.daemon?.port ?? 3737);
 
       // Read token from token file if available (silent fallback if not found)
@@ -109,7 +114,7 @@ export async function handleSessionSnapshot(
         headers["Authorization"] = `Bearer ${token}`;
       }
 
-      assertHookPublicationFence();
+      await retry(() => assertHookPublicationFence());
       ingestResult = await daemonJsonRequest<{ totalTokens?: number }>(port, "/ingest", {
         method: "POST",
         headers,

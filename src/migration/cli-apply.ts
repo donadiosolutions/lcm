@@ -196,7 +196,8 @@ export function performMigrationApply(input: MigrationApplyInput): Promise<Migra
   return withMigrationBoundary(
     () => runMigrationApply(input, identity),
     (evidence) => withIdentityMutation(
-      { status: "refuse", reason: MIGRATION_UNEXPECTED_FAILURE_REASON, evidence },
+      // A dry run never reaches a write, so its boundary fallback is not applied.
+      { status: "refuse", reason: MIGRATION_UNEXPECTED_FAILURE_REASON, evidence, ...(input.dryRun === true ? { applied: false } : {}) },
       identity.mutation ?? (identity.started ? migrationApplyIdentityMutation(identity.progress, "thrown") : undefined),
     ),
   );

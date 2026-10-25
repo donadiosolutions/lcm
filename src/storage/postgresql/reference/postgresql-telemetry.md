@@ -2,9 +2,11 @@
 
 This guide is the normative contract that issues #637, #638, #639, and #640
 implement for PostgreSQL operational observations. #637 implements the query
-fingerprint family described below; the remaining families are still contracts
-for their owning issues. The implemented surface is the sanitized backend
-snapshot described in
+fingerprint (statement statistics) family, #638 implements the runtime health
+families `pool`, `migration`, `extensions`, and `queue`, and #639
+implements the incident diagnostics runbook and sanitization canaries. The
+#640 production-shaped load certification is still a contract. The implemented
+surface is the sanitized backend snapshot described in
 [observational diagnostics](../../../../docs/cli.md#observational-diagnostics).
 Each implementing issue encodes its rules in code and tests and updates this
 guide when it adds a metric, label, or status.
@@ -448,7 +450,7 @@ or error text is emitted.
 | Migration | `migration_expected_count` (`expectedCount`) | count | the verified packaged migration list | the family failure reason when the family fails before the probe | scope; 1 value |
 | Migration | `migration_history_status` (`historyStatus`) | closed enum | positional comparison of ledger IDs and checksums with the packaged list | none; `unavailable` is a value | scope; 1 value |
 | Extensions | `entries` (one record per extension) | `name`: the four fixed names; `status`: the existing closed readiness status; `installedVersion` and `defaultVersion`: version string | the health result's extension observations, picked into these fields only | `unavailable` for a missing, duplicate, or invalid record, named by extension; the family failure reason for every extension when the family fails | extension; at most 4 records (exactly 4 when observed), at most 16 scalar fields |
-| Queue | `outbox_oldest_pending_age_seconds` (`outboxOldestPendingAgeSeconds`) | number, seconds | local wall clock minus the oldest capture time of a pending or retry local event | `no-entry` when no such event exists; `unavailable` for an unread or skipped source; `out-of-range` for an invalid or future timestamp; `permission-denied` or `timeout` when the local read fails on a partial family | scope; 1 value |
+| Queue | `outbox_oldest_pending_age_seconds` (`outboxOldestPendingAgeSeconds`) | number, seconds | local wall clock minus the oldest capture time of a pending or retry local event | `no-entry` when no such event exists; `unavailable` for an unread or skipped source, which takes precedence; `out-of-range` when every source was read and any source's reported oldest pending timestamp is invalid, or the overall oldest timestamp is in the future; `permission-denied` or `timeout` when the local read fails on a partial family | scope; 1 value |
 | Queue | `inbox_claimed_count` (`inboxClaimed`), `inbox_quarantined_count` (`inboxQuarantined`) | counts | server inbox rows in the `claimed` and `quarantined` states | `limit-reached`, `out-of-range`, or the probe failure reason | scope; 2 values |
 | Queue | `replay_lag_seconds` (`replayLagSeconds`) | number, seconds | server clock minus the oldest `next_attempt_at` of a due `pending` or `retry` row | `no-entry` when no row is due; `limit-reached`, `out-of-range`, or the probe failure reason | scope; 1 value |
 

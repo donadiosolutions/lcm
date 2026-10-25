@@ -148,6 +148,131 @@ describe("handleSessionStart", () => {
     }
   });
 
+  describe("waiting for a live publication-lock owner", () => {
+    const liveContention = (): PrivateMutationLockContentionError => new PrivateMutationLockContentionError(
+      "publication lock is busy",
+      {
+        contendedLock: {
+          path: "/lcm/publication.lock",
+          owner: { version: 1, pid: process.pid + 1, processStartTime: null, nonce: "owner" },
+        },
+      },
+    );
+    const noPause = async (): Promise<void> => undefined;
+
+    it("restores after the owner releases the lock before and after daemon admission", async () => {
+      let calls = 0;
+      const fence = vi.spyOn(publicationFence, "assertHookPublicationFence").mockImplementation(() => {
+        calls += 1;
+        // Two refusals at the first fence, none at the second except one wait.
+        if (calls <= 2 || calls === 4) throw liveContention();
+      });
+      mockEnsureDaemon.mockResolvedValueOnce({ connected: true, port: 3737, spawned: false });
+      const post = vi.fn().mockResolvedValue({ context: "restored under contention" });
+      const retry = publicationFence.hookAdmissionRetry({ _wait: noPause });
+      try {
+        await expect(handleSessionStart("{}", { post }, 3737, { backend: "sqlite" }, retry))
+          .resolves.toEqual({ exitCode: 0, stdout: "restored under contention" });
+        expect(calls).toBe(5);
+        expect(mockEnsureDaemon).toHaveBeenCalledWith(expect.objectContaining({
+          _withPublicationAdmissionRetry: retry,
+        }));
+        expect(post).toHaveBeenCalledTimes(1);
+      } finally {
+        fence.mockRestore();
+      }
+    });
+
+    it("restores when only the daemon's post-health admission contends and then releases", async () => {
+      const fence = vi.spyOn(publicationFence, "assertHookPublicationFence").mockImplementation(() => {});
+      let postHealthAttempts = 0;
+      mockEnsureDaemon.mockImplementationOnce(async (ensureOptions) => {
+        await ensureOptions._withPublicationAdmissionRetry!(() => {
+          postHealthAttempts += 1;
+          if (postHealthAttempts <= 2) throw liveContention();
+        });
+        return { connected: true, port: 3737, spawned: false };
+      });
+      const post = vi.fn().mockResolvedValue({ context: "restored after the post-health wait" });
+      try {
+        await expect(handleSessionStart("{}", { post }, 3737, { backend: "sqlite" },
+          publicationFence.hookAdmissionRetry({ _wait: noPause })))
+          .resolves.toEqual({ exitCode: 0, stdout: "restored after the post-health wait" });
+        expect(postHealthAttempts).toBe(3);
+        expect(post).toHaveBeenCalledTimes(1);
+      } finally {
+        fence.mockRestore();
+      }
+    });
+
+    it("keeps the best-effort skip when the first fence outlasts the allowance", async () => {
+      const stderrWrite = vi.spyOn(process.stderr, "write").mockImplementation(() => true);
+      const fence = vi.spyOn(publicationFence, "assertHookPublicationFence").mockImplementation(() => {
+        throw liveContention();
+      });
+      const post = vi.fn();
+      try {
+        await expect(handleSessionStart("{}", { post }, 3737, { backend: "sqlite" },
+          publicationFence.hookAdmissionRetry({ totalMs: 100, _wait: noPause })))
+          .resolves.toEqual({ exitCode: 0, stdout: "" });
+        expect(fence).toHaveBeenCalledTimes(3);
+        expect(mockEnsureDaemon).not.toHaveBeenCalled();
+        expect(post).not.toHaveBeenCalled();
+      } finally {
+        fence.mockRestore();
+        stderrWrite.mockRestore();
+      }
+    });
+
+    it("keeps the empty output when the fence before /restore outlasts the allowance", async () => {
+      let calls = 0;
+      const fence = vi.spyOn(publicationFence, "assertHookPublicationFence").mockImplementation(() => {
+        calls += 1;
+        if (calls > 1) throw liveContention();
+      });
+      mockEnsureDaemon.mockResolvedValueOnce({ connected: true, port: 3737, spawned: false });
+      const post = vi.fn();
+      try {
+        await expect(handleSessionStart("{}", { post }, 3737, { backend: "sqlite" },
+          publicationFence.hookAdmissionRetry({ totalMs: 50, _wait: noPause })))
+          .resolves.toEqual({ exitCode: 0, stdout: "" });
+        expect(calls).toBe(3);
+        expect(post).not.toHaveBeenCalled();
+      } finally {
+        fence.mockRestore();
+      }
+    });
+
+    it("does not wait when the caller supplied no allowance", async () => {
+      const stderrWrite = vi.spyOn(process.stderr, "write").mockImplementation(() => true);
+      const fence = vi.spyOn(publicationFence, "assertHookPublicationFence").mockImplementation(() => {
+        throw liveContention();
+      });
+      try {
+        await expect(handleSessionStart("{}", { post: vi.fn() })).resolves.toEqual({ exitCode: 0, stdout: "" });
+        expect(fence).toHaveBeenCalledTimes(1);
+        expect(mockEnsureDaemon).not.toHaveBeenCalled();
+      } finally {
+        fence.mockRestore();
+        stderrWrite.mockRestore();
+      }
+    });
+
+    it("rethrows a publication journal error without waiting", async () => {
+      const journal = new BackendPublicationJournalError("unresolved-publication", "publication remains unresolved");
+      const fence = vi.spyOn(publicationFence, "assertHookPublicationFence").mockImplementation(() => {
+        throw journal;
+      });
+      try {
+        await expect(handleSessionStart("{}", { post: vi.fn() }, 3737, { backend: "sqlite" },
+          publicationFence.hookAdmissionRetry({ _wait: noPause }))).rejects.toBe(journal);
+        expect(fence).toHaveBeenCalledTimes(1);
+      } finally {
+        fence.mockRestore();
+      }
+    });
+  });
+
   it("does not fall back to SQLite when the selected PostgreSQL daemon refuses admission", async () => {
     const fence = vi.spyOn(publicationFence, "assertHookPublicationFence").mockImplementation(() => {});
     mockEnsureDaemon.mockResolvedValueOnce({

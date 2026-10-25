@@ -315,8 +315,9 @@ export async function collectBackendDiagnostics(options: CollectBackendDiagnosti
         const health = await runtime.health(controller.signal);
         if (controller.signal.aborted) return timeoutSnapshot();
         // Derived before the health-status throw: an unavailable result can still carry extensions.
+        // The family is finalized only when health() returned extension records; otherwise the catch mirrors the classified failure.
         snapshot.telemetry.extensions = extensionsTelemetry(health.extensions, Date.now());
-        finished.add("extensions");
+        if (health.extensions !== undefined) finished.add("extensions");
         snapshot.tls = health.tls === true ? "ready" : "unavailable";
         snapshot.extensions = health.extensions === undefined ? "unverified" : areRequiredPostgreSqlExtensionsReady(health.extensions) ? "ready" : "unavailable";
         snapshot.search = health.searchConfiguration === undefined ? "unverified" : health.searchConfiguration.ready ? "ready" : "unavailable";

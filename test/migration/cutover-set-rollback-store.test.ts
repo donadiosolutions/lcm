@@ -220,8 +220,8 @@ describe("cutover-set rollback checkpoint", () => {
     expect(() => cutoverSetRollbackCheckpointMemberRecord(checkpoint, 2)).toThrow(/no member at index 2/u);
     const other = createCutoverSetRollbackCheckpoint(checkpointBody(rollbackManifest(2), (b) => { b.identityDigest = HEX("f"); }));
     expect(() => recordCutoverSetRollbackCheckpoint({ homeDir, checkpoint: other })).toThrow(expect.objectContaining({ name: "MigrationBindingConflictError" }));
-    expect(readCutoverSetRollbackRecords({ homeDir, originalSetId: "cutover-set-2" })).toEqual({ state: "authoritatively-absent" });
-    expect(readCutoverSetRollbackRecords({ homeDir: home(), originalSetId: SET_ID })).toEqual({ state: "authoritatively-absent" });
+    expect(readCutoverSetRollbackRecords({ homeDir, originalSetId: "cutover-set-2" })).toEqual({ state: "authoritatively-absent", cause: "empty" });
+    expect(readCutoverSetRollbackRecords({ homeDir: home(), originalSetId: SET_ID })).toEqual({ state: "authoritatively-absent", cause: "empty" });
   });
 
   it("refuses a record whose checksum was not re-derived, and an oversized one, before any write", () => {
@@ -234,7 +234,7 @@ describe("cutover-set rollback checkpoint", () => {
     expect(canonicalJson(cutoverSetRollbackCheckpointAggregate(large)).length).toBeGreaterThan(MAX_CUTOVER_SET_ROLLBACK_RECORD_BYTES);
     expect(cutoverSetRollbackRecordCapacity({ originalSetId: SET_ID, manifest }).checkpointBytes).toBeGreaterThan(MAX_CUTOVER_SET_ROLLBACK_RECORD_BYTES);
     expect(() => recordCutoverSetRollbackCheckpoint({ homeDir, checkpoint: large })).toThrow(expect.objectContaining({ reason: "invalid-input", message: expect.stringContaining("exceeds") }));
-    expect(readCutoverSetRollbackRecords({ homeDir, originalSetId: SET_ID })).toEqual({ state: "authoritatively-absent" });
+    expect(readCutoverSetRollbackRecords({ homeDir, originalSetId: SET_ID })).toEqual({ state: "authoritatively-absent", cause: "empty" });
     expect(MAX_CUTOVER_SET_ROLLBACK_RECORD_BYTES).toBe(BACKEND_PUBLICATION_MAX_JOURNAL_BYTES);
   });
 
@@ -290,6 +290,44 @@ describe("cutover-set rollback checkpoint", () => {
     expect(parseBackendCutoverSetRollbackSelection(selection, manifest)).toEqual(selection);
   }, 120_000);
 
+  /** A home whose store holds only the named files of a checkpoint that differs from the one the tests record. */
+  function homeWithForeignRecords(keep: readonly string[]): { homeDir: string; directory: string } {
+    const homeDir = home();
+    const foreign = createCutoverSetRollbackCheckpoint(checkpointBody(rollbackManifest(2), (b) => {
+      b.identityDigest = HEX("f");
+      b.members[1].evidenceSha256 = HEX("f");
+    }));
+    recordCutoverSetRollbackCheckpoint({ homeDir, checkpoint: foreign });
+    const directory = migrationCutoverSetRollbackDirectory(homeDir, SET_ID);
+    for (const name of CHECKPOINT_FILES) if (!keep.includes(name)) rmSync(join(directory, name));
+    return { homeDir, directory };
+  }
+
+  it("refuses a conflicting stored member before it writes any other record", () => {
+    const { homeDir, directory } = homeWithForeignRecords(["member-000001.json"]);
+    expect(readCutoverSetRollbackRecords({ homeDir, originalSetId: SET_ID })).toEqual({ state: "authoritatively-absent", cause: "checkpoint-incomplete", memberRecords: 1 });
+    const checkpoint = createCutoverSetRollbackCheckpoint(checkpointBody(rollbackManifest(2)));
+    expect(() => recordCutoverSetRollbackCheckpoint({ homeDir, checkpoint }))
+      .toThrow(expect.objectContaining({ name: "MigrationBindingConflictError", message: expect.stringContaining("member-000001.json") }));
+    expect(readdirSync(directory)).toEqual(["member-000001.json"]);
+  });
+
+  it("refuses a conflicting stored aggregate before it writes any member record", () => {
+    const { homeDir, directory } = homeWithForeignRecords(["checkpoint.json"]);
+    const checkpoint = createCutoverSetRollbackCheckpoint(checkpointBody(rollbackManifest(2)));
+    expect(() => recordCutoverSetRollbackCheckpoint({ homeDir, checkpoint }))
+      .toThrow(expect.objectContaining({ name: "MigrationBindingConflictError", message: expect.stringContaining("checkpoint.json") }));
+    expect(readdirSync(directory)).toEqual(["checkpoint.json"]);
+  });
+
+  it("falls back to per-file reconciliation when the store directory cannot be scanned", () => {
+    const { homeDir, directory } = homeWithForeignRecords(["member-000001.json"]);
+    writeFileSync(join(directory, ".selection.json.0a1b.tmp"), "other\n", { mode: 0o600 });
+    const checkpoint = createCutoverSetRollbackCheckpoint(checkpointBody(rollbackManifest(2)));
+    expect(() => recordCutoverSetRollbackCheckpoint({ homeDir, checkpoint })).toThrow(expect.objectContaining({ name: "MigrationBindingConflictError" }));
+    expect(readdirSync(directory).sort()).toEqual([".selection.json.0a1b.tmp", "member-000000.json", "member-000001.json"]);
+  });
+
   it("treats member records without their aggregate as no commitment, and an aggregate without one of its members as untrusted", () => {
     const homeDir = home();
     const checkpoint = createCutoverSetRollbackCheckpoint(checkpointBody(rollbackManifest(2)));
@@ -297,7 +335,7 @@ describe("cutover-set rollback checkpoint", () => {
     const directory = migrationCutoverSetRollbackDirectory(homeDir, SET_ID);
     const aggregate = readFileSync(join(directory, "checkpoint.json"));
     rmSync(join(directory, "checkpoint.json"));
-    expect(readCutoverSetRollbackRecords({ homeDir, originalSetId: SET_ID })).toEqual({ state: "authoritatively-absent" });
+    expect(readCutoverSetRollbackRecords({ homeDir, originalSetId: SET_ID })).toEqual({ state: "authoritatively-absent", cause: "checkpoint-incomplete", memberRecords: 2 });
     // The retry re-derives the same bytes: the member records are reused and the aggregate completes the checkpoint.
     recordCutoverSetRollbackCheckpoint({ homeDir, checkpoint });
     expect(readFileSync(join(directory, "checkpoint.json"))).toEqual(aggregate);

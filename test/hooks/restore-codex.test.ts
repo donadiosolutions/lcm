@@ -106,6 +106,76 @@ describe("handleSessionStart for Codex", () => {
     await expect(start({ source })).resolves.toEqual({ exitCode: 0, stdout: MARKED_OUTPUT });
   });
 
+  describe("referenced (paginated-history) forks", () => {
+    const parentId = "01980000-0000-7000-8000-000000000001";
+    let parentOffsets: number[];
+
+    function ordered(ordinal: number, item: Record<string, unknown>): string {
+      return JSON.stringify({ timestamp: "2026-01-01T00:00:00.000Z", ordinal, ...item });
+    }
+
+    function writeParent(items: Array<Record<string, unknown>>): void {
+      let content = "";
+      parentOffsets = [];
+      items.forEach((item, index) => {
+        content += `${ordered(index, item)}\n`;
+        parentOffsets.push(Buffer.byteLength(content));
+      });
+      writeFileSync(join(codexHome, "sessions", "2026", "01", "01", `rollout-2026-01-01T00-00-00-${parentId}.jsonl`), content);
+    }
+
+    /** The fork's rollout: a session_meta referencing the first count parent records, then its own. */
+    function writeFork(count: number, own: Array<Record<string, unknown>> = []): void {
+      const meta = {
+        type: "session_meta",
+        payload: {
+          id: "01980000-0000-7000-8000-000000000002",
+          forked_from_id: parentId,
+          forked_from_ordinal_exclusive: count,
+          history_mode: "paginated",
+          history_base: { thread_id: parentId, end_ordinal_exclusive: count, end_byte_offset: parentOffsets[count - 1] },
+        },
+      };
+      writeRollout([meta, ...own].map((item, index) => ordered(count + index, item)));
+    }
+
+    const meta = { type: "session_meta", payload: { id: parentId, history_mode: "paginated" } };
+    const parentBlock = JSON.parse(block) as Record<string, unknown>;
+    const filler = JSON.parse(developer("filler")) as Record<string, unknown>;
+
+    it.each(["fork", "resume"])("skips %s when the parent history the fork references holds a live restoration", async (source) => {
+      writeParent([meta, parentBlock, filler]);
+      writeFork(3, [filler]);
+      await expect(start({ source })).resolves.toEqual({ exitCode: 0, stdout: "" });
+    });
+
+    it("prints a fork whose referenced history holds no live restoration", async () => {
+      writeParent([meta, filler, parentBlock]);
+      writeFork(2, [filler]);
+      await expect(start({ source: "fork" })).resolves.toEqual({ exitCode: 0, stdout: MARKED_OUTPUT });
+      writeParent([meta, parentBlock, JSON.parse(compacted) as Record<string, unknown>]);
+      writeFork(3);
+      await expect(start({ source: "fork" })).resolves.toEqual({ exitCode: 0, stdout: MARKED_OUTPUT });
+      writeParent([meta, parentBlock]);
+      writeFork(2, [JSON.parse(rolledBack) as Record<string, unknown>]);
+      await expect(start({ source: "fork" })).resolves.toEqual({ exitCode: 0, stdout: MARKED_OUTPUT });
+    });
+
+    it("prints a fork whose referenced parent is missing", async () => {
+      writeParent([meta, parentBlock]);
+      writeFork(2, [filler]);
+      rmSync(join(codexHome, "sessions", "2026", "01", "01", `rollout-2026-01-01T00-00-00-${parentId}.jsonl`));
+      await expect(start({ source: "fork" })).resolves.toEqual({ exitCode: 0, stdout: MARKED_OUTPUT });
+    });
+
+    it("prints a startup session even when the referenced history holds a restoration", async () => {
+      writeParent([meta, parentBlock]);
+      writeFork(2);
+      await expect(start({ source: "startup" })).resolves.toEqual({ exitCode: 0, stdout: MARKED_OUTPUT });
+    });
+  });
+
+
   it("prints a resume when the transcript path is unusable", async () => {
     const outsideDirectory = mkdtempSync(join(tmpdir(), "lcm-restore-outside-"));
     const outside = join(outsideDirectory, "rollout-o.jsonl");

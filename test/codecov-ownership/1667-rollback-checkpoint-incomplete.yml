@@ -1,0 +1,11 @@
+references: ["#1667", "#1550", "#1551"]
+rationale: >-
+  #1667 makes the rollback record reader distinguish member records of an
+  uncommitted checkpoint from an empty store, refuses a conflicting stored
+  checkpoint record before any member record is written, and carries the
+  distinction into the set report and the write fingerprint. It changes three
+  files that already live in the migration cutover owner; no topology change.
+pins:
+  - ["src/migration/cutover-set-rollback-store.ts", "unit-migration-cutover"]
+  - ["src/migration/cli-cutover-set.ts", "unit-migration-cutover"]
+  - ["src/migration/cli-cutover-set-state.ts", "unit-migration-cutover"]

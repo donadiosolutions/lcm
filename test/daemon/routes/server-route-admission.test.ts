@@ -1395,7 +1395,8 @@ describe("diagnostic route publication refusal", () => {
       expect(Object.keys(value)).toEqual(["backendDiagnostics"]);
       expect(value).toMatchObject({ backendDiagnostics: { backend: "sqlite", classification: "unavailable", publication: "unavailable", schema: "unverified", outbox: { status: "unverified" } } });
       expect(value).not.toHaveProperty("backendDiagnostics.metrics");
-      expect(JSON.stringify(value)).not.toMatch(/private-canary|transcript|messages|123|journal\.json/);
+      // \b keeps the fixture value 123 from matching digits inside telemetry timestamps.
+      expect(JSON.stringify(value)).not.toMatch(/private-canary|transcript|messages|\b123\b|journal\.json/);
       expect(handler).not.toHaveBeenCalled();
     } finally {
       await daemon?.stop();
@@ -1429,7 +1430,7 @@ describe("diagnostic route publication refusal", () => {
       expect(Object.keys(value)).toEqual(["backendDiagnostics"]);
       expect(value).toMatchObject({ backendDiagnostics: { backend: "sqlite", classification: "stale-publication", publication: "unavailable" } });
       expect(value).not.toHaveProperty("backendDiagnostics.metrics");
-      expect(JSON.stringify(value)).not.toMatch(/private-canary|transcript|messages|123/);
+      expect(JSON.stringify(value)).not.toMatch(/private-canary|transcript|messages|\b123\b/);
       expect(handler).toHaveBeenCalledOnce();
     } finally {
       await daemon?.stop();

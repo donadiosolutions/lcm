@@ -1,0 +1,9 @@
+references: ["#1691"]
+rationale: >-
+  #1691 bounds the alias table lock wait in ensureProjectAliases and reports a
+  timeout as the closed alias-lock-timeout refusal in the migration identity
+  step. The new typed error lives in the PostgreSQL identity repository and
+  the mapping in target-identity.ts. No file moves; no topology change.
+pins:
+  - ["src/storage/postgresql/identity-repository.ts", "integration-postgresql-identity"]
+  - ["src/migration/target-identity.ts", "unit-migration-cutover"]

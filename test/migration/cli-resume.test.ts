@@ -314,8 +314,8 @@ describe("resume rows 11 and 12 call the same callees as activate and rollback",
   it("row 11 runs the activate command with this command's token and the manifest's backend, and returns its outcome unchanged", async () => {
     const { home, resolutionAtRow11 } = await selectionPrepared();
     const outcome = {
-      status: "ok" as const, generationId: FIXTURE_GENERATION, manifestPhase: "active", applied: true, next: "swap-grants-then-start-daemon",
-      evidence: { grantSwap: "required-before-daemon-start" }, restart: { answer: "satisfied" as const, presence: "absent" as const },
+      status: "ok" as const, generationId: FIXTURE_GENERATION, manifestPhase: "active", applied: true, next: "revoke-transfer-grants-then-start-daemon",
+      evidence: { transferGrantRevocation: "required-before-daemon-start" }, restart: { answer: "satisfied" as const, presence: "absent" as const },
     };
     const activate = vi.fn(async () => outcome);
     const rollback = vi.fn();

@@ -1,10 +1,17 @@
-import { describe, it, expect, vi, beforeEach } from "vitest";
+import { afterEach, describe, it, expect, vi, beforeEach } from "vitest";
 import type { SnapshotDeps } from "../../src/hooks/session-snapshot.js";
+import { assertHookPublicationFence } from "../../src/hooks/publication-fence.js";
+import {
+  createLockContentionWaitBudget,
+  PrivateMutationLockContentionError,
+  retryWhileLiveLockContended,
+} from "../../src/private-mutation-lock.js";
 
 vi.mock("../../src/hooks/publication-fence.js", () => ({
   assertHookPublicationFence: vi.fn(),
   assertHookRootEstablished: vi.fn(),
   isBackendPublicationJournalError: () => false,
+  NO_HOOK_ADMISSION_RETRY: async <T>(step: () => T | Promise<T>): Promise<T> => await step(),
 }));
 
 function makeDeps(overrides: Partial<SnapshotDeps> = {}): SnapshotDeps {
@@ -142,6 +149,66 @@ describe("handleSessionSnapshot", () => {
       deps,
     );
     expect(result.exitCode).toBe(0);
+  });
+
+  describe("waiting for a live publication-lock owner", () => {
+    const liveContention = (): PrivateMutationLockContentionError => new PrivateMutationLockContentionError(
+      "publication lock is busy",
+      {
+        contendedLock: {
+          path: "/lcm/publication.lock",
+          owner: { version: 1, pid: process.pid + 1, processStartTime: null, nonce: "owner" },
+        },
+      },
+    );
+    const admissionRetry = (totalMs: number): SnapshotDeps["admissionRetry"] => {
+      const budget = createLockContentionWaitBudget(totalMs);
+      return (step) => retryWhileLiveLockContended(step, { budget, _wait: async () => undefined });
+    };
+    const input = JSON.stringify({ session_id: "abc-123", cwd: "/tmp/test", transcript_path: "/tmp/session.jsonl" });
+
+    beforeEach(() => {
+      vi.mocked(assertHookPublicationFence).mockReset();
+    });
+    afterEach(() => {
+      vi.mocked(assertHookPublicationFence).mockReset();
+    });
+
+    it("ingests once the owner releases the lock", async () => {
+      vi.mocked(assertHookPublicationFence)
+        .mockImplementationOnce(() => { throw liveContention(); })
+        .mockImplementationOnce(() => { throw liveContention(); });
+      const deps = makeDeps({ admissionRetry: admissionRetry(1000) });
+      const { handleSessionSnapshot } = await import("../../src/hooks/session-snapshot.js");
+
+      await handleSessionSnapshot(input, deps);
+
+      expect(assertHookPublicationFence).toHaveBeenCalledTimes(3);
+      expect(deps.post).toHaveBeenCalledTimes(1);
+    });
+
+    it("keeps the silent skip once the owner outlasts the allowance", async () => {
+      vi.mocked(assertHookPublicationFence).mockImplementation(() => { throw liveContention(); });
+      const deps = makeDeps({ admissionRetry: admissionRetry(100) });
+      const { handleSessionSnapshot } = await import("../../src/hooks/session-snapshot.js");
+
+      await expect(handleSessionSnapshot(input, deps)).resolves.toEqual({ exitCode: 0, stdout: "" });
+
+      expect(assertHookPublicationFence).toHaveBeenCalledTimes(3);
+      expect(deps.post).not.toHaveBeenCalled();
+      expect(deps.writeFileSync).not.toHaveBeenCalled();
+    });
+
+    it("tries the fence once when no allowance was supplied", async () => {
+      vi.mocked(assertHookPublicationFence).mockImplementation(() => { throw liveContention(); });
+      const deps = makeDeps();
+      const { handleSessionSnapshot } = await import("../../src/hooks/session-snapshot.js");
+
+      await handleSessionSnapshot(input, deps);
+
+      expect(assertHookPublicationFence).toHaveBeenCalledTimes(1);
+      expect(deps.post).not.toHaveBeenCalled();
+    });
   });
 
   describe("Codex subagents", () => {

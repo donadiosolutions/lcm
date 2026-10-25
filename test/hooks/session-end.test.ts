@@ -492,6 +492,65 @@ describe("handleSessionEnd", () => {
     } finally { fence.mockRestore(); stderr.mockRestore(); }
   });
 
+  describe("waiting for a live publication-lock owner", () => {
+    const liveContention = (): PrivateMutationLockContentionError => new PrivateMutationLockContentionError(
+      "fixture publication busy",
+      {
+        contendedLock: {
+          path: "/lcm/publication.lock",
+          owner: { version: 1, pid: process.pid + 1, processStartTime: null, nonce: "owner" },
+        },
+      },
+    );
+    const noPause = async (): Promise<void> => undefined;
+
+    it("ingests after the initial fence, the config load and the pre-ingest fence stop contending", async () => {
+      const actualFence = publicationFence.assertHookPublicationFence;
+      let fenceCalls = 0;
+      const fence = vi.spyOn(publicationFence, "assertHookPublicationFence").mockImplementation(() => {
+        fenceCalls += 1;
+        // The first call of the initial fence and of the pre-ingest fence are refused.
+        if (fenceCalls === 1 || fenceCalls === 3) throw liveContention();
+        actualFence();
+      });
+      let configCalls = 0;
+      vi.mocked(loadDaemonConfig).mockImplementation(() => {
+        configCalls += 1;
+        if (configCalls === 1) throw liveContention();
+        return defaultConfig;
+      });
+      const client = createMockClient({ ingested: 2 });
+      const retry = publicationFence.hookAdmissionRetry({ _wait: noPause });
+      try {
+        await expect(handleSessionEnd('{"session_id":"s1","cwd":"/tmp"}', client, 3737, { backend: "sqlite" }, retry))
+          .resolves.toEqual({ exitCode: 0, stdout: "" });
+        expect(client.post).toHaveBeenCalledWith("/ingest", expect.objectContaining({ session_id: "s1" }));
+        expect(configCalls).toBe(2);
+      } finally { fence.mockRestore(); }
+    });
+
+    it("hands the allowance to daemon admission", async () => {
+      const { ensureDaemon } = await import("../../src/daemon/lifecycle.js");
+      const retry = publicationFence.hookAdmissionRetry({ _wait: noPause });
+      await handleSessionEnd('{"session_id":"s1","cwd":"/tmp"}', createMockClient({ ingested: 1 }), 3737, { backend: "sqlite" }, retry);
+      expect(ensureDaemon).toHaveBeenCalledWith(expect.objectContaining({ _withPublicationAdmissionRetry: retry }));
+    });
+
+    it("keeps the logged skip once the allowance is spent", async () => {
+      const contention = liveContention();
+      const fence = vi.spyOn(publicationFence, "assertHookPublicationFence").mockImplementation(() => { throw contention; });
+      const client = createMockClient({ ingested: 2 });
+      try {
+        await expect(handleSessionEnd('{"session_id":"s1","cwd":"/tmp"}', client, 3737, { backend: "sqlite" },
+          publicationFence.hookAdmissionRetry({ totalMs: 100, _wait: noPause })))
+          .resolves.toEqual({ exitCode: 0, stdout: "" });
+        expect(fence).toHaveBeenCalledTimes(3);
+        expect(safeLogError).toHaveBeenCalledWith("SessionEnd", contention, {});
+        expect(client.post).not.toHaveBeenCalled();
+      } finally { fence.mockRestore(); }
+    });
+  });
+
   it("rethrows a local journal error from the completion request seam", async () => {
     const client = createMockClient({ ingested: 2 });
     const error = new BackendPublicationJournalError("malformed-journal", "fixture journal malformed");

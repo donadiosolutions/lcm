@@ -1252,11 +1252,20 @@ function memberTarget(ctx: Context, member: Member): RollbackSessionTarget {
   };
 }
 
-/** Open every member's fenced session in manifest order (lease, then set quiescence or recovery admission); the keeper spans them. Every route opens the sessions once per call. */
+/**
+ * Open every member's fenced session in manifest order (lease, then set quiescence or recovery admission); the keeper spans them. Every route opens the sessions once per call.
+ * A blocked exit stops and clears the keeper, leaving any sessions already opened on their members for the call's cleanup to release or close.
+ * From the return until that cleanup, `ctx.keeper !== null` iff every member session of this call is open; the keeper is set while the opens are in progress.
+ * `blocked()` records the member's reason and detail; it does not use the keeper.
+ */
 async function openSessions(ctx: Context, recovery: boolean): Promise<Exit | null> {
   ctx.keeper = startSetKeeper(ctx);
   for (const member of ctx.members) {
-    if (ctx.input.signal?.aborted === true) return blocked(ctx, "sessions", member, "cancelled", "the rollback was cancelled before the member's session was opened");
+    if (ctx.input.signal?.aborted === true) {
+      await ctx.keeper.stop();
+      ctx.keeper = null;
+      return blocked(ctx, "sessions", member, "cancelled", "the rollback was cancelled before the member's session was opened");
+    }
     try {
       member.session = await ctx.deps.openMemberSession({
         homeDir: ctx.homeDir, lockToken: ctx.token, generationId: member.generationId, publicationId: ctx.setId, runtime: ctx.runtime!,
@@ -1264,6 +1273,8 @@ async function openSessions(ctx: Context, recovery: boolean): Promise<Exit | nul
       }, memberTarget(ctx, member), ctx.deps.sessionDependencies);
     } catch (error) {
       const failure = sessionFailure(error);
+      await ctx.keeper.stop();
+      ctx.keeper = null;
       return blocked(ctx, "sessions", member, failure.reason, failure.detail);
     }
   }
@@ -1739,7 +1750,10 @@ async function revalidateFrozenMember(ctx: Context, member: Member, consequence:
   return null;
 }
 
-/** The sessions of a call are opened once: a re-prepare after an abort reacquires them when the abort was settled without them. */
+/**
+ * The sessions of a call are opened once: a re-prepare after an abort reacquires them when the abort was settled without them.
+ * A route that continued after a partial open would have to close or skip the surviving sessions first: reopening would drop an open session object.
+ */
 async function ensureSessions(ctx: Context): Promise<Exit | null> {
   if (ctx.keeper !== null) return null;
   return openSessions(ctx, true);
@@ -1913,6 +1927,7 @@ function settleMember(ctx: Context, member: Member, sealedDigest: string): Exit 
   if (manifest.phase !== "rolling-back" || pending?.kind !== "publish-rollback" || pending.effectId !== publishEffectId(member.terminalEvidenceSha256!)) {
     return interrupted(ctx, "completion", "readback-mismatch", at(member, "the manifest is not rolling back with this rollback's pending publish-rollback"));
   }
+  const reportCreatedAt = ctx.now().toISOString();
   let report: ReturnType<typeof writeRollbackReport>;
   try {
     report = ctx.deps.writeReport(ctx.homeDir, {
@@ -1929,7 +1944,7 @@ function settleMember(ctx: Context, member: Member, sealedDigest: string): Exit 
     member.manifest = ctx.deps.manifestStore.update(member.generationId, manifest.checksumSha256, (head) =>
       completeMigrationEffect(head, {
         effectId: pending.effectId, completedAt: ctx.now().toISOString(),
-        report: { kind: "rollback", reportId: report.reportId, reportSha256: report.checksumSha256, createdAt: ctx.now().toISOString() }, rollbackMode: member.mode!,
+        report: { kind: "rollback", reportId: report.reportId, reportSha256: report.checksumSha256, createdAt: reportCreatedAt }, rollbackMode: member.mode!,
       }));
   } catch (error) {
     if (error instanceof MigrationProtocolError) return interrupted(ctx, "completion", "state-unresolvable", at(member, "publish-rollback could not be completed: " + error.message));

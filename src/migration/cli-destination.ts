@@ -12,10 +12,11 @@ import { resolveMigrationTargetConfig } from "./target-config.js";
  * `activate`. It never mints anything and never writes:
  *
  * - `settings` is `connectionSettings(...)` around the resolved
- *   `storage.postgresql` object, the transfer-role connection verify opens.
- *   `activate` passes this same object as both `transferSettings` and
- *   `ordinarySettings`, so no `LCM_POSTGRES_*` environment is needed at the
- *   call and no secret is written to `config.json`.
+ *   `storage.postgresql` object, the transfer-role connection verify opens
+ *   and activate keeps as `transferSettings`. After its dry-run branch,
+ *   cli-activate separately resolves the daemon role from the activate-only
+ *   `LCM_POSTGRES_RUNTIME_URL` and passes that as `ordinarySettings`. Neither
+ *   secret is written to `config.json`.
  * - `expectedOwner` is the resolved `migrationRole`.
  * - `expectedIdentity` is the held-safe identity (the persisted local map
  *   entry plus a SELECT of the destination alias); it is the same

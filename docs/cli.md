@@ -20,8 +20,9 @@ The `lcm migration` group (`plan`, `dry-run`, `apply`, `resume`, `verify`, `repo
 `abort`, `activate`, `rollback`) performs the
 reversible SQLite-to-PostgreSQL cutover. Read the operator runbook,
 [Migration operations](migration-operations.md), before running `apply`: it leaves a
-maintenance hold that only `activate` or `abort` can release. After `activate`, swap the
-PostgreSQL grants (add the runtime grants, revoke the transfer grants) before starting the daemon.
+maintenance hold that only `activate` or `abort` can release. For one generation, apply the runtime
+grants before `activate`, then revoke the transfer grants before starting the daemon. The `--set`
+flow remains transfer-only and uses the grant swap in its dedicated runbook.
 
 Storage-backed commands use the backend selected in the authenticated LCM
 configuration. SQLite remains the default. With `storage.backend` set to
@@ -470,7 +471,8 @@ under `telemetry`: `pool`, `migration`, `extensions`, and `queue`. Each reports 
 (`observed`, `partial`, `unavailable`, `permission-denied`, or `timeout`), the time it
 was observed, a health of `healthy`, `degraded`, or `unavailable`, the fields it could
 not observe with a reason, and one fixed next action. SQLite reports all four
-as `not-applicable`. A family that could not be observed is `unavailable`, which is
+as `not-applicable`. A family that could not be observed reports `unavailable`, or the
+classified `permission-denied` or `timeout` failure, which is
 different from an observed unhealthy condition, and a partial observation never
 claims `healthy`. A degraded family raises a `healthy` snapshot to `degraded` and
 never changes any other classification.
@@ -482,7 +484,9 @@ never changes any other classification.
 | `extensions` | Status and versions (numeric versions, or `unrecognized`) of `pg_stat_statements`, `pg_trgm`, `pgcrypto`, and `unaccent` | Any extension is not `current` | Have a database administrator install or update the required PostgreSQL extensions and verify their schema and preload configuration, then run `lcm doctor`. |
 | `queue` | Age of the oldest pending local event, inbox claimed and quarantined counts, and replay lag | An inbox or ready local outbox quarantine count is above 0, or the local pending age or the replay lag exceeds 900 seconds | Inspect with `lcm events quarantine` and replay with `lcm events replay <event-id>`. For a backlog: check daemon delivery with `lcm events status`, then run `lcm doctor`. |
 
-The local pending age uses this machine's clock. The inbox counts and replay lag
+The local pending age uses this machine's clock, and it is omitted when any
+local source reports an invalid oldest pending timestamp, unless another source
+was unread or skipped, which is reported as unavailable. The inbox counts and replay lag
 come from the database and use its clock. A selected project without an observed
 local binding reports only the database values, so its queue family is
 `partial`. A reached read cap, a failed probe, or an unreadable local source omits
@@ -610,7 +614,12 @@ observed empty database.
 `lcm status`, `lcm stats --pool`, and `lcm doctor` authenticate an existing
 daemon through the internal `GET /health/observe` endpoint. It reports process
 identity with `observation: "identity-only"` and `storage.status: "unverified"`;
-it never opens project storage or runs the active readiness probe. Diagnostics
+it never opens project storage or runs the active readiness probe. It still
+answers when the daemon's startup backend differs from the backend now selected
+on disk, so a daemon left running across a migration cutover remains
+identifiable, including when its own environment lacks the PostgreSQL URL, CA
+file, or migration role of the newly selected backend (values that are present
+are still validated); every other admission check applies as before. Diagnostics
 require the exact installed version, backend, entrypoint, runtime digest, and
 unchanged configuration witness. An old daemon without this endpoint, malformed
 response, missing credentials, or mismatched identity refuses observation;

@@ -50,6 +50,9 @@ describe('backend diagnostics', () => {
 });
 
 import { mkdirSync, writeFileSync, symlinkSync } from 'node:fs';
+import { DatabaseSync } from 'node:sqlite';
+import { collectEventStats } from '../../src/db/events-stats.js';
+import { EventsDb } from '../../src/hooks/events-db.js';
 import { parseDaemonConfig } from '../../src/daemon/config.js';
 import { PostgreSqlStorageOperationError } from '../../src/storage/postgresql/errors.js';
 import type { BackendDiagnosticDependencies, BackendDiagnosticObservation, BackendDiagnosticRuntime } from '../../src/storage/diagnostics.js';
@@ -772,6 +775,27 @@ describe('runtime health telemetry never overrides the existing classification',
     const result=await collectBackendDiagnostics({_dependencies:dependencies});
     expect(result.telemetry.queue).toMatchObject({status:'partial',inboxClaimed:0,omitted:expect.arrayContaining([{field:'outboxOldestPendingAgeSeconds',reason:'unavailable'}])});
   });
+  it('omits local age when a valid sidecar would otherwise mask an invalid sibling timestamp', async () => {
+    vi.spyOn(Date,'now').mockReturnValue(Date.UTC(2026,1,3,12,0,0));
+    const home=mkdtempSync(join(tmpdir(),'lcm-diagnostic-')); homes.push(home);
+    const eventsHome=join(home,'.lcm','events'); mkdirSync(eventsHome,{recursive:true,mode:0o700});
+    for (const [file,createdAt] of [['a-valid.db','2026-02-03 11:59:00'],['b-invalid.db','not-a-timestamp']] as const) {
+      const path=join(eventsHome,file);
+      const db=new EventsDb(path);
+      db.insertEvent('s',{type:'decision',category:'decision',data:'d',priority:1},'PostToolUse');
+      db.close();
+      const raw=new DatabaseSync(path);
+      raw.exec("PRAGMA journal_mode = WAL");
+      raw.exec("UPDATE events SET created_at = '"+createdAt+"', delivery_state = 'pending'");
+      raw.close();
+    }
+    const {dependencies}=fixture(); dependencies.readOutbox=options=>collectEventStats(options);
+    const result=await collectBackendDiagnostics({homeDir:home,_dependencies:dependencies});
+    expect(result.outbox.status).toBe('ready');
+    expect(result.telemetry.queue).toMatchObject({status:'partial',health:'unavailable',inboxClaimed:0,inboxQuarantined:0,omitted:expect.arrayContaining([{field:'outboxOldestPendingAgeSeconds',reason:'out-of-range'}])});
+    expect(result.telemetry.queue).not.toHaveProperty('outboxOldestPendingAgeSeconds');
+    expect(JSON.stringify(result)).not.toMatch(/not-a-timestamp|2026-02-03 11:59:00/);
+  });
   it('keeps the selected remote scope server-only when no local binding exists', async () => {
     const {dependencies}=fixture();
     const result=await collectBackendDiagnostics({_dependencies:dependencies,projectId:machineId});
@@ -793,6 +817,24 @@ describe('runtime health telemetry lifecycle', () => {
     expect(result.telemetry.queue).toMatchObject({status:'permission-denied',health:'unavailable'});
     expect(dependencies.readMigrationHistory).not.toHaveBeenCalled();
     expect(dependencies.readQueue).not.toHaveBeenCalled();
+  });
+  it.each([['42501','permission-denied'],['57014','timeout'],['08006','unavailable']] as const)('reports the classified failure %s for extensions when health() carries none', async (code, status) => {
+    const {dependencies,health}=fixture();
+    Object.assign(health,{status:'unavailable',error:typedFailure(code),extensions:undefined});
+    const result=await collectBackendDiagnostics({_dependencies:dependencies});
+    expect(result.classification).toBe(status);
+    expect(result.telemetry.pool).toMatchObject({status:'observed'});
+    expect(result.telemetry.extensions).toEqual({status,observedAt:expect.any(Number),health:'unavailable',entries:[],remediation:RUNTIME_HEALTH_ACTIONS.unavailable,
+      omitted:['pg_stat_statements','pg_trgm','pgcrypto','unaccent'].map(field=>({field,reason:status}))});
+  });
+  it.each(['healthy','degraded'] as const)('mirrors a later classified failure in extensions when %s health() carries none', async healthStatus => {
+    const {dependencies,health}=fixture();
+    Object.assign(health,{status:healthStatus,extensions:undefined});
+    dependencies.readMetrics=vi.fn(async()=>{throw typedFailure('42501');});
+    const result=await collectBackendDiagnostics({_dependencies:dependencies});
+    expect(result.classification).toBe('permission-denied');
+    expect(result.telemetry.extensions).toMatchObject({status:'permission-denied',health:'unavailable',entries:[],remediation:RUNTIME_HEALTH_ACTIONS.unavailable});
+    expect((result.telemetry.extensions as {omitted:unknown[]}).omitted).toHaveLength(4);
   });
   it('keeps extensions when reading the probe pool throws', async () => {
     const {dependencies,runtime}=fixture(); runtime.poolDiagnostics=()=>{throw new Error('private pool');};

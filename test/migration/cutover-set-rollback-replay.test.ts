@@ -163,7 +163,7 @@ describe("replay across a set rollback", () => {
     rmSync(directory, { recursive: true, force: true });
     refused(f, 0, witness, "commitment is absent");
     refused(f, 0, activationWitness(f, 0));
-    expect(readCutoverSetRollbackRecords({ homeDir: f.homeDir, originalSetId: f.originalSetId })).toEqual({ state: "authoritatively-absent" });
+    expect(readCutoverSetRollbackRecords({ homeDir: f.homeDir, originalSetId: f.originalSetId })).toEqual({ state: "authoritatively-absent", cause: "empty" });
     // An unrelated generation keeps the single-generation answer through its own rollback binding.
     recordMigrationSelectionBinding({
       homeDir: f.homeDir, generationId: "other-generation",

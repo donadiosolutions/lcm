@@ -2,16 +2,20 @@ import { join } from "node:path";
 import { createHash } from "node:crypto";
 import { mkdtempSync, rmSync } from "node:fs";
 import { DEFAULT_DAEMON_PORT, parseStoredConfig, readDaemonConfigRawSnapshot } from "../daemon/config.js";
-import { requireMachineIdentity } from "../machine-identity.js";
+import { MachineIdentityFileError, requireMachineIdentity } from "../machine-identity.js";
 import { configPath, daemonPidPath, lcmHomeDir } from "../runtime-paths.js";
 import { PRIVATE_FILE_MODE, readBoundedRegularFileWithStat } from "../security-files.js";
 import {
+  backendPublicationCanonicalSha256,
+  backendPublicationConfigSha256,
+  backendPublicationProjectMapSha256,
   readBackendMaintenanceJournal,
   readBackendPublicationJournal,
   withBackendPublicationAppendBarrierAsync,
   type BackendMaintenanceJournal,
   type BackendPublicationJournal,
   type BackendPublicationLockToken,
+  type BackendPublicationRecoveryFile,
   type CompleteBackendMaintenanceSelectionInput,
   type PrepareBackendMaintenanceSelectionInput,
   type PrepareBackendPublicationInput,
@@ -25,14 +29,21 @@ import {
 } from "../storage/backend-publication-material.js";
 import type { StorageIdentityContext } from "../storage/contracts.js";
 import { StorageOperationError } from "../storage/errors.js";
+import { PortableStreamError } from "../storage/portable-record.js";
 import type { PostgreSqlConnectionSettings, PostgreSqlQueryExecutor, PostgreSqlRuntimeHealth } from "../storage/postgresql/contracts.js";
 import {
   POSTGRESQL_BACKEND_PUBLICATION_RESOURCE_KEY,
   POSTGRESQL_BACKEND_PUBLICATION_RESOURCE_TYPE,
+  PostgreSqlBackendPublicationGuardError,
 } from "../storage/postgresql/publication-guard.js";
 import { createPostgreSqlBackendPublicationRemoteGuard } from "../storage/postgresql/publication-remote-guard.js";
 import { PostgreSqlRuntime } from "../storage/postgresql/runtime.js";
-import { verifyPostgreSqlTransferSchema, type PostgreSqlRuntimeReadiness } from "../storage/postgresql/runtime-readiness.js";
+import {
+  verifyPostgreSqlRuntimeSchema,
+  verifyPostgreSqlTransferSchema,
+  type PostgreSqlRuntimeReadiness,
+  type PostgreSqlRuntimeReadinessOptions,
+} from "../storage/postgresql/runtime-readiness.js";
 import type { PostgreSqlSnapshotSession } from "../storage/postgresql/snapshot-session.js";
 import {
   ActivationArtifactIdentityMismatchError,
@@ -149,8 +160,10 @@ import {
 /**
  * The migration activation orchestrator (#625, plan-v7.1): one entry point
  * for a fresh activation and for crash recovery, runMigrationActivation.
- * It classifies durable state first (step C), enters the matching row of
- * plan-v5 section 7, and runs the S0-S16 sequence under one retained
+ * It classifies durable state first (step C; an absent manifest is refused
+ * before the append barrier, which would create the LCM home, and the machine
+ * identity is read only once an ordinary runtime is about to open), enters the
+ * matching row of plan-v5 section 7, and runs the S0-S16 sequence under one retained
  * append-barrier token (I5), publishing the version-2 backend selection
  * for exactly one verified generation.
  *
@@ -208,14 +221,14 @@ import {
  * - S3 quiescence, S4 coverage then G8, S4b (amendment 1) compose material
  *   and freeze the verified manifest's revision/checksum IN MEMORY; the
  *   link is written only after the artifact at S11.
- * - S5 report freshness: activationEligible, id/sha match the manifest
- *   ref, live destination identity, pre-publication projectMapWitness.
- * - S6 G7 health on the ordinary runtime, admitted through the transfer
- *   verifier (plan-v7.2 B2: activation runs under the transfer role alone,
- *   so both settings carry that role; see MigrationActivationInput). S7
- *   census on a NEW transfer snapshot after the transfer schema check
- *   (amendment 4). S8: every class ran, mismatch totals zero, recomputed
- *   census equals the report's.
+ * - Before S2, the live ordinary destination identity is rebound and both
+ *   sessions prove distinct current_user/session_user role identities. S5
+ *   then retains report freshness and pre-publication projectMapWitness.
+ * - S6 G7 health runs on the ordinary runtime profile while admitting the
+ *   discovered transfer role as one caller-scoped peer. S7 census runs on a
+ *   NEW transfer snapshot after transfer-profile admission with the ordinary
+ *   role as its peer (amendment 4). S8: every class ran, mismatch totals
+ *   zero, recomputed census equals the report's.
  * - S9/S10 prepare-activation (inputSha256 = sha(epochId)) and
  *   publish-activation begin. S11 artifact -> link -> epoch -> attempt ->
  *   witness -> witness binding (mandatory order, plan-v6 section 7).
@@ -287,6 +300,9 @@ export type MigrationActivationInterruptionCause =
   | "state-unresolvable";
 
 export type MigrationActivationTriState = "no" | "yes" | "unknown";
+
+/** The live config and project map digests an interruption's `applied` readback compares against witnesses. */
+export type MigrationActivationSelectionDigests = Readonly<{ configSha256: string; projectMapSha256: string }>;
 
 /** {generationId, publicationId?, manifestRevision?}: fields only when evidenced (amendment 2). */
 export type MigrationActivationIdentity = Readonly<{
@@ -369,19 +385,13 @@ export const MIGRATION_ACTIVATION_LEASE_CLEANUP_TIMEOUT_MS = 30 * 1000;
 export type MigrationActivationInput = Readonly<{
   homeDir: string;
   generationId: string;
-  /** Transfer-role settings (A5 copy-binding read and the S7 census); #627
-   * supplies them. Activation runs entirely under the transfer role
-   * (plan-v7.2 B1): ordinarySettings MUST carry these same transfer-role
-   * settings, and #627 passes the same object twice. */
+  /** Transfer-role settings (A5 copy-binding read and the S7 census). S7
+   * admits the live ordinary role as its one caller-scoped canonical peer. */
   transferSettings: PostgreSqlConnectionSettings;
-  /** Settings for the S2 lease guard and the S6/S15 health probes; #627
-   * supplies them (R4). These are the SAME transfer-role settings as
-   * transferSettings (plan-v7.2 B1), not the daemon's runtime role: S6 and
-   * S15 admit this role through the transfer verifier, so a caller that
-   * passes runtime-only settings fails closed at S6 (target-unhealthy,
-   * schema-mismatch) before any effect. Applying the runtime grants and
-   * revoking the transfer grants is the operator's step after activation
-   * (docs/migration-cutover.md); #1607 is the later readiness improvement. */
+  /** Daemon runtime-role settings for the S2 lease guard and S6/S15 health.
+   * Health uses runtime admission with the live transfer role as its one
+   * caller-scoped canonical peer. The two sessions must name distinct roles
+   * on the same sealed destination before any ordinary-runtime effect. */
   ordinarySettings: PostgreSqlConnectionSettings;
   /** The destination project identity #627 resolved for verify: id, canonical,
    * remoteProjectId (PostgreSQL UUIDv7) and localProjectId (project hash).
@@ -411,6 +421,13 @@ export type MigrationActivationTransferRuntime = PostgreSqlQueryExecutor & Reado
 
 export type MigrationActivationSnapshot = PostgreSqlQueryExecutor & Readonly<{
   close(): Promise<void>;
+}>;
+
+export type MigrationActivationRoleIdentityRead = Readonly<{
+  currentUser: string;
+  sessionUser: string;
+  oid: string;
+  tls: boolean;
 }>;
 
 /** The coordinator surface this module drives: maintenance selection plus
@@ -469,11 +486,21 @@ export interface MigrationActivationDependencies {
   readonly readVerificationReport: (generationId: string, reportSha256: string) => MigrationVerificationReport;
   readonly createOrdinaryRuntime: (settings: PostgreSqlConnectionSettings) => MigrationActivationOrdinaryRuntime;
   readonly createTransferRuntime: (settings: PostgreSqlConnectionSettings) => MigrationActivationTransferRuntime;
-  /** The transfer-profile admission (verifyPostgreSqlTransferSchema): S7's
-   * schema check, and the verifier S6/S15 hand to checkTargetHealth (B2). */
+  readonly readRoleIdentity: (
+    executor: PostgreSqlQueryExecutor,
+    signal?: AbortSignal,
+  ) => Promise<MigrationActivationRoleIdentityRead>;
+  /** Runtime-profile admission used by S6/S15 with the discovered transfer
+   * role as the one caller-scoped peer. */
+  readonly verifyRuntimeSchema: (
+    executor: PostgreSqlQueryExecutor,
+    options: PostgreSqlRuntimeReadinessOptions,
+  ) => Promise<PostgreSqlRuntimeReadiness>;
+  /** Transfer-profile admission used by S7 with the discovered runtime role
+   * as the one caller-scoped peer. */
   readonly verifyTransferSchema: (
     executor: PostgreSqlQueryExecutor,
-    options: { readonly expectedOwner: string; readonly signal?: AbortSignal },
+    options: PostgreSqlRuntimeReadinessOptions,
   ) => Promise<PostgreSqlRuntimeReadiness>;
   readonly checkTargetHealth: typeof checkMigrationTargetHealth;
   readonly readCopyBinding: typeof readMigrationCopyBindingSha256;
@@ -487,6 +514,9 @@ export interface MigrationActivationDependencies {
       scratchParent: string; signal?: AbortSignal;
     }>,
   ) => Promise<Readonly<{ census: readonly MigrationVerificationDomainCensus[] }>>;
+  /** Allocates S7's census scratch directory (default: mkdtemp under the LCM
+   * home). Called only at S7, so refusals before it never touch the disk. */
+  readonly allocateScratch: (homeDir: string) => string;
   readonly census: MigrationActivationCensusSeam;
   readonly withAppendBarrier: typeof withBackendPublicationAppendBarrierAsync;
   readonly checkQuiescence: typeof checkActivationWriterQuiescence;
@@ -511,6 +541,8 @@ export interface MigrationActivationDependencies {
   readonly drive: typeof driveActivationPublication;
   readonly readMaintenanceJournal: (homeDir: string) => BackendMaintenanceJournal | null;
   readonly readPublicationJournal: (homeDir: string) => BackendPublicationJournal | null;
+  /** The live selection: sha256 of the config bytes and the canonical project map digest (the journal's witness convention). */
+  readonly readSelectionDigests: (homeDir: string) => MigrationActivationSelectionDigests;
   readonly persistReport: typeof persistMigrationActivationReport;
   readonly readReport: typeof readMigrationActivationReport;
   readonly machineId: (homeDir: string) => string;
@@ -538,6 +570,37 @@ export function createMigrationActivationDependencies(
     readVerificationReport: (generationId, reportSha256) => verificationStore.read(generationId, reportSha256),
     createOrdinaryRuntime: (settings) => new PostgreSqlRuntime(settings),
     createTransferRuntime: (settings) => new PostgreSqlRuntime(settings) as unknown as MigrationActivationTransferRuntime,
+    readRoleIdentity: async (executor, signal) => {
+      const result = await executor.query<{
+        readonly current_user_name: string;
+        readonly session_user_name: string;
+        readonly role_oid: string;
+        readonly tls: boolean;
+      }>({
+        text: `SELECT CURRENT_USER::pg_catalog.text AS current_user_name,
+                      SESSION_USER::pg_catalog.text AS session_user_name,
+                      role.oid::pg_catalog.text AS role_oid,
+                      COALESCE((
+                        SELECT ssl
+                        FROM pg_catalog.pg_stat_ssl
+                        WHERE pid OPERATOR(pg_catalog.=) pg_catalog.pg_backend_pid()
+                      ), false) AS tls
+               FROM pg_catalog.pg_roles AS role
+               WHERE role.rolname OPERATOR(pg_catalog.=) CURRENT_USER`,
+      }, {
+        domain: "factory",
+        operation: "readMigrationActivationRoleIdentity",
+        ...(signal === undefined ? {} : { signal }),
+      });
+      const row = result.rows[0];
+      return {
+        currentUser: row?.current_user_name ?? "",
+        sessionUser: row?.session_user_name ?? "",
+        oid: row?.role_oid ?? "",
+        tls: row?.tls ?? false,
+      };
+    },
+    verifyRuntimeSchema: (executor, options) => verifyPostgreSqlRuntimeSchema(executor, options),
     verifyTransferSchema: (executor, options) => verifyPostgreSqlTransferSchema(executor, options),
     checkTargetHealth: checkMigrationTargetHealth,
     readCopyBinding: readMigrationCopyBindingSha256,
@@ -575,9 +638,14 @@ export function createMigrationActivationDependencies(
     drive: driveActivationPublication,
     readMaintenanceJournal: (homeDir) => readBackendMaintenanceJournal(homeDir),
     readPublicationJournal: (homeDir) => readBackendPublicationJournal(homeDir),
+    readSelectionDigests: (homeDir) => ({
+      configSha256: backendPublicationConfigSha256(homeDir),
+      projectMapSha256: backendPublicationProjectMapSha256(homeDir),
+    }),
     persistReport: persistMigrationActivationReport,
     readReport: readMigrationActivationReport,
     machineId: (homeDir) => requireMachineIdentity(homeDir).machineId,
+    allocateScratch: (home) => mkdtempSync(join(lcmHomeDir(home), "activation-scratch-")),
     daemonPort: storedDaemonPort,
     checkRestart: checkActivationRestartAdmission,
     leaseTtlMs: MIGRATION_ACTIVATION_LEASE_TTL_MS,
@@ -686,7 +754,9 @@ type Context = {
   readonly localProjectId: string;
   readonly remoteProjectId: string;
   readonly now: () => Date;
-  readonly machineId: string;
+  /** Null until resolveMachineId runs, immediately before openOrdinary; every
+   * consumer (openOrdinary, S2 and the lease helpers) runs after it. */
+  machineId: string | null;
   token: BackendPublicationLockToken;
   manifest: MigrationManifest;
   report: MigrationVerificationReport;
@@ -694,6 +764,8 @@ type Context = {
   effectBegun: boolean;
   resumedFrom: MigrationActivationResumePoint;
   ordinary: MigrationActivationOrdinaryRuntime | null;
+  ordinaryRole: Readonly<{ role: string; oid: string }> | null;
+  transferRole: Readonly<{ role: string; oid: string }> | null;
   guard: ActivationLeasePublicationGuard | null;
   coordinator: MigrationActivationCoordinator | null;
   evidenceSha256: string | null;
@@ -725,26 +797,66 @@ function projectBinding(ctx: Context): ProjectBinding {
 // Evidence for interruptions (amendment 2) and identity
 // ---------------------------------------------------------------------------
 
+/** The own journal records the config as published: yes needs the live selection to match it. */
 const APPLIED_YES_PHASES: readonly BackendPublicationJournal["phase"][] = ["config-published", "releasing", "released", "completed"];
+/** The write may be in flight: never proven either way, even when the live selection equals the source. */
+export const APPLIED_IN_FLIGHT_PHASES: readonly BackendPublicationJournal["phase"][] = ["map-publishing", "map-published", "config-publishing"];
 
+export function digestsMatch(live: MigrationActivationSelectionDigests, configSha256: string, projectMapSha256: string): boolean {
+  return live.configSha256 === configSha256 && live.projectMapSha256 === projectMapSha256;
+}
+
+/** The digest of a recovery file under the journal convention: raw bytes for the config, canonical JSON for the map, {} when absent. */
+export function recoveryFileDigests(config: BackendPublicationRecoveryFile, projectMap: BackendPublicationRecoveryFile): MigrationActivationSelectionDigests {
+  return {
+    configSha256: createHash("sha256").update(config.presence === "present" ? config.content : "{}").digest("hex"),
+    projectMapSha256: backendPublicationCanonicalSha256(
+      projectMap.presence === "present" ? JSON.parse(Buffer.from(projectMap.content).toString("utf8")) : {},
+    ),
+  };
+}
+
+/** "no" only when the live selection still equals this activation's pre-publication source witness; otherwise "unknown". */
+function classifyAgainstSource(ctx: Context): MigrationActivationTriState {
+  // The witness enters the context at compose or at the stored artifact load;
+  // an interruption before either has no source proof.
+  const source = ctx.material?.material.source ?? ctx.artifact?.source;
+  if (source === undefined) return "unknown";
+  const witness = recoveryFileDigests(source.config, source.projectMap);
+  return digestsMatch(ctx.deps.readSelectionDigests(ctx.homeDir), witness.configSha256, witness.projectMapSha256) ? "no" : "unknown";
+}
+
+/**
+ * applied is evidence-derived (amendment 2): the journal phase says what was
+ * attempted, and an independent readback of the live config and project map
+ * must agree before it is reported. yes needs the published witnesses; no
+ * needs the pre-publication witnesses (the journal's expected digests, or the
+ * source material when the journal is absent, foreign or v3). Everything else,
+ * including any readback failure, is unknown. Never throws.
+ */
 function classifyApplied(ctx: Context): MigrationActivationTriState {
-  let journal: BackendPublicationJournal | null;
   try {
     // A live version-3 maintenance journal entered from sqlite means no
-    // version-2 publication has been prepared for this generation: nothing
-    // can have been applied. A window entered from another backend is a
-    // rollback (#626) that superseded whatever this activation published.
+    // version-2 publication has been prepared for this generation. A window
+    // entered from another backend is a rollback (#626) that superseded
+    // whatever this activation published.
     const maintenance = ctx.deps.readMaintenanceJournal(ctx.homeDir);
-    if (maintenance !== null) return isActivationMaintenance(maintenance) ? "no" : "unknown";
-    journal = ctx.deps.readPublicationJournal(ctx.homeDir);
+    if (maintenance !== null) return isActivationMaintenance(maintenance) ? classifyAgainstSource(ctx) : "unknown";
+    const journal = ctx.deps.readPublicationJournal(ctx.homeDir);
+    if (journal === null || journal.publicationId !== ctx.publicationId) return classifyAgainstSource(ctx);
+    if (APPLIED_IN_FLIGHT_PHASES.includes(journal.phase)) return "unknown";
+    const live = ctx.deps.readSelectionDigests(ctx.homeDir);
+    if (APPLIED_YES_PHASES.includes(journal.phase)) {
+      const { publishedConfigSha256, publishedProjectMapSha256 } = journal;
+      return publishedConfigSha256 !== null && publishedProjectMapSha256 !== null && digestsMatch(live, publishedConfigSha256, publishedProjectMapSha256) ? "yes" : "unknown";
+    }
+    // preparing through guarded and the abort family: no configuration or map
+    // mutation is recorded before map-publishing, but the phase alone is not
+    // proof, and a restore may be incomplete.
+    return digestsMatch(live, journal.expectedConfigSha256, journal.expectedProjectMapSha256) ? "no" : "unknown";
   } catch {
     return "unknown";
   }
-  if (journal === null || journal.publicationId !== ctx.publicationId) return "no";
-  if (APPLIED_YES_PHASES.includes(journal.phase)) return "yes";
-  // preparing through config-publishing, and the abort family before a
-  // completed restore readback: the publication may or may not have landed.
-  return "unknown";
 }
 
 /**
@@ -806,12 +918,16 @@ function isManifestAbsent(error: unknown): boolean {
   return error instanceof MigrationProtocolError && error.reason === "unexpected-state" && /head is absent/u.test(error.message);
 }
 
+function manifestAbsentRefusal(generationId: string): Exit {
+  return refusal("S0", "manifest-absent", "no migration manifest exists for generation " + generationId);
+}
+
 function readManifest(ctx: Context): Step<MigrationManifest> {
   try {
     return ok(ctx.deps.manifestStore.read(ctx.generationId));
   } catch (error) {
     if (isManifestAbsent(error)) {
-      return refused(ctx, "S0", "manifest-absent", "no migration manifest exists for generation " + ctx.generationId);
+      return manifestAbsentRefusal(ctx.generationId);
     }
     if (error instanceof MigrationProtocolError) {
       return refused(ctx, "S0", "manifest-unresolvable", "the migration manifest could not be read: " + error.message);
@@ -954,7 +1070,25 @@ function attemptFor(ctx: Context): MigrationActivationAttempt {
 function openOrdinary(ctx: Context): void {
   ctx.ordinary = ctx.deps.createOrdinaryRuntime(ctx.input.ordinarySettings);
   ctx.guard = ctx.ordinary.backendPublicationGuard();
-  ctx.coordinator = ctx.deps.createCoordinator({ homeDir: ctx.homeDir, guard: ctx.guard, machineId: ctx.machineId });
+  ctx.coordinator = ctx.deps.createCoordinator({ homeDir: ctx.homeDir, guard: ctx.guard, machineId: ctx.machineId! });
+}
+
+/**
+ * The registered machine identity, read only once the run needs it (an
+ * uninitialized home must still reach the S0 classification). An identity
+ * the file cannot supply (unregistered, pending, malformed) or a filesystem
+ * error from reading it is unresolvable state; anything else rethrows.
+ */
+function resolveMachineId(ctx: Context): Exit | null {
+  try {
+    ctx.machineId = ctx.deps.machineId(ctx.homeDir);
+    return null;
+  } catch (error) {
+    if (error instanceof MachineIdentityFileError || (error instanceof Error && typeof (error as NodeJS.ErrnoException).code === "string")) {
+      return refused(ctx, "S0", "state-unresolvable", "the machine identity could not be resolved: " + error.message);
+    }
+    throw error;
+  }
 }
 
 /** S0 (A5): evidenceSha256 from the completed transfer run, on its own
@@ -976,7 +1110,15 @@ async function stepCopyBinding(ctx: Context): Promise<Step<string>> {
   }
 }
 
-async function identityCheck(ctx: Context, executor: PostgreSqlQueryExecutor, step: MigrationActivationRefusalStep): Promise<Step<MigrationDestinationIdentity>> {
+/** The live destination identity on one session: drift refuses at `step`; a
+ * target failure refuses at `failureStep` (the ordinary runtime probe
+ * attributes its failures to S6, the health step, while its drift is S5). */
+async function identityCheck(
+  ctx: Context,
+  executor: PostgreSqlQueryExecutor,
+  step: MigrationActivationRefusalStep,
+  failureStep: MigrationActivationRefusalStep = step,
+): Promise<Step<MigrationDestinationIdentity>> {
   let live: MigrationDestinationIdentity;
   try {
     live = await ctx.deps.captureDestinationIdentity(executor, ctx.remoteProjectId, ctx.input.signal);
@@ -993,7 +1135,7 @@ async function identityCheck(ctx: Context, executor: PostgreSqlQueryExecutor, st
     if (error instanceof Error && error.name === "MigrationVerificationDriverError") {
       return refused(ctx, step, "identity-drift", "the live destination identity does not match the sealed manifest: " + error.message);
     }
-    throw error;
+    return targetFailure(ctx, error, failureStep, failureStep + " destination identity query");
   }
   if (live.sealedWitnessSha256 !== ctx.report.body.destinationIdentity.sealedWitnessSha256) {
     return refused(ctx, step, "identity-drift", "the live destination identity does not match the verification report");
@@ -1001,11 +1143,69 @@ async function identityCheck(ctx: Context, executor: PostgreSqlQueryExecutor, st
   return ok(live);
 }
 
+function validRoleIdentityRead(value: MigrationActivationRoleIdentityRead): boolean {
+  return typeof value.currentUser === "string"
+    && Buffer.byteLength(value.currentUser, "utf8") > 0
+    && Buffer.byteLength(value.currentUser, "utf8") <= 63
+    && typeof value.sessionUser === "string"
+    && value.currentUser === value.sessionUser
+    && typeof value.oid === "string"
+    && /^[0-9]+$/u.test(value.oid)
+    && value.tls === true;
+}
+
+async function discoverActivationRoles(ctx: Context): Promise<Step<true>> {
+  const transfer = ctx.deps.createTransferRuntime(ctx.input.transferSettings);
+  try {
+    let ordinary: MigrationActivationRoleIdentityRead;
+    let transferIdentity: MigrationActivationRoleIdentityRead;
+    try {
+      ordinary = await ctx.deps.readRoleIdentity(ctx.ordinary!, ctx.input.signal);
+      transferIdentity = await ctx.deps.readRoleIdentity(transfer, ctx.input.signal);
+    } catch (error) {
+      if (error instanceof StorageOperationError) {
+        const attributed = classifyMigrationTargetFailure(error, "activation role discovery");
+        return refused(
+          ctx,
+          "S6",
+          attributed.status === "unhealthy" ? "target-unhealthy" : "target-unresolvable",
+          attributed.reason + ": activation role discovery failed",
+        );
+      }
+      return refused(ctx, "S6", "target-unresolvable", "connection-failed: activation role discovery failed");
+    }
+    if (
+      !validRoleIdentityRead(ordinary)
+      || !validRoleIdentityRead(transferIdentity)
+      || ordinary.oid === transferIdentity.oid
+      || ordinary.currentUser === transferIdentity.currentUser
+    ) {
+      return refused(
+        ctx,
+        "S6",
+        "target-unhealthy",
+        "schema-mismatch: activation requires distinct unswitched runtime and transfer role sessions",
+      );
+    }
+    ctx.ordinaryRole = { role: ordinary.currentUser, oid: ordinary.oid };
+    ctx.transferRole = { role: transferIdentity.currentUser, oid: transferIdentity.oid };
+    return ok(true);
+  } finally {
+    await transfer.close();
+  }
+}
+
+async function prepareActivationSessions(ctx: Context): Promise<Step<true>> {
+  const identity = await identityCheck(ctx, ctx.ordinary!, "S5", "S6");
+  if (isExit(identity)) return identity;
+  return discoverActivationRoles(ctx);
+}
+
 /** S2 fresh acquire (pre-selection). An expired same-generation row is taken over. */
 async function stepLeaseAcquire(ctx: Context): Promise<Step<ActivationLeaseFence>> {
   const base = {
     projectId: ctx.remoteProjectId,
-    machineId: ctx.machineId,
+    machineId: ctx.machineId!,
     publicationId: ctx.publicationId,
     targetBackend: "postgresql" as const,
     evidenceSha256: ctx.evidenceSha256!,
@@ -1016,7 +1216,19 @@ async function stepLeaseAcquire(ctx: Context): Promise<Step<ActivationLeaseFence
   if (acquired.status === "acquired") return ok(acquired.fence);
   if (acquired.status === "conflict") return refused(ctx, "S2", "lease-conflict", acquired.detail);
   if (acquired.status === "unresolvable") return refused(ctx, "S2", "lease-unresolvable", acquired.detail);
-  const current = await ctx.guard!.read({ projectId: ctx.remoteProjectId, targetBackend: "postgresql", evidenceSha256: ctx.evidenceSha256!, signal: ctx.input.signal });
+  let current: ActivationLeaseFence | null;
+  try {
+    current = await ctx.guard!.read({ projectId: ctx.remoteProjectId, targetBackend: "postgresql", evidenceSha256: ctx.evidenceSha256!, signal: ctx.input.signal });
+  } catch (error) {
+    // A decodable row naming another generation is a routine conflict; an undecodable row is data damage.
+    if (error instanceof PostgreSqlBackendPublicationGuardError && error.reason === "fence-mismatch") {
+      return refused(ctx, "S2", "lease-conflict", "the expired lease row was taken by a different publication generation before takeover");
+    }
+    if (error instanceof PostgreSqlBackendPublicationGuardError && error.reason === "invalid-row") {
+      return refused(ctx, "S2", "lease-unresolvable", "the expired lease row is corrupt or ambiguous and cannot be attributed to any publication generation");
+    }
+    throw error;
+  }
   if (current === null) return refused(ctx, "S2", "lease-unresolvable", "the expired lease row vanished before takeover");
   const took: ActivationLeaseTakeoverResult = await takeoverActivationLease(ctx.guard!, { ...base, expectedFencingToken: current.fencingToken });
   if (took.status === "took-over") return ok(took.fence);
@@ -1038,7 +1250,7 @@ type LeaseContinuation =
 async function continueLease(ctx: Context): Promise<LeaseContinuation> {
   const mutation = {
     projectId: ctx.remoteProjectId,
-    machineId: ctx.machineId,
+    machineId: ctx.machineId!,
     publicationId: ctx.publicationId,
     targetBackend: "postgresql" as const,
     evidenceSha256: ctx.evidenceSha256!,
@@ -1062,7 +1274,7 @@ async function continueLease(ctx: Context): Promise<LeaseContinuation> {
 type OwnFenceRead =
   | Readonly<{ kind: "own"; fence: ActivationLeaseFence }>
   | Readonly<{ kind: "absent"; detail: string }>
-  | Readonly<{ kind: "foreign"; detail: string }>
+  | Readonly<{ kind: "foreign"; detail: string; corrupt: boolean }>
   | Readonly<{ kind: "unresolvable"; detail: string }>;
 
 /** Re-read the lease row to continue from (re-entry): the row this
@@ -1072,9 +1284,9 @@ type OwnFenceRead =
 async function readOwnFence(ctx: Context): Promise<OwnFenceRead> {
   const resolved = await resolveActivationLeaseFence(ctx.guard!, { projectId: ctx.remoteProjectId, targetBackend: "postgresql", evidenceSha256: ctx.evidenceSha256!, signal: ctx.input.signal });
   if (resolved.kind === "absent") return { kind: "absent", detail: "no fenced lease row exists for this generation" };
-  if (resolved.kind === "identity-mismatch") return { kind: "foreign", detail: resolved.detail };
+  if (resolved.kind === "identity-mismatch") return { kind: "foreign", detail: resolved.detail, corrupt: resolved.corrupt === true };
   if (resolved.kind === "unresolvable") return { kind: "unresolvable", detail: resolved.detail };
-  if (resolved.fence.publicationId !== ctx.publicationId) return { kind: "foreign", detail: "the fenced lease row names another publication" };
+  if (resolved.fence.publicationId !== ctx.publicationId) return { kind: "foreign", detail: "the fenced lease row names another publication", corrupt: false };
   return { kind: "own", fence: resolved.fence };
 }
 
@@ -1098,11 +1310,21 @@ const NO_OWN_FENCE_PHASES: ReadonlySet<BackendPublicationJournal["phase"]> = new
  * home) may legitimately have acquired the released row, and only local
  * authenticated finalization (released) or the terminal report (completed)
  * remains; neither the drive nor S16 renews, releases, acquires or takes
- * over that row. At releasing the coordinator still has to authenticate its
- * own release from the row, and the abort family unwinds through it, so a
- * foreign row stays lease-lost there.
+ * over that row.
  */
 const SUCCESSOR_ROW_PHASES: ReadonlySet<BackendPublicationJournal["phase"]> = new Set(["released", "completed"]);
+
+/**
+ * The release window (Bug #1651): the remote release may already have
+ * committed while the journal still reads releasing (or abort-releasing), so
+ * a successor publication may hold the released row. A decodable foreign row
+ * is admitted so the coordinator can finish its release tail, which is the
+ * only proof that this publication's fence was released; the drive neither
+ * renews, releases, acquires nor takes over that row. A corrupt or ambiguous
+ * row is never admitted, and a coordinator whose guard cannot prove the
+ * release still fails closed.
+ */
+const RELEASE_WINDOW_PHASES: ReadonlySet<BackendPublicationJournal["phase"]> = new Set(["releasing", "abort-releasing"]);
 
 /**
  * Release the S2 lease of a run that ends before any durable effect (the
@@ -1121,7 +1343,7 @@ const SUCCESSOR_ROW_PHASES: ReadonlySet<BackendPublicationJournal["phase"]> = ne
 async function releaseAbandonedLease(ctx: Context): Promise<string | null> {
   const mutation = {
     projectId: ctx.remoteProjectId,
-    machineId: ctx.machineId,
+    machineId: ctx.machineId!,
     publicationId: ctx.publicationId,
     targetBackend: "postgresql" as const,
     evidenceSha256: ctx.evidenceSha256!,
@@ -1223,14 +1445,17 @@ function projectMapWitness(ctx: Context, mode: "pre-publication" | "post-publica
   }
 }
 
-/** S6/S15 (plan-v7.2 B2): the health probe is the factory's, but the schema
- * admission is the transfer verifier, because the activation role holds the
- * transfer profile. checkMigrationTargetHealth's own default (the runtime
- * verifier) is untouched for its other callers. */
+/** S6/S15: health runs on the daemon runtime role and admits only the live,
+ * catalog-checked transfer role as its caller-scoped canonical peer. */
 function observeHealth(ctx: Context): Promise<MigrationTargetHealthResult> {
   return ctx.deps.checkTargetHealth(
     { runtime: ctx.ordinary!, expectedOwner: ctx.input.expectedOwner, signal: ctx.input.signal },
-    { verifyRuntimeSchema: ctx.deps.verifyTransferSchema },
+    {
+      verifyRuntimeSchema: (executor, options) => ctx.deps.verifyRuntimeSchema(executor, {
+        ...options,
+        admittedPeer: { role: ctx.transferRole!.role },
+      }),
+    },
   );
 }
 
@@ -1241,33 +1466,48 @@ async function stepHealth(ctx: Context): Promise<Step<MigrationTargetHealthResul
   return refused(ctx, "S6", health.status === "unhealthy" ? "target-unhealthy" : "target-unresolvable", health.reason + ": " + health.detail);
 }
 
-/** A target failure observed by S7 (the transfer schema check, the snapshot
- * open, the census read): the StorageOperationError family, attributed
- * exactly as S6 attributes the same failures, becomes the S6 refusal
- * vocabulary (target-unhealthy / target-unresolvable). Anything else is
- * not a target condition and is thrown. */
-function targetFailure(ctx: Context, error: unknown, stage: string): Exit {
-  if (!(error instanceof StorageOperationError)) throw error;
-  const attributed = classifyMigrationTargetFailure(error, stage);
-  return refused(ctx, "S7", attributed.status === "unhealthy" ? "target-unhealthy" : "target-unresolvable", attributed.reason + ": " + attributed.detail);
+/** A target failure observed at `step` (the S0, S5 and S7 destination
+ * identity queries; the S7 transfer schema check, snapshot open and census
+ * read): the StorageOperationError family, attributed exactly as S6
+ * attributes the same failures, becomes the S6 refusal vocabulary
+ * (target-unhealthy / target-unresolvable). The PostgreSQL portable source
+ * normalizes a storage failure to PortableStreamError("source-unavailable")
+ * carrying the storage error as its cause; that wrapper alone is unwrapped.
+ * PortableStreamError "aborted" is a cancellation, not a target condition;
+ * it and every other error are thrown. */
+function targetFailure(ctx: Context, error: unknown, step: MigrationActivationRefusalStep, stage: string): Exit {
+  const failure = error instanceof PortableStreamError && error.code === "source-unavailable" ? error.cause : error;
+  if (!(failure instanceof StorageOperationError)) throw error;
+  const attributed = classifyMigrationTargetFailure(failure, stage);
+  return refused(ctx, step, attributed.status === "unhealthy" ? "target-unhealthy" : "target-unresolvable", attributed.reason + ": " + attributed.detail);
 }
 
 /** S7: a NEW transfer snapshot, after the transfer schema check (amendment 4).
  * Close failures still surface (plan-v7 S7); they are outside the attributed
  * stages. */
-async function stepCensus(ctx: Context, scratchParent: string): Promise<Step<{ censusVector: MigrationCensusVector; canonicalDelta: MigrationCanonicalDelta }>> {
+async function stepCensus(ctx: Context): Promise<Step<{ censusVector: MigrationCensusVector; canonicalDelta: MigrationCanonicalDelta }>> {
   const transfer = ctx.deps.createTransferRuntime(ctx.input.transferSettings);
   try {
     let session: MigrationActivationSnapshot;
     try {
-      await ctx.deps.verifyTransferSchema(transfer, { expectedOwner: ctx.input.expectedOwner, signal: ctx.input.signal });
+      await ctx.deps.verifyTransferSchema(transfer, {
+        expectedOwner: ctx.input.expectedOwner,
+        signal: ctx.input.signal,
+        admittedPeer: { role: ctx.ordinaryRole!.role },
+      });
       session = await transfer.openReadOnlySnapshot({ projectId: ctx.input.expectedIdentity.id, signal: ctx.input.signal });
     } catch (error) {
-      return targetFailure(ctx, error, "S7 transfer schema check and snapshot open");
+      return targetFailure(ctx, error, "S7", "S7 transfer schema check and snapshot open");
     }
     try {
       const identity = await identityCheck(ctx, session, "S7");
       if (isExit(identity)) return identity;
+      let scratchParent: string;
+      try {
+        scratchParent = ctx.deps.allocateScratch(ctx.homeDir);
+      } catch (error) {
+        return refused(ctx, "S7", "state-unresolvable", "the census scratch directory could not be allocated: " + (error as Error).message);
+      }
       let read: Awaited<ReturnType<MigrationActivationDependencies["readDestinationCensus"]>>;
       try {
         read = await ctx.deps.readDestinationCensus(session, {
@@ -1278,7 +1518,9 @@ async function stepCensus(ctx: Context, scratchParent: string): Promise<Step<{ c
           signal: ctx.input.signal,
         });
       } catch (error) {
-        return targetFailure(ctx, error, "S7 census read");
+        return targetFailure(ctx, error, "S7", "S7 census read");
+      } finally {
+        rmSync(scratchParent, { recursive: true, force: true });
       }
       return ok({
         censusVector: ctx.deps.census.buildMigrationCensusVector(read.census),
@@ -1703,39 +1945,42 @@ export async function runMigrationActivation(
     localProjectId: input.expectedIdentity.localProjectId!,
     remoteProjectId: input.expectedIdentity.remoteProjectId!,
     now: input.now ?? (() => new Date()),
-    machineId: deps.machineId(input.homeDir),
+    machineId: null,
     token: {} as BackendPublicationLockToken,
     manifest: null as unknown as MigrationManifest,
     report: null as unknown as MigrationVerificationReport,
     verificationRef: null as unknown as MigrationReportReference,
     effectBegun: false,
     resumedFrom: "fresh",
-    ordinary: null, guard: null, coordinator: null,
+    ordinary: null, ordinaryRole: null, transferRole: null, guard: null, coordinator: null,
     evidenceSha256: null, fence: null, successorFencingToken: null, quiescence: null,
     pair: null, material: null, identityDigest: null, artifact: null, link: null,
     censusVector: null, canonicalDelta: null, epoch: null, attempt: null, witness: null, pendingStartedAt: null,
   };
-  const scratchParent = mkdtempSync(join(lcmHomeDir(input.homeDir), "activation-scratch-"));
+  // The append barrier creates the LCM home, so an uninitialized home must be
+  // classified before entering it. Only the absent case exits here; every
+  // other read result is classified by the in-barrier read (step C).
   try {
-    return await deps.withAppendBarrier(input.homeDir, async (token) => {
-      ctx.token = token;
-      try {
-        return await withPreEffectLeaseReleased(ctx, await runUnderBarrier(ctx, scratchParent));
-      } catch (error) {
-        // Best effort, only when readback proves no effect began (a commit
-        // that then threw keeps its lease): the original error is the outcome.
-        if (ctx.fence !== null && headPositivelyUnbegun(ctx)) await releaseAbandonedLease(ctx);
-        throw error;
-      } finally {
-        if (ctx.ordinary !== null) await ctx.ordinary.close();
-      }
-    });
-  } finally {
-    rmSync(scratchParent, { recursive: true, force: true });
+    deps.manifestStore.read(input.generationId);
+  } catch (error) {
+    if (isManifestAbsent(error)) return manifestAbsentRefusal(input.generationId).exit;
   }
+  return deps.withAppendBarrier(input.homeDir, async (token) => {
+    ctx.token = token;
+    try {
+      return await withPreEffectLeaseReleased(ctx, await runUnderBarrier(ctx));
+    } catch (error) {
+      // Best effort, only when readback proves no effect began (a commit
+      // that then threw keeps its lease): the original error is the outcome.
+      if (ctx.fence !== null && headPositivelyUnbegun(ctx)) await releaseAbandonedLease(ctx);
+      throw error;
+    } finally {
+      if (ctx.ordinary !== null) await ctx.ordinary.close();
+    }
+  });
 }
 
-async function runUnderBarrier(ctx: Context, scratchParent: string): Promise<MigrationActivationOutcome> {
+async function runUnderBarrier(ctx: Context): Promise<MigrationActivationOutcome> {
   // --- C: manifest and verification report ---------------------------------
   const manifest = readManifest(ctx);
   if (isExit(manifest)) return manifest.exit;
@@ -1814,6 +2059,8 @@ async function runUnderBarrier(ctx: Context, scratchParent: string): Promise<Mig
     ctx.evidenceSha256 = artifact.projects[0]!.evidenceSha256;
   }
 
+  const machine = resolveMachineId(ctx);
+  if (machine !== null) return machine.exit;
   openOrdinary(ctx);
 
   // --- Post-selection re-entry (v2 journal, or v3 selection-prepared/completed) ---
@@ -1826,17 +2073,23 @@ async function runUnderBarrier(ctx: Context, scratchParent: string): Promise<Mig
     const adopted = adoptStoredAttempt(ctx, v3, ownV2);
     if (isExit(adopted)) return adopted.exit;
     ctx.resumedFrom = ownV2 !== null ? "publication-journal" : v3!.phase === "selection-prepared" ? "selection-prepared" : "selection-completed-unbound";
+    const preparedSessions = await prepareActivationSessions(ctx);
+    if (isExit(preparedSessions)) return preparedSessions.exit;
     const own = await readOwnFence(ctx);
     if (own.kind === "own") {
       ctx.fence = own.fence;
     } else if (own.kind === "unresolvable") {
       return interrupted(ctx, "S13b", "lease-unresolvable", own.detail).exit;
-    } else if (!(ownV2 !== null && (own.kind === "foreign" ? SUCCESSOR_ROW_PHASES : NO_OWN_FENCE_PHASES).has(ownV2.phase))) {
+    } else if (!(ownV2 !== null && (own.kind === "foreign"
+      ? SUCCESSOR_ROW_PHASES.has(ownV2.phase) || (RELEASE_WINDOW_PHASES.has(ownV2.phase) && !own.corrupt)
+      : NO_OWN_FENCE_PHASES.has(ownV2.phase)))) {
       // An absent row is lost unless the coordinator owns the fences for
       // this phase (NO_OWN_FENCE_PHASES); a row of another publication is
       // lost unless this publication has already released its own
-      // (SUCCESSOR_ROW_PHASES). Otherwise ctx.fence stays null and stepDrive
-      // continues without one, never touching a successor's row.
+      // (SUCCESSOR_ROW_PHASES) or is finishing that release
+      // (RELEASE_WINDOW_PHASES, decodable rows only). Otherwise ctx.fence
+      // stays null and stepDrive continues without one, never touching a
+      // successor's row.
       return interrupted(ctx, "S13b", "lease-lost", own.detail).exit;
     }
     // A selection is recorded only after S10 began publish-activation, and
@@ -1865,6 +2118,9 @@ async function runUnderBarrier(ctx: Context, scratchParent: string): Promise<Mig
   } else if (ctx.manifest.pendingEffect !== null) {
     ctx.resumedFrom = "prepare-activation-pending";
   }
+
+  const preparedSessions = await prepareActivationSessions(ctx);
+  if (isExit(preparedSessions)) return preparedSessions.exit;
 
   // S0: evidence digest (A5) unless the artifact already carries it.
   if (ctx.evidenceSha256 === null) {
@@ -1923,14 +2179,13 @@ async function runUnderBarrier(ctx: Context, scratchParent: string): Promise<Mig
       return interrupted(ctx, "S11", "artifact-identity-mismatch", "an artifact under the recomputed digest was sealed under another publicationId").exit;
     }
   }
-  // S5 (identity; the project-map predicate ran above)
-  const identity = await identityCheck(ctx, ctx.ordinary!, "S5");
-  if (isExit(identity)) return identity.exit;
+  // S5 destination identity was bound before S2; the project-map predicate
+  // above is the remaining S5 check.
   // S6
   const health = await stepHealth(ctx);
   if (isExit(health)) return health.exit;
   // S7
-  const census = await stepCensus(ctx, scratchParent);
+  const census = await stepCensus(ctx);
   if (isExit(census)) return census.exit;
   ctx.censusVector = census.value.censusVector;
   ctx.canonicalDelta = census.value.canonicalDelta;

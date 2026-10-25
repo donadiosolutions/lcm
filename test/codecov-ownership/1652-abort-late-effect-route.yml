@@ -1,0 +1,8 @@
+references: ["#1652"]
+rationale: >-
+  Issue #1652 makes the abort command classify a pending effect that appears
+  after its first route again, so the refusal names resume only when resume
+  may run the effect. The change stays inside cli-abort.ts, which keeps its
+  owner.
+pins:
+  - ["src/migration/cli-abort.ts", "unit-migration-cutover"]

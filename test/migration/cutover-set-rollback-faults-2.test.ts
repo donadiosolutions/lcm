@@ -194,6 +194,22 @@ describe("under the hold", () => {
     expectRolledBack(f, await f.run(), "selection-prepared");
   });
 
+  it("keeps the first member's lease and every effect when a later member's session fails to open", async () => {
+    const f = await rollbackFixture();
+    const [a, b] = f.members;
+    await crashAt(f, "after-prepare-complete:" + b!.generationId);
+    const manifests = () => f.members.map((member) => f.activation.manifestStore.read(member.generationId));
+    const preserved = manifests();
+    // Member A's session opens for real, then B's open fails: A's lease is kept (a member effect exists) and nothing is lost.
+    blockedAt(await f.run({ openMemberSession: async (request, target, dependencies) => {
+      if (request.generationId === b!.generationId) throw new Error("wire dropped");
+      return f.deps.openMemberSession(request, target, dependencies);
+    } }), "sessions", b!.generationId, "target-unreachable", "wire dropped");
+    expect(f.activation.guard.rows.get(a!.remoteProjectId)).toMatchObject({ publicationId: f.setId, releasedAt: null });
+    expect(manifests()).toEqual(preserved);
+    expectRolledBack(f, await f.run(), "held");
+  });
+
   it("releases leases after a blocked set only while no member moved, reporting a release that failed", async () => {
     const f = await rollbackFixture();
     const [a] = f.members;

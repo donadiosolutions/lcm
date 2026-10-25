@@ -1,0 +1,16 @@
+references: ["#1607"]
+rationale: >-
+  Adds caller-scoped PostgreSQL peer admission so migration activation can
+  prove the daemon runtime role while the canonical transfer role still has
+  grants. The readiness verifier keeps its PostgreSQL schema owner; the
+  activation, CLI, and refusal vocabulary remain in migration cutover;
+  command descriptions remain in CLI. The runbook records that cutover-set
+  activation stays transfer-only. No
+  production file is added, removed, moved, or re-owned.
+pins:
+  - ["src/storage/postgresql/runtime-readiness.ts", "integration-postgresql-schema"]
+  - ["src/migration/activate-generation.ts", "unit-migration-cutover"]
+  - ["src/migration/cli-activate.ts", "unit-migration-cutover"]
+  - ["src/migration/refusal-mapping.ts", "unit-migration-cutover"]
+  - ["src/cli-help.ts", "unit-cli"]
+  - ["bin/lcm.ts", "unit-cli"]

@@ -1,0 +1,8 @@
+references: ["#1625"]
+rationale: >-
+  The Codex hooks.json strict parser now tracks non-integer number
+  spellings only at the handler count fields instead of serializing every
+  shallow path; the parser stays in the connectors owner and no component
+  is added, moved or re-owned.
+pins:
+  - ["src/connectors/codex-hooks.ts", "unit-connectors"]
