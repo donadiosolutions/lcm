@@ -339,11 +339,14 @@ With SQLite, `text` must be a string without an embedded NUL character
 that byte are refused when selected for reading, search, export, recall, or
 FTS replay. NUL characters in JSON-escaped tags remain supported.
 
-Storing content that already exists as an active memory in scope merges into
+Storing exactly the same text as an active memory in scope merges into
 that memory rather than creating a second one, including content with no
 searchable lexical terms that ranked search alone could not recall. The
 returned `id` is the existing memory's id, its tags are unioned with the
-supplied ones, and its confidence stays at the maximum. This is the same
+supplied ones, and its confidence stays at the maximum. Any other text,
+including a wording, case, or whitespace difference, is stored as a new
+memory with a fresh `id`; related memories are never merged or overwritten.
+This is the same
 decision `lcm promote` and knowledge import make on every backend; see
 [portable-knowledge.md](portable-knowledge.md) for its scope and
 serialization on each backend.

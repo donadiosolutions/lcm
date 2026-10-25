@@ -1,0 +1,7 @@
+references: ["#1727"]
+rationale: >-
+  #1727 restricts the shared deduplication decision to exactly identical
+  content. The change is confined to the existing decision helper, which
+  keeps its established owner and adds no component.
+pins:
+  - ["src/promotion/dedup.ts", "unit-promotion"]
