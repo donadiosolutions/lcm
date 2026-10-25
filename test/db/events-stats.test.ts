@@ -37,6 +37,7 @@ vi.mock("../../src/hooks/events-db.js", async (importOriginal) => {
 import { collectDetailedEventStats, collectEventStats } from "../../src/db/events-stats.js";
 import { collectEventSidecars } from "../../src/db/event-sidecars.js";
 import { EventsDb } from "../../src/hooks/events-db.js";
+import { localPendingAgeRead } from "../../src/storage/runtime-health.js";
 import {
   serializeWorktreeReconciliationFence,
 } from "../../src/worktree-reconciliation-fence.js";
@@ -490,6 +491,13 @@ describe("read-only sidecar oldest pending capture time", () => {
   it("reports a complete read with no qualifying row as null", async () => {
     seed("none.db", [["2019-01-01 00:00:00", "quarantined"]]);
     expect((await collectEventStats({ pruneOrphanSidecars: false })).oldestPendingAt).toBeNull();
+  });
+  it("does not let a valid sidecar mask an invalid timestamp in another sidecar", async () => {
+    seed("a-valid.db", [["2026-02-03 11:59:00", "pending"]]);
+    seed("b-invalid.db", [["not-a-timestamp", "pending"]]);
+    const stats = await collectEventStats({ pruneOrphanSidecars: false });
+    expect(stats.oldestPendingAt).toBe("not-a-timestamp");
+    expect(localPendingAgeRead(stats.oldestPendingAt, Date.UTC(2026, 1, 3, 12, 0, 0))).toEqual({ reason: "out-of-range" });
   });
   it("leaves the value unknown on the writable scan path", async () => {
     seed("writable.db", [["2026-02-03 10:00:00", "pending"]]);

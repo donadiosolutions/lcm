@@ -1,0 +1,10 @@
+references: ["#1637"]
+rationale: >-
+  #1637 stops the oldest pending capture time fold from hiding an invalid
+  sidecar timestamp behind a valid sibling. The fold in the events statistics
+  module keeps its existing persistence owner, and the strict timestamp parser
+  it now shares with the read-side age check stays in the runtime health
+  module under its existing diagnostics owner.
+pins:
+  - ["src/db/events-stats.ts", "unit-local-persistence"]
+  - ["src/storage/runtime-health.ts", "unit-diagnostics"]

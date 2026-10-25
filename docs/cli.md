@@ -482,7 +482,9 @@ never changes any other classification.
 | `extensions` | Status and versions (numeric versions, or `unrecognized`) of `pg_stat_statements`, `pg_trgm`, `pgcrypto`, and `unaccent` | Any extension is not `current` | Have a database administrator install or update the required PostgreSQL extensions and verify their schema and preload configuration, then run `lcm doctor`. |
 | `queue` | Age of the oldest pending local event, inbox claimed and quarantined counts, and replay lag | An inbox or ready local outbox quarantine count is above 0, or the local pending age or the replay lag exceeds 900 seconds | Inspect with `lcm events quarantine` and replay with `lcm events replay <event-id>`. For a backlog: check daemon delivery with `lcm events status`, then run `lcm doctor`. |
 
-The local pending age uses this machine's clock. The inbox counts and replay lag
+The local pending age uses this machine's clock, and it is omitted when any
+local source reports an invalid oldest pending timestamp, unless another source
+was unread or skipped, which is reported as unavailable. The inbox counts and replay lag
 come from the database and use its clock. A selected project without an observed
 local binding reports only the database values, so its queue family is
 `partial`. A reached read cap, a failed probe, or an unreadable local source omits
