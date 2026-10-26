@@ -152,12 +152,12 @@ function findUrlPathStarts(chars: readonly string[]): UrlPathStarts {
       if (privateRoot) return firstSlash;
     }
   };
-  const hasMatchingQuoteBeforeLineEnd = (start: number, quote: string): boolean => {
+  const findMatchingQuoteBeforeLineEnd = (start: number, quote: string): number => {
     for (let cursor = start; cursor < chars.length; cursor += 1) {
-      if (chars[cursor] === "\n" || chars[cursor] === "\r") return false;
-      if (chars[cursor] === quote) return true;
+      if (chars[cursor] === "\n" || chars[cursor] === "\r") return -1;
+      if (chars[cursor] === quote) return cursor;
     }
-    return false;
+    return -1;
   };
   let restartedPathlessFile = false;
   let quotedPathEnded = false;
@@ -171,6 +171,8 @@ function findUrlPathStarts(chars: readonly string[]): UrlPathStarts {
   let pendingNestedUrlContinuation = false;
   let postCloseFilePathActive = false;
   let postCloseFilePathBracketDepth = 0;
+  let inheritedFileQuoteParentOwnerBracketDepth = 0;
+  let inheritedFileQuoteEnd = -1;
   let queryOrFragment = false;
   let queryOrFragmentStart = -1;
   let nestedPublicUrlBracketDepth = 0;
@@ -219,6 +221,25 @@ function findUrlPathStarts(chars: readonly string[]): UrlPathStarts {
         pendingNestedUrlContinuation = false;
       }
       continue;
+    }
+    if (
+      index === inheritedFileQuoteEnd &&
+      inheritedFileQuoteParentOwnerBracketDepth > 0 &&
+      (chars[index + 1] === "&" || chars[index + 1] === "|")
+    ) {
+      const successorStart = index + 2;
+      const privateRootPathStart = returnedParentPrivateRootPathStart(successorStart);
+      if (
+        chars[successorStart] === "/" ||
+        chars[successorStart] === "\\" ||
+        isWindowsDrivePathStart(chars, successorStart)
+      ) {
+        forcedPath[successorStart] = 1;
+      } else if (privateRootPathStart >= 0) {
+        forcedPath[privateRootPathStart] = 1;
+      }
+      inheritedFileQuoteParentOwnerBracketDepth = 0;
+      inheritedFileQuoteEnd = -1;
     }
     const closingPathlessFileQueryOwnerDepth =
       pathlessFileQueryOwnerBracketDepth > 0 && char === "]"
@@ -404,12 +425,19 @@ function findUrlPathStarts(chars: readonly string[]): UrlPathStarts {
     if ((separator >= 0 || restartedPathlessFile) && nestedFileSchemeStart >= 0) {
       const directNestedFileQuote = quoteCode(chars[nestedFileSchemeStart - 1]);
       const enclosingQuote = quoteFromCode(schemeQuote);
+      const matchingEnclosingQuoteEnd =
+        directNestedFileQuote === 0 && enclosingQuote !== undefined
+          ? findMatchingQuoteBeforeLineEnd(nestedFileSchemeStart, enclosingQuote)
+          : -1;
       const inheritedNestedFileQuote =
         directNestedFileQuote === 0 &&
-        enclosingQuote !== undefined &&
-        hasMatchingQuoteBeforeLineEnd(nestedFileSchemeStart, enclosingQuote)
+        matchingEnclosingQuoteEnd >= 0
           ? schemeQuote
           : 0;
+      if (inheritedNestedFileQuote !== 0 && pathlessFileQueryOwnerBracketDepth > 0) {
+        inheritedFileQuoteParentOwnerBracketDepth = pathlessFileQueryOwnerBracketDepth;
+        inheritedFileQuoteEnd = matchingEnclosingQuoteEnd;
+      }
       activeNestedFileUrlParentOwnerBracketDepth = pathlessFileQueryOwnerBracketDepth;
       if (activeNestedFileUrlParentOwnerBracketDepth > 0) {
         nestedFileUrlParentOwnerBracketDepths.add(activeNestedFileUrlParentOwnerBracketDepth);

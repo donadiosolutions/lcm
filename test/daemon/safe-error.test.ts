@@ -4024,6 +4024,52 @@ describe("sanitizeError", () => {
       expect(sanitizeError(first)).toBe(first);
       expect(sanitizeError(sanitizeError(first))).toBe(first);
     });
+
+    const inheritedFileRootCases: Array<readonly [string, string, string]> = (["'", '"'] as const).flatMap(
+      (quote) =>
+        (["&", "|"] as const).flatMap((delimiter) =>
+          [
+            ["Windows", "\\Users\\SECRET\\x"],
+            ["POSIX", "/Users/SECRET/x"],
+            ["drive", "C:\\Users\\SECRET\\x"],
+            ["UNC", "\\\\srv\\share\\SECRET"],
+          ].map(([rootName, successor]) => [
+            `${quote} inherited file quote, ${delimiter}, ${rootName} root`,
+            `file://h?x=[${quote}https://outer.test/x?next=file:///Users/a/My Files/private.db${quote}${delimiter}${successor}]`,
+            `file://h?x=[${quote}https://outer.test/x?next=file://<path>${quote}${delimiter}<path>]`,
+          ] as const),
+        ),
+    );
+    inheritedFileRootCases.push(
+      ...(["'", '"'] as const).map((quote) => [
+        `${quote} inherited file quote with private relative successor`,
+        `file://h?x=[${quote}https://outer.test/x?next=file:///Users/a/My Files/private.db${quote}&later/Users/CANARY/x]`,
+        `file://h?x=[${quote}https://outer.test/x?next=file://<path>${quote}&later<path>]`,
+      ] as const),
+      [
+        "standalone inherited file quote control",
+        "'https://outer.test/x?next=file:///Users/a/My Files/private.db'|\\Users\\SECRET\\x",
+        "'https://outer.test/x?next=file://<path>'|\\Users\\SECRET\\x",
+      ],
+      [
+        "inherited file quote public successor control",
+        "file://h?x=['https://outer.test/x?next=file:///Users/a/My Files/private.db'|https://f.test/x]",
+        "file://h?x=['https://outer.test/x?next=file://<path>'|https://f.test/x]",
+      ],
+      [
+        "inherited file quote ordinary relative control",
+        "file://h?x=['https://outer.test/x?next=file:///Users/a/My Files/private.db'|relative/path]",
+        "file://h?x=['https://outer.test/x?next=file://<path>'|relative/path]",
+      ],
+    );
+
+    it.each(inheritedFileRootCases)("%s", (_name, input, expected) => {
+      const first = sanitizeError(input);
+
+      expect(first).toBe(expected);
+      expect(sanitizeError(first)).toBe(first);
+      expect(sanitizeError(sanitizeError(first))).toBe(first);
+    });
   });
 
   describe("Bug #1346", () => {
