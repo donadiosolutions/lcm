@@ -4316,6 +4316,11 @@ describe("sanitizeError", () => {
         "'file://host.invalid/Users/canary/My Files/private.db'",
         "'file://host.invalid<path>'",
       ],
+      [
+        "multiple nested children share one quote boundary",
+        "'https://outer.test/x?k0=file://host/Users/u/MyFiles/0.db&k1=file://host/Users/u/MyFiles/1.db'",
+        "'https://outer.test/x?k0=file://host<path>'",
+      ],
     );
 
     it.each(matrix)("%s", (_name, input, expected) => {
