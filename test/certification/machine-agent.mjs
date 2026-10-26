@@ -8,7 +8,6 @@ import { Worker } from "node:worker_threads";
 import { createHash } from "node:crypto";
 import { connect as tlsConnect } from "node:tls";
 import { createDeterministicSchedule, createFaultSchedule } from "./schedule.mjs";
-import { publishPostgreSqlBackend } from "./backend-publication.mjs";
 import { loadCertificationContract } from "./contract.mjs";
 
 const execFileAsync = promisify(execFile);
@@ -40,7 +39,10 @@ export function machineStoredConfig(environment) {
   return {
     summarizer: { mock: true },
     hooks: { disableAutoCompact: true, snapshotIntervalSec: 1 },
-    storage: { postgresql: { poolMax: 2 } },
+    storage: {
+      backend: "sqlite",
+      postgresql: { migrationRole: environment.LCM_CERT_MIGRATION_ROLE, poolMax: 2 },
+    },
   };
 }
 
@@ -277,6 +279,7 @@ export async function executeDeterministicSchedule({
   entrypoint,
   cwd,
   environment,
+  daemonClient,
   evidenceDirectory,
   now = () => performance.now(),
   wallNow = () => Date.now(),
@@ -362,9 +365,17 @@ export async function executeDeterministicSchedule({
         });
         if (hookError) throw hookError;
       } else if (entry.op === "search") {
-        commandTiming = await transientCli.run(() => runCli(entrypoint, ["search", "deterministic certification record"], { cwd, env: environment, timeoutMs: Math.max(1, remainingOperationMs()) }));
+        if (daemonClient) {
+          const processStartNs = process.hrtime.bigint(); const processStartWallMs = Date.now();
+          await daemonClient.post("/search", { cwd, query: "deterministic certification record", limit: 5, layers: [], tags: [] });
+          commandTiming = { processStartNs: processStartNs.toString(), processExitNs: process.hrtime.bigint().toString(), processStartWallMs, processExitWallMs: Date.now() };
+        } else commandTiming = await transientCli.run(() => runCli(entrypoint, ["search", "deterministic certification record"], { cwd, env: environment, timeoutMs: Math.max(1, remainingOperationMs()) }));
       } else if (entry.op === "store") {
-        commandTiming = await transientCli.run(() => runCli(entrypoint, ["store", `certification record ${entry.id}`, "--tag", "type:solution", "--tag", "scope:project"], { cwd, env: environment, timeoutMs: Math.max(1, remainingOperationMs()) }));
+        if (daemonClient) {
+          const processStartNs = process.hrtime.bigint(); const processStartWallMs = Date.now();
+          await daemonClient.post("/store", { cwd, text: `certification record ${entry.id}`, tags: ["type:solution", "scope:project"], metadata: {} });
+          commandTiming = { processStartNs: processStartNs.toString(), processExitNs: process.hrtime.bigint().toString(), processStartWallMs, processExitWallMs: Date.now() };
+        } else commandTiming = await transientCli.run(() => runCli(entrypoint, ["store", `certification record ${entry.id}`, "--tag", "type:solution", "--tag", "scope:project"], { cwd, env: environment, timeoutMs: Math.max(1, remainingOperationMs()) }));
       } else if (entry.op === "snapshot") {
         appendFileSync(environment.LCM_CERT_TRANSCRIPT_PATH, `${JSON.stringify({
           timestamp: new Date().toISOString(),
@@ -599,6 +610,31 @@ export async function captureDoctorEvidence(run) {
   }
 }
 
+export async function runPublicMigrationFlow(runStep, options = {}) {
+  const steps = [];
+  const invoke = async (name, args) => {
+    const envelope = await runStep(args);
+    if (envelope?.outcome !== "ok") {
+      const reason = envelope?.refusal?.reason ?? "unknown-refusal";
+      const next = envelope?.next ?? "none";
+      const evidence = JSON.stringify(envelope?.evidence ?? {});
+      throw new Error(`certification migration ${name} refused: reason=${reason} next=${next} evidence=${evidence}`);
+    }
+    steps.push({ name, args, envelope });
+    return envelope;
+  };
+  const plan = await invoke("plan", ["plan"]);
+  const generation = plan.generation;
+  if (typeof generation !== "string" || generation.length === 0) {
+    throw new Error("certification migration plan omitted its generation");
+  }
+  await invoke("apply", ["apply", "--confirm-generation", generation]);
+  await invoke("verify", ["verify", "--generation", generation, "--confirm-generation", generation]);
+  await options.beforeActivate?.(steps);
+  await invoke("activate", ["activate", "--generation", generation, "--confirm-generation", generation, "--confirm-backend", "postgresql"]);
+  return steps;
+}
+
 export async function runMachineAgent(environment = process.env) {
   const evidenceDirectory = environment.LCM_CERT_EVIDENCE_DIR;
   const machine = process.argv[process.argv.indexOf("--machine") + 1];
@@ -618,12 +654,69 @@ export async function runMachineAgent(environment = process.env) {
   const configDirectory = join(environment.HOME, ".lcm");
   mkdirSync(configDirectory, { recursive: true, mode: 0o700 });
   writeFileSync(join(configDirectory, "config.json"), `${JSON.stringify(machineStoredConfig(environment), null, 2)}\n`, { mode: 0o600, flag: "wx" });
-  await publishPostgreSqlBackend({
+  const [projectModule, runtimePaths, projectMapModule, maintenance] = await Promise.all([
+    import(pathToFileURL("/opt/lcm/dist/src/daemon/project.js").href),
+    import(pathToFileURL("/opt/lcm/dist/src/runtime-paths.js").href),
+    import(pathToFileURL("/opt/lcm/dist/src/project-map.js").href),
+    import(pathToFileURL("/opt/lcm/dist/src/migration/maintenance.js").href),
+  ]);
+  const localProject = projectModule.localProjectIdentity(project, environment.HOME);
+  const projectDirectory = join(runtimePaths.projectsDir(environment.HOME), localProject.id);
+  mkdirSync(projectDirectory, { recursive: true, mode: 0o700 });
+  writeFileSync(join(projectDirectory, "meta.json"), `${JSON.stringify({ cwd: project })}\n`, { mode: 0o600, flag: "wx" });
+  mkdirSync(join(environment.HOME, ".lcm", "events"), { recursive: true, mode: 0o700 });
+  projectMapModule.clearProjectMapCache();
+  const { prepareSqliteMigrationEnrollment } = maintenance;
+  await prepareSqliteMigrationEnrollment({
+    cwd: project,
     homeDir: environment.HOME,
-    packageRoot: "/opt/lcm",
-    publicationId: `certification-${environment.LCM_CERT_RUN_ID}-${machine}`,
+    displayName: name,
+    targetConfig: {
+      backend: "postgresql",
+      postgresql: {
+        url: environment.LCM_POSTGRES_URL,
+        caFile: environment.LCM_POSTGRES_CA_FILE,
+        migrationRole: environment.LCM_CERT_MIGRATION_ROLE,
+        poolMax: 2,
+        connectionTimeoutMs: 10_000,
+        idleTimeoutMs: 30_000,
+        statementTimeoutMs: 60_000,
+        snapshotIdleTimeoutMs: 300_000,
+      },
+    },
   });
-  await execFileAsync(process.execPath, [lcm, "machine", "register", "--name", name, "--json"], { cwd: project, env: environment, timeout: 60_000 });
+  await waitForControl(join(evidenceDirectory, "migration-start.json"), {
+    deadlineMs: Date.now() + contract.timeline.full.setupMaxSeconds * 1000,
+  });
+  const migrationSteps = await runPublicMigrationFlow(async (args) => {
+    try {
+      const result = await execFileAsync(process.execPath, [lcm, "migration", ...args, "--json"], { cwd: project, env: environment, timeout: 120_000 });
+      return JSON.parse(result.stdout);
+    } catch (error) {
+      if (typeof error?.stdout !== "string" || error.stdout.length === 0) throw error;
+      return JSON.parse(error.stdout);
+    }
+  }, {
+    beforeActivate: async (steps) => {
+      writeFileSync(join(evidenceDirectory, "verification-receipt.json"), `${JSON.stringify({
+        machine,
+        at: new Date().toISOString(),
+        steps,
+      }, null, 2)}\n`, { mode: 0o600, flag: "wx" });
+      await waitForControl(join(evidenceDirectory, "activation-start.json"), {
+        deadlineMs: Date.now() + contract.timeline.full.setupMaxSeconds * 1000,
+      });
+    },
+  });
+  writeFileSync(join(evidenceDirectory, "activation-receipt.json"), `${JSON.stringify({
+    machine,
+    at: new Date().toISOString(),
+    steps: migrationSteps,
+  }, null, 2)}\n`, { mode: 0o600, flag: "wx" });
+  await waitForControl(join(evidenceDirectory, "runtime-ready.json"), {
+    deadlineMs: Date.now() + contract.timeline.full.setupMaxSeconds * 1000,
+  });
+  environment.LCM_POSTGRES_URL = environment.LCM_POSTGRES_RUNTIME_URL;
   const tlsReadiness = {
     wrongCa: await requireTlsRejection(lcm, environment, environment.LCM_POSTGRES_URL, environment.LCM_CERT_WRONG_CA_FILE, "certificate-authority", project),
     wrongHostname: await requireTlsRejection(lcm, environment, environment.LCM_CERT_WRONG_HOST_URL, environment.LCM_POSTGRES_CA_FILE, "certificate-name", project),
@@ -631,23 +724,25 @@ export async function runMachineAgent(environment = process.env) {
   const identity = await execFileAsync(process.execPath, [lcm, "machine", "show", "--json"], { cwd: project, env: environment, timeout: 60_000 });
   writeFileSync(join(evidenceDirectory, "identity.json"), identity.stdout, { mode: 0o600, flag: "wx" });
   const { DaemonClient } = await import(pathToFileURL("/opt/lcm/dist/src/daemon/client.js").href);
-  const daemonClient = new DaemonClient("http://127.0.0.1:3737", join(configDirectory, "daemon.token"));
+  const daemonTokenPath = join(configDirectory, "daemon.token");
   const daemon = await startForegroundDaemon({
     entrypoint: lcm,
     environment,
     cwd: project,
     daemonArguments: ["/opt/lcm/certification/daemon-agent.mjs"],
     healthProbe: async () => {
-      if (!await daemonClient.health()) throw new Error("foreground daemon is not healthy");
+      if (!await new DaemonClient("http://127.0.0.1:3737", daemonTokenPath).health()) throw new Error("foreground daemon is not healthy");
     },
   });
+  const daemonClient = new DaemonClient("http://127.0.0.1:3737", daemonTokenPath);
   try {
-  await execFileAsync(process.execPath, [lcm, "project", "create", project, "--name", `cert-${environment.LCM_CERT_RUN_ID}`, "--json"], { cwd: project, env: environment, timeout: 60_000 });
+  writeFileSync(join(evidenceDirectory, "daemon-started.json"), `${JSON.stringify({ machine, at: new Date().toISOString() })}\n`, { mode: 0o600, flag: "wx" });
   const doctor = await captureDoctorEvidence(() => execFileAsync(process.execPath, [lcm, "doctor", "--verbose"], { cwd: project, env: environment, timeout: 60_000 }));
-  await execFileAsync(process.execPath, [lcm, "store", "certification readiness", "--tag", "type:solution", "--tag", "scope:project"], { cwd: project, env: environment, timeout: 60_000 });
-  await execFileAsync(process.execPath, [lcm, "search", "certification readiness"], { cwd: project, env: environment, timeout: 60_000 });
+  await daemonClient.post("/store", { cwd: project, text: "certification readiness", tags: ["type:solution", "scope:project"], metadata: {} });
+  await daemonClient.post("/search", { cwd: project, query: "certification readiness", limit: 5, layers: [], tags: [] });
   writeFileSync(join(evidenceDirectory, "readiness.json"), `${JSON.stringify({
     machine,
+    migrationSteps,
     tls: tlsReadiness,
     doctorExitCode: doctor.exitCode,
     doctorSha256: createHash("sha256").update(doctor.stdout).digest("hex"),
@@ -678,12 +773,12 @@ export async function runMachineAgent(environment = process.env) {
     ];
     verifyEmissionBudget(emissionTimes, 30);
     expectedEvents = emissionTimes.length;
-    await executeDeterministicSchedule({ schedule: warmup, scheduleStartWallMs: Date.parse(warmupControl.warmupStartAt), entrypoint: lcm, cwd: project, environment, evidenceDirectory });
+    await executeDeterministicSchedule({ schedule: warmup, scheduleStartWallMs: Date.parse(warmupControl.warmupStartAt), entrypoint: lcm, cwd: project, environment, daemonClient, evidenceDirectory });
     writeFileSync(join(evidenceDirectory, "warmup-complete.json"), `${JSON.stringify({ machine, at: new Date().toISOString() })}\n`, { mode: 0o600, flag: "wx" });
     const control = await waitForControl(join(evidenceDirectory, "phase-control.json"), {
       deadlineMs: Date.now() + 120_000,
     });
-    await executeDeterministicSchedule({ schedule, scheduleStartWallMs: Date.parse(control.steadyT0At), entrypoint: lcm, cwd: project, environment, evidenceDirectory });
+    await executeDeterministicSchedule({ schedule, scheduleStartWallMs: Date.parse(control.steadyT0At), entrypoint: lcm, cwd: project, environment, daemonClient, evidenceDirectory });
     writeFileSync(join(evidenceDirectory, "steady-complete.json"), `${JSON.stringify({ machine, at: new Date().toISOString(), steadyT0At: control.steadyT0At })}\n`, { mode: 0o600, flag: "wx" });
     const settleUntil = Date.parse(control.steadyT0At) + timeline.steadySeconds * 1000 + (timeline.pendingSettleMaxSeconds ?? 0) * 1000;
     if (Date.now() < settleUntil) await new Promise((resolve) => setTimeout(resolve, settleUntil - Date.now()));
@@ -693,7 +788,7 @@ export async function runMachineAgent(environment = process.env) {
         machine, runId: environment.LCM_CERT_RUN_ID, phase: "partition-recovery",
         durationSeconds: contract.thresholds.recovery.partition.rtoSeconds,
       });
-      await executeDeterministicSchedule({ schedule: partitionSchedule, entrypoint: lcm, cwd: project, environment, evidenceDirectory });
+      await executeDeterministicSchedule({ schedule: partitionSchedule, entrypoint: lcm, cwd: project, environment, daemonClient, evidenceDirectory });
       await waitForControl(join(evidenceDirectory, "partition-cleared.json"), {
         deadlineMs: Date.now() + timeline.partitionPhaseMaxSeconds * 1000,
       });
@@ -706,7 +801,7 @@ export async function runMachineAgent(environment = process.env) {
           machine, runId: environment.LCM_CERT_RUN_ID, phase: "restart-recovery",
           durationSeconds: contract.thresholds.recovery.restartDatabase.rtoSeconds,
         });
-        await executeDeterministicSchedule({ schedule: restartSchedule, entrypoint: lcm, cwd: project, environment, evidenceDirectory });
+        await executeDeterministicSchedule({ schedule: restartSchedule, entrypoint: lcm, cwd: project, environment, daemonClient, evidenceDirectory });
         await waitForControl(join(evidenceDirectory, "restart-cleared.json"), {
           deadlineMs: Date.now() + timeline.restartPhaseMaxSeconds * 1000,
         });
@@ -760,7 +855,13 @@ export async function runMachineAgent(environment = process.env) {
 
 if (import.meta.url === `file://${process.argv[1]}`) {
   runMachineAgent().catch((error) => {
-    process.stderr.write(`machine agent failed: ${error.message}\n`);
+    const diagnostics = [];
+    const seen = new Set();
+    for (let current = error; current && !seen.has(current); current = current.cause) {
+      seen.add(current);
+      diagnostics.push(String(current?.stack ?? current));
+    }
+    process.stderr.write(`machine agent failed: ${diagnostics.join("\nCaused by: ")}\n`);
     process.exitCode = 1;
   });
 }

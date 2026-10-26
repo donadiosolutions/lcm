@@ -11,6 +11,7 @@ import {
   isAcknowledgedRow,
   machineStoredConfig,
   observeAcknowledgments,
+  runPublicMigrationFlow,
   startForegroundDaemon,
   verifyFinalDrain,
   verifyEmissionBudget,
@@ -24,7 +25,10 @@ describe("certification machine agent", () => {
     expect(machineStoredConfig({ LCM_CERT_MIGRATION_ROLE: "lcm_test_migrator" })).toEqual({
       summarizer: { mock: true },
       hooks: { disableAutoCompact: true, snapshotIntervalSec: 1 },
-      storage: { postgresql: { poolMax: 2 } },
+      storage: {
+        backend: "sqlite",
+        postgresql: { migrationRole: "lcm_test_migrator", poolMax: 2 },
+      },
     });
     expect(() => machineStoredConfig({})).toThrow("migration role");
   });
@@ -97,6 +101,23 @@ describe("certification machine agent", () => {
       exitCode: 1,
     });
     await expect(captureDoctorEvidence(async () => { throw new Error("no report"); })).rejects.toThrow("no report");
+  });
+
+  it("runs the supported public forward migration flow with one confirmed generation", async () => {
+    const runStep = vi.fn(async (args: string[]) => ({
+      generation: "generation-1",
+      outcome: "ok",
+      manifestPhase: args[0] === "apply" ? "copied" : args[0] === "verify" ? "verified" : args[0] === "activate" ? "active" : null,
+    }));
+    const result = await runPublicMigrationFlow(runStep);
+
+    expect(runStep.mock.calls.map(([args]) => args)).toEqual([
+      ["plan"],
+      ["apply", "--confirm-generation", "generation-1"],
+      ["verify", "--generation", "generation-1", "--confirm-generation", "generation-1"],
+      ["activate", "--generation", "generation-1", "--confirm-generation", "generation-1", "--confirm-backend", "postgresql"],
+    ]);
+    expect(result).toHaveLength(4);
   });
 
   it("records first-seen monotonic time and distinct inbox ids", () => {

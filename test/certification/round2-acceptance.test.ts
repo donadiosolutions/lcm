@@ -32,14 +32,16 @@ describe("round 2 certification acceptance helpers", () => {
     const args = buildMachineContainerArgs({
       machine: "a", name: "machine-a", hostname: "machine-a", network: "network",
       image: "node@sha256:" + "a".repeat(64), ownerLabels: { kind: "machine-a" },
-      stagedPackage: "/stage", homeParent: "/home-parent", caFile: "/ca", wrongCaFile: "/wrong-ca",
+      stagedPackage: "/stage", nodeModules: "/node_modules", homeParent: "/home-parent", caFile: "/ca", wrongCaFile: "/wrong-ca",
       evidenceDirectory: "/evidence", environmentFile: "/env",
     });
     expect(args).toContain("--userns=keep-id:uid=1000,gid=1000");
   });
 
-  it("requires the lane migration role without persisting the protected value", () => {
-    expect(JSON.stringify(machineStoredConfig({ LCM_CERT_MIGRATION_ROLE: "lcm_test_migrator" }))).not.toContain("migrationRole");
+  it("starts migration enrollment from SQLite with the lane migration role", () => {
+    expect(machineStoredConfig({ LCM_CERT_MIGRATION_ROLE: "lcm_test_migrator" })).toMatchObject({
+      storage: { backend: "sqlite", postgresql: { migrationRole: "lcm_test_migrator" } },
+    });
     expect(() => machineStoredConfig({})).toThrow("migration role");
   });
 

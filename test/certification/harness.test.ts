@@ -11,6 +11,7 @@ import {
   prepareManagedDatabase,
   recordFaultStep,
   runLocalCertification,
+  runMachineActivationBarrier,
   stageBuiltPackage,
   verifyDistinctMachineIdentities,
   waitForMachineFiles,
@@ -95,6 +96,26 @@ describe("certification harness", () => {
     expect(delay).not.toHaveBeenCalled();
   });
 
+  it("revokes transfer only after both activations and starts daemons afterward", async () => {
+    const order: string[] = [];
+    await runMachineActivationBarrier({
+      verifyA: async () => { order.push("verify-a"); },
+      verifyB: async () => { order.push("verify-b"); },
+      grantRuntime: async () => { order.push("grant-runtime"); },
+      activateA: async () => { order.push("activate-a"); },
+      activateB: async () => { order.push("activate-b"); },
+      revokeTransfer: async () => { order.push("revoke-transfer"); },
+      verifyRuntime: async () => { order.push("verify-runtime"); },
+      startDaemonA: async () => { order.push("start-daemon-a"); },
+      startDaemonB: async () => { order.push("start-daemon-b"); },
+      stagger: async () => { order.push("stagger"); },
+    });
+    expect(order).toEqual([
+      "verify-a", "verify-b", "grant-runtime", "activate-a", "activate-b", "revoke-transfer", "verify-runtime",
+      "start-daemon-a", "stagger", "start-daemon-b",
+    ]);
+  });
+
   it("pins ownership, identity, limits and safe mount modes in machine argv", () => {
     const args = buildMachineContainerArgs({
       machine: "a",
@@ -104,6 +125,7 @@ describe("certification harness", () => {
       image: "node@sha256:" + "a".repeat(64),
       ownerLabels: { "com.donadiosolutions.lcm.test.run": "abc", kind: "machine-a" },
       stagedPackage: "/private/stage",
+      nodeModules: "/private/node_modules",
       homeParent: "/private/home-parent-a",
       caFile: "/private/ca.crt",
       evidenceDirectory: "/private/evidence/a",
@@ -114,6 +136,7 @@ describe("certification harness", () => {
       "--user", "1000:1000", "--hostname", "lcm-cert-a",
       "--add-host", "wrong.example:203.0.113.7",
       "--volume", "/private/stage:/opt/lcm:ro,z",
+      "--volume", "/private/node_modules:/opt/lcm/node_modules:ro,z",
       "--volume", "/private/home-parent-a:/home/lcm-parent:Z",
       "--volume", "/private/ca.crt:/run/lcm-ca/ca.crt:ro,z",
     ]));
@@ -203,6 +226,7 @@ describe("certification harness", () => {
         adminUrl: "postgresql://admin:admin-secret@db.example:25060/lcm_cert_run12345",
         containerAdminUrl: "postgresql://admin:container-secret@lcm-pg-alias:5432/lcm_cert_run12345",
         migratorUrl: "postgresql://migrator:migrator-secret@db.example:25060/lcm_cert_run12345",
+        runtimeUrl: "postgresql://runtime:runtime-secret@db.example:25060/lcm_cert_run12345",
       },
       runRoot: root,
       caFile,
@@ -210,7 +234,7 @@ describe("certification harness", () => {
       containerCli: "podman",
       processRunner,
       publishBackend,
-      secrets: ["admin-secret", "container-secret", "migrator-secret"],
+      secrets: ["admin-secret", "container-secret", "migrator-secret", "runtime-secret"],
       sourceRoot: new URL("../..", import.meta.url).pathname,
       names: { restore: "lcm-pg-restore-aaaaaaaaaaaaaaaaaaaa", runner: "lcm-pg-runner-aaaaaaaaaaaaaaaaaaaa" },
       owner: { pid: 1, birth: "linux:12345678-1234-1234-1234-123456789abc:1", scope: "linux:12345678-1234-1234-1234-123456789abc:abc" },
@@ -220,8 +244,11 @@ describe("certification harness", () => {
     expect(calls.filter((call) => call.command === process.execPath)).toHaveLength(2);
     expect(calls.flatMap((call) => call.args).join("\n")).not.toContain("admin-secret");
     expect(calls.flatMap((call) => call.args).join("\n")).not.toContain("migrator-secret");
-    expect(readFileSync(join(root, "managed-sql.env"), "utf8")).toBe(
-      "LCM_CERT_ADMIN_URL=postgresql://admin:container-secret@lcm-pg-alias:5432/lcm_cert_run12345\n",
+    expect(readFileSync(join(root, "managed-sql.env"), "utf8")).toMatch(
+      /^LCM_CERT_ADMIN_URL=postgresql:\/\/admin:container-secret@lcm-pg-alias:5432\/lcm_cert_run12345\nLCM_CERT_TRANSFER_PASSWORD=[A-Za-z0-9_-]+\n$/u,
+    );
+    expect(readFileSync(join(root, "managed-setup.sql"), "utf8")).toContain(
+      "ALTER DATABASE :\"database_name\" OWNER TO :\"migrator_role\";",
     );
     expect(calls.some((call) => call.args.includes("postgres") && call.args.includes("migrate"))).toBe(true);
     expect(publishBackend).toHaveBeenCalledWith(expect.objectContaining({
@@ -255,7 +282,7 @@ describe("certification harness", () => {
     });
   });
 
-  it("prepares the fresh local database before collecting readiness", async () => {
+  it("prepares the fresh local database before machine setup", async () => {
     const root = mkdtempSync(join(tmpdir(), "lcm-cert-local-prepare-"));
     const evidenceDirectory = join(root, "evidence");
     const harnessDirectory = join(root, "harness");
@@ -288,9 +315,8 @@ describe("certification harness", () => {
       }),
       stagePackage: () => ({ root: join(root, "package"), sha256: "b".repeat(64) }),
       captureExecutionProvenance: () => ({ dirty: false }),
-      prepareDatabase: async () => { order.push("prepare"); },
-      collectReadiness: async () => { order.push("readiness"); throw new Error("stop after readiness"); },
-    })).rejects.toThrow("stop after readiness");
-    expect(order).toEqual(["prepare", "readiness"]);
+      prepareDatabase: async () => { order.push("prepare"); throw new Error("stop after prepare"); },
+    })).rejects.toThrow("stop after prepare");
+    expect(order).toEqual(["prepare"]);
   });
 });

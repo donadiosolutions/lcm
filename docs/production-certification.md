@@ -48,6 +48,14 @@ ready, waits for both warmup-complete witnesses, and then publishes one shared
 steady-state T0. The database-growth baseline is collected after that barrier and
 before the first scheduled steady operation.
 
+Fresh machine homes enter through the supported SQLite migration path. Both
+machines complete public plan/apply/verify before the coordinator grants the
+ordinary runtime profile; they then activate serially against the shared project.
+Only after both activation receipts are recorded does the coordinator revoke the
+transfer profile, prove ordinary runtime schema/ACL readiness, and start daemon A
+then daemon B with the 150-second stagger. These setup steps and receipts must fit
+within the 600-second setup budget and are written to private setup evidence.
+
 ## Prepare the staged package
 
 The harness consumes an already-built `dist/` tree. It never invokes `build` or

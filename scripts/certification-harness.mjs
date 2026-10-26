@@ -1,5 +1,5 @@
 #!/usr/bin/env node
-import { createHash } from "node:crypto";
+import { createHash, randomBytes } from "node:crypto";
 import { execFileSync } from "node:child_process";
 import { cpSync, existsSync, lstatSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, rmSync, writeFileSync } from "node:fs";
 import { lookup } from "node:dns/promises";
@@ -118,6 +118,7 @@ export function buildMachineContainerArgs(input) {
   if (input.environmentFile) args.push("--env-file", input.environmentFile);
   args.push(
     "--volume", `${input.stagedPackage}:/opt/lcm:ro,z`,
+    "--volume", `${input.nodeModules}:/opt/lcm/node_modules:ro,z`,
     "--volume", `${input.homeParent}:/home/lcm-parent:Z`,
     "--volume", `${input.caFile}:/run/lcm-ca/ca.crt:ro,z`,
     ...(input.wrongCaFile ? ["--volume", `${input.wrongCaFile}:/run/lcm-ca/wrong-ca.crt:ro,z`] : []),
@@ -129,9 +130,17 @@ export function buildMachineContainerArgs(input) {
   return args;
 }
 
-function urlAtHost(value, hostname) {
+function urlAtHost(value, hostname, port) {
   const url = new URL(value);
   url.hostname = hostname;
+  if (port !== undefined) url.port = String(port);
+  return url.toString();
+}
+
+function urlWithCredentials(value, username, password) {
+  const url = new URL(value);
+  url.username = username;
+  url.password = password;
   return url.toString();
 }
 
@@ -173,6 +182,19 @@ export async function monitorMachinesForDuration({ machineNames, run, durationMs
     await assertMachinesRunning(machineNames, run);
     return now() >= deadline;
   }, { timeoutMs: durationMs + 2_000, delay, now, signal });
+}
+
+export async function runMachineActivationBarrier(input) {
+  await input.verifyA();
+  await input.verifyB();
+  await input.grantRuntime();
+  await input.activateA();
+  await input.activateB();
+  await input.revokeTransfer();
+  await input.verifyRuntime();
+  await input.startDaemonA();
+  await input.stagger();
+  await input.startDaemonB();
 }
 
 function publishWarmupControl(evidenceDirectory, wallNow = Date.now) {
@@ -287,7 +309,7 @@ export async function runManagedMachinePair(input, dependencies = {}) {
       : monitorMachinesForDuration({ machineNames, run, durationMs, signal: input.signal });
   let clockMonitor;
   try {
-    await (dependencies.prepareDatabase ?? prepareManagedDatabase)({
+    const databasePreparation = await (dependencies.prepareDatabase ?? prepareManagedDatabase)({
       privateConnection: input.privateConnection,
       runRoot,
       caFile,
@@ -329,7 +351,8 @@ export async function runManagedMachinePair(input, dependencies = {}) {
       writeEnvironmentFile(environmentFile, {
         HOME: "/home/lcm-parent/home",
         LCM_CLIENT: "codex",
-        LCM_POSTGRES_URL: input.privateConnection.runtimeUrl,
+        LCM_POSTGRES_URL: databasePreparation.transferUrl,
+        LCM_POSTGRES_RUNTIME_URL: input.privateConnection.runtimeUrl,
         LCM_POSTGRES_CA_FILE: "/run/lcm-ca/ca.crt",
         LCM_POSTGRES_MIGRATION_ROLE: input.privateConnection.migratorName,
         LCM_CERT_MIGRATION_ROLE: input.privateConnection.migratorName,
@@ -346,7 +369,7 @@ export async function runManagedMachinePair(input, dependencies = {}) {
       await run(buildMachineContainerArgs({
         machine, name, hostname: `lcm-cert-${machine}`, network, image: NODE_IMAGE,
         ownerLabels: labels,
-        stagedPackage: stage.root, homeParent, caFile, wrongCaFile, evidenceDirectory: evidence,
+        stagedPackage: stage.root, nodeModules: join(dependencies.sourceRoot ?? repositoryRoot, "node_modules"), homeParent, caFile, wrongCaFile, evidenceDirectory: evidence,
         environmentFile, wrongHost: { host: wrongHostname, address: endpointAddress },
       }));
     }
@@ -469,6 +492,11 @@ export async function runManagedMachinePair(input, dependencies = {}) {
 
 export async function prepareManagedDatabase(input) {
   const { privateConnection, runRoot, caFile, setupNetwork, containerCli, processRunner, secrets, sourceRoot, names, owner, runId } = input;
+  const transferName = privateConnection.transferName ?? `lcm_cert_transfer_${runId.slice(0, 16)}`;
+  const transferPassword = privateConnection.transferPassword ?? randomBytes(24).toString("base64url");
+  const transferUrl = privateConnection.transferUrl
+    ?? urlWithCredentials(privateConnection.migratorUrl, transferName, transferPassword);
+  if (!privateConnection.transferUrl) secrets.push(transferPassword, transferUrl);
   const setupSql = join(runRoot, "managed-setup.sql");
   writeFileSync(setupSql, [
     "\\set ON_ERROR_STOP on",
@@ -476,25 +504,32 @@ export async function prepareManagedDatabase(input) {
     "CREATE EXTENSION IF NOT EXISTS unaccent WITH SCHEMA public;",
     "CREATE EXTENSION IF NOT EXISTS pgcrypto WITH SCHEMA public;",
     "CREATE EXTENSION IF NOT EXISTS pg_stat_statements WITH SCHEMA public;",
+    ...(privateConnection.transferUrl ? [] : [
+      "SELECT pg_catalog.format('CREATE ROLE %I LOGIN PASSWORD %L', :'transfer_role', :'transfer_password') WHERE NOT EXISTS (SELECT 1 FROM pg_catalog.pg_roles WHERE rolname OPERATOR(pg_catalog.=) :'transfer_role') \\gexec",
+    ]),
+    "ALTER DATABASE :\"database_name\" OWNER TO :\"migrator_role\";",
     "GRANT CONNECT, CREATE ON DATABASE :\"database_name\" TO :\"migrator_role\";",
     "GRANT CONNECT ON DATABASE :\"database_name\" TO :\"runtime_role\";",
+    "GRANT CONNECT ON DATABASE :\"database_name\" TO :\"transfer_role\";",
     "",
   ].join("\n"), { mode: 0o600, flag: "wx" });
   const credentialFile = join(runRoot, "managed-sql.env");
   writeEnvironmentFile(credentialFile, {
     LCM_CERT_ADMIN_URL: privateConnection.containerAdminUrl ?? privateConnection.adminUrl,
+    LCM_CERT_TRANSFER_PASSWORD: transferPassword,
   });
   const grantsSource = join(sourceRoot, "src", "storage", "postgresql", "reference");
   const grantsDirectory = join(runRoot, "runtime-grants");
   mkdirSync(grantsDirectory, { mode: 0o700 });
-  for (const name of readdirSync(grantsSource).filter((entry) => /^postgresql-runtime-.*-grants\.sql$/u.test(entry)).sort()) {
+  for (const name of readdirSync(grantsSource).filter((entry) => /^postgresql-(?:runtime-.*|transfer)-grants\.sql$/u.test(entry)).sort()) {
     cpSync(join(grantsSource, name), join(grantsDirectory, name), { errorOnExist: true });
   }
   const psqlScript = [
     "export PGSSLMODE=verify-full",
     "export PGSSLROOTCERT=/run/lcm-ca/ca.crt",
-    "psql \"$LCM_CERT_ADMIN_URL\" --set=ON_ERROR_STOP=1 --set=database_name=\"$LCM_CERT_DATABASE\" --set=migrator_role=\"$LCM_CERT_MIGRATOR\" --set=runtime_role=\"$LCM_CERT_RUNTIME\" --file=/run/lcm-cert/setup.sql",
-    "for grant in /run/lcm-grants/postgresql-runtime-*-grants.sql; do psql \"$LCM_CERT_ADMIN_URL\" --set=ON_ERROR_STOP=1 --set=lcm_runtime_role=\"$LCM_CERT_RUNTIME\" --file=\"$grant\"; done",
+    "psql \"$LCM_CERT_ADMIN_URL\" --set=ON_ERROR_STOP=1 --set=database_name=\"$LCM_CERT_DATABASE\" --set=migrator_role=\"$LCM_CERT_MIGRATOR\" --set=runtime_role=\"$LCM_CERT_RUNTIME\" --set=transfer_role=\"$LCM_CERT_TRANSFER\" --set=transfer_password=\"$LCM_CERT_TRANSFER_PASSWORD\" --file=/run/lcm-cert/setup.sql",
+    "for grant in /run/lcm-grants/postgresql-runtime-*-grants.sql; do psql \"$LCM_CERT_ADMIN_URL\" --set=ON_ERROR_STOP=1 --set=lcm_runtime_role=\"$LCM_CERT_TRANSFER\" --file=\"$grant\"; done",
+    "psql \"$LCM_CERT_ADMIN_URL\" --set=ON_ERROR_STOP=1 --set=lcm_runtime_role=\"$LCM_CERT_TRANSFER\" --file=/run/lcm-grants/postgresql-transfer-grants.sql",
   ].join("\n");
   const basePsqlArgs = [
     ...(setupNetwork ? ["--network", setupNetwork] : []),
@@ -502,6 +537,7 @@ export async function prepareManagedDatabase(input) {
     "--env", `LCM_CERT_DATABASE=${privateConnection.databaseName}`,
     "--env", `LCM_CERT_MIGRATOR=${privateConnection.migratorName}`,
     "--env", `LCM_CERT_RUNTIME=${privateConnection.runtimeName}`,
+    "--env", `LCM_CERT_TRANSFER=${transferName}`,
     "--volume", `${caFile}:/run/lcm-ca/ca.crt:ro,z`,
     "--volume", `${setupSql}:/run/lcm-cert/setup.sql:ro,Z`,
     "--volume", `${grantsDirectory}:/run/lcm-grants:ro,Z`,
@@ -546,6 +582,75 @@ export async function prepareManagedDatabase(input) {
   });
   await runLcmStep("migration", ["postgres", "migrate", "--json"]);
   await runPsql(names.runner, "runner", psqlScript);
+  return { transferName, transferUrl };
+}
+
+export async function verifyRuntimeSchemaReadiness({ sourceRoot, url, caFile, expectedOwner }) {
+  const [{ PostgreSqlRuntime }, { verifyPostgreSqlRuntimeSchema }] = await Promise.all([
+    import(pathToFileURL(join(sourceRoot, "dist", "src", "storage", "postgresql", "runtime.js")).href),
+    import(pathToFileURL(join(sourceRoot, "dist", "src", "storage", "postgresql", "runtime-readiness.js")).href),
+  ]);
+  const runtime = new PostgreSqlRuntime({
+    url,
+    caFile,
+    poolMax: 2,
+    connectionTimeoutMs: 10_000,
+    idleTimeoutMs: 30_000,
+    statementTimeoutMs: 60_000,
+    snapshotIdleTimeoutMs: 300_000,
+  });
+  try {
+    return await verifyPostgreSqlRuntimeSchema(runtime, { expectedOwner });
+  } catch (error) {
+    throw new Error(`certification runtime schema readiness failed: ${error?.reason ?? error?.message ?? error}`, { cause: error });
+  } finally {
+    await runtime.close().catch(() => undefined);
+  }
+}
+
+export async function revokeTransferProfile({ adminUrl, caFile, role }) {
+  if (!/^[a-z][a-z0-9_]{0,62}$/u.test(role)) throw new Error("invalid certification transfer role");
+  const loaded = await import("pg");
+  const Client = loaded.Client ?? loaded.default?.Client;
+  const client = new Client({
+    connectionString: adminUrl,
+    ssl: { ca: readFileSync(caFile, "utf8"), rejectUnauthorized: true },
+    connectionTimeoutMillis: 30_000,
+    statement_timeout: 30_000,
+  });
+  await client.connect();
+  try {
+    await client.query(`DROP OWNED BY "${role}"`);
+  } finally {
+    await client.end().catch(() => undefined);
+  }
+  return { role, revoked: true, at: new Date().toISOString() };
+}
+
+export async function grantRuntimeProfile({ adminUrl, caFile, role, databaseName, sourceRoot }) {
+  if (!/^[a-z][a-z0-9_]{0,62}$/u.test(role)) throw new Error("invalid certification runtime role");
+  const loaded = await import("pg");
+  const Client = loaded.Client ?? loaded.default?.Client;
+  const client = new Client({
+    connectionString: adminUrl,
+    ssl: { ca: readFileSync(caFile, "utf8"), rejectUnauthorized: true },
+    connectionTimeoutMillis: 30_000,
+    statement_timeout: 30_000,
+  });
+  await client.connect();
+  try {
+    await client.query(`GRANT CONNECT ON DATABASE "${databaseName}" TO "${role}"`);
+    const directory = join(sourceRoot, "src", "storage", "postgresql", "reference");
+    for (const name of readdirSync(directory).filter((entry) => /^postgresql-runtime-.*-grants\.sql$/u.test(entry)).sort()) {
+      const sql = readFileSync(join(directory, name), "utf8")
+        .split("\n").filter((line) => !line.startsWith("\\")).join("\n")
+        .replaceAll(':"lcm_runtime_role"', `"${role}"`);
+      await client.query(sql);
+    }
+  } finally {
+    await client.end().catch(() => undefined);
+  }
+  return { role, granted: true, at: new Date().toISOString() };
 }
 
 export async function collectDatabaseReadiness({ url, ca, expectedVersionNum, expectedMajor = 18, expectedDatabase, expectedPort, expectedRole, expectedMigrationCount, requireResidualEmpty = true, clientFactory }) {
@@ -621,7 +726,7 @@ export async function collectDatabaseRelationBytes({ url, ca }) {
   client.on("error", () => undefined);
   try {
     await client.connect();
-    const row = (await client.query(`SELECT pg_catalog.coalesce(pg_catalog.sum(pg_catalog.pg_total_relation_size(class.oid)), 0)::text AS bytes
+    const row = (await client.query(`SELECT COALESCE(pg_catalog.sum(pg_catalog.pg_total_relation_size(class.oid)), 0)::text AS bytes
       FROM pg_catalog.pg_class AS class JOIN pg_catalog.pg_namespace AS namespace ON namespace.oid = class.relnamespace
       WHERE namespace.nspname = 'lcm'`)).rows[0];
     const bytes = Number(row?.bytes);
@@ -649,7 +754,7 @@ export async function startClockMonitor({ machineNames, run, url, ca, evidenceDi
         await client.connect();
         server = (await client.query("SELECT pg_catalog.clock_timestamp()::text AS now")).rows[0];
         connections = (await client.query(`SELECT usename::text AS role_name,
-          pg_catalog.coalesce(client_addr::text, 'local') AS client_address,
+          COALESCE(client_addr::text, 'local') AS client_address,
           pg_catalog.count(*)::integer AS connections
           FROM pg_catalog.pg_stat_activity
           WHERE datname OPERATOR(pg_catalog.=) pg_catalog.current_database()
@@ -827,7 +932,7 @@ export async function runLocalCertification(options, dependencies = {}) {
       const created = [];
       let clockMonitor;
       try {
-        await (dependencies.prepareDatabase ?? prepareManagedDatabase)({
+        const databasePreparation = await (dependencies.prepareDatabase ?? prepareManagedDatabase)({
           privateConnection: {
             databaseName: context.names.controlDatabase,
             migratorName: "lcm_test_migrator",
@@ -848,17 +953,7 @@ export async function runLocalCertification(options, dependencies = {}) {
           owner: context.owner,
           runId: context.runId,
         });
-        const databaseReadiness = await (dependencies.collectReadiness ?? collectDatabaseReadiness)({
-          url: context.environment.LCM_TEST_POSTGRES_RUNTIME_URL,
-          ca: readFileSync(context.environment.LCM_TEST_POSTGRES_CA_FILE, "utf8"),
-          expectedVersionNum: 180004,
-          expectedDatabase: context.names.controlDatabase,
-          expectedPort: 5432,
-          expectedRole: "lcm_test_runtime",
-          expectedMigrationCount: readdirSync(join(dependencies.sourceRoot ?? repositoryRoot, "src", "storage", "postgresql", "migrations")).filter((name) => name.endsWith(".sql")).length,
-        });
-        mkdirSync(options.evidenceDirectory, { recursive: true, mode: 0o700 });
-        writeFileSync(join(options.evidenceDirectory, "database-readiness.json"), `${JSON.stringify(databaseReadiness, null, 2)}\n`, { mode: 0o600, flag: "wx" });
+        let databaseReadiness;
         for (const machine of ['a', 'b']) {
           const homeParent = join(context.directory, `machine-${machine}-home-parent`);
           const home = join(homeParent, "home");
@@ -869,7 +964,8 @@ export async function runLocalCertification(options, dependencies = {}) {
           writeEnvironmentFile(environmentFile, {
             HOME: "/home/lcm-parent/home",
             LCM_CLIENT: "codex",
-            LCM_POSTGRES_URL: context.inNetworkEnvironment.LCM_TEST_POSTGRES_RUNTIME_URL,
+            LCM_POSTGRES_URL: urlAtHost(databasePreparation.transferUrl, context.names.alias, 5432),
+            LCM_POSTGRES_RUNTIME_URL: context.inNetworkEnvironment.LCM_TEST_POSTGRES_RUNTIME_URL,
             LCM_POSTGRES_CA_FILE: "/run/lcm-ca/ca.crt",
             LCM_POSTGRES_MIGRATION_ROLE: "lcm_test_migrator",
             LCM_CERT_MIGRATION_ROLE: "lcm_test_migrator",
@@ -885,7 +981,7 @@ export async function runLocalCertification(options, dependencies = {}) {
           await context.processRunner(context.containerCli, buildMachineContainerArgs({
             machine, name, hostname: `lcm-cert-${machine}`, network: context.names.network,
             image: NODE_IMAGE, ownerLabels: ownershipLabels(context.runId, kind, context.owner),
-            stagedPackage: stage.root, homeParent, caFile: context.environment.LCM_TEST_POSTGRES_CA_FILE,
+            stagedPackage: stage.root, nodeModules: join(dependencies.sourceRoot ?? repositoryRoot, "node_modules"), homeParent, caFile: context.environment.LCM_TEST_POSTGRES_CA_FILE,
             wrongCaFile: context.environment.LCM_TEST_POSTGRES_WRONG_CA_FILE,
             evidenceDirectory: evidence, environmentFile,
           }), { redactSecrets: context.secrets });
@@ -901,11 +997,95 @@ export async function runLocalCertification(options, dependencies = {}) {
           : dependencies.delay
             ? dependencies.delay(durationMs)
             : monitorMachinesForDuration({ machineNames, run: runContainer, durationMs });
-        await context.processRunner(context.containerCli, ["container", "start", context.names.machineA], { redactSecrets: context.secrets });
-        await waitForFiles([join(options.evidenceDirectory, "machine-a", "ready.json")], [context.names.machineA], contract.timeline.full.setupMaxSeconds * 1000);
-        await monitorDelay([context.names.machineA], contract.timeline.full.secondDaemonStartOffsetSeconds * 1000);
-        await context.processRunner(context.containerCli, ["container", "start", context.names.machineB], { redactSecrets: context.secrets });
-        await waitForFiles([join(options.evidenceDirectory, "machine-b", "ready.json")], [context.names.machineA, context.names.machineB], contract.timeline.full.setupMaxSeconds * 1000);
+        const setupStartedAt = Date.now();
+        const activationReceipts = {};
+        let revocation;
+        let runtimeGrant;
+        await runMachineActivationBarrier({
+          verifyA: async () => {
+            await runContainer(["container", "start", context.names.machineA]);
+            writeFileSync(join(options.evidenceDirectory, "machine-a", "migration-start.json"), `${JSON.stringify({ at: new Date().toISOString() })}\n`, { mode: 0o600, flag: "wx" });
+            await waitForFiles([join(options.evidenceDirectory, "machine-a", "verification-receipt.json")], [context.names.machineA], contract.timeline.full.setupMaxSeconds * 1000);
+          },
+          verifyB: async () => {
+            await runContainer(["container", "start", context.names.machineB]);
+            writeFileSync(join(options.evidenceDirectory, "machine-b", "migration-start.json"), `${JSON.stringify({ at: new Date().toISOString() })}\n`, { mode: 0o600, flag: "wx" });
+            await waitForFiles([join(options.evidenceDirectory, "machine-b", "verification-receipt.json")], [context.names.machineA, context.names.machineB], contract.timeline.full.setupMaxSeconds * 1000);
+          },
+          grantRuntime: async () => {
+            runtimeGrant = await (dependencies.grantRuntime ?? grantRuntimeProfile)({
+              adminUrl: context.environment.LCM_TEST_POSTGRES_ADMIN_URL,
+              caFile: context.environment.LCM_TEST_POSTGRES_CA_FILE,
+              role: "lcm_test_runtime",
+              databaseName: context.names.controlDatabase,
+              sourceRoot: dependencies.sourceRoot ?? repositoryRoot,
+            });
+          },
+          activateA: async () => {
+            writeFileSync(join(options.evidenceDirectory, "machine-a", "activation-start.json"), `${JSON.stringify({ at: new Date().toISOString() })}\n`, { mode: 0o600, flag: "wx" });
+            const path = join(options.evidenceDirectory, "machine-a", "activation-receipt.json");
+            await waitForFiles([path], [context.names.machineA], contract.timeline.full.setupMaxSeconds * 1000);
+            activationReceipts.a = jsonFromFile(path);
+          },
+          activateB: async () => {
+            writeFileSync(join(options.evidenceDirectory, "machine-b", "activation-start.json"), `${JSON.stringify({ at: new Date().toISOString() })}\n`, { mode: 0o600, flag: "wx" });
+            const path = join(options.evidenceDirectory, "machine-b", "activation-receipt.json");
+            await waitForFiles([path], [context.names.machineA, context.names.machineB], contract.timeline.full.setupMaxSeconds * 1000);
+            activationReceipts.b = jsonFromFile(path);
+          },
+          revokeTransfer: async () => {
+            revocation = await (dependencies.revokeTransfer ?? revokeTransferProfile)({
+              adminUrl: context.environment.LCM_TEST_POSTGRES_ADMIN_URL,
+              caFile: context.environment.LCM_TEST_POSTGRES_CA_FILE,
+              role: databasePreparation.transferName,
+            });
+          },
+          verifyRuntime: async () => {
+            await (dependencies.verifyRuntime ?? verifyRuntimeSchemaReadiness)({
+              sourceRoot: dependencies.sourceRoot ?? repositoryRoot,
+              url: context.environment.LCM_TEST_POSTGRES_RUNTIME_URL,
+              caFile: context.environment.LCM_TEST_POSTGRES_CA_FILE,
+              expectedOwner: "lcm_test_migrator",
+            });
+            databaseReadiness = await (dependencies.collectReadiness ?? collectDatabaseReadiness)({
+              url: context.environment.LCM_TEST_POSTGRES_RUNTIME_URL,
+              ca: readFileSync(context.environment.LCM_TEST_POSTGRES_CA_FILE, "utf8"),
+              expectedVersionNum: 180004,
+              expectedDatabase: context.names.controlDatabase,
+              expectedPort: 5432,
+              expectedRole: "lcm_test_runtime",
+              expectedMigrationCount: readdirSync(join(dependencies.sourceRoot ?? repositoryRoot, "src", "storage", "postgresql", "migrations")).filter((name) => name.endsWith(".sql")).length,
+              requireResidualEmpty: false,
+            });
+          },
+          startDaemonA: async () => {
+            writeFileSync(join(options.evidenceDirectory, "machine-a", "runtime-ready.json"), `${JSON.stringify({ at: new Date().toISOString() })}\n`, { mode: 0o600, flag: "wx" });
+            await waitForFiles([join(options.evidenceDirectory, "machine-a", "daemon-started.json")], [context.names.machineA, context.names.machineB], contract.timeline.full.setupMaxSeconds * 1000);
+          },
+          stagger: () => monitorDelay([context.names.machineA, context.names.machineB], contract.timeline.full.secondDaemonStartOffsetSeconds * 1000),
+          startDaemonB: async () => {
+            writeFileSync(join(options.evidenceDirectory, "machine-b", "runtime-ready.json"), `${JSON.stringify({ at: new Date().toISOString() })}\n`, { mode: 0o600, flag: "wx" });
+            await waitForFiles([join(options.evidenceDirectory, "machine-b", "daemon-started.json")], [context.names.machineA, context.names.machineB], contract.timeline.full.setupMaxSeconds * 1000);
+          },
+        });
+        if (Date.now() - setupStartedAt > contract.timeline.full.setupMaxSeconds * 1000) {
+          throw new Error("certification setup exceeded setupMaxSeconds");
+        }
+        writeFileSync(join(options.evidenceDirectory, "setup-evidence.json"), `${JSON.stringify({
+          startedAt: new Date(setupStartedAt).toISOString(),
+          completedAt: new Date().toISOString(),
+          activationReceipts,
+          revocation,
+          runtimeGrant,
+          runtimeReadiness: "pass",
+          daemonStartOrder: ["a", "b"],
+        }, null, 2)}\n`, { mode: 0o600, flag: "wx" });
+        writeFileSync(join(options.evidenceDirectory, "database-readiness.json"), `${JSON.stringify(databaseReadiness, null, 2)}\n`, { mode: 0o600, flag: "wx" });
+        await waitForFiles(
+          ['a', 'b'].map((machine) => join(options.evidenceDirectory, `machine-${machine}`, "ready.json")),
+          [context.names.machineA, context.names.machineB],
+          contract.timeline.full.setupMaxSeconds * 1000,
+        );
         const identities = verifyDistinctMachineIdentities({ a: machineRoots.a.home, b: machineRoots.b.home });
         writeFileSync(join(options.evidenceDirectory, "machine-identities.json"), `${JSON.stringify(identities, null, 2)}\n`, { mode: 0o600, flag: "wx" });
         clockMonitor = await (dependencies.startClockMonitor ?? startClockMonitor)({
