@@ -4060,6 +4060,23 @@ describe("sanitizeError", () => {
         "file://h?x=['https://outer.test/x?next=file:///Users/a/My Files/private.db'|relative/path]",
         "file://h?x=['https://outer.test/x?next=file://<path>'|relative/path]",
       ],
+      ...(["'", '"'] as const).flatMap((quote) =>
+        (["&", "|"] as const).map((delimiter) => [
+          `${quote} inherited file quote, ${delimiter}, named Windows successor`,
+          `file://h?x=[${quote}https://outer.test/x?next=file:///Users/a/My Files/private.db${quote}${delimiter}name=\\Users\\SECRET\\x]`,
+          `file://h?x=[${quote}https://outer.test/x?next=file://<path>${quote}${delimiter}name=<path>]`,
+        ] as const),
+      ),
+      [
+        "inherited file quote chained rooted successors",
+        "file://h?x=['https://outer.test/x?next=file:///Users/a/My Files/private.db'|\\Users\\SECRET\\x&\\Users\\CANARY\\y]",
+        "file://h?x=['https://outer.test/x?next=file://<path>'|<path>&<path>]",
+      ],
+      [
+        "inherited file quote later private-root relative",
+        "file://h?x=['https://outer.test/x?next=file:///Users/a/My Files/private.db'|\\Users\\SECRET\\x&later/Users/CANARY/y]",
+        "file://h?x=['https://outer.test/x?next=file://<path>'|<path>&later<path>]",
+      ],
     );
 
     it.each(inheritedFileRootCases)("%s", (_name, input, expected) => {

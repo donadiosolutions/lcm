@@ -233,6 +233,10 @@ function findUrlPathStarts(chars: readonly string[]): UrlPathStarts {
       inheritedFileQuoteParentOwnerBracketDepth > 0 &&
       (chars[index + 1] === "&" || chars[index + 1] === "|")
     ) {
+      pathlessFileQueryOwnerBracketDepth = inheritedFileQuoteParentOwnerBracketDepth;
+      nestedFileUrlParentOwnerBracketDepths.add(inheritedFileQuoteParentOwnerBracketDepth);
+      restartedNestedFileUrlParentOwnerBracketDepths.delete(inheritedFileQuoteParentOwnerBracketDepth);
+      repeatedPipeHandoffWrapperDepths.add(inheritedFileQuoteParentOwnerBracketDepth);
       const successorStart = index + 2;
       const privateRootPathStart = returnedParentPrivateRootPathStart(successorStart);
       if (

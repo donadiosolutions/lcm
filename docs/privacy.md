@@ -708,11 +708,13 @@ bundle and keep provider, credential, quarantine, and recovery sessions private.
   inherit that enclosing quote through its matching close. This removes a
   space-bearing private path and any suffix inside the quote on the first pass,
   while preserving text after the close. An immediately quoted child keeps its
-  own quote. Inside a bracketed file query, the matching close also retains the
-  enclosing handoff across whitespace: an immediate `&` or `|` rooted successor,
-  or a private-root relative successor, redacts on the same pass. Unquoted URLs,
-  embedded URLs whose scheme did not begin at the quote, unmatched quotes, and
-  newlines retain their existing boundaries.
+  own quote. Inside a bracketed file query, the matching close restores the
+  enclosing owner across whitespace until that wrapper's real close. Immediate
+  and later `&` or `|` rooted successors, named Windows successors, and
+  recognized private-root relatives redact on the same pass; ordinary relative
+  and public-URL successors remain readable. Unquoted URLs, embedded URLs whose
+  scheme did not begin at the quote, unmatched quotes, and newlines retain their
+  existing boundaries.
 
   Root-relative Windows values after opaque wrapper text remain conservatively
   redacted. LCM does not expose such private-looking values merely because URL
