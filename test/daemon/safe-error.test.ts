@@ -4121,6 +4121,11 @@ describe("sanitizeError", () => {
         "file://h?x=[file://<path>]|[later<path>]",
       ],
       [
+        "path-bearing sibling delimited private-root relative",
+        "file://h?x=[file:///Users/b/two]|[value|later/Users/SECRET/y]",
+        "file://h?x=[file://<path>]|[value|later<path>]",
+      ],
+      [
         "sibling query-only file children",
         "file://h?x=[file://a?key=/pub&\\Users\\S1\\x]&[file://b?key2=/pub2|\\Users\\S2\\y]",
         "file://h?x=[file://a?key=<path>&<path>]&[file://b?key2=<path>|<path>]",
