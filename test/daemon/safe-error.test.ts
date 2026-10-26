@@ -4085,6 +4085,26 @@ describe("sanitizeError", () => {
         "file://h?x=[file://alpha?token=<path>&<path>]&[file://beta?token=<path>|<path>]",
       ],
       [
+        "pipe-separated file sibling",
+        "file://h?x=[file://a?key=/pub&\\Users\\S1\\x]|[file://b?key2=/pub2|\\Users\\S2\\y]",
+        "file://h?x=[file://a?key=<path>&<path>]|[file://b?key2=<path>|<path>]",
+      ],
+      [
+        "comma-separated file sibling",
+        "file://h?x=[file://a?key=/pub&\\Users\\S1\\x],[file://b?key2=/pub2|\\Users\\S2\\y]",
+        "file://h?x=[file://a?key=<path>&<path>],[file://b?key2=<path>|<path>]",
+      ],
+      [
+        "semicolon-separated file sibling",
+        "file://h?x=[file://a?key=/pub&\\Users\\S1\\x];[file://b?key2=/pub2|\\Users\\S2\\y]",
+        "file://h?x=[file://a?key=<path>&<path>];[file://b?key2=<path>|<path>]",
+      ],
+      [
+        "pipe-separated literal sibling",
+        "file://h?x=[file://a?key=/pub]|[value|\\Users\\S2\\y]",
+        "file://h?x=[file://a?key=<path>]|[value|<path>]",
+      ],
+      [
         "nested child closes before its Windows tail",
         "file://h?x=[[https://e.test/t|file://host?key=/public]\\Users\\SECRET\\x]",
         "file://h?x=[[https://e.test/t|file://host?key=<path>]<path>]",

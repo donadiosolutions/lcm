@@ -245,8 +245,13 @@ function findUrlPathStarts(chars: readonly string[]): UrlPathStarts {
       pathlessFileQueryOwnerBracketDepth > 0 && char === "]"
         ? pathlessFileQueryOwnerBracketDepth
         : 0;
+    const siblingWrapperDelimiter = chars[index + 1];
     const continuesWithSiblingWrapper =
-      char === "]" && chars[index + 1] === "&" && chars[index + 2] === "[";
+      char === "]" &&
+      siblingWrapperDelimiter !== undefined &&
+      "&|,;".includes(siblingWrapperDelimiter) &&
+      chars[index + 2] === "[";
+    const entersSiblingWrapper = "&|,;".includes(char) && chars[index + 1] === "[";
     if (pathlessFileQueryOwnerBracketDepth > 0 && char === "[") {
       pathlessFileQueryOwnerBracketDepth += 1;
     } else if (pathlessFileQueryOwnerBracketDepth > 0 && char === "]") {
@@ -693,7 +698,8 @@ function findUrlPathStarts(chars: readonly string[]): UrlPathStarts {
       restartedPathlessFile &&
       URL_END_DELIMITERS.has(char) &&
       !FILE_URL_AUTHORITY_DELIMITERS.has(char) &&
-      !continuesWithSiblingWrapper
+      !continuesWithSiblingWrapper &&
+      !entersSiblingWrapper
     ) {
       restartedPathlessFile = false;
       quotedQueryTail = false;
