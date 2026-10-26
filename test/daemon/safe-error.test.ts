@@ -3813,6 +3813,60 @@ describe("sanitizeError", () => {
     expect(sanitizeError(sanitizeError(first))).toBe(first);
   });
 
+  describe("Bug #1349", () => {
+    it.each([
+      [
+        "returns from a path-bearing child on pipe",
+        "file://h?x=[file:///Users/CHILD/x|later/Users/alice/secret.db]",
+        "file://h?x=[file://<path>|later<path>]",
+        "file://h?x=[file://<path>|later<path>]",
+      ],
+      [
+        "pins the intermediate Bug #1336 ordinary relative pipe sequence",
+        "file://h?x=[file:///Users/CHILD/x|relative/path]",
+        "file://h?x=[file://<path>|relative/path]",
+        "file://h?x=[file://<path>|relative<path>]",
+      ],
+      [
+        "keeps the ampersand return",
+        "file://h?x=[file:///Users/CHILD/x&later/Users/alice/secret.db]",
+        "file://h?x=[file://<path>&later<path>]",
+        "file://h?x=[file://<path>&later<path>]",
+      ],
+      [
+        "keeps a query-only child scoped",
+        "file://h?x=[https://e.test/t&file://host?key=/public|later/Users/secret]",
+        "file://h?x=[https://e.test/t&file://host?key=<path>|later/Users/secret]",
+        "file://h?x=[https://e.test/t&file://host?key=<path>|later/Users/secret]",
+      ],
+      [
+        "keeps a POSIX root redacted",
+        "file://h?x=[file:///Users/CHILD/x|/Users/alice/secret.db]",
+        "file://h?x=[file://<path>|<path>]",
+        "file://h?x=[file://<path>|<path>]",
+      ],
+      [
+        "keeps a Windows root redacted",
+        "file://h?x=[file:///Users/CHILD/x|\\Users\\alice\\secret.db]",
+        "file://h?x=[file://<path>|<path>]",
+        "file://h?x=[file://<path>|<path>]",
+      ],
+      [
+        "keeps a drive root redacted",
+        "file://h?x=[file:///Users/CHILD/x|C:\\Users\\alice\\secret.db]",
+        "file://h?x=[file://<path>|<path>]",
+        "file://h?x=[file://<path>|<path>]",
+      ],
+    ] as const)("%s", (_name, input, firstExpected, stableExpected) => {
+      const first = sanitizeError(input);
+      const second = sanitizeError(first);
+
+      expect(first).toBe(firstExpected);
+      expect(second).toBe(stableExpected);
+      expect(sanitizeError(second)).toBe(second);
+    });
+  });
+
   it("preserves deferred Bug #1332 contextual over-redaction after the pipe-handoff fix", () => {
     const input = "file://h?x=[value|later=\\Users\\bob\\secret.db]";
     const expected = "file://h?x=[value|later=<path>]";

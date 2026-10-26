@@ -382,7 +382,7 @@ function findUrlPathStarts(chars: readonly string[]): UrlPathStarts {
       activeNestedFileUrlParentOwnerBracketDepth > 0 &&
       exactFileScheme &&
       foundFilePath &&
-      char === "&"
+      (char === "&" || char === "|")
     ) {
       const wordBearingPrivatePathStart = queryOrFragment
         ? wordBearingPrivateRootPathStart(chars, index + 1)
