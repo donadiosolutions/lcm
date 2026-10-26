@@ -4157,6 +4157,64 @@ describe("sanitizeError", () => {
     });
   });
 
+  describe("Bug #917", () => {
+    const matrix: Array<readonly [string, string, string]> = (["'", '"'] as const).flatMap(
+      (quote) =>
+        (["?", "#", "&"] as const).flatMap((delimiter) =>
+          (["", "?keep=1", "#frag", "&other=1"] as const).map((suffix) => [
+            `${quote} outer quote, ${delimiter} delimiter, ${suffix || "no suffix"}`,
+            `${quote}https://outer.test/x${delimiter}next=file://host.invalid/Users/canary/My Files/private.db${suffix}${quote} trailing text`,
+            `${quote}https://outer.test/x${delimiter}next=file://host.invalid<path>${quote} trailing text`,
+          ] as const),
+        ),
+    );
+    matrix.push(
+      [
+        "unquoted residual",
+        "https://outer.test/x?next=file://host.invalid/Users/canary/My Files/private.db",
+        "https://outer.test/x?next=file://host.invalid<path> Files/private.db",
+      ],
+      [
+        "quote does not open an embedded URL",
+        "error 'see https://outer.test/x?next=file://host.invalid/Users/canary/My Files/private.db' end",
+        "error 'see https://outer.test/x?next=file://host.invalid<path> Files/private.db' end",
+      ],
+      [
+        "immediately quoted nested file child",
+        "https://outer.test/x?next='file://host.invalid/Users/canary/My Files/private.db'",
+        "https://outer.test/x?next='file://host.invalid<path>'",
+      ],
+      [
+        "unmatched outer quote residual",
+        "'https://outer.test/x?next=file://host.invalid/Users/canary/My Files/private.db",
+        "'https://outer.test/x?next=file://host.invalid<path> Files/private.db",
+      ],
+      [
+        "newline terminates inherited quoting",
+        "'https://outer.test/x?next=file://host.invalid/Users/canary/My\nFiles/private.db'",
+        "'https://outer.test/x?next=file://host.invalid<path>\nFiles/private.db'",
+      ],
+      [
+        "outer-quoted public URL without file child",
+        "'https://outer.test/x?next=https://public.test/path'",
+        "'https://outer.test/x?next=https://public.test/path'",
+      ],
+      [
+        "outer-quoted file URL control",
+        "'file://host.invalid/Users/canary/My Files/private.db'",
+        "'file://host.invalid<path>'",
+      ],
+    );
+
+    it.each(matrix)("%s", (_name, input, expected) => {
+      const first = sanitizeError(input);
+
+      expect(first).toBe(expected);
+      expect(sanitizeError(first)).toBe(first);
+      expect(sanitizeError(sanitizeError(first))).toBe(first);
+    });
+  });
+
   it("preserves deferred Bug #1332 contextual over-redaction after the pipe-handoff fix", () => {
     const input = "file://h?x=[value|later=\\Users\\bob\\secret.db]";
     const expected = "file://h?x=[value|later=<path>]";

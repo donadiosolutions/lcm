@@ -152,6 +152,13 @@ function findUrlPathStarts(chars: readonly string[]): UrlPathStarts {
     }
     return -1;
   };
+  const hasMatchingQuoteBeforeLineEnd = (start: number, quote: string): boolean => {
+    for (let cursor = start; cursor < chars.length; cursor += 1) {
+      if (chars[cursor] === "\n" || chars[cursor] === "\r") return false;
+      if (chars[cursor] === quote) return true;
+    }
+    return false;
+  };
   let restartedPathlessFile = false;
   let quotedPathEnded = false;
   let quotedQueryTail = false;
@@ -395,6 +402,14 @@ function findUrlPathStarts(chars: readonly string[]): UrlPathStarts {
         ? index + 1
         : -1;
     if ((separator >= 0 || restartedPathlessFile) && nestedFileSchemeStart >= 0) {
+      const directNestedFileQuote = quoteCode(chars[nestedFileSchemeStart - 1]);
+      const enclosingQuote = quoteFromCode(schemeQuote);
+      const inheritedNestedFileQuote =
+        directNestedFileQuote === 0 &&
+        enclosingQuote !== undefined &&
+        hasMatchingQuoteBeforeLineEnd(nestedFileSchemeStart, enclosingQuote)
+          ? schemeQuote
+          : 0;
       activeNestedFileUrlParentOwnerBracketDepth = pathlessFileQueryOwnerBracketDepth;
       if (activeNestedFileUrlParentOwnerBracketDepth > 0) {
         nestedFileUrlParentOwnerBracketDepths.add(activeNestedFileUrlParentOwnerBracketDepth);
@@ -417,7 +432,7 @@ function findUrlPathStarts(chars: readonly string[]): UrlPathStarts {
       quotedQueryPublicUrlOwnQueryOrFragment = false;
       schemeLength = 0;
       fileSchemeLength = 0;
-      schemeQuote = quoteCode(chars[nestedFileSchemeStart - 1]);
+      schemeQuote = directNestedFileQuote || inheritedNestedFileQuote;
       authority[nestedFileSchemeStart + 5] = 1;
       authority[nestedFileSchemeStart + 6] = 1;
       continue;
