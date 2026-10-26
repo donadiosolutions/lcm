@@ -640,6 +640,18 @@ function findUrlPathStarts(chars: readonly string[]): UrlPathStarts {
         (char === '"' || isFileUrlLiteral(chars, index + 1))
       );
     const closesQuotedFilePath = foundFilePath && schemeQuote !== 0 && quoteCode(char) === schemeQuote;
+    const quotedPublicRootStart =
+      pathlessFileQueryOwnerBracketDepth > 0 &&
+      pathlessFileQueryBracketDepth > 0 &&
+      !exactFileScheme &&
+      schemeQuote !== 0 &&
+      quoteCode(char) === schemeQuote &&
+      (chars[index + 1] === "|" || chars[index + 1] === "&") &&
+      (chars[index + 2] === "/" ||
+        chars[index + 2] === "\\" ||
+        isWindowsDrivePathStart(chars, index + 2))
+        ? index + 2
+        : -1;
     if (separator >= 0 && brackets > 0 && closesQuotedFilePath && URL_END_DELIMITERS.has(char)) {
       // The quoted path ended. Keep URL and wrapper state so an adjacent
       // separator after the wrapper still restarts a file path, but stop
@@ -657,6 +669,7 @@ function findUrlPathStarts(chars: readonly string[]): UrlPathStarts {
       URL_END_DELIMITERS.has(char) &&
       !fileAuthorityDelimiter
     ) {
+      if (quotedPublicRootStart >= 0) forcedPath[quotedPublicRootStart] = 1;
       // A closed quoted file path can hand off a root-relative Windows tail,
       // even when the preceding path contains only root separators.
       if (closesQuotedFilePath && chars[index + 1] === "\\") file[index + 1] = 1;

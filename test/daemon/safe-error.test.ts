@@ -3929,6 +3929,92 @@ describe("sanitizeError", () => {
     });
   });
 
+  describe("Bug #1344", () => {
+    it.each([
+      [
+        "single-quoted pipe handoff",
+        "file://h?x=['https://e.test/t'|\\Users\\SECRET\\x]",
+        "file://h?x=['https://e.test/t'|<path>]",
+      ],
+      [
+        "single-quoted ampersand handoff",
+        "file://h?x=['https://e.test/t'&\\Users\\SECRET\\x]",
+        "file://h?x=['https://e.test/t'&<path>]",
+      ],
+      [
+        "double-quoted pipe handoff",
+        'file://h?x=["https://e.test/t"|\\Users\\SECRET\\x]',
+        'file://h?x=["https://e.test/t"|<path>]',
+      ],
+      [
+        "P3 own-query preservation",
+        "file://h?x=['https://e.test/t?next=/public'|\\Users\\SECRET\\x]",
+        "file://h?x=['https://e.test/t?next=/public'|<path>]",
+      ],
+      [
+        "quoted nested-file control",
+        'file://h?x=["file://host?key=/public"|\\Users\\SECRET\\x]',
+        'file://h?x=["file://host?key=<path>"|<path>]',
+      ],
+      [
+        "Bug #1374 single-quoted named root",
+        "file://h?x=['https://e.test/t'name=\\Users\\SECRET\\x]",
+        "file://h?x=['https://e.test/t'name=<path>]",
+      ],
+      [
+        "Bug #1374 double-quoted named root",
+        'file://h?x=["https://e.test/t"name=\\Users\\SECRET\\x]',
+        'file://h?x=["https://e.test/t"name=<path>]',
+      ],
+      [
+        "quoted public URL without successor",
+        "file://h?x=['https://e.test/t']",
+        "file://h?x=['https://e.test/t']",
+      ],
+      [
+        "standalone quoted public URL",
+        "'https://e.test/t'|\\Users\\SECRET\\x",
+        "'https://e.test/t'|\\Users\\SECRET\\x",
+      ],
+      [
+        "ordinary relative successor",
+        "file://h?x=['https://e.test/t'|relative/path]",
+        "file://h?x=['https://e.test/t'|relative/path]",
+      ],
+      [
+        "public URL successor",
+        "file://h?x=['https://e.test/t'|https://f.test/x]",
+        "file://h?x=['https://e.test/t'|https://f.test/x]",
+      ],
+      [
+        "POSIX-root successor",
+        "file://h?x=['https://e.test/t'|/Users/SECRET/x]",
+        "file://h?x=['https://e.test/t'|<path>]",
+      ],
+      [
+        "drive-root successor",
+        "file://h?x=['https://e.test/t'|C:\\Users\\SECRET\\x]",
+        "file://h?x=['https://e.test/t'|<path>]",
+      ],
+      [
+        "UNC-root successor",
+        "file://h?x=['https://e.test/t'|\\\\srv\\share\\SECRET]",
+        "file://h?x=['https://e.test/t'|<path>]",
+      ],
+      [
+        "Bug #1374 W2 query-only control",
+        "file://h?x=[file://host?key=/public&'https://e.test/t'&later/Users/secret]",
+        "file://h?x=[file://host?key=<path>&'https://e.test/t'&later/Users/secret]",
+      ],
+    ] as const)("%s", (_name, input, expected) => {
+      const first = sanitizeError(input);
+
+      expect(first).toBe(expected);
+      expect(sanitizeError(first)).toBe(first);
+      expect(sanitizeError(sanitizeError(first))).toBe(first);
+    });
+  });
+
   it("preserves deferred Bug #1332 contextual over-redaction after the pipe-handoff fix", () => {
     const input = "file://h?x=[value|later=\\Users\\bob\\secret.db]";
     const expected = "file://h?x=[value|later=<path>]";
