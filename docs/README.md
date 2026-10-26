@@ -48,6 +48,9 @@ detail you need.
 - [Cutover rehearsal](migration-rehearsal.md) — reproduce the interrupted
   migration, activation and rollback rehearsal against an isolated
   PostgreSQL 18 container and read what its evidence does and does not prove.
+- [Production certification](production-certification.md) — run the bounded
+  two-machine local or managed PostgreSQL certification harness and interpret
+  its evidence and non-claims.
 - [Optional FTS5 setup](fts5.md) — enable faster ranked local full-text search
   when the active Node.js runtime does not include FTS5.
 - [VS Code and Codex setup](vscode-codex.md) — connect LCM to Codex or GitHub

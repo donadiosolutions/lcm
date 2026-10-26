@@ -433,6 +433,8 @@ export function createRunNames(runId) {
     volume: `lcm-pg-data-${short}`,
     restore: `lcm-pg-restore-${short}`,
     runner: `lcm-pg-runner-${short}`,
+    machineA: `lcm-pg-machine-a-${short}`,
+    machineB: `lcm-pg-machine-b-${short}`,
     alias: `lcm-pg-${short}.test`,
     wrongAlias: `lcm-pg-wrong-${short}.test`,
     controlDatabase: `lcm_harness_${short}`,
@@ -442,6 +444,8 @@ export function createRunNames(runId) {
 const resourceSpecs = [
   { type: "container", key: "restore", kind: "restore" },
   { type: "container", key: "runner", kind: "runner" },
+  { type: "container", key: "machineA", kind: "machine-a" },
+  { type: "container", key: "machineB", kind: "machine-b" },
   { type: "container", key: "container", kind: "database" },
   { type: "volume", key: "volume", kind: "data" },
   { type: "network", key: "network", kind: "network" },
@@ -1315,7 +1319,19 @@ async function listLabeledResources(dockerRunner = docker) {
 }
 
 function shortRunPrefixFromName(name) {
-  return name.match(/^lcm-pg-(?:net-|data-|restore-|runner-)?([0-9a-f]{20})$/u)?.[1];
+  return name.match(/^lcm-pg-(?:net-|data-|restore-|runner-|machine-[ab]-)?([0-9a-f]{20})$/u)?.[1];
+}
+
+export function createInNetworkEnvironment(environment, names) {
+  const result = { ...environment, LCM_TEST_POSTGRES_WRONG_HOST: names.wrongAlias };
+  for (const [key, value] of Object.entries(environment)) {
+    if (!key.startsWith("LCM_TEST_POSTGRES_") || !key.endsWith("_URL")) continue;
+    const url = new URL(value);
+    url.hostname = names.alias;
+    url.port = "5432";
+    result[key] = url.toString();
+  }
+  return result;
 }
 
 export function harnessDirectoryFromRecord(record, dependencies = {}) {
@@ -1697,7 +1713,7 @@ export async function reclaimProvenOrphans(dependencies = {}) {
         databaseAbsent = true;
       }
     }
-    for (const kind of ["database", "data", "network"]) {
+    for (const kind of ["machine-a", "machine-b", "database", "data", "network"]) {
       const resource = byKind.get(kind);
       if (!resource) continue;
       if (kind === "database" && databaseAbsent) continue;
@@ -1814,7 +1830,7 @@ export function sanitizedHarnessErrorDetails(error, secrets) {
 }
 
 export async function cleanupHarnessResources(context, dependencies = {}) {
-  const { names, runId, directory, sentinelReady, owner } = context;
+  const { names, runId, directory, sentinelReady, owner, includeMachines = false } = context;
   const dockerRunner = dependencies.dockerRunner ?? docker;
   const removeResource = dependencies.removeResource
     ?? ((type, name) => {
@@ -1845,6 +1861,10 @@ export async function cleanupHarnessResources(context, dependencies = {}) {
 
     await attempt(() => removeResource("container", names.restore));
     await attempt(() => removeResource("container", names.runner));
+    if (includeMachines) {
+      await attempt(() => removeResource("container", names.machineA));
+      await attempt(() => removeResource("container", names.machineB));
+    }
     let containerOwned = !sentinelReady;
     if (sentinelReady) {
       try {
@@ -2131,6 +2151,7 @@ export async function runHarness(options = {}) {
       get sentinelReady() {
         return sentinelReady;
       },
+      includeMachines: options.certificationMachines === true,
       owner,
     },
     {
@@ -2241,7 +2262,18 @@ export async function runHarness(options = {}) {
       LCM_TEST_POSTGRES_WRONG_HOST: ci ? names.wrongAlias : "localhost",
     };
     try {
-      if (options.runTests) await options.runTests({ runId, names, directory, parent, environment }, ci);
+      if (options.runTests) await options.runTests({
+        runId,
+        names,
+        directory,
+        parent,
+        environment,
+        owner,
+        containerCli: engine.cli,
+        processRunner: setupProcess,
+        secrets,
+        inNetworkEnvironment: createInNetworkEnvironment(environment, names),
+      }, ci);
       else await runTests(
         {
           runId,

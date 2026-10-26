@@ -1,0 +1,94 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://donadiosolutions.com/lcm/certification-evidence-v1.schema.json",
+  "type": "object",
+  "required": ["schemaVersion", "contract", "startedAt", "lane", "profile", "provenance", "machines", "faults", "slos", "cleanup", "verdict"],
+  "additionalProperties": false,
+  "properties": {
+    "schemaVersion": { "const": 1 },
+    "contract": {
+      "type": "object",
+      "required": ["sha256", "status", "approval"],
+      "additionalProperties": false,
+      "properties": {
+        "sha256": { "type": "string", "pattern": "^[0-9a-f]{64}$" },
+        "status": { "const": "approved" },
+        "approval": {
+          "type": "object",
+          "required": ["approvedAt", "approvalRef", "approvedBy"],
+          "additionalProperties": false,
+          "properties": {
+            "approvedAt": { "type": "string", "minLength": 20 },
+            "approvalRef": { "type": "string", "minLength": 1 },
+            "approvedBy": { "type": "string", "minLength": 1 },
+            "priceSource": { "type": "string", "minLength": 1 }
+          }
+        }
+      }
+    },
+    "startedAt": { "type": "string", "minLength": 20 },
+    "lane": { "enum": ["local", "managed"] },
+    "profile": { "enum": ["smoke", "full"] },
+    "provenance": {
+      "type": "object",
+      "required": ["testedCommit", "dirty", "testedInputsSha256", "testedInputsCount", "lockfileSha256", "cliSha256", "node"],
+      "additionalProperties": false,
+      "properties": {
+        "testedCommit": { "type": "string", "pattern": "^[0-9a-f]{40}$" },
+        "dirty": { "type": "boolean" },
+        "testedInputsSha256": { "type": "string", "pattern": "^[0-9a-f]{64}$" },
+        "testedInputsCount": { "type": "integer", "minimum": 1 },
+        "lockfileSha256": { "type": "string", "pattern": "^[0-9a-f]{64}$" },
+        "cliSha256": { "type": "string", "pattern": "^[0-9a-f]{64}$" },
+        "node": { "type": "string", "minLength": 1 }
+      }
+    },
+    "machines": { "type": "array", "minItems": 2, "maxItems": 2, "items": { "$ref": "#/$defs/machine" } },
+    "faults": { "type": "array", "items": { "type": "object" } },
+    "slos": { "type": "array", "minItems": 1, "items": { "$ref": "#/$defs/slo" } },
+    "cleanup": {
+      "type": "object",
+      "required": ["verdict", "residualResources"],
+      "additionalProperties": false,
+      "properties": {
+        "verdict": { "enum": ["pass", "fail", "incomplete"] },
+        "residualResources": { "type": "integer", "minimum": 0 }
+      }
+    },
+    "verdict": { "enum": ["pass", "fail", "incomplete"] }
+  },
+  "$defs": {
+    "machine": {
+      "type": "object",
+      "required": ["name", "machineId", "identityKeySha256"],
+      "additionalProperties": false,
+      "properties": {
+        "name": { "enum": ["a", "b"] },
+        "machineId": { "type": "string", "pattern": "^[0-9a-f-]{36}$" },
+        "identityKeySha256": { "type": "string", "pattern": "^[0-9a-f]{64}$" }
+      }
+    },
+    "slo": {
+      "type": "object",
+      "required": ["id", "formula", "inputs", "threshold", "observed", "verdict"],
+      "additionalProperties": false,
+      "properties": {
+        "id": { "type": "string", "minLength": 1 },
+        "formula": { "type": "string", "minLength": 1 },
+        "inputs": {
+          "type": "object",
+          "required": ["count", "sampleFile", "sampleSha256"],
+          "additionalProperties": false,
+          "properties": {
+            "count": { "type": "integer", "minimum": 0 },
+            "sampleFile": { "type": "string", "pattern": "^[A-Za-z0-9_.-]+$" },
+            "sampleSha256": { "type": "string", "pattern": "^[0-9a-f]{64}$" }
+          }
+        },
+        "threshold": { "type": "number" },
+        "observed": { "type": "number" },
+        "verdict": { "enum": ["pass", "fail", "incomplete"] }
+      }
+    }
+  }
+}

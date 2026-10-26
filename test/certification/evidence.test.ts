@@ -1,0 +1,44 @@
+import { mkdtempSync, readFileSync, writeFileSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
+import { describe, expect, it } from "vitest";
+import { validateEvidence } from "../postgresql/cutover-rehearsal/check-evidence.js";
+import { assembleCertificationGate, writeCertificationGate } from "./slo.mjs";
+
+describe("certification evidence", () => {
+  it("assembles an allowlisted gate that conforms to the committed schema", () => {
+    const directory = mkdtempSync(join(tmpdir(), "lcm-cert-evidence-"));
+    writeFileSync(join(directory, "samples.ndjson"), `${JSON.stringify({ op: "hook", durationMs: 10, outcome: "success" })}\n`);
+    const gate = assembleCertificationGate({
+      evidenceDirectory: directory,
+      contractSha256: "a".repeat(64),
+      contractStatus: "approved",
+      approval: { approvedAt: "2026-10-26T10:00:00.000Z", approvalRef: "issue-629", approvedBy: "maintainer" },
+      startedAt: "2026-10-26T10:01:00.000Z",
+      lane: "local",
+      profile: "full",
+      provenance: {
+        testedCommit: "d".repeat(40), dirty: false, testedInputsSha256: "e".repeat(64),
+        testedInputsCount: 100, lockfileSha256: "f".repeat(64), cliSha256: "1".repeat(64), node: process.version,
+      },
+      machines: [
+        { name: "a", machineId: "018f0000-0000-7000-8000-000000000001", identityKeySha256: "b".repeat(64) },
+        { name: "b", machineId: "018f0000-0000-7000-8000-000000000002", identityKeySha256: "c".repeat(64) },
+      ],
+      faults: [],
+      cleanup: { verdict: "pass", residualResources: 0 },
+      slos: [{ id: "hook.p50", formula: "nearest-rank", inputs: { count: 20, sampleFile: "samples.ndjson" }, threshold: 400, observed: 10, verdict: "pass" }],
+    });
+    const schema = JSON.parse(readFileSync(new URL("./evidence-schema.json", import.meta.url), "utf8"));
+
+    expect(validateEvidence(schema, gate)).toEqual([]);
+    expect(gate.provenance.testedCommit).toBe("d".repeat(40));
+    expect(JSON.stringify(gate)).not.toContain("token");
+    expect(gate.slos[0]?.inputs.sampleSha256).toMatch(/^[0-9a-f]{64}$/u);
+
+    const output = mkdtempSync(join(tmpdir(), "lcm-cert-gate-"));
+    const paths = writeCertificationGate(gate, output);
+    expect(JSON.parse(readFileSync(paths.json, "utf8"))).toEqual(gate);
+    expect(readFileSync(paths.markdown, "utf8")).toContain("hook.p50 | pass | 10 | 400");
+  });
+});
