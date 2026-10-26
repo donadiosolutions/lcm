@@ -4120,6 +4120,36 @@ describe("sanitizeError", () => {
         "file://h?x=[file://host?key=<path>]<path>?key=<path>]]",
       ],
       [
+        "adjacent public bracket components",
+        "file://h?x=[file://host?key=/public]\\Users\\FIRST\\x[https://host][https://other?key=/Users/SECOND/secret]",
+        "file://h?x=[file://host?key=<path>]<path>?key=<path>]",
+      ],
+      [
+        "adjacent text bracket component",
+        "file://h?x=[file://host?key=/public]\\Users\\FIRST\\x[text][https://other?key=/Users/SECOND/secret]",
+        "file://h?x=[file://host?key=<path>]<path>?key=<path>]",
+      ],
+      [
+        "adjacent empty bracket component",
+        "file://h?x=[file://host?key=/public]\\Users\\FIRST\\x[][https://other?key=/Users/SECOND/secret]",
+        "file://h?x=[file://host?key=<path>]<path>?key=<path>]",
+      ],
+      [
+        "adjacent nested bracket component",
+        "file://h?x=[file://host?key=/public]\\Users\\FIRST\\x[[https://host]][https://other?key=/Users/SECOND/secret]",
+        "file://h?x=[file://host?key=<path>]<path>?key=<path>]",
+      ],
+      [
+        "space ends post-close bracket composition",
+        "file://h?x=[file://host?key=/public]\\Users\\FIRST\\x[https://host] [https://other?key=/Users/SECOND/secret]",
+        "file://h?x=[file://host?key=<path>]<path> [https://other?key=/Users/SECOND/secret]",
+      ],
+      [
+        "newline ends post-close bracket composition",
+        "file://h?x=[file://host?key=/public]\\Users\\FIRST\\x[https://host]\n[https://other?key=/Users/SECOND/secret]",
+        "file://h?x=[file://host?key=<path>]<path>\n[https://other?key=/Users/SECOND/secret]",
+      ],
+      [
         "whitespace-separated prose control",
         "file://h?x=[file://host?key=/public] later/thing",
         "file://h?x=[file://host?key=<path>] later/thing",

@@ -694,7 +694,9 @@ bundle and keep provider, credential, quarantine, and recovery sessions private.
   grammar, so rooted values redact as they would in a standalone sibling.
   Rooted Windows tails after a closing wrapper, including a later bracketed
   URL's rooted query value inside that tail, are also removed on the first pass.
-  Whitespace-separated prose and public URLs and ordinary unspaced relative
+  Adjacent balanced bracket components remain part of that same tail until its
+  consumed path span ends. Whitespace and newlines end the composition;
+  whitespace-separated prose and public URLs and ordinary unspaced relative
   tails remain unchanged.
 
   An exact nested `file://` child inside a public URL that began at a quote can

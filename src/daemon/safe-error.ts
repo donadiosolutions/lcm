@@ -307,7 +307,9 @@ function findUrlPathStarts(chars: readonly string[]): UrlPathStarts {
         postCloseFilePathBracketDepth += 1;
       } else if (char === "]" && postCloseFilePathBracketDepth > 0) {
         postCloseFilePathBracketDepth -= 1;
-        if (postCloseFilePathBracketDepth === 0) postCloseFilePathActive = false;
+        if (postCloseFilePathBracketDepth === 0 && chars[index + 1] !== "[") {
+          postCloseFilePathActive = false;
+        }
       } else if (
         postCloseFilePathBracketDepth > 0 &&
         char === "=" &&
