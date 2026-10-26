@@ -4189,6 +4189,31 @@ describe("sanitizeError", () => {
         "file://h?x=[file://host?key=<path>]<path>?key=<path>]",
       ],
       [
+        "path-word bridge between bracket components",
+        "file://h?x=[file://host?key=/public]\\Users\\FIRST\\x[https://host]x[https://other?key=/Users/SECOND/secret]",
+        "file://h?x=[file://host?key=<path>]<path>?key=<path>]",
+      ],
+      [
+        "ampersand rooted query value",
+        "file://h?x=[file://host?key=/public]\\Users\\FIRST\\x[https://host][https://other?x=1&/Users/SECOND/secret]",
+        "file://h?x=[file://host?key=<path>]<path>?x=1&<path>]",
+      ],
+      [
+        "fragment rooted query value",
+        "file://h?x=[file://host?key=/public]\\Users\\FIRST\\x[https://host][https://other#/Users/SECOND/secret]",
+        "file://h?x=[file://host?key=<path>]<path>#<path>]",
+      ],
+      [
+        "question rooted query value",
+        "file://h?x=[file://host?key=/public]\\Users\\FIRST\\x[https://host][https://other?/Users/SECOND/secret]",
+        "file://h?x=[file://host?key=<path>]<path>?<path>]",
+      ],
+      [
+        "backslash rooted query value",
+        "file://h?x=[file://host?key=/public]\\Users\\FIRST\\x[https://host?key=\\Users\\SECOND\\secret]",
+        "file://h?x=[file://host?key=<path>]<path>?key=<path>]",
+      ],
+      [
         "space ends post-close bracket composition",
         "file://h?x=[file://host?key=/public]\\Users\\FIRST\\x[https://host] [https://other?key=/Users/SECOND/secret]",
         "file://h?x=[file://host?key=<path>]<path> [https://other?key=/Users/SECOND/secret]",

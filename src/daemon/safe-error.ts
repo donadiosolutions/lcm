@@ -328,17 +328,26 @@ function findUrlPathStarts(chars: readonly string[]): UrlPathStarts {
         postCloseFilePathBracketDepth += 1;
       } else if (char === "]" && postCloseFilePathBracketDepth > 0) {
         postCloseFilePathBracketDepth -= 1;
-        if (postCloseFilePathBracketDepth === 0 && chars[index + 1] !== "[") {
-          postCloseFilePathActive = false;
+        if (postCloseFilePathBracketDepth === 0) {
+          const next = chars[index + 1];
+          if (next !== "[" && next !== "/" && next !== "\\" && !isPathWord(next)) {
+            postCloseFilePathActive = false;
+          }
         }
       } else if (
         postCloseFilePathBracketDepth > 0 &&
-        char === "=" &&
-        chars[index + 1] === "/" &&
+        (char === "=" || char === "&" || char === "#" || char === "?") &&
+        (chars[index + 1] === "/" || chars[index + 1] === "\\") &&
         isPathWord(chars[index + 2])
       ) {
         forcedPath[index + 1] = 1;
-      } else if (postCloseFilePathBracketDepth === 0 && URL_END_DELIMITERS.has(char)) {
+      } else if (
+        postCloseFilePathBracketDepth === 0 &&
+        char !== "[" &&
+        char !== "/" &&
+        char !== "\\" &&
+        !isPathWord(char)
+      ) {
         postCloseFilePathActive = false;
       }
     }

@@ -697,8 +697,10 @@ bundle and keep provider, credential, quarantine, and recovery sessions private.
   recognized private-root relatives redact there on the first pass.
   Rooted Windows tails after a closing wrapper, including a later bracketed
   URL's rooted query value inside that tail, are also removed on the first pass.
-  Adjacent balanced bracket components remain part of that same tail until its
-  consumed path span ends. Whitespace and newlines end the composition;
+  Adjacent balanced bracket components and path-word or path-separator text
+  between them remain part of that same tail until its consumed path span ends.
+  Inside those tracked components, a rooted `/` or `\` value immediately after
+  `=`, `&`, `#`, or `?` is removed. Whitespace and newlines end the composition;
   whitespace-separated prose and public URLs and ordinary unspaced relative
   tails remain unchanged.
 
