@@ -132,6 +132,26 @@ function findUrlPathStarts(chars: readonly string[]): UrlPathStarts {
       quote,
     ).end;
   };
+  const returnedParentPrivateRootPathStart = (start: number): number => {
+    if (!isPathWord(chars[start])) return -1;
+    let cursor = start;
+    let firstSlash = -1;
+    while (isPathWord(chars[cursor])) {
+      const segmentStart = cursor;
+      while (isPathWord(chars[cursor])) cursor += 1;
+      const segment = chars.slice(segmentStart, cursor).join("").toLowerCase();
+      const delimiter = chars[cursor];
+      const privateRoot = segment === "users" || segment === "home" || segment === "root";
+      if (privateRoot && isPathWord(chars[cursor + 1])) {
+        if (delimiter === "/") return firstSlash >= 0 ? firstSlash : cursor;
+        if (delimiter === "\\" && firstSlash >= 0) return firstSlash;
+      }
+      if (delimiter !== "/" || !isPathWord(chars[cursor + 1])) return -1;
+      if (firstSlash < 0) firstSlash = cursor;
+      cursor += 1;
+    }
+    return -1;
+  };
   let restartedPathlessFile = false;
   let quotedPathEnded = false;
   let quotedQueryTail = false;
@@ -414,15 +434,15 @@ function findUrlPathStarts(chars: readonly string[]): UrlPathStarts {
       separator < 0 &&
       (char === "&" || char === "|")
     ) {
+      const privateRootPathStart = returnedParentPrivateRootPathStart(index + 1);
       if (chars[index + 1] === "/" || chars[index + 1] === "\\") {
         forcedPath[index + 1] = 1;
       } else if (
+        privateRootPathStart >= 0 &&
         !restartedNestedFileUrlParentOwnerBracketDepths.has(pathlessFileQueryOwnerBracketDepth) &&
-        startsWordBearingSlashPath(chars, index + 1)
+        pathlessFileQueryOwnerBracketDepth > 0
       ) {
-        let pathStart = index + 1;
-        while (isPathWord(chars[pathStart])) pathStart += 1;
-        forcedPath[pathStart] = 1;
+        forcedPath[privateRootPathStart] = 1;
       }
     }
     if (restartedPathlessFile && char === "[") {

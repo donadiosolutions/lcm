@@ -3352,11 +3352,11 @@ describe("sanitizeError", () => {
     expect(sanitizeError(sanitizeError(first))).toBe(first);
   });
 
-  it("preserves deferred direct-relative successor over-redaction", () => {
+  it("preserves the Bug #1336 direct-relative successor", () => {
     const input =
       "file://h?x=[https://o.test/t&/Users/o/one&file:///Users/a/two&relative/path]";
     const expected =
-      "file://h?x=[https://o.test/t&<path>&file://<path>&relative<path>]";
+      "file://h?x=[https://o.test/t&<path>&file://<path>&relative/path]";
     const first = sanitizeError(input);
 
     expect(first).toBe(expected);
@@ -3420,21 +3420,21 @@ describe("sanitizeError", () => {
       "query",
       "file://h?x=[https://e.test/t&file:///Users/a/one?key=/public&relative/path]",
       "file://h?x=[https://e.test/t&file://<path>?key=<path>&relative/path]",
-      "file://h?x=[https://e.test/t&file://<path>?key=<path>&relative<path>]",
+      "file://h?x=[https://e.test/t&file://<path>?key=<path>&relative/path]",
     ],
     [
       "fragment",
       "file://h?x=[https://e.test/t&file:///Users/a/one#key=/public&docs/readme/more]",
       "file://h?x=[https://e.test/t&file://<path>#key=<path>&docs/readme/more]",
-      "file://h?x=[https://e.test/t&file://<path>#key=<path>&docs<path>]",
+      "file://h?x=[https://e.test/t&file://<path>#key=<path>&docs/readme/more]",
     ],
     [
       "incomplete Users root",
       "file://h?x=[https://e.test/t&file:///Users/a/one?key=/public&later/Users]",
       "file://h?x=[https://e.test/t&file://<path>?key=<path>&later/Users]",
-      "file://h?x=[https://e.test/t&file://<path>?key=<path>&later<path>]",
+      "file://h?x=[https://e.test/t&file://<path>?key=<path>&later/Users]",
     ],
-  ] as const)("preserves deferred Bug #1336 %s pass sequence", (_name, input, firstExpected, stableExpected) => {
+  ] as const)("pins Bug #1336 %s pass stability", (_name, input, firstExpected, stableExpected) => {
     const first = sanitizeError(input);
     const second = sanitizeError(first);
 
@@ -3822,10 +3822,10 @@ describe("sanitizeError", () => {
         "file://h?x=[file://<path>|later<path>]",
       ],
       [
-        "pins the intermediate Bug #1336 ordinary relative pipe sequence",
+        "preserves the Bug #1336 ordinary relative pipe successor",
         "file://h?x=[file:///Users/CHILD/x|relative/path]",
         "file://h?x=[file://<path>|relative/path]",
-        "file://h?x=[file://<path>|relative<path>]",
+        "file://h?x=[file://<path>|relative/path]",
       ],
       [
         "keeps the ampersand return",
@@ -3867,6 +3867,68 @@ describe("sanitizeError", () => {
     });
   });
 
+  describe("Bug #1336", () => {
+    const prefix = "file://h?x=[https://e.test/t&/Users/a/one&file:///Users/b/two";
+    const expectedPrefix = "file://h?x=[https://e.test/t&<path>&file://<path>";
+    const returnedParentRows = [
+      ["relative path", "relative/path", "relative/path"],
+      ["ordinary value", "another/ordinary/value", "another/ordinary/value"],
+      ["nested Users root", "later/Users/alice/secret", "later<path>"],
+      ["nested home root", "later/home/alice/secret", "later<path>"],
+      ["nested root root", "later/root/secret", "later<path>"],
+      ["leading Users root", "Users/alice/secret", "Users<path>"],
+      ["leading home root", "home/alice/secret", "home<path>"],
+      ["leading root root", "root/private", "root<path>"],
+      ["non-leading Users root", "not/Users/secret", "not<path>"],
+      ["non-leading home root", "backup/home/secret", "backup<path>"],
+      ["deep Users root", "a/b/Users/alice/secret", "a<path>"],
+      ["case-insensitive Users root", "docs/users/guide", "docs<path>"],
+      ["incomplete Users root", "later/Users", "later/Users"],
+      ["homeless segment", "later/homeless/x", "later/homeless/x"],
+      ["Users2 segment", "later/Users2/x", "later/Users2/x"],
+      ["public URL", "https://p.test/x", "https://p.test/x"],
+      ["POSIX root", "/Users/c/three", "<path>"],
+      ["Windows root", "\\Users\\c\\three", "<path>"],
+      ["UNC root", "\\\\srv\\share\\s", "<path>"],
+      ["drive root", "C:\\Users\\c\\three", "<path>"],
+      ["P3 Users backslash continuation", "later/Users\\alice\\secret", "later<path>"],
+      ["P3 home backslash continuation", "later/home\\alice\\secret", "later<path>"],
+    ] as const;
+    const cases: Array<readonly [string, string, string]> = returnedParentRows.flatMap(
+      ([name, value, expected]) =>
+        (["&", "|"] as const).map((delimiter) => [
+          `${name} after ${delimiter}`,
+          `${prefix}${delimiter}${value}]`,
+          `${expectedPrefix}${delimiter}${expected}]`,
+        ] as const),
+    );
+    cases.push(
+      [
+        "query child ordinary relative",
+        "file://h?x=[https://e.test/t&file:///Users/a/one?key=/public&relative/path]",
+        "file://h?x=[https://e.test/t&file://<path>?key=<path>&relative/path]",
+      ],
+      [
+        "hard reset",
+        `${prefix}&relative/path later/Users/secret]`,
+        `${expectedPrefix}&relative/path later/Users/secret]`,
+      ],
+      [
+        "matching close",
+        `${prefix}]&relative/path`,
+        `${expectedPrefix}]&relative/path`,
+      ],
+    );
+
+    it.each(cases)("%s", (_name, input, expected) => {
+      const first = sanitizeError(input);
+
+      expect(first).toBe(expected);
+      expect(sanitizeError(first)).toBe(first);
+      expect(sanitizeError(sanitizeError(first))).toBe(first);
+    });
+  });
+
   it("preserves deferred Bug #1332 contextual over-redaction after the pipe-handoff fix", () => {
     const input = "file://h?x=[value|later=\\Users\\bob\\secret.db]";
     const expected = "file://h?x=[value|later=<path>]";
@@ -3877,11 +3939,11 @@ describe("sanitizeError", () => {
     expect(sanitizeError(sanitizeError(first))).toBe(first);
   });
 
-  it("preserves deferred Bug #1336 root anchor after the pipe-handoff fix", () => {
+  it("preserves the Bug #1336 root anchor after the pipe-handoff fix", () => {
     const input =
       "file://h?x=[https://e.test/t&/Users/a/one&file:///Users/b/two&relative/path]";
     const expected =
-      "file://h?x=[https://e.test/t&<path>&file://<path>&relative<path>]";
+      "file://h?x=[https://e.test/t&<path>&file://<path>&relative/path]";
     const first = sanitizeError(input);
 
     expect(first).toBe(expected);
