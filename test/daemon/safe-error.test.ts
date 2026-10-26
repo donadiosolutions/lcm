@@ -3012,10 +3012,7 @@ describe("sanitizeError", () => {
   });
 
   describe("Bug #1332", () => {
-    it.each([
-      ["original contextual pin"],
-      ["post-pipe-handoff regression pin"],
-    ] as const)("keeps the privacy decision for %s", () => {
+    it("keeps the privacy decision for the original and post-pipe-handoff contexts", () => {
       const input = "file://h?x=[value|later=\\Users\\bob\\secret.db]";
       const expected = "file://h?x=[value|later=<path>]";
       const first = sanitizeError(input);
