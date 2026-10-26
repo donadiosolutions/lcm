@@ -175,6 +175,8 @@ function findUrlPathStarts(chars: readonly string[]): UrlPathStarts {
   let inheritedFileQuoteEnd = -1;
   let cachedEnclosingQuote = 0;
   let cachedEnclosingQuoteBoundary = -1;
+  let siblingWrapperStart = -1;
+  let siblingWrapperOwnerBracketDepth = 0;
   let queryOrFragment = false;
   let queryOrFragmentStart = -1;
   let nestedPublicUrlBracketDepth = 0;
@@ -217,6 +219,8 @@ function findUrlPathStarts(chars: readonly string[]): UrlPathStarts {
       quotedQueryPublicUrlOwnQueryOrFragment = false;
       postCloseFilePathActive = false;
       postCloseFilePathBracketDepth = 0;
+      siblingWrapperStart = -1;
+      siblingWrapperOwnerBracketDepth = 0;
       if (!preservesClosedBracketHandoff) {
         fileTailBracketDepth = 0;
         pendingFileTailBackslash = false;
@@ -253,7 +257,8 @@ function findUrlPathStarts(chars: readonly string[]): UrlPathStarts {
       siblingWrapperDelimiter !== undefined &&
       "&|,;".includes(siblingWrapperDelimiter) &&
       chars[index + 2] === "[";
-    const entersSiblingWrapper = "&|,;".includes(char) && chars[index + 1] === "[";
+    const entersSiblingWrapper = index === siblingWrapperStart;
+    if (entersSiblingWrapper) restartedPathlessFile = true;
     if (pathlessFileQueryOwnerBracketDepth > 0 && char === "[") {
       pathlessFileQueryOwnerBracketDepth += 1;
     } else if (pathlessFileQueryOwnerBracketDepth > 0 && char === "]") {
@@ -262,7 +267,13 @@ function findUrlPathStarts(chars: readonly string[]): UrlPathStarts {
       pathlessFileQueryOwnerBracketDepth = 1;
     }
     if (closingPathlessFileQueryOwnerDepth > 0 && continuesWithSiblingWrapper) {
-      restartedPathlessFile = true;
+      siblingWrapperStart = index + 2;
+    }
+    if (entersSiblingWrapper) {
+      siblingWrapperStart = -1;
+      siblingWrapperOwnerBracketDepth = pathlessFileQueryOwnerBracketDepth;
+      const privateRootPathStart = returnedParentPrivateRootPathStart(index + 1);
+      if (privateRootPathStart >= 0) forcedPath[privateRootPathStart] = 1;
     }
     if (
       closingPathlessFileQueryOwnerDepth > 0 &&
@@ -280,6 +291,9 @@ function findUrlPathStarts(chars: readonly string[]): UrlPathStarts {
       if (closingPathlessFileQueryOwnerDepth === activeNestedFileUrlParentOwnerBracketDepth) {
         activeNestedFileUrlParentOwnerBracketDepth = 0;
       }
+    }
+    if (closingPathlessFileQueryOwnerDepth === siblingWrapperOwnerBracketDepth) {
+      siblingWrapperOwnerBracketDepth = 0;
     }
     if (closingPathlessFileQueryOwnerDepth > 0) {
       repeatedPipeHandoffWrapperDepths.delete(closingPathlessFileQueryOwnerDepth);
@@ -344,6 +358,21 @@ function findUrlPathStarts(chars: readonly string[]): UrlPathStarts {
       (chars[index + 1] === "/" || chars[index + 1] === "\\")
     ) {
       forcedPath[index + 1] = 1;
+    }
+    if (
+      siblingWrapperOwnerBracketDepth > 0 &&
+      (char === "|" || char === "&")
+    ) {
+      const privateRootPathStart = returnedParentPrivateRootPathStart(index + 1);
+      if (
+        chars[index + 1] === "/" ||
+        chars[index + 1] === "\\" ||
+        isWindowsDrivePathStart(chars, index + 1)
+      ) {
+        forcedPath[index + 1] = 1;
+      } else if (privateRootPathStart >= 0) {
+        forcedPath[privateRootPathStart] = 1;
+      }
     }
     if (fileTailBracketDepth > 0 && char === "[") {
       fileTailBracketDepth += 1;
@@ -714,8 +743,7 @@ function findUrlPathStarts(chars: readonly string[]): UrlPathStarts {
       restartedPathlessFile &&
       URL_END_DELIMITERS.has(char) &&
       !FILE_URL_AUTHORITY_DELIMITERS.has(char) &&
-      !continuesWithSiblingWrapper &&
-      !entersSiblingWrapper
+      !continuesWithSiblingWrapper
     ) {
       restartedPathlessFile = false;
       quotedQueryTail = false;
@@ -892,7 +920,11 @@ function findUrlPathStarts(chars: readonly string[]): UrlPathStarts {
       }
       continue;
     }
-    if (restartedPathlessFile && isNestedBracketPathStart(char, restartedPathlessBrackets, false)) {
+    if (
+      restartedPathlessFile &&
+      siblingWrapperOwnerBracketDepth === 0 &&
+      isNestedBracketPathStart(char, restartedPathlessBrackets, false)
+    ) {
       forcedPath[index] = 1;
       schemeLength = 0;
       fileSchemeLength = 0;

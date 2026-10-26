@@ -4074,6 +4074,36 @@ describe("sanitizeError", () => {
   describe("Bug #1346", () => {
     it.each([
       [
+        "bare pipe opener does not re-enter sibling ownership",
+        "file://host?key=/public|[relative/path]",
+        "file://host?key=<path>|[relative/path]",
+      ],
+      [
+        "path-bearing pipe sibling",
+        "file://h?x=[file:///Users/b/two]|[value|\\Users\\SECRET\\y]",
+        "file://h?x=[file://<path>]|[value|<path>]",
+      ],
+      [
+        "path-bearing comma sibling",
+        "file://h?x=[file:///Users/b/two],[value|\\Users\\SECRET\\y]",
+        "file://h?x=[file://<path>],[value|<path>]",
+      ],
+      [
+        "path-bearing semicolon sibling",
+        "file://h?x=[file:///Users/b/two];[value|\\Users\\SECRET\\y]",
+        "file://h?x=[file://<path>];[value|<path>]",
+      ],
+      [
+        "path-bearing sibling ordinary relative control",
+        "file://h?x=[file:///Users/b/two]|[later/thing]",
+        "file://h?x=[file://<path>]|[later/thing]",
+      ],
+      [
+        "path-bearing sibling private-root relative",
+        "file://h?x=[file:///Users/b/two]|[later/Users/SECRET/y]",
+        "file://h?x=[file://<path>]|[later<path>]",
+      ],
+      [
         "sibling query-only file children",
         "file://h?x=[file://a?key=/pub&\\Users\\S1\\x]&[file://b?key2=/pub2|\\Users\\S2\\y]",
         "file://h?x=[file://a?key=<path>&<path>]&[file://b?key2=<path>|<path>]",

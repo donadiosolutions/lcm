@@ -690,9 +690,11 @@ bundle and keep provider, credential, quarantine, and recovery sessions private.
   query, an immediate `&` or `|` successor is redacted only when it begins with
   a supported POSIX, Windows, drive, or UNC root. The public URL's own query,
   ordinary relative successors, and following public URLs stay readable. An
-  immediate sibling wrapper after `]&[`, `]|[`, `],[`, or `];[` re-enters the
-  same observable ownership grammar, so rooted values redact as they would in
-  a standalone sibling.
+  immediate sibling wrapper after `]&[`, `]|[`, `],[`, or `];[` re-enters only
+  when the delimiter follows the matching owner close; a bare delimiter plus
+  `[` does not create ownership. A path-bearing first sibling preserves an
+  ordinary relative value in the next sibling, while supported roots and
+  recognized private-root relatives redact there on the first pass.
   Rooted Windows tails after a closing wrapper, including a later bracketed
   URL's rooted query value inside that tail, are also removed on the first pass.
   Adjacent balanced bracket components remain part of that same tail until its
