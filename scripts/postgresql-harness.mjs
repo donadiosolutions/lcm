@@ -603,7 +603,7 @@ export function sanitizeHarnessText(value, secrets) {
     if (secret) sanitized = sanitized.split(secret).join("[REDACTED]");
   }
   return sanitized
-    .replace(/postgresql:\/\/[^\s]+/giu, "postgresql://[REDACTED]")
+    .replace(/postgresql:\/\/[^\s"'\\]+/giu, "postgresql://[REDACTED]")
     .replace(/-----BEGIN [^-]+-----[\s\S]*?-----END [^-]+-----/gu, "[REDACTED PEM]");
 }
 
@@ -661,7 +661,7 @@ export function createStreamRedactor(secrets) {
     const scanned = scanPemMarkers(redacted, depth);
     depth = scanned.depth;
     if (startedInPem && scanned.output === "") return undefined;
-    return scanned.output.replace(/postgresql:\/\/[^\s]+/giu, "postgresql://[REDACTED]");
+    return scanned.output.replace(/postgresql:\/\/[^\s"'\\]+/giu, "postgresql://[REDACTED]");
   };
   // Scans text that is being dropped, so markers may span writes and have a
   // label of any length. A BEGIN keyword opens a block at once, whether or not

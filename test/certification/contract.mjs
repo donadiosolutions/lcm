@@ -1,9 +1,32 @@
 import { createHash } from "node:crypto";
-import { readFileSync } from "node:fs";
+import { existsSync, readFileSync } from "node:fs";
+import { extname } from "node:path";
 import { fileURLToPath } from "node:url";
 
 function pathOf(path) {
   return path instanceof URL ? fileURLToPath(path) : path;
+}
+
+function approvalPathFor(contractPath) {
+  const extension = extname(contractPath);
+  return `${contractPath.slice(0, -extension.length)}.approval${extension}`;
+}
+
+function loadApproval(path, contractSha256) {
+  const approval = JSON.parse(readFileSync(path, "utf8"));
+  for (const field of ["contractSha256", "approvedBy", "approvedAt", "approvalRef"]) {
+    if (typeof approval?.[field] !== "string" || approval[field].length === 0) {
+      throw new Error(`certification approval record is missing ${field}`);
+    }
+  }
+  if (!/^[0-9a-f]{64}$/u.test(approval.contractSha256)
+    || approval.contractSha256 !== contractSha256) {
+    throw new Error("certification approval hash does not match the contract bytes");
+  }
+  if (!Number.isFinite(Date.parse(approval.approvedAt))) {
+    throw new Error("certification approval record has an invalid approvedAt");
+  }
+  return approval;
 }
 function positiveInteger(value, name) {
   if (!Number.isSafeInteger(value) || value <= 0) throw new Error(`invalid certification contract ${name}`);
@@ -118,21 +141,16 @@ function assertContract(contract) {
 }
 
 export function loadCertificationContract(path, options = {}) {
-  const bytes = readFileSync(pathOf(path));
+  const contractPath = pathOf(path);
+  const bytes = readFileSync(contractPath);
   const contract = assertContract(JSON.parse(bytes.toString("utf8")));
-  if (options.requireApproved !== false && contract.status !== "approved") {
-    throw new Error("certification contract must be approved before evidence collection");
+  const sha256 = createHash("sha256").update(bytes).digest("hex");
+  const approvalPath = options.approvalPath === undefined
+    ? approvalPathFor(contractPath)
+    : pathOf(options.approvalPath);
+  const approval = existsSync(approvalPath) ? loadApproval(approvalPath, sha256) : undefined;
+  if (options.requireApproved !== false && approval === undefined) {
+    throw new Error("certification contract requires a matching approval record before evidence collection");
   }
-  if (contract.status === "approved") {
-    for (const field of ["approvedBy", "approvedAt", "approvalRef"]) {
-      if (typeof contract.approval?.[field] !== "string" || contract.approval[field].length === 0) {
-        throw new Error(`approved certification contract is missing ${field}`);
-      }
-    }
-    const approvedAt = Date.parse(contract.approval.approvedAt);
-    if (!Number.isFinite(approvedAt) || new Date(approvedAt).toISOString() !== contract.approval.approvedAt) {
-      throw new Error("approved certification contract has an invalid approvedAt");
-    }
-  }
-  return { contract, sha256: createHash("sha256").update(bytes).digest("hex") };
+  return { contract, sha256, approval, status: approval === undefined ? "draft" : "approved" };
 }

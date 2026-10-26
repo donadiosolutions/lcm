@@ -16,8 +16,16 @@
       "serverVersionNum": 180004,
       "machines": 2,
       "machineKind": "rootless-podman-container",
-      "containerLimits": { "cpus": 1, "memoryMiB": 1024, "pids": 256, "uid": "fixed non-root" },
-      "faults": ["partition-machine-a", "restart-database"]
+      "containerLimits": {
+        "cpus": 1,
+        "memoryMiB": 1024,
+        "pids": 256,
+        "uid": "fixed non-root"
+      },
+      "faults": [
+        "partition-machine-a",
+        "restart-database"
+      ]
     },
     "managed": {
       "provider": "digitalocean",
@@ -36,7 +44,9 @@
       "familyTag": "lcm-cert",
       "runTagPattern": "lcm-cert-run-<runId>",
       "serializedRuns": true,
-      "faults": ["partition-machine-a"]
+      "faults": [
+        "partition-machine-a"
+      ]
     }
   },
   "configuration": {
@@ -87,7 +97,12 @@
       "sessionSnapshot": "T0+30+60k, k=0..99; session s0; hook_event_name Stop; owned pinned Codex transcript fixture",
       "compact": "T0+55+300k, k=0..19; session s0; explicit /compact operation; the only compaction source"
     },
-    "primaryTextBytesCycle": [256, 1024, 1024, 8192],
+    "primaryTextBytesCycle": [
+      256,
+      1024,
+      1024,
+      8192
+    ],
     "primaryTextLength": "cycle[floor(j/4) mod 4]; ASCII; JSON envelope bytes recorded separately; stored truncation (DATA_SOFT_CAP) recorded, not counted as input change",
     "fixtures": {
       "userPrompt": "\"Always prefer deterministic records. \" + lowercase x padding to N bytes; extracts exactly one decision event",
@@ -95,7 +110,10 @@
       "cardinalityCheck": "unit tests for all 8 kind/length combinations; runtime asserts exactly one new row per invocation"
     },
     "emission": {
-      "sources": ["user-prompt", "post-tool"],
+      "sources": [
+        "user-prompt",
+        "post-tool"
+      ],
       "expectedAuxiliaryRows": 0,
       "maxRowsPerMachinePerRolling300s": 30,
       "violation": "fail",
@@ -115,7 +133,11 @@
       "daemonSearch": 2400,
       "daemonStore": 1200
     },
-    "expectedPerMachine": { "hookInvocations": 600, "daemonSearch": 1200, "daemonStore": 600 }
+    "expectedPerMachine": {
+      "hookInvocations": 600,
+      "daemonSearch": 1200,
+      "daemonStore": 600
+    }
   },
   "oracle": {
     "invocationLedger": "persist invocation id/kind/session/expected count before each serialized hook; capture exactly one new matching row (uuid, machine sequence, source/type/session, scrubbed payload hash) within 2 s after exit; persisted outside SQLite immediately; rows from failed commands reconciled",
@@ -136,19 +158,39 @@
   "thresholds": {
     "hookCommandMs": {
       "definition": "public CLI process start to exit wall time (monotonic); schedule delay reported separately",
-      "pooled": { "p50": 400, "p95": 1000, "p99": 2000 },
+      "pooled": {
+        "p50": 400,
+        "p95": 1000,
+        "p99": 2000
+      },
       "perKindPooledP95": 1000,
       "perMachineP95": 1000,
       "minSuccessesForSubgates": 200,
       "basis": "unmeasured approval-selected policy limits"
     },
     "daemonSearchMs": {
-      "local": { "p50": 100, "p95": 500, "p99": 1500 },
-      "managed": { "p50": 300, "p95": 1500, "p99": 4000 }
+      "local": {
+        "p50": 100,
+        "p95": 500,
+        "p99": 1500
+      },
+      "managed": {
+        "p50": 300,
+        "p95": 1500,
+        "p99": 4000
+      }
     },
     "daemonStoreMs": {
-      "local": { "p50": 100, "p95": 500, "p99": 1500 },
-      "managed": { "p50": 300, "p95": 1500, "p99": 4000 }
+      "local": {
+        "p50": 100,
+        "p95": 500,
+        "p99": 1500
+      },
+      "managed": {
+        "p50": 300,
+        "p95": 1500,
+        "p99": 4000
+      }
     },
     "acknowledgmentLagSeconds": {
       "population": "successful steady oracle entries",
@@ -156,7 +198,10 @@
       "max": 900,
       "note": "conservative upper bound; exact applied_at not claimed"
     },
-    "errors": { "nonInjectedErrorRateMax": 0.001, "missingScheduledAttempt": "fail" },
+    "errors": {
+      "nonInjectedErrorRateMax": 0.001,
+      "missingScheduledAttempt": "fail"
+    },
     "loss": {
       "rule": "every successful invocation maps to exactly one oracle event and every oracle event is acknowledged by end of final drain; missing input row and missing ack reported separately",
       "max": 0
@@ -226,7 +271,12 @@
   },
   "calculations": {
     "percentile": "nearest-rank: ascending successful samples at index ceil(q*n)-1",
-    "minimumSamples": { "p50": 20, "p95": 200, "p99": 1000, "below": "incomplete" },
+    "minimumSamples": {
+      "p50": 20,
+      "p95": 200,
+      "p99": 1000,
+      "below": "incomplete"
+    },
     "population": "pooled across both machines within one lane run; never across lanes or repetitions",
     "errorRate": "nonInjected failed attempts / scheduled steady attempts",
     "verdict": "pass only if every gated item passes on every lane run; a definite breach => fail (takes precedence); otherwise any missing/insufficient evidence => incomplete"

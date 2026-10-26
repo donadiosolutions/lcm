@@ -99,6 +99,9 @@ describe("CI plan classification", () => {
     expect(graphInvisibleTests("test/certification/contract-v1.json")).toEqual([
       "test/certification/contract.test.ts", "test/certification/evidence.test.ts", "test/certification/gate.test.ts", "test/certification/round2-acceptance.test.ts",
     ]);
+    expect(graphInvisibleTests("test/certification/contract-v1.approval.json")).toEqual([
+      "test/certification/contract.test.ts", "test/certification/evidence.test.ts", "test/certification/gate.test.ts", "test/certification/round2-acceptance.test.ts",
+    ]);
     expect(graphInvisibleTests("test/certification/evidence-schema.json")).toEqual([
       "test/certification/contract.test.ts", "test/certification/evidence.test.ts", "test/certification/gate.test.ts", "test/certification/round2-acceptance.test.ts",
     ]);

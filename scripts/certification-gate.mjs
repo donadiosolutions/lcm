@@ -387,8 +387,8 @@ export function assembleGateFromEvidence(input, dependencies = {}) {
     ...manifest,
     evidenceDirectory: input.evidenceDirectory,
     contractSha256: loaded.sha256,
-    contractStatus: loaded.contract.status,
-    approval: loaded.contract.approval,
+    contractStatus: loaded.status,
+    approval: loaded.approval,
     provenance: execution,
   });
   const schema = JSON.parse(readFileSync(new URL("../test/certification/evidence-schema.json", import.meta.url), "utf8"));

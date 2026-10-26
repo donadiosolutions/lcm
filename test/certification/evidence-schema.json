@@ -15,9 +15,10 @@
         "status": { "const": "approved" },
         "approval": {
           "type": "object",
-          "required": ["approvedAt", "approvalRef", "approvedBy"],
+          "required": ["contractSha256", "approvedAt", "approvalRef", "approvedBy"],
           "additionalProperties": false,
           "properties": {
+            "contractSha256": { "type": "string", "pattern": "^[0-9a-f]{64}$" },
             "approvedAt": { "type": "string", "minLength": 20 },
             "approvalRef": { "type": "string", "minLength": 1 },
             "approvedBy": { "type": "string", "minLength": 1 },

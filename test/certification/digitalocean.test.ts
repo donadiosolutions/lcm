@@ -26,6 +26,36 @@ describe("certification DigitalOcean lifecycle", () => {
     expect(() => readDigitalOceanToken(path)).toThrow("0600");
   });
 
+  it.each([
+    ["plain", "access-token: yaml-token\ncontext: default\n"],
+    ["single-quoted", "access-token: 'yaml-token'\ncontext: default\n"],
+    ["double-quoted", "access-token: \"yaml-token\"\ncontext: default\n"],
+  ])("extracts one top-level access token from a %s doctl config", (_name, contents) => {
+    const directory = mkdtempSync(join(tmpdir(), "lcm-cert-do-config-"));
+    const path = join(directory, "config.yaml");
+    writeFileSync(path, contents, { mode: 0o600 });
+
+    expect(readDigitalOceanToken(path)).toBe("yaml-token");
+  });
+
+  it("rejects missing, repeated, and non-owner doctl credentials", () => {
+    const directory = mkdtempSync(join(tmpdir(), "lcm-cert-do-invalid-config-"));
+    const missing = join(directory, "missing.yaml");
+    const repeated = join(directory, "repeated.yaml");
+    const foreign = join(directory, "foreign-token");
+    writeFileSync(missing, "context: default\n", { mode: 0o600 });
+    writeFileSync(repeated, "access-token: first\naccess-token: second\n", { mode: 0o600 });
+    writeFileSync(foreign, "secret-token\n", { mode: 0o600 });
+
+    expect(() => readDigitalOceanToken(missing)).toThrow("exactly one top-level access-token");
+    expect(() => readDigitalOceanToken(repeated)).toThrow("exactly one top-level access-token");
+    if (process.getuid) {
+      const getuid = vi.spyOn(process, "getuid").mockReturnValue(process.getuid() + 1);
+      try { expect(() => readDigitalOceanToken(foreign)).toThrow("owned by the current user"); }
+      finally { getuid.mockRestore(); }
+    }
+  });
+
   it("uses a fixed origin, registers the token before I/O and rejects redirects", async () => {
     const order: string[] = [];
     const client = createDigitalOceanClient({

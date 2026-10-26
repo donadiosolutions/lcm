@@ -13,7 +13,7 @@ describe("certification evidence", () => {
       evidenceDirectory: directory,
       contractSha256: "a".repeat(64),
       contractStatus: "approved",
-      approval: { approvedAt: "2026-10-26T10:00:00.000Z", approvalRef: "issue-629", approvedBy: "maintainer" },
+      approval: { contractSha256: "a".repeat(64), approvedAt: "2026-10-26T10:00:00.000Z", approvalRef: "issue-629", approvedBy: "maintainer" },
       startedAt: "2026-10-26T10:01:00.000Z",
       lane: "local",
       profile: "full",

@@ -5,11 +5,12 @@ LCM machine identities against PostgreSQL 18. It records the exact contract,
 machine identities, scheduled attempts, operation samples, fault steps, cleanup
 witnesses, and SLO calculations needed to reproduce a gate decision.
 
-The committed contract starts in `draft` status. The harness refuses to collect
-evidence until a maintainer changes it to `approved` and fills in `approvedBy`,
-`approvedAt`, and `approvalRef`. Freeze that approval before running either lane.
-Changing the contract afterward changes its SHA-256 and invalidates prior gate
-evidence.
+The committed contract remains byte-for-byte in `draft` status. Approval lives in
+`test/certification/contract-v1.approval.json`, which names the approved contract
+SHA-256, approver, approval time, and approval reference. The harness refuses to
+collect evidence unless that hash matches the contract bytes, and evidence must
+start at or after the approval time. Changing either file invalidates the binding;
+changing the contract requires a new approval record.
 
 ## What the two machines mean
 
@@ -84,11 +85,14 @@ harness verifies that all owned resources and private roots are gone.
 
 Managed execution is authorized separately because it creates a billable provider
 resource. Supply the token only through a regular mode-0600 file outside the
-repository. Supply a canonical public IPv4 address for the single firewall rule
-and private paths for the created-ID receipt and evidence:
+repository that is owned by the current user. The file can contain only the bare
+token or can be a `doctl` `config.yaml` with exactly one top-level
+`access-token:` scalar, either plain or quoted. Supply a canonical public IPv4
+address for the single firewall rule and private paths for the created-ID receipt
+and evidence:
 
 ```bash
-LCM_CERT_DIGITALOCEAN_TOKEN_FILE=/absolute/private/do-token \
+LCM_CERT_DIGITALOCEAN_TOKEN_FILE=/absolute/private/do-token-or-config.yaml \
 LCM_CERT_TRUSTED_IPV4=203.0.113.8 \
 LCM_CERT_RUN_ID=run12345 \
 LCM_CERT_CREATED_ID_RECEIPT=/absolute/private/created-cluster.json \

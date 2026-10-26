@@ -7,6 +7,34 @@ import { prepareEvidenceDirectory, runManagedMachinePair } from "./certification
 const API_ORIGIN = "https://api.digitalocean.com";
 const FAMILY_TAG = "lcm-cert";
 
+function parseDigitalOceanToken(contents) {
+  const text = contents.trim();
+  if (!text) throw new Error("DigitalOcean token file is invalid");
+  const matches = contents.split(/\r?\n/u).filter((line) => /^access-token\s*:/u.test(line));
+  if (matches.length === 0) {
+    if (text.includes("\n") || text.includes("\r") || text.includes(":")) {
+      throw new Error("DigitalOcean doctl config must contain exactly one top-level access-token");
+    }
+    return text;
+  }
+  if (matches.length !== 1) {
+    throw new Error("DigitalOcean doctl config must contain exactly one top-level access-token");
+  }
+  const scalar = matches[0].replace(/^access-token\s*:/u, "").trim();
+  let token;
+  if (/^"(?:[^"\\]|\\.)*"$/u.test(scalar)) {
+    token = JSON.parse(scalar);
+  } else if (/^'(?:[^']|'')*'$/u.test(scalar)) {
+    token = scalar.slice(1, -1).replace(/''/gu, "'");
+  } else if (/^\S+$/u.test(scalar)) {
+    token = scalar;
+  }
+  if (typeof token !== "string" || token.length === 0 || /[\r\n]/u.test(token)) {
+    throw new Error("DigitalOcean access-token scalar is invalid");
+  }
+  return token;
+}
+
 export function readDigitalOceanToken(path) {
   if (typeof path !== "string" || path.length === 0) throw new Error("DigitalOcean token file is required");
   let descriptor;
@@ -14,6 +42,9 @@ export function readDigitalOceanToken(path) {
     descriptor = openSync(path, constants.O_RDONLY | constants.O_NOFOLLOW);
     const status = fstatSync(descriptor);
     if (!status.isFile()) throw new Error("DigitalOcean token path must be a regular file");
+    if (process.platform !== "win32" && process.getuid && status.uid !== process.getuid()) {
+      throw new Error("DigitalOcean token file must be owned by the current user");
+    }
     if (process.platform !== "win32" && (status.mode & 0o777) !== 0o600) {
       throw new Error("DigitalOcean token file must use mode 0600");
     }
@@ -26,9 +57,7 @@ export function readDigitalOceanToken(path) {
       offset += count;
     }
     if (offset !== status.size) throw new Error("DigitalOcean token file changed while reading");
-    const token = buffer.toString("utf8").trim();
-    if (!token || token.includes("\n") || token.includes("\r")) throw new Error("DigitalOcean token file is invalid");
-    return token;
+    return parseDigitalOceanToken(buffer.toString("utf8"));
   } finally {
     if (descriptor !== undefined) closeSync(descriptor);
   }
@@ -360,9 +389,10 @@ export async function runDigitalOceanLifecycle(input) {
 
 export async function runManagedCertification(options, dependencies = {}) {
   const environment = dependencies.environment ?? process.env;
-  const token = dependencies.token ?? readDigitalOceanToken(environment.LCM_CERT_DIGITALOCEAN_TOKEN_FILE);
   const secrets = dependencies.secrets ?? [];
   const registerSecret = dependencies.registerSecret ?? ((secret) => secrets.push(secret));
+  const token = dependencies.token ?? readDigitalOceanToken(environment.LCM_CERT_DIGITALOCEAN_TOKEN_FILE);
+  registerSecret(token);
   const client = dependencies.client ?? createDigitalOceanClient({
     token,
     registerSecret,
@@ -370,7 +400,14 @@ export async function runManagedCertification(options, dependencies = {}) {
   });
   const lifecycle = dependencies.runLifecycle ?? runDigitalOceanLifecycle;
   if (dependencies.prepareEvidence !== false) {
-    prepareEvidenceDirectory(options.evidenceDirectory, { lane: "managed", profile: options.profile, runId: environment.LCM_CERT_RUN_ID, startedAt: new Date().toISOString() });
+    prepareEvidenceDirectory(options.evidenceDirectory, {
+      lane: "managed",
+      profile: options.profile,
+      runId: environment.LCM_CERT_RUN_ID,
+      contractSha256: options.contractSha256,
+      approval: options.approval,
+      startedAt: new Date().toISOString(),
+    });
   }
   const receiptPath = environment.LCM_CERT_CREATED_ID_RECEIPT;
   const lockPath = environment.LCM_CERT_FAMILY_LOCK_FILE ?? join(dirname(receiptPath), "lcm-cert-family.lock");

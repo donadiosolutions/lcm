@@ -3447,6 +3447,19 @@ describe("PostgreSQL harness utilities", () => {
       expect(output).toBe("login [REDACTED] ok postgresql://[REDACTED] tail\n");
     });
 
+    it("preserves JSON syntax while redacting a credential URL", () => {
+      const redactor = createStreamRedactor([])!;
+      const input = `${JSON.stringify([{
+        Config: { Env: ["LCM_POSTGRES_URL=postgresql://user:password@host/db"] },
+      }], null, 2)}\n`;
+      const output = redactor.write(input) + redactor.end();
+
+      expect(JSON.parse(output)[0].Config.Env).toEqual([
+        "LCM_POSTGRES_URL=postgresql://[REDACTED]",
+      ]);
+      expect(output).not.toContain("user:password");
+    });
+
     it("decodes multibyte characters split across chunks", () => {
       const redactor = createStreamRedactor([])!;
       const bytes = Buffer.from("€ ok\n");

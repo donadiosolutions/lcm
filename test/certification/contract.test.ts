@@ -1,3 +1,4 @@
+import { createHash } from "node:crypto";
 import { mkdtempSync, readFileSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -8,6 +9,8 @@ import {
 } from "./contract.mjs";
 
 const contractPath = new URL("./contract-v1.json", import.meta.url);
+const approvalPath = new URL("./contract-v1.approval.json", import.meta.url);
+const approvedContractSha256 = "b62288ae79e24b1ff69b2b8dd2149e14657383113d757c196a457d974067c188";
 
 describe("certification contract", () => {
   it("loads the draft for planning and derives the frozen full schedule counts", () => {
@@ -24,8 +27,32 @@ describe("certification contract", () => {
     });
   });
 
-  it("refuses evidence collection while the contract is a draft", () => {
-    expect(() => loadCertificationContract(contractPath)).toThrow("approved");
+  it("binds evidence collection to the external approval record", () => {
+    const loaded = loadCertificationContract(contractPath);
+
+    expect(loaded.contract.status).toBe("draft");
+    expect(loaded.sha256).toBe(approvedContractSha256);
+    expect(loaded.approval).toEqual({
+      contractSha256: approvedContractSha256,
+      approvedBy: "bcdonadio (repository owner)",
+      approvedAt: "2026-10-26T20:30:00Z",
+      approvalRef: "issue #629 threshold approval relayed in Epic #228 run",
+    });
+  });
+
+  it("rejects an approval record bound to different contract bytes", () => {
+    const directory = mkdtempSync(join(tmpdir(), "lcm-cert-contract-approval-"));
+    const path = join(directory, "contract.json");
+    const approval = join(directory, "contract.approval.json");
+    writeFileSync(path, readFileSync(contractPath));
+    writeFileSync(approval, `${JSON.stringify({
+      ...JSON.parse(readFileSync(approvalPath, "utf8")),
+      contractSha256: "0".repeat(64),
+    })}\n`);
+
+    expect(() => loadCertificationContract(path, { approvalPath: approval })).toThrow(
+      "approval hash",
+    );
   });
 
   it("rejects a schedule whose expected counts miss a minimum sample floor", () => {
@@ -63,6 +90,10 @@ describe("certification contract", () => {
     expect(() => loadCertificationContract(write("floor", (value) => { value.calculations.minimumSamples.p99 = 999; }), { requireApproved: false })).toThrow("sample floors");
     expect(() => loadCertificationContract(write("counts", (value) => { value.workload.expectedPerMachine.daemonStore = 599; }), { requireApproved: false })).toThrow("per-machine");
     expect(() => loadCertificationContract(write("capacity", (value) => { value.thresholds.capacity.totalMax = 20; }), { requireApproved: false })).toThrow("capacity");
-    expect(() => loadCertificationContract(write("approval", (value) => { value.status = "approved"; value.approval = { ...value.approval, approvedBy: "x", approvedAt: "not-a-date", approvalRef: "x" }; }))).toThrow("approvedAt");
+    const approvalContract = write("approval", () => undefined);
+    const approval = join(directory, "approval.approval.json");
+    const approvalSha256 = createHash("sha256").update(readFileSync(approvalContract)).digest("hex");
+    writeFileSync(approval, `${JSON.stringify({ contractSha256: approvalSha256, approvedBy: "x", approvedAt: "not-a-date", approvalRef: "x" })}\n`);
+    expect(() => loadCertificationContract(approvalContract, { approvalPath: approval })).toThrow("approvedAt");
   });
 });

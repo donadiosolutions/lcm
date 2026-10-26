@@ -2,10 +2,13 @@
 import { execFile, spawn } from "node:child_process";
 import { appendFileSync, existsSync, mkdirSync, readFileSync, readdirSync, statSync, writeFileSync } from "node:fs";
 import { dirname, join } from "node:path";
+import { pathToFileURL } from "node:url";
 import { promisify } from "node:util";
 import { Worker } from "node:worker_threads";
 import { createHash } from "node:crypto";
+import { connect as tlsConnect } from "node:tls";
 import { createDeterministicSchedule, createFaultSchedule } from "./schedule.mjs";
+import { publishPostgreSqlBackend } from "./backend-publication.mjs";
 import { loadCertificationContract } from "./contract.mjs";
 
 const execFileAsync = promisify(execFile);
@@ -32,16 +35,13 @@ export function createHookFixture({ kind, bytes, sessionId, cwd }) {
   throw new Error("unsupported hook fixture kind");
 }
 
-export function machineConfigEntries(environment) {
+export function machineStoredConfig(environment) {
   if (!environment.LCM_CERT_MIGRATION_ROLE) throw new Error("certification migration role is required");
-  return [
-    ["storage.backend", "postgresql"],
-    ["storage.postgresql.migrationRole", environment.LCM_CERT_MIGRATION_ROLE],
-    ["summarizer.mock", "true"],
-    ["hooks.disableAutoCompact", "true"],
-    ["hooks.snapshotIntervalSec", "1"],
-    ["storage.postgresql.poolMax", "2"],
-  ];
+  return {
+    summarizer: { mock: true },
+    hooks: { disableAutoCompact: true, snapshotIntervalSec: 1 },
+    storage: { postgresql: { poolMax: 2 } },
+  };
 }
 
 export function isAcknowledgedRow(row) {
@@ -223,18 +223,53 @@ export function classifyTlsRejection(error) {
   return "transport-or-other";
 }
 
+async function probeRawTlsRejection(url, caFile) {
+  const endpoint = new URL(url);
+  return new Promise((resolve, reject) => {
+    const socket = tlsConnect({
+      host: endpoint.hostname,
+      port: Number(endpoint.port || 5432),
+      servername: endpoint.hostname,
+      ca: readFileSync(caFile),
+      rejectUnauthorized: true,
+    });
+    const timeout = setTimeout(() => {
+      socket.destroy();
+      resolve(new Error("raw TLS probe timed out"));
+    }, 10_000);
+    timeout.unref?.();
+    socket.once("secureConnect", () => {
+      clearTimeout(timeout);
+      socket.end();
+      reject(new Error("raw TLS negative probe unexpectedly succeeded"));
+    });
+    socket.once("error", (error) => {
+      clearTimeout(timeout);
+      resolve(error);
+    });
+  });
+}
+
+export async function verifyTlsNegativeProbe({ expected, clientProbe, tlsProbe }) {
+  let clientRejected = false;
+  try { await clientProbe(); } catch { clientRejected = true; }
+  if (!clientRejected) throw new Error(`TLS negative probe unexpectedly succeeded for ${expected}`);
+  const classification = classifyTlsRejection(await tlsProbe());
+  if (classification !== expected) {
+    throw new Error(`TLS negative probe returned ${classification}, expected ${expected}`);
+  }
+  return classification;
+}
+
 async function requireTlsRejection(entrypoint, environment, url, caFile, expected, cwd) {
-  try {
-    await runCli(entrypoint, ["project", "list", "--json"], {
+  return verifyTlsNegativeProbe({
+    expected,
+    clientProbe: () => runCli(entrypoint, ["project", "list", "--json"], {
       cwd,
       env: { ...environment, LCM_POSTGRES_URL: url, LCM_POSTGRES_CA_FILE: caFile },
-    });
-  } catch (error) {
-    const classification = classifyTlsRejection(error);
-    if (classification === expected) return classification;
-    throw new Error(`TLS negative probe returned ${classification}, expected ${expected}`, { cause: error });
-  }
-  throw new Error(`TLS negative probe unexpectedly succeeded for ${expected}`);
+    }),
+    tlsProbe: () => probeRawTlsRejection(url, caFile),
+  });
 }
 
 export async function executeDeterministicSchedule({
@@ -488,6 +523,82 @@ async function waitForAcknowledgmentCatchUp(home, evidenceDirectory, phase, dead
   return result;
 }
 
+export async function startForegroundDaemon({
+  entrypoint,
+  environment,
+  cwd,
+  daemonArguments,
+  spawnProcess = spawn,
+  healthProbe,
+  delay = (milliseconds) => new Promise((resolve) => setTimeout(resolve, milliseconds)),
+}) {
+  const child = spawnProcess(process.execPath, daemonArguments ?? [entrypoint, "daemon", "start", "--foreground"], {
+    cwd,
+    env: environment,
+    stdio: ["ignore", "pipe", "pipe"],
+  });
+  const stdout = [];
+  const stderr = [];
+  const append = (target, chunk) => {
+    target.push(Buffer.from(chunk));
+    while (Buffer.concat(target).length > 64 * 1024) target.shift();
+  };
+  child.stdout?.on("data", (chunk) => append(stdout, chunk));
+  child.stderr?.on("data", (chunk) => append(stderr, chunk));
+  let exitState;
+  const exited = new Promise((resolve) => {
+    child.once("error", (error) => { exitState = { error }; resolve(exitState); });
+    child.once("exit", (code, signal) => { exitState = { code, signal }; resolve(exitState); });
+  });
+  const output = () => [Buffer.concat(stderr).toString("utf8"), Buffer.concat(stdout).toString("utf8")]
+    .map((value) => value.trim()).filter(Boolean).join("\n");
+  const assertRunning = () => {
+    if (exitState) throw new Error(`foreground daemon exited unexpectedly${output() ? `: ${output()}` : ""}`, { cause: exitState.error });
+  };
+  const probe = healthProbe ?? (() => execFileAsync(process.execPath, [entrypoint, "status", "--json"], {
+    cwd, env: environment, timeout: 5_000,
+  }));
+  for (let attempt = 0; attempt < 240; attempt += 1) {
+    if (exitState) throw new Error(`foreground daemon exited before readiness${output() ? `: ${output()}` : ""}`, { cause: exitState.error });
+    try {
+      await probe();
+      await delay(100);
+      assertRunning();
+      let stopping;
+      return {
+        assertRunning,
+        stop() {
+          stopping ??= (async () => {
+            if (exitState) return;
+            child.kill("SIGTERM");
+            let timeout;
+            await Promise.race([
+              exited,
+              new Promise((_, reject) => { timeout = setTimeout(() => reject(new Error("foreground daemon did not stop")), 10_000); }),
+            ]).finally(() => clearTimeout(timeout));
+          })();
+          return stopping;
+        },
+      };
+    } catch {
+      await delay(250);
+    }
+  }
+  if (!exitState) child.kill("SIGTERM");
+  await Promise.race([exited, delay(10_000)]);
+  throw new Error(`foreground daemon did not become ready${output() ? `: ${output()}` : ""}`);
+}
+
+export async function captureDoctorEvidence(run) {
+  try {
+    const result = await run();
+    return { stdout: result.stdout, exitCode: 0 };
+  } catch (error) {
+    if (typeof error?.stdout !== "string" || error.stdout.length === 0) throw error;
+    return { stdout: error.stdout, exitCode: Number.isInteger(error.code) ? error.code : 1 };
+  }
+}
+
 export async function runMachineAgent(environment = process.env) {
   const evidenceDirectory = environment.LCM_CERT_EVIDENCE_DIR;
   const machine = process.argv[process.argv.indexOf("--machine") + 1];
@@ -504,9 +615,14 @@ export async function runMachineAgent(environment = process.env) {
     JSON.stringify({ timestamp: new Date().toISOString(), type: "response_item", payload: { type: "message", role: "user", content: [{ type: "input_text", text: "Certification transcript fixture." }] } }),
   ].join("\n") + "\n", { mode: 0o600, flag: "wx" });
   environment.LCM_CERT_TRANSCRIPT_PATH = transcriptPath;
-  for (const [path, value] of machineConfigEntries(environment)) {
-    await execFileAsync(process.execPath, [lcm, "config", "set", path, value, "--json"], { cwd: project, env: environment, timeout: 60_000 });
-  }
+  const configDirectory = join(environment.HOME, ".lcm");
+  mkdirSync(configDirectory, { recursive: true, mode: 0o700 });
+  writeFileSync(join(configDirectory, "config.json"), `${JSON.stringify(machineStoredConfig(environment), null, 2)}\n`, { mode: 0o600, flag: "wx" });
+  await publishPostgreSqlBackend({
+    homeDir: environment.HOME,
+    packageRoot: "/opt/lcm",
+    publicationId: `certification-${environment.LCM_CERT_RUN_ID}-${machine}`,
+  });
   await execFileAsync(process.execPath, [lcm, "machine", "register", "--name", name, "--json"], { cwd: project, env: environment, timeout: 60_000 });
   const tlsReadiness = {
     wrongCa: await requireTlsRejection(lcm, environment, environment.LCM_POSTGRES_URL, environment.LCM_CERT_WRONG_CA_FILE, "certificate-authority", project),
@@ -514,14 +630,26 @@ export async function runMachineAgent(environment = process.env) {
   };
   const identity = await execFileAsync(process.execPath, [lcm, "machine", "show", "--json"], { cwd: project, env: environment, timeout: 60_000 });
   writeFileSync(join(evidenceDirectory, "identity.json"), identity.stdout, { mode: 0o600, flag: "wx" });
+  const { DaemonClient } = await import(pathToFileURL("/opt/lcm/dist/src/daemon/client.js").href);
+  const daemonClient = new DaemonClient("http://127.0.0.1:3737", join(configDirectory, "daemon.token"));
+  const daemon = await startForegroundDaemon({
+    entrypoint: lcm,
+    environment,
+    cwd: project,
+    daemonArguments: ["/opt/lcm/certification/daemon-agent.mjs"],
+    healthProbe: async () => {
+      if (!await daemonClient.health()) throw new Error("foreground daemon is not healthy");
+    },
+  });
+  try {
   await execFileAsync(process.execPath, [lcm, "project", "create", project, "--name", `cert-${environment.LCM_CERT_RUN_ID}`, "--json"], { cwd: project, env: environment, timeout: 60_000 });
-  await execFileAsync(process.execPath, [lcm, "daemon", "start"], { env: environment, timeout: 60_000 });
-  const doctor = await execFileAsync(process.execPath, [lcm, "doctor", "--verbose"], { cwd: project, env: environment, timeout: 60_000 });
+  const doctor = await captureDoctorEvidence(() => execFileAsync(process.execPath, [lcm, "doctor", "--verbose"], { cwd: project, env: environment, timeout: 60_000 }));
   await execFileAsync(process.execPath, [lcm, "store", "certification readiness", "--tag", "type:solution", "--tag", "scope:project"], { cwd: project, env: environment, timeout: 60_000 });
   await execFileAsync(process.execPath, [lcm, "search", "certification readiness"], { cwd: project, env: environment, timeout: 60_000 });
   writeFileSync(join(evidenceDirectory, "readiness.json"), `${JSON.stringify({
     machine,
     tls: tlsReadiness,
+    doctorExitCode: doctor.exitCode,
     doctorSha256: createHash("sha256").update(doctor.stdout).digest("hex"),
     doctor: doctor.stdout,
   }, null, 2)}\n`, { mode: 0o600, flag: "wx" });
@@ -589,6 +717,9 @@ export async function runMachineAgent(environment = process.env) {
     }
     const drainSeconds = environment.LCM_CERT_PROFILE === "full" ? 900 : 660;
     await new Promise((resolve) => setTimeout(resolve, drainSeconds * 1000));
+  } catch (error) {
+    daemon.assertRunning();
+    throw error;
   } finally {
     observerAbort.abort();
     observerResult = await observer;
@@ -614,13 +745,17 @@ export async function runMachineAgent(environment = process.env) {
   }
   writeFileSync(join(evidenceDirectory, "drain.json"), `${JSON.stringify(drain)}\n`, { mode: 0o600, flag: "wx" });
   if (drainError) throw drainError;
-  const finalDoctor = await execFileAsync(process.execPath, [lcm, "doctor", "--verbose"], { cwd: project, env: environment, timeout: 60_000 });
+  const finalDoctor = await captureDoctorEvidence(() => execFileAsync(process.execPath, [lcm, "doctor", "--verbose"], { cwd: project, env: environment, timeout: 60_000 }));
   writeFileSync(join(evidenceDirectory, "final-diagnostics.json"), `${JSON.stringify({
     doctorSha256: createHash("sha256").update(finalDoctor.stdout).digest("hex"),
     doctor: finalDoctor.stdout,
+    doctorExitCode: finalDoctor.exitCode,
     sweepTimestamps,
   })}\n`, { mode: 0o600, flag: "wx" });
   await waitForControl(join(evidenceDirectory, "clock-finished.json"), { deadlineMs: Date.now() + 120_000 });
+  } finally {
+    await daemon.stop();
+  }
 }
 
 if (import.meta.url === `file://${process.argv[1]}`) {

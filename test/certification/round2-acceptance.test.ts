@@ -10,7 +10,7 @@ import {
 } from "../../scripts/certification-digitalocean.mjs";
 import {
   classifyTlsRejection,
-  machineConfigEntries,
+  machineStoredConfig,
 } from "./machine-agent.mjs";
 import {
   cleanupVerdict,
@@ -32,17 +32,15 @@ describe("round 2 certification acceptance helpers", () => {
     const args = buildMachineContainerArgs({
       machine: "a", name: "machine-a", hostname: "machine-a", network: "network",
       image: "node@sha256:" + "a".repeat(64), ownerLabels: { kind: "machine-a" },
-      stagedPackage: "/stage", home: "/home", caFile: "/ca", wrongCaFile: "/wrong-ca",
+      stagedPackage: "/stage", homeParent: "/home-parent", caFile: "/ca", wrongCaFile: "/wrong-ca",
       evidenceDirectory: "/evidence", environmentFile: "/env",
     });
     expect(args).toContain("--userns=keep-id:uid=1000,gid=1000");
   });
 
-  it("selects PostgreSQL with the lane migration role before readiness", () => {
-    expect(machineConfigEntries({ LCM_CERT_MIGRATION_ROLE: "lcm_test_migrator" })).toEqual(expect.arrayContaining([
-      ["storage.backend", "postgresql"],
-      ["storage.postgresql.migrationRole", "lcm_test_migrator"],
-    ]));
+  it("requires the lane migration role without persisting the protected value", () => {
+    expect(JSON.stringify(machineStoredConfig({ LCM_CERT_MIGRATION_ROLE: "lcm_test_migrator" }))).not.toContain("migrationRole");
+    expect(() => machineStoredConfig({})).toThrow("migration role");
   });
 
   it("derives phase deadlines from the contract instead of a 360 second default", () => {

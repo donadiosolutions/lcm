@@ -15,12 +15,16 @@ function rawFixture(options: Variant = {}) {
   const root = mkdtempSync(join(tmpdir(), "lcm-cert-raw-gate-"));
   const output = join(root, "gate");
   const contract = JSON.parse(readFileSync(new URL("./contract-v1.json", import.meta.url), "utf8"));
-  contract.status = "approved";
-  contract.approval = { ...contract.approval, approvedBy: "maintainer", approvedAt: "2026-10-26T10:00:00.000Z", approvalRef: "issue-629" };
   const contractText = `${JSON.stringify(contract)}\n`;
   const contractPath = join(root, "contract.json");
   writeFileSync(contractPath, contractText);
   const contractSha256 = createHash("sha256").update(contractText).digest("hex");
+  writeJson(join(root, "contract.approval.json"), {
+    contractSha256,
+    approvedBy: "maintainer",
+    approvedAt: "2026-10-26T10:00:00.000Z",
+    approvalRef: "issue-629",
+  });
   const provenance = {
     testedCommit: "c".repeat(40), dirty: false, testedInputsSha256: "d".repeat(64), testedInputsCount: 100,
     lockfileSha256: "e".repeat(64), cliSha256: "f".repeat(64), stagedPackageSha256: "1".repeat(64),
@@ -111,7 +115,7 @@ function rawFixture(options: Variant = {}) {
   const current = { ...provenance } as Record<string, unknown>;
   delete current.stagedPackageSha256;
   delete current.contractSha256;
-  return { root, output, contractPath, provenance: current };
+  return { root, output, contractPath, contractSha256, provenance: current };
 }
 
 function assemble(fixture: ReturnType<typeof rawFixture>) {
@@ -129,6 +133,11 @@ describe("certification raw evidence pipeline", () => {
     writeJson(join(fixture.root, "evidence-manifest.json"), { slos: [{ id: "forged", verdict: "pass" }] });
     const result = assemble(fixture);
     expect(result.gate.verdict).toBe("pass");
+    expect(result.gate.contract).toMatchObject({
+      sha256: fixture.contractSha256,
+      status: "approved",
+      approval: { contractSha256: fixture.contractSha256 },
+    });
     expect(result.gate.slos.some((slo: any) => slo.id === "forged")).toBe(false);
     expect(JSON.parse(readFileSync(result.paths.json, "utf8"))).toEqual(result.gate);
   });

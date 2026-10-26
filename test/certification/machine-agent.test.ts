@@ -1,20 +1,34 @@
 import { mkdtempSync, readFileSync } from "node:fs";
+import { EventEmitter } from "node:events";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { describe, expect, it } from "vitest";
+import { describe, expect, it, vi } from "vitest";
 import {
   createAdmissionController,
   createHookFixture,
+  captureDoctorEvidence,
   executeDeterministicSchedule,
   isAcknowledgedRow,
+  machineStoredConfig,
   observeAcknowledgments,
+  startForegroundDaemon,
   verifyFinalDrain,
   verifyEmissionBudget,
+  verifyTlsNegativeProbe,
 } from "./machine-agent.mjs";
 import { extractPostToolEvents, extractUserPromptEvents } from "../../src/hooks/extractors.js";
 import { normalizePostToolInput } from "../../src/hooks/post-tool-normalization.js";
 
 describe("certification machine agent", () => {
+  it("configures typed values before backend publication", () => {
+    expect(machineStoredConfig({ LCM_CERT_MIGRATION_ROLE: "lcm_test_migrator" })).toEqual({
+      summarizer: { mock: true },
+      hooks: { disableAutoCompact: true, snapshotIntervalSec: 1 },
+      storage: { postgresql: { poolMax: 2 } },
+    });
+    expect(() => machineStoredConfig({})).toThrow("migration role");
+  });
+
   it.each([256, 1024, 8192])("creates exact-byte one-event fixtures for %i bytes", (bytes) => {
     const userPrompt = createHookFixture({ kind: "user-prompt", bytes, sessionId: "s0", cwd: "/project" });
     const postTool = createHookFixture({ kind: "post-tool", bytes, sessionId: "s0", cwd: "/project" });
@@ -35,6 +49,54 @@ describe("certification machine agent", () => {
   it("recognizes only terminal acknowledged rows", () => {
     expect(isAcknowledgedRow({ delivery_state: "acknowledged", remote_inbox_id: "i", acknowledged_at: "now" })).toBe(true);
     expect(isAcknowledgedRow({ delivery_state: "replicated", remote_inbox_id: "i", acknowledged_at: null })).toBe(false);
+  });
+
+  it("requires both the product client rejection and the expected raw TLS class", async () => {
+    await expect(verifyTlsNegativeProbe({
+      expected: "certificate-authority",
+      clientProbe: async () => { throw new Error("LCM command failed"); },
+      tlsProbe: async () => new Error("self signed certificate in certificate chain"),
+    })).resolves.toBe("certificate-authority");
+    await expect(verifyTlsNegativeProbe({
+      expected: "certificate-authority",
+      clientProbe: async () => undefined,
+      tlsProbe: async () => new Error("self signed certificate in certificate chain"),
+    })).rejects.toThrow("unexpectedly succeeded");
+  });
+
+  it("owns a foreground daemon child through bounded startup and stop", async () => {
+    const child = new EventEmitter() as any;
+    child.stdout = new EventEmitter();
+    child.stderr = new EventEmitter();
+    child.kill = vi.fn(() => {
+      queueMicrotask(() => child.emit("exit", 0, null));
+      return true;
+    });
+    const spawnProcess = vi.fn(() => child);
+    const daemon = await startForegroundDaemon({
+      entrypoint: "/opt/lcm/dist/lcm.mjs",
+      environment: {},
+      cwd: "/project",
+      daemonArguments: ["/opt/lcm/certification/daemon-agent.mjs"],
+      spawnProcess,
+      healthProbe: async () => undefined,
+      delay: async () => undefined,
+    });
+
+    await daemon.stop();
+    expect(spawnProcess).toHaveBeenCalledWith(process.execPath, [
+      "/opt/lcm/certification/daemon-agent.mjs",
+    ], expect.objectContaining({ cwd: "/project" }));
+    expect(child.kill).toHaveBeenCalledWith("SIGTERM");
+  });
+
+  it("retains an isolated-home doctor report when connector checks are nonzero", async () => {
+    const failure = Object.assign(new Error("doctor failed"), { stdout: "10 passed · 1 failed\n", code: 1 });
+    await expect(captureDoctorEvidence(async () => { throw failure; })).resolves.toEqual({
+      stdout: "10 passed · 1 failed\n",
+      exitCode: 1,
+    });
+    await expect(captureDoctorEvidence(async () => { throw new Error("no report"); })).rejects.toThrow("no report");
   });
 
   it("records first-seen monotonic time and distinct inbox ids", () => {

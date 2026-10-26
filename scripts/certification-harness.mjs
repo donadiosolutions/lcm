@@ -8,6 +8,7 @@ import { isAbsolute, join, relative } from "node:path";
 import { fileURLToPath, pathToFileURL } from "node:url";
 import { NODE_IMAGE, POSTGRES_IMAGE } from "./postgresql-images.mjs";
 import { loadCertificationContract } from "../test/certification/contract.mjs";
+import { publishPostgreSqlBackend } from "../test/certification/backend-publication.mjs";
 import { createDeterministicSchedule } from "../test/certification/schedule.mjs";
 import { createOwnerIdentity, createProcessLifecycle, createRunNames, ownershipLabels, removeOwnedResource, runHarness, runSanitizedProcess } from "./postgresql-harness.mjs";
 
@@ -33,6 +34,13 @@ export function captureExecutionProvenance(root, contractSha256, stagedPackageSh
     contractSha256,
     node: process.version,
   };
+}
+
+export function assertExecutionProvenance(profile, provenance) {
+  if (profile === "full" && provenance.dirty) {
+    throw new Error("certification execution checkout must be clean");
+  }
+  return provenance;
 }
 
 export const DATABASE_IDENTITY_SQL = `SELECT current_setting('server_version_num')::integer AS server_version_num,
@@ -74,10 +82,15 @@ export function recoveryWindowSearch(samples, { machine, clearedAtMs, deadlineMs
 }
 
 export function parseCertificationArguments(argv) {
+  const separator = argv.indexOf("--");
+  if (separator !== -1 && argv.lastIndexOf("--") !== separator) throw new Error("invalid certification arguments");
+  const argumentsWithoutSeparator = separator === -1
+    ? argv
+    : [...argv.slice(0, separator), ...argv.slice(separator + 1)];
   const values = new Map();
-  for (let index = 0; index < argv.length; index += 2) {
-    const option = argv[index];
-    const value = argv[index + 1];
+  for (let index = 0; index < argumentsWithoutSeparator.length; index += 2) {
+    const option = argumentsWithoutSeparator[index];
+    const value = argumentsWithoutSeparator[index + 1];
     if (!option?.startsWith("--") || value === undefined) throw new Error("invalid certification arguments");
     values.set(option, value);
   }
@@ -105,7 +118,7 @@ export function buildMachineContainerArgs(input) {
   if (input.environmentFile) args.push("--env-file", input.environmentFile);
   args.push(
     "--volume", `${input.stagedPackage}:/opt/lcm:ro,z`,
-    "--volume", `${input.home}:/home/lcm:Z`,
+    "--volume", `${input.homeParent}:/home/lcm-parent:Z`,
     "--volume", `${input.caFile}:/run/lcm-ca/ca.crt:ro,z`,
     ...(input.wrongCaFile ? ["--volume", `${input.wrongCaFile}:/run/lcm-ca/wrong-ca.crt:ro,z`] : []),
     "--volume", `${input.evidenceDirectory}:/evidence:Z`,
@@ -130,6 +143,36 @@ async function poll(predicate, { attempts = Number.POSITIVE_INFINITY, timeoutMs 
     await delay(1000);
   }
   throw new Error("certification machine phase timed out");
+}
+
+export async function assertMachinesRunning(machineNames, run) {
+  for (const name of machineNames) {
+    const inspected = await run(["container", "inspect", "--format", "{{json .State}}", name]);
+    const state = JSON.parse(inspected.stdout.trim());
+    if (state?.Running === true) continue;
+    const logs = await run(["container", "logs", name]).catch(() => ({ stdout: "", stderr: "" }));
+    const diagnostic = [logs.stderr, logs.stdout].map((value) => String(value ?? "").trim()).filter(Boolean).join("\n");
+    if (state?.Running === false) {
+      throw new Error(`certification machine ${name} exited with code ${state.ExitCode} before phase completed${diagnostic ? `: ${diagnostic}` : ""}`);
+    }
+    throw new Error(`certification machine ${name} has uncertain runtime state before phase completed${diagnostic ? `: ${diagnostic}` : ""}`);
+  }
+}
+
+export async function waitForMachineFiles({ paths, machineNames, run, exists = existsSync, timeoutMs, delay, signal }) {
+  return poll(async () => {
+    if (paths.every((path) => exists(path))) return true;
+    await assertMachinesRunning(machineNames, run);
+    return false;
+  }, { timeoutMs, delay, signal });
+}
+
+export async function monitorMachinesForDuration({ machineNames, run, durationMs, delay, now = Date.now, signal }) {
+  const deadline = now() + durationMs;
+  return poll(async () => {
+    await assertMachinesRunning(machineNames, run);
+    return now() >= deadline;
+  }, { timeoutMs: durationMs + 2_000, delay, now, signal });
 }
 
 function publishWarmupControl(evidenceDirectory, wallNow = Date.now) {
@@ -203,7 +246,7 @@ export async function runManagedMachinePair(input, dependencies = {}) {
     const executionProvenance = (dependencies.captureExecutionProvenance ?? captureExecutionProvenance)(
       dependencies.sourceRoot ?? repositoryRoot, input.contractSha256, stage.sha256,
     );
-    if (executionProvenance.dirty) throw new Error("certification execution checkout must be clean");
+    assertExecutionProvenance(input.profile, executionProvenance);
     mkdirSync(input.evidenceDirectory, { recursive: true, mode: 0o700 });
     writeFileSync(join(input.evidenceDirectory, "execution-provenance.json"), `${JSON.stringify(executionProvenance, null, 2)}\n`, { mode: 0o600, flag: "wx" });
     writeFileSync(caFile, input.privateConnection.ca, { mode: 0o600, flag: "wx" });
@@ -234,6 +277,14 @@ export async function runManagedMachinePair(input, dependencies = {}) {
   const run = (args) => processRunner(containerCli, args, { redactSecrets: input.secrets });
   const exists = dependencies.exists ?? existsSync;
   const delay = dependencies.delay;
+  const waitForFiles = (paths, machineNames, timeoutMs) => waitForMachineFiles({
+    paths, machineNames, run, exists, timeoutMs, delay, signal: input.signal,
+  });
+  const monitorDelay = (machineNames, durationMs) => dependencies.monitorMachineDelay
+    ? dependencies.monitorMachineDelay(machineNames, durationMs)
+    : delay
+      ? delay(durationMs)
+      : monitorMachinesForDuration({ machineNames, run, durationMs, signal: input.signal });
   let clockMonitor;
   try {
     await (dependencies.prepareDatabase ?? prepareManagedDatabase)({
@@ -268,17 +319,19 @@ export async function runManagedMachinePair(input, dependencies = {}) {
     await run(["network", "create", ...Object.entries(networkLabels).flatMap(([key, value]) => ["--label", `${key}=${value}`]), network]);
     for (const machine of ['a', 'b']) {
       const name = machine === 'a' ? names.machineA : names.machineB;
-      const home = join(runRoot, `home-${machine}`);
+      const homeParent = join(runRoot, `home-parent-${machine}`);
+      const home = join(homeParent, "home");
       const evidence = join(input.evidenceDirectory, `machine-${machine}`);
       mkdirSync(home, { recursive: true, mode: 0o700 });
       homes[machine] = home;
       mkdirSync(evidence, { recursive: true, mode: 0o700 });
       const environmentFile = join(runRoot, `machine-${machine}.env`);
       writeEnvironmentFile(environmentFile, {
-        HOME: "/home/lcm",
+        HOME: "/home/lcm-parent/home",
         LCM_CLIENT: "codex",
         LCM_POSTGRES_URL: input.privateConnection.runtimeUrl,
         LCM_POSTGRES_CA_FILE: "/run/lcm-ca/ca.crt",
+        LCM_POSTGRES_MIGRATION_ROLE: input.privateConnection.migratorName,
         LCM_CERT_MIGRATION_ROLE: input.privateConnection.migratorName,
         LCM_CERT_WRONG_CA_FILE: "/run/lcm-ca/wrong-ca.crt",
         LCM_CERT_WRONG_HOST_URL: urlAtHost(input.privateConnection.runtimeUrl, wrongHostname),
@@ -293,20 +346,22 @@ export async function runManagedMachinePair(input, dependencies = {}) {
       await run(buildMachineContainerArgs({
         machine, name, hostname: `lcm-cert-${machine}`, network, image: NODE_IMAGE,
         ownerLabels: labels,
-        stagedPackage: stage.root, home, caFile, wrongCaFile, evidenceDirectory: evidence,
+        stagedPackage: stage.root, homeParent, caFile, wrongCaFile, evidenceDirectory: evidence,
         environmentFile, wrongHost: { host: wrongHostname, address: endpointAddress },
       }));
     }
     await run(["container", "start", names.machineA]);
-    if (!dependencies.waitForReady) await poll(
-      () => exists(join(input.evidenceDirectory, "machine-a", "ready.json")),
-      { timeoutMs: contract.timeline.full.setupMaxSeconds * 1000, delay, signal: input.signal },
+    if (!dependencies.waitForReady) await waitForFiles(
+      [join(input.evidenceDirectory, "machine-a", "ready.json")],
+      [names.machineA],
+      contract.timeline.full.setupMaxSeconds * 1000,
     );
-    await (delay ?? ((ms) => new Promise((resolve) => setTimeout(resolve, ms))))(contract.timeline.full.secondDaemonStartOffsetSeconds * 1000);
+    await monitorDelay([names.machineA], contract.timeline.full.secondDaemonStartOffsetSeconds * 1000);
     await run(["container", "start", names.machineB]);
-    const waitForReady = dependencies.waitForReady ?? (() => poll(
-      () => exists(join(input.evidenceDirectory, "machine-b", "ready.json")),
-      { timeoutMs: contract.timeline.full.setupMaxSeconds * 1000, delay, signal: input.signal },
+    const waitForReady = dependencies.waitForReady ?? (() => waitForFiles(
+      [join(input.evidenceDirectory, "machine-b", "ready.json")],
+      [names.machineA, names.machineB],
+      contract.timeline.full.setupMaxSeconds * 1000,
     ));
     await waitForReady();
     const identities = (dependencies.verifyIdentities ?? verifyDistinctMachineIdentities)(homes);
@@ -319,33 +374,34 @@ export async function runManagedMachinePair(input, dependencies = {}) {
       evidenceDirectory: input.evidenceDirectory,
     });
     const warmupControl = publishWarmupControl(input.evidenceDirectory, dependencies.wallNow);
-    const waitForWarmupComplete = dependencies.waitForWarmupComplete ?? (() => poll(
-      () => ['a', 'b'].every((machine) => exists(join(input.evidenceDirectory, `machine-${machine}`, "warmup-complete.json"))),
-      { timeoutMs: contract.timeline[input.profile].warmupSeconds * 1000 + 120_000, delay, signal: input.signal },
+    const waitForWarmupComplete = dependencies.waitForWarmupComplete ?? (() => waitForFiles(
+      ['a', 'b'].map((machine) => join(input.evidenceDirectory, `machine-${machine}`, "warmup-complete.json")),
+      [names.machineA, names.machineB],
+      contract.timeline[input.profile].warmupSeconds * 1000 + 120_000,
     ));
     await waitForWarmupComplete();
     publishSteadyControl(input.evidenceDirectory, warmupControl, dependencies.wallNow);
     const growthBefore = await (dependencies.collectRelationBytes ?? collectDatabaseRelationBytes)({ url: input.privateConnection.runtimeUrl, ca: input.privateConnection.ca });
-    const waitForSteadyComplete = dependencies.waitForSteadyComplete ?? (() => poll(() => ['a', 'b'].every((machine) => exists(join(input.evidenceDirectory, `machine-${machine}`, "steady-complete.json"))), {
-      timeoutMs: phaseDeadlineMs(contract, input.profile, "fault-ready"), delay, signal: input.signal,
-    }));
+    const waitForSteadyComplete = dependencies.waitForSteadyComplete ?? (() => waitForFiles(
+      ['a', 'b'].map((machine) => join(input.evidenceDirectory, `machine-${machine}`, "steady-complete.json")),
+      [names.machineA, names.machineB],
+      phaseDeadlineMs(contract, input.profile, "fault-ready"),
+    ));
     await waitForSteadyComplete();
     const growthAfter = await (dependencies.collectRelationBytes ?? collectDatabaseRelationBytes)({ url: input.privateConnection.runtimeUrl, ca: input.privateConnection.ca });
     writeFileSync(join(input.evidenceDirectory, "database-growth.json"), `${JSON.stringify({ beforeBytes: growthBefore, afterBytes: growthAfter, deltaBytes: growthAfter - growthBefore })}\n`, { mode: 0o600, flag: "wx" });
     let fault;
     if (input.profile === "full") {
-      const waitForFaultReady = dependencies.waitForFaultReady ?? (() => poll(
-        () => ['a', 'b'].every((machine) => exists(join(input.evidenceDirectory, `machine-${machine}`, "fault-ready.json"))),
-        { timeoutMs: phaseDeadlineMs(contract, input.profile, "fault-ready"), delay, signal: input.signal },
+      const waitForFaultReady = dependencies.waitForFaultReady ?? (() => waitForFiles(
+        ['a', 'b'].map((machine) => join(input.evidenceDirectory, `machine-${machine}`, "fault-ready.json")),
+        [names.machineA, names.machineB],
+        phaseDeadlineMs(contract, input.profile, "fault-ready"),
       ));
       await waitForFaultReady();
       const requestedAt = new Date().toISOString();
       await run(["network", "disconnect", network, names.machineA]);
       const appliedAt = new Date().toISOString();
-      await Promise.race([
-        (delay ?? ((ms) => new Promise((resolve) => setTimeout(resolve, ms))))(60_000),
-        aborted(input.signal),
-      ]);
+      await Promise.race([monitorDelay([names.machineA, names.machineB], 60_000), aborted(input.signal)]);
       await run(["network", "connect", network, names.machineA]);
       await run(["container", "exec", names.machineA, "node", "/opt/lcm/dist/lcm.mjs", "doctor", "--verbose"]);
       await (dependencies.collectReadiness ?? collectDatabaseReadiness)({
@@ -361,18 +417,20 @@ export async function runManagedMachinePair(input, dependencies = {}) {
       for (const machine of ['a', 'b']) {
         writeFileSync(join(input.evidenceDirectory, `machine-${machine}`, "partition-cleared.json"), `${JSON.stringify({ clearedAt })}\n`, { mode: 0o600, flag: "wx" });
       }
-      const waitForPartitionRecovery = dependencies.waitForPartitionRecovery ?? (() => poll(
-        () => ['a', 'b'].every((machine) => exists(join(input.evidenceDirectory, `machine-${machine}`, "partition-recovered.json"))),
-        { timeoutMs: phaseDeadlineMs(contract, input.profile, "partition"), delay, signal: input.signal },
+      const waitForPartitionRecovery = dependencies.waitForPartitionRecovery ?? (() => waitForFiles(
+        ['a', 'b'].map((machine) => join(input.evidenceDirectory, `machine-${machine}`, "partition-recovered.json")),
+        [names.machineA, names.machineB],
+        phaseDeadlineMs(contract, input.profile, "partition"),
       ));
       await waitForPartitionRecovery();
       const recoveredAt = new Date().toISOString();
       fault = recordFaultStep({ id: "partition-a", kind: "partition-machine", target: "a" }, { requestedAt, appliedAt, clearedAt, recoveredAt });
       writeFileSync(join(input.evidenceDirectory, "fault-partition-a.json"), `${JSON.stringify(fault, null, 2)}\n`, { mode: 0o600, flag: "wx" });
     }
-    const waitForDrain = dependencies.waitForDrain ?? (() => poll(
-      () => ['a', 'b'].every((machine) => exists(join(input.evidenceDirectory, `machine-${machine}`, "drain.json"))),
-      { timeoutMs: phaseDeadlineMs(contract, input.profile, "drain"), delay, signal: input.signal },
+    const waitForDrain = dependencies.waitForDrain ?? (() => waitForFiles(
+      ['a', 'b'].map((machine) => join(input.evidenceDirectory, `machine-${machine}`, "drain.json")),
+      [names.machineA, names.machineB],
+      phaseDeadlineMs(contract, input.profile, "drain"),
     ));
     await waitForDrain();
     await clockMonitor.stop();
@@ -410,7 +468,7 @@ export async function runManagedMachinePair(input, dependencies = {}) {
 }
 
 export async function prepareManagedDatabase(input) {
-  const { privateConnection, runRoot, caFile, containerCli, processRunner, secrets, sourceRoot, names, owner, runId } = input;
+  const { privateConnection, runRoot, caFile, setupNetwork, containerCli, processRunner, secrets, sourceRoot, names, owner, runId } = input;
   const setupSql = join(runRoot, "managed-setup.sql");
   writeFileSync(setupSql, [
     "\\set ON_ERROR_STOP on",
@@ -423,7 +481,9 @@ export async function prepareManagedDatabase(input) {
     "",
   ].join("\n"), { mode: 0o600, flag: "wx" });
   const credentialFile = join(runRoot, "managed-sql.env");
-  writeEnvironmentFile(credentialFile, { LCM_CERT_ADMIN_URL: privateConnection.adminUrl });
+  writeEnvironmentFile(credentialFile, {
+    LCM_CERT_ADMIN_URL: privateConnection.containerAdminUrl ?? privateConnection.adminUrl,
+  });
   const grantsSource = join(sourceRoot, "src", "storage", "postgresql", "reference");
   const grantsDirectory = join(runRoot, "runtime-grants");
   mkdirSync(grantsDirectory, { mode: 0o700 });
@@ -437,6 +497,7 @@ export async function prepareManagedDatabase(input) {
     "for grant in /run/lcm-grants/postgresql-runtime-*-grants.sql; do psql \"$LCM_CERT_ADMIN_URL\" --set=ON_ERROR_STOP=1 --set=lcm_runtime_role=\"$LCM_CERT_RUNTIME\" --file=\"$grant\"; done",
   ].join("\n");
   const basePsqlArgs = [
+    ...(setupNetwork ? ["--network", setupNetwork] : []),
     "--env-file", credentialFile,
     "--env", `LCM_CERT_DATABASE=${privateConnection.databaseName}`,
     "--env", `LCM_CERT_MIGRATOR=${privateConnection.migratorName}`,
@@ -469,9 +530,21 @@ export async function prepareManagedDatabase(input) {
     LCM_POSTGRES_MIGRATION_ROLE: privateConnection.migratorName,
   };
   const entrypoint = join(sourceRoot, "dist", "lcm.mjs");
-  await processRunner(process.execPath, [entrypoint, "config", "set", "storage.backend", "postgresql", "--json"], { env: migrationEnvironment, redactSecrets: secrets });
-  await processRunner(process.execPath, [entrypoint, "config", "set", "storage.postgresql.poolMax", "2", "--json"], { env: migrationEnvironment, redactSecrets: secrets });
-  await processRunner(process.execPath, [entrypoint, "postgres", "migrate", "--json"], { env: migrationEnvironment, redactSecrets: secrets });
+  const runLcmStep = async (label, args) => {
+    try {
+      return await processRunner(process.execPath, [entrypoint, ...args], { env: migrationEnvironment, redactSecrets: secrets });
+    } catch (error) {
+      const diagnostic = String(error.stderr ?? "").trim();
+      throw new Error(`certification database ${label} failed: ${diagnostic || error.message}`, { cause: error });
+    }
+  };
+  await runLcmStep("pool configuration", ["config", "set", "storage.postgresql.poolMax", "2", "--json"]);
+  await (input.publishBackend ?? publishPostgreSqlBackend)({
+    homeDir: migrationHome,
+    packageRoot: sourceRoot,
+    publicationId: `certification-${runId}`,
+  });
+  await runLcmStep("migration", ["postgres", "migrate", "--json"]);
   await runPsql(names.runner, "runner", psqlScript);
 }
 
@@ -642,6 +715,9 @@ export function stageBuiltPackage({ sourceRoot, destination, machineAgentPath })
   cpSync(new URL("../test/certification/schedule.mjs", import.meta.url), join(destination, "certification", "schedule.mjs"), { errorOnExist: true });
   cpSync(new URL("../test/certification/contract.mjs", import.meta.url), join(destination, "certification", "contract.mjs"), { errorOnExist: true });
   cpSync(new URL("../test/certification/contract-v1.json", import.meta.url), join(destination, "certification", "contract-v1.json"), { errorOnExist: true });
+  cpSync(new URL("../test/certification/contract-v1.approval.json", import.meta.url), join(destination, "certification", "contract-v1.approval.json"), { errorOnExist: true });
+  cpSync(new URL("../test/certification/backend-publication.mjs", import.meta.url), join(destination, "certification", "backend-publication.mjs"), { errorOnExist: true });
+  cpSync(new URL("../test/certification/daemon-agent.mjs", import.meta.url), join(destination, "certification", "daemon-agent.mjs"), { errorOnExist: true });
   cpSync(new URL("../test/certification/sqlite-observer-worker.mjs", import.meta.url), join(destination, "certification", "sqlite-observer-worker.mjs"), { errorOnExist: true });
   const hash = createHash("sha256");
   for (const path of walkFiles(destination)) {
@@ -698,6 +774,16 @@ function jsonFromFile(path) {
 }
 
 export function prepareEvidenceDirectory(path, metadata) {
+  if (metadata.approval !== undefined) {
+    const approvedAt = Date.parse(metadata.approval.approvedAt);
+    const startedAt = Date.parse(metadata.startedAt);
+    if (!Number.isFinite(approvedAt) || !Number.isFinite(startedAt) || approvedAt > startedAt) {
+      throw new Error("contract approval must precede evidence collection");
+    }
+    if (metadata.approval.contractSha256 !== metadata.contractSha256) {
+      throw new Error("evidence metadata approval hash does not match the contract");
+    }
+  }
   const fromRepository = relative(repositoryRoot, path);
   if (fromRepository === "" || (!fromRepository.startsWith("..") && !isAbsolute(fromRepository))) {
     throw new Error("certification evidence directory must be outside the repository");
@@ -712,7 +798,13 @@ export async function runLocalCertification(options, dependencies = {}) {
   if ((dependencies.environment ?? process.env).LCM_TEST_CONTAINER_CLI !== "podman") {
     throw new Error("local certification requires LCM_TEST_CONTAINER_CLI=podman");
   }
-  prepareEvidenceDirectory(options.evidenceDirectory, { lane: "local", profile: options.profile, startedAt: new Date().toISOString() });
+  prepareEvidenceDirectory(options.evidenceDirectory, {
+    lane: "local",
+    profile: options.profile,
+    contractSha256: options.contractSha256,
+    approval: options.approval,
+    startedAt: new Date().toISOString(),
+  });
   const executeHarness = dependencies.runHarness ?? runHarness;
   let result;
   try {
@@ -721,7 +813,7 @@ export async function runLocalCertification(options, dependencies = {}) {
     runTests: async (context) => {
       const runMetadata = jsonFromFile(join(options.evidenceDirectory, "run.json"));
       writeFileSync(join(options.evidenceDirectory, "run.json"), `${JSON.stringify({ ...runMetadata, runId: context.runId }, null, 2)}\n`, { mode: 0o600 });
-      const stage = stageBuiltPackage({
+      const stage = dependencies.stagePackage?.(context.directory) ?? stageBuiltPackage({
         sourceRoot: dependencies.sourceRoot ?? repositoryRoot,
         destination: join(context.directory, "package"),
         machineAgentPath: new URL("../test/certification/machine-agent.mjs", import.meta.url),
@@ -729,12 +821,33 @@ export async function runLocalCertification(options, dependencies = {}) {
       const executionProvenance = (dependencies.captureExecutionProvenance ?? captureExecutionProvenance)(
         dependencies.sourceRoot ?? repositoryRoot, options.contractSha256, stage.sha256,
       );
-      if (executionProvenance.dirty) throw new Error("certification execution checkout must be clean");
+      assertExecutionProvenance(options.profile, executionProvenance);
       writeFileSync(join(options.evidenceDirectory, "execution-provenance.json"), `${JSON.stringify(executionProvenance, null, 2)}\n`, { mode: 0o600, flag: "wx" });
       const machineRoots = {};
       const created = [];
       let clockMonitor;
       try {
+        await (dependencies.prepareDatabase ?? prepareManagedDatabase)({
+          privateConnection: {
+            databaseName: context.names.controlDatabase,
+            migratorName: "lcm_test_migrator",
+            runtimeName: "lcm_test_runtime",
+            adminUrl: context.environment.LCM_TEST_POSTGRES_ADMIN_URL,
+            containerAdminUrl: context.inNetworkEnvironment.LCM_TEST_POSTGRES_ADMIN_URL,
+            migratorUrl: context.environment.LCM_TEST_POSTGRES_MIGRATOR_URL,
+            runtimeUrl: context.environment.LCM_TEST_POSTGRES_RUNTIME_URL,
+          },
+          runRoot: context.directory,
+          caFile: context.environment.LCM_TEST_POSTGRES_CA_FILE,
+          setupNetwork: context.names.network,
+          containerCli: context.containerCli,
+          processRunner: context.processRunner,
+          secrets: context.secrets,
+          sourceRoot: dependencies.sourceRoot ?? repositoryRoot,
+          names: context.names,
+          owner: context.owner,
+          runId: context.runId,
+        });
         const databaseReadiness = await (dependencies.collectReadiness ?? collectDatabaseReadiness)({
           url: context.environment.LCM_TEST_POSTGRES_RUNTIME_URL,
           ca: readFileSync(context.environment.LCM_TEST_POSTGRES_CA_FILE, "utf8"),
@@ -747,16 +860,18 @@ export async function runLocalCertification(options, dependencies = {}) {
         mkdirSync(options.evidenceDirectory, { recursive: true, mode: 0o700 });
         writeFileSync(join(options.evidenceDirectory, "database-readiness.json"), `${JSON.stringify(databaseReadiness, null, 2)}\n`, { mode: 0o600, flag: "wx" });
         for (const machine of ['a', 'b']) {
-          const home = join(context.directory, `machine-${machine}-home`);
+          const homeParent = join(context.directory, `machine-${machine}-home-parent`);
+          const home = join(homeParent, "home");
           const evidence = join(options.evidenceDirectory, `machine-${machine}`);
           mkdirSync(home, { recursive: true, mode: 0o700 });
           mkdirSync(evidence, { recursive: true, mode: 0o700 });
           const environmentFile = join(context.directory, `machine-${machine}.env`);
           writeEnvironmentFile(environmentFile, {
-            HOME: "/home/lcm",
+            HOME: "/home/lcm-parent/home",
             LCM_CLIENT: "codex",
             LCM_POSTGRES_URL: context.inNetworkEnvironment.LCM_TEST_POSTGRES_RUNTIME_URL,
             LCM_POSTGRES_CA_FILE: "/run/lcm-ca/ca.crt",
+            LCM_POSTGRES_MIGRATION_ROLE: "lcm_test_migrator",
             LCM_CERT_MIGRATION_ROLE: "lcm_test_migrator",
             LCM_CERT_WRONG_CA_FILE: "/run/lcm-ca/wrong-ca.crt",
             LCM_CERT_WRONG_HOST_URL: urlAtHost(context.inNetworkEnvironment.LCM_TEST_POSTGRES_RUNTIME_URL, context.names.wrongAlias),
@@ -770,22 +885,29 @@ export async function runLocalCertification(options, dependencies = {}) {
           await context.processRunner(context.containerCli, buildMachineContainerArgs({
             machine, name, hostname: `lcm-cert-${machine}`, network: context.names.network,
             image: NODE_IMAGE, ownerLabels: ownershipLabels(context.runId, kind, context.owner),
-            stagedPackage: stage.root, home, caFile: context.environment.LCM_TEST_POSTGRES_CA_FILE,
+            stagedPackage: stage.root, homeParent, caFile: context.environment.LCM_TEST_POSTGRES_CA_FILE,
             wrongCaFile: context.environment.LCM_TEST_POSTGRES_WRONG_CA_FILE,
             evidenceDirectory: evidence, environmentFile,
           }), { redactSecrets: context.secrets });
           created.push(name);
           machineRoots[machine] = { home, evidence };
         }
-        const waitForFile = (path, timeoutMs) => poll(() => existsSync(path), { timeoutMs, delay: dependencies.delay });
+        const runContainer = (args) => context.processRunner(context.containerCli, args, { redactSecrets: context.secrets });
+        const waitForFiles = (paths, machineNames, timeoutMs) => waitForMachineFiles({
+          paths, machineNames, run: runContainer, timeoutMs, delay: dependencies.delay,
+        });
+        const monitorDelay = (machineNames, durationMs) => dependencies.monitorMachineDelay
+          ? dependencies.monitorMachineDelay(machineNames, durationMs)
+          : dependencies.delay
+            ? dependencies.delay(durationMs)
+            : monitorMachinesForDuration({ machineNames, run: runContainer, durationMs });
         await context.processRunner(context.containerCli, ["container", "start", context.names.machineA], { redactSecrets: context.secrets });
-        await waitForFile(join(options.evidenceDirectory, "machine-a", "ready.json"), contract.timeline.full.setupMaxSeconds * 1000);
-        await (dependencies.delay ?? ((ms) => new Promise((resolve) => setTimeout(resolve, ms))))(contract.timeline.full.secondDaemonStartOffsetSeconds * 1000);
+        await waitForFiles([join(options.evidenceDirectory, "machine-a", "ready.json")], [context.names.machineA], contract.timeline.full.setupMaxSeconds * 1000);
+        await monitorDelay([context.names.machineA], contract.timeline.full.secondDaemonStartOffsetSeconds * 1000);
         await context.processRunner(context.containerCli, ["container", "start", context.names.machineB], { redactSecrets: context.secrets });
-        await waitForFile(join(options.evidenceDirectory, "machine-b", "ready.json"), contract.timeline.full.setupMaxSeconds * 1000);
+        await waitForFiles([join(options.evidenceDirectory, "machine-b", "ready.json")], [context.names.machineA, context.names.machineB], contract.timeline.full.setupMaxSeconds * 1000);
         const identities = verifyDistinctMachineIdentities({ a: machineRoots.a.home, b: machineRoots.b.home });
         writeFileSync(join(options.evidenceDirectory, "machine-identities.json"), `${JSON.stringify(identities, null, 2)}\n`, { mode: 0o600, flag: "wx" });
-        const runContainer = (args) => context.processRunner(context.containerCli, args, { redactSecrets: context.secrets });
         clockMonitor = await (dependencies.startClockMonitor ?? startClockMonitor)({
           machineNames: { a: context.names.machineA, b: context.names.machineB },
           run: runContainer,
@@ -794,8 +916,9 @@ export async function runLocalCertification(options, dependencies = {}) {
           evidenceDirectory: options.evidenceDirectory,
         });
         const warmupControl = publishWarmupControl(options.evidenceDirectory, dependencies.wallNow);
-        for (const machine of ['a', 'b']) await waitForFile(
-          join(options.evidenceDirectory, `machine-${machine}`, "warmup-complete.json"),
+        await waitForFiles(
+          ['a', 'b'].map((machine) => join(options.evidenceDirectory, `machine-${machine}`, "warmup-complete.json")),
+          [context.names.machineA, context.names.machineB],
           contract.timeline[options.profile].warmupSeconds * 1000 + 120_000,
         );
         publishSteadyControl(options.evidenceDirectory, warmupControl, dependencies.wallNow);
@@ -803,18 +926,26 @@ export async function runLocalCertification(options, dependencies = {}) {
           url: context.environment.LCM_TEST_POSTGRES_RUNTIME_URL,
           ca: readFileSync(context.environment.LCM_TEST_POSTGRES_CA_FILE, "utf8"),
         });
-        for (const machine of ['a', 'b']) await waitForFile(join(options.evidenceDirectory, `machine-${machine}`, "steady-complete.json"), phaseDeadlineMs(contract, options.profile, "fault-ready"));
+        await waitForFiles(
+          ['a', 'b'].map((machine) => join(options.evidenceDirectory, `machine-${machine}`, "steady-complete.json")),
+          [context.names.machineA, context.names.machineB],
+          phaseDeadlineMs(contract, options.profile, "fault-ready"),
+        );
         const growthAfter = await (dependencies.collectRelationBytes ?? collectDatabaseRelationBytes)({
           url: context.environment.LCM_TEST_POSTGRES_RUNTIME_URL,
           ca: readFileSync(context.environment.LCM_TEST_POSTGRES_CA_FILE, "utf8"),
         });
         writeFileSync(join(options.evidenceDirectory, "database-growth.json"), `${JSON.stringify({ beforeBytes: growthBefore, afterBytes: growthAfter, deltaBytes: growthAfter - growthBefore })}\n`, { mode: 0o600, flag: "wx" });
         if (options.profile === "full") {
-          for (const machine of ['a', 'b']) await waitForFile(join(options.evidenceDirectory, `machine-${machine}`, "fault-ready.json"), phaseDeadlineMs(contract, options.profile, "fault-ready"));
+          await waitForFiles(
+            ['a', 'b'].map((machine) => join(options.evidenceDirectory, `machine-${machine}`, "fault-ready.json")),
+            [context.names.machineA, context.names.machineB],
+            phaseDeadlineMs(contract, options.profile, "fault-ready"),
+          );
           const partitionRequestedAt = new Date().toISOString();
           await context.processRunner(context.containerCli, ["network", "disconnect", context.names.network, context.names.machineA], { redactSecrets: context.secrets });
           const partitionAppliedAt = new Date().toISOString();
-          await (dependencies.delay ?? ((ms) => new Promise((resolve) => setTimeout(resolve, ms))))(60_000);
+          await monitorDelay([context.names.machineA, context.names.machineB], 60_000);
           await context.processRunner(context.containerCli, ["network", "connect", context.names.network, context.names.machineA], { redactSecrets: context.secrets });
           await context.processRunner(context.containerCli, ["container", "exec", context.names.machineA, "node", "/opt/lcm/dist/lcm.mjs", "doctor", "--verbose"], { redactSecrets: context.secrets });
           await (dependencies.collectReadiness ?? collectDatabaseReadiness)({
@@ -831,7 +962,11 @@ export async function runLocalCertification(options, dependencies = {}) {
             join(options.evidenceDirectory, `machine-${machine}`, "partition-cleared.json"),
             `${JSON.stringify({ clearedAt: partitionClearedAt })}\n`, { mode: 0o600, flag: "wx" },
           );
-          for (const machine of ['a', 'b']) await waitForFile(join(options.evidenceDirectory, `machine-${machine}`, "restart-ready.json"), phaseDeadlineMs(contract, options.profile, "partition"));
+          await waitForFiles(
+            ['a', 'b'].map((machine) => join(options.evidenceDirectory, `machine-${machine}`, "restart-ready.json")),
+            [context.names.machineA, context.names.machineB],
+            phaseDeadlineMs(contract, options.profile, "partition"),
+          );
           const partitionRecoveredAt = new Date().toISOString();
           const restartRequestedAt = new Date().toISOString();
           await context.processRunner(context.containerCli, ["container", "stop", "--time", "120", context.names.container], { redactSecrets: context.secrets });
@@ -852,14 +987,22 @@ export async function runLocalCertification(options, dependencies = {}) {
             join(options.evidenceDirectory, `machine-${machine}`, "restart-cleared.json"),
             `${JSON.stringify({ clearedAt: restartClearedAt })}\n`, { mode: 0o600, flag: "wx" },
           );
-          for (const machine of ['a', 'b']) await waitForFile(join(options.evidenceDirectory, `machine-${machine}`, "restart-recovered.json"), phaseDeadlineMs(contract, options.profile, "restart"));
+          await waitForFiles(
+            ['a', 'b'].map((machine) => join(options.evidenceDirectory, `machine-${machine}`, "restart-recovered.json")),
+            [context.names.machineA, context.names.machineB],
+            phaseDeadlineMs(contract, options.profile, "restart"),
+          );
           const restartRecoveredAt = new Date().toISOString();
           writeFileSync(join(options.evidenceDirectory, "faults.json"), `${JSON.stringify([
             { id: "partition-a", kind: "partition-machine", target: "a", requestedAt: partitionRequestedAt, appliedAt: partitionAppliedAt, clearedAt: partitionClearedAt, recoveredAt: partitionRecoveredAt },
             { id: "restart-database", kind: "restart-database", target: "database", requestedAt: restartRequestedAt, appliedAt: restartAppliedAt, clearedAt: restartClearedAt, recoveredAt: restartRecoveredAt },
           ], null, 2)}\n`, { mode: 0o600, flag: "wx" });
         }
-        for (const machine of ['a', 'b']) await waitForFile(join(options.evidenceDirectory, `machine-${machine}`, "drain.json"), phaseDeadlineMs(contract, options.profile, "drain"));
+        await waitForFiles(
+          ['a', 'b'].map((machine) => join(options.evidenceDirectory, `machine-${machine}`, "drain.json")),
+          [context.names.machineA, context.names.machineB],
+          phaseDeadlineMs(contract, options.profile, "drain"),
+        );
         await clockMonitor.stop();
         clockMonitor = undefined;
         for (const machine of ['a', 'b']) writeFileSync(
@@ -898,6 +1041,8 @@ export async function main(argv = process.argv.slice(2)) {
   const loaded = loadCertificationContract(new URL("../test/certification/contract-v1.json", import.meta.url));
   options.contract = loaded.contract;
   options.contractSha256 = loaded.sha256;
+  options.contractStatus = loaded.status;
+  options.approval = loaded.approval;
   if (options.lane === "local") {
     const deadlineSeconds = options.profile === "full" ? 10_800 : 1_800;
     const deadline = setTimeout(() => process.kill(process.pid, "SIGTERM"), deadlineSeconds * 1000);
