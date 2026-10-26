@@ -4063,6 +4063,11 @@ describe("sanitizeError", () => {
         "file://h?x=[file://host?key=<path>]<path>?key=<path>]",
       ],
       [
+        "nested post-close tail brackets",
+        "file://h?x=[file://host?key=/public]\\Users\\FIRST\\x[[https://host?key=/Users/SECOND/secret]]",
+        "file://h?x=[file://host?key=<path>]<path>?key=<path>]]",
+      ],
+      [
         "whitespace-separated prose control",
         "file://h?x=[file://host?key=/public] later/thing",
         "file://h?x=[file://host?key=<path>] later/thing",
