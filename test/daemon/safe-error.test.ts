@@ -4015,6 +4015,72 @@ describe("sanitizeError", () => {
     });
   });
 
+  describe("Bug #1346", () => {
+    it.each([
+      [
+        "sibling query-only file children",
+        "file://h?x=[file://a?key=/pub&\\Users\\S1\\x]&[file://b?key2=/pub2|\\Users\\S2\\y]",
+        "file://h?x=[file://a?key=<path>&<path>]&[file://b?key2=<path>|<path>]",
+      ],
+      [
+        "sibling close variant",
+        "file://h?x=[file://alpha?token=/tmp&\\Users\\ALICE\\one.db]&[file://beta?token=/tmp|\\Users\\BOB\\two.db]",
+        "file://h?x=[file://alpha?token=<path>&<path>]&[file://beta?token=<path>|<path>]",
+      ],
+      [
+        "nested child closes before its Windows tail",
+        "file://h?x=[[https://e.test/t|file://host?key=/public]\\Users\\SECRET\\x]",
+        "file://h?x=[[https://e.test/t|file://host?key=<path>]<path>]",
+      ],
+      [
+        "file wrapper closes before its Windows tail",
+        "file://h?x=[file://host?key=/Users/a/private]|\\Users\\SECRET\\x",
+        "file://h?x=[file://host?key=<path>]|<path>",
+      ],
+      [
+        "Bug #1374 item 6 outward handoff",
+        "file://h?x=[[[https://e.test/t|file://host?key=/public]]|\\Users\\SECRET\\x]",
+        "file://h?x=[[[https://e.test/t|file://host?key=<path>]]|<path>]",
+      ],
+      [
+        "later public sibling",
+        "file://h?x=[file://a?key=/pub]&[https://e.test/t|\\Users\\S2\\y]",
+        "file://h?x=[file://a?key=<path>]&[https://e.test/t|<path>]",
+      ],
+      [
+        "later literal sibling",
+        "file://h?x=[file://a?key=/pub]&[value|\\Users\\S2\\y]",
+        "file://h?x=[file://a?key=<path>]&[value|<path>]",
+      ],
+      [
+        "Bug #1374 W1 outward handoff",
+        "file://h?x=[file://host?key=/public]\\Users\\FIRST\\x[https://host?key=/Users/SECOND/secret]",
+        "file://h?x=[file://host?key=<path>]<path>?key=<path>]",
+      ],
+      [
+        "whitespace-separated prose control",
+        "file://h?x=[file://host?key=/public] later/thing",
+        "file://h?x=[file://host?key=<path>] later/thing",
+      ],
+      [
+        "whitespace-separated public URL control",
+        "file://h?x=[file://host?key=/public] https://p.test/x",
+        "file://h?x=[file://host?key=<path>] https://p.test/x",
+      ],
+      [
+        "ordinary relative post-close control",
+        "file://h?x=[file://host?key=/public]later/thing",
+        "file://h?x=[file://host?key=<path>]later/thing",
+      ],
+    ] as const)("%s", (_name, input, expected) => {
+      const first = sanitizeError(input);
+
+      expect(first).toBe(expected);
+      expect(sanitizeError(first)).toBe(first);
+      expect(sanitizeError(sanitizeError(first))).toBe(first);
+    });
+  });
+
   it("preserves deferred Bug #1332 contextual over-redaction after the pipe-handoff fix", () => {
     const input = "file://h?x=[value|later=\\Users\\bob\\secret.db]";
     const expected = "file://h?x=[value|later=<path>]";
@@ -4101,14 +4167,14 @@ describe("sanitizeError", () => {
     [
       "ampersand nested child",
       "file://h?x=[[https://e.test/t&file://host?key=/public]\\Users\\SECRET\\x]",
-      "file://h?x=[[https://e.test/t&file://host?key=<path>]\\Users\\SECRET\\x]",
+      "file://h?x=[[https://e.test/t&file://host?key=<path>]<path>]",
     ],
     [
       "pipe nested child",
       "file://h?x=[[https://e.test/t|file://host?key=/public]\\Users\\SECRET\\x]",
-      "file://h?x=[[https://e.test/t|file://host?key=<path>]\\Users\\SECRET\\x]",
+      "file://h?x=[[https://e.test/t|file://host?key=<path>]<path>]",
     ],
-  ] as const)("keeps the query-only nested-file handoff scoped inside its own bracket for %s", (_name, input, expected) => {
+  ] as const)("pins the Bug #1346 query-only nested-file handoff after its bracket for %s", (_name, input, expected) => {
     const first = sanitizeError(input);
 
     expect(first).toBe(expected);
