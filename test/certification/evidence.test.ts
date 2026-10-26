@@ -19,14 +19,16 @@ describe("certification evidence", () => {
       profile: "full",
       provenance: {
         testedCommit: "d".repeat(40), dirty: false, testedInputsSha256: "e".repeat(64),
-        testedInputsCount: 100, lockfileSha256: "f".repeat(64), cliSha256: "1".repeat(64), node: process.version,
+        testedInputsCount: 100, lockfileSha256: "f".repeat(64), cliSha256: "1".repeat(64),
+        stagedPackageSha256: "2".repeat(64), contractSha256: "a".repeat(64), node: process.version,
       },
       machines: [
         { name: "a", machineId: "018f0000-0000-7000-8000-000000000001", identityKeySha256: "b".repeat(64) },
         { name: "b", machineId: "018f0000-0000-7000-8000-000000000002", identityKeySha256: "c".repeat(64) },
       ],
       faults: [],
-      cleanup: { verdict: "pass", residualResources: 0 },
+      cleanup: { verdict: "pass", residualResources: 0, labeledContainers: 0, labeledNetworks: 0, labeledVolumes: 0, familyTaggedProviderClusters: 0, privateRootsAbsent: true, ownedProcessesExited: true, providerDestroyConfirmedWithinSeconds: 0 },
+      diagnostics: { databaseGrowth: { beforeBytes: 0, afterBytes: 0, deltaBytes: 0 }, submittedPrimaryBytes: 0, submittedEnvelopeBytes: 0, truncatedRows: 0, sweepWitnessSha256: ["3".repeat(64), "4".repeat(64)] },
       slos: [{ id: "hook.p50", formula: "nearest-rank", inputs: { count: 20, sampleFile: "samples.ndjson" }, threshold: 400, observed: 10, verdict: "pass" }],
     });
     const schema = JSON.parse(readFileSync(new URL("./evidence-schema.json", import.meta.url), "utf8"));

@@ -2,7 +2,7 @@
   "$schema": "https://json-schema.org/draft/2020-12/schema",
   "$id": "https://donadiosolutions.com/lcm/certification-evidence-v1.schema.json",
   "type": "object",
-  "required": ["schemaVersion", "contract", "startedAt", "lane", "profile", "provenance", "machines", "faults", "slos", "cleanup", "verdict"],
+  "required": ["schemaVersion", "contract", "startedAt", "lane", "profile", "provenance", "machines", "faults", "slos", "cleanup", "diagnostics", "verdict"],
   "additionalProperties": false,
   "properties": {
     "schemaVersion": { "const": 1 },
@@ -31,7 +31,7 @@
     "profile": { "enum": ["smoke", "full"] },
     "provenance": {
       "type": "object",
-      "required": ["testedCommit", "dirty", "testedInputsSha256", "testedInputsCount", "lockfileSha256", "cliSha256", "node"],
+      "required": ["testedCommit", "dirty", "testedInputsSha256", "testedInputsCount", "lockfileSha256", "cliSha256", "stagedPackageSha256", "contractSha256", "node"],
       "additionalProperties": false,
       "properties": {
         "testedCommit": { "type": "string", "pattern": "^[0-9a-f]{40}$" },
@@ -40,19 +40,49 @@
         "testedInputsCount": { "type": "integer", "minimum": 1 },
         "lockfileSha256": { "type": "string", "pattern": "^[0-9a-f]{64}$" },
         "cliSha256": { "type": "string", "pattern": "^[0-9a-f]{64}$" },
+        "stagedPackageSha256": { "type": "string", "pattern": "^[0-9a-f]{64}$" },
+        "contractSha256": { "type": "string", "pattern": "^[0-9a-f]{64}$" },
         "node": { "type": "string", "minLength": 1 }
       }
     },
     "machines": { "type": "array", "minItems": 2, "maxItems": 2, "items": { "$ref": "#/$defs/machine" } },
-    "faults": { "type": "array", "items": { "type": "object" } },
+    "faults": { "type": "array", "items": { "$ref": "#/$defs/fault" } },
     "slos": { "type": "array", "minItems": 1, "items": { "$ref": "#/$defs/slo" } },
     "cleanup": {
       "type": "object",
-      "required": ["verdict", "residualResources"],
+      "required": ["verdict", "residualResources", "labeledContainers", "labeledNetworks", "labeledVolumes", "familyTaggedProviderClusters", "privateRootsAbsent", "ownedProcessesExited", "providerDestroyConfirmedWithinSeconds"],
       "additionalProperties": false,
       "properties": {
         "verdict": { "enum": ["pass", "fail", "incomplete"] },
-        "residualResources": { "type": "integer", "minimum": 0 }
+        "residualResources": { "type": "integer", "minimum": 0 },
+        "labeledContainers": { "type": "integer", "minimum": 0 },
+        "labeledNetworks": { "type": "integer", "minimum": 0 },
+        "labeledVolumes": { "type": "integer", "minimum": 0 },
+        "familyTaggedProviderClusters": { "type": "integer", "minimum": 0 },
+        "privateRootsAbsent": { "type": "boolean" },
+        "ownedProcessesExited": { "type": "boolean" },
+        "providerDestroyConfirmedWithinSeconds": { "type": "number", "minimum": 0 }
+      }
+    },
+    "diagnostics": {
+      "type": "object",
+      "required": ["databaseGrowth", "submittedPrimaryBytes", "submittedEnvelopeBytes", "truncatedRows", "sweepWitnessSha256"],
+      "additionalProperties": false,
+      "properties": {
+        "databaseGrowth": {
+          "type": "object",
+          "required": ["beforeBytes", "afterBytes", "deltaBytes"],
+          "additionalProperties": false,
+          "properties": {
+            "beforeBytes": { "type": "integer", "minimum": 0 },
+            "afterBytes": { "type": "integer", "minimum": 0 },
+            "deltaBytes": { "type": "integer" }
+          }
+        },
+        "submittedPrimaryBytes": { "type": "integer", "minimum": 0 },
+        "submittedEnvelopeBytes": { "type": "integer", "minimum": 0 },
+        "truncatedRows": { "type": "integer", "minimum": 0 },
+        "sweepWitnessSha256": { "type": "array", "minItems": 2, "maxItems": 2, "items": { "type": "string", "pattern": "^[0-9a-f]{64}$" } }
       }
     },
     "verdict": { "enum": ["pass", "fail", "incomplete"] }
@@ -66,6 +96,20 @@
         "name": { "enum": ["a", "b"] },
         "machineId": { "type": "string", "pattern": "^[0-9a-f-]{36}$" },
         "identityKeySha256": { "type": "string", "pattern": "^[0-9a-f]{64}$" }
+      }
+    },
+    "fault": {
+      "type": "object",
+      "required": ["id", "kind", "target", "requestedAt", "appliedAt", "clearedAt", "recoveredAt"],
+      "additionalProperties": false,
+      "properties": {
+        "id": { "type": "string", "minLength": 1 },
+        "kind": { "enum": ["partition-machine", "restart-database"] },
+        "target": { "type": "string", "minLength": 1 },
+        "requestedAt": { "type": "string", "minLength": 20 },
+        "appliedAt": { "type": "string", "minLength": 20 },
+        "clearedAt": { "type": "string", "minLength": 20 },
+        "recoveredAt": { "type": "string", "minLength": 20 }
       }
     },
     "slo": {

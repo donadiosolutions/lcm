@@ -2072,17 +2072,22 @@ describe("PostgreSQL harness utilities", () => {
     ]));
   });
 
-  it.each(["restore", "runner"] as const)(
+  it.each([
+    ["restore", "restore", "a"],
+    ["runner", "runner", "b"],
+    ["machine-a", "machineA", "6"],
+    ["machine-b", "machineB", "7"],
+  ] as const)(
     "preserves an entire stale run when a missing %s worker appears live during the stability barrier",
-    async (workerKind) => {
-      const runId = workerKind === "restore" ? "a".repeat(32) : "b".repeat(32);
+    async (workerKind, workerKey, runCharacter) => {
+      const runId = runCharacter.repeat(32);
       const names = createRunNames(runId);
       const owner = {
-        pid: workerKind === "restore" ? 102 : 103,
-        birth: `linux:12345678-1234-1234-1234-123456789abc:${workerKind === "restore" ? 1020 : 1030}`,
+        pid: 102,
+        birth: "linux:12345678-1234-1234-1234-123456789abc:1020",
         scope: testOwnerScope,
       };
-      const workerName = names[workerKind];
+      const workerName = names[workerKey];
       const records = new Map([
         [`container:${names.container}`, ownershipLabels(runId, "database", owner)],
         [`volume:${names.volume}`, ownershipLabels(runId, "data", owner)],
@@ -2222,14 +2227,18 @@ describe("PostgreSQL harness utilities", () => {
     })).resolves.toBeDefined();
 
     expect(delay).toHaveBeenCalledOnce();
-    expect(events.slice(0, 5)).toEqual([
+    expect(events.slice(0, 9)).toEqual([
       `missing:${names.restore}`,
       `missing:${names.runner}`,
+      `missing:${names.machineA}`,
+      `missing:${names.machineB}`,
       `delay:${ORPHAN_WORKER_STABILITY_DELAY_MS}`,
       `missing:${names.restore}`,
       `missing:${names.runner}`,
+      `missing:${names.machineA}`,
+      `missing:${names.machineB}`,
     ]);
-    expect(events[5]).toBe(`remove:container:${names.container}`);
+    expect(events[9]).toBe(`remove:container:${names.container}`);
   });
 
   it("aborts a stale run when worker state becomes uncertain before reclamation", async () => {

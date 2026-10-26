@@ -5,6 +5,9 @@ import { join } from "node:path";
 export function nearestRank(values, quantile) {
   if (!Array.isArray(values) || values.length === 0) throw new Error("percentile population must not be empty");
   if (!(quantile > 0 && quantile <= 1)) throw new Error("quantile must be in (0, 1]");
+  if (!values.every((value) => typeof value === "number" && Number.isFinite(value) && value >= 0)) {
+    throw new Error("percentile population contains an invalid duration");
+  }
   const sorted = [...values].sort((left, right) => left - right);
   return sorted[Math.ceil(quantile * sorted.length) - 1];
 }
@@ -57,7 +60,9 @@ const sha256 = (bytes) => createHash("sha256").update(bytes).digest("hex");
 
 export function assembleCertificationGate(input) {
   if (input.contractStatus !== "approved") throw new Error("gate requires an approved contract");
-  if (Date.parse(input.approval.approvedAt) > Date.parse(input.startedAt)) {
+  const approvedAt = Date.parse(input.approval.approvedAt);
+  const startedAt = Date.parse(input.startedAt);
+  if (!Number.isFinite(approvedAt) || !Number.isFinite(startedAt) || approvedAt > startedAt) {
     throw new Error("contract approval must precede evidence collection");
   }
   const slos = input.slos.map((slo) => {
@@ -67,9 +72,10 @@ export function assembleCertificationGate(input) {
       inputs: { ...slo.inputs, sampleSha256: sha256(readFileSync(samplePath)) },
     };
   });
-  const verdict = input.cleanup.verdict === "fail" || slos.some((slo) => slo.verdict === "fail")
+  const cleanupFails = input.cleanup.verdict === "fail" || input.cleanup.residualResources !== 0;
+  const verdict = cleanupFails || slos.some((slo) => slo.verdict === "fail")
     ? "fail"
-    : slos.some((slo) => slo.verdict === "incomplete") ? "incomplete" : "pass";
+    : input.cleanup.verdict === "incomplete" || slos.some((slo) => slo.verdict === "incomplete") ? "incomplete" : "pass";
   return {
     schemaVersion: 1,
     contract: { sha256: input.contractSha256, status: input.contractStatus, approval: input.approval },
@@ -81,6 +87,7 @@ export function assembleCertificationGate(input) {
     faults: input.faults,
     slos,
     cleanup: input.cleanup,
+    diagnostics: input.diagnostics,
     verdict,
   };
 }

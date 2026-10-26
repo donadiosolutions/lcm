@@ -80,6 +80,12 @@ function assertContract(contract) {
     if (declared?.[name] !== count) throw new Error(`certification contract ${name} schedule count is inconsistent`);
   }
   const p99Minimum = positiveInteger(contract?.calculations?.minimumSamples?.p99, "p99 minimum");
+  if (contract.calculations.minimumSamples.p50 !== 20
+    || contract.calculations.minimumSamples.p95 !== 200
+    || p99Minimum !== 1000
+    || contract.thresholds.hookCommandMs.minSuccessesForSubgates !== 200) {
+    throw new Error("certification contract v1 sample floors changed");
+  }
   for (const name of ["hookInvocations", "daemonSearch", "daemonStore"]) {
     if (derived[name] < p99Minimum) {
       throw new Error(`certification contract ${name} misses p99 minimum ${p99Minimum}`);
@@ -88,6 +94,25 @@ function assertContract(contract) {
   const subgateMinimum = positiveInteger(contract?.thresholds?.hookCommandMs?.minSuccessesForSubgates, "hook subgate minimum");
   if (derived.userPrompt < subgateMinimum || derived.postTool < subgateMinimum) {
     throw new Error("certification contract hook kind schedule misses subgate minimum");
+  }
+  const perMachine = contract.workload.expectedPerMachine;
+  if (perMachine.hookInvocations * contract.workload.machines !== derived.hookInvocations
+    || perMachine.daemonSearch * contract.workload.machines !== derived.daemonSearch
+    || perMachine.daemonStore * contract.workload.machines !== derived.daemonStore) {
+    throw new Error("certification contract per-machine counts are inconsistent");
+  }
+  const full = contract.timeline.full;
+  if (scheduledCount(full.steadySeconds, 30, 60) !== 100 || scheduledCount(full.steadySeconds, 55, 300) !== 20) {
+    throw new Error("certification contract snapshot or compact count changed");
+  }
+  const managed = contract.lanes.managed;
+  if (managed.stopNewWorkAtSeconds + managed.cleanupReserveSeconds !== managed.absoluteDeadlineSeconds
+    || contract.thresholds.capacity.totalMax !== 19
+    || contract.thresholds.capacity.managedUsableBudget !== 23) {
+    throw new Error("certification contract managed or capacity arithmetic changed");
+  }
+  if (contract.status === "draft" && Object.values(contract.approval).slice(0, 3).some((value) => value !== null)) {
+    throw new Error("draft certification contract contains approval evidence");
   }
   return contract;
 }
@@ -103,6 +128,10 @@ export function loadCertificationContract(path, options = {}) {
       if (typeof contract.approval?.[field] !== "string" || contract.approval[field].length === 0) {
         throw new Error(`approved certification contract is missing ${field}`);
       }
+    }
+    const approvedAt = Date.parse(contract.approval.approvedAt);
+    if (!Number.isFinite(approvedAt) || new Date(approvedAt).toISOString() !== contract.approval.approvedAt) {
+      throw new Error("approved certification contract has an invalid approvedAt");
     }
   }
   return { contract, sha256: createHash("sha256").update(bytes).digest("hex") };

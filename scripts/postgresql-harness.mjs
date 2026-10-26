@@ -1582,7 +1582,7 @@ export async function discoverHarnessRuns(dependencies = {}) {
       run.classification = classifyOwnerIdentity(run.owner, dependencies);
       if (run.classification === "stale") {
         const activeWorker = run.resources.some(
-          (resource) => (resource.kind === "runner" || resource.kind === "restore") && resource.running,
+          (resource) => ["runner", "restore", "machine-a", "machine-b"].includes(resource.kind) && resource.running,
         );
         if (activeWorker) {
           run.classification = "live";
@@ -1614,6 +1614,8 @@ async function inspectReclaimableWorkers(run, names, dockerRunner) {
   for (const [kind, name] of [
     ["restore", names.restore],
     ["runner", names.runner],
+    ["machine-a", names.machineA],
+    ["machine-b", names.machineB],
   ]) {
     const expectedLabels = ownershipLabels(run.runId, kind, run.owner);
     let record;
@@ -1713,7 +1715,7 @@ export async function reclaimProvenOrphans(dependencies = {}) {
         databaseAbsent = true;
       }
     }
-    for (const kind of ["machine-a", "machine-b", "database", "data", "network"]) {
+    for (const kind of ["database", "data", "network"]) {
       const resource = byKind.get(kind);
       if (!resource) continue;
       if (kind === "database" && databaseAbsent) continue;

@@ -4,15 +4,43 @@ import { join } from "node:path";
 import { describe, expect, it } from "vitest";
 import {
   buildMachineContainerArgs,
+  collectDatabaseReadiness,
   createDeterministicSchedule,
   parseCertificationArguments,
   prepareManagedDatabase,
   recordFaultStep,
+  runLocalCertification,
   stageBuiltPackage,
   verifyDistinctMachineIdentities,
 } from "../../scripts/certification-harness.mjs";
 
 describe("certification harness", () => {
+  it("executes PostgreSQL readiness with CURRENT_USER and validates the complete witness", async () => {
+    const queries: string[] = [];
+    const client = {
+      connect: async () => undefined,
+      end: async () => undefined,
+      query: async (text: string) => {
+        queries.push(text);
+        if (text === "SHOW max_connections") return { rows: [{ max_connections: "100" }] };
+        if (text === "SHOW superuser_reserved_connections") return { rows: [{ superuser_reserved_connections: "3" }] };
+        if (text.includes("server_version_num")) return { rows: [{ server_version_num: 180004, server_address: "10.0.0.1", server_port: 5432, database_name: "db", role_name: "runtime", rolsuper: false, rolcreaterole: false, rolcreatedb: false }] };
+        if (text.includes("pg_extension")) return { rows: ["pg_stat_statements", "pg_trgm", "pgcrypto", "unaccent"].map((name) => ({ name, schema: "public" })) };
+        if (text.includes("schema_migrations")) return { rows: [{ count: 9 }] };
+        if (text.includes("lcm.machines")) return { rows: [{ machines: 0, projects: 0, conversations: 0, passive_events: 0 }] };
+        if (text.includes("pg_control_system")) return { rows: [{ system_identifier: "123" }] };
+        throw new Error(text);
+      },
+    };
+    await expect(collectDatabaseReadiness({
+      url: "postgresql://runtime:pw@db:5432/db", ca: "ca", expectedVersionNum: 180004,
+      expectedDatabase: "db", expectedPort: 5432, expectedRole: "runtime", expectedMigrationCount: 9,
+      clientFactory: () => client,
+    })).resolves.toMatchObject({ residualEmpty: true, setupSessionsClosed: true });
+    expect(queries[0]).toContain("CURRENT_USER::text");
+    expect(queries[0]).not.toContain("pg_catalog.current_user");
+  });
+
   it("exposes manual certification scripts without a build or postbuild", () => {
     const packageJson = JSON.parse(readFileSync(new URL("../../package.json", import.meta.url), "utf8"));
     expect(packageJson.scripts["test:certification:local"]).toBe(
@@ -119,6 +147,18 @@ describe("certification harness", () => {
     const calls: Array<{ command: string; args: string[]; options: any }> = [];
     const processRunner = async (command: string, args: string[], options: any) => {
       calls.push({ command, args, options });
+      if (args[1] === "inspect") {
+        const name = args[2];
+        const create = calls.find((call) => call.args[0] === "container" && call.args[1] === "create" && call.args.includes(name));
+        const labels: Record<string, string> = {};
+        if (create) for (let index = 0; index < create.args.length; index += 1) {
+          if (create.args[index] === "--label") {
+            const [key, value] = create.args[index + 1].split("=");
+            labels[key] = value;
+          }
+        }
+        return { stdout: JSON.stringify([{ Config: { Labels: labels }, State: { Running: false } }]), stderr: "" };
+      }
       return { stdout: "", stderr: "" };
     };
     await prepareManagedDatabase({
@@ -135,12 +175,33 @@ describe("certification harness", () => {
       processRunner,
       secrets: ["admin-secret", "migrator-secret"],
       sourceRoot: new URL("../..", import.meta.url).pathname,
+      names: { restore: "lcm-pg-restore-aaaaaaaaaaaaaaaaaaaa", runner: "lcm-pg-runner-aaaaaaaaaaaaaaaaaaaa" },
+      owner: { pid: 1, birth: "linux:12345678-1234-1234-1234-123456789abc:1", scope: "linux:12345678-1234-1234-1234-123456789abc:abc" },
+      runId: "a".repeat(32),
     });
-    expect(calls.filter((call) => call.command === "podman")).toHaveLength(2);
+    expect(calls.filter((call) => call.command === "podman" && call.args[0] === "container" && call.args[1] === "create")).toHaveLength(2);
     expect(calls.filter((call) => call.command === process.execPath)).toHaveLength(3);
     expect(calls.flatMap((call) => call.args).join("\n")).not.toContain("admin-secret");
     expect(calls.flatMap((call) => call.args).join("\n")).not.toContain("migrator-secret");
     expect(calls.some((call) => call.args.includes("postgres") && call.args.includes("migrate"))).toBe(true);
-    expect(calls.at(-1)?.args.join("\n")).toContain("postgresql-runtime-*-grants.sql");
+    expect(calls.filter((call) => call.args[0] === "container" && call.args[1] === "create").at(-1)?.args.join("\n"))
+      .toContain("postgresql-runtime-*-grants.sql");
+    const setupCreates = calls.filter((call) => call.args[0] === "container" && call.args[1] === "create").flatMap((call) => call.args);
+    expect(setupCreates).toEqual(expect.arrayContaining(["--cpus", "1", "--memory", "512m", "--pids-limit", "128"]));
+    expect(setupCreates.join("\n")).toContain(":/run/lcm-ca/ca.crt:ro,z");
+  });
+
+  it("persists incomplete cleanup evidence when the local harness fails", async () => {
+    const root = mkdtempSync(join(tmpdir(), "lcm-cert-local-failure-"));
+    const evidenceDirectory = join(root, "evidence");
+    await expect(runLocalCertification({
+      evidenceDirectory, profile: "smoke", contract: {}, contractSha256: "a".repeat(64),
+    }, {
+      environment: { LCM_TEST_CONTAINER_CLI: "podman" },
+      runHarness: async () => { throw new Error("harness failed"); },
+    })).rejects.toThrow("harness failed");
+    expect(JSON.parse(readFileSync(join(evidenceDirectory, "cleanup.json"), "utf8"))).toMatchObject({
+      verdict: "incomplete", privateRootsAbsent: false, ownedProcessesExited: false,
+    });
   });
 });

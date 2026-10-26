@@ -42,6 +42,10 @@ migration, and observability drills belong to their separate certification issue
 warmup, 120-second steady phase, and 660-second drain with no faults. It must not
 be reported as a production percentile result. `full` runs the frozen 6000-second
 steady schedule, fault phases, recovery checks, and final 900-second drain.
+For both profiles, the coordinator starts warmup only after both machines are
+ready, waits for both warmup-complete witnesses, and then publishes one shared
+steady-state T0. The database-growth baseline is collected after that barrier and
+before the first scheduled steady operation.
 
 ## Prepare the staged package
 
@@ -56,9 +60,8 @@ all of these assets:
 - `package.json`
 
 Staging rejects missing assets, symbolic links, and non-file entries and hashes
-the complete staged tree. This candidate deliberately does not run a build because
-the current `postbuild` includes a command prohibited by the repository's local
-execution rules.
+the complete staged tree. Build and certification remain separate reviewed steps;
+the certification commands never invoke `build` or `postbuild`.
 
 ## Run the local lane
 
@@ -118,8 +121,9 @@ HTTP 404 for the ID and an empty family-tag list.
 
 ## Recovery after interruption
 
-Normal errors and termination enter owned cleanup. `SIGKILL`, host loss, or a lost
-network cannot guarantee that in-process cleanup ran. Use the private created-ID
+Normal errors and catchable termination signals enter single-flight owned cleanup.
+`SIGKILL`, host loss, or a lost network cannot guarantee that in-process cleanup
+ran. Use the private created-ID
 receipt, list clusters with the `lcm-cert` family tag, compare the exact ID, name,
 and both tags, and then delete that exact ID with an authenticated operator tool.
 Do not delete a name-only or tag-only match. A future run refuses to start while
@@ -146,15 +150,26 @@ pnpm run test:certification:gate -- \
   --output-dir /absolute/private/lcm-certification/gate
 ```
 
-The gate writer imports the cutover rehearsal's provenance capture and schema
-validator, derives every population from raw machine records, and refuses missing
-readiness, observer, drain, fault, cleanup, contract, or sample evidence.
+The gate writer rechecks the execution-time repository digest with the same
+provenance calculation, reuses the cutover rehearsal schema validator, always
+derives every population from raw machine records, and refuses missing readiness,
+observer, drain, lane fault, cleanup, contract, provenance or sample evidence. A
+supplied manifest cannot define or override the SLO universe. Non-gating raw
+diagnostics retain relation-size deltas, submitted payload and envelope bytes,
+stored truncation counts, final doctor output hashes, and remote-prune sweep
+timestamps.
 
 The acknowledgment metric is a conservative upper bound from successful public
 hook-command exit to the first one-second observer sighting of a terminal local
 acknowledgment. It does not claim the exact PostgreSQL `applied_at` time. The
 duplicate gate covers only distinct acknowledged inbox IDs observed for the same
 captured event ID. It does not prove historical exactly-once logical effects.
+Hook, search, and store timing use the public CLI process spawn-to-exit boundary;
+queue delay, schedule delay, SQLite capture, and observer delay are recorded as
+separate fields. Search and store still traverse the daemon route selected by the
+public commands rather than a private in-process storage seam.
+The synthetic `TaskCreate` fixture proves the compatibility-tool extraction path;
+it is not evidence of native Codex task-tool integration.
 
 One local and one managed repetition provide a bounded baseline. They do not
 certify provider reliability, independent host clocks, multi-host hardware

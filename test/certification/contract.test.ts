@@ -50,4 +50,19 @@ describe("certification contract", () => {
     writeFileSync(path, `${JSON.stringify(candidate)}\n`);
     expect(() => loadCertificationContract(path, { requireApproved: false })).toThrow("oracle.observer");
   });
+
+  it("rejects drift in v1 floors, per-machine counts, capacity and approval time", () => {
+    const directory = mkdtempSync(join(tmpdir(), "lcm-cert-contract-drift-"));
+    const write = (name: string, mutate: (candidate: any) => void) => {
+      const candidate = JSON.parse(readFileSync(contractPath, "utf8"));
+      mutate(candidate);
+      const path = join(directory, `${name}.json`);
+      writeFileSync(path, `${JSON.stringify(candidate)}\n`);
+      return path;
+    };
+    expect(() => loadCertificationContract(write("floor", (value) => { value.calculations.minimumSamples.p99 = 999; }), { requireApproved: false })).toThrow("sample floors");
+    expect(() => loadCertificationContract(write("counts", (value) => { value.workload.expectedPerMachine.daemonStore = 599; }), { requireApproved: false })).toThrow("per-machine");
+    expect(() => loadCertificationContract(write("capacity", (value) => { value.thresholds.capacity.totalMax = 20; }), { requireApproved: false })).toThrow("capacity");
+    expect(() => loadCertificationContract(write("approval", (value) => { value.status = "approved"; value.approval = { ...value.approval, approvedBy: "x", approvedAt: "not-a-date", approvalRef: "x" }; }))).toThrow("approvedAt");
+  });
 });

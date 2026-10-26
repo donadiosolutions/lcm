@@ -97,10 +97,10 @@ describe("CI plan classification", () => {
     expect(graphInvisibleTests("test/postgresql/other.integration.ts")).toEqual([]);
     expect(graphInvisibleTests("test/codecov-ownership/1403-unbound-enumeration.yml")).toEqual(["test/codecov-config.test.ts"]);
     expect(graphInvisibleTests("test/certification/contract-v1.json")).toEqual([
-      "test/certification/contract.test.ts", "test/certification/evidence.test.ts", "test/certification/gate.test.ts",
+      "test/certification/contract.test.ts", "test/certification/evidence.test.ts", "test/certification/gate.test.ts", "test/certification/round2-acceptance.test.ts",
     ]);
     expect(graphInvisibleTests("test/certification/evidence-schema.json")).toEqual([
-      "test/certification/contract.test.ts", "test/certification/evidence.test.ts", "test/certification/gate.test.ts",
+      "test/certification/contract.test.ts", "test/certification/evidence.test.ts", "test/certification/gate.test.ts", "test/certification/round2-acceptance.test.ts",
     ]);
     expect(graphInvisibleTests("src/memory/other.ts")).toEqual([]);
     expect(graphInvisibleTests("package.json")).toEqual([]);

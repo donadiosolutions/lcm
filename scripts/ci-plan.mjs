@@ -97,6 +97,7 @@ export const GRAPH_INVISIBLE_INPUTS = Object.freeze([
       "test/certification/contract.test.ts",
       "test/certification/evidence.test.ts",
       "test/certification/gate.test.ts",
+      "test/certification/round2-acceptance.test.ts",
     ]),
   }),
 ]);

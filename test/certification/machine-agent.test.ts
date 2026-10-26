@@ -1,7 +1,11 @@
+import { mkdtempSync, readFileSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 import { describe, expect, it } from "vitest";
 import {
   createAdmissionController,
   createHookFixture,
+  executeDeterministicSchedule,
   isAcknowledgedRow,
   observeAcknowledgments,
   verifyFinalDrain,
@@ -69,5 +73,16 @@ describe("certification machine agent", () => {
   it("enforces the half-open rolling 300-second emission budget", () => {
     expect(verifyEmissionBudget(Array.from({ length: 30 }, (_, index) => 1 + index * 10), 30)).toBe(30);
     expect(() => verifyEmissionBudget(Array.from({ length: 31 }, (_, index) => index * 9), 30)).toThrow("emission budget");
+  });
+
+  it("records an operation whose admission starts after its absolute deadline", async () => {
+    const evidenceDirectory = mkdtempSync(join(tmpdir(), "lcm-cert-operation-deadline-"));
+    const samples = await executeDeterministicSchedule({
+      schedule: [{ id: "late", machine: "a", op: "search", offsetSeconds: 0, phase: "steady" }],
+      entrypoint: "/unused/lcm.mjs", cwd: evidenceDirectory, environment: {}, evidenceDirectory,
+      scheduleStartWallMs: 0, wallNow: () => 60_001, delay: async () => undefined,
+    });
+    expect(samples).toEqual([expect.objectContaining({ outcome: "failed", errorClass: "OperationDeadlineExceeded" })]);
+    expect(readFileSync(join(evidenceDirectory, "samples.ndjson"), "utf8")).toContain("OperationDeadlineExceeded");
   });
 });

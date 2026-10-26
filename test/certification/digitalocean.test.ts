@@ -1,10 +1,13 @@
-import { chmodSync, mkdtempSync, writeFileSync } from "node:fs";
+import { EventEmitter } from "node:events";
+import { chmodSync, mkdtempSync, readFileSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { describe, expect, it, vi } from "vitest";
 import {
   createDigitalOceanClient,
+  listByTag,
   readDigitalOceanToken,
+  runManagedCertification,
   runDigitalOceanLifecycle,
 } from "../../scripts/certification-digitalocean.mjs";
 import { runManagedMachinePair } from "../../scripts/certification-harness.mjs";
@@ -39,6 +42,14 @@ describe("certification DigitalOcean lifecycle", () => {
     await expect(client.request("GET", "https://evil.example/v2/databases")).rejects.toThrow("path");
   });
 
+  it("exhausts fixed-origin pagination before proving tag uniqueness", async () => {
+    const request = vi.fn(async (_method: string, path: string) => new URL(path, "https://api.digitalocean.com").searchParams.get("page") === "2"
+      ? { body: { databases: [{ id: "second" }] } }
+      : { body: { databases: [{ id: "first" }], links: { pages: { next: "https://api.digitalocean.com/v2/databases?tag_name=lcm-cert&page=2" } } } });
+    await expect(listByTag({ request } as any, "lcm-cert")).resolves.toEqual([{ id: "first" }, { id: "second" }]);
+    expect(request).toHaveBeenCalledTimes(2);
+  });
+
   it("creates, firewalls, allowlists evidence and destroys the exact owned cluster", async () => {
     const requests: Array<{ method: string; path: string; body?: any }> = [];
     const secrets: string[] = [];
@@ -49,7 +60,7 @@ describe("certification DigitalOcean lifecycle", () => {
       requests.push({ method: init.method!, path, body });
       if (init.method === "POST" && path === "/v2/databases") return json({ database: { id: "cluster-1", name: body.name, tags: body.tags, status: "online", host: "db.example", port: 25060, user: "doadmin", password: "provider-password", uri: "postgresql://doadmin:provider-password@db.example:25060/defaultdb" } }, 201);
       if (init.method === "PUT" && path.endsWith("/firewall")) return json({ rules: body.rules });
-      if (init.method === "GET" && path.endsWith("/firewall")) return json({ rules: [{ type: "ip_addr", value: "203.0.113.8" }] });
+      if (init.method === "GET" && path.endsWith("/firewall")) return json({ rules: [{ type: "ip_addr", value: "203.0.113.8", uuid: "rule-1", cluster_uuid: "cluster-1", created_at: "2026-10-26T00:00:00Z" }] });
       if (init.method === "GET" && path.endsWith("/ca")) return json({ ca: { certificate: "-----BEGIN CERTIFICATE-----\nprovider\n-----END CERTIFICATE-----\n" } });
       if (init.method === "POST" && path.endsWith("/dbs")) return json({ db: { name: body.name } }, 201);
       if (init.method === "POST" && path.endsWith("/users")) return json({ user: { name: body.name, password: `${body.name}-password` } }, 201);
@@ -74,10 +85,11 @@ describe("certification DigitalOcean lifecycle", () => {
   });
 
   it("refuses a non-empty family preflight without deleting anything", async () => {
+    const directory = mkdtempSync(join(tmpdir(), "lcm-cert-do-preflight-"));
     const fetch = vi.fn(async () => json({ databases: [{ id: "foreign" }] }));
     const client = createDigitalOceanClient({ token: "token", registerSecret: vi.fn(), fetch: fetch as any });
     await expect(runDigitalOceanLifecycle({
-      client, runId: "run12345", trustedIpv4: "203.0.113.8", receiptPath: "/private/unused",
+      client, runId: "run12345", trustedIpv4: "203.0.113.8", receiptPath: join(directory, "receipt"),
       useCluster: vi.fn(),
     })).rejects.toThrow("family tag");
     expect(fetch).toHaveBeenCalledOnce();
@@ -107,10 +119,103 @@ describe("certification DigitalOcean lifecycle", () => {
     expect(postCount).toBe(1);
   });
 
+  it("destroys the exact cluster when receipt persistence fails after create", async () => {
+    let deleted = false;
+    const fetch = vi.fn(async (url: string, init: RequestInit) => {
+      const parsed = new URL(url);
+      if (init.method === "GET" && parsed.searchParams.has("tag_name")) return json({ databases: [] });
+      if (init.method === "POST" && parsed.pathname === "/v2/databases") return json({ database: { id: "cluster-1", name: "lcm-cert-run12345", tags: ["lcm-cert", "lcm-cert-run-run12345"] } }, 201);
+      if (init.method === "GET" && parsed.pathname === "/v2/databases/cluster-1") return deleted ? json({}, 404) : json({ database: { id: "cluster-1", name: "lcm-cert-run12345", tags: ["lcm-cert", "lcm-cert-run-run12345"] } });
+      if (init.method === "DELETE") { deleted = true; return new Response(null, { status: 204 }); }
+      throw new Error(`${init.method} ${url}`);
+    });
+    const client = createDigitalOceanClient({ token: "token", registerSecret: vi.fn(), fetch: fetch as any });
+    await expect(runDigitalOceanLifecycle({
+      client, runId: "run12345", trustedIpv4: "203.0.113.8", receiptPath: "/unused/receipt",
+      reserveReceipt: () => ({ commit: () => { throw new Error("receipt failed"); }, close: vi.fn() }),
+      useCluster: vi.fn(),
+    })).rejects.toThrow("receipt failed");
+    expect(deleted).toBe(true);
+  });
+
+  it("settles provider cleanup when a managed signal aborts the workload", async () => {
+    const controller = new AbortController();
+    let deleted = false;
+    const fetch = vi.fn(async (url: string, init: RequestInit) => {
+      const parsed = new URL(url);
+      const body = init.body ? JSON.parse(String(init.body)) : undefined;
+      if (init.method === "GET" && parsed.searchParams.has("tag_name")) return json({ databases: [] });
+      if (init.method === "POST" && parsed.pathname === "/v2/databases") return json({ database: { id: "cluster-1", name: body.name, tags: body.tags, status: "online", host: "db.example", port: 25060, user: "doadmin", password: "pw" } }, 201);
+      if (init.method === "GET" && parsed.pathname === "/v2/databases/cluster-1") return deleted ? json({}, 404) : json({ database: { id: "cluster-1", name: "lcm-cert-run12345", tags: ["lcm-cert", "lcm-cert-run-run12345"], status: "online", host: "db.example", port: 25060 } });
+      if (init.method === "PUT") return json({});
+      if (init.method === "GET" && parsed.pathname.endsWith("/firewall")) return json({ rules: [{ type: "ip_addr", value: "203.0.113.8" }] });
+      if (init.method === "GET" && parsed.pathname.endsWith("/ca")) return json({ ca: { certificate: "-----BEGIN CERTIFICATE-----\nca\n-----END CERTIFICATE-----" } });
+      if (init.method === "POST" && parsed.pathname.endsWith("/dbs")) return json({ db: { name: body.name } }, 201);
+      if (init.method === "POST" && parsed.pathname.endsWith("/users")) return json({ user: { name: body.name, password: "pw" } }, 201);
+      if (init.method === "DELETE") { deleted = true; return new Response(null, { status: 204 }); }
+      throw new Error(`${init.method} ${url}`);
+    });
+    const client = createDigitalOceanClient({ token: "token", registerSecret: vi.fn(), fetch: fetch as any });
+    const directory = mkdtempSync(join(tmpdir(), "lcm-cert-do-signal-"));
+    await expect(runDigitalOceanLifecycle({
+      client, runId: "run12345", trustedIpv4: "203.0.113.8", receiptPath: join(directory, "receipt"), signal: controller.signal,
+      useCluster: async () => { controller.abort(new Error("SIGTERM")); throw controller.signal.reason; },
+    })).rejects.toThrow("SIGTERM");
+    expect(deleted).toBe(true);
+  });
+
+  it("persists successful cleanup evidence when the managed workload fails", async () => {
+    const directory = mkdtempSync(join(tmpdir(), "lcm-cert-do-failed-workload-"));
+    const failure = Object.assign(new Error("workload failed"), {
+      providerCleanup: { destroyedId: "cluster-1", confirmed404: true, emptyFamilyTag: true, seconds: 12 },
+    });
+    await expect(runManagedCertification({
+      evidenceDirectory: directory, profile: "full", contract: {}, contractSha256: "a".repeat(64),
+    }, {
+      environment: {
+        LCM_CERT_RUN_ID: "run12345",
+        LCM_CERT_TRUSTED_IPV4: "203.0.113.8",
+        LCM_CERT_CREATED_ID_RECEIPT: join(directory, "receipt"),
+        LCM_CERT_FAMILY_LOCK_FILE: join(directory, "family.lock"),
+      },
+      token: "token", client: {}, prepareEvidence: false,
+      runLifecycle: async () => { throw failure; },
+    })).rejects.toThrow("workload failed");
+    expect(JSON.parse(readFileSync(join(directory, "cleanup.json"), "utf8"))).toMatchObject({
+      verdict: "pass", residualResources: 0, familyTaggedProviderClusters: 0,
+      privateRootsAbsent: true, ownedProcessesExited: true,
+      providerDestroyConfirmedWithinSeconds: 12,
+    });
+  });
+
+  it("preserves a managed signal exit after lifecycle cleanup completes", async () => {
+    const directory = mkdtempSync(join(tmpdir(), "lcm-cert-do-top-signal-"));
+    const signalEmitter = new EventEmitter();
+    const promise = runManagedCertification({
+      evidenceDirectory: directory, profile: "full", contract: {}, contractSha256: "a".repeat(64),
+    }, {
+      environment: {
+        LCM_CERT_RUN_ID: "run12345",
+        LCM_CERT_TRUSTED_IPV4: "203.0.113.8",
+        LCM_CERT_CREATED_ID_RECEIPT: join(directory, "receipt"),
+        LCM_CERT_FAMILY_LOCK_FILE: join(directory, "family.lock"),
+      },
+      token: "token", client: {}, prepareEvidence: false, signalEmitter,
+      runLifecycle: async () => {
+        signalEmitter.emit("SIGTERM");
+        return { cleanup: { destroyedId: "cluster-1", confirmed404: true, emptyFamilyTag: true, seconds: 1 } };
+      },
+    });
+    await expect(promise).rejects.toMatchObject({ exitCode: 143 });
+    expect(JSON.parse(readFileSync(join(directory, "cleanup.json"), "utf8"))).toMatchObject({ verdict: "pass" });
+    expect(signalEmitter.listenerCount("SIGTERM")).toBe(0);
+  });
+
   it("wires both managed machines through the shared agent and injects the partition", async () => {
     const root = mkdtempSync(join(tmpdir(), "lcm-cert-managed-pair-"));
     const evidenceDirectory = join(root, "evidence");
     const calls: string[][] = [];
+    let wallNow = Date.parse("2026-10-26T10:00:00.000Z");
     const processRunner = vi.fn(async (_command: string, args: string[]) => {
       calls.push(args);
       if (args[1] === "inspect") {
@@ -127,11 +232,15 @@ describe("certification DigitalOcean lifecycle", () => {
       }
       return { stdout: "", stderr: "" };
     });
+    const phaseDelay = vi.fn(async () => undefined);
     const result = await runManagedMachinePair({
       cluster: { host: "db.example", port: 25060 },
       privateConnection: {
         ca: "-----BEGIN CERTIFICATE-----\nprovider\n-----END CERTIFICATE-----\n",
         runtimeUrl: "postgresql://runtime:secret@db.example:25060/lcm_cert_run12345",
+        databaseName: "lcm_cert_run12345",
+        migratorName: "lcm_cert_migrator_run12345",
+        runtimeName: "lcm_cert_runtime_run12345",
       },
       wrongCa: "-----BEGIN CERTIFICATE-----\nwrong\n-----END CERTIFICATE-----\n",
       runId: "run12345",
@@ -144,29 +253,41 @@ describe("certification DigitalOcean lifecycle", () => {
       owner: { pid: 1, birth: "linux:12345678-1234-1234-1234-123456789abc:1", scope: "linux:12345678-1234-1234-1234-123456789abc:abc" },
       createRunRoot: () => join(root, "run"),
       stagePackage: (runRoot: string) => ({ root: join(runRoot, "package"), sha256: "a".repeat(64) }),
+      captureExecutionProvenance: () => ({ dirty: false, testedCommit: "c".repeat(40), testedInputsSha256: "d".repeat(64), testedInputsCount: 1, lockfileSha256: "e".repeat(64), cliSha256: "f".repeat(64), stagedPackageSha256: "a".repeat(64), contractSha256: "b".repeat(64), node: process.version }),
       resolveHost: async () => "203.0.113.7",
       waitForReady: async () => undefined,
+      waitForWarmupComplete: async () => { wallNow += 120_000; },
       waitForFaultReady: async () => undefined,
+      waitForSteadyComplete: async () => undefined,
       waitForPartitionRecovery: async () => undefined,
       waitForDrain: async () => undefined,
       waitForExit: async () => undefined,
       prepareDatabase: async () => undefined,
       collectReadiness: async () => ({ serverVersionNum: 180000, role: { superuser: false, createRole: false, createDb: false } }),
+      collectRelationBytes: async () => 0,
       verifyIdentities: () => ({
         a: { machineId: "018f0000-0000-7000-8000-000000000001", identityKeySha256: "a".repeat(64) },
         b: { machineId: "018f0000-0000-7000-8000-000000000002", identityKeySha256: "b".repeat(64) },
       }),
       startClockMonitor: async () => ({ stop: async () => [] }),
-      delay: async () => undefined,
+      delay: phaseDelay,
+      wallNow: () => wallNow,
       removeRunRoot: vi.fn(),
     });
     expect(result.stageSha256).toBe("a".repeat(64));
     expect(calls.filter((args) => args[0] === "container" && args[1] === "create")).toHaveLength(2);
-    expect(calls).toContainEqual(expect.arrayContaining(["network", "disconnect", expect.stringContaining("lcm-cert-net"), expect.stringContaining("machine-a")]));
-    expect(calls).toContainEqual(expect.arrayContaining(["network", "connect", expect.stringContaining("lcm-cert-net"), expect.stringContaining("machine-a")]));
+    expect(calls).toContainEqual(expect.arrayContaining(["network", "disconnect", expect.stringContaining("lcm-pg-net"), expect.stringContaining("machine-a")]));
+    expect(calls).toContainEqual(expect.arrayContaining(["network", "connect", expect.stringContaining("lcm-pg-net"), expect.stringContaining("machine-a")]));
     const createText = calls.filter((args) => args[0] === "container" && args[1] === "create").flat().join("\n");
     expect(createText).toContain("wrong-run12345.invalid:203.0.113.7");
     expect(createText).toContain("/opt/lcm/certification/machine-agent.mjs");
     expect(createText).not.toContain("postgresql://");
+    const startA = calls.findIndex((args) => args[0] === "container" && args[1] === "start" && args.some((value) => value.includes("machine-a")));
+    const startB = calls.findIndex((args) => args[0] === "container" && args[1] === "start" && args.some((value) => value.includes("machine-b")));
+    expect(startA).toBeGreaterThanOrEqual(0);
+    expect(startB).toBeGreaterThan(startA);
+    expect(phaseDelay).toHaveBeenCalledWith(150_000);
+    const phaseControl = JSON.parse(readFileSync(join(evidenceDirectory, "phase-control.json"), "utf8"));
+    expect(Date.parse(phaseControl.steadyT0At) - Date.parse(phaseControl.warmupStartAt)).toBeGreaterThanOrEqual(120_000);
   });
 });
