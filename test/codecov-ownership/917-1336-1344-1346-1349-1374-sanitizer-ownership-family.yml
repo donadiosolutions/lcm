@@ -1,0 +1,6 @@
+references: ["#917", "#1332", "#1336", "#1344", "#1346", "#1349", "#1374"]
+rationale: >-
+  The sanitizer ownership fixes materially change src/daemon/safe-error.ts
+  without changing its established unit-daemon-core component.
+pins:
+  - ["src/daemon/safe-error.ts", "unit-daemon-core"]

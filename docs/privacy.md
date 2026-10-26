@@ -671,25 +671,41 @@ bundle and keep provider, credential, quarantine, and recovery sessions private.
   wrapper depth, so closing an inner wrapper consumes only its own one-use tail
   while outer handoffs remain pending. Repeated handoffs at the same depth stay
   bounded by that depth, and resets clear all pending depths. Quoted-file query
-  ownership remains independent from a nested public-URL child, allowing every
-  immediate bare path and later word-bearing private parameter to redact on the
-  same pass. A nested exact file URL retains its own path/query classification
-  while bound to the observable enclosing owner; after the child span ends, a
-  depth-keyed returned-parent set classifies every later same-wrapper bare or
-  word-bearing private value. Closing an inner wrapper removes only that depth,
-  preserving still-open outer owners until their matching close or a hard
-  reset. Within a child query or fragment, an ampersand word-bearing `Users`
-  root returns to the retained parent and redacts on the same pass. The same
-  narrow handoff remains available after an intervening public URL child while
-  that wrapper depth is retained, including a named root-relative Windows
-  value. Quoted public URLs keep ordinary relative and named slash-bearing
-  parameters inside their own query or fragment. A bare absolute path, complete
-  word-bearing `Users` root, or named Windows/drive/UNC value returns to the
-  quoted-file parent and restores that parent for later children. This does not
-  trust marker text, classify ordinary relative values as private on the
-  returned-parent transition, or make backslashes global. The direct-relative
-  nested-file query/fragment family remains deferred: its first pass preserves
-  the relative bytes and its next stable pass conservatively redacts them.
+  ownership remains independent from a nested public-URL child. A path-bearing
+  nested exact `file://` child returns to the observable enclosing owner through
+  either `&` or `|`. After the child span ends, later same-wrapper absolute roots
+  are redacted, while ordinary relative successors such as `relative/path`
+  remain byte-identical. A slash-bearing relative successor is treated as
+  private only when it contains a complete `Users`, `home`, or `root` segment,
+  case-insensitively, with a `/` or `\` continuation; redaction starts at the
+  successor's first slash. Other relative values, such as `later/var/data`,
+  remain visible by policy. Query and fragment child forms use the same stable
+  rule. A separate active-child home/root successor can still remain visible on
+  the first pass and redact on the second pass; that residual is tracked
+  separately. Closing an inner wrapper removes only that depth, preserving
+  still-open outer owners until their matching close or a hard reset.
+
+  When a matching quote closes a nested public URL inside a bracketed file
+  query, an immediate `&` or `|` successor is redacted only when it begins with
+  a supported POSIX, Windows, drive, or UNC root. The public URL's own query,
+  ordinary relative successors, and following public URLs stay readable. An
+  immediate `]&[` sibling wrapper re-enters the same observable ownership
+  grammar, so rooted values redact as they would in a standalone sibling.
+  Rooted Windows tails after a closing wrapper, including a later bracketed
+  URL's rooted query value inside that tail, are also removed on the first pass.
+  Whitespace-separated prose and public URLs and ordinary unspaced relative
+  tails remain unchanged.
+
+  An exact nested `file://` child inside a public URL that began at a quote can
+  inherit that enclosing quote through its matching close. This removes a
+  space-bearing private path and any suffix inside the quote on the first pass,
+  while preserving text after the close. An immediately quoted child keeps its
+  own quote. Unquoted URLs, embedded URLs whose scheme did not begin at the
+  quote, unmatched quotes, and newlines retain their existing boundaries.
+
+  Root-relative Windows values after opaque wrapper text remain conservatively
+  redacted. LCM does not expose such private-looking values merely because URL
+  punctuation could also be interpreted as ending ownership.
   An unquoted exact file wrapper immediately followed by an ampersand-separated
   public URL is recognized from that observable syntax on every pass. The
   doubled-bracket pathless policy retains the observable scheme, authority, and

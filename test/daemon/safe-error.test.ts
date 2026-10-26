@@ -3011,14 +3011,19 @@ describe("sanitizeError", () => {
     expect(sanitizeError(sanitizeError(sanitizeError(input)))).toBe(input);
   });
 
-  it("preserves deferred Bug #1332 contextual over-redaction", () => {
-    const input = "file://h?x=[value|later=\\Users\\bob\\secret.db]";
-    const expected = "file://h?x=[value|later=<path>]";
-    const first = sanitizeError(input);
+  describe("Bug #1332", () => {
+    it.each([
+      ["original contextual pin"],
+      ["post-pipe-handoff regression pin"],
+    ] as const)("keeps the privacy decision for %s", () => {
+      const input = "file://h?x=[value|later=\\Users\\bob\\secret.db]";
+      const expected = "file://h?x=[value|later=<path>]";
+      const first = sanitizeError(input);
 
-    expect(first).toBe(expected);
-    expect(sanitizeError(first)).toBe(first);
-    expect(sanitizeError(sanitizeError(first))).toBe(first);
+      expect(first).toBe(expected);
+      expect(sanitizeError(first)).toBe(first);
+      expect(sanitizeError(sanitizeError(first))).toBe(first);
+    });
   });
 
   it("keeps quoted-query ownership after an immediate public URL path handoff", () => {
@@ -4213,16 +4218,6 @@ describe("sanitizeError", () => {
       expect(sanitizeError(first)).toBe(first);
       expect(sanitizeError(sanitizeError(first))).toBe(first);
     });
-  });
-
-  it("preserves deferred Bug #1332 contextual over-redaction after the pipe-handoff fix", () => {
-    const input = "file://h?x=[value|later=\\Users\\bob\\secret.db]";
-    const expected = "file://h?x=[value|later=<path>]";
-    const first = sanitizeError(input);
-
-    expect(first).toBe(expected);
-    expect(sanitizeError(first)).toBe(first);
-    expect(sanitizeError(sanitizeError(first))).toBe(first);
   });
 
   it("preserves the Bug #1336 root anchor after the pipe-handoff fix", () => {
