@@ -3898,6 +3898,12 @@ describe("sanitizeError", () => {
       ["drive root", "C:\\Users\\c\\three", "<path>"],
       ["P3 Users backslash continuation", "later/Users\\alice\\secret", "later<path>"],
       ["P3 home backslash continuation", "later/home\\alice\\secret", "later<path>"],
+      ["repeated separator after Users", "later/Users//CANARY/secret.db", "later<path>"],
+      ["repeated separator after home", "later/home//CANARY", "later<path>"],
+      ["repeated separator after root", "later/root//CANARY", "later<path>"],
+      ["empty segment before Users", "a/b//Users/CANARY", "a<path>"],
+      ["mixed separator run", "later/Users/\\CANARY", "later<path>"],
+      ["repeated backslash continuation", "later/Users\\\\CANARY", "later<path>"],
     ] as const;
     const cases: Array<readonly [string, string, string]> = returnedParentRows.flatMap(
       ([name, value, expected]) =>

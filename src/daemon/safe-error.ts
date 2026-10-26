@@ -142,13 +142,14 @@ function findUrlPathStarts(chars: readonly string[]): UrlPathStarts {
       const segment = chars.slice(segmentStart, cursor).join("").toLowerCase();
       const delimiter = chars[cursor];
       const privateRoot = segment === "users" || segment === "home" || segment === "root";
-      if (privateRoot && isPathWord(chars[cursor + 1])) {
-        if (delimiter === "/") return firstSlash >= 0 ? firstSlash : cursor;
-        if (delimiter === "\\" && firstSlash >= 0) return firstSlash;
+      if (delimiter !== "/" && delimiter !== "\\") return -1;
+      if (firstSlash < 0) {
+        if (delimiter !== "/") return -1;
+        firstSlash = cursor;
       }
-      if (delimiter !== "/" || !isPathWord(chars[cursor + 1])) return -1;
-      if (firstSlash < 0) firstSlash = cursor;
-      cursor += 1;
+      while (chars[cursor] === "/" || chars[cursor] === "\\") cursor += 1;
+      if (!isPathWord(chars[cursor])) return -1;
+      if (privateRoot) return firstSlash;
     }
   };
   const hasMatchingQuoteBeforeLineEnd = (start: number, quote: string): boolean => {
