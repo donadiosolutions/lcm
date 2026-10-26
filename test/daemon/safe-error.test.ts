@@ -4081,6 +4081,82 @@ describe("sanitizeError", () => {
     });
   });
 
+  describe("Bug #1374", () => {
+    it.each([
+      [
+        "item 1 single-quoted public child",
+        "file://h?x=['https://e.test/t'name=\\Users\\SECRET\\x",
+        "file://h?x=['https://e.test/t'name=<path>",
+      ],
+      [
+        "item 2 double-quoted public child",
+        'file://h?x=["https://e.test/t"name=\\Users\\SECRET\\x',
+        'file://h?x=["https://e.test/t"name=<path>',
+      ],
+      [
+        "item 3 nested-file suspension control",
+        "file://h?x=[[[https://e.test/t|file://host?key=/public]]|name=\\Users\\SECRET\\x]",
+        "file://h?x=[[[https://e.test/t|file://host?key=<path>]]|name=<path>]",
+      ],
+      [
+        "item 4 later public URL control",
+        "file://h?x=[value|https://e.test/t|name=\\Users\\SECRET\\x]",
+        "file://h?x=[value|https://e.test/t|name=<path>]",
+      ],
+      [
+        "item 5a opaque scheme privacy decision",
+        "file://h?x=[mailto:a@b|name=\\Users\\SECRET\\x]",
+        "file://h?x=[mailto:a@b|name=<path>]",
+      ],
+      [
+        "item 5b single-slash file scheme",
+        "file://h?x=[file:/x|name=\\Users\\SECRET\\x]",
+        "file://h?x=[file:<path>|name=<path>]",
+      ],
+      [
+        "item 6 outward handoff",
+        "file://h?x=[[[https://e.test/t|file://host?key=/public]]|\\Users\\SECRET\\x]",
+        "file://h?x=[[[https://e.test/t|file://host?key=<path>]]|<path>]",
+      ],
+      [
+        "item 7 Windows path",
+        "C:\\tmp\\private[https://public.test/x]secret.db",
+        "<path>",
+      ],
+      [
+        "item 7 POSIX path",
+        "/tmp/private[https://public.test/x]secret.db",
+        "<path>",
+      ],
+      [
+        "item 7 prose path",
+        "error C:\\tmp\\private[https://public.test/x]secret.db failed",
+        "error <path> failed",
+      ],
+      [
+        "item 8 drive wrapper",
+        "file://h?x=[C:\\Users\\SECRET\\x|name=\\Users\\SECRET\\y]",
+        "file://h?x=[<path>|name=<path>]",
+      ],
+      [
+        "W1 bracketed URL after file tail",
+        "file://h?x=[file://host?key=/public]\\Users\\FIRST\\x[https://host?key=/Users/SECOND/secret]",
+        "file://h?x=[file://host?key=<path>]<path>?key=<path>]",
+      ],
+      [
+        "W2 query-only child boundary",
+        "file://h?x=[file://host?key=/public&'https://e.test/t'&later/Users/secret]",
+        "file://h?x=[file://host?key=<path>&'https://e.test/t'&later/Users/secret]",
+      ],
+    ] as const)("%s", (_name, input, expected) => {
+      const first = sanitizeError(input);
+
+      expect(first).toBe(expected);
+      expect(sanitizeError(first)).toBe(first);
+      expect(sanitizeError(sanitizeError(first))).toBe(first);
+    });
+  });
+
   it("preserves deferred Bug #1332 contextual over-redaction after the pipe-handoff fix", () => {
     const input = "file://h?x=[value|later=\\Users\\bob\\secret.db]";
     const expected = "file://h?x=[value|later=<path>]";
