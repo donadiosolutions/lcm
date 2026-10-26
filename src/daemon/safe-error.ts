@@ -152,17 +152,12 @@ function findUrlPathStarts(chars: readonly string[]): UrlPathStarts {
       if (privateRoot) return firstSlash;
     }
   };
-  const findQuoteBoundaryBeforeLineEnd = (
-    start: number,
-    quote: string,
-  ): { boundary: number; matched: boolean } => {
+  const findMatchingQuoteBeforeLineEnd = (start: number, quote: string): number => {
     for (let cursor = start; cursor < chars.length; cursor += 1) {
-      if (chars[cursor] === "\n" || chars[cursor] === "\r") {
-        return { boundary: cursor, matched: false };
-      }
-      if (chars[cursor] === quote) return { boundary: cursor, matched: true };
+      if (chars[cursor] === "\n" || chars[cursor] === "\r") return -1;
+      if (chars[cursor] === quote) return cursor;
     }
-    return { boundary: chars.length, matched: false };
+    return -1;
   };
   let restartedPathlessFile = false;
   let quotedPathEnded = false;
@@ -180,7 +175,6 @@ function findUrlPathStarts(chars: readonly string[]): UrlPathStarts {
   let inheritedFileQuoteEnd = -1;
   let cachedEnclosingQuote = 0;
   let cachedEnclosingQuoteBoundary = -1;
-  let cachedEnclosingQuoteMatched = false;
   let queryOrFragment = false;
   let queryOrFragmentStart = -1;
   let nestedPublicUrlBracketDepth = 0;
@@ -446,13 +440,16 @@ function findUrlPathStarts(chars: readonly string[]): UrlPathStarts {
           cachedEnclosingQuote === schemeQuote &&
           nestedFileSchemeStart < cachedEnclosingQuoteBoundary
         ) {
-          if (cachedEnclosingQuoteMatched) matchingEnclosingQuoteEnd = cachedEnclosingQuoteBoundary;
+          matchingEnclosingQuoteEnd = cachedEnclosingQuoteBoundary;
         } else {
-          const quoteBoundary = findQuoteBoundaryBeforeLineEnd(nestedFileSchemeStart, enclosingQuote);
-          cachedEnclosingQuote = schemeQuote;
-          cachedEnclosingQuoteBoundary = quoteBoundary.boundary;
-          cachedEnclosingQuoteMatched = quoteBoundary.matched;
-          if (quoteBoundary.matched) matchingEnclosingQuoteEnd = quoteBoundary.boundary;
+          matchingEnclosingQuoteEnd = findMatchingQuoteBeforeLineEnd(
+            nestedFileSchemeStart,
+            enclosingQuote,
+          );
+          if (matchingEnclosingQuoteEnd >= 0) {
+            cachedEnclosingQuote = schemeQuote;
+            cachedEnclosingQuoteBoundary = matchingEnclosingQuoteEnd;
+          }
         }
       }
       const inheritedNestedFileQuote =

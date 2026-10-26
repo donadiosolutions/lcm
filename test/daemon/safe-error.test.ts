@@ -3901,6 +3901,8 @@ describe("sanitizeError", () => {
       ["empty segment before Users", "a/b//Users/CANARY", "a<path>"],
       ["mixed separator run", "later/Users/\\CANARY", "later<path>"],
       ["repeated backslash continuation", "later/Users\\\\CANARY", "later<path>"],
+      ["leading backslash-only relative", "Users\\CANARY", "Users\\CANARY"],
+      ["separator run without continuation", "later/Users//", "later/Users//"],
     ] as const;
     const cases: Array<readonly [string, string, string]> = returnedParentRows.flatMap(
       ([name, value, expected]) =>
