@@ -547,9 +547,16 @@ function findUrlPathStarts(chars: readonly string[]): UrlPathStarts {
       foundFilePath &&
       (char === "&" || char === "|")
     ) {
-      const wordBearingPrivatePathStart = queryOrFragment
-        ? wordBearingPrivateRootPathStart(chars, index + 1)
-        : -1;
+      // The established Users-only match also accepts trailing separator
+      // runs that the returned-parent predicate rejects, so keep it first and
+      // add the complete Users/home/root segment match as a fallback.
+      let wordBearingPrivatePathStart = -1;
+      if (queryOrFragment) {
+        wordBearingPrivatePathStart = wordBearingPrivateRootPathStart(chars, index + 1);
+        if (wordBearingPrivatePathStart < 0) {
+          wordBearingPrivatePathStart = returnedParentPrivateRootPathStart(index + 1);
+        }
+      }
       const returnsToParent =
         !queryOrFragment ||
         chars[index + 1] === "/" ||

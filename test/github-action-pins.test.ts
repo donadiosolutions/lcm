@@ -30,6 +30,9 @@ const approvedRepositories = new Set([
   "codecov/codecov-action",
   "github/codeql-action",
   "openai/codex-action",
+  "useblacksmith/begin-testbox",
+  "useblacksmith/run-testbox",
+  "useblacksmith/stickydisk",
 ]);
 
 function isWorkflowFile(name: string): boolean {

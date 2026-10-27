@@ -200,7 +200,10 @@ function expectCompletePostgresqlImageMatches(
   matches: Array<Record<string, string | undefined>>,
 ): void {
   expect(matches).toHaveLength(2);
-  expect(matches.map(({ depName }) => depName).sort()).toEqual(["node", "postgres"]);
+  expect(matches.map(({ depName }) => depName).sort()).toEqual([
+    "docker.io/library/node",
+    "docker.io/library/postgres",
+  ]);
   for (const { currentDigest, currentValue } of matches) {
     expect(currentValue).toMatch(/^[^\s@"]+$/u);
     expect(currentDigest).toMatch(/^sha256:[a-f0-9]{64}$/u);
@@ -340,8 +343,8 @@ describe("dependency automation configuration", () => {
       "utf8",
     );
     const alternateImageSource = [
-      'export const POSTGRES_IMAGE = "postgres:18.5-bookworm@sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";',
-      'export const NODE_IMAGE = "node:22.21.0-bookworm-slim@sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb";',
+      'export const POSTGRES_IMAGE = "docker.io/library/postgres:18.5-bookworm@sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";',
+      'export const NODE_IMAGE = "docker.io/library/node:22.21.0-bookworm-slim@sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb";',
     ].join("\n");
 
     expect(renovate.customManagers).toHaveLength(1);

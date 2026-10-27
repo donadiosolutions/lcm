@@ -976,3 +976,98 @@ describe("deduplicateAndInsert", () => {
     expect(results[0].confidence).toBe(0.95);
   });
 });
+
+describe("deduplicateAndInsertInRepositories existingOnly", () => {
+  const thresholds = { dedupBm25Threshold: 15, dedupCandidateLimit: 100 };
+  const input = {
+    tags: ["source:passive-capture"],
+    sourceProjectId: "p1",
+    sessionId: "s1",
+    depth: 0,
+    confidence: 0.3,
+    thresholds,
+  };
+
+  it("returns null and inserts nothing for an unrelated lexical hit", async () => {
+    const db = makeDb();
+    const store = new PromotedStore(db);
+    store.insert({
+      content: "src/config/settings.ts (read) shared terms",
+      tags: ["decision"],
+      projectId: "p1",
+      confidence: 0.6,
+    });
+    const content = "src/config/other.ts (read) shared terms";
+    const deps = repositoryDeps(db, store, "p1");
+    expect(store.search(content, 1, undefined, "p1")).toHaveLength(1);
+
+    const id = await deps.transaction(repositories =>
+      deduplicateAndInsertInRepositories(repositories, { ...input, content, existingOnly: true }));
+
+    expect(id).toBeNull();
+    expect(store.getAll()).toHaveLength(1);
+    expect(deps.lexicalSearch.searchPromoted).toHaveBeenCalledOnce();
+  });
+
+  it("merges into the identical entry without inserting", async () => {
+    const db = makeDb();
+    const store = new PromotedStore(db);
+    const content = "src/main.ts (source)";
+    const existing = store.insert({
+      content,
+      tags: ["decision"],
+      projectId: "p1",
+      confidence: 0.1,
+    });
+    const deps = repositoryDeps(db, store, "p1");
+
+    const id = await deps.transaction(repositories =>
+      deduplicateAndInsertInRepositories(repositories, { ...input, content, existingOnly: true }));
+
+    expect(id).toBe(existing);
+    const rows = store.getAll();
+    expect(rows).toHaveLength(1);
+    expect(rows[0].confidence).toBe(0.3);
+    expect(JSON.parse(rows[0].tags)).toEqual(expect.arrayContaining(["decision", "source:passive-capture"]));
+  });
+
+  it("returns null when the exact row vanished before the serialized decision", async () => {
+    const content = "src/main.ts (source)";
+    const row = {
+      id: "gone",
+      content,
+      tags: [],
+      projectId: "p1",
+      sessionId: null,
+      confidence: 0.5,
+      createdAt: "2026-01-01T00:00:00.000Z",
+    };
+    let visible = true;
+    const findExactContent = vi.fn(async () => visible ? row : null);
+    const repositories = {
+      promotedDecisionSerializer: {
+        serializeDecision: vi.fn(async () => { visible = false; }),
+      },
+      lexicalSearch: { searchPromoted: vi.fn(async () => []) },
+      promotedMemory: {
+        findExactContent,
+        insert: vi.fn(async () => "unexpected"),
+        update: vi.fn(async () => undefined),
+        archive: vi.fn(async () => undefined),
+      },
+    };
+    // An earlier, unserialized read still sees the row.
+    await expect(findExactContent()).resolves.toBe(row);
+
+    await expect(deduplicateAndInsertInRepositories(repositories as never, {
+      ...input,
+      content,
+      candidateScope: "owner",
+      existingOnly: true,
+    })).resolves.toBeNull();
+
+    expect(repositories.promotedDecisionSerializer.serializeDecision).toHaveBeenCalledOnce();
+    expect(repositories.promotedMemory.insert).not.toHaveBeenCalled();
+    expect(repositories.promotedMemory.update).not.toHaveBeenCalled();
+  });
+});

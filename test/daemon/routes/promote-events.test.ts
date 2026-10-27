@@ -272,7 +272,12 @@ describe("promote-events route", () => {
     verify.close();
   });
 
-  it.each([false, true])("commits the unreinforced lexical decision with existing match=%s", async (hasMatch) => {
+  it.each([
+    ["no entry", "none"],
+    ["an unrelated lexical hit", "unrelated"],
+    ["an identical entry", "identical"],
+  ] as const)("commits the unreinforced decision against %s", async (_label, seed) => {
+    const hasMatch = seed === "identical";
     recoverMachineIdentity({
       version: 1,
       identityKey: `machine:${"c".repeat(64)}`,
@@ -287,9 +292,10 @@ describe("promote-events route", () => {
       firstMachineSequence: "0000000000000000000",
       establishedAt: "2026-09-07T03:04:05.123456Z",
     });
-    const existingId = hasMatch ? new PromotedStore(projectDb).insert({
-      content: "only once", tags: [], projectId: projectId(dir), depth: 0, confidence: 0.5,
-    }) : undefined;
+    const existingId = seed === "none" ? undefined : new PromotedStore(projectDb).insert({
+      content: hasMatch ? "only once" : "only once but different words",
+      tags: [], projectId: projectId(dir), depth: 0, confidence: 0.5,
+    });
     projectDb.close();
     const edb = new EventsDb(sidecarPath);
     edb.insertEvent("s1", {
@@ -319,8 +325,56 @@ describe("promote-events route", () => {
         outcome: "no-effect",
         effectWitness: { reason: "unreinforced-pattern" },
       }]);
-    expect(new PromotedStore(verify).getAll()).toHaveLength(hasMatch ? 1 : 0);
+    expect(new PromotedStore(verify).getAll()).toHaveLength(seed === "none" ? 0 : 1);
     verify.close();
+  });
+
+  it("skips a one-off tier 3 event whose only lexical hit is an unrelated entry", async () => {
+    const edb = new EventsDb(sidecarPath);
+    edb.insertEvent("s1", { type: "file_read", category: "file", data: "src/config/other.ts (read) shared terms", priority: 3 }, "PostToolUse");
+    edb.close();
+    const db = setupProjectDb(dir);
+    new PromotedStore(db).insert({
+      content: "src/config/settings.ts (read) shared terms", tags: ["seed"], projectId: projectId(dir), confidence: 0.6,
+    });
+    expect(new PromotedStore(db).search("src/config/other.ts (read) shared terms", 1, undefined, projectId(dir))).toHaveLength(1);
+    db.close();
+
+    await expect(promoteEventsForCwd(makeConfig(), dir)).resolves.toMatchObject({
+      promoted: 0, skipped: 1, errors: 0,
+    });
+
+    const verify = new DatabaseSync(projectDbPath(dir), { readOnly: true });
+    expect(new PromotedStore(verify).getAll()).toHaveLength(1);
+    verify.close();
+    const sidecar = new EventsDb(sidecarPath);
+    expect(sidecar.getUnprocessed()).toEqual([]);
+    sidecar.close();
+    expect(vi.mocked(deduplicateAndInsert)).not.toHaveBeenCalled();
+  });
+
+  it("re-confirms an identical entry for a one-off tier 3 event without inserting", async () => {
+    const edb = new EventsDb(sidecarPath);
+    edb.insertEvent("s1", { type: "file_read", category: "file", data: "src/main.ts (source)", priority: 3 }, "PostToolUse");
+    edb.close();
+    const db = setupProjectDb(dir);
+    const existingId = new PromotedStore(db).insert({
+      content: "src/main.ts (source)", tags: ["seed"], projectId: projectId(dir), confidence: 0.05,
+    });
+    db.close();
+
+    await expect(promoteEventsForCwd(makeConfig(), dir)).resolves.toMatchObject({
+      promoted: 1, skipped: 0, errors: 0,
+    });
+
+    const verify = new DatabaseSync(projectDbPath(dir), { readOnly: true });
+    const rows = new PromotedStore(verify).getAll();
+    expect(rows).toHaveLength(1);
+    expect(rows[0].id).toBe(existingId);
+    expect(rows[0].confidence).toBeGreaterThan(0.05);
+    expect(JSON.parse(rows[0].tags)).toEqual(expect.arrayContaining(["seed", "source:passive-capture"]));
+    verify.close();
+    expect(vi.mocked(deduplicateAndInsert)).not.toHaveBeenCalled();
   });
 
   it.each([
@@ -989,7 +1043,8 @@ describe("promote-events route", () => {
     await createPromoteEventsHandler(makeConfig())(request, res, JSON.stringify({ cwd: dir }));
 
     expect(getBody()).toMatchObject({ promoted: event.promoted, skipped: 1 - event.promoted, errors: 0 });
-    expect(deduplicateAndInsert).toHaveBeenCalledTimes(event.promoted);
+    expect(deduplicateAndInsert).not.toHaveBeenCalled();
+    expect(deduplicateAndInsertInRepositories).toHaveBeenCalledTimes(event.promoted);
     const verify = new EventsDb(sidecarPath);
     expect(verify.getUnprocessed()).toEqual([]);
     verify.close();
