@@ -1,3 +1,4 @@
+import { spawnSync } from "node:child_process";
 import { EventEmitter } from "node:events";
 import { chmodSync, lstatSync, mkdtempSync, readFileSync, rmSync, statSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
@@ -3885,8 +3886,20 @@ describe("PostgreSQL harness container engine selection", () => {
   const labelArguments = (runId: string, kind: string) => Object.entries(ownershipLabels(runId, kind, owner))
     .flatMap(([key, value]) => ["--label", `${key}=${value}`]);
 
-  it("defaults to Docker and accepts only docker, podman or absolute executables", () => {
-    expect(resolveContainerEngine({})).toEqual({ cli: "docker", flavour: "docker" });
+  it("defaults to Podman locally and Docker in CI, and accepts only docker, podman or absolute executables", () => {
+    const podman = { cli: "podman", flavour: "podman" };
+    const docker = { cli: "docker", flavour: "docker" };
+    expect(resolveContainerEngine({})).toEqual(podman);
+    expect(resolveContainerEngine({ GITHUB_ACTIONS: "false" })).toEqual(podman);
+    expect(resolveContainerEngine({ GITHUB_ACTIONS: "true" })).toEqual(docker);
+    // An explicit ci signal wins over the environment, in both directions.
+    expect(resolveContainerEngine({}, true)).toEqual(docker);
+    expect(resolveContainerEngine({ GITHUB_ACTIONS: "true" }, false)).toEqual(podman);
+    // An explicit selection ignores the CI signal; assertContainerEngineSupported rejects Podman in CI.
+    expect(resolveContainerEngine({ LCM_TEST_CONTAINER_CLI: "docker" }, false)).toEqual(docker);
+    expect(resolveContainerEngine({ LCM_TEST_CONTAINER_CLI: "podman" }, true)).toEqual(podman);
+    expect(() => resolveContainerEngine({ LCM_TEST_CONTAINER_CLI: "" }, true)).toThrow("LCM_TEST_CONTAINER_CLI must be");
+    expect(() => resolveContainerEngine({ LCM_TEST_CONTAINER_CLI: "bogus" }, false)).toThrow("LCM_TEST_CONTAINER_CLI must be");
     expect(resolveContainerEngine({ LCM_TEST_CONTAINER_CLI: "docker" })).toEqual({ cli: "docker", flavour: "docker" });
     expect(resolveContainerEngine({ LCM_TEST_CONTAINER_CLI: "podman" })).toEqual({ cli: "podman", flavour: "podman" });
     expect(resolveContainerEngine({ LCM_TEST_CONTAINER_CLI: "/usr/bin/podman" }))
@@ -3914,7 +3927,7 @@ describe("PostgreSQL harness container engine selection", () => {
     const docker = { cli: "docker", flavour: "docker" };
     expect(() => assertContainerEngineSupported(podman, true, {})).toThrow("only local mode");
     expect(() => assertContainerEngineSupported(podman, false, { LCM_POSTGRES_TEMPLATE_ARCHIVE: "/cache/t.tar" }))
-      .toThrow("LCM_POSTGRES_TEMPLATE_ARCHIVE");
+      .toThrow("LCM_POSTGRES_TEMPLATE_ARCHIVE; unset it, or set LCM_TEST_CONTAINER_CLI=docker to use a template archive");
     expect(() => assertContainerEngineSupported(podman, false, { LCM_POSTGRES_TEMPLATE_ARCHIVE: "  " })).not.toThrow();
     expect(() => assertContainerEngineSupported(podman, false, {})).not.toThrow();
     expect(() => assertContainerEngineSupported(docker, true, { LCM_POSTGRES_TEMPLATE_ARCHIVE: "/cache/t.tar" }))
@@ -3924,6 +3937,7 @@ describe("PostgreSQL harness container engine selection", () => {
   it.each([
     ["Podman in CI mode", { LCM_TEST_CONTAINER_CLI: "podman", GITHUB_ACTIONS: "true" }, undefined],
     ["Podman with a template archive", { LCM_TEST_CONTAINER_CLI: "podman", LCM_POSTGRES_TEMPLATE_ARCHIVE: "/cache/t.tar" }, false],
+    ["the default Podman with a template archive", { LCM_POSTGRES_TEMPLATE_ARCHIVE: "/cache/t.tar" }, false],
     ["an unknown CLI", { LCM_TEST_CONTAINER_CLI: "bogus" }, undefined],
   ])("rejects %s before any marker, engine call or allocation", async (_label, environment, ci) => {
     const write = vi.spyOn(process.stderr, "write").mockImplementation(() => true);
@@ -3943,6 +3957,72 @@ describe("PostgreSQL harness container engine selection", () => {
       write.mockRestore();
     }
   });
+
+  it.each([
+    ["no ci option, GITHUB_ACTIONS unset", undefined, "", "podman"],
+    ["options.ci=false (local topology) under GITHUB_ACTIONS=true", false, "true", "docker"],
+    ["options.ci=true over GITHUB_ACTIONS unset", true, "", "docker"],
+    ["no ci option, GITHUB_ACTIONS=true", undefined, "true", "docker"],
+  ])("invokes the engine selected by the resolved CI signal (%s) when the CLI is unset", async (
+    _label,
+    ci,
+    githubActions,
+    expected,
+  ) => {
+    const scratch = mkdtempSync(join(tmpdir(), "lcm-postgresql-default-cli-"));
+    const log = join(scratch, "calls.log");
+    for (const name of ["docker", "podman"]) {
+      writeFileSync(join(scratch, name), "#!/bin/bash\necho '" + name + "' >> '" + log + "'\nexit 1\n");
+      chmodSync(join(scratch, name), 0o755);
+    }
+    const write = vi.spyOn(process.stderr, "write").mockImplementation(() => true);
+    vi.stubEnv("PATH", scratch + ":" + process.env.PATH);
+    vi.stubEnv("GITHUB_ACTIONS", githubActions);
+    vi.stubEnv("LCM_POSTGRES_TEMPLATE_ARCHIVE", "");
+    vi.stubEnv("LCM_TEST_CONTAINER_CLI", undefined);
+    try {
+      await expect(runHarness({ ci })).rejects.toThrow();
+      const invoked = new Set(readFileSync(log, "utf8").split("\n").filter(Boolean));
+      expect([...invoked]).toEqual([expected]);
+    } finally {
+      vi.unstubAllEnvs();
+      write.mockRestore();
+      rmSync(scratch, { recursive: true, force: true });
+    }
+  });
+
+  it.each(["--consumer-signal-probe", "--fork-consumer-signal-probe"])(
+    "keeps Docker for the %s CLI entry under GitHub Actions with a staged template archive",
+    (probe) => {
+      const scratch = mkdtempSync(join(tmpdir(), "lcm-postgresql-probe-cli-"));
+      const log = join(scratch, "calls.log");
+      try {
+        for (const name of ["docker", "podman"]) {
+          writeFileSync(join(scratch, name), "#!/bin/bash\necho '" + name + "' >> '" + log + "'\nexit 1\n");
+          chmodSync(join(scratch, name), 0o755);
+        }
+        const environment: NodeJS.ProcessEnv = {
+          ...process.env,
+          PATH: scratch + ":" + process.env.PATH,
+          GITHUB_ACTIONS: "true",
+          LCM_POSTGRES_TEMPLATE_ARCHIVE: join(scratch, "template.tar"),
+        };
+        delete environment.LCM_TEST_CONTAINER_CLI;
+        const result = spawnSync(process.execPath, ["scripts/postgresql-harness.mjs", probe], {
+          encoding: "utf8",
+          env: environment,
+          timeout: 60_000,
+          killSignal: "SIGKILL",
+        });
+        expect(result.error).toBeUndefined();
+        expect(result.stderr).not.toContain("does not support LCM_POSTGRES_TEMPLATE_ARCHIVE");
+        const invoked = new Set(readFileSync(log, "utf8").split("\n").filter(Boolean));
+        expect([...invoked]).toEqual(["docker"]);
+      } finally {
+        rmSync(scratch, { recursive: true, force: true });
+      }
+    },
+  );
 
   it.each(["docker", "podman"])(
     "binds the real run directory into the %s database container",
