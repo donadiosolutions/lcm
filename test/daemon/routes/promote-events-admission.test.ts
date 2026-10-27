@@ -327,6 +327,18 @@ describe("canonical promotion publication admission", () => {
     expect(existsSync(join(home, ".lcm", "projects", newId, "db.sqlite"))).toBe(false);
 
     rmSync(linked, { recursive: true, force: true });
+    const oldBytesBefore = readFileSync(oldSidecar);
+    const newBytesBefore = readFileSync(newSidecar);
+    expect(existingEventsDbPath(linked)).toBe(oldSidecar);
+    await expect(parkUnavailableCwdEvents(linked, newSidecar))
+      .rejects.toBeInstanceOf(SidecarIdentityConflictError);
+    expect(sidecarState(oldSidecar)).toEqual(oldBefore);
+    expect(sidecarState(newSidecar)).toEqual(newBefore);
+    expect(readFileSync(oldSidecar)).toEqual(oldBytesBefore);
+    expect(readFileSync(newSidecar)).toEqual(newBytesBefore);
+    expect(readFileSync(evidencePath)).toEqual(evidenceBefore);
+    expect(existsSync(projectMapPath())).toBe(false);
+    expect(existsSync(join(home, ".lcm", "projects"))).toBe(false);
     await expect(parkUnavailableCwdEvents(linked, oldSidecar)).resolves.toMatchObject({
       deferred: { reason: "unavailable-cwd" },
     });

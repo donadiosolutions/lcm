@@ -73,6 +73,11 @@ type PromotionExecutionContext = Pick<
   "publicationLockToken" | "withPublicationAdmission" | "signal"
 >;
 
+type AdmittedPromotionExecutionContext = PromotionExecutionContext & (
+  | { withPublicationAdmission: NonNullable<PromotionExecutionContext["withPublicationAdmission"]> }
+  | { withPublicationAdmission?: undefined; publicationLockToken: BackendPublicationLockToken }
+);
+
 export type PromoteTerminalOutcome = {
   kind: "parked";
   reason: "unavailable-cwd";
@@ -260,9 +265,13 @@ async function withLockedCwdPromotion<T>(
 function promotionExecutionContext(
   publicationLockToken: BackendPublicationLockToken | undefined,
   context: PromotionExecutionContext | undefined,
-): PromotionExecutionContext | undefined {
-  if (context?.withPublicationAdmission !== undefined
-      || context?.publicationLockToken !== undefined) return context;
+): AdmittedPromotionExecutionContext {
+  if (context?.withPublicationAdmission !== undefined) {
+    return { ...context, withPublicationAdmission: context.withPublicationAdmission };
+  }
+  if (context?.publicationLockToken !== undefined) {
+    return { ...context, withPublicationAdmission: undefined, publicationLockToken: context.publicationLockToken };
+  }
   if (publicationLockToken !== undefined) return { publicationLockToken };
   return {
     ...context,
@@ -790,15 +799,13 @@ async function promoteEventsForCwdUnlocked(
 
 /** Queue only local SQLite preparation; scrubber and selected work have separate lifetimes. */
 async function withPromotionLocalAdmission<T>(
-  context: PromotionExecutionContext | undefined,
+  context: AdmittedPromotionExecutionContext,
   operation: (token?: BackendPublicationLockToken) => Promise<T>,
 ): Promise<T> {
-  if (context?.withPublicationAdmission !== undefined) {
+  if (context.withPublicationAdmission !== undefined) {
     return context.withPublicationAdmission(operation, context.signal);
   }
-  return context?.publicationLockToken === undefined
-    ? withBackendPublicationConsumerLockAsync(undefined, operation)
-    : operation(context.publicationLockToken);
+  return operation(context.publicationLockToken);
 }
 
 /** Keep retained compatibility admission on resources owned by this route. */
@@ -875,7 +882,7 @@ async function runSelectedPromotionBatch(
   outboxFactory: SQLiteLocalHookOutboxFactory,
   existingEdb: LocalHookOutboxRepository | undefined,
   factory: StorageBackendFactory,
-  context: PromotionExecutionContext | undefined,
+  context: AdmittedPromotionExecutionContext,
   expectedIdentity: StorageIdentityContext & { readonly localProjectId: string },
 ): Promise<{ result: PromoteResult; edb: LocalHookOutboxRepository | undefined }> {
   let edb = existingEdb;
