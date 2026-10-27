@@ -2,6 +2,8 @@ import { mkdirSync, mkdtempSync, rmSync, writeFileSync, chmodSync } from "node:f
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { spawnSync } from "node:child_process";
+import { createServer } from "node:http";
+import type { AddressInfo } from "node:net";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { classifyMigrationDaemonPresence } from "../../src/migration/daemon-presence.js";
 import type { DaemonObservation } from "../../src/daemon/client.js";
@@ -204,12 +206,36 @@ describe("classifyMigrationDaemonPresence: the unresolvable outcome, never misre
     expect(result).toEqual({ status: "unresolvable", evidence: "observe-unknown-error" });
   });
 
-  it("exercises the real network path end to end: a real token file present, a real (refused) HTTP connection attempt, observe() catching the failure and returning null, landing on authoritatively-absent (no live daemon actually listens on this port)", async () => {
+  it("classifies absent when a token remains but no PID file records a daemon", async () => {
     const homeDir = home();
     writeFileSync(join(homeDir, ".lcm", "config.json"), JSON.stringify({ storage: { backend: "sqlite" }, daemon: { port: 3939 } }), { mode: 0o600 });
     writeFileSync(join(homeDir, ".lcm", "daemon.token"), "a-real-token-value\n", { mode: 0o600 });
     const result = await classifyMigrationDaemonPresence({ homeDir });
     expect(result).toEqual({ status: "authoritatively-absent" });
+  });
+
+  it("keeps an unsafe live peer unresolvable and sends no token to its listener", async () => {
+    const homeDir = home();
+    let requests = 0;
+    const server = createServer((_request, response) => {
+      requests += 1;
+      response.setHeader("Content-Type", "application/json");
+      response.end(JSON.stringify(realObservation()));
+    });
+    await new Promise<void>(resolve => server.listen(0, "127.0.0.1", resolve));
+    try {
+      const port = (server.address() as AddressInfo).port;
+      writeFileSync(join(homeDir, ".lcm", "config.json"), JSON.stringify({ daemon: { port } }), { mode: 0o600 });
+      writeFileSync(join(homeDir, ".lcm", "daemon.token"), "private-token", { mode: 0o600 });
+      writeFileSync(join(homeDir, ".lcm", "daemon.pid"), String(process.pid), { mode: 0o600 });
+      expect(await classifyMigrationDaemonPresence({ homeDir })).toEqual({
+        status: "unresolvable", evidence: "observe-DaemonPeerRefusalError",
+      });
+      expect(requests).toBe(0);
+    } finally {
+      server.closeAllConnections();
+      await new Promise<void>(resolve => server.close(() => resolve()));
+    }
   });
 
 });

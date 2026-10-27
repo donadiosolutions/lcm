@@ -10,6 +10,7 @@ import { normalizeTranscriptClient } from "../transcript-provider.js";
 import { safeLogError } from "./hook-errors.js";
 import { configPath as defaultConfigPath, daemonPidPath, daemonTokenPath, lcmHomeDir } from "../runtime-paths.js";
 import { readAuthToken } from "../daemon/auth.js";
+import { admitDaemonPeer, type DaemonPeerAdmission } from "../daemon/peer-admission.js";
 import type { StorageBackendSelection } from "../storage/backend.js";
 import {
   clearDaemonNotice,
@@ -57,14 +58,29 @@ function getDaemonToken(): string | null {
   return readAuthToken(daemonTokenPath());
 }
 
+/** One monotonic allowance shared by consecutive best-effort notifications. */
+export type HookPeerBudget = Readonly<{
+  deadline: number;
+  /** @internal Deterministic listener admission for hook tests. */
+  admitPeerForTesting?: (port: number, deadline: number) => DaemonPeerAdmission | null;
+}>;
+
 function fireLocalPostRequestRaw(
   port: number,
   path: string,
   body: Record<string, unknown>,
   lockToken: HookPublicationLockToken,
+  budget?: HookPeerBudget,
 ): void {
   assertHookPublicationFenceToken(lockToken);
+  const deadline = budget?.deadline ?? performance.now() + 500;
+  const peer = budget?.admitPeerForTesting === undefined
+    ? admitDaemonPeer({ port, deadline })
+    : budget.admitPeerForTesting(port, deadline);
+  if (peer === null || performance.now() >= deadline) return;
   const json = JSON.stringify(body);
+  assertHookPublicationFenceToken(lockToken);
+  if (performance.now() >= deadline) return;
   const token = getDaemonToken();
   const headers: Record<string, string> = {
     "Content-Type": "application/json",
@@ -73,6 +89,8 @@ function fireLocalPostRequestRaw(
   if (token) {
     headers["Authorization"] = `Bearer ${token}`;
   }
+  assertHookPublicationFenceToken(lockToken);
+  if (performance.now() >= deadline) return;
   const req = request({
     hostname: "127.0.0.1",
     port,
@@ -103,16 +121,17 @@ function fireLocalPostRequestRaw(
 export function fireCompactRequest(
   port: number,
   body: Record<string, unknown>,
+  budget?: HookPeerBudget,
 ): void {
-  withHookPublicationFence((lockToken) => fireLocalPostRequestRaw(port, "/compact", body, lockToken));
+  withHookPublicationFence((lockToken) => fireLocalPostRequestRaw(port, "/compact", body, lockToken, budget));
 }
 
-export function firePromoteRequest(port: number, body: Record<string, unknown>): void {
-  withHookPublicationFence((lockToken) => fireLocalPostRequestRaw(port, "/promote", body, lockToken));
+export function firePromoteRequest(port: number, body: Record<string, unknown>, budget?: HookPeerBudget): void {
+  withHookPublicationFence((lockToken) => fireLocalPostRequestRaw(port, "/promote", body, lockToken, budget));
 }
 
-export function firePromoteEventsRequest(port: number, body: Record<string, unknown>): void {
-  withHookPublicationFence((lockToken) => fireLocalPostRequestRaw(port, "/promote-events", body, lockToken));
+export function firePromoteEventsRequest(port: number, body: Record<string, unknown>, budget?: HookPeerBudget): void {
+  withHookPublicationFence((lockToken) => fireLocalPostRequestRaw(port, "/promote-events", body, lockToken, budget));
 }
 
 /**
@@ -125,8 +144,8 @@ export function firePromoteEventsRequest(port: number, body: Record<string, unkn
  * This is intentionally separate from DaemonClient.post(), which is a full
  * request/response client.
  */
-export function firePromoteEventsNotifyRequest(port: number, body: Record<string, unknown>): void {
-  withHookPublicationFence((lockToken) => fireLocalPostRequestRaw(port, "/promote-events/notify", body, lockToken));
+export function firePromoteEventsNotifyRequest(port: number, body: Record<string, unknown>, budget?: HookPeerBudget): void {
+  withHookPublicationFence((lockToken) => fireLocalPostRequestRaw(port, "/promote-events/notify", body, lockToken, budget));
 }
 
 function scheduleBackgroundRequest(schedule: () => void): void {
@@ -253,16 +272,17 @@ export async function handleSessionEnd(
   }
 
   const { input, clientName, ingestResult, disableCompact } = admitted;
+  const backgroundPeerBudget: HookPeerBudget = { deadline: performance.now() + 500 };
   if (!disableCompact) {
     scheduleBackgroundRequest(() => fireCompactRequest(daemonPort, {
       session_id: input.session_id,
       cwd: input.cwd,
       skip_ingest: true,
       client: clientName,
-    }));
+    }, backgroundPeerBudget));
   }
-  scheduleBackgroundRequest(() => firePromoteRequest(daemonPort, { cwd: input.cwd }));
-  scheduleBackgroundRequest(() => firePromoteEventsRequest(daemonPort, { cwd: input.cwd }));
+  scheduleBackgroundRequest(() => firePromoteRequest(daemonPort, { cwd: input.cwd }, backgroundPeerBudget));
+  scheduleBackgroundRequest(() => firePromoteEventsRequest(daemonPort, { cwd: input.cwd }, backgroundPeerBudget));
   if (clientName === "claude") {
     // Created only after the fence check so the one-second budget covers the request alone.
     let completionSignal: AbortSignal | undefined;

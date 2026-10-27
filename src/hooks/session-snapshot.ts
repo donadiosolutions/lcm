@@ -3,6 +3,8 @@ import { join } from "node:path";
 import { homedir } from "node:os";
 import { normalizeTranscriptClient } from "../transcript-provider.js";
 import { daemonJsonRequest, normalizeDaemonPort } from "../daemon/http-url.js";
+import { admitDaemonPeer, type DaemonPeerAdmission } from "../daemon/peer-admission.js";
+import type { HookPeerBudget } from "./session-end.js";
 import { configPath as defaultConfigPath, daemonTokenPath, tmpDir as lcmTmpDir } from "../runtime-paths.js";
 import {
   assertHookPublicationFence,
@@ -21,6 +23,8 @@ export interface SnapshotDeps {
   verifiedPort?: number;
   /** Waits for a live publication-lock owner before each pre-effect admission. */
   admissionRetry?: HookAdmissionRetry;
+  /** @internal Deterministic listener admission for snapshot tests. */
+  _admitPeerForTesting?: (port: number, deadline: number) => DaemonPeerAdmission | null;
 }
 
 function defaultStatSync(path: string): { mtimeMs: number } | null {
@@ -89,6 +93,7 @@ export async function handleSessionSnapshot(
 
     // POST to /ingest — daemon handles delta via storedCount
     let ingestResult: { totalTokens?: number } | undefined;
+    let peerBudget: HookPeerBudget | undefined;
     const _post = deps?.post;
     if (_post) {
       await retry(() => assertHookPublicationFence());
@@ -98,6 +103,17 @@ export async function handleSessionSnapshot(
       const { readFileSync: _readFileSync } = await import("node:fs");
       const config = await retry(() => loadDaemonConfig(defaultConfigPath()));
       const port = deps?.verifiedPort ?? normalizeDaemonPort(config.daemon?.port ?? 3737);
+      const deadline = performance.now() + 5_000;
+      await retry(() => assertHookPublicationFence());
+      const admitPeer = (): DaemonPeerAdmission | null => deps?._admitPeerForTesting === undefined
+        ? admitDaemonPeer({ port, deadline })
+        : deps._admitPeerForTesting(port, deadline);
+      if (admitPeer() === null || performance.now() >= deadline) return { exitCode: 0, stdout: "" };
+      // The publication fence may wait after the first process proof. Recheck
+      // both boundaries so a changed selection or listener cannot use it.
+      await retry(() => assertHookPublicationFence());
+      if (admitPeer() === null || performance.now() >= deadline) return { exitCode: 0, stdout: "" };
+      peerBudget = { deadline, admitPeerForTesting: deps?._admitPeerForTesting };
 
       // Read token from token file if available (silent fallback if not found)
       let token: string | null = null;
@@ -114,12 +130,14 @@ export async function handleSessionSnapshot(
         headers["Authorization"] = `Bearer ${token}`;
       }
 
-      await retry(() => assertHookPublicationFence());
+      assertHookPublicationFence();
+      if (performance.now() >= deadline) return { exitCode: 0, stdout: "" };
+
       ingestResult = await daemonJsonRequest<{ totalTokens?: number }>(port, "/ingest", {
         method: "POST",
         headers,
         body: { session_id, cwd, transcript_path, client: clientName },
-        timeoutMs: 5000,
+        timeoutMs: Math.max(1, Math.floor(deadline - performance.now())),
       });
     }
 
@@ -136,7 +154,7 @@ export async function handleSessionSnapshot(
             cwd,
             skip_ingest: true,
             client: "codex",
-          });
+          }, peerBudget);
         }
       } catch (error) {
         if (isBackendPublicationJournalError(error)) throw error;
@@ -158,7 +176,7 @@ export async function handleSessionSnapshot(
       const _config = _loadConfig(defaultConfigPath());
       const port = deps?.verifiedPort ?? normalizeDaemonPort(_config.daemon?.port ?? 3737);
       const { firePromoteEventsRequest } = await import("./session-end.js");
-      firePromoteEventsRequest(port, { cwd: input.cwd });
+      firePromoteEventsRequest(port, { cwd: input.cwd }, peerBudget);
     } catch (error) {
       if (isBackendPublicationJournalError(error)) throw error;
       // Best-effort only

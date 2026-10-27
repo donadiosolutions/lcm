@@ -1,6 +1,8 @@
 import { accessSync, constants, lstatSync } from "node:fs";
 import { stdin } from "node:process";
 import { daemonJsonResponse } from "../daemon/http-url.js";
+import { DaemonPeerRefusalError } from "../daemon/client.js";
+import { admitDaemonPeer } from "../daemon/peer-admission.js";
 import { createTerminalDeadline, type TerminalDeadline } from "../cli/terminal-deadline.js";
 import { readTerminalStdin } from "../cli/terminal-stdin.js";
 import { assertHookPublicationFence, hookAdmissionRetry } from "./publication-fence.js";
@@ -34,6 +36,7 @@ export type TerminalSnapshotDeps = Readonly<{
     endpoint: { port: number; token: string },
     body: Record<string, unknown>,
     signal: AbortSignal,
+    timeoutMs: number,
   ) => Promise<{ statusCode: number }>;
   logError: (event: string, error: unknown, opts: { cwd?: string; sessionId?: string }) => Promise<void>;
 }>;
@@ -47,12 +50,21 @@ function defaultPost(
   endpoint: { port: number; token: string },
   body: Record<string, unknown>,
   signal: AbortSignal,
+  timeoutMs: number,
 ): Promise<{ statusCode: number }> {
+  const deadline = performance.now() + timeoutMs;
+  if (signal.aborted || timeoutMs <= 0
+    || admitDaemonPeer({ port: endpoint.port, deadline }) === null) {
+    throw new DaemonPeerRefusalError();
+  }
+  const remainingMs = Math.floor(deadline - performance.now());
+  if (signal.aborted || remainingMs <= 0) throw new DaemonPeerRefusalError();
   return daemonJsonResponse(endpoint.port, "/ingest/terminal", {
     method: "POST",
     headers: { "Content-Type": "application/json", Authorization: `Bearer ${endpoint.token}` },
     body,
     signal,
+    timeoutMs: remainingMs,
   });
 }
 
@@ -102,6 +114,7 @@ function isTranscriptReadable(path: string): boolean {
 }
 
 function postFailureOutcome(error: unknown): TerminalOutcome {
+  if (error instanceof DaemonPeerRefusalError) return "daemon-unavailable";
   const code = (error as { code?: unknown } | null)?.code;
   return typeof code === "string" && UNREACHABLE_CODES.includes(code)
     ? "daemon-unavailable"
@@ -137,6 +150,7 @@ async function submit(
   // bound the wait and the outcome reserve stays untouched. Half of the budget
   // may go to waiting, which leaves the rest for the request itself.
   const postScope = deadline.openPhase("post");
+  const postStarted = performance.now();
   try {
     try {
       await hookAdmissionRetry({
@@ -146,11 +160,13 @@ async function submit(
     } catch {
       return "publication-refused";
     }
-    if (postScope.budgetMs <= 0) return "deadline-exhausted";
+    const remainingMs = Math.floor(postScope.budgetMs - (performance.now() - postStarted));
+    if (postScope.signal.aborted || remainingMs <= 0) return "deadline-exhausted";
     const response = await deps.post(
       endpoint,
       { session_id, cwd, transcript_path, client: "codex", event },
       postScope.signal,
+      remainingMs,
     );
     if (response.statusCode !== 202) return "ingest-failed";
     state.accepted = true;

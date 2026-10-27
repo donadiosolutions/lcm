@@ -508,6 +508,8 @@ component_management:
         # #1233 keeps publication-contention managed restart recovery lifecycle-owned.
         - "^src/daemon/lifecycle-scope\\.ts$"
         - "^src/daemon/lifecycle\\.ts$"
+        - "^src/daemon/peer-admission\\.ts$"
+        - "^src/daemon/peer-attribution\\.ts$"
         - "^src/daemon/managed-credentials\\.ts$"
         # #1450 keeps stable managed PATH canonicalization and direct executable
         # admission in this existing service-manager owner.

@@ -61,6 +61,7 @@ vi.mock("../../src/daemon/client.js", () => ({
       post: localStatsMocks.post,
     };
   }),
+  verifiedLocalDaemonClient: vi.fn(() => ({ post: localStatsMocks.post })),
 }));
 vi.mock("../../src/daemon/version.js", () => ({
   PKG_VERSION: "9.9.9-test",

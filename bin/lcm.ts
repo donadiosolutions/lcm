@@ -9,11 +9,13 @@ import { Command, Option } from "commander";
 import { packageRootFor } from "../src/runtime-root.js";
 import {
   DaemonClient,
+  verifiedLocalDaemonClient,
   type DaemonHealth,
   type DaemonRequestOptions,
   type InvocationControlRequest,
   type InvocationControlResponse,
 } from "../src/daemon/client.js";
+import { admitDaemonPeer } from "../src/daemon/peer-admission.js";
 import { performMigrationPlan } from "../src/migration/cli-plan.js";
 import { performMigrationDryRunCheck } from "../src/migration/cli-dry-run.js";
 import { performMigrationApply } from "../src/migration/cli-apply.js";
@@ -2649,7 +2651,8 @@ async function createDaemonClientOrExitWithConfig(): Promise<DaemonClientWithCon
   clearDaemonRemediationMarker();
 
   return {
-    client: new DaemonClient(`http://127.0.0.1:${port}`, tokenPath),
+    client: new DaemonClient(`http://127.0.0.1:${port}`, tokenPath,
+      () => admitDaemonPeer({ port, deadline: performance.now() + 2_000 })),
     config,
   };
 }
@@ -2666,11 +2669,13 @@ async function createDaemonReadClientOrExit(
   try {
     const first = readDaemonConfigSnapshot(configPath);
     const tokenPath = daemonTokenPath();
-    const { readAuthToken } = await import("../src/daemon/auth.js");
-    const token = readAuthToken(tokenPath);
-    if (typeof token === "string" && token.length > 0) {
-      const port = first.config.daemon.port;
-      const client = new DaemonClient(`http://127.0.0.1:${port}`, tokenPath);
+    const port = first.config.daemon.port;
+    if (admitDaemonPeer({ port, deadline: performance.now() + 2_000 }) !== null) {
+      const { readAuthToken } = await import("../src/daemon/auth.js");
+      const token = readAuthToken(tokenPath);
+      if (typeof token !== "string" || token.length === 0) throw new Error("Daemon token is unavailable");
+      const client = new DaemonClient(`http://127.0.0.1:${port}`, tokenPath,
+        () => admitDaemonPeer({ port, deadline: performance.now() + 2_000 }));
       const health = options.diagnosticOnly
         ? await client.observe({ timeoutMs: 2000 })
         : await client.health();
@@ -3086,7 +3091,7 @@ export async function runCli(
           }
           const drained = await drainCompactInvocationUntilProved({
             lifecycle: invocationLifecycle,
-            createFreshClient: () => new DaemonClient(`http://127.0.0.1:${compactPort}`, compactTokenPath),
+            createFreshClient: () => verifiedLocalDaemonClient(compactPort, compactTokenPath),
             awaitLocalWork: async () => { await localWorkPromise?.catch(() => undefined); },
             localWorkDispatched: () => localWorkPromise !== undefined,
             originalHealth: originalDaemonHealth,
@@ -3206,7 +3211,7 @@ export async function runCli(
         const cwd = all ? undefined : process.cwd();
         const tokenPath = daemonTokenPath();
         compactTokenPath = tokenPath;
-        let client = new DaemonClient(`http://127.0.0.1:${port}`, tokenPath);
+        let client = verifiedLocalDaemonClient(port, tokenPath);
 
         const { NinjaRenderer } = await import("../src/cli/pipeline-runner.js");
         const { makeProgressState } = await import("../src/cli/progress-state.js");
@@ -3331,7 +3336,7 @@ export async function runCli(
                     throw new Error(daemonUnavailableMessage(recovery, "live-no-response"));
                   }
                   clearDaemonRemediationMarker();
-                  client = new DaemonClient(`http://127.0.0.1:${port}`, tokenPath);
+                  client = verifiedLocalDaemonClient(port, tokenPath);
                   // The invocation-aware branch above throws before recovery;
                   // reaching this point therefore guarantees a legacy client.
                   result = await client.post("/promote", promotionBody);
@@ -4444,7 +4449,7 @@ export async function runCli(
       console.error(`\n  Importing ${providerLabel} sessions${all ? " (all projects)" : ""}...\n`);
       renderer.start();
 
-      const client = new DaemonClient(`http://127.0.0.1:${port}`);
+      const client = verifiedLocalDaemonClient(port);
       const result = await importSessions(client, {
         all, verbose, dryRun, replay, provider,
         onProgress: (patch) => {
@@ -4513,7 +4518,7 @@ export async function runCli(
       }
       clearDaemonRemediationMarker();
 
-      const client = new DaemonClient(`http://127.0.0.1:${port}`);
+      const client = verifiedLocalDaemonClient(port);
       if (dryRun) console.error("  [dry-run] No changes will be written.\n");
 
       let totalProcessed = 0;

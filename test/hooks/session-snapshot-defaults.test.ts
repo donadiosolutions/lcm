@@ -5,6 +5,7 @@ import {
   PrivateMutationLockContentionError,
   retryWhileLiveLockContended,
 } from "../../src/private-mutation-lock.js";
+import { admitDaemonPeer } from "../../src/daemon/peer-admission.js";
 
 const mocks = vi.hoisted(() => ({
   statSync: vi.fn(),
@@ -43,6 +44,9 @@ vi.mock("../../src/hooks/session-end.js", () => ({
   fireCompactRequest: mocks.fireCompactRequest,
   firePromoteEventsRequest: mocks.firePromoteEventsRequest,
 }));
+vi.mock("../../src/daemon/peer-admission.js", () => ({
+  admitDaemonPeer: vi.fn(() => ({ pid: 42, birth: "fixture" })),
+}));
 
 vi.mock("../../src/hooks/publication-fence.js", () => ({
   assertHookPublicationFence: mocks.assertHookPublicationFence,
@@ -63,6 +67,7 @@ const payload = {
 describe("handleSessionSnapshot default integrations", () => {
   beforeEach(() => {
     vi.clearAllMocks();
+    vi.mocked(admitDaemonPeer).mockReturnValue({ pid: 42, birth: "fixture" });
     mocks.isBackendPublicationJournalError.mockReturnValue(false);
     mocks.statSync.mockImplementation(() => { throw new Error("missing"); });
     mocks.readFileSync.mockReturnValue("token-value\n");
@@ -81,12 +86,32 @@ describe("handleSessionSnapshot default integrations", () => {
       headers: expect.objectContaining({ Authorization: "Bearer token-value" }),
       body: expect.objectContaining({ client: "codex" }),
     }));
-    expect(mocks.fireCompactRequest).toHaveBeenCalledWith(4545, expect.objectContaining({ skip_ingest: true }));
+    expect(mocks.fireCompactRequest).toHaveBeenCalledWith(4545, expect.objectContaining({ skip_ingest: true }), expect.any(Object));
     expect(mocks.writeFileSync).toHaveBeenCalledWith(expect.stringContaining("snap-unsafe_session.json"), expect.any(String));
     expect(mocks.chmodSync).toHaveBeenCalledWith(expect.any(String), 0o600);
-    expect(mocks.firePromoteEventsRequest).toHaveBeenCalledWith(4545, { cwd: "/project" });
+    expect(mocks.firePromoteEventsRequest).toHaveBeenCalledWith(4545, { cwd: "/project" }, expect.any(Object));
     expect(mocks.assertHookRootEstablished.mock.invocationCallOrder[0])
       .toBeLessThan(mocks.mkdirSync.mock.invocationCallOrder[0]);
+  });
+
+  it("sends no token or transcript when the local listener is unverified", async () => {
+    vi.mocked(admitDaemonPeer).mockReturnValueOnce(null);
+    expect(await handleSessionSnapshot(JSON.stringify(payload))).toEqual({ exitCode: 0, stdout: "" });
+    expect(mocks.readFileSync).not.toHaveBeenCalled();
+    expect(mocks.daemonJsonRequest).not.toHaveBeenCalled();
+    expect(mocks.fireCompactRequest).not.toHaveBeenCalled();
+  });
+
+  it("re-admits after the publication fence before reading a token", async () => {
+    const order: string[] = [];
+    mocks.assertHookPublicationFence.mockImplementation(() => { order.push("fence"); });
+    vi.mocked(admitDaemonPeer)
+      .mockImplementationOnce(() => { order.push("admit-1"); return { pid: 42, birth: "first" }; })
+      .mockImplementationOnce(() => { order.push("admit-2"); return null; });
+    expect(await handleSessionSnapshot(JSON.stringify(payload))).toEqual({ exitCode: 0, stdout: "" });
+    expect(order).toEqual(["fence", "admit-1", "fence", "admit-2"]);
+    expect(mocks.readFileSync).not.toHaveBeenCalled();
+    expect(mocks.daemonJsonRequest).not.toHaveBeenCalled();
   });
 
   describe("waiting for a live publication-lock owner", () => {
@@ -126,7 +151,7 @@ describe("handleSessionSnapshot default integrations", () => {
         .resolves.toEqual({ exitCode: 0, stdout: "" });
 
       expect(mocks.daemonJsonRequest).toHaveBeenCalledTimes(1);
-      expect(mocks.assertHookPublicationFence).toHaveBeenCalledTimes(2);
+      expect(mocks.assertHookPublicationFence).toHaveBeenCalledTimes(4);
       expect(mocks.writeFileSync).toHaveBeenCalledTimes(1);
     });
 
@@ -168,8 +193,8 @@ describe("handleSessionSnapshot default integrations", () => {
   it("reuses the verified port for ingest, compact, and promotion after config changes", async () => {
     await handleSessionSnapshot(JSON.stringify(payload), { verifiedPort: 7777 });
     expect(mocks.daemonJsonRequest).toHaveBeenCalledWith(7777, "/ingest", expect.any(Object));
-    expect(mocks.fireCompactRequest).toHaveBeenCalledWith(7777, expect.any(Object));
-    expect(mocks.firePromoteEventsRequest).toHaveBeenCalledWith(7777, { cwd: "/project" });
+    expect(mocks.fireCompactRequest).toHaveBeenCalledWith(7777, expect.any(Object), expect.any(Object));
+    expect(mocks.firePromoteEventsRequest).toHaveBeenCalledWith(7777, { cwd: "/project" }, expect.any(Object));
   });
 
   it("proceeds without auth when the token file is missing or empty", async () => {
@@ -249,7 +274,7 @@ describe("handleSessionSnapshot default integrations", () => {
     });
     mocks.daemonJsonRequest.mockResolvedValue({ totalTokens: 1 });
     await handleSessionSnapshot(JSON.stringify(payload));
-    expect(mocks.fireCompactRequest).toHaveBeenCalledWith(3737, expect.any(Object));
+    expect(mocks.fireCompactRequest).toHaveBeenCalledWith(3737, expect.any(Object), expect.any(Object));
   });
 
   describe("Codex SubagentStop", () => {
@@ -280,9 +305,9 @@ describe("handleSessionSnapshot default integrations", () => {
         cwd: "/project",
         skip_ingest: true,
         client: "codex",
-      });
+      }, expect.any(Object));
       expect(mocks.writeFileSync).not.toHaveBeenCalled();
-      expect(mocks.firePromoteEventsRequest).toHaveBeenCalledWith(4545, { cwd: "/project" });
+      expect(mocks.firePromoteEventsRequest).toHaveBeenCalledWith(4545, { cwd: "/project" }, expect.any(Object));
     });
 
     it("never reads the parent rollout and ignores a child event without a valid scope", async () => {

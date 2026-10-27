@@ -1,4 +1,4 @@
-import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, statSync, writeFileSync } from "node:fs";
+import { existsSync, lstatSync, mkdirSync, mkdtempSync, readFileSync, rmSync, statSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { basename, dirname, join } from "node:path";
 import { afterEach, describe, expect, it, vi } from "vitest";
@@ -113,6 +113,25 @@ function withHermeticLifecycleSeams(
   return {
     ...options,
     _hermeticTestSeams: seams,
+    _admitDaemonPeerForTesting: options._admitDaemonPeerForTesting
+      ?? (options._isProcessAliveOverride !== undefined && options._listeningPortsOverride !== undefined
+        ? (mode) => {
+            try {
+              const stat = lstatSync(options.pidFilePath);
+              if (!stat.isFile() || stat.nlink !== 1) return null;
+              const raw = readFileSync(options.pidFilePath, "utf8");
+              if (!/^[1-9][0-9]*$/u.test(raw)) return null;
+              const pid = Number(raw);
+              if (!Number.isSafeInteger(pid) || pid <= 0
+                || (mode.kind === "replacement-manager" && mode.managerPid !== pid)
+                || !options._isProcessAliveOverride!(pid)
+                || !options._listeningPortsOverride!(pid).includes(options.port)) return null;
+              return { pid, birth: `fixture-${pid}` };
+            } catch {
+              return null;
+            }
+          }
+        : undefined),
     // PostgreSQL selection needs completed publication evidence that these fixtures do not create.
     ...(options.expectedStorageBackend === "postgresql" ? { _assertBackendPublication: () => undefined } : {}),
   };
@@ -293,6 +312,28 @@ describe("ensureDaemon", () => {
       pid: 4242,
     });
     expect(fetchMock).toHaveBeenCalledTimes(3);
+  });
+
+  it("sends no bearer to a prebound foreign listener", async () => {
+    const pidFile = makeHermeticPidFile("lcm-lifecycle-foreign-listener-");
+    writeFileSync(pidFile, "4242");
+    writeFileSync(join(dirname(pidFile), "daemon.token"), "local-token");
+    const fetch = vi.fn(async (_url: string, _init?: RequestInit) => ({
+      ok: true, status: 200,
+      json: async () => ({ status: "ok", version: "1.2.3", storageBackend: "sqlite", pid: 4242 }),
+    } as Response));
+    const result = await ensureDaemon({
+      port: 19999,
+      pidFilePath: pidFile,
+      spawnTimeoutMs: 100,
+      expectedVersion: "1.2.3",
+      _skipSpawn: true,
+      _fetchOverride: fetch as FetchOverride,
+      _isProcessAliveOverride: () => true,
+      _listeningPortsOverride: () => [],
+    });
+    expect(result.connected).toBe(false);
+    expect(fetch.mock.calls.every(([, init]) => init?.headers === undefined)).toBe(true);
   });
 
   it("accepts an authenticated staged PostgreSQL daemon with sanitized 503 readiness", async () => {

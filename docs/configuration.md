@@ -1218,7 +1218,36 @@ or production PostgreSQL cluster.
 
 The daemon listens on `127.0.0.1` only. lcm clients and hooks only build daemon
 requests to loopback HTTP origins and known daemon routes, so a malformed config
-or caller cannot redirect daemon traffic to another host. A managed daemon's
+or caller cannot redirect daemon traffic to another host.
+
+Before LCM's CLI, hooks, MCP server, memory API, migration checks, doctor, or
+installer sends a bearer token or hook payload, it checks its private
+`daemon.pid`, the current process owner and birth, and ownership of the exact
+configured loopback listener. Long-running clients and publication retries
+repeat that check before each request. A missing or unsafe witness refuses the
+request; best-effort hooks then return no output and doctor reports an
+unavailable daemon observation. Restart the daemon and run
+`lcm doctor` if these checks continue to refuse a healthy installation.
+The pre-tool hint's 1.5-second, doctor's two-second and snapshot ingest's
+five-second budgets include listener verification and the HTTP exchange.
+Fire-and-forget hook notifications share a short verification allowance and
+skip remaining sends when it expires. On Linux, a managed systemd listener can use its
+verified control group when `/proc` socket descriptors are inaccessible;
+macOS uses process ownership and `lsof`. This protects against another local
+user occupying the port while LCM's daemon is absent. A process running as
+your own user can already read the private token. An ordinary HTTP request
+cannot hold the socket used for the ownership check, so a port change between
+that check and connection remains possible.
+
+A managed replacement can briefly have no PID file. LCM accepts that state
+only while its supervisor freshly confirms the exact replacement job and
+listener. Other missing PID files refuse authenticated requests.
+Older SQLite configuration can still be read from a non-private `.lcm`
+directory, but authenticated daemon probes require a private owner-only state
+directory and PID file. Repair the state directory permissions and restart the
+daemon before retrying those probes.
+
+A managed daemon's
 unauthenticated `GET /health` response is a constant-cost, storage-free liveness
 probe containing only status, package version, selected backend, uptime, and
 PID. It does not inspect project databases or expose installation paths.

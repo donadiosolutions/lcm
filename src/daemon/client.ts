@@ -1,5 +1,5 @@
 import { readAuthToken } from "./auth.js";
-import { join } from "node:path";
+import { dirname, resolve } from "node:path";
 import { homedir } from "node:os";
 import {
   daemonJsonRequest,
@@ -11,6 +11,30 @@ import { isAbortError, throwIfAborted } from "./cancellation.js";
 import { daemonTokenPath } from "../runtime-paths.js";
 import type { StorageBackend } from "./config.js";
 import { isStagedPostgreSqlHealth } from "./staged-postgresql.js";
+import { admitDaemonPeer, type DaemonPeerAdmission } from "./peer-admission.js";
+
+/** Local ownership proof failed before a token or request body was sent. */
+export class DaemonPeerRefusalError extends Error {
+  constructor() {
+    super("Daemon peer could not be verified");
+    this.name = "DaemonPeerRefusalError";
+  }
+}
+
+/** Production client: re-proves local ownership before each bearer request. */
+export function verifiedLocalDaemonClient(
+  port: number,
+  tokenPath?: string,
+  homeDir: string = tokenPath === undefined ? homedir() : dirname(dirname(tokenPath)),
+): DaemonClient {
+  const canonicalTokenPath = daemonTokenPath(homeDir);
+  const path = tokenPath ?? canonicalTokenPath;
+  return new DaemonClient(`http://127.0.0.1:${port}`, path,
+    (budgetMs) => resolve(path) === resolve(canonicalTokenPath)
+      ? admitDaemonPeer({ port, homeDir, deadline: performance.now() + Math.min(2_000, budgetMs ?? 2_000) })
+      : null,
+    true);
+}
 
 export type DaemonHealth = {
   status: string;
@@ -127,8 +151,27 @@ export class DaemonClient {
   private tokenLoaded = false;
   private readonly port: number;
 
-  constructor(baseUrl: string, private tokenPath?: string) {
+  constructor(
+    baseUrl: string,
+    private tokenPath?: string,
+    private readonly admitPeer?: (budgetMs?: number) => DaemonPeerAdmission | null | Promise<DaemonPeerAdmission | null>,
+    private readonly strictPeerRefusal = false,
+  ) {
     this.port = daemonPortFromLoopbackUrl(baseUrl);
+  }
+
+  private async admission(options?: DaemonRequestOptions): Promise<DaemonPeerAdmission | undefined> {
+    if (this.admitPeer === undefined) return undefined;
+    const peer = await this.admitPeer(options?.timeoutMs);
+    if (peer === null) throw new DaemonPeerRefusalError();
+    return peer;
+  }
+
+  private remainingOptions(options: DaemonRequestOptions | undefined, started: number): DaemonRequestOptions | undefined {
+    if (this.admitPeer === undefined || options?.timeoutMs === undefined) return options;
+    const timeoutMs = Math.floor(options.timeoutMs - (performance.now() - started));
+    if (timeoutMs <= 0) throw new DaemonPeerRefusalError();
+    return { ...options, timeoutMs };
   }
 
   private getToken(): string | null {
@@ -144,6 +187,10 @@ export class DaemonClient {
   async health(options?: DaemonRequestOptions): Promise<DaemonHealth | null> {
     try {
       throwIfAborted(options?.signal);
+      const started = performance.now();
+      const peer = await this.admission(options);
+      const requestOptions = this.remainingOptions(options, started);
+      throwIfAborted(options?.signal);
       const token = this.getToken();
       const headers: Record<string, string> = {};
       if (token) {
@@ -152,9 +199,10 @@ export class DaemonClient {
       const response = await daemonJsonResponse<DaemonHealthResponse>(this.port, "/health", {
         method: "GET",
         headers,
-        ...options,
+        ...requestOptions,
       });
       const health = response.data;
+      if (peer !== undefined && health.pid !== peer.pid) return null;
       if (
         (response.statusCode < 200 || response.statusCode >= 300)
         && !isStagedPostgreSqlHealth(response.statusCode, health)
@@ -165,7 +213,7 @@ export class DaemonClient {
       const storageBackend = inferredHealthStorageBackend(health);
       return storageBackend === undefined ? rest : { ...rest, storageBackend };
     } catch (error) {
-      if (isAbortError(error)) throw error;
+      if (isAbortError(error) || (this.strictPeerRefusal && error instanceof DaemonPeerRefusalError)) throw error;
       return null;
     }
   }
@@ -173,16 +221,21 @@ export class DaemonClient {
   async observe(options?: DaemonRequestOptions): Promise<DaemonObservation | null> {
     try {
       throwIfAborted(options?.signal);
+      const started = performance.now();
+      const peer = await this.admission(options);
+      const requestOptions = this.remainingOptions(options, started);
+      throwIfAborted(options?.signal);
       const token = this.getToken();
       if (!token) return null;
       const response = await daemonJsonResponse<unknown>(this.port, "/health/observe", {
         method: "GET",
         headers: { Authorization: `Bearer ${token}` },
-        ...options,
+        ...requestOptions,
       });
-      return parseDaemonObservation(response.statusCode, response.data);
+      const observation = parseDaemonObservation(response.statusCode, response.data);
+      return observation?.pid === peer?.pid || peer === undefined ? observation : null;
     } catch (error) {
-      if (isAbortError(error)) throw error;
+      if (isAbortError(error) || (this.strictPeerRefusal && error instanceof DaemonPeerRefusalError)) throw error;
       return null;
     }
   }
@@ -190,6 +243,10 @@ export class DaemonClient {
   async get<T = unknown>(path: string, options?: DaemonRequestOptions): Promise<T> {
     throwIfAborted(options?.signal);
     const route = normalizeDaemonPath(path);
+    const started = performance.now();
+    await this.admission(options);
+    const requestOptions = this.remainingOptions(options, started);
+    throwIfAborted(options?.signal);
     const token = this.getToken();
     const headers: Record<string, string> = {};
     if (token) {
@@ -198,13 +255,17 @@ export class DaemonClient {
     return await daemonJsonRequest<T>(this.port, route, {
       method: "GET",
       headers,
-      ...options,
+      ...requestOptions,
     });
   }
 
   async post<T = unknown>(path: string, body: unknown, options?: DaemonRequestOptions): Promise<T> {
     throwIfAborted(options?.signal);
     const route = normalizeDaemonPath(path);
+    const started = performance.now();
+    await this.admission(options);
+    const requestOptions = this.remainingOptions(options, started);
+    throwIfAborted(options?.signal);
     const token = this.getToken();
     const headers: Record<string, string> = { "Content-Type": "application/json" };
     if (token) {
@@ -214,7 +275,7 @@ export class DaemonClient {
       method: "POST",
       headers,
       body,
-      ...options,
+      ...requestOptions,
     });
   }
 

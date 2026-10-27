@@ -199,8 +199,11 @@ describe("handlePreToolUse", () => {
       response.end(JSON.stringify(value));
     };
   };
-  const run = (overrides: Record<string, unknown> = {}, deps?: { deadlineMs?: number }) => (
-    handlePreToolUse(JSON.stringify({ ...sessionPayload, ...overrides }), deps)
+  const run = (overrides: Record<string, unknown> = {}, deps?: { deadlineMs?: number; _admitPeerForTesting?: () => { pid: number; birth: string } | null }) => (
+    handlePreToolUse(JSON.stringify({ ...sessionPayload, ...overrides }), {
+      _admitPeerForTesting: () => ({ pid: process.pid, birth: "fixture" }),
+      ...deps,
+    })
   );
   const parse = (stdout: string) => JSON.parse(stdout) as {
     hookSpecificOutput: { hookEventName: string; additionalContext: string };
@@ -261,6 +264,12 @@ describe("handlePreToolUse", () => {
     expect(block.join("\n")).toContain("- Use podman socket for postgres");
     expect(block.join("\n")).toContain("<!-- surfaced-memory-ids: memory-1 -->");
     expect(result.stdout).not.toMatch(/permissionDecision|updatedInput|systemMessage|"decision"|"continue"|stopReason/);
+  });
+
+  it("sends no bearer or pre-tool payload when listener ownership is refused", async () => {
+    enable();
+    expect(await run({}, { _admitPeerForTesting: () => null })).toEqual({ exitCode: 0, stdout: "" });
+    expect(requests).toEqual([]);
   });
 
   it.each([

@@ -4,7 +4,7 @@ import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js"
 import { CallToolRequestSchema, ListToolsRequestSchema } from "@modelcontextprotocol/sdk/types.js";
 import { join } from "node:path";
 import { homedir } from "node:os";
-import { DaemonClient } from "../daemon/client.js";
+import { DaemonClient, verifiedLocalDaemonClient } from "../daemon/client.js";
 import { loadDaemonConfig, type DaemonConfig, type ResolvedStorageConfig } from "../daemon/config.js";
 import { ensureDaemon } from "../daemon/lifecycle.js";
 import { configPath as defaultConfigPath, daemonPidPath } from "../runtime-paths.js";
@@ -350,7 +350,7 @@ export async function startMcpServer(options: StartMcpServerOptions = {}): Promi
     throw new Error("Refusing to start MCP server: daemon endpoint identity could not be verified.");
   }
 
-  const client = new DaemonClient(`http://127.0.0.1:${port}`);
+  const client = verifiedLocalDaemonClient(port);
   const server = new Server({ name: "lcm", version: "1.0.0" }, { capabilities: { tools: {} } });
 
   server.setRequestHandler(ListToolsRequestSchema, async () => ({ tools: TOOLS }));

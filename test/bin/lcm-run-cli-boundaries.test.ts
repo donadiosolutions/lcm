@@ -3,6 +3,7 @@ import { Command } from "commander";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { BackendPublicationJournalError } from "../../src/storage/backend-publication.js";
+import { admitDaemonPeer } from "../../src/daemon/peer-admission.js";
 
 const state = vi.hoisted(() => ({
   exit: vi.fn((code?: string | number | null): never => { throw new Error(`exit:${code ?? 0}`); }),
@@ -217,7 +218,8 @@ vi.mock("../../src/daemon/config.js", async importOriginal => ({
   ...(await importOriginal<typeof import("../../src/daemon/config.js")>()), loadDaemonConfig: state.loadConfig,
 }));
 vi.mock("../../src/daemon/lifecycle.js", () => ({ ensureDaemon: state.ensureDaemon, restartDaemon: state.restartDaemon }));
-vi.mock("../../src/daemon/client.js", () => ({ DaemonClient: class {
+vi.mock("../../src/daemon/client.js", () => {
+  class MockDaemonClient {
   post = state.post;
   get = state.get;
   health = state.health;
@@ -226,7 +228,15 @@ vi.mock("../../src/daemon/client.js", () => ({ DaemonClient: class {
   heartbeatInvocation = state.heartbeatInvocation;
   cancelInvocation = state.cancelInvocation;
   finishInvocation = state.finishInvocation;
-} }));
+  }
+  return {
+    DaemonClient: MockDaemonClient,
+    verifiedLocalDaemonClient: vi.fn(() => new MockDaemonClient()),
+  };
+});
+vi.mock("../../src/daemon/peer-admission.js", () => ({
+  admitDaemonPeer: vi.fn(() => null),
+}));
 vi.mock("../../src/daemon/server.js", () => ({ createDaemon: state.createDaemon }));
 vi.mock("../../src/daemon/auth.js", () => ({ ensureAuthToken: vi.fn(), readAuthToken: state.readAuthToken }));
 vi.mock("../../src/llm/process-utils.js", async importOriginal => ({
@@ -753,8 +763,10 @@ describe("runCli identity boundaries", () => {
 
 describe("runCli lifecycle and connector boundaries", () => {
   it("does not bootstrap the root before an authenticated healthy daemon read", async () => {
+    vi.mocked(admitDaemonPeer).mockReturnValueOnce({ pid: 42, birth: "fixture" });
     state.health.mockResolvedValue({
       status: "ok",
+      pid: 42,
       version: "1.4.2",
       storageBackend: "sqlite",
       entrypoint: "/daemon",

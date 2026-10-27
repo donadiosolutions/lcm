@@ -376,7 +376,29 @@ function hermetic(options: EnsureDaemonOptions, environment: NodeJS.ProcessEnv =
   };
   privateDirectory(seams.homeDir);
   for (const directory of [seams.runtimeDir, seams.credentialDir, seams.procRoot]) mkdirSync(directory, { recursive: true });
-  return { ...options, _hermeticTestSeams: seams };
+  const admitPeer = options._admitDaemonPeerForTesting
+    ?? (options._isProcessAliveOverride !== undefined && options._listeningPortsOverride !== undefined
+      ? () => {
+          try {
+            const stat = lstatSync(options.pidFilePath);
+            if (!stat.isFile() || stat.nlink !== 1) return null;
+            const raw = readFileSync(options.pidFilePath, "utf8");
+            if (!/^[1-9][0-9]*$/u.test(raw)) return null;
+            const pid = Number(raw);
+            const status = readFileSync(join(seams.procRoot, String(pid), "status"), "utf8");
+            const command = readFileSync(join(seams.procRoot, String(pid), "cmdline"), "utf8").replace(/\0/g, " ");
+            const uid = /^Uid:\s+([0-9]+)(?:\s|$)/mu.exec(status)?.[1];
+            if (!Number.isSafeInteger(pid) || Number(uid) !== seams.uid
+              || !command.includes("lcm") || !command.includes("daemon start")
+              || !options._isProcessAliveOverride!(pid)
+              || !options._listeningPortsOverride!(pid).includes(options.port)) return null;
+            return { pid, birth: `fixture-${pid}` };
+          } catch {
+            return null;
+          }
+        }
+      : undefined);
+  return { ...options, _hermeticTestSeams: seams, _admitDaemonPeerForTesting: admitPeer };
 }
 
 function ensure(options: EnsureDaemonOptions): ReturnType<typeof ensureDaemonProduction> {
@@ -2298,7 +2320,7 @@ describe("authenticated legacy generated systemd refusal matrix", () => {
     ["descriptor replacement between reads", { mutatePidBeforeSecondDiscovery: true }, "ambiguous"],
     ["manager discovery unavailable", { discoveries: [{ kind: "unavailable" as const, reason: "manager-timeout" }] }, "manager-unavailable"],
     ["manager discovery failure", { discoveryThrows: true }, "manager-unavailable"],
-  ] as const)("refuses $0 without broad mutation", async (_name, config, refusalReason) => {
+  ] as const)("refuses %s without broad mutation", async (_name, config, refusalReason) => {
     const fixture = await runLegacyFixture(config);
     expect(fixture.result).toMatchObject({ restarted: false });
     if (refusalReason === undefined) expect(fixture.result.refusalReason).toBeUndefined();
@@ -2308,6 +2330,10 @@ describe("authenticated legacy generated systemd refusal matrix", () => {
     expect(fixture.supervisor.start).not.toHaveBeenCalled();
     expect(fixture.ensure).not.toHaveBeenCalled();
     expect(fixture.kill).not.toHaveBeenCalled();
+    if (_name === "wrong listener") {
+      expect(fixture.fetch.mock.calls.filter(([, init]) =>
+        (init as RequestInit | undefined)?.headers !== undefined)).toHaveLength(0);
+    }
   });
 
   it("refuses stable start when a remaining PID path is unchanged after the exact legacy stop", async () => {

@@ -133,6 +133,7 @@ function minimalDeps(overrides: DoctorOverrides = {}): DoctorDeps {
       message: "lcm: 7/7 tools",
     }),
     homedir: defaultDoctorHome,
+    _admitDaemonPeerForTesting: () => ({ pid: DAEMON_OBSERVATION.pid, birth: "fixture" }),
     _expectedRuntimeDigestForTesting: EXPECTED_RUNTIME_DIGEST,
     platform: "darwin",
     ...rest,
@@ -1675,6 +1676,17 @@ describe("doctor authenticated daemon identity", () => {
     });
   }
   const healthy = DAEMON_OBSERVATION;
+
+  it("does not read the token or fetch when local peer admission refuses", async () => {
+    const deps = authenticatedDeps(healthy);
+    const readToken = vi.fn(deps.readFileSync);
+    deps.readFileSync = readToken;
+    deps._admitDaemonPeerForTesting = () => null;
+    const results = await runDoctor(deps);
+    expect(results.find(result => result.name === "daemon")?.status).toBe("fail");
+    expect(deps.fetch).not.toHaveBeenCalled();
+    expect(readToken.mock.calls.some(([path]) => path.endsWith("daemon.token"))).toBe(false);
+  });
 
   it.each([
     ["version", undefined], ["version", "0.4.0"], ["runtimeDigest", undefined],

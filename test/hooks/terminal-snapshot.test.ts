@@ -8,6 +8,11 @@ import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { createTerminalDeadline, type TerminalDeadline } from "../../src/cli/terminal-deadline.js";
 import { TERMINAL_STDIN_MAX_BYTES } from "../../src/cli/terminal-stdin.js";
 import { PrivateMutationLockContentionError } from "../../src/private-mutation-lock.js";
+import { admitDaemonPeer } from "../../src/daemon/peer-admission.js";
+
+vi.mock("../../src/daemon/peer-admission.js", () => ({
+  admitDaemonPeer: vi.fn(() => ({ pid: 42, birth: "fixture" })),
+}));
 import {
   handleTerminalSnapshot,
   reportTerminalOutcome,
@@ -224,13 +229,14 @@ describe("Codex terminal snapshot handler", () => {
     expect(loggedReasons()).toEqual(["unconfirmed"]);
   });
 
-  it("aborts a POST that outlives the work window", async () => {
+  it("does not start a POST when the remaining work window is exhausted", async () => {
     post.mockImplementation((_endpoint, _body, signal: AbortSignal) => new Promise((_resolve, reject) => {
       signal.addEventListener("abort", () => reject(Object.assign(new Error("aborted"), { name: "AbortError" })));
     }));
-    elapsed = 1349;
+    elapsed = 1349.5;
     await run(payload());
-    expect(loggedReasons()).toEqual(["unconfirmed"]);
+    expect(post).not.toHaveBeenCalled();
+    expect(loggedReasons()).toEqual(["deadline-exhausted"]);
   });
 
   it("keeps an acknowledged request accepted when a later local step fails", async () => {
@@ -278,6 +284,7 @@ describe("Codex terminal snapshot defaults", () => {
   let server: Server | undefined;
 
   beforeEach(() => {
+    vi.mocked(admitDaemonPeer).mockReset().mockReturnValue({ pid: 42, birth: "fixture" });
     dir = mkdtempSync(join(tmpdir(), "terminal-snapshot-default-"));
     transcript = join(dir, "rollout.jsonl");
     writeFileSync(transcript, "{}\n");
@@ -321,6 +328,20 @@ describe("Codex terminal snapshot defaults", () => {
       body: { session_id: "s", cwd: dir, transcript_path: transcript, client: "codex", event: "Interrupt" },
     }]);
     expect(logError).not.toHaveBeenCalled();
+  });
+
+  it("sends no bearer or transcript if listener ownership changes after the fence", async () => {
+    const seen: unknown[] = [];
+    const port = await listen(202, seen);
+    vi.mocked(admitDaemonPeer).mockReturnValueOnce(null);
+    const logError = vi.fn(async () => undefined);
+    await handleTerminalSnapshot(
+      JSON.stringify({ hook_event_name: "Interrupt", session_id: "s", cwd: dir, transcript_path: transcript }),
+      { deadline: createTerminalDeadline() },
+      { verify: async () => ({ port, token: "secret" }), assertPublicationFence: () => undefined, logError },
+    );
+    expect(seen).toEqual([]);
+    expect(logError.mock.calls[0]?.[1]).toMatchObject({ message: "daemon-unavailable" });
   });
 
   it("classifies a real unexpected status and a real refused connection", async () => {

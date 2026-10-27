@@ -29,6 +29,7 @@ function deps(overrides: Partial<PublicationConvergenceDeps> = {}): PublicationC
   return {
     fetch: healthFetch(),
     readToken: () => "token",
+    admitPeer: () => ({ pid: 42, birth: "birth" }),
     readOwner: () => ({ version: 1, pid: 42, processStartTime: "birth", nonce: "a".repeat(32) }),
     processBirth: () => "birth",
     platform: "linux",
@@ -38,6 +39,22 @@ function deps(overrides: Partial<PublicationConvergenceDeps> = {}): PublicationC
 }
 
 describe("publication convergence", () => {
+  it("refuses capture before token read or fetch without an admitted listener", async () => {
+    const readToken = vi.fn(() => "token");
+    const fetch = healthFetch();
+    const input = {
+      port: 3737,
+      expectedVersion: identity.version,
+      expectedStorageBackend: identity.storageBackend,
+      expectedEntrypoint: identity.entrypoint,
+      expectedRuntimeDigest: identity.runtimeDigest,
+    };
+    await expect(capturePublicationIdentity({ ...input, deps: { readToken, fetch } })).resolves.toBeUndefined();
+    await expect(capturePublicationIdentity({ ...input, deps: { readToken, fetch, admitPeer: () => null } })).resolves.toBeUndefined();
+    expect(readToken).not.toHaveBeenCalled();
+    expect(fetch).not.toHaveBeenCalled();
+  });
+
   const carriedOwner = { version: 1 as const, pid: 42, processStartTime: "birth", nonce: "a".repeat(32) };
   const carried = (
     path = "/tmp/lock",

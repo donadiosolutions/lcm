@@ -87,7 +87,8 @@ describe("read-only running daemon verification", () => {
     const spawnSyncSpy = vi.fn();
     const before = snapshot();
 
-    await expect(verifyRunningDaemon(options({ _spawnSyncOverride: spawnSyncSpy as never })))
+    await expect(verifyRunningDaemon(options({ _spawnSyncOverride: spawnSyncSpy as never,
+      _admitDaemonPeerForTesting: () => ({ pid: process.pid, birth: "fixture" }) })))
       .resolves.toEqual({ port, token: TOKEN });
 
     expect(snapshot()).toBe(before);
@@ -102,6 +103,7 @@ describe("read-only running daemon verification", () => {
       _fetchOverride: fetchSpy as never,
       _isProcessAliveOverride: () => true,
       _realpathOverride: (path: string) => path,
+      _admitDaemonPeerForTesting: () => ({ pid: process.pid, birth: "fixture" }),
     }))).resolves.toEqual({ port, token: TOKEN });
     expect(fetchSpy).toHaveBeenCalled();
   });
@@ -159,6 +161,15 @@ describe("read-only running daemon verification", () => {
     await expect(verifyRunningDaemon(options())).resolves.toBeNull();
   });
 
+  it("sends no bearer when local listener admission refuses", async () => {
+    const fetch = vi.fn(globalThis.fetch);
+    await expect(verifyRunningDaemon(options({
+      _fetchOverride: fetch as never,
+      _admitDaemonPeerForTesting: () => null,
+    }))).resolves.toBeNull();
+    expect(fetch).not.toHaveBeenCalled();
+  });
+
   it("refuses a different reported entrypoint or runtime digest", async () => {
     behavior.authenticatedHealth = () => identity({ entrypoint: "/elsewhere/lcm.mjs", runtimeDigest: DIGEST });
     await expect(verifyRunningDaemon(options())).resolves.toBeNull();
@@ -198,7 +209,9 @@ describe("read-only running daemon verification", () => {
     await expect(verifyRunningDaemon(darwin({ budgetMs: 400 }))).resolves.toBeNull();
     expect(lsof).not.toHaveBeenCalled();
 
-    await expect(verifyRunningDaemon(darwin({ budgetMs: 5000 }))).resolves.toEqual({ port, token: TOKEN });
+    await expect(verifyRunningDaemon(darwin({ budgetMs: 5000,
+      _admitDaemonPeerForTesting: () => ({ pid: process.pid, birth: "fixture" }),
+    }))).resolves.toEqual({ port, token: TOKEN });
     expect(lsof).toHaveBeenCalledOnce();
   });
 });

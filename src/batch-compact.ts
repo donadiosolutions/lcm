@@ -6,7 +6,7 @@ import {
   type ProgressPhaseError,
   type ProgressState,
 } from "./cli/progress-state.js";
-import { DaemonClient } from "./daemon/client.js";
+import { verifiedLocalDaemonClient } from "./daemon/client.js";
 import { isAbortError, throwIfAborted } from "./daemon/cancellation.js";
 import { isDaemonTransportFailure } from "./daemon/http-url.js";
 import { configPath } from "./runtime-paths.js";
@@ -701,7 +701,7 @@ export async function batchCompact(opts: {
   const compactedProjectIndexes = new Map<string, number>();
   const activeSessions = new Map<number, ProgressCurrentSession>();
   const claimedAt = new Map<number, number>();
-  const client = new DaemonClient(`http://127.0.0.1:${opts.port}`, opts.tokenPath);
+  const client = verifiedLocalDaemonClient(opts.port, opts.tokenPath);
   type CompactResponse = {
     summary?: string;
     skipped?: boolean;

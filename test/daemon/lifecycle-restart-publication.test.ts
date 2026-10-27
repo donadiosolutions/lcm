@@ -1,8 +1,10 @@
 import {
   chmodSync,
+  existsSync,
   mkdtempSync,
   mkdirSync,
   renameSync,
+  readFileSync,
   rmSync,
   symlinkSync,
   unlinkSync,
@@ -215,6 +217,15 @@ function options(
     expectedRuntimeDigest: "b".repeat(64),
     _hermeticTestSeams: f.seams,
     _isManagedProcessOverride: () => true,
+    _admitDaemonPeerForTesting: (mode) => {
+      if (!existsSync(f.pidPath)) return mode.kind === "replacement-manager"
+        ? { pid: mode.managerPid, birth: `birth-${mode.managerPid}` } : null;
+      const raw = readFileSync(f.pidPath, "utf8");
+      if (!/^[1-9][0-9]*$/u.test(raw)) return null;
+      const pid = Number(raw);
+      if (mode.kind === "replacement-manager" && pid !== mode.managerPid) return null;
+      return { pid, birth: `birth-${pid}` };
+    },
     ...overrides,
   };
 }
@@ -376,14 +387,16 @@ describe("restart publication assertion convergence", () => {
       });
     }) as never;
     f.seams.isProcessAlive = vi.fn(() => true);
+    let replacementStarted = false;
     const probe = vi.fn(async (spec: SupervisorSpec): Promise<SupervisorObservation> => ({
       kind: "registered-running-valid",
       name: spec.name,
       scopeDigest: spec.scopeDigest,
       nonce: spec.nonce,
-      managerPid: 111,
+      managerPid: replacementStarted ? 222 : 111,
     }));
     const stopAndStart = vi.fn(async (spec: SupervisorSpec) => {
+      replacementStarted = true;
       writeFileSync(f.pidPath, "222", { mode: 0o600 });
       return {
         kind: spec.kind,
@@ -1870,7 +1883,7 @@ describe("restart publication assertion convergence", () => {
     expect(fetch).not.toHaveBeenCalled();
   });
 
-  it("captures canonical production state without relying on test ownership seams", async () => {
+  it("refuses forged canonical production health without OS peer proof", async () => {
     const root = mkdtempSync(join(tmpdir(), "lcm-950-production-capture-"));
     roots.push(root);
     const stateDir = join(root, ".lcm");
@@ -1908,7 +1921,8 @@ describe("restart publication assertion convergence", () => {
       process.argv[1] = originalEntrypoint;
     }
 
-    expect(fetch).toHaveBeenCalledTimes(3);
+    expect(fetch).toHaveBeenCalledOnce();
+    expect(fetch.mock.calls[0]?.[1]?.headers).toBeUndefined();
     expect(boundedReadCalls).not.toHaveLength(0);
     expect(boundedReadCalls.every(call => call.options.expectedUid === process.getuid?.())).toBe(true);
   });
@@ -1985,7 +1999,7 @@ describe("restart publication assertion convergence", () => {
     expect(boundedReadCalls[0]?.options.expectedUid).toBe(0);
   });
 
-  it("retains production capture compatibility when process.getuid is unavailable", async () => {
+  it("refuses authenticated production capture when process UID is unavailable", async () => {
     const root = mkdtempSync(join(tmpdir(), "lcm-950-no-getuid-"));
     roots.push(root);
     const stateDir = join(root, ".lcm");
@@ -2021,7 +2035,8 @@ describe("restart publication assertion convergence", () => {
       process.argv[1] = originalEntrypoint;
     }
 
-    expect(fetch).toHaveBeenCalledTimes(3);
+    expect(fetch).toHaveBeenCalledOnce();
+    expect(fetch.mock.calls[0]?.[1]?.headers).toBeUndefined();
     expect(boundedReadCalls).not.toHaveLength(0);
     expect(boundedReadCalls.every(call => call.options.expectedUid === undefined)).toBe(true);
   });
@@ -2553,14 +2568,16 @@ describe("restart publication assertion convergence", () => {
     });
     f.seams.fetch = fetch as never;
     f.seams.isProcessAlive = vi.fn(() => true);
+    let replacementStarted = false;
     const probe = vi.fn(async (spec: SupervisorSpec): Promise<SupervisorObservation> => ({
       kind: "registered-running-valid",
       name: spec.name,
       scopeDigest: spec.scopeDigest,
       nonce: spec.nonce,
-      managerPid: 111,
+      managerPid: replacementStarted ? 222 : 111,
     }));
     const stopAndStart = vi.fn(async (spec: SupervisorSpec) => {
+      replacementStarted = true;
       rmSync(f.pidPath, { force: true });
       if (pidState !== undefined) writeFileSync(f.pidPath, pidState, { mode: 0o600 });
       writeFileSync(f.tokenPath, "replacement-token", { mode: 0o600 });
@@ -2594,8 +2611,10 @@ describe("restart publication assertion convergence", () => {
       _supervisorOverride: supervisor,
       _ensureDaemonOverride: injectedEnsure,
       _listeningPortsOverride: () => [43_950],
-      _processStartTimeForTesting: vi.fn(),
-      _readPrivateMutationLockOwnerForTesting: vi.fn(),
+      _processStartTimeForTesting: pid => `birth-${pid}`,
+      _readPrivateMutationLockOwnerForTesting: () => ({
+        version: 1, pid: 111, processStartTime: "birth-111", nonce: "a".repeat(32),
+      }),
       _assertBackendPublication: () => {
         assertions += 1;
         if (assertions === 2) throw contention;
@@ -2856,7 +2875,7 @@ describe("restart publication assertion convergence", () => {
       name: spec.name,
       scopeDigest: spec.scopeDigest,
       nonce: spec.nonce,
-      managerPid: 111,
+      managerPid: phase === "current" ? 111 : 222,
     }));
     const stopAndStart = vi.fn(async (spec: SupervisorSpec) => {
       phase = "replacement";

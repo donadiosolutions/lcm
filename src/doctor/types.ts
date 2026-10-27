@@ -9,6 +9,8 @@ export interface CheckResult {
 }
 
 export interface DoctorDeps {
+  /** @internal Deterministic listener admission seam for doctor tests. */
+  _admitDaemonPeerForTesting?: (port: number, deadline: number) => import("../daemon/peer-admission.js").DaemonPeerAdmission | null;
   collectBackendSnapshot: (homeDir: string) => Promise<BackendDiagnosticSnapshot>;
   existsSync: (path: string) => boolean;
   readFileSync: (path: string, encoding: string) => string;

@@ -399,6 +399,8 @@ const expectedComponents = [
       // #1233 keeps publication-contention managed restart recovery lifecycle-owned.
       "^src/daemon/lifecycle-scope\\.ts$",
       "^src/daemon/lifecycle\\.ts$",
+      "^src/daemon/peer-admission\\.ts$",
+      "^src/daemon/peer-attribution\\.ts$",
       "^src/daemon/managed-credentials\\.ts$",
       // #1450 keeps stable managed PATH canonicalization and direct executable
       // admission in this existing service-manager owner.
@@ -790,7 +792,7 @@ describe("Codecov configuration", () => {
       expect(isSafeOwnershipPath(path)).toBe(true);
     }
 
-    expect(productionFiles).toHaveLength(331);
+    expect(productionFiles).toHaveLength(333);
 
     for (const component of validateComponents(components)) {
       expect(filesMatchedByComponent(component, productionFiles).length).toBeGreaterThan(0);
@@ -820,7 +822,7 @@ describe("Codecov configuration", () => {
 
     expect(unownedFiles).toEqual([]);
     expect(multiplyOwnedFiles).toEqual([]);
-    expect(ownershipCounts.size).toBe(331);
+    expect(ownershipCounts.size).toBe(333);
   });
 
   test("keeps every recorded ownership decision in its intended component", () => {

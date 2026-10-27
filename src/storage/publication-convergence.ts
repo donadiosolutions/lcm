@@ -2,6 +2,7 @@ import { join, resolve } from "node:path";
 import { daemonEntrypointMatches } from "../daemon/lifecycle-scope.js";
 import { isStagedPostgreSqlHealth } from "../daemon/staged-postgresql.js";
 import { PrivateMutationLockContentionError, processStartTime, readPrivateMutationLockOwner } from "../private-mutation-lock.js";
+import type { DaemonPeerAdmission } from "../daemon/peer-admission.js";
 
 export const PUBLICATION_CONVERGENCE_MS = 2_000;
 export const PUBLICATION_CONVERGENCE_POLL_MS = 50;
@@ -29,6 +30,8 @@ export type PublicationConvergenceDeps = Readonly<{
   sleep?: (delayMs: number) => Promise<void>;
   fetch?: typeof globalThis.fetch;
   readToken?: () => string | null;
+  /** Required for tokened capture and every retry; absence refuses before token read. */
+  admitPeer?: (port: number, deadline: number) => DaemonPeerAdmission | null | Promise<DaemonPeerAdmission | null>;
   readOwner?: typeof readPrivateMutationLockOwner;
   processBirth?: typeof processStartTime;
   platform?: NodeJS.Platform;
@@ -90,13 +93,17 @@ async function authenticatedHealth(
   const controller = new AbortController();
   let timer: ReturnType<typeof setTimeout> | undefined;
   try {
+    const now = deps.now ?? performance.now.bind(performance);
+    const deadline = now() + timeoutMs;
+    const admitted = await deps.admitPeer?.(port, deadline);
+    if (admitted === undefined || admitted === null || now() >= deadline) return null;
     const token = deps.readToken?.() ?? null;
     if (token === null || deps.fetch === undefined) return null;
     const timeout = new Promise<never>((_, reject) => {
       timer = setTimeout(() => {
         controller.abort();
         reject(new Error("Daemon health check timed out"));
-      }, timeoutMs);
+      }, Math.max(1, deadline - now()));
     });
     const response = await Promise.race([
       (async () => {
@@ -105,7 +112,7 @@ async function authenticatedHealth(
           signal: controller.signal,
         });
         const health = await result.json() as PublicationDaemonHealth | null;
-        if (health === null || typeof health !== "object") return null;
+        if (health === null || typeof health !== "object" || health.pid !== admitted.pid) return null;
         return (result.ok && health.status === "ok")
           || isStagedPostgreSqlHealth(result.status, health)
           ? health : null;

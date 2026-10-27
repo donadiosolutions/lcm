@@ -54,6 +54,7 @@ import {
   parseDaemonObservation,
   type DaemonObservation,
 } from "../daemon/client.js";
+import { admitDaemonPeer } from "../daemon/peer-admission.js";
 import {
   assertBackendPublicationConfigReadAccess,
   BackendPublicationJournalError,
@@ -201,11 +202,21 @@ async function readDoctorAuthenticatedObservation(
   deps: DoctorDeps,
   port: number,
 ): Promise<DaemonObservation | null> {
-  return readDaemonObservation(
+  const deadline = performance.now() + DAEMON_OBSERVATION_DEADLINE_MS;
+  const admitted = (deps._admitDaemonPeerForTesting ?? ((targetPort, targetDeadline) => admitDaemonPeer({
+    port: targetPort, deadline: targetDeadline, homeDir: deps.homedir,
+  })))(port, deadline);
+  if (admitted === null) return null;
+  const token = readDoctorDaemonToken(deps);
+  const remaining = Math.floor(deadline - performance.now());
+  if (remaining <= 0) return null;
+  const observation = await readDaemonObservation(
     deps.fetch,
     port,
-    readDoctorDaemonToken(deps),
+    token,
+    remaining,
   );
+  return observation?.pid === admitted.pid ? observation : null;
 }
 
 type ExpectedDaemonIdentity = Readonly<{

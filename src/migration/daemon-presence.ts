@@ -1,7 +1,6 @@
-import { readFileSync } from "node:fs";
-import { DaemonClient, type DaemonObservation } from "../daemon/client.js";
+import { lstatSync, readFileSync } from "node:fs";
+import { verifiedLocalDaemonClient, type DaemonObservation } from "../daemon/client.js";
 import { readDaemonConfigSnapshot } from "../daemon/config.js";
-import { readAuthToken } from "../daemon/auth.js";
 import { configPath, daemonPidPath, daemonTokenPath } from "../runtime-paths.js";
 
 /**
@@ -101,13 +100,22 @@ function defaultClassifyLiveness(pid: number): MigrationDaemonProcessLiveness {
 }
 
 async function defaultObserve(homeDir: string): Promise<DaemonObservation | null> {
+  const deadline = performance.now() + 2_000;
   const snapshot = readDaemonConfigSnapshot(configPath(homeDir));
   const tokenPath = daemonTokenPath(homeDir);
-  const token = readAuthToken(tokenPath);
-  if (token === null || token.length === 0) return null;
+  for (const path of [tokenPath, daemonPidPath(homeDir)]) {
+    try {
+      lstatSync(path);
+    } catch (error) {
+      if ((error as NodeJS.ErrnoException).code === "ENOENT") return null;
+      throw error;
+    }
+  }
   const port = snapshot.config.daemon.port;
-  const client = new DaemonClient(`http://127.0.0.1:${port}`, tokenPath);
-  return client.observe({ timeoutMs: 2000 });
+  const remainingMs = Math.floor(deadline - performance.now());
+  if (remainingMs <= 0) throw new Error("daemon presence observation budget expired");
+  const client = verifiedLocalDaemonClient(port, tokenPath, homeDir);
+  return client.observe({ timeoutMs: remainingMs });
 }
 
 export async function classifyMigrationDaemonPresence(input: Readonly<{

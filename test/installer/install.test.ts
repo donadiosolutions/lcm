@@ -2113,6 +2113,7 @@ describe("installer publication admission integration", () => {
     return {
       fetch,
       readToken: () => "token",
+      admitPeer: () => ({ pid: process.pid, birth: "fixture" }),
       _expectedVersionForTesting: expectedVersion,
       _expectedEntrypointForTesting: expectedEntrypoint,
       _expectedRuntimeDigestForTesting: expectedRuntimeDigest,
@@ -2368,19 +2369,23 @@ describe("installer publication admission integration", () => {
     }
   });
 
-  it("preserves healthy identity capture for a legacy non-private SQLite root", async () => {
+  it("refuses authenticated capture for a legacy non-private SQLite root", async () => {
     const home = mkdtempSync(join(tmpdir(), "lcm-installer-legacy-root-"));
     const root = join(home, ".lcm");
     const configPath = join(root, "config.json");
     fsMkdirSync(root, { mode: 0o755 });
     fsWriteFileSync(configPath, '{"daemon":{"port":4123}}', { mode: 0o600 });
     try {
+      const fetch = healthyFetch();
+      const readToken = vi.fn(() => "token");
       const result = await createInstallerPublicationConvergence(
         configPath,
-        healthyFactorySeams(healthyFetch()),
+        { ...healthyFactorySeams(fetch), admitPeer: () => null, readToken },
       );
-      expect(result.identity).toBeDefined();
+      expect(result.identity).toBeUndefined();
       expect(result.port).toBe(4123);
+      expect(readToken).not.toHaveBeenCalled();
+      expect(fetch).not.toHaveBeenCalled();
     } finally {
       fsRmSync(home, { recursive: true, force: true });
     }
@@ -2437,6 +2442,7 @@ describe("installer publication admission integration", () => {
     try {
       const canonical = await createInstallerPublicationConvergence(canonicalConfig, {
         fetch: health,
+        admitPeer: () => ({ pid: process.pid, birth: "fixture" }),
         _expectedVersionForTesting: expectedVersion,
         _expectedEntrypointForTesting: expectedEntrypoint,
         _expectedRuntimeDigestForTesting: expectedRuntimeDigest,
@@ -2710,6 +2716,7 @@ describe("installer publication admission integration", () => {
         now: () => now,
         sleep: async (ms) => { sleeps.push(ms); now += ms; },
         readToken: () => "token",
+        admitPeer: () => ({ pid: process.pid, birth: "fixture" }),
         readOwner: () => ({ version: 1, pid: process.pid, processStartTime: "birth", nonce: "a".repeat(32) }),
         processBirth: () => "birth",
         fetch: vi.fn(async () => ({

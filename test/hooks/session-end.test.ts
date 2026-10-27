@@ -11,6 +11,12 @@ import * as publicationFence from "../../src/hooks/publication-fence.js";
 import * as daemonNotice from "../../src/hooks/daemon-notice.js";
 import { PrivateMutationLockContentionError } from "../../src/private-mutation-lock.js";
 import { BackendPublicationJournalError, withBackendPublicationConsumerLock } from "../../src/storage/backend-publication.js";
+import * as daemonAuth from "../../src/daemon/auth.js";
+import { admitDaemonPeer } from "../../src/daemon/peer-admission.js";
+
+vi.mock("../../src/daemon/peer-admission.js", () => ({
+  admitDaemonPeer: vi.fn(() => ({ pid: 42, birth: "fixture" })),
+}));
 
 vi.mock("../../src/daemon/lifecycle.js", () => ({
   ensureDaemon: vi.fn().mockResolvedValue({ connected: true, port: 3737, spawned: false }),
@@ -69,6 +75,7 @@ describe("handleSessionEnd", () => {
 
   beforeEach(async () => {
     vi.clearAllMocks();
+    vi.mocked(admitDaemonPeer).mockReturnValue({ pid: 42, birth: "fixture" });
     mockHttpReq.on.mockReturnThis();
     const actualConfig = await vi.importActual<typeof import("../../src/daemon/config.js")>(
       "../../src/daemon/config.js",
@@ -235,6 +242,25 @@ describe("handleSessionEnd", () => {
     const errorHandler = mockHttpReq.on.mock.calls.find(([event]) => event === "error")?.[1] as ((error: Error) => void) | undefined;
     expect(errorHandler).toBeTypeOf("function");
     expect(() => errorHandler!(new Error("connection refused"))).not.toThrow();
+  });
+
+  it("opens no socket or sends no body when local peer admission refuses", async () => {
+    vi.mocked(admitDaemonPeer).mockReturnValueOnce(null);
+    fireCompactRequest(3737, { session_id: "secret", cwd: "/private" });
+    expect(request).not.toHaveBeenCalled();
+    expect(mockHttpReq.write).not.toHaveBeenCalled();
+  });
+
+  it("rechecks publication after peer attribution before token or socket", () => {
+    const tokenRead = vi.spyOn(daemonAuth, "readAuthToken");
+    const changed = new BackendPublicationJournalError("unsafe-storage", "publication changed");
+    vi.spyOn(publicationFence, "assertHookPublicationFenceToken")
+      .mockImplementationOnce(() => undefined)
+      .mockImplementationOnce(() => { throw changed; });
+    expect(() => fireCompactRequest(3737, { session_id: "secret" })).toThrow(changed);
+    expect(tokenRead).not.toHaveBeenCalled();
+    expect(request).not.toHaveBeenCalled();
+    expect(mockHttpReq.write).not.toHaveBeenCalled();
   });
 
   it("fires compact via http.request when totalTokens exceeds threshold", async () => {

@@ -142,7 +142,7 @@ export async function dispatchHook(
         : { verifiedPort: verifiedSnapshotPort, admissionRetry },
     );
   }
-  const { DaemonClient } = await import("../daemon/client.js");
+  const { verifiedLocalDaemonClient } = await import("../daemon/client.js");
   const { loadHookConfig } = await import("./config.js");
   const { join } = await import("node:path");
   const { homedir } = await import("node:os");
@@ -159,7 +159,7 @@ export async function dispatchHook(
     return { exitCode: 0, stdout: "" };
   }
   const port = config.daemonPort;
-  const client = new DaemonClient(`http://127.0.0.1:${port}`);
+  const client = verifiedLocalDaemonClient(port);
 
   switch (command) {
     case "compact": {

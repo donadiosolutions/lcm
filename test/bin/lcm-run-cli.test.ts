@@ -10,6 +10,7 @@ import { StorageBackendUnavailableError } from "../../src/storage/backend.js";
 import { BackendPublicationJournalError } from "../../src/storage/backend-publication.js";
 import { createPublicationConvergence } from "../../src/storage/publication-convergence.js";
 import { readBoundedRegularFile } from "../../src/security-files.js";
+import { admitDaemonPeer } from "../../src/daemon/peer-admission.js";
 
 const FIXED_PUBLICATION_ADMISSION_DIAGNOSTIC =
   "lcm: backend publication admission blocked; preserve the evidence, run 'lcm doctor', and resolve the authenticated publication before retrying.";
@@ -250,8 +251,8 @@ vi.mock("../../src/runtime-paths.js", async importOriginal => ({
   migrateLegacyHomeIfNeeded: state.migrateLegacyHome,
   projectsDir: () => `${state.runtimeHome}/projects`,
 }));
-vi.mock("../../src/daemon/client.js", () => ({
-  DaemonClient: class {
+vi.mock("../../src/daemon/client.js", () => {
+  class MockDaemonClient {
     post = state.post;
     get = state.get;
     health = state.health;
@@ -259,7 +260,14 @@ vi.mock("../../src/daemon/client.js", () => ({
     constructor() {
       state.daemonClientInstances++;
     }
-  },
+  }
+  return {
+    DaemonClient: MockDaemonClient,
+    verifiedLocalDaemonClient: vi.fn(() => new MockDaemonClient()),
+  };
+});
+vi.mock("../../src/daemon/peer-admission.js", () => ({
+  admitDaemonPeer: vi.fn(() => ({ pid: 42, birth: "fixture" })),
 }));
 vi.mock("../../src/daemon/config.js", async importOriginal => ({
   ...(await importOriginal<typeof import("../../src/daemon/config.js")>()),
@@ -424,6 +432,7 @@ function makeTestConvergence(
       now: () => now,
       sleep: async (delayMs: number) => { now += delayMs; },
       readToken: () => "token",
+        admitPeer: () => ({ pid: 42, birth: "fixture" }),
       readOwner,
       processBirth: () => "birth",
       lockPath: "/tmp/publication.lock",
@@ -573,6 +582,7 @@ describe("runCli registration and help dispatch", () => {
       identity: { pid: 42, version: "1.4.2", storageBackend: "sqlite", entrypoint: "/daemon", runtimeDigest: "runtime" },
       deps: {
         readToken: () => "token",
+        admitPeer: () => ({ pid: 42, birth: "fixture" }),
         readOwner: () => ({ version: 1, pid: 42, processStartTime: "birth", nonce: "a".repeat(32) }),
         processBirth: () => "birth",
         lockPath: "/tmp/publication.lock",
@@ -628,6 +638,7 @@ describe("runCli registration and help dispatch", () => {
       deps: {
         sleep: async () => undefined,
         readToken: () => "token",
+        admitPeer: () => ({ pid: 42, birth: "fixture" }),
         readOwner: () => ({ version: 1, pid: 42, processStartTime: "birth", nonce: "a".repeat(32) }),
         processBirth: () => "birth",
         lockPath: "/tmp/publication.lock",
@@ -660,6 +671,7 @@ describe("runCli registration and help dispatch", () => {
         now: () => now,
         sleep: async () => { sleeps += 1; now = sleeps === 1 ? 1_990 : 2_000; },
         readToken: () => "token",
+        admitPeer: () => ({ pid: 42, birth: "fixture" }),
         readOwner: () => ({ version: 1, pid: 42, processStartTime: "birth", nonce: "a".repeat(32) }),
         processBirth: () => "birth",
         lockPath: "/tmp/publication.lock",
@@ -1684,6 +1696,15 @@ describe("runCli daemon-backed and utility actions", () => {
     expect(migrate).toHaveBeenCalledOnce();
     expect(state.ensureDaemon).toHaveBeenCalledOnce();
     expect(state.health).not.toHaveBeenCalled();
+  });
+
+  it("refuses diagnostic read before token or HTTP when the listener is foreign", async () => {
+    vi.mocked(admitDaemonPeer).mockReturnValueOnce(null);
+    state.observe.mockResolvedValue({ status: "ok", pid: 42 });
+    await invoke(["status"]);
+    expect(state.readAuthToken).not.toHaveBeenCalled();
+    expect(state.observe).not.toHaveBeenCalled();
+    expect(state.post).not.toHaveBeenCalled();
   });
 
   it.each([

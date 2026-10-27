@@ -1,4 +1,4 @@
-import { DaemonClient } from "../daemon/client.js";
+import { DaemonClient, verifiedLocalDaemonClient } from "../daemon/client.js";
 import type { SearchLayerInput } from "../retrieval.js";
 
 export type SearchResult = {
@@ -31,5 +31,5 @@ export function createMemoryApi(client: DaemonClient): MemoryApi {
 }
 
 // Convenience singleton with default daemon address
-const defaultClient = new DaemonClient("http://127.0.0.1:3737");
+const defaultClient = verifiedLocalDaemonClient(3737);
 export const memory: MemoryApi = createMemoryApi(defaultClient);
