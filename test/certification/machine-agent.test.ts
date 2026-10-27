@@ -271,6 +271,65 @@ it("redacts secret environment values and URL credentials and bounds diagnostic 
     expect(redactDiagnosticText("plain detail stays", environment, 4096, secrets)).toBe("plain detail stays");
   });
 
+it("masks short derived credentials at any length while keeping the whole-value floor", () => {
+    const directory = mkdtempSync(join(tmpdir(), "lcm-cert-redact-short-"));
+    const daemonTokenPath = join(directory, "daemon.token");
+    writeFileSync(daemonTokenPath, "tok4567\n");
+    const environment = {
+      LCM_POSTGRES_URL: "postgresql://runtime:abc123@db.internal:5432/lcm?token=q%2F1",
+      LCM_TINY_SECRET: "tiny",
+      LCM_HOME_DIR_KEY: "short",
+    };
+    const secrets = collectDiagnosticSecrets(environment, { daemonTokenPath });
+    expect(secrets.get("abc123")).toBe("LCM_POSTGRES_URL.password");
+    expect(secrets.get("q%2F1")).toBe("LCM_POSTGRES_URL.token");
+    expect(secrets.get("q/1")).toBe("LCM_POSTGRES_URL.token");
+    expect(secrets.get("tok4567")).toBe("daemon.token");
+    expect(secrets.has("tiny")).toBe(false);
+    expect(secrets.has("short")).toBe(false);
+    expect(secrets.has("")).toBe(false);
+    const redacted = redactDiagnosticText("pw abc123; query q%2F1 decoded q/1; bearer tok4567; words tiny short stay", environment, 4096, secrets);
+    for (const secret of ["abc123", "q%2F1", "q/1", "tok4567"]) expect(redacted).not.toContain(secret);
+    expect(redacted).toContain("[redacted:LCM_POSTGRES_URL.password]");
+    expect(redacted).toContain("[redacted:daemon.token]");
+    expect(redacted).toContain("words tiny short stay");
+  });
+
+  it("distinguishes the two fatal-abort paths: waiting attempts are cancelled without a record, queued attempts fail with one record", async () => {
+    const evidenceDirectory = mkdtempSync(join(tmpdir(), "lcm-cert-abort-paths-"));
+    const post = vi.fn(async () => { throw Object.assign(new Error("request deadline"), { code: "OperationDeadlineExceeded" }); });
+    // Zero-offset attempts enter admission in one tick (four active, four queued);
+    // the "waiting" attempt sits in an abortable delay until the fatal abort fires.
+    const delay = (milliseconds: number, { signal }: { signal?: AbortSignal } = {}) => new Promise<void>((resolve) => {
+      if (milliseconds === 0) { resolve(); return; }
+      const timer = setTimeout(resolve, milliseconds);
+      const onAbort = () => { clearTimeout(timer); resolve(); };
+      signal?.addEventListener("abort", onAbort, { once: true });
+      if (signal?.aborted) onAbort();
+    });
+    const samples = await executeDeterministicSchedule({
+      schedule: [
+        ...Array.from({ length: 8 }, (_, index) => ({ id: `queued-${index}`, machine: "a", op: "search", offsetSeconds: 0, phase: "steady" })),
+        { id: "waiting", machine: "b", op: "search", offsetSeconds: 6000, phase: "steady" },
+      ],
+      entrypoint: "/unused/lcm.mjs", cwd: evidenceDirectory, environment: {}, evidenceDirectory,
+      daemonClient: { post }, scheduleStartWallMs: Date.now(), delay,
+    });
+    const waiting = samples.find((sample) => sample.id === "waiting");
+    expect(waiting).toMatchObject({ outcome: "cancelled", errorClass: "AdmissionAborted" });
+    const queuedAborted = samples.filter((sample) => sample.id.startsWith("queued-") && sample.errorClass === "AdmissionAborted");
+    expect(queuedAborted.length).toBeGreaterThan(0);
+    expect(queuedAborted.every((sample) => sample.outcome === "failed")).toBe(true);
+    const failures = readFileSync(join(evidenceDirectory, "failures.ndjson"), "utf8").trim().split("\n").map((line) => JSON.parse(line));
+    expect(failures.some((record) => record.id === "waiting")).toBe(false);
+    for (const sample of queuedAborted) {
+      const rows = failures.filter((record) => record.id === sample.id);
+      expect(rows).toHaveLength(1);
+      expect(rows[0]).toMatchObject({ errorClass: "AdmissionAborted", message: "certification schedule aborted", exitCode: null, exitSignal: null, processStartWallMs: null, processExitWallMs: null });
+    }
+    expect(failures.map((record) => record.id).sort()).toEqual(samples.filter((sample) => sample.outcome === "failed").map((sample) => sample.id).sort());
+  });
+
   it("records private diagnostics for a deadline elapsed before admission without fabricating timing", async () => {
     const evidenceDirectory = mkdtempSync(join(tmpdir(), "lcm-cert-preadmission-record-"));
     const samples = await executeDeterministicSchedule({

@@ -228,19 +228,22 @@ export function classifyTlsRejection(error) {
 
 const DIAGNOSTIC_TEXT_LIMIT = 4096;
 const SECRET_ENVIRONMENT_NAME = /(PASSWORD|TOKEN|SECRET|KEY|_URL)$/iu;
-const SECRET_MINIMUM_LENGTH = 8;
+// Whole environment values shorter than this are not masked (they are too likely to
+// be ordinary words). Derived components (URL passwords, credential query values,
+// the daemon token) are secrets by construction and are masked at any nonempty length.
+const WHOLE_VALUE_MINIMUM_LENGTH = 8;
 const SECRET_QUERY_PARAMETER = /((?:password|passwd|pwd|token|secret|api[_-]?key|access[_-]?key)=)[^&\s'"]+/giu;
 
-function addSecretForms(secrets, label, value) {
-  if (typeof value !== "string" || value.length < SECRET_MINIMUM_LENGTH) return;
+function addSecretForms(secrets, label, value, minimumLength = 1) {
+  if (typeof value !== "string" || value.length < minimumLength || value.length === 0) return;
   secrets.set(value, label);
   try {
     const decoded = decodeURIComponent(value);
-    if (decoded.length >= SECRET_MINIMUM_LENGTH) secrets.set(decoded, label);
+    if (decoded.length > 0) secrets.set(decoded, label);
   } catch { /* not URL-encoded */ }
   try {
     const encoded = encodeURIComponent(value);
-    if (encoded.length >= SECRET_MINIMUM_LENGTH) secrets.set(encoded, label);
+    if (encoded.length > 0) secrets.set(encoded, label);
   } catch { /* unencodable */ }
 }
 
@@ -252,7 +255,7 @@ export function collectDiagnosticSecrets(environment = {}, { daemonTokenPath, re
   const secrets = new Map();
   for (const [name, value] of Object.entries(environment)) {
     if (typeof value !== "string" || !SECRET_ENVIRONMENT_NAME.test(name)) continue;
-    addSecretForms(secrets, name, value);
+    addSecretForms(secrets, name, value, WHOLE_VALUE_MINIMUM_LENGTH);
     if (/^[a-z][a-z0-9+.-]*:\/\//iu.test(value)) {
       try {
         const url = new URL(value);

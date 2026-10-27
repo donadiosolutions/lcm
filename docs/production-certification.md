@@ -194,13 +194,17 @@ private `failures.ndjson`: exit code or signal, error message, stdout and stderr
 summaries, and process timing. Redaction masks whole secret-bearing environment
 values, the bare and URL-decoded password of any credential URL, credential query
 parameters, and the file-backed daemon token, longest value first, then truncates
-the text. Admission overflow, a deadline that elapsed before admission, and an
-operation that returned only after its absolute deadline also get one record each,
-without fabricated exit scalars or process timing. Attempts cancelled before they
-started (`AdmissionAborted` after a fatal abort) are recorded only in
-`samples.ndjson`; they never ran, so there is nothing to diagnose. Only the error
-class, exit code, and signal reach `samples.ndjson`; the gate never reads
-`failures.ndjson`.
+the text. Whole environment values shorter than eight characters are left alone;
+derived components are masked at any length. Admission overflow, a deadline that
+elapsed before admission, and an operation that returned only after its absolute
+deadline also get one record each, without fabricated exit scalars or process
+timing. A fatal schedule abort reaches waiting attempts in two ways: an attempt
+still waiting for its scheduled offset returns a `cancelled` sample with
+`AdmissionAborted` and no failure record, because it never entered admission; an
+attempt already queued inside admission observes the abort as a `failed` sample with
+`AdmissionAborted` plus one private record whose exit scalars and process timing
+are null. Only the error class, exit code, and signal reach `samples.ndjson`; the
+gate never reads `failures.ndjson`.
 
 The acknowledgment metric is a conservative upper bound from successful public
 hook-command exit to the first one-second observer sighting of a terminal local
