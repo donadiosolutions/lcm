@@ -1,6 +1,12 @@
+import { existsSync } from "node:fs";
 import { admittedProjectIdentity } from "./storage-lifecycle.js";
 import type { EventRow, PatternReinforcementStats } from "../../hooks/events-db.js";
-import { eventsDbPath, existingEventsDbPath } from "../../db/events-path.js";
+import {
+  assertExistingSidecarProjectBinding,
+  eventsDbPath,
+  existingEventsDbPath,
+  SidecarIdentityConflictError,
+} from "../../db/events-path.js";
 import { deduplicateAndInsert, deduplicateAndInsertInRepositories } from "../../promotion/dedup.js";
 import { sendJson, type RouteExecutionContext, type RouteHandler } from "../server.js";
 import { isMissingCwdError, validateCwd } from "../validate-cwd.js";
@@ -22,6 +28,8 @@ import {
 import {
   BackendPublicationJournalError,
   type BackendPublicationLockToken,
+  withBackendPublicationConsumerLock,
+  withBackendPublicationConsumerLockAsync,
 } from "../../storage/backend-publication.js";
 import {
   closeRouteStorage,
@@ -197,18 +205,21 @@ async function withLockedCwdPromotion<T>(
   publicationLockToken?: BackendPublicationLockToken,
   context?: PromotionExecutionContext,
 ): Promise<T> {
-  const existingPath = (resolvedCwd: string) => {
-    const discover = (token = publicationLockToken) => existingEventsDbPathForPromotion(resolvedCwd, token);
-    return context?.withPublicationAdmission === undefined
-      ? discover()
-      : context.withPublicationAdmission(discover, context.signal);
-  };
+  const executionContext = promotionExecutionContext(publicationLockToken, context);
+  const existingPath = (resolvedCwd: string) => context?.withPublicationAdmission === undefined
+    ? existingEventsDbPathForPromotion(resolvedCwd, publicationLockToken)
+    : context.withPublicationAdmission(token => existingEventsDbPathForPromotion(resolvedCwd, token), context.signal);
   let sidecarPath = sidecarPathOverride;
   if (sidecarPath === undefined) {
     try {
       const resolvedCwd = validateCwd(cwd);
-      sidecarPath = await existingPath(resolvedCwd)
-        ?? eventsDbPath(resolvedCwd);
+      const select = (token?: BackendPublicationLockToken) =>
+        existingEventsDbPathForPromotion(resolvedCwd, token) ?? eventsDbPath(resolvedCwd);
+      sidecarPath = context?.withPublicationAdmission !== undefined
+        ? await context.withPublicationAdmission(select, context.signal)
+        : publicationLockToken !== undefined
+          ? select(publicationLockToken)
+          : withBackendPublicationConsumerLock(undefined, token => select(token));
     } catch (error) {
       if (!isMissingCwdError(error)) throw error;
       // Preserve the same absolute lexical normalization used for an existing
@@ -226,9 +237,21 @@ async function withLockedCwdPromotion<T>(
       // cwd to recover. This is the decisive check for both state mutation and
       // terminal parking.
       const resolvedCwd = validateCwd(cwd);
+      await withPromotionLocalAdmission(executionContext, token => {
+        assertExistingSidecarProjectBinding(resolvedCwd, sidecarPath, undefined, token);
+        return Promise.resolve();
+      });
       return await onReady(resolvedCwd, sidecarPath);
     } catch (error) {
       if (!isMissingCwdError(error)) throw error;
+      const resolvedCwd = validateCwd(cwd, { allowMissing: true });
+      await withPromotionLocalAdmission(executionContext, token => {
+        if (existingEventsDbPathForPromotion(resolvedCwd, token) !== sidecarPath
+            && existsSync(sidecarPath)) {
+          throw new SidecarIdentityConflictError();
+        }
+        return Promise.resolve();
+      });
       return onUnavailable(await parkUnavailableCwdEventsUnlocked(sidecarPath, publicationLockToken));
     }
   });
@@ -238,8 +261,13 @@ function promotionExecutionContext(
   publicationLockToken: BackendPublicationLockToken | undefined,
   context: PromotionExecutionContext | undefined,
 ): PromotionExecutionContext | undefined {
-  if (context !== undefined) return context;
-  return publicationLockToken === undefined ? undefined : { publicationLockToken };
+  if (context?.withPublicationAdmission !== undefined
+      || context?.publicationLockToken !== undefined) return context;
+  if (publicationLockToken !== undefined) return { publicationLockToken };
+  return {
+    ...context,
+    withPublicationAdmission: operation => withBackendPublicationConsumerLockAsync(undefined, operation),
+  };
 }
 
 function createPromotionStorageFactory(config: DaemonConfig, context?: PromotionExecutionContext) {
@@ -266,6 +294,7 @@ function existingEventsDbPathForPromotion(
 export async function parkUnavailableCwdEvents(
   cwd: string,
   sidecarPathOverride?: string,
+  options: { _beforeRecoveredAdmissionForTesting?: () => void } = {},
 ): Promise<PromoteResult> {
   // The cwd is revalidated under the lock, while an explicit sidecar path
   // remains the exact durable record to clear or observe. This permits a
@@ -274,25 +303,37 @@ export async function parkUnavailableCwdEvents(
   return withLockedCwdPromotion(
     cwd,
     sidecarPathOverride,
-    (_resolvedCwd, sidecarPath) => clearRecoveredMissingCwdState(sidecarPath),
+    (resolvedCwd, sidecarPath) => {
+      options._beforeRecoveredAdmissionForTesting?.();
+      return clearRecoveredMissingCwdState(resolvedCwd, sidecarPath);
+    },
     (result) => result,
   );
 }
 
 async function clearRecoveredMissingCwdState(
+  cwd: string,
   sidecarPath: string,
 ): Promise<PromoteResult> {
   const outboxFactory = new SQLiteLocalHookOutboxFactory();
   try {
-    const edb = await outboxFactory.openExisting(sidecarPath);
-    await edb?.clearMissingCwd();
-    return {
-      promoted: 0,
-      skipped: 0,
-      correlated: 0,
-      errors: 0,
-      message: "cwd recovered; cleared durable parking state",
-    };
+    return await withBackendPublicationConsumerLockAsync(undefined, async token => {
+      try {
+        validateCwd(cwd);
+        assertExistingSidecarProjectBinding(cwd, sidecarPath, undefined, token);
+        const edb = await outboxFactory.openExisting(sidecarPath, {}, token);
+        await edb?.clearMissingCwd(token);
+        return {
+          promoted: 0,
+          skipped: 0,
+          correlated: 0,
+          errors: 0,
+          message: "cwd recovered; cleared durable parking state",
+        };
+      } finally {
+        await outboxFactory.close(token);
+      }
+    });
   } finally {
     await closeRouteStorage(outboxFactory);
   }
@@ -394,6 +435,13 @@ export function createPromoteEventsHandler(
           );
       sendJson(res, 200, result);
     } catch (error) {
+      if (error instanceof SidecarIdentityConflictError) {
+        sendJson(res, 409, {
+          status: "blocked",
+          error: "sidecar identity does not match the current project",
+        });
+        return;
+      }
       if (error instanceof BackendPublicationJournalError) {
         sendJson(res, 503, {
           status: "blocked",
@@ -448,6 +496,7 @@ export function createPromoteAllEventsHandler(
       };
 
       const sidecars = await collectEventSidecars({ timeoutMs: 30_000, maxDbs: Number.MAX_SAFE_INTEGER,
+        pruneOrphanSidecars: false,
         publicationLockToken: context?.publicationLockToken });
       result.scanned = sidecars.length;
       result.sidecarsWithUnprocessed = sidecars.filter(sidecar => sidecar.unprocessed > 0).length;
@@ -545,7 +594,9 @@ export function createPromoteAllEventsHandler(
             correlated: 0,
             errors: 1,
             batches: 0,
-            message: "failed to promote events",
+            message: error instanceof SidecarIdentityConflictError
+              ? "sidecar identity does not match the current project"
+              : "failed to promote events",
           });
         }
       }
@@ -632,30 +683,25 @@ async function drainEventsForCwdUnlocked(
 
   const outboxFactory = new SQLiteLocalHookOutboxFactory();
   let ownedFactory: StorageBackendFactory | undefined;
+  let edb: LocalHookOutboxRepository | undefined;
   const executionContext = promotionExecutionContext(publicationLockToken, context);
   const effectiveToken = executionContext?.publicationLockToken;
   try {
-    const edb = await withPromotionLocalAdmission(executionContext, async token => {
-      const outbox = await outboxFactory.open(sidecarPath, {}, token);
-      await outbox.clearMissingCwd(token);
-      return outbox;
-    });
     const factory = storageFactory ?? (ownedFactory = await createPromotionStorageFactory(config, executionContext));
     for (let batch = 0; batch < MAX_GLOBAL_PROMOTION_BATCHES; batch++) {
-      const prepared = await withPromotionLocalAdmission(executionContext,
-        token => preparePromotionBatch(config, edb, token));
-      const expectedIdentity = prepared.events.length === 0
-        ? undefined
-        : await admittedProjectIdentity(cwd, config.storage, executionContext);
-      const batchResult = await runSelectedPromotionBatch(
+      const expectedIdentity = await admittedProjectIdentity(cwd, config.storage, executionContext);
+      const batch = await runSelectedPromotionBatch(
         config,
         cwd,
+        sidecarPath,
+        outboxFactory,
         edb,
         factory,
         executionContext,
-        prepared,
         expectedIdentity,
       );
+      edb = batch.edb;
+      const batchResult = batch.result;
       if (batchResult.message === "no unprocessed events") {
         result.message = result.batches === 0
           ? "no unprocessed events"
@@ -724,24 +770,19 @@ async function promoteEventsForCwdUnlocked(
   const executionContext = promotionExecutionContext(publicationLockToken, context);
   const effectiveToken = executionContext?.publicationLockToken;
   try {
-    const { edb, prepared } = await withPromotionLocalAdmission(executionContext, async token => {
-      const edb = await outboxFactory.open(sidecarPath, {}, token);
-      await edb.clearMissingCwd(token);
-      return { edb, prepared: await preparePromotionBatch(config, edb, token) };
-    });
     const factory = storageFactory ?? (ownedFactory = await createPromotionStorageFactory(config, executionContext));
-    const expectedIdentity = prepared.events.length === 0
-      ? undefined
-      : await admittedProjectIdentity(cwd, config.storage, executionContext);
-    return await runSelectedPromotionBatch(
+    const expectedIdentity = await admittedProjectIdentity(cwd, config.storage, executionContext);
+    const batch = await runSelectedPromotionBatch(
       config,
       cwd,
-      edb,
+      sidecarPath,
+      outboxFactory,
+      undefined,
       factory,
       executionContext,
-      prepared,
       expectedIdentity,
     );
+    return batch.result;
   } finally {
     await closePromotionStorage(effectiveToken, outboxFactory, ownedFactory);
   }
@@ -752,9 +793,12 @@ async function withPromotionLocalAdmission<T>(
   context: PromotionExecutionContext | undefined,
   operation: (token?: BackendPublicationLockToken) => Promise<T>,
 ): Promise<T> {
-  return context?.withPublicationAdmission === undefined
-    ? operation(context?.publicationLockToken)
-    : context.withPublicationAdmission(operation, context.signal);
+  if (context?.withPublicationAdmission !== undefined) {
+    return context.withPublicationAdmission(operation, context.signal);
+  }
+  return context?.publicationLockToken === undefined
+    ? withBackendPublicationConsumerLockAsync(undefined, operation)
+    : operation(context.publicationLockToken);
 }
 
 /** Keep retained compatibility admission on resources owned by this route. */
@@ -827,22 +871,31 @@ function cancelledPromotionResult(): PromoteResult {
 async function runSelectedPromotionBatch(
   config: DaemonConfig,
   cwd: string,
-  edb: LocalHookOutboxRepository,
+  sidecarPath: string,
+  outboxFactory: SQLiteLocalHookOutboxFactory,
+  existingEdb: LocalHookOutboxRepository | undefined,
   factory: StorageBackendFactory,
   context: PromotionExecutionContext | undefined,
-  prepared: PreparedPromotionBatch,
-  expectedIdentity?: StorageIdentityContext & { readonly localProjectId: string },
-): Promise<PromoteResult> {
+  expectedIdentity: StorageIdentityContext & { readonly localProjectId: string },
+): Promise<{ result: PromoteResult; edb: LocalHookOutboxRepository | undefined }> {
+  let edb = existingEdb;
+  const prepared = await withPromotionLocalAdmission(context, async token => {
+    assertExistingSidecarProjectBinding(cwd, sidecarPath, undefined, token);
+    if (edb === undefined) {
+      edb = await outboxFactory.open(sidecarPath, {}, token);
+    }
+    return preparePromotionBatch(config, edb, token);
+  });
   const activeScrubber = prepared.events.length === 0
     ? undefined
     : await ScrubEngine.forProject(
       config.security.sensitivePatterns,
       projectPathsForIdentity({
-        id: expectedIdentity!.localProjectId,
-        canonical: expectedIdentity!.canonical,
-        ...(expectedIdentity!.remoteProjectId === undefined
+        id: expectedIdentity.localProjectId,
+        canonical: expectedIdentity.canonical,
+        ...(expectedIdentity.remoteProjectId === undefined
           ? {}
-          : { remoteProjectId: expectedIdentity!.remoteProjectId }),
+          : { remoteProjectId: expectedIdentity.remoteProjectId }),
       }).dir,
     );
   const storageRequest = {
@@ -851,7 +904,17 @@ async function runSelectedPromotionBatch(
     factory,
     context,
     mode: "create" as const,
-    ...(expectedIdentity === undefined ? {} : { expectedIdentity }),
+    expectedIdentity,
+    beforeOpen: async (
+      identity: StorageIdentityContext & { readonly localProjectId: string },
+      token?: BackendPublicationLockToken,
+    ) => {
+      assertExistingSidecarProjectBinding(cwd, sidecarPath, {
+        id: identity.localProjectId,
+        canonical: identity.canonical,
+      }, token);
+      if (existingEdb === undefined) await edb!.clearMissingCwd(token);
+    },
   };
   let result: PromoteResult | null;
   try {
@@ -870,7 +933,7 @@ async function runSelectedPromotionBatch(
         return promoteEventsBatch(
           config,
           cwd,
-          edb,
+          edb!,
           project,
           activeScrubber!,
           new Map(),
@@ -883,11 +946,11 @@ async function runSelectedPromotionBatch(
     );
   } catch (error) {
     if (error instanceof Error && error.name === "AbortError") {
-      return cancelledPromotionResult();
+      return { result: cancelledPromotionResult(), edb };
     }
     throw error;
   }
-  return result ?? cancelledPromotionResult();
+  return { result: result ?? cancelledPromotionResult(), edb };
 }
 
 async function promoteEventsBatch(
@@ -999,31 +1062,28 @@ async function promoteEventsBatch(
             confidence,
             newEntryConfidence,
             thresholds: {
-              dedupBm25Threshold: thresholds.dedupBm25Threshold ?? 15,
               dedupCandidateLimit: thresholds.dedupCandidateLimit ?? 100,
             },
           };
           if (!receiptEra) {
             if (event.priority === 3 && !reinforced) {
-              const candidateSourceProjectId = project.backend === "postgresql"
-                ? undefined
-                : project.projectId;
-              const existing = NON_PROMOTABLE_EVENT_TYPES.has(event.type) ? [] : await project.lexicalSearch.searchPromoted(
-                scrubbedData,
-                1,
-                undefined,
-                candidateSourceProjectId,
-              );
-              if (existing.length === 0) {
+              // A one-off event may only re-confirm an identical entry that
+              // dedup itself would merge into; it never creates a memory.
+              const existingId = NON_PROMOTABLE_EVENT_TYPES.has(event.type)
+                ? null
+                : await project.transaction((repositories) =>
+                  deduplicateAndInsertInRepositories(repositories, { ...dedupInput, existingOnly: true }));
+              if (existingId === null) {
                 processedIds.push(event.event_id);
                 result.skipped++;
                 continue;
               }
+            } else {
+              await deduplicateAndInsert({
+                transaction: (callback) => project.transaction(callback),
+                ...dedupInput,
+              });
             }
-            await deduplicateAndInsert({
-              transaction: (callback) => project.transaction(callback),
-              ...dedupInput,
-            });
           } else {
             const promotion = await project.transaction(async (repositories) => {
             const committedAt = (): string => `${new Date().toISOString().slice(0, -1)}000Z`;
@@ -1048,31 +1108,23 @@ async function promoteEventsBatch(
             if (priorReceipt !== null) {
               return { promoted: priorReceipt.outcome === "applied" };
             }
-            if (event.priority === 3 && !reinforced) {
-              const existing = NON_PROMOTABLE_EVENT_TYPES.has(event.type) ? [] : await repositories.lexicalSearch.searchPromoted(
-                scrubbedData,
-                1,
-                undefined,
-                project.projectId,
-              );
-              if (existing.length === 0) {
-                await repositories.migrationReceipt!.record({
-                  epochId: epoch.epochId,
-                  envelope,
-                  effectWitness: {
-                    version: 1,
-                    outcome: "no-effect",
-                    reason: "unreinforced-pattern",
-                  },
-                  committedAt: committedAt(),
-                });
-                return { promoted: false as const };
-              }
+            const oneOff = event.priority === 3 && !reinforced;
+            const promotedMemoryId = oneOff && NON_PROMOTABLE_EVENT_TYPES.has(event.type)
+              ? null
+              : await deduplicateAndInsertInRepositories(repositories, { ...dedupInput, existingOnly: oneOff });
+            if (promotedMemoryId === null) {
+              await repositories.migrationReceipt!.record({
+                epochId: epoch.epochId,
+                envelope,
+                effectWitness: {
+                  version: 1,
+                  outcome: "no-effect",
+                  reason: "unreinforced-pattern",
+                },
+                committedAt: committedAt(),
+              });
+              return { promoted: false as const };
             }
-            const promotedMemoryId = await deduplicateAndInsertInRepositories(
-              repositories,
-              dedupInput,
-            );
             await repositories.migrationReceipt!.record({
               epochId: epoch.epochId,
               envelope,

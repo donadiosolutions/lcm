@@ -150,7 +150,6 @@ export interface ImportResult {
 }
 
 const DEFAULT_DEDUP_THRESHOLDS = {
-  dedupBm25Threshold: 15,
   dedupCandidateLimit: 100,
 };
 

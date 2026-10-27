@@ -116,7 +116,7 @@ describe("daemon storage identity routing", () => {
     };
     const config = {
       storage: POSTGRESQL_STORAGE,
-      compaction: { promotionThresholds: { dedupBm25Threshold: 15, dedupCandidateLimit: 100 } },
+      compaction: { promotionThresholds: { dedupCandidateLimit: 100 } },
       security: { sensitivePatterns: [], notify_on_filter: false },
     } as unknown as DaemonConfig;
 

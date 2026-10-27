@@ -1220,8 +1220,10 @@ The daemon listens on `127.0.0.1` only. lcm clients and hooks only build daemon
 requests to loopback HTTP origins and known daemon routes, so a malformed config
 or caller cannot redirect daemon traffic to another host. A managed daemon's
 unauthenticated `GET /health` response is a constant-cost, storage-free liveness
-probe containing only status, package version, selected backend, uptime, and
-PID. It does not inspect project databases or expose installation paths.
+probe containing only status, package version, `storageBackend` (the daemon's
+startup backend), uptime, and PID. That backend can differ from the current
+on-disk selection. It does not inspect project databases or expose installation
+paths.
 Supplying a valid daemon bearer token returns the full storage-backed health
 diagnostic; supplying an invalid credential returns `401`. Embedded and test
 callers that intentionally create a daemon without a token retain the full
@@ -1239,11 +1241,16 @@ SQLite also answers when it lacks the PostgreSQL URL, CA file, or migration role
 of the newly selected backend, since it never needed them; any of those values
 that is present is still validated. Its HTTP 200
 JSON has `status: "ok"`, `observation: "identity-only"`, and
-`storage: { "status": "unverified" }`, with version, selected backend, uptime,
-PID, entrypoint, daemon generation, and the actual runtime digest when available.
+`storage: { "status": "unverified" }`, with version, the daemon's startup backend
+in `storageBackend`, uptime, PID, entrypoint, daemon generation, and the actual
+runtime digest when available.
 An owner identifier is included when configured. No storage readiness or backend
 error result is included: observation never calls storage health or opens project
-storage. This endpoint is an internal diagnostic mechanism with no third-party
+storage. If background passive-event work halted, the response also includes
+process-local `passiveEvents` details, including its reason and message; a healthy
+daemon omits that field. A managed daemon's anonymous `/health` never includes
+those details.
+This endpoint is an internal diagnostic mechanism with no third-party
 compatibility promise.
 
 Doctor requires this explicit response and exact installed runtime identity;
@@ -1350,6 +1357,14 @@ independently before merging them: the current key wins when both names occur
 in the same source, while runtime overrides continue to take precedence over
 stored configuration. `lcm config get` and `lcm config set` accept the legacy
 path and report its canonical `dedupCandidateLimit` spelling.
+
+`compaction.promotionThresholds.dedupBm25Threshold` is deprecated and ignored,
+because promotion deduplication merges only exactly identical text. It is not
+renamed: `lcm config get` and `lcm config set` reject the path, and a
+`config.json` that still contains the key keeps loading with the value
+dropped. `lcm doctor` warns when the stored value is not `15`, the default
+written by older LCM versions. Removing the key is safe. Loading a
+configuration does not rewrite `config.json`, so delete the key by hand.
 
 When `lcm doctor` finds a malformed `mcpServers.lcm` value, it reports the
 finding and recommends explicit repair with `lcm install`. It never writes

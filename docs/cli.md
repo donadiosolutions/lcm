@@ -623,10 +623,15 @@ answers when the daemon's startup backend differs from the backend now selected
 on disk, so a daemon left running across a migration cutover remains
 identifiable, including when its own environment lacks the PostgreSQL URL, CA
 file, or migration role of the newly selected backend (values that are present
-are still validated); every other admission check applies as before. Diagnostics
-require the exact installed version, backend, entrypoint, runtime digest, and
-unchanged configuration witness. An old daemon without this endpoint, malformed
-response, missing credentials, or mismatched identity refuses observation;
+are still validated); every other admission check applies as before. Its raw
+HTTP response can also include process-local `passiveEvents` halt details when
+background work has stopped. A healthy daemon omits the field. A managed
+daemon's anonymous `/health` does not expose these details, and
+observation's unverified storage status does not establish readiness.
+Diagnostics require the exact installed version, backend, entrypoint, runtime
+digest, and unchanged configuration witness. An old daemon without this
+endpoint, malformed response, missing credentials, or mismatched identity
+refuses observation;
 there is no retry through active `/health` or automatic lifecycle repair.
 Status and pool statistics retain their local diagnostic fallback. Status JSON
 identifies its source with `diagnosticSource: "daemon"` or `"local"`.

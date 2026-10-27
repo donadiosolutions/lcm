@@ -528,6 +528,26 @@ describe("setConfigValue", () => {
     expect(getConfigValue({ configPath, path: legacyPath })).toBe(17);
   });
 
+  it("rejects the deprecated dedup threshold path before reading or writing the file", () => {
+    const path = "compaction.promotionThresholds.dedupBm25Threshold";
+    const { configPath } = makeConfig({ compaction: { promotionThresholds: { dedupBm25Threshold: 15 } } });
+    const before = readFileSync(configPath, "utf-8");
+
+    expect(() => parseConfigPath(path)).toThrow(ConfigManagerError);
+    expect(() => normalizeConfigPath(path)).toThrow("deprecated and ignored");
+    expect(() => getConfigValue({ configPath, path })).toThrow("deprecated and ignored");
+    expect(() => getConfigValue({ configPath, path, effective: true })).toThrow("deprecated and ignored");
+    expect(() => setConfigValue({
+      configPath,
+      path,
+      value: "20",
+      json: true,
+      env: { LCM_SUMMARY_PROVIDER: "disabled" },
+    })).toThrow(ConfigManagerError);
+    expect(readFileSync(configPath, "utf-8")).toBe(before);
+    expect(parseConfigPath("compaction.promotionThresholds.dedupCandidateLimit")).toHaveLength(3);
+  });
+
   it("masks the returned value for secret paths", () => {
     const { configPath } = makeConfig({});
     expect(setConfigValue({

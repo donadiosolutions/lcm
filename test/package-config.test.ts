@@ -140,7 +140,14 @@ describe("package.json", () => {
     try {
       const packed = JSON.parse(execFileSync("npm", ["pack", "--json", "--ignore-scripts", "--pack-destination", scratch], {
         cwd: repositoryRoot, encoding: "utf8", timeout: PACKAGE_COMMAND_TIMEOUT_MS,
-      })) as Array<{ filename: string }>;
+      })) as Array<{ filename: string; files?: Array<{ path?: unknown }> }>;
+      const trackedDocs = execFileSync("git", ["ls-files", "--", "docs"], {
+        cwd: repositoryRoot, encoding: "utf8", timeout: PACKAGE_COMMAND_TIMEOUT_MS,
+      }).trim().split("\n");
+      const packedDocs = (packed[0].files ?? []).flatMap((entry) =>
+        typeof entry.path === "string" && entry.path.startsWith("docs/") ? [entry.path] : [],
+      ).sort();
+      expect(packedDocs).toEqual(trackedDocs);
       writeFileSync(join(scratch, "package.json"), JSON.stringify({ name: "portable-consumer", version: "1.0.0", private: true }));
       stagePortableArtifact(join(scratch, packed[0].filename), scratch);
       verifyPortablePackage(scratch);
@@ -227,6 +234,60 @@ describe("package.json", () => {
       "URI host is malformed.",
     );
   });
+  it("keeps encoded schemes inert through the AJV nested fast-uri seam", () => {
+    for (const reference of [
+      "%6Aavascript:alert(1)",
+      "%u006Aavascript:alert(1)",
+    ]) {
+      expect(nestedFastUri.parse(reference).scheme).not.toBe("javascript");
+      expect(nestedFastUri.normalize(reference)).not.toMatch(/^javascript:/i);
+      expect(() => nestedFastUri.resolve("https://safe.example/", reference)).toThrow(
+        "URI scheme is malformed.",
+      );
+    }
+    expect(nestedFastUri.normalize("https://safe.example/path")).toBe(
+      "https://safe.example/path",
+    );
+  });
+  it("preserves relative dot segments before AJV nested fast-uri resolution", () => {
+    const base = "https://safe.example/docs/sub/page";
+    for (const reference of ["../private", "a/../public"]) {
+      expect(nestedFastUri.resolve(base, nestedFastUri.normalize(reference))).toBe(
+        nestedFastUri.resolve(base, reference),
+      );
+    }
+    expect(nestedFastUri.resolve(base, "sibling")).toBe(
+      "https://safe.example/docs/sub/sibling",
+    );
+  });
+  it("rejects ambiguous hosts through the AJV nested fast-uri seam", () => {
+    for (const reference of [
+      "https://evil.example@user@safe.example/path",
+      "https://sa\tfe.example/path",
+    ]) {
+      const parsed = nestedFastUri.parse(reference);
+      expect(parsed.error || parsed.host !== "safe.example").toBeTruthy();
+    }
+    expect(nestedFastUri.parse("https://safe.example/path")).toMatchObject({
+      host: "safe.example",
+    });
+  });
+  it("keeps first-segment colons inert in AJV nested fast-uri suffixes", () => {
+    for (const path of ["javascript:alert(1)", "./javascript:alert(1)"]) {
+      const suffix = nestedFastUri.serialize({ path }, { reference: "suffix" });
+      expect(suffix).not.toMatch(/^javascript:/i);
+      expect(nestedFastUri.parse(suffix).scheme).not.toBe("javascript");
+    }
+    expect(nestedFastUri.serialize({ path: "javascript:alert(1)" }, { reference: "suffix" })).toContain(
+      "%3A",
+    );
+    expect(nestedFastUri.serialize({ path: "./javascript:alert(1)" }, { reference: "suffix" })).toBe(
+      "./javascript:alert(1)",
+    );
+    expect(nestedFastUri.serialize({ path: "relative/path" }, { reference: "suffix" })).toBe(
+      "relative/path",
+    );
+  });
   it("does not have pi-ai", () => expect(pkg.dependencies).not.toHaveProperty("@mariozechner/pi-ai"));
   it("does not have pi-agent-core", () => expect(pkg.dependencies).not.toHaveProperty("@mariozechner/pi-agent-core"));
 
@@ -284,6 +345,12 @@ describe("package.json", () => {
       expect(
         paths.filter((path) => path.startsWith("docs/postgresql-")),
       ).toEqual([]);
+      const trackedDocs = execFileSync("git", ["ls-files", "--", "docs"], {
+        cwd: repositoryRoot,
+        encoding: "utf8",
+        timeout: PACKAGE_COMMAND_TIMEOUT_MS,
+      }).trim().split("\n");
+      expect(paths.filter((path) => path.startsWith("docs/")).sort()).toEqual(trackedDocs);
 
       const forbiddenArtifacts = paths.filter((path) =>
         /(^|\/)(?:native|target|rust)(?:\/|$)/iu.test(path)

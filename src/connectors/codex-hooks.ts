@@ -782,7 +782,7 @@ function isCertificate(value: unknown): value is ConnectorLeafCertificate {
   const candidate = value as Partial<Extract<ConnectorLeafCertificate, { state: "regular" }>>;
   return typeof candidate.sha256 === "string"
     && /^[0-9a-f]{64}$/u.test(candidate.sha256)
-    && Number.isSafeInteger(candidate.size) && (candidate.size ?? -1) >= 0
+    && Number.isSafeInteger(candidate.size) && candidate.size! >= 0
     && Number.isSafeInteger(candidate.mode)
     && typeof candidate.dev === "string" && typeof candidate.ino === "string";
 }

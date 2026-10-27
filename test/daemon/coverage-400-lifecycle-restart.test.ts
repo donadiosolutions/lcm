@@ -1958,6 +1958,36 @@ describe("managed restart refusal and repair coverage", () => {
     expect(failure.refusalReason).toBe("startup-failure");
   });
 
+  it.each([
+    ["matching", false, true],
+    ["different", true, false],
+  ] as const)("revalidates an injected nonce-free first manager observation against a %s second nonce", async (_label, differs, restarts) => {
+    const dir = root();
+    writePid(dir, 200);
+    const managed = managedSupervisor((spec, call) => ({
+      kind: "registered-running-valid",
+      managerPid: 200,
+      scopeDigest: spec.scopeDigest,
+      ...(call === 1 ? {} : { nonce: differs ? "foreign-nonce" : spec.nonce }),
+      name: spec.name,
+    }));
+    const ensureMock = vi.fn(async () => ({ connected: true, port: 19_999, spawned: true }));
+    const result = await restart({
+      ...baseOptions(dir),
+      enforceUserManagerParent: true,
+      _supervisorOverride: managed.supervisor,
+      _isProcessAliveOverride: () => true,
+      _listeningPortsOverride: () => [19_999],
+      _fetchOverride: vi.fn().mockRejectedValue(new Error("offline")) as unknown as FetchOverride,
+      _ensureDaemonOverride: ensureMock,
+    });
+
+    expect(result.restarted).toBe(restarts);
+    expect(result.refusalReason).toBe(differs ? "live-no-response" : undefined);
+    expect(managed.probe).toHaveBeenCalledTimes(2);
+    expect(managed.stopAndStart).toHaveBeenCalledTimes(restarts ? 1 : 0);
+  });
+
   it("fails closed when a verified detached daemon survives both termination signals", async () => {
     const dir = root("issue-600-detached-live-");
     writePid(dir, 200);

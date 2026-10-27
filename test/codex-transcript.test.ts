@@ -1382,6 +1382,28 @@ describe("readLiveCodexRestoration for referenced forks", () => {
     expect(liveIn(home, fork)).toBe(false);
   });
 
+  it("rejects a referenced parent when three canonical files share its rollout id", () => {
+    const home = makeTmpDir();
+    const day = "2026/02/01";
+    const parent = writeRollout(home, { rolloutId: uuid(1), items: [metaItem(uuid(1)), markerItem], day });
+    const fork = forkAll(home, 2, parent, []);
+    expect(liveIn(home, fork)).toBe(true);
+
+    writeRollout(home, {
+      rolloutId: parent.rolloutId,
+      threadId: uuid(3),
+      items: [metaItem(uuid(3)), markerItem],
+      day,
+    });
+    writeRollout(home, {
+      rolloutId: parent.rolloutId,
+      threadId: uuid(4),
+      items: [metaItem(uuid(4)), markerItem],
+      day,
+    });
+    expect(liveIn(home, fork)).toBe(false);
+  });
+
   it("matches only canonical rollout names while walking the sessions layout", () => {
     const home = makeTmpDir();
     const parent = writeRollout(home, { rolloutId: uuid(1), items: [metaItem(uuid(1)), markerItem] });

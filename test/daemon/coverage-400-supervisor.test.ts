@@ -786,6 +786,29 @@ function legacySystemdState(
 }
 
 describe("legacy generated systemd discovery and exact stop", () => {
+  it.each([
+    ["LoadState", "LoadState=loaded\n"],
+    ["ActiveState", "ActiveState=active\n"],
+    ["SubState", "SubState=running\n"],
+  ] as const)("rejects discovery with missing %s", async (_field, omitted) => {
+    const name = "lcm-daemon-1234-1720000000000.service";
+    const output = legacySystemdState().replace(omitted, "");
+    const runner = runQueue([
+      { code: 0, stdout: legacySystemdList(name) },
+      { code: 0, stdout: output },
+    ]);
+    const capabilities = legacySystemdCapabilities(createSupervisor("systemd-user", {
+      run: runner.run,
+      platform: "linux",
+    }));
+
+    await expect(capabilities.discoverLegacySystemdUnits!()).resolves.toEqual({
+      kind: "unavailable",
+      reason: "state-conflict",
+    });
+    expect(runner.calls).toHaveLength(2);
+  });
+
   it("discovers only strict legacy names and returns authenticated manager PIDs", async () => {
     spec("systemd-user");
     const runner = runQueue([
@@ -1025,6 +1048,31 @@ describe("legacy generated systemd discovery and exact stop", () => {
         command: "systemctl",
         args: legacySystemdShowArgsForTest(candidate.name),
       },
+    ]);
+  });
+
+  it.each([
+    ["LoadState", "LoadState=loaded\n"],
+    ["ActiveState", "ActiveState=deactivating\n"],
+    ["SubState", "SubState=stop-sigterm\n"],
+  ] as const)("refuses a post-stop transition with missing %s", async (_field, omitted) => {
+    const candidate = legacySystemdCandidate();
+    const transition = legacySystemdState("deactivating", 4242, "stop-sigterm").replace(omitted, "");
+    const runner = runQueue([
+      { code: 0, stdout: legacySystemdState("active", 4242) },
+      { code: 0, stdout: "stop queued" },
+      { code: 0, stdout: transition },
+    ]);
+    const capabilities = legacySystemdCapabilities(createSupervisor("systemd-user", {
+      run: runner.run,
+      platform: "linux",
+    }));
+
+    await expect(capabilities.stopLegacySystemdUnit!(candidate)).rejects.toThrow("manager command");
+    expect(runner.calls.map(({ args }) => args)).toEqual([
+      legacySystemdShowArgsForTest(candidate.name),
+      ["--user", "stop", candidate.name],
+      legacySystemdShowArgsForTest(candidate.name),
     ]);
   });
 

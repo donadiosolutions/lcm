@@ -1,0 +1,8 @@
+references: ["#1765", "#1763"]
+rationale: >-
+  #1765 and the second #1763 comment make sanitizeError own bracket components
+  that a rooted post-close tail or an inherited-quote successor consumes, so
+  rooted query values inside them redact on the first pass; safe-error.ts keeps
+  its established owner.
+pins:
+  - ["src/daemon/safe-error.ts", "unit-daemon-core"]

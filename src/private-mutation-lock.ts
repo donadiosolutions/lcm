@@ -235,7 +235,7 @@ function readLockOwner(
     || typeof value !== "object"
     || owner.version !== 1
     || !Number.isSafeInteger(owner.pid)
-    || (owner.pid ?? 0) <= 0
+    || owner.pid! <= 0
     || (owner.processStartTime !== null && typeof owner.processStartTime !== "string")
     || typeof owner.nonce !== "string"
     || !/^[a-f0-9]{32}$/u.test(owner.nonce)

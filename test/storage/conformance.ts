@@ -493,7 +493,7 @@ export function defineCoreStorageConformance(
       tags: ["concurrency"],
       depth: 0,
       confidence: 0.8,
-      thresholds: { dedupBm25Threshold: 0.000001, dedupCandidateLimit: 10 },
+      thresholds: { dedupCandidateLimit: 10 },
     };
     const [firstId, secondId] = await Promise.all([
       deduplicateAndInsert(concurrent),

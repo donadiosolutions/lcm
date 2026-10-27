@@ -17,6 +17,7 @@ const mocks = vi.hoisted(() => ({
   collect: vi.fn(() => [] as unknown[]),
   storeSearch: vi.fn(() => [] as unknown[]),
   dedup: vi.fn(async () => "id"),
+  dedupRepos: vi.fn(async (..._args: unknown[]) => null as string | null),
   openProject: vi.fn(),
   closeProject: vi.fn(),
   closeFactory: vi.fn(),
@@ -39,7 +40,9 @@ const mocks = vi.hoisted(() => ({
   scrubberFactory: vi.fn(),
   eventsPath: vi.fn(() => "/events.db"),
   existingEventsPath: vi.fn(),
+  assertExistingSidecarProjectBinding: vi.fn(),
 }));
+const SidecarIdentityConflictError = vi.hoisted(() => class SidecarIdentityConflictError extends Error {});
 const missingCwdError = vi.hoisted(() => new Error("missing cwd"));
 
 vi.mock("../../../src/hooks/events-db.js", () => ({
@@ -61,8 +64,13 @@ vi.mock("../../../src/hooks/events-db.js", () => ({
 vi.mock("../../../src/db/events-path.js", () => ({
   eventsDbPath: mocks.eventsPath,
   existingEventsDbPath: mocks.existingEventsPath,
+  assertExistingSidecarProjectBinding: mocks.assertExistingSidecarProjectBinding,
+  SidecarIdentityConflictError,
 }));
-vi.mock("../../../src/promotion/dedup.js", () => ({ deduplicateAndInsert: mocks.dedup }));
+vi.mock("../../../src/promotion/dedup.js", () => ({
+  deduplicateAndInsert: mocks.dedup,
+  deduplicateAndInsertInRepositories: mocks.dedupRepos,
+}));
 vi.mock("../../../src/daemon/server.js", () => ({ sendJson: mocks.send }));
 vi.mock("../../../src/daemon/validate-cwd.js", () => ({
   validateCwd: mocks.validate,
@@ -141,7 +149,7 @@ function projectStorage() {
 
 describe("promote-events unit boundaries", () => {
   beforeEach(() => {
-    for (const mock of Object.values(mocks)) mock.mockClear();
+    for (const mock of Object.values(mocks)) mock.mockReset();
     mocks.events.mockReturnValue([]);
     mocks.mark.mockImplementation(() => undefined);
     mocks.reinforcement.mockReturnValue({ totalCount: 0, distinctSessions: 0 });
@@ -154,6 +162,7 @@ describe("promote-events unit boundaries", () => {
     mocks.openProject.mockResolvedValue(projectStorage());
     mocks.storeSearch.mockReturnValue([]);
     mocks.dedup.mockResolvedValue("id");
+    mocks.dedupRepos.mockResolvedValue(null);
     mocks.validate.mockImplementation((cwd: string) => cwd);
     mocks.scrub.mockImplementation((text: string) => text);
     mocks.scrubberFactory.mockResolvedValue({ scrub: mocks.scrub });
@@ -194,7 +203,7 @@ describe("promote-events unit boundaries", () => {
     expect(mocks.send).toHaveBeenLastCalledWith(response, 500, { error: "failed to promote events" });
   });
 
-  it("fails selected-project identity after local outbox preparation for direct, drain, all, and notify paths", async () => {
+  it("fails selected-project identity before opening the outbox for direct, drain, all, and notify paths", async () => {
     const identityFailure = new Error("PostgreSQL project binding is required");
     mocks.identity.mockImplementation(() => { throw identityFailure; });
 
@@ -257,7 +266,7 @@ describe("promote-events unit boundaries", () => {
       identityFailure,
       { cwd: "/cwd" },
     );
-    expect(mocks.openOutbox).toHaveBeenCalled();
+    expect(mocks.openOutbox).not.toHaveBeenCalled();
     expect(mocks.openProject).not.toHaveBeenCalled();
   });
 
@@ -288,7 +297,7 @@ describe("promote-events unit boundaries", () => {
       error: "Machine identity is unavailable. Run `lcm machine show` for recovery guidance.",
       storageBackend: "postgresql",
     });
-    expect(mocks.openOutbox).toHaveBeenCalledOnce();
+    expect(mocks.openOutbox).not.toHaveBeenCalled();
     expect(mocks.scrubberFactory).not.toHaveBeenCalled();
   });
 
@@ -334,7 +343,7 @@ describe("promote-events unit boundaries", () => {
     expect(mocks.openOutbox).toHaveBeenCalledTimes(2);
   });
 
-  it("queues local SQLite preparation separately from scrubber and selected storage", async () => {
+  it("prepares the sidecar locally, then releases admission before scrubber work", async () => {
     const sequence: string[] = [];
     let admitted = false;
     const events = [event({ data: "admit only the selected batch" })];
@@ -377,10 +386,10 @@ describe("promote-events unit boundaries", () => {
 
     expect(mocks.mark).toHaveBeenCalledWith([events[0].event_id]);
     expect(sequence).toEqual([
-      "admission", "outbox-open", "outbox-read", "admission", "scrubber",
-      "admission", "project-open", "repository-batch",
+      "admission", "admission", "admission", "outbox-open", "outbox-read",
+      "scrubber", "admission", "project-open", "repository-batch",
     ]);
-    expect(withPublicationAdmission).toHaveBeenCalledTimes(3);
+    expect(withPublicationAdmission).toHaveBeenCalledTimes(4);
   });
 
   it("pairs a PostgreSQL-shaped preflight identity with scrubber paths and admission", async () => {
@@ -413,7 +422,7 @@ describe("promote-events unit boundaries", () => {
     );
     expect(mocks.openProject).toHaveBeenCalledWith(
       admitted,
-      undefined,
+      expect.any(Object),
       expect.any(AbortSignal),
     );
   });
@@ -489,10 +498,10 @@ describe("promote-events unit boundaries", () => {
         ? [event({ event_id: eventsCalls === 1 ? 1 : 2, data: eventsCalls === 1 ? "a" : "b" })]
         : [];
     });
+    let bIdentityCalls = 0;
     mocks.identity.mockImplementation((cwd: string) => {
       if (cwd === "/a") return a;
-      if (cwd === "/b" && mocks.identity.mock.calls.filter(([path]) => path === "/b").length === 1) return b;
-      if (cwd === "/b") return { ...b, canonical: "/b-drift" };
+      if (cwd === "/b") return ++bIdentityCalls === 1 ? b : { ...b, canonical: "/b-drift" };
       return c;
     });
 
@@ -505,8 +514,8 @@ describe("promote-events unit boundaries", () => {
     });
     expect(mocks.closeFactory).toHaveBeenCalledOnce();
     expect(mocks.mark).toHaveBeenCalledWith([1]);
-    expect(mocks.openProject).toHaveBeenCalledTimes(2);
     expect(mocks.identity.mock.calls.some(([cwd]) => cwd === "/c")).toBe(false);
+    expect(mocks.openProject).toHaveBeenCalledTimes(2);
     expect(mocks.log).not.toHaveBeenCalled();
   });
 
@@ -598,15 +607,33 @@ describe("promote-events unit boundaries", () => {
     expect(mocks.closeFactory).toHaveBeenCalledTimes(3);
   });
 
+  it("reports a diagnostic sidecar scan skipped by its budget", async () => {
+    mocks.collect.mockReturnValueOnce([{
+      file: "a.db", projectId: "a", path: "/a.db", metadataMissing: true,
+      captured: 0, unprocessed: 0, errors: 0, lastCapture: null,
+      scanSkipped: "sidecar scan skipped after timeout", scanSkippedCount: 1,
+    }]);
+    const response = {} as never;
+    await createPromoteAllEventsHandler(config)({} as never, response, "");
+    expect(mocks.send.mock.calls.at(-1)?.[2]).toMatchObject({
+      failedProjects: 1,
+      projects: [{
+        projectId: "a",
+        incomplete: true,
+        message: "sidecar scan skipped: sidecar scan skipped after timeout",
+      }],
+    });
+  });
+
   it("distinguishes an initially empty drain", async () => {
     mocks.events.mockReturnValueOnce([]);
     await expect(drainEventsForCwd(config, "/cwd", "/events.db"))
       .resolves.toMatchObject({ batches: 0, message: "no unprocessed events" });
-    expect(mocks.identity).toHaveBeenCalledTimes(1);
+    expect(mocks.identity).toHaveBeenCalledTimes(2);
     expect(mocks.openProject).toHaveBeenCalledTimes(1);
-    expect(mocks.openOutbox.mock.invocationCallOrder[0])
-      .toBeLessThan(mocks.identity.mock.invocationCallOrder[0]);
     expect(mocks.identity.mock.invocationCallOrder[0])
+      .toBeLessThan(mocks.openOutbox.mock.invocationCallOrder[0]);
+    expect(mocks.openOutbox.mock.invocationCallOrder[0])
       .toBeLessThan(mocks.openProject.mock.invocationCallOrder[0]);
   });
 
@@ -659,7 +686,7 @@ describe("promote-events unit boundaries", () => {
     expect(mocks.openProject).toHaveBeenCalledOnce();
     expect(mocks.openProject).toHaveBeenCalledWith(
       identityA,
-      undefined,
+      expect.any(Object),
       expect.any(AbortSignal),
     );
     expect(mocks.closeEvents).toHaveBeenCalledOnce();
@@ -691,7 +718,7 @@ describe("promote-events unit boundaries", () => {
       machineId: "machine-c",
     };
     const pending = [first, second];
-    const identityCalls = [identityA, identityA, identityB, identityB, identityC];
+    const identityCalls = [identityA, identityA, identityB, identityB, identityC, identityC];
     mocks.events.mockImplementation(() => pending.length === 0 ? [] : [pending[0]]);
     mocks.mark.mockImplementation((processedIds: number[]) => {
       for (const processedId of processedIds) {
@@ -713,6 +740,7 @@ describe("promote-events unit boundaries", () => {
       identityA,
       identityB,
       identityB,
+      identityC,
       identityC,
     ]);
     expect(mocks.projectPaths.mock.calls.map(([identity]) => identity)).toEqual([
@@ -740,19 +768,19 @@ describe("promote-events unit boundaries", () => {
     expect(mocks.openProject).toHaveBeenNthCalledWith(
       1,
       identityA,
-      undefined,
+      expect.any(Object),
       expect.any(AbortSignal),
     );
     expect(mocks.openProject).toHaveBeenNthCalledWith(
       2,
       identityB,
-      undefined,
+      expect.any(Object),
       expect.any(AbortSignal),
     );
     expect(mocks.openProject).toHaveBeenNthCalledWith(
       3,
       identityC,
-      undefined,
+      expect.any(Object),
       expect.any(AbortSignal),
     );
     expect(mocks.openProject).toHaveBeenCalledTimes(3);
@@ -783,7 +811,7 @@ describe("promote-events unit boundaries", () => {
         remoteProjectId: "pid",
         machineId: "machine",
       }),
-      undefined,
+      expect.any(Object),
       expect.any(AbortSignal),
     );
     expect(mocks.closeProject).toHaveBeenCalledOnce();
@@ -877,7 +905,8 @@ describe("promote-events unit boundaries", () => {
 
   it("stops after the hard maximum when a sidecar never drains", async () => {
     mocks.events.mockImplementation(() => [event({ data: "repeating" })]);
-    const result = await drainEventsForCwd(config, "/cwd", "/events.db");
+    const result = await drainEventsForCwd(config, "/cwd", "/events.db", undefined, undefined,
+      { withPublicationAdmission: testPublicationAdmission });
     expect(result).toMatchObject({
       batches: 10_000,
       promoted: 10_000,
@@ -889,7 +918,10 @@ describe("promote-events unit boundaries", () => {
 
   it("parks through durable sidecar state without consuming unprocessed rows", async () => {
     mocks.observeMissingCwd.mockReturnValue({ parked: true, observations: 3, retryAfterMs: 0 });
-    mocks.validate.mockImplementation(() => { throw missingCwdError; });
+    mocks.validate.mockImplementation((cwd: string, options?: { allowMissing?: boolean }) => {
+      if (options?.allowMissing) return cwd;
+      throw missingCwdError;
+    });
 
     const result = await parkUnavailableCwdEvents("/missing", "/events.db");
 
@@ -947,8 +979,10 @@ describe("promote-events unit boundaries", () => {
     await expect(promoteEventsForCwd(config, lexical)).resolves.toMatchObject({
       deferred: { kind: "awaiting-confirmation", observations: 1 },
     });
-    expect(mocks.existingEventsPath).toHaveBeenCalledOnce();
-    expect(mocks.existingEventsPath).toHaveBeenCalledWith("/workspace/missing");
+    expect(mocks.existingEventsPath).toHaveBeenCalledTimes(2);
+    expect(mocks.existingEventsPath).toHaveBeenCalledWith("/workspace/missing", {
+      publicationLockToken: expect.any(Object),
+    });
     expect(mocks.eventsPath).not.toHaveBeenCalled();
     expect(mocks.observeMissingCwd).toHaveBeenCalledOnce();
   });
@@ -989,7 +1023,8 @@ describe("promote-events unit boundaries", () => {
       event({ event_id: 7, session_id: "f", seq: 1, category: "decision", type: "decision", data: "dedup-error", priority: 1 }),
     ];
     mocks.events.mockReturnValueOnce(events);
-    mocks.storeSearch.mockImplementation((query: string) => query === "existing" ? [{ id: "match" }] : []);
+    mocks.dedupRepos.mockImplementation(async (_repositories, input) =>
+      (input as { content: string }).content === "existing" ? "match" : null);
     mocks.reinforcement.mockImplementation((_type: string, _category: string, data: string) =>
       data === "reinforced" ? { totalCount: 3, distinctSessions: 2 } : { totalCount: 0, distinctSessions: 0 });
     mocks.dedup.mockImplementation(async (input: {
@@ -1008,7 +1043,6 @@ describe("promote-events unit boundaries", () => {
       batch: undefined,
       pattern: undefined,
     };
-    defaults.compaction.promotionThresholds.dedupBm25Threshold = undefined;
     defaults.compaction.promotionThresholds.dedupCandidateLimit = undefined;
     defaults.compaction.promotionThresholds.insightsMaxAgeDays = undefined;
     defaults.compaction.promotionThresholds.maxConfidence = undefined;
@@ -1104,36 +1138,51 @@ describe("promote-events unit boundaries", () => {
     expect(mocks.mark).toHaveBeenLastCalledWith([]);
   });
 
-  it("scopes tier 3 eligibility to the current project attribution", async () => {
+  it("admits a one-off tier 3 event only through existing-only dedup in the current project scope", async () => {
     mocks.events.mockReturnValueOnce([
       event({ event_id: 1, category: "file", type: "file", data: "foreign-only", priority: 3 }),
       event({ event_id: 2, category: "file", type: "file", data: "same-project", priority: 3 }),
     ]);
-    mocks.storeSearch.mockImplementation(
-      (query: string, _limit: number, _tags: string[] | undefined, sourceProjectId: string | undefined) => {
-        if (query === "foreign-only") {
-          return sourceProjectId === undefined ? [{ id: "foreign" }] : [];
-        }
-        return sourceProjectId === "pid" ? [{ id: "same-project" }] : [];
-      },
-    );
+    mocks.dedupRepos.mockImplementation(async (_repositories, input) =>
+      (input as { content: string }).content === "same-project" ? "same-project" : null);
 
     await expect(promoteEventsForCwd(config, "/cwd", "/events.db")).resolves.toMatchObject({
       promoted: 1,
       skipped: 1,
       errors: 0,
     });
-    expect(mocks.storeSearch).toHaveBeenNthCalledWith(1, "foreign-only", 1, undefined, "pid");
-    expect(mocks.storeSearch).toHaveBeenNthCalledWith(2, "same-project", 1, undefined, "pid");
-    expect(mocks.dedup).toHaveBeenCalledOnce();
-    expect(mocks.dedup).toHaveBeenCalledWith(expect.objectContaining({
+    expect(mocks.storeSearch).not.toHaveBeenCalled();
+    expect(mocks.dedup).not.toHaveBeenCalled();
+    expect(mocks.dedupRepos).toHaveBeenCalledTimes(2);
+    expect(mocks.dedupRepos).toHaveBeenNthCalledWith(1, {}, expect.objectContaining({
+      content: "foreign-only",
+      sourceProjectId: "pid",
+      candidateScope: "owner",
+      existingOnly: true,
+    }));
+    expect(mocks.dedupRepos).toHaveBeenNthCalledWith(2, {}, expect.objectContaining({
       content: "same-project",
       sourceProjectId: "pid",
+      candidateScope: "owner",
+      existingOnly: true,
     }));
     expect(mocks.mark).toHaveBeenCalledWith([1, 2]);
   });
 
-  it("runs the public PostgreSQL priority 3 path through real dedup and preserves local provenance", async () => {
+  it("does not consult dedup for a one-off event of a non-promotable type", async () => {
+    mocks.events.mockReturnValueOnce([
+      event({ event_id: 1, category: "tool", type: "tool_outcome_unknown", data: "probe", priority: 3 }),
+    ]);
+    mocks.dedupRepos.mockResolvedValue("would-match");
+
+    await expect(promoteEventsForCwd(config, "/cwd", "/events.db"))
+      .resolves.toMatchObject({ promoted: 0, skipped: 1, errors: 0 });
+    expect(mocks.dedupRepos).not.toHaveBeenCalled();
+    expect(mocks.dedup).not.toHaveBeenCalled();
+    expect(mocks.mark).toHaveBeenCalledWith([1]);
+  });
+
+  it("runs the public PostgreSQL priority 3 path through real existing-only dedup", async () => {
     const remoteId = "018f22c4-6d2a-7f10-8a4c-6b8d3e5f9012";
     const localId = "a".repeat(64);
     mocks.identity.mockImplementation((cwd: string) => ({
@@ -1156,10 +1205,19 @@ describe("promote-events unit boundaries", () => {
       createdAt: "2026-01-01T00:00:00.000Z",
       rank: -0.1,
     };
+    const exactRow = {
+      id: "owner-exact",
+      content: "exact owner pattern",
+      tags: ["owner"],
+      projectId: remoteId,
+      sessionId: null,
+      confidence: 0.1,
+      createdAt: "2026-01-01T00:00:00.000Z",
+    };
     const repositories = {
       lexicalSearch: { searchPromoted: mocks.storeSearch },
       promotedMemory: {
-        findExactContent: vi.fn().mockResolvedValue(null),
+        findExactContent: vi.fn(async (content: string) => content === exactRow.content ? exactRow : null),
         insert: vi.fn().mockResolvedValue("inserted"),
         update: vi.fn().mockResolvedValue(undefined),
         archive: vi.fn().mockResolvedValue(undefined),
@@ -1168,9 +1226,12 @@ describe("promote-events unit boundaries", () => {
     mocks.events.mockReturnValueOnce([
       event({ event_id: 31, category: "file", type: "file", data: candidate.content, priority: 3 }),
       event({ event_id: 32, category: "file", type: "file", data: "no lexical match", priority: 3 }),
+      event({ event_id: 33, category: "file", type: "file", data: "unrelated lexical hit", priority: 3 }),
+      event({ event_id: 34, category: "file", type: "file", data: exactRow.content, priority: 3 }),
     ]);
     mocks.storeSearch.mockImplementation((query: string, _limit: number, _tags: string[] | undefined, source: string | undefined) =>
-      query === candidate.content && (source === undefined || source === candidate.projectId)
+      (query === candidate.content || query === "unrelated lexical hit")
+        && (source === undefined || source === candidate.projectId)
         ? [candidate]
         : []);
     mocks.openProject.mockResolvedValue({
@@ -1182,24 +1243,32 @@ describe("promote-events unit boundaries", () => {
     });
     mocks.transaction.mockImplementation(async (callback: (value: typeof repositories) => Promise<unknown>) =>
       callback(repositories));
-    mocks.dedup.mockImplementation(async input => actual.deduplicateAndInsert(input as never));
+    mocks.dedupRepos.mockImplementation(async (repos, input) =>
+      actual.deduplicateAndInsertInRepositories(repos as never, input as never));
 
     await expect(promoteEventsForCwd(postgresqlConfig, "/cwd", "/events.db"))
-      .resolves.toMatchObject({ promoted: 1, skipped: 1, errors: 0 });
-    expect(mocks.storeSearch).toHaveBeenNthCalledWith(1, candidate.content, 1, undefined, undefined);
-    expect(mocks.storeSearch).toHaveBeenNthCalledWith(2, candidate.content, 100, undefined, undefined);
+      .resolves.toMatchObject({ promoted: 2, skipped: 2, errors: 0 });
+    expect(mocks.storeSearch).toHaveBeenNthCalledWith(1, candidate.content, 100, undefined, undefined);
+    expect(mocks.storeSearch).toHaveBeenNthCalledWith(2, "no lexical match", 100, undefined, undefined);
+    expect(mocks.storeSearch).toHaveBeenNthCalledWith(3, "unrelated lexical hit", 100, undefined, undefined);
     expect(repositories.promotedMemory.insert).not.toHaveBeenCalled();
     expect(repositories.promotedMemory.update).toHaveBeenCalledWith("local-canonical", {
       confidence: 0.75,
       tags: expect.arrayContaining(["local", "source:passive-capture"]),
     });
-    expect(mocks.dedup).toHaveBeenCalledWith(expect.objectContaining({
+    expect(repositories.promotedMemory.findExactContent).toHaveBeenCalledWith(exactRow.content, undefined);
+    expect(repositories.promotedMemory.update).toHaveBeenCalledWith("owner-exact", {
+      confidence: 0.2,
+      tags: expect.arrayContaining(["owner", "source:passive-capture"]),
+    });
+    expect(mocks.dedup).not.toHaveBeenCalled();
+    expect(mocks.dedupRepos).toHaveBeenCalledWith(repositories, expect.objectContaining({
       sourceProjectId: remoteId,
       candidateScope: "owner",
       backend: "postgresql",
+      existingOnly: true,
     }));
-    expect(mocks.storeSearch).toHaveBeenNthCalledWith(3, "no lexical match", 1, undefined, undefined);
-    expect(mocks.mark).toHaveBeenCalledWith([31, 32]);
+    expect(mocks.mark).toHaveBeenCalledWith([31, 32, 33, 34]);
   });
 
   it.each([
