@@ -502,7 +502,7 @@ type BackendPublicationPermitInput = Readonly<{
 }>;
 
 type BackendPublicationPermitMetadata = Readonly<{
-  homeDir: string | undefined;
+  homeDir: string;
   publicationId: string;
   checksumSha256: string;
   phase: BackendPublicationPhase;
@@ -2429,7 +2429,7 @@ function permitMetadata(
   const metadata = activePublicationPermits.get(permit);
   if (
     metadata === undefined
-    || resolve(join(metadata.homeDir ?? homedir(), ".lcm")) !== rootPath(homeDir)
+    || resolve(join(metadata.homeDir, ".lcm")) !== rootPath(homeDir)
     || (journal !== undefined && (
       metadata.publicationId !== journal.publicationId
       || metadata.checksumSha256 !== journal.checksumSha256
@@ -4589,7 +4589,7 @@ function operationPath(homeDir: string | undefined): string {
 
 /** Crash-recoverable local orchestration for backend publication. */
 export class BackendPublicationCoordinator {
-  readonly #homeDir: string | undefined;
+  readonly #homeDir: string;
   readonly #driver: BackendPublicationDriver;
   readonly #observer: BackendPublicationObserver;
 
@@ -4598,7 +4598,7 @@ export class BackendPublicationCoordinator {
     driver: BackendPublicationDriver;
     observer?: BackendPublicationObserver;
   }>) {
-    this.#homeDir = input.homeDir;
+    this.#homeDir = resolve(input.homeDir ?? homedir());
     this.#driver = input.driver;
     this.#observer = input.observer ?? NOOP_OBSERVER;
   }
@@ -4963,7 +4963,7 @@ export class BackendPublicationCoordinator {
   ): Promise<void> {
     await withRevocablePrivateMutationPermit(`backend publication ${access}`, async (permit) => {
       activePublicationPermits.set(permit, {
-        homeDir: context.homeDir,
+        homeDir: this.#homeDir,
         publicationId: context.journal.publicationId,
         checksumSha256: context.journal.checksumSha256,
         phase: context.journal.phase,

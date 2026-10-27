@@ -890,6 +890,45 @@ describe("local backend-publication consumer seam", () => {
     }
   });
 
+  it("binds an omitted-home coordinator permit to its issuance home", async () => {
+    const { home, material } = fixture();
+    const otherHome = makeHome();
+    const previousHome = process.env.HOME;
+    process.env.HOME = home;
+    let checked = false;
+    try {
+      const coordinator = new BackendPublicationCoordinator({
+        driver: driverFor(home, false, {
+          beforeProjectMap: ({ permit }) => {
+            process.env.HOME = otherHome;
+            try {
+              expect(() => assertBackendPublicationPermit(permit, otherHome))
+                .toThrow("does not match durable state");
+              expect(() => assertBackendPublicationPermit(permit))
+                .toThrow("does not match durable state");
+              expect(() => assertBackendPublicationPermit(permit, home)).not.toThrow();
+              checked = true;
+            } finally {
+              process.env.HOME = home;
+            }
+          },
+        }),
+      });
+      await coordinator.prepare({
+        publicationId: "consumer-default-home",
+        sourceBackend: "sqlite",
+        targetBackend: "postgresql",
+        material,
+        projects: [],
+      });
+      await expect(coordinator.resume()).resolves.toMatchObject({ phase: "completed" });
+      expect(checked).toBe(true);
+    } finally {
+      if (previousHome === undefined) delete process.env.HOME;
+      else process.env.HOME = previousHome;
+    }
+  });
+
   it("supports exact active permits for synchronous and asynchronous consumer/config callbacks", async () => {
     const pending = await pendingFixture();
     const { home, journal } = pending;
