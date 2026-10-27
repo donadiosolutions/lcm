@@ -1,0 +1,10 @@
+references: ["#1780"]
+rationale: >-
+  Keeps selected hook data complete through extraction and native shell
+  normalization, then scrubs it before applying the durable output cap in
+  src/hooks/event-scrubbing.ts. These materially changed files retain their
+  existing hooks unit owner. No file is added, removed, moved or re-owned.
+pins:
+  - ["src/hooks/event-scrubbing.ts", "unit-hooks"]
+  - ["src/hooks/extractors.ts", "unit-hooks"]
+  - ["src/hooks/post-tool-normalization.ts", "unit-hooks"]
