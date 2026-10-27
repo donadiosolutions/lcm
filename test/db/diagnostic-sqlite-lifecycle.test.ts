@@ -239,6 +239,65 @@ describe("snapshot-owned SQLite session", () => {
     expect(child.kill).toHaveBeenCalledOnce();
     expect(vi.getTimerCount()).toBe(0);
   });
+  it("keeps the default session lifetime at two seconds", async () => {
+    const controller = new AbortController();
+    const result = withDiagnosticSqliteSession(controller.signal, async () => {
+      await vi.advanceTimersByTimeAsync(2001);
+      return readDiagnosticSqlite({ ...request, signal: controller.signal });
+    });
+    await expect(result).rejects.toMatchObject({ code: "DIAGNOSTIC_SQLITE_TIMEOUT" });
+    expect(harness.fork).not.toHaveBeenCalled();
+    expect(vi.getTimerCount()).toBe(0);
+  });
+  it("lets an opted-in session continue after two seconds while each read remains capped", async () => {
+    const controller = new AbortController();
+    const continued = withDiagnosticSqliteSession(controller.signal, async () => {
+      await vi.advanceTimersByTimeAsync(2001);
+      const reading = readDiagnosticSqlite({ ...request, signal: controller.signal });
+      child.emit("message", { id: 1, ok: true, rows: [1] });
+      return reading;
+    }, { lifetimeMs: 5000 });
+    await expect(continued).resolves.toEqual([1]);
+    expect(child.kill).toHaveBeenCalledOnce();
+
+    const nextController = new AbortController();
+    const cappedRead = withDiagnosticSqliteSession(nextController.signal, async () => {
+      const outcome = readDiagnosticSqlite({ ...request, signal: nextController.signal, timeoutMs: 5000 })
+        .catch(error => error);
+      await vi.advanceTimersByTimeAsync(2000);
+      return outcome;
+    }, { lifetimeMs: 5000 });
+    await expect(cappedRead).resolves.toMatchObject({ code: "DIAGNOSTIC_SQLITE_TIMEOUT" });
+    expect(vi.getTimerCount()).toBe(0);
+  });
+  it.each([0, -1, NaN, Infinity])("refuses an invalid session lifetime %s", async lifetimeMs => {
+    const controller = new AbortController();
+    await expect(withDiagnosticSqliteSession(controller.signal, async () => 1, { lifetimeMs }))
+      .rejects.toMatchObject({ code: "DIAGNOSTIC_SQLITE_TIMEOUT" });
+    expect(harness.fork).not.toHaveBeenCalled();
+    expect(vi.getTimerCount()).toBe(0);
+  });
+  it("caps an opted-in session at thirty seconds", async () => {
+    const controller = new AbortController();
+    const result = withDiagnosticSqliteSession(controller.signal, async () => {
+      await vi.advanceTimersByTimeAsync(30_000);
+      return readDiagnosticSqlite({ ...request, signal: controller.signal });
+    }, { lifetimeMs: 99_999 });
+    await expect(result).rejects.toMatchObject({ code: "DIAGNOSTIC_SQLITE_TIMEOUT" });
+    expect(harness.fork).not.toHaveBeenCalled();
+    expect(vi.getTimerCount()).toBe(0);
+  });
+  it("cancels an extended session and its active read", async () => {
+    const controller = new AbortController();
+    const result = withDiagnosticSqliteSession(controller.signal, () => {
+      const reading = readDiagnosticSqlite({ ...request, signal: controller.signal });
+      controller.abort();
+      return reading;
+    }, { lifetimeMs: 30_000 });
+    await expect(result).rejects.toMatchObject({ code: "DIAGNOSTIC_SQLITE_ABORTED" });
+    expect(child.kill).toHaveBeenCalledOnce();
+    expect(vi.getTimerCount()).toBe(0);
+  });
   it("bounds queued requests without sending or retaining unbounded frames", async () => {
     const {result}=start(async signal=>{
       const readings=Array.from({length:34},()=>readDiagnosticSqlite({...request,signal}));

@@ -1,21 +1,33 @@
 import { describe, it, expect, afterEach, vi } from "vitest";
-import { mkdirSync, mkdtempSync, rmSync } from "node:fs";
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { tmpdir } from "node:os";
 import { execFileSync } from "node:child_process";
 import { DatabaseSync } from "node:sqlite";
+import type { IncomingMessage, ServerResponse } from "node:http";
 import type { DaemonConfig } from "../../../src/daemon/config.js";
-import { promoteEventsForCwd, drainEventsForCwd } from "../../../src/daemon/routes/promote-events.js";
+import { createPromoteAllEventsHandler, promoteEventsForCwd, drainEventsForCwd, parkUnavailableCwdEvents } from "../../../src/daemon/routes/promote-events.js";
 import { ensureProjectDir, projectDbPath, projectId } from "../../../src/daemon/project.js";
 import { EventsDb } from "../../../src/hooks/events-db.js";
-import { eventsDbPath } from "../../../src/db/events-path.js";
+import { eventsDbPath, eventsDir, existingEventsDbPath, SidecarIdentityConflictError } from "../../../src/db/events-path.js";
 import { runLcmMigrations } from "../../../src/db/migration.js";
 import { closeLcmConnection, getPoolStats } from "../../../src/db/connection.js";
 import { PromotedStore } from "../../../src/db/promoted.js";
 import { recoverMachineIdentity } from "../../../src/machine-identity.js";
 import { adoptMigrationReceiptEpoch, readMigrationReceiptEvidence } from "../../../src/migration/receipts.js";
 import { withBackendPublicationConsumerLockAsync } from "../../../src/storage/backend-publication.js";
-import { clearProjectMapCache } from "../../../src/project-map.js";
+import {
+  addProjectAlias,
+  clearProjectMapCache,
+  hashProjectPath,
+  normalizeProjectIdentityPath,
+  projectMapPath,
+  removeProjectAlias,
+  renewRetiredProjectIdentity,
+  resolveProjectIdentity,
+  retiredProjectIdentitySuccessor,
+} from "../../../src/project-map.js";
+import { serializeWorktreeReconciliationFence } from "../../../src/worktree-reconciliation-fence.js";
 
 function makeConfig(): DaemonConfig {
   return {
@@ -116,7 +128,277 @@ function expectReleased(home: string): void {
     .toEqual([]);
 }
 
+function retiredSidecarFixture(eventCount = 1) {
+  const home = mkdtempSync(join(tmpdir(), "lcm-promotion-retired-"));
+  roots.push(home);
+  vi.stubEnv("HOME", home);
+  mkdirSync(join(home, ".lcm"), { mode: 0o700 });
+  const cwd = join(home, "project");
+  mkdirSync(cwd);
+  const oldId = resolveProjectIdentity(cwd).id;
+  const sidecar = eventsDbPath(cwd);
+  const events = new EventsDb(sidecar);
+  for (let index = 0; index < eventCount; index++) {
+    events.insertEvent(`session-${index}`, {
+      type: "decision", category: "decision", data: `retired identity event ${index}`, priority: 1,
+    }, "PostToolUse");
+  }
+  events.close();
+  const projects = join(home, ".lcm", "projects");
+  mkdirSync(projects, { mode: 0o700 });
+  writeFileSync(join(projects, oldId), serializeWorktreeReconciliationFence(oldId, "project"), { mode: 0o600 });
+  const newId = retiredProjectIdentitySuccessor(oldId, normalizeProjectIdentityPath(cwd));
+  return { home, cwd, sidecar, oldId, newId };
+}
+
 describe("canonical promotion publication admission", () => {
+  it("refuses a legal retired-ID renewal between selection and destination admission", async () => {
+    const f = retiredSidecarFixture();
+    const before = sidecarState(f.sidecar);
+    let admissions = 0;
+    const context = {
+      withPublicationAdmission: <T>(operation: (token: object) => Promise<T> | T) => {
+        admissions++;
+        if (admissions === 3) {
+          expect(renewRetiredProjectIdentity(f.cwd)).toMatchObject({ changed: true, newId: f.newId });
+        }
+        return withBackendPublicationConsumerLockAsync(f.home, operation);
+      },
+    };
+
+    await expect(promoteEventsForCwd(makeConfig(), f.cwd, f.sidecar, undefined, undefined, context))
+      .rejects.toBeInstanceOf(SidecarIdentityConflictError);
+    expect(admissions).toBeGreaterThanOrEqual(4);
+    expect(sidecarState(f.sidecar)).toEqual(before);
+    expect(existsSync(join(f.home, ".lcm", "projects", f.newId, "db.sqlite"))).toBe(false);
+    expectReleased(f.home);
+  });
+
+  it("rechecks an alias removal before the second drain batch", async () => {
+    const home = mkdtempSync(join(tmpdir(), "lcm-promotion-alias-transition-"));
+    roots.push(home);
+    vi.stubEnv("HOME", home);
+    mkdirSync(join(home, ".lcm"), { mode: 0o700 });
+    const canonical = join(home, "canonical");
+    const alias = join(home, "alias");
+    mkdirSync(canonical);
+    mkdirSync(alias);
+    const oldId = resolveProjectIdentity(canonical).id;
+    addProjectAlias(alias, { canonical });
+    const sidecar = eventsDbPath(alias);
+    const events = new EventsDb(sidecar);
+    for (let index = 0; index < 501; index++) {
+      events.insertEvent(`session-${index}`, {
+        type: "decision", category: "decision", data: `alias event ${index}`, priority: 1,
+      }, "PostToolUse");
+    }
+    events.close();
+    let admissions = 0;
+    const context = {
+      withPublicationAdmission: <T>(operation: (token: object) => Promise<T> | T) => {
+        admissions++;
+        if (admissions === 6) {
+          expect(removeProjectAlias(alias, { canonical })).toMatchObject({ removed: true });
+        }
+        return withBackendPublicationConsumerLockAsync(home, operation);
+      },
+    };
+
+    await expect(drainEventsForCwd(makeConfig(), alias, sidecar, undefined, undefined, context))
+      .rejects.toBeInstanceOf(SidecarIdentityConflictError);
+    expect(admissions).toBeGreaterThanOrEqual(7);
+    const state = sidecarState(sidecar);
+    expect(state.events.filter(event => event.processed_at !== null)).toHaveLength(500);
+    expect(state.events.filter(event => event.processed_at === null)).toHaveLength(1);
+    const newId = hashProjectPath(normalizeProjectIdentityPath(alias));
+    expect(newId).not.toBe(oldId);
+    expect(existsSync(join(home, ".lcm", "projects", newId, "db.sqlite"))).toBe(false);
+    expectReleased(home);
+  }, 30_000);
+
+  it("keeps recovered-cwd parking unchanged when its binding changes before retained admission", async () => {
+    const home = mkdtempSync(join(tmpdir(), "lcm-promotion-recovered-transition-"));
+    roots.push(home);
+    vi.stubEnv("HOME", home);
+    mkdirSync(join(home, ".lcm"), { mode: 0o700 });
+    const canonical = join(home, "canonical");
+    const alias = join(home, "alias");
+    mkdirSync(canonical);
+    mkdirSync(alias);
+    resolveProjectIdentity(canonical);
+    addProjectAlias(alias, { canonical });
+    const sidecar = eventsDbPath(alias);
+    const events = new EventsDb(sidecar);
+    events.insertEvent("session", {
+      type: "decision", category: "decision", data: "parked alias decision", priority: 1,
+    }, "PostToolUse");
+    events.observeMissingCwd(0, 0, 3);
+    events.close();
+    const before = sidecarState(sidecar);
+
+    await expect(parkUnavailableCwdEvents(alias, sidecar, {
+      _beforeRecoveredAdmissionForTesting: () => {
+        expect(removeProjectAlias(alias, { canonical })).toMatchObject({ removed: true });
+      },
+    })).rejects.toBeInstanceOf(SidecarIdentityConflictError);
+    expect(sidecarState(sidecar)).toEqual(before);
+
+    addProjectAlias(alias, { canonical });
+    await expect(parkUnavailableCwdEvents(alias, sidecar)).resolves.toMatchObject({
+      message: "cwd recovered; cleared durable parking state",
+    });
+    expect(sidecarState(sidecar).missingCwd).toEqual([]);
+    expect(sidecarState(sidecar).events).toEqual(before.events);
+    expectReleased(home);
+  });
+
+  it("does not clear a parked sidecar when an existing cwd has an unauthenticated map owner", async () => {
+    const home = mkdtempSync(join(tmpdir(), "lcm-promotion-unauthenticated-map-"));
+    roots.push(home);
+    vi.stubEnv("HOME", home);
+    mkdirSync(join(home, ".lcm"), { mode: 0o700 });
+    const cwd = join(home, "project");
+    mkdirSync(cwd);
+    const sidecar = eventsDbPath(cwd);
+    const events = new EventsDb(sidecar);
+    events.insertEvent("session", {
+      type: "decision", category: "decision", data: "preserve parked decision", priority: 1,
+    }, "PostToolUse");
+    events.observeMissingCwd(0, 0, 3);
+    events.close();
+    const before = sidecarState(sidecar);
+    const bytes = readFileSync(sidecar);
+    const unauthorizedId = "f".repeat(64);
+    expect(unauthorizedId).not.toBe(hashProjectPath(cwd));
+    writeFileSync(projectMapPath(), JSON.stringify({
+      [unauthorizedId]: { canonical: cwd, aliases: [] },
+    }), { mode: 0o600 });
+    clearProjectMapCache();
+
+    expect(existingEventsDbPath(cwd)).toBe(sidecar);
+    await expect(parkUnavailableCwdEvents(cwd, sidecar))
+      .rejects.toBeInstanceOf(SidecarIdentityConflictError);
+    expect(sidecarState(sidecar)).toEqual(before);
+    expect(readFileSync(sidecar)).toEqual(bytes);
+    expectReleased(home);
+  });
+
+  it("preserves a deleted worktree's old sidecar when its cwd is reused, then recovers it", async () => {
+    const home = mkdtempSync(join(tmpdir(), "lcm-promotion-reused-cwd-"));
+    roots.push(home);
+    vi.stubEnv("HOME", home);
+    mkdirSync(join(home, ".lcm"), { mode: 0o700 });
+    const primary = join(home, "primary");
+    const linked = join(home, "linked");
+    const admin = join(primary, ".git", "worktrees", "linked");
+    mkdirSync(join(primary, ".git", "objects"), { recursive: true });
+    mkdirSync(admin, { recursive: true });
+    mkdirSync(linked);
+    writeFileSync(join(primary, ".git", "HEAD"), "ref: refs/heads/main\n");
+    writeFileSync(join(primary, ".git", "config"), "[core]\nrepositoryformatversion = 0\n");
+    writeFileSync(join(admin, "HEAD"), "ref: refs/heads/linked\n");
+    writeFileSync(join(admin, "commondir"), "../..\n");
+    writeFileSync(join(linked, ".git"), `gitdir: ${admin}\n`);
+    writeFileSync(join(admin, "gitdir"), `${join(linked, ".git")}\n`);
+
+    const oldSidecar = eventsDbPath(linked);
+    const oldEvents = new EventsDb(oldSidecar);
+    oldEvents.insertEvent("old", { type: "decision", category: "decision", data: "old worktree decision", priority: 1 }, "PostToolUse");
+    oldEvents.close();
+    const evidencePath = join(eventsDir(), `${hashProjectPath(linked)}.identity.json`);
+    const evidenceBefore = readFileSync(evidencePath);
+    rmSync(linked, { recursive: true, force: true });
+    mkdirSync(linked);
+    const newId = hashProjectPath(normalizeProjectIdentityPath(linked));
+    const newSidecar = join(eventsDir(), `${newId}.db`);
+    const newEvents = new EventsDb(newSidecar);
+    newEvents.insertEvent("new", { type: "decision", category: "decision", data: "new project decision", priority: 1 }, "PostToolUse");
+    newEvents.close();
+    const oldBefore = sidecarState(oldSidecar);
+    const newBefore = sidecarState(newSidecar);
+
+    await expect(promoteEventsForCwd(makeConfig(), linked)).rejects.toBeInstanceOf(SidecarIdentityConflictError);
+    await expect(drainEventsForCwd(makeConfig(), linked, oldSidecar)).rejects.toBeInstanceOf(SidecarIdentityConflictError);
+    await expect(parkUnavailableCwdEvents(linked, oldSidecar)).rejects.toBeInstanceOf(SidecarIdentityConflictError);
+    expect(sidecarState(oldSidecar)).toEqual(oldBefore);
+    expect(sidecarState(newSidecar)).toEqual(newBefore);
+    expect(readFileSync(evidencePath)).toEqual(evidenceBefore);
+    expect(existsSync(projectMapPath())).toBe(false);
+    expect(existsSync(join(home, ".lcm", "projects", newId, "db.sqlite"))).toBe(false);
+
+    rmSync(linked, { recursive: true, force: true });
+    await expect(parkUnavailableCwdEvents(linked, oldSidecar)).resolves.toMatchObject({
+      deferred: { reason: "unavailable-cwd" },
+    });
+    mkdirSync(linked);
+    writeFileSync(join(linked, ".git"), `gitdir: ${admin}\n`);
+    await expect(parkUnavailableCwdEvents(linked, oldSidecar)).resolves.toMatchObject({
+      message: "cwd recovered; cleared durable parking state",
+    });
+    expect(sidecarState(oldSidecar).missingCwd).toEqual([]);
+    expect(sidecarState(oldSidecar).events).toEqual(oldBefore.events);
+  });
+
+  it("scans a stale old-schema worktree sidecar without repairing it before global refusal", async () => {
+    const home = mkdtempSync(join(tmpdir(), "lcm-promotion-all-stale-schema-"));
+    roots.push(home);
+    vi.stubEnv("HOME", home);
+    mkdirSync(join(home, ".lcm"), { mode: 0o700 });
+    const primary = join(home, "primary");
+    const linked = join(home, "linked");
+    const admin = join(primary, ".git", "worktrees", "linked");
+    mkdirSync(join(primary, ".git", "objects"), { recursive: true });
+    mkdirSync(admin, { recursive: true });
+    mkdirSync(linked);
+    writeFileSync(join(primary, ".git", "HEAD"), "ref: refs/heads/main\n");
+    writeFileSync(join(primary, ".git", "config"), "[core]\nrepositoryformatversion = 0\n");
+    writeFileSync(join(admin, "HEAD"), "ref: refs/heads/linked\n");
+    writeFileSync(join(admin, "commondir"), "../..\n");
+    writeFileSync(join(linked, ".git"), `gitdir: ${admin}\n`);
+    writeFileSync(join(admin, "gitdir"), `${join(linked, ".git")}\n`);
+    const oldId = hashProjectPath(normalizeProjectIdentityPath(primary));
+    const oldSidecar = eventsDbPath(linked);
+    const oldEvents = new EventsDb(oldSidecar);
+    oldEvents.insertEvent("old", {
+      type: "decision", category: "decision", data: "old worktree decision", priority: 1,
+    }, "PostToolUse");
+    oldEvents.close();
+
+    rmSync(linked, { recursive: true, force: true });
+    mkdirSync(linked);
+    expect(resolveProjectIdentity(linked).id).not.toBe(oldId);
+    const oldProject = join(home, ".lcm", "projects", oldId);
+    mkdirSync(oldProject, { recursive: true, mode: 0o700 });
+    writeFileSync(join(oldProject, "meta.json"), JSON.stringify({ cwd: linked }), { mode: 0o600 });
+    const legacy = new DatabaseSync(oldSidecar);
+    legacy.exec("DROP TABLE missing_cwd_state");
+    legacy.prepare("UPDATE schema_version SET version = 4").run();
+    legacy.close();
+    const bytesBefore = readFileSync(oldSidecar);
+
+    let responseBody = "";
+    const response = {
+      writeHead: vi.fn().mockReturnThis(),
+      end: vi.fn((body: string) => { responseBody = body; }),
+    } as unknown as ServerResponse;
+    await createPromoteAllEventsHandler(makeConfig())({} as IncomingMessage, response, "");
+    const result = JSON.parse(responseBody) as {
+      failedProjects: number;
+      projects: Array<{ message?: string }>;
+    };
+    expect(result.failedProjects).toBe(1);
+    expect(result.projects[0]?.message).toBe("sidecar identity does not match the current project");
+    expect(readFileSync(oldSidecar)).toEqual(bytesBefore);
+    const retained = new DatabaseSync(oldSidecar, { readOnly: true });
+    expect(retained.prepare("SELECT version FROM schema_version").get()).toEqual({ version: 4 });
+    expect(retained.prepare("SELECT name FROM sqlite_master WHERE name = 'missing_cwd_state'").get())
+      .toBeUndefined();
+    expect(retained.prepare("SELECT COUNT(*) AS pending FROM events WHERE processed_at IS NULL").get())
+      .toEqual({ pending: 1 });
+    retained.close();
+    expectReleased(home);
+  });
+
   it.each([
     { name: "promotion", promote: promoteEventsForCwd, epoch: false },
     { name: "promotion", promote: promoteEventsForCwd, epoch: true },
@@ -222,7 +504,7 @@ describe("canonical promotion publication admission", () => {
       { withPublicationAdmission },
     )).resolves.toMatchObject({ deferred: { observations: 1 } });
 
-    expect(withPublicationAdmission).toHaveBeenCalledOnce();
+    expect(withPublicationAdmission).toHaveBeenCalledTimes(2);
     expect(sidecarState(f.sidecar).missingCwd).toMatchObject([{ observations: 1 }]);
     expectReleased(f.home);
   });

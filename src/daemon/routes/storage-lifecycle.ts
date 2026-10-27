@@ -65,6 +65,11 @@ export type ProjectStorageRequest = Readonly<{
   readonly context?: RouteExecutionContext;
   readonly mode: "create" | "existing";
   readonly expectedIdentity?: StorageIdentityContext & { readonly localProjectId: string };
+  /** Check source provenance before the destination is opened under this admission. */
+  readonly beforeOpen?: (
+    identity: StorageIdentityContext & { readonly localProjectId: string },
+    publicationLockToken?: BackendPublicationLockToken,
+  ) => Promise<void> | void;
   /** Optional non-revocable work that must settle before storage closes. */
   readonly beforeClose?: () => Promise<void>;
 }>;
@@ -272,6 +277,9 @@ export async function withProjectStorage<T>(
           "project storage identity changed during publication admission",
         );
       }
+      if (request.beforeOpen !== undefined) {
+        await request.beforeOpen(identity, publicationLockToken);
+      }
       state.openPending = true;
       try {
         project = request.mode === "existing"
@@ -329,6 +337,9 @@ export async function withProjectStorage<T>(
           "unexpected-state",
           "project storage identity changed during publication admission",
         );
+      }
+      if (request.beforeOpen !== undefined) {
+        await request.beforeOpen(identity, publicationLockToken);
       }
       openStage = true;
       state.openPending = true;

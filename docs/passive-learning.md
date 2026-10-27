@@ -178,6 +178,29 @@ promotion retries the pending events on a later run. An `lcm events promote
 the blocked response has no aggregate counts, and later sidecars remain
 available for the next retry.
 
+Before opening a sidecar or clearing its missing-directory state, promotion
+checks that the sidecar belongs to the currently admitted project. It repeats
+that check against the destination identity before opening project storage and
+for each drain batch. If a deleted worktree path is reused by another project,
+the old sidecar stays unchanged. Direct promotion returns `409` with
+`status: "blocked"` and a sidecar identity message; `--all` reports that
+sidecar as a failed project and continues scanning. Restore the original
+worktree binding to recover its pending events, or resolve the old sidecar
+separately before promoting the new project at the reused path. A recovered
+directory clears durable parking only after the same identity check succeeds.
+An older exact-cwd sidecar without identity evidence can resume at an ordinary
+mapless path; a linked worktree whose Git anchor differs from that sidecar ID
+needs its original project binding restored before promotion.
+
+`--all` discovers sidecars with a read-only scan, so discovery does not repair
+or migrate an older sidecar before checking its project identity. If the
+diagnostic reader cannot query an older schema, `--all` reports that sidecar
+as a failed scan and leaves it unchanged for recovery under its original
+project binding. The `--all` command also leaves orphan sidecars in place
+instead of pruning them during discovery.
+The read-only scan may use its full 30-second discovery budget; each individual
+SQLite diagnostic read still has a two-second limit.
+
 Promotion through `lcm events promote` (and `--all`) needs the backend
 publication lock briefly. If another process, such as a hook, holds the lock,
 the daemon waits up to about 3 seconds for it to be released and then
