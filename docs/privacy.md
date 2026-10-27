@@ -172,10 +172,11 @@ would skip; it re-fences and archives that source, preserving its original
 bytes in the private backup. If the completion marker is missing when the
 target transaction checks it, LCM rechecks the normalized source and fails closed
 instead of relying on the earlier marker observation. This does not audit or
-repair canonical content written by an older LCM version. If that target
-contains a known truncated legacy value, the script above can diagnose
-unsupported rows but cannot repair the canonical target. This refusal
-behavior is implemented by [#1173](https://github.com/donadiosolutions/lcm/issues/1173).
+repair canonical content written by an older LCM version. The ID-only
+diagnostic above reports non-`TEXT` or still-NUL rows; it cannot detect a value
+already truncated into otherwise valid SQLite `TEXT`. Empty output does not
+clear a known truncation, and this guide offers no canonical-target repair.
+This refusal behavior is implemented by [#1173](https://github.com/donadiosolutions/lcm/issues/1173).
 
 That marker recheck has a rare third outcome. LCM commits the source write
 fence before the target transaction begins, so when the marker is present at
