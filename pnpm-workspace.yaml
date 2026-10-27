@@ -2,7 +2,7 @@ packages:
   - '.'
 
 overrides:
-  ajv>fast-uri: 3.1.7
+  ajv>fast-uri: 3.1.9
   magicast>source-map-js: 1.2.2
   qs: 6.16.0
   read-yaml-file: 2.1.0
