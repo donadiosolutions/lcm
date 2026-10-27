@@ -541,6 +541,12 @@ daemon drives replication, not these commands. CLI/import-export remains
 observed local outbox counts alongside selected-backend readiness through the
 [shared diagnostic snapshot](cli.md#observational-diagnostics).
 
+Text errors from `status`, `validate`, `quarantine`, and `replay` use a fixed
+failure line without the underlying cause. A busy `events promote` request
+uses a fixed retry hint. Rerun with `--json` for the original structured
+`error` message, and escape that value before displaying it in a terminal or
+log.
+
 ### Learned Insights
 
 On SessionStart, recently promoted passive insights are surfaced in a `<learned-insights>` block. This closes the feedback loop — the system learns from your sessions and applies those learnings in future ones.
