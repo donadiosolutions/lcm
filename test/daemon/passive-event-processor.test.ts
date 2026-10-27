@@ -1425,10 +1425,42 @@ describe("PassiveEventProcessor replication follow-up (#1764)", () => {
     expect(h.replicatePassiveEvents).toHaveBeenCalledTimes(1);
   });
 
-  it("logs a follow-up that fails outside the per-project handling", async () => {
+  it("keeps replicating when logging a failed project rejects, and arms no follow-up for it", async () => {
     const failure = new Error("replicate failed");
+    const results: Record<string, unknown[]> = {
+      [A.path]: [saturated(), failure],
+      [B.path]: [saturated(), saturated(), outcome({ applied: 1 })],
+    };
+    const safeLogError = vi.fn().mockImplementation(async () => {
+      throw new Error("log failed");
+    });
+    const h = harness([A, B], async (_cwd, _signal, path) => {
+      const value = results[path]?.shift();
+      if (value instanceof Error) throw value;
+      return value;
+    }, { safeLogError });
+    await h.processor.runSweep();
+    expect(h.live(BACKLOG_DELAY)).toHaveLength(1);
+
+    // A fails and its logger rejects; B in the same pass is still replicated.
+    await h.fire(BACKLOG_DELAY);
+    expect(calledPaths(h.replicatePassiveEvents)).toEqual([A.path, B.path, A.path, B.path]);
+    expect(safeLogError).toHaveBeenCalledTimes(1);
+    expect(safeLogError).toHaveBeenCalledWith("passive-event-processor", failure, { cwd: A.cwd });
+
+    // Only B stays in the follow-up set.
+    await h.fire(BACKLOG_DELAY);
+    expect(calledPaths(h.replicatePassiveEvents).slice(4)).toEqual([B.path]);
+    h.processor.stop();
+  });
+
+  it("logs a follow-up that fails outside the per-project handling", async () => {
+    const mismatch = new BackendPublicationJournalError(
+      "backend-mismatch",
+      "daemon request backend differs from the authenticated startup backend",
+    );
     const logFailure = new Error("log failed");
-    const results: unknown[] = [saturated(), failure];
+    const results: unknown[] = [saturated(), mismatch];
     const safeLogError = vi.fn().mockRejectedValueOnce(logFailure).mockResolvedValue(undefined);
     const h = harness([A], async () => {
       const value = results.shift();
@@ -1439,7 +1471,7 @@ describe("PassiveEventProcessor replication follow-up (#1764)", () => {
 
     await h.fire(BACKLOG_DELAY);
 
-    expect(safeLogError).toHaveBeenNthCalledWith(1, "passive-event-processor", failure, { cwd: A.cwd });
+    expect(safeLogError).toHaveBeenNthCalledWith(1, "passive-event-processor", mismatch, {});
     expect(safeLogError).toHaveBeenNthCalledWith(2, "passive-event-processor", logFailure, {});
     h.processor.stop();
   });

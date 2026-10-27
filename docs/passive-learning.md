@@ -342,9 +342,8 @@ replicate only those projects and repeat until a pass is no longer saturated or
 makes no such progress; a pass without that progress waits for the next sweep.
 A follow-up yields to local promotion: queued promotion work gets one short
 window to run first, after which replication proceeds even if promotion keeps
-retrying. While one machine drains a large backlog it holds the project drain
-lease most of the time, so other machines' local uploads for that project wait
-until it has drained.
+retrying. The drain lease is held per machine and released after every pass,
+so a machine draining a large backlog does not delay other machines' uploads.
 
 A pass only runs for a project when all of the following hold:
 

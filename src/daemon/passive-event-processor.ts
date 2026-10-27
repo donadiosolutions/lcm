@@ -344,8 +344,12 @@ export class PassiveEventProcessor {
           await this.haltForBackendMismatch(error);
           return;
         }
-        await this.logError("passive-event-processor", error, { cwd });
         this.replicationBacklog.delete(sidecar.path);
+        try {
+          await this.logError("passive-event-processor", error, { cwd });
+        } catch {
+          // A failing logger must not stop replication of the later projects.
+        }
         continue;
       }
       if (result === null) {
