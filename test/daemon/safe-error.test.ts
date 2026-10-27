@@ -4400,10 +4400,11 @@ describe("sanitizeError", () => {
       ["nested exact file URL inside the bracket", "[file:///Users/NEST/x?key=/Users/SECOND/s]", "?key=<path>]"],
       ["nested exact file URL after a bridge", "[https://host]:x[file:///Users/NEST/x]", ""],
       ["public URL with a plain query", "([https://other/public/path?key=plain]", "?key=plain]"],
+      ["delimiter at the end of input", "([https://other?", "?"],
       ["root-only separator run", "([https://other?key=//]", "?key=//]"],
       ["delimiter without a path word", "([https://other?key=/]", "?key=/]"],
       // The scan stopped at the query of a component, so the tail does not own what follows it.
-      ["bridge after a query-bearing component", "[https://host?q=1]:x[https://other?key=/after/scan]", "?q=1]:x[https://other?key=/after/scan]"],
+      ["bridge after a query-bearing component", "[https://host?q=1]:x[https://other?key=/Users/SECOND/s]", "?q=1]:x[https://other?key=/Users/SECOND/s]"],
       // An unmatched close ends the tail.
       ["unmatched close", "[https://host]]:x[https://other?key=/after/close]", "]:x[https://other?key=/after/close]"],
       ["unmatched close before a component", "[https://a?key=/Users/SECOND/s]][https://other?key=/after/close]", "?key=<path>]][https://other?key=/after/close]"],
@@ -4440,8 +4441,22 @@ describe("sanitizeError", () => {
       ),
     );
 
+    const driveValues: Array<readonly [string, string, string]> = ["C:/Users/SECOND/s", "c:/Users/SECOND/s", "D:/home/SECOND/s", "Z:/root/SECOND/s"].flatMap(
+      (value) =>
+        queries.flatMap(([queryName, query, expectedQuery]) =>
+          ["", "(", "[https://host]:x"].map(
+            (lead) =>
+              [
+                "forward-slash drive " + value + " after " + queryName + (lead === "" ? "" : " behind " + lead),
+                lead + "[https://other" + query + value + "]",
+                expectedQuery + "<path>]",
+              ] as const,
+          ),
+        ),
+    );
+
     describe.each(origins)("%s", (_origin, prefix, expectedPrefix, closing) => {
-      it.each([...tails, ...values])("%s", (_name, tail, expectedTail) => {
+      it.each([...tails, ...values, ...driveValues])("%s", (_name, tail, expectedTail) => {
         const first = sanitizeError(prefix + tail + closing);
 
         expect(first).toBe(expectedPrefix + expectedTail + closing);
@@ -4461,6 +4476,57 @@ describe("sanitizeError", () => {
         expect(sanitizeError(first)).toBe(first);
         expect(sanitizeError(sanitizeError(first))).toBe(first);
       });
+    });
+
+    describe.each(inheritedQuoteTails)("%s", (_origin, prefix, expectedPrefix, closing) => {
+      it.each(["&", "|"])("redacts a private-root relative value after %s inside the owned bracket", (delimiter) => {
+        for (const [value, expectedValue] of [
+          ["later/Users/SECOND/s", "later<path>"],
+          ["Users/SECOND/s", "Users<path>"],
+          ["later/home/SECOND/s", "later<path>"],
+          ["later/root/SECOND/s", "later<path>"],
+          ["a/b/Users/SECOND/s", "a<path>"],
+          ["later//Users//SECOND/s", "later<path>"],
+        ] as const) {
+          const first = sanitizeError(prefix + "([https://other?a=1" + delimiter + value + "]" + closing);
+
+          expect(first).toBe(expectedPrefix + "?a=1" + delimiter + expectedValue + "]" + closing);
+          expect(sanitizeError(first)).toBe(first);
+          expect(sanitizeError(sanitizeError(first))).toBe(first);
+        }
+      });
+
+      it.each(["&", "|"])("keeps ordinary, incomplete, and public values after %s readable", (delimiter) => {
+        for (const value of [
+          "later/data/SECOND/s",
+          "later/Users",
+          "later/Users/",
+          "https://p.test/x",
+          "plain",
+        ]) {
+          const first = sanitizeError(prefix + "([https://other?a=1" + delimiter + value + "]" + closing);
+
+          expect(first).toBe(expectedPrefix + "?a=1" + delimiter + value + "]" + closing);
+          expect(sanitizeError(first)).toBe(first);
+          expect(sanitizeError(sanitizeError(first))).toBe(first);
+        }
+      });
+    });
+
+    it.each(["&", "|"])("keeps a post-close private-root relative value after %s readable", (delimiter) => {
+      const input = postCloseTail[1] + "([https://other?a=1" + delimiter + "later/Users/SECOND/s]";
+      const first = sanitizeError(input);
+
+      expect(first).toBe(postCloseTail[2] + "?a=1" + delimiter + "later/Users/SECOND/s]");
+      expect(sanitizeError(first)).toBe(first);
+      expect(sanitizeError(sanitizeError(first))).toBe(first);
+    });
+
+    it.each(["C:/Users/S/s", "c:/home/S/s"])("keeps a standalone public URL drive value %s unchanged", (value) => {
+      const input = "[https://other?key=" + value + "]";
+
+      expect(sanitizeError(input)).toBe(input);
+      expect(sanitizeError(sanitizeError(input))).toBe(input);
     });
 
     it.each([

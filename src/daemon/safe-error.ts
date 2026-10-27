@@ -147,10 +147,12 @@ function findUrlPathStarts(chars: readonly string[]): UrlPathStarts {
     trackingStart: number,
     fileUrl: boolean,
     forced: boolean,
+    inheritedQuote: boolean,
   ): void => {
     postCloseFilePathActive = true;
     postCloseFilePathBracketDepth = 0;
     postCloseFilePathTrackingStart = trackingStart;
+    postCloseFilePathInheritedQuote = inheritedQuote;
     postCloseFilePathTailEnd = measurePrivateSpanEnd(start, fileUrl, forced);
   };
   const skipSeparatorRun = (start: number): number => {
@@ -158,6 +160,8 @@ function findUrlPathStarts(chars: readonly string[]): UrlPathStarts {
     while (chars[cursor] === "/" || chars[cursor] === "\\") cursor += 1;
     return cursor;
   };
+  const isForwardSlashDrivePathStart = (start: number): boolean =>
+    /^[A-Za-z]$/u.test(chars[start] ?? "") && chars[start + 1] === ":" && chars[start + 2] === "/";
   const returnedParentPrivateRootPathStart = (start: number): number => {
     if (!isPathWord(chars[start])) return -1;
     let cursor = start;
@@ -199,6 +203,7 @@ function findUrlPathStarts(chars: readonly string[]): UrlPathStarts {
   let postCloseFilePathBracketDepth = 0;
   let postCloseFilePathTrackingStart = 0;
   let postCloseFilePathTailEnd = -1;
+  let postCloseFilePathInheritedQuote = false;
   let inheritedFileQuoteParentOwnerBracketDepth = 0;
   let inheritedFileQuoteEnd = -1;
   let cachedEnclosingQuote = 0;
@@ -273,10 +278,10 @@ function findUrlPathStarts(chars: readonly string[]): UrlPathStarts {
         isWindowsDrivePathStart(chars, successorStart)
       ) {
         forcedPath[successorStart] = 1;
-        armBracketTail(successorStart, successorStart, false, true);
+        armBracketTail(successorStart, successorStart, false, true, true);
       } else if (privateRootPathStart >= 0) {
         forcedPath[privateRootPathStart] = 1;
-        armBracketTail(privateRootPathStart, successorStart, false, true);
+        armBracketTail(privateRootPathStart, successorStart, false, true, true);
       }
       inheritedFileQuoteParentOwnerBracketDepth = 0;
       inheritedFileQuoteEnd = -1;
@@ -341,7 +346,7 @@ function findUrlPathStarts(chars: readonly string[]): UrlPathStarts {
           fileTailBracketDepth = 0;
           pendingFileTailBackslash = false;
           pendingNestedUrlContinuation = false;
-          armBracketTail(index, index + 1, true, false);
+          armBracketTail(index, index + 1, true, false, false);
           continue;
         }
       } else {
@@ -357,6 +362,14 @@ function findUrlPathStarts(chars: readonly string[]): UrlPathStarts {
       }
     }
     if (postCloseFilePathActive && index >= postCloseFilePathTrackingStart) {
+      // An inherited-quote tail also owns a private-root relative value after
+      // an ampersand or pipe, which its owner redacts on the next pass.
+      const relativeRootStart =
+        postCloseFilePathInheritedQuote &&
+        postCloseFilePathBracketDepth > 0 &&
+        (char === "&" || char === "|")
+          ? returnedParentPrivateRootPathStart(index + 1)
+          : -1;
       if (char === "[") {
         postCloseFilePathBracketDepth += 1;
       } else if (char === "]" && postCloseFilePathBracketDepth > 0) {
@@ -376,10 +389,13 @@ function findUrlPathStarts(chars: readonly string[]): UrlPathStarts {
       } else if (
         postCloseFilePathBracketDepth > 0 &&
         (char === "=" || char === "&" || char === "#" || char === "?") &&
-        (chars[index + 1] === "/" || chars[index + 1] === "\\") &&
-        isPathWord(chars[skipSeparatorRun(index + 1)])
+        (((chars[index + 1] === "/" || chars[index + 1] === "\\") &&
+          isPathWord(chars[skipSeparatorRun(index + 1)])) ||
+          isForwardSlashDrivePathStart(index + 1))
       ) {
         forcedPath[index + 1] = 1;
+      } else if (relativeRootStart >= 0) {
+        forcedPath[relativeRootStart] = 1;
       } else if (
         postCloseFilePathBracketDepth === 0 &&
         index >= postCloseFilePathTailEnd &&
