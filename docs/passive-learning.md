@@ -308,7 +308,7 @@ outcome (a batch that only schedules retries or only fails without a counter),
 when the drain lease is lost, or when a publication admission is refused. A
 mixed batch with any applied or quarantined row continues. Other ready work,
 such as another machine, a new arrival, or a retry timer, may be claimed by a
-later fetch of the same pass but is not guaranteed; it waits for the next sweep
+later fetch of the same pass but is not guaranteed; it waits for a later pass
 once the pass stops making progress. "Up to the batch size" thus means ready
 work the pass actually settles, not a guarantee about peers.
 
@@ -338,6 +338,18 @@ minutes, and covers one project per scanned sidecar. The lease owner is the
 daemon instance id, so fencing follows daemon lifetime and a restarted daemon
 cannot reuse its predecessor's lease. Batch size, lease TTL, retry backoff and
 quarantine thresholds keep their built-in values and are not configurable.
+
+Every pass stays bounded by the batch size. A project whose pass ended
+saturated, meaning at least one of its capped reads returned a full batch, and
+that settled rows for good (uploaded, applied, acknowledged, quarantined or
+pruned; rows only scheduled for retry do not count), gets a follow-up pass
+about one second later instead of waiting for the next sweep. Follow-ups
+replicate only those projects and repeat until a pass is no longer saturated or
+makes no such progress; a pass without that progress waits for the next sweep.
+A follow-up yields to local promotion: queued promotion work gets one short
+window to run first, after which replication proceeds even if promotion keeps
+retrying. The drain lease is held per machine and released after every pass,
+so a machine draining a large backlog does not delay other machines' uploads.
 
 A pass only runs for a project when all of the following hold:
 
@@ -399,7 +411,7 @@ for the rest of the pass, so rows it uploaded there are not abandoned
 mid-pass; that includes the further claims of events the old project already
 holds, while new local uploads and the withdrawal of copies from other
 projects stay withheld. Rows the pass did not upload stay pending locally and
-upload to the new binding on the next sweep. A pass run without a publication
+upload to the new binding on the next pass. A pass run without a publication
 admission checks the binding too, but without the admission's lock, so that
 check is best effort.
 
@@ -504,7 +516,8 @@ is unavailable. A SQLite daemon reports `enabled: false` permanently, because
 replication is not something it can ever do. `passes` and `lastPassAt` are
 what separate a daemon that has never replicated from one that has: they stay
 at `0` and `null` until the first sweep and advance on every sweep afterwards,
-whether or not a project was admitted. `projects` counts the passes that
+whether or not a project was admitted. Follow-up passes advance them between
+sweeps too. `projects` counts the passes that
 returned a replication result: gate skips return nothing, and a project
 whose batch throws mid-way returns nothing either, so an enabled daemon
 with passes recorded and no projects is skipping or failing rather than
@@ -559,7 +572,7 @@ described above are intentionally not part of this configuration:
 
 When a pattern crosses the reinforcement threshold, `reinforcementBoost` is added to the base pattern confidence, capped by `maxConfidence`, only when bootstrapping a new promoted entry.
 
-`compaction.promotionThresholds.dedupBm25Threshold` is still accepted for compatibility but no longer causes different text to merge; only exactly the same text is deduplicated.
+Only exactly the same text is deduplicated. The former `compaction.promotionThresholds.dedupBm25Threshold` setting is deprecated and ignored: it is not renamed, and `lcm config get` and `lcm config set` reject it. A `config.json` that still contains it keeps loading, and `lcm doctor` warns when the stored value is not the old default of `15`. Removing the key is safe and changes no behavior; LCM does not rewrite `config.json` on load, so delete it by hand.
 
 ## Data Storage
 

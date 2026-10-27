@@ -2054,6 +2054,99 @@ test("redacts credentials before issue content enters model prompts", () => {
   }
 });
 
+test("preserves custom and Unicode URL credential masking with empty userinfo", () => {
+  const cases = [
+    {
+      label: "mixed-case custom scheme",
+      value: "CuStOm+SSL://user:ordinary-control@example.test/private",
+      sensitive: "ordinary-control",
+      preserved: "CuStOm+SSL://user:[REDACTED]@example.test/private",
+    },
+    {
+      label: "Unicode case-folded scheme",
+      value: "K://user:unicode-control@example.test/private",
+      sensitive: "unicode-control",
+      preserved: "K://user:[REDACTED]@example.test/private",
+    },
+    {
+      label: "empty userinfo",
+      value: "CuStOm+SSL://:empty-userinfo-control@example.test/private",
+      sensitive: "empty-userinfo-control",
+      preserved: "CuStOm+SSL://:[REDACTED]@example.test/private",
+    },
+  ];
+
+  for (const entry of cases) {
+    const redacted = redactPromptText(entry.value, 1_000);
+    assert.equal(redacted.includes(entry.sensitive), false, entry.label);
+    assert.equal(redacted.includes(entry.preserved), true, entry.label);
+  }
+});
+
+test("bounds URL credential scanning for long scheme-bearing prompt text", () => {
+  // Mutation caught: retrying a scheme prefix for every character before a late ://.
+  const adversarialText = `${"a".repeat(65_533)}://`;
+  const cases = [
+    {
+      label: "no-loss Bug intake",
+      maximum: Number.MAX_SAFE_INTEGER,
+      expectedLength: adversarialText.length,
+      expectedWork: adversarialText.length,
+      retainsSeparator: true,
+    },
+    {
+      label: "default truncation",
+      maximum: 8_000,
+      expectedLength: 8_000,
+      expectedWork: adversarialText.length + 8_000,
+      retainsSeparator: false,
+    },
+  ];
+
+  for (const entry of cases) {
+    let scannedCodeUnits = 0;
+    const redacted = redactPromptText(adversarialText, entry.maximum, {
+      onUrlCredentialCodeUnit() {
+        scannedCodeUnits += 1;
+      },
+    });
+    assert.equal(redacted.length, entry.expectedLength, entry.label);
+    assert.equal(redacted.endsWith("://"), entry.retainsSeparator, entry.label);
+    assert.equal(scannedCodeUnits, entry.expectedWork, entry.label);
+  }
+});
+
+test("redacts empty-userinfo credential fragments at the truncation tail", () => {
+  const cases = [
+    {
+      label: "ordinary username",
+      urlPrefix: " CuStOm+SSL://user:",
+      preservedSuffix: "CuStOm+SSL://user:",
+    },
+    {
+      label: "empty userinfo",
+      urlPrefix: " CuStOm+SSL://:",
+      preservedSuffix: "CuStOm+SSL://:",
+    },
+  ];
+
+  for (const entry of cases) {
+    const exposedCredential = "leak";
+    const prefix = "a".repeat(8_000 - entry.urlPrefix.length - exposedCredential.length);
+    const value = `${prefix}${entry.urlPrefix}${exposedCredential}x`;
+    let scannedCodeUnits = 0;
+    const redacted = redactPromptText(value, 8_000, {
+      onUrlCredentialCodeUnit() {
+        scannedCodeUnits += 1;
+      },
+    });
+
+    assert.equal(redacted.includes(exposedCredential), false, entry.label);
+    assert.equal(redacted.endsWith(entry.preservedSuffix), true, entry.label);
+    assert.equal(scannedCodeUnits, value.length + 8_000, entry.label);
+  }
+});
+
 test("parses and validates complete model output", () => {
   assert.deepEqual(
     parseAndValidateClassification(JSON.stringify(validResult), policy, [42]),

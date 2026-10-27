@@ -1845,3 +1845,45 @@ it("uses the authenticated configuration for global pattern counts", async () =>
   expect(results.find(row => row.name === "user-patterns")?.message).toContain("2 global");
   expect(JSON.stringify(results)).not.toContain("PATTERN_CANARY");
 });
+
+describe("runDoctor deprecated dedup threshold warning", () => {
+  async function deprecationResults(content: string | null) {
+    const results = await runDoctor(minimalDeps(doctorConfigSeams(content)));
+    return results.filter((result) => result.name === "config-deprecated");
+  }
+
+  it.each([0.5, 20, 0])("warns once in Stack when the stored threshold is %s", async (value) => {
+    const warnings = await deprecationResults(JSON.stringify({
+      compaction: { promotionThresholds: { dedupBm25Threshold: value } },
+    }));
+    expect(warnings).toEqual([{
+      name: "config-deprecated",
+      category: "Stack",
+      status: "warn",
+      message: expect.stringContaining(
+        "Fix: remove compaction.promotionThresholds.dedupBm25Threshold from config.json; it has no effect",
+      ),
+    }]);
+  });
+
+  it.each([
+    ["the former default", { compaction: { promotionThresholds: { dedupBm25Threshold: 15 } } }],
+    ["an empty config", {}],
+    ["no promotion thresholds", { compaction: { leafTokens: 1000 } }],
+    ["no stored threshold", { compaction: { promotionThresholds: { dedupCandidateLimit: 10 } } }],
+  ])("stays silent for %s", async (_label, config) => {
+    expect(await deprecationResults(JSON.stringify(config))).toEqual([]);
+  });
+
+  it("stays silent when config.json is absent", async () => {
+    expect(await deprecationResults(null)).toEqual([]);
+  });
+
+  it("stays silent when the configuration is invalid", async () => {
+    const results = await runDoctor(minimalDeps(doctorConfigSeams(JSON.stringify({
+      compaction: { promotionThresholds: { dedupBm25Threshold: "20" } },
+    }))));
+    expect(results.find((result) => result.name === "config")).toMatchObject({ status: "fail" });
+    expect(results.some((result) => result.name === "config-deprecated")).toBe(false);
+  });
+});

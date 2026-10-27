@@ -57,6 +57,9 @@ const CONFIG_PATH_ALIASES: ReadonlyMap<string, readonly string[]> = new Map([
     ["compaction", "promotionThresholds", "dedupCandidateLimit"],
   ],
 ]);
+const DEPRECATED_CONFIG_PATHS: ReadonlySet<string> = new Set([
+  "compaction.promotionThresholds.dedupBm25Threshold",
+]);
 
 export type ConfigValueOptions = {
   configPath: string;
@@ -95,6 +98,11 @@ export function parseConfigPath(path: string): string[] {
     if (DENIED_PATH_SEGMENTS.has(segment)) {
       throw new ConfigManagerError(`Configuration path contains forbidden segment ${JSON.stringify(segment)}.`);
     }
+  }
+  if (DEPRECATED_CONFIG_PATHS.has(path)) {
+    throw new ConfigManagerError(
+      `Configuration path ${JSON.stringify(path)} is deprecated and ignored; remove it from config.json.`,
+    );
   }
   const aliasedSegments = CONFIG_PATH_ALIASES.get(segments.join("."));
   return aliasedSegments === undefined ? segments : [...aliasedSegments];

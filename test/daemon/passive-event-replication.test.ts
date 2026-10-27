@@ -377,6 +377,7 @@ describe("PassiveEventReplicationWorker", () => {
       quarantined: 0,
       acknowledged: 1,
       pruned: 1,
+      backlog: false,
     });
     expect(local.claimDeliveries).toHaveBeenCalledWith({
       machineId: MACHINE_ID,
@@ -434,6 +435,7 @@ describe("PassiveEventReplicationWorker", () => {
       quarantined: 0,
       acknowledged: 0,
       pruned: 0,
+      backlog: false,
     });
     expect(local.claimDeliveries).not.toHaveBeenCalled();
     expect(remote.releaseDrainLease).not.toHaveBeenCalled();
@@ -2288,6 +2290,64 @@ describe("PassiveEventReplicationWorker", () => {
     await active;
     await stopping;
     expect(stopped).toBe(true);
+  });
+
+  describe("backlog signal (#1764)", () => {
+    const SECOND_ID = "22345678-1234-4abc-8def-123456789abc";
+
+    it("is false when no capped read returned a full batch", async () => {
+      const local = localRepository({
+        claimDeliveries: vi.fn().mockResolvedValue([localRow({ event_version: 999 })]),
+        listAwaitingRemote: vi.fn().mockResolvedValue([localRow({ delivery_state: "replicated" })]),
+        listAcknowledgedForRemotePrune: vi.fn().mockResolvedValue([
+          localRow({ delivery_state: "acknowledged", remote_inbox_id: "41" }),
+        ]),
+      });
+      const remote = remoteRepository({ pruneApplied: vi.fn().mockResolvedValue(1n) });
+
+      await expect(worker(local, remote, {}, { batchSize: 2 }).runOnce())
+        .resolves.toMatchObject({ leaseAcquired: true, backlog: false });
+    });
+
+    it("is true when the local delivery claim returns a full batch", async () => {
+      const local = localRepository({
+        claimDeliveries: vi.fn().mockResolvedValue([
+          localRow({ event_version: 999 }),
+          localRow({ event_uuid: SECOND_ID, event_version: 999 }),
+        ]),
+      });
+
+      await expect(worker(local, remoteRepository(), {}, { batchSize: 2 }).runOnce())
+        .resolves.toMatchObject({ quarantined: 2, backlog: true });
+    });
+
+    it("is true when the remote claim loop ends on its spent budget", async () => {
+      const inbox = statefulInbox(inboxRows(MACHINE_ID, 3));
+
+      await expect(worker(localRepository(), inboxRemote(inbox), {}, { batchSize: 2 }).runOnce())
+        .resolves.toMatchObject({ applied: 2, backlog: true });
+    });
+
+    it("is true when reconciliation reads a full batch of awaiting rows", async () => {
+      const local = localRepository({
+        listAwaitingRemote: vi.fn().mockResolvedValue([localRow({ delivery_state: "replicated" })]),
+      });
+
+      await expect(worker(local, remoteRepository(), {}, { batchSize: 1 }).runOnce())
+        .resolves.toMatchObject({ backlog: true });
+    });
+
+    it("is true when pruning reads a full batch of acknowledged rows", async () => {
+      const local = localRepository({
+        listAcknowledgedForRemotePrune: vi.fn().mockResolvedValue([
+          localRow({ delivery_state: "acknowledged", remote_inbox_id: "41" }),
+        ]),
+      });
+      const remote = remoteRepository({ pruneApplied: vi.fn().mockResolvedValue(1n) });
+
+      await expect(worker(local, remote, {}, { batchSize: 1 }).runOnce())
+        .resolves.toMatchObject({ pruned: 1, backlog: true });
+    });
   });
 
   it("keeps the public defaults stable for operator documentation", () => {

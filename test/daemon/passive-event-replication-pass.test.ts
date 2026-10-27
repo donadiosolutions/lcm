@@ -130,6 +130,7 @@ const summary = {
   quarantined: 0,
   acknowledged: 2,
   pruned: 1,
+  backlog: false,
 };
 
 describe("passive-event replication pass", () => {
