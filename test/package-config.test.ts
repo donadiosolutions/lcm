@@ -140,7 +140,14 @@ describe("package.json", () => {
     try {
       const packed = JSON.parse(execFileSync("npm", ["pack", "--json", "--ignore-scripts", "--pack-destination", scratch], {
         cwd: repositoryRoot, encoding: "utf8", timeout: PACKAGE_COMMAND_TIMEOUT_MS,
-      })) as Array<{ filename: string }>;
+      })) as Array<{ filename: string; files?: Array<{ path?: unknown }> }>;
+      const trackedDocs = execFileSync("git", ["ls-files", "--", "docs"], {
+        cwd: repositoryRoot, encoding: "utf8", timeout: PACKAGE_COMMAND_TIMEOUT_MS,
+      }).trim().split("\n");
+      const packedDocs = (packed[0].files ?? []).flatMap((entry) =>
+        typeof entry.path === "string" && entry.path.startsWith("docs/") ? [entry.path] : [],
+      ).sort();
+      expect(packedDocs).toEqual(trackedDocs);
       writeFileSync(join(scratch, "package.json"), JSON.stringify({ name: "portable-consumer", version: "1.0.0", private: true }));
       stagePortableArtifact(join(scratch, packed[0].filename), scratch);
       verifyPortablePackage(scratch);
