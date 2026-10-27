@@ -13,14 +13,14 @@ describe("certification evidence", () => {
       evidenceDirectory: directory,
       contractSha256: "a".repeat(64),
       contractStatus: "approved",
-      approval: { contractSha256: "a".repeat(64), approvedAt: "2026-10-26T10:00:00.000Z", approvalRef: "issue-629", approvedBy: "maintainer" },
+      approval: { contractSha256: "a".repeat(64), approvedAt: "2026-10-26T10:00:00.000Z", note: "recorded", approvalRef: "issue-629", approvedBy: "maintainer" },
       startedAt: "2026-10-26T10:01:00.000Z",
       lane: "local",
       profile: "full",
       provenance: {
         testedCommit: "d".repeat(40), dirty: false, testedInputsSha256: "e".repeat(64),
         testedInputsCount: 100, lockfileSha256: "f".repeat(64), cliSha256: "1".repeat(64),
-        stagedPackageSha256: "2".repeat(64), contractSha256: "a".repeat(64), node: process.version,
+        stagedPackageSha256: "2".repeat(64), contractSha256: "a".repeat(64), approvalSha256: "5".repeat(64), node: process.version,
       },
       machines: [
         { name: "a", machineId: "018f0000-0000-7000-8000-000000000001", identityKeySha256: "b".repeat(64) },

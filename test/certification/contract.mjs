@@ -13,8 +13,9 @@ function approvalPathFor(contractPath) {
 }
 
 function loadApproval(path, contractSha256) {
-  const approval = JSON.parse(readFileSync(path, "utf8"));
-  for (const field of ["contractSha256", "approvedBy", "approvedAt", "approvalRef"]) {
+  const bytes = readFileSync(path);
+  const approval = JSON.parse(bytes.toString("utf8"));
+  for (const field of ["contractSha256", "approvedBy", "approvedAt", "note", "approvalRef"]) {
     if (typeof approval?.[field] !== "string" || approval[field].length === 0) {
       throw new Error(`certification approval record is missing ${field}`);
     }
@@ -26,7 +27,7 @@ function loadApproval(path, contractSha256) {
   if (!Number.isFinite(Date.parse(approval.approvedAt))) {
     throw new Error("certification approval record has an invalid approvedAt");
   }
-  return approval;
+  return { approval, sha256: createHash("sha256").update(bytes).digest("hex") };
 }
 function positiveInteger(value, name) {
   if (!Number.isSafeInteger(value) || value <= 0) throw new Error(`invalid certification contract ${name}`);
@@ -148,9 +149,15 @@ export function loadCertificationContract(path, options = {}) {
   const approvalPath = options.approvalPath === undefined
     ? approvalPathFor(contractPath)
     : pathOf(options.approvalPath);
-  const approval = existsSync(approvalPath) ? loadApproval(approvalPath, sha256) : undefined;
-  if (options.requireApproved !== false && approval === undefined) {
+  const loadedApproval = existsSync(approvalPath) ? loadApproval(approvalPath, sha256) : undefined;
+  if (options.requireApproved !== false && loadedApproval === undefined) {
     throw new Error("certification contract requires a matching approval record before evidence collection");
   }
-  return { contract, sha256, approval, status: approval === undefined ? "draft" : "approved" };
+  return {
+    contract,
+    sha256,
+    approval: loadedApproval?.approval,
+    approvalSha256: loadedApproval?.sha256,
+    status: loadedApproval === undefined ? "draft" : "approved",
+  };
 }

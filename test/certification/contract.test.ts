@@ -35,8 +35,9 @@ describe("certification contract", () => {
     expect(loaded.approval).toEqual({
       contractSha256: approvedContractSha256,
       approvedBy: "bcdonadio (repository owner)",
-      approvedAt: "2026-10-26T20:30:00Z",
-      approvalRef: "issue #629 threshold approval relayed in Epic #228 run",
+      approvedAt: "2026-10-26T20:48:28Z",
+      note: "recorded by root at receipt",
+      approvalRef: "run-record epic-228-run-01a15242 entry 2026-10-26 20:48:28 UTC (user request_user_input answer in root chat)",
     });
   });
 
@@ -93,7 +94,7 @@ describe("certification contract", () => {
     const approvalContract = write("approval", () => undefined);
     const approval = join(directory, "approval.approval.json");
     const approvalSha256 = createHash("sha256").update(readFileSync(approvalContract)).digest("hex");
-    writeFileSync(approval, `${JSON.stringify({ contractSha256: approvalSha256, approvedBy: "x", approvedAt: "not-a-date", approvalRef: "x" })}\n`);
+    writeFileSync(approval, `${JSON.stringify({ contractSha256: approvalSha256, approvedBy: "x", approvedAt: "not-a-date", note: "x", approvalRef: "x" })}\n`);
     expect(() => loadCertificationContract(approvalContract, { approvalPath: approval })).toThrow("approvedAt");
   });
 });

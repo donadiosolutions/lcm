@@ -6,6 +6,8 @@ import {
   assertExecutionProvenance,
   buildMachineContainerArgs,
   collectDatabaseReadiness,
+  collectResidualState,
+  collectSetupSessionClosure,
   createDeterministicSchedule,
   parseCertificationArguments,
   prepareManagedDatabase,
@@ -13,9 +15,23 @@ import {
   runLocalCertification,
   runMachineActivationBarrier,
   stageBuiltPackage,
+  startClockMonitor,
   verifyDistinctMachineIdentities,
   waitForMachineFiles,
 } from "../../scripts/certification-harness.mjs";
+
+vi.mock("pg", () => ({
+  Client: class {
+    on() { return this; }
+    async connect() {}
+    async query(text: string) {
+      return text.includes("clock_timestamp")
+        ? { rows: [{ now: "2026-10-26T10:00:00.000Z" }] }
+        : { rows: [] };
+    }
+    async end() {}
+  },
+}));
 
 describe("certification harness", () => {
   it("executes PostgreSQL readiness with CURRENT_USER and validates the complete witness", async () => {
@@ -39,9 +55,22 @@ describe("certification harness", () => {
       url: "postgresql://runtime:pw@db:5432/db", ca: "ca", expectedVersionNum: 180004,
       expectedDatabase: "db", expectedPort: 5432, expectedRole: "runtime", expectedMigrationCount: 9,
       clientFactory: () => client,
-    })).resolves.toMatchObject({ residualEmpty: true, setupSessionsClosed: true });
+    })).resolves.toMatchObject({ residualEmpty: true });
     expect(queries[0]).toContain("CURRENT_USER::text");
     expect(queries[0]).not.toContain("pg_catalog.current_user");
+  });
+
+  it("separates pre-activation residual state from measured setup-session closure", async () => {
+    const clients = [
+      { connect: async () => undefined, end: async () => undefined, query: async () => ({ rows: [{ machines: 0, projects: 0, conversations: 0, passive_events: 0 }] }) },
+      { connect: async () => undefined, end: async () => undefined, query: async () => ({ rows: [{ role_name: "migrator", connections: 1 }] }) },
+    ];
+    await expect(collectResidualState({ url: "postgresql://x", ca: "ca", clientFactory: () => clients.shift() })).resolves.toMatchObject({ residualEmpty: true });
+    await expect(collectSetupSessionClosure({ url: "postgresql://x", ca: "ca", roles: ["migrator", "transfer"], clientFactory: () => clients.shift() })).resolves.toMatchObject({
+      setupSessionsClosed: false,
+      totalConnections: 1,
+      roles: { migrator: 1, transfer: 0 },
+    });
   });
 
   it("exposes manual certification scripts without a build or postbuild", () => {
@@ -114,6 +143,24 @@ describe("certification harness", () => {
       "verify-a", "verify-b", "grant-runtime", "activate-a", "activate-b", "revoke-transfer", "verify-runtime",
       "start-daemon-a", "stagger", "start-daemon-b",
     ]);
+  });
+
+  it("samples both machine clocks concurrently at each monitor tick", async () => {
+    const root = mkdtempSync(join(tmpdir(), "lcm-cert-clock-monitor-"));
+    const clockCalls: string[] = [];
+    const monitor = await startClockMonitor({
+      machineNames: { a: "machine-a", b: "machine-b" },
+      run: async (args: string[]) => {
+        clockCalls.push(args[2]);
+        return { stdout: JSON.stringify({ wallMs: 100, monotonicNs: "100" }), stderr: "" };
+      },
+      url: "postgresql://runtime@db/cert",
+      ca: "ca",
+      evidenceDirectory: root,
+      intervalMs: 60_000,
+    });
+    expect(clockCalls.slice(0, 2)).toEqual(["machine-a", "machine-b"]);
+    await monitor.stop();
   });
 
   it("pins ownership, identity, limits and safe mount modes in machine argv", () => {
@@ -267,9 +314,9 @@ describe("certification harness", () => {
   it("persists incomplete cleanup evidence when the local harness fails", async () => {
     const root = mkdtempSync(join(tmpdir(), "lcm-cert-local-failure-"));
     const evidenceDirectory = join(root, "evidence");
-    const approval = { contractSha256: "a".repeat(64), approvedBy: "owner", approvedAt: "2026-10-26T10:00:00Z", approvalRef: "issue #629" };
+    const approval = { contractSha256: "a".repeat(64), approvedBy: "owner", approvedAt: "2026-10-26T10:00:00Z", note: "recorded", approvalRef: "issue #629" };
     await expect(runLocalCertification({
-      evidenceDirectory, profile: "smoke", contract: {}, contractSha256: "a".repeat(64), approval,
+      evidenceDirectory, profile: "smoke", contract: {}, contractSha256: "a".repeat(64), approval, approvalSha256: "b".repeat(64),
     }, {
       environment: { LCM_TEST_CONTAINER_CLI: "podman" },
       runHarness: async () => { throw new Error("harness failed"); },
@@ -278,8 +325,15 @@ describe("certification harness", () => {
       verdict: "incomplete", privateRootsAbsent: false, ownedProcessesExited: false,
     });
     expect(JSON.parse(readFileSync(join(evidenceDirectory, "run.json"), "utf8"))).toMatchObject({
-      contractSha256: "a".repeat(64), approval,
+      contractSha256: "a".repeat(64), approval, approvalSha256: "b".repeat(64),
     });
+  });
+
+  it("refuses evidence collection without an approval receipt", async () => {
+    const root = mkdtempSync(join(tmpdir(), "lcm-cert-missing-approval-"));
+    await expect(runLocalCertification({
+      evidenceDirectory: join(root, "evidence"), profile: "smoke", contract: {}, contractSha256: "a".repeat(64),
+    }, { environment: { LCM_TEST_CONTAINER_CLI: "podman" }, runHarness: async () => undefined })).rejects.toThrow("approval");
   });
 
   it("prepares the fresh local database before machine setup", async () => {
@@ -289,10 +343,10 @@ describe("certification harness", () => {
     const caFile = join(root, "ca.crt");
     writeFileSync(caFile, "certificate", { mode: 0o600 });
     const order: string[] = [];
-    const approval = { contractSha256: "a".repeat(64), approvedBy: "owner", approvedAt: "2026-10-26T10:00:00Z", approvalRef: "issue #629" };
+    const approval = { contractSha256: "a".repeat(64), approvedBy: "owner", approvedAt: "2026-10-26T10:00:00Z", note: "recorded", approvalRef: "issue #629" };
 
     await expect(runLocalCertification({
-      evidenceDirectory, profile: "smoke", contract: {}, contractSha256: "a".repeat(64), approval,
+      evidenceDirectory, profile: "smoke", contract: {}, contractSha256: "a".repeat(64), approval, approvalSha256: "b".repeat(64),
     }, {
       environment: { LCM_TEST_CONTAINER_CLI: "podman" },
       runHarness: async ({ runTests }: any) => runTests({

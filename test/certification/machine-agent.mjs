@@ -4,6 +4,7 @@ import { appendFileSync, existsSync, mkdirSync, readFileSync, readdirSync, statS
 import { dirname, join } from "node:path";
 import { pathToFileURL } from "node:url";
 import { promisify } from "node:util";
+import { setTimeout as sleep } from "node:timers/promises";
 import { Worker } from "node:worker_threads";
 import { createHash } from "node:crypto";
 import { connect as tlsConnect } from "node:tls";
@@ -253,14 +254,49 @@ async function probeRawTlsRejection(url, caFile) {
 }
 
 export async function verifyTlsNegativeProbe({ expected, clientProbe, tlsProbe }) {
-  let clientRejected = false;
-  try { await clientProbe(); } catch { clientRejected = true; }
-  if (!clientRejected) throw new Error(`TLS negative probe unexpectedly succeeded for ${expected}`);
+  let clientError;
+  try { await clientProbe(); } catch (error) { clientError = error; }
+  if (!clientError) throw new Error(`TLS negative probe unexpectedly succeeded for ${expected}`);
+  const clientClassification = classifyTlsRejection(clientError);
+  if (clientClassification !== expected) {
+    throw new Error(`LCM client TLS probe returned ${clientClassification}, expected ${expected}`);
+  }
   const classification = classifyTlsRejection(await tlsProbe());
   if (classification !== expected) {
     throw new Error(`TLS negative probe returned ${classification}, expected ${expected}`);
   }
   return classification;
+}
+
+function operationDeadlineError() {
+  return Object.assign(new Error("certification operation deadline exceeded"), {
+    code: "OperationDeadlineExceeded",
+    errorClass: "OperationDeadlineExceeded",
+  });
+}
+
+async function runWithDeadline(timeoutMs, parentSignal, operation) {
+  const controller = new AbortController();
+  let deadlineExpired = false;
+  const onParentAbort = () => controller.abort(parentSignal.reason);
+  if (parentSignal?.aborted) onParentAbort();
+  else parentSignal?.addEventListener("abort", onParentAbort, { once: true });
+  const timer = setTimeout(() => {
+    deadlineExpired = true;
+    controller.abort(operationDeadlineError());
+  }, Math.max(1, timeoutMs));
+  try {
+    if (controller.signal.aborted) throw controller.signal.reason;
+    const result = await operation({ signal: controller.signal, timeoutMs: Math.max(1, timeoutMs) });
+    if (deadlineExpired) throw operationDeadlineError();
+    return result;
+  } catch (error) {
+    if (deadlineExpired) throw operationDeadlineError();
+    throw error;
+  } finally {
+    clearTimeout(timer);
+    parentSignal?.removeEventListener("abort", onParentAbort);
+  }
 }
 
 async function requireTlsRejection(entrypoint, environment, url, caFile, expected, cwd) {
@@ -284,8 +320,12 @@ export async function executeDeterministicSchedule({
   now = () => performance.now(),
   wallNow = () => Date.now(),
   scheduleStartWallMs = wallNow(),
-  delay = (milliseconds) => new Promise((resolve) => setTimeout(resolve, milliseconds)),
+  operationTimeoutMs = 60_000,
+  delay = (milliseconds, options) => sleep(milliseconds, undefined, options),
 }) {
+  if (!Number.isSafeInteger(operationTimeoutMs) || operationTimeoutMs <= 0) {
+    throw new Error("certification operation timeout must be a positive integer");
+  }
   const admission = createAdmissionController({ maxActive: 4, maxQueued: 64 });
   const transientCli = createAdmissionController({ maxActive: 1, maxQueued: 64 });
   const samplesPath = join(evidenceDirectory, "samples.ndjson");
@@ -293,7 +333,7 @@ export async function executeDeterministicSchedule({
   const fatalAbort = new AbortController();
   const operations = schedule.map(async (entry) => {
     const scheduledWallMs = scheduleStartWallMs + entry.offsetSeconds * 1000;
-    const operationDeadlineWallMs = scheduledWallMs + 60_000;
+    const operationDeadlineWallMs = scheduledWallMs + operationTimeoutMs;
     const remainingOperationMs = () => operationDeadlineWallMs - wallNow();
     await waitForScheduledDelay(Math.max(0, scheduledWallMs - wallNow()), fatalAbort.signal, delay);
     if (fatalAbort.signal.aborted) {
@@ -367,13 +407,15 @@ export async function executeDeterministicSchedule({
       } else if (entry.op === "search") {
         if (daemonClient) {
           const processStartNs = process.hrtime.bigint(); const processStartWallMs = Date.now();
-          await daemonClient.post("/search", { cwd, query: "deterministic certification record", limit: 5, layers: [], tags: [] });
+          await runWithDeadline(remainingOperationMs(), fatalAbort.signal, (options) =>
+            daemonClient.post("/search", { cwd, query: "deterministic certification record", limit: 5, layers: [], tags: [] }, options));
           commandTiming = { processStartNs: processStartNs.toString(), processExitNs: process.hrtime.bigint().toString(), processStartWallMs, processExitWallMs: Date.now() };
         } else commandTiming = await transientCli.run(() => runCli(entrypoint, ["search", "deterministic certification record"], { cwd, env: environment, timeoutMs: Math.max(1, remainingOperationMs()) }));
       } else if (entry.op === "store") {
         if (daemonClient) {
           const processStartNs = process.hrtime.bigint(); const processStartWallMs = Date.now();
-          await daemonClient.post("/store", { cwd, text: `certification record ${entry.id}`, tags: ["type:solution", "scope:project"], metadata: {} });
+          await runWithDeadline(remainingOperationMs(), fatalAbort.signal, (options) =>
+            daemonClient.post("/store", { cwd, text: `certification record ${entry.id}`, tags: ["type:solution", "scope:project"], metadata: {} }, options));
           commandTiming = { processStartNs: processStartNs.toString(), processExitNs: process.hrtime.bigint().toString(), processStartWallMs, processExitWallMs: Date.now() };
         } else commandTiming = await transientCli.run(() => runCli(entrypoint, ["store", `certification record ${entry.id}`, "--tag", "type:solution", "--tag", "scope:project"], { cwd, env: environment, timeoutMs: Math.max(1, remainingOperationMs()) }));
       } else if (entry.op === "snapshot") {
@@ -391,7 +433,9 @@ export async function executeDeterministicSchedule({
       }
     } catch (error) {
       outcome = "failed";
-      errorClass = error?.errorClass ?? error?.code ?? error?.name ?? "Error";
+      errorClass = fatalAbort.signal.reason?.code === "OperationDeadlineExceeded"
+        ? "OperationDeadlineExceeded"
+        : error?.errorClass ?? error?.code ?? error?.name ?? "Error";
       if (errorClass === "OperationDeadlineExceeded") fatalAbort.abort(error);
     }
     const endedAt = now();
@@ -505,31 +549,40 @@ export async function waitForControl(path, { deadlineMs, now = Date.now, delay =
 }
 
 async function waitForScheduledDelay(milliseconds, signal, delay) {
-  let onAbort;
-  const abort = new Promise((resolve) => {
-    onAbort = resolve;
-    signal.addEventListener("abort", onAbort, { once: true });
-  });
-  await Promise.race([delay(milliseconds), abort]);
-  signal.removeEventListener("abort", onAbort);
+  try {
+    await delay(milliseconds, { signal });
+  } catch (error) {
+    if (!signal.aborted) throw error;
+  }
 }
 
-async function waitForAcknowledgmentCatchUp(home, evidenceDirectory, phase, deadlineSeconds) {
-  const started = Date.now();
-  let result;
-  while (Date.now() - started <= deadlineSeconds * 1000) {
-    const databasePath = findEventsDatabase(home);
-    if (databasePath) {
-      const rows = await readAllDeliveryRows(databasePath);
-      const incomplete = rows.filter((row) => !isAcknowledgedRow(row) || !row.remote_pruned_at);
-      if (incomplete.length === 0) {
-        result = { phase, verdict: "pass", seconds: (Date.now() - started) / 1000, remaining: 0 };
-        break;
-      }
-    }
-    await new Promise((resolve) => setTimeout(resolve, 1000));
+export async function waitForAcknowledgmentCatchUp(home, evidenceDirectory, phase, clearedAt, deadlineSeconds, options = {}) {
+  const now = options.now ?? Date.now;
+  const delay = options.delay ?? ((milliseconds) => new Promise((resolve) => setTimeout(resolve, milliseconds)));
+  const clearedAtMs = Date.parse(clearedAt);
+  if (!Number.isFinite(clearedAtMs) || !Number.isSafeInteger(deadlineSeconds) || deadlineSeconds <= 0) {
+    throw new Error("invalid acknowledgment catch-up deadline");
   }
-  result ??= { phase, verdict: "fail", seconds: deadlineSeconds, remaining: null };
+  const deadlineAtMs = clearedAtMs + deadlineSeconds * 1000;
+  let result;
+  while (!result) {
+    let rows;
+    if (options.readRows) rows = await options.readRows();
+    else {
+      const databasePath = findEventsDatabase(home);
+      if (databasePath) rows = await readAllDeliveryRows(databasePath);
+    }
+    const observedAtMs = now();
+    const observedAt = new Date(observedAtMs).toISOString();
+    const seconds = (observedAtMs - clearedAtMs) / 1000;
+    const complete = rows !== undefined && rows.every((row) => isAcknowledgedRow(row) && Boolean(row.remote_pruned_at));
+    result = complete && observedAtMs <= deadlineAtMs
+      ? { phase, verdict: "pass", clearedAt, observedAt, seconds, remaining: 0 }
+      : observedAtMs >= deadlineAtMs
+        ? { phase, verdict: "fail", clearedAt, observedAt, seconds, remaining: null }
+        : undefined;
+    if (!result) await delay(Math.min(1000, deadlineAtMs - observedAtMs));
+  }
   writeFileSync(join(evidenceDirectory, `${phase}-catch-up.json`), `${JSON.stringify(result)}\n`, { mode: 0o600, flag: "wx" });
   return result;
 }
@@ -541,7 +594,8 @@ export async function startForegroundDaemon({
   daemonArguments,
   spawnProcess = spawn,
   healthProbe,
-  delay = (milliseconds) => new Promise((resolve) => setTimeout(resolve, milliseconds)),
+  readinessTimeoutMs = 60_000,
+  delay = (milliseconds, options) => sleep(milliseconds, undefined, options),
 }) {
   const child = spawnProcess(process.execPath, daemonArguments ?? [entrypoint, "daemon", "start", "--foreground"], {
     cwd,
@@ -569,35 +623,57 @@ export async function startForegroundDaemon({
   const probe = healthProbe ?? (() => execFileAsync(process.execPath, [entrypoint, "status", "--json"], {
     cwd, env: environment, timeout: 5_000,
   }));
-  for (let attempt = 0; attempt < 240; attempt += 1) {
-    if (exitState) throw new Error(`foreground daemon exited before readiness${output() ? `: ${output()}` : ""}`, { cause: exitState.error });
-    try {
-      await probe();
-      await delay(100);
-      assertRunning();
-      let stopping;
-      return {
-        assertRunning,
-        stop() {
-          stopping ??= (async () => {
-            if (exitState) return;
-            child.kill("SIGTERM");
-            let timeout;
-            await Promise.race([
-              exited,
-              new Promise((_, reject) => { timeout = setTimeout(() => reject(new Error("foreground daemon did not stop")), 10_000); }),
-            ]).finally(() => clearTimeout(timeout));
-          })();
-          return stopping;
-        },
-      };
-    } catch {
-      await delay(250);
+  const readinessController = new AbortController();
+  const readinessDeadline = Date.now() + readinessTimeoutMs;
+  const readinessError = Object.assign(new Error("foreground daemon readiness deadline exceeded"), {
+    code: "ReadinessDeadlineExceeded",
+  });
+  const readinessTimer = setTimeout(() => readinessController.abort(readinessError), readinessTimeoutMs);
+  try {
+    for (let attempt = 0; attempt < 240; attempt += 1) {
+      if (exitState) throw new Error(`foreground daemon exited before readiness${output() ? `: ${output()}` : ""}`, { cause: exitState.error });
+      if (readinessController.signal.aborted) break;
+      const timeoutMs = Math.max(1, readinessDeadline - Date.now());
+      try {
+        await probe({ signal: readinessController.signal, timeoutMs });
+        await delay(Math.min(100, Math.max(1, readinessDeadline - Date.now())), { signal: readinessController.signal });
+        assertRunning();
+        clearTimeout(readinessTimer);
+        let stopping;
+        return {
+          assertRunning,
+          stop() {
+            stopping ??= (async () => {
+              if (exitState) return;
+              child.kill("SIGTERM");
+              let timeout;
+              await Promise.race([
+                exited,
+                new Promise((_, reject) => { timeout = setTimeout(() => reject(new Error("foreground daemon did not stop")), 10_000); }),
+              ]).finally(() => clearTimeout(timeout));
+            })();
+            return stopping;
+          },
+        };
+      } catch {
+        if (readinessController.signal.aborted) break;
+        try {
+          await delay(Math.min(250, Math.max(1, readinessDeadline - Date.now())), { signal: readinessController.signal });
+        } catch {
+          if (readinessController.signal.aborted) break;
+        }
+      }
     }
+  } finally {
+    clearTimeout(readinessTimer);
   }
   if (!exitState) child.kill("SIGTERM");
-  await Promise.race([exited, delay(10_000)]);
-  throw new Error(`foreground daemon did not become ready${output() ? `: ${output()}` : ""}`);
+  let killTimeout;
+  await Promise.race([exited, new Promise((resolve) => { killTimeout = setTimeout(resolve, 10_000); })])
+    .finally(() => clearTimeout(killTimeout));
+  throw new Error(`foreground daemon did not become ready${output() ? `: ${output()}` : ""}`, {
+    cause: readinessController.signal.aborted ? readinessError : undefined,
+  });
 }
 
 export async function captureDoctorEvidence(run) {
@@ -730,16 +806,18 @@ export async function runMachineAgent(environment = process.env) {
     environment,
     cwd: project,
     daemonArguments: ["/opt/lcm/certification/daemon-agent.mjs"],
-    healthProbe: async () => {
-      if (!await new DaemonClient("http://127.0.0.1:3737", daemonTokenPath).health()) throw new Error("foreground daemon is not healthy");
+    healthProbe: async ({ signal, timeoutMs }) => {
+      if (!await new DaemonClient("http://127.0.0.1:3737", daemonTokenPath).health({ signal, timeoutMs })) throw new Error("foreground daemon is not healthy");
     },
   });
   const daemonClient = new DaemonClient("http://127.0.0.1:3737", daemonTokenPath);
   try {
   writeFileSync(join(evidenceDirectory, "daemon-started.json"), `${JSON.stringify({ machine, at: new Date().toISOString() })}\n`, { mode: 0o600, flag: "wx" });
   const doctor = await captureDoctorEvidence(() => execFileAsync(process.execPath, [lcm, "doctor", "--verbose"], { cwd: project, env: environment, timeout: 60_000 }));
-  await daemonClient.post("/store", { cwd: project, text: "certification readiness", tags: ["type:solution", "scope:project"], metadata: {} });
-  await daemonClient.post("/search", { cwd: project, query: "certification readiness", limit: 5, layers: [], tags: [] });
+  await runWithDeadline(60_000, undefined, (options) =>
+    daemonClient.post("/store", { cwd: project, text: "certification readiness", tags: ["type:solution", "scope:project"], metadata: {} }, options));
+  await runWithDeadline(60_000, undefined, (options) =>
+    daemonClient.post("/search", { cwd: project, query: "certification readiness", limit: 5, layers: [], tags: [] }, options));
   writeFileSync(join(evidenceDirectory, "readiness.json"), `${JSON.stringify({
     machine,
     migrationSteps,
@@ -789,10 +867,13 @@ export async function runMachineAgent(environment = process.env) {
         durationSeconds: contract.thresholds.recovery.partition.rtoSeconds,
       });
       await executeDeterministicSchedule({ schedule: partitionSchedule, entrypoint: lcm, cwd: project, environment, daemonClient, evidenceDirectory });
-      await waitForControl(join(evidenceDirectory, "partition-cleared.json"), {
+      const partitionClearance = await waitForControl(join(evidenceDirectory, "partition-cleared.json"), {
         deadlineMs: Date.now() + timeline.partitionPhaseMaxSeconds * 1000,
       });
-      const partitionCatchUp = await waitForAcknowledgmentCatchUp(environment.HOME, evidenceDirectory, "partition", contract.thresholds.recovery.acknowledgmentCatchUpAfterClearedSeconds);
+      const partitionCatchUp = await waitForAcknowledgmentCatchUp(
+        environment.HOME, evidenceDirectory, "partition", partitionClearance.clearedAt,
+        contract.thresholds.recovery.acknowledgmentCatchUpAfterClearedSeconds,
+      );
       if (partitionCatchUp.verdict !== "pass") throw new Error("partition acknowledgment catch-up failed");
       writeFileSync(join(evidenceDirectory, "partition-recovered.json"), `${JSON.stringify({ machine, at: new Date().toISOString() })}\n`, { mode: 0o600, flag: "wx" });
       if (environment.LCM_CERT_LANE === "local") {
@@ -802,10 +883,13 @@ export async function runMachineAgent(environment = process.env) {
           durationSeconds: contract.thresholds.recovery.restartDatabase.rtoSeconds,
         });
         await executeDeterministicSchedule({ schedule: restartSchedule, entrypoint: lcm, cwd: project, environment, daemonClient, evidenceDirectory });
-        await waitForControl(join(evidenceDirectory, "restart-cleared.json"), {
+        const restartClearance = await waitForControl(join(evidenceDirectory, "restart-cleared.json"), {
           deadlineMs: Date.now() + timeline.restartPhaseMaxSeconds * 1000,
         });
-        const restartCatchUp = await waitForAcknowledgmentCatchUp(environment.HOME, evidenceDirectory, "restart", contract.thresholds.recovery.acknowledgmentCatchUpAfterClearedSeconds);
+        const restartCatchUp = await waitForAcknowledgmentCatchUp(
+          environment.HOME, evidenceDirectory, "restart", restartClearance.clearedAt,
+          contract.thresholds.recovery.acknowledgmentCatchUpAfterClearedSeconds,
+        );
         if (restartCatchUp.verdict !== "pass") throw new Error("restart acknowledgment catch-up failed");
         writeFileSync(join(evidenceDirectory, "restart-recovered.json"), `${JSON.stringify({ machine, at: new Date().toISOString() })}\n`, { mode: 0o600, flag: "wx" });
       }

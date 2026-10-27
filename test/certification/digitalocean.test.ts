@@ -11,6 +11,7 @@ import {
   runDigitalOceanLifecycle,
 } from "../../scripts/certification-digitalocean.mjs";
 import { runManagedMachinePair } from "../../scripts/certification-harness.mjs";
+import { waitForControl } from "./machine-agent.mjs";
 
 const json = (value: unknown, status = 200) => new Response(JSON.stringify(value), {
   status,
@@ -241,14 +242,38 @@ describe("certification DigitalOcean lifecycle", () => {
     expect(signalEmitter.listenerCount("SIGTERM")).toBe(0);
   });
 
-  it("wires both managed machines through the shared agent and injects the partition", async () => {
+  it("runs managed setup controls through real file waits before workload readiness", async () => {
     const root = mkdtempSync(join(tmpdir(), "lcm-cert-managed-pair-"));
     const evidenceDirectory = join(root, "evidence");
     const calls: string[][] = [];
+    const events: string[] = [];
+    const fakeAgents: Promise<void>[] = [];
+    const setupMaxSeconds = 2;
+    const writeControl = (machine: "a" | "b", file: string) => writeFileSync(
+      join(evidenceDirectory, `machine-${machine}`, file), `${JSON.stringify({ machine, at: new Date().toISOString() })}\n`,
+      { mode: 0o600, flag: "wx" },
+    );
+    const fakeAgent = async (machine: "a" | "b") => {
+      const directory = join(evidenceDirectory, `machine-${machine}`);
+      const wait = (file: string) => waitForControl(join(directory, file), {
+        deadlineMs: Date.now() + setupMaxSeconds * 1000,
+        delay: async () => new Promise((resolve) => setTimeout(resolve, 1)),
+      });
+      await wait("migration-start.json");
+      events.push(`verified-${machine}`);
+      writeControl(machine, "verification-receipt.json");
+      await wait("activation-start.json");
+      events.push(`activated-${machine}`);
+      writeControl(machine, "activation-receipt.json");
+      await wait("runtime-ready.json");
+      writeControl(machine, "daemon-started.json");
+      writeControl(machine, "ready.json");
+    };
     let wallNow = Date.parse("2026-10-26T10:00:00.000Z");
     const processRunner = vi.fn(async (_command: string, args: string[]) => {
       calls.push(args);
       if (args[1] === "inspect") {
+        if (args.includes("{{json .State}}")) return { stdout: JSON.stringify({ Running: true }), stderr: "" };
         const name = args[2];
         const create = calls.find((candidate) => candidate.includes("create") && candidate.includes(name));
         const labels: Record<string, string> = {};
@@ -259,6 +284,14 @@ describe("certification DigitalOcean lifecycle", () => {
           }
         }
         return { stdout: JSON.stringify([args[0] === "container" ? { Config: { Labels: labels } } : { Labels: labels }]), stderr: "" };
+      }
+      if (args[1] === "start" && args[2]) {
+        const machine = args[2].includes("machine-a") ? "a" : args[2].includes("machine-b") ? "b" : undefined;
+      if (machine) fakeAgents.push(fakeAgent(machine));
+      }
+      if (args.includes("-e")) {
+        const configuredMax = args[2].includes("machine-b") ? 3 : 2;
+        return { stdout: JSON.stringify({ backend: "postgresql", pool: { status: "ready", configuredMax } }), stderr: "" };
       }
       return { stdout: "", stderr: "" };
     });
@@ -277,33 +310,40 @@ describe("certification DigitalOcean lifecycle", () => {
       profile: "full",
       evidenceDirectory,
       secrets: ["secret"],
+      contract: { timeline: { full: { setupMaxSeconds, secondDaemonStartOffsetSeconds: 150, warmupSeconds: 120 }, smoke: { warmupSeconds: 120 } } },
     }, {
       processRunner,
       containerCli: "podman",
       owner: { pid: 1, birth: "linux:12345678-1234-1234-1234-123456789abc:1", scope: "linux:12345678-1234-1234-1234-123456789abc:abc" },
       createRunRoot: () => join(root, "run"),
       stagePackage: (runRoot: string) => ({ root: join(runRoot, "package"), sha256: "a".repeat(64) }),
-      captureExecutionProvenance: () => ({ dirty: false, testedCommit: "c".repeat(40), testedInputsSha256: "d".repeat(64), testedInputsCount: 1, lockfileSha256: "e".repeat(64), cliSha256: "f".repeat(64), stagedPackageSha256: "a".repeat(64), contractSha256: "b".repeat(64), node: process.version }),
+      captureExecutionProvenance: () => ({ dirty: false, testedCommit: "c".repeat(40), testedInputsSha256: "d".repeat(64), testedInputsCount: 1, lockfileSha256: "e".repeat(64), cliSha256: "f".repeat(64), stagedPackageSha256: "a".repeat(64), contractSha256: "b".repeat(64), approvalSha256: "9".repeat(64), node: process.version }),
       resolveHost: async () => "203.0.113.7",
-      waitForReady: async () => undefined,
       waitForWarmupComplete: async () => { wallNow += 120_000; },
       waitForFaultReady: async () => undefined,
       waitForSteadyComplete: async () => undefined,
       waitForPartitionRecovery: async () => undefined,
       waitForDrain: async () => undefined,
       waitForExit: async () => undefined,
-      prepareDatabase: async () => ({ transferUrl: "postgresql://transfer:secret@db.example:25060/lcm_cert_run12345" }),
-      collectReadiness: async () => ({ serverVersionNum: 180000, role: { superuser: false, createRole: false, createDb: false } }),
+      prepareDatabase: async () => ({ transferName: "lcm_cert_transfer_run", transferUrl: "postgresql://transfer:secret@db.example:25060/lcm_cert_run12345" }),
+      collectReadiness: async () => ({ serverVersionNum: 180000, residualEmpty: false, role: { superuser: false, createRole: false, createDb: false } }),
+      collectResidualState: async () => ({ observedAt: new Date().toISOString(), residual: { machines: 0, projects: 0, conversations: 0, passive_events: 0 }, residualEmpty: true }),
+      collectSetupSessionClosure: async () => ({ observedAt: new Date().toISOString(), roles: { migrator: 0, transfer: 0 }, totalConnections: 0, setupSessionsClosed: true }),
+      grantRuntime: async () => { events.push("grant-runtime"); return { granted: true }; },
+      revokeTransfer: async () => { events.push("revoke-transfer"); return { revoked: true }; },
+      verifyRuntime: async () => { events.push("verify-runtime"); },
       collectRelationBytes: async () => 0,
       verifyIdentities: () => ({
         a: { machineId: "018f0000-0000-7000-8000-000000000001", identityKeySha256: "a".repeat(64) },
         b: { machineId: "018f0000-0000-7000-8000-000000000002", identityKeySha256: "b".repeat(64) },
       }),
       startClockMonitor: async () => ({ stop: async () => [] }),
-      delay: phaseDelay,
       wallNow: () => wallNow,
       removeRunRoot: vi.fn(),
+      delay: async () => new Promise((resolve) => setTimeout(resolve, 5)),
+      monitorMachineDelay: phaseDelay,
     });
+    await Promise.all(fakeAgents);
     expect(result.stageSha256).toBe("a".repeat(64));
     expect(calls.filter((args) => args[0] === "container" && args[1] === "create")).toHaveLength(2);
     expect(calls).toContainEqual(expect.arrayContaining(["network", "disconnect", expect.stringContaining("lcm-pg-net"), expect.stringContaining("machine-a")]));
@@ -316,7 +356,19 @@ describe("certification DigitalOcean lifecycle", () => {
     const startB = calls.findIndex((args) => args[0] === "container" && args[1] === "start" && args.some((value) => value.includes("machine-b")));
     expect(startA).toBeGreaterThanOrEqual(0);
     expect(startB).toBeGreaterThan(startA);
-    expect(phaseDelay).toHaveBeenCalledWith(150_000);
+    expect(phaseDelay).toHaveBeenCalledWith(expect.any(Array), 150_000);
+    const readiness = JSON.parse(readFileSync(join(evidenceDirectory, "database-readiness.json"), "utf8"));
+    expect(readiness).toMatchObject({
+      residualEmpty: false,
+      poolByMachine: { a: { configuredMax: 2 }, b: { configuredMax: 3 } },
+      setupSessionsClosed: true,
+    });
+    expect(readiness.configuredPoolMax).toBeUndefined();
+    expect(JSON.parse(readFileSync(join(evidenceDirectory, "pre-activation-residual.json"), "utf8")).residualEmpty).toBe(true);
+    expect(JSON.parse(readFileSync(join(evidenceDirectory, "setup-session-closure.json"), "utf8")).totalConnections).toBe(0);
+    expect(events).toEqual(["verified-a", "verified-b", "grant-runtime", "activated-a", "activated-b", "revoke-transfer", "verify-runtime"]);
+    expect(readFileSync(join(evidenceDirectory, "machine-a", "runtime-ready.json"), "utf8")).toBeTruthy();
+    expect(readFileSync(join(evidenceDirectory, "machine-b", "runtime-ready.json"), "utf8")).toBeTruthy();
     const phaseControl = JSON.parse(readFileSync(join(evidenceDirectory, "phase-control.json"), "utf8"));
     expect(Date.parse(phaseControl.steadyT0At) - Date.parse(phaseControl.warmupStartAt)).toBeGreaterThanOrEqual(120_000);
   });

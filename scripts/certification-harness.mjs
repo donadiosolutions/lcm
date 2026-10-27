@@ -17,7 +17,7 @@ export { createDeterministicSchedule };
 
 function sha256(value) { return createHash("sha256").update(value).digest("hex"); }
 
-export function captureExecutionProvenance(root, contractSha256, stagedPackageSha256) {
+export function captureExecutionProvenance(root, contractSha256, stagedPackageSha256, approvalSha256) {
   const git = (...args) => execFileSync("git", ["-C", root, ...args], { encoding: "utf8", maxBuffer: 64 * 1024 * 1024 });
   const paths = git("ls-files", "-z").split("\0").filter(Boolean)
     .filter((path) => !["docs/production-certification-gate.json", "docs/production-certification-gate.md"].includes(path)).sort();
@@ -32,6 +32,7 @@ export function captureExecutionProvenance(root, contractSha256, stagedPackageSh
     cliSha256: sha256(readFileSync(join(root, "dist", "lcm.mjs"))),
     stagedPackageSha256,
     contractSha256,
+    approvalSha256,
     node: process.version,
   };
 }
@@ -231,6 +232,22 @@ function waitInterval(milliseconds, signal) {
     signal.addEventListener("abort", onAbort, { once: true });
   });
 }
+
+async function collectMachinePoolWitness(name, run) {
+  const script = `const { DaemonClient } = await import("/opt/lcm/dist/src/daemon/client.js");
+const { daemonTokenPath } = await import("/opt/lcm/dist/src/runtime-paths.js");
+const client = new DaemonClient("http://127.0.0.1:3737", daemonTokenPath(process.env.HOME));
+const stats = await client.get("/stats/pool");
+process.stdout.write(JSON.stringify(stats.backendDiagnostics));`;
+  const result = await run(["container", "exec", name, "node", "--input-type=module", "-e", script]);
+  const diagnostics = JSON.parse(result.stdout.trim());
+  if (diagnostics?.backend !== "postgresql" || diagnostics.pool?.status !== "ready"
+    || !Number.isSafeInteger(diagnostics.pool.configuredMax) || diagnostics.pool.configuredMax < 1) {
+    throw new Error(`certification machine ${name} has no effective PostgreSQL pool witness`);
+  }
+  return { observedAt: new Date().toISOString(), configuredMax: diagnostics.pool.configuredMax };
+}
+
 export async function runManagedMachinePair(input, dependencies = {}) {
   const contract = input.contract ?? loadCertificationContract(new URL("../test/certification/contract-v1.json", import.meta.url), { requireApproved: false }).contract;
   const containerCli = dependencies.containerCli ?? "podman";
@@ -266,7 +283,7 @@ export async function runManagedMachinePair(input, dependencies = {}) {
       machineAgentPath: new URL("../test/certification/machine-agent.mjs", import.meta.url),
     });
     const executionProvenance = (dependencies.captureExecutionProvenance ?? captureExecutionProvenance)(
-      dependencies.sourceRoot ?? repositoryRoot, input.contractSha256, stage.sha256,
+      dependencies.sourceRoot ?? repositoryRoot, input.contractSha256, stage.sha256, input.approvalSha256,
     );
     assertExecutionProvenance(input.profile, executionProvenance);
     mkdirSync(input.evidenceDirectory, { recursive: true, mode: 0o700 });
@@ -321,22 +338,12 @@ export async function runManagedMachinePair(input, dependencies = {}) {
       owner,
       runId: ownershipRunId,
     });
-    const databaseReadiness = await (dependencies.collectReadiness ?? collectDatabaseReadiness)({
-      url: input.privateConnection.runtimeUrl,
+    const preActivationResidual = await (dependencies.collectResidualState ?? collectResidualState)({
+      url: databasePreparation.transferUrl,
       ca: input.privateConnection.ca,
-      expectedMajor: 18,
-      expectedDatabase: input.privateConnection.databaseName,
-      expectedPort: input.cluster.port,
-      expectedRole: input.privateConnection.runtimeName,
-      expectedMigrationCount: readdirSync(join(dependencies.sourceRoot ?? repositoryRoot, "src", "storage", "postgresql", "migrations")).filter((name) => name.endsWith(".sql")).length,
     });
     mkdirSync(input.evidenceDirectory, { recursive: true, mode: 0o700 });
-    writeFileSync(join(input.evidenceDirectory, "database-readiness.json"), `${JSON.stringify({
-      ...databaseReadiness,
-      providerClusterId: input.cluster.id,
-      providerHost: input.cluster.host,
-      providerPort: input.cluster.port,
-    }, null, 2)}\n`, { mode: 0o600, flag: "wx" });
+    writeFileSync(join(input.evidenceDirectory, "pre-activation-residual.json"), `${JSON.stringify(preActivationResidual, null, 2)}\n`, { mode: 0o600, flag: "wx" });
     networkCreated = true;
     await run(["network", "create", ...Object.entries(networkLabels).flatMap(([key, value]) => ["--label", `${key}=${value}`]), network]);
     for (const machine of ['a', 'b']) {
@@ -373,20 +380,123 @@ export async function runManagedMachinePair(input, dependencies = {}) {
         environmentFile, wrongHost: { host: wrongHostname, address: endpointAddress },
       }));
     }
-    await run(["container", "start", names.machineA]);
-    if (!dependencies.waitForReady) await waitForFiles(
-      [join(input.evidenceDirectory, "machine-a", "ready.json")],
-      [names.machineA],
-      contract.timeline.full.setupMaxSeconds * 1000,
-    );
-    await monitorDelay([names.machineA], contract.timeline.full.secondDaemonStartOffsetSeconds * 1000);
-    await run(["container", "start", names.machineB]);
-    const waitForReady = dependencies.waitForReady ?? (() => waitForFiles(
-      [join(input.evidenceDirectory, "machine-b", "ready.json")],
+    const setupStartedAt = Date.now();
+    const setupDeadline = setupStartedAt + contract.timeline.full.setupMaxSeconds * 1000;
+    const waitForSetupFiles = (paths, machineNames) => {
+      const remainingMs = setupDeadline - Date.now();
+      if (remainingMs <= 0) throw new Error("certification setup exceeded setupMaxSeconds");
+      return waitForFiles(paths, machineNames, remainingMs);
+    };
+    const activationReceipts = {};
+    const poolByMachine = {};
+    let runtimeGrant;
+    let revocation;
+    let databaseReadiness;
+    let setupSessionClosure;
+    await runMachineActivationBarrier({
+      verifyA: async () => {
+        await run(["container", "start", names.machineA]);
+        writeFileSync(join(input.evidenceDirectory, "machine-a", "migration-start.json"), `${JSON.stringify({ at: new Date().toISOString() })}\n`, { mode: 0o600, flag: "wx" });
+        await waitForSetupFiles([join(input.evidenceDirectory, "machine-a", "verification-receipt.json")], [names.machineA]);
+      },
+      verifyB: async () => {
+        await run(["container", "start", names.machineB]);
+        writeFileSync(join(input.evidenceDirectory, "machine-b", "migration-start.json"), `${JSON.stringify({ at: new Date().toISOString() })}\n`, { mode: 0o600, flag: "wx" });
+        await waitForSetupFiles([join(input.evidenceDirectory, "machine-b", "verification-receipt.json")], [names.machineA, names.machineB]);
+      },
+      grantRuntime: async () => {
+        runtimeGrant = await (dependencies.grantRuntime ?? grantRuntimeProfile)({
+          adminUrl: input.privateConnection.containerAdminUrl ?? input.privateConnection.adminUrl,
+          caFile,
+          role: input.privateConnection.runtimeName,
+          databaseName: input.privateConnection.databaseName,
+          sourceRoot: dependencies.sourceRoot ?? repositoryRoot,
+        });
+      },
+      activateA: async () => {
+        writeFileSync(join(input.evidenceDirectory, "machine-a", "activation-start.json"), `${JSON.stringify({ at: new Date().toISOString() })}\n`, { mode: 0o600, flag: "wx" });
+        const path = join(input.evidenceDirectory, "machine-a", "activation-receipt.json");
+        await waitForSetupFiles([path], [names.machineA, names.machineB]);
+        activationReceipts.a = jsonFromFile(path);
+      },
+      activateB: async () => {
+        writeFileSync(join(input.evidenceDirectory, "machine-b", "activation-start.json"), `${JSON.stringify({ at: new Date().toISOString() })}\n`, { mode: 0o600, flag: "wx" });
+        const path = join(input.evidenceDirectory, "machine-b", "activation-receipt.json");
+        await waitForSetupFiles([path], [names.machineA, names.machineB]);
+        activationReceipts.b = jsonFromFile(path);
+      },
+      revokeTransfer: async () => {
+        revocation = await (dependencies.revokeTransfer ?? revokeTransferProfile)({
+          adminUrl: input.privateConnection.containerAdminUrl ?? input.privateConnection.adminUrl,
+          caFile,
+          role: databasePreparation.transferName,
+        });
+      },
+      verifyRuntime: async () => {
+        await (dependencies.verifyRuntime ?? verifyRuntimeSchemaReadiness)({
+          sourceRoot: dependencies.sourceRoot ?? repositoryRoot,
+          url: input.privateConnection.runtimeUrl,
+          caFile,
+          expectedOwner: input.privateConnection.migratorName,
+        });
+        databaseReadiness = await (dependencies.collectReadiness ?? collectDatabaseReadiness)({
+          url: input.privateConnection.runtimeUrl,
+          ca: input.privateConnection.ca,
+          expectedMajor: 18,
+          expectedDatabase: input.privateConnection.databaseName,
+          expectedPort: input.cluster.port,
+          expectedRole: input.privateConnection.runtimeName,
+          expectedMigrationCount: readdirSync(join(dependencies.sourceRoot ?? repositoryRoot, "src", "storage", "postgresql", "migrations")).filter((name) => name.endsWith(".sql")).length,
+          requireResidualEmpty: false,
+        });
+        setupSessionClosure = await (dependencies.collectSetupSessionClosure ?? collectSetupSessionClosure)({
+          url: input.privateConnection.containerAdminUrl ?? input.privateConnection.adminUrl,
+          ca: input.privateConnection.ca,
+          roles: [input.privateConnection.migratorName, databasePreparation.transferName],
+        });
+      },
+      startDaemonA: async () => {
+        writeFileSync(join(input.evidenceDirectory, "machine-a", "runtime-ready.json"), `${JSON.stringify({ at: new Date().toISOString() })}\n`, { mode: 0o600, flag: "wx" });
+        await waitForSetupFiles([join(input.evidenceDirectory, "machine-a", "daemon-started.json")], [names.machineA, names.machineB]);
+        poolByMachine.a = await collectMachinePoolWitness(names.machineA, run);
+      },
+      stagger: () => monitorDelay([names.machineA, names.machineB], contract.timeline.full.secondDaemonStartOffsetSeconds * 1000),
+      startDaemonB: async () => {
+        writeFileSync(join(input.evidenceDirectory, "machine-b", "runtime-ready.json"), `${JSON.stringify({ at: new Date().toISOString() })}\n`, { mode: 0o600, flag: "wx" });
+        await waitForSetupFiles([join(input.evidenceDirectory, "machine-b", "daemon-started.json")], [names.machineA, names.machineB]);
+        poolByMachine.b = await collectMachinePoolWitness(names.machineB, run);
+      },
+    });
+    if (Date.now() > setupDeadline) throw new Error("certification setup exceeded setupMaxSeconds");
+    const configuredPoolMax = poolByMachine.a?.configuredMax === poolByMachine.b?.configuredMax
+      ? poolByMachine.a.configuredMax : undefined;
+    databaseReadiness = {
+      ...databaseReadiness,
+      configuredPoolMax,
+      poolByMachine,
+      setupSessionsClosed: setupSessionClosure.setupSessionsClosed,
+      setupSessionClosure,
+      providerClusterId: input.cluster.id,
+      providerHost: input.cluster.host,
+      providerPort: input.cluster.port,
+    };
+    writeFileSync(join(input.evidenceDirectory, "setup-session-closure.json"), `${JSON.stringify(setupSessionClosure, null, 2)}\n`, { mode: 0o600, flag: "wx" });
+    writeFileSync(join(input.evidenceDirectory, "setup-evidence.json"), `${JSON.stringify({
+      startedAt: new Date(setupStartedAt).toISOString(),
+      completedAt: new Date().toISOString(),
+      activationReceipts,
+      revocation,
+      runtimeGrant,
+      runtimeReadiness: "pass",
+      daemonStartOrder: ["a", "b"],
+      setupSessionClosure,
+      poolByMachine,
+    }, null, 2)}\n`, { mode: 0o600, flag: "wx" });
+    writeFileSync(join(input.evidenceDirectory, "database-readiness.json"), `${JSON.stringify(databaseReadiness, null, 2)}\n`, { mode: 0o600, flag: "wx" });
+    await waitForSetupFiles(
+      ['a', 'b'].map((machine) => join(input.evidenceDirectory, `machine-${machine}`, "ready.json")),
       [names.machineA, names.machineB],
-      contract.timeline.full.setupMaxSeconds * 1000,
-    ));
-    await waitForReady();
+    );
     const identities = (dependencies.verifyIdentities ?? verifyDistinctMachineIdentities)(homes);
     writeFileSync(join(input.evidenceDirectory, "machine-identities.json"), `${JSON.stringify(identities, null, 2)}\n`, { mode: 0o600, flag: "wx" });
     clockMonitor = await (dependencies.startClockMonitor ?? startClockMonitor)({
@@ -710,9 +820,65 @@ export async function collectDatabaseReadiness({ url, ca, expectedVersionNum, ex
       maxConnections,
       reservedConnections,
       residualEmpty,
-      configuredPoolMax: 2,
-      setupSessionsClosed: true,
       systemIdentifier,
+    };
+  } finally {
+    await client.end();
+  }
+}
+
+export async function collectResidualState({ url, ca, clientFactory }) {
+  const loaded = await import("pg");
+  const Client = loaded.Client ?? loaded.default?.Client;
+  const client = clientFactory?.() ?? new Client({
+    connectionString: url,
+    ssl: { ca, rejectUnauthorized: true },
+    connectionTimeoutMillis: 30_000,
+    statement_timeout: 30_000,
+  });
+  await client.connect();
+  try {
+    const residual = (await client.query(`SELECT
+      (SELECT pg_catalog.count(*)::integer FROM lcm.machines) AS machines,
+      (SELECT pg_catalog.count(*)::integer FROM lcm.projects) AS projects,
+      (SELECT pg_catalog.count(*)::integer FROM lcm.conversations) AS conversations,
+      (SELECT pg_catalog.count(*)::integer FROM lcm.passive_event_inbox) AS passive_events`)).rows[0];
+    return {
+      observedAt: new Date().toISOString(),
+      residual,
+      residualEmpty: residual !== undefined && Object.values(residual).every((value) => value === 0),
+    };
+  } finally {
+    await client.end();
+  }
+}
+
+export async function collectSetupSessionClosure({ url, ca, roles, clientFactory }) {
+  if (!Array.isArray(roles) || roles.length === 0 || roles.some((role) => typeof role !== "string" || role.length === 0)) {
+    throw new Error("certification setup roles are required");
+  }
+  const loaded = await import("pg");
+  const Client = loaded.Client ?? loaded.default?.Client;
+  const client = clientFactory?.() ?? new Client({
+    connectionString: url,
+    ssl: { ca, rejectUnauthorized: true },
+    connectionTimeoutMillis: 30_000,
+    statement_timeout: 30_000,
+  });
+  await client.connect();
+  try {
+    const rows = (await client.query(`SELECT usename::text AS role_name, pg_catalog.count(*)::integer AS connections
+      FROM pg_catalog.pg_stat_activity
+      WHERE usename OPERATOR(pg_catalog.=) ANY($1::text[]) AND pid OPERATOR(pg_catalog.<>) pg_catalog.pg_backend_pid()
+      GROUP BY usename ORDER BY usename`, [roles])).rows;
+    const counts = Object.fromEntries(roles.map((role) => [role, 0]));
+    for (const row of rows) counts[row.role_name] = Number(row.connections);
+    const totalConnections = Object.values(counts).reduce((sum, count) => sum + count, 0);
+    return {
+      observedAt: new Date().toISOString(),
+      roles: counts,
+      totalConnections,
+      setupSessionsClosed: totalConnections === 0,
     };
   } finally {
     await client.end();
@@ -744,7 +910,7 @@ export async function startClockMonitor({ machineNames, run, url, ca, evidenceDi
     return JSON.parse(result.stdout.trim());
   };
   const sample = async (phase = "interval") => {
-    for (const [machine, name] of Object.entries(machineNames)) {
+    const machineSamples = await Promise.all(Object.entries(machineNames).map(async ([machine, name]) => {
       const t0 = await machineClock(name);
       const client = new Client({ connectionString: url, ssl: { ca, rejectUnauthorized: true }, connectionTimeoutMillis: 30_000, statement_timeout: 30_000 });
       client.on("error", () => undefined);
@@ -765,8 +931,9 @@ export async function startClockMonitor({ machineNames, run, url, ca, evidenceDi
       const t1 = await machineClock(name);
       const radiusMs = Math.max(0, (t1.wallMs - t0.wallMs) / 2);
       const databaseConnections = connections?.reduce((sum, entry) => sum + Number(entry.connections), 0);
-      samples.push({ phase, machine, t0, serverTime: server?.now, connections, databaseConnections, t1, radiusMs, verdict: radiusMs <= 250 ? "pass" : "fail" });
-    }
+      return { phase, machine, t0, serverTime: server?.now, connections, databaseConnections, t1, radiusMs, verdict: radiusMs <= 250 ? "pass" : "fail" };
+    }));
+    samples.push(...machineSamples);
   };
   await sample("start");
   const stopController = new AbortController();
@@ -879,15 +1046,16 @@ function jsonFromFile(path) {
 }
 
 export function prepareEvidenceDirectory(path, metadata) {
-  if (metadata.approval !== undefined) {
-    const approvedAt = Date.parse(metadata.approval.approvedAt);
-    const startedAt = Date.parse(metadata.startedAt);
-    if (!Number.isFinite(approvedAt) || !Number.isFinite(startedAt) || approvedAt > startedAt) {
-      throw new Error("contract approval must precede evidence collection");
-    }
-    if (metadata.approval.contractSha256 !== metadata.contractSha256) {
-      throw new Error("evidence metadata approval hash does not match the contract");
-    }
+  if (!metadata.approval || !/^[0-9a-f]{64}$/u.test(metadata.approvalSha256 ?? "")) {
+    throw new Error("certification evidence collection requires an approval receipt");
+  }
+  const approvedAt = Date.parse(metadata.approval.approvedAt);
+  const startedAt = Date.parse(metadata.startedAt);
+  if (!Number.isFinite(approvedAt) || !Number.isFinite(startedAt) || approvedAt > startedAt) {
+    throw new Error("contract approval must precede evidence collection");
+  }
+  if (metadata.approval.contractSha256 !== metadata.contractSha256) {
+    throw new Error("evidence metadata approval hash does not match the contract");
   }
   const fromRepository = relative(repositoryRoot, path);
   if (fromRepository === "" || (!fromRepository.startsWith("..") && !isAbsolute(fromRepository))) {
@@ -908,6 +1076,7 @@ export async function runLocalCertification(options, dependencies = {}) {
     profile: options.profile,
     contractSha256: options.contractSha256,
     approval: options.approval,
+    approvalSha256: options.approvalSha256,
     startedAt: new Date().toISOString(),
   });
   const executeHarness = dependencies.runHarness ?? runHarness;
@@ -924,7 +1093,7 @@ export async function runLocalCertification(options, dependencies = {}) {
         machineAgentPath: new URL("../test/certification/machine-agent.mjs", import.meta.url),
       });
       const executionProvenance = (dependencies.captureExecutionProvenance ?? captureExecutionProvenance)(
-        dependencies.sourceRoot ?? repositoryRoot, options.contractSha256, stage.sha256,
+        dependencies.sourceRoot ?? repositoryRoot, options.contractSha256, stage.sha256, options.approvalSha256,
       );
       assertExecutionProvenance(options.profile, executionProvenance);
       writeFileSync(join(options.evidenceDirectory, "execution-provenance.json"), `${JSON.stringify(executionProvenance, null, 2)}\n`, { mode: 0o600, flag: "wx" });
@@ -953,6 +1122,11 @@ export async function runLocalCertification(options, dependencies = {}) {
           owner: context.owner,
           runId: context.runId,
         });
+        const preActivationResidual = await (dependencies.collectResidualState ?? collectResidualState)({
+          url: context.environment.LCM_TEST_POSTGRES_ADMIN_URL,
+          ca: readFileSync(context.environment.LCM_TEST_POSTGRES_CA_FILE, "utf8"),
+        });
+        writeFileSync(join(options.evidenceDirectory, "pre-activation-residual.json"), `${JSON.stringify(preActivationResidual, null, 2)}\n`, { mode: 0o600, flag: "wx" });
         let databaseReadiness;
         for (const machine of ['a', 'b']) {
           const homeParent = join(context.directory, `machine-${machine}-home-parent`);
@@ -998,19 +1172,27 @@ export async function runLocalCertification(options, dependencies = {}) {
             ? dependencies.delay(durationMs)
             : monitorMachinesForDuration({ machineNames, run: runContainer, durationMs });
         const setupStartedAt = Date.now();
+        const setupDeadline = setupStartedAt + contract.timeline.full.setupMaxSeconds * 1000;
+        const waitForSetupFiles = (paths, machineNames) => {
+          const remainingMs = setupDeadline - Date.now();
+          if (remainingMs <= 0) throw new Error("certification setup exceeded setupMaxSeconds");
+          return waitForFiles(paths, machineNames, remainingMs);
+        };
         const activationReceipts = {};
+        const poolByMachine = {};
         let revocation;
         let runtimeGrant;
+        let setupSessionClosure;
         await runMachineActivationBarrier({
           verifyA: async () => {
             await runContainer(["container", "start", context.names.machineA]);
             writeFileSync(join(options.evidenceDirectory, "machine-a", "migration-start.json"), `${JSON.stringify({ at: new Date().toISOString() })}\n`, { mode: 0o600, flag: "wx" });
-            await waitForFiles([join(options.evidenceDirectory, "machine-a", "verification-receipt.json")], [context.names.machineA], contract.timeline.full.setupMaxSeconds * 1000);
+            await waitForSetupFiles([join(options.evidenceDirectory, "machine-a", "verification-receipt.json")], [context.names.machineA]);
           },
           verifyB: async () => {
             await runContainer(["container", "start", context.names.machineB]);
             writeFileSync(join(options.evidenceDirectory, "machine-b", "migration-start.json"), `${JSON.stringify({ at: new Date().toISOString() })}\n`, { mode: 0o600, flag: "wx" });
-            await waitForFiles([join(options.evidenceDirectory, "machine-b", "verification-receipt.json")], [context.names.machineA, context.names.machineB], contract.timeline.full.setupMaxSeconds * 1000);
+            await waitForSetupFiles([join(options.evidenceDirectory, "machine-b", "verification-receipt.json")], [context.names.machineA, context.names.machineB]);
           },
           grantRuntime: async () => {
             runtimeGrant = await (dependencies.grantRuntime ?? grantRuntimeProfile)({
@@ -1024,13 +1206,13 @@ export async function runLocalCertification(options, dependencies = {}) {
           activateA: async () => {
             writeFileSync(join(options.evidenceDirectory, "machine-a", "activation-start.json"), `${JSON.stringify({ at: new Date().toISOString() })}\n`, { mode: 0o600, flag: "wx" });
             const path = join(options.evidenceDirectory, "machine-a", "activation-receipt.json");
-            await waitForFiles([path], [context.names.machineA], contract.timeline.full.setupMaxSeconds * 1000);
+            await waitForSetupFiles([path], [context.names.machineA]);
             activationReceipts.a = jsonFromFile(path);
           },
           activateB: async () => {
             writeFileSync(join(options.evidenceDirectory, "machine-b", "activation-start.json"), `${JSON.stringify({ at: new Date().toISOString() })}\n`, { mode: 0o600, flag: "wx" });
             const path = join(options.evidenceDirectory, "machine-b", "activation-receipt.json");
-            await waitForFiles([path], [context.names.machineA, context.names.machineB], contract.timeline.full.setupMaxSeconds * 1000);
+            await waitForSetupFiles([path], [context.names.machineA, context.names.machineB]);
             activationReceipts.b = jsonFromFile(path);
           },
           revokeTransfer: async () => {
@@ -1057,20 +1239,34 @@ export async function runLocalCertification(options, dependencies = {}) {
               expectedMigrationCount: readdirSync(join(dependencies.sourceRoot ?? repositoryRoot, "src", "storage", "postgresql", "migrations")).filter((name) => name.endsWith(".sql")).length,
               requireResidualEmpty: false,
             });
+            setupSessionClosure = await (dependencies.collectSetupSessionClosure ?? collectSetupSessionClosure)({
+              url: context.environment.LCM_TEST_POSTGRES_ADMIN_URL,
+              ca: readFileSync(context.environment.LCM_TEST_POSTGRES_CA_FILE, "utf8"),
+              roles: ["lcm_test_migrator", databasePreparation.transferName],
+            });
           },
           startDaemonA: async () => {
             writeFileSync(join(options.evidenceDirectory, "machine-a", "runtime-ready.json"), `${JSON.stringify({ at: new Date().toISOString() })}\n`, { mode: 0o600, flag: "wx" });
-            await waitForFiles([join(options.evidenceDirectory, "machine-a", "daemon-started.json")], [context.names.machineA, context.names.machineB], contract.timeline.full.setupMaxSeconds * 1000);
+            await waitForSetupFiles([join(options.evidenceDirectory, "machine-a", "daemon-started.json")], [context.names.machineA, context.names.machineB]);
+            poolByMachine.a = await collectMachinePoolWitness(context.names.machineA, runContainer);
           },
           stagger: () => monitorDelay([context.names.machineA, context.names.machineB], contract.timeline.full.secondDaemonStartOffsetSeconds * 1000),
           startDaemonB: async () => {
             writeFileSync(join(options.evidenceDirectory, "machine-b", "runtime-ready.json"), `${JSON.stringify({ at: new Date().toISOString() })}\n`, { mode: 0o600, flag: "wx" });
-            await waitForFiles([join(options.evidenceDirectory, "machine-b", "daemon-started.json")], [context.names.machineA, context.names.machineB], contract.timeline.full.setupMaxSeconds * 1000);
+            await waitForSetupFiles([join(options.evidenceDirectory, "machine-b", "daemon-started.json")], [context.names.machineA, context.names.machineB]);
+            poolByMachine.b = await collectMachinePoolWitness(context.names.machineB, runContainer);
           },
         });
-        if (Date.now() - setupStartedAt > contract.timeline.full.setupMaxSeconds * 1000) {
+        if (Date.now() > setupDeadline) {
           throw new Error("certification setup exceeded setupMaxSeconds");
         }
+        databaseReadiness = {
+          ...databaseReadiness,
+          configuredPoolMax: poolByMachine.a?.configuredMax === poolByMachine.b?.configuredMax ? poolByMachine.a.configuredMax : undefined,
+          poolByMachine,
+          setupSessionsClosed: setupSessionClosure.setupSessionsClosed,
+          setupSessionClosure,
+        };
         writeFileSync(join(options.evidenceDirectory, "setup-evidence.json"), `${JSON.stringify({
           startedAt: new Date(setupStartedAt).toISOString(),
           completedAt: new Date().toISOString(),
@@ -1079,12 +1275,14 @@ export async function runLocalCertification(options, dependencies = {}) {
           runtimeGrant,
           runtimeReadiness: "pass",
           daemonStartOrder: ["a", "b"],
+          setupSessionClosure,
+          poolByMachine,
         }, null, 2)}\n`, { mode: 0o600, flag: "wx" });
+        writeFileSync(join(options.evidenceDirectory, "setup-session-closure.json"), `${JSON.stringify(setupSessionClosure, null, 2)}\n`, { mode: 0o600, flag: "wx" });
         writeFileSync(join(options.evidenceDirectory, "database-readiness.json"), `${JSON.stringify(databaseReadiness, null, 2)}\n`, { mode: 0o600, flag: "wx" });
-        await waitForFiles(
+        await waitForSetupFiles(
           ['a', 'b'].map((machine) => join(options.evidenceDirectory, `machine-${machine}`, "ready.json")),
           [context.names.machineA, context.names.machineB],
-          contract.timeline.full.setupMaxSeconds * 1000,
         );
         const identities = verifyDistinctMachineIdentities({ a: machineRoots.a.home, b: machineRoots.b.home });
         writeFileSync(join(options.evidenceDirectory, "machine-identities.json"), `${JSON.stringify(identities, null, 2)}\n`, { mode: 0o600, flag: "wx" });
@@ -1223,6 +1421,7 @@ export async function main(argv = process.argv.slice(2)) {
   options.contractSha256 = loaded.sha256;
   options.contractStatus = loaded.status;
   options.approval = loaded.approval;
+  options.approvalSha256 = loaded.approvalSha256;
   if (options.lane === "local") {
     const deadlineSeconds = options.profile === "full" ? 10_800 : 1_800;
     const deadline = setTimeout(() => process.kill(process.pid, "SIGTERM"), deadlineSeconds * 1000);

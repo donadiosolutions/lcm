@@ -6,18 +6,15 @@ import { pathToFileURL } from "node:url";
 import { validateEvidence } from "../test/postgresql/cutover-rehearsal/check-evidence.ts";
 import { loadCertificationContract } from "../test/certification/contract.mjs";
 import { assembleCertificationGate, errorRate, evaluatePercentiles, nearestRank, writeCertificationGate } from "../test/certification/slo.mjs";
-import { createDeterministicSchedule } from "../test/certification/schedule.mjs";
+import { createDeterministicSchedule, createFaultSchedule } from "../test/certification/schedule.mjs";
 import { captureExecutionProvenance, recoveryWindowSearch } from "./certification-harness.mjs";
 
 function json(path) { return JSON.parse(readFileSync(path, "utf8")); }
 function ndjson(path) {
   return readFileSync(path, "utf8").split(/\r?\n/u).filter(Boolean).map((line) => JSON.parse(line));
 }
-function sampleFile(directory, name, values) {
-  const path = join(directory, name);
-  writeFileSync(path, values.map((value) => `${JSON.stringify(value)}\n`).join(""), { mode: 0o600, flag: "wx" });
-  return name;
-}
+// Allow five seconds for query duration and scheduler jitter on a 60-second cadence.
+const clockCadenceNanos = 65_000_000_000n;
 
 function percentileSlos(id, samples, thresholds, minimums, file) {
   const evaluated = evaluatePercentiles(samples, thresholds, minimums);
@@ -27,26 +24,31 @@ function percentileSlos(id, samples, thresholds, minimums, file) {
     inputs: { count: samples.length, sampleFile: file },
     threshold,
     observed: evaluated.observed[percentile] ?? 0,
-    verdict: evaluated.reasons.some((reason) => reason.startsWith(percentile))
-      ? (evaluated.reasons.some((reason) => reason.startsWith(percentile) && reason.includes("exceeds")) ? "fail" : "incomplete")
-      : "pass",
+    verdict: evaluated.verdicts[percentile],
   }));
 }
 
-export function clockVerdict(samples, threshold, minimumCount = 2) {
+export function clockVerdict(samples, threshold, minimumCount = 2, steadySeconds = 0, steadyStartMs, steadyEndMs) {
   const finite = samples.filter((entry) => Number.isFinite(entry?.radiusMs) && entry.radiusMs >= 0);
   if (finite.some((entry) => entry.radiusMs > threshold || entry.verdict === "fail")) return "fail";
   const validBracket = (entry) => ['a', 'b'].includes(entry.machine)
     && Number.isFinite(entry.t0?.wallMs) && Number.isFinite(entry.t1?.wallMs) && entry.t1.wallMs >= entry.t0.wallMs
     && typeof entry.t0?.monotonicNs === "string" && /^\d+$/u.test(entry.t0.monotonicNs)
     && typeof entry.t1?.monotonicNs === "string" && /^\d+$/u.test(entry.t1.monotonicNs)
+    && BigInt(entry.t1.monotonicNs) >= BigInt(entry.t0.monotonicNs)
     && Number.isFinite(Date.parse(entry.serverTime))
     && Math.abs(entry.radiusMs - (entry.t1.wallMs - entry.t0.wallMs) / 2) < 0.001;
-  const perMachineMinimum = Math.floor(minimumCount / 2);
-  if (samples.length < minimumCount || finite.length !== samples.length || samples.some((entry) => entry.verdict === "incomplete" || !validBracket(entry))
-    || ['a', 'b'].some((machine) => samples.filter((entry) => entry.machine === machine).length < perMachineMinimum
-      || !samples.some((entry) => entry.machine === machine && entry.phase === "start")
-      || !samples.some((entry) => entry.machine === machine && entry.phase === "end"))) return "incomplete";
+  const expectedPerMachine = Math.max(2, Math.floor(steadySeconds / 60) + 1);
+  if (samples.length < minimumCount || finite.length !== samples.length || samples.some((entry) => entry.verdict === "incomplete" || !validBracket(entry))) return "incomplete";
+  for (const machine of ['a', 'b']) {
+    const rows = samples.filter((entry) => entry.machine === machine)
+      .sort((left, right) => Number(BigInt(left.t0.monotonicNs) - BigInt(right.t0.monotonicNs)));
+    if (rows.length < expectedPerMachine || rows[0]?.phase !== "start" || rows.at(-1)?.phase !== "end") return "incomplete";
+    if (Number.isFinite(steadyStartMs) && Number.isFinite(steadyEndMs)
+      && (rows[0].t0.wallMs > steadyStartMs || rows.at(-1).t0.wallMs < steadyEndMs)) return "incomplete";
+    if (BigInt(rows.at(-1).t0.monotonicNs) - BigInt(rows[0].t0.monotonicNs) < BigInt(steadySeconds) * 1_000_000_000n) return "incomplete";
+    if (rows.slice(1).some((entry, index) => BigInt(entry.t0.monotonicNs) - BigInt(rows[index].t0.monotonicNs) > clockCadenceNanos)) return "incomplete";
+  }
   return "pass";
 }
 
@@ -98,19 +100,33 @@ export function reconcileOracleBijection(invocations, mappings, acknowledgments)
 }
 
 export function recoveryVerdicts(observed, limits) {
-  const values = Object.values(observed);
-  const incomplete = !values.every((value) => Number.isFinite(value) && value >= 0);
-  const failed = !incomplete && (observed.firstSuccessSeconds > limits.firstSuccess || observed.outageSeconds > limits.outage
-    || observed.rtoSeconds > limits.rto || observed.catchUpSeconds > limits.catchUp);
+  const checks = [
+    [observed.firstSuccessSeconds, limits.firstSuccess],
+    [observed.outageSeconds, limits.outage],
+    [observed.rtoSeconds, limits.rto],
+    [observed.catchUpSeconds, limits.catchUp],
+  ];
+  const incomplete = checks.some(([value]) => !Number.isFinite(value) || value < 0);
+  const failed = limits.knownFailure === true || checks.some(([value, threshold]) => Number.isFinite(value)
+    && value >= 0 && Number.isFinite(threshold) && value > threshold);
   return { verdict: failed ? "fail" : incomplete ? "incomplete" : "pass", ...observed };
 }
 
 export function buildEvidenceManifest({ evidenceDirectory, contract, persist = true }) {
+  const generatedSamples = {};
+  const sampleFile = (name, values) => {
+    generatedSamples[name] = Buffer.from(values.map((value) => `${JSON.stringify(value)}\n`).join(""));
+    return name;
+  };
   const run = json(join(evidenceDirectory, "run.json"));
   const identities = json(join(evidenceDirectory, "machine-identities.json"));
   const cleanup = json(join(evidenceDirectory, "cleanup.json"));
   const executionProvenance = json(join(evidenceDirectory, "execution-provenance.json"));
   const databaseReadiness = json(join(evidenceDirectory, "database-readiness.json"));
+  const preActivationResidualPath = join(evidenceDirectory, "pre-activation-residual.json");
+  const setupSessionClosurePath = join(evidenceDirectory, "setup-session-closure.json");
+  const preActivationResidual = existsSync(preActivationResidualPath) ? json(preActivationResidualPath) : undefined;
+  const setupSessionClosure = existsSync(setupSessionClosurePath) ? json(setupSessionClosurePath) : undefined;
   const cleanupFieldsPass = cleanup.residualResources === 0
     && cleanup.labeledContainers === contract.thresholds.cleanup.labeledContainers
     && cleanup.labeledNetworks === contract.thresholds.cleanup.labeledNetworks
@@ -157,10 +173,10 @@ export function buildEvidenceManifest({ evidenceDirectory, contract, persist = t
   const search = successful("search");
   const store = successful("store");
   const files = {
-    hook: sampleFile(evidenceDirectory, "hook-command-samples.ndjson", hook),
-    search: sampleFile(evidenceDirectory, "daemon-search-samples.ndjson", search),
-    store: sampleFile(evidenceDirectory, "daemon-store-samples.ndjson", store),
-    attempts: sampleFile(evidenceDirectory, "steady-attempts.ndjson", steady),
+    hook: sampleFile("hook-command-samples.ndjson", hook),
+    search: sampleFile("daemon-search-samples.ndjson", search),
+    store: sampleFile("daemon-store-samples.ndjson", store),
+    attempts: sampleFile("steady-attempts.ndjson", steady),
   };
   const minimums = contract.calculations.minimumSamples;
   const slos = [
@@ -185,6 +201,41 @@ export function buildEvidenceManifest({ evidenceDirectory, contract, persist = t
   const expectedDatabase = run.lane === "local" ? `lcm_harness_${String(run.runId).slice(0, 20)}` : `lcm_cert_${run.runId}`.slice(0, 63);
   const expectedRole = run.lane === "local" ? "lcm_test_runtime" : `lcm_cert_runtime_${run.runId}`.slice(0, 63);
   const expectedExtensions = ["pg_stat_statements", "pg_trgm", "pgcrypto", "unaccent"];
+  const residualKeys = ["machines", "projects", "conversations", "passive_events"];
+  const residualCounts = preActivationResidual?.residual;
+  const residualWitnessPresent = Number.isFinite(Date.parse(preActivationResidual?.observedAt))
+    && residualCounts && typeof residualCounts === "object"
+    && residualKeys.every((key) => Number.isSafeInteger(residualCounts[key]) && residualCounts[key] >= 0);
+  const preActivationEmpty = residualWitnessPresent
+    && Object.keys(residualCounts).length === residualKeys.length
+    && residualKeys.every((key) => residualCounts[key] === 0)
+    && preActivationResidual.residualEmpty === true;
+  const poolRows = databaseReadiness.poolByMachine;
+  const poolEvidencePresent = ["a", "b"].every((machine) => Number.isFinite(Date.parse(poolRows?.[machine]?.observedAt))
+    && Number.isSafeInteger(poolRows?.[machine]?.configuredMax) && poolRows[machine].configuredMax > 0)
+    && (poolRows?.a?.configuredMax !== poolRows?.b?.configuredMax || Number.isSafeInteger(databaseReadiness.configuredPoolMax));
+  const poolConfigMatches = poolEvidencePresent
+    && ["a", "b"].every((machine) => poolRows[machine].configuredMax === contract.thresholds.capacity.poolMaxPerRuntime)
+    && databaseReadiness.configuredPoolMax === contract.thresholds.capacity.poolMaxPerRuntime;
+  const closureRoles = setupSessionClosure?.roles;
+  const closureWitnessPresent = Number.isFinite(Date.parse(setupSessionClosure?.observedAt))
+    && closureRoles && typeof closureRoles === "object" && !Array.isArray(closureRoles)
+    && Object.keys(closureRoles).length === 2
+    && Object.values(closureRoles).every((count) => Number.isSafeInteger(count) && count >= 0)
+    && Number.isSafeInteger(setupSessionClosure?.totalConnections) && setupSessionClosure.totalConnections >= 0
+    && Object.values(closureRoles).reduce((sum, count) => sum + count, 0) === setupSessionClosure.totalConnections
+    && typeof setupSessionClosure?.setupSessionsClosed === "boolean"
+    && databaseReadiness.setupSessionClosure
+    && typeof databaseReadiness.setupSessionsClosed === "boolean";
+  const nestedClosure = databaseReadiness.setupSessionClosure;
+  const closureConsistent = closureWitnessPresent
+    && nestedClosure.observedAt === setupSessionClosure.observedAt
+    && nestedClosure.totalConnections === setupSessionClosure.totalConnections
+    && nestedClosure.setupSessionsClosed === setupSessionClosure.setupSessionsClosed
+    && JSON.stringify(nestedClosure.roles) === JSON.stringify(setupSessionClosure.roles)
+    && databaseReadiness.setupSessionsClosed === setupSessionClosure.setupSessionsClosed;
+  const setupSessionsClosed = closureConsistent && setupSessionClosure.setupSessionsClosed === true
+    && setupSessionClosure.totalConnections === 0 && Object.values(closureRoles).every((count) => count === 0);
   const actualExtensions = Array.isArray(databaseReadiness.extensions)
     ? databaseReadiness.extensions.map((entry) => `${entry?.name}:${entry?.schema}`).sort()
     : [];
@@ -205,15 +256,16 @@ export function buildEvidenceManifest({ evidenceDirectory, contract, persist = t
     && databaseReadiness.role?.superuser === false
     && databaseReadiness.role?.createRole === false
     && databaseReadiness.role?.createDb === false
-    && databaseReadiness.residualEmpty === true
+    && preActivationEmpty
     && Object.values(drains).every((entry) => entry.verdict === "pass" && Number.isInteger(entry.expectedEvents)
       && entry.expectedEvents > 0 && entry.acknowledged === entry.expectedEvents
       && entry.remotePruned === entry.expectedEvents && entry.nonterminal === 0 && entry.awaitingRemotePrune === 0);
-  const readinessFile = sampleFile(evidenceDirectory, "readiness-witness.ndjson", [{ databaseReadiness, readinessByMachine, drains }]);
+  const readinessFile = sampleFile("readiness-witness.ndjson", [{ databaseReadiness, preActivationResidual, readinessByMachine, setupSessionClosure, drains }]);
+  const readinessEvidenceMissing = !residualWitnessPresent || !closureWitnessPresent || !poolEvidencePresent;
   slos.push({
     id: "readiness", formula: "all database, role, TLS, machine and drain predicates",
     inputs: { count: 2, sampleFile: readinessFile }, threshold: 1, observed: readinessOk ? 1 : 0,
-    verdict: readinessOk ? "pass" : "fail",
+    verdict: readinessEvidenceMissing ? "incomplete" : readinessOk ? "pass" : "fail",
   });
   const drainFailures = Object.values(drains).filter((entry) => entry.verdict !== "pass"
     || entry.expectedEvents <= 0 || entry.acknowledged !== entry.expectedEvents
@@ -225,8 +277,8 @@ export function buildEvidenceManifest({ evidenceDirectory, contract, persist = t
     slos.push({
       id: `hook-command.${label}.p95`, formula: "nearest-rank per hook kind", inputs: { count: rows.length, sampleFile: files.hook },
       threshold: contract.thresholds.hookCommandMs.perKindPooledP95, observed,
-      verdict: rows.length < contract.thresholds.hookCommandMs.minSuccessesForSubgates ? "incomplete"
-        : observed <= contract.thresholds.hookCommandMs.perKindPooledP95 ? "pass" : "fail",
+      verdict: observed > contract.thresholds.hookCommandMs.perKindPooledP95 ? "fail"
+        : rows.length < contract.thresholds.hookCommandMs.minSuccessesForSubgates ? "incomplete" : "pass",
     });
   }
   for (const machine of ['a', 'b']) {
@@ -235,15 +287,16 @@ export function buildEvidenceManifest({ evidenceDirectory, contract, persist = t
     slos.push({
       id: `hook-command.machine-${machine}.p95`, formula: "nearest-rank per machine", inputs: { count: rows.length, sampleFile: files.hook },
       threshold: contract.thresholds.hookCommandMs.perMachineP95, observed,
-      verdict: rows.length < contract.thresholds.hookCommandMs.minSuccessesForSubgates ? "incomplete"
-        : observed <= contract.thresholds.hookCommandMs.perMachineP95 ? "pass" : "fail",
+      verdict: observed > contract.thresholds.hookCommandMs.perMachineP95 ? "fail"
+        : rows.length < contract.thresholds.hookCommandMs.minSuccessesForSubgates ? "incomplete" : "pass",
     });
   }
-  const expected = contract.workload.expectedPooledSteadyAttemptsPerLane;
-  const scheduled = expected.hookInvocations + expected.daemonSearch + expected.daemonStore;
+  const expectedSteady = expectedAttempts.filter((sample) => ["hook", "search", "store"].includes(sample.op));
+  const scheduled = expectedSteady.length;
   const relevant = steady.filter((sample) => ["hook", "search", "store"].includes(sample.op));
-  const failures = relevant.filter((sample) => sample.outcome !== "success").length + Math.max(0, scheduled - relevant.length);
-  const observedErrorRate = errorRate({ scheduled, failed: Math.min(scheduled, failures) });
+  const observedById = new Map(relevant.map((sample) => [sample.id, sample]));
+  const failures = expectedSteady.filter((sample) => observedById.get(sample.id)?.outcome !== "success").length;
+  const observedErrorRate = errorRate({ scheduled, failed: failures });
   slos.push({
     id: "non-injected-error-rate", formula: "failed or missing steady attempts / scheduled attempts",
     inputs: { count: relevant.length, sampleFile: files.attempts }, threshold: contract.thresholds.errors.nonInjectedErrorRateMax,
@@ -271,12 +324,12 @@ export function buildEvidenceManifest({ evidenceDirectory, contract, persist = t
       lagSamples.push(Math.max(0, Number(BigInt(acknowledgment.firstSeenMonotonicNs) - BigInt(sample.processExitNs))) / 1e9);
     }
   }
-  const lagFile = sampleFile(evidenceDirectory, "acknowledgment-lag-samples.ndjson", lagSamples.map((seconds) => ({ seconds })));
-  const oracleFile = sampleFile(evidenceDirectory, "oracle-events.ndjson", mappings.map((mapping) => ({ ...mapping, acknowledgment: acknowledgments[mapping.eventUuid] })));
+  const lagFile = sampleFile("acknowledgment-lag-samples.ndjson", lagSamples.map((seconds) => ({ seconds })));
+  const oracleFile = sampleFile("oracle-events.ndjson", mappings.map((mapping) => ({ ...mapping, acknowledgment: acknowledgments[mapping.eventUuid] })));
   const lagP99 = lagSamples.length === 0 ? 0 : nearestRank(lagSamples, 0.99);
   const lagMax = lagSamples.length === 0 ? 0 : Math.max(...lagSamples);
   slos.push(
-    { id: "acknowledgment-lag.p99", formula: "nearest-rank", inputs: { count: lagSamples.length, sampleFile: lagFile }, threshold: contract.thresholds.acknowledgmentLagSeconds.p99, observed: lagP99, verdict: lagSamples.length < minimums.p99 ? "incomplete" : lagP99 <= contract.thresholds.acknowledgmentLagSeconds.p99 ? "pass" : "fail" },
+    { id: "acknowledgment-lag.p99", formula: "nearest-rank", inputs: { count: lagSamples.length, sampleFile: lagFile }, threshold: contract.thresholds.acknowledgmentLagSeconds.p99, observed: lagP99, verdict: lagSamples.length > 0 && lagP99 > contract.thresholds.acknowledgmentLagSeconds.p99 ? "fail" : lagSamples.length < minimums.p99 ? "incomplete" : "pass" },
     { id: "acknowledgment-lag.max", formula: "maximum", inputs: { count: lagSamples.length, sampleFile: lagFile }, threshold: contract.thresholds.acknowledgmentLagSeconds.max, observed: lagMax, verdict: lagSamples.length === 0 ? "incomplete" : lagMax <= contract.thresholds.acknowledgmentLagSeconds.max ? "pass" : "fail" },
     { id: "oracle-capture-bijection", formula: "one invocation to one unique event", inputs: { count: invocationOutcomes.length, sampleFile: oracleFile }, threshold: 0, observed: oracle.missingCapture.length + oracle.reusedEvents.length, verdict: oracle.verdict === "incomplete" ? "incomplete" : "pass" },
     { id: "event-loss", formula: "captured events without terminal acknowledgment", inputs: { count: mappings.length, sampleFile: oracleFile }, threshold: 0, observed: oracle.missingAcknowledgment.length, verdict: oracle.missingAcknowledgment.length === 0 ? "pass" : "fail" },
@@ -293,10 +346,12 @@ export function buildEvidenceManifest({ evidenceDirectory, contract, persist = t
     if (slo.verdict !== "fail" && observerIncomplete) slo.verdict = "incomplete";
   }
   slos.push({ id: "observer-completeness", formula: "all one-second polls present, bounded and identity-stable", inputs: { count: observerRows.length, sampleFile: "observer-witness.ndjson" }, threshold: 0, observed: observerRows.filter((entry) => entry.incomplete).length, verdict: observerIncomplete ? "incomplete" : "pass" });
-  sampleFile(evidenceDirectory, "observer-witness.ndjson", observerRows);
+  sampleFile("observer-witness.ndjson", observerRows);
   const clocks = json(join(evidenceDirectory, "clock-witness.json"));
   const clockRadius = Math.max(0, ...clocks.filter((entry) => typeof entry.radiusMs === "number").map((entry) => entry.radiusMs));
-  const clockState = clockVerdict(clocks, contract.thresholds.clock.maxIntervalRadiusMs, Math.floor(contract.timeline.full.steadySeconds / 60) * 2 + 2);
+  const steadySeconds = contract.timeline[run.profile].steadySeconds;
+  const clockState = clockVerdict(clocks, contract.thresholds.clock.maxIntervalRadiusMs,
+    Math.floor(steadySeconds / 60) * 2 + 2, steadySeconds, steadyStart, steadyEnd);
   slos.push({
     id: "clock-interval-radius", formula: "max((t1.wall-t0.wall)/2)", inputs: { count: clocks.length, sampleFile: "clock-witness.json" },
     threshold: contract.thresholds.clock.maxIntervalRadiusMs, observed: clockRadius,
@@ -309,17 +364,22 @@ export function buildEvidenceManifest({ evidenceDirectory, contract, persist = t
   const perAddressWithinCap = runtimeGroups.every((entry) => Number(entry.connections) <= 8);
   const capacityMissing = clocks.length === 0 || clocks.some((entry) => !Array.isArray(entry.connections))
     || !Number.isFinite(databaseReadiness.maxConnections) || !Number.isFinite(databaseReadiness.reservedConnections)
-    || databaseReadiness.configuredPoolMax !== contract.thresholds.capacity.poolMaxPerRuntime
-    || databaseReadiness.setupSessionsClosed !== true || runtimeAddresses.size < 2;
+    || !poolEvidencePresent || !closureWitnessPresent || !closureConsistent || runtimeAddresses.size < 2;
   const capacityLimit = Math.min(contract.thresholds.capacity.totalMax, run.lane === "managed" ? contract.thresholds.capacity.managedUsableBudget : contract.thresholds.capacity.totalMax);
-  slos.push({ id: "capacity", formula: "attributed per-address runtime peaks plus coordinator within configured total and usable budget", inputs: { count: clocks.length, sampleFile: "clock-witness.json" }, threshold: capacityLimit, observed: connectionPeak, verdict: capacityMissing ? "incomplete" : connectionPeak <= capacityLimit && perAddressWithinCap ? "pass" : "fail" });
+  const capacityFail = (poolEvidencePresent && !poolConfigMatches)
+    || (closureWitnessPresent && closureConsistent && !setupSessionsClosed)
+    || (closureWitnessPresent && !closureConsistent)
+    || connectionPeak > capacityLimit || !perAddressWithinCap;
+  slos.push({ id: "capacity", formula: "measured per-machine pools and setup-role closure plus attributed runtime peaks within configured total and usable budget", inputs: { count: clocks.length, sampleFile: "clock-witness.json" }, threshold: capacityLimit, observed: connectionPeak, verdict: capacityFail ? "fail" : capacityMissing ? "incomplete" : "pass" });
   const faults = existsSync(join(evidenceDirectory, "faults.json"))
     ? json(join(evidenceDirectory, "faults.json"))
     : existsSync(join(evidenceDirectory, "fault-partition-a.json")) ? [json(join(evidenceDirectory, "fault-partition-a.json"))] : [];
-  const expectedFaultIds = contract.lanes[run.lane].faults.map((fault) => fault === "partition-machine-a" ? "partition-a" : fault).sort();
+  const expectedFaultIds = (run.profile === "full" ? contract.lanes[run.lane].faults : [])
+    .map((fault) => fault === "partition-machine-a" ? "partition-a" : fault).sort();
   const actualFaultIds = faults.map((fault) => fault.id).sort();
-  const faultSetPass = JSON.stringify(expectedFaultIds) === JSON.stringify(actualFaultIds);
-  slos.push({ id: "lane-fault-set", formula: "exact contract lane fault IDs", inputs: { count: faults.length, sampleFile: faults.length > 1 ? "faults.json" : "fault-partition-a.json" }, threshold: expectedFaultIds.length, observed: faults.length, verdict: faultSetPass ? "pass" : "fail" });
+  const faultSetVerdict = run.profile === "smoke" && faults.length === 0 ? "incomplete"
+    : JSON.stringify(expectedFaultIds) === JSON.stringify(actualFaultIds) ? "pass" : "fail";
+  slos.push({ id: "lane-fault-set", formula: "full-profile exact contract lane fault IDs", inputs: { count: faults.length, sampleFile: "faults.json" }, threshold: expectedFaultIds.length, observed: faults.length, verdict: faultSetVerdict });
   for (const fault of faults) {
     const limit = fault.kind === "restart-database"
       ? contract.thresholds.recovery.restartDatabase.rtoSeconds
@@ -330,18 +390,42 @@ export function buildEvidenceManifest({ evidenceDirectory, contract, persist = t
     const windows = affected.map((machine) => recoveryWindowSearch(faultSamples, {
       machine, clearedAtMs: Date.parse(fault.clearedAt), deadlineMs: Date.parse(fault.appliedAt) + limit * 1000,
     }));
-    const firstSuccess = Math.min(...faultSamples.filter((sample) => affected.includes(sample.machine) && sample.outcome === "success" && Date.parse(sample.wallEndedAt) >= Date.parse(fault.clearedAt)).map((sample) => (Date.parse(sample.wallEndedAt) - Date.parse(fault.clearedAt)) / 1000));
+    const firstSuccessByMachine = affected.map((machine) => {
+      const successes = faultSamples.filter((sample) => sample.machine === machine && sample.outcome === "success"
+        && Date.parse(sample.wallEndedAt) >= Date.parse(fault.clearedAt));
+      return successes.length === 0 ? Number.POSITIVE_INFINITY
+        : Math.min(...successes.map((sample) => (Date.parse(sample.wallEndedAt) - Date.parse(fault.clearedAt)) / 1000));
+    });
+    const firstSuccess = Math.max(...firstSuccessByMachine);
     const observed = windows.every((entry) => entry.pass) ? Math.max(...windows.map((entry) => (entry.endMs - Date.parse(fault.appliedAt)) / 1000)) : Number.POSITIVE_INFINITY;
     const catchUps = affected.map((machine) => json(join(evidenceDirectory, `machine-${machine}`, `${fault.id === "partition-a" ? "partition" : "restart"}-catch-up.json`)));
-    const catchUpComplete = catchUps.every((entry) => entry.verdict === "pass" && entry.remaining === 0 && Number.isFinite(entry.seconds));
-    const catchUpSeconds = catchUpComplete ? Math.max(...catchUps.map((entry) => Number(entry.seconds))) : Number.POSITIVE_INFINITY;
+    const catchUpLimit = contract.thresholds.recovery.acknowledgmentCatchUpAfterClearedSeconds;
+    const catchUpElapsed = catchUps.map((entry) => {
+      const clearedAtMs = Date.parse(entry.clearedAt);
+      const observedAtMs = Date.parse(entry.observedAt);
+      return Number.isFinite(clearedAtMs) && clearedAtMs === Date.parse(fault.clearedAt) && Number.isFinite(observedAtMs) && observedAtMs >= clearedAtMs
+        ? (observedAtMs - clearedAtMs) / 1000 : Number.POSITIVE_INFINITY;
+    });
+    const catchUpComplete = catchUps.every((entry, index) => entry.verdict === "pass" && entry.remaining === 0 && Number.isFinite(catchUpElapsed[index]));
+    const catchUpSeconds = catchUpComplete ? Math.max(...catchUpElapsed) : Number.POSITIVE_INFINITY;
     const outageSeconds = (Date.parse(fault.clearedAt) - Date.parse(fault.appliedAt)) / 1000;
     const recoveryKey = fault.kind === "restart-database" ? "restartDatabase" : "partition";
+    const expectedFaultAttempts = affected.flatMap((machine) => createFaultSchedule({
+      machine, runId: run.runId, phase, durationSeconds: limit,
+    }));
+    const faultSamplesByMachine = new Map(faultSamples.map((sample) => [sample.id, sample]));
+    const faultEvidenceComplete = expectedFaultAttempts.length > 0 && expectedFaultAttempts.every((sample) => {
+      const observedSample = faultSamplesByMachine.get(sample.id);
+      return observedSample && ["success", "failed"].includes(observedSample.outcome);
+    });
     const recovery = recoveryVerdicts({ firstSuccessSeconds: firstSuccess, outageSeconds, rtoSeconds: observed, catchUpSeconds }, {
       firstSuccess: contract.thresholds.recovery[recoveryKey].firstSuccessAfterClearedSeconds,
-      outage: fault.kind === "restart-database" ? contract.thresholds.recovery.restartDatabase.maxOutageSeconds : 60,
+      ...(fault.kind === "restart-database" ? { outage: contract.thresholds.recovery.restartDatabase.maxOutageSeconds } : {}),
       rto: limit,
-      catchUp: contract.thresholds.recovery.acknowledgmentCatchUpAfterClearedSeconds,
+      catchUp: catchUpLimit,
+      knownFailure: faultEvidenceComplete && (firstSuccess > contract.thresholds.recovery[recoveryKey].firstSuccessAfterClearedSeconds
+        || windows.some((entry) => !entry.pass) || catchUps.some((entry, index) => entry.verdict === "fail"
+          || entry.remaining > 0 || (Number.isFinite(catchUpElapsed[index]) && catchUpElapsed[index] > catchUpLimit))),
     });
     const faultFile = existsSync(join(evidenceDirectory, "faults.json")) ? "faults.json" : "fault-partition-a.json";
     slos.push({ id: `recovery.${fault.id}`, formula: "first success, outage, 1-second-aligned per-kind 60-second window and acknowledgment catch-up", inputs: { count: faultSamples.length, sampleFile: faultFile }, threshold: limit, observed: Number.isFinite(observed) ? observed : limit + 1, verdict: recovery.verdict });
@@ -358,6 +442,9 @@ export function buildEvidenceManifest({ evidenceDirectory, contract, persist = t
     startedAt: run.startedAt,
     lane: run.lane,
     profile: run.profile,
+    runContractSha256: run.contractSha256,
+    runApproval: run.approval,
+    runApprovalSha256: run.approvalSha256,
     machines: ['a', 'b'].map((name) => ({ name, ...identities[name] })),
     faults,
     cleanup: verifiedCleanup,
@@ -366,22 +453,26 @@ export function buildEvidenceManifest({ evidenceDirectory, contract, persist = t
     diagnostics,
   };
   if (persist) writeFileSync(join(evidenceDirectory, "evidence-manifest.json"), `${JSON.stringify(manifest, null, 2)}\n`, { mode: 0o600, flag: "wx" });
-  return manifest;
+  return { manifest, sampleFiles: generatedSamples };
 }
 
 export function assembleGateFromEvidence(input, dependencies = {}) {
   const loaded = loadCertificationContract(input.contractPath);
-  const manifest = buildEvidenceManifest({ evidenceDirectory: input.evidenceDirectory, contract: loaded.contract, persist: false });
+  const { manifest, sampleFiles } = buildEvidenceManifest({ evidenceDirectory: input.evidenceDirectory, contract: loaded.contract, persist: false });
   const execution = manifest.executionProvenance;
   const provenance = dependencies.captureProvenance
     ? dependencies.captureProvenance(input.repositoryRoot)
-    : captureExecutionProvenance(input.repositoryRoot, execution.contractSha256, execution.stagedPackageSha256);
-  for (const field of ["testedCommit", "testedInputsSha256", "testedInputsCount", "lockfileSha256", "cliSha256", "node"]) {
+    : captureExecutionProvenance(input.repositoryRoot, execution.contractSha256, execution.stagedPackageSha256, execution.approvalSha256);
+  for (const field of ["testedCommit", "testedInputsSha256", "testedInputsCount", "lockfileSha256", "cliSha256", "approvalSha256", "node"]) {
     if (execution[field] !== provenance[field]) throw new Error(`certification execution provenance differs at ${field}`);
   }
   if (execution.dirty || provenance.dirty || execution.contractSha256 !== loaded.sha256
+    || execution.approvalSha256 !== loaded.approvalSha256
+    || manifest.runContractSha256 !== loaded.sha256
+    || manifest.runApprovalSha256 !== loaded.approvalSha256
+    || JSON.stringify(manifest.runApproval) !== JSON.stringify(loaded.approval)
     || typeof execution.stagedPackageSha256 !== "string" || !/^[0-9a-f]{64}$/u.test(execution.stagedPackageSha256)) {
-    throw new Error("certification execution provenance is dirty or unbound");
+    throw new Error("certification execution provenance or approval is dirty or unbound");
   }
   const gate = assembleCertificationGate({
     ...manifest,
@@ -390,11 +481,12 @@ export function assembleGateFromEvidence(input, dependencies = {}) {
     contractStatus: loaded.status,
     approval: loaded.approval,
     provenance: execution,
+    sampleFiles,
   });
   const schema = JSON.parse(readFileSync(new URL("../test/certification/evidence-schema.json", import.meta.url), "utf8"));
   const errors = validateEvidence(schema, gate);
   if (errors.length > 0) throw new Error(`certification gate evidence is invalid:\n${errors.join("\n")}`);
-  return { gate, paths: writeCertificationGate(gate, input.outputDirectory) };
+  return { gate, paths: writeCertificationGate(gate, input.outputDirectory, sampleFiles) };
 }
 
 function parse(argv) {

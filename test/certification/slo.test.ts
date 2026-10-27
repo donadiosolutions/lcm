@@ -15,8 +15,9 @@ describe("certification SLO calculators", () => {
   it("marks an under-sized percentile population incomplete", () => {
     expect(evaluatePercentiles([1, 2, 3], { p50: 10 }, { p50: 20 })).toEqual({
       verdict: "incomplete",
+      verdicts: { p50: "incomplete" },
       reasons: ["p50 has 3 samples; minimum is 20"],
-      observed: {},
+      observed: { p50: 2 },
     });
   });
 

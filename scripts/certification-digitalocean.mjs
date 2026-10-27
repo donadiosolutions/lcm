@@ -406,6 +406,7 @@ export async function runManagedCertification(options, dependencies = {}) {
       runId: environment.LCM_CERT_RUN_ID,
       contractSha256: options.contractSha256,
       approval: options.approval,
+      approvalSha256: options.approvalSha256,
       startedAt: new Date().toISOString(),
     });
   }
@@ -446,6 +447,7 @@ export async function runManagedCertification(options, dependencies = {}) {
         profile: options.profile,
         contract: options.contract,
         contractSha256: options.contractSha256,
+        approvalSha256: options.approvalSha256,
         evidenceDirectory: options.evidenceDirectory,
         secrets,
         signal: workload.signal,

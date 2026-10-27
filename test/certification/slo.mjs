@@ -13,24 +13,26 @@ export function nearestRank(values, quantile) {
 }
 export function evaluatePercentiles(values, thresholds, minimums) {
   const observed = {};
+  const verdicts = {};
   const reasons = [];
-  let verdict = "pass";
   for (const [name, threshold] of Object.entries(thresholds)) {
     const minimum = minimums[name];
     if (!Number.isSafeInteger(minimum) || minimum <= 0) throw new Error(`invalid minimum for ${name}`);
-    if (values.length < minimum) {
-      reasons.push(`${name} has ${values.length} samples; minimum is ${minimum}`);
-      if (verdict !== "fail") verdict = "incomplete";
-      continue;
-    }
     const quantile = Number(name.slice(1)) / 100;
-    observed[name] = nearestRank(values, quantile);
-    if (observed[name] > threshold) {
+    if (values.length > 0) observed[name] = nearestRank(values, quantile);
+    if (values.length > 0 && observed[name] > threshold) {
       reasons.push(`${name} observed ${observed[name]} exceeds ${threshold}`);
-      verdict = "fail";
+      verdicts[name] = "fail";
+    } else if (values.length < minimum) {
+      reasons.push(`${name} has ${values.length} samples; minimum is ${minimum}`);
+      verdicts[name] = "incomplete";
+    } else {
+      verdicts[name] = "pass";
     }
   }
-  return { verdict, reasons, observed };
+  const verdict = Object.values(verdicts).includes("fail") ? "fail"
+    : Object.values(verdicts).includes("incomplete") ? "incomplete" : "pass";
+  return { verdict, verdicts, reasons, observed };
 }
 
 export function errorRate({ scheduled, failed }) {
@@ -67,9 +69,10 @@ export function assembleCertificationGate(input) {
   }
   const slos = input.slos.map((slo) => {
     const samplePath = join(input.evidenceDirectory, slo.inputs.sampleFile);
+    const bytes = input.sampleFiles?.[slo.inputs.sampleFile] ?? readFileSync(samplePath);
     return {
       ...slo,
-      inputs: { ...slo.inputs, sampleSha256: sha256(readFileSync(samplePath)) },
+      inputs: { ...slo.inputs, sampleSha256: sha256(bytes) },
     };
   });
   const cleanupFails = input.cleanup.verdict === "fail" || input.cleanup.residualResources !== 0;
@@ -92,8 +95,9 @@ export function assembleCertificationGate(input) {
   };
 }
 
-export function writeCertificationGate(gate, outputDirectory) {
+export function writeCertificationGate(gate, outputDirectory, sampleFiles = {}) {
   mkdirSync(outputDirectory, { recursive: true });
+  for (const [name, bytes] of Object.entries(sampleFiles)) writeFileSync(join(outputDirectory, name), bytes, { mode: 0o600 });
   const json = join(outputDirectory, "production-certification-gate.json");
   const markdown = join(outputDirectory, "production-certification-gate.md");
   const rows = gate.slos.map((slo) => `${slo.id} | ${slo.verdict} | ${slo.observed} | ${slo.threshold}`);
@@ -112,7 +116,7 @@ export function writeCertificationGate(gate, outputDirectory) {
     `Cleanup: **${gate.cleanup.verdict}** (${gate.cleanup.residualResources} residual resources)`,
     "",
   ].join("\n");
-  writeFileSync(json, `${JSON.stringify(gate, null, 2)}\n`, { encoding: "utf8", flag: "wx" });
-  writeFileSync(markdown, body, { encoding: "utf8", flag: "wx" });
+  writeFileSync(json, `${JSON.stringify(gate, null, 2)}\n`, { encoding: "utf8", mode: 0o600 });
+  writeFileSync(markdown, body, { encoding: "utf8", mode: 0o600 });
   return { json, markdown };
 }

@@ -48,13 +48,19 @@ ready, waits for both warmup-complete witnesses, and then publishes one shared
 steady-state T0. The database-growth baseline is collected after that barrier and
 before the first scheduled steady operation.
 
-Fresh machine homes enter through the supported SQLite migration path. Both
-machines complete public plan/apply/verify before the coordinator grants the
-ordinary runtime profile; they then activate serially against the shared project.
-Only after both activation receipts are recorded does the coordinator revoke the
-transfer profile, prove ordinary runtime schema/ACL readiness, and start daemon A
-then daemon B with the 150-second stagger. These setup steps and receipts must fit
-within the 600-second setup budget and are written to private setup evidence.
+Fresh machine homes enter through the supported SQLite migration path in both
+lanes. The coordinator writes `migration-start.json` for machine A and waits for
+its public plan/apply/verify receipt before starting machine B's migration; it
+then waits for B's verification receipt. After granting the ordinary runtime
+profile, the coordinator publishes `activation-start.json` for A and then B so
+their activations run serially against the shared project. Once both activation
+receipts are recorded, it revokes the transfer profile, proves ordinary runtime
+schema/ACL readiness, and publishes `runtime-ready.json` for each machine. Each
+agent then records daemon readiness after its doctor, store, and search checks.
+The coordinator starts warmup only after both `ready.json` witnesses exist, waits
+for both `warmup-complete.json` witnesses, and publishes the shared steady-state
+T0. These setup steps and receipts must fit within the 600-second setup budget
+and are written to private setup evidence.
 
 ## Prepare the staged package
 
@@ -85,9 +91,9 @@ LCM_TEST_CONTAINER_CLI=podman \
 ```
 
 The local whole-run deadline is 10,800 seconds. The harness creates and labels the
-database, network, volume, and two machine containers under one run identity. A
-`finally` block removes the machine containers, and the enclosing PostgreSQL
-harness verifies that all owned resources and private roots are gone.
+database, network, volume, and two machine containers under one run identity. The
+enclosing PostgreSQL harness owns machine-container teardown and verifies that
+all owned resources and private roots are gone after the test exits.
 
 ## Run the managed lane
 
@@ -176,10 +182,11 @@ hook-command exit to the first one-second observer sighting of a terminal local
 acknowledgment. It does not claim the exact PostgreSQL `applied_at` time. The
 duplicate gate covers only distinct acknowledged inbox IDs observed for the same
 captured event ID. It does not prove historical exactly-once logical effects.
-Hook, search, and store timing use the public CLI process spawn-to-exit boundary;
-queue delay, schedule delay, SQLite capture, and observer delay are recorded as
-separate fields. Search and store still traverse the daemon route selected by the
-public commands rather than a private in-process storage seam.
+Hook timing uses the public CLI process spawn-to-exit boundary. Search and store
+timing use the elapsed authenticated daemon HTTP request to `/search` or `/store`,
+including its request/response transport; both use the same daemon routes as the
+public commands, not a private in-process storage seam. Queue delay, schedule
+delay, SQLite capture, and observer delay are recorded separately.
 The synthetic `TaskCreate` fixture proves the compatibility-tool extraction path;
 it is not evidence of native Codex task-tool integration.
 

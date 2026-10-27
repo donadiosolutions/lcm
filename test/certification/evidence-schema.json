@@ -15,11 +15,12 @@
         "status": { "const": "approved" },
         "approval": {
           "type": "object",
-          "required": ["contractSha256", "approvedAt", "approvalRef", "approvedBy"],
+          "required": ["contractSha256", "approvedAt", "note", "approvalRef", "approvedBy"],
           "additionalProperties": false,
           "properties": {
             "contractSha256": { "type": "string", "pattern": "^[0-9a-f]{64}$" },
             "approvedAt": { "type": "string", "minLength": 20 },
+            "note": { "type": "string", "minLength": 1 },
             "approvalRef": { "type": "string", "minLength": 1 },
             "approvedBy": { "type": "string", "minLength": 1 },
             "priceSource": { "type": "string", "minLength": 1 }
@@ -32,7 +33,7 @@
     "profile": { "enum": ["smoke", "full"] },
     "provenance": {
       "type": "object",
-      "required": ["testedCommit", "dirty", "testedInputsSha256", "testedInputsCount", "lockfileSha256", "cliSha256", "stagedPackageSha256", "contractSha256", "node"],
+      "required": ["testedCommit", "dirty", "testedInputsSha256", "testedInputsCount", "lockfileSha256", "cliSha256", "stagedPackageSha256", "contractSha256", "approvalSha256", "node"],
       "additionalProperties": false,
       "properties": {
         "testedCommit": { "type": "string", "pattern": "^[0-9a-f]{40}$" },
@@ -43,6 +44,7 @@
         "cliSha256": { "type": "string", "pattern": "^[0-9a-f]{64}$" },
         "stagedPackageSha256": { "type": "string", "pattern": "^[0-9a-f]{64}$" },
         "contractSha256": { "type": "string", "pattern": "^[0-9a-f]{64}$" },
+        "approvalSha256": { "type": "string", "pattern": "^[0-9a-f]{64}$" },
         "node": { "type": "string", "minLength": 1 }
       }
     },

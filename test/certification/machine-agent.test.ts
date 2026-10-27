@@ -16,6 +16,7 @@ import {
   verifyFinalDrain,
   verifyEmissionBudget,
   verifyTlsNegativeProbe,
+  waitForAcknowledgmentCatchUp,
 } from "./machine-agent.mjs";
 import { extractPostToolEvents, extractUserPromptEvents } from "../../src/hooks/extractors.js";
 import { normalizePostToolInput } from "../../src/hooks/post-tool-normalization.js";
@@ -58,9 +59,14 @@ describe("certification machine agent", () => {
   it("requires both the product client rejection and the expected raw TLS class", async () => {
     await expect(verifyTlsNegativeProbe({
       expected: "certificate-authority",
-      clientProbe: async () => { throw new Error("LCM command failed"); },
+      clientProbe: async () => { throw Object.assign(new Error("LCM command failed"), { stderr: "self signed certificate in certificate chain" }); },
       tlsProbe: async () => new Error("self signed certificate in certificate chain"),
     })).resolves.toBe("certificate-authority");
+    await expect(verifyTlsNegativeProbe({
+      expected: "certificate-authority",
+      clientProbe: async () => { throw Object.assign(new Error("LCM command failed"), { stderr: "connect ECONNREFUSED" }); },
+      tlsProbe: async () => new Error("self signed certificate in certificate chain"),
+    })).rejects.toThrow("transport-or-other");
     await expect(verifyTlsNegativeProbe({
       expected: "certificate-authority",
       clientProbe: async () => undefined,
@@ -167,5 +173,126 @@ describe("certification machine agent", () => {
     });
     expect(samples).toEqual([expect.objectContaining({ outcome: "failed", errorClass: "OperationDeadlineExceeded" })]);
     expect(readFileSync(join(evidenceDirectory, "samples.ndjson"), "utf8")).toContain("OperationDeadlineExceeded");
+  });
+
+  it("aborts an in-flight daemon request at the absolute operation deadline", async () => {
+    const evidenceDirectory = mkdtempSync(join(tmpdir(), "lcm-cert-http-deadline-"));
+    const post = vi.fn((_path: string, _body: unknown, options: { signal: AbortSignal; timeoutMs: number }) =>
+      new Promise((_resolve, reject) => {
+        options.signal.addEventListener("abort", () => reject(options.signal.reason), { once: true });
+      }));
+    const execution = executeDeterministicSchedule({
+      schedule: [{ id: "http", machine: "a", op: "search", offsetSeconds: 0, phase: "steady" }],
+      entrypoint: "/unused/lcm.mjs", cwd: evidenceDirectory, environment: {}, evidenceDirectory,
+      daemonClient: { post }, scheduleStartWallMs: Date.now(), operationTimeoutMs: 25,
+    });
+
+    await expect(execution).resolves.toEqual([
+      expect.objectContaining({ outcome: "failed", errorClass: "OperationDeadlineExceeded" }),
+    ]);
+    expect(post).toHaveBeenCalledWith("/search", expect.any(Object), expect.objectContaining({
+      timeoutMs: expect.any(Number), signal: expect.objectContaining({ aborted: true }),
+    }));
+    expect(readFileSync(join(evidenceDirectory, "samples.ndjson"), "utf8")).toContain("OperationDeadlineExceeded");
+  });
+
+  it("clears later arrival timers when a schedule aborts", async () => {
+    const evidenceDirectory = mkdtempSync(join(tmpdir(), "lcm-cert-arrival-abort-"));
+    const post = vi.fn(async () => { throw Object.assign(new Error("request deadline"), { code: "OperationDeadlineExceeded" }); });
+    const outstanding = new Set<NodeJS.Timeout>();
+    let abortListeners = 0;
+    const delay = (milliseconds: number, { signal }: { signal?: AbortSignal } = {}) => new Promise<void>((resolve) => {
+      const timer = setTimeout(() => {
+        outstanding.delete(timer);
+        signal?.removeEventListener("abort", onAbort);
+        abortListeners -= 1;
+        resolve();
+      }, milliseconds);
+      outstanding.add(timer);
+      const onAbort = () => {
+        clearTimeout(timer);
+        outstanding.delete(timer);
+        signal?.removeEventListener("abort", onAbort);
+        abortListeners -= 1;
+        resolve();
+      };
+      abortListeners += 1;
+      signal?.addEventListener("abort", onAbort, { once: true });
+      if (signal?.aborted) onAbort();
+    });
+    const execution = executeDeterministicSchedule({
+      schedule: [
+        { id: "first", machine: "a", op: "search", offsetSeconds: 0, phase: "steady" },
+        { id: "later", machine: "b", op: "search", offsetSeconds: 6000, phase: "steady" },
+      ],
+      entrypoint: "/unused/lcm.mjs", cwd: evidenceDirectory, environment: {}, evidenceDirectory,
+      daemonClient: { post }, scheduleStartWallMs: Date.now(), delay,
+    });
+
+    await expect(execution).resolves.toEqual([
+      expect.objectContaining({ id: "first", outcome: "failed" }),
+      expect.objectContaining({ id: "later", outcome: "cancelled", errorClass: "AdmissionAborted" }),
+    ]);
+    expect(outstanding.size).toBe(0);
+    expect(abortListeners).toBe(0);
+  });
+
+  it("bounds daemon health readiness with an absolute cancellable deadline", async () => {
+    const child = new EventEmitter() as any;
+    child.stdout = new EventEmitter();
+    child.stderr = new EventEmitter();
+    child.kill = vi.fn(() => {
+      queueMicrotask(() => child.emit("exit", 0, null));
+      return true;
+    });
+    const healthProbe = vi.fn(({ signal }: { signal: AbortSignal }) => new Promise((_resolve, reject) => {
+      signal.addEventListener("abort", () => reject(signal.reason), { once: true });
+    }));
+    const startup = startForegroundDaemon({
+      entrypoint: "/opt/lcm/dist/lcm.mjs", environment: {}, cwd: "/project",
+      daemonArguments: ["/opt/lcm/certification/daemon-agent.mjs"],
+      spawnProcess: vi.fn(() => child), healthProbe, readinessTimeoutMs: 25, delay: async () => undefined,
+    });
+
+    await expect(startup).rejects.toThrow("did not become ready");
+    expect(healthProbe).toHaveBeenCalledWith(expect.objectContaining({
+      timeoutMs: expect.any(Number), signal: expect.objectContaining({ aborted: true }),
+    }));
+    expect(healthProbe).toHaveBeenCalledTimes(1);
+  });
+
+  it("measures catch-up against clearance time and records the observation", async () => {
+    const evidenceDirectory = mkdtempSync(join(tmpdir(), "lcm-cert-catch-up-deadline-"));
+    const clearedAt = "2026-10-26T10:00:00.000Z";
+    const result = await waitForAcknowledgmentCatchUp(
+      "/unused/home", evidenceDirectory, "partition", clearedAt, 900,
+      {
+        now: () => Date.parse(clearedAt) + 950_000,
+        readRows: async () => [{ delivery_state: "acknowledged", remote_inbox_id: "inbox-1", acknowledged_at: clearedAt, remote_pruned_at: clearedAt }],
+      },
+    );
+
+    expect(result).toMatchObject({
+      phase: "partition", verdict: "fail", clearedAt,
+      observedAt: "2026-10-26T10:15:50.000Z", seconds: 950, remaining: null,
+    });
+    expect(readFileSync(join(evidenceDirectory, "partition-catch-up.json"), "utf8")).toContain('"seconds":950');
+  });
+
+  it("records the qualifying catch-up observation from clearance", async () => {
+    const evidenceDirectory = mkdtempSync(join(tmpdir(), "lcm-cert-catch-up-pass-"));
+    const clearedAt = "2026-10-26T10:00:00.000Z";
+    const result = await waitForAcknowledgmentCatchUp(
+      "/unused/home", evidenceDirectory, "restart", clearedAt, 900,
+      {
+        now: () => Date.parse(clearedAt) + 12_500,
+        readRows: async () => [{ delivery_state: "acknowledged", remote_inbox_id: "inbox-1", acknowledged_at: clearedAt, remote_pruned_at: clearedAt }],
+      },
+    );
+
+    expect(result).toMatchObject({
+      phase: "restart", verdict: "pass", clearedAt,
+      observedAt: "2026-10-26T10:00:12.500Z", seconds: 12.5, remaining: 0,
+    });
   });
 });
