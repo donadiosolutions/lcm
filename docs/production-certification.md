@@ -177,6 +177,21 @@ diagnostics retain relation-size deltas, submitted payload and envelope bytes,
 stored truncation counts, final doctor output hashes, and remote-prune sweep
 timestamps.
 
+The non-injected error rate follows the contract formula `nonInjected failed
+attempts / scheduled steady attempts` over the complete expected steady schedule
+of both machines: hooks, searches, stores, session snapshots, and explicit
+compacts (5,040 attempts for the full profile, 102 for smoke). A scheduled
+operation that failed, was cancelled, or is missing counts as a failure, so a run
+whose scheduled maintenance never succeeds cannot certify. The contract's
+`expectedPooledSteadyAttemptsPerLane` table lists only the latency populations.
+Latency percentiles still use successful hook, search, and store samples.
+
+When an operation fails, each machine appends a bounded, redacted record to its
+private `failures.ndjson`: exit code or signal, error message, stdout and stderr
+summaries (secret-bearing environment values and URL credentials masked, text
+truncated), and process timing. Only the error class, exit code, and signal reach
+`samples.ndjson`; the gate never reads `failures.ndjson`.
+
 The acknowledgment metric is a conservative upper bound from successful public
 hook-command exit to the first one-second observer sighting of a terminal local
 acknowledgment. It does not claim the exact PostgreSQL `applied_at` time. The

@@ -1,4 +1,4 @@
-import { mkdtempSync, readFileSync } from "node:fs";
+import { mkdtempSync, readFileSync, writeFileSync } from "node:fs";
 import { EventEmitter } from "node:events";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -12,6 +12,7 @@ import {
   machineStoredConfig,
   observeAcknowledgments,
   probeLcmTlsRejection,
+  redactDiagnosticText,
   runPublicMigrationFlow,
   startForegroundDaemon,
   verifyFinalDrain,
@@ -99,7 +100,7 @@ describe("certification machine agent", () => {
     expect(end).toHaveBeenCalledOnce();
   });
 
-  it("owns a foreground daemon child through bounded startup and stop", async () => {
+  it("owns a foreground daemon child started through the packaged entrypoint", async () => {
     const child = new EventEmitter() as any;
     child.stdout = new EventEmitter();
     child.stderr = new EventEmitter();
@@ -112,15 +113,16 @@ describe("certification machine agent", () => {
       entrypoint: "/opt/lcm/dist/lcm.mjs",
       environment: {},
       cwd: "/project",
-      daemonArguments: ["/opt/lcm/certification/daemon-agent.mjs"],
       spawnProcess,
       healthProbe: async () => undefined,
       delay: async () => undefined,
     });
 
     await daemon.stop();
+    // The daemon reports process.argv[1] as its identity; the CLI authenticates it
+    // only against the packaged entrypoint, so no wrapper script may sit in front.
     expect(spawnProcess).toHaveBeenCalledWith(process.execPath, [
-      "/opt/lcm/certification/daemon-agent.mjs",
+      "/opt/lcm/dist/lcm.mjs", "daemon", "start", "--foreground",
     ], expect.objectContaining({ cwd: "/project" }));
     expect(child.kill).toHaveBeenCalledWith("SIGTERM");
   });
@@ -221,6 +223,78 @@ describe("certification machine agent", () => {
     expect(readFileSync(join(evidenceDirectory, "samples.ndjson"), "utf8")).toContain("OperationDeadlineExceeded");
   });
 
+it("redacts secret environment values and URL credentials and bounds diagnostic text", () => {
+    const environment = { LCM_POSTGRES_URL: "postgresql://runtime:pw-secret-123@db.internal:5432/lcm", LCM_CERT_TRANSFER_PASSWORD: "transfer-secret-456", HOME: "/home/machine-a", SHORT_KEY: "abc" };
+    const text = "failed for postgresql://runtime:pw-secret-123@db.internal:5432/lcm and transfer-secret-456 and other://user:topsecret@host/x and abc";
+    const redacted = redactDiagnosticText(text, environment);
+    expect(redacted).not.toContain("pw-secret-123");
+    expect(redacted).not.toContain("transfer-secret-456");
+    expect(redacted).not.toContain("topsecret");
+    expect(redacted).toContain("[redacted:LCM_POSTGRES_URL]");
+    expect(redacted).toContain("[redacted:LCM_CERT_TRANSFER_PASSWORD]");
+    expect(redacted).toContain("other://user:[redacted]@host/x");
+    expect(redacted).toContain(" abc");
+    expect(redactDiagnosticText(undefined)).toBe("");
+    const long = redactDiagnosticText("y".repeat(5000), {}, 100);
+    expect(long.startsWith("y".repeat(100))).toBe(true);
+    expect(long).toContain("[truncated 4900 characters]");
+    expect(long.length).toBeLessThan(200);
+  });
+
+  it("persists bounded redacted private diagnostics and timing for a failed CLI operation", async () => {
+    const evidenceDirectory = mkdtempSync(join(tmpdir(), "lcm-cert-cli-failure-"));
+    const entrypoint = join(evidenceDirectory, "failing-lcm.mjs");
+    writeFileSync(entrypoint, [
+      "process.stdout.write('partial output');",
+      "process.stderr.write('compact refused: marker-stderr ' + process.env.LCM_POSTGRES_URL + '\\n');",
+      "process.exit(3);",
+    ].join("\n"));
+    const environment = { PATH: process.env.PATH ?? "", LCM_POSTGRES_URL: "postgresql://runtime:pw-secret-123@db.internal:5432/lcm" };
+    const scheduleStartWallMs = Date.now();
+    const samples = await executeDeterministicSchedule({
+      schedule: [{ id: "compact-0", machine: "a", op: "compact", offsetSeconds: 0, phase: "steady", sessionId: "s0" }],
+      entrypoint, cwd: evidenceDirectory, environment, evidenceDirectory, scheduleStartWallMs,
+    });
+    expect(samples).toEqual([expect.objectContaining({ id: "compact-0", outcome: "failed", errorClass: "CliExit", exitCode: 3 })]);
+    const sample = samples[0] as Record<string, unknown>;
+    expect(sample.exitSignal).toBeUndefined();
+    expect(typeof sample.processStartWallMs).toBe("number");
+    expect(typeof sample.processExitWallMs).toBe("number");
+    expect(sample.processExitWallMs as number).toBeGreaterThanOrEqual(sample.processStartWallMs as number);
+    expect(sample.durationMs as number).toBeGreaterThan(0);
+    expect(sample.scheduleDelayMs as number).toBeGreaterThanOrEqual(0);
+    expect(sample.scheduleDelayMs as number).toBeLessThan(sample.durationMs as number + 10_000);
+    const samplesText = readFileSync(join(evidenceDirectory, "samples.ndjson"), "utf8");
+    expect(samplesText).not.toContain("marker-stderr");
+    expect(samplesText).not.toContain("pw-secret-123");
+    const failures = readFileSync(join(evidenceDirectory, "failures.ndjson"), "utf8").trim().split("\n").map((line) => JSON.parse(line));
+    expect(failures).toEqual([expect.objectContaining({
+      id: "compact-0", machine: "a", op: "compact", phase: "steady", errorClass: "CliExit", exitCode: 3, exitSignal: null,
+      message: "LCM command failed with 3", stdout: "partial output",
+      processStartWallMs: sample.processStartWallMs, processExitWallMs: sample.processExitWallMs,
+    })]);
+    expect(failures[0].stderr).toContain("compact refused: marker-stderr [redacted:LCM_POSTGRES_URL]");
+    expect(failures[0].stderr).not.toContain("pw-secret-123");
+  });
+
+  it("records timing and a redacted message for a failed daemon operation", async () => {
+    const evidenceDirectory = mkdtempSync(join(tmpdir(), "lcm-cert-daemon-failure-"));
+    const post = vi.fn(async () => { throw new Error("daemon rejected token-secret-789"); });
+    const samples = await executeDeterministicSchedule({
+      schedule: [{ id: "search-0", machine: "b", op: "search", offsetSeconds: 0, phase: "steady" }],
+      entrypoint: "/unused/lcm.mjs", cwd: evidenceDirectory, environment: { LCM_API_TOKEN: "token-secret-789" }, evidenceDirectory,
+      daemonClient: { post }, scheduleStartWallMs: Date.now(),
+    });
+    expect(samples).toEqual([expect.objectContaining({ id: "search-0", outcome: "failed", errorClass: "Error" })]);
+    const sample = samples[0] as Record<string, unknown>;
+    expect(sample.exitCode).toBeUndefined();
+    expect(typeof sample.processStartWallMs).toBe("number");
+    expect(typeof sample.processExitWallMs).toBe("number");
+    const failures = readFileSync(join(evidenceDirectory, "failures.ndjson"), "utf8").trim().split("\n").map((line) => JSON.parse(line));
+    expect(failures).toEqual([expect.objectContaining({ id: "search-0", op: "search", errorClass: "Error", exitCode: null, exitSignal: null, message: "daemon rejected [redacted:LCM_API_TOKEN]", stderr: "", stdout: "" })]);
+    expect(readFileSync(join(evidenceDirectory, "samples.ndjson"), "utf8")).not.toContain("token-secret-789");
+  });
+
   it("clears later arrival timers when a schedule aborts", async () => {
     const evidenceDirectory = mkdtempSync(join(tmpdir(), "lcm-cert-arrival-abort-"));
     const post = vi.fn(async () => { throw Object.assign(new Error("request deadline"), { code: "OperationDeadlineExceeded" }); });
@@ -275,7 +349,6 @@ describe("certification machine agent", () => {
     }));
     const startup = startForegroundDaemon({
       entrypoint: "/opt/lcm/dist/lcm.mjs", environment: {}, cwd: "/project",
-      daemonArguments: ["/opt/lcm/certification/daemon-agent.mjs"],
       spawnProcess: vi.fn(() => child), healthProbe, readinessTimeoutMs: 25, delay: async () => undefined,
     });
 

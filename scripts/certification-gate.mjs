@@ -291,15 +291,17 @@ export function buildEvidenceManifest({ evidenceDirectory, contract, persist = t
         : rows.length < contract.thresholds.hookCommandMs.minSuccessesForSubgates ? "incomplete" : "pass",
     });
   }
-  const expectedSteady = expectedAttempts.filter((sample) => ["hook", "search", "store"].includes(sample.op));
-  const scheduled = expectedSteady.length;
-  const relevant = steady.filter((sample) => ["hook", "search", "store"].includes(sample.op));
-  const observedById = new Map(relevant.map((sample) => [sample.id, sample]));
-  const failures = expectedSteady.filter((sample) => observedById.get(sample.id)?.outcome !== "success").length;
+  // Contract calculations.errorRate: "nonInjected failed attempts / scheduled steady attempts".
+  // The population is the complete expected steady schedule for both machines, including
+  // session snapshots and explicit compacts; a scheduled operation that failed, was
+  // cancelled or is missing counts as a failure.
+  const scheduled = expectedAttempts.length;
+  const observedById = new Map(steady.map((sample) => [sample.id, sample]));
+  const failures = expectedAttempts.filter((sample) => observedById.get(sample.id)?.outcome !== "success").length;
   const observedErrorRate = errorRate({ scheduled, failed: failures });
   slos.push({
-    id: "non-injected-error-rate", formula: "failed or missing steady attempts / scheduled attempts",
-    inputs: { count: relevant.length, sampleFile: files.attempts }, threshold: contract.thresholds.errors.nonInjectedErrorRateMax,
+    id: "non-injected-error-rate", formula: "failed, cancelled or missing attempts / complete expected steady schedule (hook, search, store, snapshot, compact)",
+    inputs: { count: steady.length, sampleFile: files.attempts }, threshold: contract.thresholds.errors.nonInjectedErrorRateMax,
     observed: observedErrorRate, verdict: observedErrorRate <= contract.thresholds.errors.nonInjectedErrorRateMax ? "pass" : "fail",
   });
   const ledger = ['a', 'b'].flatMap((machine) => ndjson(join(evidenceDirectory, `machine-${machine}`, "invocations.ndjson")));
@@ -490,9 +492,10 @@ export function assembleGateFromEvidence(input, dependencies = {}) {
   return { gate, paths: writeCertificationGate(gate, input.outputDirectory, sampleFiles) };
 }
 
-function parse(argv) {
+export function parseGateArguments(argv) {
+  const normalized = argv[0] === "--" ? argv.slice(1) : argv;
   const values = new Map();
-  for (let index = 0; index < argv.length; index += 2) values.set(argv[index], argv[index + 1]);
+  for (let index = 0; index < normalized.length; index += 2) values.set(normalized[index], normalized[index + 1]);
   for (const name of ["--repository-root", "--evidence-dir", "--contract", "--output-dir"]) {
     if (!values.get(name)) throw new Error(`missing ${name}`);
   }
@@ -506,7 +509,7 @@ function parse(argv) {
 
 if (process.argv[1] && import.meta.url === pathToFileURL(process.argv[1]).href) {
   try {
-    const result = assembleGateFromEvidence(parse(process.argv.slice(2)));
+    const result = assembleGateFromEvidence(parseGateArguments(process.argv.slice(2)));
     process.stdout.write(`${result.paths.json}\n${result.paths.markdown}\n`);
   } catch (error) {
     process.stderr.write(`Certification gate failed: ${error.message}\n`);

@@ -989,7 +989,6 @@ export function stageBuiltPackage({ sourceRoot, destination, machineAgentPath })
   cpSync(new URL("../test/certification/contract-v1.json", import.meta.url), join(destination, "certification", "contract-v1.json"), { errorOnExist: true });
   cpSync(new URL("../test/certification/contract-v1.approval.json", import.meta.url), join(destination, "certification", "contract-v1.approval.json"), { errorOnExist: true });
   cpSync(new URL("../test/certification/backend-publication.mjs", import.meta.url), join(destination, "certification", "backend-publication.mjs"), { errorOnExist: true });
-  cpSync(new URL("../test/certification/daemon-agent.mjs", import.meta.url), join(destination, "certification", "daemon-agent.mjs"), { errorOnExist: true });
   cpSync(new URL("../test/certification/sqlite-observer-worker.mjs", import.meta.url), join(destination, "certification", "sqlite-observer-worker.mjs"), { errorOnExist: true });
   const hash = createHash("sha256");
   for (const path of walkFiles(destination)) {

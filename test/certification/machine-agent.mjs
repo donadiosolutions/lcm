@@ -226,6 +226,39 @@ export function classifyTlsRejection(error) {
   return "transport-or-other";
 }
 
+const DIAGNOSTIC_TEXT_LIMIT = 4096;
+const SECRET_ENVIRONMENT_NAME = /(PASSWORD|TOKEN|SECRET|KEY|_URL)$/iu;
+
+// Bounded, redacted text for private failure diagnostics. Exact secret-bearing
+// environment values are masked first, then any credential embedded in a URL.
+export function redactDiagnosticText(text, environment = {}, limit = DIAGNOSTIC_TEXT_LIMIT) {
+  let value = typeof text === "string" ? text : text === undefined || text === null ? "" : String(text);
+  for (const [name, secret] of Object.entries(environment)) {
+    if (typeof secret !== "string" || secret.length < 8 || !SECRET_ENVIRONMENT_NAME.test(name)) continue;
+    value = value.split(secret).join(`[redacted:${name}]`);
+  }
+  value = value.replace(/([a-z][a-z0-9+.-]*:\/\/[^\s/@:]+:)[^\s@]+@/giu, "$1[redacted]@");
+  if (value.length > limit) value = `${value.slice(0, limit)}...[truncated ${value.length - limit} characters]`;
+  return value;
+}
+
+// Private per-machine failure record (machine-<x>/failures.ndjson). The gate never
+// reads this file, so diagnostic text stays out of public gate output.
+export function createOperationFailureRecord(entry, error, errorClass, environment) {
+  return {
+    id: entry.id, machine: entry.machine, op: entry.op, kind: entry.kind, phase: entry.phase ?? "steady",
+    recordedAt: new Date().toISOString(),
+    errorClass,
+    exitCode: Number.isInteger(error?.code) ? error.code : null,
+    exitSignal: typeof error?.signal === "string" ? error.signal : null,
+    message: redactDiagnosticText(error?.message, environment),
+    stderr: redactDiagnosticText(error?.stderr, environment),
+    stdout: redactDiagnosticText(error?.stdout, environment),
+    processStartWallMs: Number.isFinite(error?.processStartWallMs) ? error.processStartWallMs : null,
+    processExitWallMs: Number.isFinite(error?.processExitWallMs) ? error.processExitWallMs : null,
+  };
+}
+
 async function probeRawTlsRejection(url, caFile) {
   const endpoint = new URL(url);
   return new Promise((resolve, reject) => {
@@ -355,6 +388,7 @@ export async function executeDeterministicSchedule({
   const transientCli = createAdmissionController({ maxActive: 1, maxQueued: 64 });
   const samplesPath = join(evidenceDirectory, "samples.ndjson");
   const ledgerPath = join(evidenceDirectory, "invocations.ndjson");
+  const failuresPath = join(evidenceDirectory, "failures.ndjson");
   const fatalAbort = new AbortController();
   const operations = schedule.map(async (entry) => {
     const scheduledWallMs = scheduleStartWallMs + entry.offsetSeconds * 1000;
@@ -376,9 +410,19 @@ export async function executeDeterministicSchedule({
     let outcome = "success";
     let errorClass;
     let commandTiming;
+    let exitCode;
+    let exitSignal;
     let submittedPrimaryBytes;
     let submittedEnvelopeBytes;
     let storedTruncated;
+    const timedDaemonCall = async (call) => {
+      const processStartNs = process.hrtime.bigint();
+      const processStartWallMs = Date.now();
+      try { await call(); }
+      finally {
+        commandTiming = { processStartNs: processStartNs.toString(), processExitNs: process.hrtime.bigint().toString(), processStartWallMs, processExitWallMs: Date.now() };
+      }
+    };
     try {
       if (entry.op === "hook") {
         const fixture = createHookFixture({ kind: entry.kind, bytes: entry.primaryTextBytes, sessionId: entry.sessionId, cwd });
@@ -431,17 +475,13 @@ export async function executeDeterministicSchedule({
         if (hookError) throw hookError;
       } else if (entry.op === "search") {
         if (daemonClient) {
-          const processStartNs = process.hrtime.bigint(); const processStartWallMs = Date.now();
-          await runWithDeadline(remainingOperationMs(), fatalAbort.signal, (options) =>
-            daemonClient.post("/search", { cwd, query: "deterministic certification record", limit: 5, layers: [], tags: [] }, options));
-          commandTiming = { processStartNs: processStartNs.toString(), processExitNs: process.hrtime.bigint().toString(), processStartWallMs, processExitWallMs: Date.now() };
+          await timedDaemonCall(() => runWithDeadline(remainingOperationMs(), fatalAbort.signal, (options) =>
+            daemonClient.post("/search", { cwd, query: "deterministic certification record", limit: 5, layers: [], tags: [] }, options)));
         } else commandTiming = await transientCli.run(() => runCli(entrypoint, ["search", "deterministic certification record"], { cwd, env: environment, timeoutMs: Math.max(1, remainingOperationMs()) }));
       } else if (entry.op === "store") {
         if (daemonClient) {
-          const processStartNs = process.hrtime.bigint(); const processStartWallMs = Date.now();
-          await runWithDeadline(remainingOperationMs(), fatalAbort.signal, (options) =>
-            daemonClient.post("/store", { cwd, text: `certification record ${entry.id}`, tags: ["type:solution", "scope:project"], metadata: {} }, options));
-          commandTiming = { processStartNs: processStartNs.toString(), processExitNs: process.hrtime.bigint().toString(), processStartWallMs, processExitWallMs: Date.now() };
+          await timedDaemonCall(() => runWithDeadline(remainingOperationMs(), fatalAbort.signal, (options) =>
+            daemonClient.post("/store", { cwd, text: `certification record ${entry.id}`, tags: ["type:solution", "scope:project"], metadata: {} }, options)));
         } else commandTiming = await transientCli.run(() => runCli(entrypoint, ["store", `certification record ${entry.id}`, "--tag", "type:solution", "--tag", "scope:project"], { cwd, env: environment, timeoutMs: Math.max(1, remainingOperationMs()) }));
       } else if (entry.op === "snapshot") {
         appendFileSync(environment.LCM_CERT_TRANSCRIPT_PATH, `${JSON.stringify({
@@ -461,6 +501,15 @@ export async function executeDeterministicSchedule({
       errorClass = fatalAbort.signal.reason?.code === "OperationDeadlineExceeded"
         ? "OperationDeadlineExceeded"
         : error?.errorClass ?? error?.code ?? error?.name ?? "Error";
+      if (error?.processStartNs && error?.processExitNs) {
+        commandTiming = {
+          processStartNs: error.processStartNs, processExitNs: error.processExitNs,
+          processStartWallMs: error.processStartWallMs, processExitWallMs: error.processExitWallMs,
+        };
+      }
+      if (Number.isInteger(error?.code)) exitCode = error.code;
+      if (typeof error?.signal === "string") exitSignal = error.signal;
+      appendNdjson(failuresPath, createOperationFailureRecord(entry, error, errorClass, environment));
       if (errorClass === "OperationDeadlineExceeded") fatalAbort.abort(error);
     }
     const endedAt = now();
@@ -486,6 +535,8 @@ export async function executeDeterministicSchedule({
       outcome,
       ...(submittedPrimaryBytes === undefined ? {} : { submittedPrimaryBytes, submittedEnvelopeBytes, storedTruncated }),
       ...(errorClass ? { errorClass } : {}),
+      ...(exitCode === undefined ? {} : { exitCode }),
+      ...(exitSignal === undefined ? {} : { exitSignal }),
     };
     appendNdjson(samplesPath, sample);
       return sample;
@@ -826,11 +877,14 @@ export async function runMachineAgent(environment = process.env) {
   writeFileSync(join(evidenceDirectory, "identity.json"), identity.stdout, { mode: 0o600, flag: "wx" });
   const { DaemonClient } = await import(pathToFileURL("/opt/lcm/dist/src/daemon/client.js").href);
   const daemonTokenPath = join(configDirectory, "daemon.token");
+  // Start the daemon through the packaged entrypoint itself. The daemon publishes
+  // process.argv[1] as its entrypoint identity, and the CLI (compact, doctor)
+  // authenticates a running daemon only when that identity is the packaged
+  // /opt/lcm/dist/lcm.mjs; a wrapper script would make it unauthenticated.
   const daemon = await startForegroundDaemon({
     entrypoint: lcm,
     environment,
     cwd: project,
-    daemonArguments: ["/opt/lcm/certification/daemon-agent.mjs"],
     healthProbe: async ({ signal, timeoutMs }) => {
       if (!await new DaemonClient("http://127.0.0.1:3737", daemonTokenPath).health({ signal, timeoutMs })) throw new Error("foreground daemon is not healthy");
     },

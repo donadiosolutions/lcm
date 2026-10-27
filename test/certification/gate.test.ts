@@ -3,7 +3,7 @@ import { existsSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, writeFil
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { describe, expect, it } from "vitest";
-import { assembleGateFromEvidence } from "../../scripts/certification-gate.mjs";
+import { assembleGateFromEvidence, parseGateArguments } from "../../scripts/certification-gate.mjs";
 import { createDeterministicSchedule, createFaultSchedule } from "./schedule.mjs";
 
 function writeJson(path: string, value: unknown): void { writeFileSync(path, `${JSON.stringify(value)}\n`); }
@@ -18,7 +18,15 @@ function snapshotFiles(root: string, directory = root, files = new Map<string, B
 }
 
 type FaultLayout = "faults" | "partition-a" | "none";
-type Variant = { observerGap?: boolean; clockBreach?: boolean; clockGap?: boolean; duplicateMapping?: boolean; drainFail?: boolean; capacityPeak?: number; recoveryFail?: boolean; partitionFirstSuccessSeconds?: number; restartBFirstSuccessSeconds?: number; restartBNoSuccess?: boolean; noRecoverySuccess?: boolean; catchUpFail?: boolean; catchUpAtSeconds?: number; missingCatchUpTimestamp?: boolean; readinessInvalid?: boolean; residualOccupied?: boolean; poolConfigMismatch?: boolean; setupSessionOpen?: boolean; phaseEarly?: boolean; profile?: "smoke" | "full"; lane?: "local" | "managed"; faultLayout?: FaultLayout; smokeFailure?: boolean; smokeSlow?: boolean };
+type MaintenanceFailure = "compact" | "snapshot" | "mixed";
+type Variant = { observerGap?: boolean; clockBreach?: boolean; clockGap?: boolean; duplicateMapping?: boolean; drainFail?: boolean; capacityPeak?: number; recoveryFail?: boolean; partitionFirstSuccessSeconds?: number; restartBFirstSuccessSeconds?: number; restartBNoSuccess?: boolean; noRecoverySuccess?: boolean; catchUpFail?: boolean; catchUpAtSeconds?: number; missingCatchUpTimestamp?: boolean; readinessInvalid?: boolean; residualOccupied?: boolean; poolConfigMismatch?: boolean; setupSessionOpen?: boolean; phaseEarly?: boolean; profile?: "smoke" | "full"; lane?: "local" | "managed"; faultLayout?: FaultLayout; maintenanceFailure?: MaintenanceFailure; smokeFailure?: boolean; smokeSlow?: boolean };
+
+// Every scheduled compact, every scheduled snapshot, or every other one of each.
+function maintenanceFails(mode: MaintenanceFailure | undefined, op: string, index: number): boolean {
+  if (mode === undefined || (op !== "compact" && op !== "snapshot")) return false;
+  if (mode === "mixed") return op === "compact" ? index % 2 === 0 : index % 2 === 1;
+  return op === mode;
+}
 
 // Mirrors the real producers: local full writes faults.json with both faults,
 // managed full writes only fault-partition-a.json, and smoke writes no fault file.
@@ -126,7 +134,9 @@ function rawFixture(options: Variant = {}) {
     const steady = createDeterministicSchedule({ profile, machine, runId: "run12345", contract }).map((entry) => ({
       ...entry, phase: "steady", scheduledWallMs: t0 + entry.offsetSeconds * 1000,
       wallEndedAt: new Date(t0 + entry.offsetSeconds * 1000 + 10).toISOString(), durationMs: options.smokeSlow && entry.op === "search" ? 10_000 : 10,
-      outcome: options.smokeFailure && entry.op === "search" && entry.index === 0 ? "failed" : "success", processExitNs: String(BigInt(1_000_000_000 + entry.index * 10_000_000)),
+      outcome: (options.smokeFailure && entry.op === "search" && entry.index === 0) || maintenanceFails(options.maintenanceFailure, entry.op, entry.index) ? "failed" : "success",
+      ...(maintenanceFails(options.maintenanceFailure, entry.op, entry.index) ? { errorClass: "CliExit", exitCode: 1 } : {}),
+      processExitNs: String(BigInt(1_000_000_000 + entry.index * 10_000_000)),
     }));
     const partition = (faultLayout !== "none" ? createFaultSchedule({ machine, runId: "run12345", phase: "partition-recovery", durationSeconds: 180 }) : []).map((entry) => ({
       ...entry, scheduledWallMs: partitionApplied + entry.offsetSeconds * 1000,
@@ -397,5 +407,56 @@ describe("lane fault-set sample from real producer layouts", () => {
     const gate = assemble(fixture).gate;
     expect(faultSetOf(gate)).toMatchObject({ verdict: "fail", observed: 1, threshold: 2, inputs: { count: 1, sampleFile: "lane-fault-set.ndjson" } });
     expect(gate.verdict).toBe("fail");
+  });
+});
+
+describe("scheduled maintenance outcomes gate the non-injected error rate", () => {
+  const errorRateOf = (gate: any) => gate.slos.find((slo: any) => slo.id === "non-injected-error-rate");
+  const identityOf = (gate: any) => gate.slos.find((slo: any) => slo.id === "scheduled-attempt-identity");
+  // Full profile per machine: 600 hooks + 1200 searches + 600 stores + 100 snapshots + 20 compacts = 2520; pooled 5040.
+  const fullScheduled = 5040;
+
+  it.each([["local"], ["managed"]] as const)("counts the complete %s steady schedule including snapshot and compact", (lane) => {
+    const gate = assemble(rawFixture({ lane })).gate;
+    expect(gate.verdict).toBe("pass");
+    expect(errorRateOf(gate)).toMatchObject({ verdict: "pass", observed: 0, inputs: { count: fullScheduled } });
+    expect(errorRateOf(gate).formula).toMatch(/snapshot, compact/u);
+  });
+
+  it.each([
+    ["local", "compact", 40],
+    ["local", "snapshot", 200],
+    ["local", "mixed", 120],
+    ["managed", "compact", 40],
+    ["managed", "snapshot", 200],
+    ["managed", "mixed", 120],
+  ] as const)("fails otherwise passing %s evidence when %s maintenance operations fail", (lane, mode, failed) => {
+    const gate = assemble(rawFixture({ lane, maintenanceFailure: mode })).gate;
+    expect(identityOf(gate).verdict).toBe("pass");
+    expect(errorRateOf(gate)).toMatchObject({ verdict: "fail", inputs: { count: fullScheduled } });
+    expect(errorRateOf(gate).observed).toBeCloseTo(failed / fullScheduled, 12);
+    expect(gate.verdict).toBe("fail");
+  });
+
+  it("fails smoke evidence whose only failure is a compact", () => {
+    const gate = assemble(rawFixture({ profile: "smoke", maintenanceFailure: "compact" })).gate;
+    expect(errorRateOf(gate)).toMatchObject({ verdict: "fail", inputs: { count: 102 } });
+    expect(errorRateOf(gate).observed).toBeCloseTo(2 / 102, 12);
+    expect(gate.verdict).toBe("fail");
+  });
+});
+
+describe("gate command-line parsing", () => {
+  const pairs = ["--repository-root", "/repo", "--evidence-dir", "/evidence", "--contract", "/repo/contract.json", "--output-dir", "/out"];
+
+  it("accepts the documented pnpm-forwarded leading separator and the direct form equally", () => {
+    const direct = parseGateArguments(pairs);
+    expect(direct).toEqual({ repositoryRoot: "/repo", evidenceDirectory: "/evidence", contractPath: "/repo/contract.json", outputDirectory: "/out" });
+    expect(parseGateArguments(["--", ...pairs])).toEqual(direct);
+  });
+
+  it("still rejects missing required options", () => {
+    expect(() => parseGateArguments(["--", "--repository-root", "/repo"])).toThrow("missing --evidence-dir");
+    expect(() => parseGateArguments([])).toThrow("missing --repository-root");
   });
 });
