@@ -142,8 +142,21 @@ export async function deduplicateAndInsert(params: DedupParams): Promise<string>
  */
 export async function deduplicateAndInsertInRepositories(
   repositories: TransactionRepositories,
+  input: DedupInsertInput & Readonly<{ existingOnly: boolean }>,
+): Promise<string | null>;
+export async function deduplicateAndInsertInRepositories(
+  repositories: TransactionRepositories,
   input: DedupInsertInput,
-): Promise<string> {
+): Promise<string>;
+/**
+ * With `existingOnly`, the same decision runs but a miss returns `null`
+ * instead of inserting, so the caller can re-confirm an entry that already
+ * exists without ever creating one.
+ */
+export async function deduplicateAndInsertInRepositories(
+  repositories: TransactionRepositories,
+  input: DedupInsertInput & Readonly<{ existingOnly?: boolean }>,
+): Promise<string | null> {
   // Hold this project's decisions for the rest of the caller's transaction
   // before reading candidates. Without it two concurrent transactions each
   // read an empty candidate set, each take the insert branch below, and both
@@ -192,6 +205,7 @@ export async function deduplicateAndInsertInRepositories(
     (candidate) => isDuplicateCandidate(candidate, input.content),
   );
   if (duplicates.length === 0) {
+    if (input.existingOnly === true) return null;
     return repositories.promotedMemory.insert({
       content: input.content,
       tags: input.tags,
