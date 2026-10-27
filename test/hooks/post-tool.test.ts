@@ -652,28 +652,28 @@ describe("handlePostToolUse", () => {
       tool_name: "functions.exec",
       tool_input: { command: "git branch capture-test" },
       tool_output: { isError: true },
-      expected: { type: "error_tool", category: "error", data: "Bash error: git branch capture-test", priority: 1 },
+      expected: { type: "error_tool", category: "error", data: "Bash error: git branch", priority: 1 },
     },
     {
       name: "functions.exec_command is_error error event",
       tool_name: "functions.exec_command",
       tool_input: { cmd: "npm install capture-test" },
       tool_output: { is_error: true },
-      expected: { type: "error_tool", category: "error", data: "Bash error: npm install capture-test", priority: 1 },
+      expected: { type: "error_tool", category: "error", data: "Bash error: npm install", priority: 1 },
     },
     {
       name: "functions.exec nonzero exit_code error event",
       tool_name: "functions.exec",
       tool_input: { command: "git branch capture-test" },
       tool_response: { exit_code: 2 },
-      expected: { type: "error_tool", category: "error", data: "Bash error: git branch capture-test", priority: 1 },
+      expected: { type: "error_tool", category: "error", data: "Bash error: git branch", priority: 1 },
     },
     {
       name: "functions.exec_command nonzero exitCode error event",
       tool_name: "functions.exec_command",
       tool_input: { cmd: "npm install capture-test" },
       tool_response: { exitCode: 2 },
-      expected: { type: "error_tool", category: "error", data: "Bash error: npm install capture-test", priority: 1 },
+      expected: { type: "error_tool", category: "error", data: "Bash error: npm install", priority: 1 },
     },
     {
       name: "functions.exec zero exit_code normal event",
@@ -702,7 +702,7 @@ describe("handlePostToolUse", () => {
       tool_name: "functions.exec",
       tool_input: { command: "git branch capture-test" },
       tool_response: { isError: true, is_error: false, exit_code: 0, exitCode: 0 },
-      expected: { type: "error_tool", category: "error", data: "Bash error: git branch capture-test", priority: 1 },
+      expected: { type: "error_tool", category: "error", data: "Bash error: git branch", priority: 1 },
     },
   ] as const)("persists native Codex $name through EventsDb", async ({ expected, ...payload }) => {
     const rows = await runNativePersistenceCase(payload);
@@ -739,7 +739,7 @@ describe("handlePostToolUse", () => {
         session_id: "native-codex-session",
         type: "decision",
         category: "decision",
-        data: "Q: Which scope?\nA: Narrow; keep it small",
+        data: "Q: Which scope?\nA: Narrow;  keep it small",
         source_hook: "PostToolUse",
       }),
     ]);
@@ -765,7 +765,7 @@ describe("handlePostToolUse", () => {
     expect(rows).toEqual([
       expect.objectContaining({
         type: "error_tool",
-        data: "Bash error: npm install capture-test",
+        data: "Bash error: npm install",
       }),
     ]);
     expect(JSON.stringify(rows)).not.toContain("RAW_");
@@ -823,6 +823,89 @@ describe("handlePostToolUse", () => {
       expect(db.getUnprocessed()[0]?.data).toContain("Use [REDACTED]?");
     } finally {
       db.close();
+    }
+  });
+
+  it("persists only scrubbed complete selected fields across native and legacy hooks", async () => {
+    writeFileSync(join(homeDir, ".lcm", "config.json"), JSON.stringify({
+      security: { sensitivePatterns: [
+        "CUSTOMTOKEN_[A-Z]+\\s", "SECRET\\s+FIRST;",
+        "curl\\s+-H\\s+'Authorization:\\s+SECRET\\s+WORD';",
+      ] },
+    }), { mode: 0o600 });
+    const pat = `dop_v1_${"a".repeat(64)}`;
+    const atCut = (prefix: string, secret: string): string =>
+      `${prefix}${"x".repeat(1_999 - prefix.length - secret.length)} ${secret}; tail`;
+    const cases: { name: string; payload: Record<string, unknown>; marker: string; omitted?: boolean }[] = [
+      {
+        name: "native answer PAT at the output cut", marker: "dop_v1_",
+        payload: { tool_name: "request_user_input", tool_input: { questions: [{ id: "q", question: "Choose?" }] },
+          tool_response: { answers: { q: { answers: [atCut("Q: Choose?\nA: ", pat).slice("Q: Choose?\nA: ".length)] } } } },
+      },
+      {
+        name: "legacy answer PAT through the output cut", marker: "dop_v1_",
+        payload: { client: "claude", tool_name: "AskUserQuestion", tool_input: { question: "Choose?" },
+          tool_response: atCut("Q: Choose?\nA: ", pat).slice("Q: Choose?\nA: ".length) },
+      },
+      {
+        name: "native answer custom spanning delimiter", marker: "SECRET FIRST",
+        payload: { tool_name: "request_user_input", tool_input: { questions: [{ id: "q", question: "Choose?" }] },
+          tool_response: { answers: { q: { answers: [atCut("Q: Choose?\nA: ", "SECRET FIRST").slice("Q: Choose?\nA: ".length)] } } } },
+      },
+      {
+        name: "quoted multiword curl credential", marker: "SECRET WORD",
+        payload: { tool_name: "request_user_input", tool_input: { questions: [{ id: "q", question: "Choose?" }] },
+          tool_response: { answers: { q: { answers: [atCut("Q: Choose?\nA: ", "curl -H 'Authorization: SECRET WORD'").slice("Q: Choose?\nA: ".length)] } } } },
+      },
+      {
+        name: "native answer trailing whitespace", marker: "CUSTOMTOKEN_ALPHA",
+        payload: { tool_name: "request_user_input", tool_input: { questions: [{ id: "q", question: "Choose?" }] },
+          tool_response: { answers: { q: { answers: ["CUSTOMTOKEN_ALPHA "] } } } },
+      },
+      {
+        name: "native shell success", marker: "dop_v1_",
+        payload: { tool_name: "functions.exec_command", tool_input: { cmd: atCut("npm install ", pat) },
+          tool_response: { exit_code: 0 } },
+      },
+      {
+        name: "native shell error uses fixed selector", marker: "dop_v1_",
+        payload: { tool_name: "functions.exec_command", tool_input: { cmd: `npm install ${pat};` },
+          tool_response: { exit_code: 1 } },
+      },
+      {
+        name: "spawn label past former 200 cap", marker: "dop_v1_",
+        payload: { tool_name: "spawn_agent", tool_input: { task_name: `${"n".repeat(199)} ${pat};` } },
+      },
+      {
+        name: "plan explanation past former 500 cap", marker: "dop_v1_",
+        payload: { tool_name: "update_plan", tool_input: { explanation: `${"n".repeat(499)} ${pat};` } },
+      },
+      {
+        name: "long ordinary answer", marker: "never-present",
+        payload: { tool_name: "request_user_input", tool_input: { questions: [{ id: "q", question: "Choose?" }] },
+          tool_response: { answers: { q: { answers: ["a".repeat(3_000)] } } } },
+      },
+      {
+        name: "over-budget native answer", marker: "never-present", omitted: true,
+        payload: { tool_name: "request_user_input", tool_input: { questions: [{ id: "q", question: "Choose?" }] },
+          tool_response: { answers: { q: { answers: ["a".repeat(8_193)] } } } },
+      },
+      {
+        name: "over-budget native Bash command", marker: "never-present", omitted: true,
+        payload: { tool_name: "functions.exec_command", tool_input: { cmd: `npm install ${"a".repeat(8_193)}` },
+          tool_response: { exit_code: 0 } },
+      },
+      {
+        name: "secret-marked native answer", marker: "never-present", omitted: true,
+        payload: { tool_name: "request_user_input", tool_input: { questions: [{ id: "q", question: "Choose?", isSecret: true }] },
+          tool_response: { answers: { q: { answers: ["safe"] } } } },
+      },
+    ];
+    for (const { name, payload, marker, omitted } of cases) {
+      const rows = await runNativePersistenceCase(payload);
+      expect(rows, name).toHaveLength(omitted ? 0 : 1);
+      expect(JSON.stringify(rows), name).not.toContain(marker);
+      for (const row of rows) expect(String(row.data).length, name).toBeLessThanOrEqual(2_003);
     }
   });
 

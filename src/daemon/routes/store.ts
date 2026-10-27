@@ -136,7 +136,6 @@ export function createStoreHandler(
           depth: metadata.depth ?? 0,
           confidence: 1.0,
           thresholds: {
-            dedupBm25Threshold: config.compaction.promotionThresholds.dedupBm25Threshold,
             dedupCandidateLimit: config.compaction.promotionThresholds.dedupCandidateLimit,
           },
         }),

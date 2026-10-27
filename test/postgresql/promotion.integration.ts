@@ -129,7 +129,7 @@ describe("PostgreSQL passive promotion provenance", { timeout: 120_000 }, () => 
           tags: ["passive"],
           depth: 0,
           confidence: 0.9,
-          thresholds: { dedupBm25Threshold: 15, dedupCandidateLimit: 100 },
+          thresholds: { dedupCandidateLimit: 100 },
         });
         expect([localId, manualId]).toContain(id);
         const rows = await storage.promotedMemory.getAll();
@@ -156,7 +156,7 @@ describe("PostgreSQL passive promotion provenance", { timeout: 120_000 }, () => 
           tags: ["passive"],
           depth: 0,
           confidence: 0.7,
-          thresholds: { dedupBm25Threshold: 15, dedupCandidateLimit: 100 },
+          thresholds: { dedupCandidateLimit: 100 },
         });
         expect(remoteConvergedId).toBe(remoteOnlyId);
 
@@ -169,7 +169,7 @@ describe("PostgreSQL passive promotion provenance", { timeout: 120_000 }, () => 
           tags: [],
           depth: 0,
           confidence: 0.5,
-          thresholds: { dedupBm25Threshold: 15, dedupCandidateLimit: 100 },
+          thresholds: { dedupCandidateLimit: 100 },
         });
         expect(await storage.promotedMemory.getById(isolated)).not.toBeNull();
         const provenance = await database.migrator.query<{ source_project_id: string }>({
@@ -572,7 +572,7 @@ describe("PostgreSQL concurrent promoted-content deduplication", { timeout: 120_
         backend: "postgresql" as const,
         depth: 0,
         confidence: 0.9,
-        thresholds: { dedupBm25Threshold: 0.5, dedupCandidateLimit: 10 },
+        thresholds: { dedupCandidateLimit: 10 },
       };
 
       // Deterministic seam: hold the first transaction between the real
@@ -705,7 +705,7 @@ describe("PostgreSQL concurrent promoted-content deduplication", { timeout: 120_
               backend: "postgresql" as const,
               depth: 0,
               confidence: 0.9,
-              thresholds: { dedupBm25Threshold: 0.5, dedupCandidateLimit: 10 },
+              thresholds: { dedupCandidateLimit: 10 },
             });
             if (entry === 0) afterFirstEntry = await advisoryLocksHeld();
           }

@@ -49,6 +49,11 @@ export interface PassiveEventReplicationResult {
   readonly quarantined: number;
   readonly acknowledged: number;
   readonly pruned: number;
+  /**
+   * Whether any capped read of the pass returned a full batch, so more work
+   * may be waiting than this bounded pass could take (#1764).
+   */
+  readonly backlog: boolean;
 }
 
 /**
@@ -168,6 +173,7 @@ function result(): PassiveEventReplicationResult {
     quarantined: 0,
     acknowledged: 0,
     pruned: 0,
+    backlog: false,
   };
 }
 
@@ -327,6 +333,7 @@ export class PassiveEventReplicationWorker {
         // its own renewal. A lost lease stops claiming but still reconciles.
         if (!await admit(() => this.renewLease(lease.fencingToken, signal))) break;
       }
+      if (budget <= 0) mutable.backlog = true;
       await admit(() => this.reconcileLocal(mutable, signal));
       await admit(() => this.pruneAcknowledged(mutable, signal));
       return mutable;
@@ -349,6 +356,7 @@ export class PassiveEventReplicationWorker {
       retried: number;
       quarantined: number;
       acknowledged: number;
+      backlog: boolean;
     },
     signal?: AbortSignal,
   ): Promise<void> {
@@ -359,6 +367,7 @@ export class PassiveEventReplicationWorker {
       limit: this.options.batchSize,
       staleClaimMs: this.options.staleClaimMs,
     });
+    if (claimed.length === this.options.batchSize) summary.backlog = true;
     if (claimed.length === 0) return;
     const supported: LocalHookEventRow[] = [];
     for (const event of claimed) {
@@ -733,10 +742,11 @@ export class PassiveEventReplicationWorker {
   }
 
   private async reconcileLocal(
-    summary: { acknowledged: number; quarantined: number },
+    summary: { acknowledged: number; quarantined: number; backlog: boolean },
     signal?: AbortSignal,
   ): Promise<void> {
     const local = await this.dependencies.local.listAwaitingRemote(this.options.batchSize);
+    if (local.length === this.options.batchSize) summary.backlog = true;
     if (local.length === 0) return;
     const remote = await this.dependencies.remote.readEvents(
       local.map((event) => ({
@@ -847,12 +857,13 @@ export class PassiveEventReplicationWorker {
   }
 
   private async pruneAcknowledged(
-    summary: { pruned: number },
+    summary: { pruned: number; backlog: boolean },
     signal?: AbortSignal,
   ): Promise<void> {
     const acknowledged = await this.dependencies.local.listAcknowledgedForRemotePrune(
       this.options.batchSize,
     );
+    if (acknowledged.length === this.options.batchSize) summary.backlog = true;
     if (acknowledged.length === 0) return;
     const keys = acknowledged.map((event) => ({
       inboxId: BigInt(event.remote_inbox_id!),

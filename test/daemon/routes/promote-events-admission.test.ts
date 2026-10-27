@@ -40,7 +40,6 @@ function makeConfig(): DaemonConfig {
         compressionRatio: 0.1,
         keywords: { decision: ["decided"] },
         architecturePatterns: [],
-        dedupBm25Threshold: 15,
         dedupCandidateLimit: 100,
         eventConfidence: {
           decision: 0.5,

@@ -78,7 +78,6 @@ function makeConfig(): DaemonConfig {
         compressionRatio: 0.1,
         keywords: { decision: ["decided"] },
         architecturePatterns: [],
-        dedupBm25Threshold: 15,
         dedupCandidateLimit: 100,
         eventConfidence: {
           decision: 0.5,
@@ -1181,14 +1180,13 @@ describe("promote-events route", () => {
 
     const config = makeConfig();
     config.compaction.promotionThresholds.eventConfidence = undefined;
-    config.compaction.promotionThresholds.dedupBm25Threshold = undefined;
     config.compaction.promotionThresholds.dedupCandidateLimit = undefined;
     config.compaction.promotionThresholds.insightsMaxAgeDays = undefined;
     config.compaction.promotionThresholds.maxConfidence = undefined;
     config.compaction.promotionThresholds.reinforcementBoost = undefined;
     const result = await promoteEventsForCwd(config, dir);
     expect(result.promoted).toBeGreaterThanOrEqual(5);
-    expect(vi.mocked(deduplicateAndInsert).mock.calls.some(([input]) => input.thresholds.dedupBm25Threshold === 15)).toBe(true);
+    expect(vi.mocked(deduplicateAndInsert).mock.calls.some(([input]) => input.thresholds.dedupCandidateLimit === 100)).toBe(true);
   });
 
   it("reports a global project whose drain throws", async () => {

@@ -1,4 +1,4 @@
-import type { ExtractedEvent } from "./extractors.js";
+import { MAX_SCRUB_INPUT, type ExtractedEvent } from "./extractors.js";
 import { statSync } from "node:fs";
 import { dirname } from "node:path";
 import { join } from "node:path";
@@ -20,6 +20,7 @@ interface ScrubCacheEntry {
 }
 
 const SCRUB_CACHE_MAX = 100;
+const DATA_SOFT_CAP = 2_000;
 const scrubCache = new Map<string, ScrubCacheEntry>();
 let scrubCacheMax = SCRUB_CACHE_MAX;
 
@@ -100,6 +101,9 @@ export async function scrubExtractedEvents(
   cwd: string,
   globalPatterns?: string[],
 ): Promise<ExtractedEvent[]> {
+  // Reject complete over-budget fields before any regex sees a partial value.
+  const admitted = events.filter((event) =>
+    event.data.length + (event.tags?.reduce((length, tag) => length + tag.length, 0) ?? 0) <= MAX_SCRUB_INPUT);
   const patterns = globalPatterns ?? persistedSensitivePatterns();
   // Hook capture must not enter backend-selected project-map reconciliation.
   // The local sidecar identity remains stable for ordinary projects and uses
@@ -108,11 +112,17 @@ export async function scrubExtractedEvents(
   const projDir = join(lcmHomeDir(), "projects", identity.id);
   assertProjectStorageIdentityActive(projDir, identity.id);
   const scrubber = await getScrubber(patterns, projDir);
-  return events.map((event) => ({
+  const bound = (value: string): string => {
+    if (value.length <= DATA_SOFT_CAP) return value;
+    const prefix = value.slice(0, DATA_SOFT_CAP);
+    // Keep the UTF-16 cap without persisting half of a surrogate pair.
+    return `${/[\uD800-\uDBFF]$/u.test(prefix) ? prefix.slice(0, -1) : prefix}...`;
+  };
+  return admitted.map((event) => ({
     ...event,
-    data: scrubber.scrub(event.data),
+    data: bound(scrubber.scrub(event.data)),
     ...(event.tags
-      ? { tags: event.tags.map((tag) => scrubber.scrub(tag)) }
+      ? { tags: event.tags.map((tag) => bound(scrubber.scrub(tag))) }
       : {}),
   }));
 }

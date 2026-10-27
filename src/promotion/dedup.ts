@@ -6,7 +6,6 @@ import type {
 } from "../storage/contracts.js";
 
 type DedupThresholds = {
-  dedupBm25Threshold: number;
   dedupCandidateLimit: number;
 };
 
@@ -61,8 +60,7 @@ function isDuplicateCandidate(
   // only byte-for-byte identical content may merge, whatever the candidate's
   // rank. A lexical match is not evidence of duplication: BM25 grows with the
   // number of matched rare terms, so a long text can outrank any threshold
-  // against an unrelated memory. dedupBm25Threshold is still accepted but no
-  // longer influences this decision.
+  // against an unrelated memory.
   return candidate.content === content;
 }
 

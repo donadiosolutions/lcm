@@ -513,10 +513,15 @@ Codex capture is deliberately narrow. Current Codex reports shell commands
 (`exec_command` and the `write_stdin` polls that finish them) to hooks as the
 tool `Bash`; LCM also accepts the legacy names `functions.exec` and
 `functions.exec_command` as aliases. The adapter takes `tool_input.command`, or
-`tool_input.cmd` when `command` is absent, and bounds the accepted command to
-2,000 characters before passing it through the existing event-data truncation
-and sensitive-data scrubbing. MCP tools (`mcp__<server>__<tool>`) are recorded
-by tool name only.
+`tool_input.cmd` when `command` is absent, and passes the complete selected
+command to semantic extraction up to 8,192 UTF-16 code units. Longer commands
+create no passive event. Complete selected event data and tags within that
+admission limit are scrubbed before each retained field is limited to 2,000
+code units plus `...`; larger selected events are omitted. A failed Bash
+event stores only a matched git/install command type, such as
+`Bash error: npm install`, or the fixed label `Bash error: command`, without
+arguments.
+MCP tools (`mcp__<server>__<tool>`) are recorded by tool name only.
 
 Codex's PostToolUse payload carries no shell exit status, only the output text,
 and LCM never parses that text. A completed git or install command is
@@ -588,6 +593,8 @@ ambiguous or malformed unmatched marker/header combinations are preserved
 conservatively and may require a second reinstall to become byte-stable; user-
 authored Markdown outside recognized regions, including heading lines, is never
 removed by this recovery behavior.
+Install and removal also handle rules files with many separate recognized
+managed blocks while retaining the line-ending style of the user content.
 
 Removing a rules connector deletes its file only when managed-block removal
 leaves zero bytes. Spaces, tabs, form-feed, and other non-CR/LF user Markdown

@@ -417,7 +417,6 @@ export function createPromoteHandler(
                       depth: summary.depth,
                       confidence: promotionResult.confidence,
                       thresholds: {
-                        dedupBm25Threshold: config.compaction.promotionThresholds.dedupBm25Threshold,
                         dedupCandidateLimit: config.compaction.promotionThresholds.dedupCandidateLimit,
                       },
                     }));
