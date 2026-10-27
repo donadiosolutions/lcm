@@ -541,6 +541,10 @@ daemon drives replication, not these commands. CLI/import-export remains
 observed local outbox counts alongside selected-backend readiness through the
 [shared diagnostic snapshot](cli.md#observational-diagnostics).
 
+Operator command errors shown in text mode are rendered on one terminal-safe
+line. With `--json`, the structured `error` value retains the original message
+for programmatic diagnostics; display it with appropriate escaping.
+
 ### Learned Insights
 
 On SessionStart, recently promoted passive insights are surfaced in a `<learned-insights>` block. This closes the feedback loop — the system learns from your sessions and applies those learnings in future ones.

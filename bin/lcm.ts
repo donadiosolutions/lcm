@@ -3809,7 +3809,7 @@ export async function runCli(
   const passiveOperatorError = (error: unknown, json: boolean): never => {
     const message = error instanceof Error ? error.message : String(error);
     if (json) printJson({ error: message });
-    else console.error(`Error: ${message}`);
+    else console.error(`Error: ${sanitizeTerminalText(message)}`);
     return exit(1);
   };
 
