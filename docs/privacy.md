@@ -106,182 +106,52 @@ The refusal uses a fixed error and does not include the memory text, ID, path,
 or query. NUL characters in JSON-escaped tags remain supported.
 
 New promoted content containing `U+0000` is rejected before the database write.
-For a legacy row, use the offline procedure below with **Node.js 25 or newer**
-(the built-in `node:sqlite` module supplies everything; no npm dependencies or
-LCM internal imports are needed). LCM does not strip bytes, truncate rows, or
-run an automatic migration. If no intended replacement is known, preserve the
-backup and leave the row refused.
+LCM does not strip bytes, truncate rows, or run an automatic migration. The
+script below diagnoses affected legacy rows; it cannot repair them on any
+platform. Preserve the database with its WAL/SHM sidecars and seek a separately
+reviewed recovery procedure rather than improvising a backup destination or
+editing the row in place.
 
 1. Close agent sessions and stop the LCM service with your service manager.
    Keep all writers, including hooks, CLI commands and worktree reconciliation,
-   stopped throughout maintenance. Identify the project's existing
+   stopped throughout diagnosis. Identify the project's existing
    `~/.lcm/projects/{hash}/db.sqlite` using its adjacent `meta.json`; use the
    configured runtime directory if yours differs. This procedure is only for
    SQLite projects.
-2. Save the following script as `repair-promoted.mjs` in a new private directory
-   under your own home or local user profile. On POSIX, for example, run
-   `umask 077; mkdir -m 700 "$HOME/lcm-repair"`, then save the script there.
-   On Windows, inspect the ACL of every containing directory from the local
-   drive root through your profile to the repair folder using folder Properties
-   > Security > Advanced or `icacls`. Confirm that another account cannot
-   create, delete, rename or replace the next path component, including through
-   inherited permissions, `DELETE_CHILD`, ownership or permission-change rights.
-   Traversal alone is acceptable. The repair folder must grant access only to
-   your account, Administrators and SYSTEM, with no shared access. If any
-   effective right cannot be verified, do not run the repair. Keep these
-   permissions in place throughout the repair; Node's mode bits do not verify
-   Windows ACLs. From the script directory, first run
-   `node repair-promoted.mjs /absolute/path/db.sqlite` to print affected IDs
-   only. It opens the database read-only and does not print memory content.
-3. Put the complete intended replacement in a private UTF-8 text file. Every
-   byte, including a final newline, is part of the replacement. Run the repair
-   with the selected ID, replacement file and a **new backup filename directly
-   inside the script directory**:
-
-   ```sh
-   node "$HOME/lcm-repair/repair-promoted.mjs" /absolute/path/db.sqlite SELECTED_ID /absolute/path/replacement.txt "$HOME/lcm-repair/before-repair.sqlite"
-   ```
-
-   The script creates a consistent SQLite backup (including committed WAL
-   data), verifies its integrity, then replaces that row and its FTS entry in
-   one transaction. It preserves all other fields, and keeps archived rows out
-   of the search index. It refuses healthy rows, unknown IDs, invalid UTF-8 and
-   NUL-containing replacements. On Windows, use a fully qualified path on a
-   local drive for both the script and backup; this example refuses UNC shares
-   and drive-root-relative paths. A failed repair rolls back; keep the backup.
+2. Save the following script as `repair-promoted.mjs` in a private directory.
+   With **Node.js 25 or newer**, run
+   `node repair-promoted.mjs /absolute/path/db.sqlite`. The built-in
+   `node:sqlite` module supplies everything; no npm dependencies or LCM
+   internal imports are needed. The script opens the database read-only and
+   prints affected IDs only, never memory content. It rejects repair arguments
+   before opening the database.
 
 ```js
-import { DatabaseSync, backup } from "node:sqlite";
-import { closeSync, lstatSync, openSync, readFileSync, realpathSync, statSync } from "node:fs";
-import { dirname, isAbsolute, join, parse, relative, resolve, sep } from "node:path";
-import { fileURLToPath } from "node:url";
+import { DatabaseSync } from "node:sqlite";
+import { statSync } from "node:fs";
 
 const args = process.argv.slice(2);
-if (args.length !== 1 && args.length !== 4) {
-  throw new Error("Usage: node repair-promoted.mjs DB [ID TEXT_FILE NEW_BACKUP]");
+if (args.length !== 1) {
+  throw new Error("Usage: node repair-promoted.mjs DB (diagnosis only)");
 }
-const [path, id, textFile, backupPath] = args;
+const [path] = args;
 if (!statSync(path).isFile()) throw new Error("DB must be an existing file");
 const unsupported = "typeof(content) <> 'text' OR instr(content, char(0)) > 0";
-const db = new DatabaseSync(path, { readOnly: args.length === 1 });
+const db = new DatabaseSync(path, { readOnly: true });
 try {
-  if (args.length === 1) {
-    for (const row of db.prepare(`SELECT id FROM promoted WHERE ${unsupported}`).all()) {
-      console.log(JSON.stringify(row.id));
-    }
-  } else {
-    const content = new TextDecoder("utf-8", { fatal: true, ignoreBOM: true })
-      .decode(readFileSync(textFile));
-    if (content.includes("\u0000")) throw new Error("Replacement contains NUL");
-    const scriptDir = dirname(fileURLToPath(import.meta.url));
-    if (process.platform === "win32" &&
-        (!/^[A-Za-z]:[\\/]/.test(scriptDir) || !/^[A-Za-z]:[\\/]/.test(backupPath))) {
-      throw new Error("Script and backup must be on a local drive");
-    }
-    if (!isAbsolute(backupPath)) throw new Error("Backup path must be absolute");
-    const destination = resolve(backupPath);
-    const backupDir = dirname(destination);
-    if (process.platform !== "win32" && backupDir !== scriptDir) {
-      throw new Error("Backup must be a direct child of the script directory");
-    }
-    const uid = process.platform === "win32" ? undefined : process.getuid?.();
-    if (process.platform !== "win32" && typeof uid !== "number") {
-      throw new Error("Cannot verify directory ownership");
-    }
-    const inspectChain = (directory) => {
-      const root = parse(directory).root;
-      let current = root;
-      let parentInfo;
-      for (const component of ["", ...relative(root, directory).split(sep).filter(Boolean)]) {
-        if (component) current = join(current, component);
-        const info = lstatSync(current);
-        if (!info.isDirectory() || info.isSymbolicLink()) {
-          throw new Error("Backup directory chain contains a link or non-directory");
-        }
-        if (process.platform !== "win32" &&
-            ((info.uid !== uid && info.uid !== 0) || (info.mode & 0o022))) {
-          throw new Error("Backup directory chain is not trusted");
-        }
-        parentInfo = info;
-      }
-      return parentInfo;
-    };
-    const parentInfo = inspectChain(scriptDir);
-    if (process.platform === "win32") {
-      const backupDirInfo = inspectChain(backupDir);
-      if (!parentInfo.ino ||
-          realpathSync.native(backupDir).toLowerCase() !==
-            realpathSync.native(scriptDir).toLowerCase() ||
-          backupDirInfo.dev !== parentInfo.dev || backupDirInfo.ino !== parentInfo.ino) {
-        throw new Error("Backup must be a direct child of the script directory");
-      }
-    }
-    if (process.platform !== "win32" &&
-        (parentInfo.uid !== uid || (parentInfo.mode & 0o077))) {
-      throw new Error("Script directory must be private and process-owned");
-    }
-    const checkParent = () => {
-      const now = lstatSync(scriptDir);
-      if (!now.isDirectory() || now.isSymbolicLink() ||
-          now.dev !== parentInfo.dev || now.ino !== parentInfo.ino) {
-        throw new Error("Script directory changed during backup");
-      }
-    };
-    // Exclusive creation rejects an existing name. The trusted directory chain
-    // prevents other accounts replacing it when SQLite reopens the pathname.
-    closeSync(openSync(destination, "wx", 0o600));
-    checkParent();
-    await backup(db, destination);
-    const saved = new DatabaseSync(destination, { readOnly: true });
-    try {
-      const checks = saved.prepare("PRAGMA integrity_check").all();
-      if (checks.length !== 1 || checks[0].integrity_check !== "ok") {
-        throw new Error("Backup integrity check failed");
-      }
-    } finally {
-      saved.close();
-    }
-    checkParent();
-    db.exec("BEGIN IMMEDIATE");
-    try {
-      const row = db.prepare(`SELECT rowid, tags, archived_at FROM promoted
-        WHERE id = ? AND (${unsupported})`).get(id);
-      if (!row) throw new Error("ID is missing or does not need repair");
-      db.prepare("UPDATE promoted SET content = ? WHERE id = ?").run(content, id);
-      const fts = db.prepare("SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'promoted_fts'").get();
-      if (fts) {
-        db.prepare("DELETE FROM promoted_fts WHERE rowid = ?").run(row.rowid);
-        if (row.archived_at === null) {
-          db.prepare("INSERT INTO promoted_fts(rowid, content, tags) VALUES (?, ?, ?)")
-            .run(row.rowid, content, row.tags);
-        }
-      }
-      db.exec("COMMIT");
-      console.log("Repair committed; retain the verified backup.");
-    } catch (error) {
-      db.exec("ROLLBACK");
-      throw error;
-    }
+  for (const row of db.prepare(`SELECT id FROM promoted WHERE ${unsupported}`).all()) {
+    console.log(JSON.stringify(row.id));
   }
 } finally {
   db.close();
 }
 ```
 
-4. Repeat the diagnostic until no affected IDs remain (use a new backup name
-   for each repair). Restart the service and agent sessions, then verify the
-   active memory with `lcm search "distinctive replacement words"` from the
-   original project directory before resuming normal use. Archived memories
-   remain excluded from search; the offline diagnostic verifies that their
-   content is now supported. Retain the backup until verification is complete.
-   Do not replace a live
-   database file or discard its WAL/SHM sidecars to restore a backup; stop all
-   writers again before any restoration.
-
-The directory checks protect against other local accounts. They do not protect
-against a process running as your account or an administrator, or permissions
-changed during the repair. The parent identity checks detect observed changes;
-they do not atomically reserve the directory or backup filename.
+3. If IDs are printed, keep the original database and WAL/SHM sidecars intact.
+   In-place promoted-memory repair is unavailable in this guide. Leave those
+   rows refused and obtain a separately reviewed recovery procedure before
+   changing them. Do not use the former four-argument invocation or remove a
+   write fence to make a repair attempt work.
 
 Legacy worktree reconciliation uses a separate import path. During a real
 reconciliation, LCM checks the live source database while its existing
@@ -290,21 +160,21 @@ transaction. For a source that has not been merged, a promoted row whose
 `content` is not SQLite `TEXT` or contains an embedded NUL fails closed with
 `stored promoted content is unsupported` before the row can be copied or used
 to rebuild FTS. The source check rolls back the uncommitted fence, so the source
-bytes remain intact and can be repaired in place. A target check rolls back the
-target transaction; its source fence may already be committed, so repair the
-target database in place and rerun reconciliation. Use the offline diagnostic
-and replacement procedure above to inspect and deliberately repair affected
-rows before retrying.
+bytes remain intact. A target check rolls back the target transaction; its
+source fence may already be committed. The diagnostic above can identify
+affected promoted rows, but this guide offers no in-place
+repair. Preserve the source and target databases with their WAL/SHM sidecars
+and seek a separately reviewed recovery procedure before retrying.
 
 A canonical per-source completion marker remains an idempotent recovery
-boundary. LCM does not ask for a source repair that the completed merge would
-skip; it re-fences and archives that source, preserving its original bytes in
-the private backup. If the completion marker is missing when the target
-transaction checks it, LCM rechecks the normalized source and fails closed
+boundary. LCM does not require changes to a source whose completed merge it
+would skip; it re-fences and archives that source, preserving its original
+bytes in the private backup. If the completion marker is missing when the
+target transaction checks it, LCM rechecks the normalized source and fails closed
 instead of relying on the earlier marker observation. This does not audit or
 repair canonical content written by an older LCM version. If that target
-contains a known truncated legacy value, repair the canonical target with the
-offline procedure above. This refusal
+contains a known truncated legacy value, the script above can diagnose
+unsupported rows but cannot repair the canonical target. This refusal
 behavior is implemented by [#1173](https://github.com/donadiosolutions/lcm/issues/1173).
 
 That marker recheck has a rare third outcome. LCM commits the source write
@@ -313,8 +183,8 @@ the initial read-only check but durably absent inside the target transaction,
 the normalized source recheck refuses while the source is already retired.
 Nothing is copied and nothing is truncated: the canonical target keeps its
 existing rows and the source keeps its original bytes. The retired source now
-carries write-fence triggers on its ordinary tables, so the in-place
-`UPDATE promoted` repair described above aborts with
+carries write-fence triggers on its ordinary tables, so an in-place
+`UPDATE promoted` would abort with
 `LCM source retired by worktree reconciliation`, and a later run refuses again
 at the source guard because the marker is still missing.
 
@@ -323,10 +193,10 @@ triggers or the `worktree_reconciliation_fence` table and do not edit the
 target's `worktree_reconciliation_sources` marker by hand: those are what keep
 a retired source from being written and from being merged twice. Stop the
 writers, leave the source database, the canonical target, and the
-reconciliation journal exactly as they are, keep a backup, and report the state
-at [the issue tracker](https://github.com/donadiosolutions/lcm/issues) so that
-recovery is designed against the retirement and admission boundary instead of
-being improvised on a live database.
+reconciliation journal exactly as they are, including their WAL/SHM sidecars,
+and report the state at [the issue tracker](https://github.com/donadiosolutions/lcm/issues)
+so recovery is designed against the retirement and admission boundary instead
+of being improvised on a live database.
 
 ### Unsupported legacy conversation message bytes
 
@@ -345,9 +215,9 @@ Stop writers, keep the database and its WAL/SHM sidecars together, and make a
 verified backup before repair. Inspect affected rows offline with
 `typeof(content)`, `hex(content)`, and `instr(content, char(0))`, then correct
 the intended scalar value and rerun reconciliation. Do not use the promoted
-memory script above for `messages`; it is an inline, promoted-only diagnostic
-and repair procedure, not a shipped general-purpose migration. Empty text,
-valid multi-byte Unicode, a genuine replacement character (`U+FFFD`, encoded as
+memory script above for `messages`; it is an inline, promoted-only diagnostic,
+not a shipped general-purpose migration. Empty text, valid multi-byte Unicode,
+a genuine replacement character (`U+FFFD`, encoded as
 UTF-8 `EF BF BD`), and literal JSON-escaped `\\u0000` text remain supported.
 Malformed UTF-8, an actual NUL byte, and non-`TEXT` storage are refused. If a
 source completion marker already exists, reconciliation preserves the existing

@@ -358,18 +358,20 @@ merge markers continue from the verified state.
 Promoted-memory content is checked at the SQLite boundary during project
 reconciliation. An unmerged source row with a non-`TEXT` value or an embedded
 NUL is refused before its source fence commits, preserving the source bytes for
-an in-place repair. The same check runs on the target inside its transaction
+offline diagnosis. The same check runs on the target inside its transaction
 before conversation or promoted rows are copied and before FTS is rebuilt. A
-target refusal can leave the source fence committed; repair the target in place
-and rerun reconciliation. A source whose canonical completion marker already
-exists is re-fenced and archived without a source-content repair request. Its
+target refusal can leave the source fence committed. In-place promoted repair
+is unavailable in this guide; preserve the database and WAL/SHM sidecars and
+seek a separately reviewed recovery procedure before retrying reconciliation.
+A source whose canonical completion marker already exists is re-fenced and
+archived without a source-content repair request. Its
 original bytes remain in the private backup, while the completion marker stays
 an idempotent boundary rather than a retrospective audit of canonical content.
 If that marker disappears before the target transaction checks it, LCM
 revalidates the normalized source before copying. The fixed error is `stored
 promoted content is unsupported` and does not include memory content, IDs,
 paths, or tags. See the
-[offline promoted-memory repair procedure](privacy.md#embedded-nul-in-promoted-memory).
+[read-only promoted-memory diagnostic](privacy.md#embedded-nul-in-promoted-memory).
 
 When no canonical completion marker exists for a source, legacy conversation
 messages use the same SQLite boundary check. On that merge path,
@@ -394,8 +396,8 @@ whose write fence has already committed is retired and rejects that in-place
 correction. See
 [Embedded NUL in promoted memory](privacy.md#embedded-nul-in-promoted-memory)
 for that retired-source state, for why no in-place source repair is supported
-there, and for the offline repair procedure, which covers promoted rows only
-and is not a shipped message-repair command. Empty text,
+there, and for the promoted-only diagnostic, which cannot repair rows and is
+not a shipped message-repair command. Empty text,
 valid multi-byte Unicode, a genuine `U+FFFD` replacement character encoded as
 UTF-8 `EF BF BD`, and literal JSON-escaped `\\u0000` text remain valid. A
 malformed byte that a driver would display as `U+FFFD` remains unsupported.

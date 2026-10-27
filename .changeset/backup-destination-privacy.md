@@ -2,4 +2,5 @@
 "@donadiosolutions/lcm": patch
 ---
 
-Require a private backup destination for the offline promoted-memory repair.
+Limit the inline promoted-memory recovery script to read-only diagnosis. In-place
+repair remains unavailable pending a separately reviewed recovery procedure.
