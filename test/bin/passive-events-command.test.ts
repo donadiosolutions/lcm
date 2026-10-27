@@ -396,14 +396,14 @@ describe("lcm events staged PostgreSQL operator commands", () => {
   });
 
   it("keeps path-bearing reconciliation errors on one safe text line", async () => {
-    const message = "invalid Git config metadata at /tmp/project\nforged\u001b[31mred\u001b[0m\u001b]0;spoof\u0007/config: ambiguous worktree configuration";
+    const message = "invalid Git config metadata at /tmp/project\nforged\rheader\u001b[31mred\u001b[0m\u001b]0;spoof\u0007/config: ambiguous worktree configuration";
     state.reconcileWorktree.mockImplementation(() => { throw new Error(message); });
     const error = vi.spyOn(console, "error").mockImplementation(() => undefined);
     const stdout = vi.spyOn(process.stdout, "write").mockImplementation(() => true);
 
     await expect(invoke("events", "status")).rejects.toThrow("exit:1");
     expect(error).toHaveBeenCalledExactlyOnceWith(
-      "Error: invalid Git config metadata at /tmp/project forgedred/config: ambiguous worktree configuration",
+      "Error: invalid Git config metadata at /tmp/project forged headerred/config: ambiguous worktree configuration",
     );
 
     await expect(invoke("events", "status", "--json")).rejects.toThrow("exit:1");
