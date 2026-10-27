@@ -212,7 +212,7 @@ if [[ "$1" == "run" && "$2" == "watch" ]]; then
     if [[ -s "$FAKE_POST_PUBLISH_REMOTE_TAG_STATE" ]]; then
       cp "$FAKE_POST_PUBLISH_REMOTE_TAG_STATE" "$FAKE_REMOTE_TAG_STATE"
     else
-      rm -f "$FAKE_REMOTE_TAG_STATE"
+      node -e 'try { require("node:fs").unlinkSync(process.env.FAKE_REMOTE_TAG_STATE); } catch (error) { if (error.code !== "ENOENT") throw error; }'
     fi
   fi
   exit 0
