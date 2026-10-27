@@ -978,7 +978,7 @@ describe("deduplicateAndInsert", () => {
 });
 
 describe("deduplicateAndInsertInRepositories existingOnly", () => {
-  const thresholds = { dedupBm25Threshold: 15, dedupCandidateLimit: 100 };
+  const thresholds = { dedupCandidateLimit: 100 };
   const input = {
     tags: ["source:passive-capture"],
     sourceProjectId: "p1",
