@@ -588,6 +588,8 @@ ambiguous or malformed unmatched marker/header combinations are preserved
 conservatively and may require a second reinstall to become byte-stable; user-
 authored Markdown outside recognized regions, including heading lines, is never
 removed by this recovery behavior.
+Install and removal also handle rules files with many separate recognized
+managed blocks while retaining the line-ending style of the user content.
 
 Removing a rules connector deletes its file only when managed-block removal
 leaves zero bytes. Spaces, tabs, form-feed, and other non-CR/LF user Markdown
