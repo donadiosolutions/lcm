@@ -85,7 +85,7 @@
     "body-parser": "2.3.0",
     "esbuild": "0.28.2",
     "eslint": "10.13.0",
-    "fast-uri": "4.2.2",
+    "fast-uri": "4.2.3",
     "openai": "7.36.0",
     "typescript": "6.0.3",
     "typescript-eslint": "8.71.2",
