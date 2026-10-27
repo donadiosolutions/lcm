@@ -871,9 +871,18 @@ describe("local backend-publication consumer seam", () => {
         expectedChecksumSha256: journal.checksumSha256,
         access: "read-recovery",
       }, (permit) => {
-        expect(() => assertBackendPublicationPermit(permit)).not.toThrow();
-        expect(() => assertBackendPublicationPermit(permit, otherHome))
-          .toThrow("does not match durable state");
+        expect(() => assertBackendPublicationPermit(permit, home)).not.toThrow();
+        process.env.HOME = otherHome;
+        try {
+          expect(() => assertBackendPublicationPermit(permit, otherHome))
+            .toThrow("does not match durable state");
+          expect(() => assertBackendPublicationPermit(permit))
+            .toThrow("does not match durable state");
+          expect(() => assertBackendPublicationPermit(permit, home)).not.toThrow();
+        } finally {
+          process.env.HOME = home;
+        }
+        expect(() => assertBackendPublicationPermit(permit, home)).not.toThrow();
       });
     } finally {
       if (previousHome === undefined) delete process.env.HOME;

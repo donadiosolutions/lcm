@@ -3677,10 +3677,11 @@ export async function withBackendPublicationPermit<T>(
   input: BackendPublicationPermitInput,
   callback: (permit: PrivateMutationPermit) => T | Promise<T>,
 ): Promise<T> {
+  const homeDir = resolve(input.homeDir ?? homedir());
   return withBackendPublicationConsumerLockAsync(
-    input.homeDir,
+    homeDir,
     async () => {
-      const journal = readJournal(input.homeDir);
+      const journal = readJournal(homeDir);
       if (
         journal === null
         || journal.publicationId !== input.publicationId
@@ -3716,7 +3717,7 @@ export async function withBackendPublicationPermit<T>(
       }
       return withRevocablePrivateMutationPermit(`backend publication ${input.access}`, async (permit) => {
         activePublicationPermits.set(permit, {
-          homeDir: input.homeDir,
+          homeDir,
           publicationId: journal.publicationId,
           checksumSha256: journal.checksumSha256,
           phase: journal.phase,
