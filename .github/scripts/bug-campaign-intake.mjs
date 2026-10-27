@@ -77,35 +77,43 @@ function parseRepository(repository) {
   return Object.freeze({ owner: match[1], repository: match[2], value: repository });
 }
 
+function parseIssueUrl(value, label) {
+  const url = assertNonEmptyString(value, `${label}.url`);
+  const match = /^https:\/\/github\.com\/([A-Za-z0-9][A-Za-z0-9_.-]*)\/([A-Za-z0-9][A-Za-z0-9_.-]*)\/issues\/([1-9][0-9]*)$/iu.exec(url);
+  if (!match || match[0] !== url) {
+    throw new Error(`${label}.url must be a canonical GitHub issue URL`);
+  }
+  const issueNumber = Number(match[3]);
+  if (!Number.isSafeInteger(issueNumber)) {
+    throw new Error(`${label}.url must be a canonical GitHub issue URL`);
+  }
+  return Object.freeze({
+    repository: parseRepository(`${match[1]}/${match[2]}`),
+    issueNumber,
+  });
+}
+
 function parseParentRepository(parent) {
   if (!isPlainObject(parent)) {
     throw new TypeError("Issue parent must be an object");
   }
-  if (!isPlainObject(parent.repository)) {
-    throw new TypeError("Issue parent.repository must be an object");
+  const number = assertIssueNumber(parent.number, "Issue parent.number");
+  const parsed = parseIssueUrl(parent.url, "Issue parent");
+  if (parsed.issueNumber !== number) {
+    throw new Error("Issue parent.url did not match its issue number");
   }
-  return parseRepository(parent.repository.nameWithOwner);
+  return parsed.repository;
 }
 
 function validateIssueUrl(value, repository, issueNumber, label) {
-  const url = assertNonEmptyString(value, `${label}.url`);
-  let parsed;
-  try {
-    parsed = new URL(url);
-  } catch {
-    throw new Error(`${label}.url must be a canonical GitHub issue URL`);
-  }
-  const expectedPath = `/${repository.owner}/${repository.repository}/issues/${issueNumber}`;
+  const parsed = parseIssueUrl(value, label);
   if (
-    parsed.protocol !== "https:"
-    || parsed.hostname.toLowerCase() !== GITHUB_HOST
-    || parsed.search !== ""
-    || parsed.hash !== ""
-    || parsed.pathname.toLowerCase() !== expectedPath.toLowerCase()
+    parsed.repository.value.toLowerCase() !== repository.value.toLowerCase()
+    || parsed.issueNumber !== issueNumber
   ) {
     throw new Error(`${label}.url must be a canonical GitHub issue URL`);
   }
-  return url;
+  return `https://${GITHUB_HOST}/${repository.value}/issues/${issueNumber}`;
 }
 
 function nativeType(value, label) {
@@ -399,7 +407,8 @@ function truncateScalarToFit(data, field, originalBytes) {
     }
   }
   if (best === undefined) {
-    throw new Error("Issue data cannot fit in a bounded envelope");
+    data[field] = "";
+    return;
   }
   data[field] = best;
 }

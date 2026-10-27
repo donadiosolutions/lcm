@@ -2,6 +2,7 @@ import assert from "node:assert/strict";
 import test from "node:test";
 
 const moduleUrl = new URL("./bug-campaign-intake.mjs", import.meta.url);
+const envelopeLimitBytes = 65_536;
 
 async function intakeApi() {
   return import(moduleUrl.href);
@@ -15,11 +16,18 @@ function parseEnvelope(envelope) {
   return JSON.parse(envelope.slice(start.length, -end.length));
 }
 
-function campaignIssueResponse(parent) {
+function wrapEnvelope(payload) {
+  return `<<<LCM_UNTRUSTED_ISSUE_DATA>>>\n${JSON.stringify(payload)}\n<<<END_LCM_UNTRUSTED_ISSUE_DATA>>>`;
+}
+
+function campaignIssueResponse(
+  parent,
+  url = "https://github.com/donadiosolutions/lcm/issues/1448",
+) {
   return JSON.stringify({
     id: "I_kwDONadiosolutionsLCM1448",
     number: 1448,
-    url: "https://github.com/donadiosolutions/lcm/issues/1448",
+    url,
     issueType: { name: "Bug" },
     parent,
     state: "OPEN",
@@ -109,7 +117,7 @@ test("keeps GitHub title and body out of trusted intake output", async () => {
 });
 
 test("projects a same-repository GitHub linked parent", async () => {
-  // Mutation caught: rejecting the LinkedIssue repository shape for a valid same-repository parent.
+  // Mutation caught: requiring a repository field that gh does not export for linked parents.
   const { fetchBugCampaignIssue } = await intakeApi();
   const untrustedParentTitle = "Inert parent title";
   const parent = {
@@ -118,7 +126,6 @@ test("projects a same-repository GitHub linked parent", async () => {
     title: untrustedParentTitle,
     state: "OPEN",
     url: "https://github.com/donadiosolutions/lcm/issues/1400",
-    repository: { nameWithOwner: "donadiosolutions/lcm" },
   };
 
   const projection = await fetchBugCampaignIssue({
@@ -138,15 +145,14 @@ test("projects a same-repository GitHub linked parent", async () => {
 });
 
 test("projects a cross-repository GitHub linked parent", async () => {
-  // Mutation caught: validating a parent URL against the child repository instead of its own repository.
+  // Mutation caught: deriving parent identity from the child repository instead of the parent URL.
   const { fetchBugCampaignIssue } = await intakeApi();
   const parent = {
     id: "I_kwDOParentRepo1400",
     number: 1400,
     title: "Inert cross-repository parent title",
     state: "OPEN",
-    url: "https://github.com/donadiosolutions/parent-repo/issues/1400",
-    repository: { nameWithOwner: "donadiosolutions/parent-repo" },
+    url: "HTTPS://GITHUB.COM/donadiosolutions/parent-repo/issues/1400",
   };
 
   const projection = await fetchBugCampaignIssue({
@@ -163,33 +169,42 @@ test("projects a cross-repository GitHub linked parent", async () => {
   });
 });
 
-test("fails closed for malformed or mismatched linked parent repositories", async () => {
-  // Mutation caught: ignoring the parent repository identity while accepting a child-canonical URL.
+test("fails closed for malformed or mismatched linked parent URLs", async () => {
+  // Mutation caught: deriving parent identity without validating the complete GitHub issue URL.
   const { fetchBugCampaignIssue } = await intakeApi();
   const cases = [
     {
-      label: "malformed repository",
+      label: "malformed host",
       parent: {
         id: "I_kwDONadiosolutionsLCM1400",
         number: 1400,
-        title: "Inert malformed parent title",
+        title: "Inert malformed-host parent title",
         state: "OPEN",
-        url: "https://github.com/donadiosolutions/lcm/issues/1400",
-        repository: { nameWithOwner: "not a repository" },
+        url: "https://example.com/donadiosolutions/lcm/issues/1400",
       },
-      expected: /Repository must be an owner\/repository string/u,
+      expected: /Issue parent\.url must be a canonical GitHub issue URL/u,
     },
     {
-      label: "repository and URL mismatch",
+      label: "malformed path",
       parent: {
         id: "I_kwDOParentRepo1400",
         number: 1400,
-        title: "Inert mismatched parent title",
+        title: "Inert malformed-path parent title",
         state: "OPEN",
-        url: "https://github.com/donadiosolutions/lcm/issues/1400",
-        repository: { nameWithOwner: "donadiosolutions/parent-repo" },
+        url: "https://github.com/donadiosolutions/parent-repo/pull/1400",
       },
       expected: /Issue parent\.url must be a canonical GitHub issue URL/u,
+    },
+    {
+      label: "URL and number mismatch",
+      parent: {
+        id: "I_kwDOParentRepo1400",
+        number: 1400,
+        title: "Inert mismatched-number parent title",
+        state: "OPEN",
+        url: "https://github.com/donadiosolutions/parent-repo/issues/1401",
+      },
+      expected: /Issue parent\.url did not match its issue number/u,
     },
   ];
 
@@ -202,6 +217,63 @@ test("fails closed for malformed or mismatched linked parent repositories", asyn
       }),
       expected,
       label,
+    );
+  }
+});
+
+test("canonicalizes issue URLs and rejects credentials or explicit ports", async () => {
+  // Mutation caught: returning the transport URL verbatim or accepting authority decorations.
+  const { fetchBugCampaignIssue } = await intakeApi();
+  const projection = await fetchBugCampaignIssue({
+    repository: "donadiosolutions/lcm",
+    issueNumber: 1448,
+    runCommand: async () => campaignIssueResponse(
+      null,
+      "HTTPS://GITHUB.COM/donadiosolutions/lcm/issues/1448",
+    ),
+  });
+  assert.equal(
+    projection.trustedIssue.url,
+    "https://github.com/donadiosolutions/lcm/issues/1448",
+  );
+
+  for (const url of [
+    "https://user:password@github.com/donadiosolutions/lcm/issues/1448",
+    "https://github.com:443/donadiosolutions/lcm/issues/1448",
+  ]) {
+    await assert.rejects(
+      fetchBugCampaignIssue({
+        repository: "donadiosolutions/lcm",
+        issueNumber: 1448,
+        runCommand: async () => campaignIssueResponse(null, url),
+      }),
+      /Issue\.url must be a canonical GitHub issue URL/u,
+      url,
+    );
+  }
+});
+
+test("rejects parent URLs with credentials or explicit ports", async () => {
+  // Mutation caught: deriving a trusted parent repository from a decorated authority.
+  const { fetchBugCampaignIssue } = await intakeApi();
+  for (const url of [
+    "https://user:password@github.com/donadiosolutions/lcm/issues/1400",
+    "https://github.com:443/donadiosolutions/lcm/issues/1400",
+  ]) {
+    await assert.rejects(
+      fetchBugCampaignIssue({
+        repository: "donadiosolutions/lcm",
+        issueNumber: 1448,
+        runCommand: async () => campaignIssueResponse({
+          id: "I_kwDONadiosolutionsLCM1400",
+          number: 1400,
+          state: "OPEN",
+          title: "Inert parent title",
+          url,
+        }),
+      }),
+      /Issue parent\.url must be a canonical GitHub issue URL/u,
+      url,
     );
   }
 });
@@ -352,6 +424,129 @@ test("skips a prefiltered full-pattern scan for a bounded keyword-absent near mi
   }
 
   assert.equal(merakiExecutions, 0);
+});
+
+test("reports exact metadata when truncating an oversized body", async () => {
+  // Mutation caught: truncating without stable byte-accurate metadata.
+  const { projectUntrustedIssueData } = await intakeApi();
+  const input = {
+    title: "Safe title",
+    body: "b".repeat(80_000),
+    comments: [],
+    reproduction: [],
+    evidence: [],
+  };
+  const untruncated = { ...input, truncation: { applied: false } };
+
+  const envelope = await projectUntrustedIssueData(input);
+  const projected = parseEnvelope(envelope);
+
+  assert.deepEqual(projected.truncation, {
+    applied: true,
+    source: "github-issue-view",
+    reason: "envelope-byte-limit",
+    originalBytes: Buffer.byteLength(wrapEnvelope(untruncated), "utf8"),
+    retainedBytes: Buffer.byteLength(envelope, "utf8"),
+  });
+  assert.ok(Buffer.byteLength(envelope, "utf8") <= envelopeLimitBytes);
+});
+
+test("exhausts body before cutting an oversized title", async () => {
+  // Mutation caught: failing after body exhaustion instead of continuing to the title.
+  const { projectUntrustedIssueData } = await intakeApi();
+  const cases = [
+    { title: "t".repeat(80_000), body: "" },
+    { title: "t".repeat(70_000), body: "b".repeat(70_000) },
+  ];
+
+  for (const input of cases) {
+    const envelope = await projectUntrustedIssueData({
+      ...input,
+      comments: [],
+      reproduction: [],
+      evidence: [],
+    });
+    const projected = parseEnvelope(envelope);
+    assert.equal(projected.truncation.applied, true);
+    assert.equal(projected.body, "");
+    assert.ok(projected.title.length < input.title.length);
+    assert.ok(Buffer.byteLength(envelope, "utf8") <= envelopeLimitBytes);
+  }
+});
+
+test("removes array tails in evidence reproduction comments order", async () => {
+  // Mutation caught: removing an earlier array or shifting survivor order.
+  const { projectUntrustedIssueData } = await intakeApi();
+  const entries = (field, fill) => Array.from(
+    { length: 4 },
+    (_, index) => `${field}-${index}:${fill.repeat(17_000)}`,
+  );
+  const envelope = await projectUntrustedIssueData({
+    title: "Safe title",
+    body: "Safe body",
+    comments: entries("comments", "c"),
+    reproduction: entries("reproduction", "r"),
+    evidence: entries("evidence", "e"),
+  });
+  const projected = parseEnvelope(envelope);
+
+  assert.deepEqual(projected.evidence, []);
+  assert.deepEqual(projected.reproduction, []);
+  assert.deepEqual(
+    projected.comments.map((entry) => entry.slice(0, entry.indexOf(":"))),
+    ["comments-0", "comments-1", "comments-2"],
+  );
+});
+
+test("truncates a multibyte scalar only at a code-point boundary", async () => {
+  // Mutation caught: slicing UTF-8 bytes in the middle of a multibyte character.
+  const { projectUntrustedIssueData } = await intakeApi();
+  const envelope = await projectUntrustedIssueData({
+    title: "Safe title",
+    body: `${"a".repeat(65_000)}${"🙂".repeat(1_000)}`,
+    comments: [],
+    reproduction: [],
+    evidence: [],
+  });
+  const projected = parseEnvelope(envelope);
+
+  assert.equal(projected.truncation.applied, true);
+  assert.equal(projected.body.includes("�"), false);
+  assert.equal(Array.from(projected.body).at(-1), "🙂");
+  assert.ok(Buffer.byteLength(envelope, "utf8") <= envelopeLimitBytes);
+});
+
+test("redacts a credential crossing the truncation boundary before cutting", async () => {
+  // Mutation caught: truncating raw issue text before running credential redaction.
+  const { projectUntrustedIssueData } = await intakeApi();
+  const credential = `ghp_${"A".repeat(36)}`;
+  const credentialStart = 65_240;
+  const suffix = "z".repeat(2_000);
+  const harmlessEnvelope = await projectUntrustedIssueData({
+    title: "Safe title",
+    body: "a".repeat(credentialStart + credential.length + suffix.length),
+    comments: [],
+    reproduction: [],
+    evidence: [],
+  });
+  const harmlessBoundary = parseEnvelope(harmlessEnvelope).body.length;
+  assert.ok(credentialStart < harmlessBoundary);
+  assert.ok(credentialStart + credential.length > harmlessBoundary);
+
+  const envelope = await projectUntrustedIssueData({
+    title: "Safe title",
+    body: `${"a".repeat(credentialStart)}${credential}${suffix}`,
+    comments: [],
+    reproduction: [],
+    evidence: [],
+  });
+  const projected = parseEnvelope(envelope);
+
+  assert.equal(projected.truncation.applied, true);
+  assert.equal(envelope.includes(credential), false);
+  assert.equal(projected.body.includes("ghp_"), false);
+  assert.equal(projected.body.includes("[REDACTED]"), true);
+  assert.ok(Buffer.byteLength(envelope, "utf8") <= envelopeLimitBytes);
 });
 
 test("fails closed for non-Bug campaign controls and hides raw transport errors", async () => {
