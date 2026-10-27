@@ -1140,7 +1140,7 @@ function isDoubledDriveColonInPath(chars: readonly string[], index: number, wind
     chars[index] === ":" &&
     chars[index + 1] === ":" &&
     chars[index + 2] === "\\" &&
-    /^[A-Za-z]$/u.test(chars[index - 1] ?? "") &&
+    /^[A-Za-z]$/u.test(chars[index - 1]!) &&
     (boundary === "\\" || (windows && boundary === "/")) &&
     !startsUrlSchemeLiteral(chars, index + 3)
   );

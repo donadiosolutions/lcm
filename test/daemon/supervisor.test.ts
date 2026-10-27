@@ -1672,6 +1672,7 @@ describe("systemd-user supervisor", () => {
     ["different prior nonce", (spec: SupervisorSpec) => managerText({ ...spec, nonce: "other-nonce" }, "deactivating", 0, "stop-sigterm")],
     ["unknown stop substate", (spec: SupervisorSpec) => managerText(spec, "deactivating", 0, "custom-transition")],
     ["non-deactivating state", (spec: SupervisorSpec) => managerText(spec, "activating", 0, "start")],
+    ["missing active state", (spec: SupervisorSpec) => managerText(spec, "deactivating", 0, "stop-sigterm").replace("ActiveState=deactivating\n", "")],
     ["missing stop substate", (spec: SupervisorSpec) => managerText(spec, "deactivating", 0, "stop-sigterm").replace("SubState=stop-sigterm\n", "")],
   ])("does not treat %s as owned post-stop state", async (_label, transitionFor) => {
     const spec = makeSpec("systemd-user");
