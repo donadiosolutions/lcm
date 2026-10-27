@@ -1,3 +1,4 @@
+import { createHash } from "node:crypto";
 import { mkdirSync, mkdtempSync, readFileSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -5,6 +6,8 @@ import { describe, expect, it, vi } from "vitest";
 import {
   assertExecutionProvenance,
   buildMachineContainerArgs,
+  captureExecutionHost,
+  captureExecutionProvenance,
   collectDatabaseReadiness,
   collectResidualState,
   collectSetupSessionClosure,
@@ -16,6 +19,7 @@ import {
   runMachineActivationBarrier,
   stageBuiltPackage,
   startClockMonitor,
+  validateRunnerSku,
   verifyDistinctMachineIdentities,
   waitForMachineFiles,
 } from "../../scripts/certification-harness.mjs";
@@ -105,6 +109,63 @@ describe("certification harness", () => {
     expect(assertExecutionProvenance("smoke", provenance)).toBe(provenance);
     expect(() => assertExecutionProvenance("full", provenance)).toThrow("clean");
   });
+
+  it("captures the execution-host witness with a hashed hostname and runner metadata from the environment", () => {
+    const seams = {
+      environment: { RUNNER_NAME: "blacksmith-8vcpu-ubuntu-2404", RUNNER_OS: "Linux", RUNNER_ARCH: "X64", LCM_CERT_RUNNER_SKU: "blacksmith/8vcpu-ubuntu-24.04:v1" },
+      containerCli: "podman",
+      readFile: (path: string) => { if (path !== "/etc/os-release") throw new Error("unexpected"); return 'NAME="Ubuntu"\nID=ubuntu\nVERSION_ID="24.04"\n'; },
+      engineVersion: (cli: string) => `${cli}-5.2.3\n`,
+      os: { arch: () => "x64", cpus: () => Array.from({ length: 8 }, () => ({ model: "AMD EPYC 9R14" })), hostname: () => "testbox-01", release: () => "6.8.0-45-generic", totalmem: () => 33_000_000_000 },
+    };
+    const host = captureExecutionHost(seams);
+    expect(host).toMatchObject({
+      osId: "ubuntu", osVersionId: "24.04", kernelRelease: "6.8.0-45-generic", architecture: "x64", cpuModel: "AMD EPYC 9R14", logicalCpus: 8,
+      totalMemoryBytes: 33_000_000_000, containerEngine: "podman", containerEngineVersion: "podman-5.2.3",
+      runnerName: "blacksmith-8vcpu-ubuntu-2404", runnerOs: "Linux", runnerArch: "X64", runnerSku: "blacksmith/8vcpu-ubuntu-24.04:v1",
+    });
+    expect(host.hostnameSha256).toBe(createHash("sha256").update("testbox-01").digest("hex"));
+    expect(JSON.stringify(host)).not.toContain("testbox-01");
+    expect(Number.isFinite(Date.parse(host.capturedAt))).toBe(true);
+    expect(Object.keys(host).sort()).toEqual([
+      "architecture", "capturedAt", "containerEngine", "containerEngineVersion", "cpuModel", "hostnameSha256", "kernelRelease", "logicalCpus",
+      "osId", "osVersionId", "runnerArch", "runnerName", "runnerOs", "runnerSku", "totalMemoryBytes",
+    ]);
+  });
+
+  it("records missing runner metadata, os-release and engine version as null rather than failing", () => {
+    const host = captureExecutionHost({
+      environment: {}, containerCli: "podman",
+      readFile: () => { throw new Error("ENOENT"); },
+      engineVersion: () => { throw new Error("not installed"); },
+      os: { arch: () => "arm64", cpus: () => [{ model: "Apple M3" }], hostname: () => "laptop", release: () => "24.0.0", totalmem: () => 16_000_000_000 },
+    });
+    expect(host).toMatchObject({ osId: null, osVersionId: null, containerEngineVersion: null, runnerName: null, runnerOs: null, runnerArch: null, runnerSku: null, logicalCpus: 1 });
+  });
+
+  it("validates an operator-declared runner SKU only when it is set", () => {
+    expect(validateRunnerSku(undefined)).toBeNull();
+    expect(validateRunnerSku("")).toBeNull();
+    expect(validateRunnerSku("blacksmith-8vcpu-ubuntu-2404")).toBe("blacksmith-8vcpu-ubuntu-2404");
+    expect(() => validateRunnerSku("has space")).toThrow("LCM_CERT_RUNNER_SKU");
+    expect(() => validateRunnerSku("-leading")).toThrow("LCM_CERT_RUNNER_SKU");
+    expect(() => validateRunnerSku("x".repeat(129))).toThrow("LCM_CERT_RUNNER_SKU");
+    expect(() => captureExecutionHost({ environment: { LCM_CERT_RUNNER_SKU: "bad sku" }, readFile: () => "", engineVersion: () => "1", os: { arch: () => "x64", cpus: () => [{ model: "m" }], hostname: () => "h", release: () => "r", totalmem: () => 1 } })).toThrow("LCM_CERT_RUNNER_SKU");
+  });
+
+  it("refuses provenance for a checkout without .git instead of claiming a commit", () => {
+    const copy = mkdtempSync(join(tmpdir(), "lcm-cert-rsync-copy-"));
+    writeFileSync(join(copy, "pnpm-lock.yaml"), "lockfileVersion: 9\n");
+    expect(() => captureExecutionProvenance(copy, "a".repeat(64), "b".repeat(64), "c".repeat(64), { executionHost: {} })).toThrow(/no \.git.*cannot be certified/u);
+  });
+
+  it("attaches the host witness to real checkout provenance", () => {
+    const root = new URL("../..", import.meta.url).pathname;
+    const witness = { capturedAt: "2026-10-27T00:00:00.000Z", hostnameSha256: "7".repeat(64) };
+    const provenance = captureExecutionProvenance(root, "a".repeat(64), "b".repeat(64), "c".repeat(64), { executionHost: witness });
+    expect(provenance.testedCommit).toMatch(/^[0-9a-f]{40}$/u);
+    expect(provenance.executionHost).toBe(witness);
+  }, 30_000);
 
   it("fails a phase immediately when a machine exits and preserves redacted logs", async () => {
     const run = vi.fn(async (args: string[]) => {

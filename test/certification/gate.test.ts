@@ -19,7 +19,7 @@ function snapshotFiles(root: string, directory = root, files = new Map<string, B
 
 type FaultLayout = "faults" | "partition-a" | "none";
 type MaintenanceFailure = "compact" | "snapshot" | "mixed";
-type Variant = { observerGap?: boolean; clockBreach?: boolean; clockGap?: boolean; duplicateMapping?: boolean; drainFail?: boolean; capacityPeak?: number; recoveryFail?: boolean; partitionFirstSuccessSeconds?: number; restartBFirstSuccessSeconds?: number; restartBNoSuccess?: boolean; noRecoverySuccess?: boolean; catchUpFail?: boolean; catchUpAtSeconds?: number; missingCatchUpTimestamp?: boolean; readinessInvalid?: boolean; residualOccupied?: boolean; poolConfigMismatch?: boolean; setupSessionOpen?: boolean; phaseEarly?: boolean; profile?: "smoke" | "full"; lane?: "local" | "managed"; faultLayout?: FaultLayout; maintenanceFailure?: MaintenanceFailure; smokeFailure?: boolean; smokeSlow?: boolean };
+type Variant = { observerGap?: boolean; clockBreach?: boolean; clockGap?: boolean; duplicateMapping?: boolean; drainFail?: boolean; capacityPeak?: number; recoveryFail?: boolean; partitionFirstSuccessSeconds?: number; restartBFirstSuccessSeconds?: number; restartBNoSuccess?: boolean; noRecoverySuccess?: boolean; catchUpFail?: boolean; catchUpAtSeconds?: number; missingCatchUpTimestamp?: boolean; readinessInvalid?: boolean; residualOccupied?: boolean; poolConfigMismatch?: boolean; setupSessionOpen?: boolean; phaseEarly?: boolean; profile?: "smoke" | "full"; lane?: "local" | "managed"; faultLayout?: FaultLayout; maintenanceFailure?: MaintenanceFailure; smokeFailure?: boolean; smokeSlow?: boolean; executionHost?: Record<string, unknown> };
 
 // Every scheduled compact, every scheduled snapshot, or every other one of each.
 function maintenanceFails(mode: MaintenanceFailure | undefined, op: string, index: number): boolean {
@@ -48,10 +48,16 @@ function rawFixture(options: Variant = {}) {
   const approvalText = `${JSON.stringify(approval)}\n`;
   writeFileSync(join(root, "contract.approval.json"), approvalText);
   const approvalSha256 = createHash("sha256").update(approvalText).digest("hex");
+  const executionHost = {
+    capturedAt: "2026-10-26T10:00:59.000Z", osId: "ubuntu", osVersionId: "24.04", kernelRelease: "6.8.0-45-generic", architecture: "x64",
+    cpuModel: "AMD EPYC 9R14", logicalCpus: 8, totalMemoryBytes: 33_000_000_000, containerEngine: "podman", containerEngineVersion: "5.2.3",
+    hostnameSha256: "7".repeat(64), runnerName: "blacksmith-8vcpu-ubuntu-2404", runnerOs: "Linux", runnerArch: "X64", runnerSku: "blacksmith-8vcpu-ubuntu-2404",
+    ...(options.executionHost ?? {}),
+  };
   const provenance = {
     testedCommit: "c".repeat(40), dirty: false, testedInputsSha256: "d".repeat(64), testedInputsCount: 100,
     lockfileSha256: "e".repeat(64), cliSha256: "f".repeat(64), stagedPackageSha256: "1".repeat(64),
-    contractSha256, approvalSha256, node: process.version,
+    contractSha256, approvalSha256, node: process.version, executionHost,
   };
   const profile = options.profile ?? "full";
   const lane = options.lane ?? "local";
@@ -184,6 +190,9 @@ function rawFixture(options: Variant = {}) {
   const current = { ...provenance } as Record<string, unknown>;
   delete current.stagedPackageSha256;
   delete current.contractSha256;
+  // The assembling host is a different machine in general: its witness must not be
+  // compared against the recorded one.
+  current.executionHost = { ...executionHost, hostnameSha256: "8".repeat(64), capturedAt: "2026-10-27T00:00:00.000Z", runnerSku: null };
   return { root, output, contractPath, contractSha256, provenance: current, faults: faultLayout === "faults" ? [partitionFault, restartFault] : faultLayout === "partition-a" ? [partitionFault] : [] };
 }
 
@@ -443,6 +452,44 @@ describe("scheduled maintenance outcomes gate the non-injected error rate", () =
     expect(errorRateOf(gate)).toMatchObject({ verdict: "fail", inputs: { count: 102 } });
     expect(errorRateOf(gate).observed).toBeCloseTo(2 / 102, 12);
     expect(gate.verdict).toBe("fail");
+  });
+});
+
+describe("execution-host witness in the public gate", () => {
+  it("carries the recorded witness into gate provenance and markdown as recorded, not the assembling host", () => {
+    const fixture = rawFixture();
+    const result = assemble(fixture);
+    expect(result.gate.provenance.executionHost).toMatchObject({
+      osId: "ubuntu", osVersionId: "24.04", kernelRelease: "6.8.0-45-generic", architecture: "x64", cpuModel: "AMD EPYC 9R14", logicalCpus: 8,
+      totalMemoryBytes: 33_000_000_000, containerEngine: "podman", containerEngineVersion: "5.2.3", hostnameSha256: "7".repeat(64),
+      runnerName: "blacksmith-8vcpu-ubuntu-2404", runnerOs: "Linux", runnerArch: "X64", runnerSku: "blacksmith-8vcpu-ubuntu-2404",
+    });
+    const markdown = readFileSync(result.paths.markdown, "utf8");
+    expect(markdown).toContain("## Execution host");
+    expect(markdown).toContain("OS: ubuntu 24.04; kernel 6.8.0-45-generic; x64");
+    expect(markdown).toContain("CPU: AMD EPYC 9R14 (8 logical); memory 30.7 GiB");
+    expect(markdown).toContain("Container engine: podman 5.2.3");
+    expect(markdown).toContain(`Hostname SHA-256: \`${"7".repeat(64)}\``);
+    expect(markdown).toContain("SKU blacksmith-8vcpu-ubuntu-2404");
+    expect(markdown).not.toContain("8".repeat(64));
+  });
+
+  it("accepts null runner metadata and SKU without failing and renders them as n/a", () => {
+    const fixture = rawFixture({ executionHost: { runnerName: null, runnerOs: null, runnerArch: null, runnerSku: null, containerEngineVersion: null } });
+    const result = assemble(fixture);
+    expect(result.gate.verdict).toBe("pass");
+    expect(result.gate.provenance.executionHost).toMatchObject({ runnerName: null, runnerOs: null, runnerArch: null, runnerSku: null });
+    expect(readFileSync(result.paths.markdown, "utf8")).toContain("Runner: name n/a; os n/a; arch n/a; SKU n/a");
+  });
+
+  it("refuses evidence without a host witness, with a malformed hostname digest, or with an unknown witness key", () => {
+    const missing = rawFixture();
+    const recorded = JSON.parse(readFileSync(join(missing.root, "execution-provenance.json"), "utf8"));
+    delete recorded.executionHost;
+    writeJson(join(missing.root, "execution-provenance.json"), recorded);
+    expect(() => assemble(missing)).toThrow("execution-host witness");
+    expect(() => assemble(rawFixture({ executionHost: { hostnameSha256: "lcm-testbox" } }))).toThrow("hostname digest");
+    expect(() => assemble(rawFixture({ executionHost: { rawHostname: "leak" } }))).toThrow("unexpected key");
   });
 });
 

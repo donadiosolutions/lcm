@@ -317,7 +317,7 @@ describe("certification DigitalOcean lifecycle", () => {
       owner: { pid: 1, birth: "linux:12345678-1234-1234-1234-123456789abc:1", scope: "linux:12345678-1234-1234-1234-123456789abc:abc" },
       createRunRoot: () => join(root, "run"),
       stagePackage: (runRoot: string) => ({ root: join(runRoot, "package"), sha256: "a".repeat(64) }),
-      captureExecutionProvenance: () => ({ dirty: false, testedCommit: "c".repeat(40), testedInputsSha256: "d".repeat(64), testedInputsCount: 1, lockfileSha256: "e".repeat(64), cliSha256: "f".repeat(64), stagedPackageSha256: "a".repeat(64), contractSha256: "b".repeat(64), approvalSha256: "9".repeat(64), node: process.version }),
+      captureExecutionProvenance: () => ({ dirty: false, testedCommit: "c".repeat(40), testedInputsSha256: "d".repeat(64), testedInputsCount: 1, lockfileSha256: "e".repeat(64), cliSha256: "f".repeat(64), stagedPackageSha256: "a".repeat(64), contractSha256: "b".repeat(64), approvalSha256: "9".repeat(64), node: process.version, executionHost: { capturedAt: "2026-10-26T10:00:00.000Z", hostnameSha256: "7".repeat(64) } }),
       resolveHost: async () => "203.0.113.7",
       waitForWarmupComplete: async () => { wallNow += 120_000; },
       waitForFaultReady: async () => undefined,

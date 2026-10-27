@@ -7,7 +7,7 @@ import { validateEvidence } from "../test/postgresql/cutover-rehearsal/check-evi
 import { loadCertificationContract } from "../test/certification/contract.mjs";
 import { assembleCertificationGate, errorRate, evaluatePercentiles, nearestRank, writeCertificationGate } from "../test/certification/slo.mjs";
 import { createDeterministicSchedule, createFaultSchedule } from "../test/certification/schedule.mjs";
-import { captureExecutionProvenance, recoveryWindowSearch } from "./certification-harness.mjs";
+import { EXECUTION_HOST_IDENTITY_FIELDS, captureExecutionProvenance, recoveryWindowSearch } from "./certification-harness.mjs";
 
 function json(path) { return JSON.parse(readFileSync(path, "utf8")); }
 function ndjson(path) {
@@ -465,10 +465,23 @@ export function assembleGateFromEvidence(input, dependencies = {}) {
   const execution = manifest.executionProvenance;
   const provenance = dependencies.captureProvenance
     ? dependencies.captureProvenance(input.repositoryRoot)
-    : captureExecutionProvenance(input.repositoryRoot, execution.contractSha256, execution.stagedPackageSha256, execution.approvalSha256);
+    : captureExecutionProvenance(input.repositoryRoot, execution.contractSha256, execution.stagedPackageSha256, execution.approvalSha256, {
+      containerCli: execution.executionHost?.containerEngine ?? "podman",
+    });
   for (const field of ["testedCommit", "testedInputsSha256", "testedInputsCount", "lockfileSha256", "cliSha256", "approvalSha256", "node"]) {
     if (execution[field] !== provenance[field]) throw new Error(`certification execution provenance differs at ${field}`);
   }
+  // The recorded execution-host witness is required and is carried into the public
+  // gate as recorded. Gate assembly may legitimately run on another machine, so the
+  // witness is checked for shape only, never against the assembling host.
+  const host = execution.executionHost;
+  if (!host || typeof host !== "object" || Array.isArray(host)) {
+    throw new Error("certification execution provenance is missing its execution-host witness");
+  }
+  for (const field of EXECUTION_HOST_IDENTITY_FIELDS) {
+    if (!(field in host)) throw new Error(`certification execution-host witness is missing ${field}`);
+  }
+  if (!/^[0-9a-f]{64}$/u.test(host.hostnameSha256 ?? "")) throw new Error("certification execution-host witness has an invalid hostname digest");
   if (execution.dirty || provenance.dirty || execution.contractSha256 !== loaded.sha256
     || execution.approvalSha256 !== loaded.approvalSha256
     || manifest.runContractSha256 !== loaded.sha256

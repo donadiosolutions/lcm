@@ -180,6 +180,21 @@ diagnostics retain relation-size deltas, submitted payload and envelope bytes,
 stored truncation counts, final doctor output hashes, and remote-prune sweep
 timestamps.
 
+Execution provenance also carries an execution-host witness captured once at run
+start by both lanes: OS release ID and version, kernel release, architecture, CPU
+model and logical CPU count, total memory, container engine name and version, and
+the SHA-256 of the hostname (the raw hostname is never recorded). When the run
+executes on a CI runner, `RUNNER_NAME`, `RUNNER_OS` and `RUNNER_ARCH` are copied
+from the environment; absent values are recorded as `null`, never treated as a
+failure. An operator may declare the runner SKU through `LCM_CERT_RUNNER_SKU`
+(1-128 characters of letters, digits, `.`, `_`, `:`, `/` and `-`); when set it is
+validated and recorded, when unset it is `null`. The witness is copied as recorded
+into the public gate JSON and summarized in the gate Markdown, so a reviewer can see
+whether the evidence came from a laptop or a testbox VM. Provenance capture requires
+a Git checkout: a copy that arrived without `.git` (for example through `rsync`)
+is refused with an explicit message rather than attributed to a commit that cannot
+be proven.
+
 The non-injected error rate follows the contract formula `nonInjected failed
 attempts / scheduled steady attempts` over the complete expected steady schedule
 of both machines: hooks, searches, stores, session snapshots, and explicit
@@ -222,5 +237,7 @@ it is not evidence of native Codex task-tool integration.
 One local and one managed repetition provide a bounded baseline. They do not
 certify provider reliability, independent host clocks, multi-host hardware
 failure, long-term capacity, provider failover, backup/PITR, or every downstream
-drill. A failed threshold is a valid `fail`; missing or insufficient evidence is
+drill. Measured latencies describe the execution host (laptop or testbox VM)
+recorded in the host witness, not any other hardware class. A failed threshold is a
+valid `fail`; missing or insufficient evidence is
 `incomplete`. A definite failure takes precedence when both are present.

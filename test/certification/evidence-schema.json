@@ -33,7 +33,7 @@
     "profile": { "enum": ["smoke", "full"] },
     "provenance": {
       "type": "object",
-      "required": ["testedCommit", "dirty", "testedInputsSha256", "testedInputsCount", "lockfileSha256", "cliSha256", "stagedPackageSha256", "contractSha256", "approvalSha256", "node"],
+      "required": ["testedCommit", "dirty", "testedInputsSha256", "testedInputsCount", "lockfileSha256", "cliSha256", "stagedPackageSha256", "contractSha256", "approvalSha256", "node", "executionHost"],
       "additionalProperties": false,
       "properties": {
         "testedCommit": { "type": "string", "pattern": "^[0-9a-f]{40}$" },
@@ -45,7 +45,29 @@
         "stagedPackageSha256": { "type": "string", "pattern": "^[0-9a-f]{64}$" },
         "contractSha256": { "type": "string", "pattern": "^[0-9a-f]{64}$" },
         "approvalSha256": { "type": "string", "pattern": "^[0-9a-f]{64}$" },
-        "node": { "type": "string", "minLength": 1 }
+        "node": { "type": "string", "minLength": 1 },
+        "executionHost": {
+          "type": "object",
+          "required": ["capturedAt", "osId", "osVersionId", "kernelRelease", "architecture", "cpuModel", "logicalCpus", "totalMemoryBytes", "containerEngine", "containerEngineVersion", "hostnameSha256", "runnerName", "runnerOs", "runnerArch", "runnerSku"],
+          "additionalProperties": false,
+          "properties": {
+            "capturedAt": { "type": "string", "minLength": 20 },
+            "osId": { "type": ["string", "null"], "maxLength": 128 },
+            "osVersionId": { "type": ["string", "null"], "maxLength": 128 },
+            "kernelRelease": { "type": ["string", "null"], "maxLength": 128 },
+            "architecture": { "type": ["string", "null"], "maxLength": 128 },
+            "cpuModel": { "type": ["string", "null"], "maxLength": 128 },
+            "logicalCpus": { "type": "integer", "minimum": 1 },
+            "totalMemoryBytes": { "type": "integer", "minimum": 1 },
+            "containerEngine": { "type": "string", "minLength": 1, "maxLength": 128 },
+            "containerEngineVersion": { "type": ["string", "null"], "maxLength": 128 },
+            "hostnameSha256": { "type": "string", "pattern": "^[0-9a-f]{64}$" },
+            "runnerName": { "type": ["string", "null"], "maxLength": 128 },
+            "runnerOs": { "type": ["string", "null"], "maxLength": 128 },
+            "runnerArch": { "type": ["string", "null"], "maxLength": 128 },
+            "runnerSku": { "type": ["string", "null"], "pattern": "^[A-Za-z0-9][A-Za-z0-9._:/-]{0,127}$" }
+          }
+        }
       }
     },
     "machines": { "type": "array", "minItems": 2, "maxItems": 2, "items": { "$ref": "#/$defs/machine" } },

@@ -3,7 +3,7 @@ import { createHash, randomBytes } from "node:crypto";
 import { execFileSync } from "node:child_process";
 import { cpSync, existsSync, lstatSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, rmSync, writeFileSync } from "node:fs";
 import { lookup } from "node:dns/promises";
-import { tmpdir } from "node:os";
+import { arch as osArch, cpus as osCpus, hostname as osHostname, release as osRelease, totalmem as osTotalmem, tmpdir } from "node:os";
 import { isAbsolute, join, relative } from "node:path";
 import { fileURLToPath, pathToFileURL } from "node:url";
 import { NODE_IMAGE, POSTGRES_IMAGE } from "./postgresql-images.mjs";
@@ -17,12 +17,87 @@ export { createDeterministicSchedule };
 
 function sha256(value) { return createHash("sha256").update(value).digest("hex"); }
 
-export function captureExecutionProvenance(root, contractSha256, stagedPackageSha256, approvalSha256) {
+const RUNNER_SKU_PATTERN = /^[A-Za-z0-9][A-Za-z0-9._:/-]{0,127}$/u;
+const RUNNER_FIELD_LIMIT = 128;
+
+function parseOsRelease(text) {
+  const values = {};
+  for (const line of text.split("\n")) {
+    const match = /^([A-Z_]+)=(.*)$/u.exec(line.trim());
+    if (!match) continue;
+    values[match[1]] = match[2].replace(/^"(.*)"$/u, "$1").replace(/^'(.*)'$/u, "$1");
+  }
+  return values;
+}
+
+function boundedString(value, limit = RUNNER_FIELD_LIMIT) {
+  if (typeof value !== "string") return null;
+  const trimmed = value.trim();
+  if (trimmed.length === 0) return null;
+  return trimmed.length > limit ? trimmed.slice(0, limit) : trimmed;
+}
+
+// Operator-declared runner SKU: optional, but when set it must be a bounded safe
+// token (letters, digits, dot, underscore, colon, slash, hyphen; <= 128 characters).
+export function validateRunnerSku(value) {
+  if (value === undefined || value === "") return null;
+  if (typeof value !== "string" || !RUNNER_SKU_PATTERN.test(value)) {
+    throw new Error("LCM_CERT_RUNNER_SKU must be 1-128 characters of [A-Za-z0-9._:/-] starting with a letter or digit");
+  }
+  return value;
+}
+
+// Execution-host witness captured once at run start. Records what machine ran the
+// lane (OS, kernel, CPU, memory, container engine, runner metadata) so a gate can
+// state its execution host; the hostname is recorded only as a SHA-256.
+export function captureExecutionHost({
+  environment = process.env,
+  containerCli = "podman",
+  readFile = (path) => readFileSync(path, "utf8"),
+  engineVersion = (cli) => execFileSync(cli, ["version", "--format", "{{.Client.Version}}"], { encoding: "utf8", timeout: 10_000 }).trim(),
+  os = { arch: osArch, cpus: osCpus, hostname: osHostname, release: osRelease, totalmem: osTotalmem },
+} = {}) {
+  let osRelease = {};
+  try { osRelease = parseOsRelease(readFile("/etc/os-release")); } catch { /* unavailable on this platform */ }
+  const cpus = os.cpus();
+  let containerEngineVersion = null;
+  try { containerEngineVersion = boundedString(engineVersion(containerCli)); } catch { /* engine version unavailable */ }
+  return {
+    capturedAt: new Date().toISOString(),
+    osId: boundedString(osRelease.ID),
+    osVersionId: boundedString(osRelease.VERSION_ID),
+    kernelRelease: boundedString(os.release()),
+    architecture: boundedString(os.arch()),
+    cpuModel: boundedString(cpus[0]?.model),
+    logicalCpus: cpus.length,
+    totalMemoryBytes: os.totalmem(),
+    containerEngine: containerCli,
+    containerEngineVersion,
+    hostnameSha256: sha256(os.hostname()),
+    runnerName: boundedString(environment.RUNNER_NAME),
+    runnerOs: boundedString(environment.RUNNER_OS),
+    runnerArch: boundedString(environment.RUNNER_ARCH),
+    runnerSku: validateRunnerSku(environment.LCM_CERT_RUNNER_SKU),
+  };
+}
+
+// Fields of the host witness that identify the machine and must agree between the
+// recorded run and any later readback on the same host; capturedAt and the engine
+// version are informational.
+export const EXECUTION_HOST_IDENTITY_FIELDS = Object.freeze([
+  "osId", "osVersionId", "kernelRelease", "architecture", "cpuModel", "logicalCpus", "totalMemoryBytes", "containerEngine", "hostnameSha256",
+]);
+
+export function captureExecutionProvenance(root, contractSha256, stagedPackageSha256, approvalSha256, options = {}) {
+  if (!existsSync(join(root, ".git"))) {
+    throw new Error(`certification checkout at ${root} has no .git; execution provenance requires a Git checkout whose HEAD can be proven (an rsync copy without .git cannot be certified)`);
+  }
   const git = (...args) => execFileSync("git", ["-C", root, ...args], { encoding: "utf8", maxBuffer: 64 * 1024 * 1024 });
   const paths = git("ls-files", "-z").split("\0").filter(Boolean)
     .filter((path) => !["docs/production-certification-gate.json", "docs/production-certification-gate.md"].includes(path)).sort();
   const inputs = createHash("sha256");
   for (const path of paths) { inputs.update(path); inputs.update("\0"); inputs.update(readFileSync(join(root, path))); inputs.update("\0"); }
+  const executionHost = options.executionHost ?? captureExecutionHost({ environment: options.environment, containerCli: options.containerCli });
   return {
     testedCommit: git("rev-parse", "HEAD").trim(),
     dirty: git("status", "--porcelain").trim() !== "",
@@ -34,6 +109,7 @@ export function captureExecutionProvenance(root, contractSha256, stagedPackageSh
     contractSha256,
     approvalSha256,
     node: process.version,
+    executionHost,
   };
 }
 
@@ -284,6 +360,7 @@ export async function runManagedMachinePair(input, dependencies = {}) {
     });
     const executionProvenance = (dependencies.captureExecutionProvenance ?? captureExecutionProvenance)(
       dependencies.sourceRoot ?? repositoryRoot, input.contractSha256, stage.sha256, input.approvalSha256,
+      { environment: dependencies.environment ?? process.env, containerCli },
     );
     assertExecutionProvenance(input.profile, executionProvenance);
     mkdirSync(input.evidenceDirectory, { recursive: true, mode: 0o700 });
@@ -1093,6 +1170,7 @@ export async function runLocalCertification(options, dependencies = {}) {
       });
       const executionProvenance = (dependencies.captureExecutionProvenance ?? captureExecutionProvenance)(
         dependencies.sourceRoot ?? repositoryRoot, options.contractSha256, stage.sha256, options.approvalSha256,
+        { environment: dependencies.environment ?? process.env, containerCli: "podman" },
       );
       assertExecutionProvenance(options.profile, executionProvenance);
       writeFileSync(join(options.evidenceDirectory, "execution-provenance.json"), `${JSON.stringify(executionProvenance, null, 2)}\n`, { mode: 0o600, flag: "wx" });

@@ -21,6 +21,11 @@ describe("certification evidence", () => {
         testedCommit: "d".repeat(40), dirty: false, testedInputsSha256: "e".repeat(64),
         testedInputsCount: 100, lockfileSha256: "f".repeat(64), cliSha256: "1".repeat(64),
         stagedPackageSha256: "2".repeat(64), contractSha256: "a".repeat(64), approvalSha256: "5".repeat(64), node: process.version,
+        executionHost: {
+          capturedAt: "2026-10-26T10:00:59.000Z", osId: "ubuntu", osVersionId: "24.04", kernelRelease: "6.8.0-45-generic", architecture: "x64",
+          cpuModel: "AMD EPYC 9R14", logicalCpus: 8, totalMemoryBytes: 33_000_000_000, containerEngine: "podman", containerEngineVersion: null,
+          hostnameSha256: "7".repeat(64), runnerName: null, runnerOs: null, runnerArch: null, runnerSku: null,
+        },
       },
       machines: [
         { name: "a", machineId: "018f0000-0000-7000-8000-000000000001", identityKeySha256: "b".repeat(64) },
