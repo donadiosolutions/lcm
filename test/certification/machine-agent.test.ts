@@ -11,6 +11,7 @@ import {
   isAcknowledgedRow,
   machineStoredConfig,
   observeAcknowledgments,
+  probeLcmTlsRejection,
   runPublicMigrationFlow,
   startForegroundDaemon,
   verifyFinalDrain,
@@ -72,6 +73,30 @@ describe("certification machine agent", () => {
       clientProbe: async () => undefined,
       tlsProbe: async () => new Error("self signed certificate in certificate chain"),
     })).rejects.toThrow("unexpectedly succeeded");
+  });
+
+  it("uses the packaged LCM PostgreSQL client configuration for TLS probes", async () => {
+    const tlsError = new Error("self signed certificate in certificate chain");
+    const connect = vi.fn(async () => { throw tlsError; });
+    const end = vi.fn(async () => undefined);
+    const buildConfig = vi.fn(() => ({ ssl: { rejectUnauthorized: true } }));
+
+    await expect(probeLcmTlsRejection({
+      entrypoint: "/opt/lcm/dist/lcm.mjs",
+      url: "postgresql://runtime:secret@db:5432/lcm",
+      caFile: "/run/lcm-ca/wrong-ca.crt",
+      loadClientConfig: async () => buildConfig,
+      clientFactory: async (config: unknown) => {
+        expect(config).toEqual({ ssl: { rejectUnauthorized: true } });
+        return { connect, query: vi.fn(), end };
+      },
+    })).rejects.toBe(tlsError);
+    expect(buildConfig).toHaveBeenCalledWith(expect.objectContaining({
+      url: "postgresql://runtime:secret@db:5432/lcm",
+      caFile: "/run/lcm-ca/wrong-ca.crt",
+    }), { applicationName: "lcm-certification-tls-negative" });
+    expect(connect).toHaveBeenCalledOnce();
+    expect(end).toHaveBeenCalledOnce();
   });
 
   it("owns a foreground daemon child through bounded startup and stop", async () => {

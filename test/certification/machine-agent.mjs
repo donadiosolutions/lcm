@@ -299,13 +299,38 @@ async function runWithDeadline(timeoutMs, parentSignal, operation) {
   }
 }
 
-async function requireTlsRejection(entrypoint, environment, url, caFile, expected, cwd) {
+export async function probeLcmTlsRejection({ entrypoint, url, caFile, loadClientConfig, clientFactory }) {
+  const buildClientConfig = loadClientConfig ?? (async () => {
+    const module = await import(pathToFileURL(join(dirname(entrypoint), "src", "storage", "postgresql", "client-config.js")).href);
+    return module.buildPostgreSqlClientConfig;
+  });
+  const createClient = clientFactory ?? (async (config) => {
+    const loaded = await import("pg");
+    const Client = loaded.Client ?? loaded.default?.Client;
+    return new Client(config);
+  });
+  const config = (await buildClientConfig())({
+    url,
+    caFile,
+    poolMax: 1,
+    connectionTimeoutMs: 10_000,
+    idleTimeoutMs: 10_000,
+    statementTimeoutMs: 10_000,
+    snapshotIdleTimeoutMs: 10_000,
+  }, { applicationName: "lcm-certification-tls-negative" });
+  const client = await createClient(config);
+  try {
+    await client.connect();
+    await client.query("SELECT 1");
+  } finally {
+    await client.end().catch(() => undefined);
+  }
+}
+
+async function requireTlsRejection(entrypoint, _environment, url, caFile, expected, _cwd) {
   return verifyTlsNegativeProbe({
     expected,
-    clientProbe: () => runCli(entrypoint, ["project", "list", "--json"], {
-      cwd,
-      env: { ...environment, LCM_POSTGRES_URL: url, LCM_POSTGRES_CA_FILE: caFile },
-    }),
+    clientProbe: () => probeLcmTlsRejection({ entrypoint, url, caFile }),
     tlsProbe: () => probeRawTlsRejection(url, caFile),
   });
 }
