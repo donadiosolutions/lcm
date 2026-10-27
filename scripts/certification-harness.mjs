@@ -47,9 +47,20 @@ export function validateRunnerSku(value) {
   return value;
 }
 
+// Self-hosted runners default RUNNER_NAME to the machine name, so a runner name
+// whose first DNS label matches the hostname's (ignoring case) would publish the
+// hostname verbatim. It is recorded as null instead; other runner metadata is
+// recorded as provided.
+function runnerNameWithoutHost(value, hostname) {
+  const name = boundedString(value);
+  const firstLabel = (text) => text.trim().toLowerCase().split(".")[0];
+  return name !== null && firstLabel(name) === firstLabel(hostname) ? null : name;
+}
+
 // Execution-host witness captured once at run start. Records what machine ran the
 // lane (OS, kernel, CPU, memory, container engine, runner metadata) so a gate can
-// state its execution host; the hostname is recorded only as a SHA-256.
+// state its execution host. The hostname is recorded only as a SHA-256, and a
+// RUNNER_NAME that names the host is withheld.
 export function captureExecutionHost({
   environment = process.env,
   containerCli = "podman",
@@ -62,6 +73,7 @@ export function captureExecutionHost({
   const cpus = os.cpus();
   let containerEngineVersion = null;
   try { containerEngineVersion = boundedString(engineVersion(containerCli)); } catch { /* engine version unavailable */ }
+  const hostname = os.hostname();
   return {
     capturedAt: new Date().toISOString(),
     osId: boundedString(osRelease.ID),
@@ -73,17 +85,18 @@ export function captureExecutionHost({
     totalMemoryBytes: os.totalmem(),
     containerEngine: containerCli,
     containerEngineVersion,
-    hostnameSha256: sha256(os.hostname()),
-    runnerName: boundedString(environment.RUNNER_NAME),
+    hostnameSha256: sha256(hostname),
+    runnerName: runnerNameWithoutHost(environment.RUNNER_NAME, hostname),
     runnerOs: boundedString(environment.RUNNER_OS),
     runnerArch: boundedString(environment.RUNNER_ARCH),
     runnerSku: validateRunnerSku(environment.LCM_CERT_RUNNER_SKU),
   };
 }
 
-// Fields of the host witness that identify the machine and must agree between the
-// recorded run and any later readback on the same host; capturedAt and the engine
-// version are informational.
+// Witness fields whose presence gate assembly checks before validating the whole
+// recorded witness against the closed evidence schema. They are never compared with
+// the assembling host, because the gate may be assembled on another machine and
+// publishes the witness as recorded.
 export const EXECUTION_HOST_IDENTITY_FIELDS = Object.freeze([
   "osId", "osVersionId", "kernelRelease", "architecture", "cpuModel", "logicalCpus", "totalMemoryBytes", "containerEngine", "hostnameSha256",
 ]);

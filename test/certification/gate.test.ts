@@ -1,9 +1,11 @@
 import { createHash } from "node:crypto";
 import { existsSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
-import { join } from "node:path";
-import { describe, expect, it } from "vitest";
+import { delimiter, join } from "node:path";
+import { afterEach, describe, expect, it, vi } from "vitest";
 import { assembleGateFromEvidence, parseGateArguments } from "../../scripts/certification-gate.mjs";
+import { captureExecutionHost, captureExecutionProvenance } from "../../scripts/certification-harness.mjs";
+import { createGitCheckoutFixture } from "./git-checkout-fixture.js";
 import { createDeterministicSchedule, createFaultSchedule } from "./schedule.mjs";
 
 function writeJson(path: string, value: unknown): void { writeFileSync(path, `${JSON.stringify(value)}\n`); }
@@ -203,6 +205,18 @@ function assemble(fixture: ReturnType<typeof rawFixture>) {
     contractPath: fixture.contractPath,
     outputDirectory: fixture.output,
   }, { captureProvenance: () => fixture.provenance });
+}
+
+// Smoke evidence whose recorded code provenance matches a throwaway Git checkout, so
+// the gate's real readback (no injected captureProvenance) runs end to end without
+// the repository's build output.
+function realReadbackInput(executionHost: Record<string, unknown>) {
+  const checkout = createGitCheckoutFixture();
+  const fixture = rawFixture({ profile: "smoke", executionHost });
+  const path = join(fixture.root, "execution-provenance.json");
+  const recorded = JSON.parse(readFileSync(path, "utf8"));
+  writeJson(path, captureExecutionProvenance(checkout.root, recorded.contractSha256, recorded.stagedPackageSha256, recorded.approvalSha256, { executionHost: recorded.executionHost }));
+  return { repositoryRoot: checkout.root, evidenceDirectory: fixture.root, contractPath: fixture.contractPath, outputDirectory: fixture.output };
 }
 
 describe("certification raw evidence pipeline", () => {
@@ -490,6 +504,44 @@ describe("execution-host witness in the public gate", () => {
     expect(() => assemble(missing)).toThrow("execution-host witness");
     expect(() => assemble(rawFixture({ executionHost: { hostnameSha256: "lcm-testbox" } }))).toThrow("hostname digest");
     expect(() => assemble(rawFixture({ executionHost: { rawHostname: "leak" } }))).toThrow("unexpected key");
+  });
+});
+
+describe("gate readback never captures the assembling host", () => {
+  afterEach(() => { vi.unstubAllEnvs(); });
+
+  it("does not execute a container engine named by the recorded witness", () => {
+    const bin = mkdtempSync(join(tmpdir(), "lcm-cert-engine-"));
+    const marker = join(bin, "executed");
+    writeFileSync(join(bin, "lcm-cert-sentinel-engine"), `#!/bin/sh\n: > '${marker}'\necho 9.9.9\n`, { mode: 0o755 });
+    vi.stubEnv("PATH", `${bin}${delimiter}${process.env.PATH ?? ""}`);
+    const result = assembleGateFromEvidence(realReadbackInput({ containerEngine: "lcm-cert-sentinel-engine" }));
+    expect(result.gate.provenance.executionHost.containerEngine).toBe("lcm-cert-sentinel-engine");
+    expect(existsSync(marker)).toBe(false);
+  });
+
+  it("assembles despite an invalid assembler runner SKU and publishes the recorded witness without the raw hostname", () => {
+    vi.stubEnv("LCM_CERT_RUNNER_SKU", "not a valid sku");
+    const witness = captureExecutionHost({
+      environment: { RUNNER_NAME: "lcm-testbox-07", RUNNER_OS: "Linux", RUNNER_ARCH: "X64", LCM_CERT_RUNNER_SKU: "blacksmith-8vcpu-ubuntu-2404" },
+      containerCli: "podman", readFile: () => "ID=ubuntu\nVERSION_ID=24.04\n", engineVersion: () => "5.8.4",
+      os: { arch: () => "x64", cpus: () => Array.from({ length: 8 }, () => ({ model: "AMD EPYC 9R14" })), hostname: () => "lcm-testbox-07", release: () => "6.8.0-45-generic", totalmem: () => 33_000_000_000 },
+    });
+    const result = assembleGateFromEvidence(realReadbackInput(witness));
+    expect(result.gate.provenance.executionHost).toEqual(witness);
+    expect(result.gate.provenance.executionHost).toMatchObject({ runnerName: null, runnerSku: "blacksmith-8vcpu-ubuntu-2404" });
+    for (const path of [result.paths.json, result.paths.markdown]) expect(readFileSync(path, "utf8")).not.toContain("lcm-testbox-07");
+  });
+
+  it("validates the recorded witness against the closed schema before any provenance readback", () => {
+    for (const executionHost of [{ logicalCpus: 0 }, { containerEngine: "x".repeat(129) }, { runnerSku: "not a valid sku" }, { rawHostname: "lcm-testbox-07" }]) {
+      const fixture = rawFixture({ profile: "smoke", executionHost });
+      const captureProvenance = vi.fn(() => fixture.provenance);
+      expect(() => assembleGateFromEvidence({
+        repositoryRoot: fixture.root, evidenceDirectory: fixture.root, contractPath: fixture.contractPath, outputDirectory: fixture.output,
+      }, { captureProvenance })).toThrow("execution-host witness is invalid");
+      expect(captureProvenance).not.toHaveBeenCalled();
+    }
   });
 });
 

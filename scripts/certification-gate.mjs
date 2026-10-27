@@ -463,17 +463,11 @@ export function assembleGateFromEvidence(input, dependencies = {}) {
   const loaded = loadCertificationContract(input.contractPath);
   const { manifest, sampleFiles } = buildEvidenceManifest({ evidenceDirectory: input.evidenceDirectory, contract: loaded.contract, persist: false });
   const execution = manifest.executionProvenance;
-  const provenance = dependencies.captureProvenance
-    ? dependencies.captureProvenance(input.repositoryRoot)
-    : captureExecutionProvenance(input.repositoryRoot, execution.contractSha256, execution.stagedPackageSha256, execution.approvalSha256, {
-      containerCli: execution.executionHost?.containerEngine ?? "podman",
-    });
-  for (const field of ["testedCommit", "testedInputsSha256", "testedInputsCount", "lockfileSha256", "cliSha256", "approvalSha256", "node"]) {
-    if (execution[field] !== provenance[field]) throw new Error(`certification execution provenance differs at ${field}`);
-  }
-  // The recorded execution-host witness is required and is carried into the public
-  // gate as recorded. Gate assembly may legitimately run on another machine, so the
-  // witness is checked for shape only, never against the assembling host.
+  const schema = JSON.parse(readFileSync(new URL("../test/certification/evidence-schema.json", import.meta.url), "utf8"));
+  // The recorded execution-host witness is required, validated against the closed
+  // evidence schema before any use, and carried into the public gate as recorded.
+  // Gate assembly may legitimately run on another machine, so the witness is never
+  // compared with the assembling host.
   const host = execution.executionHost;
   if (!host || typeof host !== "object" || Array.isArray(host)) {
     throw new Error("certification execution provenance is missing its execution-host witness");
@@ -482,6 +476,20 @@ export function assembleGateFromEvidence(input, dependencies = {}) {
     if (!(field in host)) throw new Error(`certification execution-host witness is missing ${field}`);
   }
   if (!/^[0-9a-f]{64}$/u.test(host.hostnameSha256 ?? "")) throw new Error("certification execution-host witness has an invalid hostname digest");
+  const hostErrors = validateEvidence(schema, host, "#/properties/provenance/properties/executionHost");
+  if (hostErrors.length > 0) throw new Error(`certification execution-host witness is invalid:\n${hostErrors.join("\n")}`);
+  // Readback recomputes code provenance only. Injecting the validated recorded
+  // witness skips live host capture, so nothing named by evidence (such as
+  // containerEngine) is executed and the assembler's own environment (such as
+  // LCM_CERT_RUNNER_SKU) cannot fail assembly.
+  const provenance = dependencies.captureProvenance
+    ? dependencies.captureProvenance(input.repositoryRoot)
+    : captureExecutionProvenance(input.repositoryRoot, execution.contractSha256, execution.stagedPackageSha256, execution.approvalSha256, {
+      executionHost: host,
+    });
+  for (const field of ["testedCommit", "testedInputsSha256", "testedInputsCount", "lockfileSha256", "cliSha256", "approvalSha256", "node"]) {
+    if (execution[field] !== provenance[field]) throw new Error(`certification execution provenance differs at ${field}`);
+  }
   if (execution.dirty || provenance.dirty || execution.contractSha256 !== loaded.sha256
     || execution.approvalSha256 !== loaded.approvalSha256
     || manifest.runContractSha256 !== loaded.sha256
@@ -499,7 +507,6 @@ export function assembleGateFromEvidence(input, dependencies = {}) {
     provenance: execution,
     sampleFiles,
   });
-  const schema = JSON.parse(readFileSync(new URL("../test/certification/evidence-schema.json", import.meta.url), "utf8"));
   const errors = validateEvidence(schema, gate);
   if (errors.length > 0) throw new Error(`certification gate evidence is invalid:\n${errors.join("\n")}`);
   return { gate, paths: writeCertificationGate(gate, input.outputDirectory, sampleFiles) };

@@ -23,6 +23,7 @@ import {
   verifyDistinctMachineIdentities,
   waitForMachineFiles,
 } from "../../scripts/certification-harness.mjs";
+import { createGitCheckoutFixture } from "./git-checkout-fixture.js";
 
 vi.mock("pg", () => ({
   Client: class {
@@ -153,19 +154,49 @@ describe("certification harness", () => {
     expect(() => captureExecutionHost({ environment: { LCM_CERT_RUNNER_SKU: "bad sku" }, readFile: () => "", engineVersion: () => "1", os: { arch: () => "x64", cpus: () => [{ model: "m" }], hostname: () => "h", release: () => "r", totalmem: () => 1 } })).toThrow("LCM_CERT_RUNNER_SKU");
   });
 
+  it("withholds a runner name that names the host so the hostname is published only as its digest", () => {
+    const capture = (hostname: string, runnerName: string) => captureExecutionHost({
+      environment: { RUNNER_NAME: runnerName }, containerCli: "podman", readFile: () => "", engineVersion: () => "5.2.3",
+      os: { arch: () => "x64", cpus: () => [{ model: "m" }], hostname: () => hostname, release: () => "r", totalmem: () => 1 },
+    });
+    for (const [hostname, runnerName] of [
+      ["lcm-testbox-07", "lcm-testbox-07"],
+      ["lcm-testbox-07", " LCM-Testbox-07 "],
+      ["lcm-testbox-07.ci.example.internal", "lcm-testbox-07"],
+      ["lcm-testbox-07", "lcm-testbox-07.ci.example.internal"],
+    ]) {
+      const host = capture(hostname, runnerName);
+      expect(host.runnerName).toBeNull();
+      expect(host.hostnameSha256).toBe(createHash("sha256").update(hostname).digest("hex"));
+      expect(JSON.stringify(host).toLowerCase()).not.toContain("lcm-testbox-07");
+    }
+    expect(capture("lcm-testbox-07", "blacksmith-8vcpu-ubuntu-2404").runnerName).toBe("blacksmith-8vcpu-ubuntu-2404");
+  });
+
   it("refuses provenance for a checkout without .git instead of claiming a commit", () => {
     const copy = mkdtempSync(join(tmpdir(), "lcm-cert-rsync-copy-"));
     writeFileSync(join(copy, "pnpm-lock.yaml"), "lockfileVersion: 9\n");
     expect(() => captureExecutionProvenance(copy, "a".repeat(64), "b".repeat(64), "c".repeat(64), { executionHost: {} })).toThrow(/no \.git.*cannot be certified/u);
   });
 
-  it("attaches the host witness to real checkout provenance", () => {
-    const root = new URL("../..", import.meta.url).pathname;
+  it("attaches the host witness to Git checkout provenance without the repository build output", () => {
+    const checkout = createGitCheckoutFixture();
     const witness = { capturedAt: "2026-10-27T00:00:00.000Z", hostnameSha256: "7".repeat(64) };
-    const provenance = captureExecutionProvenance(root, "a".repeat(64), "b".repeat(64), "c".repeat(64), { executionHost: witness });
-    expect(provenance.testedCommit).toMatch(/^[0-9a-f]{40}$/u);
+    const provenance = captureExecutionProvenance(checkout.root, "a".repeat(64), "b".repeat(64), "c".repeat(64), { executionHost: witness });
+    expect(provenance).toMatchObject({
+      testedCommit: checkout.head,
+      dirty: false,
+      testedInputsCount: 3,
+      lockfileSha256: createHash("sha256").update(checkout.lockfile).digest("hex"),
+      cliSha256: createHash("sha256").update(checkout.cli).digest("hex"),
+      stagedPackageSha256: "b".repeat(64),
+      contractSha256: "a".repeat(64),
+      approvalSha256: "c".repeat(64),
+      node: process.version,
+    });
+    expect(provenance.testedInputsSha256).toMatch(/^[0-9a-f]{64}$/u);
     expect(provenance.executionHost).toBe(witness);
-  }, 30_000);
+  });
 
   it("fails a phase immediately when a machine exits and preserves redacted logs", async () => {
     const run = vi.fn(async (args: string[]) => {

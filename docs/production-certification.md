@@ -183,17 +183,24 @@ timestamps.
 Execution provenance also carries an execution-host witness captured once at run
 start by both lanes: OS release ID and version, kernel release, architecture, CPU
 model and logical CPU count, total memory, container engine name and version, and
-the SHA-256 of the hostname (the raw hostname is never recorded). When the run
+the SHA-256 of the hostname (the hostname itself is never recorded). When the run
 executes on a CI runner, `RUNNER_NAME`, `RUNNER_OS` and `RUNNER_ARCH` are copied
 from the environment; absent values are recorded as `null`, never treated as a
-failure. An operator may declare the runner SKU through `LCM_CERT_RUNNER_SKU`
-(1-128 characters of letters, digits, `.`, `_`, `:`, `/` and `-`); when set it is
-validated and recorded, when unset it is `null`. The witness is copied as recorded
-into the public gate JSON and summarized in the gate Markdown, so a reviewer can see
-whether the evidence came from a laptop or a testbox VM. Provenance capture requires
-a Git checkout: a copy that arrived without `.git` (for example through `rsync`)
-is refused with an explicit message rather than attributed to a commit that cannot
-be proven.
+failure. Self-hosted runners are named after their machine by default, so a
+`RUNNER_NAME` whose first DNS label matches the hostname's (ignoring case) is also
+recorded as `null`; any other runner value is recorded as provided. An operator
+may declare the runner SKU through `LCM_CERT_RUNNER_SKU` (1-128 characters of
+letters, digits, `.`, `_`, `:`, `/` and `-`); when set it is validated and
+recorded, when unset it is `null`. The witness is copied as recorded into the
+public gate JSON and summarized in the gate Markdown, so a reviewer can see whether
+the evidence came from a laptop or a testbox VM. Gate assembly recomputes code
+provenance from its own checkout but never captures a second host witness: it
+validates the recorded witness against the closed evidence schema, runs no
+container engine named in the evidence, and ignores the assembling machine's
+`LCM_CERT_RUNNER_SKU`, so a gate can be assembled on another machine. Provenance
+capture requires a Git checkout: a copy that arrived without `.git` (for example
+through `rsync`) is refused with an explicit message rather than attributed to a
+commit that cannot be proven.
 
 The non-injected error rate follows the contract formula `nonInjected failed
 attempts / scheduled steady attempts` over the complete expected steady schedule
