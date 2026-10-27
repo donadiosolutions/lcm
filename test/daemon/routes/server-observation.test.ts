@@ -207,6 +207,49 @@ describe("authenticated daemon identity observation", () => {
     expect(other.status).toBe(503);
   });
 
+  it("keeps a real halt private after a completed backend selection", async () => {
+    const url = await start();
+    const projectCwd = mkdtempSync(join(home, "passive-project-"));
+    const notified = await fetch(`${url}/promote-events/notify`, {
+      method: "POST",
+      headers: { ...headers, "Content-Type": "application/json" },
+      body: JSON.stringify({ cwd: projectCwd, priority: 0 }),
+    });
+    expect(notified.status).toBe(200);
+
+    await selectPostgreSqlOnDisk();
+    await vi.waitFor(async () => {
+      const response = await fetch(`${url}/health/observe`, { headers });
+      expect(response.status).toBe(200);
+      expect(await response.json()).toMatchObject({
+        observation: "identity-only",
+        storageBackend: "sqlite",
+        storage: { status: "unverified" },
+        passiveEvents: {
+          halted: true,
+          haltedReason: "backend-mismatch",
+          haltedMessage: "daemon request backend differs from the authenticated startup backend",
+        },
+      });
+    }, { timeout: 7_000, interval: 25 });
+
+    const publicHealth = await fetch(`${url}/health`);
+    expect(publicHealth.status).toBe(200);
+    expect(await publicHealth.json()).not.toHaveProperty("passiveEvents");
+
+    for (const authorization of [undefined, "Bearer wrong"]) {
+      const denied = await fetch(`${url}/health/observe`, {
+        headers: authorization === undefined ? {} : { Authorization: authorization },
+      });
+      expect(denied.status).toBe(401);
+      expect(await denied.json()).toEqual({ error: "unauthorized" });
+    }
+
+    const active = await fetch(`${url}/health`, { headers });
+    expect(active.status).toBe(503);
+    expect(await active.json()).toEqual({ status: "blocked", error: "backend publication admission blocked" });
+  }, 10_000);
+
   it("lets the migration restart matrix classify a stale daemon as restart-required", async () => {
     const url = await start();
     const port = Number(new URL(url).port);
