@@ -458,6 +458,16 @@ describe("Codex hook configuration boundaries", () => {
     expect(Object.keys(observed)).toEqual(["state", "content", "certificate"]);
     expect(Object.isFrozen(observed.certificate)).toBe(true);
     expect(Object.keys(observed.certificate)).toEqual(["state", "sha256", "size", "mode", "dev", "ino"]);
+    for (const size of [undefined, -1, 1.5]) {
+      const malformed = { ...observed.certificate, size };
+      expect(() => mutateConnectorLeaf({
+        displayPath: path,
+        operationPath: path,
+        parentOperationPath: dir,
+        expected: malformed as never,
+        decide: () => ({ state: "unchanged" as const }),
+      })).toThrow(/invalid connector publication certificate/iu);
+    }
     expect(() => mutateConnectorLeaf({
       displayPath: path,
       operationPath: path,

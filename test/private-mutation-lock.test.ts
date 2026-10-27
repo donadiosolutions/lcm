@@ -227,6 +227,15 @@ describe("private mutation lock release recovery", () => {
     expect(() => readPrivateMutationLockOwner(lockPath)).toThrow("lock is malformed");
   });
 
+  it.each([undefined, null, 0, -1, 1.5])("rejects an invalid owner PID %s", (pid) => {
+    const { lockPath } = makeLock();
+    const owner = JSON.parse(ownerContent("a".repeat(32))) as Record<string, unknown>;
+    if (pid === undefined) delete owner.pid;
+    else owner.pid = pid;
+    writeFileSync(lockPath, JSON.stringify(owner), { mode: 0o600 });
+    expect(() => readPrivateMutationLockOwner(lockPath)).toThrow("invalid owner");
+  });
+
   it("recovers an owned lock when cleanup fails after a successful mutation", () => {
     const { lockPath } = makeLock();
     const releaseFailure = new Error("release observer failed");

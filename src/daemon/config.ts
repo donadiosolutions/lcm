@@ -166,7 +166,7 @@ export type DaemonConfig = {
   daemon: { port: number; socketPath: string; logLevel: string; logMaxSizeMB: number; logRetentionDays: number; idleTimeoutMs: number };
   compaction: {
     leafTokens: number; maxDepth: number; autoCompactMinTokens: number;
-    promotionThresholds: { minDepth: number; compressionRatio: number; keywords: Record<string, string[]>; architecturePatterns: string[]; dedupBm25Threshold: number; dedupCandidateLimit: number; eventConfidence?: { decision?: number; plan?: number; errorFix?: number; batch?: number; pattern?: number }; reinforcementBoost?: number; maxConfidence?: number; insightsMaxAgeDays?: number };
+    promotionThresholds: { minDepth: number; compressionRatio: number; keywords: Record<string, string[]>; architecturePatterns: string[]; dedupCandidateLimit: number; eventConfidence?: { decision?: number; plan?: number; errorFix?: number; batch?: number; pattern?: number }; reinforcementBoost?: number; maxConfidence?: number; insightsMaxAgeDays?: number };
   };
   restoration: {
     recentSummaries: number;
@@ -248,7 +248,6 @@ const DEFAULTS: DaemonConfigDefaults = {
       minDepth: 2, compressionRatio: 0.3,
       keywords: { decision: ["decided", "agreed", "will use", "going with", "chosen"], fix: ["fixed", "root cause", "workaround", "resolved"] },
       architecturePatterns: ["src/[\\w/]+\\.ts", "[A-Z][a-zA-Z]+(Engine|Store|Service|Manager|Handler|Client)", "interface [A-Z]", "class [A-Z]"],
-      dedupBm25Threshold: 15,
       dedupCandidateLimit: 100,
       eventConfidence: {
         decision: 0.5,
@@ -867,10 +866,10 @@ function rejectUnknownKeys(
 const DAEMON_KEYS = new Set(["port", "socketPath", "logLevel", "logMaxSizeMB", "logRetentionDays", "idleTimeoutMs"]);
 const COMPACTION_KEYS = new Set(["leafTokens", "maxDepth", "autoCompactMinTokens", "promotionThresholds"]);
 const PROMOTION_THRESHOLD_KEYS = new Set([
-  "minDepth", "compressionRatio", "keywords", "architecturePatterns", "dedupBm25Threshold",
+  "minDepth", "compressionRatio", "keywords", "architecturePatterns",
   "dedupCandidateLimit", "eventConfidence", "reinforcementBoost", "maxConfidence", "insightsMaxAgeDays",
   // Supported legacy fields removed by the post-merge migration.
-  "mergeMaxEntries", "confidenceDecayRate",
+  "mergeMaxEntries", "confidenceDecayRate", "dedupBm25Threshold",
 ]);
 const EVENT_CONFIDENCE_KEYS = new Set(["decision", "plan", "errorFix", "batch", "pattern"]);
 const RESTORATION_KEYS = new Set([
@@ -968,7 +967,6 @@ function validatePromotionThresholds(value: unknown): void {
   rejectUnknownKeys(thresholds, path, PROMOTION_THRESHOLD_KEYS);
   validateOptionalInteger(thresholds, "minDepth", path);
   validateOptionalNumber(thresholds, "compressionRatio", path, 0, 1);
-  validateOptionalNumber(thresholds, "dedupBm25Threshold", path);
   validateOptionalInteger(thresholds, "dedupCandidateLimit", path, 1);
   validateOptionalNumber(thresholds, "reinforcementBoost", path, 0, 1);
   validateOptionalNumber(thresholds, "maxConfidence", path, 0, 1);
@@ -976,6 +974,7 @@ function validatePromotionThresholds(value: unknown): void {
   // Supported legacy fields remain valid until the post-merge migration removes them.
   validateOptionalInteger(thresholds, "mergeMaxEntries", path, 1);
   validateOptionalNumber(thresholds, "confidenceDecayRate", path, 0, 1);
+  validateOptionalNumber(thresholds, "dedupBm25Threshold", path);
   validateOptionalStringArray(thresholds, "architecturePatterns", path);
 
   if (thresholds.keywords !== undefined) {
@@ -1565,6 +1564,7 @@ function migrateLegacyPromotionThresholds(thresholds: Record<string, unknown>): 
   }
   delete migrated.mergeMaxEntries;
   delete migrated.confidenceDecayRate;
+  delete migrated.dedupBm25Threshold;
   return migrated;
 }
 

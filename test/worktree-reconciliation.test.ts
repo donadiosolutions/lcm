@@ -8718,6 +8718,11 @@ describe("worktree reconciliation", () => {
       { ...valid, remoteProjectId: 42 },
       { ...valid, remoteProjectId: "not-a-uuid" },
       { ...valid, reason: 42 },
+      { ...valid, sourceComponents: {
+        ["b".repeat(64)]: { projectDb: false, eventsDb: false, patterns: true, patternsDigest: "bad" },
+      } },
+      { ...valid, discovery: { codexFingerprint: "c".repeat(64), complete: true } },
+      { ...valid, discovery: { mapFingerprint: "b".repeat(64), complete: true } },
       {
         ...valid,
         discovery: {
@@ -11135,6 +11140,16 @@ describe("worktree reconciliation", () => {
     writePrivateFixtureFile(join(root, `${targetHash}.json`), JSON.stringify(baseJournal));
     clearProjectMapCache();
     expect(() => reconcileWorktrees(main)).toThrow("source disappeared before merge");
+
+    writePrivateFixtureFile(join(root, `${targetHash}.json`), JSON.stringify({
+      ...baseJournal,
+      phase: "blocked",
+      reason: "preflight interrupted",
+    }));
+    expect(() => reconcileWorktrees(main)).toThrow("source disappeared before merge");
+    expect(listWorktreeReconciliationJournals()).toMatchObject([{ phase: "blocked" }]);
+
+    writePrivateFixtureFile(join(root, `${targetHash}.json`), JSON.stringify(baseJournal));
 
     writePrivateFixtureFile(projectMapPath(), `${JSON.stringify({
       [targetHash]: { canonical, aliases: [], remoteProjectId },

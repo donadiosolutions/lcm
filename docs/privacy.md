@@ -371,6 +371,14 @@ bundled Gitleaks rules, built-in patterns, global `security.sensitivePatterns`,
 and the project's `sensitive-patterns.txt`. Previously captured passive events
 are scrubbed again before promotion.
 
+For a project retained under an older map identity, passive hooks apply both
+the local sidecar project's patterns and patterns added with `lcm sensitive add`
+under that older identity. The extra pattern directory is used only when the
+map identity is authenticated by its canonical path, project metadata, or
+renewal fence.
+Hook events still use the stable local sidecar path. Patterns from both
+directories are applied together before an event is stored.
+
 Errors returned through MCP redact supported credential assignments before
 they become tool-visible diagnostics. This includes quoted, unquoted, and
 ODBC-style brace-delimited values for password, token, API-key, authorization,
@@ -681,10 +689,12 @@ bundle and keep provider, credential, quarantine, and recovery sessions private.
   of those separators are treated as one continuation, and redaction starts at
   the successor's first slash. Other relative values, such as `later/var/data`,
   remain visible by policy. Query and fragment child forms use the same stable
-  rule. A separate active-child home/root successor can still remain visible on
-  the first pass and redact on the second pass; that residual is tracked
-  separately. Closing an inner wrapper removes only that depth, preserving
-  still-open outer owners until their matching close or a hard reset.
+  rule. The same complete `Users`, `home`, or `root` segment match applies to
+  a successor that follows a path-bearing nested `file://` child's query or
+  fragment, so it is redacted on the first pass instead of the second. A
+  public-URL parameter of that child does not end the match. Closing an inner
+  wrapper removes only that depth, preserving still-open outer owners until
+  their matching close or a hard reset.
 
   When a matching quote closes a nested public URL inside a bracketed file
   query, an immediate `&` or `|` successor is redacted only when it begins with
@@ -697,24 +707,39 @@ bundle and keep provider, credential, quarantine, and recovery sessions private.
   recognized private-root relatives redact there on the first pass.
   Rooted Windows tails after a closing wrapper, including a later bracketed
   URL's rooted query value inside that tail, are also removed on the first pass.
-  Adjacent balanced bracket components and path-word or path-separator text
-  between them remain part of that same tail until its consumed path span ends.
-  Inside those tracked components, a rooted `/` or `\` value immediately after
-  `=`, `&`, `#`, or `?` is removed. Whitespace and newlines end the composition;
-  whitespace-separated prose and public URLs and ordinary unspaced relative
-  tails remain unchanged.
+  The same tail owns the bracket components that its path span consumes,
+  including `(`, `{`, `^`, backtick, and `:` bridges and adjacent `][`
+  components. A component opened inside the tail keeps that ownership through
+  its matching close, including across a `?`, `#`, `&`, or `=` that stops the
+  span. Adjacent components are covered when they are reached through those
+  continuations; a bridge that follows a component whose query ended the
+  consumed span does not re-arm ownership. Inside owned components, a rooted
+  value immediately after `=`, `&`, `#`, or `?` is removed on the first pass
+  when a run of `/` or `\` separators leads to a path word, so `//Users/x`,
+  `\\Users\x`, and mixed runs are covered, and when it is a drive path such as
+  `C:/Users/x` or `c:/home/x`. A slash-only run with no path word after it is
+  unchanged; a backslash-only run is redacted by the existing Windows-root rule.
+  An unmatched `]`, text outside a component after the span stopped, whitespace,
+  and newlines end the composition; whitespace-separated prose, public URLs,
+  and ordinary unspaced relative tails remain unchanged.
 
   An exact nested `file://` child inside a public URL that began at a quote can
   inherit that enclosing quote through its matching close. This removes a
   space-bearing private path and any suffix inside the quote on the first pass,
   while preserving text after the close. An immediately quoted child keeps its
-  own quote. Inside a bracketed file query, the matching close restores the
-  enclosing owner across whitespace until that wrapper's real close. Immediate
-  and later `&` or `|` rooted successors, named Windows successors, and
-  recognized private-root relatives redact on the same pass; ordinary relative
-  and public-URL successors remain readable. Unquoted URLs, embedded URLs whose
-  scheme did not begin at the quote, unmatched quotes, and newlines retain their
-  existing boundaries.
+  own quote. Inside a bracketed file query, the matching quote restores the
+  enclosing owner only when `&` or `|` immediately follows it. Whitespace
+  before the delimiter prevents that handoff, and whitespace between the
+  delimiter and the successor resets ownership; in both cases a Windows
+  backslash-rooted value stays readable unless another path rule applies. Within
+  the same uninterrupted wrapper after an immediate rooted handoff, immediate
+  and later supported rooted, named Windows, and recognized private-root
+  successors redact on the same pass. Bracketed components that follow a
+  redacted successor follow the tail rules above, and inside them a
+  private-root relative value after `&` or `|` is also redacted on the first
+  pass. Ordinary relative and public-URL successors remain readable. Unquoted
+  URLs, embedded URLs whose scheme did not begin at the quote, unmatched
+  quotes, and newlines retain their existing boundaries.
 
   Root-relative Windows values after opaque wrapper text remain conservatively
   redacted. LCM does not expose such private-looking values merely because URL

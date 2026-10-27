@@ -3193,21 +3193,26 @@ describe("runCli failure and alternate presentation branches", () => {
   it("presents a busy promotion as a retry message and exits non-zero (#1684)", async () => {
     const stderr = vi.spyOn(console, "error").mockImplementation(() => undefined);
     const stdout = vi.spyOn(process.stdout, "write").mockImplementation(() => true);
-    const message = "backend publication work is in progress; retry the promotion";
+    const message = "BUSY_LOG_CANARY\r\n\u001b[31mforged\u001b[0m\u001b]0;spoof\u0007backend publication work is in progress; retry the promotion";
     const busy = (): Error => Object.assign(new Error(message), { statusCode: 503 });
 
     state.post.mockRejectedValueOnce(busy());
     expect((await invoke(["events", "promote"]))?.message).toBe("exit:1");
-    expect(stderr).toHaveBeenCalledWith(`Error: ${message}`);
+    expect(stderr).toHaveBeenCalledExactlyOnceWith(
+      "Error: backend publication work is in progress; retry the promotion.",
+    );
+    expect(String(stderr.mock.calls[0]?.[0])).not.toContain("BUSY_LOG_CANARY");
+    expect(String(stderr.mock.calls[0]?.[0])).not.toMatch(/[\r\n\u001b]/);
     state.post.mockRejectedValueOnce(busy());
     expect((await invoke(["events", "promote", "--all", "--json"]))?.message).toBe("exit:1");
     expect(JSON.parse(String(stdout.mock.calls.at(-1)?.[0]))).toEqual({ error: message });
+    expect(stderr).toHaveBeenCalledTimes(1);
 
     // Other failures are not presented here; they reach the top-level handler.
     stderr.mockClear();
     state.post.mockRejectedValueOnce(Object.assign(new Error("boom"), { statusCode: 500 }));
     expect((await invoke(["events", "promote"]))?.message).toBe("boom");
-    expect(stderr).not.toHaveBeenCalledWith("Error: boom");
+    expect(stderr).not.toHaveBeenCalled();
   });
 
   it("covers connector alternate and failure outcomes", async () => {

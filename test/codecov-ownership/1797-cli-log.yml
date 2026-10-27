@@ -1,0 +1,7 @@
+references: ["#1797"]
+rationale: >-
+  Sanitizes path-bearing passive-event operator errors before text stderr
+  display while retaining the original structured JSON error. The command
+  remains in the existing CLI component; no ownership or topology change.
+pins:
+  - ["bin/lcm.ts", "unit-cli"]

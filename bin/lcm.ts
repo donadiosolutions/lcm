@@ -3782,9 +3782,9 @@ export async function runCli(
           ? await client.post<any>("/promote-events/all", {})
           : await client.post<any>("/promote-events", { cwd: process.cwd(), drain: true });
       } catch (error) {
-        // A busy daemon answers 503 with a retry message; show it instead of the generic failure.
+        // A busy daemon answers 503; show a fixed retry hint instead of its message.
         if ((error as { statusCode?: number } | null)?.statusCode !== 503) throw error;
-        return passiveOperatorError(error, jsonFlag);
+        return passiveOperatorError(error, jsonFlag, true);
       }
       const failed = all
         ? ((result.errors ?? 0) > 0 || (result.failedProjects ?? 0) > 0)
@@ -3811,10 +3811,11 @@ export async function runCli(
       if (failed) exit(1);
     });
 
-  const passiveOperatorError = (error: unknown, json: boolean): never => {
+  const passiveOperatorError = (error: unknown, json: boolean, busyPromotion = false): never => {
     const message = error instanceof Error ? error.message : String(error);
     if (json) printJson({ error: message });
-    else console.error(`Error: ${message}`);
+    else if (busyPromotion) console.error("Error: backend publication work is in progress; retry the promotion.");
+    else console.error("Error: passive-event command failed; rerun with --json for details.");
     return exit(1);
   };
 

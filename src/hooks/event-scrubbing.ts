@@ -1,9 +1,9 @@
-import type { ExtractedEvent } from "./extractors.js";
+import { MAX_SCRUB_INPUT, type ExtractedEvent } from "./extractors.js";
 import { statSync } from "node:fs";
 import { dirname } from "node:path";
 import { join } from "node:path";
 import { loadHookConfig } from "./config.js";
-import { localProjectIdentity } from "../daemon/project.js";
+import { localHookPatternIdentity } from "../daemon/project.js";
 import { configPath, lcmHomeDir } from "../runtime-paths.js";
 import { ScrubEngine } from "../scrub.js";
 import { PrivateMutationLockContentionError } from "../private-mutation-lock.js";
@@ -16,10 +16,11 @@ import { assertProjectStorageIdentityActive } from "../worktree-reconciliation-f
 interface ScrubCacheEntry {
   engine: ScrubEngine;
   patternsKey: string;
-  projectPatternsMtime: number;
+  projectPatternsMtimes: string;
 }
 
 const SCRUB_CACHE_MAX = 100;
+const DATA_SOFT_CAP = 2_000;
 const scrubCache = new Map<string, ScrubCacheEntry>();
 let scrubCacheMax = SCRUB_CACHE_MAX;
 
@@ -31,30 +32,35 @@ function projectPatternsMtime(projDir: string): number {
   }
 }
 
-async function getScrubber(patterns: string[], projDir: string): Promise<ScrubEngine> {
+async function getScrubber(patterns: string[], projDirs: readonly string[]): Promise<ScrubEngine> {
+  const cacheKey = JSON.stringify(projDirs);
   const patternsKey = JSON.stringify(patterns);
-  const mtime = projectPatternsMtime(projDir);
-  const cached = scrubCache.get(projDir);
+  const mtimes = JSON.stringify(projDirs.map(projectPatternsMtime));
+  const cached = scrubCache.get(cacheKey);
   if (
     cached
     && cached.patternsKey === patternsKey
-    && cached.projectPatternsMtime === mtime
+    && cached.projectPatternsMtimes === mtimes
   ) {
     // Refresh insertion order so the bounded map behaves as an LRU cache.
-    scrubCache.delete(projDir);
-    scrubCache.set(projDir, cached);
+    scrubCache.delete(cacheKey);
+    scrubCache.set(cacheKey, cached);
     return cached.engine;
   }
 
-  const engine = await ScrubEngine.forProject(patterns, projDir);
-  scrubCache.delete(projDir);
+  const engine = projDirs.length === 1
+    ? await ScrubEngine.forProject(patterns, projDirs[0]!)
+    : new ScrubEngine(patterns, (await Promise.all(projDirs.map((dir) =>
+      ScrubEngine.loadProjectPatterns(join(dir, "sensitive-patterns.txt"))
+    ))).flat());
+  scrubCache.delete(cacheKey);
   if (scrubCache.size >= scrubCacheMax) {
     scrubCache.delete(scrubCache.keys().next().value as string);
   }
-  scrubCache.set(projDir, {
+  scrubCache.set(cacheKey, {
     engine,
     patternsKey,
-    projectPatternsMtime: mtime,
+    projectPatternsMtimes: mtimes,
   });
   return engine;
 }
@@ -100,19 +106,30 @@ export async function scrubExtractedEvents(
   cwd: string,
   globalPatterns?: string[],
 ): Promise<ExtractedEvent[]> {
+  // Reject complete over-budget fields before any regex sees a partial value.
+  const admitted = events.filter((event) =>
+    event.data.length + (event.tags?.reduce((length, tag) => length + tag.length, 0) ?? 0) <= MAX_SCRUB_INPUT);
   const patterns = globalPatterns ?? persistedSensitivePatterns();
   // Hook capture must not enter backend-selected project-map reconciliation.
   // The local sidecar identity remains stable for ordinary projects and uses
   // the compatibility snapshot for already-mapped aliases/worktrees.
-  const identity = localProjectIdentity(cwd);
-  const projDir = join(lcmHomeDir(), "projects", identity.id);
-  assertProjectStorageIdentityActive(projDir, identity.id);
-  const scrubber = await getScrubber(patterns, projDir);
-  return events.map((event) => ({
+  const identity = localHookPatternIdentity(cwd);
+  const projDirs = identity.patternIds.map((id) => join(lcmHomeDir(), "projects", id));
+  for (const [index, id] of identity.patternIds.entries()) {
+    assertProjectStorageIdentityActive(projDirs[index]!, id);
+  }
+  const scrubber = await getScrubber(patterns, projDirs);
+  const bound = (value: string): string => {
+    if (value.length <= DATA_SOFT_CAP) return value;
+    const prefix = value.slice(0, DATA_SOFT_CAP);
+    // Keep the UTF-16 cap without persisting half of a surrogate pair.
+    return `${/[\uD800-\uDBFF]$/u.test(prefix) ? prefix.slice(0, -1) : prefix}...`;
+  };
+  return admitted.map((event) => ({
     ...event,
-    data: scrubber.scrub(event.data),
+    data: bound(scrubber.scrub(event.data)),
     ...(event.tags
-      ? { tags: event.tags.map((tag) => scrubber.scrub(tag)) }
+      ? { tags: event.tags.map((tag) => bound(scrubber.scrub(tag))) }
       : {}),
   }));
 }

@@ -294,12 +294,15 @@ that admits nothing does not halt and writes nothing to the lost backend: no
 sidecar has unprocessed events, and no project passes the replication gates
 before its first phase. A project whose startup PostgreSQL is unhealthy is
 reported as a storage failure instead. Once the halt is raised, the
-unauthenticated `/health` response carries a `passiveEvents` object with
-`halted`, `haltedReason`, and `haltedMessage`; it is absent on a healthy
-daemon. Health is the surface to check for this, because read admission
-refuses `/status` and every other route under the same mismatch. The next
-hook run observes the `/health` backend mismatch through `ensureDaemon` and
-replaces the daemon, which clears the halt.
+bearer-gated `/health/observe` response can carry a process-local
+`passiveEvents` object with `halted`, `haltedReason`, and `haltedMessage`; it is
+absent on a healthy daemon. Observation remains storage-free and marks storage
+`unverified`. It requires valid private-root, publication, and configuration
+witnesses even during a completed backend selection. A managed daemon's
+anonymous `/health` stays limited to public liveness and identity, while
+authenticated active `/health` and `/status` refuse the backend mismatch. The
+next hook run observes the `/health` backend mismatch through `ensureDaemon`
+and replaces the daemon, which clears the halt.
 
 Do not edit a held journal to release it. Preserve the journal and snapshot
 generation when capture, selection, or abort readback fails. A migration report,

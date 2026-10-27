@@ -999,31 +999,28 @@ async function promoteEventsBatch(
             confidence,
             newEntryConfidence,
             thresholds: {
-              dedupBm25Threshold: thresholds.dedupBm25Threshold ?? 15,
               dedupCandidateLimit: thresholds.dedupCandidateLimit ?? 100,
             },
           };
           if (!receiptEra) {
             if (event.priority === 3 && !reinforced) {
-              const candidateSourceProjectId = project.backend === "postgresql"
-                ? undefined
-                : project.projectId;
-              const existing = NON_PROMOTABLE_EVENT_TYPES.has(event.type) ? [] : await project.lexicalSearch.searchPromoted(
-                scrubbedData,
-                1,
-                undefined,
-                candidateSourceProjectId,
-              );
-              if (existing.length === 0) {
+              // A one-off event may only re-confirm an identical entry that
+              // dedup itself would merge into; it never creates a memory.
+              const existingId = NON_PROMOTABLE_EVENT_TYPES.has(event.type)
+                ? null
+                : await project.transaction((repositories) =>
+                  deduplicateAndInsertInRepositories(repositories, { ...dedupInput, existingOnly: true }));
+              if (existingId === null) {
                 processedIds.push(event.event_id);
                 result.skipped++;
                 continue;
               }
+            } else {
+              await deduplicateAndInsert({
+                transaction: (callback) => project.transaction(callback),
+                ...dedupInput,
+              });
             }
-            await deduplicateAndInsert({
-              transaction: (callback) => project.transaction(callback),
-              ...dedupInput,
-            });
           } else {
             const promotion = await project.transaction(async (repositories) => {
             const committedAt = (): string => `${new Date().toISOString().slice(0, -1)}000Z`;
@@ -1048,31 +1045,23 @@ async function promoteEventsBatch(
             if (priorReceipt !== null) {
               return { promoted: priorReceipt.outcome === "applied" };
             }
-            if (event.priority === 3 && !reinforced) {
-              const existing = NON_PROMOTABLE_EVENT_TYPES.has(event.type) ? [] : await repositories.lexicalSearch.searchPromoted(
-                scrubbedData,
-                1,
-                undefined,
-                project.projectId,
-              );
-              if (existing.length === 0) {
-                await repositories.migrationReceipt!.record({
-                  epochId: epoch.epochId,
-                  envelope,
-                  effectWitness: {
-                    version: 1,
-                    outcome: "no-effect",
-                    reason: "unreinforced-pattern",
-                  },
-                  committedAt: committedAt(),
-                });
-                return { promoted: false as const };
-              }
+            const oneOff = event.priority === 3 && !reinforced;
+            const promotedMemoryId = oneOff && NON_PROMOTABLE_EVENT_TYPES.has(event.type)
+              ? null
+              : await deduplicateAndInsertInRepositories(repositories, { ...dedupInput, existingOnly: oneOff });
+            if (promotedMemoryId === null) {
+              await repositories.migrationReceipt!.record({
+                epochId: epoch.epochId,
+                envelope,
+                effectWitness: {
+                  version: 1,
+                  outcome: "no-effect",
+                  reason: "unreinforced-pattern",
+                },
+                committedAt: committedAt(),
+              });
+              return { promoted: false as const };
             }
-            const promotedMemoryId = await deduplicateAndInsertInRepositories(
-              repositories,
-              dedupInput,
-            );
             await repositories.migrationReceipt!.record({
               epochId: epoch.epochId,
               envelope,

@@ -805,13 +805,7 @@ export async function createDaemon(config: DaemonConfig, options?: DaemonOptions
     }, idleTimeoutMs);
   }
 
-  /**
-   * #1384: report a halted background sweep on the health route. Read admission
-   * refuses every other route once the configured backend diverges from this
-   * daemon's frozen startup backend, so unauthenticated health is the only
-   * surface that still answers when the halt is most relevant. A healthy daemon
-   * keeps its existing response shape.
-   */
+  /** Report a halted background sweep through authenticated diagnostics. */
   const passiveEventHaltReport = (): {
     passiveEvents?: PassiveEventBackgroundDiagnostics;
   } => {
@@ -828,7 +822,6 @@ export async function createDaemon(config: DaemonConfig, options?: DaemonOptions
         uptime: Math.floor((Date.now() - startTime) / 1000),
         pid: process.pid,
         ...(daemonOwnerId ? { ownerId: daemonOwnerId } : {}),
-        ...passiveEventHaltReport(),
       });
       return;
     }
@@ -870,6 +863,7 @@ export async function createDaemon(config: DaemonConfig, options?: DaemonOptions
       ...(daemonOwnerId ? { ownerId: daemonOwnerId } : {}),
       daemonInstanceId: invocationCoordinator.daemonInstanceId,
       ...(runtimeDigest ? { runtimeDigest } : {}),
+      ...passiveEventHaltReport(),
     });
   }, "read");
   registerBuiltInRoute(
