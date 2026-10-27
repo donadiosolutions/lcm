@@ -23,9 +23,8 @@ import {
   CODEX_CONFIG_PATH,
   LEGACY_CODEX_HOOKS_PATHS,
   hasCodexHooksContent,
-  mergeCodexHooksContent,
+  planCodexHooksInstall,
   removeCodexHooksContent,
-  setCodexHooksFeature,
   captureConnectorLeaf,
   mutateConnectorLeaf,
   compensateConnectorLeaf,
@@ -45,6 +44,7 @@ import { packageExecutable } from "../runtime-root.js";
 import {
   clearConnectorTransport,
   readConnectorTransport,
+  readPreToolRecallSnapshot,
   setConnectorTransport,
 } from "../config-manager.js";
 import { configPath as defaultConfigPath } from "../runtime-paths.js";
@@ -55,6 +55,8 @@ export interface InstallResult {
   paths?: string[];
   requiresRestart: boolean;
   manual?: string;
+  /** Follow-up lines for the operator (preserved settings, trust step). */
+  notices?: string[];
   transport?: ConnectorTransport;
   partial?: boolean;
   failures?: string[];
@@ -1323,6 +1325,7 @@ function installComponent(
   cwd: string,
   strictMcp = false,
   transport: ConnectorTransport = "cli",
+  preToolRecall = false,
 ): InstallResult {
   if (surface === "hook") {
     if (agent.id === "codex") {
@@ -1330,11 +1333,19 @@ function installComponent(
       if (!hookConfigPath) throw new Error(`No config path defined for ${agent.name} with type hook`);
       const hooksPath = resolveConfigPath(hookConfigPath, cwd);
       const configPath = resolveConfigPath(CODEX_CONFIG_PATH, cwd);
-      updateRegularFileNoFollow(configPath, (existing) => {
-        const updated = setCodexHooksFeature(existing.toString("utf-8"));
-        return updated === existing.toString("utf-8") ? undefined : Buffer.from(updated, "utf-8");
-      });
-      updateRegularFileNoFollow(hooksPath, (existing) => Buffer.from(mergeCodexHooksContent(existing.toString("utf-8"), transport), "utf-8"));
+      // Decide every write first, from the exact snapshots the mutation authority
+      // compare-and-swaps against: a refusal leaves both files untouched, and the
+      // planned bytes are what gets written.
+      const captured = (path: string): string => {
+        const snapshot = activeMutationAuthority!.snapshots.get(path)!;
+        return snapshot.state === "regular" ? snapshot.content.toString("utf-8") : "";
+      };
+      const plan = planCodexHooksInstall(captured(hooksPath), captured(configPath), transport, { preToolRecall });
+      if (plan.refusal !== undefined) throw new Error(plan.refusal);
+      updateRegularFileNoFollow(configPath, () => (
+        plan.configContent === undefined ? undefined : Buffer.from(plan.configContent, "utf-8")
+      ));
+      updateRegularFileNoFollow(hooksPath, () => Buffer.from(plan.hooksContent, "utf-8"));
       for (const legacyPath of LEGACY_CODEX_HOOKS_PATHS.map((path) => resolveConfigPath(path, cwd))) {
         if (legacyPath !== hooksPath) {
           const legacyContent = readOptionalRegularFileNoFollow(legacyPath)?.toString("utf-8");
@@ -1351,7 +1362,7 @@ function installComponent(
           }
         }
       }
-      return { success: true, path: hooksPath, requiresRestart: surfaceRequiresRestart(surface) };
+      return { success: true, path: hooksPath, requiresRestart: surfaceRequiresRestart(surface), notices: [...plan.notices] };
     }
     if (agent.id === "claude-code") {
       return {
@@ -1466,9 +1477,23 @@ function legacyDefaultSurfaces(agent: Agent): readonly ConnectorSurface[] {
   return ["mcp"];
 }
 
+/**
+ * Resolve the opt-in PreToolUse hook flag once per install, before any Codex
+ * file is staged. Only a selection that writes Codex's hook file depends on
+ * daemon config; a failed read throws so installs never guess.
+ */
+function resolvePreToolRecall(
+  agent: Agent,
+  surfaces: readonly ConnectorSurface[],
+  configFile: string = defaultConfigPath(),
+): boolean {
+  return agent.id === "codex" && surfaces.includes("hook") ? readPreToolRecallSnapshot(configFile) : false;
+}
+
 function installLegacyDefault(agent: Agent, cwd: string): InstallResult {
   const targets = legacyDefaultSurfaces(agent);
-  const results = targets.map((surface) => installComponent(agent, surface, cwd, false, "cli"));
+  const preToolRecall = resolvePreToolRecall(agent, targets);
+  const results = targets.map((surface) => installComponent(agent, surface, cwd, false, "cli", preToolRecall));
   for (const surface of targets) verifySurface(agent, surface, cwd, undefined, "cli");
   const paths = results.map((result) => result.path).filter((path) => path.length > 0);
   return {
@@ -1477,7 +1502,13 @@ function installLegacyDefault(agent: Agent, cwd: string): InstallResult {
     paths,
     requiresRestart: results.some((result) => result.requiresRestart),
     manual: results.map((result) => result.manual).filter((manual): manual is string => Boolean(manual)).join("\n\n") || undefined,
+    ...collectNotices(results),
   };
+}
+
+function collectNotices(results: readonly InstallResult[]): { notices?: string[] } {
+  const notices = results.flatMap((result) => result.notices ?? []);
+  return notices.length > 0 ? { notices } : {};
 }
 
 function removeLegacyDefault(agent: Agent, cwd: string): boolean {
@@ -1663,6 +1694,39 @@ function runNativeCodexMcp(
     );
   }
   return runnerText(result.stdout);
+}
+
+export type CodexCliVersionProbe =
+  | { readonly state: "found"; readonly raw: string }
+  | { readonly state: "unavailable"; readonly reason: string };
+
+/** Read-only `codex --version` probe for doctor; minimal environment, never writes Codex state. */
+export function probeCodexCliVersion(
+  cwd: string = process.cwd(),
+  runner: CodexCliRunner = defaultCodexCliRunner,
+  dependencies: NativeCodexMcpEnvironmentDependencies = {},
+): CodexCliVersionProbe {
+  const source = dependencies.environment ?? process.env;
+  const env: NodeJS.ProcessEnv = {};
+  for (const name of ["PATH", "HOME", "LANG"] as const) {
+    const value = source[name];
+    if (value !== undefined) env[name] = value;
+  }
+  // Wrapper-launched codex builds need the validated session-bus variables; nothing else is forwarded.
+  Object.assign(env, authenticatedNativeCodexBusEnvironment(dependencies));
+  let result: CodexCliRunResult;
+  try {
+    result = runner({ executable: "codex", argv: ["--version"], cwd, env, shell: false, timeout: CODEX_MCP_TIMEOUT_MS, maxBuffer: CODEX_MCP_MAX_OUTPUT });
+  } catch {
+    return { state: "unavailable", reason: "codex --version could not be run" };
+  }
+  if (result.error) {
+    const missing = (result.error as NodeJS.ErrnoException).code === "ENOENT";
+    return { state: "unavailable", reason: missing ? "codex not found on PATH" : "codex --version could not be run" };
+  }
+  if (result.status !== 0) return { state: "unavailable", reason: "codex --version exited with an error" };
+  const raw = runnerText(result.stdout).trim().split("\n")[0].slice(0, 200);
+  return raw === "" ? { state: "unavailable", reason: "codex --version printed nothing" } : { state: "found", raw };
 }
 
 function normalizeCodexMcpEntries(value: unknown): readonly CodexMcpEntry[] {
@@ -2042,6 +2106,7 @@ function installTransportBundle(
   let codexMcpMutated = false;
   try {
     phase(options, "snapshot");
+    const preToolRecall = resolvePreToolRecall(agent, targetSurfaces, configFile);
     let codexMcpPreflight: readonly CodexMcpEntry[] | undefined;
     if (runner && targetSurfaces.includes("mcp") && agent.id === "codex") codexMcpPreflight = preflightCodexMcpInstall(runner);
     phase(options, "stage");
@@ -2058,7 +2123,7 @@ function installTransportBundle(
         codexMcpMutated = installCodexMcp(runner!, codexMcpPreflight!);
         staged.push({ success: true, path: "", requiresRestart: true });
       } else {
-        staged.push(installComponent(agent, surface, cwd, true, transport));
+        staged.push(installComponent(agent, surface, cwd, true, transport, preToolRecall));
         filesMutated ||= !fileSnapshotsEqual(snapshots, snapshotOwnedFiles(paths));
       }
     }
@@ -2090,6 +2155,7 @@ function installTransportBundle(
       paths: resultPaths,
       requiresRestart: staged.some((result) => result.requiresRestart),
       manual: staged.map((result) => result.manual).filter((manual): manual is string => Boolean(manual)).join("\n\n") || undefined,
+      ...collectNotices(staged),
       transport,
     };
   } catch (error) {
@@ -2124,6 +2190,23 @@ function installTransportBundle(
     }
     const detail = activeMutationAuthority!.displayError(error).message;
     throw new Error(failures.length > 0 ? `${detail}; rollback incomplete (${failures.join("; ")})` : detail);
+  }
+}
+
+/**
+ * Codex hook installs write config.toml and then hooks.json. Routes without the
+ * transport bundle's own rollback must not keep the first write when the second fails.
+ */
+function compensateCodexOnFailure<T>(agent: Agent, callback: () => T): T {
+  if (agent.id !== "codex") return callback();
+  try {
+    return callback();
+  } catch (error) {
+    const authority = activeMutationAuthority;
+    if (authority === undefined || !authority.hasMutations()) throw error;
+    const failures = authority.compensateOwnedFiles();
+    const detail = authority.displayError(error).message;
+    throw new Error(failures.length > 0 ? detail + "; rollback incomplete (owned state: " + failures.join("; ") + ")" : detail);
   }
 }
 
@@ -2166,7 +2249,7 @@ export function installConnector(
   if (!isNewTransportCall) {
     if (transportOrSurface === undefined) {
       const surfaces = legacyDefaultSurfaces(agent);
-      return withInstallAuthority(agent, surfaces, parsed.cwd, () => installLegacyDefault(agent, parsed.cwd));
+      return withInstallAuthority(agent, surfaces, parsed.cwd, () => compensateCodexOnFailure(agent, () => installLegacyDefault(agent, parsed.cwd)));
     }
     const surface = transportOrSurface;
     const configPath = agent.configPaths[surface];
@@ -2174,7 +2257,9 @@ export function installConnector(
       || (surface === "hook" && agent.id === "claude-code")) {
       return installComponent(agent, surface, parsed.cwd);
     }
-    return withInstallAuthority(agent, [surface], parsed.cwd, () => installComponent(agent, surface, parsed.cwd));
+    return withInstallAuthority(agent, [surface], parsed.cwd, () => compensateCodexOnFailure(agent, () => (
+      installComponent(agent, surface, parsed.cwd, false, "cli", resolvePreToolRecall(agent, [surface]))
+    )));
   }
   if (transportOrSurface !== undefined && transportOrSurface !== "cli" && transportOrSurface !== "mcp") {
     throw new Error(`Unsupported connector transport ${JSON.stringify(transportOrSurface)}; choose cli or mcp`);

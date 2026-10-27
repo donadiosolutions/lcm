@@ -51,6 +51,8 @@ export const GRAPH_INVISIBLE_INPUTS = Object.freeze([
       "test/package-config.test.ts",
       "test/daemon/remediation-string-regression.test.ts",
       "test/external-admission-workflow.test.ts",
+      "test/incident-runbook.test.ts",
+      "test/migration/runbook-conformance.test.ts",
       "test/release-workflows.test.ts",
     ]),
   }),
@@ -74,6 +76,14 @@ export const GRAPH_INVISIBLE_INPUTS = Object.freeze([
     pattern: /^src\/memory\/index\.ts$/u,
     tests: Object.freeze(["test/memory/search-type-contract.test.ts"]),
   }),
+  // Test sources a test reads from disk and evaluates instead of importing. The
+  // completeness test only proves a reading test is listed; a new disk-read
+  // source needs its own pattern and entry.
+  Object.freeze({
+    name: "extracted-sources",
+    pattern: /^test\/postgresql\/surface-parity\.integration\.ts$/u,
+    tests: Object.freeze(["test/surface-parity/worker-admission.test.ts"]),
+  }),
   // Codecov ownership fragments the contract test reads from disk.
   Object.freeze({
     name: "codecov-ownership",
@@ -85,6 +95,7 @@ export const GRAPH_INVISIBLE_INPUTS = Object.freeze([
 // The PostgreSQL conformance harness exercises the packed CLI and daemon in a
 // container, which the module graph of `test/postgresql/**` does not see.
 export const POSTGRESQL_PATH_PATTERNS = Object.freeze([
+  /^docs\/incident-diagnostics\.md$/u,
   /^bin\//u,
   /^installer\//u,
   /^src\/cli\//u,

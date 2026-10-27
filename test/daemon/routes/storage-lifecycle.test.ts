@@ -7,6 +7,7 @@ import {
   closeRouteStorage,
   createCommitCloseBarrier,
   openExistingProject,
+  settleProjectStorageExecutions,
   withProjectStorage,
   stagedPostgreSqlUnavailableResponse,
   storageIdentityRequiredResponse,
@@ -1538,3 +1539,151 @@ describe("PostgreSQL read prefix retry under bounded admission", () => {
   });
 });
 
+describe("settleProjectStorageExecutions", () => {
+  type Deferred = { promise: Promise<void>; release: () => void };
+  const deferred = (): Deferred => {
+    let release!: () => void;
+    const promise = new Promise<void>(resolve => { release = resolve; });
+    return { promise, release };
+  };
+  const flush = async (): Promise<void> => {
+    for (let turn = 0; turn < 10; turn += 1) await new Promise<void>(resolve => setImmediate(resolve));
+  };
+  /** A shared factory whose project open resolves only when released. */
+  function gatedFactory(events: string[], gate: Deferred, entered: Deferred = deferred()): StorageBackendFactory {
+    return fakeFactory({
+      openProject: async () => {
+        events.push("open:start");
+        entered.release();
+        await gate.promise;
+        events.push("open:end");
+        return fakeProject(async () => { events.push("project.close"); });
+      },
+    });
+  }
+
+  it("resolves immediately when nothing ran on the factory", async () => {
+    const factory = fakeFactory({});
+    await expect(settleProjectStorageExecutions(factory)).resolves.toBeUndefined();
+    await withTemporaryProject(async ({ cwd, config }) => {
+      await withProjectStorage({
+        config, cwd, factory: fakeFactory({ openProject: async () => fakeProject(async () => undefined) }),
+        mode: "create",
+      }, async () => "done");
+    });
+    await expect(settleProjectStorageExecutions(factory)).resolves.toBeUndefined();
+  });
+
+  it("waits for the private open and close of an aborted route whose public promise already rejected", async () => {
+    await withTemporaryProject(async ({ cwd, config }) => {
+      const events: string[] = [];
+      const gate = deferred();
+      const entered = deferred();
+      const factory = gatedFactory(events, gate, entered);
+      const controller = new AbortController();
+      const operation = vi.fn(async () => "must not run");
+      const result = withProjectStorage({
+        config, cwd, factory, mode: "create", context: { signal: controller.signal },
+      }, operation);
+      await entered.promise;
+      controller.abort();
+      await expect(result).rejects.toSatisfy(isAbortError);
+
+      let settled = false;
+      const settling = settleProjectStorageExecutions(factory).then(() => { settled = true; });
+      await flush();
+      expect(settled).toBe(false);
+      expect(events).toEqual(["open:start"]);
+
+      gate.release();
+      await settling;
+      expect(events).toEqual(["open:start", "open:end", "project.close"]);
+      expect(operation).not.toHaveBeenCalled();
+    });
+  });
+
+  it("also waits for an execution that starts while it is waiting", async () => {
+    await withTemporaryProject(async ({ cwd, config }) => {
+      const events: string[] = [];
+      const first = deferred();
+      const second = deferred();
+      const firstEntered = deferred();
+      const secondEntered = deferred();
+      const gates = [first, second];
+      const entered = [firstEntered, secondEntered];
+      let opened = 0;
+      const factory = fakeFactory({
+        openProject: async () => {
+          const index = opened;
+          opened += 1;
+          entered[index]!.release();
+          await gates[index]!.promise;
+          events.push(`open:${index}`);
+          return fakeProject(async () => { events.push(`close:${index}`); });
+        },
+      });
+      const run = () => withProjectStorage({ config, cwd, factory, mode: "create" }, async () => undefined);
+      const firstRun = run();
+      await firstEntered.promise;
+
+      let settled = false;
+      const settling = settleProjectStorageExecutions(factory).then(() => { settled = true; });
+      const secondRun = run();
+      await secondEntered.promise;
+
+      first.release();
+      await firstRun;
+      await flush();
+      expect(settled).toBe(false);
+
+      second.release();
+      await settling;
+      await secondRun;
+      expect(events).toEqual(["open:0", "close:0", "open:1", "close:1"]);
+    });
+  });
+
+  it("never rejects when the private execution fails", async () => {
+    await withTemporaryProject(async ({ cwd, config }) => {
+      const gate = deferred();
+      const entered = deferred();
+      const factory = fakeFactory({
+        openProject: async () => {
+          entered.release();
+          await gate.promise;
+          throw new Error("open failed");
+        },
+      });
+      const result = withProjectStorage({ config, cwd, factory, mode: "create" }, async () => undefined);
+      const rejected = expect(result).rejects.toThrow("open failed");
+      await entered.promise;
+      const settling = settleProjectStorageExecutions(factory);
+      gate.release();
+      await rejected;
+      await expect(settling).resolves.toBeUndefined();
+    });
+  });
+
+  it("does not track executions that own their factory", async () => {
+    await withTemporaryProject(async ({ cwd, config }) => {
+      const events: string[] = [];
+      const gate = deferred();
+      const entered = deferred();
+      const owned = gatedFactory(events, gate, entered);
+      storageFactorySeam.create.mockResolvedValueOnce(owned);
+      const controller = new AbortController();
+      const result = withProjectStorage({
+        config, cwd, mode: "create", context: { signal: controller.signal },
+      }, async () => undefined);
+      await entered.promise;
+      controller.abort();
+      await expect(result).rejects.toSatisfy(isAbortError);
+
+      await expect(settleProjectStorageExecutions(owned)).resolves.toBeUndefined();
+      expect(events).toEqual(["open:start"]);
+      gate.release();
+      await vi.waitFor(() => expect(owned.close).toHaveBeenCalledOnce());
+      expect(events).toEqual(["open:start", "open:end", "project.close"]);
+    });
+  });
+});

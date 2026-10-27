@@ -1,0 +1,7 @@
+references: ["#1566"]
+rationale: >-
+  #1566 replaces the single generic per-session compact failure message with a
+  classifier that derives fixed text from structured error fields; the change
+  is confined to batch-compact.ts, which keeps its established owner.
+pins:
+  - ["src/batch-compact.ts", "unit-compaction-summarization"]

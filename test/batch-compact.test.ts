@@ -17,6 +17,10 @@ import {
 import * as cliStorage from "../src/cli-storage.js";
 import { NATIVE_SOURCE_LOCATOR_BATCH_SIZE } from "../src/storage/contracts.js";
 import * as daemonConfig from "../src/daemon/config.js";
+import * as dbConnection from "../src/db/connection.js";
+import { createAbortError } from "../src/daemon/cancellation.js";
+import { createCompactInvocationLifecycle } from "../bin/lcm.js";
+import { createInvocationCoordinator, type InvocationSnapshot } from "../src/daemon/invocation-coordinator.js";
 import * as publicationModule from "../src/storage/backend-publication.js";
 import * as factoryModule from "../src/storage/factory.js";
 import { DaemonClient } from "../src/daemon/client.js";
@@ -41,14 +45,16 @@ import {
   projectPaths,
 } from "../src/daemon/project.js";
 import { recoverMachineIdentity } from "../src/machine-identity.js";
+import { TransportedUnboundProjectError } from "../src/storage/identity-context.js";
 import {
   RETIRED_PROJECT_IDENTITY_DIAGNOSTIC,
   serializeWorktreeReconciliationFence,
 } from "../src/worktree-reconciliation-fence.js";
 import { NinjaRenderer } from "../src/cli/pipeline-runner.js";
-import { makeProgressState } from "../src/cli/progress-state.js";
+import { makeProgressState, type ProgressState } from "../src/cli/progress-state.js";
 
 const FULL_SUITE_DISCOVERY_TEST_TIMEOUT_MS = 15_000;
+const FAILURE_POISON = "sk-test-SECRET leaked from /home/poison/secret.txt";
 const BATCH_COMPACT_TEST_MACHINE_ID = "018f22c4-6d2a-7f10-8a4c-6b8d3e5f9012";
 const mutableFs = createRequire(import.meta.url)("node:fs") as Record<string, unknown>;
 
@@ -2604,6 +2610,93 @@ describe("batch compaction discovery", () => {
     ]);
   });
 
+  it.each<[string, () => unknown, string, boolean]>([
+    ["HTTP 500", () => Object.assign(new Error(FAILURE_POISON), { statusCode: 500 }), "daemon compaction failed (HTTP 500); run lcm doctor", false],
+    ["HTTP 599", () => Object.assign(new Error(FAILURE_POISON), { statusCode: 599 }), "daemon compaction failed (HTTP 599); run lcm doctor", false],
+    ["HTTP 503", () => Object.assign(new Error(FAILURE_POISON), { statusCode: 503 }), "daemon unavailable (HTTP 503); run lcm doctor", false],
+    ["HTTP 401", () => Object.assign(new Error(FAILURE_POISON), { statusCode: 401 }), "daemon auth rejected (HTTP 401); run lcm doctor", false],
+    ["HTTP 403", () => Object.assign(new Error(FAILURE_POISON), { statusCode: 403 }), "daemon auth rejected (HTTP 403); run lcm doctor", false],
+    ["HTTP 400", () => Object.assign(new Error(FAILURE_POISON), { statusCode: 400 }), "daemon rejected compact request (HTTP 400)", false],
+    ["HTTP 404", () => Object.assign(new Error(FAILURE_POISON), { statusCode: 404 }), "daemon rejected compact request (HTTP 404)", false],
+    ["status 399", () => Object.assign(new Error(FAILURE_POISON), { statusCode: 399 }), "compaction request failed", false],
+    ["status 600", () => Object.assign(new Error(FAILURE_POISON), { statusCode: 600 }), "compaction request failed", false],
+    ["status 500.5", () => Object.assign(new Error(FAILURE_POISON), { statusCode: 500.5 }), "compaction request failed", false],
+    ["string status", () => Object.assign(new Error(FAILURE_POISON), { statusCode: "500" }), "compaction request failed", false],
+    ["status NaN", () => Object.assign(new Error(FAILURE_POISON), { statusCode: Number.NaN }), "compaction request failed", false],
+    ["EPIPE", () => Object.assign(new Error(FAILURE_POISON), { code: "EPIPE" }), "daemon connection lost; outcome unknown; rerun after lcm doctor", true],
+    ["ETIMEDOUT", () => Object.assign(new Error(FAILURE_POISON), { code: "ETIMEDOUT" }), "daemon connection lost; outcome unknown; rerun after lcm doctor", true],
+    ["request timeout", () => new Error("Daemon request timed out"), "daemon connection lost; outcome unknown; rerun after lcm doctor", true],
+    ["HTTP error body that reads as a timeout", () => Object.assign(new Error("Daemon request timed out"), { statusCode: 500 }), "daemon compaction failed (HTTP 500); run lcm doctor", true],
+    ["intentional abort", () => createAbortError(new Error(FAILURE_POISON)), "compaction request cancelled", false],
+    ["unbound project", () => Object.assign(new TransportedUnboundProjectError(FAILURE_POISON), { statusCode: 409 }), "no PostgreSQL binding; run lcm project create or lcm project link <id>", false],
+    ["SyntaxError", () => new SyntaxError(FAILURE_POISON), "malformed compact response", false],
+    ["plain Error", () => new Error(FAILURE_POISON), "compaction request failed", false],
+    ["non-Error", () => FAILURE_POISON, "unknown error", false],
+  ])("reports a fixed actionable message for %s without leaking the raw error", async (_name, makeError, expected, transport) => {
+    expect(expected.length).toBeLessThanOrEqual(72);
+    const cwd = makeDir("compact-failure-classification");
+    const paths = projectPaths(cwd);
+    ensureProjectDir(cwd);
+    writeFileSync(paths.metaPath, JSON.stringify({ cwd: paths.canonical }));
+    seedConversation(paths.dbPath);
+    vi.spyOn(DaemonClient.prototype, "post").mockRejectedValue(makeError());
+    const stdout = vi.spyOn(console, "log").mockImplementation(() => undefined);
+    const stderr = vi.spyOn(console, "error").mockImplementation(() => undefined);
+    vi.spyOn(process.stdout, "write").mockImplementation(() => true);
+    const onTransportFailure = vi.fn();
+    const progress: Array<Partial<ProgressState>> = [];
+    const events: CompactProgressEvent[] = [];
+    const state = makeProgressState({ phases: [{ name: "Compact", status: "active" }], total: 1 });
+    const output: string[] = [];
+    const renderer = new NinjaRenderer({
+      state,
+      renderOpts: { isTTY: false, width: 80, color: false, verbose: true },
+      output: {
+        columns: 80,
+        write: (chunk: string | Uint8Array) => {
+          output.push(String(chunk));
+          return true;
+        },
+      },
+      handleSignals: false,
+    });
+
+    const result = await batchCompact({
+      minTokens: 100,
+      dryRun: false,
+      port: 3737,
+      cwd,
+      onTransportFailure,
+      onProgress: patch => {
+        progress.push(patch);
+        Object.assign(state, patch);
+      },
+      onEvent: event => {
+        events.push(event);
+        renderer.handleEvent(event);
+      },
+    });
+    renderer.printSummary();
+
+    expect(result.failures).toBe(1);
+    expect(progress.find(patch => patch.errors)?.errors).toEqual([
+      expect.objectContaining({ sessionId: "session-1", message: expected }),
+    ]);
+    expect(events).toContainEqual(expect.objectContaining({
+      type: "session-terminal",
+      outcome: "failed",
+      message: expected,
+    }));
+    // Lifecycle line (width 96) and summary list (width 72 at 80 columns)
+    // both show the full message, including its recovery command.
+    const rendered = output.join("");
+    expect(rendered.split(`: ${expected}\n`)).toHaveLength(3);
+    const everything = JSON.stringify([stdout.mock.calls, stderr.mock.calls, progress, events, rendered]);
+    expect(everything).not.toContain("sk-test-SECRET");
+    expect(everything).not.toContain("/home/poison");
+    expect(onTransportFailure).toHaveBeenCalledTimes(transport ? 1 : 0);
+  });
+
   it("reports daemon no-ops as unchanged and excludes them from promotion projects", async () => {
     const cwd = makeDir("compact-noop-accounting");
     const paths = projectPaths(cwd);
@@ -3151,6 +3244,814 @@ describe("batch compaction discovery", () => {
 
     await expect(pending).resolves.toMatchObject({ compacted: 2 });
   });
+
+
+  // --- #1568 / #1569: discovery checkpoints, cancellation and macrotask yield ---
+
+  type StorageObservation = {
+    open?: (call: number) => void;
+    getMessages?: (conversationId: number, afterSeq: number | undefined) => void;
+    locators?: (sessionIds: readonly string[]) => void | Promise<void>;
+  };
+
+  function wrapObject<T extends object>(target: T, overrides: Record<string, unknown>): T {
+    return new Proxy(target, {
+      get(inner, property) {
+        if (typeof property === "string" && Object.hasOwn(overrides, property)) return overrides[property];
+        const value = Reflect.get(inner, property) as unknown;
+        return typeof value === "function" ? (value as (...args: unknown[]) => unknown).bind(inner) : value;
+      },
+    });
+  }
+
+  /** Count direct-path storage opens and closes and observe discovery reads. */
+  function observeDirectStorage(hooks: StorageObservation = {}): { opened: number; closed: number } {
+    const counts = { opened: 0, closed: 0 };
+    let admissions = 0;
+    const realFactory = factoryModule.createStorageBackendFactory;
+    vi.spyOn(factoryModule, "createStorageBackendFactory").mockImplementation(async (...args) => {
+      admissions += 1;
+      hooks.open?.(admissions);
+      const factory = await realFactory(...args);
+      return wrapObject(factory, {
+        openExistingProject: async (...openArgs: Parameters<typeof factory.openExistingProject>) => {
+          const storage = await factory.openExistingProject(...openArgs);
+          if (storage === null) return null;
+          counts.opened += 1;
+          const native = storage.nativeTranscripts;
+          return wrapObject(storage, {
+            close: async (...closeArgs: Parameters<typeof storage.close>) => {
+              counts.closed += 1;
+              return storage.close(...closeArgs);
+            },
+            conversations: wrapObject(storage.conversations, {
+              getMessages: async (...readArgs: Parameters<typeof storage.conversations.getMessages>) => {
+                hooks.getMessages?.(readArgs[0], readArgs[1]?.afterSeq);
+                return storage.conversations.getMessages(...readArgs);
+              },
+            }),
+            ...(native === undefined ? {} : {
+              nativeTranscripts: {
+                ...native,
+                repository: wrapObject(native.repository, {
+                  listUnambiguousSourceLocators: async (
+                    input: Parameters<typeof native.repository.listUnambiguousSourceLocators>[0],
+                  ) => {
+                    await hooks.locators?.(input.nativeSessionIds);
+                    return native.repository.listUnambiguousSourceLocators(input);
+                  },
+                }),
+              },
+            }),
+          });
+        },
+      });
+    });
+    return counts;
+  }
+
+  /** Finite self-rescheduling setImmediate counter: it only advances when discovery yields. */
+  function startMacrotaskWitness(limit: number): { ticks: () => number; stop: () => void } {
+    let ticks = 0;
+    let handle: NodeJS.Immediate | undefined;
+    const tick = (): void => {
+      ticks += 1;
+      handle = ticks < limit ? setImmediate(tick) : undefined;
+    };
+    handle = setImmediate(tick);
+    return {
+      ticks: () => ticks,
+      stop: () => {
+        if (handle !== undefined) clearImmediate(handle);
+        handle = undefined;
+      },
+    };
+  }
+
+  function seedCompactProject(name: string, ids: readonly number[] = [1]): { cwd: string; canonical: string } {
+    const cwd = makeDir(name);
+    const paths = projectPaths(cwd);
+    ensureProjectDir(cwd);
+    writeFileSync(paths.metaPath, JSON.stringify({ cwd: paths.canonical }));
+    seedConversations(paths.dbPath, ids);
+    return { cwd, canonical: paths.canonical };
+  }
+
+  function expectStrictlyIncreasing(samples: readonly number[]): void {
+    for (let index = 1; index < samples.length; index += 1) {
+      expect(samples[index]!, "sample " + index + " of " + JSON.stringify(samples)).toBeGreaterThan(samples[index - 1]!);
+    }
+  }
+
+  const ZERO_COMPACT_RESULT = { compacted: 0, unchanged: 0, skipped: 0, failures: 0, compactedProjects: [] };
+
+  const WITNESS_TURN_CAP = 2_000;
+
+  function seedWideConversation(dbPath: string, conversationId: number, messages: number): void {
+    const wide = new DatabaseSync(dbPath);
+    try {
+      wide.prepare("INSERT INTO conversations (conversation_id, session_id) VALUES (?, ?)")
+        .run(conversationId, "session-" + conversationId);
+      insertMessages(wide, conversationId, messages, messages + 99);
+    } finally {
+      wide.close();
+    }
+  }
+
+  async function discoverWithWitness(
+    cwd: string,
+    observe: (record: (label: string) => void) => StorageObservation,
+  ): Promise<Array<{ label: string; ticks: number }>> {
+    const witness = startMacrotaskWitness(WITNESS_TURN_CAP);
+    const samples: Array<{ label: string; ticks: number }> = [];
+    const record = (label: string): void => { samples.push({ label, ticks: witness.ticks() }); };
+    observeDirectStorage(observe(record));
+    try {
+      await findUncompacted(100, false, cwd);
+    } finally {
+      witness.stop();
+    }
+    return samples;
+  }
+
+  it.each([true, false])(
+    "returns zero counts without listing projects or opening storage when cancelled before discovery (dryRun=%s)",
+    async (dryRun) => {
+      seedCompactProject("compact-pre-aborted");
+      const listProjects = vi.spyOn(cliStorage, "listCliProjects");
+      const openStorage = vi.spyOn(cliStorage, "withCliProjectStorage");
+      const error = vi.spyOn(console, "error").mockImplementation(() => undefined);
+      const post = vi.spyOn(DaemonClient.prototype, "post");
+      const events: CompactProgressEvent[] = [];
+      const progress: Array<Partial<ProgressState>> = [];
+      const controller = new AbortController();
+      controller.abort();
+
+      expect(await batchCompact({
+        minTokens: 100,
+        dryRun,
+        port: 3737,
+        signal: controller.signal,
+        onEvent: event => events.push(event),
+        onProgress: patch => progress.push(patch),
+      })).toEqual(ZERO_COMPACT_RESULT);
+
+      expect(events).toEqual([]);
+      expect(progress).toEqual([]);
+      expect(listProjects).not.toHaveBeenCalled();
+      expect(openStorage).not.toHaveBeenCalled();
+      expect(post).not.toHaveBeenCalled();
+      expect(error).not.toHaveBeenCalled();
+    },
+  );
+
+  // A8(a): macrotask witness inside one direct-path project. The seams are the
+  // proxied storage calls (message pages and source-locator lookups).
+  it("yields a macrotask turn between conversations, message pages, and locator batches of one project", async () => {
+    const cwd = makeDir("compact-yield-one-project");
+    ensureProjectDir(cwd);
+    const ids = Array.from({ length: NATIVE_SOURCE_LOCATOR_BATCH_SIZE + 3 }, (_value, index) => index + 1);
+    seedDiscoveryFixture(projectPaths(cwd).dbPath, projectPaths(cwd).id, ids, sessionId => [
+      { locator: "sessions/" + sessionId + ".jsonl", key: "ik-" + sessionId },
+    ]);
+    // 501 messages force a second 500-message page for this conversation.
+    seedWideConversation(projectPaths(cwd).dbPath, 1000, 501);
+
+    const samples = await discoverWithWitness(cwd, record => ({
+      getMessages: (conversationId, afterSeq) => record("read " + conversationId + "@" + String(afterSeq)),
+      locators: sessionIds => { record("locators " + sessionIds.length); },
+    }));
+
+    const labels = samples.map(sample => sample.label);
+    expect(labels).toEqual(expect.arrayContaining(["read 1@undefined", "read 1000@undefined", "read 1000@500"]));
+    expect(labels.filter(label => label.startsWith("locators "))).toEqual([
+      "locators " + NATIVE_SOURCE_LOCATOR_BATCH_SIZE,
+      "locators 4",
+    ]);
+    expectStrictlyIncreasing(samples.map(sample => sample.ticks));
+  }, FULL_SUITE_DISCOVERY_TEST_TIMEOUT_MS);
+
+  it("yields a macrotask turn between per-session locator fallbacks of one project", async () => {
+    const cwd = makeDir("compact-yield-locator-fallback");
+    ensureProjectDir(cwd);
+    seedDiscoveryFixture(projectPaths(cwd).dbPath, projectPaths(cwd).id, [1, 2, 3], sessionId => [
+      { locator: "sessions/" + sessionId + ".jsonl", key: "ik-" + sessionId },
+    ]);
+
+    const samples = await discoverWithWitness(cwd, record => ({
+      locators: sessionIds => {
+        record("locators " + sessionIds.length);
+        // The three-session batch fails, so each session resolves on its own.
+        if (sessionIds.length > 1) throw new Error("batch lookup failed");
+      },
+    }));
+
+    expect(samples.map(sample => sample.label)).toEqual(["locators 3", "locators 1", "locators 1", "locators 1"]);
+    expectStrictlyIncreasing(samples.map(sample => sample.ticks));
+  }, FULL_SUITE_DISCOVERY_TEST_TIMEOUT_MS);
+
+  it("yields a macrotask turn before each project starts", async () => {
+    seedCompactProject("compact-yield-project-first");
+    seedCompactProject("compact-yield-project-second");
+    vi.spyOn(console, "error").mockImplementation(() => undefined);
+    vi.spyOn(process.stdout, "write").mockImplementation(() => true);
+    vi.spyOn(DaemonClient.prototype, "post").mockResolvedValue({ tokensBefore: 250, tokensAfter: 50 });
+    let witness: ReturnType<typeof startMacrotaskWitness> | undefined;
+    const starts: number[] = [];
+    try {
+      await batchCompact({
+        minTokens: 100,
+        dryRun: false,
+        port: 3737,
+        onEvent: event => {
+          if (event.type === "discovery-start") witness = startMacrotaskWitness(WITNESS_TURN_CAP);
+          if (event.type === "discovery-item-start") starts.push(witness?.ticks() ?? 0);
+        },
+      });
+    } finally {
+      witness?.stop();
+    }
+    expect(starts).toHaveLength(2);
+    expectStrictlyIncreasing(starts);
+  }, FULL_SUITE_DISCOVERY_TEST_TIMEOUT_MS);
+
+  // A8(b): cancellation through the event loop before any project starts.
+  it("stops at discovery start without starting a project, opening storage, or compacting", async () => {
+    seedCompactProject("compact-abort-start-first");
+    seedCompactProject("compact-abort-start-second");
+    const counts = observeDirectStorage();
+    const post = vi.spyOn(DaemonClient.prototype, "post").mockResolvedValue({ tokensBefore: 250, tokensAfter: 50 });
+    const error = vi.spyOn(console, "error").mockImplementation(() => undefined);
+    const events: CompactProgressEvent[] = [];
+    const controller = new AbortController();
+
+    expect(await batchCompact({
+      minTokens: 100,
+      dryRun: false,
+      port: 3737,
+      signal: controller.signal,
+      onEvent: event => {
+        events.push(event);
+        if (event.type === "discovery-start") setImmediate(() => controller.abort());
+      },
+    })).toEqual(ZERO_COMPACT_RESULT);
+
+    expect(events.map(event => event.type)).toEqual(["discovery-start", "discovery-clear"]);
+    expect(counts.opened).toBe(0);
+    expect(post).not.toHaveBeenCalled();
+    expect(error).not.toHaveBeenCalled();
+  }, FULL_SUITE_DISCOVERY_TEST_TIMEOUT_MS);
+
+  // A8(c): cancellation scheduled from a seam inside an already opened project.
+  it("closes direct storage opened before cancellation and starts no later project", async () => {
+    seedCompactProject("compact-abort-open-first");
+    seedCompactProject("compact-abort-open-second");
+    const controller = new AbortController();
+    let scheduled = false;
+    const counts = observeDirectStorage({
+      getMessages: () => {
+        if (scheduled) return;
+        scheduled = true;
+        setImmediate(() => controller.abort());
+      },
+    });
+    const post = vi.spyOn(DaemonClient.prototype, "post").mockResolvedValue({ tokensBefore: 250, tokensAfter: 50 });
+    const error = vi.spyOn(console, "error").mockImplementation(() => undefined);
+    const events: CompactProgressEvent[] = [];
+    const progress: Array<Partial<ProgressState>> = [];
+
+    expect(await batchCompact({
+      minTokens: 100,
+      dryRun: false,
+      port: 3737,
+      signal: controller.signal,
+      onEvent: event => events.push(event),
+      onProgress: patch => progress.push(patch),
+    })).toEqual(ZERO_COMPACT_RESULT);
+
+    expect(events.map(event => event.type))
+      .toEqual(["discovery-start", "discovery-item-start", "discovery-clear"]);
+    expect(counts).toEqual({ opened: 1, closed: 1 });
+    // Without a retained failure the aborted run emits no progress patch.
+    expect(progress).toEqual([]);
+    expect(post).not.toHaveBeenCalled();
+    expect(error).not.toHaveBeenCalled();
+  }, FULL_SUITE_DISCOVERY_TEST_TIMEOUT_MS);
+
+  it("closes the preview snapshot opened before cancellation and starts no later project", async () => {
+    seedCompactProject("compact-preview-abort-first");
+    seedCompactProject("compact-preview-abort-second");
+    const controller = new AbortController();
+    const counts = { opened: 0, closed: 0 };
+    const realCapture = dbConnection.captureExistingLcmSnapshot;
+    vi.spyOn(dbConnection, "captureExistingLcmSnapshot").mockImplementation((...args) => {
+      const snapshot = realCapture(...args);
+      if (snapshot === null) return null;
+      counts.opened += 1;
+      setImmediate(() => controller.abort());
+      return wrapObject(snapshot, { close: () => { counts.closed += 1; snapshot.close(); } });
+    });
+    const error = vi.spyOn(console, "error").mockImplementation(() => undefined);
+    const events: CompactProgressEvent[] = [];
+
+    expect(await batchCompact({
+      minTokens: 100,
+      dryRun: true,
+      port: 3737,
+      signal: controller.signal,
+      onEvent: event => events.push(event),
+    })).toEqual(ZERO_COMPACT_RESULT);
+
+    expect(events.map(event => event.type))
+      .toEqual(["discovery-start", "discovery-item-start", "discovery-clear"]);
+    expect(counts).toEqual({ opened: 1, closed: 1 });
+    expect(error).not.toHaveBeenCalled();
+  }, FULL_SUITE_DISCOVERY_TEST_TIMEOUT_MS);
+
+  it("stops before the next project when cancellation arrives between two projects", async () => {
+    seedCompactProject("compact-abort-between-first");
+    seedCompactProject("compact-abort-between-second");
+    const counts = observeDirectStorage();
+    const post = vi.spyOn(DaemonClient.prototype, "post").mockResolvedValue({ tokensBefore: 250, tokensAfter: 50 });
+    const error = vi.spyOn(console, "error").mockImplementation(() => undefined);
+    const events: CompactProgressEvent[] = [];
+    const controller = new AbortController();
+
+    expect(await batchCompact({
+      minTokens: 100,
+      dryRun: false,
+      port: 3737,
+      signal: controller.signal,
+      onEvent: event => {
+        events.push(event);
+        if (event.type === "discovery-item-terminal" && event.index === 1) controller.abort();
+      },
+    })).toEqual(ZERO_COMPACT_RESULT);
+
+    expect(events.map(event => event.type)).toEqual([
+      "discovery-start", "discovery-item-start", "discovery-item-terminal", "discovery-clear",
+    ]);
+    expect(counts).toEqual({ opened: 1, closed: 1 });
+    expect(post).not.toHaveBeenCalled();
+    expect(error).not.toHaveBeenCalled();
+  }, FULL_SUITE_DISCOVERY_TEST_TIMEOUT_MS);
+
+  // Round 1: cancellation observed after a project's last read must not
+  // classify the project done or hand its conversations to the compact pool.
+  type FinalReadCase = {
+    name: string;
+    ineligible: boolean;
+    arm: (controller: AbortController) => StorageObservation;
+  };
+
+  it.each<FinalReadCase>([
+    {
+      name: "latched during the final locator read",
+      ineligible: false,
+      arm: controller => ({
+        locators: () => new Promise<void>(resolveRead => setImmediate(() => {
+          controller.abort();
+          resolveRead();
+        })),
+      }),
+    },
+    {
+      name: "queued as the next macrotask by a synchronous final locator return",
+      ineligible: false,
+      arm: controller => ({ locators: () => { setImmediate(() => controller.abort()); } }),
+    },
+    {
+      name: "queued as the next macrotask by the final read of an ineligible project",
+      ineligible: true,
+      arm: controller => ({ getMessages: () => { setImmediate(() => controller.abort()); } }),
+    },
+  ])("does not complete a direct project scan cancelled $name", async ({ ineligible, arm }) => {
+    const first = seedCompactProject("compact-final-read-first");
+    seedCompactProject("compact-final-read-second");
+    if (ineligible) {
+      // Too few tokens: the scan finds no candidate and reads no locators.
+      const quiet = new DatabaseSync(projectPaths(first.cwd).dbPath);
+      try {
+        quiet.exec("UPDATE messages SET token_count = 1");
+      } finally {
+        quiet.close();
+      }
+    }
+    const controller = new AbortController();
+    const counts = observeDirectStorage(arm(controller));
+    const post = vi.spyOn(DaemonClient.prototype, "post").mockResolvedValue({ tokensBefore: 250, tokensAfter: 50 });
+    const error = vi.spyOn(console, "error").mockImplementation(() => undefined);
+    const events: CompactProgressEvent[] = [];
+
+    expect(await batchCompact({
+      minTokens: 100,
+      dryRun: false,
+      port: 3737,
+      signal: controller.signal,
+      onEvent: event => events.push(event),
+    })).toEqual(ZERO_COMPACT_RESULT);
+
+    // No done terminal, and neither "Found N", "Nothing to compact", nor
+    // "Batch compact complete." is printed.
+    expect(events.map(event => event.type))
+      .toEqual(["discovery-start", "discovery-item-start", "discovery-clear"]);
+    expect(counts).toEqual({ opened: 1, closed: 1 });
+    expect(post).not.toHaveBeenCalled();
+    expect(error).not.toHaveBeenCalled();
+  }, FULL_SUITE_DISCOVERY_TEST_TIMEOUT_MS);
+
+  it("does not complete a preview project scan cancelled by a synchronous final locator read", async () => {
+    seedCompactProject("compact-final-read-preview-first");
+    seedCompactProject("compact-final-read-preview-second");
+    const controller = new AbortController();
+    const counts = { opened: 0, closed: 0 };
+    const realCapture = dbConnection.captureExistingLcmSnapshot;
+    vi.spyOn(dbConnection, "captureExistingLcmSnapshot").mockImplementation((...args) => {
+      const snapshot = realCapture(...args);
+      if (snapshot === null) return null;
+      counts.opened += 1;
+      const db = wrapObject(snapshot.db, {
+        prepare: (sql: string) => {
+          // The locator statement is the scan's last read and returns synchronously.
+          if (sql.includes("runtime_native_transcripts")) setImmediate(() => controller.abort());
+          return snapshot.db.prepare(sql);
+        },
+      });
+      return wrapObject(snapshot, { db, close: () => { counts.closed += 1; snapshot.close(); } });
+    });
+    const error = vi.spyOn(console, "error").mockImplementation(() => undefined);
+    const events: CompactProgressEvent[] = [];
+
+    expect(await batchCompact({
+      minTokens: 100,
+      dryRun: true,
+      port: 3737,
+      signal: controller.signal,
+      onEvent: event => events.push(event),
+    })).toEqual(ZERO_COMPACT_RESULT);
+
+    expect(events.map(event => event.type))
+      .toEqual(["discovery-start", "discovery-item-start", "discovery-clear"]);
+    expect(counts).toEqual({ opened: 1, closed: 1 });
+    expect(error).not.toHaveBeenCalled();
+  }, FULL_SUITE_DISCOVERY_TEST_TIMEOUT_MS);
+
+  // Round 2: the final project's open reports missing storage or fails
+  // ordinarily while a cancellation is queued. Those exits must observe it too.
+  type FinalOpenCase = { kind: "missing" | "failing"; cancel: boolean };
+
+  it.each<FinalOpenCase>([
+    { kind: "missing", cancel: true },
+    { kind: "failing", cancel: true },
+    { kind: "missing", cancel: false },
+    { kind: "failing", cancel: false },
+  ])("handles a final project whose open is $kind (cancel=$cancel)", async ({ kind, cancel }) => {
+    const corruptProject = (name: string): string => {
+      const corruptCwd = makeDir(name);
+      const corruptDir = projectPaths(corruptCwd).dir;
+      ensureProjectDir(corruptCwd);
+      writeFileSync(join(corruptDir, "meta.json"), JSON.stringify({ cwd: corruptCwd }));
+      writeFileSync(join(corruptDir, "db.sqlite"), "not sqlite");
+      return corruptCwd;
+    };
+    const earlierFailure = corruptProject("compact-final-open-earlier-failure");
+    seedCompactProject("compact-final-open-eligible");
+    if (kind === "failing") corruptProject("compact-final-open-final");
+    else ensureProjectDir(makeDir("compact-final-open-final"));
+    const controller = new AbortController();
+    // The third storage admission is the final project's open.
+    observeDirectStorage({
+      open: call => { if (call === 3 && cancel) setImmediate(() => controller.abort()); },
+    });
+    const post = vi.spyOn(DaemonClient.prototype, "post").mockResolvedValue({ tokensBefore: 250, tokensAfter: 50 });
+    const error = vi.spyOn(console, "error").mockImplementation(() => undefined);
+    vi.spyOn(process.stdout, "write").mockImplementation(() => true);
+    const progress: Array<Partial<ProgressState>> = [];
+    const events: CompactProgressEvent[] = [];
+    const retained = { phase: "Compact", target: earlierFailure, message: "project storage discovery failed" };
+
+    const result = await batchCompact({
+      minTokens: 100,
+      dryRun: false,
+      port: 3737,
+      signal: controller.signal,
+      onProgress: patch => progress.push(patch),
+      onEvent: event => events.push(event),
+    });
+
+    const head = [
+      "discovery-start",
+      "discovery-item-start", "phase-failure", "discovery-item-terminal",
+      "discovery-item-start", "discovery-item-terminal",
+      "discovery-item-start",
+    ];
+    if (cancel) {
+      expect(result).toEqual({ ...ZERO_COMPACT_RESULT, failures: 1 });
+      // The interrupted project gets no terminal event and no failure.
+      expect(events.map(event => event.type)).toEqual([...head, "discovery-clear"]);
+      expect(progress).toEqual([{ phaseErrors: [retained] }]);
+      expect(post).not.toHaveBeenCalled();
+      expect(error).not.toHaveBeenCalled();
+      return;
+    }
+    expect(post).toHaveBeenCalledOnce();
+    expect(result).toMatchObject({ compacted: 1, failures: kind === "failing" ? 2 : 1 });
+    const discovery = events.slice(0, events.findIndex(event => event.type === "discovery-clear") + 1);
+    expect(discovery.slice(kind === "failing" ? -3 : -2).map(event => event.type)).toEqual(
+      kind === "failing"
+        ? ["phase-failure", "discovery-item-terminal", "discovery-clear"]
+        : ["discovery-item-terminal", "discovery-clear"],
+    );
+    expect(discovery.filter(event => event.type === "discovery-item-terminal").at(-1))
+      .toMatchObject({ index: 3, outcome: kind === "failing" ? "failed" : "done" });
+  }, FULL_SUITE_DISCOVERY_TEST_TIMEOUT_MS);
+
+  it("rejects a non-cancellation error raised by a discovery event handler and still clears discovery", async () => {
+    seedCompactProject("compact-event-handler-failure");
+    vi.spyOn(console, "error").mockImplementation(() => undefined);
+    const events: CompactProgressEvent[] = [];
+
+    // Only intentional cancellation ends discovery quietly: any other error
+    // raised outside the per-project classification still rejects the run.
+    await expect(batchCompact({
+      minTokens: 100,
+      dryRun: false,
+      port: 3737,
+      onEvent: event => {
+        events.push(event);
+        if (event.type === "discovery-item-start") throw new Error("renderer failed");
+      },
+    })).rejects.toThrow("renderer failed");
+    expect(events.map(event => event.type))
+      .toEqual(["discovery-start", "discovery-item-start", "discovery-clear"]);
+  });
+  type LocatorAbortCase = {
+    name: string;
+    ids: number;
+    hook: (call: number, sessionIds: readonly string[], controller: AbortController) => void;
+    calls: number;
+  };
+
+  it.each<LocatorAbortCase>([
+    {
+      name: "between two locator batches",
+      ids: NATIVE_SOURCE_LOCATOR_BATCH_SIZE + 3,
+      hook: (call, _ids, controller) => { if (call === 1) controller.abort(); },
+      calls: 1,
+    },
+    {
+      name: "when a locator batch throws an abort error",
+      ids: 3,
+      hook: () => { throw createAbortError(); },
+      calls: 1,
+    },
+    {
+      name: "when a per-session fallback throws an abort error",
+      ids: 3,
+      hook: (call, sessionIds) => {
+        if (sessionIds.length > 1) throw new Error("batch lookup failed");
+        if (call === 2) throw createAbortError();
+      },
+      calls: 2,
+    },
+    {
+      name: "between per-session fallbacks",
+      ids: 3,
+      hook: (call, sessionIds, controller) => {
+        if (sessionIds.length > 1) throw new Error("batch lookup failed");
+        if (call === 2) controller.abort();
+      },
+      calls: 2,
+    },
+  ])("stops discovery cancelled $name", async ({ ids, hook, calls }) => {
+    const cwd = makeDir("compact-locator-abort");
+    ensureProjectDir(cwd);
+    seedDiscoveryFixture(
+      projectPaths(cwd).dbPath,
+      projectPaths(cwd).id,
+      Array.from({ length: ids }, (_value, index) => index + 1),
+      sessionId => [{ locator: "sessions/" + sessionId + ".jsonl", key: "ik-" + sessionId }],
+    );
+    const controller = new AbortController();
+    let call = 0;
+    const counts = observeDirectStorage({
+      locators: sessionIds => {
+        call += 1;
+        hook(call, sessionIds, controller);
+      },
+    });
+    const post = vi.spyOn(DaemonClient.prototype, "post").mockResolvedValue({ tokensBefore: 250, tokensAfter: 50 });
+    const error = vi.spyOn(console, "error").mockImplementation(() => undefined);
+    const events: CompactProgressEvent[] = [];
+
+    expect(await batchCompact({
+      minTokens: 100,
+      dryRun: false,
+      port: 3737,
+      cwd,
+      signal: controller.signal,
+      onEvent: event => events.push(event),
+    })).toEqual(ZERO_COMPACT_RESULT);
+
+    expect(call).toBe(calls);
+    expect(events.map(event => event.type))
+      .toEqual(["discovery-start", "discovery-item-start", "discovery-clear"]);
+    expect(counts).toEqual({ opened: 1, closed: 1 });
+    expect(post).not.toHaveBeenCalled();
+    expect(error).not.toHaveBeenCalled();
+  }, FULL_SUITE_DISCOVERY_TEST_TIMEOUT_MS);
+
+
+  // A8(d): project 1 fails, project 2 is opened and interrupted, project 3 is untouched.
+  it.each([true, false])(
+    "retains an earlier project failure when cancellation interrupts the second of three projects (progress=%s)",
+    async (withProgress) => {
+      const corruptCwd = makeDir("compact-abort-retained-corrupt");
+      const corruptDir = projectPaths(corruptCwd).dir;
+      ensureProjectDir(corruptCwd);
+      writeFileSync(join(corruptDir, "meta.json"), JSON.stringify({ cwd: corruptCwd }));
+      writeFileSync(join(corruptDir, "db.sqlite"), "not sqlite");
+      seedCompactProject("compact-abort-retained-second");
+      seedCompactProject("compact-abort-retained-third");
+      const controller = new AbortController();
+      let scheduled = false;
+      const counts = observeDirectStorage({
+        getMessages: () => {
+          if (scheduled) return;
+          scheduled = true;
+          setImmediate(() => controller.abort());
+        },
+      });
+      const post = vi.spyOn(DaemonClient.prototype, "post");
+      const error = vi.spyOn(console, "error").mockImplementation(() => undefined);
+      const progress: Array<Partial<ProgressState>> = [];
+      const events: CompactProgressEvent[] = [];
+
+      expect(await batchCompact({
+        minTokens: 100,
+        dryRun: false,
+        port: 3737,
+        signal: controller.signal,
+        ...(withProgress ? { onProgress: (patch: Partial<ProgressState>) => progress.push(patch) } : {}),
+        onEvent: event => events.push(event),
+      })).toEqual({ ...ZERO_COMPACT_RESULT, failures: 1 });
+
+      expect(events.map(event => event.type)).toEqual([
+        "discovery-start",
+        "discovery-item-start",
+        "phase-failure",
+        "discovery-item-terminal",
+        "discovery-item-start",
+        "discovery-clear",
+      ]);
+      expect(events.filter(event => event.type === "discovery-item-start").map(event => (event as { index: number }).index))
+        .toEqual([1, 2]);
+      expect(events.filter(event => event.type === "phase-failure")).toEqual([
+        { type: "phase-failure", phase: "Compact", project: corruptCwd, message: "project storage discovery failed" },
+      ]);
+      expect(counts).toEqual({ opened: 1, closed: 1 });
+      // The patch carries only the retained failure: no total, no summary.
+      expect(progress).toEqual(withProgress ? [{
+        phaseErrors: [{ phase: "Compact", target: corruptCwd, message: "project storage discovery failed" }],
+      }] : []);
+      expect(post).not.toHaveBeenCalled();
+      expect(error).not.toHaveBeenCalled();
+    },
+    FULL_SUITE_DISCOVERY_TEST_TIMEOUT_MS,
+  );
+
+  // A9: a real invocation lease on a logical clock. Storage seams advance logical
+  // time past two leases; the lease heartbeat only keeps the invocation alive if
+  // discovery yields macrotask turns.
+  it("keeps the real invocation lease alive through a discovery longer than two leases", async () => {
+    const leaseMs = 1_000;
+    const daemonInstanceId = "11111111-1111-4111-8111-111111111111";
+    const invocationId = "22222222-2222-4222-8222-222222222222";
+    const { canonical, cwd } = seedCompactProject("compact-lease-discovery", [1]);
+    const quiet = new DatabaseSync(projectPaths(cwd).dbPath);
+    try {
+      // Nine ineligible conversations add storage reads without adding sessions.
+      for (let id = 2; id <= 10; id += 1) {
+        quiet.prepare("INSERT INTO conversations (conversation_id, session_id) VALUES (?, ?)").run(id, "session-" + id);
+        insertMessages(quiet, id, 9, 9);
+      }
+    } finally {
+      quiet.close();
+    }
+
+    let logicalNow = 1_000_000;
+    const logicalTimers = new Map<number, { due: number; run: () => void }>();
+    let nextTimerId = 1;
+    const logicalSetTimeout = ((run: () => void, delay: number) => {
+      const id = nextTimerId++;
+      logicalTimers.set(id, { due: logicalNow + delay, run });
+      return id;
+    }) as unknown as typeof setTimeout;
+    const logicalClearTimeout = ((id: number) => { logicalTimers.delete(id); }) as unknown as typeof clearTimeout;
+    const advanceLogicalClock = (ms: number): void => {
+      logicalNow += ms;
+      while (true) {
+        const next = [...logicalTimers.entries()]
+          .filter(([, timer]) => timer.due <= logicalNow)
+          .sort((left, right) => left[1].due - right[1].due)[0];
+        if (next === undefined) return;
+        logicalTimers.delete(next[0]);
+        next[1].run();
+      }
+    };
+    // The heartbeat interval fires once per event-loop turn, never on wall time.
+    type TurnTimer = { stopped: boolean; handle?: NodeJS.Immediate };
+    let turns = 0;
+    const turnSetInterval = ((run: () => void) => {
+      const timer: TurnTimer = { stopped: false };
+      const tick = (): void => {
+        turns += 1;
+        if (timer.stopped || turns > WITNESS_TURN_CAP) return;
+        run();
+        timer.handle = setImmediate(tick);
+      };
+      timer.handle = setImmediate(tick);
+      return timer;
+    }) as unknown as typeof setInterval;
+    const turnClearInterval = ((timer: TurnTimer) => {
+      timer.stopped = true;
+      if (timer.handle !== undefined) clearImmediate(timer.handle);
+    }) as unknown as typeof clearInterval;
+
+    const coordinator = createInvocationCoordinator({
+      daemonInstanceId,
+      now: () => logicalNow,
+      setTimeout: logicalSetTimeout,
+      clearTimeout: logicalClearTimeout,
+      leaseMs,
+    });
+    const target = { invocationId, command: "compact" as const, daemonInstanceId };
+    const heartbeats: InvocationSnapshot[] = [];
+    const client = {
+      startInvocation: vi.fn(async () => coordinator.start(target)),
+      heartbeatInvocation: vi.fn(async () => {
+        const snapshot = coordinator.heartbeat(target);
+        heartbeats.push(snapshot);
+        return snapshot;
+      }),
+      cancelInvocation: vi.fn(async () => coordinator.cancel(target)),
+      finishInvocation: vi.fn(async () => coordinator.finish(target)),
+    };
+    const lifecycle = createCompactInvocationLifecycle({
+      client: client as never,
+      daemonInstanceId,
+      invocationId,
+      heartbeatMs: 5,
+      setInterval: turnSetInterval,
+      clearInterval: turnClearInterval,
+    });
+    // Every conversation read consumes half a lease of logical time.
+    observeDirectStorage({ getMessages: () => advanceLogicalClock(leaseMs / 2) });
+    let admissions = 0;
+    const post = vi.spyOn(DaemonClient.prototype, "post").mockImplementation(async () => {
+      const admission = coordinator.admitWork(target);
+      admissions += 1;
+      try {
+        return { tokensBefore: 250, tokensAfter: 50 };
+      } finally {
+        admission.release();
+      }
+    });
+    vi.spyOn(console, "error").mockImplementation(() => undefined);
+    vi.spyOn(process.stdout, "write").mockImplementation(() => true);
+
+    let started: Awaited<ReturnType<typeof lifecycle.start>>;
+    let heartbeatsAtDiscoveryClear = -1;
+    try {
+      started = await lifecycle.start();
+      expect(await batchCompact({
+        minTokens: 100,
+        dryRun: false,
+        port: 3737,
+        cwd,
+        invocationId: lifecycle.invocationId,
+        signal: lifecycle.signal,
+        onEvent: event => {
+          if (event.type === "discovery-clear") heartbeatsAtDiscoveryClear = heartbeats.length;
+        },
+      })).toEqual({ compacted: 1, unchanged: 0, skipped: 0, failures: 0, compactedProjects: [canonical] });
+
+      expect(logicalNow - 1_000_000).toBeGreaterThan(2 * leaseMs);
+      expect(heartbeatsAtDiscoveryClear).toBeGreaterThanOrEqual(4);
+      expect(heartbeats.every(snapshot => snapshot.state === "active")).toBe(true);
+      const expiries = heartbeats.map(snapshot => snapshot.leaseExpiresAt!);
+      expect(expiries.slice(1).every((expiry, index) => expiry >= expiries[index]!)).toBe(true);
+      expect(expiries.at(-1)).toBeGreaterThan(started.leaseExpiresAt! + 2 * leaseMs);
+      // The first compact admission succeeded and nothing was replayed.
+      expect(post).toHaveBeenCalledOnce();
+      expect(admissions).toBe(1);
+      expect(coordinator.snapshot(invocationId)).toMatchObject({ state: "active", activeCount: 0 });
+    } finally {
+      await lifecycle.finish().catch(() => undefined);
+      await coordinator.close();
+    }
+    expect(logicalTimers.size).toBe(0);
+  }, FULL_SUITE_DISCOVERY_TEST_TIMEOUT_MS);
 });
 
 describe("batch worker pool", () => {

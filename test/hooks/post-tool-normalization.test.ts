@@ -43,7 +43,8 @@ describe("normalizePostToolInput", () => {
 
     expect(normalized.tool_name).toBe("Bash");
     expect(normalized.tool_input).toEqual({ command: fixture.tool_input.command ?? fixture.tool_input.cmd });
-    expect(extract({ client: "codex", ...fixture })[0]).toMatchObject({
+    expect(normalized.tool_output).toEqual({ outcome: "unknown" });
+    expect(extract({ client: "codex", ...fixture, tool_response: { exit_code: 0 } })[0]).toMatchObject({
       type: fixture.expectedType,
       category: fixture.expectedCategory,
       priority: fixture.expectedPriority,
@@ -181,7 +182,7 @@ describe("normalizePostToolInput", () => {
       tool_response: response,
     });
 
-    expect(normalized.tool_output).toEqual({ isError: expected });
+    expect(normalized.tool_output).toEqual({ outcome: expected ? "failed" : "succeeded" });
     expect(extractPostToolEvents(normalized)[0]?.type).toBe(expected ? "error_tool" : "git_branch");
   });
 
@@ -189,7 +190,7 @@ describe("normalizePostToolInput", () => {
     { name: "both sources invalid", output: { isError: "no" }, response: { exitCode: "0" } },
     { name: "nested status fields", output: { result: { isError: true } }, response: { status: { exit_code: 1 } } },
     { name: "non-record sources", output: "isError=true", response: ["exit_code", 1] },
-  ])("omits canonical status for $name", ({ output, response }) => {
+  ])("reports an unknown outcome for $name", ({ output, response }) => {
     const normalized = normalize({
       client: "codex",
       tool_name: "functions.exec_command",
@@ -198,8 +199,11 @@ describe("normalizePostToolInput", () => {
       tool_response: response,
     });
 
-    expect(normalized.tool_output).toBeUndefined();
-    expect(extractPostToolEvents(normalized)[0]?.type).toBe("git_branch");
+    expect(normalized.tool_output).toEqual({ outcome: "unknown" });
+    expect(extractPostToolEvents(normalized)[0]).toMatchObject({
+      type: "tool_outcome_unknown",
+      data: "Bash outcome unknown: git branch",
+    });
   });
 
   it.each([
@@ -248,6 +252,7 @@ describe("normalizePostToolInput", () => {
       client: "codex",
       tool_name: "functions.exec_command",
       tool_input: { command: "git branch preferred", cmd: "npm install ignored" },
+      tool_response: { exit_code: 0 },
     });
     expect(commandWins.tool_input).toEqual({ command: "git branch preferred" });
     expect(extractPostToolEvents(commandWins)[0]?.type).toBe("git_branch");
@@ -267,6 +272,7 @@ describe("normalizePostToolInput", () => {
       client: "codex",
       tool_name: "functions.exec_command",
       tool_input: { command: 42, cmd: "npm install fallback" },
+      tool_response: { exit_code: 0 },
     });
 
     expect(normalized.tool_input).toEqual({ command: "npm install fallback" });
@@ -297,6 +303,7 @@ describe("normalizePostToolInput", () => {
       client: "codex",
       tool_name: "functions.exec_command",
       tool_input: { cmd: `npm install ${"x".repeat(2500)}` },
+      tool_response: { exit_code: 0 },
     });
     const boundedCommand = normalized.tool_input.command;
 
@@ -355,5 +362,211 @@ describe("normalizePostToolInput", () => {
 
   it("proves both fixed benign functional coverage fixtures in memory", () => {
     expect(codexPostToolFunctionalCoverage()).toBe(true);
+  });
+
+  describe("current Codex 0.163 shapes", () => {
+    it("maps the current Bash name, ignoring the original command id and textual output", () => {
+      const raw = {
+        client: "codex",
+        tool_name: "Bash",
+        tool_use_id: "exec-call-45",
+        tool_input: { command: "git commit -m 'x'" },
+        tool_response: "finished\n",
+      };
+      const normalized = normalize(raw);
+
+      expect(normalized).toEqual({
+        tool_name: "Bash",
+        tool_input: { command: "git commit -m 'x'" },
+        tool_output: { outcome: "unknown" },
+      });
+      expect(extractPostToolEvents(normalized)).toEqual([{
+        type: "tool_outcome_unknown",
+        category: "tool",
+        data: "Bash outcome unknown: git commit",
+        priority: 3,
+      }]);
+    });
+
+    it("never parses textual results for an exit status", () => {
+      const events = extract({
+        client: "codex",
+        tool_name: "Bash",
+        tool_input: { command: "git push" },
+        tool_response: "Process exited with code 1\nPROCESS ERROR",
+      });
+      expect(events.map(event => event.type)).toEqual(["tool_outcome_unknown"]);
+    });
+
+    it("records no event for unselected commands, including a poll completion", () => {
+      expect(extract({
+        client: "codex",
+        tool_name: "Bash",
+        tool_use_id: "exec-call-45",
+        tool_input: { command: "sleep 1; echo finished" },
+        tool_response: "finished\n",
+      })).toEqual([]);
+    });
+
+    it("keeps structured shell failure and success on the Bash path", () => {
+      expect(extract({
+        client: "codex",
+        tool_name: "Bash",
+        tool_input: { command: "git push origin main" },
+        tool_response: { exit_code: 1 },
+      })[0]).toMatchObject({ type: "error_tool", data: "Bash error: git push origin" });
+      expect(extract({
+        client: "codex",
+        tool_name: "Bash",
+        tool_input: { command: "git push origin main" },
+        tool_response: { exit_code: 0 },
+      })[0]).toMatchObject({ type: "git_push" });
+    });
+
+    it("suppresses the current Bash name for lcm store without an outcome", () => {
+      expect(normalize({
+        client: "codex",
+        tool_name: "Bash",
+        tool_input: { command: "lcm store x" },
+      })).toEqual({ tool_name: "Bash", tool_input: { command: "" } });
+    });
+
+    it("treats a non-Codex Bash payload with the legacy status path", () => {
+      expect(extract({
+        client: "claude",
+        tool_name: "Bash",
+        tool_input: { command: "git branch" },
+        tool_output: { isError: true },
+      })[0]).toMatchObject({ type: "error_tool" });
+    });
+
+    it.each([
+      { name: "content array", response: { content: [{ type: "text", text: SENTINEL }] }, outcome: "succeeded" },
+      { name: "empty content array", response: { content: [] }, outcome: "succeeded" },
+      { name: "explicit isError false", response: { content: [], isError: false }, outcome: "succeeded" },
+      { name: "isError false without content", response: { isError: false }, outcome: "succeeded" },
+      { name: "isError true", response: { content: [], isError: true }, outcome: "failed" },
+      { name: "is_error true alias", response: { content: [], is_error: true }, outcome: "failed" },
+      { name: "is_error false alias", response: { is_error: false }, outcome: "succeeded" },
+      { name: "non-boolean isError", response: { content: [], isError: "false" }, outcome: "unknown" },
+      { name: "non-boolean is_error", response: { content: [], is_error: 0 }, outcome: "unknown" },
+      { name: "isError wins over is_error", response: { content: [], isError: false, is_error: true }, outcome: "succeeded" },
+      { name: "structuredContent only", response: { structuredContent: { a: SENTINEL } }, outcome: "unknown" },
+      { name: "_meta only", response: { _meta: { a: 1 } }, outcome: "unknown" },
+      { name: "non-array content", response: { content: "text" }, outcome: "unknown" },
+      { name: "string response", response: SENTINEL, outcome: "unknown" },
+      { name: "array response", response: [SENTINEL], outcome: "unknown" },
+      { name: "missing response", response: undefined, outcome: "unknown" },
+    ])("derives an MCP outcome from $name", ({ response, outcome }) => {
+      const normalized = normalize({
+        client: "codex",
+        tool_name: "mcp__server__tool",
+        tool_input: { query: SENTINEL },
+        tool_response: response,
+      });
+
+      expect(normalized).toEqual({
+        tool_name: "mcp__server__tool",
+        tool_input: {},
+        tool_output: { outcome },
+      });
+      expect(JSON.stringify(normalized)).not.toContain(SENTINEL);
+      expect(extractPostToolEvents(normalized)[0]).toMatchObject(
+        outcome === "succeeded"
+          ? { type: "mcp_call", data: "mcp__server__tool", priority: 3 }
+          : outcome === "failed"
+            ? { type: "error_tool", data: "mcp__server__tool error", priority: 1 }
+            : { type: "tool_outcome_unknown", data: "mcp__server__tool outcome unknown", priority: 3 },
+      );
+    });
+
+    it("prefers a status on tool_output over tool_response for MCP", () => {
+      expect(normalize({
+        client: "codex",
+        tool_name: "mcp__server__tool",
+        tool_input: {},
+        tool_output: { isError: true },
+        tool_response: { content: [] },
+      }).tool_output).toEqual({ outcome: "failed" });
+      expect(normalize({
+        client: "codex",
+        tool_name: "mcp__server__tool",
+        tool_input: {},
+        tool_output: { content: [] },
+        tool_response: { isError: true },
+      }).tool_output).toEqual({ outcome: "failed" });
+    });
+
+    it("leaves MCP tools of non-Codex clients unchanged", () => {
+      expect(extract({
+        client: "claude",
+        tool_name: "mcp__server__tool",
+        tool_input: { a: 1 },
+        tool_output: { isError: true },
+      })).toEqual([{ type: "mcp_call", category: "mcp", data: "mcp__server__tool", priority: 3 }]);
+    });
+  });
+});
+
+describe("native Codex activity through normalization", () => {
+  const sentinel = "native-activity-raw-secret";
+
+  it.each([
+    {
+      name: "apply_patch",
+      input: {
+        tool_name: "apply_patch",
+        tool_input: { command: "*** Begin Patch\n*** Add File: src/new.ts\n+" + sentinel + "\n*** End Patch" },
+        tool_response: "Success. Updated the following files:\nA src/new.ts",
+      },
+      expected: { type: "file_write", category: "file", data: "src/new.ts (source)", priority: 3 },
+    },
+    {
+      name: "collaborationspawn_agent",
+      input: {
+        tool_name: "collaborationspawn_agent",
+        tool_input: { message: sentinel },
+        tool_response: '{"task_name":"/root/worker"}',
+      },
+      expected: { type: "subagent_dispatch", category: "subagent", data: "/root/worker", priority: 3 },
+    },
+    {
+      name: "request_user_input",
+      input: {
+        tool_name: "request_user_input",
+        tool_input: { questions: [{ id: "scope", header: "Scope", question: "Which scope?", options: [] }] },
+        tool_response: '{"answers":{"scope":{"answers":["Narrow"]}}}',
+      },
+      expected: { type: "decision", category: "decision", data: "Q: Which scope?\nA: Narrow", priority: 1 },
+    },
+    {
+      name: "update_plan",
+      input: {
+        tool_name: "update_plan",
+        tool_input: { explanation: "Reordered", plan: [{ step: "Do it", status: "pending" }] },
+        tool_response: "Plan updated",
+      },
+      expected: { type: "plan_update", category: "proposal", data: "Plan: Reordered\nSteps: Do it", priority: 3 },
+    },
+  ])("passes native $name through unchanged and extracts its event", ({ input, expected }) => {
+    const normalized = normalize({ client: "codex", ...input });
+
+    expect(normalized).toEqual(input);
+    expect(extractPostToolEvents(normalized)).toEqual([expected]);
+    expect(JSON.stringify(extractPostToolEvents(normalized))).not.toContain(sentinel);
+  });
+
+  it("keeps a legacy isError projection so a failed native call yields the generic error", () => {
+    const normalized = normalize({
+      client: "codex",
+      tool_name: "update_plan",
+      tool_input: { explanation: "Reordered", plan: [] },
+      tool_output: { isError: true, stdout: sentinel },
+    });
+
+    expect(normalized.tool_output).toEqual({ isError: true });
+    expect(extractPostToolEvents(normalized)).toEqual([
+      { type: "error_tool", category: "error", data: "update_plan error", priority: 1 },
+    ]);
   });
 });

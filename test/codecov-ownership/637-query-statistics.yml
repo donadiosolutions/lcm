@@ -1,0 +1,15 @@
+references: ["#637"]
+rationale: >-
+  #637 adds bounded PostgreSQL query-statistics collection to diagnostics and
+  exports the exact repository SQL templates used by its starter catalog. The
+  collector, snapshot integration, renderer, and doctor check remain
+  diagnostics-owned; each repository retains its existing component owner.
+pins:
+  - ["src/storage/diagnostics.ts", "unit-diagnostics"]
+  - ["src/storage/diagnostic-renderer.ts", "unit-diagnostics"]
+  - ["src/storage/postgresql/query-operations.ts", "unit-diagnostics"]
+  - ["src/storage/postgresql/query-statistics.ts", "unit-diagnostics"]
+  - ["src/doctor/doctor.ts", "unit-diagnostics"]
+  - ["src/storage/postgresql/conversation-repository.ts", "integration-postgresql-conversations"]
+  - ["src/storage/postgresql/memory-repositories.ts", "integration-postgresql-memory"]
+  - ["src/storage/postgresql/summary-context-repositories.ts", "integration-postgresql-memory"]

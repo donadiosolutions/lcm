@@ -26,6 +26,7 @@ import {
   isBackendPublicationEvidenceMissing,
   isBackendPublicationJournalError,
 } from "./publication-fence.js";
+import { resolveHookSessionScope } from "./subagent-scope.js";
 
 type PromptSearchResponse = {
   hints: string[];
@@ -109,6 +110,7 @@ export async function handleUserPromptSubmit(
     // `input.transport` is untrusted hook stdin and is deliberately ignored.
     // Generated hook commands supply the selected transport through the
     // out-of-band argument above; legacy commands infer from client identity.
+    const scope = resolveHookSessionScope(input as Record<string, unknown>);
     const selectedTransport = resolvePromptTransport(input as Record<string, unknown>, transport);
     const cwd = resolveHookCwd(input.cwd);
     try {
@@ -126,8 +128,10 @@ export async function handleUserPromptSubmit(
     // settings mutation that was intended to occur after durable admission.
     let hookRepairAllowed = true;
 
-    // Sidecar event extraction — must happen before prompt-search, must never throw
-    try {
+    // Sidecar event extraction — must happen before prompt-search, must never throw.
+    // A Codex subagent's prompt is parent-authored delegation, not a user
+    // decision, so a child extracts and enqueues nothing.
+    if (!scope.isSubagent) try {
       const { extractUserPromptEvents } = await import("./extractors.js");
       const { ensureProjectDir } = await import("../daemon/project.js");
 
@@ -265,7 +269,7 @@ export async function handleUserPromptSubmit(
     const result = await effectiveClient.post<PromptSearchResponse>("/prompt-search", {
       query: input.prompt,
       cwd,
-      session_id: input.session_id,
+      session_id: scope.isSubagent ? scope.sessionId : input.session_id,
       learningInstructionBytes: Buffer.byteLength(memoryFeedbackInstruction(selectedTransport), "utf8"),
     });
 

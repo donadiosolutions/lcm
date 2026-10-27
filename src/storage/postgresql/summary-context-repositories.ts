@@ -61,6 +61,46 @@ const SUMMARY_SELECT = `s.summary_id, s.conversation_id, s.kind, s.depth,
 const LARGE_FILE_COLUMNS = `file_id, conversation_id, file_name, mime_type,
   byte_size, storage_uri, exploration_summary, created_at`;
 
+export const QUERY_GET_SUMMARY = `SELECT ${SUMMARY_SELECT}
+               FROM lcm.summaries AS s
+               WHERE s.project_id = $1
+                 AND s.summary_id_sha256 = public.digest($2, 'sha256')
+                 AND s.summary_id = $2
+               ORDER BY s.summary_key
+               LIMIT 2`;
+export const QUERY_GET_CONTEXT_ITEMS = `SELECT item.conversation_id, item.ordinal, item.item_type,
+                      item.message_id, summary.summary_id, item.created_at
+               FROM lcm.context_items AS item
+               LEFT JOIN lcm.summaries AS summary
+                 ON summary.project_id = item.project_id
+                 AND summary.conversation_id = item.conversation_id
+                 AND summary.summary_key = item.summary_key
+               WHERE item.project_id = $1
+                 AND item.conversation_id = $2
+               ORDER BY item.ordinal`;
+export const QUERY_GET_CONTEXT_TOKEN_COUNT = `SELECT COALESCE(SUM(tokens.token_count), 0) AS total
+               FROM (
+                 SELECT message.token_count
+                 FROM lcm.context_items AS item
+                 INNER JOIN lcm.messages AS message
+                   ON message.project_id = item.project_id
+                   AND message.conversation_id = item.conversation_id
+                   AND message.message_id = item.message_id
+                 WHERE item.project_id = $1
+                   AND item.conversation_id = $2
+                   AND item.item_type = 'message'
+                 UNION ALL
+                 SELECT summary.token_count
+                 FROM lcm.context_items AS item
+                 INNER JOIN lcm.summaries AS summary
+                   ON summary.project_id = item.project_id
+                   AND summary.conversation_id = item.conversation_id
+                   AND summary.summary_key = item.summary_key
+                 WHERE item.project_id = $1
+                   AND item.conversation_id = $2
+                   AND item.item_type = 'summary'
+               ) AS tokens`;
+
 export interface PostgreSqlSummaryContextFence {
   readonly machineId: string;
   readonly processId: string;
@@ -1349,13 +1389,7 @@ export class PostgreSqlSummaryRepository implements SummaryRepository {
     validateOpaqueText(summaryId, this.projectId, "summaries", operation, "summary_id");
     return this.core.read("summaries", operation, async (executor) => {
       const result = await executor.query<SummaryRow>({
-        text: `SELECT ${SUMMARY_SELECT}
-               FROM lcm.summaries AS s
-               WHERE s.project_id = $1
-                 AND s.summary_id_sha256 = public.digest($2, 'sha256')
-                 AND s.summary_id = $2
-               ORDER BY s.summary_key
-               LIMIT 2`,
+        text: QUERY_GET_SUMMARY,
         values: [this.projectId, summaryId],
       }, this.core.context("summaries", operation));
       if (result.rows.length > 1) {
@@ -2152,16 +2186,7 @@ export class PostgreSqlContextRepository implements ContextRepository {
     );
     return this.core.read("context", operation, async (executor) => {
       const result = await executor.query<ContextItemRow>({
-        text: `SELECT item.conversation_id, item.ordinal, item.item_type,
-                      item.message_id, summary.summary_id, item.created_at
-               FROM lcm.context_items AS item
-               LEFT JOIN lcm.summaries AS summary
-                 ON summary.project_id = item.project_id
-                 AND summary.conversation_id = item.conversation_id
-                 AND summary.summary_key = item.summary_key
-               WHERE item.project_id = $1
-                 AND item.conversation_id = $2
-               ORDER BY item.ordinal`,
+        text: QUERY_GET_CONTEXT_ITEMS,
         values: [this.projectId, conversationId],
       }, this.core.context("context", operation));
       return result.rows.map((row) =>
@@ -2607,28 +2632,7 @@ export class PostgreSqlContextRepository implements ContextRepository {
     );
     return this.core.read("context", operation, async (executor) => {
       const result = await executor.query<{ total: unknown }>({
-        text: `SELECT COALESCE(SUM(tokens.token_count), 0) AS total
-               FROM (
-                 SELECT message.token_count
-                 FROM lcm.context_items AS item
-                 INNER JOIN lcm.messages AS message
-                   ON message.project_id = item.project_id
-                   AND message.conversation_id = item.conversation_id
-                   AND message.message_id = item.message_id
-                 WHERE item.project_id = $1
-                   AND item.conversation_id = $2
-                   AND item.item_type = 'message'
-                 UNION ALL
-                 SELECT summary.token_count
-                 FROM lcm.context_items AS item
-                 INNER JOIN lcm.summaries AS summary
-                   ON summary.project_id = item.project_id
-                   AND summary.conversation_id = item.conversation_id
-                   AND summary.summary_key = item.summary_key
-                 WHERE item.project_id = $1
-                   AND item.conversation_id = $2
-                   AND item.item_type = 'summary'
-               ) AS tokens`,
+        text: QUERY_GET_CONTEXT_TOKEN_COUNT,
         values: [this.projectId, conversationId],
       }, this.core.context("context", operation));
       return safeInteger(

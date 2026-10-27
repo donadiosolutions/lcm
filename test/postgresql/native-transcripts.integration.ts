@@ -172,6 +172,8 @@ describe("PostgreSQL 18 native transcript repository", () => {
         message_select: boolean;
         message_content_select: boolean;
         message_token_count_select: boolean;
+        part_type_select: boolean;
+        part_text_select: boolean;
         transcript_select: boolean;
         transcript_insert: boolean;
         transcript_payload_insert: boolean;
@@ -218,6 +220,14 @@ describe("PostgreSQL 18 native transcript repository", () => {
                    'lcm_test_runtime', 'lcm.messages',
                    'token_count', 'SELECT'
                  ) AS message_token_count_select,
+                 has_column_privilege(
+                   'lcm_test_runtime', 'lcm.message_parts',
+                   'part_type', 'SELECT'
+                 ) AS part_type_select,
+                 has_column_privilege(
+                   'lcm_test_runtime', 'lcm.message_parts',
+                   'text_content', 'SELECT'
+                 ) AS part_text_select,
                  has_table_privilege(
                    'lcm_test_runtime', 'lcm.native_transcripts', 'SELECT'
                  ) AS transcript_select,
@@ -293,6 +303,8 @@ describe("PostgreSQL 18 native transcript repository", () => {
         message_select: false,
         message_content_select: true,
         message_token_count_select: false,
+        part_type_select: true,
+        part_text_select: false,
         transcript_select: true,
         transcript_insert: false,
         transcript_payload_insert: true,
@@ -751,6 +763,18 @@ describe("PostgreSQL 18 native transcript repository", () => {
       })).resolves.toHaveLength(2);
       await expect(repository.getById(unlinkedTranscriptId)).resolves
         .toMatchObject({ messageLinks: [] });
+      await expect(repository.listLinkedSourceOrdinals({
+        machineId: scope.machineId,
+        clientName: "codex",
+        sourceLocator: "aggregate/session.jsonl",
+        nativeSessionId: "aggregate-session",
+      })).resolves.toEqual([1]);
+      await expect(repository.listLinkedSourceOrdinals({
+        machineId: scope.machineId,
+        clientName: "codex",
+        sourceLocator: "aggregate/session.jsonl",
+        nativeSessionId: "other-session",
+      })).resolves.toEqual([]);
       await expect(repository.listByMessage({
         conversationId: scope.conversationId,
         messageId: scope.messageId,

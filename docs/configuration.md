@@ -181,11 +181,14 @@ guidance, plus native hooks where implemented. There is no fallback between
 MCP and CLI guidance. Removal is whole-bundle and clears the stored choice
 after the bundle is removed.
 
-For Codex, choose MCP explicitly with
-`lcm connectors install codex --transport mcp`. LCM uses the native `codex mcp`
-commands for that bundle; no TOML editing is required. Return to the
-default CLI bundle with `lcm connectors install codex --transport cli`. The
-explicit MCP bundle does not retain or install the CLI-only managed
+For Codex, choose MCP explicitly: first register the server with
+`codex mcp add lcm -- lcm mcp`, then run
+`lcm connectors install codex --transport mcp`. LCM verifies the existing
+registration but does not add or remove it automatically. To return to the
+default CLI bundle, first run `codex mcp remove lcm`, then
+`lcm connectors install codex --transport cli`; while the registration remains,
+convergence refuses (the removal direction is source-backed, not natively run).
+The explicit MCP bundle does not retain or install the CLI-only managed
 `~/.codex/AGENTS.md` entry.
 
 On Linux, the nested native `codex mcp` commands receive the current user's
@@ -439,6 +442,89 @@ Prompt-time recall now has a second budget layer after `/prompt-search` ranking.
 
 In practice, the hook asks the daemon for ranked candidates, the daemon dedupes and trims them against the final byte budget, and only the emitted hints get surfaced back to the hook. That means increasing `promptSearchMaxResults` without adjusting `maxInjectedMemoryBytes` just gives the reranker more candidates to choose from; it does not guarantee more emitted context.
 
+### Opt-in PreToolUse memory hints (Codex)
+
+Codex can surface one or two relevant memories just before it runs a shell
+command, an `apply_patch` edit, or an MCP tool call. The feature is off by
+default and applies only to Codex 0.163.0 and later; Claude Code is unaffected.
+
+Enable it, then reinstall the Codex hooks so the `PreToolUse` registration is
+written:
+
+```bash
+lcm config set hooks.preToolRecall true --json
+lcm connectors install codex
+```
+
+To turn it off, set the key to `false` and reinstall. The installer then
+removes the `PreToolUse` entry and leaves any hooks you added yourself. The hook
+also re-reads the key on every call, so `false` stops new hints immediately even
+before you reinstall. The install reads `hooks.preToolRecall` from the daemon
+configuration file (never from Codex's `config.toml`); if that file cannot be
+read, the install fails before it writes any Codex file.
+
+**What is sent.** The hook derives a short query from the *identity* of the
+pending call and sends it, with the working directory and session id, to the
+authenticated loopback daemon:
+
+- Shell commands: the executable name, a small set of subcommands (`git status`,
+  `pnpm run <script>`), and file path names for `cat`, `head`, `tail`, `less`,
+  `more`, and `wc`. Anything with quotes, redirections, expansions, subshells,
+  heredocs, background jobs, or other unsupported shell syntax is skipped
+  entirely. Flags and everything after them, environment assignments, and
+  interpreter or inline code are never used.
+- `apply_patch`: the file paths named in the `*** Add File`, `*** Update File`,
+  `*** Delete File`, and `*** Move to` header lines. Patch bodies are never used.
+- MCP tools: the server and tool names. Arguments are never used, and the `lcm`
+  MCP server itself is skipped.
+
+Generic words such as `src`, `test`, `run`, and `build` are dropped, and at least
+two distinct terms must remain. LCM adds no new storage of the query or of the
+injected text; the only new record is the existing surfacing log (memory ids and
+session id), which is shared with prompt recall. The injected context does
+enter Codex's own history, and Codex may spill oversized hook output (default
+2,500-token limit) to operating-system temporary `hook_outputs` files.
+
+**Behavior and limits.**
+
+- Hints are advisory. Codex records them and then runs the already-selected call
+  unchanged, so they inform later steps; they do not make the model reconsider
+  the pending call. The hook never blocks, approves, or rewrites a call.
+- Only the root thread receives hints; subagent calls are skipped.
+- The hook never starts the daemon. If the daemon is unavailable, slower than
+  1.5 seconds, or returns an unusable answer, the call proceeds with no hint.
+  Codex also bounds the hook at 5 seconds.
+- At most two memories are returned, within `maxInjectedMemoryBytes` in total
+  (the short `LCM memory related to the pending ...` line is reserved from that
+  budget).
+- Cooldown is shared with prompt recall. A memory shown by either path is not
+  shown again by the pre-tool path until `surfacingCooldownWindow` hours pass
+  (with `surfacingCooldownWindow: 0` there is no cooldown), and pre-tool never
+  re-shows a cooled-down memory even when it is the only match. A pre-tool hint
+  also counts as an unused surfacing for the usual
+  `unusedSurfacingPenalty`, which can lower that memory's later prompt-recall
+  score. Concurrent duplicate calls can surface the same memory twice, and
+  distinct hints accumulate in the conversation history.
+- Recency decay keeps a full two-term match just below 2, so a pre-tool request
+  also admits a result that matches every query term and scores above 0 but
+  below `promptSearchMinScore`, down to `promptSearchMinScore - 0.5` (1.5 with
+  the default of 2). The relief applies only when every query term matches: a
+  partial match, even one boosted by recorded use, still needs the configured
+  minimum. A stricter configured value is still honored (with 4, a full match
+  needs 3.5), and a result scoring 0 (for example a stale memory when
+  `allowStaleOnStrongMatch` is off) is never admitted by the relief. Prompt
+  recall is unchanged.
+
+### Snapshot throttle (Codex)
+
+`hooks.snapshotIntervalSec` (default `60`) sets the minimum interval between ordinary
+`Stop` snapshots of the same Codex session. A `Stop` inside the interval skips
+transcript ingestion. A later eligible `Stop` or `PreCompact` can attempt to ingest that
+session's remaining delta. `Interrupt` and `SessionEnd` instead make a best-effort
+terminal handoff to an already-running verified daemon. `SubagentStop` bypasses the
+throttle for the child's own transcript; it does not save a skipped parent
+snapshot. Recovery can fail or be skipped.
+
 ### Leaf chunk tokens
 
 `LCM_LEAF_CHUNK_TOKENS` (default `20000`) caps the amount of source material per leaf compaction pass.
@@ -569,9 +655,21 @@ configuration commands:
 
 ```bash
 export LCM_POSTGRES_URL='postgresql://USER:PASSWORD@HOST:25060/DATABASE'
+export LCM_POSTGRES_RUNTIME_URL='postgresql://RUNTIME_USER:RUNTIME_PASSWORD@HOST:25060/DATABASE'
 export LCM_POSTGRES_CA_FILE='/absolute/path/to/ca-certificate.crt'
 export LCM_POSTGRES_MIGRATION_ROLE='lcm_migration'
 ```
+
+`LCM_POSTGRES_RUNTIME_URL` is used only by `lcm migration activate`, including
+`activate --set` and `lcm migration resume` when it continues an interrupted activation. Set it
+after applying the runtime grant scripts and before activation so `S6` and
+`S15` prove the same restricted role the daemon will use. Activate validates
+it with the same URL rules as `LCM_POSTGRES_URL` and reuses the resolved CA
+and pool/time-out settings. `lcm migration verify`, `activate --dry-run`, the
+daemon, MCP, systemd, and launchd do not read it; it is never written to
+`config.json` or included in output. After activation, set the daemon's
+`LCM_POSTGRES_URL` to this same runtime-role URL and unset the activate-only
+variable when it is no longer needed.
 
 `migrationRole` is the expected owner of the database, the `lcm` schema, and
 all managed schema objects. It is an authorization identity, not a credential,
@@ -928,6 +1026,10 @@ grants fail native imports without falling back to SQLite; parsed messages
 committed before the native failure remain available for retry. See
 [PostgreSQL native transcripts](../src/storage/postgresql/reference/postgresql-native-transcripts.md) before
 running an explicit backfill.
+The conversation grants' table `SELECT` on `message_parts` already covers the
+column reads that native linkage needs, so a role that applied an earlier
+version of the transcript grant stays ready; re-applying the script is harmless
+and only adds the column-limited `message_parts` grants.
 The memory grant permits direct use of the selected promoted-memory, recall,
 redaction-administration, and session-coordination repositories. Deletes are
 limited to their six owned mutable-state tables; generated search data is
@@ -972,7 +1074,7 @@ failure if either cleanup fails. This explicit lifecycle is also the cleanup
 model used by daemon route operations and does not change SQLite's active
 default.
 
-Before opening project storage, restore
+Before opening project storage, set
 `LCM_POSTGRES_URL` to the restricted runtime-role URL, run `lcm machine
 register`, pair projects explicitly, and complete backend publication. Factory
 construction fails closed on unhealthy TLS/runtime state, ownership or schema
@@ -1128,7 +1230,14 @@ health response.
 Diagnostic commands `lcm doctor`, `lcm status`, and `lcm stats --pool` instead use
 internal `GET /health/observe`. It requires the daemon bearer token, including
 refusing tokenless embedded servers with `401`, and remains subject to the
-normal configuration, publication, and shutdown admission checks. Its HTTP 200
+normal configuration, publication, and shutdown admission checks, except that it
+still answers when the daemon's startup backend differs from the backend now
+selected on disk (for example after a migration cutover), so the stale daemon
+stays identifiable; the private-root, publication-evidence, and configuration
+witness checks still apply to the on-disk backend. A daemon that started on
+SQLite also answers when it lacks the PostgreSQL URL, CA file, or migration role
+of the newly selected backend, since it never needed them; any of those values
+that is present is still validated. Its HTTP 200
 JSON has `status: "ok"`, `observation: "identity-only"`, and
 `storage: { "status": "unverified" }`, with version, selected backend, uptime,
 PID, entrypoint, daemon generation, and the actual runtime digest when available.
@@ -1879,5 +1988,21 @@ overrides use environment variables set in the agent's config.
 
 ## Disabling LCM
 
-Set `LCM_ENABLED=false` to disable LCM while keeping its native hooks
-registered. Run `lcm uninstall` to remove the native Claude integration.
+Set `LCM_ENABLED=false` (exactly this lowercase value, with no trimming) in the
+environment of the agent process that runs the hooks. Every native LCM hook,
+for Claude and Codex, then exits `0` with no output and skips capture, the
+user-prompt outbox append, recall and restore context injection, compaction,
+daemon start, and hook auto-repair. The hooks stay registered.
+
+Stored data is untouched, and work that is already queued or in flight is not
+cancelled. A daemon that is already running keeps running, including its
+10-minute Claude transcript scan and passive replication, until it exits on its
+own after `daemon.idleTimeoutMs` (see [Daemon safety](#daemon-safety); `0`
+disables the idle timer). There is no daemon stop command.
+
+`lcm compact` (without `--hook`) is skipped as well, with exit code `0` and one
+line on stderr, because older installations may still invoke it as their
+PreCompact hook. Other CLI commands, MCP tools, and MCP startup are unaffected.
+
+Unset `LCM_ENABLED` or set it to any other value, including `0` or `False`,
+to re-enable LCM. Run `lcm uninstall` to remove the native Claude integration.

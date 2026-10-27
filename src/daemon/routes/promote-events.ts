@@ -29,6 +29,13 @@ import {
   withProjectStorage,
 } from "./storage-lifecycle.js";
 import { StorageOperationError } from "../../storage/errors.js";
+import { PrivateMutationLockContentionError } from "../../private-mutation-lock.js";
+
+/** Retryable answer while publication work (a hook, the sweep, another process) holds the lock. */
+export const PROMOTE_EVENTS_BUSY_BODY = Object.freeze({
+  status: "busy",
+  error: "backend publication work is in progress; retry the promotion",
+});
 
 const AUTO_TAGS: Record<string, string> = {
   decision: "type:preference",
@@ -47,6 +54,9 @@ const MISSING_CWD_CONFIRMATION_INTERVAL_MS = 5 * 60 * 1000;
 const MIN_REINFORCED_PATTERN_OCCURRENCES = 3;
 const MIN_REINFORCED_PATTERN_SESSIONS = 2;
 const AUTO_PROMOTABLE_PATTERN_CATEGORIES = new Set(["file", "mcp", "skill", "subagent"]);
+// Observations whose tool outcome is unavailable are stored but never promoted,
+// reinforced or correlated as the fix for an earlier error.
+const NON_PROMOTABLE_EVENT_TYPES = new Set(["tool_outcome_unknown"]);
 const EMPTY_REINFORCEMENT: PatternReinforcementStats = { totalCount: 0, distinctSessions: 0 };
 const sidecarPromotionLocks = new Map<string, Promise<void>>();
 
@@ -124,6 +134,7 @@ function correlateErrors(events: EventRow[]): void {
       for (let j = i + 1; j < sessionEvents.length && (sessionEvents[j].seq - event.seq) <= CORRELATION_WINDOW; j++) {
         const candidate = sessionEvents[j];
         if (candidate.category === "error") continue; // skip other errors
+        if (NON_PROMOTABLE_EVENT_TYPES.has(candidate.type)) continue;
         const candidatePrefix = candidate.data.split(/\s+/).slice(0, 3).join(" ").toLowerCase();
 
         // Match on command prefix overlap — guard against empty match token (data without colon)
@@ -390,6 +401,10 @@ export function createPromoteEventsHandler(
         });
         return;
       }
+      if (error instanceof PrivateMutationLockContentionError) {
+        sendJson(res, 503, PROMOTE_EVENTS_BUSY_BODY);
+        return;
+      }
       // Log detailed failure but avoid exposing internal error/stack info to the client
       await safeLogError("promote-events", error, { cwd });
       const storageFailure = storageRouteFailureResponse(
@@ -514,6 +529,7 @@ export function createPromoteAllEventsHandler(
           });
         } catch (error) {
           if (error instanceof BackendPublicationJournalError) throw error;
+          if (error instanceof PrivateMutationLockContentionError) throw error;
           if (storageRouteFailureResponse(config.storage.backend, error, "promote-events-all", activeFactory)) {
             throw error;
           }
@@ -541,6 +557,10 @@ export function createPromoteAllEventsHandler(
           status: "blocked",
           error: "backend publication admission blocked",
         });
+        return;
+      }
+      if (error instanceof PrivateMutationLockContentionError) {
+        sendJson(res, 503, PROMOTE_EVENTS_BUSY_BODY);
         return;
       }
       await safeLogError("promote-events", error, {});
@@ -988,7 +1008,7 @@ async function promoteEventsBatch(
               const candidateSourceProjectId = project.backend === "postgresql"
                 ? undefined
                 : project.projectId;
-              const existing = await project.lexicalSearch.searchPromoted(
+              const existing = NON_PROMOTABLE_EVENT_TYPES.has(event.type) ? [] : await project.lexicalSearch.searchPromoted(
                 scrubbedData,
                 1,
                 undefined,
@@ -1029,7 +1049,7 @@ async function promoteEventsBatch(
               return { promoted: priorReceipt.outcome === "applied" };
             }
             if (event.priority === 3 && !reinforced) {
-              const existing = await repositories.lexicalSearch.searchPromoted(
+              const existing = NON_PROMOTABLE_EVENT_TYPES.has(event.type) ? [] : await repositories.lexicalSearch.searchPromoted(
                 scrubbedData,
                 1,
                 undefined,

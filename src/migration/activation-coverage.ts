@@ -115,6 +115,91 @@ export type ActivationCoverageDependencies = Readonly<{
 const PROJECT_HASH_RE = /^[a-f0-9]{64}$/;
 const EVENTS_DATABASE_RE = /^([a-f0-9]{64})\.db$/;
 
+/** The reasons an enumeration of stored-data projects can refuse: the
+ * coverage reasons that attribute a read failure, never a verdict. */
+export type StoredDataProjectEnumerationReason = Exclude<
+  ActivationCoverageReason,
+  "complete-coverage" | "uncovered-project-directories"
+>;
+
+/** The full set of project hashes with stored data under one home, or an
+ * attributed refusal. Hashes are the union of hash-named directories under
+ * projects/ and <hash>.db files under events/, kept only when
+ * projects/<hash>/db.sqlite or events/<hash>.db exists; sorted. */
+export type StoredDataProjectEnumeration = Readonly<
+  | { status: "enumerated"; projectHashes: readonly string[] }
+  | { status: "unresolvable"; reason: StoredDataProjectEnumerationReason; detail: string }
+>;
+
+/**
+ * The one enumeration both checkActivationProjectCoverage and
+ * enumerateStoredDataProjectHashes perform (plan-v7.1 G8: "the full
+ * stored-data hash set from coverage's locked enumeration"). Every
+ * attribution branch and detail string is exactly what the coverage check
+ * reported before this was extracted; the coverage check's behaviour is
+ * unchanged.
+ */
+function enumerateStoredDataHashes(
+  root: string,
+  eventsRoot: string,
+  readProjectDirectoryEntries: (root: string) => readonly Dirent[],
+  readEventsDirectoryEntries: (root: string) => readonly Dirent[],
+): StoredDataProjectEnumeration {
+  const entriesOutcome = attributeNullableRead(() => readProjectDirectoryEntries(root));
+  if (entriesOutcome.kind === "unresolvable") {
+    return { status: "unresolvable", reason: "projects-directory-unresolvable", detail: entriesOutcome.detail };
+  }
+  // "absent" means the projects directory does not exist yet: no
+  // installation has stored any project under this home, so coverage is
+  // trivially complete (there is nothing to be uncovered).
+  const entries = entriesOutcome.kind === "absent" ? [] : entriesOutcome.value;
+
+  const eventsOutcome = attributeNullableRead(() => readEventsDirectoryEntries(eventsRoot));
+  if (eventsOutcome.kind === "unresolvable") {
+    return { status: "unresolvable", reason: "events-directory-unresolvable", detail: eventsOutcome.detail };
+  }
+  // "absent" means the events directory does not exist yet: no events-only
+  // project data can exist under this home.
+  const eventEntries = eventsOutcome.kind === "absent" ? [] : eventsOutcome.value;
+
+  const hashes = new Set<string>();
+  for (const entry of entries) {
+    if (entry.isDirectory() && PROJECT_HASH_RE.test(entry.name)) hashes.add(entry.name);
+  }
+  for (const entry of eventEntries) {
+    const match = EVENTS_DATABASE_RE.exec(entry.name);
+    if (match !== null) hashes.add(match[1]!);
+  }
+
+  const withData: string[] = [];
+  for (const hash of hashes) {
+    const statOutcome = attributeNullableRead(() => statSync(projectDatabasePath(root, hash)));
+    if (statOutcome.kind === "unresolvable") {
+      return {
+        status: "unresolvable",
+        reason: "project-directory-unresolvable",
+        detail: `cannot determine whether project directory ${hash} has stored data: ${statOutcome.detail}`,
+      };
+    }
+    // "absent" means this hash has no db.sqlite (an uninitialized,
+    // fully-drained or events-only project); its events database, if any,
+    // still counts as stored data.
+    if (statOutcome.kind === "absent") {
+      const eventsStat = attributeNullableRead(() => statSync(join(eventsRoot, hash + ".db")));
+      if (eventsStat.kind === "unresolvable") {
+        return {
+          status: "unresolvable",
+          reason: "events-file-unresolvable",
+          detail: `cannot determine whether project ${hash} has an events database: ${eventsStat.detail}`,
+        };
+      }
+      if (eventsStat.kind === "absent") continue;
+    }
+    withData.push(hash);
+  }
+  return { status: "enumerated", projectHashes: Object.freeze([...withData].sort()) };
+}
+
 function buildResult(
   status: ActivationCoverageStatus,
   reason: ActivationCoverageReason,
@@ -161,61 +246,14 @@ export function checkActivationProjectCoverage(
   return withProjectMapReconciliationLock((map) => {
     const root = projectsDir(input.homeDir);
     const eventsRoot = join(lcmHomeDir(input.homeDir), "events");
-    const entriesOutcome = attributeNullableRead(() => readProjectDirectoryEntries(root));
-    if (entriesOutcome.kind === "unresolvable") {
-      return buildResult("unresolvable", "projects-directory-unresolvable", entriesOutcome.detail, 0, []);
-    }
-    // "absent" means the projects directory does not exist yet: no
-    // installation has stored any project under this home, so coverage is
-    // trivially complete (there is nothing to be uncovered).
-    const entries = entriesOutcome.kind === "absent" ? [] : entriesOutcome.value;
-
-    const eventsOutcome = attributeNullableRead(() => readEventsDirectoryEntries(eventsRoot));
-    if (eventsOutcome.kind === "unresolvable") {
-      return buildResult("unresolvable", "events-directory-unresolvable", eventsOutcome.detail, 0, []);
-    }
-    // "absent" means the events directory does not exist yet: no events-only
-    // project data can exist under this home.
-    const eventEntries = eventsOutcome.kind === "absent" ? [] : eventsOutcome.value;
-
-    const hashes = new Set<string>();
-    for (const entry of entries) {
-      if (entry.isDirectory() && PROJECT_HASH_RE.test(entry.name)) hashes.add(entry.name);
-    }
-    for (const entry of eventEntries) {
-      const match = EVENTS_DATABASE_RE.exec(entry.name);
-      if (match !== null) hashes.add(match[1]!);
+    const enumeration = enumerateStoredDataHashes(root, eventsRoot, readProjectDirectoryEntries, readEventsDirectoryEntries);
+    if (enumeration.status === "unresolvable") {
+      return buildResult("unresolvable", enumeration.reason, enumeration.detail, 0, []);
     }
 
     const uncovered: UncoveredProjectDirectory[] = [];
     let coveredProjectCount = 0;
-    for (const hash of hashes) {
-      const statOutcome = attributeNullableRead(() => statSync(projectDatabasePath(root, hash)));
-      if (statOutcome.kind === "unresolvable") {
-        return buildResult(
-          "unresolvable",
-          "project-directory-unresolvable",
-          `cannot determine whether project directory ${hash} has stored data: ${statOutcome.detail}`,
-          0,
-          [],
-        );
-      }
-      // "absent" means this hash has no db.sqlite (an uninitialized,
-      // fully-drained or events-only project); its events database, if any,
-      // still counts as stored data.
-      if (statOutcome.kind === "absent") {
-        const eventsStat = attributeNullableRead(() => statSync(join(eventsRoot, hash + ".db")));
-        if (eventsStat.kind === "unresolvable") {
-          return buildResult(
-            "unresolvable",
-            "events-file-unresolvable",
-            `cannot determine whether project ${hash} has an events database: ${eventsStat.detail}`,
-            0,
-            [],
-          );
-        }
-        if (eventsStat.kind === "absent") continue;
-      }
+    for (const hash of enumeration.projectHashes) {
       if (Object.hasOwn(map, hash)) {
         coveredProjectCount += 1;
       } else {
@@ -244,4 +282,99 @@ export function checkActivationProjectCoverage(
       [],
     );
   }, input.homeDir, input.publicationLockToken);
+}
+
+/**
+ * The full stored-data project-hash set under one home (plan-v7.1 G8),
+ * from exactly the enumeration checkActivationProjectCoverage performs,
+ * under the same locked snapshot seam so the set cannot change under a
+ * concurrent map mutation while it is taken. Returns the sorted hashes or
+ * the same attributed refusal the coverage check would have reported. Pass
+ * the retained publication lock token to reuse it. Run it pre-selection
+ * only (G8 is a pre-selection refusal).
+ */
+export function enumerateStoredDataProjectHashes(
+  input: ActivationCoverageInput & Readonly<{
+    /** Enumerate without publishing a project-map metadata backfill (a preview must write nothing). */
+    suppressMetadataBackfill?: boolean;
+  }> = {},
+  dependencies: ActivationCoverageDependencies = {},
+): StoredDataProjectEnumeration {
+  const readProjectDirectoryEntries = dependencies.readProjectDirectoryEntries
+    ?? ((root: string): readonly Dirent[] => readdirSync(root, { withFileTypes: true }));
+  const readEventsDirectoryEntries = dependencies.readEventsDirectoryEntries
+    ?? ((root: string): readonly Dirent[] => readdirSync(root, { withFileTypes: true }));
+  return withProjectMapReconciliationLock(() => enumerateStoredDataHashes(
+    projectsDir(input.homeDir),
+    join(lcmHomeDir(input.homeDir), "events"),
+    readProjectDirectoryEntries,
+    readEventsDirectoryEntries,
+  ), input.homeDir, input.publicationLockToken, { suppressMetadataBackfill: input.suppressMetadataBackfill });
+}
+
+export type ActivationSingleProjectReason =
+  /** The stored-data set is exactly {localProjectId}. */
+  | "single-project"
+  /** Other projects under this home hold stored data; one publication
+   * would flip the whole home's backend for them too. */
+  | "other-projects-hold-data"
+  /** This generation's own project is not in the stored-data set. */
+  | "local-project-has-no-data";
+
+/** The G8 verdict (plan-v6 section 1 G8, plan-v7.1): pure, two-valued
+ * because its inputs are already an attributed enumeration; an
+ * unresolvable enumeration never reaches it. */
+export type ActivationSingleProjectVerdict = Readonly<{
+  status: "satisfied" | "unsatisfied";
+  reason: ActivationSingleProjectReason;
+  detail: string;
+  /** Every stored-data hash other than localProjectId, sorted. */
+  otherProjectHashes: readonly string[];
+}>;
+
+/**
+ * Evaluate G8 over an already-taken enumeration: refuse unless the
+ * stored-data set equals exactly {localProjectId}. Every other project with
+ * data -- whether or not it has its own verified generation -- refuses,
+ * because one publication flips the home-wide backend and
+ * multi-generation publication is not built. Pure: no I/O, no lock. A
+ * malformed localProjectId is a caller programming error and throws.
+ */
+export function evaluateActivationSingleProjectCoverage(
+  input: Readonly<{ storedDataProjectHashes: readonly string[]; localProjectId: string }>,
+): ActivationSingleProjectVerdict {
+  if (typeof input?.localProjectId !== "string" || !PROJECT_HASH_RE.test(input.localProjectId)) {
+    throw new Error("activation single-project coverage localProjectId is not a project hash");
+  }
+  if (!Array.isArray(input.storedDataProjectHashes)) {
+    throw new Error("activation single-project coverage storedDataProjectHashes is not an array");
+  }
+  const others = [...new Set(input.storedDataProjectHashes)]
+    .filter((hash) => hash !== input.localProjectId)
+    .sort();
+  const localPresent = input.storedDataProjectHashes.includes(input.localProjectId);
+  if (others.length > 0) {
+    return Object.freeze({
+      status: "unsatisfied",
+      reason: "other-projects-hold-data",
+      detail: `${others.length} other project${others.length === 1 ? "" : "s"} under this home hold stored data (${others.join(", ")})`
+        + (localPresent ? "" : `; this generation's project ${input.localProjectId} has none`)
+        + "; one publication would flip the backend for every project, so activation refuses",
+      otherProjectHashes: Object.freeze(others),
+    });
+  }
+  if (!localPresent) {
+    return Object.freeze({
+      status: "unsatisfied",
+      reason: "local-project-has-no-data",
+      detail: `this generation's project ${input.localProjectId} has no stored data under this home`,
+      otherProjectHashes: Object.freeze([]),
+    });
+  }
+  return Object.freeze({
+    status: "satisfied",
+    reason: "single-project",
+    detail: `the stored-data project set is exactly {${input.localProjectId}}`,
+    otherProjectHashes: Object.freeze([]),
+  });
 }

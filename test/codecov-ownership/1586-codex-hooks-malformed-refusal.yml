@@ -1,0 +1,7 @@
+references: ["#1586", "#1606"]
+rationale: >-
+  The install planner in codex-hooks.ts now refuses invalid JSON instead of
+  treating it as an empty hooks object. The file stays a connector concern and
+  keeps unit-connectors; no path is added, removed or moved.
+pins:
+  - ["src/connectors/codex-hooks.ts", "unit-connectors"]

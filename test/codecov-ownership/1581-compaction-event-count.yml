@@ -1,0 +1,26 @@
+references: ["#1581"]
+rationale: >-
+  Compaction event rows stop counting as transcript messages in /ingest and
+  /compact slicing and native linkage (#1567 is related and stays open). The
+  session-wide slice helper lives in the route owner, the event writer stays in
+  compaction, the slot marker contract and repository read stay in the shared
+  storage contracts, the SQLite store, and the PostgreSQL conversation
+  repository, and the event flag on the native snapshot stays with the
+  native-transcript repositories and resolver. The flag reads message-part
+  columns, so the optional transcript grant manifest in the PostgreSQL runtime
+  readiness module and the schema snapshot's sanctioned column ACLs in the
+  PostgreSQL migrations module gain those columns. Every file keeps its
+  current component; no path or topology changes.
+pins:
+  - ["src/compaction.ts", "unit-compaction-summarization"]
+  - ["src/daemon/routes/ingest.ts", "unit-daemon-routes"]
+  - ["src/daemon/routes/compact.ts", "unit-daemon-routes"]
+  - ["src/storage/contracts.ts", "unit-storage-abstractions"]
+  - ["src/storage/native-transcript-ingest.ts", "unit-transcripts-import"]
+  - ["src/storage/postgresql/conversation-repository.ts", "integration-postgresql-conversations"]
+  - ["src/storage/postgresql/native-transcript-repository.ts", "integration-postgresql-transcripts"]
+  - ["src/storage/postgresql/runtime-readiness.ts", "integration-postgresql-schema"]
+  - ["src/storage/postgresql/migrations.ts", "integration-postgresql-schema"]
+  - ["src/storage/sqlite/native-transcript-repository.ts", "unit-local-persistence"]
+  - ["src/storage/sqlite/repositories.ts", "unit-local-persistence"]
+  - ["src/store/conversation-store.ts", "unit-local-persistence"]

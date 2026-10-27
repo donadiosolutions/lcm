@@ -22,6 +22,7 @@ import { strict as assert } from "node:assert";
 import { basename, dirname, join } from "node:path";
 import { homedir } from "node:os";
 import type { ConnectorTransport } from "./types.js";
+import { addCodexHooksFeature, classifyCodexHooksFeature } from "./codex-config-toml.js";
 
 export const CODEX_HOOKS_PATH = "~/.codex/hooks.json";
 export const CODEX_CONFIG_PATH = "~/.codex/config.toml";
@@ -36,7 +37,7 @@ export interface CodexPostToolHookInspection {
   readonly structural: boolean;
 }
 
-type CodexCommandHook = {
+export type CodexCommandHook = {
   type?: string;
   command?: string;
   timeout?: number;
@@ -44,7 +45,7 @@ type CodexCommandHook = {
   [key: string]: unknown;
 };
 
-type CodexHookGroup = {
+export type CodexHookGroup = {
   matcher?: string;
   hooks?: CodexCommandHook[];
   [key: string]: unknown;
@@ -63,11 +64,23 @@ function lcmCommand(command: string, transport: ConnectorTransport = "cli"): str
   return `lcm ${command} --client codex${suffix}`;
 }
 
-function codexLcmHooks(transport: ConnectorTransport = "cli"): Record<string, CodexHookGroup[]> {
-  return {
+/** Optional Codex hook registrations; callers resolve the value, generators never read config. */
+export interface CodexLcmHookOptions {
+  /** Register the opt-in PreToolUse memory hint hook (default off). */
+  readonly preToolRecall?: boolean;
+}
+
+/** Tools whose pending call the opt-in PreToolUse hook can derive a memory query from. */
+const PRE_TOOL_RECALL_MATCHER = "^(Bash|apply_patch|mcp__.*)$";
+
+export function codexLcmHooks(
+  transport: ConnectorTransport = "cli",
+  options: CodexLcmHookOptions = {},
+): Record<string, CodexHookGroup[]> {
+  const hooks: Record<string, CodexHookGroup[]> = {
     SessionStart: [
       {
-        matcher: "startup|resume|clear",
+        matcher: "startup|resume|clear|compact|fork",
         hooks: [
           {
             type: "command",
@@ -128,11 +141,204 @@ function codexLcmHooks(transport: ConnectorTransport = "cli"): Record<string, Co
         ],
       },
     ],
+    SubagentStart: [
+      {
+        hooks: [
+          {
+            type: "command",
+            command: lcmCommand("restore"),
+            timeout: 30,
+            statusMessage: "Loading LCM memory for subagent",
+          },
+        ],
+      },
+    ],
+    SubagentStop: [
+      {
+        hooks: [
+          {
+            type: "command",
+            command: lcmCommand("session-snapshot"),
+            timeout: 30,
+            statusMessage: "Saving LCM subagent memory",
+          },
+        ],
+      },
+    ],
+    // Codex clamps Interrupt and SessionEnd command hooks to 1..3 seconds and
+    // kills the process group at the cap, so 3 is the most these can use.
+    Interrupt: [
+      {
+        hooks: [
+          {
+            type: "command",
+            command: `${lcmCommand("session-snapshot")} --terminal`,
+            timeout: 3,
+            statusMessage: "Saving LCM memory after interruption",
+          },
+        ],
+      },
+    ],
+    SessionEnd: [
+      {
+        hooks: [
+          {
+            type: "command",
+            command: `${lcmCommand("session-snapshot")} --terminal`,
+            timeout: 3,
+            statusMessage: "Saving LCM memory before session end",
+          },
+        ],
+      },
+    ],
   };
+  if (options.preToolRecall === true) {
+    hooks.PreToolUse = [
+      {
+        matcher: PRE_TOOL_RECALL_MATCHER,
+        hooks: [
+          {
+            type: "command",
+            command: lcmCommand("pre-tool"),
+            timeout: 5,
+            statusMessage: "Checking LCM memory for this action",
+          },
+        ],
+      },
+    ];
+  }
+  return hooks;
 }
 
 function isObject(value: unknown): value is Record<string, unknown> {
   return !!value && typeof value === "object" && !Array.isArray(value);
+}
+
+/** Structural path from the document root: object member names and array indices. */
+export type CodexHooksJsonPath = ReadonlyArray<string | number>;
+
+export interface CodexHooksJson {
+  /** What JSON.parse returns; a repeated member keeps its last value. */
+  readonly value: unknown;
+  /**
+   * One entry per repeated member name, compared after unescaping, with the path of the object that
+   * repeats it. Objects deeper than every typed object (more than TYPED_OBJECT_PATH_DEPTH segments)
+   * contribute only their first repeat in the document, so the list stays small on adversarial input.
+   */
+  readonly duplicates: ReadonlyArray<{ readonly path: CodexHooksJsonPath; readonly name: string }>;
+  /**
+   * True when the number written at path is not an unsigned integer token (a sign, fraction or exponent).
+   * Only the handler count fields are tracked, at ["hooks", <event>, <group index>, "hooks", <handler index>,
+   * "timeout" | "additionalContextLimit"]; every other path is false. A field written more than once is true
+   * when any of its occurrences is not an unsigned integer token.
+   */
+  readonly nonIntegerNumberAt: (path: CodexHooksJsonPath) => boolean;
+}
+
+const UNSIGNED_INTEGER_TOKEN = /^(?:0|[1-9][0-9]*)$/;
+const NUMBER_TOKEN_CHAR = /[0-9eE+\-.]/;
+/** hooks / event / group / hooks / handler / field: the only numbers the connector reads. */
+const HANDLER_FIELD_PATH_DEPTH = 6;
+const HANDLER_COUNT_FIELDS: ReadonlySet<string> = new Set(["timeout", "additionalContextLimit"]);
+/** root, hooks, group and handler objects: the deepest object path the connector checks. */
+const TYPED_OBJECT_PATH_DEPTH = 5;
+
+type Segment = string | number;
+type Frame = { readonly object: boolean; readonly names: Set<string>; key: string; index: number; expectKey: boolean };
+/** event -> group index -> handler index -> count fields written with a non-integer spelling. */
+type NonIntegerFields = Map<Segment, Map<Segment, Map<Segment, Set<Segment>>>>;
+
+function entryOf<Key, Value>(map: Map<Key, Value>, key: Key, create: () => Value): Value {
+  const found = map.get(key);
+  if (found !== undefined) return found;
+  const created = create();
+  map.set(key, created);
+  return created;
+}
+
+/**
+ * The handler count field a number is being read for, decided from the open frames alone:
+ * object (root) / object (hooks) / array (groups) / object (group) / array (handlers) / object (handler).
+ */
+function handlerCountField(stack: readonly Frame[]): string | undefined {
+  if (stack.length !== HANDLER_FIELD_PATH_DEPTH) return undefined;
+  const [root, hooks, groups, group, handlers, handler] = stack;
+  if (!root.object || !hooks.object || groups.object || !group.object || handlers.object || !handler.object) {
+    return undefined;
+  }
+  if (root.key !== "hooks" || group.key !== "hooks") return undefined;
+  return HANDLER_COUNT_FIELDS.has(handler.key) ? handler.key : undefined;
+}
+
+/**
+ * Read hooks.json text with JSON.parse for syntax and values, then walk the same text
+ * once, iteratively, for what JSON.parse discards: repeated member names and how each
+ * number was written. Undefined means the text is not valid JSON.
+ */
+export function parseCodexHooksJson(content: string): CodexHooksJson | undefined {
+  let value: unknown;
+  try {
+    value = JSON.parse(content);
+  } catch {
+    return undefined;
+  }
+  const segment = (frame: Frame): string | number => (frame.object ? frame.key : frame.index);
+  const stack: Frame[] = [];
+  const duplicates: Array<{ path: CodexHooksJsonPath; name: string }> = [];
+  let deepDuplicateSeen = false;
+  const nonInteger: NonIntegerFields = new Map();
+  let at = 0;
+  while (at < content.length) {
+    const char = content[at];
+    const top = stack[stack.length - 1];
+    if (char === "{" || char === "[") {
+      stack.push({ object: char === "{", names: new Set(), key: "", index: 0, expectKey: char === "{" });
+      at += 1;
+    } else if (char === "}" || char === "]") {
+      stack.pop();
+      at += 1;
+    } else if (char === ",") {
+      if (top.object) top.expectKey = true;
+      else top.index += 1;
+      at += 1;
+    } else if (char === '"') {
+      let end = at + 1;
+      while (content[end] !== '"') end += content[end] === "\\" ? 2 : 1;
+      if (top?.object && top.expectKey) {
+        const name = JSON.parse(content.slice(at, end + 1)) as string;
+        if (top.names.has(name) && (stack.length - 1 <= TYPED_OBJECT_PATH_DEPTH || !deepDuplicateSeen)) {
+          if (stack.length - 1 > TYPED_OBJECT_PATH_DEPTH) deepDuplicateSeen = true;
+          duplicates.push({ path: stack.slice(0, -1).map(segment), name });
+        }
+        top.names.add(name);
+        top.key = name;
+        top.expectKey = false;
+      }
+      at = end + 1;
+    } else if (char === "-" || (char >= "0" && char <= "9")) {
+      let end = at + 1;
+      while (end < content.length && NUMBER_TOKEN_CHAR.test(content[end])) end += 1;
+      const field = handlerCountField(stack);
+      if (field !== undefined && !UNSIGNED_INTEGER_TOKEN.test(content.slice(at, end))) {
+        const [, hooks, groups, , handlers] = stack;
+        const groupsOfEvent = entryOf(nonInteger, hooks.key, () => new Map());
+        const handlersOfGroup = entryOf(groupsOfEvent, groups.index, () => new Map());
+        entryOf(handlersOfGroup, handlers.index, () => new Set()).add(field);
+      }
+      at = end;
+    } else {
+      at += 1;
+    }
+  }
+  return {
+    value,
+    duplicates,
+    nonIntegerNumberAt: (path) => {
+      const [root, event, group, hooks, handler, field] = path;
+      if (path.length !== HANDLER_FIELD_PATH_DEPTH || root !== "hooks" || hooks !== "hooks") return false;
+      return nonInteger.get(event)?.get(group)?.get(handler)?.has(field) === true;
+    },
+  };
 }
 
 function normalizeHooksConfig(value: unknown): CodexHooksConfig {
@@ -143,12 +349,12 @@ function normalizeHooksConfig(value: unknown): CodexHooksConfig {
   return config as CodexHooksConfig;
 }
 
-function isLcmHookCommand(command: unknown): boolean {
+export function isLcmHookCommand(command: unknown): boolean {
   if (typeof command !== "string") return false;
   if (/\blcm\s+user-prompt\s+--client\s+codex(?:\s+--transport\s+(?:cli|mcp))?$/.test(command)) {
     return true;
   }
-  return /\blcm\s+(restore|post-tool|session-snapshot)\b/.test(command);
+  return /\blcm\s+(restore|post-tool|pre-tool|session-snapshot)\b/.test(command);
 }
 
 function stripLcmHooks(config: CodexHooksConfig): { config: CodexHooksConfig; removed: boolean } {
@@ -189,39 +395,174 @@ function hasNonHookKeys(config: CodexHooksConfig): boolean {
   return Object.keys(config).some((key) => key !== "hooks");
 }
 
-/** Pure content operation used by the anchored installer mutation seam. */
-export function mergeCodexHooksContent(content: string, transport: ConnectorTransport = "cli"): string {
-  const config = stripLcmHooks(readHooksConfigFromContent(content)).config;
-  const lcmHooks = codexLcmHooks(transport);
-  for (const [event, groups] of Object.entries(lcmHooks)) {
-    config.hooks[event] = [...(config.hooks[event] ?? []), ...groups];
+export interface CodexHooksMergePlan {
+  readonly content: string;
+  /** Set when updating would silently move other hooks' per-hook Codex state. */
+  readonly refusal?: string;
+}
+
+const LCM_HOOK_ROLE = /\blcm\s+(user-prompt|restore|post-tool|pre-tool|session-snapshot)\b/;
+
+/** The LCM subcommand a managed handler runs; with its event it identifies one hook role. */
+export function codexLcmHookRole(command: unknown): string | undefined {
+  return isLcmHookCommand(command) ? LCM_HOOK_ROLE.exec(command as string)![1] : undefined;
+}
+
+function refusal(event: string, detail: string): string {
+  return "LCM cannot update " + event + " (" + detail + ") without moving other hooks' Codex state; "
+    + "move/remove the LCM handler manually or run lcm connectors remove codex first";
+}
+
+type HooksRead = { readonly config: CodexHooksConfig; readonly refusal?: undefined }
+  | { readonly config?: undefined; readonly refusal: string };
+
+/**
+ * Read existing hooks.json text for rewriting. Only empty or JSON-whitespace text starts
+ * from nothing; invalid JSON, or any object that repeats a member name at any depth, is a
+ * refusal because rewriting would drop the user's other hooks or the shadowed member.
+ */
+function readHooksConfigFromContent(content: string): HooksRead {
+  if (/^[ \t\r\n]*$/.test(content)) return { config: normalizeHooksConfig(undefined) };
+  const parsed = parseCodexHooksJson(content);
+  const why = parsed === undefined ? "is not valid JSON"
+    : parsed.duplicates.length > 0 ? "repeats the key " + JSON.stringify(parsed.duplicates[0].name)
+    : undefined;
+  if (why !== undefined) {
+    return {
+      refusal: "LCM cannot update hooks.json: it " + why + ", so LCM left it unchanged; "
+        + "fix the file or move it aside, then rerun lcm connectors install codex",
+    };
   }
-  return JSON.stringify(config, null, 2) + "\n";
+  return { config: normalizeHooksConfig(parsed!.value) };
+}
+
+/**
+ * Merge LCM handlers in place. Codex keys per-hook enablement and trust by
+ * (event, group index, handler index), so every existing LCM handler keeps its
+ * coordinates; only a clean tail append or removal is allowed to change layout.
+ */
+export function planCodexHooksMerge(
+  content: string,
+  transport: ConnectorTransport = "cli",
+  expected: Record<string, CodexHookGroup[]> = codexLcmHooks(transport),
+): CodexHooksMergePlan {
+  const read = readHooksConfigFromContent(content);
+  if (read.refusal !== undefined) return { content, refusal: read.refusal };
+  const config = read.config;
+  const roleKey = (event: string, role: string): string => event + "\u0000" + role;
+  const expectedRoles = new Set<string>();
+  for (const [event, groups] of Object.entries(expected)) {
+    for (const group of groups) {
+      for (const hook of group.hooks!) expectedRoles.add(roleKey(event, codexLcmHookRole(hook.command)!));
+    }
+  }
+
+  type Located = { event: string; group: number; handler: number; key: string };
+  const located: Located[] = [];
+  for (const [event, groups] of Object.entries(config.hooks)) {
+    if (!Array.isArray(groups)) continue;
+    groups.forEach((group, groupIndex) => {
+      if (!isObject(group) || !Array.isArray(group.hooks)) return;
+      group.hooks.forEach((hook, handlerIndex) => {
+        const role = isObject(hook) ? codexLcmHookRole(hook.command) : undefined;
+        if (role !== undefined) located.push({ event, group: groupIndex, handler: handlerIndex, key: roleKey(event, role) });
+      });
+    });
+  }
+
+  const occurrences = new Map<string, Located[]>();
+  for (const entry of located) occurrences.set(entry.key, [...(occurrences.get(entry.key) ?? []), entry]);
+  for (const [key, entries] of occurrences) {
+    if (expectedRoles.has(key) && entries.length > 1) {
+      return { content, refusal: refusal(entries[0].event, "multiple LCM handlers share one role") };
+    }
+  }
+
+  const obsolete = located.filter((entry) => !expectedRoles.has(entry.key));
+  // An obsolete role may only be the very last handler of the event's last group,
+  // judged on the original coordinates: any later handler or group means refusal.
+  for (const entry of obsolete) {
+    const groups = config.hooks[entry.event];
+    const hooks = (groups[entry.group] as CodexHookGroup).hooks!;
+    if (entry.handler < hooks.length - 1 || entry.group < groups.length - 1) {
+      return { content, refusal: refusal(entry.event, "a later hook would change position") };
+    }
+  }
+
+  // Replace each existing role entirely, at its original coordinates.
+  const missing: Array<{ event: string; matcher?: string; hooks: CodexCommandHook[] }> = [];
+  for (const [event, wanted] of Object.entries(expected)) {
+    for (const wantedGroup of wanted) {
+      const absent: CodexCommandHook[] = [];
+      for (const hook of wantedGroup.hooks!) {
+        const existing = occurrences.get(roleKey(event, codexLcmHookRole(hook.command)!))?.[0];
+        if (existing === undefined) {
+          absent.push(hook);
+          continue;
+        }
+        const group = config.hooks[event][existing.group] as CodexHookGroup;
+        if (group.matcher !== wantedGroup.matcher) {
+          const onlyReplacedLcm = group.hooks!.every((peer) => {
+            const role = isObject(peer) ? codexLcmHookRole(peer.command) : undefined;
+            return role !== undefined && expectedRoles.has(roleKey(event, role));
+          });
+          if (!onlyReplacedLcm) return { content, refusal: refusal(event, "the group matcher must change") };
+          if (wantedGroup.matcher === undefined) delete group.matcher;
+          else group.matcher = wantedGroup.matcher;
+        }
+        group.hooks![existing.handler] = structuredClone(hook);
+      }
+      if (absent.length > 0) {
+        missing.push({ event, ...(wantedGroup.matcher === undefined ? {} : { matcher: wantedGroup.matcher }), hooks: absent });
+      }
+    }
+  }
+
+  for (const event of new Set(obsolete.map((entry) => entry.event))) {
+    // The check above guarantees one obsolete handler, last in the last group.
+    const groups = config.hooks[event];
+    const hooks = (groups[groups.length - 1] as CodexHookGroup).hooks!;
+    hooks.pop();
+    if (hooks.length === 0) groups.pop();
+    if (groups.length === 0) delete config.hooks[event];
+  }
+
+  for (const entry of missing) {
+    const groups = Array.isArray(config.hooks[entry.event]) ? config.hooks[entry.event] : [];
+    config.hooks[entry.event] = [...groups, structuredClone({ ...(entry.matcher === undefined ? {} : { matcher: entry.matcher }), hooks: entry.hooks })];
+  }
+  return { content: JSON.stringify(config, null, 2) + "\n" };
+}
+
+/** Pure content operation used by the anchored installer mutation seam. */
+export function mergeCodexHooksContent(
+  content: string,
+  transport: ConnectorTransport = "cli",
+  options: CodexLcmHookOptions = {},
+): string {
+  const plan = planCodexHooksMerge(content, transport, codexLcmHooks(transport, options));
+  if (plan.refusal !== undefined) throw new Error(plan.refusal);
+  return plan.content;
 }
 
 /** Pure content operation for removing LCM hooks. */
 export function removeCodexHooksContent(content: string): { state: "unchanged" | "rewrite" | "remove"; content: string } {
-  const { config, removed } = stripLcmHooks(readHooksConfigFromContent(content));
+  const read = readHooksConfigFromContent(content);
+  if (read.refusal !== undefined) return { state: "unchanged", content };
+  const { config, removed } = stripLcmHooks(read.config);
   if (!removed) return { state: "unchanged", content };
   if (!hasAnyHookGroups(config) && !hasNonHookKeys(config)) return { state: "remove", content: "" };
   return { state: "rewrite", content: JSON.stringify(config, null, 2) + "\n" };
 }
 
 export function hasCodexHooksContent(content: string): boolean {
-  const config = readHooksConfigFromContent(content);
-  return Object.values(config.hooks).some((groups) =>
+  const read = readHooksConfigFromContent(content);
+  if (read.refusal !== undefined) return false;
+  return Object.values(read.config.hooks).some((groups) =>
     Array.isArray(groups) && groups.some((group) =>
       Array.isArray(group.hooks) && group.hooks.some((hook) => isLcmHookCommand(hook.command)),
     ),
   );
-}
-
-function readHooksConfigFromContent(content: string): CodexHooksConfig {
-  try {
-    return normalizeHooksConfig(JSON.parse(content));
-  } catch {
-    return { hooks: {} };
-  }
 }
 
 export function enableCodexHooksFeature(configPath: string): void {
@@ -239,53 +580,52 @@ export function enableCodexHooksFeature(configPath: string): void {
   }
 }
 
+export const CODEX_TRUST_NOTICE = "Open Codex /hooks to review and trust the LCM hooks; they do not run until trusted.";
+
+export interface CodexHooksInstallPlan {
+  readonly hooksContent: string;
+  /** Undefined when config.toml must stay byte-identical. */
+  readonly configContent?: string;
+  readonly notices: readonly string[];
+  readonly refusal?: string;
+}
+
+/**
+ * Decide every install write before any file is touched. A refusal means
+ * neither hooks.json nor config.toml may be written.
+ */
+export function planCodexHooksInstall(
+  hooksContent: string,
+  configContent: string,
+  transport: ConnectorTransport = "cli",
+  options: CodexLcmHookOptions & { readonly expected?: Record<string, CodexHookGroup[]> } = {},
+): CodexHooksInstallPlan {
+  const merge = planCodexHooksMerge(
+    hooksContent,
+    transport,
+    options.expected ?? codexLcmHooks(transport, { preToolRecall: options.preToolRecall }),
+  );
+  if (merge.refusal !== undefined) return { hooksContent, notices: [], refusal: merge.refusal };
+  const feature = addCodexHooksFeature(configContent);
+  const state = classifyCodexHooksFeature(configContent);
+  const notices: string[] = [];
+  if (state === "explicit-false") {
+    notices.push("Codex hooks feature is disabled in config.toml; left unchanged; LCM hooks will not run until you enable it");
+  } else if (state === "unrecognized") {
+    notices.push("Could not interpret the Codex hooks feature setting in config.toml; left unchanged; confirm hooks are not disabled");
+  } else if (state === "absent" && !feature.added) {
+    notices.push("Could not safely add the Codex hooks feature to config.toml; left unchanged (Codex enables hooks by default)");
+  }
+  notices.push(CODEX_TRUST_NOTICE);
+  return {
+    hooksContent: merge.content,
+    ...(feature.added ? { configContent: feature.content } : {}),
+    notices,
+  };
+}
+
 export function setCodexHooksFeature(content: string): string {
-  const normalized = content.replace(/\r\n/g, "\n").trimEnd();
-  if (!normalized) {
-    return "[features]\nhooks = true\n";
-  }
-
-  const lines = normalized.split("\n");
-  const sectionHeader = /^\s*\[features\]\s*(?:#.*)?$/;
-  const anySectionHeader = /^\s*\[[^\]]+\]\s*(?:#.*)?$/;
-  const hooksFeatureLine = /^(\s*hooks\s*=\s*).*(\s*)$/;
-  const deprecatedFeatureLine = /^\s*codex_hooks\s*=.*$/;
-
-  const featuresStart = lines.findIndex((line) => sectionHeader.test(line));
-  if (featuresStart === -1) {
-    return `${normalized}\n\n[features]\nhooks = true\n`;
-  }
-
-  let insertAt = featuresStart + 1;
-  let featuresEnd = lines.length;
-  let hooksLine = -1;
-  for (let i = featuresStart + 1; i < lines.length; i++) {
-    if (anySectionHeader.test(lines[i])) {
-      featuresEnd = i;
-      break;
-    }
-    if (hooksFeatureLine.test(lines[i])) {
-      hooksLine = i;
-    }
-    insertAt = i + 1;
-  }
-
-  for (let i = featuresEnd - 1; i > featuresStart; i--) {
-    if (deprecatedFeatureLine.test(lines[i])) {
-      lines.splice(i, 1);
-      if (hooksLine > i) hooksLine -= 1;
-      featuresEnd -= 1;
-      insertAt = Math.min(insertAt, featuresEnd);
-    }
-  }
-
-  if (hooksLine !== -1) {
-    lines[hooksLine] = lines[hooksLine].replace(hooksFeatureLine, "$1true");
-    return `${lines.join("\n")}\n`;
-  }
-
-  lines.splice(Math.min(insertAt, featuresEnd), 0, "hooks = true");
-  return `${lines.join("\n")}\n`;
+  return addCodexHooksFeature(content).content;
 }
 
 export function installCodexHooks(
@@ -293,12 +633,25 @@ export function installCodexHooks(
   configPath: string,
   transport: ConnectorTransport = "cli",
 ): void {
-  // Legacy two-path helper; callers requiring Bug #713 guarantees use installConnector.
-  mkdirSync(dirname(hooksPath), { recursive: true });
-  enableCodexHooksFeature(configPath);
+  // Legacy two-path helper with no production callers (tests only); it never
+  // reads daemon config, so the opt-in PreToolUse hook is always off here.
+  // Callers requiring Bug #713 guarantees use installConnector.
+  let existingConfig = "";
+  try {
+    existingConfig = readFileSync(configPath, "utf-8");
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error;
+  }
   let existing = "";
   try { existing = readFileSync(hooksPath, "utf-8"); } catch { /* malformed/absent is treated as empty */ }
-  writeFileSync(hooksPath, mergeCodexHooksContent(existing, transport));
+  const plan = planCodexHooksInstall(existing, existingConfig, transport);
+  if (plan.refusal !== undefined) throw new Error(plan.refusal);
+  mkdirSync(dirname(hooksPath), { recursive: true });
+  if (plan.configContent !== undefined) {
+    mkdirSync(dirname(configPath), { recursive: true });
+    writeFileSync(configPath, plan.configContent);
+  }
+  writeFileSync(hooksPath, plan.hooksContent);
 }
 
 /** Internal captured state.  It is observational input, never authority. */

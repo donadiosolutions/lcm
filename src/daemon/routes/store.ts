@@ -117,12 +117,12 @@ export function createStoreHandler(
           expectedIdentity: storageIdentity,
         },
         // Make the same deduplication decision as import and promote. Content
-        // that already exists as an active memory in scope merges into it and
-        // returns that memory's id, with confidence raised to the maximum and
-        // tags unioned; only new content inserts. On PostgreSQL the helper also
-        // takes the project-scoped decision lock, so a manual store serializes
-        // with a concurrent import or promote into the same project instead of
-        // committing a second copy neither writer could see.
+        // that is exactly the same text as an active memory in scope merges
+        // into it and returns that memory's id, with confidence raised to the
+        // maximum and tags unioned; any other text inserts. On PostgreSQL the
+        // helper also takes the project-scoped decision lock, so a manual
+        // store serializes with a concurrent import or promote into the same
+        // project instead of committing a second copy neither writer could see.
         async (project) => deduplicateAndInsert({
           transaction: project.transaction.bind(project),
           content: scrubbedText,

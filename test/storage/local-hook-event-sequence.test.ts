@@ -95,6 +95,136 @@ describe("local hook event sequence", () => {
     expect(allocateLocalHookEventSequence(allocatorPath)).toBe(1n);
   });
 
+  describe("reconcileCheckpoint", () => {
+    it("advances the checkpoint to stay ahead of an already-used historical sequence, without minting or returning anything", () => {
+      const path = sequencePath();
+      const allocator = new LocalHookEventSequenceAllocator(path);
+      try {
+        allocator.reconcileCheckpoint(9n);
+        // Breakable independently: the checkpoint must be STRICTLY ahead
+        // of the reconciled value (9n was already used), so the next
+        // live allocation is 10n, not 9n.
+        expect(allocator.peekNextSequence()).toBe(10n);
+        expect(allocator.allocateSequence()).toBe(10n);
+      } finally {
+        allocator.close();
+      }
+    });
+
+    it("is a no-op when the stored checkpoint already exceeds the supplied value -- proven by an unchanged checkpoint after both a lower and an equal call", () => {
+      const path = sequencePath();
+      const allocator = new LocalHookEventSequenceAllocator(path);
+      try {
+        allocator.reconcileCheckpoint(9n);
+        expect(allocator.peekNextSequence()).toBe(10n);
+        allocator.reconcileCheckpoint(3n);
+        expect(allocator.peekNextSequence()).toBe(10n);
+        allocator.reconcileCheckpoint(9n);
+        expect(allocator.peekNextSequence()).toBe(10n);
+      } finally {
+        allocator.close();
+      }
+    });
+
+    it("never regresses the checkpoint below a value live allocation has already advanced past", () => {
+      const path = sequencePath();
+      const allocator = new LocalHookEventSequenceAllocator(path);
+      try {
+        allocator.allocateSequences(5);
+        expect(allocator.peekNextSequence()).toBe(5n);
+        allocator.reconcileCheckpoint(0n);
+        expect(allocator.peekNextSequence()).toBe(5n);
+      } finally {
+        allocator.close();
+      }
+    });
+
+    it("refuses on a closed allocator, the same as every other method", () => {
+      const path = sequencePath();
+      const allocator = new LocalHookEventSequenceAllocator(path);
+      allocator.close();
+      expect(() => allocator.reconcileCheckpoint(0n)).toThrow("allocator is closed");
+    });
+
+    it("refuses a value outside the PostgreSQL bigint range", () => {
+      const path = sequencePath();
+      const allocator = new LocalHookEventSequenceAllocator(path);
+      try {
+        expect(() => allocator.reconcileCheckpoint(-1n)).toThrow("outside the PostgreSQL bigint range");
+        expect(() => allocator.reconcileCheckpoint(MAX_POSTGRESQL_BIGINT + 1n)).toThrow("outside the PostgreSQL bigint range");
+      } finally {
+        allocator.close();
+      }
+    });
+
+    it("reconciles the maximum representable sequence without overflowing", () => {
+      const path = sequencePath();
+      const allocator = new LocalHookEventSequenceAllocator(path);
+      try {
+        allocator.reconcileCheckpoint(MAX_POSTGRESQL_BIGINT);
+        expect(allocator.peekNextSequence()).toBe(MAX_POSTGRESQL_BIGINT + 1n);
+      } finally {
+        allocator.close();
+      }
+    });
+
+    it("rolls back and preserves the prior checkpoint when the commit itself fails", () => {
+      const path = sequencePath();
+      const allocator = new LocalHookEventSequenceAllocator(path);
+      try {
+        allocator.allocateSequence();
+        expect(allocator.peekNextSequence()).toBe(1n);
+        const realExec = DatabaseSync.prototype.exec;
+        const execSpy = vi.spyOn(DatabaseSync.prototype, "exec");
+        execSpy.mockImplementation(function (this: DatabaseSync, sql: string) {
+          if (sql === "COMMIT") throw new Error("simulated commit failure");
+          return realExec.call(this, sql);
+        });
+        try {
+          expect(() => allocator.reconcileCheckpoint(50n)).toThrow();
+        } finally {
+          execSpy.mockRestore();
+        }
+        // The checkpoint is exactly what it was before the failed
+        // reconcile -- proving the ROLLBACK preserved it rather than
+        // partially applying the write.
+        expect(allocator.peekNextSequence()).toBe(1n);
+      } finally {
+        allocator.close();
+      }
+    });
+
+    it("still surfaces the original commit failure when the rollback itself also fails, rather than losing it to a swallowed error", () => {
+      const path = sequencePath();
+      const allocator = new LocalHookEventSequenceAllocator(path);
+      try {
+        allocator.allocateSequence();
+        const realExec = DatabaseSync.prototype.exec;
+        const execSpy = vi.spyOn(DatabaseSync.prototype, "exec");
+        execSpy.mockImplementation(function (this: DatabaseSync, sql: string) {
+          if (sql === "COMMIT") throw new Error("simulated commit failure");
+          if (sql === "ROLLBACK") throw new Error("simulated rollback failure too");
+          return realExec.call(this, sql);
+        });
+        try {
+          expect(() => allocator.reconcileCheckpoint(50n)).toThrow("simulated commit failure");
+        } finally {
+          execSpy.mockRestore();
+        }
+        // Not asserting the checkpoint value here: when BOTH commit and
+        // rollback fail, the underlying SQLite transaction is left
+        // genuinely open (neither committed nor rolled back), which is
+        // an inherent double-fault state rather than something this
+        // method can restore to a clean "preserved" value. What matters,
+        // and what the assertion above proves, is that the ORIGINAL
+        // commit failure is what a caller sees, not the secondary
+        // rollback failure masking it.
+      } finally {
+        allocator.close();
+      }
+    });
+  });
+
   it("releases its connection when checkpoint initialization fails", () => {
     const path = sequencePath();
     const originalExec = DatabaseSync.prototype.exec;

@@ -1,0 +1,45 @@
+references: ["#626"]
+rationale: >-
+  Adds reversible rollback into a new SQLite generation as five modules
+  under src/migration/ (eligibility, generation build, install, sidecar
+  materialization and the orchestration that sequences them). They are
+  cutover lifecycle work, so they stay in the directory-level migration
+  cutover owner alongside the forward path they reverse; no topology change.
+  src/migration/activation-evidence-store.ts persists the activation epoch,
+  attempt and witness records those modules read back, in the same owner.
+  src/migration/rollback-session.ts (the production fenced PostgreSQL session)
+  and src/migration/rollback-inputs.ts (input derivation from durable state)
+  complete the same lifecycle and stay in that owner.
+  src/migration/generation-binding-store.ts (binding resolver and shared
+  scoped-store primitives) and src/migration/verify-generation.ts (exported
+  census and delta builders) are materially changed and keep their existing
+  migration cutover owner. src/storage/local-hook-event-sequence.ts is
+  materially changed but keeps its established local event storage owner.
+  src/migration/maintenance.ts (replay admission routed from durable
+  authority) is materially changed and keeps its migration cutover owner.
+  rollback-inputs.ts now also holds the production entry (the closed
+  MigrationRollbackError and the coordinator wiring), and rollback.ts the
+  coordinator step and the resume table; both are materially changed and
+  stay in the same owner. No file is added, removed, moved or re-owned.
+  src/migration/index.ts (the rollback export surface) and
+  src/storage/postgresql/factory.ts (an export made visible to the rollback
+  session) are also materially changed and keep their existing owners.
+  src/storage/backend-publication.ts (the maintenance journal's source
+  backend, which an aborted window leaves selected) is materially changed
+  and keeps its storage abstractions owner.
+pins:
+  - ["src/migration/activation-evidence-store.ts", "unit-migration-cutover"]
+  - ["src/migration/generation-binding-store.ts", "unit-migration-cutover"]
+  - ["src/migration/index.ts", "unit-migration-cutover"]
+  - ["src/migration/maintenance.ts", "unit-migration-cutover"]
+  - ["src/migration/rollback-eligibility.ts", "unit-migration-cutover"]
+  - ["src/migration/rollback-generation.ts", "unit-migration-cutover"]
+  - ["src/migration/rollback-inputs.ts", "unit-migration-cutover"]
+  - ["src/migration/rollback-install.ts", "unit-migration-cutover"]
+  - ["src/migration/rollback-session.ts", "unit-migration-cutover"]
+  - ["src/migration/rollback-sidecars.ts", "unit-migration-cutover"]
+  - ["src/migration/rollback.ts", "unit-migration-cutover"]
+  - ["src/migration/verify-generation.ts", "unit-migration-cutover"]
+  - ["src/storage/postgresql/factory.ts", "integration-postgresql-runtime"]
+  - ["src/storage/local-hook-event-sequence.ts", "unit-local-event-storage"]
+  - ["src/storage/backend-publication.ts", "unit-storage-abstractions"]

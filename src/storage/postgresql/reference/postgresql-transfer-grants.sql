@@ -29,7 +29,8 @@ ON TABLE lcm.transfer_runs TO :"lcm_runtime_role";
 GRANT INSERT (
   bootstrapped_at,
   created_at,
-  updated_at
+  updated_at,
+  parent_session_id
 )
 ON TABLE lcm.conversations TO :"lcm_runtime_role";
 

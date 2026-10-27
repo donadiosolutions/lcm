@@ -114,16 +114,10 @@ vi.mock("../../../src/storage/index.js", () => ({
       const repositories = {
         conversations: {
           getOrCreateConversation: mocks.getConversation,
-          getMessageCount: mocks.getCount,
-          createMessagesBulk: mocks.createBulk,
+          getTranscriptSlotSnapshot: async () => ({ transcriptCount: await mocks.getCount(), events: [] }),
+          appendMessages: (_conversationId: number, inputs: unknown[]) => mocks.createBulk(inputs),
         },
         context: { appendContextMessages: mocks.append, getContextTokenCount: mocks.tokens },
-        coordination: {
-          getSessionIngest: async (sessionId: string) => {
-            const row = mocks.sessionGet(sessionId);
-            return row ? { sessionId, messageCount: row.message_count, completedAt: "now" } : null;
-          },
-        },
         redactionAdmin: { upsertCounts: vi.fn(async () => undefined) },
       };
       return {
@@ -605,18 +599,17 @@ describe("ingest persistence boundaries", () => {
     expect(mocks.normalize.mock.calls.map((call) => call[0])).toEqual(["codex", "codex", undefined]);
   });
 
-  it("skips completed sessions and rolls back when coordination lookup fails", async () => {
+  it("slices by the stored transcript count and ignores a recorded completion", async () => {
     const handler = createIngestHandler(config);
-    mocks.sessionGet.mockReturnValueOnce({ message_count: 1 });
+    mocks.sessionGet.mockReturnValue({ message_count: 99 });
+    mocks.getCount.mockResolvedValue(1);
     await handler({} as never, response, JSON.stringify({ session_id: "complete", cwd: "/ok", messages: [validMessage] }));
     expect(mocks.send).toHaveBeenLastCalledWith(response, 200, { ingested: 0, totalTokens: 0 });
-    const failure = new Error("coordination failed");
-    mocks.sessionGet.mockImplementationOnce(() => { throw failure; });
-    await handler({} as never, response, JSON.stringify({ session_id: "failed", cwd: "/ok", messages: [validMessage] }));
-    expect(mocks.send).toHaveBeenLastCalledWith(response, 500, { error: "ingest failed", code: "INGEST_FAILED" });
-    expect(mocks.getConversation).not.toHaveBeenCalled();
     expect(mocks.createBulk).not.toHaveBeenCalled();
-    expect(mocks.logError).toHaveBeenLastCalledWith("ingest", failure, { cwd: "/ok", sessionId: "failed" });
+    mocks.getCount.mockResolvedValue(0);
+    await handler({} as never, response, JSON.stringify({ session_id: "complete", cwd: "/ok", messages: [validMessage] }));
+    expect(mocks.send).toHaveBeenLastCalledWith(response, 200, { ingested: 1, totalTokens: 7 });
+    expect(mocks.sessionGet).not.toHaveBeenCalled();
   });
 
   it("reports every redaction category and tolerates metadata write failures", async () => {
@@ -921,7 +914,7 @@ describe("ingest persistence boundaries", () => {
     });
     expect(metadata).toEqual({ cwd: "/ok" });
 
-    mocks.sessionGet.mockReturnValue({ message_count: 1 });
+    mocks.getCount.mockResolvedValue(1);
     await handler({} as never, response, JSON.stringify({
       session_id: "postgresql-publication-retry",
       cwd: "/ok",

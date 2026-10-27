@@ -39,6 +39,8 @@ import {
   type PostgreSqlFactoryDependencies,
 } from "../../src/storage/postgresql/factory.js";
 import { createPostgreSqlStorageBackendFactory } from "../../src/storage/postgresql.js";
+import { PostgreSqlDiagnosticPoolError } from "../../src/storage/postgresql/errors.js";
+import { PostgreSqlRuntime } from "../../src/storage/postgresql/runtime.js";
 import { PrivateMutationLockContentionError } from "../../src/private-mutation-lock.js";
 import type {
   PostgreSqlQueryOptions,
@@ -260,6 +262,23 @@ describe("PostgreSQL storage backend factory", () => {
     const pool = { configuredMax: 5, total: 2, idle: 1, waiting: 0, failed: false };
     Object.assign(runtime, { poolDiagnostics: () => pool });
     expect(factory.getDiagnosticPool()).toEqual(pool);
+    await factory.close();
+  });
+
+  it("propagates the real runtime's closed pool rejection without the counter", async () => {
+    const { runtime, dependencies } = harness();
+    const factory = await createPostgreSqlStorageBackendFactoryWithHome(config, "/home/operator", dependencies);
+    const pgPool = { totalCount: -7919, idleCount: 0, waitingCount: 0, on: () => undefined, end: async () => undefined };
+    const real = new PostgreSqlRuntime(config.postgresql, {
+      createPool: () => pgPool as never, createClient: () => ({}) as never, buildConfig: () => ({}),
+    });
+    Object.assign(runtime, { poolDiagnostics: real.poolDiagnostics.bind(real) });
+    const rejection = (() => { try { return factory.getDiagnosticPool(); } catch (error) { return error; } })();
+    expect(rejection).toBeInstanceOf(PostgreSqlDiagnosticPoolError);
+    expect(rejection).toMatchObject({ reason: "out-of-range" });
+    expect(JSON.stringify(rejection)).not.toContain("7919");
+    pgPool.totalCount = 2;
+    expect(factory.getDiagnosticPool()).toEqual({ configuredMax: 5, total: 2, idle: 0, waiting: 0, failed: false });
     await factory.close();
   });
 

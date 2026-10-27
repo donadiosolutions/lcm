@@ -37,7 +37,7 @@ function deferred<T>(): Deferred<T> {
   return { promise, resolve };
 }
 
-const EXPECTED_BUILT_IN_ROUTE_ADMISSIONS: readonly [string, RouteAdmission, "retained" | "operation-scoped"][] = [
+const EXPECTED_BUILT_IN_ROUTE_ADMISSIONS: readonly [string, RouteAdmission, "retained" | "operation-scoped" | "enqueue-only"][] = [
   ["GET /health", "read", "retained"],
   ["GET /health/observe", "read", "retained"],
   ["POST /compact", "mutating", "operation-scoped"],
@@ -59,6 +59,7 @@ const EXPECTED_BUILT_IN_ROUTE_ADMISSIONS: readonly [string, RouteAdmission, "ret
   ["GET /stats/pool", "read", "retained"],
   ["POST /review-stale", "mutating", "operation-scoped"],
   ["POST /invocation-control", "read", "retained"],
+  ["POST /ingest/terminal", "mutating", "enqueue-only"],
   ["POST /status", "read", "retained"],
 ];
 
@@ -74,7 +75,7 @@ describe("daemon route publication admission", () => {
     mkdirSync(join(tempHome, "project"), { recursive: true, mode: 0o700 });
     const configPath = join(lcmDir, "config.json");
     writeFileSync(configPath, "{}\n", { mode: 0o600 });
-    const registrations: Array<[string, RouteAdmission, "retained" | "operation-scoped"]> = [];
+    const registrations: Array<[string, RouteAdmission, "retained" | "operation-scoped" | "enqueue-only"]> = [];
     let daemon: DaemonInstance | undefined;
 
     try {
@@ -92,6 +93,16 @@ describe("daemon route publication admission", () => {
         .map(([key]) => key);
       for (const routeKey of mutatingRouteKeys) {
         const [method, path] = routeKey.split(" ");
+        if (routeKey === "POST /ingest/terminal") {
+          // Enqueue-only and authenticated: a daemon without a token refuses it.
+          const refused = await fetch(`http://127.0.0.1:${daemon.address().port}${path}`, {
+            method,
+            headers: { "Content-Type": "application/json" },
+            body: "{}",
+          });
+          expect(refused.status).toBe(401);
+          continue;
+        }
         const handlerStarted = deferred<void>();
         const releaseHandler = deferred<void>();
         daemon.registerRoute(method, path, async (_req, res) => {
@@ -1384,7 +1395,8 @@ describe("diagnostic route publication refusal", () => {
       expect(Object.keys(value)).toEqual(["backendDiagnostics"]);
       expect(value).toMatchObject({ backendDiagnostics: { backend: "sqlite", classification: "unavailable", publication: "unavailable", schema: "unverified", outbox: { status: "unverified" } } });
       expect(value).not.toHaveProperty("backendDiagnostics.metrics");
-      expect(JSON.stringify(value)).not.toMatch(/private-canary|transcript|messages|123|journal\.json/);
+      // \b keeps the fixture value 123 from matching digits inside telemetry timestamps.
+      expect(JSON.stringify(value)).not.toMatch(/private-canary|transcript|messages|\b123\b|journal\.json/);
       expect(handler).not.toHaveBeenCalled();
     } finally {
       await daemon?.stop();
@@ -1418,7 +1430,7 @@ describe("diagnostic route publication refusal", () => {
       expect(Object.keys(value)).toEqual(["backendDiagnostics"]);
       expect(value).toMatchObject({ backendDiagnostics: { backend: "sqlite", classification: "stale-publication", publication: "unavailable" } });
       expect(value).not.toHaveProperty("backendDiagnostics.metrics");
-      expect(JSON.stringify(value)).not.toMatch(/private-canary|transcript|messages|123/);
+      expect(JSON.stringify(value)).not.toMatch(/private-canary|transcript|messages|\b123\b/);
       expect(handler).toHaveBeenCalledOnce();
     } finally {
       await daemon?.stop();

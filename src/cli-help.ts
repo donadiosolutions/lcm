@@ -153,6 +153,37 @@ const HELP: Record<string, CommandHelp> = {
     notes: "Configure storage.backend=postgresql and set the non-secret expected owner through storage.postgresql.migrationRole or its LCM_POSTGRES_MIGRATION_ROLE fallback. Supply migration-owner credentials through LCM_POSTGRES_URL and the verified CA path through LCM_POSTGRES_CA_FILE. The command validates PostgreSQL 18, extensions, ownership, migration checksums, and schema fingerprints. It does not install extensions or grant runtime privileges.",
   },
 
+  migration: {
+    summary: "Reversible SQLite-to-PostgreSQL cutover: plan, dry-run, apply, resume, verify, report, abort, activate, rollback.",
+    usage: "lcm migration <plan|dry-run|apply|resume|verify|report|abort|activate|rollback> [--json]",
+    options: [
+      ["plan [--json]", "Preview the next migration generation without mutating anything"],
+      ["dry-run [--json]", "Check the SQLite migration source alone (no PostgreSQL, no journal)"],
+      ["apply --confirm-generation <id> [--dry-run] [--max-records <n>] [--max-bytes <n>] [--json]", "Capture, mint the manifest, and copy to the confirmed generation"],
+      ["resume [--generation <id>] --confirm-generation <id> [--dry-run] [--max-records <n>] [--max-bytes <n>] [--json]", "Run the next step of a held generation (dry-run effect, copy, or a carried effect); --dry-run only names the step"],
+      ["verify [--generation <id>] --confirm-generation <id> [--dry-run] [--lease-ttl-ms <n>] [--json]", "Verify a copied generation against PostgreSQL, finish a pending verification from persisted evidence, or confirm a verified one; --dry-run computes without recording"],
+      ["report [--generation <id>] [--json]", "Read-only account of one generation: its state, its owner, the next command, and the daemon restart check"],
+      ["abort [--generation <id>] --confirm-generation <id> [--dry-run] [--json]", "Complete whichever recovery write (journal or manifest) is missing; repeating it only confirms"],
+      ["activate [--generation <id>] --confirm-generation <id> --confirm-backend postgresql [--dry-run] [--json]", "Switch a verified generation to PostgreSQL after runtime grants are applied; afterwards revoke the transfer grants, then start the daemon; --dry-run never exits 0"],
+      ["rollback [--generation <id>] --confirm-generation <id> --confirm-backend sqlite [--dry-run] [--json]", "Return an activated generation to SQLite; run it with LCM_POSTGRES_URL set to the runtime role (migrationRole stays the schema owner); refuses while any other project is remotely bound; --dry-run never exits 0"],
+      ["<command> --set", "Run any of the nine commands on every project of this home as one cutover set. --generation and --confirm-generation take the aggregate set id (the original one, also for rollback), never a member generation id. verify --set confirms persisted evidence, and its --dry-run, activate --set --dry-run and rollback --set --dry-run never exit 0"],
+    ],
+    examples: [
+      ["lcm migration plan", "Print the candidate generation id to confirm with apply"],
+      ["lcm migration apply --confirm-generation <id>", "Apply exactly the generation plan printed"],
+      ["lcm migration apply --confirm-generation <id> --dry-run", "Stop after the confirmation fence; mutate nothing"],
+      ["lcm migration report", "See where the held generation is and which command to run next"],
+      ["lcm migration resume --confirm-generation <id>", "Run the one step report named for a held generation"],
+      ["lcm migration abort --confirm-generation <id>", "Abort the held or entering migration whose generation id you pass"],
+      ["lcm migration activate --confirm-generation <id> --confirm-backend postgresql", "Switch the verified generation to PostgreSQL, then revoke the transfer grants before starting the daemon"],
+      ["lcm migration rollback --confirm-generation <id> --confirm-backend sqlite", "Return the activated generation to SQLite"],
+      ["lcm migration plan --set", "Print the set id to confirm when the home holds more than one project"],
+      ["lcm migration activate --set --generation <set-id> --confirm-generation <set-id> --confirm-backend postgresql", "Prove the runtime role and switch every project through one publication, then revoke the transfer grants before starting the daemon"],
+      ["lcm migration report --set --generation <set-id>", "Aggregate status of the set: state, members, owner and the next command"],
+    ],
+    notes: "This project must not be linked to a PostgreSQL project through `lcm project create` or `lcm project link` before you migrate: migration resolves or creates the destination identity itself, and a linked project makes apply refuse multi-machine-installation. apply refuses unless --confirm-generation exactly matches the candidate a fresh plan resolves at the moment apply runs; a stale or missing token refuses rather than proceeding. Never a silent fallback: an unresolvable or unverified target, an unresolvable daemon presence, or a state that does not admit the operation all refuse with a distinct, closed reason. A home with several projects moves only through --set (see docs/migration-cutover-set.md); without --set the commands keep their single-project behavior and refuse a home that holds other projects' data. See docs/migration-operations.md for the full exit-class table, every refusal's remedy, and the fencing residue.",
+  },
+
   search: {
     summary: "Search memory across episodic and promoted layers for the current project.",
     usage: "lcm search <query> [--limit N] [--layer episodic|promoted] [--tag <tag>]",
@@ -474,13 +505,22 @@ const HELP: Record<string, CommandHelp> = {
     notes: "Invoked automatically by Claude Code and Codex PostToolUse hooks. Not intended for direct use.",
   },
 
+  "pre-tool": {
+    summary: "Dispatch the opt-in pre-tool hook — surfaces memory hints before a tool call.",
+    usage: "lcm pre-tool",
+    examples: [
+      ["lcm pre-tool", "Surface memory hints for a pending tool call (called by the Codex PreToolUse hook)"],
+    ],
+    notes: "Invoked automatically by the Codex PreToolUse hook, which is installed only when hooks.preToolRecall is true. Not intended for direct use.",
+  },
+
   "session-snapshot": {
     summary: "Dispatch the rolling session snapshot hook.",
     usage: "lcm session-snapshot",
     examples: [
       ["lcm session-snapshot", "Ingest transcript deltas (called by Stop and PreCompact hooks)"],
     ],
-    notes: "Used by Codex Stop hooks for rolling writeback and Codex PreCompact hooks for forced pre-compaction snapshots. Also used by Claude Code Stop hooks for best-effort snapshots. Not intended for direct use.",
+    notes: "Used by Codex Stop hooks for rolling writeback and Codex PreCompact hooks for forced pre-compaction snapshots. Codex Interrupt and SessionEnd hooks run it with a three second budget: it hands the transcript to the already-running daemon and never starts or repairs one. Also used by Claude Code Stop hooks for best-effort snapshots. Not intended for direct use.",
   },
 };
 
@@ -503,6 +543,7 @@ const GROUPS = [
       { name: "machine <register|show|recover>", summary: "Manage this machine's PostgreSQL identity" },
       { name: "project <create|link|unlink|list|show|reconcile-worktrees|renew-retired-identity>", summary: "Manage local and PostgreSQL project identities" },
       { name: "postgres migrate [--json]", summary: "Apply packaged PostgreSQL schema migrations" },
+      { name: "migration <plan|dry-run|apply|resume|verify|report|abort> [--json]", summary: "Reversible SQLite-to-PostgreSQL cutover" },
       { name: "mcp", summary: "Start the MCP server (stdio transport)" },
     ],
   },
@@ -556,6 +597,7 @@ const GROUPS = [
       { name: "session-snapshot", summary: "Stop hook — ingest rolling transcript snapshots" },
       { name: "user-prompt", summary: "UserPromptSubmit hook — record user prompt context" },
       { name: "post-tool", summary: "PostToolUse hook — record tool invocation events" },
+      { name: "pre-tool", summary: "PreToolUse hook — opt-in memory hints before a tool call" },
     ],
   },
 ];

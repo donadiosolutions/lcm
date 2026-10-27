@@ -10,7 +10,11 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { lcmHomeDir, projectsDir } from "../../src/runtime-paths.js";
 import { projectMapPath, clearProjectMapCache } from "../../src/project-map.js";
-import { checkActivationProjectCoverage } from "../../src/migration/activation-coverage.js";
+import {
+  checkActivationProjectCoverage,
+  enumerateStoredDataProjectHashes,
+  evaluateActivationSingleProjectCoverage,
+} from "../../src/migration/activation-coverage.js";
 
 const roots: string[] = [];
 
@@ -328,3 +332,103 @@ describe("checkActivationProjectCoverage", () => {
     }
   });
 });
+
+
+describe("enumerateStoredDataProjectHashes (G8 inventory from the same locked enumeration)", () => {
+  it("is an empty enumeration when the projects directory does not exist yet", () => {
+    const homeDir = home();
+    expect(enumerateStoredDataProjectHashes({ homeDir })).toEqual({ status: "enumerated", projectHashes: [] });
+  });
+
+  it("returns the sorted union of db.sqlite directories and events-only <hash>.db files, skipping data-less hashes and strays", () => {
+    const homeDir = home();
+    withStoredData(projectDir(homeDir, HASH_B));
+    projectDir(homeDir, HASH_C); // no stored data
+    withEventsData(homeDir, HASH_A); // events-only
+    mkdirSync(join(projectsDir(homeDir), "not-a-hash"), { mode: 0o700 });
+    writeFileSync(join(lcmHomeDir(homeDir), "events", "stray.txt"), "x");
+    writeMap(homeDir, []);
+    const result = enumerateStoredDataProjectHashes({ homeDir });
+    expect(result).toEqual({ status: "enumerated", projectHashes: [HASH_A, HASH_B] });
+    expect(Object.isFrozen((result as { projectHashes: readonly string[] }).projectHashes)).toBe(true);
+  });
+
+  it("reports the same set regardless of map coverage (the inventory is not a coverage verdict)", () => {
+    const homeDir = home();
+    withStoredData(projectDir(homeDir, HASH_A));
+    withStoredData(projectDir(homeDir, HASH_B));
+    writeMap(homeDir, [HASH_A]);
+    expect(enumerateStoredDataProjectHashes({ homeDir })).toEqual({ status: "enumerated", projectHashes: [HASH_A, HASH_B] });
+    expect(checkActivationProjectCoverage({ homeDir }).status).toBe("unsatisfied");
+  });
+
+  it.each([
+    ["projects-directory-unresolvable", { readProjectDirectoryEntries: () => { throw Object.assign(new Error("EACCES"), { code: "EACCES" }); } }],
+    ["events-directory-unresolvable", { readEventsDirectoryEntries: () => { throw Object.assign(new Error("EACCES"), { code: "EACCES" }); } }],
+  ] as const)("refuses with %s exactly as the coverage check does (injected)", (reason, dependencies) => {
+    const homeDir = home();
+    withStoredData(projectDir(homeDir, HASH_A));
+    writeMap(homeDir, [HASH_A]);
+    const enumeration = enumerateStoredDataProjectHashes({ homeDir }, dependencies);
+    const coverage = checkActivationProjectCoverage({ homeDir }, dependencies);
+    expect(enumeration).toEqual({ status: "unresolvable", reason, detail: expect.any(String) });
+    expect(coverage).toMatchObject({ status: "unresolvable", reason, detail: (enumeration as { detail: string }).detail });
+  });
+
+  it("refuses with events-file-unresolvable for a listable but unsearchable events directory, like the coverage check", () => {
+    const homeDir = home();
+    withEventsData(homeDir, HASH_A);
+    const events = join(lcmHomeDir(homeDir), "events");
+    chmodSync(events, 0o400);
+    try {
+      expect(enumerateStoredDataProjectHashes({ homeDir })).toMatchObject({ status: "unresolvable", reason: "events-file-unresolvable" });
+    } finally {
+      chmodSync(events, 0o700);
+    }
+  });
+});
+
+describe("evaluateActivationSingleProjectCoverage (G8: the set must equal exactly {localProjectId})", () => {
+  it("is satisfied when the stored-data set is exactly this generation's project", () => {
+    expect(evaluateActivationSingleProjectCoverage({ storedDataProjectHashes: [HASH_A], localProjectId: HASH_A })).toEqual({
+      status: "satisfied", reason: "single-project", detail: expect.stringContaining(HASH_A), otherProjectHashes: [],
+    });
+  });
+
+  it("refuses when any other project holds data, listing every other hash sorted (whether or not it has its own generation)", () => {
+    const verdict = evaluateActivationSingleProjectCoverage({ storedDataProjectHashes: [HASH_C, HASH_A, HASH_B], localProjectId: HASH_A });
+    expect(verdict).toEqual({
+      status: "unsatisfied",
+      reason: "other-projects-hold-data",
+      detail: expect.stringContaining(HASH_B + ", " + HASH_C),
+      otherProjectHashes: [HASH_B, HASH_C],
+    });
+    expect(verdict.detail).toContain("2 other projects");
+  });
+
+  it("singularizes one other project and notes when the local project itself has no data", () => {
+    const verdict = evaluateActivationSingleProjectCoverage({ storedDataProjectHashes: [HASH_B], localProjectId: HASH_A });
+    expect(verdict).toMatchObject({ status: "unsatisfied", reason: "other-projects-hold-data", otherProjectHashes: [HASH_B] });
+    expect(verdict.detail).toContain("1 other project under");
+    expect(verdict.detail).toContain(HASH_A + " has none");
+  });
+
+  it("refuses an empty set: this generation's own project must hold data", () => {
+    expect(evaluateActivationSingleProjectCoverage({ storedDataProjectHashes: [], localProjectId: HASH_A })).toMatchObject({
+      status: "unsatisfied", reason: "local-project-has-no-data", otherProjectHashes: [],
+    });
+  });
+
+  it("is pure and tolerates a duplicated input hash", () => {
+    expect(evaluateActivationSingleProjectCoverage({ storedDataProjectHashes: [HASH_A, HASH_A], localProjectId: HASH_A }).status).toBe("satisfied");
+  });
+
+  it.each([
+    ["non-hash localProjectId", { storedDataProjectHashes: [], localProjectId: "project" }],
+    ["non-object input", null],
+    ["non-array set", { storedDataProjectHashes: "x", localProjectId: HASH_A }],
+  ])("throws for a caller programming error (%s)", (_name, input) => {
+    expect(() => evaluateActivationSingleProjectCoverage(input as unknown as Parameters<typeof evaluateActivationSingleProjectCoverage>[0])).toThrow();
+  });
+});
+

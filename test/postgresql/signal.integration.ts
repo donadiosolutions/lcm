@@ -9,17 +9,29 @@ import {
   createSignalCleanupDiagnosticParser,
   createRunNames,
   removeLabeled,
+  resolveContainerEngine,
   resolveSignalProbeReadinessTimeout,
   sanitizeHarnessText,
 } from "../../scripts/postgresql-harness.mjs";
 
 const execFileAsync = promisify(execFile);
+const CONTAINER_ENGINE = resolveContainerEngine(process.env);
+const CONTAINER_CLI = CONTAINER_ENGINE.cli;
+// Vitest runtime isolation replaces HOME, but rootless Podman keeps its
+// containers, images and networks under the real HOME. Docker is unaffected.
+const CONTAINER_ENVIRONMENT: NodeJS.ProcessEnv = CONTAINER_ENGINE.flavour === "podman"
+  ? { ...process.env, HOME: process.env.LCM_TEST_REAL_HOME || process.env.HOME }
+  : process.env;
 const SIGNAL_PROBE_READINESS_TIMEOUT_MS = resolveSignalProbeReadinessTimeout(process.env);
 const SIGNAL_CASE_CLEANUP_MARGIN_MS = 30_000;
 // The surviving-consumer case can launch first, second, third, and fallback cleanup probes.
 const MAX_SIGNAL_PROBE_FAN_OUT = 4;
 const launchedRunIds = new Set<string>();
 const itPosixSignal = process.platform === "win32" ? it.skip : it;
+
+function containerCli(args: string[]): Promise<{ stdout: string; stderr: string }> {
+  return execFileAsync(CONTAINER_CLI, args, { env: CONTAINER_ENVIRONMENT });
+}
 
 function signalCaseTimeout(probeCount: number): number {
   return SIGNAL_PROBE_READINESS_TIMEOUT_MS * probeCount + SIGNAL_CASE_CLEANUP_MARGIN_MS;
@@ -54,7 +66,7 @@ async function launchSignalProbe(mode: ProbeMode = "harness"): Promise<SignalPro
       : mode === "allocation-failure" ? "--allocation-failure-probe" : "--signal-probe";
   const child = spawn(process.execPath, ["scripts/postgresql-harness.mjs", flag], {
     cwd: process.cwd(),
-    env: process.env,
+    env: CONTAINER_ENVIRONMENT,
     stdio: ["ignore", "ignore", "pipe"],
   });
   let readyMarkerTail = "";
@@ -133,7 +145,7 @@ function exited(child: ChildProcess): Promise<{ code: number | null; signal: Nod
 }
 
 async function expectNoResources(runId: string): Promise<void> {
-  await auditHarnessRunResources([runId], (args) => execFileAsync("docker", args));
+  await auditHarnessRunResources([runId], containerCli);
 }
 
 async function expectResources(runId: string): Promise<void> {
@@ -142,17 +154,17 @@ async function expectResources(runId: string): Promise<void> {
     ["network", "ls", "--quiet", "--filter", `label=${RUN_LABEL}=${runId}`],
     ["volume", "ls", "--quiet", "--filter", `label=${RUN_LABEL}=${runId}`],
   ]) {
-    const { stdout } = await execFileAsync("docker", args);
+    const { stdout } = await containerCli(args);
     expect(stdout.trim()).not.toBe("");
   }
 }
 
 afterAll(async () => {
-  await auditHarnessRunResources(launchedRunIds, (args) => execFileAsync("docker", args));
+  await auditHarnessRunResources(launchedRunIds, containerCli);
 }, signalCaseTimeout(MAX_SIGNAL_PROBE_FAN_OUT));
 
 async function harnessDirectory(runId: string): Promise<string> {
-  const { stdout } = await execFileAsync("docker", ["container", "inspect", createRunNames(runId).container]);
+  const { stdout } = await containerCli(["container", "inspect", createRunNames(runId).container]);
   const record = JSON.parse(stdout)[0] as { Mounts: Array<{ Destination: string; Source: string }> };
   return record.Mounts.find((mount) => mount.Destination === "/run/lcm-harness")!.Source;
 }
@@ -345,7 +357,7 @@ describe("PostgreSQL harness signal teardown", () => {
   it("propagates and sanitizes a real Docker inspection failure", async () => {
     const unavailableSocket = "/tmp/lcm-postgresql-harness-unavailable-cleanup.sock";
     const dockerRunner = async (args: string[]): Promise<{ stdout: string; stderr: string }> => {
-      const { stdout, stderr } = await execFileAsync("docker", ["--host", `unix://${unavailableSocket}`, ...args]);
+      const { stdout, stderr } = await containerCli(["--host", `unix://${unavailableSocket}`, ...args]);
       return { stdout, stderr };
     };
     const failure = await removeLabeled(

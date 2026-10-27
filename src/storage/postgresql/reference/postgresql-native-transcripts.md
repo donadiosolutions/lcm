@@ -292,13 +292,16 @@ ctime change cookie detect changes to that bound source before prefix
 validation and again before destination batches and checkpoint-only progress
 writes. Live descriptor comparisons use the filesystem's exact nanosecond
 `mtime` and `ctime` values; checkpoint JSON records their numeric millisecond
-representations as source metadata. A ctime-only change is tolerated only when
-the locator now resolves to a different inode while every stable property of
-the bound descriptor is unchanged, which is the supported atomic-replacement
-case. If the locator still identifies the opened inode—or cannot be
-resolved—the ctime change fails closed. This also catches a same-size in-place
-rewrite whose modification time was restored. A changed source never advances
-that batch.
+representations as source metadata. Every fence also resolves the locator,
+whether or not the descriptor's ctime moved, because some filesystems (for
+example ZFS) can coalesce ctime updates. A locator that is missing or cannot
+be resolved fails closed, so a removed or renamed-away source is rejected
+even when the change cookie did not move. A locator that now resolves to a
+different inode is the supported atomic-replacement case and is accepted
+while the bound descriptor stays unchanged. If the locator still identifies
+the opened inode, a ctime change fails closed. This also catches a same-size
+in-place rewrite whose modification time was restored. A changed source
+never advances that batch.
 
 If the completed prefix changed—including a reorder—LCM rescans from the
 beginning and relies on deterministic ingest keys to skip records already
@@ -417,8 +420,10 @@ grants only:
 - column-limited `SELECT` on `conversations` columns `project_id`,
   `conversation_id`, `session_id`, `session_id_sha256`, and `created_at`, plus
   `messages` columns `project_id`, `conversation_id`, `message_id`, `seq`,
-  `role`, and `content`, which are the exact fields used by one-statement
-  native-session message linking;
+  `role`, and `content`, plus `message_parts` columns `project_id`,
+  `conversation_id`, `message_id`, and `part_type`, which are the exact
+  fields used by one-statement native-session message linking (the `part_type`
+  read tells compaction event rows from transcript messages);
 - `SELECT` and column-limited `INSERT` on `native_transcripts`, including the
   validated equal `observed_at` and `ingested_at` values;
 - `SELECT` and column-limited `INSERT` on `transcript_messages`; and

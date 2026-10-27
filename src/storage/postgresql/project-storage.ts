@@ -392,6 +392,10 @@ export class PostgreSqlProjectStorage implements ProjectStorage {
           scoped,
           this.projectId,
         ),
+        nativeProvenance: new PostgreSqlNativeTranscriptRepository(
+          scoped,
+          this.projectId,
+        ),
       };
       try {
         return await transactionContext.run(

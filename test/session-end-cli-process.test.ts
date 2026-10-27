@@ -146,7 +146,12 @@ async function exercise(scenario: Scenario): Promise<void> {
       body: { cwd: home, session_id: "process-session", client },
     });
     expect(stdout).toBe("");
-    expect(stderr).toBe("");
+    const unacknowledged = (reason: string) => "lcm: session completion was not acknowledged (" + reason + ")\n";
+    expect(stderr).toBe(
+      scenario === "stalled" || scenario === "dribbling" ? unacknowledged("timeout")
+        : scenario === "http-error" ? unacknowledged("status-503")
+          : "",
+    );
   } finally {
     clearTimeout(watchdog);
     clearInterval(dribble);

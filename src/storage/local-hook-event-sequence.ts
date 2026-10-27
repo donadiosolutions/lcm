@@ -166,6 +166,57 @@ export class LocalHookEventSequenceAllocator {
     this.closed = true;
     closeLcmConnection(this.sequencePath, this.db);
   }
+
+  /**
+   * Reconciles the shared checkpoint to stay ahead of a historical
+   * event's ALREADY-USED machine sequence, without minting, allocating
+   * or handing back any sequence number. Exists for item #626's rollback
+   * materialization: rolling back reproduces each archived passive event
+   * with its ORIGINAL machine_sequence value rather than allocating a new
+   * one (`allocateSequences` would be wrong there -- it always
+   * advances by minting fresh values, and a caller reproducing history
+   * must not mint anything). Once those original values are written back
+   * into the events table, the shared checkpoint -- read by every
+   * project's hook processing, not only the one being rolled back -- must
+   * be lifted to stay ahead of history it did not itself allocate, or the
+   * next live `allocateSequence` could mint a value that
+   * collides with one already written.
+   *
+   * Monotone and refuses to regress: if the stored checkpoint already
+   * exceeds `highestObservedSequence`, this is a no-op. It never
+   * moves the checkpoint down under any circumstance. Additive: no
+   * existing method's behaviour changes.
+   */
+  reconcileCheckpoint(highestObservedSequence: bigint): void {
+    if (this.closed) {
+      throw new Error("local hook sequence allocator is closed");
+    }
+    if (highestObservedSequence < 0n || highestObservedSequence > MAX_POSTGRESQL_BIGINT) {
+      throw new Error("local hook machine sequence is outside the PostgreSQL bigint range");
+    }
+    const required = highestObservedSequence + 1n;
+    // Mirrors allocateSequences's own validation-lease discipline: a
+    // pooled handle can remain usable after its file is unlinked or
+    // replaced, so a temporary lease revalidates the persistent path
+    // before every reservation, including this reconcile-only one.
+    const validationLease = getLcmConnection(this.sequencePath);
+    try {
+      this.db.exec("BEGIN IMMEDIATE");
+      try {
+        const row = this.readCheckpoint.get() as { next_sequence?: unknown } | undefined;
+        const current = parseSequence(row?.next_sequence, "sequence checkpoint", EXHAUSTED_SEQUENCE_CHECKPOINT);
+        if (current < required) {
+          this.writeCheckpoint.run(required.toString());
+        }
+        this.db.exec("COMMIT");
+      } catch (error) {
+        try { this.db.exec("ROLLBACK"); } catch { /* preserve reconciliation failure */ }
+        throw error;
+      }
+    } finally {
+      closeLcmConnection(this.sequencePath, validationLease);
+    }
+  }
 }
 
 /**

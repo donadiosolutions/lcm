@@ -23,6 +23,7 @@ const guidanceSurfaceFiles = [
   ".agents/skills/lcm-release/SKILL.md", "docs/README.md", "docs/agent-tools.md",
   "docs/architecture.md", "docs/cli.md", "docs/configuration.md",
   "docs/daemon-restart-recovery.md",
+  "docs/incident-diagnostics.md",
   "docs/external-admission.md", "docs/fts5.md", "docs/hook-protocol.md",
   "docs/issue-triage.md", "docs/passive-learning.md", "docs/privacy.md",
   "docs/project-identity.md", "docs/releasing.md", "docs/tag-schema.md",

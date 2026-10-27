@@ -378,6 +378,33 @@ describe("CI workflow", () => {
     }
   });
 
+  it("requires a complete parity artifact from the PostgreSQL run", () => {
+    const steps = workflow.jobs.postgresql.steps;
+    const harness = steps.find((step) => step.name === "Run isolated PostgreSQL 18 conformance harness")!;
+    const extraction = steps.find((step) => step.name === "Validate surface parity evidence")!;
+    const upload = steps.find((step) => step.name === "Upload surface parity evidence")!;
+    expect(harness.run).toContain("set -o pipefail");
+    expect(harness.run).toContain('pnpm run test:postgresql 2>&1 | tee "$RUNNER_TEMP/surface-parity.log"');
+    expect(extraction.if).toBe("always()");
+    expect(extraction.run).toContain("node scripts/surface-parity-artifact.mjs");
+    expect(extraction.run).toContain('"$RUNNER_TEMP/surface-parity.log"');
+    expect(extraction.env).toEqual({
+      LCM_PARITY_CANDIDATE_SHA: "${{ github.event.pull_request.head.sha || github.sha }}",
+    });
+    expect(upload).toMatchObject({
+      if: "always()",
+      uses: expect.stringMatching(/^actions\/upload-artifact@[0-9a-f]{40}$/u),
+      with: {
+        name: "surface-parity-${{ github.run_id }}-${{ github.run_attempt }}",
+        path: "${{ runner.temp }}/surface-parity/",
+        "if-no-files-found": "error",
+        "retention-days": 14,
+      },
+    });
+    expect(steps.indexOf(harness)).toBeLessThan(steps.indexOf(extraction));
+    expect(steps.indexOf(extraction)).toBeLessThan(steps.indexOf(upload));
+  });
+
   it("plans the run and executes checks and dynamic unit shards", () => {
     const plan = workflow.jobs.plan;
     expect(plan["runs-on"]).toBe("blacksmith-4vcpu-ubuntu-2404");
@@ -531,7 +558,13 @@ describe("CI workflow", () => {
     expect(postgresql.strategy).toBeUndefined();
     expect(postgresql.steps.some((step) => step.uses === "./.github/actions/setup-node")).toBe(true);
     expect(postgresql.steps.some((step) => step.uses === "./.github/actions/stage-postgresql")).toBe(true);
-    expect(postgresql.steps.at(-1)?.run).toBe("pnpm run test:postgresql");
+    // The harness runs once; the parity evidence steps follow it (see the parity test).
+    expect(postgresql.steps.filter((step) => step.run?.includes("pnpm run test:postgresql"))).toHaveLength(1);
+    expect(postgresql.steps.map((step) => step.name).slice(-3)).toEqual([
+      "Run isolated PostgreSQL 18 conformance harness",
+      "Validate surface parity evidence",
+      "Upload surface parity evidence",
+    ]);
     expect(stagePostgresqlSource.match(/uses: actions\/cache\/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9/gu)).toHaveLength(2);
     expect(stagePostgresqlSource.match(/uses: actions\/cache\/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9/gu)).toHaveLength(2);
     expect(stagePostgresqlSource).not.toContain("restore-keys:");

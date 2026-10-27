@@ -6,6 +6,7 @@ import { handlePreCompact } from "../../src/hooks/compact.js";
 import type { DaemonClient } from "../../src/daemon/client.js";
 import * as publicationFence from "../../src/hooks/publication-fence.js";
 import { BackendPublicationJournalError } from "../../src/storage/backend-publication.js";
+import { PrivateMutationLockContentionError } from "../../src/private-mutation-lock.js";
 
 const promotionState = vi.hoisted(() => ({ error: undefined as Error | undefined }));
 
@@ -15,7 +16,9 @@ vi.mock("../../src/hooks/session-end.js", () => ({
   }),
 }));
 
-vi.mock("../../src/hooks/publication-fence.js", () => ({
+vi.mock("../../src/hooks/publication-fence.js", async (importOriginal) => ({
+  hookAdmissionRetry: (await importOriginal<typeof import("../../src/hooks/publication-fence.js")>()).hookAdmissionRetry,
+  NO_HOOK_ADMISSION_RETRY: (await importOriginal<typeof import("../../src/hooks/publication-fence.js")>()).NO_HOOK_ADMISSION_RETRY,
   assertHookPublicationFence: vi.fn(),
   isBackendPublicationJournalError: (error: unknown) => error instanceof BackendPublicationJournalError,
   isBackendPublicationEvidenceMissing: (error: unknown) =>
@@ -98,6 +101,68 @@ describe("handlePreCompact", () => {
       .resolves.toEqual({ exitCode: 0, stdout: "" });
     expect(mockSafeLogError).toHaveBeenCalledWith("PreCompact", publicationError, {});
     expect(mockEnsureDaemon).not.toHaveBeenCalled();
+  });
+
+  describe("waiting for a live publication-lock owner", () => {
+    const liveContention = (): PrivateMutationLockContentionError => new PrivateMutationLockContentionError(
+      "publication lock is busy",
+      {
+        contendedLock: {
+          path: "/lcm/publication.lock",
+          owner: { version: 1, pid: process.pid + 1, processStartTime: null, nonce: "owner" },
+        },
+      },
+    );
+    const noPause = async (): Promise<void> => undefined;
+
+    it("compacts after the owner releases the lock before and after daemon admission", async () => {
+      let calls = 0;
+      vi.mocked(publicationFence.assertHookPublicationFence).mockImplementation(() => {
+        calls += 1;
+        if (calls <= 2 || calls === 4) throw liveContention();
+      });
+      mockEnsureDaemon.mockResolvedValueOnce({ connected: true, port: 3737, spawned: false });
+      const post = vi.fn().mockResolvedValue({ summary: "compacted under contention" });
+      const retry = publicationFence.hookAdmissionRetry({ _wait: noPause });
+
+      await expect(handlePreCompact("{}", mockDaemonClient(post), 3737, { backend: "sqlite" }, retry))
+        .resolves.toEqual({ exitCode: 0, stdout: "compacted under contention" });
+
+      expect(calls).toBe(5);
+      expect(mockEnsureDaemon).toHaveBeenCalledWith(expect.objectContaining({
+        _withPublicationAdmissionRetry: retry,
+      }));
+      expect(mockSafeLogError).not.toHaveBeenCalled();
+    });
+
+    it("logs the contention and skips once the allowance is spent", async () => {
+      const contention = liveContention();
+      vi.mocked(publicationFence.assertHookPublicationFence).mockImplementation(() => { throw contention; });
+
+      await expect(handlePreCompact("{}", mockDaemonClient(vi.fn()), 3737, { backend: "sqlite" },
+        publicationFence.hookAdmissionRetry({ totalMs: 100, _wait: noPause })))
+        .resolves.toEqual({ exitCode: 0, stdout: "" });
+
+      expect(publicationFence.assertHookPublicationFence).toHaveBeenCalledTimes(3);
+      expect(mockSafeLogError).toHaveBeenCalledWith("PreCompact", contention, {});
+      expect(mockEnsureDaemon).not.toHaveBeenCalled();
+    });
+
+    it("skips the daemon request when the fence before it outlasts the allowance", async () => {
+      let calls = 0;
+      vi.mocked(publicationFence.assertHookPublicationFence).mockImplementation(() => {
+        calls += 1;
+        if (calls > 1) throw liveContention();
+      });
+      mockEnsureDaemon.mockResolvedValueOnce({ connected: true, port: 3737, spawned: false });
+      const post = vi.fn();
+
+      await expect(handlePreCompact("{}", mockDaemonClient(post), 3737, { backend: "sqlite" },
+        publicationFence.hookAdmissionRetry({ totalMs: 50, _wait: noPause })))
+        .resolves.toEqual({ exitCode: 0, stdout: "" });
+
+      expect(post).not.toHaveBeenCalled();
+    });
   });
 
   it("continues to daemon transport for selected PostgreSQL", async () => {

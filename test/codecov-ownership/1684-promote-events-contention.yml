@@ -1,0 +1,12 @@
+references: ["#1684"]
+rationale: >-
+  The daemon core (src/daemon/server.ts) adds the promote-events routes to the
+  admission retry set and maps lock contention on them to a retryable 503
+  busy answer. The promote-events route (src/daemon/routes/promote-events.ts)
+  maps the same contention in its single-project and --all handlers, and the
+  CLI (bin/lcm.ts) prints that answer as an error. No file is added, removed,
+  moved, or re-owned; all three stay in the components that already own them.
+pins:
+  - ["src/daemon/server.ts", "unit-daemon-core"]
+  - ["src/daemon/routes/promote-events.ts", "unit-daemon-routes"]
+  - ["bin/lcm.ts", "unit-cli"]

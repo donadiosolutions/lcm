@@ -1,0 +1,14 @@
+references: ["#1578"]
+rationale: >-
+  Codex user forks that copied their parent's rollout stop storing the copied
+  history again. src/codex-transcript.ts (copied-fork boundary and its message
+  walk), src/storage/native-transcript-ingest.ts (position-based inherited
+  classification) keep their transcript import owner, and
+  src/daemon/routes/ingest.ts (session lineage marker and shared decision) and
+  src/daemon/routes/compact.ts (same decision for /compact) keep their daemon
+  routes owner. No file is added, removed, moved or re-owned.
+pins:
+  - ["src/codex-transcript.ts", "unit-transcripts-import"]
+  - ["src/storage/native-transcript-ingest.ts", "unit-transcripts-import"]
+  - ["src/daemon/routes/ingest.ts", "unit-daemon-routes"]
+  - ["src/daemon/routes/compact.ts", "unit-daemon-routes"]

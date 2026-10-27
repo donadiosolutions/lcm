@@ -8,6 +8,7 @@ import {
   ensurePrivateDirectory,
   isPrivateFileCollisionFailure,
   openPrivateDirectory,
+  openPrivateDirectoryIfExists,
   readBoundedRegularFileWithStat,
   type BoundedFileResult,
   type PrivateDirectoryHandle,
@@ -178,6 +179,20 @@ import {
  * is written once, inside the fenced window, before the token is released,
  * so there is no later attempt that would otherwise recreate a directory
  * lost to power loss right after this module returned success.
+ *
+ * The read side (resolveMigrationWitnessBindings, below) lives in this
+ * module so the author of the wire format also owns its read semantics. It
+ * parses every entry with the writers' own strictness and never repairs,
+ * deletes or normalises anything: "authoritatively-absent" is concluded
+ * only from a positively absent store or generation directory under an
+ * authenticated parent, or from an authenticated generation directory that
+ * holds no binding file; every other failure to read, parse or
+ * authenticate is "unresolvable", and the two are never collapsed. The
+ * shared directory scan (readGenerationScopedFiles) and the shared durable
+ * writer (recordGenerationScopedFile) are exported so the sibling
+ * activation evidence store reuses one implementation of the private
+ * generation-scoped layout, scratch-twin authentication and crash recovery
+ * rather than carrying a second copy of them.
  */
 
 const GENERATION_BINDING_SUBDIRECTORY = "migration-generation-bindings";
@@ -191,6 +206,37 @@ const GENERATION_BINDING_WIRE_VERSION = 1 as const;
 const MAX_GENERATION_BINDING_FILE_BYTES = 4096;
 const GENERATION_BINDING_TOKEN_PATTERN = /^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$/u;
 const WITNESS_CHECKSUM_PATTERN = /^[0-9a-f]{64}$/u;
+const GENERATION_BINDING_FILE_NAME_PATTERN =
+  /^(?:selection-(?:activation|rollback)\.binding|witness-[0-9a-f]{64}\.binding)$/u;
+/** atomicWritePrivateFileDurable's scratch naming, for any final name: the
+ * final name is group 1. Whether group 1 is a name the store may hold is
+ * decided by the store, never by this pattern. */
+const WRITER_SCRATCH_ENTRY_PATTERN = /^\.(.+)\.[0-9a-f]+\.tmp$/u;
+
+/**
+ * A private, generation-scoped directory of immutable single-record files:
+ * <home>/.lcm/<subdirectory>/<sha256hex(generationId)>/<final name>. The
+ * binding store and the activation evidence store are two instances; the
+ * layout, authentication, durable creation, crash-twin recovery and scan
+ * below are written once against this descriptor.
+ */
+export type GenerationScopedStore = Readonly<{
+  /** Directory name beneath the private LCM root. */
+  subdirectory: string;
+  /** What one stored file is, with its article, for refusal messages. */
+  noun: string;
+  /** Upper bound for any one stored file. */
+  maxFileBytes: number;
+  /** True for every final (published) file name the store may hold. */
+  isFinalFileName: (name: string) => boolean;
+}>;
+
+const GENERATION_BINDING_STORE: GenerationScopedStore = {
+  subdirectory: GENERATION_BINDING_SUBDIRECTORY,
+  noun: "generation binding",
+  maxFileBytes: MAX_GENERATION_BINDING_FILE_BYTES,
+  isFinalFileName: (name) => GENERATION_BINDING_FILE_NAME_PATTERN.test(name),
+};
 
 const SELECTION_BINDING_KEYS = [
   "attemptId",
@@ -300,14 +346,25 @@ function rootPath(homeDir: string): string {
 
 /** The generation-binding store subdirectory beneath the private LCM root. */
 export function migrationGenerationBindingStoreDirectory(homeDir: string): string {
-  return join(rootPath(homeDir), GENERATION_BINDING_SUBDIRECTORY);
+  return generationScopedStoreDirectory(GENERATION_BINDING_STORE, homeDir);
+}
+
+/** The store subdirectory of a generation-scoped store. */
+export function generationScopedStoreDirectory(store: GenerationScopedStore, homeDir: string): string {
+  return join(rootPath(homeDir), store.subdirectory);
+}
+
+/** The per-generation directory of a generation-scoped store, named by
+ * sha256hex(generationId) rather than the raw id. */
+export function generationScopedDirectory(store: GenerationScopedStore, homeDir: string, generationId: string): string {
+  return join(generationScopedStoreDirectory(store, homeDir), sha256(generationId));
 }
 
 /** The per-generation directory both binding families share, named by
  * sha256hex(generationId) rather than the raw id so no caller-supplied
  * value can traverse or escape the store. */
 export function migrationGenerationBindingDirectory(homeDir: string, generationId: string): string {
-  return join(migrationGenerationBindingStoreDirectory(homeDir), sha256(generationId));
+  return generationScopedDirectory(GENERATION_BINDING_STORE, homeDir, generationId);
 }
 
 /** The path a selection binding of a given kind is stored at. At most one
@@ -358,14 +415,14 @@ function assertWitnessChecksum(value: unknown): asserts value is string {
   }
 }
 
-function validateHomeDir(value: unknown): string {
+export function validateHomeDir(value: unknown): string {
   if (typeof value !== "string" || value.length === 0) {
     throw new MigrationBindingValidationError("homeDir is invalid");
   }
   return value;
 }
 
-function validateGenerationId(value: unknown): string {
+export function validateGenerationId(value: unknown): string {
   assertToken(value, "generationId");
   return value;
 }
@@ -665,54 +722,36 @@ function publishedLinkCount(publishedPath: string): bigint | undefined {
   }
 }
 
-type ReconcileDecision = "reused" | "conflict";
+export type ReconcileDecision = "reused" | "conflict";
 /** Decide, from an existing stored file's raw content, whether it reconciles
  * with the candidate this write is for (see the module doc comment for why
  * this comparison differs between the two writers). */
-type GenerationBindingReconciler = (storedContent: string) => ReconcileDecision;
+export type GenerationScopedReconciler = (storedContent: string) => ReconcileDecision;
+
+type AuthenticatedScratchTwin = Readonly<{ twinPath: string; published: BoundedFileResult }>;
 
 /**
- * Authenticate and, if found, complete an interrupted durable-write crash
- * twin (see the module doc comment for the exact crash window this
- * recovers). A twin is accepted only when a scratch file matching the
- * writer's exact naming convention in the same directory is byte-and-
- * metadata identical to the published name via exactWriterLinkPair. On a
- * match, the interrupted unlink is completed and the published file is
- * asserted single-link again -- the same expectedNlink discipline
- * security-files.ts's own unlinkPrivateFileIfIdentityMatches applies --
- * before reconciliation proceeds against the published content exactly as
- * it would for any ordinary existing file. A third hard link appearing
- * between the authenticated read and the unlink would otherwise leave
- * this call returning "reused" while the file stays multi-link, so a
- * post-unlink count other than exactly 1 refuses as
- * MigrationBindingUnresolvableError rather than being silently accepted.
- * A published file that vanished entirely in that same window is reported
- * as "absent" instead: the key is genuinely gone, and the caller's
- * requireAbsent write converges by publishing fresh. Zero matches, more
- * than one match, or a final nlink that is not exactly 2 cannot be
- * authenticated as this specific crash shape and refuse as
- * MigrationBindingUnresolvableError: a multi-link state this module could
- * not resolve is not evidence of a conflict, because no comparison
- * against a trustworthy read ever ran.
+ * The read-only half of crash-twin recovery, shared by the writer's
+ * reconciliation (which then completes the interrupted unlink) and the
+ * reader (which never mutates anything). A twin is accepted only when a
+ * scratch file matching the writer's exact naming convention in the same
+ * directory is byte-and-metadata identical to the published name via
+ * exactWriterLinkPair. Returns undefined whenever the multi-link state
+ * cannot be authenticated as that exact crash shape: the published file
+ * is not a two-link file, no candidate matches, or more than one does.
  */
-function reconcileWriterScratchTwin(
+function findAuthenticatedScratchTwin(
   path: string,
   directory: string,
+  store: GenerationScopedStore,
   expectedUid: number | undefined,
   readWithStat: typeof readBoundedRegularFileWithStat,
-  reconcile: GenerationBindingReconciler,
-): "absent" | "reused" {
-  const unresolvable = (): never => {
-    throw new MigrationBindingUnresolvableError(
-      "a multi-link generation binding at " + path +
-        " could not be authenticated as an interrupted durable-write scratch twin",
-    );
-  };
+): AuthenticatedScratchTwin | undefined {
   const readAt = (candidatePath: string) =>
     attributeNullableRead<BoundedFileResult>(
       () => readWithStat(candidatePath, {
         allowedRoot: directory,
-        maxBytes: MAX_GENERATION_BINDING_FILE_BYTES,
+        maxBytes: store.maxFileBytes,
         expectedUid,
         allowedModes: [PRIVATE_FILE_MODE],
       }),
@@ -720,16 +759,14 @@ function reconcileWriterScratchTwin(
     );
 
   const finalOutcome = readAt(path);
-  if (finalOutcome.kind !== "present" || finalOutcome.value.nlink !== "2") {
-    return unresolvable();
-  }
+  if (finalOutcome.kind !== "present" || finalOutcome.value.nlink !== "2") return undefined;
 
   const namePattern = writerScratchNamePattern(basename(path));
   let entries: readonly string[];
   try {
     entries = readdirSync(directory);
   } catch {
-    return unresolvable();
+    return undefined;
   }
 
   let twinPath: string | undefined;
@@ -747,40 +784,81 @@ function reconcileWriterScratchTwin(
     try {
       candidateOutcome = readAt(join(directory, entry));
     } catch {
-      return unresolvable();
+      return undefined;
     }
-    if (candidateOutcome.kind === "unresolvable") return unresolvable();
+    if (candidateOutcome.kind === "unresolvable") return undefined;
     if (candidateOutcome.kind === "absent") continue;
     if (!exactWriterLinkPair(finalOutcome.value, candidateOutcome.value)) continue;
-    if (twinPath !== undefined) return unresolvable();
+    if (twinPath !== undefined) return undefined;
     twinPath = join(directory, entry);
   }
-  if (twinPath === undefined) return unresolvable();
+  if (twinPath === undefined) return undefined;
+  return { twinPath, published: finalOutcome.value };
+}
 
-  const publishedNlink = completeInterruptedScratchUnlink(twinPath, path, finalOutcome.value, expectedUid);
+/**
+ * Authenticate and, if found, complete an interrupted durable-write crash
+ * twin (see the module doc comment for the exact crash window this
+ * recovers). On an authenticated twin (findAuthenticatedScratchTwin), the
+ * interrupted unlink is completed and the published file is
+ * asserted single-link again -- the same expectedNlink discipline
+ * security-files.ts's own unlinkPrivateFileIfIdentityMatches applies --
+ * before reconciliation proceeds against the published content exactly as
+ * it would for any ordinary existing file. A third hard link appearing
+ * between the authenticated read and the unlink would otherwise leave
+ * this call returning "reused" while the file stays multi-link, so a
+ * post-unlink count other than exactly 1 refuses as
+ * MigrationBindingUnresolvableError rather than being silently accepted.
+ * A published file that vanished entirely in that same window is reported
+ * as "absent" instead: the key is genuinely gone, and the caller's
+ * requireAbsent write converges by publishing fresh. A multi-link state
+ * that cannot be authenticated as this specific crash shape refuses as
+ * MigrationBindingUnresolvableError: a multi-link state this module could
+ * not resolve is not evidence of a conflict, because no comparison
+ * against a trustworthy read ever ran.
+ */
+function reconcileWriterScratchTwin(
+  path: string,
+  directory: string,
+  store: GenerationScopedStore,
+  expectedUid: number | undefined,
+  readWithStat: typeof readBoundedRegularFileWithStat,
+  reconcile: GenerationScopedReconciler,
+): "absent" | "reused" {
+  const unresolvable = (): never => {
+    throw new MigrationBindingUnresolvableError(
+      "a multi-link " + store.noun + " at " + path +
+        " could not be authenticated as an interrupted durable-write scratch twin",
+    );
+  };
+  const found = findAuthenticatedScratchTwin(path, directory, store, expectedUid, readWithStat);
+  if (found === undefined) return unresolvable();
+
+  const publishedNlink = completeInterruptedScratchUnlink(found.twinPath, path, found.published, expectedUid);
   if (publishedNlink === undefined) return "absent";
   if (publishedNlink !== 1n) return unresolvable();
 
-  if (reconcile(finalOutcome.value.content) === "reused") return "reused";
+  if (reconcile(found.published.content) === "reused") return "reused";
   throw new MigrationBindingConflictError(
-    "a generation binding already exists at " + path +
+    "a " + store.noun + " already exists at " + path +
       " and does not reconcile with the candidate; refusing to overwrite durable authority",
   );
 }
 
-function reconcileGenerationBindingFile(
+function reconcileGenerationScopedFile(
   path: string,
   directory: string,
+  store: GenerationScopedStore,
   expectedUid: number | undefined,
   readWithStat: typeof readBoundedRegularFileWithStat,
-  reconcile: GenerationBindingReconciler,
+  reconcile: GenerationScopedReconciler,
 ): "absent" | "reused" {
   let outcome;
   try {
     outcome = attributeNullableRead<BoundedFileResult>(
       () => readWithStat(path, {
         allowedRoot: directory,
-        maxBytes: MAX_GENERATION_BINDING_FILE_BYTES,
+        maxBytes: store.maxFileBytes,
         expectedUid,
         allowedModes: [PRIVATE_FILE_MODE],
         requireSingleLink: true,
@@ -789,19 +867,19 @@ function reconcileGenerationBindingFile(
     );
   } catch (error) {
     if (isMultipleHardLinksError(error)) {
-      return reconcileWriterScratchTwin(path, directory, expectedUid, readWithStat, reconcile);
+      return reconcileWriterScratchTwin(path, directory, store, expectedUid, readWithStat, reconcile);
     }
     throw error;
   }
   if (outcome.kind === "unresolvable") {
     throw new MigrationBindingUnresolvableError(
-      "cannot determine whether a generation binding already exists at " + path + ": " + outcome.detail,
+      "cannot determine whether a " + store.noun + " already exists at " + path + ": " + outcome.detail,
     );
   }
   if (outcome.kind === "absent") return "absent";
   if (reconcile(outcome.value.content) === "reused") return "reused";
   throw new MigrationBindingConflictError(
-    "a generation binding already exists at " + path +
+    "a " + store.noun + " already exists at " + path +
       " and does not reconcile with the candidate; refusing to overwrite durable authority",
   );
 }
@@ -852,12 +930,13 @@ function ensureSyncedPrivateChild(
 }
 
 /**
- * Authenticate (and create if absent) the private generation-binding store
+ * Authenticate (and create if absent) a generation-scoped store's private
  * subdirectory and the per-generation directory beneath it, atop an
  * already-existing private LCM root this module never creates. See
  * ensureSyncedPrivateChild for the creation-path durability guarantee.
  */
-function ensureGenerationBindingDirectories(
+function ensureGenerationScopedDirectories(
+  store: GenerationScopedStore,
   homeDir: string,
   generationId: string,
   expectedUid: number | undefined,
@@ -873,24 +952,24 @@ function ensureGenerationBindingDirectories(
     );
   }
   try {
-    const store = migrationGenerationBindingStoreDirectory(homeDir);
+    const storeDirectory = generationScopedStoreDirectory(store, homeDir);
     let storeHandle: PrivateDirectoryHandle;
     try {
-      storeHandle = ensureSyncedPrivateChild(rootHandle, store, expectedUid);
+      storeHandle = ensureSyncedPrivateChild(rootHandle, storeDirectory, expectedUid);
     } catch (error) {
       throw new MigrationBindingUnsafeStorageError(
-        "generation binding store directory is unsafe: " + (error as Error).message,
+        store.noun + " store directory is unsafe: " + (error as Error).message,
         { cause: error },
       );
     }
     try {
-      const generationDirectory = migrationGenerationBindingDirectory(homeDir, generationId);
+      const generationDirectory = generationScopedDirectory(store, homeDir, generationId);
       let generationHandle: PrivateDirectoryHandle;
       try {
         generationHandle = ensureSyncedPrivateChild(storeHandle, generationDirectory, expectedUid);
       } catch (error) {
         throw new MigrationBindingUnsafeStorageError(
-          "per-generation binding directory is unsafe: " + (error as Error).message,
+          "per-generation " + store.noun + " directory is unsafe: " + (error as Error).message,
           { cause: error },
         );
       }
@@ -928,45 +1007,94 @@ export type RecordMigrationWitnessBindingDependencies = RecordMigrationSelection
  * rule real rather than nominal. See the module doc comment for the full
  * crash-safety and idempotency rationale.
  */
-function recordGenerationBindingFile(
+export function recordGenerationScopedFile(
+  store: GenerationScopedStore,
   homeDir: string,
   generationId: string,
   fileName: string,
   serialized: string,
-  reconcile: GenerationBindingReconciler,
+  reconcile: GenerationScopedReconciler,
   dependencies: RecordMigrationSelectionBindingDependencies,
 ): void {
   const expectedUid = dependencies.expectedUid ?? currentUid();
   const readWithStat = dependencies.readWithStat ?? readBoundedRegularFileWithStat;
   const writeDurable = dependencies.writeDurable ?? atomicWritePrivateFileDurable;
 
-  const directory = ensureGenerationBindingDirectories(homeDir, generationId, expectedUid);
+  const directory = ensureGenerationScopedDirectories(store, homeDir, generationId, expectedUid);
   const path = join(directory, fileName);
 
   const attempt = (): "absent" | "reused" =>
-    reconcileGenerationBindingFile(path, directory, expectedUid, readWithStat, reconcile);
+    reconcileGenerationScopedFile(path, directory, store, expectedUid, readWithStat, reconcile);
 
-  if (attempt() === "reused") return;
-
-  try {
-    writeDurable(path, serialized, {
-      requireAbsent: true,
-      maxExistingBytes: MAX_GENERATION_BINDING_FILE_BYTES,
-      expectedUid,
-    });
-  } catch (error) {
-    if (!isBenignCollisionRace(error)) throw error;
-    // A concurrent writer published (or leftover debris blocked, then
-    // cleared) between our presence check and this write attempt. Re-read
-    // and reconcile exactly as above rather than treating a race as a
-    // failure: this is the "retry converges" property applied to true
-    // concurrency, not just sequential crash-then-retry.
-    if (attempt() === "absent") {
-      // The collision this call observed is already gone. Surface the
-      // original error rather than loop indefinitely against a filesystem
-      // that keeps changing out from under this call.
-      throw error;
+  if (attempt() === "absent") {
+    try {
+      writeDurable(path, serialized, {
+        requireAbsent: true,
+        maxExistingBytes: store.maxFileBytes,
+        expectedUid,
+      });
+    } catch (error) {
+      if (!isBenignCollisionRace(error)) throw error;
+      // A concurrent writer published (or leftover debris blocked, then
+      // cleared) between our presence check and this write attempt. Re-read
+      // and reconcile exactly as above rather than treating a race as a
+      // failure: this is the "retry converges" property applied to true
+      // concurrency, not just sequential crash-then-retry.
+      if (attempt() === "absent") {
+        // The collision this call observed is already gone. Surface the
+        // original error rather than loop indefinitely against a filesystem
+        // that keeps changing out from under this call.
+        throw error;
+      }
     }
+  }
+  removeIdenticalLoneScratch(path, directory, store, expectedUid, readWithStat);
+}
+
+/**
+ * After a successful write or reuse, removes the writer scratch files of
+ * this final name that a crash before the link step left behind and whose
+ * content is byte-identical to the file just published or reused: they hold
+ * nothing the published file does not, and the reader refuses any other lone
+ * scratch. Each candidate must be a single-link regular file owned by the
+ * expected uid with the writer's mode (a twin, a foreign file or a scratch
+ * with different content is left alone). The removal is made durable.
+ */
+function removeIdenticalLoneScratch(
+  path: string,
+  directory: string,
+  store: GenerationScopedStore,
+  expectedUid: number | undefined,
+  readWithStat: typeof readBoundedRegularFileWithStat,
+): void {
+  const published = readWithStat(path, {
+    allowedRoot: directory,
+    maxBytes: store.maxFileBytes,
+    expectedUid,
+    allowedModes: [PRIVATE_FILE_MODE],
+    requireSingleLink: true,
+  }).content;
+  const namePattern = writerScratchNamePattern(basename(path));
+  let removed = false;
+  for (const entry of readdirSync(directory)) {
+    if (!namePattern.test(entry)) continue;
+    const candidate = join(directory, entry);
+    if (
+      readLoneScratchContent(candidate, directory, store, expectedUid, readWithStat) !== published
+    ) continue;
+    try {
+      unlinkSync(candidate);
+    } catch (error) {
+      if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error;
+    }
+    removed = true;
+  }
+  if (!removed) return;
+  const directoryHandle = openPrivateDirectory(directory, { expectedUid });
+  try {
+    fsyncSync(directoryHandle.fd);
+  } finally {
+    directoryHandle.close();
   }
 }
 
@@ -987,8 +1115,10 @@ export function recordMigrationSelectionBinding(
   const binding = validateSelectionBinding(validatedInput.binding);
   const serialized = selectionWireContent(generationId, binding);
   const fileName = `selection-${binding.kind}.binding`;
-  const reconcile: GenerationBindingReconciler = (stored) => (stored === serialized ? "reused" : "conflict");
-  recordGenerationBindingFile(homeDir, generationId, fileName, serialized, reconcile, dependencies);
+  const reconcile: GenerationScopedReconciler = (stored) => (stored === serialized ? "reused" : "conflict");
+  recordGenerationScopedFile(
+    GENERATION_BINDING_STORE, homeDir, generationId, fileName, serialized, reconcile, dependencies,
+  );
 }
 
 /**
@@ -1010,7 +1140,7 @@ export function recordMigrationWitnessBinding(
   const binding = validateWitnessBinding(validatedInput.binding);
   const serialized = witnessWireContent(generationId, binding);
   const fileName = `witness-${binding.witnessChecksumSha256}.binding`;
-  const reconcile: GenerationBindingReconciler = (stored) => {
+  const reconcile: GenerationScopedReconciler = (stored) => {
     const parsed = parseStoredWitnessBinding(stored);
     if (
       parsed === undefined
@@ -1024,5 +1154,289 @@ export function recordMigrationWitnessBinding(
     }
     return "reused";
   };
-  recordGenerationBindingFile(homeDir, generationId, fileName, serialized, reconcile, dependencies);
+  recordGenerationScopedFile(
+    GENERATION_BINDING_STORE, homeDir, generationId, fileName, serialized, reconcile, dependencies,
+  );
+}
+
+// ---------------------------------------------------------------------------
+// Read side. See the module doc comment.
+// ---------------------------------------------------------------------------
+
+/** One authenticated generation directory's published files, or why it
+ * could not be read. "absent" is concluded only from positive absence
+ * under an authenticated parent, or from an authenticated generation
+ * directory that holds no final file; everything else is "unresolvable". */
+export type GenerationScopedRead =
+  | Readonly<{ kind: "absent" }>
+  | Readonly<{ kind: "unresolvable"; reason: string }>
+  | Readonly<{ kind: "present"; files: readonly Readonly<{ name: string; content: string }>[] }>;
+
+/** Dependency-injection shape for the reader: override the bounded reader
+ * or the expected owning uid. */
+export type ReadGenerationScopedFilesDependencies = Readonly<{
+  readWithStat?: typeof readBoundedRegularFileWithStat;
+  expectedUid?: number;
+}>;
+
+const GENERATION_SCOPED_ABSENT: GenerationScopedRead = { kind: "absent" };
+
+function generationScopedUnresolvable(reason: string): GenerationScopedRead {
+  return { kind: "unresolvable", reason };
+}
+
+/**
+ * A lone scratch file's content, or undefined when it cannot be read as a
+ * bounded private regular file. The read itself enforces the only shape a
+ * lone writer scratch file can legitimately have -- a regular file with a
+ * single link, owned by the expected uid, with the writer's mode
+ * (requireSingleLink, expectedUid, allowedModes) -- so a separate shape
+ * check would be redundant with it (review r1 matrix A19-03 / A19-06).
+ */
+function readLoneScratchContent(
+  path: string,
+  directory: string,
+  store: GenerationScopedStore,
+  expectedUid: number | undefined,
+  readWithStat: typeof readBoundedRegularFileWithStat,
+): string | undefined {
+  try {
+    return readWithStat(path, {
+      allowedRoot: directory,
+      maxBytes: store.maxFileBytes,
+      expectedUid,
+      allowedModes: [PRIVATE_FILE_MODE],
+      requireSingleLink: true,
+    }).content;
+  } catch {
+    return undefined;
+  }
+}
+
+function scanGenerationScopedDirectory(
+  store: GenerationScopedStore,
+  directory: string,
+  expectedUid: number | undefined,
+  readWithStat: typeof readBoundedRegularFileWithStat,
+): GenerationScopedRead {
+  const files: { name: string; content: string }[] = [];
+  const twinPaths = new Set<string>();
+  const scratchEntries: { entry: string; finalName: string }[] = [];
+  for (const entry of readdirSync(directory).sort()) {
+    const path = join(directory, entry);
+    if (store.isFinalFileName(entry)) {
+      const read = readWithStat(path, {
+        allowedRoot: directory,
+        maxBytes: store.maxFileBytes,
+        expectedUid,
+        allowedModes: [PRIVATE_FILE_MODE],
+      });
+      if (read.nlink !== "1") {
+        const twin = findAuthenticatedScratchTwin(path, directory, store, expectedUid, readWithStat);
+        if (twin === undefined) {
+          return generationScopedUnresolvable(entry + " has multiple hard links that are not an authenticated scratch twin");
+        }
+        twinPaths.add(twin.twinPath);
+      }
+      files.push({ name: entry, content: read.content });
+      continue;
+    }
+    const scratchOf = WRITER_SCRATCH_ENTRY_PATTERN.exec(entry)?.[1];
+    if (scratchOf === undefined || !store.isFinalFileName(scratchOf)) {
+      return generationScopedUnresolvable("unknown entry " + entry);
+    }
+    scratchEntries.push({ entry, finalName: scratchOf });
+  }
+  // A scratch entry is ignorable only when it is the authenticated twin of a
+  // final file, or a lone single-link file whose content is byte-identical
+  // to the published file of the same name -- stale debris after a completed
+  // write. Any other lone scratch may be the only copy of a binding whose
+  // final name was lost, or an interrupted write of unknown outcome.
+  for (const { entry, finalName } of scratchEntries) {
+    const path = join(directory, entry);
+    if (twinPaths.has(path)) continue;
+    const published = files.find((file) => file.name === finalName);
+    if (
+      published === undefined
+      || readLoneScratchContent(path, directory, store, expectedUid, readWithStat) !== published.content
+    ) {
+      return generationScopedUnresolvable("scratch entry " + entry + " is not an authenticated writer scratch file");
+    }
+  }
+  return files.length === 0 ? GENERATION_SCOPED_ABSENT : { kind: "present", files };
+}
+
+/**
+ * Read every published file of one generation's directory, authenticating
+ * each directory on the way down (owner uid, mode, no symlink) and each
+ * file with the writers' bounded-read rules. Synchronous and read-only: it
+ * never creates, repairs or deletes anything. The caller parses the
+ * returned content with its own strictness; this function only decides
+ * between the three honest answers.
+ */
+export function readGenerationScopedFiles(
+  store: GenerationScopedStore,
+  input: Readonly<{ homeDir: string; generationId: string }>,
+  dependencies: ReadGenerationScopedFilesDependencies = {},
+): GenerationScopedRead {
+  const expectedUid = dependencies.expectedUid ?? currentUid();
+  const readWithStat = dependencies.readWithStat ?? readBoundedRegularFileWithStat;
+  try {
+    const rootHandle = openPrivateDirectory(rootPath(input.homeDir), { expectedUid });
+    try {
+      const storeHandle = openPrivateDirectoryIfExists(
+        generationScopedStoreDirectory(store, input.homeDir),
+        { expectedUid },
+      );
+      if (storeHandle === undefined) return GENERATION_SCOPED_ABSENT;
+      try {
+        const directory = generationScopedDirectory(store, input.homeDir, input.generationId);
+        const generationHandle = openPrivateDirectoryIfExists(directory, { expectedUid });
+        if (generationHandle === undefined) return GENERATION_SCOPED_ABSENT;
+        try {
+          return scanGenerationScopedDirectory(store, directory, expectedUid, readWithStat);
+        } finally {
+          generationHandle.close();
+        }
+      } finally {
+        storeHandle.close();
+      }
+    } finally {
+      rootHandle.close();
+    }
+  } catch (error) {
+    return generationScopedUnresolvable(store.noun + " store cannot be read: " + (error as Error).message);
+  }
+}
+
+/** coordinator-seam-FROZEN.md v4 section 14, verbatim. */
+export type MigrationWitnessResolution =
+  | Readonly<{
+    state: "resolved";
+    /** Ascending by manifestRevision, ties by witnessChecksumSha256. */
+    witnesses: readonly MigrationWitnessBinding[];
+    /** Ascending by manifestRevision, ties by kind. */
+    selections: readonly MigrationSelectionBinding[];
+  }>
+  | Readonly<{ state: "authoritatively-absent" }>
+  | Readonly<{ state: "unresolvable"; reason: string }>;
+
+type ParsedGenerationBindingFile =
+  | Readonly<{ selection: MigrationSelectionBinding; witness?: undefined }>
+  | Readonly<{ witness: MigrationWitnessBinding; selection?: undefined }>;
+
+/**
+ * Parse one stored file with the writers' exact strictness: the envelope
+ * keys, the module's own wire version, the generationId cross-check, the
+ * full validate*Binding pass, the file name's key against the embedded
+ * binding (kind for a selection, checksum for a witness), and finally the
+ * writer's canonical bytes -- a file that is not byte-for-byte what a
+ * writer would have produced is not trusted. Throws on any deviation.
+ */
+function parseStoredGenerationBindingFile(
+  name: string,
+  content: string,
+  generationId: string,
+): ParsedGenerationBindingFile {
+  const envelope: unknown = JSON.parse(content);
+  if (
+    !isRecord(envelope)
+    || !exactKeys(envelope, ["binding", "generationId", "version"])
+    || envelope.version !== GENERATION_BINDING_WIRE_VERSION
+    || envelope.generationId !== generationId
+  ) {
+    throw new MigrationBindingValidationError("envelope is invalid");
+  }
+  if (name.startsWith("selection-")) {
+    const selection = validateSelectionBinding(envelope.binding);
+    if (name !== "selection-" + selection.kind + ".binding") {
+      throw new MigrationBindingValidationError("file name does not match the stored selection kind");
+    }
+    if (content !== selectionWireContent(generationId, selection)) {
+      throw new MigrationBindingValidationError("content is not canonical");
+    }
+    return { selection };
+  }
+  const witness = validateWitnessBinding(envelope.binding);
+  if (name !== "witness-" + witness.witnessChecksumSha256 + ".binding") {
+    throw new MigrationBindingValidationError("file name does not match the stored witness checksum");
+  }
+  if (content !== witnessWireContent(generationId, witness)) {
+    throw new MigrationBindingValidationError("content is not canonical");
+  }
+  return { witness };
+}
+
+/**
+ * Ascending by manifestRevision, ties by the entry's file-name key (unique
+ * per entry, so the order is total). Sorting zero-padded string keys with
+ * the default sort keeps the order independent of the locale.
+ */
+function orderedByRevision<T extends Readonly<{ manifestRevision: number }>>(
+  entries: readonly T[],
+  tieKey: (entry: T) => string,
+): readonly T[] {
+  const keyed = new Map(entries.map((entry) => [
+    String(entry.manifestRevision).padStart(16, "0") + ":" + tieKey(entry),
+    entry,
+  ]));
+  return [...keyed.keys()].sort().map((key) => keyed.get(key)!);
+}
+
+/**
+ * Boundary A (coordinator-seam-FROZEN.md v4 section 14): resolve every
+ * witness and selection binding recorded for a generation.
+ *
+ * - "authoritatively-absent": the store or this generation's directory is
+ *   positively absent under an authenticated parent, or the authenticated
+ *   directory holds no binding file.
+ * - "unresolvable": every other outcome -- an unauthenticated directory or
+ *   file, an unreadable entry, an unknown name, an unparseable or
+ *   non-canonical binding, a key that disagrees with its content, an
+ *   unauthenticated multi-link file.
+ * - "resolved": every entry parsed. Both arrays are ascending by
+ *   manifestRevision (section 14: ordering carries lineage; the current
+ *   authority is the last activation selection), never in directory-
+ *   listing order.
+ *
+ * Synchronous and read-only; never repairs, normalises or deletes.
+ */
+export function resolveMigrationWitnessBindings(
+  input: Readonly<{ homeDir: string; generationId: string }>,
+  dependencies: ReadGenerationScopedFilesDependencies = {},
+): MigrationWitnessResolution {
+  const homeDir = validateHomeDir(input.homeDir);
+  const generationId = validateGenerationId(input.generationId);
+  const read = readGenerationScopedFiles(GENERATION_BINDING_STORE, { homeDir, generationId }, dependencies);
+  if (read.kind === "absent") return { state: "authoritatively-absent" };
+  if (read.kind === "unresolvable") return { state: "unresolvable", reason: read.reason };
+  const witnesses: MigrationWitnessBinding[] = [];
+  const selections: MigrationSelectionBinding[] = [];
+  for (const file of read.files) {
+    let parsed: ParsedGenerationBindingFile;
+    try {
+      parsed = parseStoredGenerationBindingFile(file.name, file.content, generationId);
+    } catch (error) {
+      return { state: "unresolvable", reason: file.name + " cannot be trusted: " + (error as Error).message };
+    }
+    if (parsed.selection !== undefined) selections.push(parsed.selection);
+    else witnesses.push(parsed.witness);
+  }
+  // Protocol order: a rollback unwinds an activation, so its selection is
+  // recorded at a strictly later manifest revision. An equal or inverted
+  // pair cannot be ordered by revision and is not trusted.
+  const activation = selections.find((selection) => selection.kind === "activation");
+  const rollback = selections.find((selection) => selection.kind === "rollback");
+  if (activation !== undefined && rollback !== undefined && rollback.manifestRevision <= activation.manifestRevision) {
+    return {
+      state: "unresolvable",
+      reason: "the rollback selection (revision " + rollback.manifestRevision
+        + ") is not recorded after the activation selection (revision " + activation.manifestRevision + ")",
+    };
+  }
+  return {
+    state: "resolved",
+    witnesses: orderedByRevision(witnesses, (entry) => entry.witnessChecksumSha256),
+    selections: orderedByRevision(selections, (entry) => entry.kind),
+  };
 }

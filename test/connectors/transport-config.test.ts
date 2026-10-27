@@ -18,6 +18,7 @@ import {
   clearConnectorTransport,
   readConnectorTransport,
   readConnectorTransportSnapshot,
+  readPreToolRecallSnapshot,
   setConnectorTransport,
 } from "../../src/config-manager.js";
 import { PrivateMutationLockContentionError } from "../../src/private-mutation-lock.js";
@@ -303,5 +304,60 @@ describe("persisted connector transport configuration", () => {
     const after = lstatSync(configPath);
     expect(after.ino).not.toBe(before.ino);
     expect(after.mode & 0o777).toBe(0o600);
+  });
+});
+
+describe("persisted PreToolUse recall opt-in", () => {
+  it.each([
+    ["an absent config", undefined, false],
+    ["an empty config", { version: 1 }, false],
+    ["hooks without the key", { version: 1, hooks: { snapshotIntervalSec: 30 } }, false],
+    ["an explicit false", { version: 1, hooks: { preToolRecall: false } }, false],
+    ["an explicit true", { version: 1, hooks: { preToolRecall: true } }, true],
+  ] as const)("reads %s without taking the publication lock", async (_label, content, expected) => {
+    const { configPath } = makeHome(content);
+    await withBackendPublicationConfigLockAsync(configPath, async () => {
+      expect(readPreToolRecallSnapshot(configPath)).toBe(expected);
+    });
+    if (content === undefined) expect(existsSync(configPath)).toBe(false);
+  });
+
+  it.each([
+    ["a string", "true"],
+    ["a number", 1],
+    ["null", null],
+  ] as const)("refuses a stored %s value instead of guessing", (_label, value) => {
+    const { configPath } = makeHome({ version: 1, hooks: { preToolRecall: value } });
+    expect(() => readPreToolRecallSnapshot(configPath)).toThrow("hooks.preToolRecall");
+  });
+
+  it("refuses a malformed config", () => {
+    const { configPath } = makeHome();
+    writeFileSync(configPath, "{ not json", { mode: 0o600 });
+    expect(() => readPreToolRecallSnapshot(configPath)).toThrow();
+  });
+
+  it("rejects configuration drift between lock-free snapshots", () => {
+    const { configPath } = makeHome({ version: 1, hooks: { preToolRecall: true } });
+
+    expect(() => readPreToolRecallSnapshot(configPath, {
+      _afterFirstSnapshotForTesting: () => {
+        writeFileSync(configPath, JSON.stringify({ version: 1 }), { mode: 0o600 });
+      },
+    })).toThrow("Configuration changed during lock-free hook setting inspection");
+  });
+
+  it("rejects publication evidence that changes between snapshots", () => {
+    const content = JSON.stringify({ version: 1, hooks: { preToolRecall: true } });
+    const { home, configPath } = makeHome();
+    writeFileSync(configPath, content, { mode: 0o600 });
+    writeAbortedTerminalPublicationJournal(home, "terminal-publication-a", content);
+
+    expect(readPreToolRecallSnapshot(configPath)).toBe(true);
+    expect(() => readPreToolRecallSnapshot(configPath, {
+      _afterFirstSnapshotForTesting: () => {
+        writeAbortedTerminalPublicationJournal(home, "terminal-publication-b", content);
+      },
+    })).toThrow("Backend publication changed during lock-free hook setting inspection.");
   });
 });

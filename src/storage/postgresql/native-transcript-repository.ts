@@ -15,6 +15,7 @@ import {
   type NativeTranscriptCheckpointRecord,
   type NativeTranscriptMessageLinkRecord,
   type NativeTranscriptMessageSnapshotRepository,
+  type NativeTranscriptProvenanceRepository,
   type NativeTranscriptRecord,
   type NativeTranscriptRepository,
   type NativeTranscriptSessionMessageRecord,
@@ -105,6 +106,10 @@ type SourceLocatorRow = QueryResultRow & {
   locator_count: unknown;
 };
 
+type LinkedSourceOrdinalRow = QueryResultRow & {
+  source_ordinal: unknown;
+};
+
 type TranscriptRow = QueryResultRow & {
   transcript_id: unknown;
   project_id: unknown;
@@ -153,6 +158,7 @@ type SessionMessageRow = QueryResultRow & {
   message_sequence: unknown;
   role: unknown;
   content: unknown;
+  is_compaction_event: unknown;
 };
 
 type TransactionIsolationRow = QueryResultRow & {
@@ -930,6 +936,7 @@ type CheckpointLockDisposition =
 export class PostgreSqlNativeTranscriptRepository
 implements
   NativeTranscriptMessageSnapshotRepository,
+  NativeTranscriptProvenanceRepository,
   NativeTranscriptRepository {
   private readonly projectId: string;
 
@@ -1196,6 +1203,50 @@ implements
     });
   }
 
+  async listLinkedSourceOrdinals(
+    input: NativeTranscriptCheckpointKey & { readonly nativeSessionId: string },
+  ): Promise<readonly number[]> {
+    const operation = "listLinkedSourceOrdinals";
+    const key = this.validateKey(input, operation);
+    const nativeSessionId = nonemptyString(
+      input.nativeSessionId,
+      this.projectId,
+      operation,
+      "native_session_id",
+      true,
+    );
+    return this.read(operation, async (executor) => {
+      const result = await executor.query<LinkedSourceOrdinalRow>({
+        text: `SELECT DISTINCT transcript.source_ordinal
+               FROM lcm.native_transcripts AS transcript
+               INNER JOIN lcm.transcript_messages AS link
+                 ON link.project_id = transcript.project_id
+                AND link.transcript_id = transcript.transcript_id
+               WHERE transcript.project_id = $1
+                 AND transcript.machine_id = $2
+                 AND transcript.client_name = $3
+                 AND transcript.source_locator = $4
+                 AND transcript.native_session_id_sha256 =
+                   public.digest($5, 'sha256')
+                 AND transcript.native_session_id = $5
+               ORDER BY transcript.source_ordinal`,
+        values: [
+          this.projectId,
+          key.machineId,
+          key.clientName,
+          key.sourceLocator,
+          nativeSessionId,
+        ],
+      }, this.context(operation));
+      return result.rows.map((row) => nonnegativeInteger(
+        row.source_ordinal,
+        this.projectId,
+        operation,
+        "source_ordinal",
+      ));
+    });
+  }
+
   async getCheckpoint(
     input: NativeTranscriptCheckpointKey,
   ): Promise<NativeTranscriptCheckpointRecord | null> {
@@ -1241,7 +1292,16 @@ implements
                       message.message_id,
                       message.seq AS message_sequence,
                       message.role,
-                      message.content
+                      message.content,
+                      EXISTS (
+                        SELECT 1
+                        FROM lcm.message_parts AS compaction_part
+                        WHERE compaction_part.project_id = message.project_id
+                          AND compaction_part.conversation_id =
+                            message.conversation_id
+                          AND compaction_part.message_id = message.message_id
+                          AND compaction_part.part_type = 'compaction'
+                      ) AS is_compaction_event
                FROM lcm.conversations AS conversation
                INNER JOIN lcm.messages AS message
                  ON message.project_id = conversation.project_id
@@ -1281,6 +1341,12 @@ implements
           this.projectId,
           operation,
           "content",
+        ),
+        isCompactionEvent: boolean(
+          row.is_compaction_event,
+          this.projectId,
+          operation,
+          "is_compaction_event",
         ),
       }));
     });

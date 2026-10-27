@@ -607,4 +607,53 @@ describe("restore route coverage", () => {
     parse.mockRestore();
     expect(output.json()).toEqual({ error: "restore failed" });
   });
+
+  it("restores full memory for a Codex compact without touching instruction files or rows", async () => {
+    state.rows = [{ content: "episode" }];
+    state.promoted = [promoted("project")];
+    state.passive = [promoted("passive")];
+    state.instructionContent = "file rules that must not be read";
+    state.instructionRow = {
+      clientName: "codex",
+      sessionId: "s",
+      worktreePath: "/tmp",
+      cwdPath: "/tmp",
+      content: "stored rules",
+      contentHash: "stored",
+      updatedAt: "now",
+    };
+    const body = await call(JSON.stringify({ session_id: "s", cwd: "/tmp", source: "compact", client: "codex" }));
+    expect(body.context).toContain("orientation");
+    expect(body.context).toContain("<recent-session-context>episode</recent-session-context>");
+    expect(body.context).toContain("content project");
+    expect(body.context).toContain("<project-instructions>\nstored rules\n</project-instructions>");
+    expect(body).toHaveProperty("insights.0.content", "content passive");
+    expect(state.instructionPaths.filter((path) => path.endsWith("AGENTS.md"))).toEqual([]);
+    expect(state.instructionUpserts).toEqual([]);
+    expect(state.instructionDeletes).toBe(0);
+  });
+
+  it("keeps the Codex compact on existing storage", async () => {
+    state.exists = false;
+    const body = await call(JSON.stringify({ session_id: "s", cwd: "/tmp", source: "compact", client: "codex" }));
+    expect(body).toEqual({ context: "orientation" });
+    expect(state.openCount).toBe(0);
+  });
+
+  it("restores full memory for a Codex resume inside the LCM compaction window", async () => {
+    justCompactedMap.set("s", Date.now());
+    state.rows = [{ content: "episode" }];
+    state.instructionContent = "file rules";
+    const body = await call(JSON.stringify({ session_id: "s", cwd: "/tmp", source: "resume", client: "codex" }));
+    expect(body.context).toContain("<recent-session-context>episode</recent-session-context>");
+    expect(body.context).toContain("file rules");
+    expect(state.instructionUpserts).toHaveLength(1);
+  });
+
+  it("still strips a Claude restore inside the LCM compaction window", async () => {
+    justCompactedMap.set("s", Date.now());
+    state.rows = [{ content: "episode" }];
+    const body = await call(JSON.stringify({ session_id: "s", cwd: "/tmp", source: "resume" }));
+    expect(body).toEqual({ context: "orientation" });
+  });
 });

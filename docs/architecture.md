@@ -43,7 +43,8 @@ project opens. Unresolved or inconsistent publication, identity, or runtime
 state fails closed with sanitized `409` identity or `503` storage responses;
 the daemon never opens a project SQLite database as fallback. Request
 cancellation closes the active project, and daemon shutdown aborts and drains
-background consumers before closing the shared factory. The local SQLite hook
+background consumers, including their still-pending project opens, before
+closing the shared factory. The local SQLite hook
 outbox and metadata-only transcript quarantine remain local and are not
 general caches or activation paths. CLI/import-export remains #618-owned.
 Stats, pool diagnostics, status, and doctor use a shared sanitized,

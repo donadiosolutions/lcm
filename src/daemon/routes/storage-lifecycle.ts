@@ -129,6 +129,23 @@ export type ProjectStorageOperation<T> = (
   publicationLockToken?: BackendPublicationLockToken,
 ) => Promise<T> | T;
 
+/** Private executions still running on each caller-supplied (shared) factory. */
+const sharedFactoryExecutions = new WeakMap<StorageBackendFactory, Set<Promise<void>>>();
+
+/**
+ * Resolve once every `withProjectStorage` execution on this shared factory has
+ * finished its private open, operation and project close. A route's public
+ * promise may reject early on abort while its private open is still pending, so
+ * the owner of the factory waits here before closing it. Never rejects.
+ */
+export async function settleProjectStorageExecutions(factory: StorageBackendFactory): Promise<void> {
+  let pending = sharedFactoryExecutions.get(factory);
+  while (pending !== undefined && pending.size > 0) {
+    await Promise.all(pending);
+    pending = sharedFactoryExecutions.get(factory);
+  }
+}
+
 /**
  * A read prefix failure that the daemon's own publication work may have caused:
  * publication-lock contention from factory creation, identity, or the open, or
@@ -372,6 +389,14 @@ export async function withProjectStorage<T>(
     // project cleanup have completed.
     await closeRouteStorage(ownedFactory);
   });
+  if (request.factory !== undefined) {
+    const executions = sharedFactoryExecutions.get(request.factory) ?? new Set<Promise<void>>();
+    sharedFactoryExecutions.set(request.factory, executions);
+    const tracked: Promise<void> = settledExecution
+      .then(() => undefined, () => undefined)
+      .then(() => { executions.delete(tracked); });
+    executions.add(tracked);
+  }
   if (request.context?.withPublicationAdmission === undefined
       && request.context?.publicationLockToken !== undefined) {
     return settledExecution;

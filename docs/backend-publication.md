@@ -181,8 +181,10 @@ compare-and-swap; completion is reserved for a caller that has authoritative
 terminal readback. A source-preserving abort verifies the original selection
 evidence and never invokes the version-2 target config/map restoration path.
 
-After `maintenance-aborted`, normal configuration loading resumes for SQLite,
-including installations whose configuration file is absent. After
+After `maintenance-aborted`, normal configuration loading resumes for the
+source backend the journal recorded when the window was entered: SQLite for an
+activation's window, including installations whose configuration file is
+absent, and PostgreSQL for a rollback's. After
 `selection-completed`, it resumes for the target backend recorded in the
 journal. Entering, held, and prepared maintenance continue to block normal
 configuration reads. A terminal journal for a different backend is also refused.
@@ -275,8 +277,10 @@ pre-journal directory state, does not block durable local enqueue. Existing
 journals must still have an authenticated supported shape; malformed or unknown
 versions and unsafe paths refuse. Consumer operations remain fenced until their
 own authoritative terminal readback.
-After an authenticated abort, SQLite consumer admission resumes. After selected-
-generation completion, only the recorded target backend is admitted.
+After an authenticated abort, consumer admission resumes for the journal's
+recorded source backend (SQLite for an activation's window, PostgreSQL for a
+rollback's). After selected-generation completion, only the recorded target
+backend is admitted.
 
 A daemon that is already running authenticates its startup backend once and
 keeps it for its whole lifetime. Changing the configured backend underneath it
@@ -643,7 +647,7 @@ When the coordinator does ask it to acquire, the provider reads the row first:
   generation, not a failed read, while acquiring: a released one is replaced
   by a new generation, and an unreleased one ends in the guard's
   `publication-conflict` below. Reading for release still reports the
-  mismatch;
+  mismatch, except through the reconciliation read described after this list;
 - an unreleased row of any other generation: the guard refuses with
   `publication-conflict` and the coordinator fails closed. A foreign
   machine's row that is still active and names this publication, target
@@ -651,6 +655,26 @@ When the coordinator does ask it to acquire, the provider reads the row first:
   is never journalled as ours. An inactive foreign row is returned unchanged.
   A released one can then be reclaimed by acquiring, but an expired row that
   was never released fails closed with `publication-conflict`.
+
+When the guard offers `readForReleaseReconciliation` (the production
+PostgreSQL guard does), the provider also declares
+`readRemoteGuardForReleaseReconciliation`. It returns the project's row
+whichever generation it names, including another target backend, evidence or
+machine, and the coordinator uses it for its release-phase reads. A crash can
+leave the journal at `releasing` (or `abort-releasing`) after the remote
+release committed, and a publication from another home may then acquire the
+released row. The guard rebinds a row to another identity only when it is
+released and always gives the new row a strictly greater fencing token, so a
+row of another identity with a greater token than the journalled fence proves
+that fence was released. The coordinator then skips that project: it does not
+release, renew or acquire the successor's row, never journals the successor's
+fence, and records its own journalled fence as released no later than the
+successor's acquisition so the terminal journal holds no active fence. It
+continues with the next project and finishes the release. A same-identity
+row, an equal or lower token, another project, a malformed token, a corrupt
+row, an unattributable read, or a provider that does not declare the
+capability still fails closed with `unexpected-state`. The read after
+reacquiring an expired fence never inherits this proof.
 
 The activation step's lease assertion before it drives the coordinator is a
 fail-fast check only. The coordinator re-reads the fence independently, so a

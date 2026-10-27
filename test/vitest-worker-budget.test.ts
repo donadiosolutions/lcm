@@ -96,9 +96,52 @@ describe("local Vitest worker budget", () => {
     });
   });
 
+  describe("PostgreSQL cutover rehearsal profile", () => {
+    const rehearsalTest = "test/postgresql/cutover-rehearsal.integration.ts";
+
+    it.each([{}, { LCM_TEST_POSTGRES_CUTOVER_REHEARSAL: "false" }, { LCM_TEST_POSTGRES_CUTOVER_REHEARSAL: "1" }])(
+      "keeps the rehearsal file in the ordinary integration run for %j",
+      (environment) => {
+        const configuration = createPostgresqlVitestConfiguration(environment);
+
+        expect(configuration.test.include).toEqual(["test/postgresql/**/*.integration.ts"]);
+        expect(configuration.test.exclude).not.toContain(rehearsalTest);
+      },
+    );
+
+    it("includes only the rehearsal file when the opt-in flag is set", () => {
+      const configuration = createPostgresqlVitestConfiguration({ LCM_TEST_POSTGRES_CUTOVER_REHEARSAL: "true" });
+
+      expect(configuration.test.include).toEqual([rehearsalTest]);
+      expect(configuration.test.exclude).toEqual([]);
+    });
+
+    it("refuses the census-cost and rehearsal flags together", () => {
+      expect(() => createPostgresqlVitestConfiguration({
+        LCM_TEST_POSTGRES_CENSUS_COST: "true",
+        LCM_TEST_POSTGRES_CUTOVER_REHEARSAL: "true",
+      })).toThrow("mutually exclusive");
+    });
+
+    it("keeps the fork probe selection when the rehearsal flag is also set", () => {
+      const configuration = createPostgresqlVitestConfiguration({
+        LCM_TEST_POSTGRES_CUTOVER_REHEARSAL: "true",
+        LCM_TEST_POSTGRES_FORK_PROBE: "true",
+      });
+
+      expect(configuration.test.include).toEqual(["test/postgresql/fixtures/persistent-worker.integration.ts"]);
+    });
+  });
+
   it.each(["true", "1"])("keeps PostgreSQL CI sizing at one when CPU discovery is zero and CI is %s", (CI) => {
     const configuration = createPostgresqlVitestConfiguration({ CI }, () => 0);
 
     expect(configuration.test.maxWorkers).toBe(1);
+  });
+
+  it("keeps the passing-test lines out of the capture-capped harness output", () => {
+    const configuration = createPostgresqlVitestConfiguration({});
+
+    expect(configuration.test.slowTestThreshold).toBeGreaterThan(configuration.test.testTimeout);
   });
 });

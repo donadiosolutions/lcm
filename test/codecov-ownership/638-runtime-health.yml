@@ -1,0 +1,19 @@
+references: ["#638"]
+rationale: >-
+  #638 adds the pool, migration, extension and queue runtime health families
+  to the backend diagnostic snapshot. The pure interpretation module and its
+  PostgreSQL probe adapter are new files that join the existing diagnostics
+  owner next to the collector and renderer they extend. The two src/db files
+  only carry an internal oldest pending capture time and keep their existing
+  persistence owner. The pool observation boundary in the PostgreSQL runtime
+  and its typed rejection error in the PostgreSQL errors module gain a closed
+  rejection reason and keep their existing runtime owner.
+pins:
+  - ["src/storage/runtime-health.ts", "unit-diagnostics"]
+  - ["src/storage/postgresql/runtime-health.ts", "unit-diagnostics"]
+  - ["src/storage/diagnostics.ts", "unit-diagnostics"]
+  - ["src/storage/diagnostic-renderer.ts", "unit-diagnostics"]
+  - ["src/db/event-sidecars.ts", "unit-local-persistence"]
+  - ["src/db/events-stats.ts", "unit-local-persistence"]
+  - ["src/storage/postgresql/runtime.ts", "integration-postgresql-runtime"]
+  - ["src/storage/postgresql/errors.ts", "integration-postgresql-runtime"]

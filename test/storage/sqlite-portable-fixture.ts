@@ -82,7 +82,7 @@ export function seedPortableSqlite(databasePath: string, input: {
     const f = SQLITE_PORTABLE_FIXTURE;
     const t = f.timestamp.replace("T", " ").replace("Z", "");
     db.exec("BEGIN");
-    db.prepare("INSERT INTO conversations(conversation_id,session_id,title,created_at,updated_at) VALUES(71,?,'SQLite source',?,?)").run(f.sessionId, t, t);
+    db.prepare("INSERT INTO conversations(conversation_id,session_id,title,created_at,updated_at,parent_session_id) VALUES(71,?,'SQLite source',?,?,'sqlite-parent-thread')").run(f.sessionId, t, t);
     db.prepare("INSERT INTO messages(message_id,conversation_id,seq,role,content,token_count,created_at) VALUES(83,71,?,'assistant','SQLite source message',?,?)").run(9007199254740993n, 9007199254740995n, t);
     db.prepare(`INSERT INTO message_parts(part_id,message_id,session_id,part_type,ordinal,text_content,
       is_ignored,is_synthetic,tool_call_id,tool_name,tool_status,tool_input,tool_output,tool_error,tool_title,

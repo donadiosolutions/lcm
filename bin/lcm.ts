@@ -1,6 +1,6 @@
 #!/usr/bin/env node
 import { randomUUID } from "node:crypto";
-import { realpathSync } from "node:fs";
+import { lstatSync, realpathSync } from "node:fs";
 import { argv, exit, kill as processKill, stdin, stdout } from "node:process";
 import { homedir } from "node:os";
 import { isAbsolute, join, relative, resolve } from "node:path";
@@ -14,6 +14,41 @@ import {
   type InvocationControlRequest,
   type InvocationControlResponse,
 } from "../src/daemon/client.js";
+import { performMigrationPlan } from "../src/migration/cli-plan.js";
+import { performMigrationDryRunCheck } from "../src/migration/cli-dry-run.js";
+import { performMigrationApply } from "../src/migration/cli-apply.js";
+import { performMigrationAbortCommand } from "../src/migration/cli-abort.js";
+import { performMigrationVerifyCommand } from "../src/migration/cli-verify.js";
+import { performMigrationResumeCommand } from "../src/migration/cli-resume.js";
+import { performMigrationReportCommand } from "../src/migration/cli-report.js";
+import { performMigrationActivateCommand } from "../src/migration/cli-activate.js";
+import { performMigrationRollbackCommand } from "../src/migration/cli-rollback.js";
+import {
+  performSetAbort,
+  performSetActivate,
+  performSetApply,
+  performSetDryRun,
+  performSetPlan,
+  performSetReport,
+  performSetResume,
+  performSetRollback,
+  performSetVerify,
+} from "../src/migration/cli-cutover-set.js";
+import {
+  renderMigrationPlanEnvelope,
+  renderMigrationDryRunEnvelope,
+  renderMigrationApplyEnvelope,
+  renderMigrationAbortEnvelope,
+  renderMigrationVerifyEnvelope,
+  renderMigrationResumeEnvelope,
+  renderMigrationReportEnvelope,
+  renderMigrationActivateEnvelope,
+  renderMigrationRollbackEnvelope,
+  renderMigrationSetEnvelope,
+  renderMigrationUnexpectedFailureEnvelope,
+} from "../src/migration/cli-render.js";
+import type { MigrationCommandName } from "../src/migration/exit-classes.js";
+import { serializeMigrationEnvelope, type MigrationEnvelope } from "../src/migration/envelope.js";
 import {
   ConfigValidationError,
   DEFAULT_LLM_MAX_CONCURRENCY,
@@ -37,10 +72,12 @@ import {
   daemonPidPath,
   daemonTokenPath,
   lcmHomeDir,
+  legacyLcmHomeDir,
   migrateLegacyHomeIfNeeded,
   projectsDir as lcmProjectsDir,
 } from "../src/runtime-paths.js";
 import type { ProgressState } from "../src/cli/progress-state.js";
+import { writeHookOutput } from "../src/cli/hook-output.js";
 import { CliProjectStorageMissingError } from "../src/cli-storage.js";
 import { StorageIdentityConfigurationError, TransportedUnboundProjectError, UNBOUND_POSTGRESQL_PROJECT_MESSAGE } from "../src/storage/identity-context.js";
 import { MachineIdentityFileError } from "../src/machine-identity.js";
@@ -54,7 +91,9 @@ import {
 } from "../src/storage/backend-publication.js";
 import { BACKEND_PUBLICATION_ADMISSION_DIAGNOSTIC } from "../src/hooks/publication-fence.js";
 import { sanitizeTerminalText } from "../src/terminal-sanitize.js";
+import { resolveLcmConfig } from "../src/db/config.js";
 import { isDaemonTransportFailure } from "../src/daemon/http-url.js";
+import { sameEnvelope } from "../src/daemon/passive-event-replication.js";
 import {
   clearDaemonRemediation,
   isDaemonRefusalReason,
@@ -1009,6 +1048,20 @@ function withHookClient(stdinText: string, client: unknown): string {
   return withHookOverrides(stdinText, client, undefined);
 }
 
+/** Dispatch a hook; Codex invocations additionally leave a best-effort LCM-local completion record. */
+async function dispatchObservedHook(
+  command: "restore" | "user-prompt" | "post-tool" | "pre-tool" | "session-snapshot",
+  input: string,
+  client: unknown,
+  context?: { transport?: "cli" | "mcp" },
+): Promise<{ exitCode: number; stdout: string }> {
+  const { dispatchHook } = await import("../src/hooks/dispatch.js");
+  const run = () => context === undefined ? dispatchHook(command, input) : dispatchHook(command, input, context);
+  if (client !== "codex") return run();
+  const { runObservedCodexHook } = await import("../src/hooks/codex-hook-receipts.js");
+  return runObservedCodexHook({ client, command, stdinText: input }, run);
+}
+
 async function withCustomHelp(cmd: Command, commandName: string): Promise<never> {
   const { printHelp } = await import("../src/cli-help.js");
   printHelp(commandName);
@@ -1229,6 +1282,14 @@ function isNestedUnderRoot(actionCommand: Command, parentName: string, actionNam
 
 function shouldRunRootBootstrapMigration(actionCommand: Command): boolean {
   if (isNestedUnderRoot(actionCommand, "daemon", "restart")) return false;
+  // Each migration subcommand owns a state of the cutover, including the ones that leave a
+  // maintenance hold, and the bootstrap's publication admission refuses while the hold exists.
+  // The bootstrap can only still do work when a legacy home waits to be moved into an absent
+  // active root; a completed migration keeps the legacy directory as evidence and does not count.
+  if (isNestedUnderRoot(actionCommand, "migration")) {
+    const stat = (path: string) => { try { return lstatSync(path); } catch { return undefined; } };
+    return stat(legacyLcmHomeDir())?.isDirectory() === true && stat(lcmHomeDir()) === undefined;
+  }
   const action = actionCommand.name();
   const topLevel = actionCommand.parent?.name() === "lcm";
   if (topLevel && (
@@ -1241,19 +1302,26 @@ function shouldRunRootBootstrapMigration(actionCommand: Command): boolean {
   // admission policy. SessionStart bootstrap and installation own legacy-root
   // migration, so the global preflight must not turn publication-lock
   // contention into a hook failure before the handler runs.
+  // A bare `lcm compact` is the legacy PreCompact hook command; with
+  // LCM_ENABLED=false it is skipped by its action, so it must not run the
+  // preflight either.
   if (topLevel && (
     action === "post-tool"
+    || action === "pre-tool"
     || action === "restore"
     || action === "session-end"
     || action === "session-snapshot"
     || action === "user-prompt"
-    || (action === "compact" && actionCommand.opts<{ hook?: boolean }>().hook === true)
+    || (action === "compact" && (
+      actionCommand.opts<{ hook?: boolean }>().hook === true
+      || !resolveLcmConfig(process.env).enabled
+    ))
   )) return false;
   if (topLevel && action === "status") return false;
   if (topLevel && (action === "stats" || action === "doctor")) return false;
   if (topLevel && (action === "diagnose" || action === "help")) return false;
   if ((action === "list" || action === "doctor") && actionCommand.parent?.name() === "connectors") return false;
-  if (topLevel && ["daemon", "config", "machine", "project", "postgres", "events", "connectors"].includes(action)) return false;
+  if (topLevel && ["daemon", "config", "machine", "project", "postgres", "migration", "events", "connectors"].includes(action)) return false;
   return true;
 }
 
@@ -1588,26 +1656,6 @@ async function withPassiveEventOperatorSession<T>(
   } finally {
     await session.close();
   }
-}
-
-function passiveEventReadbackMatches(
-  local: LocalHookEventRow,
-  remote: PostgreSqlPassiveEventRecord,
-): boolean {
-  const payload = remote.payload as Record<string, unknown>;
-  return local.machine_id === remote.machineId
-    && local.event_uuid === remote.eventId
-    && local.event_version === remote.eventVersion
-    && BigInt(local.machine_sequence) === remote.machineSequence
-    && local.type === remote.eventType
-    && payload.sessionId === local.session_id
-    && payload.sessionSequence === local.seq
-    && payload.category === local.category
-    && payload.data === local.data
-    && payload.priority === local.priority
-    && payload.sourceHook === local.source_hook
-    && payload.previousEventId === local.prev_event_id
-    && payload.createdAt === local.created_at;
 }
 
 function serializablePassiveEvent(record: PostgreSqlPassiveEventRecord): Record<string, unknown> {
@@ -2052,6 +2100,369 @@ export function registerMachineCommand(program: Command): void {
 
   program.addCommand(machineCmd);
 }
+
+
+/**
+ * Section 3's `lcm migration` command group -- `plan`, `dry-run`, `apply`,
+ * `resume`, `verify`, `report`, `abort`, `activate` and `rollback`.
+ * Modelled on `registerPostgreSqlCommand` above.
+ *
+ * Every action handler is thin glue by design: call the orchestration
+ * function from `src/migration/cli-*.ts`, call the matching `render*`
+ * function from `src/migration/cli-render.ts` to build the section 10
+ * envelope, then emit it. All classification, evidence construction and
+ * exit-class lookup happens in those already-unit-tested modules, not
+ * here -- this function's own job is argument parsing and I/O routing.
+ *
+ * **Section 10's stream separation.** `--json` prints exactly the
+ * envelope to stdout, written once, via `writeCliOutput`; without
+ * `--json`, stdout carries one short human-readable summary line built
+ * only from already-sanitized envelope fields. Progress and diagnostic
+ * text always go to stderr via `writeCliError`, regardless of `--json`,
+ * so stdout's single document is never mixed with anything else.
+ */
+function migrationHumanSummary(envelope: MigrationEnvelope): string {
+  if (envelope.refusal !== null) {
+    const generation = envelope.generation === null ? "" : ` [generation=${envelope.generation}]`;
+    return `Refused (${envelope.outcome}, exit ${envelope.exitCode}): ${envelope.refusal.reason}${generation} -- ${envelope.refusal.remedy}`;
+  }
+  const parts = [`${envelope.command}: ok (exit 0)`];
+  if (envelope.generation !== null) parts.push(`generation=${envelope.generation}`);
+  if (envelope.manifestPhase !== null) parts.push(`phase=${envelope.manifestPhase}`);
+  parts.push(`applied=${String(envelope.applied)}`);
+  if (envelope.next !== null) parts.push(`next=${envelope.next}`);
+  return parts.join(" ");
+}
+
+function emitMigrationEnvelope(
+  command: MigrationCommandName,
+  build: () => MigrationEnvelope,
+  jsonFlag: boolean | undefined,
+): void {
+  // Rendering can itself fail (an unmapped reason, evidence the sanitizer
+  // refuses to emit). Exactly one document is still printed.
+  let envelope: MigrationEnvelope;
+  try {
+    envelope = build();
+  } catch (error) {
+    envelope = renderMigrationUnexpectedFailureEnvelope(command, error);
+  }
+  if (jsonFlag) {
+    writeCliOutput(serializeMigrationEnvelope(envelope));
+  } else {
+    writeCliOutput(`${migrationHumanSummary(envelope)}\n`);
+  }
+  process.exitCode = envelope.exitCode;
+}
+
+export function registerMigrationCommand(program: Command): void {
+  type MigrationJsonOptions = { help?: boolean; json?: boolean; set?: boolean };
+  type MigrationApplyOptions = MigrationJsonOptions & {
+    confirmGeneration?: string;
+    confirmBackend?: string;
+    generation?: string;
+    dryRun?: boolean;
+    maxRecords?: string;
+    maxBytes?: string;
+    leaseTtlMs?: string;
+  };
+
+  const migrationCmd = new Command("migration")
+    .description("Reversible SQLite-to-PostgreSQL cutover (plan, dry-run, apply, resume, verify, report, abort, activate, rollback)");
+  migrationCmd.helpOption(false).option("-h, --help", "Show help");
+  migrationCmd.action(async () => {
+    writeCliError("Usage: lcm migration <plan|dry-run|apply|resume|verify|report|abort|activate|rollback> [--json]\n");
+    exit(1);
+  });
+
+  migrationCmd
+    .command("plan")
+    .description("Preview the next migration generation without mutating anything")
+    .option("--set", "Operate on every project of this home as one cutover set (see docs/migration-cutover-set.md)")
+    .option("--json", "Output structured JSON")
+    .helpOption(false).option("-h, --help", "Show help")
+    .action(async (opts: MigrationJsonOptions) => {
+      writeCliError("Resolving migration preflight...\n");
+      if (opts.set === true) {
+        const setOutcome = await performSetPlan({ homeDir: homedir() });
+        writeCliError("Migration plan finished.\n");
+        emitMigrationEnvelope("plan", () => renderMigrationSetEnvelope("plan", setOutcome), opts.json);
+        return;
+      }
+      const outcome = await performMigrationPlan({ cwd: process.cwd(), homeDir: homedir() });
+      writeCliError("Migration plan finished.\n");
+      emitMigrationEnvelope("plan", () => renderMigrationPlanEnvelope(outcome), opts.json);
+    });
+
+  migrationCmd
+    .command("dry-run")
+    .description("Check the SQLite migration source without touching PostgreSQL or the journal")
+    .option("--set", "Operate on every project of this home as one cutover set (see docs/migration-cutover-set.md)")
+    .option("--json", "Output structured JSON")
+    .helpOption(false).option("-h, --help", "Show help")
+    .action(async (opts: MigrationJsonOptions) => {
+      writeCliError("Checking the SQLite migration source...\n");
+      if (opts.set === true) {
+        const setOutcome = await performSetDryRun({ homeDir: homedir() });
+        writeCliError("Migration dry-run finished.\n");
+        emitMigrationEnvelope("dry-run", () => renderMigrationSetEnvelope("dry-run", setOutcome), opts.json);
+        return;
+      }
+      const outcome = await performMigrationDryRunCheck({ cwd: process.cwd(), homeDir: homedir() });
+      writeCliError("Migration dry-run finished.\n");
+      emitMigrationEnvelope("dry-run", () => renderMigrationDryRunEnvelope(outcome), opts.json);
+    });
+
+  migrationCmd
+    .command("apply")
+    .description("Apply the confirmed migration generation: capture, manifest genesis and copy")
+    .option("--confirm-generation <id>", "The exact generation id `lcm migration plan` printed (the set id with --set)")
+    .option("--set", "Operate on every project of this home as one cutover set (see docs/migration-cutover-set.md)")
+    .option("--dry-run", "Stop after the confirmation fence; do not capture, copy, or mutate anything")
+    .option("--max-records <n>", "Maximum records per copy batch")
+    .option("--max-bytes <n>", "Maximum bytes per copy batch")
+    .option("--json", "Output structured JSON")
+    .helpOption(false).option("-h, --help", "Show help")
+    .action(async (opts: MigrationApplyOptions) => {
+      const maxRecords = opts.maxRecords === undefined ? undefined : parsePositiveInteger(opts.maxRecords, "--max-records");
+      const maxBytes = opts.maxBytes === undefined ? undefined : parsePositiveInteger(opts.maxBytes, "--max-bytes");
+      writeCliError("Resolving migration preflight...\n");
+      if (opts.set === true) {
+        const setOutcome = await performSetApply({
+          homeDir: homedir(),
+          confirmGenerationId: opts.confirmGeneration,
+          dryRun: opts.dryRun,
+          maxRecords,
+          maxBytes,
+        });
+        writeCliError("Migration apply finished.\n");
+        emitMigrationEnvelope("apply", () => renderMigrationSetEnvelope("apply", setOutcome), opts.json);
+        return;
+      }
+      const outcome = await performMigrationApply({
+        cwd: process.cwd(),
+        homeDir: homedir(),
+        confirmGenerationId: opts.confirmGeneration,
+        dryRun: opts.dryRun,
+        maxRecords,
+        maxBytes,
+        onDaemonObserved: (presence) => {
+          writeCliError(
+            `A running LCM daemon was observed (pid ${presence.pid}, ${presence.storageBackend} backend). The maintenance hold fences its storage operations until the hold ends.\n`,
+          );
+        },
+      });
+      writeCliError("Migration apply finished.\n");
+      emitMigrationEnvelope("apply", () => renderMigrationApplyEnvelope(outcome), opts.json);
+    });
+
+  migrationCmd
+    .command("resume")
+    .description("Run the next step of a held generation: genesis and dry-run, copy, or finishing a carried effect")
+    .option("--generation <id>", "The generation to resume (default: the live maintenance hold); the original set id with --set")
+    .option("--confirm-generation <id>", "The resolved generation id (the set id with --set)")
+    .option("--set", "Operate on every project of this home as one cutover set (see docs/migration-cutover-set.md)")
+    .option("--dry-run", "Name the step resume would run; run nothing and predict nothing")
+    .option("--max-records <n>", "Maximum records per copy batch")
+    .option("--max-bytes <n>", "Maximum bytes per copy batch")
+    .option("--json", "Output structured JSON")
+    .helpOption(false).option("-h, --help", "Show help")
+    .action(async (opts: MigrationApplyOptions) => {
+      const maxRecords = opts.maxRecords === undefined ? undefined : parsePositiveInteger(opts.maxRecords, "--max-records");
+      const maxBytes = opts.maxBytes === undefined ? undefined : parsePositiveInteger(opts.maxBytes, "--max-bytes");
+      writeCliError("Resolving the generation to resume...\n");
+      if (opts.set === true) {
+        const setOutcome = await performSetResume({
+          homeDir: homedir(),
+          generation: opts.generation,
+          confirmGenerationId: opts.confirmGeneration,
+          dryRun: opts.dryRun,
+          maxRecords,
+          maxBytes,
+        });
+        writeCliError("Migration resume finished.\n");
+        emitMigrationEnvelope("resume", () => renderMigrationSetEnvelope("resume", setOutcome), opts.json);
+        return;
+      }
+      const outcome = await performMigrationResumeCommand({
+        cwd: process.cwd(),
+        homeDir: homedir(),
+        generation: opts.generation,
+        confirmGenerationId: opts.confirmGeneration,
+        dryRun: opts.dryRun,
+        maxRecords,
+        maxBytes,
+      });
+      writeCliError("Migration resume finished.\n");
+      emitMigrationEnvelope("resume", () => renderMigrationResumeEnvelope(outcome), opts.json);
+    });
+
+  migrationCmd
+    .command("verify")
+    .description("Verify a copied generation against PostgreSQL, finish a pending verification, or confirm a verified one")
+    .option("--generation <id>", "The generation to verify (default: the live maintenance hold); the original set id with --set")
+    .option("--confirm-generation <id>", "The resolved generation id (the set id with --set)")
+    .option("--set", "Operate on every project of this home as one cutover set (see docs/migration-cutover-set.md)")
+    .option("--dry-run", "Compute the verification without recording it (takes and releases the verification lease); with --set a persisted-only preview that never exits 0")
+    .option("--lease-ttl-ms <n>", "Verification lease time to live in milliseconds (default 300000)")
+    .option("--json", "Output structured JSON")
+    .helpOption(false).option("-h, --help", "Show help")
+    .action(async (opts: MigrationApplyOptions) => {
+      const leaseTtlMs = opts.leaseTtlMs === undefined ? undefined : parsePositiveInteger(opts.leaseTtlMs, "--lease-ttl-ms");
+      if (opts.set === true && leaseTtlMs !== undefined) {
+        console.error("--lease-ttl-ms does not apply to --set: set verification takes no lease");
+        exit(1);
+      }
+      writeCliError("Verifying the migration generation...\n");
+      if (opts.set === true) {
+        const setOutcome = await performSetVerify({
+          homeDir: homedir(),
+          generation: opts.generation,
+          confirmGenerationId: opts.confirmGeneration,
+          dryRun: opts.dryRun,
+        });
+        writeCliError("Migration verify finished.\n");
+        emitMigrationEnvelope("verify", () => renderMigrationSetEnvelope("verify", setOutcome), opts.json);
+        return;
+      }
+      const outcome = await performMigrationVerifyCommand({
+        cwd: process.cwd(),
+        homeDir: homedir(),
+        generation: opts.generation,
+        confirmGenerationId: opts.confirmGeneration,
+        dryRun: opts.dryRun,
+        leaseTtlMs,
+      });
+      writeCliError("Migration verify finished.\n");
+      emitMigrationEnvelope("verify", () => renderMigrationVerifyEnvelope(outcome), opts.json);
+    });
+
+  migrationCmd
+    .command("report")
+    .description("Read-only account of one generation: what exists, what owns it, and what to run next")
+    .option("--generation <id>", "The generation to report (default: the live or terminal journal's own); the original set id with --set")
+    .option("--set", "Operate on every project of this home as one cutover set (see docs/migration-cutover-set.md)")
+    .option("--json", "Output structured JSON")
+    .helpOption(false).option("-h, --help", "Show help")
+    .action(async (opts: MigrationApplyOptions) => {
+      writeCliError("Reading the migration generation...\n");
+      if (opts.set === true) {
+        const setOutcome = await performSetReport({ homeDir: homedir(), generation: opts.generation });
+        writeCliError("Migration report finished.\n");
+        emitMigrationEnvelope("report", () => renderMigrationSetEnvelope("report", setOutcome), opts.json);
+        return;
+      }
+      const outcome = await performMigrationReportCommand({ homeDir: homedir(), generation: opts.generation });
+      writeCliError("Migration report finished.\n");
+      emitMigrationEnvelope("report", () => renderMigrationReportEnvelope(outcome), opts.json);
+    });
+
+  migrationCmd
+    .command("abort")
+    .description("Abort a held or entering migration, completing whichever recovery write is missing")
+    .option("--generation <id>", "The generation to abort (default: the journal's own generation)")
+    .option("--confirm-generation <id>", "The generation id of the live maintenance hold (the set id of a set hold)")
+    .option("--set", "Operate on every project of this home as one cutover set (see docs/migration-cutover-set.md)")
+    .option("--dry-run", "Run every read and check, then stop before changing anything")
+    .option("--json", "Output structured JSON")
+    .helpOption(false).option("-h, --help", "Show help")
+    .action(async (opts: MigrationApplyOptions) => {
+      writeCliError("Aborting the migration hold...\n");
+      if (opts.set === true) {
+        const setOutcome = await performSetAbort({
+          homeDir: homedir(),
+          generation: opts.generation,
+          confirmGenerationId: opts.confirmGeneration,
+          dryRun: opts.dryRun,
+        });
+        writeCliError("Migration abort finished.\n");
+        emitMigrationEnvelope("abort", () => renderMigrationSetEnvelope("abort", setOutcome), opts.json);
+        return;
+      }
+      const outcome = await performMigrationAbortCommand({
+        homeDir: homedir(),
+        generation: opts.generation,
+        confirmGenerationId: opts.confirmGeneration,
+        dryRun: opts.dryRun,
+      });
+      writeCliError("Migration abort finished.\n");
+      emitMigrationEnvelope("abort", () => renderMigrationAbortEnvelope(outcome), opts.json);
+    });
+
+  migrationCmd
+    .command("activate")
+    .description("Switch a verified generation or set to PostgreSQL after runtime grants are applied. Afterwards revoke the transfer grants, then start the daemon")
+    .option("--generation <id>", "The generation to activate (default: the live maintenance hold); the original set id with --set")
+    .option("--confirm-generation <id>", "The resolved generation id (the set id with --set)")
+    .option("--confirm-backend <backend>", "The backend activation switches to: postgresql")
+    .option("--set", "Operate on every project of this home as one cutover set (see docs/migration-cutover-set.md)")
+    .option("--dry-run", "Read the persisted state; evaluates nothing, so it never exits 0")
+    .option("--json", "Output structured JSON")
+    .helpOption(false).option("-h, --help", "Show help")
+    .action(async (opts: MigrationApplyOptions) => {
+      writeCliError("Activating the migration generation...\n");
+      if (opts.set === true) {
+        const setOutcome = await performSetActivate({
+          homeDir: homedir(),
+          generation: opts.generation,
+          confirmGenerationId: opts.confirmGeneration,
+          confirmBackend: opts.confirmBackend,
+          dryRun: opts.dryRun,
+        });
+        writeCliError("Migration activate finished.\n");
+        emitMigrationEnvelope("activate", () => renderMigrationSetEnvelope("activate", setOutcome), opts.json);
+        return;
+      }
+      const outcome = await performMigrationActivateCommand({
+        cwd: process.cwd(),
+        homeDir: homedir(),
+        generation: opts.generation,
+        confirmGenerationId: opts.confirmGeneration,
+        confirmBackend: opts.confirmBackend,
+        dryRun: opts.dryRun,
+      });
+      writeCliError("Migration activate finished.\n");
+      emitMigrationEnvelope("activate", () => renderMigrationActivateEnvelope(outcome), opts.json);
+    });
+
+  migrationCmd
+    .command("rollback")
+    .description("Return an activated generation to SQLite, using the runtime-role LCM_POSTGRES_URL. Refuses while any other project is remotely bound")
+    .option("--generation <id>", "The generation to roll back (default: the live maintenance hold); always the original set id with --set")
+    .option("--confirm-generation <id>", "The resolved generation id (the original set id with --set)")
+    .option("--confirm-backend <backend>", "The backend rollback switches to: sqlite")
+    .option("--set", "Operate on every project of this home as one cutover set (see docs/migration-cutover-set.md)")
+    .option("--dry-run", "Read the route and the manifest; evaluates nothing, so it never exits 0")
+    .option("--json", "Output structured JSON")
+    .helpOption(false).option("-h, --help", "Show help")
+    .action(async (opts: MigrationApplyOptions) => {
+      writeCliError("Rolling back the migration generation...\n");
+      if (opts.set === true) {
+        const setOutcome = await performSetRollback({
+          homeDir: homedir(),
+          generation: opts.generation,
+          confirmGenerationId: opts.confirmGeneration,
+          confirmBackend: opts.confirmBackend,
+          dryRun: opts.dryRun,
+        });
+        writeCliError("Migration rollback finished.\n");
+        emitMigrationEnvelope("rollback", () => renderMigrationSetEnvelope("rollback", setOutcome), opts.json);
+        return;
+      }
+      const outcome = await performMigrationRollbackCommand({
+        homeDir: homedir(),
+        generation: opts.generation,
+        confirmGenerationId: opts.confirmGeneration,
+        confirmBackend: opts.confirmBackend,
+        dryRun: opts.dryRun,
+      });
+      writeCliError("Migration rollback finished.\n");
+      emitMigrationEnvelope("rollback", () => renderMigrationRollbackEnvelope(outcome), opts.json);
+    });
+
+  program.addCommand(migrationCmd);
+}
+
 
 export function registerPostgreSqlCommand(program: Command): void {
   type PostgreSqlOptions = {
@@ -2632,6 +3043,14 @@ export async function runCli(
       // Hook dispatch only when --hook is explicit; all other invocations go to batch.
       const hook: boolean = opts.hook ?? false;
       if (!hook) {
+        // Older installations register the bare `lcm compact` as their PreCompact
+        // hook, and dispatchHook() is not reached without --hook; honor the
+        // documented LCM_ENABLED=false contract before any batch work.
+        if (!resolveLcmConfig(process.env).enabled) {
+          process.stderr.write("lcm compact: skipped because LCM_ENABLED=false\n");
+          process.exitCode = 0;
+          return;
+        }
         let invocationLifecycle: CompactInvocationLifecycle | undefined;
         let localWorkPromise: Promise<void> | undefined;
         let compactPort = 3737;
@@ -3018,7 +3437,7 @@ export async function runCli(
       }
       const input = withHookOverrides(await readStdin(), opts.client, reasoningEffort, requestPolicy, fastMode);
       const r = await dispatchHook("compact", input);
-      if (r.stdout) stdout.write(r.stdout);
+      await writeHookOutput(stdout, r.stdout);
       exit(r.exitCode);
     });
 
@@ -3034,10 +3453,9 @@ export async function runCli(
         const { printHelp } = await import("../src/cli-help.js");
         printHelp("restore"); exit(0);
       }
-      const { dispatchHook } = await import("../src/hooks/dispatch.js");
       const input = withHookClient(await readStdin(), opts.client);
-      const r = await dispatchHook("restore", input);
-      if (r.stdout) stdout.write(r.stdout);
+      const r = await dispatchObservedHook("restore", input, opts.client);
+      await writeHookOutput(stdout, r.stdout);
       exit(r.exitCode);
     });
 
@@ -3056,7 +3474,7 @@ export async function runCli(
       const { dispatchHook } = await import("../src/hooks/dispatch.js");
       const input = withHookClient(await readStdin(), opts.client);
       const r = await dispatchHook("session-end", input);
-      if (r.stdout) stdout.write(r.stdout);
+      await writeHookOutput(stdout, r.stdout);
       exit(r.exitCode);
     });
 
@@ -3073,10 +3491,9 @@ export async function runCli(
         const { printHelp } = await import("../src/cli-help.js");
         printHelp("user-prompt"); exit(0);
       }
-      const { dispatchHook } = await import("../src/hooks/dispatch.js");
       const input = withHookClient(await readStdin(), opts.client);
-      const r = await dispatchHook("user-prompt", input, { transport: opts.transport });
-      if (r.stdout) stdout.write(r.stdout);
+      const r = await dispatchObservedHook("user-prompt", input, opts.client, { transport: opts.transport });
+      await writeHookOutput(stdout, r.stdout);
       exit(r.exitCode);
     });
 
@@ -3092,29 +3509,57 @@ export async function runCli(
         const { printHelp } = await import("../src/cli-help.js");
         printHelp("post-tool"); exit(0);
       }
-      const { dispatchHook } = await import("../src/hooks/dispatch.js");
       const input = withHookClient(await readStdin(), opts.client);
-      const r = await dispatchHook("post-tool", input);
-      if (r.stdout) stdout.write(r.stdout);
+      const r = await dispatchObservedHook("post-tool", input, opts.client);
+      await writeHookOutput(stdout, r.stdout);
       exit(r.exitCode);
     });
 
-  // ─── session-snapshot (hook) ─────────────────────────────────────────────
+  // ─── pre-tool (hook) ───────────────────────────────────────────────────────
   program
-    .command("session-snapshot")
-    .description("Rolling ingest snapshot (called by Stop hook)")
+    .command("pre-tool")
+    .description("Dispatch the pre-tool hook (PreToolUse event)")
     .helpOption(false)
     .addOption(new Option("--client <client>", "Hook client identity (internal)").hideHelp())
     .option("-h, --help", "Show help")
     .action(async (opts) => {
       if (opts.help) {
         const { printHelp } = await import("../src/cli-help.js");
+        printHelp("pre-tool"); exit(0);
+      }
+      const input = withHookClient(await readStdin(), opts.client);
+      const r = await dispatchObservedHook("pre-tool", input, opts.client);
+      await writeHookOutput(stdout, r.stdout);
+      exit(r.exitCode);
+    });
+
+  // ─── session-snapshot (hook) ─────────────────────────────────────────────
+  program
+    .command("session-snapshot")
+    .description("Rolling ingest snapshot (called by Stop, PreCompact, Interrupt and SessionEnd hooks)")
+    .helpOption(false)
+    .addOption(new Option("--client <client>", "Hook client identity (internal)").hideHelp())
+    .addOption(new Option("--terminal", "Interrupt or SessionEnd snapshot with a three second budget (internal)").hideHelp())
+    .option("-h, --help", "Show help")
+    .action(async (opts) => {
+      if (opts.help) {
+        const { printHelp } = await import("../src/cli-help.js");
         printHelp("session-snapshot"); exit(0);
       }
-      const { dispatchHook } = await import("../src/hooks/dispatch.js");
+      if (opts.terminal === true) {
+        // Terminal hooks never fail the session they are saving: this path has
+        // its own catch boundary and always exits 0 with no output.
+        try {
+          const { runTerminalSnapshotCommand } = await import("../src/hooks/terminal-snapshot.js");
+          await runTerminalSnapshotCommand();
+        } catch {
+          // A failed import or an unexpected rejection must stay silent too.
+        }
+        exit(0);
+      }
       const input = withHookClient(await readStdin(), opts.client);
-      const r = await dispatchHook("session-snapshot", input);
-      if (r.stdout) stdout.write(r.stdout);
+      const r = await dispatchObservedHook("session-snapshot", input, opts.client);
+      await writeHookOutput(stdout, r.stdout);
       exit(r.exitCode);
     });
 
@@ -3326,9 +3771,16 @@ export async function runCli(
       const all: boolean = opts.all ?? false;
       const jsonFlag: boolean = opts.json ?? false;
       const client = await createDaemonClientOrExit();
-      const result = all
-        ? await client.post<any>("/promote-events/all", {})
-        : await client.post<any>("/promote-events", { cwd: process.cwd(), drain: true });
+      let result: any;
+      try {
+        result = all
+          ? await client.post<any>("/promote-events/all", {})
+          : await client.post<any>("/promote-events", { cwd: process.cwd(), drain: true });
+      } catch (error) {
+        // A busy daemon answers 503 with a retry message; show it instead of the generic failure.
+        if ((error as { statusCode?: number } | null)?.statusCode !== 503) throw error;
+        return passiveOperatorError(error, jsonFlag);
+      }
       const failed = all
         ? ((result.errors ?? 0) > 0 || (result.failedProjects ?? 0) > 0)
         : ((result.errors ?? 0) > 0 || result.incomplete === true);
@@ -3431,7 +3883,7 @@ export async function runCli(
           for (const event of events) {
             const record = byId.get(event.event_uuid);
             if (!record) missing.push(event.event_uuid);
-            else if (!passiveEventReadbackMatches(event, record)) {
+            else if (!sameEnvelope(event, record)) {
               mismatched.push(event.event_uuid);
             } else {
               matched += 1;
@@ -3564,6 +4016,7 @@ export async function runCli(
   registerMachineCommand(program);
   registerProjectCommand(program, runWithPublicationRetry);
   registerPostgreSqlCommand(program);
+  registerMigrationCommand(program);
   registerMemoryCommands(
     program,
     async (options) => (await createDaemonReadClientOrExit(preflightSeams, options)).client,
@@ -3735,6 +4188,7 @@ export async function runCli(
             console.log(`    Path: ${path}`);
           }
           if ((result as any).requiresRestart) console.log("    Restart the agent to activate.");
+          for (const notice of (result as any).notices ?? []) console.log(`    ${notice}`);
           console.log();
         }
       } catch (err: any) {
@@ -3789,7 +4243,7 @@ export async function runCli(
       }
       const { AGENTS } = await import("../src/connectors/registry.js");
       const { listConnectors, listConnectorInventory } = await import("../src/connectors/installer.js");
-      const { readConnectorTransportSnapshot } = await import("../src/config-manager.js");
+      const { readConnectorTransportSnapshot, readPreToolRecallSnapshot } = await import("../src/config-manager.js");
       const { findAgent } = await import("../src/connectors/registry.js");
       const found = agentName ? findAgent(agentName) : undefined;
       const agents = found ? [found] : agentName ? [] : AGENTS;
@@ -3830,32 +4284,28 @@ export async function runCli(
 
         if ((agent as any).id !== "codex" || agentName === undefined) continue;
 
-        const {
-          inspectCodexPostToolHook,
-          resolveCodexHooksPath,
-        } = await import("../src/connectors/codex-hooks.js");
+        const { probeCodexCliVersion } = await import("../src/connectors/installer.js");
+        const { runCodexReadinessCheck } = await import("../src/connectors/codex-readiness.js");
         const { codexPostToolFunctionalCoverage } = await import("../src/hooks/post-tool-normalization.js");
-        const inspection = inspectCodexPostToolHook(
-          resolveCodexHooksPath(opts.global ? homedir() : process.cwd()),
-        );
+        const readiness = runCodexReadinessCheck({
+          homeDir: homedir(),
+          probeVersion: () => probeCodexCliVersion(connectorCwd),
+          readStoredTransport: () => readConnectorTransportSnapshot(defaultConfigPath(), "codex"),
+          readPreToolRecall: () => readPreToolRecallSnapshot(defaultConfigPath()),
+        });
+        for (const line of readiness.lines) console.log(line);
+        failures += readiness.failures;
 
-        if (inspection.state === "installed") {
-          console.log("  ✓ Codex: PostToolUse hook installed");
-          let functional = false;
-          try {
-            functional = codexPostToolFunctionalCoverage();
-          } catch {
-            functional = false;
-          }
-          if (functional) {
-            console.log("  ✓ Codex: native exec capture functional");
-          } else {
-            console.log("  ✗ Codex: native exec capture functional");
-            failures += 1;
-          }
+        let selfTestPassed = false;
+        try {
+          selfTestPassed = codexPostToolFunctionalCoverage();
+        } catch {
+          selfTestPassed = false;
+        }
+        if (selfTestPassed) {
+          console.log("  ✓ Codex: native exec normalization self-test passed (fixtures only; not proof of runtime execution)");
         } else {
-          console.log(`  ✗ Codex: PostToolUse hook ${inspection.state}`);
-          console.log("  Codex: native exec capture functional check skipped");
+          console.log("  ✗ Codex: native exec normalization self-test failed (fixtures only)");
           failures += 1;
         }
       }

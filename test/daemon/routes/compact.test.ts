@@ -1371,6 +1371,99 @@ describe("POST /compact", () => {
     expect(body.latestSummaryContent.length).toBeGreaterThan(0);
   });
 
+  it("keeps ingesting a transcript after /compact wrote its event rows", async () => {
+    const tempDir = mkdtempSync(join(tmpdir(), "lcm-compact-events-"));
+    tempDirs.push(tempDir);
+    const transcriptPath = join(tempDir, "session.jsonl");
+    const line = (index: number) => JSON.stringify({
+      message: {
+        role: index % 2 === 0 ? "user" : "assistant",
+        content: ("message " + index + " ").repeat(50),
+      },
+    });
+    const writeTranscript = (count: number) =>
+      writeFileSync(transcriptPath, Array.from({ length: count }, (_, index) => line(index)).join("\n") + "\n");
+    daemon = await createDaemon(loadDaemonConfig("/x", {
+      daemon: { port: 0 },
+      summarizer: { mock: true },
+    }));
+    const compact = async () => {
+      const response = await fetch("http://127.0.0.1:" + daemon!.address().port + "/compact", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ session_id: "compact-events", cwd: tempDir, transcript_path: transcriptPath }),
+      });
+      expect(response.status).toBe(200);
+      return await response.json() as { actionTaken: boolean };
+    };
+
+    writeTranscript(12);
+    expect((await compact()).actionTaken).toBe(true);
+    const db = new DatabaseSync(projectDbPath(tempDir));
+    const rows = () => db.prepare(
+      "SELECT m.seq AS seq, m.content AS content, " +
+      "EXISTS (SELECT 1 FROM message_parts p WHERE p.message_id = m.message_id AND p.part_type = 'compaction') AS is_event " +
+      "FROM messages m ORDER BY m.seq",
+    ).all() as Array<{ seq: number; content: string; is_event: number }>;
+    try {
+      const afterFirst = rows();
+      const events = afterFirst.filter((row) => row.is_event === 1);
+      expect(events.length).toBeGreaterThan(0);
+      expect(afterFirst.filter((row) => row.is_event === 0)).toHaveLength(12);
+      // Each event is born unconsumed, in the same transaction as its compaction part.
+      expect(db.prepare("SELECT ordinal, metadata FROM message_parts WHERE part_type = 'snapshot' ORDER BY message_id").all())
+        .toEqual(events.map(() => ({ ordinal: 1, metadata: JSON.stringify({ lcmTranscriptSlot: { version: 1, consumed: false } }) })));
+
+      // The old COUNT(*) slice skipped one parsed message per stored event.
+      writeTranscript(15);
+      await compact();
+      const afterSecond = rows();
+      const transcript = afterSecond.filter((row) => row.is_event === 0).map((row) => row.content);
+      expect(transcript).toEqual(Array.from({ length: 15 }, (_, index) => ("message " + index + " ").repeat(50)));
+      expect(afterSecond.map((row) => row.seq)).toEqual(afterSecond.map((_, index) => index));
+    } finally {
+      db.close();
+    }
+  }, FULL_SUITE_DAEMON_TEST_TIMEOUT_MS);
+
++  it("swallows a failed event write without leaving a stray event message behind", async () => {
+    const tempDir = mkdtempSync(join(tmpdir(), "lcm-compact-event-failure-"));
+    tempDirs.push(tempDir);
+    const transcriptPath = join(tempDir, "session.jsonl");
+    const writeTranscript = (count: number) => writeFileSync(transcriptPath, Array.from({ length: count }, (_, index) => JSON.stringify({
+      message: { role: index % 2 === 0 ? "user" : "assistant", content: ("message " + index + " ").repeat(50) },
+    })).join("\n") + "\n");
+    writeTranscript(12);
+    daemon = await createDaemon(loadDaemonConfig("/x", {
+      daemon: { port: 0 },
+      summarizer: { mock: true },
+    }));
+    const request = () => fetch("http://127.0.0.1:" + daemon!.address().port + "/compact", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ session_id: "compact-event-failure", cwd: tempDir, transcript_path: transcriptPath }),
+    });
+    expect((await request()).status).toBe(200);
+    const db = new DatabaseSync(projectDbPath(tempDir));
+    try {
+      const count = (sql: string) => (db.prepare(sql).get() as { n: number }).n;
+      const before = {
+        messages: count("SELECT COUNT(*) AS n FROM messages"),
+        events: count("SELECT COUNT(*) AS n FROM message_parts WHERE part_type = 'compaction'"),
+      };
+      expect(before.events).toBeGreaterThan(0);
+      db.exec("CREATE TRIGGER fail_marker BEFORE INSERT ON message_parts WHEN NEW.part_type = 'snapshot' BEGIN SELECT RAISE(ABORT, 'injected'); END");
+      writeTranscript(24);
+      expect((await request()).status).toBe(200);
+      // The new transcript rows are stored; the failed event left no message or part behind.
+      expect(count("SELECT COUNT(*) AS n FROM messages") - before.messages).toBe(12);
+      expect(count("SELECT COUNT(*) AS n FROM message_parts WHERE part_type = 'compaction'")).toBe(before.events);
+      expect(count("SELECT COUNT(*) AS n FROM messages WHERE role = 'system' AND content LIKE 'LCM compaction%'")).toBe(before.events);
+    } finally {
+      db.close();
+    }
+  }, FULL_SUITE_DAEMON_TEST_TIMEOUT_MS);
+
   it("updates redaction_stats when transcript ingestion contains secrets", async () => {
     const tempDir = mkdtempSync(join(tmpdir(), "lcm-compact-redact-"));
     tempDirs.push(tempDir);

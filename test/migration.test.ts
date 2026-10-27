@@ -4,6 +4,7 @@ import { join } from "node:path";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { closeLcmConnection, getLcmConnection } from "../src/db/connection.js";
 import { runLcmMigrations } from "../src/db/migration.js";
+import { validateSqlitePortableSchema } from "../src/storage/sqlite/portable-source.js";
 
 const tempDirs: string[] = [];
 
@@ -548,5 +549,42 @@ describe("session_ingest_log table migration", () => {
     expect(info.length).toBeGreaterThan(0);
 
     db.close();
+  });
+});
+
+describe("conversations.parent_session_id migration", () => {
+  const layout = (db: ReturnType<typeof getLcmConnection>) => (db.prepare("PRAGMA table_xinfo(conversations)").all() as Array<{
+    name: string; type: string; notnull: number; dflt_value: string | null; pk: number; hidden: number;
+  }>).map(({ name, type, notnull, dflt_value, pk, hidden }) => ({ name, type, notnull, dflt_value, pk, hidden }));
+
+  it("adds the column last on a fresh database and to an existing one with an identical layout", () => {
+    const tempDir = mkdtempSync(join(tmpdir(), "lcm-parent-session-"));
+    tempDirs.push(tempDir);
+    const fresh = getLcmConnection(join(tempDir, "fresh.db"));
+    runLcmMigrations(fresh, { fts5Available: false });
+    const freshLayout = layout(fresh);
+    expect(freshLayout.at(-1)).toEqual({
+      name: "parent_session_id", type: "TEXT", notnull: 0, dflt_value: null, pk: 0, hidden: 0,
+    });
+    expect(() => validateSqlitePortableSchema(fresh)).not.toThrow();
+
+    const legacy = getLcmConnection(join(tempDir, "legacy.db"));
+    legacy.exec(`
+      CREATE TABLE conversations (
+        conversation_id INTEGER PRIMARY KEY AUTOINCREMENT,
+        session_id TEXT NOT NULL,
+        title TEXT,
+        bootstrapped_at TEXT,
+        created_at TEXT NOT NULL DEFAULT (datetime('now')),
+        updated_at TEXT NOT NULL DEFAULT (datetime('now'))
+      );
+      INSERT INTO conversations (session_id) VALUES ('legacy');
+    `);
+    runLcmMigrations(legacy, { fts5Available: false });
+    runLcmMigrations(legacy, { fts5Available: false });
+    expect(layout(legacy)).toEqual(freshLayout);
+    expect(legacy.prepare("SELECT session_id, parent_session_id FROM conversations").get())
+      .toEqual({ session_id: "legacy", parent_session_id: null });
+    expect(() => validateSqlitePortableSchema(legacy)).not.toThrow();
   });
 });

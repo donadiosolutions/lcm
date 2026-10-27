@@ -440,7 +440,7 @@ baseline. Provider backup retention is independent of live-table deletion.
 
 | Table                 | Ownership and retention                                                                                                                                                                                        | Enforced invariants and indexes                                                                                                                                                                                                                                                                                                                                                                                                                                                                  |
 | --------------------- | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ |
-| `conversations`       | Project-scoped source root. Project deletion is restricted; an explicit conversation deletion owns messages, summaries, context, and large-file metadata. Multiple rows may represent segments of one session. | Generated `bigint` primary key and scoped identity; exact nonnull session text, including whitespace-only and arbitrary-length caller values accepted by the shared contract; ordered timestamps and optional bootstrap time. `conversations_project_order_idx` supplies deterministic newest-first project ordering, while `conversations_session_lookup_idx` uses the fixed-width session SHA-256 candidate. Every lookup retains exact `session_id` equality as a collision residual.         |
+| `conversations`       | Project-scoped source root. Project deletion is restricted; an explicit conversation deletion owns messages, summaries, context, and large-file metadata. Multiple rows may represent segments of one session. | Generated `bigint` primary key and scoped identity; exact nonnull session text, including whitespace-only and arbitrary-length caller values accepted by the shared contract; ordered timestamps, optional bootstrap time, and an optional `parent_session_id` (migration 0009) naming the immediate parent session of a subagent conversation. `conversations_project_order_idx` supplies deterministic newest-first project ordering, while `conversations_session_lookup_idx` uses the fixed-width session SHA-256 candidate. Every lookup retains exact `session_id` equality as a collision residual.         |
 | `messages`            | Owned by a conversation and cascades with it. Coverage, context, and transcript provenance references restrict direct deletion until those relationships are handled.                                          | Generated `bigint` primary key; scoped unique sequence and identity; nonnegative sequence and token count; four-role enum. The scoped sequence unique index provides conversation order and `messages_project_created_idx` provides stable project order; `messages_search_document_idx` and `messages_content_trgm_idx` provide FTS and substring/fuzzy access.                                                                                                                                 |
 | `message_parts`       | Owned by a message and cascades with it.                                                                                                                                                                       | UUID primary key with a UUIDv7 default; unique scoped nonnegative `bigint` ordinal, checked by the adapter before JavaScript conversion; exact nonnull session text; closed part-type enum; nonnegative token fields; finite nonnegative cost. Nullable metadata is opaque text and round-trips unchanged. `message_parts_type_idx` supports scoped type/order access.                                                                                                                           |
 | `native_transcripts`  | Project- and machine-scoped scrubbed source. Both roots restrict deletion. The #86 repository is append-only and exposes no pre-redaction or implicit deletion path.                                           | UUIDv7-enforced primary key; nonblank client/format/version/session/scrubber/source fields; nonnegative source ordinal; 64-character lowercase SHA-256 content digest and ingest key; object-or-array JSON payload; idempotent `(project_id, machine_id, ingest_key)`; `ingested_at >= observed_at`. Source-order and fixed-width native-session digest indexes give deterministic provenance scans with exact-text residuals; `native_transcripts_payload_idx` supplies JSONB path containment. |
@@ -564,7 +564,11 @@ The migrator is intentionally not a superuser.
 The following extensions are not prerequisites:
 
 - Deferred to an owning post-parity issue: `vector`, `vectorscale`, `anon`,
-  `pg_cron`, `pg_partman`, `pg_stat_monitor`, and `pgaudit`.
+  `pg_cron`, and `pg_partman`.
+- Not part of required P4 delivery: `pg_stat_monitor` and `pgaudit`. They
+  remain future opt-in research only after a measured need, under the
+  [deeper audit policy](postgresql-telemetry.md#deeper-audit-policy) of the
+  telemetry contract.
 - Rejected absent a measured use case: `hstore`, `lo`, `ltree`, and TimescaleDB.
 
 Adding one requires an explicit migration and operational review; availability
@@ -809,8 +813,8 @@ PostgreSQL runtime. The daemon and operational CLI commands use those
 repositories after project and backend-publication admission. Migration
 cutover and rollback remain separate workflows.
 
-The transcript script grants column-limited `SELECT` on the exact conversation
-and message fields needed for native-session linkage, plus `SELECT` and
+The transcript script grants column-limited `SELECT` on the exact conversation,
+message, and message-part fields needed for native-session linkage, plus `SELECT` and
 column-limited `INSERT` on `native_transcripts` and `transcript_messages`. It
 grants `SELECT`, column-limited `INSERT`, and `UPDATE` only for checkpoint
 position, cumulative accounting, checkpoint payload, and update time on
@@ -964,6 +968,20 @@ backends.
 The 0007 snapshot covered 27 tables, 101 indexes, 204 constraints, 254
 column ACLs, and 883 definition objects. Previous migration snapshots remain
 pinned for safe incremental upgrades.
+
+## Conversation parent session
+
+Migration `0009_conversation_parent_session.sql` adds a nullable `text`
+column `parent_session_id` to `lcm.conversations`. It holds the immediate
+parent session of a Codex subagent conversation, set once from the subagent's
+own rollout and never overwritten or cleared. It has no foreign key, because
+`session_id` is not unique and the parent may be absent or stored as several
+segments, and no index, because no query reads it. The runtime role gains
+column `UPDATE` on it (the keep-first fill runs inside the ingest
+transaction, with no `INSERT` grant, because rows are created without it),
+and the transfer role gains column `INSERT` so a transfer can write it. The
+0009 snapshot covers 888 definition objects: one more ordinary column and
+one more column ACL than 0008.
 
 ## Transfer identity content fingerprint
 

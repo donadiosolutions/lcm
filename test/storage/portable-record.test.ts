@@ -743,6 +743,58 @@ const expectDeepFrozen = (value: unknown, seen = new WeakSet<object>()): void =>
   }
 };
 
+const PRE_CHANGE_CONVERSATION_RECORD_BYTES = "{\"dependencies\":[{\"domain\":\"project\",\"identitySha256\":\"48fe03f1e75fe5493511541608343b4bc9f450ea0d7c6e320a1e075c32d89663\"}],\"domain\":\"conversations\",\"domainVersion\":1,\"identitySha256\":\"cb5d31483f7998868807bc49f90b09c1699c3565a41007c00ff17accfafc7999\",\"order\":[\"session-1\",\"Conversation\",null,\"2026-08-13T12:34:56.123456Z\",\"2026-08-13T12:34:56.123456Z\",{\"$integer\":\"0\"}],\"ordinal\":0,\"recordSha256\":\"65bd3fcdb21269db43888c9e3df2ff413bddf727ed33f98b7fb32331b14358d4\",\"value\":{\"bootstrappedAt\":null,\"conversationFingerprint\":\"5a1291dfaf04a2403e28da1c72603a323de4164a33cfddac6a20949e3082862e\",\"createdAt\":\"2026-08-13T12:34:56.123456Z\",\"occurrenceOrdinal\":{\"$integer\":\"0\"},\"sessionId\":\"session-1\",\"title\":\"Conversation\",\"updatedAt\":\"2026-08-13T12:34:56.123456Z\"},\"version\":1}\n";
+const PRE_CHANGE_CONVERSATION_RECORD_SHA256 = "65bd3fcdb21269db43888c9e3df2ff413bddf727ed33f98b7fb32331b14358d4";
+
+describe("conversation parentSessionId value metadata", () => {
+  const baseInput = (value: Record<string, unknown> = {}) => ({
+    domain: "conversations" as const,
+    ordinal: 0,
+    value: { ...representativeValues.conversations, ...value },
+    context: { projectIdentity },
+  }) as never;
+
+  it("keeps a pre-change conversation record byte-identical and its digest unchanged", () => {
+    const bytes = Buffer.from(PRE_CHANGE_CONVERSATION_RECORD_BYTES, "utf8");
+    const parsed = parsePortableRecord(bytes);
+    expect(parsed.recordSha256).toBe(PRE_CHANGE_CONVERSATION_RECORD_SHA256);
+    expect(Buffer.from(serializePortableRecord(parsed)).toString("utf8")).toBe(PRE_CHANGE_CONVERSATION_RECORD_BYTES);
+    const created = createPortableRecord(baseInput());
+    expect(created.recordSha256).toBe(PRE_CHANGE_CONVERSATION_RECORD_SHA256);
+    expect(Object.keys(created.value)).not.toContain("parentSessionId");
+  });
+
+  it("round-trips a recorded parent as value-only metadata without changing identity or fingerprint", () => {
+    const plain = createPortableRecord(baseInput());
+    const linked = createPortableRecord(baseInput({ parentSessionId: "parent-thread" }));
+    expect((linked.value as { parentSessionId?: string }).parentSessionId).toBe("parent-thread");
+    expect(linked.identitySha256).toBe(plain.identitySha256);
+    expect(linked.order).toEqual(plain.order);
+    expect(linked.order).toHaveLength(6);
+    expect(linked.dependencies).toEqual(plain.dependencies);
+    expect((linked.value as { conversationFingerprint: string }).conversationFingerprint)
+      .toBe((plain.value as { conversationFingerprint: string }).conversationFingerprint);
+    expect(linked.recordSha256).not.toBe(plain.recordSha256);
+    expect(parsePortableRecord(serializePortableRecord(linked))).toEqual(linked);
+  });
+
+  it("rejects a conversation value that is not a plain object", () => {
+    for (const value of [null, "conversation", []]) {
+      expect(() => createPortableRecord({ ...baseInput(), value } as never)).toThrow(PortableStreamError);
+    }
+  });
+
+  it.each([
+    ["an empty string", ""],
+    ["a NUL character", "bad\u0000parent"],
+    ["null", null],
+    ["a number", 7],
+    ["undefined", undefined],
+  ])("rejects a present but invalid parent: %s", (_name, parentSessionId) => {
+    expect(() => createPortableRecord(baseInput({ parentSessionId }))).toThrow(PortableStreamError);
+  });
+});
+
 describe("portable record public seam", () => {
   it("exposes the frozen 22-domain order", () => {
     expect(PORTABLE_RECORD_DOMAIN_ORDER).toEqual([
@@ -783,7 +835,7 @@ describe("portable record public seam", () => {
     expect(Object.isFrozen(PORTABLE_RECORD_DOMAIN_ORDER)).toBe(true);
     expect(Object.isFrozen(PORTABLE_RECORD_SCHEMA_DESCRIPTOR)).toBe(true);
     expect(PORTABLE_RECORD_SCHEMA_SHA256).toMatch(/^[0-9a-f]{64}$/);
-    expect(PORTABLE_RECORD_SCHEMA_SHA256).toBe("5fd2432722dc42e80e2454f6e2db2a454da5fc6b2f69c7fa58594d9349f91e0f");
+    expect(PORTABLE_RECORD_SCHEMA_SHA256).toBe("4d325f8abf2b062b761fcb3701689c6a2ddee663861c1f192ad3fa71e09f32b4");
     expect(PORTABLE_RECORD_SCHEMA_DESCRIPTOR.canonicalization.integers.signedInt64).toEqual([
       "-9223372036854775808",
       "9223372036854775807",
@@ -828,6 +880,12 @@ describe("portable record public seam", () => {
     (invalidCoverage as { domainsByOrder: { messages: { coverage: string[] } } })
       .domainsByOrder.messages.coverage = [];
     expect(validatePortableRecordSchemaDescriptor(invalidCoverage)).toBe(false);
+    for (const key of ["conversationClosure", "optionalFields", "optionalRules"]) {
+      const tampered = structuredClone(PORTABLE_RECORD_SCHEMA_DESCRIPTOR) as never;
+      (tampered as { domainsByOrder: { conversations: Record<string, unknown> } })
+        .domainsByOrder.conversations[key] = key === "conversationClosure" ? {} : ["other"];
+      expect(validatePortableRecordSchemaDescriptor(tampered)).toBe(false);
+    }
     expect(validatePortableRecordSchemaDescriptor(null)).toBe(false);
     expect(validatePortableRecordSchemaDescriptor({
       ...structuredClone(PORTABLE_RECORD_SCHEMA_DESCRIPTOR),
@@ -1095,7 +1153,7 @@ describe("portable record public seam", () => {
     expect(canonicalJsonBytes(preimage)).toEqual(Buffer.from(canonical, "utf8"));
     expect(independentlyHashed).toBe(PORTABLE_RECORD_SCHEMA_SHA256);
     expect(canonicalSha256(preimage)).toBe(PORTABLE_RECORD_SCHEMA_SHA256);
-    expect(PORTABLE_RECORD_SCHEMA_SHA256).toBe("5fd2432722dc42e80e2454f6e2db2a454da5fc6b2f69c7fa58594d9349f91e0f");
+    expect(PORTABLE_RECORD_SCHEMA_SHA256).toBe("4d325f8abf2b062b761fcb3701689c6a2ddee663861c1f192ad3fa71e09f32b4");
   });
 
   it("freezes independent canonical bytes and digest vectors", () => {

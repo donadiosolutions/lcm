@@ -1,0 +1,10 @@
+references: ["#1577"]
+rationale: >-
+  #1577 opens transcript paths non-blocking and checks for a regular file
+  before reading, so a FIFO cannot hang native ingest or compaction. The three
+  touched files keep their existing unit-transcripts-import owner (see
+  0000-legacy-ledger.yml).
+pins:
+  - ["src/storage/native-transcript-ingest.ts", "unit-transcripts-import"]
+  - ["src/transcript.ts", "unit-transcripts-import"]
+  - ["src/codex-transcript.ts", "unit-transcripts-import"]

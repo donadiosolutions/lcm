@@ -126,6 +126,8 @@ export type PortableRecordValueInputByDomain = Readonly<{
     title: string | null;
     bootstrappedAt: PortableRawTimestamp | null;
     updatedAt: PortableRawTimestamp;
+    /** Value-only metadata; omitted while the conversation has no recorded parent. */
+    parentSessionId?: string;
   }>;
   messages: Readonly<{
     conversationIdentitySha256: string;
@@ -314,6 +316,7 @@ export type PortableRecordValueByDomain = Readonly<{
     title: string | null;
     bootstrappedAt: PortableTimestamp | null;
     updatedAt: PortableTimestamp;
+    parentSessionId?: string;
   }>;
   messages: Readonly<{
     conversationIdentitySha256: string;
@@ -589,6 +592,8 @@ const PORTABLE_RECORD_SCHEMA_BASE = {
       dependencies: ["project"],
       fields: ["conversationFingerprint", "occurrenceOrdinal", "sessionId", "createdAt", "title", "bootstrappedAt", "updatedAt"],
       rules: ["sha256", "nonnegative-safe-integer", "string", "timestamp", "string|null", "timestamp|null", "timestamp"],
+      optionalFields: ["parentSessionId"],
+      optionalRules: ["string"],
       coverage: ["database"],
     },
     messages: {
@@ -957,7 +962,7 @@ export function validatePortableRecordSchemaDescriptor(descriptor: unknown): boo
       const candidate = snapshotExactObject(domainsByOrder[domain], [
         "logicalKey", "identityOrderPrefix", "order", "dependencies", "fields", "rules", "coverage",
         "constructionContext", "contextValidation",
-        ...(domain === "conversations" ? ["conversationClosure"] : []),
+        ...(domain === "conversations" ? ["conversationClosure", "optionalFields", "optionalRules"] : []),
       ]);
       const fields = stringArray(candidate.fields);
       const rules = stringArray(candidate.rules);
@@ -993,7 +998,11 @@ export function validatePortableRecordSchemaDescriptor(descriptor: unknown): boo
         || !sameStrings(candidate.contextValidation, context.contextValidation)
         || (
           domain === "conversations"
-          && canonicalJson(candidate.conversationClosure) !== canonicalJson(CONVERSATION_CLOSURE_DESCRIPTOR)
+          && (
+            canonicalJson(candidate.conversationClosure) !== canonicalJson(CONVERSATION_CLOSURE_DESCRIPTOR)
+            || !sameStrings(candidate.optionalFields, PORTABLE_RECORD_SCHEMA_BASE.domainsByOrder.conversations.optionalFields)
+            || !sameStrings(candidate.optionalRules, PORTABLE_RECORD_SCHEMA_BASE.domainsByOrder.conversations.optionalRules)
+          )
         )
       ) return false;
 
@@ -1701,7 +1710,11 @@ function normalizeDomainValue(
   mode: IntegerInputMode,
 ): PortableRecordValue {
   const fields = PORTABLE_RECORD_SCHEMA_BASE.domainsByOrder[domain].fields;
-  const value = expectExactObject(domain, input, fields);
+  const optional: readonly string[] = domain === "conversations"
+    ? PORTABLE_RECORD_SCHEMA_BASE.domainsByOrder.conversations.optionalFields
+    : [];
+  const present = isPlainObject(input) ? optional.filter((key) => Object.hasOwn(input, key)) : [];
+  const value = expectExactObject(domain, input, [...fields, ...present]);
   switch (domain) {
     case "machines":
       return deepFreeze({
@@ -1725,6 +1738,7 @@ function normalizeDomainValue(
         title: nullableString(value.title),
         bootstrappedAt: nullableTimestamp(value.bootstrappedAt),
         updatedAt: normalizeTimestamp(value.updatedAt as PortableRawTimestamp) as PortableTimestamp,
+        ...(present.length === 0 ? {} : { parentSessionId: nonemptyString(value.parentSessionId) }),
       });
       const fingerprint = canonicalSha256([
         PORTABLE_CONVERSATION_VALUE_TAG,

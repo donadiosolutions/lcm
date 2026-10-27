@@ -179,6 +179,14 @@ The native hooks use:
 | `PostToolUse` | `lcm post-tool --client codex` | Capture passive learning signals from tool use |
 | `PreCompact` | `lcm session-snapshot --client codex` | Force-ingest transcript deltas before manual or automatic Codex compaction |
 | `Stop` | `lcm session-snapshot --client codex` | Ingest Codex transcript deltas and compact when the configured token threshold is reached |
+| `SubagentStart` | `lcm restore --client codex` | Load project memory into a Codex subagent when it starts |
+| `SubagentStop` | `lcm session-snapshot --client codex` | Ingest the subagent rollout under the subagent's own session when it finishes |
+| `Interrupt` | `lcm session-snapshot --client codex --terminal` | Save the transcript when you interrupt a running turn |
+| `SessionEnd` | `lcm session-snapshot --client codex --terminal` | Save the transcript when Codex shuts a session down gracefully |
+
+The `Interrupt` and `SessionEnd` hooks only hand the transcript to the daemon that
+is already running; see [Codex hooks](docs/vscode-codex.md#saving-memory-when-a-turn-is-interrupted-or-a-session-ends)
+for what they cover.
 
 Import older Codex sessions when needed:
 
@@ -397,7 +405,7 @@ All environment variables are optional. The default summarizer mode is `auto`.
 | `LCM_MAX_EXPAND_TOKENS` | `4000` | Default expansion token cap for the unregistered `buildExpansionToolDefinition` helper; the shipped `lcm_expand` tool does not apply it |
 | `LCM_LARGE_FILE_TOKEN_THRESHOLD` | `25000` | File size (tokens) above which content is extracted to disk |
 | `LCM_AUTOCOMPACT_DISABLED` | `false` | Set to `true` to disable automatic compaction after each turn |
-| `LCM_ENABLED` | `true` | Set to `false` to disable LCM while keeping its native integration installed |
+| `LCM_ENABLED` | `true` | Exactly lowercase `false` makes LCM's native hooks no-ops while leaving the integration installed; see [Disabling LCM](docs/configuration.md#disabling-lcm) |
 
 The JSON setting `llm.maxConcurrency` defaults to `1` and accepts integers from
 `1` through `32`. It limits only in-flight manual `/compact` requests; promotion

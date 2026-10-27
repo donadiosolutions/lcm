@@ -20,7 +20,7 @@ offsets retain their stated offset.
 
 Two hooks capture events during your session:
 
-- **PostToolUse** — fires after every tool call. Extracts structured metadata (tool name, command, file path) from tool inputs. Never captures raw tool output. For Codex, the native `functions.exec` and `functions.exec_command` calls are adapted into the existing Bash event semantics.
+- **PostToolUse** — fires after every tool call. Extracts structured metadata (tool name, command, file path) from tool inputs. Never captures raw tool output. For Codex, shell commands (reported as `Bash`; the legacy `functions.exec` and `functions.exec_command` names are accepted as aliases) and MCP calls are adapted into the existing event semantics. The native `apply_patch`, `spawn_agent`, `request_user_input`, and `update_plan` tools produce the file, subagent, decision, and plan events described under [Codex native activity](#codex-native-activity).
 - **UserPromptSubmit** — fires on each user prompt. Detects decisions ("always use X"), role statements ("I'm a data scientist"), and intent patterns.
 
 Events are written to a **sidecar SQLite database**
@@ -48,12 +48,15 @@ new global sequences during their transactional schema upgrade.
 
 #### Codex native command capture
 
-The Codex connector recognizes only PostToolUse payloads marked with
-`client: "codex"` whose `tool_name` is exactly `functions.exec` or
-`functions.exec_command`. The adapter accepts the string `tool_input.command`
-first, or the string `tool_input.cmd` when `command` is not a string. Other
-command-like, path-like, and file-like fields are ignored; a blank `command`
-does not fall back to `cmd`.
+The Codex connector recognizes PostToolUse payloads marked with
+`client: "codex"` whose `tool_name` is `Bash` (the name current Codex uses for
+shell commands), the legacy aliases `functions.exec` and
+`functions.exec_command`, or an `mcp__<server>__<tool>` MCP tool; other native tools are covered
+under [Codex native activity](#codex-native-activity). For shell
+commands the adapter accepts the string `tool_input.command` first, or the
+string `tool_input.cmd` when `command` is not a string. Other command-like,
+path-like, and file-like fields are ignored; a blank `command` does not fall
+back to `cmd`.
 
 The adapter passes only bounded semantic information into the existing Bash
 extractor:
@@ -67,31 +70,84 @@ extractor:
   precedence is `isError`, `is_error`, `exit_code`, then `exitCode`; boolean
   values are used directly and finite numeric exit codes treat zero as
   success and any other value as an error. Invalid, nested, string, `NaN`, and
-  infinite values are ignored.
+  infinite values are ignored. When no status is present, which is the case for
+  the textual result current Codex sends for a shell command, the outcome is
+  unknown. Text is never parsed for a status.
+- An unknown outcome for a git or install command is stored as a
+  `tool_outcome_unknown` observation that names only the matched command (for
+  example `Bash outcome unknown: git commit`; arguments and messages are not
+  stored) rather than a git or environment event. It is never promoted,
+  reinforced, or correlated as the fix for an earlier error. Unknown outcomes
+  for other commands are not recorded.
+- A Codex MCP call is stored by tool name only. Ordinary shell completions,
+  including nonzero exits, are delivered without a status and recorded as
+  unknown. An MCP call that reports `isError: true`, a handler error, and an
+  aborted or interrupted tool produce no PostToolUse payload, so LCM records
+  nothing for them. See
+  [Codex native PostToolUse capture](hook-protocol.md#codex-native-posttooluse-capture)
+  for the full matrix, including poll attribution and the
+  intercepted `apply_patch` gap.
 - The raw Codex response, stdout, stderr, and unknown output fields are never
   copied into the normalized event. Shell text is not parsed into file events.
 - A command whose trimmed text begins with `lcm store` is suppressed so LCM's
   own storage activity cannot create a passive-learning feedback loop.
 
-Only events recognized by the existing Bash extractor are queued. The command
+Only events recognized by the Bash and MCP extractors are queued. The command
 itself is not stored as a transcript.
 
 | Category | Examples | Priority |
 |----------|----------|----------|
-| Decisions | User answers to AskUserQuestion, "always use TypeScript" | 1 (immediate) |
+| Decisions | User answers to AskUserQuestion or Codex `request_user_input`, "always use TypeScript" | 1 (immediate) |
 | Plan approvals | EnterPlanMode / ExitPlanMode events | 1 (immediate) |
 | Errors | Bash commands that fail (isError: true) | 1 (immediate) |
 | Git operations | Commits, merges, branch switches | 2 (batch) |
 | Environment | `npm install`, `pip install`, `brew install` | 2 (batch) |
 | File access | Read/Edit/Write/Glob/Grep with file paths | 3 (pattern-only) |
+| File changes | Files added, deleted, edited, or moved by Codex `apply_patch` (paths only) | 3 (pattern-only) |
+| Delegation | Subagent dispatches (Claude `Agent`, Codex `spawn_agent`) as a short label | 3 (pattern-only) |
+| Plan proposals | Codex `update_plan` revisions that include an explanation | 3 (pattern-only) |
 | MCP tools | Which MCP tools are used (tool name only) | 3 (pattern-only) |
 | Skills | Which skills are invoked | 3 (pattern-only) |
 
+#### Codex native activity
+
+Codex runs PostToolUse only after a tool call succeeds, so each of these tools
+is captured when it completes. A payload that flags the call with `isError`
+records only the generic tool error instead. No configuration is needed.
+
+- **`apply_patch`** records each file the patch adds, deletes, or updates, with
+  a type label (source, test, config, docs). An update that moves a file
+  records one event naming both paths. At most 20 file observations are
+  recorded per patch, and a path is skipped when either end is sensitive. Patch
+  contents and the tool response are never stored. Patches that Codex
+  intercepts from a shell command are not `apply_patch` calls and are not
+  captured.
+- **`spawn_agent`** records a short dispatch label: the task name, then the
+  nickname, then the agent type, or the generic label `agent`. The generic
+  label does not identify a distinct child. Codex multi-agent v2 reports the
+  tool as `collaborationspawn_agent`, which is captured the same way; custom
+  collaboration namespaces are not. The brief, items, model, and agent ID are
+  never stored.
+- **`request_user_input`** records each answered question as a decision, using
+  the question text and the chosen options or notes, for at most the first three
+  questions. Unanswered and secret questions are skipped, and so is
+  `request_user_input_async`, which only reports that the question was sent.
+- **`update_plan`** records a plan proposal only when the call includes an
+  explanation: the explanation and up to 10 step names, without statuses. Calls
+  without an explanation are progress updates and are not captured. Proposals
+  are promoted only when they match an existing memory; they never create a
+  preference or decision on their own.
+
+Routine coordination tools such as `send_message`, `wait_agent`,
+`list_agents`, and `close_agent` are not captured.
+
 ### What Is NOT Captured
 
-- Raw tool payload contents such as file contents, command stdout/stderr, and
-  unknown Codex response fields (only bounded semantic metadata and brief user
-  answers are stored)
+- Raw tool payload contents such as file contents, patch bodies, command
+  stdout/stderr, subagent briefs, and unknown Codex response fields (only
+  bounded semantic metadata and brief user answers are stored)
+- Unanswered or secret Codex questions, plan step statuses, and routine
+  subagent coordination calls
 - Sensitive file paths (`.env`, `.ssh/`, `credentials`, `.npmrc`)
 - LCM's own `lcm_store` calls (prevents feedback loops)
 
@@ -115,6 +171,19 @@ promotion retries the pending events on a later run. An `lcm events promote
 --all` scan stops at that project after any earlier projects have committed;
 the blocked response has no aggregate counts, and later sidecars remain
 available for the next retry.
+
+Promotion through `lcm events promote` (and `--all`) needs the backend
+publication lock briefly. If another process, such as a hook, holds the lock,
+the daemon waits up to about 3 seconds for it to be released and then
+promotes. The wait does not cover the daemon's own work: while the background
+sweep (for example its sidecar scan) or an earlier promotion's cleanup holds
+the lock, or when the wait is exhausted, the daemon answers `503` with
+`status: "busy"` instead of a server error, and the command exits non-zero
+with "backend publication work is in progress; retry the promotion". Retry the
+command; nothing is lost and pending events stay queued. This differs from the
+`503` `status: "blocked"` response above, which means the backend itself is
+not admitting work. For `--all`, projects promoted before the busy response
+stay promoted, but the response carries no aggregate counts.
 
 While a larger passive-learning batch is running, the daemon can remain alive
 and own its configured listener even if bounded health checks cannot complete.
@@ -173,7 +242,7 @@ When the daemon processes queued events, it applies three promotion tiers:
 
 **Tier 2 — Batch promotion** (priority 2): Git and environment events are promoted with moderate confidence (0.3).
 
-**Tier 3 — Pattern reinforcement** (priority 3): File access and tool usage events start as low-confidence signals. A one-off event is skipped unless it matches an existing entry in the promoted store. To bootstrap a new promotion without a seed, the same pattern must appear at least three times across at least two distinct sessions in recent sidecar history. Within one batch, successful reinforcement lookups are reused. A transient lookup failure leaves only that event unprocessed and retryable; a later sibling with the same pattern performs an independent retry. The reinforcement boost only applies on the insert path for a new memory, not when re-confirming an already-promoted entry.
+**Tier 3 — Pattern reinforcement** (priority 3): File access and tool usage events start as low-confidence signals. A one-off event is skipped unless lexical search finds a related entry in the promoted store; it is then stored as a new memory unless its text is exactly the same as an existing one. To bootstrap a new promotion without a seed, the same pattern must appear at least three times across at least two distinct sessions in recent sidecar history. Within one batch, successful reinforcement lookups are reused. A transient lookup failure leaves only that event unprocessed and retryable; a later sibling with the same pattern performs an independent retry. The reinforcement boost only applies on the insert path for a new memory, not when re-confirming an already-promoted entry.
 
 With PostgreSQL selected, passive promotion searches the current owner's promoted
 knowledge across its provenance values. This lets an event converge with a
@@ -360,10 +429,10 @@ pass.
 A row can also have reached the previous project without the local outbox
 recording it: the upload committed but the local record was lost, so the row is
 still pending locally with no remote inbox id. The previous project's copy then
-makes every upload of that row to the new project fail, and the failure takes
-the rest of its batch with it. When an upload fails and the new project lacks
-some of the rows, the same recovery runs for those rows right away, and the
-batch is uploaded once more without the rows that cannot go:
+makes every upload of that row to the new project fail, and a batch holding it
+fails as a whole. When an upload fails and the new project lacks some of the
+rows, the same recovery runs for those rows right away, and the batch is
+uploaded once more without the rows that cannot go:
 
 - an undelivered copy is withdrawn and the row is uploaded to the new project
   in the same pass;
@@ -374,6 +443,16 @@ batch is uploaded once more without the rows that cannot go:
 - a copy that differs from the row is never changed. One error naming the rows
   is reported, and once the row has been attempted the configured number of
   times it is quarantined locally.
+
+The same holds for a row whose copy in the project the machine is bound to
+differs from it (the same event identity with other content), which is what
+makes an upload fail when the batch holds it. That row is retried with backoff
+on its own, and quarantined locally once it has been attempted the configured
+number of times, whichever row of the batch the failed upload named. One error
+naming the differing rows is reported per pass. The other rows of the batch are
+uploaded in the same pass instead of waiting for it. If the extra upload then
+fails because another copy differs, the rows of that upload are retried with
+backoff and the next pass settles the differing rows again.
 
 The other rows of that batch are normally uploaded in the same pass instead of
 waiting for the row that failed it. If the new upload fails again, or the
@@ -474,6 +553,8 @@ described above are intentionally not part of this configuration:
 
 When a pattern crosses the reinforcement threshold, `reinforcementBoost` is added to the base pattern confidence, capped by `maxConfidence`, only when bootstrapping a new promoted entry.
 
+`compaction.promotionThresholds.dedupBm25Threshold` is still accepted for compatibility but no longer causes different text to merge; only exactly the same text is deduplicated.
+
 ## Data Storage
 
 - **Sidecar DB**: `~/.lcm/events/<sha256-of-project-path>.db`
@@ -571,7 +652,7 @@ no sidecar is deleted underneath it.
 - **Promoted store**: Events promoted via `deduplicateAndInsert()` into the main LCM database
   - Tagged with `source:passive-capture` and `hook:<PostToolUse|UserPromptSubmit>`
   - Searchable via `lcm search` and `lcm grep`
-  - Deduplicated via BM25 matching
+  - Deduplicated by exact text: only an event whose text is exactly the same as an active memory merges into it
 
 ## Negative-Match Guards
 

@@ -12,6 +12,7 @@ import {
   type NativeTranscriptCheckpointKey,
   type NativeTranscriptCheckpointRecord,
   type NativeTranscriptMessageSnapshotRepository,
+  type NativeTranscriptProvenanceRepository,
   type NativeTranscriptRecord,
   type NativeTranscriptRepository,
   type NativeTranscriptSessionMessageRecord,
@@ -169,7 +170,7 @@ const transcriptColumns = `transcript.*, (
 const keyWhere = "project_id = ? AND machine_id = ? AND client_name = ? AND source_locator = ?";
 
 /** Active runtime ingest; the invoker owns root/scoped transaction lifetime. */
-export class SqliteNativeTranscriptRepository implements NativeTranscriptRepository, NativeTranscriptMessageSnapshotRepository {
+export class SqliteNativeTranscriptRepository implements NativeTranscriptRepository, NativeTranscriptMessageSnapshotRepository, NativeTranscriptProvenanceRepository {
   constructor(private readonly db: DatabaseSync, private readonly projectId: string, private readonly invoke: RepositoryInvoker) {}
 
   private async execute<T>(operation: string, callback: () => T, atomic = false): Promise<T> {
@@ -305,15 +306,22 @@ export class SqliteNativeTranscriptRepository implements NativeTranscriptReposit
     });
   }
 
+  listLinkedSourceOrdinals(input: NativeTranscriptCheckpointKey & { readonly nativeSessionId: string }): Promise<readonly number[]> {
+    return this.execute("listLinkedSourceOrdinals", () => {
+      const value = object(input);
+      return this.db.prepare("SELECT DISTINCT transcript.source_ordinal FROM runtime_native_transcripts AS transcript JOIN runtime_native_transcript_messages AS link ON link.project_id = transcript.project_id AND link.transcript_id = transcript.transcript_id WHERE transcript.project_id = ? AND transcript.machine_id = ? AND transcript.client_name = ? AND transcript.source_locator = ? AND transcript.native_session_id = ? ORDER BY transcript.source_ordinal").all(...this.keyValues(checkpointKey(value)), text(value.nativeSessionId)).map(row => integer(row.source_ordinal));
+    });
+  }
+
   getCheckpoint(input: NativeTranscriptCheckpointKey): Promise<NativeTranscriptCheckpointRecord | null> {
     return this.execute("getCheckpoint", () => this.readCheckpoint(checkpointKey(input)));
   }
 
   getNativeTranscriptMessageSnapshot(nativeSessionId: string): Promise<readonly NativeTranscriptSessionMessageRecord[]> {
-    return this.execute("getNativeTranscriptMessageSnapshot", () => this.db.prepare("SELECT c.conversation_id,m.message_id,m.seq,m.role,m.content FROM conversations c JOIN messages m ON m.conversation_id=c.conversation_id WHERE c.session_id = ? ORDER BY c.created_at,c.conversation_id,m.seq,m.message_id").all(text(nativeSessionId)).map(row => {
+    return this.execute("getNativeTranscriptMessageSnapshot", () => this.db.prepare("SELECT c.conversation_id,m.message_id,m.seq,m.role,m.content,EXISTS (SELECT 1 FROM message_parts p WHERE p.message_id=m.message_id AND p.part_type='compaction') AS is_compaction_event FROM conversations c JOIN messages m ON m.conversation_id=c.conversation_id WHERE c.session_id = ? ORDER BY c.created_at,c.conversation_id,m.seq,m.message_id").all(text(nativeSessionId)).map(row => {
       const role = row.role;
       requireValue(role === "system" || role === "user" || role === "assistant" || role === "tool");
-      return { conversationId: integer(row.conversation_id), messageId: integer(row.message_id), messageSequence: integer(row.seq), role, content: text(row.content, false) };
+      return { conversationId: integer(row.conversation_id), messageId: integer(row.message_id), messageSequence: integer(row.seq), role, content: text(row.content, false), isCompactionEvent: row.is_compaction_event === 1 };
     }));
   }
 }

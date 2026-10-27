@@ -18,7 +18,7 @@ TO :"lcm_runtime_role";
 
 GRANT SELECT ON TABLE lcm.conversations TO :"lcm_runtime_role";
 GRANT INSERT (project_id, session_id, title),
-      UPDATE (bootstrapped_at, updated_at)
+      UPDATE (bootstrapped_at, updated_at, parent_session_id)
 ON TABLE lcm.conversations TO :"lcm_runtime_role";
 GRANT USAGE ON SEQUENCE lcm.conversations_conversation_id_seq
 TO :"lcm_runtime_role";

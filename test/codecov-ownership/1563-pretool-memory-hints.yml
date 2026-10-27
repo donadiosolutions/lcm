@@ -1,0 +1,25 @@
+references: ["#1563", "#1557"]
+rationale: >-
+  Adds the opt-in Codex PreToolUse memory hint hook. The new handler and its
+  query extractor sit beside the other hook handlers in the hooks owner
+  (matched by the existing src/hooks/ path, so codecov.yml is unchanged), and
+  its dispatch entry stays there. The stored hooks.preToolRecall setting is
+  daemon-core configuration, read by the hook projection and the connector
+  installer through the configuration-security owner. Codex hook registration
+  and the Codex readiness check that expects the opt-in PreToolUse role only
+  while the setting is enabled stay connector-owned, the pre-tool recall mode
+  of the prompt-search route
+  stays route-owned, and the hidden pre-tool command and its help stay CLI-owned.
+  No file was removed, moved or re-owned.
+pins:
+  - ["src/hooks/pre-tool.ts", "unit-hooks"]
+  - ["src/hooks/dispatch.ts", "unit-hooks"]
+  - ["src/daemon/config.ts", "unit-daemon-core"]
+  - ["src/config-projection.ts", "unit-configuration-security"]
+  - ["src/config-manager.ts", "unit-configuration-security"]
+  - ["src/connectors/codex-hooks.ts", "unit-connectors"]
+  - ["src/connectors/installer.ts", "unit-connectors"]
+  - ["src/connectors/codex-readiness.ts", "unit-connectors"]
+  - ["src/daemon/routes/prompt-search.ts", "unit-daemon-routes"]
+  - ["src/cli-help.ts", "unit-cli"]
+  - ["bin/lcm.ts", "unit-cli"]

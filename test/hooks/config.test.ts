@@ -2,7 +2,10 @@ import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, describe, expect, it } from "vitest";
-import { loadStoredLlmRequestPolicyConfig } from "../../src/config-projection.js";
+import {
+  loadStoredLlmRequestPolicyConfig,
+  loadStoredPreToolRecallSettings,
+} from "../../src/config-projection.js";
 import {
   DEFAULT_LLM_REQUEST_TIMEOUT_MS,
   DEFAULT_LLM_RETRY_POLICY,
@@ -98,5 +101,35 @@ describe("loadHookConfig", () => {
     const directory = join(root, "config.json");
     mkdirSync(directory);
     expect(() => loadHookConfig(directory)).toThrow();
+  });
+
+  it("loads the PreToolUse opt-in as disabled with the default port when the file is absent", () => {
+    const root = mkdtempSync(join(tmpdir(), "lcm-pretool-config-missing-"));
+    dirs.push(root);
+    expect(loadStoredPreToolRecallSettings(join(root, "missing.json"))).toEqual({
+      enabled: false,
+      daemonPort: 3737,
+    });
+  });
+
+  it.each([
+    [{ hooks: { preToolRecall: true } }, true, 3737],
+    [{ hooks: { preToolRecall: false }, daemon: { port: 4545 } }, false, 4545],
+    [{ hooks: { snapshotIntervalSec: 30 } }, false, 3737],
+    [{ daemon: { port: 4646 } }, false, 4646],
+  ] as const)("projects hooks.preToolRecall from %j", (config, enabled, daemonPort) => {
+    const root = mkdtempSync(join(tmpdir(), "lcm-pretool-config-"));
+    dirs.push(root);
+    const path = join(root, "config.json");
+    writeFileSync(path, JSON.stringify(config), { mode: 0o600 });
+    expect(loadStoredPreToolRecallSettings(path)).toEqual({ enabled, daemonPort });
+  });
+
+  it("rejects a non-boolean PreToolUse opt-in instead of enabling it", () => {
+    const root = mkdtempSync(join(tmpdir(), "lcm-pretool-config-invalid-"));
+    dirs.push(root);
+    const path = join(root, "config.json");
+    writeFileSync(path, JSON.stringify({ hooks: { preToolRecall: "true" } }), { mode: 0o600 });
+    expect(() => loadStoredPreToolRecallSettings(path)).toThrow("hooks.preToolRecall");
   });
 });

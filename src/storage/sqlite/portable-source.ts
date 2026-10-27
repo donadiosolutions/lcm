@@ -88,7 +88,7 @@ function tableExists(db:DatabaseSync,table:string):boolean {
 // Supported captured layouts are explicit. Source admission never runs migrations.
 const sourceLayouts: Readonly<Record<string,string>> = {
   "context_items": "conversation_id:INTEGER|ordinal:INTEGER|item_type:TEXT|message_id:INTEGER|summary_id:TEXT|created_at:TEXT",
-  "conversations": "conversation_id:INTEGER|session_id:TEXT|title:TEXT|bootstrapped_at:TEXT|created_at:TEXT|updated_at:TEXT",
+  "conversations": "conversation_id:INTEGER|session_id:TEXT|title:TEXT|bootstrapped_at:TEXT|created_at:TEXT|updated_at:TEXT|parent_session_id:TEXT",
   "large_files": "file_id:TEXT|conversation_id:INTEGER|file_name:TEXT|mime_type:TEXT|byte_size:INTEGER|storage_uri:TEXT|exploration_summary:TEXT|created_at:TEXT",
   "message_parts": "part_id:TEXT|message_id:INTEGER|session_id:TEXT|part_type:TEXT|ordinal:INTEGER|text_content:TEXT|is_ignored:INTEGER|is_synthetic:INTEGER|tool_call_id:TEXT|tool_name:TEXT|tool_status:TEXT|tool_input:TEXT|tool_output:TEXT|tool_error:TEXT|tool_title:TEXT|patch_hash:TEXT|patch_files:TEXT|file_mime:TEXT|file_name:TEXT|file_url:TEXT|subtask_prompt:TEXT|subtask_desc:TEXT|subtask_agent:TEXT|step_reason:TEXT|step_cost:REAL|step_tokens_in:INTEGER|step_tokens_out:INTEGER|snapshot_hash:TEXT|compaction_auto:INTEGER|metadata:TEXT",
   "messages": "message_id:INTEGER|conversation_id:INTEGER|seq:INTEGER|role:TEXT|content:TEXT|token_count:INTEGER|created_at:TEXT",

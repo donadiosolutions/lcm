@@ -599,4 +599,136 @@ describe("PostgreSQL 18 passive-event replication", () => {
       }
     });
   });
+
+  it("delivers pending events copied by a cutover exactly once (#1693)", async () => {
+    await withPostgreSqlTestDatabase("passive-cutover-copy", async (database) => {
+      await grantPassiveEventRuntimePrivileges(database);
+      const projectId = await createProject(database, "Passive cutover project");
+      const machineId = await createMachine(database, "Passive cutover machine");
+      await database.migrator.query({
+        text: `CREATE TABLE public.passive_event_effects(
+                 effect_id bigint GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
+                 event_id uuid NOT NULL UNIQUE,
+                 machine_id uuid NOT NULL
+               );
+               REVOKE ALL ON public.passive_event_effects FROM PUBLIC;
+               GRANT INSERT, SELECT ON public.passive_event_effects
+               TO lcm_test_runtime;
+               GRANT USAGE ON SEQUENCE public.passive_event_effects_effect_id_seq
+               TO lcm_test_runtime`,
+      }, { domain: "passive-events", operation: "createCutoverEffects" });
+      const directory = mkdtempSync(join(tmpdir(), "lcm-passive-cutover-"));
+      const factory = new SQLiteLocalHookOutboxFactory();
+      try {
+        const path = join(directory, "events.db");
+        const local = await factory.open(path);
+        await insertLocalEvents(local, "cutover", 3);
+        const [plain, chained, fresh] = await local.getUnprocessed(500);
+        // The second event carries a machine-local previous event id, as
+        // promote-events leaves on a pending row that never attempted delivery.
+        await local.setPrevEventId(chained.event_id, plain.event_id);
+        clearCapturedMachineIdentity(path);
+
+        // The migration copy writes these two inbox rows in the portable
+        // envelope: an ISO createdAt and no previousEventId.
+        const copied = new Map<string, string>();
+        for (const row of [plain, chained]) {
+          const createdAt = `${row.created_at.replace(" ", "T")}.000000Z`;
+          const inserted = await database.migrator.query<{ inbox_id: string }>({
+            text: `INSERT INTO lcm.passive_event_inbox(
+                     project_id, machine_id, event_id, event_version,
+                     machine_sequence, event_type, payload, status,
+                     received_at, next_attempt_at
+                   ) VALUES($1, $2, $3, $4, $5::pg_catalog.int8, $6,
+                            $7::pg_catalog.jsonb, 'pending',
+                            $8::pg_catalog.timestamptz, $8::pg_catalog.timestamptz)
+                   RETURNING inbox_id::pg_catalog.text`,
+            values: [
+              projectId,
+              machineId,
+              row.event_uuid,
+              row.event_version,
+              row.machine_sequence,
+              row.type,
+              JSON.stringify({
+                sessionId: row.session_id,
+                category: row.category,
+                data: row.data,
+                sourceHook: row.source_hook,
+                createdAt,
+                sessionSequence: row.seq,
+                priority: row.priority,
+              }),
+              createdAt,
+            ],
+          }, { domain: "passive-events", operation: "copyCutoverInboxRow" });
+          copied.set(row.event_uuid, inserted.rows[0].inbox_id);
+        }
+        expect(plain.created_at).toMatch(/^\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2}$/u);
+
+        const remote = new PostgreSqlPassiveEventRepository(
+          database.runtime,
+          projectId,
+          machineId,
+        );
+        // The real prune deletes applied inbox rows, so the rows seen at
+        // prune time prove which inbox row served each event.
+        const pruned: Array<{ eventId: string; inboxId: string; createdAt: unknown }> = [];
+        const prune = remote.pruneApplied.bind(remote);
+        remote.pruneApplied = async (keys, signal) => {
+          const records = await remote.readEvents(
+            keys.map((key) => ({ machineId: key.machineId, eventId: key.eventId })),
+            signal,
+          );
+          pruned.push(...records.map((record) => ({
+            eventId: record.eventId,
+            inboxId: record.inboxId.toString(),
+            createdAt: record.payload.createdAt,
+          })));
+          return prune(keys, signal);
+        };
+
+        const result = await worker(local, remote, "replication-cutover", 10).runOnce();
+
+        expect(result).toMatchObject({
+          uploaded: 3,
+          retried: 0,
+          quarantined: 0,
+          applied: 3,
+          acknowledged: 3,
+          pruned: 3,
+        });
+        const rows = await local.getUnprocessed(500);
+        expect(rows).toHaveLength(3);
+        expect(rows.every((row) =>
+          row.delivery_state === "acknowledged" && row.remote_pruned_at !== null))
+          .toBe(true);
+        // Each event was served by exactly one inbox row, and the copied rows
+        // kept the inbox ids and portable payload the migration gave them.
+        expect(pruned).toHaveLength(3);
+        for (const row of [plain, chained]) {
+          expect(pruned.filter((entry) => entry.eventId === row.event_uuid)).toEqual([{
+            eventId: row.event_uuid,
+            inboxId: copied.get(row.event_uuid),
+            createdAt: `${row.created_at.replace(" ", "T")}.000000Z`,
+          }]);
+        }
+        expect(pruned.filter((entry) => entry.eventId === fresh.event_uuid))
+          .toHaveLength(1);
+        const effects = await database.migrator.query<{ event_id: string }>({
+          text: "SELECT event_id::pg_catalog.text AS event_id FROM public.passive_event_effects",
+        }, { domain: "passive-events", operation: "countCutoverEffects" });
+        expect(effects.rows.map((row) => row.event_id).sort()).toEqual(
+          [plain, chained, fresh].map((row) => row.event_uuid).sort(),
+        );
+        const remaining = await database.migrator.query<{ count: string }>({
+          text: "SELECT COUNT(*)::pg_catalog.text AS count FROM lcm.passive_event_inbox",
+        }, { domain: "passive-events", operation: "countCutoverInbox" });
+        expect(remaining.rows[0].count).toBe("0");
+      } finally {
+        await factory.close();
+        rmSync(directory, { recursive: true, force: true });
+      }
+    });
+  });
 });

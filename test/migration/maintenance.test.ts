@@ -990,6 +990,45 @@ describe("backend publication maintenance journal v3", () => {
     expect(assertMigrationReplayAdmission(replay)).toEqual({ backend: "sqlite", disposition: "source-abort" });
   });
 
+  // PR #1556 thread 4307516130: a maintenance window entered from PostgreSQL (a rollback's) that aborts leaves
+  // PostgreSQL selected for the consumer, the config admission and replay admission. Omitting sourceBackend keeps
+  // the activation's SQLite default, byte for byte.
+  it.each([
+    { entered: "postgresql", selected: "postgresql", mismatched: "sqlite" },
+    { entered: undefined, selected: "sqlite", mismatched: "postgresql" },
+  ] as const)("an aborted window entered from $entered leaves $selected selected", async ({ entered, selected, mismatched }) => {
+    const homeDir = home();
+    vi.stubEnv("HOME", homeDir);
+    const configPath = join(homeDir, ".lcm", "config.json");
+    const entering = entered === undefined ? input() : { ...input(), sourceBackend: entered };
+    const held = await coordinator(homeDir).enterMaintenance(entering);
+    expect(held.sourceBackend).toBe(selected);
+    // Re-entering an interrupted "maintenance-entering" journal matches on the source backend too.
+    const journalPath = publicationApi.backendPublicationJournalPath(homeDir);
+    const { checksumSha256: _held, ...heldBody } = JSON.parse(readFileSync(journalPath, "utf8")) as Record<string, unknown>;
+    const enteringBody = { ...heldBody, phase: "maintenance-entering" };
+    writeFileSync(journalPath, JSON.stringify({ ...enteringBody, checksumSha256: publicationApi.backendPublicationCanonicalSha256(enteringBody) }), { mode: 0o600 });
+    await expect(coordinator(homeDir).enterMaintenance({ ...input(), sourceBackend: mismatched }))
+      .rejects.toMatchObject({ reason: "unexpected-state", message: expect.stringContaining("does not match entering state") });
+    const resumed = await coordinator(homeDir).enterMaintenance(entering);
+    expect(resumed).toMatchObject({ phase: "maintenance-held", sourceBackend: selected });
+    const aborted = await coordinator(homeDir).abortMaintenance({
+      expectedChecksumSha256: resumed.checksumSha256, sourceSelectionSha256: HASH_A, abortEvidenceSha256: HASH_B,
+    });
+    expect(aborted).toMatchObject({ phase: "maintenance-aborted", sourceBackend: selected });
+    expect(publicationApi.readBackendMaintenanceJournal(homeDir)?.sourceBackend).toBe(selected);
+    expect(() => assertBackendPublicationConsumerAccess({ homeDir, backend: selected })).not.toThrow();
+    expect(() => assertBackendPublicationConsumerAccess({ homeDir, backend: mismatched }))
+      .toThrow(expect.objectContaining({ reason: "backend-mismatch" }));
+    const witness = publicationApi.captureBackendPublicationFileWitness(configPath, join(homeDir, ".lcm")).witness;
+    expect(publicationApi.assertBackendPublicationConfigReadAccess(configPath, selected, witness))
+      .toEqual({ journalChecksumSha256: aborted.checksumSha256 });
+    expect(() => publicationApi.assertBackendPublicationConfigReadAccess(configPath, mismatched, witness))
+      .toThrow(expect.objectContaining({ reason: "backend-mismatch" }));
+    expect(assertMigrationReplayAdmission({ homeDir, generationId: "generation-1", evidenceSha256: HASH_B }))
+      .toEqual({ backend: selected, disposition: "source-abort" });
+  });
+
   it.each(["machine", "identity-key"])("preserves pending identity when remote readback changes %s", async (change) => {
     const fixture = enrollmentFixture();
     fixture.repository.recoverMachine.mockImplementation(async () => ({ ...fixture.registered(),

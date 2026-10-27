@@ -222,6 +222,40 @@ recorded PID and birth fingerprint no longer identify a live process before
 manually removing that exact object. If the evidence cannot be established,
 preserve it for reconciliation; elapsed time is never proof of ownership.
 
+### Rootless Podman
+
+Contributors who prefer rootless Podman can run the local harness with it:
+
+```bash
+LCM_TEST_CONTAINER_CLI=podman pnpm run test:postgresql
+```
+
+`LCM_TEST_CONTAINER_CLI` accepts `docker` (the default), `podman`, or an
+absolute path to either executable (a `.exe` suffix, as on Windows, is
+ignored); any other value, including an empty one,
+stops the harness before it allocates anything. The variable selects the engine
+for the local harness only. Continuous integration, the `GITHUB_ACTIONS` mode
+of the harness, and the image and template commands of
+`scripts/ci-environment.mjs` continue to use Docker, and the harness rejects
+Podman when `GITHUB_ACTIONS=true`.
+
+Under Podman the harness always initializes a fresh database and rejects
+`LCM_POSTGRES_TEMPLATE_ARCHIVE`. The first run may pull the pinned PostgreSQL
+image. With either engine the harness copies its two initialization scripts
+into its private per-run directory. Under Podman it mounts that directory and
+the copies with `ro,Z` (Docker uses `ro,z`). On SELinux hosts the label
+relabels them, so only run-private files are
+relabeled and no checkout path is mounted or relabeled. The temporary directory
+(`TMPDIR`) must therefore be on a local filesystem that SELinux can label. Cleanup, ownership labels, and orphan
+recovery behave as they do with Docker. Inspect leftovers with the same
+commands, using `podman`:
+
+```bash
+podman ps -a --filter label=com.donadiosolutions.lcm.postgresql-test-run
+podman network ls --filter label=com.donadiosolutions.lcm.postgresql-test-run
+podman volume ls --filter label=com.donadiosolutions.lcm.postgresql-test-run
+```
+
 ## Register a PostgreSQL repository contract
 
 Every PostgreSQL implementation of a `ProjectRepositories` domain must pass a
@@ -507,7 +541,7 @@ schema creation, migration-ledger access, table ownership, `TRUNCATE`,
 arbitrary updates, sequence mutation, or access to unrelated domain objects.
 
 The transcript script grants schema `USAGE`; column-limited `SELECT` on the
-conversation and message fields needed for exact native-session linkage;
+conversation, message, and message-part fields needed for exact native-session linkage;
 `SELECT` and column-limited `INSERT` on `native_transcripts` and
 `transcript_messages`; and `SELECT`, identity-column `INSERT`, and
 checkpoint-field-only `UPDATE` on `ingest_checkpoints`. It does not grant

@@ -1,0 +1,8 @@
+references: ["#1559"]
+rationale: >-
+  Adds native Codex activity capture (apply_patch, spawn_agent,
+  request_user_input and update_plan branches) to src/hooks/extractors.ts. The
+  file is materially changed and keeps its existing hooks unit owner. No file
+  is added, removed, moved or re-owned.
+pins:
+  - ["src/hooks/extractors.ts", "unit-hooks"]

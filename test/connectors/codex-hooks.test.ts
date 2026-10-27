@@ -33,6 +33,8 @@ import {
   compensateConnectorLeaf,
   finalizeConnectorLeaf,
   matchesCertificate,
+  codexLcmHooks,
+  mergeCodexHooksContent,
 } from "../../src/connectors/codex-hooks.js";
 
 function serializedErrorSurface(value: unknown): string {
@@ -66,12 +68,6 @@ describe("Codex hook configuration boundaries", () => {
   it("sets the feature in empty, absent, existing, and section-delimited configs", () => {
     expect(setCodexHooksFeature("\r\n")).toBe("[features]\nhooks = true\n");
     expect(setCodexHooksFeature("model = 'x'\n")).toContain("\n\n[features]\nhooks = true\n");
-    expect(setCodexHooksFeature("[features]\nhooks = false\n[other]\nx = 1\n"))
-      .toBe("[features]\nhooks = true\n[other]\nx = 1\n");
-    expect(setCodexHooksFeature("[features] # settings\ncodex_hooks = true\nhooks = false\n"))
-      .toBe("[features] # settings\nhooks = true\n");
-    expect(setCodexHooksFeature("[features]\nhooks = false\ncodex_hooks = true\n"))
-      .toBe("[features]\nhooks = true\n");
     expect(setCodexHooksFeature("[features]\nvalue = 1\n[other]\nx = 1\n"))
       .toBe("[features]\nvalue = 1\nhooks = true\n[other]\nx = 1\n");
   });
@@ -88,8 +84,13 @@ describe("Codex hook configuration boundaries", () => {
     expect(() => enableCodexHooksFeature(configPath)).toThrow();
   });
 
-  it("normalizes malformed hook files while installing", () => {
+  it("refuses a malformed hook file and normalizes valid non-object JSON while installing", () => {
     writeFileSync(hooksPath, "not json");
+    expect(() => installCodexHooks(hooksPath, configPath)).toThrow("not valid JSON");
+    expect(readFileSync(hooksPath, "utf-8")).toBe("not json");
+    expect(existsSync(configPath)).toBe(false);
+
+    writeFileSync(hooksPath, "");
     installCodexHooks(hooksPath, configPath);
     expect(hasCodexHooks(hooksPath)).toBe(true);
 
@@ -102,12 +103,23 @@ describe("Codex hook configuration boundaries", () => {
     expect(hasCodexHooks(hooksPath)).toBe(true);
   });
 
-  it("stamps only UserPromptSubmit and converges legacy or stamped prompt hooks", () => {
+  it("installs the SessionStart matcher for compact and fork over a legacy matcher", () => {
+    writeFileSync(hooksPath, JSON.stringify({
+      hooks: {
+        SessionStart: [{ matcher: "startup|resume|clear", hooks: [{ type: "command", command: "lcm restore --client codex" }] }],
+      },
+    }));
+    installCodexHooks(hooksPath, configPath);
+    const sessionStart = JSON.parse(readFileSync(hooksPath, "utf-8")).hooks.SessionStart;
+    expect(sessionStart).toHaveLength(1);
+    expect(sessionStart[0].matcher).toBe("startup|resume|clear|compact|fork");
+  });
+
+  it("stamps only UserPromptSubmit and converges a legacy prompt hook in place", () => {
     writeFileSync(hooksPath, JSON.stringify({
       hooks: {
         UserPromptSubmit: [{ hooks: [
           { type: "command", command: "lcm user-prompt --client codex" },
-          { type: "command", command: "lcm user-prompt --client codex --transport mcp" },
           { type: "command", command: "lcm user-prompt --client codex --transport invalid" },
         ] }],
       },
@@ -115,8 +127,97 @@ describe("Codex hook configuration boundaries", () => {
     installCodexHooks(hooksPath, configPath);
     const result = JSON.parse(readFileSync(hooksPath, "utf-8"));
     const commands = result.hooks.UserPromptSubmit.flatMap((group: any) => group.hooks.map((hook: any) => hook.command));
-    expect(commands).toEqual(["lcm user-prompt --client codex --transport invalid", "lcm user-prompt --client codex --transport cli"]);
+    expect(commands).toEqual(["lcm user-prompt --client codex --transport cli", "lcm user-prompt --client codex --transport invalid"]);
     expect(result.hooks.PostToolUse[0].hooks[0].command).toBe("lcm post-tool --client codex");
+  });
+
+  it("registers SubagentStart and SubagentStop idempotently without disturbing foreign hooks", () => {
+    writeFileSync(hooksPath, JSON.stringify({
+      hooks: {
+        SubagentStart: [{ hooks: [{ type: "command", command: "echo foreign-start" }] }],
+        SubagentStop: [{ hooks: [{ type: "command", command: "echo foreign-stop" }] }],
+      },
+    }));
+    installCodexHooks(hooksPath, configPath);
+    installCodexHooks(hooksPath, configPath);
+    const result = JSON.parse(readFileSync(hooksPath, "utf-8"));
+    expect(result.hooks.SubagentStart).toEqual([
+      { hooks: [{ type: "command", command: "echo foreign-start" }] },
+      { hooks: [{
+        type: "command",
+        command: "lcm restore --client codex",
+        timeout: 30,
+        statusMessage: "Loading LCM memory for subagent",
+      }] },
+    ]);
+    expect(result.hooks.SubagentStop).toEqual([
+      { hooks: [{ type: "command", command: "echo foreign-stop" }] },
+      { hooks: [{
+        type: "command",
+        command: "lcm session-snapshot --client codex",
+        timeout: 30,
+        statusMessage: "Saving LCM subagent memory",
+      }] },
+    ]);
+
+    removeCodexHooks(hooksPath);
+    const stripped = JSON.parse(readFileSync(hooksPath, "utf-8"));
+    expect(stripped.hooks).toEqual({
+      SubagentStart: [{ hooks: [{ type: "command", command: "echo foreign-start" }] }],
+      SubagentStop: [{ hooks: [{ type: "command", command: "echo foreign-stop" }] }],
+    });
+  });
+
+  it("registers no PreToolUse hook by default and never through the legacy installer", () => {
+    expect(codexLcmHooks("cli")).not.toHaveProperty("PreToolUse");
+    expect(codexLcmHooks("cli", { preToolRecall: false })).not.toHaveProperty("PreToolUse");
+    expect(codexLcmHooks("cli", {})).not.toHaveProperty("PreToolUse");
+    installCodexHooks(hooksPath, configPath);
+    expect(JSON.parse(readFileSync(hooksPath, "utf-8")).hooks).not.toHaveProperty("PreToolUse");
+  });
+
+  it("registers the opt-in PreToolUse hook for Bash, apply_patch and MCP tools only", () => {
+    expect(codexLcmHooks("mcp", { preToolRecall: true }).PreToolUse).toEqual([{
+      matcher: "^(Bash|apply_patch|mcp__.*)$",
+      hooks: [{
+        type: "command",
+        command: "lcm pre-tool --client codex",
+        timeout: 5,
+        statusMessage: "Checking LCM memory for this action",
+      }],
+    }]);
+    const merged = JSON.parse(mergeCodexHooksContent("", "cli", { preToolRecall: true }));
+    expect(Object.keys(merged.hooks).sort()).toEqual([
+      "Interrupt", "PostToolUse", "PreCompact", "PreToolUse", "SessionEnd", "SessionStart", "Stop", "SubagentStart", "SubagentStop",
+      "UserPromptSubmit",
+    ]);
+  });
+
+  it("adds, keeps and removes the PreToolUse hook as the setting toggles while preserving user hooks", () => {
+    const userHook = { matcher: "Bash", hooks: [{ type: "command", command: "echo mine" }] };
+    const initial = JSON.stringify({ hooks: { PreToolUse: [userHook] } });
+    const enabled = mergeCodexHooksContent(initial, "cli", { preToolRecall: true });
+    expect(JSON.parse(enabled).hooks.PreToolUse).toHaveLength(2);
+    expect(JSON.parse(enabled).hooks.PreToolUse[0]).toEqual(userHook);
+
+    const reinstalled = mergeCodexHooksContent(enabled, "cli", { preToolRecall: true });
+    expect(JSON.parse(reinstalled).hooks.PreToolUse).toHaveLength(2);
+
+    const disabled = mergeCodexHooksContent(reinstalled, "cli", { preToolRecall: false });
+    expect(JSON.parse(disabled).hooks.PreToolUse).toEqual([userHook]);
+    expect(JSON.parse(mergeCodexHooksContent(disabled, "cli")).hooks.PreToolUse).toEqual([userHook]);
+  });
+
+  it("recognizes and removes only the LCM pre-tool command", () => {
+    writeFileSync(hooksPath, mergeCodexHooksContent(JSON.stringify({
+      hooks: { PreToolUse: [{ hooks: [{ type: "command", command: "echo lcm pre-tooling elsewhere" }] }] },
+    }), "cli", { preToolRecall: true }));
+    expect(hasCodexHooks(hooksPath)).toBe(true);
+    expect(removeCodexHooks(hooksPath)).toBe(true);
+    const remaining = JSON.parse(readFileSync(hooksPath, "utf-8"));
+    expect(remaining.hooks.PreToolUse).toEqual([
+      { hooks: [{ type: "command", command: "echo lcm pre-tooling elsewhere" }] },
+    ]);
   });
 
   it("rejects an unsupported transport before writing Codex hooks", () => {

@@ -30,7 +30,8 @@ export interface SqliteRuntimeReadOptions {
   };
 }
 
-type Field = readonly [field: string, column: string, kind?: "boolean" | "timestamp" | "json" | "conversations" | "messages"];
+// "optional" fields are omitted from the portable value while the column is NULL.
+type Field = readonly [field: string, column: string, kind?: "boolean" | "timestamp" | "json" | "conversations" | "messages" | "optional"];
 interface Mapping {
   readonly table: string;
   readonly key: readonly string[];
@@ -43,6 +44,7 @@ const mappings: Partial<Record<PortableDomain, Mapping>> = {
   conversations: { table: "conversations", key: ["conversation_id"], fields: [
     ["sessionId", "session_id"], ["title", "title"], ["bootstrappedAt", "bootstrapped_at", "timestamp"],
     ["createdAt", "created_at", "timestamp"], ["updatedAt", "updated_at", "timestamp"],
+    ["parentSessionId", "parent_session_id", "optional"],
   ] },
   messages: { table: "messages", key: ["message_id"], fields: [
     ["conversationIdentitySha256", "conversation_id", "conversations"], ["seq", "seq"], ["role", "role"],
@@ -164,8 +166,9 @@ export function writePortableRuntimeRecord(
     return JSON.stringify([String(parent), String(ordinal)]);
   }
   const mapping = mappingFor(record.domain);
-  const columns = mapping.fields.map(([, column]) => column);
-  const values = mapping.fields.map(([field, , kind]) => {
+  const fields = mapping.fields.filter(([field, , kind]) => kind !== "optional" || value[field] !== undefined);
+  const columns = fields.map(([, column]) => column);
+  const values = fields.map(([field, , kind]) => {
     const input = value[field];
     if (record.domain === "promoted-memories" && field === "sourceProjectId") return scalar(input ?? identity.projectId);
     if (input === null) return null;
@@ -185,8 +188,9 @@ function decodeRow(domain: PortableDomain, mapping: Mapping, row: Record<string,
   const references: { field: string; domain: PortableDomain; locator: string }[] = [];
   for (const [field, column, kind] of mapping.fields) {
     const native = row[column];
-    if (native === null) value[field] = null;
-    else if (kind === "conversations" || kind === "messages") {
+    if (native === null) {
+      if (kind !== "optional") value[field] = null;
+    } else if (kind === "conversations" || kind === "messages") {
       const locator = String(native);
       value[field] = locator;
       references.push({ field, domain: kind, locator });

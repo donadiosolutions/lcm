@@ -148,6 +148,7 @@ export function createSqliteRepositories(
       getConversationBySessionId: (sessionId) => invoke("conversations", "getConversationBySessionId", () => conversations.getConversationBySessionId(sessionId)),
       getOrCreateConversation: (sessionId, title) => invoke("conversations", "getOrCreateConversation", () => conversations.getOrCreateConversation(sessionId, title)),
       markConversationBootstrapped: (id) => invoke("conversations", "markConversationBootstrapped", () => conversations.markConversationBootstrapped(id)),
+      setParentSessionIdIfNull: (id, parentSessionId) => invoke("conversations", "setParentSessionIdIfNull", () => conversations.setParentSessionIdIfNull(id, parentSessionId)),
       listConversations: () => invoke("conversations", "listConversations", () => conversations.listConversations()),
       createMessage: (input) => invoke("conversations", "createMessage", () => conversations.createMessage(input)),
       createMessagesBulk: (inputs) => inputs.length === 0
@@ -180,6 +181,7 @@ export function createSqliteRepositories(
       getMessageCount: (id) => invoke("conversations", "getMessageCount", () => conversations.getMessageCount(id)),
       getMessageCountBySessionId: (sessionId) => invoke("conversations", "getMessageCountBySessionId", () => conversations.getMessageCountBySessionId(sessionId)),
       getMaxSeq: (id) => invoke("conversations", "getMaxSeq", () => conversations.getMaxSeq(id)),
+      getTranscriptSlotSnapshot: (sessionId) => invoke("conversations", "getTranscriptSlotSnapshot", () => conversations.getTranscriptSlotSnapshot(sessionId)),
       deleteMessages: (ids) => ids.length === 0
         ? Promise.resolve(0)
         : invoke("conversations", "deleteMessages", () => conversationAtomic.deleteMessages(ids), true),

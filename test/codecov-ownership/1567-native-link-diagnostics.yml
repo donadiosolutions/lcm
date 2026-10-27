@@ -1,0 +1,8 @@
+references: ["#1567"]
+rationale: >-
+  #1567 adds a validated condition code and ordinal to the native transcript
+  linkage error and an optional resolver explanation; both files keep their
+  established owner.
+pins:
+  - ["src/storage/native-transcript-ingest.ts", "unit-transcripts-import"]
+  - ["src/storage/native-transcripts.ts", "unit-transcripts-import"]

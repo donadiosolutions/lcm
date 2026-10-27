@@ -91,6 +91,26 @@ describe("createBackendPublicationDriver: remote guard choice validation", () =>
     expect(driver.cleanupAbortedMaterial).toBeUndefined();
   });
 
+  it("wires the optional release-reconciliation read through only when the provider declares it (Bug #1651)", async () => {
+    const provider: BackendPublicationRemoteGuardProvider = {
+      acquireRemoteGuard: vi.fn(),
+      readRemoteGuard: vi.fn(),
+      releaseRemoteGuard: vi.fn(),
+    };
+    expect(createBackendPublicationDriver({ remoteGuard: { mode: "delegated", provider } })
+      .readRemoteGuardForReleaseReconciliation).toBeUndefined();
+    const reconcile = vi.fn(async () => null);
+    const driver = createBackendPublicationDriver({
+      remoteGuard: { mode: "delegated", provider: { ...provider, readRemoteGuardForReleaseReconciliation: reconcile } },
+    });
+    const context = { homeDir: undefined, journal: {} as never, project: {} as never };
+    await expect(driver.readRemoteGuardForReleaseReconciliation!(context)).resolves.toBeNull();
+    expect(reconcile).toHaveBeenCalledWith(context);
+    expect(() => createBackendPublicationDriver({
+      remoteGuard: { mode: "delegated", provider: { ...provider, readRemoteGuardForReleaseReconciliation: "no" as never } },
+    })).toThrow(/readRemoteGuardForReleaseReconciliation must be a function/);
+  });
+
   it("accepts a fully-implemented delegated provider (positive control) and wires all three methods through", async () => {
     const fence: BackendPublicationFenceRecord = {
       projectId: "p",

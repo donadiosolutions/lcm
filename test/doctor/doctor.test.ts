@@ -5,6 +5,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { runDoctor } from "../../src/doctor/doctor.js";
 import { backendDiagnosticFailure, type BackendDiagnosticSnapshot } from "../../src/storage/diagnostics.js";
+import { telemetryFillers } from "../../src/storage/runtime-health.js";
 import type { DoctorDeps } from "../../src/doctor/types.js";
 import { doctorConfigReadFailureSeams, doctorConfigSeams } from "./config-seams.js";
 import { writeAbortedTerminalPublicationJournal } from "../fixtures/terminal-publication-journal.js";
@@ -1249,6 +1250,10 @@ describe("runDoctor configuration validation", () => {
         pool: { origin: "diagnostic-probe", status: "ready" },
         project: { scope: "aggregate", status: "ready" }, identity: { status: "ready" },
         outbox: { status: "ready", captured: 100, unprocessed: 5, errors: 0 },
+        telemetry: {
+          ...telemetryFillers("postgresql", "unavailable", 0),
+          statements: { status: "observed", observedAt: 1, scope: "aggregate" },
+        },
         remediation: "No action required.",
       };
     mockCollectEventStats.mockReturnValue({

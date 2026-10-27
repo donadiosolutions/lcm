@@ -26,6 +26,9 @@ import {
   MigrationVerificationDriverError,
   assertDestinationIdentityMatches,
   assertPermanentReadOnlyGuard,
+  completePendingMigrationVerification,
+  buildMigrationCanonicalDelta,
+  buildMigrationCensusVector,
   inspectMigrationVerification,
   readFencedDestinationCensus,
   readLedgerMismatches,
@@ -3248,16 +3251,157 @@ describe("verifyMigrationGeneration: search self-match probe (round-2 P1)", () =
     expect(differentSeed.report.body.publicProbeSha256).not.toBe(result.report.body.publicProbeSha256);
   }, 15000);
 
-  it("marks the search probe not-run, with a distinct reason, when the source has no messages to probe with at all", async () => {
+  it("#1676 named negative: an empty candidate pool with a non-zero messages checkpoint and census never earns public-search", async () => {
+    // The pool is empty only because the fake stream yielded no message
+    // records; the checkpoint and the destination census still say four
+    // messages exist. Pool-empty alone must not earn the receipt.
     stubDestinationPrimitives();
     const recordCounts = Object.fromEntries(PORTABLE_RECORD_DOMAIN_ORDER.map((domain, index) => [domain, index])) as Partial<Record<PortableDomain, number>>;
     const copySource = fakeCopySource({ recordCounts, messagesRecords: [] });
-    const runtime = fakeRuntime();
+    // searchRows: [] so the empty-source search is clean and only the
+    // non-zero checkpoint and census can refuse the receipt.
+    const runtime = fakeRuntime({ searchRows: [] });
     const dependencies = dependenciesFor(copySource, runtime);
     const result = await verifyMigrationGeneration(baseInput({ homeDir: "/tmp/lcm-verify-search-no-messages" }), dependencies);
     expect(result.report.body.publicProbeCoverage).toContainEqual({ probe: "public-search", ran: false });
     expect(result.report.activationEligible).toBe(false);
   }, 15000);
+
+  describe("#1676 empty project: the empty-source search witness", () => {
+    const MESSAGES_INDEX = PORTABLE_RECORD_DOMAIN_ORDER.indexOf("messages");
+    const countFor = (domain: PortableDomain, messageCount: number): number => (
+      domain === "messages" ? messageCount : PORTABLE_RECORD_DOMAIN_ORDER.indexOf(domain)
+    );
+    /** An internally consistent project whose messages domain is empty on the source, the manifest, the ledger and the census. */
+    async function verifyEmptyProject(options: {
+      home: string;
+      sourceMessageCount?: number;
+      censusMessageCount?: number;
+      runtime?: Parameters<typeof fakeRuntime>[0];
+    }) {
+      const sourceMessageCount = options.sourceMessageCount ?? 0;
+      const censusMessageCount = options.censusMessageCount ?? 0;
+      const ledgerCheckpoints = PORTABLE_RECORD_DOMAIN_ORDER.map((domain) => ({
+        ...defaultLedgerCheckpoint(domain), ordinal: countFor(domain, censusMessageCount), recordCount: countFor(domain, censusMessageCount),
+      }));
+      stubDestinationPrimitives({
+        manifestCheckpoints: ledgerCheckpoints,
+        domainCensus: (domain) => {
+          const count = countFor(domain, censusMessageCount);
+          return {
+            domain, recordCount: count, prefixSha256: fakeHash(`prefix-${domain}-${count}`),
+            terminalIdentitySha256: count === 0 ? null : HASH_A,
+          };
+        },
+      });
+      const recordCounts = Object.fromEntries(PORTABLE_RECORD_DOMAIN_ORDER.map((domain) => [domain, countFor(domain, sourceMessageCount)])) as Partial<Record<PortableDomain, number>>;
+      const session = fakeSession({
+        ledgerCheckpoints,
+        ledgerIdentityTotal: LEDGER_TOTAL_RECORD_COUNT_DEFAULT - MESSAGES_INDEX + censusMessageCount,
+      });
+      return verifyMigrationGeneration(
+        baseInput({ homeDir: options.home }),
+        dependenciesFor(
+          fakeCopySource({ recordCounts, messagesRecords: [] }),
+          fakeRuntime({ session, searchRows: [], ...options.runtime }),
+        ),
+      );
+    }
+    const SEARCH_HIT_ROW = {
+      message_id: 1, conversation_id: 1, role: "user", snippet: "match",
+      created_at: "2026-01-01T00:00:00.000Z", rank: 1, match_phase: 0,
+    };
+
+    it("earns public-search and activation eligibility when source, census and the production search all agree the project is empty", async () => {
+      const result = await verifyEmptyProject({ home: "/tmp/lcm-verify-empty-project" });
+      expect(result.report.mismatches).toEqual([]);
+      expect(result.outcome).toBe("clean");
+      expect(result.report.body.publicProbeCoverage).toContainEqual({ probe: "public-search", ran: true });
+      expect(result.report.activationEligible).toBe(true);
+    }, 15000);
+
+    it("folds a distinct digest: the empty-source pass differs from a self-match pass and from every non-earning pass on the same zero fixture", async () => {
+      const empty = await verifyEmptyProject({ home: "/tmp/lcm-verify-empty-digest" });
+      const noRun = await verifyEmptyProject({ home: "/tmp/lcm-verify-empty-digest-no-run", runtime: { transferRunId: null } });
+      const incomplete = await verifyEmptyProject({ home: "/tmp/lcm-verify-empty-digest-incomplete", runtime: { transferRunState: "active" } });
+      const rows = await verifyEmptyProject({ home: "/tmp/lcm-verify-empty-digest-rows", runtime: { searchRows: [SEARCH_HIT_ROW] } });
+      stubDestinationPrimitives();
+      const selfMatch = await verifyMigrationGeneration(
+        baseInput({ homeDir: "/tmp/lcm-verify-empty-digest-self-match" }),
+        dependenciesFor(fakeCopySource({
+          recordCounts: Object.fromEntries(PORTABLE_RECORD_DOMAIN_ORDER.map((domain, index) => [domain, index])) as Partial<Record<PortableDomain, number>>,
+        }), fakeRuntime()),
+      );
+      const digests = [empty, noRun, incomplete, rows, selfMatch].map((entry) => entry.report.body.publicProbeSha256);
+      expect(new Set(digests).size).toBe(digests.length);
+    }, 30000);
+
+    it("withholds the receipt when no transfer run exists or the run is not completed", async () => {
+      for (const [home, runtime] of [
+        ["/tmp/lcm-verify-empty-no-run", { transferRunId: null }],
+        ["/tmp/lcm-verify-empty-incomplete-run", { transferRunState: "active" }],
+      ] as const) {
+        const result = await verifyEmptyProject({ home, runtime });
+        expect(result.report.body.publicProbeCoverage).toContainEqual({ probe: "public-search", ran: false });
+        expect(result.report.activationEligible).toBe(false);
+      }
+    }, 30000);
+
+    it("withholds the receipt when the production search returns a row for an empty project", async () => {
+      const result = await verifyEmptyProject({ home: "/tmp/lcm-verify-empty-search-row", runtime: { searchRows: [SEARCH_HIT_ROW] } });
+      expect(result.report.body.publicProbeCoverage).toContainEqual({ probe: "public-search", ran: false });
+      expect(result.report.activationEligible).toBe(false);
+    }, 15000);
+
+    it("withholds the receipt and refuses eligibility when the fenced census holds messages the source did not have", async () => {
+      const result = await verifyEmptyProject({ home: "/tmp/lcm-verify-empty-census-nonzero", censusMessageCount: 3 });
+      expect(result.report.body.publicProbeCoverage).toContainEqual({ probe: "public-search", ran: false });
+      expect(result.report.activationEligible).toBe(false);
+      expect(result.report.mismatches.some((mismatch) => mismatch.domain === "messages")).toBe(true);
+    }, 15000);
+
+    it("withholds the receipt when the source stream yielded no candidates but its messages checkpoint is non-zero", async () => {
+      const result = await verifyEmptyProject({ home: "/tmp/lcm-verify-empty-checkpoint-nonzero", sourceMessageCount: 3, censusMessageCount: 3 });
+      expect(result.report.body.publicProbeCoverage).toContainEqual({ probe: "public-search", ran: false });
+      expect(result.report.activationEligible).toBe(false);
+    }, 15000);
+
+    it("withholds the receipt when the source checkpoint is non-zero even though the census is zero and the search is clean", async () => {
+      const result = await verifyEmptyProject({ home: "/tmp/lcm-verify-empty-checkpoint-only", sourceMessageCount: 3, censusMessageCount: 0 });
+      expect(result.report.body.publicProbeCoverage).toContainEqual({ probe: "public-search", ran: false });
+      expect(result.report.activationEligible).toBe(false);
+    }, 15000);
+
+    it("does not let the number of returned rows reach publicProbeSha256", async () => {
+      const second = { ...SEARCH_HIT_ROW, message_id: 2 };
+      const one = await verifyEmptyProject({ home: "/tmp/lcm-verify-empty-one-row", runtime: { searchRows: [SEARCH_HIT_ROW] } });
+      const two = await verifyEmptyProject({ home: "/tmp/lcm-verify-empty-two-rows", runtime: { searchRows: [SEARCH_HIT_ROW, second] } });
+      for (const result of [one, two]) {
+        expect(result.report.body.publicProbeCoverage).toContainEqual({ probe: "public-search", ran: false });
+      }
+      expect(two.report.body.publicProbeSha256).toBe(one.report.body.publicProbeSha256);
+    }, 30000);
+
+    it("propagates a search error instead of folding it into a pass", async () => {
+      const runtime = fakeRuntime({ session: fakeSession(), searchRows: [] });
+      // Only the production full-text statement fails; every other read keeps working.
+      const failing = {
+        ...runtime,
+        transaction: vi.fn(async (callback: (executor: unknown) => Promise<unknown>) => runtime.transaction(async (executor: unknown) => callback({
+          query: async (config: { text: string }) => {
+            if (config.text.includes("WITH input AS MATERIALIZED")) throw new Error("search backend down");
+            return (executor as { query: (config: unknown) => Promise<unknown> }).query(config);
+          },
+        }))),
+      };
+      stubDestinationPrimitives();
+      const recordCounts = Object.fromEntries(PORTABLE_RECORD_DOMAIN_ORDER.map((domain) => [domain, countFor(domain, 0)])) as Partial<Record<PortableDomain, number>>;
+      await expect(verifyMigrationGeneration(
+        baseInput({ homeDir: "/tmp/lcm-verify-empty-search-error" }),
+        dependenciesFor(fakeCopySource({ recordCounts, messagesRecords: [] }), failing as never),
+      )).rejects.toThrow("search backend down");
+    }, 15000);
+  });
 
   it("caps the search-probe candidate pool at MIGRATION_SEARCH_PROBE_CANDIDATE_POOL_SIZE, still finding a match among the first N", async () => {
     stubDestinationPrimitives();
@@ -3505,4 +3649,29 @@ describe("verifyMigrationGeneration: completion receipts (#1396)", () => {
       { probe: "public-listing", ran: true }, { probe: "public-search", ran: false },
     ]);
   }, 15000);
+});
+
+describe("completePendingMigrationVerification (plan-v5 Part B (2): the persisted-report completion, extracted unchanged)", () => {
+  it("returns null, touching nothing, when no verify-generation effect is pending", () => {
+    const manifest = fakeManifestStore();
+    const before = manifest.current.checksumSha256;
+    expect(completePendingMigrationVerification({ homeDir: "/tmp/lcm-verify-no-pending", generationId: MANIFEST_FIXTURE_GENERATION_ID })).toBeNull();
+    expect(manifest.current.checksumSha256).toBe(before);
+  });
+});
+
+describe("shared census and canonical-delta builders", () => {
+  const domains = PORTABLE_RECORD_DOMAIN_ORDER.map((domain, index) => ({
+    domain, recordCount: index, prefixSha256: HASH_A, terminalIdentitySha256: index === 0 ? null : HASH_A,
+  }));
+
+  it("builds a frozen-schema census vector and canonical delta from one domain census", () => {
+    const census = buildMigrationCensusVector(domains);
+    const delta = buildMigrationCanonicalDelta(domains);
+    expect(census.domains.map((entry) => entry.domain)).toEqual([...PORTABLE_RECORD_DOMAIN_ORDER]);
+    expect(delta.domains.map((entry) => entry.recordCount)).toEqual(domains.map((entry) => entry.recordCount));
+    // A domain without a terminal identity gets the deterministic empty sentinel, never null.
+    expect(delta.domains[0]!.terminalIdentitySha256).toMatch(/^[0-9a-f]{64}$/u);
+    expect(delta.domains[1]!.terminalIdentitySha256).toBe(HASH_A);
+  });
 });

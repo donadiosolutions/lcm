@@ -161,6 +161,13 @@ const MEMORY_COLUMNS = `
   memory.archived_at
 `.trim();
 
+export const QUERY_GET_PROMOTED_MEMORY_BY_ID = `SELECT ${MEMORY_COLUMNS}
+               FROM lcm.promoted_memories AS memory
+               WHERE memory.project_id OPERATOR(pg_catalog.=)
+                   $1::pg_catalog.uuid
+                 AND memory.memory_id OPERATOR(pg_catalog.=)
+                   $2::pg_catalog.uuid`;
+
 export class PostgreSqlMemoryDataError extends StorageOperationError {
   constructor(
     projectId: string,
@@ -767,12 +774,7 @@ implements PromotedMemoryRepository {
     if (memoryId === null) return null;
     return this.access.read(operation, async (executor) => {
       const result = await executor.query<MemoryRow>({
-        text: `SELECT ${MEMORY_COLUMNS}
-               FROM lcm.promoted_memories AS memory
-               WHERE memory.project_id OPERATOR(pg_catalog.=)
-                   $1::pg_catalog.uuid
-                 AND memory.memory_id OPERATOR(pg_catalog.=)
-                   $2::pg_catalog.uuid`,
+        text: QUERY_GET_PROMOTED_MEMORY_BY_ID,
         values: [this.access.projectId, memoryId],
       }, this.access.context(operation));
       const row = result.rows[0];

@@ -5583,7 +5583,7 @@ describe("BackendPublicationCoordinator lockToken seam", () => {
     const { home, fake } = await preparedFixture();
     const active = coordinator(home, fake.driver);
     const resumed = await withBackendPublicationAppendBarrierAsync(home, async (token) => active.resume(token));
-    expect(resumed.phase).not.toBe("preparing");
+    expect(resumed.phase).toBe("completed");
   });
 
   it("resume: still acquires the lock when no token is supplied", async () => {
@@ -5611,7 +5611,7 @@ describe("BackendPublicationCoordinator lockToken seam", () => {
     const { home, fake } = await preparedFixture();
     const active = coordinator(home, fake.driver);
     const recovered = await withBackendPublicationAppendBarrierAsync(home, async (token) => active.recoverPending({}, token));
-    expect(recovered).not.toBeNull();
+    expect(recovered?.phase).toBe("completed");
   });
 
   it("recoverPending: still acquires the lock when no token is supplied", async () => {
@@ -5654,7 +5654,7 @@ describe("BackendPublicationCoordinator lockToken seam", () => {
       async (token) => active.resume(token),
       { allowUnresolved: true },
     );
-    expect(resumed.phase).not.toBe("preparing");
+    expect(resumed.phase).toBe("completed");
   });
 
   it("enterMaintenance: accepts a retained barrier token", async () => {
@@ -7381,5 +7381,148 @@ describe("backend publication directory link-count policy", () => {
 
     expect(mutatedAdmitted).toBe(false);
     expectNlinkMutation(observed.evidence);
+  });
+});
+
+describe("BackendPublicationCoordinator release reconciliation (Bug #1651)", () => {
+  const RELEASED = "2026-08-06T12:01:00.000Z";
+  const successorAt = "2026-08-06T12:00:30.000Z";
+  const successorOf = (overrides: Partial<BackendPublicationFenceRecord> = {}): BackendPublicationFenceRecord => fenceRecord({
+    machineId: "machine-2",
+    publicationId: "publication-2",
+    fencingToken: "2",
+    acquiredAt: successorAt,
+    renewedAt: successorAt,
+    ...overrides,
+  });
+  type Reconcile = NonNullable<BackendPublicationDriver["readRemoteGuardForReleaseReconciliation"]>;
+
+  /** A releasing journal whose remote row was released and then rebound by another publication. */
+  async function supersededFixture(successor: BackendPublicationFenceRecord | null = successorOf()) {
+    const fixture = await releasingFixture();
+    const reconcile = vi.fn<Reconcile>(async () => successor);
+    fixture.fake.driver.readRemoteGuardForReleaseReconciliation = reconcile;
+    fixture.fake.driver.readRemoteGuard = vi.fn(async () => { throw new Error("the ordinary release read must not be used"); });
+    return { ...fixture, reconcile };
+  }
+
+  it.each([
+    ["an active successor", successorOf()],
+    ["a released successor", successorOf({ releasedAt: RELEASED })],
+    ["an expired successor", successorOf({ databaseExpired: true })],
+    ["a successor of another evidence digest", successorOf({ evidenceSha256: "e".repeat(64), publicationId: "publication-1", machineId: "machine-1" })],
+    ["a successor of another target backend", successorOf({ targetBackend: "sqlite", publicationId: "publication-1", machineId: "machine-1" })],
+    ["a successor of another machine", successorOf({ publicationId: "publication-1" })],
+  ])("finishes the release tail without touching %s", async (_name, successor) => {
+    const { home, fake, reconcile } = await supersededFixture(successor);
+    const persisted = readBackendPublicationJournal(home)!.projects[0]!.fence!;
+    const completed = await coordinator(home, fake.driver).recoverPending();
+    expect(completed?.phase).toBe("completed");
+    expect(reconcile).toHaveBeenCalledOnce();
+    expect(fake.driver.releaseRemoteGuard).not.toHaveBeenCalled();
+    expect(fake.driver.acquireRemoteGuard).toHaveBeenCalledOnce();
+    // The successor's fence is not journalled; the persisted fence is marked released no later than its acquisition.
+    expect(completed?.projects[0]?.fence).toEqual({ ...persisted, releasedAt: successorAt });
+  });
+
+  it("finishes the abort tail the same way", async () => {
+    const { home, fake } = await supersededFixture();
+    fake.driver.cleanupAbortedMaterial = vi.fn(async () => undefined);
+    await expect(coordinator(home, fake.driver).abort()).resolves.toMatchObject({ phase: "aborted" });
+    expect(fake.driver.releaseRemoteGuard).not.toHaveBeenCalled();
+    expect(readBackendPublicationJournal(home)?.projects[0]?.fence?.releasedAt).toBe(successorAt);
+  });
+
+  it("proves the release from the post-release read as well, and keeps an already released journalled fence", async () => {
+    const { home, fake } = await releasingFixture();
+    let reads = 0;
+    fake.driver.readRemoteGuardForReleaseReconciliation = vi.fn(async () => {
+      reads += 1;
+      return reads === 1 ? fenceRecord() : successorOf();
+    });
+    const completed = await coordinator(home, fake.driver).recoverPending();
+    expect(completed?.phase).toBe("completed");
+    expect(fake.driver.releaseRemoteGuard).toHaveBeenCalledOnce();
+    expect(completed?.projects[0]?.fence).toEqual({ ...fenceRecord(), releasedAt: successorAt });
+
+    // A journalled fence that is already released is not rewritten when a successor appears later.
+    const released = await releasingFixture();
+    rewriteJournal(released.home, (journal) => ({
+      ...journal,
+      projects: (journal.projects as Record<string, unknown>[]).map((project) => ({ ...project, fence: fenceRecord({ releasedAt: RELEASED }) })),
+    }));
+    released.fake.driver.readRemoteGuardForReleaseReconciliation = vi.fn(async () => successorOf());
+    const before = readBackendPublicationJournal(released.home)!;
+    const done = await coordinator(released.home, released.fake.driver).recoverPending();
+    expect(done?.phase).toBe("completed");
+    expect(done?.projects[0]?.fence).toEqual(before.projects[0]!.fence);
+  });
+
+  it("continues with the next project after a superseded one and releases that one normally", async () => {
+    const { home, fake } = await releasingFixture();
+    const secondFence = fenceRecord({ projectId: "remote-project-z", evidenceSha256: "b".repeat(64) });
+    rewriteJournal(home, (journal) => ({
+      ...journal,
+      projects: [
+        ...(journal.projects as Record<string, unknown>[]),
+        { localProjectId: "local-project-z", remoteProjectId: "remote-project-z", evidenceSha256: "b".repeat(64), fence: secondFence },
+      ],
+    }));
+    let secondReads = 0;
+    fake.driver.readRemoteGuardForReleaseReconciliation = vi.fn(async ({ project }) => {
+      if (project.remoteProjectId === "remote-project") return successorOf();
+      secondReads += 1;
+      return secondReads === 1 ? secondFence : { ...secondFence, releasedAt: RELEASED };
+    });
+    const completed = await coordinator(home, fake.driver).recoverPending();
+    expect(completed?.phase).toBe("completed");
+    expect(fake.driver.releaseRemoteGuard).toHaveBeenCalledOnce();
+    expect(completed?.projects.map((project) => project.fence?.releasedAt)).toEqual([successorAt, RELEASED]);
+  });
+
+  it.each([
+    ["the same token", successorOf({ fencingToken: "1" })],
+    ["a lower token", successorOf({ fencingToken: "0" })],
+    ["a malformed token", successorOf({ fencingToken: "not-a-number" })],
+    ["a leading-zero token", successorOf({ fencingToken: "02" })],
+    ["another project", successorOf({ projectId: "other-project" })],
+    ["the same identity with a regressed token", fenceRecord({ fencingToken: "0" })],
+  ])("keeps failing closed on %s", async (_name, row) => {
+    const { home, fake } = await supersededFixture(row);
+    await expect(coordinator(home, fake.driver).recoverPending()).rejects.toMatchObject({ reason: "unexpected-state" });
+    expect(readBackendPublicationJournal(home)?.phase).toBe("releasing");
+    expect(readBackendPublicationJournal(home)?.projects[0]?.fence).toEqual(fenceRecord());
+    expect(fake.driver.releaseRemoteGuard).not.toHaveBeenCalled();
+  });
+
+  it("fails closed on a missing release row and on a journalled token that is not a positive integer", async () => {
+    const missing = await supersededFixture(null);
+    await expect(coordinator(missing.home, missing.fake.driver).recoverPending()).rejects.toMatchObject({ reason: "unexpected-state" });
+    const malformed = await supersededFixture();
+    rewriteJournal(malformed.home, (journal) => ({
+      ...journal,
+      projects: (journal.projects as Record<string, unknown>[]).map((project) => ({ ...project, fence: fenceRecord({ fencingToken: "0" }) })),
+    }));
+    await expect(coordinator(malformed.home, malformed.fake.driver).recoverPending()).rejects.toMatchObject({ reason: "unexpected-state" });
+    expect(malformed.fake.driver.releaseRemoteGuard).not.toHaveBeenCalled();
+  });
+
+  it("does not inherit the supersession on the read after reacquiring an expired fence", async () => {
+    const { home, fake } = await releasingFixture();
+    let reads = 0;
+    fake.driver.readRemoteGuardForReleaseReconciliation = vi.fn(async () => {
+      reads += 1;
+      return reads === 1 ? fenceRecord({ databaseExpired: true }) : successorOf();
+    });
+    await expect(coordinator(home, fake.driver).recoverPending()).rejects.toMatchObject({ reason: "unexpected-state" });
+    expect(fake.driver.releaseRemoteGuard).not.toHaveBeenCalled();
+    expect(readBackendPublicationJournal(home)?.projects[0]?.fence).toEqual(fenceRecord());
+  });
+
+  it("a driver without the capability keeps failing closed on a rebound row", async () => {
+    const { home, fake } = await releasingFixture();
+    fake.driver.readRemoteGuard = vi.fn(async () => successorOf());
+    await expect(coordinator(home, fake.driver).recoverPending()).rejects.toMatchObject({ reason: "unexpected-state" });
+    expect(fake.driver.releaseRemoteGuard).not.toHaveBeenCalled();
   });
 });
