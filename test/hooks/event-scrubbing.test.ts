@@ -138,6 +138,31 @@ describe("passive event scrubbing", () => {
     }
   });
 
+  it("applies a legacy pattern before capping retained hook data", async () => {
+    const fixture = mappedProject("canonical");
+    try {
+      writeFileSync(join(fixture.legacyDir, "sensitive-patterns.txt"), "LEGACY-[0-9]+;\n");
+      const data = `${"x".repeat(1_988)} LEGACY-123456; tail`;
+      const events = await scrubExtractedEvents([{
+        type: "decision", category: "decision", data, priority: 1,
+      }], fixture.cwd, []);
+      expect(events[0]?.data).not.toContain("LEGACY-");
+      expect(events[0]?.data).not.toContain("123456");
+      expect(events[0]?.data).toContain("[REDACTED]");
+      await appendLocalHookEvents({
+        cwd: fixture.cwd, sessionId: "session-1", events, sourceHook: "PostToolUse",
+      });
+      const db = new EventsDb(eventsDbPath(fixture.cwd));
+      try {
+        expect(db.getUnprocessed()[0]?.data).not.toContain("123456");
+      } finally {
+        db.close();
+      }
+    } finally {
+      fixture.restoreHome();
+    }
+  });
+
   it("invalidates the combined scrubber when either pattern file changes", async () => {
     const fixture = mappedProject("canonical");
     try {
@@ -159,6 +184,70 @@ describe("passive event scrubbing", () => {
     } finally {
       fixture.restoreHome();
     }
+  });
+
+  it("scrubs complete data before the durable cap, including a delimiter at the cut", async () => {
+    const cwd = mkdtempSync(join(tmpdir(), "lcm-event-scrub-cut-"));
+    dirs.push(cwd);
+    const token = `dop_v1_${"a".repeat(64)}`;
+    const data = `${"x".repeat(1_999 - token.length)} ${token}; tail`;
+    const [event] = await scrubExtractedEvents([{
+      type: "decision", category: "decision", data, priority: 1,
+    }], cwd, []);
+    expect(event.data).not.toContain(token);
+    expect(event.data).not.toContain("dop_v1_");
+    expect(event.data).toContain("[REDACTED]");
+    expect(event.data.length).toBeLessThanOrEqual(2_003);
+  });
+
+  it("drops complete over-budget data or tags before scrubbing", async () => {
+    const cwd = mkdtempSync(join(tmpdir(), "lcm-event-scrub-limit-"));
+    dirs.push(cwd);
+    const events = await scrubExtractedEvents([
+      { type: "decision", category: "decision", data: "x".repeat(8_193), priority: 1 },
+      { type: "decision", category: "decision", data: "safe", tags: ["x".repeat(8_193)], priority: 1 },
+      { type: "decision", category: "decision", data: "safe", tags: ["ok"], priority: 1 },
+    ], cwd, []);
+    expect(events).toEqual([{ type: "decision", category: "decision", data: "safe", tags: ["ok"], priority: 1 }]);
+  });
+
+  it("accepts a complete field at the exact scrub admission limit", async () => {
+    const cwd = mkdtempSync(join(tmpdir(), "lcm-event-scrub-exact-limit-"));
+    dirs.push(cwd);
+    const token = `dop_v1_${"a".repeat(64)}`;
+    const prefix = `token ${token};`;
+    const data = `${prefix}${"x".repeat(8_192 - prefix.length)}`;
+    const events = await scrubExtractedEvents([{
+      type: "decision", category: "decision", data, priority: 1,
+    }], cwd, []);
+    expect(events).toHaveLength(1);
+    expect(events[0].data).toContain("[REDACTED]");
+    expect(events[0].data).not.toContain("dop_v1_");
+    expect(events[0].data.length).toBeLessThanOrEqual(2_003);
+  });
+
+  it("caps scrubbed data and tags without retaining secret fragments", async () => {
+    const cwd = mkdtempSync(join(tmpdir(), "lcm-event-scrub-output-"));
+    dirs.push(cwd);
+    const token = `dop_v1_${"b".repeat(64)}`;
+    const events = await scrubExtractedEvents([{
+      type: "decision", category: "decision", data: `${"x".repeat(2_100)}${token};`,
+      tags: [`${"y".repeat(2_100)}${token};`], priority: 1,
+    }], cwd, []);
+    expect(events).toHaveLength(1);
+    expect(events[0].data).toHaveLength(2_003);
+    expect(events[0].tags?.[0]).toHaveLength(2_003);
+    expect(JSON.stringify(events)).not.toContain("dop_v1_");
+  });
+
+  it("does not split a Unicode surrogate at the output boundary", async () => {
+    const cwd = mkdtempSync(join(tmpdir(), "lcm-event-scrub-unicode-"));
+    dirs.push(cwd);
+    const [event] = await scrubExtractedEvents([{
+      type: "decision", category: "decision", data: `${"x".repeat(1_999)}🙂tail`, priority: 1,
+    }], cwd, []);
+    expect(event.data).toBe(`${"x".repeat(1_999)}...`);
+    expect(event.data).not.toContain("\ud83d");
   });
 
   it("redacts content and tags before sidecar persistence", async () => {

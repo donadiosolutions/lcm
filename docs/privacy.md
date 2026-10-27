@@ -727,15 +727,19 @@ bundle and keep provider, credential, quarantine, and recovery sessions private.
   inherit that enclosing quote through its matching close. This removes a
   space-bearing private path and any suffix inside the quote on the first pass,
   while preserving text after the close. An immediately quoted child keeps its
-  own quote. Inside a bracketed file query, the matching close restores the
-  enclosing owner across whitespace until that wrapper's real close. Immediate
-  and later `&` or `|` rooted successors, named Windows successors, and
-  recognized private-root relatives redact on the same pass. Bracketed
-  components that follow a redacted successor follow the tail rules above, and
-  inside them a private-root relative value after `&` or `|` is also redacted
-  on the first pass. Ordinary relative and public-URL successors remain
-  readable. Unquoted URLs, embedded URLs whose scheme did not begin at the
-  quote, unmatched quotes, and newlines retain their existing boundaries.
+  own quote. Inside a bracketed file query, the matching quote restores the
+  enclosing owner only when `&` or `|` immediately follows it. Whitespace
+  before the delimiter prevents that handoff, and whitespace between the
+  delimiter and the successor resets ownership; in both cases a Windows
+  backslash-rooted value stays readable unless another path rule applies. Within
+  the same uninterrupted wrapper after an immediate rooted handoff, immediate
+  and later supported rooted, named Windows, and recognized private-root
+  successors redact on the same pass. Bracketed components that follow a
+  redacted successor follow the tail rules above, and inside them a
+  private-root relative value after `&` or `|` is also redacted on the first
+  pass. Ordinary relative and public-URL successors remain readable. Unquoted
+  URLs, embedded URLs whose scheme did not begin at the quote, unmatched
+  quotes, and newlines retain their existing boundaries.
 
   Root-relative Windows values after opaque wrapper text remain conservatively
   redacted. LCM does not expose such private-looking values merely because URL

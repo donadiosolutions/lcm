@@ -4644,6 +4644,56 @@ describe("sanitizeError", () => {
     });
   });
 
+  describe("Bug #1766", () => {
+    // These pin the documented boundary of the inherited quote owner. The
+    // whitespace-separated outputs deliberately keep the successor readable:
+    // #1766 corrects docs/privacy.md instead of widening runtime ownership.
+    const base = "file://h?x=['https://outer.test/x?next=file:///Users/a/My Files/private.db'";
+    const redactedBase = "file://h?x=['https://outer.test/x?next=file://<path>'";
+    const successor = "\\Users\\SECRET\\x]";
+    const cases: ReadonlyArray<readonly [name: string, input: string, expected: string]> = [
+      ["immediate pipe hands off the owner", base + "|" + successor, redactedBase + "|<path>]"],
+      ["space before pipe prevents the handoff", base + " |" + successor, redactedBase + " |" + successor],
+      ["tab before pipe prevents the handoff", base + "\t|" + successor, redactedBase + "\t|" + successor],
+      ["newline before pipe prevents the handoff", base + "\n|" + successor, redactedBase + "\n|" + successor],
+      ["carriage return before pipe prevents the handoff", base + "\r|" + successor, redactedBase + "\r|" + successor],
+      [
+        "non-breaking space before pipe prevents the handoff",
+        base + "\u00a0|" + successor,
+        redactedBase + "\u00a0|" + successor,
+      ],
+      ["space after pipe resets ownership", base + "| " + successor, redactedBase + "| " + successor],
+      ["tab after pipe resets ownership", base + "|\t" + successor, redactedBase + "|\t" + successor],
+      ["space before ampersand prevents the handoff", base + " &" + successor, redactedBase + " &" + successor],
+      ["semicolon is not a handoff delimiter", base + ";" + successor, redactedBase + ";" + successor],
+      ["a non-delimiter is not a handoff", base + "x" + successor, redactedBase + "x" + successor],
+      [
+        "later rooted successor after an immediate handoff",
+        base + "|\\Users\\SECRET\\x&\\Users\\LATER\\y]",
+        redactedBase + "|<path>&<path>]",
+      ],
+      [
+        "later ordinary relative successor stays readable",
+        base + "|\\Users\\SECRET\\x&later/var/data]",
+        redactedBase + "|<path>&later/var/data]",
+      ],
+      [
+        "whitespace after a later delimiter resets ownership",
+        base + "|\\Users\\SECRET\\x& \\Users\\LATER\\y]",
+        redactedBase + "|<path>& \\Users\\LATER\\y]",
+      ],
+    ];
+
+    it.each(cases)("%s on every pass", (_name, input, expected) => {
+      const first = sanitizeError(input);
+      const second = sanitizeError(first);
+      const third = sanitizeError(second);
+      expect(first).toBe(expected);
+      expect(second).toBe(expected);
+      expect(third).toBe(expected);
+    });
+  });
+
 
   describe("Bug #917", () => {
     const matrix: Array<readonly [string, string, string]> = (["'", '"'] as const).flatMap(
