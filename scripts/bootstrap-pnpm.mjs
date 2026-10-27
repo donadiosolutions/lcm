@@ -92,7 +92,7 @@ export async function bootstrapPnpm({ destination, manifestPath = defaultManifes
     const bin = join(directory, "bin");
     await mkdir(bin, { mode: 0o700 });
     await symlink("../package/bin/pnpm.cjs", join(bin, "pnpm"));
-    const result = await run(join(bin, "pnpm"), ["--version"], {
+    const result = await run(process.execPath, [join(bin, "pnpm"), "--version"], {
       cwd: packageRoot,
       env: { ...process.env, npm_config_manage_package_manager_versions: "false" },
       timeout: timeoutMs, maxBuffer: 1024 * 1024,

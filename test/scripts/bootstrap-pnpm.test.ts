@@ -56,14 +56,44 @@ describe("bootstrap-pnpm", () => {
     const { download } = await fixture();
     const bin = await bootstrapPnpm({ destination, manifestPath }, { download });
     expect(bin).toBe(resolve(destination, "bin"));
-    expect((await lstat(destination)).mode & 0o777).toBe(0o700);
+    expect((await lstat(destination)).isDirectory()).toBe(true);
+    if (process.platform !== "win32") {
+      expect((await lstat(destination)).mode & 0o777).toBe(0o700);
+    }
     expect((await lstat(join(bin, "pnpm"))).isSymbolicLink()).toBe(true);
     expect(await readFile(join(destination, "package", "bin", "executed"), "utf8")).toBe("yes");
-    const nested = await execute(join(bin, "pnpm"), ["--nested"], {
-      env: { ...process.env, PATH: `${bin}${delimiter}${process.env.PATH}` },
-    });
-    expect(nested.stdout.trim()).toBe(version);
+    if (process.platform === "win32") {
+      const direct = await execute(process.execPath, [join(bin, "pnpm"), "--version"]);
+      expect(direct.stdout.trim()).toBe(version);
+    } else {
+      const nested = await execute(join(bin, "pnpm"), ["--nested"], {
+        env: { ...process.env, PATH: `${bin}${delimiter}${process.env.PATH}` },
+      });
+      expect(nested.stdout.trim()).toBe(version);
+    }
     await absent(join(destination, "pnpm.tgz"));
+  });
+
+  it("verifies the fresh launcher through the exact Node executable and bounded options", async () => {
+    const { download } = await fixture();
+    const calls: Array<{ command: string; args: string[]; options: Record<string, unknown> }> = [];
+    const bin = await bootstrapPnpm({ destination, manifestPath }, {
+      download,
+      run: async (command: string, args: string[], options: Record<string, unknown>) => {
+        calls.push({ command, args, options });
+        return execute(command, args, options);
+      },
+    });
+    expect(calls[0]?.command).toBe("tar");
+    expect(calls[1]).toMatchObject({
+      command: process.execPath,
+      args: [join(bin, "pnpm"), "--version"],
+      options: {
+        cwd: join(destination, "package"), timeout: 60_000, maxBuffer: 1024 * 1024,
+        env: expect.objectContaining({ npm_config_manage_package_manager_versions: "false" }),
+      },
+    });
+    expect(calls).toHaveLength(2);
   });
 
   it("downloads only the versioned registry archive read from the manifest pin", async () => {

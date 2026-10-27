@@ -1,0 +1,66 @@
+name: Windows daemon peer baseline
+
+on:
+  push:
+    branches:
+      - fix/security-daemon-peer
+
+permissions:
+  contents: read
+
+concurrency:
+  group: windows-daemon-peer-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  baseline:
+    name: Two-user Windows baseline
+    runs-on: windows-2025
+    timeout-minutes: 20
+    steps:
+      - name: Checkout exact pushed revision
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Set up pinned Node
+        uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+        with:
+          node-version: "25.4.0"
+
+      - name: Bootstrap verified pnpm and install locked dependencies
+        shell: pwsh
+        run: |
+          $bootstrapRoot = Join-Path ([Environment]::GetFolderPath('UserProfile')) ('lcm-pnpm-' + [Guid]::NewGuid().ToString('N'))
+          New-Item -ItemType Directory -Path $bootstrapRoot | Out-Null
+          $bin = @(node scripts/bootstrap-pnpm.mjs --destination (Join-Path $bootstrapRoot 'verified'))
+          if ($LASTEXITCODE -ne 0 -or $bin.Count -ne 1 -or -not (Test-Path -LiteralPath $bin[0])) {
+            throw 'Verified pnpm bootstrap failed.'
+          }
+          $binPath = [string]$bin[0]
+          Add-Content -LiteralPath $env:GITHUB_PATH -Value $binPath -Encoding utf8
+          Add-Content -LiteralPath $env:GITHUB_ENV -Value "LCM_WINDOWS_BOOTSTRAP_ROOT=$bootstrapRoot" -Encoding utf8
+          $pnpmScript = Join-Path $binPath 'pnpm'
+          Add-Content -LiteralPath $env:GITHUB_ENV -Value "LCM_WINDOWS_PNPM_SCRIPT=$pnpmScript" -Encoding utf8
+          if ((node $pnpmScript --version).Trim() -ne '10.34.5') { throw 'Verified pnpm version mismatch.' }
+          node $pnpmScript install --frozen-lockfile
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+
+      - name: Compile without postbuild
+        shell: pwsh
+        run: |
+          node $env:LCM_WINDOWS_PNPM_SCRIPT exec tsc
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          node scripts/build-runtime.mjs
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          foreach ($path in @('dist/src/prompts', 'dist/src/connectors/templates', 'dist/src/storage/postgresql/migrations', 'dist/installer')) {
+            New-Item -ItemType Directory -Force -Path $path | Out-Null
+          }
+          Copy-Item src/prompts/*.yaml dist/src/prompts/
+          Copy-Item src/connectors/templates/* dist/src/connectors/templates/ -Recurse
+          Copy-Item src/storage/postgresql/migrations/*.sql dist/src/storage/postgresql/migrations/
+          Copy-Item installer/setup.sh dist/installer/setup.sh
+
+      - name: Observe two standard users and normal state creation
+        shell: pwsh
+        run: ./.github/scripts/windows-daemon-peer-baseline.ps1
