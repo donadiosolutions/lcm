@@ -15,7 +15,7 @@ import {
   retiredProjectIdentitySuccessor,
 } from "../../src/project-map.js";
 import { localProjectIdentity } from "../../src/daemon/project.js";
-import { chmodSync, existsSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, renameSync, rmSync, statSync, writeFileSync } from "node:fs";
+import { chmodSync, existsSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, renameSync, rmSync, statSync, symlinkSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { homedir } from "node:os";
 import { tmpdir } from "node:os";
@@ -205,6 +205,75 @@ describe("backend-independent local project identity", () => {
       );
       writeFileSync(legacySidecar, "");
       expect(existingEventsDbPath(unavailable)).toBe(legacySidecar);
+      expect(existsSync(projectMapPath())).toBe(false);
+      expect(existsSync(join(home, ".lcm", "projects"))).toBe(false);
+    } finally {
+      rmSync(primary, { recursive: true, force: true });
+      rmSync(linked, { recursive: true, force: true });
+    }
+  });
+
+  it("refuses evidence recovery when the missing cwd develops a symlink loop", () => {
+    const { primary, linked, anchorSidecar, evidencePath } = prepareDeletedLinkedWorktree();
+    try {
+      writeFileSync(anchorSidecar, "old sidecar");
+      const evidenceBefore = readFileSync(evidencePath);
+      const sidecarBefore = readFileSync(anchorSidecar);
+      const entriesBefore = readdirSync(eventsDir()).sort();
+      expect(existingEventsDbPath(linked)).toBe(anchorSidecar);
+
+      expect(existingEventsDbPath(linked, {
+        _openEventsDirectoryForTesting: (path, options) => {
+          const handle = openPrivateDirectory(path, options);
+          symlinkSync(linked, linked);
+          return handle;
+        },
+      })).toBeUndefined();
+      expect(() => statSync(linked)).toThrow(expect.objectContaining({ code: "ELOOP" }));
+      rmSync(linked);
+
+      expect(existingEventsDbPath(linked)).toBe(anchorSidecar);
+      expect(readFileSync(evidencePath)).toEqual(evidenceBefore);
+      expect(readFileSync(anchorSidecar)).toEqual(sidecarBefore);
+      expect(readdirSync(eventsDir()).sort()).toEqual(entriesBefore);
+      expect(existsSync(projectMapPath())).toBe(false);
+      expect(existsSync(join(home, ".lcm", "projects"))).toBe(false);
+    } finally {
+      rmSync(primary, { recursive: true, force: true });
+      rmSync(linked, { recursive: true, force: true });
+    }
+  });
+
+  it("recovers evidence for a missing child cwd when its ancestor becomes a file", () => {
+    const { primary, linked, anchorSidecar } = prepareDeletedLinkedWorktree();
+    try {
+      mkdirSync(linked);
+      writeFileSync(join(linked, ".git"), `gitdir: ${join(primary, ".git", "worktrees", "linked")}\n`);
+      const child = join(linked, "child");
+      mkdirSync(child);
+      expect(eventsDbPath(child)).toBe(anchorSidecar);
+      const evidencePath = join(eventsDir(), `${hashProjectPath(normalizeProjectPath(child))}.identity.json`);
+      writeFileSync(anchorSidecar, "old sidecar");
+      const evidenceBefore = readFileSync(evidencePath);
+      const sidecarBefore = readFileSync(anchorSidecar);
+      const entriesBefore = readdirSync(eventsDir()).sort();
+      rmSync(linked, { recursive: true });
+      expect(existingEventsDbPath(child)).toBe(anchorSidecar);
+
+      expect(existingEventsDbPath(child, {
+        _openEventsDirectoryForTesting: (path, options) => {
+          const handle = openPrivateDirectory(path, options);
+          writeFileSync(linked, "unavailable ancestor");
+          return handle;
+        },
+      })).toBe(anchorSidecar);
+      expect(() => statSync(child)).toThrow(expect.objectContaining({ code: "ENOTDIR" }));
+      rmSync(linked);
+
+      expect(existingEventsDbPath(child)).toBe(anchorSidecar);
+      expect(readFileSync(evidencePath)).toEqual(evidenceBefore);
+      expect(readFileSync(anchorSidecar)).toEqual(sidecarBefore);
+      expect(readdirSync(eventsDir()).sort()).toEqual(entriesBefore);
       expect(existsSync(projectMapPath())).toBe(false);
       expect(existsSync(join(home, ".lcm", "projects"))).toBe(false);
     } finally {

@@ -1,0 +1,7 @@
+references: ["#1799"]
+rationale: >-
+  Promotion admission keeps its existing daemon route owner while its internal
+  context type requires the callback or token already supplied by the producer.
+  No production files were added, removed, moved, or re-owned.
+pins:
+  - ["src/daemon/routes/promote-events.ts", "unit-daemon-routes"]
