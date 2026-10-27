@@ -1,0 +1,10 @@
+references: ["#1754"]
+rationale: >-
+  #1754 makes the Tier 3 passive-promotion gate require an exact existing
+  entry by reusing the shared deduplication decision with an existing-only
+  mode. The change stays inside the existing decision helper and the
+  promote-events route, which keep their established owners and add no
+  component.
+pins:
+  - ["src/promotion/dedup.ts", "unit-promotion"]
+  - ["src/daemon/routes/promote-events.ts", "unit-daemon-routes"]

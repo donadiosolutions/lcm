@@ -3939,6 +3939,86 @@ describe("sanitizeError", () => {
     });
   });
 
+  describe("Bug #1763", () => {
+    const prefix = "file://h?x=[file:///Users/CHILD/x";
+    const expectedPrefix = "file://h?x=[file://<path>";
+    const successorRows = [
+      ["issue body home root", "later/home/alice/secret.db", "later<path>"],
+      ["separator run before Users", "later//Users/CANARY", "later<path>"],
+      ["empty segment before root", "a/b//root//CANARY", "a<path>"],
+      ["leading home root", "home/alice/secret", "home<path>"],
+      ["leading Users root", "Users/alice/secret", "Users<path>"],
+      ["leading root root", "root/private", "root<path>"],
+      ["deep root root", "a/b/c/root/secret", "a<path>"],
+      ["non-leading Users root", "not/Users/secret", "not<path>"],
+      ["mixed case home root", "later/HOME/alice", "later<path>"],
+      ["slash-first home backslash continuation", "later/home\\alice", "later<path>"],
+      ["slash-first root backslash continuation", "later/root\\secret", "later<path>"],
+      ["preserved Users with trailing separator", "later/Users/", "later<path>"],
+      ["preserved Users with trailing separator run", "later/Users//", "later<path>"],
+      ["preserved Users path", "later/Users/alice/secret.db", "later<path>"],
+      ["second successor", "later/home/a&second/Users/b", "later<path>&second<path>"],
+      ["successor with its own query", "later/home/alice/secret.db?key=/Users/Z", "later<path>?key=<path>"],
+      ["backslash-first relative", "later\\home\\alice", "later\\home\\alice"],
+      ["homes segment", "later/homes/x", "later/homes/x"],
+      ["Users2 segment", "later/Users2/x", "later/Users2/x"],
+      ["bare home", "later/home", "later/home"],
+      ["home with empty continuation", "later/home/", "later/home/"],
+      ["bare root", "later/root", "later/root"],
+      ["ordinary relative value", "later/var/data", "later/var/data"],
+      ["relative path", "relative/path", "relative/path"],
+      ["public URL", "https://p.test/x", "https://p.test/x"],
+    ] as const;
+    const cases: Array<readonly [string, string, string]> = successorRows.flatMap(
+      ([name, value, expected]) =>
+        (["&", "|"] as const).map((delimiter) => [
+          name + " after " + delimiter,
+          prefix + delimiter + value + "]",
+          expectedPrefix + delimiter + expected + "]",
+        ] as const),
+    );
+    cases.push(
+      [
+        "successor after a public URL parameter of the active child",
+        prefix + "&https://e.test/x&later/home/bob/secret.db]",
+        expectedPrefix + "&https://e.test/x&later<path>]",
+      ],
+      [
+        "query-only child keeps a relative successor visible",
+        "file://host?key=/public&later/Users/secret",
+        "file://host?key=<path>&later/Users/secret",
+      ],
+      [
+        "quoted public query home successor stays visible",
+        "file://h?x=['https://e.test/x?q=1'&later/home/bob/secret.db]",
+        "file://h?x=['https://e.test/x?q=1'&later/home/bob/secret.db]",
+      ],
+      [
+        "quoted public query separator-run successor stays visible",
+        "file://h?x=['https://e.test/x?q=1'&later//Users/bob/secret.db]",
+        "file://h?x=['https://e.test/x?q=1'&later//Users/bob/secret.db]",
+      ],
+      [
+        "retained parent home successor stays visible",
+        "file://h?x=[https://e.test/t&/Users/a/one&https://p.test/x&later/home/final/secret]",
+        "file://h?x=[https://e.test/t&<path>&https://p.test/x&later/home/final/secret]",
+      ],
+      [
+        "retained parent separator-run successor stays visible",
+        "file://h?x=[https://e.test/t&/Users/a/one&https://p.test/x&later//home/final/secret]",
+        "file://h?x=[https://e.test/t&<path>&https://p.test/x&later//home/final/secret]",
+      ],
+    );
+
+    it.each(cases)("%s", (_name, input, expected) => {
+      const first = sanitizeError(input);
+
+      expect(first).toBe(expected);
+      expect(sanitizeError(first)).toBe(first);
+      expect(sanitizeError(sanitizeError(first))).toBe(first);
+    });
+  });
+
   describe("Bug #1344", () => {
     it.each([
       [
