@@ -999,7 +999,6 @@ async function promoteEventsBatch(
             confidence,
             newEntryConfidence,
             thresholds: {
-              dedupBm25Threshold: thresholds.dedupBm25Threshold ?? 15,
               dedupCandidateLimit: thresholds.dedupCandidateLimit ?? 100,
             },
           };

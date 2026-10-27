@@ -553,7 +553,7 @@ described above are intentionally not part of this configuration:
 
 When a pattern crosses the reinforcement threshold, `reinforcementBoost` is added to the base pattern confidence, capped by `maxConfidence`, only when bootstrapping a new promoted entry.
 
-`compaction.promotionThresholds.dedupBm25Threshold` is still accepted for compatibility but no longer causes different text to merge; only exactly the same text is deduplicated.
+Only exactly the same text is deduplicated. The former `compaction.promotionThresholds.dedupBm25Threshold` setting is deprecated and ignored: it is not renamed, and `lcm config get` and `lcm config set` reject it. A `config.json` that still contains it keeps loading, and `lcm doctor` warns when the stored value is not the old default of `15`. Removing the key is safe and changes no behavior; LCM does not rewrite `config.json` on load, so delete it by hand.
 
 ## Data Storage
 

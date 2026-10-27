@@ -162,7 +162,7 @@ describe("deduplicateAndInsert", () => {
           transaction: storage.transaction.bind(storage), repositories,
           content: "Caller-owned transaction must atomically roll back this decision",
           tags: ["decision"], depth: 0, confidence: 0.9,
-          thresholds: { dedupBm25Threshold: 15, dedupCandidateLimit: 10 },
+          thresholds: { dedupCandidateLimit: 10 },
         });
         expect(await repositories.promotedMemory.getById(insertedId)).toMatchObject({ id: insertedId });
         throw new Error("rollback caller transaction");
@@ -199,7 +199,7 @@ describe("deduplicateAndInsert", () => {
       sourceProjectId: "p1",
       depth: 0,
       confidence: 0.7,
-      thresholds: { dedupBm25Threshold: 15, dedupCandidateLimit: 10 },
+      thresholds: { dedupCandidateLimit: 10 },
     })).resolves.toBe("exact-id");
     expect(insert).not.toHaveBeenCalled();
     expect(update).toHaveBeenCalledWith("exact-id", {
@@ -227,7 +227,7 @@ describe("deduplicateAndInsert", () => {
       sourceProjectId: "p1",
       depth: 0,
       confidence: 0.5,
-      thresholds: { dedupBm25Threshold: 15, dedupCandidateLimit: 10 },
+      thresholds: { dedupCandidateLimit: 10 },
     };
     const candidate = {
       id: "candidate",
@@ -290,7 +290,7 @@ describe("deduplicateAndInsert", () => {
       sourceProjectId: "p1",
       depth: 0,
       confidence: 0.5,
-      thresholds: { dedupBm25Threshold: 15, dedupCandidateLimit: 10 },
+      thresholds: { dedupCandidateLimit: 10 },
     })).resolves.toBe(expected);
   });
 
@@ -325,7 +325,7 @@ describe("deduplicateAndInsert", () => {
       sourceProjectId: "p1",
       depth: 0,
       confidence: 0.8,
-      thresholds: { dedupBm25Threshold: 15, dedupCandidateLimit: 10 },
+      thresholds: { dedupCandidateLimit: 10 },
     })).resolves.toBe("first");
     expect(insert).not.toHaveBeenCalled();
     expect(update).toHaveBeenCalledWith("first", {
@@ -366,7 +366,7 @@ describe("deduplicateAndInsert", () => {
       projectId: "p1",
       depth: 0,
       confidence: 0.8,
-      thresholds: { dedupBm25Threshold: 15, dedupCandidateLimit: 10 },
+      thresholds: { dedupCandidateLimit: 10 },
     })).resolves.toBe("legacy-exact");
     expect(insert).not.toHaveBeenCalled();
     expect(update).toHaveBeenCalledWith("legacy-exact", {
@@ -396,7 +396,7 @@ describe("deduplicateAndInsert", () => {
       const insert = vi.fn().mockResolvedValue("inserted");
       const update = vi.fn().mockResolvedValue(undefined);
       const archive = vi.fn().mockResolvedValue(undefined);
-      const thresholds = { dedupBm25Threshold: 15, dedupCandidateLimit: 10 };
+      const thresholds = { dedupCandidateLimit: 10 };
       const common = { content: "incoming text", tags: ["incoming"], depth: 0, confidence: 0.5, thresholds };
       const repositories = {
         lexicalSearch: { searchPromoted: vi.fn().mockResolvedValue(page) },
@@ -461,7 +461,7 @@ describe("deduplicateAndInsert", () => {
         tags: ["incoming"],
         depth: 0,
         confidence: 0.9,
-        thresholds: { dedupBm25Threshold: 15, dedupCandidateLimit: 100 },
+        thresholds: { dedupCandidateLimit: 100 },
       });
 
       expect(id).not.toBe(magnet);
@@ -492,7 +492,7 @@ describe("deduplicateAndInsert", () => {
       ...(backend === undefined ? {} : { backend }),
       depth: 0,
       confidence: 0.5,
-      thresholds: { dedupBm25Threshold: 15, dedupCandidateLimit: 10 },
+      thresholds: { dedupCandidateLimit: 10 },
     });
 
     expect(inserted).not.toBe(first);
@@ -524,7 +524,7 @@ describe("deduplicateAndInsert", () => {
         candidateScope: "owner" as const,
         depth: 0,
         confidence: 0.5,
-        thresholds: { dedupBm25Threshold: 15, dedupCandidateLimit: 10 },
+        thresholds: { dedupCandidateLimit: 10 },
       };
 
       await deduplicateAndInsert({
@@ -586,7 +586,7 @@ describe("deduplicateAndInsert", () => {
       backend: "postgresql",
       depth: 0,
       confidence: 0.7,
-      thresholds: { dedupBm25Threshold: 15, dedupCandidateLimit: 2 },
+      thresholds: { dedupCandidateLimit: 2 },
     })).resolves.toBe("exact-owner");
 
     expect(findExactContent).toHaveBeenCalledWith("same punctuation!", undefined);
@@ -643,7 +643,7 @@ describe("deduplicateAndInsert", () => {
       backend,
       depth: 0,
       confidence: 0.7,
-      thresholds: { dedupBm25Threshold: 15, dedupCandidateLimit: 10 },
+      thresholds: { dedupCandidateLimit: 10 },
     })).resolves.toBe("punctuation-owner");
 
     expect(searchPromoted).toHaveBeenCalledWith("!!!", 10, undefined, expectedScope);
@@ -694,7 +694,7 @@ describe("deduplicateAndInsert", () => {
       backend: "postgresql",
       depth: 0,
       confidence: 0.9,
-      thresholds: { dedupBm25Threshold: 15, dedupCandidateLimit: 2 },
+      thresholds: { dedupCandidateLimit: 2 },
     })).resolves.toBe("exact-owner");
     expect(update).toHaveBeenCalledWith("exact-owner", {
       confidence: 0.9,
@@ -714,7 +714,7 @@ describe("deduplicateAndInsert", () => {
     expect(candidate.rank).toBeGreaterThan(-15);
     const backend = mode === "legacy" ? { store, projectId: "p1" } : dedupDeps(db, store);
     const shared = { ...backend, tags: ["imported"], depth: 0, confidence: 0.9,
-      thresholds: { dedupBm25Threshold: 15, dedupCandidateLimit: 10 } };
+      thresholds: { dedupCandidateLimit: 10 } };
     expect(await deduplicateAndInsert({ ...shared, content })).toBe(id);
     expect(store.getAll()).toHaveLength(1);
     expect(JSON.parse(store.getById(id)!.tags)).toEqual(["original", "imported"]);
@@ -732,7 +732,7 @@ describe("deduplicateAndInsert", () => {
       tags: ["decision"],
       depth: 2,
       confidence: 0.7,
-      thresholds: { dedupBm25Threshold: 15, dedupCandidateLimit: 10 },
+      thresholds: { dedupCandidateLimit: 10 },
     };
 
     const first = await deduplicateAndInsert({
@@ -775,7 +775,7 @@ describe("deduplicateAndInsert", () => {
       projectId: "p1",
       depth: 2,
       confidence: 0.7,
-      thresholds: { dedupBm25Threshold: 15, dedupCandidateLimit: 3 },
+      thresholds: { dedupCandidateLimit: 3 },
     });
     expect([store.getById(weaker), store.getById(stronger)].filter((row) => row?.archived_at)).toHaveLength(1);
 
@@ -786,7 +786,7 @@ describe("deduplicateAndInsert", () => {
       projectId: "p2",
       depth: 0,
       confidence: 0.4,
-      thresholds: { dedupBm25Threshold: 15, dedupCandidateLimit: 3 },
+      thresholds: { dedupCandidateLimit: 3 },
     });
     expect(store.getById(inserted)).not.toBeNull();
   });
@@ -803,7 +803,7 @@ describe("deduplicateAndInsert", () => {
       depth: 2,
       confidence: 0.2,
       newEntryConfidence: 0.8,
-      thresholds: { dedupBm25Threshold: 15, dedupCandidateLimit: 3 },
+      thresholds: { dedupCandidateLimit: 3 },
     });
 
     const results = store.search("PostgreSQL database", 10);
@@ -831,7 +831,7 @@ describe("deduplicateAndInsert", () => {
       depth: 2,
       confidence: 0.2,
       newEntryConfidence: 0.6,
-      thresholds: { dedupBm25Threshold: 15, dedupCandidateLimit: 3 },
+      thresholds: { dedupCandidateLimit: 3 },
     });
 
     const results = store.search("PostgreSQL database", 10);
@@ -859,7 +859,7 @@ describe("deduplicateAndInsert", () => {
       sessionId: "s1",
       depth: 2,
       confidence: 0.8,
-      thresholds: { dedupBm25Threshold: 15, dedupCandidateLimit: 3 },
+      thresholds: { dedupCandidateLimit: 3 },
     });
 
     const results = store.search("PostgreSQL database", 10);
@@ -900,7 +900,7 @@ describe("deduplicateAndInsert", () => {
       sessionId: "s1",
       depth: 2,
       confidence: 0.6,
-      thresholds: { dedupBm25Threshold: 15, dedupCandidateLimit: 3 },
+      thresholds: { dedupCandidateLimit: 3 },
     });
 
     const results = store.search("PostgreSQL database", 10);
@@ -933,7 +933,7 @@ describe("deduplicateAndInsert", () => {
       sessionId: "s1",
       depth: 2,
       confidence: 0.7,
-      thresholds: { dedupBm25Threshold: 15, dedupCandidateLimit: 3 },
+      thresholds: { dedupCandidateLimit: 3 },
     });
 
     // Only canonical is searchable
@@ -967,7 +967,7 @@ describe("deduplicateAndInsert", () => {
       sessionId: "s1",
       depth: 2,
       confidence: 0.95,
-      thresholds: { dedupBm25Threshold: 15, dedupCandidateLimit: 3 },
+      thresholds: { dedupCandidateLimit: 3 },
     });
 
     const results = store.search("PostgreSQL database", 10);

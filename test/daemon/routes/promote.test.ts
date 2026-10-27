@@ -24,7 +24,6 @@ function makeConfig(): DaemonConfig {
         compressionRatio: 0.1,
         keywords: { decision: ["decided", "agreed"], architecture: ["architecture", "pattern"] },
         architecturePatterns: [],
-        dedupBm25Threshold: 15,
         dedupCandidateLimit: 3,
       },
     },

@@ -1008,7 +1008,6 @@ describe("promote-events unit boundaries", () => {
       batch: undefined,
       pattern: undefined,
     };
-    defaults.compaction.promotionThresholds.dedupBm25Threshold = undefined;
     defaults.compaction.promotionThresholds.dedupCandidateLimit = undefined;
     defaults.compaction.promotionThresholds.insightsMaxAgeDays = undefined;
     defaults.compaction.promotionThresholds.maxConfidence = undefined;

@@ -1351,6 +1351,14 @@ in the same source, while runtime overrides continue to take precedence over
 stored configuration. `lcm config get` and `lcm config set` accept the legacy
 path and report its canonical `dedupCandidateLimit` spelling.
 
+`compaction.promotionThresholds.dedupBm25Threshold` is deprecated and ignored,
+because promotion deduplication merges only exactly identical text. It is not
+renamed: `lcm config get` and `lcm config set` reject the path, and a
+`config.json` that still contains the key keeps loading with the value
+dropped. `lcm doctor` warns when the stored value is not `15`, the default
+written by older LCM versions. Removing the key is safe. Loading a
+configuration does not rewrite `config.json`, so delete the key by hand.
+
 When `lcm doctor` finds a malformed `mcpServers.lcm` value, it reports the
 finding and recommends explicit repair with `lcm install`. It never writes
 settings, hooks, managed guidance, or remediation markers. Malformed JSON, a
