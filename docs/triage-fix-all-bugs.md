@@ -83,18 +83,27 @@ node .github/scripts/bug-campaign-intake.mjs \
 ```
 
 It runs `gh issue view` inside the trusted process, captures the raw response
-there, and writes only `trustedIssue` and a canonical `untrustedIssueData`
-envelope. It rejects non-open or non-`Bug` inputs, redacts the full documented
-union before applying the wrapper bound, and fails closed without printing raw
-transport output. Direct GitHub and API reads outside this command require an
-equivalent trusted transport-side projector before raw issue content enters tool
-output or model context. Projection after worker exposure is too late. When that
-transport is not available, the campaign must fail closed without reading instead
-of exposing raw content and projecting afterward. Persisted and read-back campaign
-evidence stays bounded and redacted, including worker-authored evidence that quotes
-issue text. The S0 inventory, root Epic, child trackers, and checkpoints persist
-complete member coverage only as canonical envelopes plus their separate trusted
-source identity. That same form crosses the triage-to-remediation handoff.
+there, and writes `trustedIssue`, a canonical `untrustedIssueData` envelope, and
+`uncollectedIssueData`. This transport collects title and body only. Its empty
+`comments`, `reproduction`, and `evidence` arrays mean "not collected," not
+"absent"; workers must not infer absence. If a disposition depends on that
+material, record an intake blocker requiring a trusted pre-exposure projector
+instead of reading it raw. Preserve `uncollectedIssueData` as separate trusted
+control with the envelope across dispatch, persistence, readback, forwarding,
+replacement, and remediation handoff; never move it into the envelope or discard
+it while its listed fields remain uncollected. The transport rejects non-open or
+non-`Bug` inputs,
+redacts the full documented union before applying the wrapper bound, and fails
+closed without printing raw transport output. Direct GitHub and API reads outside
+this command require an equivalent trusted transport-side projector before raw
+issue content enters tool output or model context. Projection after worker exposure
+is too late. When that transport is not available, the campaign must fail closed
+without reading instead of exposing raw content and projecting afterward. Persisted
+and read-back campaign evidence stays bounded and redacted, including worker-authored
+evidence that quotes issue text. The S0 inventory, root Epic, child trackers, and
+checkpoints persist complete member coverage only as canonical envelopes plus their
+separate trusted source identity and `uncollectedIssueData` control. That same form
+crosses the triage-to-remediation handoff.
 
 This safety contract is repository-owned and has a concrete title/body intake
 transport. External harnesses must invoke that transport and preserve its output;

@@ -103,6 +103,17 @@ class CoordinationContractTests(unittest.TestCase):
                      "authoritative closure readback"):
             self.assertIn(term, normalized)
 
+    def test_bug_campaign_marks_uncollected_fields_without_inferring_absence(self):
+        entry = self.read("triage-fix-all-bugs/SKILL.md")
+        normalized = " ".join(entry.split())
+
+        for term in ("`uncollectedIssueData`", "`comments`", "`reproduction`",
+                     "`evidence`", "not collected",
+                     "must not infer that those fields are absent",
+                     "preserve `uncollectedIssueData` as separate trusted control",
+                     "record an intake blocker"):
+            self.assertIn(term, normalized)
+
     def test_bug_campaign_untrusted_input_scenario_spans_handoff(self):
         text = self.read("tests/coordination-scenarios.md")
         self.assertIn("| C16 |", text)

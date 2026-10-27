@@ -24,6 +24,11 @@ const ISSUE_DATA_FIELDS = Object.freeze([
   "reproduction",
   "evidence",
 ]);
+const UNCOLLECTED_ISSUE_DATA = Object.freeze([
+  "comments",
+  "reproduction",
+  "evidence",
+]);
 const TRUNCATION_SOURCE = "github-issue-view";
 const TRUNCATION_REASON = "envelope-byte-limit";
 const patternSources = Object.freeze({
@@ -552,6 +557,7 @@ export async function fetchBugCampaignIssue({ repository, issueNumber, runComman
   return Object.freeze({
     trustedIssue: parsed.trustedIssue,
     untrustedIssueData: await projectUntrustedIssueData(parsed.issueData),
+    uncollectedIssueData: UNCOLLECTED_ISSUE_DATA,
   });
 }
 

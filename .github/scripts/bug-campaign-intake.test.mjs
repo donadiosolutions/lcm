@@ -70,7 +70,16 @@ test("keeps GitHub title and body out of trusted intake output", async () => {
   });
   const result = JSON.parse(output);
 
-  assert.deepEqual(Object.keys(result), ["trustedIssue", "untrustedIssueData"]);
+  assert.deepEqual(Object.keys(result), [
+    "trustedIssue",
+    "untrustedIssueData",
+    "uncollectedIssueData",
+  ]);
+  assert.deepEqual(result.uncollectedIssueData, [
+    "comments",
+    "reproduction",
+    "evidence",
+  ]);
   assert.deepEqual(result.trustedIssue, {
     host: "github.com",
     repository: "donadiosolutions/lcm",
@@ -118,6 +127,7 @@ test("projects a same-repository GitHub linked parent", async () => {
     runCommand: async () => campaignIssueResponse(parent),
   });
 
+  assert.ok(Object.isFrozen(projection.uncollectedIssueData));
   assert.deepEqual(projection.trustedIssue.parent, {
     number: 1400,
     nodeId: "I_kwDONadiosolutionsLCM1400",
