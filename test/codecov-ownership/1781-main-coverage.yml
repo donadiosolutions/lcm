@@ -1,0 +1,10 @@
+references: ["#1781"]
+rationale: >-
+  Keep the four behavior-equivalent coverage repairs with their existing lock,
+  connector, daemon, and worktree owners. Validation still rejects malformed
+  inputs before the removed nullish fallbacks could be reached.
+pins:
+  - ["src/private-mutation-lock.ts", "unit-configuration-security"]
+  - ["src/worktree-reconciliation.ts", "unit-project-worktrees"]
+  - ["src/connectors/codex-hooks.ts", "unit-connectors"]
+  - ["src/daemon/safe-error.ts", "unit-daemon-core"]

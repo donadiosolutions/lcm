@@ -860,6 +860,27 @@ describe("local backend-publication consumer seam", () => {
     }
   });
 
+  it("binds an omitted-home publication permit to the isolated default home", async () => {
+    const { home, journal } = await pendingFixture();
+    const otherHome = makeHome();
+    const previousHome = process.env.HOME;
+    process.env.HOME = home;
+    try {
+      await withBackendPublicationPermit({
+        publicationId: journal.publicationId,
+        expectedChecksumSha256: journal.checksumSha256,
+        access: "read-recovery",
+      }, (permit) => {
+        expect(() => assertBackendPublicationPermit(permit)).not.toThrow();
+        expect(() => assertBackendPublicationPermit(permit, otherHome))
+          .toThrow("does not match durable state");
+      });
+    } finally {
+      if (previousHome === undefined) delete process.env.HOME;
+      else process.env.HOME = previousHome;
+    }
+  });
+
   it("supports exact active permits for synchronous and asynchronous consumer/config callbacks", async () => {
     const pending = await pendingFixture();
     const { home, journal } = pending;
