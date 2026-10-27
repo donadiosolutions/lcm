@@ -1,0 +1,8 @@
+references: ["PR #1793"]
+rationale: >-
+  PR #1793 admits authenticated legacy project patterns for passive hook
+  scrubbing while retaining the stable local sidecar ID. The changed project
+  identity helper and hook scrubber keep their existing component owners.
+pins:
+  - ["src/daemon/project.ts", "unit-daemon-core"]
+  - ["src/hooks/event-scrubbing.ts", "unit-hooks"]
