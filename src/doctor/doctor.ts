@@ -117,6 +117,19 @@ interface DoctorConfig {
   retry?: LlmRetryPolicy;
   validationError?: ConfigValidationError;
   publicationError?: BackendPublicationJournalError;
+  /** The stored file sets the ignored dedupBm25Threshold to a non-default value. */
+  deprecatedDedupThreshold?: boolean;
+}
+
+/** Older LCM versions wrote this default into every bootstrapped config. */
+const FORMER_DEDUP_BM25_THRESHOLD_DEFAULT = 15;
+
+function storesDeprecatedDedupThreshold(content: string): boolean {
+  const stored = JSON.parse(content) as {
+    compaction?: { promotionThresholds?: { dedupBm25Threshold?: unknown } };
+  };
+  const value = stored.compaction?.promotionThresholds?.dedupBm25Threshold;
+  return value !== undefined && value !== FORMER_DEDUP_BM25_THRESHOLD_DEFAULT;
 }
 
 const PASSIVE_BACKLOG_WARN_THRESHOLD = 200;
@@ -411,7 +424,10 @@ function loadConfig(deps: DoctorDeps): DoctorConfig {
           publicationError: undefined,
         };
       }
-      return doctorConfigFromDaemonConfig(parsed);
+      return {
+        ...doctorConfigFromDaemonConfig(parsed),
+        deprecatedDedupThreshold: storesDeprecatedDedupThreshold(first.content),
+      };
     } catch (error) {
       if (error instanceof BackendPublicationJournalError) {
         return {
@@ -771,6 +787,14 @@ export async function runDoctor(overrides?: Partial<DoctorDeps>, doctorOptions: 
       results.push(config.validationError
         ? { name: "config", category: "Stack", status: "fail", message: "Configuration validation failed. Correct config.json, then run: lcm doctor" }
         : { name: "config", category: "Stack", status: "pass", message: "Configuration is valid" });
+      if (config.deprecatedDedupThreshold) {
+        results.push({
+          name: "config-deprecated",
+          category: "Stack",
+          status: "warn",
+          message: "compaction.promotionThresholds.dedupBm25Threshold is deprecated and ignored\n     Fix: remove compaction.promotionThresholds.dedupBm25Threshold from config.json; it has no effect",
+        });
+      }
     } else {
       results.push({ name: "config", category: "Stack", status: "fail", message: `Missing — run: lcm install` });
     }
