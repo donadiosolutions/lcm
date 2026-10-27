@@ -357,6 +357,58 @@ describe("CI environment cache metadata", () => {
     }
   });
 
+  it("accepts familiar and fully qualified Docker Hub repo digests for pinned images", () => {
+    for (const image of POSTGRESQL_HARNESS_IMAGES) {
+      const digest = image.slice(image.lastIndexOf("@sha256:"));
+      const name = /\/library\/([^:@]+)[:@]/u.exec(image)![1];
+      for (const repository of [
+        name,
+        "library/" + name,
+        "docker.io/library/" + name,
+        "index.docker.io/library/" + name,
+      ]) {
+        expect(() => validateImageInspection(image, JSON.stringify([{
+          RepoDigests: ["unrelated@sha256:" + "1".repeat(64), repository + digest],
+        }])), repository).not.toThrow();
+      }
+    }
+  });
+
+  it("rejects repo digests that differ in digest, registry, namespace, or spelling", () => {
+    const digest = POSTGRES_IMAGE.slice(POSTGRES_IMAGE.lastIndexOf("@sha256:"));
+    const rejected = [
+      "quay.io/library/postgres" + digest,
+      "docker.io/evil/postgres" + digest,
+      "evil/postgres" + digest,
+      "docker.io.evil.com/library/postgres" + digest,
+      "evil/docker.io/library/postgres" + digest,
+      "registry-1.docker.io/library/postgres" + digest,
+      "docker.io:443/library/postgres" + digest,
+      "Docker.io/library/postgres" + digest,
+      "docker.io/library/Postgres" + digest,
+      "docker.io//postgres" + digest,
+      "docker.io/library/node" + digest,
+      "node" + digest,
+      "postgres@sha256:" + "0".repeat(64),
+      "postgres" + digest.slice(0, -1),
+      "postgres" + digest.toUpperCase(),
+      "postgres" + digest + "0",
+      "postgres:18.4-bookworm" + digest,
+      "postgres",
+      digest,
+    ];
+    for (const entry of rejected) {
+      expect(() => validateImageInspection(POSTGRES_IMAGE, JSON.stringify([{
+        RepoDigests: [entry],
+      }])), entry).toThrow("pinned digest");
+    }
+    for (const RepoDigests of [undefined, null, "postgres" + digest, [], [null, 7, {}]]) {
+      expect(() => validateImageInspection(POSTGRES_IMAGE, JSON.stringify([{ RepoDigests }])))
+        .toThrow("pinned digest");
+    }
+    expect(() => validateImageInspection(POSTGRES_IMAGE, "[{}]")).toThrow("pinned digest");
+  });
+
   it("rejects unpinned images and malformed Docker inspection output", () => {
     expect(() => expectedRepoDigest("postgres:18.4-bookworm")).toThrow("not digest pinned");
     expect(() => validateImageInspection(POSTGRES_IMAGE, "[]")).toThrow("pinned digest");

@@ -332,10 +332,34 @@ export function expectedRepoDigest(image) {
   return `${repository}${image.slice(separator)}`;
 }
 
+const DOCKER_HUB_HOSTS = new Set(["docker.io", "index.docker.io"]);
+const REPO_DIGEST_PATTERN = /^([^@]+)@(sha256:[0-9a-f]{64})$/u;
+
+// Docker reports RepoDigests in the familiar form (postgres@sha256:...) even
+// when an image is pulled by its fully qualified name, while Podman reports
+// docker.io/library/postgres@sha256:.... Both name the same Docker Hub
+// repository; any other registry, namespace, or spelling stays distinct.
+function canonicalRepository(repository) {
+  const components = repository.split("/");
+  if (DOCKER_HUB_HOSTS.has(components[0])) components.shift();
+  if (components.length === 1) components.unshift("library");
+  return components.join("/");
+}
+
+function repoDigestMatches(expected, candidate) {
+  if (typeof candidate !== "string") return false;
+  const expectedParts = REPO_DIGEST_PATTERN.exec(expected);
+  const candidateParts = REPO_DIGEST_PATTERN.exec(candidate);
+  return expectedParts !== null && candidateParts !== null
+    && expectedParts[2] === candidateParts[2]
+    && canonicalRepository(expectedParts[1]) === canonicalRepository(candidateParts[1]);
+}
+
 export function validateImageInspection(image, inspection) {
   const records = JSON.parse(inspection);
   const repoDigests = records[0]?.RepoDigests;
-  if (!Array.isArray(repoDigests) || !repoDigests.includes(expectedRepoDigest(image))) {
+  const expected = expectedRepoDigest(image);
+  if (!Array.isArray(repoDigests) || !repoDigests.some((entry) => repoDigestMatches(expected, entry))) {
     throw new Error(`loaded container image does not match its pinned digest: ${image}`);
   }
 }
