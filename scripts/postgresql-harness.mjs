@@ -28,7 +28,6 @@ import {
 } from "./postgresql-images.mjs";
 import {
   POSTGRES_TEMPLATE_MARKER,
-  containerEngineEnvironment,
   validatePostgreSqlTemplateArchive,
 } from "./ci-environment.mjs";
 import {
@@ -77,13 +76,19 @@ export const CONTAINER_CLI_VARIABLE = "LCM_TEST_CONTAINER_CLI";
 const CONTAINER_FLAVOURS = Object.freeze(["docker", "podman"]);
 
 /**
- * Select the container engine CLI once per harness run. Unset selects Docker;
- * otherwise only "docker", "podman" or an absolute path to one of them is valid.
- * A Windows ".exe" suffix on the path's basename is ignored, case-insensitively.
+ * Select the container engine CLI once per harness run. Unset selects native
+ * Podman for local runs and Docker for GitHub Actions runs (`ci`, which
+ * defaults to GITHUB_ACTIONS=true); otherwise only "docker", "podman" or an
+ * absolute path to one of them is valid. Docker is therefore an explicit local
+ * opt-in. A Windows ".exe" suffix on the path's basename is ignored,
+ * case-insensitively.
  */
-export function resolveContainerEngine(environment = process.env) {
+export function resolveContainerEngine(environment = process.env, ci = environment.GITHUB_ACTIONS === "true") {
   const configured = environment[CONTAINER_CLI_VARIABLE];
-  if (configured === undefined) return { cli: "docker", flavour: "docker" };
+  if (configured === undefined) {
+    const flavour = ci ? "docker" : "podman";
+    return { cli: flavour, flavour };
+  }
   if (typeof configured === "string" && !configured.includes("\0")) {
     if (CONTAINER_FLAVOURS.includes(configured)) return { cli: configured, flavour: configured };
     if (isAbsolute(configured)) {
@@ -107,7 +112,8 @@ export function assertContainerEngineSupported(engine, ci, environment = process
   }
   if (String(environment.LCM_POSTGRES_TEMPLATE_ARCHIVE ?? "").trim().length > 0) {
     throw new Error(
-      "the Podman PostgreSQL harness does not support LCM_POSTGRES_TEMPLATE_ARCHIVE; unset it",
+      "the Podman PostgreSQL harness does not support LCM_POSTGRES_TEMPLATE_ARCHIVE; "
+        + "unset it, or set LCM_TEST_CONTAINER_CLI=docker to use a template archive",
     );
   }
 }
@@ -2081,7 +2087,7 @@ export async function runHarness(options = {}) {
   const ci = options.ci ?? process.env.GITHUB_ACTIONS === "true";
   let engine;
   try {
-    engine = resolveContainerEngine(process.env);
+    engine = resolveContainerEngine(process.env, ci);
     assertContainerEngineSupported(engine, ci, process.env);
   } catch (error) {
     process.stderr.write(`PostgreSQL harness startup failed: ${error.message}\n`);
@@ -2284,13 +2290,6 @@ if (process.argv[1] && fileURLToPath(import.meta.url) === process.argv[1]) {
   const consumerProbe = process.argv.includes("--consumer-signal-probe");
   const forkConsumerProbe = process.argv.includes("--fork-consumer-signal-probe");
   const allocationFailureProbe = process.argv.includes("--allocation-failure-probe");
-  try {
-    // Every docker child, including nested Vitest and signal probes, inherits this.
-    Object.assign(process.env, containerEngineEnvironment(process.env));
-  } catch (error) {
-    process.stderr.write(`PostgreSQL harness startup failed: ${error.message}\n`);
-    process.exit(1);
-  }
   runHarness(allocationFailureProbe ? {
     afterRunAllocation: () => {
       throw new Error("injected pre-readiness failure");
