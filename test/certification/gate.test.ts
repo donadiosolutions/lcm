@@ -1,5 +1,5 @@
 import { createHash } from "node:crypto";
-import { mkdirSync, mkdtempSync, readFileSync, readdirSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { describe, expect, it } from "vitest";
@@ -17,8 +17,11 @@ function snapshotFiles(root: string, directory = root, files = new Map<string, B
   return files;
 }
 
-type Variant = { observerGap?: boolean; clockBreach?: boolean; clockGap?: boolean; duplicateMapping?: boolean; drainFail?: boolean; capacityPeak?: number; recoveryFail?: boolean; partitionFirstSuccessSeconds?: number; restartBFirstSuccessSeconds?: number; restartBNoSuccess?: boolean; noRecoverySuccess?: boolean; catchUpFail?: boolean; catchUpAtSeconds?: number; missingCatchUpTimestamp?: boolean; readinessInvalid?: boolean; residualOccupied?: boolean; poolConfigMismatch?: boolean; setupSessionOpen?: boolean; phaseEarly?: boolean; profile?: "smoke" | "full"; smokeFailure?: boolean; smokeSlow?: boolean };
+type FaultLayout = "faults" | "partition-a" | "none";
+type Variant = { observerGap?: boolean; clockBreach?: boolean; clockGap?: boolean; duplicateMapping?: boolean; drainFail?: boolean; capacityPeak?: number; recoveryFail?: boolean; partitionFirstSuccessSeconds?: number; restartBFirstSuccessSeconds?: number; restartBNoSuccess?: boolean; noRecoverySuccess?: boolean; catchUpFail?: boolean; catchUpAtSeconds?: number; missingCatchUpTimestamp?: boolean; readinessInvalid?: boolean; residualOccupied?: boolean; poolConfigMismatch?: boolean; setupSessionOpen?: boolean; phaseEarly?: boolean; profile?: "smoke" | "full"; lane?: "local" | "managed"; faultLayout?: FaultLayout; smokeFailure?: boolean; smokeSlow?: boolean };
 
+// Mirrors the real producers: local full writes faults.json with both faults,
+// managed full writes only fault-partition-a.json, and smoke writes no fault file.
 function rawFixture(options: Variant = {}) {
   const root = mkdtempSync(join(tmpdir(), "lcm-cert-raw-gate-"));
   const output = join(mkdtempSync(join(tmpdir(), "lcm-cert-raw-gate-output-")), "gate");
@@ -43,8 +46,11 @@ function rawFixture(options: Variant = {}) {
     contractSha256, approvalSha256, node: process.version,
   };
   const profile = options.profile ?? "full";
+  const lane = options.lane ?? "local";
+  const faultLayout: FaultLayout = options.faultLayout ?? (profile === "full" ? (lane === "managed" ? "partition-a" : "faults") : "none");
+  const runtimeRole = lane === "local" ? "lcm_test_runtime" : "lcm_cert_runtime_run12345";
   const t0 = Date.parse("2026-10-26T10:10:00.000Z");
-  writeJson(join(root, "run.json"), { lane: "local", profile, runId: "run12345", contractSha256, approval, approvalSha256, startedAt: "2026-10-26T10:01:00.000Z" });
+  writeJson(join(root, "run.json"), { lane, profile, runId: "run12345", contractSha256, approval, approvalSha256, startedAt: "2026-10-26T10:01:00.000Z" });
   writeJson(join(root, "phase-control.json"), { warmupStartAt: options.phaseEarly ? "2026-10-26T10:09:00.000Z" : "2026-10-26T10:08:00.000Z", steadyT0At: new Date(t0).toISOString() });
   writeJson(join(root, "execution-provenance.json"), provenance);
   writeJson(join(root, "machine-identities.json"), {
@@ -65,8 +71,9 @@ function rawFixture(options: Variant = {}) {
   writeJson(join(root, "pre-activation-residual.json"), preActivationResidual);
   writeJson(join(root, "setup-session-closure.json"), setupSessionClosure);
   writeJson(join(root, "database-readiness.json"), {
-    serverVersionNum: options.readinessInvalid ? 170006 : 180004, serverPort: 5432,
-    databaseName: "lcm_harness_run12345", roleName: "lcm_test_runtime",
+    serverVersionNum: options.readinessInvalid ? 170006 : 180004, serverPort: lane === "local" ? 5432 : 25060,
+    ...(lane === "managed" ? { providerPort: 25060 } : {}),
+    databaseName: lane === "local" ? "lcm_harness_run12345" : "lcm_cert_run12345", roleName: runtimeRole,
     role: { superuser: false, createRole: false, createDb: false }, residualEmpty: false,
     maxConnections: 100, reservedConnections: 3,
     configuredPoolMax: options.poolConfigMismatch ? undefined : 2,
@@ -96,7 +103,7 @@ function rawFixture(options: Variant = {}) {
       serverTime: new Date(wallMs + 10).toISOString(),
       t1: { wallMs: wallMs + (options.clockBreach && index === 0 ? 600 : 20), monotonicNs: String(1_020_000_000n + BigInt(minute) * 60_000_000_000n) },
       databaseConnections: index === 0 ? options.capacityPeak ?? 8 : 8,
-      connections: [{ role_name: "lcm_test_runtime", client_address: machine === "a" ? "10.0.0.2" : "10.0.0.3", connections: index === 0 ? options.capacityPeak ?? 8 : 8 }],
+      connections: [{ role_name: runtimeRole, client_address: machine === "a" ? "10.0.0.2" : "10.0.0.3", connections: index === 0 ? options.capacityPeak ?? 8 : 8 }],
     };
   })).flat();
   if (options.clockGap) {
@@ -108,10 +115,10 @@ function rawFixture(options: Variant = {}) {
   const partitionCleared = partitionApplied + 60_500;
   const restartApplied = partitionApplied + 400_000;
   const restartCleared = restartApplied + 60_000;
-  writeJson(join(root, "faults.json"), profile === "full" ? [
-    { id: "partition-a", kind: "partition-machine", target: "a", requestedAt: new Date(partitionApplied - 10).toISOString(), appliedAt: new Date(partitionApplied).toISOString(), clearedAt: new Date(partitionCleared).toISOString(), recoveredAt: new Date(partitionCleared + 90_000).toISOString() },
-    { id: "restart-database", kind: "restart-database", target: "database", requestedAt: new Date(restartApplied - 10).toISOString(), appliedAt: new Date(restartApplied).toISOString(), clearedAt: new Date(restartCleared).toISOString(), recoveredAt: new Date(restartCleared + 90_000).toISOString() },
-  ] : []);
+  const partitionFault = { id: "partition-a", kind: "partition-machine", target: "a", requestedAt: new Date(partitionApplied - 10).toISOString(), appliedAt: new Date(partitionApplied).toISOString(), clearedAt: new Date(partitionCleared).toISOString(), recoveredAt: new Date(partitionCleared + 90_000).toISOString() };
+  const restartFault = { id: "restart-database", kind: "restart-database", target: "database", requestedAt: new Date(restartApplied - 10).toISOString(), appliedAt: new Date(restartApplied).toISOString(), clearedAt: new Date(restartCleared).toISOString(), recoveredAt: new Date(restartCleared + 90_000).toISOString() };
+  if (faultLayout === "faults") writeFileSync(join(root, "faults.json"), `${JSON.stringify([partitionFault, restartFault], null, 2)}\n`);
+  if (faultLayout === "partition-a") writeFileSync(join(root, "fault-partition-a.json"), `${JSON.stringify(partitionFault, null, 2)}\n`);
   for (const machine of ["a", "b"] as const) {
     const directory = join(root, `machine-${machine}`);
     mkdirSync(directory);
@@ -121,13 +128,13 @@ function rawFixture(options: Variant = {}) {
       wallEndedAt: new Date(t0 + entry.offsetSeconds * 1000 + 10).toISOString(), durationMs: options.smokeSlow && entry.op === "search" ? 10_000 : 10,
       outcome: options.smokeFailure && entry.op === "search" && entry.index === 0 ? "failed" : "success", processExitNs: String(BigInt(1_000_000_000 + entry.index * 10_000_000)),
     }));
-    const partition = (profile === "full" ? createFaultSchedule({ machine, runId: "run12345", phase: "partition-recovery", durationSeconds: 180 }) : []).map((entry) => ({
+    const partition = (faultLayout !== "none" ? createFaultSchedule({ machine, runId: "run12345", phase: "partition-recovery", durationSeconds: 180 }) : []).map((entry) => ({
       ...entry, scheduledWallMs: partitionApplied + entry.offsetSeconds * 1000,
       wallEndedAt: new Date(partitionApplied + entry.offsetSeconds * 1000 + 10).toISOString(), durationMs: 10,
       outcome: options.recoveryFail && machine === "a" || options.partitionFirstSuccessSeconds !== undefined && machine === "a"
         && partitionApplied + entry.offsetSeconds * 1000 + 10 < partitionCleared + options.partitionFirstSuccessSeconds * 1000 ? "failed" : "success",
     }));
-    const restart = (profile === "full" ? createFaultSchedule({ machine, runId: "run12345", phase: "restart-recovery", durationSeconds: 240 }) : []).map((entry) => ({
+    const restart = (faultLayout === "faults" ? createFaultSchedule({ machine, runId: "run12345", phase: "restart-recovery", durationSeconds: 240 }) : []).map((entry) => ({
       ...entry, scheduledWallMs: restartApplied + entry.offsetSeconds * 1000,
       wallEndedAt: new Date(restartApplied + entry.offsetSeconds * 1000 + 10).toISOString(), durationMs: 10, outcome: "success",
     }));
@@ -167,7 +174,7 @@ function rawFixture(options: Variant = {}) {
   const current = { ...provenance } as Record<string, unknown>;
   delete current.stagedPackageSha256;
   delete current.contractSha256;
-  return { root, output, contractPath, contractSha256, provenance: current };
+  return { root, output, contractPath, contractSha256, provenance: current, faults: faultLayout === "faults" ? [partitionFault, restartFault] : faultLayout === "partition-a" ? [partitionFault] : [] };
 }
 
 function assemble(fixture: ReturnType<typeof rawFixture>) {
@@ -324,5 +331,71 @@ describe("certification raw evidence pipeline", () => {
     const gate = assemble(rawFixture(variant)).gate;
     expect(gate.slos.find((slo: any) => slo.id === sloId)?.verdict).not.toBe("pass");
     expect(gate.verdict).not.toBe("pass");
+  });
+});
+
+describe("lane fault-set sample from real producer layouts", () => {
+  const ndjson = (values: unknown[]) => values.map((value) => `${JSON.stringify(value)}\n`).join("");
+  const sha256 = (text: string) => createHash("sha256").update(text).digest("hex");
+  const faultSetOf = (gate: any) => gate.slos.find((slo: any) => slo.id === "lane-fault-set");
+
+  it("assembles managed full evidence that records only fault-partition-a.json", () => {
+    const fixture = rawFixture({ lane: "managed" });
+    expect(existsSync(join(fixture.root, "faults.json"))).toBe(false);
+    expect(existsSync(join(fixture.root, "fault-partition-a.json"))).toBe(true);
+    const before = snapshotFiles(fixture.root);
+    const first = assemble(fixture).gate;
+    expect(first.lane).toBe("managed");
+    expect(first.verdict).toBe("pass");
+    expect(faultSetOf(first)).toMatchObject({
+      verdict: "pass", observed: 1, threshold: 1,
+      inputs: { count: 1, sampleFile: "lane-fault-set.ndjson", sampleSha256: sha256(ndjson(fixture.faults)) },
+    });
+    expect(first.faults).toEqual(fixture.faults);
+    expect(first.slos.find((slo: any) => slo.id === "recovery.partition-a")).toMatchObject({ verdict: "pass", inputs: { sampleFile: "fault-partition-a.json" } });
+    expect(first.slos.some((slo: any) => slo.id === "recovery.restart-database")).toBe(false);
+    expect(readFileSync(join(fixture.output, "lane-fault-set.ndjson"), "utf8")).toBe(ndjson(fixture.faults));
+    expect(assemble(fixture).gate).toEqual(first);
+    expect(snapshotFiles(fixture.root)).toEqual(before);
+  }, 15_000);
+
+  it("assembles smoke evidence that records no fault file at all", () => {
+    const fixture = rawFixture({ profile: "smoke" });
+    expect(existsSync(join(fixture.root, "faults.json"))).toBe(false);
+    expect(existsSync(join(fixture.root, "fault-partition-a.json"))).toBe(false);
+    const before = snapshotFiles(fixture.root);
+    const first = assemble(fixture).gate;
+    expect(first.verdict).toBe("incomplete");
+    expect(first.faults).toEqual([]);
+    expect(faultSetOf(first)).toMatchObject({
+      verdict: "incomplete", observed: 0, threshold: 0,
+      inputs: { count: 0, sampleFile: "lane-fault-set.ndjson", sampleSha256: sha256("") },
+    });
+    expect(readFileSync(join(fixture.output, "lane-fault-set.ndjson"), "utf8")).toBe("");
+    expect(assemble(fixture).gate).toEqual(first);
+    expect(snapshotFiles(fixture.root)).toEqual(before);
+  }, 15_000);
+
+  it("derives the local full fault-set sample from faults.json without rewriting it", () => {
+    const fixture = rawFixture();
+    expect(existsSync(join(fixture.root, "faults.json"))).toBe(true);
+    const rawBytes = readFileSync(join(fixture.root, "faults.json"));
+    const first = assemble(fixture).gate;
+    expect(first.verdict).toBe("pass");
+    expect(faultSetOf(first)).toMatchObject({
+      verdict: "pass", observed: 2, threshold: 2,
+      inputs: { count: 2, sampleFile: "lane-fault-set.ndjson", sampleSha256: sha256(ndjson(fixture.faults)) },
+    });
+    expect(first.slos.find((slo: any) => slo.id === "recovery.restart-database")).toMatchObject({ verdict: "pass", inputs: { sampleFile: "faults.json" } });
+    expect(readFileSync(join(fixture.output, "lane-fault-set.ndjson"), "utf8")).toBe(ndjson(fixture.faults));
+    expect(readFileSync(join(fixture.root, "faults.json"))).toEqual(rawBytes);
+    expect(existsSync(join(fixture.root, "lane-fault-set.ndjson"))).toBe(false);
+  });
+
+  it("fails rather than throws when a full run records fewer faults than its lane requires", () => {
+    const fixture = rawFixture({ lane: "local", faultLayout: "partition-a" });
+    const gate = assemble(fixture).gate;
+    expect(faultSetOf(gate)).toMatchObject({ verdict: "fail", observed: 1, threshold: 2, inputs: { count: 1, sampleFile: "lane-fault-set.ndjson" } });
+    expect(gate.verdict).toBe("fail");
   });
 });

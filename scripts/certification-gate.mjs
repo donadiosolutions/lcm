@@ -379,7 +379,8 @@ export function buildEvidenceManifest({ evidenceDirectory, contract, persist = t
   const actualFaultIds = faults.map((fault) => fault.id).sort();
   const faultSetVerdict = run.profile === "smoke" && faults.length === 0 ? "incomplete"
     : JSON.stringify(expectedFaultIds) === JSON.stringify(actualFaultIds) ? "pass" : "fail";
-  slos.push({ id: "lane-fault-set", formula: "full-profile exact contract lane fault IDs", inputs: { count: faults.length, sampleFile: "faults.json" }, threshold: expectedFaultIds.length, observed: faults.length, verdict: faultSetVerdict });
+  const faultSetFile = sampleFile("lane-fault-set.ndjson", faults);
+  slos.push({ id: "lane-fault-set", formula: "full-profile exact contract lane fault IDs", inputs: { count: faults.length, sampleFile: faultSetFile }, threshold: expectedFaultIds.length, observed: faults.length, verdict: faultSetVerdict });
   for (const fault of faults) {
     const limit = fault.kind === "restart-database"
       ? contract.thresholds.recovery.restartDatabase.rtoSeconds
