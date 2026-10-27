@@ -20,6 +20,7 @@ export const PASSIVE_EVENT_PROCESSOR_DEFAULTS = {
   sweepMaxSidecars: 20,
   sweepScanTimeoutMs: 5000,
   backgroundBatchLimit: 1,
+  replicationBacklogDelayMs: 1000,
 } as const;
 
 export interface PassiveEventNotification {
@@ -80,6 +81,8 @@ export interface PassiveEventProcessorDeps {
   signal?: AbortSignal;
 }
 
+type EventSidecar = Awaited<ReturnType<typeof collectEventSidecars>>[number];
+
 type TimeoutHandle = ReturnType<typeof setTimeout>;
 type IntervalHandle = ReturnType<typeof setInterval>;
 
@@ -116,6 +119,14 @@ export class PassiveEventProcessor {
   private sweepTimer: TimeoutHandle | null = null;
   private sweepInterval: IntervalHandle | null = null;
   private sweepStartIndex = 0;
+  /**
+   * Projects whose last replication pass ended saturated and still made
+   * terminal progress, keyed by sidecar path (#1764). Each is revisited by a
+   * short follow-up pass instead of waiting for the next sweep.
+   */
+  private readonly replicationBacklog = new Map<string, EventSidecar>();
+  private followUpTimer: TimeoutHandle | null = null;
+  private followUpDeferred = false;
   private haltedReason: "backend-mismatch" | null = null;
   private haltedMessage: string | null = null;
   private readonly replication = {
@@ -266,6 +277,7 @@ export class PassiveEventProcessor {
       await this.replicateSidecars(sidecars);
     } finally {
       this.finishDrain();
+      this.scheduleReplicationFollowUp(this.defaults.replicationBacklogDelayMs, false);
     }
   }
 
@@ -310,7 +322,7 @@ export class PassiveEventProcessor {
    * the SessionStart hook already does around its own outbox work.
    */
   private async replicateSidecars(
-    sidecars: readonly Awaited<ReturnType<typeof collectEventSidecars>>[number][],
+    sidecars: readonly EventSidecar[],
   ): Promise<void> {
     const replicate = this.replicatePassiveEvents;
     if (replicate === undefined) return;
@@ -332,10 +344,18 @@ export class PassiveEventProcessor {
           await this.haltForBackendMismatch(error);
           return;
         }
-        await this.logError("passive-event-processor", error, { cwd });
+        this.replicationBacklog.delete(sidecar.path);
+        try {
+          await this.logError("passive-event-processor", error, { cwd });
+        } catch {
+          // A failing logger must not stop replication of the later projects.
+        }
         continue;
       }
-      if (result === null) continue;
+      if (result === null) {
+        this.replicationBacklog.delete(sidecar.path);
+        continue;
+      }
       this.replication.projects += 1;
       this.replication.uploaded += result.uploaded;
       this.replication.applied += result.applied;
@@ -343,6 +363,55 @@ export class PassiveEventProcessor {
       this.replication.pruned += result.pruned;
       this.replication.retried += result.retried;
       this.replication.quarantined += result.quarantined;
+      // A saturated pass only earns a follow-up when it settled rows for good;
+      // retries alone would just hammer a failing remote (#1764).
+      const progress = result.uploaded + result.applied + result.acknowledged
+        + result.quarantined + result.pruned > 0;
+      if (result.backlog && progress) this.replicationBacklog.set(sidecar.path, sidecar);
+      else this.replicationBacklog.delete(sidecar.path);
+    }
+  }
+
+  /**
+   * Arm the single short-delay follow-up when saturated projects remain
+   * (#1764). `deferred` records that this follow-up already yielded once to
+   * queued local promotion.
+   */
+  private scheduleReplicationFollowUp(delayMs: number, deferred: boolean): void {
+    if (this.followUpTimer) {
+      this.clearTimer(this.followUpTimer);
+      this.followUpTimer = null;
+    }
+    if (this.stopped || this.haltedReason !== null || this.replicationBacklog.size === 0) return;
+    this.followUpDeferred = deferred;
+    this.followUpTimer = this.setTimer(() => {
+      this.followUpTimer = null;
+      void this.runReplicationFollowUp().catch(async error => {
+        await this.logError("passive-event-processor", error, {});
+      });
+    }, delayMs);
+    this.unref(this.followUpTimer);
+  }
+
+  private async runReplicationFollowUp(): Promise<void> {
+    if (this.stopped || this.haltedReason !== null) return;
+    // Drains never overlap, and local promotion goes first, but only once per
+    // armed follow-up so a project that keeps requeuing itself cannot starve
+    // replication.
+    if (this.draining) {
+      this.scheduleReplicationFollowUp(this.defaults.debounceMs, this.followUpDeferred);
+      return;
+    }
+    if (this.queuedProjects.size > 0 && !this.followUpDeferred) {
+      this.scheduleReplicationFollowUp(this.defaults.debounceMs, true);
+      return;
+    }
+    this.draining = true;
+    try {
+      await this.replicateSidecars([...this.replicationBacklog.values()]);
+    } finally {
+      this.finishDrain();
+      this.scheduleReplicationFollowUp(this.defaults.replicationBacklogDelayMs, false);
     }
   }
 
@@ -459,6 +528,11 @@ export class PassiveEventProcessor {
     this.debounceTimers.clear();
     this.debounceDeadlines.clear();
     this.queuedProjects.clear();
+    this.replicationBacklog.clear();
+    if (this.followUpTimer) {
+      this.clearTimer(this.followUpTimer);
+      this.followUpTimer = null;
+    }
     if (this.sweepTimer) {
       this.clearTimer(this.sweepTimer);
       this.sweepTimer = null;

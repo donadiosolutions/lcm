@@ -57,6 +57,7 @@ function replicationSummary() {
     quarantined: 0,
     acknowledged: 1,
     pruned: 1,
+    backlog: false,
   };
 }
 
@@ -812,6 +813,7 @@ describe("PassiveEventProcessor", () => {
           quarantined: 2,
           acknowledged: 3,
           pruned: 5,
+          backlog: false,
         }
         : null
     ));
@@ -1123,6 +1125,358 @@ describe("PassiveEventProcessor", () => {
     expect(signal?.aborted).toBe(true);
   });
 });
+
+describe("PassiveEventProcessor replication follow-up (#1764)", () => {
+  const BACKLOG_DELAY = PASSIVE_EVENT_PROCESSOR_DEFAULTS.replicationBacklogDelayMs;
+  const DEBOUNCE = PASSIVE_EVENT_PROCESSOR_DEFAULTS.debounceMs;
+  const idle: PromoteResult = {
+    promoted: 0,
+    skipped: 0,
+    correlated: 0,
+    errors: 0,
+    message: "no unprocessed events",
+  };
+
+  function outcome(overrides: Partial<ReturnType<typeof replicationSummary>> = {}) {
+    return {
+      leaseAcquired: true,
+      uploaded: 0,
+      applied: 0,
+      retried: 0,
+      quarantined: 0,
+      acknowledged: 0,
+      pruned: 0,
+      backlog: false,
+      ...overrides,
+    };
+  }
+
+  const saturated = (overrides: Partial<ReturnType<typeof outcome>> = {}) =>
+    outcome({ applied: 1, backlog: true, ...overrides });
+
+  const A = sidecar({ cwd: "/a", path: "/events/a.db", unprocessed: 0 });
+  const B = sidecar({ cwd: "/b", path: "/events/b.db", unprocessed: 0 });
+
+  /** Timers that track cancellation and firing so only live ones are exposed. */
+  function harness(
+    sidecars: readonly EventSidecarSummary[],
+    replicate: (cwd: string, signal: AbortSignal | undefined, path: string) => Promise<unknown>,
+    extra: Record<string, unknown> = {},
+  ) {
+    const base = timerDeps();
+    const cleared = new Set<unknown>();
+    const fired = new Set<unknown>();
+    base.deps.clearTimeout = ((handle: unknown) => { cleared.add(handle); }) as typeof clearTimeout;
+    const collect = vi.fn<CollectEventSidecars>().mockResolvedValue([...sidecars]);
+    const replicatePassiveEvents = vi.fn(replicate);
+    const processor = new PassiveEventProcessor(
+      makeReplicatingConfig(),
+      PASSIVE_EVENT_PROCESSOR_DEFAULTS,
+      {
+        ...base.deps,
+        collectEventSidecars: collect,
+        replicatePassiveEvents,
+        promoteEventsForCwd: vi.fn<PromoteEventsForCwd>().mockResolvedValue(idle),
+        ...extra,
+      } as never,
+    );
+    const live = (ms: number) =>
+      base.timers.filter(timer => timer.ms === ms && !cleared.has(timer) && !fired.has(timer));
+    /** Fire one timer and return the timers it scheduled. */
+    const fireTimer = async (timer: ScheduledTimer | undefined) => {
+      if (timer === undefined) throw new Error("no timer to fire");
+      const before = base.timers.length;
+      fired.add(timer);
+      timer.callback();
+      await new Promise<void>(resolve => { setImmediate(resolve); });
+      return base.timers.slice(before);
+    };
+    const fire = (ms: number) => fireTimer(live(ms)[0]);
+    return { ...base, processor, collect, replicatePassiveEvents, live, fire, fireTimer, cleared };
+  }
+
+  const calledPaths = (fn: { mock: { calls: unknown[][] } }) => fn.mock.calls.map(call => call[2]);
+
+  it("replicates only the saturated project again shortly after, until it is no longer saturated", async () => {
+    const results = [saturated(), saturated(), outcome({ applied: 1 })];
+    const h = harness([A, B], async (_cwd, _signal, path) =>
+      path === A.path ? results.shift() : outcome({ applied: 1 }));
+
+    await h.processor.runSweep();
+    expect(calledPaths(h.replicatePassiveEvents)).toEqual([A.path, B.path]);
+    expect(h.live(BACKLOG_DELAY)).toHaveLength(1);
+    expect(h.live(BACKLOG_DELAY)[0]?.unref).toHaveBeenCalled();
+
+    await h.fire(BACKLOG_DELAY);
+    expect(calledPaths(h.replicatePassiveEvents)).toEqual([A.path, B.path, A.path]);
+    expect(h.live(BACKLOG_DELAY)).toHaveLength(1);
+
+    await h.fire(BACKLOG_DELAY);
+    expect(calledPaths(h.replicatePassiveEvents)).toEqual([A.path, B.path, A.path, A.path]);
+    expect(h.live(BACKLOG_DELAY)).toHaveLength(0);
+    expect(h.replicatePassiveEvents.mock.calls.at(-1)?.[1]).toBeInstanceOf(AbortSignal);
+    expect(h.processor.backgroundDiagnostics().replication).toMatchObject({
+      passes: 3,
+      projects: 4,
+      applied: 4,
+    });
+    h.processor.stop();
+  });
+
+  it.each(["uploaded", "applied", "acknowledged", "quarantined", "pruned"] as const)(
+    "counts %s as terminal progress for a saturated pass",
+    async field => {
+      const h = harness([A], async () => outcome({ backlog: true, [field]: 1 }));
+      await h.processor.runSweep();
+      expect(h.live(BACKLOG_DELAY)).toHaveLength(1);
+      h.processor.stop();
+    },
+  );
+
+  it.each([
+    ["only retried rows", outcome({ backlog: true, retried: 3 })],
+    ["no progress at all", outcome({ backlog: true })],
+    ["progress without a backlog", outcome({ applied: 2 })],
+  ])("does not schedule a follow-up after a pass with %s", async (_name, result) => {
+    const h = harness([A], async () => result);
+    await h.processor.runSweep();
+    expect(h.live(BACKLOG_DELAY)).toHaveLength(0);
+    h.processor.stop();
+  });
+
+  it("forgets a project whose follow-up returns null or fails", async () => {
+    const failure = new Error("remote unavailable");
+    for (const next of [null, failure]) {
+      const results: unknown[] = [saturated(), next];
+      const h = harness([A], async () => {
+        const value = results.shift();
+        if (value instanceof Error) throw value;
+        return value;
+      });
+      await h.processor.runSweep();
+      expect(h.live(BACKLOG_DELAY)).toHaveLength(1);
+      await h.fire(BACKLOG_DELAY);
+      expect(h.replicatePassiveEvents).toHaveBeenCalledTimes(2);
+      expect(h.live(BACKLOG_DELAY)).toHaveLength(0);
+      if (next !== null) {
+        expect(h.deps.safeLogError)
+          .toHaveBeenCalledWith("passive-event-processor", failure, { cwd: A.cwd });
+      }
+      h.processor.stop();
+    }
+  });
+
+  it("keeps a saturated project that a later sweep did not reach", async () => {
+    const h = harness([A], async (_cwd, _signal, path) =>
+      path === A.path ? saturated() : outcome());
+    await h.processor.runSweep();
+    const [first] = h.live(BACKLOG_DELAY);
+
+    h.collect.mockResolvedValueOnce([B]);
+    await h.processor.runSweep();
+    // The later sweep re-armed the single follow-up rather than stacking one.
+    expect(h.cleared.has(first)).toBe(true);
+    expect(h.live(BACKLOG_DELAY)).toHaveLength(1);
+
+    await h.fire(BACKLOG_DELAY);
+    expect(calledPaths(h.replicatePassiveEvents)).toEqual([A.path, B.path, A.path]);
+    h.processor.stop();
+  });
+
+  it("lets queued local promotion run before the follow-up replication", async () => {
+    const order: string[] = [];
+    const promoteEventsForCwd = vi.fn<PromoteEventsForCwd>().mockImplementation(async () => {
+      order.push("promote");
+      return idle;
+    });
+    const h = harness([A], async () => {
+      order.push("replicate");
+      return saturated();
+    }, { promoteEventsForCwd });
+    await h.processor.runSweep();
+    order.length = 0;
+
+    h.processor.notify({ cwd: "/tmp", priority: 1 });
+    const [deferred] = await h.fire(BACKLOG_DELAY);
+    expect(order).toEqual([]);
+    expect(deferred?.ms).toBe(DEBOUNCE);
+
+    await h.processor.flushOnce();
+    await h.fireTimer(deferred);
+    expect(order).toEqual(["promote", "replicate"]);
+    h.processor.stop();
+  });
+
+  it("re-arms instead of overlapping an in-flight drain", async () => {
+    let releasePromotion!: () => void;
+    const promoteEventsForCwd = vi.fn<PromoteEventsForCwd>().mockImplementation(() =>
+      new Promise<PromoteResult>(resolve => { releasePromotion = () => resolve(idle); }));
+    const h = harness([A], async () => saturated(), { promoteEventsForCwd });
+    await h.processor.runSweep();
+    expect(h.replicatePassiveEvents).toHaveBeenCalledTimes(1);
+
+    h.processor.notify({ cwd: "/tmp", priority: 1 });
+    const drain = h.processor.flushOnce();
+    await new Promise<void>(resolve => { setImmediate(resolve); });
+    const [rearmed] = await h.fire(BACKLOG_DELAY);
+    expect(h.replicatePassiveEvents).toHaveBeenCalledTimes(1);
+    expect(rearmed?.ms).toBe(DEBOUNCE);
+
+    releasePromotion();
+    await drain;
+    await h.fireTimer(rearmed);
+    expect(h.replicatePassiveEvents).toHaveBeenCalledTimes(2);
+    h.processor.stop();
+  });
+
+  it("yields to promotion once, so a project that keeps requeuing cannot starve replication", async () => {
+    let active = 0;
+    let overlapped = false;
+    const guarded = async <T>(work: () => T): Promise<T> => {
+      active += 1;
+      if (active > 1) overlapped = true;
+      await new Promise<void>(resolve => { setImmediate(resolve); });
+      try { return work(); } finally { active -= 1; }
+    };
+    const order: string[] = [];
+    // Project A fails to promote forever and so requeues itself every drain.
+    const promoteEventsForCwd = vi.fn<PromoteEventsForCwd>().mockImplementation(() =>
+      guarded(() => {
+        order.push("promote");
+        return { promoted: 0, skipped: 0, correlated: 0, errors: 1 };
+      }));
+    const h = harness([B], () => guarded(() => {
+      order.push("replicate");
+      return saturated();
+    }), { promoteEventsForCwd });
+    await h.processor.runSweep();
+    order.length = 0;
+
+    h.processor.notify({ cwd: "/tmp", priority: 1 });
+    await h.processor.flushOnce();
+    expect(order).toEqual(["promote"]);
+
+    // First turn goes to promotion; the follow-up defers a single time.
+    const [deferred] = await h.fire(BACKLOG_DELAY);
+    expect(order).toEqual(["promote"]);
+    expect(deferred?.ms).toBe(DEBOUNCE);
+
+    // A is queued again, yet replication now gets its turn.
+    await h.processor.flushOnce();
+    await h.fireTimer(deferred);
+    await vi.waitFor(() => expect(order).toEqual(["promote", "promote", "replicate"]));
+    expect(overlapped).toBe(false);
+    h.processor.stop();
+  });
+
+  it("cancels the follow-up when the processor stops", async () => {
+    const h = harness([A], async () => saturated());
+    await h.processor.runSweep();
+    const [pending] = h.live(BACKLOG_DELAY);
+
+    h.processor.stop();
+    expect(h.cleared.has(pending)).toBe(true);
+
+    // A callback that was already due does nothing once stopped.
+    pending?.callback();
+    await new Promise<void>(resolve => { setImmediate(resolve); });
+    expect(h.replicatePassiveEvents).toHaveBeenCalledTimes(1);
+  });
+
+  it("halts a follow-up that hits a frozen-backend mismatch", async () => {
+    const mismatch = new BackendPublicationJournalError(
+      "backend-mismatch",
+      "daemon request backend differs from the authenticated startup backend",
+    );
+    const results: unknown[] = [saturated(), mismatch];
+    const h = harness([A], async () => {
+      const value = results.shift();
+      if (value instanceof Error) throw value;
+      return value;
+    });
+    await h.processor.runSweep();
+
+    await h.fire(BACKLOG_DELAY);
+    expect(h.deps.safeLogError).toHaveBeenCalledWith("passive-event-processor", mismatch, {});
+    expect(h.processor.backgroundDiagnostics()).toMatchObject({
+      halted: true,
+      haltedReason: "backend-mismatch",
+    });
+    expect(h.live(BACKLOG_DELAY)).toHaveLength(0);
+  });
+
+  it("ignores a due follow-up after a halt from promotion", async () => {
+    const mismatch = new BackendPublicationJournalError(
+      "backend-mismatch",
+      "daemon request backend differs from the authenticated startup backend",
+    );
+    const promoteEventsForCwd = vi.fn<PromoteEventsForCwd>().mockRejectedValue(mismatch);
+    const h = harness([A], async () => saturated(), { promoteEventsForCwd });
+    await h.processor.runSweep();
+    const [pending] = h.live(BACKLOG_DELAY);
+
+    h.processor.notify({ cwd: "/tmp", priority: 1 });
+    await h.processor.flushOnce();
+    expect(h.processor.backgroundDiagnostics().halted).toBe(true);
+    expect(h.cleared.has(pending)).toBe(true);
+
+    pending?.callback();
+    await new Promise<void>(resolve => { setImmediate(resolve); });
+    expect(h.replicatePassiveEvents).toHaveBeenCalledTimes(1);
+  });
+
+  it("keeps replicating when logging a failed project rejects, and arms no follow-up for it", async () => {
+    const failure = new Error("replicate failed");
+    const results: Record<string, unknown[]> = {
+      [A.path]: [saturated(), failure],
+      [B.path]: [saturated(), saturated(), outcome({ applied: 1 })],
+    };
+    const safeLogError = vi.fn().mockImplementation(async () => {
+      throw new Error("log failed");
+    });
+    const h = harness([A, B], async (_cwd, _signal, path) => {
+      const value = results[path]?.shift();
+      if (value instanceof Error) throw value;
+      return value;
+    }, { safeLogError });
+    await h.processor.runSweep();
+    expect(h.live(BACKLOG_DELAY)).toHaveLength(1);
+
+    // A fails and its logger rejects; B in the same pass is still replicated.
+    await h.fire(BACKLOG_DELAY);
+    expect(calledPaths(h.replicatePassiveEvents)).toEqual([A.path, B.path, A.path, B.path]);
+    expect(safeLogError).toHaveBeenCalledTimes(1);
+    expect(safeLogError).toHaveBeenCalledWith("passive-event-processor", failure, { cwd: A.cwd });
+
+    // Only B stays in the follow-up set.
+    await h.fire(BACKLOG_DELAY);
+    expect(calledPaths(h.replicatePassiveEvents).slice(4)).toEqual([B.path]);
+    h.processor.stop();
+  });
+
+  it("logs a follow-up that fails outside the per-project handling", async () => {
+    const mismatch = new BackendPublicationJournalError(
+      "backend-mismatch",
+      "daemon request backend differs from the authenticated startup backend",
+    );
+    const logFailure = new Error("log failed");
+    const results: unknown[] = [saturated(), mismatch];
+    const safeLogError = vi.fn().mockRejectedValueOnce(logFailure).mockResolvedValue(undefined);
+    const h = harness([A], async () => {
+      const value = results.shift();
+      if (value instanceof Error) throw value;
+      return value;
+    }, { safeLogError });
+    await h.processor.runSweep();
+
+    await h.fire(BACKLOG_DELAY);
+
+    expect(safeLogError).toHaveBeenNthCalledWith(1, "passive-event-processor", mismatch, {});
+    expect(safeLogError).toHaveBeenNthCalledWith(2, "passive-event-processor", logFailure, {});
+    h.processor.stop();
+  });
+});
+
 
 describe("createPromoteEventsNotifyHandler", () => {
   it.each(["null", "[]", "[1]", '"text"', "0", "42", "true", "false"])(
