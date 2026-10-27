@@ -541,9 +541,11 @@ daemon drives replication, not these commands. CLI/import-export remains
 observed local outbox counts alongside selected-backend readiness through the
 [shared diagnostic snapshot](cli.md#observational-diagnostics).
 
-Operator command errors shown in text mode are rendered on one terminal-safe
-line. With `--json`, the structured `error` value retains the original message
-for programmatic diagnostics; display it with appropriate escaping.
+Text errors from `status`, `validate`, `quarantine`, and `replay` use a fixed
+failure line without the underlying cause. A busy `events promote` request
+uses a fixed retry hint. Rerun with `--json` for the original structured
+`error` message, and escape that value before displaying it in a terminal or
+log.
 
 ### Learned Insights
 

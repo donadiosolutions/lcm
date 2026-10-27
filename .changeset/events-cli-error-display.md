@@ -2,5 +2,5 @@
 "@donadiosolutions/lcm": patch
 ---
 
-Render passive-event operator errors as one terminal-safe text line while
-preserving the original structured JSON error.
+Use fixed text errors for passive-event operator failures, including a retry
+hint for busy promotion, while preserving the original structured JSON error.
