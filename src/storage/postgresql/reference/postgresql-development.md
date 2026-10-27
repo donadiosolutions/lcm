@@ -241,8 +241,11 @@ Podman when `GITHUB_ACTIONS=true`.
 
 Under Podman the harness always initializes a fresh database and rejects
 `LCM_POSTGRES_TEMPLATE_ARCHIVE`. The first run may pull the pinned PostgreSQL
-image. With either engine the harness copies its two initialization scripts
-into its private per-run directory. Under Podman it mounts that directory and
+image. The pinned images are fully qualified (`docker.io/library/...`) and
+digest-pinned, so Podman needs no registry short-name configuration or
+interactive prompt to resolve them. With either engine the harness copies its
+two initialization scripts into its private per-run directory. Under Podman it
+mounts that directory and
 the copies with `ro,Z` (Docker uses `ro,z`). On SELinux hosts the label
 relabels them, so only run-private files are
 relabeled and no checkout path is mounted or relabeled. The temporary directory
