@@ -1,0 +1,81 @@
+name: Testbox PostgreSQL
+
+# Manual-only Blacksmith Testbox host (see docs/development.md, "Blacksmith
+# Testboxes"). `blacksmith testbox warmup` dispatches this workflow; the job
+# stays alive as the testbox until it is stopped or its idle timeout elapses.
+
+on:
+  workflow_dispatch:
+    inputs:
+      testbox_id:
+        description: Testbox session ID
+        required: true
+        type: string
+
+permissions:
+  contents: read
+
+jobs:
+  postgresql:
+    name: Testbox PostgreSQL
+    runs-on: blacksmith-8vcpu-ubuntu-2404
+    timeout-minutes: 330
+    steps:
+      - name: Begin Testbox
+        uses: useblacksmith/begin-testbox@22ff2ea5697369864347140857d218e42815b33c # v2
+        with:
+          testbox_id: ${{ inputs.testbox_id }}
+
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      # Mounted where ./.github/actions/setup-node points the pnpm store.
+      - name: Mount pnpm store
+        uses: useblacksmith/stickydisk@3f6be1451e3cad893b778bc93495c80452a5da26 # v1.7.2
+        with:
+          key: ${{ github.repository }}-testbox-pnpm-store
+          path: ${{ runner.temp }}/lcm-pnpm-store
+
+      - name: Mount rootless Podman storage
+        uses: useblacksmith/stickydisk@3f6be1451e3cad893b778bc93495c80452a5da26 # v1.7.2
+        with:
+          key: ${{ github.repository }}-testbox-podman-storage
+          path: ~/.local/share/containers
+
+      - name: Set up Node.js and dependencies
+        uses: ./.github/actions/setup-node
+        with:
+          cache-node-modules: "false"
+
+      - name: Expose Node.js and pnpm to SSH sessions
+        shell: bash
+        run: |
+          set -Eeuo pipefail
+          node_bin="$(dirname "$(node -p 'process.execPath')")"
+          for tool in node npm npx corepack; do
+            sudo ln -sfn "$node_bin/$tool" "/usr/local/bin/$tool"
+          done
+          sudo ln -sfn "$(command -v pnpm)" /usr/local/bin/pnpm
+
+      - name: Verify rootless Podman
+        shell: bash
+        run: |
+          set -Eeuo pipefail
+          podman --version
+          test "$(podman info --format '{{.Host.Security.Rootless}}')" = true
+          printf 'LCM_TEST_CONTAINER_CLI=podman\n' >> "$GITHUB_ENV"
+
+      - name: Stage PostgreSQL harness images in Podman
+        shell: bash
+        run: |
+          set -Eeuo pipefail
+          images="$(node --input-type=module -e 'import { POSTGRESQL_HARNESS_IMAGES } from "./scripts/postgresql-images.mjs"; console.log(POSTGRESQL_HARNESS_IMAGES.join("\n"))')"
+          while IFS= read -r image; do
+            podman pull "$image"
+          done <<< "$images"
+
+      - name: Run Testbox
+        if: ${{ always() }}
+        uses: useblacksmith/run-testbox@9b976c32aa3bcbffb348889673585a5deee1b2f3 # v2
