@@ -58,13 +58,19 @@ string `tool_input.cmd` when `command` is not a string. Other command-like,
 path-like, and file-like fields are ignored; a blank `command` does not fall
 back to `cmd`.
 
-The adapter passes only bounded semantic information into the existing Bash
+The adapter passes selected semantic information into the existing Bash
 extractor:
 
-- A command is limited to 2,000 characters at the adapter boundary; longer
-  commands are clipped with `...` before event classification.
-- The existing event-data truncation and event scrubbing still run after
-  classification, including the normal sensitive-path redaction rules.
+- Commands are classified in full up to 8,192 UTF-16 code units. Longer
+  commands create no passive event. A failed command records only a fixed
+  command type, such as `Bash error: npm install`, without arguments.
+- Selected event text is scrubbed while complete, including whitespace at its
+  boundaries. Scrubbed event data is then limited to 2,000 code units plus
+  `...`. An event whose complete selected data and tags exceed 8,192 code
+  units is omitted instead of storing a partial value. This also applies to
+  native decisions, dispatch labels, plan explanations, and extracted prompt
+  events. Oversized user prompts remain eligible for prompt search but create
+  no passive event. Sensitive-path rules still apply.
 - Status is read only from direct, top-level fields. `tool_output` wins over
   `tool_response` when it contains a valid status. Within either object, the
   precedence is `isError`, `is_error`, `exit_code`, then `exitCode`; boolean
@@ -122,7 +128,7 @@ records only the generic tool error instead. No configuration is needed.
   contents and the tool response are never stored. Patches that Codex
   intercepts from a shell command are not `apply_patch` calls and are not
   captured.
-- **`spawn_agent`** records a short dispatch label: the task name, then the
+- **`spawn_agent`** records a bounded dispatch label: the task name, then the
   nickname, then the agent type, or the generic label `agent`. The generic
   label does not identify a distinct child. Codex multi-agent v2 reports the
   tool as `collaborationspawn_agent`, which is captured the same way; custom
