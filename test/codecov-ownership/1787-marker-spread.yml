@@ -1,0 +1,7 @@
+references: ["#1787"]
+rationale: >-
+  src/connectors/installer.ts is materially changed to scan retained rules
+  segments without an input-sized function argument list. It remains under
+  unit-connectors; no production path is added, removed, moved or re-owned.
+pins:
+  - ["src/connectors/installer.ts", "unit-connectors"]

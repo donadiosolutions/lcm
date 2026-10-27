@@ -58,6 +58,24 @@ function legacyRulesContent(eol: TestMarkdownEol): string {
   ].join(eol);
 }
 
+function separatedManagedRules(retainedEol: TestMarkdownEol, removedEol: TestMarkdownEol): {
+  existing: string;
+  retained: string;
+} {
+  const userSections = Array.from({ length: 385 }, (_, index) => `User section ${index}  \t`);
+  const parts = [userSections[0]];
+  for (let index = 0; index < 384; index += 1) {
+    parts.push(
+      index % 2 === 0 ? generatedRulesContent(removedEol) : legacyRulesContent(removedEol),
+      userSections[index + 1],
+    );
+  }
+  return {
+    existing: `${parts.join(retainedEol)}${retainedEol}`,
+    retained: `${userSections.join(retainedEol)}${retainedEol}`,
+  };
+}
+
 function managedSkillContent(content: string): string {
   const eol = content.includes('\r\n') ? '\r\n' : '\n';
   let contentEnd = content.length;
@@ -667,6 +685,24 @@ describe('installConnector — rules (markdown append)', () => {
 
       install('claude-code', 'rules', tmpDir);
       expect(readFileSync(rulesPath, 'utf-8')).toBe(firstInstall);
+    });
+  });
+
+  it.each([
+    ['retained LF with removed CRLF', '\n' as TestMarkdownEol, '\r\n' as TestMarkdownEol],
+    ['retained CRLF', '\r\n' as TestMarkdownEol, '\n' as TestMarkdownEol],
+  ])('reinstalls hundreds of separated managed blocks with %s', async (_description, retainedEol, removedEol) => {
+    const rulesPath = join(tmpDir, 'CLAUDE.md');
+    const { existing, retained } = separatedManagedRules(retainedEol, removedEol);
+    writeFileSync(rulesPath, existing);
+
+    await withMockedGeneratedContent(generatedRulesContent('\n'), (install) => {
+      install('claude-code', 'rules', tmpDir);
+      const installed = `${retained}${generatedRulesContent(retainedEol)}${retainedEol}`;
+      expect(readFileSync(rulesPath, 'utf-8')).toBe(installed);
+
+      install('claude-code', 'rules', tmpDir);
+      expect(readFileSync(rulesPath, 'utf-8')).toBe(installed);
     });
   });
 
@@ -1513,6 +1549,19 @@ describe('installConnector — Codex native hooks', () => {
 });
 
 describe('removeConnector — rules', () => {
+  it.each([
+    ['retained LF with removed CRLF', '\n' as TestMarkdownEol, '\r\n' as TestMarkdownEol],
+    ['retained CRLF', '\r\n' as TestMarkdownEol, '\n' as TestMarkdownEol],
+  ])('removes hundreds of separated managed blocks with %s', (_description, retainedEol, removedEol) => {
+    const rulesPath = join(tmpDir, 'CLAUDE.md');
+    const { existing, retained } = separatedManagedRules(retainedEol, removedEol);
+    writeFileSync(rulesPath, existing);
+
+    expect(removeConnector('claude-code', 'rules', tmpDir)).toBe(true);
+    expect(readFileSync(rulesPath, 'utf-8')).toBe(retained);
+    expect(removeConnector('claude-code', 'rules', tmpDir)).toBe(false);
+  });
+
   it('removes markers from existing rules file', () => {
     installConnector('claude-code', 'rules', tmpDir);
     const removed = removeConnector('claude-code', 'rules', tmpDir);
