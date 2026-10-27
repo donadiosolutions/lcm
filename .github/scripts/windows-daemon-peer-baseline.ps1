@@ -196,20 +196,28 @@ function Assert-BootstrapContainment($adminProfile, $adminSid, $actorSids) {
 }
 
 function Stop-RemainingFixtureProcesses($sids) {
-  $matches = @(Get-CimInstance Win32_Process | Where-Object {
+  $matches = @(Get-CimInstance Win32_Process -ErrorAction Stop | Where-Object {
     $_.CommandLine -match 'windows-daemon-peer-actor|dist[\\/]lcm\.mjs'
   })
   if ($matches.Count -gt 32) { throw 'Fixture process census exceeded its bound.' }
   foreach ($candidate in $matches) {
-    $owner = Invoke-CimMethod -InputObject $candidate -MethodName GetOwnerSid -ErrorAction SilentlyContinue
-    if ($owner.ReturnValue -ne 0 -or $sids -notcontains $owner.Sid) { continue }
+    $owner = Invoke-CimMethod -InputObject $candidate -MethodName GetOwnerSid -ErrorAction Stop
+    if ($owner.ReturnValue -ne 0 -or [string]::IsNullOrWhiteSpace($owner.Sid)) {
+      throw 'Fixture process ownership could not be verified.'
+    }
+    if ($sids -notcontains $owner.Sid) { continue }
     & $taskkill /PID $candidate.ProcessId /T /F | Out-Null
   }
-  $remaining = @(Get-CimInstance Win32_Process | Where-Object {
+  $matches = @(Get-CimInstance Win32_Process -ErrorAction Stop | Where-Object {
     $_.CommandLine -match 'windows-daemon-peer-actor|dist[\\/]lcm\.mjs'
-  } | Where-Object {
-    $owner = Invoke-CimMethod -InputObject $_ -MethodName GetOwnerSid -ErrorAction SilentlyContinue
-    $owner.ReturnValue -eq 0 -and $sids -contains $owner.Sid
+  })
+  if ($matches.Count -gt 32) { throw 'Fixture process census exceeded its bound.' }
+  $remaining = @($matches | Where-Object {
+    $owner = Invoke-CimMethod -InputObject $_ -MethodName GetOwnerSid -ErrorAction Stop
+    if ($owner.ReturnValue -ne 0 -or [string]::IsNullOrWhiteSpace($owner.Sid)) {
+      throw 'Fixture process ownership could not be verified.'
+    }
+    $sids -contains $owner.Sid
   })
   if ($remaining.Count -gt 0) { throw 'Fixture-owned processes remain after cleanup.' }
 }
@@ -265,7 +273,7 @@ foreach ($identity in $users) {
   try { Remove-LocalUser -Name $identity.User.Name -ErrorAction Stop }
   catch { $cleanupErrors.Add('local-user-removal') }
   try {
-    $profile = Get-CimInstance Win32_UserProfile -Filter "SID='$($identity.Sid)'" -ErrorAction SilentlyContinue
+    $profile = Get-CimInstance Win32_UserProfile -Filter "SID='$($identity.Sid)'" -ErrorAction Stop
     if ($null -ne $profile) {
       if ($profile.Loaded) {
         $cleanupErrors.Add('user-profile-loaded')
@@ -276,14 +284,16 @@ foreach ($identity in $users) {
   } catch { $cleanupErrors.Add('user-profile-removal') }
   $profileRemains = $null
   try {
-    $profileRemains = $null -ne (Get-CimInstance Win32_UserProfile -Filter "SID='$($identity.Sid)'" -ErrorAction SilentlyContinue)
+    $profileRemains = $null -ne (Get-CimInstance Win32_UserProfile -Filter "SID='$($identity.Sid)'" -ErrorAction Stop)
   } catch { $cleanupErrors.Add('user-profile-readback') }
   if ($profileRemains) {
     $cleanupErrors.Add('user-profile-remains')
   }
   $accountRemains = $null
   try {
-    $accountRemains = $null -ne (Get-LocalUser -Name $identity.User.Name -ErrorAction SilentlyContinue)
+    $accountRemains = $null -ne (Get-LocalUser -ErrorAction Stop | Where-Object {
+      $_.SID.Value -eq $identity.Sid
+    })
   } catch { $cleanupErrors.Add('local-user-readback') }
   if ($accountRemains) {
     $cleanupErrors.Add('local-user-remains')
@@ -300,7 +310,8 @@ catch { $cleanupErrors.Add('fixture-process-remains') }
 Write-Host ('WINDOWS_BASELINE_CLEANUP_JSON=' + (@{
   createdAccountCount = $users.Count
   accounts = $cleanupReadback
-  processCleanupVerified = -not $cleanupErrors.Contains('fixture-process-remains')
+  processCleanupVerified = -not $cleanupErrors.Contains('fixture-process-cleanup') -and
+    -not $cleanupErrors.Contains('fixture-process-remains')
   errors = @($cleanupErrors.ToArray())
 } | ConvertTo-Json -Depth 6 -Compress))
 
