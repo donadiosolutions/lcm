@@ -879,7 +879,25 @@ async function runSelectedPromotionBatch(
   expectedIdentity: StorageIdentityContext & { readonly localProjectId: string },
 ): Promise<{ result: PromoteResult; edb: LocalHookOutboxRepository | undefined }> {
   let edb = existingEdb;
-  let prepared: PreparedPromotionBatch | undefined;
+  const prepared = await withPromotionLocalAdmission(context, async token => {
+    assertExistingSidecarProjectBinding(cwd, sidecarPath, undefined, token);
+    if (edb === undefined) {
+      edb = await outboxFactory.open(sidecarPath, {}, token);
+    }
+    return preparePromotionBatch(config, edb, token);
+  });
+  const activeScrubber = prepared.events.length === 0
+    ? undefined
+    : await ScrubEngine.forProject(
+      config.security.sensitivePatterns,
+      projectPathsForIdentity({
+        id: expectedIdentity.localProjectId,
+        canonical: expectedIdentity.canonical,
+        ...(expectedIdentity.remoteProjectId === undefined
+          ? {}
+          : { remoteProjectId: expectedIdentity.remoteProjectId }),
+      }).dir,
+    );
   const storageRequest = {
     config,
     cwd,
@@ -895,11 +913,7 @@ async function runSelectedPromotionBatch(
         id: identity.localProjectId,
         canonical: identity.canonical,
       }, token);
-      if (edb === undefined) {
-        edb = await outboxFactory.open(sidecarPath, {}, token);
-        await edb.clearMissingCwd(token);
-      }
-      prepared = await preparePromotionBatch(config, edb, token);
+      if (existingEdb === undefined) await edb!.clearMissingCwd(token);
     },
   };
   let result: PromoteResult | null;
@@ -907,7 +921,7 @@ async function runSelectedPromotionBatch(
     result = await withProjectStorage(
       storageRequest,
       async (project, _signal, currentPublicationLockToken) => {
-        if (prepared!.events.length === 0) {
+        if (prepared.events.length === 0) {
           return {
             promoted: 0,
             skipped: 0,
@@ -916,26 +930,16 @@ async function runSelectedPromotionBatch(
             message: "no unprocessed events",
           };
         }
-        const activeScrubber = await ScrubEngine.forProject(
-          config.security.sensitivePatterns,
-          projectPathsForIdentity({
-            id: expectedIdentity.localProjectId,
-            canonical: expectedIdentity.canonical,
-            ...(expectedIdentity.remoteProjectId === undefined
-              ? {}
-              : { remoteProjectId: expectedIdentity.remoteProjectId }),
-          }).dir,
-        );
         return promoteEventsBatch(
           config,
           cwd,
           edb!,
           project,
-          activeScrubber,
+          activeScrubber!,
           new Map(),
-          prepared!.events,
-          prepared!.reinforcementCache,
-          prepared!.reinforcementErrors,
+          prepared.events,
+          prepared.reinforcementCache,
+          prepared.reinforcementErrors,
           currentPublicationLockToken,
         );
       },

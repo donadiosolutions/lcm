@@ -197,7 +197,7 @@ describe("canonical promotion publication admission", () => {
     const context = {
       withPublicationAdmission: <T>(operation: (token: object) => Promise<T> | T) => {
         admissions++;
-        if (admissions === 5) {
+        if (admissions === 6) {
           expect(removeProjectAlias(alias, { canonical })).toMatchObject({ removed: true });
         }
         return withBackendPublicationConsumerLockAsync(home, operation);
@@ -206,7 +206,7 @@ describe("canonical promotion publication admission", () => {
 
     await expect(drainEventsForCwd(makeConfig(), alias, sidecar, undefined, undefined, context))
       .rejects.toBeInstanceOf(SidecarIdentityConflictError);
-    expect(admissions).toBeGreaterThanOrEqual(6);
+    expect(admissions).toBeGreaterThanOrEqual(7);
     const state = sidecarState(sidecar);
     expect(state.events.filter(event => event.processed_at !== null)).toHaveLength(500);
     expect(state.events.filter(event => event.processed_at === null)).toHaveLength(1);

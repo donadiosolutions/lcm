@@ -343,7 +343,7 @@ describe("promote-events unit boundaries", () => {
     expect(mocks.openOutbox).toHaveBeenCalledTimes(2);
   });
 
-  it("guards local SQLite preparation and scrubber work under selected admission", async () => {
+  it("prepares the sidecar locally, then releases admission before scrubber work", async () => {
     const sequence: string[] = [];
     let admitted = false;
     const events = [event({ data: "admit only the selected batch" })];
@@ -354,7 +354,7 @@ describe("promote-events unit boundaries", () => {
       return events;
     });
     mocks.scrubberFactory.mockImplementation(async () => {
-      expect(admitted).toBe(true);
+      expect(admitted).toBe(false);
       sequence.push("scrubber");
       return { scrub: mocks.scrub };
     });
@@ -387,9 +387,9 @@ describe("promote-events unit boundaries", () => {
     expect(mocks.mark).toHaveBeenCalledWith([events[0].event_id]);
     expect(sequence).toEqual([
       "admission", "admission", "admission", "outbox-open", "outbox-read",
-      "project-open", "scrubber", "repository-batch",
+      "scrubber", "admission", "project-open", "repository-batch",
     ]);
-    expect(withPublicationAdmission).toHaveBeenCalledTimes(3);
+    expect(withPublicationAdmission).toHaveBeenCalledTimes(4);
   });
 
   it("pairs a PostgreSQL-shaped preflight identity with scrubber paths and admission", async () => {
@@ -674,7 +674,7 @@ describe("promote-events unit boundaries", () => {
     expect(pending.map(({ event_id }) => event_id)).toEqual([second.event_id]);
     expect(mocks.mark).toHaveBeenCalledOnce();
     expect(mocks.mark).toHaveBeenCalledWith([first.event_id]);
-    expect(mocks.events).toHaveBeenCalledOnce();
+    expect(mocks.events).toHaveBeenCalledTimes(2);
     expect(mocks.identity.mock.results.map(({ value }) => value)).toEqual([
       identityA,
       identityA,
@@ -682,7 +682,7 @@ describe("promote-events unit boundaries", () => {
       identityBDrift,
     ]);
     expect(mocks.identity).toHaveBeenCalledTimes(4);
-    expect(mocks.scrubberFactory).toHaveBeenCalledOnce();
+    expect(mocks.scrubberFactory).toHaveBeenCalledTimes(2);
     expect(mocks.openProject).toHaveBeenCalledOnce();
     expect(mocks.openProject).toHaveBeenCalledWith(
       identityA,
