@@ -284,6 +284,12 @@ describe("package.json", () => {
       expect(
         paths.filter((path) => path.startsWith("docs/postgresql-")),
       ).toEqual([]);
+      const trackedDocs = execFileSync("git", ["ls-files", "--", "docs"], {
+        cwd: repositoryRoot,
+        encoding: "utf8",
+        timeout: PACKAGE_COMMAND_TIMEOUT_MS,
+      }).trim().split("\n");
+      expect(paths.filter((path) => path.startsWith("docs/")).sort()).toEqual(trackedDocs);
 
       const forbiddenArtifacts = paths.filter((path) =>
         /(^|\/)(?:native|target|rust)(?:\/|$)/iu.test(path)
