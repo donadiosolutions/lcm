@@ -134,8 +134,11 @@ function Assert-PrivateBootstrapAcl($path, $role, $adminSid, $actorSids) {
   foreach ($rule in $acl.GetAccessRules($true, $true, [Security.Principal.SecurityIdentifier])) {
     if ($rule.AccessControlType -ne [Security.AccessControl.AccessControlType]::Allow) { continue }
     $trustee = $rule.IdentityReference.Value
-    if ($actorSids -contains $trustee -or $trusted -notcontains $trustee) {
-      $rights = [int64]$rule.FileSystemRights
+    $rights = [int64]$rule.FileSystemRights
+    # Admin-profile traversal does not grant access to the private package.
+    $traverseOnly = $role -ceq 'admin-profile' -and
+      ($rights -band (-bnot [int64]0x00100020)) -eq 0
+    if ($actorSids -contains $trustee -or ($trusted -notcontains $trustee -and -not $traverseOnly)) {
       throw "Verified pnpm $role DACL grants untrusted SID $trustee rights $rights."
     }
   }
