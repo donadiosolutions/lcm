@@ -20,8 +20,8 @@ function makeMinimalStores(): { conversationStore: ConversationStore; summarySto
 
   const conversationStore = {
     getConversation: vi.fn().mockResolvedValue({ conversationId: 1, sessionId: "sess-1" }),
-    getMaxSeq: vi.fn().mockResolvedValue(0),
-    createMessage: vi.fn().mockResolvedValue({ messageId: 1 }),
+    getOrCreateConversation: vi.fn().mockResolvedValue({ conversationId: 1, sessionId: "sess-1" }),
+    appendMessages: vi.fn().mockResolvedValue([{ messageId: 1 }]),
     createMessageParts: vi.fn().mockResolvedValue(undefined),
     getMessageById: vi.fn().mockResolvedValue({
       messageId: 1, role: "user", content: "hello",

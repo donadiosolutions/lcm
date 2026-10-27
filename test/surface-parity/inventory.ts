@@ -40,23 +40,24 @@ export interface ScenarioOwner {
 }
 export interface SurfaceRow extends DiscoveredSurface, ScenarioOwner {}
 
-/** Disjoint full paths, not Commander short-name matches. Root is in addition to the 59 rows. */
+/** Disjoint full paths, not Commander short-name matches. Root is in addition to the 71 rows. */
 export const CLI_SCENARIO_PATHS = {
-  control: ["<root>", "help", "daemon", "config", "events", "machine", "project", "postgres", "connectors", "daemon start", "daemon restart", "config get", "config set", "install", "uninstall", "mcp", "connectors list", "connectors install", "connectors remove", "connectors doctor"],
+  control: ["<root>", "help", "daemon", "config", "events", "machine", "project", "postgres", "connectors", "migration", "daemon start", "daemon restart", "config get", "config set", "install", "uninstall", "mcp", "connectors list", "connectors install", "connectors remove", "connectors doctor"],
   memory: ["search", "grep", "describe", "expand", "store"],
   compaction: ["compact"],
-  hooks: ["restore", "session-end", "user-prompt", "post-tool", "session-snapshot"],
+  hooks: ["restore", "session-end", "user-prompt", "post-tool", "pre-tool", "session-snapshot"],
   diagnostics: ["status", "stats", "doctor", "diagnose"],
   events: ["events promote", "events status", "events validate", "events quarantine", "events replay"],
   identity: ["machine register", "machine show", "machine recover", "project reconcile-worktrees", "project renew-retired-identity", "project list", "project show", "project link", "project unlink", "project create"],
   admin: ["postgres migrate"],
+  migration: ["migration plan", "migration dry-run", "migration apply", "migration resume", "migration verify", "migration report", "migration abort", "migration activate", "migration rollback"],
   sensitive: ["sensitive", "sensitive list", "sensitive add", "sensitive remove", "sensitive test", "sensitive purge"],
   "native-import": ["import"],
   knowledge: ["export", "import-knowledge"],
   promotion: ["promote"],
 } as const;
 
-const GROUP_PATHS = new Set(["<root>", "help", "daemon", "config", "events", "machine", "project", "postgres", "connectors"]);
+const GROUP_PATHS = new Set(["<root>", "help", "daemon", "config", "events", "machine", "project", "postgres", "connectors", "migration"]);
 const ALL_DIRECTIONS: readonly Direction[] = ["sqlite->sqlite", "sqlite->postgresql", "postgresql->sqlite", "postgresql->postgresql"];
 const EXPECTED_DOMAINS = [
   "machines", "project", "project-aliases", "conversations", "messages", "message-parts", "large-files", "summaries", "summary-file-links", "summary-message-links", "summary-parent-links", "context-items", "promoted-memories", "promoted-memory-tags", "recall-surfacings", "redaction-counters", "session-ingest", "session-instructions", "native-transcripts", "native-transcript-message-links", "native-transcript-checkpoints", "passive-events",
@@ -77,6 +78,7 @@ const DAEMON_SCENARIOS: Record<string, string> = {
   "POST /store": "memory",
   "POST /recent": "memory",
   "POST /ingest": "memory",
+  "POST /ingest/terminal": "memory",
   "POST /prompt-search": "memory",
   "POST /session-complete": "compaction",
   "POST /promote-events": "events",
@@ -129,6 +131,9 @@ function makeScenarioMap(): Record<string, ScenarioOwner> {
       } else if (["identity", "events", "admin"].includes(scenario)) {
         expectation = "architecture-specific";
         architectureReason = "bin/lcm.ts identity/events/postgres handlers and docs/cli.md: PostgreSQL registration and event administration require configured PostgreSQL authority; assert the documented SQLite counterpart result or refusal.";
+      } else if (scenario === "migration") {
+        expectation = "architecture-specific";
+        architectureReason = "src/migration/target-config.ts, cli-preflight.ts, maintenance.ts, cli-existing.ts and docs/migration-cutover.md: the cutover commands read storage.postgresql independently of the active backend and act only on a SQLite-selected home with a registered machine, a verified transfer-role target and a live generation. Assert each configured context's documented refusal before any durable write: the SQLite context has no target and no machine identity, the PostgreSQL context fails transfer verification under the runtime role and no longer has SQLite selected, and neither holds a generation.";
       } else if (scenario === "hooks") {
         expectation = "architecture-specific";
         architectureReason = "src/hooks/ and docs/cli.md: native hook capture uses the local SQLite outbox with either configured backend; durable project writes remain on the selected backend.";

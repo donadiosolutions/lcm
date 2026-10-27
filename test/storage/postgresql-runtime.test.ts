@@ -26,6 +26,7 @@ import {
   REQUIRED_POSTGRESQL_SERVER_MAJOR_VERSION,
 } from "../../src/storage/postgresql/migrations.js";
 import {
+  PostgreSqlDiagnosticPoolError,
   PostgreSqlCommitOutcomeUnknownError,
   PostgreSqlStorageOperationError,
 } from "../../src/storage/postgresql/errors.js";
@@ -2701,10 +2702,24 @@ describe("PostgreSQL diagnostic runtime telemetry", () => {
     await fixture.runtime.close();
   });
 
-  it.each([undefined, NaN, Infinity, -1, 1.5, "private"])("rejects invalid public pool counts %j", async (count) => {
+  it.each([
+    [undefined, "unavailable"], [NaN, "out-of-range"], [Infinity, "out-of-range"], [-1, "out-of-range"],
+    [1.5, "out-of-range"], [2 ** 53, "out-of-range"], ["private", "unavailable"],
+  ] as const)("rejects invalid public pool count %j with the closed reason %s", async (count, reason) => {
     const fixture = fixtures();
     Object.assign(fixture.pool, { totalCount: count, idleCount: 0, waitingCount: 0 });
     expect(() => fixture.runtime.poolDiagnostics()).toThrow(StorageOperationError);
+    const rejection = (() => { try { fixture.runtime.poolDiagnostics(); } catch (error) { return error; } })();
+    expect(rejection).toBeInstanceOf(PostgreSqlDiagnosticPoolError);
+    expect(rejection).toMatchObject({ reason, operation: "poolDiagnostics", backend: "postgresql" });
+    expect(JSON.stringify(rejection)).not.toContain("private");
+    await fixture.runtime.close();
+  });
+
+  it("ranks an out-of-range counter above a missing one", async () => {
+    const fixture = fixtures();
+    Object.assign(fixture.pool, { totalCount: "private", idleCount: -1, waitingCount: undefined });
+    expect(() => fixture.runtime.poolDiagnostics()).toThrow(expect.objectContaining({ reason: "out-of-range" }));
     await fixture.runtime.close();
   });
 

@@ -1,0 +1,8 @@
+references: ["#1555"]
+rationale: >-
+  #1555 lets a rollback resume its own externally aborted publication and
+  admits that aborted journal to the recovery session; rollback.ts and
+  rollback-session.ts keep their established migration cutover owner.
+pins:
+  - ["src/migration/rollback.ts", "unit-migration-cutover"]
+  - ["src/migration/rollback-session.ts", "unit-migration-cutover"]

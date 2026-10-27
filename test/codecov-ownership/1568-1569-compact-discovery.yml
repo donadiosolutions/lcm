@@ -1,0 +1,11 @@
+references: ["#1568", "#1569"]
+rationale: >-
+  #1568 and #1569 add a macrotask-yielding cancellation checkpoint to
+  batch-compact discovery (between projects, conversations, message pages, and
+  source-locator batches), so heartbeats run and cancellation stops a scan, and
+  make daemonJsonResponse open a fresh connection per request instead of a
+  pooled socket. The change is confined to existing files and adds no
+  component, so each file keeps its established owner.
+pins:
+  - ["src/batch-compact.ts", "unit-compaction-summarization"]
+  - ["src/daemon/http-url.ts", "unit-daemon-core"]

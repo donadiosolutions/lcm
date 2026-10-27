@@ -31,6 +31,15 @@ GRANT SELECT (
 )
 ON TABLE lcm.messages TO :"lcm_runtime_role";
 
+-- Native snapshot linking tells compaction events from transcript messages.
+GRANT SELECT (
+  project_id,
+  conversation_id,
+  message_id,
+  part_type
+)
+ON TABLE lcm.message_parts TO :"lcm_runtime_role";
+
 GRANT SELECT ON TABLE lcm.native_transcripts TO :"lcm_runtime_role";
 GRANT INSERT (
   project_id,

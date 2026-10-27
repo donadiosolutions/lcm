@@ -49,10 +49,35 @@ describe("SQLite active native transcript repository", () => {
   it("uses exact session equality and one ordered complete message snapshot", async () => {
     const { repo } = fixture();
     expect(await repo.getNativeTranscriptMessageSnapshot("session")).toEqual([
-      { conversationId: 1, messageId: 1, messageSequence: 1, role: "user", content: "hello" },
-      { conversationId: 3, messageId: 3, messageSequence: 0, role: "assistant", content: "hello" },
+      { conversationId: 1, messageId: 1, messageSequence: 1, role: "user", content: "hello", isCompactionEvent: false },
+      { conversationId: 3, messageId: 3, messageSequence: 0, role: "assistant", content: "hello", isCompactionEvent: false },
     ]);
     expect(await repo.getNativeTranscriptMessageSnapshot("absent")).toEqual([]);
+  });
+
+  it("flags compaction events in the snapshot without hiding their sequence slots", async () => {
+    const { db, repo } = fixture();
+    db.exec(`
+      INSERT INTO conversations(conversation_id,session_id) VALUES(4,'event-session');
+      INSERT INTO messages(message_id,conversation_id,seq,role,content,token_count)
+        VALUES(10,4,0,'user','a',1),(11,4,1,'system','LCM compaction',1),(12,4,2,'user','b',1);
+      INSERT INTO message_parts(part_id,message_id,session_id,part_type,ordinal)
+        VALUES('p-text',10,'event-session','snapshot',0),('p-event',11,'event-session','compaction',0),('p-marker',11,'event-session','snapshot',1);
+    `);
+    expect((await repo.getNativeTranscriptMessageSnapshot("event-session")).map(message => [message.messageSequence, message.isCompactionEvent]))
+      .toEqual([[0, false], [1, true], [2, false]]);
+  });
+
+  it("lists only linked source ordinals of one session and source", async () => {
+    const { repo } = fixture();
+    const input = batch();
+    const unlinked = { ...input.records[0]!, sourceOrdinal: 2, ingestKey: "d".repeat(64), nativePayload: { text: "none" }, contentSha256: createHash("sha256").update('{"text":"none"}').digest("hex"), messageLinks: [] };
+    await repo.ingestBatch({ ...input, records: [input.records[0]!, unlinked], checkpoint: { lastSourceOrdinal: 2, checkpoint: { offset: 40 } } });
+    const query = { ...key, nativeSessionId: "session" };
+    expect(await repo.listLinkedSourceOrdinals(query)).toEqual([1]);
+    expect(await repo.listLinkedSourceOrdinals({ ...query, nativeSessionId: "other" })).toEqual([]);
+    expect(await repo.listLinkedSourceOrdinals({ ...query, sourceLocator: "sessions/b.jsonl" })).toEqual([]);
+    await expect(repo.listLinkedSourceOrdinals({ ...query, sourceLocator: "../escape" })).rejects.toMatchObject({ backend: "sqlite" });
   });
 
   it("rolls back earlier rows and checkpoint on a later invalid link", async () => {

@@ -20,7 +20,7 @@ it('binds canonical checkpoint UTF8 bytes to the fixed recipe-v1 commit digest',
    kind:'migration-copy-batch-commit',manifestSha256:input.manifestSha256,priorCheckpointSha256:batch.priorCheckpointSha256,
    runId:input.runId,targetGenerationId:input.targetGenerationId,targetProjectId:input.targetProjectId,version:1});
   const expected=createHash('sha256').update(preimage,'utf8').digest('hex');
-  expect(expected).toBe('0994b16d80db23fafc7ee5d9a51cf052db62039439e4749b9c30d18b06f3a3c5');
+  expect(expected).toBe('fc1ed4b6002075b3602ec196ad402f7c25b5d87395b0978db3c45f64045b6c47');
   expect(migrationCopyBatchCommitSha256(input)).toBe(expected);
  }finally{await stream.close();}
 });

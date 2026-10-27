@@ -5,7 +5,7 @@ import { afterEach, describe, expect, it, vi } from "vitest";
 import { getLcmConnection, closeLcmConnection } from "../../src/db/connection.js";
 import { runLcmMigrations } from "../../src/db/migration.js";
 import { PromotedStore } from "../../src/db/promoted.js";
-import { deduplicateAndInsert } from "../../src/promotion/dedup.js";
+import { deduplicateAndInsert, deduplicateAndInsertInRepositories } from "../../src/promotion/dedup.js";
 import { SqliteStorageBackendFactory } from "../../src/storage/sqlite/factory.js";
 import { createRepositoryInsert } from "./dedup-test-helper.js";
 
@@ -208,7 +208,7 @@ describe("deduplicateAndInsert", () => {
     });
   });
 
-  it("requires the negative threshold for nonidentical candidates", async () => {
+  it("never merges nonidentical candidates, whatever their rank", async () => {
     const searchPromoted = vi.fn();
     const insert = vi.fn().mockResolvedValue("inserted");
     const update = vi.fn().mockResolvedValue(undefined);
@@ -239,14 +239,12 @@ describe("deduplicateAndInsert", () => {
       createdAt: "2026-01-01T00:00:00.000Z",
     };
 
-    searchPromoted.mockResolvedValueOnce([{ ...candidate, rank: -15 }]);
-    await expect(deduplicateAndInsert(base)).resolves.toBe("candidate");
-    searchPromoted.mockResolvedValueOnce([{ ...candidate, rank: -14.99 }]);
-    await expect(deduplicateAndInsert(base)).resolves.toBe("inserted");
-    searchPromoted.mockResolvedValueOnce([{ ...candidate, rank: 0 }]);
-    await expect(deduplicateAndInsert(base)).resolves.toBe("inserted");
-    searchPromoted.mockResolvedValueOnce([{ ...candidate, rank: 1 }]);
-    await expect(deduplicateAndInsert(base)).resolves.toBe("inserted");
+    for (const rank of [-50, -15, -14.99, 0, 1]) {
+      searchPromoted.mockResolvedValueOnce([{ ...candidate, rank }]);
+      await expect(deduplicateAndInsert(base)).resolves.toBe("inserted");
+    }
+    expect(insert).toHaveBeenCalledTimes(5);
+    expect(update).not.toHaveBeenCalled();
   });
 
   it.each([
@@ -254,6 +252,12 @@ describe("deduplicateAndInsert", () => {
     ["exact rank zero", "same content", "same content", 0, "candidate"],
     ["exact positive rank", "same content", "same content", 1, "candidate"],
     ["trailing whitespace", "same content ", "same content", -0.1, "inserted"],
+    ["strong rank trailing whitespace", "same content ", "same content", -50, "inserted"],
+    ["strong rank whitespace folding", "if x:\n    audit()", "if x:\naudit()", -50, "inserted"],
+    ["strong rank reordered words", "content same", "same content", -50, "inserted"],
+    ["strong rank case only", "Same Content", "same content", -50, "inserted"],
+    ["strong rank NFC versus NFD", "caf\u00e9", "cafe\u0301", -50, "inserted"],
+    ["strong rank exact", "same content", "same content", -50, "candidate"],
     ["NFC versus NFD", "caf\u00e9", "cafe\u0301", -0.1, "inserted"],
     ["same prefix with different suffix", `${"x".repeat(100)}A`, `${"x".repeat(100)}B`, -0.1, "inserted"],
   ] as const)("keeps raw identity boundary: %s", async (_label, content, candidateContent, rank, expected) => {
@@ -370,6 +374,104 @@ describe("deduplicateAndInsert", () => {
       tags: ["legacy", "incoming"],
     });
   });
+
+  it.each(["transaction", "repositories", "legacy"] as const)(
+    "updates only the byte-identical candidate on a mixed strong-rank page (%s)",
+    async mode => {
+      const stored = (id: string, content: string, rank: number, confidence: number) => ({
+        id,
+        content,
+        tags: [id],
+        projectId: "p1",
+        sessionId: null,
+        confidence,
+        createdAt: "2026-01-01T00:00:00.000Z",
+        rank,
+      });
+      const page = [
+        stored("rejected-before", "unrelated strong match", -50, 0.99),
+        stored("exact", "incoming text", 0, 0.4),
+        stored("rejected-after", "incoming  text", -40, 0.98),
+      ];
+      const insert = vi.fn().mockResolvedValue("inserted");
+      const update = vi.fn().mockResolvedValue(undefined);
+      const archive = vi.fn().mockResolvedValue(undefined);
+      const thresholds = { dedupBm25Threshold: 15, dedupCandidateLimit: 10 };
+      const common = { content: "incoming text", tags: ["incoming"], depth: 0, confidence: 0.5, thresholds };
+      const repositories = {
+        lexicalSearch: { searchPromoted: vi.fn().mockResolvedValue(page) },
+        promotedMemory: { findExactContent: vi.fn().mockResolvedValue(null), insert, update, archive },
+      };
+
+      let id: string;
+      if (mode === "legacy") {
+        id = await deduplicateAndInsert({
+          ...common,
+          projectId: "p1",
+          store: {
+            search: vi.fn().mockReturnValue(page),
+            insert: insert as never,
+            update: update as never,
+            archive: archive as never,
+            transaction: vi.fn((callback: () => void) => callback()),
+          },
+        });
+      } else if (mode === "repositories") {
+        id = await deduplicateAndInsertInRepositories(repositories, { ...common, sourceProjectId: "p1" });
+      } else {
+        id = await deduplicateAndInsert({
+          ...common,
+          sourceProjectId: "p1",
+          transaction: async <T>(callback: (value: typeof repositories) => Promise<T>) => callback(repositories),
+        });
+      }
+
+      expect(id).toBe("exact");
+      expect(insert).not.toHaveBeenCalled();
+      expect(update).toHaveBeenCalledTimes(1);
+      expect(update).toHaveBeenCalledWith("exact", { confidence: 0.5, tags: ["exact", "incoming"] });
+      expect(archive).not.toHaveBeenCalled();
+    },
+  );
+
+  it.each(["repositories", "legacy"] as const)(
+    "keeps unrelated content out of a strongly ranked SQLite memory (%s)",
+    async mode => {
+      const db = makeDb();
+      const store = new PromotedStore(db);
+      const magnetContent = "Sanitizer ledger zeph1 zeph2 zeph3 zeph4 zeph5 zeph6 zeph7 zeph8";
+      for (let index = 0; index < 300; index++) {
+        store.insert({
+          content: `Filler memory ${index} about topic${index} and subject${index}`,
+          tags: ["filler"],
+          projectId: "p1",
+          confidence: 0.5,
+        });
+      }
+      const magnet = store.insert({ content: magnetContent, tags: ["magnet"], projectId: "p1", confidence: 0.3 });
+      const incoming = "Coherence read-back note zeph1 zeph2 zeph3 zeph4 zeph5 zeph6 zeph7 zeph8 follow-up";
+      const [strongest] = store.search(incoming, 100, undefined, "p1");
+      expect(strongest.id).toBe(magnet);
+      expect(strongest.rank).toBeLessThanOrEqual(-15);
+
+      const backend = mode === "legacy" ? { store, projectId: "p1" } : dedupDeps(db, store);
+      const id = await deduplicateAndInsert({
+        ...backend,
+        content: incoming,
+        tags: ["incoming"],
+        depth: 0,
+        confidence: 0.9,
+        thresholds: { dedupBm25Threshold: 15, dedupCandidateLimit: 100 },
+      });
+
+      expect(id).not.toBe(magnet);
+      expect(store.getById(id)?.content).toBe(incoming);
+      expect(store.getById(magnet)).toMatchObject({ content: magnetContent, confidence: 0.3, archived_at: null });
+      expect(JSON.parse(store.getById(magnet)!.tags)).toEqual(["magnet"]);
+      expect(store.search("coherence", 10, undefined, "p1").map((row) => row.id)).toEqual([id]);
+      expect(store.search("sanitizer", 10, undefined, "p1").map((row) => row.id)).toEqual([magnet]);
+    },
+  );
 
   it.each([
     ["SQLite", "sqlite" as const],
@@ -617,7 +719,7 @@ describe("deduplicateAndInsert", () => {
     expect(store.getAll()).toHaveLength(1);
     expect(JSON.parse(store.getById(id)!.tags)).toEqual(["original", "imported"]);
     expect(store.getById(id)!.confidence).toBe(0.9);
-    // A partial ranked match still needs the configured threshold.
+    // A partial ranked match never merges, whatever the configured threshold.
     expect(await deduplicateAndInsert({ ...shared, content: "Orchard pruning architecture" })).not.toBe(id);
     expect(store.getAll()).toHaveLength(2);
   });
@@ -661,19 +763,19 @@ describe("deduplicateAndInsert", () => {
       confidence: 0.5,
     });
     const stronger = store.insert({
-      content: "PostgreSQL database architecture decision",
+      content: "PostgreSQL database architecture",
       tags: ["strong"],
       projectId: "p1",
       confidence: 0.8,
     });
     await deduplicateAndInsert({
       store,
-      content: "PostgreSQL database architecture confirmed",
+      content: "PostgreSQL database architecture",
       tags: ["incoming"],
       projectId: "p1",
       depth: 2,
       confidence: 0.7,
-      thresholds: { dedupBm25Threshold: 0.000001, dedupCandidateLimit: 3 },
+      thresholds: { dedupBm25Threshold: 15, dedupCandidateLimit: 3 },
     });
     expect([store.getById(weaker), store.getById(stronger)].filter((row) => row?.archived_at)).toHaveLength(1);
 
@@ -712,9 +814,10 @@ describe("deduplicateAndInsert", () => {
   it("does not apply new-entry boost when deduping against an existing canonical", async () => {
     const db = makeDb();
     const store = new PromotedStore(db);
+    const content = "Confirmed PostgreSQL as the database choice after benchmarks";
 
     store.insert({
-      content: "Decided to use PostgreSQL for the database layer",
+      content,
       tags: ["decision"],
       projectId: "p1",
       confidence: 0.25,
@@ -722,13 +825,13 @@ describe("deduplicateAndInsert", () => {
 
     await deduplicateAndInsert({
       ...dedupDeps(db, store),
-      content: "Confirmed PostgreSQL as the database choice after benchmarks",
+      content,
       tags: ["decision"],
       sessionId: "s1",
       depth: 2,
       confidence: 0.2,
       newEntryConfidence: 0.6,
-      thresholds: { dedupBm25Threshold: 0.000001, dedupCandidateLimit: 3 },
+      thresholds: { dedupBm25Threshold: 15, dedupCandidateLimit: 3 },
     });
 
     const results = store.search("PostgreSQL database", 10);
@@ -736,13 +839,14 @@ describe("deduplicateAndInsert", () => {
     expect(results[0].confidence).toBe(0.25);
   });
 
-  it("refreshes canonical and archives incoming when duplicate found above threshold", async () => {
+  it("refreshes canonical and persists nothing for identical content", async () => {
     const db = makeDb();
     const store = new PromotedStore(db);
+    const content = "Decided to use PostgreSQL for the database layer";
 
     // Insert an existing entry (canonical)
     const canonical = store.insert({
-      content: "Decided to use PostgreSQL for the database layer",
+      content,
       tags: ["decision"],
       projectId: "p1",
       confidence: 0.9,
@@ -750,14 +854,12 @@ describe("deduplicateAndInsert", () => {
 
     await deduplicateAndInsert({
       ...dedupDeps(db, store),
-      content: "Confirmed PostgreSQL as the database choice after benchmarks",
+      content,
       tags: ["decision"],
       sessionId: "s1",
       depth: 2,
       confidence: 0.8,
-      // Use a near-zero threshold so our small test corpus triggers a match
-      // (FTS5 BM25 ranks in a 1-doc corpus are around -0.000003, not -0.1)
-      thresholds: { dedupBm25Threshold: 0.000001, dedupCandidateLimit: 3 },
+      thresholds: { dedupBm25Threshold: 15, dedupCandidateLimit: 3 },
     });
 
     const results = store.search("PostgreSQL database", 10);
@@ -771,20 +873,21 @@ describe("deduplicateAndInsert", () => {
     expect(results[0].id).toBe(canonical);
   });
 
-  it("archives weaker duplicates when multiple exist above threshold", async () => {
+  it("archives weaker duplicates when several identical rows exist", async () => {
     const db = makeDb();
     const store = new PromotedStore(db);
+    const content = "Decided to use PostgreSQL for the database layer";
 
-    // Insert two existing entries with different confidences
+    // Insert two identical existing entries with different confidences
     const weakEntry = store.insert({
-      content: "Decided to use PostgreSQL for the database layer",
+      content,
       tags: ["decision"],
       projectId: "p1",
       confidence: 0.7,
     });
 
     const strongEntry = store.insert({
-      content: "PostgreSQL is the database choice for this project",
+      content,
       tags: ["decision"],
       projectId: "p1",
       confidence: 0.9,
@@ -792,13 +895,12 @@ describe("deduplicateAndInsert", () => {
 
     await deduplicateAndInsert({
       ...dedupDeps(db, store),
-      content: "Confirmed PostgreSQL as the database choice",
+      content,
       tags: ["decision"],
       sessionId: "s1",
       depth: 2,
       confidence: 0.6,
-      // Use a near-zero threshold to match both existing entries
-      thresholds: { dedupBm25Threshold: 0.000001, dedupCandidateLimit: 3 },
+      thresholds: { dedupBm25Threshold: 15, dedupCandidateLimit: 3 },
     });
 
     const results = store.search("PostgreSQL database", 10);
@@ -816,8 +918,9 @@ describe("deduplicateAndInsert", () => {
     const store = new PromotedStore(db);
 
     // Insert an existing entry (canonical)
+    const content = "Decided to use PostgreSQL for the database";
     store.insert({
-      content: "Decided to use PostgreSQL for the database",
+      content,
       tags: ["decision"],
       projectId: "p1",
       confidence: 0.8,
@@ -825,12 +928,12 @@ describe("deduplicateAndInsert", () => {
 
     await deduplicateAndInsert({
       ...dedupDeps(db, store),
-      content: "PostgreSQL confirmed after review process",
+      content,
       tags: ["decision"],
       sessionId: "s1",
       depth: 2,
       confidence: 0.7,
-      thresholds: { dedupBm25Threshold: 0.000001, dedupCandidateLimit: 3 },
+      thresholds: { dedupBm25Threshold: 15, dedupCandidateLimit: 3 },
     });
 
     // Only canonical is searchable
@@ -848,9 +951,10 @@ describe("deduplicateAndInsert", () => {
   it("upgrades confidence when incoming is higher than canonical", async () => {
     const db = makeDb();
     const store = new PromotedStore(db);
+    const content = "Confirmed PostgreSQL as the database choice after extensive benchmarks";
 
     store.insert({
-      content: "Decided to use PostgreSQL for the database layer",
+      content,
       tags: ["decision"],
       projectId: "p1",
       confidence: 0.6,
@@ -858,12 +962,12 @@ describe("deduplicateAndInsert", () => {
 
     await deduplicateAndInsert({
       ...dedupDeps(db, store),
-      content: "Confirmed PostgreSQL as the database choice after extensive benchmarks",
+      content,
       tags: ["decision"],
       sessionId: "s1",
       depth: 2,
       confidence: 0.95,
-      thresholds: { dedupBm25Threshold: 0.000001, dedupCandidateLimit: 3 },
+      thresholds: { dedupBm25Threshold: 15, dedupCandidateLimit: 3 },
     });
 
     const results = store.search("PostgreSQL database", 10);

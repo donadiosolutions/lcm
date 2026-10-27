@@ -1,0 +1,58 @@
+references: ["#627"]
+rationale: >-
+  Adds the `lcm migration` operator CLI (plan, dry-run, apply, resume,
+  verify, report, abort, activate, rollback): the command renderers, the
+  target configuration, identity and reachability resolvers, the shared
+  destination resolution and restart matrix, the activate, rollback and
+  cutover helpers, the daemon-presence, hold-entry and hold-continuation
+  fences, the apply and genesis-copy drivers and the typed refusal and
+  exit-class mapping and the boundary catch that turns an unclassified
+  throw into one closed refusal. They all live under src/migration/ and stay
+  in the directory-level migration cutover owner; no topology change. The
+  new files cli-activate, cli-cutover, cli-destination, cli-restart and
+  cli-rollback are pinned with it. bin/lcm.ts and
+  src/cli-help.ts only dispatch to and describe the new command and remain
+  in the CLI owner. The manifest store gains a three-valued manifest presence
+  probe, and src/daemon/config.ts exports the backend-independent
+  PostgreSQL settings resolver the migration target configuration reuses;
+  both keep their established owners.
+pins:
+  - ["bin/lcm.ts", "unit-cli"]
+  - ["src/cli-help.ts", "unit-cli"]
+  - ["src/daemon/config.ts", "unit-daemon-core"]
+  - ["src/migration/abort.ts", "unit-migration-cutover"]
+  - ["src/migration/apply-genesis-copy.ts", "unit-migration-cutover"]
+  - ["src/migration/apply.ts", "unit-migration-cutover"]
+  - ["src/migration/boundary.ts", "unit-migration-cutover"]
+  - ["src/migration/candidate.ts", "unit-migration-cutover"]
+  - ["src/migration/cli-abort.ts", "unit-migration-cutover"]
+  - ["src/migration/cli-activate.ts", "unit-migration-cutover"]
+  - ["src/migration/cli-apply.ts", "unit-migration-cutover"]
+  - ["src/migration/cli-cutover.ts", "unit-migration-cutover"]
+  - ["src/migration/cli-destination.ts", "unit-migration-cutover"]
+  - ["src/migration/cli-dry-run.ts", "unit-migration-cutover"]
+  - ["src/migration/cli-existing.ts", "unit-migration-cutover"]
+  - ["src/migration/cli-plan.ts", "unit-migration-cutover"]
+  - ["src/migration/cli-preflight.ts", "unit-migration-cutover"]
+  - ["src/migration/cli-render.ts", "unit-migration-cutover"]
+  - ["src/migration/cli-report.ts", "unit-migration-cutover"]
+  - ["src/migration/cli-restart.ts", "unit-migration-cutover"]
+  - ["src/migration/cli-resume.ts", "unit-migration-cutover"]
+  - ["src/migration/cli-rollback.ts", "unit-migration-cutover"]
+  - ["src/migration/cli-verify.ts", "unit-migration-cutover"]
+  - ["src/migration/daemon-presence.ts", "unit-migration-cutover"]
+  - ["src/migration/envelope.ts", "unit-migration-cutover"]
+  - ["src/migration/existing-generation.ts", "unit-migration-cutover"]
+  - ["src/migration/exit-classes.ts", "unit-migration-cutover"]
+  - ["src/migration/generation-identity.ts", "unit-migration-cutover"]
+  - ["src/migration/hold-continuation.ts", "unit-migration-cutover"]
+  - ["src/migration/hold-entry.ts", "unit-migration-cutover"]
+  - ["src/migration/journal-observation.ts", "unit-migration-cutover"]
+  - ["src/migration/manifest-store.ts", "unit-migration-cutover"]
+  - ["src/migration/refusal-mapping.ts", "unit-migration-cutover"]
+  - ["src/migration/routing.ts", "unit-migration-cutover"]
+  - ["src/migration/target-config.ts", "unit-migration-cutover"]
+  - ["src/migration/target-identity.ts", "unit-migration-cutover"]
+  - ["src/migration/target-reachability.ts", "unit-migration-cutover"]
+  - ["src/migration/verify-generation.ts", "unit-migration-cutover"]
+  - ["src/project-map.ts", "unit-project-worktrees"]

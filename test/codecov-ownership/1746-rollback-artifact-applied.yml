@@ -1,0 +1,9 @@
+references: ["#1746", "#1667", "#1550", "#1551"]
+rationale: >-
+  #1746 makes a cutover-set rollback checkpoint refusal state that this call
+  published the reverse activation artifact, and has the set CLI report that
+  write as applied. It changes two files that already live in the migration
+  cutover owner; no topology change.
+pins:
+  - ["src/migration/cutover-set-rollback.ts", "unit-migration-cutover"]
+  - ["src/migration/cli-cutover-set.ts", "unit-migration-cutover"]

@@ -1,0 +1,9 @@
+references: ["#1576"]
+rationale: >-
+  #1576 makes hook dispatch honor the documented LCM_ENABLED=false setting by
+  returning a no-op before any hook work; dispatch.ts keeps its unit-hooks
+  owner. bin/lcm.ts gains the same gate for the legacy bare `lcm compact` hook
+  path; its unit-cli owner is unchanged (see 0000-legacy-ledger.yml).
+pins:
+  - ["src/hooks/dispatch.ts", "unit-hooks"]
+  - ["bin/lcm.ts", "unit-cli"]

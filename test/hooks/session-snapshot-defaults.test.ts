@@ -1,5 +1,10 @@
 import { beforeEach, describe, expect, it, vi } from "vitest";
 import { BackendPublicationJournalError } from "../../src/storage/backend-publication.js";
+import {
+  createLockContentionWaitBudget,
+  PrivateMutationLockContentionError,
+  retryWhileLiveLockContended,
+} from "../../src/private-mutation-lock.js";
 
 const mocks = vi.hoisted(() => ({
   statSync: vi.fn(),
@@ -43,6 +48,7 @@ vi.mock("../../src/hooks/publication-fence.js", () => ({
   assertHookPublicationFence: mocks.assertHookPublicationFence,
   assertHookRootEstablished: mocks.assertHookRootEstablished,
   isBackendPublicationJournalError: mocks.isBackendPublicationJournalError,
+  NO_HOOK_ADMISSION_RETRY: async <T>(step: () => T | Promise<T>): Promise<T> => await step(),
 }));
 
 import { handleSessionSnapshot } from "../../src/hooks/session-snapshot.js";
@@ -81,6 +87,82 @@ describe("handleSessionSnapshot default integrations", () => {
     expect(mocks.firePromoteEventsRequest).toHaveBeenCalledWith(4545, { cwd: "/project" });
     expect(mocks.assertHookRootEstablished.mock.invocationCallOrder[0])
       .toBeLessThan(mocks.mkdirSync.mock.invocationCallOrder[0]);
+  });
+
+  describe("waiting for a live publication-lock owner", () => {
+    const liveContention = (): PrivateMutationLockContentionError => new PrivateMutationLockContentionError(
+      "publication lock is busy",
+      {
+        contendedLock: {
+          path: "/lcm/publication.lock",
+          owner: { version: 1, pid: process.pid + 1, processStartTime: null, nonce: "owner" },
+        },
+      },
+    );
+    const admissionRetry = (totalMs: number) => {
+      const budget = createLockContentionWaitBudget(totalMs);
+      return <T>(step: () => T | Promise<T>): Promise<T> => retryWhileLiveLockContended(step, {
+        budget,
+        _wait: async () => undefined,
+      });
+    };
+    const config = {
+      daemon: { port: 4545 },
+      hooks: { snapshotIntervalSec: 60, disableAutoCompact: false },
+      compaction: { autoCompactMinTokens: 100 },
+    };
+
+    it("ingests after the config loads and the fence stop meeting the owner", async () => {
+      mocks.loadDaemonConfig
+        .mockImplementationOnce(() => { throw liveContention(); })
+        .mockReturnValueOnce(config)
+        .mockImplementationOnce(() => { throw liveContention(); })
+        .mockImplementationOnce(() => { throw liveContention(); })
+        .mockReturnValue(config);
+      mocks.assertHookPublicationFence
+        .mockImplementationOnce(() => { throw liveContention(); });
+
+      await expect(handleSessionSnapshot(JSON.stringify(payload), { admissionRetry: admissionRetry(1000) }))
+        .resolves.toEqual({ exitCode: 0, stdout: "" });
+
+      expect(mocks.daemonJsonRequest).toHaveBeenCalledTimes(1);
+      expect(mocks.assertHookPublicationFence).toHaveBeenCalledTimes(2);
+      expect(mocks.writeFileSync).toHaveBeenCalledTimes(1);
+    });
+
+    it("skips the ingest once the config load outlasts the allowance", async () => {
+      mocks.loadDaemonConfig.mockImplementation(() => { throw liveContention(); });
+
+      await expect(handleSessionSnapshot(JSON.stringify(payload), { admissionRetry: admissionRetry(100) }))
+        .resolves.toEqual({ exitCode: 0, stdout: "" });
+
+      expect(mocks.loadDaemonConfig).toHaveBeenCalledTimes(3);
+      expect(mocks.daemonJsonRequest).not.toHaveBeenCalled();
+    });
+
+    it("loads the ingest config with the verified port after the owner releases it", async () => {
+      mocks.loadDaemonConfig
+        .mockImplementationOnce(() => { throw liveContention(); })
+        .mockReturnValue(config);
+
+      await handleSessionSnapshot(
+        JSON.stringify(payload),
+        { snapshotIntervalSec: 60, verifiedPort: 7777, admissionRetry: admissionRetry(1000) },
+      );
+
+      expect(mocks.daemonJsonRequest).toHaveBeenCalledWith(7777, "/ingest", expect.any(Object));
+    });
+
+    it("skips the ingest once the fence outlasts the allowance", async () => {
+      mocks.assertHookPublicationFence.mockImplementation(() => { throw liveContention(); });
+
+      await expect(handleSessionSnapshot(JSON.stringify(payload), { admissionRetry: admissionRetry(100) }))
+        .resolves.toEqual({ exitCode: 0, stdout: "" });
+
+      expect(mocks.assertHookPublicationFence).toHaveBeenCalledTimes(3);
+      expect(mocks.daemonJsonRequest).not.toHaveBeenCalled();
+      mocks.assertHookPublicationFence.mockReset();
+    });
   });
 
   it("reuses the verified port for ingest, compact, and promotion after config changes", async () => {
@@ -168,5 +250,62 @@ describe("handleSessionSnapshot default integrations", () => {
     mocks.daemonJsonRequest.mockResolvedValue({ totalTokens: 1 });
     await handleSessionSnapshot(JSON.stringify(payload));
     expect(mocks.fireCompactRequest).toHaveBeenCalledWith(3737, expect.any(Object));
+  });
+
+  describe("Codex SubagentStop", () => {
+    const stop = {
+      client: "codex",
+      hook_event_name: "SubagentStop",
+      session_id: "tree-root",
+      agent_id: "child-thread",
+      cwd: "/project",
+      transcript_path: null,
+      agent_transcript_path: "/rollouts/child.jsonl",
+    };
+
+    it("ingests the child rollout under the child key and compacts under it", async () => {
+      mocks.statSync.mockReturnValue({ mtimeMs: Date.now() });
+      const result = await handleSessionSnapshot(JSON.stringify(stop));
+      expect(result).toEqual({ exitCode: 0, stdout: "" });
+      expect(mocks.daemonJsonRequest).toHaveBeenCalledWith(4545, "/ingest", expect.objectContaining({
+        body: {
+          session_id: "child-thread",
+          cwd: "/project",
+          transcript_path: "/rollouts/child.jsonl",
+          client: "codex",
+        },
+      }));
+      expect(mocks.fireCompactRequest).toHaveBeenCalledWith(4545, {
+        session_id: "child-thread",
+        cwd: "/project",
+        skip_ingest: true,
+        client: "codex",
+      });
+      expect(mocks.writeFileSync).not.toHaveBeenCalled();
+      expect(mocks.firePromoteEventsRequest).toHaveBeenCalledWith(4545, { cwd: "/project" });
+    });
+
+    it("never reads the parent rollout and ignores a child event without a valid scope", async () => {
+      await handleSessionSnapshot(JSON.stringify({ ...stop, agent_transcript_path: undefined, transcript_path: "/rollouts/parent.jsonl" }));
+      await handleSessionSnapshot(JSON.stringify({ ...stop, agent_id: undefined, transcript_path: "/rollouts/parent.jsonl" }));
+      await handleSessionSnapshot(JSON.stringify({ ...stop, agent_id: 5 }));
+      await handleSessionSnapshot(JSON.stringify({ ...stop, client: "claude" }));
+      expect(mocks.daemonJsonRequest).not.toHaveBeenCalled();
+    });
+
+    it("rejects a publication journal error without stdout so Codex sees a failed hook", async () => {
+      const publicationError = new BackendPublicationJournalError(
+        "malformed-journal",
+        "publication journal is malformed",
+      );
+      mocks.isBackendPublicationJournalError.mockReturnValue(true);
+      mocks.daemonJsonRequest.mockRejectedValueOnce(publicationError);
+      await expect(handleSessionSnapshot(JSON.stringify(stop))).rejects.toBe(publicationError);
+    });
+
+    it("answers ordinary failures with exit 0 and no output", async () => {
+      mocks.daemonJsonRequest.mockRejectedValueOnce(new Error("ECONNREFUSED"));
+      await expect(handleSessionSnapshot(JSON.stringify(stop))).resolves.toEqual({ exitCode: 0, stdout: "" });
+    });
   });
 });

@@ -1,0 +1,8 @@
+references: ["#1585"]
+rationale: >-
+  The doctor schema check in codex-readiness.ts now requires timeout and
+  additionalContextLimit to be written as unsigned integer tokens, using the
+  token view added to codex-hooks.ts. Both files keep unit-connectors.
+pins:
+  - ["src/connectors/codex-readiness.ts", "unit-connectors"]
+  - ["src/connectors/codex-hooks.ts", "unit-connectors"]

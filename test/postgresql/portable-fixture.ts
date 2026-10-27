@@ -113,8 +113,8 @@ export async function seedPortablePostgreSql(
   if (options.identityOnly) return { ...fixture };
 
   const conversation = await query(`INSERT INTO lcm.conversations
-    (project_id, session_id, title, bootstrapped_at, created_at, updated_at)
-    VALUES ($1, $2, NULL, NULL, $3, $4) RETURNING conversation_id::text`,
+    (project_id, session_id, title, bootstrapped_at, created_at, updated_at, parent_session_id)
+    VALUES ($1, $2, NULL, NULL, $3, $4, 'portable-parent-thread') RETURNING conversation_id::text`,
   [projectId, fixture.sessionId, at, later]);
   const conversationId = conversation.rows[0].conversation_id as string;
   const duplicate = await query(`INSERT INTO lcm.conversations

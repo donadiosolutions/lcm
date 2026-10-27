@@ -56,6 +56,7 @@
     "test:surface-parity:inventory": "node scripts/generate-surface-parity-inventory.mjs",
     "test:postgresql": "pnpm run build && node scripts/postgresql-harness.mjs",
     "test:postgresql:census-cost": "pnpm run build && LCM_TEST_POSTGRES_CENSUS_COST=true node scripts/postgresql-harness.mjs",
+    "test:postgresql:cutover-rehearsal": "pnpm run build && LCM_TEST_POSTGRES_CUTOVER_REHEARSAL=true node scripts/postgresql-harness.mjs",
     "typecheck": "tsc --noEmit && tsc --project tsconfig.postgresql-conformance.json && tsc --project tsconfig.promotion-type-regression.json && tsc --project tsconfig.identity-binding-type-regression.json",
     "verify:consumer-topology": "node scripts/verify-consumer-topology.mjs",
     "verify:native-transcript-package": "node scripts/verify-native-transcript-package.mjs && tsc --project tsconfig.native-transcript-package.json",
@@ -65,34 +66,34 @@
     "verify:portable-package": "node scripts/verify-portable-package.mjs && tsc --project tsconfig.portable-package.json"
   },
   "dependencies": {
-    "@hono/node-server": "2.1.4",
+    "@hono/node-server": "2.1.5",
     "@sinclair/typebox": "0.34.52",
     "@types/pg": "8.23.1",
     "commander": "15.0.0",
-    "js-yaml": "5.4.3",
+    "js-yaml": "5.5.0",
     "pg": "8.23.1",
     "safe-regex": "2.1.1"
   },
   "devDependencies": {
-    "@anthropic-ai/sdk": "0.133.0",
+    "@anthropic-ai/sdk": "0.135.0",
     "@changesets/cli": "3.0.3",
     "@modelcontextprotocol/sdk": "1.32.1",
     "@types/js-yaml": "4.0.9",
     "@types/node": "26.6.5",
     "@types/safe-regex": "1.1.6",
-    "@vitest/coverage-v8": "4.1.11",
+    "@vitest/coverage-v8": "4.1.12",
     "body-parser": "2.3.0",
     "esbuild": "0.28.2",
-    "eslint": "10.12.0",
-    "fast-uri": "4.2.2",
-    "openai": "7.32.0",
+    "eslint": "10.13.0",
+    "fast-uri": "4.2.3",
+    "openai": "7.36.0",
     "typescript": "6.0.3",
-    "typescript-eslint": "8.71.1",
-    "vitest": "4.1.11"
+    "typescript-eslint": "8.71.2",
+    "vitest": "4.1.12"
   },
   "peerDependencies": {
-    "@anthropic-ai/sdk": "0.133.0",
-    "openai": "7.32.0"
+    "@anthropic-ai/sdk": "0.135.0",
+    "openai": "7.36.0"
   },
   "peerDependenciesMeta": {
     "@anthropic-ai/sdk": {

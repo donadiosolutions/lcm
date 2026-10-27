@@ -65,6 +65,7 @@ it('fences real transactions and proves a server-committed response loss before 
 import { mkdirSync, mkdtempSync, readFileSync, rmSync, statSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
+import { randomUUID } from 'node:crypto';
 import { DatabaseSync } from 'node:sqlite';
 import { getMigrationReceiptEpoch, recordMigrationReceipt, type MigrationReceiptEnvelope } from '../../src/migration/receipts.js';
 import { withMigrationQueueEvidence } from '../../src/migration/queue-evidence.js';
@@ -137,9 +138,22 @@ it('resumes a real authenticated SQLite copy after durable receipt and before lo
    let interrupted=false;
    await expect(api.runSqliteMigrationCopy(input,{observe:async boundary=>{if(boundary==='after-batch-readback'&&!interrupted){interrupted=true;throw new Error('simulated process interruption');}}})).rejects.toThrow();
    expect(store.read(input.generationId).pendingEffect?.kind).toBe('copy-batch');
-   const result=await api.runSqliteMigrationCopy(input);
+   // Section 4.9-style CAS-carry discipline applied to ownerProcessId: a real
+   // re-invocation of `apply` mints a fresh randomUUID() per process (see
+   // src/migration/apply-genesis-copy.ts's caller), never the same value the
+   // interrupted attempt used. The resume leg below deliberately uses a
+   // genuinely different ownerProcessId from the interrupted attempt above,
+   // proving resume is keyed on durable manifest/effect state alone and not
+   // on lease-owner identity -- the property the CLI wiring's design
+   // decision to mint a fresh UUID per invocation depends on.
+   const resumeInput={...input,ownerProcessId:'resumed-owner-'+randomUUID()};
+   const result=await api.runSqliteMigrationCopy(resumeInput);
    expect(result.phase).toBe('copied');expect(result.checkpoints).toHaveLength(22);
-   expect(await api.runSqliteMigrationCopy(input)).toEqual(result);
+   // Idempotence re-check also uses a third, independently fresh owner --
+   // the property under test is "any owner can safely observe/complete an
+   // already-copied generation", not "the same owner replays cleanly".
+   const thirdInput={...input,ownerProcessId:'idempotent-owner-'+randomUUID()};
+   expect(await api.runSqliteMigrationCopy(thirdInput)).toEqual(result);
    expect(readFileSync(join(projectDir,'db.sqlite'))).toEqual(sourceBytes);
    expect(readFileSync(eventsPath)).toEqual(queueBytes);
    for(const evidence of preserved){expect(readFileSync(evidence.path)).toEqual(evidence.bytes);expect(statSync(evidence.path).mode).toBe(evidence.mode);}

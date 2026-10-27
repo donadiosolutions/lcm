@@ -3011,14 +3011,16 @@ describe("sanitizeError", () => {
     expect(sanitizeError(sanitizeError(sanitizeError(input)))).toBe(input);
   });
 
-  it("preserves deferred Bug #1332 contextual over-redaction", () => {
-    const input = "file://h?x=[value|later=\\Users\\bob\\secret.db]";
-    const expected = "file://h?x=[value|later=<path>]";
-    const first = sanitizeError(input);
+  describe("Bug #1332", () => {
+    it("keeps the privacy decision for the original and post-pipe-handoff contexts", () => {
+      const input = "file://h?x=[value|later=\\Users\\bob\\secret.db]";
+      const expected = "file://h?x=[value|later=<path>]";
+      const first = sanitizeError(input);
 
-    expect(first).toBe(expected);
-    expect(sanitizeError(first)).toBe(first);
-    expect(sanitizeError(sanitizeError(first))).toBe(first);
+      expect(first).toBe(expected);
+      expect(sanitizeError(first)).toBe(first);
+      expect(sanitizeError(sanitizeError(first))).toBe(first);
+    });
   });
 
   it("keeps quoted-query ownership after an immediate public URL path handoff", () => {
@@ -3352,11 +3354,11 @@ describe("sanitizeError", () => {
     expect(sanitizeError(sanitizeError(first))).toBe(first);
   });
 
-  it("preserves deferred direct-relative successor over-redaction", () => {
+  it("preserves the Bug #1336 direct-relative successor", () => {
     const input =
       "file://h?x=[https://o.test/t&/Users/o/one&file:///Users/a/two&relative/path]";
     const expected =
-      "file://h?x=[https://o.test/t&<path>&file://<path>&relative<path>]";
+      "file://h?x=[https://o.test/t&<path>&file://<path>&relative/path]";
     const first = sanitizeError(input);
 
     expect(first).toBe(expected);
@@ -3420,21 +3422,21 @@ describe("sanitizeError", () => {
       "query",
       "file://h?x=[https://e.test/t&file:///Users/a/one?key=/public&relative/path]",
       "file://h?x=[https://e.test/t&file://<path>?key=<path>&relative/path]",
-      "file://h?x=[https://e.test/t&file://<path>?key=<path>&relative<path>]",
+      "file://h?x=[https://e.test/t&file://<path>?key=<path>&relative/path]",
     ],
     [
       "fragment",
       "file://h?x=[https://e.test/t&file:///Users/a/one#key=/public&docs/readme/more]",
       "file://h?x=[https://e.test/t&file://<path>#key=<path>&docs/readme/more]",
-      "file://h?x=[https://e.test/t&file://<path>#key=<path>&docs<path>]",
+      "file://h?x=[https://e.test/t&file://<path>#key=<path>&docs/readme/more]",
     ],
     [
       "incomplete Users root",
       "file://h?x=[https://e.test/t&file:///Users/a/one?key=/public&later/Users]",
       "file://h?x=[https://e.test/t&file://<path>?key=<path>&later/Users]",
-      "file://h?x=[https://e.test/t&file://<path>?key=<path>&later<path>]",
+      "file://h?x=[https://e.test/t&file://<path>?key=<path>&later/Users]",
     ],
-  ] as const)("preserves deferred Bug #1336 %s pass sequence", (_name, input, firstExpected, stableExpected) => {
+  ] as const)("pins Bug #1336 %s pass stability", (_name, input, firstExpected, stableExpected) => {
     const first = sanitizeError(input);
     const second = sanitizeError(first);
 
@@ -3813,21 +3815,604 @@ describe("sanitizeError", () => {
     expect(sanitizeError(sanitizeError(first))).toBe(first);
   });
 
-  it("preserves deferred Bug #1332 contextual over-redaction after the pipe-handoff fix", () => {
-    const input = "file://h?x=[value|later=\\Users\\bob\\secret.db]";
-    const expected = "file://h?x=[value|later=<path>]";
-    const first = sanitizeError(input);
+  describe("Bug #1349", () => {
+    it.each([
+      [
+        "returns from a path-bearing child on pipe",
+        "file://h?x=[file:///Users/CHILD/x|later/Users/alice/secret.db]",
+        "file://h?x=[file://<path>|later<path>]",
+        "file://h?x=[file://<path>|later<path>]",
+      ],
+      [
+        "preserves the Bug #1336 ordinary relative pipe successor",
+        "file://h?x=[file:///Users/CHILD/x|relative/path]",
+        "file://h?x=[file://<path>|relative/path]",
+        "file://h?x=[file://<path>|relative/path]",
+      ],
+      [
+        "keeps the ampersand return",
+        "file://h?x=[file:///Users/CHILD/x&later/Users/alice/secret.db]",
+        "file://h?x=[file://<path>&later<path>]",
+        "file://h?x=[file://<path>&later<path>]",
+      ],
+      [
+        "keeps a query-only child scoped",
+        "file://h?x=[https://e.test/t&file://host?key=/public|later/Users/secret]",
+        "file://h?x=[https://e.test/t&file://host?key=<path>|later/Users/secret]",
+        "file://h?x=[https://e.test/t&file://host?key=<path>|later/Users/secret]",
+      ],
+      [
+        "keeps a POSIX root redacted",
+        "file://h?x=[file:///Users/CHILD/x|/Users/alice/secret.db]",
+        "file://h?x=[file://<path>|<path>]",
+        "file://h?x=[file://<path>|<path>]",
+      ],
+      [
+        "keeps a Windows root redacted",
+        "file://h?x=[file:///Users/CHILD/x|\\Users\\alice\\secret.db]",
+        "file://h?x=[file://<path>|<path>]",
+        "file://h?x=[file://<path>|<path>]",
+      ],
+      [
+        "keeps a drive root redacted",
+        "file://h?x=[file:///Users/CHILD/x|C:\\Users\\alice\\secret.db]",
+        "file://h?x=[file://<path>|<path>]",
+        "file://h?x=[file://<path>|<path>]",
+      ],
+    ] as const)("%s", (_name, input, firstExpected, stableExpected) => {
+      const first = sanitizeError(input);
+      const second = sanitizeError(first);
 
-    expect(first).toBe(expected);
-    expect(sanitizeError(first)).toBe(first);
-    expect(sanitizeError(sanitizeError(first))).toBe(first);
+      expect(first).toBe(firstExpected);
+      expect(second).toBe(stableExpected);
+      expect(sanitizeError(second)).toBe(second);
+    });
   });
 
-  it("preserves deferred Bug #1336 root anchor after the pipe-handoff fix", () => {
+  describe("Bug #1336", () => {
+    const prefix = "file://h?x=[https://e.test/t&/Users/a/one&file:///Users/b/two";
+    const expectedPrefix = "file://h?x=[https://e.test/t&<path>&file://<path>";
+    const returnedParentRows = [
+      ["relative path", "relative/path", "relative/path"],
+      ["ordinary value", "another/ordinary/value", "another/ordinary/value"],
+      ["nested Users root", "later/Users/alice/secret", "later<path>"],
+      ["nested home root", "later/home/alice/secret", "later<path>"],
+      ["nested root root", "later/root/secret", "later<path>"],
+      ["leading Users root", "Users/alice/secret", "Users<path>"],
+      ["leading home root", "home/alice/secret", "home<path>"],
+      ["leading root root", "root/private", "root<path>"],
+      ["non-leading Users root", "not/Users/secret", "not<path>"],
+      ["non-leading home root", "backup/home/secret", "backup<path>"],
+      ["deep Users root", "a/b/Users/alice/secret", "a<path>"],
+      ["case-insensitive Users root", "docs/users/guide", "docs<path>"],
+      ["incomplete Users root", "later/Users", "later/Users"],
+      ["homeless segment", "later/homeless/x", "later/homeless/x"],
+      ["Users2 segment", "later/Users2/x", "later/Users2/x"],
+      ["public URL", "https://p.test/x", "https://p.test/x"],
+      ["POSIX root", "/Users/c/three", "<path>"],
+      ["Windows root", "\\Users\\c\\three", "<path>"],
+      ["UNC root", "\\\\srv\\share\\s", "<path>"],
+      ["drive root", "C:\\Users\\c\\three", "<path>"],
+      ["P3 Users backslash continuation", "later/Users\\alice\\secret", "later<path>"],
+      ["P3 home backslash continuation", "later/home\\alice\\secret", "later<path>"],
+      ["repeated separator after Users", "later/Users//CANARY/secret.db", "later<path>"],
+      ["repeated separator after home", "later/home//CANARY", "later<path>"],
+      ["repeated separator after root", "later/root//CANARY", "later<path>"],
+      ["empty segment before Users", "a/b//Users/CANARY", "a<path>"],
+      ["mixed separator run", "later/Users/\\CANARY", "later<path>"],
+      ["repeated backslash continuation", "later/Users\\\\CANARY", "later<path>"],
+      ["leading backslash-only relative", "Users\\CANARY", "Users\\CANARY"],
+      ["separator run without continuation", "later/Users//", "later/Users//"],
+    ] as const;
+    const cases: Array<readonly [string, string, string]> = returnedParentRows.flatMap(
+      ([name, value, expected]) =>
+        (["&", "|"] as const).map((delimiter) => [
+          `${name} after ${delimiter}`,
+          `${prefix}${delimiter}${value}]`,
+          `${expectedPrefix}${delimiter}${expected}]`,
+        ] as const),
+    );
+    cases.push(
+      [
+        "query child ordinary relative",
+        "file://h?x=[https://e.test/t&file:///Users/a/one?key=/public&relative/path]",
+        "file://h?x=[https://e.test/t&file://<path>?key=<path>&relative/path]",
+      ],
+      [
+        "hard reset",
+        `${prefix}&relative/path later/Users/secret]`,
+        `${expectedPrefix}&relative/path later/Users/secret]`,
+      ],
+      [
+        "matching close",
+        `${prefix}]&relative/path`,
+        `${expectedPrefix}]&relative/path`,
+      ],
+    );
+
+    it.each(cases)("%s", (_name, input, expected) => {
+      const first = sanitizeError(input);
+
+      expect(first).toBe(expected);
+      expect(sanitizeError(first)).toBe(first);
+      expect(sanitizeError(sanitizeError(first))).toBe(first);
+    });
+  });
+
+  describe("Bug #1344", () => {
+    it.each([
+      [
+        "single-quoted pipe handoff",
+        "file://h?x=['https://e.test/t'|\\Users\\SECRET\\x]",
+        "file://h?x=['https://e.test/t'|<path>]",
+      ],
+      [
+        "single-quoted ampersand handoff",
+        "file://h?x=['https://e.test/t'&\\Users\\SECRET\\x]",
+        "file://h?x=['https://e.test/t'&<path>]",
+      ],
+      [
+        "double-quoted pipe handoff",
+        'file://h?x=["https://e.test/t"|\\Users\\SECRET\\x]',
+        'file://h?x=["https://e.test/t"|<path>]',
+      ],
+      [
+        "P3 own-query preservation",
+        "file://h?x=['https://e.test/t?next=/public'|\\Users\\SECRET\\x]",
+        "file://h?x=['https://e.test/t?next=/public'|<path>]",
+      ],
+      [
+        "quoted nested-file control",
+        'file://h?x=["file://host?key=/public"|\\Users\\SECRET\\x]',
+        'file://h?x=["file://host?key=<path>"|<path>]',
+      ],
+      [
+        "Bug #1374 single-quoted named root",
+        "file://h?x=['https://e.test/t'name=\\Users\\SECRET\\x]",
+        "file://h?x=['https://e.test/t'name=<path>]",
+      ],
+      [
+        "Bug #1374 double-quoted named root",
+        'file://h?x=["https://e.test/t"name=\\Users\\SECRET\\x]',
+        'file://h?x=["https://e.test/t"name=<path>]',
+      ],
+      [
+        "quoted public URL without successor",
+        "file://h?x=['https://e.test/t']",
+        "file://h?x=['https://e.test/t']",
+      ],
+      [
+        "standalone quoted public URL",
+        "'https://e.test/t'|\\Users\\SECRET\\x",
+        "'https://e.test/t'|\\Users\\SECRET\\x",
+      ],
+      [
+        "ordinary relative successor",
+        "file://h?x=['https://e.test/t'|relative/path]",
+        "file://h?x=['https://e.test/t'|relative/path]",
+      ],
+      [
+        "public URL successor",
+        "file://h?x=['https://e.test/t'|https://f.test/x]",
+        "file://h?x=['https://e.test/t'|https://f.test/x]",
+      ],
+      [
+        "POSIX-root successor",
+        "file://h?x=['https://e.test/t'|/Users/SECRET/x]",
+        "file://h?x=['https://e.test/t'|<path>]",
+      ],
+      [
+        "drive-root successor",
+        "file://h?x=['https://e.test/t'|C:\\Users\\SECRET\\x]",
+        "file://h?x=['https://e.test/t'|<path>]",
+      ],
+      [
+        "UNC-root successor",
+        "file://h?x=['https://e.test/t'|\\\\srv\\share\\SECRET]",
+        "file://h?x=['https://e.test/t'|<path>]",
+      ],
+      [
+        "Bug #1374 W2 query-only control",
+        "file://h?x=[file://host?key=/public&'https://e.test/t'&later/Users/secret]",
+        "file://h?x=[file://host?key=<path>&'https://e.test/t'&later/Users/secret]",
+      ],
+    ] as const)("%s", (_name, input, expected) => {
+      const first = sanitizeError(input);
+
+      expect(first).toBe(expected);
+      expect(sanitizeError(first)).toBe(first);
+      expect(sanitizeError(sanitizeError(first))).toBe(first);
+    });
+
+    const inheritedFileRootCases: Array<readonly [string, string, string]> = (["'", '"'] as const).flatMap(
+      (quote) =>
+        (["&", "|"] as const).flatMap((delimiter) =>
+          [
+            ["Windows", "\\Users\\SECRET\\x"],
+            ["POSIX", "/Users/SECRET/x"],
+            ["drive", "C:\\Users\\SECRET\\x"],
+            ["UNC", "\\\\srv\\share\\SECRET"],
+          ].map(([rootName, successor]) => [
+            `${quote} inherited file quote, ${delimiter}, ${rootName} root`,
+            `file://h?x=[${quote}https://outer.test/x?next=file:///Users/a/My Files/private.db${quote}${delimiter}${successor}]`,
+            `file://h?x=[${quote}https://outer.test/x?next=file://<path>${quote}${delimiter}<path>]`,
+          ] as const),
+        ),
+    );
+    inheritedFileRootCases.push(
+      ...(["'", '"'] as const).map((quote) => [
+        `${quote} inherited file quote with private relative successor`,
+        `file://h?x=[${quote}https://outer.test/x?next=file:///Users/a/My Files/private.db${quote}&later/Users/CANARY/x]`,
+        `file://h?x=[${quote}https://outer.test/x?next=file://<path>${quote}&later<path>]`,
+      ] as const),
+      [
+        "standalone inherited file quote control",
+        "'https://outer.test/x?next=file:///Users/a/My Files/private.db'|\\Users\\SECRET\\x",
+        "'https://outer.test/x?next=file://<path>'|\\Users\\SECRET\\x",
+      ],
+      [
+        "inherited file quote public successor control",
+        "file://h?x=['https://outer.test/x?next=file:///Users/a/My Files/private.db'|https://f.test/x]",
+        "file://h?x=['https://outer.test/x?next=file://<path>'|https://f.test/x]",
+      ],
+      [
+        "inherited file quote ordinary relative control",
+        "file://h?x=['https://outer.test/x?next=file:///Users/a/My Files/private.db'|relative/path]",
+        "file://h?x=['https://outer.test/x?next=file://<path>'|relative/path]",
+      ],
+      ...(["'", '"'] as const).flatMap((quote) =>
+        (["&", "|"] as const).map((delimiter) => [
+          `${quote} inherited file quote, ${delimiter}, named Windows successor`,
+          `file://h?x=[${quote}https://outer.test/x?next=file:///Users/a/My Files/private.db${quote}${delimiter}name=\\Users\\SECRET\\x]`,
+          `file://h?x=[${quote}https://outer.test/x?next=file://<path>${quote}${delimiter}name=<path>]`,
+        ] as const),
+      ),
+      [
+        "inherited file quote chained rooted successors",
+        "file://h?x=['https://outer.test/x?next=file:///Users/a/My Files/private.db'|\\Users\\SECRET\\x&\\Users\\CANARY\\y]",
+        "file://h?x=['https://outer.test/x?next=file://<path>'|<path>&<path>]",
+      ],
+      [
+        "inherited file quote later private-root relative",
+        "file://h?x=['https://outer.test/x?next=file:///Users/a/My Files/private.db'|\\Users\\SECRET\\x&later/Users/CANARY/y]",
+        "file://h?x=['https://outer.test/x?next=file://<path>'|<path>&later<path>]",
+      ],
+    );
+
+    it.each(inheritedFileRootCases)("%s", (_name, input, expected) => {
+      const first = sanitizeError(input);
+
+      expect(first).toBe(expected);
+      expect(sanitizeError(first)).toBe(first);
+      expect(sanitizeError(sanitizeError(first))).toBe(first);
+    });
+  });
+
+  describe("Bug #1346", () => {
+    it.each([
+      [
+        "bare pipe opener does not re-enter sibling ownership",
+        "file://host?key=/public|[relative/path]",
+        "file://host?key=<path>|[relative/path]",
+      ],
+      [
+        "path-bearing pipe sibling",
+        "file://h?x=[file:///Users/b/two]|[value|\\Users\\SECRET\\y]",
+        "file://h?x=[file://<path>]|[value|<path>]",
+      ],
+      [
+        "path-bearing comma sibling",
+        "file://h?x=[file:///Users/b/two],[value|\\Users\\SECRET\\y]",
+        "file://h?x=[file://<path>],[value|<path>]",
+      ],
+      [
+        "path-bearing semicolon sibling",
+        "file://h?x=[file:///Users/b/two];[value|\\Users\\SECRET\\y]",
+        "file://h?x=[file://<path>];[value|<path>]",
+      ],
+      [
+        "path-bearing sibling ordinary relative control",
+        "file://h?x=[file:///Users/b/two]|[later/thing]",
+        "file://h?x=[file://<path>]|[later/thing]",
+      ],
+      [
+        "path-bearing sibling private-root relative",
+        "file://h?x=[file:///Users/b/two]|[later/Users/SECRET/y]",
+        "file://h?x=[file://<path>]|[later<path>]",
+      ],
+      [
+        "path-bearing sibling delimited private-root relative",
+        "file://h?x=[file:///Users/b/two]|[value|later/Users/SECRET/y]",
+        "file://h?x=[file://<path>]|[value|later<path>]",
+      ],
+      [
+        "sibling query-only file children",
+        "file://h?x=[file://a?key=/pub&\\Users\\S1\\x]&[file://b?key2=/pub2|\\Users\\S2\\y]",
+        "file://h?x=[file://a?key=<path>&<path>]&[file://b?key2=<path>|<path>]",
+      ],
+      [
+        "sibling close variant",
+        "file://h?x=[file://alpha?token=/tmp&\\Users\\ALICE\\one.db]&[file://beta?token=/tmp|\\Users\\BOB\\two.db]",
+        "file://h?x=[file://alpha?token=<path>&<path>]&[file://beta?token=<path>|<path>]",
+      ],
+      [
+        "pipe-separated file sibling",
+        "file://h?x=[file://a?key=/pub&\\Users\\S1\\x]|[file://b?key2=/pub2|\\Users\\S2\\y]",
+        "file://h?x=[file://a?key=<path>&<path>]|[file://b?key2=<path>|<path>]",
+      ],
+      [
+        "comma-separated file sibling",
+        "file://h?x=[file://a?key=/pub&\\Users\\S1\\x],[file://b?key2=/pub2|\\Users\\S2\\y]",
+        "file://h?x=[file://a?key=<path>&<path>],[file://b?key2=<path>|<path>]",
+      ],
+      [
+        "semicolon-separated file sibling",
+        "file://h?x=[file://a?key=/pub&\\Users\\S1\\x];[file://b?key2=/pub2|\\Users\\S2\\y]",
+        "file://h?x=[file://a?key=<path>&<path>];[file://b?key2=<path>|<path>]",
+      ],
+      [
+        "pipe-separated literal sibling",
+        "file://h?x=[file://a?key=/pub]|[value|\\Users\\S2\\y]",
+        "file://h?x=[file://a?key=<path>]|[value|<path>]",
+      ],
+      [
+        "nested child closes before its Windows tail",
+        "file://h?x=[[https://e.test/t|file://host?key=/public]\\Users\\SECRET\\x]",
+        "file://h?x=[[https://e.test/t|file://host?key=<path>]<path>]",
+      ],
+      [
+        "file wrapper closes before its Windows tail",
+        "file://h?x=[file://host?key=/Users/a/private]|\\Users\\SECRET\\x",
+        "file://h?x=[file://host?key=<path>]|<path>",
+      ],
+      [
+        "Bug #1374 item 6 outward handoff",
+        "file://h?x=[[[https://e.test/t|file://host?key=/public]]|\\Users\\SECRET\\x]",
+        "file://h?x=[[[https://e.test/t|file://host?key=<path>]]|<path>]",
+      ],
+      [
+        "later public sibling",
+        "file://h?x=[file://a?key=/pub]&[https://e.test/t|\\Users\\S2\\y]",
+        "file://h?x=[file://a?key=<path>]&[https://e.test/t|<path>]",
+      ],
+      [
+        "later literal sibling",
+        "file://h?x=[file://a?key=/pub]&[value|\\Users\\S2\\y]",
+        "file://h?x=[file://a?key=<path>]&[value|<path>]",
+      ],
+      [
+        "Bug #1374 W1 outward handoff",
+        "file://h?x=[file://host?key=/public]\\Users\\FIRST\\x[https://host?key=/Users/SECOND/secret]",
+        "file://h?x=[file://host?key=<path>]<path>?key=<path>]",
+      ],
+      [
+        "nested post-close tail brackets",
+        "file://h?x=[file://host?key=/public]\\Users\\FIRST\\x[[https://host?key=/Users/SECOND/secret]]",
+        "file://h?x=[file://host?key=<path>]<path>?key=<path>]]",
+      ],
+      [
+        "adjacent public bracket components",
+        "file://h?x=[file://host?key=/public]\\Users\\FIRST\\x[https://host][https://other?key=/Users/SECOND/secret]",
+        "file://h?x=[file://host?key=<path>]<path>?key=<path>]",
+      ],
+      [
+        "adjacent text bracket component",
+        "file://h?x=[file://host?key=/public]\\Users\\FIRST\\x[text][https://other?key=/Users/SECOND/secret]",
+        "file://h?x=[file://host?key=<path>]<path>?key=<path>]",
+      ],
+      [
+        "adjacent empty bracket component",
+        "file://h?x=[file://host?key=/public]\\Users\\FIRST\\x[][https://other?key=/Users/SECOND/secret]",
+        "file://h?x=[file://host?key=<path>]<path>?key=<path>]",
+      ],
+      [
+        "adjacent nested bracket component",
+        "file://h?x=[file://host?key=/public]\\Users\\FIRST\\x[[https://host]][https://other?key=/Users/SECOND/secret]",
+        "file://h?x=[file://host?key=<path>]<path>?key=<path>]",
+      ],
+      [
+        "path-word bridge between bracket components",
+        "file://h?x=[file://host?key=/public]\\Users\\FIRST\\x[https://host]x[https://other?key=/Users/SECOND/secret]",
+        "file://h?x=[file://host?key=<path>]<path>?key=<path>]",
+      ],
+      [
+        "ampersand rooted query value",
+        "file://h?x=[file://host?key=/public]\\Users\\FIRST\\x[https://host][https://other?x=1&/Users/SECOND/secret]",
+        "file://h?x=[file://host?key=<path>]<path>?x=1&<path>]",
+      ],
+      [
+        "fragment rooted query value",
+        "file://h?x=[file://host?key=/public]\\Users\\FIRST\\x[https://host][https://other#/Users/SECOND/secret]",
+        "file://h?x=[file://host?key=<path>]<path>#<path>]",
+      ],
+      [
+        "question rooted query value",
+        "file://h?x=[file://host?key=/public]\\Users\\FIRST\\x[https://host][https://other?/Users/SECOND/secret]",
+        "file://h?x=[file://host?key=<path>]<path>?<path>]",
+      ],
+      [
+        "backslash rooted query value",
+        "file://h?x=[file://host?key=/public]\\Users\\FIRST\\x[https://host?key=\\Users\\SECOND\\secret]",
+        "file://h?x=[file://host?key=<path>]<path>?key=<path>]",
+      ],
+      [
+        "space ends post-close bracket composition",
+        "file://h?x=[file://host?key=/public]\\Users\\FIRST\\x[https://host] [https://other?key=/Users/SECOND/secret]",
+        "file://h?x=[file://host?key=<path>]<path> [https://other?key=/Users/SECOND/secret]",
+      ],
+      [
+        "newline ends post-close bracket composition",
+        "file://h?x=[file://host?key=/public]\\Users\\FIRST\\x[https://host]\n[https://other?key=/Users/SECOND/secret]",
+        "file://h?x=[file://host?key=<path>]<path>\n[https://other?key=/Users/SECOND/secret]",
+      ],
+      [
+        "whitespace-separated prose control",
+        "file://h?x=[file://host?key=/public] later/thing",
+        "file://h?x=[file://host?key=<path>] later/thing",
+      ],
+      [
+        "whitespace-separated public URL control",
+        "file://h?x=[file://host?key=/public] https://p.test/x",
+        "file://h?x=[file://host?key=<path>] https://p.test/x",
+      ],
+      [
+        "ordinary relative post-close control",
+        "file://h?x=[file://host?key=/public]later/thing",
+        "file://h?x=[file://host?key=<path>]later/thing",
+      ],
+    ] as const)("%s", (_name, input, expected) => {
+      const first = sanitizeError(input);
+
+      expect(first).toBe(expected);
+      expect(sanitizeError(first)).toBe(first);
+      expect(sanitizeError(sanitizeError(first))).toBe(first);
+    });
+  });
+
+  describe("Bug #1374", () => {
+    it.each([
+      [
+        "item 1 single-quoted public child",
+        "file://h?x=['https://e.test/t'name=\\Users\\SECRET\\x",
+        "file://h?x=['https://e.test/t'name=<path>",
+      ],
+      [
+        "item 2 double-quoted public child",
+        'file://h?x=["https://e.test/t"name=\\Users\\SECRET\\x',
+        'file://h?x=["https://e.test/t"name=<path>',
+      ],
+      [
+        "item 3 nested-file suspension control",
+        "file://h?x=[[[https://e.test/t|file://host?key=/public]]|name=\\Users\\SECRET\\x]",
+        "file://h?x=[[[https://e.test/t|file://host?key=<path>]]|name=<path>]",
+      ],
+      [
+        "item 4 later public URL control",
+        "file://h?x=[value|https://e.test/t|name=\\Users\\SECRET\\x]",
+        "file://h?x=[value|https://e.test/t|name=<path>]",
+      ],
+      [
+        "item 5a opaque scheme privacy decision",
+        "file://h?x=[mailto:a@b|name=\\Users\\SECRET\\x]",
+        "file://h?x=[mailto:a@b|name=<path>]",
+      ],
+      [
+        "item 5b single-slash file scheme",
+        "file://h?x=[file:/x|name=\\Users\\SECRET\\x]",
+        "file://h?x=[file:<path>|name=<path>]",
+      ],
+      [
+        "item 6 outward handoff",
+        "file://h?x=[[[https://e.test/t|file://host?key=/public]]|\\Users\\SECRET\\x]",
+        "file://h?x=[[[https://e.test/t|file://host?key=<path>]]|<path>]",
+      ],
+      [
+        "item 7 Windows path",
+        "C:\\tmp\\private[https://public.test/x]secret.db",
+        "<path>",
+      ],
+      [
+        "item 7 POSIX path",
+        "/tmp/private[https://public.test/x]secret.db",
+        "<path>",
+      ],
+      [
+        "item 7 prose path",
+        "error C:\\tmp\\private[https://public.test/x]secret.db failed",
+        "error <path> failed",
+      ],
+      [
+        "item 8 drive wrapper",
+        "file://h?x=[C:\\Users\\SECRET\\x|name=\\Users\\SECRET\\y]",
+        "file://h?x=[<path>|name=<path>]",
+      ],
+      [
+        "W1 bracketed URL after file tail",
+        "file://h?x=[file://host?key=/public]\\Users\\FIRST\\x[https://host?key=/Users/SECOND/secret]",
+        "file://h?x=[file://host?key=<path>]<path>?key=<path>]",
+      ],
+      [
+        "W2 query-only child boundary",
+        "file://h?x=[file://host?key=/public&'https://e.test/t'&later/Users/secret]",
+        "file://h?x=[file://host?key=<path>&'https://e.test/t'&later/Users/secret]",
+      ],
+    ] as const)("%s", (_name, input, expected) => {
+      const first = sanitizeError(input);
+
+      expect(first).toBe(expected);
+      expect(sanitizeError(first)).toBe(first);
+      expect(sanitizeError(sanitizeError(first))).toBe(first);
+    });
+  });
+
+  describe("Bug #917", () => {
+    const matrix: Array<readonly [string, string, string]> = (["'", '"'] as const).flatMap(
+      (quote) =>
+        (["?", "#", "&"] as const).flatMap((delimiter) =>
+          (["", "?keep=1", "#frag", "&other=1"] as const).map((suffix) => [
+            `${quote} outer quote, ${delimiter} delimiter, ${suffix || "no suffix"}`,
+            `${quote}https://outer.test/x${delimiter}next=file://host.invalid/Users/canary/My Files/private.db${suffix}${quote} trailing text`,
+            `${quote}https://outer.test/x${delimiter}next=file://host.invalid<path>${quote} trailing text`,
+          ] as const),
+        ),
+    );
+    matrix.push(
+      [
+        "unquoted residual",
+        "https://outer.test/x?next=file://host.invalid/Users/canary/My Files/private.db",
+        "https://outer.test/x?next=file://host.invalid<path> Files/private.db",
+      ],
+      [
+        "quote does not open an embedded URL",
+        "error 'see https://outer.test/x?next=file://host.invalid/Users/canary/My Files/private.db' end",
+        "error 'see https://outer.test/x?next=file://host.invalid<path> Files/private.db' end",
+      ],
+      [
+        "immediately quoted nested file child",
+        "https://outer.test/x?next='file://host.invalid/Users/canary/My Files/private.db'",
+        "https://outer.test/x?next='file://host.invalid<path>'",
+      ],
+      [
+        "unmatched outer quote residual",
+        "'https://outer.test/x?next=file://host.invalid/Users/canary/My Files/private.db",
+        "'https://outer.test/x?next=file://host.invalid<path> Files/private.db",
+      ],
+      [
+        "newline terminates inherited quoting",
+        "'https://outer.test/x?next=file://host.invalid/Users/canary/My\nFiles/private.db'",
+        "'https://outer.test/x?next=file://host.invalid<path>\nFiles/private.db'",
+      ],
+      [
+        "outer-quoted public URL without file child",
+        "'https://outer.test/x?next=https://public.test/path'",
+        "'https://outer.test/x?next=https://public.test/path'",
+      ],
+      [
+        "outer-quoted file URL control",
+        "'file://host.invalid/Users/canary/My Files/private.db'",
+        "'file://host.invalid<path>'",
+      ],
+      [
+        "multiple nested children share one quote boundary",
+        "'https://outer.test/x?k0=file://host/Users/u/MyFiles/0.db&k1=file://host/Users/u/MyFiles/1.db'",
+        "'https://outer.test/x?k0=file://host<path>'",
+      ],
+    );
+
+    it.each(matrix)("%s", (_name, input, expected) => {
+      const first = sanitizeError(input);
+
+      expect(first).toBe(expected);
+      expect(sanitizeError(first)).toBe(first);
+      expect(sanitizeError(sanitizeError(first))).toBe(first);
+    });
+  });
+
+  it("preserves the Bug #1336 root anchor after the pipe-handoff fix", () => {
     const input =
       "file://h?x=[https://e.test/t&/Users/a/one&file:///Users/b/two&relative/path]";
     const expected =
-      "file://h?x=[https://e.test/t&<path>&file://<path>&relative<path>]";
+      "file://h?x=[https://e.test/t&<path>&file://<path>&relative/path]";
     const first = sanitizeError(input);
 
     expect(first).toBe(expected);
@@ -3899,14 +4484,14 @@ describe("sanitizeError", () => {
     [
       "ampersand nested child",
       "file://h?x=[[https://e.test/t&file://host?key=/public]\\Users\\SECRET\\x]",
-      "file://h?x=[[https://e.test/t&file://host?key=<path>]\\Users\\SECRET\\x]",
+      "file://h?x=[[https://e.test/t&file://host?key=<path>]<path>]",
     ],
     [
       "pipe nested child",
       "file://h?x=[[https://e.test/t|file://host?key=/public]\\Users\\SECRET\\x]",
-      "file://h?x=[[https://e.test/t|file://host?key=<path>]\\Users\\SECRET\\x]",
+      "file://h?x=[[https://e.test/t|file://host?key=<path>]<path>]",
     ],
-  ] as const)("keeps the query-only nested-file handoff scoped inside its own bracket for %s", (_name, input, expected) => {
+  ] as const)("pins the Bug #1346 query-only nested-file handoff after its bracket for %s", (_name, input, expected) => {
     const first = sanitizeError(input);
 
     expect(first).toBe(expected);

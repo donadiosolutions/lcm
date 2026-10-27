@@ -486,6 +486,10 @@ component_management:
         - "^src/storage/diagnostic-renderer\\.ts$"
         - "^src/storage/diagnostic-project\\.ts$"
         - "^src/storage/postgresql/diagnostics\\.ts$"
+        - "^src/storage/postgresql/query-operations\\.ts$"
+        - "^src/storage/postgresql/query-statistics\\.ts$"
+        - "^src/storage/runtime-health\\.ts$"
+        - "^src/storage/postgresql/runtime-health\\.ts$"
         # #997 keeps doctor publication retry deadlines monotonic in this owner.
         # #619 keeps observational doctor refusal guidance in this owner.
         - "src/doctor/"

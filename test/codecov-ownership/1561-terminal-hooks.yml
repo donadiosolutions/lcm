@@ -1,0 +1,32 @@
+references: ["#1561"]
+rationale: >-
+  Codex Interrupt and SessionEnd hooks save the transcript within the three
+  second terminal budget. Four production files are added in directories that
+  already have an owner and keep it: src/cli/terminal-deadline.ts and
+  src/cli/terminal-stdin.ts (the budget arithmetic and the bounded stdin
+  reader) stay with the CLI owner, src/hooks/terminal-snapshot.ts (the
+  terminal handler and command entry) stays with the hooks owner, and
+  src/daemon/routes/ingest-terminal.ts (the POST /ingest/terminal queue) stays
+  with the daemon routes owner. The following existing files are materially
+  changed and keep their established owners: bin/lcm.ts and src/cli-help.ts
+  (hidden --terminal option and help text), src/bootstrap.ts (read-only
+  endpoint verifier), src/daemon/lifecycle.ts (read-only running-daemon
+  verification), src/daemon/server.ts (enqueue-only route mode, terminal
+  queue, idle deferral and shutdown drain), src/daemon/http-url.ts (the new
+  route in the allowlist), src/connectors/codex-hooks.ts (Interrupt and
+  SessionEnd registration) and src/hooks/dispatch.ts (terminal branch). No
+  file is removed, moved or re-owned.
+pins:
+  - ["src/cli/terminal-deadline.ts", "unit-cli"]
+  - ["src/cli/terminal-stdin.ts", "unit-cli"]
+  - ["src/hooks/terminal-snapshot.ts", "unit-hooks"]
+  - ["src/daemon/routes/ingest-terminal.ts", "unit-daemon-routes"]
+  - ["bin/lcm.ts", "unit-cli"]
+  - ["src/cli-help.ts", "unit-cli"]
+  - ["src/bootstrap.ts", "unit-installation"]
+  - ["src/daemon/lifecycle.ts", "integration-service-managers"]
+  - ["src/daemon/server.ts", "unit-daemon-core"]
+  - ["src/daemon/http-url.ts", "unit-daemon-core"]
+  - ["src/connectors/codex-hooks.ts", "unit-connectors"]
+  - ["src/hooks/dispatch.ts", "unit-hooks"]
+

@@ -1347,4 +1347,53 @@ describe("handleUserPromptSubmit", () => {
       rmSync(home, { recursive: true, force: true });
     }
   });
+
+  describe("Codex subagent scope", () => {
+    const event = { type: "decision", category: "decision", data: "choice", priority: 1 };
+    const payload = {
+      client: "codex", session_id: "tree-root", agent_id: "child-thread", agent_type: "worker",
+      cwd: "/proj", prompt: "implement the parser",
+    };
+
+    it("searches under the child key and never extracts the parent-authored prompt", async () => {
+      const append = vi.spyOn(localEnqueue, "appendLocalHookEvents");
+      mockExtractUserPromptEvents.mockReturnValue([event]);
+      mockEnsureDaemon.mockReset().mockResolvedValue({ connected: true, port: 3737, spawned: false });
+      const fence = vi.spyOn(publicationFence, "assertHookPublicationFence").mockImplementation(() => {});
+      const client = { post: vi.fn().mockResolvedValue({ hints: ["parser decision"], ids: ["id-1"] }) };
+      try {
+        const result = await handleUserPromptSubmit(JSON.stringify(payload), asDaemonClient(client), 3737, { backend: "sqlite" });
+        expect(result.stdout).toContain("parser decision");
+        expect(client.post).toHaveBeenCalledWith("/prompt-search", expect.objectContaining({ session_id: "child-thread" }));
+        expect(mockExtractUserPromptEvents).not.toHaveBeenCalled();
+        expect(append).not.toHaveBeenCalled();
+        expect(firePromoteEventsNotifyRequest).not.toHaveBeenCalled();
+      } finally {
+        append.mockRestore();
+        fence.mockRestore();
+      }
+    });
+
+    it.each([
+      ["a malformed agent_id", { agent_id: 3 }],
+      ["a non-Codex client", { client: "claude" }],
+    ])("keeps the root behavior for %s", async (_name, override) => {
+      const append = vi.spyOn(localEnqueue, "appendLocalHookEvents")
+        .mockResolvedValue({ inserted: 1, pendingCount: 1 });
+      mockExtractUserPromptEvents.mockReturnValue([event]);
+      mockEnsureDaemon.mockReset().mockResolvedValue({ connected: true, port: 3737, spawned: false });
+      const repair = vi.spyOn(autoHeal, "validateAndFixHooks").mockImplementation(() => {});
+      const fence = vi.spyOn(publicationFence, "assertHookPublicationFence").mockImplementation(() => {});
+      const client = { post: vi.fn().mockResolvedValue({ hints: [] }) };
+      try {
+        await handleUserPromptSubmit(JSON.stringify({ ...payload, ...override }), asDaemonClient(client), 3737, { backend: "sqlite" });
+        expect(append).toHaveBeenCalledWith(expect.objectContaining({ sessionId: "tree-root" }));
+        expect(client.post).toHaveBeenCalledWith("/prompt-search", expect.objectContaining({ session_id: "tree-root" }));
+      } finally {
+        append.mockRestore();
+        repair.mockRestore();
+        fence.mockRestore();
+      }
+    });
+  });
 });

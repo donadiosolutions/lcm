@@ -1,0 +1,8 @@
+references: ["#1672"]
+rationale: >-
+  #1672 namespaces unsanctioned role names in the PostgreSQL readiness ACL
+  identity so a role named like a sentinel cannot collide with a sanctioned
+  grant. The change stays inside the existing readiness verifier; no
+  production file is added, removed, moved, or re-owned.
+pins:
+  - ["src/storage/postgresql/runtime-readiness.ts", "integration-postgresql-schema"]

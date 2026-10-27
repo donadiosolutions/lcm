@@ -448,9 +448,9 @@ describe("PostgreSQL migration runner", () => {
   it("registers the durable transfer ledger in the latest schema", () => {
     const latest = loadPostgreSqlSchemaSnapshots().at(-1)!;
     expect(loadPostgreSqlMigrations().at(-1)?.id).toBe(
-      "0008_transfer_identity_content_digest",
+      "0009_conversation_parent_session",
     );
-    expect(latest.migrationId).toBe("0008_transfer_identity_content_digest");
+    expect(latest.migrationId).toBe("0009_conversation_parent_session");
     expect(latest.tableIdentities).toEqual(expect.arrayContaining([
       "transfer_runs", "transfer_batches", "transfer_identities",
     ]));
@@ -467,6 +467,8 @@ describe("PostgreSQL migration runner", () => {
     expect(latest.columnAclIdentities).toContain(
       "transfer_identities|content_sha256",
     );
+    expect(latest.ordinaryColumnIdentities).toContain("conversations|parent_session_id");
+    expect(latest.columnAclIdentities).toContain("conversations|parent_session_id");
     expect(latest.constraintIdentities).toContain(
       "transfer_identities|transfer_identities_content_sha256_check",
     );
@@ -486,6 +488,7 @@ describe("PostgreSQL migration runner", () => {
       expect.objectContaining({ id: "0006_transfer_ledger", sha256: "81fed3ac0a6059b6e2a536647a5ab5d8673322b7ba5804a60b068b927367983a" }),
       expect.objectContaining({ id: "0007_promoted_content_digest", sha256: "13d5c5ced7aacb2ac8f474ba63d576541d24d9907f69015c6cefa053b7cf0dd7" }),
       expect.objectContaining({ id: "0008_transfer_identity_content_digest", sha256: "e9510bb6099da4c17d162a96e122466ea0cd77f789b608e72fa1f55da40b70ed" }),
+      expect.objectContaining({ id: "0009_conversation_parent_session", sha256: "d76fbb489042f20f5568a798ab27416027100337d19faacf5caac60b01bd27fe" }),
     ]);
     expect(migrations[1]?.sql).toContain(
       "fencing_token bigint GENERATED ALWAYS AS IDENTITY CHECK (fencing_token > 0)",
@@ -556,20 +559,20 @@ describe("PostgreSQL migration runner", () => {
     const snapshot = snapshots.at(-1)!;
 
     expect(getPostgreSqlSchemaSnapshotExpectations(snapshot)).toMatchObject({
-      definitionGroupCounts: [101, 4, 205, 16, 255, 6, 27, 33, 239, 0],
+      definitionGroupCounts: [101, 4, 205, 16, 256, 6, 27, 33, 240, 0],
       definitionGroupHashes: [
         "0f99600ba91811264e144a2cf345fbfb3dc82b325242509d9c6ec88ca21580ca",
         "ab34552f4ae69dbd972264066f812027f0bdb0d4494f39a909d5c3c1e141484e",
         "2e29a37acde9192250ca6a420d2d7c616a9065c5348088123745e7b6062e9666",
         "94e52664f5fc04804494538ef5215268d80f566cdc25a96b24df67c227ea350c",
-        "4980050969204ada518b468dad130d6cb29e8f3446106fd12bc59ed29b9c4bc7",
+        "4dec4f4ffbaf0f9b7f4b2f0aef0830a34178a06b9caaee394052e25b603de007",
         "907a4bbb955d22d4ed88199acd38dc27e5095a0b943d51480f82a50464367702",
         "78d9632759ec8ca03727808dee165201a47ee4ee8e85cff082c8a3f8f182d628",
         "57f9a963c63a46cbd310f8cc683524b2e710797924c3cb3bf935f5d9bb13afe4",
-        "b48d870fa8471eefd460b705db71642f1d8db8479cdaaa3ad2dd227e4e1b01a6",
+        "24e48f73df39c742629e4f6e79534fb81f3fdf101ecaf3ee22d3617edbecd8d5",
         "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
       ],
-      definitionObjectCount: 886,
+      definitionObjectCount: 888,
     });
     expect(snapshot.indexNames).toHaveLength(101);
     expect(snapshot.indexNames).toContain("session_ingest_log_pkey");
@@ -629,6 +632,11 @@ describe("PostgreSQL migration runner", () => {
       },
       {
         migrationId: "0008_transfer_identity_content_digest",
+        constraintSha256: "2e29a37acde9192250ca6a420d2d7c616a9065c5348088123745e7b6062e9666",
+        tableSha256: "78d9632759ec8ca03727808dee165201a47ee4ee8e85cff082c8a3f8f182d628",
+      },
+      {
+        migrationId: "0009_conversation_parent_session",
         constraintSha256: "2e29a37acde9192250ca6a420d2d7c616a9065c5348088123745e7b6062e9666",
         tableSha256: "78d9632759ec8ca03727808dee165201a47ee4ee8e85cff082c8a3f8f182d628",
       },
@@ -710,6 +718,7 @@ describe("PostgreSQL migration runner", () => {
           "0006_transfer_ledger",
           "0007_promoted_content_digest",
           "0008_transfer_identity_content_digest",
+          "0009_conversation_parent_session",
         ],
         current: [
           "0001_migration_ledger",
@@ -720,6 +729,7 @@ describe("PostgreSQL migration runner", () => {
           "0006_transfer_ledger",
           "0007_promoted_content_digest",
           "0008_transfer_identity_content_digest",
+          "0009_conversation_parent_session",
         ],
       });
     expect(fake.operations).toEqual(expect.arrayContaining([
@@ -1987,7 +1997,7 @@ describe("migration asset read contract", () => {
   it("passes adjacent resource URLs through the injected native read seam", () => {
     const read = vi.fn(readFileSync);
     const migrations = loadPostgreSqlMigrations(read);
-    expect(migrations).toHaveLength(8);
+    expect(migrations).toHaveLength(9);
     for (const [index, migration] of migrations.entries()) {
       const [resource, encoding] = read.mock.calls[index];
       expect(resource).toBeInstanceOf(URL);

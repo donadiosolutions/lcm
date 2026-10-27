@@ -1,4 +1,4 @@
-import { mkdtempSync, rmSync, mkdirSync } from "node:fs";
+import { mkdtempSync, rmSync, mkdirSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join, dirname } from "node:path";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
@@ -9,6 +9,8 @@ import { runLcmMigrations } from "../../../src/db/migration.js";
 import { PromotedStore } from "../../../src/db/promoted.js";
 import { projectDbPath } from "../../../src/daemon/project.js";
 import { closeLcmConnection, getLcmConnection } from "../../../src/db/connection.js";
+import { buildPreToolRecallQuery, handlePreToolUse } from "../../../src/hooks/pre-tool.js";
+import { configPath, lcmHomeDir } from "../../../src/runtime-paths.js";
 
 const tempDirs: string[] = [];
 
@@ -576,9 +578,12 @@ describe("POST /prompt-search", () => {
     const db = new DatabaseSync(dbPath);
     runLcmMigrations(db);
     const store = new PromotedStore(db);
-    const firstId = store.insert({ content: "Use Bun scripts for local automation and CI wrappers", tags: ["workflow"], projectId: "p1" });
-    const secondId = store.insert({ content: "Use Bun scripts for local automation and CI wrappers with small wrappers", tags: ["workflow"], projectId: "p1" });
-    const thirdId = store.insert({ content: "Bun scripts wrap local automation and CI tasks", tags: ["workflow"], projectId: "p1" });
+    // Identical timestamps plus descending confidence make confidence the deterministic tie-breaker, so firstId always outranks secondId.
+    const firstId = store.insert({ content: "Use Bun scripts for local automation and CI wrappers", tags: ["workflow"], projectId: "p1", confidence: 0.9 });
+    const secondId = store.insert({ content: "Use Bun scripts for local automation and CI wrappers with small wrappers", tags: ["workflow"], projectId: "p1", confidence: 0.8 });
+    const thirdId = store.insert({ content: "Bun scripts wrap local automation and CI tasks", tags: ["workflow"], projectId: "p1", confidence: 0.7 });
+    const createdAt = new Date().toISOString().slice(0, 19).replace("T", " ");
+    db.prepare("UPDATE promoted SET created_at = ? WHERE id IN (?, ?, ?)").run(createdAt, firstId, secondId, thirdId);
     db.close();
 
     const config = loadDaemonConfig("/nonexistent");
@@ -833,5 +838,392 @@ describe("stale memory demotion", () => {
     } finally {
       await daemon.stop();
     }
+  });
+});
+
+
+describe("POST /prompt-search recallMode pre-tool", () => {
+  type Hit = { hints: string[]; ids: string[]; debug?: { candidates: Array<{ id: string; cooledDown: boolean; surfacingCount: number; matchedTermCount: number; queryTermCount: number; finalScore: number }> } };
+
+  function seed(
+    tempDir: string,
+    memories: Array<{
+      content: string;
+      sessionId?: string;
+      surfaced?: boolean;
+      tags?: string[];
+      surfacings?: number;
+      ageDays?: number;
+    }>,
+  ): string[] {
+    const dbPath = projectDbPath(tempDir);
+    mkdirSync(dirname(dbPath), { recursive: true });
+    const db = new DatabaseSync(dbPath);
+    try {
+      runLcmMigrations(db);
+      const store = new PromotedStore(db);
+      return memories.map((memory) => {
+        const id = store.insert({
+          content: memory.content,
+          tags: memory.tags ?? ["decision"],
+          projectId: "p1",
+          ...(memory.sessionId === undefined ? {} : { sessionId: memory.sessionId }),
+        });
+        if (memory.ageDays !== undefined) {
+          db.prepare("UPDATE promoted SET created_at = ? WHERE id = ?")
+            .run(new Date(Date.now() - memory.ageDays * 86_400_000).toISOString(), id);
+        }
+        for (let count = 0; count < (memory.surfacings ?? 0); count += 1) {
+          db.prepare("INSERT INTO recall_surfacing (memory_id, session_id) VALUES (?, ?)").run(id, "sess-earlier");
+        }
+        if (memory.surfaced) {
+          db.prepare("INSERT INTO recall_surfacing (memory_id, session_id) VALUES (?, ?)").run(id, "sess-earlier");
+        }
+        return id;
+      });
+    } finally {
+      db.close();
+    }
+  }
+
+  async function post(port: number, body: Record<string, unknown>): Promise<Hit> {
+    const res = await fetch("http://127.0.0.1:" + port + "/prompt-search", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(body),
+    });
+    expect(res.status).toBe(200);
+    return await res.json() as Hit;
+  }
+
+  function surfacingRows(tempDir: string): Array<{ memory_id: string; session_id: string }> {
+    const db = new DatabaseSync(projectDbPath(tempDir));
+    try {
+      return db.prepare("SELECT memory_id, session_id FROM recall_surfacing ORDER BY id").all() as Array<{ memory_id: string; session_id: string }>;
+    } finally {
+      db.close();
+    }
+  }
+
+  function tempProject(label: string): string {
+    const tempDir = mkdtempSync(join(tmpdir(), "lcm-prompt-search-" + label + "-"));
+    tempDirs.push(tempDir);
+    return tempDir;
+  }
+
+  it("applies the strict pre-tool policy only for the exact recallMode value", async () => {
+    const tempDir = tempProject("pretool-mode");
+    const [firstId] = seed(tempDir, [
+      { content: "TypeScript build convention", surfaced: true },
+      { content: "TypeScript build convention", surfaced: true },
+    ]);
+    const config = loadDaemonConfig("/nonexistent");
+    config.daemon.port = 0;
+    config.restoration.surfacingCooldownWindow = 24;
+    config.restoration.resurfaceMargin = 10;
+    const daemon = await createDaemon(config);
+    const port = daemon.address().port;
+
+    try {
+      const base = { query: "TypeScript build convention", cwd: tempDir, logSurfacing: false };
+      // Prompt recall falls back to the best cooled candidate.
+      for (const recallMode of [undefined, "prompt", "Pre-Tool", "pre-tool ", 1, null, true]) {
+        const prompt = await post(port, { ...base, recallMode });
+        expect(prompt.ids, String(recallMode)).toEqual([firstId]);
+      }
+      const preTool = await post(port, { ...base, recallMode: "pre-tool" });
+      expect(preTool.ids).toEqual([]);
+      expect(preTool.hints).toEqual([]);
+    } finally {
+      await daemon.stop();
+    }
+  });
+
+  it("excludes a cooled-down memory even when it ties a fresh one and the margin is zero", async () => {
+    const tempDir = tempProject("pretool-tie");
+    const [cooledId, freshId] = seed(tempDir, [
+      { content: "TypeScript build convention alpha", surfaced: true },
+      { content: "TypeScript build convention bravo" },
+    ]);
+    const config = loadDaemonConfig("/nonexistent");
+    config.daemon.port = 0;
+    config.restoration.surfacingCooldownWindow = 24;
+    config.restoration.resurfaceMargin = 0;
+    config.restoration.unusedSurfacingPenalty = 0;
+    config.restoration.recencyHalfLifeHours = 1e9;
+    const daemon = await createDaemon(config);
+    const port = daemon.address().port;
+
+    try {
+      const base = { query: "TypeScript build convention", cwd: tempDir, logSurfacing: false };
+      expect((await post(port, base)).ids.sort()).toEqual([cooledId, freshId].sort());
+      expect((await post(port, { ...base, recallMode: "pre-tool" })).ids).toEqual([freshId]);
+    } finally {
+      await daemon.stop();
+    }
+  });
+
+  it("caps pre-tool results and emitted items at two without changing prompt recall", async () => {
+    const tempDir = tempProject("pretool-cap");
+    seed(tempDir, [
+      { content: "Alpha release checklist pnpm postgresql" },
+      { content: "Bravo migration notes pnpm postgresql" },
+      { content: "Charlie rollback runbook pnpm postgresql" },
+    ]);
+    const config = loadDaemonConfig("/nonexistent");
+    config.daemon.port = 0;
+    config.restoration.promptSearchMinScore = 0;
+    config.restoration.promptSearchMaxResults = 5;
+    config.restoration.maxInjectedMemoryItems = 5;
+    config.restoration.maxInjectedMemoryBytes = 8192;
+    const daemon = await createDaemon(config);
+    const port = daemon.address().port;
+
+    try {
+      const base = { query: "pnpm postgresql", cwd: tempDir, session_id: "sess-cap" };
+      expect((await post(port, { ...base, logSurfacing: false })).ids).toHaveLength(3);
+      const preTool = await post(port, { ...base, recallMode: "pre-tool" });
+      expect(preTool.ids).toHaveLength(2);
+      expect(preTool.hints).toHaveLength(2);
+      // Surfacing stays shared with prompt recall.
+      expect(surfacingRows(tempDir)).toEqual(preTool.ids.map((memory_id) => ({ memory_id, session_id: "sess-cap" })));
+    } finally {
+      await daemon.stop();
+    }
+  });
+
+  it("honors a smaller configured result limit in pre-tool mode", async () => {
+    const tempDir = tempProject("pretool-small");
+    seed(tempDir, [
+      { content: "Alpha release checklist pnpm postgresql" },
+      { content: "Bravo migration notes pnpm postgresql" },
+    ]);
+    const config = loadDaemonConfig("/nonexistent");
+    config.daemon.port = 0;
+    config.restoration.promptSearchMinScore = 0;
+    config.restoration.promptSearchMaxResults = 1;
+    const daemon = await createDaemon(config);
+    const port = daemon.address().port;
+
+    try {
+      const preTool = await post(port, { query: "pnpm postgresql", cwd: tempDir, recallMode: "pre-tool" });
+      expect(preTool.ids).toHaveLength(1);
+    } finally {
+      await daemon.stop();
+    }
+  });
+
+  it("relaxes the minimum score by 0.5 in pre-tool mode only and never below zero", async () => {
+    const tempDir = tempProject("pretool-minscore");
+    const [memoryId] = seed(tempDir, [{ content: "Run pnpm postgresql tests through the rootless podman socket" }]);
+    const base = { query: "pnpm postgresql", cwd: tempDir, logSurfacing: false };
+    const probe = async (minScore: number): Promise<{ prompt: string[]; preTool: string[] }> => {
+      const config = loadDaemonConfig("/nonexistent");
+      config.daemon.port = 0;
+      config.restoration.promptSearchMinScore = minScore;
+      const daemon = await createDaemon(config);
+      try {
+        const port = daemon.address().port;
+        return {
+          prompt: (await post(port, base)).ids,
+          preTool: (await post(port, { ...base, recallMode: "pre-tool" })).ids,
+        };
+      } finally {
+        await daemon.stop();
+      }
+    };
+
+    // A full two-term match scores just under 2.
+    expect(await probe(2)).toEqual({ prompt: [], preTool: [memoryId] });
+    expect(await probe(4)).toEqual({ prompt: [], preTool: [] });
+    expect(await probe(0.25)).toEqual({ prompt: [memoryId], preTool: [memoryId] });
+  });
+
+  it("grants the pre-tool relief only to complete query matches", async () => {
+    const tempDir = tempProject("pretool-partial");
+    const sessionId = "same";
+    const [memoryId] = seed(tempDir, [{ content: "git rebasing adventures with quokkas", sessionId }]);
+    // Four recorded uses lift a one-of-two-term match to about 1.6 (1.5 < score < 2).
+    const used = Array.from({ length: 4 }, (_unused, index) => ({
+      content: "Acted on memory number " + index,
+      tags: ["signal:memory_used", "memory_id:" + memoryId],
+    }));
+    seed(tempDir, used);
+    const query = buildPreToolRecallQuery("Bash", { command: "git status" });
+    expect(query).toBe("git status");
+    const config = loadDaemonConfig("/nonexistent");
+    config.daemon.port = 0;
+    const daemon = await createDaemon(config);
+    const port = daemon.address().port;
+
+    try {
+      const base = { query: query!, cwd: tempDir, session_id: sessionId, debug: true, logSurfacing: false };
+      const preTool = await post(port, { ...base, recallMode: "pre-tool" });
+      const candidate = preTool.debug!.candidates
+        .find((entry) => entry.id === memoryId)!;
+      expect(candidate.matchedTermCount).toBe(1);
+      expect(candidate.queryTermCount).toBe(2);
+      expect(candidate.finalScore).toBeGreaterThan(1.5);
+      expect(candidate.finalScore).toBeLessThan(2);
+      expect(preTool.ids).toEqual([]);
+      expect((await post(port, base)).ids).toEqual([]);
+    } finally {
+      await daemon.stop();
+    }
+  });
+
+  it("does not let the relief admit a stale full match clamped to a zero score", async () => {
+    const tempDir = tempProject("pretool-stale");
+    const [memoryId] = seed(tempDir, [{
+      content: "Run pnpm postgresql tests through the rootless podman socket",
+      ageDays: 200,
+      surfacings: 5,
+    }]);
+    const config = loadDaemonConfig("/nonexistent");
+    config.daemon.port = 0;
+    config.restoration.promptSearchMinScore = 0.5;
+    config.restoration.allowStaleOnStrongMatch = false;
+    config.restoration.surfacingCooldownWindow = 0;
+    config.restoration.unusedSurfacingPenalty = 0;
+    config.restoration.stalePenalty = 0;
+    config.restoration.recencyHalfLifeHours = 1e9;
+    const daemon = await createDaemon(config);
+    const port = daemon.address().port;
+
+    try {
+      const base = { query: "pnpm postgresql", cwd: tempDir, debug: true, logSurfacing: false };
+      for (const recallMode of [undefined, "pre-tool"]) {
+        const result = await post(port, { ...base, recallMode });
+        const candidate = result.debug!.candidates
+          .find((entry) => entry.id === memoryId)!;
+        expect(candidate.matchedTermCount).toBe(2);
+        expect(candidate.finalScore).toBe(0);
+        expect(result.ids, String(recallMode)).toEqual([]);
+      }
+    } finally {
+      await daemon.stop();
+    }
+  });
+
+  describe("end to end through the real hook handler", () => {
+    const sessionId = "root-thread";
+    const unrelated = "run test src index main docs build dist file";
+
+    afterEach(() => {
+      rmSync(configPath(), { force: true });
+    });
+
+    async function withDaemon(
+      tempDir: string,
+      adjust: (config: ReturnType<typeof loadDaemonConfig>) => void,
+      body: (run: (toolName: string, toolInput: unknown) => Promise<string>, port: number) => Promise<void>,
+    ): Promise<void> {
+      const config = loadDaemonConfig("/nonexistent");
+      config.daemon.port = 0;
+      adjust(config);
+      const daemon = await createDaemon(config);
+      const port = daemon.address().port;
+      mkdirSync(lcmHomeDir(), { recursive: true, mode: 0o700 });
+      writeFileSync(configPath(), JSON.stringify({ daemon: { port }, hooks: { preToolRecall: true } }), { mode: 0o600 });
+      try {
+        await body(async (toolName, toolInput) => {
+          const result = await handlePreToolUse(JSON.stringify({
+            session_id: sessionId,
+            cwd: tempDir,
+            hook_event_name: "PreToolUse",
+            tool_name: toolName,
+            tool_input: toolInput,
+          }));
+          expect(result.exitCode).toBe(0);
+          return result.stdout;
+        }, port);
+      } finally {
+        await daemon.stop();
+      }
+    }
+
+    const contextOf = (stdout: string): string => (
+      JSON.parse(stdout) as { hookSpecificOutput: { additionalContext: string } }
+    ).hookSpecificOutput.additionalContext;
+
+    it("surfaces action-specific memories once and suppresses repeats, without generic distractors", async () => {
+      const tempDir = tempProject("pretool-e2e");
+      const [podmanId, fileId, prId, distractorId] = seed(tempDir, [
+        { content: "Run pnpm postgresql tests through the rootless podman socket, not Docker", sessionId },
+        { content: "codex-hooks.ts in src/connectors must keep the PostToolUse registration stable" },
+        { content: "GitHub create pull request titles follow conventional commits" },
+        { content: unrelated, sessionId },
+      ]);
+
+      await withDaemon(tempDir, () => undefined, async (run, port) => {
+        expect(buildPreToolRecallQuery("Bash", { command: "pnpm run test:postgresql" })).toBe("pnpm postgresql");
+        const bash = await run("Bash", { command: "pnpm run test:postgresql" });
+        expect(contextOf(bash)).toContain("shell command");
+        expect(contextOf(bash)).toContain("rootless podman socket");
+        expect(contextOf(bash)).toContain("surfaced-memory-ids: " + podmanId);
+        expect(contextOf(bash)).not.toContain(unrelated);
+
+        const patch = await run("apply_patch", {
+          command: "*** Begin Patch\n*** Update File: src/connectors/codex-hooks.ts\n@@\n-old\n+SECRETBODY\n*** End Patch",
+        });
+        expect(contextOf(patch)).toContain("file edit");
+        expect(contextOf(patch)).toContain("PostToolUse registration");
+        expect(contextOf(patch)).toContain(fileId);
+        expect(contextOf(patch)).not.toContain(unrelated);
+
+        const mcp = await run("mcp__github__create_pull_request", { title: "SECRETTITLE" });
+        expect(contextOf(mcp)).toContain("MCP tool");
+        expect(contextOf(mcp)).toContain("conventional commits");
+        expect(contextOf(mcp)).toContain(prId);
+
+        // Sequential repetition is suppressed by the shared cooldown.
+        expect(await run("Bash", { command: "pnpm run test:postgresql" })).toBe("");
+        expect(await run("apply_patch", {
+          command: "*** Update File: src/connectors/codex-hooks.ts",
+        })).toBe("");
+        expect(await run("mcp__github__create_pull_request", {})).toBe("");
+        expect(surfacingRows(tempDir).map((row) => row.memory_id)).toEqual([podmanId, fileId, prId]);
+        expect(surfacingRows(tempDir).map((row) => row.memory_id)).not.toContain(distractorId);
+
+        // Prompt recall afterwards sees the cooldown and unused-surfacing effect.
+        const later = await post(port, {
+          query: "pnpm postgresql podman socket",
+          cwd: tempDir,
+          session_id: sessionId,
+          debug: true,
+          logSurfacing: false,
+        });
+        expect(later.debug!.candidates.find((candidate) => candidate.id === podmanId)).toMatchObject({
+          cooledDown: true,
+          surfacingCount: 1,
+        });
+      });
+    });
+
+    it.each([
+      ["the default budget", (_config: ReturnType<typeof loadDaemonConfig>) => undefined, 2048],
+      ["no configured learning reserve", (config: ReturnType<typeof loadDaemonConfig>) => {
+        config.restoration.reservedForLearningInstruction = 0;
+      }, 2048],
+      ["a tiny budget", (config: ReturnType<typeof loadDaemonConfig>) => {
+        config.restoration.maxInjectedMemoryBytes = 560;
+        config.restoration.reservedForLearningInstruction = 0;
+      }, 560],
+    ])("keeps the injected context within the total budget with %s", async (_label, adjust, budget) => {
+      const tempDir = tempProject("pretool-bytes");
+      seed(tempDir, [
+        { content: "Run pnpm postgresql tests through the rootless podman socket " + "détail ☕ 日本語 ".repeat(40), sessionId },
+        { content: "Second pnpm postgresql note for the shared runner " + "détail ☕ 日本語 ".repeat(40), sessionId },
+      ]);
+
+      await withDaemon(tempDir, adjust, async (run) => {
+        const stdout = await run("Bash", { command: "pnpm run test:postgresql" });
+        const parsed = JSON.parse(stdout) as { hookSpecificOutput: { additionalContext: string } };
+        const context = parsed.hookSpecificOutput.additionalContext;
+        expect(Buffer.byteLength(context, "utf8")).toBeLessThanOrEqual(budget);
+        expect(context).toContain("pnpm postgresql");
+        expect(context).toContain("</memory-context>");
+      });
+    });
   });
 });

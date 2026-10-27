@@ -172,6 +172,12 @@ export async function assertSqliteReadback(path: string, identity: StorageIdenti
       expect(db.prepare(`SELECT count(*) AS n FROM ${nativeTables[domain]}`).get()!.n, domain)
         .toBe(corpus.get(domain)!.length);
     }
+    // The recorded parent is value-only metadata and must reach the native column.
+    const parents = domainValues(corpus, "conversations")
+      .map(value => value.parentSessionId).filter(value => value !== undefined).sort();
+    expect(parents).toHaveLength(1);
+    expect(db.prepare("SELECT parent_session_id AS p FROM conversations WHERE parent_session_id IS NOT NULL").all().map(row => row.p).sort())
+      .toEqual(parents);
     expect(db.prepare("SELECT count(*) AS n FROM messages").get()!.n).toBe(corpus.get("messages")!.length);
     expect(db.prepare("SELECT count(*) AS n FROM message_parts").get()!.n).toBe(corpus.get("message-parts")!.length);
     expect(db.prepare("SELECT count(*) AS n FROM portable_archive_native_transcripts").get()!.n).toBe(corpus.get("native-transcripts")!.length);
@@ -232,6 +238,11 @@ export async function assertPostgreSqlNativeCounts(database: PostgreSqlTestDatab
     expect((await database.migrator.query({ text: `SELECT count(*)::int AS n FROM lcm.${table} WHERE project_id=$1`, values: [projectId] }, context)).rows[0].n, domain)
       .toBe(corpus.get(domain as PortableDomain)!.length);
   }
+  const parents = domainValues(corpus, "conversations")
+    .map(value => value.parentSessionId).filter(value => value !== undefined).sort();
+  expect(parents).toHaveLength(1);
+  expect((await database.migrator.query({ text: "SELECT parent_session_id AS p FROM lcm.conversations WHERE project_id=$1 AND parent_session_id IS NOT NULL", values: [projectId] }, context))
+    .rows.map(row => row.p).sort()).toEqual(parents);
   expect((await database.migrator.query({ text: "SELECT count(DISTINCT machine_id)::int AS n FROM lcm.project_aliases WHERE project_id=$1", values: [projectId] }, context)).rows[0].n)
     .toBe(corpus.get("machines")!.length);
 }

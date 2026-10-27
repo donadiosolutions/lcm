@@ -213,7 +213,8 @@ vi.mock("../../../src/storage/index.js", () => ({
       const conversations = {
         getOrCreateConversation: async () => ({ conversationId: "conversation" }),
         getMessageCount: async () => 0,
-        createMessagesBulk: state.createMessagesBulk,
+        getTranscriptSlotSnapshot: async () => ({ transcriptCount: 0, events: [] }),
+        appendMessages: (_conversationId: unknown, inputs: unknown[]) => state.createMessagesBulk(inputs),
       };
       const summaries = {
         getSummariesByConversation: async () => state.summaries,

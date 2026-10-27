@@ -1,0 +1,9 @@
+references: ["#1584"]
+rationale: >-
+  Repeated member names in hooks.json are now detected by a strict read in
+  codex-hooks.ts (used by install, uninstall and detection) and by the doctor
+  schema check in codex-readiness.ts. Both files are connector concerns and
+  keep unit-connectors; no path is added, removed or moved.
+pins:
+  - ["src/connectors/codex-hooks.ts", "unit-connectors"]
+  - ["src/connectors/codex-readiness.ts", "unit-connectors"]

@@ -1,0 +1,14 @@
+references: ["#1560"]
+rationale: >-
+  Restores Codex memory after compaction and in resumed or forked
+  conversations. The SessionStart matcher (src/connectors/codex-hooks.ts), the
+  Codex compact restoration (src/daemon/routes/restore.ts), the hook's
+  transcript-based skip and lock release (src/hooks/restore.ts) and the
+  restoration scanner with its bounded rollout reader
+  (src/codex-transcript.ts) are materially changed and keep their existing
+  owners. No file is added, removed, moved or re-owned.
+pins:
+  - ["src/connectors/codex-hooks.ts", "unit-connectors"]
+  - ["src/daemon/routes/restore.ts", "unit-daemon-routes"]
+  - ["src/hooks/restore.ts", "unit-hooks"]
+  - ["src/codex-transcript.ts", "unit-transcripts-import"]

@@ -1,4 +1,4 @@
-import { parseCodexTranscript, parseCodexTranscriptText } from "./codex-transcript.js";
+import { parseCodexTranscript, parseCodexTranscriptText, type CodexParseOptions } from "./codex-transcript.js";
 import { parseTranscript, parseTranscriptText, type ParsedMessage } from "./transcript.js";
 
 export type TranscriptClient = "claude" | "codex";
@@ -16,6 +16,10 @@ export function parseTranscriptForClient(
     : parseTranscript(transcriptPath);
 }
 
-export function parseTranscriptTextForClient(raw: string, client: TranscriptClient): ParsedMessage[] {
-  return client === "codex" ? parseCodexTranscriptText(raw) : parseTranscriptText(raw);
+export function parseTranscriptTextForClient(
+  raw: string,
+  client: TranscriptClient,
+  options?: CodexParseOptions,
+): ParsedMessage[] {
+  return client === "codex" ? parseCodexTranscriptText(raw, options) : parseTranscriptText(raw);
 }

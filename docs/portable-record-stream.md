@@ -53,6 +53,22 @@ earlier-domain identities before the record is accepted.
 | 21 | `native-transcript-checkpoints` | `machines`, `project` | database-or-sidecar |
 | 22 | `passive-events` | `machines`, `project` | database-or-sidecar |
 
+The `conversations` value declares one optional field, `parentSessionId`: a
+non-empty string without NUL that names the conversation's immediate parent
+session. A conversation without a parent omits the field; it is never written
+as `null`, so a record for such a conversation is byte-identical to the one an
+older release produced and keeps its `recordSha256`. The field is value-only
+metadata. It is not part of the conversation fingerprint, identity, order
+tuple, or message and context bindings, so recording a parent later changes
+only that conversation's `recordSha256`, never its identity. Declaring the
+field changes `schemaSha256` and with it every domain prefix and the content
+digest. A manifest or checkpoint produced by an older release therefore fails
+closed with `incompatible-schema`, and a payload that carries a parent is
+rejected by an older binary. Finish or abandon an in-flight transfer before
+upgrading, then rerun it. Because a later parent fill changes a conversation's
+`recordSha256`, copying again after a fill needs a fresh destination; the
+existing destination idempotence rules are unchanged.
+
 The coverage class describes where an adapter obtains evidence; it is not a
 permission to omit a domain. `available` coverage carries an evidence SHA-256.
 `authoritative-empty` is allowed only with the reason
@@ -106,7 +122,8 @@ The following rules apply to both adapter output and every parsed byte stream:
   use unsigned UTF-8 byte order. JSON numbers are finite and safely
   representable in ECMAScript JSON. Strings are well-formed UTF-16 and contain
   no NUL. Maximum JSON depth is 100.
-- Objects must be plain objects with exactly the declared own keys; arrays must
+- Objects must be plain objects with exactly the declared own keys, plus the
+  optional fields a domain declares (see below); arrays must
   be dense ordinary arrays with no extra own properties. Hashes are lowercase
   64-hex SHA-256 values. Record and control bytes must round-trip to their
   canonical representation, so unknown keys, alternate spellings, malformed

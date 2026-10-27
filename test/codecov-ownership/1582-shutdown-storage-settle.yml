@@ -1,0 +1,8 @@
+references: ["#1582"]
+rationale: >-
+  #1582 makes daemon shutdown wait for the private open and close of every
+  project-storage execution on the shared factory before closing it; both
+  files keep their established owners.
+pins:
+  - ["src/daemon/routes/storage-lifecycle.ts", "unit-daemon-routes"]
+  - ["src/daemon/server.ts", "unit-daemon-core"]

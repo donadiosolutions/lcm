@@ -388,6 +388,13 @@ export const MIGRATION_SEARCH_PROBE_CANDIDATE_POOL_SIZE = 25;
 const SEARCH_PROBE_RESULT_WINDOW = 50;
 
 /**
+ * Fixed query the empty-source path sends through the production search
+ * (#1676). It must not normalize to empty, or searchMessages would return
+ * before any SQL and the path would prove nothing.
+ */
+const EMPTY_SOURCE_SEARCH_PROBE_QUERY = "lcm migration empty source probe";
+
+/**
  * The step 5 ordered-listing probe now runs through the real repository
  * (PostgreSqlConversationRepository.listConversations, the exact production
  * read path -- not hand-written SQL that would only re-test a copy of the
@@ -598,10 +605,17 @@ export async function runOrderedListingProbe(
  * anything", so it does not guess. It reports what it could not
  * evaluate and lets classCoverage's sample bit -- driven by this
  * outcome, not a static declaration -- refuse eligibility instead.
+ *
+ * The third variant (#1676) is an empty candidate pool for which the
+ * production search, sent one fixed query, returned no rows. It is
+ * never "ran" on its own: the driver upgrades it to the public-search
+ * receipt only when the source messages checkpoint and the fenced
+ * destination census both report zero messages.
  */
 export type MigrationSearchProbeOutcome =
   | Readonly<{ ran: true; chosenOrdinal: number; notRunReason: null }>
-  | Readonly<{ ran: false; chosenOrdinal: null; notRunReason: string }>;
+  | Readonly<{ ran: false; chosenOrdinal: null; notRunReason: string }>
+  | Readonly<{ ran: false; chosenOrdinal: null; notRunReason: null; emptySource: true }>;
 
 /**
  * Runs before the window, through the real
@@ -654,9 +668,6 @@ export async function runSearchSelfMatchProbe(
   executor: PostgreSqlRuntime, projectId: string, targetGenerationId: string,
   candidates: readonly MigrationSearchProbeSourceEntry[], seedBasisSha256: string, signal?: AbortSignal,
 ): Promise<MigrationSearchProbeOutcome> {
-  if (candidates.length === 0) {
-    return { ran: false, chosenOrdinal: null, notRunReason: "no source messages are available to search-probe" };
-  }
   // Round-4 P2: the run lookup used to have no state filter, so an
   // in-progress copy's incomplete run correlated candidates against a
   // ledger that is not yet the final one, and the not-run reason said
@@ -688,6 +699,20 @@ export async function runSearchSelfMatchProbe(
   }
   const runId = run.run_id;
   const repository = new PostgreSqlLexicalSearchRepository(executor, projectId);
+  if (candidates.length === 0) {
+    // #1676: with no candidate there is no self-match to confirm, so run
+    // the production search once on a fixed query and require no rows. A
+    // search error propagates; it is never folded into a pass.
+    const rows = await repository.searchMessages({
+      query: EMPTY_SOURCE_SEARCH_PROBE_QUERY, mode: "full_text" as const, limit: SEARCH_PROBE_RESULT_WINDOW,
+    });
+    return rows.length === 0
+      ? { ran: false, chosenOrdinal: null, notRunReason: null, emptySource: true }
+      : {
+        ran: false, chosenOrdinal: null,
+        notRunReason: "the source has no search-probe candidates, but the production search returned rows for the empty-source query",
+      };
+  }
   const seedIndex = Number.parseInt(seedBasisSha256.slice(0, 8), 16) % candidates.length;
   let unattributedAttempts = 0;
   let unconfirmedAttempts = 0;
@@ -1739,7 +1764,8 @@ function buildClassCoverageVector(receipts: ReadonlySet<MigrationVerificationRec
  * not-run search probe in the same pass have an honest joint
  * representation. Each probe's bit is the receipt of its own run: the
  * listing probe's is that runOrderedListingProbe completed, the search
- * probe's is that a correlated self-match was confirmed.
+ * probe's is that a correlated self-match was confirmed or, for an empty
+ * project, that the empty-source witness held (#1676).
  */
 function buildPublicProbeCoverageVector(
   receipts: ReadonlySet<MigrationVerificationReceiptId>,
@@ -1756,6 +1782,25 @@ const SKIPPED_PUBLIC_LISTING = {
 const SKIPPED_SEARCH_PROBE_OUTCOME: MigrationSearchProbeOutcome = {
   ran: false, chosenOrdinal: null, notRunReason: "the search probe was not invoked",
 };
+
+/**
+ * #1676: why an empty-source search outcome does not earn the public-search
+ * receipt, or null when the source stream and the fenced census both report
+ * zero messages. Both are required: an empty candidate pool alone proves
+ * nothing, since the pool is capped and fed from the yielded records.
+ */
+function emptySourceWitnessRefusal(
+  sourceCheckpoints: ReadonlyMap<PortableDomain, PortableCheckpoint>,
+  destinationCensus: readonly MigrationVerificationDomainCensus[],
+): string | null {
+  if (sourceCheckpoints.get("messages")!.recordCount !== 0) {
+    return "the source messages checkpoint does not report zero records, so an empty candidate pool does not show an empty project";
+  }
+  if (destinationCensus.find((entry) => entry.domain === "messages")!.recordCount !== 0) {
+    return "the fenced destination census does not report zero messages";
+  }
+  return null;
+}
 
 export interface VerifyMigrationGenerationInput {
   readonly generationId: string;
@@ -2082,6 +2127,22 @@ async function computeVerificationReport(
       // so the driver truncates here rather than letting construction throw.
       const mismatches = truncateMismatchesPerClass(fullMismatches);
 
+      // The search outcome folds into the digest so a report can never
+      // record and discard it: ran, the fixed candidate pool size and the
+      // chosen candidate's ordinal; or, for an empty project that earned
+      // the receipt (#1676), a constant tuple; or the not-run reason --
+      // never candidate content, a query string or a measured count.
+      let searchProbeFold: readonly unknown[];
+      if (searchProbeOutcome.ran) {
+        searchProbeFold = ["search-self-match", true, MIGRATION_SEARCH_PROBE_CANDIDATE_POOL_SIZE, searchProbeOutcome.chosenOrdinal];
+      } else if ("emptySource" in searchProbeOutcome) {
+        const refusal = emptySourceWitnessRefusal(sourceCheckpoints, destinationCensus);
+        if (refusal === null) receipts.add("public-search");
+        searchProbeFold = refusal === null ? ["search-self-match", "empty-source"] : ["search-self-match", false, refusal];
+      } else {
+        searchProbeFold = ["search-self-match", false, searchProbeOutcome.notRunReason];
+      }
+
       const sourceWitness: MigrationSourceWitnessDigests = {
         version: 1, identitySha256: copySource.sourceWitness.identitySha256,
         schemaSha256: copySource.sourceWitness.schemaSha256, contentSha256: copySource.sourceWitness.contentSha256,
@@ -2091,15 +2152,7 @@ async function computeVerificationReport(
       ]);
       const publicProbeSha256 = migrationWitnessSha256([
         "lcm-migration-verification-public-probe-v1", MIGRATION_PUBLIC_PROBE_ORDERING_SHA256, publicListingSha256,
-        // The search probe's outcome folds in here so a report can never
-        // again record and discard it: ran, the fixed candidate pool
-        // size and the chosen candidate's ordinal when it ran (both
-        // needed to reproduce which candidate was tried without reading
-        // the driver's own constant), or the not-run reason when it did
-        // not -- never the candidate's content, and never a query string.
-        searchProbeOutcome.ran
-          ? ["search-self-match", true, MIGRATION_SEARCH_PROBE_CANDIDATE_POOL_SIZE, searchProbeOutcome.chosenOrdinal]
-          : ["search-self-match", false, searchProbeOutcome.notRunReason],
+        searchProbeFold,
       ]);
       const reportInput: CreateMigrationVerificationReportInput = {
         generationId: input.generationId, targetGenerationId: input.targetGenerationId, bindingSha256,
@@ -2161,33 +2214,22 @@ export async function inspectMigrationVerification(
 }
 
 /**
- * Drives plan-v4.md section 2 end to end for one attempt. Never retries
- * internally: a connection loss or any other failure propagates to the
- * caller, and restarting means calling this function again from scratch.
- * Nothing is persisted until the fully-formed report is ready to write.
+ * The persisted-report completion that verifyMigrationGeneration performs
+ * first (plan-v5 Part B (2)): when a verify-generation effect is already
+ * pending, finish it from persisted values alone and never reopen the
+ * destination. Returns `null` when no verify-generation effect is pending,
+ * leaving the caller to do whatever it does otherwise.
  *
- * Steps 9-11 (persist, begin, complete) run in that fixed order: nothing
- * is begun until it is durably persisted, and begin always precedes
- * complete, so a resumed attempt can tell exactly how far a prior attempt
- * got from the manifest and the report store alone. If a verify-generation
- * effect is already pending when this function starts, that can only be
- * because an earlier attempt already persisted and began it -- the report
- * is already frozen, content-addressed evidence -- so this attempt reads
- * that report back and completes with it directly, without repeating any
- * of the expensive destination work below. Resume binds the frozen report
- * to the sealed manifest: it refuses unless the report's own recorded
- * destination identity equals manifest.destination.identitySha256, by
- * comparing persisted values only, and unless its recorded cluster system
- * identifier equals manifest.destination.systemIdentifier (a manifest that
- * never recorded one is refused). This is what makes a crash
- * between begin and complete resumable without recomputation, and what
- * makes destination drift after begin harmless: this path never reopens
- * the destination at all.
+ * This is an extraction of the resume block verifyMigrationGeneration has
+ * always had, with no change to its checks, so a caller that has no
+ * destination, project-map or lease inputs to offer (the `resume` and
+ * `verify` CLI commands, for a pending effect) can reach exactly the same
+ * code verifyMigrationGeneration reaches.
  */
-export async function verifyMigrationGeneration(
-  input: VerifyMigrationGenerationInput,
-  dependencies: VerifyMigrationGenerationDependencies = defaultDependencies,
-): Promise<VerifyMigrationGenerationResult> {
+export function completePendingMigrationVerification(input: Readonly<{
+  homeDir: string;
+  generationId: string;
+}>): VerifyMigrationGenerationResult | null {
   const manifestStore = new MigrationManifestStore({ homeDir: input.homeDir });
   const reportStore = new MigrationVerificationReportStore({ homeDir: input.homeDir });
   const resumeManifest = manifestStore.read(input.generationId);
@@ -2243,6 +2285,41 @@ export async function verifyMigrationGeneration(
       effectId: pending.effectId, inputSha256: pending.inputSha256,
     };
   }
+  return null;
+}
+
+/**
+ * Drives plan-v4.md section 2 end to end for one attempt. Never retries
+ * internally: a connection loss or any other failure propagates to the
+ * caller, and restarting means calling this function again from scratch.
+ * Nothing is persisted until the fully-formed report is ready to write.
+ *
+ * Steps 9-11 (persist, begin, complete) run in that fixed order: nothing
+ * is begun until it is durably persisted, and begin always precedes
+ * complete, so a resumed attempt can tell exactly how far a prior attempt
+ * got from the manifest and the report store alone. If a verify-generation
+ * effect is already pending when this function starts, that can only be
+ * because an earlier attempt already persisted and began it -- the report
+ * is already frozen, content-addressed evidence -- so this attempt reads
+ * that report back and completes with it directly, without repeating any
+ * of the expensive destination work below. Resume binds the frozen report
+ * to the sealed manifest: it refuses unless the report's own recorded
+ * destination identity equals manifest.destination.identitySha256, by
+ * comparing persisted values only, and unless its recorded cluster system
+ * identifier equals manifest.destination.systemIdentifier (a manifest that
+ * never recorded one is refused). This is what makes a crash
+ * between begin and complete resumable without recomputation, and what
+ * makes destination drift after begin harmless: this path never reopens
+ * the destination at all.
+ */
+export async function verifyMigrationGeneration(
+  input: VerifyMigrationGenerationInput,
+  dependencies: VerifyMigrationGenerationDependencies = defaultDependencies,
+): Promise<VerifyMigrationGenerationResult> {
+  const resumed = completePendingMigrationVerification({ homeDir: input.homeDir, generationId: input.generationId });
+  if (resumed !== null) return resumed;
+  const manifestStore = new MigrationManifestStore({ homeDir: input.homeDir });
+  const reportStore = new MigrationVerificationReportStore({ homeDir: input.homeDir });
   const { report, releaseLease, assertLeaseHeld } = await computeVerificationReport(input, dependencies);
   // Round-2 P3: the lease stays held across persist and is released
   // only once persist itself has settled (success or failure), so a

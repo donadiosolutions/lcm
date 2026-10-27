@@ -530,12 +530,12 @@ function withConnectorTransportReadRoot<T>(
   return withBackendPublicationReadRoot(homeDir, callback);
 }
 
-/** Read one validated stored connector transport without taking the publication lock. */
-export function readConnectorTransportSnapshot(
+/** Read and authenticate the stored config through stable lock-free admission. */
+function readStableStoredConfigSnapshot(
   configPath: string,
-  agentId: string,
-  options: ConnectorTransportSnapshotOptions = {},
-): ConnectorTransport | undefined {
+  options: ConnectorTransportSnapshotOptions,
+  failureSubject: string,
+): Record<string, unknown> {
   return withConnectorTransportReadRoot(configPath, (assertReadRoot) => {
     assertReadRoot();
     const first = readConnectorConfigSnapshot(configPath);
@@ -548,15 +548,41 @@ export function readConnectorTransportSnapshot(
     const second = readConnectorConfigSnapshot(configPath);
     assertReadRoot();
     if (!daemonConfigSnapshotWitnessEqual(first.witness, second.witness)) {
-      throw new ConfigManagerError("Configuration changed during lock-free connector transport inspection.");
+      throw new ConfigManagerError(`Configuration changed during lock-free ${failureSubject} inspection.`);
     }
     const secondAdmission = assertBackendPublicationConfigReadAccess(configPath, backend, second.witness);
     assertReadRoot();
     if (firstAdmission.journalChecksumSha256 !== secondAdmission.journalChecksumSha256) {
-      throw new ConfigManagerError("Backend publication changed during lock-free connector transport inspection.");
+      throw new ConfigManagerError(`Backend publication changed during lock-free ${failureSubject} inspection.`);
     }
-    return readConnectorTransportFromStored(parseStoredConfig(second.content), agentId);
+    return parseStoredConfig(second.content);
   });
+}
+
+/** Read one validated stored connector transport without taking the publication lock. */
+export function readConnectorTransportSnapshot(
+  configPath: string,
+  agentId: string,
+  options: ConnectorTransportSnapshotOptions = {},
+): ConnectorTransport | undefined {
+  return readConnectorTransportFromStored(
+    readStableStoredConfigSnapshot(configPath, options, "connector transport"),
+    agentId,
+  );
+}
+
+/**
+ * Read the stored `hooks.preToolRecall` opt-in without taking the publication
+ * lock. A missing key is disabled. A non-boolean value, a drifting or
+ * unauthenticated read, or any parse failure throws (the stored-config parser
+ * rejects non-boolean values), so a connector install never guesses.
+ */
+export function readPreToolRecallSnapshot(
+  configPath: string,
+  options: ConnectorTransportSnapshotOptions = {},
+): boolean {
+  const stored = readStableStoredConfigSnapshot(configPath, options, "hook setting");
+  return (stored.hooks as { preToolRecall?: boolean } | undefined)?.preToolRecall === true;
 }
 
 /** Persist one validated connector transport while retaining all other settings. */

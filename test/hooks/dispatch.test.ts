@@ -1,4 +1,4 @@
-import { describe, it, expect, vi } from "vitest";
+import { afterEach, describe, it, expect, vi } from "vitest";
 import { HOOK_COMMANDS, type HookCommand } from "../../src/hooks/dispatch.js";
 import { REQUIRED_HOOKS } from "../../installer/install.js";
 
@@ -23,8 +23,14 @@ vi.mock("../../src/hooks/user-prompt.js", () => ({
 vi.mock("../../src/hooks/session-snapshot.js", () => ({
   handleSessionSnapshot: vi.fn().mockResolvedValue({ exitCode: 0, stdout: "" }),
 }));
+vi.mock("../../src/hooks/terminal-snapshot.js", () => ({
+  handleTerminalSnapshot: vi.fn().mockResolvedValue({ exitCode: 0, stdout: "" }),
+}));
 vi.mock("../../src/hooks/post-tool.js", () => ({
   handlePostToolUse: vi.fn().mockResolvedValue({ exitCode: 0, stdout: "" }),
+}));
+vi.mock("../../src/hooks/pre-tool.js", () => ({
+  handlePreToolUse: vi.fn().mockResolvedValue({ exitCode: 0, stdout: "" }),
 }));
 vi.mock("../../src/daemon/client.js", () => ({
   DaemonClient: vi.fn().mockImplementation(function () {
@@ -47,6 +53,7 @@ import { dispatchHook, isHookCommand } from "../../src/hooks/dispatch.js";
 import { ensureBootstrapped, ensureCoreEndpoint } from "../../src/bootstrap.js";
 import { safeLogError } from "../../src/hooks/hook-errors.js";
 import { PrivateMutationLockContentionError } from "../../src/private-mutation-lock.js";
+import { hookAdmissionRetry } from "../../src/hooks/publication-fence.js";
 import { BackendPublicationJournalError } from "../../src/storage/backend-publication.js";
 
 describe("HOOK_COMMANDS", () => {
@@ -54,6 +61,7 @@ describe("HOOK_COMMANDS", () => {
     const commandToEvent: Record<string, string> = {
       "compact": "PreCompact",
       "post-tool": "PostToolUse",
+      "pre-tool": "PreToolUse",
       "restore": "SessionStart",
       "session-end": "SessionEnd",
       "session-snapshot": "Stop",
@@ -75,6 +83,8 @@ import { handleSessionEnd } from "../../src/hooks/session-end.js";
 import { handleUserPromptSubmit } from "../../src/hooks/user-prompt.js";
 import { handleSessionSnapshot } from "../../src/hooks/session-snapshot.js";
 import { handlePostToolUse } from "../../src/hooks/post-tool.js";
+import { handlePreToolUse } from "../../src/hooks/pre-tool.js";
+import { handleTerminalSnapshot } from "../../src/hooks/terminal-snapshot.js";
 import { loadHookConfig, type HookConfig } from "../../src/hooks/config.js";
 import type { StorageBackendSelection } from "../../src/storage/backend.js";
 
@@ -126,6 +136,7 @@ describe("dispatchHook", () => {
       expect.anything(),
       expect.any(Number),
       sqliteStorage,
+      expect.any(Function),
     );
   });
 
@@ -139,7 +150,13 @@ describe("dispatchHook", () => {
       vi.mocked(handler).mockClear();
       await dispatchHook(cmd, '{"test":true}');
       expect(handler).toHaveBeenCalledTimes(1);
-      expect(handler).toHaveBeenCalledWith('{"test":true}', expect.anything(), expect.any(Number), sqliteStorage);
+      expect(handler).toHaveBeenCalledWith(
+        '{"test":true}',
+        expect.anything(),
+        expect.any(Number),
+        sqliteStorage,
+        expect.any(Function),
+      );
     }
 
     vi.mocked(handleUserPromptSubmit).mockClear();
@@ -151,7 +168,7 @@ describe("dispatchHook", () => {
     vi.mocked(handleSessionSnapshot).mockClear();
     await dispatchHook("session-snapshot", '{"test":true}');
     expect(handleSessionSnapshot).toHaveBeenCalledTimes(1);
-    expect(handleSessionSnapshot).toHaveBeenCalledWith('{"test":true}');
+    expect(handleSessionSnapshot).toHaveBeenCalledWith('{"test":true}', { admissionRetry: expect.any(Function) });
   });
 
   it("passes the trusted transport to UserPromptSubmit", async () => {
@@ -184,6 +201,7 @@ describe("dispatchHook", () => {
           expect.anything(),
           3737,
           postgresqlStorage,
+          expect.any(Function),
         );
       }
       vi.mocked(handleUserPromptSubmit).mockClear();
@@ -198,7 +216,7 @@ describe("dispatchHook", () => {
     vi.mocked(loadHookConfig).mockReturnValue(configWithDaemon({ port: 9999 }));
     vi.mocked(handlePreCompact).mockClear();
     await dispatchHook("compact", "{}");
-    expect(handlePreCompact).toHaveBeenCalledWith("{}", expect.anything(), 9999, sqliteStorage);
+    expect(handlePreCompact).toHaveBeenCalledWith("{}", expect.anything(), 9999, sqliteStorage, expect.any(Function));
     // Reset to default
     vi.mocked(loadHookConfig).mockReturnValue(configWithDaemon({ port: 3737 }));
   });
@@ -207,7 +225,7 @@ describe("dispatchHook", () => {
     vi.mocked(handleSessionStart).mockResolvedValue({ exitCode: 0, stdout: "" });
     vi.mocked(ensureBootstrapped).mockClear();
     await dispatchHook("restore", JSON.stringify({ session_id: "test-sess-123" }));
-    expect(ensureBootstrapped).toHaveBeenCalledWith("test-sess-123");
+    expect(ensureBootstrapped).toHaveBeenCalledWith("test-sess-123", undefined, expect.any(Function));
   });
 
   it("skips ensureBootstrapped for compact (daemon already running at PreCompact time)", async () => {
@@ -249,6 +267,25 @@ describe("dispatchHook", () => {
     expect(handleSessionSnapshot).not.toHaveBeenCalled();
   });
 
+  it("hands a terminal snapshot straight to its handler without bootstrap, repair or Stop-hook work", async () => {
+    vi.mocked(ensureBootstrapped).mockClear();
+    vi.mocked(ensureCoreEndpoint).mockClear();
+    vi.mocked(validateAndFixHooks).mockClear();
+    vi.mocked(handleSessionSnapshot).mockClear();
+    vi.mocked(loadHookConfig).mockClear();
+    const terminal = { deadline: { openPhase: vi.fn(), outcomeBudgetMs: vi.fn() } };
+    const stdin = JSON.stringify({ session_id: "s1", hook_event_name: "Interrupt" });
+
+    await expect(dispatchHook("session-snapshot", stdin, { terminal })).resolves.toEqual({ exitCode: 0, stdout: "" });
+
+    expect(handleTerminalSnapshot).toHaveBeenCalledWith(stdin, terminal);
+    expect(ensureCoreEndpoint).not.toHaveBeenCalled();
+    expect(ensureBootstrapped).not.toHaveBeenCalled();
+    expect(validateAndFixHooks).not.toHaveBeenCalled();
+    expect(handleSessionSnapshot).not.toHaveBeenCalled();
+    expect(loadHookConfig).not.toHaveBeenCalled();
+  });
+
   it("reverifies snapshot identity even when the session was already bootstrapped", async () => {
     vi.mocked(ensureBootstrapped).mockClear();
     vi.mocked(ensureCoreEndpoint).mockClear();
@@ -257,13 +294,23 @@ describe("dispatchHook", () => {
     expect(ensureBootstrapped).not.toHaveBeenCalled();
   });
 
+  it("verifies the endpoint for a Codex child snapshot that lacks the tree session_id", async () => {
+    vi.mocked(ensureCoreEndpoint).mockClear();
+    vi.mocked(ensureCoreEndpoint).mockResolvedValueOnce({ connected: true, port: 4242 });
+    vi.mocked(handleSessionSnapshot).mockClear();
+    const stdin = JSON.stringify({ client: "codex", agent_id: "child-thread" });
+    await dispatchHook("session-snapshot", stdin);
+    expect(ensureCoreEndpoint).toHaveBeenCalledOnce();
+    expect(handleSessionSnapshot).toHaveBeenCalledWith(stdin, { verifiedPort: 4242, admissionRetry: expect.any(Function) });
+  });
+
   it("binds snapshot dispatch to the verified port when configuration changes afterward", async () => {
     vi.mocked(ensureCoreEndpoint).mockResolvedValueOnce({ connected: true, port: 3737 });
     vi.mocked(loadHookConfig).mockClear();
     vi.mocked(loadHookConfig).mockReturnValueOnce(configWithDaemon({ port: 9999 }));
     vi.mocked(handleSessionSnapshot).mockClear();
     await dispatchHook("session-snapshot", JSON.stringify({ session_id: "s1" }));
-    expect(handleSessionSnapshot).toHaveBeenCalledWith(expect.any(String), { verifiedPort: 3737 });
+    expect(handleSessionSnapshot).toHaveBeenCalledWith(expect.any(String), { verifiedPort: 3737, admissionRetry: expect.any(Function) });
     // The unused queued value must not leak into later tests.
     expect(loadHookConfig).not.toHaveBeenCalled();
     vi.mocked(loadHookConfig).mockReset();
@@ -279,7 +326,7 @@ describe("dispatchHook", () => {
     try {
       await expect(dispatchHook("session-snapshot", "{}")).resolves.toEqual({ exitCode: 0, stdout: "" });
       expect(loadHookConfig).not.toHaveBeenCalled();
-      expect(handleSessionSnapshot).toHaveBeenCalledWith("{}");
+      expect(handleSessionSnapshot).toHaveBeenCalledWith("{}", { admissionRetry: expect.any(Function) });
     } finally {
       vi.mocked(loadHookConfig).mockReset();
       vi.mocked(loadHookConfig).mockReturnValue(configWithDaemon({ port: 3737 }));
@@ -403,6 +450,29 @@ describe("dispatchHook", () => {
     expect(loadHookConfig).not.toHaveBeenCalled();
   });
 
+  it("routes pre-tool straight to its handler without bootstrap, repair or config load", async () => {
+    const payload = JSON.stringify({ session_id: "test", client: "codex", tool_name: "Bash" });
+    vi.mocked(handlePreToolUse).mockClear();
+    vi.mocked(ensureBootstrapped).mockClear();
+    vi.mocked(ensureCoreEndpoint).mockClear();
+    vi.mocked(validateAndFixHooks).mockClear();
+    vi.mocked(loadHookConfig).mockClear();
+
+    const result = await dispatchHook("pre-tool", payload);
+
+    expect(result).toEqual({ exitCode: 0, stdout: "" });
+    expect(handlePreToolUse).toHaveBeenCalledTimes(1);
+    expect(handlePreToolUse).toHaveBeenCalledWith(payload);
+    expect(ensureBootstrapped).not.toHaveBeenCalled();
+    expect(ensureCoreEndpoint).not.toHaveBeenCalled();
+    expect(validateAndFixHooks).not.toHaveBeenCalled();
+    expect(loadHookConfig).not.toHaveBeenCalled();
+  });
+
+  it("recognizes pre-tool as a valid hook command", () => {
+    expect(isHookCommand("pre-tool")).toBe(true);
+  });
+
   it("recognizes post-tool as a valid hook command", () => {
     expect(isHookCommand("post-tool")).toBe(true);
     expect(isHookCommand("invalid")).toBe(false);
@@ -455,11 +525,200 @@ describe("dispatchHook", () => {
   it("handles empty hook payloads and a config without a daemon port", async () => {
     vi.mocked(loadHookConfig).mockReturnValueOnce(configWithDaemon({}));
     await dispatchHook("restore", "");
-    expect(handleSessionStart).toHaveBeenCalledWith("", expect.anything(), 3737, sqliteStorage);
+    expect(handleSessionStart).toHaveBeenCalledWith("", expect.anything(), 3737, sqliteStorage, expect.any(Function));
     await dispatchHook("post-tool", "");
     expect(handlePostToolUse).toHaveBeenCalled();
     vi.mocked(loadHookConfig).mockReturnValueOnce({} as unknown as HookConfig);
     await dispatchHook("post-tool", "{}");
     expect(handlePostToolUse).toHaveBeenCalledWith("{}");
+  });
+});
+
+describe("LCM_ENABLED=false", () => {
+  const handlers = {
+    compact: handlePreCompact,
+    "post-tool": handlePostToolUse,
+    "pre-tool": handlePreToolUse,
+    restore: handleSessionStart,
+    "session-end": handleSessionEnd,
+    "session-snapshot": handleSessionSnapshot,
+    "user-prompt": handleUserPromptSubmit,
+  } satisfies Record<HookCommand, unknown>;
+  const payload = JSON.stringify({ session_id: "disabled-session", prompt: "remember this" });
+
+  afterEach(() => {
+    vi.unstubAllEnvs();
+  });
+
+  it.each(HOOK_COMMANDS)("makes %s a no-op without side effects", async (command) => {
+    vi.clearAllMocks();
+    vi.stubEnv("LCM_ENABLED", "false");
+
+    await expect(dispatchHook(command, payload)).resolves.toEqual({ exitCode: 0, stdout: "" });
+
+    expect(handlers[command]).not.toHaveBeenCalled();
+    expect(validateAndFixHooks).not.toHaveBeenCalled();
+    expect(loadHookConfig).not.toHaveBeenCalled();
+    expect(ensureBootstrapped).not.toHaveBeenCalled();
+    expect(ensureCoreEndpoint).not.toHaveBeenCalled();
+  });
+
+  it("makes MCP-transport user prompts and Codex snapshots no-ops", async () => {
+    vi.clearAllMocks();
+    vi.stubEnv("LCM_ENABLED", "false");
+
+    await expect(dispatchHook("user-prompt", payload, { transport: "mcp" })).resolves.toEqual({ exitCode: 0, stdout: "" });
+    await expect(
+      dispatchHook("session-snapshot", JSON.stringify({ session_id: "disabled-session", client: "codex" })),
+    ).resolves.toEqual({ exitCode: 0, stdout: "" });
+
+    expect(handleUserPromptSubmit).not.toHaveBeenCalled();
+    expect(handleSessionSnapshot).not.toHaveBeenCalled();
+    expect(ensureBootstrapped).not.toHaveBeenCalled();
+    expect(ensureCoreEndpoint).not.toHaveBeenCalled();
+    expect(loadHookConfig).not.toHaveBeenCalled();
+  });
+
+  it("makes Codex subagent restore and snapshot hooks no-ops", async () => {
+    vi.clearAllMocks();
+    vi.stubEnv("LCM_ENABLED", "false");
+    const subagent = JSON.stringify({
+      session_id: "tree-root",
+      agent_id: "child-thread",
+      agent_transcript_path: "/rollouts/child.jsonl",
+      client: "codex",
+    });
+
+    await expect(dispatchHook("restore", subagent)).resolves.toEqual({ exitCode: 0, stdout: "" });
+    await expect(dispatchHook("session-snapshot", subagent)).resolves.toEqual({ exitCode: 0, stdout: "" });
+
+    expect(handleSessionStart).not.toHaveBeenCalled();
+    expect(handleSessionSnapshot).not.toHaveBeenCalled();
+    expect(ensureBootstrapped).not.toHaveBeenCalled();
+    expect(ensureCoreEndpoint).not.toHaveBeenCalled();
+    expect(loadHookConfig).not.toHaveBeenCalled();
+  });
+
+  it.each([undefined, "0", "False"])("keeps hooks enabled when LCM_ENABLED is %j", async (value) => {
+    vi.clearAllMocks();
+    if (value === undefined) vi.stubEnv("LCM_ENABLED", undefined);
+    else vi.stubEnv("LCM_ENABLED", value);
+
+    await dispatchHook("restore", payload);
+
+    expect(ensureBootstrapped).toHaveBeenCalledWith("disabled-session", undefined, expect.any(Function));
+    expect(handleSessionStart).toHaveBeenCalledOnce();
+  });
+});
+
+describe("dispatchHook waiting for a live publication-lock owner", () => {
+  const liveContention = (): PrivateMutationLockContentionError => new PrivateMutationLockContentionError(
+    "publication lock is busy",
+    {
+      contendedLock: {
+        path: "/lcm/publication.lock",
+        owner: { version: 1, pid: process.pid + 1, processStartTime: null, nonce: "owner" },
+      },
+    },
+  );
+  const noPause = async (): Promise<void> => undefined;
+  const restoreInput = JSON.stringify({ session_id: "waiting-session" });
+
+  afterEach(() => {
+    vi.mocked(loadHookConfig).mockReset();
+    vi.mocked(loadHookConfig).mockReturnValue(configWithDaemon({ port: 3737 }));
+    vi.mocked(ensureBootstrapped).mockReset();
+    vi.mocked(ensureBootstrapped).mockResolvedValue(true);
+    vi.mocked(handleSessionStart).mockClear();
+    vi.mocked(handleSessionSnapshot).mockClear();
+  });
+
+  it.each([
+    ["compact", handlePreCompact],
+    ["restore", handleSessionStart],
+  ] as const)("loads the %s config after the owner releases the lock", async (cmd, handler) => {
+    vi.mocked(handler).mockClear();
+    vi.mocked(loadHookConfig).mockClear();
+    vi.mocked(loadHookConfig)
+      .mockImplementationOnce(() => { throw liveContention(); })
+      .mockImplementationOnce(() => { throw liveContention(); });
+    const admissionRetry = hookAdmissionRetry({ _wait: noPause });
+
+    await dispatchHook(cmd, restoreInput, { admissionRetry });
+
+    expect(loadHookConfig).toHaveBeenCalledTimes(3);
+    expect(handler).toHaveBeenCalledTimes(1);
+    expect(vi.mocked(handler).mock.calls[0]?.[4]).toBe(admissionRetry);
+  });
+
+  it("falls back to the best-effort skip once the allowance is spent", async () => {
+    const contention = liveContention();
+    vi.mocked(loadHookConfig).mockImplementation(() => { throw contention; });
+    vi.mocked(safeLogError).mockClear();
+
+    await expect(dispatchHook("restore", restoreInput, {
+      admissionRetry: hookAdmissionRetry({ totalMs: 100, _wait: noPause }),
+    })).resolves.toEqual({ exitCode: 0, stdout: "" });
+
+    expect(loadHookConfig).toHaveBeenCalledTimes(3);
+    expect(handleSessionStart).not.toHaveBeenCalled();
+    expect(safeLogError).toHaveBeenCalledWith("SessionStart", contention, {});
+  });
+
+  it("shares one allowance between bootstrap and the config load", async () => {
+    let bootstrapAttempts = 0;
+    vi.mocked(ensureBootstrapped).mockImplementation(async (_sessionId, _deps, retry) => {
+      await retry!(() => {
+        bootstrapAttempts += 1;
+        if (bootstrapAttempts <= 2) throw liveContention();
+      });
+      return true;
+    });
+    vi.mocked(loadHookConfig).mockImplementation(() => { throw liveContention(); });
+
+    await dispatchHook("restore", restoreInput, {
+      admissionRetry: hookAdmissionRetry({ totalMs: 150, _wait: noPause }),
+    });
+
+    // Two waits went to bootstrap, so only one is left for the config load.
+    expect(bootstrapAttempts).toBe(3);
+    expect(loadHookConfig).toHaveBeenCalledTimes(2);
+    expect(handleSessionStart).not.toHaveBeenCalled();
+  });
+
+  it("creates the default allowance for a snapshot and hands it to the endpoint check", async () => {
+    vi.mocked(ensureCoreEndpoint).mockClear();
+
+    await dispatchHook("session-snapshot", restoreInput);
+
+    expect(vi.mocked(ensureCoreEndpoint).mock.calls[0]?.[0]).toBeUndefined();
+    const retry = vi.mocked(ensureCoreEndpoint).mock.calls[0]?.[1];
+    expect(retry).toEqual(expect.any(Function));
+    expect(vi.mocked(handleSessionSnapshot).mock.calls[0]?.[1]).toMatchObject({ admissionRetry: retry });
+  });
+
+  it("gives session-end a much smaller allowance than the 5 second default", async () => {
+    vi.mocked(handleSessionEnd).mockClear();
+    vi.mocked(loadHookConfig).mockImplementation(() => { throw liveContention(); });
+    const waits: number[] = [];
+    // Real wait budget, recorded waits: the default allowance is created by dispatch itself.
+    const publicationFence = await import("../../src/hooks/publication-fence.js");
+    expect(publicationFence.HOOK_SESSION_END_CONTENTION_WAIT_MS).toBeLessThan(publicationFence.HOOK_CONTENTION_WAIT_MS / 10);
+
+    await expect(dispatchHook("session-end", restoreInput, {
+      admissionRetry: hookAdmissionRetry({
+        totalMs: publicationFence.HOOK_SESSION_END_CONTENTION_WAIT_MS,
+        _wait: async (milliseconds) => { waits.push(milliseconds); },
+      }),
+    })).resolves.toEqual({ exitCode: 0, stdout: "" });
+
+    expect(waits.reduce((total, milliseconds) => total + milliseconds, 0)).toBe(300);
+    expect(handleSessionEnd).not.toHaveBeenCalled();
+  });
+
+  it("creates its own allowance when the caller supplies none", async () => {
+    vi.mocked(handleSessionEnd).mockClear();
+    await dispatchHook("session-end", restoreInput);
+    expect(vi.mocked(handleSessionEnd).mock.calls[0]?.[4]).toEqual(expect.any(Function));
   });
 });

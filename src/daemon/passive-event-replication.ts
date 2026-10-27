@@ -7,6 +7,7 @@ import {
 import {
   PostgreSqlPassiveEventDataError,
   PostgreSqlPassiveEventRepository,
+  samePassiveEventPayload,
   type PostgreSqlPassiveEventInput,
   type PostgreSqlPassiveEventRecord,
   type PostgreSqlPassiveEventReleaseResult,
@@ -140,24 +141,16 @@ interface UploadReadback {
   readonly differs: boolean;
 }
 
-function sameEnvelope(
+export function sameEnvelope(
   local: LocalHookEventRow,
   remote: PostgreSqlPassiveEventRecord,
 ): boolean {
-  const payload = remote.payload as Record<string, unknown>;
   return local.machine_id === remote.machineId
     && local.event_uuid === remote.eventId
     && local.event_version === remote.eventVersion
     && BigInt(local.machine_sequence) === remote.machineSequence
     && local.type === remote.eventType
-    && payload.sessionId === local.session_id
-    && payload.sessionSequence === local.seq
-    && payload.category === local.category
-    && payload.data === local.data
-    && payload.priority === local.priority
-    && payload.sourceHook === local.source_hook
-    && payload.previousEventId === local.prev_event_id
-    && payload.createdAt === local.created_at;
+    && samePassiveEventPayload(eventPayload(local), remote.payload);
 }
 
 function supportsEnvelopeVersion(version: number): boolean {
@@ -478,12 +471,15 @@ export class PassiveEventReplicationWorker {
    * rows out. A row that is out because its earlier upload committed to the
    * project this machine was bound to before a relink, and the local record
    * of it was lost, cannot be inserted while that copy exists and it fails
-   * the whole batch (#1511). Any failure that left rows out, with no returned
-   * row differing from its local row, therefore asks the other projects about
+   * the whole batch (#1511). Any failure that left rows out therefore asks the other projects about
    * the missing rows once and inserts the batch once more without the rows
-   * that cannot go. A differing row, a failed readback or a failed recovery
-   * query leaves every row to retry with backoff. Returns the batch and
-   * records to account for, or null when every row has been dealt with.
+   * that cannot go. A row whose copy in the bound project differs from it is
+   * the one that failed the insert (#1695): it is settled on its own, like a
+   * mismatch elsewhere, and the other rows carry on as above, so one colliding
+   * row cannot hold back its batch. A failed readback or a failed recovery
+   * query leaves every row still unsettled to retry with backoff. Returns the
+   * batch and records to account for, or null when every row has been dealt
+   * with.
    */
   private async settleFailedUpload(
     batch: readonly LocalHookEventRow[],
@@ -506,11 +502,33 @@ export class PassiveEventReplicationWorker {
       await this.recoverBatch(batch, owner, readbackError, summary);
       return null;
     }
-    if (view.differs) {
-      await this.recoverBatch(batch, owner, insertError, summary);
-      return null;
+    const differing = batch.filter((event) => {
+      const copy = view.byId.get(event.event_uuid);
+      return copy !== undefined && !sameEnvelope(event, copy);
+    });
+    if (differing.length > 0) {
+      const reason = "remote inbox copy differs from the local row";
+      for (const event of differing) {
+        if (event.delivery_attempts >= this.options.quarantineAfterAttempts) {
+          if (await this.dependencies.local.markDeliveryQuarantined(
+            event.event_uuid,
+            owner,
+            reason,
+          )) summary.quarantined += 1;
+        } else if (await this.retryLocal(event, owner, reason)) {
+          summary.retried += 1;
+        }
+      }
+      await this.reportError(new Error(
+        `local rows differ from their copy in the bound project: ${differing.map((event) => event.event_uuid).join(", ")}`,
+      ));
     }
-    if (view.missing.length === 0) return { batch, remote: view.records };
+    // Everything from here on concerns the rows not settled above. The records
+    // returned with them may include the differing rows' copies; uploadLocal
+    // only looks up the rows of the batch it is given.
+    const rest = batch.filter((event) => !differing.includes(event));
+    if (rest.length === 0) return null;
+    if (view.missing.length === 0) return { batch: rest, remote: view.records };
 
     let outcomes: PostgreSqlPassiveEventReleaseResult[];
     try {
@@ -520,7 +538,7 @@ export class PassiveEventReplicationWorker {
       );
     } catch (releaseError) {
       await this.reportError(releaseError);
-      await this.recoverBatch(batch, owner, releaseError, summary);
+      await this.recoverBatch(rest, owner, releaseError, summary);
       return null;
     }
     const asked = new Set(view.missing.map((event) => event.event_uuid));
@@ -539,7 +557,7 @@ export class PassiveEventReplicationWorker {
     }
     const retry: LocalHookEventRow[] = [];
     const mismatched: string[] = [];
-    for (const event of batch) {
+    for (const event of rest) {
       const eventId = event.event_uuid;
       if (view.byId.has(eventId)) {
         retry.push(event);

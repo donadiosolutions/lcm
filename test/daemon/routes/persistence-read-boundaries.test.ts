@@ -861,59 +861,71 @@ describe("persistence read route boundaries", () => {
   });
 
   it("returns common diagnostic snapshots and sanitizes aggregate failures", async () => {
-    const diagnostics = backendDiagnosticFailure(new Error("private diagnostic canary"), "sqlite");
-    const factory = injectedFactory();
-    const controller = new AbortController();
-    mocks.stats.mockReturnValueOnce({ projects: 0, backendDiagnostics: diagnostics } as never);
-    await invoke(createPoolStatsHandler("/configured-home", factory), {}, { signal: controller.signal });
-    expectLast(200, { backendDiagnostics: diagnostics });
-    expect(mocks.stats).toHaveBeenCalledWith({ homeDir: "/configured-home", storageFactory: factory, signal: controller.signal });
+    // Route and expected failure snapshots each sample Date.now() for observedAt.
+    const clock = vi.spyOn(Date, "now").mockReturnValue(1_792_476_802_277);
+    try {
+      const diagnostics = backendDiagnosticFailure(new Error("private diagnostic canary"), "sqlite");
+      const factory = injectedFactory();
+      const controller = new AbortController();
+      mocks.stats.mockReturnValueOnce({ projects: 0, backendDiagnostics: diagnostics } as never);
+      await invoke(createPoolStatsHandler("/configured-home", factory), {}, { signal: controller.signal });
+      expectLast(200, { backendDiagnostics: diagnostics });
+      expect(mocks.stats).toHaveBeenCalledWith({ homeDir: "/configured-home", storageFactory: factory, signal: controller.signal });
 
-    await invoke(createStatsHandler("/configured-home", factory), {}, { signal: controller.signal });
-    expectLast(200, { projects: 0 });
-    expect(mocks.stats).toHaveBeenCalledWith({ homeDir: "/configured-home", storageFactory: factory, signal: controller.signal });
-    mocks.stats.mockImplementationOnce(() => { throw new Error("private diagnostic canary"); });
-    await invoke(createStatsHandler(), {});
-    expectLast(200, { backendDiagnostics: backendDiagnosticFailure(new Error("unobserved")) });
-    mocks.stats.mockImplementationOnce(() => { throw new StatsUnavailableError(diagnostics); });
-    await invoke(createStatsHandler(), {});
-    expectLast(200, { backendDiagnostics: diagnostics });
-    expect(JSON.stringify(mocks.end.mock.calls)).not.toContain("private diagnostic canary");
+      await invoke(createStatsHandler("/configured-home", factory), {}, { signal: controller.signal });
+      expectLast(200, { projects: 0 });
+      expect(mocks.stats).toHaveBeenCalledWith({ homeDir: "/configured-home", storageFactory: factory, signal: controller.signal });
+      mocks.stats.mockImplementationOnce(() => { throw new Error("private diagnostic canary"); });
+      await invoke(createStatsHandler(), {});
+      expectLast(200, { backendDiagnostics: backendDiagnosticFailure(new Error("unobserved")) });
+      mocks.stats.mockImplementationOnce(() => { throw new StatsUnavailableError(diagnostics); });
+      await invoke(createStatsHandler(), {});
+      expectLast(200, { backendDiagnostics: diagnostics });
+      expect(JSON.stringify(mocks.end.mock.calls)).not.toContain("private diagnostic canary");
+    } finally {
+      clock.mockRestore();
+    }
   });
 
   it("preserves configured backend identity across sanitized route failures", async () => {
-    const unavailableDiagnostics = backendDiagnosticFailure(new Error("private unavailable"), "sqlite");
-    const handlers = [
-      ["stats", createStatsHandler],
-      ["pool", createPoolStatsHandler],
-    ] as const;
-    const factories = [
-      ["sqlite", injectedFactory()],
-      ["postgresql", {...injectedFactory(),backend:"postgresql"} as StorageBackendFactory],
-      ["unavailable", undefined],
-    ] as const;
-    const failures = [
-      new Error("private error canary"),
-      {private:"non-error canary"},
-      new BackendPublicationJournalError("unexpected-state", "private publication canary"),
-    ];
-    for (const [_route, createHandler] of handlers) {
-      for (const [backend, factory] of factories) {
-        for (const failure of failures) {
-          mocks.stats.mockImplementationOnce(() => { throw failure; });
-          await invoke(createHandler("/configured-home", factory), {});
-          const expected = backendDiagnosticFailure(failure, backend);
-          expectLast(200, {backendDiagnostics:expected});
-          expect(expected.metrics).toBeUndefined();
-          expect(JSON.stringify(mocks.end.mock.calls.at(-1))).not.toMatch(/private|canary/);
+    // Route and expected failure snapshots each sample Date.now() for observedAt.
+    const clock = vi.spyOn(Date, "now").mockReturnValue(1_792_476_802_277);
+    try {
+      const unavailableDiagnostics = backendDiagnosticFailure(new Error("private unavailable"), "sqlite");
+      const handlers = [
+        ["stats", createStatsHandler],
+        ["pool", createPoolStatsHandler],
+      ] as const;
+      const factories = [
+        ["sqlite", injectedFactory()],
+        ["postgresql", {...injectedFactory(),backend:"postgresql"} as StorageBackendFactory],
+        ["unavailable", undefined],
+      ] as const;
+      const failures = [
+        new Error("private error canary"),
+        {private:"non-error canary"},
+        new BackendPublicationJournalError("unexpected-state", "private publication canary"),
+      ];
+      for (const [_route, createHandler] of handlers) {
+        for (const [backend, factory] of factories) {
+          for (const failure of failures) {
+            mocks.stats.mockImplementationOnce(() => { throw failure; });
+            await invoke(createHandler("/configured-home", factory), {});
+            const expected = backendDiagnosticFailure(failure, backend);
+            expectLast(200, {backendDiagnostics:expected});
+            expect(expected.metrics).toBeUndefined();
+            expect(JSON.stringify(mocks.end.mock.calls.at(-1))).not.toMatch(/private|canary/);
+          }
         }
       }
-    }
 
-    for (const createHandler of [createStatsHandler,createPoolStatsHandler]) {
-      mocks.stats.mockImplementationOnce(() => { throw new StatsUnavailableError(unavailableDiagnostics); });
-      await invoke(createHandler("/configured-home", injectedFactory()), {});
-      expectLast(200, {backendDiagnostics:unavailableDiagnostics});
+      for (const createHandler of [createStatsHandler,createPoolStatsHandler]) {
+        mocks.stats.mockImplementationOnce(() => { throw new StatsUnavailableError(unavailableDiagnostics); });
+        await invoke(createHandler("/configured-home", injectedFactory()), {});
+        expectLast(200, {backendDiagnostics:unavailableDiagnostics});
+      }
+    } finally {
+      clock.mockRestore();
     }
   });
 

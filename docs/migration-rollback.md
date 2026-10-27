@@ -42,6 +42,10 @@ create in the same run.
   aside to a lineage path, never truncated, replaced in place, or unlinked.
   It is checkpointed and witnessed by content hash both before and after the
   move, so the preserved copy is provably byte-identical to what was live.
+- Rollback does not delete the destination project or its alias rows in
+  PostgreSQL: the canonical path and every project-map alias that `apply`
+  migrated stay there, and the local project map keeps listing the same
+  aliases.
 
 ## A generation that never activated cannot be rolled back
 
@@ -76,9 +80,27 @@ the project map, it would be silently stranded on a backend it no longer
 routes to. Rollback therefore refuses (`multiple-remote-projects`) unless the covered project is the only one bound to
 PostgreSQL. A local-only entry never blocks. The check runs before maintenance
 is entered and again right before the selection is prepared. Unbind or migrate
-the other projects first. Installation-wide (multi-project) rollback is tracked
-by [#1544](https://github.com/donadiosolutions/lcm/issues/1544); until then the
-refusal stands.
+the other projects first. This is the single-generation rollback's rule.
+A home whose projects moved together as a cutover set is rolled back with the
+set form, which returns every member to SQLite through one publication, so
+the global selection is never split:
+
+```bash
+lcm migration rollback --set --generation <original-set-id> \
+  --confirm-generation <original-set-id> --confirm-backend sqlite
+```
+
+Always pass the **original** activated set id, also to resume an interrupted
+set rollback; the rollback hold has its own derived id, which the report
+prints as `rollbackSetId` and no command accepts. Every member gets a new SQLite
+generation and the original member generations are kept as history. The set
+rollback uses the runtime-role `LCM_POSTGRES_URL` as above, needs PostgreSQL
+reachable (there is no offline restoration), and has no abort once its
+checkpoint is written. Do not unbind projects by hand to get past the
+single-generation refusal: it protects the members of a set from a split
+selection. See
+[Cutover sets: rolling a set back](migration-cutover-set.md#rolling-a-set-back)
+and [the operator runbook](migration-cutover-set.md#running-a-set-with-lcm-migration---set).
 
 ## What activation evidence rollback relies on
 
@@ -98,8 +120,9 @@ A rollback can be interrupted at any point -- before entering maintenance,
 while maintenance is held, mid-build, or after the destination selection has
 already flipped but before the run finished recording that fact. Every one of
 those windows resumes to exactly one authoritative outcome, and a retry
-resolves every one of them except the single case described under "A prepared
-selection that drifted" below.
+resolves every one of them except the cases described under "A prepared
+selection that drifted" and "An externally aborted rollback publication" below
+when the destination changed in between.
 
 On a post-write rollback specifically, a retry after a crash **never
 resumes copying into the same partial generation**. It builds a brand-new
@@ -149,6 +172,57 @@ What the operator sees is that same `drift` refusal on every run. Do not
 force a re-selection or edit the journal: investigate the write that got past
 the fence, and treat the installation as PostgreSQL-authoritative until #1529
 provides the authenticated abort that returns it to a resumable state.
+
+### An externally aborted rollback publication
+
+The rollback's own backend publication can be aborted by something other than
+the rollback (an operator or another tool running the publication abort). An
+abort restores the configuration and project map the publication began from,
+releases the PostgreSQL lease it had recorded and removes the publication's
+sealed material; it can also stop part-way, for instance after the lease was
+released but before the publication was marked aborted. The rollback itself
+stays pending in every case, and running the same rollback operation again
+completes it:
+
+1. When the abort stopped part-way after it had already removed the sealed
+   material, the live configuration and project map are checked first: they
+   must be byte-for-byte the files the publication recorded as its source. A
+   file edited since then refuses the run (`unexpected-state` or
+   `not-eligible`) before the abort is finished and before any session is
+   opened, so the journal stays at `abort-releasing`.
+2. A part-way abort is then finished, without opening any PostgreSQL session,
+   and the restored files are checked against the same witness again. A
+   mismatch refuses the run (`unexpected-state` or `not-eligible`) and
+   changes nothing further: the aborted journal, the pending effect and the
+   lease row are left as they were. A lease the abort released stays released,
+   and a lease the publication never acquired is left unchanged.
+3. A session then takes the rollback's lease: a new lease token when the abort
+   released the one the publication held, or the existing lease when the
+   publication never acquired one.
+4. The destination is re-read under that lease and must still reproduce the
+   pending rollback's terminal evidence, and the activation authority is
+   resolved again. Because the rollback's own aborted publication now occupies
+   the slot where the activation's operability fact used to be read, that fact
+   is taken from the rollback authority artifact written before the rollback
+   began, only after the live slot reports no positive fact; an unreadable slot
+   or a missing artifact refuses.
+5. Only then is the publication prepared again over the aborted journal, which
+   is archived, and published forward as usual. The rollback settles as
+   `rolled-back`, replay admission routes to SQLite from the rollback
+   binding, and the lease is released.
+
+If step 4 finds that the destination drifted (or the authority no longer
+resolves), the run refuses with `drift` or `not-eligible` and changes
+nothing further. What remains is the pending `publish-rollback` effect, the
+aborted publication in the slot, the lease held by the recovery session, the
+PostgreSQL configuration and project map the abort restored, and replay
+admission routed to SQLite from the rollback binding. Every further retry
+refuses the same way until the destination again reproduces the recorded
+evidence. Do not edit the journal or the restored files. The composition check
+on the journal (PostgreSQL back to the pre-activation backend, for the covered
+project) proves what the publication was meant to do; it does not prove that
+the restored files are the original bytes, which is why the files are compared
+with the recorded witnesses.
 
 ## Operator-owned cleanup of quarantined and incomplete generations
 
@@ -239,6 +313,14 @@ is the abort evidence itself admitted, on PostgreSQL. Neither path ever answers
 SQLite. Only an aborted activation window selects SQLite, because that is the
 backend it was entered from.
 
+## Upgrading LCM during a rollback
+
+The portable schema digest changes in the release that adds
+`conversations.parent_session_id`. Census evidence and cutover proof
+manifests produced by an older LCM fail closed with `incompatible-schema`
+under the new binary. Finish or abandon an in-flight rollback before
+upgrading, then rerun it with the new binary.
+
 ## The maintenance window scales with data size
 
 Rollback holds the same PostgreSQL fence used by the forward migration for
@@ -265,11 +347,46 @@ cutoff: once the selection is back on SQLite, the daemon's passive sweep
 drains it (see [Passive learning](passive-learning.md)). Until that sweep
 has run, the backlog stays preserved and correctly routed.
 
-## Current rollout boundary: no operator command yet
+An archived passive event can already be in the local outbox when rollback
+runs. Rollback checks that row against the archive and compares its
+timestamp by instant rather than as text. The local outbox stores SQLite's
+`YYYY-MM-DD HH:MM:SS` form, while the archive stores the portable ISO form
+(`YYYY-MM-DDTHH:MM:SS.ffffffZ`), so both forms of the same instant match and
+rollback proceeds. A malformed timestamp, or one that names a different
+instant, still refuses the run.
+
+A passive event the daemon already drained (its `processed_at` is set) can
+still be listed as pending in PostgreSQL's inbox, because that inbox applies
+events asynchronously. Rollback accepts such a row and leaves it as it is, so
+the SQLite consumer does not replay it. A row the archive
+still holds that genuinely contradicts it, for example one that is
+acknowledged but not processed, refuses the run before rollback publishes
+anything: the canonical database is not replaced and the same rollback can be
+retried once the row is resolved.
+
+After a drain, the replication worker deletes PostgreSQL's inbox row for each
+delivered event and records that locally (`remote_pruned_at`). The archive no
+longer lists such an event, and that is the normal state after a drain, so
+rollback accepts the row and keeps it unchanged. It is not replayed only if its
+`processed_at` was already set; the remote delivery itself applies nothing, so
+a pruned row that was never processed is still promoted by the SQLite
+consumer. A delivered row without that prune record, whose inbox row
+PostgreSQL should still hold but the archive lacks, still refuses the run
+before rollback publishes anything.
+
+## Running it: `lcm migration rollback`
 
 Rollback publishes its configuration and project map through the same
 coordinator as activation, and it releases its PostgreSQL fence when the
 publication completes, so every LCM consumer sees SQLite selected once a
-rollback finishes. The orchestration is complete, but there is no CLI command
-or daemon trigger that starts it yet: the operator command (issue #627) will
-call the single internal entry point. Do not look for one in the meantime.
+rollback finishes. The operator command is
+`lcm migration rollback --confirm-generation <id> --confirm-backend sqlite`; it calls the single
+internal entry point, maps its seven refusal reasons to exit codes, checks that
+the manifest reads `rolled-back` and runs the SQLite restart check. The runbook,
+[Migration operations](migration-operations.md#rollback-and-its-limits), has the
+exit table. Rollback refuses while any other project is remotely bound, because
+the backend selection is global.
+
+Run it after revoking the transfer grants, with `LCM_POSTGRES_URL` set to the daemon's
+runtime-role connection and `migrationRole` still naming the schema owner;
+the transfer-role URL used for activation is refused.

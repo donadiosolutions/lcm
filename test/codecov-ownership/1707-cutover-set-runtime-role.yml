@@ -1,0 +1,13 @@
+references: ["#1707"]
+rationale: >-
+  Cutover-set activation now shares runtime-role discovery with
+  single-generation activation, resolves the distinct runtime connection in
+  the set CLI, updates the set refusal remedy, and aligns executable help with
+  the grant-first cutover. Existing files retain their current components.
+pins:
+  - ["src/migration/activate-generation.ts", "unit-migration-cutover"]
+  - ["src/migration/cutover-set-activate.ts", "unit-migration-cutover"]
+  - ["src/migration/cli-cutover-set.ts", "unit-migration-cutover"]
+  - ["src/migration/refusal-mapping.ts", "unit-migration-cutover"]
+  - ["src/cli-help.ts", "unit-cli"]
+  - ["bin/lcm.ts", "unit-cli"]

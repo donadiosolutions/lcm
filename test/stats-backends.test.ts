@@ -1,5 +1,6 @@
 import { afterEach, describe, expect, it, vi } from "vitest";
 import type { BackendDiagnosticSnapshot } from "../src/storage/diagnostics.js";
+import { telemetryFillers } from "../src/storage/runtime-health.js";
 
 const probe = vi.hoisted(() => ({ collect: vi.fn() }));
 vi.mock("../src/storage/diagnostics.js", () => ({ collectBackendDiagnostics: probe.collect }));
@@ -9,7 +10,8 @@ function snapshot(): BackendDiagnosticSnapshot {
   return {
     backend: "postgresql", classification: "healthy", publication: "ready", tls: "ready",
     schema: "ready", extensions: "ready", search: "ready", pool: { origin: "diagnostic-probe", status: "ready" },
-    project: { scope: "aggregate", status: "ready" }, identity: { status: "ready" }, outbox: { status: "unverified" }, remediation: "No action required.",
+    project: { scope: "aggregate", status: "ready" }, identity: { status: "ready" }, outbox: { status: "unverified" },
+    telemetry: telemetryFillers("postgresql", "unavailable", 0), remediation: "No action required.",
     metrics: {
       projects: 2, conversations: 3, compactedConversations: 1, messages: 8, summaries: 2,
       maxDepth: 2, rawTokens: 90, summaryTokens: 10, ratio: 9, promotedCount: 4,

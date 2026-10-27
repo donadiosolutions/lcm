@@ -1,0 +1,28 @@
+references: ["#1550", "#1544"]
+rationale: >-
+  #1550 rolls a cutover set back into new SQLite generations through one
+  reverse publication. The new set rollback service and the durable set
+  rollback records store (checkpoint, per-member installation records and
+  the thin frozen tuple) join the migration capture, copy and cutover
+  owner next to the set activation they unwind. The rollback session
+  module gains its separately named set member opener, non-owning runtime
+  lifetime and set recovery admission; the copy source module exposes the
+  preserved snapshot's raw portable source; the single-generation rollback
+  exports its bounded build-attempt enumerator; the maintenance module
+  gains the set rollback replay admission; the set activation, set
+  preparation and migration abort gain their rollback guards; each keeps
+  its existing migration owner. The storage journal gains the thin rollback
+  selection tuple, its parser and capacity, and keeps its storage
+  abstractions owner. No file is removed, moved or re-owned.
+pins:
+  - ["src/migration/cutover-set-rollback.ts", "unit-migration-cutover"]
+  - ["src/migration/cutover-set-rollback-store.ts", "unit-migration-cutover"]
+  - ["src/migration/rollback-session.ts", "unit-migration-cutover"]
+  - ["src/migration/copy-source.ts", "unit-migration-cutover"]
+  - ["src/migration/rollback.ts", "unit-migration-cutover"]
+  - ["src/migration/maintenance.ts", "unit-migration-cutover"]
+  - ["src/migration/cutover-set-activate.ts", "unit-migration-cutover"]
+  - ["src/migration/cutover-set-prepare.ts", "unit-migration-cutover"]
+  - ["src/migration/abort.ts", "unit-migration-cutover"]
+  - ["src/storage/backend-publication.ts", "unit-storage-abstractions"]
+

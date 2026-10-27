@@ -6,7 +6,8 @@ import {
 import type { PostgreSqlQueryExecutor } from "./contracts.js";
 
 type Row = Record<string, unknown>;
-type Field = readonly [property: string, column: string, kind?: "integer" | "timestamp" | "json"];
+// "optional" columns are omitted from the portable value while they are NULL.
+type Field = readonly [property: string, column: string, kind?: "integer" | "timestamp" | "json" | "optional"];
 interface Mapping { readonly table: string; readonly keys: readonly string[]; readonly fields: readonly Field[]; readonly joins?: string; }
 const fields = (names: string): readonly Field[] => names.split(" ").map((name) => {
   const [property, kind] = name.split(":");
@@ -19,7 +20,7 @@ const mappings: Record<PortableDomain, Mapping> = {
   machines: {table:"lcm.machines", keys:["machine_id"],fields:fields("identityKey machineId")},
   project: {table:"lcm.projects",keys:["project_id"],fields:[]},
   "project-aliases":{table:"lcm.project_aliases",keys:["machine_id","normalized_path"],fields:fields("path normalizedPath"),joins:machineJoin},
-  conversations:{table:"lcm.conversations",keys:["conversation_id"],fields:fields("sessionId title bootstrappedAt:timestamp createdAt:timestamp updatedAt:timestamp")},
+  conversations:{table:"lcm.conversations",keys:["conversation_id"],fields:fields("sessionId title bootstrappedAt:timestamp createdAt:timestamp updatedAt:timestamp parentSessionId:optional")},
   messages:{table:"lcm.messages",keys:["message_id"],fields:fields("seq:integer role content tokenCount:integer createdAt:timestamp")},
   "message-parts":{table:"lcm.message_parts",keys:["part_id"],fields:fields("partId sessionId partType ordinal:integer textContent isIgnored isSynthetic toolCallId toolName toolStatus toolInput toolOutput toolError toolTitle patchHash patchFiles fileMime fileName fileUrl subtaskPrompt subtaskDescription subtaskAgent stepReason stepCost stepTokensIn:integer stepTokensOut:integer snapshotHash compactionAuto metadata")},
   "large-files":{table:"lcm.large_files",keys:["file_key"],fields:fields("fileId fileName mimeType byteSize:integer storageUri explorationSummary createdAt:timestamp")},
@@ -80,7 +81,7 @@ function projection(domain: PortableDomain, mapping: Mapping): string {
   if (domain === "native-transcript-message-links") columns.set("ingest_key","t.ingest_key AS ingest_key");
   if (domain === "passive-events") {
     columns.set("status","r.status AS status");
-    columns.set("payload_envelope_supported", `(r.payload ?& ARRAY['sessionId','sessionSequence','category','data','priority','sourceHook','createdAt'] AND NOT EXISTS (SELECT 1 FROM pg_catalog.jsonb_object_keys(r.payload) AS envelope(key) WHERE envelope.key NOT IN ('sessionId','sessionSequence','category','data','priority','sourceHook','createdAt')) AND pg_catalog.jsonb_typeof(r.payload->'sessionId') = 'string' AND pg_catalog.jsonb_typeof(r.payload->'category') = 'string' AND pg_catalog.jsonb_typeof(r.payload->'data') = 'string' AND pg_catalog.jsonb_typeof(r.payload->'sourceHook') = 'string' AND pg_catalog.jsonb_typeof(r.payload->'createdAt') = 'string' AND pg_catalog.jsonb_typeof(r.payload->'sessionSequence') = 'number' AND pg_catalog.jsonb_typeof(r.payload->'priority') = 'number') AS payload_envelope_supported`);
+    columns.set("payload_envelope_supported", `(r.payload ?& ARRAY['sessionId','sessionSequence','category','data','priority','sourceHook','createdAt'] AND NOT EXISTS (SELECT 1 FROM pg_catalog.jsonb_object_keys(r.payload) AS envelope(key) WHERE envelope.key NOT IN ('sessionId','sessionSequence','category','data','priority','sourceHook','createdAt','previousEventId')) AND (NOT r.payload ? 'previousEventId' OR pg_catalog.jsonb_typeof(r.payload->'previousEventId') = 'null' OR (pg_catalog.jsonb_typeof(r.payload->'previousEventId') = 'number' AND (r.payload->'previousEventId')::pg_catalog.text ~ '^[1-9][0-9]*$')) AND pg_catalog.jsonb_typeof(r.payload->'sessionId') = 'string' AND pg_catalog.jsonb_typeof(r.payload->'category') = 'string' AND pg_catalog.jsonb_typeof(r.payload->'data') = 'string' AND pg_catalog.jsonb_typeof(r.payload->'sourceHook') = 'string' AND pg_catalog.jsonb_typeof(r.payload->'createdAt') = 'string' AND pg_catalog.jsonb_typeof(r.payload->'sessionSequence') = 'number' AND pg_catalog.jsonb_typeof(r.payload->'priority') = 'number') AS payload_envelope_supported`);
     for (const key of ["sessionId","sessionSequence","category","data","priority","sourceHook","createdAt"]) columns.set(key,`r.payload->>'${key}' AS "${key}"`);
   }
   return [...columns.values()].join(", ");
@@ -239,6 +240,7 @@ export function decodeCanonicalRow(domain:PortableDomain,row:Row,parent:Canonica
   const value:Row = {};
   for (const [property,column,kind] of mappings[domain].fields) {
     const raw = row[column];
+    if (kind === "optional" && (raw === null || raw === undefined)) continue;
     if (raw === undefined) fail();
     value[property] = kind === "json" ? JSON.parse(text(raw)) : raw;
   }
@@ -346,6 +348,7 @@ export async function insertCanonicalRecord(executor:PostgreSqlQueryExecutor,pro
     add("transcript_id",transcript.id);
   }
   for (const [property,column,kind] of mapping.fields) {
+    if (kind === "optional" && value[property] === undefined) continue;
     const input = domain === "promoted-memories" && property === "sourceProjectId" && value[property] === null
       ? projectId : value[property];
     add(column,kind === "json" ? canonicalJson(input) : scalar(input),kind === "json" ? "?::jsonb" : undefined);

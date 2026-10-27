@@ -13,7 +13,9 @@ import { PostgreSqlRuntime } from "../../src/storage/postgresql/runtime.js";
 import { createCertificate, encodeBookkeeping, loadMatrix, sourceDigest } from "../../scripts/surface-parity-artifact.mjs";
 import { assertCompleteReport, assertSemanticEqual, compareBackendReports, semanticDigest } from "../surface-parity/assertions.mjs";
 import { createAdmissionLedger, preparedCase, validatePreparedCatalog } from "../surface-parity/prepared-projects.mjs";
+import { partitionFencedLeases, settleHeldLeases } from "../surface-parity/passive-leases.mjs";
 import { createGitFixture } from "../surface-parity/git-fixture.mjs";
+import { workerLaunchOptions } from "../surface-parity/local-isolation.mjs";
 import { FAULT_ASSERTION_OWNERS, type SurfaceRow } from "../surface-parity/inventory.js";
 import { expectedSurfaceObservations } from "./fixtures/surface-parity-workflows.mjs";
 import { assertHarnessReady, createPostgreSqlTestDatabase, harnessEnvironment, settings, type PostgreSqlTestDatabase } from "./harness.js";
@@ -29,7 +31,7 @@ interface Deferred<T> { promise: Promise<T>; resolve(value: T): void; reject(err
 interface WorkerPaths { homeDir: string; projectPath: string; secondaryProjectPath: string }
 type CorpusCounts = { projects: number; conversations: number; messages: number; summaries: number; promotedCount: number };
 
-const SCENARIOS = ["identity", "admin", "events", "memory", "compaction", "native-import", "knowledge", "sensitive", "hooks", "promotion", "diagnostics"] as const;
+const SCENARIOS = ["identity", "admin", "migration", "events", "memory", "compaction", "native-import", "knowledge", "sensitive", "hooks", "promotion", "diagnostics"] as const;
 const FAULT_SCENARIOS = ["fault-denial", "fault-pool", "fault-cancellation", "fault-unavailable"] as const;
 type FaultScenario = typeof FAULT_SCENARIOS[number];
 const SCENARIO_TIMEOUT = 120_000;
@@ -94,8 +96,11 @@ class OwnedAdministrator {
   private prepared?: { token: number; caseId: string; paths: string[]; before: { projects: Json[]; aliases: Json[]; snapshot: Json } };
   private preparedSequence = 0;
   private preparedPaths?: WorkerPaths;
+  private fixtureMachineId?: string;
+  private passiveLeaseProjects: string[] = [];
 
   setPreparedPaths(paths: WorkerPaths): void { requireThat(!this.preparedPaths, "prepared-paths-once"); this.preparedPaths = paths; }
+  setFixtureMachine(machineId: string): void { requireThat(!this.fixtureMachineId, "fixture-machine-once"); this.fixtureMachineId = machineId; }
 
   constructor(private database: PostgreSqlTestDatabase, private unavailable: () => Promise<Json>) {
     this.runtime = new PostgreSqlRuntime(settings(database.adminUrl));
@@ -247,22 +252,29 @@ class OwnedAdministrator {
 
   /**
    * Main 9174f381 (passive-event replication in the daemon) makes every daemon
-   * start or pass acquire and release one fenced lease row per machine:
-   * resource_type passive-events, operation replicate, keyed by the machine id.
-   * Only that exact shape is exempt from the exact table digest; any other
-   * passive-events lease row fails here, and every other lease row stays pinned.
+   * start or pass acquire and release one fenced lease row per remote-bound
+   * project: resource_type passive-events, operation replicate, keyed by the
+   * machine id. Only released leases of the fixture machine's bound projects
+   * are exempt from the exact table digest (see passive-leases.mjs). A
+   * well-formed fixture lease that is still held belongs to an in-flight
+   * sweep (the startup sweep is not synchronised with daemon readiness), so
+   * snapshot() re-reads it up to the settle bound; any other passive-events
+   * row fails the snapshot at once, and every other lease row stays pinned.
+   * The aliases are read after the leases, so a project bound in between can
+   * only widen the bound set.
    */
-  private async requirePassiveReplicationLeases(): Promise<void> {
-    const leases = await this.runtime.query<{ row: Json }>({
-      text: "SELECT to_jsonb(record) AS row FROM lcm.fenced_leases record WHERE record.resource_type = 'passive-events'",
+  private async pinnedLeaseRows(leases: Json[]): Promise<Json[]> {
+    requireThat(this.fixtureMachineId, "fixture-machine-unset");
+    const bound = await this.runtime.query<{ project_id: string }>({
+      text: "SELECT DISTINCT project_id::text AS project_id FROM lcm.project_aliases WHERE machine_id=$1",
+      values: [this.fixtureMachineId],
     }, scope);
-    for (const { row } of leases.rows) {
-      requireThat(object(row) && row.operation === "replicate" && typeof row.resource_key === "string"
-        && row.resource_key === row.owner_machine_id && typeof row.owner_process_id === "string"
-        && /^lcm-daemon:[0-9a-f-]{36}$/u.test(row.owner_process_id)
-        && typeof row.fencing_token === "number" && row.fencing_token >= 1, "passive-replication-lease-shape");
-    }
-    if (leases.rows.length > 0) this.passiveLeaseObserved = true;
+    const { pinned, exempt } = partitionFencedLeases(leases, {
+      machineId: this.fixtureMachineId, projectIds: bound.rows.map(row => row.project_id), previous: this.passiveLeaseProjects,
+    });
+    this.passiveLeaseProjects = exempt;
+    if (exempt.length > 0) this.passiveLeaseObserved = true;
+    return pinned;
   }
 
   /** The settle step is only meaningful if a pending delivery was actually replicated at least once. */
@@ -275,7 +287,12 @@ class OwnedAdministrator {
     requireThat(this.passiveLeaseObserved, "passive-replication-lease-observed");
   }
 
-  private async snapshot(): Promise<Json> {
+  /** Re-reads the whole snapshot while a fixture lease is still held, up to the bound in settleHeldLeases (matches the worker's 30 s startup pass). */
+  private snapshot(): Promise<Json> {
+    return settleHeldLeases(() => this.readSnapshot());
+  }
+
+  private async readSnapshot(): Promise<Json> {
     const catalog = await this.runtime.query<{ table_name: string; column_name: string; data_type: string; is_nullable: string; column_default: string | null }>({
       text: `SELECT table_name,column_name,data_type,is_nullable,column_default
         FROM information_schema.columns WHERE table_schema='lcm'
@@ -299,16 +316,18 @@ class OwnedAdministrator {
     for (const { name } of names.rows) {
       requireThat(/^[a-z][a-z0-9_]{0,62}$/u.test(name), "snapshot-table-name");
       // The daemon's passive-event replication lane acquires and releases a
-      // fenced lease per pass, so its bookkeeping row can appear or advance
-      // across a restart or an idle interval without any user-visible change.
-      // That one bounded row shape is validated below and excluded from the
-      // exact digest; every other lease row stays exactly pinned.
+      // fenced lease per bound project and pass, so its bookkeeping rows can
+      // appear or advance across a restart or an idle interval without any
+      // user-visible change. Only released fixture-machine leases of bound
+      // projects are validated and excluded from the exact digest; a still-held
+      // fixture lease throws and is waited out by snapshot(); every other lease
+      // row stays exactly pinned.
       const rows = await this.runtime.query<{ row: Json }>({
-        text: `SELECT to_jsonb(record) AS row FROM lcm."${name}" AS record${name === "fenced_leases" ? " WHERE record.resource_type <> 'passive-events'" : ""}
+        text: `SELECT to_jsonb(record) AS row FROM lcm."${name}" AS record
           ORDER BY to_jsonb(record)::text COLLATE "C"`,
       }, scope);
-      tables[name] = { count: rows.rows.length, digest: semanticDigest(rows.rows.map(row => row.row)) };
-      if (name === "fenced_leases") await this.requirePassiveReplicationLeases();
+      const records = name === "fenced_leases" ? await this.pinnedLeaseRows(rows.rows.map(row => row.row)) : rows.rows.map(row => row.row);
+      tables[name] = { count: records.length, digest: semanticDigest(records) };
     }
     const counts = await this.runtime.query<{ projects: number; conversations: number; messages: number; summaries: number; promotedCount: number }>({
       text: `SELECT (SELECT count(*)::integer FROM lcm.projects) AS projects,
@@ -536,7 +555,7 @@ class FixedBackendWorker {
   constructor(readonly backend: Backend, env: NodeJS.ProcessEnv, private administrator: OwnedAdministrator) {
     if (backend === "postgresql") administrator.setPreparedPaths({ homeDir: env.HOME!, projectPath: env.LCM_SURFACE_PROJECT_PATH!, secondaryProjectPath: env.LCM_SURFACE_SECONDARY_PROJECT_PATH! });
     this.child = fork(join(process.cwd(), "test/postgresql/fixtures/surface-parity-worker.mjs"), [], {
-      cwd: process.cwd(), env, execArgv: [], detached: true,
+      cwd: process.cwd(), env, detached: true, ...workerLaunchOptions(),
       stdio: ["ignore", "pipe", "pipe", "ipc"],
     });
     for (const stream of [this.child.stdout, this.child.stderr]) {
@@ -764,6 +783,7 @@ describe.sequential("complete configured backend surface parity", () => {
       const primary = await repository.createProject({ machineId: machine.machineId, displayName: "Surface parity primary", path: pgPaths.projectPath, normalizedPath: resolve(pgPaths.projectPath) });
       const secondary = await repository.createProject({ machineId: machine.machineId, displayName: "Surface parity secondary", path: pgPaths.secondaryProjectPath, normalizedPath: resolve(pgPaths.secondaryProjectPath) });
       faultAuthority = { machine, project: primary, projectPath: pgPaths.projectPath };
+      administrator.setFixtureMachine(machine.machineId);
       writeFileSync(join(pgPaths.homeDir, ".lcm", "machine.json"), JSON.stringify({ version: 1, identityKey: machine.identityKey, machineId: machine.machineId, displayName: machine.displayName }) + "\n", { mode: 0o600 });
       await publishPostgreSqlSelection(pgPaths.homeDir, machine, primary, pgPaths.projectPath);
       // The secondary binding is subsequently admitted by the worker's public

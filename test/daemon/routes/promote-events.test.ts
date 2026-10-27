@@ -324,6 +324,56 @@ describe("promote-events route", () => {
     verify.close();
   });
 
+  it.each([
+    { type: "file_read", category: "file", applied: true },
+    { type: "tool_outcome_unknown", category: "tool", applied: false },
+  ] as const)("records unknown tool outcomes as receipt-era no-effect despite a lexical match: $type", async (event) => {
+    recoverMachineIdentity({
+      version: 1,
+      identityKey: `machine:${"e".repeat(64)}`,
+      machineId: MACHINE_ID,
+      displayName: "Machine A",
+    }, { homeDir });
+    const projectDb = setupProjectDb(dir);
+    adoptMigrationReceiptEpoch(projectDb, {
+      projectId: projectId(dir),
+      machineId: MACHINE_ID,
+      epochId: "318f22c4-6d2a-4f10-8a4c-6b8d3e5f9012",
+      firstMachineSequence: "0000000000000000000",
+      establishedAt: "2026-09-07T03:04:05.123456Z",
+    });
+    new PromotedStore(projectDb).insert({
+      content: "outcome probe", tags: [], projectId: projectId(dir), depth: 0, confidence: 0.5,
+    });
+    projectDb.close();
+    const edb = new EventsDb(sidecarPath);
+    edb.insertEvent("s1", { type: event.type, category: event.category, data: "outcome probe", priority: 3 }, "PostToolUse");
+    edb.close();
+
+    const run = async () => {
+      const output = mockRes();
+      await createPromoteEventsHandler(makeConfig())(request, output.res, JSON.stringify({ cwd: dir }));
+      return output.getBody();
+    };
+    expect(await run()).toMatchObject({
+      promoted: event.applied ? 1 : 0, skipped: event.applied ? 0 : 1, errors: 0,
+    });
+    const verify = new DatabaseSync(projectDbPath(dir), { readOnly: true });
+    expect(readMigrationReceiptEvidence(verify, projectId(dir), MACHINE_ID).receipts)
+      .toMatchObject([event.applied ? { outcome: "applied" } : {
+        outcome: "no-effect",
+        effectWitness: { reason: "unreinforced-pattern" },
+      }]);
+    expect(new PromotedStore(verify).getAll()).toHaveLength(1);
+    verify.close();
+    const sidecar = new EventsDb(sidecarPath);
+    expect(sidecar.getUnprocessed()).toEqual([]);
+    sidecar.close();
+
+    expect(await run()).toMatchObject({ promoted: 0, skipped: 0 });
+    expect(vi.mocked(deduplicateAndInsertInRepositories)).toHaveBeenCalledTimes(event.applied ? 1 : 0);
+  });
+
   it.each(["applied", "no-effect"] as const)("retries a committed %s receipt without repeating its decision or effect", async (outcome) => {
     recoverMachineIdentity({
       version: 1,
@@ -921,6 +971,57 @@ describe("promote-events route", () => {
     expect(result.promoted).toBe(0);
     expect(result.skipped).toBe(3);
     expect(deduplicateAndInsert).not.toHaveBeenCalled();
+  });
+
+  it.each([
+    { type: "file_read", category: "file", data: "outcome probe", promoted: 1 },
+    { type: "tool_outcome_unknown", category: "tool", data: "outcome probe", promoted: 0 },
+  ])("does not promote unknown tool outcomes even when a lexical match exists: $type", async (event) => {
+    const projectDb = setupProjectDb(dir);
+    new PromotedStore(projectDb).insert({
+      content: event.data, tags: [], projectId: projectId(dir), depth: 0, confidence: 0.5,
+    });
+    projectDb.close();
+    const edb = new EventsDb(sidecarPath);
+    edb.insertEvent("s1", { type: event.type, category: event.category, data: event.data, priority: 3 }, "PostToolUse");
+    edb.close();
+
+    const { res, getBody } = mockRes();
+    await createPromoteEventsHandler(makeConfig())(request, res, JSON.stringify({ cwd: dir }));
+
+    expect(getBody()).toMatchObject({ promoted: event.promoted, skipped: 1 - event.promoted, errors: 0 });
+    expect(deduplicateAndInsert).toHaveBeenCalledTimes(event.promoted);
+    const verify = new EventsDb(sidecarPath);
+    expect(verify.getUnprocessed()).toEqual([]);
+    verify.close();
+  });
+
+  it("does not correlate an unknown tool outcome as the fix for an earlier error", async () => {
+    const edb = new EventsDb(sidecarPath);
+    edb.insertEvent("s1", { type: "error_tool", category: "error", data: "Bash error: outcome", priority: 1 }, "PostToolUse");
+    edb.insertEvent("s1", {
+      type: "tool_outcome_unknown",
+      category: "tool",
+      data: "Bash outcome unknown: git commit",
+      priority: 3,
+    }, "PostToolUse");
+    edb.close();
+    setupProjectDb(dir).close();
+
+    const setPrev = vi.spyOn(EventsDb.prototype, "setPrevEventId");
+    const { res, getBody } = mockRes();
+    try {
+      await createPromoteEventsHandler(makeConfig())(request, res, JSON.stringify({ cwd: dir }));
+
+      expect(getBody()).toMatchObject({ promoted: 1, skipped: 1, correlated: 0, errors: 0 });
+      expect(setPrev).not.toHaveBeenCalled();
+    } finally {
+      setPrev.mockRestore();
+    }
+    expect(deduplicateAndInsert).toHaveBeenCalledTimes(1);
+    const call = vi.mocked(deduplicateAndInsert).mock.calls[0][0];
+    expect(call.content).toBe("Bash error: outcome");
+    expect(call.tags).not.toContain("type:solution");
   });
 
   it("is idempotent — skips already-processed events", async () => {

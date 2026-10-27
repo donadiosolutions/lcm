@@ -629,7 +629,8 @@ export function runLcmMigrations(
       title TEXT,
       bootstrapped_at TEXT,
       created_at TEXT NOT NULL DEFAULT (datetime('now')),
-      updated_at TEXT NOT NULL DEFAULT (datetime('now'))
+      updated_at TEXT NOT NULL DEFAULT (datetime('now')),
+      parent_session_id TEXT
     );
 
     CREATE TABLE IF NOT EXISTS messages (
@@ -808,6 +809,9 @@ export function runLcmMigrations(
   const hasBootstrappedAt = conversationColumns.some((col) => col.name === "bootstrapped_at");
   if (!hasBootstrappedAt) {
     db.exec(`ALTER TABLE conversations ADD COLUMN bootstrapped_at TEXT`);
+  }
+  if (!conversationColumns.some((col) => col.name === "parent_session_id")) {
+    db.exec(`ALTER TABLE conversations ADD COLUMN parent_session_id TEXT`);
   }
 
   ensureSummaryDepthColumn(db);

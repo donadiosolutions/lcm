@@ -8,7 +8,10 @@ import {
   assertHookPublicationFence,
   assertHookRootEstablished,
   isBackendPublicationJournalError,
+  NO_HOOK_ADMISSION_RETRY,
+  type HookAdmissionRetry,
 } from "./publication-fence.js";
+import { resolveHookSessionScope } from "./subagent-scope.js";
 
 export interface SnapshotDeps {
   statSync: (path: string) => { mtimeMs: number } | null;
@@ -16,6 +19,8 @@ export interface SnapshotDeps {
   snapshotIntervalSec: number;
   post: (path: string, body: Record<string, unknown>) => Promise<unknown>;
   verifiedPort?: number;
+  /** Waits for a live publication-lock owner before each pre-effect admission. */
+  admissionRetry?: HookAdmissionRetry;
 }
 
 function defaultStatSync(path: string): { mtimeMs: number } | null {
@@ -32,12 +37,26 @@ export async function handleSessionSnapshot(
 ): Promise<{ exitCode: number; stdout: string }> {
   try {
     const input = JSON.parse(stdin || "{}");
-    const { session_id, cwd, transcript_path } = input;
-    if (!session_id || !cwd || !transcript_path) {
+    const { cwd } = input;
+    const scope = resolveHookSessionScope(input);
+    const session_id = scope.sessionId;
+    const isSubagentStop = input.hook_event_name === "SubagentStop";
+    // A SubagentStop transcript_path is the parent's rollout (or null); the
+    // child's own rollout is agent_transcript_path. Select first, then
+    // validate, and never read the parent's rollout for a child.
+    const transcript_path = isSubagentStop ? input.agent_transcript_path : input.transcript_path;
+    if (
+      !session_id
+      || !cwd
+      || typeof transcript_path !== "string"
+      || !transcript_path
+      || (isSubagentStop && !scope.isSubagent)
+    ) {
       return { exitCode: 0, stdout: "" };
     }
     const clientName = normalizeTranscriptClient(input.client ?? process.env.LCM_CLIENT);
 
+    const retry = deps?.admissionRetry ?? NO_HOOK_ADMISSION_RETRY;
     const safeSessionId = session_id.replace(/[^a-zA-Z0-9_-]/g, "_");
     // Bootstrap/install owns root creation. Authenticate the established root
     // before creating the cursor directory so a missing or unsafe root cannot
@@ -51,10 +70,10 @@ export async function handleSessionSnapshot(
     if (intervalSec === undefined) {
       const { loadDaemonConfig } = await import("../daemon/config.js");
       const { homedir } = await import("node:os");
-      const config = loadDaemonConfig(defaultConfigPath());
+      const config = await retry(() => loadDaemonConfig(defaultConfigPath()));
       intervalSec = config.hooks?.snapshotIntervalSec ?? 60;
     }
-    const forceSnapshot = input.hook_event_name === "PreCompact";
+    const forceSnapshot = input.hook_event_name === "PreCompact" || isSubagentStop;
 
     // Throttle: stat cursor mtime, skip if within interval. PreCompact is a
     // boundary event, so force a final ingest attempt before Codex compacts.
@@ -72,12 +91,12 @@ export async function handleSessionSnapshot(
     let ingestResult: { totalTokens?: number } | undefined;
     const _post = deps?.post;
     if (_post) {
-      assertHookPublicationFence();
+      await retry(() => assertHookPublicationFence());
       ingestResult = await _post("/ingest", { session_id, cwd, transcript_path, client: clientName }) as { totalTokens?: number };
     } else {
       const { loadDaemonConfig } = await import("../daemon/config.js");
       const { readFileSync: _readFileSync } = await import("node:fs");
-      const config = loadDaemonConfig(defaultConfigPath());
+      const config = await retry(() => loadDaemonConfig(defaultConfigPath()));
       const port = deps?.verifiedPort ?? normalizeDaemonPort(config.daemon?.port ?? 3737);
 
       // Read token from token file if available (silent fallback if not found)
@@ -95,7 +114,7 @@ export async function handleSessionSnapshot(
         headers["Authorization"] = `Bearer ${token}`;
       }
 
-      assertHookPublicationFence();
+      await retry(() => assertHookPublicationFence());
       ingestResult = await daemonJsonRequest<{ totalTokens?: number }>(port, "/ingest", {
         method: "POST",
         headers,

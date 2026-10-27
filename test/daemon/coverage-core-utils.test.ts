@@ -81,6 +81,8 @@ describe("daemon URL validation boundaries", () => {
   it("accepts only known daemon paths", () => {
     expect(normalizeDaemonPath("/health")).toBe("/health");
     expect(normalizeDaemonPath("/health/observe")).toBe("/health/observe");
+    expect(normalizeDaemonPath("/ingest/terminal")).toBe("/ingest/terminal");
+    expect(() => normalizeDaemonPath("/ingest/other")).toThrow("Invalid daemon route");
     expect(() => normalizeDaemonPath("/unknown")).toThrow("Invalid daemon route");
   });
 });

@@ -20,12 +20,27 @@ import { resolveDiagnosticProject } from "./diagnostic-project.js";
 import type { StorageBackendFactory } from "./contracts.js";
 import type { PostgreSqlConnectionSettings, PostgreSqlQueryExecutor, PostgreSqlRuntimeHealth } from "./postgresql/contracts.js";
 import { readPostgreSqlDiagnosticMetrics, type PostgreSqlDiagnosticMetrics } from "./postgresql/diagnostics.js";
-import { PostgreSqlStorageOperationError } from "./postgresql/errors.js";
+import { readPostgreSqlMigrationLedger, readPostgreSqlQueueHealth } from "./postgresql/runtime-health.js";
+import { PostgreSqlDiagnosticPoolError, PostgreSqlStorageOperationError, type PostgreSqlDiagnosticPoolRejection } from "./postgresql/errors.js";
 import { areRequiredPostgreSqlExtensionsReady } from "./postgresql/extensions.js";
 import { PostgreSqlRuntime } from "./postgresql/runtime.js";
 import { verifyPostgreSqlRuntimeSchema } from "./postgresql/runtime-readiness.js";
+import {
+  collectPostgreSqlQueryStatistics,
+  createQueryStatisticsFamily,
+  type QueryStatisticsFamily,
+  type QueryStatisticsObservation,
+} from "./postgresql/query-statistics.js";
+import {
+  PROBE_MIN_REMAINING_MS, extensionsTelemetry, failUnfinishedTelemetry, failedServerQueueReads, localPendingAgeRead,
+  migrationTelemetry, poolTelemetry, queueTelemetry, serverQueueReads, telemetryDegraded, telemetryFailureStatus,
+  telemetryFillers, type BackendDiagnosticTelemetry, type FieldRead, type TelemetryFailureStatus,
+  type TelemetryFamilyName,
+} from "./runtime-health.js";
 
 export const BACKEND_DIAGNOSTIC_DEADLINE_MS = 2000;
+export const STATEMENT_FAMILY_BUDGET_MS = 750;
+const STATEMENT_FAMILY_RESERVE_MS = 100;
 export type BackendDiagnosticClassification = "healthy" | "degraded" | "unavailable" | "permission-denied" | "timeout" | "stale-publication";
 export type BackendDiagnosticReadiness = "ready" | "unavailable" | "unverified" | "not-applicable";
 export interface BackendDiagnosticPool {
@@ -63,6 +78,8 @@ export interface BackendDiagnosticSnapshot {
   identity: { status: BackendDiagnosticReadiness; machineId?: string };
   outbox: BackendDiagnosticOutbox;
   metrics?: PostgreSqlDiagnosticMetrics;
+  /** Fixed telemetry families; see the PostgreSQL telemetry guide. */
+  telemetry: BackendDiagnosticTelemetry & { statements: QueryStatisticsFamily };
   remediation: string;
 }
 export interface BackendDiagnosticRuntime extends PostgreSqlQueryExecutor {
@@ -83,6 +100,9 @@ export interface BackendDiagnosticDependencies {
   verifySchema: typeof verifyPostgreSqlRuntimeSchema;
   readMetrics: typeof readPostgreSqlDiagnosticMetrics;
   readOutbox: typeof collectEventStats;
+  readStatements: typeof collectPostgreSqlQueryStatistics;
+  readMigrationHistory: typeof readPostgreSqlMigrationLedger;
+  readQueue: typeof readPostgreSqlQueueHealth;
 }
 export interface CollectBackendDiagnosticOptions {
   homeDir?: string;
@@ -129,10 +149,17 @@ function classifyFailure(error: unknown): BackendDiagnosticClassification {
   return "unavailable";
 }
 function emptySnapshot(backend: BackendDiagnosticSnapshot["backend"], classification: BackendDiagnosticClassification): BackendDiagnosticSnapshot {
+  const statementStatus = backend === "sqlite" ? "not-applicable"
+    : backend === "postgresql" && classification === "timeout" ? "timeout" : "unavailable";
   return {
     backend, classification, publication: "unverified", tls: "unverified", schema: "unverified",
     extensions: "unverified", search: "unverified", pool: { origin: "diagnostic-probe", status: "unverified" },
-    project: { scope: "aggregate", status: "unverified" }, identity: { status: "unverified" }, outbox: { status: "unverified" }, remediation: REMEDIATION[classification],
+    project: { scope: "aggregate", status: "unverified" }, identity: { status: "unverified" }, outbox: { status: "unverified" },
+    telemetry: {
+      ...telemetryFillers(backend, telemetryFailureStatus(classification), Date.now()),
+      statements: createQueryStatisticsFamily(statementStatus),
+    },
+    remediation: REMEDIATION[classification],
   };
 }
 /** Failure DTO for an outer publication boundary. Never serializes an error. */
@@ -178,6 +205,10 @@ function safeSqlitePool(value: ReturnType<typeof getPoolStats>, origin: BackendD
   if (![value.totalConnections, value.idleConnections].every(finiteCount)) return { origin, status: "unverified" };
   return { origin, status: "ready", total: value.totalConnections, idle: value.idleConnections };
 }
+/** The closed reason of a refused pool observation; any other failure carries no reason. */
+function poolRejectionOf(error: unknown): PostgreSqlDiagnosticPoolRejection | undefined {
+  return error instanceof PostgreSqlDiagnosticPoolError ? error.reason : undefined;
+}
 function safeOutbox(value: EventStats): BackendDiagnosticOutbox {
   const counts = [value.captured, value.unprocessed, value.errors, value.deliveryPending, value.deliveryClaimed, value.deliveryRetry, value.deliveryReplicated, value.deliveryAcknowledged, value.deliveryAwaitingRemotePrune, value.deliveryQuarantined];
   if ((value.scanErrors ?? 0) > 0 || (value.scanSkipped ?? 0) > 0 || !counts.every(finiteCount)) return { status: "unavailable" };
@@ -187,7 +218,17 @@ function safeOutbox(value: EventStats): BackendDiagnosticOutbox {
 export async function collectBackendDiagnostics(options: CollectBackendDiagnosticOptions = {}): Promise<BackendDiagnosticSnapshot> {
   const scope = options.cwd !== undefined || options.projectId !== undefined ? "selected" : "aggregate";
   const scoped = (snapshot: BackendDiagnosticSnapshot): BackendDiagnosticSnapshot => { snapshot.project.scope = scope; return snapshot; };
-  const dependencies: BackendDiagnosticDependencies = { observePublication, createRuntime: settings => new PostgreSqlRuntime(settings), verifySchema: verifyPostgreSqlRuntimeSchema, readMetrics: readPostgreSqlDiagnosticMetrics, readOutbox: collectEventStats, ...options._dependencies };
+  const dependencies: BackendDiagnosticDependencies = {
+    observePublication,
+    createRuntime: settings => new PostgreSqlRuntime(settings),
+    verifySchema: verifyPostgreSqlRuntimeSchema,
+    readMetrics: readPostgreSqlDiagnosticMetrics,
+    readOutbox: collectEventStats,
+    readStatements: collectPostgreSqlQueryStatistics,
+    readMigrationHistory: readPostgreSqlMigrationLedger,
+    readQueue: readPostgreSqlQueueHealth,
+    ...options._dependencies,
+  };
   const duration = Number.isFinite(options._deadlineMs) && options._deadlineMs! > 0 ? Math.min(options._deadlineMs!, BACKEND_DIAGNOSTIC_DEADLINE_MS) : BACKEND_DIAGNOSTIC_DEADLINE_MS;
   const deadline = performance.now() + duration;
   const controller = new AbortController();
@@ -207,12 +248,16 @@ export async function collectBackendDiagnostics(options: CollectBackendDiagnosti
   // Pool counters are local observations, independent of project, outbox, or
   // remote probe work succeeding. Capture them before any await.
   let poolObservation: BackendDiagnosticPool | undefined;
+  // Capture time of the pool counters, reused by the timeout DTO.
+  let poolObservedAt = Date.now();
+  // Why the boundary refused the counters, kept only so telemetry can tell an out-of-range value from an unverified pool.
+  let poolRejection: PostgreSqlDiagnosticPoolRejection | undefined;
   if (backend === "postgresql" && options.storageFactory !== undefined) {
     const factory = options.storageFactory as StorageBackendFactory & {
       getDiagnosticPool?: () => ReturnType<BackendDiagnosticRuntime["poolDiagnostics"]> | undefined;
     };
     try { poolObservation = safePool(factory.getDiagnosticPool?.(), "daemon"); }
-    catch { poolObservation = { origin: "daemon", status: "unverified" }; }
+    catch (error) { poolObservation = { origin: "daemon", status: "unverified" }; poolRejection = poolRejectionOf(error); }
   } else if (backend === "sqlite") {
     const origin = options.storageFactory === undefined ? "local" : "daemon";
     try { poolObservation = safeSqlitePool(getPoolStats(), origin); }
@@ -230,6 +275,7 @@ export async function collectBackendDiagnostics(options: CollectBackendDiagnosti
       } catch (error) { return scoped(backendDiagnosticFailure(error, backend)); }
       snapshot.publication = "ready";
       snapshot.pool = poolObservation;
+      if (backend === "postgresql") snapshot.telemetry.pool = poolTelemetry(poolObservation, poolObservedAt, poolRejection);
     }
     return snapshot;
   };
@@ -247,8 +293,15 @@ export async function collectBackendDiagnostics(options: CollectBackendDiagnosti
     const snapshot = scoped(emptySnapshot(backend, "unavailable"));
     snapshot.publication = "ready";
     if (poolObservation !== undefined) snapshot.pool = poolObservation;
+    // Families whose observation finished; the catch rewrites only the others.
+    const finished = new Set<TelemetryFamilyName>();
+    let serverQueue: ReturnType<typeof serverQueueReads> | undefined;
+    const probeBudget = (): boolean => deadline - performance.now() >= PROBE_MIN_REMAINING_MS;
+    const failureOf = (error: unknown): TelemetryFailureStatus => telemetryFailureStatus(controller.signal.aborted ? "timeout" : classifyFailure(error));
+    const failedFamilies = (status: TelemetryFailureStatus) => telemetryFillers("postgresql", status, Date.now());
     if (before.machineId !== null && normalizeUuidV7(before.machineId) === before.machineId) snapshot.identity = { status: "ready", machineId: before.machineId };
     else if (backend === "sqlite" && before.machineId === null) snapshot.identity = { status: "not-applicable" };
+    let statementObservation: QueryStatisticsObservation | undefined;
     try {
       const selected = options.cwd === undefined ? undefined : resolveDiagnosticProject(before.mapContent ?? null, options.cwd, backend);
       const selectedProjectId = selected?.projectId ?? options.projectId;
@@ -261,17 +314,43 @@ export async function collectBackendDiagnostics(options: CollectBackendDiagnosti
         if (controller.signal.aborted) { close(); return timeoutSnapshot(); }
         const health = await runtime.health(controller.signal);
         if (controller.signal.aborted) return timeoutSnapshot();
+        // Derived before the health-status throw: an unavailable result can still carry extensions.
+        // The family is finalized only when health() returned extension records; otherwise the catch mirrors the classified failure.
+        snapshot.telemetry.extensions = extensionsTelemetry(health.extensions, Date.now());
+        if (health.extensions !== undefined) finished.add("extensions");
         snapshot.tls = health.tls === true ? "ready" : "unavailable";
         snapshot.extensions = health.extensions === undefined ? "unverified" : areRequiredPostgreSqlExtensionsReady(health.extensions) ? "ready" : "unavailable";
         snapshot.search = health.searchConfiguration === undefined ? "unverified" : health.searchConfiguration.ready ? "ready" : "unavailable";
-        snapshot.pool = poolObservation ?? safePool(runtime.poolDiagnostics(), "diagnostic-probe");
+        if (poolObservation === undefined) {
+          try { snapshot.pool = safePool(runtime.poolDiagnostics(), "diagnostic-probe"); }
+          catch (error) {
+            // Only an out-of-range counter is a pool-local fact; any other failure still fails the probe.
+            poolRejection = poolRejectionOf(error);
+            if (poolRejection !== "out-of-range") throw error;
+            snapshot.pool = { origin: "diagnostic-probe", status: "unverified" };
+          }
+          poolObservedAt = Date.now();
+        }
+        snapshot.telemetry.pool = poolTelemetry(snapshot.pool, poolObservedAt, poolRejection);
+        finished.add("pool");
         if (health.status !== "healthy" && health.status !== "degraded") throw health.error;
+        if (!probeBudget()) snapshot.telemetry.migration = failedFamilies("timeout").migration;
+        else {
+          try { snapshot.telemetry.migration = migrationTelemetry(await dependencies.readMigrationHistory(runtime, controller.signal), Date.now()); }
+          catch (error) { snapshot.telemetry.migration = failedFamilies(failureOf(error)).migration; }
+        }
+        finished.add("migration");
         const metrics = await dependencies.readMetrics(runtime, controller.signal, selectedProjectId);
         if (controller.signal.aborted) return timeoutSnapshot();
         await dependencies.verifySchema(runtime, {expectedOwner:config.migrationRole,signal:controller.signal});
         if (controller.signal.aborted) return timeoutSnapshot();
         snapshot.schema = "ready";
         snapshot.metrics = metrics;
+        if (!probeBudget()) serverQueue = failedServerQueueReads("timeout");
+        else {
+          try { serverQueue = serverQueueReads(await dependencies.readQueue(runtime, controller.signal, selectedProjectId)); }
+          catch (error) { serverQueue = failedServerQueueReads(failureOf(error)); }
+        }
         if (snapshot.tls === "ready" && snapshot.extensions === "ready" && snapshot.search === "ready" && snapshot.identity.status === "ready" && snapshot.pool.status === "ready") snapshot.classification = health.status === "degraded" || snapshot.pool.failed === true ? "degraded" : "healthy";
       } else {
         snapshot.tls = "not-applicable"; snapshot.extensions = "not-applicable"; snapshot.search = "not-applicable";
@@ -286,9 +365,80 @@ export async function collectBackendDiagnostics(options: CollectBackendDiagnosti
         ? { scope: "aggregate", status: "ready" }
         : { scope: "selected", status: localProjectId === undefined ? "unverified" : "ready", projectId: selectedProjectId, ...(localProjectId === undefined ? {} : { localProjectId }) };
       // A remote UUID cannot be interpreted as a local outbox directory identity.
-      if (!(backend === "postgresql" && selectedProjectId !== undefined && localProjectId === undefined)) snapshot.outbox = safeOutbox(await dependencies.readOutbox({homeDir:options.homeDir,signal:controller.signal,projectId:localProjectId,pruneOrphanSidecars:false,timeoutMs:Math.max(1,deadline-performance.now())}));
+      // Local pending age is unknown unless this scan reads it from a verified outbox.
+      let localAge: FieldRead = { reason: "unavailable" };
+      if (!(backend === "postgresql" && selectedProjectId !== undefined && localProjectId === undefined)) {
+        const stats = await dependencies.readOutbox({homeDir:options.homeDir,signal:controller.signal,projectId:localProjectId,pruneOrphanSidecars:false,timeoutMs:Math.max(1,deadline-performance.now())});
+        snapshot.outbox = safeOutbox(stats);
+        if (snapshot.outbox.status === "ready") localAge = localPendingAgeRead(stats.oldestPendingAt, Date.now());
+      }
+      if (serverQueue !== undefined) {
+        const localQuarantined = snapshot.outbox.status === "ready" ? snapshot.outbox.deliveryQuarantined : undefined;
+        snapshot.telemetry.queue = queueTelemetry({ ...serverQueue, outboxOldestPendingAgeSeconds: localAge }, localQuarantined, Date.now());
+      }
+      // Statement statistics run last, after every runtime-health and outbox read,
+      // while retaining the shared snapshot deadline and publication reserve.
+      if (backend === "postgresql" && runtime !== undefined && snapshot.schema === "ready") {
+        const remaining = deadline - performance.now() - STATEMENT_FAMILY_RESERVE_MS;
+        if (remaining <= 0) {
+          snapshot.telemetry.statements = createQueryStatisticsFamily("timeout");
+        } else {
+          const child = new AbortController();
+          let familyDeadlineExpired = false;
+          const abortChild = (): void => { child.abort(); };
+          controller.signal.addEventListener("abort", abortChild, { once: true });
+          const familyTimer = setTimeout(() => {
+            familyDeadlineExpired = true;
+            child.abort();
+          }, Math.min(STATEMENT_FAMILY_BUDGET_MS, remaining));
+          let resolveAbort!: () => void;
+          const childAborted = new Promise<void>((resolve) => { resolveAbort = resolve; });
+          child.signal.addEventListener("abort", resolveAbort, { once: true });
+          try {
+            const familyWork = dependencies.readStatements(runtime, {
+              publicationWitness: before.witness,
+              signal: child.signal,
+            });
+            const outcome = await Promise.race([
+              familyWork.then((value) => ({ kind: "value" as const, value })),
+              childAborted.then(() => ({ kind: "aborted" as const })),
+            ]);
+            if (outcome.kind === "value" && !child.signal.aborted) {
+              statementObservation = outcome.value;
+              snapshot.telemetry.statements = outcome.value.family;
+            } else {
+              snapshot.telemetry.statements = createQueryStatisticsFamily("timeout");
+            }
+          } catch {
+            snapshot.telemetry.statements = createQueryStatisticsFamily(
+              child.signal.aborted || controller.signal.aborted || familyDeadlineExpired
+                ? "timeout" : "unavailable",
+            );
+          } finally {
+            clearTimeout(familyTimer);
+            controller.signal.removeEventListener("abort", abortChild);
+            child.signal.removeEventListener("abort", resolveAbort);
+          }
+        }
+      }
     } catch (error) {
       snapshot.classification = controller.signal.aborted ? "timeout" : classifyFailure(error);
+      if (backend === "postgresql") {
+        const status = failureOf(error);
+        // A failed local scan keeps the server observations that already completed.
+        if (serverQueue !== undefined) {
+          snapshot.telemetry.queue = queueTelemetry({ ...serverQueue, outboxOldestPendingAgeSeconds: { reason: status } }, undefined, Date.now());
+          finished.add("queue");
+        }
+        const statements = snapshot.classification === "timeout"
+          && statementObservation === undefined
+          ? createQueryStatisticsFamily("timeout")
+          : snapshot.telemetry.statements;
+        snapshot.telemetry = {
+          ...failUnfinishedTelemetry(snapshot.telemetry, finished, status, Date.now()),
+          statements,
+        };
+      }
       delete snapshot.metrics;
       snapshot.project = { scope, status: "unavailable" };
     }
@@ -298,6 +448,8 @@ export async function collectBackendDiagnostics(options: CollectBackendDiagnosti
     } catch (error) { return scoped(backendDiagnosticFailure(error, backend)); }
     if (controller.signal.aborted || performance.now() >= deadline) return timeoutSnapshot();
     if (snapshot.outbox.status !== "ready" && (snapshot.classification === "healthy" || snapshot.classification === "degraded")) snapshot.classification = "unavailable";
+    if (snapshot.classification === "healthy" && telemetryDegraded(snapshot.telemetry)) snapshot.classification = "degraded";
+    statementObservation?.commit();
     snapshot.remediation = REMEDIATION[snapshot.classification];
     return snapshot;
   });

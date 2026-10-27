@@ -20,6 +20,7 @@
         "session-end",
         "user-prompt",
         "post-tool",
+        "pre-tool",
         "session-snapshot",
         "mcp",
         "install",
@@ -31,6 +32,7 @@
         "machine",
         "project",
         "postgres",
+        "migration",
         "search",
         "grep",
         "describe",
@@ -61,6 +63,7 @@
           "machine",
           "project",
           "postgres",
+          "migration",
           "search",
           "grep",
           "describe",
@@ -81,6 +84,7 @@
           "session-end",
           "user-prompt",
           "post-tool",
+          "pre-tool",
           "session-snapshot"
         ]
       },
@@ -1878,6 +1882,7 @@
           "machine",
           "project",
           "postgres",
+          "migration",
           "search",
           "grep",
           "describe",
@@ -1898,6 +1903,7 @@
           "session-end",
           "user-prompt",
           "post-tool",
+          "pre-tool",
           "session-snapshot"
         ]
       },
@@ -2440,6 +2446,997 @@
     "source": "bin/lcm.ts:runCli"
   },
   {
+    "assertions": [
+      "grammar",
+      "result",
+      "effects"
+    ],
+    "expectation": "grammar",
+    "id": "cli:migration",
+    "kind": "cli",
+    "registration": {
+      "aliases": [],
+      "arguments": [],
+      "children": [
+        "plan",
+        "dry-run",
+        "apply",
+        "resume",
+        "verify",
+        "report",
+        "abort",
+        "activate",
+        "rollback"
+      ],
+      "defaultCommand": null,
+      "handler": true,
+      "name": "migration",
+      "options": [
+        {
+          "choices": null,
+          "default": null,
+          "flags": "-h, --help",
+          "hidden": false,
+          "long": "--help",
+          "mandatory": false,
+          "negate": false,
+          "optional": false,
+          "preset": null,
+          "required": false,
+          "short": "-h",
+          "variadic": false
+        }
+      ],
+      "path": "migration"
+    },
+    "scenario": "control",
+    "source": "bin/lcm.ts:runCli"
+  },
+  {
+    "architectureReason": "src/migration/target-config.ts, cli-preflight.ts, maintenance.ts, cli-existing.ts and docs/migration-cutover.md: the cutover commands read storage.postgresql independently of the active backend and act only on a SQLite-selected home with a registered machine, a verified transfer-role target and a live generation. Assert each configured context's documented refusal before any durable write: the SQLite context has no target and no machine identity, the PostgreSQL context fails transfer verification under the runtime role and no longer has SQLite selected, and neither holds a generation.",
+    "assertions": [
+      "arguments",
+      "result",
+      "effects"
+    ],
+    "expectation": "architecture-specific",
+    "id": "cli:migration abort",
+    "kind": "cli",
+    "registration": {
+      "aliases": [],
+      "arguments": [],
+      "children": [],
+      "defaultCommand": null,
+      "handler": true,
+      "name": "abort",
+      "options": [
+        {
+          "choices": null,
+          "default": null,
+          "flags": "--generation <id>",
+          "hidden": false,
+          "long": "--generation",
+          "mandatory": false,
+          "negate": false,
+          "optional": false,
+          "preset": null,
+          "required": true,
+          "short": null,
+          "variadic": false
+        },
+        {
+          "choices": null,
+          "default": null,
+          "flags": "--confirm-generation <id>",
+          "hidden": false,
+          "long": "--confirm-generation",
+          "mandatory": false,
+          "negate": false,
+          "optional": false,
+          "preset": null,
+          "required": true,
+          "short": null,
+          "variadic": false
+        },
+        {
+          "choices": null,
+          "default": null,
+          "flags": "--set",
+          "hidden": false,
+          "long": "--set",
+          "mandatory": false,
+          "negate": false,
+          "optional": false,
+          "preset": null,
+          "required": false,
+          "short": null,
+          "variadic": false
+        },
+        {
+          "choices": null,
+          "default": null,
+          "flags": "--dry-run",
+          "hidden": false,
+          "long": "--dry-run",
+          "mandatory": false,
+          "negate": false,
+          "optional": false,
+          "preset": null,
+          "required": false,
+          "short": null,
+          "variadic": false
+        },
+        {
+          "choices": null,
+          "default": null,
+          "flags": "--json",
+          "hidden": false,
+          "long": "--json",
+          "mandatory": false,
+          "negate": false,
+          "optional": false,
+          "preset": null,
+          "required": false,
+          "short": null,
+          "variadic": false
+        },
+        {
+          "choices": null,
+          "default": null,
+          "flags": "-h, --help",
+          "hidden": false,
+          "long": "--help",
+          "mandatory": false,
+          "negate": false,
+          "optional": false,
+          "preset": null,
+          "required": false,
+          "short": "-h",
+          "variadic": false
+        }
+      ],
+      "path": "migration abort"
+    },
+    "scenario": "migration",
+    "source": "bin/lcm.ts:runCli"
+  },
+  {
+    "architectureReason": "src/migration/target-config.ts, cli-preflight.ts, maintenance.ts, cli-existing.ts and docs/migration-cutover.md: the cutover commands read storage.postgresql independently of the active backend and act only on a SQLite-selected home with a registered machine, a verified transfer-role target and a live generation. Assert each configured context's documented refusal before any durable write: the SQLite context has no target and no machine identity, the PostgreSQL context fails transfer verification under the runtime role and no longer has SQLite selected, and neither holds a generation.",
+    "assertions": [
+      "arguments",
+      "result",
+      "effects"
+    ],
+    "expectation": "architecture-specific",
+    "id": "cli:migration activate",
+    "kind": "cli",
+    "registration": {
+      "aliases": [],
+      "arguments": [],
+      "children": [],
+      "defaultCommand": null,
+      "handler": true,
+      "name": "activate",
+      "options": [
+        {
+          "choices": null,
+          "default": null,
+          "flags": "--generation <id>",
+          "hidden": false,
+          "long": "--generation",
+          "mandatory": false,
+          "negate": false,
+          "optional": false,
+          "preset": null,
+          "required": true,
+          "short": null,
+          "variadic": false
+        },
+        {
+          "choices": null,
+          "default": null,
+          "flags": "--confirm-generation <id>",
+          "hidden": false,
+          "long": "--confirm-generation",
+          "mandatory": false,
+          "negate": false,
+          "optional": false,
+          "preset": null,
+          "required": true,
+          "short": null,
+          "variadic": false
+        },
+        {
+          "choices": null,
+          "default": null,
+          "flags": "--confirm-backend <backend>",
+          "hidden": false,
+          "long": "--confirm-backend",
+          "mandatory": false,
+          "negate": false,
+          "optional": false,
+          "preset": null,
+          "required": true,
+          "short": null,
+          "variadic": false
+        },
+        {
+          "choices": null,
+          "default": null,
+          "flags": "--set",
+          "hidden": false,
+          "long": "--set",
+          "mandatory": false,
+          "negate": false,
+          "optional": false,
+          "preset": null,
+          "required": false,
+          "short": null,
+          "variadic": false
+        },
+        {
+          "choices": null,
+          "default": null,
+          "flags": "--dry-run",
+          "hidden": false,
+          "long": "--dry-run",
+          "mandatory": false,
+          "negate": false,
+          "optional": false,
+          "preset": null,
+          "required": false,
+          "short": null,
+          "variadic": false
+        },
+        {
+          "choices": null,
+          "default": null,
+          "flags": "--json",
+          "hidden": false,
+          "long": "--json",
+          "mandatory": false,
+          "negate": false,
+          "optional": false,
+          "preset": null,
+          "required": false,
+          "short": null,
+          "variadic": false
+        },
+        {
+          "choices": null,
+          "default": null,
+          "flags": "-h, --help",
+          "hidden": false,
+          "long": "--help",
+          "mandatory": false,
+          "negate": false,
+          "optional": false,
+          "preset": null,
+          "required": false,
+          "short": "-h",
+          "variadic": false
+        }
+      ],
+      "path": "migration activate"
+    },
+    "scenario": "migration",
+    "source": "bin/lcm.ts:runCli"
+  },
+  {
+    "architectureReason": "src/migration/target-config.ts, cli-preflight.ts, maintenance.ts, cli-existing.ts and docs/migration-cutover.md: the cutover commands read storage.postgresql independently of the active backend and act only on a SQLite-selected home with a registered machine, a verified transfer-role target and a live generation. Assert each configured context's documented refusal before any durable write: the SQLite context has no target and no machine identity, the PostgreSQL context fails transfer verification under the runtime role and no longer has SQLite selected, and neither holds a generation.",
+    "assertions": [
+      "arguments",
+      "result",
+      "effects"
+    ],
+    "expectation": "architecture-specific",
+    "id": "cli:migration apply",
+    "kind": "cli",
+    "registration": {
+      "aliases": [],
+      "arguments": [],
+      "children": [],
+      "defaultCommand": null,
+      "handler": true,
+      "name": "apply",
+      "options": [
+        {
+          "choices": null,
+          "default": null,
+          "flags": "--confirm-generation <id>",
+          "hidden": false,
+          "long": "--confirm-generation",
+          "mandatory": false,
+          "negate": false,
+          "optional": false,
+          "preset": null,
+          "required": true,
+          "short": null,
+          "variadic": false
+        },
+        {
+          "choices": null,
+          "default": null,
+          "flags": "--set",
+          "hidden": false,
+          "long": "--set",
+          "mandatory": false,
+          "negate": false,
+          "optional": false,
+          "preset": null,
+          "required": false,
+          "short": null,
+          "variadic": false
+        },
+        {
+          "choices": null,
+          "default": null,
+          "flags": "--dry-run",
+          "hidden": false,
+          "long": "--dry-run",
+          "mandatory": false,
+          "negate": false,
+          "optional": false,
+          "preset": null,
+          "required": false,
+          "short": null,
+          "variadic": false
+        },
+        {
+          "choices": null,
+          "default": null,
+          "flags": "--max-records <n>",
+          "hidden": false,
+          "long": "--max-records",
+          "mandatory": false,
+          "negate": false,
+          "optional": false,
+          "preset": null,
+          "required": true,
+          "short": null,
+          "variadic": false
+        },
+        {
+          "choices": null,
+          "default": null,
+          "flags": "--max-bytes <n>",
+          "hidden": false,
+          "long": "--max-bytes",
+          "mandatory": false,
+          "negate": false,
+          "optional": false,
+          "preset": null,
+          "required": true,
+          "short": null,
+          "variadic": false
+        },
+        {
+          "choices": null,
+          "default": null,
+          "flags": "--json",
+          "hidden": false,
+          "long": "--json",
+          "mandatory": false,
+          "negate": false,
+          "optional": false,
+          "preset": null,
+          "required": false,
+          "short": null,
+          "variadic": false
+        },
+        {
+          "choices": null,
+          "default": null,
+          "flags": "-h, --help",
+          "hidden": false,
+          "long": "--help",
+          "mandatory": false,
+          "negate": false,
+          "optional": false,
+          "preset": null,
+          "required": false,
+          "short": "-h",
+          "variadic": false
+        }
+      ],
+      "path": "migration apply"
+    },
+    "scenario": "migration",
+    "source": "bin/lcm.ts:runCli"
+  },
+  {
+    "architectureReason": "src/migration/target-config.ts, cli-preflight.ts, maintenance.ts, cli-existing.ts and docs/migration-cutover.md: the cutover commands read storage.postgresql independently of the active backend and act only on a SQLite-selected home with a registered machine, a verified transfer-role target and a live generation. Assert each configured context's documented refusal before any durable write: the SQLite context has no target and no machine identity, the PostgreSQL context fails transfer verification under the runtime role and no longer has SQLite selected, and neither holds a generation.",
+    "assertions": [
+      "arguments",
+      "result",
+      "effects"
+    ],
+    "expectation": "architecture-specific",
+    "id": "cli:migration dry-run",
+    "kind": "cli",
+    "registration": {
+      "aliases": [],
+      "arguments": [],
+      "children": [],
+      "defaultCommand": null,
+      "handler": true,
+      "name": "dry-run",
+      "options": [
+        {
+          "choices": null,
+          "default": null,
+          "flags": "--set",
+          "hidden": false,
+          "long": "--set",
+          "mandatory": false,
+          "negate": false,
+          "optional": false,
+          "preset": null,
+          "required": false,
+          "short": null,
+          "variadic": false
+        },
+        {
+          "choices": null,
+          "default": null,
+          "flags": "--json",
+          "hidden": false,
+          "long": "--json",
+          "mandatory": false,
+          "negate": false,
+          "optional": false,
+          "preset": null,
+          "required": false,
+          "short": null,
+          "variadic": false
+        },
+        {
+          "choices": null,
+          "default": null,
+          "flags": "-h, --help",
+          "hidden": false,
+          "long": "--help",
+          "mandatory": false,
+          "negate": false,
+          "optional": false,
+          "preset": null,
+          "required": false,
+          "short": "-h",
+          "variadic": false
+        }
+      ],
+      "path": "migration dry-run"
+    },
+    "scenario": "migration",
+    "source": "bin/lcm.ts:runCli"
+  },
+  {
+    "architectureReason": "src/migration/target-config.ts, cli-preflight.ts, maintenance.ts, cli-existing.ts and docs/migration-cutover.md: the cutover commands read storage.postgresql independently of the active backend and act only on a SQLite-selected home with a registered machine, a verified transfer-role target and a live generation. Assert each configured context's documented refusal before any durable write: the SQLite context has no target and no machine identity, the PostgreSQL context fails transfer verification under the runtime role and no longer has SQLite selected, and neither holds a generation.",
+    "assertions": [
+      "arguments",
+      "result",
+      "effects"
+    ],
+    "expectation": "architecture-specific",
+    "id": "cli:migration plan",
+    "kind": "cli",
+    "registration": {
+      "aliases": [],
+      "arguments": [],
+      "children": [],
+      "defaultCommand": null,
+      "handler": true,
+      "name": "plan",
+      "options": [
+        {
+          "choices": null,
+          "default": null,
+          "flags": "--set",
+          "hidden": false,
+          "long": "--set",
+          "mandatory": false,
+          "negate": false,
+          "optional": false,
+          "preset": null,
+          "required": false,
+          "short": null,
+          "variadic": false
+        },
+        {
+          "choices": null,
+          "default": null,
+          "flags": "--json",
+          "hidden": false,
+          "long": "--json",
+          "mandatory": false,
+          "negate": false,
+          "optional": false,
+          "preset": null,
+          "required": false,
+          "short": null,
+          "variadic": false
+        },
+        {
+          "choices": null,
+          "default": null,
+          "flags": "-h, --help",
+          "hidden": false,
+          "long": "--help",
+          "mandatory": false,
+          "negate": false,
+          "optional": false,
+          "preset": null,
+          "required": false,
+          "short": "-h",
+          "variadic": false
+        }
+      ],
+      "path": "migration plan"
+    },
+    "scenario": "migration",
+    "source": "bin/lcm.ts:runCli"
+  },
+  {
+    "architectureReason": "src/migration/target-config.ts, cli-preflight.ts, maintenance.ts, cli-existing.ts and docs/migration-cutover.md: the cutover commands read storage.postgresql independently of the active backend and act only on a SQLite-selected home with a registered machine, a verified transfer-role target and a live generation. Assert each configured context's documented refusal before any durable write: the SQLite context has no target and no machine identity, the PostgreSQL context fails transfer verification under the runtime role and no longer has SQLite selected, and neither holds a generation.",
+    "assertions": [
+      "arguments",
+      "result",
+      "effects"
+    ],
+    "expectation": "architecture-specific",
+    "id": "cli:migration report",
+    "kind": "cli",
+    "registration": {
+      "aliases": [],
+      "arguments": [],
+      "children": [],
+      "defaultCommand": null,
+      "handler": true,
+      "name": "report",
+      "options": [
+        {
+          "choices": null,
+          "default": null,
+          "flags": "--generation <id>",
+          "hidden": false,
+          "long": "--generation",
+          "mandatory": false,
+          "negate": false,
+          "optional": false,
+          "preset": null,
+          "required": true,
+          "short": null,
+          "variadic": false
+        },
+        {
+          "choices": null,
+          "default": null,
+          "flags": "--set",
+          "hidden": false,
+          "long": "--set",
+          "mandatory": false,
+          "negate": false,
+          "optional": false,
+          "preset": null,
+          "required": false,
+          "short": null,
+          "variadic": false
+        },
+        {
+          "choices": null,
+          "default": null,
+          "flags": "--json",
+          "hidden": false,
+          "long": "--json",
+          "mandatory": false,
+          "negate": false,
+          "optional": false,
+          "preset": null,
+          "required": false,
+          "short": null,
+          "variadic": false
+        },
+        {
+          "choices": null,
+          "default": null,
+          "flags": "-h, --help",
+          "hidden": false,
+          "long": "--help",
+          "mandatory": false,
+          "negate": false,
+          "optional": false,
+          "preset": null,
+          "required": false,
+          "short": "-h",
+          "variadic": false
+        }
+      ],
+      "path": "migration report"
+    },
+    "scenario": "migration",
+    "source": "bin/lcm.ts:runCli"
+  },
+  {
+    "architectureReason": "src/migration/target-config.ts, cli-preflight.ts, maintenance.ts, cli-existing.ts and docs/migration-cutover.md: the cutover commands read storage.postgresql independently of the active backend and act only on a SQLite-selected home with a registered machine, a verified transfer-role target and a live generation. Assert each configured context's documented refusal before any durable write: the SQLite context has no target and no machine identity, the PostgreSQL context fails transfer verification under the runtime role and no longer has SQLite selected, and neither holds a generation.",
+    "assertions": [
+      "arguments",
+      "result",
+      "effects"
+    ],
+    "expectation": "architecture-specific",
+    "id": "cli:migration resume",
+    "kind": "cli",
+    "registration": {
+      "aliases": [],
+      "arguments": [],
+      "children": [],
+      "defaultCommand": null,
+      "handler": true,
+      "name": "resume",
+      "options": [
+        {
+          "choices": null,
+          "default": null,
+          "flags": "--generation <id>",
+          "hidden": false,
+          "long": "--generation",
+          "mandatory": false,
+          "negate": false,
+          "optional": false,
+          "preset": null,
+          "required": true,
+          "short": null,
+          "variadic": false
+        },
+        {
+          "choices": null,
+          "default": null,
+          "flags": "--confirm-generation <id>",
+          "hidden": false,
+          "long": "--confirm-generation",
+          "mandatory": false,
+          "negate": false,
+          "optional": false,
+          "preset": null,
+          "required": true,
+          "short": null,
+          "variadic": false
+        },
+        {
+          "choices": null,
+          "default": null,
+          "flags": "--set",
+          "hidden": false,
+          "long": "--set",
+          "mandatory": false,
+          "negate": false,
+          "optional": false,
+          "preset": null,
+          "required": false,
+          "short": null,
+          "variadic": false
+        },
+        {
+          "choices": null,
+          "default": null,
+          "flags": "--dry-run",
+          "hidden": false,
+          "long": "--dry-run",
+          "mandatory": false,
+          "negate": false,
+          "optional": false,
+          "preset": null,
+          "required": false,
+          "short": null,
+          "variadic": false
+        },
+        {
+          "choices": null,
+          "default": null,
+          "flags": "--max-records <n>",
+          "hidden": false,
+          "long": "--max-records",
+          "mandatory": false,
+          "negate": false,
+          "optional": false,
+          "preset": null,
+          "required": true,
+          "short": null,
+          "variadic": false
+        },
+        {
+          "choices": null,
+          "default": null,
+          "flags": "--max-bytes <n>",
+          "hidden": false,
+          "long": "--max-bytes",
+          "mandatory": false,
+          "negate": false,
+          "optional": false,
+          "preset": null,
+          "required": true,
+          "short": null,
+          "variadic": false
+        },
+        {
+          "choices": null,
+          "default": null,
+          "flags": "--json",
+          "hidden": false,
+          "long": "--json",
+          "mandatory": false,
+          "negate": false,
+          "optional": false,
+          "preset": null,
+          "required": false,
+          "short": null,
+          "variadic": false
+        },
+        {
+          "choices": null,
+          "default": null,
+          "flags": "-h, --help",
+          "hidden": false,
+          "long": "--help",
+          "mandatory": false,
+          "negate": false,
+          "optional": false,
+          "preset": null,
+          "required": false,
+          "short": "-h",
+          "variadic": false
+        }
+      ],
+      "path": "migration resume"
+    },
+    "scenario": "migration",
+    "source": "bin/lcm.ts:runCli"
+  },
+  {
+    "architectureReason": "src/migration/target-config.ts, cli-preflight.ts, maintenance.ts, cli-existing.ts and docs/migration-cutover.md: the cutover commands read storage.postgresql independently of the active backend and act only on a SQLite-selected home with a registered machine, a verified transfer-role target and a live generation. Assert each configured context's documented refusal before any durable write: the SQLite context has no target and no machine identity, the PostgreSQL context fails transfer verification under the runtime role and no longer has SQLite selected, and neither holds a generation.",
+    "assertions": [
+      "arguments",
+      "result",
+      "effects"
+    ],
+    "expectation": "architecture-specific",
+    "id": "cli:migration rollback",
+    "kind": "cli",
+    "registration": {
+      "aliases": [],
+      "arguments": [],
+      "children": [],
+      "defaultCommand": null,
+      "handler": true,
+      "name": "rollback",
+      "options": [
+        {
+          "choices": null,
+          "default": null,
+          "flags": "--generation <id>",
+          "hidden": false,
+          "long": "--generation",
+          "mandatory": false,
+          "negate": false,
+          "optional": false,
+          "preset": null,
+          "required": true,
+          "short": null,
+          "variadic": false
+        },
+        {
+          "choices": null,
+          "default": null,
+          "flags": "--confirm-generation <id>",
+          "hidden": false,
+          "long": "--confirm-generation",
+          "mandatory": false,
+          "negate": false,
+          "optional": false,
+          "preset": null,
+          "required": true,
+          "short": null,
+          "variadic": false
+        },
+        {
+          "choices": null,
+          "default": null,
+          "flags": "--confirm-backend <backend>",
+          "hidden": false,
+          "long": "--confirm-backend",
+          "mandatory": false,
+          "negate": false,
+          "optional": false,
+          "preset": null,
+          "required": true,
+          "short": null,
+          "variadic": false
+        },
+        {
+          "choices": null,
+          "default": null,
+          "flags": "--set",
+          "hidden": false,
+          "long": "--set",
+          "mandatory": false,
+          "negate": false,
+          "optional": false,
+          "preset": null,
+          "required": false,
+          "short": null,
+          "variadic": false
+        },
+        {
+          "choices": null,
+          "default": null,
+          "flags": "--dry-run",
+          "hidden": false,
+          "long": "--dry-run",
+          "mandatory": false,
+          "negate": false,
+          "optional": false,
+          "preset": null,
+          "required": false,
+          "short": null,
+          "variadic": false
+        },
+        {
+          "choices": null,
+          "default": null,
+          "flags": "--json",
+          "hidden": false,
+          "long": "--json",
+          "mandatory": false,
+          "negate": false,
+          "optional": false,
+          "preset": null,
+          "required": false,
+          "short": null,
+          "variadic": false
+        },
+        {
+          "choices": null,
+          "default": null,
+          "flags": "-h, --help",
+          "hidden": false,
+          "long": "--help",
+          "mandatory": false,
+          "negate": false,
+          "optional": false,
+          "preset": null,
+          "required": false,
+          "short": "-h",
+          "variadic": false
+        }
+      ],
+      "path": "migration rollback"
+    },
+    "scenario": "migration",
+    "source": "bin/lcm.ts:runCli"
+  },
+  {
+    "architectureReason": "src/migration/target-config.ts, cli-preflight.ts, maintenance.ts, cli-existing.ts and docs/migration-cutover.md: the cutover commands read storage.postgresql independently of the active backend and act only on a SQLite-selected home with a registered machine, a verified transfer-role target and a live generation. Assert each configured context's documented refusal before any durable write: the SQLite context has no target and no machine identity, the PostgreSQL context fails transfer verification under the runtime role and no longer has SQLite selected, and neither holds a generation.",
+    "assertions": [
+      "arguments",
+      "result",
+      "effects"
+    ],
+    "expectation": "architecture-specific",
+    "id": "cli:migration verify",
+    "kind": "cli",
+    "registration": {
+      "aliases": [],
+      "arguments": [],
+      "children": [],
+      "defaultCommand": null,
+      "handler": true,
+      "name": "verify",
+      "options": [
+        {
+          "choices": null,
+          "default": null,
+          "flags": "--generation <id>",
+          "hidden": false,
+          "long": "--generation",
+          "mandatory": false,
+          "negate": false,
+          "optional": false,
+          "preset": null,
+          "required": true,
+          "short": null,
+          "variadic": false
+        },
+        {
+          "choices": null,
+          "default": null,
+          "flags": "--confirm-generation <id>",
+          "hidden": false,
+          "long": "--confirm-generation",
+          "mandatory": false,
+          "negate": false,
+          "optional": false,
+          "preset": null,
+          "required": true,
+          "short": null,
+          "variadic": false
+        },
+        {
+          "choices": null,
+          "default": null,
+          "flags": "--set",
+          "hidden": false,
+          "long": "--set",
+          "mandatory": false,
+          "negate": false,
+          "optional": false,
+          "preset": null,
+          "required": false,
+          "short": null,
+          "variadic": false
+        },
+        {
+          "choices": null,
+          "default": null,
+          "flags": "--dry-run",
+          "hidden": false,
+          "long": "--dry-run",
+          "mandatory": false,
+          "negate": false,
+          "optional": false,
+          "preset": null,
+          "required": false,
+          "short": null,
+          "variadic": false
+        },
+        {
+          "choices": null,
+          "default": null,
+          "flags": "--lease-ttl-ms <n>",
+          "hidden": false,
+          "long": "--lease-ttl-ms",
+          "mandatory": false,
+          "negate": false,
+          "optional": false,
+          "preset": null,
+          "required": true,
+          "short": null,
+          "variadic": false
+        },
+        {
+          "choices": null,
+          "default": null,
+          "flags": "--json",
+          "hidden": false,
+          "long": "--json",
+          "mandatory": false,
+          "negate": false,
+          "optional": false,
+          "preset": null,
+          "required": false,
+          "short": null,
+          "variadic": false
+        },
+        {
+          "choices": null,
+          "default": null,
+          "flags": "-h, --help",
+          "hidden": false,
+          "long": "--help",
+          "mandatory": false,
+          "negate": false,
+          "optional": false,
+          "preset": null,
+          "required": false,
+          "short": "-h",
+          "variadic": false
+        }
+      ],
+      "path": "migration verify"
+    },
+    "scenario": "migration",
+    "source": "bin/lcm.ts:runCli"
+  },
+  {
     "architectureReason": "src/hooks/ and docs/cli.md: native hook capture uses the local SQLite outbox with either configured backend; durable project writes remain on the selected backend.",
     "assertions": [
       "arguments",
@@ -2580,6 +3577,58 @@
       "path": "postgres migrate"
     },
     "scenario": "admin",
+    "source": "bin/lcm.ts:runCli"
+  },
+  {
+    "architectureReason": "src/hooks/ and docs/cli.md: native hook capture uses the local SQLite outbox with either configured backend; durable project writes remain on the selected backend.",
+    "assertions": [
+      "arguments",
+      "result",
+      "effects"
+    ],
+    "expectation": "architecture-specific",
+    "id": "cli:pre-tool",
+    "kind": "cli",
+    "registration": {
+      "aliases": [],
+      "arguments": [],
+      "children": [],
+      "defaultCommand": null,
+      "handler": true,
+      "name": "pre-tool",
+      "options": [
+        {
+          "choices": null,
+          "default": null,
+          "flags": "--client <client>",
+          "hidden": true,
+          "long": "--client",
+          "mandatory": false,
+          "negate": false,
+          "optional": false,
+          "preset": null,
+          "required": true,
+          "short": null,
+          "variadic": false
+        },
+        {
+          "choices": null,
+          "default": null,
+          "flags": "-h, --help",
+          "hidden": false,
+          "long": "--help",
+          "mandatory": false,
+          "negate": false,
+          "optional": false,
+          "preset": null,
+          "required": false,
+          "short": "-h",
+          "variadic": false
+        }
+      ],
+      "path": "pre-tool"
+    },
+    "scenario": "hooks",
     "source": "bin/lcm.ts:runCli"
   },
   {
@@ -3521,6 +4570,20 @@
         {
           "choices": null,
           "default": null,
+          "flags": "--terminal",
+          "hidden": true,
+          "long": "--terminal",
+          "mandatory": false,
+          "negate": false,
+          "optional": false,
+          "preset": null,
+          "required": false,
+          "short": null,
+          "variadic": false
+        },
+        {
+          "choices": null,
+          "default": null,
           "flags": "-h, --help",
           "hidden": false,
           "long": "--help",
@@ -4007,6 +5070,23 @@
       "admission": "mutating",
       "key": "POST /ingest",
       "publicationMode": "operation-scoped"
+    },
+    "scenario": "memory",
+    "source": "src/daemon/server.ts:createDaemon"
+  },
+  {
+    "assertions": [
+      "admission",
+      "result",
+      "effects"
+    ],
+    "expectation": "shared-data",
+    "id": "daemon:POST /ingest/terminal",
+    "kind": "daemon",
+    "registration": {
+      "admission": "mutating",
+      "key": "POST /ingest/terminal",
+      "publicationMode": "enqueue-only"
     },
     "scenario": "memory",
     "source": "src/daemon/server.ts:createDaemon"
@@ -5284,10 +6364,10 @@
     "id": "portable-domain:context-items",
     "kind": "portable-domain",
     "registration": {
-      "descriptorSha256": "bcabc3767d0ece9d517a96dc904f38ea39b205c7c7cf17f288b7577cea797b7e",
+      "descriptorSha256": "c2b7abdef3e9d401443284726716381ee76b5974f1f253676ccca7aa259ecee9",
       "domain": "context-items",
       "ordinal": 11,
-      "schemaSha256": "5fd2432722dc42e80e2454f6e2db2a454da5fc6b2f69c7fa58594d9349f91e0f"
+      "schemaSha256": "4d325f8abf2b062b761fcb3701689c6a2ddee663861c1f192ad3fa71e09f32b4"
     },
     "scenario": "transfer",
     "source": "src/storage/portable-record.ts:PORTABLE_RECORD_DOMAIN_ORDER"
@@ -5308,10 +6388,10 @@
     "id": "portable-domain:conversations",
     "kind": "portable-domain",
     "registration": {
-      "descriptorSha256": "bcabc3767d0ece9d517a96dc904f38ea39b205c7c7cf17f288b7577cea797b7e",
+      "descriptorSha256": "c2b7abdef3e9d401443284726716381ee76b5974f1f253676ccca7aa259ecee9",
       "domain": "conversations",
       "ordinal": 3,
-      "schemaSha256": "5fd2432722dc42e80e2454f6e2db2a454da5fc6b2f69c7fa58594d9349f91e0f"
+      "schemaSha256": "4d325f8abf2b062b761fcb3701689c6a2ddee663861c1f192ad3fa71e09f32b4"
     },
     "scenario": "transfer",
     "source": "src/storage/portable-record.ts:PORTABLE_RECORD_DOMAIN_ORDER"
@@ -5332,10 +6412,10 @@
     "id": "portable-domain:large-files",
     "kind": "portable-domain",
     "registration": {
-      "descriptorSha256": "bcabc3767d0ece9d517a96dc904f38ea39b205c7c7cf17f288b7577cea797b7e",
+      "descriptorSha256": "c2b7abdef3e9d401443284726716381ee76b5974f1f253676ccca7aa259ecee9",
       "domain": "large-files",
       "ordinal": 6,
-      "schemaSha256": "5fd2432722dc42e80e2454f6e2db2a454da5fc6b2f69c7fa58594d9349f91e0f"
+      "schemaSha256": "4d325f8abf2b062b761fcb3701689c6a2ddee663861c1f192ad3fa71e09f32b4"
     },
     "scenario": "transfer",
     "source": "src/storage/portable-record.ts:PORTABLE_RECORD_DOMAIN_ORDER"
@@ -5356,10 +6436,10 @@
     "id": "portable-domain:machines",
     "kind": "portable-domain",
     "registration": {
-      "descriptorSha256": "bcabc3767d0ece9d517a96dc904f38ea39b205c7c7cf17f288b7577cea797b7e",
+      "descriptorSha256": "c2b7abdef3e9d401443284726716381ee76b5974f1f253676ccca7aa259ecee9",
       "domain": "machines",
       "ordinal": 0,
-      "schemaSha256": "5fd2432722dc42e80e2454f6e2db2a454da5fc6b2f69c7fa58594d9349f91e0f"
+      "schemaSha256": "4d325f8abf2b062b761fcb3701689c6a2ddee663861c1f192ad3fa71e09f32b4"
     },
     "scenario": "transfer",
     "source": "src/storage/portable-record.ts:PORTABLE_RECORD_DOMAIN_ORDER"
@@ -5380,10 +6460,10 @@
     "id": "portable-domain:message-parts",
     "kind": "portable-domain",
     "registration": {
-      "descriptorSha256": "bcabc3767d0ece9d517a96dc904f38ea39b205c7c7cf17f288b7577cea797b7e",
+      "descriptorSha256": "c2b7abdef3e9d401443284726716381ee76b5974f1f253676ccca7aa259ecee9",
       "domain": "message-parts",
       "ordinal": 5,
-      "schemaSha256": "5fd2432722dc42e80e2454f6e2db2a454da5fc6b2f69c7fa58594d9349f91e0f"
+      "schemaSha256": "4d325f8abf2b062b761fcb3701689c6a2ddee663861c1f192ad3fa71e09f32b4"
     },
     "scenario": "transfer",
     "source": "src/storage/portable-record.ts:PORTABLE_RECORD_DOMAIN_ORDER"
@@ -5404,10 +6484,10 @@
     "id": "portable-domain:messages",
     "kind": "portable-domain",
     "registration": {
-      "descriptorSha256": "bcabc3767d0ece9d517a96dc904f38ea39b205c7c7cf17f288b7577cea797b7e",
+      "descriptorSha256": "c2b7abdef3e9d401443284726716381ee76b5974f1f253676ccca7aa259ecee9",
       "domain": "messages",
       "ordinal": 4,
-      "schemaSha256": "5fd2432722dc42e80e2454f6e2db2a454da5fc6b2f69c7fa58594d9349f91e0f"
+      "schemaSha256": "4d325f8abf2b062b761fcb3701689c6a2ddee663861c1f192ad3fa71e09f32b4"
     },
     "scenario": "transfer",
     "source": "src/storage/portable-record.ts:PORTABLE_RECORD_DOMAIN_ORDER"
@@ -5428,10 +6508,10 @@
     "id": "portable-domain:native-transcript-checkpoints",
     "kind": "portable-domain",
     "registration": {
-      "descriptorSha256": "bcabc3767d0ece9d517a96dc904f38ea39b205c7c7cf17f288b7577cea797b7e",
+      "descriptorSha256": "c2b7abdef3e9d401443284726716381ee76b5974f1f253676ccca7aa259ecee9",
       "domain": "native-transcript-checkpoints",
       "ordinal": 20,
-      "schemaSha256": "5fd2432722dc42e80e2454f6e2db2a454da5fc6b2f69c7fa58594d9349f91e0f"
+      "schemaSha256": "4d325f8abf2b062b761fcb3701689c6a2ddee663861c1f192ad3fa71e09f32b4"
     },
     "scenario": "transfer",
     "source": "src/storage/portable-record.ts:PORTABLE_RECORD_DOMAIN_ORDER"
@@ -5452,10 +6532,10 @@
     "id": "portable-domain:native-transcript-message-links",
     "kind": "portable-domain",
     "registration": {
-      "descriptorSha256": "bcabc3767d0ece9d517a96dc904f38ea39b205c7c7cf17f288b7577cea797b7e",
+      "descriptorSha256": "c2b7abdef3e9d401443284726716381ee76b5974f1f253676ccca7aa259ecee9",
       "domain": "native-transcript-message-links",
       "ordinal": 19,
-      "schemaSha256": "5fd2432722dc42e80e2454f6e2db2a454da5fc6b2f69c7fa58594d9349f91e0f"
+      "schemaSha256": "4d325f8abf2b062b761fcb3701689c6a2ddee663861c1f192ad3fa71e09f32b4"
     },
     "scenario": "transfer",
     "source": "src/storage/portable-record.ts:PORTABLE_RECORD_DOMAIN_ORDER"
@@ -5476,10 +6556,10 @@
     "id": "portable-domain:native-transcripts",
     "kind": "portable-domain",
     "registration": {
-      "descriptorSha256": "bcabc3767d0ece9d517a96dc904f38ea39b205c7c7cf17f288b7577cea797b7e",
+      "descriptorSha256": "c2b7abdef3e9d401443284726716381ee76b5974f1f253676ccca7aa259ecee9",
       "domain": "native-transcripts",
       "ordinal": 18,
-      "schemaSha256": "5fd2432722dc42e80e2454f6e2db2a454da5fc6b2f69c7fa58594d9349f91e0f"
+      "schemaSha256": "4d325f8abf2b062b761fcb3701689c6a2ddee663861c1f192ad3fa71e09f32b4"
     },
     "scenario": "transfer",
     "source": "src/storage/portable-record.ts:PORTABLE_RECORD_DOMAIN_ORDER"
@@ -5500,10 +6580,10 @@
     "id": "portable-domain:passive-events",
     "kind": "portable-domain",
     "registration": {
-      "descriptorSha256": "bcabc3767d0ece9d517a96dc904f38ea39b205c7c7cf17f288b7577cea797b7e",
+      "descriptorSha256": "c2b7abdef3e9d401443284726716381ee76b5974f1f253676ccca7aa259ecee9",
       "domain": "passive-events",
       "ordinal": 21,
-      "schemaSha256": "5fd2432722dc42e80e2454f6e2db2a454da5fc6b2f69c7fa58594d9349f91e0f"
+      "schemaSha256": "4d325f8abf2b062b761fcb3701689c6a2ddee663861c1f192ad3fa71e09f32b4"
     },
     "scenario": "transfer",
     "source": "src/storage/portable-record.ts:PORTABLE_RECORD_DOMAIN_ORDER"
@@ -5524,10 +6604,10 @@
     "id": "portable-domain:project",
     "kind": "portable-domain",
     "registration": {
-      "descriptorSha256": "bcabc3767d0ece9d517a96dc904f38ea39b205c7c7cf17f288b7577cea797b7e",
+      "descriptorSha256": "c2b7abdef3e9d401443284726716381ee76b5974f1f253676ccca7aa259ecee9",
       "domain": "project",
       "ordinal": 1,
-      "schemaSha256": "5fd2432722dc42e80e2454f6e2db2a454da5fc6b2f69c7fa58594d9349f91e0f"
+      "schemaSha256": "4d325f8abf2b062b761fcb3701689c6a2ddee663861c1f192ad3fa71e09f32b4"
     },
     "scenario": "transfer",
     "source": "src/storage/portable-record.ts:PORTABLE_RECORD_DOMAIN_ORDER"
@@ -5548,10 +6628,10 @@
     "id": "portable-domain:project-aliases",
     "kind": "portable-domain",
     "registration": {
-      "descriptorSha256": "bcabc3767d0ece9d517a96dc904f38ea39b205c7c7cf17f288b7577cea797b7e",
+      "descriptorSha256": "c2b7abdef3e9d401443284726716381ee76b5974f1f253676ccca7aa259ecee9",
       "domain": "project-aliases",
       "ordinal": 2,
-      "schemaSha256": "5fd2432722dc42e80e2454f6e2db2a454da5fc6b2f69c7fa58594d9349f91e0f"
+      "schemaSha256": "4d325f8abf2b062b761fcb3701689c6a2ddee663861c1f192ad3fa71e09f32b4"
     },
     "scenario": "transfer",
     "source": "src/storage/portable-record.ts:PORTABLE_RECORD_DOMAIN_ORDER"
@@ -5572,10 +6652,10 @@
     "id": "portable-domain:promoted-memories",
     "kind": "portable-domain",
     "registration": {
-      "descriptorSha256": "bcabc3767d0ece9d517a96dc904f38ea39b205c7c7cf17f288b7577cea797b7e",
+      "descriptorSha256": "c2b7abdef3e9d401443284726716381ee76b5974f1f253676ccca7aa259ecee9",
       "domain": "promoted-memories",
       "ordinal": 12,
-      "schemaSha256": "5fd2432722dc42e80e2454f6e2db2a454da5fc6b2f69c7fa58594d9349f91e0f"
+      "schemaSha256": "4d325f8abf2b062b761fcb3701689c6a2ddee663861c1f192ad3fa71e09f32b4"
     },
     "scenario": "transfer",
     "source": "src/storage/portable-record.ts:PORTABLE_RECORD_DOMAIN_ORDER"
@@ -5596,10 +6676,10 @@
     "id": "portable-domain:promoted-memory-tags",
     "kind": "portable-domain",
     "registration": {
-      "descriptorSha256": "bcabc3767d0ece9d517a96dc904f38ea39b205c7c7cf17f288b7577cea797b7e",
+      "descriptorSha256": "c2b7abdef3e9d401443284726716381ee76b5974f1f253676ccca7aa259ecee9",
       "domain": "promoted-memory-tags",
       "ordinal": 13,
-      "schemaSha256": "5fd2432722dc42e80e2454f6e2db2a454da5fc6b2f69c7fa58594d9349f91e0f"
+      "schemaSha256": "4d325f8abf2b062b761fcb3701689c6a2ddee663861c1f192ad3fa71e09f32b4"
     },
     "scenario": "transfer",
     "source": "src/storage/portable-record.ts:PORTABLE_RECORD_DOMAIN_ORDER"
@@ -5620,10 +6700,10 @@
     "id": "portable-domain:recall-surfacings",
     "kind": "portable-domain",
     "registration": {
-      "descriptorSha256": "bcabc3767d0ece9d517a96dc904f38ea39b205c7c7cf17f288b7577cea797b7e",
+      "descriptorSha256": "c2b7abdef3e9d401443284726716381ee76b5974f1f253676ccca7aa259ecee9",
       "domain": "recall-surfacings",
       "ordinal": 14,
-      "schemaSha256": "5fd2432722dc42e80e2454f6e2db2a454da5fc6b2f69c7fa58594d9349f91e0f"
+      "schemaSha256": "4d325f8abf2b062b761fcb3701689c6a2ddee663861c1f192ad3fa71e09f32b4"
     },
     "scenario": "transfer",
     "source": "src/storage/portable-record.ts:PORTABLE_RECORD_DOMAIN_ORDER"
@@ -5644,10 +6724,10 @@
     "id": "portable-domain:redaction-counters",
     "kind": "portable-domain",
     "registration": {
-      "descriptorSha256": "bcabc3767d0ece9d517a96dc904f38ea39b205c7c7cf17f288b7577cea797b7e",
+      "descriptorSha256": "c2b7abdef3e9d401443284726716381ee76b5974f1f253676ccca7aa259ecee9",
       "domain": "redaction-counters",
       "ordinal": 15,
-      "schemaSha256": "5fd2432722dc42e80e2454f6e2db2a454da5fc6b2f69c7fa58594d9349f91e0f"
+      "schemaSha256": "4d325f8abf2b062b761fcb3701689c6a2ddee663861c1f192ad3fa71e09f32b4"
     },
     "scenario": "transfer",
     "source": "src/storage/portable-record.ts:PORTABLE_RECORD_DOMAIN_ORDER"
@@ -5668,10 +6748,10 @@
     "id": "portable-domain:session-ingest",
     "kind": "portable-domain",
     "registration": {
-      "descriptorSha256": "bcabc3767d0ece9d517a96dc904f38ea39b205c7c7cf17f288b7577cea797b7e",
+      "descriptorSha256": "c2b7abdef3e9d401443284726716381ee76b5974f1f253676ccca7aa259ecee9",
       "domain": "session-ingest",
       "ordinal": 16,
-      "schemaSha256": "5fd2432722dc42e80e2454f6e2db2a454da5fc6b2f69c7fa58594d9349f91e0f"
+      "schemaSha256": "4d325f8abf2b062b761fcb3701689c6a2ddee663861c1f192ad3fa71e09f32b4"
     },
     "scenario": "transfer",
     "source": "src/storage/portable-record.ts:PORTABLE_RECORD_DOMAIN_ORDER"
@@ -5692,10 +6772,10 @@
     "id": "portable-domain:session-instructions",
     "kind": "portable-domain",
     "registration": {
-      "descriptorSha256": "bcabc3767d0ece9d517a96dc904f38ea39b205c7c7cf17f288b7577cea797b7e",
+      "descriptorSha256": "c2b7abdef3e9d401443284726716381ee76b5974f1f253676ccca7aa259ecee9",
       "domain": "session-instructions",
       "ordinal": 17,
-      "schemaSha256": "5fd2432722dc42e80e2454f6e2db2a454da5fc6b2f69c7fa58594d9349f91e0f"
+      "schemaSha256": "4d325f8abf2b062b761fcb3701689c6a2ddee663861c1f192ad3fa71e09f32b4"
     },
     "scenario": "transfer",
     "source": "src/storage/portable-record.ts:PORTABLE_RECORD_DOMAIN_ORDER"
@@ -5716,10 +6796,10 @@
     "id": "portable-domain:summaries",
     "kind": "portable-domain",
     "registration": {
-      "descriptorSha256": "bcabc3767d0ece9d517a96dc904f38ea39b205c7c7cf17f288b7577cea797b7e",
+      "descriptorSha256": "c2b7abdef3e9d401443284726716381ee76b5974f1f253676ccca7aa259ecee9",
       "domain": "summaries",
       "ordinal": 7,
-      "schemaSha256": "5fd2432722dc42e80e2454f6e2db2a454da5fc6b2f69c7fa58594d9349f91e0f"
+      "schemaSha256": "4d325f8abf2b062b761fcb3701689c6a2ddee663861c1f192ad3fa71e09f32b4"
     },
     "scenario": "transfer",
     "source": "src/storage/portable-record.ts:PORTABLE_RECORD_DOMAIN_ORDER"
@@ -5740,10 +6820,10 @@
     "id": "portable-domain:summary-file-links",
     "kind": "portable-domain",
     "registration": {
-      "descriptorSha256": "bcabc3767d0ece9d517a96dc904f38ea39b205c7c7cf17f288b7577cea797b7e",
+      "descriptorSha256": "c2b7abdef3e9d401443284726716381ee76b5974f1f253676ccca7aa259ecee9",
       "domain": "summary-file-links",
       "ordinal": 8,
-      "schemaSha256": "5fd2432722dc42e80e2454f6e2db2a454da5fc6b2f69c7fa58594d9349f91e0f"
+      "schemaSha256": "4d325f8abf2b062b761fcb3701689c6a2ddee663861c1f192ad3fa71e09f32b4"
     },
     "scenario": "transfer",
     "source": "src/storage/portable-record.ts:PORTABLE_RECORD_DOMAIN_ORDER"
@@ -5764,10 +6844,10 @@
     "id": "portable-domain:summary-message-links",
     "kind": "portable-domain",
     "registration": {
-      "descriptorSha256": "bcabc3767d0ece9d517a96dc904f38ea39b205c7c7cf17f288b7577cea797b7e",
+      "descriptorSha256": "c2b7abdef3e9d401443284726716381ee76b5974f1f253676ccca7aa259ecee9",
       "domain": "summary-message-links",
       "ordinal": 9,
-      "schemaSha256": "5fd2432722dc42e80e2454f6e2db2a454da5fc6b2f69c7fa58594d9349f91e0f"
+      "schemaSha256": "4d325f8abf2b062b761fcb3701689c6a2ddee663861c1f192ad3fa71e09f32b4"
     },
     "scenario": "transfer",
     "source": "src/storage/portable-record.ts:PORTABLE_RECORD_DOMAIN_ORDER"
@@ -5788,10 +6868,10 @@
     "id": "portable-domain:summary-parent-links",
     "kind": "portable-domain",
     "registration": {
-      "descriptorSha256": "bcabc3767d0ece9d517a96dc904f38ea39b205c7c7cf17f288b7577cea797b7e",
+      "descriptorSha256": "c2b7abdef3e9d401443284726716381ee76b5974f1f253676ccca7aa259ecee9",
       "domain": "summary-parent-links",
       "ordinal": 10,
-      "schemaSha256": "5fd2432722dc42e80e2454f6e2db2a454da5fc6b2f69c7fa58594d9349f91e0f"
+      "schemaSha256": "4d325f8abf2b062b761fcb3701689c6a2ddee663861c1f192ad3fa71e09f32b4"
     },
     "scenario": "transfer",
     "source": "src/storage/portable-record.ts:PORTABLE_RECORD_DOMAIN_ORDER"

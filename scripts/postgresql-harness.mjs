@@ -5,6 +5,7 @@ import {
   chmodSync,
   closeSync,
   constants,
+  copyFileSync,
   fstatSync,
   mkdtempSync,
   openSync,
@@ -19,6 +20,7 @@ import {
 } from "node:fs";
 import { platform } from "node:os";
 import { basename, dirname, isAbsolute, join, normalize, win32 } from "node:path";
+import { StringDecoder } from "node:string_decoder";
 import { fileURLToPath } from "node:url";
 import {
   NODE_IMAGE,
@@ -46,6 +48,14 @@ export const OWNER_SCOPE_LABEL = "com.donadiosolutions.lcm.postgresql-test-owner
 export const RESOURCE_KIND_LABEL = "com.donadiosolutions.lcm.postgresql-test-resource-kind";
 export const OWNER_SCHEMA_VERSION = "2";
 export const MAX_CAPTURED_OUTPUT_BYTES = 64 * 1024;
+// One harness cluster serves every test database of a run, and each database
+// adds roughly 200 distinct statements; the complete suite reaches about 58,000
+// entries, past the stock cap of 5,000, which evicts statements that
+// query-statistics.integration.ts still expects to see. PostgreSQL sizes the
+// statistics hash at postmaster start, so the cap costs shared memory up front
+// (measured: shared_memory_size rises from 152 MB to 194 MB, about 0.45 KiB per
+// entry); query text lives in a file.
+export const PG_STAT_STATEMENTS_MAX = 100_000;
 export const MAX_DOCKER_REMOVE_ATTEMPTS = 3;
 export const ORPHAN_WORKER_STABILITY_DELAY_MS = 250;
 export const HARNESS_CLEANUP_RETRY_DELAYS_MS = Object.freeze([
@@ -62,6 +72,49 @@ export const MAX_HARNESS_ALLOCATION_MARKER_LINE_LENGTH =
   HARNESS_ALLOCATION_MARKER.length + 1 + 32;
 export const SIGNAL_CLEANUP_FAILURE_MARKER = "PostgreSQL harness cleanup failed:";
 export const SIGNAL_DIAGNOSTIC_FLUSH_TIMEOUT_MS = 5_000;
+
+export const CONTAINER_CLI_VARIABLE = "LCM_TEST_CONTAINER_CLI";
+const CONTAINER_FLAVOURS = Object.freeze(["docker", "podman"]);
+
+/**
+ * Select the container engine CLI once per harness run. Unset selects Docker;
+ * otherwise only "docker", "podman" or an absolute path to one of them is valid.
+ * A Windows ".exe" suffix on the path's basename is ignored, case-insensitively.
+ */
+export function resolveContainerEngine(environment = process.env) {
+  const configured = environment[CONTAINER_CLI_VARIABLE];
+  if (configured === undefined) return { cli: "docker", flavour: "docker" };
+  if (typeof configured === "string" && !configured.includes("\0")) {
+    if (CONTAINER_FLAVOURS.includes(configured)) return { cli: configured, flavour: configured };
+    if (isAbsolute(configured)) {
+      const executable = basename(configured);
+      const flavour = /\.exe$/iu.test(executable) ? executable.slice(0, -4).toLowerCase() : executable;
+      if (CONTAINER_FLAVOURS.includes(flavour)) return { cli: configured, flavour };
+    }
+  }
+  throw new Error(
+    `${CONTAINER_CLI_VARIABLE} must be "docker", "podman", or an absolute path to a docker or podman executable`,
+  );
+}
+
+/** Reject Podman configurations the local harness cannot run safely, before any side effect. */
+export function assertContainerEngineSupported(engine, ci, environment = process.env) {
+  if (engine.flavour !== "podman") return;
+  if (ci) {
+    throw new Error(
+      "the Podman PostgreSQL harness supports only local mode; run it without GITHUB_ACTIONS",
+    );
+  }
+  if (String(environment.LCM_POSTGRES_TEMPLATE_ARCHIVE ?? "").trim().length > 0) {
+    throw new Error(
+      "the Podman PostgreSQL harness does not support LCM_POSTGRES_TEMPLATE_ARCHIVE; unset it",
+    );
+  }
+}
+
+export function createContainerRunner(cli) {
+  return (args, options) => runProcess(cli, args, options);
+}
 
 export function resolveSignalProbeReadinessTimeout(environment = process.env) {
   const configured = environment.LCM_TEST_POSTGRES_SIGNAL_READY_TIMEOUT_MS;
@@ -551,6 +604,169 @@ export function sanitizeHarnessText(value, secrets) {
     .replace(/-----BEGIN [^-]+-----[\s\S]*?-----END [^-]+-----/gu, "[REDACTED PEM]");
 }
 
+// Same marker grammar as sanitizeHarnessText: any non-empty hyphen-free label.
+const PEM_MARKER = /-----(BEGIN|END) [^-]+-----/gu;
+const PEM_KEYWORD = /-----(BEGIN|END) /gu;
+// The longest keyword prefix that is not yet a complete keyword ("-----BEGIN").
+const PEM_KEYWORD_PREFIX_CHARS = 10;
+
+// Walks complete BEGIN and END markers left to right, starting at nesting
+// depth `depth`. Returns the text outside PEM blocks, with each block replaced
+// by a marker, and the depth after the last marker. A BEGIN with no later END
+// leaves the block open; an END while no block is open is ordinary text.
+function scanPemMarkers(text, depth) {
+  let output = "";
+  let cursor = 0;
+  let open = depth;
+  for (const match of text.matchAll(PEM_MARKER)) {
+    const end = match.index + match[0].length;
+    if (match[1] === "BEGIN") {
+      if (open === 0) output += text.slice(cursor, match.index) + "[REDACTED PEM]";
+      open += 1;
+    } else if (open > 0) {
+      open -= 1;
+      if (open === 0) cursor = end;
+    }
+  }
+  if (open === 0) output += text.slice(cursor);
+  return { output, depth: open };
+}
+
+// Redacts a child stream one complete line at a time, so every byte passes
+// through secret, URL, and PEM redaction with full state before the bounded
+// capture ring may discard any of it. A PEM block is dropped from its BEGIN
+// marker through its END marker, also when the stream ends inside it. A line
+// longer than MAX_CAPTURED_OUTPUT_BYTES is dropped and replaced by a marker,
+// however the chunks divide it; only its PEM state is kept, by a streaming
+// marker scanner that needs no buffer for the label. dropped() reports that
+// any line was dropped, which callers treat as capture truncation. Returns
+// undefined when a secret spans lines, which line-wise redaction cannot cover.
+export function createStreamRedactor(secrets) {
+  const needles = secrets.filter(Boolean);
+  if (needles.some((secret) => String(secret).includes("\n"))) return undefined;
+  const decoder = new StringDecoder("utf8");
+  let pending = "";
+  let discarding = false;
+  let anyDropped = false;
+  let depth = 0;
+  let carry = "";
+  let label;
+  const redactLine = (line) => {
+    const startedInPem = depth > 0;
+    let redacted = line;
+    for (const secret of needles) redacted = redacted.split(secret).join("[REDACTED]");
+    const scanned = scanPemMarkers(redacted, depth);
+    depth = scanned.depth;
+    if (startedInPem && scanned.output === "") return undefined;
+    return scanned.output.replace(/postgresql:\/\/[^\s]+/giu, "postgresql://[REDACTED]");
+  };
+  // Scans text that is being dropped, so markers may span writes and have a
+  // label of any length. A BEGIN keyword opens a block at once, whether or not
+  // its closing hyphens are ever confirmed (fail closed); only a confirmed END
+  // marker closes one. State is a bounded keyword-prefix carry plus, inside a
+  // label, the marker kind, whether the label is non-empty and the hyphen run.
+  const scanDropped = (text) => {
+    let rest = text;
+    while (rest !== "" || label === undefined) {
+      if (label) {
+        let index = 0;
+        let failed = false;
+        while (index < rest.length) {
+          if (rest[index] !== "-") {
+            if (label.dashes > 0) {
+              failed = true;
+              break;
+            }
+            label.named = true;
+            index += 1;
+            continue;
+          }
+          label.dashes += 1;
+          index += 1;
+          if (label.dashes === 5 && label.named) {
+            if (label.kind === "END") depth = Math.max(0, depth - 1);
+            label = undefined;
+            break;
+          }
+        }
+        if (failed) {
+          // The hyphens may begin the next keyword, so rescan them.
+          carry = "-".repeat(Math.min(label.dashes, PEM_KEYWORD_PREFIX_CHARS));
+          label = undefined;
+        }
+        rest = rest.slice(index);
+        if (label) return;
+        continue;
+      }
+      const window = carry + rest;
+      PEM_KEYWORD.lastIndex = 0;
+      const match = PEM_KEYWORD.exec(window);
+      if (!match) {
+        carry = window.slice(-PEM_KEYWORD_PREFIX_CHARS);
+        return;
+      }
+      rest = window.slice(match.index + match[0].length);
+      carry = "";
+      label = { kind: match[1], named: false, dashes: 0 };
+      if (label.kind === "BEGIN") depth += 1;
+    }
+  };
+  const dropLine = () => {
+    anyDropped = true;
+    discarding = false;
+    carry = "";
+    label = undefined;
+    return `[redacted: output line exceeded ${MAX_CAPTURED_OUTPUT_BYTES} bytes]`;
+  };
+  const consume = (text) => {
+    let output = "";
+    let start = 0;
+    for (let newline = text.indexOf("\n"); newline >= 0; newline = text.indexOf("\n", start)) {
+      const line = text.slice(start, newline);
+      start = newline + 1;
+      let emitted;
+      if (discarding) {
+        scanDropped(line);
+        emitted = dropLine();
+      } else if (Buffer.byteLength(line) > MAX_CAPTURED_OUTPUT_BYTES) {
+        scanDropped(line);
+        emitted = dropLine();
+      } else {
+        emitted = redactLine(line);
+      }
+      if (emitted !== undefined) output += `${emitted}\n`;
+    }
+    const rest = text.slice(start);
+    if (discarding || Buffer.byteLength(rest) > MAX_CAPTURED_OUTPUT_BYTES) {
+      discarding = true;
+      scanDropped(rest);
+      pending = "";
+    } else {
+      pending = rest;
+    }
+    return output;
+  };
+  return {
+    write(chunk) {
+      const text = pending + (typeof chunk === "string" ? chunk : decoder.write(chunk));
+      pending = "";
+      return consume(text);
+    },
+    end() {
+      const text = pending + decoder.end();
+      pending = "";
+      if (discarding || Buffer.byteLength(text) > MAX_CAPTURED_OUTPUT_BYTES) {
+        scanDropped(text);
+        return dropLine();
+      }
+      return text === "" ? "" : redactLine(text) ?? "";
+    },
+    dropped() {
+      return anyDropped;
+    },
+  };
+}
+
 export function runProcess(command, args, options = {}) {
   return new Promise((resolve, reject) => {
     const spawnProcess = options.spawnProcess ?? spawn;
@@ -576,26 +792,38 @@ export function runProcess(command, args, options = {}) {
     let stdoutTruncated = false;
     let stderrTruncated = false;
     let settled = false;
+    // Redaction precedes the ring, so a truncated tail never holds unredacted bytes.
+    const stdoutRedactor = options.redactSecrets === undefined
+      ? undefined
+      : createStreamRedactor(options.redactSecrets);
+    const stderrRedactor = options.redactSecrets === undefined
+      ? undefined
+      : createStreamRedactor(options.redactSecrets);
+    const redacted = stdoutRedactor !== undefined;
     const appendTail = (current, chunk) => {
       const next = Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk);
+      // A truncated tail starts on a code point boundary, never inside a character.
+      const cut = (value) => value.subarray(utf8TailStart(value, 0));
       if (next.length >= maxCapturedOutputBytes) {
-        return { value: next.subarray(-maxCapturedOutputBytes), truncated: current.length > 0 || next.length > maxCapturedOutputBytes };
+        const truncated = current.length > 0 || next.length > maxCapturedOutputBytes;
+        const value = next.subarray(-maxCapturedOutputBytes);
+        return { value: truncated ? cut(value) : value, truncated };
       }
       if (current.length + next.length <= maxCapturedOutputBytes) {
         return { value: Buffer.concat([current, next]), truncated: false };
       }
       return {
-        value: Buffer.concat([current.subarray(current.length + next.length - maxCapturedOutputBytes), next]),
+        value: cut(Buffer.concat([current.subarray(current.length + next.length - maxCapturedOutputBytes), next])),
         truncated: true,
       };
     };
     child.stdout?.on("data", (chunk) => {
-      const appended = appendTail(stdout, chunk);
+      const appended = appendTail(stdout, stdoutRedactor ? stdoutRedactor.write(chunk) : chunk);
       stdout = appended.value;
       stdoutTruncated ||= appended.truncated;
     });
     child.stderr?.on("data", (chunk) => {
-      const appended = appendTail(stderr, chunk);
+      const appended = appendTail(stderr, stderrRedactor ? stderrRedactor.write(chunk) : chunk);
       stderr = appended.value;
       stderrTruncated ||= appended.truncated;
     });
@@ -606,6 +834,17 @@ export function runProcess(command, args, options = {}) {
     };
     child.once("error", (error) => settle(() => reject(error)));
     child.once("close", (code, signal) => settle(() => {
+      if (redacted) {
+        const flushedStdout = appendTail(stdout, stdoutRedactor.end());
+        stdout = flushedStdout.value;
+        stdoutTruncated ||= flushedStdout.truncated;
+        const flushedStderr = appendTail(stderr, stderrRedactor.end());
+        stderr = flushedStderr.value;
+        stderrTruncated ||= flushedStderr.truncated;
+        // A dropped overlong line is capture truncation, whatever the exit status.
+        stdoutTruncated ||= stdoutRedactor.dropped();
+        stderrTruncated ||= stderrRedactor.dropped();
+      }
       const capturedStdout = stdout.toString("utf8");
       const capturedStderr = stderr.toString("utf8");
       if (code === 0) {
@@ -614,6 +853,7 @@ export function runProcess(command, args, options = {}) {
           stderr: capturedStderr.trim(),
           stdoutTruncated,
           stderrTruncated,
+          ...(redacted ? { redacted } : {}),
         });
       }
       else reject(Object.assign(new Error(`${command} failed`), {
@@ -623,22 +863,93 @@ export function runProcess(command, args, options = {}) {
         stderr: capturedStderr,
         stdoutTruncated,
         stderrTruncated,
+        ...(redacted ? { redacted } : {}),
       }));
     }));
   });
 }
 
+// Bytes of redacted child output that a failed harness run reports when a
+// stream exceeded the capture limit. Kept below half of the final diagnostic so
+// the head of the combined harness diagnostic still holds all of it.
+const CHILD_DIAGNOSTIC_EXCERPT_BYTES = 24 * 1024;
+
+function utf8HeadEnd(bytes, end) {
+  let boundary = end;
+  while (boundary > 0 && (bytes[boundary] & 0xc0) === 0x80) boundary -= 1;
+  return boundary;
+}
+
+function utf8TailStart(bytes, start) {
+  let boundary = start;
+  while (boundary < bytes.length && (bytes[boundary] & 0xc0) === 0x80) boundary += 1;
+  return boundary;
+}
+
+function utf8Tail(value, limit) {
+  const bytes = Buffer.from(value);
+  if (bytes.length <= limit) return value;
+  return bytes.subarray(utf8TailStart(bytes, bytes.length - limit)).toString("utf8");
+}
+
+// Bounds already sanitized text to `limit` bytes: a marker with the original
+// size, the head, an elision line, and the tail, cut on code point boundaries.
+export function boundedDiagnosticExcerpt(value, limit = MAX_CAPTURED_OUTPUT_BYTES) {
+  const bytes = Buffer.from(value);
+  if (bytes.length <= limit) return value;
+  const marker = (head, tail) => `[PostgreSQL harness diagnostic truncated: ${bytes.length} bytes, showing first ${head} and last ${tail}]\n`;
+  const elision = "\n[... diagnostic output elided ...]\n";
+  const available = limit - Buffer.byteLength(marker(limit, limit)) - Buffer.byteLength(elision);
+  const headEnd = utf8HeadEnd(bytes, Math.floor(available / 2));
+  const tailStart = utf8TailStart(bytes, bytes.length - (available - Math.floor(available / 2)));
+  return marker(headEnd, bytes.length - tailStart)
+    + bytes.subarray(0, headEnd).toString("utf8")
+    + elision
+    + bytes.subarray(tailStart).toString("utf8");
+}
+
+const capturedOutputFailures = new WeakSet();
+const CAPTURE_LIMIT_MESSAGE = "PostgreSQL harness child output exceeded the safe capture limit";
+const EXPANDED_LIMIT_MESSAGE = "PostgreSQL harness sanitized output exceeded the safe capture limit";
+
+function capturedOutputFailure(error, output, streams) {
+  const notice = `${output.limit}; showing the sanitized tail of each stream`;
+  const sections = [["stdout", output.stdout], ["stderr", output.stderr]].filter(([, text]) => text !== "");
+  const labelBytes = sections.reduce((total, [name]) => total + Buffer.byteLength(`\n[${name} tail]\n`), 0);
+  const share = Math.floor(
+    (CHILD_DIAGNOSTIC_EXCERPT_BYTES - Buffer.byteLength(notice) - labelBytes) / Math.max(sections.length, 1),
+  );
+  const diagnostic = [
+    notice,
+    ...sections.map(([name, text]) => `[${name} tail]\n${utf8Tail(text, share)}`),
+  ].join("\n");
+  streams.stderr.write(`${diagnostic}\n`);
+  capturedOutputFailures.add(error);
+  // The run still fails. The redacted excerpt travels in stderr, which harnessErrorDetails reads.
+  return Object.assign(error, {
+    stdout: "",
+    stderr: diagnostic,
+    stdoutTruncated: false,
+    stderrTruncated: false,
+    redacted: true,
+  });
+}
+
 function sanitizedCapturedOutput(result, secrets) {
-  if (result?.stdoutTruncated || result?.stderrTruncated) {
-    throw new Error("PostgreSQL harness child output exceeded the safe capture limit");
+  const truncated = Boolean(result?.stdoutTruncated || result?.stderrTruncated);
+  if (result?.redacted === true) {
+    // The runner redacted each line before its ring could discard any byte.
+    return { stdout: result.stdout ?? "", stderr: result.stderr ?? "", limit: truncated ? CAPTURE_LIMIT_MESSAGE : undefined };
+  }
+  if (truncated) {
+    // A raw truncated tail may begin inside a secret or PEM block; surface nothing.
+    throw new Error(CAPTURE_LIMIT_MESSAGE);
   }
   const stdout = sanitizeHarnessText(result?.stdout ?? "", secrets);
   const stderr = sanitizeHarnessText(result?.stderr ?? "", secrets);
-  if (Buffer.byteLength(stdout) > MAX_CAPTURED_OUTPUT_BYTES
-    || Buffer.byteLength(stderr) > MAX_CAPTURED_OUTPUT_BYTES) {
-    throw new Error("PostgreSQL harness sanitized output exceeded the safe capture limit");
-  }
-  return { stdout, stderr };
+  const expanded = Buffer.byteLength(stdout) > MAX_CAPTURED_OUTPUT_BYTES
+    || Buffer.byteLength(stderr) > MAX_CAPTURED_OUTPUT_BYTES;
+  return { stdout, stderr, limit: expanded ? EXPANDED_LIMIT_MESSAGE : undefined };
 }
 
 function surfaceCapturedOutput(output, streams) {
@@ -655,14 +966,17 @@ export async function runSanitizedProcess(command, args, options = {}) {
     ...processOptions
   } = options;
   try {
-    const result = await processRunner(command, args, processOptions);
+    const result = await processRunner(command, args, { ...processOptions, redactSecrets: secrets });
     const output = sanitizedCapturedOutput(result, secrets);
+    if (output.limit) throw capturedOutputFailure(new Error(output.limit), output, { stdout, stderr });
     surfaceCapturedOutput(output, { stdout, stderr });
-    return output;
+    return { stdout: output.stdout, stderr: output.stderr };
   } catch (error) {
+    if (capturedOutputFailures.has(error)) throw error;
     const output = sanitizedCapturedOutput(error, secrets);
+    if (output.limit) throw capturedOutputFailure(error, output, { stdout, stderr });
     surfaceCapturedOutput(output, { stdout, stderr });
-    if (error && typeof error === "object") Object.assign(error, output);
+    if (error && typeof error === "object") Object.assign(error, { stdout: output.stdout, stderr: output.stderr });
     throw error;
   }
 }
@@ -850,9 +1164,16 @@ async function inspectDockerObject(type, name, dockerRunner = docker) {
   return JSON.parse(result.stdout)[0];
 }
 
+/** Read ownership labels from an inspect record; Podman reports network labels in lowercase. */
+export function inspectedLabels(type, record) {
+  if (type === "container") return record?.Config?.Labels ?? {};
+  if (type === "network") return record?.Labels ?? record?.labels ?? {};
+  return record?.Labels ?? {};
+}
+
 export async function inspectLabels(type, name, dockerRunner = docker) {
   const record = await inspectDockerObject(type, name, dockerRunner);
-  return type === "container" ? record?.Config?.Labels ?? {} : record?.Labels ?? {};
+  return inspectedLabels(type, record);
 }
 
 export function isMissingDockerObjectError(error, type, name) {
@@ -870,11 +1191,24 @@ export function isMissingDockerObjectError(error, type, name) {
       ? diagnostic.slice("Error: ".length)
       : diagnostic;
   const expected = type === "container"
-    ? `No such container: ${name}`
+    ? [
+      `No such container: ${name}`,
+      `no such container "${name}"`,
+      `no container with name or ID "${name}" found: no such container`,
+      `no container with ID or name "${name}" found: no such container`,
+    ]
     : type === "network"
-      ? `network ${name} not found`
-      : `get ${name}: no such volume`;
-  return message === expected;
+      ? [
+        `network ${name} not found`,
+        `network ${name}: unable to find network with name or ID ${name}: network not found`,
+        `unable to find network with name or ID ${name}: network not found`,
+      ]
+      : [
+        `get ${name}: no such volume`,
+        `no such volume ${name}`,
+        `no volume with name "${name}" found: no such volume`,
+      ];
+  return expected.includes(message);
 }
 
 export async function removeLabeled(type, name, runId, dockerRunner = docker) {
@@ -934,7 +1268,7 @@ export async function removeOwnedResource(
       if (isMissingDockerObjectError(error, type, name)) return;
       throw error;
     }
-    const labels = type === "container" ? record?.Config?.Labels ?? {} : record?.Labels ?? {};
+    const labels = inspectedLabels(type, record);
     if (!labelsMatchOwnership(labels, expectedLabels)) {
       throw new Error(`refusing to remove ${type} with changed PostgreSQL harness ownership`);
     }
@@ -1149,7 +1483,7 @@ export async function discoverHarnessRuns(dependencies = {}) {
       });
       continue;
     }
-    const labels = resource.type === "container" ? record?.Config?.Labels ?? {} : record?.Labels ?? {};
+    const labels = inspectedLabels(resource.type, record);
     const ownership = requiredOwnership(labels);
     const spec = ownership && resourceSpec(resource.type, resource.name, ownership.runId);
     if (!ownership || !spec || spec.kind !== ownership.kind) {
@@ -1304,7 +1638,7 @@ export async function reclaimProvenOrphans(dependencies = {}) {
   if (ambiguousCount > 0) {
     const stderr = dependencies.stderr ?? process.stderr;
     stderr.write(
-      `PostgreSQL harness preserved ${ambiguousCount} ambiguous labeled Docker run${ambiguousCount === 1 ? "" : "s"}; manual reconciliation required.\n`,
+      `PostgreSQL harness preserved ${ambiguousCount} ambiguous labeled run${ambiguousCount === 1 ? "" : "s"}; manual reconciliation required.\n`,
     );
   }
   for (const run of runs) {
@@ -1412,7 +1746,7 @@ async function waitForPostgreSql(container, database, dockerRunner = docker, use
 async function hostPort(container, dockerRunner = docker) {
   const result = await dockerRunner(["port", container, "5432/tcp"]);
   const match = result.stdout.match(/127\.0\.0\.1:(\d+)$/u);
-  if (!match || match[1] === "5432") throw new Error("Docker did not allocate a safe random loopback port");
+  if (!match || match[1] === "5432") throw new Error("the container engine did not allocate a safe random loopback port");
   return Number(match[1]);
 }
 
@@ -1455,26 +1789,42 @@ export function harnessErrorDetails(error) {
   if (error instanceof AggregateError) {
     return [error.message, ...error.errors.map((nested) => harnessErrorDetails(nested))].join("\n");
   }
-  return String(error?.stderr ?? error?.message ?? error);
+  return String(harnessErrorStderr(error) ?? error?.message ?? error);
 }
 
-function sanitizedHarnessErrorDetails(error, secrets) {
-  const sanitized = sanitizeHarnessText(harnessErrorDetails(error), secrets);
-  return Buffer.byteLength(sanitized) <= MAX_CAPTURED_OUTPUT_BYTES
-    ? sanitized
-    : "PostgreSQL harness diagnostic exceeded the safe capture limit";
+const RAW_OUTPUT_OMITTED = "[raw child output omitted: capture exceeded the safe limit before redaction]";
+
+// A raw ring tail that overflowed may start inside a secret or PEM block, and
+// redacting it afterwards cannot recover that state, so it is never reported.
+function harnessErrorStderr(error) {
+  return error?.stderrTruncated === true && error.redacted !== true
+    ? RAW_OUTPUT_OMITTED
+    : error?.stderr;
+}
+
+export function appendContainerLogs(error, logs) {
+  const rawLogsOverflowed = logs.redacted !== true && (logs.stdoutTruncated || logs.stderrTruncated);
+  return Object.assign(error, {
+    stderr: `${harnessErrorStderr(error) ?? ""}\n${rawLogsOverflowed ? RAW_OUTPUT_OMITTED : `${logs.stdout}\n${logs.stderr}`}`,
+    stderrTruncated: false,
+  });
+}
+
+export function sanitizedHarnessErrorDetails(error, secrets) {
+  return boundedDiagnosticExcerpt(sanitizeHarnessText(harnessErrorDetails(error), secrets));
 }
 
 export async function cleanupHarnessResources(context, dependencies = {}) {
   const { names, runId, directory, sentinelReady, owner } = context;
+  const dockerRunner = dependencies.dockerRunner ?? docker;
   const removeResource = dependencies.removeResource
     ?? ((type, name) => {
       const spec = resourceSpec(type, name, runId);
-      if (!owner || !spec) return removeLabeled(type, name, runId);
-      return removeOwnedResource(type, name, ownershipLabels(runId, spec.kind, owner));
+      if (!owner || !spec) return removeLabeled(type, name, runId, dockerRunner);
+      return removeOwnedResource(type, name, ownershipLabels(runId, spec.kind, owner), dockerRunner);
     });
   const verifySentinel = dependencies.verifySentinel
-    ?? (() => verifyContainerSentinel(names, runId));
+    ?? (() => verifyContainerSentinel(names, runId, dockerRunner));
   const removeDirectory = dependencies.removeDirectory
     ?? ((path) => rmSync(path, { recursive: true, force: true }));
   const retryDelays = dependencies.retryDelays ?? HARNESS_CLEANUP_RETRY_DELAYS_MS;
@@ -1581,6 +1931,46 @@ export function createCiRunnerContainerArgs(context, envFile) {
   ];
 }
 
+/**
+ * Build the database container arguments. Every bind source is a harness-owned
+ * path (the run directory and the scripts staged inside it), never a checkout
+ * file. Docker keeps the shared SELinux label (`z`); Podman, which runs one
+ * container per private run directory, relabels privately (`Z`).
+ */
+export function createDatabaseContainerArgs(context) {
+  const { names, runId, owner, directory, stagedScripts, publish, usingCachedTemplate, flavour } = context;
+  const podman = flavour === "podman";
+  const mode = podman ? "ro,Z" : "ro,z";
+  const args = [
+    "create", "--name", names.container,
+    ...dockerLabelArgs(ownershipLabels(runId, "database", owner)),
+    "--network", names.network,
+    "--network-alias", names.alias,
+    "--network-alias", names.wrongAlias,
+    ...publish,
+    "--env", `LCM_POSTGRES_TEMPLATE_MARKER=${POSTGRES_TEMPLATE_MARKER}`,
+    "--volume", `${names.volume}:/var/lib/postgresql`,
+    "--volume", `${directory}:/run/lcm-harness:${mode}`,
+    "--volume", `${stagedScripts.cachedRunInitScript}:/run/lcm-cached-init.sh:${mode}`,
+  ];
+  if (!usingCachedTemplate) {
+    args.push(
+      "--volume", `${stagedScripts.initScript}:/docker-entrypoint-initdb.d/10-lcm-harness.sh:${mode}`,
+      "--env", "POSTGRES_USER=lcm_harness_admin",
+      "--env", `POSTGRES_DB=${names.controlDatabase}`,
+      "--env", "POSTGRES_PASSWORD_FILE=/run/lcm-private/admin-password",
+      "--env", "POSTGRES_INITDB_ARGS=--auth-host=scram-sha-256",
+    );
+  }
+  args.push(
+    "--entrypoint", "/bin/bash",
+    POSTGRES_IMAGE,
+    "-ceu",
+    "install -d -o postgres -g postgres -m 0700 /var/lib/postgresql/certs /run/lcm-private; install -o postgres -g postgres -m 0600 /run/lcm-harness/server.key /var/lib/postgresql/certs/server.key; install -o postgres -g postgres -m 0644 /run/lcm-harness/server.crt /run/lcm-harness/ca.crt /var/lib/postgresql/certs/; install -o postgres -g postgres -m 0600 /run/lcm-harness/admin-password /run/lcm-harness/migrator-password /run/lcm-harness/runtime-password /run/lcm-harness/run-id /run/lcm-harness/database-name /run/lcm-private/; exec /usr/local/bin/docker-entrypoint.sh postgres -c ssl=on -c ssl_cert_file=/var/lib/postgresql/certs/server.crt -c ssl_key_file=/var/lib/postgresql/certs/server.key -c ssl_ca_file=/var/lib/postgresql/certs/ca.crt -c shared_preload_libraries=pg_stat_statements -c pg_stat_statements.max=" + PG_STAT_STATEMENTS_MAX + " -c listen_addresses=* -c password_encryption=scram-sha-256 -c timezone=UTC",
+  );
+  return args;
+}
+
 export async function runTests(context, ci, setupDocker = docker, testProcess = runProcess) {
   const env = { ...process.env, ...context.environment };
   delete env.LCM_TEST_POSTGRES_FORK_PROBE;
@@ -1665,22 +2055,45 @@ export async function runTests(context, ci, setupDocker = docker, testProcess = 
   writeFileSync(envFile, Object.entries(createDockerRunnerEnvironment(context.environment, censusCost))
     .map(([key, value]) => `${key}=${value}`).join("\n") + "\n", { mode: 0o600 });
   await setupDocker(createCiRunnerContainerArgs(context, envFile));
-  await runSanitizedProcess("docker", ["start", "--attach", context.names.runner], {
+  await runSanitizedProcess(context.containerCli ?? "docker", ["start", "--attach", context.names.runner], {
     processRunner: (_command, args, processOptions) => setupDocker(args, processOptions),
     secrets,
     terminateOnStop: true,
   });
 }
 
+// Copies the database container's init scripts into the harness-owned run
+// directory so SELinux relabeling applies to the copies, not the checkout.
+export function stageHarnessScripts(directory) {
+  const staged = {
+    initScript: join(directory, "init.sh"),
+    cachedRunInitScript: join(directory, "cached-run-init.sh"),
+  };
+  copyFileSync(initScript, staged.initScript);
+  copyFileSync(cachedRunInitScript, staged.cachedRunInitScript);
+  chmodSync(staged.initScript, 0o644);
+  chmodSync(staged.cachedRunInitScript, 0o644);
+  return staged;
+}
+
 export async function runHarness(options = {}) {
   resolveSignalProbeReadinessTimeout(process.env);
   const ci = options.ci ?? process.env.GITHUB_ACTIONS === "true";
+  let engine;
+  try {
+    engine = resolveContainerEngine(process.env);
+    assertContainerEngineSupported(engine, ci, process.env);
+  } catch (error) {
+    process.stderr.write(`PostgreSQL harness startup failed: ${error.message}\n`);
+    throw error;
+  }
+  const containerRunner = createContainerRunner(engine.cli);
   const runId = randomBytes(16).toString("hex");
   process.stderr.write(`${HARNESS_ALLOCATION_MARKER} ${runId}\n`);
   let owner;
   try {
     await options.afterRunAllocation?.({ runId });
-    await reclaimProvenOrphans();
+    await reclaimProvenOrphans({ dockerRunner: containerRunner });
     owner = createOwnerIdentity();
   } catch (error) {
     process.stderr.write(`PostgreSQL harness startup failed: ${sanitizedHarnessErrorDetails(error, [])}\n`);
@@ -1709,7 +2122,7 @@ export async function runHarness(options = {}) {
   validateRunNames(names, runId);
   const processLifecycle = createProcessLifecycle();
   const setupProcess = processLifecycle.run;
-  const setupDocker = (args, processOptions) => setupProcess("docker", args, processOptions);
+  const setupDocker = (args, processOptions) => setupProcess(engine.cli, args, processOptions);
   let sentinelReady = false;
   const { teardown } = createHarnessCleanupOperations(
     {
@@ -1721,7 +2134,11 @@ export async function runHarness(options = {}) {
       },
       owner,
     },
-    { stop: processLifecycle.stop, secrets },
+    {
+      stop: processLifecycle.stop,
+      secrets,
+      cleanupDependencies: { dockerRunner: containerRunner },
+    },
   );
   let exitSignal;
   let signalExitPromise;
@@ -1747,6 +2164,7 @@ export async function runHarness(options = {}) {
     writeFileSync(join(directory, "admin-password"), `${passwords.admin}\n`, { mode: 0o600 });
     writeFileSync(join(directory, "migrator-password"), `${passwords.migrator}\n`, { mode: 0o600 });
     writeFileSync(join(directory, "runtime-password"), `${passwords.runtime}\n`, { mode: 0o600 });
+    const stagedScripts = stageHarnessScripts(directory);
     await writeTlsFixtures(directory, names.alias, setupProcess);
     await setupDocker([
       "network", "create",
@@ -1782,35 +2200,16 @@ export async function runHarness(options = {}) {
         setupDocker,
       );
     }
-    const publish = ci ? [] : ["--publish", "127.0.0.1::5432"];
-    const containerArgs = [
-      "create", "--name", names.container,
-      ...dockerLabelArgs(ownershipLabels(runId, "database", owner)),
-      "--network", names.network,
-      "--network-alias", names.alias,
-      "--network-alias", names.wrongAlias,
-      ...publish,
-      "--env", `LCM_POSTGRES_TEMPLATE_MARKER=${POSTGRES_TEMPLATE_MARKER}`,
-      "--volume", `${names.volume}:/var/lib/postgresql`,
-      "--volume", `${directory}:/run/lcm-harness:ro`,
-      "--volume", `${cachedRunInitScript}:/run/lcm-cached-init.sh:ro`,
-    ];
-    if (!usingCachedTemplate) {
-      containerArgs.push(
-        "--volume", `${initScript}:/docker-entrypoint-initdb.d/10-lcm-harness.sh:ro`,
-        "--env", "POSTGRES_USER=lcm_harness_admin",
-        "--env", `POSTGRES_DB=${names.controlDatabase}`,
-        "--env", "POSTGRES_PASSWORD_FILE=/run/lcm-private/admin-password",
-        "--env", "POSTGRES_INITDB_ARGS=--auth-host=scram-sha-256",
-      );
-    }
-    containerArgs.push(
-      "--entrypoint", "/bin/bash",
-      POSTGRES_IMAGE,
-      "-ceu",
-      "install -d -o postgres -g postgres -m 0700 /var/lib/postgresql/certs /run/lcm-private; install -o postgres -g postgres -m 0600 /run/lcm-harness/server.key /var/lib/postgresql/certs/server.key; install -o postgres -g postgres -m 0644 /run/lcm-harness/server.crt /run/lcm-harness/ca.crt /var/lib/postgresql/certs/; install -o postgres -g postgres -m 0600 /run/lcm-harness/admin-password /run/lcm-harness/migrator-password /run/lcm-harness/runtime-password /run/lcm-harness/run-id /run/lcm-harness/database-name /run/lcm-private/; exec /usr/local/bin/docker-entrypoint.sh postgres -c ssl=on -c ssl_cert_file=/var/lib/postgresql/certs/server.crt -c ssl_key_file=/var/lib/postgresql/certs/server.key -c ssl_ca_file=/var/lib/postgresql/certs/ca.crt -c shared_preload_libraries=pg_stat_statements -c listen_addresses=* -c password_encryption=scram-sha-256 -c timezone=UTC",
-    );
-    await setupDocker(containerArgs);
+    await setupDocker(createDatabaseContainerArgs({
+      names,
+      runId,
+      owner,
+      directory,
+      stagedScripts,
+      publish: ci ? [] : ["--publish", "127.0.0.1::5432"],
+      usingCachedTemplate,
+      flavour: engine.flavour,
+    }));
     await setupDocker(["start", names.container]);
     try {
       await waitForPostgreSql(
@@ -1823,8 +2222,9 @@ export async function runHarness(options = {}) {
         await setupDocker(["exec", names.container, "/bin/bash", "/run/lcm-cached-init.sh"]);
       }
     } catch (error) {
-      const logs = await docker(["logs", names.container]).catch(() => ({ stdout: "", stderr: "" }));
-      throw Object.assign(error, { stderr: `${error?.stderr ?? ""}\n${logs.stdout}\n${logs.stderr}` });
+      const logs = await containerRunner(["logs", names.container], { redactSecrets: secrets })
+        .catch(() => ({ stdout: "", stderr: "" }));
+      throw appendContainerLogs(error, logs);
     }
     await waitForContainerSentinel(names, runId, setupDocker);
     sentinelReady = true;
@@ -1852,6 +2252,7 @@ export async function runHarness(options = {}) {
           environment,
           secrets,
           owner,
+          containerCli: engine.cli,
           consumerProbe: options.consumerProbe,
           forkConsumerProbe: options.forkConsumerProbe,
         },
@@ -1861,8 +2262,9 @@ export async function runHarness(options = {}) {
         setupProcess,
       );
     } catch (error) {
-      const logs = await docker(["logs", names.container]).catch(() => ({ stdout: "", stderr: "" }));
-      throw Object.assign(error, { stderr: `${error?.stderr ?? ""}\n${logs.stdout}\n${logs.stderr}` });
+      const logs = await containerRunner(["logs", names.container], { redactSecrets: secrets })
+        .catch(() => ({ stdout: "", stderr: "" }));
+      throw appendContainerLogs(error, logs);
     }
   } catch (error) {
     const details = sanitizedHarnessErrorDetails(error, secrets);

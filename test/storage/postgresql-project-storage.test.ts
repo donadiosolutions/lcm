@@ -216,6 +216,8 @@ describe("PostgreSqlProjectStorage", () => {
       expect(scopedRepositories.every((repository, index) => (
         repository !== rootRepositories[index]
       ))).toBe(true);
+      expect(repositories.nativeProvenance).toBeDefined();
+      expect(repositories.nativeProvenance).not.toBe(storage.nativeTranscripts.repository);
     });
     expect(runtime.transactions).toEqual([{
       domain: "transaction",

@@ -1,10 +1,13 @@
 import {
   extractPostToolEvents,
   type PostToolInput,
+  type ToolOutcome,
 } from "./extractors.js";
 
 const COMMAND_SOFT_CAP = 2000;
-const NATIVE_TOOL_NAMES = new Set(["functions.exec", "functions.exec_command"]);
+// "Bash" is the name current Codex emits for unified exec; the dotted names are
+// legacy aliases kept for compatibility.
+const CODEX_SHELL_TOOL_NAMES = new Set(["Bash", "functions.exec", "functions.exec_command"]);
 
 export interface RawPostToolInput {
   readonly client?: unknown;
@@ -36,12 +39,28 @@ function statusFromRecord(record: StatusRecord): boolean | undefined {
   return undefined;
 }
 
-function normalizeStatus(toolOutput: unknown, toolResponse: unknown): { isError?: boolean } | undefined {
+function shellOutcome(toolOutput: unknown, toolResponse: unknown): ToolOutcome {
   const outputStatus = isRecord(toolOutput) ? statusFromRecord(toolOutput) : undefined;
-  if (outputStatus !== undefined) return { isError: outputStatus };
+  const status = outputStatus ??
+    (isRecord(toolResponse) ? statusFromRecord(toolResponse) : undefined);
+  if (status === undefined) return "unknown";
+  return status ? "failed" : "succeeded";
+}
 
-  const responseStatus = isRecord(toolResponse) ? statusFromRecord(toolResponse) : undefined;
-  return responseStatus === undefined ? undefined : { isError: responseStatus };
+function mcpFlagOutcome(record: StatusRecord): ToolOutcome | undefined {
+  const flag = record.isError !== undefined ? record.isError : record.is_error;
+  if (flag === undefined) return undefined;
+  if (typeof flag !== "boolean") return "unknown";
+  return flag ? "failed" : "succeeded";
+}
+
+function mcpOutcome(toolOutput: unknown, toolResponse: unknown): ToolOutcome {
+  const outputFlag = isRecord(toolOutput) ? mcpFlagOutcome(toolOutput) : undefined;
+  if (outputFlag !== undefined) return outputFlag;
+  if (!isRecord(toolResponse)) return "unknown";
+  const responseFlag = mcpFlagOutcome(toolResponse);
+  if (responseFlag !== undefined) return responseFlag;
+  return Array.isArray(toolResponse.content) ? "succeeded" : "unknown";
 }
 
 function normalizeLegacyToolOutput(value: unknown): { isError?: boolean } | undefined {
@@ -73,7 +92,14 @@ function normalizeNonNativeInput(input: RawPostToolInput): PostToolInput {
 
 export function normalizePostToolInput(input: RawPostToolInput): PostToolInput {
   const toolName = typeof input.tool_name === "string" ? input.tool_name : "";
-  if (input.client !== "codex" || !NATIVE_TOOL_NAMES.has(toolName)) {
+  if (input.client === "codex" && toolName.startsWith("mcp__")) {
+    return {
+      tool_name: toolName,
+      tool_input: {},
+      tool_output: { outcome: mcpOutcome(input.tool_output, input.tool_response) },
+    };
+  }
+  if (input.client !== "codex" || !CODEX_SHELL_TOOL_NAMES.has(toolName)) {
     return normalizeNonNativeInput(input);
   }
 
@@ -92,27 +118,30 @@ export function normalizePostToolInput(input: RawPostToolInput): PostToolInput {
     tool_name: "Bash",
     tool_input: { command: boundCommand(selectedCommand) },
   };
-  const status = normalizeStatus(input.tool_output, input.tool_response);
-  if (status !== undefined) normalized.tool_output = status;
+  normalized.tool_output = { outcome: shellOutcome(input.tool_output, input.tool_response) };
   return normalized;
 }
 
 export function codexPostToolFunctionalCoverage(): boolean {
   const fixtures = [
     {
-      tool_name: "functions.exec",
+      tool_name: "Bash",
       tool_input: { command: "git branch" },
-      expected: "git_branch",
+      tool_response: "finished\n",
+      expected: { type: "tool_outcome_unknown", data: "Bash outcome unknown: git branch" },
     },
     {
       tool_name: "functions.exec_command",
       tool_input: { cmd: "npm install probe" },
-      expected: "env_install",
+      tool_response: { exit_code: 0 },
+      expected: { type: "env_install", data: "npm install probe" },
     },
   ] as const;
 
   return fixtures.every(({ expected, ...fixture }) => {
     const events = extractPostToolEvents(normalizePostToolInput({ client: "codex", ...fixture }));
-    return events.length === 1 && events[0]?.type === expected;
+    return events.length === 1 &&
+      events[0]?.type === expected.type &&
+      events[0]?.data === expected.data;
   });
 }

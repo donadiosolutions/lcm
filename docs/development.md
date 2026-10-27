@@ -93,7 +93,24 @@ TypeScript file; `pnpm run test:ci` reproduces that gate locally. Do not
 exclude files or skip tests to meet it. PostgreSQL integration files run only
 through `pnpm run test:postgresql`; see
 [PostgreSQL development](../src/storage/postgresql/reference/postgresql-development.md)
-for the isolated container prerequisites and lifecycle.
+for the isolated container prerequisites and lifecycle, including running the
+local harness with rootless Podman (`LCM_TEST_CONTAINER_CLI=podman`).
+
+The surface-parity worker (`test/postgresql/surface-parity.integration.ts`)
+refuses to start while a `systemd --user` manager owned by the same user is
+visible in `/proc`, because the daemon lifecycle would then behave differently
+from CI, whose runner has no user manager. On a desktop session, which always
+has one, the test therefore launches the worker through `unshare --user
+--map-current-user --pid --fork --mount-proc`. The worker keeps your uid and
+runs in a private PID namespace whose `/proc` shows no user manager; the host
+session is not touched. When no user manager is visible, as in CI, the worker
+is started directly. If `unshare` is missing or unprivileged user namespaces
+are denied, the test fails with
+`surface-parity-parent:local-isolation-unavailable:unshare-missing` or
+`surface-parity-parent:local-isolation-unavailable:user-namespace-denied`
+instead of skipping. Install util-linux's `unshare` or allow unprivileged user
+namespaces (for example `sysctl user.max_user_namespaces` above zero), or run
+the test from a session without a user manager.
 
 ## Continuous integration
 

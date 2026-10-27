@@ -1,0 +1,9 @@
+references: ["#1719", "#1608"]
+rationale: >-
+  Changes the Codex readiness check (src/connectors/codex-readiness.ts) so
+  doctor no longer validates timeout and statusMessage on prompt and agent
+  hook handlers, which Codex ignores. The file stays in the connectors owner,
+  matched by the existing src/connectors/ path, so codecov.yml is unchanged.
+  No file was added, removed, moved or re-owned.
+pins:
+  - ["src/connectors/codex-readiness.ts", "unit-connectors"]

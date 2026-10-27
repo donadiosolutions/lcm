@@ -96,15 +96,15 @@ export class SqliteProjectStorage implements ProjectStorage {
   ): Promise<T> {
     this.assertOpen("transaction", "transaction");
     return this.executor.transaction(async (token): Promise<T> => {
-      const repositories = createSqliteRepositories(
-        this.stores,
-        this.projectId,
-        (domain, operation, operationCallback, atomic) =>
-          atomic
-            ? this.executor.runAtomicScoped(token, domain, operation, operationCallback)
-            : this.executor.runScoped(token, domain, operation, operationCallback),
-      );
-      return callback(repositories);
+      const scoped: RepositoryInvoker = (domain, operation, operationCallback, atomic) =>
+        atomic
+          ? this.executor.runAtomicScoped(token, domain, operation, operationCallback)
+          : this.executor.runScoped(token, domain, operation, operationCallback);
+      const repositories = createSqliteRepositories(this.stores, this.projectId, scoped);
+      return callback({
+        ...repositories,
+        nativeProvenance: new SqliteNativeTranscriptRepository(this.stores.db, this.projectId, scoped),
+      });
     }, this.operationAdmission.getStore() ?? this.admission);
   }
 

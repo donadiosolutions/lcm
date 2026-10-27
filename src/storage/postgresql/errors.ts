@@ -106,6 +106,20 @@ export class PostgreSqlCommitOutcomeUnknownError extends StorageOperationError {
   }
 }
 
+/**
+ * Closed reason for a refused pool observation. A counter that is a number
+ * but not an exact non-negative safe integer is out of range; a missing or
+ * non-numeric counter is unavailable. The counter itself is never carried.
+ */
+export type PostgreSqlDiagnosticPoolRejection = "out-of-range" | "unavailable";
+
+/** Thrown by the pool observation boundary; carries only the closed reason. */
+export class PostgreSqlDiagnosticPoolError extends StorageOperationError {
+  constructor(readonly reason: PostgreSqlDiagnosticPoolRejection) {
+    super("STORAGE_OPERATION_FAILED", "postgresql", undefined, "factory", "poolDiagnostics");
+  }
+}
+
 export function sanitizeSqlState(error: unknown): string | null {
   const code = (error as PostgreSqlDriverError | undefined)?.code;
   return typeof code === "string" && /^[0-9A-Z]{5}$/u.test(code) ? code : null;

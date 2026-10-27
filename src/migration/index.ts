@@ -189,3 +189,136 @@ export type {
   VerifyMigrationGenerationDependencies,
   VerifyMigrationGenerationResult,
 } from "./verify-generation.js";
+
+// --- #625: activation orchestrator building blocks --------------------------
+//
+// Phase-1 pieces of the activation orchestrator (plan-v6 G5, G6, G7 and the
+// deterministic publicationId). The orchestrator itself (G1) is not here yet.
+
+export {
+  ActivationPublicationIdError,
+  deriveActivationPublicationId,
+} from "./activation-publication-id.js";
+
+export {
+  MigrationTargetHealthError,
+  checkMigrationTargetHealth,
+} from "./target-health.js";
+export type {
+  MigrationTargetHealthDependencies,
+  MigrationTargetHealthErrorReason,
+  MigrationTargetHealthInput,
+  MigrationTargetHealthResult,
+  MigrationTargetHealthRuntime,
+  MigrationTargetHealthStatus,
+  MigrationTargetUnhealthyReason,
+  MigrationTargetUnresolvableReason,
+} from "./target-health.js";
+
+export {
+  ActivationGenerationLinkConflictError,
+  activationGenerationLinkPath,
+  readActivationGenerationLink,
+  recordActivationGenerationLink,
+} from "./activation-artifact-store.js";
+export type {
+  ActivationGenerationLink,
+  ActivationGenerationLinkReadResult,
+  ActivationGenerationLinkRecordResult,
+  ActivationGenerationLinkUnresolvableReason,
+} from "./activation-artifact-store.js";
+
+export {
+  MigrationActivationReportError,
+  createMigrationActivationReport,
+  migrationActivationReportDirectory,
+  migrationActivationReportPath,
+  migrationActivationReportReference,
+  migrationActivationReportStoreDirectory,
+  parseMigrationActivationReport,
+  persistMigrationActivationReport,
+  readMigrationActivationReport,
+} from "./activation-report.js";
+export type {
+  CreateMigrationActivationReportInput,
+  MigrationActivationReport,
+  MigrationActivationReportBody,
+  MigrationActivationReportPersistResult,
+  MigrationActivationReportReadResult,
+  MigrationActivationReportReason,
+  MigrationActivationReportStoreDependencies,
+  MigrationActivationReportUnresolvableReason,
+} from "./activation-report.js";
+
+export {
+  MIGRATION_PROJECT_MAP_WITNESS_DOMAIN,
+  MigrationProjectMapWitnessError,
+  computeMigrationProjectMapWitnessSha256,
+  migrationProjectMapWitnessDigest,
+} from "./project-map-witness.js";
+export type {
+  ComputeMigrationProjectMapWitnessDependencies,
+  ComputeMigrationProjectMapWitnessInput,
+  MigrationProjectMapDriftCause,
+  MigrationProjectMapWitnessMode,
+  MigrationProjectMapWitnessReason,
+} from "./project-map-witness.js";
+
+export {
+  enumerateStoredDataProjectHashes,
+  evaluateActivationSingleProjectCoverage,
+} from "./activation-coverage.js";
+export type {
+  ActivationSingleProjectReason,
+  ActivationSingleProjectVerdict,
+  StoredDataProjectEnumeration,
+  StoredDataProjectEnumerationReason,
+} from "./activation-coverage.js";
+
+export {
+  MigrationCopyBindingReadError,
+  readMigrationCopyBindingSha256,
+} from "./copy-binding-reader.js";
+export type {
+  MigrationCopyBindingReadResult,
+  MigrationCopyBindingUnresolvableReason,
+  ReadMigrationCopyBindingInput,
+} from "./copy-binding-reader.js";
+
+// --- #625: the activation orchestrator (G1) ----------------------------------
+//
+// plan-v7.1: one entry point that activates or recovers one verified
+// generation under the local append barrier, a non-predictive preview, and
+// the production dependency builder, which wires the #626 evidence store,
+// witness-binding resolver and census builders at exactly one point.
+
+export {
+  MIGRATION_ACTIVATION_LEASE_TTL_MS,
+  MigrationActivationError,
+  createMigrationActivationDependencies,
+  previewMigrationActivation,
+  readMigrationManifestRevision,
+  runMigrationActivation,
+} from "./activate-generation.js";
+export type {
+  MigrationActivationBindingSeam,
+  MigrationActivationCensusSeam,
+  MigrationActivationCoordinator,
+  MigrationActivationCrashPoint,
+  MigrationActivationDependencies,
+  MigrationActivationEvidenceSeam,
+  MigrationActivationIdentity,
+  MigrationActivationInput,
+  MigrationActivationInterruptionCause,
+  MigrationActivationInterruptionStep,
+  MigrationActivationOrdinaryRuntime,
+  MigrationActivationOutcome,
+  MigrationActivationPreview,
+  MigrationActivationPreviewCheck,
+  MigrationActivationRefusalReason,
+  MigrationActivationRefusalStep,
+  MigrationActivationResumePoint,
+  MigrationActivationSnapshot,
+  MigrationActivationTransferRuntime,
+  MigrationActivationTriState,
+} from "./activate-generation.js";

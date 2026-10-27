@@ -34,12 +34,24 @@ import {
   parseMigrationManifest,
   type MigrationManifest,
   type MigrationManifestHead,
+  type MigrationProtocolReason,
 } from "./protocol.js";
 
 const GENERATION_ID_PATTERN = /^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$/u;
 const SHA256_PATTERN = /^[0-9a-f]{64}$/u;
 const MANIFEST_FILENAME_PATTERN = /^([0-9a-f]{64})\.json$/u;
 const MAX_MANIFEST_BYTES = 1 * 1024 * 1024;
+
+/**
+ * Result of {@link MigrationManifestStore.probeManifestPresence}. `present`
+ * and `absent` are both typed, positive observations; `unresolvable` means
+ * the probe could not establish either and preserves why, for evidence, but
+ * is never treated as absence.
+ */
+export type MigrationManifestPresence =
+  | Readonly<{ status: "present" }>
+  | Readonly<{ status: "absent" }>
+  | Readonly<{ status: "unresolvable"; reason: MigrationProtocolReason | "internal-error" }>;
 
 function invalidPathInput(message: string): never {
   throw new MigrationProtocolError("invalid-input", message);
@@ -2161,6 +2173,37 @@ export class MigrationManifestStore {
       || state.publicationGroup?.kind === "capture-cleaned"
     ) return state.publicationSuccessor!;
     return state.manifest;
+  }
+
+  /**
+   * Three-valued presence probe for a known generation id: `present`,
+   * authoritatively `absent`, or `unresolvable`.
+   *
+   * This adds nothing to the existing seam. `#readOptionalState` already
+   * returns a typed `null` when the LCM root, the migrations root, or this
+   * generation's own directory is missing (its `allowMissingThroughIndex: 2`
+   * covers exactly those three path segments); `read()` simply converts that
+   * typed `null` into a thrown `unexpected-state`. This method restores the
+   * distinction `read()` collapses instead of re-deriving it: no bare ENOENT
+   * is caught here, because the absence path below is the seam's own typed
+   * path, not ours.
+   *
+   * `false` for `rejectImmediateSuccessor` is deliberate: occupancy must
+   * not refuse a candidate merely because its manifest has a mid-flight
+   * publication group awaiting recovery. Such a manifest is present either
+   * way, matching what `update()` already passes.
+   */
+  probeManifestPresence(generationId: string): MigrationManifestPresence {
+    assertGenerationId(generationId);
+    try {
+      const state = this.#readOptionalState(generationId, false);
+      return state === null ? { status: "absent" } : { status: "present" };
+    } catch (error) {
+      if (error instanceof MigrationProtocolError) {
+        return { status: "unresolvable", reason: error.reason };
+      }
+      return { status: "unresolvable", reason: "internal-error" };
+    }
   }
 
   #readState(generationId: string): AuthenticatedManifestState {

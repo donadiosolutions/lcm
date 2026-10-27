@@ -1,0 +1,6 @@
+references: ["#1657"]
+rationale: >-
+  Issue #1657 names the member generation in the evidence of a cutover-set
+  abort readback refusal; cli-abort.ts keeps its component.
+pins:
+  - ["src/migration/cli-abort.ts", "unit-migration-cutover"]

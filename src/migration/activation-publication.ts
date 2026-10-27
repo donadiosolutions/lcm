@@ -1,15 +1,27 @@
+import { join } from "node:path";
 import {
+  backendPublicationDirectory,
+  backendPublicationMaterialContent,
   isTerminalBackendMaintenancePhase,
   readBackendMaintenanceJournal,
   readBackendPublicationJournal,
   type BackendMaintenanceJournal,
   type BackendPublicationJournal,
   type BackendPublicationLockToken,
+  type BackendPublicationPhase,
   type BackendPublicationRecoveryMaterial,
   type PrepareBackendPublicationInput,
   type RecoverPendingOptions,
 } from "../storage/backend-publication.js";
 import type { StorageBackendName } from "../storage/contracts.js";
+import {
+  assertPrivateDirectory,
+  openPrivateDirectory,
+  readBoundedRegularFileWithStat,
+  type BoundedFileResult,
+  type PrivateDirectoryHandle,
+} from "../security-files.js";
+import { attributeNullableRead } from "./activation-absence.js";
 import {
   assertActivationLeaseFence,
   type ActivationLeaseAssertResult,
@@ -75,19 +87,61 @@ import {
  * a recomputation would need anyway.
  *
  * Release belongs to the publication, never to this step. This function
- * never calls coordinator.abort() and never implements a release path of
- * its own. BackendPublicationCoordinator#resume's own phase machine
- * (#resumeUnlocked in backend-publication.ts) already frees every
- * project's remote fence via #releaseAll before a journal can reach its
- * completed phase, and a terminal journal that still carried an active
- * fence would be refused outright by that same machine's own invariants.
- * Adding a second release path here would only contend with the one the
- * coordinator already runs.
+ * never implements a release path of its own. BackendPublicationCoordinator
+ * #resume's own phase machine (#resumeUnlocked in backend-publication.ts)
+ * already frees every project's remote fence via #releaseAll before a
+ * journal can reach its completed phase, and a terminal journal that still
+ * carried an active fence would be refused outright by that same machine's
+ * own invariants. Adding a second release path here would only contend
+ * with the one the coordinator already runs.
  *
- * Dispatch resume versus a fresh prepare correctly. This function never
- * calls prepare() on top of a publication that is already in flight, and it
- * calls coordinator.recoverPending only for a journal of its own
- * publicationId. The order is:
+ * One controlled abort, and only one (plan-v7.1 amendment 3 / A1). The
+ * coordinator's prepare() writes the "preparing" journal, then seals the
+ * material file, then checkpoints "prepared" with the recovery reference.
+ * A crash between the first two leaves a journal whose recoveryReference
+ * is null and whose material file is positively absent. That journal can
+ * never be resumed (there is no material to authenticate) and must not be
+ * driven to a reported abort either: nothing was published, and the same
+ * publicationId must be prepared again from the artifact (a fresh id would
+ * break the S0 identity chain; see activation-artifact-store.ts). This
+ * function therefore calls coordinator.abort(lockToken) for exactly that
+ * shape -- the coordinator's own pre-seal branch transitions it straight
+ * to "aborted" without restoring anything -- and then prepares again with
+ * the same publicationId. A crash after that abort and before the
+ * re-prepare leaves the single re-preparable "aborted" shape: recovery
+ * reference null, material positively absent, no published config or
+ * project-map witness, and the same identity as the artifact. Every other
+ * "aborted" journal (an operator abort, or any abort after sealing or
+ * publishing) is reported as aborted and never re-prepared. The predicate
+ * uses only fields the journal already carries; there is no abort-reason
+ * column.
+ *
+ * A "preparing" journal whose material IS present is the post-seal crash:
+ * the coordinator can authenticate it (a null recovery reference skips the
+ * digest check), so before resuming this function additionally compares
+ * the sealed bytes, byte for byte, against the artifact's own copy
+ * (backendPublicationMaterialContent of the artifact's material under this
+ * publicationId). Equal -> resume; different -> artifact-identity-mismatch,
+ * never a resume of material this activation did not seal.
+ *
+ * Dispatch (every row below is this publicationId's identity-matching
+ * journal, or no journal at all; see steps 2-3 for the other cases):
+ *
+ * | version-2 journal | action |
+ * | --- | --- |
+ * | absent, or a terminal journal of another publication (prepare() archives it) | fresh prepare from the artifact, then resume |
+ * | preparing, recoveryReference null, material positively absent | fence precheck; abort under the token; fresh prepare with the same publicationId |
+ * | preparing, recoveryReference null, material present | fence precheck; sealed bytes equal the artifact -> recoverPending resume; differ -> artifact-identity-mismatch |
+ * | aborted, recoveryReference null, material positively absent, no publish witness recorded | fence precheck; fresh prepare with the same publicationId (prepare archives the aborted journal) |
+ * | any other aborted | reported as aborted; never re-prepared |
+ * | aborting, config-restoring, map-restoring, abort-releasing | recoverPending (the coordinator completes the abort and reconciles fences itself); reported as aborted; no fence precheck |
+ * | prepared, acquiring, guarded, map-publishing, map-published, config-publishing, config-published | fence precheck; recoverPending resume |
+ * | releasing, released | recoverPending resume with NO fence precheck (plan-v7 A3: the fences are being or have been released; the coordinator still reconciles an expired unreleased fence inside release) |
+ * | completed | reported as completed; nothing is driven |
+ *
+ * A material read that fails for any reason other than a positive ENOENT
+ * under the authenticated publication directory is artifact-unresolvable;
+ * absence is never guessed. The order is:
  *
  * 1. A repeated localProjectId or remoteProjectId is refused
  *    (duplicate-publication-input) before any I/O.
@@ -105,14 +159,16 @@ import {
  *    phase: a publicationId alone does not make a journal this
  *    publication's, and a reused id is another generation's journal that
  *    is neither resumed nor reported as this call's result.
- * 4. Lease fences are asserted for every project, except when the journal
- *    is of this publicationId and already terminal (its fences are already
- *    released).
+ * 4. Lease fences are asserted for every project, except for the rows the
+ *    table above marks as having no precheck: a terminal journal (its
+ *    fences are already released), the release tail, and the abort family
+ *    (the coordinator releases those fences itself as it completes the
+ *    abort; a precheck here would refuse a half-released abort forever).
  * 5. A version-2 journal of this publicationId that passes the identity
- *    check is driven with recoverPending({ disposition: "resume" },
- *    lockToken) and its result is reported. The journal recoverPending
- *    returns is held to the same identity check: a same-id journal that
- *    no longer matches is publication-collision, not this call's result.
+ *    check is dispatched per the table. Where recoverPending runs, the
+ *    journal it returns is held to the same identity check: a same-id
+ *    journal that no longer matches is publication-collision, not this
+ *    call's result.
  * 6. Every other case (no journal, a terminal version-3 maintenance
  *    journal, or a terminal journal of another publicationId) is a fresh
  *    prepare then resume under the same lockToken. recoverPending is not
@@ -174,6 +230,9 @@ export interface ActivationPublicationCoordinator {
     lockToken: BackendPublicationLockToken,
   ): Promise<BackendPublicationJournal>;
   resume(lockToken: BackendPublicationLockToken): Promise<BackendPublicationJournal>;
+  /** Used for exactly one shape: a "preparing" journal with no recovery
+   * reference and no material file (see the module doc comment). */
+  abort(lockToken: BackendPublicationLockToken): Promise<BackendPublicationJournal>;
 }
 
 export type ActivationPublicationInput = Readonly<{
@@ -218,7 +277,32 @@ export type ActivationPublicationDependencies = Readonly<{
   /** Override the read-only version-2 publication journal peek. Defaults to
    * readBackendPublicationJournal. */
   readPublicationJournal?: (homeDir?: string) => BackendPublicationJournal | null;
+  /** Override the attributed presence read of the sealed material file.
+   * Defaults to readSealedMaterialContent (ENOENT under the authenticated
+   * publication directory is the only positive absence). */
+  readSealedMaterial?: (homeDir: string | undefined, publicationId: string) => SealedMaterialRead;
 }>;
+
+/** One attributed read of the coordinator's sealed material file. */
+export type SealedMaterialRead = Readonly<
+  | { kind: "present"; content: string }
+  | { kind: "absent" }
+  | { kind: "unresolvable"; detail: string }
+>;
+
+/** Which dispatch row ran (see the module doc comment's table). null when
+ * the call refused before any dispatch. */
+export type ActivationPublicationDispatch =
+  | "fresh-prepare"
+  | "resume"
+  /** A "preparing" journal whose material is present: sealed bytes are
+   * compared against the artifact before the resume. */
+  | "resume-after-material-check"
+  | "release-tail"
+  | "abort-completion"
+  | "controlled-abort-then-prepare"
+  | "reprepare-aborted"
+  | "terminal-report";
 
 export type ActivationPublicationFenceCheck = Readonly<{
   localProjectId: string;
@@ -256,6 +340,7 @@ export type ActivationPublicationResult = Readonly<{
   detail: string;
   journal: BackendPublicationJournal | null;
   fenceChecks: readonly ActivationPublicationFenceCheck[];
+  dispatch: ActivationPublicationDispatch | null;
 }>;
 
 function buildResult(
@@ -263,8 +348,80 @@ function buildResult(
   detail: string,
   journal: BackendPublicationJournal | null,
   fenceChecks: readonly ActivationPublicationFenceCheck[],
+  dispatch: ActivationPublicationDispatch | null = null,
 ): ActivationPublicationResult {
-  return Object.freeze({ status, detail, journal, fenceChecks: Object.freeze([...fenceChecks]) });
+  return Object.freeze({ status, detail, journal, fenceChecks: Object.freeze([...fenceChecks]), dispatch });
+}
+
+/** backend-publication.ts's MAX_MATERIAL_BYTES: the bound the coordinator
+ * itself seals and authenticates material under. */
+const MAX_SEALED_MATERIAL_BYTES = 8 * 1024 * 1024;
+
+function currentUid(): number | undefined {
+  return typeof process.getuid === "function" ? process.getuid() : undefined;
+}
+
+/**
+ * Read the sealed material file the coordinator's prepare() writes for a
+ * publication, attributed: present with its exact bytes, positively absent
+ * (ENOENT under the authenticated publication directory), or unresolvable
+ * for anything else -- an unauthenticated or changed directory, a
+ * permission denial, a multi-link or wrong-mode file, or an error this
+ * reader does not recognize. Absence is the only outcome that licenses a
+ * controlled abort or a re-prepare, so it is never guessed.
+ */
+export function readSealedMaterialContent(homeDir: string | undefined, publicationId: string): SealedMaterialRead {
+  const directory = backendPublicationDirectory(homeDir);
+  const expectedUid = currentUid();
+  let handle: PrivateDirectoryHandle;
+  try {
+    handle = openPrivateDirectory(directory, { expectedUid });
+  } catch (error) {
+    return { kind: "unresolvable", detail: "the backend publication directory cannot be authenticated: " + (error as Error).message };
+  }
+  try {
+    let outcome;
+    try {
+      outcome = attributeNullableRead<BoundedFileResult>(() => readBoundedRegularFileWithStat(
+        join(directory, publicationId + ".material"),
+        {
+          allowedRoot: directory,
+          maxBytes: MAX_SEALED_MATERIAL_BYTES,
+          expectedUid,
+          allowedModes: [0o600],
+          requireSingleLink: true,
+        },
+      ));
+    } catch (error) {
+      return { kind: "unresolvable", detail: "the sealed material could not be read: " + (error as Error).message };
+    }
+    if (outcome.kind === "unresolvable") {
+      return { kind: "unresolvable", detail: "the sealed material could not be read: " + outcome.detail };
+    }
+    try {
+      assertPrivateDirectory(handle, directory, handle.witness, expectedUid);
+    } catch (error) {
+      return { kind: "unresolvable", detail: "the backend publication directory changed during the read: " + (error as Error).message };
+    }
+    return outcome.kind === "absent" ? { kind: "absent" } : { kind: "present", content: outcome.value.content };
+  } finally {
+    handle.close();
+  }
+}
+
+const RELEASE_TAIL_PHASES: readonly BackendPublicationPhase[] = ["releasing", "released"];
+const ABORT_FAMILY_PHASES: readonly BackendPublicationPhase[] = ["aborting", "config-restoring", "map-restoring", "abort-releasing"];
+
+/** The journal-field half of the single re-preparable aborted shape (see
+ * the module doc comment): no recovery reference and no publish witness.
+ * The other half, a positively absent material file, is read only when
+ * this half holds, so an operator abort (reference present, or a publish
+ * witness recorded) is reported without touching the material. */
+function isPreSealAbortedCandidate(journal: BackendPublicationJournal): boolean {
+  return journal.phase === "aborted"
+    && journal.recoveryReference === null
+    && journal.publishedConfigSha256 === null
+    && journal.publishedProjectMapSha256 === null;
 }
 
 function projectCoverageKey(
@@ -343,6 +500,7 @@ export async function driveActivationPublication(
   const readArtifact = dependencies.readArtifact ?? readActivationArtifact;
   const readMaintenanceJournal = dependencies.readMaintenanceJournal ?? readBackendMaintenanceJournal;
   const readPublicationJournal = dependencies.readPublicationJournal ?? readBackendPublicationJournal;
+  const readSealedMaterial = dependencies.readSealedMaterial ?? readSealedMaterialContent;
 
   const fenceChecks: ActivationPublicationFenceCheck[] = [];
 
@@ -407,9 +565,61 @@ export async function driveActivationPublication(
     }
   }
 
-  // A terminal journal of this publication has already released its fences,
-  // so its result is reported without requiring active leases.
-  if (!(sameIdJournal !== null && existingTerminal)) {
+  // Classify the same-id journal's phase into a dispatch row first (see the
+  // module doc comment's table), because the row decides whether the fence
+  // precheck runs at all.
+  const phase = sameIdJournal?.phase ?? null;
+  let sealed: SealedMaterialRead | null = null;
+  const needsMaterialRead = sameIdJournal !== null && (
+    (phase === "preparing" && sameIdJournal.recoveryReference === null)
+    || isPreSealAbortedCandidate(sameIdJournal)
+  );
+  if (needsMaterialRead) {
+    sealed = readSealedMaterial(input.homeDir, input.publicationId);
+    if (sealed.kind === "unresolvable") {
+      return buildResult(
+        "artifact-unresolvable",
+        "the sealed material for publication " + input.publicationId + " at journal phase " + phase +
+          " could not be attributed as present or absent: " + sealed.detail,
+        sameIdJournal,
+        fenceChecks,
+      );
+    }
+  }
+  let row: ActivationPublicationDispatch;
+  if (sameIdJournal === null) {
+    row = "fresh-prepare";
+  } else if (phase === "completed") {
+    row = "terminal-report";
+  } else if (phase === "aborted") {
+    row = sealed !== null && sealed.kind === "absent" ? "reprepare-aborted" : "terminal-report";
+  } else if (phase === "preparing" && sameIdJournal.recoveryReference === null) {
+    row = sealed!.kind === "absent" ? "controlled-abort-then-prepare" : "resume-after-material-check";
+  } else if (RELEASE_TAIL_PHASES.includes(phase!)) {
+    row = "release-tail";
+  } else if (ABORT_FAMILY_PHASES.includes(phase!)) {
+    row = "abort-completion";
+  } else {
+    row = "resume";
+  }
+
+  if (row === "terminal-report") {
+    return buildResult(
+      phase === "aborted" ? "aborted" : "completed",
+      "the existing backend publication journal for " + input.publicationId + " is already terminal at phase " +
+        phase + (phase === "aborted" ? "; it is not the pre-seal shape and is never re-prepared" : ""),
+      sameIdJournal,
+      fenceChecks,
+      row,
+    );
+  }
+
+  // Fence precheck: every row that will acquire or consume this
+  // generation's fences asserts them first. The release tail and the abort
+  // family skip it (plan-v7 A3): their fences are being released by the
+  // coordinator itself, which reconciles an expired unreleased fence inside
+  // release, and a precheck would refuse a half-released journal forever.
+  if (row !== "release-tail" && row !== "abort-completion") {
     for (const project of input.projects) {
       const assertion = await assertActivationLeaseFence(guard, {
         projectId: project.remoteProjectId,
@@ -452,7 +662,7 @@ export async function driveActivationPublication(
   // lifetime analysis: that confirmation does not survive the awaits
   // below, and the coordinator's own acquireAll step independently
   // re-checks the same fences at the moment it actually consumes them.
-  if (sameIdJournal !== null) {
+  if (row === "resume" || row === "release-tail" || row === "abort-completion") {
     const recovered = await coordinator.recoverPending({ disposition: "resume" }, input.lockToken);
     if (recovered !== null && recovered.publicationId === input.publicationId) {
       const mismatch = journalIdentityMismatch(recovered, input);
@@ -470,6 +680,7 @@ export async function driveActivationPublication(
           recovered.phase,
         recovered,
         fenceChecks,
+        row,
       );
     }
     if (recovered !== null && recovered.phase !== "completed" && recovered.phase !== "aborted") {
@@ -482,14 +693,17 @@ export async function driveActivationPublication(
         fenceChecks,
       );
     }
+    // The journal vanished (or another terminal one appeared) between the
+    // peek and recoverPending: fall through to a fresh dispatch.
+    row = "fresh-prepare";
   }
 
-  // Fresh dispatch: there is no journal, or only a terminal journal that
-  // prepare() archives itself before writing the new one (an unrelated
-  // terminal version-2 journal, or a terminal selection-completed /
-  // maintenance-aborted version-3 maintenance journal). recoverPending is
-  // never called here: it cannot resume a version-3 journal, and a fresh
-  // prepare under the retained token re-reads the journal itself.
+  // Fresh dispatch (and the two re-prepare rows): there is no live journal
+  // of this publication, or only a terminal one that prepare() archives
+  // itself before writing the new one (an unrelated terminal version-2
+  // journal, a terminal selection-completed / maintenance-aborted
+  // version-3 maintenance journal, or this publication's own pre-seal
+  // aborted journal). Every prepare() is built from the artifact's bytes.
   let artifact: ActivationArtifactRecoveryMaterial | null;
   try {
     artifact = readArtifact({ homeDir: input.homeDir, identityDigest: input.identityDigest });
@@ -532,6 +746,66 @@ export async function driveActivationPublication(
   }
 
   const material: BackendPublicationRecoveryMaterial = { source: artifact.source, target: artifact.target };
+
+  if (row === "resume-after-material-check") {
+    // The post-seal "preparing" crash: the material file exists but the
+    // journal never recorded its reference. The coordinator would
+    // authenticate it on resume (a null reference skips the digest check),
+    // so this function first proves the sealed bytes are this activation's
+    // own: byte identity against the artifact's copy, never a resume of
+    // material this activation did not seal.
+    const expected = backendPublicationMaterialContent(artifact.publicationId, material);
+    if (sealed!.kind !== "present" || sealed!.content !== expected) {
+      return buildResult(
+        "artifact-identity-mismatch",
+        "the sealed material for publication " + input.publicationId + " (journal phase preparing, no recovery " +
+          "reference) is not byte-identical to the activation artifact's recovery material; refusing to resume it",
+        sameIdJournal,
+        fenceChecks,
+        row,
+      );
+    }
+    const recovered = await coordinator.recoverPending({ disposition: "resume" }, input.lockToken);
+    if (recovered === null || recovered.publicationId !== input.publicationId || journalIdentityMismatch(recovered, input) !== null) {
+      return buildResult(
+        "publication-collision",
+        "the backend publication journal recoverPending returned after the sealed-material check is not this " +
+          "publication's journal; refusing to report it as this publication's result",
+        recovered,
+        fenceChecks,
+        row,
+      );
+    }
+    return buildResult(
+      recovered.phase === "aborted" ? "aborted" : "completed",
+      "the sealed material matched the activation artifact and the existing backend publication journal for " +
+        recovered.publicationId + " was driven to phase " + recovered.phase,
+      recovered,
+      fenceChecks,
+      row,
+    );
+  }
+
+  if (row === "controlled-abort-then-prepare") {
+    // The pre-seal "preparing" crash: no reference, no material. The
+    // coordinator's own pre-seal abort branch transitions it straight to
+    // "aborted" (nothing to restore), after which prepare() archives that
+    // terminal journal and seals fresh material under the SAME
+    // publicationId. A crash between these two calls leaves the
+    // re-preparable aborted shape the next call recognizes.
+    const aborted = await coordinator.abort(input.lockToken);
+    if (aborted.phase !== "aborted" || aborted.publicationId !== input.publicationId) {
+      return buildResult(
+        "publication-unresolvable",
+        "the controlled pre-seal abort of publication " + input.publicationId + " did not reach phase aborted (" +
+          aborted.publicationId + " at " + aborted.phase + "); refusing to re-prepare over it",
+        aborted,
+        fenceChecks,
+        row,
+      );
+    }
+  }
+
   await coordinator.prepare(
     {
       publicationId: artifact.publicationId,
@@ -547,8 +821,9 @@ export async function driveActivationPublication(
   return buildResult(
     resumed.phase === "aborted" ? "aborted" : "completed",
     "a fresh backend publication journal for " + resumed.publicationId + " was prepared and driven to phase " +
-      resumed.phase,
+      resumed.phase + (row === "fresh-prepare" ? "" : " (" + row + ")"),
     resumed,
     fenceChecks,
+    row,
   );
 }

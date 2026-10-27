@@ -517,3 +517,26 @@ it("budgets a batch item as its row bytes plus its two UTF-8 locator copies",()=
   expect(Buffer.byteLength('["é€"]')).toBe(9);
   expect(mapping.canonicalBatchItemBytes(5n,"")).toBe(5n);
 });
+
+it("maps the optional conversation parent column only when it holds a value",async()=>{
+  const context={projectIdentity:{scope:"shared" as const,projectId},occurrenceOrdinal:"0"};
+  const row={session_id:"session",title:null,bootstrapped_at:null,created_at:timestamp,updated_at:timestamp};
+  const plain=mapping.decodeCanonicalRow("conversations",{...row,parent_session_id:null},context);
+  expect(plain.value).not.toHaveProperty("parentSessionId");
+  expect(mapping.decodeCanonicalRow("conversations",row,context).value).not.toHaveProperty("parentSessionId");
+  const linked=mapping.decodeCanonicalRow("conversations",{...row,parent_session_id:"parent-thread"},context);
+  expect(linked.value).toMatchObject({parentSessionId:"parent-thread"});
+  const record=(input:typeof plain)=>createPortableRecord({...input,ordinal:0} as import("../../src/storage/portable-record.js").PortableRecordInput);
+  expect(record(linked).identitySha256).toBe(record(plain).identitySha256);
+  for(const [input,expected] of [[plain,false],[linked,true]] as const){
+    const calls:{text:string;values:unknown[]}[]=[];
+    const db={query:async(config:{text:string;values:unknown[]})=>{
+      calls.push(config);
+      return {rows:[{locator:'["8"]'}],rowCount:1,fields:[],command:"SELECT",oid:0};
+    }} as unknown as PostgreSqlQueryExecutor;
+    await mapping.insertCanonicalRecord(db,projectId,record(input),async()=> '["7"]');
+    const insert=calls.find(call=>call.text.startsWith("INSERT"))!;
+    expect(insert.text.includes("parent_session_id")).toBe(expected);
+    expect(insert.values.includes("parent-thread")).toBe(expected);
+  }
+});

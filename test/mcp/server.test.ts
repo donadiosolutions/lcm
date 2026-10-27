@@ -10,6 +10,7 @@ import { DEFAULT_SEARCH_RESULT_LIMIT, MAX_SEARCH_RESULT_LIMIT } from "../../src/
 import { CallToolRequestSchema } from "@modelcontextprotocol/sdk/types.js";
 import { StatsUnavailableError } from "../../src/stats.js";
 import type { BackendDiagnosticSnapshot } from "../../src/storage/diagnostics.js";
+import { telemetryFillers } from "../../src/storage/runtime-health.js";
 import { PrivateMutationLockContentionError } from "../../src/private-mutation-lock.js";
 
 type LocalToolHandler = (request: { params: { name: string; arguments?: Record<string, unknown> } }) => Promise<{
@@ -800,6 +801,7 @@ describe("local lcm_stats diagnostic failures", () => {
         extensions: "unverified", search: "unverified",
         pool: { origin: "diagnostic-probe", status: "unavailable" },
         project: { scope: "aggregate", status: "unverified" }, identity: { status: "unverified" }, outbox: { status: "unverified" },
+        telemetry: telemetryFillers("postgresql", "unavailable", 0),
         remediation: "Run `lcm doctor` and review the storage configuration.",
       };
       const canaries = [

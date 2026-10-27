@@ -16,6 +16,14 @@ lcm project link --help
 lcm connectors install --help
 ```
 
+The `lcm migration` group (`plan`, `dry-run`, `apply`, `resume`, `verify`, `report`,
+`abort`, `activate`, `rollback`) performs the
+reversible SQLite-to-PostgreSQL cutover. Read the operator runbook,
+[Migration operations](migration-operations.md), before running `apply`: it leaves a
+maintenance hold that only `activate` or `abort` can release. For one generation or a cutover set,
+apply the runtime grants before `activate`, then revoke the transfer grants before starting the
+daemon.
+
 Storage-backed commands use the backend selected in the authenticated LCM
 configuration. SQLite remains the default. With `storage.backend` set to
 `postgresql`, reads, writes, native session import, compaction, and promoted
@@ -132,13 +140,16 @@ for example `lcm export --tags decision,architecture`.
 
 `lcm store` makes the same deduplication decision as `lcm promote` and
 knowledge import. When the content already exists as an active memory in
-scope, the command merges into that memory instead of adding a second one:
+scope, meaning exactly the same text (after secret scrubbing), the command
+merges into that memory instead of adding a second one:
 the printed `id` is the existing memory's id, its tags are unioned with the
 new ones, and its confidence stays at the maximum of the two. Repeating the
 same `lcm store` therefore yields one memory, even when the content carries
 no searchable lexical terms (for example, punctuation only) that ranked
 search alone could not recall: an exact-content lookup runs as a fallback on
-every backend. Content that does not match returns a fresh id. On PostgreSQL
+every backend. Any other text, including a wording, case, or whitespace
+difference from an existing memory, returns a fresh id and never changes the
+existing memory. On PostgreSQL
 the scope is every active memory of the bound project, and the store takes
 the project's deduplication lock for the duration of its write, so it takes
 turns with a concurrent `lcm promote` or knowledge import into that same
@@ -447,11 +458,48 @@ project ID was selected; an absent ID is not evidence of a missing project.
 | Snapshot state | Meaning and next action |
 |---|---|
 | `healthy` | All required readiness observations verified. |
-| `degraded` | Readiness verified, but the observed pool still reports a recovery failure condition. Inspect the backend service and repeat the diagnostic after recovery. |
+| `degraded` | Readiness verified, but the observed pool still reports a recovery failure condition, or a [runtime health family](#runtime-health-families) is degraded. Inspect the backend service and repeat the diagnostic after recovery. |
 | `unavailable` | Storage could not be safely read or a required observation could not be verified. Check configuration, service readiness, and the fixed guidance in the output. |
 | `permission-denied` | A trusted local or database permission failure prevented observation. Restore the intended access or runtime grants, then retry. |
 | `timeout` | Collection reached its deadline or the caller cancelled it. Check service responsiveness and retry. |
 | `stale-publication` | Publication evidence is unresolved or inconsistent, or authenticated evidence changed during collection. Preserve the evidence and follow the [publication recovery guidance](backend-publication.md#journal-less-publication-evidence). |
+
+### Runtime health families
+
+Use the [incident diagnostics runbook](incident-diagnostics.md) for bounded,
+least-privilege collection, interpretation, and private recovery procedures.
+
+On a PostgreSQL backend the snapshot also carries four runtime health families
+under `telemetry`: `pool`, `migration`, `extensions`, and `queue`. Each reports a status
+(`observed`, `partial`, `unavailable`, `permission-denied`, or `timeout`), the time it
+was observed, a health of `healthy`, `degraded`, or `unavailable`, the fields it could
+not observe with a reason, and one fixed next action. SQLite reports all four
+as `not-applicable`. A family that could not be observed reports `unavailable`, or the
+classified `permission-denied` or `timeout` failure, which is
+different from an observed unhealthy condition, and a partial observation never
+claims `healthy`. A degraded family raises a `healthy` snapshot to `degraded` and
+never changes any other classification.
+
+| Family | What it reports | Degraded when | Next action |
+|---|---|---|---|
+| `pool` | Saturation ratio: busy connections over the configured maximum | The daemon pool ratio is 1 or more with waiting connections, or the pool failure latch is set. The pool of a CLI diagnostic probe cannot establish daemon saturation. | Reduce concurrent database load or raise `storage.postgresql.poolMax`, then run `lcm doctor`. For the failure latch: check backend connectivity, then run `lcm doctor` again. |
+| `migration` | Applied and expected migration counts and a history status | The history is `behind`, `ahead`, `drift`, or `checksum-mismatch` | Behind: run `lcm postgres migrate` with the migration role, then run `lcm doctor`. Ahead: upgrade LCM to a release that includes every applied migration, then run `lcm doctor`. Drift or mismatch: restore the packaged PostgreSQL schema history; never edit applied migrations. |
+| `extensions` | Status and versions (numeric versions, or `unrecognized`) of `pg_stat_statements`, `pg_trgm`, `pgcrypto`, and `unaccent` | Any extension is not `current` | Have a database administrator install or update the required PostgreSQL extensions and verify their schema and preload configuration, then run `lcm doctor`. |
+| `queue` | Age of the oldest pending local event, inbox claimed and quarantined counts, and replay lag | An inbox or ready local outbox quarantine count is above 0, or the local pending age or the replay lag exceeds 900 seconds | Inspect with `lcm events quarantine` and replay with `lcm events replay <event-id>`. For a backlog: check daemon delivery with `lcm events status`, then run `lcm doctor`. |
+
+The local pending age uses this machine's clock, and it is omitted when any
+pending or retry local event has an invalid capture time, unless another source
+was unread or skipped, which is reported as unavailable. The inbox counts and replay lag
+come from the database and use its clock. A selected project without an observed
+local binding reports only the database values, so its queue family is
+`partial`. A reached read cap, a failed probe, or an unreadable local source omits
+only the affected fields with a reason. The families keep no history, so they
+report no rate and no reset, and they do not count connection acquire timeouts.
+A missing value is never a zero. The snapshot contains no migration ID, checksum,
+event ID, payload, schema name, or error text. Text output shows one line per
+family and one fixed action, and `lcm doctor` only prints these actions.
+The guide for [PostgreSQL telemetry](../src/storage/postgresql/reference/postgresql-telemetry.md#runtime-health-families)
+lists every field, bound, and threshold.
 
 Backend snapshot collection has a default deadline of 2000 milliseconds and
 honors caller cancellation. SQLite project and event-sidecar reads share one
@@ -485,6 +533,45 @@ remote metrics do not become empty-project totals. Diagnostic output contains
 no recalled-text previews (`topRecalled`), transcript or memory payloads, raw
 errors, SQL values, connection URLs, role names, CA paths, or arbitrary local
 paths. Verbose output follows the same boundary.
+
+### Query statistics
+
+PostgreSQL snapshots include `telemetry.statements`, a bounded aggregate of
+numeric `pg_stat_statements` counters for a packaged starter catalog of LCM
+operations. The family is always labelled `scope: aggregate`, including when
+the rest of the request selects one project. It never emits query text, SQL
+literals, parameter values, query identifiers, role or database names, or
+utility statements. SQLite reports `not-applicable`.
+
+The text summary reports the family status and how many cataloged operations
+have a valid call counter. `observed` means the current cumulative values are
+complete; `reset` means a long-lived daemon observed an epoch change;
+`partial` means a mapped entry or field was lost or a bound was reached.
+One-shot CLI processes do not retain a prior comparison, so reset and
+comparison-derived partial states normally appear only in daemon responses.
+`disabled` means `pg_stat_statements.track` is `none`. `timeout`,
+`permission-denied`, `stale`, and `unavailable` affect production
+certification, but they do not change application startup or backend health.
+
+For `disabled`, enable statement tracking through the database provider's
+normal configuration process and reconnect, then retry. For `timeout`, check
+database responsiveness and retry. For `stale`, repeat the observation; if it
+persists, check for a server restart or concurrent statistics reset. For
+`partial` or `reset`, take another observation in the same daemon process and
+compare only values that remain in one epoch. For `unavailable`, verify that
+PostgreSQL 18 has the required extension loaded and computes query identifiers.
+LCM never enables settings or resets statistics.
+
+If an operator deliberately revoked the collector function privilege, restore
+the extension's supported boundary as an administrator:
+
+```sql
+GRANT EXECUTE ON FUNCTION public.pg_stat_statements(boolean)
+  TO "your_lcm_runtime_role";
+```
+
+Replace `your_lcm_runtime_role` with the configured LCM runtime role. Do not grant
+`pg_monitor` or `pg_read_all_stats`; the collector does not require them.
 
 Publication and configuration are authenticated before and after asynchronous
 probes. If their witnesses differ, the result is `stale-publication` and the
@@ -530,7 +617,12 @@ observed empty database.
 `lcm status`, `lcm stats --pool`, and `lcm doctor` authenticate an existing
 daemon through the internal `GET /health/observe` endpoint. It reports process
 identity with `observation: "identity-only"` and `storage.status: "unverified"`;
-it never opens project storage or runs the active readiness probe. Diagnostics
+it never opens project storage or runs the active readiness probe. It still
+answers when the daemon's startup backend differs from the backend now selected
+on disk, so a daemon left running across a migration cutover remains
+identifiable, including when its own environment lacks the PostgreSQL URL, CA
+file, or migration role of the newly selected backend (values that are present
+are still validated); every other admission check applies as before. Diagnostics
 require the exact installed version, backend, entrypoint, runtime digest, and
 unchanged configuration witness. An old daemon without this endpoint, malformed
 response, missing credentials, or mismatched identity refuses observation;
@@ -590,6 +682,29 @@ These failures produce a nonzero exit status and are not reported as “Nothing 
 compact.” A failed scan does not mark any session as processed. Back up the
 reported project database, resolve its storage or schema error, and rerun the
 command; the still-eligible sessions will be discovered again.
+
+When the daemon fails a single session's compaction request, `lcm compact`
+lists that session under "Failed" with a fixed message that names the cause
+and the next step. Per-session, progress, event, and summary output never
+interpolate the daemon's raw error text, provider responses, or file paths; they
+use a fixed message plus at most the numeric HTTP status. The CLI's separate
+daemon transport and heartbeat log lines are outside this redaction scope and
+still print Node's socket-layer text (for example `write EPIPE`). A failed
+session is not marked processed, so rerunning `lcm compact` after fixing the
+cause retries it; discovery re-checks eligibility.
+
+| Message | Meaning and next step |
+| --- | --- |
+| `daemon connection lost; outcome unknown; rerun after lcm doctor` | The connection dropped or timed out before a result arrived, so the compaction may or may not have been applied. Run `lcm doctor`, then rerun. |
+| `daemon auth rejected (HTTP 401 or 403); run lcm doctor` | The daemon refused the CLI's credentials. Run `lcm doctor`. |
+| `daemon unavailable (HTTP 503); run lcm doctor` | The daemon could not admit the request, for example because storage or invocation control is unavailable. Run `lcm doctor`, then rerun. |
+| `daemon rejected compact request (HTTP 4xx)` | The daemon rejected the request itself; rerunning unchanged is unlikely to help. |
+| `daemon compaction failed (HTTP 5xx); run lcm doctor` | The daemon failed while compacting. Run `lcm doctor` and rerun. |
+| `no PostgreSQL binding; run lcm project create or lcm project link <id>` | Run `lcm project create` or `lcm project link <project-id>` in the affected project directory. |
+| `compaction request cancelled` | The run was interrupted before this session finished. |
+| `malformed compact response` | The daemon replied with a body the CLI could not read. |
+| `compaction request failed` | Any other failure; run `lcm doctor`. |
+| `unknown error` | The request was rejected with a value that is not an error object; run `lcm doctor`. |
 
 `lcm compact --all` discovers projects from authenticated project bindings.
 It does not read `meta.json` to select projects or trust unbound metadata
@@ -734,6 +849,9 @@ boundaries and the user-facing failure cases.
 
 ## Compact concurrency and cancellation
 
+With `LCM_ENABLED=false` in the environment, `lcm compact` exits `0` after one
+stderr line without compacting; see [Disabling LCM](configuration.md#disabling-lcm).
+
 `lcm compact` accepts a bounded worker-pool setting for manual batch work:
 
 ```bash
@@ -781,6 +899,22 @@ signals keep waiting and print a diagnostic instead of interrupting settlement.
 Provider work already accepted by a remote service may continue remotely; the
 local guarantee covers LCM-owned queued/active requests, SDK retries, provider
 processes/groups, locks, and invocation-scoped promotion only.
+
+Discovery of eligible sessions also honors cancellation. It hands control back
+to the event loop at project, conversation, message-page, source-locator batch,
+and per-session locator-fallback boundaries, and again after each project scan
+finishes, so the lease heartbeat keeps running during a long scan and Ctrl+C or
+`SIGTERM` stops discovery at the next boundary rather than after the whole
+scan. Listing the project inventory before the first project starts, opening
+one project's storage, and reading one conversation's final page together with
+its summaries and context items are not interruptible and finish first. An
+interrupted scan closes the project storage it opened, reports no failure for
+the interrupted project, prints neither the "Found N uncompacted conversations"
+summary nor "Nothing to compact", and sends no `/compact` request. Failures
+recorded for earlier projects before the interruption are still reported. Every
+request to the local daemon uses a fresh loopback connection, so a connection
+the daemon already closed at its keep-alive timeout cannot cause a spurious
+"write EPIPE" transport failure.
 
 If cancellation cannot prove that the managed daemon and its owned provider
 work disappeared, LCM does not signal an unknown process or claim success. It

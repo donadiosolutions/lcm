@@ -30,7 +30,7 @@ function assertSemanticEqual(actual, expected, id) {
 const OWNED_ROWS = {
   memory: ["cli:store", "cli:search", "cli:grep", "cli:describe", "cli:expand",
     "daemon:POST /store", "daemon:POST /search", "daemon:POST /grep", "daemon:POST /describe", "daemon:POST /expand",
-    "daemon:POST /ingest", "daemon:POST /recent", "daemon:POST /restore", "daemon:POST /prompt-search",
+    "daemon:POST /ingest", "daemon:POST /ingest/terminal", "daemon:POST /recent", "daemon:POST /restore", "daemon:POST /prompt-search",
     "mcp:lcm_store", "mcp:lcm_search", "mcp:lcm_grep", "mcp:lcm_describe", "mcp:lcm_expand"],
   compaction: ["cli:compact", "daemon:POST /compact", "daemon:POST /session-complete", "daemon:POST /invocation-control"],
   diagnostics: ["cli:stats", "cli:status", "cli:doctor", "cli:diagnose", "daemon:GET /stats", "daemon:GET /stats/pool",
@@ -170,6 +170,8 @@ async function memory(context) {
   check(retry.ingested === 0, "ingest:deduplicated-retry");
   await request(context, "/ingest", { cwd }, 400);
   observations["daemon:POST /ingest"] = { messages: corpus.length + 2, replay: retry.ingested };
+  await request(context, "/ingest/terminal", { cwd }, 400);
+  observations["daemon:POST /ingest/terminal"] = { invalidStatus: 400 };
   const canonicalMessages = await context.readProject(context.projectId, async storage => {
     const conversation = await storage.conversations.getConversationBySessionId("parity-memory-first");
     check(conversation !== null, "grep:native-conversation");
@@ -799,7 +801,7 @@ export async function runSurfaceScenario(scenario, context) {
   if (scenario === "compaction") return compaction(owned);
   if (scenario === "diagnostics") return diagnostics(owned);
   if (["native-import", "knowledge"].includes(scenario)) return runImportScenario(scenario, owned);
-  if (["identity", "admin", "events", "sensitive"].includes(scenario)) return runIdentityScenario(scenario, owned);
+  if (["identity", "admin", "migration", "events", "sensitive"].includes(scenario)) return runIdentityScenario(scenario, owned);
   if (["hooks", "promotion"].includes(scenario)) return runHookScenario(scenario, owned);
   throw new Error(`surface-parity:unknown-scenario:${scenario}`);
 }

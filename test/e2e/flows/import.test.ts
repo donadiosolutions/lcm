@@ -45,8 +45,16 @@ describe("Flows 2-4: Import", { timeout: 60_000 }, () => {
     expect(result.ingested).toBeGreaterThan(0);
   });
 
-  it("Flow 5: refuses native completion when the ingest log claims missing messages", async () => {
-    // An inconsistent completion marker must not bypass exact native linkage.
+  it("Flow 5: an inflated ingest log row does not block ingest", async () => {
+    // The stored slice is the idempotency check, so a pre-recorded log row
+    // with an inflated message_count must not suppress the append.
+    const expected = await handle.client.post<{ ingested: number }>("/ingest", {
+      session_id: "e2e-test-control",
+      cwd: handle.tmpDir,
+      transcript_path: handle.fixturePath,
+    });
+    expect(expected.ingested).toBeGreaterThan(0);
+
     const { db, close } = openProjectDb(handle.tmpDir);
     try {
       db.prepare(
@@ -56,10 +64,18 @@ describe("Flows 2-4: Import", { timeout: 60_000 }, () => {
       close();
     }
 
-    await expect(handle.client.post("/ingest", {
+    const first = await handle.client.post<{ ingested: number }>("/ingest", {
       session_id: "e2e-test-skip-me",
       cwd: handle.tmpDir,
       transcript_path: handle.fixturePath,
-    })).rejects.toMatchObject({ statusCode: 500, message: "ingest failed" });
+    });
+    expect(first.ingested).toBe(expected.ingested);
+
+    const repeat = await handle.client.post<{ ingested: number }>("/ingest", {
+      session_id: "e2e-test-skip-me",
+      cwd: handle.tmpDir,
+      transcript_path: handle.fixturePath,
+    });
+    expect(repeat.ingested).toBe(0);
   });
 });

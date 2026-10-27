@@ -62,6 +62,22 @@ export async function exerciseConversationRepositoryConformance(
   expect((await repository.getConversation(first.conversationId))?.bootstrappedAt?.getTime())
     .toBe(firstBootstrap?.getTime());
 
+  // Parent linkage is keep-first, never cleared, and leaves updated_at alone.
+  expect((await repository.getConversation(first.conversationId))?.parentSessionId).toBeNull();
+  const beforeParent = await repository.getConversation(first.conversationId);
+  await repository.setParentSessionIdIfNull(first.conversationId, "parent-one");
+  await repository.setParentSessionIdIfNull(first.conversationId, "parent-two");
+  await repository.setParentSessionIdIfNull(999_999, "parent-one");
+  const afterParent = await repository.getConversation(first.conversationId);
+  expect(afterParent?.parentSessionId).toBe("parent-one");
+  expect(afterParent?.updatedAt.getTime()).toBe(beforeParent?.updatedAt.getTime());
+  expect((await repository.getConversation(second.conversationId))?.parentSessionId).toBeNull();
+  await expectNulRejected(() => repository.setParentSessionIdIfNull(
+    second.conversationId,
+    nulText,
+  ));
+  expect((await repository.getConversation(second.conversationId))?.parentSessionId).toBeNull();
+
   const createdMessages = await repository.createMessagesBulk([
     {
       conversationId: first.conversationId,
@@ -244,5 +260,58 @@ export async function exerciseConversationRepositoryConformance(
   expect(await repository.getMaxSeq(split.conversationId)).toBe(0);
   expect(await repository.getMaxSeq(second.conversationId)).toBe(0);
 
+  await exerciseTranscriptSlotConformance(repository);
+
   return { first, second, messages, third, appended };
+}
+
+const slotMarker = (consumed: boolean): string =>
+  JSON.stringify({ lcmTranscriptSlot: { version: 1, consumed } });
+
+/**
+ * Session-wide transcript slot state: transcript rows are messages without a
+ * compaction part, events keep their session order across split conversations,
+ * and only valid markers are reported.
+ */
+async function exerciseTranscriptSlotConformance(
+  repository: ConversationRepository,
+): Promise<void> {
+  const sessionId = "session-slot";
+  expect(await repository.getTranscriptSlotSnapshot(sessionId)).toEqual({ transcriptCount: 0, events: [] });
+  const older = await repository.createConversation({ sessionId });
+  const newer = await repository.createConversation({ sessionId });
+  const message = (conversationId: number, seq: number, content: string) =>
+    repository.createMessage({ conversationId, seq, role: "user", content, tokenCount: 1 });
+  const part = (partType: "compaction" | "snapshot" | "text", ordinal: number, metadata?: string): CreateMessagePartInput =>
+    ({ sessionId, partType, ordinal, ...(metadata === undefined ? {} : { metadata }) });
+
+  const t0 = await message(older.conversationId, 0, "t0");
+  const e1 = await message(older.conversationId, 1, "event one");
+  await message(older.conversationId, 2, "t1");
+  const e2 = await message(older.conversationId, 3, "event two");
+  await message(newer.conversationId, 0, "t2");
+  const e3 = await message(newer.conversationId, 1, "event three");
+  // A snapshot part on a transcript row never makes it an event.
+  await repository.createMessageParts(t0.messageId, [part("snapshot", 0, slotMarker(true))]);
+  await repository.createMessageParts(e1.messageId, [part("compaction", 0, "{}"), part("snapshot", 1, slotMarker(true))]);
+  await repository.createMessageParts(e2.messageId, [part("compaction", 0)]);
+  await repository.createMessageParts(e3.messageId, [
+    part("compaction", 0),
+    part("snapshot", 1, "not json"),
+    part("snapshot", 2, slotMarker(false)),
+    part("snapshot", 3, JSON.stringify({ lcmTranscriptSlot: { version: 2, consumed: true } })),
+  ]);
+
+  expect(await repository.getTranscriptSlotSnapshot(sessionId)).toEqual({
+    transcriptCount: 3,
+    events: [
+      { messageId: e1.messageId, followedByTranscript: true, nextOrdinal: 2, slotMarkers: [true] },
+      { messageId: e2.messageId, followedByTranscript: true, nextOrdinal: 1, slotMarkers: [] },
+      { messageId: e3.messageId, followedByTranscript: false, nextOrdinal: 4, slotMarkers: [false] },
+    ],
+  });
+  // getMessageCountBySessionId keeps counting every row, events included.
+  expect(await repository.getMessageCountBySessionId(sessionId)).toBe(6);
+  expect(await repository.getTranscriptSlotSnapshot("session-slot-other")).toEqual({ transcriptCount: 0, events: [] });
+  await expectNulRejected(() => repository.getTranscriptSlotSnapshot("sensitive-nul\0suffix"));
 }

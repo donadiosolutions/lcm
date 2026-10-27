@@ -96,6 +96,8 @@ export async function safeLogError(
   error: unknown,
   opts: { cwd?: string; sessionId?: string },
 ): Promise<void> {
+  // Per-process marker read by Codex hook receipts, which must not import this heavy module.
+  (globalThis as Record<symbol, unknown>)[Symbol.for("lcm.hookErrorReported")] = true;
   if (error instanceof RetiredProjectIdentityError) {
     try {
       retiredProjectDiagnosticWriter(`${RETIRED_PROJECT_IDENTITY_DIAGNOSTIC}\n`);

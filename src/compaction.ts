@@ -1,5 +1,6 @@
 import { createHash } from "node:crypto";
 import type { CreateMessagePartInput } from "./store/conversation-store.js";
+import { encodeTranscriptSlotMarker } from "./storage/contracts.js";
 import type { SummaryRecord, ContextItemRecord } from "./store/summary-store.js";
 import { extractFileIdsFromContent } from "./large-files.js";
 import type { ScrubEngine } from "./scrub.js";
@@ -1517,14 +1518,15 @@ export class CompactionEngine {
     });
 
     const writeEvent = async (conversations: ConversationRepository): Promise<void> => {
-      const seq = (await conversations.getMaxSeq(input.conversationId)) + 1;
-      const eventMessage = await conversations.createMessage({
-        conversationId: input.conversationId,
-        seq,
+      // Enter the session's critical section before allocating: ingest takes
+      // the same lock through getOrCreateConversation, so the event and its
+      // slot marker are never interleaved with a transcript append.
+      await conversations.getOrCreateConversation(input.sessionId);
+      const [eventMessage] = await conversations.appendMessages(input.conversationId, [{
         role: "system",
         content,
         tokenCount: estimateTokens(content),
-      });
+      }]);
 
       const parts: CreateMessagePartInput[] = [
         {
@@ -1534,8 +1536,15 @@ export class CompactionEngine {
           textContent: content,
           metadata,
         },
+        {
+          // Born unconsumed: the event never occupies a transcript index.
+          sessionId: input.sessionId,
+          partType: "snapshot",
+          ordinal: 1,
+          metadata: encodeTranscriptSlotMarker(false),
+        },
       ];
-      await conversations.createMessageParts(eventMessage.messageId, parts);
+      await conversations.createMessageParts(eventMessage!.messageId, parts);
     };
 
     try {

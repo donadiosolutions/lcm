@@ -1,5 +1,6 @@
 import { beforeEach, describe, expect, it, vi } from "vitest";
 import type { EventSidecarSummary } from "../../src/db/event-sidecars.js";
+import { localPendingAgeRead } from "../../src/storage/runtime-health.js";
 
 const sidecarMock = vi.hoisted(() => vi.fn<() => Promise<EventSidecarSummary[]>>());
 
@@ -150,5 +151,94 @@ describe("event stats aggregation boundaries", () => {
       deliveryQuarantined: 0,
       oldestDeliveryAt: null,
     });
+  });
+});
+
+
+describe("internal oldest pending capture time", () => {
+  beforeEach(() => sidecarMock.mockReset());
+  const readers = [
+    ["collectEventStats", (): Promise<{ oldestPendingAt?: string | null }> => collectEventStats(1)],
+    ["collectDetailedEventStats", (): Promise<{ oldestPendingAt?: string | null }> => collectDetailedEventStats(1)],
+  ] as const;
+
+  it.each(readers)("%s reports a proven empty source as null", async (_name, read) => {
+    sidecarMock.mockResolvedValue([]);
+    expect((await read()).oldestPendingAt).toBeNull();
+    sidecarMock.mockResolvedValue([sidecar({ oldestPendingAt: null }), sidecar({ file: "b.db", oldestPendingAt: null })]);
+    expect((await read()).oldestPendingAt).toBeNull();
+  });
+  it.each(readers)("%s selects the minimum across complete sidecars and ignores pruned ones", async (_name, read) => {
+    sidecarMock.mockResolvedValue([
+      sidecar({ oldestPendingAt: "2026-02-03 10:00:00" }),
+      sidecar({ file: "none.db", oldestPendingAt: null }),
+      sidecar({ file: "older.db", oldestPendingAt: "2026-01-01 00:00:00" }),
+      sidecar({ file: "newer.db", oldestPendingAt: "2026-03-01 00:00:00" }),
+      sidecar({ file: "pruned.db", pruned: true }),
+    ]);
+    expect((await read()).oldestPendingAt).toBe("2026-01-01 00:00:00");
+  });
+  it.each(readers)("%s makes the aggregate unknown when any source did not report it", async (_name, read) => {
+    for (const unread of [
+      sidecar({ file: "legacy.db" }),
+      sidecar({ file: "failed.db", scanError: "bad" }),
+      sidecar({ file: "skipped.db", scanSkipped: "budget", scanSkippedCount: 2 }),
+    ]) {
+      for (const order of [[unread, sidecar({ oldestPendingAt: "2026-01-01 00:00:00" })], [sidecar({ oldestPendingAt: "2026-01-01 00:00:00" }), unread]]) {
+        sidecarMock.mockResolvedValue(order);
+        expect((await read()).oldestPendingAt).toBeUndefined();
+      }
+    }
+  });
+  it("never adds the value to a detailed project record", async () => {
+    sidecarMock.mockResolvedValue([sidecar({ oldestPendingAt: "2026-01-01 00:00:00" })]);
+    expect(Object.keys((await collectDetailedEventStats(1)).projects[0]!)).not.toContain("oldestPendingAt");
+  });
+  const valid = "2026-02-03 10:00:00";
+  const orders = <T>(first: T, second: T): T[][] => [[first, second], [second, first]];
+  it.each(readers)("%s keeps an invalid timestamp from being masked by a valid sibling", async (_name, read) => {
+    for (const invalid of ["not-a-timestamp", "2026-02-30 10:00:00", "2026-00-01 00:00:00"]) {
+      for (const order of orders(valid, invalid)) {
+        sidecarMock.mockResolvedValue(order.map((oldestPendingAt, index) => sidecar({ file: index + ".db", oldestPendingAt })));
+        expect((await read()).oldestPendingAt).toBe(invalid);
+      }
+    }
+  });
+  it.each(readers)("%s keeps an invalid timestamp across null, a later invalid one, and a valid one", async (_name, read) => {
+    for (const order of orders<string | null>(null, "not-a-timestamp")) {
+      sidecarMock.mockResolvedValue(order.map((oldestPendingAt, index) => sidecar({ file: index + ".db", oldestPendingAt })));
+      expect((await read()).oldestPendingAt).toBe("not-a-timestamp");
+    }
+    sidecarMock.mockResolvedValue([
+      sidecar({ oldestPendingAt: "not-a-timestamp" }),
+      sidecar({ file: "b.db", oldestPendingAt: "2026-02-30 10:00:00" }),
+    ]);
+    expect((await read()).oldestPendingAt).toBe("not-a-timestamp");
+    sidecarMock.mockResolvedValue([
+      sidecar({ oldestPendingAt: "not-a-timestamp" }),
+      sidecar({ file: "b.db", oldestPendingAt: valid }),
+      sidecar({ file: "c.db", oldestPendingAt: "2025-01-01 00:00:00" }),
+    ]);
+    expect((await read()).oldestPendingAt).toBe("not-a-timestamp");
+  });
+  it.each(readers)("%s keeps the aggregate unknown when an unread source meets an invalid timestamp", async (_name, read) => {
+    const unread = sidecar({ file: "legacy.db" });
+    for (const order of orders(unread, sidecar({ file: "bad.db", oldestPendingAt: "not-a-timestamp" }))) {
+      sidecarMock.mockResolvedValue(order);
+      expect((await read()).oldestPendingAt).toBeUndefined();
+    }
+  });
+  it.each(readers)("%s leaves a calendar-valid future sibling to the read-time age check", async (_name, read) => {
+    const future = "2099-01-01 00:00:00";
+    for (const order of orders(valid, future)) {
+      sidecarMock.mockResolvedValue(order.map((oldestPendingAt, index) => sidecar({ file: index + ".db", oldestPendingAt })));
+      const folded = (await read()).oldestPendingAt;
+      expect(folded).toBe(valid);
+      expect(localPendingAgeRead(folded, Date.UTC(2026, 1, 3, 11, 0, 0))).toEqual({ value: 3600 });
+    }
+  });
+  it.each(readers)("%s reports an invalid fold as out of range at read time", async (_name, read) => {
+    sidecarMock.mockResolvedValue([sidecar({ oldestPendingAt: valid }), sidecar({ file: "b.db", oldestPendingAt: "2026-02-30 10:00:00" })]);
+    expect(localPendingAgeRead((await read()).oldestPendingAt, Date.UTC(2026, 1, 3, 11, 0, 0))).toEqual({ reason: "out-of-range" });
   });
 });

@@ -9,6 +9,7 @@ const UUID = /^[0-9a-f]{8}-[0-9a-f]{4}-7[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{1
 const ABSENT_ID = "01900000-0000-7000-8000-000000000099";
 const REMOTE_REFUSAL = /require.*storage\.backend.*postgresql/iu;
 const PATTERN = "parity_private_[0-9]{4}";
+const MIGRATION_COMMANDS = ["plan", "dry-run", "apply", "resume", "verify", "report", "abort", "activate", "rollback"];
 // Mirrors src/project-map.ts's unexported successor domain separator exactly;
 // this independently re-derives the successor id to verify CLI output rather
 // than importing production internals into the public-surface fixture.
@@ -428,6 +429,57 @@ async function admin(context) {
   return [receipt("postgres migrate", observation)];
 }
 
+// The durable bytes a cutover command may own (src/migration/*): the v2/v3
+// journal directory, the manifest directory, and the identity files apply
+// mints after its fence. Daemon-owned files are outside this scope.
+function migrationWitness(context) {
+  const lcm = join(context.homeDir, ".lcm");
+  const file = (name) => existsSync(join(lcm, name)) ? createHash("sha256").update(readFileSync(join(lcm, name))).digest("hex") : null;
+  return {
+    config: file("config.json"), map: file("map.json"), machine: file("machine.json"),
+    publication: files(join(lcm, "backend-publication")), migrations: files(join(lcm, "migrations")),
+  };
+}
+
+function migrationEnvelope(result, command) {
+  let envelope;
+  try { envelope = JSON.parse(result.stdout); } catch { envelope = undefined; }
+  if (envelope === undefined || envelope === null || typeof envelope !== "object") {
+    // The CLI printed no section-10 envelope: report a fixed category plus
+    // digests, never the raw streams, which can carry private paths.
+    const failure = new Error(`surface-migration:${command}:no-envelope`);
+    failure.surfaceEvidence = { stdoutErrorDigest: createHash("sha256").update(result.stdout).digest("hex"), stderrDigest: createHash("sha256").update(result.stderr).digest("hex") };
+    throw failure;
+  }
+  assert.equal(envelope.schemaVersion, 1, "surface-migration:envelope-schema");
+  assert.equal(envelope.command, command, "surface-migration:envelope-command");
+  assert.equal(envelope.exitCode, result.code, "surface-migration:envelope-exit-code");
+  return envelope;
+}
+
+async function migration(context) {
+  // Section 3's cutover commands act only on a SQLite-selected home with a
+  // registered machine, a verified transfer-role target and a live
+  // generation. Neither configured context satisfies that, so every command
+  // refuses before its first durable write. Each receipt pins the context's
+  // exact counterpart refusal from the envelope the command printed, and the
+  // witness proves no journal, manifest, map, machine or config byte changed.
+  const rows = [];
+  const before = migrationWitness(context);
+  for (const command of MIGRATION_COMMANDS) {
+    await invalid(context, ["migration", command]);
+    const result = await context.cli(["migration", command, "--json"]);
+    const envelope = migrationEnvelope(result, command);
+    assert.deepEqual(migrationWitness(context), before, `surface-migration:${command}:durable-bytes-changed`);
+    rows.push(receipt(`migration ${command}`, {
+      code: result.code, outcome: envelope.outcome,
+      refusal: envelope.refusal === null ? null : envelope.refusal.reason,
+      applied: envelope.applied, generation: envelope.generation,
+    }));
+  }
+  return rows;
+}
+
 async function events(context) {
   const rows = [];
   const root = privateRoot(context, "events-operator");
@@ -644,7 +696,7 @@ async function sensitive(context) {
 }
 
 export async function runIdentityScenario(scenario, context) {
-  const run = { identity, admin, events, sensitive }[scenario];
+  const run = { identity, admin, migration, events, sensitive }[scenario];
   assert.ok(run, `unknown identity workflow ${scenario}`);
   const rows = scenario === "sensitive" ? await context.runStoppedSensitiveCase(() => run(context)) : await run(context);
   const expected = context.matrix.filter((row) => row.scenario === scenario).map((row) => row.id).sort();
@@ -678,12 +730,42 @@ export function expectedIdentityObservations(backend) {
     // compares against loadPostgreSqlMigrations() directly (never this
     // static list), so this is only the cross-backend architecture-result
     // comparison catching up to the real, current migration ledger.
-    "cli:postgres migrate": pg ? { code: 0, backend: "postgresql", applied: [], current: ["0001_migration_ledger", "0002_schema_baseline", "0003_machine_identity_key", "0004_machine_display_name", "0005_summary_context_integrity", "0006_transfer_ledger", "0007_promoted_content_digest", "0008_transfer_identity_content_digest"] } : refusal,
+    "cli:postgres migrate": pg ? { code: 0, backend: "postgresql", applied: [], current: ["0001_migration_ledger", "0002_schema_baseline", "0003_machine_identity_key", "0004_machine_display_name", "0005_summary_context_integrity", "0006_transfer_ledger", "0007_promoted_content_digest", "0008_transfer_identity_content_digest", "0009_conversation_parent_session"] } : refusal,
+    ...expectedMigrationObservations(backend),
     "cli:events promote": { code: 0, promoted: 0, errors: 0 },
     "cli:events status": pg ? { code: 0, pending: 0, quarantined: 0, remotePending: "0" } : refusal,
     "cli:events validate": pg ? { code: 0, checked: 0, matched: 0, missing: [], mismatched: [] } : refusal,
     "cli:events quarantine": pg ? { code: 0, local: 1, remote: 0, reason: "surface operator fixture" } : refusal,
     "cli:events replay": pg ? { code: 0, replayed: true, localReplayed: true, event: null, repeatCode: 1 } : refusal,
     "cli:sensitive purge": pg ? { code: 1, refusal: "postgresql-unavailable", unchanged: true } : { code: 0, removed: true },
+  };
+}
+
+// src/migration/refusal-mapping.ts exit classes: refused-precondition is 2,
+// refused-contention 4, refused-evidence 5. The SQLite context configures no
+// storage.postgresql target (target-config.ts) and registers no machine
+// (maintenance.ts: authenticateSqliteMigrationSource). The PostgreSQL context
+// reaches its real target under the runtime role, which never received the
+// transfer grants (target-reachability.ts, proven on a real database by
+// test/postgresql/target-reachability.integration.ts), no longer has SQLite
+// selected, and keeps the completed v2 publication journal that abort refuses
+// to probe past (cli-abort.ts). Neither context holds a generation, so every
+// generation-bound command refuses before reading a manifest (cli-existing.ts).
+export function expectedMigrationObservations(backend) {
+  assert.ok(backend === "sqlite" || backend === "postgresql");
+  const pg = backend === "postgresql";
+  const refusal = (code, outcome, reason) => ({ code, outcome, refusal: reason, applied: false, generation: null });
+  const precondition = (reason) => refusal(2, "refused-precondition", reason);
+  const target = () => precondition(pg ? "migration-target-verification-failed" : "migration-target-missing");
+  return {
+    "cli:migration plan": target(),
+    "cli:migration dry-run": refusal(5, "refused-evidence", "dry-run-failed"),
+    "cli:migration apply": target(),
+    "cli:migration resume": precondition("generation-required"),
+    "cli:migration verify": precondition("generation-required"),
+    "cli:migration report": precondition("generation-required"),
+    "cli:migration abort": pg ? refusal(4, "refused-contention", "publication-occupies-slot") : precondition("abort-nothing-to-abort"),
+    "cli:migration activate": precondition("generation-required"),
+    "cli:migration rollback": precondition("generation-required"),
   };
 }

@@ -1,0 +1,14 @@
+references: ["#1670"]
+rationale: >-
+  #1670 lets the cutover-set candidate preview and the confirmation fence
+  enumerate the stored-data projects without publishing a project-map
+  metadata backfill. The reconciliation lock in src/project-map.ts, the
+  stored-data enumeration in activation-coverage.ts, the member authority
+  resolution in maintenance.ts and the fresh planning step in
+  cutover-set-prepare.ts only thread one optional flag. They keep their
+  existing owners; no topology change.
+pins:
+  - ["src/migration/activation-coverage.ts", "unit-migration-cutover"]
+  - ["src/migration/cutover-set-prepare.ts", "unit-migration-cutover"]
+  - ["src/migration/maintenance.ts", "unit-migration-cutover"]
+  - ["src/project-map.ts", "unit-project-worktrees"]

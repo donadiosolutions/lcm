@@ -1,0 +1,24 @@
+references: ["#1564"]
+rationale: >-
+  Adds three production modules for reporting actual Codex connector
+  readiness. src/connectors/codex-config-toml.ts (the conservative config.toml
+  scanner and hooks-feature classifier) and src/connectors/codex-readiness.ts
+  (trust-hash computation and the static readiness report) are connector
+  concerns and fall under the existing src/connectors/ unit-connectors owner.
+  src/hooks/codex-hook-receipts.ts (LCM-local completion observations of Codex
+  hook runs) falls under the existing unit-hooks owner. No path is removed,
+  moved or re-owned and codecov.yml is unchanged.
+  src/connectors/codex-hooks.ts (in-place merge and install planner) and
+  src/connectors/installer.ts (preflight planning, install notices and the
+  codex version probe) are materially changed and keep unit-connectors.
+  src/hooks/hook-errors.ts (the per-process error marker) is materially
+  changed and keeps unit-hooks. bin/lcm.ts (doctor readiness output and the
+  Codex hook observation wrapper) is materially changed and keeps unit-cli.
+pins:
+  - ["src/connectors/codex-config-toml.ts", "unit-connectors"]
+  - ["src/connectors/codex-readiness.ts", "unit-connectors"]
+  - ["src/connectors/codex-hooks.ts", "unit-connectors"]
+  - ["src/connectors/installer.ts", "unit-connectors"]
+  - ["src/hooks/codex-hook-receipts.ts", "unit-hooks"]
+  - ["src/hooks/hook-errors.ts", "unit-hooks"]
+  - ["bin/lcm.ts", "unit-cli"]

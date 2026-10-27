@@ -1,4 +1,4 @@
-import { readFileSync } from "node:fs";
+import { closeSync, constants, fstatSync, openSync, readFileSync } from "node:fs";
 
 interface ContentBlock {
   type?: string;
@@ -45,13 +45,34 @@ export function estimateTokens(text: string): number {
   return Math.max(1, Math.ceil(text.length / 4));
 }
 
-export function parseTranscript(transcriptPath: string): ParsedMessage[] {
-  let raw: string;
+/**
+ * Read a transcript pathname as UTF-8 without waiting on special files. The
+ * open is non-blocking so a FIFO with no writer cannot stall the caller, and
+ * the descriptor must name a regular file before any bytes are read. Symlinks
+ * are followed. Returns undefined for IO errors and non-regular files.
+ */
+export function readTranscriptFileText(transcriptPath: string): string | undefined {
+  let fd: number | undefined;
   try {
-    raw = readFileSync(transcriptPath, "utf-8");
+    fd = openSync(transcriptPath, constants.O_RDONLY | constants.O_NONBLOCK);
+    if (!fstatSync(fd).isFile()) return undefined;
+    return readFileSync(fd, "utf-8");
   } catch {
-    return [];
+    return undefined;
+  } finally {
+    if (fd !== undefined) {
+      try {
+        closeSync(fd);
+      } catch {
+        // descriptor cleanup failure is not a parse failure
+      }
+    }
   }
+}
+
+export function parseTranscript(transcriptPath: string): ParsedMessage[] {
+  const raw = readTranscriptFileText(transcriptPath);
+  if (raw === undefined) return [];
 
   return parseTranscriptText(raw);
 }

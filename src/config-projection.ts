@@ -79,3 +79,29 @@ export function loadStoredLlmRequestPolicyConfig(
     return parseLlmRequestPolicyConfig(file.content, env);
   });
 }
+
+/** Hook-only opt-in for Codex PreToolUse memory hints and the daemon port. */
+export type StoredPreToolRecallSettings = {
+  enabled: boolean;
+  daemonPort: number;
+};
+
+/**
+ * Load the PreToolUse opt-in without resolving environment-only secrets for a
+ * remote storage backend. Only a stored boolean `true` enables the feature.
+ */
+export function loadStoredPreToolRecallSettings(path: string): StoredPreToolRecallSettings {
+  return withBackendPublicationConfigLock(path, (lockToken) => {
+    const file = readStoredConfig(path);
+    const stored = parseStoredConfig(file.content);
+    const daemon = stored.daemon as { port?: number } | undefined;
+    const storage = stored.storage as { backend?: StorageBackend } | undefined;
+    const hooks = stored.hooks as { preToolRecall?: unknown } | undefined;
+    const backend = storage?.backend ?? "sqlite";
+    assertBackendPublicationConfigAccess(path, backend, file.observedContent, undefined, lockToken);
+    return {
+      enabled: hooks?.preToolRecall === true,
+      daemonPort: daemon?.port ?? 3737,
+    };
+  });
+}

@@ -1,0 +1,43 @@
+references: ["#625"]
+rationale: >-
+  Adds the phase-1 building blocks of the migration activation orchestrator
+  under src/migration/, so they stay in the directory-level migration cutover
+  owner; no topology change. New modules: the deterministic activation
+  publicationId derivation, the three-valued PostgreSQL target health check
+  (authenticated probe plus the factory's own schema readiness check, with
+  definite server refusals reported as unhealthy and transport, abort, closed
+  or ambiguous readiness reported as unresolvable), and the immutable
+  activation report (body, identity, protocol report reference, and a
+  content-addressed per-generation store with a three-valued reader).
+  Materially changes the activation artifact store, which gains the durable
+  generation -> publication link record (immutable, byte-identical reuse,
+  typed conflict, shared crash-twin recovery) and its three-valued reader,
+  and the migration index, which exports the new public API. Phase 2 adds
+  the project-map witness (one definition, pre/post-publication modes, no
+  writing read seam), extends the coverage module with the G8 stored-data
+  inventory and single-project verdict, attributes pid-file read failures
+  in the restart check, adds the transfer-ledger copy-binding reader, and
+  adjusts the report body and generation link. The publication step gains
+  the plan-v7.1 version-2 dispatch table (one controlled pre-seal abort and
+  re-prepare, sealed-material comparison, release-tail and abort-family
+  rows without a fence precheck); backend-publication.ts only exports its
+  existing material serialization for that byte comparison and stays in
+  its own storage owner (unit-storage-abstractions). Phase 3 adds the
+  orchestrator itself (src/migration/activate-generation.ts): the S0-S16
+  sequence under the append barrier, the closed refusal / interruption
+  vocabularies, the applied / reportStored classifiers, lease continuation,
+  crash-row re-entry, the non-predictive preview and the production
+  dependency builder with the single #626 wiring point.
+pins:
+  - ["src/migration/activate-generation.ts", "unit-migration-cutover"]
+  - ["src/storage/backend-publication.ts", "unit-storage-abstractions"]
+  - ["src/migration/copy-binding-reader.ts", "unit-migration-cutover"]
+  - ["src/migration/project-map-witness.ts", "unit-migration-cutover"]
+  - ["src/migration/activation-coverage.ts", "unit-migration-cutover"]
+  - ["src/migration/activation-restart-check.ts", "unit-migration-cutover"]
+  - ["src/migration/activation-publication-id.ts", "unit-migration-cutover"]
+  - ["src/migration/target-health.ts", "unit-migration-cutover"]
+  - ["src/migration/activation-artifact-store.ts", "unit-migration-cutover"]
+  - ["src/migration/activation-report.ts", "unit-migration-cutover"]
+  - ["src/migration/index.ts", "unit-migration-cutover"]
+  - ["src/migration/activation-publication.ts", "unit-migration-cutover"]

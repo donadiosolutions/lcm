@@ -32,6 +32,7 @@ describe("printHelp — full reference", () => {
     expect(text).toContain("Sensitive");
     expect(text).toContain("Hooks (internal)");
     expect(text).toContain("post-tool");
+    expect(text).toContain("pre-tool");
   });
 
   it("includes version and help flags", () => {
@@ -177,6 +178,14 @@ describe("printHelp — per-command detail", () => {
     expect(text).toContain("PostToolUse");
   });
 
+  it("prints hook command help (pre-tool)", () => {
+    const out = vi.spyOn(process.stdout, "write").mockImplementation(() => true);
+    printHelp("pre-tool");
+    const text = out.mock.calls.map(c => c[0]).join("");
+    expect(text).toContain("lcm pre-tool");
+    expect(text).toContain("hooks.preToolRecall");
+  });
+
   it("prints mcp command help", () => {
     const out = vi.spyOn(process.stdout, "write").mockImplementation(() => true);
     printHelp("mcp");
@@ -243,6 +252,23 @@ describe("printHelp — per-command detail", () => {
     expect(postgresText).toContain("storage.postgresql.migrationRole");
     expect(postgresText).toContain("LCM_POSTGRES_MIGRATION_ROLE");
     expect(postgresText).toContain("does not install extensions or grant runtime privileges");
+
+    out.mockClear();
+    printHelp("migration");
+    const migrationText = out.mock.calls.map(c => c[0]).join("");
+    expect(migrationText).toContain("lcm migration <plan|dry-run|apply|resume|verify|report|abort|activate|rollback> [--json]");
+    expect(migrationText).toContain("--confirm-generation <id>");
+    expect(migrationText).toContain("Complete whichever recovery write");
+    expect(migrationText).toContain("--confirm-backend postgresql");
+    expect(migrationText).toContain("revoke the transfer grants");
+    expect(migrationText).toContain("--confirm-backend sqlite");
+    expect(migrationText).toContain("remotely bound");
+    expect(migrationText).toContain("<command> --set");
+    expect(migrationText).toContain("never a member generation id");
+    expect(migrationText).toContain("lcm migration report --set --generation <set-id>");
+    expect(migrationText).toContain("docs/migration-cutover-set.md");
+    expect(migrationText).toContain("Never a silent fallback");
+    expect(migrationText).toContain("docs/migration-operations.md");
   });
 
   it("prints import command help with Codex provider flags", () => {

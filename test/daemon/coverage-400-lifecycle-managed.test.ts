@@ -36,7 +36,11 @@ import {
   type DaemonLifecycleTestScope,
 } from "../../src/daemon/lifecycle-scope.js";
 import { RUNTIME_DIGEST } from "../../src/daemon/version.js";
-import { PrivateMutationLockContentionError } from "../../src/private-mutation-lock.js";
+import {
+  createLockContentionWaitBudget,
+  PrivateMutationLockContentionError,
+  retryWhileLiveLockContended,
+} from "../../src/private-mutation-lock.js";
 
 vi.mock("node:os", async (importOriginal) => {
   const actual = await importOriginal<typeof import("node:os")>();
@@ -1111,6 +1115,187 @@ describe("issue 400 managed ensure admission matrix", () => {
     });
     expect(publicationAssertions).toBe(3);
     expect(fixture.start).not.toHaveBeenCalled();
+  });
+
+  describe("a live holder in another process", () => {
+    const foreignHolder = (message: string): PrivateMutationLockContentionError =>
+      new PrivateMutationLockContentionError(message, {
+        contendedLock: {
+          path: "/lcm/.lcm.backend-publication.lock",
+          owner: { version: 1, pid: process.pid + 1, processStartTime: "other-birth", nonce: "f".repeat(32) },
+        },
+      });
+    const waitingRetry = (waits: number[]) => {
+      const budget = createLockContentionWaitBudget(1_000);
+      return <T>(step: () => T | Promise<T>): Promise<T> => retryWhileLiveLockContended(step, {
+        budget,
+        _wait: async (milliseconds) => { waits.push(milliseconds); },
+      });
+    };
+
+    it("is waited for at the final admission of a running daemon through the caller retry", async () => {
+      let publicationAssertions = 0;
+      const waits: number[] = [];
+      const fixture = createFixture({
+        isAlive: () => true,
+        fetch: sequenceFetch([
+          healthy(4242, "/tmp/lcm-daemon-entrypoint.mjs", { runtimeDigest: "a".repeat(64) }),
+          healthy(4242, "/tmp/lcm-daemon-entrypoint.mjs", { runtimeDigest: "a".repeat(64) }),
+          response({ totalConnections: 0 }),
+          healthy(4242, "/tmp/lcm-daemon-entrypoint.mjs", { runtimeDigest: "a".repeat(64) }),
+        ]),
+      });
+      setRunningProbe(fixture, 4242);
+      writeFileSync(fixture.tokenPath, "managed-token", { mode: 0o600 });
+      const options = optionsFor(fixture, {
+        expectedRuntimeDigest: "a".repeat(64),
+        _managedOperationAuthorized: true,
+        _managedOperationManagerPid: 4242,
+        _withPublicationAdmissionRetry: waitingRetry(waits),
+        _assertBackendPublication: () => {
+          publicationAssertions += 1;
+          if (publicationAssertions === 2 || publicationAssertions === 3) {
+            throw foreignHolder("a hook holds the publication lock");
+          }
+        },
+      });
+      Object.assign(options, {
+        _processStartTimeForTesting: () => "birth",
+        _readPrivateMutationLockOwnerForTesting: () => ({
+          version: 1,
+          pid: 4242,
+          processStartTime: "birth",
+          nonce: "a".repeat(32),
+        }),
+      });
+
+      await expect(ensureDaemon(options)).resolves.toMatchObject({ connected: true, pid: 4242 });
+
+      // Only the final assertion is rerun, one caller pause per refusal, then admitted.
+      expect(publicationAssertions).toBe(4);
+      expect(waits).toEqual([50, 50]);
+    });
+
+    it("hands a lock that moves from a hook to the daemon back to child convergence", async () => {
+      let publicationAssertions = 0;
+      const waits: number[] = [];
+      let now = 0;
+      const fixture = createFixture({
+        isAlive: () => true,
+        fetch: sequenceFetch([
+          healthy(4242, "/tmp/lcm-daemon-entrypoint.mjs", { runtimeDigest: "a".repeat(64) }),
+          healthy(4242, "/tmp/lcm-daemon-entrypoint.mjs", { runtimeDigest: "a".repeat(64) }),
+          response({ totalConnections: 0 }),
+          healthy(4242, "/tmp/lcm-daemon-entrypoint.mjs", { runtimeDigest: "a".repeat(64) }),
+        ]),
+        sleep: async (ms) => { now += ms; },
+      });
+      setRunningProbe(fixture, 4242);
+      writeFileSync(fixture.tokenPath, "managed-token", { mode: 0o600 });
+      const options = optionsFor(fixture, {
+        expectedRuntimeDigest: "a".repeat(64),
+        _managedOperationAuthorized: true,
+        _managedOperationManagerPid: 4242,
+        _monotonicNowOverride: () => now,
+        _sleepOverride: async (ms) => { now += ms; },
+        _withPublicationAdmissionRetry: waitingRetry(waits),
+        _assertBackendPublication: () => {
+          publicationAssertions += 1;
+          // A hook holds the lock first, then the daemon does; both are refused once.
+          if (publicationAssertions === 2) throw foreignHolder("a hook holds the publication lock");
+          if (publicationAssertions === 3) {
+            throw new PrivateMutationLockContentionError("the daemon sweep now holds the publication lock");
+          }
+        },
+      });
+      Object.assign(options, {
+        _processStartTimeForTesting: () => "birth",
+        _readPrivateMutationLockOwnerForTesting: () => ({
+          version: 1,
+          pid: 4242,
+          processStartTime: "birth",
+          nonce: "a".repeat(32),
+        }),
+      });
+
+      await expect(ensureDaemon(options)).resolves.toMatchObject({ connected: true, pid: 4242 });
+
+      expect(publicationAssertions).toBe(4);
+      // Only the hook-owned refusal used the caller's allowance.
+      expect(waits).toEqual([50]);
+    });
+
+    it("still fails at the final admission of a running daemon when no caller retry was supplied", async () => {
+      let publicationAssertions = 0;
+      const contention = foreignHolder("a hook holds the publication lock");
+      const fixture = createFixture({
+        isAlive: () => true,
+        fetch: sequenceFetch([
+          healthy(4242, "/tmp/lcm-daemon-entrypoint.mjs", { runtimeDigest: "a".repeat(64) }),
+          healthy(4242, "/tmp/lcm-daemon-entrypoint.mjs", { runtimeDigest: "a".repeat(64) }),
+          response({ totalConnections: 0 }),
+          healthy(4242, "/tmp/lcm-daemon-entrypoint.mjs", { runtimeDigest: "a".repeat(64) }),
+        ]),
+      });
+      setRunningProbe(fixture, 4242);
+      writeFileSync(fixture.tokenPath, "managed-token", { mode: 0o600 });
+      const options = optionsFor(fixture, {
+        expectedRuntimeDigest: "a".repeat(64),
+        _managedOperationAuthorized: true,
+        _managedOperationManagerPid: 4242,
+        _assertBackendPublication: () => {
+          publicationAssertions += 1;
+          if (publicationAssertions === 2) throw contention;
+        },
+      });
+      Object.assign(options, {
+        _processStartTimeForTesting: () => "birth",
+        _readPrivateMutationLockOwnerForTesting: () => ({
+          version: 1,
+          pid: 4242,
+          processStartTime: "birth",
+          nonce: "a".repeat(32),
+        }),
+      });
+
+      await expect(ensureDaemon(options)).rejects.toBe(contention);
+      expect(publicationAssertions).toBe(2);
+    });
+
+    it("is waited for at both admissions when no daemon is running", async () => {
+      let publicationAssertions = 0;
+      const waits: number[] = [];
+      const retry = waitingRetry(waits);
+      const fixture = createFixture({
+        isAlive: () => true,
+        fetch: sequenceFetch([
+          new Error("pre-start offline"),
+          healthy(4242, "/tmp/lcm-daemon-entrypoint.mjs", { runtimeDigest: "a".repeat(64) }),
+          healthy(4242, "/tmp/lcm-daemon-entrypoint.mjs", { runtimeDigest: "a".repeat(64) }),
+          response({ totalConnections: 0 }),
+        ]),
+      });
+      fixture.probe
+        .mockImplementationOnce(async (spec: SupervisorSpec) => observation(spec, "absent"))
+        .mockImplementation(async (spec: SupervisorSpec) => observation(spec, "registered-running-valid", { managerPid: 4242 }));
+      writeFileSync(fixture.tokenPath, "managed-token", { mode: 0o600 });
+
+      await expect(ensureDaemon(optionsFor(fixture, {
+        _skipSpawn: false,
+        expectedRuntimeDigest: "a".repeat(64),
+        _withPublicationAdmissionRetry: retry,
+        _assertBackendPublication: () => {
+          publicationAssertions += 1;
+          // The first attempt of the initial admission and of the final one are refused.
+          if (publicationAssertions === 1 || publicationAssertions === 3) {
+            throw foreignHolder("a hook holds the publication lock");
+          }
+        },
+      }))).resolves.toMatchObject({ connected: true, spawned: true, pid: 4242 });
+
+      expect(publicationAssertions).toBe(4);
+      expect(waits).toEqual([50, 50]);
+    });
   });
 
   it("fails closed when the admission token rotates before retry", async () => {

@@ -11,6 +11,11 @@ import {
 } from "node:fs";
 import { dirname, isAbsolute, join, sep } from "node:path";
 import { GITLEAKS_PATTERNS } from "../generated-patterns.js";
+import {
+  isInheritedSubagentRecord,
+  type CodexInheritedBoundary,
+  type CodexInheritedBoundaryInput,
+} from "../codex-transcript.js";
 import { NATIVE_PATTERNS, ScrubEngine } from "../scrub.js";
 import type { MessageRole } from "../store/conversation-store.js";
 import type {
@@ -84,10 +89,111 @@ export class NativeTranscriptConfigurationError extends Error {
   }
 }
 
+/**
+ * Why an exact resolver could not return a stored message for one sanitized
+ * native message.
+ *
+ * - `invalid-input`: the sequence, role, session id or content were not valid
+ *   resolver input.
+ * - `session-not-found`: no stored rows exist for the native session.
+ * - `invalid-session-snapshot`: the stored session rows are malformed,
+ *   repeat a conversation, or are not contiguous from zero.
+ * - `sequence-out-of-range`: the session has no message at the sequence.
+ * - `role-mismatch`: the stored message at the sequence has another role.
+ * - `content-mismatch`: the stored message at the sequence has other content.
+ */
+const NATIVE_TRANSCRIPT_LINK_MISS_CONDITIONS = [
+  "invalid-input",
+  "session-not-found",
+  "invalid-session-snapshot",
+  "sequence-out-of-range",
+  "role-mismatch",
+  "content-mismatch",
+] as const;
+
+export type NativeTranscriptLinkMissCondition =
+  (typeof NATIVE_TRANSCRIPT_LINK_MISS_CONDITIONS)[number];
+
+/**
+ * Condition named by a {@link NativeTranscriptLinkError}.
+ *
+ * - Every {@link NativeTranscriptLinkMissCondition}: an exact lookup missed
+ *   for a message candidate; the error also names its session sequence.
+ * - `unresolved`: the lookup missed and the resolver could not explain why,
+ *   or no condition was supplied.
+ * - `unsupported-pending-after-quarantine`: a record followed quarantined
+ *   records but used a custom message mapper or produced several messages,
+ *   so its session position cannot be searched.
+ * - `ambiguous-pending-match`: more than one session sequence in the
+ *   pending window matched the message.
+ * - `unmatched-pending-window`: no session sequence in the pending window
+ *   matched the message.
+ */
+export type NativeTranscriptLinkCondition =
+  | NativeTranscriptLinkMissCondition
+  | "unresolved"
+  | "unsupported-pending-after-quarantine"
+  | "ambiguous-pending-match"
+  | "unmatched-pending-window";
+
+const NATIVE_TRANSCRIPT_LINK_CONDITIONS: readonly string[] = [
+  ...NATIVE_TRANSCRIPT_LINK_MISS_CONDITIONS,
+  "unresolved",
+  "unsupported-pending-after-quarantine",
+  "ambiguous-pending-match",
+  "unmatched-pending-window",
+];
+
+function isLinkMissCondition(
+  value: unknown,
+): value is NativeTranscriptLinkMissCondition {
+  return typeof value === "string"
+    && (NATIVE_TRANSCRIPT_LINK_MISS_CONDITIONS as readonly string[])
+      .includes(value);
+}
+
+function linkCondition(value: unknown): NativeTranscriptLinkCondition {
+  return typeof value === "string"
+    && NATIVE_TRANSCRIPT_LINK_CONDITIONS.includes(value)
+    ? value as NativeTranscriptLinkCondition
+    : "unresolved";
+}
+
+function linkOrdinal(value: unknown): number | undefined {
+  return typeof value === "number" && Number.isSafeInteger(value) && value >= 0
+    ? value
+    : undefined;
+}
+
+export interface NativeTranscriptLinkErrorDetails {
+  readonly condition?: NativeTranscriptLinkCondition;
+  readonly sessionSequence?: number;
+}
+
+/**
+ * Raised when a native transcript message cannot be linked to its stored
+ * message. The message names only a validated condition code and validated
+ * non-negative integers, never transcript content, roles, ids or paths.
+ */
 export class NativeTranscriptLinkError extends Error {
-  constructor(readonly sourceOrdinal: number) {
-    super("native transcript message linkage failed");
+  readonly condition: NativeTranscriptLinkCondition;
+  readonly sessionSequence: number | undefined;
+
+  constructor(
+    readonly sourceOrdinal: number,
+    details: NativeTranscriptLinkErrorDetails = {},
+  ) {
+    const condition = linkCondition(details.condition);
+    const ordinal = linkOrdinal(sourceOrdinal);
+    const sequence = linkOrdinal(details.sessionSequence);
+    super(
+      `native transcript message linkage failed: ${condition}`
+      + (ordinal === undefined ? "" : ` at source ordinal ${ordinal}`)
+      + (sequence === undefined ? "" : ` (session sequence ${sequence})`),
+    );
     this.name = "NativeTranscriptLinkError";
+    this.condition = condition;
+    this.sessionSequence = sequence;
   }
 }
 
@@ -316,6 +422,12 @@ export interface PreparedNativeTranscriptRecord {
   readonly contentSha256: string;
   readonly ingestKey: string;
   readonly nativePayload: JsonObject | JsonValue[];
+  /**
+   * Set only when a Codex inherited boundary was supplied: whether the RAW
+   * record, classified before key scrubbing, is parent history a forked
+   * subagent inherited.
+   */
+  readonly inheritedHistory?: boolean;
 }
 
 export interface QuarantinedNativeTranscriptRecord {
@@ -341,6 +453,8 @@ export interface NativeTranscriptJsonlReadOptions {
   readonly clock?: () => Date;
   /** @internal Allows bounded unit tests without allocating ten MiB. */
   readonly maxRecordBytes?: number;
+  /** Classify each record against this Codex inherited-history boundary. */
+  readonly codexInheritedBoundary?: CodexInheritedBoundaryInput;
   /**
    * Report physical progress only after this absolute byte boundary.
    * Crossing records are trimmed and rehashed from the boundary.
@@ -365,6 +479,7 @@ interface NativeTranscriptJsonlReadSnapshot {
   readonly maxRecordBytes: number;
   readonly progressStartByteOffset: number;
   readonly onProgress: NativeTranscriptJsonlReadOptions["onProgress"];
+  readonly inheritedBoundary: CodexInheritedBoundary | undefined;
 }
 
 function snapshotByteIterable(
@@ -429,6 +544,10 @@ function snapshotNativeTranscriptJsonlReadOptions(
   const onProgress = options.onProgress;
   const callerScrubber = options.scrubber;
   const callerBytes = options.bytes;
+  const inheritedBoundary = snapshotInheritedBoundary(
+    options.codexInheritedBoundary,
+    format,
+  );
   assertFormat(format);
   assertNonemptyText(nativeSessionId);
   assertSourceLocator(sourceLocator);
@@ -462,7 +581,38 @@ function snapshotNativeTranscriptJsonlReadOptions(
     maxRecordBytes,
     progressStartByteOffset,
     onProgress,
+    inheritedBoundary,
   });
+}
+
+function snapshotInheritedBoundary(
+  boundary: CodexInheritedBoundaryInput | undefined,
+  format: NativeTranscriptFormat,
+): CodexInheritedBoundary | undefined {
+  if (boundary === undefined) return undefined;
+  if (
+    boundary === null
+    || typeof boundary !== "object"
+    || format.clientName !== CODEX_NATIVE_TRANSCRIPT_FORMAT.clientName
+  ) {
+    throw new NativeTranscriptConfigurationError("invalid-input");
+  }
+  // The shape from before boundaries had a kind is the ordinal variant.
+  if (boundary.kind === "ordinal" || boundary.kind === undefined) {
+    if (!Number.isSafeInteger(boundary.start) || boundary.start < 0 || typeof boundary.paginated !== "boolean") {
+      throw new NativeTranscriptConfigurationError("invalid-input");
+    }
+    return Object.freeze({ kind: "ordinal", start: boundary.start, paginated: boundary.paginated });
+  }
+  if (boundary.kind === "copied-fork") {
+    if (boundary.pending === true && boundary.startRecord === undefined) {
+      return Object.freeze({ kind: "copied-fork", pending: true });
+    }
+    if (boundary.pending === undefined && Number.isSafeInteger(boundary.startRecord) && boundary.startRecord >= 0) {
+      return Object.freeze({ kind: "copied-fork", startRecord: boundary.startRecord });
+    }
+  }
+  throw new NativeTranscriptConfigurationError("invalid-input");
 }
 
 function ingestKey(
@@ -785,6 +935,33 @@ export function readNativeTranscriptJsonl(
   }
 }
 
+/**
+ * Source ordinals of the records of one Codex rollout that its own bytes
+ * classify as inherited parent history. Ordinals are those the native reader
+ * assigns (every non-blank physical record, quarantined or not), so they match
+ * committed native records of the same prefix. Nothing is scrubbed or stored.
+ */
+export async function inheritedNativeSourceOrdinals(
+  bytes: Uint8Array,
+  boundary: CodexInheritedBoundary,
+): Promise<ReadonlySet<number>> {
+  const ordinals = new Set<number>();
+  const chunks = (async function* (): AsyncGenerator<Uint8Array> { yield bytes; })();
+  for await (const outcome of readNativeTranscriptJsonl({
+    bytes: chunks,
+    format: CODEX_NATIVE_TRANSCRIPT_FORMAT,
+    nativeSessionId: "inherited-ordinal-scan",
+    sourceLocator: "inherited-ordinal-scan.jsonl",
+    scrubber: { scrubberVersion: "inherited-ordinal-scan/v1", scrubJson: (value) => value },
+    codexInheritedBoundary: boundary,
+  })) {
+    if (outcome.kind === "record" && outcome.inheritedHistory === true) {
+      ordinals.add(outcome.sourceOrdinal);
+    }
+  }
+  return ordinals;
+}
+
 async function* readNativeTranscriptJsonlSnapshot(
   config: NativeTranscriptJsonlReadSnapshot,
 ): AsyncGenerator<NativeTranscriptReadOutcome> {
@@ -842,6 +1019,11 @@ async function* readNativeTranscriptJsonlSnapshot(
     try {
       const parsed = parsedContainer(decodeRecord(bytes));
       assertJsonTreeSafe(parsed);
+      // Classified from the raw record: scrubbing rewrites keys as well as
+      // values, so the scrubbed payload cannot be trusted to carry "ordinal".
+      const inheritedHistory = config.inheritedBoundary === undefined
+        ? undefined
+        : isInheritedSubagentRecord(parsed, config.inheritedBoundary, sourceOrdinal);
       const nativePayload = config.scrubber.scrubJson(parsed);
       const canonicalPayload = canonicalNativeTranscriptJson(nativePayload);
       if (Buffer.byteLength(canonicalPayload, "utf8") > config.maxRecordBytes) {
@@ -870,6 +1052,7 @@ async function* readNativeTranscriptJsonlSnapshot(
           occurrence,
         ),
         nativePayload,
+        ...(inheritedHistory === undefined ? {} : { inheritedHistory }),
       };
       sourceOrdinal += 1;
       return outcome;
@@ -986,7 +1169,7 @@ function openValidatedSourceFile(
   }
   const fd = openSync(
     sourcePath,
-    constants.O_RDONLY | constants.O_NOFOLLOW,
+    constants.O_RDONLY | constants.O_NOFOLLOW | constants.O_NONBLOCK,
   );
   try {
     const descriptorStat = fstatSync(fd, { bigint: true });
@@ -1041,7 +1224,10 @@ export function createFileNativeTranscriptSource(
     readonly _beforeStreamForTesting?: () => void;
     /** @internal Deterministic mid-stream mutation seam. */
     readonly _afterChunkForTesting?: (chunkOrdinal: number) => void;
-    /** @internal Simulates filesystem change-cookie coalescing. */
+    /**
+     * @internal Simulates a filesystem whose descriptor metadata and ctime
+     * change cookie did not move; locator checks still run.
+     */
     readonly _forceMetadataUnchangedForTesting?: boolean;
   } = {},
 ): NativeTranscriptByteSource {
@@ -1071,32 +1257,41 @@ export function createFileNativeTranscriptSource(
       };
       const assertUnchanged = (): void => {
         assertOpen();
-        if (options._forceMetadataUnchangedForTesting) return;
-        const current = fstatSync(opened.fd, { bigint: true });
-        const descriptorChanged =
-          current.dev !== opened.device
-          || current.ino !== opened.inode
-          || current.mode !== opened.mode
-          || current.uid !== opened.userId
-          || current.gid !== opened.groupId
-          || current.size !== opened.sizeBytesExact
-          || current.mtimeNs !== opened.modifiedAtNs;
-        if (descriptorChanged) {
+        const current = options._forceMetadataUnchangedForTesting
+          ? undefined
+          : fstatSync(opened.fd, { bigint: true });
+        if (
+          current !== undefined
+          && (
+            current.dev !== opened.device
+            || current.ino !== opened.inode
+            || current.mode !== opened.mode
+            || current.uid !== opened.userId
+            || current.gid !== opened.groupId
+            || current.size !== opened.sizeBytesExact
+            || current.mtimeNs !== opened.modifiedAtNs
+          )
+        ) {
           throw new NativeTranscriptSourceChangedError();
         }
-        if (current.ctimeNs !== opened.changedAtNs) {
-          let locatorStillNamesOpenedFile = true;
-          try {
-            const locatorStat = statSync(sourcePath, { bigint: true });
-            locatorStillNamesOpenedFile =
-              locatorStat.dev === opened.device
-              && locatorStat.ino === opened.inode;
-          } catch {
-            // A missing or unreadable locator does not prove atomic replacement.
-          }
-          if (locatorStillNamesOpenedFile) {
-            throw new NativeTranscriptSourceChangedError();
-          }
+        // Filesystems such as ZFS can coalesce ctime, so the locator is
+        // checked on every call rather than only after a ctime change.
+        let locatorStat;
+        try {
+          locatorStat = statSync(sourcePath, { bigint: true });
+        } catch {
+          // A missing or unreadable locator does not prove atomic replacement.
+          throw new NativeTranscriptSourceChangedError();
+        }
+        if (
+          locatorStat.dev !== opened.device
+          || locatorStat.ino !== opened.inode
+        ) {
+          // Atomic replacement: the opened descriptor remains the bound source.
+          return;
+        }
+        if (current !== undefined && current.ctimeNs !== opened.changedAtNs) {
+          throw new NativeTranscriptSourceChangedError();
         }
       };
       const snapshot: NativeTranscriptSourceSnapshot = {
@@ -1482,6 +1677,17 @@ export interface ExactNativeTranscriptMessageResolver {
     readonly conversationId: number;
     readonly messageId: number;
   } | null>;
+  /**
+   * Optionally explain why {@link resolveExact} returned `null` for the same
+   * input. Implementations must return only a closed condition code and must
+   * not read a different repository view than `resolveExact`.
+   */
+  explainMiss?(input: {
+    readonly nativeSessionId: string;
+    readonly sessionSequence: number;
+    readonly role: MessageRole;
+    readonly content: string;
+  }): Promise<NativeTranscriptLinkMissCondition | "unresolved">;
 }
 
 /**
@@ -1507,14 +1713,18 @@ export function createExactNativeTranscriptMessageResolver(
     readonly role: MessageRole;
     readonly content: string;
   };
-  const snapshots = new Map<string, Promise<readonly ResolvedMessage[] | null>>();
+  type SessionSnapshot =
+    | { readonly kind: "empty" }
+    | { readonly kind: "invalid" }
+    | { readonly kind: "messages"; readonly messages: readonly ResolvedMessage[] };
+  const snapshots = new Map<string, Promise<SessionSnapshot>>();
   const loadSnapshot = async (
     nativeSessionId: string,
-  ): Promise<readonly ResolvedMessage[] | null> => {
+  ): Promise<SessionSnapshot> => {
     const rows = await messages.getNativeTranscriptMessageSnapshot(
       nativeSessionId,
     );
-    if (rows.length === 0) return null;
+    if (rows.length === 0) return { kind: "empty" };
     const seenConversationIds = new Set<number>();
     const sessionMessages: ResolvedMessage[] = [];
     let currentConversationId: number | undefined;
@@ -1529,17 +1739,28 @@ export function createExactNativeTranscriptMessageResolver(
         || message.messageSequence < 0
         || !isMessageRole(message.role)
         || message.content.includes("\0")
+        || (
+          message.isCompactionEvent !== undefined
+          && typeof message.isCompactionEvent !== "boolean"
+        )
       ) {
-        return null;
+        return { kind: "invalid" };
       }
       if (message.conversationId !== currentConversationId) {
-        if (seenConversationIds.has(message.conversationId)) return null;
+        if (seenConversationIds.has(message.conversationId)) {
+          return { kind: "invalid" };
+        }
         seenConversationIds.add(message.conversationId);
         currentConversationId = message.conversationId;
         expectedMessageSequence = 0;
       }
-      if (message.messageSequence !== expectedMessageSequence) return null;
+      if (message.messageSequence !== expectedMessageSequence) {
+        return { kind: "invalid" };
+      }
       expectedMessageSequence += 1;
+      // Compaction events occupy a sequence value but are not transcript
+      // messages, so they stay out of the transcript order.
+      if (message.isCompactionEvent) continue;
       sessionMessages.push({
         conversationId: message.conversationId,
         messageId: message.messageId,
@@ -1547,46 +1768,72 @@ export function createExactNativeTranscriptMessageResolver(
         content: message.content,
       });
     }
-    return sessionMessages;
+    return { kind: "messages", messages: sessionMessages };
+  };
+
+  type ExactInput = Parameters<
+    ExactNativeTranscriptMessageResolver["resolveExact"]
+  >[0];
+  const classify = async (
+    input: ExactInput,
+  ): Promise<
+    | {
+      readonly condition: NativeTranscriptLinkMissCondition;
+      readonly resolved?: undefined;
+    }
+    | {
+      readonly condition?: undefined;
+      readonly resolved: {
+        readonly conversationId: number;
+        readonly messageId: number;
+      };
+    }
+  > => {
+    if (
+      !Number.isSafeInteger(input.sessionSequence)
+      || input.sessionSequence < 0
+      || !isMessageRole(input.role)
+      || input.nativeSessionId.length === 0
+      || input.nativeSessionId.includes("\0")
+      || input.content.includes("\0")
+    ) {
+      return { condition: "invalid-input" };
+    }
+    let snapshot = snapshots.get(input.nativeSessionId);
+    if (!snapshot) {
+      const loading = loadSnapshot(input.nativeSessionId);
+      const cached = loading.catch((error: unknown) => {
+        snapshots.delete(input.nativeSessionId);
+        throw error;
+      });
+      snapshots.set(input.nativeSessionId, cached);
+      snapshot = cached;
+    }
+    const sessionSnapshot = await snapshot;
+    if (sessionSnapshot.kind === "empty") {
+      return { condition: "session-not-found" };
+    }
+    if (sessionSnapshot.kind === "invalid") {
+      return { condition: "invalid-session-snapshot" };
+    }
+    const message = sessionSnapshot.messages[input.sessionSequence];
+    if (!message) return { condition: "sequence-out-of-range" };
+    if (message.role !== input.role) return { condition: "role-mismatch" };
+    if (message.content !== input.content) {
+      return { condition: "content-mismatch" };
+    }
+    return {
+      resolved: {
+        conversationId: message.conversationId,
+        messageId: message.messageId,
+      },
+    };
   };
 
   return {
-    resolveExact: async (input) => {
-      if (
-        !Number.isSafeInteger(input.sessionSequence)
-        || input.sessionSequence < 0
-        || !isMessageRole(input.role)
-        || input.nativeSessionId.length === 0
-        || input.nativeSessionId.includes("\0")
-        || input.content.includes("\0")
-      ) {
-        return null;
-      }
-      let snapshot = snapshots.get(input.nativeSessionId);
-      if (!snapshot) {
-        const loading = loadSnapshot(input.nativeSessionId);
-        const cached = loading.catch((error: unknown) => {
-          snapshots.delete(input.nativeSessionId);
-          throw error;
-        });
-        snapshots.set(input.nativeSessionId, cached);
-        snapshot = cached;
-      }
-      const sessionMessages = await snapshot;
-      if (!sessionMessages) return null;
-      const message = sessionMessages[input.sessionSequence];
-      if (
-        !message
-        || message.role !== input.role
-        || message.content !== input.content
-      ) {
-        return null;
-      }
-      return {
-        conversationId: message.conversationId,
-        messageId: message.messageId,
-      };
-    },
+    resolveExact: async (input) => (await classify(input)).resolved ?? null,
+    explainMiss: async (input) =>
+      (await classify(input)).condition ?? "unresolved",
   };
 }
 
@@ -1680,6 +1927,12 @@ export interface NativeTranscriptBackfillOptions {
   readonly projectPatterns: readonly string[];
   readonly pipelineVersion?: string;
   readonly messageMapper?: NativeTranscriptMessageMapper;
+  /**
+   * Built-in Codex option: records a forked subagent inherited map to no
+   * messages (they stay stored, unlinked). Unlike a messageMapper it keeps
+   * quarantine-gap recovery.
+   */
+  readonly codexInheritedBoundary?: CodexInheritedBoundaryInput;
   readonly messageResolver: ExactNativeTranscriptMessageResolver;
   readonly batchSize?: number;
   readonly clock?: () => Date;
@@ -1718,6 +1971,7 @@ interface NativeTranscriptBackfillSnapshot {
   readonly batchSize: number;
   readonly clock: (() => Date) | undefined;
   readonly maxRecordBytes: number | undefined;
+  readonly inheritedBoundary: CodexInheritedBoundary | undefined;
 }
 
 function snapshotNativeTranscriptBackfillOptions(
@@ -1798,6 +2052,10 @@ function snapshotNativeTranscriptBackfillOptions(
     || typeof messageResolver !== "object"
     || typeof messageResolver.resolveExact !== "function"
     || (
+      messageResolver.explainMiss !== undefined
+      && typeof messageResolver.explainMiss !== "function"
+    )
+    || (
       callerMapper !== undefined
       && (
         callerMapper === null
@@ -1812,7 +2070,12 @@ function snapshotNativeTranscriptBackfillOptions(
   if (clientName !== format.clientName) {
     throw new NativeTranscriptConfigurationError("invalid-input");
   }
+  const inheritedBoundary = snapshotInheritedBoundary(
+    options.codexInheritedBoundary,
+    format,
+  );
   const mapper = callerMapper ?? createNativeTranscriptMessageMapper();
+  const explainMiss = messageResolver.explainMiss;
   return Object.freeze({
     repository: Object.freeze({
       getCheckpoint: repository.getCheckpoint.bind(repository),
@@ -1838,10 +2101,12 @@ function snapshotNativeTranscriptBackfillOptions(
     hasCustomMessageMapper: callerMapper !== undefined,
     messageResolver: Object.freeze({
       resolveExact: messageResolver.resolveExact.bind(messageResolver),
+      explainMiss: explainMiss?.bind(messageResolver),
     }),
     batchSize,
     clock,
     maxRecordBytes,
+    inheritedBoundary,
   });
 }
 
@@ -1858,6 +2123,19 @@ function assertMetadata(
   return metadata;
 }
 
+async function explainLinkMiss(
+  resolver: ExactNativeTranscriptMessageResolver,
+  lookup: Parameters<ExactNativeTranscriptMessageResolver["resolveExact"]>[0],
+): Promise<NativeTranscriptLinkCondition> {
+  if (!resolver.explainMiss) return "unresolved";
+  try {
+    const condition = await resolver.explainMiss(lookup);
+    return isLinkMissCondition(condition) ? condition : "unresolved";
+  } catch {
+    return "unresolved";
+  }
+}
+
 async function messageLinks(
   record: PreparedNativeTranscriptRecord,
   candidates: readonly (
@@ -1867,13 +2145,19 @@ async function messageLinks(
 ): Promise<CreateNativeTranscriptMessageLinkInput[]> {
   const links: CreateNativeTranscriptMessageLinkInput[] = [];
   for (const candidate of candidates) {
-    const resolved = await resolver.resolveExact({
+    const lookup = {
       nativeSessionId: record.nativeSessionId,
       sessionSequence: candidate.sessionSequence,
       role: candidate.role,
       content: candidate.content,
-    });
-    if (!resolved) throw new NativeTranscriptLinkError(record.sourceOrdinal);
+    };
+    const resolved = await resolver.resolveExact(lookup);
+    if (!resolved) {
+      throw new NativeTranscriptLinkError(candidate.sourceOrdinal, {
+        condition: await explainLinkMiss(resolver, lookup),
+        sessionSequence: candidate.sessionSequence,
+      });
+    }
     assertSafeNonnegative(resolved.conversationId);
     assertSafeNonnegative(resolved.messageId);
     links.push({
@@ -1896,6 +2180,11 @@ function mappedMessageCandidates(
   )[];
   readonly nextSessionSequence: number;
 } {
+  // Inherited parent history stays stored but unlinked, so it never takes a
+  // place in the session-wide message order of the subagent's own history.
+  if (record.inheritedHistory === true) {
+    return { candidates: [], nextSessionSequence: startingSessionSequence };
+  }
   const candidates = mapper.map(
     format,
     cloneNativePayload(record.nativePayload),
@@ -2030,7 +2319,9 @@ export async function runNativeTranscriptBackfill(
         };
       }
       if (config.hasCustomMessageMapper || candidates.length !== 1) {
-        throw new NativeTranscriptLinkError(record.sourceOrdinal);
+        throw new NativeTranscriptLinkError(record.sourceOrdinal, {
+          condition: "unsupported-pending-after-quarantine",
+        });
       }
       const lastCandidateSequence =
         nextSessionSequence + pendingQuarantinedRecords;
@@ -2052,10 +2343,18 @@ export async function runNativeTranscriptBackfill(
           content: candidate.content,
         });
         if (!resolved) continue;
-        if (match) throw new NativeTranscriptLinkError(record.sourceOrdinal);
+        if (match) {
+          throw new NativeTranscriptLinkError(record.sourceOrdinal, {
+            condition: "ambiguous-pending-match",
+          });
+        }
         match = { ...resolved, sessionSequence };
       }
-      if (!match) throw new NativeTranscriptLinkError(record.sourceOrdinal);
+      if (!match) {
+        throw new NativeTranscriptLinkError(record.sourceOrdinal, {
+          condition: "unmatched-pending-window",
+        });
+      }
       pendingQuarantinedRecords = 0;
       return {
         links: [{
@@ -2158,6 +2457,7 @@ export async function runNativeTranscriptBackfill(
       scrubber,
       clock: config.clock,
       maxRecordBytes: config.maxRecordBytes,
+      codexInheritedBoundary: config.inheritedBoundary,
       progressStartByteOffset: committedByteOffset,
       onProgress: (progress) => {
         progressState.latest = progress;

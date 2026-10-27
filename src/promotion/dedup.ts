@@ -54,14 +54,16 @@ type DedupParams = {
 }) | { store: LegacyDedupStore; projectId: string });
 
 function isDuplicateCandidate(
-  candidate: { content: string; rank: number },
+  candidate: { content: string },
   content: string,
-  bm25Threshold: number,
 ): boolean {
-  // Exact byte-for-byte content identity always deduplicates, regardless of
-  // rank sign. Nonidentical candidates must clear the negative BM25 threshold.
-  if (candidate.content === content) return true;
-  return candidate.rank < 0 && candidate.rank <= -bm25Threshold;
+  // A merge keeps the canonical content and discards the incoming text, so
+  // only byte-for-byte identical content may merge, whatever the candidate's
+  // rank. A lexical match is not evidence of duplication: BM25 grows with the
+  // number of matched rare terms, so a long text can outrank any threshold
+  // against an unrelated memory. dedupBm25Threshold is still accepted but no
+  // longer influences this decision.
+  return candidate.content === content;
 }
 
 export async function deduplicateAndInsert(params: DedupParams): Promise<string> {
@@ -106,9 +108,8 @@ export async function deduplicateAndInsert(params: DedupParams): Promise<string>
     params.projectId,
   );
 
-  // Exact identity is authoritative; only nonidentical ranked matches need the BM25 threshold.
   const duplicates = candidates.filter(
-    (candidate) => isDuplicateCandidate(candidate, content, thresholds.dedupBm25Threshold),
+    (candidate) => isDuplicateCandidate(candidate, content),
   );
 
   if (duplicates.length === 0) {
@@ -188,7 +189,7 @@ export async function deduplicateAndInsertInRepositories(
     ? [...exactCandidate, ...candidates]
     : candidates;
   const duplicates = combinedCandidates.filter(
-    (candidate) => isDuplicateCandidate(candidate, input.content, input.thresholds.dedupBm25Threshold),
+    (candidate) => isDuplicateCandidate(candidate, input.content),
   );
   if (duplicates.length === 0) {
     return repositories.promotedMemory.insert({

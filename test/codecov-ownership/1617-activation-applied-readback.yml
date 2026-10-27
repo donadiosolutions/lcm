@@ -1,0 +1,9 @@
+references: ["#1617"]
+rationale: >-
+  Migration activation confirms an interrupted run as applied only when the
+  live configuration and project map match the published witnesses, and as not
+  applied only when they still match the pre-publication source; any other
+  state is unknown. The orchestrator stays in migration cutover. No production
+  file is added, removed, moved, or re-owned.
+pins:
+  - ["src/migration/activate-generation.ts", "unit-migration-cutover"]

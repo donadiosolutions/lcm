@@ -11,10 +11,12 @@ import {
   isBackendPublicationEvidenceMissing,
   isBackendPublicationJournalError,
 } from "./publication-fence.js";
+import { resolveHookSessionScope } from "./subagent-scope.js";
 
 interface PostToolHookInput {
   client?: unknown;
   session_id?: unknown;
+  agent_id?: unknown;
   tool_name?: unknown;
   tool_input?: unknown;
   tool_response?: unknown;
@@ -40,9 +42,11 @@ export async function handlePostToolUse(
   let enqueued = false;
   try {
     const input = JSON.parse(stdin) as PostToolHookInput;
-    const { session_id, tool_name } = input;
+    const { tool_name } = input;
+    // A Codex subagent's tool use belongs to the child thread, not the tree.
+    const sessionId = resolveHookSessionScope(input as Record<string, unknown>).sessionId;
 
-    if (typeof tool_name !== "string" || typeof session_id !== "string") return { exitCode: 0, stdout: "" };
+    if (typeof tool_name !== "string" || sessionId === undefined) return { exitCode: 0, stdout: "" };
 
     const extractedEvents = extractPostToolEvents(normalizePostToolInput(input));
     if (extractedEvents.length === 0) return { exitCode: 0, stdout: "" };
@@ -63,7 +67,7 @@ export async function handlePostToolUse(
 
     await appendLocalHookEvents({
       cwd: resolvedCwd,
-      sessionId: session_id,
+      sessionId,
       events,
       sourceHook: "PostToolUse",
     });

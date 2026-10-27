@@ -238,9 +238,13 @@ An unsupported corpus fails as a whole. The adapters do not silently replace
 identities, coerce incompatible values, discard unsupported domains or export
 a partial manifest as complete. Correct the source or choose a compatible
 new generation before retrying a non-retryable refusal. PostgreSQL passive-event
-envelopes must have the supported seven keys and their native field types;
-unknown envelope fields are refused rather than silently discarded. The `data`
-string stays opaque, and event disposition normalization remains unchanged.
+envelopes must have the supported seven keys and their native field types. An
+envelope may also carry the replication pointer `previousEventId`, absent, JSON
+null or a positive integer; the export accepts it and leaves it out of the
+portable record, as the SQLite source omits its local pointer. Any other
+unknown envelope field, or another pointer value, is refused rather than
+silently discarded. The `data` string stays opaque, and event disposition
+normalization remains unchanged.
 
 Readers use an owned disk index for ordering, logical identities, dependency
 checks and duplicate conversation occurrence assignment. The index stores
@@ -296,6 +300,15 @@ slower to complete but does not load itself into memory.
 A run started before the upgrade that adds this check (schema migration 0008)
 carries no per-record content fingerprints and cannot complete. Copy it again
 into a fresh isolated destination.
+
+The portable schema digest also changes in the release that records a
+conversation's parent session (schema migration 0009; see
+[Portable record stream](portable-record-stream.md)). A transfer run, manifest
+or checkpoint produced by an older LCM fails closed with
+`incompatible-schema` under the new binary. Finish or abandon in-flight
+transfers before upgrading, then rerun them with the new binary. Copying again
+after a parent was recorded needs a fresh destination, because that
+conversation's record digest changes while its identity does not.
 
 The recheck belongs to the transition into the completed state. After a run
 has completed, later legitimate edits to the project do not make its completed

@@ -13,7 +13,8 @@ import { PACKAGED_RUNTIME_ENTRYPOINT, PKG_VERSION, RUNTIME_DIGEST } from "../src
 
 const defaultDaemon = vi.hoisted(() => vi.fn().mockResolvedValue({ connected: true }));
 const homeMock = vi.hoisted(() => ({ homeDir: "" }));
-vi.mock("../src/daemon/lifecycle.js", () => ({ ensureDaemon: defaultDaemon }));
+const defaultVerify = vi.hoisted(() => vi.fn().mockResolvedValue(null));
+vi.mock("../src/daemon/lifecycle.js", () => ({ ensureDaemon: defaultDaemon, verifyRunningDaemon: defaultVerify }));
 vi.mock("node:os", async () => {
   const actual = await vi.importActual<typeof import("node:os")>("node:os");
   return { ...actual, homedir: () => homeMock.homeDir };
@@ -43,6 +44,38 @@ function makeDeps(overrides: Partial<EnsureCoreDeps> = {}): EnsureCoreDeps {
 }
 
 describe("ensureCore", () => {
+  it("lets a caller-supplied admission retry replace the dependency's own for endpoint and bootstrap", async () => {
+    const own = vi.fn(async <T>(step: () => T | Promise<T>) => await step());
+    const supplied = vi.fn(async <T>(step: () => T | Promise<T>) => await step());
+    const ensureDaemon = vi.fn().mockResolvedValue({ connected: true });
+    const flagDir = join(publicationRoot, "tmp");
+    const makeBootstrapDeps = () => ({
+      ...makeDeps({
+        ensureRuntimeHome: vi.fn(),
+        _withPublicationAdmissionRetry: own,
+        ensureDaemon,
+      }),
+      flagExists: vi.fn().mockReturnValue(false),
+      writeFlag: vi.fn(),
+    });
+    const { ensureCoreEndpoint, ensureBootstrapped } = await import("../src/bootstrap.js");
+    mkdirSync(flagDir, { recursive: true, mode: 0o700 });
+
+    await expect(ensureCoreEndpoint(makeDeps({
+      ensureRuntimeHome: vi.fn(),
+      _withPublicationAdmissionRetry: own,
+      ensureDaemon,
+    }), supplied)).resolves.toMatchObject({ connected: true });
+    expect(supplied).toHaveBeenCalledTimes(3);
+    expect(own).not.toHaveBeenCalled();
+
+    supplied.mockClear();
+    await expect(ensureBootstrapped("retry-session", makeBootstrapDeps(), supplied)).resolves.toBe(true);
+    expect(supplied).toHaveBeenCalledTimes(3);
+    expect(own).not.toHaveBeenCalled();
+    expect(ensureDaemon).toHaveBeenLastCalledWith(expect.objectContaining({ _withPublicationAdmissionRetry: supplied }));
+  });
+
   it("threads one publication admission wrapper through every core edge", async () => {
     const admission = vi.fn(async <T>(step: () => T | Promise<T>) => await step());
     const ensureRuntimeHome = vi.fn();
@@ -453,5 +486,118 @@ describe("ensureBootstrapped", () => {
       writeFlag,
     })).resolves.toBe(false);
     expect(writeFlag).not.toHaveBeenCalled();
+  });
+});
+
+describe("verifyCoreEndpoint", () => {
+  const verifyDir = mkdtempSync(join(tmpdir(), "lcm-bootstrap-verify-"));
+  afterAll(() => rmSync(verifyDir, { recursive: true, force: true }));
+  const home = (name: string): string => {
+    const dir = join(verifyDir, name);
+    mkdirSync(dir, { mode: 0o700 });
+    return dir;
+  };
+
+  it("verifies the daemon named by the existing config without writing anything", async () => {
+    const dir = home("present");
+    const configPath = join(dir, "config.json");
+    writeFileSync(configPath, JSON.stringify({ daemon: { port: 4242 } }), { mode: 0o600 });
+    const verifyRunningDaemon = vi.fn().mockResolvedValue({ port: 4242, token: "tok" });
+    const signal = new AbortController().signal;
+    const { verifyCoreEndpoint } = await import("../src/bootstrap.js");
+
+    await expect(verifyCoreEndpoint({ budgetMs: 321, signal }, {
+      configPath,
+      binaryPath: "/opt/lcm/dist/lcm.mjs",
+      verifyRunningDaemon,
+    })).resolves.toEqual({ port: 4242, token: "tok" });
+
+    expect(verifyRunningDaemon).toHaveBeenCalledWith({
+      port: 4242,
+      pidFilePath: join(dir, "daemon.pid"),
+      expectedVersion: PKG_VERSION,
+      expectedStorageBackend: "sqlite",
+      expectedEntrypoint: "/opt/lcm/dist/lcm.mjs",
+      expectedRuntimeDigest: RUNTIME_DIGEST,
+      budgetMs: 321,
+      signal,
+    });
+    expect(fsExistsSync(join(dir, "daemon.pid"))).toBe(false);
+    expect(fsExistsSync(join(dir, "daemon.token"))).toBe(false);
+  });
+
+  it("reads the config without an owner check on platforms that have no user ids", async () => {
+    const dir = home("no-uid");
+    const configPath = join(dir, "config.json");
+    writeFileSync(configPath, "{}", { mode: 0o600 });
+    const verifyRunningDaemon = vi.fn().mockResolvedValue({ port: 3737, token: "tok" });
+    const { verifyCoreEndpoint } = await import("../src/bootstrap.js");
+    const getuid = Object.getOwnPropertyDescriptor(process, "getuid")!;
+    Object.defineProperty(process, "getuid", { value: undefined, configurable: true });
+    try {
+      await expect(verifyCoreEndpoint({ budgetMs: 100 }, {
+        configPath,
+        binaryPath: "/opt/lcm/dist/lcm.mjs",
+        verifyRunningDaemon,
+      })).resolves.toEqual({ port: 3737, token: "tok" });
+    } finally {
+      Object.defineProperty(process, "getuid", getuid);
+    }
+  });
+
+  it("refuses, without creating a config, when there is none", async () => {
+    const dir = home("absent");
+    const verifyRunningDaemon = vi.fn();
+    const { verifyCoreEndpoint } = await import("../src/bootstrap.js");
+    await expect(verifyCoreEndpoint({ budgetMs: 100 }, {
+      configPath: join(dir, "config.json"),
+      binaryPath: "/opt/lcm/dist/lcm.mjs",
+      verifyRunningDaemon,
+    })).resolves.toBeNull();
+    expect(verifyRunningDaemon).not.toHaveBeenCalled();
+    expect(fsExistsSync(join(dir, "config.json"))).toBe(false);
+  });
+
+  it.each([
+    ["a config readable by others", "{}", 0o644],
+    ["an invalid config", "{", 0o600],
+  ])("refuses %s", async (_name, content, mode) => {
+    const dir = home(`bad-${mode}-${content.length}`);
+    const configPath = join(dir, "config.json");
+    writeFileSync(configPath, content, { mode });
+    chmodSync(configPath, mode);
+    const verifyRunningDaemon = vi.fn();
+    const { verifyCoreEndpoint } = await import("../src/bootstrap.js");
+    await expect(verifyCoreEndpoint({ budgetMs: 100 }, {
+      configPath,
+      binaryPath: "/opt/lcm/dist/lcm.mjs",
+      verifyRunningDaemon,
+    })).resolves.toBeNull();
+    expect(verifyRunningDaemon).not.toHaveBeenCalled();
+  });
+
+  it("refuses when the verifier throws", async () => {
+    const dir = home("throws");
+    const configPath = join(dir, "config.json");
+    writeFileSync(configPath, "{}", { mode: 0o600 });
+    const { verifyCoreEndpoint } = await import("../src/bootstrap.js");
+    await expect(verifyCoreEndpoint({ budgetMs: 100 }, {
+      configPath,
+      binaryPath: "/opt/lcm/dist/lcm.mjs",
+      verifyRunningDaemon: vi.fn().mockRejectedValue(new Error("boom")),
+    })).resolves.toBeNull();
+  });
+
+  it("uses the installed lifecycle verifier and the canonical config by default", async () => {
+    defaultVerify.mockClear();
+    const canonical = join(publicationRoot, "config.json");
+    writeFileSync(canonical, "{}", { mode: 0o600 });
+    const { verifyCoreEndpoint } = await import("../src/bootstrap.js");
+    try {
+      await expect(verifyCoreEndpoint({ budgetMs: 100 })).resolves.toBeNull();
+    } finally {
+      rmSync(canonical, { force: true });
+    }
+    expect(defaultVerify).toHaveBeenCalledOnce();
   });
 });

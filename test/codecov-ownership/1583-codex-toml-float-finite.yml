@@ -1,0 +1,7 @@
+references: ["#1583"]
+rationale: >-
+  #1583 makes the Codex config.toml scanner reject floats that overflow f64,
+  as toml 0.9 does; the change is confined to the existing scanner, so it
+  keeps its established owner.
+pins:
+  - ["src/connectors/codex-config-toml.ts", "unit-connectors"]

@@ -4,9 +4,10 @@ import { dirname, join } from 'node:path';
 import { DatabaseSync } from 'node:sqlite';
 import { createGitFixture } from '../../surface-parity/git-fixture.mjs';
 
-const HOOKS = ['restore', 'session-end', 'user-prompt', 'post-tool', 'session-snapshot'];
+const HOOKS = ['restore', 'session-end', 'user-prompt', 'post-tool', 'pre-tool', 'session-snapshot'];
 const INSTRUCTION = 'Parity hook instruction: preserve the orchard watering schedule.';
 const NEEDLE = 'quince espalier pollination orchard';
+const PRE_TOOL_NEEDLE = 'tangerine trellis rootstock budding';
 
 function executedAssertions(id) {
   if (id.startsWith('cli:')) return ['arguments', 'result', 'effects'];
@@ -22,8 +23,8 @@ function record(context, id, observation) {
   return { id, assertions, verdict: 'passed', observation };
 }
 
-async function hook(context, command, payload) {
-  const result = await context.cli([command, '--client', 'claude'], {
+async function hook(context, command, payload, client = 'claude') {
+  const result = await context.cli([command, '--client', client], {
     cwd: context.projectPath, stdin: JSON.stringify(payload),
   });
   const failureClass = ['contention', 'publication', 'daemon', 'database', 'SQLITE', 'bootstrap'].filter(term => result.stderr.includes(term)).join('-') || 'unclassified';
@@ -170,7 +171,13 @@ async function runHooks(context) {
       completionCount = row === null ? 'missing' : String(row.messageCount);
       return row?.messageCount === 2;
     }, 'session-end:completion-persisted');
-  } catch { assert.fail(`surface-parity:session-end:completion-${completionCount}`); }
+  } catch {
+    if (completionCount !== 'missing') assert.fail(`surface-parity:session-end:completion-${completionCount}`);
+    const reason = /^lcm: session completion was not acknowledged \((timeout|unavailable|status-[1-5]\d\d)\)$/m.exec(endResult.stderr)?.[1];
+    assert.fail(reason === undefined
+      ? 'surface-parity:session-end:completion-missing-unreported'
+      : `surface-parity:session-end:completion-missing-unacknowledged-${reason}`);
+  }
   observations.push(record(context, 'cli:session-end', { exit: endResult.code, persisted: 2, completionRecorded: true, outbox: 'sqlite-local' }));
   await context.isolateAsyncWork();
 
@@ -197,6 +204,30 @@ async function runHooks(context) {
   ]) await post(context, '/store', { cwd: context.projectPath, text, tags: ['parity-hook-background'] });
   const stored = await post(context, '/store', { cwd: context.projectPath, text: NEEDLE, tags: ['parity-hook-recall'] });
   assert.equal(stored.stored, true);
+
+  // Opt-in Codex PreToolUse hint: enable the setting through the public config
+  // command (it keeps publication evidence authentic), store a memory whose
+  // terms equal the query derived from an apply_patch file path, then run the
+  // real hook with a Codex-shaped payload.
+  const enabled = await context.cli(['config', 'set', 'hooks.preToolRecall', 'true', '--json'], { cwd: context.projectPath });
+  assert.equal(enabled.code, 0, 'surface-parity:pre-tool:enable-setting');
+  const preToolStored = await post(context, '/store', { cwd: context.projectPath, text: PRE_TOOL_NEEDLE, tags: ['parity-pre-tool-recall'] });
+  assert.equal(preToolStored.stored, true);
+  const preTool = await hook(context, 'pre-tool', {
+    cwd: context.projectPath, session_id: 'parity-pre-tool-cli', hook_event_name: 'PreToolUse',
+    tool_name: 'apply_patch', tool_use_id: 'parity-pre-tool-call',
+    tool_input: { command: '*** Begin Patch\n*** Update File: budding/rootstock-trellis-tangerine.ts\n@@\n-old\n+new\n*** End Patch' },
+  }, 'codex');
+  const preToolOutput = JSON.parse(preTool.stdout);
+  assert.deepEqual(Object.keys(preToolOutput), ['hookSpecificOutput'], 'surface-parity:pre-tool:output-shape');
+  assert.deepEqual(Object.keys(preToolOutput.hookSpecificOutput), ['hookEventName', 'additionalContext']);
+  assert.equal(preToolOutput.hookSpecificOutput.hookEventName, 'PreToolUse');
+  assert.ok(preToolOutput.hookSpecificOutput.additionalContext.includes(PRE_TOOL_NEEDLE), 'surface-parity:pre-tool:recalled-context');
+  const preToolFeedback = await context.readProject(context.projectId, storage => storage.recall.getFeedback([preToolStored.id]));
+  assert.ok(preToolFeedback.get(preToolStored.id)?.surfacingCount > 0, 'surface-parity:pre-tool:surfacing-recorded');
+  observations.push(record(context, 'cli:pre-tool', { exit: preTool.code, additionalContextReturned: true, surfacingRecorded: true }));
+  await context.isolateAsyncWork();
+
   const invalidSearch = await post(context, '/prompt-search', {});
   assert.deepEqual(invalidSearch, { hints: [] });
   const promptSearch = await post(context, '/prompt-search', {
@@ -391,6 +422,7 @@ export function expectedHookObservations(backend) {
     'cli:session-snapshot': { exit: 0, persisted: 2, duplicateFree: true, outbox: 'sqlite-local' },
     'cli:post-tool': { exit: 0, events: 1, priority: 3, outbox: 'sqlite-local' },
     'cli:user-prompt': { exit: 0, recalledContext: true, decisionCaptured: true, surfacingRecorded: true, outbox: 'sqlite-local' },
+    'cli:pre-tool': { exit: 0, additionalContextReturned: true, surfacingRecorded: true },
     'cli:promote': { exit: 0, dryRunNoWrites: true, ordinaryProvenance: 'local-project-hash', memoryCreated: true },
     'daemon:POST /promote': { admissionStatus: 401, invalidStatus: 400, repeatPromoted: 0, singlePassiveEventReinforcesSameMemory: true, provenanceRetained: true, immediateTiers: [1, 2], patternOccurrences: 3, patternSessions: 2 },
     'daemon:POST /review-stale': { admissionStatus: 401, invalidStatus: 400, staleCountConsistent: true, archived: 'archived', revived: 'revived' },

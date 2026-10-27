@@ -13,7 +13,7 @@ const CASES = {
   'sensitive-files': ['sensitive', ['sensitive']],
   'promotion-root': ['promotion', ['promotion']],
 };
-export const SCENARIO_ORDER = ['identity', 'admin', 'events', 'memory', 'compaction', 'native-import', 'knowledge', 'sensitive', 'hooks', 'promotion', 'diagnostics', 'fault-denial', 'fault-pool', 'fault-cancellation', 'fault-unavailable'];
+export const SCENARIO_ORDER = ['identity', 'admin', 'migration', 'events', 'memory', 'compaction', 'native-import', 'knowledge', 'sensitive', 'hooks', 'promotion', 'diagnostics', 'fault-denial', 'fault-pool', 'fault-cancellation', 'fault-unavailable'];
 const CASE_ORDER = Object.keys(CASES);
 const uuid = value => typeof value === 'string' && /^[a-f0-9]{8}-[a-f0-9]{4}-7[a-f0-9]{3}-[89ab][a-f0-9]{3}-[a-f0-9]{12}$/u.test(value);
 const hash = value => createHash('sha256').update(value).digest('hex');

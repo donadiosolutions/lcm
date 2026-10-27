@@ -36,8 +36,9 @@ bounded fuzzy candidate page or the content carries no searchable lexical
 terms, on both backends: PostgreSQL matches across the bound project's
 whole provenance, and SQLite matches within its existing source-scoped
 boundary. Repeating the same document then uses its stored retry identities
-to skip already accepted entries. Nonidentical content still requires the
-configured deduplication threshold.
+to skip already accepted entries. Content that is not exactly the same text
+does not merge in the deduplication decision, however similar its wording or
+however well it ranks in search.
 
 Compaction-driven promotion (`lcm promote`, including the promote step that
 runs after `lcm compact`) makes the same owner-scoped decision on every

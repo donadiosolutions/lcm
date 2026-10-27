@@ -15,8 +15,11 @@ import { namespaceUidForParentUid, parseHomeParentWitness, parseUidMap } from ".
 const enabled = process.platform === "linux"
   && process.env.LCM_RUNTIME_PATHS_SYSTEMD_INTEGRATION === "1";
 const sentinel = "LCM_RUNTIME_PATHS_SYSTEMD_SENTINEL=admitted";
+const SYSTEMD_RUN_TIMEOUT_MS = 30_000;
 
 describe.runIf(enabled)("runtime paths user-systemd namespace integration", () => {
+  // The synchronous systemd-run spawn may block for its full bound; the test
+  // timeout must exceed it, plus margin for fixture setup and assertions.
   it("bootstraps the constrained user-systemd path without a preseeded witness", () => {
     const runRoot = process.env.LCM_RUNTIME_PATHS_SYSTEMD_RUN_ROOT;
     if (runRoot === undefined || runRoot.length === 0) {
@@ -82,7 +85,7 @@ describe.runIf(enabled)("runtime paths user-systemd namespace integration", () =
         `--property=WorkingDirectory=${process.cwd()}`,
         `--setenv=HOME=${home}`,
         process.execPath, "--input-type=module", "-e", child,
-      ], { encoding: "utf8", timeout: 30_000, env: { ...process.env, HOME: home } });
+      ], { encoding: "utf8", timeout: SYSTEMD_RUN_TIMEOUT_MS, env: { ...process.env, HOME: home } });
 
       if (result.error !== undefined) {
         throw new Error(`user-systemd child could not be started: ${result.error.message}`);
@@ -107,5 +110,5 @@ describe.runIf(enabled)("runtime paths user-systemd namespace integration", () =
     } finally {
       rmSync(home, { recursive: true, force: true });
     }
-  });
+  }, SYSTEMD_RUN_TIMEOUT_MS + 30_000);
 });

@@ -70,6 +70,16 @@ const COLORS = {
   dim: "\x1b[2m",
   nc: "\x1b[0m",
 };
+const QUERY_STATISTICS_STATUSES = [
+  "not-applicable", "disabled", "unavailable", "permission-denied", "timeout",
+  "stale", "reset", "partial", "observed",
+] as const;
+
+function queryStatisticsStatus(value: unknown): (typeof QUERY_STATISTICS_STATUSES)[number] {
+  return typeof value === "string" && QUERY_STATISTICS_STATUSES.includes(
+    value as (typeof QUERY_STATISTICS_STATUSES)[number],
+  ) ? value as (typeof QUERY_STATISTICS_STATUSES)[number] : "unavailable";
+}
 
 async function collectBackendSnapshot(homeDir: string): Promise<BackendDiagnosticSnapshot> {
   try {
@@ -707,6 +717,19 @@ export async function runDoctor(overrides?: Partial<DoctorDeps>, doctorOptions: 
         : backendDiagnostics.classification === "degraded" ? "warn" : "fail",
       message: renderBackendDiagnostics(backendDiagnostics),
       backendDiagnostics,
+    });
+    const queryStatistics = queryStatisticsStatus(
+      backendDiagnostics.telemetry?.statements?.status,
+    );
+    const queryStatisticsReady = queryStatistics === "observed"
+      || queryStatistics === "not-applicable";
+    results.push({
+      name: "query-statistics",
+      category: "Storage",
+      status: queryStatisticsReady ? "pass" : "warn",
+      message: queryStatisticsReady
+        ? `Query statistics: ${queryStatistics}`
+        : `Query statistics: ${queryStatistics}. Production certification requires observed query statistics; application operation is unaffected.`,
     });
     const config = loadConfig(deps);
     const publicationBlocked = checkBackendPublicationAdmission(results, config);

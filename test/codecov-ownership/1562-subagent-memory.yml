@@ -1,0 +1,57 @@
+references: ["#1562"]
+rationale: >-
+  Adds src/hooks/subagent-scope.ts, the pure helper that keys a Codex
+  subagent hook payload by its own thread id, to the hook handlers it serves;
+  the directory-level hooks owner already covers it, so there is no topology
+  change. src/hooks/restore.ts, session-snapshot.ts, post-tool.ts,
+  user-prompt.ts and dispatch.ts are materially changed and keep that owner.
+  src/connectors/codex-hooks.ts (SubagentStart and SubagentStop registration)
+  is materially changed and keeps its connectors owner.
+  src/codex-transcript.ts, src/transcript-provider.ts and
+  src/storage/native-transcript-ingest.ts (inherited subagent history) are
+  materially changed and keep their transcript import owner, and
+  src/daemon/routes/ingest.ts (history mode choice) keeps its daemon routes
+  owner. src/storage/contracts.ts and the transaction wiring in
+  src/storage/postgresql/project-storage.ts (a read-only native provenance
+  seam) are materially changed and keep their storage abstractions owner;
+  src/storage/sqlite/native-transcript-repository.ts and
+  src/storage/sqlite/project-storage.ts keep their local persistence owner, and
+  src/storage/postgresql/native-transcript-repository.ts keeps its PostgreSQL
+  transcripts owner. The immediate-parent column (conversations.parent_session_id)
+  materially changes src/store/conversation-store.ts,
+  src/storage/sqlite/repositories.ts, src/db/migration.ts,
+  src/storage/sqlite/portable-source.ts and
+  src/storage/sqlite/portable-runtime-mapping.ts, which keep their local
+  persistence owner; src/storage/portable-record.ts, which keeps its storage
+  abstractions owner; src/storage/postgresql/conversation-repository.ts, which
+  keeps its PostgreSQL conversations owner; src/storage/postgresql/migrations.ts
+  and src/storage/postgresql/runtime-readiness.ts, which keep their PostgreSQL
+  schema owner; and src/storage/postgresql/portable-mapping.ts, which keeps its
+  PostgreSQL portable owner. No file is removed, moved or re-owned.
+pins:
+  - ["src/hooks/subagent-scope.ts", "unit-hooks"]
+  - ["src/hooks/restore.ts", "unit-hooks"]
+  - ["src/hooks/session-snapshot.ts", "unit-hooks"]
+  - ["src/hooks/post-tool.ts", "unit-hooks"]
+  - ["src/hooks/user-prompt.ts", "unit-hooks"]
+  - ["src/hooks/dispatch.ts", "unit-hooks"]
+  - ["src/connectors/codex-hooks.ts", "unit-connectors"]
+  - ["src/codex-transcript.ts", "unit-transcripts-import"]
+  - ["src/transcript-provider.ts", "unit-transcripts-import"]
+  - ["src/storage/native-transcript-ingest.ts", "unit-transcripts-import"]
+  - ["src/daemon/routes/ingest.ts", "unit-daemon-routes"]
+  - ["src/storage/contracts.ts", "unit-storage-abstractions"]
+  - ["src/storage/postgresql/project-storage.ts", "unit-storage-abstractions"]
+  - ["src/storage/sqlite/native-transcript-repository.ts", "unit-local-persistence"]
+  - ["src/storage/sqlite/project-storage.ts", "unit-local-persistence"]
+  - ["src/storage/postgresql/native-transcript-repository.ts", "integration-postgresql-transcripts"]
+  - ["src/store/conversation-store.ts", "unit-local-persistence"]
+  - ["src/storage/sqlite/repositories.ts", "unit-local-persistence"]
+  - ["src/db/migration.ts", "unit-local-persistence"]
+  - ["src/storage/sqlite/portable-source.ts", "unit-local-persistence"]
+  - ["src/storage/sqlite/portable-runtime-mapping.ts", "unit-local-persistence"]
+  - ["src/storage/portable-record.ts", "unit-storage-abstractions"]
+  - ["src/storage/postgresql/conversation-repository.ts", "integration-postgresql-conversations"]
+  - ["src/storage/postgresql/migrations.ts", "integration-postgresql-schema"]
+  - ["src/storage/postgresql/runtime-readiness.ts", "integration-postgresql-schema"]
+  - ["src/storage/postgresql/portable-mapping.ts", "integration-postgresql-portable"]

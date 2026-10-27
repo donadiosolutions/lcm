@@ -5,7 +5,19 @@ import type {
   PostgreSqlQueryExecutor,
   PostgreSqlTransactionOptions,
 } from "./contracts.js";
-import { PostgreSqlCommitOutcomeUnknownError } from "./errors.js";
+import {
+  PostgreSqlCommitOutcomeUnknownError,
+  PostgreSqlStorageOperationError,
+} from "./errors.js";
+
+/**
+ * How long the alias reconcile waits for the `lcm.project_aliases` table lock
+ * before it gives up, so a conflicting uncommitted alias write is reported
+ * well before the configured statement timeout cancels the statement.
+ */
+const ALIAS_RECONCILE_LOCK_TIMEOUT_MS = 5_000;
+/** lock_not_available (lock_timeout) and query_canceled (statement_timeout). */
+const ALIAS_LOCK_WAIT_SQLSTATES: ReadonlySet<string> = new Set(["55P03", "57014"]);
 
 export interface PostgreSqlIdentityExecutor extends PostgreSqlQueryExecutor {
   transaction<T>(
@@ -230,6 +242,26 @@ export class PostgreSqlIdentityRegistrationError extends StorageOperationError {
     );
     this.name = "PostgreSqlIdentityRegistrationError";
     this.message = "PostgreSQL machine registration did not return an identity";
+  }
+}
+
+/**
+ * The alias reconcile could not take the `lcm.project_aliases` table lock
+ * within its bounded wait because another session holds a conflicting
+ * uncommitted alias write. Nothing was written; retrying later is safe.
+ */
+export class PostgreSqlIdentityAliasLockTimeoutError extends StorageOperationError {
+  constructor(projectId: string) {
+    super(
+      "STORAGE_OPERATION_FAILED",
+      "postgresql",
+      projectId,
+      "identity",
+      "ensureProjectAliases",
+    );
+    this.name = "PostgreSqlIdentityAliasLockTimeoutError";
+    this.message =
+      `timed out waiting for the project alias lock while reconciling project ${projectId}; another session is writing project aliases`;
   }
 }
 
@@ -570,6 +602,134 @@ export class PostgreSqlIdentityRepository {
       }
       throw error;
     }
+  }
+
+  /**
+   * Brings an existing project's alias set to exactly `aliases` for one
+   * machine in a single transaction: inserts the missing rows and writes
+   * nothing when the set already matches. Returns `null`, with nothing
+   * written, when the project holds any alias outside the set (another
+   * machine, another path) or any requested alias is owned by another project
+   * or stored under a different path or normalized path.
+   *
+   * The transaction first takes a SHARE ROW EXCLUSIVE lock on
+   * `lcm.project_aliases`: it blocks every concurrent alias insert, update
+   * and delete (including a new unrelated alias of this project, which a row
+   * lock cannot see) until commit. The runtime role cannot lock the
+   * `lcm.projects` row (no UPDATE privilege), and DELETE is enough for LOCK
+   * TABLE. After writing, the project's rows are read again and anything but
+   * exactly the requested set throws, so the inserts roll back; a `null`
+   * return after a write would commit them.
+   *
+   * The lock wait is bounded: the transaction sets a local lock_timeout of
+   * {@link ALIAS_RECONCILE_LOCK_TIMEOUT_MS} around the LOCK statement only.
+   * When that statement fails with a lock or statement timeout, because a
+   * conflicting alias write is still uncommitted, the call rejects with
+   * {@link PostgreSqlIdentityAliasLockTimeoutError}. The translation happens
+   * outside the transaction: the runtime rethrows the first failed query's
+   * error ahead of anything the callback throws.
+   */
+  async ensureProjectAliases(input: {
+    readonly machineId: string;
+    readonly projectId: string;
+    readonly aliases: readonly RemoteProjectAliasInput[];
+  }): Promise<{ readonly inserted: number } | null> {
+    const lock: { failure?: unknown } = {};
+    try {
+      return await this.reconcileProjectAliases(input, lock);
+    } catch (error) {
+      if (
+        error === lock.failure
+        && error instanceof PostgreSqlStorageOperationError
+        && error.sqlState !== null
+        && ALIAS_LOCK_WAIT_SQLSTATES.has(error.sqlState)
+      ) throw new PostgreSqlIdentityAliasLockTimeoutError(input.projectId);
+      throw error;
+    }
+  }
+
+  private reconcileProjectAliases(input: {
+    readonly machineId: string;
+    readonly projectId: string;
+    readonly aliases: readonly RemoteProjectAliasInput[];
+  }, lock: { failure?: unknown }): Promise<{ readonly inserted: number } | null> {
+    return this.executor.transaction(async (transaction) => {
+      const options = projectScopeOptions("ensureProjectAliases", [input.projectId]);
+      const prior = await transaction.query<{ setting: string }>({
+        text: "SELECT pg_catalog.current_setting('lock_timeout') AS setting",
+      }, options);
+      const previousSetting = prior.rows[0]!.setting;
+      await transaction.query({
+        text: "SELECT pg_catalog.set_config('lock_timeout', $1::pg_catalog.text, true)",
+        values: [`${ALIAS_RECONCILE_LOCK_TIMEOUT_MS}ms`],
+      }, options);
+      try {
+        await transaction.query({
+          text: "LOCK TABLE lcm.project_aliases IN SHARE ROW EXCLUSIVE MODE",
+        }, options);
+      } catch (error) {
+        // Nothing may be queried after this: the transaction is aborted.
+        lock.failure = error;
+        throw error;
+      }
+      await transaction.query({
+        text: "SELECT pg_catalog.set_config('lock_timeout', $1::pg_catalog.text, true)",
+        values: [previousSetting],
+      }, options);
+      const current = await transaction.query<AliasRow>({
+        text: `SELECT project_id, machine_id, path, normalized_path, linked_at
+               FROM lcm.project_aliases
+               WHERE project_id = $1
+                  OR (
+                    machine_id = $2
+                    AND (normalized_path = ANY($3::text[]) OR path = ANY($4::text[]))
+                  )`,
+        values: [
+          input.projectId,
+          input.machineId,
+          input.aliases.map(({ normalizedPath }) => normalizedPath),
+          input.aliases.map(({ path }) => path),
+        ],
+      }, projectScopeOptions("ensureProjectAliases", [input.projectId]));
+      const wanted = new Map(input.aliases.map((alias) => [alias.normalizedPath, alias]));
+      for (const row of current.rows) {
+        const alias = row.machine_id === input.machineId ? wanted.get(row.normalized_path) : undefined;
+        if (row.project_id !== input.projectId || alias === undefined || alias.path !== row.path) return null;
+      }
+      const present = new Set(current.rows.map((row) => row.normalized_path));
+      let inserted = 0;
+      for (const alias of input.aliases) {
+        if (present.has(alias.normalizedPath)) continue;
+        await this.linkWithExecutor(transaction, {
+          machineId: input.machineId,
+          projectId: input.projectId,
+          ...alias,
+        });
+        inserted += 1;
+      }
+      if (inserted > 0) {
+        const final = await transaction.query<AliasRow>({
+          text: `SELECT project_id, machine_id, path, normalized_path, linked_at
+                 FROM lcm.project_aliases
+                 WHERE project_id = $1`,
+          values: [input.projectId],
+        }, projectScopeOptions("ensureProjectAliases", [input.projectId]));
+        const exact = final.rows.length === input.aliases.length && final.rows.every((row) => {
+          const alias = row.machine_id === input.machineId ? wanted.get(row.normalized_path) : undefined;
+          return alias !== undefined && alias.path === row.path;
+        });
+        if (!exact) {
+          // Thrown, never returned: a return would commit the inserts above.
+          throw new PostgreSqlIdentityConflictError(
+            input.machineId,
+            input.aliases[0]!.normalizedPath,
+            input.projectId,
+            input.projectId,
+          );
+        }
+      }
+      return { inserted };
+    }, projectScopeOptions("ensureProjectAliases", [input.projectId]));
   }
 
   async replaceProjectAlias(input: {

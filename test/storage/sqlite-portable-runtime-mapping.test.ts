@@ -75,6 +75,20 @@ describe("SQLite canonical runtime mapping", () => {
     expect(readPortableRuntimeRow(db, "messages", String(message.message_id), options)?.value.content).toBe("native mutation");
   });
 
+  it("omits a null parent from the portable value and persists a recorded parent natively", () => {
+    const db = database();
+    const conversation = buildRecords(options).get("conversations")![0];
+    const plainLocator = writePortableRuntimeRecord(db, conversation, () => "", options.projectIdentity);
+    const plain = readPortableRuntimeRow(db, "conversations", plainLocator, options)!;
+    expect(plain.value).not.toHaveProperty("parentSessionId");
+    expect(db.prepare("SELECT parent_session_id AS p FROM conversations WHERE conversation_id=?").get(plainLocator)).toEqual({ p: null });
+
+    const linked = { ...conversation, value: { ...conversation.value, parentSessionId: "parent-thread" } } as typeof conversation;
+    const linkedLocator = writePortableRuntimeRecord(db, linked, () => "", options.projectIdentity);
+    expect(readPortableRuntimeRow(db, "conversations", linkedLocator, options)!.value.parentSessionId).toBe("parent-thread");
+    expect(db.prepare("SELECT parent_session_id AS p FROM conversations WHERE conversation_id=?").get(linkedLocator)).toEqual({ p: "parent-thread" });
+  });
+
   it("reads a conversation message closure in numeric sequence order without including siblings", () => {
     const db = database();
     db.exec("INSERT INTO conversations(conversation_id,session_id) VALUES(1,'one'),(2,'two')");

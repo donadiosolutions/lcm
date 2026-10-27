@@ -30,12 +30,16 @@ import { join } from "node:path";
 import { DatabaseSync } from "node:sqlite";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { runLcmMigrations } from "../../src/db/migration.js";
+import { initializePortableArchive, writePortableArchiveRecord } from "../../src/storage/sqlite/portable-archive.js";
+import { materializeRollbackSidecars, RollbackSidecarError } from "../../src/migration/rollback-sidecars.js";
+import { toMigrationRollbackError } from "../../src/migration/rollback-inputs.js";
+import { buildRecords, postgresGeneration, MACHINE_A_UUID } from "../fixtures/portable-records.js";
 import {
   openSqlitePortableSource,
   sqlitePortableFileSha256,
 } from "../../src/storage/sqlite/portable-source.js";
 import { createPortableRecordStream, type PortableRecordStream } from "../../src/storage/portable-record-stream.js";
-import { canonicalSha256, PORTABLE_RECORD_SCHEMA_SHA256 } from "../../src/storage/portable-record.js";
+import { canonicalSha256, createPortableRecord, PORTABLE_RECORD_SCHEMA_SHA256 } from "../../src/storage/portable-record.js";
 import {
   BackendPublicationCoordinator,
   assertBackendPublicationConsumerAccess,
@@ -64,6 +68,7 @@ import {
 } from "../../src/migration/generation-binding-store.js";
 import { originalRollbackPreemption, readRollbackPreemptionRecord } from "../../src/migration/rollback-install.js";
 import { assertMigrationReplayAdmission } from "../../src/migration/maintenance.js";
+import { deriveActivationPublicationId } from "../../src/migration/activation-publication-id.js";
 import {
   FIXTURE_LOCAL_PROJECT_ID,
   FIXTURE_REMOTE_PROJECT_ID,
@@ -1543,6 +1548,7 @@ describe("donadiosolutions/lcm#1431: selection-completes-but-binding-not-yet-wri
     const census = fixtureCensusVector("a16-census");
     const scenarioFor = (generationId: string) => fixtureActivationScenario({
       generationId, destinationIdentity, censusVector: census, canonicalDeltaBaseline: baseline,
+      publicationId: deriveActivationPublicationId(generationId),
     });
     const unchangedSession = async () => fakeSession({
       observations: [{
@@ -1566,11 +1572,13 @@ describe("donadiosolutions/lcm#1431: selection-completes-but-binding-not-yet-wri
       recordMigrationSelectionBinding({ homeDir, generationId, binding: scenario.selection });
       return scenario;
     }
-    /** Real stores and real recorders throughout; a coordinator, a session and overrides vary. */
+    /** Real stores and real recorders throughout; a coordinator, a session and overrides vary. The retained
+     * publication names the derived activation publication id the scenario's binding carries. */
     const depsFor = (homeDir: string, extra: Partial<RunMigrationRollbackDependencies> = {}): RunMigrationRollbackDependencies => ({
       coordinator: coordinatorFor(homeDir),
       recordActivationWitness: recordMigrationActivationWitness,
       openFencedSession: unchangedSession,
+      readRetainedMaterial: () => retainedActivationPublication(deriveActivationPublicationId(GEN)),
       ...extra,
     });
     const realUnlinkSync = (createRequire(import.meta.url)("node:fs") as { unlinkSync: (p: string) => void }).unlinkSync;
@@ -3069,6 +3077,124 @@ describe("rollback.ts refusal, recovery and I/O paths", () => {
       const outcome = await runRollback(RUN(homeDir, "gen-enum"), deps);
       expect(outcome.manifest.rollbackLineage.mode).toBe("post-write");
     });
+
+    describe("a live passive event the archive lists as pending (#1681)", () => {
+      const store = (homeDir: string) => new MigrationManifestStore({ homeDir });
+      /**
+       * A live events database holding the fixture's passive events, as an earlier PostgreSQL-era run left it, with
+       * one real SQL edit on the event the archive lists as pending. The verified generation the rollback builds is
+       * given the same archive records when step 10 runs, because the SQLite source fixture carries no passive events.
+       */
+      function arrange(homeDir: string, liveEdit: (pendingEventId: string) => string) {
+        const scratchDir = mkdtempSync(join(tmpdir(), "lcm-rollback-orch-archive-"));
+        dirs.push(scratchDir);
+        const records = buildRecords(postgresGeneration());
+        // The built generation's archive already holds machine records at the first ordinals.
+        const machines = records.get("machines")!.map((record, index) => createPortableRecord({
+          domain: "machines", ordinal: 1000 + index, value: record.value, context: null,
+        }));
+        const archived = [...machines, ...records.get("passive-events")!];
+        const writeArchive = (databasePath: string): void => {
+          const db = new DatabaseSync(databasePath);
+          try {
+            for (const record of archived) writePortableArchiveRecord(db, record);
+          } finally {
+            db.close();
+          }
+        };
+        const scratch = join(scratchDir, "db.sqlite");
+        const scratchDb = new DatabaseSync(scratch);
+        try {
+          runLcmMigrations(scratchDb, { fts5Available: false });
+          initializePortableArchive(scratchDb);
+        } finally {
+          scratchDb.close();
+        }
+        writeArchive(scratch);
+        const { eventsDbPath } = materializeRollbackSidecars({
+          homeDir, databasePath: scratch, localProjectId: FIXTURE_LOCAL_PROJECT_ID, machineId: MACHINE_A_UUID,
+        });
+        const pendingEventId = records.get("passive-events")!.find((record) => record.value.disposition === "pending")!.value.eventId;
+        const live = new DatabaseSync(eventsDbPath);
+        try {
+          live.exec(liveEdit(pendingEventId));
+        } finally {
+          live.close();
+        }
+        const readLive = (): Record<string, unknown> => {
+          const db = new DatabaseSync(eventsDbPath, { readOnly: true });
+          try {
+            return { ...db.prepare("SELECT * FROM events WHERE event_uuid = ?").get(pendingEventId) };
+          } finally {
+            db.close();
+          }
+        };
+        return { writeArchive, readLive };
+      }
+      function sessionSeeding(homeDir: string, generationId: string, writeArchive: (databasePath: string) => void) {
+        const probe = { revisionAtStep10: -1 };
+        const session = fakeSession({ observations: [postWrite], source: sqliteSourceStream });
+        const real = session.captureReadback.bind(session);
+        let calls = 0;
+        session.captureReadback = async (request) => {
+          calls += 1;
+          if (calls === 2) {
+            const buildRoot = join(homeDir, ".lcm", "migration-rollback-generations");
+            const built = readdirSync(buildRoot).find((name) => name.startsWith(generationId + "-rb"))!;
+            writeArchive(join(buildRoot, built, "db.sqlite"));
+            probe.revisionAtStep10 = store(homeDir).read(generationId).revision;
+          }
+          return real(request);
+        };
+        return { session, probe };
+      }
+      const rosterOfMachineA = [{ machineId: MACHINE_A_UUID, queueCutoff: null, evidenceSha256: "7".repeat(64) }];
+
+      it("refuses a genuinely divergent row before publish-rollback begins, leaving the manifest and the canonical database untouched", async () => {
+        const homeDir = tempHome();
+        const generationId = "gen-1681-divergent";
+        manifestAtVerified(store(homeDir), generationId);
+        const { writeArchive, readLive } = arrange(homeDir, (id) => "UPDATE events SET data = '{\"diverged\":true}' WHERE event_uuid = '" + id + "'");
+        const liveBefore = readLive();
+        const recorded: unknown[] = [];
+        const { session, probe } = sessionSeeding(homeDir, generationId, writeArchive);
+        const error = await runRollback(RUN(homeDir, generationId, { roster: rosterOfMachineA }), {
+          coordinator: coordinatorFor(homeDir), ...authoritativeDeps(scenarioFor(generationId)),
+          recordSelectionBinding: (call) => { recorded.push(call.binding); },
+          recordWitnessBinding: (call) => { recorded.push(call.binding); },
+          openFencedSession: async () => session,
+        }).then(() => null, (caught: unknown) => caught);
+        expect(error).toBeInstanceOf(RollbackSidecarError);
+        expect(error).toMatchObject({ reason: "verification-failed", message: expect.stringContaining("diverges from its archive row") });
+        expect(toMigrationRollbackError(error).reason).toBe("unexpected-state");
+        const manifest = store(homeDir).read(generationId);
+        expect(probe.revisionAtStep10).toBeGreaterThan(0);
+        expect(manifest).toMatchObject({ phase: "rolling-back", pendingEffect: null, revision: probe.revisionAtStep10 });
+        expect(existsSync(join(homeDir, "live.sqlite"))).toBe(false);
+        expect(readBackendMaintenanceJournal(homeDir)?.phase).toBe("maintenance-held");
+        expect(recorded).toEqual([]);
+        expect(readLive()).toEqual(liveBefore);
+      });
+
+      it("completes when the daemon already drained the row, leaving it exactly as it was", async () => {
+        const homeDir = tempHome();
+        const generationId = "gen-1681-drained";
+        manifestAtVerified(store(homeDir), generationId);
+        const { writeArchive, readLive } = arrange(homeDir, (id) =>
+          "UPDATE events SET delivery_state = 'replicated', remote_inbox_id = 'inbox-1', processed_at = '2026-01-01T00:00:00.000000Z' WHERE event_uuid = '" + id + "'");
+        const liveBefore = readLive();
+        const { session } = sessionSeeding(homeDir, generationId, writeArchive);
+        const outcome = await runRollback(RUN(homeDir, generationId, { roster: rosterOfMachineA }), {
+          coordinator: coordinatorFor(homeDir), ...authoritativeDeps(scenarioFor(generationId)),
+          recordSelectionBinding: () => undefined, recordWitnessBinding: () => undefined,
+          openFencedSession: async () => session,
+        });
+        expect(outcome.manifest).toMatchObject({ phase: "rolled-back", pendingEffect: null });
+        expect(existsSync(join(homeDir, "live.sqlite"))).toBe(true);
+        expect(readLive()).toEqual(liveBefore);
+        expect(liveBefore).toMatchObject({ remote_inbox_id: "inbox-1", processed_at: "2026-01-01T00:00:00.000000Z" });
+      });
+    });
   });
 
   it("refuses with the revalidation's own reason when step 10 finds a different destination identity", async () => {
@@ -3695,13 +3821,29 @@ describe("readOwnPublicationSourceFromMaterial: the rollback's sealed pre-public
     expect(source.projectMap[FIXTURE_LOCAL_PROJECT_ID]).toMatchObject({ remoteProjectId: FIXTURE_REMOTE_PROJECT_ID });
   });
 
-  it("is null for another publication's journal, and once its own publication was aborted", async () => {
+  it("is null for another publication's journal", async () => {
     const homeDir = tempHome();
-    const coordinator = await prepared(homeDir, ID);
+    await prepared(homeDir, ID);
     expect(readOwnPublicationSourceFromMaterial(homeDir, deriveRollbackPublicationId("another-generation"), FIXTURE_LOCAL_PROJECT_ID)).toBeNull();
+  });
+
+  it("reads the live files once its own publication was aborted, only as the journal witnessed them (#1555)", async () => {
+    const homeDir = tempHome();
+    const material = rollbackPublicationMaterial();
+    for (const [name, file] of [["config.json", material.source.config], ["map.json", material.source.projectMap]] as const) {
+      if (file.presence === "present") writeFileSync(join(homeDir, ".lcm", name), file.content, { mode: 0o600 });
+    }
+    const coordinator = await prepared(homeDir, ID);
     await coordinator.recoverPending({ disposition: "abort" });
-    expect(readBackendPublicationJournal(homeDir)).toMatchObject({ phase: "aborted" });
-    expect(readOwnPublicationSourceFromMaterial(homeDir, ID, FIXTURE_LOCAL_PROJECT_ID)).toBeNull();
+    expect(readBackendPublicationJournal(homeDir)).toMatchObject({ phase: "aborted", recoveryReference: expect.anything() });
+    expect(readOwnPublicationSourceFromMaterial(homeDir, ID, FIXTURE_LOCAL_PROJECT_ID)!.projectMap[FIXTURE_LOCAL_PROJECT_ID])
+      .toMatchObject({ remoteProjectId: FIXTURE_REMOTE_PROJECT_ID });
+    // Another covered project is not this rollback's composition: no source of its own.
+    expect(readOwnPublicationSourceFromMaterial(homeDir, ID, "d".repeat(64))).toBeNull();
+
+    writeFileSync(join(homeDir, ".lcm", "map.json"), "{}", { mode: 0o600 });
+    expect(() => readOwnPublicationSourceFromMaterial(homeDir, ID, FIXTURE_LOCAL_PROJECT_ID))
+      .toThrow(expect.objectContaining({ reason: "unexpected-state", message: expect.stringContaining("live project map is not the one") }));
   });
 
   it("refuses a sealed publication whose source project map was absent", async () => {

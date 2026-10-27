@@ -61,6 +61,58 @@ export interface StorageHealth {
   readonly error?: import("./errors.js").StorageOperationError;
 }
 
+/** Metadata key that identifies a transcript slot marker on a compaction event. */
+export const TRANSCRIPT_SLOT_METADATA_KEY = "lcmTranscriptSlot";
+
+/**
+ * Serialize the slot marker stored on a compaction event message.
+ *
+ * `consumed` records whether the event occupied one index of the cumulative
+ * transcript list that clients re-send, so ingest can skip that index once.
+ */
+export function encodeTranscriptSlotMarker(consumed: boolean): string {
+  return JSON.stringify({ [TRANSCRIPT_SLOT_METADATA_KEY]: { version: 1, consumed } });
+}
+
+/** Return the consumed flag of a valid slot marker, or null for any other metadata. */
+export function parseTranscriptSlotMarker(metadata: string | null): boolean | null {
+  if (metadata === null) return null;
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(metadata);
+  } catch {
+    return null;
+  }
+  if (parsed === null || typeof parsed !== "object" || Array.isArray(parsed)) return null;
+  const marker = (parsed as Record<string, unknown>)[TRANSCRIPT_SLOT_METADATA_KEY];
+  if (marker === null || typeof marker !== "object" || Array.isArray(marker)) return null;
+  const { version, consumed } = marker as Record<string, unknown>;
+  return version === 1 && typeof consumed === "boolean" ? consumed : null;
+}
+
+/** One compaction event row of a session and its slot bookkeeping. */
+export type TranscriptSlotEvent = {
+  messageId: number;
+  /** A transcript row follows the event in session order. */
+  followedByTranscript: boolean;
+  /** First free part ordinal on the event message. */
+  nextOrdinal: number;
+  /** Consumed flag of every valid slot marker on the event, in ordinal order. */
+  slotMarkers: boolean[];
+};
+
+/**
+ * Session-wide transcript slot state.
+ *
+ * An event row is a message with a compaction part; every other message is a
+ * transcript row. Session order is conversation creation time, conversation
+ * ID, message seq, message ID.
+ */
+export type TranscriptSlotSnapshot = {
+  transcriptCount: number;
+  events: TranscriptSlotEvent[];
+};
+
 export interface ConversationRepository {
   /**
    * Conversation-domain text inputs reject embedded U+0000 before database
@@ -71,6 +123,11 @@ export interface ConversationRepository {
   getConversationBySessionId(sessionId: string): Promise<ConversationRecord | null>;
   getOrCreateConversation(sessionId: string, title?: string): Promise<ConversationRecord>;
   markConversationBootstrapped(conversationId: ConversationId): Promise<void>;
+  /**
+   * Record the immediate parent session once; an existing value is kept and
+   * never cleared. Does not change updated_at.
+   */
+  setParentSessionIdIfNull(conversationId: ConversationId, parentSessionId: string): Promise<void>;
   listConversations(): Promise<ConversationRecord[]>;
   /**
    * Create one explicit sequence value for replay/import.
@@ -120,6 +177,14 @@ export interface ConversationRepository {
    * empty.
    */
   getMaxSeq(conversationId: ConversationId): Promise<number>;
+  /**
+   * Read the session-wide transcript slot state: the number of transcript rows
+   * (messages without a compaction part) and each compaction event row with
+   * its slot markers, in session order. getMessageCount keeps counting every
+   * row. Callers that write after reading hold the session lock by calling
+   * getOrCreateConversation first in the same transaction.
+   */
+  getTranscriptSlotSnapshot(sessionId: string): Promise<TranscriptSlotSnapshot>;
   deleteMessages(messageIds: MessageId[]): Promise<number>;
 }
 
@@ -216,6 +281,14 @@ export interface NativeTranscriptSessionMessageRecord {
   readonly messageSequence: number;
   readonly role: MessageRole;
   readonly content: string;
+  /**
+   * The message has a compaction part, so it is not a transcript row.
+   *
+   * The built-in SQLite and PostgreSQL repositories always set it. An absent
+   * value means the message is not a compaction event, so a repository
+   * written before this field existed keeps linking as before.
+   */
+  readonly isCompactionEvent?: boolean;
 }
 
 /**
@@ -228,6 +301,19 @@ export interface NativeTranscriptMessageSnapshotRepository {
   getNativeTranscriptMessageSnapshot(
     nativeSessionId: string,
   ): Promise<readonly NativeTranscriptSessionMessageRecord[]>;
+}
+
+/**
+ * Narrow read-only provenance seam, available inside a project transaction.
+ *
+ * It reports which committed native records of one source are linked to a
+ * stored message, so an ingest decision can honor links that already exist.
+ */
+export interface NativeTranscriptProvenanceRepository {
+  /** Ascending source ordinals of the session's linked native records in one source. */
+  listLinkedSourceOrdinals(
+    input: NativeTranscriptCheckpointKey & { readonly nativeSessionId: string },
+  ): Promise<readonly number[]>;
 }
 
 /**
@@ -458,6 +544,8 @@ export type TransactionRepositories = ProjectRepositories & Readonly<{
    * backends that run concurrent root transactions on separate connections.
    */
   promotedDecisionSerializer?: PromotedDecisionSerializer;
+  /** Transaction-scoped native link provenance; absent on backends without native storage. */
+  nativeProvenance?: NativeTranscriptProvenanceRepository;
 }>;
 
 export interface ProjectStorage extends ProjectRepositories {

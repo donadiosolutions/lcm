@@ -17,6 +17,7 @@ import {
   isPostgreSqlConnectionError,
   isPostgreSqlSnapshotTerminationSqlState,
   normalizePostgreSqlError,
+  PostgreSqlDiagnosticPoolError,
   PostgreSqlStorageOperationError,
   PostgreSqlCommitOutcomeUnknownError,
   sanitizeSqlState,
@@ -873,17 +874,16 @@ export class PostgreSqlRuntime implements PostgreSqlQueryExecutor {
   }
 
   poolDiagnostics(): PostgreSqlDiagnosticPool {
-    const count = (value: number): number => {
-      if (!Number.isSafeInteger(value) || value < 0) {
-        throw new StorageOperationError("STORAGE_OPERATION_FAILED", "postgresql", undefined, "factory", "poolDiagnostics");
-      }
-      return value;
-    };
+    const counts: unknown[] = [this.settings.poolMax, this.pool.totalCount, this.pool.idleCount, this.pool.waitingCount];
+    // An established out-of-range number outranks a missing counter, matching the telemetry contract.
+    const rejection = counts.some(value => typeof value === "number" && !(Number.isSafeInteger(value) && value >= 0)) ? "out-of-range"
+      : counts.some(value => typeof value !== "number") ? "unavailable" : undefined;
+    if (rejection !== undefined) throw new PostgreSqlDiagnosticPoolError(rejection);
     return {
-      configuredMax: count(this.settings.poolMax),
-      total: count(this.pool.totalCount),
-      idle: count(this.pool.idleCount),
-      waiting: count(this.pool.waitingCount),
+      configuredMax: this.settings.poolMax,
+      total: this.pool.totalCount,
+      idle: this.pool.idleCount,
+      waiting: this.pool.waitingCount,
       failed: this.poolFailed,
     };
   }

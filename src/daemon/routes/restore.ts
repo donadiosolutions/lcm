@@ -146,10 +146,13 @@ export function createRestoreHandler(
         }
       }
 
-      // Post-compaction detection
+      // Post-compaction detection. justCompactedMap marks LCM summarization,
+      // which Codex snapshots can trigger without replacing Codex's context, so
+      // only the Codex compact source counts there.
+      const isCodex = client === "codex";
       const isPostCompact =
         source === "compact" ||
-        (justCompactedMap.has(session_id) && Date.now() - justCompactedMap.get(session_id)! < JUST_COMPACTED_TTL_MS);
+        (!isCodex && justCompactedMap.has(session_id) && Date.now() - justCompactedMap.get(session_id)! < JUST_COMPACTED_TTL_MS);
 
       // File-system instruction discovery is deliberately outside selected
       // storage admission. Only the corresponding repository read/write below
@@ -187,7 +190,10 @@ export function createRestoreHandler(
                 // Other restoration read failures remain non-fatal.
               }
 
-              if (isPostCompact) {
+              // Claude keeps its context-preserving compaction, so it only needs
+              // orientation. Codex drops hook context on compaction and needs
+              // the full memory again (the stored instructions row still applies).
+              if (isPostCompact && !isCodex) {
                 const context = [orientation, instructionsContext].filter(Boolean).join("\n\n");
                 return { context };
               }
@@ -225,26 +231,28 @@ export function createRestoreHandler(
                   // Non-fatal for SQLite and non-storage compatibility failures.
                 }
 
-                try {
-                  if (instructionContent) {
-                    instructionsContext = `<project-instructions>\n${instructionContent}\n</project-instructions>`;
-                    const hash = createHash("sha256").update(instructionContent).digest("hex");
-                    const existing = await storage.coordination.getSessionInstructions(instructionScope!);
+                if (!isPostCompact) {
+                  try {
+                    if (instructionContent) {
+                      instructionsContext = `<project-instructions>\n${instructionContent}\n</project-instructions>`;
+                      const hash = createHash("sha256").update(instructionContent).digest("hex");
+                      const existing = await storage.coordination.getSessionInstructions(instructionScope!);
 
-                    if (!existing || existing.contentHash !== hash) {
-                      await storage.coordination.upsertSessionInstructions(
-                        instructionScope!,
-                        instructionContent,
-                        hash,
-                      );
+                      if (!existing || existing.contentHash !== hash) {
+                        await storage.coordination.upsertSessionInstructions(
+                          instructionScope!,
+                          instructionContent,
+                          hash,
+                        );
+                      }
+                    } else {
+                      instructionsContext = "";
+                      await storage.coordination.deleteSessionInstructions(instructionScope!);
                     }
-                  } else {
-                    instructionsContext = "";
-                    await storage.coordination.deleteSessionInstructions(instructionScope!);
+                  } catch (error) {
+                    rethrowPostgreSqlStorageFailure(error);
+                    // Non-fatal for SQLite and non-storage compatibility failures.
                   }
-                } catch (error) {
-                  rethrowPostgreSqlStorageFailure(error);
-                  // Non-fatal for SQLite and non-storage compatibility failures.
                 }
               } catch (error) {
                 rethrowPostgreSqlStorageFailure(error);

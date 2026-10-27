@@ -8,11 +8,15 @@ export interface ExtractedEvent {
   tags?: string[];
 }
 
+export type ToolOutcome = "succeeded" | "failed" | "unknown";
+
 export interface PostToolInput {
   tool_name: string;
   tool_input: Record<string, unknown>;
   tool_response?: unknown;
-  tool_output?: { isError?: boolean };
+  // `outcome` is the only status signal when present; `isError` applies to
+  // outcome-less (non-Codex) input.
+  tool_output?: { isError?: boolean; outcome?: ToolOutcome };
 }
 
 const SENSITIVE_PATHS = [".env", ".ssh/", "credentials", "secrets/", ".npmrc", ".netrc"];
@@ -38,6 +42,10 @@ function truncate(s: string): string {
   return s.length > DATA_SOFT_CAP ? s.slice(0, DATA_SOFT_CAP) + "..." : s;
 }
 
+function commandPrefix(command: string): string {
+  return command.split(/\s+/).slice(0, 3).join(" ");
+}
+
 function isSensitivePath(path: string): boolean {
   const lower = path.toLowerCase();
   return SENSITIVE_PATHS.some(p => lower.includes(p));
@@ -52,12 +60,30 @@ function classifyFile(path: string): string {
 
 function extractBashEvents(input: PostToolInput): ExtractedEvent[] {
   const command = String(input.tool_input.command ?? "");
-  const isError = input.tool_output?.isError === true;
+  const outcome = input.tool_output?.outcome;
+  const isError = outcome === undefined
+    ? input.tool_output?.isError === true
+    : outcome === "failed";
 
   // Error detection (priority 1)
   if (isError) {
-    const prefix = command.split(/\s+/).slice(0, 3).join(" ");
-    return [{ type: "error_tool", category: "error", data: truncate(`Bash error: ${prefix}`), priority: 1 }];
+    return [{ type: "error_tool", category: "error", data: truncate(`Bash error: ${commandPrefix(command)}`), priority: 1 }];
+  }
+
+  // Completed without a status: record that the result is unknown instead of
+  // presenting the command as a success.
+  if (outcome === "unknown") {
+    // Only the matched selector is recorded, never further command tokens.
+    const selector = GIT_COMMANDS.find(gc => command.startsWith(gc)) ??
+      ENV_COMMANDS.find(ec => command.startsWith(ec));
+    return selector === undefined
+      ? []
+      : [{
+        type: "tool_outcome_unknown",
+        category: "tool",
+        data: `Bash outcome unknown: ${selector.trim()}`,
+        priority: 3,
+      }];
   }
 
   // Git operations (priority 2)
@@ -96,6 +122,152 @@ function extractFileEvents(toolName: string, input: PostToolInput): ExtractedEve
     data: truncate(`${filePath} (${classifyFile(filePath)})`),
     priority: 3,
   }];
+}
+
+const PATCH_EVENT_CAP = 20;
+const USER_INPUT_QUESTION_CAP = 3;
+const PLAN_STEP_CAP = 10;
+const PLAN_EXPLANATION_CAP = 500;
+const SPAWN_LABEL_CAP = 200;
+const PATCH_HEADERS: readonly (readonly [string, string])[] = [
+  ["*** Add File: ", "file_write"],
+  ["*** Delete File: ", "file_delete"],
+  ["*** Update File: ", "file_edit"],
+];
+const PATCH_MOVE_HEADER = "*** Move to: ";
+
+function isRecord(value: unknown): value is Record<string, unknown> {
+  return typeof value === "object" && value !== null && !Array.isArray(value);
+}
+
+function nonEmptyString(value: unknown): string {
+  return typeof value === "string" ? value.trim() : "";
+}
+
+// Native Codex responses are normally a JSON string; accept an object as well.
+function parseResponse(response: unknown): Record<string, unknown> {
+  if (typeof response !== "string") return isRecord(response) ? response : {};
+  try {
+    const parsed: unknown = JSON.parse(response);
+    return isRecord(parsed) ? parsed : {};
+  } catch {
+    return {};
+  }
+}
+
+// A present outcome is authoritative; otherwise the legacy isError flag decides.
+function isFailedCall(input: PostToolInput): boolean {
+  const outcome = input.tool_output?.outcome;
+  return outcome === undefined ? input.tool_output?.isError === true : outcome === "failed";
+}
+
+interface PatchOperation {
+  type: string;
+  path: string;
+  to?: string;
+}
+
+// Mirrors the Codex apply_patch header states: lines inside an Update section keep
+// leading whitespace (it marks hunk context), other states trim both sides.
+function parsePatchOperations(patch: string): PatchOperation[] {
+  const operations: PatchOperation[] = [];
+  let updating = false;
+  let movable: PatchOperation | undefined;
+  for (const raw of patch.split(/\r?\n/)) {
+    const line: string = updating ? raw.trimEnd() : raw.trim();
+    const header: readonly [string, string] | undefined = PATCH_HEADERS.find(([prefix]) => line.startsWith(prefix));
+    if (header) {
+      const operation = { type: header[1], path: line.slice(header[0].length).trim() };
+      operations.push(operation);
+      updating = header[1] === "file_edit";
+      movable = updating ? operation : undefined;
+    } else if (movable && line.startsWith(PATCH_MOVE_HEADER)) {
+      movable.to = line.slice(PATCH_MOVE_HEADER.length).trim();
+      movable = undefined;
+    } else {
+      movable = undefined;
+    }
+  }
+  return operations;
+}
+
+function extractPatchEvents(input: PostToolInput): ExtractedEvent[] {
+  const { command } = input.tool_input;
+  if (typeof command !== "string") return [];
+  const events = new Map<string, ExtractedEvent>();
+  for (const { type, path, to } of parsePatchOperations(command)) {
+    if (isSensitivePath(path) || (to && isSensitivePath(to))) continue;
+    const label = to ? `${path} -> ${to} (${classifyFile(to)})` : `${path} (${classifyFile(path)})`;
+    events.set(`${type}\0${label}`, { type, category: "file", data: truncate(label), priority: 3 });
+  }
+  return [...events.values()].slice(0, PATCH_EVENT_CAP);
+}
+
+function extractSpawnEvents(input: PostToolInput): ExtractedEvent[] {
+  const response = parseResponse(input.tool_response);
+  const label = [response.task_name, response.nickname, input.tool_input.task_name, input.tool_input.agent_type]
+    .map(nonEmptyString)
+    .find(Boolean) ?? "agent";
+  return [{
+    type: "subagent_dispatch",
+    category: "subagent",
+    data: truncate(label.slice(0, SPAWN_LABEL_CAP)),
+    priority: 3,
+  }];
+}
+
+function extractUserInputEvents(input: PostToolInput): ExtractedEvent[] {
+  const { questions } = input.tool_input;
+  const answers = parseResponse(input.tool_response).answers;
+  if (!Array.isArray(questions) || !isRecord(answers)) return [];
+  const seen = new Set<string>();
+  const events: ExtractedEvent[] = [];
+  for (const entry of questions.slice(0, USER_INPUT_QUESTION_CAP)) {
+    if (!isRecord(entry) || typeof entry.id !== "string" || seen.has(entry.id)) continue;
+    seen.add(entry.id);
+    const question = nonEmptyString(entry.question);
+    const answer = answers[entry.id];
+    const given = isRecord(answer) && Array.isArray(answer.answers) ? answer.answers : [];
+    const text = given
+      .filter((item): item is string => typeof item === "string")
+      .map(item => item.replace(/^user_note:/, "").trim())
+      .filter(Boolean)
+      .join("; ");
+    if (!question || entry.isSecret === true || !text) continue;
+    events.push({ type: "decision", category: "decision", data: truncate(`Q: ${question}\nA: ${text}`), priority: 1 });
+  }
+  return events;
+}
+
+// Only an explained plan revision is meaningful; unexplained updates are progress ticks.
+function extractPlanEvents(input: PostToolInput): ExtractedEvent[] {
+  const explanation = nonEmptyString(input.tool_input.explanation);
+  if (!explanation) return [];
+  const { plan } = input.tool_input;
+  const steps = (Array.isArray(plan) ? plan : [])
+    .map(item => (isRecord(item) ? nonEmptyString(item.step) : ""))
+    .filter(Boolean)
+    .slice(0, PLAN_STEP_CAP);
+  const stepLine = steps.length > 0 ? `\nSteps: ${steps.join("; ")}` : "";
+  return [{
+    type: "plan_update",
+    category: "proposal",
+    data: truncate(`Plan: ${explanation.slice(0, PLAN_EXPLANATION_CAP)}${stepLine}`),
+    priority: 3,
+  }];
+}
+
+// Native Codex tools run PostToolUse only after success. V2 spawns dispatch as the
+// flattened "collaborationspawn_agent"; every other collaboration tool stays uncaptured.
+function extractNativeActivityEvents(input: PostToolInput): ExtractedEvent[] | undefined {
+  switch (input.tool_name) {
+    case "apply_patch": return extractPatchEvents(input);
+    case "spawn_agent":
+    case "collaborationspawn_agent": return extractSpawnEvents(input);
+    case "request_user_input": return extractUserInputEvents(input);
+    case "update_plan": return extractPlanEvents(input);
+    default: return undefined;
+  }
 }
 
 export function extractPostToolEvents(input: PostToolInput): ExtractedEvent[] {
@@ -162,7 +334,25 @@ export function extractPostToolEvents(input: PostToolInput): ExtractedEvent[] {
 
   // MCP tools (priority 3) — tool name only, no args
   if (tool_name.startsWith("mcp__")) {
+    const outcome = input.tool_output?.outcome;
+    if (outcome === "failed") {
+      return [{ type: "error_tool", category: "error", data: truncate(`${tool_name} error`), priority: 1 }];
+    }
+    if (outcome === "unknown") {
+      return [{
+        type: "tool_outcome_unknown",
+        category: "tool",
+        data: truncate(`${tool_name} outcome unknown`),
+        priority: 3,
+      }];
+    }
     return [{ type: "mcp_call", category: "mcp", data: tool_name, priority: 3 }];
+  }
+
+  // Native Codex activity (a failed call falls through to the generic error below)
+  if (!isFailedCall(input)) {
+    const native = extractNativeActivityEvents(input);
+    if (native) return native;
   }
 
   // Any other tool with isError flag

@@ -1,0 +1,9 @@
+references: ["#1663"]
+rationale: >-
+  The rollback sidecar verifier now compares a passive event's created_at by
+  instant in canonical form, so an outbox row that keeps SQLite's
+  datetime('now') text verifies against the archive's portable timestamp. The
+  change stays inside the existing rollback sidecar module in the migration
+  cutover owner; no file is added, removed, moved or re-owned.
+pins:
+  - ["src/migration/rollback-sidecars.ts", "unit-migration-cutover"]

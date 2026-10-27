@@ -1,0 +1,13 @@
+references: ["#1558"]
+rationale: >-
+  Interprets current Codex tool outcomes: src/hooks/post-tool-normalization.ts
+  derives a succeeded, failed or unknown outcome for Codex shell and MCP
+  payloads and src/hooks/extractors.ts records an unknown-outcome observation
+  from it; both keep their existing hooks owner. src/daemon/routes/promote-events.ts
+  keeps such observations out of promotion, reinforcement and error
+  correlation and keeps its daemon routes owner. No file is added, removed,
+  moved or re-owned.
+pins:
+  - ["src/hooks/extractors.ts", "unit-hooks"]
+  - ["src/hooks/post-tool-normalization.ts", "unit-hooks"]
+  - ["src/daemon/routes/promote-events.ts", "unit-daemon-routes"]

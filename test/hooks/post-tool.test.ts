@@ -619,13 +619,33 @@ describe("handlePostToolUse", () => {
       name: "functions.exec command Git event",
       tool_name: "functions.exec",
       tool_input: { command: "git branch capture-test" },
+      tool_response: { exit_code: 0 },
       expected: { type: "git_branch", category: "git", data: "git branch", priority: 2 },
     },
     {
       name: "functions.exec_command cmd environment event",
       tool_name: "functions.exec_command",
       tool_input: { cmd: "npm install capture-test" },
+      tool_response: { exit_code: 0 },
       expected: { type: "env_install", category: "env", data: "npm install capture-test", priority: 2 },
+    },
+    {
+      name: "current Bash completion with a textual result as an unknown outcome",
+      tool_name: "Bash",
+      tool_use_id: "exec-call-45",
+      tool_input: { command: "git commit -m 'RAW_COMMIT_MESSAGE'" },
+      tool_response: "RAW_OUTPUT_SECRET finished\n",
+      expected: { type: "tool_outcome_unknown", category: "tool", data: "Bash outcome unknown: git commit", priority: 3 },
+    },
+    {
+      name: "current MCP success as a tool-name-only call",
+      tool_name: "mcp__server__lookup",
+      tool_input: { query: "RAW_ARGUMENT_SECRET" },
+      tool_response: {
+        content: [{ type: "text", text: "RAW_CONTENT_SECRET" }],
+        structuredContent: { value: "RAW_STRUCTURED_SECRET" },
+      },
+      expected: { type: "mcp_call", category: "mcp", data: "mcp__server__lookup", priority: 3 },
     },
     {
       name: "functions.exec isError error event",
@@ -693,6 +713,7 @@ describe("handlePostToolUse", () => {
         ...expected,
       }),
     ]);
+    expect(JSON.stringify(rows)).not.toContain("RAW_");
   });
 
   it.each([
@@ -702,6 +723,27 @@ describe("handlePostToolUse", () => {
     { name: "functions.exec_command error", tool_name: "functions.exec_command", tool_input: { cmd: "lcm store capture-test" }, tool_response: { exitCode: 1 } },
   ] as const)("does not persist native Codex lcm-store feedback loop: $name", async (payload) => {
     expect(await runNativePersistenceCase(payload)).toEqual([]);
+  });
+
+  it("persists a bounded decision for a native Codex request_user_input call without raw response fields", async () => {
+    const rows = await runNativePersistenceCase({
+      tool_name: "request_user_input",
+      tool_input: {
+        questions: [{ id: "scope", header: "Scope", question: "Which scope?", options: [{ label: "Narrow", description: "RAW_OPTION_DESCRIPTION" }] }],
+        RAW_INPUT_FIELD: "RAW_INPUT_SECRET",
+      },
+      tool_response: '{"answers":{"scope":{"answers":["Narrow","user_note: keep it small"]},"other":{"answers":["RAW_UNKNOWN_ANSWER"]}}}',
+    });
+    expect(rows).toEqual([
+      expect.objectContaining({
+        session_id: "native-codex-session",
+        type: "decision",
+        category: "decision",
+        data: "Q: Which scope?\nA: Narrow; keep it small",
+        source_hook: "PostToolUse",
+      }),
+    ]);
+    expect(JSON.stringify(rows)).not.toContain("RAW_");
   });
 
   it("does not persist raw native output, response, or secret sentinels", async () => {
@@ -824,5 +866,34 @@ describe("handlePostToolUse", () => {
     expect(await handlePostToolUse(JSON.stringify({
       session_id: "s1", tool_name: "AskUserQuestion", tool_input: {}, tool_output: { isError: true }, daemon_port: 0,
     }))).toEqual({ exitCode: 0, stdout: "" });
+  });
+
+  describe("Codex subagent scope", () => {
+    const decision = {
+      tool_name: "AskUserQuestion",
+      tool_input: { question: "Use SQLite?" },
+      tool_response: "yes",
+    };
+
+    it("stores a child's events under agent_id rather than the tree session_id", async () => {
+      const rows = await runNativePersistenceCase({ ...decision, agent_id: "child-thread", agent_type: "worker" });
+      expect(rows).toEqual([expect.objectContaining({ session_id: "child-thread", source_hook: "PostToolUse" })]);
+    });
+
+    it("attributes a child by agent_id when the tree session_id is missing or malformed", async () => {
+      expect(await runNativePersistenceCase({ ...decision, session_id: undefined, agent_id: "child-thread" }))
+        .toEqual([expect.objectContaining({ session_id: "child-thread" })]);
+      expect(await runNativePersistenceCase({ ...decision, session_id: 12, agent_id: "child-thread" }))
+        .toEqual([expect.objectContaining({ session_id: "child-thread" })]);
+    });
+
+    it("keeps session_id for malformed agent_id and for non-Codex clients", async () => {
+      expect(await runNativePersistenceCase({ ...decision, agent_id: "" }))
+        .toEqual([expect.objectContaining({ session_id: "native-codex-session" })]);
+      expect(await runNativePersistenceCase({ ...decision, agent_id: 9 }))
+        .toEqual([expect.objectContaining({ session_id: "native-codex-session" })]);
+      expect(await runNativePersistenceCase({ ...decision, agent_id: "child-thread", client: "claude" }))
+        .toEqual([expect.objectContaining({ session_id: "native-codex-session" })]);
+    });
   });
 });

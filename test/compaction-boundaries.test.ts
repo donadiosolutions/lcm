@@ -55,8 +55,8 @@ function fixture(configOverrides: Partial<CompactionConfig> = {}) {
   const conversations = {
     getMessageById: vi.fn(async () => null),
     getConversation: vi.fn(async () => null),
-    getMaxSeq: vi.fn(async () => 0),
-    createMessage: vi.fn(async () => ({ messageId: 99 })),
+    getOrCreateConversation: vi.fn(async () => ({ conversationId: 1, sessionId: "session" })),
+    appendMessages: vi.fn(async () => [{ messageId: 99 }]),
     createMessageParts: vi.fn(async () => undefined),
   };
   const summaries = {
@@ -497,7 +497,7 @@ describe("durable compaction events", () => {
     await call<Promise<void>>(engine, "persistCompactionEvents", {
       ...base, leafResult: { summaryId: "leaf", level: "normal" }, condenseResult: null,
     });
-    expect(conversations.createMessage).not.toHaveBeenCalled();
+    expect(conversations.appendMessages).not.toHaveBeenCalled();
   });
 
   it("writes leaf and condensed events with shared created summary IDs", async () => {
@@ -508,10 +508,21 @@ describe("durable compaction events", () => {
       leafResult: { summaryId: "leaf", level: "normal" },
       condenseResult: { summaryId: "condensed", level: "aggressive" },
     });
-    expect(conversations.createMessage).toHaveBeenCalledTimes(2);
+    expect(conversations.appendMessages).toHaveBeenCalledTimes(2);
     expect(conversations.createMessageParts).toHaveBeenCalledTimes(2);
-    const metadata = JSON.parse(conversations.createMessageParts.mock.calls[0][1][0].metadata!);
+    const parts = conversations.createMessageParts.mock.calls[0][1];
+    const metadata = JSON.parse(parts[0].metadata!);
     expect(metadata).toMatchObject({ createdSummaryIds: ["leaf", "condensed"], condensedPassOccurred: true });
+    // Born unconsumed at the next free ordinal, after the session lock call.
+    expect(parts[1]).toEqual({
+      sessionId: "session",
+      partType: "snapshot",
+      ordinal: 1,
+      metadata: JSON.stringify({ lcmTranscriptSlot: { version: 1, consumed: false } }),
+    });
+    expect(conversations.getOrCreateConversation).toHaveBeenCalledWith("session");
+    expect(conversations.getOrCreateConversation.mock.invocationCallOrder[0])
+      .toBeLessThan(conversations.appendMessages.mock.invocationCallOrder[0]);
   });
 
   it("writes a condensed-only event and swallows transaction failures", async () => {

@@ -42,6 +42,9 @@ import {
 } from "../invocation-coordinator.js";
 import { normalizeTranscriptClient, parseTranscriptForClient } from "../../transcript-provider.js";
 import { ScrubEngine } from "../../scrub.js";
+import { appendSessionTranscript, codexLineageRequestFromText, persistCodexLineage } from "./ingest.js";
+import { readTranscriptFileText } from "../../transcript.js";
+import { safeLogError } from "../../hooks/hook-errors.js";
 import {
   makeSummarizerCache,
   resolveEffectiveProvider,
@@ -694,36 +697,28 @@ export function createCompactHandler(
           // Ingest new messages from the transcript into the DB.
           const safeTranscriptPath = transcript_path ? isSafeTranscriptPath(transcript_path, cwd) : false;
           if (!skip_ingest && safeTranscriptPath && existsSync(safeTranscriptPath)) {
-            const parsed = parseTranscriptForClient(safeTranscriptPath, normalizeTranscriptClient(client));
-            await withCommitAdmission(() => admittedProject.transaction(async (repositories) => {
-              const storedCount = await repositories.conversations.getMessageCount(
-                conversation.conversationId,
-              );
-              const newMessages = parsed.slice(storedCount);
-              if (newMessages.length > 0) {
-                const ingestCounts = { gitleaks: 0, builtIn: 0, global: 0, project: 0 };
-                const inputs = newMessages.map((m, i) => {
-                  const { text: scrubbedContent, gitleaks, builtIn, global: globalCount, project } = scrubber.scrubWithCounts(m.content);
-                  ingestCounts.gitleaks += gitleaks;
-                  ingestCounts.builtIn += builtIn;
-                  ingestCounts.global += globalCount;
-                  ingestCounts.project += project;
-                  return {
-                    conversationId: conversation.conversationId,
-                    seq: storedCount + i,
-                    role: m.role as "user" | "assistant" | "system",
-                    content: scrubbedContent,
-                    tokenCount: m.tokenCount,
-                  };
-                });
-                const records = await repositories.conversations.createMessagesBulk(inputs);
-                await repositories.redactionAdmin.upsertCounts(ingestCounts);
-                await repositories.context.appendContextMessages(
-                  conversation.conversationId,
-                  records.map((record) => record.messageId),
+            const transcriptClient = normalizeTranscriptClient(client);
+            if (transcriptClient === "codex") {
+              // Same decision as /ingest: the rollout is read once and the
+              // session's stored reading says which of its lists continues.
+              const raw = readTranscriptFileText(safeTranscriptPath);
+              const request = codexLineageRequestFromText(raw ?? "");
+              const { history } = await withCommitAdmission(() => admittedProject.transaction(
+                (repositories) => persistCodexLineage(repositories, session_id, request, scrubber, async () => undefined),
+              ));
+              if (history === "lineage-mismatch") {
+                await safeLogError(
+                  "compact",
+                  new Error("codex transcript does not continue the reading its stored history follows"),
+                  { cwd, sessionId: session_id },
                 );
               }
-            }));
+            } else {
+              const parsed = parseTranscriptForClient(safeTranscriptPath, transcriptClient);
+              await withCommitAdmission(() => admittedProject.transaction(async (repositories) => {
+                await appendSessionTranscript(repositories, session_id, parsed, scrubber);
+              }));
+            }
           }
 
           // Check if there's anything to compact

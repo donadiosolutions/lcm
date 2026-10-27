@@ -1,5 +1,6 @@
 import {
   readBackendMaintenanceJournal,
+  resolveBackendMaintenanceGenerationBinding,
   withBackendPublicationRetainedAppendAdmissionAsync,
   BackendPublicationJournalError,
   type BackendMaintenanceJournal,
@@ -81,6 +82,9 @@ export type ActivationQuiescenceReason =
   | "maintenance-journal-absent"
   | "maintenance-journal-unresolvable"
   | "maintenance-not-held"
+  | "cutover-set-unsupported"
+  | "cutover-set-absent"
+  | "cutover-set-member-unbound"
   | "roster-not-single-machine"
   | "machine-identity-unavailable"
   | "roster-row-absent";
@@ -148,6 +152,11 @@ export type ActivationQuiescenceDependencies = Readonly<{
    * reach that branch through the real reader; see the test suite for the
    * explicit note on why injection is used there instead of a real fixture. */
   readMaintenanceJournal?: (homeDir?: string) => BackendMaintenanceJournal | null;
+}>;
+
+/** The set entry point's input: the member generation whose own binding view is fenced. */
+export type CutoverSetActivationQuiescenceInput = ActivationQuiescenceInput & Readonly<{
+  generationId: string;
 }>;
 
 function buildResult(
@@ -218,6 +227,76 @@ function sealQuiescenceEnvelope(payload: QuiescencePayload): ActivationQuiescenc
   });
 }
 
+type HeldJournalRead =
+  | Readonly<{ kind: "held"; journal: BackendMaintenanceJournal }>
+  | Readonly<{ kind: "result"; result: ActivationQuiescenceResult }>;
+
+/** The journal read and the held-phase check both entry points share, attributed identically. */
+function readHeldJournal(
+  homeDir: string | undefined,
+  readMaintenanceJournal: (homeDir?: string) => BackendMaintenanceJournal | null,
+): HeldJournalRead {
+  const journalOutcome = attributeNullableRead(
+    () => readMaintenanceJournal(homeDir),
+    {
+      whenNull: {
+        cause: "not-found",
+        detail: "no backend maintenance journal exists for this installation",
+      },
+      classifyError: classifyMaintenanceJournalRead,
+    },
+  );
+  if (journalOutcome.kind === "unresolvable") {
+    return { kind: "result", result: buildResult("unresolvable", "maintenance-journal-unresolvable", journalOutcome.detail, null) };
+  }
+  if (journalOutcome.kind === "absent") {
+    return { kind: "result", result: buildResult("unsatisfied", "maintenance-journal-absent", journalOutcome.detail, null) };
+  }
+  const journal: BackendMaintenanceJournal = journalOutcome.value;
+
+  if (journal.phase !== "maintenance-held") {
+    return { kind: "result", result: buildResult(
+      "unsatisfied",
+      "maintenance-not-held",
+      `the maintenance journal is in phase ${journal.phase}; writer quiescence is only attributable while maintenance is held (phase maintenance-held)`,
+      null,
+    ) };
+  }
+  return { kind: "held", journal };
+}
+
+type MachineIdRead =
+  | Readonly<{ kind: "machine"; machineId: string }>
+  | Readonly<{ kind: "result"; result: ActivationQuiescenceResult }>;
+
+/** This machine's registered identity, attributed identically for both entry points. */
+function readRegisteredMachineId(homeDir: string | undefined): MachineIdRead {
+  const identityOutcome = attributeNullableRead(
+    () => readMachineIdentity(homeDir),
+    {
+      whenNull: {
+        cause: "not-registered",
+        detail: "this machine has no registered machine identity",
+      },
+    },
+  );
+  if (identityOutcome.kind === "unresolvable") {
+    return { kind: "result", result: buildResult("unresolvable", "machine-identity-unavailable", identityOutcome.detail, null) };
+  }
+  if (identityOutcome.kind === "absent") {
+    return { kind: "result", result: buildResult("unresolvable", "machine-identity-unavailable", identityOutcome.detail, null) };
+  }
+  if (identityOutcome.value.machineId === null) {
+    return { kind: "result", result: buildResult(
+      "unresolvable",
+      "machine-identity-unavailable",
+      "this machine's identity registration is still pending; quiescence cannot be attributed to an unregistered machine",
+      null,
+    ) };
+  }
+  return { kind: "machine", machineId: identityOutcome.value.machineId };
+}
+
 /**
  * Assert local writer quiescence for the current installation and, on
  * success, seal a replayable quiescenceFence. See the module doc comment
@@ -232,29 +311,15 @@ export async function checkActivationWriterQuiescence(
   return withBackendPublicationRetainedAppendAdmissionAsync(input.homeDir, (): ActivationQuiescenceResult => {
     const observedAt = now().toISOString();
 
-    const journalOutcome = attributeNullableRead(
-      () => readMaintenanceJournal(input.homeDir),
-      {
-        whenNull: {
-          cause: "not-found",
-          detail: "no backend maintenance journal exists for this installation",
-        },
-        classifyError: classifyMaintenanceJournalRead,
-      },
-    );
-    if (journalOutcome.kind === "unresolvable") {
-      return buildResult("unresolvable", "maintenance-journal-unresolvable", journalOutcome.detail, null);
-    }
-    if (journalOutcome.kind === "absent") {
-      return buildResult("unsatisfied", "maintenance-journal-absent", journalOutcome.detail, null);
-    }
-    const journal: BackendMaintenanceJournal = journalOutcome.value;
+    const held = readHeldJournal(input.homeDir, readMaintenanceJournal);
+    if (held.kind === "result") return held.result;
+    const journal = held.journal;
 
-    if (journal.phase !== "maintenance-held") {
+    if (journal.cutoverSet !== undefined) {
       return buildResult(
         "unsatisfied",
-        "maintenance-not-held",
-        `the maintenance journal is in phase ${journal.phase}; writer quiescence is only attributable while maintenance is held (phase maintenance-held)`,
+        "cutover-set-unsupported",
+        "the maintenance journal binds a cutover set; this single-generation check refuses a set hold, whose members are checked by the set-aware entry point",
         null,
       );
     }
@@ -268,30 +333,9 @@ export async function checkActivationWriterQuiescence(
       );
     }
 
-    const identityOutcome = attributeNullableRead(
-      () => readMachineIdentity(input.homeDir),
-      {
-        whenNull: {
-          cause: "not-registered",
-          detail: "this machine has no registered machine identity",
-        },
-      },
-    );
-    if (identityOutcome.kind === "unresolvable") {
-      return buildResult("unresolvable", "machine-identity-unavailable", identityOutcome.detail, null);
-    }
-    if (identityOutcome.kind === "absent") {
-      return buildResult("unresolvable", "machine-identity-unavailable", identityOutcome.detail, null);
-    }
-    if (identityOutcome.value.machineId === null) {
-      return buildResult(
-        "unresolvable",
-        "machine-identity-unavailable",
-        "this machine's identity registration is still pending; quiescence cannot be attributed to an unregistered machine",
-        null,
-      );
-    }
-    const machineId: string = identityOutcome.value.machineId;
+    const machine = readRegisteredMachineId(input.homeDir);
+    if (machine.kind === "result") return machine.result;
+    const machineId: string = machine.machineId;
 
     const rosterRowOutcome = attributeNullableValue(
       journal.roster.find((row: BackendMaintenanceRosterEntry) => row.machineId === machineId),
@@ -325,3 +369,93 @@ export async function checkActivationWriterQuiescence(
     );
   }, input.lockToken, input.admissionOptions);
 }
+
+/**
+ * The set-aware counterpart (#1549): the same bounded point check over the
+ * same shared append barrier, attributed to ONE member of the held cutover
+ * set from that member's own binding view. The envelope names the member
+ * generation, the member's held binding digest (not the aggregate journal
+ * checksum) and the member's own captured cutoff row; the set's immutable
+ * entry sentinel roster is never offered as a member cutoff, so a member
+ * that was not captured under the hold is refused rather than fenced. The
+ * single-generation check above is untouched: a set journal still refuses
+ * there with cutover-set-unsupported.
+ */
+export async function checkCutoverSetActivationWriterQuiescence(
+  input: CutoverSetActivationQuiescenceInput,
+  dependencies: ActivationQuiescenceDependencies = {},
+): Promise<ActivationQuiescenceResult> {
+  const now = dependencies.now ?? ((): Date => new Date());
+  const readMaintenanceJournal = dependencies.readMaintenanceJournal ?? readBackendMaintenanceJournal;
+  return withBackendPublicationRetainedAppendAdmissionAsync(input.homeDir, (): ActivationQuiescenceResult => {
+    const observedAt = now().toISOString();
+
+    const held = readHeldJournal(input.homeDir, readMaintenanceJournal);
+    if (held.kind === "result") return held.result;
+    const journal = held.journal;
+
+    if (journal.cutoverSet === undefined) {
+      return buildResult(
+        "unsatisfied",
+        "cutover-set-absent",
+        "the maintenance journal binds a single generation, not a cutover set; use the single-generation check",
+        null,
+      );
+    }
+    const view = resolveBackendMaintenanceGenerationBinding(journal, input.generationId);
+    if (view === null) {
+      return buildResult(
+        "unsatisfied",
+        "cutover-set-member-unbound",
+        `generation ${input.generationId} is not a member of the held cutover set ${journal.generationId}`,
+        null,
+      );
+    }
+
+    const machine = readRegisteredMachineId(input.homeDir);
+    if (machine.kind === "result") return machine.result;
+    const machineId: string = machine.machineId;
+
+    // A set member's roster is exactly one row of the set's machine (the set
+    // parser refuses anything else), so only its machine and cutoff decide.
+    const rosterRowOutcome = attributeNullableValue(
+      view.roster.find((row: BackendMaintenanceRosterEntry) => row.machineId === machineId),
+      {
+        cause: "not-in-roster",
+        detail: `the member's roster does not cover this machine (${machineId})`,
+      },
+    );
+    if (rosterRowOutcome.kind === "absent") {
+      return buildResult("unsatisfied", "roster-row-absent", rosterRowOutcome.detail, null);
+    }
+    const rosterRow = rosterRowOutcome.value;
+    if (rosterRow.queueCutoff === null) {
+      return buildResult(
+        "unsatisfied",
+        "cutover-set-member-unbound",
+        `generation ${input.generationId} still carries the set's entry sentinel; it was not captured under this hold`,
+        null,
+      );
+    }
+
+    const payload: QuiescencePayload = {
+      version: 1,
+      homeDir: normalizeHomeDirForPayload(input.homeDir),
+      machineId,
+      observedAt,
+      generationId: view.generationId,
+      maintenanceChecksumSha256: view.checksumSha256,
+      rosterRow: { queueCutoff: rosterRow.queueCutoff, evidenceSha256: rosterRow.evidenceSha256 },
+      reach: QUIESCENCE_REACH,
+    };
+    const quiescenceFence = sealQuiescenceEnvelope(payload);
+
+    return buildResult(
+      "satisfied",
+      "quiescence-observed",
+      `no local writer is active for machine ${machineId} under cutover-set member generation ${view.generationId}`,
+      quiescenceFence,
+    );
+  }, input.lockToken, input.admissionOptions);
+}
+

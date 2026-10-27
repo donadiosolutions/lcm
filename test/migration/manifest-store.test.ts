@@ -5390,3 +5390,105 @@ describe("migration manifest exact recovery", () => {
     expect(existsSync(migrationManifestGenerationDirectory(generationId, unsafeHome))).toBe(false);
   });
 });
+describe("MigrationManifestStore.probeManifestPresence", () => {
+  it("reports absent when the migrations root has never been created", () => {
+    const home = makeHome();
+    const store = new MigrationManifestStore({ homeDir: home });
+    expect(existsSync(join(home, ".lcm", "migrations"))).toBe(false);
+    expect(store.probeManifestPresence("generation-1")).toEqual({ status: "absent" });
+  });
+
+  it("reports absent for a generation id whose directory does not exist, even once the migrations root exists for another generation", () => {
+    const home = makeHome();
+    const store = new MigrationManifestStore({ homeDir: home });
+    store.create(manifest("generation-other"));
+    expect(existsSync(join(home, ".lcm", "migrations"))).toBe(true);
+    expect(existsSync(migrationManifestGenerationDirectory("generation-1", home))).toBe(false);
+    expect(store.probeManifestPresence("generation-1")).toEqual({ status: "absent" });
+  });
+
+  it("reports present once a manifest has been created for that generation", () => {
+    const home = makeHome();
+    const store = new MigrationManifestStore({ homeDir: home });
+    store.create(manifest("generation-1"));
+    expect(store.probeManifestPresence("generation-1")).toEqual({ status: "present" });
+  });
+
+  it("reports present rather than refusing when the manifest has a mid-flight publication group awaiting recovery", () => {
+    // Occupancy must not refuse a candidate merely because its manifest needs
+    // recovery; it is present either way. `read()` would throw
+    // recovery-required for this exact fixture (see the row-1 tests above);
+    // the probe must not.
+    const state = createRow1PublicationState("probe-mid-flight");
+    const store = new MigrationManifestStore({ homeDir: state.home });
+    expectProtocolReason(() => store.read(state.initial.generationId), "recovery-required");
+    expect(store.probeManifestPresence(state.initial.generationId)).toEqual({ status: "present" });
+  });
+
+  it("reports unresolvable, never absent, when revisions is missing beneath an otherwise present generation (red: without the catch this throws a raw ENOENT)", () => {
+    const home = makeHome();
+    const store = new MigrationManifestStore({ homeDir: home });
+    store.create(manifest("generation-1"));
+    const generation = migrationManifestGenerationDirectory("generation-1", home);
+    rmSync(join(generation, "revisions"), { recursive: true });
+
+    // Positive control: confirm this is the raw, uncaught throw the probe
+    // must convert, not a scenario that already behaves like absence.
+    expect(() => store.read("generation-1")).toThrow();
+    expectNonProtocolFailure(() => store.read("generation-1"));
+
+    expect(store.probeManifestPresence("generation-1")).toEqual({
+      status: "unresolvable",
+      reason: "internal-error",
+    });
+  });
+
+  it("reports unresolvable, never absent, on a non-ENOENT failure (red: an unsafe migrations directory mode)", () => {
+    const home = makeHome();
+    const migrations = join(home, ".lcm", "migrations");
+    mkdirSync(migrations, { mode: 0o700 });
+    chmodSync(migrations, 0o755);
+    const store = new MigrationManifestStore({ homeDir: home });
+    let result: ReturnType<typeof store.probeManifestPresence>;
+    try {
+      result = store.probeManifestPresence("generation-1");
+    } finally {
+      chmodSync(migrations, 0o700);
+    }
+    expect(result).toEqual({ status: "unresolvable", reason: "internal-error" });
+  });
+
+  it("preserves a MigrationProtocolError's own reason for evidence rather than collapsing every failure to one label", () => {
+    const home = makeHome();
+    const store = new MigrationManifestStore({ homeDir: home });
+    store.create(manifest("generation-1"));
+    const headPath = migrationManifestHeadPath("generation-1", home);
+    const original = readFileSync(headPath, "utf8");
+    writeFileSync(headPath, original.replace(/[{]/u, "["), { mode: 0o600 });
+
+    // Positive control: this is genuinely a malformed-manifest failure, not
+    // the absence path, before the probe is asked to classify it.
+    expectProtocolReason(() => store.read("generation-1"), "malformed-manifest");
+
+    expect(store.probeManifestPresence("generation-1")).toEqual({
+      status: "unresolvable",
+      reason: "malformed-manifest",
+    });
+  });
+
+  it("rejects a malformed generation id directly, never as unresolvable evidence", () => {
+    const home = makeHome();
+    const store = new MigrationManifestStore({ homeDir: home });
+    expectProtocolReason(() => store.probeManifestPresence("bad id"), "invalid-input");
+  });
+});
+
+function expectNonProtocolFailure(callback: () => unknown): void {
+  let failure: unknown;
+  try {
+    callback();
+  } catch (error) {
+    failure = error;
+  }
+  expect(failure).not.toBeInstanceOf(MigrationProtocolError);
+}

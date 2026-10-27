@@ -33,10 +33,10 @@ The matrix uses these expectation classes:
 | `architecture-specific` | The matrix records why the outcomes differ and checks the actual counterpart result or refusal. |
 | `grammar` | The public command grammar, help, or default dispatch is checked in both configured contexts. |
 
-Control tests own root grammar and the 19 setup, service, configuration, connector,
+Control tests own root grammar and the 20 setup, service, configuration, connector,
 MCP-launch, help, and group commands named by the inventory. Data workers own the
-other 40 CLI commands, including identity, events, diagnostics, hooks, and
-sensitive-memory operations. Setup calls do not create another completion result
+other 51 CLI commands, including identity, events, migration cutover, diagnostics,
+hooks, and sensitive-memory operations. Setup calls do not create another completion result
 for a row owned by another scenario. Backend independence is an expectation to
 test, rather than permission to omit execution.
 
@@ -134,7 +134,10 @@ It does not relax the observational contracts for CLI `stats`, `status`, or
 cannot use a readiness receipt to permit sidecar removal or identity changes.
 The separately inventoried authenticated `GET /health/observe` endpoint reports
 process identity with storage status `unverified`. It supports diagnostic
-identity checks without probing active storage readiness. Its assertions require
+identity checks without probing active storage readiness, and it alone tolerates
+a startup backend that differs from the on-disk selection, including when the
+daemon's environment lacks the newly selected backend's PostgreSQL URL, CA file,
+or migration role, while every other admission check still applies. Its assertions require
 authentication, stable identity, and the strict read-only contract; it cannot
 use the active-health bookkeeping allowance or certify storage readiness.
 Failure scenarios check unavailable or exhausted storage, cancellation, cleanup,

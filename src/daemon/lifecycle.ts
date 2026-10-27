@@ -2155,6 +2155,7 @@ export async function ensureDaemon(opts: EnsureDaemonOptions): Promise<EnsureDae
     },
   });
   let childConvergence: PublicationConvergence | undefined;
+  let childDaemonPid: number | undefined;
   const evidence = admissionEvidence;
   if (
     evidence !== undefined
@@ -2164,6 +2165,7 @@ export async function ensureDaemon(opts: EnsureDaemonOptions): Promise<EnsureDae
     && result.pid === evidence.health.pid
     && !opts._abortSignal?.aborted
   ) {
+    childDaemonPid = evidence.health.pid;
     childConvergence = createLifecyclePublicationConvergence(opts, {
       pid: evidence.health.pid!,
       version: evidence.expectedVersion,
@@ -2180,9 +2182,37 @@ export async function ensureDaemon(opts: EnsureDaemonOptions): Promise<EnsureDae
       readOwner: evidence.readOwner,
     });
   }
-  const finalWrap = childConvergence === undefined
+  // The running daemon's own lock holds converge through the child wrapper.
+  // Every failed final attempt is classified again: contention owned by a
+  // live process that is not the child falls back to the caller's wrapper
+  // for one pause, after which the assertion returns to the child wrapper, so
+  // a daemon-owned lock never spends the caller's allowance. The lifecycle
+  // itself is never rerun.
+  const finalWrap: PublicationAdmissionWrapper = childConvergence === undefined
     ? wrap
-    : abortPreservingPublicationWrapper(opts, childConvergence);
+    : async (step) => {
+      const convergent = abortPreservingPublicationWrapper(opts, childConvergence);
+      for (;;) {
+        try {
+          return await convergent(step);
+        } catch (error) {
+          if (
+            !(error instanceof PrivateMutationLockContentionError)
+            || error.contendedLock === undefined
+            || error.contendedLock.owner.pid === childDaemonPid
+            || opts._withPublicationAdmissionRetry === undefined
+            || opts._abortSignal?.aborted
+          ) throw error;
+          let refused = false;
+          await wrap(() => {
+            if (!refused) {
+              refused = true;
+              throw error;
+            }
+          });
+        }
+      }
+    };
   await finalWrap(() => assertLifecycleBackendPublication(opts));
   return result;
 }
@@ -4010,6 +4040,112 @@ async function ensureDaemonUnlocked(opts: EnsureDaemonOptions): Promise<EnsureDa
     warning: combinedWarning,
     restartedForParent,
   });
+}
+
+/** Fixed subprocess timeout of the platform listener fallbacks. */
+const LISTENER_FALLBACK_TIMEOUT_MS = 1000;
+
+export type VerifyRunningDaemonOptions = Readonly<{
+  port: number;
+  pidFilePath: string;
+  expectedVersion: string | undefined;
+  expectedStorageBackend: StorageBackend;
+  expectedEntrypoint: string | undefined;
+  expectedRuntimeDigest: string | undefined;
+  /** Budget for the whole verification, in milliseconds. */
+  budgetMs: number;
+  signal?: AbortSignal;
+}> & Pick<
+  EnsureDaemonOptions,
+  | "_fetchOverride"
+  | "_spawnSyncOverride"
+  | "_isProcessAliveOverride"
+  | "_platform"
+  | "_procRoot"
+  | "_realpathOverride"
+>;
+
+export type VerifiedRunningDaemon = Readonly<{ port: number; token: string }>;
+
+/**
+ * Read-only check that the PID-file daemon is the expected, authenticated LCM
+ * daemon listening on `port`. It applies the healthy-path policy of
+ * `ensureDaemon` (PID liveness, exact listener, public and authenticated
+ * health identity, version, backend, entrypoint and runtime digest) without
+ * starting, stopping, repairing or cleaning up anything, and returns the
+ * port with the token that authenticated it. Any missing or mismatched
+ * evidence, a missing expected identity, or an exhausted budget is a refusal.
+ *
+ * The platform listener fallbacks use a fixed one second subprocess timeout
+ * that an AbortSignal cannot preempt, so they only run when the remaining
+ * budget covers it; otherwise the check refuses.
+ */
+export async function verifyRunningDaemon(
+  opts: VerifyRunningDaemonOptions,
+): Promise<VerifiedRunningDaemon | null> {
+  const { expectedVersion, expectedEntrypoint, expectedRuntimeDigest } = opts;
+  if (
+    typeof expectedVersion !== "string"
+    || expectedVersion.length === 0
+    || expectedEntrypoint === undefined
+  ) return null;
+  const tokenPath = join(dirname(opts.pidFilePath), "daemon.token");
+  const platform = opts._platform ?? osPlatform();
+  const procRoot = opts._procRoot ?? "/proc";
+  const startedAt = performance.now();
+  const remainingMs = (): number => opts.budgetMs - (performance.now() - startedAt);
+  const remainingDeadline = (): RequestDeadline | null => {
+    const timeoutMs = remainingMs();
+    return timeoutMs <= 0
+      ? null
+      : { timeoutMs, setTimeoutFn: setTimeout, clearTimeoutFn: clearTimeout, abortSignal: opts.signal };
+  };
+
+  const pid = readPidFile(opts.pidFilePath);
+  if (pid === null || !(opts._isProcessAliveOverride ?? isProcessAlive)(pid)) return null;
+  const token = readAuthToken(tokenPath);
+  if (token === null) return null;
+  const spawnSyncImpl = opts._spawnSyncOverride ?? spawnSync;
+  const budgetedSpawnSync = ((...args: Parameters<typeof spawnSync>) =>
+    remainingMs() >= LISTENER_FALLBACK_TIMEOUT_MS
+      ? spawnSyncImpl(...args)
+      : { status: null, stdout: "" }) as typeof spawnSync;
+  if (!findListeningTcpPorts(pid, platform, budgetedSpawnSync, procRoot, opts.port).includes(opts.port)) {
+    return null;
+  }
+
+  const healthDeadline = remainingDeadline();
+  if (healthDeadline === null) return null;
+  const fetchFn = opts._fetchOverride ?? globalThis.fetch;
+  const health = await checkDaemonHealth(opts.port, fetchFn, healthDeadline);
+  if (
+    !isRecognizedDaemonHealth(health)
+    || health.pid !== pid
+    || !healthVersionMatches(health, expectedVersion)
+    || !healthStorageBackendMatches(health, opts.expectedStorageBackend)
+  ) return null;
+  const authenticated = await checkDaemonDiagnostics(
+    opts.port,
+    tokenPath,
+    fetchFn,
+    remainingDeadline,
+    health,
+    opts.expectedStorageBackend,
+    () => token,
+  );
+  if (
+    authenticated === null
+    || !processEntrypointMatches(
+      authenticated,
+      expectedEntrypoint,
+      platform,
+      procRoot,
+      opts._realpathOverride ?? realpathSync,
+    )
+    || expectedRuntimeDigest === undefined
+    || !healthRuntimeDigestMatches(authenticated, expectedRuntimeDigest)
+  ) return null;
+  return { port: opts.port, token };
 }
 
 /**

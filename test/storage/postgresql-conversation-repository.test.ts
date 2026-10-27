@@ -81,6 +81,7 @@ const conversationRow = {
   bootstrapped_at: null,
   created_at: "2026-01-01T00:00:00.000Z",
   updated_at: new Date("2026-01-02T00:00:00.000Z"),
+  parent_session_id: null,
 };
 
 const messageRow = {
@@ -134,6 +135,7 @@ describe("PostgreSQL conversation repository", () => {
     await expect(repository.getOrCreateConversation("session-a", "ignored"))
       .resolves.toMatchObject({ conversationId: 41 });
     await expect(repository.markConversationBootstrapped(41)).resolves.toBeUndefined();
+    await expect(repository.setParentSessionIdIfNull(41, "parent-a")).resolves.toBeUndefined();
     await expect(repository.listConversations()).resolves.toHaveLength(1);
     await expect(repository.createMessage({
       conversationId: 41,
@@ -204,6 +206,12 @@ describe("PostgreSQL conversation repository", () => {
       expect(config.text).not.toContain("session-a");
       expect(config.text).not.toContain("hello");
     }
+    const parentUpdate = db.query.mock.calls.find(
+      ([config]) => config.text.includes("SET parent_session_id"),
+    )?.[0];
+    expect(parentUpdate).toMatchObject({ values: [projectId, 41, "parent-a"] });
+    expect(parentUpdate.text).toContain("AND parent_session_id IS NULL");
+    expect(parentUpdate.text).not.toContain("updated_at");
     const sessionLookup = db.query.mock.calls.find(
       ([config]) => config.text.includes("session_id_sha256"),
     )?.[0];
@@ -918,6 +926,23 @@ describe("PostgreSQL conversation repository", () => {
     ]);
   });
 
+  it("sets the parent on the active transaction scope through a savepoint", async () => {
+    const statements: string[] = [];
+    const query = vi.fn(async (config: QueryConfig<unknown[]>) => {
+      statements.push(config.text);
+      return result([]);
+    });
+    const repository = new PostgreSqlConversationRepository(scopedExecutor(query), projectId);
+
+    await expect(repository.setParentSessionIdIfNull(41, "parent-a")).resolves.toBeUndefined();
+    expect(statements).toEqual([
+      "SAVEPOINT lcm_conversation_repository_1",
+      expect.stringContaining("SET parent_session_id = $3"),
+      "RELEASE SAVEPOINT lcm_conversation_repository_1",
+    ]);
+    expect(query.mock.calls[1][0]).toMatchObject({ values: [projectId, 41, "parent-a"] });
+  });
+
   it("serializes bootstrap and part writes behind a failing scoped mapped write", async () => {
     const unsafeMessage = {
       ...messageRow,
@@ -1102,6 +1127,130 @@ describe("PostgreSQL conversation repository", () => {
     await expect(repository.getMaxSeq(42)).resolves.toBe(6);
   });
 
+  const slotMarker = (consumed: boolean) =>
+    JSON.stringify({ lcmTranscriptSlot: { version: 1, consumed } });
+
+  function slotQuery(rows: {
+    count?: unknown;
+    events?: Array<Record<string, unknown>>;
+    markers?: Array<Record<string, unknown>>;
+  }) {
+    return vi.fn((config: QueryConfig<unknown[]>) => {
+      if (config.text.includes("transaction_isolation")) {
+        return result([{ transaction_isolation: "read committed" }]);
+      }
+      if (config.text.includes("pg_advisory_xact_lock")) return result([{ pg_advisory_xact_lock: null }]);
+      if (config.text.includes("session_id_sha256") && config.text.includes("lcm.conversations")
+        && !config.text.includes("compaction_part") && !config.text.includes("message_parts")) {
+        return result([conversationRow]);
+      }
+      if (config.text.includes("COUNT(message.message_id)")) return result([{ count: rows.count ?? "0" }]);
+      if (config.text.includes("AS followed")) return result(rows.events ?? []);
+      if (config.text.includes("part.part_type = 'snapshot'")) return result(rows.markers ?? []);
+      return result([]);
+    });
+  }
+
+  it("reads the session-wide transcript slot state with three project-scoped statements", async () => {
+    const query = slotQuery({
+      count: "7",
+      events: [
+        { message_id: "61", followed: true, next_ordinal: "1" },
+        { message_id: 62n, followed: false, next_ordinal: 3 },
+        { message_id: 63, followed: true, next_ordinal: "2" },
+      ],
+      markers: [
+        { message_id: "62", metadata: slotMarker(false) },
+        { message_id: "62", metadata: "not json" },
+        { message_id: 62n, metadata: slotMarker(false) },
+        { message_id: "63", metadata: slotMarker(true) },
+        { message_id: "63", metadata: null },
+      ],
+    });
+    const repository = new PostgreSqlConversationRepository(executor(query), projectId);
+
+    await expect(repository.getTranscriptSlotSnapshot("session-a")).resolves.toEqual({
+      transcriptCount: 7,
+      events: [
+        { messageId: 61, followedByTranscript: true, nextOrdinal: 1, slotMarkers: [] },
+        { messageId: 62, followedByTranscript: false, nextOrdinal: 3, slotMarkers: [false, false] },
+        { messageId: 63, followedByTranscript: true, nextOrdinal: 2, slotMarkers: [true] },
+      ],
+    });
+    expect(query).toHaveBeenCalledTimes(3);
+    for (const [config] of query.mock.calls) {
+      expect(config.values).toEqual([projectId, "session-a"]);
+      expect(config.text).toContain("conversation.project_id = $1");
+      expect(config.text).toContain("conversation.session_id_sha256 = public.digest($2, 'sha256')");
+      expect(config.text).toContain("conversation.session_id = $2");
+      expect(config.text).toContain("compaction_part.part_type = 'compaction'");
+    }
+    const [counted, events, markers] = query.mock.calls.map(([config]) => config.text as string);
+    expect(counted).toContain("AND NOT EXISTS (");
+    expect(events).toContain("ORDER BY conversation.created_at");
+    expect(events).toContain("later_conversation.created_at");
+    expect(markers).toContain("ORDER BY part.message_id, part.ordinal");
+    await expect(new PostgreSqlConversationRepository(executor(slotQuery({})), projectId)
+      .getTranscriptSlotSnapshot("empty")).resolves.toEqual({ transcriptCount: 0, events: [] });
+  });
+
+  it("rejects malformed slot snapshot data and NUL session text without reading", async () => {
+    for (const [field, rows] of [
+      ["count", { count: "9007199254740992" }],
+      ["message_id", { events: [{ message_id: "x", followed: false, next_ordinal: 0 }] }],
+      ["next_ordinal", { events: [{ message_id: "1", followed: false, next_ordinal: "-x" }] }],
+      ["message_id", { markers: [{ message_id: "9007199254740992", metadata: slotMarker(true) }] }],
+    ] as const) {
+      const repository = new PostgreSqlConversationRepository(executor(slotQuery(rows)), projectId);
+      await expect(repository.getTranscriptSlotSnapshot("session-a")).rejects.toMatchObject({
+        name: "PostgreSqlConversationDataError",
+        operation: "getTranscriptSlotSnapshot",
+        field,
+      });
+    }
+    const untouched = executor(() => {
+      throw new Error("NUL session text must not query");
+    });
+    await expect(new PostgreSqlConversationRepository(untouched, projectId)
+      .getTranscriptSlotSnapshot("before\0after")).rejects.toMatchObject({ field: "session_id" });
+    expect(untouched.query).not.toHaveBeenCalled();
+  });
+
+  it("holds the session advisory lock before any slot read or append on one scoped executor", async () => {
+    const query = slotQuery({
+      count: "1",
+      events: [{ message_id: "61", followed: true, next_ordinal: "1" }],
+    });
+    const statements: string[] = [];
+    const recording = vi.fn((config: QueryConfig<unknown[]>, options: PostgreSqlQueryOptions) => {
+      statements.push(config.text);
+      return query(config, options);
+    });
+    const repository = new PostgreSqlConversationRepository(scopedExecutor(recording), projectId);
+
+    await repository.getOrCreateConversation("session-a");
+    await repository.getTranscriptSlotSnapshot("session-a");
+    await repository.createMessageParts(61, [{
+      sessionId: "session-a",
+      partType: "snapshot",
+      ordinal: 1,
+      metadata: slotMarker(true),
+    }]);
+
+    const lock = statements.findIndex((text) => text.includes("pg_advisory_xact_lock"));
+    const counted = statements.findIndex((text) => text.includes("COUNT(message.message_id)"));
+    const events = statements.findIndex((text) => text.includes("AS followed"));
+    const markers = statements.findIndex((text) => text.includes("part.part_type = 'snapshot'"));
+    const marker = statements.findIndex((text) => text.includes("INSERT INTO lcm.message_parts"));
+    expect(lock).toBeGreaterThanOrEqual(0);
+    expect(counted).toBeGreaterThan(lock);
+    expect(events).toBeGreaterThan(counted);
+    expect(markers).toBeGreaterThan(events);
+    expect(marker).toBeGreaterThan(markers);
+    // The reads join the surrounding transaction: no nested transaction was opened.
+    expect(statements.filter((text) => /^(BEGIN|COMMIT)/u.test(text))).toEqual([]);
+  });
+
   it.each([
     ["maximum string", String(Number.MAX_SAFE_INTEGER), Number.MAX_SAFE_INTEGER],
     ["minimum string", String(Number.MIN_SAFE_INTEGER), Number.MIN_SAFE_INTEGER],
@@ -1195,6 +1344,10 @@ describe("PostgreSQL conversation repository", () => {
 
   it.each([
     ["getConversation", () => repositoryForInputs().getConversation(1.5), "conversation_id"],
+    ["setParentSessionIdIfNull id", () =>
+      repositoryForInputs().setParentSessionIdIfNull(1.5, "parent"), "conversation_id"],
+    ["setParentSessionIdIfNull NUL", () =>
+      repositoryForInputs().setParentSessionIdIfNull(1, "bad\0parent"), "parent_session_id"],
     ["markConversationBootstrapped", () =>
       repositoryForInputs().markConversationBootstrapped(Number.POSITIVE_INFINITY), "conversation_id"],
     ["createMessage conversation", () => repositoryForInputs().createMessage({

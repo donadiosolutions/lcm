@@ -7,6 +7,7 @@ import {
   type ProgressState,
 } from "./cli/progress-state.js";
 import { DaemonClient } from "./daemon/client.js";
+import { isAbortError, throwIfAborted } from "./daemon/cancellation.js";
 import { isDaemonTransportFailure } from "./daemon/http-url.js";
 import { configPath } from "./runtime-paths.js";
 import { normalizeProjectPath, resolveExistingProjectIdentity } from "./project-map.js";
@@ -18,7 +19,11 @@ import { projectPathsForIdentity } from "./daemon/project.js";
 import { CliProjectStorageMissingError, listCliProjects, withCliProjectStorage } from "./cli-storage.js";
 import { NATIVE_SOURCE_LOCATOR_BATCH_SIZE, type ProjectRepositories } from "./storage/contracts.js";
 import { createSqliteRepositories, createSqliteRepositoryStores } from "./storage/sqlite/repositories.js";
-import { StorageIdentityConfigurationError, UNBOUND_POSTGRESQL_PROJECT_MESSAGE } from "./storage/identity-context.js";
+import {
+  StorageIdentityConfigurationError,
+  TransportedUnboundProjectError,
+  UNBOUND_POSTGRESQL_PROJECT_MESSAGE,
+} from "./storage/identity-context.js";
 import {
   RetiredProjectIdentityError,
   assertProjectStorageIdentityActive,
@@ -102,6 +107,9 @@ type UncompactedDiscovery = {
   /** True when project enumeration itself threw; false when every selected
    * project was enumerated but individual projects failed to open. */
   discoveryFailed: boolean;
+  /** True when intentional cancellation interrupted discovery; the other
+   * fields then carry only what was recorded before the interruption. */
+  aborted: boolean;
 };
 
 const MANUAL_COMPACT_LEAF_MIN_FANOUT = 3;
@@ -239,6 +247,25 @@ type SourceLocatorResolver = (
   sessionIds: readonly string[],
 ) => Promise<ReadonlyMap<string, string>>;
 
+/**
+ * Yield one macrotask turn, then observe cancellation.
+ *
+ * Storage callbacks settle on promise microtasks, so a discovery that never
+ * yields would starve timers (lease heartbeats) and signal handlers until it
+ * returned. Awaiting a setImmediate lets the event loop reach those phases
+ * at project, conversation, subsequent-page, locator-batch, and per-session
+ * locator-fallback boundaries and after each project scan returns, and the
+ * signal check afterwards turns a cancellation that ran in that window into
+ * an intentional abort. The intervals between checkpoints stay indivisible:
+ * project inventory enumeration (listing the projects before the first
+ * checkpoint), one storage open, and one conversation's final page plus its
+ * summaries and context reads.
+ */
+async function discoveryCheckpoint(signal?: AbortSignal): Promise<void> {
+  await new Promise<void>(resolveTurn => setImmediate(resolveTurn));
+  throwIfAborted(signal);
+}
+
 type CompactRepositories = Pick<ProjectRepositories, "conversations" | "summaries" | "context"> & {
   readonly nativeTranscripts?: ProjectStorage["nativeTranscripts"];
 };
@@ -249,9 +276,11 @@ async function discoverProject(
   minTokens: number,
   replay: boolean,
   resolveSourceLocators?: SourceLocatorResolver,
+  signal?: AbortSignal,
 ): Promise<UncompactedConversation[]> {
   const candidates: UncompactedConversation[] = [];
   for (const conversation of await storage.conversations.listConversations()) {
+    await discoveryCheckpoint(signal);
     const conversationId = conversation.conversationId;
     let messages = 0;
     let tokens = 0;
@@ -264,6 +293,7 @@ async function discoverProject(
       tokens += page.reduce((total, message) => total + message.tokenCount, 0);
       if (page.length < 500) break;
       afterSeq = page[page.length - 1]!.seq;
+      await discoveryCheckpoint(signal);
     }
     if (messages === 0 || tokens < minTokens) continue;
     const summaries = await storage.summaries.getSummariesByConversation(conversationId);
@@ -294,7 +324,7 @@ async function discoverProject(
       tokens,
     });
   }
-  const locators = await discoverySourceLocators(storage, candidates, resolveSourceLocators);
+  const locators = await discoverySourceLocators(storage, candidates, resolveSourceLocators, signal);
   return candidates
     .map(candidate => {
       const sourceLocator = locators.get(candidate.sessionId);
@@ -318,6 +348,7 @@ async function discoverySourceLocators(
   storage: CompactRepositories,
   candidates: readonly { readonly sessionId: string }[],
   resolveSourceLocators?: SourceLocatorResolver,
+  signal?: AbortSignal,
 ): Promise<ReadonlyMap<string, string>> {
   const sessionIds = [...new Set(candidates.map(candidate => candidate.sessionId))];
   if (sessionIds.length === 0) return new Map();
@@ -334,18 +365,22 @@ async function discoverySourceLocators(
     offset < sessionIds.length;
     offset += NATIVE_SOURCE_LOCATOR_BATCH_SIZE
   ) {
+    await discoveryCheckpoint(signal);
     const chunk = sessionIds.slice(offset, offset + NATIVE_SOURCE_LOCATOR_BATCH_SIZE);
     try {
       for (const [sessionId, locator] of await resolve(chunk)) locators.set(sessionId, locator);
-    } catch {
+    } catch (error) {
+      if (isAbortError(error)) throw error;
       // One unreadable session must not hide provenance for every other
       // session, so a failed batch degrades to per-session resolution. A
       // failed batch therefore costs its own statement plus one bounded
       // statement per session in that batch, and only on the error path.
       for (const sessionId of chunk) {
+        await discoveryCheckpoint(signal);
         try {
           for (const [id, locator] of await resolve([sessionId])) locators.set(id, locator);
-        } catch {
+        } catch (sessionError) {
+          if (isAbortError(sessionError)) throw sessionError;
           // Optional provenance is omitted for this session alone.
         }
       }
@@ -359,6 +394,7 @@ async function discoverSqlitePreview(
   project: { id: string; canonical: string },
   minTokens: number,
   replay: boolean,
+  signal?: AbortSignal,
 ): Promise<UncompactedConversation[]> {
   const config = loadDaemonConfig(configPath());
   return withBackendPublicationConsumerLockAsync(undefined, async token => {
@@ -415,6 +451,7 @@ async function discoverSqlitePreview(
           }
           return locators;
         },
+        signal,
       );
     } finally {
       snapshot.close();
@@ -428,6 +465,7 @@ async function discoverUncompacted(
   cwdFilter?: string,
   replay = false,
   onEvent?: (event: CompactProgressEvent) => void,
+  signal?: AbortSignal,
 ): Promise<UncompactedDiscovery> {
   const conversations: UncompactedConversation[] = [];
   const failures: ProjectScanFailure[] = [];
@@ -440,15 +478,17 @@ async function discoverUncompacted(
   } catch {
     onEvent?.({ type: "phase-failure", phase: "Compact", project: cwdFilter, message: "project discovery failed" });
     onEvent?.({ type: "discovery-clear" });
-    return { conversations, failures: [{ target: cwdFilter ?? "projects", message: "project discovery failed" }], discoveryFailed: true };
+    return { conversations, failures: [{ target: cwdFilter ?? "projects", message: "project discovery failed" }], discoveryFailed: true, aborted: false };
   }
   const selectedProjects = projects.filter(project => cwdFilter === undefined
     || project.canonical === filterCanonical
     || project.aliases.includes(resolve(cwdFilter)));
   onEvent?.({ type: "discovery-start", total: selectedProjects.length });
+  let aborted = false;
   try {
     for (const [offset, project] of selectedProjects.entries()) {
       const index = offset + 1;
+      await discoveryCheckpoint(signal);
       onEvent?.({
         type: "discovery-item-start",
         index,
@@ -460,9 +500,13 @@ async function discoverUncompacted(
         const config = loadDaemonConfig(configPath());
         const selected = selectStorageBackendForConfig(configPath(), config.storage);
         const found = readOnly && selected.backend === "sqlite"
-          ? await discoverSqlitePreview(project, minTokens, replay)
+          ? await discoverSqlitePreview(project, minTokens, replay, signal)
           : await withCliProjectStorage(project.canonical, {}, async ({ storage, project: opened }) =>
-            discoverProject(storage, opened, minTokens, replay));
+            discoverProject(storage, opened, minTokens, replay, undefined, signal));
+        // The scan's last read has no checkpoint after it: a cancellation
+        // latched there, or queued as the next macrotask, must not classify
+        // the project done or hand its conversations to the compact pool.
+        await discoveryCheckpoint(signal);
         conversations.push(...found);
         onEvent?.({
           type: "discovery-item-terminal",
@@ -473,6 +517,13 @@ async function discoverUncompacted(
           outcome: "done",
         });
       } catch (error) {
+        // Intentional cancellation is not a project failure: leave the
+        // interrupted project without a terminal event and stop admitting more.
+        if (isAbortError(error)) throw error;
+        // A cancellation queued while the open failed or found no storage is
+        // still pending here: observe it before classifying the project, so it
+        // cannot leave discovery unnoticed and admit compact work.
+        await discoveryCheckpoint(signal);
         if (error instanceof CliProjectStorageMissingError) {
           onEvent?.({
             type: "discovery-item-terminal",
@@ -511,10 +562,13 @@ async function discoverUncompacted(
         });
       }
     }
+  } catch (error) {
+    if (!isAbortError(error)) throw error;
+    aborted = true;
   } finally {
     onEvent?.({ type: "discovery-clear" });
   }
-  return { conversations, failures, discoveryFailed: false };
+  return { conversations, failures, discoveryFailed: false, aborted };
 }
 
 /** Find conversations eligible for compaction, above the token threshold. */
@@ -522,6 +576,31 @@ export async function findUncompacted(minTokens: number, readOnly = false, cwdFi
   const configFile = configPath();
   selectStorageBackendForConfig(configFile, loadDaemonConfig(configFile).storage);
   return (await discoverUncompacted(minTokens, readOnly, cwdFilter, replay)).conversations;
+}
+
+/**
+ * Derive a per-session failure message from structured error fields only.
+ * The message never contains error.message, a response body or a provider
+ * payload; every string is a constant plus at most a validated HTTP status.
+ */
+function classifySessionFailure(error: unknown): string {
+  if (!(error instanceof Error)) return "unknown error";
+  if (isAbortError(error)) return "compaction request cancelled";
+  if (error instanceof TransportedUnboundProjectError) {
+    return "no PostgreSQL binding; run lcm project create or lcm project link <id>";
+  }
+  const statusCode = (error as { statusCode?: unknown }).statusCode;
+  if (typeof statusCode === "number" && Number.isSafeInteger(statusCode) && statusCode >= 400 && statusCode <= 599) {
+    if (statusCode === 401 || statusCode === 403) return `daemon auth rejected (HTTP ${statusCode}); run lcm doctor`;
+    if (statusCode === 503) return "daemon unavailable (HTTP 503); run lcm doctor";
+    if (statusCode < 500) return `daemon rejected compact request (HTTP ${statusCode})`;
+    return `daemon compaction failed (HTTP ${statusCode}); run lcm doctor`;
+  }
+  if (isDaemonTransportFailure(error)) {
+    return "daemon connection lost; outcome unknown; rerun after lcm doctor";
+  }
+  if (error instanceof SyntaxError) return "malformed compact response";
+  return "compaction request failed";
 }
 
 /** Compact all uncompacted conversations above threshold via the daemon. */
@@ -553,12 +632,18 @@ export async function batchCompact(opts: {
   const config = loadDaemonConfig(configFile);
   selectStorageBackendForConfig(configFile, config.storage);
   const maxConcurrency = opts.replay ? 1 : opts.maxConcurrency ?? config.llm.maxConcurrency;
+  // A command already cancelled before discovery must not list projects, open
+  // storage, or report that nothing needs compaction.
+  if (opts.signal?.aborted === true) {
+    return { compacted: 0, unchanged: 0, skipped: 0, failures: 0, compactedProjects: [] };
+  }
   const discovery = await discoverUncompacted(
     opts.minTokens,
     opts.dryRun,
     opts.cwd,
     opts.replay,
     opts.onEvent,
+    opts.signal,
   );
   const conversations = discovery.conversations;
   const onProgress = opts.onProgress;
@@ -567,6 +652,13 @@ export async function batchCompact(opts: {
     target: failure.target,
     message: failure.message,
   }));
+
+  if (discovery.aborted) {
+    // Cancelled mid-discovery: surface only failures recorded before the
+    // interruption, then skip the summary lines and the worker pool.
+    if (phaseErrors.length > 0) onProgress?.({ phaseErrors });
+    return { compacted: 0, unchanged: 0, skipped: 0, failures: phaseErrors.length, compactedProjects: [] };
+  }
 
   if (conversations.length === 0 && phaseErrors.length === 0) {
     console.error("Nothing to compact — no sessions are currently eligible.");
@@ -712,7 +804,7 @@ export async function batchCompact(opts: {
       const activePatch = progressActivePatch();
 
       if ("error" in result) {
-        const errMsg = result.error instanceof Error ? "compaction request failed" : "unknown error";
+        const errMsg = classifySessionFailure(result.error);
         if (isDaemonTransportFailure(result.error)) opts.onTransportFailure?.(result.error);
         progressErrors.push({
           project: conv.cwd,

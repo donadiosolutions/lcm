@@ -5,7 +5,7 @@ import {
   type BackendPublicationProjectRecord,
   type BackendPublicationRecoveryFile,
 } from "../storage/backend-publication.js";
-import { canonicalJson, canonicalSha256 } from "../storage/portable-record.js";
+import { canonicalJson, canonicalSha256, sha256 } from "../storage/portable-record.js";
 import {
   OWNER_ONLY_FILE_MODES,
   PRIVATE_FILE_MODE,
@@ -97,9 +97,46 @@ import { attributeNullableRead } from "./activation-absence.js";
  * is publication-time state this module never observes), and the
  * publicationId itself.
  *
+ * Part C: the generation -> publication link record.
+ *
+ * The recovery-material record is keyed by its identity digest on purpose
+ * (Part A), which leaves one question a crash-recovering driver cannot
+ * answer from the record alone: "which artifact belongs to generation G?"
+ * Recomputing the digest from live source/target files is only correct
+ * before those files change; after the version-2 publication (plan-v5 S13)
+ * has rewritten the config and project map, a recomputed digest names a
+ * record that was never published. recordActivationGenerationLink therefore
+ * writes a second, tiny immutable file next to the artifacts, named by the
+ * generation id's SHA-256 (generation-<sha256hex(generationId)>.link,
+ * never the raw id, so the name stays fixed-width and path-safe), carrying
+ * {generationId, publicationId, identityDigest, epochManifestRevision,
+ * epochManifestChecksumSha256}. The last two are the revision and checksum
+ * of the VERIFIED manifest the activation epoch is derived from, frozen
+ * here before prepare-activation advances the manifest (plan-v7 A8/S-2):
+ * a retry that re-derived them from the now-activating manifest would
+ * mint a different epochId and refuse itself, so retries read the pair
+ * from this link and never from the live manifest. The link is written in
+ * S4b, after coverage backfill and before any manifest effect, under the
+ * exact same
+ * persistence discipline (requireAbsent durable write, byte-identical
+ * reuse, typed conflict on different bytes, crash-twin recovery, directory
+ * fsync). A re-entering driver -- and #627's read-only report -- resolve the
+ * link first and read the artifact by the digest it names.
+ *
+ * readActivationGenerationLink is three-valued, never null: "resolved" with
+ * the strictly parsed link, "authoritatively-absent" when an attributed
+ * not-found was observed (the private root, the artifact directory, or the
+ * link file is genuinely missing), or "unresolvable" with a reason when the
+ * read could not be trusted (unauthenticated root or directory, permission
+ * denial, an unconverged multi-link state, a malformed or canonically
+ * different record, a record naming another generation, or a directory
+ * that changed under the read). An unrecognized I/O error still propagates
+ * raw: this reader attributes, it never guesses.
+ *
  * Nullable reads. Every nullable read in this module -- the presence check
- * for an existing artifact at a computed identity-digest path, and the
- * optional per-file capture helper -- goes through activation-absence.ts's
+ * for an existing artifact at a computed identity-digest path, the
+ * generation link presence check, and the optional per-file capture
+ * helper -- goes through activation-absence.ts's
  * attributeNullableRead, never a bare try/catch that folds "not found" and
  * "permission denied" into the same conclusion. A read that succeeded and
  * found nothing is reported as absent (safe to write); a read that could
@@ -119,6 +156,15 @@ const MAX_ACTIVATION_ARTIFACT_BYTES = 8 * 1024 * 1024;
 const IDENTITY_DIGEST_PATTERN = /^[0-9a-f]{64}$/u;
 const PUBLICATION_ID_PATTERN = /^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$/u;
 const EVIDENCE_SHA256_PATTERN = /^[0-9a-f]{64}$/u;
+const ACTIVATION_GENERATION_LINK_VERSION = 1 as const;
+/** Same identifier shape every migration store in this directory requires
+ * of a generation id (manifest-store.ts, verification-store.ts,
+ * generation-binding-store.ts). */
+const GENERATION_ID_PATTERN = /^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$/u;
+/** A link record is three bounded tokens plus a version: well under 500
+ * bytes at every field's maximum length. Bounded generously above that,
+ * matching generation-binding-store.ts's convention. */
+const MAX_ACTIVATION_GENERATION_LINK_BYTES = 4096;
 
 /** The four-file identity subset of BackendPublicationProjectRecord this
  * module's recovery material actually needs. The fence is publication-time
@@ -162,6 +208,65 @@ export type ActivationArtifactPublishResult = Readonly<{
   path: string;
   material: ActivationArtifactRecoveryMaterial;
 }>;
+
+/** The durable generation -> publication link (Part C of the module doc). */
+export type ActivationGenerationLink = Readonly<{
+  version: typeof ACTIVATION_GENERATION_LINK_VERSION;
+  generationId: string;
+  publicationId: string;
+  /** The identity digest (store key) of the recovery-material record this
+   * generation's activation publishes; see readActivationArtifact. */
+  identityDigest: string;
+  /** Revision of the verified manifest the activation epoch derives from,
+   * frozen before prepare-activation advances it (plan-v7 A8). */
+  epochManifestRevision: number;
+  /** checksumSha256 of that same verified manifest. */
+  epochManifestChecksumSha256: string;
+}>;
+
+export type ActivationGenerationLinkRecordResult = Readonly<{
+  outcome: ActivationArtifactPublishOutcome;
+  path: string;
+  link: ActivationGenerationLink;
+}>;
+
+export type ActivationGenerationLinkUnresolvableReason =
+  /** The private LCM root exists but failed private-directory authentication. */
+  | "root-unauthenticated"
+  /** The artifact directory exists but failed private-directory authentication. */
+  | "directory-unauthenticated"
+  /** The link read was refused (attributed as unresolvable by activation-absence.ts). */
+  | "read-unresolvable"
+  /** The link has more than one hard link: an interrupted durable write the
+   * writer's retry converges and a reader never repairs. */
+  | "multi-link"
+  /** The stored bytes are not a canonical, strictly valid link record. */
+  | "malformed-record"
+  /** The stored record is well-formed but names a different generation than
+   * the one its filename was derived from. */
+  | "generation-mismatch"
+  /** The root or the directory changed identity between open and read. */
+  | "directory-changed";
+
+/** Three-valued link read. Never collapse "authoritatively-absent" and
+ * "unresolvable": the first licenses a fresh activation to proceed to S11,
+ * the second refuses until an operator looks. */
+export type ActivationGenerationLinkReadResult = Readonly<
+  | { state: "resolved"; link: ActivationGenerationLink; path: string }
+  | { state: "authoritatively-absent"; detail: string }
+  | { state: "unresolvable"; reason: ActivationGenerationLinkUnresolvableReason; detail: string }
+>;
+
+/** A generation link already exists for this generation with different
+ * bytes (another publicationId or identityDigest). Never overwritten: two
+ * publications for one generation is exactly the state the link exists to
+ * make impossible to miss. */
+export class ActivationGenerationLinkConflictError extends Error {
+  constructor(message: string, options?: { readonly cause?: unknown }) {
+    super(message, options);
+    this.name = "ActivationGenerationLinkConflictError";
+  }
+}
 
 /** The candidate record's shape (or a caller-supplied stored record being
  * parsed back) does not satisfy this module's schema. */
@@ -228,6 +333,13 @@ export function activationArtifactDirectory(homeDir?: string): string {
 
 export function activationArtifactPath(homeDir: string | undefined, identityDigest: string): string {
   return join(activationArtifactDirectory(homeDir), identityDigest + ".material");
+}
+
+/** The generation link's path: named by the generation id's SHA-256, never
+ * the raw id, so the name is fixed-width and path-safe for any identifier
+ * the pattern admits. */
+export function activationGenerationLinkPath(homeDir: string | undefined, generationId: string): string {
+  return join(activationArtifactDirectory(homeDir), "generation-" + sha256(generationId) + ".link");
 }
 
 /**
@@ -584,6 +696,20 @@ type ReconcileOutcome =
   | Readonly<{ kind: "absent" }>
   | Readonly<{ kind: "reused" }>;
 
+/** What one immutable file in the activation artifact directory is, for
+ * the shared reconcile helpers below: how to name it in an unresolvable
+ * message, how large a legitimate copy may be, and which typed conflict
+ * error a byte-different existing copy raises. The recovery-material
+ * record and the generation link share every other part of the
+ * discipline (requireAbsent durable write, byte-identical reuse, crash-twin
+ * recovery, attributed presence reads) and differ only here. */
+type ReconcileSubject = Readonly<{
+  /** Noun phrase without article, e.g. "activation artifact". */
+  describe: string;
+  maxBytes: number;
+  conflict: (path: string) => Error;
+}>;
+
 const MULTIPLE_HARD_LINKS_MESSAGE = "file has multiple hard links";
 
 function isMultipleHardLinksError(error: unknown): boolean {
@@ -717,13 +843,13 @@ function reconcileArtifactScratchTwin(
   path: string,
   directory: string,
   serialized: string,
-  identityDigest: string,
+  subject: ReconcileSubject,
   expectedUid: number | undefined,
   readWithStat: typeof readBoundedRegularFileWithStat,
 ): ReconcileOutcome {
   const unresolvable = (): never => {
     throw new ActivationArtifactPresenceUnresolvableError(
-      "a multi-link activation artifact at " + path +
+      "a multi-link " + subject.describe + " at " + path +
         " could not be authenticated as an interrupted durable-write scratch twin",
     );
   };
@@ -731,7 +857,7 @@ function reconcileArtifactScratchTwin(
     attributeNullableRead<BoundedFileResult>(
       () => readWithStat(candidatePath, {
         allowedRoot: directory,
-        maxBytes: MAX_ACTIVATION_ARTIFACT_BYTES,
+        maxBytes: subject.maxBytes,
         expectedUid,
         allowedModes: [PRIVATE_FILE_MODE],
       }),
@@ -779,17 +905,14 @@ function reconcileArtifactScratchTwin(
   if (finalOutcome.value.content === serialized) {
     return { kind: "reused" };
   }
-  throw new ActivationArtifactIdentityMismatchError(
-    "an activation artifact already exists at " + path + " for identity digest " + identityDigest +
-      " with different content; refusing to overwrite durable recovery material",
-  );
+  throw subject.conflict(path);
 }
 
 function reconcileExisting(
   path: string,
   directory: string,
   serialized: string,
-  identityDigest: string,
+  subject: ReconcileSubject,
   expectedUid: number | undefined,
   readWithStat: typeof readBoundedRegularFileWithStat,
 ): ReconcileOutcome {
@@ -798,7 +921,7 @@ function reconcileExisting(
     outcome = attributeNullableRead<BoundedFileResult>(
       () => readWithStat(path, {
         allowedRoot: directory,
-        maxBytes: MAX_ACTIVATION_ARTIFACT_BYTES,
+        maxBytes: subject.maxBytes,
         expectedUid,
         allowedModes: [PRIVATE_FILE_MODE],
         requireSingleLink: true,
@@ -806,13 +929,13 @@ function reconcileExisting(
     );
   } catch (error) {
     if (isMultipleHardLinksError(error)) {
-      return reconcileArtifactScratchTwin(path, directory, serialized, identityDigest, expectedUid, readWithStat);
+      return reconcileArtifactScratchTwin(path, directory, serialized, subject, expectedUid, readWithStat);
     }
     throw error;
   }
   if (outcome.kind === "unresolvable") {
     throw new ActivationArtifactPresenceUnresolvableError(
-      "cannot determine whether an activation artifact already exists at " + path + ": " + outcome.detail,
+      "cannot determine whether an " + subject.describe + " already exists at " + path + ": " + outcome.detail,
     );
   }
   if (outcome.kind === "absent") {
@@ -821,10 +944,68 @@ function reconcileExisting(
   if (outcome.value.content === serialized) {
     return { kind: "reused" };
   }
-  throw new ActivationArtifactIdentityMismatchError(
-    "an activation artifact already exists at " + path + " for identity digest " + identityDigest +
-      " with different content; refusing to overwrite durable recovery material",
-  );
+  throw subject.conflict(path);
+}
+
+/** The recovery-material record's reconcile subject (see ReconcileSubject). */
+function artifactSubject(identityDigest: string): ReconcileSubject {
+  return {
+    describe: "activation artifact",
+    maxBytes: MAX_ACTIVATION_ARTIFACT_BYTES,
+    conflict: (path) => new ActivationArtifactIdentityMismatchError(
+      "an activation artifact already exists at " + path + " for identity digest " + identityDigest +
+        " with different content; refusing to overwrite durable recovery material",
+    ),
+  };
+}
+
+/**
+ * Shared publish core for both immutable files this directory holds:
+ * reconcile against whatever already sits at path, durably write with
+ * requireAbsent only when the key is genuinely absent, and on a benign
+ * collision race re-reconcile rather than fail. See
+ * publishActivationArtifact's doc comment for the full retry-converges
+ * rationale; it is identical for the generation link.
+ */
+function publishImmutableFile(
+  path: string,
+  directory: string,
+  serialized: string,
+  subject: ReconcileSubject,
+  expectedUid: number | undefined,
+  readWithStat: typeof readBoundedRegularFileWithStat,
+  writeDurable: typeof atomicWritePrivateFileDurable,
+): ActivationArtifactPublishOutcome {
+  const attempt = (): ReconcileOutcome =>
+    reconcileExisting(path, directory, serialized, subject, expectedUid, readWithStat);
+
+  const first = attempt();
+  if (first.kind === "reused") return "reused";
+
+  try {
+    writeDurable(path, serialized, {
+      requireAbsent: true,
+      maxExistingBytes: subject.maxBytes,
+      expectedUid,
+    });
+  } catch (error) {
+    if (!isBenignCollisionRace(error)) throw error;
+    // A concurrent writer published (or a leftover debris file blocked, then
+    // cleared) between our presence check and this write attempt. Re-read
+    // and reconcile exactly as above rather than treating a race as failure:
+    // this is the "retry converges" property applied to true concurrency,
+    // not just sequential crash-then-retry.
+    const retry = attempt();
+    if (retry.kind === "absent") {
+      // The collision this module observed is already gone. Surface the
+      // original error rather than loop indefinitely against a filesystem
+      // that keeps changing out from under this call.
+      throw error;
+    }
+    return "reused";
+  }
+
+  return "written";
 }
 
 /**
@@ -848,38 +1029,10 @@ export function publishActivationArtifact(
 
   ensureActivationArtifactDirectory(input.homeDir, expectedUid);
 
-  const attempt = (): ReconcileOutcome =>
-    reconcileExisting(path, directory, serialized, identityDigest, expectedUid, readWithStat);
-
-  const first = attempt();
-  if (first.kind === "reused") {
-    return { outcome: "reused", identityDigest, path, material };
-  }
-
-  try {
-    writeDurable(path, serialized, {
-      requireAbsent: true,
-      maxExistingBytes: MAX_ACTIVATION_ARTIFACT_BYTES,
-      expectedUid,
-    });
-  } catch (error) {
-    if (!isBenignCollisionRace(error)) throw error;
-    // A concurrent writer published (or a leftover debris file blocked, then
-    // cleared) between our presence check and this write attempt. Re-read
-    // and reconcile exactly as above rather than treating a race as failure:
-    // this is the "retry converges" property applied to true concurrency,
-    // not just sequential crash-then-retry.
-    const retry = attempt();
-    if (retry.kind === "absent") {
-      // The collision this module observed is already gone. Surface the
-      // original error rather than loop indefinitely against a filesystem
-      // that keeps changing out from under this call.
-      throw error;
-    }
-    return { outcome: "reused", identityDigest, path, material };
-  }
-
-  return { outcome: "written", identityDigest, path, material };
+  const outcome = publishImmutableFile(
+    path, directory, serialized, artifactSubject(identityDigest), expectedUid, readWithStat, writeDurable,
+  );
+  return { outcome, identityDigest, path, material };
 }
 
 export type ActivationArtifactReadDependencies = Readonly<{
@@ -1046,4 +1199,265 @@ export function captureActivationRecoveryFile(
     parentDev: observed.parentDev,
     parentIno: observed.parentIno,
   };
+}
+
+// --- Part C: the generation -> publication link ------------------------------
+
+function validateGenerationId(generationId: unknown): string {
+  if (typeof generationId !== "string" || !GENERATION_ID_PATTERN.test(generationId)) {
+    throw new ActivationArtifactValidationError("activation generation link generation id is invalid");
+  }
+  return generationId;
+}
+
+const LINK_INPUT_KEYS = [
+  "epochManifestChecksumSha256",
+  "epochManifestRevision",
+  "generationId",
+  "identityDigest",
+  "publicationId",
+] as const;
+const LINK_RECORD_KEYS = [...LINK_INPUT_KEYS, "version"] as const;
+
+function validateActivationGenerationLink(input: unknown): ActivationGenerationLink {
+  if (
+    !isRecord(input)
+    || !(exactKeys(input, LINK_INPUT_KEYS) || exactKeys(input, ["homeDir", ...LINK_INPUT_KEYS]))
+    || (input.homeDir !== undefined && typeof input.homeDir !== "string")
+  ) {
+    throw new ActivationArtifactValidationError("activation generation link input is invalid");
+  }
+  const generationId = validateGenerationId(input.generationId);
+  if (typeof input.publicationId !== "string" || !PUBLICATION_ID_PATTERN.test(input.publicationId)) {
+    throw new ActivationArtifactValidationError("activation generation link publicationId is invalid");
+  }
+  if (typeof input.identityDigest !== "string" || !IDENTITY_DIGEST_PATTERN.test(input.identityDigest)) {
+    throw new ActivationArtifactValidationError("activation generation link identity digest is invalid");
+  }
+  if (!isManifestRevision(input.epochManifestRevision)) {
+    throw new ActivationArtifactValidationError("activation generation link epoch manifest revision is invalid");
+  }
+  if (
+    typeof input.epochManifestChecksumSha256 !== "string"
+    || !IDENTITY_DIGEST_PATTERN.test(input.epochManifestChecksumSha256)
+  ) {
+    throw new ActivationArtifactValidationError("activation generation link epoch manifest checksum is invalid");
+  }
+  return {
+    version: ACTIVATION_GENERATION_LINK_VERSION,
+    generationId,
+    publicationId: input.publicationId,
+    identityDigest: input.identityDigest,
+    epochManifestRevision: input.epochManifestRevision,
+    epochManifestChecksumSha256: input.epochManifestChecksumSha256,
+  };
+}
+
+/** Same bound protocol.ts applies to a manifest revision: a safe,
+ * non-negative integer (genesis is revision 0). */
+function isManifestRevision(value: unknown): value is number {
+  return typeof value === "number" && Number.isSafeInteger(value) && value >= 0;
+}
+
+function linkWireContent(link: ActivationGenerationLink): string {
+  return canonicalJson({
+    version: link.version,
+    generationId: link.generationId,
+    publicationId: link.publicationId,
+    identityDigest: link.identityDigest,
+    epochManifestRevision: link.epochManifestRevision,
+    epochManifestChecksumSha256: link.epochManifestChecksumSha256,
+  }) + "\n";
+}
+
+/** Strict parse of stored link bytes: valid JSON, exact keys, supported
+ * version, every token pattern-valid, and byte-canonical (the bytes must
+ * equal this module's own serialization of what they parse to). Returns
+ * undefined for any violation; the caller attributes that as
+ * "malformed-record" rather than this helper throwing, so the reader stays
+ * three-valued. */
+function parseActivationGenerationLink(content: string): ActivationGenerationLink | undefined {
+  let value: unknown;
+  try {
+    value = JSON.parse(content);
+  } catch {
+    return undefined;
+  }
+  if (
+    !isRecord(value)
+    || !exactKeys(value, LINK_RECORD_KEYS)
+    || value.version !== ACTIVATION_GENERATION_LINK_VERSION
+    || typeof value.generationId !== "string"
+    || !GENERATION_ID_PATTERN.test(value.generationId)
+    || typeof value.publicationId !== "string"
+    || !PUBLICATION_ID_PATTERN.test(value.publicationId)
+    || typeof value.identityDigest !== "string"
+    || !IDENTITY_DIGEST_PATTERN.test(value.identityDigest)
+    || !isManifestRevision(value.epochManifestRevision)
+    || typeof value.epochManifestChecksumSha256 !== "string"
+    || !IDENTITY_DIGEST_PATTERN.test(value.epochManifestChecksumSha256)
+  ) {
+    return undefined;
+  }
+  const link: ActivationGenerationLink = {
+    version: ACTIVATION_GENERATION_LINK_VERSION,
+    generationId: value.generationId,
+    publicationId: value.publicationId,
+    identityDigest: value.identityDigest,
+    epochManifestRevision: value.epochManifestRevision,
+    epochManifestChecksumSha256: value.epochManifestChecksumSha256,
+  };
+  return linkWireContent(link) === content ? link : undefined;
+}
+
+/** The generation link's reconcile subject (see ReconcileSubject). */
+function linkSubject(generationId: string): ReconcileSubject {
+  return {
+    describe: "activation generation link",
+    maxBytes: MAX_ACTIVATION_GENERATION_LINK_BYTES,
+    conflict: (path) => new ActivationGenerationLinkConflictError(
+      "an activation generation link already exists at " + path + " for generation " + generationId +
+        " with different content (another publicationId or identity digest); refusing to overwrite it",
+    ),
+  };
+}
+
+/**
+ * Durably record the generation -> publication link, or reuse an already
+ * recorded byte-identical one. Same persistence discipline and the same
+ * dependency seam as publishActivationArtifact (see Part A and Part C of
+ * the module doc comment). Different stored bytes for the same generation
+ * raise ActivationGenerationLinkConflictError, never an overwrite. Call it
+ * in S4b, after coverage backfill and before any manifest effect; the
+ * epoch manifest pair must come from the verified manifest.
+ */
+export function recordActivationGenerationLink(
+  input: Readonly<{
+    homeDir?: string;
+    generationId: string;
+    publicationId: string;
+    identityDigest: string;
+    epochManifestRevision: number;
+    epochManifestChecksumSha256: string;
+  }>,
+  dependencies: ActivationArtifactPublishDependencies = {},
+): ActivationGenerationLinkRecordResult {
+  const link = validateActivationGenerationLink(input);
+  const directory = activationArtifactDirectory(input.homeDir);
+  const path = activationGenerationLinkPath(input.homeDir, link.generationId);
+  const serialized = linkWireContent(link);
+  const expectedUid = dependencies.expectedUid ?? currentUid();
+  const readWithStat = dependencies.readWithStat ?? readBoundedRegularFileWithStat;
+  const writeDurable = dependencies.writeDurable ?? atomicWritePrivateFileDurable;
+
+  ensureActivationArtifactDirectory(input.homeDir, expectedUid);
+
+  const outcome = publishImmutableFile(
+    path, directory, serialized, linkSubject(link.generationId), expectedUid, readWithStat, writeDurable,
+  );
+  return { outcome, path, link };
+}
+
+/**
+ * Resolve the generation -> publication link three-valued; see Part C of
+ * the module doc comment for the exact meaning of each state. The private
+ * LCM root and then the artifact directory are authenticated before the
+ * read and re-asserted after it, exactly as readActivationArtifact does. A
+ * malformed generationId is a caller programming error and throws
+ * ActivationArtifactValidationError before any I/O; nothing else throws
+ * except an I/O error this module does not recognize, which propagates raw.
+ */
+export function readActivationGenerationLink(
+  input: Readonly<{ homeDir?: string; generationId: string }>,
+  dependencies: ActivationArtifactReadDependencies = {},
+): ActivationGenerationLinkReadResult {
+  const generationId = validateGenerationId(input?.generationId);
+  const root = rootPath(input.homeDir);
+  const directory = activationArtifactDirectory(input.homeDir);
+  const path = activationGenerationLinkPath(input.homeDir, generationId);
+  const expectedUid = dependencies.expectedUid ?? currentUid();
+  const readWithStat = dependencies.readWithStat ?? readBoundedRegularFileWithStat;
+  const unresolvable = (reason: ActivationGenerationLinkUnresolvableReason, detail: string): ActivationGenerationLinkReadResult =>
+    ({ state: "unresolvable", reason, detail });
+
+  let rootHandle: PrivateDirectoryHandle | undefined;
+  try {
+    rootHandle = openPrivateDirectoryIfExists(root, { expectedUid });
+  } catch (error) {
+    return unresolvable("root-unauthenticated", "cannot authenticate the private LCM root " + root + ": " + (error as Error).message);
+  }
+  if (rootHandle === undefined) {
+    return { state: "authoritatively-absent", detail: "the private LCM root " + root + " does not exist" };
+  }
+  try {
+    let handle: PrivateDirectoryHandle | undefined;
+    try {
+      handle = openPrivateDirectoryIfExists(directory, { expectedUid });
+    } catch (error) {
+      return unresolvable(
+        "directory-unauthenticated",
+        "cannot authenticate the activation artifact directory " + directory + ": " + (error as Error).message,
+      );
+    }
+    if (handle === undefined) {
+      return { state: "authoritatively-absent", detail: "the activation artifact directory " + directory + " does not exist" };
+    }
+    try {
+      let outcome;
+      try {
+        outcome = attributeNullableRead<BoundedFileResult>(
+          () => readWithStat(path, {
+            allowedRoot: directory,
+            maxBytes: MAX_ACTIVATION_GENERATION_LINK_BYTES,
+            expectedUid,
+            allowedModes: [PRIVATE_FILE_MODE],
+            requireSingleLink: true,
+          }),
+        );
+      } catch (error) {
+        if (isMultipleHardLinksError(error)) {
+          return unresolvable(
+            "multi-link",
+            "activation generation link at " + path +
+              " has multiple hard links and cannot be authenticated by a read; retry the link record to converge the interrupted durable write",
+          );
+        }
+        throw error;
+      }
+      if (outcome.kind === "unresolvable") {
+        return unresolvable("read-unresolvable", "cannot determine whether an activation generation link exists at " + path + ": " + outcome.detail);
+      }
+      let resolved: ActivationGenerationLinkReadResult;
+      if (outcome.kind === "absent") {
+        resolved = { state: "authoritatively-absent", detail: "no activation generation link exists at " + path + ": " + outcome.detail };
+      } else {
+        const link = parseActivationGenerationLink(outcome.value.content);
+        if (link === undefined) {
+          return unresolvable("malformed-record", "activation generation link at " + path + " is not a canonical, valid link record");
+        }
+        if (link.generationId !== generationId) {
+          return unresolvable(
+            "generation-mismatch",
+            "activation generation link at " + path + " names generation " + link.generationId + ", not " + generationId,
+          );
+        }
+        resolved = { state: "resolved", link, path };
+      }
+      try {
+        assertPrivateDirectory(handle, directory, handle.witness, expectedUid);
+        assertPrivateDirectory(rootHandle, root, rootHandle.witness, expectedUid);
+      } catch (error) {
+        return unresolvable(
+          "directory-changed",
+          "the activation artifact directory " + directory + " or its private LCM root changed during the read: " +
+            (error as Error).message,
+        );
+      }
+      return resolved;
+    } finally {
+      handle.close();
+    }
+  } finally {
+    rootHandle.close();
+  }
 }

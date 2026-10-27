@@ -1,0 +1,8 @@
+references: ["#1695"]
+rationale: >-
+  Settling a row whose bound-project copy differs on its own, so the rest of
+  its upload batch still goes, is confined to the existing replication worker
+  file. It adds no component and the file keeps its passive-events owner; this
+  pin records that decision for a materially changed file.
+pins:
+  - ["src/daemon/passive-event-replication.ts", "integration-postgresql-passive-events"]

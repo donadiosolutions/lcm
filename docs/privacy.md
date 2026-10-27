@@ -4,6 +4,13 @@ Long Context Manager (LCM) stores your conversation history locally by default
 to enable memory across sessions. This document explains exactly what is
 stored, what leaves your machine, and how to control sensitive data.
 
+PostgreSQL query diagnostics expose only allowlisted operation names and
+bounded numeric `pg_stat_statements` counters. The collector never reads
+statement text. It uses raw query identifiers only as bounded in-process mapping
+keys and never emits or logs them. SQL literals, parameter values, utility
+statements, role names, database names, and connection metadata are likewise
+never emitted or logged by this family.
+
 ## What is stored locally
 
 With the default SQLite backend, all storage is on your machine:
@@ -272,7 +279,9 @@ source bytes and refuses unsupported content before copying it. After an
 offline in-place repair, rerun reconciliation to continue from its durable
 fence and marker state.
 
-No data is sent to any Long Context Manager (LCM) server. There is no telemetry.
+No data is sent to any Long Context Manager (LCM) server. There is no telemetry;
+PostgreSQL operational observations stay local and on demand and are never
+uploaded.
 An explicitly configured PostgreSQL backend is a user-operated remote-primary
 store; daemon project writes and reads use it only after the publication and
 identity gates described below. Hook capture remains local and the data sent to
@@ -518,6 +527,10 @@ The `Security` section of the doctor output shows:
 
 ## Safe local diagnostics
 
+For PostgreSQL incidents, use the [least-privilege incident diagnostics
+runbook](incident-diagnostics.md) to create the explicitly allowlisted evidence
+bundle and keep provider, credential, quarantine, and recovery sessions private.
+
 - The `/describe` and `/expand` compatibility handlers sanitize fallback error
   messages before handing them to the daemon response layer, which sanitizes
   top-level error strings again before serialization. They retain their legacy
@@ -658,25 +671,54 @@ The `Security` section of the doctor output shows:
   wrapper depth, so closing an inner wrapper consumes only its own one-use tail
   while outer handoffs remain pending. Repeated handoffs at the same depth stay
   bounded by that depth, and resets clear all pending depths. Quoted-file query
-  ownership remains independent from a nested public-URL child, allowing every
-  immediate bare path and later word-bearing private parameter to redact on the
-  same pass. A nested exact file URL retains its own path/query classification
-  while bound to the observable enclosing owner; after the child span ends, a
-  depth-keyed returned-parent set classifies every later same-wrapper bare or
-  word-bearing private value. Closing an inner wrapper removes only that depth,
-  preserving still-open outer owners until their matching close or a hard
-  reset. Within a child query or fragment, an ampersand word-bearing `Users`
-  root returns to the retained parent and redacts on the same pass. The same
-  narrow handoff remains available after an intervening public URL child while
-  that wrapper depth is retained, including a named root-relative Windows
-  value. Quoted public URLs keep ordinary relative and named slash-bearing
-  parameters inside their own query or fragment. A bare absolute path, complete
-  word-bearing `Users` root, or named Windows/drive/UNC value returns to the
-  quoted-file parent and restores that parent for later children. This does not
-  trust marker text, classify ordinary relative values as private on the
-  returned-parent transition, or make backslashes global. The direct-relative
-  nested-file query/fragment family remains deferred: its first pass preserves
-  the relative bytes and its next stable pass conservatively redacts them.
+  ownership remains independent from a nested public-URL child. A path-bearing
+  nested exact `file://` child returns to the observable enclosing owner through
+  either `&` or `|`. After the child span ends, later same-wrapper absolute roots
+  are redacted, while ordinary relative successors such as `relative/path`
+  remain byte-identical. A slash-bearing relative successor is treated as
+  private only when it contains a complete `Users`, `home`, or `root` segment,
+  case-insensitively, with a `/` or `\` continuation. Repeated and mixed runs
+  of those separators are treated as one continuation, and redaction starts at
+  the successor's first slash. Other relative values, such as `later/var/data`,
+  remain visible by policy. Query and fragment child forms use the same stable
+  rule. A separate active-child home/root successor can still remain visible on
+  the first pass and redact on the second pass; that residual is tracked
+  separately. Closing an inner wrapper removes only that depth, preserving
+  still-open outer owners until their matching close or a hard reset.
+
+  When a matching quote closes a nested public URL inside a bracketed file
+  query, an immediate `&` or `|` successor is redacted only when it begins with
+  a supported POSIX, Windows, drive, or UNC root. The public URL's own query,
+  ordinary relative successors, and following public URLs stay readable. An
+  immediate sibling wrapper after `]&[`, `]|[`, `],[`, or `];[` re-enters only
+  when the delimiter follows the matching owner close; a bare delimiter plus
+  `[` does not create ownership. A path-bearing first sibling preserves an
+  ordinary relative value in the next sibling, while supported roots and
+  recognized private-root relatives redact there on the first pass.
+  Rooted Windows tails after a closing wrapper, including a later bracketed
+  URL's rooted query value inside that tail, are also removed on the first pass.
+  Adjacent balanced bracket components and path-word or path-separator text
+  between them remain part of that same tail until its consumed path span ends.
+  Inside those tracked components, a rooted `/` or `\` value immediately after
+  `=`, `&`, `#`, or `?` is removed. Whitespace and newlines end the composition;
+  whitespace-separated prose and public URLs and ordinary unspaced relative
+  tails remain unchanged.
+
+  An exact nested `file://` child inside a public URL that began at a quote can
+  inherit that enclosing quote through its matching close. This removes a
+  space-bearing private path and any suffix inside the quote on the first pass,
+  while preserving text after the close. An immediately quoted child keeps its
+  own quote. Inside a bracketed file query, the matching close restores the
+  enclosing owner across whitespace until that wrapper's real close. Immediate
+  and later `&` or `|` rooted successors, named Windows successors, and
+  recognized private-root relatives redact on the same pass; ordinary relative
+  and public-URL successors remain readable. Unquoted URLs, embedded URLs whose
+  scheme did not begin at the quote, unmatched quotes, and newlines retain their
+  existing boundaries.
+
+  Root-relative Windows values after opaque wrapper text remain conservatively
+  redacted. LCM does not expose such private-looking values merely because URL
+  punctuation could also be interpreted as ending ownership.
   An unquoted exact file wrapper immediately followed by an ampersand-separated
   public URL is recognized from that observable syntax on every pass. The
   doubled-bracket pathless policy retains the observable scheme, authority, and
@@ -737,7 +779,7 @@ The `Security` section of the doctor output shows:
   There are no configuration options for this defense-in-depth behavior.
 - Hook project paths retain leading and trailing whitespace. Directories whose names differ only by that whitespace remain separate LCM projects.
 - Hook errors are attached to a project sidecar only when the reported working directory is an existing directory. Invalid paths are recorded in the bounded fallback log without creating project metadata.
-- Stats, status, pool diagnostics, and doctor use an allowlisted backend snapshot. They omit recalled-text previews (`topRecalled`), memory and transcript payloads, raw errors, SQL values, URLs, role names, CA paths, and arbitrary local paths. Verbose diagnostics retain the same boundary. Only observed numeric aggregates, safe identifiers, classified states, and fixed guidance are exposed. SQLite content is not modified; necessary WAL/SHM read coordination may occur. See [observational diagnostics](cli.md#observational-diagnostics).
+- Stats, status, pool diagnostics, and doctor use an allowlisted backend snapshot. They omit recalled-text previews (`topRecalled`), memory and transcript payloads, raw errors, SQL values, URLs, role names, CA paths, and arbitrary local paths. Verbose diagnostics retain the same boundary. Only observed numeric aggregates, safe identifiers, classified states, and fixed guidance are exposed. SQLite content is not modified; necessary WAL/SHM read coordination may occur. See [observational diagnostics](cli.md#observational-diagnostics). PostgreSQL telemetry follows the [telemetry and redaction contract](../src/storage/postgresql/reference/postgresql-telemetry.md).
 - Sidecar scans return a single aggregate truncation record when their time or database limit is reached, so diagnostic responses remain bounded even if the events directory contains many files.
 - A rooted path following a nested public URL inside a bracketed `file://` query wrapper is redacted in more shapes. This now includes URLs carrying brackets, such as an IPv6 authority or a bracketed path segment, and a Windows drive root such as `C:\` as the value that arms the handoff. Repeated separators inside one wrapper each redact their successor rather than only the first. Values that are not path roots, such as a bare relative value, still do not arm it.
 - Comma and semicolon are not sibling handoff separators in that wrapper, so a single-leading-backslash Windows value after them stays visible. POSIX paths and Windows drive roots after a comma or semicolon still become `<path>`.

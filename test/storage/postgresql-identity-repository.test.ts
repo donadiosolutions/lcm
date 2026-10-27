@@ -5,6 +5,7 @@ import type {
   PostgreSqlIdentityExecutor,
 } from "../../src/storage/postgresql/identity-repository.js";
 import {
+  PostgreSqlIdentityAliasLockTimeoutError,
   PostgreSqlIdentityAliasNormalizedPathConflictError,
   PostgreSqlIdentityAliasPathConflictError,
   PostgreSqlIdentityCreateOutcomeUnknownError,
@@ -18,7 +19,7 @@ import {
   PostgreSqlIdentityUnlinkPathOutcomeUnknownError,
   PostgreSqlIdentityUnlinkProjectOutcomeUnknownError,
 } from "../../src/storage/postgresql/identity-repository.js";
-import { PostgreSqlCommitOutcomeUnknownError } from "../../src/storage/postgresql/errors.js";
+import { PostgreSqlCommitOutcomeUnknownError, PostgreSqlStorageOperationError } from "../../src/storage/postgresql/errors.js";
 import type {
   PostgreSqlQueryOptions,
 } from "../../src/storage/postgresql/contracts.js";
@@ -1634,5 +1635,180 @@ describe("PostgreSQL identity repository", () => {
 
     const missing = new PostgreSqlIdentityRepository(executor(() => result([])));
     await expect(missing.getProject(projectRow.project_id)).resolves.toBeNull();
+  });
+
+  describe("ensureProjectAliases", () => {
+    const machineId = machineRow.machine_id;
+    const projectId = projectRow.project_id;
+    const moved = { path: "/work/moved", normalizedPath: "/real/moved" };
+    const wanted = [
+      { path: aliasRow.path, normalizedPath: aliasRow.normalized_path },
+      moved,
+    ];
+    const movedRow = { ...aliasRow, path: moved.path, normalized_path: moved.normalizedPath };
+    const ensure = async (
+      current: Array<typeof aliasRow>,
+      insertRows: typeof aliasRow[] = [movedRow],
+      reread?: Array<typeof aliasRow>,
+    ) => {
+      const inserts: unknown[][] = [];
+      const statements: string[] = [];
+      const db = executor((config) => {
+        statements.push(config.text.trim().split("\n")[0]!);
+        if (config.text.includes("current_setting")) return result([{ setting: "7s" }]);
+        if (config.text.includes("set_config")) return result([]);
+        if (config.text.startsWith("LOCK TABLE")) return result([]);
+        if (config.text.includes("SELECT project_id FROM")) return result([{ project_id: projectId }]);
+        if (config.text.includes("INSERT INTO lcm.project_aliases")) {
+          inserts.push(config.values as unknown[]);
+          return result(insertRows);
+        }
+        if (config.text.includes("FROM lcm.project_aliases") && config.text.includes("OR (")) return result(current);
+        if (config.text.includes("FROM lcm.project_aliases")) return result(reread ?? [...current, ...insertRows]);
+        throw new Error(`unexpected SQL: ${config.text}`);
+      });
+      const outcome = await new PostgreSqlIdentityRepository(db).ensureProjectAliases({ machineId, projectId, aliases: wanted });
+      return { outcome, inserts, db, statements };
+    };
+
+    it("writes nothing when the project already holds exactly the requested set", async () => {
+      const { outcome, inserts, db } = await ensure([aliasRow, movedRow]);
+      expect(outcome).toEqual({ inserted: 0 });
+      expect(inserts).toEqual([]);
+      expect(db.transaction).toHaveBeenCalledTimes(1);
+      expect(db.query.mock.calls[4]![0]).toMatchObject({
+        values: [projectId, machineId, [aliasRow.normalized_path, moved.normalizedPath], [aliasRow.path, moved.path]],
+      });
+    });
+
+    it("inserts exactly the missing rows in the one transaction", async () => {
+      const { outcome, inserts, db } = await ensure([aliasRow]);
+      expect(outcome).toEqual({ inserted: 1 });
+      expect(inserts).toEqual([[projectId, machineId, moved.path, moved.normalizedPath]]);
+      expect(db.transaction).toHaveBeenCalledTimes(1);
+      expect((await ensure([], [aliasRow, movedRow])).outcome).toEqual({ inserted: 2 });
+    });
+
+    it.each([
+      ["an alias outside the set", [aliasRow, { ...aliasRow, path: "/work/extra", normalized_path: "/real/extra" }]],
+      ["an alias of another machine", [{ ...aliasRow, machine_id: "018f22c4-6d2a-7f10-8a4c-6b8d3e5f9099" }]],
+      ["a requested alias owned by another project", [{ ...aliasRow, project_id: "018f22c4-6d2a-7f10-8a4c-6b8d3e5f9021" }]],
+      ["a requested alias stored under another path", [{ ...aliasRow, path: "/work/other-spelling" }]],
+      ["a requested path stored under another normalized path", [{ ...aliasRow, normalized_path: "/real/other" }]],
+    ])("returns null and writes nothing for %s", async (_label, current) => {
+      const { outcome, inserts } = await ensure(current);
+      expect(outcome).toBeNull();
+      expect(inserts).toEqual([]);
+    });
+
+    it("locks the alias table before it reads and re-reads the whole project after writing", async () => {
+      const { statements } = await ensure([aliasRow]);
+      expect(statements[2]).toBe("LOCK TABLE lcm.project_aliases IN SHARE ROW EXCLUSIVE MODE");
+      expect(statements.filter((statement) => statement.startsWith("SELECT project_id, machine_id")).length).toBe(2);
+      const equal = await ensure([aliasRow, movedRow]);
+      expect(equal.statements.filter((statement) => statement.startsWith("SELECT project_id, machine_id")).length).toBe(1);
+    });
+
+    it.each([
+      ["an unrelated alias committed meanwhile", [aliasRow, movedRow, { ...aliasRow, path: "/work/stranger", normalized_path: "/real/stranger" }]],
+      ["the canonical alias removed meanwhile", [movedRow]],
+      ["a requested alias re-pointed meanwhile", [aliasRow, { ...movedRow, path: "/work/other" }]],
+      ["a requested alias taken over by another machine meanwhile", [aliasRow, { ...movedRow, machine_id: "018f22c4-6d2a-7f10-8a4c-6b8d3e5f9099" }]],
+    ])("throws an alias conflict, so the inserts roll back, when the re-read shows %s", async (_label, reread) => {
+      const failure = await ensure([aliasRow], [movedRow], reread).catch((error: unknown) => error);
+      expect(failure).toBeInstanceOf(PostgreSqlIdentityConflictError);
+    });
+
+    it("propagates a link failure so the whole transaction rolls back", async () => {
+      const failure = await ensure([aliasRow], []).catch((error: unknown) => error);
+      expect(failure).toBeInstanceOf(PostgreSqlIdentityNotFoundError);
+    });
+
+    describe("bounded alias lock wait (#1691)", () => {
+      const storageFailure = (sqlState: string | null) => new PostgreSqlStorageOperationError(
+        "STORAGE_OPERATION_FAILED",
+        { domain: "identity", operation: "ensureProjectAliases", projectId },
+        sqlState,
+        false,
+      );
+      // Models the real runtime: the first failed query is cached and rejects the transaction ahead of any callback error.
+      const runtimeLike = (failAt: (sql: string) => unknown, lockPolicy: "cached" | "other" = "cached") => {
+        const statements: string[] = [];
+        let cached: unknown;
+        const query = vi.fn(async (config: QueryConfig<unknown[]>) => {
+          statements.push(config.text);
+          const failure = failAt(config.text);
+          if (failure !== undefined) {
+            cached ??= failure;
+            throw failure;
+          }
+          if (config.text.includes("current_setting")) return result([{ setting: "7s" }]);
+          return result([]);
+        });
+        const transaction = vi.fn(async (callback: (executor: unknown) => Promise<unknown>) => {
+          let callbackError: unknown;
+          try {
+            await callback({ query });
+          } catch (error) {
+            callbackError = error;
+          }
+          if (lockPolicy === "other" && cached !== undefined) throw storageFailure("55P03");
+          if (cached !== undefined) throw cached;
+          throw callbackError;
+        });
+        const db = { query, transaction } as unknown as PostgreSqlIdentityExecutor;
+        return { repository: new PostgreSqlIdentityRepository(db), statements, query };
+      };
+      const reconcile = (repository: PostgreSqlIdentityRepository) => repository
+        .ensureProjectAliases({ machineId, projectId, aliases: wanted })
+        .catch((error: unknown) => error);
+      const isLock = (sql: string) => sql.startsWith("LOCK TABLE");
+
+      it("bounds the lock wait with a local lock_timeout around the LOCK and restores the prior setting", async () => {
+        const { statements, db } = await ensure([aliasRow, movedRow]);
+        expect(statements[0]).toContain("current_setting('lock_timeout')");
+        expect(statements[1]).toContain("set_config('lock_timeout'");
+        expect(statements[2]).toBe("LOCK TABLE lcm.project_aliases IN SHARE ROW EXCLUSIVE MODE");
+        expect(statements[3]).toContain("set_config('lock_timeout'");
+        expect(statements[4]).toMatch(/^SELECT project_id, machine_id/u);
+        expect(db.query.mock.calls[1]![0]).toMatchObject({ values: ["5000ms"] });
+        expect(db.query.mock.calls[3]![0]).toMatchObject({ values: ["7s"] });
+      });
+
+      it.each(["55P03", "57014"])("reports %s on the LOCK as a typed alias lock timeout and queries nothing afterwards", async (sqlState) => {
+        const { repository, statements } = runtimeLike((sql) => isLock(sql) ? storageFailure(sqlState) : undefined);
+        const failure = await reconcile(repository);
+        expect(failure).toBeInstanceOf(PostgreSqlIdentityAliasLockTimeoutError);
+        expect(failure).toMatchObject({ code: "STORAGE_OPERATION_FAILED", domain: "identity", operation: "ensureProjectAliases", projectId, retryable: false });
+        expect(failure).not.toBeInstanceOf(PostgreSqlStorageOperationError);
+        expect(statements).toHaveLength(3);
+      });
+
+      it.each([
+        ["a later statement timing out", (sql: string) => sql.startsWith("SELECT project_id, machine_id") ? storageFailure("55P03") : undefined, "55P03"],
+        ["a later statement cancelled", (sql: string) => sql.startsWith("SELECT project_id, machine_id") ? storageFailure("57014") : undefined, "57014"],
+        ["the timeout setting failing", (sql: string) => sql.includes("set_config") ? storageFailure("55P03") : undefined, "55P03"],
+        ["the LOCK failing with another SQLSTATE", (sql: string) => isLock(sql) ? storageFailure("40001") : undefined, "40001"],
+        ["the LOCK failing without a SQLSTATE", (sql: string) => isLock(sql) ? storageFailure(null) : undefined, null],
+      ])("leaves %s unchanged", async (_label, failAt, sqlState) => {
+        const { repository } = runtimeLike(failAt);
+        const failure = await reconcile(repository);
+        expect(failure).toBeInstanceOf(PostgreSqlStorageOperationError);
+        expect(failure).toMatchObject({ sqlState });
+      });
+
+      it("leaves a non-storage LOCK failure unchanged", async () => {
+        const original = new Error("connection reset");
+        const { repository } = runtimeLike((sql) => isLock(sql) ? original : undefined);
+        expect(await reconcile(repository)).toBe(original);
+      });
+
+      it("leaves a different rejection of the transaction unchanged even after a LOCK timeout", async () => {
+        const { repository } = runtimeLike((sql) => isLock(sql) ? storageFailure("55P03") : undefined, "other");
+        const failure = await reconcile(repository);
+        expect(failure).toBeInstanceOf(PostgreSqlStorageOperationError);
+        expect(failure).toMatchObject({ sqlState: "55P03" });
+      });
+    });
   });
 });

@@ -26,6 +26,9 @@ detail you need.
 
 ### Setup and troubleshooting
 
+- [Incident diagnostics](incident-diagnostics.md) — collect bounded,
+  least-privilege PostgreSQL and provider evidence and follow private recovery
+  procedures without exposing content or credentials.
 - [Managed daemon recovery](daemon-restart-recovery.md) — diagnose and recover
   the user-managed daemon safely.
 - [Managed daemon temporary storage](daemon-temporary-storage.md) — understand
@@ -38,6 +41,13 @@ detail you need.
 - [Reversible migration rollback](migration-rollback.md) — understand what a
   rollback preserves, what each refusal means, and how to recover after an
   interrupted attempt.
+- [Cutover sets](migration-cutover-set.md) — understand the contract for
+  moving every project of a machine under one maintenance hold, how a set is
+  prepared and activated through one publication, and how an interrupted
+  activation resumes.
+- [Cutover rehearsal](migration-rehearsal.md) — reproduce the interrupted
+  migration, activation and rollback rehearsal against an isolated
+  PostgreSQL 18 container and read what its evidence does and does not prove.
 - [Optional FTS5 setup](fts5.md) — enable faster ranked local full-text search
   when the active Node.js runtime does not include FTS5.
 - [VS Code and Codex setup](vscode-codex.md) — connect LCM to Codex or GitHub
@@ -79,6 +89,7 @@ with the [storage-backend configuration guide](configuration.md#storage-backend)
 - [Lexical search](../src/storage/postgresql/reference/postgresql-search.md)
 - [Cross-machine coordination](../src/storage/postgresql/reference/postgresql-coordination.md)
 - [Summaries, context, and large files](../src/storage/postgresql/reference/postgresql-summary-context.md)
+- [Telemetry and redaction contract](../src/storage/postgresql/reference/postgresql-telemetry.md)
 
 Each PostgreSQL guide links to the reviewed runtime grant scripts required by
 the repository it describes.

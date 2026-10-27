@@ -147,7 +147,7 @@ import {
 } from "./rollback-eligibility.js";
 import { buildRollbackGeneration, type RollbackGenerationOutcome } from "./rollback-generation.js";
 import { installRollbackGeneration } from "./rollback-install.js";
-import { materializeRollbackSidecars } from "./rollback-sidecars.js";
+import { assertRollbackSidecarsCompatible, materializeRollbackSidecars } from "./rollback-sidecars.js";
 
 const MAX_REPORT_BYTES = 64 * 1024;
 
@@ -553,12 +553,25 @@ function sameOperabilityFactValue(
  *    enterMaintenance call), so it can only mean the live slot is held
  *    by something unrelated to this rollback, and there is nothing to
  *    recover from.
+ *
+ * donadiosolutions/lcm#1555. One opt-in substitution, passed only by
+ * recoverPendingPublishRollback's row for this rollback's own externally
+ * aborted publication: when the RAW live read is authoritatively-absent
+ * and the artifact exists, the artifact's recorded fact stands in for it,
+ * before the disagreement check above. This rollback's own enterMaintenance
+ * archived the activation's completed publication, and the rollback's own
+ * (aborted) publication now occupies the live slot, so the live slot can no
+ * longer show the positive fact the artifact recorded. A live read that is
+ * unresolvable, or no artifact, is never substituted.
  */
 async function resolveRollbackOperabilityFact(
-  input: Readonly<{ homeDir: string; generationId: string }>,
+  input: Readonly<{ homeDir: string; generationId: string; ownAbortedPublication?: true }>,
 ): Promise<Readonly<{ fact: OperabilityFactResolution; artifact: RollbackAuthorityArtifactBody | null }>> {
   const live = await readBackendPublicationOperabilityFact({ homeDir: input.homeDir });
   const artifact = readRollbackAuthorityArtifact(input.homeDir, input.generationId);
+  if (input.ownAbortedPublication === true && live.state === "authoritatively-absent" && artifact !== null) {
+    return { fact: artifactOperabilityFact(artifact), artifact };
+  }
   if (live.state !== "unresolvable") {
     if (artifact !== null && !sameOperabilityFactValue(live, artifact)) {
       return {
@@ -585,11 +598,16 @@ async function resolveRollbackOperabilityFact(
     };
   }
   return {
-    fact: artifact.operabilityFactState === "present"
-      ? { state: "present", valueSha256: artifact.operabilityFactValueSha256! }
-      : { state: "authoritatively-absent" },
+    fact: artifactOperabilityFact(artifact),
     artifact,
   };
+}
+
+/** The operability fact the durable rollback-authority artifact recorded. */
+function artifactOperabilityFact(artifact: RollbackAuthorityArtifactBody): OperabilityFactResolution {
+  return artifact.operabilityFactState === "present"
+    ? { state: "present", valueSha256: artifact.operabilityFactValueSha256! }
+    : { state: "authoritatively-absent" };
 }
 
 /**
@@ -983,16 +1001,41 @@ function decodeRecoveryFile(file: BackendPublicationRecoveryFile): string {
  * reader refuses such a journal by design, and nothing has been published or fenced from it: the live configuration
  * and project map are still the pre-rollback source. Recognized only for the rollback's composition (postgresql to
  * sqlite, exactly the covered project); any other unreferenced journal is left to the authenticated reader's
- * refusal, and an aborted journal that had sealed its material is not this (it stays refused, #1555).
+ * refusal, and an aborted journal that had sealed its material is not this (see isOwnConsumedMaterialJournal).
  */
 function isOwnUnsealedJournal(journal: BackendPublicationJournal, publicationId: string, localProjectId: string): boolean {
-  return journal.publicationId === publicationId
-    && (journal.phase === "preparing" || journal.phase === "aborted")
+  return (journal.phase === "preparing" || journal.phase === "aborted")
     && journal.recoveryReference === null
+    && isOwnRollbackShape(journal, publicationId, localProjectId);
+}
+
+/** The rollback's composition as the source readers can know it: postgresql to sqlite, exactly the covered project. */
+function isOwnRollbackShape(journal: BackendPublicationJournal, publicationId: string, localProjectId: string): boolean {
+  return journal.publicationId === publicationId
     && journal.sourceBackend === "postgresql"
     && journal.targetBackend === "sqlite"
     && journal.projects.length === 1
     && journal.projects[0]!.localProjectId === localProjectId;
+}
+
+/**
+ * #1555. This rollback's own publication after an abort that had sealed its material: the coordinator's abort
+ * restores the configuration and the project map, releases what it recorded and consumes the material
+ * (backend-publication.ts #abortUnlocked: restoreConfig, restoreMap, #releaseAll, #cleanupMaterial, then aborted),
+ * so a journal at aborted with its reference, or at abort-releasing once the material file is gone (the crash
+ * window between the cleanup and the aborted checkpoint), has no sealed source to authenticate. Its source is the
+ * live files the abort restored, which the reader checks against the journal's witnesses. At abort-releasing with
+ * the material still present the authenticated reader decides, as before.
+ */
+function isOwnConsumedMaterialJournal(
+  journal: BackendPublicationJournal,
+  homeDir: string,
+  publicationId: string,
+  localProjectId: string,
+): boolean {
+  return isOwnRollbackShape(journal, publicationId, localProjectId)
+    && (journal.phase === "aborted"
+      || (journal.phase === "abort-releasing" && unsealedPublicationMaterialAbsent(homeDir, publicationId)));
 }
 
 /**
@@ -1021,7 +1064,8 @@ type OwnPublicationSourceFiles = Readonly<{ config: string; projectMap: string }
  * a reference). The coordinator observed the live configuration and project map when it wrote that journal
  * (sourceState, carried unchanged into the aborted transition) and has mutated neither since, so the live files are
  * the source -- read privately (the ordinary readers refuse any in-flight or unreferenced publication) and accepted
- * only byte-for-byte as the journal witnessed them.
+ * only byte-for-byte as the journal witnessed them. #1555 reads the files a completed abort restored the same way
+ * (sourceState then witnesses the restored files, raw bytes and length): a later edit of either file refuses.
  */
 function readUnsealedPublicationSource(homeDir: string, journal: BackendPublicationJournal): OwnPublicationSourceFiles {
   const root = lcmHomeDir(homeDir);
@@ -1035,7 +1079,7 @@ function readUnsealedPublicationSource(homeDir: string, journal: BackendPublicat
     ) {
       throw new RollbackOrchestrationError(
         "unexpected-state",
-        "the live " + field + " is not the one the rollback's unsealed publication observed as its source",
+        "the live " + field + " is not the one the rollback's publication witnessed as its source",
       );
     }
     return observed.content;
@@ -1049,11 +1093,14 @@ function readUnsealedPublicationSource(homeDir: string, journal: BackendPublicat
 /**
  * The configuration and project map as they were before this rollback's own publication, read from the
  * authenticated recovery material that publication sealed; null when no publication of this rollback is in the
- * live slot (or it was aborted, which restored the files). Once the publication has begun the live files and the
+ * live slot. Once the publication has begun the live files and the
  * consumer reads are the rollback's in-flight state -- the config selects sqlite, the project is unbound, and the
  * consumer read refuses an unresolved publication -- so every re-run reads its inputs from this sealed source.
  * A journal without a reference -- still at preparing, or aborted straight from it (E6/E7) -- has sealed nothing
  * and published nothing: its source is read from the live files, matched against the witnesses it recorded.
+ * An abort of this rollback's publication that already restored the files and consumed the sealed material
+ * (phase aborted with a reference, or abort-releasing with the material gone) has no sealed source left to read
+ * either; the live files stand in for it, accepted only byte-for-byte as the journal witnessed them (#1555).
  */
 function readOwnPublicationSourceFiles(homeDir: string, publicationId: string, localProjectId: string): OwnPublicationSourceFiles | null {
   // While maintenance holds the live slot no publication journal is readable, and none of this rollback's exists.
@@ -1061,6 +1108,9 @@ function readOwnPublicationSourceFiles(homeDir: string, publicationId: string, l
   const journal = readBackendPublicationJournal(homeDir);
   if (journal === null || journal.publicationId !== publicationId) return null;
   if (isOwnUnsealedJournal(journal, publicationId, localProjectId)) return readUnsealedPublicationSource(homeDir, journal);
+  if (isOwnConsumedMaterialJournal(journal, homeDir, publicationId, localProjectId)) {
+    return readUnsealedPublicationSource(homeDir, journal);
+  }
   if (journal.phase === "aborted") return null;
   const material = readAuthenticatedBackendPublicationMaterial(journal, homeDir);
   return { config: decodeRecoveryFile(material.source.config), projectMap: decodeRecoveryFile(material.source.projectMap) };
@@ -1564,7 +1614,8 @@ function rollbackGenerationBuildRoot(homeDir: string): string {
 }
 
 const ROLLBACK_GENERATION_BUILD_ATTEMPT_ORDINAL_PATTERN = /^[1-9][0-9]*$/u;
-const MAX_ROLLBACK_GENERATION_BUILD_ATTEMPT_ENTRIES = 100_000;
+/** The bounded scan of the build root (#1550 C6: shared with the set rollback, unchanged). */
+export const MAX_ROLLBACK_GENERATION_BUILD_ATTEMPT_ENTRIES = 100_000;
 /** The generation-id limit the manifest store and the rollback generation builder both enforce. */
 const MAX_GENERATION_ID_LENGTH = 128;
 /**
@@ -1611,8 +1662,11 @@ export function rollbackGenerationBuildBase(baseGenerationId: string): string {
  * so a differently-shaped generationId that happens to share a textual
  * prefix (including one containing "-rb" itself) can never be mistaken
  * for one of THIS generationId/revision pair's own attempts.
+ *
+ * Exported unchanged for the set rollback (#1550 C6), which allocates its members' fresh physical attempts
+ * through this same bounded enumeration and build base.
  */
-function highestRollbackGenerationBuildAttempt(
+export function highestRollbackGenerationBuildAttempt(
   homeDir: string,
   baseGenerationId: string,
   revision: number,
@@ -1826,6 +1880,18 @@ async function runPostPrepareSequence(
     if (drift !== null) throw new RollbackOrchestrationError("drift", drift);
   }
 
+  // #1681: a live passive-event row that genuinely contradicts the verified generation's archive refuses here, with
+  // the manifest still resumable at rolling-back, instead of after publish-rollback began and the canonical database
+  // was replaced. A resumed publication (pending effect) keeps the post-install verification below.
+  if (mode === "post-write" && working.pendingEffect === null) {
+    assertRollbackSidecarsCompatible({
+      homeDir: input.homeDir,
+      databasePath: built!.databasePath,
+      localProjectId: input.localProjectId,
+      machineId: input.roster[0]!.machineId,
+    });
+  }
+
   const epochId = authority.selection.epochId;
   const attemptId = authority.selection.attemptId;
   const terminalEvidenceSha256 = session.computeRollbackTerminalEvidenceSha256({
@@ -1973,6 +2039,7 @@ async function runPostPrepareSequence(
 async function resolveContinuationAuthority(
   input: Readonly<RunMigrationRollbackInput>,
   deps: Readonly<ResolvedRollbackDependencies>,
+  ownAbortedPublication?: true,
 ): Promise<Readonly<
   | { status: "refused"; reason: string }
   | {
@@ -1985,6 +2052,7 @@ async function resolveContinuationAuthority(
   const { fact: operabilityFact, artifact: priorAuthorityArtifact } = await resolveRollbackOperabilityFact({
     homeDir: input.homeDir,
     generationId: input.generationId,
+    ownAbortedPublication,
   });
   const witnessResolution = deps.resolveWitnessBindings({
     homeDir: input.homeDir,
@@ -2247,10 +2315,13 @@ function journalIsRollbackComposition(phase: PublicationPhase, journal: BackendP
  * to completion and returns the sealed material digest. Never prepares a
  * second time: a journal for the rollback publicationId already in the live
  * slot is resumed (or, completed, verified) rather than composed again. The
- * one exception (E6) is a journal the coordinator left at preparing without
- * sealed material, which only the coordinator's missing-material abort can
+ * exceptions are a journal the coordinator left at preparing without sealed
+ * material (E6), which only the coordinator's missing-material abort can
  * settle: it is taken to aborted and the publication is composed and
- * prepared again, under the same barrier and the same fenced session.
+ * prepared again, under the same barrier and the same fenced session; and
+ * an aborted journal that had sealed its material (#1555), composed again
+ * only under a recovery session (the caller has proven the restored source
+ * and the authority; without a session it refuses).
  */
 async function publishRollbackSelection(phase: PublicationPhase): Promise<string> {
   const { input, deps, token } = phase;
@@ -2267,9 +2338,22 @@ async function publishRollbackSelection(phase: PublicationPhase): Promise<string
         "the publication in the live slot carries this rollback's id but is not its composition",
       );
     }
-    // E6: the missing-material exit already taken (by an earlier retry that died before preparing again): the
-    // journal recorded no fence and published nothing, so it is only the terminal journal prepare() archives.
-    journal = isAbortedUnsealedJournal(slot.journal) ? null : slot.journal;
+    if (slot.journal.phase === "aborted") {
+      // #1555: a journal that had sealed its material was aborted by the coordinator after the publication began,
+      // and only recoverPendingPublishRollback's abort row may compose over it (it has proven the source and the
+      // authority, and holds a session on the lease). Without a session this is a structural refusal.
+      if (slot.journal.recoveryReference !== null && phase.session === null) {
+        throw new RollbackOrchestrationError(
+          "unexpected-state",
+          "the rollback's aborted coordinator publication can only be composed again under a recovery session",
+        );
+      }
+      // E6: the missing-material exit already taken (by an earlier retry that died before preparing again): the
+      // journal recorded no fence and published nothing, so it is only the terminal journal prepare() archives.
+      journal = null;
+    } else {
+      journal = slot.journal;
+    }
   }
   if (
     journal !== null && journal.phase === "preparing" && journal.recoveryReference === null
@@ -2456,12 +2540,30 @@ async function recoverRolledBackAuthority(
  * which the coordinator adopts (or supersedes, when the row it recorded was already released) and releases. At
  * released the fence is durably released and the coordinator finalizes without another release, and on the abort
  * path it releases whatever it recorded through its own provider: a session lease acquired there would be a fresh
- * row that nothing ever releases, and guarded PostgreSQL writers refuse while any unreleased row exists (E1).
+ * row that nothing ever releases, and guarded PostgreSQL writers refuse while any unreleased row exists (E1). The
+ * abort path therefore finishes through the coordinator alone and only then opens a session, to resume the
+ * publication forward (ABORT_PATH_PUBLICATION_PHASES, #1555).
  */
 const FENCE_DRIVING_PUBLICATION_PHASES: readonly BackendPublicationPhase[] = [
   "preparing", "prepared", "acquiring", "guarded", "map-publishing", "map-published",
   "config-publishing", "config-published", "releasing",
 ];
+
+/**
+ * #1555. The coordinator phases of an abort that is under way (backend-publication.ts #abortUnlocked), and the
+ * terminal aborted phase once the abort had sealed material to restore from (a reference). A rollback that meets
+ * one of them was not the one that aborted: the abort is finished through the coordinator alone and the
+ * publication is then resumed forward by composing and preparing it again (recoverExternallyAbortedPublication).
+ * An aborted journal without a reference is the missing-material exit instead (E6).
+ */
+const ABORT_PATH_PUBLICATION_PHASES: readonly BackendPublicationPhase[] = [
+  "aborting", "config-restoring", "map-restoring", "abort-releasing",
+];
+
+function isExternalAbortJournal(journal: BackendPublicationJournal): boolean {
+  return ABORT_PATH_PUBLICATION_PHASES.includes(journal.phase)
+    || (journal.phase === "aborted" && journal.recoveryReference !== null);
+}
 
 /**
  * Recovers a rollback whose publish-rollback effect was pending when the
@@ -2484,8 +2586,16 @@ const FENCE_DRIVING_PUBLICATION_PHASES: readonly BackendPublicationPhase[] = [
  *    before it, so the coordinator is resumed (or, completed, verified)
  *    and the report and the manifest completion follow. A fenced session
  *    is opened only while the coordinator still drives the fence
- *    (FENCE_DRIVING_PUBLICATION_PHASES); at released, on the abort path
- *    and at the terminal phases it is resumed without acquiring a lease;
+ *    (FENCE_DRIVING_PUBLICATION_PHASES); at released and at completed it
+ *    is resumed without acquiring a lease;
+ *  - the slot holds this rollback's publication on the abort path, or
+ *    aborted after it sealed its material (#1555: something else aborted
+ *    it): the abort is finished through the coordinator alone, the
+ *    restored source and the authority are proven again, and the
+ *    publication is composed and prepared again under a recovery session
+ *    that takes the lease (recoverExternallyAbortedPublication). A refusal
+ *    or a drift leaves the effect pending, the slot aborted and the lease
+ *    held;
  *  - the slot holds nothing of this rollback and no rollback selection
  *    binding exists: no selection could have completed, so the effect is
  *    abandoned. With a binding the selection did complete and the journal
@@ -2570,6 +2680,50 @@ async function recoverPendingPublishRollback(
     };
 
     /**
+     * #1555. This rollback's own publication was aborted by something other than this rollback (the coordinator's
+     * abort ran, or stopped part-way, after the publication began). The retained barrier is held throughout. In
+     * order: (1) the journal must be this rollback's composition, before anything is mutated; (2) an abort that
+     * stopped part-way is finished through the coordinator alone (no session: it releases what it recorded through
+     * its own provider, and a lease acquired here would be a row nothing releases); (3) the slot must now hold the
+     * aborted, referenced journal of the same composition with no fence left unreleased, and the source files it
+     * restored must read back as witnessed; (4) a recovery session takes the lease (a successor token when the
+     * abort released the recorded one, the original row when the coordinator never acquired it) and every failure
+     * from there keeps it; (5) the authority and the readback are proven again, and only then is the publication
+     * composed and prepared again over the aborted journal. A drift or a refusal at (5) leaves the effect pending,
+     * the slot aborted and the lease held, and every retry refuses the same way.
+     */
+    const recoverExternallyAbortedPublication = async (
+      first: PublicationPhase,
+      journal: BackendPublicationJournal,
+    ): Promise<RunMigrationRollbackOutcome> => {
+      const notComposition = (): RollbackOrchestrationError => new RollbackOrchestrationError(
+        "unexpected-state",
+        "the publication in the live slot carries this rollback's id but is not its composition",
+      );
+      if (!journalIsRollbackComposition(first, journal)) throw notComposition();
+      if (journal.phase !== "aborted") await deps.coordinator.abort(token);
+      const settled = readPublicationSlot(input.homeDir);
+      if (
+        settled.kind !== "publication"
+        || settled.journal.publicationId !== publicationId
+        || settled.journal.phase !== "aborted"
+        || settled.journal.recoveryReference === null
+        || settled.journal.projects.some((project) => project.fence !== null && project.fence.releasedAt === null)
+      ) {
+        throw new RollbackOrchestrationError(
+          "unexpected-state",
+          "the rollback's coordinator publication did not settle as an aborted publication with every recorded fence released",
+        );
+      }
+      const phase = storedPhase();
+      if (!journalIsRollbackComposition(phase, settled.journal)) throw notComposition();
+      return withRecoverySession(async (session) => {
+        await revalidatePreparedSelection(input, deps, current, session, phase, true);
+        return finishRollbackPublication({ ...phase, session }, current);
+      });
+    };
+
+    /**
      * Abandons the effect back to the sealed return phase. Only callers that have shown no selection was
      * prepared or completed reach it; an unfinished maintenance of this generation is aborted first.
      */
@@ -2650,6 +2804,10 @@ async function recoverPendingPublishRollback(
         );
       }
       const phase = storedPhase();
+      // #1555: this rollback's publication is on the abort path or was aborted after it sealed its material
+      // (something other than this rollback ran the coordinator's abort). It is resumed forward by re-running the
+      // rollback once the abort is finished, the source is proven restored and the authority is proven again.
+      if (isExternalAbortJournal(slot.journal)) return recoverExternallyAbortedPublication(phase, slot.journal);
       // E6: an aborted journal that never sealed its material is the coordinator's missing-material exit; the
       // publication is composed and prepared again under a recovery session, exactly as a selection-completed
       // maintenance would be.
@@ -2692,8 +2850,9 @@ async function revalidatePreparedSelection(
   current: MigrationManifest,
   session: RollbackFencedSession,
   phase: PublicationPhase,
+  ownAbortedPublication?: true,
 ): Promise<void> {
-  const resolved = await resolveContinuationAuthority(input, deps);
+  const resolved = await resolveContinuationAuthority(input, deps, ownAbortedPublication);
   if (resolved.status === "refused") {
     throw new RollbackOrchestrationError("not-eligible", "the authority no longer resolves: " + resolved.reason);
   }

@@ -16,6 +16,7 @@ import {
   type BackendPublicationDriver,
 } from "../../src/storage/backend-publication.js";
 import { assertMigrationReplayAdmission } from "../../src/migration/maintenance.js";
+import { deriveActivationPublicationId } from "../../src/migration/activation-publication-id.js";
 import {
   migrationGenerationBindingDirectory,
   recordMigrationSelectionBinding,
@@ -94,7 +95,7 @@ function recordSelection(homeDir: string, kind: "activation" | "rollback", evide
     homeDir, generationId: GENERATION_ID,
     binding: {
       kind, epochId: "epoch-1", attemptId: "attempt-1", manifestRevision,
-      witnessChecksumSha256: evidence, publicationId: "publication-" + kind,
+      witnessChecksumSha256: evidence, publicationId: kind === "activation" ? deriveActivationPublicationId(GENERATION_ID) : "publication-" + kind,
     },
   });
 }

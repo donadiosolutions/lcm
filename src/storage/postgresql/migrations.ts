@@ -55,6 +55,11 @@ const MIGRATION_MANIFEST = [
     filename: "0008_transfer_identity_content_digest.sql",
     sha256: "e9510bb6099da4c17d162a96e122466ea0cd77f789b608e72fa1f55da40b70ed",
   },
+  {
+    id: "0009_conversation_parent_session",
+    filename: "0009_conversation_parent_session.sql",
+    sha256: "d76fbb489042f20f5568a798ab27416027100337d19faacf5caac60b01bd27fe",
+  },
 ] as const;
 
 type MigrationRow = QueryResultRow & { id: string; checksum_sha256: string };
@@ -688,6 +693,23 @@ export function loadPostgreSqlSchemaSnapshots(): readonly PostgreSqlSchemaSnapsh
       constraint: "2e29a37acde9192250ca6a420d2d7c616a9065c5348088123745e7b6062e9666",
     },
   };
+  const conversationParentSession: PostgreSqlSchemaSnapshot = {
+    ...transferIdentityContentDigest,
+    migrationId: "0009_conversation_parent_session",
+    ordinaryColumnIdentities: [
+      ...transferIdentityContentDigest.ordinaryColumnIdentities,
+      "conversations|parent_session_id",
+    ],
+    columnAclIdentities: [
+      ...transferIdentityContentDigest.columnAclIdentities,
+      "conversations|parent_session_id",
+    ],
+    definitionHashes: {
+      ...transferIdentityContentDigest.definitionHashes,
+      ordinaryColumn: "24e48f73df39c742629e4f6e79534fb81f3fdf101ecaf3ee22d3617edbecd8d5",
+      columnAcl: "4dec4f4ffbaf0f9b7f4b2f0aef0830a34178a06b9caaee394052e25b603de007",
+    },
+  };
   return [
     baseline,
     machineIdentity,
@@ -696,6 +718,7 @@ export function loadPostgreSqlSchemaSnapshots(): readonly PostgreSqlSchemaSnapsh
     transferLedger,
     promotedContentDigest,
     transferIdentityContentDigest,
+    conversationParentSession,
   ];
 }
 
@@ -2393,7 +2416,7 @@ export async function runPostgreSqlMigrations(
                               privilege.privilege_type OPERATOR(pg_catalog.=) 'INSERT'
                               AND (
                               (relation.relname OPERATOR(pg_catalog.=) 'conversations'
-                               AND attribute.attname OPERATOR(pg_catalog.=) ANY (ARRAY['bootstrapped_at', 'created_at', 'updated_at']::pg_catalog.text[]))
+                               AND attribute.attname OPERATOR(pg_catalog.=) ANY (ARRAY['bootstrapped_at', 'created_at', 'updated_at', 'parent_session_id']::pg_catalog.text[]))
                               OR
                               (relation.relname OPERATOR(pg_catalog.=) 'messages'
                                AND attribute.attname OPERATOR(pg_catalog.=) ANY (ARRAY['created_at']::pg_catalog.text[]))
@@ -2528,7 +2551,8 @@ export async function runPostgreSqlMigrations(
                                     ANY (
                                       ARRAY[
                                         'bootstrapped_at',
-                                        'updated_at'
+                                        'updated_at',
+                                        'parent_session_id'
                                       ]::pg_catalog.text[]
                                     )
                                   AND privilege.privilege_type OPERATOR(pg_catalog.=) 'UPDATE'
@@ -2569,6 +2593,20 @@ export async function runPostgreSqlMigrations(
                                     OPERATOR(pg_catalog.=) 'INSERT'
                                 )
                               )
+                            )
+                            OR (
+                              relation.relname OPERATOR(pg_catalog.=) 'message_parts'
+                              AND attribute.attname OPERATOR(pg_catalog.=)
+                                ANY (
+                                  ARRAY[
+                                    'project_id',
+                                    'conversation_id',
+                                    'message_id',
+                                    'part_type'
+                                  ]::pg_catalog.text[]
+                                )
+                              AND privilege.privilege_type
+                                OPERATOR(pg_catalog.=) 'SELECT'
                             )
                             OR (
                               relation.relname OPERATOR(pg_catalog.=) 'summaries'

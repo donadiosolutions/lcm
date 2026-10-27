@@ -47,8 +47,8 @@ describe("complete public backend surface inventory", () => {
     expect(ownership.map((path) => `cli:${path}`).sort()).toEqual(
       discovered.filter((row) => row.kind === "cli").map((row) => row.id).sort(),
     );
-    expect(CLI_SCENARIO_PATHS.control).toHaveLength(20);
-    expect(ownership).toHaveLength(61);
+    expect(CLI_SCENARIO_PATHS.control).toHaveLength(21);
+    expect(ownership).toHaveLength(72);
     expect(discovered.filter((row) => row.kind === "portable-domain")).toHaveLength(22);
     expect(discovered.find((row) => row.id === "daemon:POST /status")).toBeDefined();
     expect(discovered.find((row) => row.id === "daemon:GET /health")).toBeDefined();

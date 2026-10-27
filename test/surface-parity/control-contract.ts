@@ -38,7 +38,7 @@ vi.mock("../../src/connectors/installer.js", () => ({
 }));
 
 export const CONTROL_PATHS = [
-  "<root>", "help", "daemon", "config", "events", "machine", "project", "postgres", "connectors",
+  "<root>", "help", "daemon", "config", "events", "machine", "project", "postgres", "connectors", "migration",
   "daemon start", "daemon restart", "config get", "config set", "install", "uninstall", "mcp",
   "connectors list", "connectors install", "connectors remove", "connectors doctor",
 ] as const;
@@ -235,6 +235,7 @@ const groupUsage: Partial<Record<ControlPath, string>> = {
   machine: "Usage: lcm machine <register|show|recover> [options]",
   project: "Usage: lcm project <create|link|unlink|list|show|reconcile-worktrees|renew-retired-identity> [options]",
   postgres: "Usage: lcm postgres migrate [--json]",
+  migration: "Usage: lcm migration <plan|dry-run|apply|resume|verify|report|abort|activate|rollback> [--json]",
   connectors: "Usage: lcm connectors <list|install|remove|doctor> [options]",
 };
 const validArgs: Partial<Record<ControlPath, string[]>> = {

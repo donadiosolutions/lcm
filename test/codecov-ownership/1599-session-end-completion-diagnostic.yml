@@ -1,0 +1,7 @@
+references: ["#1599"]
+rationale: >-
+  #1599 makes an unacknowledged session-end completion diagnosable by writing
+  a fixed classified stderr line; the change is confined to session-end.ts,
+  which keeps its established owner.
+pins:
+  - ["src/hooks/session-end.ts", "unit-hooks"]

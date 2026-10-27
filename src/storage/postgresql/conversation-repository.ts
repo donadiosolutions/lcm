@@ -12,7 +12,11 @@ import type {
   MessageRecord,
   MessageRole,
 } from "../../store/conversation-store.js";
-import type { ConversationRepository } from "../contracts.js";
+import {
+  parseTranscriptSlotMarker,
+  type ConversationRepository,
+  type TranscriptSlotSnapshot,
+} from "../contracts.js";
 import { StorageOperationError } from "../errors.js";
 import type {
   PostgreSqlQueryExecutor,
@@ -31,12 +35,66 @@ const MIN_SAFE_BIGINT = BigInt(Number.MIN_SAFE_INTEGER);
 const MAX_SAFE_BIGINT = BigInt(Number.MAX_SAFE_INTEGER);
 
 const CONVERSATION_COLUMNS =
-  "conversation_id, session_id, title, bootstrapped_at, created_at, updated_at";
+  "conversation_id, session_id, title, bootstrapped_at, created_at, updated_at, " +
+  "parent_session_id";
 const MESSAGE_COLUMNS =
   "message_id, conversation_id, seq, role, content, token_count, created_at";
 const MESSAGE_PART_COLUMNS =
   "part_id, message_id, session_id, part_type, ordinal, text_content, " +
   "tool_call_id, tool_name, tool_input, tool_output, metadata";
+
+export const QUERY_GET_CONVERSATION_BY_SESSION_ID = `SELECT ${CONVERSATION_COLUMNS}
+             FROM lcm.conversations
+             WHERE project_id = $1
+               AND session_id_sha256 = public.digest($2, 'sha256')
+               AND session_id = $2
+             ORDER BY created_at DESC, conversation_id DESC
+             LIMIT 1`;
+export const QUERY_LOCK_CONVERSATION_FOR_APPEND = `SELECT conversation_id
+               FROM lcm.conversations
+               WHERE project_id = $1
+                 AND conversation_id = $2
+               FOR UPDATE`;
+export const QUERY_GET_MAX_SEQ_FOR_APPEND = `SELECT MAX(seq) AS max_seq
+               FROM lcm.messages
+               WHERE project_id = $1
+                 AND conversation_id = $2`;
+export const QUERY_GET_MAX_SEQ = `SELECT COALESCE(MAX(seq), 0) AS max_seq
+             FROM lcm.messages
+             WHERE project_id = $1
+               AND conversation_id = $2`;
+export const QUERY_GET_MESSAGES = `SELECT ${MESSAGE_COLUMNS}
+             FROM lcm.messages
+             WHERE project_id = $1
+               AND conversation_id = $2
+               AND seq > $3
+             ORDER BY seq, message_id`;
+export const QUERY_GET_MESSAGES_LIMITED = `${QUERY_GET_MESSAGES} LIMIT $4`;
+export const QUERY_GET_LAST_MESSAGE = `SELECT ${MESSAGE_COLUMNS}
+             FROM lcm.messages
+             WHERE project_id = $1
+               AND conversation_id = $2
+             ORDER BY seq DESC, message_id DESC
+             LIMIT 1`;
+export const QUERY_GET_MESSAGE_COUNT = `SELECT COUNT(*) AS count
+             FROM lcm.messages
+             WHERE project_id = $1
+               AND conversation_id = $2`;
+export const QUERY_MARK_CONVERSATION_BOOTSTRAPPED = `UPDATE lcm.conversations
+               SET bootstrapped_at = COALESCE(
+                     bootstrapped_at,
+                     pg_catalog.statement_timestamp()
+                   ),
+                   updated_at = GREATEST(
+                     updated_at,
+                     pg_catalog.statement_timestamp()
+                   )
+               WHERE project_id = $1
+                 AND conversation_id = $2`;
+export const QUERY_LIST_CONVERSATIONS = `SELECT ${CONVERSATION_COLUMNS}
+               FROM lcm.conversations
+               WHERE project_id = $1
+               ORDER BY created_at, conversation_id`;
 
 type PostgreSqlConversationTransactionContext = PostgreSqlTransactionOptions & {
   readonly domain: "conversations";
@@ -74,6 +132,7 @@ type ConversationRow = QueryResultRow & {
   bootstrapped_at: Date | string | null;
   created_at: Date | string;
   updated_at: Date | string;
+  parent_session_id: string | null;
 };
 
 type MessageRow = QueryResultRow & {
@@ -107,6 +166,28 @@ type CountRow = QueryResultRow & {
 type MaxSeqRow = QueryResultRow & {
   max_seq: string | number | bigint | null;
 };
+
+type SlotEventRow = QueryResultRow & {
+  message_id: string | number | bigint;
+  followed: boolean;
+  next_ordinal: string | number | bigint;
+};
+
+type SlotMarkerRow = QueryResultRow & {
+  message_id: string | number | bigint;
+  metadata: string | null;
+};
+
+function hasCompactionPart(message: string): string {
+  return `EXISTS (
+                 SELECT 1
+                 FROM lcm.message_parts AS compaction_part
+                 WHERE compaction_part.project_id = ${message}.project_id
+                   AND compaction_part.conversation_id = ${message}.conversation_id
+                   AND compaction_part.message_id = ${message}.message_id
+                   AND compaction_part.part_type = 'compaction'
+               )`;
+}
 
 type TransactionIsolationRow = QueryResultRow & {
   transaction_isolation: unknown;
@@ -211,6 +292,7 @@ function conversationFromRow(
     bootstrappedAt: row.bootstrapped_at === null ? null : date(row.bootstrapped_at),
     createdAt: date(row.created_at),
     updatedAt: date(row.updated_at),
+    parentSessionId: row.parent_session_id,
   };
 }
 
@@ -363,18 +445,32 @@ export class PostgreSqlConversationRepository implements ConversationRepository 
     );
     await this.scopedDirectWrite(operation, async (transaction) => {
       await transaction.query({
-        text: `UPDATE lcm.conversations
-               SET bootstrapped_at = COALESCE(
-                     bootstrapped_at,
-                     pg_catalog.statement_timestamp()
-                   ),
-                   updated_at = GREATEST(
-                     updated_at,
-                     pg_catalog.statement_timestamp()
-                   )
-               WHERE project_id = $1
-                 AND conversation_id = $2`,
+        text: QUERY_MARK_CONVERSATION_BOOTSTRAPPED,
         values: [this.projectId, conversationId],
+      }, this.context(operation));
+    });
+  }
+
+  async setParentSessionIdIfNull(
+    conversationId: ConversationId,
+    parentSessionId: string,
+  ): Promise<void> {
+    const operation = "setParentSessionIdIfNull";
+    safeInputInteger(
+      conversationId,
+      this.projectId,
+      operation,
+      "conversation_id",
+    );
+    validateNoNul(parentSessionId, this.projectId, operation, "parent_session_id");
+    await this.scopedDirectWrite(operation, async (transaction) => {
+      await transaction.query({
+        text: `UPDATE lcm.conversations
+               SET parent_session_id = $3
+               WHERE project_id = $1
+                 AND conversation_id = $2
+                 AND parent_session_id IS NULL`,
+        values: [this.projectId, conversationId, parentSessionId],
       }, this.context(operation));
     });
   }
@@ -383,10 +479,7 @@ export class PostgreSqlConversationRepository implements ConversationRepository 
     const operation = "listConversations";
     return this.serializedRead(operation, async (executor) => {
       const result = await executor.query<ConversationRow>({
-        text: `SELECT ${CONVERSATION_COLUMNS}
-               FROM lcm.conversations
-               WHERE project_id = $1
-               ORDER BY created_at, conversation_id`,
+        text: QUERY_LIST_CONVERSATIONS,
         values: [this.projectId],
       }, this.context(operation));
       return result.rows.map((row) =>
@@ -427,18 +520,11 @@ export class PostgreSqlConversationRepository implements ConversationRepository 
     for (const input of inputs) this.validateAppendMessageInput(input, operation);
     return this.contentionWrite(operation, async (transaction) => {
       await transaction.query({
-        text: `SELECT conversation_id
-               FROM lcm.conversations
-               WHERE project_id = $1
-                 AND conversation_id = $2
-               FOR UPDATE`,
+        text: QUERY_LOCK_CONVERSATION_FOR_APPEND,
         values: [this.projectId, conversationId],
       }, this.context(operation));
       const maximum = await transaction.query<MaxSeqRow>({
-        text: `SELECT MAX(seq) AS max_seq
-               FROM lcm.messages
-               WHERE project_id = $1
-                 AND conversation_id = $2`,
+        text: QUERY_GET_MAX_SEQ_FOR_APPEND,
         values: [this.projectId, conversationId],
       }, this.context(operation));
       const rawMaximum = maximum.rows[0]?.max_seq ?? null;
@@ -477,16 +563,10 @@ export class PostgreSqlConversationRepository implements ConversationRepository 
     }
     const values: unknown[] = [this.projectId, conversationId, afterSeq];
     const hasBoundedLimit = options?.limit !== undefined && options.limit >= 0;
-    const limit = hasBoundedLimit ? " LIMIT $4" : "";
     if (hasBoundedLimit) values.push(options.limit);
     return this.serializedRead(operation, async (executor) => {
       const result = await executor.query<MessageRow>({
-        text: `SELECT ${MESSAGE_COLUMNS}
-             FROM lcm.messages
-             WHERE project_id = $1
-               AND conversation_id = $2
-               AND seq > $3
-             ORDER BY seq, message_id${limit}`,
+        text: hasBoundedLimit ? QUERY_GET_MESSAGES_LIMITED : QUERY_GET_MESSAGES,
         values,
       }, this.context(operation));
       return result.rows.map((row) =>
@@ -501,12 +581,7 @@ export class PostgreSqlConversationRepository implements ConversationRepository 
     safeInputInteger(conversationId, this.projectId, operation, "conversation_id");
     return this.serializedRead(operation, async (executor) => {
       const result = await executor.query<MessageRow>({
-        text: `SELECT ${MESSAGE_COLUMNS}
-             FROM lcm.messages
-             WHERE project_id = $1
-               AND conversation_id = $2
-             ORDER BY seq DESC, message_id DESC
-             LIMIT 1`,
+        text: QUERY_GET_LAST_MESSAGE,
         values: [this.projectId, conversationId],
       }, this.context(operation));
       const row = result.rows[0];
@@ -652,10 +727,7 @@ export class PostgreSqlConversationRepository implements ConversationRepository 
     safeInputInteger(conversationId, this.projectId, operation, "conversation_id");
     return this.serializedRead(operation, async (executor) => {
       const result = await executor.query<CountRow>({
-        text: `SELECT COUNT(*) AS count
-             FROM lcm.messages
-             WHERE project_id = $1
-               AND conversation_id = $2`,
+        text: QUERY_GET_MESSAGE_COUNT,
         values: [this.projectId, conversationId],
       }, this.context(operation));
       return this.count(result.rows[0], operation);
@@ -691,14 +763,132 @@ export class PostgreSqlConversationRepository implements ConversationRepository 
     safeInputInteger(conversationId, this.projectId, operation, "conversation_id");
     return this.serializedRead(operation, async (executor) => {
       const result = await executor.query<MaxSeqRow>({
-        text: `SELECT COALESCE(MAX(seq), 0) AS max_seq
-             FROM lcm.messages
-             WHERE project_id = $1
-               AND conversation_id = $2`,
+        text: QUERY_GET_MAX_SEQ,
         values: [this.projectId, conversationId],
       }, this.context(operation));
       const value = result.rows[0]?.max_seq ?? 0;
       return safeInteger(value, this.projectId, operation, "max_seq");
+    });
+  }
+
+  /**
+   * Read the session-wide transcript slot state. Callers hold the session's
+   * advisory lock (getOrCreateConversation in the same transaction) so the
+   * three reads observe one consistent state.
+   */
+  async getTranscriptSlotSnapshot(
+    sessionId: string,
+  ): Promise<TranscriptSlotSnapshot> {
+    const operation = "getTranscriptSlotSnapshot";
+    validateNoNul(sessionId, this.projectId, operation, "session_id");
+    return this.serializedRead(operation, async (executor) => {
+      const sessionFilter = `conversation.project_id = $1
+               AND conversation.session_id_sha256 = public.digest($2, 'sha256')
+               AND conversation.session_id = $2`;
+      const counted = await executor.query<CountRow>({
+        text: `SELECT COUNT(message.message_id) AS count
+               FROM lcm.conversations AS conversation
+               INNER JOIN lcm.messages AS message
+                 ON message.project_id = conversation.project_id
+                AND message.conversation_id = conversation.conversation_id
+               WHERE ${sessionFilter}
+                 AND NOT ${hasCompactionPart("message")}`,
+        values: [this.projectId, sessionId],
+      }, this.context(operation));
+      const events = await executor.query<SlotEventRow>({
+        text: `SELECT message.message_id,
+                      EXISTS (
+                        SELECT 1
+                        FROM lcm.conversations AS later_conversation
+                        INNER JOIN lcm.messages AS later
+                          ON later.project_id = later_conversation.project_id
+                         AND later.conversation_id = later_conversation.conversation_id
+                        WHERE later_conversation.project_id = conversation.project_id
+                          AND later_conversation.session_id_sha256 =
+                            conversation.session_id_sha256
+                          AND later_conversation.session_id = conversation.session_id
+                          AND NOT ${hasCompactionPart("later")}
+                          AND (later_conversation.created_at,
+                               later_conversation.conversation_id,
+                               later.seq,
+                               later.message_id)
+                            > (conversation.created_at,
+                               conversation.conversation_id,
+                               message.seq,
+                               message.message_id)
+                      ) AS followed,
+                      (
+                        SELECT COALESCE(MAX(part.ordinal) + 1, 0)
+                        FROM lcm.message_parts AS part
+                        WHERE part.project_id = message.project_id
+                          AND part.conversation_id = message.conversation_id
+                          AND part.message_id = message.message_id
+                      ) AS next_ordinal
+               FROM lcm.conversations AS conversation
+               INNER JOIN lcm.messages AS message
+                 ON message.project_id = conversation.project_id
+                AND message.conversation_id = conversation.conversation_id
+               WHERE ${sessionFilter}
+                 AND ${hasCompactionPart("message")}
+               ORDER BY conversation.created_at,
+                        conversation.conversation_id,
+                        message.seq,
+                        message.message_id`,
+        values: [this.projectId, sessionId],
+      }, this.context(operation));
+      const markers = await executor.query<SlotMarkerRow>({
+        text: `SELECT part.message_id, part.metadata
+               FROM lcm.conversations AS conversation
+               INNER JOIN lcm.messages AS message
+                 ON message.project_id = conversation.project_id
+                AND message.conversation_id = conversation.conversation_id
+               INNER JOIN lcm.message_parts AS part
+                 ON part.project_id = message.project_id
+                AND part.conversation_id = message.conversation_id
+                AND part.message_id = message.message_id
+               WHERE ${sessionFilter}
+                 AND part.part_type = 'snapshot'
+                 AND ${hasCompactionPart("message")}
+               ORDER BY part.message_id, part.ordinal`,
+        values: [this.projectId, sessionId],
+      }, this.context(operation));
+      const markersByMessage = new Map<number, boolean[]>();
+      for (const row of markers.rows) {
+        const consumed = parseTranscriptSlotMarker(row.metadata);
+        if (consumed === null) continue;
+        const messageId = safeInteger(
+          row.message_id,
+          this.projectId,
+          operation,
+          "message_id",
+        );
+        markersByMessage.set(messageId, [
+          ...(markersByMessage.get(messageId) ?? []),
+          consumed,
+        ]);
+      }
+      return {
+        transcriptCount: this.count(counted.rows[0], operation),
+        events: events.rows.map((row) => {
+          const messageId = safeInteger(
+            row.message_id,
+            this.projectId,
+            operation,
+            "message_id",
+          );
+          return {
+            messageId,
+            followedByTranscript: row.followed,
+            nextOrdinal: safeInteger(
+              row.next_ordinal,
+              this.projectId,
+              operation,
+              "next_ordinal",
+            ),
+            slotMarkers: markersByMessage.get(messageId) ?? [],
+          };
+        }),
+      };
     });
   }
 
@@ -886,13 +1076,7 @@ export class PostgreSqlConversationRepository implements ConversationRepository 
     operation: string,
   ): Promise<ConversationRecord | null> {
     const result = await executor.query<ConversationRow>({
-      text: `SELECT ${CONVERSATION_COLUMNS}
-             FROM lcm.conversations
-             WHERE project_id = $1
-               AND session_id_sha256 = public.digest($2, 'sha256')
-               AND session_id = $2
-             ORDER BY created_at DESC, conversation_id DESC
-             LIMIT 1`,
+      text: QUERY_GET_CONVERSATION_BY_SESSION_ID,
       values: [this.projectId, sessionId],
     }, this.context(operation));
     const row = result.rows[0];
