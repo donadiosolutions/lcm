@@ -71,6 +71,8 @@ export interface EventSidecarScanOptions {
   includeRecentErrors?: boolean;
   pruneOrphanSidecars?: boolean;
   pruneOrphanSidecarsOlderThanDays?: number;
+  /** @internal Deterministic boundary between completed sidecar scans. */
+  _afterSidecarForTesting?: (summary: EventSidecarSummary) => void;
 }
 
 const DEFAULT_TIMEOUT_MS = 2000;
@@ -377,7 +379,9 @@ function pruneSidecarFiles(
 export async function collectEventSidecars(options: EventSidecarScanOptions = {}): Promise<EventSidecarSummary[]> {
   if (options.pruneOrphanSidecars !== false) return scanEventSidecars(options);
   const signal = options.signal ?? new AbortController().signal;
-  return withDiagnosticSqliteSession(signal, () => scanEventSidecars({...options, signal}));
+  return withDiagnosticSqliteSession(signal, () => scanEventSidecars({...options, signal}), {
+    lifetimeMs: options.timeoutMs ?? DEFAULT_TIMEOUT_MS,
+  });
 }
 
 async function scanEventSidecars(options: EventSidecarScanOptions): Promise<EventSidecarSummary[]> {
@@ -591,6 +595,7 @@ async function scanEventSidecars(options: EventSidecarScanOptions): Promise<Even
           } else {
             sidecars.push(summary);
           }
+          options._afterSidecarForTesting?.(summary);
         };
 
         if (pruneOrphans) {

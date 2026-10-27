@@ -198,6 +198,8 @@ diagnostic reader cannot query an older schema, `--all` reports that sidecar
 as a failed scan and leaves it unchanged for recovery under its original
 project binding. The `--all` command also leaves orphan sidecars in place
 instead of pruning them during discovery.
+The read-only scan may use its full 30-second discovery budget; each individual
+SQLite diagnostic read still has a two-second limit.
 
 Promotion through `lcm events promote` (and `--all`) needs the backend
 publication lock briefly. If another process, such as a hook, holds the lock,
