@@ -118,27 +118,43 @@ backup and leave the row refused.
    `~/.lcm/projects/{hash}/db.sqlite` using its adjacent `meta.json`; use the
    configured runtime directory if yours differs. This procedure is only for
    SQLite projects.
-2. In a private directory (`umask 077` on POSIX), save the following script as
-   `repair-promoted.mjs`. First run `node repair-promoted.mjs /absolute/path/db.sqlite`
-   to print affected IDs only. It opens the database read-only and does not
-   print memory content.
+2. Save the following script as `repair-promoted.mjs` in a new private directory
+   under your own home or local user profile. On POSIX, for example, run
+   `umask 077; mkdir -m 700 "$HOME/lcm-repair"`, then save the script there.
+   On Windows, inspect the ACL of every containing directory from the local
+   drive root through your profile to the repair folder using folder Properties
+   > Security > Advanced or `icacls`. Confirm that another account cannot
+   create, delete, rename or replace the next path component, including through
+   inherited permissions, `DELETE_CHILD`, ownership or permission-change rights.
+   Traversal alone is acceptable. The repair folder must grant access only to
+   your account, Administrators and SYSTEM, with no shared access. If any
+   effective right cannot be verified, do not run the repair. Keep these
+   permissions in place throughout the repair; Node's mode bits do not verify
+   Windows ACLs. From the script directory, first run
+   `node repair-promoted.mjs /absolute/path/db.sqlite` to print affected IDs
+   only. It opens the database read-only and does not print memory content.
 3. Put the complete intended replacement in a private UTF-8 text file. Every
    byte, including a final newline, is part of the replacement. Run the repair
-   with the selected ID, replacement file and a **new backup filename**:
+   with the selected ID, replacement file and a **new backup filename directly
+   inside the script directory**:
 
    ```sh
-   node repair-promoted.mjs /absolute/path/db.sqlite SELECTED_ID /absolute/path/replacement.txt /absolute/path/before-repair.sqlite
+   node "$HOME/lcm-repair/repair-promoted.mjs" /absolute/path/db.sqlite SELECTED_ID /absolute/path/replacement.txt "$HOME/lcm-repair/before-repair.sqlite"
    ```
 
    The script creates a consistent SQLite backup (including committed WAL
    data), verifies its integrity, then replaces that row and its FTS entry in
    one transaction. It preserves all other fields, and keeps archived rows out
    of the search index. It refuses healthy rows, unknown IDs, invalid UTF-8 and
-   NUL-containing replacements. A failed repair rolls back; keep the backup.
+   NUL-containing replacements. On Windows, use a fully qualified path on a
+   local drive for both the script and backup; this example refuses UNC shares
+   and drive-root-relative paths. A failed repair rolls back; keep the backup.
 
 ```js
 import { DatabaseSync, backup } from "node:sqlite";
-import { closeSync, openSync, readFileSync, statSync } from "node:fs";
+import { closeSync, lstatSync, openSync, readFileSync, realpathSync, statSync } from "node:fs";
+import { dirname, isAbsolute, join, parse, relative, resolve, sep } from "node:path";
+import { fileURLToPath } from "node:url";
 
 const args = process.argv.slice(2);
 if (args.length !== 1 && args.length !== 4) {
@@ -157,10 +173,66 @@ try {
     const content = new TextDecoder("utf-8", { fatal: true, ignoreBOM: true })
       .decode(readFileSync(textFile));
     if (content.includes("\u0000")) throw new Error("Replacement contains NUL");
-    // Exclusive creation prevents overwriting an existing backup or the DB.
-    closeSync(openSync(backupPath, "wx", 0o600));
-    await backup(db, backupPath);
-    const saved = new DatabaseSync(backupPath, { readOnly: true });
+    const scriptDir = dirname(fileURLToPath(import.meta.url));
+    if (process.platform === "win32" &&
+        (!/^[A-Za-z]:[\\/]/.test(scriptDir) || !/^[A-Za-z]:[\\/]/.test(backupPath))) {
+      throw new Error("Script and backup must be on a local drive");
+    }
+    if (!isAbsolute(backupPath)) throw new Error("Backup path must be absolute");
+    const destination = resolve(backupPath);
+    const backupDir = dirname(destination);
+    if (process.platform !== "win32" && backupDir !== scriptDir) {
+      throw new Error("Backup must be a direct child of the script directory");
+    }
+    const uid = process.platform === "win32" ? undefined : process.getuid?.();
+    if (process.platform !== "win32" && typeof uid !== "number") {
+      throw new Error("Cannot verify directory ownership");
+    }
+    const inspectChain = (directory) => {
+      const root = parse(directory).root;
+      let current = root;
+      let parentInfo;
+      for (const component of ["", ...relative(root, directory).split(sep).filter(Boolean)]) {
+        if (component) current = join(current, component);
+        const info = lstatSync(current);
+        if (!info.isDirectory() || info.isSymbolicLink()) {
+          throw new Error("Backup directory chain contains a link or non-directory");
+        }
+        if (process.platform !== "win32" &&
+            ((info.uid !== uid && info.uid !== 0) || (info.mode & 0o022))) {
+          throw new Error("Backup directory chain is not trusted");
+        }
+        parentInfo = info;
+      }
+      return parentInfo;
+    };
+    const parentInfo = inspectChain(scriptDir);
+    if (process.platform === "win32") {
+      const backupDirInfo = inspectChain(backupDir);
+      if (!parentInfo.ino ||
+          realpathSync.native(backupDir).toLowerCase() !==
+            realpathSync.native(scriptDir).toLowerCase() ||
+          backupDirInfo.dev !== parentInfo.dev || backupDirInfo.ino !== parentInfo.ino) {
+        throw new Error("Backup must be a direct child of the script directory");
+      }
+    }
+    if (process.platform !== "win32" &&
+        (parentInfo.uid !== uid || (parentInfo.mode & 0o077))) {
+      throw new Error("Script directory must be private and process-owned");
+    }
+    const checkParent = () => {
+      const now = lstatSync(scriptDir);
+      if (!now.isDirectory() || now.isSymbolicLink() ||
+          now.dev !== parentInfo.dev || now.ino !== parentInfo.ino) {
+        throw new Error("Script directory changed during backup");
+      }
+    };
+    // Exclusive creation rejects an existing name. The trusted directory chain
+    // prevents other accounts replacing it when SQLite reopens the pathname.
+    closeSync(openSync(destination, "wx", 0o600));
+    checkParent();
+    await backup(db, destination);
+    const saved = new DatabaseSync(destination, { readOnly: true });
     try {
       const checks = saved.prepare("PRAGMA integrity_check").all();
       if (checks.length !== 1 || checks[0].integrity_check !== "ok") {
@@ -169,6 +241,7 @@ try {
     } finally {
       saved.close();
     }
+    checkParent();
     db.exec("BEGIN IMMEDIATE");
     try {
       const row = db.prepare(`SELECT rowid, tags, archived_at FROM promoted
@@ -204,6 +277,11 @@ try {
    Do not replace a live
    database file or discard its WAL/SHM sidecars to restore a backup; stop all
    writers again before any restoration.
+
+The directory checks protect against other local accounts. They do not protect
+against a process running as your account or an administrator, or permissions
+changed during the repair. The parent identity checks detect observed changes;
+they do not atomically reserve the directory or backup filename.
 
 Legacy worktree reconciliation uses a separate import path. During a real
 reconciliation, LCM checks the live source database while its existing
