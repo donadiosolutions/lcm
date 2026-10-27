@@ -681,10 +681,12 @@ bundle and keep provider, credential, quarantine, and recovery sessions private.
   of those separators are treated as one continuation, and redaction starts at
   the successor's first slash. Other relative values, such as `later/var/data`,
   remain visible by policy. Query and fragment child forms use the same stable
-  rule. A separate active-child home/root successor can still remain visible on
-  the first pass and redact on the second pass; that residual is tracked
-  separately. Closing an inner wrapper removes only that depth, preserving
-  still-open outer owners until their matching close or a hard reset.
+  rule. The same complete `Users`, `home`, or `root` segment match applies to
+  a successor that follows a path-bearing nested `file://` child's query or
+  fragment, so it is redacted on the first pass instead of the second. A
+  public-URL parameter of that child does not end the match. Closing an inner
+  wrapper removes only that depth, preserving still-open outer owners until
+  their matching close or a hard reset.
 
   When a matching quote closes a nested public URL inside a bracketed file
   query, an immediate `&` or `|` successor is redacted only when it begins with
