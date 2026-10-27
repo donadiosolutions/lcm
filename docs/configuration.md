@@ -1245,7 +1245,8 @@ An owner identifier is included when configured. No storage readiness or backend
 error result is included: observation never calls storage health or opens project
 storage. If background passive-event work halted, the response also includes
 process-local `passiveEvents` details, including its reason and message; a healthy
-daemon omits that field. Anonymous `/health` never includes those details.
+daemon omits that field. A managed daemon's anonymous `/health` never includes
+those details.
 This endpoint is an internal diagnostic mechanism with no third-party
 compatibility promise.
 
