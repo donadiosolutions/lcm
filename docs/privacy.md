@@ -371,6 +371,13 @@ bundled Gitleaks rules, built-in patterns, global `security.sensitivePatterns`,
 and the project's `sensitive-patterns.txt`. Previously captured passive events
 are scrubbed again before promotion.
 
+For a project retained under an older map identity, passive hooks apply both
+the local sidecar project's patterns and patterns added with `lcm sensitive add`
+under that older identity. The extra pattern directory is used only when the
+map identity is corroborated by the project's metadata or renewal fence.
+Hook events still use the stable local sidecar path. Patterns from both
+directories are applied together before an event is stored.
+
 Errors returned through MCP redact supported credential assignments before
 they become tool-visible diagnostics. This includes quoted, unquoted, and
 ODBC-style brace-delimited values for password, token, API-key, authorization,

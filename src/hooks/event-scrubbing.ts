@@ -3,7 +3,7 @@ import { statSync } from "node:fs";
 import { dirname } from "node:path";
 import { join } from "node:path";
 import { loadHookConfig } from "./config.js";
-import { localProjectIdentity } from "../daemon/project.js";
+import { localHookPatternIdentity } from "../daemon/project.js";
 import { configPath, lcmHomeDir } from "../runtime-paths.js";
 import { ScrubEngine } from "../scrub.js";
 import { PrivateMutationLockContentionError } from "../private-mutation-lock.js";
@@ -16,7 +16,7 @@ import { assertProjectStorageIdentityActive } from "../worktree-reconciliation-f
 interface ScrubCacheEntry {
   engine: ScrubEngine;
   patternsKey: string;
-  projectPatternsMtime: number;
+  projectPatternsMtimes: string;
 }
 
 const SCRUB_CACHE_MAX = 100;
@@ -31,30 +31,35 @@ function projectPatternsMtime(projDir: string): number {
   }
 }
 
-async function getScrubber(patterns: string[], projDir: string): Promise<ScrubEngine> {
+async function getScrubber(patterns: string[], projDirs: readonly string[]): Promise<ScrubEngine> {
+  const cacheKey = JSON.stringify(projDirs);
   const patternsKey = JSON.stringify(patterns);
-  const mtime = projectPatternsMtime(projDir);
-  const cached = scrubCache.get(projDir);
+  const mtimes = JSON.stringify(projDirs.map(projectPatternsMtime));
+  const cached = scrubCache.get(cacheKey);
   if (
     cached
     && cached.patternsKey === patternsKey
-    && cached.projectPatternsMtime === mtime
+    && cached.projectPatternsMtimes === mtimes
   ) {
     // Refresh insertion order so the bounded map behaves as an LRU cache.
-    scrubCache.delete(projDir);
-    scrubCache.set(projDir, cached);
+    scrubCache.delete(cacheKey);
+    scrubCache.set(cacheKey, cached);
     return cached.engine;
   }
 
-  const engine = await ScrubEngine.forProject(patterns, projDir);
-  scrubCache.delete(projDir);
+  const engine = projDirs.length === 1
+    ? await ScrubEngine.forProject(patterns, projDirs[0]!)
+    : new ScrubEngine(patterns, (await Promise.all(projDirs.map((dir) =>
+      ScrubEngine.loadProjectPatterns(join(dir, "sensitive-patterns.txt"))
+    ))).flat());
+  scrubCache.delete(cacheKey);
   if (scrubCache.size >= scrubCacheMax) {
     scrubCache.delete(scrubCache.keys().next().value as string);
   }
-  scrubCache.set(projDir, {
+  scrubCache.set(cacheKey, {
     engine,
     patternsKey,
-    projectPatternsMtime: mtime,
+    projectPatternsMtimes: mtimes,
   });
   return engine;
 }
@@ -104,10 +109,12 @@ export async function scrubExtractedEvents(
   // Hook capture must not enter backend-selected project-map reconciliation.
   // The local sidecar identity remains stable for ordinary projects and uses
   // the compatibility snapshot for already-mapped aliases/worktrees.
-  const identity = localProjectIdentity(cwd);
-  const projDir = join(lcmHomeDir(), "projects", identity.id);
-  assertProjectStorageIdentityActive(projDir, identity.id);
-  const scrubber = await getScrubber(patterns, projDir);
+  const identity = localHookPatternIdentity(cwd);
+  const projDirs = identity.patternIds.map((id) => join(lcmHomeDir(), "projects", id));
+  for (const [index, id] of identity.patternIds.entries()) {
+    assertProjectStorageIdentityActive(projDirs[index]!, id);
+  }
+  const scrubber = await getScrubber(patterns, projDirs);
   return events.map((event) => ({
     ...event,
     data: scrubber.scrub(event.data),
