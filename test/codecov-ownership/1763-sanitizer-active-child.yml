@@ -1,0 +1,7 @@
+references: ["#1763"]
+rationale: >-
+  #1763 makes the active-child return in sanitizeError recognize complete
+  Users, home, and root successor segments on the first pass; safe-error.ts
+  keeps its established owner.
+pins:
+  - ["src/daemon/safe-error.ts", "unit-daemon-core"]
