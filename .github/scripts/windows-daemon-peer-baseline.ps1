@@ -18,6 +18,18 @@ if (-not $principal.IsInRole([Security.Principal.WindowsBuiltInRole]::Administra
   throw 'Two-user Windows baseline requires the runner administrator for setup.'
 }
 
+# Resolve and construct the exact credential type before creating either user.
+# This preflight has no account side effect and no real password.
+$credentialType = 'System.Management.Automation.PSCredential' -as [type]
+if ($null -eq $credentialType -or $credentialType.FullName -ne 'System.Management.Automation.PSCredential') {
+  throw 'Windows baseline PSCredential type resolution failed before account creation.'
+}
+$preflightSecure = ConvertTo-SecureString 'fixture-type-preflight-only' -AsPlainText -Force
+$preflightCredential = [System.Management.Automation.PSCredential]::new('fixture-preflight', $preflightSecure)
+if ($preflightCredential.GetType() -ne $credentialType) {
+  throw 'Windows baseline PSCredential construction failed before account creation.'
+}
+
 function New-TestCredential($name) {
   $bytes = New-Object byte[] 32
   [Security.Cryptography.RandomNumberGenerator]::Create().GetBytes($bytes)
@@ -28,7 +40,7 @@ function New-TestCredential($name) {
   # Record ownership before the remaining setup can throw, so final cleanup
   # also removes an account whose credential construction failed.
   $script:users += $identity
-  $identity.Credential = New-Object Security.Management.Automation.PSCredential("$env:COMPUTERNAME\$name", $secure)
+  $identity.Credential = [System.Management.Automation.PSCredential]::new("$env:COMPUTERNAME\$name", $secure)
   return $identity
 }
 
@@ -245,6 +257,7 @@ try {
 }
 
 $cleanupErrors = New-Object System.Collections.Generic.List[string]
+$cleanupReadback = @()
 $sids = @($users | ForEach-Object { $_.Sid })
 try { Stop-RemainingFixtureProcesses $sids }
 catch { $cleanupErrors.Add('fixture-process-cleanup') }
@@ -261,15 +274,35 @@ foreach ($identity in $users) {
       }
     }
   } catch { $cleanupErrors.Add('user-profile-removal') }
-  if ($null -ne (Get-CimInstance Win32_UserProfile -Filter "SID='$($identity.Sid)'" -ErrorAction SilentlyContinue)) {
+  $profileRemains = $null
+  try {
+    $profileRemains = $null -ne (Get-CimInstance Win32_UserProfile -Filter "SID='$($identity.Sid)'" -ErrorAction SilentlyContinue)
+  } catch { $cleanupErrors.Add('user-profile-readback') }
+  if ($profileRemains) {
     $cleanupErrors.Add('user-profile-remains')
   }
-  if ($null -ne (Get-LocalUser -Name $identity.User.Name -ErrorAction SilentlyContinue)) {
+  $accountRemains = $null
+  try {
+    $accountRemains = $null -ne (Get-LocalUser -Name $identity.User.Name -ErrorAction SilentlyContinue)
+  } catch { $cleanupErrors.Add('local-user-readback') }
+  if ($accountRemains) {
     $cleanupErrors.Add('local-user-remains')
+  }
+  $cleanupReadback += @{
+    sid = $identity.Sid
+    accountRemains = $accountRemains
+    profileRemains = $profileRemains
   }
 }
 try { Stop-RemainingFixtureProcesses $sids }
 catch { $cleanupErrors.Add('fixture-process-remains') }
+
+Write-Host ('WINDOWS_BASELINE_CLEANUP_JSON=' + (@{
+  createdAccountCount = $users.Count
+  accounts = $cleanupReadback
+  processCleanupVerified = -not $cleanupErrors.Contains('fixture-process-remains')
+  errors = @($cleanupErrors.ToArray())
+} | ConvertTo-Json -Depth 6 -Compress))
 
 if ($primaryError) {
   if ($cleanupErrors.Count -gt 0) {
