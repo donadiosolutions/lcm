@@ -93,7 +93,7 @@ export function expectedSteadyAttempts(contract) {
 }
 
 function assertContract(contract) {
-  if (contract?.id !== "lcm-production-certification" || contract?.version !== 1) {
+  if (contract?.id !== "lcm-production-certification" || contract?.version !== 2) {
     throw new Error("invalid certification contract identity");
   }
   if (!['draft', 'approved'].includes(contract.status)) throw new Error("invalid certification contract status");
@@ -108,7 +108,14 @@ function assertContract(contract) {
     || contract.calculations.minimumSamples.p95 !== 200
     || p99Minimum !== 1000
     || contract.thresholds.hookCommandMs.minSuccessesForSubgates !== 200) {
-    throw new Error("certification contract v1 sample floors changed");
+    throw new Error("certification contract v2 sample floors changed");
+  }
+  // Approved v2 hook limits (the only change from v1): pooled p50/p95/p99 600/1500/2500,
+  // per-kind and per-machine p95 1500.
+  const hook = contract.thresholds.hookCommandMs;
+  if (hook.pooled?.p50 !== 600 || hook.pooled?.p95 !== 1500 || hook.pooled?.p99 !== 2500
+    || hook.perKindPooledP95 !== 1500 || hook.perMachineP95 !== 1500) {
+    throw new Error("certification contract v2 hook limits changed");
   }
   for (const name of ["hookInvocations", "daemonSearch", "daemonStore"]) {
     if (derived[name] < p99Minimum) {

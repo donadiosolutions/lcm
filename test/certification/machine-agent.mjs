@@ -228,32 +228,76 @@ export function classifyTlsRejection(error) {
 
 const DIAGNOSTIC_TEXT_LIMIT = 4096;
 const SECRET_ENVIRONMENT_NAME = /(PASSWORD|TOKEN|SECRET|KEY|_URL)$/iu;
+const SECRET_MINIMUM_LENGTH = 8;
+const SECRET_QUERY_PARAMETER = /((?:password|passwd|pwd|token|secret|api[_-]?key|access[_-]?key)=)[^&\s'"]+/giu;
 
-// Bounded, redacted text for private failure diagnostics. Exact secret-bearing
-// environment values are masked first, then any credential embedded in a URL.
-export function redactDiagnosticText(text, environment = {}, limit = DIAGNOSTIC_TEXT_LIMIT) {
-  let value = typeof text === "string" ? text : text === undefined || text === null ? "" : String(text);
-  for (const [name, secret] of Object.entries(environment)) {
-    if (typeof secret !== "string" || secret.length < 8 || !SECRET_ENVIRONMENT_NAME.test(name)) continue;
-    value = value.split(secret).join(`[redacted:${name}]`);
+function addSecretForms(secrets, label, value) {
+  if (typeof value !== "string" || value.length < SECRET_MINIMUM_LENGTH) return;
+  secrets.set(value, label);
+  try {
+    const decoded = decodeURIComponent(value);
+    if (decoded.length >= SECRET_MINIMUM_LENGTH) secrets.set(decoded, label);
+  } catch { /* not URL-encoded */ }
+  try {
+    const encoded = encodeURIComponent(value);
+    if (encoded.length >= SECRET_MINIMUM_LENGTH) secrets.set(encoded, label);
+  } catch { /* unencodable */ }
+}
+
+// Collect every secret form that diagnostics could echo: the whole value of each
+// secret-bearing environment variable, the bare and decoded userinfo password of any
+// URL-valued one, credential query parameters inside it, and the file-backed daemon
+// token (read from the given path; absent files contribute nothing).
+export function collectDiagnosticSecrets(environment = {}, { daemonTokenPath, readFile = (path) => readFileSync(path, "utf8") } = {}) {
+  const secrets = new Map();
+  for (const [name, value] of Object.entries(environment)) {
+    if (typeof value !== "string" || !SECRET_ENVIRONMENT_NAME.test(name)) continue;
+    addSecretForms(secrets, name, value);
+    if (/^[a-z][a-z0-9+.-]*:\/\//iu.test(value)) {
+      try {
+        const url = new URL(value);
+        addSecretForms(secrets, `${name}.password`, url.password);
+        for (const [key, parameter] of url.searchParams) {
+          if (SECRET_ENVIRONMENT_NAME.test(key) || /^(password|passwd|pwd|token|secret|api[_-]?key|access[_-]?key)$/iu.test(key)) {
+            addSecretForms(secrets, `${name}.${key}`, parameter);
+          }
+        }
+      } catch { /* not a parseable URL; the whole value is still masked */ }
+    }
   }
+  if (daemonTokenPath) {
+    try { addSecretForms(secrets, "daemon.token", readFile(daemonTokenPath).trim()); }
+    catch { /* token file absent or unreadable */ }
+  }
+  return secrets;
+}
+
+// Bounded, redacted text for private failure diagnostics. Known secret forms are
+// masked longest-first (so a shorter secret can never split a longer one), then any
+// remaining URL userinfo credential, then any credential-looking query parameter.
+export function redactDiagnosticText(text, environment = {}, limit = DIAGNOSTIC_TEXT_LIMIT, secrets) {
+  let value = typeof text === "string" ? text : text === undefined || text === null ? "" : String(text);
+  const known = secrets instanceof Map ? secrets : collectDiagnosticSecrets(environment);
+  const ordered = [...known.entries()].sort((left, right) => right[0].length - left[0].length);
+  for (const [secret, label] of ordered) value = value.split(secret).join(`[redacted:${label}]`);
   value = value.replace(/([a-z][a-z0-9+.-]*:\/\/[^\s/@:]+:)[^\s@]+@/giu, "$1[redacted]@");
+  value = value.replace(SECRET_QUERY_PARAMETER, "$1[redacted]");
   if (value.length > limit) value = `${value.slice(0, limit)}...[truncated ${value.length - limit} characters]`;
   return value;
 }
 
 // Private per-machine failure record (machine-<x>/failures.ndjson). The gate never
 // reads this file, so diagnostic text stays out of public gate output.
-export function createOperationFailureRecord(entry, error, errorClass, environment) {
+export function createOperationFailureRecord(entry, error, errorClass, environment, secrets) {
   return {
     id: entry.id, machine: entry.machine, op: entry.op, kind: entry.kind, phase: entry.phase ?? "steady",
     recordedAt: new Date().toISOString(),
     errorClass,
     exitCode: Number.isInteger(error?.code) ? error.code : null,
     exitSignal: typeof error?.signal === "string" ? error.signal : null,
-    message: redactDiagnosticText(error?.message, environment),
-    stderr: redactDiagnosticText(error?.stderr, environment),
-    stdout: redactDiagnosticText(error?.stdout, environment),
+    message: redactDiagnosticText(error?.message, environment, DIAGNOSTIC_TEXT_LIMIT, secrets),
+    stderr: redactDiagnosticText(error?.stderr, environment, DIAGNOSTIC_TEXT_LIMIT, secrets),
+    stdout: redactDiagnosticText(error?.stdout, environment, DIAGNOSTIC_TEXT_LIMIT, secrets),
     processStartWallMs: Number.isFinite(error?.processStartWallMs) ? error.processStartWallMs : null,
     processExitWallMs: Number.isFinite(error?.processExitWallMs) ? error.processExitWallMs : null,
   };
@@ -375,6 +419,7 @@ export async function executeDeterministicSchedule({
   environment,
   daemonClient,
   evidenceDirectory,
+  daemonTokenPath,
   now = () => performance.now(),
   wallNow = () => Date.now(),
   scheduleStartWallMs = wallNow(),
@@ -389,6 +434,10 @@ export async function executeDeterministicSchedule({
   const samplesPath = join(evidenceDirectory, "samples.ndjson");
   const ledgerPath = join(evidenceDirectory, "invocations.ndjson");
   const failuresPath = join(evidenceDirectory, "failures.ndjson");
+  // Secret forms are collected once per schedule; the daemon token file is read here
+  // so a token echoed by a failing CLI child is masked in private diagnostics.
+  const diagnosticSecrets = collectDiagnosticSecrets(environment, { daemonTokenPath });
+  const recordFailure = (entry, error, errorClass) => appendNdjson(failuresPath, createOperationFailureRecord(entry, error, errorClass, environment, diagnosticSecrets));
   const fatalAbort = new AbortController();
   const operations = schedule.map(async (entry) => {
     const scheduledWallMs = scheduleStartWallMs + entry.offsetSeconds * 1000;
@@ -410,6 +459,7 @@ export async function executeDeterministicSchedule({
     let outcome = "success";
     let errorClass;
     let commandTiming;
+    let failureRecorded = false;
     let exitCode;
     let exitSignal;
     let submittedPrimaryBytes;
@@ -509,7 +559,8 @@ export async function executeDeterministicSchedule({
       }
       if (Number.isInteger(error?.code)) exitCode = error.code;
       if (typeof error?.signal === "string") exitSignal = error.signal;
-      appendNdjson(failuresPath, createOperationFailureRecord(entry, error, errorClass, environment));
+      recordFailure(entry, error, errorClass);
+      failureRecorded = true;
       if (errorClass === "OperationDeadlineExceeded") fatalAbort.abort(error);
     }
     const endedAt = now();
@@ -517,6 +568,14 @@ export async function executeDeterministicSchedule({
     if (wallNow() > operationDeadlineWallMs) {
       outcome = "failed";
       errorClass = "OperationDeadlineExceeded";
+      // An operation that returned only after its absolute deadline: record once,
+      // with the real command timing when the child produced any.
+      if (!failureRecorded) {
+        recordFailure(entry, {
+          message: "certification operation completed after its absolute deadline",
+          processStartWallMs: commandTiming?.processStartWallMs, processExitWallMs: commandTiming?.processExitWallMs,
+        }, errorClass);
+      }
       fatalAbort.abort(new Error("certification operation deadline exceeded"));
     }
     const sample = {
@@ -542,7 +601,12 @@ export async function executeDeterministicSchedule({
       return sample;
       });
     } catch (error) {
-      const sample = { id: entry.id, machine: entry.machine, op: entry.op, kind: entry.kind, sessionId: entry.sessionId, phase: entry.phase ?? "steady", scheduledWallMs, outcome: "failed", errorClass: /overflow/u.test(error?.message ?? "") ? "AdmissionOverflow" : error?.code ?? error?.name ?? "Error" };
+      // Admission overflow, deadline elapsed before admission, or queued abort: the
+      // command never ran, so the record carries the error class and message only
+      // (no fabricated exit scalars or process timing).
+      const errorClass = /overflow/u.test(error?.message ?? "") ? "AdmissionOverflow" : error?.code ?? error?.name ?? "Error";
+      const sample = { id: entry.id, machine: entry.machine, op: entry.op, kind: entry.kind, sessionId: entry.sessionId, phase: entry.phase ?? "steady", scheduledWallMs, outcome: "failed", errorClass };
+      recordFailure(entry, { message: error?.message }, errorClass);
       appendNdjson(samplesPath, sample);
       fatalAbort.abort(error);
       return sample;
@@ -792,7 +856,7 @@ export async function runMachineAgent(environment = process.env) {
   const machine = process.argv[process.argv.indexOf("--machine") + 1];
   if (!evidenceDirectory || !['a', 'b'].includes(machine)) throw new Error("missing machine-agent configuration");
   mkdirSync(evidenceDirectory, { recursive: true, mode: 0o700 });
-  const { contract } = loadCertificationContract(new URL("./contract-v1.json", import.meta.url));
+  const { contract } = loadCertificationContract(new URL("./contract-v2.json", import.meta.url));
   const lcm = "/opt/lcm/dist/lcm.mjs";
   const name = `cert-${environment.LCM_CERT_RUN_ID}-${machine}`;
   const project = join(environment.HOME, "project");
@@ -930,12 +994,12 @@ export async function runMachineAgent(environment = process.env) {
     ];
     verifyEmissionBudget(emissionTimes, 30);
     expectedEvents = emissionTimes.length;
-    await executeDeterministicSchedule({ schedule: warmup, scheduleStartWallMs: Date.parse(warmupControl.warmupStartAt), entrypoint: lcm, cwd: project, environment, daemonClient, evidenceDirectory });
+    await executeDeterministicSchedule({ schedule: warmup, scheduleStartWallMs: Date.parse(warmupControl.warmupStartAt), entrypoint: lcm, cwd: project, environment, daemonClient, evidenceDirectory, daemonTokenPath });
     writeFileSync(join(evidenceDirectory, "warmup-complete.json"), `${JSON.stringify({ machine, at: new Date().toISOString() })}\n`, { mode: 0o600, flag: "wx" });
     const control = await waitForControl(join(evidenceDirectory, "phase-control.json"), {
       deadlineMs: Date.now() + 120_000,
     });
-    await executeDeterministicSchedule({ schedule, scheduleStartWallMs: Date.parse(control.steadyT0At), entrypoint: lcm, cwd: project, environment, daemonClient, evidenceDirectory });
+    await executeDeterministicSchedule({ schedule, scheduleStartWallMs: Date.parse(control.steadyT0At), entrypoint: lcm, cwd: project, environment, daemonClient, evidenceDirectory, daemonTokenPath });
     writeFileSync(join(evidenceDirectory, "steady-complete.json"), `${JSON.stringify({ machine, at: new Date().toISOString(), steadyT0At: control.steadyT0At })}\n`, { mode: 0o600, flag: "wx" });
     const settleUntil = Date.parse(control.steadyT0At) + timeline.steadySeconds * 1000 + (timeline.pendingSettleMaxSeconds ?? 0) * 1000;
     if (Date.now() < settleUntil) await new Promise((resolve) => setTimeout(resolve, settleUntil - Date.now()));
@@ -945,7 +1009,7 @@ export async function runMachineAgent(environment = process.env) {
         machine, runId: environment.LCM_CERT_RUN_ID, phase: "partition-recovery",
         durationSeconds: contract.thresholds.recovery.partition.rtoSeconds,
       });
-      await executeDeterministicSchedule({ schedule: partitionSchedule, entrypoint: lcm, cwd: project, environment, daemonClient, evidenceDirectory });
+      await executeDeterministicSchedule({ schedule: partitionSchedule, entrypoint: lcm, cwd: project, environment, daemonClient, evidenceDirectory, daemonTokenPath });
       const partitionClearance = await waitForControl(join(evidenceDirectory, "partition-cleared.json"), {
         deadlineMs: Date.now() + timeline.partitionPhaseMaxSeconds * 1000,
       });
@@ -961,7 +1025,7 @@ export async function runMachineAgent(environment = process.env) {
           machine, runId: environment.LCM_CERT_RUN_ID, phase: "restart-recovery",
           durationSeconds: contract.thresholds.recovery.restartDatabase.rtoSeconds,
         });
-        await executeDeterministicSchedule({ schedule: restartSchedule, entrypoint: lcm, cwd: project, environment, daemonClient, evidenceDirectory });
+        await executeDeterministicSchedule({ schedule: restartSchedule, entrypoint: lcm, cwd: project, environment, daemonClient, evidenceDirectory, daemonTokenPath });
         const restartClearance = await waitForControl(join(evidenceDirectory, "restart-cleared.json"), {
           deadlineMs: Date.now() + timeline.restartPhaseMaxSeconds * 1000,
         });

@@ -96,10 +96,10 @@ describe("CI plan classification", () => {
     expect(graphInvisibleTests("test/postgresql/surface-parity.integration.ts")).toEqual(["test/surface-parity/worker-admission.test.ts"]);
     expect(graphInvisibleTests("test/postgresql/other.integration.ts")).toEqual([]);
     expect(graphInvisibleTests("test/codecov-ownership/1403-unbound-enumeration.yml")).toEqual(["test/codecov-config.test.ts"]);
-    expect(graphInvisibleTests("test/certification/contract-v1.json")).toEqual([
+    expect(graphInvisibleTests("test/certification/contract-v2.json")).toEqual([
       "test/certification/contract.test.ts", "test/certification/evidence.test.ts", "test/certification/gate.test.ts", "test/certification/round2-acceptance.test.ts",
     ]);
-    expect(graphInvisibleTests("test/certification/contract-v1.approval.json")).toEqual([
+    expect(graphInvisibleTests("test/certification/contract-v2.approval.json")).toEqual([
       "test/certification/contract.test.ts", "test/certification/evidence.test.ts", "test/certification/gate.test.ts", "test/certification/round2-acceptance.test.ts",
     ]);
     expect(graphInvisibleTests("test/certification/evidence-schema.json")).toEqual([
@@ -403,7 +403,7 @@ describe("graph-invisible input table completeness", () => {
     // Ownership fragments read from disk by the Codecov contract test.
     "codecov-ownership": [/join\(projectRoot, "test", "codecov-ownership"\)/u],
     "certification-contracts": [
-      /new URL\("\.\/(?:contract-v1|evidence-schema)\.json"/u,
+      /new URL\("\.\/(?:contract-v2|evidence-schema)\.json"/u,
     ],
   };
 

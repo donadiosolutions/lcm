@@ -33,7 +33,7 @@ function maintenanceFails(mode: MaintenanceFailure | undefined, op: string, inde
 function rawFixture(options: Variant = {}) {
   const root = mkdtempSync(join(tmpdir(), "lcm-cert-raw-gate-"));
   const output = join(mkdtempSync(join(tmpdir(), "lcm-cert-raw-gate-output-")), "gate");
-  const contract = JSON.parse(readFileSync(new URL("./contract-v1.json", import.meta.url), "utf8"));
+  const contract = JSON.parse(readFileSync(new URL("./contract-v2.json", import.meta.url), "utf8"));
   const contractText = `${JSON.stringify(contract)}\n`;
   const contractPath = join(root, "contract.json");
   writeFileSync(contractPath, contractText);

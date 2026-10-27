@@ -5,12 +5,15 @@ LCM machine identities against PostgreSQL 18. It records the exact contract,
 machine identities, scheduled attempts, operation samples, fault steps, cleanup
 witnesses, and SLO calculations needed to reproduce a gate decision.
 
-The committed contract remains byte-for-byte in `draft` status. Approval lives in
-`test/certification/contract-v1.approval.json`, which names the approved contract
+The committed contract (`test/certification/contract-v2.json`, version 2) remains
+byte-for-byte in `draft` status. Approval lives in
+`test/certification/contract-v2.approval.json`, which names the approved contract
 SHA-256, approver, approval time, and approval reference. The harness refuses to
 collect evidence unless that hash matches the contract bytes, and evidence must
 start at or after the approval time. Changing either file invalidates the binding;
-changing the contract requires a new approval record.
+changing the contract requires a new approval record. Version 2 supersedes v1; the
+only change recalibrated the hook-command limits (pooled p50/p95/p99 600/1500/2500 ms,
+per-kind and per-machine p95 1500 ms). No certification evidence was collected under v1.
 
 ## What the two machines mean
 
@@ -164,7 +167,7 @@ directory and copy the reviewed outputs into `docs/` in the evidence commit:
 pnpm run test:certification:gate -- \
   --repository-root "$PWD" \
   --evidence-dir /absolute/private/lcm-certification/local \
-  --contract "$PWD/test/certification/contract-v1.json" \
+  --contract "$PWD/test/certification/contract-v2.json" \
   --output-dir /absolute/private/lcm-certification/gate
 ```
 
@@ -188,9 +191,16 @@ Latency percentiles still use successful hook, search, and store samples.
 
 When an operation fails, each machine appends a bounded, redacted record to its
 private `failures.ndjson`: exit code or signal, error message, stdout and stderr
-summaries (secret-bearing environment values and URL credentials masked, text
-truncated), and process timing. Only the error class, exit code, and signal reach
-`samples.ndjson`; the gate never reads `failures.ndjson`.
+summaries, and process timing. Redaction masks whole secret-bearing environment
+values, the bare and URL-decoded password of any credential URL, credential query
+parameters, and the file-backed daemon token, longest value first, then truncates
+the text. Admission overflow, a deadline that elapsed before admission, and an
+operation that returned only after its absolute deadline also get one record each,
+without fabricated exit scalars or process timing. Attempts cancelled before they
+started (`AdmissionAborted` after a fatal abort) are recorded only in
+`samples.ndjson`; they never ran, so there is nothing to diagnose. Only the error
+class, exit code, and signal reach `samples.ndjson`; the gate never reads
+`failures.ndjson`.
 
 The acknowledgment metric is a conservative upper bound from successful public
 hook-command exit to the first one-second observer sighting of a terminal local

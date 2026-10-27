@@ -92,7 +92,7 @@ export const GRAPH_INVISIBLE_INPUTS = Object.freeze([
   }),
   Object.freeze({
     name: "certification-contracts",
-    pattern: /^test\/certification\/(?:contract-v1(?:\.approval)?|evidence-schema)\.json$/u,
+    pattern: /^test\/certification\/(?:contract-v2(?:\.approval)?|evidence-schema)\.json$/u,
     tests: Object.freeze([
       "test/certification/contract.test.ts",
       "test/certification/evidence.test.ts",

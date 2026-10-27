@@ -209,8 +209,8 @@ describe("certification harness", () => {
     expect(result.sha256).toMatch(/^[0-9a-f]{64}$/u);
     expect(readFileSync(join(target, "dist", "lcm.mjs"), "utf8")).toBe("dist/lcm.mjs");
     expect(readFileSync(join(target, "certification", "machine-agent.mjs"), "utf8")).toBe("export {};\n");
-    expect(JSON.parse(readFileSync(join(target, "certification", "contract-v1.approval.json"), "utf8")))
-      .toMatchObject({ contractSha256: "b62288ae79e24b1ff69b2b8dd2149e14657383113d757c196a457d974067c188" });
+    expect(JSON.parse(readFileSync(join(target, "certification", "contract-v2.approval.json"), "utf8")))
+      .toMatchObject({ contractSha256: "6dc8cef4c170c851bbc4c9626ee4a31c3d5cf7a7f4b41bb4e4852c88759222e4" });
   });
 
   it("creates the exact full schedule and records fault transitions", () => {

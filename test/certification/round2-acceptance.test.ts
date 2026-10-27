@@ -19,7 +19,7 @@ import {
   reconcileOracleBijection,
   recoveryVerdicts,
 } from "../../scripts/certification-gate.mjs";
-import contract from "./contract-v1.json";
+import contract from "./contract-v2.json";
 import { cleanupHarnessResources, createRunNames } from "../../scripts/postgresql-harness.mjs";
 
 describe("round 2 certification acceptance helpers", () => {

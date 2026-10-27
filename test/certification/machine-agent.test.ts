@@ -7,6 +7,7 @@ import {
   createAdmissionController,
   createHookFixture,
   captureDoctorEvidence,
+  collectDiagnosticSecrets,
   executeDeterministicSchedule,
   isAcknowledgedRow,
   machineStoredConfig,
@@ -239,6 +240,77 @@ it("redacts secret environment values and URL credentials and bounds diagnostic 
     expect(long.startsWith("y".repeat(100))).toBe(true);
     expect(long).toContain("[truncated 4900 characters]");
     expect(long.length).toBeLessThan(200);
+  });
+
+  it("redacts derived secret forms: bare and decoded URL passwords, query credentials, daemon token, longest first", () => {
+    const directory = mkdtempSync(join(tmpdir(), "lcm-cert-redact-derived-"));
+    const daemonTokenPath = join(directory, "daemon.token");
+    writeFileSync(daemonTokenPath, "daemon-token-value-0123456789\n");
+    const environment = {
+      LCM_POSTGRES_URL: "postgresql://runtime:p%40ss-word-9876@db.internal:5432/lcm?sslmode=require&password=query-pass-5555",
+      LCM_SHORT_SECRET: "short-secret-xyz",
+      LCM_LONG_SECRET: "short-secret-xyz-plus-longer-suffix",
+    };
+    const secrets = collectDiagnosticSecrets(environment, { daemonTokenPath });
+    expect([...secrets.keys()]).toEqual(expect.arrayContaining(["p%40ss-word-9876", "p@ss-word-9876", "query-pass-5555", "daemon-token-value-0123456789", "short-secret-xyz", "short-secret-xyz-plus-longer-suffix"]));
+    const text = [
+      "bare encoded p%40ss-word-9876 and decoded p@ss-word-9876",
+      "query password=query-pass-5555 and token=unknown-token-1234&next",
+      "authorization bearer daemon-token-value-0123456789",
+      "overlap short-secret-xyz-plus-longer-suffix then short-secret-xyz",
+    ].join("\n");
+    const redacted = redactDiagnosticText(text, environment, 4096, secrets);
+    for (const secret of ["p%40ss-word-9876", "p@ss-word-9876", "query-pass-5555", "unknown-token-1234", "daemon-token-value-0123456789", "short-secret-xyz", "longer-suffix"]) {
+      expect(redacted).not.toContain(secret);
+    }
+    expect(redacted).toContain("[redacted:LCM_POSTGRES_URL.password]");
+    expect(redacted).toContain("[redacted:daemon.token]");
+    expect(redacted).toContain("token=[redacted]");
+    expect(redacted).toContain("overlap [redacted:LCM_LONG_SECRET] then [redacted:LCM_SHORT_SECRET]");
+    expect(collectDiagnosticSecrets(environment, { daemonTokenPath: join(directory, "missing.token") }).has("daemon-token-value-0123456789")).toBe(false);
+    expect(redactDiagnosticText("plain detail stays", environment, 4096, secrets)).toBe("plain detail stays");
+  });
+
+  it("records private diagnostics for a deadline elapsed before admission without fabricating timing", async () => {
+    const evidenceDirectory = mkdtempSync(join(tmpdir(), "lcm-cert-preadmission-record-"));
+    const samples = await executeDeterministicSchedule({
+      schedule: [{ id: "late", machine: "a", op: "search", offsetSeconds: 0, phase: "steady" }],
+      entrypoint: "/unused/lcm.mjs", cwd: evidenceDirectory, environment: {}, evidenceDirectory,
+      scheduleStartWallMs: 0, wallNow: () => 60_001, delay: async () => undefined,
+    });
+    expect(samples).toEqual([expect.objectContaining({ outcome: "failed", errorClass: "OperationDeadlineExceeded" })]);
+    const failures = readFileSync(join(evidenceDirectory, "failures.ndjson"), "utf8").trim().split("\n").map((line) => JSON.parse(line));
+    expect(failures).toEqual([expect.objectContaining({
+      id: "late", errorClass: "OperationDeadlineExceeded", exitCode: null, exitSignal: null,
+      message: "certification operation deadline elapsed before admission", processStartWallMs: null, processExitWallMs: null,
+    })]);
+  });
+
+  it("records private diagnostics for admission overflow and for a late return past the deadline, once each", async () => {
+    const evidenceDirectory = mkdtempSync(join(tmpdir(), "lcm-cert-overflow-late-record-"));
+    let clock = 0;
+    const post = vi.fn(async () => { clock = 60_001; });
+    const schedule = [
+      ...Array.from({ length: 70 }, (_, index) => ({ id: `search-${index}`, machine: "a", op: "search", offsetSeconds: 0, phase: "steady" })),
+    ];
+    const samples = await executeDeterministicSchedule({
+      schedule, entrypoint: "/unused/lcm.mjs", cwd: evidenceDirectory, environment: {}, evidenceDirectory,
+      daemonClient: { post }, scheduleStartWallMs: 0, wallNow: () => clock, delay: async () => undefined,
+    });
+    const byClass = samples.reduce((counts, sample) => ({ ...counts, [sample.errorClass ?? "none"]: (counts[sample.errorClass ?? "none"] ?? 0) + 1 }), {} as Record<string, number>);
+    expect(byClass.AdmissionOverflow).toBeGreaterThan(0);
+    expect(byClass.OperationDeadlineExceeded).toBeGreaterThan(0);
+    expect(samples.every((sample) => sample.outcome !== "success")).toBe(true);
+    const failures = readFileSync(join(evidenceDirectory, "failures.ndjson"), "utf8").trim().split("\n").map((line) => JSON.parse(line));
+    const failedIds = samples.filter((sample) => sample.outcome === "failed").map((sample) => sample.id).sort();
+    expect(failures.map((record) => record.id).sort()).toEqual(failedIds);
+    expect(new Set(failures.map((record) => record.id)).size).toBe(failures.length);
+    const overflow = failures.find((record) => record.errorClass === "AdmissionOverflow");
+    expect(overflow).toMatchObject({ exitCode: null, exitSignal: null, processStartWallMs: null, processExitWallMs: null });
+    expect(overflow.message).toMatch(/overflow/u);
+    const late = failures.find((record) => record.message === "certification operation completed after its absolute deadline");
+    expect(late).toMatchObject({ errorClass: "OperationDeadlineExceeded", exitCode: null, exitSignal: null });
+    expect(typeof late.processStartWallMs).toBe("number");
   });
 
   it("persists bounded redacted private diagnostics and timing for a failed CLI operation", async () => {

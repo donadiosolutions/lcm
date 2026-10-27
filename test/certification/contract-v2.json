@@ -1,8 +1,8 @@
 {
-  "$comment": "Contract r3 for user approval. No certification evidence collected. Immutable once approved; any change after evidence invalidates the gate. Latency/RTO limits are approval-selected policy targets, not measured claims.",
+  "$comment": "Contract v2 DRAFT for user approval. Only change from approved v1 (sha256 b62288ae...): hookCommandMs pooled p50/p95/p99 and per-kind/per-machine p95 recalibrated after non-certifying smokes measured p50 428-441 ms and p95 ~1011 ms on the 1 CPU/1 GiB machines. No certification evidence collected.",
   "id": "lcm-production-certification",
-  "version": 1,
-  "draftRevision": 3,
+  "version": 2,
+  "draftRevision": 1,
   "status": "draft",
   "approval": {
     "approvedBy": null,
@@ -159,14 +159,14 @@
     "hookCommandMs": {
       "definition": "public CLI process start to exit wall time (monotonic); schedule delay reported separately",
       "pooled": {
-        "p50": 400,
-        "p95": 1000,
-        "p99": 2000
+        "p50": 600,
+        "p95": 1500,
+        "p99": 2500
       },
-      "perKindPooledP95": 1000,
-      "perMachineP95": 1000,
+      "perKindPooledP95": 1500,
+      "perMachineP95": 1500,
       "minSuccessesForSubgates": 200,
-      "basis": "unmeasured approval-selected policy limits"
+      "basis": "recalibrated from non-certifying smoke-44/45/47 observations (p50 428-441 ms, p95 ~1011 ms) with margin; approval-selected policy limits"
     },
     "daemonSearchMs": {
       "local": {
