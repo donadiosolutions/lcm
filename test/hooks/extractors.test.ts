@@ -43,6 +43,19 @@ describe("extractPostToolEvents", () => {
     });
   });
 
+  it("uses a fixed generic label for an unrelated failed Bash command", () => {
+    expect(extractPostToolEvents({
+      tool_name: "Bash",
+      tool_input: { command: "curl -H private-value https://example.invalid" },
+      tool_output: { isError: true },
+    })).toEqual([{
+      type: "error_tool",
+      category: "error",
+      data: "Bash error: command",
+      priority: 1,
+    }]);
+  });
+
   it("extracts git commit from Bash", () => {
     const events = extractPostToolEvents({
       tool_name: "Bash",
