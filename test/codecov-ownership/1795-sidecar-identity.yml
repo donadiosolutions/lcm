@@ -1,0 +1,13 @@
+references: ["#1795"]
+rationale: >-
+  The existing-only sidecar evidence and binding checks remain local
+  persistence work in src/db/events-path.ts. Promotion admission and
+  recovered-cwd handling remain daemon route work in
+  src/daemon/routes/promote-events.ts and
+  src/daemon/routes/storage-lifecycle.ts. These materially changed files
+  retain their established component owners; no files were added, removed,
+  moved, or re-owned.
+pins:
+  - ["src/db/events-path.ts", "unit-local-persistence"]
+  - ["src/daemon/routes/promote-events.ts", "unit-daemon-routes"]
+  - ["src/daemon/routes/storage-lifecycle.ts", "unit-daemon-routes"]
