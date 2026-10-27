@@ -1,0 +1,7 @@
+references: ["PR #1775", "#1384"]
+rationale: >-
+  PR #1775 moves halted passive-event detail from managed anonymous health to
+  bearer-gated daemon observation. The changed src/daemon/server.ts remains in
+  its existing daemon-core owner; the component map does not change.
+pins:
+  - ["src/daemon/server.ts", "unit-daemon-core"]
