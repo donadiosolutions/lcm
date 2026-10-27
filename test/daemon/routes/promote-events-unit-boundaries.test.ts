@@ -40,7 +40,9 @@ const mocks = vi.hoisted(() => ({
   scrubberFactory: vi.fn(),
   eventsPath: vi.fn(() => "/events.db"),
   existingEventsPath: vi.fn(),
+  assertExistingSidecarProjectBinding: vi.fn(),
 }));
+const SidecarIdentityConflictError = vi.hoisted(() => class SidecarIdentityConflictError extends Error {});
 const missingCwdError = vi.hoisted(() => new Error("missing cwd"));
 
 vi.mock("../../../src/hooks/events-db.js", () => ({
@@ -62,6 +64,8 @@ vi.mock("../../../src/hooks/events-db.js", () => ({
 vi.mock("../../../src/db/events-path.js", () => ({
   eventsDbPath: mocks.eventsPath,
   existingEventsDbPath: mocks.existingEventsPath,
+  assertExistingSidecarProjectBinding: mocks.assertExistingSidecarProjectBinding,
+  SidecarIdentityConflictError,
 }));
 vi.mock("../../../src/promotion/dedup.js", () => ({
   deduplicateAndInsert: mocks.dedup,
@@ -145,7 +149,7 @@ function projectStorage() {
 
 describe("promote-events unit boundaries", () => {
   beforeEach(() => {
-    for (const mock of Object.values(mocks)) mock.mockClear();
+    for (const mock of Object.values(mocks)) mock.mockReset();
     mocks.events.mockReturnValue([]);
     mocks.mark.mockImplementation(() => undefined);
     mocks.reinforcement.mockReturnValue({ totalCount: 0, distinctSessions: 0 });
@@ -199,7 +203,7 @@ describe("promote-events unit boundaries", () => {
     expect(mocks.send).toHaveBeenLastCalledWith(response, 500, { error: "failed to promote events" });
   });
 
-  it("fails selected-project identity after local outbox preparation for direct, drain, all, and notify paths", async () => {
+  it("fails selected-project identity before opening the outbox for direct, drain, all, and notify paths", async () => {
     const identityFailure = new Error("PostgreSQL project binding is required");
     mocks.identity.mockImplementation(() => { throw identityFailure; });
 
@@ -262,7 +266,7 @@ describe("promote-events unit boundaries", () => {
       identityFailure,
       { cwd: "/cwd" },
     );
-    expect(mocks.openOutbox).toHaveBeenCalled();
+    expect(mocks.openOutbox).not.toHaveBeenCalled();
     expect(mocks.openProject).not.toHaveBeenCalled();
   });
 
@@ -293,7 +297,7 @@ describe("promote-events unit boundaries", () => {
       error: "Machine identity is unavailable. Run `lcm machine show` for recovery guidance.",
       storageBackend: "postgresql",
     });
-    expect(mocks.openOutbox).toHaveBeenCalledOnce();
+    expect(mocks.openOutbox).not.toHaveBeenCalled();
     expect(mocks.scrubberFactory).not.toHaveBeenCalled();
   });
 
@@ -339,7 +343,7 @@ describe("promote-events unit boundaries", () => {
     expect(mocks.openOutbox).toHaveBeenCalledTimes(2);
   });
 
-  it("queues local SQLite preparation separately from scrubber and selected storage", async () => {
+  it("guards local SQLite preparation and scrubber work under selected admission", async () => {
     const sequence: string[] = [];
     let admitted = false;
     const events = [event({ data: "admit only the selected batch" })];
@@ -350,7 +354,7 @@ describe("promote-events unit boundaries", () => {
       return events;
     });
     mocks.scrubberFactory.mockImplementation(async () => {
-      expect(admitted).toBe(false);
+      expect(admitted).toBe(true);
       sequence.push("scrubber");
       return { scrub: mocks.scrub };
     });
@@ -382,8 +386,8 @@ describe("promote-events unit boundaries", () => {
 
     expect(mocks.mark).toHaveBeenCalledWith([events[0].event_id]);
     expect(sequence).toEqual([
-      "admission", "outbox-open", "outbox-read", "admission", "scrubber",
-      "admission", "project-open", "repository-batch",
+      "admission", "admission", "admission", "outbox-open", "outbox-read",
+      "project-open", "scrubber", "repository-batch",
     ]);
     expect(withPublicationAdmission).toHaveBeenCalledTimes(3);
   });
@@ -418,7 +422,7 @@ describe("promote-events unit boundaries", () => {
     );
     expect(mocks.openProject).toHaveBeenCalledWith(
       admitted,
-      undefined,
+      expect.any(Object),
       expect.any(AbortSignal),
     );
   });
@@ -494,10 +498,10 @@ describe("promote-events unit boundaries", () => {
         ? [event({ event_id: eventsCalls === 1 ? 1 : 2, data: eventsCalls === 1 ? "a" : "b" })]
         : [];
     });
+    let bIdentityCalls = 0;
     mocks.identity.mockImplementation((cwd: string) => {
       if (cwd === "/a") return a;
-      if (cwd === "/b" && mocks.identity.mock.calls.filter(([path]) => path === "/b").length === 1) return b;
-      if (cwd === "/b") return { ...b, canonical: "/b-drift" };
+      if (cwd === "/b") return ++bIdentityCalls === 1 ? b : { ...b, canonical: "/b-drift" };
       return c;
     });
 
@@ -510,8 +514,8 @@ describe("promote-events unit boundaries", () => {
     });
     expect(mocks.closeFactory).toHaveBeenCalledOnce();
     expect(mocks.mark).toHaveBeenCalledWith([1]);
-    expect(mocks.openProject).toHaveBeenCalledTimes(2);
     expect(mocks.identity.mock.calls.some(([cwd]) => cwd === "/c")).toBe(false);
+    expect(mocks.openProject).toHaveBeenCalledTimes(2);
     expect(mocks.log).not.toHaveBeenCalled();
   });
 
@@ -607,11 +611,11 @@ describe("promote-events unit boundaries", () => {
     mocks.events.mockReturnValueOnce([]);
     await expect(drainEventsForCwd(config, "/cwd", "/events.db"))
       .resolves.toMatchObject({ batches: 0, message: "no unprocessed events" });
-    expect(mocks.identity).toHaveBeenCalledTimes(1);
+    expect(mocks.identity).toHaveBeenCalledTimes(2);
     expect(mocks.openProject).toHaveBeenCalledTimes(1);
-    expect(mocks.openOutbox.mock.invocationCallOrder[0])
-      .toBeLessThan(mocks.identity.mock.invocationCallOrder[0]);
     expect(mocks.identity.mock.invocationCallOrder[0])
+      .toBeLessThan(mocks.openOutbox.mock.invocationCallOrder[0]);
+    expect(mocks.openOutbox.mock.invocationCallOrder[0])
       .toBeLessThan(mocks.openProject.mock.invocationCallOrder[0]);
   });
 
@@ -652,7 +656,7 @@ describe("promote-events unit boundaries", () => {
     expect(pending.map(({ event_id }) => event_id)).toEqual([second.event_id]);
     expect(mocks.mark).toHaveBeenCalledOnce();
     expect(mocks.mark).toHaveBeenCalledWith([first.event_id]);
-    expect(mocks.events).toHaveBeenCalledTimes(2);
+    expect(mocks.events).toHaveBeenCalledOnce();
     expect(mocks.identity.mock.results.map(({ value }) => value)).toEqual([
       identityA,
       identityA,
@@ -660,11 +664,11 @@ describe("promote-events unit boundaries", () => {
       identityBDrift,
     ]);
     expect(mocks.identity).toHaveBeenCalledTimes(4);
-    expect(mocks.scrubberFactory).toHaveBeenCalledTimes(2);
+    expect(mocks.scrubberFactory).toHaveBeenCalledOnce();
     expect(mocks.openProject).toHaveBeenCalledOnce();
     expect(mocks.openProject).toHaveBeenCalledWith(
       identityA,
-      undefined,
+      expect.any(Object),
       expect.any(AbortSignal),
     );
     expect(mocks.closeEvents).toHaveBeenCalledOnce();
@@ -696,7 +700,7 @@ describe("promote-events unit boundaries", () => {
       machineId: "machine-c",
     };
     const pending = [first, second];
-    const identityCalls = [identityA, identityA, identityB, identityB, identityC];
+    const identityCalls = [identityA, identityA, identityB, identityB, identityC, identityC];
     mocks.events.mockImplementation(() => pending.length === 0 ? [] : [pending[0]]);
     mocks.mark.mockImplementation((processedIds: number[]) => {
       for (const processedId of processedIds) {
@@ -718,6 +722,7 @@ describe("promote-events unit boundaries", () => {
       identityA,
       identityB,
       identityB,
+      identityC,
       identityC,
     ]);
     expect(mocks.projectPaths.mock.calls.map(([identity]) => identity)).toEqual([
@@ -745,19 +750,19 @@ describe("promote-events unit boundaries", () => {
     expect(mocks.openProject).toHaveBeenNthCalledWith(
       1,
       identityA,
-      undefined,
+      expect.any(Object),
       expect.any(AbortSignal),
     );
     expect(mocks.openProject).toHaveBeenNthCalledWith(
       2,
       identityB,
-      undefined,
+      expect.any(Object),
       expect.any(AbortSignal),
     );
     expect(mocks.openProject).toHaveBeenNthCalledWith(
       3,
       identityC,
-      undefined,
+      expect.any(Object),
       expect.any(AbortSignal),
     );
     expect(mocks.openProject).toHaveBeenCalledTimes(3);
@@ -788,7 +793,7 @@ describe("promote-events unit boundaries", () => {
         remoteProjectId: "pid",
         machineId: "machine",
       }),
-      undefined,
+      expect.any(Object),
       expect.any(AbortSignal),
     );
     expect(mocks.closeProject).toHaveBeenCalledOnce();
@@ -882,7 +887,8 @@ describe("promote-events unit boundaries", () => {
 
   it("stops after the hard maximum when a sidecar never drains", async () => {
     mocks.events.mockImplementation(() => [event({ data: "repeating" })]);
-    const result = await drainEventsForCwd(config, "/cwd", "/events.db");
+    const result = await drainEventsForCwd(config, "/cwd", "/events.db", undefined, undefined,
+      { withPublicationAdmission: testPublicationAdmission });
     expect(result).toMatchObject({
       batches: 10_000,
       promoted: 10_000,
@@ -894,7 +900,10 @@ describe("promote-events unit boundaries", () => {
 
   it("parks through durable sidecar state without consuming unprocessed rows", async () => {
     mocks.observeMissingCwd.mockReturnValue({ parked: true, observations: 3, retryAfterMs: 0 });
-    mocks.validate.mockImplementation(() => { throw missingCwdError; });
+    mocks.validate.mockImplementation((cwd: string, options?: { allowMissing?: boolean }) => {
+      if (options?.allowMissing) return cwd;
+      throw missingCwdError;
+    });
 
     const result = await parkUnavailableCwdEvents("/missing", "/events.db");
 
@@ -952,8 +961,10 @@ describe("promote-events unit boundaries", () => {
     await expect(promoteEventsForCwd(config, lexical)).resolves.toMatchObject({
       deferred: { kind: "awaiting-confirmation", observations: 1 },
     });
-    expect(mocks.existingEventsPath).toHaveBeenCalledOnce();
-    expect(mocks.existingEventsPath).toHaveBeenCalledWith("/workspace/missing");
+    expect(mocks.existingEventsPath).toHaveBeenCalledTimes(2);
+    expect(mocks.existingEventsPath).toHaveBeenCalledWith("/workspace/missing", {
+      publicationLockToken: expect.any(Object),
+    });
     expect(mocks.eventsPath).not.toHaveBeenCalled();
     expect(mocks.observeMissingCwd).toHaveBeenCalledOnce();
   });

@@ -1,4 +1,4 @@
-import { existsSync } from "node:fs";
+import { existsSync, statSync } from "node:fs";
 import { join, resolve } from "node:path";
 import { localProjectIdentity } from "../daemon/project.js";
 import {
@@ -39,6 +39,13 @@ type ExistingEventsDbPathOptions = Readonly<{
   /** @internal Test-only directory-open seam for isolating evidence ownership. */
   _openEventsDirectoryForTesting?: typeof openPrivateDirectory;
 }>;
+
+export class SidecarIdentityConflictError extends Error {
+  constructor() {
+    super("sidecar identity does not match the current project");
+    this.name = "SidecarIdentityConflictError";
+  }
+}
 
 function effectiveUid(): number | undefined {
   return typeof process.getuid === "function" ? process.getuid() : undefined;
@@ -82,10 +89,10 @@ function publishIdentityEvidence(cwd: string, identity: { id: string; canonical:
   );
 }
 
-function existingSidecarFromIdentityEvidence(
+function readIdentityEvidence(
   cwd: string,
   expectedUid: number | undefined,
-): string | undefined {
+): SidecarIdentityEvidence | undefined {
   const normalizedCwd = normalizeProjectPath(cwd);
   const path = identityEvidencePath(normalizedCwd);
 
@@ -120,11 +127,30 @@ function existingSidecarFromIdentityEvidence(
     ) {
       return undefined;
     }
-    const candidate = join(eventsDir(), `${record.id}.db`);
-    return existsSync(candidate) ? candidate : undefined;
+    return record as SidecarIdentityEvidence;
   } catch {
     return undefined;
   }
+}
+
+function existingSidecarFromIdentityEvidence(
+  cwd: string,
+  expectedUid: number | undefined,
+): string | undefined {
+  const evidence = readIdentityEvidence(cwd, expectedUid);
+  if (evidence === undefined) return undefined;
+  try {
+    if (statSync(cwd).isDirectory()
+        && evidence.canonical !== normalizeProjectIdentityPath(cwd)) {
+      throw new SidecarIdentityConflictError();
+    }
+  } catch (error) {
+    if (error instanceof SidecarIdentityConflictError) throw error;
+    const code = (error as NodeJS.ErrnoException).code;
+    if (code !== "ENOENT" && code !== "ENOTDIR") throw error;
+  }
+  const candidate = join(eventsDir(), `${evidence.id}.db`);
+  return existsSync(candidate) ? candidate : undefined;
 }
 
 export function eventsDir(homeDir?: string): string {
@@ -215,7 +241,8 @@ export function existingEventsDbPath(
           result = existsSync(candidate) ? candidate : undefined;
         }
       }
-    } catch {
+    } catch (error) {
+      if (error instanceof SidecarIdentityConflictError) throw error;
       failed = true;
     }
 
@@ -227,5 +254,33 @@ export function existingEventsDbPath(
     return failed ? undefined : result;
   } finally {
     handle.close();
+  }
+}
+
+/** Check a selected sidecar against the current read-only project binding. */
+export function assertExistingSidecarProjectBinding(
+  cwd: string,
+  sidecarPath: string,
+  admitted: Readonly<{ id: string; canonical: string }> | undefined,
+  publicationLockToken?: BackendPublicationLockToken,
+): void {
+  const directory = eventsDir();
+  if (existsSync(directory)) {
+    const handle = openPrivateDirectory(directory, { expectedUid: effectiveUid() });
+    try {
+      assertPrivateDirectory(handle, directory, handle.witness);
+    } finally {
+      handle.close();
+    }
+  }
+  const current = authenticatedExistingProjectIdentity(cwd, publicationLockToken);
+  const canonical = current?.canonical ?? normalizeProjectIdentityPath(cwd);
+  const id = current?.id ?? hashProjectPath(canonical);
+  const exactSidecar = join(directory, `${id}.db`);
+  const selected = existingEventsDbPath(cwd, { publicationLockToken });
+  if ((admitted !== undefined && (admitted.id !== id || admitted.canonical !== canonical))
+      || sidecarPath !== (selected ?? exactSidecar)
+      || sidecarPath !== exactSidecar) {
+    throw new SidecarIdentityConflictError();
   }
 }

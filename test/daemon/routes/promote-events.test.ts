@@ -39,12 +39,16 @@ const FORCED_WRAPPER_TIMEOUT_MS = 1;
 const eventPathMocks = vi.hoisted(() => ({
   eventsDir: vi.fn(),
   existingEventsDbPath: vi.fn(),
+  assertExistingSidecarProjectBinding: vi.fn(),
+  SidecarIdentityConflictError: class SidecarIdentityConflictError extends Error {},
 }));
 
 // Mock eventsDbPath to point at our temp dir
 vi.mock("../../../src/db/events-path.js", () => ({
   eventsDbPath: vi.fn(),
   existingEventsDbPath: eventPathMocks.existingEventsDbPath,
+  assertExistingSidecarProjectBinding: eventPathMocks.assertExistingSidecarProjectBinding,
+  SidecarIdentityConflictError: eventPathMocks.SidecarIdentityConflictError,
   eventsDir: eventPathMocks.eventsDir,
 }));
 
@@ -152,10 +156,11 @@ describe("promote-events route", () => {
     sidecarPath = join(dir, "events.db");
     extraDirs = [];
     startedPromotionOperations = [];
-    eventPathMocks.eventsDir.mockReturnValue(dir);
-    eventPathMocks.existingEventsDbPath.mockReturnValue(sidecarPath);
-    vi.mocked(eventsDbPath).mockReturnValue(sidecarPath);
-    vi.mocked(deduplicateAndInsert).mockClear();
+    eventPathMocks.eventsDir.mockReset().mockReturnValue(dir);
+    eventPathMocks.existingEventsDbPath.mockReset().mockReturnValue(sidecarPath);
+    eventPathMocks.assertExistingSidecarProjectBinding.mockReset();
+    vi.mocked(eventsDbPath).mockReset().mockReturnValue(sidecarPath);
+    vi.mocked(deduplicateAndInsert).mockReset().mockResolvedValue("mock-id");
     vi.mocked(deduplicateAndInsertInRepositories).mockClear();
     clearProjectMapCache();
   });
@@ -780,6 +785,7 @@ describe("promote-events route", () => {
     extraDirs.push(sidecarParent);
     const disappearingSidecar = join(sidecarParent, "events.db");
     new EventsDb(disappearingSidecar).close();
+    eventPathMocks.existingEventsDbPath.mockReturnValue(disappearingSidecar);
     const openExisting = EventsDb.openExisting;
     const openSpy = vi.spyOn(EventsDb, "openExisting").mockImplementation((dbPath, options) => {
       if (dbPath === disappearingSidecar) {
@@ -810,6 +816,7 @@ describe("promote-events route", () => {
     const corruptSidecar = join(dir, "parking-corrupt.db");
     const evidence = Buffer.from("not a sqlite database");
     writeFileSync(corruptSidecar, evidence);
+    eventPathMocks.existingEventsDbPath.mockReturnValue(corruptSidecar);
 
     await expect(parkUnavailableCwdEvents(deletedCwd, corruptSidecar)).rejects.toThrow();
     expect(readFileSync(corruptSidecar)).toEqual(evidence);
@@ -848,6 +855,7 @@ describe("promote-events route", () => {
     const deletedCwd = join(dir, "deleted-empty-sidecar");
     const emptySidecar = join(dir, "empty.db");
     new EventsDb(emptySidecar).close();
+    eventPathMocks.existingEventsDbPath.mockReturnValue(emptySidecar);
     vi.useFakeTimers();
     vi.setSystemTime(0);
     const getUnprocessed = vi.spyOn(EventsDb.prototype, "getUnprocessed");
@@ -933,20 +941,25 @@ describe("promote-events route", () => {
     edb.close();
     setupProjectDb(contendedCwd).close();
 
-    let releaseFirst!: () => void;
-    let firstEntered!: () => void;
-    const firstEnteredPromise = new Promise<void>((resolve) => { firstEntered = resolve; });
-    const firstGate = new Promise<void>((resolve) => { releaseFirst = resolve; });
-    vi.mocked(deduplicateAndInsert).mockImplementationOnce(async () => {
-      firstEntered();
-      await firstGate;
-      return "first-id";
-    });
+    let releaseFirstClose!: () => void;
+    let firstCloseEntered!: () => void;
+    const firstCloseEnteredPromise = new Promise<void>((resolve) => { firstCloseEntered = resolve; });
+    const firstCloseGate = new Promise<void>((resolve) => { releaseFirstClose = resolve; });
+    const originalClose = SQLiteLocalHookOutboxFactory.prototype.close;
+    const closeSpy = vi.spyOn(SQLiteLocalHookOutboxFactory.prototype, "close")
+      .mockImplementationOnce(async function (
+        this: SQLiteLocalHookOutboxFactory,
+        token?: Parameters<SQLiteLocalHookOutboxFactory["close"]>[0],
+      ) {
+        firstCloseEntered();
+        await firstCloseGate;
+        return originalClose.call(this, token);
+      });
 
     const firstPromotion = registerPromotionOperation(
       promoteEventsForCwd(makeConfig(), contendedCwd, sidecarPath),
     );
-    await firstEnteredPromise;
+    await firstCloseEnteredPromise;
 
     const missingState = new EventsDb(sidecarPath);
     missingState.observeMissingCwd(0, 5 * 60 * 1000, 3);
@@ -964,7 +977,8 @@ describe("promote-events route", () => {
     await Promise.resolve();
     mkdirSync(contendedCwd, { recursive: true });
     setupProjectDb(contendedCwd).close();
-    releaseFirst();
+    releaseFirstClose();
+    closeSpy.mockRestore();
 
     await expect(firstPromotion).resolves.toMatchObject({ promoted: 1 });
     await expect(waitingPromotion).resolves.toMatchObject({ promoted: 1, errors: 0 });
@@ -1444,6 +1458,56 @@ describe("promote-events route", () => {
     remainingDb.close();
     expect(remaining).toHaveLength(0);
   }, PROMOTION_DRAIN_TIMEOUT_MS);
+
+  it("reports an identity refusal for an explicitly selected global sidecar without consuming it", async () => {
+    const projectCwd = mkdtempSync(join(tmpdir(), "promote-all-identity-refusal-"));
+    extraDirs.push(projectCwd);
+    const selected = join(dir, `${projectId(projectCwd)}.db`);
+    ensureProjectDir(projectCwd);
+    const edb = new EventsDb(selected);
+    edb.insertEvent("session", {
+      type: "decision", category: "decision", data: "retain selected event", priority: 1,
+    }, "PostToolUse");
+    edb.close();
+    setupProjectDb(projectCwd).close();
+    eventPathMocks.assertExistingSidecarProjectBinding.mockImplementation(() => {
+      throw new eventPathMocks.SidecarIdentityConflictError();
+    });
+
+    const handler = createPromoteAllEventsHandler(makeConfig());
+    const { res, getBody } = mockRes();
+    await handler(request, res, "");
+
+    const result = getBody();
+    expect(result.failedProjects).toBe(1);
+    expect(result.projects[0].message).toBe("sidecar identity does not match the current project");
+    const retained = new EventsDb(selected);
+    expect(retained.getUnprocessed()).toHaveLength(1);
+    retained.close();
+    expect(eventPathMocks.assertExistingSidecarProjectBinding).toHaveBeenCalled();
+  });
+
+  it("returns a specific direct-route refusal for a conflicting sidecar", async () => {
+    const edb = new EventsDb(sidecarPath);
+    edb.insertEvent("session", {
+      type: "decision", category: "decision", data: "retain direct event", priority: 1,
+    }, "PostToolUse");
+    edb.close();
+    eventPathMocks.assertExistingSidecarProjectBinding.mockImplementation(() => {
+      throw new eventPathMocks.SidecarIdentityConflictError();
+    });
+    const handler = createPromoteEventsHandler(makeConfig());
+    const { res, getBody } = mockRes();
+    await handler(request, res, JSON.stringify({ cwd: dir }));
+    expect(res.writeHead).toHaveBeenCalledWith(409, expect.anything());
+    expect(getBody()).toEqual({
+      status: "blocked",
+      error: "sidecar identity does not match the current project",
+    });
+    const retained = new EventsDb(sidecarPath);
+    expect(retained.getUnprocessed()).toHaveLength(1);
+    retained.close();
+  });
 
   it("settles route work after a forced wrapper timeout", async () => {
     const edb = new EventsDb(sidecarPath);

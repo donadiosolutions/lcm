@@ -1,9 +1,11 @@
 import { afterEach, beforeEach, describe, it, expect } from "vitest";
 import {
+  assertExistingSidecarProjectBinding,
   eventSequenceDbPath,
   eventsDbPath,
   eventsDir,
   existingEventsDbPath,
+  SidecarIdentityConflictError,
 } from "../../src/db/events-path.js";
 import {
   hashProjectPath,
@@ -13,7 +15,7 @@ import {
   retiredProjectIdentitySuccessor,
 } from "../../src/project-map.js";
 import { localProjectIdentity } from "../../src/daemon/project.js";
-import { chmodSync, existsSync, mkdirSync, mkdtempSync, readdirSync, renameSync, rmSync, statSync, writeFileSync } from "node:fs";
+import { chmodSync, existsSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, renameSync, rmSync, statSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { homedir } from "node:os";
 import { tmpdir } from "node:os";
@@ -117,6 +119,10 @@ describe("backend-independent local project identity", () => {
     const existingSidecar = join(sidecarDir, `${hashProjectPath(normalizeProjectIdentityPath(project))}.db`);
     writeFileSync(existingSidecar, "");
     expect(existingEventsDbPath(project)).toBe(existingSidecar);
+    expect(() => assertExistingSidecarProjectBinding(project, existingSidecar, {
+      id: hashProjectPath(normalizeProjectIdentityPath(project)),
+      canonical: normalizeProjectIdentityPath(project),
+    })).not.toThrow();
 
     // A map key no local evidence binds to this path cannot name the sidecar:
     // the probe ignores it and keeps using the identity the canonical path
@@ -194,6 +200,46 @@ describe("backend-independent local project identity", () => {
       expect(existingEventsDbPath(unavailable)).toBe(legacySidecar);
       expect(existsSync(projectMapPath())).toBe(false);
       expect(existsSync(join(home, ".lcm", "projects"))).toBe(false);
+    } finally {
+      rmSync(primary, { recursive: true, force: true });
+      rmSync(linked, { recursive: true, force: true });
+    }
+  });
+
+  it("refuses old linked-worktree evidence when its cwd is reused by a new project", () => {
+    const { primary, linked, anchorSidecar, evidencePath } = prepareDeletedLinkedWorktree();
+    try {
+      writeFileSync(anchorSidecar, "old sidecar");
+      const evidenceBefore = readFileSync(evidencePath);
+      mkdirSync(linked);
+      const newId = hashProjectPath(normalizeProjectIdentityPath(linked));
+      writeFileSync(join(eventsDir(), `${newId}.db`), "new sidecar");
+
+      expect(() => existingEventsDbPath(linked)).toThrow(SidecarIdentityConflictError);
+      expect(() => assertExistingSidecarProjectBinding(linked, anchorSidecar, undefined))
+        .toThrow(SidecarIdentityConflictError);
+      expect(readFileSync(evidencePath)).toEqual(evidenceBefore);
+      expect(readFileSync(anchorSidecar, "utf8")).toBe("old sidecar");
+
+      rmSync(linked, { recursive: true, force: true });
+      expect(existingEventsDbPath(linked)).toBe(anchorSidecar);
+    } finally {
+      rmSync(primary, { recursive: true, force: true });
+      rmSync(linked, { recursive: true, force: true });
+    }
+  });
+
+  it("refuses an exact-cwd legacy sidecar when a restored worktree has a different Git anchor", () => {
+    const { primary, linked } = prepareDeletedLinkedWorktree();
+    try {
+      const legacySidecar = join(eventsDir(), `${hashProjectPath(normalizeProjectPath(linked))}.db`);
+      writeFileSync(legacySidecar, "legacy sidecar");
+      mkdirSync(linked);
+      writeFileSync(join(linked, ".git"), `gitdir: ${join(primary, ".git", "worktrees", "linked")}\n`);
+      expect(existingEventsDbPath(linked)).toBe(legacySidecar);
+      expect(() => assertExistingSidecarProjectBinding(linked, legacySidecar, undefined))
+        .toThrow(SidecarIdentityConflictError);
+      expect(readFileSync(legacySidecar, "utf8")).toBe("legacy sidecar");
     } finally {
       rmSync(primary, { recursive: true, force: true });
       rmSync(linked, { recursive: true, force: true });
@@ -312,6 +358,8 @@ describe("backend-independent local project identity", () => {
 
     expect(existsSync(projectMapPath())).toBe(false);
     expect(existingEventsDbPath(project)).toBe(sidecar);
+    expect(() => assertExistingSidecarProjectBinding(project, sidecar, undefined))
+      .toThrow(SidecarIdentityConflictError);
   });
 
   it("rejects a renewed successor id when the retained predecessor fence is absent", () => {
