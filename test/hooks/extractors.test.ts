@@ -43,6 +43,19 @@ describe("extractPostToolEvents", () => {
     });
   });
 
+  it("uses a fixed generic label for an unrelated failed Bash command", () => {
+    expect(extractPostToolEvents({
+      tool_name: "Bash",
+      tool_input: { command: "curl -H private-value https://example.invalid" },
+      tool_output: { isError: true },
+    })).toEqual([{
+      type: "error_tool",
+      category: "error",
+      data: "Bash error: command",
+      priority: 1,
+    }]);
+  });
+
   it("extracts git commit from Bash", () => {
     const events = extractPostToolEvents({
       tool_name: "Bash",
@@ -230,13 +243,13 @@ describe("extractPostToolEvents", () => {
     });
   });
 
-  it("truncates data at 2000 char soft cap", () => {
+  it("passes complete selected data to the scrub boundary", () => {
     const events = extractPostToolEvents({
       tool_name: "AskUserQuestion",
       tool_input: { question: "x".repeat(3000) },
       tool_response: "yes",
     });
-    expect(events[0].data.length).toBeLessThanOrEqual(2050); // soft cap with some slack
+    expect(events[0].data).toContain("x".repeat(3000));
   });
 
   describe("explicit tool outcome", () => {
@@ -391,7 +404,7 @@ describe("normalizePromptWithChannels", () => {
   it("handles multi-line channel content", () => {
     const raw = '<channel source="telegram" chat_id="1">\nalways use TypeScript\nfor new files\n</channel>';
     const { text, fromChannel } = normalizePromptWithChannels(raw);
-    expect(text).toBe("always use TypeScript\nfor new files");
+    expect(text).toBe("\nalways use TypeScript\nfor new files\n");
     expect(fromChannel).toBe(true);
   });
 
@@ -642,7 +655,7 @@ describe("extractPostToolEvents — native Codex activity", () => {
     it.each([
       { name: "task name over nickname", input: {}, response: '{"task_name":"/root/x","nickname":"Ada"}', expected: "/root/x" },
       { name: "response nickname", input: { task_name: "ignored" }, response: '{"agent_id":"uuid-1","nickname":"Bo"}', expected: "Bo" },
-      { name: "input task name", input: { task_name: " t1 ", agent_type: "explorer" }, response: '{"agent_id":"uuid-1"}', expected: "t1" },
+      { name: "input task name", input: { task_name: " t1 ", agent_type: "explorer" }, response: '{"agent_id":"uuid-1"}', expected: " t1 " },
       { name: "input agent type", input: { agent_type: "explorer", message: SENTINEL }, response: '{"agent_id":"uuid-1"}', expected: "explorer" },
       { name: "items-only brief", input: { items: [{ type: "text", text: SENTINEL }] }, response: '{"agent_id":"uuid-1"}', expected: "agent" },
       { name: "object response", input: {}, response: { task_name: "/root/obj" }, expected: "/root/obj" },
@@ -658,9 +671,9 @@ describe("extractPostToolEvents — native Codex activity", () => {
       expect(JSON.stringify(events)).not.toContain(SENTINEL);
     });
 
-    it("clips a long label to 200 characters", () => {
+    it("passes a complete long label to the scrub boundary", () => {
       const [event] = extractPostToolEvents(call("spawn_agent", { task_name: "n".repeat(300) }));
-      expect(event.data).toBe("n".repeat(200));
+      expect(event.data).toBe("n".repeat(300));
     });
   });
 
@@ -679,7 +692,7 @@ describe("extractPostToolEvents — native Codex activity", () => {
         '{"answers":{"scope":{"answers":["Narrow","user_note: keep it small"]}}}',
       );
       expect(events).toEqual([
-        { type: "decision", category: "decision", data: "Q: Which scope?\nA: Narrow; keep it small", priority: 1 },
+        { type: "decision", category: "decision", data: "Q: Which scope?\nA: Narrow;  keep it small", priority: 1 },
       ]);
     });
 
@@ -688,7 +701,7 @@ describe("extractPostToolEvents — native Codex activity", () => {
         { questions },
         { answers: { scope: { answers: [42, null, "  ", "user_note:", "user_note:   ", " Wide ", "user_note: why"] } } },
       );
-      expect(summarize(events)).toEqual(["decision: Q: Which scope?\nA: Wide; why"]);
+      expect(summarize(events)).toEqual(["decision: Q: Which scope?\nA:  Wide ;  why"]);
     });
 
     it.each([
@@ -791,7 +804,7 @@ describe("extractPostToolEvents — native Codex activity", () => {
       expect(events).toEqual([{
         type: "plan_update",
         category: "proposal",
-        data: "Plan: Switch to a retry strategy\nSteps: Add retry; Test it",
+        data: "Plan:   Switch to a retry strategy  \nSteps: Add retry;  Test it ",
         priority: 3,
       }]);
     });
@@ -803,7 +816,7 @@ describe("extractPostToolEvents — native Codex activity", () => {
       {
         name: "invalid steps",
         input: { explanation: "Why", plan: [null, "x", { step: 5 }, { step: "  " }, { status: "pending" }, { step: " ok " }] },
-        expected: "Plan: Why\nSteps: ok",
+        expected: "Plan: Why\nSteps:  ok ",
       },
       { name: "only invalid steps", input: { explanation: "Why", plan: [null, { step: 1 }] }, expected: "Plan: Why" },
     ])("builds the proposal text from $name", ({ input, expected }) => {
@@ -818,10 +831,10 @@ describe("extractPostToolEvents — native Codex activity", () => {
       expect(plan(input)).toEqual([]);
     });
 
-    it("keeps at most ten valid steps and clips the explanation to 500 characters", () => {
+    it("keeps at most ten valid steps and the complete explanation for scrubbing", () => {
       const steps = [{ step: 1 }, null, ...Array.from({ length: 11 }, (_, index) => ({ step: "s" + index }))];
       const [event] = plan({ explanation: "e".repeat(600), plan: steps });
-      expect(event.data).toBe("Plan: " + "e".repeat(500) + "\nSteps: " + Array.from({ length: 10 }, (_, index) => "s" + index).join("; "));
+      expect(event.data).toBe("Plan: " + "e".repeat(600) + "\nSteps: " + Array.from({ length: 10 }, (_, index) => "s" + index).join("; "));
     });
   });
 
