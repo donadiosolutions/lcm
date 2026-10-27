@@ -107,6 +107,13 @@ describe("backend-independent local project identity", () => {
     expect(() => existingEventsDbPath(project)).toThrow("project path maps to multiple hashes");
   });
 
+  it("does not treat a malformed existing map as mapless during sidecar admission", () => {
+    writeFileSync(projectMapPath(), "{", { mode: 0o600 });
+    const candidate = join(eventsDir(), `${hashProjectPath(normalizeProjectIdentityPath(project))}.db`);
+    expect(() => assertExistingSidecarProjectBinding(project, candidate, undefined))
+      .toThrow();
+  });
+
   it("keeps the existing-only probe read-only while recovering an orphaned sidecar", () => {
     const unavailable = join(project, "gone");
     expect(existingEventsDbPath(unavailable)).toBeUndefined();

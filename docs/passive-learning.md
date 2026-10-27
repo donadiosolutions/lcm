@@ -192,6 +192,13 @@ An older exact-cwd sidecar without identity evidence can resume at an ordinary
 mapless path; a linked worktree whose Git anchor differs from that sidecar ID
 needs its original project binding restored before promotion.
 
+`--all` discovers sidecars with a read-only scan, so discovery does not repair
+or migrate an older sidecar before checking its project identity. If the
+diagnostic reader cannot query an older schema, `--all` reports that sidecar
+as a failed scan and leaves it unchanged for recovery under its original
+project binding. The `--all` command also leaves orphan sidecars in place
+instead of pruning them during discovery.
+
 Promotion through `lcm events promote` (and `--all`) needs the backend
 publication lock briefly. If another process, such as a hook, holds the lock,
 the daemon waits up to about 3 seconds for it to be released and then

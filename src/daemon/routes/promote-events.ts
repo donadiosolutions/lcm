@@ -496,6 +496,7 @@ export function createPromoteAllEventsHandler(
       };
 
       const sidecars = await collectEventSidecars({ timeoutMs: 30_000, maxDbs: Number.MAX_SAFE_INTEGER,
+        pruneOrphanSidecars: false,
         publicationLockToken: context?.publicationLockToken });
       result.scanned = sidecars.length;
       result.sidecarsWithUnprocessed = sidecars.filter(sidecar => sidecar.unprocessed > 0).length;

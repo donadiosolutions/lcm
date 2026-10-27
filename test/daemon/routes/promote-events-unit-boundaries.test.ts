@@ -607,6 +607,24 @@ describe("promote-events unit boundaries", () => {
     expect(mocks.closeFactory).toHaveBeenCalledTimes(3);
   });
 
+  it("reports a diagnostic sidecar scan skipped by its budget", async () => {
+    mocks.collect.mockReturnValueOnce([{
+      file: "a.db", projectId: "a", path: "/a.db", metadataMissing: true,
+      captured: 0, unprocessed: 0, errors: 0, lastCapture: null,
+      scanSkipped: "sidecar scan skipped after timeout", scanSkippedCount: 1,
+    }]);
+    const response = {} as never;
+    await createPromoteAllEventsHandler(config)({} as never, response, "");
+    expect(mocks.send.mock.calls.at(-1)?.[2]).toMatchObject({
+      failedProjects: 1,
+      projects: [{
+        projectId: "a",
+        incomplete: true,
+        message: "sidecar scan skipped: sidecar scan skipped after timeout",
+      }],
+    });
+  });
+
   it("distinguishes an initially empty drain", async () => {
     mocks.events.mockReturnValueOnce([]);
     await expect(drainEventsForCwd(config, "/cwd", "/events.db"))

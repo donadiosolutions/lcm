@@ -273,7 +273,15 @@ export function assertExistingSidecarProjectBinding(
       handle.close();
     }
   }
-  const current = authenticatedExistingProjectIdentity(cwd, publicationLockToken);
+  let current: ReturnType<typeof resolveExistingProjectIdentity>;
+  try {
+    current = resolveExistingProjectIdentity(cwd, publicationLockToken);
+  } catch (error) {
+    if (error instanceof UnauthenticatedProjectIdentityError) {
+      throw new SidecarIdentityConflictError();
+    }
+    throw error;
+  }
   const canonical = current?.canonical ?? normalizeProjectIdentityPath(cwd);
   const id = current?.id ?? hashProjectPath(canonical);
   const exactSidecar = join(directory, `${id}.db`);
