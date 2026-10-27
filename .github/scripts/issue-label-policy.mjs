@@ -505,6 +505,12 @@ function truncatePromptCodeUnits(value, maximum) {
 const URL_SCHEME_START = /^[a-z]$/iu;
 const URL_SCHEME_CHARACTER = /^[a-z0-9+.-]$/iu;
 const URL_CREDENTIAL_WHITESPACE = /\s/u;
+const PROMPT_PRIVATE_KEY_BLOCK_PATTERN = /-----BEGIN [A-Z0-9 ]{0,72}PRIVATE KEY-----[\s\S]*?-----END [A-Z0-9 ]{0,72}PRIVATE KEY-----/gu;
+const PROMPT_PRIVATE_KEY_HEADER_PATTERN = /-----BEGIN [A-Z0-9 ]{0,72}PRIVATE KEY-----/gu;
+const PROMPT_PRIVATE_KEY_TAIL_PATTERN = /-----BEGIN [A-Z0-9 ]{0,72}PRIVATE KEY-----[\s\S]*$/gu;
+const PROMPT_TOKEN_PATTERN = /\b(?:github_pat_[A-Za-z0-9_]{20,}|gh[pousr]_[A-Za-z0-9_]{20,}|sk-[A-Za-z0-9_-]{20,}|AKIA[A-Z0-9]{16})\b/gu;
+const PROMPT_BEARER_PATTERN = /(\bbearer\s+)([A-Za-z0-9._~+/-]{8,}={0,2})/giu;
+const PROMPT_ASSIGNMENT_PATTERN = /(\b(?:password|passwd|token|secret|api[_-]?key|authorization)\s*[:=]\s*)(?:("[^"\r\n]+"|'[^'\r\n]+'|[^\s,;]+))/giu;
 
 function isUrlCredentialTerminator(character) {
   return character === "/" || character === "@" || URL_CREDENTIAL_WHITESPACE.test(character);
@@ -519,7 +525,7 @@ function scanUrlCredentialScheme(value, index, schemeStart) {
   return -1;
 }
 
-function redactUrlCredentials(value, onUrlCredentialCodeUnit) {
+function redactUrlCredentials(value, onUrlCredentialCodeUnit, onUrlCredentialRange) {
   const chunks = [];
   let copiedUntil = 0;
   let schemeStart = -1;
@@ -554,6 +560,9 @@ function redactUrlCredentials(value, onUrlCredentialCodeUnit) {
     } else if (candidate) {
       if (character === "@") {
         if (index > candidate.passwordStart) {
+          if (onUrlCredentialRange) {
+            onUrlCredentialRange(candidate.passwordStart, index);
+          }
           chunks.push(value.slice(copiedUntil, candidate.passwordStart), "[REDACTED]@");
           copiedUntil = index + 1;
         }
@@ -623,6 +632,54 @@ function redactTrailingUrlCredential(value, onUrlCredentialCodeUnit) {
   return value;
 }
 
+function collectPromptPatternRanges(value, pattern, ranges, capture = 0) {
+  pattern.lastIndex = 0;
+  let match;
+  try {
+    while ((match = pattern.exec(value)) !== null) {
+      const matchedValue = match[capture];
+      const end = match.index + match[0].length;
+      ranges.push([end - matchedValue.length, end]);
+    }
+  } finally {
+    pattern.lastIndex = 0;
+  }
+}
+
+export function collectPromptRedactionRanges(value, instrumentation = undefined) {
+  const text = String(value ?? "");
+  const observer = instrumentation?.onUrlCredentialCodeUnit;
+  const onUrlCredentialCodeUnit =
+    typeof observer === "function" ? observer : undefined;
+  const ranges = [];
+  const privateKeyBlockRanges = [];
+  collectPromptPatternRanges(
+    text,
+    PROMPT_PRIVATE_KEY_BLOCK_PATTERN,
+    privateKeyBlockRanges,
+  );
+  ranges.push(...privateKeyBlockRanges);
+  const privateKeyHeaders = [];
+  collectPromptPatternRanges(text, PROMPT_PRIVATE_KEY_HEADER_PATTERN, privateKeyHeaders);
+  for (const [start] of privateKeyHeaders) {
+    if (!privateKeyBlockRanges.some(([blockStart, blockEnd]) => (
+      start >= blockStart && start < blockEnd
+    ))) {
+      ranges.push([start, text.length]);
+      break;
+    }
+  }
+  collectPromptPatternRanges(text, PROMPT_TOKEN_PATTERN, ranges);
+  collectPromptPatternRanges(text, PROMPT_BEARER_PATTERN, ranges, 2);
+  collectPromptPatternRanges(text, PROMPT_ASSIGNMENT_PATTERN, ranges, 2);
+  redactUrlCredentials(
+    text,
+    onUrlCredentialCodeUnit,
+    (start, end) => ranges.push([start, end]),
+  );
+  return ranges;
+}
+
 export function redactPromptText(value, maximum = 8_000, instrumentation = undefined) {
   if (!Number.isSafeInteger(maximum) || maximum < 0) {
     throw new TypeError("Maximum prompt text length must be a non-negative integer");
@@ -631,26 +688,11 @@ export function redactPromptText(value, maximum = 8_000, instrumentation = undef
   const onUrlCredentialCodeUnit =
     typeof observer === "function" ? observer : undefined;
   let redacted = String(value ?? "")
-    .replace(
-      /-----BEGIN [A-Z0-9 ]{0,72}PRIVATE KEY-----[\s\S]*?-----END [A-Z0-9 ]{0,72}PRIVATE KEY-----/gu,
-      "[REDACTED]",
-    )
-    .replace(
-      /-----BEGIN [A-Z0-9 ]{0,72}PRIVATE KEY-----[\s\S]*$/gu,
-      "[REDACTED]",
-    )
-    .replace(
-      /\b(?:github_pat_[A-Za-z0-9_]{20,}|gh[pousr]_[A-Za-z0-9_]{20,}|sk-[A-Za-z0-9_-]{20,}|AKIA[A-Z0-9]{16})\b/gu,
-      "[REDACTED]",
-    )
-    .replace(
-      /(\bbearer\s+)[A-Za-z0-9._~+/-]{8,}={0,2}/giu,
-      "$1[REDACTED]",
-    )
-    .replace(
-      /(\b(?:password|passwd|token|secret|api[_-]?key|authorization)\s*[:=]\s*)(?:"[^"\r\n]+"|'[^'\r\n]+'|[^\s,;]+)/giu,
-      "$1[REDACTED]",
-    );
+    .replace(PROMPT_PRIVATE_KEY_BLOCK_PATTERN, "[REDACTED]")
+    .replace(PROMPT_PRIVATE_KEY_TAIL_PATTERN, "[REDACTED]")
+    .replace(PROMPT_TOKEN_PATTERN, "[REDACTED]")
+    .replace(PROMPT_BEARER_PATTERN, "$1[REDACTED]")
+    .replace(PROMPT_ASSIGNMENT_PATTERN, "$1[REDACTED]");
   redacted = redactUrlCredentials(redacted, onUrlCredentialCodeUnit);
   const wasTruncated = redacted.length > maximum;
   let bounded = truncatePromptCodeUnits(redacted, maximum);

@@ -307,6 +307,82 @@ test("redacts nested alternate issue-derived fields before serialization", async
   assert.deepEqual(parsed.truncation, { applied: false });
 });
 
+test("redacts complete overlapping trusted matches in nested issue data", async () => {
+  // Mutation caught: replacing a shorter match before collecting a longer overlapping match.
+  const { projectUntrustedIssueData } = await intakeApi();
+  const routableGitlabPat = `glpat-${"A".repeat(40)}.ab1234567`;
+  const envelope = await projectUntrustedIssueData({
+    title: "Safe title",
+    body: `body=${routableGitlabPat}`,
+    comments: [{
+      [`key-${routableGitlabPat}`]: { value: `value=${routableGitlabPat}` },
+    }],
+    reproduction: [],
+    evidence: [],
+  });
+  const projected = parseEnvelope(envelope);
+
+  assert.equal(projected.body, "body=[REDACTED]");
+  assert.deepEqual(projected.comments, [{
+    "key-[REDACTED]": { value: "value=[REDACTED]" },
+  }]);
+  assert.equal(envelope.includes("AAAA"), false);
+  assert.equal(envelope.includes(".ab1234567"), false);
+});
+
+test("redacts the complete overlapping routable GitLab runner token", async () => {
+  // Mutation caught: replacing the shorter GitLab runner match before its routable form.
+  const { projectUntrustedIssueData } = await intakeApi();
+  const routableGitlabRunnerToken = `glrt-t1_${"B".repeat(40)}.ab1234567`;
+  const envelope = await projectUntrustedIssueData({
+    title: routableGitlabRunnerToken,
+    body: "",
+    comments: [],
+    reproduction: [],
+    evidence: [],
+  });
+  const projected = parseEnvelope(envelope);
+
+  assert.equal(projected.title, "[REDACTED]");
+  assert.equal(envelope.includes("BBBB"), false);
+  assert.equal(envelope.includes(".ab1234567"), false);
+});
+
+test("merges touching credential matches into one redaction", async () => {
+  // Mutation caught: replacing touching trusted-pattern spans independently.
+  const { projectUntrustedIssueData } = await intakeApi();
+  const adjacentTokens = `gldt-${"C".repeat(20)}glptt-${"d".repeat(40)}`;
+  const envelope = await projectUntrustedIssueData({
+    title: "Safe title",
+    body: adjacentTokens,
+    comments: [],
+    reproduction: [],
+    evidence: [],
+  });
+
+  assert.equal(parseEnvelope(envelope).body, "[REDACTED]");
+});
+
+test("keeps incomplete private-key payloads covered by prompt redaction", async () => {
+  // Mutation caught: replacing only a PEM header before prompt redaction sees the payload.
+  const { projectUntrustedIssueData } = await intakeApi();
+  const privateKey = "-----BEGIN RSA PRIVATE KEY-----\nshort-private-key-payload";
+  const envelope = await projectUntrustedIssueData({
+    title: "Safe title",
+    body: privateKey,
+    comments: [{ [privateKey]: { value: privateKey } }],
+    reproduction: [],
+    evidence: [],
+  });
+  const projected = parseEnvelope(envelope);
+
+  assert.equal(projected.body, "[REDACTED]");
+  assert.deepEqual(projected.comments, [{
+    "[REDACTED]": { value: "[REDACTED]" },
+  }]);
+  assert.equal(envelope.includes("short-private-key-payload"), false);
+});
+
 test("preserves prompt, generated, and native redaction in intake", async () => {
   // Mutation caught: dropping one redaction layer while changing prompt URL handling.
   const { projectUntrustedIssueData } = await intakeApi();

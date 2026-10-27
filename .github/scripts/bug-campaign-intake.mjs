@@ -6,7 +6,10 @@ import { pathToFileURL } from "node:url";
 import { promisify } from "node:util";
 import ts from "typescript";
 
-import { redactPromptText } from "./issue-label-policy.mjs";
+import {
+  collectPromptRedactionRanges,
+  redactPromptText,
+} from "./issue-label-policy.mjs";
 
 export const UNTRUSTED_ISSUE_DATA_START = "<<<LCM_UNTRUSTED_ISSUE_DATA>>>";
 export const UNTRUSTED_ISSUE_DATA_END = "<<<END_LCM_UNTRUSTED_ISSUE_DATA>>>";
@@ -273,32 +276,59 @@ function trustedPatterns() {
   return trustedPatternsPromise;
 }
 
-function redactWithPattern(value, pattern) {
-  pattern.regex.lastIndex = 0;
-  let match;
-  while ((match = pattern.regex.exec(value)) !== null) {
-    if (match[0].length === 0) {
-      throw new Error(`Trusted redaction pattern ${pattern.id} matched without consuming input`);
+function redactPatternUnion(value, patterns) {
+  const ranges = collectPromptRedactionRanges(value);
+  const lowercaseValue = value.toLowerCase();
+  for (const pattern of patterns) {
+    if (
+      pattern.prefilter
+      && !pattern.keywords.some((keyword) => lowercaseValue.includes(keyword))
+    ) {
+      continue;
+    }
+    pattern.regex.lastIndex = 0;
+    let match;
+    try {
+      while ((match = pattern.regex.exec(value)) !== null) {
+        if (match[0].length === 0) {
+          throw new Error(`Trusted redaction pattern ${pattern.id} matched without consuming input`);
+        }
+        ranges.push([match.index, match.index + match[0].length]);
+      }
+    } finally {
+      pattern.regex.lastIndex = 0;
     }
   }
-  pattern.regex.lastIndex = 0;
-  return value.replace(pattern.regex, REDACTED);
+  if (ranges.length === 0) return value;
+
+  ranges.sort((left, right) => left[0] - right[0] || left[1] - right[1]);
+  const merged = [];
+  let current = ranges[0];
+  for (let index = 1; index < ranges.length; index += 1) {
+    const next = ranges[index];
+    if (next[0] <= current[1]) {
+      current = [current[0], Math.max(current[1], next[1])];
+    } else {
+      merged.push(current);
+      current = next;
+    }
+  }
+  merged.push(current);
+
+  let redacted = "";
+  let position = 0;
+  for (const [start, end] of merged) {
+    redacted += value.slice(position, start) + REDACTED;
+    position = end;
+  }
+  return redacted + value.slice(position);
 }
 
 async function redactIssueString(value) {
   let redacted;
   try {
-    redacted = redactPromptText(value, Number.MAX_SAFE_INTEGER);
-    const lowercaseRedacted = redacted.toLowerCase();
-    for (const pattern of await trustedPatterns()) {
-      if (
-        pattern.prefilter
-        && !pattern.keywords.some((keyword) => lowercaseRedacted.includes(keyword))
-      ) {
-        continue;
-      }
-      redacted = redactWithPattern(redacted, pattern);
-    }
+    const unionRedacted = redactPatternUnion(value, await trustedPatterns());
+    redacted = redactPromptText(unionRedacted, Number.MAX_SAFE_INTEGER);
   } catch {
     throw new Error("Trusted issue redaction configuration is unavailable");
   }

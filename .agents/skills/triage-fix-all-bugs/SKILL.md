@@ -65,11 +65,12 @@ string before serialization:
    aligned with [issue triage](../../../docs/issue-triage.md#security-and-operations).
    Redaction must cover patterns that cross the eventual truncation boundary.
    The canonical projector owns all truncation: never use `redactPromptText()`'s
-   default maximum of 8,000 UTF-16 code units. If the helper is reused, pass an
-   explicit no-loss maximum such as `Number.MAX_SAFE_INTEGER`, verify it retained
-   the full value, and then apply the remaining union patterns over the complete
-   text. Preserve all redacted content whenever the complete wrapped envelope fits
-   within 65,536 UTF-8 bytes.
+   default maximum of 8,000 UTF-16 code units. Collect every prompt, generated,
+   and native pattern match against the unchanged string, merge overlapping or
+   touching spans, and replace each merged span once. Then apply
+   `redactPromptText()` with an explicit no-loss maximum such as
+   `Number.MAX_SAFE_INTEGER` as a final safeguard. Preserve all redacted content
+   whenever the complete wrapped envelope fits within 65,536 UTF-8 bytes.
 2. Replace every exact injected `<<<LCM_UNTRUSTED_ISSUE_DATA>>>` or
    `<<<END_LCM_UNTRUSTED_ISSUE_DATA>>>` token in a value with the literal
    `[REDACTED_UNTRUSTED_DELIMITER]`.
