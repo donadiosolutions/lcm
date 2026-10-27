@@ -168,6 +168,32 @@ node scripts/ci-vitest.mjs shard
 `node scripts/ci-plan.mjs --event push --ref refs/heads/main` prints the plan
 summary for a full run without writing GitHub outputs.
 
+## Blacksmith Testboxes
+
+Two manual workflows host [Blacksmith Testboxes](https://docs.blacksmith.sh/blacksmith-testbox/overview):
+clean Blacksmith runners that run your local working tree, for acceptance runs
+that should not depend on the local machine. Each is `workflow_dispatch`-only,
+holds no secrets, and keeps pnpm (and, for PostgreSQL, rootless Podman) state
+on Blacksmith sticky disks so warmups after the first are fast.
+
+| Workflow | Runner | Use |
+| --- | --- | --- |
+| `testbox-node.yml` | `blacksmith-4vcpu-ubuntu-2404` | Focused Vitest, type-check, and build runs. |
+| `testbox-postgresql.yml` | `blacksmith-8vcpu-ubuntu-2404` | PostgreSQL 18 harness, certification lanes, and other container-backed runs with rootless Podman. |
+
+```bash
+blacksmith testbox warmup testbox-postgresql.yml --idle-timeout 240   # prints tbx_...
+blacksmith testbox run --id tbx_... "LCM_TEST_CONTAINER_CLI=podman pnpm run test:postgresql"
+blacksmith testbox stop --id tbx_...
+```
+
+Pass `--ref` to warm up a branch other than the default. Testboxes stop after
+`--idle-timeout` minutes without a `run` (30 by default); the PostgreSQL job
+is capped at 330 minutes and the Node.js job at 90. Set
+`LCM_TEST_CONTAINER_CLI=podman` in each PostgreSQL command, because SSH
+sessions do not inherit the workflow environment. Do not place credentials in
+a testbox.
+
 ## Coordinated GitHub work
 
 Use the repository's [triage-fix-all-bugs skill](triage-fix-all-bugs.md) for an
