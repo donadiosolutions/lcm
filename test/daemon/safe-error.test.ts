@@ -4345,6 +4345,160 @@ describe("sanitizeError", () => {
     });
   });
 
+  describe("Bug #1765", () => {
+    type TailOrigin = readonly [
+      name: string,
+      prefix: string,
+      expectedPrefix: string,
+      closing: string,
+    ];
+    const postCloseTail: TailOrigin = [
+      "post-close tail",
+      "file://h?x=[file://host?key=/public]\\Users\\FIRST\\x",
+      "file://h?x=[file://host?key=<path>]<path>",
+      "",
+    ];
+    const inheritedQuoteTails: TailOrigin[] = (["|", "&"] as const).flatMap((delimiter) => [
+      [
+        "inherited-quote successor with spaces after " + delimiter,
+        "file://h?x=['https://outer.test/x?next=file:///Users/a/My Files/private.db'" +
+          delimiter +
+          "\\Users\\CANARY\\x",
+        "file://h?x=['https://outer.test/x?next=file://<path>'" + delimiter + "<path>",
+        "]",
+      ] as const,
+      [
+        "inherited-quote successor without spaces after " + delimiter,
+        "file://h?x=['https://outer.test/x?next=file:///Users/a/private.db'" +
+          delimiter +
+          "\\Users\\CANARY\\x",
+        "file://h?x=['https://outer.test/x?next=file://<path>'" + delimiter + "<path>",
+        "]",
+      ] as const,
+    ]);
+    const origins: TailOrigin[] = [postCloseTail, ...inheritedQuoteTails];
+    const inner = "[https://other?key=/Users/SECOND/secret]";
+
+    const tails: Array<readonly [string, string, string]> = [
+      ...["(", "{", "^", "`"].map(
+        (punctuation) =>
+          ["punctuation " + punctuation, punctuation + inner, "?key=<path>]"] as const,
+      ),
+      ...[":", ":x", ":x/y", "(", "{", "^", "`"].map(
+        (bridge) =>
+          ["bridge " + bridge, "[https://host]" + bridge + inner, "?key=<path>]"] as const,
+      ),
+      ["two bridged components", "[https://host]:x[https://mid]:y" + inner, "?key=<path>]"],
+      [
+        "adjacent components",
+        "[https://a?key=/Users/SECOND/s][https://b?key=/Users/THIRD/s]",
+        "?key=<path>][https://b?key=<path>]",
+      ],
+      ["nested brackets", "[[https://a?key=/Users/SECOND/s]]", "?key=<path>]]"],
+      ["bracket opened inside the tail", "[x[https://a?key=/home/SECOND/s]]", "?key=<path>]]"],
+      ["no punctuation", inner, "?key=<path>]"],
+      ["nested exact file URL inside the bracket", "[file:///Users/NEST/x?key=/Users/SECOND/s]", "?key=<path>]"],
+      ["nested exact file URL after a bridge", "[https://host]:x[file:///Users/NEST/x]", ""],
+      ["public URL with a plain query", "([https://other/public/path?key=plain]", "?key=plain]"],
+      ["root-only separator run", "([https://other?key=//]", "?key=//]"],
+      ["delimiter without a path word", "([https://other?key=/]", "?key=/]"],
+      // The scan stopped at the query of a component, so the tail does not own what follows it.
+      ["bridge after a query-bearing component", "[https://host?q=1]:x[https://other?key=/after/scan]", "?q=1]:x[https://other?key=/after/scan]"],
+      // An unmatched close ends the tail.
+      ["unmatched close", "[https://host]]:x[https://other?key=/after/close]", "]:x[https://other?key=/after/close]"],
+      ["unmatched close before a component", "[https://a?key=/Users/SECOND/s]][https://other?key=/after/close]", "?key=<path>]][https://other?key=/after/close]"],
+    ];
+    const roots = ["Users", "home", "root"] as const;
+    const runs: Array<readonly [string, (root: string) => string]> = [
+      ["slash", (root) => "/" + root + "/SECOND/secret"],
+      ["backslash", (root) => "\\" + root + "\\SECOND\\secret"],
+      ["double slash", (root) => "//" + root + "/SECOND/secret"],
+      ["double backslash", (root) => "\\\\" + root + "\\SECOND\\secret"],
+      ["slash then backslash", (root) => "/\\" + root + "/SECOND/secret"],
+      ["backslash then slash", (root) => "\\/" + root + "/SECOND/secret"],
+    ];
+    const queries: Array<readonly [string, string, string]> = [
+      ["equals", "?key=", "?key="],
+      ["ampersand", "?a=1&", "?a=1&"],
+      ["fragment", "#", "#"],
+      ["question mark", "?", "?"],
+      ["fragment equals", "?q=1#key=", "?q=1#key="],
+      ["ampersand equals", "?q=1&key=", "?q=1&key="],
+    ];
+    const values: Array<readonly [string, string, string]> = roots.flatMap((root) =>
+      runs.flatMap(([runName, value]) =>
+        queries.flatMap(([queryName, query, expectedQuery]) =>
+          ["", "(", "[https://host]:x"].map(
+            (lead) =>
+              [
+                root + " " + runName + " value after " + queryName + (lead === "" ? "" : " behind " + lead),
+                lead + "[https://other" + query + value(root) + "]",
+                expectedQuery + "<path>]",
+              ] as const,
+          ),
+        ),
+      ),
+    );
+
+    describe.each(origins)("%s", (_origin, prefix, expectedPrefix, closing) => {
+      it.each([...tails, ...values])("%s", (_name, tail, expectedTail) => {
+        const first = sanitizeError(prefix + tail + closing);
+
+        expect(first).toBe(expectedPrefix + expectedTail + closing);
+        expect(sanitizeError(first)).toBe(first);
+        expect(sanitizeError(sanitizeError(first))).toBe(first);
+      });
+
+      it.each([
+        ["space", " "],
+        ["tab", "\t"],
+        ["newline", "\n"],
+      ])("keeps a bracketed URL after %s visible", (_name, whitespace) => {
+        const input = prefix + whitespace + "([https://other?key=/after/space]" + closing;
+        const first = sanitizeError(input);
+
+        expect(first).toBe(expectedPrefix + whitespace + "([https://other?key=/after/space]" + closing);
+        expect(sanitizeError(first)).toBe(first);
+        expect(sanitizeError(sanitizeError(first))).toBe(first);
+      });
+    });
+
+    it.each([
+      [
+        "slash successor",
+        "file://h?x=['https://outer.test/x?next=file:///Users/a/private.db'|/Users/CANARY/x[https://host]:x" + inner + "]",
+        "file://h?x=['https://outer.test/x?next=file://<path>'|<path>?key=<path>]]",
+      ],
+      [
+        "drive successor",
+        "file://h?x=['https://outer.test/x?next=file:///Users/a/private.db'&C:\\Users\\CANARY\\x(" + inner + "]",
+        "file://h?x=['https://outer.test/x?next=file://<path>'&<path>?key=<path>]]",
+      ],
+      [
+        "private-root successor",
+        "file://h?x=['https://outer.test/x?next=file:///Users/a/private.db'&later/Users/CANARY/x[https://host]:x" + inner + "]",
+        "file://h?x=['https://outer.test/x?next=file://<path>'&later<path>?key=<path>]]",
+      ],
+      [
+        "ordinary relative successor stays readable",
+        "file://h?x=['https://outer.test/x?next=file:///Users/a/private.db'&later/data[https://host]:x" + inner + "]",
+        "file://h?x=['https://outer.test/x?next=file://<path>'&later/data[https://host]:x" + inner + "]",
+      ],
+      [
+        "public URL successor stays readable",
+        "file://h?x=['https://outer.test/x?next=file:///Users/a/private.db'&https://p.test/x" + inner + "]",
+        "file://h?x=['https://outer.test/x?next=file://<path>'&https://p.test/x" + inner + "]",
+      ],
+    ] as const)("pins the inherited-quote %s", (_name, input, expected) => {
+      const first = sanitizeError(input);
+
+      expect(first).toBe(expected);
+      expect(sanitizeError(first)).toBe(first);
+      expect(sanitizeError(sanitizeError(first))).toBe(first);
+    });
+  });
+
+
   describe("Bug #917", () => {
     const matrix: Array<readonly [string, string, string]> = (["'", '"'] as const).flatMap(
       (quote) =>

@@ -697,12 +697,17 @@ bundle and keep provider, credential, quarantine, and recovery sessions private.
   recognized private-root relatives redact there on the first pass.
   Rooted Windows tails after a closing wrapper, including a later bracketed
   URL's rooted query value inside that tail, are also removed on the first pass.
-  Adjacent balanced bracket components and path-word or path-separator text
-  between them remain part of that same tail until its consumed path span ends.
-  Inside those tracked components, a rooted `/` or `\` value immediately after
-  `=`, `&`, `#`, or `?` is removed. Whitespace and newlines end the composition;
-  whitespace-separated prose and public URLs and ordinary unspaced relative
-  tails remain unchanged.
+  The same tail owns the bracket components that its path span consumes,
+  including `(`, `{`, `^`, backtick, and `:` bridges and adjacent `][`
+  components. A component opened inside the tail keeps that ownership through
+  its matching close, including across a `?`, `#`, `&`, or `=` that stops the
+  span, and every adjacent component is covered. Inside those components, a
+  rooted value immediately after `=`, `&`, `#`, or `?` is removed on the first
+  pass when a run of `/` or `\` separators leads to a path word, so `//Users/x`,
+  `\\Users\x`, and mixed runs are covered; a separator run with no path word
+  after it is unchanged. An unmatched `]`, text after the span stopped outside a
+  component, whitespace, and newlines end the composition; whitespace-separated
+  prose, public URLs, and ordinary unspaced relative tails remain unchanged.
 
   An exact nested `file://` child inside a public URL that began at a quote can
   inherit that enclosing quote through its matching close. This removes a
@@ -711,10 +716,11 @@ bundle and keep provider, credential, quarantine, and recovery sessions private.
   own quote. Inside a bracketed file query, the matching close restores the
   enclosing owner across whitespace until that wrapper's real close. Immediate
   and later `&` or `|` rooted successors, named Windows successors, and
-  recognized private-root relatives redact on the same pass; ordinary relative
-  and public-URL successors remain readable. Unquoted URLs, embedded URLs whose
-  scheme did not begin at the quote, unmatched quotes, and newlines retain their
-  existing boundaries.
+  recognized private-root relatives redact on the same pass, and bracketed
+  components that follow a redacted successor follow the tail rules above;
+  ordinary relative and public-URL successors remain readable. Unquoted URLs,
+  embedded URLs whose scheme did not begin at the quote, unmatched quotes, and
+  newlines retain their existing boundaries.
 
   Root-relative Windows values after opaque wrapper text remain conservatively
   redacted. LCM does not expose such private-looking values merely because URL
