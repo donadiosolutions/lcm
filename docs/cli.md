@@ -622,7 +622,11 @@ answers when the daemon's startup backend differs from the backend now selected
 on disk, so a daemon left running across a migration cutover remains
 identifiable, including when its own environment lacks the PostgreSQL URL, CA
 file, or migration role of the newly selected backend (values that are present
-are still validated); every other admission check applies as before. Diagnostics
+are still validated); every other admission check applies as before. Its raw
+HTTP response can also include process-local `passiveEvents` halt details when
+background work has stopped. A healthy daemon omits the field. Anonymous
+`/health` does not expose these details, and observation's unverified storage
+status does not establish readiness. Diagnostics
 require the exact installed version, backend, entrypoint, runtime digest, and
 unchanged configuration witness. An old daemon without this endpoint, malformed
 response, missing credentials, or mismatched identity refuses observation;

@@ -1243,7 +1243,10 @@ JSON has `status: "ok"`, `observation: "identity-only"`, and
 PID, entrypoint, daemon generation, and the actual runtime digest when available.
 An owner identifier is included when configured. No storage readiness or backend
 error result is included: observation never calls storage health or opens project
-storage. This endpoint is an internal diagnostic mechanism with no third-party
+storage. If background passive-event work halted, the response also includes
+process-local `passiveEvents` details, including its reason and message; a healthy
+daemon omits that field. Anonymous `/health` never includes those details.
+This endpoint is an internal diagnostic mechanism with no third-party
 compatibility promise.
 
 Doctor requires this explicit response and exact installed runtime identity;
