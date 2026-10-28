@@ -5279,6 +5279,179 @@ describe("sanitizeError", () => {
     ] as const)("keeps the base UNC value for a %s", (_name, input, expected) => {
       assertStable(input, expected);
     });
+
+    it.each([
+      [
+        "soft-whitespace word bridge",
+        postClose +
+          "\u00a0([https://f?key=/Users/A/x]word[https://s?key=/home/B/y]",
+        redactedPostClose + "?key=<path>]word[https://s?key=/home/B/y]",
+      ],
+      [
+        "later-successor word/slash bridge",
+        inherited +
+          "&second/Users/B/x([https://f?key=/Users/A/x]" +
+          "w/x[https://s?key=/home/B/y]]",
+        redactedInherited +
+          "&second<path>?key=<path>]w/x[https://s?key=/home/B/y]]",
+      ],
+      [
+        "restarted-wrapper punctuation bridge",
+        "file://h?x=[a]\\b([https://f?key=/Users/A/x]" +
+          ".x[https://s?key=/home/B/y]",
+        "file://h?x=[a]<path>?key=<path>].x[https://s?key=/home/B/y]",
+      ],
+      [
+        "active-child path-word bridge",
+        activeChild +
+          "&later/home/alice/s([https://f?key=/Users/A/x]" +
+          "-x[https://s?key=/home/B/y]",
+        "file://h?x=[file://<path>&later<path>?key=<path>]" +
+          "-x[https://s?key=/home/B/y]",
+      ],
+    ] as const)("ends new ownership before a %s", (_name, input, expected) => {
+      assertStable(input, expected);
+    });
+
+    it.each([
+      [
+        "soft-whitespace slash-drive bridge",
+        postClose +
+          "\u00a0([https://f?key=/Users/A/x]/x[https://s?key=C:/Users/B/y]",
+        redactedPostClose + "?key=<path>]<path>?key=C:<path>]",
+      ],
+      [
+        "later-successor slash-drive bridge",
+        inherited +
+          "&second/Users/B/x([https://f?key=/Users/A/x]" +
+          "/x[https://s?key=C:/Users/B/y]]",
+        redactedInherited +
+          "&second<path>?key=<path>]<path>?key=C:<path>]]",
+      ],
+      [
+        "restarted-wrapper slash-drive bridge",
+        "file://h?x=[a]\\b([https://f?key=/Users/A/x]" +
+          "/x[https://s?key=C:/Users/B/y]",
+        "file://h?x=[a]<path>?key=<path>]<path>?key=C:<path>]",
+      ],
+      [
+        "active-child slash-drive bridge",
+        activeChild +
+          "&later/home/alice/s([https://f?key=/Users/A/x]" +
+          "/x[https://s?key=C:/Users/B/y]",
+        "file://h?x=[file://<path>&later<path>?key=<path>]" +
+          "<path>?key=C:<path>]",
+      ],
+    ] as const)("preserves the independent drive spelling for a %s", (_name, input, expected) => {
+      assertStable(input, expected);
+    });
+
+    it.each([
+      [
+        "soft-whitespace slash-rooted bridge",
+        postClose +
+          "\u00a0([https://f?key=/Users/A/x]/x[https://s?key=/home/B/y]",
+        redactedPostClose + "?key=<path>]<path>?key=<path>]",
+      ],
+      [
+        "later-successor slash-rooted bridge",
+        inherited +
+          "&second/Users/B/x([https://f?key=/Users/A/x]" +
+          "/x[https://s?key=/home/B/y]]",
+        redactedInherited +
+          "&second<path>?key=<path>]<path>?key=<path>]]",
+      ],
+      [
+        "restarted-wrapper slash-rooted bridge",
+        "file://h?x=[a]\\b([https://f?key=/Users/A/x]" +
+          "/x[https://s?key=/home/B/y]",
+        "file://h?x=[a]<path>?key=<path>]<path>?key=<path>]",
+      ],
+      [
+        "active-child slash-rooted bridge",
+        activeChild +
+          "&later/home/alice/s([https://f?key=/Users/A/x]" +
+          "/x[https://s?key=/home/B/y]",
+        "file://h?x=[file://<path>&later<path>?key=<path>]" +
+          "<path>?key=<path>]",
+      ],
+    ] as const)("completes the independent rooted value for a %s", (_name, input, expected) => {
+      assertStable(input, expected);
+    });
+
+    it("tracks nested brackets before an independent slash-bridge drive", () => {
+      assertStable(
+        "file://h?x=[a]\\b([https://f?key=/Users/A/x]" +
+          "/x[[https://nested]?key=C:/Users/B/y]",
+        "file://h?x=[a]<path>?key=<path>]<path>?key=C:<path>]",
+      );
+    });
+
+    it("leaves a slash bridge without another component to the base scanner", () => {
+      assertStable(
+        "file://h?x=[a]\\b([https://f?key=/Users/A/x]/xplain",
+        "file://h?x=[a]<path>?key=<path>]<path>",
+      );
+    });
+
+    it.each([
+      ["soft-whitespace", postClose + "\u00a0", redactedPostClose],
+      ["later successor", inherited + "&second/Users/B/x", redactedInherited + "&second<path>"],
+      ["restarted wrapper", "file://h?x=[a]\\b", "file://h?x=[a]<path>"],
+    ] as const)("keeps a backslash-bridged drive visible for a %s origin", (_name, prefix, expectedPrefix) => {
+      assertStable(
+        prefix + "([https://f?key=/Users/A/x]\\x[https://s?key=C:/Users/B/y]",
+        expectedPrefix + "?key=<path>]\\x[https://s?key=C:/Users/B/y]",
+      );
+    });
+
+    it.each([
+      ["UNC value", "\\srv\\share\\secret"],
+      ["Users value", "\\Users\\B\\y"],
+    ] as const)("completes an active-child named %s", (_name, value) => {
+      assertStable(
+        activeChild +
+          "&later/home/alice/s([https://f?key=/Users/A/x&k2=" +
+          value +
+          "]",
+        "file://h?x=[file://<path>&later<path>?key=<path>&k2=<path>]",
+      );
+    });
+
+    it.each([
+      ["soft-whitespace", postClose + "\u00a0", redactedPostClose],
+      ["restarted wrapper", "file://h?x=[a]\\b", "file://h?x=[a]<path>"],
+    ] as const)("keeps a named backslash value visible for a %s origin", (_name, prefix, expectedPrefix) => {
+      assertStable(
+        prefix + "([https://f?key=/Users/A/x&k2=\\srv\\share\\secret]",
+        expectedPrefix + "?key=<path>&k2=\\srv\\share\\secret]",
+      );
+    });
+
+    it("applies X1 to a named drive parameter in the first owned component", () => {
+      assertStable(
+        activeChild +
+          "&later/home/alice/s([https://f?key=/Users/A/x&k2=C:/Users/B/y]",
+        "file://h?x=[file://<path>&later<path>?key=<path>&k2=<path>]",
+      );
+    });
+
+    it("records the independent slash-bridge colon pass sequence", () => {
+      const input =
+        "file://h?x=[a]\\b([https://f?key=/Users/A/x]" +
+        "/x[https://s?key=XY:/Users/B/y]";
+      const first = sanitizeError(input);
+      const second = sanitizeError(first);
+      const third = sanitizeError(second);
+
+      expect(first).toBe(
+        "file://h?x=[a]<path>?key=<path>]<path>?key=XY:/Users/B/y]",
+      );
+      expect(second).toBe(
+        "file://h?x=[a]<path>?key=<path>]<path>?key=XY:<path>]",
+      );
+      expect(third).toBe(second);
+    });
   });
 
   describe("Bug #1789", () => {
