@@ -437,6 +437,10 @@ export async function executeDeterministicSchedule({
   scheduleStartWallMs = wallNow(),
   operationTimeoutMs = 60_000,
   delay = (milliseconds, options) => sleep(milliseconds, undefined, options),
+  // A fault-recovery schedule passes false: the contract's recovery windows count a timeout
+  // as a failure and the fault workload's deterministic rates continue, so one timed-out
+  // operation must not cancel the rest of the phase.
+  deadlineAbortsSchedule = true,
 }) {
   if (!Number.isSafeInteger(operationTimeoutMs) || operationTimeoutMs <= 0) {
     throw new Error("certification operation timeout must be a positive integer");
@@ -571,7 +575,7 @@ export async function executeDeterministicSchedule({
       if (typeof error?.signal === "string") exitSignal = error.signal;
       recordFailure(entry, error, errorClass);
       failureRecorded = true;
-      if (errorClass === "OperationDeadlineExceeded") fatalAbort.abort(error);
+      if (errorClass === "OperationDeadlineExceeded" && deadlineAbortsSchedule) fatalAbort.abort(error);
     }
     const endedAt = now();
     const wallEndedAt = new Date().toISOString();
@@ -586,7 +590,7 @@ export async function executeDeterministicSchedule({
           processStartWallMs: commandTiming?.processStartWallMs, processExitWallMs: commandTiming?.processExitWallMs,
         }, errorClass);
       }
-      fatalAbort.abort(new Error("certification operation deadline exceeded"));
+      if (deadlineAbortsSchedule) fatalAbort.abort(new Error("certification operation deadline exceeded"));
     }
     const sample = {
       id: entry.id, machine: entry.machine, op: entry.op, kind: entry.kind, sessionId: entry.sessionId, phase: entry.phase ?? "steady",
@@ -618,7 +622,7 @@ export async function executeDeterministicSchedule({
       const sample = { id: entry.id, machine: entry.machine, op: entry.op, kind: entry.kind, sessionId: entry.sessionId, phase: entry.phase ?? "steady", scheduledWallMs, outcome: "failed", errorClass };
       recordFailure(entry, { message: error?.message }, errorClass);
       appendNdjson(samplesPath, sample);
-      fatalAbort.abort(error);
+      if (deadlineAbortsSchedule || errorClass !== "OperationDeadlineExceeded") fatalAbort.abort(error);
       return sample;
     }
   });
@@ -1038,7 +1042,7 @@ export async function runMachineAgent(environment = process.env) {
         machine, runId: environment.LCM_CERT_RUN_ID, phase: "partition-recovery",
         durationSeconds: contract.thresholds.recovery.partition.rtoSeconds,
       });
-      await executeDeterministicSchedule({ schedule: partitionSchedule, entrypoint: lcm, cwd: project, environment, daemonClient, evidenceDirectory, daemonTokenPath });
+      await executeDeterministicSchedule({ schedule: partitionSchedule, entrypoint: lcm, cwd: project, environment, daemonClient, evidenceDirectory, daemonTokenPath, deadlineAbortsSchedule: false });
       const partitionClearance = await waitForControl(join(evidenceDirectory, "partition-cleared.json"), {
         deadlineMs: Date.now() + contract.timeline.full.partitionPhaseMaxSeconds * 1000,
       });
@@ -1054,7 +1058,7 @@ export async function runMachineAgent(environment = process.env) {
           machine, runId: environment.LCM_CERT_RUN_ID, phase: "restart-recovery",
           durationSeconds: contract.thresholds.recovery.restartDatabase.rtoSeconds,
         });
-        await executeDeterministicSchedule({ schedule: restartSchedule, entrypoint: lcm, cwd: project, environment, daemonClient, evidenceDirectory, daemonTokenPath });
+        await executeDeterministicSchedule({ schedule: restartSchedule, entrypoint: lcm, cwd: project, environment, daemonClient, evidenceDirectory, daemonTokenPath, deadlineAbortsSchedule: false });
         const restartClearance = await waitForControl(join(evidenceDirectory, "restart-cleared.json"), {
           deadlineMs: Date.now() + contract.timeline.full.restartPhaseMaxSeconds * 1000,
         });

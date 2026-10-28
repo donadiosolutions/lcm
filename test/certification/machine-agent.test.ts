@@ -487,6 +487,39 @@ it("masks short derived credentials at any length while keeping the whole-value 
     expect(abortListeners).toBe(0);
   });
 
+  it("keeps a fault-recovery schedule running after an operation times out", async () => {
+    // The first search times out; the later store is released only after that failure.
+    const runSchedule = (deadlineAbortsSchedule: boolean) => {
+      const evidenceDirectory = mkdtempSync(join(tmpdir(), "lcm-cert-fault-deadline-"));
+      let releaseLater = () => {};
+      const searchFailed = new Promise<void>((resolve) => { releaseLater = resolve; });
+      const post = vi.fn(async (path: string) => {
+        if (path !== "/search") return {};
+        setTimeout(releaseLater, 0);
+        throw Object.assign(new Error("request deadline"), { code: "OperationDeadlineExceeded" });
+      });
+      return executeDeterministicSchedule({
+        schedule: [
+          { id: "hung", machine: "a", op: "search", offsetSeconds: 0, phase: "partition-recovery" },
+          { id: "after", machine: "a", op: "store", offsetSeconds: 2, phase: "partition-recovery" },
+        ],
+        entrypoint: "/unused/lcm.mjs", cwd: evidenceDirectory, environment: {}, evidenceDirectory,
+        daemonClient: { post }, scheduleStartWallMs: Date.now(),
+        delay: (milliseconds: number) => milliseconds > 0 ? searchFailed : Promise.resolve(),
+        deadlineAbortsSchedule,
+      });
+    };
+    await expect(runSchedule(false)).resolves.toEqual([
+      expect.objectContaining({ id: "hung", outcome: "failed", errorClass: "OperationDeadlineExceeded" }),
+      expect.objectContaining({ id: "after", outcome: "success" }),
+    ]);
+    // The steady default still treats the timeout as fatal and cancels the later arrival.
+    await expect(runSchedule(true)).resolves.toEqual([
+      expect.objectContaining({ id: "hung", outcome: "failed", errorClass: "OperationDeadlineExceeded" }),
+      expect.objectContaining({ id: "after", outcome: "cancelled", errorClass: "AdmissionAborted" }),
+    ]);
+  });
+
   it("bounds daemon health readiness with an absolute cancellable deadline", async () => {
     const child = new EventEmitter() as any;
     child.stdout = new EventEmitter();

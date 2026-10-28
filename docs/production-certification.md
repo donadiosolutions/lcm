@@ -260,6 +260,10 @@ attempt already queued inside admission observes the abort as a `failed` sample 
 `AdmissionAborted` plus one private record whose exit scalars and process timing
 are null. Only the error class, exit code, and signal reach `samples.ndjson`; the
 gate never reads `failures.ndjson`.
+An operation that exceeds its deadline aborts the warmup or steady schedule this
+way. In the partition and restart recovery phases the timeout is recorded as a
+failure and the phase continues, because the contract counts a timeout as a
+failure inside its recovery windows and keeps the fault workload's rates going.
 
 The acknowledgment metric is a conservative upper bound from successful public
 hook-command exit to the first one-second observer sighting of a terminal local
