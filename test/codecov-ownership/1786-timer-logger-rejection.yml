@@ -1,0 +1,6 @@
+references: ["#1786"]
+rationale: >-
+  Keeps the passive-event processor, including background-timer logger
+  containment, in the daemon-events owner. No file changes component.
+pins:
+  - ["src/daemon/passive-event-processor.ts", "unit-daemon-events"]
