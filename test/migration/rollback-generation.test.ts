@@ -163,6 +163,7 @@ describe("buildRollbackGeneration", () => {
     })).rejects.toMatchObject({ name: "RollbackGenerationError", reason: "generation-exists" });
   });
 
+  // Three migrated SQLite sources: CI max 4.0 s over 16 runs; one run timed out at 5.0 s. 15 s is this directory's per-test budget.
   it("records the export snapshot's evidence in the witness of both a verified and a quarantined build, and null when none is given", async () => {
     const exportEvidence = { canonicalDelta: fixtureCanonicalDelta("export"), censusVector: fixtureCensusVector("export") };
     const witnessOf = (homeDir: string, generationId: string) => JSON.parse(
@@ -194,7 +195,7 @@ describe("buildRollbackGeneration", () => {
       homeDir, generationId: "gen-evidence-none", projectIdentity: identity, source: await sqliteSourceStream(sqliteFixture()),
     });
     expect(witnessOf(homeDir, "gen-evidence-none").exportEvidence).toBeNull();
-  });
+  }, 15000);
 
   it("quarantines rather than deletes when the transfer itself fails, and tightens the partial database file to 0400", async () => {
     const homeDir = tempHome();
