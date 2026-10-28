@@ -1348,7 +1348,7 @@ function recordMemberEvidence(ctx: Context, member: Member, step: MigrationActiv
   try {
     ctx.deps.evidence.recordMigrationActivationEpoch({ homeDir: ctx.homeDir, epoch: member.epoch! });
     crash(ctx, "after-epoch:" + member.generationId);
-    ctx.deps.evidence.recordMigrationActivationAttempt({ homeDir: ctx.homeDir, generationId: member.generationId, attempt: member.attempt! });
+    ctx.deps.evidence.recordMigrationActivationAttempt({ homeDir: ctx.homeDir, generationId: member.generationId, attempt: member.attempt!, nextWitness: member.witness! });
     crash(ctx, "after-attempt:" + member.generationId);
     ctx.deps.evidence.recordMigrationActivationWitness({ homeDir: ctx.homeDir, generationId: member.generationId, witness: member.witness! });
     crash(ctx, "after-witness:" + member.generationId);

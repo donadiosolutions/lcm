@@ -14,6 +14,7 @@ import {
   generationScopedDirectory,
   readGenerationScopedFiles,
   recordGenerationScopedFile,
+  type GenerationScopedPendingWrite,
   validateGenerationId,
   validateHomeDir,
   type GenerationScopedReconciler,
@@ -228,9 +229,24 @@ export function readMigrationActivationEvidence(
   input: Readonly<{ homeDir: string; generationId: string }>,
   dependencies: RecordMigrationSelectionBindingDependencies = {},
 ): MigrationActivationEvidenceResolution {
+  return readStoredEvidence(input, dependencies, []);
+}
+
+/**
+ * readMigrationActivationEvidence plus the records a writer is about to
+ * write. A lone writer scratch of exactly one of those records, with its
+ * final absent, is the writer's own interrupted write: it is ignored (and
+ * never reported as stored) so the retry can publish the final and clear the
+ * scratch. The exported reader passes none and stays strict.
+ */
+function readStoredEvidence(
+  input: Readonly<{ homeDir: string; generationId: string }>,
+  dependencies: RecordMigrationSelectionBindingDependencies,
+  pending: readonly GenerationScopedPendingWrite[],
+): MigrationActivationEvidenceResolution {
   const homeDir = validateHomeDir(input.homeDir);
   const generationId = validateGenerationId(input.generationId);
-  const read = readGenerationScopedFiles(ACTIVATION_EVIDENCE_STORE, { homeDir, generationId }, dependencies);
+  const read = readGenerationScopedFiles(ACTIVATION_EVIDENCE_STORE, { homeDir, generationId }, dependencies, pending);
   if (read.kind === "absent") return { state: "authoritatively-absent" };
   if (read.kind === "unresolvable") return { state: "unresolvable", reason: read.reason };
   const epochs = new Map<string, MigrationActivationEpoch>();
@@ -277,8 +293,9 @@ function requireStoredEvidence(
   homeDir: string,
   generationId: string,
   dependencies: RecordMigrationSelectionBindingDependencies,
+  pending: readonly GenerationScopedPendingWrite[] = [],
 ): Extract<MigrationActivationEvidenceResolution, { state: "resolved" }> | null {
-  const stored = readMigrationActivationEvidence({ homeDir, generationId }, dependencies);
+  const stored = readStoredEvidence({ homeDir, generationId }, dependencies, pending);
   if (stored.state === "unresolvable") {
     throw new MigrationActivationEvidenceRefusalError(
       "evidence-unresolvable",
@@ -292,10 +309,9 @@ function recordEvidence(
   homeDir: string,
   generationId: string,
   fileName: string,
-  record: unknown,
+  serialized: string,
   dependencies: RecordMigrationSelectionBindingDependencies,
 ): void {
-  const serialized = evidenceWireContent(generationId, record);
   const reconcile: GenerationScopedReconciler = (stored) => (stored === serialized ? "reused" : "conflict");
   recordGenerationScopedFile(
     ACTIVATION_EVIDENCE_STORE, homeDir, generationId, fileName, serialized, reconcile, dependencies,
@@ -314,7 +330,9 @@ export function recordMigrationActivationEpoch(
 ): void {
   const homeDir = validateHomeDir(input.homeDir);
   const epoch = parseMigrationActivationEpoch(input.epoch);
-  recordEvidence(homeDir, epoch.generationId, "epoch-" + epoch.epochId + ".json", epoch, dependencies);
+  recordEvidence(
+    homeDir, epoch.generationId, "epoch-" + epoch.epochId + ".json", evidenceWireContent(epoch.generationId, epoch), dependencies,
+  );
 }
 
 /**
@@ -323,22 +341,55 @@ export function recordMigrationActivationEpoch(
  * generation already (MigrationActivationEvidenceRefusalError
  * "epoch-missing" otherwise). Synchronous. Second step of the ordering
  * contract.
+ *
+ * Crash recovery. A lone writer scratch of this very attempt (final absent,
+ * byte-identical to the bytes about to be written) is an interrupted first
+ * write: the retry publishes the final and clears the scratch. An activation
+ * driver that also holds the witness it will record next passes it as
+ * nextWitness: a lone scratch of exactly that witness (an interrupted witness
+ * write, which leaves the attempt final and a witness scratch) then does not
+ * block this idempotent re-entry either. nextWitness is parsed and must name
+ * this attempt and its epoch (MigrationActivationWitnessError
+ * "unexpected-state" otherwise, before any read or write); it is never
+ * written here -- the witness writer alone records it, with its full checks.
+ * Any other lone scratch still makes the store unresolvable.
  */
 export function recordMigrationActivationAttempt(
-  input: Readonly<{ homeDir: string; generationId: string; attempt: MigrationActivationAttempt }>,
+  input: Readonly<{
+    homeDir: string;
+    generationId: string;
+    attempt: MigrationActivationAttempt;
+    nextWitness?: MigrationActivationWitness;
+  }>,
   dependencies: RecordMigrationSelectionBindingDependencies = {},
 ): void {
   const homeDir = validateHomeDir(input.homeDir);
   const generationId = validateGenerationId(input.generationId);
   const attempt = parseMigrationActivationAttempt(input.attempt);
-  const stored = requireStoredEvidence(homeDir, generationId, dependencies);
+  const fileName = "attempt-" + attempt.attemptId + ".json";
+  const serialized = evidenceWireContent(generationId, attempt);
+  const pending: GenerationScopedPendingWrite[] = [{ fileName, content: serialized }];
+  if (input.nextWitness !== undefined) {
+    const nextWitness = parseMigrationActivationWitness(input.nextWitness);
+    if (nextWitness.attemptId !== attempt.attemptId || nextWitness.epochId !== attempt.epochId) {
+      throw new MigrationActivationWitnessError(
+        "unexpected-state",
+        "the next witness does not name the attempt being recorded and its epoch",
+      );
+    }
+    pending.push({
+      fileName: "witness-" + nextWitness.checksumSha256 + ".json",
+      content: evidenceWireContent(generationId, nextWitness),
+    });
+  }
+  const stored = requireStoredEvidence(homeDir, generationId, dependencies, pending);
   if (stored === null || !stored.epochs.some((epoch) => epoch.epochId === attempt.epochId)) {
     throw new MigrationActivationEvidenceRefusalError(
       "epoch-missing",
       "the activation epoch " + attempt.epochId + " is not stored for this generation",
     );
   }
-  recordEvidence(homeDir, generationId, "attempt-" + attempt.attemptId + ".json", attempt, dependencies);
+  recordEvidence(homeDir, generationId, fileName, serialized, dependencies);
 }
 
 /**
@@ -348,7 +399,9 @@ export function recordMigrationActivationAttempt(
  * createMigrationActivationWitness mints from them and the witness's own
  * kind, post-epoch evidence and rollback mode -- every field and the
  * checksum. Refusals are typed and nothing is written. Synchronous. Third
- * step of the ordering contract.
+ * step of the ordering contract. A lone writer scratch of this very witness
+ * (final absent, byte-identical) is an interrupted first write and is
+ * finished by the retry, as for the attempt.
  */
 export function recordMigrationActivationWitness(
   input: Readonly<{ homeDir: string; generationId: string; witness: MigrationActivationWitness }>,
@@ -357,7 +410,9 @@ export function recordMigrationActivationWitness(
   const homeDir = validateHomeDir(input.homeDir);
   const generationId = validateGenerationId(input.generationId);
   const witness = parseMigrationActivationWitness(input.witness);
-  const stored = requireStoredEvidence(homeDir, generationId, dependencies);
+  const fileName = "witness-" + witness.checksumSha256 + ".json";
+  const serialized = evidenceWireContent(generationId, witness);
+  const stored = requireStoredEvidence(homeDir, generationId, dependencies, [{ fileName, content: serialized }]);
   const epoch = stored?.epochs.find((candidate) => candidate.epochId === witness.epochId);
   if (epoch === undefined) {
     throw new MigrationActivationEvidenceRefusalError(
@@ -378,7 +433,7 @@ export function recordMigrationActivationWitness(
       "the witness is not what its stored epoch and attempt mint",
     );
   }
-  recordEvidence(homeDir, generationId, "witness-" + witness.checksumSha256 + ".json", witness, dependencies);
+  recordEvidence(homeDir, generationId, fileName, serialized, dependencies);
 }
 
 /**

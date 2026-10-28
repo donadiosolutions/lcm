@@ -32,7 +32,7 @@ import { createPostgreSqlBackendPublicationRemoteGuard } from "../../src/storage
 import { PostgreSqlRuntimeReadinessError, type PostgreSqlRuntimeReadiness } from "../../src/storage/postgresql/runtime-readiness.js";
 import { PostgreSqlStorageOperationError } from "../../src/storage/postgresql/errors.js";
 import { StorageOperationError } from "../../src/storage/errors.js";
-import { PORTABLE_RECORD_DOMAIN_ORDER, PortableStreamError, type PortableDomain } from "../../src/storage/portable-record.js";
+import { PORTABLE_RECORD_DOMAIN_ORDER, PortableStreamError, canonicalJson, type PortableDomain } from "../../src/storage/portable-record.js";
 import {
   MIGRATION_ACTIVATION_LEASE_CLEANUP_TIMEOUT_MS,
   MigrationActivationError,
@@ -57,6 +57,7 @@ import {
 } from "../../src/migration/activation-artifact-store.js";
 import {
   MigrationActivationEvidenceRefusalError,
+  migrationActivationEvidenceDirectory,
   readMigrationActivationEvidence,
   recordMigrationActivationAttempt,
   recordMigrationActivationEpoch,
@@ -66,6 +67,7 @@ import type { ActivationLeasePublicationGuard } from "../../src/migration/activa
 import { deriveActivationPublicationId } from "../../src/migration/activation-publication-id.js";
 import { MigrationActivationReportError, migrationActivationReportDirectory, readMigrationActivationReport } from "../../src/migration/activation-report.js";
 import {
+  createMigrationActivationWitness,
   migrationWitnessSha256,
   type MigrationActivationAttempt,
   type MigrationActivationEpoch,
@@ -921,6 +923,43 @@ describe("runMigrationActivation: crash rows (plan-v5 section 7 / synthesis amen
       expect(f.evidence.attempts.size).toBe(1);
     },
   );
+
+  describe("an interrupted witness write (attempt final + witness scratch, #1769)", () => {
+    /** The scratch an interrupted witness write leaves: the witness the chain mints from the stored epoch and attempt. */
+    function plantWitnessScratch(f: Fixture, tamper = false): string {
+      const stored = readMigrationActivationEvidence({ homeDir: f.homeDir, generationId: GENERATION });
+      if (stored.state !== "resolved") throw new Error("expected resolved evidence");
+      const witness = createMigrationActivationWitness({
+        kind: "activation", epoch: stored.epochs[0]!, attempt: stored.attempts[0]!,
+        postEpochDelta: null, postEpochCensus: null, rollbackMode: null,
+      });
+      const wire = canonicalJson({ version: 1, generationId: GENERATION, record: witness }) + "\n";
+      const path = join(migrationActivationEvidenceDirectory(f.homeDir, GENERATION), ".witness-" + witness.checksumSha256 + ".json.0123abcd.tmp");
+      writeFileSync(path, tamper ? wire.replace("\n", " \n") : wire, { mode: 0o600 });
+      expect(readMigrationActivationEvidence({ homeDir: f.homeDir, generationId: GENERATION })).toMatchObject({ state: "unresolvable" });
+      return path;
+    }
+
+    it("the resumed chain re-enters at the attempt, finishes the witness and clears the scratch", async () => {
+      const f = await fixture();
+      let scratch = "";
+      await crashThenResume(f, "after-attempt", "publish-pending-after-link", () => { scratch = plantWitnessScratch(f); });
+      expect(existsSync(scratch)).toBe(false);
+      expect(f.evidence.epochs.size).toBe(1);
+      expect(f.evidence.attempts.size).toBe(1);
+      expect(f.evidence.witnesses.size).toBe(1);
+    });
+
+    it("a witness scratch that is not the minted witness is refused: nothing is written and the scratch stays", async () => {
+      const f = await fixture();
+      const crashPoint = (p: string): void => { if (p === "after-attempt") throw new Error("injected crash"); };
+      await expect(f.run({ crashPoint })).rejects.toThrow("injected crash");
+      const scratch = plantWitnessScratch(f, true);
+      expect(await f.run()).toMatchObject({ status: "interrupted", cause: "evidence-unresolvable" });
+      expect(existsSync(scratch)).toBe(true);
+      expect(readdirSync(migrationActivationEvidenceDirectory(f.homeDir, GENERATION)).filter((name) => name.startsWith("witness-"))).toEqual([]);
+    });
+  });
 
   it("witnessed but unpublished with a moving clock: the pre-selection re-entry mints a NEW attempt (every attempt is recorded) and the selection carries the latest witness", async () => {
     const f = await fixture();
