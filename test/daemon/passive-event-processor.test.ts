@@ -168,6 +168,24 @@ function sidecar(overrides: Partial<EventSidecarSummary> = {}): EventSidecarSumm
   };
 }
 
+/**
+ * Run a background timer and return every unhandled rejection it leaked. The
+ * listener is installed before the timer fires and one macrotask is awaited so
+ * the rejection has surfaced.
+ */
+async function leakedRejections(fireTimer: () => void | Promise<void>): Promise<unknown[]> {
+  const leaked: unknown[] = [];
+  const record = (reason: unknown): void => { leaked.push(reason); };
+  process.on("unhandledRejection", record);
+  try {
+    await fireTimer();
+    await new Promise<void>(resolve => { setImmediate(resolve); });
+  } finally {
+    process.off("unhandledRejection", record);
+  }
+  return leaked;
+}
+
 describe("PassiveEventProcessor", () => {
   it("schedules priority and threshold notifications with near-immediate delay", () => {
     const { timers, deps } = timerDeps();
@@ -1124,6 +1142,69 @@ describe("PassiveEventProcessor", () => {
     await Promise.all([drain, shutdown]);
     expect(signal?.aborted).toBe(true);
   });
+
+  describe("a failing diagnostic logger in a background timer (#1786)", () => {
+    const logFailure = new Error("logger failed");
+
+    it("contains it when the interval sweep fails", async () => {
+      const { intervals, deps } = timerDeps();
+      const scanError = new Error("scan failed");
+      const safeLogError = vi.fn().mockRejectedValue(logFailure);
+      const processor = new PassiveEventProcessor(makeConfig(), PASSIVE_EVENT_PROCESSOR_DEFAULTS, {
+        ...deps,
+        safeLogError,
+        collectEventSidecars: vi.fn<CollectEventSidecars>().mockRejectedValue(scanError),
+      });
+      processor.start();
+
+      const leaked = await leakedRejections(() => { intervals[0].callback(); });
+
+      expect(leaked).toEqual([]);
+      expect(safeLogError).toHaveBeenCalledTimes(1);
+      expect(safeLogError).toHaveBeenCalledWith("passive-event-processor", scanError, {});
+      processor.stop();
+    });
+
+    it("contains it when the scheduled sweep fails", async () => {
+      const { timers, deps } = timerDeps();
+      const scanError = new Error("scan failed");
+      const safeLogError = vi.fn().mockRejectedValue(logFailure);
+      const processor = new PassiveEventProcessor(makeConfig(), PASSIVE_EVENT_PROCESSOR_DEFAULTS, {
+        ...deps,
+        safeLogError,
+        collectEventSidecars: vi.fn<CollectEventSidecars>().mockRejectedValue(scanError),
+      });
+      processor.start();
+      expect(timers[0].ms).toBe(0);
+
+      const leaked = await leakedRejections(() => { timers[0].callback(); });
+
+      expect(leaked).toEqual([]);
+      expect(safeLogError).toHaveBeenCalledTimes(1);
+      expect(safeLogError).toHaveBeenCalledWith("passive-event-processor", scanError, {});
+      processor.stop();
+    });
+
+    it("contains it when a project debounce drain fails", async () => {
+      const { timers, deps } = timerDeps();
+      const promoteError = new Error("promote failed");
+      const safeLogError = vi.fn().mockRejectedValue(logFailure);
+      const processor = new PassiveEventProcessor(makeConfig(), PASSIVE_EVENT_PROCESSOR_DEFAULTS, {
+        ...deps,
+        safeLogError,
+        promoteEventsForCwd: vi.fn<PromoteEventsForCwd>().mockRejectedValue(promoteError),
+      });
+      processor.notify({ cwd: "/tmp", priority: 1 });
+
+      const leaked = await leakedRejections(() => { timers[0].callback(); });
+
+      expect(leaked).toEqual([]);
+      expect(safeLogError).toHaveBeenCalledTimes(2);
+      expect(safeLogError).toHaveBeenNthCalledWith(1, "passive-event-processor", promoteError, { cwd: "/tmp" });
+      expect(safeLogError).toHaveBeenNthCalledWith(2, "passive-event-processor", logFailure, { cwd: "/tmp" });
+      processor.stop();
+    });
+  });
 });
 
 describe("PassiveEventProcessor replication follow-up (#1764)", () => {
@@ -1471,6 +1552,30 @@ describe("PassiveEventProcessor replication follow-up (#1764)", () => {
 
     await h.fire(BACKLOG_DELAY);
 
+    expect(safeLogError).toHaveBeenNthCalledWith(1, "passive-event-processor", mismatch, {});
+    expect(safeLogError).toHaveBeenNthCalledWith(2, "passive-event-processor", logFailure, {});
+    h.processor.stop();
+  });
+
+  it("contains a logger that keeps failing while a follow-up fails", async () => {
+    const mismatch = new BackendPublicationJournalError(
+      "backend-mismatch",
+      "daemon request backend differs from the authenticated startup backend",
+    );
+    const logFailure = new Error("logger failed");
+    const results: unknown[] = [saturated(), mismatch];
+    const safeLogError = vi.fn().mockRejectedValue(logFailure);
+    const h = harness([A], async () => {
+      const value = results.shift();
+      if (value instanceof Error) throw value;
+      return value;
+    }, { safeLogError });
+    await h.processor.runSweep();
+
+    const leaked = await leakedRejections(() => h.fire(BACKLOG_DELAY).then(() => undefined));
+
+    expect(leaked).toEqual([]);
+    expect(safeLogError).toHaveBeenCalledTimes(2);
     expect(safeLogError).toHaveBeenNthCalledWith(1, "passive-event-processor", mismatch, {});
     expect(safeLogError).toHaveBeenNthCalledWith(2, "passive-event-processor", logFailure, {});
     h.processor.stop();
