@@ -334,7 +334,7 @@ describe("activation evidence store: interrupted first write of the record being
 
     it("is refused when its bytes differ from the record being written, leaving the scratch", () => {
       const state = seeded(orphan.through);
-      const differing = orphan.wire(state).replace("\n", " \n");
+      const differing = orphan.wire(state).replace(/\n$/u, " \n");
       plant(state.homeDir, scratchOf(orphan.finalName(state)), differing);
       refusedUntouched(state, scratchOf(orphan.finalName(state)), differing);
     });
@@ -441,7 +441,7 @@ describe("activation evidence store: interrupted first write of the record being
 
     it("refuses a witness scratch whose bytes differ from the next witness, writing nothing", () => {
       const state = seeded("epoch");
-      const differing = wire(state.witness).replace("\n", " \n");
+      const differing = wire(state.witness).replace(/\n$/u, " \n");
       plant(state.homeDir, scratchOf(witnessName(state.witness)), differing);
       expect(() => chain(state, state.witness)).toThrowError(expect.objectContaining({ reason: "evidence-unresolvable" }));
       expect(existsSync(join(dir(state.homeDir), attemptName(state.attempt)))).toBe(false);

@@ -935,7 +935,7 @@ describe("runMigrationActivation: crash rows (plan-v5 section 7 / synthesis amen
       });
       const wire = canonicalJson({ version: 1, generationId: GENERATION, record: witness }) + "\n";
       const path = join(migrationActivationEvidenceDirectory(f.homeDir, GENERATION), ".witness-" + witness.checksumSha256 + ".json.0123abcd.tmp");
-      writeFileSync(path, tamper ? wire.replace("\n", " \n") : wire, { mode: 0o600 });
+      writeFileSync(path, tamper ? wire.replace(/\n$/u, " \n") : wire, { mode: 0o600 });
       expect(readMigrationActivationEvidence({ homeDir: f.homeDir, generationId: GENERATION })).toMatchObject({ state: "unresolvable" });
       return path;
     }
