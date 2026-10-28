@@ -916,6 +916,7 @@ function findUrlPathStarts(chars: readonly string[]): UrlPathStarts {
           activeNestedFileUrlParentOwnerBracketDepth,
         );
         const ownsPrivateRelative = !queryOrFragment;
+        const ownsRootedQuery = backslashSlashPathStart < 0;
         armBracketTail(
           activeChildClaimStart,
           index + 1,
@@ -923,7 +924,7 @@ function findUrlPathStarts(chars: readonly string[]): UrlPathStarts {
           true,
           inheritedQuote,
           ownsPrivateRelative,
-          true,
+          ownsRootedQuery,
           false,
           true,
         );

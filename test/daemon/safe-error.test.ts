@@ -5268,6 +5268,11 @@ describe("sanitizeError", () => {
           "[https://host]:x[https://other?key=/Users/SECRET2/x]",
         "file://h?x=[file://<path>&later\\<path>?key=<path>]",
       ],
+      [
+        "private-relative query stays readable",
+        mixedSuccessorPrefix + "?key=later/home/S/s]",
+        "file://h?x=[file://<path>&later\\<path>?key=later/home/S/s]",
+      ],
     ] as const)("stabilizes the mixed-successor integration: %s", (_name, input, expected) => {
       assertStable(input, expected);
     });
