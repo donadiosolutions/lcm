@@ -168,12 +168,53 @@ function findUrlPathStarts(chars: readonly string[]): UrlPathStarts {
     while (isPathWord(chars[cursor])) cursor += 1;
     if (chars[cursor] !== "\\") return -1;
     let firstSlash = -1;
+    let backslashesAfterSlash = 0;
     while (chars[cursor] === "/" || chars[cursor] === "\\") {
       if (firstSlash < 0 && chars[cursor] === "/") firstSlash = cursor;
+      else if (firstSlash >= 0 && chars[cursor] === "\\") backslashesAfterSlash += 1;
       cursor += 1;
+    }
+    if (
+      isWindowsDrivePathStart(chars, cursor) ||
+      isForwardSlashDrivePathStart(cursor) ||
+      isFileUrlLiteral(chars, cursor) ||
+      backslashesAfterSlash >= 2
+    ) {
+      return -1;
     }
     return firstSlash >= 0 && isPathWord(chars[cursor]) ? firstSlash : -1;
   };
+  const previousSuccessorDelimiter = (delimiterIndex: number): number => {
+    let cursor = delimiterIndex - 1;
+    while (cursor >= 0 && chars[cursor] !== "&" && chars[cursor] !== "|") cursor -= 1;
+    return cursor;
+  };
+  const previousSuccessorIsPlain = (delimiterIndex: number): boolean => {
+    const previousDelimiter = previousSuccessorDelimiter(delimiterIndex);
+    if (previousDelimiter < 0 || !isPathWord(chars[previousDelimiter + 1])) return false;
+    let cursor = previousDelimiter + 1;
+    while (isPathWord(chars[cursor])) cursor += 1;
+    return cursor === delimiterIndex;
+  };
+  const laterSuccessorBeforeBracket = new Uint8Array(chars.length);
+  const queryBeforeBracket = new Uint8Array(chars.length);
+  let bracketSeen = false;
+  let successorBeforeBracket = false;
+  let queryDelimiterBeforeBracket = false;
+  for (let cursor = chars.length - 1; cursor >= 0; cursor -= 1) {
+    const char = chars[cursor];
+    if (char.trim() === "" || char === "]") {
+      bracketSeen = false;
+      successorBeforeBracket = false;
+      queryDelimiterBeforeBracket = false;
+      continue;
+    }
+    if (char === "[") bracketSeen = true;
+    else if (bracketSeen && (char === "&" || char === "|")) successorBeforeBracket = true;
+    else if (bracketSeen && (char === "?" || char === "#")) queryDelimiterBeforeBracket = true;
+    if (successorBeforeBracket) laterSuccessorBeforeBracket[cursor] = 1;
+    if (queryDelimiterBeforeBracket) queryBeforeBracket[cursor] = 1;
+  }
   const returnedParentPrivateRootPathStart = (start: number): number => {
     if (!isPathWord(chars[start])) return -1;
     let cursor = start;
@@ -230,6 +271,7 @@ function findUrlPathStarts(chars: readonly string[]): UrlPathStarts {
   let slashPrefixedNestedPublicSchemeStart = -1;
   let quotedQueryPublicUrl = false;
   let quotedQueryPublicUrlOwnQueryOrFragment = false;
+  let backslashSlashClaimActive = false;
 
   for (let index = 0; index < chars.length; index += 1) {
     const char = chars[index];
@@ -262,6 +304,7 @@ function findUrlPathStarts(chars: readonly string[]): UrlPathStarts {
       slashPrefixedNestedPublicSchemeStart = -1;
       quotedQueryPublicUrl = false;
       quotedQueryPublicUrlOwnQueryOrFragment = false;
+      backslashSlashClaimActive = false;
       postCloseFilePathActive = false;
       postCloseFilePathBracketDepth = 0;
       siblingWrapperStart = -1;
@@ -587,6 +630,7 @@ function findUrlPathStarts(chars: readonly string[]): UrlPathStarts {
       slashPrefixedNestedPublicSchemeStart = -1;
       quotedQueryPublicUrl = false;
       quotedQueryPublicUrlOwnQueryOrFragment = false;
+      backslashSlashClaimActive = false;
       schemeLength = 0;
       fileSchemeLength = 0;
       schemeQuote = directNestedFileQuote || inheritedNestedFileQuote;
@@ -608,12 +652,19 @@ function findUrlPathStarts(chars: readonly string[]): UrlPathStarts {
     const activeBackslashSlashPathStart: number =
       exactFileScheme &&
       foundFilePath &&
-      (char === "&" || char === "|") &&
+      char === "&" &&
+      schemeQuote === 0 &&
+      !postCloseFilePathInheritedQuote &&
+      !repeatedPipeHandoffWrapperDepths.has(pathlessFileQueryOwnerBracketDepth) &&
       queryOrFragmentStart <= separator &&
-      nestedFileSchemeStarts[separator - 4] === 1
+      nestedFileSchemeStarts[separator - 4] === 1 &&
+      (previousSuccessorDelimiter(index) < 0 ||
+        backslashSlashClaimActive ||
+        previousSuccessorIsPlain(index)) &&
+      laterSuccessorBeforeBracket[index + 1] !== 1 &&
+      !(pathlessFileQueryOwnerBracketDepth === 0 && queryBeforeBracket[index + 1] === 1)
         ? backslashSlashSuccessorPathStart(index + 1)
         : -1;
-    let returnedFromActiveBackslashSlash = false;
     if (
       (activeNestedFileUrlParentOwnerBracketDepth > 0 || activeBackslashSlashPathStart >= 0) &&
       exactFileScheme &&
@@ -635,17 +686,20 @@ function findUrlPathStarts(chars: readonly string[]): UrlPathStarts {
         !queryOrFragment ||
         chars[index + 1] === "/" ||
         chars[index + 1] === "\\" ||
-        wordBearingPrivatePathStart >= 0 ||
-        backslashSlashPathStart >= 0;
+        wordBearingPrivatePathStart >= 0;
       if (returnsToParent && (chars[index + 1] === "/" || chars[index + 1] === "\\")) {
         forcedPath[index + 1] = 1;
       }
       if (wordBearingPrivatePathStart >= 0) forcedPath[wordBearingPrivatePathStart] = 1;
-      if (backslashSlashPathStart >= 0) {
-        forcedPath[backslashSlashPathStart] = 1;
-        armBracketTail(backslashSlashPathStart, index + 1, false, true, false);
-        returnedFromActiveBackslashSlash = true;
-      }
+      if (backslashSlashPathStart >= 0) forcedPath[backslashSlashPathStart] = 1;
+      const keepsClaimAcrossOrdinaryRelative: boolean =
+        backslashSlashClaimActive &&
+        startsWordBearingSlashPath(chars, index + 1) &&
+        wordBearingPrivatePathStart < 0 &&
+        !startsUrlSchemeLiteral(chars, index + 1);
+      backslashSlashClaimActive =
+        backslashSlashPathStart >= 0 ||
+        keepsClaimAcrossOrdinaryRelative;
       if (returnsToParent) {
         separator = -1;
         exactFileScheme = false;
@@ -665,14 +719,8 @@ function findUrlPathStarts(chars: readonly string[]): UrlPathStarts {
       (char === "&" || char === "|")
     ) {
       const privateRootPathStart = returnedParentPrivateRootPathStart(index + 1);
-      const backslashSlashPathStart = backslashSlashSuccessorPathStart(index + 1);
       if (chars[index + 1] === "/" || chars[index + 1] === "\\") {
         forcedPath[index + 1] = 1;
-      } else if (backslashSlashPathStart >= 0) {
-        forcedPath[backslashSlashPathStart] = 1;
-        if (!returnedFromActiveBackslashSlash) {
-          armBracketTail(backslashSlashPathStart, index + 1, false, true, false);
-        }
       } else if (
         privateRootPathStart >= 0 &&
         !restartedNestedFileUrlParentOwnerBracketDepths.has(pathlessFileQueryOwnerBracketDepth) &&
@@ -680,6 +728,7 @@ function findUrlPathStarts(chars: readonly string[]): UrlPathStarts {
       ) {
         forcedPath[privateRootPathStart] = 1;
       }
+      backslashSlashClaimActive = false;
     }
     if (restartedPathlessFile && char === "[") {
       restartedPathlessBrackets += 1;

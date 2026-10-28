@@ -695,11 +695,18 @@ bundle and keep provider, credential, quarantine, and recovery sessions private.
   public-URL parameter of that child does not end the match. Closing an inner
   wrapper removes only that depth, preserving still-open outer owners until
   their matching close or a hard reset. As an exception to ordinary-relative
-  visibility, a successor after a path-bearing nested `file://` child is
-  redacted from the first `/` when a path-word label is followed by a separator
-  run that starts with `\`, also contains `/`, and then has another path word.
-  The label and any preceding backslashes remain visible; backslash-only runs
-  and runs without a following path word remain unchanged.
+  visibility, an ampersand successor after a path-bearing nested `file://`
+  child is redacted from the first `/` when a path-word label is followed by a
+  separator run that starts with `\`, also contains `/`, and then has another
+  path word. The label and any preceding backslashes remain visible;
+  backslash-only runs and runs without a following path word remain unchanged.
+  When the text after that slash is a Windows drive path, the slash stays
+  visible and redaction begins at the drive root. An intervening public-URL
+  successor keeps a later mixed-separator successor on its existing visibility
+  boundary. Following bracketed text continues to use its existing query and
+  bracket redaction rules rather than inheriting new ownership from this case.
+  If another successor intervenes before that bracket, the existing multi-pass
+  boundary is retained instead of claiming the mixed-separator successor early.
 
   When a matching quote closes a nested public URL inside a bracketed file
   query, an immediate `&` or `|` successor is redacted only when it begins with

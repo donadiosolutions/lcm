@@ -4836,6 +4836,139 @@ describe("sanitizeError", () => {
       ],
     ];
 
+    const reviewedRegressions: ReadonlyArray<
+      readonly [name: string, input: string, expected: string]
+    > = [
+      [
+        "later private-relative query value",
+        "file://h?x=[file:///Users/CHILD/x&later\\/home/alice/s([https://other?a=1&later/home/SECOND/secret]",
+        "file://h?x=[file://<path>&later\\<path>?a=1&later<path>]",
+      ],
+      [
+        "named private-relative query value",
+        "file://h?x=[file:///Users/CHILD/x&later\\/home/alice/s([https://other?key=later/home/S/s]",
+        "file://h?x=[file://<path>&later\\<path>?key=later<path>]",
+      ],
+      [
+        "colon-slash query value",
+        "file://h?x=[file:///Users/CHILD/x&later\\/home/alice/s([https://other?key=XY:/Users/S/s]",
+        "file://h?x=[file://<path>&later\\<path>?key=XY:<path>]",
+      ],
+      [
+        "second rooted query value",
+        "file://h?x=[file:///Users/CHILD/x&later\\/home/alice/s?key=/Users/Z([https://other?key=/Users/SECRET2/x]",
+        "file://h?x=[file://<path>&later\\<path>?key=<path>?key=<path>]",
+      ],
+      [
+        "query-ended second bracket",
+        "file://h?x=[file:///Users/CHILD/x&later\\/home/alice/s[https://a?q=plain]:x[https://other?key=/Users/SECOND/s]",
+        "file://h?x=[file://<path>&later\\<path>?q=plain]:x[https://other?key=<path>]",
+      ],
+      [
+        "slash-only query value",
+        "file://h?x=[file:///Users/CHILD/x&later\\/home/alice/s([https://other?key=/]",
+        "file://h?x=[file://<path>&later\\<path>?key=<path>]",
+      ],
+      [
+        "pipe public URL path",
+        "file://h?x=[file:///Users/CHILD/x|later\\/https://public.test/x/s([https://other?key=plain]",
+        "file://h?x=[file://<path>|later\\<path>?key=plain]",
+      ],
+      [
+        "pipe private-looking public URL path",
+        "file://h?x=[file:///Users/CHILD/x|later\\/https://public.test/Users/SECRET/x([https://other?key=plain]",
+        "file://h?x=[file://<path>|later\\<path>?key=plain]",
+      ],
+      [
+        "inherited-quote public URL path",
+        "file://h?x=['https://outer.test/x?next=file:///Users/a/private.db'&later\\/https://public.test/x/s([https://other?key=C:\\Users\\SECRET2\\x]",
+        "file://h?x=['https://outer.test/x?next=file://<path>'&later\\<path>?key=<path>]",
+      ],
+      [
+        "ampersand backslash drive successor",
+        "file://h?x=[file:///Users/CHILD/x&later\\/C:\\Users\\x]",
+        "file://h?x=[file://<path>&later\\/<path>]",
+      ],
+      [
+        "ampersand lowercase drive successor",
+        "file://h?x=[file:///Users/CHILD/x&later\\/c:\\Users\\x]",
+        "file://h?x=[file://<path>&later\\/<path>]",
+      ],
+      [
+        "ampersand home drive successor",
+        "file://h?x=[file:///Users/CHILD/x&later\\/D:\\home\\x]",
+        "file://h?x=[file://<path>&later\\/<path>]",
+      ],
+      [
+        "multiple backslashes before a drive successor",
+        "file://h?x=[file:///Users/CHILD/x&later\\\\/C:\\Users\\x]",
+        "file://h?x=[file://<path>&later\\\\/<path>]",
+      ],
+      [
+        "UNC root after the mixed separator",
+        "file://h?x=[file:///Users/CHILD/x&later\\/\\\\Users\\x]",
+        "file://h?x=[file://<path>&later\\/<path>]",
+      ],
+      [
+        "pipe forward-slash drive successor",
+        "file://h?x=[file:///Users/CHILD/x|later\\/C:/Users/x]",
+        "file://h?x=[file://<path>|later\\<path>:<path>]",
+      ],
+      [
+        "mixed successor after a public URL",
+        "file://h?x=[file:///Users/CHILD/x&https://public.test/x&later\\/var/b]",
+        "file://h?x=[file://<path>&https://public.test/x&later\\/var/b]",
+      ],
+      [
+        "private-looking mixed successor after a public URL",
+        "file://h?x=[file:///Users/CHILD/x&https://public.test/x&later\\/home/b]",
+        "file://h?x=[file://<path>&https://public.test/x&later\\/home/b]",
+      ],
+      [
+        "mixed successor after plain text",
+        "file://h?x=[file:///Users/CHILD/x&plain&later\\/home/b]",
+        "file://h?x=[file://<path>&plain&later\\<path>]",
+      ],
+      [
+        "mixed successor after an ordinary relative",
+        "file://h?x=[file:///Users/CHILD/x&later\\/home/a&second/var/b&third\\/var/c]",
+        "file://h?x=[file://<path>&later\\<path>&second/var/b&third\\<path>]",
+      ],
+    ];
+
+    const reviewedPassSequences: ReadonlyArray<
+      readonly [name: string, input: string, first: string, second: string, third: string]
+    > = [
+      [
+        "preserved drive before a later mixed successor",
+        "file://h?x=[file:///Users/CHILD/x&later\\/C:/Users/x&second\\/var/b([https://other?key=/Users/S2/x]",
+        "file://h?x=[file://<path>&later\\/C:/Users/x&second\\/var/b([https://other?key=<path>]",
+        "file://h?x=[file://<path>&later\\<path>:<path>&second\\<path>?key=<path>]",
+        "file://h?x=[file://<path>&later\\<path>:<path>&second\\<path>?key=<path>]",
+      ],
+      [
+        "ordinary second successor before a bracket",
+        "file://h?x=[file:///Users/CHILD/x&later\\/home/alice&second/var/b([https://other?key=/Users/S2/x]",
+        "file://h?x=[file://<path>&later\\/home/alice&second/var/b([https://other?key=<path>]",
+        "file://h?x=[file://<path>&later\\<path>&second/var/b([https://other?key=<path>]",
+        "file://h?x=[file://<path>&later\\<path>&second/var/b([https://other?key=<path>]",
+      ],
+      [
+        "non-path mixed value",
+        "file://h?x=[file:///Users/CHILD/x&=later\\/home/alice]",
+        "file://h?x=[file://<path>&=later\\/home/alice]",
+        "file://h?x=[file://<path>&=later\\<path>]",
+        "file://h?x=[file://<path>&=later\\<path>]",
+      ],
+      [
+        "mixed successor after a non-path value",
+        "file://h?x=[file:///Users/CHILD/x&=x&later\\/home/alice]",
+        "file://h?x=[file://<path>&=x&later\\/home/alice]",
+        "file://h?x=[file://<path>&=x&later\\<path>]",
+        "file://h?x=[file://<path>&=x&later\\<path>]",
+      ],
+    ];
+
     it.each(targets)("redacts the %s on the first pass", (_name, input, expected) => {
       const first = sanitizeError(input);
       const second = sanitizeError(first);
@@ -4855,6 +4988,29 @@ describe("sanitizeError", () => {
       expect(second).toBe(expected);
       expect(third).toBe(expected);
     });
+
+    it.each(reviewedRegressions)("preserves the reviewed %s", (_name, input, expected) => {
+      const first = sanitizeError(input);
+      const second = sanitizeError(first);
+      const third = sanitizeError(second);
+
+      expect(first).toBe(expected);
+      expect(second).toBe(expected);
+      expect(third).toBe(expected);
+    });
+
+    it.each(reviewedPassSequences)(
+      "preserves the reviewed %s pass sequence",
+      (_name, input, expectedFirst, expectedSecond, expectedThird) => {
+        const first = sanitizeError(input);
+        const second = sanitizeError(first);
+        const third = sanitizeError(second);
+
+        expect(first).toBe(expectedFirst);
+        expect(second).toBe(expectedSecond);
+        expect(third).toBe(expectedThird);
+      },
+    );
   });
 
   describe("Bug #917", () => {
