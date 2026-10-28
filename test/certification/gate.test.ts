@@ -22,7 +22,7 @@ function snapshotFiles(root: string, directory = root, files = new Map<string, B
 
 type FaultLayout = "faults" | "partition-a" | "none";
 type MaintenanceFailure = "compact" | "snapshot" | "mixed";
-type Variant = { observerGap?: boolean; observerSiblingsPresent?: boolean; extraObserverRow?: Record<string, unknown>; clockBreach?: boolean; clockGap?: boolean; duplicateMapping?: boolean; drainFail?: boolean; capacityPeak?: number; recoveryFail?: boolean; partitionFirstSuccessSeconds?: number; restartBFirstSuccessSeconds?: number; restartBNoSuccess?: boolean; noRecoverySuccess?: boolean; catchUpFail?: boolean; catchUpAtSeconds?: number; missingCatchUpTimestamp?: boolean; readinessInvalid?: boolean; residualOccupied?: boolean; poolConfigMismatch?: boolean; setupSessionOpen?: boolean; phaseEarly?: boolean; profile?: "smoke" | "full"; lane?: "local" | "managed"; faultLayout?: FaultLayout; maintenanceFailure?: MaintenanceFailure; smokeFailure?: boolean; smokeSlow?: boolean; executionHost?: Record<string, unknown> };
+type Variant = { withFaults?: boolean; observerGap?: boolean; observerSiblingsPresent?: boolean; extraObserverRow?: Record<string, unknown>; clockBreach?: boolean; clockGap?: boolean; duplicateMapping?: boolean; drainFail?: boolean; capacityPeak?: number; recoveryFail?: boolean; partitionFirstSuccessSeconds?: number; restartBFirstSuccessSeconds?: number; restartBNoSuccess?: boolean; noRecoverySuccess?: boolean; catchUpFail?: boolean; catchUpAtSeconds?: number; missingCatchUpTimestamp?: boolean; readinessInvalid?: boolean; residualOccupied?: boolean; poolConfigMismatch?: boolean; setupSessionOpen?: boolean; phaseEarly?: boolean; profile?: "smoke" | "full"; lane?: "local" | "managed"; faultLayout?: FaultLayout; maintenanceFailure?: MaintenanceFailure; smokeFailure?: boolean; smokeSlow?: boolean; executionHost?: Record<string, unknown> };
 
 // Every scheduled compact, every scheduled snapshot, or every other one of each.
 function maintenanceFails(mode: MaintenanceFailure | undefined, op: string, index: number): boolean {
@@ -67,7 +67,7 @@ function rawFixture(options: Variant = {}) {
   const faultLayout: FaultLayout = options.faultLayout ?? (profile === "full" ? (lane === "managed" ? "partition-a" : "faults") : "none");
   const runtimeRole = lane === "local" ? "lcm_test_runtime" : "lcm_cert_runtime_run12345";
   const t0 = Date.parse("2026-10-26T10:10:00.000Z");
-  writeJson(join(root, "run.json"), { lane, profile, runId: "run12345", contractSha256, approval, approvalSha256, startedAt: "2026-10-26T10:01:00.000Z" });
+  writeJson(join(root, "run.json"), { lane, profile, ...(options.withFaults ? { withFaults: true } : {}), runId: "run12345", contractSha256, approval, approvalSha256, startedAt: "2026-10-26T10:01:00.000Z" });
   writeJson(join(root, "phase-control.json"), { warmupStartAt: options.phaseEarly ? "2026-10-26T10:09:00.000Z" : "2026-10-26T10:08:00.000Z", steadyT0At: new Date(t0).toISOString() });
   writeJson(join(root, "execution-provenance.json"), provenance);
   writeJson(join(root, "machine-identities.json"), {
@@ -449,6 +449,36 @@ describe("lane fault-set sample from real producer layouts", () => {
     const gate = assemble(fixture).gate;
     expect(faultSetOf(gate)).toMatchObject({ verdict: "fail", observed: 1, threshold: 2, inputs: { count: 1, sampleFile: "lane-fault-set.ndjson" } });
     expect(gate.verdict).toBe("fail");
+  });
+
+  it("evaluates a fault smoke against the lane's contract faults and keeps it non-certifying", () => {
+    const fixture = rawFixture({ profile: "smoke", withFaults: true, faultLayout: "faults" });
+    const result = assemble(fixture);
+    const gate = result.gate;
+    expect(gate.withFaults).toBe(true);
+    expect(faultSetOf(gate)).toMatchObject({ verdict: "pass", observed: 2, threshold: 2, formula: "full profile or smoke with faults: exact contract lane fault IDs" });
+    for (const id of ["recovery.partition-a", "recovery.restart-database"]) {
+      expect(gate.slos.find((slo: any) => slo.id === id)).toMatchObject({ verdict: "pass", inputs: { sampleFile: "faults.json" } });
+    }
+    expect(gate.slos.find((slo: any) => slo.id === "profile-certifying")).toMatchObject({ verdict: "incomplete", observed: 0 });
+    expect(gate.verdict).toBe("incomplete");
+    expect(readFileSync(result.paths.markdown, "utf8")).toContain("Lane/profile: `local` / `smoke` with faults (non-certifying)");
+  });
+
+  it("fails a fault smoke whose recorded faults differ from the lane's contract faults", () => {
+    for (const faultLayout of ["partition-a", "none"] as const) {
+      const gate = assemble(rawFixture({ profile: "smoke", withFaults: true, faultLayout })).gate;
+      expect(faultSetOf(gate)).toMatchObject({ verdict: "fail", threshold: 2, observed: faultLayout === "none" ? 0 : 1 });
+      expect(gate.verdict).toBe("fail");
+    }
+  });
+
+  it("publishes withFaults false for runs without the option", () => {
+    for (const profile of ["smoke", "full"] as const) {
+      const result = assemble(rawFixture({ profile }));
+      expect(result.gate.withFaults).toBe(false);
+      expect(readFileSync(result.paths.markdown, "utf8")).not.toContain("with faults");
+    }
   });
 });
 

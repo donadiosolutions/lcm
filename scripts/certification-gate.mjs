@@ -120,6 +120,9 @@ export function buildEvidenceManifest({ evidenceDirectory, contract, persist = t
     return name;
   };
   const run = json(join(evidenceDirectory, "run.json"));
+  // A smoke run recorded with the non-certifying --with-faults option injects the lane's
+  // contract faults; it stays non-certifying because profile-certifying needs the full profile.
+  const withFaults = run.profile === "smoke" && run.withFaults === true;
   const identities = json(join(evidenceDirectory, "machine-identities.json"));
   const cleanup = json(join(evidenceDirectory, "cleanup.json"));
   const executionProvenance = json(join(evidenceDirectory, "execution-provenance.json"));
@@ -379,13 +382,13 @@ export function buildEvidenceManifest({ evidenceDirectory, contract, persist = t
   const faults = existsSync(join(evidenceDirectory, "faults.json"))
     ? json(join(evidenceDirectory, "faults.json"))
     : existsSync(join(evidenceDirectory, "fault-partition-a.json")) ? [json(join(evidenceDirectory, "fault-partition-a.json"))] : [];
-  const expectedFaultIds = (run.profile === "full" ? contract.lanes[run.lane].faults : [])
+  const expectedFaultIds = (run.profile === "full" || withFaults ? contract.lanes[run.lane].faults : [])
     .map((fault) => fault === "partition-machine-a" ? "partition-a" : fault).sort();
   const actualFaultIds = faults.map((fault) => fault.id).sort();
-  const faultSetVerdict = run.profile === "smoke" && faults.length === 0 ? "incomplete"
+  const faultSetVerdict = run.profile === "smoke" && !withFaults && faults.length === 0 ? "incomplete"
     : JSON.stringify(expectedFaultIds) === JSON.stringify(actualFaultIds) ? "pass" : "fail";
   const faultSetFile = sampleFile("lane-fault-set.ndjson", faults);
-  slos.push({ id: "lane-fault-set", formula: "full-profile exact contract lane fault IDs", inputs: { count: faults.length, sampleFile: faultSetFile }, threshold: expectedFaultIds.length, observed: faults.length, verdict: faultSetVerdict });
+  slos.push({ id: "lane-fault-set", formula: "full profile or smoke with faults: exact contract lane fault IDs", inputs: { count: faults.length, sampleFile: faultSetFile }, threshold: expectedFaultIds.length, observed: faults.length, verdict: faultSetVerdict });
   for (const fault of faults) {
     const limit = fault.kind === "restart-database"
       ? contract.thresholds.recovery.restartDatabase.rtoSeconds
@@ -448,6 +451,7 @@ export function buildEvidenceManifest({ evidenceDirectory, contract, persist = t
     startedAt: run.startedAt,
     lane: run.lane,
     profile: run.profile,
+    withFaults,
     runContractSha256: run.contractSha256,
     runApproval: run.approval,
     runApprovalSha256: run.approvalSha256,

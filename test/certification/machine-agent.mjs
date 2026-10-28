@@ -1030,14 +1030,17 @@ export async function runMachineAgent(environment = process.env) {
     const settleUntil = Date.parse(control.steadyT0At) + timeline.steadySeconds * 1000 + (timeline.pendingSettleMaxSeconds ?? 0) * 1000;
     if (Date.now() < settleUntil) await new Promise((resolve) => setTimeout(resolve, settleUntil - Date.now()));
     writeFileSync(join(evidenceDirectory, "fault-ready.json"), `${JSON.stringify({ machine, at: new Date().toISOString() })}\n`, { mode: 0o600, flag: "wx" });
-    if (profile === "full") {
+    // The full profile always runs the fault phases; a smoke run does so only for the
+    // coordinator's non-certifying --with-faults option. Fault phases always use the full
+    // profile's bounds.
+    if (profile === "full" || environment.LCM_CERT_WITH_FAULTS === "1") {
       const partitionSchedule = createFaultSchedule({
         machine, runId: environment.LCM_CERT_RUN_ID, phase: "partition-recovery",
         durationSeconds: contract.thresholds.recovery.partition.rtoSeconds,
       });
       await executeDeterministicSchedule({ schedule: partitionSchedule, entrypoint: lcm, cwd: project, environment, daemonClient, evidenceDirectory, daemonTokenPath });
       const partitionClearance = await waitForControl(join(evidenceDirectory, "partition-cleared.json"), {
-        deadlineMs: Date.now() + timeline.partitionPhaseMaxSeconds * 1000,
+        deadlineMs: Date.now() + contract.timeline.full.partitionPhaseMaxSeconds * 1000,
       });
       const partitionCatchUp = await waitForAcknowledgmentCatchUp(
         environment.HOME, evidenceDirectory, "partition", partitionClearance.clearedAt,
@@ -1053,7 +1056,7 @@ export async function runMachineAgent(environment = process.env) {
         });
         await executeDeterministicSchedule({ schedule: restartSchedule, entrypoint: lcm, cwd: project, environment, daemonClient, evidenceDirectory, daemonTokenPath });
         const restartClearance = await waitForControl(join(evidenceDirectory, "restart-cleared.json"), {
-          deadlineMs: Date.now() + timeline.restartPhaseMaxSeconds * 1000,
+          deadlineMs: Date.now() + contract.timeline.full.restartPhaseMaxSeconds * 1000,
         });
         const restartCatchUp = await waitForAcknowledgmentCatchUp(
           environment.HOME, evidenceDirectory, "restart", restartClearance.clearedAt,

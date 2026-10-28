@@ -10,7 +10,7 @@ import {
   runManagedCertification,
   runDigitalOceanLifecycle,
 } from "../../scripts/certification-digitalocean.mjs";
-import { runManagedMachinePair } from "../../scripts/certification-harness.mjs";
+import { MACHINE_DATABASE_CLEARANCE_SCRIPT, machineDatabaseClearanceArgs, runManagedMachinePair } from "../../scripts/certification-harness.mjs";
 import { waitForControl } from "./machine-agent.mjs";
 
 const json = (value: unknown, status = 200) => new Response(JSON.stringify(value), {
@@ -289,10 +289,22 @@ describe("certification DigitalOcean lifecycle", () => {
         const machine = args[2].includes("machine-a") ? "a" : args[2].includes("machine-b") ? "b" : undefined;
       if (machine) fakeAgents.push(fakeAgent(machine));
       }
+      // Only the runtime-role clearance probe reaches the run's database from inside a
+      // machine; any other command there uses the env file's revoked transfer URL.
+      if (args[1] === "exec" && args.at(-1) === MACHINE_DATABASE_CLEARANCE_SCRIPT) {
+        return {
+          stdout: JSON.stringify({
+            server_version_num: 180004, server_address: "10.10.0.5", server_port: 25060, database_name: "lcm_cert_run12345",
+            role_name: "lcm_cert_runtime_run12345", rolsuper: false, rolcreaterole: false, rolcreatedb: false,
+          }),
+          stderr: "",
+        };
+      }
       if (args.includes("-e")) {
         const configuredMax = args[2].includes("machine-b") ? 3 : 2;
         return { stdout: JSON.stringify({ backend: "postgresql", pool: { status: "ready", configuredMax } }), stderr: "" };
       }
+      if (args[1] === "exec") throw new Error("permission denied for schema lcm");
       return { stdout: "", stderr: "" };
     });
     const phaseDelay = vi.fn(async () => undefined);
@@ -310,7 +322,7 @@ describe("certification DigitalOcean lifecycle", () => {
       profile: "full",
       evidenceDirectory,
       secrets: ["secret"],
-      contract: { timeline: { full: { setupMaxSeconds, secondDaemonStartOffsetSeconds: 150, warmupSeconds: 120 }, smoke: { warmupSeconds: 120 } } },
+      contract: { timeline: { full: { setupMaxSeconds, secondDaemonStartOffsetSeconds: 150, warmupSeconds: 120, partitionPhaseMaxSeconds: 1080 }, smoke: { warmupSeconds: 120 } } },
     }, {
       processRunner,
       containerCli: "podman",
@@ -352,6 +364,16 @@ describe("certification DigitalOcean lifecycle", () => {
     expect(createText).toContain("wrong-run12345.invalid:203.0.113.7");
     expect(createText).toContain("/opt/lcm/certification/machine-agent.mjs");
     expect(createText).not.toContain("postgresql://");
+    // The partition clearance runs the runtime-role probe in machine A right after the
+    // reconnect, in the environment of the env file A was created with.
+    const createA = calls.find((args) => args[0] === "container" && args[1] === "create" && args.includes("lcm-cert-a"));
+    const machineA = createA?.[createA.indexOf("--name") + 1] ?? "";
+    expect(calls.filter((args) => args[1] === "exec" && args[2] === machineA && !args.at(-1)?.includes("/stats/pool")))
+      .toEqual([machineDatabaseClearanceArgs(machineA)]);
+    expect(calls[calls.findIndex((args) => args[0] === "network" && args[1] === "connect") + 1]).toEqual(machineDatabaseClearanceArgs(machineA));
+    const environmentA = readFileSync(createA?.[createA.indexOf("--env-file") + 1] ?? "", "utf8");
+    expect(environmentA).toContain("LCM_POSTGRES_RUNTIME_URL=postgresql://runtime:secret@db.example:25060/lcm_cert_run12345\n");
+    expect(environmentA).toContain("LCM_POSTGRES_CA_FILE=/run/lcm-ca/ca.crt\n");
     const startA = calls.findIndex((args) => args[0] === "container" && args[1] === "start" && args.some((value) => value.includes("machine-a")));
     const startB = calls.findIndex((args) => args[0] === "container" && args[1] === "start" && args.some((value) => value.includes("machine-b")));
     expect(startA).toBeGreaterThanOrEqual(0);

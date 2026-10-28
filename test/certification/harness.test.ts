@@ -1,9 +1,11 @@
 import { createHash } from "node:crypto";
-import { mkdirSync, mkdtempSync, readFileSync, readdirSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { describe, expect, it, vi } from "vitest";
 import {
+  DATABASE_IDENTITY_SQL,
+  MACHINE_DATABASE_CLEARANCE_SCRIPT,
   assertExecutionProvenance,
   buildMachineContainerArgs,
   captureExecutionHost,
@@ -12,6 +14,7 @@ import {
   collectResidualState,
   collectSetupSessionClosure,
   createDeterministicSchedule,
+  machineDatabaseClearanceArgs,
   parseCertificationArguments,
   prepareManagedDatabase,
   recordFaultStep,
@@ -22,9 +25,12 @@ import {
   validateRunnerSku,
   verifyDistinctMachineIdentities,
   waitForMachineFiles,
+  waitForMachineDatabaseClearance,
 } from "../../scripts/certification-harness.mjs";
+import { createRunNames } from "../../scripts/postgresql-harness.mjs";
 import { loadCertificationContract } from "./contract.mjs";
 import { createGitCheckoutFixture } from "./git-checkout-fixture.js";
+import { waitForControl } from "./machine-agent.mjs";
 
 vi.mock("pg", () => ({
   Client: class {
@@ -103,6 +109,17 @@ describe("certification harness", () => {
     });
     expect(() => parseCertificationArguments(["--lane", "other", "--profile", "smoke", "--evidence-dir", "/tmp/e"])).toThrow("lane");
     expect(() => parseCertificationArguments(["--lane", "local", "--profile", "smoke", "--evidence-dir", "relative"])).toThrow("absolute");
+  });
+
+  it("accepts the valueless --with-faults option only for a local smoke run", () => {
+    const expected = { lane: "local", profile: "smoke", evidenceDirectory: "/private/evidence", withFaults: true };
+    expect(parseCertificationArguments(["--lane", "local", "--", "--profile", "smoke", "--with-faults", "--evidence-dir", "/private/evidence"])).toEqual(expected);
+    expect(parseCertificationArguments(["--lane", "local", "--with-faults", "--profile", "smoke", "--evidence-dir", "/private/evidence"])).toEqual(expected);
+    for (const [lane, profile] of [["local", "full"], ["managed", "smoke"], ["managed", "full"]]) {
+      expect(() => parseCertificationArguments(["--lane", lane, "--profile", profile, "--with-faults", "--evidence-dir", "/private/evidence"]))
+        .toThrow("--with-faults requires the local lane and the smoke profile");
+    }
+    expect(() => parseCertificationArguments(["--lane", "local", "--profile", "smoke", "--evidence-dir"])).toThrow("invalid certification arguments");
   });
 
   it("records a dirty exploratory smoke but rejects dirty certifying provenance", () => {
@@ -482,5 +499,250 @@ describe("certification harness", () => {
       prepareDatabase: async () => { order.push("prepare"); throw new Error("stop after prepare"); },
     })).rejects.toThrow("stop after prepare");
     expect(order).toEqual(["prepare"]);
+  });
+});
+
+describe("certification fault clearance probes", () => {
+  const fastDelay = () => new Promise<void>((resolve) => setTimeout(resolve, 1));
+  const localExpected = { expectedVersionNum: 180004, expectedDatabase: "lcm_harness_aaaaaaaaaaaaaaaaaaaa", expectedPort: 5432, expectedRole: "lcm_test_runtime" };
+  const identityRow = (overrides: Record<string, unknown> = {}) => ({
+    server_version_num: 180004, server_address: "10.89.0.2", server_port: 5432,
+    database_name: "lcm_harness_aaaaaaaaaaaaaaaaaaaa", role_name: "lcm_test_runtime",
+    rolsuper: false, rolcreaterole: false, rolcreatedb: false, ...overrides,
+  });
+
+  it("runs one fixed in-machine script that reads the runtime URL and CA by name", () => {
+    expect(machineDatabaseClearanceArgs("machine-a")).toEqual(["container", "exec", "machine-a", "node", "--input-type=module", "-e", MACHINE_DATABASE_CLEARANCE_SCRIPT]);
+    expect(MACHINE_DATABASE_CLEARANCE_SCRIPT).toContain("connectionString: process.env.LCM_POSTGRES_RUNTIME_URL");
+    expect(MACHINE_DATABASE_CLEARANCE_SCRIPT).toContain('readFileSync(process.env.LCM_POSTGRES_CA_FILE, "utf8"), rejectUnauthorized: true');
+    expect(MACHINE_DATABASE_CLEARANCE_SCRIPT).toContain(JSON.stringify(DATABASE_IDENTITY_SQL));
+    expect(MACHINE_DATABASE_CLEARANCE_SCRIPT).not.toMatch(/LCM_POSTGRES_URL\b|postgresql:\/\/|doctor/u);
+  });
+
+  it("retries the probe until PostgreSQL accepts it and returns the verified identity", async () => {
+    const attempts: string[][] = [];
+    const run = async (args: string[]) => {
+      attempts.push(args);
+      if (attempts.length < 3) throw new Error("the database system is starting up");
+      return { stdout: `${JSON.stringify(identityRow())}\n`, stderr: "" };
+    };
+    await expect(waitForMachineDatabaseClearance({ name: "machine-a", run, expected: localExpected, timeoutMs: 10_000, delay: fastDelay }))
+      .resolves.toEqual(identityRow());
+    expect(attempts).toEqual(Array.from({ length: 3 }, () => machineDatabaseClearanceArgs("machine-a")));
+  });
+
+  it("fails at once on another role, database or port, and after its bound when every attempt fails", async () => {
+    for (const overrides of [{ role_name: "lcm_cert_transfer_aaaaaaaaaaaaaaaa" }, { database_name: "lcm_harness_other" }, { server_port: 15432 }]) {
+      const run = vi.fn(async () => ({ stdout: JSON.stringify(identityRow(overrides)), stderr: "" }));
+      await expect(waitForMachineDatabaseClearance({ name: "machine-a", run, expected: localExpected, timeoutMs: 10_000, delay: fastDelay }))
+        .rejects.toThrow("certification machine machine-a database clearance failed: certification database identity or least-privilege readiness failed");
+      expect(run).toHaveBeenCalledTimes(1);
+    }
+    const unreachable = vi.fn(async () => { throw new Error("connect ECONNREFUSED"); });
+    await expect(waitForMachineDatabaseClearance({ name: "machine-a", run: unreachable, expected: localExpected, timeoutMs: 25, delay: fastDelay }))
+      .rejects.toThrow("certification machine machine-a database clearance failed: certification machine phase timed out");
+    expect(unreachable.mock.calls.length).toBeGreaterThan(1);
+    const controller = new AbortController();
+    controller.abort(new Error("certification aborted by test"));
+    await expect(waitForMachineDatabaseClearance({ name: "machine-a", run: unreachable, expected: localExpected, timeoutMs: 10_000, delay: fastDelay, signal: controller.signal }))
+      .rejects.toThrow("certification aborted by test");
+  });
+
+  // Drives runLocalCertification through its fault phases with fake machine agents. The fake
+  // container runner answers an exec in a machine from the env file that machine was created
+  // with: the clearance probe connects with the file's LCM_POSTGRES_RUNTIME_URL, and any other
+  // command (such as `lcm doctor`) connects with its LCM_POSTGRES_URL, the transfer role that
+  // setup revoked, and fails the way certifying run 1 did.
+  async function runLocalFaultPath(variant: { profile: "full" | "smoke"; withFaults?: boolean; clearanceFailures?: number; identity?: Record<string, unknown> }) {
+    const root = mkdtempSync(join(tmpdir(), "lcm-cert-local-faults-"));
+    const evidenceDirectory = join(root, "evidence");
+    const harnessDirectory = join(root, "harness");
+    mkdirSync(harnessDirectory);
+    const caFile = join(root, "ca.crt");
+    writeFileSync(caFile, "certificate", { mode: 0o600 });
+    const { contract } = loadCertificationContract(new URL("./contract-v3.json", import.meta.url));
+    const names = createRunNames("a".repeat(32));
+    const hostUrl = (role: string) => `postgresql://${role}:${role}-secret@127.0.0.1:15432/${names.controlDatabase}`;
+    const networkUrl = (role: string) => `postgresql://${role}:${role}-secret@${names.alias}:5432/${names.controlDatabase}`;
+    const transferRole = "lcm_cert_transfer_aaaaaaaaaaaaaaaa";
+    const calls: string[][] = [];
+    const environmentFiles = new Map<string, Record<string, string>>();
+    const agents: Promise<unknown>[] = [];
+    const faults = variant.profile === "full" || variant.withFaults === true;
+    let clearanceFailures = variant.clearanceFailures ?? 0;
+    let agentsStopped = false;
+    const agentDelay = async () => {
+      if (agentsStopped) throw new Error("fake agent stopped");
+      await fastDelay();
+    };
+    const fakeAgent = async (machine: "a" | "b") => {
+      const directory = join(evidenceDirectory, `machine-${machine}`);
+      const wait = (file: string) => waitForControl(join(directory, file), { deadlineMs: Date.now() + 10_000, delay: agentDelay });
+      const write = (file: string) => writeFileSync(join(directory, file), `${JSON.stringify({ machine, at: new Date().toISOString() })}\n`, { mode: 0o600, flag: "wx" });
+      await wait("migration-start.json");
+      write("verification-receipt.json");
+      await wait("activation-start.json");
+      write("activation-receipt.json");
+      await wait("runtime-ready.json");
+      write("daemon-started.json");
+      const home = join(harnessDirectory, `machine-${machine}-home-parent`, "home");
+      mkdirSync(join(home, ".lcm"), { recursive: true });
+      writeFileSync(join(home, ".lcm", "machine.json"), JSON.stringify({
+        machineId: `018f0000-0000-7000-8000-00000000000${machine === "a" ? 1 : 2}`, identityKey: `machine:${machine.repeat(64)}`,
+      }));
+      write("ready.json");
+      await wait("warmup-control.json");
+      write("warmup-complete.json");
+      await wait("phase-control.json");
+      write("steady-complete.json");
+      write("fault-ready.json");
+      if (faults) {
+        await wait("partition-cleared.json");
+        write("partition-recovered.json");
+        write("restart-ready.json");
+        await wait("restart-cleared.json");
+        write("restart-recovered.json");
+      }
+      write("drain.json");
+      await wait("clock-finished.json");
+    };
+    const processRunner = vi.fn(async (_command: string, args: string[]) => {
+      calls.push(args);
+      const [kind, action, target] = args;
+      if (kind === "container" && action === "create") {
+        const lines = readFileSync(args[args.indexOf("--env-file") + 1], "utf8").trim().split("\n");
+        environmentFiles.set(args[args.indexOf("--name") + 1], Object.fromEntries(lines.map((line) => [line.slice(0, line.indexOf("=")), line.slice(line.indexOf("=") + 1)])));
+      }
+      if (kind === "container" && action === "start" && (target === names.machineA || target === names.machineB)) {
+        agents.push(fakeAgent(target === names.machineA ? "a" : "b").catch((error: unknown) => error));
+      }
+      if (kind === "container" && action === "inspect") return { stdout: JSON.stringify({ Running: true }), stderr: "" };
+      if (kind === "container" && action === "exec") {
+        if (args.at(-1)?.includes("/stats/pool")) return { stdout: JSON.stringify({ backend: "postgresql", pool: { status: "ready", configuredMax: 2 } }), stderr: "" };
+        const environment = environmentFiles.get(target) ?? {};
+        if (JSON.stringify(args) === JSON.stringify(machineDatabaseClearanceArgs(target))) {
+          if (clearanceFailures > 0) {
+            clearanceFailures -= 1;
+            throw new Error("the database system is starting up");
+          }
+          const url = new URL(environment.LCM_POSTGRES_RUNTIME_URL);
+          return {
+            stdout: JSON.stringify({ ...identityRow({ server_port: Number(url.port), database_name: url.pathname.slice(1), role_name: decodeURIComponent(url.username) }), ...variant.identity }),
+            stderr: "",
+          };
+        }
+        throw new Error(`permission denied for schema lcm (role ${decodeURIComponent(new URL(environment.LCM_POSTGRES_URL).username)})`);
+      }
+      return { stdout: "", stderr: "" };
+    });
+    const collectReadiness = vi.fn(async () => ({ serverVersionNum: 180004 }));
+    const approval = { contractSha256: "a".repeat(64), approvedBy: "owner", approvedAt: "2026-10-26T10:00:00Z", note: "recorded", approvalRef: "issue #629" };
+    let error: unknown;
+    try {
+      await runLocalCertification({
+        evidenceDirectory, profile: variant.profile, ...(variant.withFaults ? { withFaults: true } : {}),
+        contract, contractSha256: "a".repeat(64), approval, approvalSha256: "b".repeat(64),
+      }, {
+        environment: { LCM_TEST_CONTAINER_CLI: "podman" },
+        runHarness: async ({ runTests }: any) => runTests({
+          runId: "a".repeat(32),
+          names,
+          directory: harnessDirectory,
+          environment: {
+            LCM_TEST_POSTGRES_ADMIN_URL: hostUrl("lcm_harness_admin"),
+            LCM_TEST_POSTGRES_MIGRATOR_URL: hostUrl("lcm_test_migrator"),
+            LCM_TEST_POSTGRES_RUNTIME_URL: hostUrl("lcm_test_runtime"),
+            LCM_TEST_POSTGRES_CA_FILE: caFile,
+            LCM_TEST_POSTGRES_WRONG_CA_FILE: caFile,
+          },
+          inNetworkEnvironment: {
+            LCM_TEST_POSTGRES_ADMIN_URL: networkUrl("lcm_harness_admin"),
+            LCM_TEST_POSTGRES_RUNTIME_URL: networkUrl("lcm_test_runtime"),
+          },
+          owner: { pid: 1, birth: "birth", scope: "scope" },
+          containerCli: "podman",
+          processRunner,
+          secrets: ["lcm_harness_admin-secret", "lcm_test_migrator-secret", "lcm_test_runtime-secret", `${transferRole}-secret`],
+        }),
+        stagePackage: () => ({ root: join(root, "package"), sha256: "b".repeat(64) }),
+        captureExecutionProvenance: () => ({ dirty: false }),
+        prepareDatabase: async () => ({ transferName: transferRole, transferUrl: hostUrl(transferRole) }),
+        collectResidualState: async () => ({ observedAt: new Date().toISOString(), residual: { machines: 0, projects: 0, conversations: 0, passive_events: 0 }, residualEmpty: true }),
+        grantRuntime: async () => ({ granted: true }),
+        revokeTransfer: async () => ({ revoked: true }),
+        verifyRuntime: async () => undefined,
+        collectReadiness,
+        collectSetupSessionClosure: async () => ({ observedAt: new Date().toISOString(), roles: { migrator: 0, transfer: 0 }, totalConnections: 0, setupSessionsClosed: true }),
+        startClockMonitor: async () => ({ stop: async () => [] }),
+        collectRelationBytes: async () => 0,
+        monitorMachineDelay: async () => undefined,
+        delay: fastDelay,
+      });
+    } catch (caught) {
+      error = caught;
+      agentsStopped = true;
+    }
+    await Promise.all(agents);
+    const clearances = calls.filter((args) => args[0] === "container" && args[1] === "exec" && !args.at(-1)?.includes("/stats/pool"));
+    return { error, calls, clearances, environmentFiles, collectReadiness, names, evidenceDirectory, hostUrl, networkUrl };
+  }
+
+  it.each([
+    ["the full profile", { profile: "full" as const }],
+    ["a fault smoke", { profile: "smoke" as const, withFaults: true }],
+  ])("clears both local faults with the runtime-role probe inside machine A in %s", async (_label, variant) => {
+    const run = await runLocalFaultPath(variant);
+    expect(run.error).toBeUndefined();
+    const probe = machineDatabaseClearanceArgs(run.names.machineA);
+    expect(run.clearances).toEqual([probe, probe]);
+    const probeAt = run.calls.flatMap((args, index) => JSON.stringify(args) === JSON.stringify(probe) ? [index] : []);
+    expect(probeAt[0]).toBe(run.calls.findIndex((args) => args[0] === "network" && args[1] === "connect" && args[3] === run.names.machineA) + 1);
+    expect(probeAt[1]).toBe(run.calls.findIndex((args) => args[0] === "container" && args[1] === "start" && args[2] === run.names.container) + 1);
+    // The probe runs in machine A's container environment: the env file it was created with.
+    const createA = run.calls.find((args) => args[0] === "container" && args[1] === "create" && args.includes(run.names.machineA));
+    expect(createA).toEqual(expect.arrayContaining(["--env-file"]));
+    expect(run.environmentFiles.get(run.names.machineA)).toMatchObject({
+      HOME: "/home/lcm-parent/home",
+      LCM_POSTGRES_RUNTIME_URL: run.networkUrl("lcm_test_runtime"),
+      LCM_POSTGRES_CA_FILE: "/run/lcm-ca/ca.crt",
+    });
+    expect(run.calls.flat().join("\n")).not.toMatch(/postgresql:\/\/|-secret/u);
+    const runtimeReadiness = expect.objectContaining({
+      url: run.hostUrl("lcm_test_runtime"), expectedVersionNum: 180004, expectedDatabase: run.names.controlDatabase,
+      expectedPort: 5432, expectedRole: "lcm_test_runtime", requireResidualEmpty: false,
+    });
+    expect(run.collectReadiness).toHaveBeenCalledTimes(3);
+    expect(run.collectReadiness).toHaveBeenNthCalledWith(2, runtimeReadiness);
+    expect(run.collectReadiness).toHaveBeenNthCalledWith(3, runtimeReadiness);
+    const faults = JSON.parse(readFileSync(join(run.evidenceDirectory, "faults.json"), "utf8"));
+    expect(faults.map((fault: { id: string }) => fault.id)).toEqual(["partition-a", "restart-database"]);
+    expect(JSON.parse(readFileSync(join(run.evidenceDirectory, "cleanup.json"), "utf8")).verdict).toBe("pass");
+    expect(JSON.parse(readFileSync(join(run.evidenceDirectory, "run.json"), "utf8")).withFaults).toBe(variant.withFaults);
+    for (const name of [run.names.machineA, run.names.machineB]) {
+      expect(run.environmentFiles.get(name)?.LCM_CERT_WITH_FAULTS).toBe(variant.withFaults ? "1" : undefined);
+    }
+  });
+
+  it("retries machine A's probe while the database is not yet accepting connections", async () => {
+    const run = await runLocalFaultPath({ profile: "full", clearanceFailures: 2 });
+    expect(run.error).toBeUndefined();
+    expect(run.clearances).toHaveLength(4);
+  });
+
+  it("aborts before clearing the partition when machine A reaches another database", async () => {
+    const run = await runLocalFaultPath({ profile: "full", identity: { database_name: "lcm_harness_other" } });
+    expect(String(run.error)).toContain("database clearance failed");
+    expect(run.clearances).toHaveLength(1);
+    expect(existsSync(join(run.evidenceDirectory, "machine-a", "partition-cleared.json"))).toBe(false);
+    expect(JSON.parse(readFileSync(join(run.evidenceDirectory, "cleanup.json"), "utf8")).verdict).toBe("incomplete");
+  });
+
+  it("injects no fault and runs no probe in a plain smoke", async () => {
+    const run = await runLocalFaultPath({ profile: "smoke" });
+    expect(run.error).toBeUndefined();
+    expect(run.clearances).toEqual([]);
+    expect(run.calls.some((args) => args[0] === "network" && args[1] === "disconnect")).toBe(false);
+    expect(existsSync(join(run.evidenceDirectory, "faults.json"))).toBe(false);
+    expect(run.environmentFiles.get(run.names.machineA)?.LCM_CERT_WITH_FAULTS).toBeUndefined();
   });
 });

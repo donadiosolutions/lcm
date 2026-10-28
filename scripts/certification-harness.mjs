@@ -145,6 +145,60 @@ export const DATABASE_IDENTITY_SQL = `SELECT current_setting('server_version_num
   role.rolsuper, role.rolcreaterole, role.rolcreatedb
   FROM pg_catalog.pg_roles AS role WHERE role.rolname OPERATOR(pg_catalog.=) CURRENT_USER`;
 
+// The identity and least-privilege predicate of the database readiness probe: the run's
+// own database, port and role on the expected server version, with no superuser,
+// CREATEROLE or CREATEDB attribute.
+export function assertDatabaseIdentity(identity, { expectedVersionNum, expectedMajor = 18, expectedDatabase, expectedPort, expectedRole }) {
+  if (!identity || Math.floor(identity.server_version_num / 10_000) !== expectedMajor
+    || (expectedVersionNum !== undefined && identity.server_version_num !== expectedVersionNum)
+    || (expectedDatabase !== undefined && identity.database_name !== expectedDatabase)
+    || (expectedPort !== undefined && identity.server_port !== expectedPort)
+    || (expectedRole !== undefined && identity.role_name !== expectedRole)
+    || identity.rolsuper || identity.rolcreaterole || identity.rolcreatedb) {
+    throw new Error("certification database identity or least-privilege readiness failed");
+  }
+  return identity;
+}
+
+// Fault clearance probe, run inside machine A: a fresh SQL/TLS connection with the
+// runtime role to the run's own database. It uses the environment the machine agent runs
+// with after runtime-ready: the container's env file supplies LCM_POSTGRES_RUNTIME_URL and
+// LCM_POSTGRES_CA_FILE, which the script reads by name, so no credential reaches argv or
+// logs. `lcm doctor` cannot serve as this probe: an exec session sees the env file's
+// LCM_POSTGRES_URL, the transfer role revoked before steady state (the agent switches to
+// the runtime URL only inside its own process), and doctor exits 1 in every machine
+// because the claude and codex summarizer CLIs are not installed there.
+export const MACHINE_DATABASE_CLEARANCE_SCRIPT = `const { readFileSync } = await import("node:fs");
+const { createRequire } = await import("node:module");
+const { Client } = createRequire("/opt/lcm/package.json")("pg");
+const client = new Client({ connectionString: process.env.LCM_POSTGRES_RUNTIME_URL, ssl: { ca: readFileSync(process.env.LCM_POSTGRES_CA_FILE, "utf8"), rejectUnauthorized: true }, connectionTimeoutMillis: 30000, statement_timeout: 30000 });
+await client.connect();
+try {
+  process.stdout.write(JSON.stringify((await client.query(${JSON.stringify(DATABASE_IDENTITY_SQL)})).rows[0]));
+} finally {
+  await client.end();
+}`;
+
+export function machineDatabaseClearanceArgs(name) {
+  return ["container", "exec", name, "node", "--input-type=module", "-e", MACHINE_DATABASE_CLEARANCE_SCRIPT];
+}
+
+// Retries the probe once per second within the fault phase's bound, because PostgreSQL
+// accepts connections only shortly after its container starts again. A connection that
+// reaches another database, port or role fails at once.
+export async function waitForMachineDatabaseClearance({ name, run, expected, timeoutMs, delay, signal }) {
+  let identity;
+  await poll(async () => {
+    const result = await run(machineDatabaseClearanceArgs(name)).catch(() => undefined);
+    if (result === undefined) return false;
+    identity = assertDatabaseIdentity(JSON.parse(result.stdout.trim()), expected);
+    return true;
+  }, { timeoutMs, delay, signal }).catch((error) => {
+    throw signal?.aborted ? error : new Error(`certification machine ${name} database clearance failed: ${error.message}`, { cause: error });
+  });
+  return identity;
+}
+
 export function phaseDeadlineMs(contract, profile, phase) {
   const timeline = contract.timeline[profile];
   const seconds = profile === "smoke"
@@ -182,11 +236,19 @@ export function parseCertificationArguments(argv) {
     ? argv
     : [...argv.slice(0, separator), ...argv.slice(separator + 1)];
   const values = new Map();
-  for (let index = 0; index < argumentsWithoutSeparator.length; index += 2) {
+  let withFaults = false;
+  for (let index = 0; index < argumentsWithoutSeparator.length;) {
     const option = argumentsWithoutSeparator[index];
+    // --with-faults is the only option without a value.
+    if (option === "--with-faults") {
+      withFaults = true;
+      index += 1;
+      continue;
+    }
     const value = argumentsWithoutSeparator[index + 1];
     if (!option?.startsWith("--") || value === undefined) throw new Error("invalid certification arguments");
     values.set(option, value);
+    index += 2;
   }
   const lane = values.get("--lane");
   const profile = values.get("--profile");
@@ -194,7 +256,11 @@ export function parseCertificationArguments(argv) {
   if (!['local', 'managed'].includes(lane)) throw new Error("certification lane must be local or managed");
   if (!['smoke', 'full'].includes(profile)) throw new Error("certification profile must be smoke or full");
   if (!evidenceDirectory || !isAbsolute(evidenceDirectory)) throw new Error("certification evidence directory must be absolute");
-  return { lane, profile, evidenceDirectory };
+  // A non-certifying fault smoke: the smoke workload plus the local lane's contract faults.
+  if (withFaults && (lane !== "local" || profile !== "smoke")) {
+    throw new Error("certification --with-faults requires the local lane and the smoke profile");
+  }
+  return { lane, profile, evidenceDirectory, ...(withFaults ? { withFaults: true } : {}) };
 }
 export function buildMachineContainerArgs(input) {
   if (!['a', 'b'].includes(input.machine)) throw new Error("invalid certification machine");
@@ -630,14 +696,20 @@ export async function runManagedMachinePair(input, dependencies = {}) {
       const appliedAt = new Date().toISOString();
       await Promise.race([monitorDelay([names.machineA, names.machineB], 60_000), aborted(input.signal)]);
       await run(["network", "connect", network, names.machineA]);
-      await run(["container", "exec", names.machineA, "node", "/opt/lcm/dist/lcm.mjs", "doctor", "--verbose"]);
-      await (dependencies.collectReadiness ?? collectDatabaseReadiness)({
-        url: input.privateConnection.runtimeUrl,
-        ca: input.privateConnection.ca,
+      const runtimeIdentity = {
         expectedMajor: 18,
         expectedDatabase: input.privateConnection.databaseName,
         expectedPort: input.cluster.port,
         expectedRole: input.privateConnection.runtimeName,
+      };
+      await waitForMachineDatabaseClearance({
+        name: names.machineA, run, expected: runtimeIdentity,
+        timeoutMs: phaseDeadlineMs(contract, "full", "partition"), delay, signal: input.signal,
+      });
+      await (dependencies.collectReadiness ?? collectDatabaseReadiness)({
+        url: input.privateConnection.runtimeUrl,
+        ca: input.privateConnection.ca,
+        ...runtimeIdentity,
         requireResidualEmpty: false,
       });
       const clearedAt = new Date().toISOString();
@@ -863,15 +935,9 @@ export async function collectDatabaseReadiness({ url, ca, expectedVersionNum, ex
   const client = clientFactory?.() ?? new Client({ connectionString: url, ssl: { ca, rejectUnauthorized: true }, connectionTimeoutMillis: 30_000, statement_timeout: 30_000 });
   await client.connect();
   try {
-    const identity = (await client.query(DATABASE_IDENTITY_SQL)).rows[0];
-    if (!identity || Math.floor(identity.server_version_num / 10_000) !== expectedMajor
-      || (expectedVersionNum !== undefined && identity.server_version_num !== expectedVersionNum)
-      || (expectedDatabase !== undefined && identity.database_name !== expectedDatabase)
-      || (expectedPort !== undefined && identity.server_port !== expectedPort)
-      || (expectedRole !== undefined && identity.role_name !== expectedRole)
-      || identity.rolsuper || identity.rolcreaterole || identity.rolcreatedb) {
-      throw new Error("certification database identity or least-privilege readiness failed");
-    }
+    const identity = assertDatabaseIdentity((await client.query(DATABASE_IDENTITY_SQL)).rows[0], {
+      expectedVersionNum, expectedMajor, expectedDatabase, expectedPort, expectedRole,
+    });
     const extensions = (await client.query(`SELECT extension.extname::text AS name, namespace.nspname::text AS schema
       FROM pg_catalog.pg_extension AS extension
       JOIN pg_catalog.pg_namespace AS namespace ON namespace.oid OPERATOR(pg_catalog.=) extension.extnamespace
@@ -1167,11 +1233,15 @@ export async function runLocalCertification(options, dependencies = {}) {
   prepareEvidenceDirectory(options.evidenceDirectory, {
     lane: "local",
     profile: options.profile,
+    ...(options.withFaults === true ? { withFaults: true } : {}),
     contractSha256: options.contractSha256,
     approval: options.approval,
     approvalSha256: options.approvalSha256,
     startedAt: new Date().toISOString(),
   });
+  // The full profile always injects the lane's faults; a smoke run does so only when the
+  // non-certifying --with-faults option asks for it.
+  const faultsEnabled = options.profile === "full" || options.withFaults === true;
   const executeHarness = dependencies.runHarness ?? runHarness;
   let result;
   try {
@@ -1241,6 +1311,7 @@ export async function runLocalCertification(options, dependencies = {}) {
             LCM_CERT_WRONG_HOST_URL: urlAtHost(context.inNetworkEnvironment.LCM_TEST_POSTGRES_RUNTIME_URL, context.names.wrongAlias),
             LCM_CERT_EVIDENCE_DIR: "/evidence",
             LCM_CERT_PROFILE: options.profile,
+            ...(options.withFaults === true ? { LCM_CERT_WITH_FAULTS: "1" } : {}),
             LCM_CERT_LANE: "local",
             LCM_CERT_RUN_ID: context.runId,
           });
@@ -1408,25 +1479,33 @@ export async function runLocalCertification(options, dependencies = {}) {
           ca: readFileSync(context.environment.LCM_TEST_POSTGRES_CA_FILE, "utf8"),
         });
         writeFileSync(join(options.evidenceDirectory, "database-growth.json"), `${JSON.stringify({ beforeBytes: growthBefore, afterBytes: growthAfter, deltaBytes: growthAfter - growthBefore })}\n`, { mode: 0o600, flag: "wx" });
-        if (options.profile === "full") {
+        if (faultsEnabled) {
           await waitForFiles(
             ['a', 'b'].map((machine) => join(options.evidenceDirectory, `machine-${machine}`, "fault-ready.json")),
             [context.names.machineA, context.names.machineB],
             phaseDeadlineMs(contract, options.profile, "fault-ready"),
           );
+          const runtimeIdentity = {
+            expectedVersionNum: 180004,
+            expectedDatabase: context.names.controlDatabase,
+            expectedPort: 5432,
+            expectedRole: "lcm_test_runtime",
+          };
+          // Every fault phase uses the full profile's bound, including in a fault smoke.
+          const clearMachineA = (phase) => waitForMachineDatabaseClearance({
+            name: context.names.machineA, run: runContainer, expected: runtimeIdentity,
+            timeoutMs: phaseDeadlineMs(contract, "full", phase), delay: dependencies.delay,
+          });
           const partitionRequestedAt = new Date().toISOString();
           await context.processRunner(context.containerCli, ["network", "disconnect", context.names.network, context.names.machineA], { redactSecrets: context.secrets });
           const partitionAppliedAt = new Date().toISOString();
           await monitorDelay([context.names.machineA, context.names.machineB], 60_000);
           await context.processRunner(context.containerCli, ["network", "connect", context.names.network, context.names.machineA], { redactSecrets: context.secrets });
-          await context.processRunner(context.containerCli, ["container", "exec", context.names.machineA, "node", "/opt/lcm/dist/lcm.mjs", "doctor", "--verbose"], { redactSecrets: context.secrets });
+          await clearMachineA("partition");
           await (dependencies.collectReadiness ?? collectDatabaseReadiness)({
             url: context.environment.LCM_TEST_POSTGRES_RUNTIME_URL,
             ca: readFileSync(context.environment.LCM_TEST_POSTGRES_CA_FILE, "utf8"),
-            expectedVersionNum: 180004,
-            expectedDatabase: context.names.controlDatabase,
-            expectedPort: 5432,
-            expectedRole: "lcm_test_runtime",
+            ...runtimeIdentity,
             requireResidualEmpty: false,
           });
           const partitionClearedAt = new Date().toISOString();
@@ -1437,21 +1516,18 @@ export async function runLocalCertification(options, dependencies = {}) {
           await waitForFiles(
             ['a', 'b'].map((machine) => join(options.evidenceDirectory, `machine-${machine}`, "restart-ready.json")),
             [context.names.machineA, context.names.machineB],
-            phaseDeadlineMs(contract, options.profile, "partition"),
+            phaseDeadlineMs(contract, "full", "partition"),
           );
           const partitionRecoveredAt = new Date().toISOString();
           const restartRequestedAt = new Date().toISOString();
           await context.processRunner(context.containerCli, ["container", "stop", "--time", "120", context.names.container], { redactSecrets: context.secrets });
           const restartAppliedAt = new Date().toISOString();
           await context.processRunner(context.containerCli, ["container", "start", context.names.container], { redactSecrets: context.secrets });
-          await context.processRunner(context.containerCli, ["container", "exec", context.names.machineA, "node", "/opt/lcm/dist/lcm.mjs", "doctor", "--verbose"], { redactSecrets: context.secrets });
+          await clearMachineA("restart");
           await (dependencies.collectReadiness ?? collectDatabaseReadiness)({
             url: context.environment.LCM_TEST_POSTGRES_RUNTIME_URL,
             ca: readFileSync(context.environment.LCM_TEST_POSTGRES_CA_FILE, "utf8"),
-            expectedVersionNum: 180004,
-            expectedDatabase: context.names.controlDatabase,
-            expectedPort: 5432,
-            expectedRole: "lcm_test_runtime",
+            ...runtimeIdentity,
             requireResidualEmpty: false,
           });
           const restartClearedAt = new Date().toISOString();
@@ -1462,7 +1538,7 @@ export async function runLocalCertification(options, dependencies = {}) {
           await waitForFiles(
             ['a', 'b'].map((machine) => join(options.evidenceDirectory, `machine-${machine}`, "restart-recovered.json")),
             [context.names.machineA, context.names.machineB],
-            phaseDeadlineMs(contract, options.profile, "restart"),
+            phaseDeadlineMs(contract, "full", "restart"),
           );
           const restartRecoveredAt = new Date().toISOString();
           writeFileSync(join(options.evidenceDirectory, "faults.json"), `${JSON.stringify([
@@ -1517,7 +1593,11 @@ export async function main(argv = process.argv.slice(2)) {
   options.approval = loaded.approval;
   options.approvalSha256 = loaded.approvalSha256;
   if (options.lane === "local") {
-    const deadlineSeconds = options.profile === "full" ? 10_800 : 1_800;
+    // A fault smoke adds the full profile's partition and restart phase bounds to the
+    // smoke deadline.
+    const { partitionPhaseMaxSeconds, restartPhaseMaxSeconds } = loaded.contract.timeline.full;
+    const deadlineSeconds = options.profile === "full" ? 10_800
+      : 1_800 + (options.withFaults === true ? partitionPhaseMaxSeconds + restartPhaseMaxSeconds : 0);
     const deadline = setTimeout(() => process.kill(process.pid, "SIGTERM"), deadlineSeconds * 1000);
     deadline.unref?.();
     try { return await runLocalCertification(options); }

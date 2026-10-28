@@ -51,6 +51,23 @@ migration, and observability drills belong to their separate certification issue
 warmup, 120-second steady phase, and 660-second drain with no faults. It must not
 be reported as a production percentile result. `full` runs the frozen 6000-second
 steady schedule, fault phases, recovery checks, and final 900-second drain.
+
+A local smoke run can also inject the lane's two faults with `--with-faults`. This
+fault smoke runs the smoke workload, then the machine-A partition and the database
+restart under the full profile's fault-phase bounds, then the 660-second smoke
+drain. `run.json` and the gate record `withFaults: true`. The gate checks the
+recorded faults against the lane's contract fault set and scores their recovery,
+but the run stays non-certifying because only the full profile certifies. The
+option is refused with the full profile and with the managed lane.
+
+The coordinator clears a fault only after two checks pass. First, a fresh SQL/TLS
+connection from inside machine A must reach the run's own database, port, and
+runtime role. It runs in machine A's container environment, with the runtime URL
+and CA read from the machine's environment file, so no credential appears in a
+command line. Second, a host-side readiness check must confirm the same identity.
+The in-machine check retries once per second within the fault phase's bound,
+because PostgreSQL accepts connections only shortly after it restarts.
+
 For both profiles, the coordinator starts warmup only after both machines are
 ready, waits for both warmup-complete witnesses, and then publishes one shared
 steady-state T0. The database-growth baseline is collected after that barrier and
@@ -98,10 +115,21 @@ LCM_TEST_CONTAINER_CLI=podman \
   --evidence-dir /absolute/private/lcm-certification/local
 ```
 
-The local whole-run deadline is 10,800 seconds. The harness creates and labels the
-database, network, volume, and two machine containers under one run identity. The
-enclosing PostgreSQL harness owns machine-container teardown and verifies that
-all owned resources and private roots are gone after the test exits.
+The local whole-run deadline is 10,800 seconds for the full profile and 1,800
+seconds for a smoke. A fault smoke adds the full profile's 1,080-second partition
+and 1,140-second restart phase bounds, for 4,020 seconds:
+
+```bash
+LCM_TEST_CONTAINER_CLI=podman \
+  pnpm run test:certification:local -- \
+  --profile smoke --with-faults \
+  --evidence-dir /absolute/private/lcm-certification/fault-smoke
+```
+
+The harness creates and labels the database, network, volume, and two machine
+containers under one run identity. The enclosing PostgreSQL harness owns
+machine-container teardown and verifies that all owned resources and private roots
+are gone after the test exits.
 
 ## Run the managed lane
 
