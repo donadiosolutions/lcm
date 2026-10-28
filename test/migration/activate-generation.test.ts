@@ -1473,6 +1473,7 @@ describe("runMigrationActivation: classification refusals and interruptions", ()
     await expect(j.run({ publishArtifact: () => { throw new RangeError("raw"); } })).rejects.toBeInstanceOf(RangeError);
   });
 
+  // Ten sequential activation fixtures: CI max 2.8 s over 22 runs; one run timed out at 5.3 s. 15 s is this directory's per-test budget.
   it("S11 evidence interruptions: refusals and binding errors from the evidence and binding seams", async () => {
     const f = await fixture();
     f.evidence.failNext = "epoch";
@@ -1497,7 +1498,7 @@ describe("runMigrationActivation: classification refusals and interruptions", ()
     expect(await l.run({ bindings: { ...l.bindings, recordMigrationWitnessBinding: () => { throw namedError("MigrationBindingUnresolvableError"); } } })).toMatchObject({ status: "interrupted", step: "S11", cause: "binding-unresolvable" });
     const m = await fixture();
     await expect(m.run({ bindings: { ...m.bindings, recordMigrationWitnessBinding: () => { throw new RangeError("raw"); } } })).rejects.toBeInstanceOf(RangeError);
-  });
+  }, 15000);
 
   it("S13a binding interruptions", async () => {
     const f = await fixture();

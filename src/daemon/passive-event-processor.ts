@@ -181,9 +181,7 @@ export class PassiveEventProcessor {
     if (this.stopped) return;
     this.scheduleSweep(0);
     this.sweepInterval = this.setRepeating(() => {
-      void this.runSweep().catch(async error => {
-        await this.logError("passive-event-processor", error, {});
-      });
+      void this.runSweep().catch(error => this.reportBackgroundFailure(error, {}));
     }, this.defaults.sweepIntervalMs);
     this.unref(this.sweepInterval);
   }
@@ -386,9 +384,7 @@ export class PassiveEventProcessor {
     this.followUpDeferred = deferred;
     this.followUpTimer = this.setTimer(() => {
       this.followUpTimer = null;
-      void this.runReplicationFollowUp().catch(async error => {
-        await this.logError("passive-event-processor", error, {});
-      });
+      void this.runReplicationFollowUp().catch(error => this.reportBackgroundFailure(error, {}));
     }, delayMs);
     this.unref(this.followUpTimer);
   }
@@ -425,9 +421,7 @@ export class PassiveEventProcessor {
     const timer = this.setTimer(() => {
       this.debounceTimers.delete(cwd);
       this.debounceDeadlines.delete(cwd);
-      void this.drainQueuedProjects().catch(async error => {
-        await this.logError("passive-event-processor", error, { cwd });
-      });
+      void this.drainQueuedProjects().catch(error => this.reportBackgroundFailure(error, { cwd }));
     }, delayMs);
     this.unref(timer);
     this.debounceTimers.set(cwd, timer);
@@ -438,11 +432,18 @@ export class PassiveEventProcessor {
     if (this.sweepTimer) this.clearTimer(this.sweepTimer);
     this.sweepTimer = this.setTimer(() => {
       this.sweepTimer = null;
-      void this.runSweep().catch(async error => {
-        await this.logError("passive-event-processor", error, {});
-      });
+      void this.runSweep().catch(error => this.reportBackgroundFailure(error, {}));
     }, delayMs);
     this.unref(this.sweepTimer);
+  }
+
+  /** A background timer has no caller, so a failing diagnostic logger is contained here. */
+  private async reportBackgroundFailure(error: unknown, opts: { cwd?: string }): Promise<void> {
+    try {
+      await this.logError("passive-event-processor", error, opts);
+    } catch {
+      // Last-resort diagnostic; its failure must not escape the timer.
+    }
   }
 
   private async drainQueuedProjects(): Promise<void> {
