@@ -26,9 +26,12 @@ import {
   migrationGenerationBindingStoreDirectory,
   migrationSelectionBindingPath,
   migrationWitnessBindingPath,
+  generationScopedDirectory,
+  readGenerationScopedFiles,
   recordMigrationSelectionBinding,
   recordMigrationWitnessBinding,
   resolveMigrationWitnessBindings,
+  type GenerationScopedStore,
   type MigrationSelectionBinding,
   type MigrationWitnessBinding,
   type ReadGenerationScopedFilesDependencies,
@@ -2430,3 +2433,58 @@ describe("writer cleanup of identical lone scratch (A19)", () => {
   });
 });
 
+
+describe("readGenerationScopedFiles: pending writes (#1769)", () => {
+  const store: GenerationScopedStore = {
+    subdirectory: "pending-test",
+    noun: "pending test record",
+    maxFileBytes: 4096,
+    isFinalFileName: (name) => /^rec-[0-9]\.json$/u.test(name),
+  };
+  function seeded(): { homeDir: string; directory: string } {
+    const homeDir = home();
+    const directory = generationScopedDirectory(store, homeDir, GENERATION_ID);
+    mkdirSync(directory, { recursive: true, mode: 0o700 });
+    return { homeDir, directory };
+  }
+  const plantFile = (directory: string, name: string, content: string): void =>
+    writeFileSync(join(directory, name), content, { mode: 0o600 });
+  const scan = (homeDir: string, pending?: readonly { fileName: string; content: string }[]) =>
+    readGenerationScopedFiles(store, { homeDir, generationId: GENERATION_ID }, {}, pending);
+
+  it("refuses a lone scratch of a missing final by default and ignores it only when it equals the pending bytes", () => {
+    const { homeDir, directory } = seeded();
+    plantFile(directory, ".rec-1.json.0123abcd.tmp", "mine");
+    expect(scan(homeDir)).toMatchObject({ kind: "unresolvable" });
+    expect(scan(homeDir, [])).toMatchObject({ kind: "unresolvable" });
+    expect(scan(homeDir, [{ fileName: "rec-1.json", content: "other" }])).toMatchObject({ kind: "unresolvable" });
+    expect(scan(homeDir, [{ fileName: "rec-2.json", content: "mine" }])).toMatchObject({ kind: "unresolvable" });
+    expect(scan(homeDir, [{ fileName: "rec-1.json", content: "mine" }])).toEqual({ kind: "absent" });
+  });
+
+  it("never returns a pending record among the published files", () => {
+    const { homeDir, directory } = seeded();
+    plantFile(directory, "rec-2.json", "published");
+    plantFile(directory, ".rec-1.json.0123abcd.tmp", "mine");
+    expect(scan(homeDir, [{ fileName: "rec-1.json", content: "mine" }])).toEqual({
+      kind: "present", files: [{ name: "rec-2.json", content: "published" }],
+    });
+  });
+
+  it("compares only with the published bytes once the final exists", () => {
+    const { homeDir, directory } = seeded();
+    plantFile(directory, "rec-1.json", "published");
+    plantFile(directory, ".rec-1.json.0123abcd.tmp", "mine");
+    expect(scan(homeDir, [{ fileName: "rec-1.json", content: "mine" }])).toMatchObject({ kind: "unresolvable" });
+    rmSync(join(directory, ".rec-1.json.0123abcd.tmp"));
+    plantFile(directory, ".rec-1.json.0123abcd.tmp", "published");
+    expect(scan(homeDir, [{ fileName: "rec-1.json", content: "mine" }])).toMatchObject({ kind: "present" });
+  });
+
+  it("still authenticates the pending scratch: a wrong mode is refused", () => {
+    const { homeDir, directory } = seeded();
+    plantFile(directory, ".rec-1.json.0123abcd.tmp", "mine");
+    chmodSync(join(directory, ".rec-1.json.0123abcd.tmp"), 0o644);
+    expect(scan(homeDir, [{ fileName: "rec-1.json", content: "mine" }])).toMatchObject({ kind: "unresolvable" });
+  });
+});

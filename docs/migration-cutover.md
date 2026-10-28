@@ -433,6 +433,14 @@ that evidence in a fixed order:
    binding is derived from.
 3. The coordinator then publishes the backend publication durably.
 
+An activation interrupted while it was writing one of these records, the
+attempt or the witness, leaves a partial private file next to the others.
+Running the same activation again finishes the write: it publishes the
+record, removes the partial file, and continues. This applies only when the
+partial file holds exactly the bytes the activation is about to write. Any
+other leftover in the evidence directory is refused as unresolvable, and
+nothing is written until it has been inspected.
+
 A crash while the publication is in flight leaves an activation that has to
 be resumed or aborted before anything else; rollback refuses to start over
 it. A completed publication without a recorded selection binding means

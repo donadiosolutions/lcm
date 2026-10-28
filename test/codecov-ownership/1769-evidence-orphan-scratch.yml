@@ -1,0 +1,12 @@
+references: ["#1769"]
+rationale: >-
+  #1769 lets the activation evidence attempt and witness writers finish an
+  interrupted first write of their own record. The change touches the shared
+  scoped-directory scan, the evidence store and the two activation chains that
+  call it, all of which stay in the migration cutover owner; no file is added,
+  moved or re-owned.
+pins:
+  - ["src/migration/generation-binding-store.ts", "unit-migration-cutover"]
+  - ["src/migration/activation-evidence-store.ts", "unit-migration-cutover"]
+  - ["src/migration/activate-generation.ts", "unit-migration-cutover"]
+  - ["src/migration/cutover-set-activate.ts", "unit-migration-cutover"]
