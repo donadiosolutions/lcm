@@ -1,0 +1,7 @@
+references: ["#1779"]
+rationale: >-
+  #1779 makes sanitizeError redact a backslash-slash relative successor after
+  an active nested file child on the first pass; safe-error.ts keeps its
+  established owner.
+pins:
+  - ["src/daemon/safe-error.ts", "unit-daemon-core"]
