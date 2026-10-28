@@ -3546,7 +3546,7 @@ describe("migration manifest compare-and-swap update", () => {
     expect(existsSync(artifacts.attempt)).toBe(true);
   });
 
-  it("preserves immediate-successor probe failures instead of guessing", () => {
+  it("reports immediate-successor probe failures as recovery-required with the cause", () => {
     const home = makeHome();
     const initial = manifest("successor-probe-failure");
     const store = new MigrationManifestStore({ homeDir: home });
@@ -3557,14 +3557,26 @@ describe("migration manifest compare-and-swap update", () => {
       "0000000000000001",
     );
     const realLstat = createRequire(import.meta.url)("node:fs").lstatSync as typeof lstatSync;
-    expect(() => withPatchedFs("lstatSync", ((path: string, options?: unknown) => {
+    let failure: unknown;
+    withPatchedFs("lstatSync", ((path: string, options?: unknown) => {
       if (path === successor) {
         const error = new Error("successor probe denied") as NodeJS.ErrnoException;
         error.code = "EACCES";
         throw error;
       }
       return realLstat(path, options as never);
-    }) as never, () => store.read(initial.generationId))).toThrow("successor probe denied");
+    }) as never, () => {
+      try {
+        store.read(initial.generationId);
+      } catch (error) {
+        failure = error;
+      }
+    });
+    expect(failure).toBeInstanceOf(MigrationProtocolError);
+    expect((failure as MigrationProtocolError).reason).toBe("recovery-required");
+    expect((failure as MigrationProtocolError).message)
+      .toBe("migration manifest has an unpublished immediate successor");
+    expect(((failure as MigrationProtocolError).cause as Error).message).toBe("successor probe denied");
   });
 
   it("reads a valid maximum-safe revision without probing an impossible successor", () => {
@@ -4261,8 +4273,9 @@ describe("migration manifest exact recovery", () => {
       const headPath = migrationManifestHeadPath(initial.generationId, home);
       const headBefore = readFileSync(headPath, "utf8");
 
-      expectProtocolReason(() => store.read(initial.generationId), "recovery-required");
+      expect(store.read(initial.generationId)).toEqual(initial);
       expect(store.recover(initial.generationId)).toEqual(initial);
+      expect(store.read(initial.generationId)).toEqual(initial);
       expect(readFileSync(headPath, "utf8")).toBe(headBefore);
       expect(readdirSync(successorDirectory)).toEqual(state === "empty" ? [] : [scratch]);
       expect(store.update(initial.generationId, initial.checksumSha256, () => candidate)).toEqual(candidate);
@@ -4293,10 +4306,66 @@ describe("migration manifest exact recovery", () => {
     const headPath = migrationManifestHeadPath(initial.generationId, home);
     const headBefore = readFileSync(headPath, "utf8");
 
+    expect(store.read(initial.generationId)).toEqual(initial);
     expect(store.recover(initial.generationId)).toEqual(initial);
+    expect(store.read(initial.generationId)).toEqual(initial);
     expect(readFileSync(headPath, "utf8")).toBe(headBefore);
     expect(readdirSync(successorDirectory)).toEqual([scratch]);
     expect(readFileSync(join(successorDirectory, scratch), "utf8")).toBe(scratchContent);
+  });
+
+  it("keeps ordinary reads recovery-required for a successor that is not an empty or scratch-only directory", () => {
+    const cases = [
+      "manifest-bearing",
+      "unknown-entry",
+      "two-non-manifest-entries",
+      "wrong-mode-scratch",
+      "symlinked-directory",
+    ] as const;
+    for (const state of cases) {
+      const home = makeHome();
+      const initial = manifest("read-successor-" + state);
+      const store = new MigrationManifestStore({ homeDir: home });
+      store.create(initial);
+      const candidate = beginMigrationEffect(initial, {
+        effectId: "effect-read-successor-" + state,
+        kind: "verify-dry-run",
+        inputSha256: HASH,
+        startedAt: "2026-08-12T12:00:01.000Z",
+      });
+      const revisions = join(migrationManifestGenerationDirectory(initial.generationId, home), "revisions");
+      const successorDirectory = join(revisions, "0000000000000001");
+      const scratch = (fill: string) => `.${candidate.checksumSha256}.json.${fill.repeat(24)}.tmp`;
+      if (state === "manifest-bearing") {
+        publishSuccessorOrphan(home, initial, candidate);
+      } else if (state === "symlinked-directory") {
+        const target = join(home, "elsewhere");
+        mkdirSync(target, { mode: 0o700 });
+        symlinkSync(target, successorDirectory);
+      } else {
+        mkdirSync(successorDirectory, { mode: 0o700 });
+        if (state === "unknown-entry") {
+          writeFileSync(join(successorDirectory, "unknown.tmp"), "scratch", { mode: 0o600 });
+        } else if (state === "two-non-manifest-entries") {
+          writeFileSync(join(successorDirectory, scratch("a")), canonicalFixture(candidate), { mode: 0o600 });
+          writeFileSync(join(successorDirectory, scratch("b")), canonicalFixture(candidate), { mode: 0o600 });
+        } else {
+          writeFileSync(join(successorDirectory, scratch("c")), canonicalFixture(candidate), { mode: 0o600 });
+          chmodSync(join(successorDirectory, scratch("c")), 0o644);
+        }
+      }
+
+      let failure: unknown;
+      try {
+        store.read(initial.generationId);
+      } catch (error) {
+        failure = error;
+      }
+      expect(failure, state).toBeInstanceOf(MigrationProtocolError);
+      expect((failure as MigrationProtocolError).reason, state).toBe("recovery-required");
+      expect((failure as MigrationProtocolError).message, state)
+        .toBe("migration manifest has an unpublished immediate successor");
+    }
   });
 
   it("refuses an unknown scratch-only recovery entry without changing the head", () => {

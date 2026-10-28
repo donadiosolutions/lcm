@@ -339,8 +339,11 @@ replacement fails without overwriting those bytes.
 ## Crash recovery
 
 Ordinary reads authenticate the head and its selected revision. If the exact
-next numeric revision directory exists, the read returns `recovery-required`
-instead of ignoring or choosing the orphan.
+next numeric revision directory is empty or holds only an authenticated writer
+scratch file, the read returns the current head: content publication had not
+completed, so nothing newer exists to choose. If that directory holds a
+manifest, or anything that cannot be authenticated, the read returns
+`recovery-required` instead of ignoring or choosing the orphan.
 
 An empty next revision directory or one containing only an authenticated
 writer scratch file means content publication had not completed. Recovery
@@ -463,8 +466,8 @@ Callers receive a `MigrationProtocolError` with one sanitized reason:
 - `malformed-manifest` — persisted structure, canonical encoding, or path
   identity is inconsistent.
 - `checksum-mismatch` — a manifest or head seal does not authenticate.
-- `recovery-required` — one exact unpublished successor exists and ordinary
-  reads must stop.
+- `recovery-required` — the next revision directory holds a manifest or
+  anything that cannot be authenticated, and ordinary reads must stop.
 - `unexpected-state` — a legal operation cannot proceed from the authenticated
   state, including stale compare-and-swap input or ambiguous recovery evidence.
 

@@ -1,0 +1,8 @@
+references: ["#1772"]
+rationale: >-
+  #1772 lets ordinary manifest reads ignore an incomplete (empty or
+  scratch-only) immediate successor. The change is confined to the existing
+  successor check in src/migration/manifest-store.ts, which stays in the
+  migration cutover owner; no file is added, moved or re-owned.
+pins:
+  - ["src/migration/manifest-store.ts", "unit-migration-cutover"]

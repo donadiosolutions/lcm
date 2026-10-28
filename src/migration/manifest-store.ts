@@ -282,18 +282,31 @@ type AuthenticatedManifestState = Readonly<{
   revisions: string;
 }>;
 
-function assertNoImmediateSuccessor(
+/**
+ * Ordinary reads stay on the current head while the immediate successor is
+ * only staged: an empty revision directory or one holding a single
+ * authenticated writer scratch publishes nothing and is finished or replaced
+ * by the next update.  A successor that holds a manifest, or anything that the
+ * classifier cannot authenticate, still needs explicit recovery.
+ */
+function assertNoPublishedImmediateSuccessor(
   revisions: string,
+  generationId: string,
   revision: number,
+  expectedUid: number | undefined,
 ): void {
   if (revision === Number.MAX_SAFE_INTEGER) return;
-  const successorPath = join(revisions, revisionDirectoryName(revision + 1));
+  let candidate: ReturnType<typeof readAuthenticatedRevisionCandidate>;
   try {
-    lstatSync(successorPath);
+    candidate = readAuthenticatedRevisionCandidate(revisions, generationId, revision + 1, expectedUid);
   } catch (error) {
-    if ((error as NodeJS.ErrnoException).code === "ENOENT") return;
-    throw error;
+    throw new MigrationProtocolError(
+      "recovery-required",
+      "migration manifest has an unpublished immediate successor",
+      { cause: error },
+    );
   }
+  if (candidate?.kind !== "manifest") return;
   throw new MigrationProtocolError(
     "recovery-required",
     "migration manifest has an unpublished immediate successor",
@@ -2337,7 +2350,7 @@ export class MigrationManifestStore {
             };
           }
           if (rejectImmediateSuccessor) {
-            assertNoImmediateSuccessor(revisions, head.revision);
+            assertNoPublishedImmediateSuccessor(revisions, generationId, head.revision, this.#expectedUid);
             if (nestedScratch !== null) {
               throw new MigrationProtocolError(
                 "recovery-required",
