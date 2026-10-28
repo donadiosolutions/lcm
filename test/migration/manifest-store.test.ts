@@ -795,6 +795,19 @@ function rewriteManifestFixture(
   return rewritten;
 }
 
+function expectInterruptedSuccessorWrite(callback: () => unknown): void {
+  let failure: unknown;
+  try {
+    callback();
+  } catch (error) {
+    failure = error;
+  }
+  expect(failure).toBeInstanceOf(MigrationProtocolError);
+  expect((failure as MigrationProtocolError).reason).toBe("recovery-required");
+  expect((failure as MigrationProtocolError).message)
+    .toBe("migration manifest has an interrupted successor write; retry the same create or update to finish it");
+}
+
 function expectProtocolReason(callback: () => unknown, reason: MigrationProtocolError["reason"]): void {
   try {
     callback();
@@ -4248,7 +4261,7 @@ describe("migration manifest exact recovery", () => {
     expectProtocolReason(() => store.read(initial.generationId), "recovery-required");
   });
 
-  it("returns the current head for empty and scratch-only successors and lets update retry", () => {
+  it("reads the head for an empty successor, refuses reads for a scratch-only one, and lets update retry", () => {
     for (const state of ["empty", "scratch-only"] as const) {
       const home = makeHome();
       const initial = manifest(`recover-incomplete-${state}`);
@@ -4273,9 +4286,16 @@ describe("migration manifest exact recovery", () => {
       const headPath = migrationManifestHeadPath(initial.generationId, home);
       const headBefore = readFileSync(headPath, "utf8");
 
-      expect(store.read(initial.generationId)).toEqual(initial);
+      const readOrdinary = () => {
+        if (state === "empty") {
+          expect(store.read(initial.generationId)).toEqual(initial);
+          return;
+        }
+        expectInterruptedSuccessorWrite(() => store.read(initial.generationId));
+      };
+      readOrdinary();
       expect(store.recover(initial.generationId)).toEqual(initial);
-      expect(store.read(initial.generationId)).toEqual(initial);
+      readOrdinary();
       expect(readFileSync(headPath, "utf8")).toBe(headBefore);
       expect(readdirSync(successorDirectory)).toEqual(state === "empty" ? [] : [scratch]);
       expect(store.update(initial.generationId, initial.checksumSha256, () => candidate)).toEqual(candidate);
@@ -4306,15 +4326,15 @@ describe("migration manifest exact recovery", () => {
     const headPath = migrationManifestHeadPath(initial.generationId, home);
     const headBefore = readFileSync(headPath, "utf8");
 
-    expect(store.read(initial.generationId)).toEqual(initial);
+    expectInterruptedSuccessorWrite(() => store.read(initial.generationId));
     expect(store.recover(initial.generationId)).toEqual(initial);
-    expect(store.read(initial.generationId)).toEqual(initial);
+    expectInterruptedSuccessorWrite(() => store.read(initial.generationId));
     expect(readFileSync(headPath, "utf8")).toBe(headBefore);
     expect(readdirSync(successorDirectory)).toEqual([scratch]);
     expect(readFileSync(join(successorDirectory, scratch), "utf8")).toBe(scratchContent);
   });
 
-  it("keeps ordinary reads recovery-required for a successor that is not an empty or scratch-only directory", () => {
+  it("keeps ordinary reads recovery-required for a successor that holds a manifest or unauthenticatable entries", () => {
     const cases = [
       "manifest-bearing",
       "unknown-entry",

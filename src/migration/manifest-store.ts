@@ -283,11 +283,14 @@ type AuthenticatedManifestState = Readonly<{
 }>;
 
 /**
- * Ordinary reads stay on the current head while the immediate successor is
- * only staged: an empty revision directory or one holding a single
- * authenticated writer scratch publishes nothing and is finished or replaced
- * by the next update.  A successor that holds a manifest, or anything that the
- * classifier cannot authenticate, still needs explicit recovery.
+ * Ordinary reads stay on the current head only while the immediate successor
+ * directory is empty: an empty directory is compatible with every candidate,
+ * so the next update writes its manifest normally.  A writer scratch binds the
+ * revision to the one candidate it was started for, so a read-then-act gate
+ * that proceeded on the head could commit work its own update would then
+ * refuse; it reports recovery-required until the same update finishes the
+ * write.  A manifest, or anything the classifier cannot authenticate, also
+ * needs explicit recovery.
  */
 function assertNoPublishedImmediateSuccessor(
   revisions: string,
@@ -306,10 +309,12 @@ function assertNoPublishedImmediateSuccessor(
       { cause: error },
     );
   }
-  if (candidate?.kind !== "manifest") return;
+  if (candidate === null || (candidate.kind === "incomplete" && candidate.empty)) return;
   throw new MigrationProtocolError(
     "recovery-required",
-    "migration manifest has an unpublished immediate successor",
+    candidate.kind === "incomplete"
+      ? "migration manifest has an interrupted successor write; retry the same create or update to finish it"
+      : "migration manifest has an unpublished immediate successor",
   );
 }
 
@@ -320,7 +325,7 @@ function exactRecoveryCandidate(
   previousManifestSha256: string | null,
   expectedUid: number | undefined,
 ): Readonly<{ kind: "manifest"; manifest: MigrationManifest; directory: string }>
-  | Readonly<{ kind: "incomplete"; directory: string }>
+  | Readonly<{ kind: "incomplete"; directory: string; empty: boolean }>
   | null {
   const candidate = readAuthenticatedRevisionCandidate(
     revisions,
@@ -351,7 +356,7 @@ function readAuthenticatedRevisionCandidate(
   revision: number,
   expectedUid: number | undefined,
 ): Readonly<{ kind: "manifest"; manifest: MigrationManifest; directory: string }>
-  | Readonly<{ kind: "incomplete"; directory: string }>
+  | Readonly<{ kind: "incomplete"; directory: string; empty: boolean }>
   | null {
   const directory = join(revisions, revisionDirectoryName(revision));
   try {
@@ -362,7 +367,7 @@ function readAuthenticatedRevisionCandidate(
   }
   return withAuthenticatedDirectories([directory], expectedUid, () => {
     const entries = readDirectoryEntriesBounded(directory, 2);
-    if (entries.length === 0) return { kind: "incomplete", directory };
+    if (entries.length === 0) return { kind: "incomplete", directory, empty: true };
     const manifestEntries = entries.filter((entry) => MANIFEST_FILENAME_PATTERN.test(entry));
     if (manifestEntries.length === 0 && entries.length === 1) {
       const scratch = revisionScratchMatch(entries[0]!);
@@ -371,7 +376,7 @@ function readAuthenticatedRevisionCandidate(
         // incomplete evidence never advances the head, the intended candidate
         // checksum is bound later by the exact create/update retry.
         assertRecoverableRevisionEntries(directory, scratch[1]!, expectedUid);
-        return { kind: "incomplete", directory };
+        return { kind: "incomplete", directory, empty: false };
       }
     }
     if (manifestEntries.length !== 1) {

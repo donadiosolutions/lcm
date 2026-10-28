@@ -1,4 +1,4 @@
-import { chmodSync, mkdirSync, mkdtempSync, readFileSync, rmSync } from "node:fs";
+import { chmodSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, describe, expect, it } from "vitest";
@@ -172,6 +172,28 @@ describe("performMigrationAbort (section 4.6, completes whichever write is missi
     expect(result).toEqual({ status: "completed", mutated: true });
     expect(store.read("generation-1").phase).toBe("aborted");
     expect(readBackendMaintenanceJournal(home)!.phase).toBe("maintenance-aborted");
+  });
+
+  it("refuses before any journal write when the immediate successor holds a scratch for a different candidate (#1772)", async () => {
+    const home = makeHome();
+    const held = await heldJournal(home);
+    const initial = manifest();
+    const store = new MigrationManifestStore({ homeDir: home });
+    store.create(initial);
+    const other = beginMigrationEffect(initial, {
+      effectId: "e".repeat(64), kind: "verify-dry-run", inputSha256: "f".repeat(64), startedAt: CREATED_AT,
+    });
+    const successor = join(migrationManifestGenerationDirectory("generation-1", home), "revisions", "0000000000000001");
+    mkdirSync(successor, { mode: 0o700 });
+    writeFileSync(join(successor, "." + other.checksumSha256 + ".json." + "a".repeat(24) + ".tmp"), JSON.stringify(other).slice(0, 40), { mode: 0o600 });
+    const journalBefore = readFileSync(backendPublicationJournalPath(home));
+
+    const result = await performMigrationAbort({
+      homeDir: home, coordinator: coordinatorFor(home), journal: held, abortEvidenceSha256: "c".repeat(64), manifestStore: store,
+    });
+    expect(result).toEqual({ status: "refuse", evidence: "manifest-recovery-required", mutated: false });
+    expect(readFileSync(backendPublicationJournalPath(home)).equals(journalBefore)).toBe(true);
+    expect(readBackendMaintenanceJournal(home)!.phase).toBe("maintenance-held");
   });
 
   it("still refuses before any journal write when the immediate successor already holds a manifest (#1772)", async () => {
