@@ -7,6 +7,7 @@ import { assembleGateFromEvidence, parseGateArguments } from "../../scripts/cert
 import { captureExecutionHost, captureExecutionProvenance } from "../../scripts/certification-harness.mjs";
 import { createGitCheckoutFixture } from "./git-checkout-fixture.js";
 import { createDeterministicSchedule, createFaultSchedule } from "./schedule.mjs";
+import { observerReadSettings } from "./sqlite-observer-worker.mjs";
 
 function writeJson(path: string, value: unknown): void { writeFileSync(path, `${JSON.stringify(value)}\n`); }
 function writeNdjson(path: string, values: unknown[]): void { writeFileSync(path, values.map((value) => `${JSON.stringify(value)}\n`).join("")); }
@@ -59,7 +60,7 @@ function rawFixture(options: Variant = {}) {
   const provenance = {
     testedCommit: "c".repeat(40), dirty: false, testedInputsSha256: "d".repeat(64), testedInputsCount: 100,
     lockfileSha256: "e".repeat(64), cliSha256: "f".repeat(64), stagedPackageSha256: "1".repeat(64),
-    contractSha256, approvalSha256, node: process.version, executionHost,
+    contractSha256, approvalSha256, node: process.version, executionHost, observerSettings: observerReadSettings(contract),
   };
   const profile = options.profile ?? "full";
   const lane = options.lane ?? "local";
@@ -195,6 +196,7 @@ function rawFixture(options: Variant = {}) {
   const current = { ...provenance } as Record<string, unknown>;
   delete current.stagedPackageSha256;
   delete current.contractSha256;
+  delete current.observerSettings;
   // The assembling host is a different machine in general: its witness must not be
   // compared against the recorded one.
   current.executionHost = { ...executionHost, hostnameSha256: "8".repeat(64), capturedAt: "2026-10-27T00:00:00.000Z", runnerSku: null };
@@ -218,7 +220,9 @@ function realReadbackInput(executionHost: Record<string, unknown>) {
   const fixture = rawFixture({ profile: "smoke", executionHost });
   const path = join(fixture.root, "execution-provenance.json");
   const recorded = JSON.parse(readFileSync(path, "utf8"));
-  writeJson(path, captureExecutionProvenance(checkout.root, recorded.contractSha256, recorded.stagedPackageSha256, recorded.approvalSha256, { executionHost: recorded.executionHost }));
+  writeJson(path, captureExecutionProvenance(checkout.root, recorded.contractSha256, recorded.stagedPackageSha256, recorded.approvalSha256, {
+    executionHost: recorded.executionHost, contract: JSON.parse(readFileSync(fixture.contractPath, "utf8")),
+  }));
   return { repositoryRoot: checkout.root, evidenceDirectory: fixture.root, contractPath: fixture.contractPath, outputDirectory: fixture.output };
 }
 
@@ -519,6 +523,50 @@ describe("execution-host witness in the public gate", () => {
     expect(() => assemble(missing)).toThrow("execution-host witness");
     expect(() => assemble(rawFixture({ executionHost: { hostnameSha256: "lcm-testbox" } }))).toThrow("hostname digest");
     expect(() => assemble(rawFixture({ executionHost: { rawHostname: "leak" } }))).toThrow("unexpected key");
+  });
+});
+
+describe("observer read settings in the public gate", () => {
+  // Rewrites the recorded settings; undefined removes them.
+  function withObserverSettings(observerSettings: unknown) {
+    const fixture = rawFixture({ profile: "smoke" });
+    const path = join(fixture.root, "execution-provenance.json");
+    const recorded = JSON.parse(readFileSync(path, "utf8"));
+    if (observerSettings === undefined) delete recorded.observerSettings;
+    else recorded.observerSettings = observerSettings;
+    writeJson(path, recorded);
+    return fixture;
+  }
+  const recorded = { pollSeconds: 1, busyTimeoutMs: 200, perQueryDeadlineMs: 250, maxPollGapSeconds: 2 };
+
+  it("carries the recorded settings into the gate JSON and markdown", () => {
+    const result = assemble(rawFixture({ profile: "smoke" }));
+    expect(result.gate.provenance.observerSettings).toEqual(recorded);
+    expect(JSON.parse(readFileSync(result.paths.json, "utf8")).provenance.observerSettings).toEqual(recorded);
+    const markdown = readFileSync(result.paths.markdown, "utf8");
+    expect(markdown).toContain("## Observer reads");
+    expect(markdown).toContain("Poll every 1 s; SQLite busy timeout 200 ms; per-query deadline 250 ms; maximum poll gap 2 s");
+  });
+
+  it("refuses evidence without settings or whose busy timeout is not shorter than the per-query deadline", () => {
+    const missing = withObserverSettings(undefined);
+    const captureProvenance = vi.fn(() => missing.provenance);
+    expect(() => assembleGateFromEvidence({
+      repositoryRoot: missing.root, evidenceDirectory: missing.root, contractPath: missing.contractPath, outputDirectory: missing.output,
+    }, { captureProvenance })).toThrow("missing its observer read settings");
+    expect(captureProvenance).not.toHaveBeenCalled();
+    expect(existsSync(missing.output)).toBe(false);
+    for (const busyTimeoutMs of [250, 300]) {
+      expect(() => assemble(withObserverSettings({ ...recorded, busyTimeoutMs }))).toThrow("busy timeout is not shorter than its per-query deadline");
+    }
+  });
+
+  it("validates the settings against the closed schema and the values the contract and observer code produce", () => {
+    expect(() => assemble(withObserverSettings({ ...recorded, databasePath: "/home/user/.lcm/events/project.db" }))).toThrow("unexpected key databasePath");
+    expect(() => assemble(withObserverSettings({ pollSeconds: 1, busyTimeoutMs: 200, perQueryDeadlineMs: 250 }))).toThrow("missing maxPollGapSeconds");
+    expect(() => assemble(withObserverSettings({ ...recorded, pollSeconds: 1.5 }))).toThrow("observer read settings are invalid");
+    expect(() => assemble(withObserverSettings({ ...recorded, pollSeconds: 2 }))).toThrow("do not match the contract and observer code at pollSeconds");
+    expect(() => assemble(withObserverSettings({ ...recorded, busyTimeoutMs: 100 }))).toThrow("do not match the contract and observer code at busyTimeoutMs");
   });
 });
 

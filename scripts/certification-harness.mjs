@@ -10,6 +10,7 @@ import { NODE_IMAGE, POSTGRES_IMAGE } from "./postgresql-images.mjs";
 import { loadCertificationContract } from "../test/certification/contract.mjs";
 import { publishPostgreSqlBackend } from "../test/certification/backend-publication.mjs";
 import { createDeterministicSchedule } from "../test/certification/schedule.mjs";
+import { observerReadSettings } from "../test/certification/sqlite-observer-worker.mjs";
 import { createOwnerIdentity, createProcessLifecycle, createRunNames, ownershipLabels, removeOwnedResource, runHarness, runSanitizedProcess } from "./postgresql-harness.mjs";
 
 const repositoryRoot = join(fileURLToPath(new URL("..", import.meta.url)));
@@ -123,6 +124,9 @@ export function captureExecutionProvenance(root, contractSha256, stagedPackageSh
     approvalSha256,
     node: process.version,
     executionHost,
+    // Both lanes pass their contract so the run records the observer read settings its
+    // machine agents use; gate readback recomputes code provenance only and omits them.
+    ...(options.contract === undefined ? {} : { observerSettings: observerReadSettings(options.contract) }),
   };
 }
 
@@ -373,7 +377,7 @@ export async function runManagedMachinePair(input, dependencies = {}) {
     });
     const executionProvenance = (dependencies.captureExecutionProvenance ?? captureExecutionProvenance)(
       dependencies.sourceRoot ?? repositoryRoot, input.contractSha256, stage.sha256, input.approvalSha256,
-      { environment: dependencies.environment ?? process.env, containerCli },
+      { environment: dependencies.environment ?? process.env, containerCli, contract },
     );
     assertExecutionProvenance(input.profile, executionProvenance);
     mkdirSync(input.evidenceDirectory, { recursive: true, mode: 0o700 });
@@ -1183,7 +1187,7 @@ export async function runLocalCertification(options, dependencies = {}) {
       });
       const executionProvenance = (dependencies.captureExecutionProvenance ?? captureExecutionProvenance)(
         dependencies.sourceRoot ?? repositoryRoot, options.contractSha256, stage.sha256, options.approvalSha256,
-        { environment: dependencies.environment ?? process.env, containerCli: "podman" },
+        { environment: dependencies.environment ?? process.env, containerCli: "podman", contract },
       );
       assertExecutionProvenance(options.profile, executionProvenance);
       writeFileSync(join(options.evidenceDirectory, "execution-provenance.json"), `${JSON.stringify(executionProvenance, null, 2)}\n`, { mode: 0o600, flag: "wx" });

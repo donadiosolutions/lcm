@@ -26,6 +26,7 @@ describe("certification evidence", () => {
           cpuModel: "AMD EPYC 9R14", logicalCpus: 8, totalMemoryBytes: 33_000_000_000, containerEngine: "podman", containerEngineVersion: null,
           hostnameSha256: "7".repeat(64), runnerName: null, runnerOs: null, runnerArch: null, runnerSku: null,
         },
+        observerSettings: { pollSeconds: 1, busyTimeoutMs: 200, perQueryDeadlineMs: 250, maxPollGapSeconds: 2 },
       },
       machines: [
         { name: "a", machineId: "018f0000-0000-7000-8000-000000000001", identityKeySha256: "b".repeat(64) },

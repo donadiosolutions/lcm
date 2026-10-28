@@ -102,6 +102,7 @@ export function writeCertificationGate(gate, outputDirectory, sampleFiles = {}) 
   const markdown = join(outputDirectory, "production-certification-gate.md");
   const rows = gate.slos.map((slo) => `${slo.id} | ${slo.verdict} | ${slo.observed} | ${slo.threshold}`);
   const host = gate.provenance?.executionHost ?? {};
+  const observer = gate.provenance?.observerSettings ?? {};
   const show = (value) => value === null || value === undefined ? "n/a" : String(value);
   const memoryGiB = Number.isFinite(host.totalMemoryBytes) ? `${(host.totalMemoryBytes / 1024 ** 3).toFixed(1)} GiB` : "n/a";
   const body = [
@@ -119,6 +120,10 @@ export function writeCertificationGate(gate, outputDirectory, sampleFiles = {}) 
     `Container engine: ${show(host.containerEngine)} ${show(host.containerEngineVersion)}`,
     `Hostname SHA-256: \`${show(host.hostnameSha256)}\``,
     `Runner: name ${show(host.runnerName)}; os ${show(host.runnerOs)}; arch ${show(host.runnerArch)}; SKU ${show(host.runnerSku)}`,
+    "",
+    "## Observer reads",
+    "",
+    `Poll every ${show(observer.pollSeconds)} s; SQLite busy timeout ${show(observer.busyTimeoutMs)} ms; per-query deadline ${show(observer.perQueryDeadlineMs)} ms; maximum poll gap ${show(observer.maxPollGapSeconds)} s`,
     "",
     "SLO | Verdict | Observed | Threshold",
     "--- | --- | ---: | ---:",

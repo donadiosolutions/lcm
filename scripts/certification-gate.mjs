@@ -7,6 +7,7 @@ import { validateEvidence } from "../test/postgresql/cutover-rehearsal/check-evi
 import { loadCertificationContract } from "../test/certification/contract.mjs";
 import { assembleCertificationGate, errorRate, evaluatePercentiles, nearestRank, writeCertificationGate } from "../test/certification/slo.mjs";
 import { createDeterministicSchedule, createFaultSchedule } from "../test/certification/schedule.mjs";
+import { observerReadSettings } from "../test/certification/sqlite-observer-worker.mjs";
 import { EXECUTION_HOST_IDENTITY_FIELDS, captureExecutionProvenance, recoveryWindowSearch } from "./certification-harness.mjs";
 
 function json(path) { return JSON.parse(readFileSync(path, "utf8")); }
@@ -480,6 +481,22 @@ export function assembleGateFromEvidence(input, dependencies = {}) {
   if (!/^[0-9a-f]{64}$/u.test(host.hostnameSha256 ?? "")) throw new Error("certification execution-host witness has an invalid hostname digest");
   const hostErrors = validateEvidence(schema, host, "#/properties/provenance/properties/executionHost");
   if (hostErrors.length > 0) throw new Error(`certification execution-host witness is invalid:\n${hostErrors.join("\n")}`);
+  // The recorded observer read settings are required, validated against the closed
+  // evidence schema, and carried into the public gate as recorded. The busy timeout must
+  // stay inside the per-query deadline, and the settings must be the ones that the
+  // tested observer code derives from this contract.
+  const observerSettings = execution.observerSettings;
+  if (!observerSettings || typeof observerSettings !== "object" || Array.isArray(observerSettings)) {
+    throw new Error("certification execution provenance is missing its observer read settings");
+  }
+  const observerErrors = validateEvidence(schema, observerSettings, "#/properties/provenance/properties/observerSettings");
+  if (observerErrors.length > 0) throw new Error(`certification observer read settings are invalid:\n${observerErrors.join("\n")}`);
+  if (observerSettings.busyTimeoutMs >= observerSettings.perQueryDeadlineMs) {
+    throw new Error("certification observer busy timeout is not shorter than its per-query deadline");
+  }
+  for (const [field, expected] of Object.entries(observerReadSettings(loaded.contract))) {
+    if (observerSettings[field] !== expected) throw new Error(`certification observer read settings do not match the contract and observer code at ${field}`);
+  }
   // Readback recomputes code provenance only. Injecting the validated recorded
   // witness skips live host capture, so nothing named by evidence (such as
   // containerEngine) is executed and the assembler's own environment (such as

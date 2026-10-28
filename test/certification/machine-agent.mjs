@@ -10,6 +10,7 @@ import { createHash } from "node:crypto";
 import { connect as tlsConnect } from "node:tls";
 import { createDeterministicSchedule, createFaultSchedule } from "./schedule.mjs";
 import { loadCertificationContract } from "./contract.mjs";
+import { observerReadSettings } from "./sqlite-observer-worker.mjs";
 
 const execFileAsync = promisify(execFile);
 
@@ -120,8 +121,8 @@ export function querySqliteBounded(databasePath, mode, sessionId, timeoutMs = 25
   });
 }
 
-export function readAcknowledgmentRows(databasePath) {
-  return querySqliteBounded(databasePath, "acknowledgments");
+export function readAcknowledgmentRows(databasePath, timeoutMs) {
+  return querySqliteBounded(databasePath, "acknowledgments", undefined, timeoutMs);
 }
 
 function readAllDeliveryRows(databasePath) {
@@ -624,18 +625,21 @@ export async function executeDeterministicSchedule({
   return Promise.all(operations);
 }
 
-// Polls the local events database once per second with a bounded read-only query.
-// A poll is incomplete only when the read fails, the gap since the previous poll
-// exceeds two seconds, or the database file or its parent directory is replaced
-// (including the database disappearing after it was seen). The -wal/-shm siblings
-// are recorded as a diagnostic only: SQLite removes them when its last connection
-// closes cleanly, so their absence is not missing evidence.
+// Polls the local events database every settings.pollSeconds with a read bounded by
+// settings.perQueryDeadlineMs (see observerReadSettings). A poll is incomplete only when
+// the read fails, the gap since the previous poll exceeds settings.maxPollGapSeconds, or
+// the database file or its parent directory is replaced (including the database
+// disappearing after it was seen). The -wal/-shm siblings are recorded as a diagnostic
+// only: SQLite removes them when its last connection closes cleanly, so their absence is
+// not missing evidence.
 export async function observeUntilStopped({
-  home, evidenceDirectory, signal,
+  home, evidenceDirectory, signal, settings,
   now = () => performance.now(),
   readRows = readAcknowledgmentRows,
   pause = (milliseconds) => new Promise((resolve) => setTimeout(resolve, milliseconds)),
 }) {
+  const pollMs = settings.pollSeconds * 1000;
+  const maxGapMs = settings.maxPollGapSeconds * 1000;
   let observations = new Map();
   let priorPoll = now();
   let identityWitness;
@@ -663,14 +667,14 @@ export async function observeUntilStopped({
       identityWitness = currentWitness;
       const siblingsPresent = existsSync(`${databasePath}-wal`) && existsSync(`${databasePath}-shm`);
       try {
-        observations = observeAcknowledgments(observations, await readRows(databasePath));
+        observations = observeAcknowledgments(observations, await readRows(databasePath, settings.perQueryDeadlineMs));
       } catch (error) {
         incomplete = true;
         appendNdjson(join(evidenceDirectory, "observer.ndjson"), { monotonicMs: currentPoll, gapMs, status: "error", errorClass: error?.name ?? "Error", incomplete: true, acknowledgments: Object.fromEntries(observations) });
-        await pause(1000);
+        await pause(pollMs);
         continue;
       }
-      const pollIncomplete = gapMs > 2000;
+      const pollIncomplete = gapMs > maxGapMs;
       incomplete ||= pollIncomplete;
       appendNdjson(join(evidenceDirectory, "observer.ndjson"), {
         monotonicMs: currentPoll,
@@ -681,7 +685,7 @@ export async function observeUntilStopped({
         acknowledgments: Object.fromEntries(observations),
       });
     }
-    await pause(1000);
+    await pause(pollMs);
     }
   } catch (error) {
     try {
@@ -878,6 +882,7 @@ export async function runMachineAgent(environment = process.env) {
   if (!evidenceDirectory || !['a', 'b'].includes(machine)) throw new Error("missing machine-agent configuration");
   mkdirSync(evidenceDirectory, { recursive: true, mode: 0o700 });
   const { contract } = loadCertificationContract(new URL("./contract-v3.json", import.meta.url));
+  const observerSettings = observerReadSettings(contract);
   const lcm = "/opt/lcm/dist/lcm.mjs";
   const name = `cert-${environment.LCM_CERT_RUN_ID}-${machine}`;
   const project = join(environment.HOME, "project");
@@ -992,7 +997,7 @@ export async function runMachineAgent(environment = process.env) {
   }, null, 2)}\n`, { mode: 0o600, flag: "wx" });
   writeFileSync(join(evidenceDirectory, "ready.json"), `${JSON.stringify({ machine, at: new Date().toISOString() })}\n`, { mode: 0o600, flag: "wx" });
   const observerAbort = new AbortController();
-  const observer = observeUntilStopped({ home: environment.HOME, evidenceDirectory, signal: observerAbort.signal });
+  const observer = observeUntilStopped({ home: environment.HOME, evidenceDirectory, signal: observerAbort.signal, settings: observerSettings });
   let observerResult;
   let expectedEvents = 0;
   try {

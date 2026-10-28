@@ -33,7 +33,7 @@
     "profile": { "enum": ["smoke", "full"] },
     "provenance": {
       "type": "object",
-      "required": ["testedCommit", "dirty", "testedInputsSha256", "testedInputsCount", "lockfileSha256", "cliSha256", "stagedPackageSha256", "contractSha256", "approvalSha256", "node", "executionHost"],
+      "required": ["testedCommit", "dirty", "testedInputsSha256", "testedInputsCount", "lockfileSha256", "cliSha256", "stagedPackageSha256", "contractSha256", "approvalSha256", "node", "executionHost", "observerSettings"],
       "additionalProperties": false,
       "properties": {
         "testedCommit": { "type": "string", "pattern": "^[0-9a-f]{40}$" },
@@ -66,6 +66,17 @@
             "runnerOs": { "type": ["string", "null"], "maxLength": 128 },
             "runnerArch": { "type": ["string", "null"], "maxLength": 128 },
             "runnerSku": { "type": ["string", "null"], "pattern": "^[A-Za-z0-9][A-Za-z0-9._:/-]{0,127}$" }
+          }
+        },
+        "observerSettings": {
+          "type": "object",
+          "required": ["pollSeconds", "busyTimeoutMs", "perQueryDeadlineMs", "maxPollGapSeconds"],
+          "additionalProperties": false,
+          "properties": {
+            "pollSeconds": { "type": "integer", "minimum": 1 },
+            "busyTimeoutMs": { "type": "integer", "minimum": 1 },
+            "perQueryDeadlineMs": { "type": "integer", "minimum": 1 },
+            "maxPollGapSeconds": { "type": "integer", "minimum": 1 }
           }
         }
       }

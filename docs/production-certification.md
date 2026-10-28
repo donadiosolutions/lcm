@@ -253,6 +253,16 @@ directory is replaced. Whether the `-wal` and `-shm` siblings exist is recorded
 as a diagnostic only, because SQLite removes them when its last connection closes
 cleanly.
 
+Execution provenance records the observer's read settings once per run as
+`observerSettings`: the poll interval (`pollSeconds`, 1), the SQLite busy timeout
+that lets a read wait out a transient lock (`busyTimeoutMs`, 200), the per-query
+deadline after which the read is abandoned (`perQueryDeadlineMs`, 250), and the
+maximum gap between polls (`maxPollGapSeconds`, 2). The busy timeout comes from
+the observer code and the other values from the contract. The gate refuses
+evidence that lacks these settings, whose busy timeout is not shorter than the
+per-query deadline, or whose values differ from the contract and observer code,
+and it publishes them in the gate JSON and Markdown.
+
 One local and one managed repetition provide a bounded baseline. They do not
 certify provider reliability, independent host clocks, multi-host hardware
 failure, long-term capacity, provider failover, backup/PITR, or every downstream

@@ -25,6 +25,7 @@ import {
   verifyTlsNegativeProbe,
   waitForAcknowledgmentCatchUp,
 } from "./machine-agent.mjs";
+import { OBSERVER_BUSY_TIMEOUT_MS, observerReadSettings } from "./sqlite-observer-worker.mjs";
 import { extractPostToolEvents, extractUserPromptEvents } from "../../src/hooks/extractors.js";
 import { normalizePostToolInput } from "../../src/hooks/post-tool-normalization.js";
 import { scrubExtractedEvents } from "../../src/hooks/event-scrubbing.js";
@@ -546,6 +547,7 @@ it("masks short derived credentials at any length while keeping the whole-value 
 });
 describe("certification observer poll completeness", () => {
   const acknowledged = { event_uuid: "e1", delivery_state: "acknowledged", remote_inbox_id: "inbox-1", acknowledged_at: "2026-10-28T00:00:00.000Z" };
+  const settings = observerReadSettings(JSON.parse(readFileSync(new URL("./contract-v3.json", import.meta.url), "utf8")));
 
   function observerHome({ siblings }: { siblings: boolean }) {
     const home = mkdtempSync(join(tmpdir(), "lcm-cert-observer-home-"));
@@ -560,7 +562,7 @@ describe("certification observer poll completeness", () => {
   // Runs the real observer loop for a fixed number of polls on a scripted monotonic clock.
   function observe(
     input: { home: string; evidenceDirectory: string },
-    options: { clock: number[]; polls: number; readRows?: (path: string) => Promise<unknown[]>; betweenPolls?: () => void },
+    options: { clock: number[]; polls: number; readRows?: (path: string, timeoutMs: number) => Promise<unknown[]>; betweenPolls?: () => void; pauses?: number[] },
   ) {
     const controller = new AbortController();
     let clockReads = 0;
@@ -568,9 +570,11 @@ describe("certification observer poll completeness", () => {
     return observeUntilStopped({
       ...input,
       signal: controller.signal,
+      settings,
       now: () => options.clock[Math.min(clockReads++, options.clock.length - 1)],
       readRows: options.readRows ?? (async () => [acknowledged]),
-      pause: async () => {
+      pause: async (milliseconds: number) => {
+        options.pauses?.push(milliseconds);
         pauses += 1;
         if (pauses >= options.polls) controller.abort();
         else options.betweenPolls?.();
@@ -605,6 +609,19 @@ describe("certification observer poll completeness", () => {
     expect(records(input.evidenceDirectory)).toEqual([
       expect.objectContaining({ status: "ok", gapMs: 2500, siblingsPresent: true, incomplete: true }),
     ]);
+  });
+
+  it("reads with the recorded per-query deadline and pauses for the recorded poll interval", async () => {
+    const input = observerHome({ siblings: true });
+    const deadlines: number[] = [];
+    const pauses: number[] = [];
+    const result = await observe(input, {
+      clock: [0, 1000, 2000], polls: 2, pauses,
+      readRows: async (_path, timeoutMs) => { deadlines.push(timeoutMs); return [acknowledged]; },
+    });
+    expect(result.incomplete).toBe(false);
+    expect(deadlines).toEqual([250, 250]);
+    expect(pauses).toEqual([1000, 1000]);
   });
 
   it("marks a failed read incomplete", async () => {
@@ -658,13 +675,13 @@ describe("certification observer poll completeness", () => {
       clock: [0, 1000], polls: 1,
       // The production read (worker thread, 250 ms deadline); the lock is released 75 ms
       // after the read starts.
-      readRows: async (path) => {
+      readRows: async (path, timeoutMs) => {
         const release = new Promise((resolve) => setTimeout(resolve, 75)).then(() => {
           holder.close();
           releasedAt = performance.now();
         });
         try {
-          return await readAcknowledgmentRows(path);
+          return await readAcknowledgmentRows(path, timeoutMs);
         } finally {
           settledAt = performance.now();
           await release;
@@ -685,10 +702,10 @@ describe("certification observer poll completeness", () => {
     try {
       const result = await observe(input, {
         clock: [0, 1000], polls: 1,
-        readRows: async (path) => {
+        readRows: async (path, timeoutMs) => {
           const started = performance.now();
           try {
-            return await readAcknowledgmentRows(path);
+            return await readAcknowledgmentRows(path, timeoutMs);
           } finally {
             readMs = performance.now() - started;
           }
@@ -701,6 +718,28 @@ describe("certification observer poll completeness", () => {
       expect(readMs).toBeLessThan(1000);
     } finally {
       holder.close();
+    }
+  });
+});
+
+describe("certification observer read settings", () => {
+  const contract = JSON.parse(readFileSync(new URL("./contract-v3.json", import.meta.url), "utf8"));
+  const withObserver = (observer: Record<string, unknown>) => ({ ...contract, oracle: { ...contract.oracle, observer: { ...contract.oracle.observer, ...observer } } });
+
+  it("takes the poll, deadline and gap from the contract and the busy timeout from the observer worker", () => {
+    expect(observerReadSettings(contract)).toEqual({ pollSeconds: 1, busyTimeoutMs: 200, perQueryDeadlineMs: 250, maxPollGapSeconds: 2 });
+    expect(OBSERVER_BUSY_TIMEOUT_MS).toBe(200);
+    expect(observerReadSettings(withObserver({ pollSeconds: 3, perQueryDeadlineMs: 900, maxPollGapSeconds: 7 })))
+      .toEqual({ pollSeconds: 3, busyTimeoutMs: OBSERVER_BUSY_TIMEOUT_MS, perQueryDeadlineMs: 900, maxPollGapSeconds: 7 });
+  });
+
+  it("refuses a missing or non-positive setting and a busy timeout that is not shorter than the deadline", () => {
+    expect(() => observerReadSettings({})).toThrow("invalid certification observer read setting pollSeconds");
+    expect(() => observerReadSettings(withObserver({ maxPollGapSeconds: undefined }))).toThrow("invalid certification observer read setting maxPollGapSeconds");
+    expect(() => observerReadSettings(withObserver({ pollSeconds: 0 }))).toThrow("invalid certification observer read setting pollSeconds");
+    expect(() => observerReadSettings(withObserver({ perQueryDeadlineMs: 2.5 }))).toThrow("invalid certification observer read setting perQueryDeadlineMs");
+    for (const perQueryDeadlineMs of [OBSERVER_BUSY_TIMEOUT_MS, OBSERVER_BUSY_TIMEOUT_MS - 1]) {
+      expect(() => observerReadSettings(withObserver({ perQueryDeadlineMs }))).toThrow("busy timeout must be shorter than its per-query deadline");
     }
   });
 });

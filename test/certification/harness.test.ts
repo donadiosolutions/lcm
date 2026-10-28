@@ -197,6 +197,16 @@ describe("certification harness", () => {
     });
     expect(provenance.testedInputsSha256).toMatch(/^[0-9a-f]{64}$/u);
     expect(provenance.executionHost).toBe(witness);
+    expect(provenance).not.toHaveProperty("observerSettings");
+  });
+
+  it("records the run's observer read settings when given its contract", () => {
+    const checkout = createGitCheckoutFixture();
+    const { contract } = loadCertificationContract(new URL("./contract-v3.json", import.meta.url));
+    const provenance = captureExecutionProvenance(checkout.root, "a".repeat(64), "b".repeat(64), "c".repeat(64), {
+      executionHost: { capturedAt: "2026-10-27T00:00:00.000Z", hostnameSha256: "7".repeat(64) }, contract,
+    });
+    expect(provenance.observerSettings).toEqual({ pollSeconds: 1, busyTimeoutMs: 200, perQueryDeadlineMs: 250, maxPollGapSeconds: 2 });
   });
 
   it("fails a phase immediately when a machine exits and preserves redacted logs", async () => {
