@@ -16,6 +16,7 @@ import {
   observeAcknowledgments,
   observeUntilStopped,
   probeLcmTlsRejection,
+  readAcknowledgmentRows,
   redactDiagnosticText,
   runPublicMigrationFlow,
   startForegroundDaemon,
@@ -625,5 +626,81 @@ describe("certification observer poll completeness", () => {
     });
     expect(result.incomplete).toBe(true);
     expect(records(input.evidenceDirectory).map((record) => [record.status, record.incomplete])).toEqual([["ok", false], ["replaced", true]]);
+  });
+
+  // A real events database with the columns the observer worker selects, closed cleanly so
+  // SQLite has removed its -wal/-shm siblings.
+  function writeEventsDatabase(path: string) {
+    const database = new DatabaseSync(path);
+    database.exec("PRAGMA journal_mode = WAL");
+    database.exec(`CREATE TABLE events (event_id INTEGER PRIMARY KEY, event_uuid TEXT, machine_sequence TEXT, session_id TEXT, type TEXT,
+      source_hook TEXT, data TEXT, delivery_state TEXT, remote_inbox_id TEXT, acknowledged_at TEXT, remote_pruned_at TEXT)`);
+    database.prepare(`INSERT INTO events (event_uuid, machine_sequence, session_id, type, source_hook, data, delivery_state, remote_inbox_id, acknowledged_at)
+      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`).run("e1", "0000000000000000001", "s0", "task_create", "PostToolUse", "row", "acknowledged", "inbox-1", "2026-10-28T00:00:00.000Z");
+    database.close();
+  }
+
+  // Another connection holding an exclusive lock: a new reader gets SQLITE_BUSY until it closes.
+  function holdExclusiveLock(path: string) {
+    const holder = new DatabaseSync(path);
+    holder.exec("PRAGMA locking_mode = EXCLUSIVE");
+    holder.prepare("SELECT count(*) AS count FROM events").get();
+    return holder;
+  }
+
+  it("completes a poll whose real read waits out a transient lock", async () => {
+    const input = observerHome({ siblings: false });
+    writeEventsDatabase(input.database);
+    const holder = holdExclusiveLock(input.database);
+    let releasedAt = Number.POSITIVE_INFINITY;
+    let settledAt = Number.NEGATIVE_INFINITY;
+    const result = await observe(input, {
+      clock: [0, 1000], polls: 1,
+      // The production read (worker thread, 250 ms deadline); the lock is released 75 ms
+      // after the read starts.
+      readRows: async (path) => {
+        const release = new Promise((resolve) => setTimeout(resolve, 75)).then(() => {
+          holder.close();
+          releasedAt = performance.now();
+        });
+        try {
+          return await readAcknowledgmentRows(path);
+        } finally {
+          settledAt = performance.now();
+          await release;
+        }
+      },
+    });
+    expect(result.incomplete).toBe(false);
+    expect(result.observations.get("e1")?.inboxIds).toEqual(["inbox-1"]);
+    expect(settledAt).toBeGreaterThan(releasedAt);
+    expect(records(input.evidenceDirectory)).toEqual([expect.objectContaining({ status: "ok", incomplete: false })]);
+  });
+
+  it("keeps a poll incomplete when the lock outlasts the bounded read", async () => {
+    const input = observerHome({ siblings: false });
+    writeEventsDatabase(input.database);
+    const holder = holdExclusiveLock(input.database);
+    let readMs = Number.NaN;
+    try {
+      const result = await observe(input, {
+        clock: [0, 1000], polls: 1,
+        readRows: async (path) => {
+          const started = performance.now();
+          try {
+            return await readAcknowledgmentRows(path);
+          } finally {
+            readMs = performance.now() - started;
+          }
+        },
+      });
+      expect(result.incomplete).toBe(true);
+      expect(records(input.evidenceDirectory)).toEqual([expect.objectContaining({ status: "error", incomplete: true })]);
+      // The read waited its 200 ms busy timeout (or hit the 250 ms deadline) and then gave up.
+      expect(readMs).toBeGreaterThanOrEqual(200);
+      expect(readMs).toBeLessThan(1000);
+    } finally {
+      holder.close();
+    }
   });
 });
