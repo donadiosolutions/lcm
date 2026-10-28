@@ -5063,6 +5063,898 @@ describe("sanitizeError", () => {
     );
   });
 
+  describe("Bug #1785", () => {
+    const assertStable = (input: string, expected: string): void => {
+      const first = sanitizeError(input);
+      const second = sanitizeError(first);
+      const third = sanitizeError(second);
+
+      expect(first).toBe(expected);
+      expect(second).toBe(expected);
+      expect(third).toBe(expected);
+    };
+
+    const postClose = "file://h?x=[file://host?key=/public]\\Users\\FIRST\\x";
+    const redactedPostClose = "file://h?x=[file://host?key=<path>]<path>";
+    const rootedInner = "([https://other?key=/Users/SECOND/secret]";
+
+    it.each([
+      ["vertical tab", "\u000b"],
+      ["form feed", "\u000c"],
+      ["no-break space", "\u00a0"],
+      ["Ogham space mark", "\u1680"],
+      ["en quad", "\u2000"],
+      ["em quad", "\u2001"],
+      ["en space", "\u2002"],
+      ["em space", "\u2003"],
+      ["three-per-em space", "\u2004"],
+      ["four-per-em space", "\u2005"],
+      ["six-per-em space", "\u2006"],
+      ["figure space", "\u2007"],
+      ["punctuation space", "\u2008"],
+      ["thin space", "\u2009"],
+      ["hair space", "\u200a"],
+      ["line separator", "\u2028"],
+      ["paragraph separator", "\u2029"],
+      ["narrow no-break space", "\u202f"],
+      ["medium mathematical space", "\u205f"],
+      ["ideographic space", "\u3000"],
+      ["byte order mark", "\ufeff"],
+    ] as const)("keeps the measured tail through %s", (_name, whitespace) => {
+      assertStable(
+        postClose + whitespace + rootedInner,
+        redactedPostClose + "?key=<path>]",
+      );
+    });
+
+    it("keeps the measured tail through consecutive no-break spaces", () => {
+      assertStable(
+        postClose + "\u00a0\u00a0" + rootedInner,
+        redactedPostClose + "?key=<path>]",
+      );
+    });
+
+    it("uses the owned-drive rule after a no-break space", () => {
+      assertStable(
+        postClose + "\u00a0([https://other?key=C:/Users/SECOND/s]",
+        redactedPostClose + "?key=<path>]",
+      );
+    });
+
+    it.each([
+      ["space", " "],
+      ["tab", "\t"],
+      ["line feed", "\n"],
+      ["carriage return", "\r"],
+    ] as const)("hard-resets the tail at %s", (_name, whitespace) => {
+      assertStable(
+        postClose + whitespace + rootedInner,
+        redactedPostClose + whitespace + rootedInner,
+      );
+    });
+
+    it.each([
+      [
+        "colon bridge after no-break space",
+        postClose + "\u00a0:x[https://other?key=/Users/SECOND/secret]",
+        redactedPostClose + ":x[https://other?key=/Users/SECOND/secret]",
+      ],
+      [
+        "unmatched close before no-break space",
+        postClose + "]\u00a0([[https://other?key=/Users/SECOND/secret]]",
+        redactedPostClose + "]\u00a0([[https://other?key=/Users/SECOND/secret]]",
+      ],
+      [
+        "plain value after no-break space",
+        postClose + "\u00a0([https://other?key=plain]",
+        redactedPostClose + "?key=plain]",
+      ],
+      [
+        "public URL value after no-break space",
+        postClose + "\u00a0([https://other?key=https://public.test/x]",
+        redactedPostClose + "?key=https://public.test/x]",
+      ],
+      [
+        "opaque mail value after no-break space",
+        postClose + "\u00a0([https://other?key=mailto:user@public.test]",
+        redactedPostClose + "?key=mailto:user@public.test]",
+      ],
+      [
+        "zero-width space already keeps ownership",
+        postClose + "\u200b" + rootedInner,
+        redactedPostClose + "?key=<path>]",
+      ],
+    ] as const)("preserves the measured-tail control: %s", (_name, input, expected) => {
+      assertStable(input, expected);
+    });
+
+    const inherited =
+      "file://h?x=['https://outer.test/x?next=file:///Users/a/private.db'|\\Users\\CANARY\\x";
+    const redactedInherited =
+      "file://h?x=['https://outer.test/x?next=file://<path>'|<path>";
+
+    it.each([
+      [
+        "private-root second successor",
+        inherited + "&second/Users/B/x[https://inner?key=/home/C/s]]",
+        redactedInherited + "&second<path>?key=<path>]]",
+      ],
+      [
+        "rooted second successor",
+        inherited + "&/Users/B/x[https://inner?key=/home/C/s]]",
+        redactedInherited + "&<path>?key=<path>]]",
+      ],
+      [
+        "pipe-delimited second successor",
+        inherited + "|second/Users/B/x[https://inner?key=/home/C/s]]",
+        redactedInherited + "|second<path>?key=<path>]]",
+      ],
+      [
+        "third claimed successor",
+        inherited +
+          "&second/Users/B/x&third/home/C/x[https://inner?key=/home/C/s]]",
+        redactedInherited + "&second<path>&third<path>?key=<path>]]",
+      ],
+    ] as const)("re-arms an inherited tail for a %s", (_name, input, expected) => {
+      assertStable(input, expected);
+    });
+
+    it.each([
+      [
+        "ordinary second successor",
+        inherited + "&second/var/B/x[https://inner?key=/home/C/s]]",
+        redactedInherited + "&second/var/B/x[https://inner?key=/home/C/s]]",
+      ],
+      [
+        "plain value after a claimed successor",
+        inherited + "&second/Users/B/x[https://inner?key=plain]]",
+        redactedInherited + "&second<path>?key=plain]]",
+      ],
+      [
+        "public URL value after a claimed successor",
+        inherited + "&second/Users/B/x[https://inner?key=https://public.test/x]]",
+        redactedInherited + "&second<path>?key=https://public.test/x]]",
+      ],
+    ] as const)("preserves the inherited-tail control: %s", (_name, input, expected) => {
+      assertStable(input, expected);
+    });
+
+    const integratedInheritedPrefix =
+      "file://h?x=['https://outer.test/x?next=file:///Users/a/My Files/private.db'";
+    const integratedRedactedPrefix =
+      "file://h?x=['https://outer.test/x?next=file://<path>'";
+
+    it.each([
+      [
+        "zero-width immediate bracket composition",
+        integratedInheritedPrefix +
+          "\u200b|\\Users\\SECRET\\x[https://inner?key=/home/C/s]]",
+        integratedRedactedPrefix + "\u200b|<path>?key=<path>]]",
+      ],
+      [
+        "zero-width handoff with a claimed second successor",
+        integratedInheritedPrefix +
+          "\u200b|\\Users\\SECRET\\x&second/Users/B/x" +
+          "[https://inner?key=/home/C/s]]",
+        integratedRedactedPrefix +
+          "\u200b|<path>&second<path>?key=<path>]]",
+      ],
+    ] as const)("stabilizes the inherited-quote integration: %s", (_name, input, expected) => {
+      assertStable(input, expected);
+    });
+
+    const mixedSuccessorPrefix =
+      "file://h?x=[file:///Users/CHILD/x&later\\/home/alice/s";
+
+    it.each([
+      [
+        "rooted query value",
+        mixedSuccessorPrefix + "([https://other?key=/Users/SECRET2/x]",
+        "file://h?x=[file://<path>&later\\<path>?key=<path>]",
+      ],
+      [
+        "drive query value uses X1",
+        mixedSuccessorPrefix + "([https://other?key=C:/Users/SECRET2/x]",
+        "file://h?x=[file://<path>&later\\<path>?key=<path>]",
+      ],
+      [
+        "colon-single-slash query value",
+        mixedSuccessorPrefix + "([https://other?key=XY:/Users/SECRET2/x]",
+        "file://h?x=[file://<path>&later\\<path>?key=XY:<path>]",
+      ],
+      [
+        "queryless consumed-component bridge",
+        mixedSuccessorPrefix +
+          "[https://host]:x[https://other?key=/Users/SECRET2/x]",
+        "file://h?x=[file://<path>&later\\<path>?key=<path>]",
+      ],
+      [
+        "private-relative query stays readable",
+        mixedSuccessorPrefix + "?key=later/home/S/s]",
+        "file://h?x=[file://<path>&later\\<path>?key=later/home/S/s]",
+      ],
+    ] as const)("stabilizes the mixed-successor integration: %s", (_name, input, expected) => {
+      assertStable(input, expected);
+    });
+
+    it.each([
+      [
+        "backslash restart with a rooted value",
+        "file://h?x=[a]\\b[https://other?key=/Users/S/s]",
+        "file://h?x=[a]<path>?key=<path>]",
+      ],
+      [
+        "slash restart with a rooted value",
+        "file://h?x=[a]/b[https://other?key=/Users/S/s]",
+        "file://h?x=[a]<path>?key=<path>]",
+      ],
+      [
+        "backslash restart with a public rooted value",
+        "file://h?x=[a]\\b[https://other?key=/public/docs]",
+        "file://h?x=[a]<path>?key=<path>]",
+      ],
+      [
+        "backslash restart with a drive value",
+        "file://h?x=[a]\\b[https://other?key=C:/Users/S/s]",
+        "file://h?x=[a]<path>?key=<path>]",
+      ],
+    ] as const)("owns a bracket after a %s", (_name, input, expected) => {
+      assertStable(input, expected);
+    });
+
+    it.each([
+      ["private-looking relative value", "later/home/S/s"],
+      ["plain value", "plain"],
+      ["public URL value", "https://public.test/x"],
+      ["opaque mail value", "mailto:user@public.test"],
+    ] as const)("keeps a restarted-pathless %s visible", (_name, value) => {
+      assertStable(
+        "file://h?x=[a]\\b[https://other?key=" + value + "]",
+        "file://h?x=[a]<path>?key=" + value + "]",
+      );
+    });
+
+    const ownedValuePrefix = postClose + "([https://other?key=";
+    const redactedOwnedValuePrefix = redactedPostClose + "?key=";
+
+    it.each([
+      ["alphabetic prefix", "XY:/Users/S/s", "XY:<path>"],
+      ["public-looking path", "XY:/public/docs", "XY:<path>"],
+      ["second alphabetic prefix", "AB:/Users/S/s", "AB:<path>"],
+      ["numeric prefix", "1:/Users/x", "1:<path>"],
+      ["empty prefix", ":/Users/x", ":<path>"],
+      ["mail scheme text", "mailto:/Users/S/s", "mailto:<path>"],
+      ["file scheme text", "file:/Users/S/s", "file:<path>"],
+      ["slash-bearing prefix", "ab/cd:/Users/S/s", "ab/cd:<path>"],
+    ] as const)("redacts the single-slash owned value with %s", (_name, value, expected) => {
+      assertStable(
+        ownedValuePrefix + value + "]",
+        redactedOwnedValuePrefix + expected + "]",
+      );
+    });
+
+    it.each([
+      "https://public.test/x",
+      "https://public.test/Users/secret",
+      "http://public.test/a",
+      "XY://Users/S/s",
+      "custom+scheme://host/x",
+      "git://host/repo",
+      "12:30/Users/S/s",
+      "XY:\\Users\\S\\s",
+      "mailto:user@public.test",
+      "note",
+      "later/var/data",
+      ":/",
+      "XY:/",
+      "XY:////",
+      "/",
+    ] as const)("keeps the owned value %s visible", (value) => {
+      assertStable(
+        ownedValuePrefix + value + "]",
+        redactedOwnedValuePrefix + value + "]",
+      );
+    });
+
+    it("does not claim a colon-single-slash value outside an owned bracket", () => {
+      const input = "https://e.test/x?key=XY:/Users/S/s";
+
+      assertStable(input, input);
+    });
+
+    const activeChild = "file://h?x=[file:///Users/CHILD/x";
+
+    it.each([
+      [
+        "private-root successor with punctuation",
+        activeChild + "&later/home/alice/s([https://other?key=/Users/SECRET2/x]",
+        "file://h?x=[file://<path>&later<path>?key=<path>]",
+      ],
+      [
+        "private-root successor without punctuation",
+        activeChild + "&later/home/alice/s[https://other?key=/Users/SECRET2/x]",
+        "file://h?x=[file://<path>&later<path>?key=<path>]",
+      ],
+      [
+        "rooted successor with a drive value",
+        activeChild + "&/Users/alice/s([https://other?key=C:/Users/SECRET2/x]",
+        "file://h?x=[file://<path>&<path>?key=<path>]",
+      ],
+      [
+        "private-root successor with a drive value",
+        activeChild + "&later/home/alice/s([https://other?key=C:/Users/SECRET2/x]",
+        "file://h?x=[file://<path>&later<path>?key=<path>]",
+      ],
+      [
+        "private-root value inside the owned bracket",
+        activeChild +
+          "&later/Users/alice/s([https://other?a=1&later/home/SECOND/secret]",
+        "file://h?x=[file://<path>&later<path>?a=1&later<path>]",
+      ],
+      [
+        "pipe-delimited private-root successor",
+        activeChild + "|a/b//root//s([https://other?key=/Users/SECRET2/x]",
+        "file://h?x=[file://<path>|a<path>?key=<path>]",
+      ],
+      [
+        "successor with its own rooted query",
+        activeChild +
+          "&later/home/alice/s?key=/Users/Z([https://other?key=/Users/SECRET2/x]",
+        "file://h?x=[file://<path>&later<path>?key=<path>?key=<path>]",
+      ],
+      [
+        "public URL before the claimed successor",
+        activeChild +
+          "&https://e.test/x&later/home/bob/s([https://other?key=/Users/SECRET2/x]",
+        "file://h?x=[file://<path>&https://e.test/x&later<path>?key=<path>]",
+      ],
+      [
+        "consumed-component bridge",
+        activeChild +
+          "&later/home/alice/s[https://host]:x[https://other?key=/Users/SECRET2/x]",
+        "file://h?x=[file://<path>&later<path>?key=<path>]",
+      ],
+      [
+        "inherited quote around a private-root successor",
+        "file://h?x=[file:///Users/CHILD/x?next=['https://outer.test/x?next=" +
+          "file:///Users/a/private.db'&later/home/CANARY/x" +
+          "[https://other?key=/Users/SECRET2/x]]]",
+        "file://h?x=[file://<path>?next=['https://outer.test/x?next=file://<path>'" +
+          "&later<path>?key=<path>]]]",
+      ],
+      [
+        "inherited quote around a rooted Windows successor",
+        "file://h?x=[file:///Users/CHILD/x?next=['https://outer.test/x?next=" +
+          "file:///Users/a/private.db'&\\Users\\CANARY\\x" +
+          "[https://other?key=/Users/SECRET2/x]]]",
+        "file://h?x=[file://<path>?next=['https://outer.test/x?next=file://<path>'" +
+          "&<path>?key=<path>]]]",
+      ],
+    ] as const)("owns a bracket after an active-child %s", (_name, input, expected) => {
+      assertStable(input, expected);
+    });
+
+    it.each([
+      [
+        "ordinary successor",
+        activeChild + "&later/var/data([https://other?key=/Users/SECRET2/x]",
+        "file://h?x=[file://<path>&later/var/data([https://other?key=<path>]",
+      ],
+      [
+        "ordinary inner value",
+        activeChild + "&later/home/alice/s([https://other?a=1&later/var/data]",
+        "file://h?x=[file://<path>&later<path>?a=1&later/var/data]",
+      ],
+      [
+        "query-ended bridge",
+        activeChild +
+          "&later/home/alice/s[https://a?q=plain]:x[https://other?key=/Users/SECOND/s]",
+        "file://h?x=[file://<path>&later<path>?q=plain]:x" +
+          "[https://other?key=/Users/SECOND/s]",
+      ],
+      [
+        "query without an equals sign",
+        activeChild +
+          "&later/home/alice/s?plain([https://other?key=/Users/SECOND/s]",
+        "file://h?x=[file://<path>&later<path>?plain" +
+          "([https://other?key=/Users/SECOND/s]",
+      ],
+      [
+        "query without a name",
+        activeChild +
+          "&later/home/alice/s?=plain([https://other?key=/Users/SECOND/s]",
+        "file://h?x=[file://<path>&later<path>?=plain" +
+          "([https://other?key=/Users/SECOND/s]",
+      ],
+      [
+        "space before bracket punctuation",
+        activeChild + "&later/home/alice/s ([https://other?key=/Users/SECOND/s]",
+        "file://h?x=[file://<path>&later<path> ([https://other?key=/Users/SECOND/s]",
+      ],
+    ] as const)("preserves the active-child control: %s", (_name, input, expected) => {
+      assertStable(input, expected);
+    });
+
+    it.each([
+      [
+        "measured whitespace tail",
+        postClose +
+          "\u00a0([https://first?key=plain][https://other?key=/Users/SECOND/s]",
+        redactedPostClose + "?key=plain][https://other?key=/Users/SECOND/s]",
+      ],
+      [
+        "later inherited successor",
+        inherited +
+          "&second/Users/B/x([https://first?key=plain]" +
+          "[https://other?key=/Users/SECOND/s]",
+        redactedInherited +
+          "&second<path>?key=plain][https://other?key=/Users/SECOND/s]",
+      ],
+      [
+        "restarted backslash wrapper",
+        "file://h?x=[a]\\b([https://first?key=plain]" +
+          "[https://other?key=/Users/SECOND/s]",
+        "file://h?x=[a]<path>?key=plain][https://other?key=/Users/SECOND/s]",
+      ],
+      [
+        "restarted slash wrapper",
+        "file://h?x=[a]/b([https://first?key=plain]" +
+          "[https://other?key=/Users/SECOND/s]",
+        "file://h?x=[a]<path>?key=plain][https://other?key=/Users/SECOND/s]",
+      ],
+      [
+        "active private-root successor",
+        activeChild +
+          "&later/home/alice/s([https://first?key=plain]" +
+          "[https://other?key=/Users/SECOND/s]",
+        "file://h?x=[file://<path>&later<path>?key=plain]" +
+          "[https://other?key=/Users/SECOND/s]",
+      ],
+      [
+        "active rooted successor",
+        activeChild +
+          "&/Users/alice/s([https://first?key=plain]" +
+          "[https://other?key=/Users/SECOND/s]",
+        "file://h?x=[file://<path>&<path>?key=plain]" +
+          "[https://other?key=/Users/SECOND/s]",
+      ],
+      [
+        "active pipe successor",
+        activeChild +
+          "|a/b//root//s([https://first?key=plain]" +
+          "[https://other?key=/Users/SECOND/s]",
+        "file://h?x=[file://<path>|a<path>?key=plain]" +
+          "[https://other?key=/Users/SECOND/s]",
+      ],
+      [
+        "active successor after a public URL",
+        activeChild +
+          "&https://e.test/x&later/home/bob/s([https://first?key=plain]" +
+          "[https://other?key=/Users/SECOND/s]",
+        "file://h?x=[file://<path>&https://e.test/x&later<path>?key=plain]" +
+          "[https://other?key=/Users/SECOND/s]",
+      ],
+    ] as const)(
+      "ends %s ownership after a plain query component",
+      (_name, input, expected) => {
+        assertStable(input, expected);
+      },
+    );
+
+    it("retains direct post-close ownership across adjacent components", () => {
+      assertStable(
+        postClose +
+          "([https://first?key=plain][https://other?key=/Users/SECOND/s]",
+        redactedPostClose + "?key=plain][https://other?key=<path>]",
+      );
+    });
+
+    it.each(
+      (["", "\u200b", "\u200c", "\u200d", "\u2060"] as const).flatMap(
+        (interposer) =>
+          (["|", "&"] as const).map((delimiter) => [
+            `${interposer === "" ? "immediate" : "invisible-run"} ${delimiter} handoff`,
+            integratedInheritedPrefix +
+              interposer +
+              delimiter +
+              "\\Users\\CANARY\\x([https://first?key=plain]" +
+              "[https://second?key=/home/B/y]",
+            integratedRedactedPrefix +
+              interposer +
+              delimiter +
+              "<path>?key=plain][https://second?key=<path>]",
+          ] as const),
+      ),
+    )("retains original inherited adjacency for %s", (_name, input, expected) => {
+      assertStable(input, expected);
+    });
+
+    it.each([
+      [
+        "private-relative value after an ampersand handoff",
+        integratedInheritedPrefix +
+          "&\\Users\\CANARY\\x[https://first?key=plain]" +
+          "[https://second?a=1&later/home/B/y]",
+        integratedRedactedPrefix +
+          "&<path>?key=plain][https://second?a=1&later<path>]",
+      ],
+      [
+        "drive value after an invisible pipe handoff",
+        integratedInheritedPrefix +
+          "\u200b|\\Users\\CANARY\\x([https://first?key=plain]" +
+          "[https://second?key=C:/Users/B/y]",
+        integratedRedactedPrefix +
+          "\u200b|<path>?key=plain][https://second?key=<path>]",
+      ],
+      [
+        "rooted successor without an opening parenthesis",
+        integratedInheritedPrefix +
+          "|/Users/CANARY/x[https://first?key=plain]" +
+          "[https://second?key=/var/data]",
+        integratedRedactedPrefix +
+          "|<path>?key=plain][https://second?key=<path>]",
+      ],
+      [
+        "private-root relative successor",
+        integratedInheritedPrefix +
+          "|later/Users/CANARY/x([https://first?key=plain]" +
+          "[https://second?key=/home/B/y]",
+        integratedRedactedPrefix +
+          "|later<path>?key=plain][https://second?key=<path>]",
+      ],
+    ] as const)("retains the inherited-adjacency variant: %s", (_name, input, expected) => {
+      assertStable(input, expected);
+    });
+
+    it.each([
+      [
+        "soft-whitespace origin",
+        postClose +
+          "\u00a0([https://first?key=/Users/A/x]" +
+          "[https://second?key=/home/B/y]",
+        redactedPostClose + "?key=<path>][https://second?key=/home/B/y]",
+      ],
+      [
+        "later-successor origin",
+        inherited +
+          "&second/Users/B/x([https://first?key=/Users/A/x]" +
+          "[https://second?key=/home/B/y]]",
+        redactedInherited +
+          "&second<path>?key=<path>][https://second?key=/home/B/y]]",
+      ],
+      [
+        "restarted-wrapper origin",
+        "file://h?x=[a]\\b([https://first?key=/Users/A/x]" +
+          "[https://second?key=/home/B/y]",
+        "file://h?x=[a]<path>?key=<path>][https://second?key=/home/B/y]",
+      ],
+      [
+        "active-child origin",
+        activeChild +
+          "&later/home/alice/s([https://first?key=/Users/A/x]" +
+          "[https://second?key=/home/B/y]",
+        "file://h?x=[file://<path>&later<path>?key=<path>]" +
+          "[https://second?key=/home/B/y]",
+      ],
+    ] as const)("limits %s to its first component", (_name, input, expected) => {
+      assertStable(input, expected);
+    });
+
+    it.each([
+      [
+        "direct post-close owner",
+        postClose +
+          "([https://first?key=plain][https://second?key=XY:/Users/B/y]",
+        redactedPostClose +
+          "?key=plain][https://second?key=XY:/Users/B/y]",
+      ],
+      [
+        "immediate inherited owner",
+        inherited +
+          "([https://first?key=/Users/A/x]" +
+          "[https://second?key=XY:/Users/B/y]",
+        redactedInherited +
+          "?key=<path>][https://second?key=XY:/Users/B/y]",
+      ],
+      [
+        "soft-whitespace owner",
+        postClose +
+          "\u00a0([https://first?key=/Users/A/x]" +
+          "[https://second?key=mailto:/Users/B/y]",
+        redactedPostClose +
+          "?key=<path>][https://second?key=mailto:/Users/B/y]",
+      ],
+    ] as const)("keeps second-component colon text for %s", (_name, input, expected) => {
+      assertStable(input, expected);
+    });
+
+    it.each([
+      [
+        "single-segment restarted slash tail",
+        "file://h?x=[a]/b([https://inner?key=\\server\\share\\secret]",
+        "file://h?x=[a]<path>?key=\\server\\share\\secret]",
+      ],
+      [
+        "multi-segment restarted slash tail",
+        "file://h?x=[a]/bc/de([https://inner?key=\\server\\share\\secret]",
+        "file://h?x=[a]<path>?key=\\server\\share\\secret]",
+      ],
+    ] as const)("keeps the base UNC value for a %s", (_name, input, expected) => {
+      assertStable(input, expected);
+    });
+
+    it.each([
+      [
+        "soft-whitespace word bridge",
+        postClose +
+          "\u00a0([https://f?key=/Users/A/x]word[https://s?key=/home/B/y]",
+        redactedPostClose + "?key=<path>]word[https://s?key=/home/B/y]",
+      ],
+      [
+        "later-successor word/slash bridge",
+        inherited +
+          "&second/Users/B/x([https://f?key=/Users/A/x]" +
+          "w/x[https://s?key=/home/B/y]]",
+        redactedInherited +
+          "&second<path>?key=<path>]w/x[https://s?key=/home/B/y]]",
+      ],
+      [
+        "restarted-wrapper punctuation bridge",
+        "file://h?x=[a]\\b([https://f?key=/Users/A/x]" +
+          ".x[https://s?key=/home/B/y]",
+        "file://h?x=[a]<path>?key=<path>].x[https://s?key=/home/B/y]",
+      ],
+      [
+        "active-child path-word bridge",
+        activeChild +
+          "&later/home/alice/s([https://f?key=/Users/A/x]" +
+          "-x[https://s?key=/home/B/y]",
+        "file://h?x=[file://<path>&later<path>?key=<path>]" +
+          "-x[https://s?key=/home/B/y]",
+      ],
+    ] as const)("ends new ownership before a %s", (_name, input, expected) => {
+      assertStable(input, expected);
+    });
+
+    it.each([
+      [
+        "soft-whitespace slash-drive bridge",
+        postClose +
+          "\u00a0([https://f?key=/Users/A/x]/x[https://s?key=C:/Users/B/y]",
+        redactedPostClose + "?key=<path>]<path>?key=C:<path>]",
+      ],
+      [
+        "later-successor slash-drive bridge",
+        inherited +
+          "&second/Users/B/x([https://f?key=/Users/A/x]" +
+          "/x[https://s?key=C:/Users/B/y]]",
+        redactedInherited +
+          "&second<path>?key=<path>]<path>?key=C:<path>]]",
+      ],
+      [
+        "restarted-wrapper slash-drive bridge",
+        "file://h?x=[a]\\b([https://f?key=/Users/A/x]" +
+          "/x[https://s?key=C:/Users/B/y]",
+        "file://h?x=[a]<path>?key=<path>]<path>?key=C:<path>]",
+      ],
+      [
+        "active-child slash-drive bridge",
+        activeChild +
+          "&later/home/alice/s([https://f?key=/Users/A/x]" +
+          "/x[https://s?key=C:/Users/B/y]",
+        "file://h?x=[file://<path>&later<path>?key=<path>]" +
+          "<path>?key=C:<path>]",
+      ],
+    ] as const)("preserves the independent drive spelling for a %s", (_name, input, expected) => {
+      assertStable(input, expected);
+    });
+
+    it.each([
+      [
+        "soft-whitespace slash-rooted bridge",
+        postClose +
+          "\u00a0([https://f?key=/Users/A/x]/x[https://s?key=/home/B/y]",
+        redactedPostClose + "?key=<path>]<path>?key=<path>]",
+      ],
+      [
+        "later-successor slash-rooted bridge",
+        inherited +
+          "&second/Users/B/x([https://f?key=/Users/A/x]" +
+          "/x[https://s?key=/home/B/y]]",
+        redactedInherited +
+          "&second<path>?key=<path>]<path>?key=<path>]]",
+      ],
+      [
+        "restarted-wrapper slash-rooted bridge",
+        "file://h?x=[a]\\b([https://f?key=/Users/A/x]" +
+          "/x[https://s?key=/home/B/y]",
+        "file://h?x=[a]<path>?key=<path>]<path>?key=<path>]",
+      ],
+      [
+        "active-child slash-rooted bridge",
+        activeChild +
+          "&later/home/alice/s([https://f?key=/Users/A/x]" +
+          "/x[https://s?key=/home/B/y]",
+        "file://h?x=[file://<path>&later<path>?key=<path>]" +
+          "<path>?key=<path>]",
+      ],
+    ] as const)("completes the independent rooted value for a %s", (_name, input, expected) => {
+      assertStable(input, expected);
+    });
+
+    it("tracks nested brackets before an independent slash-bridge drive", () => {
+      assertStable(
+        "file://h?x=[a]\\b([https://f?key=/Users/A/x]" +
+          "/x[[https://nested]?key=C:/Users/B/y]",
+        "file://h?x=[a]<path>?key=<path>]<path>?key=C:<path>]",
+      );
+    });
+
+    it("leaves a slash bridge without another component to the base scanner", () => {
+      assertStable(
+        "file://h?x=[a]\\b([https://f?key=/Users/A/x]/xplain",
+        "file://h?x=[a]<path>?key=<path>]<path>",
+      );
+    });
+
+    it.each([
+      ["soft-whitespace", postClose + "\u00a0", redactedPostClose],
+      ["later successor", inherited + "&second/Users/B/x", redactedInherited + "&second<path>"],
+      ["restarted wrapper", "file://h?x=[a]\\b", "file://h?x=[a]<path>"],
+    ] as const)("keeps a backslash-bridged drive visible for a %s origin", (_name, prefix, expectedPrefix) => {
+      assertStable(
+        prefix + "([https://f?key=/Users/A/x]\\x[https://s?key=C:/Users/B/y]",
+        expectedPrefix + "?key=<path>]\\x[https://s?key=C:/Users/B/y]",
+      );
+    });
+
+    it.each([
+      ["UNC value", "\\srv\\share\\secret"],
+      ["Users value", "\\Users\\B\\y"],
+    ] as const)("completes an active-child named %s", (_name, value) => {
+      assertStable(
+        activeChild +
+          "&later/home/alice/s([https://f?key=/Users/A/x&k2=" +
+          value +
+          "]",
+        "file://h?x=[file://<path>&later<path>?key=<path>&k2=<path>]",
+      );
+    });
+
+    it.each([
+      ["soft-whitespace", postClose + "\u00a0", redactedPostClose],
+      ["restarted wrapper", "file://h?x=[a]\\b", "file://h?x=[a]<path>"],
+    ] as const)("keeps a named backslash value visible for a %s origin", (_name, prefix, expectedPrefix) => {
+      assertStable(
+        prefix + "([https://f?key=/Users/A/x&k2=\\srv\\share\\secret]",
+        expectedPrefix + "?key=<path>&k2=\\srv\\share\\secret]",
+      );
+    });
+
+    it("applies X1 to a named drive parameter in the first owned component", () => {
+      assertStable(
+        activeChild +
+          "&later/home/alice/s([https://f?key=/Users/A/x&k2=C:/Users/B/y]",
+        "file://h?x=[file://<path>&later<path>?key=<path>&k2=<path>]",
+      );
+    });
+
+    it("records the independent slash-bridge colon pass sequence", () => {
+      const input =
+        "file://h?x=[a]\\b([https://f?key=/Users/A/x]" +
+        "/x[https://s?key=XY:/Users/B/y]";
+      const first = sanitizeError(input);
+      const second = sanitizeError(first);
+      const third = sanitizeError(second);
+
+      expect(first).toBe(
+        "file://h?x=[a]<path>?key=<path>]<path>?key=XY:/Users/B/y]",
+      );
+      expect(second).toBe(
+        "file://h?x=[a]<path>?key=<path>]<path>?key=XY:<path>]",
+      );
+      expect(third).toBe(second);
+    });
+
+    describe("claims nested inside an owned bracket", () => {
+      const quoted = "file://h?x=['https://o?x=file:///a'";
+      const redactedQuoted = "file://h?x=['https://o?x=file://<path>'";
+      const secretBracket = "[https://o?key=/Users/SECRET/s]]";
+
+      it.each([
+        ["pipe", "|"],
+        ["ampersand", "&"],
+      ] as const)(
+        "keeps the inherited owner through an active child after %s",
+        (_name, delimiter) => {
+          assertStable(
+            quoted + delimiter + "\\a[file:///b&/c]" + secretBracket,
+            redactedQuoted + delimiter + "<path>&<path>][https://o?key=<path>]]",
+          );
+        },
+      );
+
+      it.each([
+        ["zero width space", "\u200b"],
+        ["zero width non-joiner", "\u200c"],
+        ["zero width joiner", "\u200d"],
+        ["word joiner", "\u2060"],
+      ] as const)("keeps the inherited owner behind a %s run", (_name, interposer) => {
+        assertStable(
+          quoted + interposer + "|\\a[file:///b&/c]" + secretBracket,
+          redactedQuoted + interposer + "|<path>&<path>][https://o?key=<path>]]",
+        );
+      });
+
+      it.each([
+        ["rooted", "/Users/SECRET/x", "<path>"],
+        ["private-relative", "later/Users/SECRET/x", "later<path>"],
+      ] as const)("keeps a %s inherited successor owner", (_name, successor, expected) => {
+        assertStable(
+          quoted + "|" + successor + "[file:///b&/c]" + secretBracket,
+          redactedQuoted + "|" + expected + "&<path>][https://o?key=<path>]]",
+        );
+      });
+
+      it.each([
+        ["pipe child", "[file:///b|/c]", "<path>|<path>]"],
+        ["backslash child", "[file:///b&\\c]", "<path>&<path>]"],
+        ["later rooted successor", "[file:///b&/c&/d]", "<path>&<path>&<path>]"],
+        ["later private successor", "[file:///b&/c&later/Users/d]", "<path>&<path>&later<path>]"],
+        ["later pipe successor", "[file:///b&/c|/d]", "<path>&<path>|<path>]"],
+        ["queried private child", "[file:///b?q=1&later/home/c]", "<path>?q=1&later<path>]"],
+        ["mixed-separator child", "[file:///b&later\\/home/c]", "<path>&later\\<path>]"],
+        ["restarted backslash wrapper", "[file://h2?x=[a]\\b]", "<path>?x=[a]<path>]"],
+        ["restarted slash wrapper", "[file://h2?x=[a]/b]", "<path>?x=[a]<path>]"],
+        ["restarted nested bracket", "[file://h2?x=[a][/Users/S/s]]", "<path>?x=[a][<path>]]"],
+        [
+          "child with its own bracket",
+          "[file:///b&/c([https://i?key=/Users/I/s]]",
+          "<path>&<path>?key=<path>]]",
+        ],
+      ] as const)("keeps the inherited owner through a %s", (_name, inner, expected) => {
+        assertStable(
+          quoted + "|\\a" + inner + secretBracket,
+          redactedQuoted + "|" + expected + "[https://o?key=<path>]]",
+        );
+      });
+
+      it.each([
+        ["drive", "C:/Users/SECRET/s", "<path>"],
+        ["private-relative", "later/home/SECRET/s", "later/home/SECRET/s"],
+        ["colon", "XY:/Users/SECRET/s", "XY:/Users/SECRET/s"],
+        ["plain", "plain", "plain"],
+        ["public", "https://public.test/x", "https://public.test/x"],
+      ] as const)("keeps the adjacent %s value as before", (_name, value, expected) => {
+        assertStable(
+          quoted + "|\\a[file:///b&/c][https://o?key=" + value + "]]",
+          redactedQuoted + "|<path>&<path>][https://o?key=" + expected + "]]",
+        );
+      });
+
+      it.each([
+        ["bridged", ":x"],
+        ["parenthesised", "("],
+      ] as const)("leaves a %s rooted value visible as before", (_name, bridge) => {
+        assertStable(
+          quoted + "|\\a[file:///b&/c]" + bridge + secretBracket,
+          redactedQuoted + "|<path>&<path>]" + bridge + secretBracket,
+        );
+      });
+
+      it.each([
+        ["active child", "[file:///b&/c]", "&<path>]"],
+        ["later successor", "[file:///b&/c&/d]", "&<path>&<path>]"],
+        ["restarted wrapper", "[file://h2?x=[a]\\b]", "?x=[a]<path>]"],
+      ] as const)("keeps the direct post-close owner through a %s", (_name, inner, expected) => {
+        assertStable(
+          postClose + inner + "[https://o?key=/Users/SECRET/s]",
+          redactedPostClose + expected + "[https://o?key=<path>]",
+        );
+      });
+    });
+  });
+
   describe("Bug #1789", () => {
     const prefix = "file://h?x=['https://outer.test/x?next=file:///Users/a/My Files/private.db'";
     const redactedPrefix = "file://h?x=['https://outer.test/x?next=file://<path>'";

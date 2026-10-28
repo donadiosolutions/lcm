@@ -1,0 +1,7 @@
+references: ["#1785"]
+rationale: >-
+  #1785 extends measured bracket-tail ownership across additional whitespace,
+  claimed successors, restarted wrappers, and single-slash colon values while
+  preserving public and ordinary relative values.
+pins:
+  - ["src/daemon/safe-error.ts", "unit-daemon-core"]
