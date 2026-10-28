@@ -5047,6 +5047,80 @@ describe("sanitizeError", () => {
     ] as const)("preserves the active-child control: %s", (_name, input, expected) => {
       assertStable(input, expected);
     });
+
+    it.each([
+      [
+        "measured whitespace tail",
+        postClose +
+          "\u00a0([https://first?key=plain][https://other?key=/Users/SECOND/s]",
+        redactedPostClose + "?key=plain][https://other?key=/Users/SECOND/s]",
+      ],
+      [
+        "later inherited successor",
+        inherited +
+          "&second/Users/B/x([https://first?key=plain]" +
+          "[https://other?key=/Users/SECOND/s]",
+        redactedInherited +
+          "&second<path>?key=plain][https://other?key=/Users/SECOND/s]",
+      ],
+      [
+        "restarted backslash wrapper",
+        "file://h?x=[a]\\b([https://first?key=plain]" +
+          "[https://other?key=/Users/SECOND/s]",
+        "file://h?x=[a]<path>?key=plain][https://other?key=/Users/SECOND/s]",
+      ],
+      [
+        "restarted slash wrapper",
+        "file://h?x=[a]/b([https://first?key=plain]" +
+          "[https://other?key=/Users/SECOND/s]",
+        "file://h?x=[a]<path>?key=plain][https://other?key=/Users/SECOND/s]",
+      ],
+      [
+        "active private-root successor",
+        activeChild +
+          "&later/home/alice/s([https://first?key=plain]" +
+          "[https://other?key=/Users/SECOND/s]",
+        "file://h?x=[file://<path>&later<path>?key=plain]" +
+          "[https://other?key=/Users/SECOND/s]",
+      ],
+      [
+        "active rooted successor",
+        activeChild +
+          "&/Users/alice/s([https://first?key=plain]" +
+          "[https://other?key=/Users/SECOND/s]",
+        "file://h?x=[file://<path>&<path>?key=plain]" +
+          "[https://other?key=/Users/SECOND/s]",
+      ],
+      [
+        "active pipe successor",
+        activeChild +
+          "|a/b//root//s([https://first?key=plain]" +
+          "[https://other?key=/Users/SECOND/s]",
+        "file://h?x=[file://<path>|a<path>?key=plain]" +
+          "[https://other?key=/Users/SECOND/s]",
+      ],
+      [
+        "active successor after a public URL",
+        activeChild +
+          "&https://e.test/x&later/home/bob/s([https://first?key=plain]" +
+          "[https://other?key=/Users/SECOND/s]",
+        "file://h?x=[file://<path>&https://e.test/x&later<path>?key=plain]" +
+          "[https://other?key=/Users/SECOND/s]",
+      ],
+    ] as const)(
+      "ends %s ownership after a plain query component",
+      (_name, input, expected) => {
+        assertStable(input, expected);
+      },
+    );
+
+    it("retains direct post-close ownership across adjacent components", () => {
+      assertStable(
+        postClose +
+          "([https://first?key=plain][https://other?key=/Users/SECOND/s]",
+        redactedPostClose + "?key=plain][https://other?key=<path>]",
+      );
+    });
   });
 
 
