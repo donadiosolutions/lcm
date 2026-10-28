@@ -723,6 +723,17 @@ bundle and keep provider, credential, quarantine, and recovery sessions private.
   and newlines end the composition; whitespace-separated prose, public URLs,
   and ordinary unspaced relative tails remain unchanged.
 
+  A measured rooted tail also keeps this bracket ownership across JavaScript
+  whitespace other than space, tab, line feed, and carriage return when that
+  character is still inside the consumed path span. Those four characters stay
+  hard boundaries. A later rooted or recognized private-root successor in the
+  same inherited wrapper owns the bracket components it consumes, as does a
+  rooted tail that follows a restarted pathless wrapper. Inside any such owned
+  component, a colon followed by one slash and a path word redacts from that
+  slash while preserving the prefix, such as `label:<path>`. A `://` authority,
+  a slash with no following path word, ordinary relative text, and public or
+  opaque URL values remain readable.
+
   An exact nested `file://` child inside a public URL that began at a quote can
   inherit that enclosing quote through its matching close. This removes a
   space-bearing private path and any suffix inside the quote on the first pass,
