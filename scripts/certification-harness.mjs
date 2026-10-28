@@ -338,7 +338,7 @@ process.stdout.write(JSON.stringify(stats.backendDiagnostics));`;
 }
 
 export async function runManagedMachinePair(input, dependencies = {}) {
-  const contract = input.contract ?? loadCertificationContract(new URL("../test/certification/contract-v2.json", import.meta.url), { requireApproved: false }).contract;
+  const contract = input.contract ?? loadCertificationContract(new URL("../test/certification/contract-v3.json", import.meta.url), { requireApproved: false }).contract;
   const containerCli = dependencies.containerCli ?? "podman";
   const lifecycle = dependencies.processLifecycle ?? createProcessLifecycle();
   const processRunner = dependencies.processRunner
@@ -1076,8 +1076,8 @@ export function stageBuiltPackage({ sourceRoot, destination, machineAgentPath })
   cpSync(machineAgentPath, join(destination, "certification", "machine-agent.mjs"), { errorOnExist: true });
   cpSync(new URL("../test/certification/schedule.mjs", import.meta.url), join(destination, "certification", "schedule.mjs"), { errorOnExist: true });
   cpSync(new URL("../test/certification/contract.mjs", import.meta.url), join(destination, "certification", "contract.mjs"), { errorOnExist: true });
-  cpSync(new URL("../test/certification/contract-v2.json", import.meta.url), join(destination, "certification", "contract-v2.json"), { errorOnExist: true });
-  cpSync(new URL("../test/certification/contract-v2.approval.json", import.meta.url), join(destination, "certification", "contract-v2.approval.json"), { errorOnExist: true });
+  cpSync(new URL("../test/certification/contract-v3.json", import.meta.url), join(destination, "certification", "contract-v3.json"), { errorOnExist: true });
+  cpSync(new URL("../test/certification/contract-v3.approval.json", import.meta.url), join(destination, "certification", "contract-v3.approval.json"), { errorOnExist: true });
   cpSync(new URL("../test/certification/backend-publication.mjs", import.meta.url), join(destination, "certification", "backend-publication.mjs"), { errorOnExist: true });
   cpSync(new URL("../test/certification/sqlite-observer-worker.mjs", import.meta.url), join(destination, "certification", "sqlite-observer-worker.mjs"), { errorOnExist: true });
   const hash = createHash("sha256");
@@ -1156,7 +1156,7 @@ export function prepareEvidenceDirectory(path, metadata) {
 }
 
 export async function runLocalCertification(options, dependencies = {}) {
-  const contract = options.contract ?? loadCertificationContract(new URL("../test/certification/contract-v2.json", import.meta.url), { requireApproved: false }).contract;
+  const contract = options.contract ?? loadCertificationContract(new URL("../test/certification/contract-v3.json", import.meta.url), { requireApproved: false }).contract;
   if ((dependencies.environment ?? process.env).LCM_TEST_CONTAINER_CLI !== "podman") {
     throw new Error("local certification requires LCM_TEST_CONTAINER_CLI=podman");
   }
@@ -1506,7 +1506,7 @@ export async function runLocalCertification(options, dependencies = {}) {
 
 export async function main(argv = process.argv.slice(2)) {
   const options = parseCertificationArguments(argv);
-  const loaded = loadCertificationContract(new URL("../test/certification/contract-v2.json", import.meta.url));
+  const loaded = loadCertificationContract(new URL("../test/certification/contract-v3.json", import.meta.url));
   options.contract = loaded.contract;
   options.contractSha256 = loaded.sha256;
   options.contractStatus = loaded.status;

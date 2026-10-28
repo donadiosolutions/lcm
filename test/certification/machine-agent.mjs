@@ -35,6 +35,14 @@ export function createHookFixture({ kind, bytes, sessionId, cwd }) {
   throw new Error("unsupported hook fixture kind");
 }
 
+// The stored event text the capture oracle expects for a hook fixture: the prompt,
+// or the TaskCreate "subject → status" line, capped at the product's 2,000-character
+// DATA_SOFT_CAP with a trailing "...".
+export function expectedHookPayload(kind, fixture) {
+  const data = kind === "user-prompt" ? fixture.prompt : `${fixture.tool_input.subject} → ${fixture.tool_input.status}`;
+  return data.length > 2000 ? `${data.slice(0, 2000)}...` : data;
+}
+
 export function machineStoredConfig(environment) {
   if (!environment.LCM_CERT_MIGRATION_ROLE) throw new Error("certification migration role is required");
   return {
@@ -501,13 +509,11 @@ export async function executeDeterministicSchedule({
             if (resolvedDatabase) {
               try {
                 const after = await readEventRows(resolvedDatabase, entry.sessionId);
-                const expectedData = entry.kind === "user-prompt" ? fixture.prompt : `${fixture.tool_input.subject} → ${fixture.tool_input.status}`;
-                const truncatedExpectedData = expectedData.length > 2000 ? `${expectedData.slice(0, 2000)}...` : expectedData;
                 captured = captureInvocationRow(before, after, {
                   sessionId: entry.sessionId,
                   sourceHook: entry.kind === "user-prompt" ? "UserPromptSubmit" : "PostToolUse",
                   type: entry.kind === "user-prompt" ? "user_decision" : "task_create",
-                  payloadSha256: createHash("sha256").update(truncatedExpectedData).digest("hex"),
+                  payloadSha256: createHash("sha256").update(expectedHookPayload(entry.kind, fixture)).digest("hex"),
                 });
                 break;
               } catch (error) { captureError = error; }
@@ -618,15 +624,26 @@ export async function executeDeterministicSchedule({
   return Promise.all(operations);
 }
 
-async function observeUntilStopped({ home, evidenceDirectory, signal }) {
+// Polls the local events database once per second with a bounded read-only query.
+// A poll is incomplete only when the read fails, the gap since the previous poll
+// exceeds two seconds, or the database file or its parent directory is replaced
+// (including the database disappearing after it was seen). The -wal/-shm siblings
+// are recorded as a diagnostic only: SQLite removes them when its last connection
+// closes cleanly, so their absence is not missing evidence.
+export async function observeUntilStopped({
+  home, evidenceDirectory, signal,
+  now = () => performance.now(),
+  readRows = readAcknowledgmentRows,
+  pause = (milliseconds) => new Promise((resolve) => setTimeout(resolve, milliseconds)),
+}) {
   let observations = new Map();
-  let priorPoll = performance.now();
+  let priorPoll = now();
   let identityWitness;
   let incomplete = false;
   let seenDatabase = false;
   try {
     while (!signal.aborted) {
-    const currentPoll = performance.now();
+    const currentPoll = now();
     const gapMs = currentPoll - priorPoll;
     priorPoll = currentPoll;
     const databasePath = findEventsDatabase(home);
@@ -646,29 +663,30 @@ async function observeUntilStopped({ home, evidenceDirectory, signal }) {
       identityWitness = currentWitness;
       const siblingsPresent = existsSync(`${databasePath}-wal`) && existsSync(`${databasePath}-shm`);
       try {
-        observations = observeAcknowledgments(observations, await readAcknowledgmentRows(databasePath));
+        observations = observeAcknowledgments(observations, await readRows(databasePath));
       } catch (error) {
         incomplete = true;
         appendNdjson(join(evidenceDirectory, "observer.ndjson"), { monotonicMs: currentPoll, gapMs, status: "error", errorClass: error?.name ?? "Error", incomplete: true, acknowledgments: Object.fromEntries(observations) });
-        await new Promise((resolve) => setTimeout(resolve, 1000));
+        await pause(1000);
         continue;
       }
-      incomplete ||= gapMs > 2000 || !siblingsPresent;
+      const pollIncomplete = gapMs > 2000;
+      incomplete ||= pollIncomplete;
       appendNdjson(join(evidenceDirectory, "observer.ndjson"), {
         monotonicMs: currentPoll,
         gapMs,
         status: "ok",
         siblingsPresent,
-        incomplete: gapMs > 2000 || !siblingsPresent,
+        incomplete: pollIncomplete,
         acknowledgments: Object.fromEntries(observations),
       });
     }
-    await new Promise((resolve) => setTimeout(resolve, 1000));
+    await pause(1000);
     }
   } catch (error) {
     try {
       appendNdjson(join(evidenceDirectory, "observer.ndjson"), {
-        monotonicMs: performance.now(), status: "error", errorClass: error?.name ?? "Error",
+        monotonicMs: now(), status: "error", errorClass: error?.name ?? "Error",
         incomplete: true, acknowledgments: Object.fromEntries(observations),
       });
     } catch {
@@ -859,7 +877,7 @@ export async function runMachineAgent(environment = process.env) {
   const machine = process.argv[process.argv.indexOf("--machine") + 1];
   if (!evidenceDirectory || !['a', 'b'].includes(machine)) throw new Error("missing machine-agent configuration");
   mkdirSync(evidenceDirectory, { recursive: true, mode: 0o700 });
-  const { contract } = loadCertificationContract(new URL("./contract-v2.json", import.meta.url));
+  const { contract } = loadCertificationContract(new URL("./contract-v3.json", import.meta.url));
   const lcm = "/opt/lcm/dist/lcm.mjs";
   const name = `cert-${environment.LCM_CERT_RUN_ID}-${machine}`;
   const project = join(environment.HOME, "project");

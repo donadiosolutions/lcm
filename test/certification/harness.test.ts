@@ -1,5 +1,5 @@
 import { createHash } from "node:crypto";
-import { mkdirSync, mkdtempSync, readFileSync, writeFileSync } from "node:fs";
+import { mkdirSync, mkdtempSync, readFileSync, readdirSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { describe, expect, it, vi } from "vitest";
@@ -23,6 +23,7 @@ import {
   verifyDistinctMachineIdentities,
   waitForMachineFiles,
 } from "../../scripts/certification-harness.mjs";
+import { loadCertificationContract } from "./contract.mjs";
 import { createGitCheckoutFixture } from "./git-checkout-fixture.js";
 
 vi.mock("pg", () => ({
@@ -301,13 +302,20 @@ describe("certification harness", () => {
     expect(result.sha256).toMatch(/^[0-9a-f]{64}$/u);
     expect(readFileSync(join(target, "dist", "lcm.mjs"), "utf8")).toBe("dist/lcm.mjs");
     expect(readFileSync(join(target, "certification", "machine-agent.mjs"), "utf8")).toBe("export {};\n");
-    expect(JSON.parse(readFileSync(join(target, "certification", "contract-v2.approval.json"), "utf8")))
-      .toMatchObject({ contractSha256: "6dc8cef4c170c851bbc4c9626ee4a31c3d5cf7a7f4b41bb4e4852c88759222e4" });
+    // The machines receive only the approved v3 contract and its approval record.
+    const certification = join(target, "certification");
+    const approvedContractSha256 = "ea6ccaaa77212c3c7486cdc85af03a985dde05eeef18096a4511163d0f490839";
+    expect(readdirSync(certification).filter((name) => name.startsWith("contract-v")).sort()).toEqual(["contract-v3.approval.json", "contract-v3.json"]);
+    expect(createHash("sha256").update(readFileSync(join(certification, "contract-v3.json"))).digest("hex")).toBe(approvedContractSha256);
+    expect(JSON.parse(readFileSync(join(certification, "contract-v3.approval.json"), "utf8"))).toMatchObject({ contractSha256: approvedContractSha256 });
+    expect(loadCertificationContract(join(certification, "contract-v3.json"))).toMatchObject({ status: "approved", sha256: approvedContractSha256, contract: { version: 3 } });
   });
 
   it("creates the exact full schedule and records fault transitions", () => {
     const schedule = createDeterministicSchedule({ profile: "full", machine: "a", runId: "run" });
     expect(schedule.filter((entry: any) => entry.op === "hook")).toHaveLength(600);
+    expect([...new Set(schedule.filter((entry: any) => entry.op === "hook").map((entry: any) => entry.primaryTextBytes))].sort((left, right) => left - right))
+      .toEqual([256, 1024, 6144]);
     expect(schedule.filter((entry: any) => entry.op === "search")).toHaveLength(1200);
     expect(schedule.filter((entry: any) => entry.op === "store")).toHaveLength(600);
     expect(schedule.filter((entry: any) => entry.op === "snapshot")).toHaveLength(100);

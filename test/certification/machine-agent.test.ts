@@ -1,7 +1,8 @@
-import { mkdtempSync, readFileSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, renameSync, writeFileSync } from "node:fs";
 import { EventEmitter } from "node:events";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import { DatabaseSync } from "node:sqlite";
 import { describe, expect, it, vi } from "vitest";
 import {
   createAdmissionController,
@@ -9,9 +10,11 @@ import {
   captureDoctorEvidence,
   collectDiagnosticSecrets,
   executeDeterministicSchedule,
+  expectedHookPayload,
   isAcknowledgedRow,
   machineStoredConfig,
   observeAcknowledgments,
+  observeUntilStopped,
   probeLcmTlsRejection,
   redactDiagnosticText,
   runPublicMigrationFlow,
@@ -23,6 +26,12 @@ import {
 } from "./machine-agent.mjs";
 import { extractPostToolEvents, extractUserPromptEvents } from "../../src/hooks/extractors.js";
 import { normalizePostToolInput } from "../../src/hooks/post-tool-normalization.js";
+import { scrubExtractedEvents } from "../../src/hooks/event-scrubbing.js";
+
+// The workload's primary-text cycle, read from the approved contract file itself so
+// that any cycle edit is exercised against the product's capture admission below.
+const primaryTextBytesCycle: number[] = JSON.parse(readFileSync(new URL("./contract-v3.json", import.meta.url), "utf8"))
+  .workload.primaryTextBytesCycle;
 
 describe("certification machine agent", () => {
   it("configures typed values before backend publication", () => {
@@ -37,7 +46,7 @@ describe("certification machine agent", () => {
     expect(() => machineStoredConfig({})).toThrow("migration role");
   });
 
-  it.each([256, 1024, 8192])("creates exact-byte one-event fixtures for %i bytes", (bytes) => {
+  it.each([...new Set(primaryTextBytesCycle)])("creates exact-byte one-event fixtures for %i bytes", (bytes) => {
     const userPrompt = createHookFixture({ kind: "user-prompt", bytes, sessionId: "s0", cwd: "/project" });
     const postTool = createHookFixture({ kind: "post-tool", bytes, sessionId: "s0", cwd: "/project" });
     expect(Buffer.byteLength(userPrompt.prompt)).toBe(bytes);
@@ -45,14 +54,23 @@ describe("certification machine agent", () => {
     expect(postTool.tool_name).toBe("TaskCreate");
   });
 
-  it.each([256, 1024, 1024, 8192])("pins one extracted event for both fixture kinds at %i bytes", (bytes) => {
-    const userPrompt = createHookFixture({ kind: "user-prompt", bytes, sessionId: "s0", cwd: "/project" });
-    const postTool = createHookFixture({ kind: "post-tool", bytes, sessionId: "s0", cwd: "/project" });
-    expect(extractUserPromptEvents(userPrompt.prompt)).toHaveLength(1);
-    expect(extractUserPromptEvents(userPrompt.prompt)[0]?.type).toBe("user_decision");
-    expect(extractPostToolEvents(normalizePostToolInput(postTool))).toHaveLength(1);
-    expect(extractPostToolEvents(normalizePostToolInput(postTool))[0]?.type).toBe("task_create");
-  });
+  // Contract cardinality check for all 8 kind/length combinations: extraction yields one
+  // event, and the product's scrub admission (MAX_SCRUB_INPUT) keeps exactly that event
+  // with the payload the runtime capture oracle hashes. A fixture over the product limit
+  // fails here instead of aborting a full run.
+  it.each(primaryTextBytesCycle.flatMap((bytes) => (["user-prompt", "post-tool"] as const).map((kind) => [kind, bytes] as const)))(
+    "admits exactly one scrubbed %s event at %i bytes", async (kind, bytes) => {
+      const cwd = mkdtempSync(join(tmpdir(), "lcm-cert-fixture-admission-"));
+      const fixture = createHookFixture({ kind, bytes, sessionId: "s0", cwd });
+      const extracted = kind === "user-prompt"
+        ? extractUserPromptEvents(fixture.prompt)
+        : extractPostToolEvents(normalizePostToolInput(fixture));
+      expect(extracted.map((event) => event.type)).toEqual([kind === "user-prompt" ? "user_decision" : "task_create"]);
+      const admitted = await scrubExtractedEvents(extracted, cwd, []);
+      expect(admitted).toHaveLength(1);
+      expect(admitted[0]?.data).toBe(expectedHookPayload(kind, fixture));
+    },
+  );
 
   it("recognizes only terminal acknowledged rows", () => {
     expect(isAcknowledgedRow({ delivery_state: "acknowledged", remote_inbox_id: "i", acknowledged_at: "now" })).toBe(true);
@@ -523,5 +541,89 @@ it("masks short derived credentials at any length while keeping the whole-value 
       phase: "restart", verdict: "pass", clearedAt,
       observedAt: "2026-10-26T10:00:12.500Z", seconds: 12.5, remaining: 0,
     });
+  });
+});
+describe("certification observer poll completeness", () => {
+  const acknowledged = { event_uuid: "e1", delivery_state: "acknowledged", remote_inbox_id: "inbox-1", acknowledged_at: "2026-10-28T00:00:00.000Z" };
+
+  function observerHome({ siblings }: { siblings: boolean }) {
+    const home = mkdtempSync(join(tmpdir(), "lcm-cert-observer-home-"));
+    const evidenceDirectory = mkdtempSync(join(tmpdir(), "lcm-cert-observer-evidence-"));
+    mkdirSync(join(home, ".lcm", "events"), { recursive: true });
+    const database = join(home, ".lcm", "events", "project.db");
+    writeFileSync(database, "");
+    if (siblings) for (const suffix of ["-wal", "-shm"]) writeFileSync(`${database}${suffix}`, "");
+    return { home, evidenceDirectory, database };
+  }
+
+  // Runs the real observer loop for a fixed number of polls on a scripted monotonic clock.
+  function observe(
+    input: { home: string; evidenceDirectory: string },
+    options: { clock: number[]; polls: number; readRows?: (path: string) => Promise<unknown[]>; betweenPolls?: () => void },
+  ) {
+    const controller = new AbortController();
+    let clockReads = 0;
+    let pauses = 0;
+    return observeUntilStopped({
+      ...input,
+      signal: controller.signal,
+      now: () => options.clock[Math.min(clockReads++, options.clock.length - 1)],
+      readRows: options.readRows ?? (async () => [acknowledged]),
+      pause: async () => {
+        pauses += 1;
+        if (pauses >= options.polls) controller.abort();
+        else options.betweenPolls?.();
+      },
+    });
+  }
+
+  const records = (evidenceDirectory: string) => readFileSync(join(evidenceDirectory, "observer.ndjson"), "utf8")
+    .trim().split("\n").map((line) => JSON.parse(line));
+
+  it("keeps a good poll complete after SQLite removed the -wal/-shm siblings on a clean close", async () => {
+    const input = observerHome({ siblings: false });
+    const database = new DatabaseSync(input.database);
+    database.exec("PRAGMA journal_mode = WAL");
+    database.exec("CREATE TABLE events (event_id INTEGER PRIMARY KEY, data TEXT)");
+    database.prepare("INSERT INTO events (data) VALUES (?)").run("row");
+    database.close();
+    expect([existsSync(`${input.database}-wal`), existsSync(`${input.database}-shm`)]).toEqual([false, false]);
+
+    const result = await observe(input, { clock: [0, 1000], polls: 1 });
+    expect(result.incomplete).toBe(false);
+    expect(result.observations.get("e1")?.inboxIds).toEqual(["inbox-1"]);
+    expect(records(input.evidenceDirectory)).toEqual([
+      expect.objectContaining({ status: "ok", gapMs: 1000, siblingsPresent: false, incomplete: false }),
+    ]);
+  });
+
+  it("marks a poll gap over two seconds incomplete", async () => {
+    const input = observerHome({ siblings: true });
+    const result = await observe(input, { clock: [0, 2500], polls: 1 });
+    expect(result.incomplete).toBe(true);
+    expect(records(input.evidenceDirectory)).toEqual([
+      expect.objectContaining({ status: "ok", gapMs: 2500, siblingsPresent: true, incomplete: true }),
+    ]);
+  });
+
+  it("marks a failed read incomplete", async () => {
+    const input = observerHome({ siblings: true });
+    const result = await observe(input, { clock: [0, 1000], polls: 1, readRows: async () => { throw new Error("read failed"); } });
+    expect(result.incomplete).toBe(true);
+    expect(records(input.evidenceDirectory)).toEqual([expect.objectContaining({ status: "error", incomplete: true })]);
+  });
+
+  it("marks a replaced database file incomplete and stops observing", async () => {
+    const input = observerHome({ siblings: true });
+    const result = await observe(input, {
+      clock: [0, 1000, 2000], polls: 2,
+      betweenPolls: () => {
+        const replacement = join(input.home, ".lcm", "events", "replacement.tmp");
+        writeFileSync(replacement, "");
+        renameSync(replacement, input.database);
+      },
+    });
+    expect(result.incomplete).toBe(true);
+    expect(records(input.evidenceDirectory).map((record) => [record.status, record.incomplete])).toEqual([["ok", false], ["replaced", true]]);
   });
 });

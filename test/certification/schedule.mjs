@@ -3,7 +3,7 @@ function scheduleCount(duration, first, every) {
 }
 export function createDeterministicSchedule({ profile, machine, runId, idNamespace = runId, contract }) {
   const duration = profile === "full" ? (contract?.timeline?.full?.steadySeconds ?? 6000) : (contract?.timeline?.smoke?.steadySeconds ?? 120);
-  const bytesCycle = contract?.workload?.primaryTextBytesCycle ?? [256, 1024, 1024, 8192];
+  const bytesCycle = contract?.workload?.primaryTextBytesCycle ?? [256, 1024, 1024, 6144];
   const schedule = [];
   const add = (op, first, every, extra = () => ({})) => {
     for (let index = 0; index < scheduleCount(duration, first, every); index += 1) {

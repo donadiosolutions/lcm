@@ -8,16 +8,19 @@ import {
   loadCertificationContract,
 } from "./contract.mjs";
 
-const contractPath = new URL("./contract-v2.json", import.meta.url);
-const approvalPath = new URL("./contract-v2.approval.json", import.meta.url);
-const approvedContractSha256 = "6dc8cef4c170c851bbc4c9626ee4a31c3d5cf7a7f4b41bb4e4852c88759222e4";
+const contractPath = new URL("./contract-v3.json", import.meta.url);
+const approvalPath = new URL("./contract-v3.approval.json", import.meta.url);
+const approvedContractSha256 = "ea6ccaaa77212c3c7486cdc85af03a985dde05eeef18096a4511163d0f490839";
+const supersededContractPath = new URL("./contract-v2.json", import.meta.url);
+const supersededContractSha256 = "6dc8cef4c170c851bbc4c9626ee4a31c3d5cf7a7f4b41bb4e4852c88759222e4";
 
 describe("certification contract", () => {
   it("loads the draft for planning and derives the frozen full schedule counts", () => {
     const loaded = loadCertificationContract(contractPath, { requireApproved: false });
 
     expect(loaded.contract.status).toBe("draft");
-    expect(loaded.contract.version).toBe(2);
+    expect(loaded.contract.version).toBe(3);
+    expect(loaded.contract.workload.primaryTextBytesCycle).toEqual([256, 1024, 1024, 6144]);
     expect(loaded.contract.thresholds.hookCommandMs).toMatchObject({ pooled: { p50: 600, p95: 1500, p99: 2500 }, perKindPooledP95: 1500, perMachineP95: 1500 });
     expect(loaded.sha256).toMatch(/^[0-9a-f]{64}$/u);
     expect(expectedSteadyAttempts(loaded.contract)).toEqual({
@@ -37,10 +40,16 @@ describe("certification contract", () => {
     expect(loaded.approval).toEqual({
       contractSha256: approvedContractSha256,
       approvedBy: "bcdonadio (repository owner)",
-      approvedAt: "2026-10-27T03:16:01Z",
+      approvedAt: "2026-10-28T13:54:14Z",
       note: "recorded by root at receipt",
-      approvalRef: "run-record epic-228-run-01a15242 entry 2026-10-27 03:16:01 UTC (user request_user_input answer in root chat)",
+      approvalRef: "run-record epic-228-run-01a15242 entry 2026-10-28 13:54:14 UTC (user request_user_input answer in root chat)",
     });
+  });
+
+  it("refuses the superseded v2 contract kept as history, even with its matching approval", () => {
+    expect(createHash("sha256").update(readFileSync(supersededContractPath)).digest("hex")).toBe(supersededContractSha256);
+    expect(() => loadCertificationContract(supersededContractPath)).toThrow("version 3 is required");
+    expect(() => loadCertificationContract(supersededContractPath, { requireApproved: false })).toThrow("version 3 is required");
   });
 
   it("rejects an approval record bound to different contract bytes", () => {
@@ -81,7 +90,7 @@ describe("certification contract", () => {
     expect(() => loadCertificationContract(path, { requireApproved: false })).toThrow("oracle.observer");
   });
 
-  it("rejects drift in v2 floors, hook limits, version, per-machine counts, capacity and approval time", () => {
+  it("rejects drift in v3 floors, hook limits, text cycle, version, per-machine counts, capacity and approval time", () => {
     const directory = mkdtempSync(join(tmpdir(), "lcm-cert-contract-drift-"));
     const write = (name: string, mutate: (candidate: any) => void) => {
       const candidate = JSON.parse(readFileSync(contractPath, "utf8"));
@@ -92,7 +101,10 @@ describe("certification contract", () => {
     };
     expect(() => loadCertificationContract(write("floor", (value) => { value.calculations.minimumSamples.p99 = 999; }), { requireApproved: false })).toThrow("sample floors");
     expect(() => loadCertificationContract(write("hook", (value) => { value.thresholds.hookCommandMs.pooled.p95 = 1000; }), { requireApproved: false })).toThrow("hook limits");
-    expect(() => loadCertificationContract(write("version", (value) => { value.version = 1; }), { requireApproved: false })).toThrow("identity");
+    expect(() => loadCertificationContract(write("cycle", (value) => { value.workload.primaryTextBytesCycle[3] = 8192; }), { requireApproved: false })).toThrow("primary text cycle");
+    for (const version of [1, 2, 4]) {
+      expect(() => loadCertificationContract(write(`version-${version}`, (value) => { value.version = version; }), { requireApproved: false })).toThrow("identity");
+    }
     expect(() => loadCertificationContract(write("counts", (value) => { value.workload.expectedPerMachine.daemonStore = 599; }), { requireApproved: false })).toThrow("per-machine");
     expect(() => loadCertificationContract(write("capacity", (value) => { value.thresholds.capacity.totalMax = 20; }), { requireApproved: false })).toThrow("capacity");
     const approvalContract = write("approval", () => undefined);

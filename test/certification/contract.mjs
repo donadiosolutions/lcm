@@ -93,8 +93,10 @@ export function expectedSteadyAttempts(contract) {
 }
 
 function assertContract(contract) {
-  if (contract?.id !== "lcm-production-certification" || contract?.version !== 2) {
-    throw new Error("invalid certification contract identity");
+  // Only contract version 3 can certify; superseded versions stay in the tree as
+  // history and are refused here, before any evidence collection or gate assembly.
+  if (contract?.id !== "lcm-production-certification" || contract?.version !== 3) {
+    throw new Error("invalid certification contract identity: version 3 is required");
   }
   if (!['draft', 'approved'].includes(contract.status)) throw new Error("invalid certification contract status");
   assertShape(contract);
@@ -108,14 +110,19 @@ function assertContract(contract) {
     || contract.calculations.minimumSamples.p95 !== 200
     || p99Minimum !== 1000
     || contract.thresholds.hookCommandMs.minSuccessesForSubgates !== 200) {
-    throw new Error("certification contract v2 sample floors changed");
+    throw new Error("certification contract v3 sample floors changed");
   }
-  // Approved v2 hook limits (the only change from v1): pooled p50/p95/p99 600/1500/2500,
+  // Hook limits approved in v2 and unchanged in v3: pooled p50/p95/p99 600/1500/2500,
   // per-kind and per-machine p95 1500.
   const hook = contract.thresholds.hookCommandMs;
   if (hook.pooled?.p50 !== 600 || hook.pooled?.p95 !== 1500 || hook.pooled?.p99 !== 2500
     || hook.perKindPooledP95 !== 1500 || hook.perMachineP95 !== 1500) {
-    throw new Error("certification contract v2 hook limits changed");
+    throw new Error("certification contract v3 hook limits changed");
+  }
+  // The only v3 change: the largest primary text is 6144 bytes, so the TaskCreate
+  // fixture text stays within hook capture's 8192-character scrub admission budget.
+  if (JSON.stringify(contract.workload.primaryTextBytesCycle) !== JSON.stringify([256, 1024, 1024, 6144])) {
+    throw new Error("certification contract v3 primary text cycle changed");
   }
   for (const name of ["hookInvocations", "daemonSearch", "daemonStore"]) {
     if (derived[name] < p99Minimum) {

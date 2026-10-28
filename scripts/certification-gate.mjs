@@ -339,11 +339,13 @@ export function buildEvidenceManifest({ evidenceDirectory, contract, persist = t
   );
   const observerRows = ['a', 'b'].flatMap((machine) => ndjson(join(evidenceDirectory, `machine-${machine}`, "observer.ndjson"))
     .map((entry) => ({ machine, ...entry })));
+  // A poll is incomplete on read failure, a gap over two seconds, or database or
+  // parent replacement. Absent -wal/-shm siblings are a recorded diagnostic only:
+  // SQLite removes them when its last connection closes cleanly.
   const observerIncomplete = observerRows.length === 0
     || ['a', 'b'].some((machine) => !observerRows.some((entry) => entry.machine === machine && entry.status === "ok"))
     || observerRows.some((entry) => entry.incomplete === true || entry.status === "missing" || entry.status === "error" || entry.status === "replaced"
-      || !Number.isFinite(entry.gapMs) || entry.gapMs < 0 || entry.gapMs > 2000
-      || (entry.status === "ok" && entry.siblingsPresent !== true));
+      || !Number.isFinite(entry.gapMs) || entry.gapMs < 0 || entry.gapMs > 2000);
   for (const slo of slos.filter((entry) => entry.id.startsWith("acknowledgment-lag."))) {
     if (slo.verdict !== "fail" && observerIncomplete) slo.verdict = "incomplete";
   }

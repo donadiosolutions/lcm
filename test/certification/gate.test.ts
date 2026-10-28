@@ -21,7 +21,7 @@ function snapshotFiles(root: string, directory = root, files = new Map<string, B
 
 type FaultLayout = "faults" | "partition-a" | "none";
 type MaintenanceFailure = "compact" | "snapshot" | "mixed";
-type Variant = { observerGap?: boolean; clockBreach?: boolean; clockGap?: boolean; duplicateMapping?: boolean; drainFail?: boolean; capacityPeak?: number; recoveryFail?: boolean; partitionFirstSuccessSeconds?: number; restartBFirstSuccessSeconds?: number; restartBNoSuccess?: boolean; noRecoverySuccess?: boolean; catchUpFail?: boolean; catchUpAtSeconds?: number; missingCatchUpTimestamp?: boolean; readinessInvalid?: boolean; residualOccupied?: boolean; poolConfigMismatch?: boolean; setupSessionOpen?: boolean; phaseEarly?: boolean; profile?: "smoke" | "full"; lane?: "local" | "managed"; faultLayout?: FaultLayout; maintenanceFailure?: MaintenanceFailure; smokeFailure?: boolean; smokeSlow?: boolean; executionHost?: Record<string, unknown> };
+type Variant = { observerGap?: boolean; observerSiblingsPresent?: boolean; extraObserverRow?: Record<string, unknown>; clockBreach?: boolean; clockGap?: boolean; duplicateMapping?: boolean; drainFail?: boolean; capacityPeak?: number; recoveryFail?: boolean; partitionFirstSuccessSeconds?: number; restartBFirstSuccessSeconds?: number; restartBNoSuccess?: boolean; noRecoverySuccess?: boolean; catchUpFail?: boolean; catchUpAtSeconds?: number; missingCatchUpTimestamp?: boolean; readinessInvalid?: boolean; residualOccupied?: boolean; poolConfigMismatch?: boolean; setupSessionOpen?: boolean; phaseEarly?: boolean; profile?: "smoke" | "full"; lane?: "local" | "managed"; faultLayout?: FaultLayout; maintenanceFailure?: MaintenanceFailure; smokeFailure?: boolean; smokeSlow?: boolean; executionHost?: Record<string, unknown> };
 
 // Every scheduled compact, every scheduled snapshot, or every other one of each.
 function maintenanceFails(mode: MaintenanceFailure | undefined, op: string, index: number): boolean {
@@ -35,7 +35,7 @@ function maintenanceFails(mode: MaintenanceFailure | undefined, op: string, inde
 function rawFixture(options: Variant = {}) {
   const root = mkdtempSync(join(tmpdir(), "lcm-cert-raw-gate-"));
   const output = join(mkdtempSync(join(tmpdir(), "lcm-cert-raw-gate-output-")), "gate");
-  const contract = JSON.parse(readFileSync(new URL("./contract-v2.json", import.meta.url), "utf8"));
+  const contract = JSON.parse(readFileSync(new URL("./contract-v3.json", import.meta.url), "utf8"));
   const contractText = `${JSON.stringify(contract)}\n`;
   const contractPath = join(root, "contract.json");
   writeFileSync(contractPath, contractText);
@@ -176,7 +176,10 @@ function rawFixture(options: Variant = {}) {
       { firstSeenMonotonicNs: String(BigInt(entry.processExitNs) + 1_000_000_000n), inboxIds: [`inbox-${machine}-${index}`] },
     ]));
     writeNdjson(join(directory, "acknowledgments.ndjson"), [acknowledgments]);
-    writeNdjson(join(directory, "observer.ndjson"), [{ status: "ok", gapMs: options.observerGap ? 3000 : 1000, incomplete: false, siblingsPresent: true }]);
+    writeNdjson(join(directory, "observer.ndjson"), [
+      { status: "ok", gapMs: options.observerGap ? 3000 : 1000, incomplete: false, siblingsPresent: options.observerSiblingsPresent ?? true },
+      ...(options.extraObserverRow ? [{ gapMs: 1000, ...options.extraObserverRow }] : []),
+    ]);
     writeJson(join(directory, "readiness.json"), { tls: { wrongCa: "certificate-authority", wrongHostname: "certificate-name" } });
     writeJson(join(directory, "partition-catch-up.json"), options.missingCatchUpTimestamp && machine === "a"
       ? { phase: "partition", verdict: "incomplete", seconds: 0, remaining: 0, clearedAt: new Date(partitionCleared).toISOString() }
@@ -350,6 +353,18 @@ describe("certification raw evidence pipeline", () => {
 
   it("marks an observer gap incomplete when no definite gate fails", () => {
     expect(assemble(rawFixture({ observerGap: true })).gate.verdict).toBe("incomplete");
+  });
+
+  it("passes good observer polls whose -wal/-shm siblings were absent", () => {
+    const gate = assemble(rawFixture({ observerSiblingsPresent: false })).gate;
+    expect(gate.slos.find((slo: any) => slo.id === "observer-completeness")).toMatchObject({ verdict: "pass", observed: 0 });
+    expect(gate.verdict).toBe("pass");
+  });
+
+  it.each(["error", "replaced", "missing"])("keeps a raw %s poll incomplete even when the row claims completeness", (status) => {
+    const gate = assemble(rawFixture({ extraObserverRow: { status, incomplete: false } })).gate;
+    expect(gate.slos.find((slo: any) => slo.id === "observer-completeness")?.verdict).toBe("incomplete");
+    expect(gate.verdict).toBe("incomplete");
   });
 
   it.each([
@@ -542,6 +557,19 @@ describe("gate readback never captures the assembling host", () => {
       }, { captureProvenance })).toThrow("execution-host witness is invalid");
       expect(captureProvenance).not.toHaveBeenCalled();
     }
+  });
+});
+
+describe("gate contract version", () => {
+  it("refuses to assemble a gate against the superseded v2 contract", () => {
+    const fixture = rawFixture({ profile: "smoke" });
+    const before = snapshotFiles(fixture.root);
+    expect(() => assembleGateFromEvidence({
+      repositoryRoot: fixture.root, evidenceDirectory: fixture.root,
+      contractPath: new URL("./contract-v2.json", import.meta.url).pathname, outputDirectory: fixture.output,
+    }, { captureProvenance: () => fixture.provenance })).toThrow("version 3 is required");
+    expect(existsSync(fixture.output)).toBe(false);
+    expect(snapshotFiles(fixture.root)).toEqual(before);
   });
 });
 

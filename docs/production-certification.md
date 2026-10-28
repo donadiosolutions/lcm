@@ -5,15 +5,20 @@ LCM machine identities against PostgreSQL 18. It records the exact contract,
 machine identities, scheduled attempts, operation samples, fault steps, cleanup
 witnesses, and SLO calculations needed to reproduce a gate decision.
 
-The committed contract (`test/certification/contract-v2.json`, version 2) remains
+The committed contract (`test/certification/contract-v3.json`, version 3) remains
 byte-for-byte in `draft` status. Approval lives in
-`test/certification/contract-v2.approval.json`, which names the approved contract
+`test/certification/contract-v3.approval.json`, which names the approved contract
 SHA-256, approver, approval time, and approval reference. The harness refuses to
 collect evidence unless that hash matches the contract bytes, and evidence must
 start at or after the approval time. Changing either file invalidates the binding;
-changing the contract requires a new approval record. Version 2 supersedes v1; the
-only change recalibrated the hook-command limits (pooled p50/p95/p99 600/1500/2500 ms,
-per-kind and per-machine p95 1500 ms). No certification evidence was collected under v1.
+changing the contract requires a new approval record. Version 3 supersedes v2; its
+only change lowers the largest primary-text size from 8,192 to 6,144 bytes, because
+hook capture drops an event whose text and tags exceed 8,192 characters and the
+8,192-byte `TaskCreate` fixture produced 8,202. It keeps the v2 hook-command limits
+(pooled p50/p95/p99 600/1500/2500 ms, per-kind and per-machine p95 1500 ms).
+`contract-v2.json` and its approval record stay in the tree as history only: the
+contract loader used by the harness, the machine agents, and the gate refuses any
+version other than 3. No certification evidence was collected under v1 or v2.
 
 ## What the two machines mean
 
@@ -167,7 +172,7 @@ directory and copy the reviewed outputs into `docs/` in the evidence commit:
 pnpm run test:certification:gate -- \
   --repository-root "$PWD" \
   --evidence-dir /absolute/private/lcm-certification/local \
-  --contract "$PWD/test/certification/contract-v2.json" \
+  --contract "$PWD/test/certification/contract-v3.json" \
   --output-dir /absolute/private/lcm-certification/gate
 ```
 
@@ -240,6 +245,13 @@ public commands, not a private in-process storage seam. Queue delay, schedule
 delay, SQLite capture, and observer delay are recorded separately.
 The synthetic `TaskCreate` fixture proves the compatibility-tool extraction path;
 it is not evidence of native Codex task-tool integration.
+
+Each machine's observer reads its local events database once per second with a
+bounded read-only query. A poll is incomplete only when the read fails, the gap
+since the previous poll exceeds two seconds, or the database file or its parent
+directory is replaced. Whether the `-wal` and `-shm` siblings exist is recorded
+as a diagnostic only, because SQLite removes them when its last connection closes
+cleanly.
 
 One local and one managed repetition provide a bounded baseline. They do not
 certify provider reliability, independent host clocks, multi-host hardware
