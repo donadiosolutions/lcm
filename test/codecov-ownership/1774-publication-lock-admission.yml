@@ -1,0 +1,14 @@
+references: ["#1774"]
+rationale: >-
+  #1774 lets daemon /search and /store wait a bounded time for a live
+  publication-lock owner, the daemon's own unqueued lock users included,
+  instead of refusing at once. src/private-mutation-lock.ts gains the
+  live-owner predicate and a retry policy option, src/daemon/server.ts
+  widens the read admission to a per-request wait allowance and opts /store
+  into the capture-route wait, and src/daemon/routes/store.ts answers a busy
+  503 when the wait is spent. No file is added, removed, moved, or re-owned;
+  all three stay in the components that already own them.
+pins:
+  - ["src/private-mutation-lock.ts", "unit-configuration-security"]
+  - ["src/daemon/server.ts", "unit-daemon-core"]
+  - ["src/daemon/routes/store.ts", "unit-daemon-routes"]

@@ -582,13 +582,27 @@ On PostgreSQL, the read routes `/search`, `/grep`, `/recent`, `/describe`, and
 `/expand` likewise return a sanitized `503` when project storage fails,
 including publication-lock contention (marked retryable), instead of an empty
 or null `200`.
-When such a read first meets the daemon's own publication work, for example a
-replication sweep phase, it waits up to one second for a turn in the daemon's
-publication queue and retries once. If the retry fails, the read returns the
+When such a read first meets publication work that holds the lock, whether the
+daemon's own (for example a replication sweep phase or background identity
+work) or another process's (such as a hook's short hold), it retries once
+inside a bounded admission. Each read request has one wait allowance of
+4 seconds, counted from its first read admission and shared by all of that
+request's admissions. It covers both the wait for a turn in the daemon's
+publication queue and, once the turn is granted, the wait for a live lock
+owner to release the lock. If the allowance runs out, the read returns the
 sanitized `503`; contention with publication work and an expired wait are
 marked retryable, while a genuine storage failure keeps `retryable: false`.
-The one-second limit only bounds waiting in the queue: a lock held by another process
-fails immediately once the turn is granted.
+The allowance bounds waiting only. It is not an end-to-end deadline, it does
+not limit how long a holder keeps the lock, and a request that is cancelled or
+reaches its own deadline stops waiting at once.
+
+`POST /store` (the `lcm_store` tool and the commands that call it) waits the
+same way for a live lock owner, another process or the daemon itself, for up to
+3 seconds counted from its first wait and shared by all of the request's
+admissions. If the lock is still held when that wait ends, or the owner cannot
+be confirmed as live, the route answers a retryable `503` with
+`status: "busy"` and `error: "backend publication work is in progress; retry the store"`
+instead of a `500`. Nothing was stored; retry the request.
 The daemon cancels request-scoped work on client disconnect and drains active
 consumers before closing the factory during shutdown. No PostgreSQL failure
 opens a project SQLite database as a recovery path.

@@ -215,6 +215,33 @@ describe("POST /ingest/terminal", () => {
     });
   });
 
+  it("does not wait for a live owner in the daemon's own process, which only capture requests wait for", async () => {
+    let armed = false;
+    let attempts = 0;
+    const lock: typeof withBackendPublicationConsumerLockAsync = (...args) => {
+      if (!armed) return withBackendPublicationConsumerLockAsync(...args);
+      attempts += 1;
+      throw new PrivateMutationLockContentionError(
+        "backend publication mutation is already in progress (owned by live PID)",
+        {
+          contendedLock: {
+            path: "/lcm/publication.lock",
+            owner: { version: 1, pid: process.pid, processStartTime: null, nonce: "owner" },
+          },
+        },
+      );
+    };
+    const warn = vi.spyOn(console, "warn").mockImplementation(() => undefined);
+    await withTerminalDaemon({ daemonOptions: { _withBackendPublicationConsumerLockAsync: lock } }, async (fixture) => {
+      armed = true;
+      expect((await bounded(fixture.post(body(fixture)))).status).toBe(202);
+      await vi.waitFor(() => expect(warn).toHaveBeenCalledWith("[lcm] terminal ingest failed"), { timeout: 5_000 });
+
+      expect(attempts).toBe(1);
+      expect(fixture.messageCount()).toBe(0);
+    });
+  });
+
   it("stops waiting for the publication lock when the daemon shuts down", async () => {
     let armed = false;
     let refused = 0;
