@@ -2,7 +2,7 @@ import { createHash } from "node:crypto";
 import { existsSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { describe, expect, it, vi } from "vitest";
+import { afterEach, describe, expect, it, vi } from "vitest";
 import {
   DATABASE_IDENTITY_SQL,
   MACHINE_DATABASE_CLEARANCE_SCRIPT,
@@ -32,10 +32,19 @@ import { loadCertificationContract } from "./contract.mjs";
 import { createGitCheckoutFixture } from "./git-checkout-fixture.js";
 import { waitForControl } from "./machine-agent.mjs";
 
+// Scripted failures for the mocked PostgreSQL client: each connect fails while
+// connectFailures is positive, as a connection refused during a database restart does.
+const pgScript = vi.hoisted(() => ({ connectFailures: 0, connects: 0 }));
 vi.mock("pg", () => ({
   Client: class {
     on() { return this; }
-    async connect() {}
+    async connect() {
+      pgScript.connects += 1;
+      if (pgScript.connectFailures > 0) {
+        pgScript.connectFailures -= 1;
+        throw Object.assign(new Error("connect ECONNREFUSED 127.0.0.1:5432"), { code: "ECONNREFUSED" });
+      }
+    }
     async query(text: string) {
       return text.includes("clock_timestamp")
         ? { rows: [{ now: "2026-10-26T10:00:00.000Z" }] }
@@ -539,9 +548,15 @@ describe("certification fault clearance probes", () => {
       expect(run).toHaveBeenCalledTimes(1);
     }
     const unreachable = vi.fn(async () => { throw new Error("connect ECONNREFUSED"); });
-    await expect(waitForMachineDatabaseClearance({ name: "machine-a", run: unreachable, expected: localExpected, timeoutMs: 25, delay: fastDelay }))
+    // A scripted clock: one second passes per retry pause, so a 2.5 s bound allows exactly
+    // three attempts however slowly the test runs.
+    let clock = 0;
+    await expect(waitForMachineDatabaseClearance({
+      name: "machine-a", run: unreachable, expected: localExpected, timeoutMs: 2_500,
+      now: () => clock, delay: async () => { clock += 1_000; },
+    }))
       .rejects.toThrow("certification machine machine-a database clearance failed: certification machine phase timed out");
-    expect(unreachable.mock.calls.length).toBeGreaterThan(1);
+    expect(unreachable).toHaveBeenCalledTimes(3);
     const controller = new AbortController();
     controller.abort(new Error("certification aborted by test"));
     await expect(waitForMachineDatabaseClearance({ name: "machine-a", run: unreachable, expected: localExpected, timeoutMs: 10_000, delay: fastDelay, signal: controller.signal }))
@@ -744,5 +759,86 @@ describe("certification fault clearance probes", () => {
     expect(run.calls.some((args) => args[0] === "network" && args[1] === "disconnect")).toBe(false);
     expect(existsSync(join(run.evidenceDirectory, "faults.json"))).toBe(false);
     expect(run.environmentFiles.get(run.names.machineA)?.LCM_CERT_WITH_FAULTS).toBeUndefined();
+  });
+});
+
+describe("certification clock sample retries", () => {
+  afterEach(() => { pgScript.connectFailures = 0; });
+
+  // A scripted wall clock for the retry policy: each container exec advances it by execMs
+  // and reports it as the machine clock; each retry pause advances it by the pause.
+  function scriptedClock() {
+    const state = { clock: 1_000_000, execMs: 10 };
+    return {
+      state,
+      start: (evidenceDirectory: string) => startClockMonitor({
+        machineNames: { a: "machine-a" },
+        run: async () => {
+          state.clock += state.execMs;
+          return { stdout: JSON.stringify({ wallMs: state.clock, monotonicNs: String(BigInt(state.clock) * 1_000_000n) }), stderr: "" };
+        },
+        url: "postgresql://runtime@db/cert", ca: "ca", evidenceDirectory, intervalMs: 3_600_000,
+        now: () => state.clock, delay: async (milliseconds: number) => { state.clock += milliseconds; },
+      }),
+    };
+  }
+  const failure = (attempt: number, startedAtMs: number) => ({ attempt, errorClass: "Error", code: "ECONNREFUSED", startedAtMs, failedAtMs: startedAtMs + 10 });
+
+  it("retries a sample that failed before measuring and records every attempt", async () => {
+    const root = mkdtempSync(join(tmpdir(), "lcm-cert-clock-retry-"));
+    const clock = scriptedClock();
+    pgScript.connectFailures = 2;
+    const samples = await (await clock.start(root)).stop();
+    expect(samples).toEqual([
+      expect.objectContaining({
+        phase: "start", machine: "a", verdict: "pass", radiusMs: 5, attempt: 3,
+        t0: { wallMs: 1_001_030, monotonicNs: "1001030000000" },
+        failedAttempts: [failure(1, 1_000_000), failure(2, 1_000_510)],
+      }),
+      expect.objectContaining({ phase: "end", machine: "a", verdict: "pass", attempt: 1, failedAttempts: [] }),
+    ]);
+    expect(JSON.parse(readFileSync(join(root, "clock-witness.json"), "utf8"))).toEqual(samples);
+  });
+
+  it("records a sample whose attempts all failed as incomplete after the attempt limit", async () => {
+    const root = mkdtempSync(join(tmpdir(), "lcm-cert-clock-exhausted-"));
+    const clock = scriptedClock();
+    const monitor = await clock.start(root);
+    pgScript.connectFailures = 100;
+    const end = (await monitor.stop()).at(-1);
+    expect(end).toMatchObject({ phase: "end", machine: "a", verdict: "incomplete", attempt: 5, errorClass: "Error", code: "ECONNREFUSED" });
+    expect(end.failedAttempts.map((entry: { attempt: number }) => entry.attempt)).toEqual([1, 2, 3, 4]);
+    expect(end).not.toHaveProperty("t0");
+  });
+
+  it("stops retrying when the next attempt would start outside the retry window", async () => {
+    const root = mkdtempSync(join(tmpdir(), "lcm-cert-clock-window-"));
+    const clock = scriptedClock();
+    const monitor = await clock.start(root);
+    // Each attempt now spends 1.6 s before failing: the second starts 2.1 s after the first,
+    // and a third would start 4.2 s after it, outside the 3 s window.
+    clock.state.execMs = 1_600;
+    pgScript.connectFailures = 100;
+    const end = (await monitor.stop()).at(-1);
+    expect(end).toMatchObject({ phase: "end", verdict: "incomplete", attempt: 2 });
+    expect(end.failedAttempts).toHaveLength(1);
+  });
+
+  it("never retries a measured bracket, even one over the radius bound", async () => {
+    const root = mkdtempSync(join(tmpdir(), "lcm-cert-clock-breach-"));
+    const clock = scriptedClock();
+    const monitor = await clock.start(root);
+    clock.state.execMs = 600;
+    const connects = pgScript.connects;
+    const end = (await monitor.stop()).at(-1);
+    expect(end).toMatchObject({ phase: "end", verdict: "fail", radiusMs: 300, attempt: 1, failedAttempts: [] });
+    expect(pgScript.connects - connects).toBe(1);
+  });
+
+  it("still stops the run when the start sample fails on every attempt", async () => {
+    const root = mkdtempSync(join(tmpdir(), "lcm-cert-clock-start-"));
+    pgScript.connectFailures = 100;
+    await expect(scriptedClock().start(root)).rejects.toThrow("certification clock monitor could not sample machine a at start (Error)");
+    expect(existsSync(join(root, "clock-witness.json"))).toBe(false);
   });
 });

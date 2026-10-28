@@ -213,6 +213,20 @@ diagnostics retain relation-size deltas, submitted payload and envelope bytes,
 stored truncation counts, final doctor output hashes, and remote-prune sweep
 timestamps.
 
+Each recorded fault carries `requestedAt`, `appliedAt`, `clearedAt` and
+`recoveredAt`. `recoveredAt` only marks when both agents finished the fault phase,
+meaning the fault workload and the acknowledgment catch-up check; it is not a
+recovery time. The measured recovery time is the observed value of the fault's
+`recovery.<id>` SLO.
+
+The coordinator brackets each machine's clock against the database at run start,
+every 60 seconds, and at the end. A bracket that fails before it measures anything,
+for example while the database restarts, is retried for that machine for up to three
+seconds, which keeps the sample inside the gate's 65-second cadence. A measured
+bracket is never retried. `clock-witness.json` records every attempt, and the gate
+scores the last one: a sample that succeeded after retries counts, and a sample whose
+attempts all failed leaves the clock and capacity results incomplete.
+
 Execution provenance also carries an execution-host witness captured once at run
 start by both lanes: OS release ID and version, kernel release, architecture, CPU
 model and logical CPU count, total memory, container engine name and version, and

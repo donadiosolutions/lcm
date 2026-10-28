@@ -1,12 +1,13 @@
 import { createHash } from "node:crypto";
-import { existsSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, writeFileSync } from "node:fs";
+import { appendFileSync, existsSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { delimiter, join } from "node:path";
 import { afterEach, describe, expect, it, vi } from "vitest";
-import { assembleGateFromEvidence, parseGateArguments } from "../../scripts/certification-gate.mjs";
+import { assembleGateFromEvidence, buildEvidenceManifest, createSampleBuilder, forEachNdjsonRow, parseGateArguments, readObserverWitness } from "../../scripts/certification-gate.mjs";
 import { captureExecutionHost, captureExecutionProvenance } from "../../scripts/certification-harness.mjs";
 import { createGitCheckoutFixture } from "./git-checkout-fixture.js";
 import { createDeterministicSchedule, createFaultSchedule } from "./schedule.mjs";
+import { sampleSha256, writeSampleFile } from "./slo.mjs";
 import { observerReadSettings } from "./sqlite-observer-worker.mjs";
 
 function writeJson(path: string, value: unknown): void { writeFileSync(path, `${JSON.stringify(value)}\n`); }
@@ -22,7 +23,7 @@ function snapshotFiles(root: string, directory = root, files = new Map<string, B
 
 type FaultLayout = "faults" | "partition-a" | "none";
 type MaintenanceFailure = "compact" | "snapshot" | "mixed";
-type Variant = { withFaults?: boolean; observerGap?: boolean; observerSiblingsPresent?: boolean; extraObserverRow?: Record<string, unknown>; clockBreach?: boolean; clockGap?: boolean; duplicateMapping?: boolean; drainFail?: boolean; capacityPeak?: number; recoveryFail?: boolean; partitionFirstSuccessSeconds?: number; restartBFirstSuccessSeconds?: number; restartBNoSuccess?: boolean; noRecoverySuccess?: boolean; catchUpFail?: boolean; catchUpAtSeconds?: number; missingCatchUpTimestamp?: boolean; readinessInvalid?: boolean; residualOccupied?: boolean; poolConfigMismatch?: boolean; setupSessionOpen?: boolean; phaseEarly?: boolean; profile?: "smoke" | "full"; lane?: "local" | "managed"; faultLayout?: FaultLayout; maintenanceFailure?: MaintenanceFailure; smokeFailure?: boolean; smokeSlow?: boolean; executionHost?: Record<string, unknown> };
+type Variant = { clockRetry?: "recovered" | "exhausted" | "miscounted"; observerRows?: number; withFaults?: boolean; observerGap?: boolean; observerSiblingsPresent?: boolean; extraObserverRow?: Record<string, unknown>; clockBreach?: boolean; clockGap?: boolean; duplicateMapping?: boolean; drainFail?: boolean; capacityPeak?: number; recoveryFail?: boolean; partitionFirstSuccessSeconds?: number; restartBFirstSuccessSeconds?: number; restartBNoSuccess?: boolean; noRecoverySuccess?: boolean; catchUpFail?: boolean; catchUpAtSeconds?: number; missingCatchUpTimestamp?: boolean; readinessInvalid?: boolean; residualOccupied?: boolean; poolConfigMismatch?: boolean; setupSessionOpen?: boolean; phaseEarly?: boolean; profile?: "smoke" | "full"; lane?: "local" | "managed"; faultLayout?: FaultLayout; maintenanceFailure?: MaintenanceFailure; smokeFailure?: boolean; smokeSlow?: boolean; executionHost?: Record<string, unknown> };
 
 // Every scheduled compact, every scheduled snapshot, or every other one of each.
 function maintenanceFails(mode: MaintenanceFailure | undefined, op: string, index: number): boolean {
@@ -109,7 +110,7 @@ function rawFixture(options: Variant = {}) {
   });
   writeJson(join(root, "database-growth.json"), { beforeBytes: 1000, afterBytes: 2000, deltaBytes: 1000 });
   const clockDurationMinutes = Math.floor(contract.timeline[profile].steadySeconds / 60);
-  const clocks = Array.from({ length: clockDurationMinutes + 1 }, (_, minute) => ["a", "b"].map((machine) => {
+  const clocks: Array<Record<string, any>> = Array.from({ length: clockDurationMinutes + 1 }, (_, minute) => ["a", "b"].map((machine) => {
     const index = minute * 2 + (machine === "b" ? 1 : 0);
     const wallMs = t0 + minute * 60_000;
     return {
@@ -126,6 +127,27 @@ function rawFixture(options: Variant = {}) {
   if (options.clockGap) {
     const row = clocks.find((entry) => entry.machine === "a" && entry.phase === "interval");
     if (row) row.t0.monotonicNs = String(1_000_000_000n + 180_000_000_000n);
+  }
+  // One interval sample of machine A that the monitor retried: it succeeded 1.4 s late on
+  // its third attempt, all five attempts failed, or its attempt number disagrees with the
+  // failed attempts it records.
+  if (options.clockRetry) {
+    const index = clocks.findIndex((entry) => entry.machine === "a" && entry.phase === "interval");
+    const row = clocks[index];
+    const failed = (attempt: number) => ({
+      attempt, errorClass: "Error", code: "ECONNREFUSED",
+      startedAtMs: row.t0.wallMs + (attempt - 1) * 700, failedAtMs: row.t0.wallMs + (attempt - 1) * 700 + 200,
+    });
+    clocks[index] = options.clockRetry === "exhausted"
+      ? { phase: "interval", machine: "a", verdict: "incomplete", ...failed(5), failedAttempts: [1, 2, 3, 4].map(failed) }
+      : {
+        ...row,
+        t0: { wallMs: row.t0.wallMs + 1_400, monotonicNs: String(BigInt(row.t0.monotonicNs) + 1_400_000_000n) },
+        serverTime: new Date(row.t0.wallMs + 1_410).toISOString(),
+        t1: { wallMs: row.t1.wallMs + 1_400, monotonicNs: String(BigInt(row.t1.monotonicNs) + 1_400_000_000n) },
+        attempt: 3,
+        failedAttempts: (options.clockRetry === "miscounted" ? [1] : [1, 2]).map(failed),
+      };
   }
   writeJson(join(root, "clock-witness.json"), clocks);
   const partitionApplied = t0 + 6_060_000;
@@ -177,10 +199,17 @@ function rawFixture(options: Variant = {}) {
       { firstSeenMonotonicNs: String(BigInt(entry.processExitNs) + 1_000_000_000n), inboxIds: [`inbox-${machine}-${index}`] },
     ]));
     writeNdjson(join(directory, "acknowledgments.ndjson"), [acknowledgments]);
-    writeNdjson(join(directory, "observer.ndjson"), [
+    // A long observer file carries the cumulative acknowledgment map in every poll, as
+    // the real observer does.
+    writeNdjson(join(directory, "observer.ndjson"), options.observerRows === undefined ? [
       { status: "ok", gapMs: options.observerGap ? 3000 : 1000, incomplete: false, siblingsPresent: options.observerSiblingsPresent ?? true },
       ...(options.extraObserverRow ? [{ gapMs: 1000, ...options.extraObserverRow }] : []),
-    ]);
+    ] : Array.from({ length: options.observerRows }, (_, poll) => ({
+      monotonicMs: 1_000 * (poll + 1) + 0.25, gapMs: 1000.5, status: "ok", siblingsPresent: poll % 3 !== 0, incomplete: false,
+      acknowledgments: Object.fromEntries(Array.from({ length: Math.floor(poll / 4) }, (_, event) => [
+        `${machine}-event-${event}`, { firstSeenMonotonicNs: String(1_000_000_000 + event), inboxIds: [String(event + 1)] },
+      ])),
+    })));
     writeJson(join(directory, "readiness.json"), { tls: { wrongCa: "certificate-authority", wrongHostname: "certificate-name" } });
     writeJson(join(directory, "partition-catch-up.json"), options.missingCatchUpTimestamp && machine === "a"
       ? { phase: "partition", verdict: "incomplete", seconds: 0, remaining: 0, clearedAt: new Date(partitionCleared).toISOString() }
@@ -325,6 +354,23 @@ describe("certification raw evidence pipeline", () => {
     expect(gate.verdict).toBe("incomplete");
   });
 
+  it("scores a clock sample that succeeded on a recorded retry like any other sample", () => {
+    const gate = assemble(rawFixture({ clockRetry: "recovered" })).gate;
+    expect(gate.slos.find((slo: any) => slo.id === "clock-interval-radius")?.verdict).toBe("pass");
+    expect(gate.slos.find((slo: any) => slo.id === "capacity")?.verdict).toBe("pass");
+    expect(gate.verdict).toBe("pass");
+  });
+
+  it("keeps a clock sample incomplete when every attempt failed or its attempt count disagrees with its failures", () => {
+    const exhausted = assemble(rawFixture({ clockRetry: "exhausted" })).gate;
+    expect(exhausted.slos.find((slo: any) => slo.id === "clock-interval-radius")?.verdict).toBe("incomplete");
+    expect(exhausted.slos.find((slo: any) => slo.id === "capacity")?.verdict).toBe("incomplete");
+    expect(exhausted.verdict).toBe("incomplete");
+    const miscounted = assemble(rawFixture({ clockRetry: "miscounted" })).gate;
+    expect(miscounted.slos.find((slo: any) => slo.id === "clock-interval-radius")?.verdict).toBe("incomplete");
+    expect(miscounted.verdict).toBe("incomplete");
+  }, 15_000);
+
   it("accepts partition recovery after the contracted 60-second reconnect plus verification overhead", () => {
     const gate = assemble(rawFixture()).gate;
     expect(gate.slos.find((slo: any) => slo.id === "recovery.partition-a")?.verdict).toBe("pass");
@@ -384,6 +430,97 @@ describe("certification raw evidence pipeline", () => {
     expect(gate.slos.find((slo: any) => slo.id === sloId)?.verdict).not.toBe("pass");
     expect(gate.verdict).not.toBe("pass");
   });
+});
+
+// The gate's earlier reading of the observer files: each file as one string and the
+// merged witness as one joined string. The streamed reading must reproduce its bytes.
+function joinedObserverWitness(root: string): Buffer {
+  return Buffer.from(["a", "b"].flatMap((machine) => readFileSync(join(root, `machine-${machine}`, "observer.ndjson"), "utf8")
+    .split(/\r?\n/u).filter(Boolean).map((line) => ({ machine, ...JSON.parse(line) })))
+    .map((row) => `${JSON.stringify(row)}\n`).join(""));
+}
+const sha256Hex = (bytes: Buffer) => createHash("sha256").update(bytes).digest("hex");
+
+describe("streamed evidence reads and chunked samples", () => {
+  function ndjsonFile(text: string): string {
+    const path = join(mkdtempSync(join(tmpdir(), "lcm-cert-ndjson-")), "rows.ndjson");
+    writeFileSync(path, text);
+    return path;
+  }
+  function streamedRows(path: string, chunkSizes?: { chunkBytes: number }): unknown[] {
+    const rows: unknown[] = [];
+    forEachNdjsonRow(path, (row: unknown) => { rows.push(row); }, chunkSizes);
+    return rows;
+  }
+
+  it("splits rows exactly as the whole-text split does at every chunk size", () => {
+    const path = ndjsonFile([
+      '{"n":1,"text":"ação 🙂"}\r\n', "\n", `{"n":2,"long":"${"x".repeat(150)}"}\n`, "\r\n", '{"n":3,"text":"🙂🙂"}\r\n', '{"n":4}',
+    ].join(""));
+    const whole = readFileSync(path, "utf8").split(/\r?\n/u).filter(Boolean).map((line) => JSON.parse(line));
+    expect(whole.map((row) => row.n)).toEqual([1, 2, 3, 4]);
+    for (const chunkBytes of [1, 2, 3, 5, 64]) expect(streamedRows(path, { chunkBytes })).toEqual(whole);
+    expect(streamedRows(path)).toEqual(whole);
+  });
+
+  it("reads the next chunk only after the rows before it are visited", () => {
+    const path = ndjsonFile('{"n":1}\n{"n":2}\n');
+    const seen: number[] = [];
+    // A whole-file read would miss the row appended while the first row is visited.
+    forEachNdjsonRow(path, (row: { n: number }) => {
+      seen.push(row.n);
+      if (row.n === 1) appendFileSync(path, '{"n":3}\n');
+    }, { chunkBytes: 8 });
+    expect(seen).toEqual([1, 2, 3]);
+  });
+
+  it("flushes sample chunks only at row boundaries, so multibyte text and empty samples keep their bytes", () => {
+    const rows = Array.from({ length: 50 }, (_, index) => ({ index, text: "ação 🙂".repeat(index % 7) }));
+    const builder = createSampleBuilder({ chunkChars: 40 });
+    for (const row of rows) builder.append(row);
+    const chunks = builder.finish();
+    expect(chunks.length).toBeGreaterThan(10);
+    for (const chunk of chunks) expect(chunk.toString("utf8").endsWith("\n")).toBe(true);
+    expect(Buffer.concat(chunks).equals(Buffer.from(rows.map((row) => `${JSON.stringify(row)}\n`).join("")))).toBe(true);
+    const empty = createSampleBuilder().finish();
+    expect(empty).toEqual([]);
+    expect(sampleSha256(empty)).toBe(sha256Hex(Buffer.alloc(0)));
+  });
+
+  it("merges both observer files into a chunked witness byte-identical to the joined witness", () => {
+    const fixture = rawFixture({ profile: "smoke", observerRows: 240 });
+    const golden = joinedObserverWitness(fixture.root);
+    const { polls, witness } = readObserverWitness(fixture.root, { chunkBytes: 64, chunkChars: 512 });
+    expect(Buffer.concat(witness).equals(golden)).toBe(true);
+    expect(sampleSha256(witness)).toBe(sha256Hex(golden));
+    expect(polls).toHaveLength(480);
+    expect(polls[0]).toEqual({ machine: "a", status: "ok", incomplete: false, gapMs: 1000.5 });
+    expect(polls.at(-1)).toEqual({ machine: "b", status: "ok", incomplete: false, gapMs: 1000.5 });
+    const longestRow = Math.max(...golden.toString("utf8").split("\n").map((line) => line.length + 1));
+    expect(witness.length).toBeGreaterThan(100);
+    for (const chunk of witness) expect(chunk.length).toBeLessThan(512 + longestRow);
+    const written = join(mkdtempSync(join(tmpdir(), "lcm-cert-witness-")), "observer-witness.ndjson");
+    writeSampleFile(written, witness);
+    expect(readFileSync(written).equals(golden)).toBe(true);
+  });
+
+  it("builds the same manifest and samples at any chunk size and publishes the witness unchanged", () => {
+    const fixture = rawFixture({ profile: "smoke", observerRows: 240 });
+    const contract = JSON.parse(readFileSync(fixture.contractPath, "utf8"));
+    const tiny = buildEvidenceManifest({ evidenceDirectory: fixture.root, contract, persist: false, chunkSizes: { chunkBytes: 7, chunkChars: 64 } });
+    const standard = buildEvidenceManifest({ evidenceDirectory: fixture.root, contract, persist: false });
+    expect(tiny.manifest).toEqual(standard.manifest);
+    expect(Object.keys(tiny.sampleFiles)).toEqual(Object.keys(standard.sampleFiles));
+    for (const [name, sample] of Object.entries(standard.sampleFiles)) {
+      expect(Buffer.concat(tiny.sampleFiles[name]).equals(Buffer.concat(sample as Buffer[]))).toBe(true);
+    }
+    const golden = joinedObserverWitness(fixture.root);
+    const result = assemble(fixture);
+    expect(result.gate.slos.find((slo: any) => slo.id === "observer-completeness")).toMatchObject({
+      verdict: "pass", observed: 0, inputs: { count: 480, sampleSha256: sha256Hex(golden) },
+    });
+    expect(readFileSync(join(fixture.output, "observer-witness.ndjson")).equals(golden)).toBe(true);
+  }, 15_000);
 });
 
 describe("lane fault-set sample from real producer layouts", () => {

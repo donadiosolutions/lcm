@@ -520,6 +520,57 @@ it("masks short derived credentials at any length while keeping the whole-value 
     ]);
   });
 
+  // The two other deadline paths. The later operation waits one real macrotask, so it is
+  // admitted only after the first operation has settled.
+  const afterFirstSettles = (milliseconds: number) => milliseconds > 0
+    ? new Promise<void>((resolve) => setTimeout(resolve, 20))
+    : Promise.resolve();
+  const runAfterDeadline = (path: "late return" | "before admission", deadlineAbortsSchedule: boolean) => {
+    const evidenceDirectory = mkdtempSync(join(tmpdir(), "lcm-cert-deadline-path-"));
+    // Before admission: the first operation's deadline has already passed when it is due.
+    // Late return: its request returns only after its deadline.
+    let clock = path === "before admission" ? 60_001 : 0;
+    const post = vi.fn(async (route: string) => {
+      if (route === "/search") clock = 60_001;
+      return {};
+    });
+    return executeDeterministicSchedule({
+      schedule: [
+        { id: "late", machine: "a", op: "search", offsetSeconds: 0, phase: "restart-recovery" },
+        { id: "after", machine: "a", op: "store", offsetSeconds: 61, phase: "restart-recovery" },
+      ],
+      entrypoint: "/unused/lcm.mjs", cwd: evidenceDirectory, environment: {}, evidenceDirectory,
+      daemonClient: { post }, scheduleStartWallMs: 0, wallNow: () => clock, delay: afterFirstSettles, deadlineAbortsSchedule,
+    });
+  };
+
+  it.each(["late return", "before admission"] as const)("keeps a fault-recovery schedule running after a %s deadline", async (path) => {
+    await expect(runAfterDeadline(path, false)).resolves.toEqual([
+      expect.objectContaining({ id: "late", outcome: "failed", errorClass: "OperationDeadlineExceeded" }),
+      expect.objectContaining({ id: "after", outcome: "success" }),
+    ]);
+    await expect(runAfterDeadline(path, true)).resolves.toEqual([
+      expect.objectContaining({ id: "late", outcome: "failed", errorClass: "OperationDeadlineExceeded" }),
+      expect.objectContaining({ id: "after", outcome: "cancelled", errorClass: "AdmissionAborted" }),
+    ]);
+  });
+
+  it("still aborts a fault-recovery schedule on admission overflow", async () => {
+    const evidenceDirectory = mkdtempSync(join(tmpdir(), "lcm-cert-fault-overflow-"));
+    const post = vi.fn(async () => ({}));
+    const samples = await executeDeterministicSchedule({
+      schedule: [
+        // 4 active plus 64 queued fit; the last two of the 70 overflow.
+        ...Array.from({ length: 70 }, (_, index) => ({ id: `search-${index}`, machine: "a", op: "search", offsetSeconds: 0, phase: "partition-recovery" })),
+        { id: "after", machine: "a", op: "store", offsetSeconds: 10, phase: "partition-recovery" },
+      ],
+      entrypoint: "/unused/lcm.mjs", cwd: evidenceDirectory, environment: {}, evidenceDirectory,
+      daemonClient: { post }, scheduleStartWallMs: 0, wallNow: () => 0, delay: afterFirstSettles, deadlineAbortsSchedule: false,
+    });
+    expect(samples.filter((sample) => sample.errorClass === "AdmissionOverflow").length).toBeGreaterThan(0);
+    expect(samples.at(-1)).toMatchObject({ id: "after", outcome: "cancelled", errorClass: "AdmissionAborted" });
+  });
+
   it("bounds daemon health readiness with an absolute cancellable deadline", async () => {
     const child = new EventEmitter() as any;
     child.stdout = new EventEmitter();

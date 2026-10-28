@@ -186,14 +186,14 @@ export function machineDatabaseClearanceArgs(name) {
 // Retries the probe once per second within the fault phase's bound, because PostgreSQL
 // accepts connections only shortly after its container starts again. A connection that
 // reaches another database, port or role fails at once.
-export async function waitForMachineDatabaseClearance({ name, run, expected, timeoutMs, delay, signal }) {
+export async function waitForMachineDatabaseClearance({ name, run, expected, timeoutMs, delay, signal, now }) {
   let identity;
   await poll(async () => {
     const result = await run(machineDatabaseClearanceArgs(name)).catch(() => undefined);
     if (result === undefined) return false;
     identity = assertDatabaseIdentity(JSON.parse(result.stdout.trim()), expected);
     return true;
-  }, { timeoutMs, delay, signal }).catch((error) => {
+  }, { timeoutMs, delay, signal, now }).catch((error) => {
     throw signal?.aborted ? error : new Error(`certification machine ${name} database clearance failed: ${error.message}`, { cause: error });
   });
   return identity;
@@ -1061,7 +1061,18 @@ export async function collectDatabaseRelationBytes({ url, ca }) {
   } finally { await client.end().catch(() => undefined); }
 }
 
-export async function startClockMonitor({ machineNames, run, url, ca, evidenceDirectory, intervalMs = 60_000 }) {
+// A clock sample that fails before measuring a bracket, for example because the database
+// refuses connections while it restarts, is retried for that machine. A retry starts at most
+// windowMs after the sample's first attempt: with the 60 s interval and a passing bracket
+// under 500 ms, a retried sample still lands inside the gate's 65 s cadence bound. A
+// measured bracket is never retried, even one over the radius bound. Every sample records
+// its attempt number and each earlier failed attempt.
+export const CLOCK_SAMPLE_RETRY = Object.freeze({ maxAttempts: 5, delayMs: 500, windowMs: 3_000 });
+
+export async function startClockMonitor({
+  machineNames, run, url, ca, evidenceDirectory, intervalMs = 60_000,
+  retry = CLOCK_SAMPLE_RETRY, now = Date.now, delay = (milliseconds) => new Promise((resolve) => setTimeout(resolve, milliseconds)),
+}) {
   const loaded = await import("pg");
   const Client = loaded.Client ?? loaded.default?.Client;
   const samples = [];
@@ -1069,33 +1080,57 @@ export async function startClockMonitor({ machineNames, run, url, ca, evidenceDi
     const result = await run(["container", "exec", name, "node", "-e", "process.stdout.write(JSON.stringify({wallMs:Date.now(),monotonicNs:process.hrtime.bigint().toString()}))"]);
     return JSON.parse(result.stdout.trim());
   };
-  const sample = async (phase = "interval") => {
-    const machineSamples = await Promise.all(Object.entries(machineNames).map(async ([machine, name]) => {
-      const t0 = await machineClock(name);
-      const client = new Client({ connectionString: url, ssl: { ca, rejectUnauthorized: true }, connectionTimeoutMillis: 30_000, statement_timeout: 30_000 });
-      client.on("error", () => undefined);
-      let server;
-      let connections;
-      try {
-        await client.connect();
-        server = (await client.query("SELECT pg_catalog.clock_timestamp()::text AS now")).rows[0];
-        connections = (await client.query(`SELECT usename::text AS role_name,
-          COALESCE(client_addr::text, 'local') AS client_address,
-          pg_catalog.count(*)::integer AS connections
-          FROM pg_catalog.pg_stat_activity
-          WHERE datname OPERATOR(pg_catalog.=) pg_catalog.current_database()
-          GROUP BY usename, client_addr ORDER BY usename, client_addr`)).rows;
-      } finally {
-        await client.end().catch(() => undefined);
-      }
-      const t1 = await machineClock(name);
-      const radiusMs = Math.max(0, (t1.wallMs - t0.wallMs) / 2);
-      const databaseConnections = connections?.reduce((sum, entry) => sum + Number(entry.connections), 0);
-      return { phase, machine, t0, serverTime: server?.now, connections, databaseConnections, t1, radiusMs, verdict: radiusMs <= 250 ? "pass" : "fail" };
-    }));
-    samples.push(...machineSamples);
+  const measure = async (phase, machine, name) => {
+    const t0 = await machineClock(name);
+    const client = new Client({ connectionString: url, ssl: { ca, rejectUnauthorized: true }, connectionTimeoutMillis: 30_000, statement_timeout: 30_000 });
+    client.on("error", () => undefined);
+    let server;
+    let connections;
+    try {
+      await client.connect();
+      server = (await client.query("SELECT pg_catalog.clock_timestamp()::text AS now")).rows[0];
+      connections = (await client.query(`SELECT usename::text AS role_name,
+        COALESCE(client_addr::text, 'local') AS client_address,
+        pg_catalog.count(*)::integer AS connections
+        FROM pg_catalog.pg_stat_activity
+        WHERE datname OPERATOR(pg_catalog.=) pg_catalog.current_database()
+        GROUP BY usename, client_addr ORDER BY usename, client_addr`)).rows;
+    } finally {
+      await client.end().catch(() => undefined);
+    }
+    const t1 = await machineClock(name);
+    const radiusMs = Math.max(0, (t1.wallMs - t0.wallMs) / 2);
+    const databaseConnections = connections?.reduce((sum, entry) => sum + Number(entry.connections), 0);
+    return { phase, machine, t0, serverTime: server?.now, connections, databaseConnections, t1, radiusMs, verdict: radiusMs <= 250 ? "pass" : "fail" };
   };
-  await sample("start");
+  const sampleMachine = async (phase, machine, name) => {
+    const failedAttempts = [];
+    const firstStartedAtMs = now();
+    for (let attempt = 1; ; attempt += 1) {
+      const startedAtMs = now();
+      try {
+        return { ...(await measure(phase, machine, name)), attempt, failedAttempts };
+      } catch (error) {
+        const code = typeof error?.code === "string" && /^[A-Za-z0-9_]{1,32}$/u.test(error.code) ? { code: error.code } : {};
+        const failure = { attempt, errorClass: error?.name ?? "Error", ...code, startedAtMs, failedAtMs: now() };
+        if (attempt >= retry.maxAttempts || failure.failedAtMs + retry.delayMs - firstStartedAtMs > retry.windowMs) {
+          return { phase, machine, verdict: "incomplete", ...failure, failedAttempts };
+        }
+        failedAttempts.push(failure);
+        await delay(retry.delayMs);
+      }
+    }
+  };
+  const sample = async (phase = "interval") => {
+    const machineSamples = await Promise.all(Object.entries(machineNames).map(([machine, name]) => sampleMachine(phase, machine, name)));
+    samples.push(...machineSamples);
+    return machineSamples;
+  };
+  // Without a start bracket the clock gate cannot pass, so the run stops before its workload.
+  const startFailure = (await sample("start")).find((entry) => entry.verdict === "incomplete");
+  if (startFailure) {
+    throw new Error(`certification clock monitor could not sample machine ${startFailure.machine} at start (${startFailure.errorClass})`);
+  }
   const stopController = new AbortController();
   const loop = (async () => {
     while (!stopController.signal.aborted) {

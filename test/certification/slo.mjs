@@ -1,5 +1,5 @@
 import { createHash } from "node:crypto";
-import { mkdirSync, readFileSync, writeFileSync } from "node:fs";
+import { closeSync, mkdirSync, openSync, readFileSync, writeFileSync, writeSync } from "node:fs";
 import { join } from "node:path";
 
 export function nearestRank(values, quantile) {
@@ -58,7 +58,24 @@ export function recoveryWindow(attempts, { startMs, endMs }) {
   return { verdict, search: result.search, store: result.store };
 }
 
-const sha256 = (bytes) => createHash("sha256").update(bytes).digest("hex");
+// A sample is a Buffer, or the gate's list of Buffer chunks. Both are hashed and written
+// chunk by chunk, so no sample is ever joined into one string or one Buffer.
+const sampleChunks = (sample) => Buffer.isBuffer(sample) ? [sample] : sample;
+export function sampleSha256(sample) {
+  const hash = createHash("sha256");
+  for (const chunk of sampleChunks(sample)) hash.update(chunk);
+  return hash.digest("hex");
+}
+export function writeSampleFile(path, sample) {
+  const fd = openSync(path, "w", 0o600);
+  try {
+    for (const chunk of sampleChunks(sample)) {
+      for (let offset = 0; offset < chunk.length;) offset += writeSync(fd, chunk, offset, chunk.length - offset);
+    }
+  } finally {
+    closeSync(fd);
+  }
+}
 
 export function assembleCertificationGate(input) {
   if (input.contractStatus !== "approved") throw new Error("gate requires an approved contract");
@@ -72,7 +89,7 @@ export function assembleCertificationGate(input) {
     const bytes = input.sampleFiles?.[slo.inputs.sampleFile] ?? readFileSync(samplePath);
     return {
       ...slo,
-      inputs: { ...slo.inputs, sampleSha256: sha256(bytes) },
+      inputs: { ...slo.inputs, sampleSha256: sampleSha256(bytes) },
     };
   });
   const cleanupFails = input.cleanup.verdict === "fail" || input.cleanup.residualResources !== 0;
@@ -98,7 +115,7 @@ export function assembleCertificationGate(input) {
 
 export function writeCertificationGate(gate, outputDirectory, sampleFiles = {}) {
   mkdirSync(outputDirectory, { recursive: true });
-  for (const [name, bytes] of Object.entries(sampleFiles)) writeFileSync(join(outputDirectory, name), bytes, { mode: 0o600 });
+  for (const [name, sample] of Object.entries(sampleFiles)) writeSampleFile(join(outputDirectory, name), sample);
   const json = join(outputDirectory, "production-certification-gate.json");
   const markdown = join(outputDirectory, "production-certification-gate.md");
   const rows = gate.slos.map((slo) => `${slo.id} | ${slo.verdict} | ${slo.observed} | ${slo.threshold}`);

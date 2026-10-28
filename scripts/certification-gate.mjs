@@ -1,6 +1,6 @@
 #!/usr/bin/env node
 import { createHash } from "node:crypto";
-import { existsSync, readFileSync, writeFileSync } from "node:fs";
+import { closeSync, existsSync, openSync, readFileSync, readSync, writeFileSync } from "node:fs";
 import { join, resolve } from "node:path";
 import { pathToFileURL } from "node:url";
 import { validateEvidence } from "../test/postgresql/cutover-rehearsal/check-evidence.ts";
@@ -11,9 +11,85 @@ import { observerReadSettings } from "../test/certification/sqlite-observer-work
 import { EXECUTION_HOST_IDENTITY_FIELDS, captureExecutionProvenance, recoveryWindowSearch } from "./certification-harness.mjs";
 
 function json(path) { return JSON.parse(readFileSync(path, "utf8")); }
-function ndjson(path) {
-  return readFileSync(path, "utf8").split(/\r?\n/u).filter(Boolean).map((line) => JSON.parse(line));
+
+// NDJSON evidence is read in fixed-size chunks and decoded one line at a time, so a full
+// run's per-machine observer file (180 MB or more) never becomes one string. Lines split
+// exactly as text.split(/\r?\n/u).filter(Boolean) splits the whole text: a newline ends a
+// line, one carriage return before it is dropped, and empty lines are skipped.
+export const NDJSON_CHUNK_BYTES = 1 << 20;
+export function forEachNdjsonRow(path, visit, { chunkBytes = NDJSON_CHUNK_BYTES } = {}) {
+  const emit = (bytes, terminated) => {
+    const end = terminated && bytes.length > 0 && bytes[bytes.length - 1] === 0x0d ? bytes.length - 1 : bytes.length;
+    if (end > 0) visit(JSON.parse(bytes.toString("utf8", 0, end)));
+  };
+  const fd = openSync(path, "r");
+  try {
+    const chunk = Buffer.allocUnsafe(chunkBytes);
+    let partial = [];
+    for (let read = readSync(fd, chunk, 0, chunkBytes, null); read > 0; read = readSync(fd, chunk, 0, chunkBytes, null)) {
+      const view = chunk.subarray(0, read);
+      let start = 0;
+      for (let newline = view.indexOf(0x0a); newline !== -1; newline = view.indexOf(0x0a, start)) {
+        const piece = view.subarray(start, newline);
+        emit(partial.length === 0 ? piece : Buffer.concat([...partial, piece]), true);
+        partial = [];
+        start = newline + 1;
+      }
+      // The chunk buffer is reused by the next read, so an unterminated tail is copied.
+      if (start < read) partial.push(Buffer.from(view.subarray(start)));
+    }
+    if (partial.length > 0) emit(Buffer.concat(partial), false);
+  } finally {
+    closeSync(fd);
+  }
 }
+
+function ndjson(path, chunkSizes) {
+  const rows = [];
+  forEachNdjsonRow(path, (row) => { rows.push(row); }, chunkSizes);
+  return rows;
+}
+
+// Sample files are built as a list of Buffer chunks of about SAMPLE_CHUNK_CHARS characters,
+// so a sample over V8's 536,870,888-character string limit (a full run's merged observer
+// witness can approach it) is never one string. Joined, the chunks are exactly
+// Buffer.from(rows.map((row) => `${JSON.stringify(row)}\n`).join("")).
+export const SAMPLE_CHUNK_CHARS = 1 << 20;
+export function createSampleBuilder({ chunkChars = SAMPLE_CHUNK_CHARS } = {}) {
+  const chunks = [];
+  let pending = "";
+  return {
+    append(row) {
+      pending += `${JSON.stringify(row)}\n`;
+      if (pending.length >= chunkChars) {
+        chunks.push(Buffer.from(pending));
+        pending = "";
+      }
+    },
+    finish() {
+      if (pending.length > 0) chunks.push(Buffer.from(pending));
+      pending = "";
+      return chunks;
+    },
+  };
+}
+
+// Merges both machines' observer files into the observer witness one row at a time and
+// keeps only the fields the completeness predicate reads, so the rows' cumulative
+// acknowledgment maps are never all in memory and the witness is never one string.
+export function readObserverWitness(evidenceDirectory, chunkSizes = {}) {
+  const witness = createSampleBuilder(chunkSizes);
+  const polls = [];
+  for (const machine of ['a', 'b']) {
+    forEachNdjsonRow(join(evidenceDirectory, `machine-${machine}`, "observer.ndjson"), (entry) => {
+      const row = { machine, ...entry };
+      witness.append(row);
+      polls.push({ machine: row.machine, status: row.status, incomplete: row.incomplete, gapMs: row.gapMs });
+    }, chunkSizes);
+  }
+  return { polls, witness: witness.finish() };
+}
+
 // Allow five seconds for query duration and scheduler jitter on a 60-second cadence.
 const clockCadenceNanos = 65_000_000_000n;
 
@@ -32,13 +108,19 @@ function percentileSlos(id, samples, thresholds, minimums, file) {
 export function clockVerdict(samples, threshold, minimumCount = 2, steadySeconds = 0, steadyStartMs, steadyEndMs) {
   const finite = samples.filter((entry) => Number.isFinite(entry?.radiusMs) && entry.radiusMs >= 0);
   if (finite.some((entry) => entry.radiusMs > threshold || entry.verdict === "fail")) return "fail";
+  // A sample the monitor retried records its attempt number and each earlier failed
+  // attempt; a sample without an attempt number comes from a single attempt.
+  const attemptsRecorded = (entry) => entry.attempt === undefined
+    || (Number.isSafeInteger(entry.attempt) && entry.attempt >= 1
+      && Array.isArray(entry.failedAttempts) && entry.failedAttempts.length === entry.attempt - 1);
   const validBracket = (entry) => ['a', 'b'].includes(entry.machine)
     && Number.isFinite(entry.t0?.wallMs) && Number.isFinite(entry.t1?.wallMs) && entry.t1.wallMs >= entry.t0.wallMs
     && typeof entry.t0?.monotonicNs === "string" && /^\d+$/u.test(entry.t0.monotonicNs)
     && typeof entry.t1?.monotonicNs === "string" && /^\d+$/u.test(entry.t1.monotonicNs)
     && BigInt(entry.t1.monotonicNs) >= BigInt(entry.t0.monotonicNs)
     && Number.isFinite(Date.parse(entry.serverTime))
-    && Math.abs(entry.radiusMs - (entry.t1.wallMs - entry.t0.wallMs) / 2) < 0.001;
+    && Math.abs(entry.radiusMs - (entry.t1.wallMs - entry.t0.wallMs) / 2) < 0.001
+    && attemptsRecorded(entry);
   const expectedPerMachine = Math.max(2, Math.floor(steadySeconds / 60) + 1);
   if (samples.length < minimumCount || finite.length !== samples.length || samples.some((entry) => entry.verdict === "incomplete" || !validBracket(entry))) return "incomplete";
   for (const machine of ['a', 'b']) {
@@ -113,10 +195,12 @@ export function recoveryVerdicts(observed, limits) {
   return { verdict: failed ? "fail" : incomplete ? "incomplete" : "pass", ...observed };
 }
 
-export function buildEvidenceManifest({ evidenceDirectory, contract, persist = true }) {
+export function buildEvidenceManifest({ evidenceDirectory, contract, persist = true, chunkSizes = {} }) {
   const generatedSamples = {};
   const sampleFile = (name, values) => {
-    generatedSamples[name] = Buffer.from(values.map((value) => `${JSON.stringify(value)}\n`).join(""));
+    const builder = createSampleBuilder(chunkSizes);
+    for (const value of values) builder.append(value);
+    generatedSamples[name] = builder.finish();
     return name;
   };
   const run = json(join(evidenceDirectory, "run.json"));
@@ -155,7 +239,7 @@ export function buildEvidenceManifest({ evidenceDirectory, contract, persist = t
   const drains = Object.fromEntries(['a', 'b'].map((machine) => [machine, json(join(evidenceDirectory, `machine-${machine}`, "drain.json"))]));
   const samplesByMachine = Object.fromEntries(['a', 'b'].map((machine) => [
     machine,
-    ndjson(join(evidenceDirectory, `machine-${machine}`, "samples.ndjson")),
+    ndjson(join(evidenceDirectory, `machine-${machine}`, "samples.ndjson"), chunkSizes),
   ]));
   const allSamples = Object.values(samplesByMachine).flat();
   const steady = allSamples.filter((sample) => sample.phase === "steady");
@@ -308,10 +392,10 @@ export function buildEvidenceManifest({ evidenceDirectory, contract, persist = t
     inputs: { count: steady.length, sampleFile: files.attempts }, threshold: contract.thresholds.errors.nonInjectedErrorRateMax,
     observed: observedErrorRate, verdict: observedErrorRate <= contract.thresholds.errors.nonInjectedErrorRateMax ? "pass" : "fail",
   });
-  const ledger = ['a', 'b'].flatMap((machine) => ndjson(join(evidenceDirectory, `machine-${machine}`, "invocations.ndjson")));
+  const ledger = ['a', 'b'].flatMap((machine) => ndjson(join(evidenceDirectory, `machine-${machine}`, "invocations.ndjson"), chunkSizes));
   const mappings = ledger.filter((entry) => entry.eventUuid);
   const acknowledgments = Object.assign({}, ...['a', 'b'].map((machine) => {
-    const rows = ndjson(join(evidenceDirectory, `machine-${machine}`, "acknowledgments.ndjson"));
+    const rows = ndjson(join(evidenceDirectory, `machine-${machine}`, "acknowledgments.ndjson"), chunkSizes);
     return rows[0] ?? {};
   }));
   const hookById = Object.fromEntries(allSamples.filter((sample) => sample.op === "hook").map((sample) => [sample.id, sample]));
@@ -341,8 +425,8 @@ export function buildEvidenceManifest({ evidenceDirectory, contract, persist = t
     { id: "event-loss", formula: "captured events without terminal acknowledgment", inputs: { count: mappings.length, sampleFile: oracleFile }, threshold: 0, observed: oracle.missingAcknowledgment.length, verdict: oracle.missingAcknowledgment.length === 0 ? "pass" : "fail" },
     { id: "observed-duplicate-inbox-ids", formula: "event ids with more than one distinct acknowledged inbox id", inputs: { count: mappings.length, sampleFile: oracleFile }, threshold: 0, observed: duplicates + oracle.duplicateInbox.length, verdict: duplicates + oracle.duplicateInbox.length === 0 ? "pass" : "fail" },
   );
-  const observerRows = ['a', 'b'].flatMap((machine) => ndjson(join(evidenceDirectory, `machine-${machine}`, "observer.ndjson"))
-    .map((entry) => ({ machine, ...entry })));
+  const observer = readObserverWitness(evidenceDirectory, chunkSizes);
+  const observerRows = observer.polls;
   // A poll is incomplete on read failure, a gap over two seconds, or database or
   // parent replacement. Absent -wal/-shm siblings are a recorded diagnostic only:
   // SQLite removes them when its last connection closes cleanly.
@@ -354,7 +438,7 @@ export function buildEvidenceManifest({ evidenceDirectory, contract, persist = t
     if (slo.verdict !== "fail" && observerIncomplete) slo.verdict = "incomplete";
   }
   slos.push({ id: "observer-completeness", formula: "all one-second polls present, bounded and identity-stable", inputs: { count: observerRows.length, sampleFile: "observer-witness.ndjson" }, threshold: 0, observed: observerRows.filter((entry) => entry.incomplete).length, verdict: observerIncomplete ? "incomplete" : "pass" });
-  sampleFile("observer-witness.ndjson", observerRows);
+  generatedSamples["observer-witness.ndjson"] = observer.witness;
   const clocks = json(join(evidenceDirectory, "clock-witness.json"));
   const clockRadius = Math.max(0, ...clocks.filter((entry) => typeof entry.radiusMs === "number").map((entry) => entry.radiusMs));
   const steadySeconds = contract.timeline[run.profile].steadySeconds;
