@@ -202,11 +202,10 @@ The read-only scan may use its full 30-second discovery budget; each individual
 SQLite diagnostic read still has a two-second limit.
 
 Promotion through `lcm events promote` (and `--all`) needs the backend
-publication lock briefly. If another process, such as a hook, holds the lock,
-the daemon waits up to about 3 seconds for it to be released and then
-promotes. The wait does not cover the daemon's own work: while the background
-sweep (for example its sidecar scan) or an earlier promotion's cleanup holds
-the lock, or when the wait is exhausted, the daemon answers `503` with
+publication lock briefly. If another process, such as a hook, or the daemon's
+own concurrent work, such as the background sweep's sidecar scan, holds the
+lock, the daemon waits up to about 3 seconds for it to be released and then
+promotes. When the wait is exhausted, the daemon answers `503` with
 `status: "busy"` instead of a server error, and the command exits non-zero
 with "backend publication work is in progress; retry the promotion". Retry the
 command; nothing is lost and pending events stay queued. This differs from the

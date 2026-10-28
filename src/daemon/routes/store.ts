@@ -17,6 +17,13 @@ import {
   withProjectStorage,
 } from "./storage-lifecycle.js";
 import { BackendPublicationJournalError } from "../../storage/backend-publication.js";
+import { PrivateMutationLockContentionError } from "../../private-mutation-lock.js";
+
+/** Retryable answer while publication work (a hook, the daemon's own sweep, another process) holds the lock past the wait. */
+export const STORE_BUSY_BODY = Object.freeze({
+  status: "busy",
+  error: "backend publication work is in progress; retry the store",
+});
 
 /** Cache entry for a per-project ScrubEngine. */
 interface ScrubCacheEntry {
@@ -148,6 +155,10 @@ export function createStoreHandler(
           status: "blocked",
           error: "backend publication admission blocked",
         });
+        return;
+      }
+      if (err instanceof PrivateMutationLockContentionError) {
+        sendJson(res, 503, STORE_BUSY_BODY);
         return;
       }
       const storageFailure = storageRouteFailureResponse(config.storage.backend, err, "store", storageFactory);

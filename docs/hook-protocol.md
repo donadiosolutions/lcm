@@ -721,9 +721,10 @@ counted from acceptance, and daemon shutdown cancels it; both are best-effort
 cancellation, not a guarantee that the work stops at that instant. If another
 process holds the backend-publication lock, the run waits for it inside that
 deadline instead of failing, and it never repeats work that has started. The
-ordinary `POST /ingest` and `POST /restore` routes wait the same way until
-3 seconds after the request's first wait, across all of its admissions, before
-they fail. The daemon does
+ordinary `POST /ingest` and `POST /restore` routes wait the same way, and
+also for the daemon's own concurrent lock users, until 3 seconds after the
+request's first wait, across all of its admissions, before they fail. The
+terminal hand-off keeps waiting only for other processes. The daemon does
 not become idle while accepted work remains, and shutdown waits for the queue
 before it closes shared storage. The outcome of each deferred run (captured, no
 new observations, cancelled, blocked, failed or expired) is logged by the daemon
