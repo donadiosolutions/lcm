@@ -449,7 +449,13 @@ export interface MigrationActivationCoordinator extends ActivationPublicationCoo
 export interface MigrationActivationEvidenceSeam {
   recordMigrationActivationEpoch(input: Readonly<{ homeDir: string; epoch: MigrationActivationEpoch }>): void;
   recordMigrationActivationAttempt(
-    input: Readonly<{ homeDir: string; generationId: string; attempt: MigrationActivationAttempt }>,
+    input: Readonly<{
+      homeDir: string;
+      generationId: string;
+      attempt: MigrationActivationAttempt;
+      /** The witness recorded next; lets re-entry survive an interrupted witness write. */
+      nextWitness?: MigrationActivationWitness;
+    }>,
   ): void;
   recordMigrationActivationWitness(
     input: Readonly<{ homeDir: string; generationId: string; witness: MigrationActivationWitness }>,
@@ -1694,7 +1700,7 @@ function recordEvidenceChain(ctx: Context, step: MigrationActivationInterruption
   try {
     ctx.deps.evidence.recordMigrationActivationEpoch({ homeDir: ctx.homeDir, epoch: ctx.epoch! });
     crash(ctx, "after-epoch");
-    ctx.deps.evidence.recordMigrationActivationAttempt({ homeDir: ctx.homeDir, generationId: ctx.generationId, attempt: ctx.attempt! });
+    ctx.deps.evidence.recordMigrationActivationAttempt({ homeDir: ctx.homeDir, generationId: ctx.generationId, attempt: ctx.attempt!, nextWitness: ctx.witness! });
     crash(ctx, "after-attempt");
     ctx.deps.evidence.recordMigrationActivationWitness({ homeDir: ctx.homeDir, generationId: ctx.generationId, witness: ctx.witness! });
     crash(ctx, "after-witness");

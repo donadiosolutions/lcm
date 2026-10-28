@@ -5,6 +5,8 @@ import {
   linkSync,
   mkdirSync,
   mkdtempSync,
+  readFileSync,
+  readdirSync,
   rmSync,
   statSync,
   writeFileSync,
@@ -253,6 +255,212 @@ describe("activation evidence store: writers", () => {
     plant(homeDir, "." + name + ".0123abce.tmp", "half written");
     expect(readMigrationActivationEvidence({ homeDir, generationId: GENERATION_ID }))
       .toMatchObject({ state: "unresolvable" });
+  });
+});
+
+describe("activation evidence store: interrupted first write of the record being written (#1769)", () => {
+  const read = (homeDir: string) => readMigrationActivationEvidence({ homeDir, generationId: GENERATION_ID });
+  const attemptName = (attempt: { attemptId: string }): string => "attempt-" + attempt.attemptId + ".json";
+  const witnessName = (witness: { checksumSha256: string }): string => "witness-" + witness.checksumSha256 + ".json";
+  /** The writer's scratch name for a final: .<final>.<hex>.tmp. */
+  const scratchOf = (name: string, hex = "0123abcd"): string => "." + name + "." + hex + ".tmp";
+  const entries = (homeDir: string): string[] => readdirSync(dir(homeDir)).sort();
+
+  function seeded(through: "epoch" | "attempt") {
+    const homeDir = home();
+    const epoch = fixtureEpoch({ generationId: GENERATION_ID });
+    const attempt = fixtureAttempt({ epoch });
+    const witness = fixtureActivationWitness(epoch, attempt);
+    recordMigrationActivationEpoch({ homeDir, epoch });
+    if (through === "attempt") recordMigrationActivationAttempt({ homeDir, generationId: GENERATION_ID, attempt });
+    return { homeDir, epoch, attempt, witness };
+  }
+
+  it("finishes an interrupted attempt write: the retry publishes the canonical final, clears the scratch and reuses it afterwards", () => {
+    const { homeDir, attempt } = seeded("epoch");
+    const scratch = plant(homeDir, scratchOf(attemptName(attempt)), wire(attempt));
+    // The strict reader keeps refusing the lone scratch.
+    expect(read(homeDir)).toMatchObject({ state: "unresolvable" });
+
+    recordMigrationActivationAttempt({ homeDir, generationId: GENERATION_ID, attempt });
+
+    const finalPath = join(dir(homeDir), attemptName(attempt));
+    expect(readFileSync(finalPath, "utf8")).toBe(wire(attempt));
+    expect(existsSync(scratch)).toBe(false);
+    expect(read(homeDir)).toMatchObject({ state: "resolved", attempts: [attempt] });
+    const inode = statSync(finalPath).ino;
+    recordMigrationActivationAttempt({ homeDir, generationId: GENERATION_ID, attempt });
+    expect(statSync(finalPath).ino).toBe(inode);
+  });
+
+  it("finishes an interrupted witness write: the retry publishes the canonical final, clears the scratch and reuses it afterwards", () => {
+    const { homeDir, witness } = seeded("attempt");
+    const scratch = plant(homeDir, scratchOf(witnessName(witness)), wire(witness));
+    expect(read(homeDir)).toMatchObject({ state: "unresolvable" });
+
+    recordMigrationActivationWitness({ homeDir, generationId: GENERATION_ID, witness });
+
+    const finalPath = join(dir(homeDir), witnessName(witness));
+    expect(readFileSync(finalPath, "utf8")).toBe(wire(witness));
+    expect(existsSync(scratch)).toBe(false);
+    expect(read(homeDir)).toMatchObject({ state: "resolved", witnesses: [witness] });
+    const inode = statSync(finalPath).ino;
+    recordMigrationActivationWitness({ homeDir, generationId: GENERATION_ID, witness });
+    expect(statSync(finalPath).ino).toBe(inode);
+  });
+
+  type Orphan = Readonly<{ label: string; through: "epoch" | "attempt"; write: (s: ReturnType<typeof seeded>) => void; finalName: (s: ReturnType<typeof seeded>) => string; wire: (s: ReturnType<typeof seeded>) => string }>;
+  const orphans: readonly Orphan[] = [
+    {
+      label: "attempt", through: "epoch",
+      write: ({ homeDir, attempt }) => recordMigrationActivationAttempt({ homeDir, generationId: GENERATION_ID, attempt }),
+      finalName: ({ attempt }) => attemptName(attempt), wire: ({ attempt }) => wire(attempt),
+    },
+    {
+      label: "witness", through: "attempt",
+      write: ({ homeDir, witness }) => recordMigrationActivationWitness({ homeDir, generationId: GENERATION_ID, witness }),
+      finalName: ({ witness }) => witnessName(witness), wire: ({ witness }) => wire(witness),
+    },
+  ];
+
+  describe.each(orphans)("an orphan $label scratch that cannot be trusted", (orphan) => {
+    const refusedUntouched = (state: ReturnType<typeof seeded>, scratchName: string, content: string) => {
+      expect(() => orphan.write(state)).toThrowError(
+        expect.objectContaining({ name: "MigrationActivationEvidenceRefusalError", reason: "evidence-unresolvable" }),
+      );
+      expect(existsSync(join(dir(state.homeDir), orphan.finalName(state)))).toBe(false);
+      expect(readFileSync(join(dir(state.homeDir), scratchName), "utf8")).toBe(content);
+    };
+
+    it("is refused when its bytes differ from the record being written, leaving the scratch", () => {
+      const state = seeded(orphan.through);
+      const differing = orphan.wire(state).replace(/\n$/u, " \n");
+      plant(state.homeDir, scratchOf(orphan.finalName(state)), differing);
+      refusedUntouched(state, scratchOf(orphan.finalName(state)), differing);
+    });
+
+    it("is refused when its mode is not the writer's", () => {
+      const state = seeded(orphan.through);
+      const path = plant(state.homeDir, scratchOf(orphan.finalName(state)), orphan.wire(state));
+      chmodSync(path, 0o644);
+      refusedUntouched(state, scratchOf(orphan.finalName(state)), orphan.wire(state));
+    });
+
+    it("is refused when it has more than one link", () => {
+      const state = seeded(orphan.through);
+      const path = plant(state.homeDir, scratchOf(orphan.finalName(state)), orphan.wire(state));
+      linkSync(path, join(dir(state.homeDir), scratchOf(orphan.finalName(state), "0123abce")));
+      refusedUntouched(state, scratchOf(orphan.finalName(state)), orphan.wire(state));
+    });
+
+    it("is refused when its name is not a writer scratch of a final record", () => {
+      const state = seeded(orphan.through);
+      plant(state.homeDir, ".notes.txt.0123abcd.tmp", orphan.wire(state));
+      refusedUntouched(state, ".notes.txt.0123abcd.tmp", orphan.wire(state));
+    });
+  });
+
+  it("refuses a lone scratch of another record than the one being written", () => {
+    const { homeDir, attempt, witness } = seeded("epoch");
+    plant(homeDir, scratchOf(witnessName(witness)), wire(witness));
+    expect(() => recordMigrationActivationAttempt({ homeDir, generationId: GENERATION_ID, attempt }))
+      .toThrowError(expect.objectContaining({ reason: "evidence-unresolvable" }));
+    expect(existsSync(join(dir(homeDir), attemptName(attempt)))).toBe(false);
+    expect(entries(homeDir)).toContain(scratchOf(witnessName(witness)));
+  });
+
+  it("keeps the ordering checks for an orphan: an attempt scratch without its epoch is epoch-missing", () => {
+    const homeDir = home();
+    const epoch = fixtureEpoch({ generationId: GENERATION_ID });
+    const attempt = fixtureAttempt({ epoch });
+    plant(homeDir, scratchOf(attemptName(attempt)), wire(attempt));
+    expect(() => recordMigrationActivationAttempt({ homeDir, generationId: GENERATION_ID, attempt }))
+      .toThrowError(expect.objectContaining({ reason: "epoch-missing" }));
+    expect(existsSync(join(dir(homeDir), attemptName(attempt)))).toBe(false);
+    expect(existsSync(join(dir(homeDir), scratchOf(attemptName(attempt))))).toBe(true);
+  });
+
+  it("keeps the ordering checks for an orphan: a witness scratch without its epoch is epoch-missing, without its attempt attempt-missing", () => {
+    const { homeDir, witness } = seeded("epoch");
+    plant(homeDir, scratchOf(witnessName(witness)), wire(witness));
+    expect(() => recordMigrationActivationWitness({ homeDir, generationId: GENERATION_ID, witness }))
+      .toThrowError(expect.objectContaining({ reason: "attempt-missing" }));
+    const bare = home();
+    plant(bare, scratchOf(witnessName(witness)), wire(witness));
+    expect(() => recordMigrationActivationWitness({ homeDir: bare, generationId: GENERATION_ID, witness }))
+      .toThrowError(expect.objectContaining({ reason: "epoch-missing" }));
+    expect(existsSync(join(dir(bare), witnessName(witness)))).toBe(false);
+  });
+
+  it("keeps the reproduction check for an orphan witness scratch that its stored epoch and attempt do not mint", () => {
+    const { homeDir, witness } = seeded("attempt");
+    const forged = forgedWitness(witness);
+    plant(homeDir, scratchOf(witnessName(forged)), wire(forged));
+    expect(() => recordMigrationActivationWitness({ homeDir, generationId: GENERATION_ID, witness: forged }))
+      .toThrowError(expect.objectContaining({ reason: "witness-does-not-reproduce" }));
+    expect(existsSync(join(dir(homeDir), witnessName(forged)))).toBe(false);
+    expect(existsSync(join(dir(homeDir), scratchOf(witnessName(forged))))).toBe(true);
+  });
+
+  describe("nextWitness (re-entry of the chain after an interrupted witness write)", () => {
+    const chain = (state: ReturnType<typeof seeded>, nextWitness?: typeof state.witness) =>
+      recordMigrationActivationAttempt({
+        homeDir: state.homeDir, generationId: GENERATION_ID, attempt: state.attempt,
+        ...(nextWitness === undefined ? {} : { nextWitness }),
+      });
+
+    it("lets the attempt writer re-enter beside the canonical witness scratch; the witness writer then finishes it", () => {
+      const state = seeded("attempt");
+      const scratch = plant(state.homeDir, scratchOf(witnessName(state.witness)), wire(state.witness));
+      const finalPath = join(dir(state.homeDir), attemptName(state.attempt));
+      const inode = statSync(finalPath).ino;
+
+      chain(state, state.witness);
+
+      expect(statSync(finalPath).ino).toBe(inode);
+      expect(existsSync(scratch)).toBe(true);
+      expect(existsSync(join(dir(state.homeDir), witnessName(state.witness)))).toBe(false);
+      recordMigrationActivationWitness({ homeDir: state.homeDir, generationId: GENERATION_ID, witness: state.witness });
+      expect(existsSync(scratch)).toBe(false);
+      expect(read(state.homeDir)).toMatchObject({ state: "resolved", attempts: [state.attempt], witnesses: [state.witness] });
+    });
+
+    it("without nextWitness a direct attempt write still refuses the unrelated witness scratch", () => {
+      const state = seeded("attempt");
+      plant(state.homeDir, scratchOf(witnessName(state.witness)), wire(state.witness));
+      expect(() => chain(state)).toThrowError(expect.objectContaining({ reason: "evidence-unresolvable" }));
+    });
+
+    it("also finishes an interrupted attempt write when it is given", () => {
+      const state = seeded("epoch");
+      const scratch = plant(state.homeDir, scratchOf(attemptName(state.attempt)), wire(state.attempt));
+      chain(state, state.witness);
+      expect(readFileSync(join(dir(state.homeDir), attemptName(state.attempt)), "utf8")).toBe(wire(state.attempt));
+      expect(existsSync(scratch)).toBe(false);
+    });
+
+    it("refuses a witness scratch whose bytes differ from the next witness, writing nothing", () => {
+      const state = seeded("epoch");
+      const differing = wire(state.witness).replace(/\n$/u, " \n");
+      plant(state.homeDir, scratchOf(witnessName(state.witness)), differing);
+      expect(() => chain(state, state.witness)).toThrowError(expect.objectContaining({ reason: "evidence-unresolvable" }));
+      expect(existsSync(join(dir(state.homeDir), attemptName(state.attempt)))).toBe(false);
+      expect(readFileSync(join(dir(state.homeDir), scratchOf(witnessName(state.witness))), "utf8")).toBe(differing);
+    });
+
+    it("refuses a next witness that names another attempt or another epoch before any read or write", () => {
+      const state = seeded("epoch");
+      const otherAttempt = fixtureAttempt({ epoch: state.epoch, seed: "other" });
+      const foreignAttempt = fixtureActivationWitness(state.epoch, otherAttempt);
+      expect(() => chain(state, foreignAttempt)).toThrowError(MigrationActivationWitnessError);
+      const { checksumSha256: _discarded, ...payload } = state.witness;
+      const reEpoched = { ...payload, epochId: "e".repeat(64) };
+      const foreignEpoch = { ...reEpoched, checksumSha256: migrationWitnessSha256(reEpoched) };
+      expect(() => chain(state, foreignEpoch)).toThrowError(
+        expect.objectContaining({ name: "MigrationActivationWitnessError", reason: "unexpected-state" }),
+      );
+      expect(existsSync(join(dir(state.homeDir), attemptName(state.attempt)))).toBe(false);
+    });
   });
 });
 
