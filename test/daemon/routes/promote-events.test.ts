@@ -39,12 +39,16 @@ const FORCED_WRAPPER_TIMEOUT_MS = 1;
 const eventPathMocks = vi.hoisted(() => ({
   eventsDir: vi.fn(),
   existingEventsDbPath: vi.fn(),
+  assertExistingSidecarProjectBinding: vi.fn(),
+  SidecarIdentityConflictError: class SidecarIdentityConflictError extends Error {},
 }));
 
 // Mock eventsDbPath to point at our temp dir
 vi.mock("../../../src/db/events-path.js", () => ({
   eventsDbPath: vi.fn(),
   existingEventsDbPath: eventPathMocks.existingEventsDbPath,
+  assertExistingSidecarProjectBinding: eventPathMocks.assertExistingSidecarProjectBinding,
+  SidecarIdentityConflictError: eventPathMocks.SidecarIdentityConflictError,
   eventsDir: eventPathMocks.eventsDir,
 }));
 
@@ -74,7 +78,6 @@ function makeConfig(): DaemonConfig {
         compressionRatio: 0.1,
         keywords: { decision: ["decided"] },
         architecturePatterns: [],
-        dedupBm25Threshold: 15,
         dedupCandidateLimit: 100,
         eventConfidence: {
           decision: 0.5,
@@ -152,10 +155,11 @@ describe("promote-events route", () => {
     sidecarPath = join(dir, "events.db");
     extraDirs = [];
     startedPromotionOperations = [];
-    eventPathMocks.eventsDir.mockReturnValue(dir);
-    eventPathMocks.existingEventsDbPath.mockReturnValue(sidecarPath);
-    vi.mocked(eventsDbPath).mockReturnValue(sidecarPath);
-    vi.mocked(deduplicateAndInsert).mockClear();
+    eventPathMocks.eventsDir.mockReset().mockReturnValue(dir);
+    eventPathMocks.existingEventsDbPath.mockReset().mockReturnValue(sidecarPath);
+    eventPathMocks.assertExistingSidecarProjectBinding.mockReset();
+    vi.mocked(eventsDbPath).mockReset().mockReturnValue(sidecarPath);
+    vi.mocked(deduplicateAndInsert).mockReset().mockResolvedValue("mock-id");
     vi.mocked(deduplicateAndInsertInRepositories).mockClear();
     clearProjectMapCache();
   });
@@ -273,7 +277,12 @@ describe("promote-events route", () => {
     verify.close();
   });
 
-  it.each([false, true])("commits the unreinforced lexical decision with existing match=%s", async (hasMatch) => {
+  it.each([
+    ["no entry", "none"],
+    ["an unrelated lexical hit", "unrelated"],
+    ["an identical entry", "identical"],
+  ] as const)("commits the unreinforced decision against %s", async (_label, seed) => {
+    const hasMatch = seed === "identical";
     recoverMachineIdentity({
       version: 1,
       identityKey: `machine:${"c".repeat(64)}`,
@@ -288,9 +297,10 @@ describe("promote-events route", () => {
       firstMachineSequence: "0000000000000000000",
       establishedAt: "2026-09-07T03:04:05.123456Z",
     });
-    const existingId = hasMatch ? new PromotedStore(projectDb).insert({
-      content: "only once", tags: [], projectId: projectId(dir), depth: 0, confidence: 0.5,
-    }) : undefined;
+    const existingId = seed === "none" ? undefined : new PromotedStore(projectDb).insert({
+      content: hasMatch ? "only once" : "only once but different words",
+      tags: [], projectId: projectId(dir), depth: 0, confidence: 0.5,
+    });
     projectDb.close();
     const edb = new EventsDb(sidecarPath);
     edb.insertEvent("s1", {
@@ -320,8 +330,56 @@ describe("promote-events route", () => {
         outcome: "no-effect",
         effectWitness: { reason: "unreinforced-pattern" },
       }]);
-    expect(new PromotedStore(verify).getAll()).toHaveLength(hasMatch ? 1 : 0);
+    expect(new PromotedStore(verify).getAll()).toHaveLength(seed === "none" ? 0 : 1);
     verify.close();
+  });
+
+  it("skips a one-off tier 3 event whose only lexical hit is an unrelated entry", async () => {
+    const edb = new EventsDb(sidecarPath);
+    edb.insertEvent("s1", { type: "file_read", category: "file", data: "src/config/other.ts (read) shared terms", priority: 3 }, "PostToolUse");
+    edb.close();
+    const db = setupProjectDb(dir);
+    new PromotedStore(db).insert({
+      content: "src/config/settings.ts (read) shared terms", tags: ["seed"], projectId: projectId(dir), confidence: 0.6,
+    });
+    expect(new PromotedStore(db).search("src/config/other.ts (read) shared terms", 1, undefined, projectId(dir))).toHaveLength(1);
+    db.close();
+
+    await expect(promoteEventsForCwd(makeConfig(), dir)).resolves.toMatchObject({
+      promoted: 0, skipped: 1, errors: 0,
+    });
+
+    const verify = new DatabaseSync(projectDbPath(dir), { readOnly: true });
+    expect(new PromotedStore(verify).getAll()).toHaveLength(1);
+    verify.close();
+    const sidecar = new EventsDb(sidecarPath);
+    expect(sidecar.getUnprocessed()).toEqual([]);
+    sidecar.close();
+    expect(vi.mocked(deduplicateAndInsert)).not.toHaveBeenCalled();
+  });
+
+  it("re-confirms an identical entry for a one-off tier 3 event without inserting", async () => {
+    const edb = new EventsDb(sidecarPath);
+    edb.insertEvent("s1", { type: "file_read", category: "file", data: "src/main.ts (source)", priority: 3 }, "PostToolUse");
+    edb.close();
+    const db = setupProjectDb(dir);
+    const existingId = new PromotedStore(db).insert({
+      content: "src/main.ts (source)", tags: ["seed"], projectId: projectId(dir), confidence: 0.05,
+    });
+    db.close();
+
+    await expect(promoteEventsForCwd(makeConfig(), dir)).resolves.toMatchObject({
+      promoted: 1, skipped: 0, errors: 0,
+    });
+
+    const verify = new DatabaseSync(projectDbPath(dir), { readOnly: true });
+    const rows = new PromotedStore(verify).getAll();
+    expect(rows).toHaveLength(1);
+    expect(rows[0].id).toBe(existingId);
+    expect(rows[0].confidence).toBeGreaterThan(0.05);
+    expect(JSON.parse(rows[0].tags)).toEqual(expect.arrayContaining(["seed", "source:passive-capture"]));
+    verify.close();
+    expect(vi.mocked(deduplicateAndInsert)).not.toHaveBeenCalled();
   });
 
   it.each([
@@ -726,6 +784,7 @@ describe("promote-events route", () => {
     extraDirs.push(sidecarParent);
     const disappearingSidecar = join(sidecarParent, "events.db");
     new EventsDb(disappearingSidecar).close();
+    eventPathMocks.existingEventsDbPath.mockReturnValue(disappearingSidecar);
     const openExisting = EventsDb.openExisting;
     const openSpy = vi.spyOn(EventsDb, "openExisting").mockImplementation((dbPath, options) => {
       if (dbPath === disappearingSidecar) {
@@ -756,6 +815,7 @@ describe("promote-events route", () => {
     const corruptSidecar = join(dir, "parking-corrupt.db");
     const evidence = Buffer.from("not a sqlite database");
     writeFileSync(corruptSidecar, evidence);
+    eventPathMocks.existingEventsDbPath.mockReturnValue(corruptSidecar);
 
     await expect(parkUnavailableCwdEvents(deletedCwd, corruptSidecar)).rejects.toThrow();
     expect(readFileSync(corruptSidecar)).toEqual(evidence);
@@ -794,6 +854,7 @@ describe("promote-events route", () => {
     const deletedCwd = join(dir, "deleted-empty-sidecar");
     const emptySidecar = join(dir, "empty.db");
     new EventsDb(emptySidecar).close();
+    eventPathMocks.existingEventsDbPath.mockReturnValue(emptySidecar);
     vi.useFakeTimers();
     vi.setSystemTime(0);
     const getUnprocessed = vi.spyOn(EventsDb.prototype, "getUnprocessed");
@@ -879,20 +940,25 @@ describe("promote-events route", () => {
     edb.close();
     setupProjectDb(contendedCwd).close();
 
-    let releaseFirst!: () => void;
-    let firstEntered!: () => void;
-    const firstEnteredPromise = new Promise<void>((resolve) => { firstEntered = resolve; });
-    const firstGate = new Promise<void>((resolve) => { releaseFirst = resolve; });
-    vi.mocked(deduplicateAndInsert).mockImplementationOnce(async () => {
-      firstEntered();
-      await firstGate;
-      return "first-id";
-    });
+    let releaseFirstClose!: () => void;
+    let firstCloseEntered!: () => void;
+    const firstCloseEnteredPromise = new Promise<void>((resolve) => { firstCloseEntered = resolve; });
+    const firstCloseGate = new Promise<void>((resolve) => { releaseFirstClose = resolve; });
+    const originalClose = SQLiteLocalHookOutboxFactory.prototype.close;
+    const closeSpy = vi.spyOn(SQLiteLocalHookOutboxFactory.prototype, "close")
+      .mockImplementationOnce(async function (
+        this: SQLiteLocalHookOutboxFactory,
+        token?: Parameters<SQLiteLocalHookOutboxFactory["close"]>[0],
+      ) {
+        firstCloseEntered();
+        await firstCloseGate;
+        return originalClose.call(this, token);
+      });
 
     const firstPromotion = registerPromotionOperation(
       promoteEventsForCwd(makeConfig(), contendedCwd, sidecarPath),
     );
-    await firstEnteredPromise;
+    await firstCloseEnteredPromise;
 
     const missingState = new EventsDb(sidecarPath);
     missingState.observeMissingCwd(0, 5 * 60 * 1000, 3);
@@ -910,7 +976,8 @@ describe("promote-events route", () => {
     await Promise.resolve();
     mkdirSync(contendedCwd, { recursive: true });
     setupProjectDb(contendedCwd).close();
-    releaseFirst();
+    releaseFirstClose();
+    closeSpy.mockRestore();
 
     await expect(firstPromotion).resolves.toMatchObject({ promoted: 1 });
     await expect(waitingPromotion).resolves.toMatchObject({ promoted: 1, errors: 0 });
@@ -990,7 +1057,8 @@ describe("promote-events route", () => {
     await createPromoteEventsHandler(makeConfig())(request, res, JSON.stringify({ cwd: dir }));
 
     expect(getBody()).toMatchObject({ promoted: event.promoted, skipped: 1 - event.promoted, errors: 0 });
-    expect(deduplicateAndInsert).toHaveBeenCalledTimes(event.promoted);
+    expect(deduplicateAndInsert).not.toHaveBeenCalled();
+    expect(deduplicateAndInsertInRepositories).toHaveBeenCalledTimes(event.promoted);
     const verify = new EventsDb(sidecarPath);
     expect(verify.getUnprocessed()).toEqual([]);
     verify.close();
@@ -1112,14 +1180,13 @@ describe("promote-events route", () => {
 
     const config = makeConfig();
     config.compaction.promotionThresholds.eventConfidence = undefined;
-    config.compaction.promotionThresholds.dedupBm25Threshold = undefined;
     config.compaction.promotionThresholds.dedupCandidateLimit = undefined;
     config.compaction.promotionThresholds.insightsMaxAgeDays = undefined;
     config.compaction.promotionThresholds.maxConfidence = undefined;
     config.compaction.promotionThresholds.reinforcementBoost = undefined;
     const result = await promoteEventsForCwd(config, dir);
     expect(result.promoted).toBeGreaterThanOrEqual(5);
-    expect(vi.mocked(deduplicateAndInsert).mock.calls.some(([input]) => input.thresholds.dedupBm25Threshold === 15)).toBe(true);
+    expect(vi.mocked(deduplicateAndInsert).mock.calls.some(([input]) => input.thresholds.dedupCandidateLimit === 100)).toBe(true);
   });
 
   it("reports a global project whose drain throws", async () => {
@@ -1316,7 +1383,7 @@ describe("promote-events route", () => {
     expect(existsSync(recomputedSidecarPath)).toBe(false);
   });
 
-  it("reports sidecars skipped by the global scan budget", async () => {
+  it("leaves empty orphan sidecars in place during global read-only discovery", async () => {
     const firstSidecarPath = join(dir, "a-project.db");
     const secondSidecarPath = join(dir, "b-project.db");
 
@@ -1325,32 +1392,16 @@ describe("promote-events route", () => {
     const secondDb = new EventsDb(secondSidecarPath);
     secondDb.close();
 
-    const now = vi.spyOn(Date, "now").mockReturnValue(0);
-    const originalClose = SQLiteLocalHookOutboxFactory.prototype.close;
-    const close = vi.spyOn(SQLiteLocalHookOutboxFactory.prototype, "close")
-      .mockImplementationOnce(async function (this: SQLiteLocalHookOutboxFactory) {
-        await originalClose.call(this);
-        // The first read after close is the mandatory pre-prune stop check for
-        // this completed sidecar. Exhaust the budget only for the next loop.
-        now.mockReturnValueOnce(0).mockReturnValue(30_001);
-      });
-
     const handler = createPromoteAllEventsHandler(makeConfig());
     const { res, getBody } = mockRes();
-    try {
-      await handler(request, res, "");
-    } finally {
-      close.mockRestore();
-      now.mockRestore();
-    }
+    await handler(request, res, "");
 
     const result = getBody();
     expect(result.scanned).toBe(2);
-    expect(result.failedProjects).toBe(1);
-    expect(result.projects).toHaveLength(1);
-    expect(result.projects[0].projectId).toBe("b-project");
-    expect(result.projects[0].incomplete).toBe(true);
-    expect(result.projects[0].message).toContain("sidecar scan skipped");
+    expect(result.failedProjects).toBe(0);
+    expect(result.projects).toHaveLength(0);
+    expect(existsSync(firstSidecarPath)).toBe(true);
+    expect(existsSync(secondSidecarPath)).toBe(true);
   });
 
   it("drains every batch from metadata-backed sidecars during global promotion", async () => {
@@ -1389,6 +1440,66 @@ describe("promote-events route", () => {
     remainingDb.close();
     expect(remaining).toHaveLength(0);
   }, PROMOTION_DRAIN_TIMEOUT_MS);
+
+  it("leaves a repairable old-schema sidecar unchanged when global promotion refuses its identity", async () => {
+    const projectCwd = mkdtempSync(join(tmpdir(), "promote-all-identity-refusal-"));
+    extraDirs.push(projectCwd);
+    const selected = join(dir, `${projectId(projectCwd)}.db`);
+    ensureProjectDir(projectCwd);
+    const edb = new EventsDb(selected);
+    edb.insertEvent("session", {
+      type: "decision", category: "decision", data: "retain selected event", priority: 1,
+    }, "PostToolUse");
+    edb.close();
+    setupProjectDb(projectCwd).close();
+    const legacy = new DatabaseSync(selected);
+    legacy.exec("DROP TABLE missing_cwd_state");
+    legacy.prepare("UPDATE schema_version SET version = 4").run();
+    legacy.close();
+    const bytesBefore = readFileSync(selected);
+    eventPathMocks.assertExistingSidecarProjectBinding.mockImplementation(() => {
+      throw new eventPathMocks.SidecarIdentityConflictError();
+    });
+
+    const handler = createPromoteAllEventsHandler(makeConfig());
+    const { res, getBody } = mockRes();
+    await handler(request, res, "");
+
+    const result = getBody();
+    expect(result.failedProjects).toBe(1);
+    expect(result.projects[0].message).toBe("sidecar identity does not match the current project");
+    expect(readFileSync(selected)).toEqual(bytesBefore);
+    const retained = new DatabaseSync(selected, { readOnly: true });
+    expect(retained.prepare("SELECT version FROM schema_version").get()).toEqual({ version: 4 });
+    expect(retained.prepare("SELECT name FROM sqlite_master WHERE name = 'missing_cwd_state'").get())
+      .toBeUndefined();
+    expect(retained.prepare("SELECT COUNT(*) AS pending FROM events WHERE processed_at IS NULL").get())
+      .toEqual({ pending: 1 });
+    retained.close();
+    expect(eventPathMocks.assertExistingSidecarProjectBinding).toHaveBeenCalled();
+  });
+
+  it("returns a specific direct-route refusal for a conflicting sidecar", async () => {
+    const edb = new EventsDb(sidecarPath);
+    edb.insertEvent("session", {
+      type: "decision", category: "decision", data: "retain direct event", priority: 1,
+    }, "PostToolUse");
+    edb.close();
+    eventPathMocks.assertExistingSidecarProjectBinding.mockImplementation(() => {
+      throw new eventPathMocks.SidecarIdentityConflictError();
+    });
+    const handler = createPromoteEventsHandler(makeConfig());
+    const { res, getBody } = mockRes();
+    await handler(request, res, JSON.stringify({ cwd: dir }));
+    expect(res.writeHead).toHaveBeenCalledWith(409, expect.anything());
+    expect(getBody()).toEqual({
+      status: "blocked",
+      error: "sidecar identity does not match the current project",
+    });
+    const retained = new EventsDb(sidecarPath);
+    expect(retained.getUnprocessed()).toHaveLength(1);
+    retained.close();
+  });
 
   it("settles route work after a forced wrapper timeout", async () => {
     const edb = new EventsDb(sidecarPath);

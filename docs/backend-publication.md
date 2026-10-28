@@ -294,12 +294,15 @@ that admits nothing does not halt and writes nothing to the lost backend: no
 sidecar has unprocessed events, and no project passes the replication gates
 before its first phase. A project whose startup PostgreSQL is unhealthy is
 reported as a storage failure instead. Once the halt is raised, the
-unauthenticated `/health` response carries a `passiveEvents` object with
-`halted`, `haltedReason`, and `haltedMessage`; it is absent on a healthy
-daemon. Health is the surface to check for this, because read admission
-refuses `/status` and every other route under the same mismatch. The next
-hook run observes the `/health` backend mismatch through `ensureDaemon` and
-replaces the daemon, which clears the halt.
+bearer-gated `/health/observe` response can carry a process-local
+`passiveEvents` object with `halted`, `haltedReason`, and `haltedMessage`; it is
+absent on a healthy daemon. Observation remains storage-free and marks storage
+`unverified`. It requires valid private-root, publication, and configuration
+witnesses even during a completed backend selection. A managed daemon's
+anonymous `/health` stays limited to public liveness and identity, while
+authenticated active `/health` and `/status` refuse the backend mismatch. The
+next hook run observes the `/health` backend mismatch through `ensureDaemon`
+and replaces the daemon, which clears the halt.
 
 Do not edit a held journal to release it. Preserve the journal and snapshot
 generation when capture, selection, or abort readback fails. A migration report,
@@ -802,6 +805,18 @@ into `~/.lcm/` and then creates the retained copy; the cross-device fallback
 keeps its authenticated staging copy. Source, staging, and target identities,
 hashes, ownership, and modes are rechecked at each non-terminal boundary.
 
+An interrupted legacy migration whose journal is in the `published`,
+`removing`, or `retaining` phase is finished by the next command that runs
+the root bootstrap. The `lcm migration` subcommands normally skip that
+bootstrap so a maintenance hold cannot make them unrunnable, but when the
+active root exists and such a journal is present they run it first and
+finish the migration if publication admission allows. If admission refuses
+(for example because a maintenance hold or an unresolved publication is in
+effect), the subcommand continues immediately without finishing the
+migration and without waiting; a later command that runs the bootstrap,
+including a later `lcm migration` subcommand once admission allows, finishes
+it. Any other bootstrap failure is reported as usual.
+
 During `lcm install`, publication-lock admission is bounded and authenticated
 against the managed daemon already serving the configured home. The preflight
 migration, root preparation, absent-config creation, backend selection, and
@@ -886,7 +901,10 @@ an explicit operator action:
 1. Stop the daemon and any CLI, hook, or MCP process using this home.
 2. Open `~/.lcm-legacy-migration.json` and require `"phase":"retained"`.
    Record its exact `stagingName`; do not substitute a glob or a similarly
-   named path.
+   named path. A `published`, `removing`, or `retaining` phase means the
+   migration was interrupted; run a command that bootstraps `~/.lcm/` (an
+   `lcm migration` subcommand also finishes it when publication admission
+   allows) and re-check the phase before cleaning up.
 3. Verify that the live `~/.lcm/` state is the state you intend to keep.
 4. Remove the legacy `~/.lossless-claude` directory and the exact
    `~/<stagingName>` retained-copy path. Either may already be absent or may

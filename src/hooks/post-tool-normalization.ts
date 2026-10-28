@@ -4,7 +4,6 @@ import {
   type ToolOutcome,
 } from "./extractors.js";
 
-const COMMAND_SOFT_CAP = 2000;
 // "Bash" is the name current Codex emits for unified exec; the dotted names are
 // legacy aliases kept for compatibility.
 const CODEX_SHELL_TOOL_NAMES = new Set(["Bash", "functions.exec", "functions.exec_command"]);
@@ -68,12 +67,6 @@ function normalizeLegacyToolOutput(value: unknown): { isError?: boolean } | unde
   return typeof value.isError === "boolean" ? { isError: value.isError } : {};
 }
 
-function boundCommand(command: string): string {
-  return command.length > COMMAND_SOFT_CAP
-    ? `${command.slice(0, COMMAND_SOFT_CAP)}...`
-    : command;
-}
-
 function isNativeFeedbackLoop(command: string): boolean {
   return /^lcm\s+store(?:\s|$)/u.test(command.trim());
 }
@@ -116,7 +109,7 @@ export function normalizePostToolInput(input: RawPostToolInput): PostToolInput {
 
   const normalized: PostToolInput = {
     tool_name: "Bash",
-    tool_input: { command: boundCommand(selectedCommand) },
+    tool_input: { command: selectedCommand },
   };
   normalized.tool_output = { outcome: shellOutcome(input.tool_output, input.tool_response) };
   return normalized;

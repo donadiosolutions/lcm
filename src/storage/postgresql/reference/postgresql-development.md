@@ -71,8 +71,11 @@ fingerprint preflight is the failed contract, then rerun readiness.
 
 ## Run the conformance harness
 
-Docker and the runner-provided OpenSSL must be available. From a clean checkout
-with the [verified pnpm toolchain](../../../../docs/development.md) bootstrapped
+A container engine and the runner-provided OpenSSL must be available: rootless
+Podman for local runs, Docker in GitHub Actions. Local runs default to native
+Podman (see [Rootless Podman](#rootless-podman)); set
+`LCM_TEST_CONTAINER_CLI=docker` to use Docker locally instead. From a clean
+checkout with the [verified pnpm toolchain](../../../../docs/development.md) bootstrapped
 and dependencies installed using `pnpm install --frozen-lockfile`, run:
 
 ```bash
@@ -209,7 +212,8 @@ restore container is still running.
 
 A failed ownership or database-sentinel guard intentionally leaves resources
 for inspection. Never delete them by a broad name glob. Inspect the exact
-labels first:
+labels first. The commands below use `docker`, as in GitHub Actions; local runs
+use `podman` unless `LCM_TEST_CONTAINER_CLI` selects Docker:
 
 ```bash
 docker ps -a --filter label=com.donadiosolutions.lcm.postgresql-test-run
@@ -224,25 +228,39 @@ preserve it for reconciliation; elapsed time is never proof of ownership.
 
 ### Rootless Podman
 
-Contributors who prefer rootless Podman can run the local harness with it:
+Outside GitHub Actions the harness uses native rootless Podman by default;
+nothing needs to be set:
 
 ```bash
-LCM_TEST_CONTAINER_CLI=podman pnpm run test:postgresql
+pnpm run test:postgresql
 ```
 
-`LCM_TEST_CONTAINER_CLI` accepts `docker` (the default), `podman`, or an
-absolute path to either executable (a `.exe` suffix, as on Windows, is
-ignored); any other value, including an empty one,
-stops the harness before it allocates anything. The variable selects the engine
-for the local harness only. Continuous integration, the `GITHUB_ACTIONS` mode
-of the harness, and the image and template commands of
-`scripts/ci-environment.mjs` continue to use Docker, and the harness rejects
-Podman when `GITHUB_ACTIONS=true`.
+`LCM_TEST_CONTAINER_CLI` overrides the engine. It accepts `docker`, `podman`,
+or an absolute path to either executable (a `.exe` suffix, as on Windows, is
+ignored); any other value, including an empty one, stops the harness before it
+allocates anything. When it is unset, the harness uses `podman` locally and
+`docker` when `GITHUB_ACTIONS=true`. Docker is therefore an explicit local
+opt-in:
+
+```bash
+LCM_TEST_CONTAINER_CLI=docker pnpm run test:postgresql
+```
+
+The Podman harness supports local mode only: it rejects Podman, including an
+explicit `LCM_TEST_CONTAINER_CLI=podman`, when `GITHUB_ACTIONS=true`. The image
+and template commands of `scripts/ci-environment.mjs` (staging and loading the
+pinned images, building and validating the template archive) produce and
+consume the CI cache artifacts for the Docker harness, so they always use
+Docker regardless of this variable.
 
 Under Podman the harness always initializes a fresh database and rejects
-`LCM_POSTGRES_TEMPLATE_ARCHIVE`. The first run may pull the pinned PostgreSQL
-image. With either engine the harness copies its two initialization scripts
-into its private per-run directory. Under Podman it mounts that directory and
+`LCM_POSTGRES_TEMPLATE_ARCHIVE`; set `LCM_TEST_CONTAINER_CLI=docker` to use a
+template archive locally. The first run may pull the pinned PostgreSQL
+image. The pinned images are fully qualified (`docker.io/library/...`) and
+digest-pinned, so Podman needs no registry short-name configuration or
+interactive prompt to resolve them. With either engine the harness copies its
+two initialization scripts into its private per-run directory. Under Podman it
+mounts that directory and
 the copies with `ro,Z` (Docker uses `ro,z`). On SELinux hosts the label
 relabels them, so only run-private files are
 relabeled and no checkout path is mounted or relabeled. The temporary directory

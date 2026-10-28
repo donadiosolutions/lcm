@@ -582,13 +582,27 @@ On PostgreSQL, the read routes `/search`, `/grep`, `/recent`, `/describe`, and
 `/expand` likewise return a sanitized `503` when project storage fails,
 including publication-lock contention (marked retryable), instead of an empty
 or null `200`.
-When such a read first meets the daemon's own publication work, for example a
-replication sweep phase, it waits up to one second for a turn in the daemon's
-publication queue and retries once. If the retry fails, the read returns the
+When such a read first meets publication work that holds the lock, whether the
+daemon's own (for example a replication sweep phase or background identity
+work) or another process's (such as a hook's short hold), it retries once
+inside a bounded admission. Each read request has one wait allowance of
+4 seconds, counted from its first read admission and shared by all of that
+request's admissions. It covers both the wait for a turn in the daemon's
+publication queue and, once the turn is granted, the wait for a live lock
+owner to release the lock. If the allowance runs out, the read returns the
 sanitized `503`; contention with publication work and an expired wait are
 marked retryable, while a genuine storage failure keeps `retryable: false`.
-The one-second limit only bounds waiting in the queue: a lock held by another process
-fails immediately once the turn is granted.
+The allowance bounds waiting only. It is not an end-to-end deadline, it does
+not limit how long a holder keeps the lock, and a request that is cancelled or
+reaches its own deadline stops waiting at once.
+
+`POST /store` (the `lcm_store` tool and the commands that call it) waits the
+same way for a live lock owner, another process or the daemon itself, for up to
+3 seconds counted from its first wait and shared by all of the request's
+admissions. If the lock is still held when that wait ends, or the owner cannot
+be confirmed as live, the route answers a retryable `503` with
+`status: "busy"` and `error: "backend publication work is in progress; retry the store"`
+instead of a `500`. Nothing was stored; retry the request.
 The daemon cancels request-scoped work on client disconnect and drains active
 consumers before closing the factory during shutdown. No PostgreSQL failure
 opens a project SQLite database as a recovery path.
@@ -1220,8 +1234,10 @@ The daemon listens on `127.0.0.1` only. lcm clients and hooks only build daemon
 requests to loopback HTTP origins and known daemon routes, so a malformed config
 or caller cannot redirect daemon traffic to another host. A managed daemon's
 unauthenticated `GET /health` response is a constant-cost, storage-free liveness
-probe containing only status, package version, selected backend, uptime, and
-PID. It does not inspect project databases or expose installation paths.
+probe containing only status, package version, `storageBackend` (the daemon's
+startup backend), uptime, and PID. That backend can differ from the current
+on-disk selection. It does not inspect project databases or expose installation
+paths.
 Supplying a valid daemon bearer token returns the full storage-backed health
 diagnostic; supplying an invalid credential returns `401`. Embedded and test
 callers that intentionally create a daemon without a token retain the full
@@ -1239,11 +1255,16 @@ SQLite also answers when it lacks the PostgreSQL URL, CA file, or migration role
 of the newly selected backend, since it never needed them; any of those values
 that is present is still validated. Its HTTP 200
 JSON has `status: "ok"`, `observation: "identity-only"`, and
-`storage: { "status": "unverified" }`, with version, selected backend, uptime,
-PID, entrypoint, daemon generation, and the actual runtime digest when available.
+`storage: { "status": "unverified" }`, with version, the daemon's startup backend
+in `storageBackend`, uptime, PID, entrypoint, daemon generation, and the actual
+runtime digest when available.
 An owner identifier is included when configured. No storage readiness or backend
 error result is included: observation never calls storage health or opens project
-storage. This endpoint is an internal diagnostic mechanism with no third-party
+storage. If background passive-event work halted, the response also includes
+process-local `passiveEvents` details, including its reason and message; a healthy
+daemon omits that field. A managed daemon's anonymous `/health` never includes
+those details.
+This endpoint is an internal diagnostic mechanism with no third-party
 compatibility promise.
 
 Doctor requires this explicit response and exact installed runtime identity;
@@ -1350,6 +1371,14 @@ independently before merging them: the current key wins when both names occur
 in the same source, while runtime overrides continue to take precedence over
 stored configuration. `lcm config get` and `lcm config set` accept the legacy
 path and report its canonical `dedupCandidateLimit` spelling.
+
+`compaction.promotionThresholds.dedupBm25Threshold` is deprecated and ignored,
+because promotion deduplication merges only exactly identical text. It is not
+renamed: `lcm config get` and `lcm config set` reject the path, and a
+`config.json` that still contains the key keeps loading with the value
+dropped. `lcm doctor` warns when the stored value is not `15`, the default
+written by older LCM versions. Removing the key is safe. Loading a
+configuration does not rewrite `config.json`, so delete the key by hand.
 
 When `lcm doctor` finds a malformed `mcpServers.lcm` value, it reports the
 finding and recommends explicit repair with `lcm install`. It never writes

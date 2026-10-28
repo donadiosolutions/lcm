@@ -104,6 +104,10 @@ jobs:
             exit 1
           fi
 
+          if [[ ! -f CHANGELOG.md ]]; then
+            echo "::error::CHANGELOG.md is missing from the tagged commit; the release commit must contain the release notes for $version"
+            exit 1
+          fi
           changelog_block="$(awk -v version="$version" '
             $0 == "## " version || $0 == "## [" version "]" ||
             index($0, "## " version " ") == 1 || index($0, "## [" version "] ") == 1 {
@@ -490,6 +494,10 @@ jobs:
             exit 1
           fi
 
+          if [[ ! -f CHANGELOG.md ]]; then
+            echo "::error::CHANGELOG.md is missing from the tagged commit; the release commit must contain the release notes for $version"
+            exit 1
+          fi
           changelog_block="$(awk -v version="$version" '
             $0 == "## " version || $0 == "## [" version "]" ||
             index($0, "## " version " ") == 1 || index($0, "## [" version "] ") == 1 {
@@ -839,6 +847,10 @@ jobs:
           version="$(node -p "JSON.parse(require('node:fs').readFileSync('package.json', 'utf8')).version")"
           if [[ "$version" != "${RELEASE_TAG#v}" ]]; then
             echo "::error::package.json version $version does not match release tag $RELEASE_TAG"
+            exit 1
+          fi
+          if [[ ! -f CHANGELOG.md ]]; then
+            echo "::error::CHANGELOG.md is missing from the tagged commit; the release commit must contain the release notes for $version"
             exit 1
           fi
           changelog_block="$(awk -v version="$version" '

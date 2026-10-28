@@ -368,7 +368,7 @@ describe("daemon server", () => {
   // #1384: drives the real assertDaemonRequestStorageAdmission seam rather than
   // the _assertBackendPublication override, because the defect was precisely
   // that the frozen-startup-backend comparison shipped with no coverage.
-  it("halts background passive-event work and reports it on health when the configured backend diverges from startup", async () => {
+  it("omits passive-event diagnostics from public health after a direct backend switch", async () => {
     const configPath = join(tempHome!, "divergent-config.json");
     writeFileSync(configPath, "{}", { mode: 0o600 });
     const caPath = join(tempHome!, "postgres-ca.pem");
@@ -409,19 +409,17 @@ describe("daemon server", () => {
       // An operator now switches the configured backend under a running daemon.
       writeFileSync(configPath, JSON.stringify({ storage: { backend: "postgresql" } }), { mode: 0o600 });
 
-      // The debounced drain reaches the genuine admission seam, which refuses.
-      await vi.waitFor(async () => {
-        const health = await fetch(`http://127.0.0.1:${port}/health`);
-        expect(health.status).toBe(200);
-        await expect(health.json()).resolves.toMatchObject({
-          storageBackend: "sqlite",
-          passiveEvents: {
-            halted: true,
-            haltedReason: "backend-mismatch",
-            haltedMessage: "daemon request backend differs from the authenticated startup backend",
-          },
-        });
-      }, { timeout: 5_000, interval: 25 });
+      const active = await fetch(`http://127.0.0.1:${port}/health`, {
+        headers: { authorization: `Bearer ${token}` },
+      });
+      expect(active.status).toBe(503);
+      expect(await active.json()).toEqual({ status: "blocked", error: "backend publication admission blocked" });
+
+      const health = await fetch(`http://127.0.0.1:${port}/health`);
+      expect(health.status).toBe(200);
+      const body = await health.json();
+      expect(body).toMatchObject({ storageBackend: "sqlite" });
+      expect(body).not.toHaveProperty("passiveEvents");
     } finally {
       rmSync(projectCwd, { recursive: true, force: true });
       process.argv[1] = previousEntrypoint;
@@ -1536,6 +1534,8 @@ describe("daemon auth", () => {
       publicationConfigPath: configPath,
       tokenPath,
       _testIdentity: testIdentity,
+      // The held lock belongs to this process, so /store waits for it; keep the wait short.
+      _routeAdmissionWaitMs: 100,
     });
     authDaemon.registerRoute("GET", "/custom-read", async (_req, res) => {
       res.end(JSON.stringify({ ok: true }));
@@ -1566,7 +1566,11 @@ describe("daemon auth", () => {
       expect(health.status).toBe(200);
       expect(pool.status).toBe(200);
       expect(custom.status).toBe(200);
-      expect(mutation.status).toBe(500);
+      expect(mutation.status).toBe(503);
+      expect(await mutation.json()).toEqual({
+        status: "busy",
+        error: "backend publication work is in progress; retry the store",
+      });
     } finally {
       release.resolve();
       await holder;

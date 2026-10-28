@@ -1,0 +1,8 @@
+references: ["#1764"]
+rationale: >-
+  #1764 adds a backlog signal to the replication worker result and a short
+  follow-up replication pass to the passive-event processor. Both files keep
+  their established owners and no component is added.
+pins:
+  - ["src/daemon/passive-event-processor.ts", "unit-daemon-events"]
+  - ["src/daemon/passive-event-replication.ts", "integration-postgresql-passive-events"]

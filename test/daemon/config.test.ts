@@ -345,6 +345,27 @@ describe("known configuration schema validation", () => {
     }).compaction.promotionThresholds.dedupCandidateLimit).toBe(31);
   });
 
+  it("loads stored and override configs that still carry the deprecated dedup threshold and drops it", () => {
+    const stored = JSON.stringify({ compaction: { promotionThresholds: { dedupBm25Threshold: 15, dedupCandidateLimit: 7 } } });
+    expect(parseStoredConfig(stored).compaction).toEqual({ promotionThresholds: { dedupCandidateLimit: 7 } });
+    const fromStored = parseDaemonConfig(stored);
+    expect(fromStored.compaction.promotionThresholds).not.toHaveProperty("dedupBm25Threshold");
+    expect(fromStored.compaction.promotionThresholds.dedupCandidateLimit).toBe(7);
+
+    const overrides = { compaction: { promotionThresholds: { dedupBm25Threshold: 0.5 } } };
+    const fromOverrides = parseDaemonConfig("{}", overrides);
+    expect(fromOverrides.compaction.promotionThresholds).not.toHaveProperty("dedupBm25Threshold");
+    expect(overrides).toEqual({ compaction: { promotionThresholds: { dedupBm25Threshold: 0.5 } } });
+    expect(parseDaemonConfig("{}").compaction.promotionThresholds).not.toHaveProperty("dedupBm25Threshold");
+  });
+
+  it("still rejects a deprecated dedup threshold of the wrong type", () => {
+    const invalid = JSON.stringify({ compaction: { promotionThresholds: { dedupBm25Threshold: "15" } } });
+    expect(() => parseStoredConfig(invalid)).toThrow("compaction.promotionThresholds.dedupBm25Threshold");
+    expect(() => parseDaemonConfig("{}", { compaction: { promotionThresholds: { dedupBm25Threshold: "15" } } }))
+      .toThrow("compaction.promotionThresholds.dedupBm25Threshold");
+  });
+
   it("prefers the current promotion-limit key within each source without mutating inputs", () => {
     const stored = parseStoredConfig(JSON.stringify({
       compaction: {

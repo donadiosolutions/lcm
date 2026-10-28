@@ -1,0 +1,9 @@
+references: ["#1677"]
+rationale: >-
+  #1677 lets the lcm migration subcommands finish an interrupted legacy-home
+  migration instead of leaving it to a later command. The dispatch decision
+  stays in bin/lcm.ts and the read-only journal probe is added to
+  src/runtime-paths.ts; no file is added, moved or re-owned.
+pins:
+  - ["bin/lcm.ts", "unit-cli"]
+  - ["src/runtime-paths.ts", "unit-configuration-security"]

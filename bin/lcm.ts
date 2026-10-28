@@ -73,6 +73,7 @@ import {
   daemonTokenPath,
   lcmHomeDir,
   legacyLcmHomeDir,
+  legacyHomeMigrationAwaitsFinish,
   migrateLegacyHomeIfNeeded,
   projectsDir as lcmProjectsDir,
 } from "../src/runtime-paths.js";
@@ -1280,15 +1281,33 @@ function isNestedUnderRoot(actionCommand: Command, parentName: string, actionNam
     && (actionName === undefined || actionCommand.name() === actionName);
 }
 
-function shouldRunRootBootstrapMigration(actionCommand: Command): boolean {
-  if (isNestedUnderRoot(actionCommand, "daemon", "restart")) return false;
+type RootBootstrapDispatch = Readonly<{
+  run: boolean;
+  /** The bootstrap may be refused by publication admission without failing the command. */
+  toleratePublicationAdmission: boolean;
+}>;
+
+const SKIP_ROOT_BOOTSTRAP: RootBootstrapDispatch = { run: false, toleratePublicationAdmission: false };
+const RUN_ROOT_BOOTSTRAP: RootBootstrapDispatch = { run: true, toleratePublicationAdmission: false };
+
+function rootBootstrapDispatch(actionCommand: Command): RootBootstrapDispatch {
+  if (isNestedUnderRoot(actionCommand, "daemon", "restart")) return SKIP_ROOT_BOOTSTRAP;
   // Each migration subcommand owns a state of the cutover, including the ones that leave a
   // maintenance hold, and the bootstrap's publication admission refuses while the hold exists.
   // The bootstrap can only still do work when a legacy home waits to be moved into an absent
-  // active root; a completed migration keeps the legacy directory as evidence and does not count.
+  // active root, or when an interrupted migration journal in the published, removing or
+  // retaining phase still owes its finish step; a completed migration keeps the legacy
+  // directory as evidence and does not count.
   if (isNestedUnderRoot(actionCommand, "migration")) {
     const stat = (path: string) => { try { return lstatSync(path); } catch { return undefined; } };
-    return stat(legacyLcmHomeDir())?.isDirectory() === true && stat(lcmHomeDir()) === undefined;
+    const rootPresent = stat(lcmHomeDir()) !== undefined;
+    if (stat(legacyLcmHomeDir())?.isDirectory() === true && !rootPresent) return RUN_ROOT_BOOTSTRAP;
+    // The root fact is captured here, once, and travels with the decision: a refusal by
+    // publication admission is tolerable only because the root existed before the call.
+    // The probe is a lock-free hint; the locked bootstrap re-reads the journal.
+    return rootPresent && legacyHomeMigrationAwaitsFinish()
+      ? { run: true, toleratePublicationAdmission: true }
+      : SKIP_ROOT_BOOTSTRAP;
   }
   const action = actionCommand.name();
   const topLevel = actionCommand.parent?.name() === "lcm";
@@ -1297,7 +1316,7 @@ function shouldRunRootBootstrapMigration(actionCommand: Command): boolean {
     || action === "grep"
     || action === "describe"
     || action === "expand"
-  )) return false;
+  )) return SKIP_ROOT_BOOTSTRAP;
   // Installed hook entrypoints own their bounded bootstrap and publication
   // admission policy. SessionStart bootstrap and installation own legacy-root
   // migration, so the global preflight must not turn publication-lock
@@ -1316,13 +1335,13 @@ function shouldRunRootBootstrapMigration(actionCommand: Command): boolean {
       actionCommand.opts<{ hook?: boolean }>().hook === true
       || !resolveLcmConfig(process.env).enabled
     ))
-  )) return false;
-  if (topLevel && action === "status") return false;
-  if (topLevel && (action === "stats" || action === "doctor")) return false;
-  if (topLevel && (action === "diagnose" || action === "help")) return false;
-  if ((action === "list" || action === "doctor") && actionCommand.parent?.name() === "connectors") return false;
-  if (topLevel && ["daemon", "config", "machine", "project", "postgres", "migration", "events", "connectors"].includes(action)) return false;
-  return true;
+  )) return SKIP_ROOT_BOOTSTRAP;
+  if (topLevel && action === "status") return SKIP_ROOT_BOOTSTRAP;
+  if (topLevel && (action === "stats" || action === "doctor")) return SKIP_ROOT_BOOTSTRAP;
+  if (topLevel && (action === "diagnose" || action === "help")) return SKIP_ROOT_BOOTSTRAP;
+  if ((action === "list" || action === "doctor") && actionCommand.parent?.name() === "connectors") return SKIP_ROOT_BOOTSTRAP;
+  if (topLevel && ["daemon", "config", "machine", "project", "postgres", "migration", "events", "connectors"].includes(action)) return SKIP_ROOT_BOOTSTRAP;
+  return RUN_ROOT_BOOTSTRAP;
 }
 
 type DaemonRestartConfigObservation = Readonly<{
@@ -3777,9 +3796,9 @@ export async function runCli(
           ? await client.post<any>("/promote-events/all", {})
           : await client.post<any>("/promote-events", { cwd: process.cwd(), drain: true });
       } catch (error) {
-        // A busy daemon answers 503 with a retry message; show it instead of the generic failure.
+        // A busy daemon answers 503; show a fixed retry hint instead of its message.
         if ((error as { statusCode?: number } | null)?.statusCode !== 503) throw error;
-        return passiveOperatorError(error, jsonFlag);
+        return passiveOperatorError(error, jsonFlag, true);
       }
       const failed = all
         ? ((result.errors ?? 0) > 0 || (result.failedProjects ?? 0) > 0)
@@ -3806,10 +3825,11 @@ export async function runCli(
       if (failed) exit(1);
     });
 
-  const passiveOperatorError = (error: unknown, json: boolean): never => {
+  const passiveOperatorError = (error: unknown, json: boolean, busyPromotion = false): never => {
     const message = error instanceof Error ? error.message : String(error);
     if (json) printJson({ error: message });
-    else console.error(`Error: ${message}`);
+    else if (busyPromotion) console.error("Error: backend publication work is in progress; retry the promotion.");
+    else console.error("Error: passive-event command failed; rerun with --json for details.");
     return exit(1);
   };
 
@@ -4726,7 +4746,8 @@ export async function runCli(
     });
 
   program.hook("preAction", async (_thisCommand, actionCommand) => {
-    if (!shouldRunRootBootstrapMigration(actionCommand)) return;
+    const dispatch = rootBootstrapDispatch(actionCommand);
+    if (!dispatch.run) return;
     const action = actionCommand.name();
     const usePublicationConvergence = shouldUsePublicationConvergence(actionCommand);
     if (usePublicationConvergence) {
@@ -4741,11 +4762,22 @@ export async function runCli(
       }), publicationConvergence);
       return;
     }
-    await migrateLegacyHomeWithRetry({
-      migrate,
-      sleep: preflightSeams?.sleep ?? DEFAULT_ROOT_BOOTSTRAP_RETRY_SEAMS.sleep,
-      attempt: preflightSeams?.attempt,
-    });
+    try {
+      await migrateLegacyHomeWithRetry({
+        migrate,
+        sleep: preflightSeams?.sleep ?? DEFAULT_ROOT_BOOTSTRAP_RETRY_SEAMS.sleep,
+        attempt: preflightSeams?.attempt,
+      });
+    } catch (error) {
+      // With the active root already present, a BackendPublicationJournalError can only be the
+      // publication admission assertion that runs before the bootstrap callback (including
+      // its rewrap after descriptor cleanup). The subcommand owns its own state, so continue
+      // without waiting; a later bootstrap-running command finishes the migration. Every other
+      // failure is deliberate and propagates: an error from the finish step itself, exhausted
+      // BootstrapLockContentionError and PrivateMutationLockContentionError.
+      if (dispatch.toleratePublicationAdmission && error instanceof BackendPublicationJournalError) return;
+      throw error;
+    }
   });
 
   // ─── Unknown command fallback ──────────────────────────────────────────────

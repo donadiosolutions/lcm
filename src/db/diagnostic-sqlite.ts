@@ -4,6 +4,7 @@ import { packageAsset, packageRootFor } from "../runtime-root.js";
 import type { DiagnosticSqliteRequest, DiagnosticSqliteResponse } from "./diagnostic-sqlite-worker.js";
 
 export const DIAGNOSTIC_SQLITE_DEADLINE_MS = 2000;
+const MAX_DIAGNOSTIC_SQLITE_SESSION_LIFETIME_MS = 30_000;
 
 export interface ReadDiagnosticSqliteOptions extends DiagnosticSqliteRequest {
   signal?: AbortSignal;
@@ -97,7 +98,7 @@ interface DiagnosticSqliteSession {
 // snapshot and concurrent snapshots never share a signal or child.
 const sessions = new WeakMap<AbortSignal, DiagnosticSqliteSession>();
 
-function createSession(signal: AbortSignal): DiagnosticSqliteSession {
+function createSession(signal: AbortSignal, lifetimeMs: number): DiagnosticSqliteSession {
   let child: ChildProcess | undefined;
   let closed: Error | undefined;
   let active: SessionRequest | undefined;
@@ -156,7 +157,7 @@ function createSession(signal: AbortSignal): DiagnosticSqliteSession {
     ].includes(response.code) ? response.code : "DIAGNOSTIC_SQLITE_WORKER"));
     dispatch();
   };
-  const lifetime = setTimeout(() => close(failure("DIAGNOSTIC_SQLITE_TIMEOUT")), DIAGNOSTIC_SQLITE_DEADLINE_MS);
+  const lifetime = setTimeout(() => close(failure("DIAGNOSTIC_SQLITE_TIMEOUT")), lifetimeMs);
   signal.addEventListener("abort", abort, {once: true});
   if (signal.aborted) abort();
   return {
@@ -175,9 +176,17 @@ function createSession(signal: AbortSignal): DiagnosticSqliteSession {
 }
 
 /** Share one killable child only for this whole diagnostic observation. */
-export async function withDiagnosticSqliteSession<T>(signal: AbortSignal, operation: () => Promise<T>): Promise<T> {
+export async function withDiagnosticSqliteSession<T>(
+  signal: AbortSignal,
+  operation: () => Promise<T>,
+  options: { lifetimeMs?: number } = {},
+): Promise<T> {
+  const requestedLifetime = options.lifetimeMs ?? DIAGNOSTIC_SQLITE_DEADLINE_MS;
+  if (!Number.isFinite(requestedLifetime) || requestedLifetime <= 0) {
+    throw failure("DIAGNOSTIC_SQLITE_TIMEOUT");
+  }
   if (sessions.has(signal)) return operation();
-  const session = createSession(signal);
+  const session = createSession(signal, Math.min(Math.ceil(requestedLifetime), MAX_DIAGNOSTIC_SQLITE_SESSION_LIFETIME_MS));
   sessions.set(signal, session);
   try { return await operation(); }
   finally { sessions.delete(signal); session.close(); }

@@ -24,6 +24,7 @@ import {
   configPath,
   daemonPidPath,
   daemonTokenPath,
+  legacyHomeMigrationAwaitsFinish,
   legacyLcmHomeDir,
   lcmHomeDir,
   lcmPath,
@@ -919,5 +920,55 @@ describe("runtime paths", () => {
     expect(() => migrateLegacyHomeIfNeeded(home)).toThrow("symlink entries");
     expect(existsSync(legacy)).toBe(true);
     expect(existsSync(lcmHomeDir(home))).toBe(false);
+  });
+
+  describe("legacyHomeMigrationAwaitsFinish", () => {
+    const witness = { identity: { dev: "1", ino: "2" }, mode: 700, uid: 0, gid: 0, hash: "a".repeat(64) };
+
+    it("is false when no journal exists", () => {
+      expect(legacyHomeMigrationAwaitsFinish(makeHome())).toBe(false);
+    });
+
+    it.each(["published", "removing"])("is true for an authenticated %s journal", (phase) => {
+      const home = makeHome();
+      migrationJournal(home, { version: 2, phase, target: witness, retained: null });
+
+      expect(legacyHomeMigrationAwaitsFinish(home)).toBe(true);
+    });
+
+    it("is true for an authenticated retaining journal", () => {
+      const home = makeHome();
+      migrationJournal(home, { version: 2, phase: "retaining", target: witness, retained: witness });
+
+      expect(legacyHomeMigrationAwaitsFinish(home)).toBe(true);
+    });
+
+    it.each([
+      ["planned", null, null],
+      ["copying", witness, null],
+      ["retained", witness, witness],
+    ])("is false for a %s journal", (phase, target, retained) => {
+      const home = makeHome();
+      migrationJournal(home, { version: 2, phase, target, retained });
+
+      expect(legacyHomeMigrationAwaitsFinish(home)).toBe(false);
+    });
+
+    it("is false for a malformed or checksum-invalid journal", () => {
+      const home = makeHome();
+      migrationJournal(home, { version: 2, phase: "published", target: witness, retained: null, checksumSha256: "0".repeat(64) });
+      expect(legacyHomeMigrationAwaitsFinish(home)).toBe(false);
+
+      writeFileSync(join(home, ".lcm-legacy-migration.json"), "{", { mode: 0o600 });
+      expect(legacyHomeMigrationAwaitsFinish(home)).toBe(false);
+    });
+
+    it("is false for a journal with the wrong file mode", () => {
+      const home = makeHome();
+      migrationJournal(home, { version: 2, phase: "published", target: witness, retained: null });
+      chmodSync(join(home, ".lcm-legacy-migration.json"), 0o644);
+
+      expect(legacyHomeMigrationAwaitsFinish(home)).toBe(false);
+    });
   });
 });

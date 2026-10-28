@@ -1,0 +1,15 @@
+references: ["#1755"]
+rationale: >-
+  #1755 removes the ignored dedupBm25Threshold from the configuration
+  defaults, dedup inputs, and callers, rejects its config path, and adds a
+  doctor warning. Every touched production file keeps its established owner
+  and no component is added.
+pins:
+  - ["src/daemon/config.ts", "unit-daemon-core"]
+  - ["src/promotion/dedup.ts", "unit-promotion"]
+  - ["src/daemon/routes/store.ts", "unit-daemon-routes"]
+  - ["src/daemon/routes/promote.ts", "unit-daemon-routes"]
+  - ["src/daemon/routes/promote-events.ts", "unit-daemon-routes"]
+  - ["src/portable-knowledge.ts", "unit-project-worktrees"]
+  - ["src/config-manager.ts", "unit-configuration-security"]
+  - ["src/doctor/doctor.ts", "unit-diagnostics"]

@@ -4,6 +4,7 @@ import { join, resolve, normalize, join as pathJoin, dirname, basename, parse } 
 import { lcmHomeDir } from "../runtime-paths.js";
 import {
   hashProjectPath,
+  isAuthenticatedProjectIdentity,
   isAuthenticatedRetiredProjectIdentitySuccessor,
   normalizeProjectIdentityPath,
   projectMapPath,
@@ -134,14 +135,23 @@ export type LocalProjectIdentity = Readonly<{
   canonical: string;
 }>;
 
+export type LocalHookPatternIdentity = Readonly<{
+  local: LocalProjectIdentity;
+  patternIds: readonly string[];
+}>;
+
 function parseLocalProjectMapCompatibility(
   cwd: string,
   homeDir?: string,
-): LocalProjectIdentity {
+): LocalHookPatternIdentity {
   const canonical = normalizeProjectIdentityPath(cwd);
-  const fallback: LocalProjectIdentity = {
+  const fallbackLocal: LocalProjectIdentity = {
     id: hashProjectPath(canonical),
     canonical,
+  };
+  const fallback: LocalHookPatternIdentity = {
+    local: fallbackLocal,
+    patternIds: [fallbackLocal.id],
   };
 
   // Hook durability cannot depend on project-map reconciliation or backend
@@ -193,9 +203,13 @@ function parseLocalProjectMapCompatibility(
       matched.canonical,
       homeDir,
     );
+    const sidecarId = acceptsSuccessor ? matched.id : retiredId;
     return {
-      id: acceptsSuccessor ? matched.id : retiredId,
-      canonical: matched.canonical,
+      local: { id: sidecarId, canonical: matched.canonical },
+      patternIds: matched.id !== sidecarId
+        && isAuthenticatedProjectIdentity(matched.id, matched.canonical, homeDir)
+        ? [sidecarId, matched.id]
+        : [sidecarId],
     };
   } catch {
     return fallback;
@@ -212,6 +226,11 @@ function parseLocalProjectMapCompatibility(
  * linked worktrees.
  */
 export function localProjectIdentity(cwd: string, homeDir?: string): LocalProjectIdentity {
+  return parseLocalProjectMapCompatibility(cwd, homeDir).local;
+}
+
+/** Resolve hook pattern directories from the same read-only map snapshot. */
+export function localHookPatternIdentity(cwd: string, homeDir?: string): LocalHookPatternIdentity {
   return parseLocalProjectMapCompatibility(cwd, homeDir);
 }
 

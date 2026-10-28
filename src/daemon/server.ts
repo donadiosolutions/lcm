@@ -28,7 +28,7 @@ import { createGrepHandler } from "./routes/grep.js";
 import { createSearchHandler } from "./routes/search.js";
 import { createExpandHandler } from "./routes/expand.js";
 import { createDescribeHandler } from "./routes/describe.js";
-import { createStoreHandler } from "./routes/store.js";
+import { createStoreHandler, STORE_BUSY_BODY } from "./routes/store.js";
 import { createRecentHandler } from "./routes/recent.js";
 import { createIngestHandler } from "./routes/ingest.js";
 import { createTerminalIngestQueue, TERMINAL_INGEST_DEADLINE_MS } from "./routes/ingest-terminal.js";
@@ -59,6 +59,7 @@ import { createPublicationQueue } from "./publication-queue.js";
 import {
   createLockContentionDeadlineBudget,
   createLockContentionWaitBudget,
+  isLiveLockContention,
   PrivateMutationLockContentionError,
   retryWhileLiveLockContended,
   type LockContentionWaitBudget,
@@ -184,11 +185,11 @@ export type DaemonOptions = {
   _withBackendPublicationConsumerLockAsync?: typeof withBackendPublicationConsumerLockAsync;
   /** @internal Test-only request lifecycle observer. */
   _onRequestLifecycle?: (event: RequestLifecycleEvent, signal: AbortSignal) => void;
-  /** @internal Queue-wait budget for a PostgreSQL read's admitted retry, in milliseconds. */
+  /** @internal Wait allowance of one PostgreSQL read request's admissions (queue turn plus live lock owner), in milliseconds. */
   _readAdmissionWaitMs?: number;
   /** @internal Length of a capture request's wait for a live lock owner, counted from its first wait, in milliseconds. */
   _routeAdmissionWaitMs?: number;
-  /** @internal Monotonic clock for that wait. */
+  /** @internal Monotonic clock for the capture and read waits. */
   _routeAdmissionNow?: () => number;
   /** @internal Test-only observer for the closed built-in route registry. */
   _onBuiltInRouteRegistered?: (
@@ -201,14 +202,20 @@ export type DaemonOptions = {
 const MAX_BODY_BYTES = 10 * 1024 * 1024; // 10 MB
 const MAX_REQUEST_CONFIG_BYTES = 4 * 1024 * 1024;
 const MAX_BUFFERED_RESPONSE_BYTES = MAX_BODY_BYTES;
-const READ_ADMISSION_WAIT_MS = 1000;
-/** Deadline, from the first wait, for a live lock owner across one capture request's admissions. */
+/**
+ * Wait allowance, from a PostgreSQL read request's first read admission, shared
+ * by all of its admissions and covering both the publication-queue turn and a
+ * live lock owner after the turn. It is not an end-to-end deadline.
+ */
+const READ_ADMISSION_WAIT_MS = 4000;
+/** Deadline, from the first wait, for a live lock owner across one capture or store request's admissions. */
 const ROUTE_ADMISSION_CONTENTION_WAIT_MS = 3000;
 const ADMISSION_RETRY_ROUTES: ReadonlySet<string> = new Set([
   "POST /ingest",
   "POST /restore",
   "POST /promote-events",
   "POST /promote-events/all",
+  "POST /store",
 ]);
 /** Routes that answer a retryable 503 `busy` instead of a 500 when the publication lock stays contended. */
 const PROMOTE_EVENTS_BUSY_ROUTES: ReadonlySet<string> = new Set(["POST /promote-events", "POST /promote-events/all"]);
@@ -633,13 +640,17 @@ export async function createDaemon(config: DaemonConfig, options?: DaemonOptions
   };
   const enqueuePublication = createPublicationQueue();
   /**
-   * With a wait budget, acquiring the consumer lock waits for a live foreign
-   * owner (a hook's short fence, for example) instead of failing the request.
-   * Only the acquisition is retried; an operation callback is never replayed.
+   * With a wait budget, acquiring the consumer lock waits for a live owner
+   * instead of failing the request. The default owner policy is a live foreign
+   * process (a hook's short fence, for example); isRetryable widens or narrows
+   * it. Only the outer acquisition at queue entry is retried: a nested admission
+   * is rejected by the queue without a contended lock, and an operation callback
+   * is never replayed.
    */
   const publicationAdmission = (
     signal: AbortSignal,
     contentionBudget?: LockContentionWaitBudget,
+    isRetryable?: (error: unknown) => boolean,
   ): RoutePublicationAdmission => async (operation, operationSignal) => {
     const cancellation = composeAbortSignals([signal, operationSignal]);
     try {
@@ -662,6 +673,7 @@ export async function createDaemon(config: DaemonConfig, options?: DaemonOptions
             budget: contentionBudget,
             signal: cancellation.signal,
             canRetry: () => !entered,
+            isRetryable,
           }).catch((error: unknown) => {
             // A wait ended by shutdown or by the request's own deadline is a
             // cancellation, as it was before the wait existed.
@@ -675,33 +687,63 @@ export async function createDaemon(config: DaemonConfig, options?: DaemonOptions
   };
   const withBackgroundPublicationAdmission: BackgroundPublicationAdmission = publicationAdmission(shutdownController.signal);
   /**
-   * One bounded turn on the publication queue for a PostgreSQL read's retry.
-   * The deadline only bounds queue waiting: it is disarmed on callback entry,
-   * and it never aborts the request signal, which would discard the 503.
+   * A PostgreSQL read's retry of its identity/open prefix: one turn on the
+   * publication queue, then one lock acquisition that waits for a live owner,
+   * the daemon's own unqueued lock users included. One absolute deadline per
+   * request, set at its first read admission and shared by all of its
+   * admissions, bounds both waits. It is disarmed at callback entry and never
+   * aborts the request signal (which would discard the 503) or an entered
+   * prefix. Only the acquisition is retried; the prefix is never replayed.
    */
-  const boundedReadAdmission = (requestSignal: AbortSignal): RoutePublicationAdmission => async operation => {
-    const deadline = new AbortController();
-    let deadlineFired = false;
-    const timer = setTimeout(() => {
-      deadlineFired = true;
-      deadline.abort();
-    }, options?._readAdmissionWaitMs ?? READ_ADMISSION_WAIT_MS);
-    const composed = composeAbortSignals([requestSignal, deadline.signal]);
-    try {
-      return await enqueuePublication(() => {
+  const boundedReadAdmission = (requestSignal: AbortSignal): RoutePublicationAdmission => {
+    const budget = createLockContentionDeadlineBudget(
+      options?._readAdmissionWaitMs ?? READ_ADMISSION_WAIT_MS,
+      options?._routeAdmissionNow,
+    );
+    return async (operation, operationSignal) => {
+      budget.begin?.();
+      const cancellation = composeAbortSignals([requestSignal, operationSignal]);
+      const deadline = new AbortController();
+      let deadlineFired = false;
+      const timer = setTimeout(() => {
+        deadlineFired = true;
+        deadline.abort();
+      }, budget.remainingMs());
+      const queueCancellation = composeAbortSignals([cancellation.signal, deadline.signal]);
+      try {
+        return await enqueuePublication(() => {
+          clearTimeout(timer);
+          throwIfAborted(cancellation.signal);
+          let entered = false;
+          return retryWhileLiveLockContended(
+            () => withConsumerPublicationLockAsync(publicationHome, publicationLockToken => {
+              entered = true;
+              throwIfAborted(cancellation.signal);
+              return operation(publicationLockToken);
+            }),
+            {
+              budget,
+              signal: cancellation.signal,
+              canRetry: () => !entered,
+              isRetryable: isLiveLockContention,
+            },
+          ).catch((error: unknown) => {
+            // A wait ended by the request or the operation is a cancellation.
+            if (!entered) throwIfAborted(cancellation.signal);
+            throw error;
+          });
+        }, queueCancellation.signal);
+      } catch (error) {
+        if (deadlineFired && !cancellation.signal.aborted) {
+          throw new PrivateMutationLockContentionError("daemon publication work is in progress; retry the read");
+        }
+        throw error;
+      } finally {
         clearTimeout(timer);
-        throwIfAborted(requestSignal);
-        return withConsumerPublicationLockAsync(publicationHome, publicationLockToken => operation(publicationLockToken));
-      }, composed.signal);
-    } catch (error) {
-      if (deadlineFired && !requestSignal.aborted) {
-        throw new PrivateMutationLockContentionError("daemon publication work is in progress; retry the read");
+        queueCancellation.cleanup();
+        cancellation.cleanup();
       }
-      throw error;
-    } finally {
-      clearTimeout(timer);
-      composed.cleanup();
-    }
+    };
   };
   const withRequestPublicationAdmission = (
     retainedToken: BackendPublicationLockToken,
@@ -805,13 +847,7 @@ export async function createDaemon(config: DaemonConfig, options?: DaemonOptions
     }, idleTimeoutMs);
   }
 
-  /**
-   * #1384: report a halted background sweep on the health route. Read admission
-   * refuses every other route once the configured backend diverges from this
-   * daemon's frozen startup backend, so unauthenticated health is the only
-   * surface that still answers when the halt is most relevant. A healthy daemon
-   * keeps its existing response shape.
-   */
+  /** Report a halted background sweep through authenticated diagnostics. */
   const passiveEventHaltReport = (): {
     passiveEvents?: PassiveEventBackgroundDiagnostics;
   } => {
@@ -828,7 +864,6 @@ export async function createDaemon(config: DaemonConfig, options?: DaemonOptions
         uptime: Math.floor((Date.now() - startTime) / 1000),
         pid: process.pid,
         ...(daemonOwnerId ? { ownerId: daemonOwnerId } : {}),
-        ...passiveEventHaltReport(),
       });
       return;
     }
@@ -870,6 +905,7 @@ export async function createDaemon(config: DaemonConfig, options?: DaemonOptions
       ...(daemonOwnerId ? { ownerId: daemonOwnerId } : {}),
       daemonInstanceId: invocationCoordinator.daemonInstanceId,
       ...(runtimeDigest ? { runtimeDigest } : {}),
+      ...passiveEventHaltReport(),
     });
   }, "read");
   registerBuiltInRoute(
@@ -1157,15 +1193,16 @@ export async function createDaemon(config: DaemonConfig, options?: DaemonOptions
           assertDaemonNotShuttingDown();
           // Capture requests wait briefly for a live lock owner rather than
           // dropping the hook's hand-off; the hook's own client gives up at 5 s.
-          const withPublicationAdmission = publicationAdmission(
-            requestSignal,
-            ADMISSION_RETRY_ROUTES.has(key)
-              ? createLockContentionDeadlineBudget(
+          const withPublicationAdmission = ADMISSION_RETRY_ROUTES.has(key)
+            ? publicationAdmission(
+              requestSignal,
+              createLockContentionDeadlineBudget(
                 options?._routeAdmissionWaitMs ?? ROUTE_ADMISSION_CONTENTION_WAIT_MS,
                 options?._routeAdmissionNow,
-              )
-              : undefined,
-          );
+              ),
+              isLiveLockContention,
+            )
+            : publicationAdmission(requestSignal);
           await withPublicationAdmission(() => undefined);
           throwIfAborted(requestSignal);
           if (route.responseMode === "buffered") {
@@ -1262,9 +1299,15 @@ export async function createDaemon(config: DaemonConfig, options?: DaemonOptions
         });
         return;
       }
-      if (err instanceof PrivateMutationLockContentionError && PROMOTE_EVENTS_BUSY_ROUTES.has(key)) {
-        sendJsonIfWritable(res, 503, PROMOTE_EVENTS_BUSY_BODY);
-        return;
+      if (err instanceof PrivateMutationLockContentionError) {
+        if (PROMOTE_EVENTS_BUSY_ROUTES.has(key)) {
+          sendJsonIfWritable(res, 503, PROMOTE_EVENTS_BUSY_BODY);
+          return;
+        }
+        if (key === "POST /store") {
+          sendJsonIfWritable(res, 503, STORE_BUSY_BODY);
+          return;
+        }
       }
       const { status, message } = requestErrorResponse(err);
       sendJsonIfWritable(res, status, { error: message });

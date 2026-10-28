@@ -1179,6 +1179,13 @@ export type ReadGenerationScopedFilesDependencies = Readonly<{
   expectedUid?: number;
 }>;
 
+/** A record the caller is about to write: its final file name and the exact
+ * bytes it will write. Passed to the read side only by a writer's own
+ * pre-read so a lone scratch of its own interrupted write (final absent,
+ * byte-identical content) does not make the store unresolvable. Pending
+ * records are never part of the returned files. */
+export type GenerationScopedPendingWrite = Readonly<{ fileName: string; content: string }>;
+
 const GENERATION_SCOPED_ABSENT: GenerationScopedRead = { kind: "absent" };
 
 function generationScopedUnresolvable(reason: string): GenerationScopedRead {
@@ -1218,6 +1225,7 @@ function scanGenerationScopedDirectory(
   directory: string,
   expectedUid: number | undefined,
   readWithStat: typeof readBoundedRegularFileWithStat,
+  pending: readonly GenerationScopedPendingWrite[],
 ): GenerationScopedRead {
   const files: { name: string; content: string }[] = [];
   const twinPaths = new Set<string>();
@@ -1251,14 +1259,22 @@ function scanGenerationScopedDirectory(
   // final file, or a lone single-link file whose content is byte-identical
   // to the published file of the same name -- stale debris after a completed
   // write. Any other lone scratch may be the only copy of a binding whose
-  // final name was lost, or an interrupted write of unknown outcome.
+  // final name was lost, or an interrupted write of unknown outcome. The one
+  // exception is a caller that is itself about to write the exact bytes of
+  // a record (pending): when the final name is absent, a lone scratch whose
+  // authenticated content is byte-identical to that pending record is the
+  // caller's own interrupted write, which the write about to happen
+  // supersedes. With the final present only the published bytes count.
   for (const { entry, finalName } of scratchEntries) {
     const path = join(directory, entry);
     if (twinPaths.has(path)) continue;
     const published = files.find((file) => file.name === finalName);
+    const expected = published === undefined
+      ? pending.find((write) => write.fileName === finalName)?.content
+      : published.content;
     if (
-      published === undefined
-      || readLoneScratchContent(path, directory, store, expectedUid, readWithStat) !== published.content
+      expected === undefined
+      || readLoneScratchContent(path, directory, store, expectedUid, readWithStat) !== expected
     ) {
       return generationScopedUnresolvable("scratch entry " + entry + " is not an authenticated writer scratch file");
     }
@@ -1278,6 +1294,7 @@ export function readGenerationScopedFiles(
   store: GenerationScopedStore,
   input: Readonly<{ homeDir: string; generationId: string }>,
   dependencies: ReadGenerationScopedFilesDependencies = {},
+  pending: readonly GenerationScopedPendingWrite[] = [],
 ): GenerationScopedRead {
   const expectedUid = dependencies.expectedUid ?? currentUid();
   const readWithStat = dependencies.readWithStat ?? readBoundedRegularFileWithStat;
@@ -1294,7 +1311,7 @@ export function readGenerationScopedFiles(
         const generationHandle = openPrivateDirectoryIfExists(directory, { expectedUid });
         if (generationHandle === undefined) return GENERATION_SCOPED_ABSENT;
         try {
-          return scanGenerationScopedDirectory(store, directory, expectedUid, readWithStat);
+          return scanGenerationScopedDirectory(store, directory, expectedUid, readWithStat, pending);
         } finally {
           generationHandle.close();
         }

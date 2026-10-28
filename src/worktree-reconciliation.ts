@@ -636,7 +636,7 @@ function readJournalAdmission(
           || (
             (component as Partial<SourceComponentSnapshot>).patternsDigest !== undefined
             && !HASH_RE.test(
-              (component as Partial<SourceComponentSnapshot>).patternsDigest ?? "",
+              (component as Partial<SourceComponentSnapshot>).patternsDigest!,
             )
           )
         ))

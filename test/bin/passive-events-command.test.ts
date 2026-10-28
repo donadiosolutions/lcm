@@ -115,6 +115,7 @@ const { runCli } = await import("../../bin/lcm.js");
 
 const MACHINE_ID = "0195d250-0000-7000-8000-000000000002";
 const EVENT_ID = "12345678-1234-4abc-8def-123456789abc";
+const OPERATOR_ERROR_TEXT = "Error: passive-event command failed; rerun with --json for details.";
 
 function localEvent(overrides: Partial<LocalHookEventRow> = {}): LocalHookEventRow {
   return {
@@ -385,7 +386,7 @@ describe("lcm events staged PostgreSQL operator commands", () => {
 
     await expect(invoke("events", "status")).rejects.toThrow("exit:1");
 
-    expect(error).toHaveBeenCalledWith("Error: conflicting PostgreSQL project bindings");
+    expect(error).toHaveBeenCalledWith(OPERATOR_ERROR_TEXT);
     expect(state.reconcileWorktree).toHaveBeenCalledOnce();
     expect(state.resolveProject).not.toHaveBeenCalled();
     expect(state.requireMachine).not.toHaveBeenCalled();
@@ -395,15 +396,29 @@ describe("lcm events staged PostgreSQL operator commands", () => {
     expect(state.repositoryConstructor).not.toHaveBeenCalled();
   });
 
-  it("reports the exact genuinely-unbound diagnostic before opening resources", async () => {
+  it("hides path-bearing reconciliation errors in text while preserving JSON", async () => {
+    const message = "invalid Git config metadata at /tmp/project\nFORGED_LOG_MARKER\rheader\u001b[31mred\u001b[0m\u001b]0;spoof\u0007/config: ambiguous worktree configuration";
+    state.reconcileWorktree.mockImplementation(() => { throw new Error(message); });
+    const error = vi.spyOn(console, "error").mockImplementation(() => undefined);
+    const stdout = vi.spyOn(process.stdout, "write").mockImplementation(() => true);
+
+    await expect(invoke("events", "status")).rejects.toThrow("exit:1");
+    expect(error).toHaveBeenCalledExactlyOnceWith(OPERATOR_ERROR_TEXT);
+    expect(String(error.mock.calls[0]?.[0])).not.toContain("FORGED_LOG_MARKER");
+    expect(String(error.mock.calls[0]?.[0])).not.toMatch(/[\r\n\u001b]/);
+
+    await expect(invoke("events", "status", "--json")).rejects.toThrow("exit:1");
+    expect(error).toHaveBeenCalledTimes(1);
+    expect(JSON.parse(stdoutText(stdout))).toEqual({ error: message });
+  });
+
+  it("reports an unbound project before opening resources", async () => {
     state.remoteProjectId = undefined;
     const error = vi.spyOn(console, "error").mockImplementation(() => undefined);
 
     await expect(invoke("events", "status")).rejects.toThrow("exit:1");
 
-    expect(error).toHaveBeenCalledWith(
-      "Error: local project has no PostgreSQL binding; run `lcm project create` or `lcm project link <project-id>`",
-    );
+    expect(error).toHaveBeenCalledWith(OPERATOR_ERROR_TEXT);
     expect(state.reconcileWorktree).toHaveBeenCalledOnce();
     expect(state.resolveProject).toHaveBeenCalledOnce();
     expect(state.reconcileWorktree.mock.invocationCallOrder[0])
@@ -421,7 +436,7 @@ describe("lcm events staged PostgreSQL operator commands", () => {
 
     await expect(invoke("events", "status")).rejects.toThrow("exit:1");
 
-    expect(error).toHaveBeenCalledWith("Error: database unavailable");
+    expect(error).toHaveBeenCalledWith(OPERATOR_ERROR_TEXT);
     expect(state.outboxClose).toHaveBeenCalledOnce();
     expect(state.runtimeClose).toHaveBeenCalledOnce();
   });
@@ -432,9 +447,7 @@ describe("lcm events staged PostgreSQL operator commands", () => {
 
     await expect(invoke("events", "status")).rejects.toThrow("exit:1");
 
-    expect(error).toHaveBeenCalledWith(
-      "Error: PostgreSQL passive-event storage is unavailable",
-    );
+    expect(error).toHaveBeenCalledWith(OPERATOR_ERROR_TEXT);
     expect(state.outboxClose).toHaveBeenCalledOnce();
     expect(state.runtimeClose).toHaveBeenCalledOnce();
   });
@@ -445,7 +458,7 @@ describe("lcm events staged PostgreSQL operator commands", () => {
 
     await expect(invoke("events", "status")).rejects.toThrow("exit:1");
 
-    expect(error).toHaveBeenCalledWith("Error: database unavailable");
+    expect(error).toHaveBeenCalledWith(OPERATOR_ERROR_TEXT);
   });
 
   it("attempts runtime cleanup when local outbox cleanup fails", async () => {
@@ -454,7 +467,7 @@ describe("lcm events staged PostgreSQL operator commands", () => {
 
     await expect(invoke("events", "status")).rejects.toThrow("exit:1");
 
-    expect(error).toHaveBeenCalledWith("Error: outbox close failed");
+    expect(error).toHaveBeenCalledWith(OPERATOR_ERROR_TEXT);
     expect(state.outboxClose).toHaveBeenCalledOnce();
     expect(state.runtimeClose).toHaveBeenCalledOnce();
   });
@@ -561,7 +574,7 @@ describe("lcm events staged PostgreSQL operator commands", () => {
     const error = vi.spyOn(console, "error").mockImplementation(() => undefined);
     await expect(invoke("events", "validate", "--limit", limit))
       .rejects.toThrow("exit:1");
-    expect(error).toHaveBeenCalledWith(expect.stringContaining("--limit"));
+    expect(error).toHaveBeenCalledWith(OPERATOR_ERROR_TEXT);
     expect(state.runtimeHealth).not.toHaveBeenCalled();
   });
 
@@ -639,7 +652,7 @@ describe("lcm events staged PostgreSQL operator commands", () => {
     await expect(invoke("events", "quarantine", "--limit", limit))
       .rejects.toThrow("exit:1");
 
-    expect(error).toHaveBeenCalledWith(expect.stringContaining("--limit"));
+    expect(error).toHaveBeenCalledWith(OPERATOR_ERROR_TEXT);
     expect(state.runtimeHealth).not.toHaveBeenCalled();
   });
 
@@ -765,13 +778,13 @@ describe("lcm events staged PostgreSQL operator commands", () => {
     expect(process.exitCode).toBe(1);
   });
 
-  it("reports exact replay readback failures through the operator boundary", async () => {
+  it("handles replay readback failures through the operator boundary", async () => {
     state.readEvent.mockRejectedValue(new Error("replay readback failed"));
     const error = vi.spyOn(console, "error").mockImplementation(() => undefined);
 
     await expect(invoke("events", "replay", EVENT_ID)).rejects.toThrow("exit:1");
 
-    expect(error).toHaveBeenCalledWith("Error: replay readback failed");
+    expect(error).toHaveBeenCalledWith(OPERATOR_ERROR_TEXT);
   });
 
   it("prints the shared events help from every operator subcommand", async () => {

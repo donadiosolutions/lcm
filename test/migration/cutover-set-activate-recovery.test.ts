@@ -1,5 +1,6 @@
 import { afterEach, describe, expect, it, vi } from "vitest";
-import { readdirSync, rmSync } from "node:fs";
+import { existsSync, readdirSync, rmSync, writeFileSync } from "node:fs";
+import { join } from "node:path";
 import {
   backendPublicationJournalPath,
   readBackendMaintenanceJournal,
@@ -9,7 +10,9 @@ import {
 import { readCutoverSetActivationRecords, migrationCutoverSetActivationDirectory } from "../../src/migration/cutover-set-activation-store.js";
 import { readActivationGenerationLink } from "../../src/migration/activation-artifact-store.js";
 import { migrationActivationReportDirectory } from "../../src/migration/activation-report.js";
-import { readMigrationActivationEvidence } from "../../src/migration/activation-evidence-store.js";
+import { migrationActivationEvidenceDirectory, readMigrationActivationEvidence } from "../../src/migration/activation-evidence-store.js";
+import { createMigrationActivationWitness } from "../../src/migration/activation-witness.js";
+import { canonicalJson } from "../../src/storage/portable-record.js";
 import { assertMigrationReplayAdmission } from "../../src/migration/maintenance.js";
 import { performMigrationAbortCommand } from "../../src/migration/cli-abort.js";
 import { MigrationProjectMapWitnessError } from "../../src/migration/project-map-witness.js";
@@ -104,6 +107,45 @@ describe("activateCutoverSet: crash at every boundary resumes to all-old or all-
       if (evidence.state === "resolved") expect(evidence.attempts).toHaveLength(1);
     });
   }
+
+  describe("a member's interrupted witness write (attempt final + witness scratch, #1769)", () => {
+    /** The scratch an interrupted witness write leaves: the witness the chain mints from the member's stored epoch and attempt. */
+    function plantWitnessScratch(f: Fixture, generationId: string, tamper: boolean): string {
+      const stored = readMigrationActivationEvidence({ homeDir: f.homeDir, generationId });
+      if (stored.state !== "resolved") throw new Error("expected resolved evidence");
+      const witness = createMigrationActivationWitness({
+        kind: "activation", epoch: stored.epochs[0]!, attempt: stored.attempts[0]!,
+        postEpochDelta: null, postEpochCensus: null, rollbackMode: null,
+      });
+      const wire = canonicalJson({ version: 1, generationId, record: witness }) + "\n";
+      const path = join(migrationActivationEvidenceDirectory(f.homeDir, generationId), ".witness-" + witness.checksumSha256 + ".json.0123abcd.tmp");
+      writeFileSync(path, tamper ? wire.replace(/\n$/u, " \n") : wire, { mode: 0o600 });
+      expect(readMigrationActivationEvidence({ homeDir: f.homeDir, generationId })).toMatchObject({ state: "unresolvable" });
+      return path;
+    }
+
+    it("the resumed set re-enters at the attempt, finishes the witness and clears the scratch", async () => {
+      const f = await fixture();
+      const [a] = f.members as [Fixture["members"][number], Fixture["members"][number]];
+      let scratch = "";
+      await crashThenResume(f, "after-attempt:" + a.generationId, "pre-selection", () => { scratch = plantWitnessScratch(f, a.generationId, false); });
+      expect(existsSync(scratch)).toBe(false);
+      const evidence = readMigrationActivationEvidence({ homeDir: f.homeDir, generationId: a.generationId });
+      if (evidence.state !== "resolved") throw new Error("expected resolved evidence");
+      expect(evidence.attempts).toHaveLength(1);
+      expect(evidence.witnesses).toHaveLength(1);
+    });
+
+    it("a witness scratch that is not the minted witness is refused with evidence-unresolvable, writing no witness", async () => {
+      const f = await fixture();
+      const [a] = f.members as [Fixture["members"][number], Fixture["members"][number]];
+      await expect(f.run({ crashPoint: (p) => { if (p === "after-attempt:" + a.generationId) throw new Error("crash"); } })).rejects.toThrow("crash");
+      const scratch = plantWitnessScratch(f, a.generationId, true);
+      expect(await f.run()).toMatchObject({ status: "interrupted", cause: "evidence-unresolvable" });
+      expect(existsSync(scratch)).toBe(true);
+      expect(readdirSync(migrationActivationEvidenceDirectory(f.homeDir, a.generationId)).filter((name) => name.startsWith("witness-"))).toEqual([]);
+    });
+  });
 
   it("after the frozen selection, before selection-prepared: the frozen attempts are adopted, not re-minted", async () => {
     const f = await fixture();

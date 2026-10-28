@@ -220,7 +220,7 @@ describe("declared Node engine floor", () => {
 
   it("runs the PostgreSQL conformance runner on a supported runtime", () => {
     const floor = declaredFloor();
-    const tag = /^node:(\d+\.\d+\.\d+)-/u.exec(NODE_IMAGE);
+    const tag = /^docker\.io\/library\/node:(\d+\.\d+\.\d+)-/u.exec(NODE_IMAGE);
     expect(tag, `${NODE_IMAGE} must pin an exact Node tag`).not.toBeNull();
     expect(compareVersions(parseVersion(tag![1])!, floor) >= 0).toBe(true);
   });

@@ -616,7 +616,7 @@ describe("PostgreSQL lexical-search repository", () => {
       sourceProjectId: "source-a",
       depth: 2,
       confidence: 0.7,
-      thresholds: { dedupBm25Threshold: 0.2, dedupCandidateLimit: 10 },
+      thresholds: { dedupCandidateLimit: 10 },
     };
 
     // A nonidentical candidate never merges, even when its primary rank

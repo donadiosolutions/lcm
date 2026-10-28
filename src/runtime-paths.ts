@@ -1983,6 +1983,26 @@ function withPublicationAdmission<T>(homeDir: string, callback: (admission: Publ
 }
 
 /**
+ * Read-only, lock-free dispatch hint: true when an authenticated legacy
+ * migration journal records a published, removing or retaining phase, that is,
+ * a migration whose finish step a later bootstrap still owes.
+ *
+ * A missing, unreadable, wrong-mode or malformed journal deliberately answers
+ * false. This is a fail-open hint for callers deciding whether to attempt the
+ * bootstrap at all; it must not become a hard error. The locked bootstrap
+ * re-reads the journal and remains the only authority over the migration.
+ */
+export function legacyHomeMigrationAwaitsFinish(homeDir: string = homedir()): boolean {
+  try {
+    const journal = readMigrationJournal(homeDir);
+    return journal !== null
+      && (journal.phase === "published" || journal.phase === "removing" || journal.phase === "retaining");
+  } catch {
+    return false;
+  }
+}
+
+/**
  * Operator-assisted bootstrap for ~/.lcm. This is the sole TypeScript path
  * that may create the private root. It authenticates the home and parent,
  * creates only the final component, tightens it through the retained fd, and

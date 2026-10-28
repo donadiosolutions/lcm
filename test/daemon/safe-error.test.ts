@@ -3939,6 +3939,86 @@ describe("sanitizeError", () => {
     });
   });
 
+  describe("Bug #1763", () => {
+    const prefix = "file://h?x=[file:///Users/CHILD/x";
+    const expectedPrefix = "file://h?x=[file://<path>";
+    const successorRows = [
+      ["issue body home root", "later/home/alice/secret.db", "later<path>"],
+      ["separator run before Users", "later//Users/CANARY", "later<path>"],
+      ["empty segment before root", "a/b//root//CANARY", "a<path>"],
+      ["leading home root", "home/alice/secret", "home<path>"],
+      ["leading Users root", "Users/alice/secret", "Users<path>"],
+      ["leading root root", "root/private", "root<path>"],
+      ["deep root root", "a/b/c/root/secret", "a<path>"],
+      ["non-leading Users root", "not/Users/secret", "not<path>"],
+      ["mixed case home root", "later/HOME/alice", "later<path>"],
+      ["slash-first home backslash continuation", "later/home\\alice", "later<path>"],
+      ["slash-first root backslash continuation", "later/root\\secret", "later<path>"],
+      ["preserved Users with trailing separator", "later/Users/", "later<path>"],
+      ["preserved Users with trailing separator run", "later/Users//", "later<path>"],
+      ["preserved Users path", "later/Users/alice/secret.db", "later<path>"],
+      ["second successor", "later/home/a&second/Users/b", "later<path>&second<path>"],
+      ["successor with its own query", "later/home/alice/secret.db?key=/Users/Z", "later<path>?key=<path>"],
+      ["backslash-first relative", "later\\home\\alice", "later\\home\\alice"],
+      ["homes segment", "later/homes/x", "later/homes/x"],
+      ["Users2 segment", "later/Users2/x", "later/Users2/x"],
+      ["bare home", "later/home", "later/home"],
+      ["home with empty continuation", "later/home/", "later/home/"],
+      ["bare root", "later/root", "later/root"],
+      ["ordinary relative value", "later/var/data", "later/var/data"],
+      ["relative path", "relative/path", "relative/path"],
+      ["public URL", "https://p.test/x", "https://p.test/x"],
+    ] as const;
+    const cases: Array<readonly [string, string, string]> = successorRows.flatMap(
+      ([name, value, expected]) =>
+        (["&", "|"] as const).map((delimiter) => [
+          name + " after " + delimiter,
+          prefix + delimiter + value + "]",
+          expectedPrefix + delimiter + expected + "]",
+        ] as const),
+    );
+    cases.push(
+      [
+        "successor after a public URL parameter of the active child",
+        prefix + "&https://e.test/x&later/home/bob/secret.db]",
+        expectedPrefix + "&https://e.test/x&later<path>]",
+      ],
+      [
+        "query-only child keeps a relative successor visible",
+        "file://host?key=/public&later/Users/secret",
+        "file://host?key=<path>&later/Users/secret",
+      ],
+      [
+        "quoted public query home successor stays visible",
+        "file://h?x=['https://e.test/x?q=1'&later/home/bob/secret.db]",
+        "file://h?x=['https://e.test/x?q=1'&later/home/bob/secret.db]",
+      ],
+      [
+        "quoted public query separator-run successor stays visible",
+        "file://h?x=['https://e.test/x?q=1'&later//Users/bob/secret.db]",
+        "file://h?x=['https://e.test/x?q=1'&later//Users/bob/secret.db]",
+      ],
+      [
+        "retained parent home successor stays visible",
+        "file://h?x=[https://e.test/t&/Users/a/one&https://p.test/x&later/home/final/secret]",
+        "file://h?x=[https://e.test/t&<path>&https://p.test/x&later/home/final/secret]",
+      ],
+      [
+        "retained parent separator-run successor stays visible",
+        "file://h?x=[https://e.test/t&/Users/a/one&https://p.test/x&later//home/final/secret]",
+        "file://h?x=[https://e.test/t&<path>&https://p.test/x&later//home/final/secret]",
+      ],
+    );
+
+    it.each(cases)("%s", (_name, input, expected) => {
+      const first = sanitizeError(input);
+
+      expect(first).toBe(expected);
+      expect(sanitizeError(first)).toBe(first);
+      expect(sanitizeError(sanitizeError(first))).toBe(first);
+    });
+  });
+
   describe("Bug #1344", () => {
     it.each([
       [
@@ -4344,6 +4424,413 @@ describe("sanitizeError", () => {
       expect(sanitizeError(sanitizeError(first))).toBe(first);
     });
   });
+
+  describe("Bug #1765", () => {
+    type TailOrigin = readonly [
+      name: string,
+      prefix: string,
+      expectedPrefix: string,
+      closing: string,
+    ];
+    const postCloseTail: TailOrigin = [
+      "post-close tail",
+      "file://h?x=[file://host?key=/public]\\Users\\FIRST\\x",
+      "file://h?x=[file://host?key=<path>]<path>",
+      "",
+    ];
+    const inheritedQuoteTails: TailOrigin[] = (["|", "&"] as const).flatMap((delimiter) => [
+      [
+        "inherited-quote successor with spaces after " + delimiter,
+        "file://h?x=['https://outer.test/x?next=file:///Users/a/My Files/private.db'" +
+          delimiter +
+          "\\Users\\CANARY\\x",
+        "file://h?x=['https://outer.test/x?next=file://<path>'" + delimiter + "<path>",
+        "]",
+      ] as const,
+      [
+        "inherited-quote successor without spaces after " + delimiter,
+        "file://h?x=['https://outer.test/x?next=file:///Users/a/private.db'" +
+          delimiter +
+          "\\Users\\CANARY\\x",
+        "file://h?x=['https://outer.test/x?next=file://<path>'" + delimiter + "<path>",
+        "]",
+      ] as const,
+    ]);
+    const origins: TailOrigin[] = [postCloseTail, ...inheritedQuoteTails];
+    const inner = "[https://other?key=/Users/SECOND/secret]";
+
+    const tails: Array<readonly [string, string, string]> = [
+      ...["(", "{", "^", "`"].map(
+        (punctuation) =>
+          ["punctuation " + punctuation, punctuation + inner, "?key=<path>]"] as const,
+      ),
+      ...[":", ":x", ":x/y", "(", "{", "^", "`"].map(
+        (bridge) =>
+          ["bridge " + bridge, "[https://host]" + bridge + inner, "?key=<path>]"] as const,
+      ),
+      ["two bridged components", "[https://host]:x[https://mid]:y" + inner, "?key=<path>]"],
+      [
+        "adjacent components",
+        "[https://a?key=/Users/SECOND/s][https://b?key=/Users/THIRD/s]",
+        "?key=<path>][https://b?key=<path>]",
+      ],
+      ["nested brackets", "[[https://a?key=/Users/SECOND/s]]", "?key=<path>]]"],
+      ["bracket opened inside the tail", "[x[https://a?key=/home/SECOND/s]]", "?key=<path>]]"],
+      ["no punctuation", inner, "?key=<path>]"],
+      ["nested exact file URL inside the bracket", "[file:///Users/NEST/x?key=/Users/SECOND/s]", "?key=<path>]"],
+      ["nested exact file URL after a bridge", "[https://host]:x[file:///Users/NEST/x]", ""],
+      ["public URL with a plain query", "([https://other/public/path?key=plain]", "?key=plain]"],
+      ["delimiter at the end of input", "([https://other?", "?"],
+      ["root-only separator run", "([https://other?key=//]", "?key=//]"],
+      ["delimiter without a path word", "([https://other?key=/]", "?key=/]"],
+      // The scan stopped at the query of a component, so the tail does not own what follows it.
+      ["bridge after a query-bearing component", "[https://host?q=1]:x[https://other?key=/Users/SECOND/s]", "?q=1]:x[https://other?key=/Users/SECOND/s]"],
+      // An unmatched close ends the tail.
+      ["unmatched close", "[https://host]]:x[https://other?key=/after/close]", "]:x[https://other?key=/after/close]"],
+      ["unmatched close before a component", "[https://a?key=/Users/SECOND/s]][https://other?key=/after/close]", "?key=<path>]][https://other?key=/after/close]"],
+    ];
+    const roots = ["Users", "home", "root"] as const;
+    const runs: Array<readonly [string, (root: string) => string]> = [
+      ["slash", (root) => "/" + root + "/SECOND/secret"],
+      ["backslash", (root) => "\\" + root + "\\SECOND\\secret"],
+      ["double slash", (root) => "//" + root + "/SECOND/secret"],
+      ["double backslash", (root) => "\\\\" + root + "\\SECOND\\secret"],
+      ["slash then backslash", (root) => "/\\" + root + "/SECOND/secret"],
+      ["backslash then slash", (root) => "\\/" + root + "/SECOND/secret"],
+    ];
+    const queries: Array<readonly [string, string, string]> = [
+      ["equals", "?key=", "?key="],
+      ["ampersand", "?a=1&", "?a=1&"],
+      ["fragment", "#", "#"],
+      ["question mark", "?", "?"],
+      ["fragment equals", "?q=1#key=", "?q=1#key="],
+      ["ampersand equals", "?q=1&key=", "?q=1&key="],
+    ];
+    const values: Array<readonly [string, string, string]> = roots.flatMap((root) =>
+      runs.flatMap(([runName, value]) =>
+        queries.flatMap(([queryName, query, expectedQuery]) =>
+          ["", "(", "[https://host]:x"].map(
+            (lead) =>
+              [
+                root + " " + runName + " value after " + queryName + (lead === "" ? "" : " behind " + lead),
+                lead + "[https://other" + query + value(root) + "]",
+                expectedQuery + "<path>]",
+              ] as const,
+          ),
+        ),
+      ),
+    );
+
+    const driveValues: Array<readonly [string, string, string]> = ["C:/Users/SECOND/s", "c:/Users/SECOND/s", "D:/home/SECOND/s", "Z:/root/SECOND/s"].flatMap(
+      (value) =>
+        queries.flatMap(([queryName, query, expectedQuery]) =>
+          ["", "(", "[https://host]:x"].map(
+            (lead) =>
+              [
+                "forward-slash drive " + value + " after " + queryName + (lead === "" ? "" : " behind " + lead),
+                lead + "[https://other" + query + value + "]",
+                expectedQuery + "<path>]",
+              ] as const,
+          ),
+        ),
+    );
+
+    describe.each(origins)("%s", (_origin, prefix, expectedPrefix, closing) => {
+      it.each([...tails, ...values, ...driveValues])("%s", (_name, tail, expectedTail) => {
+        const first = sanitizeError(prefix + tail + closing);
+
+        expect(first).toBe(expectedPrefix + expectedTail + closing);
+        expect(sanitizeError(first)).toBe(first);
+        expect(sanitizeError(sanitizeError(first))).toBe(first);
+      });
+
+      it.each([
+        ["space", " "],
+        ["tab", "\t"],
+        ["newline", "\n"],
+      ])("keeps a bracketed URL after %s visible", (_name, whitespace) => {
+        const input = prefix + whitespace + "([https://other?key=/after/space]" + closing;
+        const first = sanitizeError(input);
+
+        expect(first).toBe(expectedPrefix + whitespace + "([https://other?key=/after/space]" + closing);
+        expect(sanitizeError(first)).toBe(first);
+        expect(sanitizeError(sanitizeError(first))).toBe(first);
+      });
+    });
+
+    describe.each(inheritedQuoteTails)("%s", (_origin, prefix, expectedPrefix, closing) => {
+      it.each(["&", "|"])("redacts a private-root relative value after %s inside the owned bracket", (delimiter) => {
+        for (const [value, expectedValue] of [
+          ["later/Users/SECOND/s", "later<path>"],
+          ["Users/SECOND/s", "Users<path>"],
+          ["later/home/SECOND/s", "later<path>"],
+          ["later/root/SECOND/s", "later<path>"],
+          ["a/b/Users/SECOND/s", "a<path>"],
+          ["later//Users//SECOND/s", "later<path>"],
+        ] as const) {
+          const first = sanitizeError(prefix + "([https://other?a=1" + delimiter + value + "]" + closing);
+
+          expect(first).toBe(expectedPrefix + "?a=1" + delimiter + expectedValue + "]" + closing);
+          expect(sanitizeError(first)).toBe(first);
+          expect(sanitizeError(sanitizeError(first))).toBe(first);
+        }
+      });
+
+      it.each(["&", "|"])("keeps ordinary, incomplete, and public values after %s readable", (delimiter) => {
+        for (const value of [
+          "later/data/SECOND/s",
+          "later/Users",
+          "later/Users/",
+          "https://p.test/x",
+          "plain",
+        ]) {
+          const first = sanitizeError(prefix + "([https://other?a=1" + delimiter + value + "]" + closing);
+
+          expect(first).toBe(expectedPrefix + "?a=1" + delimiter + value + "]" + closing);
+          expect(sanitizeError(first)).toBe(first);
+          expect(sanitizeError(sanitizeError(first))).toBe(first);
+        }
+      });
+    });
+
+    it.each(["&", "|"])("keeps a post-close private-root relative value after %s readable", (delimiter) => {
+      const input = postCloseTail[1] + "([https://other?a=1" + delimiter + "later/Users/SECOND/s]";
+      const first = sanitizeError(input);
+
+      expect(first).toBe(postCloseTail[2] + "?a=1" + delimiter + "later/Users/SECOND/s]");
+      expect(sanitizeError(first)).toBe(first);
+      expect(sanitizeError(sanitizeError(first))).toBe(first);
+    });
+
+    it.each(["C:/Users/S/s", "c:/home/S/s"])("keeps a standalone public URL drive value %s unchanged", (value) => {
+      const input = "[https://other?key=" + value + "]";
+
+      expect(sanitizeError(input)).toBe(input);
+      expect(sanitizeError(sanitizeError(input))).toBe(input);
+    });
+
+    it.each([
+      [
+        "slash successor",
+        "file://h?x=['https://outer.test/x?next=file:///Users/a/private.db'|/Users/CANARY/x[https://host]:x" + inner + "]",
+        "file://h?x=['https://outer.test/x?next=file://<path>'|<path>?key=<path>]]",
+      ],
+      [
+        "drive successor",
+        "file://h?x=['https://outer.test/x?next=file:///Users/a/private.db'&C:\\Users\\CANARY\\x(" + inner + "]",
+        "file://h?x=['https://outer.test/x?next=file://<path>'&<path>?key=<path>]]",
+      ],
+      [
+        "private-root successor",
+        "file://h?x=['https://outer.test/x?next=file:///Users/a/private.db'&later/Users/CANARY/x[https://host]:x" + inner + "]",
+        "file://h?x=['https://outer.test/x?next=file://<path>'&later<path>?key=<path>]]",
+      ],
+      [
+        "ordinary relative successor stays readable",
+        "file://h?x=['https://outer.test/x?next=file:///Users/a/private.db'&later/data[https://host]:x" + inner + "]",
+        "file://h?x=['https://outer.test/x?next=file://<path>'&later/data[https://host]:x" + inner + "]",
+      ],
+      [
+        "public URL successor stays readable",
+        "file://h?x=['https://outer.test/x?next=file:///Users/a/private.db'&https://p.test/x" + inner + "]",
+        "file://h?x=['https://outer.test/x?next=file://<path>'&https://p.test/x" + inner + "]",
+      ],
+    ] as const)("pins the inherited-quote %s", (_name, input, expected) => {
+      const first = sanitizeError(input);
+
+      expect(first).toBe(expected);
+      expect(sanitizeError(first)).toBe(first);
+      expect(sanitizeError(sanitizeError(first))).toBe(first);
+    });
+  });
+
+  describe("Bug #1766", () => {
+    // These pin the documented boundary of the inherited quote owner. The
+    // whitespace-separated outputs deliberately keep the successor readable:
+    // #1766 corrects docs/privacy.md instead of widening runtime ownership.
+    const base = "file://h?x=['https://outer.test/x?next=file:///Users/a/My Files/private.db'";
+    const redactedBase = "file://h?x=['https://outer.test/x?next=file://<path>'";
+    const successor = "\\Users\\SECRET\\x]";
+    const cases: ReadonlyArray<readonly [name: string, input: string, expected: string]> = [
+      ["immediate pipe hands off the owner", base + "|" + successor, redactedBase + "|<path>]"],
+      ["space before pipe prevents the handoff", base + " |" + successor, redactedBase + " |" + successor],
+      ["tab before pipe prevents the handoff", base + "\t|" + successor, redactedBase + "\t|" + successor],
+      ["newline before pipe prevents the handoff", base + "\n|" + successor, redactedBase + "\n|" + successor],
+      ["carriage return before pipe prevents the handoff", base + "\r|" + successor, redactedBase + "\r|" + successor],
+      [
+        "non-breaking space before pipe prevents the handoff",
+        base + "\u00a0|" + successor,
+        redactedBase + "\u00a0|" + successor,
+      ],
+      ["space after pipe resets ownership", base + "| " + successor, redactedBase + "| " + successor],
+      ["tab after pipe resets ownership", base + "|\t" + successor, redactedBase + "|\t" + successor],
+      ["space before ampersand prevents the handoff", base + " &" + successor, redactedBase + " &" + successor],
+      ["semicolon is not a handoff delimiter", base + ";" + successor, redactedBase + ";" + successor],
+      ["a non-delimiter is not a handoff", base + "x" + successor, redactedBase + "x" + successor],
+      [
+        "later rooted successor after an immediate handoff",
+        base + "|\\Users\\SECRET\\x&\\Users\\LATER\\y]",
+        redactedBase + "|<path>&<path>]",
+      ],
+      [
+        "later ordinary relative successor stays readable",
+        base + "|\\Users\\SECRET\\x&later/var/data]",
+        redactedBase + "|<path>&later/var/data]",
+      ],
+      [
+        "whitespace after a later delimiter resets ownership",
+        base + "|\\Users\\SECRET\\x& \\Users\\LATER\\y]",
+        redactedBase + "|<path>& \\Users\\LATER\\y]",
+      ],
+    ];
+
+    it.each(cases)("%s on every pass", (_name, input, expected) => {
+      const first = sanitizeError(input);
+      const second = sanitizeError(first);
+      const third = sanitizeError(second);
+      expect(first).toBe(expected);
+      expect(second).toBe(expected);
+      expect(third).toBe(expected);
+    });
+  });
+
+  describe("Bug #1789", () => {
+    const prefix = "file://h?x=['https://outer.test/x?next=file:///Users/a/My Files/private.db'";
+    const redactedPrefix = "file://h?x=['https://outer.test/x?next=file://<path>'";
+    const windowsRoot = "\\Users\\SECRET\\x]";
+    const cases: Array<readonly [name: string, input: string, expected: string]> = [
+      ...([
+        ["U+200B", "\u200b"],
+        ["U+200C", "\u200c"],
+        ["U+200D", "\u200d"],
+        ["U+2060", "\u2060"],
+      ] as const).map(([name, interposer]) => [
+        name + " before pipe restores the inherited owner",
+        prefix + interposer + "|" + windowsRoot,
+        redactedPrefix + interposer + "|<path>]",
+      ] as const),
+      [
+        "mixed invisible run before pipe restores the inherited owner",
+        prefix + "\u200b\u200c|" + windowsRoot,
+        redactedPrefix + "\u200b\u200c|<path>]",
+      ],
+      [
+        "U+200B before ampersand restores the inherited owner",
+        prefix + "\u200b&" + windowsRoot,
+        redactedPrefix + "\u200b&<path>]",
+      ],
+      [
+        "U+200B before a private-root relative pipe successor",
+        prefix + "\u200b|later/home/alice]",
+        redactedPrefix + "\u200b|later<path>]",
+      ],
+      ["quote-equals backslash Users value", prefix + "=\\Users\\SECRET\\x]", redactedPrefix + "=<path>]"],
+      ["quote-equals ordinary backslash value", prefix + "=\\var\\data]", redactedPrefix + "=<path>]"],
+      [
+        "quote-repeated-equals backslash value",
+        prefix + "==\\Users\\SECRET\\x]",
+        redactedPrefix + "==<path>]",
+      ],
+      [
+        "invisible run before quote-equals backslash value",
+        prefix + "\u200b=\\var\\data]",
+        redactedPrefix + "\u200b=<path>]",
+      ],
+      [
+        "invisible run successor owns its immediate bracket composition",
+        prefix + "\u200b|\\Users\\SECRET\\x[https://inner?key=/home/C/s]]",
+        redactedPrefix + "\u200b|<path>?key=<path>]]",
+      ],
+      ["immediate pipe keeps its established handoff", prefix + "|" + windowsRoot, redactedPrefix + "|<path>]"],
+      [
+        "immediate ampersand keeps its established handoff",
+        prefix + "&" + windowsRoot,
+        redactedPrefix + "&<path>]",
+      ],
+      ["POSIX value after equals keeps its established redaction", prefix + "=/Users/SECRET/x]", redactedPrefix + "=<path>]"],
+      [
+        "Windows drive value after equals keeps its established redaction",
+        prefix + "=C:\\Users\\SECRET\\x]",
+        redactedPrefix + "=<path>]",
+      ],
+      [
+        "UNC value after equals keeps its established redaction",
+        prefix + "=\\\\server\\share]",
+        redactedPrefix + "=<path>]",
+      ],
+      [
+        "forward-slash drive value after equals keeps its established redaction",
+        prefix + "=C:/Users/SECRET/x]",
+        redactedPrefix + "=C:<path>]",
+      ],
+      [
+        "private-root relative value after equals stays readable",
+        prefix + "=later/home/alice]",
+        redactedPrefix + "=later/home/alice]",
+      ],
+      [
+        "Users relative value after equals stays readable",
+        prefix + "=Users/alice/x]",
+        redactedPrefix + "=Users/alice/x]",
+      ],
+      ["plain value after equals stays readable", prefix + "=plain]", redactedPrefix + "=plain]"],
+      [
+        "public URL value after equals stays readable",
+        prefix + "=https://public.test/x]",
+        redactedPrefix + "=https://public.test/x]",
+      ],
+      [
+        "space and U+200B after equals keep a backslash value readable",
+        prefix + "= \u200b\\Users\\SECRET\\x]",
+        redactedPrefix + "= \u200b\\Users\\SECRET\\x]",
+      ],
+      [
+        "U+200B after equals keeps a backslash value readable",
+        prefix + "=\u200b\\Users\\SECRET\\x]",
+        redactedPrefix + "=\u200b\\Users\\SECRET\\x]",
+      ],
+      [
+        "U+200B after pipe keeps a backslash value readable",
+        prefix + "|\u200b\\Users\\SECRET\\x]",
+        redactedPrefix + "|\u200b\\Users\\SECRET\\x]",
+      ],
+      ...(["|", "&", "="] as const).map((delimiter) => [
+        "U+FEFF before " + delimiter + " remains a whitespace boundary",
+        prefix + "\ufeff" + delimiter + windowsRoot,
+        redactedPrefix + "\ufeff" + delimiter + windowsRoot,
+      ] as const),
+      ...([
+        ["space", " "],
+        ["tab", "\t"],
+        ["non-breaking space", "\u00a0"],
+      ] as const).map(([name, whitespace]) => [
+        name + " before pipe remains a whitespace boundary",
+        prefix + whitespace + "|" + windowsRoot,
+        redactedPrefix + whitespace + "|" + windowsRoot,
+      ] as const),
+      [
+        "semicolon instead of a handoff delimiter stays readable",
+        prefix + ";" + windowsRoot,
+        redactedPrefix + ";" + windowsRoot,
+      ],
+      [
+        "ordinary text instead of a handoff delimiter stays readable",
+        prefix + "x" + windowsRoot,
+        redactedPrefix + "x" + windowsRoot,
+      ],
+    ];
+
+    it.each(cases)("%s on every pass", (_name, input, expected) => {
+      const first = sanitizeError(input);
+      const second = sanitizeError(first);
+      const third = sanitizeError(second);
+
+      expect(first).toBe(expected);
+      expect(second).toBe(expected);
+      expect(third).toBe(expected);
+    });
+  });
+
 
   describe("Bug #917", () => {
     const matrix: Array<readonly [string, string, string]> = (["'", '"'] as const).flatMap(

@@ -339,8 +339,13 @@ replacement fails without overwriting those bytes.
 ## Crash recovery
 
 Ordinary reads authenticate the head and its selected revision. If the exact
-next numeric revision directory exists, the read returns `recovery-required`
-instead of ignoring or choosing the orphan.
+next numeric revision directory is empty, the read returns the current head:
+content publication had not started, so nothing newer exists to choose. If
+that directory holds an authenticated writer scratch file, the read returns
+`recovery-required` because the scratch binds the revision to one candidate;
+retry the same create or update to finish it. A manifest, or anything that
+cannot be authenticated, also returns `recovery-required` instead of being
+ignored or chosen as an orphan.
 
 An empty next revision directory or one containing only an authenticated
 writer scratch file means content publication had not completed. Recovery
@@ -433,6 +438,14 @@ that evidence in a fixed order:
    binding is derived from.
 3. The coordinator then publishes the backend publication durably.
 
+An activation interrupted while it was writing one of these records, the
+attempt or the witness, leaves a partial private file next to the others.
+Running the same activation again finishes the write: it publishes the
+record, removes the partial file, and continues. This applies only when the
+partial file holds exactly the bytes the activation is about to write. Any
+other leftover in the evidence directory is refused as unresolvable, and
+nothing is written until it has been inspected.
+
 A crash while the publication is in flight leaves an activation that has to
 be resumed or aborted before anything else; rollback refuses to start over
 it. A completed publication without a recorded selection binding means
@@ -463,8 +476,9 @@ Callers receive a `MigrationProtocolError` with one sanitized reason:
 - `malformed-manifest` — persisted structure, canonical encoding, or path
   identity is inconsistent.
 - `checksum-mismatch` — a manifest or head seal does not authenticate.
-- `recovery-required` — one exact unpublished successor exists and ordinary
-  reads must stop.
+- `recovery-required` — the next revision directory holds a manifest, a
+  writer scratch (retry the same create or update), or anything that cannot
+  be authenticated, and ordinary reads must stop.
 - `unexpected-state` — a legal operation cannot proceed from the authenticated
   state, including stale compare-and-swap input or ambiguous recovery evidence.
 

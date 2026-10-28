@@ -334,8 +334,11 @@ function hasManagedBlock(content: string): boolean {
   return findManagedBlocks(content).length > 0;
 }
 
-function establishedMarkdownEol(...contents: string[]): MarkdownEol {
-  return contents.some(content => content.includes('\r\n')) ? '\r\n' : '\n';
+function establishedMarkdownEol(contents: readonly string[]): MarkdownEol {
+  for (const content of contents) {
+    if (content.includes('\r\n')) return '\r\n';
+  }
+  return '\n';
 }
 
 function trimMarkdownLineBreaksAtStart(content: string): string {
@@ -384,7 +387,7 @@ function removeMarkers(content: string): string {
   }
   retainedRaw.push(content.slice(cursor));
 
-  const eol = establishedMarkdownEol(...retainedRaw);
+  const eol = establishedMarkdownEol(retainedRaw);
   const retained: string[] = [];
   for (let index = 0; index < retainedRaw.length; index += 1) {
     let segment = trimMarkdownLineBreaksAtEnd(retainedRaw[index]);
@@ -396,13 +399,13 @@ function removeMarkers(content: string): string {
   return `${normalizeMarkdownLineEndings(retained.join(eol), eol)}${eol}`;
 }
 
-function normalizeMarkdownEof(content: string, eol: MarkdownEol = establishedMarkdownEol(content)): string {
+function normalizeMarkdownEof(content: string, eol: MarkdownEol = establishedMarkdownEol([content])): string {
   return normalizeMarkdownLineEndings(trimMarkdownLineBreaksAtEnd(content), eol) + eol;
 }
 
 function appendMarkdown(existing: string, content: string, blankLineBeforeManagedBlock = false): string {
   const cleaned = removeMarkers(existing);
-  const eol = establishedMarkdownEol(cleaned, content);
+  const eol = establishedMarkdownEol([cleaned, content]);
   const normalizedExisting = normalizeMarkdownLineEndings(trimMarkdownLineBreaksAtEnd(cleaned), eol);
   const normalizedContent = normalizeMarkdownEof(content, eol);
   if (!normalizedExisting) return normalizedContent;
@@ -443,7 +446,7 @@ function hasManagedSkillMarker(content: string): boolean {
 }
 
 function managedSkillContent(content: string): string {
-  const eol = establishedMarkdownEol(content);
+  const eol = establishedMarkdownEol([content]);
   const normalized = normalizeMarkdownEof(content, eol);
   if (hasManagedSkillMarker(normalized)) return normalized;
   const frontmatterEnd = yamlFrontmatterEnd(normalized) ?? 0;
@@ -459,7 +462,7 @@ function isHistoricalSkill(content: Buffer): boolean {
 }
 
 function withoutManagedSkillMarker(content: string): string {
-  const eol = establishedMarkdownEol(content);
+  const eol = establishedMarkdownEol([content]);
   const markerLine = `${LCM_MANAGED_SKILL_MARKER}${eol}`;
   return content.replace(markerLine, "");
 }
@@ -1458,7 +1461,7 @@ function removeComponent(agent: Agent, surface: ConnectorSurface, cwd: string, s
       const content = base.content.toString("utf-8");
       if (!hasManagedBlock(content)) return { state: "unchanged" };
       const cleaned = removeMarkers(content);
-      const eol = establishedMarkdownEol(cleaned);
+      const eol = establishedMarkdownEol([cleaned]);
       const updated = cleaned === "" ? { state: "absent" as const } : { state: "regular" as const, content: Buffer.from(normalizeMarkdownEof(cleaned, eol), "utf-8"), mode: base.certificate.mode };
       return updated;
     });

@@ -123,8 +123,8 @@ describe("daemon configuration uncovered boundaries", () => {
   });
 
   it("executes the legacy migration arm through its pure internal seam", () => {
-    const input = { mergeMaxEntries: 17, confidenceDecayRate: 0.5 };
+    const input = { mergeMaxEntries: 17, confidenceDecayRate: 0.5, dedupBm25Threshold: 15 };
     expect(__configTestUtils.migrateLegacyPromotionThresholds(input)).toEqual({ dedupCandidateLimit: 17 });
-    expect(input).toEqual({ mergeMaxEntries: 17, confidenceDecayRate: 0.5 });
+    expect(input).toEqual({ mergeMaxEntries: 17, confidenceDecayRate: 0.5, dedupBm25Threshold: 15 });
   });
 });

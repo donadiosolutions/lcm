@@ -129,6 +129,44 @@ function fakeFactory(options: {
   };
 }
 
+describe("pre-open source admission", () => {
+  it("refuses a mutating project before open under its retained publication token", async () => {
+    await withTemporaryProject(async ({ home, cwd, config }) => {
+      const refusal = new Error("source identity changed");
+      const openProject = vi.fn(async () => fakeProject(async () => undefined));
+      const beforeOpen = vi.fn((identity: { localProjectId: string }, token?: BackendPublicationLockToken) => {
+        expect(identity.localProjectId).toBeTruthy();
+        expect(token).toBeDefined();
+        throw refusal;
+      });
+      const context = {
+        withPublicationAdmission: <T>(operation: (token: BackendPublicationLockToken) => Promise<T> | T) =>
+          withBackendPublicationConsumerLockAsync(home, operation),
+      };
+      await expect(withProjectStorage({ config, cwd, factory: fakeFactory({ openProject }),
+        context, mode: "create", beforeOpen }, async () => undefined)).rejects.toBe(refusal);
+      expect(beforeOpen).toHaveBeenCalledOnce();
+      expect(openProject).not.toHaveBeenCalled();
+    });
+  });
+
+  it("runs a read prefix guard before opening an existing project", async () => {
+    await withTemporaryProject(async ({ cwd, config }) => {
+      const refusal = new Error("source identity changed");
+      const openExistingProject = vi.fn(async () => fakeProject(async () => undefined));
+      const beforeOpen = vi.fn(() => { throw refusal; });
+      const context = {
+        withReadAdmission: <T>(operation: (token: BackendPublicationLockToken) => Promise<T> | T) =>
+          Promise.resolve(operation({})),
+      };
+      await expect(withProjectStorage({ config, cwd, factory: fakeFactory({ openExistingProject }),
+        context, mode: "existing", beforeOpen }, async () => undefined)).rejects.toBe(refusal);
+      expect(beforeOpen).toHaveBeenCalledOnce();
+      expect(openExistingProject).not.toHaveBeenCalled();
+    });
+  });
+});
+
 describe("route storage cleanup", () => {
   it("settles commit close barriers across acquisition and release edge cases", async () => {
     const barrier = createCommitCloseBarrier();

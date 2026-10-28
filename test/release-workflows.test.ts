@@ -701,7 +701,8 @@ function runMetadataValidation(step: WorkflowStep, {
   version = "1.2.3",
   metadata = JSON.stringify({ version }),
   ancestor = true,
-}: { version?: string; metadata?: string; ancestor?: boolean } = {}) {
+  changelog = true,
+}: { version?: string; metadata?: string; ancestor?: boolean; changelog?: boolean } = {}) {
   const root = mkdtempSync(join(tmpdir(), "lcm-release-metadata-"));
   try {
     const bin = join(root, "bin");
@@ -709,7 +710,7 @@ function runMetadataValidation(step: WorkflowStep, {
     const output = join(root, "output");
     mkdirSync(bin);
     writeFileSync(join(root, "package.json"), metadata);
-    writeFileSync(join(root, "CHANGELOG.md"), `## ${version}\n\n- Fixture release.\n`);
+    if (changelog) writeFileSync(join(root, "CHANGELOG.md"), `## ${version}\n\n- Fixture release.\n`);
     writeFileSync(join(bin, "git"), `#!/bin/bash
 printf 'git %s\\n' "$*" >> "$FIXTURE_CALLS"
 if [[ "$*" == "fetch --no-tags origin main" ]]; then exit 0; fi
@@ -782,6 +783,14 @@ describe.each(metadataValidationSteps)("$name metadata admission", (step) => {
     expect(result.status).not.toBe(0);
     expect(result.stderr).toContain("SyntaxError");
     expect(result.calls).toEqual(["git fetch --no-tags origin main", "git merge-base --is-ancestor HEAD origin/main", "node"]);
+    expect(result.output).toBe("");
+  });
+
+  it("rejects a tagged commit without CHANGELOG.md using an explicit annotation", () => {
+    const result = runMetadataValidation(step, { changelog: false });
+    expect(result.status).toBe(1);
+    expect(result.stdout).toContain("::error::CHANGELOG.md is missing from the tagged commit");
+    expect(result.stderr).not.toContain("awk");
     expect(result.output).toBe("");
   });
 

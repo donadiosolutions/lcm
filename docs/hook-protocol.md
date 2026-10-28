@@ -406,8 +406,8 @@ lcm connectors doctor codex
 ```
 
 The `--global` option selects the existing global connector scope; no new
-configuration option is required for native command capture, and the 2,000-
-character adapter bound is fixed rather than configurable.
+configuration option is required for native command capture. A shell command
+longer than 8,192 UTF-16 code units creates no passive event.
 
 Codex reports unified-exec shell commands (`exec_command`, and the
 `write_stdin` poll that finishes a long-running one) as `tool_name: "Bash"`
@@ -415,8 +415,10 @@ with `tool_input.command` set to the original command and `tool_use_id` set to
 the original call's id; MCP tools arrive as `mcp__<server>__<tool>`. lcm adapts
 `Bash` and, as legacy compatibility aliases, `functions.exec` and
 `functions.exec_command` (command from `command`, or `cmd` when `command` is
-absent). Every adapted payload is reduced to a bounded command or tool name and
-an outcome of `succeeded`, `failed`, or `unknown`.
+absent). The selected shell command remains complete through semantic
+extraction, subject to that admission limit. MCP events retain only the tool
+name. The adapter also determines an outcome of `succeeded`, `failed`, or
+`unknown`.
 
 Outcome rules:
 
@@ -436,7 +438,7 @@ How each outcome is stored:
 | Outcome | Shell command | MCP tool |
 |---|---|---|
 | `succeeded` | Existing git or environment event | `mcp_call` (tool name only) |
-| `failed` | `error_tool` (`Bash error: <first three tokens>`) | `error_tool` (`<tool> error`) |
+| `failed` | `error_tool` with a matched git/install command type (for example `Bash error: npm install`), or `Bash error: command` when none matches; arguments are omitted | `error_tool` (`<tool> error`) |
 | `unknown` | `tool_outcome_unknown` naming only the matched git or install command (for example `Bash outcome unknown: git commit`); nothing for other commands | `tool_outcome_unknown` |
 
 A `tool_outcome_unknown` observation (category `tool`, priority 3) is
@@ -469,10 +471,12 @@ Codex versions or tools that do supply a status.
 
 The adapter does not persist raw Codex responses, stdout, stderr, or unknown
 fields, and it does not infer file events from shell text or unrecognized
-file-like fields. The existing event truncation and scrubbing pipeline still
-runs on derived event data. Commands whose trimmed text begins with `lcm
-store` are suppressed to prevent LCM's own writes from feeding back into
-passive learning.
+file-like fields. Complete selected event data and tags totaling at most
+8,192 UTF-16 code units are scrubbed before each retained field is limited to
+2,000 code units plus `...`. Larger selected events are omitted instead of
+storing a partial value. Commands whose trimmed text begins with `lcm store`
+are suppressed to prevent LCM's own writes from feeding back into passive
+learning.
 
 The native `apply_patch`, `spawn_agent` (reported as
 `collaborationspawn_agent` by Codex multi-agent v2), `request_user_input`, and
@@ -717,9 +721,10 @@ counted from acceptance, and daemon shutdown cancels it; both are best-effort
 cancellation, not a guarantee that the work stops at that instant. If another
 process holds the backend-publication lock, the run waits for it inside that
 deadline instead of failing, and it never repeats work that has started. The
-ordinary `POST /ingest` and `POST /restore` routes wait the same way until
-3 seconds after the request's first wait, across all of its admissions, before
-they fail. The daemon does
+ordinary `POST /ingest` and `POST /restore` routes wait the same way, and
+also for the daemon's own concurrent lock users, until 3 seconds after the
+request's first wait, across all of its admissions, before they fail. The
+terminal hand-off keeps waiting only for other processes. The daemon does
 not become idle while accepted work remains, and shutdown waits for the queue
 before it closes shared storage. The outcome of each deferred run (captured, no
 new observations, cancelled, blocked, failed or expired) is logged by the daemon

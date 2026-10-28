@@ -20,7 +20,7 @@ export interface PostToolInput {
 }
 
 const SENSITIVE_PATHS = [".env", ".ssh/", "credentials", "secrets/", ".npmrc", ".netrc"];
-const DATA_SOFT_CAP = 2000;
+export const MAX_SCRUB_INPUT = 8_192;
 
 const NEGATIVE_PATTERNS = [
   "don't worry", "dont worry",
@@ -38,14 +38,6 @@ const ENV_COMMANDS = ["npm install", "npm i ", "yarn add", "pip install", "pip3 
 const GIT_COMMANDS = ["git commit", "git merge", "git rebase", "git checkout", "git switch",
   "git branch", "git push", "git pull", "git stash", "git reset", "git cherry-pick"];
 
-function truncate(s: string): string {
-  return s.length > DATA_SOFT_CAP ? s.slice(0, DATA_SOFT_CAP) + "..." : s;
-}
-
-function commandPrefix(command: string): string {
-  return command.split(/\s+/).slice(0, 3).join(" ");
-}
-
 function isSensitivePath(path: string): boolean {
   const lower = path.toLowerCase();
   return SENSITIVE_PATHS.some(p => lower.includes(p));
@@ -60,6 +52,9 @@ function classifyFile(path: string): string {
 
 function extractBashEvents(input: PostToolInput): ExtractedEvent[] {
   const command = String(input.tool_input.command ?? "");
+  // Keep the command complete through selection and scrubbing. An oversized
+  // command is not safe to parse or retain as a partial event.
+  if (command.length > MAX_SCRUB_INPUT) return [];
   const outcome = input.tool_output?.outcome;
   const isError = outcome === undefined
     ? input.tool_output?.isError === true
@@ -67,7 +62,9 @@ function extractBashEvents(input: PostToolInput): ExtractedEvent[] {
 
   // Error detection (priority 1)
   if (isError) {
-    return [{ type: "error_tool", category: "error", data: truncate(`Bash error: ${commandPrefix(command)}`), priority: 1 }];
+    const selector = GIT_COMMANDS.find(gc => command.startsWith(gc)) ??
+      ENV_COMMANDS.find(ec => command.startsWith(ec));
+    return [{ type: "error_tool", category: "error", data: `Bash error: ${selector?.trim() ?? "command"}`, priority: 1 }];
   }
 
   // Completed without a status: record that the result is unknown instead of
@@ -93,13 +90,13 @@ function extractBashEvents(input: PostToolInput): ExtractedEvent[] {
     const data = commitMsgMatch
       ? `${gitMatch}: ${commitMsgMatch[1]}`
       : gitMatch;
-    return [{ type: `git_${gitMatch.split(" ")[1]}`, category: "git", data: truncate(data), priority: 2 }];
+    return [{ type: `git_${gitMatch.split(" ")[1]}`, category: "git", data, priority: 2 }];
   }
 
   // Env commands (priority 2)
   const envMatch = ENV_COMMANDS.find(ec => command.startsWith(ec));
   if (envMatch) {
-    return [{ type: "env_install", category: "env", data: truncate(command), priority: 2 }];
+    return [{ type: "env_install", category: "env", data: command, priority: 2 }];
   }
 
   return [];
@@ -119,7 +116,7 @@ function extractFileEvents(toolName: string, input: PostToolInput): ExtractedEve
   return [{
     type: typeMap[toolName],
     category: "file",
-    data: truncate(`${filePath} (${classifyFile(filePath)})`),
+    data: `${filePath} (${classifyFile(filePath)})`,
     priority: 3,
   }];
 }
@@ -127,8 +124,6 @@ function extractFileEvents(toolName: string, input: PostToolInput): ExtractedEve
 const PATCH_EVENT_CAP = 20;
 const USER_INPUT_QUESTION_CAP = 3;
 const PLAN_STEP_CAP = 10;
-const PLAN_EXPLANATION_CAP = 500;
-const SPAWN_LABEL_CAP = 200;
 const PATCH_HEADERS: readonly (readonly [string, string])[] = [
   ["*** Add File: ", "file_write"],
   ["*** Delete File: ", "file_delete"],
@@ -141,7 +136,7 @@ function isRecord(value: unknown): value is Record<string, unknown> {
 }
 
 function nonEmptyString(value: unknown): string {
-  return typeof value === "string" ? value.trim() : "";
+  return typeof value === "string" && value.trim() ? value : "";
 }
 
 // Native Codex responses are normally a JSON string; accept an object as well.
@@ -198,7 +193,7 @@ function extractPatchEvents(input: PostToolInput): ExtractedEvent[] {
   for (const { type, path, to } of parsePatchOperations(command)) {
     if (isSensitivePath(path) || (to && isSensitivePath(to))) continue;
     const label = to ? `${path} -> ${to} (${classifyFile(to)})` : `${path} (${classifyFile(path)})`;
-    events.set(`${type}\0${label}`, { type, category: "file", data: truncate(label), priority: 3 });
+    events.set(`${type}\0${label}`, { type, category: "file", data: label, priority: 3 });
   }
   return [...events.values()].slice(0, PATCH_EVENT_CAP);
 }
@@ -211,7 +206,7 @@ function extractSpawnEvents(input: PostToolInput): ExtractedEvent[] {
   return [{
     type: "subagent_dispatch",
     category: "subagent",
-    data: truncate(label.slice(0, SPAWN_LABEL_CAP)),
+    data: label,
     priority: 3,
   }];
 }
@@ -230,11 +225,11 @@ function extractUserInputEvents(input: PostToolInput): ExtractedEvent[] {
     const given = isRecord(answer) && Array.isArray(answer.answers) ? answer.answers : [];
     const text = given
       .filter((item): item is string => typeof item === "string")
-      .map(item => item.replace(/^user_note:/, "").trim())
-      .filter(Boolean)
+      .map(item => item.replace(/^user_note:/, ""))
+      .filter(item => item.trim().length > 0)
       .join("; ");
     if (!question || entry.isSecret === true || !text) continue;
-    events.push({ type: "decision", category: "decision", data: truncate(`Q: ${question}\nA: ${text}`), priority: 1 });
+    events.push({ type: "decision", category: "decision", data: `Q: ${question}\nA: ${text}`, priority: 1 });
   }
   return events;
 }
@@ -252,7 +247,7 @@ function extractPlanEvents(input: PostToolInput): ExtractedEvent[] {
   return [{
     type: "plan_update",
     category: "proposal",
-    data: truncate(`Plan: ${explanation.slice(0, PLAN_EXPLANATION_CAP)}${stepLine}`),
+    data: `Plan: ${explanation}${stepLine}`,
     priority: 3,
   }];
 }
@@ -283,7 +278,7 @@ export function extractPostToolEvents(input: PostToolInput): ExtractedEvent[] {
     return [{
       type: "decision",
       category: "decision",
-      data: truncate(`Q: ${question}\nA: ${answer}`),
+      data: `Q: ${question}\nA: ${answer}`,
       priority: 1,
     }];
   }
@@ -315,7 +310,7 @@ export function extractPostToolEvents(input: PostToolInput): ExtractedEvent[] {
     return [{
       type: `task_${tool_name === "TaskCreate" ? "create" : "update"}`,
       category: "task",
-      data: truncate(`${subject} → ${status}`),
+      data: `${subject} → ${status}`,
       priority: 2,
     }];
   }
@@ -323,7 +318,7 @@ export function extractPostToolEvents(input: PostToolInput): ExtractedEvent[] {
   // Agent/subagent (priority 3)
   if (tool_name === "Agent") {
     const desc = String(input.tool_input.description ?? "");
-    return [{ type: "subagent_dispatch", category: "subagent", data: truncate(desc), priority: 3 }];
+    return [{ type: "subagent_dispatch", category: "subagent", data: desc, priority: 3 }];
   }
 
   // Skill (priority 3)
@@ -336,13 +331,13 @@ export function extractPostToolEvents(input: PostToolInput): ExtractedEvent[] {
   if (tool_name.startsWith("mcp__")) {
     const outcome = input.tool_output?.outcome;
     if (outcome === "failed") {
-      return [{ type: "error_tool", category: "error", data: truncate(`${tool_name} error`), priority: 1 }];
+      return [{ type: "error_tool", category: "error", data: `${tool_name} error`, priority: 1 }];
     }
     if (outcome === "unknown") {
       return [{
         type: "tool_outcome_unknown",
         category: "tool",
-        data: truncate(`${tool_name} outcome unknown`),
+        data: `${tool_name} outcome unknown`,
         priority: 3,
       }];
     }
@@ -360,7 +355,7 @@ export function extractPostToolEvents(input: PostToolInput): ExtractedEvent[] {
     return [{
       type: "error_tool",
       category: "error",
-      data: truncate(`${tool_name} error`),
+      data: `${tool_name} error`,
       priority: 1,
     }];
   }
@@ -396,7 +391,7 @@ export function normalizePromptWithChannels(prompt: string): { text: string; fro
       parts.push(prompt.slice(cursor));
       break;
     }
-    parts.push(prompt.slice(cursor, open), prompt.slice(openEnd + 1, close).trim());
+    parts.push(prompt.slice(cursor, open), prompt.slice(openEnd + 1, close));
     cursor = close + "</channel>".length;
     fromChannel = true;
   }
@@ -405,6 +400,7 @@ export function normalizePromptWithChannels(prompt: string): { text: string; fro
 
 export function extractUserPromptEvents(prompt: string): ExtractedEvent[] {
   const events: ExtractedEvent[] = [];
+  if (prompt.length > MAX_SCRUB_INPUT) return events;
 
   // Strip <channel> XML tags before running extractors
   const { text: normalizedPrompt, fromChannel } = normalizePromptWithChannels(prompt);
@@ -424,7 +420,7 @@ export function extractUserPromptEvents(prompt: string): ExtractedEvent[] {
         const event: ExtractedEvent = {
           type: "user_decision",
           category: "decision",
-          data: truncate(normalizedPrompt),
+          data: normalizedPrompt,
           priority: 1,
         };
         if (channelTags) event.tags = channelTags;
@@ -444,7 +440,7 @@ export function extractUserPromptEvents(prompt: string): ExtractedEvent[] {
       const event: ExtractedEvent = {
         type: "user_role",
         category: "role",
-        data: truncate(normalizedPrompt),
+        data: normalizedPrompt,
         priority: 2,
       };
       if (channelTags) event.tags = channelTags;

@@ -19,6 +19,8 @@ let mockEventsDir: string;
 vi.mock("../../src/db/events-path.js", () => ({
   eventsDir: () => mockEventsDir,
   existingEventsDbPath: () => undefined,
+  assertExistingSidecarProjectBinding: () => undefined,
+  SidecarIdentityConflictError: class SidecarIdentityConflictError extends Error {},
   eventsDbPath: (cwd: string) => {
     // Use a deterministic filename based on cwd hash (matching real logic)
     const { createHash } = require("node:crypto");

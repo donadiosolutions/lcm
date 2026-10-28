@@ -96,3 +96,7 @@ with the [storage-backend configuration guide](configuration.md#storage-backend)
 
 Each PostgreSQL guide links to the reviewed runtime grant scripts required by
 the repository it describes.
+
+The npm package includes the public guides listed individually in
+`package.json`'s `files` field. When adding a public guide, add its exact path
+there so it is available in installed packages.

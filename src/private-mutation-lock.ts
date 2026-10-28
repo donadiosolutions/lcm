@@ -235,7 +235,7 @@ function readLockOwner(
     || typeof value !== "object"
     || owner.version !== 1
     || !Number.isSafeInteger(owner.pid)
-    || (owner.pid ?? 0) <= 0
+    || owner.pid! <= 0
     || (owner.processStartTime !== null && typeof owner.processStartTime !== "string")
     || typeof owner.nonce !== "string"
     || !/^[a-f0-9]{32}$/u.test(owner.nonce)
@@ -755,12 +755,24 @@ export function createLockContentionDeadlineBudget(
 /**
  * True only when another live process owns the lock. Contention with an
  * ambiguous owner, with this process, or one of the timeout subclasses carries
- * no live foreign owner and is never worth waiting for.
+ * no live foreign owner and is never worth waiting for. This is the default
+ * policy of every caller of retryWhileLiveLockContended.
  */
 export function isLiveForeignLockContention(error: unknown): boolean {
   return error instanceof PrivateMutationLockContentionError
     && error.contendedLock !== undefined
     && error.contendedLock.owner.pid !== process.pid;
+}
+
+/**
+ * True when a verified live owner holds the lock, this process included. The
+ * lock records contendedLock only for a live main-lock owner, so ambiguous
+ * owners, reclaimers, nested daemon admissions and the timeout subclasses are
+ * excluded. A daemon that waits on its own unqueued lock users is safe only
+ * because the wait wraps just the outer acquisition, never an admitted callback.
+ */
+export function isLiveLockContention(error: unknown): boolean {
+  return error instanceof PrivateMutationLockContentionError && error.contendedLock !== undefined;
 }
 
 export type LiveLockRetryOptions = Readonly<{
@@ -769,6 +781,8 @@ export type LiveLockRetryOptions = Readonly<{
   signal?: AbortSignal;
   /** Consulted before each wait; return false once the step has had effects. */
   canRetry?: () => boolean;
+  /** Which errors are worth waiting for; defaults to isLiveForeignLockContention. */
+  isRetryable?: (error: unknown) => boolean;
   /** @internal Awaited pause used by tests to avoid real timers. */
   _wait?: (milliseconds: number, signal?: AbortSignal) => Promise<void>;
 }>;
@@ -787,25 +801,27 @@ function pause(milliseconds: number, signal?: AbortSignal): Promise<void> {
 }
 
 /**
- * Repeat one lock-acquiring step while a live foreign process holds the lock.
+ * Repeat one lock-acquiring step while a live process holds the lock.
  *
  * The step must be a pre-effect, idempotent acquisition or check: nothing is
- * held during a wait, and only live foreign contention is retried. Every other
- * error is rethrown at once. When the shared budget is spent or the signal
- * aborts, the last contention error is rethrown so the caller's existing
- * contention handling remains the final fallback.
+ * held during a wait, and only contention accepted by options.isRetryable
+ * (live foreign contention by default) is retried. Every other error is
+ * rethrown at once. When the shared budget is spent or the signal aborts, the
+ * last contention error is rethrown so the caller's existing contention
+ * handling remains the final fallback.
  */
 export async function retryWhileLiveLockContended<T>(
   step: () => T | Promise<T>,
   options: LiveLockRetryOptions,
 ): Promise<T> {
   const wait = options._wait ?? pause;
+  const isRetryable = options.isRetryable ?? isLiveForeignLockContention;
   const aborted = (): boolean => options.signal?.aborted === true;
   for (;;) {
     try {
       return await step();
     } catch (error) {
-      if (!isLiveForeignLockContention(error) || options.canRetry?.() === false) throw error;
+      if (!isRetryable(error) || options.canRetry?.() === false) throw error;
       options.budget.begin?.();
       const delay = Math.min(LIVE_LOCK_RETRY_DELAY_MS, options.budget.remainingMs());
       if (delay <= 0 || aborted()) throw error;

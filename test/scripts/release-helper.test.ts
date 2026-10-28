@@ -21,6 +21,8 @@ const otherTagObjectSha = "d".repeat(40);
 interface HarnessOptions {
   fromStep?: 3 | 4 | 8;
   changelogContent?: string;
+  /** Working-tree CHANGELOG.md fixture; null omits the file. */
+  workingChangelog?: string | null;
   localTagState?: string;
   mergeSha?: string;
   mergeReachable?: boolean;
@@ -45,7 +47,7 @@ interface HarnessOptions {
 interface HarnessResult {
   packageContent: string;
   lockContent: string;
-  changelogContent: string;
+  changelogContent: string | null;
   calls: string[];
   localTagState: string | null;
   remoteTagState: string | null;
@@ -73,7 +75,10 @@ function runRelease(options: HarnessOptions = {}): HarnessResult {
   mkdirSync(binDir);
   writeFileSync(join(root, "package.json"), JSON.stringify({ name: "@donadiosolutions/lcm", version: "1.0.0", description: "Preserved fixture metadata" }));
   writeFileSync(join(root, "pnpm-lock.yaml"), "lockfileVersion: '9.0'\nimporters:\n  .: {}\n");
-  writeFileSync(join(root, "CHANGELOG.md"), "# Changelog\n\n## 1.0.0\n\n- Existing release\n");
+  const workingChangelog = options.workingChangelog === undefined
+    ? "# Changelog\n\n## 1.0.0\n\n- Existing release\n"
+    : options.workingChangelog;
+  if (workingChangelog !== null) writeFileSync(join(root, "CHANGELOG.md"), workingChangelog);
   const scriptsDir = join(root, ".github", "scripts");
   mkdirSync(scriptsDir, { recursive: true });
   for (const scriptName of [
@@ -212,7 +217,7 @@ if [[ "$1" == "run" && "$2" == "watch" ]]; then
     if [[ -s "$FAKE_POST_PUBLISH_REMOTE_TAG_STATE" ]]; then
       cp "$FAKE_POST_PUBLISH_REMOTE_TAG_STATE" "$FAKE_REMOTE_TAG_STATE"
     else
-      rm -f "$FAKE_REMOTE_TAG_STATE"
+      node -e 'try { require("node:fs").unlinkSync(process.env.FAKE_REMOTE_TAG_STATE); } catch (error) { if (error.code !== "ENOENT") throw error; }'
     fi
   fi
   exit 0
@@ -315,7 +320,7 @@ exit 0
     return {
       packageContent: readFileSync(join(root, "package.json"), "utf8"),
       lockContent: readFileSync(join(root, "pnpm-lock.yaml"), "utf8"),
-      changelogContent: readFileSync(join(root, "CHANGELOG.md"), "utf8"),
+      changelogContent: existsSync(join(root, "CHANGELOG.md")) ? readFileSync(join(root, "CHANGELOG.md"), "utf8") : null,
       calls: existsSync(callLog) ? readFileSync(callLog, "utf8").trim().split("\n") : [],
       localTagState: existsSync(localTagState) ? readFileSync(localTagState, "utf8").trim() : null,
       remoteTagState: existsSync(remoteTagState) ? readFileSync(remoteTagState, "utf8").trim() : null,
@@ -758,6 +763,27 @@ describe("manual release helper versioning and staging", () => {
     expect(result.calls.some((call) => call.startsWith("npm|version"))).toBe(false);
     expect(result.calls.some((call) => call.includes("package-lock.json"))).toBe(false);
     expect(result.calls.some((call) => call.startsWith("git|tag|") || call.startsWith("gh|"))).toBe(false);
+  });
+
+  it("creates a missing CHANGELOG.md with the Changesets heading and stages it", () => {
+    const result = runRelease({ fromStep: 3, workingChangelog: null });
+    expect(result.status).toBe(71); // Deliberate stop in the fake push tool.
+    expect(result.stderr).toBe("");
+    expect(JSON.parse(result.packageContent).version).toBe(version);
+    expect(result.changelogContent).toBe(
+      `# @donadiosolutions/lcm\n\n## ${version}\n\n### Patch Changes\n\n- Manual release ${tag}.\n`,
+    );
+    expect(result.calls).toContain("git|add|package.json|CHANGELOG.md");
+  });
+
+  it("leaves package.json and CHANGELOG.md unmodified when the changelog has no top-level heading", () => {
+    const headingless = "## 1.0.0\n\n- Existing release\n";
+    const result = runRelease({ fromStep: 3, workingChangelog: headingless });
+    expect(result.status).not.toBe(0);
+    expect(result.stderr).toContain("CHANGELOG.md top-level heading not found");
+    expect(JSON.parse(result.packageContent).version).toBe("1.0.0");
+    expect(result.changelogContent).toBe(headingless);
+    expect(result.calls.some((call) => call.startsWith("git|add|"))).toBe(false);
   });
 
   it("resumes step 4 without rewriting version, lockfile, or changelog", () => {

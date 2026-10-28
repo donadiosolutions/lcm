@@ -76,13 +76,20 @@ export const CONTAINER_CLI_VARIABLE = "LCM_TEST_CONTAINER_CLI";
 const CONTAINER_FLAVOURS = Object.freeze(["docker", "podman"]);
 
 /**
- * Select the container engine CLI once per harness run. Unset selects Docker;
- * otherwise only "docker", "podman" or an absolute path to one of them is valid.
- * A Windows ".exe" suffix on the path's basename is ignored, case-insensitively.
+ * Select the container engine CLI once per harness run. Unset selects native
+ * Podman for local runs and Docker for CI runs (`ci`, which defaults to
+ * GITHUB_ACTIONS=true; runHarness also passes true when it runs under GitHub
+ * Actions with a local topology); otherwise only "docker", "podman" or an
+ * absolute path to one of them is valid. Docker is therefore an explicit local
+ * opt-in. A Windows ".exe" suffix on the path's basename is ignored,
+ * case-insensitively.
  */
-export function resolveContainerEngine(environment = process.env) {
+export function resolveContainerEngine(environment = process.env, ci = environment.GITHUB_ACTIONS === "true") {
   const configured = environment[CONTAINER_CLI_VARIABLE];
-  if (configured === undefined) return { cli: "docker", flavour: "docker" };
+  if (configured === undefined) {
+    const flavour = ci ? "docker" : "podman";
+    return { cli: flavour, flavour };
+  }
   if (typeof configured === "string" && !configured.includes("\0")) {
     if (CONTAINER_FLAVOURS.includes(configured)) return { cli: configured, flavour: configured };
     if (isAbsolute(configured)) {
@@ -106,7 +113,8 @@ export function assertContainerEngineSupported(engine, ci, environment = process
   }
   if (String(environment.LCM_POSTGRES_TEMPLATE_ARCHIVE ?? "").trim().length > 0) {
     throw new Error(
-      "the Podman PostgreSQL harness does not support LCM_POSTGRES_TEMPLATE_ARCHIVE; unset it",
+      "the Podman PostgreSQL harness does not support LCM_POSTGRES_TEMPLATE_ARCHIVE; "
+        + "unset it, or set LCM_TEST_CONTAINER_CLI=docker to use a template archive",
     );
   }
 }
@@ -2102,7 +2110,10 @@ export async function runHarness(options = {}) {
   const ci = options.ci ?? process.env.GITHUB_ACTIONS === "true";
   let engine;
   try {
-    engine = resolveContainerEngine(process.env);
+    // `ci` selects the topology and gates Podman. The unset-CLI default is Docker
+    // whenever the topology is CI or the process runs under GitHub Actions, since the
+    // conformance signal probes use a local topology there but stage a template archive.
+    engine = resolveContainerEngine(process.env, ci || process.env.GITHUB_ACTIONS === "true");
     assertContainerEngineSupported(engine, ci, process.env);
   } catch (error) {
     process.stderr.write(`PostgreSQL harness startup failed: ${error.message}\n`);

@@ -298,21 +298,20 @@ describe("normalizePostToolInput", () => {
     expect(extractPostToolEvents(leadingSpace)).toEqual([]);
   });
 
-  it("bounds the command before it reaches extraction", () => {
+  it("passes the complete command to extraction", () => {
     const normalized = normalize({
       client: "codex",
       tool_name: "functions.exec_command",
       tool_input: { cmd: `npm install ${"x".repeat(2500)}` },
       tool_response: { exit_code: 0 },
     });
-    const boundedCommand = normalized.tool_input.command;
+    const selectedCommand = normalized.tool_input.command;
 
-    expect(typeof boundedCommand).toBe("string");
-    expect(boundedCommand).toHaveLength(2003);
-    expect(boundedCommand).toMatch(/x\.\.\.$/u);
+    expect(typeof selectedCommand).toBe("string");
+    expect(selectedCommand).toBe(`npm install ${"x".repeat(2500)}`);
     expect(extractPostToolEvents(normalized)[0]).toMatchObject({
       type: "env_install",
-      data: boundedCommand,
+      data: selectedCommand,
     });
   });
 
@@ -414,7 +413,7 @@ describe("normalizePostToolInput", () => {
         tool_name: "Bash",
         tool_input: { command: "git push origin main" },
         tool_response: { exit_code: 1 },
-      })[0]).toMatchObject({ type: "error_tool", data: "Bash error: git push origin" });
+      })[0]).toMatchObject({ type: "error_tool", data: "Bash error: git push" });
       expect(extract({
         client: "codex",
         tool_name: "Bash",
