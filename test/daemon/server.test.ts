@@ -1534,6 +1534,8 @@ describe("daemon auth", () => {
       publicationConfigPath: configPath,
       tokenPath,
       _testIdentity: testIdentity,
+      // The held lock belongs to this process, so /store waits for it; keep the wait short.
+      _routeAdmissionWaitMs: 100,
     });
     authDaemon.registerRoute("GET", "/custom-read", async (_req, res) => {
       res.end(JSON.stringify({ ok: true }));
@@ -1564,7 +1566,11 @@ describe("daemon auth", () => {
       expect(health.status).toBe(200);
       expect(pool.status).toBe(200);
       expect(custom.status).toBe(200);
-      expect(mutation.status).toBe(500);
+      expect(mutation.status).toBe(503);
+      expect(await mutation.json()).toEqual({
+        status: "busy",
+        error: "backend publication work is in progress; retry the store",
+      });
     } finally {
       release.resolve();
       await holder;
