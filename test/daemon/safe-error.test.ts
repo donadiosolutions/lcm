@@ -4694,6 +4694,168 @@ describe("sanitizeError", () => {
     });
   });
 
+  describe("Bug #1779", () => {
+    const targets: ReadonlyArray<readonly [name: string, input: string, expected: string]> = [
+      [
+        "home successor",
+        "file://h?x=[file:///Users/CHILD/x&later\\/home/alice]",
+        "file://h?x=[file://<path>&later\\<path>]",
+      ],
+      [
+        "var successor",
+        "file://h?x=[file:///Users/CHILD/x&later\\/var/data]",
+        "file://h?x=[file://<path>&later\\<path>]",
+      ],
+      [
+        "Users successor",
+        "file://h?x=[file:///Users/CHILD/x&later\\/Users/alice]",
+        "file://h?x=[file://<path>&later\\<path>]",
+      ],
+      [
+        "root successor",
+        "file://h?x=[file:///Users/CHILD/x&later\\/root/x]",
+        "file://h?x=[file://<path>&later\\<path>]",
+      ],
+      [
+        "case-insensitive successor",
+        "file://h?x=[file:///Users/CHILD/x&Later\\/HOME/alice]",
+        "file://h?x=[file://<path>&Later\\<path>]",
+      ],
+      [
+        "ordinary path word after the slash",
+        "file://h?x=[file:///Users/CHILD/x&later\\/homes/alice]",
+        "file://h?x=[file://<path>&later\\<path>]",
+      ],
+      [
+        "multiple leading backslashes",
+        "file://h?x=[file:///Users/CHILD/x&later\\\\/x]",
+        "file://h?x=[file://<path>&later\\\\<path>]",
+      ],
+      [
+        "public URL text after the slash",
+        "file://h?x=[file:///Users/CHILD/x&later\\/https://public.test/x]",
+        "file://h?x=[file://<path>&later\\<path>]",
+      ],
+      [
+        "two ampersand successors",
+        "file://h?x=[file:///Users/CHILD/x&later\\/home/a&second\\/var/b]",
+        "file://h?x=[file://<path>&later\\<path>&second\\<path>]",
+      ],
+      [
+        "nested file child in a non-file owner",
+        "https://h?x=[file:///Users/CHILD/x&later\\/home/alice]",
+        "https://h?x=[file://<path>&later\\<path>]",
+      ],
+      [
+        "unclosed wrapper",
+        "file://h?x=[file:///Users/CHILD/x&later\\/home/alice",
+        "file://h?x=[file://<path>&later\\<path>",
+      ],
+      [
+        "successor followed by a bracketed URL",
+        "file://h?x=[file:///Users/CHILD/x&later\\/home/alice/s([https://other?key=/Users/SECRET2/x]",
+        "file://h?x=[file://<path>&later\\<path>?key=<path>]",
+      ],
+    ];
+
+    const controls: ReadonlyArray<readonly [name: string, input: string, expected: string]> = [
+      [
+        "pipe home successor",
+        "file://h?x=[file:///Users/CHILD/x|later\\/home/alice]",
+        "file://h?x=[file://<path>|later\\<path>]",
+      ],
+      [
+        "pipe var successor",
+        "file://h?x=[file:///Users/CHILD/x|later\\/var/data]",
+        "file://h?x=[file://<path>|later\\<path>]",
+      ],
+      [
+        "separator run without a path word",
+        "file://h?x=[file:///Users/CHILD/x&later\\/]",
+        "file://h?x=[file://<path>&later\\/]",
+      ],
+      [
+        "word before the slash",
+        "file://h?x=[file:///Users/CHILD/x&later\\x/y]",
+        "file://h?x=[file://<path>&later\\x/y]",
+      ],
+      [
+        "backslash-only value",
+        "file://h?x=[file:///Users/CHILD/x&later\\home]",
+        "file://h?x=[file://<path>&later\\home]",
+      ],
+      [
+        "backslash-only path",
+        "file://h?x=[file:///Users/CHILD/x&later\\home\\alice]",
+        "file://h?x=[file://<path>&later\\home\\alice]",
+      ],
+      [
+        "query child",
+        "file://h?x=[file:///Users/CHILD/x?y=1&later\\/home/alice]",
+        "file://h?x=[file://<path>?y=1&later<path>]",
+      ],
+      [
+        "fragment child after ampersand",
+        "file://h?x=[file:///Users/CHILD/x#f&later\\/var/data]",
+        "file://h?x=[file://<path>#f&later<path>]",
+      ],
+      [
+        "fragment child after pipe",
+        "file://h?x=[file:///Users/CHILD/x#f|later\\/home/alice]",
+        "file://h?x=[file://<path>#f|later\\<path>]",
+      ],
+      [
+        "pathless child",
+        "file://h?x=[file://host&later\\/home/alice]",
+        "file://h?x=[file://host&later<path>]",
+      ],
+      [
+        "forward-slash private relative",
+        "file://h?x=[file:///Users/CHILD/x&later/home/alice]",
+        "file://h?x=[file://<path>&later<path>]",
+      ],
+      [
+        "forward-slash ordinary relative",
+        "file://h?x=[file:///Users/CHILD/x&later/var/data]",
+        "file://h?x=[file://<path>&later/var/data]",
+      ],
+      [
+        "unrelated public URL",
+        "https://public.test/a\\/var/data",
+        "https://public.test/a\\/var/data",
+      ],
+      [
+        "public URL query value",
+        "https://e.test/x?next=later\\/var/data",
+        "https://e.test/x?next=later\\/var/data",
+      ],
+      [
+        "whole-message quoted wrapper",
+        "'file://h?x=[file:///Users/CHILD/x&later\\/home/alice]'",
+        "'file://h?x=[file://<path>'",
+      ],
+    ];
+
+    it.each(targets)("redacts the %s on the first pass", (_name, input, expected) => {
+      const first = sanitizeError(input);
+      const second = sanitizeError(first);
+      const third = sanitizeError(second);
+
+      expect(first).toBe(expected);
+      expect(second).toBe(expected);
+      expect(third).toBe(expected);
+    });
+
+    it.each(controls)("keeps the %s stable", (_name, input, expected) => {
+      const first = sanitizeError(input);
+      const second = sanitizeError(first);
+      const third = sanitizeError(second);
+
+      expect(first).toBe(expected);
+      expect(second).toBe(expected);
+      expect(third).toBe(expected);
+    });
+  });
 
   describe("Bug #917", () => {
     const matrix: Array<readonly [string, string, string]> = (["'", '"'] as const).flatMap(

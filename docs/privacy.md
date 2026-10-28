@@ -694,7 +694,12 @@ bundle and keep provider, credential, quarantine, and recovery sessions private.
   fragment, so it is redacted on the first pass instead of the second. A
   public-URL parameter of that child does not end the match. Closing an inner
   wrapper removes only that depth, preserving still-open outer owners until
-  their matching close or a hard reset.
+  their matching close or a hard reset. As an exception to ordinary-relative
+  visibility, a successor after a path-bearing nested `file://` child is
+  redacted from the first `/` when a path-word label is followed by a separator
+  run that starts with `\`, also contains `/`, and then has another path word.
+  The label and any preceding backslashes remain visible; backslash-only runs
+  and runs without a following path word remain unchanged.
 
   When a matching quote closes a nested public URL inside a bracketed file
   query, an immediate `&` or `|` successor is redacted only when it begins with
