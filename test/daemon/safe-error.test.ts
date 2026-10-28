@@ -5855,6 +5855,104 @@ describe("sanitizeError", () => {
       );
       expect(third).toBe(second);
     });
+
+    describe("claims nested inside an owned bracket", () => {
+      const quoted = "file://h?x=['https://o?x=file:///a'";
+      const redactedQuoted = "file://h?x=['https://o?x=file://<path>'";
+      const secretBracket = "[https://o?key=/Users/SECRET/s]]";
+
+      it.each([
+        ["pipe", "|"],
+        ["ampersand", "&"],
+      ] as const)(
+        "keeps the inherited owner through an active child after %s",
+        (_name, delimiter) => {
+          assertStable(
+            quoted + delimiter + "\\a[file:///b&/c]" + secretBracket,
+            redactedQuoted + delimiter + "<path>&<path>][https://o?key=<path>]]",
+          );
+        },
+      );
+
+      it.each([
+        ["zero width space", "\u200b"],
+        ["zero width non-joiner", "\u200c"],
+        ["zero width joiner", "\u200d"],
+        ["word joiner", "\u2060"],
+      ] as const)("keeps the inherited owner behind a %s run", (_name, interposer) => {
+        assertStable(
+          quoted + interposer + "|\\a[file:///b&/c]" + secretBracket,
+          redactedQuoted + interposer + "|<path>&<path>][https://o?key=<path>]]",
+        );
+      });
+
+      it.each([
+        ["rooted", "/Users/SECRET/x", "<path>"],
+        ["private-relative", "later/Users/SECRET/x", "later<path>"],
+      ] as const)("keeps a %s inherited successor owner", (_name, successor, expected) => {
+        assertStable(
+          quoted + "|" + successor + "[file:///b&/c]" + secretBracket,
+          redactedQuoted + "|" + expected + "&<path>][https://o?key=<path>]]",
+        );
+      });
+
+      it.each([
+        ["pipe child", "[file:///b|/c]", "<path>|<path>]"],
+        ["backslash child", "[file:///b&\\c]", "<path>&<path>]"],
+        ["later rooted successor", "[file:///b&/c&/d]", "<path>&<path>&<path>]"],
+        ["later private successor", "[file:///b&/c&later/Users/d]", "<path>&<path>&later<path>]"],
+        ["later pipe successor", "[file:///b&/c|/d]", "<path>&<path>|<path>]"],
+        ["queried private child", "[file:///b?q=1&later/home/c]", "<path>?q=1&later<path>]"],
+        ["mixed-separator child", "[file:///b&later\\/home/c]", "<path>&later\\<path>]"],
+        ["restarted backslash wrapper", "[file://h2?x=[a]\\b]", "<path>?x=[a]<path>]"],
+        ["restarted slash wrapper", "[file://h2?x=[a]/b]", "<path>?x=[a]<path>]"],
+        ["restarted nested bracket", "[file://h2?x=[a][/Users/S/s]]", "<path>?x=[a][<path>]]"],
+        [
+          "child with its own bracket",
+          "[file:///b&/c([https://i?key=/Users/I/s]]",
+          "<path>&<path>?key=<path>]]",
+        ],
+      ] as const)("keeps the inherited owner through a %s", (_name, inner, expected) => {
+        assertStable(
+          quoted + "|\\a" + inner + secretBracket,
+          redactedQuoted + "|" + expected + "[https://o?key=<path>]]",
+        );
+      });
+
+      it.each([
+        ["drive", "C:/Users/SECRET/s", "<path>"],
+        ["private-relative", "later/home/SECRET/s", "later/home/SECRET/s"],
+        ["colon", "XY:/Users/SECRET/s", "XY:/Users/SECRET/s"],
+        ["plain", "plain", "plain"],
+        ["public", "https://public.test/x", "https://public.test/x"],
+      ] as const)("keeps the adjacent %s value as before", (_name, value, expected) => {
+        assertStable(
+          quoted + "|\\a[file:///b&/c][https://o?key=" + value + "]]",
+          redactedQuoted + "|<path>&<path>][https://o?key=" + expected + "]]",
+        );
+      });
+
+      it.each([
+        ["bridged", ":x"],
+        ["parenthesised", "("],
+      ] as const)("leaves a %s rooted value visible as before", (_name, bridge) => {
+        assertStable(
+          quoted + "|\\a[file:///b&/c]" + bridge + secretBracket,
+          redactedQuoted + "|<path>&<path>]" + bridge + secretBracket,
+        );
+      });
+
+      it.each([
+        ["active child", "[file:///b&/c]", "&<path>]"],
+        ["later successor", "[file:///b&/c&/d]", "&<path>&<path>]"],
+        ["restarted wrapper", "[file://h2?x=[a]\\b]", "?x=[a]<path>]"],
+      ] as const)("keeps the direct post-close owner through a %s", (_name, inner, expected) => {
+        assertStable(
+          postClose + inner + "[https://o?key=/Users/SECRET/s]",
+          redactedPostClose + expected + "[https://o?key=<path>]",
+        );
+      });
+    });
   });
 
   describe("Bug #1789", () => {

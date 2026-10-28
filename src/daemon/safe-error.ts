@@ -167,6 +167,18 @@ function findUrlPathStarts(chars: readonly string[]): UrlPathStarts {
     postCloseFilePathOwnsBackslashQuery = ownsBackslashQuery;
     postCloseFilePathTailEnd = measurePrivateSpanEnd(start, fileUrl, forced);
   };
+  // A claim that activates inside a bracket an active tail already owns is
+  // absorbed by that owner: it completes the owner's current component and
+  // must not replace the owner's depth and adjacency tracking, so the owner
+  // keeps redacting the components its bracket reaches, exactly as before.
+  const absorbsClaimInsideOwnedBracketTail = (): boolean => {
+    if (!postCloseFilePathActive || postCloseFilePathBracketDepth === 0) return false;
+    if (!postCloseFilePathComponentHasQuery) {
+      postCloseFilePathComponent += 1;
+      postCloseFilePathComponentHasQuery = true;
+    }
+    return true;
+  };
   const skipSeparatorRun = (start: number): number => {
     let cursor = start;
     while (chars[cursor] === "/" || chars[cursor] === "\\") cursor += 1;
@@ -911,7 +923,7 @@ function findUrlPathStarts(chars: readonly string[]): UrlPathStarts {
                 isWindowsDrivePathStart(chars, index + 1))
             ? index + 1
             : -1;
-      if (activeChildClaimStart >= 0) {
+      if (activeChildClaimStart >= 0 && !absorbsClaimInsideOwnedBracketTail()) {
         const inheritedQuote = inheritedQuoteTailWrapperDepths.has(
           activeNestedFileUrlParentOwnerBracketDepth,
         );
@@ -975,9 +987,10 @@ function findUrlPathStarts(chars: readonly string[]): UrlPathStarts {
         postCloseFilePathActive &&
         postCloseFilePathInheritedQuote &&
         postCloseFilePathTrackingStart === index + 1;
+      const armsSuccessorTail = ownsBracketTail && !alreadyArmedAtSuccessor;
       if (chars[index + 1] === "/" || chars[index + 1] === "\\") {
         forcedPath[index + 1] = 1;
-        if (ownsBracketTail && !alreadyArmedAtSuccessor) {
+        if (armsSuccessorTail && !absorbsClaimInsideOwnedBracketTail()) {
           armBracketTail(
             index + 1,
             index + 1,
@@ -996,7 +1009,7 @@ function findUrlPathStarts(chars: readonly string[]): UrlPathStarts {
         pathlessFileQueryOwnerBracketDepth > 0
       ) {
         forcedPath[privateRootPathStart] = 1;
-        if (ownsBracketTail && !alreadyArmedAtSuccessor) {
+        if (armsSuccessorTail && !absorbsClaimInsideOwnedBracketTail()) {
           armBracketTail(
             privateRootPathStart,
             index + 1,
@@ -1364,7 +1377,9 @@ function findUrlPathStarts(chars: readonly string[]): UrlPathStarts {
       isPathWord(chars[index + 1])
     ) {
       forcedPath[index] = 1;
-      armBracketTail(index, index + 1, false, true, false, false, false, false, false);
+      if (!absorbsClaimInsideOwnedBracketTail()) {
+        armBracketTail(index, index + 1, false, true, false, false, false, false, false);
+      }
     }
     if (
       restartedPathlessFile &&
@@ -1372,7 +1387,9 @@ function findUrlPathStarts(chars: readonly string[]): UrlPathStarts {
       isNestedBracketPathStart(char, restartedPathlessBrackets, false)
     ) {
       forcedPath[index] = 1;
-      armBracketTail(index, index + 1, false, true, false, false, false, false, false);
+      if (!absorbsClaimInsideOwnedBracketTail()) {
+        armBracketTail(index, index + 1, false, true, false, false, false, false, false);
+      }
       schemeLength = 0;
       fileSchemeLength = 0;
       schemeQuote = 0;
@@ -1393,7 +1410,9 @@ function findUrlPathStarts(chars: readonly string[]): UrlPathStarts {
       quotedQueryPublicUrl = false;
       quotedQueryPublicUrlOwnQueryOrFragment = false;
       file[index] = 1;
-      armBracketTail(index, index + 1, true, false, false, false, false, false, false);
+      if (!absorbsClaimInsideOwnedBracketTail()) {
+        armBracketTail(index, index + 1, true, false, false, false, false, false, false);
+      }
       continue;
     }
     if (char === ":" && schemeLength > 0 && chars[index + 1] === "/" && chars[index + 2] === "/") {
