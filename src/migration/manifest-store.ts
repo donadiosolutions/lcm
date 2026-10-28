@@ -282,21 +282,39 @@ type AuthenticatedManifestState = Readonly<{
   revisions: string;
 }>;
 
-function assertNoImmediateSuccessor(
+/**
+ * Ordinary reads stay on the current head only while the immediate successor
+ * directory is empty: an empty directory is compatible with every candidate,
+ * so the next update writes its manifest normally.  A writer scratch binds the
+ * revision to the one candidate it was started for, so a read-then-act gate
+ * that proceeded on the head could commit work its own update would then
+ * refuse; it reports recovery-required until the same update finishes the
+ * write.  A manifest, or anything the classifier cannot authenticate, also
+ * needs explicit recovery.
+ */
+function assertNoPublishedImmediateSuccessor(
   revisions: string,
+  generationId: string,
   revision: number,
+  expectedUid: number | undefined,
 ): void {
   if (revision === Number.MAX_SAFE_INTEGER) return;
-  const successorPath = join(revisions, revisionDirectoryName(revision + 1));
+  let candidate: ReturnType<typeof readAuthenticatedRevisionCandidate>;
   try {
-    lstatSync(successorPath);
+    candidate = readAuthenticatedRevisionCandidate(revisions, generationId, revision + 1, expectedUid);
   } catch (error) {
-    if ((error as NodeJS.ErrnoException).code === "ENOENT") return;
-    throw error;
+    throw new MigrationProtocolError(
+      "recovery-required",
+      "migration manifest has an unpublished immediate successor",
+      { cause: error },
+    );
   }
+  if (candidate === null || (candidate.kind === "incomplete" && candidate.empty)) return;
   throw new MigrationProtocolError(
     "recovery-required",
-    "migration manifest has an unpublished immediate successor",
+    candidate.kind === "incomplete"
+      ? "migration manifest has an interrupted successor write; retry the same create or update to finish it"
+      : "migration manifest has an unpublished immediate successor",
   );
 }
 
@@ -307,7 +325,7 @@ function exactRecoveryCandidate(
   previousManifestSha256: string | null,
   expectedUid: number | undefined,
 ): Readonly<{ kind: "manifest"; manifest: MigrationManifest; directory: string }>
-  | Readonly<{ kind: "incomplete"; directory: string }>
+  | Readonly<{ kind: "incomplete"; directory: string; empty: boolean }>
   | null {
   const candidate = readAuthenticatedRevisionCandidate(
     revisions,
@@ -338,7 +356,7 @@ function readAuthenticatedRevisionCandidate(
   revision: number,
   expectedUid: number | undefined,
 ): Readonly<{ kind: "manifest"; manifest: MigrationManifest; directory: string }>
-  | Readonly<{ kind: "incomplete"; directory: string }>
+  | Readonly<{ kind: "incomplete"; directory: string; empty: boolean }>
   | null {
   const directory = join(revisions, revisionDirectoryName(revision));
   try {
@@ -349,7 +367,7 @@ function readAuthenticatedRevisionCandidate(
   }
   return withAuthenticatedDirectories([directory], expectedUid, () => {
     const entries = readDirectoryEntriesBounded(directory, 2);
-    if (entries.length === 0) return { kind: "incomplete", directory };
+    if (entries.length === 0) return { kind: "incomplete", directory, empty: true };
     const manifestEntries = entries.filter((entry) => MANIFEST_FILENAME_PATTERN.test(entry));
     if (manifestEntries.length === 0 && entries.length === 1) {
       const scratch = revisionScratchMatch(entries[0]!);
@@ -358,7 +376,7 @@ function readAuthenticatedRevisionCandidate(
         // incomplete evidence never advances the head, the intended candidate
         // checksum is bound later by the exact create/update retry.
         assertRecoverableRevisionEntries(directory, scratch[1]!, expectedUid);
-        return { kind: "incomplete", directory };
+        return { kind: "incomplete", directory, empty: false };
       }
     }
     if (manifestEntries.length !== 1) {
@@ -2337,7 +2355,7 @@ export class MigrationManifestStore {
             };
           }
           if (rejectImmediateSuccessor) {
-            assertNoImmediateSuccessor(revisions, head.revision);
+            assertNoPublishedImmediateSuccessor(revisions, generationId, head.revision, this.#expectedUid);
             if (nestedScratch !== null) {
               throw new MigrationProtocolError(
                 "recovery-required",

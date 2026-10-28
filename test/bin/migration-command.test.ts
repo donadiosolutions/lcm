@@ -1,4 +1,5 @@
-import { existsSync, mkdirSync, renameSync, rmSync, writeFileSync } from "node:fs";
+import { createHash } from "node:crypto";
+import { chmodSync, existsSync, mkdirSync, renameSync, rmSync, writeFileSync } from "node:fs";
 import { homedir } from "node:os";
 import { join } from "node:path";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
@@ -89,6 +90,8 @@ vi.mock("../../src/migration/cli-cutover-set.js", () => ({
 
 const { runCli } = await import("../../bin/lcm.js");
 const { LEGACY_LCM_HOME_DIRNAME, migrateLegacyHomeIfNeeded } = await import("../../src/runtime-paths.js");
+const { BackendPublicationJournalError } = await import("../../src/storage/backend-publication.js");
+const { PrivateMutationLockContentionError } = await import("../../src/private-mutation-lock.js");
 
 function stdoutText(spy) {
   return spy.mock.calls.map(([value]) => String(value)).join("");
@@ -601,6 +604,123 @@ describe("lcm migration command group", () => {
       withoutActiveRoot();
       await planOnce();
       expect(migrateLegacyHomeIfNeeded).not.toHaveBeenCalled();
+    });
+
+    describe("interrupted legacy migration finish (#1677)", () => {
+      const journalPath = (): string => join(homedir(), ".lcm-legacy-migration.json");
+      const canonical = (value) => {
+        if (value === null || typeof value !== "object") return JSON.stringify(value);
+        if (Array.isArray(value)) return "[" + value.map(canonical).join(",") + "]";
+        return "{" + Object.keys(value).sort().map((key) => JSON.stringify(key) + ":" + canonical(value[key])).join(",") + "}";
+      };
+      const witness = { identity: { dev: "1", ino: "2" }, mode: 700, uid: 0, gid: 0, hash: "a".repeat(64) };
+      const writeJournal = (phase, overrides = {}, mode = 0o600) => {
+        const operationId = "0123456789abcdef0123456789abcdef0123456789abcdef";
+        const payload = {
+          version: 2,
+          phase,
+          operationId,
+          sourceName: LEGACY_LCM_HOME_DIRNAME,
+          targetName: ".lcm",
+          stagingName: ".lcm-legacy-migration-" + createHash("sha256").update(".lcm\0" + operationId).digest("hex") + ".partial",
+          source: witness,
+          target: phase === "planned" ? null : witness,
+          targetBaseHash: null,
+          retained: phase === "retaining" || phase === "retained" ? witness : null,
+          ...overrides,
+        };
+        const journal = { ...payload, checksumSha256: createHash("sha256").update(canonical(payload)).digest("hex") };
+        writeFileSync(journalPath(), canonical(journal) + "\n", { mode });
+        chmodSync(journalPath(), mode);
+      };
+      const planEnvelope = async () => {
+        state.plan.mockResolvedValueOnce({ status: "refuse", reason: "machine-identity-unregistered" });
+        const out = vi.spyOn(process.stdout, "write").mockImplementation(() => true);
+        await invoke("migration", "plan", "--json");
+        return JSON.parse(stdoutText(out));
+      };
+
+      afterEach(() => {
+        if (existsSync(journalPath())) rmSync(journalPath());
+      });
+
+      it.each(["published", "removing", "retaining"])("finishes a %s journal once before the subcommand runs", async (phase) => {
+        writeJournal(phase);
+        const envelope = await planEnvelope();
+        expect(migrateLegacyHomeIfNeeded).toHaveBeenCalledTimes(1);
+        expect(state.plan).toHaveBeenCalledTimes(1);
+        expect(envelope).toMatchObject({ command: "plan", outcome: "refused-precondition", exitCode: 2 });
+      });
+
+      it.each([
+        ["a hold's unresolved-publication refusal", "unresolved-publication", "maintenance hold is active"],
+        ["a non-hold unresolved-publication refusal", "unresolved-publication", "publication is unresolved"],
+        ["another publication refusal", "unsafe-storage", "publication storage is unsafe"],
+      ])("continues to the subcommand when publication admission refuses with %s", async (_label, reason, message) => {
+        writeJournal("published");
+        migrateLegacyHomeIfNeeded.mockImplementationOnce(() => {
+          throw new BackendPublicationJournalError(reason, message);
+        });
+        const envelope = await planEnvelope();
+        expect(migrateLegacyHomeIfNeeded).toHaveBeenCalledTimes(1);
+        expect(state.plan).toHaveBeenCalledTimes(1);
+        expect(envelope).toMatchObject({ command: "plan", outcome: "refused-precondition", exitCode: 2 });
+      });
+
+      it.each([
+        ["a plain error from the finish step", () => new Error("legacy migration retaining root changed")],
+        ["private mutation lock contention", () => new PrivateMutationLockContentionError("private mutation lock is held")],
+      ])("propagates %s and does not run the subcommand", async (_label, makeError) => {
+        writeJournal("retaining");
+        const failure = makeError();
+        migrateLegacyHomeIfNeeded.mockImplementationOnce(() => {
+          throw failure;
+        });
+        state.plan.mockResolvedValueOnce({ status: "refuse", reason: "machine-identity-unregistered" });
+        await expect(invoke("migration", "plan", "--json")).rejects.toBe(failure);
+        expect(state.plan).not.toHaveBeenCalled();
+      });
+
+      it.each(["planned", "copying", "retained"])("does not run the bootstrap for a %s journal", async (phase) => {
+        writeJournal(phase);
+        await planOnce();
+        expect(migrateLegacyHomeIfNeeded).not.toHaveBeenCalled();
+      });
+
+      it("does not run the bootstrap when the journal is missing", async () => {
+        await planOnce();
+        expect(migrateLegacyHomeIfNeeded).not.toHaveBeenCalled();
+      });
+
+      it.each([
+        ["checksum-invalid", () => writeJournal("published", { checksumSha256: "0".repeat(64) })],
+        ["malformed", () => writeFileSync(journalPath(), "{", { mode: 0o600 })],
+        ["wrong-mode", () => writeJournal("published", {}, 0o644)],
+      ])("does not run the bootstrap for a %s journal", async (_label, arrange) => {
+        arrange();
+        await planOnce();
+        expect(migrateLegacyHomeIfNeeded).not.toHaveBeenCalled();
+      });
+
+      it("keeps a pending journal skipped while the active root is absent and no legacy directory exists", async () => {
+        writeJournal("published");
+        withoutActiveRoot();
+        await planOnce();
+        expect(migrateLegacyHomeIfNeeded).not.toHaveBeenCalled();
+      });
+
+      it("keeps the unchanged bootstrap, with no refusal tolerance, for a legacy directory beside an absent root", async () => {
+        writeJournal("published");
+        mkdirSync(legacyHome(), { recursive: true, mode: 0o700 });
+        withoutActiveRoot();
+        const refusal = new BackendPublicationJournalError("unresolved-publication", "publication is unresolved");
+        migrateLegacyHomeIfNeeded.mockImplementationOnce(() => {
+          throw refusal;
+        });
+        state.plan.mockResolvedValueOnce({ status: "refuse", reason: "machine-identity-unregistered" });
+        await expect(invoke("migration", "plan", "--json")).rejects.toBe(refusal);
+        expect(state.plan).not.toHaveBeenCalled();
+      });
     });
   });
 });

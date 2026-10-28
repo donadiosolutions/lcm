@@ -250,20 +250,15 @@ fi
 if run_step 3; then
   step "Step 3 — Bump version files and CHANGELOG.md to $VERSION"
 
+  # Compute the changelog first and write it before package.json, so a
+  # changelog failure leaves both files unmodified.
   VERSION="$VERSION" node <<'NODE'
   const fs = require('node:fs');
-  const path = 'package.json';
-  const pkg = JSON.parse(fs.readFileSync(path, 'utf8'));
-  pkg.version = process.env.VERSION;
-  fs.writeFileSync(path, JSON.stringify(pkg, null, 2) + '\n');
-NODE
-  ok "package.json → $VERSION"
-
-  VERSION="$VERSION" node <<'NODE'
-  const fs = require('fs');
   const p = 'CHANGELOG.md';
   const version = process.env.VERSION;
-  const changelog = fs.readFileSync(p, 'utf8');
+  const pkg = JSON.parse(fs.readFileSync('package.json', 'utf8'));
+  // Changesets creates CHANGELOG.md with the package name as its heading.
+  const changelog = fs.existsSync(p) ? fs.readFileSync(p, 'utf8') : `# ${pkg.name}\n`;
   const hasBlock = changelog
     .split(/\r?\n/)
     .some(
@@ -274,6 +269,7 @@ NODE
         line.startsWith(`## [${version}] `)
     );
 
+  let updated = changelog;
   if (!hasBlock) {
     const eol = changelog.includes('\r\n') ? '\r\n' : '\n';
     const lines = changelog.split(/\r?\n/);
@@ -291,10 +287,17 @@ NODE
       '',
       `- Manual release v${version}.`
     );
-    fs.writeFileSync(p, lines.join(eol));
+    updated = lines.join(eol);
   }
+
+  if (updated !== changelog || !fs.existsSync(p)) {
+    fs.writeFileSync(p, updated);
+  }
+  pkg.version = version;
+  fs.writeFileSync('package.json', JSON.stringify(pkg, null, 2) + '\n');
 NODE
   ok "CHANGELOG.md includes $VERSION release block."
+  ok "package.json → $VERSION"
 
   V1=$(node -p "require('./package.json').version")
   [[ "$V1" != "$VERSION" ]] && \

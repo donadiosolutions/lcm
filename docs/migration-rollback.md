@@ -124,6 +124,11 @@ resolves every one of them except the cases described under "A prepared
 selection that drifted" and "An externally aborted rollback publication" below
 when the destination changed in between.
 
+One window is not yet recovered automatically: a rollback interrupted while
+it was writing its own rollback witness leaves a partial file in the
+activation evidence directory, and a retry refuses it as unresolvable instead
+of finishing the write. The file is preserved; inspect it before retrying.
+
 On a post-write rollback specifically, a retry after a crash **never
 resumes copying into the same partial generation**. It builds a brand-new
 generation directory, one attempt number higher than any attempt already on

@@ -5013,6 +5013,144 @@ describe("sanitizeError", () => {
     );
   });
 
+  describe("Bug #1789", () => {
+    const prefix = "file://h?x=['https://outer.test/x?next=file:///Users/a/My Files/private.db'";
+    const redactedPrefix = "file://h?x=['https://outer.test/x?next=file://<path>'";
+    const windowsRoot = "\\Users\\SECRET\\x]";
+    const cases: Array<readonly [name: string, input: string, expected: string]> = [
+      ...([
+        ["U+200B", "\u200b"],
+        ["U+200C", "\u200c"],
+        ["U+200D", "\u200d"],
+        ["U+2060", "\u2060"],
+      ] as const).map(([name, interposer]) => [
+        name + " before pipe restores the inherited owner",
+        prefix + interposer + "|" + windowsRoot,
+        redactedPrefix + interposer + "|<path>]",
+      ] as const),
+      [
+        "mixed invisible run before pipe restores the inherited owner",
+        prefix + "\u200b\u200c|" + windowsRoot,
+        redactedPrefix + "\u200b\u200c|<path>]",
+      ],
+      [
+        "U+200B before ampersand restores the inherited owner",
+        prefix + "\u200b&" + windowsRoot,
+        redactedPrefix + "\u200b&<path>]",
+      ],
+      [
+        "U+200B before a private-root relative pipe successor",
+        prefix + "\u200b|later/home/alice]",
+        redactedPrefix + "\u200b|later<path>]",
+      ],
+      ["quote-equals backslash Users value", prefix + "=\\Users\\SECRET\\x]", redactedPrefix + "=<path>]"],
+      ["quote-equals ordinary backslash value", prefix + "=\\var\\data]", redactedPrefix + "=<path>]"],
+      [
+        "quote-repeated-equals backslash value",
+        prefix + "==\\Users\\SECRET\\x]",
+        redactedPrefix + "==<path>]",
+      ],
+      [
+        "invisible run before quote-equals backslash value",
+        prefix + "\u200b=\\var\\data]",
+        redactedPrefix + "\u200b=<path>]",
+      ],
+      [
+        "invisible run successor owns its immediate bracket composition",
+        prefix + "\u200b|\\Users\\SECRET\\x[https://inner?key=/home/C/s]]",
+        redactedPrefix + "\u200b|<path>?key=<path>]]",
+      ],
+      ["immediate pipe keeps its established handoff", prefix + "|" + windowsRoot, redactedPrefix + "|<path>]"],
+      [
+        "immediate ampersand keeps its established handoff",
+        prefix + "&" + windowsRoot,
+        redactedPrefix + "&<path>]",
+      ],
+      ["POSIX value after equals keeps its established redaction", prefix + "=/Users/SECRET/x]", redactedPrefix + "=<path>]"],
+      [
+        "Windows drive value after equals keeps its established redaction",
+        prefix + "=C:\\Users\\SECRET\\x]",
+        redactedPrefix + "=<path>]",
+      ],
+      [
+        "UNC value after equals keeps its established redaction",
+        prefix + "=\\\\server\\share]",
+        redactedPrefix + "=<path>]",
+      ],
+      [
+        "forward-slash drive value after equals keeps its established redaction",
+        prefix + "=C:/Users/SECRET/x]",
+        redactedPrefix + "=C:<path>]",
+      ],
+      [
+        "private-root relative value after equals stays readable",
+        prefix + "=later/home/alice]",
+        redactedPrefix + "=later/home/alice]",
+      ],
+      [
+        "Users relative value after equals stays readable",
+        prefix + "=Users/alice/x]",
+        redactedPrefix + "=Users/alice/x]",
+      ],
+      ["plain value after equals stays readable", prefix + "=plain]", redactedPrefix + "=plain]"],
+      [
+        "public URL value after equals stays readable",
+        prefix + "=https://public.test/x]",
+        redactedPrefix + "=https://public.test/x]",
+      ],
+      [
+        "space and U+200B after equals keep a backslash value readable",
+        prefix + "= \u200b\\Users\\SECRET\\x]",
+        redactedPrefix + "= \u200b\\Users\\SECRET\\x]",
+      ],
+      [
+        "U+200B after equals keeps a backslash value readable",
+        prefix + "=\u200b\\Users\\SECRET\\x]",
+        redactedPrefix + "=\u200b\\Users\\SECRET\\x]",
+      ],
+      [
+        "U+200B after pipe keeps a backslash value readable",
+        prefix + "|\u200b\\Users\\SECRET\\x]",
+        redactedPrefix + "|\u200b\\Users\\SECRET\\x]",
+      ],
+      ...(["|", "&", "="] as const).map((delimiter) => [
+        "U+FEFF before " + delimiter + " remains a whitespace boundary",
+        prefix + "\ufeff" + delimiter + windowsRoot,
+        redactedPrefix + "\ufeff" + delimiter + windowsRoot,
+      ] as const),
+      ...([
+        ["space", " "],
+        ["tab", "\t"],
+        ["non-breaking space", "\u00a0"],
+      ] as const).map(([name, whitespace]) => [
+        name + " before pipe remains a whitespace boundary",
+        prefix + whitespace + "|" + windowsRoot,
+        redactedPrefix + whitespace + "|" + windowsRoot,
+      ] as const),
+      [
+        "semicolon instead of a handoff delimiter stays readable",
+        prefix + ";" + windowsRoot,
+        redactedPrefix + ";" + windowsRoot,
+      ],
+      [
+        "ordinary text instead of a handoff delimiter stays readable",
+        prefix + "x" + windowsRoot,
+        redactedPrefix + "x" + windowsRoot,
+      ],
+    ];
+
+    it.each(cases)("%s on every pass", (_name, input, expected) => {
+      const first = sanitizeError(input);
+      const second = sanitizeError(first);
+      const third = sanitizeError(second);
+
+      expect(first).toBe(expected);
+      expect(second).toBe(expected);
+      expect(third).toBe(expected);
+    });
+  });
+
+
   describe("Bug #917", () => {
     const matrix: Array<readonly [string, string, string]> = (["'", '"'] as const).flatMap(
       (quote) =>
