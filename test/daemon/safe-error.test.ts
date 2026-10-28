@@ -5145,6 +5145,140 @@ describe("sanitizeError", () => {
         redactedPostClose + "?key=plain][https://other?key=<path>]",
       );
     });
+
+    it.each(
+      (["", "\u200b", "\u200c", "\u200d", "\u2060"] as const).flatMap(
+        (interposer) =>
+          (["|", "&"] as const).map((delimiter) => [
+            `${interposer === "" ? "immediate" : "invisible-run"} ${delimiter} handoff`,
+            integratedInheritedPrefix +
+              interposer +
+              delimiter +
+              "\\Users\\CANARY\\x([https://first?key=plain]" +
+              "[https://second?key=/home/B/y]",
+            integratedRedactedPrefix +
+              interposer +
+              delimiter +
+              "<path>?key=plain][https://second?key=<path>]",
+          ] as const),
+      ),
+    )("retains original inherited adjacency for %s", (_name, input, expected) => {
+      assertStable(input, expected);
+    });
+
+    it.each([
+      [
+        "private-relative value after an ampersand handoff",
+        integratedInheritedPrefix +
+          "&\\Users\\CANARY\\x[https://first?key=plain]" +
+          "[https://second?a=1&later/home/B/y]",
+        integratedRedactedPrefix +
+          "&<path>?key=plain][https://second?a=1&later<path>]",
+      ],
+      [
+        "drive value after an invisible pipe handoff",
+        integratedInheritedPrefix +
+          "\u200b|\\Users\\CANARY\\x([https://first?key=plain]" +
+          "[https://second?key=C:/Users/B/y]",
+        integratedRedactedPrefix +
+          "\u200b|<path>?key=plain][https://second?key=<path>]",
+      ],
+      [
+        "rooted successor without an opening parenthesis",
+        integratedInheritedPrefix +
+          "|/Users/CANARY/x[https://first?key=plain]" +
+          "[https://second?key=/var/data]",
+        integratedRedactedPrefix +
+          "|<path>?key=plain][https://second?key=<path>]",
+      ],
+      [
+        "private-root relative successor",
+        integratedInheritedPrefix +
+          "|later/Users/CANARY/x([https://first?key=plain]" +
+          "[https://second?key=/home/B/y]",
+        integratedRedactedPrefix +
+          "|later<path>?key=plain][https://second?key=<path>]",
+      ],
+    ] as const)("retains the inherited-adjacency variant: %s", (_name, input, expected) => {
+      assertStable(input, expected);
+    });
+
+    it.each([
+      [
+        "soft-whitespace origin",
+        postClose +
+          "\u00a0([https://first?key=/Users/A/x]" +
+          "[https://second?key=/home/B/y]",
+        redactedPostClose + "?key=<path>][https://second?key=/home/B/y]",
+      ],
+      [
+        "later-successor origin",
+        inherited +
+          "&second/Users/B/x([https://first?key=/Users/A/x]" +
+          "[https://second?key=/home/B/y]]",
+        redactedInherited +
+          "&second<path>?key=<path>][https://second?key=/home/B/y]]",
+      ],
+      [
+        "restarted-wrapper origin",
+        "file://h?x=[a]\\b([https://first?key=/Users/A/x]" +
+          "[https://second?key=/home/B/y]",
+        "file://h?x=[a]<path>?key=<path>][https://second?key=/home/B/y]",
+      ],
+      [
+        "active-child origin",
+        activeChild +
+          "&later/home/alice/s([https://first?key=/Users/A/x]" +
+          "[https://second?key=/home/B/y]",
+        "file://h?x=[file://<path>&later<path>?key=<path>]" +
+          "[https://second?key=/home/B/y]",
+      ],
+    ] as const)("limits %s to its first component", (_name, input, expected) => {
+      assertStable(input, expected);
+    });
+
+    it.each([
+      [
+        "direct post-close owner",
+        postClose +
+          "([https://first?key=plain][https://second?key=XY:/Users/B/y]",
+        redactedPostClose +
+          "?key=plain][https://second?key=XY:/Users/B/y]",
+      ],
+      [
+        "immediate inherited owner",
+        inherited +
+          "([https://first?key=/Users/A/x]" +
+          "[https://second?key=XY:/Users/B/y]",
+        redactedInherited +
+          "?key=<path>][https://second?key=XY:/Users/B/y]",
+      ],
+      [
+        "soft-whitespace owner",
+        postClose +
+          "\u00a0([https://first?key=/Users/A/x]" +
+          "[https://second?key=mailto:/Users/B/y]",
+        redactedPostClose +
+          "?key=<path>][https://second?key=mailto:/Users/B/y]",
+      ],
+    ] as const)("keeps second-component colon text for %s", (_name, input, expected) => {
+      assertStable(input, expected);
+    });
+
+    it.each([
+      [
+        "single-segment restarted slash tail",
+        "file://h?x=[a]/b([https://inner?key=\\server\\share\\secret]",
+        "file://h?x=[a]<path>?key=\\server\\share\\secret]",
+      ],
+      [
+        "multi-segment restarted slash tail",
+        "file://h?x=[a]/bc/de([https://inner?key=\\server\\share\\secret]",
+        "file://h?x=[a]<path>?key=\\server\\share\\secret]",
+      ],
+    ] as const)("keeps the base UNC value for a %s", (_name, input, expected) => {
+      assertStable(input, expected);
+    });
   });
 
   describe("Bug #1789", () => {

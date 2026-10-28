@@ -732,10 +732,13 @@ bundle and keep provider, credential, quarantine, and recovery sessions private.
   component, a colon followed by one slash and a path word redacts from that
   slash while preserving the prefix, such as `label:<path>`. A `://` authority,
   a slash with no following path word, ordinary relative text, and public or
-  opaque URL values remain readable. For these additional tail shapes, a
-  component whose query stays plain does not pass ownership into an adjacent
-  component; a rooted value claimed inside the component retains the adjacent
-  ownership already described above.
+  opaque URL values remain readable. For these additional tail shapes, newly
+  admitted ownership is limited to the first bracket component, even when that
+  component contains a rooted value. Adjacent components and Windows
+  backslash values that were previously readable keep their existing
+  classification. The original direct post-close and immediate inherited
+  owners retain their established multi-component coverage. Colon-single-slash
+  redaction is likewise limited to the first eligible component.
 
   An exact nested `file://` child inside a public URL that began at a quote can
   inherit that enclosing quote through its matching close. This removes a
