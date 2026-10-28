@@ -17,6 +17,7 @@ import {
   createLockContentionDeadlineBudget,
   createLockContentionWaitBudget,
   isLiveForeignLockContention,
+  isLiveLockContention,
   LIVE_LOCK_RETRY_DELAY_MS,
   retryWhileLiveLockContended,
   PrivateMutationLockContentionError,
@@ -1084,6 +1085,47 @@ describe("retrying a lock that a live foreign process holds", () => {
     expect(isLiveForeignLockContention(new TimeoutContention("timed out"))).toBe(false);
     expect(isLiveForeignLockContention(new Error("other"))).toBe(false);
     expect(isLiveForeignLockContention("busy")).toBe(false);
+  });
+
+  it("recognizes a live owner in this process as well as in another one", () => {
+    expect(isLiveLockContention(liveContention())).toBe(true);
+    expect(isLiveLockContention(liveContention(process.pid))).toBe(true);
+    // Ambiguous owners, reclaimers and nested daemon admissions carry no contendedLock.
+    expect(isLiveLockContention(new PrivateMutationLockContentionError("ambiguous owner"))).toBe(false);
+    class TimeoutContention extends PrivateMutationLockContentionError {}
+    expect(isLiveLockContention(new TimeoutContention("timed out"))).toBe(false);
+    expect(isLiveLockContention(new Error("other"))).toBe(false);
+    expect(isLiveLockContention("busy")).toBe(false);
+  });
+
+  it("retries a live owner in this process only when the caller's policy accepts it", async () => {
+    let accepted = 0;
+    await retryWhileLiveLockContended(() => {
+      accepted += 1;
+      if (accepted === 1) throw liveContention(process.pid);
+    }, {
+      budget: createLockContentionWaitBudget(1000),
+      isRetryable: isLiveLockContention,
+      _wait: recordWait,
+    });
+    expect(accepted).toBe(2);
+    expect(waits).toEqual([LIVE_LOCK_RETRY_DELAY_MS]);
+
+    // The default policy still refuses to wait for this process.
+    let refused = 0;
+    await expect(retryWhileLiveLockContended(() => {
+      refused += 1;
+      throw liveContention(process.pid);
+    }, { budget: createLockContentionWaitBudget(1000), _wait: recordWait })).rejects.toThrow("busy");
+    expect(refused).toBe(1);
+
+    // The policy can also decline contention the default would retry.
+    let declined = 0;
+    await expect(retryWhileLiveLockContended(() => {
+      declined += 1;
+      throw liveContention();
+    }, { budget: createLockContentionWaitBudget(1000), isRetryable: () => false, _wait: recordWait })).rejects.toThrow("busy");
+    expect(declined).toBe(1);
   });
 
   it("returns the step result without waiting when the lock is free", async () => {

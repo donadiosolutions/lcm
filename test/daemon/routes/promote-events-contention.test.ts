@@ -31,7 +31,7 @@ const contention = (pid: number): PrivateMutationLockContentionError => new Priv
 );
 /** Another process, such as a hook, holds the lock: the request may wait for it. */
 const foreignOwner = (): PrivateMutationLockContentionError => contention(process.pid + 1);
-/** This daemon holds the lock (the sweep's sidecar scan, for example): waiting could never help. */
+/** This daemon holds the lock (the sweep's sidecar scan, for example): the request waits for it like any live owner. */
 const sameProcessOwner = (): PrivateMutationLockContentionError => contention(process.pid);
 
 type Harness = {
@@ -142,8 +142,8 @@ async function withDaemon(
 afterEach(() => vi.restoreAllMocks());
 
 describe("promote-events while publication work holds the lock (#1684)", () => {
-  it.each(PROMOTE_ROUTES)("%s answers a busy 503 at once while this process holds the lock", async (path) => {
-    await withDaemon({}, async (harness) => {
+  it.each(PROMOTE_ROUTES)("%s answers a busy 503 once the wait for this process's lock is spent", async (path) => {
+    await withDaemon({ options: { _routeAdmissionWaitMs: 100 } }, async (harness) => {
       await harness.holdLock();
       const response = await harness.post(path);
 
@@ -184,7 +184,16 @@ describe("promote-events while publication work holds the lock (#1684)", () => {
     "%s answers a busy 503, not a result, when a later admission is contended",
     async (path) => {
       // The pre-handler probe is admitted; every admission inside the handler is refused.
-      await withDaemon({ refusal: (attempt) => (attempt === 1 ? undefined : sameProcessOwner()) }, async (harness) => {
+      // Each refused attempt moves the clock 50 ms, as one pause would.
+      let now = 0;
+      await withDaemon({
+        refusal: (attempt) => {
+          if (attempt === 1) return undefined;
+          now += 50;
+          return sameProcessOwner();
+        },
+        options: { _routeAdmissionWaitMs: 100, _routeAdmissionNow: () => now },
+      }, async (harness) => {
         const response = await harness.post(path);
 
         expect(response.status).toBe(503);
@@ -249,7 +258,7 @@ describe("promote-events while publication work holds the lock (#1684)", () => {
 
   it("leaves other operation-scoped routes answering 500 for the same contention", async () => {
     await withDaemon({ refusal: () => sameProcessOwner() }, async (harness) => {
-      expect((await harness.post("/store")).status).toBe(500);
+      expect((await harness.post("/promote")).status).toBe(500);
       expect(harness.lockCalls()).toBe(1);
     });
   });

@@ -10,12 +10,12 @@ import {
   type BackendPublicationLockToken,
 } from "../../../src/storage/backend-publication.js";
 
-const liveContention = (): PrivateMutationLockContentionError => new PrivateMutationLockContentionError(
+const liveContention = (pid = process.pid + 1): PrivateMutationLockContentionError => new PrivateMutationLockContentionError(
   "backend publication mutation is already in progress (owned by live PID)",
   {
     contendedLock: {
       path: "/lcm/publication.lock",
-      owner: { version: 1, pid: process.pid + 1, processStartTime: null, nonce: "owner" },
+      owner: { version: 1, pid, processStartTime: null, nonce: "owner" },
     },
   },
 );
@@ -103,6 +103,15 @@ describe("capture route admission while a live process holds the publication loc
     });
   });
 
+  it.each(["/ingest", "/restore"])("admits %s after a live owner in the daemon's own process releases the lock", async (path) => {
+    await withDaemon({ refusal: (attempt) => (attempt <= 2 ? liveContention(process.pid) : undefined) }, async (harness) => {
+      const response = await harness.post(path);
+
+      expect(response.status).toBeLessThan(500);
+      expect(harness.lockCalls()).toBeGreaterThanOrEqual(3);
+    });
+  });
+
   it.each(["/ingest", "/restore"])("stops waiting for %s once its allowance is spent", async (path) => {
     // Each refused attempt moves the clock 50 ms, as one pause would.
     let now = 0;
@@ -158,9 +167,9 @@ describe("capture route admission while a live process holds the publication loc
     });
   });
 
-  it("does not wait for routes that did not opt in", async () => {
+  it("does not wait for operation-scoped routes that did not opt in", async () => {
     await withDaemon({ refusal: () => liveContention() }, async (harness) => {
-      expect((await harness.post("/store")).status).toBe(500);
+      expect((await harness.post("/promote")).status).toBe(500);
       expect(harness.lockCalls()).toBe(1);
     });
   });

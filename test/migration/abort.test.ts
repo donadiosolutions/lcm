@@ -1,4 +1,4 @@
-import { chmodSync, mkdirSync, mkdtempSync, readFileSync, rmSync } from "node:fs";
+import { chmodSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, describe, expect, it } from "vitest";
@@ -8,7 +8,7 @@ import {
   completePendingMigrationAbort,
   performMigrationAbort,
 } from "../../src/migration/abort.js";
-import { MigrationManifestStore } from "../../src/migration/manifest-store.js";
+import { MigrationManifestStore, migrationManifestGenerationDirectory } from "../../src/migration/manifest-store.js";
 import {
   beginMigrationEffect,
   completeMigrationEffect,
@@ -157,6 +157,68 @@ describe("performMigrationAbort (section 4.6, completes whichever write is missi
     expect(settledManifest.phase).toBe("aborted");
     const settledJournal = readBackendMaintenanceJournal(home)!;
     expect(settledJournal.phase).toBe("maintenance-aborted");
+  });
+
+  it("proceeds on a settled head whose immediate successor is an unpublished empty directory (#1772)", async () => {
+    const home = makeHome();
+    const held = await heldJournal(home);
+    const store = new MigrationManifestStore({ homeDir: home });
+    store.create(manifest());
+    mkdirSync(join(migrationManifestGenerationDirectory("generation-1", home), "revisions", "0000000000000001"), { mode: 0o700 });
+
+    const result = await performMigrationAbort({
+      homeDir: home, coordinator: coordinatorFor(home), journal: held, abortEvidenceSha256: "c".repeat(64), manifestStore: store,
+    });
+    expect(result).toEqual({ status: "completed", mutated: true });
+    expect(store.read("generation-1").phase).toBe("aborted");
+    expect(readBackendMaintenanceJournal(home)!.phase).toBe("maintenance-aborted");
+  });
+
+  it("refuses before any journal write when the immediate successor holds a scratch for a different candidate (#1772)", async () => {
+    const home = makeHome();
+    const held = await heldJournal(home);
+    const initial = manifest();
+    const store = new MigrationManifestStore({ homeDir: home });
+    store.create(initial);
+    const other = beginMigrationEffect(initial, {
+      effectId: "e".repeat(64), kind: "verify-dry-run", inputSha256: "f".repeat(64), startedAt: CREATED_AT,
+    });
+    const successor = join(migrationManifestGenerationDirectory("generation-1", home), "revisions", "0000000000000001");
+    mkdirSync(successor, { mode: 0o700 });
+    writeFileSync(join(successor, "." + other.checksumSha256 + ".json." + "a".repeat(24) + ".tmp"), JSON.stringify(other).slice(0, 40), { mode: 0o600 });
+    const journalBefore = readFileSync(backendPublicationJournalPath(home));
+
+    const result = await performMigrationAbort({
+      homeDir: home, coordinator: coordinatorFor(home), journal: held, abortEvidenceSha256: "c".repeat(64), manifestStore: store,
+    });
+    expect(result).toEqual({ status: "refuse", evidence: "manifest-recovery-required", mutated: false });
+    expect(readFileSync(backendPublicationJournalPath(home)).equals(journalBefore)).toBe(true);
+    expect(readBackendMaintenanceJournal(home)!.phase).toBe("maintenance-held");
+  });
+
+  it("still refuses before any journal write when the immediate successor already holds a manifest (#1772)", async () => {
+    const home = makeHome();
+    const held = await heldJournal(home);
+    const initial = manifest();
+    new MigrationManifestStore({ homeDir: home }).create(initial);
+    const candidate = beginMigrationEffect(initial, {
+      effectId: "e".repeat(64), kind: "verify-dry-run", inputSha256: "f".repeat(64), startedAt: CREATED_AT,
+    });
+    const crashing = new MigrationManifestStore({
+      homeDir: home,
+      observer: (event) => {
+        if (event === "after-revision-publication") throw new Error("crash:orphan-successor");
+      },
+    });
+    expect(() => crashing.update("generation-1", initial.checksumSha256, () => candidate)).toThrow("crash:orphan-successor");
+    const journalBefore = readFileSync(backendPublicationJournalPath(home));
+
+    const result = await performMigrationAbort({
+      homeDir: home, coordinator: coordinatorFor(home), journal: held, abortEvidenceSha256: "c".repeat(64),
+      manifestStore: new MigrationManifestStore({ homeDir: home }),
+    });
+    expect(result).toEqual({ status: "refuse", evidence: "manifest-recovery-required", mutated: false });
+    expect(readFileSync(backendPublicationJournalPath(home)).equals(journalBefore)).toBe(true);
   });
 
   it("is idempotent under repetition once re-invoked with the already-terminal journal read fresh from disk (red: proven by a real second and third call, not asserted)", async () => {
