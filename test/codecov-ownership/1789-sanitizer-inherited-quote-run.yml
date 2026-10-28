@@ -1,0 +1,7 @@
+references: ["#1789"]
+rationale: >-
+  #1789 makes sanitizeError redact inherited-quote successors after supported
+  invisible-character runs and named backslash values on the first pass;
+  safe-error.ts keeps its established owner.
+pins:
+  - ["src/daemon/safe-error.ts", "unit-daemon-core"]

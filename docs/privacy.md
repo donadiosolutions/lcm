@@ -742,18 +742,24 @@ bundle and keep provider, credential, quarantine, and recovery sessions private.
   space-bearing private path and any suffix inside the quote on the first pass,
   while preserving text after the close. An immediately quoted child keeps its
   own quote. Inside a bracketed file query, the matching quote restores the
-  enclosing owner only when `&` or `|` immediately follows it. Whitespace
-  before the delimiter prevents that handoff, and whitespace between the
-  delimiter and the successor resets ownership; in both cases a Windows
-  backslash-rooted value stays readable unless another path rule applies. Within
-  the same uninterrupted wrapper after an immediate rooted handoff, immediate
-  and later supported rooted, named Windows, and recognized private-root
-  successors redact on the same pass. Bracketed components that follow a
-  redacted successor follow the tail rules above, and inside them a
-  private-root relative value after `&` or `|` is also redacted on the first
-  pass. Ordinary relative and public-URL successors remain readable. Unquoted
-  URLs, embedded URLs whose scheme did not begin at the quote, unmatched
-  quotes, and newlines retain their existing boundaries.
+  enclosing owner when `&` or `|` immediately follows it, including when the
+  quote and delimiter are separated only by a run of U+200B, U+200C, U+200D,
+  or U+2060. Whitespace, including U+FEFF, before the delimiter prevents that
+  handoff, and whitespace between the delimiter and the successor resets
+  ownership; in both cases a Windows backslash-rooted value stays readable
+  unless another path rule applies. One or more `=` characters after the
+  matching quote also redact an immediately adjacent Windows backslash-rooted
+  value on the first pass. Relative, public-URL, and plain values after `=`
+  stay readable, as do backslash-rooted values separated from `=` by whitespace
+  or one of the listed invisible characters. Within the same uninterrupted
+  wrapper after an immediate rooted handoff, immediate and later supported
+  rooted, named Windows, and recognized private-root successors redact on the
+  same pass. Bracketed components that follow a redacted successor follow the
+  tail rules above, and inside them a private-root relative value after `&` or
+  `|` is also redacted on the first pass. Ordinary relative and public-URL
+  successors remain readable. Unquoted URLs, embedded URLs whose scheme did
+  not begin at the quote, unmatched quotes, and newlines retain their existing
+  boundaries.
 
   Root-relative Windows values after opaque wrapper text remain conservatively
   redacted. LCM does not expose such private-looking values merely because URL
