@@ -4934,6 +4934,21 @@ describe("sanitizeError", () => {
         "file://h?x=[file:///Users/CHILD/x&later\\/home/a&second/var/b&third\\/var/c]",
         "file://h?x=[file://<path>&later\\<path>&second/var/b&third\\<path>]",
       ],
+      [
+        "glued independent target copies",
+        "file://h?x=[file:///Users/CHILD/x&later\\/home/alice]file://h?x=[file:///Users/CHILD/x&later\\/home/alice]",
+        "file://h?x=[file://<path>&later\\<path>]file://h?x=[file://<path>&later\\<path>]",
+      ],
+      [
+        "space-separated independent target copies",
+        "file://h?x=[file:///Users/CHILD/x&later\\/home/alice] file://h?x=[file:///Users/CHILD/x&later\\/home/alice]",
+        "file://h?x=[file://<path>&later\\<path>] file://h?x=[file://<path>&later\\<path>]",
+      ],
+      [
+        "newline-separated independent target copies",
+        "file://h?x=[file:///Users/CHILD/x&later\\/home/alice]\nfile://h?x=[file:///Users/CHILD/x&later\\/home/alice]",
+        "file://h?x=[file://<path>&later\\<path>]\nfile://h?x=[file://<path>&later\\<path>]",
+      ],
     ];
 
     const reviewedPassSequences: ReadonlyArray<
@@ -4966,6 +4981,41 @@ describe("sanitizeError", () => {
         "file://h?x=[file://<path>&=x&later\\/home/alice]",
         "file://h?x=[file://<path>&=x&later\\<path>]",
         "file://h?x=[file://<path>&=x&later\\<path>]",
+      ],
+      [
+        "colon-stop XY successor",
+        "file://h?x=[file:///Users/CHILD/x&later\\/XY:/Users/S/s]",
+        "file://h?x=[file://<path>&later\\/XY:/Users/S/s]",
+        "file://h?x=[file://<path>&later\\<path>:<path>]",
+        "file://h?x=[file://<path>&later\\<path>:<path>]",
+      ],
+      [
+        "colon-stop mailto successor",
+        "file://h?x=[file:///Users/CHILD/x&later\\/mailto:/Users/S/s]",
+        "file://h?x=[file://<path>&later\\/mailto:/Users/S/s]",
+        "file://h?x=[file://<path>&later\\<path>:<path>]",
+        "file://h?x=[file://<path>&later\\<path>:<path>]",
+      ],
+      [
+        "invalid numeric authority prefix",
+        "file://h?x=[file:///Users/CHILD/x&later\\/1://Users/S/s]",
+        "file://h?x=[file://<path>&later\\/1://Users/S/s]",
+        "file://h?x=[file://<path>&later\\<path>:<path>]",
+        "file://h?x=[file://<path>&later\\<path>:<path>]",
+      ],
+      [
+        "claimed sibling before refused forward drive",
+        "file://h?x=[file:///Users/CHILD/x&later\\/home/a&later\\/C:/Users/x]",
+        "file://h?x=[file://<path>&later\\<path>&later\\/C:/Users/x]",
+        "file://h?x=[file://<path>&later\\<path>&later\\<path>:<path>]",
+        "file://h?x=[file://<path>&later\\<path>&later\\<path>:<path>]",
+      ],
+      [
+        "claimed sibling before refused file URL",
+        "file://h?x=[file:///Users/CHILD/x&later\\/home/a&later\\/file:///Users/NEST/x]",
+        "file://h?x=[file://<path>&later\\<path>&later\\/file://<path>]",
+        "file://h?x=[file://<path>&later\\<path>&later\\<path><path>]",
+        "file://h?x=[file://<path>&later\\<path>&later\\<path><path>]",
       ],
     ];
 

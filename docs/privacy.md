@@ -700,11 +700,14 @@ bundle and keep provider, credential, quarantine, and recovery sessions private.
   separator run that starts with `\`, also contains `/`, and then has another
   path word. The label and any preceding backslashes remain visible;
   backslash-only runs and runs without a following path word remain unchanged.
-  When the text after that slash is a Windows drive path, the slash stays
-  visible and redaction begins at the drive root. An intervening public-URL
-  successor keeps a later mixed-separator successor on its existing visibility
-  boundary. Following bracketed text continues to use its existing query and
-  bracket redaction rules rather than inheriting new ownership from this case.
+  When the text after that slash is a backslash-drive path such as
+  `C:\Users\x`, the slash stays visible and redaction begins at the drive root.
+  A forward-slash drive such as `C:/Users/x` keeps its existing first-pass
+  boundary and converges under the established later-pass rules. An intervening
+  public-URL successor keeps a later mixed-separator successor on its existing
+  visibility boundary. Following bracketed text continues to use its existing
+  query and bracket redaction rules rather than inheriting new ownership from
+  this case.
   If another successor intervenes before that bracket, the existing multi-pass
   boundary is retained instead of claiming the mixed-separator successor early.
 
