@@ -168,6 +168,10 @@ same npm channel-ordering guard as the workflows. Manual helper versions may use
 remain unsupported. The draft-run wait defaults to 900 seconds; override it with
 `PUBLISH_MAX_WAIT=<non-negative integer seconds>` when needed.
 
+When `CHANGELOG.md` is absent, the manual helper creates it with the
+Changesets heading (`# <package name>`) before adding the release block;
+Changesets version PRs create the file themselves.
+
 Before running the manual helper, configure Git tag signing with an available
 signing key and agent, and confirm that local signed-tag creation and signature
 verification succeed with the trusted public key.
