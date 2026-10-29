@@ -162,15 +162,37 @@ function assertOwnedCluster(cluster, ownership) {
   }
 }
 
-function allowlistedCluster(cluster) {
+// The machines reach the cluster over the internet through the trusted-IPv4 firewall, so
+// they use the public endpoint, which DigitalOcean reports under connection.
+function publicEndpoint(cluster) {
+  const host = cluster?.connection?.host;
+  const port = cluster?.connection?.port;
+  if (typeof host !== "string" || host.length === 0 || !Number.isInteger(port) || port < 1 || port > 65535) {
+    throw new Error("DigitalOcean cluster connection endpoint is malformed");
+  }
+  return { host, port };
+}
+
+function allowlistedCluster(cluster, endpoint) {
   return {
     id: cluster.id,
     name: cluster.name,
-    host: cluster.host,
-    port: cluster.port,
+    host: endpoint.host,
+    port: endpoint.port,
     status: cluster.status,
     tags: [...cluster.tags].sort(),
   };
+}
+
+// GET /v2/databases/{id}/ca returns ca.certificate as base64-encoded PEM. Raw PEM is passed
+// on unchanged; anything else must be strict base64 that decodes to a whole certificate.
+function certificatePem(value) {
+  if (typeof value !== "string") return undefined;
+  if (value.includes("BEGIN CERTIFICATE")) return value;
+  const compact = value.replace(/\s+/gu, "");
+  if (!/^[A-Za-z0-9+/]+={0,2}$/u.test(compact)) return undefined;
+  const decoded = Buffer.from(compact, "base64").toString("utf8");
+  return decoded.includes("-----BEGIN CERTIFICATE-----") && decoded.includes("-----END CERTIFICATE-----") ? decoded : undefined;
 }
 
 function databaseUrl(user, password, host, port, database) {
@@ -185,8 +207,9 @@ export async function listByTag(client, tag) {
     const body = response.body;
     if (body === null || typeof body !== "object" || Array.isArray(body)) throw new Error("DigitalOcean database list is malformed");
     // DigitalOcean answers a tag that matches no cluster with HTTP 200 and {"databases": null},
-    // without links or meta. A missing key reads the same; any other non-array is malformed.
-    const listed = response.status === 200 ? (body.databases ?? []) : body.databases;
+    // without links or meta. Only that explicit null reads as empty: a missing key or an empty
+    // body never confirms an empty tag, and any other non-array is malformed.
+    const listed = response.status === 200 && Object.hasOwn(body, "databases") && body.databases === null ? [] : body.databases;
     if (!Array.isArray(listed)) throw new Error("DigitalOcean database list is malformed");
     databases.push(...listed);
     const next = response.body.links?.pages?.next;
@@ -305,11 +328,13 @@ async function runDigitalOceanLifecycleCore({
   if (typeof ownership.id !== "string" || ownership.id.length === 0) throw new Error("DigitalOcean create response omitted the cluster ID");
   let useResult;
   let online;
+  let endpoint;
   let primaryError;
   try {
     receipt.commit({ version: 1, ...ownership });
     assertOwnedCluster(cluster, ownership);
     online = await waitOnline(client, ownership, guard, delay);
+    endpoint = publicEndpoint(online);
     guard();
     const rules = [{ type: "ip_addr", value: trustedIpv4 }];
     await client.request("PUT", `/v2/databases/${ownership.id}/firewall`, { rules });
@@ -322,8 +347,8 @@ async function runDigitalOceanLifecycleCore({
     const migratorName = `lcm_cert_migrator_${runId}`.slice(0, 63);
     const runtimeName = `lcm_cert_runtime_${runId}`.slice(0, 63);
     const caResponse = await client.request("GET", `/v2/databases/${ownership.id}/ca`);
-    const ca = caResponse.body?.ca?.certificate ?? caResponse.body?.ca;
-    if (typeof ca !== "string" || !ca.includes("BEGIN CERTIFICATE")) throw new Error("DigitalOcean CA response is malformed");
+    const ca = certificatePem(caResponse.body?.ca?.certificate ?? caResponse.body?.ca);
+    if (ca === undefined) throw new Error("DigitalOcean CA response is malformed");
     guard();
     await client.request("POST", `/v2/databases/${ownership.id}/dbs`, { name: databaseName });
     guard();
@@ -332,8 +357,8 @@ async function runDigitalOceanLifecycleCore({
     const runtimeResponse = await client.request("POST", `/v2/databases/${ownership.id}/users`, { name: runtimeName });
     const migrator = migratorResponse.body.user;
     const runtime = runtimeResponse.body.user;
-    const adminUser = createdCluster.user ?? createdCluster.connection?.user;
-    const adminPassword = createdCluster.password ?? createdCluster.connection?.password;
+    const adminUser = online.connection?.user ?? createdCluster.user ?? createdCluster.connection?.user;
+    const adminPassword = online.connection?.password ?? createdCluster.password ?? createdCluster.connection?.password;
     if (![adminUser, adminPassword, migrator?.name, migrator?.password, runtime?.name, runtime?.password]
       .every((value) => typeof value === "string" && value.length > 0)) {
       throw new Error("DigitalOcean database credentials are incomplete");
@@ -343,9 +368,9 @@ async function runDigitalOceanLifecycleCore({
       databaseName,
       migratorName,
       runtimeName,
-      adminUrl: databaseUrl(adminUser, adminPassword, online.host, online.port, databaseName),
-      migratorUrl: databaseUrl(migrator.name, migrator.password, online.host, online.port, databaseName),
-      runtimeUrl: databaseUrl(runtime.name, runtime.password, online.host, online.port, databaseName),
+      adminUrl: databaseUrl(adminUser, adminPassword, endpoint.host, endpoint.port, databaseName),
+      migratorUrl: databaseUrl(migrator.name, migrator.password, endpoint.host, endpoint.port, databaseName),
+      runtimeUrl: databaseUrl(runtime.name, runtime.password, endpoint.host, endpoint.port, databaseName),
     };
     for (const value of [privateConnection.adminUrl, privateConnection.migratorUrl, privateConnection.runtimeUrl]) {
       client.registerSecret(value);
@@ -357,7 +382,7 @@ async function runDigitalOceanLifecycleCore({
     const workloadDeadline = setTimeout(() => workloadController.abort(new Error("DigitalOcean certification stop-new-work deadline reached")), remainingWorkMs);
     try {
       const workloadSignal = signal ? AbortSignal.any([workloadController.signal, signal]) : workloadController.signal;
-      useResult = await useCluster(allowlistedCluster(online), privateConnection, { signal: workloadSignal });
+      useResult = await useCluster(allowlistedCluster(online, endpoint), privateConnection, { signal: workloadSignal });
     } finally {
       clearTimeout(workloadDeadline);
     }
@@ -383,7 +408,7 @@ async function runDigitalOceanLifecycleCore({
     primaryError.providerCleanup = providerCleanup;
     throw primaryError;
   }
-  return { cluster: allowlistedCluster(online), result: useResult, cleanup: providerCleanup };
+  return { cluster: allowlistedCluster(online, endpoint), result: useResult, cleanup: providerCleanup };
 }
 
 export async function runDigitalOceanLifecycle(input) {

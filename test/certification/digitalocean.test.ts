@@ -17,6 +17,11 @@ const json = (value: unknown, status = 200) => new Response(JSON.stringify(value
   status,
   headers: { "content-type": "application/json" },
 });
+// The documented provider shapes: the CA endpoint returns base64-encoded PEM, and a
+// cluster reports its host, port and admin credentials under connection.
+const providerPem = "-----BEGIN CERTIFICATE-----\nprovider\n-----END CERTIFICATE-----\n";
+const providerCa = Buffer.from(providerPem).toString("base64");
+const base64 = (text: string) => Buffer.from(text).toString("base64");
 describe("certification DigitalOcean lifecycle", () => {
   it("reads a token only from a private regular file", () => {
     const directory = mkdtempSync(join(tmpdir(), "lcm-cert-do-token-"));
@@ -83,11 +88,8 @@ describe("certification DigitalOcean lifecycle", () => {
 
   // The real API answers a tag that matches no cluster with HTTP 200 and
   // {"databases": null}, without links or meta.
-  it.each([
-    ["null", { databases: null }],
-    ["missing", {}],
-  ])("reads a 200 page whose database list is %s as an empty tag", async (_name, body) => {
-    const request = vi.fn(async () => ({ status: 200, body }));
+  it("reads a 200 page whose database list is null as an empty tag", async () => {
+    const request = vi.fn(async () => ({ status: 200, body: { databases: null } }));
     await expect(listByTag({ request } as any, "lcm-cert")).resolves.toEqual([]);
     expect(request).toHaveBeenCalledTimes(1);
     expect(request).toHaveBeenCalledWith("GET", "/v2/databases?tag_name=lcm-cert&per_page=200");
@@ -101,6 +103,7 @@ describe("certification DigitalOcean lifecycle", () => {
     ["a string body", 200, "x"],
     ["an array body", 200, []],
     ["a null body", 200, null],
+    ["no databases key", 200, {}],
     ["no list on HTTP 204", 204, {}],
   ])("still rejects a page with %s", async (_name, status, body) => {
     const request = vi.fn(async () => ({ status, body }));
@@ -121,15 +124,15 @@ describe("certification DigitalOcean lifecycle", () => {
       const path = new URL(url).pathname + new URL(url).search;
       const body = init.body ? JSON.parse(String(init.body)) : undefined;
       requests.push({ method: init.method!, path, body });
-      if (init.method === "POST" && path === "/v2/databases") return json({ database: { id: "cluster-1", name: body.name, tags: body.tags, status: "online", host: "db.example", port: 25060, user: "doadmin", password: "provider-password", uri: "postgresql://doadmin:provider-password@db.example:25060/defaultdb" } }, 201);
+      if (init.method === "POST" && path === "/v2/databases") return json({ database: { id: "cluster-1", name: body.name, tags: body.tags, status: "online", connection: { host: "db.example", port: 25060, user: "doadmin", password: "provider-password", uri: "postgresql://doadmin:provider-password@db.example:25060/defaultdb" } } }, 201);
       if (init.method === "PUT" && path.endsWith("/firewall")) return json({ rules: body.rules });
       if (init.method === "GET" && path.endsWith("/firewall")) return json({ rules: [{ type: "ip_addr", value: "203.0.113.8", uuid: "rule-1", cluster_uuid: "cluster-1", created_at: "2026-10-26T00:00:00Z" }] });
-      if (init.method === "GET" && path.endsWith("/ca")) return json({ ca: { certificate: "-----BEGIN CERTIFICATE-----\nprovider\n-----END CERTIFICATE-----\n" } });
+      if (init.method === "GET" && path.endsWith("/ca")) return json({ ca: { certificate: providerCa } });
       if (init.method === "POST" && path.endsWith("/dbs")) return json({ db: { name: body.name } }, 201);
       if (init.method === "POST" && path.endsWith("/users")) return json({ user: { name: body.name, password: `${body.name}-password` } }, 201);
-      if (init.method === "GET" && path === "/v2/databases/cluster-1") return deleted ? json({}, 404) : json({ database: { id: "cluster-1", name: "lcm-cert-run12345", tags: ["lcm-cert", "lcm-cert-run-run12345"], status: "online", host: "db.example", port: 25060 } });
+      if (init.method === "GET" && path === "/v2/databases/cluster-1") return deleted ? json({}, 404) : json({ database: { id: "cluster-1", name: "lcm-cert-run12345", tags: ["lcm-cert", "lcm-cert-run-run12345"], status: "online", connection: { host: "db.example", port: 25060, user: "doadmin", password: "provider-password" } } });
       if (init.method === "DELETE" && path === "/v2/databases/cluster-1") { deleted = true; return new Response(null, { status: 204 }); }
-      if (init.method === "GET" && path.includes("tag_name=lcm-cert")) return json({ databases: [] });
+      if (init.method === "GET" && path.includes("tag_name=lcm-cert")) return json({ databases: null });
       throw new Error(`${init.method} ${path}`);
     });
     const client = createDigitalOceanClient({ token: "secret-token", registerSecret: (value: string) => secrets.push(value), fetch: fetch as any });
@@ -158,40 +161,54 @@ describe("certification DigitalOcean lifecycle", () => {
     expect(fetch).toHaveBeenCalledOnce();
   });
 
-  // A complete lifecycle whose family-tag list is answered by familyList, before and
-  // after the owned cluster is deleted.
-  function familyTagLifecycle(familyList: (deleted: boolean) => unknown) {
+  // A complete lifecycle through the real client against a fake API that answers with the
+  // documented shapes: an empty tag is {"databases": null}, the CA is base64 PEM, and the
+  // cluster's host, port and admin credentials sit under connection. familyList answers the
+  // family tag before and after the owned cluster is deleted; a null connection omits it.
+  function documentedLifecycle({
+    familyList = () => ({ databases: null }),
+    ca = providerCa,
+    connection = { host: "db.example", port: 25060, user: "doadmin", password: "admin-pw" },
+    created = { connection: { host: "db.example", port: 25060, user: "doadmin", password: "admin-pw" } },
+  }: {
+    familyList?: (deleted: boolean) => unknown;
+    ca?: string;
+    connection?: Record<string, unknown> | null;
+    created?: Record<string, unknown>;
+  } = {}) {
     const requests: string[] = [];
     let deleted = false;
     const fetch = vi.fn(async (url: string, init: RequestInit) => {
       const parsed = new URL(url);
       const body = init.body ? JSON.parse(String(init.body)) : undefined;
       requests.push(`${init.method} ${parsed.pathname}${parsed.search}`);
-      if (init.method === "GET" && parsed.searchParams.get("tag_name") === "lcm-cert") return json(familyList(deleted));
-      if (init.method === "POST" && parsed.pathname === "/v2/databases") return json({ database: { id: "cluster-1", name: body.name, tags: body.tags, status: "online", host: "db.example", port: 25060, user: "doadmin", password: "pw" } }, 201);
-      if (init.method === "GET" && parsed.pathname === "/v2/databases/cluster-1") return deleted ? json({}, 404) : json({ database: { id: "cluster-1", name: "lcm-cert-run12345", tags: ["lcm-cert", "lcm-cert-run-run12345"], status: "online", host: "db.example", port: 25060 } });
+      if (init.method === "GET" && parsed.searchParams.get("tag_name") === "lcm-cert") {
+        const answer = familyList(deleted);
+        return answer instanceof Response ? answer : json(answer);
+      }
+      if (init.method === "POST" && parsed.pathname === "/v2/databases") return json({ database: { id: "cluster-1", name: body.name, tags: body.tags, status: "creating", ...created } }, 201);
+      if (init.method === "GET" && parsed.pathname === "/v2/databases/cluster-1") return deleted ? json({}, 404) : json({ database: { id: "cluster-1", name: "lcm-cert-run12345", tags: ["lcm-cert", "lcm-cert-run-run12345"], status: "online", ...(connection === null ? {} : { connection }) } });
       if (init.method === "PUT") return json({});
       if (init.method === "GET" && parsed.pathname.endsWith("/firewall")) return json({ rules: [{ type: "ip_addr", value: "203.0.113.8" }] });
-      if (init.method === "GET" && parsed.pathname.endsWith("/ca")) return json({ ca: { certificate: "-----BEGIN CERTIFICATE-----\nca\n-----END CERTIFICATE-----" } });
+      if (init.method === "GET" && parsed.pathname.endsWith("/ca")) return json({ ca: { certificate: ca } });
       if (init.method === "POST" && parsed.pathname.endsWith("/dbs")) return json({ db: { name: body.name } }, 201);
       if (init.method === "POST" && parsed.pathname.endsWith("/users")) return json({ user: { name: body.name, password: "pw" } }, 201);
       if (init.method === "DELETE") { deleted = true; return new Response(null, { status: 204 }); }
       throw new Error(`${init.method} ${url}`);
     });
     const client = createDigitalOceanClient({ token: "token", registerSecret: vi.fn(), fetch: fetch as any });
-    const directory = mkdtempSync(join(tmpdir(), "lcm-cert-do-family-tag-"));
+    const directory = mkdtempSync(join(tmpdir(), "lcm-cert-do-documented-"));
+    const useCluster = vi.fn(async (_cluster: any, _connection: any) => ({}));
     return {
       requests,
-      run: () => runDigitalOceanLifecycle({ client, runId: "run12345", trustedIpv4: "203.0.113.8", receiptPath: join(directory, "receipt"), useCluster: async () => ({}) }),
+      useCluster,
+      run: () => runDigitalOceanLifecycle({ client, runId: "run12345", trustedIpv4: "203.0.113.8", receiptPath: join(directory, "receipt"), useCluster }),
     };
   }
   const familyRequest = "GET /v2/databases?tag_name=lcm-cert&per_page=200";
 
-  it.each([
-    ["null", { databases: null }],
-    ["missing", {}],
-  ])("creates after an empty family preflight and confirms cleanup by an empty family tag when the list is %s", async (_name, emptyList) => {
-    const lifecycle = familyTagLifecycle(() => emptyList);
+  it("creates after an empty family preflight and confirms cleanup by an empty family tag", async () => {
+    const lifecycle = documentedLifecycle();
     const result = await lifecycle.run();
     expect(lifecycle.requests.slice(0, 2)).toEqual([familyRequest, "POST /v2/databases"]);
     expect(lifecycle.requests.filter((request) => request === familyRequest)).toHaveLength(2);
@@ -199,16 +216,88 @@ describe("certification DigitalOcean lifecycle", () => {
     expect(result.cleanup).toMatchObject({ destroyedId: "cluster-1", confirmed404: true, emptyFamilyTag: true });
   });
 
-  it("refuses a malformed family list before create and after delete", async () => {
-    const preflight = familyTagLifecycle(() => ({ databases: {} }));
+  // Only an explicit {"databases": null} reads as empty; a missing key or an empty body
+  // never confirms an empty family tag.
+  it.each([
+    ["databases as an object", () => ({ databases: {} })],
+    ["no databases key", () => ({})],
+    ["an empty 200 body", () => new Response(null, { status: 200 })],
+  ])("refuses a family list with %s before create and after delete", async (_name, malformed) => {
+    const preflight = documentedLifecycle({ familyList: malformed });
     await expect(preflight.run()).rejects.toThrow("DigitalOcean database list is malformed");
     expect(preflight.requests).toEqual([familyRequest]);
-    const teardown = familyTagLifecycle((deleted) => (deleted ? { databases: "x" } : { databases: null }));
+    const teardown = documentedLifecycle({ familyList: (deleted) => (deleted ? malformed() : { databases: null }) });
     await expect(teardown.run()).rejects.toMatchObject({
       message: expect.stringContaining("DigitalOcean cleanup failed for cluster cluster-1"),
       cause: expect.objectContaining({ message: "DigitalOcean database list is malformed" }),
       providerCleanup: expect.objectContaining({ emptyFamilyTag: false }),
     });
+  });
+
+  it("builds every URL and the allowlisted cluster from connection when the cluster has no top-level host or port", async () => {
+    const lifecycle = documentedLifecycle();
+    const result = await lifecycle.run();
+    const [cluster, connection] = lifecycle.useCluster.mock.calls[0];
+    const allowlisted = { id: "cluster-1", name: "lcm-cert-run12345", host: "db.example", port: 25060, status: "online", tags: ["lcm-cert", "lcm-cert-run-run12345"] };
+    expect(cluster).toEqual(allowlisted);
+    expect(result.cluster).toEqual(allowlisted);
+    for (const url of [connection.adminUrl, connection.migratorUrl, connection.runtimeUrl]) expect(new URL(url).host).toBe("db.example:25060");
+  });
+
+  it.each([
+    ["missing", null],
+    ["an empty host", { host: "", port: 25060, user: "doadmin", password: "admin-pw" }],
+    ["a string port", { host: "db.example", port: "25060", user: "doadmin", password: "admin-pw" }],
+    ["port 0", { host: "db.example", port: 0, user: "doadmin", password: "admin-pw" }],
+    ["port 65536", { host: "db.example", port: 65536, user: "doadmin", password: "admin-pw" }],
+  ])("fails closed before building URLs when the connection endpoint is %s", async (_name, connection) => {
+    const lifecycle = documentedLifecycle({ connection });
+    await expect(lifecycle.run()).rejects.toMatchObject({
+      message: "DigitalOcean cluster connection endpoint is malformed",
+      providerCleanup: expect.objectContaining({ confirmed404: true, emptyFamilyTag: true }),
+    });
+    expect(lifecycle.useCluster).not.toHaveBeenCalled();
+    expect(lifecycle.requests).not.toContain("PUT /v2/databases/cluster-1/firewall");
+  });
+
+  it.each([
+    ["base64", providerCa],
+    ["line-wrapped base64", providerCa.replace(/(.{64})/gu, "$1\n")],
+    ["raw PEM", providerPem],
+  ])("passes the provider CA on as PEM when the API returns %s", async (_name, ca) => {
+    const lifecycle = documentedLifecycle({ ca });
+    await lifecycle.run();
+    expect(lifecycle.useCluster.mock.calls[0][1].ca).toBe(providerPem);
+  });
+
+  it.each([
+    ["plain text", "not a certificate!"],
+    ["base64 with a character outside the alphabet", `${providerCa.slice(0, 10)}*${providerCa.slice(10)}`],
+    ["base64 of a PEM without its END line", base64("-----BEGIN CERTIFICATE-----\nprovider\n")],
+    ["base64 of a PEM without its BEGIN line", base64("provider\n-----END CERTIFICATE-----\n")],
+  ])("rejects a provider CA that is %s and still destroys the cluster", async (_name, ca) => {
+    const lifecycle = documentedLifecycle({ ca });
+    await expect(lifecycle.run()).rejects.toMatchObject({
+      message: "DigitalOcean CA response is malformed",
+      providerCleanup: expect.objectContaining({ confirmed404: true, emptyFamilyTag: true }),
+    });
+    expect(lifecycle.useCluster).not.toHaveBeenCalled();
+  });
+
+  it.each([
+    ["the online cluster first", { host: "db.example", port: 25060, user: "online-admin", password: "online-pw" }, "online-admin", "online-pw"],
+    ["the create response when the online cluster has none", { host: "db.example", port: 25060 }, "create-admin", "create-pw"],
+  ])("takes the admin credentials from %s", async (_name, connection, user, password) => {
+    const lifecycle = documentedLifecycle({ connection, created: { connection: { host: "db.example", port: 25060, user: "create-admin", password: "create-pw" } } });
+    await lifecycle.run();
+    const adminUrl = new URL(lifecycle.useCluster.mock.calls[0][1].adminUrl);
+    expect([adminUrl.username, adminUrl.password]).toEqual([user, password]);
+  });
+
+  it("still stops when neither the online cluster nor the create response has admin credentials", async () => {
+    const lifecycle = documentedLifecycle({ connection: { host: "db.example", port: 25060 }, created: { connection: { host: "db.example", port: 25060 } } });
+    await expect(lifecycle.run()).rejects.toThrow("DigitalOcean database credentials are incomplete");
+    expect(lifecycle.useCluster).not.toHaveBeenCalled();
   });
 
   it("surfaces the original create error when reconciliation finds no cluster under the run tag", async () => {
@@ -233,17 +322,17 @@ describe("certification DigitalOcean lifecycle", () => {
     let deleted = false;
     const fetch = vi.fn(async (url: string, init: RequestInit) => {
       const parsed = new URL(url);
-      if (init.method === "GET" && parsed.searchParams.get("tag_name") === "lcm-cert" && postCount === 0) return json({ databases: [] });
+      if (init.method === "GET" && parsed.searchParams.get("tag_name") === "lcm-cert" && postCount === 0) return json({ databases: null });
       if (init.method === "POST" && parsed.pathname === "/v2/databases") { postCount += 1; throw new TypeError("connection lost"); }
-      if (init.method === "GET" && parsed.searchParams.get("tag_name") === "lcm-cert-run-run12345") return json({ databases: [{ id: "cluster-1", name: "lcm-cert-run12345", tags: ["lcm-cert", "lcm-cert-run-run12345"], status: "online", host: "db.example", port: 25060, user: "doadmin", password: "provider-password" }] });
-      if (init.method === "GET" && parsed.pathname === "/v2/databases/cluster-1") return deleted ? json({}, 404) : json({ database: { id: "cluster-1", name: "lcm-cert-run12345", tags: ["lcm-cert", "lcm-cert-run-run12345"], status: "online", host: "db.example", port: 25060 } });
+      if (init.method === "GET" && parsed.searchParams.get("tag_name") === "lcm-cert-run-run12345") return json({ databases: [{ id: "cluster-1", name: "lcm-cert-run12345", tags: ["lcm-cert", "lcm-cert-run-run12345"], status: "online", connection: { host: "db.example", port: 25060, user: "doadmin", password: "provider-password" } }] });
+      if (init.method === "GET" && parsed.pathname === "/v2/databases/cluster-1") return deleted ? json({}, 404) : json({ database: { id: "cluster-1", name: "lcm-cert-run12345", tags: ["lcm-cert", "lcm-cert-run-run12345"], status: "online", connection: { host: "db.example", port: 25060, user: "doadmin", password: "provider-password" } } });
       if (init.method === "PUT") return json({ rules: [{ type: "ip_addr", value: "203.0.113.8" }] });
       if (init.method === "GET" && parsed.pathname.endsWith("/firewall")) return json({ rules: [{ type: "ip_addr", value: "203.0.113.8" }] });
-      if (init.method === "GET" && parsed.pathname.endsWith("/ca")) return json({ ca: { certificate: "-----BEGIN CERTIFICATE-----\nprovider\n-----END CERTIFICATE-----\n" } });
+      if (init.method === "GET" && parsed.pathname.endsWith("/ca")) return json({ ca: { certificate: providerCa } });
       if (init.method === "POST" && parsed.pathname.endsWith("/dbs")) return json({ db: { name: JSON.parse(String(init.body)).name } }, 201);
       if (init.method === "POST" && parsed.pathname.endsWith("/users")) { const name = JSON.parse(String(init.body)).name; return json({ user: { name, password: `${name}-password` } }, 201); }
       if (init.method === "DELETE") { deleted = true; return new Response(null, { status: 204 }); }
-      if (init.method === "GET" && parsed.searchParams.get("tag_name") === "lcm-cert") return json({ databases: [] });
+      if (init.method === "GET" && parsed.searchParams.get("tag_name") === "lcm-cert") return json({ databases: null });
       throw new Error(`${init.method} ${url}`);
     });
     const client = createDigitalOceanClient({ token: "token", registerSecret: vi.fn(), fetch: fetch as any });
@@ -256,7 +345,7 @@ describe("certification DigitalOcean lifecycle", () => {
     let deleted = false;
     const fetch = vi.fn(async (url: string, init: RequestInit) => {
       const parsed = new URL(url);
-      if (init.method === "GET" && parsed.searchParams.has("tag_name")) return json({ databases: [] });
+      if (init.method === "GET" && parsed.searchParams.has("tag_name")) return json({ databases: null });
       if (init.method === "POST" && parsed.pathname === "/v2/databases") return json({ database: { id: "cluster-1", name: "lcm-cert-run12345", tags: ["lcm-cert", "lcm-cert-run-run12345"] } }, 201);
       if (init.method === "GET" && parsed.pathname === "/v2/databases/cluster-1") return deleted ? json({}, 404) : json({ database: { id: "cluster-1", name: "lcm-cert-run12345", tags: ["lcm-cert", "lcm-cert-run-run12345"] } });
       if (init.method === "DELETE") { deleted = true; return new Response(null, { status: 204 }); }
@@ -277,12 +366,12 @@ describe("certification DigitalOcean lifecycle", () => {
     const fetch = vi.fn(async (url: string, init: RequestInit) => {
       const parsed = new URL(url);
       const body = init.body ? JSON.parse(String(init.body)) : undefined;
-      if (init.method === "GET" && parsed.searchParams.has("tag_name")) return json({ databases: [] });
-      if (init.method === "POST" && parsed.pathname === "/v2/databases") return json({ database: { id: "cluster-1", name: body.name, tags: body.tags, status: "online", host: "db.example", port: 25060, user: "doadmin", password: "pw" } }, 201);
-      if (init.method === "GET" && parsed.pathname === "/v2/databases/cluster-1") return deleted ? json({}, 404) : json({ database: { id: "cluster-1", name: "lcm-cert-run12345", tags: ["lcm-cert", "lcm-cert-run-run12345"], status: "online", host: "db.example", port: 25060 } });
+      if (init.method === "GET" && parsed.searchParams.has("tag_name")) return json({ databases: null });
+      if (init.method === "POST" && parsed.pathname === "/v2/databases") return json({ database: { id: "cluster-1", name: body.name, tags: body.tags, status: "online", connection: { host: "db.example", port: 25060, user: "doadmin", password: "pw" } } }, 201);
+      if (init.method === "GET" && parsed.pathname === "/v2/databases/cluster-1") return deleted ? json({}, 404) : json({ database: { id: "cluster-1", name: "lcm-cert-run12345", tags: ["lcm-cert", "lcm-cert-run-run12345"], status: "online", connection: { host: "db.example", port: 25060, user: "doadmin", password: "pw" } } });
       if (init.method === "PUT") return json({});
       if (init.method === "GET" && parsed.pathname.endsWith("/firewall")) return json({ rules: [{ type: "ip_addr", value: "203.0.113.8" }] });
-      if (init.method === "GET" && parsed.pathname.endsWith("/ca")) return json({ ca: { certificate: "-----BEGIN CERTIFICATE-----\nca\n-----END CERTIFICATE-----" } });
+      if (init.method === "GET" && parsed.pathname.endsWith("/ca")) return json({ ca: { certificate: providerCa } });
       if (init.method === "POST" && parsed.pathname.endsWith("/dbs")) return json({ db: { name: body.name } }, 201);
       if (init.method === "POST" && parsed.pathname.endsWith("/users")) return json({ user: { name: body.name, password: "pw" } }, 201);
       if (init.method === "DELETE") { deleted = true; return new Response(null, { status: 204 }); }
