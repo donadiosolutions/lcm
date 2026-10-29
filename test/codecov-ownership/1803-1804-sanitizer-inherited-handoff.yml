@@ -1,0 +1,7 @@
+references: ["#1803", "#1804"]
+rationale: >-
+  #1803 and #1804 restore inherited quoted file-path ownership across bounded
+  named values and non-whitespace continuations while preserving the existing
+  whitespace, slash, bracket, quote, and backslash boundaries.
+pins:
+  - ["src/daemon/safe-error.ts", "unit-daemon-core"]

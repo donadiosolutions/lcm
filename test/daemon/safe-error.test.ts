@@ -6092,6 +6092,257 @@ describe("sanitizeError", () => {
     });
   });
 
+  describe("Bug #1803", () => {
+    const prefix = "file://h?x=['https://outer.test/x?next=file:///Users/a/My Files/private.db'";
+    const redactedPrefix = "file://h?x=['https://outer.test/x?next=file://<path>'";
+    const bracket = "[https://inner?key=/home/C/s]]";
+    const assertPasses = (
+      input: string,
+      expectedFirst: string,
+      expectedSecond = expectedFirst,
+      expectedThird = expectedSecond,
+    ): void => {
+      const first = sanitizeError(input);
+      const second = sanitizeError(first);
+      const third = sanitizeError(second);
+
+      expect(first).toBe(expectedFirst);
+      expect(second).toBe(expectedSecond);
+      expect(third).toBe(expectedThird);
+    };
+
+    it.each([
+      [
+        "equals backslash value with a bracket",
+        prefix + "=\\Users\\SECRET\\x" + bracket,
+        redactedPrefix + "=<path>?key=<path>]]",
+      ],
+      [
+        "repeated equals backslash value with a bracket",
+        prefix + "==\\Users\\SECRET\\x" + bracket,
+        redactedPrefix + "==<path>?key=<path>]]",
+      ],
+      [
+        "invisible run before an equals backslash value with a bracket",
+        prefix + "\u200b=\\Users\\SECRET\\x" + bracket,
+        redactedPrefix + "\u200b=<path>?key=<path>]]",
+      ],
+      [
+        "equals forward-slash drive value with a bracket",
+        prefix + "=C:/Users/SECRET/x" + bracket,
+        redactedPrefix + "=C:<path>?key=<path>]]",
+      ],
+      [
+        "invisible run before an equals forward-slash drive value with a bracket",
+        prefix + "\u200b=C:/Users/SECRET/x" + bracket,
+        redactedPrefix + "\u200b=C:<path>?key=<path>]]",
+      ],
+      [
+        "equals backslash value before a later private-root successor",
+        prefix + "=\\Users\\x&later/home/alice]",
+        redactedPrefix + "=<path>&later<path>]",
+      ],
+      [
+        "equals plain value before a later private-root successor",
+        prefix + "=plain&later/home/alice]",
+        redactedPrefix + "=plain&later<path>]",
+      ],
+    ] as const)("redacts the %s on the first pass", (_name, input, expected) => {
+      assertPasses(input, expected);
+    });
+
+    it.each([
+      ["private-root relative equals value", "=later/home/alice]", "=later/home/alice]"],
+      ["forward-slash drive equals value", "=C:/Users/SECRET/x]", "=C:<path>]"],
+      ["backslash equals value", "=\\Users\\SECRET\\x]", "=<path>]"],
+      ["Users relative equals value", "=Users/alice/x]", "=Users/alice/x]"],
+      ["plain equals value", "=plain]", "=plain]"],
+      ["public URL equals value", "=https://public.test/x]", "=https://public.test/x]"],
+      ["space before equals", " =/Users/SECRET/x", " =<path>"],
+      ["backslash-drive equals value", "=C:\\Users\\SECRET\\x]", "=<path>]"],
+      ["UNC equals value", "=\\\\server\\share]", "=<path>]"],
+      ["invisible run before a backslash value", "\u200b\\Users\\SECRET\\x]", "\u200b\\Users\\SECRET\\x]"],
+      ["space and invisible run before a backslash value", " \u200b\\Users\\SECRET\\x]", " \u200b\\Users\\SECRET\\x]"],
+      ["ordinary later successor", "=later/var/data&x=plain]", "=later/var/data&x=plain]"],
+      [
+        "visible private-relative value before a bracket",
+        "=later/home/alice" + bracket,
+        "=later/home/alice" + bracket,
+      ],
+      ["visible plain value before a bracket", "=plain" + bracket, "=plain" + bracket],
+    ] as const)("keeps the %s byte-exact", (_name, suffix, expectedSuffix) => {
+      assertPasses(prefix + suffix, redactedPrefix + expectedSuffix);
+    });
+
+    it.each([
+      ["glued", ""],
+      ["ampersand-separated", "&"],
+    ] as const)("redacts %s independent target copies on the first pass", (_name, separator) => {
+      const input = prefix + "=\\Users\\SECRET\\x" + bracket;
+      const expected = redactedPrefix + "=<path>?key=<path>]]";
+
+      assertPasses(input + separator + input, expected + separator + expected);
+    });
+
+    it("redacts target copies inside independent sibling wrappers", () => {
+      const input = prefix + "=\\Users\\SECRET\\x" + bracket;
+      const expected = redactedPrefix + "=<path>?key=<path>]]";
+
+      assertPasses("[" + input + "][" + input + "]", "[" + expected + "][" + expected + "]");
+    });
+  });
+
+  describe("Bug #1804", () => {
+    const prefix = "file://h?x=['https://outer.test/x?next=file:///Users/a/My Files/private.db'";
+    const redactedPrefix = "file://h?x=['https://outer.test/x?next=file://<path>'";
+    const bracket = "[https://inner?key=/home/C/s]]";
+    const interposers = [
+      "\u00ad",
+      "\u180e",
+      "\u200e",
+      "\u200f",
+      "\u202a",
+      "\u2066",
+      "\u034f",
+      "\ufe0f",
+      ",",
+      ":",
+      "!",
+      "x",
+      "..",
+      "ab",
+      "a.b",
+      "?q",
+      "#f",
+      "=x",
+      "x=",
+      "%20",
+      "~",
+      "\u00ad\u200b",
+      "\u200b,",
+    ] as const;
+    const assertPasses = (
+      input: string,
+      expectedFirst: string,
+      expectedSecond = expectedFirst,
+      expectedThird = expectedSecond,
+    ): void => {
+      const first = sanitizeError(input);
+      const second = sanitizeError(first);
+      const third = sanitizeError(second);
+
+      expect(first).toBe(expectedFirst);
+      expect(second).toBe(expectedSecond);
+      expect(third).toBe(expectedThird);
+    };
+    const targets = interposers.flatMap((interposer) => [
+      [
+        JSON.stringify(interposer) + " before pipe and backslash root",
+        interposer + "|\\Users\\SECRET\\x]",
+        interposer + "|<path>]",
+      ],
+      [
+        JSON.stringify(interposer) + " before ampersand and backslash root",
+        interposer + "&\\Users\\SECRET\\x]",
+        interposer + "&<path>]",
+      ],
+      [
+        JSON.stringify(interposer) + " before private-root relative successor",
+        interposer + "|later/home/alice]",
+        interposer + "|later<path>]",
+      ],
+      [
+        JSON.stringify(interposer) + " before a backslash root and bracket",
+        interposer + "|\\Users\\SECRET\\x" + bracket,
+        interposer + "|<path>?key=<path>]]",
+      ],
+    ] as const);
+
+    it.each(targets)("redacts %s on the first pass", (_name, suffix, expectedSuffix) => {
+      assertPasses(prefix + suffix, redactedPrefix + expectedSuffix);
+    });
+
+    const controls = interposers.flatMap((interposer) => [
+      [JSON.stringify(interposer) + " before a plain value", interposer + "|plain]", interposer + "|plain]"],
+      [
+        JSON.stringify(interposer) + " before an already-redacted POSIX value",
+        interposer + "|/Users/SECRET/x]",
+        interposer + "|<path>]",
+      ],
+      [
+        JSON.stringify(interposer) + " before an ordinary relative value",
+        interposer + "|later/var/data]",
+        interposer + "|later/var/data]",
+      ],
+    ] as const);
+
+    it.each(controls)("keeps %s byte-exact", (_name, suffix, expectedSuffix) => {
+      assertPasses(prefix + suffix, redactedPrefix + expectedSuffix);
+    });
+
+    it.each([
+      ["space", " "],
+      ["tab", "\t"],
+      ["non-breaking space", "\u00a0"],
+      ["ideographic space", "\u3000"],
+      ["byte order mark", "\ufeff"],
+      ["mixed soft-hyphen and space run", "\u00ad \u00ad"],
+    ] as const)("keeps %s as a whitespace boundary", (_name, whitespace) => {
+      const suffix = whitespace + "|\\Users\\SECRET\\x]";
+      assertPasses(prefix + suffix, redactedPrefix + suffix);
+    });
+
+    it("keeps the slash interposer on its established pass sequence", () => {
+      assertPasses(
+        prefix + "/|\\Users\\SECRET\\x]",
+        redactedPrefix + "/|\\Users\\SECRET\\x]",
+        redactedPrefix + "<path>",
+        redactedPrefix + "<path>",
+      );
+    });
+
+    it("keeps a public URL interposer visible", () => {
+      const suffix = "http://p.test|later/home/alice]";
+      assertPasses(prefix + suffix, redactedPrefix + suffix);
+    });
+
+    it("keeps the established U+200B inherited handoff", () => {
+      assertPasses(
+        prefix + "\u200b|\\Users\\SECRET\\x]",
+        redactedPrefix + "\u200b|<path>]",
+      );
+    });
+
+    it.each([
+      ["bracket", "[x]"],
+      ["apostrophe", "'"],
+      ["double quote", "\""],
+      ["backslash", "\\"],
+    ] as const)("pins the %s interposer residual", (_name, interposer) => {
+      const input = prefix + interposer + "|\\Users\\SECRET\\x]";
+      const first = redactedPrefix + interposer + "|\\Users\\SECRET\\x]";
+      const fixed = redactedPrefix + interposer + "|<path>]";
+      assertPasses(input, first, fixed, fixed);
+    });
+
+    it.each([
+      ["glued", ""],
+      ["ampersand-separated", "&"],
+    ] as const)("redacts %s independent target copies on the first pass", (_name, separator) => {
+      const input = prefix + "\u00ad|\\Users\\SECRET\\x]";
+      const expected = redactedPrefix + "\u00ad|<path>]";
+
+      assertPasses(input + separator + input, expected + separator + expected);
+    });
+
+    it("redacts target copies inside independent sibling wrappers", () => {
+      const input = prefix + "\u00ad|\\Users\\SECRET\\x]";
+      const expected = redactedPrefix + "\u00ad|<path>]";
+
+      assertPasses("[" + input + "][" + input + "]", "[" + expected + "][" + expected + "]");
+    });
+  });
+
 
   describe("Bug #917", () => {
     const matrix: Array<readonly [string, string, string]> = (["'", '"'] as const).flatMap(
