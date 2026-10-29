@@ -19,6 +19,7 @@ import {
 import { createPortableIndex, type PortableIndex } from '../portable-index.js';
 import type { PostgreSqlConnectionSettings, PostgreSqlQueryExecutor, PostgreSqlQueryOptions } from './contracts.js';
 import { buildPostgreSqlClientConfig } from './client-config.js';
+import { isPostgreSqlConnectionError } from './errors.js';
 import { verifyPostgreSqlTransferSchema } from './runtime-readiness.js';
 import { assertPostgreSqlRecordCapability, countCanonicalRows, insertCanonicalRecord, listCanonicalHeaders, readCanonicalRow, readCanonicalContentRows, readCanonicalContentSizes, canonicalBatchItemBytes, canonicalRowContentSha256, assertPostgreSqlExistingConstraints, listPostgreSqlRecordUniqueKeys, validatePostgreSqlRecordRelations } from './portable-mapping.js';
 import { createPostgreSqlPortableSource, readPostgreSqlPortableWitness } from './portable-source.js';
@@ -203,7 +204,8 @@ async function assertEmpty(state:DestinationState,signal?:AbortSignal,executor:P
 }
 async function connect(state:DestinationState,signal?:AbortSignal):Promise<void> {
   abort(signal);
-  const client=new Client(buildPostgreSqlClientConfig(state.input.settings));
+  // query_timeout 0 (connection level) disables the client deadline: node-pg starts it before the request is sent, so a healthy large record upload could trip it.
+  const client=new Client({...buildPostgreSqlClientConfig(state.input.settings),query_timeout:0});
   client.on('error',()=>{state.broken=true;});
   state.client=client;
   await client.connect();
@@ -215,7 +217,12 @@ async function connect(state:DestinationState,signal?:AbortSignal):Promise<void>
     const onAbort=()=>{state.broken=true;void client.end().catch(()=>undefined);};
     querySignal?.addEventListener('abort',onAbort,{once:true});
     try{return await client.query<R,I>(config);}
-    catch(error){if(querySignal?.aborted) fail('aborted');throw normalizePortableTransferError(error);}
+    catch(error){
+      if(querySignal?.aborted) fail('aborted');
+      // A dead connection must fail later queries (including ROLLBACK) fast instead of each waiting another deadline.
+      if(isPostgreSqlConnectionError(error)){state.broken=true;void client.end().catch(()=>undefined);}
+      throw normalizePortableTransferError(error);
+    }
     finally{querySignal?.removeEventListener('abort',onAbort);}
   }};
   await verifyPostgreSqlTransferSchema(state.executor,{expectedOwner:state.input.expectedOwner,signal});

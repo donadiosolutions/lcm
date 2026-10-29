@@ -13,6 +13,7 @@ import {
 import {
   generationScopedDirectory,
   readGenerationScopedFiles,
+  readGenerationScopedLoneScratches,
   recordGenerationScopedFile,
   type GenerationScopedPendingWrite,
   validateGenerationId,
@@ -407,12 +408,30 @@ export function recordMigrationActivationWitness(
   input: Readonly<{ homeDir: string; generationId: string; witness: MigrationActivationWitness }>,
   dependencies: RecordMigrationSelectionBindingDependencies = {},
 ): void {
-  const homeDir = validateHomeDir(input.homeDir);
-  const generationId = validateGenerationId(input.generationId);
-  const witness = parseMigrationActivationWitness(input.witness);
+  recordWitness(
+    validateHomeDir(input.homeDir),
+    validateGenerationId(input.generationId),
+    parseMigrationActivationWitness(input.witness),
+    dependencies,
+    [],
+  );
+}
+
+/**
+ * The witness writer. otherPending are further records the caller will
+ * write next (see recoverInterruptedRollbackWitnessWrite): a lone scratch of
+ * exactly one of them does not make the store unresolvable for this write.
+ */
+function recordWitness(
+  homeDir: string,
+  generationId: string,
+  witness: MigrationActivationWitness,
+  dependencies: RecordMigrationSelectionBindingDependencies,
+  otherPending: readonly GenerationScopedPendingWrite[],
+): void {
   const fileName = "witness-" + witness.checksumSha256 + ".json";
   const serialized = evidenceWireContent(generationId, witness);
-  const stored = requireStoredEvidence(homeDir, generationId, dependencies, [{ fileName, content: serialized }]);
+  const stored = requireStoredEvidence(homeDir, generationId, dependencies, [{ fileName, content: serialized }, ...otherPending]);
   const epoch = stored?.epochs.find((candidate) => candidate.epochId === witness.epochId);
   if (epoch === undefined) {
     throw new MigrationActivationEvidenceRefusalError(
@@ -434,6 +453,99 @@ export function recordMigrationActivationWitness(
     );
   }
   recordEvidence(homeDir, generationId, fileName, serialized, dependencies);
+}
+
+const WITNESS_FILE_NAME_PATTERN = /^witness-[0-9a-f]{64}\.json$/u;
+
+/** True when the generation's evidence directory holds a lone writer
+ * scratch file (final absent) that authenticates as one. Read-only; the
+ * cheap probe before recoverInterruptedRollbackWitnessWrite. */
+export function hasInterruptedEvidenceWrite(
+  input: Readonly<{ homeDir: string; generationId: string }>,
+  dependencies: RecordMigrationSelectionBindingDependencies = {},
+): boolean {
+  return readGenerationScopedLoneScratches(
+    ACTIVATION_EVIDENCE_STORE,
+    { homeDir: validateHomeDir(input.homeDir), generationId: validateGenerationId(input.generationId) },
+    dependencies,
+  ).length > 0;
+}
+
+/**
+ * #1808. Rollback reads the evidence strictly before it can re-mint its own
+ * witness, so a rollback interrupted inside the rollback witness write
+ * (leaving only the writer scratch of that witness) would be refused as
+ * unresolvable on every retry. This finishes exactly that write, and nothing
+ * else, when it can be proven: every lone scratch of the directory must be
+ * the complete canonical rollback witness of the given activation (the epoch
+ * and attempt the stored activation witness names), and the whole directory,
+ * read with those scratches as the pending writes, must authenticate with
+ * the stored epoch, attempt and activation witness agreeing and every
+ * candidate reproducing from them. Any failure answers "none" and writes
+ * nothing; the strict readers then refuse as before.
+ *
+ * Each proven witness is published through the ordinary witness writer
+ * (ascending final name, the others still pending). Writer errors after the
+ * proof (I/O, a race) propagate; a failure after the first publication may
+ * leave that witness published without its binding, which is the state of a
+ * crash between the witness and binding writes and which every rollback path
+ * tolerates (authority follows bindings, never an unbound witness). Callers
+ * hold the append barrier so no live writer's scratch is removed meanwhile.
+ */
+export function recoverInterruptedRollbackWitnessWrite(
+  input: Readonly<{
+    homeDir: string;
+    generationId: string;
+    epochId: string;
+    attemptId: string;
+    activationWitnessChecksumSha256: string;
+  }>,
+  dependencies: RecordMigrationSelectionBindingDependencies = {},
+): "recovered" | "none" {
+  const homeDir = validateHomeDir(input.homeDir);
+  const generationId = validateGenerationId(input.generationId);
+  const candidates = new Map<string, MigrationActivationWitness>();
+  for (const scratch of readGenerationScopedLoneScratches(ACTIVATION_EVIDENCE_STORE, { homeDir, generationId }, dependencies)) {
+    const witness = parseRollbackWitnessScratch(scratch, generationId, input);
+    if (witness === null) return "none";
+    candidates.set(scratch.fileName, witness);
+  }
+  if (candidates.size === 0) return "none";
+  const ordered = [...candidates.keys()].sort().map((fileName) => [fileName, candidates.get(fileName)!] as const);
+  const pending = ordered.map(([fileName, witness]) => ({ fileName, content: evidenceWireContent(generationId, witness) }));
+  const stored = readStoredEvidence({ homeDir, generationId }, dependencies, pending);
+  if (stored.state !== "resolved") return "none";
+  const epoch = stored.epochs.find((candidate) => candidate.epochId === input.epochId);
+  const attempt = stored.attempts.find((candidate) => candidate.attemptId === input.attemptId);
+  const activation = stored.witnesses.find((candidate) => candidate.checksumSha256 === input.activationWitnessChecksumSha256);
+  if (
+    epoch === undefined || attempt === undefined || activation === undefined
+    || attempt.epochId !== epoch.epochId
+    || activation.kind !== "activation" || activation.epochId !== epoch.epochId || activation.attemptId !== attempt.attemptId
+    || ordered.some(([, witness]) => !witnessReproduces(epoch, attempt, witness))
+  ) return "none";
+  for (const [fileName, witness] of ordered) {
+    recordWitness(homeDir, generationId, witness, dependencies, pending.filter((write) => write.fileName !== fileName));
+  }
+  return "recovered";
+}
+
+/** The rollback witness for the given pair that one lone scratch holds in
+ * full canonical form, or null when it is anything else. */
+function parseRollbackWitnessScratch(
+  scratch: Readonly<{ fileName: string; content: string }>,
+  generationId: string,
+  pair: Readonly<{ epochId: string; attemptId: string }>,
+): MigrationActivationWitness | null {
+  if (!WITNESS_FILE_NAME_PATTERN.test(scratch.fileName)) return null;
+  let parsed: ParsedEvidenceFile;
+  try {
+    parsed = parseStoredEvidenceFile(scratch.fileName, scratch.content, generationId);
+  } catch {
+    return null;
+  }
+  const witness = (parsed as { witness: MigrationActivationWitness }).witness;
+  return witness.kind === "rollback" && witness.epochId === pair.epochId && witness.attemptId === pair.attemptId ? witness : null;
 }
 
 /**

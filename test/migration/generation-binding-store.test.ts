@@ -28,6 +28,7 @@ import {
   migrationWitnessBindingPath,
   generationScopedDirectory,
   readGenerationScopedFiles,
+  readGenerationScopedLoneScratches,
   recordMigrationSelectionBinding,
   recordMigrationWitnessBinding,
   resolveMigrationWitnessBindings,
@@ -2486,5 +2487,93 @@ describe("readGenerationScopedFiles: pending writes (#1769)", () => {
     plantFile(directory, ".rec-1.json.0123abcd.tmp", "mine");
     chmodSync(join(directory, ".rec-1.json.0123abcd.tmp"), 0o644);
     expect(scan(homeDir, [{ fileName: "rec-1.json", content: "mine" }])).toMatchObject({ kind: "unresolvable" });
+  });
+});
+
+describe("readGenerationScopedLoneScratches (#1808)", () => {
+  const store: GenerationScopedStore = {
+    subdirectory: "lone-test",
+    noun: "lone test record",
+    maxFileBytes: 4096,
+    isFinalFileName: (name) => /^rec-[0-9]\.json$/u.test(name),
+  };
+  function seeded(): { homeDir: string; directory: string } {
+    const homeDir = home();
+    const directory = generationScopedDirectory(store, homeDir, GENERATION_ID);
+    mkdirSync(directory, { recursive: true, mode: 0o700 });
+    return { homeDir, directory };
+  }
+  const plantFile = (directory: string, name: string, content: string, mode = 0o600): string => {
+    const path = join(directory, name);
+    writeFileSync(path, content, { mode });
+    chmodSync(path, mode);
+    return path;
+  };
+  const list = (homeDir: string, dependencies: ReadGenerationScopedFilesDependencies = {}) =>
+    readGenerationScopedLoneScratches(store, { homeDir, generationId: GENERATION_ID }, dependencies);
+
+  it("lists a lone scratch whose final is absent under the final name, with its authenticated bytes", () => {
+    const { homeDir, directory } = seeded();
+    plantFile(directory, ".rec-1.json.0123abcd.tmp", "one");
+    plantFile(directory, ".rec-2.json.0123abcd.tmp", "two");
+    expect(list(homeDir)).toEqual([
+      { fileName: "rec-1.json", content: "one" },
+      { fileName: "rec-2.json", content: "two" },
+    ]);
+  });
+
+  it("lists every scratch of one final, in directory order", () => {
+    const { homeDir, directory } = seeded();
+    plantFile(directory, ".rec-1.json.0123abcd.tmp", "one");
+    plantFile(directory, ".rec-1.json.0123abce.tmp", "one");
+    expect(list(homeDir)).toEqual([
+      { fileName: "rec-1.json", content: "one" },
+      { fileName: "rec-1.json", content: "one" },
+    ]);
+  });
+
+  it("does not list a scratch whose final is present, a published file, or an unknown entry", () => {
+    const { homeDir, directory } = seeded();
+    plantFile(directory, "rec-1.json", "published");
+    plantFile(directory, ".rec-1.json.0123abcd.tmp", "published");
+    plantFile(directory, "rec-2.json", "published");
+    plantFile(directory, ".other.json.0123abcd.tmp", "not a final name");
+    plantFile(directory, "unknown", "unknown");
+    expect(list(homeDir)).toEqual([]);
+  });
+
+  it("does not list a scratch that is not a private single-link regular file", () => {
+    const { homeDir, directory } = seeded();
+    plantFile(directory, ".rec-1.json.0123abcd.tmp", "loose", 0o644);
+    const linked = plantFile(directory, ".rec-2.json.0123abcd.tmp", "linked");
+    linkSync(linked, join(directory, ".rec-2.json.0123abce.tmp"));
+    plantFile(directory, ".rec-3.json.0123abcd.tmp", "oversize".repeat(1024));
+    expect(list(homeDir)).toEqual([]);
+  });
+
+  it("lists nothing for an absent store, an absent generation directory or an unreadable home, and never creates them", () => {
+    const absentStore = home();
+    expect(list(absentStore)).toEqual([]);
+    expect(existsSync(join(absentStore, ".lcm", store.subdirectory))).toBe(false);
+    const { homeDir } = seeded();
+    expect(readGenerationScopedLoneScratches(store, { homeDir, generationId: "generation-2" }, {})).toEqual([]);
+    expect(list(join(homeDir, "no-such-home"))).toEqual([]);
+  });
+
+  it("lists nothing when the generation directory cannot be read", () => {
+    const { homeDir, directory } = seeded();
+    plantFile(directory, ".rec-1.json.0123abcd.tmp", "one");
+    chmodSync(directory, 0o000);
+    expect(list(homeDir)).toEqual([]);
+    chmodSync(directory, 0o700);
+    expect(list(homeDir)).toHaveLength(1);
+  });
+
+  it("never repairs: the directory is unchanged by a listing", () => {
+    const { homeDir, directory } = seeded();
+    const scratch = plantFile(directory, ".rec-1.json.0123abcd.tmp", "one");
+    list(homeDir);
+    expect(readFileSync(scratch, "utf8")).toBe("one");
+    expect(existsSync(join(directory, "rec-1.json"))).toBe(false);
   });
 });

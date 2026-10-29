@@ -1,6 +1,8 @@
 import { readFileSync } from "node:fs";
+import { connect, createServer, type Socket } from "node:net";
 import { join } from "node:path";
 import { beforeAll, describe, expect, it } from "vitest";
+import { postgreSqlQueryDeadlineMs } from "../../src/storage/postgresql/client-config.js";
 import {
   PostgreSqlRuntime,
   POSTGRESQL_RUNTIME_DEFAULT_DEPENDENCIES,
@@ -283,6 +285,81 @@ describe("PostgreSQL 18 runtime", () => {
       }
     });
   });
+
+  it("abandons a query on a connection that stops answering and recovers on a fresh connection", async () => {
+    await withPostgreSqlTestDatabase("query-read-timeout", async (database) => {
+      const target = new URL(database.runtimeUrl);
+      const sockets = new Set<Socket>();
+      let forwarding = true;
+      const relay = createServer((downstream) => {
+        const upstream = connect({
+          host: target.hostname.replace(/^\[|\]$/gu, ""),
+          port: target.port === "" ? 5432 : Number(target.port),
+        });
+        sockets.add(downstream);
+        sockets.add(upstream);
+        downstream.on("error", () => upstream.destroy());
+        upstream.on("error", () => downstream.destroy());
+        downstream.on("close", () => upstream.destroy());
+        upstream.on("close", () => downstream.destroy());
+        downstream.pipe(upstream);
+        upstream.on("data", (chunk: Buffer) => { if (forwarding) downstream.write(chunk); });
+      });
+      await new Promise<void>((resolve) => { relay.listen(0, "127.0.0.1", resolve); });
+      const relayPort = (relay.address() as { port: number }).port;
+      const connectionSettings = settings(database.runtimeUrl, {
+        poolMax: 1,
+        connectionTimeoutMs: 1_000,
+        statementTimeoutMs: 1_000,
+      });
+      // Only host and port move to the relay; certificate verification stays
+      // bound to the URL host, so TLS is unchanged.
+      const runtime = new PostgreSqlRuntime(connectionSettings, {
+        ...POSTGRESQL_RUNTIME_DEFAULT_DEPENDENCIES,
+        buildConfig: (candidate) => ({
+          ...POSTGRESQL_RUNTIME_DEFAULT_DEPENDENCIES.buildConfig(candidate),
+          host: "127.0.0.1",
+          port: relayPort,
+        }),
+      });
+      let watchdog: NodeJS.Timeout | undefined;
+      try {
+        const warm = await runtime.query<{ pid: number }>({ text: "SELECT pg_backend_pid() AS pid" }, {
+          domain: "factory", operation: "warmRelay",
+        });
+        forwarding = false;
+        const deadline = postgreSqlQueryDeadlineMs(connectionSettings);
+        const started = Date.now();
+        // A deadline regression leaves the query pending; the watchdog turns that into a
+        // failed assertion so the cleanup below still runs.
+        const expired = new Promise<never>((_resolve, reject) => {
+          watchdog = setTimeout(() => { reject(new Error("query deadline watchdog expired")); }, 15_000);
+        });
+        await expect(Promise.race([runtime.query({ text: "SELECT 1" }, {
+          domain: "factory", operation: "blackHole",
+        }), expired])).rejects.toMatchObject({
+          code: "STORAGE_OPERATION_FAILED",
+          backend: "postgresql",
+          operation: "blackHole",
+          retryable: true,
+          sqlState: null,
+        });
+        const elapsed = Date.now() - started;
+        expect(elapsed).toBeGreaterThanOrEqual(deadline - 250);
+        expect(elapsed).toBeLessThan(15_000);
+        forwarding = true;
+        const fresh = await runtime.query<{ pid: number }>({ text: "SELECT pg_backend_pid() AS pid" }, {
+          domain: "factory", operation: "afterBlackHole",
+        });
+        expect(fresh.rows[0].pid).not.toBe(warm.rows[0].pid);
+      } finally {
+        clearTimeout(watchdog);
+        for (const socket of sockets) socket.destroy();
+        await new Promise<void>((resolve) => { relay.close(() => { resolve(); }); });
+        await runtime.close();
+      }
+    });
+  }, 30_000);
 
   it("fails an idle runtime transaction killed by the server with a handled storage error", async () => {
     await withPostgreSqlTestDatabase("transaction-idle-kill", async (database) => {

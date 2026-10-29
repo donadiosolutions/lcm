@@ -1,0 +1,6 @@
+references: ["#1817"]
+rationale: >-
+  #1817 preserves the drive prefix when sanitizeError redacts a drive value in
+  a bracket already owned through a mixed-separator or nested-file path.
+pins:
+  - ["src/daemon/safe-error.ts", "unit-daemon-core"]

@@ -735,6 +735,44 @@ bundle and keep provider, credential, quarantine, and recovery sessions private.
   `\\Users\x`, and mixed runs are covered, and when it is a drive path such as
   `C:/Users/x` or `c:/home/x`. A slash-only run with no path word after it is
   unchanged; a backslash-only run is redacted by the existing Windows-root rule.
+  A selected bracket can keep the letter and colon of a forward-slash drive
+  only when the whole bracket matches a conservative grammar. The bracket must
+  begin with a normal URL header, or with the exact `file://` child that
+  established its owner. The header itself is plain path-word text with its
+  scheme colon and slashes and must run straight into the first value
+  delimiter or the closing bracket; a comma, semicolon, bang, parenthesis, or
+  other punctuation after the header refuses the bracket. Its values may
+  contain plain path-word scalars,
+  already-owned rooted paths, and simple drives made only from slash-separated
+  path-word segments. All drives in an admitted bracket are classified
+  together. The bare form `?key=C:/]` is admitted only as the first and only
+  value of an `https://` bracket whose mixed-separator owner path is a
+  straight run of path words and slashes from its start to the bracket,
+  optionally through exactly one parenthesis directly before it; a parenthesis
+  group or other gap anywhere earlier in the owner path refuses it, as does a
+  bracket that follows an admitted sibling. The letter and name may vary in
+  case. After a simple drive, one immediate rooted query continuation
+  of the shape `([https://host?key=/rooted]` is admitted, where the host is a
+  plain host name with an optional numeric port; any value, delimiter, or
+  further scheme inside that authority refuses the bracket. This applies to
+  mixed-separator owners and to exact file children reached through later
+  rooted, private-relative, inherited later-successor, restarted, or preserved
+  soft-whitespace tails; for example, `&C:/Users/x` becomes `&C:<path>`.
+  An exact file child whose owner text already contains a URL scheme, such as
+  `/https://Users/x/s[file:///b&C:/Users/c]`, does not take part.
+  Public or file URL values, anonymous equals values, compounds, internal
+  whitespace, unsupported nesting, and malformed path segments refuse the
+  drive-prefix rule for the complete bracket. Refused brackets keep their
+  established whole-drive behavior, including through descendant brackets.
+  An independent later mixed copy is admitted only after a straight owner, when
+  its own bracket matches the same grammar, when its successor path leads
+  straight to the copy bracket
+  (optionally through one parenthesis), and, for a `file://` copy header, only
+  when the preceding component opened with `?` or `#`; otherwise the copy
+  keeps its established pass sequence. Space, tab, line feed, and carriage
+  return remain hard
+  boundaries, and whitespace never upgrades a tail that did not explicitly
+  request drive-prefix handling.
   An unmatched `]`, text outside a component after the span stopped, whitespace,
   and newlines end the composition; whitespace-separated prose, public URLs,
   and ordinary unspaced relative tails remain unchanged.

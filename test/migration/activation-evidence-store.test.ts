@@ -16,11 +16,13 @@ import { join } from "node:path";
 import { canonicalJson } from "../../src/storage/portable-record.js";
 import { migrationWitnessSha256, MigrationActivationWitnessError } from "../../src/migration/activation-witness.js";
 import {
+  hasInterruptedEvidenceWrite,
   migrationActivationEvidenceDirectory,
   readMigrationActivationEvidence,
   recordMigrationActivationAttempt,
   recordMigrationActivationEpoch,
   recordMigrationActivationWitness,
+  recoverInterruptedRollbackWitnessWrite,
   resolveRollbackAuthoritativeContext,
 } from "../../src/migration/activation-evidence-store.js";
 import {
@@ -630,5 +632,247 @@ describe("resolveRollbackAuthoritativeContext", () => {
     plant(homeDir, "notes.txt", "x");
     await expect(resolve(homeDir, { epochId: epoch.epochId, attemptId: attempt.attemptId }))
       .rejects.toMatchObject({ name: "MigrationActivationEvidenceRefusalError", reason: "evidence-unresolvable" });
+  });
+});
+
+describe("recoverInterruptedRollbackWitnessWrite (#1808)", () => {
+  const read = (homeDir: string) => readMigrationActivationEvidence({ homeDir, generationId: GENERATION_ID });
+  const witnessName = (witness: { checksumSha256: string }): string => "witness-" + witness.checksumSha256 + ".json";
+  const scratchOf = (name: string, hex = "0123abcd"): string => "." + name + "." + hex + ".tmp";
+  const entries = (homeDir: string): string[] => readdirSync(dir(homeDir)).sort();
+
+  function seeded() {
+    const homeDir = home();
+    const { epoch, attempt, witness } = recordAll(homeDir);
+    const rollbackOf = (index: number) => fixtureRollbackWitness({
+      epoch, attempt, postEpochDelta: driftCanonicalDelta(attempt.canonicalDeltaBaseline, index),
+      postEpochCensus: null, rollbackMode: "post-write",
+    });
+    const input = {
+      homeDir, generationId: GENERATION_ID, epochId: epoch.epochId, attemptId: attempt.attemptId,
+      activationWitnessChecksumSha256: witness.checksumSha256,
+    };
+    return { homeDir, epoch, attempt, witness, rollbackOf, rollback: rollbackOf(1), input };
+  }
+  type State = ReturnType<typeof seeded>;
+
+  /** The refusal contract: nothing written, every entry as it was, the strict reader as unresolvable as before. */
+  function expectNone(state: State, run: () => string = () => recoverInterruptedRollbackWitnessWrite(state.input)): void {
+    const before = entries(state.homeDir);
+    const contents = before.map((name) => readFileSync(join(dir(state.homeDir), name), "utf8"));
+    expect(run()).toBe("none");
+    expect(entries(state.homeDir)).toEqual(before);
+    expect(before.map((name) => readFileSync(join(dir(state.homeDir), name), "utf8"))).toEqual(contents);
+    expect(read(state.homeDir)).toMatchObject({ state: "unresolvable" });
+  }
+
+  it("publishes the canonical rollback witness scratch of the activation, clears the scratch and then answers none", () => {
+    const state = seeded();
+    const scratch = plant(state.homeDir, scratchOf(witnessName(state.rollback)), wire(state.rollback));
+    expect(read(state.homeDir)).toMatchObject({ state: "unresolvable" });
+
+    expect(recoverInterruptedRollbackWitnessWrite(state.input)).toBe("recovered");
+
+    expect(readFileSync(join(dir(state.homeDir), witnessName(state.rollback)), "utf8")).toBe(wire(state.rollback));
+    expect(existsSync(scratch)).toBe(false);
+    const stored = read(state.homeDir);
+    if (stored.state !== "resolved") throw new Error("expected resolved");
+    expect(stored.witnesses.map((entry) => entry.checksumSha256).sort())
+      .toEqual([state.witness.checksumSha256, state.rollback.checksumSha256].sort());
+    expect(recoverInterruptedRollbackWitnessWrite(state.input)).toBe("none");
+  });
+
+  it("publishes two distinct rollback witness scratches of the activation", () => {
+    const state = seeded();
+    const other = state.rollbackOf(2);
+    plant(state.homeDir, scratchOf(witnessName(state.rollback)), wire(state.rollback));
+    plant(state.homeDir, scratchOf(witnessName(other)), wire(other));
+
+    expect(recoverInterruptedRollbackWitnessWrite(state.input)).toBe("recovered");
+
+    expect(entries(state.homeDir)).toEqual([
+      "attempt-" + state.attempt.attemptId + ".json", "epoch-" + state.epoch.epochId + ".json",
+      witnessName(state.witness), witnessName(state.rollback), witnessName(other),
+    ].sort());
+    expect(read(state.homeDir)).toMatchObject({ state: "resolved" });
+  });
+
+  it("publishes a final once for duplicate scratches and clears them all", () => {
+    const state = seeded();
+    plant(state.homeDir, scratchOf(witnessName(state.rollback)), wire(state.rollback));
+    plant(state.homeDir, scratchOf(witnessName(state.rollback), "0123abce"), wire(state.rollback));
+
+    expect(recoverInterruptedRollbackWitnessWrite(state.input)).toBe("recovered");
+
+    expect(entries(state.homeDir)).not.toContainEqual(expect.stringMatching(/\.tmp$/u));
+    expect(read(state.homeDir)).toMatchObject({ state: "resolved" });
+  });
+
+  it("answers none, creating nothing, when there is no scratch, no store or no generation directory", () => {
+    const state = seeded();
+    expect(recoverInterruptedRollbackWitnessWrite(state.input)).toBe("none");
+    expect(read(state.homeDir)).toMatchObject({ state: "resolved" });
+    const bare = home();
+    expect(recoverInterruptedRollbackWitnessWrite({ ...state.input, homeDir: bare })).toBe("none");
+    expect(existsSync(dir(bare))).toBe(false);
+  });
+
+  it("does not list a scratch whose final is published", () => {
+    const state = seeded();
+    plant(state.homeDir, scratchOf(witnessName(state.witness)), wire(state.witness));
+    expect(recoverInterruptedRollbackWitnessWrite(state.input)).toBe("none");
+    expect(hasInterruptedEvidenceWrite(state.input)).toBe(false);
+    expect(read(state.homeDir)).toMatchObject({ state: "resolved" });
+  });
+
+  it("refuses an activation witness scratch, which the activation chain owns", () => {
+    const state = seeded();
+    const second = fixtureAttempt({ epoch: state.epoch, seed: "attempt-2" });
+    recordMigrationActivationAttempt({ homeDir: state.homeDir, generationId: GENERATION_ID, attempt: second });
+    const activation = fixtureActivationWitness(state.epoch, second);
+    plant(state.homeDir, scratchOf(witnessName(activation)), wire(activation));
+    expectNone(state);
+  });
+
+  it("refuses a rollback witness scratch of another attempt or another epoch", () => {
+    const state = seeded();
+    const second = fixtureAttempt({ epoch: state.epoch, seed: "attempt-2" });
+    recordMigrationActivationAttempt({ homeDir: state.homeDir, generationId: GENERATION_ID, attempt: second });
+    const otherAttempt = fixtureRollbackWitness({
+      epoch: state.epoch, attempt: second, postEpochDelta: driftCanonicalDelta(second.canonicalDeltaBaseline, 1),
+      postEpochCensus: null, rollbackMode: "post-write",
+    });
+    plant(state.homeDir, scratchOf(witnessName(otherAttempt)), wire(otherAttempt));
+    expectNone(state);
+
+    const other = seeded();
+    const epoch2 = fixtureEpoch({ generationId: GENERATION_ID, seed: "epoch-2" });
+    const attempt2 = fixtureAttempt({ epoch: epoch2, seed: "attempt-3" });
+    recordMigrationActivationEpoch({ homeDir: other.homeDir, epoch: epoch2 });
+    recordMigrationActivationAttempt({ homeDir: other.homeDir, generationId: GENERATION_ID, attempt: attempt2 });
+    const otherEpoch = fixtureRollbackWitness({
+      epoch: epoch2, attempt: attempt2, postEpochDelta: driftCanonicalDelta(attempt2.canonicalDeltaBaseline, 1),
+      postEpochCensus: null, rollbackMode: "post-write",
+    });
+    plant(other.homeDir, scratchOf(witnessName(otherEpoch)), wire(otherEpoch));
+    expectNone(other);
+  });
+
+  it("refuses bytes that are not canonical, not JSON, or a witness that its stored epoch and attempt do not mint", () => {
+    const noncanonical = seeded();
+    plant(noncanonical.homeDir, scratchOf(witnessName(noncanonical.rollback)), wire(noncanonical.rollback).replace(/\n$/u, " \n"));
+    expectNone(noncanonical);
+
+    const garbage = seeded();
+    plant(garbage.homeDir, scratchOf(witnessName(garbage.rollback)), "not json");
+    expectNone(garbage);
+
+    const forged = seeded();
+    const mutated = forgedWitness(forged.rollback);
+    plant(forged.homeDir, scratchOf(witnessName(mutated)), wire(mutated));
+    expectNone(forged);
+  });
+
+  it("refuses a scratch of an attempt record, which this recovery does not own", () => {
+    const state = seeded();
+    const second = fixtureAttempt({ epoch: state.epoch, seed: "attempt-2" });
+    plant(state.homeDir, scratchOf("attempt-" + second.attemptId + ".json"), wire(second));
+    expectNone(state);
+  });
+
+  it("refuses all of them when one scratch is valid and another is not, leaving both", () => {
+    const state = seeded();
+    const second = fixtureAttempt({ epoch: state.epoch, seed: "attempt-2" });
+    recordMigrationActivationAttempt({ homeDir: state.homeDir, generationId: GENERATION_ID, attempt: second });
+    plant(state.homeDir, scratchOf(witnessName(state.rollback)), wire(state.rollback));
+    const activation = fixtureActivationWitness(state.epoch, second);
+    plant(state.homeDir, scratchOf(witnessName(activation)), wire(activation));
+    expectNone(state);
+  });
+
+  it("refuses a valid scratch beside an entry the listing does not show, publishing nothing", () => {
+    const state = seeded();
+    plant(state.homeDir, scratchOf(witnessName(state.rollback)), wire(state.rollback));
+    const loose = plant(state.homeDir, scratchOf(witnessName(state.rollbackOf(2))), wire(state.rollbackOf(2)));
+    chmodSync(loose, 0o644);
+    expectNone(state);
+    rmSync(loose);
+    plant(state.homeDir, "unknown-entry", "x");
+    expectNone(state);
+  });
+
+  it("refuses scratches that are not private single-link files", () => {
+    const state = seeded();
+    const path = plant(state.homeDir, scratchOf(witnessName(state.rollback)), wire(state.rollback));
+    chmodSync(path, 0o644);
+    expectNone(state);
+
+    const linked = seeded();
+    const linkedPath = plant(linked.homeDir, scratchOf(witnessName(linked.rollback)), wire(linked.rollback));
+    linkSync(linkedPath, join(dir(linked.homeDir), scratchOf(witnessName(linked.rollback), "0123abce")));
+    expectNone(linked);
+  });
+
+  it("refuses when the stored activation witness is missing, is not an activation witness, or names another pair", () => {
+    const missing = seeded();
+    plant(missing.homeDir, scratchOf(witnessName(missing.rollback)), wire(missing.rollback));
+    expectNone(missing, () => recoverInterruptedRollbackWitnessWrite({ ...missing.input, activationWitnessChecksumSha256: "f".repeat(64) }));
+
+    const rollbackNamed = seeded();
+    const published = rollbackNamed.rollbackOf(2);
+    recordMigrationActivationWitness({ homeDir: rollbackNamed.homeDir, generationId: GENERATION_ID, witness: published });
+    plant(rollbackNamed.homeDir, scratchOf(witnessName(rollbackNamed.rollback)), wire(rollbackNamed.rollback));
+    expectNone(rollbackNamed, () => recoverInterruptedRollbackWitnessWrite({
+      ...rollbackNamed.input, activationWitnessChecksumSha256: published.checksumSha256,
+    }));
+
+    const otherPair = seeded();
+    const second = fixtureAttempt({ epoch: otherPair.epoch, seed: "attempt-2" });
+    recordMigrationActivationAttempt({ homeDir: otherPair.homeDir, generationId: GENERATION_ID, attempt: second });
+    const secondActivation = fixtureActivationWitness(otherPair.epoch, second);
+    recordMigrationActivationWitness({ homeDir: otherPair.homeDir, generationId: GENERATION_ID, witness: secondActivation });
+    plant(otherPair.homeDir, scratchOf(witnessName(otherPair.rollback)), wire(otherPair.rollback));
+    expectNone(otherPair, () => recoverInterruptedRollbackWitnessWrite({
+      ...otherPair.input, activationWitnessChecksumSha256: secondActivation.checksumSha256,
+    }));
+  });
+
+  it("refuses when the named epoch or attempt is not stored", () => {
+    const state = seeded();
+    plant(state.homeDir, scratchOf(witnessName(state.rollback)), wire(state.rollback));
+    expectNone(state, () => recoverInterruptedRollbackWitnessWrite({ ...state.input, epochId: "f".repeat(64) }));
+    expectNone(state, () => recoverInterruptedRollbackWitnessWrite({ ...state.input, attemptId: "f".repeat(64) }));
+  });
+
+  it("refuses when the store holds no epoch, attempt or witness at all", () => {
+    const homeDir = home();
+    const epoch = fixtureEpoch({ generationId: GENERATION_ID });
+    const attempt = fixtureAttempt({ epoch });
+    const rollback = fixtureRollbackWitness({
+      epoch, attempt, postEpochDelta: driftCanonicalDelta(attempt.canonicalDeltaBaseline, 1), postEpochCensus: null, rollbackMode: "post-write",
+    });
+    plant(homeDir, scratchOf(witnessName(rollback)), wire(rollback));
+    expect(recoverInterruptedRollbackWitnessWrite({
+      homeDir, generationId: GENERATION_ID, epochId: epoch.epochId, attemptId: attempt.attemptId, activationWitnessChecksumSha256: "a".repeat(64),
+    })).toBe("none");
+    expect(entries(homeDir)).toEqual([scratchOf(witnessName(rollback))]);
+  });
+
+  it("propagates a writer failure after the proof, leaving the scratch", () => {
+    const state = seeded();
+    plant(state.homeDir, scratchOf(witnessName(state.rollback)), wire(state.rollback));
+    expect(() => recoverInterruptedRollbackWitnessWrite(state.input, {
+      writeDurable: () => { throw new Error("disk full"); },
+    })).toThrow("disk full");
+    expect(existsSync(join(dir(state.homeDir), scratchOf(witnessName(state.rollback))))).toBe(true);
+    expect(existsSync(join(dir(state.homeDir), witnessName(state.rollback)))).toBe(false);
+  });
+
+  it("hasInterruptedEvidenceWrite reports a lone scratch and nothing else", () => {
+    const state = seeded();
+    expect(hasInterruptedEvidenceWrite(state.input)).toBe(false);
+    plant(state.homeDir, scratchOf(witnessName(state.rollback)), wire(state.rollback));
+    expect(hasInterruptedEvidenceWrite(state.input)).toBe(true);
+    expect(hasInterruptedEvidenceWrite({ homeDir: home(), generationId: GENERATION_ID })).toBe(false);
   });
 });

@@ -142,30 +142,45 @@ function findUrlPathStarts(chars: readonly string[]): UrlPathStarts {
     if (start < claimedPrivateSpanEnd) return;
     claimedPrivateSpanEnd = measurePrivateSpanEnd(start, fileUrl, forced, quote);
   };
+  type OwnedBracketDrivePrefix = "none" | "all" | "nested-file";
+  type BracketTailOptions = {
+    fileUrl: boolean;
+    forced: boolean;
+    inheritedQuote: boolean;
+    ownsPrivateRelative?: boolean;
+    ownsRootedQuery?: boolean;
+    ownsAdjacentComponents?: boolean;
+    ownsBackslashQuery?: boolean;
+    drivePrefix?: OwnedBracketDrivePrefix;
+    softWhitespaceDrivePrefix?: OwnedBracketDrivePrefix;
+  };
   // A rooted tail owns the bracket components its redacting scan consumes.
   // Measure that span once per activation, never per character.
   const armBracketTail = (
     start: number,
     trackingStart: number,
-    fileUrl: boolean,
-    forced: boolean,
-    inheritedQuote: boolean,
-    ownsPrivateRelative = inheritedQuote,
-    ownsRootedQuery = false,
-    ownsAdjacentComponents = true,
-    ownsBackslashQuery = true,
+    options: BracketTailOptions,
   ): void => {
+    const drivePrefix = options.drivePrefix ?? "none";
     postCloseFilePathActive = true;
     postCloseFilePathBracketDepth = 0;
     postCloseFilePathTrackingStart = trackingStart;
-    postCloseFilePathInheritedQuote = inheritedQuote;
-    postCloseFilePathOwnsPrivateRelative = ownsPrivateRelative;
-    postCloseFilePathOwnsRootedQuery = ownsRootedQuery;
+    postCloseFilePathInheritedQuote = options.inheritedQuote;
+    postCloseFilePathOwnsPrivateRelative =
+      options.ownsPrivateRelative ?? options.inheritedQuote;
+    postCloseFilePathOwnsRootedQuery = options.ownsRootedQuery ?? false;
     postCloseFilePathComponent = 0;
     postCloseFilePathComponentHasQuery = false;
-    postCloseFilePathOwnsAdjacentComponents = ownsAdjacentComponents;
-    postCloseFilePathOwnsBackslashQuery = ownsBackslashQuery;
-    postCloseFilePathTailEnd = measurePrivateSpanEnd(start, fileUrl, forced);
+    postCloseFilePathOwnsAdjacentComponents = options.ownsAdjacentComponents ?? true;
+    postCloseFilePathOwnsBackslashQuery = options.ownsBackslashQuery ?? true;
+    postCloseFilePathRequestedDrivePrefix = drivePrefix;
+    postCloseFilePathDrivePrefix = drivePrefix;
+    postCloseFilePathSoftWhitespaceDrivePrefix =
+      options.softWhitespaceDrivePrefix ?? "none";
+    postCloseFilePathComponentOpensQuery = false;
+    postCloseFilePathOriginHasScheme = false;
+    postCloseFilePathStraightOwnerBracket = -2;
+    postCloseFilePathTailEnd = measurePrivateSpanEnd(start, options.fileUrl, options.forced);
   };
   // A claim that activates inside a bracket an active tail already owns is
   // absorbed by that owner: it completes the owner's current component and
@@ -197,17 +212,78 @@ function findUrlPathStarts(chars: readonly string[]): UrlPathStarts {
   const isForwardSlashDrivePathStart = (start: number): boolean =>
     /^[A-Za-z]$/u.test(chars[start] ?? "") && chars[start + 1] === ":" && chars[start + 2] === "/";
   const claimedFileLiteralStarts = new Set<number>();
-  const completeBackslashSlashClaim = (pathStart: number): void => {
+  const claimedFileLiteralHasEligibleContinuation = (start: number): boolean => {
+    let cursor = start + FILE_SCHEME.length + 3;
+    while (isPathWord(chars[cursor]) || chars[cursor] === "/") cursor += 1;
+    const next = chars[cursor];
+    return (
+      next === undefined ||
+      next === "&" ||
+      next === "|" ||
+      next === "]" ||
+      WHITESPACE_PATTERN.test(next) ||
+      (next === "(" && chars[cursor + 1] === "[")
+    );
+  };
+  const completeBackslashSlashClaim = (
+    pathStart: number,
+    drivePrefix: OwnedBracketDrivePrefix,
+  ): void => {
+    let completedColon = false;
     for (let cursor = pathStart + 1; cursor < chars.length; cursor += 1) {
       const char = chars[cursor];
+      if (char === "[") {
+        if (
+          completedColon &&
+          isFileUrlLiteral(chars, cursor + 1) &&
+          ownedBracketRegionIsEligible(cursor, drivePrefix, cursor)
+        ) {
+          const fileStart = cursor + 1;
+          claimedFileLiteralStarts.add(fileStart);
+          nestedFileSchemeStarts[fileStart] = 2;
+          forcedPath[fileStart] = 1;
+          let valueCursor = fileStart;
+          while (chars[valueCursor] !== "]") {
+            if (chars[valueCursor] === "&") {
+              const valueOrNameStart = valueCursor + 1;
+              let valueStart = valueOrNameStart;
+              while (isPathWord(chars[valueStart])) valueStart += 1;
+              if (chars[valueStart] === "=") {
+                valueStart += 1;
+              } else {
+                valueStart = valueOrNameStart;
+              }
+              if (isForwardSlashDrivePathStart(valueStart)) {
+                forcedPath[valueStart + 2] = 1;
+              }
+            }
+            valueCursor += 1;
+          }
+        }
+        return;
+      }
+      if (char === "&" || char === "|") {
+        if (char === "&" && drivePrefix === "all") {
+          const valueOrNameStart = cursor + 1;
+          let valueStart = valueOrNameStart;
+          while (isPathWord(chars[valueStart])) valueStart += 1;
+          if (chars[valueStart] === "=") {
+            valueStart += 1;
+          } else {
+            valueStart = valueOrNameStart;
+          }
+          if (isForwardSlashDrivePathStart(valueStart)) {
+            forcedPath[valueStart + 2] = 1;
+          }
+        }
+        return;
+      }
       if (
-        char === "&" ||
-        char === "|" ||
-        char === "[" ||
         char === "]" ||
         WHITESPACE_PATTERN.test(char)
       ) return;
       if (isFileUrlLiteral(chars, cursor)) {
+        if (!claimedFileLiteralHasEligibleContinuation(cursor)) return;
         claimedFileLiteralStarts.add(cursor);
         // Only this #1814 claimed-file completion writes marker 2. It stops
         // the owning path scan, but the forced scan starting here consumes it.
@@ -230,7 +306,153 @@ function findUrlPathStarts(chars: readonly string[]): UrlPathStarts {
       if (!isPathWord(chars[skipSeparatorRun(cursor + 1)])) return;
       nestedFileSchemeStarts[cursor] = 1;
       forcedPath[cursor + 1] = 1;
+      completedColon = true;
     }
+  };
+  const ownedBracketValuePathStart = (start: number): number =>
+    isForwardSlashDrivePathStart(start) && postCloseFilePathDrivePrefix !== "none"
+      ? start + 2
+      : start;
+  const simplePathEnd = (start: number): number => {
+    let cursor = start;
+    if (!isPathWord(chars[cursor])) return -1;
+    while (true) {
+      while (isPathWord(chars[cursor])) cursor += 1;
+      if (chars[cursor] !== "/") return cursor;
+      cursor += 1;
+      if (!isPathWord(chars[cursor])) return -1;
+    }
+  };
+  const simpleRootedPathEnd = (start: number): number => simplePathEnd(start + 1);
+  const simpleDrivePathEnd = (start: number): number => simplePathEnd(start + 3);
+  // The one admitted continuation authority is a plain host token with an
+  // optional numeric port. Values, delimiters, further schemes, or an empty
+  // authority refuse the continuation, and with it the complete region.
+  const isContinuationHostCharacter = (char: string | undefined): boolean =>
+    char !== undefined && /^[A-Za-z\d.-]$/u.test(char);
+  const continuationAuthorityEnd = (start: number): number => {
+    let cursor = start;
+    while (isContinuationHostCharacter(chars[cursor])) cursor += 1;
+    if (cursor === start) return -1;
+    if (chars[cursor] !== ":") return cursor;
+    const portStart = cursor + 1;
+    cursor = portStart;
+    while (/^\d$/u.test(chars[cursor] ?? "")) cursor += 1;
+    return cursor > portStart ? cursor : -1;
+  };
+  const optionalRootedQueryContinuationEnd = (start: number): number => {
+    if (chars[start] !== "(" || chars[start + 1] !== "[") return -1;
+    const schemeStart = start + 2;
+    if (
+      chars.slice(schemeStart, schemeStart + 8).join("").toLowerCase() !== "https://"
+    ) {
+      return -1;
+    }
+    const cursor = continuationAuthorityEnd(schemeStart + 8);
+    if (cursor < 0) return -1;
+    if (chars.slice(cursor, cursor + 6).join("").toLowerCase() !== "?key=/") return -1;
+    const rootedEnd = simpleRootedPathEnd(cursor + 5);
+    return rootedEnd >= 0 && chars[rootedEnd] === "]" ? rootedEnd + 1 : -1;
+  };
+  const isHttpsUrlLiteral = (start: number): boolean =>
+    chars.slice(start, start + 8).join("").toLowerCase() === "https://";
+  // A mixed owner or second mixed copy is straight when its private-root path
+  // is a run of path words and slashes that leads directly to a bracket,
+  // optionally through exactly one parenthesis. Returns that bracket or -1.
+  const straightOwnerBracketStart = (start: number): number => {
+    let cursor = start;
+    while (isPathWord(chars[cursor]) || chars[cursor] === "/" || chars[cursor] === "\\") {
+      cursor += 1;
+    }
+    if (chars[cursor] === "(") cursor += 1;
+    return chars[cursor] === "[" ? cursor : -1;
+  };
+  const ownedBracketRegionIsEligible = (
+    openIndex: number,
+    drivePrefix: OwnedBracketDrivePrefix,
+    straightOwnerBracket: number,
+  ): boolean => {
+    const headerStart = openIndex + 1;
+    if (!startsUrlSchemeLiteral(chars, headerStart)) return false;
+    if (drivePrefix === "nested-file" && !isFileUrlLiteral(chars, headerStart)) return false;
+    let cursor = headerStart;
+    while (chars[cursor] !== ":") cursor += 1;
+    cursor += 3;
+    // After its scheme the header is path-word text, slashes, and a numeric
+    // port. It must end in a path word at a value delimiter or the close; a
+    // second scheme, an empty path, or any other punctuation refuses.
+    while (
+      isPathWord(chars[cursor]) ||
+      chars[cursor] === "/" ||
+      (chars[cursor] === ":" && /^\d$/u.test(chars[cursor + 1] ?? ""))
+    ) {
+      cursor += 1;
+    }
+    if (
+      !isPathWord(chars[cursor - 1]) ||
+      (chars[cursor] !== "?" &&
+        chars[cursor] !== "#" &&
+        chars[cursor] !== "&" &&
+        chars[cursor] !== "]")
+    ) {
+      return false;
+    }
+    const headerEnd = cursor;
+    // The adopted bare-drive owner is straight and opens exactly this bracket.
+    // Any other gap in the owner path refuses the exception.
+    const admitsTerminalBareDrive =
+      drivePrefix === "all" &&
+      isHttpsUrlLiteral(headerStart) &&
+      straightOwnerBracket === openIndex;
+    let sawDrive = false;
+    while (chars[cursor] !== "]") {
+      const delimiter = chars[cursor];
+      if (delimiter !== "?" && delimiter !== "#" && delimiter !== "&") return false;
+      const firstValue = cursor === headerEnd;
+      cursor += 1;
+      const valueOrNameStart = cursor;
+      while (isPathWord(chars[cursor])) cursor += 1;
+      let name = "";
+      if (chars[cursor] === "=") {
+        if (cursor === valueOrNameStart) return false;
+        name = chars.slice(valueOrNameStart, cursor).join("").toLowerCase();
+        cursor += 1;
+      } else {
+        cursor = valueOrNameStart;
+      }
+      if (
+        admitsTerminalBareDrive &&
+        firstValue &&
+        delimiter === "?" &&
+        name === "key" &&
+        isForwardSlashDrivePathStart(cursor) &&
+        chars[cursor + 3] === "]"
+      ) {
+        sawDrive = true;
+        cursor += 3;
+        continue;
+      }
+      let valueEnd = -1;
+      let driveValue = false;
+      if (isForwardSlashDrivePathStart(cursor)) {
+        valueEnd = simpleDrivePathEnd(cursor);
+        driveValue = valueEnd >= 0;
+      } else if (chars[cursor] === "/") {
+        valueEnd = simpleRootedPathEnd(cursor);
+      } else if (isPathWord(chars[cursor])) {
+        valueEnd = cursor + 1;
+        while (isPathWord(chars[valueEnd])) valueEnd += 1;
+      }
+      if (valueEnd < 0) return false;
+      if (driveValue) {
+        sawDrive = true;
+        const continuationEnd = optionalRootedQueryContinuationEnd(valueEnd);
+        if (continuationEnd >= 0) valueEnd = continuationEnd;
+      }
+      cursor = valueEnd;
+      if (chars[cursor] === "(" || chars[cursor] === "[") return false;
+    }
+    return sawDrive;
   };
   const backslashSlashSuccessorPathStart = (
     start: number,
@@ -264,10 +486,25 @@ function findUrlPathStarts(chars: readonly string[]): UrlPathStarts {
     if (isWindowsDrivePathStart(chars, cursor) || backslashesAfterSlash >= 2) {
       return -1;
     }
-    if (isFileUrlLiteral(chars, cursor) && !completesClaimedComponent) {
+    if (
+      isFileUrlLiteral(chars, cursor) &&
+      (!completesClaimedComponent || chars[cursor + FILE_SCHEME.length + 3] !== "/")
+    ) {
       return -1;
     }
     return firstSlash >= 0 && isPathWord(chars[cursor]) ? firstSlash : -1;
+  };
+  const immediateBackslashSlashSuccessorStartsPrivateRoot = (start: number): boolean => {
+    let cursor = start;
+    while (isPathWord(chars[cursor])) cursor += 1;
+    while (chars[cursor] === "/" || chars[cursor] === "\\") {
+      cursor += 1;
+    }
+    const segmentStart = cursor;
+    while (isPathWord(chars[cursor])) cursor += 1;
+    const segment = chars.slice(segmentStart, cursor).join("").toLowerCase();
+    const privateRoot = segment === "users" || segment === "home" || segment === "root";
+    return privateRoot && (chars[cursor] === "/" || chars[cursor] === "\\");
   };
   const previousSuccessorDelimiter = (delimiterIndex: number, lowerBound: number): number => {
     let cursor = delimiterIndex - 1;
@@ -359,9 +596,12 @@ function findUrlPathStarts(chars: readonly string[]): UrlPathStarts {
   };
   const armClaimedBracketTail = (
     successorStart: number,
-    inheritedQuote: boolean,
-    ownsPrivateRelative = inheritedQuote,
-    ownsAdjacentComponents = true,
+    options: {
+      inheritedQuote: boolean;
+      ownsPrivateRelative?: boolean;
+      ownsAdjacentComponents?: boolean;
+      drivePrefix?: OwnedBracketDrivePrefix;
+    },
   ): boolean => {
     const privateRootPathStart = returnedParentPrivateRootPathStart(successorStart);
     if (
@@ -373,13 +613,14 @@ function findUrlPathStarts(chars: readonly string[]): UrlPathStarts {
       armBracketTail(
         successorStart,
         successorStart,
-        false,
-        true,
-        inheritedQuote,
-        ownsPrivateRelative,
-        false,
-        ownsAdjacentComponents,
-        true,
+        {
+          fileUrl: false,
+          forced: true,
+          inheritedQuote: options.inheritedQuote,
+          ownsPrivateRelative: options.ownsPrivateRelative,
+          ownsAdjacentComponents: options.ownsAdjacentComponents,
+          drivePrefix: options.drivePrefix,
+        },
       );
       return true;
     }
@@ -388,13 +629,14 @@ function findUrlPathStarts(chars: readonly string[]): UrlPathStarts {
     armBracketTail(
       privateRootPathStart,
       successorStart,
-      false,
-      true,
-      inheritedQuote,
-      ownsPrivateRelative,
-      false,
-      ownsAdjacentComponents,
-      true,
+      {
+        fileUrl: false,
+        forced: true,
+        inheritedQuote: options.inheritedQuote,
+        ownsPrivateRelative: options.ownsPrivateRelative,
+        ownsAdjacentComponents: options.ownsAdjacentComponents,
+        drivePrefix: options.drivePrefix,
+      },
     );
     return true;
   };
@@ -427,6 +669,19 @@ function findUrlPathStarts(chars: readonly string[]): UrlPathStarts {
   let postCloseFilePathComponentHasQuery = false;
   let postCloseFilePathOwnsAdjacentComponents = true;
   let postCloseFilePathOwnsBackslashQuery = true;
+  let postCloseFilePathRequestedDrivePrefix: OwnedBracketDrivePrefix = "none";
+  let postCloseFilePathDrivePrefix: OwnedBracketDrivePrefix = "none";
+  let postCloseFilePathSoftWhitespaceDrivePrefix: OwnedBracketDrivePrefix = "none";
+  // Whether the current owned component opened with a query or fragment
+  // delimiter: only then does the frozen scanner already link a following
+  // file-header copy on the first pass.
+  let postCloseFilePathComponentOpensQuery = false;
+  // Whether the owner text before the selected bracket contains a URL scheme
+  // literal; such an origin never requests the nested-file drive prefix.
+  let postCloseFilePathOriginHasScheme = false;
+  // The bracket the owner's straight path leads to, measured once per tail
+  // activation on the first depth-zero opener (-2 = not measured, -1 = none).
+  let postCloseFilePathStraightOwnerBracket = -2;
   let inheritedFileQuoteParentOwnerBracketDepth = 0;
   let inheritedFileQuoteEnd = -1;
   let cachedEnclosingQuote = 0;
@@ -442,6 +697,7 @@ function findUrlPathStarts(chars: readonly string[]): UrlPathStarts {
   let quotedQueryPublicUrl = false;
   let quotedQueryPublicUrlOwnQueryOrFragment = false;
   let backslashSlashClaimActive = false;
+  let backslashSlashPrivateRootClaimActive = false;
   let activeNestedFileSchemeStart = -1;
 
   for (let index = 0; index < chars.length; index += 1) {
@@ -494,11 +750,26 @@ function findUrlPathStarts(chars: readonly string[]): UrlPathStarts {
         postCloseFilePathComponentHasQuery = false;
         postCloseFilePathOwnsAdjacentComponents = true;
         postCloseFilePathOwnsBackslashQuery = true;
+        postCloseFilePathRequestedDrivePrefix = "none";
+        postCloseFilePathDrivePrefix = "none";
+        postCloseFilePathSoftWhitespaceDrivePrefix = "none";
       } else {
         postCloseFilePathOwnsAdjacentComponents = false;
         postCloseFilePathOwnsBackslashQuery = false;
+        if (
+          postCloseFilePathBracketDepth === 0
+        ) {
+          if (postCloseFilePathSoftWhitespaceDrivePrefix === "none") {
+            postCloseFilePathRequestedDrivePrefix = "none";
+            postCloseFilePathDrivePrefix = "none";
+          } else {
+            postCloseFilePathRequestedDrivePrefix = postCloseFilePathSoftWhitespaceDrivePrefix;
+            postCloseFilePathDrivePrefix = postCloseFilePathSoftWhitespaceDrivePrefix;
+          }
+        }
       }
       backslashSlashClaimActive = false;
+      backslashSlashPrivateRootClaimActive = false;
       activeNestedFileSchemeStart = -1;
       siblingWrapperStart = -1;
       siblingWrapperOwnerBracketDepth = 0;
@@ -521,7 +792,7 @@ function findUrlPathStarts(chars: readonly string[]): UrlPathStarts {
         repeatedPipeHandoffWrapperDepths.add(inheritedFileQuoteParentOwnerBracketDepth);
         inheritedQuoteTailWrapperDepths.add(inheritedFileQuoteParentOwnerBracketDepth);
         const successorStart = continuationStart + 1;
-        armClaimedBracketTail(successorStart, true);
+        armClaimedBracketTail(successorStart, { inheritedQuote: true });
         inheritedFileQuoteParentOwnerBracketDepth = 0;
         inheritedFileQuoteEnd = -1;
       } else {
@@ -594,7 +865,12 @@ function findUrlPathStarts(chars: readonly string[]): UrlPathStarts {
           fileTailBracketDepth = 0;
           pendingFileTailBackslash = false;
           pendingNestedUrlContinuation = false;
-          armBracketTail(index, index + 1, true, false, false);
+          armBracketTail(index, index + 1, {
+            fileUrl: true,
+            forced: false,
+            inheritedQuote: false,
+            softWhitespaceDrivePrefix: "nested-file",
+          });
           continue;
         }
       } else {
@@ -611,19 +887,33 @@ function findUrlPathStarts(chars: readonly string[]): UrlPathStarts {
     }
     if (postCloseFilePathActive && index >= postCloseFilePathTrackingStart) {
       if (
+        postCloseFilePathBracketDepth === 0 &&
+        char === ":" &&
+        chars[index + 1] === "/" &&
+        chars[index + 2] === "/"
+      ) {
+        postCloseFilePathOriginHasScheme = true;
+      }
+      if (
         postCloseFilePathBracketDepth > 0 &&
         !postCloseFilePathComponentHasQuery &&
         (char === "?" || char === "#" || char === "&" || char === "=")
       ) {
         postCloseFilePathComponent += 1;
         postCloseFilePathComponentHasQuery = true;
+        postCloseFilePathComponentOpensQuery = char === "?" || char === "#";
       }
       const ownsAdjacentComponents = postCloseFilePathOwnsAdjacentComponents;
       const rearmedAtSuccessor =
         postCloseFilePathInheritedQuote &&
         postCloseFilePathBracketDepth === 0 &&
         (char === "&" || char === "|") &&
-        armClaimedBracketTail(index + 1, true, true, false);
+        armClaimedBracketTail(index + 1, {
+          inheritedQuote: true,
+          ownsPrivateRelative: true,
+          ownsAdjacentComponents: false,
+          drivePrefix: "nested-file",
+        });
       const ownedQueryValueStart =
         postCloseFilePathOwnsRootedQuery &&
         postCloseFilePathBracketDepth === 0 &&
@@ -634,9 +924,12 @@ function findUrlPathStarts(chars: readonly string[]): UrlPathStarts {
         ownedQueryValueStart >= 0 &&
         armClaimedBracketTail(
           ownedQueryValueStart,
-          postCloseFilePathInheritedQuote,
-          postCloseFilePathOwnsPrivateRelative,
-          ownsAdjacentComponents,
+          {
+            inheritedQuote: postCloseFilePathInheritedQuote,
+            ownsPrivateRelative: postCloseFilePathOwnsPrivateRelative,
+            ownsAdjacentComponents,
+            drivePrefix: postCloseFilePathDrivePrefix,
+          },
         );
       // An inherited-quote tail also owns a private-root relative value after
       // an ampersand or pipe, which its owner redacts on the next pass.
@@ -651,6 +944,24 @@ function findUrlPathStarts(chars: readonly string[]): UrlPathStarts {
       } else if (char === "[") {
         if (postCloseFilePathBracketDepth === 0) {
           postCloseFilePathComponentHasQuery = false;
+          if (postCloseFilePathStraightOwnerBracket === -2) {
+            postCloseFilePathStraightOwnerBracket = straightOwnerBracketStart(
+              postCloseFilePathTrackingStart,
+            );
+          }
+          postCloseFilePathDrivePrefix =
+            postCloseFilePathRequestedDrivePrefix !== "none" &&
+            !(
+              postCloseFilePathRequestedDrivePrefix === "nested-file" &&
+              postCloseFilePathOriginHasScheme
+            ) &&
+            ownedBracketRegionIsEligible(
+              index,
+              postCloseFilePathRequestedDrivePrefix,
+              postCloseFilePathStraightOwnerBracket,
+            )
+              ? postCloseFilePathRequestedDrivePrefix
+              : "none";
         }
         postCloseFilePathBracketDepth += 1;
       } else if (char === "]" && postCloseFilePathBracketDepth > 0) {
@@ -672,11 +983,43 @@ function findUrlPathStarts(chars: readonly string[]): UrlPathStarts {
               const rootedPathStart = bridgedRootedPathStart(index + 1);
               if (rootedPathStart >= 0) forcedPath[rootedPathStart] = 1;
             }
-            postCloseFilePathActive = false;
-            postCloseFilePathComponent = 0;
-            postCloseFilePathComponentHasQuery = false;
-            postCloseFilePathOwnsAdjacentComponents = true;
-            postCloseFilePathOwnsBackslashQuery = true;
+            const mixedSuccessorStart = index + 2;
+            const mixedPathStart =
+              completesNewComponent && next === "&"
+                ? backslashSlashSuccessorPathStart(mixedSuccessorStart)
+                : -1;
+            const mixedBracketStart =
+              mixedPathStart >= 0 ? straightOwnerBracketStart(mixedSuccessorStart) : -1;
+            // A second mixed copy is an independent copy only of a straight
+            // owner; a bent owner keeps the frozen pass sequence for its copy.
+            const rearmedAtMixedSuccessor =
+              mixedPathStart >= 0 &&
+              postCloseFilePathStraightOwnerBracket >= 0 &&
+              immediateBackslashSlashSuccessorStartsPrivateRoot(mixedSuccessorStart) &&
+              mixedBracketStart >= 0 &&
+              (postCloseFilePathComponentOpensQuery ||
+                !isFileUrlLiteral(chars, mixedBracketStart + 1)) &&
+              ownedBracketRegionIsEligible(mixedBracketStart, "all", mixedBracketStart);
+            if (rearmedAtMixedSuccessor) {
+              forcedPath[mixedPathStart] = 1;
+              armBracketTail(mixedPathStart, mixedSuccessorStart, {
+                fileUrl: false,
+                forced: true,
+                inheritedQuote: false,
+                ownsPrivateRelative: true,
+                ownsAdjacentComponents: false,
+                drivePrefix: "all",
+              });
+            } else {
+              postCloseFilePathActive = false;
+              postCloseFilePathComponent = 0;
+              postCloseFilePathComponentHasQuery = false;
+              postCloseFilePathOwnsAdjacentComponents = true;
+              postCloseFilePathOwnsBackslashQuery = true;
+              postCloseFilePathRequestedDrivePrefix = "none";
+              postCloseFilePathDrivePrefix = "none";
+              postCloseFilePathSoftWhitespaceDrivePrefix = "none";
+            }
           }
         }
       } else if (
@@ -697,7 +1040,7 @@ function findUrlPathStarts(chars: readonly string[]): UrlPathStarts {
           isPathWord(chars[skipSeparatorRun(index + 1)])) ||
           isForwardSlashDrivePathStart(index + 1))
       ) {
-        forcedPath[index + 1] = 1;
+        forcedPath[ownedBracketValuePathStart(index + 1)] = 1;
       } else if (relativeRootStart >= 0) {
         forcedPath[relativeRootStart] = 1;
       } else if (
@@ -713,6 +1056,9 @@ function findUrlPathStarts(chars: readonly string[]): UrlPathStarts {
         postCloseFilePathComponentHasQuery = false;
         postCloseFilePathOwnsAdjacentComponents = true;
         postCloseFilePathOwnsBackslashQuery = true;
+        postCloseFilePathRequestedDrivePrefix = "none";
+        postCloseFilePathDrivePrefix = "none";
+        postCloseFilePathSoftWhitespaceDrivePrefix = "none";
       }
     }
     if (
@@ -893,6 +1239,7 @@ function findUrlPathStarts(chars: readonly string[]): UrlPathStarts {
       quotedQueryPublicUrl = false;
       quotedQueryPublicUrlOwnQueryOrFragment = false;
       backslashSlashClaimActive = false;
+      backslashSlashPrivateRootClaimActive = false;
       schemeLength = 0;
       fileSchemeLength = 0;
       schemeQuote = directNestedFileQuote || inheritedNestedFileQuote;
@@ -925,7 +1272,7 @@ function findUrlPathStarts(chars: readonly string[]): UrlPathStarts {
         previousSuccessorIsPlain(index, activeNestedFileSchemeStart)) &&
       laterSuccessorBeforeBracket[index + 1] !== 1 &&
       !(pathlessFileQueryOwnerBracketDepth === 0 && queryBeforeBracket[index + 1] === 1)
-        ? backslashSlashSuccessorPathStart(index + 1, backslashSlashClaimActive)
+        ? backslashSlashSuccessorPathStart(index + 1, backslashSlashPrivateRootClaimActive)
         : -1;
     if (
       (activeNestedFileUrlParentOwnerBracketDepth > 0 || activeBackslashSlashPathStart >= 0) &&
@@ -964,6 +1311,9 @@ function findUrlPathStarts(chars: readonly string[]): UrlPathStarts {
                 isWindowsDrivePathStart(chars, index + 1))
             ? index + 1
             : -1;
+      const preservesMixedDrivePrefix =
+        backslashSlashPathStart >= 0 &&
+        immediateBackslashSlashSuccessorStartsPrivateRoot(index + 1);
       if (activeChildClaimStart >= 0 && !absorbsClaimInsideOwnedBracketTail()) {
         const inheritedQuote = inheritedQuoteTailWrapperDepths.has(
           activeNestedFileUrlParentOwnerBracketDepth,
@@ -973,18 +1323,23 @@ function findUrlPathStarts(chars: readonly string[]): UrlPathStarts {
         armBracketTail(
           activeChildClaimStart,
           index + 1,
-          false,
-          true,
-          inheritedQuote,
-          ownsPrivateRelative,
-          ownsRootedQuery,
-          false,
-          true,
+          {
+            fileUrl: false,
+            forced: true,
+            inheritedQuote,
+            ownsPrivateRelative,
+            ownsRootedQuery,
+            ownsAdjacentComponents: false,
+            drivePrefix: preservesMixedDrivePrefix ? "all" : "nested-file",
+          },
         );
       }
       if (backslashSlashPathStart >= 0) {
         forcedPath[backslashSlashPathStart] = 1;
-        completeBackslashSlashClaim(backslashSlashPathStart);
+        completeBackslashSlashClaim(
+          backslashSlashPathStart,
+          preservesMixedDrivePrefix ? "all" : "nested-file",
+        );
       }
       const keepsClaimAcrossOrdinaryRelative: boolean =
         backslashSlashClaimActive &&
@@ -994,6 +1349,9 @@ function findUrlPathStarts(chars: readonly string[]): UrlPathStarts {
       backslashSlashClaimActive =
         backslashSlashPathStart >= 0 ||
         keepsClaimAcrossOrdinaryRelative;
+      backslashSlashPrivateRootClaimActive =
+        backslashSlashPathStart >= 0 &&
+        immediateBackslashSlashSuccessorStartsPrivateRoot(index + 1);
       if (returnsToParent) {
         separator = -1;
         exactFileScheme = false;
@@ -1038,13 +1396,16 @@ function findUrlPathStarts(chars: readonly string[]): UrlPathStarts {
           armBracketTail(
             index + 1,
             index + 1,
-            false,
-            true,
-            inheritedQuote,
-            ownsPrivateRelative,
-            true,
-            false,
-            ownsBackslashQuery,
+            {
+              fileUrl: false,
+              forced: true,
+              inheritedQuote,
+              ownsPrivateRelative,
+              ownsRootedQuery: true,
+              ownsAdjacentComponents: false,
+              ownsBackslashQuery,
+              drivePrefix: "nested-file",
+            },
           );
         }
       } else if (
@@ -1057,17 +1418,21 @@ function findUrlPathStarts(chars: readonly string[]): UrlPathStarts {
           armBracketTail(
             privateRootPathStart,
             index + 1,
-            false,
-            true,
-            inheritedQuote,
-            ownsPrivateRelative,
-            true,
-            false,
-            ownsBackslashQuery,
+            {
+              fileUrl: false,
+              forced: true,
+              inheritedQuote,
+              ownsPrivateRelative,
+              ownsRootedQuery: true,
+              ownsAdjacentComponents: false,
+              ownsBackslashQuery,
+              drivePrefix: "nested-file",
+            },
           );
         }
       }
       backslashSlashClaimActive = false;
+      backslashSlashPrivateRootClaimActive = false;
     }
     if (restartedPathlessFile && char === "[") {
       restartedPathlessBrackets += 1;
@@ -1422,7 +1787,15 @@ function findUrlPathStarts(chars: readonly string[]): UrlPathStarts {
     ) {
       forcedPath[index] = 1;
       if (!absorbsClaimInsideOwnedBracketTail()) {
-        armBracketTail(index, index + 1, false, true, false, false, false, false, false);
+        armBracketTail(index, index + 1, {
+          fileUrl: false,
+          forced: true,
+          inheritedQuote: false,
+          ownsPrivateRelative: false,
+          ownsAdjacentComponents: false,
+          ownsBackslashQuery: false,
+          drivePrefix: "nested-file",
+        });
       }
     }
     if (
@@ -1432,7 +1805,15 @@ function findUrlPathStarts(chars: readonly string[]): UrlPathStarts {
     ) {
       forcedPath[index] = 1;
       if (!absorbsClaimInsideOwnedBracketTail()) {
-        armBracketTail(index, index + 1, false, true, false, false, false, false, false);
+        armBracketTail(index, index + 1, {
+          fileUrl: false,
+          forced: true,
+          inheritedQuote: false,
+          ownsPrivateRelative: false,
+          ownsAdjacentComponents: false,
+          ownsBackslashQuery: false,
+          drivePrefix: "nested-file",
+        });
       }
       schemeLength = 0;
       fileSchemeLength = 0;
@@ -1455,7 +1836,15 @@ function findUrlPathStarts(chars: readonly string[]): UrlPathStarts {
       quotedQueryPublicUrlOwnQueryOrFragment = false;
       file[index] = 1;
       if (!absorbsClaimInsideOwnedBracketTail()) {
-        armBracketTail(index, index + 1, true, false, false, false, false, false, false);
+        armBracketTail(index, index + 1, {
+          fileUrl: true,
+          forced: false,
+          inheritedQuote: false,
+          ownsPrivateRelative: false,
+          ownsAdjacentComponents: false,
+          ownsBackslashQuery: false,
+          drivePrefix: "nested-file",
+        });
       }
       continue;
     }

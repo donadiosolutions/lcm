@@ -1,0 +1,236 @@
+[
+  {
+    "name": "F1-double",
+    "input": "file://h?x=[file:///Users/CHILD/x&later\\/home/alice/s([https://other?key=C://srv/x&k2=D:/Users/d]",
+    "requiredPasses": [
+      "file://h?x=[file://<path>&later\\<path>?key=<path>&k2=<path>]",
+      "file://h?x=[file://<path>&later\\<path>?key=<path>&k2=<path>]",
+      "file://h?x=[file://<path>&later\\<path>?key=<path>&k2=<path>]"
+    ]
+  },
+  {
+    "name": "F1-public",
+    "input": "file://h?x=[file:///Users/CHILD/x&later\\/home/alice/s([https://other?key=https://pub.test/x&k2=D:/Users/d]",
+    "requiredPasses": [
+      "file://h?x=[file://<path>&later\\<path>?key=https://pub.test/x&k2=<path>]",
+      "file://h?x=[file://<path>&later\\<path>?key=https://pub.test/x&k2=<path>]",
+      "file://h?x=[file://<path>&later\\<path>?key=https://pub.test/x&k2=<path>]"
+    ]
+  },
+  {
+    "name": "F1-anonymous",
+    "input": "file://h?x=[file:///Users/CHILD/x&later\\/home/alice/s([https://other=C:/]",
+    "requiredPasses": [
+      "file://h?x=[file://<path>&later\\<path>=<path>]",
+      "file://h?x=[file://<path>&later\\<path>=<path>]",
+      "file://h?x=[file://<path>&later\\<path>=<path>]"
+    ]
+  },
+  {
+    "name": "F1-soft-bare",
+    "input": "file://h?x=[file:///Users/CHILD/x&later\\/home/alice/s([https://other?key=C:/Users/S1/x &k2=D:/]",
+    "requiredPasses": [
+      "file://h?x=[file://<path>&later\\<path>?key=<path>&k2=<path>]",
+      "file://h?x=[file://<path>&later\\<path>?key=<path>&k2=<path>]",
+      "file://h?x=[file://<path>&later\\<path>?key=<path>&k2=<path>]"
+    ]
+  },
+  {
+    "name": "F4-partial",
+    "input": "file://h?x=[file:///Users/CHILD/x&later\\/home/alice/s([https://other?key=C:/Users/K/x&D:/]",
+    "requiredPasses": [
+      "file://h?x=[file://<path>&later\\<path>?key=<path>&<path>]",
+      "file://h?x=[file://<path>&later\\<path>?key=<path>&<path>]",
+      "file://h?x=[file://<path>&later\\<path>?key=<path>&<path>]"
+    ]
+  },
+  {
+    "name": "F5-anonymous-compound",
+    "input": "file://h?x=[file:///Users/CHILD/x&later\\/home/alice/s([https://other=C:/C:/Users/K]",
+    "requiredPasses": [
+      "file://h?x=[file://<path>&later\\<path>=<path>:<path>]",
+      "file://h?x=[file://<path>&later\\<path>=<path>:<path>]",
+      "file://h?x=[file://<path>&later\\<path>=<path>:<path>]"
+    ]
+  },
+  {
+    "name": "F5-deep-file",
+    "input": "file://h?x=[file:///Users/CHILD/x&later\\/home/alice/s([https://other&C:/Users/K/file:///x]",
+    "requiredPasses": [
+      "file://h?x=[file://<path>&later\\<path>&<path>file://<path>]",
+      "file://h?x=[file://<path>&later\\<path>&<path>file://<path>]",
+      "file://h?x=[file://<path>&later\\<path>&<path>file://<path>]"
+    ]
+  },
+  {
+    "name": "F5-soft-compound",
+    "input": "file://h?x=[file:///Users/CHILD/x&later\\/home/alice/s([https://other?key=C:/Users/S1/x &k2=C:/C:/Users/K]",
+    "requiredPasses": [
+      "file://h?x=[file://<path>&later\\<path>?key=<path>&k2=<path>:<path>]",
+      "file://h?x=[file://<path>&later\\<path>?key=<path>&k2=<path>:<path>]",
+      "file://h?x=[file://<path>&later\\<path>?key=<path>&k2=<path>:<path>]"
+    ]
+  },
+  {
+    "name": "A-compound-first",
+    "input": "file://h?x=[file:///Users/CHILD/x&later\\/home/alice/s([https://other?key=C:/file:///Users/K&k2=D:/Users/d]",
+    "requiredPasses": [
+      "file://h?x=[file://<path>&later\\<path>?key=<path>file://<path>&k2=<path>]",
+      "file://h?x=[file://<path>&later\\<path>?key=<path>file://<path>&k2=<path>]",
+      "file://h?x=[file://<path>&later\\<path>?key=<path>file://<path>&k2=<path>]"
+    ]
+  },
+  {
+    "name": "plain-target",
+    "input": "file://h?x=[file:///Users/CHILD/x&later\\/home/alice/s([https://other?key=C:/Users/K/x]",
+    "requiredPasses": [
+      "file://h?x=[file://<path>&later\\<path>?key=C:<path>]",
+      "file://h?x=[file://<path>&later\\<path>?key=C:<path>]",
+      "file://h?x=[file://<path>&later\\<path>?key=C:<path>]"
+    ]
+  },
+  {
+    "name": "bare-query-target",
+    "input": "file://h?x=[file:///Users/CHILD/x&later\\/home/alice/s([https://other?key=C:/]",
+    "requiredPasses": [
+      "file://h?x=[file://<path>&later\\<path>?key=C:<path>]",
+      "file://h?x=[file://<path>&later\\<path>?key=C:<path>]",
+      "file://h?x=[file://<path>&later\\<path>?key=C:<path>]"
+    ]
+  },
+  {
+    "name": "rooted-then-drive-target",
+    "input": "file://h?x=[file:///Users/CHILD/x&later\\/home/alice/s([https://other?key=/Users/K/x&k2=C:/Users/B/y]",
+    "requiredPasses": [
+      "file://h?x=[file://<path>&later\\<path>?key=<path>&k2=C:<path>]",
+      "file://h?x=[file://<path>&later\\<path>?key=<path>&k2=C:<path>]",
+      "file://h?x=[file://<path>&later\\<path>?key=<path>&k2=C:<path>]"
+    ]
+  },
+  {
+    "name": "soft-pathword-target",
+    "input": "file://h?x=[file:///Users/CHILD/x&later\\/home/alice/s([https://other?key=C:/Users/S1/x &k2=D:/Users/S2/y]",
+    "requiredPasses": [
+      "file://h?x=[file://<path>&later\\<path>?key=<path>&k2=<path>]",
+      "file://h?x=[file://<path>&later\\<path>?key=<path>&k2=<path>]",
+      "file://h?x=[file://<path>&later\\<path>?key=<path>&k2=<path>]"
+    ]
+  },
+  {
+    "name": "two-drives-target",
+    "input": "file://h?x=[file:///Users/CHILD/x&later\\/home/alice/s([https://other?key=C:/Users/K/x&k2=D:/Users/d]",
+    "requiredPasses": [
+      "file://h?x=[file://<path>&later\\<path>?key=C:<path>&k2=D:<path>]",
+      "file://h?x=[file://<path>&later\\<path>?key=C:<path>&k2=D:<path>]",
+      "file://h?x=[file://<path>&later\\<path>?key=C:<path>&k2=D:<path>]"
+    ]
+  },
+  {
+    "name": "F1-public-nested",
+    "input": "file://h?x=[file:///Users/CHILD/x&/Users/alice/s[file:///b&https://pub.test/x[file:///c&D:/Users/d]]",
+    "requiredPasses": [
+      "file://h?x=[file://<path>&<path>&https://pub.test/x[file://<path>&<path>]]",
+      "file://h?x=[file://<path>&<path>&https://pub.test/x[file://<path>&<path>]]",
+      "file://h?x=[file://<path>&<path>&https://pub.test/x[file://<path>&<path>]]"
+    ]
+  },
+  {
+    "name": "F1-file-first",
+    "input": "file://h?x=[file:///Users/CHILD/x&later\\/home/alice/s([https://other?key=file:///Users/K&k2=D:/]",
+    "requiredPasses": [
+      "file://h?x=[file://<path>&later\\<path>?key=file://<path>&k2=<path>]",
+      "file://h?x=[file://<path>&later\\<path>?key=file://<path>&k2=<path>]",
+      "file://h?x=[file://<path>&later\\<path>?key=file://<path>&k2=<path>]"
+    ]
+  },
+  {
+    "name": "F2-file",
+    "input": "file://h?x=[file:///Users/CHILD/x&later\\/home/alice/s([https://other?key=/Users/S0/x]&later\\/home/bob/s([https://other?key=C:/file:///Users/K]",
+    "requiredPasses": [
+      "file://h?x=[file://<path>&later\\<path>?key=<path>]&later<path>?key=C:/file://<path>]",
+      "file://h?x=[file://<path>&later\\<path>?key=<path>]&later<path>?key=C:<path><path>]",
+      "file://h?x=[file://<path>&later\\<path>?key=<path>]&later<path>?key=C:<path><path>]"
+    ]
+  },
+  {
+    "name": "F3-bare",
+    "input": "file://h?x=[file:///Users/CHILD/x&later\\/home/alice/s([https://other?key=/Users/S0/x]&later\\/home/bob/s([https://other&C:/]",
+    "requiredPasses": [
+      "file://h?x=[file://<path>&later\\<path>?key=<path>]&later<path>&C:/]",
+      "file://h?x=[file://<path>&later\\<path>?key=<path>]&later<path>&C:/]",
+      "file://h?x=[file://<path>&later\\<path>?key=<path>]&later<path>&C:/]"
+    ]
+  },
+  {
+    "name": "F3-compound",
+    "input": "file://h?x=[file:///Users/CHILD/x&later\\/home/alice/s([https://other?key=/Users/S0/x]&later\\/home/bob/s([https://other&C:/C:/Users/K]",
+    "requiredPasses": [
+      "file://h?x=[file://<path>&later\\<path>?key=<path>]&later<path>&C:/C:/Users/K]",
+      "file://h?x=[file://<path>&later\\<path>?key=<path>]&later<path>&C:<path>:<path>]",
+      "file://h?x=[file://<path>&later\\<path>?key=<path>]&later<path>&C:<path>:<path>]"
+    ]
+  },
+  {
+    "name": "second-bare-target",
+    "input": "file://h?x=[file:///Users/CHILD/x&later\\/home/alice/s([https://other?key=/Users/S0/x]&later\\/home/bob/s([https://other?key=C:/]",
+    "requiredPasses": [
+      "file://h?x=[file://<path>&later\\<path>?key=<path>]&later<path>?key=C:<path>]",
+      "file://h?x=[file://<path>&later\\<path>?key=<path>]&later<path>?key=C:<path>]",
+      "file://h?x=[file://<path>&later\\<path>?key=<path>]&later<path>?key=C:<path>]"
+    ]
+  },
+  {
+    "name": "second-drive-target",
+    "input": "file://h?x=[file:///Users/CHILD/x&later\\/home/alice/s([https://other?key=/Users/S0/x]&later\\/home/bob/s([https://other?key=C:/Users/K/x]",
+    "requiredPasses": [
+      "file://h?x=[file://<path>&later\\<path>?key=<path>]&later<path>?key=C:<path>]",
+      "file://h?x=[file://<path>&later\\<path>?key=<path>]&later<path>?key=C:<path>]",
+      "file://h?x=[file://<path>&later\\<path>?key=<path>]&later<path>?key=C:<path>]"
+    ]
+  },
+  {
+    "name": "nested-file-target",
+    "input": "file://h?x=[file:///Users/CHILD/x&/Users/alice/s[file:///b&C:/Users/c]]",
+    "requiredPasses": [
+      "file://h?x=[file://<path>&<path>&C:<path>]]",
+      "file://h?x=[file://<path>&<path>&C:<path>]]",
+      "file://h?x=[file://<path>&<path>&C:<path>]]"
+    ]
+  },
+  {
+    "name": "R2-6-nested-file",
+    "input": "file://h?x=[file:///Users/CHILD/x&later\\/home/alice/s[file:///b&C:/Users/c]]",
+    "requiredPasses": [
+      "file://h?x=[file://<path>&later\\<path>file://<path>&C:<path>]]",
+      "file://h?x=[file://<path>&later\\<path>file://<path>&C:<path>]]",
+      "file://h?x=[file://<path>&later\\<path>file://<path>&C:<path>]]"
+    ]
+  },
+  {
+    "name": "R2-6-file-owner",
+    "input": "file://h?x=[file:///Users/CHILD/x&later\\/home/file:///Users/S/s([https://other?key=C:/Users/S2/x]",
+    "requiredPasses": [
+      "file://h?x=[file://<path>&later\\<path><path>?key=C:<path>]",
+      "file://h?x=[file://<path>&later\\<path><path>?key=C:<path>]",
+      "file://h?x=[file://<path>&later\\<path><path>?key=C:<path>]"
+    ]
+  },
+  {
+    "name": "genuine1785",
+    "input": "file://h?x=[file:///Users/CHILD/x&later/home/alice/s([https://other?key=C:/Users/K/x]",
+    "requiredPasses": [
+      "file://h?x=[file://<path>&later<path>?key=<path>]",
+      "file://h?x=[file://<path>&later<path>?key=<path>]",
+      "file://h?x=[file://<path>&later<path>?key=<path>]"
+    ]
+  },
+  {
+    "name": "public-after-first",
+    "input": "file://h?x=[file:///Users/CHILD/x&later\\/home/alice/s([https://other?key=C:/Users/K/x&k2=https://pub.test/y&k3=D:/Users/d]",
+    "requiredPasses": [
+      "file://h?x=[file://<path>&later\\<path>?key=<path>&k2=https://pub.test/y&k3=<path>]",
+      "file://h?x=[file://<path>&later\\<path>?key=<path>&k2=https://pub.test/y&k3=<path>]",
+      "file://h?x=[file://<path>&later\\<path>?key=<path>&k2=https://pub.test/y&k3=<path>]"
+    ]
+  }
+]
