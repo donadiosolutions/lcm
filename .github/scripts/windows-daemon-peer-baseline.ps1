@@ -52,31 +52,94 @@ function Get-ProfilePath($sid) {
   return $profile.LocalPath
 }
 
+function Read-ActorDiagnostic($path) {
+  $result = @{ status = 'unavailable'; stage = 'unavailable'; errorClass = 'unavailable';
+    errorCode = 'unavailable'; homeProfileMismatch = $null }
+  $stream = $null
+  try {
+    if (-not (Test-Path -LiteralPath $path)) { $result.status = 'missing'; return $result }
+    $stream = [IO.File]::OpenRead($path)
+    $bytes = New-Object byte[] 1025
+    $count = $stream.Read($bytes, 0, $bytes.Length)
+    if ($count -gt 1024) { $result.status = 'oversized'; return $result }
+    $text = [Text.UTF8Encoding]::new($false, $true).GetString($bytes, 0, $count)
+    if (-not $text.TrimStart().StartsWith('{')) { $result.status = 'invalid'; return $result }
+    $parsed = $text | ConvertFrom-Json -ErrorAction Stop
+    $fields = @('version', 'stage', 'errorClass', 'errorCode', 'homeProfileMismatch')
+    if (@($parsed.PSObject.Properties).Count -ne $fields.Count -or
+        @($parsed.PSObject.Properties.Name | Where-Object { $fields -cnotcontains $_ }).Count -ne 0 -or
+        ($parsed.version -isnot [int] -and $parsed.version -isnot [long]) -or $parsed.version -ne 1 -or
+        $parsed.stage -isnot [string] -or $parsed.errorClass -isnot [string] -or $parsed.errorCode -isnot [string] -or
+        ($null -ne $parsed.homeProfileMismatch -and $parsed.homeProfileMismatch -isnot [bool])) {
+      $result.status = 'invalid'; return $result
+    }
+    $result.status = 'valid'
+    $result.stage = if ($parsed.stage -cin @('arguments', 'paths', 'profile', 'tools', 'identity',
+        'commands', 'state', 'cleanup', 'result', 'complete')) { $parsed.stage } else { 'unavailable' }
+    $result.errorClass = if ($parsed.errorClass -cin @('none', 'Error', 'TypeError', 'RangeError',
+        'SyntaxError', 'other')) { $parsed.errorClass } else { 'other' }
+    $result.errorCode = if ($parsed.errorCode -cin @('none', 'EACCES', 'EPERM', 'EINVAL', 'ENOENT',
+        'ENOTSUP', 'ETIMEDOUT', 'ENOBUFS', 'other')) { $parsed.errorCode } else { 'other' }
+    $result.homeProfileMismatch = $parsed.homeProfileMismatch
+  } catch { $result.status = 'invalid' }
+  finally { if ($null -ne $stream) { $stream.Dispose() } }
+  return $result
+}
+
 function Invoke-Actor($identity, $role) {
-  $arguments = '"' + $actor + '" ' + $role + ' ' + $runId
-  $process = Start-Process -FilePath $node -ArgumentList $arguments -Credential $identity.Credential `
-    -LoadUserProfile -WindowStyle Hidden -PassThru
-  if (-not $process.WaitForExit(120000)) {
-    & $taskkill /PID $process.Id /T /F | Out-Null
-    throw 'Standard-user actor exceeded its 120-second process deadline.'
+  $nonce = [Guid]::NewGuid().ToString('N')
+  # Only the already-verified administrator-private root receives raw capture.
+  $stdout = Join-Path $env:LCM_WINDOWS_BOOTSTRAP_ROOT "$nonce.stdout"
+  $stderr = Join-Path $env:LCM_WINDOWS_BOOTSTRAP_ROOT "$nonce.stderr"
+  $observation = @{ role = $role; stage = 'launch'; exitCode = $null; resultPresent = $null;
+    stderrPresent = $null; captureCleanupVerified = $true; actor = $null }
+  try {
+    $arguments = '"' + $actor + '" ' + $role + ' ' + $runId
+    $process = Start-Process -FilePath $node -ArgumentList $arguments -Credential $identity.Credential `
+      -LoadUserProfile -WindowStyle Hidden -PassThru -RedirectStandardOutput $stdout -RedirectStandardError $stderr
+    $observation.stage = 'wait'
+    if (-not $process.WaitForExit(120000)) {
+      & $taskkill /PID $process.Id /T /F | Out-Null
+      throw 'Standard-user actor exceeded its 120-second process deadline.'
+    }
+    $process.Refresh()
+    if ($process.ExitCode -is [int]) { $observation.exitCode = $process.ExitCode }
+    $observation.stage = 'profile-result'
+    $profilePath = Get-ProfilePath $identity.Sid
+    $resultPath = Join-Path $profilePath "lcm-peer-baseline-$runId.json"
+    $observation.resultPresent = [bool](Test-Path -LiteralPath $resultPath)
+    if ($observation.exitCode -ne 0 -or -not $observation.resultPresent) {
+      throw 'Standard-user actor failed before returning a baseline result.'
+    }
+    $observation.stage = 'result-validation'
+    $result = Get-Content -LiteralPath $resultPath -Raw | ConvertFrom-Json
+    if ($result.role -ne $role -or $result.tokenUserSid -ne $identity.Sid) {
+      throw 'Standard-user actor token SID did not match its account.'
+    }
+    $reportedProfile = [IO.Path]::GetFullPath([string]$result.profile).TrimEnd('\')
+    $actualProfile = [IO.Path]::GetFullPath($profilePath).TrimEnd('\')
+    if (-not [string]::Equals($reportedProfile, $actualProfile,
+        [StringComparison]::OrdinalIgnoreCase)) {
+      throw 'Standard-user actor did not use its own profile.'
+    }
+    $observation.stage = 'complete'
+    return @{ Profile = $profilePath; Result = $result }
+  } catch { throw 'Standard-user actor failed baseline observation or validation.' }
+  finally {
+    $observation.actor = Read-ActorDiagnostic $stdout
+    try {
+      if (Test-Path -LiteralPath $stderr) {
+        $observation.stderrPresent = (Get-Item -LiteralPath $stderr -ErrorAction Stop).Length -gt 0
+      }
+    } catch { }
+    foreach ($path in @($stdout, $stderr)) {
+      try {
+        if (Test-Path -LiteralPath $path) { Remove-Item -LiteralPath $path -ErrorAction Stop }
+      } catch { $observation.captureCleanupVerified = $false }
+    }
+    Write-Host ('WINDOWS_ACTOR_DIAGNOSTIC_JSON=' + ($observation | ConvertTo-Json -Depth 4 -Compress))
+    if (-not $observation.captureCleanupVerified) { throw 'Actor diagnostic capture cleanup failed.' }
   }
-  $process.Refresh()
-  $profilePath = Get-ProfilePath $identity.Sid
-  $resultPath = Join-Path $profilePath "lcm-peer-baseline-$runId.json"
-  if ($process.ExitCode -ne 0 -or -not (Test-Path -LiteralPath $resultPath)) {
-    throw "Standard-user $role actor failed before returning a baseline result."
-  }
-  $result = Get-Content -LiteralPath $resultPath -Raw | ConvertFrom-Json
-  if ($result.role -ne $role -or $result.tokenUserSid -ne $identity.Sid) {
-    throw "Standard-user $role actor token SID did not match its account."
-  }
-  $reportedProfile = [IO.Path]::GetFullPath([string]$result.profile).TrimEnd('\')
-  $actualProfile = [IO.Path]::GetFullPath($profilePath).TrimEnd('\')
-  if (-not [string]::Equals($reportedProfile, $actualProfile,
-      [StringComparison]::OrdinalIgnoreCase)) {
-    throw "Standard-user $role actor did not use its own profile."
-  }
-  return @{ Profile = $profilePath; Result = $result }
 }
 
 function Get-AclWitness($path) {

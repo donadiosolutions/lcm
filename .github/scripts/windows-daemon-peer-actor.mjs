@@ -1,20 +1,43 @@
 import { createHash } from "node:crypto";
 import { spawnSync } from "node:child_process";
-import { existsSync, readFileSync, writeFileSync } from "node:fs";
-import { homedir } from "node:os";
+import { existsSync, readFileSync, writeFileSync, writeSync } from "node:fs";
+import { homedir, userInfo } from "node:os";
 import { dirname, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
+
+function safeError(error) {
+  return {
+    errorClass: ["Error", "TypeError", "RangeError", "SyntaxError"].includes(error?.name) ? error.name : "other",
+    errorCode: error?.code == null ? "none" :
+      ["EACCES", "EPERM", "EINVAL", "ENOENT", "ENOTSUP", "ETIMEDOUT", "ENOBUFS"].includes(error.code) ? error.code : "other",
+  };
+}
+
+const diagnostic = { version: 1, stage: "arguments", errorClass: "none", errorCode: "none", homeProfileMismatch: null };
+process.on("uncaughtException", (error) => {
+  Object.assign(diagnostic, safeError(error));
+  process.exitCode = 1;
+});
+process.on("exit", () => {
+  try { writeSync(1, JSON.stringify(diagnostic) + "\n"); } catch { }
+});
 
 const [role, runId] = process.argv.slice(2);
 if (!(["victim", "squatter"].includes(role) && /^[0-9]{1,20}$/.test(runId ?? ""))) {
   throw new Error("invalid Windows baseline actor arguments");
 }
 
+diagnostic.stage = "paths";
 const workspace = resolve(dirname(fileURLToPath(import.meta.url)), "../..");
 const cli = join(workspace, "dist", "lcm.mjs");
+diagnostic.stage = "profile";
 const profile = homedir();
+try {
+  diagnostic.homeProfileMismatch = resolve(profile).toLowerCase() !== resolve(userInfo().homedir).toLowerCase();
+} catch { }
 const pidPath = join(profile, ".lcm", "daemon.pid");
 const resultPath = join(profile, `lcm-peer-baseline-${runId}.json`);
+diagnostic.stage = "tools";
 const systemRoot = process.env.SystemRoot;
 if (!systemRoot || !/^[A-Za-z]:\\Windows$/i.test(systemRoot)) {
   throw new Error("trusted Windows system root is unavailable");
@@ -25,6 +48,7 @@ if (!existsSync(powerShell) || !existsSync(taskkill)) {
   throw new Error("trusted Windows actor tools are unavailable");
 }
 
+diagnostic.stage = "identity";
 const identity = spawnSync(powerShell, ["-NoLogo", "-NoProfile", "-NonInteractive", "-Command",
   "[System.Security.Principal.WindowsIdentity]::GetCurrent().User.Value"], {
   encoding: "utf8", timeout: 5_000, maxBuffer: 4_096, windowsHide: true,
@@ -65,7 +89,7 @@ function boundedCli(args, timeoutMs = 20_000) {
   }
   return {
     exitCode: result.status,
-    errorCode: result.error?.code ?? null,
+    errorCode: result.error ? safeError(result.error).errorCode : null,
     diagnosticClass: diagnosticClass(result.stderr),
     elapsedMs: Math.round(performance.now() - started),
     stderrSha256: createHash("sha256").update(String(result.stderr ?? "")).digest("hex"),
@@ -81,6 +105,7 @@ const output = {
   commands: {},
 };
 
+diagnostic.stage = "commands";
 try {
   if (role === "victim") {
     output.commands.freshInstall = boundedCli(["install"]);
@@ -93,11 +118,14 @@ try {
     }
   }
 } catch (error) {
-  output.actorError = error instanceof Error ? error.name : "unknown";
+  Object.assign(diagnostic, safeError(error));
+  output.actorError = diagnostic.errorClass;
 } finally {
+  diagnostic.stage = "state";
   for (const name of [".lcm", ".lcm/daemon.pid", ".lcm/daemon.token"] ) {
     output.state[name] = existsSync(join(profile, name.replaceAll("/", "\\")));
   }
+  diagnostic.stage = "cleanup";
   if (role === "victim" && existsSync(pidPath)) {
     output.commands.daemonStop = boundedCli(["daemon", "stop"], 10_000);
     try {
@@ -118,12 +146,14 @@ try {
             "-EncodedCommand", Buffer.from(script, "utf16le").toString("base64")], {
             timeout: 5_000, maxBuffer: 4_096, windowsHide: true,
           });
-          output.commands.finalTaskkill = { exitCode: kill.status, errorCode: kill.error?.code ?? null };
+          output.commands.finalTaskkill = { exitCode: kill.status, errorCode: kill.error ? safeError(kill.error).errorCode : null };
         }
       }
     } catch {
       output.commands.finalTaskkill = { errorCode: "unavailable" };
     }
   }
+  diagnostic.stage = "result";
   writeFileSync(resultPath, JSON.stringify(output), { encoding: "utf8", mode: 0o600, flag: "wx" });
 }
+diagnostic.stage = "complete";
