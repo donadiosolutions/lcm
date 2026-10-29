@@ -117,8 +117,10 @@ import {
   type MigrationSelectionAuthority,
 } from "./activation-witness.js";
 import {
+  hasInterruptedEvidenceWrite,
   readMigrationActivationEvidence,
   recordMigrationActivationWitness,
+  recoverInterruptedRollbackWitnessWrite,
   resolveRollbackAuthoritativeContext,
 } from "./activation-evidence-store.js";
 import {
@@ -138,6 +140,7 @@ import {
   type AuthoritativeActivation,
   type MigrationSelectionBinding,
   type MigrationWitnessBinding,
+  type MigrationWitnessResolution,
   type ActivationEvidenceResolver,
   type MigrationWitnessResolver,
   type OperabilityFactResolution,
@@ -644,6 +647,55 @@ function assertAuthorityAgreesWithArtifact(
         + "recorded epoch/attempt",
     );
   }
+}
+
+/**
+ * #1808. A rollback interrupted inside the write of its own rollback witness
+ * leaves only the writer scratch of that witness in the activation evidence
+ * store, and every strict evidence read after it refuses the generation as
+ * unresolvable -- including the read a retry needs before it can mint the
+ * witness again. Before those reads, finish that one write when it can be
+ * proven to be this rollback's: the last activation selection of the bindings
+ * names the activation being rolled back, the durable rollback-authority
+ * artifact (when one exists, and it must for a rollback in progress) names the
+ * same epoch and attempt, and the store itself proves the leftover is the
+ * complete canonical rollback witness reproducible from that activation
+ * (recoverInterruptedRollbackWitnessWrite). Anything else is left alone and
+ * the strict readers refuse it as before.
+ *
+ * The cheap listing probe comes first, so a rollback with no leftover reads
+ * and acquires nothing more than it did. Otherwise the proof and the
+ * publication run in one short append barrier -- never from a listing taken
+ * before it -- so a live writer's scratch is not removed meanwhile; barrier
+ * refusals and contention propagate and leave the scratch and the rollback
+ * state as they were. A witness published here and then followed by a later
+ * refusal stays published without a binding, the state of a crash between the
+ * witness and binding writes, which every rollback path tolerates.
+ * resolveContinuationAuthority itself stays strict: the pending
+ * publish-rollback recoveries also call it.
+ */
+async function recoverInterruptedRollbackWitness(
+  input: Readonly<RunMigrationRollbackInput>,
+  proof: () => Readonly<{ resolution: MigrationWitnessResolution; artifact: RollbackAuthorityArtifactBody | null }>,
+  artifactRequired: boolean,
+): Promise<void> {
+  const generation = { homeDir: input.homeDir, generationId: input.generationId };
+  if (!hasInterruptedEvidenceWrite(generation)) return;
+  const { resolution, artifact } = proof();
+  const activations = resolution.state === "resolved"
+    ? resolution.selections.filter((selection) => selection.kind === "activation")
+    : [];
+  const selection = activations[activations.length - 1];
+  if (selection === undefined) return;
+  if (artifact === null ? artifactRequired : artifact.epochId !== selection.epochId || artifact.attemptId !== selection.attemptId) return;
+  await withBackendPublicationAppendBarrierAsync(input.homeDir, () => {
+    recoverInterruptedRollbackWitnessWrite({
+      ...generation,
+      epochId: selection.epochId,
+      attemptId: selection.attemptId,
+      activationWitnessChecksumSha256: selection.witnessChecksumSha256,
+    });
+  });
 }
 
 // ---------------------------------------------------------------------------
@@ -1409,6 +1461,9 @@ export async function runMigrationRollback(
     homeDir: input.homeDir,
     generationId: input.generationId,
   });
+  await recoverInterruptedRollbackWitness(
+    input, () => ({ resolution: witnessResolution, artifact: priorAuthorityArtifact }), false,
+  );
   const evidence = deps.resolveActivationEvidence({
     homeDir: input.homeDir,
     generationId: input.generationId,
@@ -2114,6 +2169,10 @@ async function continueAfterPrepareRollback(
   current: MigrationManifest,
   now: () => Date,
 ): Promise<RunMigrationRollbackOutcome> {
+  await recoverInterruptedRollbackWitness(input, () => ({
+    resolution: deps.resolveWitnessBindings({ homeDir: input.homeDir, generationId: input.generationId }),
+    artifact: readRollbackAuthorityArtifact(input.homeDir, input.generationId),
+  }), true);
   const resolved = await resolveContinuationAuthority(input, deps);
   if (resolved.status === "refused") {
     throw new RollbackOrchestrationError(

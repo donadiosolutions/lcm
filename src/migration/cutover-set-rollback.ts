@@ -55,6 +55,7 @@ import {
 import {
   readMigrationActivationEvidence,
   recordMigrationActivationWitness,
+  recoverInterruptedRollbackWitnessWrite,
   resolveRollbackAuthoritativeContext,
   type RollbackAuthoritativeContext,
 } from "./activation-evidence-store.js";
@@ -911,9 +912,21 @@ function checkMemberLink(ctx: Context, member: Member): Exit | null {
 }
 
 /** The activation epoch, attempt and witness the set selection froze for the member (the authority the rollback unwinds). */
-async function resolveMemberAuthority(ctx: Context, member: Member): Promise<Exit | null> {
+async function resolveMemberAuthority(ctx: Context, member: Member, recoverWitnessWrite: boolean): Promise<Exit | null> {
   let authority: RollbackAuthoritativeContext | null;
   try {
+    // #1808: a rollback interrupted inside this member's rollback witness write left only its writer scratch, which
+    // the strict read below refuses. Finish exactly that write when the store proves it is the complete canonical
+    // rollback witness of the frozen activation; anything else is refused by the read as before. The caller holds
+    // the append barrier, and a member with a pending publish-rollback or a frozen selection never gets here with
+    // recoverWitnessWrite set. A witness published and then followed by a later refusal stays published without
+    // its binding, the state of a crash between the witness and binding writes.
+    if (recoverWitnessWrite) {
+      recoverInterruptedRollbackWitnessWrite({
+        homeDir: ctx.homeDir, generationId: member.generationId, epochId: member.selectionRow.epochId,
+        attemptId: member.selectionRow.attemptId, activationWitnessChecksumSha256: member.selectionRow.witnessChecksumSha256,
+      });
+    }
     authority = await ctx.deps.resolveAuthoritativeContext({
       homeDir: ctx.homeDir, generationId: member.generationId, epochId: member.selectionRow.epochId,
       attemptId: member.selectionRow.attemptId, witnessChecksumSha256: member.selectionRow.witnessChecksumSha256,
@@ -1014,7 +1027,7 @@ async function resolveMembers(ctx: Context, expectation: ManifestExpectation): P
     if (classified !== null) return classified;
     const link = checkMemberLink(ctx, member);
     if (link !== null) return link;
-    const authority = await resolveMemberAuthority(ctx, member);
+    const authority = await resolveMemberAuthority(ctx, member, expectation !== "frozen" && member.manifest!.pendingEffect?.kind !== "publish-rollback");
     if (authority !== null) return authority;
     const snapshot = await inspectMemberSnapshot(ctx, member);
     if (snapshot !== null) return snapshot;

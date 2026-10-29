@@ -6,7 +6,7 @@
  * checkActivationWriterQuiescence legitimately handles elsewhere.
  */
 
-import { chmodSync, existsSync, mkdirSync, mkdtempSync, readFileSync, renameSync, rmSync, unlinkSync, writeFileSync } from "node:fs";
+import { chmodSync, existsSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, renameSync, rmSync, unlinkSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { DatabaseSync } from "node:sqlite";
@@ -27,7 +27,7 @@ import {
 import { createPostgreSqlBackendPublicationRemoteGuard } from "../../src/storage/postgresql/publication-remote-guard.js";
 import { createBackendPublicationDriver } from "../../src/storage/backend-publication-driver.js";
 import { PostgreSqlBackendPublicationGuardError } from "../../src/storage/postgresql/publication-guard.js";
-import { PORTABLE_RECORD_DOMAIN_ORDER, canonicalSha256 } from "../../src/storage/portable-record.js";
+import { PORTABLE_RECORD_DOMAIN_ORDER, canonicalJson, canonicalSha256 } from "../../src/storage/portable-record.js";
 import type { ActivationLeasePublicationGuard } from "../../src/migration/activation-lease.js";
 import { checkActivationWriterQuiescence } from "../../src/migration/activation-quiescence.js";
 import { MigrationManifestStore } from "../../src/migration/manifest-store.js";
@@ -38,6 +38,7 @@ import {
   type MigrationManifest,
 } from "../../src/migration/protocol.js";
 import {
+  migrationActivationEvidenceDirectory,
   readMigrationActivationEvidence,
   recordMigrationActivationAttempt,
   recordMigrationActivationEpoch,
@@ -78,7 +79,12 @@ import {
   rollbackPublicationMaterial,
   workingPublicationDriver,
 } from "../fixtures/backend-publication-driver.js";
-import { fixtureActivationScenario, fixtureDestinationIdentity } from "../fixtures/migration-activation-records.js";
+import {
+  driftCanonicalDelta,
+  fixtureActivationScenario,
+  fixtureDestinationIdentity,
+  fixtureRollbackWitness,
+} from "../fixtures/migration-activation-records.js";
 
 const GEN = "gen-recovery";
 // UUIDv7: the production remote-guard provider (shared-lease tests below) normalizes the machine id as one.
@@ -299,6 +305,29 @@ function setup() {
 function crashBeforeCompleteSelection(coordinator: BackendPublicationCoordinator): BackendPublicationCoordinator {
   coordinator.completeMaintenanceSelection = async () => { throw new Error("crash before completeMaintenanceSelection"); };
   return coordinator;
+}
+
+/** The writer's canonical bytes for an evidence record, and a lone scratch of one planted as an interrupted write leaves it (#1808). */
+const evidenceWire = (record: unknown): string => canonicalJson({ version: 1, generationId: GEN, record }) + "\n";
+function evidenceScratchPath(homeDir: string, witness: { checksumSha256: string }, hex = "0123abcd"): string {
+  return join(migrationActivationEvidenceDirectory(homeDir, GEN), ".witness-" + witness.checksumSha256 + ".json." + hex + ".tmp");
+}
+function plantEvidenceScratch(homeDir: string, witness: { checksumSha256: string }, content = evidenceWire(witness)): string {
+  const path = evidenceScratchPath(homeDir, witness);
+  writeFileSync(path, content, { mode: 0o600 });
+  return path;
+}
+/** The rollback witness the fixture's baseline destination mints (pre-write), or a drifted post-write one. */
+function storedRollbackWitness(homeDir: string, drift?: number) {
+  const stored = readMigrationActivationEvidence({ homeDir, generationId: GEN });
+  if (stored.state !== "resolved") throw new Error("expected resolved evidence");
+  const [epoch] = stored.epochs;
+  const [attempt] = stored.attempts;
+  return drift === undefined
+    ? fixtureRollbackWitness({ epoch: epoch!, attempt: attempt!, postEpochDelta: baseline, postEpochCensus: baselineCensus, rollbackMode: "pre-write" })
+    : fixtureRollbackWitness({
+      epoch: epoch!, attempt: attempt!, postEpochDelta: driftCanonicalDelta(baseline, drift), postEpochCensus: null, rollbackMode: "post-write",
+    });
 }
 
 const DRIFTED = census.map((entry, index) => (index === 0 ? { ...entry, recordCount: 7, prefixSha256: "e".repeat(64) } : entry));
@@ -1343,5 +1372,183 @@ describe("checkRollbackRecoveryAdmission", () => {
     const result = await check(homeDir);
     expect(result).toMatchObject({ status: "satisfied" });
     expect(JSON.parse(result.quiescenceFence!.payload)).toMatchObject({ journal: "publication", phase: "aborted" });
+  });
+});
+
+/**
+ * #1808. A rollback interrupted inside its own rollback witness write leaves only the writer scratch of that witness
+ * in the activation evidence store; the retry finishes exactly that write (single rollback: before the strict evidence
+ * reads, in a short append barrier) and refuses anything it cannot prove. Real stores; only the injected witness
+ * recorder plants the scratch and stops.
+ */
+describe("a rollback interrupted inside its rollback witness write (#1808)", () => {
+  const strictRefusal = expect.stringContaining("activation-evidence:unresolvable");
+  const artifactPath = (homeDir: string): string =>
+    join(homeDir, ".lcm", "migration-rollback-authority", deriveRollbackAuthorityArtifactId(GEN) + ".json");
+  const evidenceEntries = (homeDir: string): string[] => readdirSync(migrationActivationEvidenceDirectory(homeDir, GEN)).sort();
+  const strictRead = (homeDir: string) => readMigrationActivationEvidence({ homeDir, generationId: GEN });
+
+  /** The first run: stops inside the witness write, leaving the (optionally mutated) scratch of the witness it was writing. */
+  const interrupted = (t: ReturnType<typeof setup>, mutate: (content: string) => string = (content) => content) =>
+    t.dependencies(t.coordinator(), {
+      recordActivationWitness: ({ witness }) => {
+        plantEvidenceScratch(t.homeDir, witness, mutate(evidenceWire(witness)));
+        throw new Error("crash inside the witness write");
+      },
+    });
+  const interruptedRun = async (t: ReturnType<typeof setup>, mutate?: (content: string) => string): Promise<string> => {
+    await expect(runMigrationRollback(t.input, interrupted(t, mutate))).rejects.toThrow("crash inside the witness write");
+    const scratches = evidenceEntries(t.homeDir).filter((name) => name.endsWith(".tmp"));
+    expect(scratches).toHaveLength(1);
+    return join(migrationActivationEvidenceDirectory(t.homeDir, GEN), scratches[0]!);
+  };
+  /** Everything a refused recovery must leave as it found it. */
+  const snapshot = (t: ReturnType<typeof setup>, scratch: string) => ({
+    manifest: JSON.stringify(t.store.read(GEN)),
+    maintenance: JSON.stringify(readBackendMaintenanceJournal(t.homeDir)),
+    artifact: existsSync(artifactPath(t.homeDir)) ? readFileSync(artifactPath(t.homeDir), "utf8") : null,
+    evidence: evidenceEntries(t.homeDir),
+    scratch: readFileSync(scratch, "utf8"),
+  });
+  const rewriteMaintenance = (homeDir: string, mutate: (body: Record<string, unknown>) => void): void => {
+    const journalPath = backendPublicationJournalPath(homeDir);
+    const { checksumSha256: _checksum, ...journal } = JSON.parse(readFileSync(journalPath, "utf8"));
+    mutate(journal);
+    writeFileSync(journalPath, JSON.stringify({ ...journal, checksumSha256: backendPublicationCanonicalSha256(journal) }));
+  };
+  const replaceArtifact = (homeDir: string, change: Record<string, unknown>): void => {
+    const { checksumSha256: _checksum, ...artifact } = readRollbackAuthorityArtifact(homeDir, GEN)!;
+    unlinkSync(artifactPath(homeDir));
+    writeRollbackAuthorityArtifact(homeDir, { ...artifact, ...change });
+  };
+
+  it("own resume: the retry finishes the interrupted witness write, completes the rollback and clears the scratch", async () => {
+    const t = setup();
+    const scratch = await interruptedRun(t);
+    expect(t.store.read(GEN)).toMatchObject({ phase: "rolling-back", pendingEffect: null });
+    expect(strictRead(t.homeDir)).toMatchObject({ state: "unresolvable" });
+
+    const outcome = await runMigrationRollback(t.input, t.dependencies(t.coordinator()));
+
+    expect(outcome.manifest.phase).toBe("rolled-back");
+    expect(existsSync(scratch)).toBe(false);
+    expect(strictRead(t.homeDir)).toMatchObject({ state: "resolved" });
+    expect(evidenceEntries(t.homeDir).filter((name) => name.endsWith(".tmp"))).toEqual([]);
+    expect(readBackendMaintenanceJournal(t.homeDir)).toBeNull();
+    expect((await runMigrationRollback(t.input, t.dependencies(t.coordinator()))).manifest.phase).toBe("rolled-back");
+  });
+
+  it("initial entry: a canonical rollback witness scratch left before the rollback begins is finished and the rollback completes", async () => {
+    const t = setup();
+    const scratch = plantEvidenceScratch(t.homeDir, storedRollbackWitness(t.homeDir));
+    expect(strictRead(t.homeDir)).toMatchObject({ state: "unresolvable" });
+
+    const outcome = await runMigrationRollback(t.input, t.dependencies(t.coordinator()));
+
+    expect(outcome.manifest.phase).toBe("rolled-back");
+    expect(existsSync(scratch)).toBe(false);
+    expect(strictRead(t.homeDir)).toMatchObject({ state: "resolved" });
+  });
+
+  it("fresh entry with a scratch it cannot prove: refused as unresolvable with everything left as it was", async () => {
+    const t = setup();
+    const witness = storedRollbackWitness(t.homeDir);
+    const scratch = plantEvidenceScratch(t.homeDir, witness, evidenceWire(witness) + " ");
+    const before = snapshot(t, scratch);
+
+    await expect(runMigrationRollback(t.input, t.dependencies(t.coordinator()))).rejects.toMatchObject({
+      name: "RollbackOrchestrationError", reason: "not-eligible", message: strictRefusal,
+    });
+
+    expect(snapshot(t, scratch)).toEqual(before);
+    expect(before.artifact).toBeNull();
+    expect(before.maintenance).toBe("null");
+  });
+
+  it("own continuation with a scratch it cannot prove: refused as unresolvable with everything left as it was", async () => {
+    const t = setup();
+    const scratch = await interruptedRun(t, (content) => content + " ");
+    const before = snapshot(t, scratch);
+    expect(before.artifact).not.toBeNull();
+
+    await expect(runMigrationRollback(t.input, t.dependencies(t.coordinator()))).rejects.toMatchObject({
+      name: "RollbackOrchestrationError", reason: "unexpected-state",
+      message: expect.stringMatching(/^continuing a prepared rollback: authority resolution now refuses: activation-evidence:unresolvable/u),
+    });
+
+    expect(snapshot(t, scratch)).toEqual(before);
+  });
+
+  it("fresh entry skips the recovery without an activation selection or when the artifact names another activation", async () => {
+    const unbound = setup();
+    const unboundScratch = plantEvidenceScratch(unbound.homeDir, storedRollbackWitness(unbound.homeDir));
+    await expect(runMigrationRollback(unbound.input, unbound.dependencies(unbound.coordinator(), {
+      resolveWitnessBindings: () => ({ state: "authoritatively-absent" }),
+    }))).rejects.toMatchObject({ reason: "not-eligible", message: strictRefusal });
+    expect(existsSync(unboundScratch)).toBe(true);
+
+    const foreign = setup();
+    const foreignScratch = plantEvidenceScratch(foreign.homeDir, storedRollbackWitness(foreign.homeDir));
+    writeRollbackAuthorityArtifact(foreign.homeDir, {
+      version: 2, generationId: GEN, operabilityFactState: "authoritatively-absent", operabilityFactValueSha256: null,
+      epochId: "another-epoch", attemptId: "another-attempt",
+      publication: {
+        publicationId: "publication-1", sourceBackend: "sqlite", sourceProjectEntry: { localProjectId: LOCAL, remoteProjectId: REMOTE },
+        sourceConfigSha256: "a".repeat(64), sourceProjectMapSha256: "b".repeat(64),
+      },
+    });
+    await expect(runMigrationRollback(foreign.input, foreign.dependencies(foreign.coordinator())))
+      .rejects.toMatchObject({ reason: "not-eligible", message: strictRefusal });
+    expect(existsSync(foreignScratch)).toBe(true);
+  });
+
+  it("own continuation skips the recovery without the artifact or when it names another activation, keeping the existing refusal", async () => {
+    const missing = setup();
+    const missingScratch = await interruptedRun(missing);
+    unlinkSync(artifactPath(missing.homeDir));
+    await expect(runMigrationRollback(missing.input, missing.dependencies(missing.coordinator())))
+      .rejects.toMatchObject({ reason: "unexpected-state", message: expect.stringContaining("no durable rollback-authority artifact exists") });
+    expect(existsSync(missingScratch)).toBe(true);
+
+    const foreign = setup();
+    const foreignScratch = await interruptedRun(foreign);
+    replaceArtifact(foreign.homeDir, { epochId: "another-epoch" });
+    await expect(runMigrationRollback(foreign.input, foreign.dependencies(foreign.coordinator())))
+      .rejects.toMatchObject({ reason: "unexpected-state", message: strictRefusal });
+    expect(existsSync(foreignScratch)).toBe(true);
+  });
+
+  it("a refusal of the short append barrier propagates before anything is recovered, leaving the scratch and the rollback state", async () => {
+    const t = setup();
+    const scratch = await interruptedRun(t);
+    rewriteMaintenance(t.homeDir, (journal) => { journal.phase = "maintenance-entering"; });
+    const before = snapshot(t, scratch);
+
+    await expect(runMigrationRollback(t.input, t.dependencies(t.coordinator())))
+      .rejects.toMatchObject({ message: expect.stringContaining("backend maintenance is not ready for local append") });
+
+    expect(snapshot(t, scratch)).toEqual(before);
+  });
+
+  it("a pending publish-rollback stays strict: a qualifying extra rollback witness scratch is not published by the recovery of an aborted publication", async () => {
+    vi.stubEnv("LCM_POSTGRES_URL", "postgresql://user:secret@example/db");
+    try {
+      const t = setup();
+      await expect(runMigrationRollback(t.input, t.dependencies(t.sharedLeaseCoordinator("prepared")))).rejects.toThrow("crash at prepared");
+      expect(t.pending()?.kind).toBe("publish-rollback");
+      await t.sharedLeaseCoordinator().abort();
+      const extra = storedRollbackWitness(t.homeDir, 1);
+      const scratch = plantEvidenceScratch(t.homeDir, extra);
+      const before = snapshot(t, scratch);
+
+      await expect(runMigrationRollback(t.input, t.dependencies(t.sharedLeaseCoordinator()))).rejects.toMatchObject({
+        reason: "unexpected-state", message: expect.stringContaining("no stored rollback witness to take its mode from"),
+      });
+
+      expect(snapshot(t, scratch)).toEqual(before);
+      expect(evidenceEntries(t.homeDir)).not.toContain("witness-" + extra.checksumSha256 + ".json");
+    } finally {
+      vi.unstubAllEnvs();
+    }
   });
 });

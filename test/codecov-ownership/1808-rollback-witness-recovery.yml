@@ -1,0 +1,12 @@
+references: ["#1808"]
+rationale: >-
+  #1808 lets single and set rollback finish an interrupted write of their own
+  rollback witness. The change adds a read-only scratch listing to the shared
+  scoped-directory store, a dedicated recovery in the evidence store and its
+  two rollback callers, all of which stay in the migration cutover owner; no
+  file is added, moved or re-owned.
+pins:
+  - ["src/migration/generation-binding-store.ts", "unit-migration-cutover"]
+  - ["src/migration/activation-evidence-store.ts", "unit-migration-cutover"]
+  - ["src/migration/rollback.ts", "unit-migration-cutover"]
+  - ["src/migration/cutover-set-rollback.ts", "unit-migration-cutover"]
