@@ -124,10 +124,15 @@ resolves every one of them except the cases described under "A prepared
 selection that drifted" and "An externally aborted rollback publication" below
 when the destination changed in between.
 
-One window is not yet recovered automatically: a rollback interrupted while
-it was writing its own rollback witness leaves a partial file in the
-activation evidence directory, and a retry refuses it as unresolvable instead
-of finishing the write. The file is preserved; inspect it before retrying.
+A rollback, single or set, interrupted while it was writing its own rollback
+witness leaves that witness as a leftover file in the activation evidence
+directory. A retry finishes the write and continues when the leftover is the
+complete rollback witness of the activation being rolled back and reproduces
+from the activation's stored epoch and attempt. A partial, foreign or
+otherwise unprovable leftover is still refused as unresolvable and preserved;
+inspect it before retrying. An interruption while writing the rollback
+witness binding is not yet recovered automatically
+([#1821](https://github.com/donadiosolutions/lcm/issues/1821)).
 
 On a post-write rollback specifically, a retry after a crash **never
 resumes copying into the same partial generation**. It builds a brand-new
