@@ -106,52 +106,189 @@ The refusal uses a fixed error and does not include the memory text, ID, path,
 or query. NUL characters in JSON-escaped tags remain supported.
 
 New promoted content containing `U+0000` is rejected before the database write.
-LCM does not strip bytes, truncate rows, or run an automatic migration. The
-script below diagnoses affected legacy rows; it cannot repair them on any
-platform. Preserve the database with its WAL/SHM sidecars and seek a separately
-reviewed recovery procedure rather than improvising a backup destination or
-editing the row in place.
+LCM does not strip bytes, truncate rows, or run an automatic migration. With
+**Node.js 25 or newer**, the script below diagnoses affected IDs on all platforms
+and supports explicit selected-row replacement only on Linux. It uses the built-in
+`node:sqlite` module; no npm dependencies or LCM internal imports are needed. If
+no intended replacement is known, preserve the database and leave the row refused.
 
 1. Close agent sessions and stop the LCM service with your service manager.
    Keep all writers, including hooks, CLI commands and worktree reconciliation,
-   stopped throughout diagnosis. Identify the project's existing
+   stopped throughout maintenance. Identify the project's existing
    `~/.lcm/projects/{hash}/db.sqlite` using its adjacent `meta.json`; use the
    configured runtime directory if yours differs. This procedure is only for
    SQLite projects.
-2. Save the following script as `repair-promoted.mjs` in a private directory.
-   With **Node.js 25 or newer**, run
-   `node repair-promoted.mjs /absolute/path/db.sqlite`. The built-in
-   `node:sqlite` module supplies everything; no npm dependencies or LCM
-   internal imports are needed. The script opens the database read-only and
-   prints affected IDs only, never memory content. It rejects repair arguments
-   before opening the database.
+2. Save the script as `repair-promoted.mjs` in a private directory. Run
+   `node repair-promoted.mjs /absolute/path/db.sqlite` to print affected IDs
+   only, never memory content. This invocation opens the database read-only on
+   every platform. Other platforms reject the four-argument repair invocation
+   before accessing the database, replacement file or backup.
+3. Before Linux repair, establish that you are using your normal account in a
+   trusted normal host namespace, with local native ext4, XFS or Btrfs storage
+   and ordinary **unmapped ownership throughout the repair directory ancestry**.
+   Obtain the directory through your own trusted home/native storage. Do not
+   use ownership-remapped views, containers or user namespaces with unknown
+   backing ownership, remote/synthetic/FUSE/overlay filesystems, attacker-provided
+   directories or mount brokers, or uncertain mount topology. If you cannot
+   establish this prerequisite, have a trusted administrator confirm it before
+   repair. The script's filesystem-type filter checks supported permission
+   semantics; neither filesystem magic nor UID/mode samples establish mount
+   provenance or prove the absence of ownership remapping.
+4. Create a fresh directory under that trusted storage, for example
+   `umask 077; mkdir -m 700 "$HOME/lcm-repair"`, and save the script there.
+   Every containing directory from `/` must be a real directory owned by root
+   or your account and not writable by group or others; the final directory
+   must be owned by your account with mode `0700`. The script rejects other
+   ancestry without changing its permissions. Keep the script and replacement
+   file under your trusted control, and preserve permissions and topology for
+   the whole operation.
+5. Put the complete intended replacement in a private UTF-8 text file. Every
+   byte, including a final newline, is part of the replacement. Run the repair
+   with the selected ID, replacement file and a **new absolute, normalized
+   backup filename directly inside the script directory** (no `..`, redundant
+   separators or symbolic-link components):
+
+   ```sh
+   node "$HOME/lcm-repair/repair-promoted.mjs" /absolute/path/db.sqlite SELECTED_ID "$HOME/lcm-repair/replacement.txt" "$HOME/lcm-repair/before-repair.sqlite"
+   ```
+
+   Exclusive `wx` creation rejects an already-existing backup name and creates
+   a mode `0600` placeholder. Its descriptor then closes; SQLite reopens the
+   same pathname for a consistent backup, including committed WAL data. This
+   is **not an ongoing exclusive reservation**. Under the prerequisite above,
+   the private parent and trusted ancestry prevent a different local account
+   from substituting that entry. Directory checks around backup detect observed
+   drift; they do not provide an atomic pathname guarantee. A process running
+   as your account, a mount administrator or root is outside this boundary.
+
+   The script verifies backup integrity before replacing that row and its FTS
+   entry in one transaction. It preserves all other fields and keeps archived
+   rows out of the search index. It refuses healthy rows, unknown IDs, invalid
+   UTF-8 and NUL-containing replacements. A failed prerequisite or backup stops
+   before the repair transaction; a failed transaction rolls back. Keep every
+   backup, including one left by a failed attempt.
 
 ```js
-import { DatabaseSync } from "node:sqlite";
-import { statSync } from "node:fs";
+import { DatabaseSync, backup } from "node:sqlite";
+import { closeSync, lstatSync, openSync, readFileSync, statfsSync, statSync } from "node:fs";
+import { dirname, isAbsolute, join, parse, relative, resolve, sep } from "node:path";
+import { fileURLToPath } from "node:url";
 
 const args = process.argv.slice(2);
-if (args.length !== 1) {
-  throw new Error("Usage: node repair-promoted.mjs DB (diagnosis only)");
+if (args.length !== 1 && args.length !== 4) {
+  throw new Error("Usage: node repair-promoted.mjs DB [ID TEXT_FILE NEW_BACKUP]");
 }
-const [path] = args;
+const [path, id, textFile, backupPath] = args;
+const prepareRepair = () => {
+  if (process.platform !== "linux") {
+    throw new Error("Repair is supported only on Linux; diagnosis remains read-only");
+  }
+  const scriptDir = dirname(fileURLToPath(import.meta.url));
+  if (!isAbsolute(backupPath) || resolve(backupPath) !== backupPath) {
+    throw new Error("Backup path must be absolute and normalized");
+  }
+  const destination = backupPath;
+  if (dirname(destination) !== scriptDir) {
+    throw new Error("Backup must be a direct child of the script directory");
+  }
+  const uid = process.getuid?.();
+  if (typeof uid !== "number") throw new Error("Cannot verify directory ownership");
+  // A semantics filter, not proof of unmapped ownership or trusted topology.
+  const nativeTypes = new Set([0xef53n, 0x58465342n, 0x9123683en]);
+  const inspectChain = () => {
+    const root = parse(scriptDir).root;
+    let current = root;
+    let parentInfo;
+    for (const component of ["", ...relative(root, scriptDir).split(sep).filter(Boolean)]) {
+      if (component) current = join(current, component);
+      const info = lstatSync(current);
+      if (!info.isDirectory() || info.isSymbolicLink()) {
+        throw new Error("Backup directory chain contains a link or non-directory");
+      }
+      if ((info.uid !== uid && info.uid !== 0) || (info.mode & 0o022)) {
+        throw new Error("Backup directory chain is not trusted");
+      }
+      if (!nativeTypes.has(statfsSync(current, { bigint: true }).type)) {
+        throw new Error("Backup directory chain must use native ext4, XFS or Btrfs");
+      }
+      parentInfo = info;
+    }
+    if (parentInfo.uid !== uid || (parentInfo.mode & 0o7777) !== 0o700) {
+      throw new Error("Script directory must be process-owned with mode 0700");
+    }
+    return parentInfo;
+  };
+  const parentInfo = inspectChain();
+  const checkParent = () => {
+    const now = inspectChain();
+    if (now.dev !== parentInfo.dev || now.ino !== parentInfo.ino) {
+      throw new Error("Script directory changed during backup");
+    }
+  };
+  const content = new TextDecoder("utf-8", { fatal: true, ignoreBOM: true })
+    .decode(readFileSync(textFile));
+  if (content.includes("\u0000")) throw new Error("Replacement contains NUL");
+  return { content, destination, checkParent };
+};
+const repair = args.length === 4 ? prepareRepair() : undefined;
 if (!statSync(path).isFile()) throw new Error("DB must be an existing file");
 const unsupported = "typeof(content) <> 'text' OR instr(content, char(0)) > 0";
-const db = new DatabaseSync(path, { readOnly: true });
+const db = new DatabaseSync(path, { readOnly: !repair });
 try {
-  for (const row of db.prepare(`SELECT id FROM promoted WHERE ${unsupported}`).all()) {
-    console.log(JSON.stringify(row.id));
+  if (!repair) {
+    for (const row of db.prepare(`SELECT id FROM promoted WHERE ${unsupported}`).all()) {
+      console.log(JSON.stringify(row.id));
+    }
+  } else {
+    const { content, destination, checkParent } = repair;
+    // This descriptor closes. Trusted private ancestry protects SQLite's reopen.
+    closeSync(openSync(destination, "wx", 0o600));
+    checkParent();
+    await backup(db, destination);
+    checkParent();
+    const saved = new DatabaseSync(destination, { readOnly: true });
+    try {
+      const checks = saved.prepare("PRAGMA integrity_check").all();
+      if (checks.length !== 1 || checks[0].integrity_check !== "ok") {
+        throw new Error("Backup integrity check failed");
+      }
+    } finally {
+      saved.close();
+    }
+    checkParent();
+    db.exec("BEGIN IMMEDIATE");
+    try {
+      const row = db.prepare(`SELECT rowid, tags, archived_at FROM promoted
+        WHERE id = ? AND (${unsupported})`).get(id);
+      if (!row) throw new Error("ID is missing or does not need repair");
+      db.prepare("UPDATE promoted SET content = ? WHERE id = ?").run(content, id);
+      const fts = db.prepare("SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'promoted_fts'").get();
+      if (fts) {
+        db.prepare("DELETE FROM promoted_fts WHERE rowid = ?").run(row.rowid);
+        if (row.archived_at === null) {
+          db.prepare("INSERT INTO promoted_fts(rowid, content, tags) VALUES (?, ?, ?)")
+            .run(row.rowid, content, row.tags);
+        }
+      }
+      db.exec("COMMIT");
+      console.log("Repair committed; retain the verified backup.");
+    } catch (error) {
+      db.exec("ROLLBACK");
+      throw error;
+    }
   }
 } finally {
   db.close();
 }
 ```
 
-3. If IDs are printed, keep the original database and WAL/SHM sidecars intact.
-   In-place promoted-memory repair is unavailable in this guide. Leave those
-   rows refused and obtain a separately reviewed recovery procedure before
-   changing them. Do not use the former four-argument invocation or remove a
-   write fence to make a repair attempt work.
+6. Repeat the diagnostic until no affected IDs remain (use a new backup name
+   for each repair). Restart the service and agent sessions, then verify active
+   memory with `lcm search "distinctive replacement words"` from the original
+   project directory before resuming normal use. Archived memories remain
+   excluded from search; the offline diagnostic verifies their content. Retain
+   backups until verification is complete. Do not replace a live database file
+   or discard WAL/SHM sidecars to restore a backup; stop all writers again first.
 
 Legacy worktree reconciliation uses a separate import path. During a real
 reconciliation, LCM checks the live source database while its existing
@@ -160,11 +297,11 @@ transaction. For a source that has not been merged, a promoted row whose
 `content` is not SQLite `TEXT` or contains an embedded NUL fails closed with
 `stored promoted content is unsupported` before the row can be copied or used
 to rebuild FTS. The source check rolls back the uncommitted fence, so the source
-bytes remain intact. A target check rolls back the target transaction; its
-source fence may already be committed. The diagnostic above can identify
-affected promoted rows, but this guide offers no in-place
-repair. Preserve the source and target databases with their WAL/SHM sidecars
-and seek a separately reviewed recovery procedure before retrying.
+bytes remain intact and eligible rows can be repaired in place with the Linux
+procedure above. A target check rolls back the target transaction; its source
+fence may already be committed. Diagnose the affected database and, when the
+Linux prerequisites hold, repair eligible promoted rows before retrying.
+Retired/fenced sources remain unsupported as described below.
 
 A canonical per-source completion marker remains an idempotent recovery
 boundary. LCM does not require changes to a source whose completed merge it
@@ -175,7 +312,9 @@ instead of relying on the earlier marker observation. This does not audit or
 repair canonical content written by an older LCM version. The ID-only
 diagnostic above reports non-`TEXT` or still-NUL rows; it cannot detect a value
 already truncated into otherwise valid SQLite `TEXT`. Empty output does not
-clear a known truncation, and this guide offers no canonical-target repair.
+clear a known truncation, and the script refuses such otherwise valid rows.
+Preserve the evidence and seek a separately reviewed recovery procedure for
+known truncation.
 This refusal behavior is implemented by [#1173](https://github.com/donadiosolutions/lcm/issues/1173).
 
 That marker recheck has a rare third outcome. LCM commits the source write
@@ -216,7 +355,7 @@ Stop writers, keep the database and its WAL/SHM sidecars together, and make a
 verified backup before repair. Inspect affected rows offline with
 `typeof(content)`, `hex(content)`, and `instr(content, char(0))`, then correct
 the intended scalar value and rerun reconciliation. Do not use the promoted
-memory script above for `messages`; it is an inline, promoted-only diagnostic,
+memory script above for `messages`; it is an inline, promoted-only procedure,
 not a shipped general-purpose migration. Empty text, valid multi-byte Unicode,
 a genuine replacement character (`U+FFFD`, encoded as
 UTF-8 `EF BF BD`), and literal JSON-escaped `\\u0000` text remain supported.

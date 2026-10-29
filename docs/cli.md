@@ -163,8 +163,9 @@ character (`U+0000`). The store operation rejects that input before writing;
 JSON-escaped NUL characters in tags remain supported. A selected legacy
 promoted row containing an embedded NUL fails closed instead of returning a
 truncated value. See [Privacy & Data Handling](privacy.md#embedded-nul-in-promoted-memory)
-for the read-only diagnostic. In-place repair of affected promoted rows is
-unavailable in that guide pending a separately reviewed recovery procedure.
+for the read-only diagnostic on all platforms and conditional Linux-only
+selected-row repair. Retired sources and already-truncated valid text remain
+outside that repair procedure.
 
 `lcm export` writes JSON by default. The optional `--format` value accepts
 only `json`; unsupported values are rejected before export work or output
