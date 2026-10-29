@@ -184,6 +184,10 @@ export async function safeLogError(
 
     // Layer 3: Swallow silently — hooks must never crash
   } finally {
-    rootHandle.close();
+    try {
+      rootHandle.close();
+    } catch {
+      // Closing the diagnostic root handle is best effort; hooks must never crash.
+    }
   }
 }
