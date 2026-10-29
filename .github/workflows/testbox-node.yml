@@ -1,4 +1,4 @@
-name: SEC-DAEMON-PEER runtime scalar gate diagnostic
+name: SEC-DAEMON-PEER empty native job capability
 
 # Registration397854550; isolated ref only, never merge. SOURCE ONLY, no grant.
 on:
@@ -9,7 +9,7 @@ on:
         required: true
         type: string
       confirmation:
-        description: Enter METADATA_RUNTIME_GATE_20261029
+        description: Enter NATIVE_EMPTY_JOB_CAPABILITY_20261029
         required: true
         type: string
 permissions: {}
@@ -18,11 +18,11 @@ concurrency:
   cancel-in-progress: false
 jobs:
   native_empty_job:
-    if: github.event_name == 'workflow_dispatch' && github.repository == 'donadiosolutions/lcm' && github.ref == 'refs/heads/security/daemon-peer-metadata-preflight-20261029' && github.sha == inputs.expected_sha && github.workflow_sha == inputs.expected_sha && github.workflow_ref == 'donadiosolutions/lcm/.github/workflows/testbox-node.yml@refs/heads/security/daemon-peer-metadata-preflight-20261029' && inputs.expected_sha != '8deab738ceff4f2de0093e6f5cf5788a41081e95' && inputs.expected_sha != 'aa4e0e761fae8a8b2bf7fb94b5cd4491cfc5c190' && inputs.confirmation == 'METADATA_RUNTIME_GATE_20261029'
+    if: github.event_name == 'workflow_dispatch' && github.repository == 'donadiosolutions/lcm' && github.ref == 'refs/heads/security/daemon-peer-metadata-preflight-20261029' && github.sha == inputs.expected_sha && github.workflow_sha == inputs.expected_sha && github.workflow_ref == 'donadiosolutions/lcm/.github/workflows/testbox-node.yml@refs/heads/security/daemon-peer-metadata-preflight-20261029' && inputs.expected_sha != '8deab738ceff4f2de0093e6f5cf5788a41081e95' && inputs.expected_sha != 'aa4e0e761fae8a8b2bf7fb94b5cd4491cfc5c190' && inputs.expected_sha != '7bac5cb0c0d2848fe3065012f496d1326ddc881a' && inputs.confirmation == 'NATIVE_EMPTY_JOB_CAPABILITY_20261029'
     runs-on: windows-2025
     timeout-minutes: 3
     steps:
-      - name: Fixed scalar diagnostic with no native acquisition
+      - name: Fixed zero-child native capability only
         shell: pwsh
         timeout-minutes: 1
         env:
@@ -31,15 +31,15 @@ jobs:
           PREFLIGHT_WORKFLOW_SHA: ${{ github.workflow_sha }}
           PREFLIGHT_WORKFLOW_REF: ${{ github.workflow_ref }}
         run: |
-          # PRIVATE SOURCE ONLY. Metadata diagnostic; no runtime/native execution grant.
+          # PRIVATE REVIEW CANDIDATE. This is a native capability phase after source/runtime gates.
           # Provided Windows+runner supervisor+pwsh/.NET are adopted TCB, not closed runtime.
-          try {
           if($ExecutionContext.SessionState.LanguageMode -ne 'FullLanguage') {
-            '{"schema":"sec-daemon-peer-runtime-gate-v1","phase":"runtime-gate-diagnostic","status":"refused","runtimePredicate":"language-mode","runtimeOutcome":"evaluation-failed","caseFoldEquivalent":"not-applicable","childrenLaunched":0,"nativeAttempted":false,"elapsedMilliseconds":0}'
+            '{"schema":"sec-daemon-peer-native-empty-v1","status":"refused","reason":"language-mode","nativeAttempted":false}'
             exit 1
           }
           # Core-only defaults precede fallible bootstrap; early language literal stays first.
           $stage='bootstrap';$exitCode=1
+          try {
           $ErrorActionPreference='Stop';$ProgressPreference='SilentlyContinue'
           $overall=[Diagnostics.Stopwatch]::StartNew()
           $stage='dispatch'
@@ -48,141 +48,21 @@ jobs:
              $env:PREFLIGHT_EXPECTED_SHA -cnotmatch '^[0-9a-f]{40}$' -or
              $env:PREFLIGHT_EXPECTED_SHA -ceq '8deab738ceff4f2de0093e6f5cf5788a41081e95' -or
              $env:PREFLIGHT_EXPECTED_SHA -ceq 'aa4e0e761fae8a8b2bf7fb94b5cd4491cfc5c190' -or
+             $env:PREFLIGHT_EXPECTED_SHA -ceq '7bac5cb0c0d2848fe3065012f496d1326ddc881a' -or
              $env:GITHUB_SHA -cne $env:PREFLIGHT_EXPECTED_SHA -or
              $env:PREFLIGHT_WORKFLOW_SHA -cne $env:PREFLIGHT_EXPECTED_SHA -or
              $env:PREFLIGHT_WORKFLOW_REF -cne 'donadiosolutions/lcm/.github/workflows/testbox-node.yml@refs/heads/security/daemon-peer-metadata-preflight-20261029' -or
-             $env:PREFLIGHT_CONFIRMATION -cne 'METADATA_RUNTIME_GATE_20261029') { throw 'dispatch-gate' }
-          # Evaluate only the reached original scalar; no value enters the result.
-          $expectedSha=$env:PREFLIGHT_EXPECTED_SHA;$actualSha=$env:GITHUB_SHA
-          if($expectedSha -cnotmatch '^[0-9a-f]{40}$' -or $actualSha -cnotmatch '^[0-9a-f]{40}$' -or
-             $actualSha -cne $expectedSha) { throw 'dispatch-binding' }
-          $runtimePredicate='bootstrap';$runtimeOutcome='evaluation-failed';$caseFoldEquivalent='not-applicable'
-          try {
-            do {
-              $runtimePredicate='is-windows';$runtimeOutcome='evaluation-failed'
-              $runtimeScalar=$IsWindows
-              if(-not $runtimeScalar) {
-                $runtimeOutcome='mismatch'
-                break
-              }
-              $runtimePredicate='runner-os';$runtimeOutcome='evaluation-failed'
-              $runtimeScalar=$env:RUNNER_OS
-              if($runtimeScalar -cne 'Windows') {
-                $runtimeOutcome='mismatch'
-                break
-              }
-              $runtimePredicate='runner-arch';$runtimeOutcome='evaluation-failed'
-              $runtimeScalar=$env:RUNNER_ARCH
-              if($runtimeScalar -cne 'X64') {
-                $runtimeOutcome='mismatch'
-                break
-              }
-              $runtimePredicate='image-os';$runtimeOutcome='evaluation-failed'
-              $runtimeScalar=$env:ImageOS
-              if($runtimeScalar -cne 'win25-vs2026') {
-                $runtimeOutcome='mismatch'
-                break
-              }
-              $runtimePredicate='image-version';$runtimeOutcome='evaluation-failed'
-              $runtimeScalar=$env:ImageVersion
-              if($runtimeScalar -cne '20261021.278.1') {
-                $runtimeOutcome='mismatch'
-                break
-              }
-              $runtimePredicate='os-version';$runtimeOutcome='evaluation-failed'
-              $runtimeScalar=[Environment]::OSVersion.Version.ToString()
-              if($runtimeScalar -cne '10.0.26100.0') {
-                $runtimeOutcome='mismatch'
-                break
-              }
-              $runtimePredicate='pshome-case';$runtimeOutcome='evaluation-failed'
-              $runtimeScalar=$PSHOME
-              if($runtimeScalar -cne 'C:\Program Files\PowerShell\7') {
-                $runtimeOutcome='mismatch'
-                try {
-                  $caseFoldEquivalent=if([String]::Equals($runtimeScalar,'C:\Program Files\PowerShell\7',[StringComparison]::OrdinalIgnoreCase)){'true'}else{'false'}
-                } catch { $caseFoldEquivalent='evaluation-failed' }
-                break
-              }
-              $runtimePredicate='process-path-case';$runtimeOutcome='evaluation-failed'
-              $runtimeScalar=[Environment]::ProcessPath
-              if($runtimeScalar -cne 'C:\Program Files\PowerShell\7\pwsh.exe') {
-                $runtimeOutcome='mismatch'
-                try {
-                  $caseFoldEquivalent=if([String]::Equals($runtimeScalar,'C:\Program Files\PowerShell\7\pwsh.exe',[StringComparison]::OrdinalIgnoreCase)){'true'}else{'false'}
-                } catch { $caseFoldEquivalent='evaluation-failed' }
-                break
-              }
-              $runtimePredicate='ps-version';$runtimeOutcome='evaluation-failed'
-              $runtimeScalar=$PSVersionTable.PSVersion.ToString()
-              if($runtimeScalar -cne '7.6.7') {
-                $runtimeOutcome='mismatch'
-                break
-              }
-              $runtimePredicate='clr-version';$runtimeOutcome='evaluation-failed'
-              $runtimeScalar=[Environment]::Version.ToString()
-              if($runtimeScalar -cne '10.0.13') {
-                $runtimeOutcome='mismatch'
-                break
-              }
-              $runtimePredicate='framework-version';$runtimeOutcome='evaluation-failed'
-              $runtimeScalar=[Runtime.InteropServices.RuntimeInformation]::FrameworkDescription
-              if($runtimeScalar -cne '.NET 10.0.13') {
-                $runtimeOutcome='mismatch'
-                break
-              }
-              $runtimePredicate='process-architecture';$runtimeOutcome='evaluation-failed'
-              $runtimeScalar=[Runtime.InteropServices.RuntimeInformation]::ProcessArchitecture.ToString()
-              if($runtimeScalar -cne 'X64') {
-                $runtimeOutcome='mismatch'
-                break
-              }
-              $runtimePredicate='pointer-size';$runtimeOutcome='evaluation-failed'
-              $runtimeScalar=[IntPtr]::Size
-              if($runtimeScalar -ne 8) {
-                $runtimeOutcome='mismatch'
-                break
-              }
-              $runtimePredicate='dynamic-code-supported';$runtimeOutcome='evaluation-failed'
-              $runtimeScalar=[Runtime.CompilerServices.RuntimeFeature]::IsDynamicCodeSupported
-              if(-not $runtimeScalar) {
-                $runtimeOutcome='mismatch'
-                break
-              }
-              $runtimePredicate='systemroot-case';$runtimeOutcome='evaluation-failed'
-              $runtimeScalar=$env:SystemRoot
-              if($runtimeScalar -cne 'C:\Windows') {
-                $runtimeOutcome='mismatch'
-                try {
-                  $caseFoldEquivalent=if([String]::Equals($runtimeScalar,'C:\Windows',[StringComparison]::OrdinalIgnoreCase)){'true'}else{'false'}
-                } catch { $caseFoldEquivalent='evaluation-failed' }
-                break
-              }
-              $runtimePredicate='windir-case';$runtimeOutcome='evaluation-failed'
-              $runtimeScalar=$env:WINDIR
-              if($runtimeScalar -cne 'C:\Windows') {
-                $runtimeOutcome='mismatch'
-                try {
-                  $caseFoldEquivalent=if([String]::Equals($runtimeScalar,'C:\Windows',[StringComparison]::OrdinalIgnoreCase)){'true'}else{'false'}
-                } catch { $caseFoldEquivalent='evaluation-failed' }
-                break
-              }
-              $runtimePredicate='complete';$runtimeOutcome='matched'
-            } while($false)
-          } catch {
-            # Getter/operator failure retains the reached predicate and fixed outcome.
-          }
-          $elapsedMilliseconds=[Int64]$overall.ElapsedMilliseconds
-          if($elapsedMilliseconds -ge 10000 -or $elapsedMilliseconds -ge 30000) { throw 'diagnostic-budget' }
-          $resultStatus=if($runtimeOutcome -ceq 'matched'){'matched'}else{'refused'}
-          $json='{"schema":"sec-daemon-peer-runtime-gate-v1","phase":"runtime-gate-diagnostic","expectedSha":"'+$expectedSha+'","actualSha":"'+$actualSha+'","status":"'+$resultStatus+'","runtimePredicate":"'+$runtimePredicate+'","runtimeOutcome":"'+$runtimeOutcome+'","caseFoldEquivalent":"'+$caseFoldEquivalent+'","childrenLaunched":0,"nativeAttempted":false,"elapsedMilliseconds":'+$elapsedMilliseconds.ToString([Globalization.CultureInfo]::InvariantCulture)+'}'
-          if([Text.Encoding]::UTF8.GetByteCount($json) -gt 4096) { throw 'diagnostic-result-size' }
-          # Cooperative deadline check precedes output; host-start/parser failures remain external.
-          if($overall.ElapsedMilliseconds -ge 10000 -or $overall.ElapsedMilliseconds -ge 30000) { throw 'diagnostic-budget' }
-          $exitCode=if($runtimeOutcome -ceq 'matched'){0}else{1}
-          Write-Output $json
-          exit $exitCode
-          # Retained original source below is unreachable in this diagnostic carrier.
+             $env:PREFLIGHT_CONFIRMATION -cne 'NATIVE_EMPTY_JOB_CAPABILITY_20261029') { throw 'dispatch-gate' }
+          $stage='runtime'
+          # Public Windows literal ignores case; pin and identity gates remain required.
+          if(-not $IsWindows -or $env:RUNNER_OS -cne 'Windows' -or $env:RUNNER_ARCH -cne 'X64' -or $env:ImageOS -cne 'win25-vs2026' -or $env:ImageVersion -cne '20261021.278.1' -or
+             [Environment]::OSVersion.Version.ToString() -cne '10.0.26100.0' -or
+             $PSHOME -cne 'C:\Program Files\PowerShell\7' -or -not [String]::Equals([Environment]::ProcessPath,'C:\Program Files\PowerShell\7\pwsh.exe',[StringComparison]::OrdinalIgnoreCase) -or
+             $PSVersionTable.PSVersion.ToString() -cne '7.6.7' -or [Environment]::Version.ToString() -cne '10.0.13' -or
+             [Runtime.InteropServices.RuntimeInformation]::FrameworkDescription -cne '.NET 10.0.13' -or
+             [Runtime.InteropServices.RuntimeInformation]::ProcessArchitecture.ToString() -cne 'X64' -or [IntPtr]::Size -ne 8 -or
+             -not [Runtime.CompilerServices.RuntimeFeature]::IsDynamicCodeSupported -or
+             $env:SystemRoot -cne 'C:\Windows' -or $env:WINDIR -cne 'C:\Windows') { throw 'runtime-image-or-mode-drift' }
           $stage='runtime-pin'
           # Literal30 hashes only. Unhashed/lazy OS/runtime dependencies stay in adopted TCB.
           $pinsJson=@'
@@ -689,8 +569,24 @@ jobs:
           $exitCode=if($operationPassed){0}else{1}
           Write-Output $json
           } catch {
-            # Fixed fallback: no exception inspection or unvalidated commit interpolation.
-            try { Write-Output '{"schema":"sec-daemon-peer-runtime-gate-v1","phase":"runtime-gate-diagnostic","status":"refused","runtimePredicate":"bootstrap","runtimeOutcome":"evaluation-failed","caseFoldEquivalent":"not-applicable","childrenLaunched":0,"nativeAttempted":false,"elapsedMilliseconds":0}' } catch { }
-            exit 1
+            # Fixed enums only. Do not inspect/format the exception, stack, source or path.
+            # This projection needs neither an initialized timer/report nor a serializer.
+            # Any existing script:OwnedCapsuleState remains rooted, including buffer/handle
+            # slots. Unknown cleanup stays nonterminal in Root's ledger; no successor/rerun.
+            $controlledStage=switch($stage) {
+              'dispatch' {'dispatch'}
+              'runtime' {'runtime'}
+              'runtime-pin' {'runtime-pin'}
+              'source' {'source'}
+              'native' {'native'}
+              'report' {'report'}
+              'budget' {'budget'}
+              default {'bootstrap'}
+            }
+            $controlledReason=if($controlledStage -ceq 'budget'){'original-budget-refused'}else{'operational-refused'}
+            $fallback='{"schema":"sec-daemon-peer-native-empty-v1","phase":"native-empty-job-capability","status":"refused","stage":"'+$controlledStage+'","reason":"'+$controlledReason+'","operationPassed":false,"nativeAttempted":"unknown","childrenLaunched":0,"ownedLeasesClosed":"unknown","jobZero":"unknown","ioQuiescent":"unknown","observerExit":"provided-supervisor-owned-unobserved","cleanupState":"unknown-root-reconcile","stateLedger":"preserved-if-created"}'
+            # A broken output sink is also refusal; never rethrow it into host diagnostics.
+            try { Write-Output $fallback } catch { }
+            $exitCode=1
           }
           exit $exitCode
