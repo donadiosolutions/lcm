@@ -12,7 +12,7 @@ import type {
   PostgreSqlTransactionScopeExecutor,
 } from "./contracts.js";
 import { PostgreSqlSnapshotSession, type PostgreSqlSnapshotOptions } from "./snapshot-session.js";
-import { buildPostgreSqlClientConfig } from "./client-config.js";
+import { buildPostgreSqlClientConfig, postgreSqlQueryDeadlineMs } from "./client-config.js";
 import {
   isPostgreSqlConnectionError,
   isPostgreSqlSnapshotTerminationSqlState,
@@ -1071,7 +1071,17 @@ export class PostgreSqlRuntime implements PostgreSqlQueryExecutor {
     options: PostgreSqlQueryOptions,
   ): Promise<QueryResult<R>> {
     const signal = options.signal;
-    if (!signal) return client.query<R, I>(config);
+    // A text with several statements gets a deadline that never undercuts the
+    // server's per-statement limit; single statements keep the connection default.
+    const statements = 1 + (config.text.match(/;/gu)?.length ?? 0);
+    const queryTimeout = statements > 1
+      ? postgreSqlQueryDeadlineMs(this.settings, statements)
+      : undefined;
+    if (!signal) {
+      if (queryTimeout === undefined) return client.query<R, I>(config);
+      const bounded: QueryConfig<I> & { query_timeout: number } = { ...config, query_timeout: queryTimeout };
+      return client.query<R, I>(bounded);
+    }
     if (signal.aborted) throw aborted(options);
     const pidResult = await client.query<BackendPidRow>({ text: "SELECT pg_backend_pid() AS pid" });
     const pid = pidResult.rows[0].pid;
@@ -1094,9 +1104,10 @@ export class PostgreSqlRuntime implements PostgreSqlQueryExecutor {
     }
 
     const queryOutcome = new Promise<QueryOutcome>((resolve) => {
-      const query = new Query<R, I>(config, (error, result) => {
+      const query: Query<R, I> & { query_timeout?: number } = new Query<R, I>(config, (error, result) => {
         resolve({ error: error ?? null, result: result as QueryResult<R> | undefined });
       });
+      if (queryTimeout !== undefined) query.query_timeout = queryTimeout;
       client.query(query);
     });
 

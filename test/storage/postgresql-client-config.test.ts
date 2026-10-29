@@ -6,6 +6,7 @@ import { afterEach, describe, expect, it } from "vitest";
 import {
   buildPostgreSqlClientConfig,
   parsePostgreSqlUrl,
+  postgreSqlQueryDeadlineMs,
 } from "../../src/storage/postgresql/client-config.js";
 
 const directories: string[] = [];
@@ -98,11 +99,23 @@ describe("PostgreSQL client configuration", () => {
       connectionTimeoutMillis: 101,
       statement_timeout: 303,
       idle_in_transaction_session_timeout: 303,
+      query_timeout: 303 + 5000,
       keepAlive: true,
       ssl: { ca: "test-ca", rejectUnauthorized: true },
     });
     const ssl = config.ssl as Exclude<typeof config.ssl, boolean | undefined>;
     expect(ssl.checkServerIdentity?.("ignored", {} as PeerCertificate)).toBeInstanceOf(Error);
+  });
+
+  it.each([
+    { connectionTimeoutMs: 1, statementTimeoutMs: 1000, statements: undefined, expected: 6000 },
+    { connectionTimeoutMs: 5000, statementTimeoutMs: 1000, statements: 1, expected: 6000 },
+    { connectionTimeoutMs: 10_000, statementTimeoutMs: 60_000, statements: undefined, expected: 70_000 },
+    { connectionTimeoutMs: 10_000, statementTimeoutMs: 60_000, statements: 126, expected: 7_570_000 },
+    { connectionTimeoutMs: 10_000, statementTimeoutMs: 3_600_000, statements: 1000, expected: 2_147_483_647 },
+  ])("derives the query deadline $expected ms from the statement budget and a transport grace", (row) => {
+    const { statements, expected, ...timeouts } = row;
+    expect(postgreSqlQueryDeadlineMs(timeouts, statements)).toBe(expected);
   });
 
   it("uses default application and database settings", () => {

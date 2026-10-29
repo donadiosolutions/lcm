@@ -1,0 +1,14 @@
+references: ["#1820"]
+rationale: >-
+  #1820 bounds a PostgreSQL query that receives no response with a client-side
+  deadline. The deadline helper joins the client configuration, the driver
+  timeout message is classified as a retryable connection error, the runtime
+  applies a proportional deadline to multi-statement text, and the portable
+  destination discards its connection after such a failure and disables the
+  client deadline on its own upload connection. All four files keep their
+  existing owners.
+pins:
+  - ["src/storage/postgresql/client-config.ts", "integration-postgresql-runtime"]
+  - ["src/storage/postgresql/errors.ts", "integration-postgresql-runtime"]
+  - ["src/storage/postgresql/runtime.ts", "integration-postgresql-runtime"]
+  - ["src/storage/postgresql/portable-destination.ts", "integration-postgresql-portable"]
