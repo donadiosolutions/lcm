@@ -194,52 +194,85 @@ function findUrlPathStarts(chars: readonly string[]): UrlPathStarts {
     }
     return cursor;
   };
-  const inheritedQuoteContinuationDelimiter = (start: number): number => {
-    // This fallback measures one uninterrupted run for one quote-end
-    // activation. The stop set keeps separate quote ends from sharing work.
-    let cursor = start;
-    while (chars[cursor] !== undefined) {
-      const char = chars[cursor]!;
-      if (char === "&" || char === "|") return cursor;
-      if (
-        WHITESPACE_PATTERN.test(char) ||
-        char === "[" ||
-        char === "]" ||
-        char === "/" ||
-        char === "\\" ||
-        char === "'" ||
-        char === '"'
-      ) {
-        return -1;
-      }
-      cursor += 1;
-    }
-    return -1;
-  };
   const isForwardSlashDrivePathStart = (start: number): boolean =>
     /^[A-Za-z]$/u.test(chars[start] ?? "") && chars[start + 1] === ":" && chars[start + 2] === "/";
-  const inheritedClaimContainsForwardSlashDrive = (
-    start: number,
-    ownerBracketDepth: number,
-  ): boolean => {
-    let depth = ownerBracketDepth;
-    for (let cursor = start; cursor < chars.length; cursor += 1) {
-      const char = chars[cursor]!;
-      if (WHITESPACE_PATTERN.test(char)) return false;
-      if (
-        isForwardSlashDrivePathStart(cursor) &&
-        !isPathWord(chars[cursor - 1])
-      ) {
-        return true;
-      }
-      if (char === "[") depth += 1;
-      else if (char === "]") {
-        depth -= 1;
-        if (depth < ownerBracketDepth) return false;
+  const matchingBracketClose = new Int32Array(chars.length).fill(-1);
+  const enclosingBracketOpen = new Int32Array(chars.length).fill(-1);
+  const bracketStack: number[] = [];
+  for (let cursor = 0; cursor < chars.length; cursor += 1) {
+    enclosingBracketOpen[cursor] = bracketStack.at(-1) ?? -1;
+    if (chars[cursor] === "[") bracketStack.push(cursor);
+    else if (chars[cursor] === "]") {
+      const open = bracketStack.pop();
+      if (open !== undefined) matchingBracketClose[open] = cursor;
+    }
+  }
+
+  const publicValueSchemeStart = new Uint8Array(chars.length);
+  let prospectiveSchemeStart = -1;
+  for (let cursor = 0; cursor < chars.length; cursor += 1) {
+    const char = chars[cursor]!;
+    if (prospectiveSchemeStart < 0) {
+      if (URL_SCHEME_START_PATTERN.test(char)) prospectiveSchemeStart = cursor;
+      continue;
+    }
+    if (URL_SCHEME_CHARACTER_PATTERN.test(char)) continue;
+    if (char === ":" && chars[cursor + 1] === "/" && chars[cursor + 2] === "/") {
+      const previous = chars[prospectiveSchemeStart - 1];
+      if (previous !== undefined && "=&|/?#".includes(previous)) {
+        publicValueSchemeStart[prospectiveSchemeStart] = 1;
       }
     }
-    return false;
-  };
+    prospectiveSchemeStart = -1;
+  }
+
+  const nextForwardSlashDrive = new Int32Array(chars.length + 1).fill(chars.length);
+  const nextWhitespace = new Int32Array(chars.length + 1).fill(chars.length);
+  const nextFileLiteral = new Int32Array(chars.length + 1).fill(chars.length);
+  const nextPublicValue = new Int32Array(chars.length + 1).fill(chars.length);
+  const nextOpenBracket = new Int32Array(chars.length + 1).fill(chars.length);
+  const nextBackslash = new Int32Array(chars.length + 1).fill(chars.length);
+  const softBoundaryEnd = new Int32Array(chars.length + 1);
+  softBoundaryEnd[chars.length] = chars.length;
+  const inheritedContinuationDelimiter = new Int32Array(chars.length + 1).fill(-1);
+  for (let cursor = chars.length - 1; cursor >= 0; cursor -= 1) {
+    const char = chars[cursor]!;
+    const forwardDrive =
+      isForwardSlashDrivePathStart(cursor) && !isPathWord(chars[cursor - 1]);
+    nextForwardSlashDrive[cursor] = forwardDrive
+      ? cursor
+      : nextForwardSlashDrive[cursor + 1]!;
+    const whitespace = char.trim() === "";
+    nextWhitespace[cursor] = whitespace
+      ? cursor
+      : nextWhitespace[cursor + 1]!;
+    nextFileLiteral[cursor] = isFileUrlLiteral(chars, cursor)
+      ? cursor
+      : nextFileLiteral[cursor + 1]!;
+    nextPublicValue[cursor] = publicValueSchemeStart[cursor] === 1
+      ? cursor
+      : nextPublicValue[cursor + 1]!;
+    nextOpenBracket[cursor] = char === "[" ? cursor : nextOpenBracket[cursor + 1]!;
+    nextBackslash[cursor] = char === "\\" ? cursor : nextBackslash[cursor + 1]!;
+    const softBoundary = whitespace || "\u200b\u200c\u200d\u2060".includes(char);
+    softBoundaryEnd[cursor] = softBoundary ? softBoundaryEnd[cursor + 1]! : cursor;
+
+    if (char === "&" || char === "|") {
+      inheritedContinuationDelimiter[cursor] = cursor;
+    } else if (
+      whitespace ||
+      char === "[" ||
+      char === "]" ||
+      char === "/" ||
+      char === "\\" ||
+      char === "'" ||
+      char === '"'
+    ) {
+      inheritedContinuationDelimiter[cursor] = -1;
+    } else {
+      inheritedContinuationDelimiter[cursor] = inheritedContinuationDelimiter[cursor + 1]!;
+    }
+  }
   const backslashSlashSuccessorPathStart = (start: number): number => {
     if (!isPathWord(chars[start])) return -1;
     let cursor = start;
@@ -404,6 +437,148 @@ function findUrlPathStarts(chars: readonly string[]): UrlPathStarts {
     );
     return true;
   };
+  interface InheritedTailAdmission {
+    forcedStart: number;
+    tailStart: number;
+  }
+  const simpleRootedPathEnd = (start: number): number => {
+    let cursor = start;
+    if (isWindowsDrivePathStart(chars, cursor)) cursor += 3;
+    else {
+      if (chars[cursor] !== "/" && chars[cursor] !== "\\") return -1;
+      cursor = skipSeparatorRun(cursor);
+    }
+    if (!isPathWord(chars[cursor])) return -1;
+    while (true) {
+      while (isPathWord(chars[cursor])) cursor += 1;
+      if (chars[cursor] !== "/" && chars[cursor] !== "\\") return cursor;
+      cursor = skipSeparatorRun(cursor);
+      if (!isPathWord(chars[cursor])) return -1;
+    }
+  };
+  const simplePrivateRelativePath = (start: number): { forcedStart: number; end: number } | undefined => {
+    const forcedStart = returnedParentPrivateRootPathStart(start);
+    if (forcedStart < 0) return undefined;
+    let cursor = start;
+    while (isPathWord(chars[cursor]) || chars[cursor] === "/" || chars[cursor] === "\\") cursor += 1;
+    return { forcedStart, end: cursor };
+  };
+  const prospectiveRegionEnd = (start: number, ownerBracketOpen: number): number => {
+    let regionEnd = chars.length;
+    if (ownerBracketOpen >= 0) {
+      const close = matchingBracketClose[ownerBracketOpen];
+      if (close >= start) regionEnd = close + 1;
+    }
+    const componentOpen = nextOpenBracket[start]!;
+    if (componentOpen < regionEnd) {
+      const componentClose = matchingBracketClose[componentOpen];
+      if (componentClose >= componentOpen) regionEnd = componentClose + 1;
+    }
+    return regionEnd;
+  };
+  const isSimpleBracketContinuation = (
+    start: number,
+    regionEnd: number,
+    crossedSoftBoundary: boolean,
+  ): boolean => {
+    let bracketStart = start;
+    if (chars[bracketStart] === "(") bracketStart += 1;
+    if (chars[bracketStart] !== "[") return chars[bracketStart] !== "[";
+    const close = matchingBracketClose[bracketStart];
+    if (close < 0) return false;
+    const firstUnsupported = Math.min(
+      nextOpenBracket[bracketStart + 1]!,
+      nextFileLiteral[bracketStart + 1]!,
+      nextPublicValue[bracketStart + 1]!,
+      nextWhitespace[bracketStart + 1]!,
+    );
+    if (firstUnsupported < close) return false;
+    if (crossedSoftBoundary && nextBackslash[bracketStart + 1]! < close) return false;
+    return true;
+  };
+  const measureInheritedTailAdmission = (
+    successorStart: number,
+    originEnd: number,
+    initialAdmission?: InheritedTailAdmission,
+  ): InheritedTailAdmission | undefined => {
+    const ownerOpen = enclosingBracketOpen[successorStart];
+    const regionEnd = prospectiveRegionEnd(successorStart, ownerOpen);
+    if (nextForwardSlashDrive[originEnd]! < regionEnd) return undefined;
+    if (nextFileLiteral[originEnd]! < regionEnd) return undefined;
+    if (nextPublicValue[originEnd]! < regionEnd) return undefined;
+
+    let cursor = initialAdmission === undefined ? successorStart : originEnd;
+    let admission = initialAdmission;
+    let crossedSoftBoundary = false;
+    while (cursor < regionEnd) {
+      const char = chars[cursor]!;
+      if (char === "[" || char === "(" || char === "]") break;
+      if (char === "&" || char === "|") {
+        cursor += 1;
+        continue;
+      }
+      const rootedEnd = simpleRootedPathEnd(cursor);
+      if (rootedEnd >= 0) {
+        admission ??= { forcedStart: cursor, tailStart: cursor };
+        cursor = rootedEnd;
+        continue;
+      }
+      if (isPathWord(char)) {
+        const privateRelative = simplePrivateRelativePath(cursor);
+        if (privateRelative !== undefined) {
+          admission ??= { forcedStart: privateRelative.forcedStart, tailStart: cursor };
+          cursor = privateRelative.end;
+          continue;
+        }
+        while (isPathWord(chars[cursor])) cursor += 1;
+        if (chars[cursor] === "=") {
+          cursor += 1;
+          const rootedEnd = simpleRootedPathEnd(cursor);
+          if (rootedEnd >= 0) {
+            admission ??= { forcedStart: cursor, tailStart: cursor };
+            cursor = rootedEnd;
+            continue;
+          }
+        }
+        if (chars[cursor] === "&" || chars[cursor] === "|") continue;
+        return undefined;
+      }
+      if (admission !== undefined && (WHITESPACE_PATTERN.test(char) || "\u200b\u200c\u200d\u2060".includes(char))) {
+        crossedSoftBoundary = true;
+        cursor = softBoundaryEnd[cursor]!;
+        const bracketFollows =
+          chars[cursor] === "[" || (chars[cursor] === "(" && chars[cursor + 1] === "[");
+        if (!bracketFollows) return undefined;
+        break;
+      }
+      return undefined;
+    }
+    if (admission === undefined) return undefined;
+    if (!isSimpleBracketContinuation(cursor, regionEnd, crossedSoftBoundary)) return undefined;
+    return admission;
+  };
+  const applyInheritedTailAdmission = (
+    admission: InheritedTailAdmission,
+    ownerDepth: number,
+  ): void => {
+    pathlessFileQueryOwnerBracketDepth = ownerDepth;
+    nestedFileUrlParentOwnerBracketDepths.add(ownerDepth);
+    restartedNestedFileUrlParentOwnerBracketDepths.delete(ownerDepth);
+    repeatedPipeHandoffWrapperDepths.add(ownerDepth);
+    inheritedQuoteTailWrapperDepths.add(ownerDepth);
+    forcedPath[admission.forcedStart] = 1;
+    armBracketTail(
+      admission.forcedStart,
+      admission.tailStart,
+      false,
+      true,
+      true,
+      true,
+      false,
+      true,
+      true,
+    );
+  };
   const findMatchingQuoteBeforeLineEnd = (start: number, quote: string): number => {
     for (let cursor = start; cursor < chars.length; cursor += 1) {
       if (chars[cursor] === "\n" || chars[cursor] === "\r") return -1;
@@ -449,21 +624,7 @@ function findUrlPathStarts(chars: readonly string[]): UrlPathStarts {
   let quotedQueryPublicUrlOwnQueryOrFragment = false;
   let backslashSlashClaimActive = false;
   let activeNestedFileSchemeStart = -1;
-  const restoreInheritedQuoteHandoff = (
-    successorStart: number,
-    refusesForwardSlashDrive = false,
-  ): void => {
-    if (
-      refusesForwardSlashDrive &&
-      inheritedClaimContainsForwardSlashDrive(
-        successorStart,
-        inheritedFileQuoteParentOwnerBracketDepth,
-      )
-    ) {
-      inheritedFileQuoteParentOwnerBracketDepth = 0;
-      inheritedFileQuoteEnd = -1;
-      return;
-    }
+  const restoreInheritedQuoteHandoff = (successorStart: number): void => {
     pathlessFileQueryOwnerBracketDepth = inheritedFileQuoteParentOwnerBracketDepth;
     nestedFileUrlParentOwnerBracketDepths.add(inheritedFileQuoteParentOwnerBracketDepth);
     restartedNestedFileUrlParentOwnerBracketDepths.delete(inheritedFileQuoteParentOwnerBracketDepth);
@@ -556,20 +717,51 @@ function findUrlPathStarts(chars: readonly string[]): UrlPathStarts {
       if (chars[continuationStart] === "&" || chars[continuationStart] === "|") {
         restoreInheritedQuoteHandoff(continuationStart + 1);
       } else {
-        const continuationDelimiter = inheritedQuoteContinuationDelimiter(continuationStart);
+        const continuationDelimiter = inheritedContinuationDelimiter[continuationStart]!;
         if (continuationDelimiter >= 0 && chars[continuationDelimiter + 1] !== "=") {
-          restoreInheritedQuoteHandoff(continuationDelimiter + 1, true);
+          const admission = measureInheritedTailAdmission(
+            continuationDelimiter + 1,
+            continuationDelimiter + 1,
+          );
+          if (admission !== undefined) {
+            applyInheritedTailAdmission(admission, inheritedFileQuoteParentOwnerBracketDepth);
+            inheritedFileQuoteParentOwnerBracketDepth = 0;
+            inheritedFileQuoteEnd = -1;
+          }
         } else if (valueStart > continuationStart) {
           const forwardSlashDriveValue = isForwardSlashDrivePathStart(valueStart);
-          if (
-            chars[valueStart] === "/" ||
-            namedBackslashValue ||
-            isWindowsDrivePathStart(chars, valueStart) ||
-            forwardSlashDriveValue
-          ) {
-            restoreInheritedQuoteHandoff(valueStart, true);
+          let originEnd = simpleRootedPathEnd(valueStart);
+          if (forwardSlashDriveValue) {
+            originEnd = valueStart + 3;
+            while (isPathWord(chars[originEnd]) || chars[originEnd] === "/") originEnd += 1;
+          }
+          if (originEnd >= 0) {
+            const initialAdmission = {
+              forcedStart: forwardSlashDriveValue ? valueStart + 2 : valueStart,
+              tailStart: valueStart,
+            };
+            const admission = measureInheritedTailAdmission(
+              valueStart,
+              originEnd,
+              initialAdmission,
+            );
+            if (admission !== undefined) {
+              if (forwardSlashDriveValue) {
+                const pathStart = valueStart + 2;
+                forcedPath[pathStart] = 1;
+                armBracketTail(pathStart, valueStart, false, true, true);
+              } else {
+                applyInheritedTailAdmission(admission, inheritedFileQuoteParentOwnerBracketDepth);
+              }
+              inheritedFileQuoteParentOwnerBracketDepth = 0;
+              inheritedFileQuoteEnd = -1;
+            }
           }
         }
+      }
+      if (inheritedFileQuoteEnd === index) {
+        inheritedFileQuoteParentOwnerBracketDepth = 0;
+        inheritedFileQuoteEnd = -1;
       }
     }
     const closingPathlessFileQueryOwnerDepth =

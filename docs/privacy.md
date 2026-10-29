@@ -770,24 +770,33 @@ bundle and keep provider, credential, quarantine, and recovery sessions private.
   handoff, and whitespace between the delimiter and the successor resets
   ownership; in both cases a Windows backslash-rooted value stays readable
   unless another path rule applies. A slash, bracket, quote, or backslash in
-  the intervening run retains its existing boundary. One or more `=` characters
-  after the matching quote also redact an immediately adjacent POSIX-rooted,
-  Windows backslash-rooted, or drive value on the first pass. When that redacted
-  value is followed by a bracket, private values inside the bracket are redacted
-  on the same pass. A drive-shaped value in a component reached only through
-  this new handoff keeps its earlier multi-pass classification instead of being
-  collapsed to a drive-less marker; this includes nested file children and
-  later named values. Relative, public-URL, and plain values after `=` stay
-  readable, as do backslash-rooted values separated from `=` by whitespace or
-  one of the listed invisible characters. Within the same
-  uninterrupted wrapper after an immediate rooted handoff, immediate and later
-  supported rooted, named Windows, and recognized private-root successors
-  redact on the same pass. Bracketed components that follow a redacted successor
-  follow the tail rules above, and inside them a private-root relative value
-  after `&` or `|` is also redacted on the first pass. Ordinary relative and
-  public-URL successors remain readable. Unquoted URLs, embedded URLs whose
-  scheme did not begin at the quote, unmatched quotes, and newlines retain
-  their existing boundaries.
+  the intervening run retains its existing boundary. The extended handoff is
+  installed only after the complete prospective component has been validated
+  and contains a supported rooted or recognized `Users`, `home`, or `root`
+  relative successor. A neutral plain token can precede that real successor,
+  but does not establish ownership by itself.
+
+  One or more `=` characters after the matching quote redact an immediately
+  adjacent complete POSIX root, Windows backslash root, or simple drive origin
+  on the first pass when the following component also has that simple grammar.
+  A bare separator, a slash-prefixed URL, a public or file URL value, a nested
+  file child, unknown nested brackets, compound path syntax, internal
+  whitespace, or a later drive refuses the new ownership before any scanner
+  state changes. Those refused shapes keep their earlier multi-pass spelling.
+  A successor beginning with `=` after an `&` or `|` is likewise left on its
+  existing boundary. A narrow drive-free soft-whitespace boundary immediately
+  before an otherwise simple bracket is supported; whitespace inside a selected
+  value or path is not.
+
+  Relative, public-URL, and plain values directly after `=` stay readable, as
+  do backslash-rooted values separated from `=` by whitespace or one of the
+  listed invisible characters. Within the same uninterrupted wrapper after an
+  admitted rooted handoff, supported rooted, named Windows, and recognized
+  private-root successors redact on the same pass. Ordinary relative and
+  public-URL successors remain readable. The older immediate and listed
+  zero-width handoffs retain their established behavior. Unquoted URLs,
+  embedded URLs whose scheme did not begin at the quote, unmatched quotes, and
+  newlines retain their existing boundaries.
 
   Root-relative Windows values after opaque wrapper text remain conservatively
   redacted. LCM does not expose such private-looking values merely because URL

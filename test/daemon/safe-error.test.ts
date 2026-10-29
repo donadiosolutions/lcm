@@ -1,3 +1,4 @@
+import { createHash } from "node:crypto";
 import { describe, it, expect, vi } from "vitest";
 import { sanitizeError } from "../../src/daemon/safe-error.js";
 
@@ -6144,10 +6145,10 @@ describe("sanitizeError", () => {
     it.each([
       ["direct", ""],
       ["after U+200B", "\u200b"],
-    ] as const)("keeps the base drive-origin bracket sequence %s", (_name, interposer) => {
+    ] as const)("redacts the drive-origin bracket %s on the first pass", (_name, interposer) => {
       assertPasses(
         prefix + interposer + "=C:/Users/SECRET/x" + bracket,
-        redactedPrefix + interposer + "=C:<path>?key=/home/C/s]]",
+        redactedPrefix + interposer + "=C:<path>?key=<path>]]",
         redactedPrefix + interposer + "=C:<path>?key=<path>]]",
         redactedPrefix + interposer + "=C:<path>?key=<path>]]",
       );
@@ -6178,10 +6179,10 @@ describe("sanitizeError", () => {
         "=C:<path>&\\Users\\T\\y]",
         "=C:<path>&<path>]",
       ],
-    ] as const)("keeps the base drive-origin successor sequence for the %s", (_name, suffix, first, fixed) => {
+    ] as const)("redacts the drive-origin successor on the first pass for the %s", (_name, suffix, _first, fixed) => {
       assertPasses(
         prefix + suffix,
-        redactedPrefix + first,
+        redactedPrefix + fixed,
         redactedPrefix + fixed,
         redactedPrefix + fixed,
       );
@@ -6938,6 +6939,85 @@ describe("sanitizeError", () => {
         );
       },
     );
+
+    it.each([
+      ["E1", ",|[file:///b&[https://o?key=/Users/ZQC/x]]", ",|[file://<path>&[https://o?key=<path>]]", ",|[file://<path>&[https://o?key=<path>]]", ",|[file://<path>&[https://o?key=<path>]]"],
+      ["E2", ",|/https://pub.test/x?y=/Users/ZQD/x]", ",|<path>?y=/Users/ZQD/x]", ",|<path>?y=<path>]", ",|<path>?y=<path>]"],
+      ["E3", "=/Users/ZQB/x[file:///b&[https://o?key=home/ZQC/x]]", "=<path>&[https://o?key=home<path>]]", "=<path>&[https://o?key=home<path>]]", "=<path>&[https://o?key=home<path>]]"],
+      ["E4", "=/Users/ZQB/x[file:///b&[https://o?key=/home/ZQC/x]]", "=<path>&[https://o?key=<path>]]", "=<path>&[https://o?key=<path>]]", "=<path>&[https://o?key=<path>]]"],
+      ["E5", "=plain&[file:///b&([https://o?key=/Users/ZQC/x]", "=plain&[file://<path>&([https://o?key=<path>]", "=plain&[file://<path>&([https://o?key=<path>]", "=plain&[file://<path>&([https://o?key=<path>]"],
+      ["E6", "=/https://pub.test/x?y=/Users/ZQC/x]", "=<path>?y=/Users/ZQC/x]", "=<path>?y=<path>]", "=<path>?y=<path>]"],
+      ["N1", ",|\\Users\\SA\\x[file:///b&/home/TA/s]]", ",|\\Users\\SA\\x[file://<path>&<path>]]", ",|<path><path>&<path>]]", ",|<path><path>&<path>]]"],
+      ["N2", ",|\\Users\\ZQB\\x[file:///b]]", ",|\\Users\\ZQB\\x[file://<path>]]", ",|<path><path>]]", ",|<path><path>]]"],
+      ["W1", ",|\\Users\\SA\\x\u00a0/home/TA/s]", ",|\\Users\\SA\\x\u00a0<path>]", ",|<path><path>]", ",|<path><path>]"],
+      ["W2", "=\\Users\\ZQB\\x\u00a0[https://inner?key=C:/Users/ZQD/x]]", "=<path>?key=C:/Users/ZQD/x]]", "=<path>?key=C:<path>]]", "=<path>?key=C:<path>]]"],
+      ["W3", "=\\Users\\ZQB\\x\u00a0[https://inner?key=C:/file:///Users/ZQD/x]]", "=<path>?key=C:/file://<path>]]", "=<path>?key=C:<path><path>]]", "=<path>?key=C:<path><path>]]"],
+      ["W4", "=\\Users\\SP\\x[https://inner?key=/home/S1/s\u00a0/home/SA/s]]", "=<path>?key=/home/S1/s\u00a0<path>]]", "=<path>?key=<path><path>]]", "=<path>?key=<path><path>]]"],
+      ["P1", "=\\Users\\SP\\x[https://inner?key=https://pub.test/p&k4=/home/SA/s]]", "=<path>?key=https://pub.test/p&k4=/home/SA/s]]", "=<path>?key=https://pub.test/p&k4=/home/SA/s]]", "=<path>?key=https://pub.test/p&k4=/home/SA/s]]"],
+      ["B1", "=/]", "=/]", "=/]", "=/]"],
+      ["B2", "=//]", "=//]", "=//]", "=//]"],
+      ["B3", "=/&k=c:/ZQE]", "=/&k=c:<path>]", "=/&k=c:<path>]", "=/&k=c:<path>]"],
+      ["D1", "=C:/Users/SECRET/x[https://inner?key=/home/C/s]]", "=C:<path>?key=<path>]]", "=C:<path>?key=<path>]]", "=C:<path>?key=<path>]]"],
+      ["D2", "\u200b=C:/Users/SECRET/x[https://inner?key=/home/C/s]]", "\u200b=C:<path>?key=<path>]]", "\u200b=C:<path>?key=<path>]]", "\u200b=C:<path>?key=<path>]]"],
+      ["D3", "=\\Users\\S\\x[https://inner?key=C:/Users/K/x]]", "=<path>?key=C:/Users/K/x]]", "=<path>?key=C:<path>]]", "=<path>?key=C:<path>]]"],
+      ["D4", ",|\\Users\\S\\x&later/home/SQ&k=K:/Users/x]", ",|\\Users\\S\\x&later/home/SQ&k=K:<path>]", ",|<path>&later<path>&k=K:<path>]", ",|<path>&later<path>&k=K:<path>]"],
+      ["T1", "=\\Users\\SECRET\\x[https://inner?key=/home/C/s]]", "=<path>?key=<path>]]", "=<path>?key=<path>]]", "=<path>?key=<path>]]"],
+      ["T2", ",|\\Users\\SECRET\\x[https://inner?key=/home/C/s]]", ",|<path>?key=<path>]]", ",|<path>?key=<path>]]", ",|<path>?key=<path>]]"],
+      ["T3", "=plain&later/home/alice]", "=plain&later<path>]", "=plain&later<path>]", "=plain&later<path>]"],
+      ["C1", "|[file:///b&[https://o?key=/Users/ZQC/x]]", "|[file://<path>&[https://o?key=/Users/ZQC/x]]", "|[file://<path>&[https://o?key=/Users/ZQC/x]]", "|[file://<path>&[https://o?key=/Users/ZQC/x]]"],
+      ["C2", "\u200b|/https://pub.test/x?y=/Users/ZQC/x]", "\u200b|<path>https://pub.test/x?y=/Users/ZQC/x]", "\u200b|<path>https://pub.test/x?y=/Users/ZQC/x]", "\u200b|<path>https://pub.test/x?y=/Users/ZQC/x]"],
+      ["C3", " \u00ad|\\Users\\S\\x]", " \u00ad|\\Users\\S\\x]", " \u00ad|\\Users\\S\\x]", " \u00ad|\\Users\\S\\x]"],
+      ["R2 trailing separator", "=/Users/]", "=<path>]", "=<path>]", "=<path>]"],
+      ["R2 soft boundary backslash value", "=\\Users\\S\\x\u00a0[https://inner?key=\\Users\\D\\x]]", "=<path>?key=\\Users\\D\\x]]", "=<path>?key=<path>]]", "=<path>?key=<path>]]"],
+      ["R2 soft boundary parenthesised bracket", "=\\Users\\S\\x\u00a0([https://inner?key=/home/D/x]", "=<path>?key=<path>]", "=<path>?key=<path>]", "=<path>?key=<path>]"],
+      ["R2 unmatched bracket", ",|\\Users\\S\\x[https://inner?key=/home/C/s", ",|\\Users\\S\\x[https://inner?key=/home/C/s", ",|<path>?key=/home/C/s", ",|<path>?key=<path>"],
+    ] as const)("pins round-2 synthesis row %s", (_id, inputSuffix, firstSuffix, secondSuffix, thirdSuffix) => {
+      const first = sanitizeError(prefix + inputSuffix);
+      const second = sanitizeError(first);
+      const third = sanitizeError(second);
+
+      expect(first).toBe(redactedPrefix + firstSuffix);
+      expect(second).toBe(redactedPrefix + secondSuffix);
+      expect(third).toBe(redactedPrefix + thirdSuffix);
+    });
+
+    it.each([
+      [
+        "fallback200k",
+        "file://h?x=[" + "'https://o.test/x?next=file:///U/a',|v".repeat(5200) + "]",
+        208_013,
+        "c024dc35c125ec3d29e87a32bc8dc1722927774a087454b9baa9e92f8f603917",
+      ],
+      [
+        "eqPosix200k",
+        "file://h?x=[" + "'https://o.test/x?next=file:///U/a'=/U/v".repeat(5000) + "]",
+        220_013,
+        "95f18a3141abec73b4e16f103533842c9b5d7a1e7b3545ee38179c9145737a08",
+      ],
+      [
+        "eqBackslash200k",
+        "file://h?x=[" + "'https://o.test/x?next=file:///U/a'=\\U\\v".repeat(5000) + "]",
+        220_013,
+        "95f18a3141abec73b4e16f103533842c9b5d7a1e7b3545ee38179c9145737a08",
+      ],
+      [
+        "longR",
+        prefix + "x".repeat(200_000) + "|\\Users\\S\\x]",
+        200_061,
+        "679daaef1c2c504dd9691c3e2cffb0dde22a7c287237b16bcc2e33fe5c7f9793",
+      ],
+    ] as const)("matches the frozen oracle for %s in linear time", (_name, input, expectedLength, expectedHash) => {
+      let value = input;
+      for (let pass = 0; pass < 3; pass += 1) {
+        const started = performance.now();
+        value = sanitizeError(value);
+        const elapsed = performance.now() - started;
+
+        expect(elapsed).toBeLessThan(2_000);
+        expect(value).toHaveLength(expectedLength);
+        expect(createHash("sha256").update(value).digest("hex")).toBe(expectedHash);
+      }
+    });
   });
 
 
