@@ -1299,30 +1299,91 @@ export function readGenerationScopedFiles(
   const expectedUid = dependencies.expectedUid ?? currentUid();
   const readWithStat = dependencies.readWithStat ?? readBoundedRegularFileWithStat;
   try {
-    const rootHandle = openPrivateDirectory(rootPath(input.homeDir), { expectedUid });
-    try {
-      const storeHandle = openPrivateDirectoryIfExists(
-        generationScopedStoreDirectory(store, input.homeDir),
-        { expectedUid },
-      );
-      if (storeHandle === undefined) return GENERATION_SCOPED_ABSENT;
-      try {
-        const directory = generationScopedDirectory(store, input.homeDir, input.generationId);
-        const generationHandle = openPrivateDirectoryIfExists(directory, { expectedUid });
-        if (generationHandle === undefined) return GENERATION_SCOPED_ABSENT;
-        try {
-          return scanGenerationScopedDirectory(store, directory, expectedUid, readWithStat, pending);
-        } finally {
-          generationHandle.close();
-        }
-      } finally {
-        storeHandle.close();
-      }
-    } finally {
-      rootHandle.close();
-    }
+    return withAuthenticatedGenerationScopedDirectory(
+      store, input, expectedUid, GENERATION_SCOPED_ABSENT,
+      (directory) => scanGenerationScopedDirectory(store, directory, expectedUid, readWithStat, pending),
+    );
   } catch (error) {
     return generationScopedUnresolvable(store.noun + " store cannot be read: " + (error as Error).message);
+  }
+}
+
+/**
+ * Opens the private root, the store directory and the generation directory
+ * in turn (owner uid, mode, no symlink) and runs the body while all three
+ * handles are held. A positively absent store or generation directory
+ * answers absent, without running the body. Errors propagate to the caller.
+ */
+function withAuthenticatedGenerationScopedDirectory<T>(
+  store: GenerationScopedStore,
+  input: Readonly<{ homeDir: string; generationId: string }>,
+  expectedUid: number | undefined,
+  absent: T,
+  body: (directory: string) => T,
+): T {
+  const rootHandle = openPrivateDirectory(rootPath(input.homeDir), { expectedUid });
+  try {
+    const storeHandle = openPrivateDirectoryIfExists(
+      generationScopedStoreDirectory(store, input.homeDir),
+      { expectedUid },
+    );
+    if (storeHandle === undefined) return absent;
+    try {
+      const directory = generationScopedDirectory(store, input.homeDir, input.generationId);
+      const generationHandle = openPrivateDirectoryIfExists(directory, { expectedUid });
+      if (generationHandle === undefined) return absent;
+      try {
+        return body(directory);
+      } finally {
+        generationHandle.close();
+      }
+    } finally {
+      storeHandle.close();
+    }
+  } finally {
+    rootHandle.close();
+  }
+}
+
+/** A writer scratch file whose final name is absent: the final name it was
+ * writing and the authenticated bytes it holds. */
+export type GenerationScopedLoneScratch = Readonly<{ fileName: string; content: string }>;
+
+/**
+ * Discovery only: the lone writer scratch files of one generation directory,
+ * for a caller that may be able to prove one of them is its own interrupted
+ * write. A scratch is listed when its final name is one the store may hold,
+ * that final is absent, and its content reads as a lone writer scratch
+ * (owner uid, the writer's mode, a single link, bounded). Anything else is
+ * not listed: this is not the authentication of the directory, which stays
+ * the pending-aware scan of readGenerationScopedFiles. An absent or
+ * unreadable store, generation directory or entry lists nothing. Synchronous
+ * and read-only; it never creates, repairs or deletes.
+ */
+export function readGenerationScopedLoneScratches(
+  store: GenerationScopedStore,
+  input: Readonly<{ homeDir: string; generationId: string }>,
+  dependencies: ReadGenerationScopedFilesDependencies = {},
+): readonly GenerationScopedLoneScratch[] {
+  const expectedUid = dependencies.expectedUid ?? currentUid();
+  const readWithStat = dependencies.readWithStat ?? readBoundedRegularFileWithStat;
+  try {
+    return withAuthenticatedGenerationScopedDirectory<readonly GenerationScopedLoneScratch[]>(
+      store, input, expectedUid, [],
+      (directory) => {
+        const entries = readdirSync(directory).sort();
+        const lone: GenerationScopedLoneScratch[] = [];
+        for (const entry of entries) {
+          const fileName = WRITER_SCRATCH_ENTRY_PATTERN.exec(entry)?.[1];
+          if (fileName === undefined || !store.isFinalFileName(fileName) || entries.includes(fileName)) continue;
+          const content = readLoneScratchContent(join(directory, entry), directory, store, expectedUid, readWithStat);
+          if (content !== undefined) lone.push({ fileName, content });
+        }
+        return lone;
+      },
+    );
+  } catch {
+    return [];
   }
 }
 

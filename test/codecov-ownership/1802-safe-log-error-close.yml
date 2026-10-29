@@ -1,0 +1,8 @@
+references: ["#1802"]
+rationale: >-
+  Fixes src/hooks/hook-errors.ts so a throwing close of the retained LCM root
+  handle no longer rejects safeLogError. The file is materially changed and
+  keeps its existing unit-hooks owner. No path is added, removed, moved or
+  re-owned and codecov.yml is unchanged.
+pins:
+  - ["src/hooks/hook-errors.ts", "unit-hooks"]

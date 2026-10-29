@@ -193,6 +193,61 @@ describe("safeLogError", () => {
     expect(content).toContain("no cwd");
   });
 
+  describe("root handle close failure", () => {
+    const closeFailure = new Error("injected root close failure");
+
+    function failRootClose(): { close: ReturnType<typeof vi.fn>; restore: () => void } {
+      const originalOpen = securityFiles.openPrivateDirectory;
+      const close = vi.fn();
+      let opened = false;
+      const open = vi.spyOn(securityFiles, "openPrivateDirectory").mockImplementation((...args) => {
+        const handle = originalOpen(...args);
+        // Only safeLogError's own first open is faulted; later opens belong to the DB path.
+        if (opened) return handle;
+        opened = true;
+        const realClose = handle.close;
+        close.mockImplementation(() => {
+          realClose();
+          throw closeFailure;
+        });
+        return { ...handle, close };
+      });
+      return { close, restore: () => open.mockRestore() };
+    }
+
+    it("swallows a close failure after the flat-file fallback", async () => {
+      const injected = failRootClose();
+      try {
+        await expect(safeLogError("PostToolUse", new Error("close after file"), {}))
+          .resolves.toBeUndefined();
+        expect(injected.close).toHaveBeenCalledTimes(1);
+        expect(readFileSync(join(tempDir, "events.log"), "utf-8")).toContain("close after file");
+      } finally {
+        injected.restore();
+      }
+    });
+
+    it("swallows a close failure after the sidecar database write", async () => {
+      const cwd = join(tempDir, "close-project");
+      mkdirSync(cwd);
+      const injected = failRootClose();
+      try {
+        await expect(safeLogError("PostToolUse", new Error("close after db"), { cwd, sessionId: "s1" }))
+          .resolves.toBeUndefined();
+        expect(injected.close).toHaveBeenCalledTimes(1);
+      } finally {
+        injected.restore();
+      }
+      const db = new EventsDb(eventsDbPath(cwd));
+      try {
+        expect(db.getRecentErrors({ includeMaintenance: true })
+          .map((row) => row.error)).toEqual(["close after db"]);
+      } finally {
+        db.close();
+      }
+    });
+  });
+
   it("does not persist project state for a nonexistent diagnostic cwd", async () => {
     const cwd = join(tempDir, "missing-project");
     await safeLogError("PostToolUse", new Error("invalid cwd"), { cwd });
