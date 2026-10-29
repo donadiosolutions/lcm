@@ -56,6 +56,11 @@ const testIdentity = {
   ownerId: "server-tests",
   entrypoint: "/lcm-tests/server-daemon.mjs",
 } as const;
+const packageVersion = (
+  JSON.parse(readFileSync(new URL("../../package.json", import.meta.url), "utf8")) as {
+    version: string;
+  }
+).version;
 
 type Deferred<T> = {
   promise: Promise<T>;
@@ -452,7 +457,7 @@ describe("daemon server", () => {
     try {
       const res = await fetch(`http://127.0.0.1:${port}/health`);
       const data = await res.json() as { status: string; version: string; storageBackend: string; uptime: number; pid: number };
-      expect(data.version).toMatch(/^\d+\.\d+\.\d+$/);
+      expect(data.version).toBe(packageVersion);
       expect(data.status).toBe("ok");
       expect(data.storageBackend).toBe("sqlite");
       expect(data.pid).toBe(process.pid);
@@ -1822,7 +1827,7 @@ describe("daemon auth", () => {
       expect(publicResponse.status).toBe(200);
       expect(await publicResponse.json()).toEqual({
         status: "ok",
-        version: expect.stringMatching(/^\d+\.\d+\.\d+$/),
+        version: packageVersion,
         storageBackend: "sqlite",
         uptime: expect.any(Number),
         pid: process.pid,
@@ -1885,7 +1890,7 @@ describe("daemon auth", () => {
       expect(publicResponse.status).toBe(200);
       expect(await publicResponse.json()).toEqual({
         status: "ok",
-        version: expect.stringMatching(/^\d+\.\d+\.\d+$/),
+        version: packageVersion,
         storageBackend: "postgresql",
         uptime: expect.any(Number),
         pid: process.pid,

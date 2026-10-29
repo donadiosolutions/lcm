@@ -1,5 +1,5 @@
 import * as realHttp from "node:http";
-import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, describe, expect, it, vi } from "vitest";
@@ -21,6 +21,11 @@ const testIdentity = {
   ownerId: "mocked-server-tests",
   entrypoint: "/lcm-tests/mocked-server-daemon.mjs",
 } as const;
+const packageVersion = (
+  JSON.parse(readFileSync(new URL("../../package.json", import.meta.url), "utf8")) as {
+    version: string;
+  }
+).version;
 
 state.healthFactory.mockImplementation(async () => state.health);
 state.createFactory.mockImplementation(async () => ({
@@ -318,7 +323,7 @@ describe("mocked server states unavailable from Node HTTP", () => {
       expect(firstPublic.status).toBe(200);
       expect(firstPublic.body).toEqual({
         status: "ok",
-        version: expect.stringMatching(/^\d+\.\d+\.\d+$/),
+        version: packageVersion,
         storageBackend: "sqlite",
         uptime: expect.any(Number),
         pid: process.pid,
