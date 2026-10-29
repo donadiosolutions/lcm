@@ -1,7 +1,7 @@
 {
-  "schema": "sec-daemon-peer-outside-observer-contract-v1",
+  "schema": "sec-daemon-peer-fixed-child-contract-v1",
   "campaign": "lcm-security-20261027-AUvm2L56",
-  "disposition": "PRIVATE_SOURCE_ONLY_NOT_EXECUTED_NOT_GRANTED",
+  "disposition": "UNPUBLISHED_SOURCE_ONLY_ROOT_SOURCE_POLICIES_ADOPTED_SEPARATE_PUBLICATION_AND_NATIVE_GRANTS_REQUIRED",
   "rootTcbChoice": {
     "trusted": [
       "Windows OS System32 native runtime",
@@ -298,38 +298,64 @@
     "ref": "refs/heads/security/daemon-peer-metadata-preflight-20261029",
     "workflowPath": ".github/workflows/testbox-node.yml",
     "expectedShaExternallyBoundAtDispatch": true,
-    "expectedShaRule": "40 lowercase hex == GITHUB_SHA == github.workflow_sha; reject metadataParent",
-    "confirmation": "NATIVE_EMPTY_JOB_CAPABILITY_20261029",
-    "rootFreshReviewAndGrantRequired": true
+    "expectedShaRule": "40 lowercase hex == GITHUB_SHA == github.workflow_sha; reject all historical excluded SHAs and accepted empty-job publication base",
+    "confirmation": "NATIVE_FIXED_CHILD_20261029",
+    "rootFreshReviewAndGrantRequired": true,
+    "excludedShas": [
+      "8deab738ceff4f2de0093e6f5cf5788a41081e95",
+      "aa4e0e761fae8a8b2bf7fb94b5cd4491cfc5c190",
+      "7bac5cb0c0d2848fe3065012f496d1326ddc881a",
+      "c0d7c3ec7c0e137461efc0651610ec4aca3c4396"
+    ]
   },
   "canonicalComposition": {
     "encoding": "UTF-8 without BOM",
     "newlines": "LF",
     "rule": "ffi.rstrip(LF) + LF + LF + capsule.rstrip(LF); no final LF",
-    "sha256": "f4f2156b1b0fcf19a26e91cdcbeeb9660495a50f229597d32b47a766fb085fc9",
+    "sha256": "a916ed73c5077989e72b29c4746aeefdd8569c64f38dc068fd3f7a55f79f0428",
     "inlineSourceIsLiteral": true,
     "noCheckout": true
   },
   "reachable": {
-    "entrypoint": "Invoke-SecEmptyJobCapability",
-    "children": 0,
-    "nativeClassification": "Emit/PInvoke/Job Object capability probe, never metadata-only",
+    "entrypoint": "Invoke-SecFixedChildCapability",
+    "childrenAtMost": 1,
+    "createAttemptsAtMost": 1,
+    "resumeAttemptsAtMost": 1,
+    "nativeClassification": "Emit/PInvoke/Job Object one fixed exit0 child, source proposal only",
+    "recipe": {
+      "application": "C:\\Program Files\\PowerShell\\7\\pwsh.exe",
+      "command": "\"C:\\Program Files\\PowerShell\\7\\pwsh.exe\" -NoLogo -NoProfile -NonInteractive -Command \"exit 0\"",
+      "cwd": "C:\\Program Files\\PowerShell\\7",
+      "environment": [
+        "SystemRoot=C:\\Windows",
+        "WINDIR=C:\\Windows"
+      ],
+      "creationFlags": "0x08080404",
+      "startupAttributes": [
+        "HANDLE_LIST0x20002:NUL3",
+        "JOB_LIST0x2000D:J1"
+      ],
+      "atomicAssignmentRequired": true,
+      "postCreateAssignmentFallback": false
+    },
     "claimsIfObserved": [
-      "outside-J witness",
-      "configured extended limit class readback",
-      "complete empty census",
-      "checked owned job close"
+      "outside explicit J",
+      "one suspended atomic JOB_LIST child",
+      "retained handle PID/birth/member/census1 before sole resume",
+      "actual child one-bit affinity and exact configured limits readback",
+      "retained process signaled and exit0",
+      "checked child/thread releases before J Active0/Total1/list0",
+      "checked attribute/NUL/J/HGlobal releases inside original budget"
     ],
     "doesNotProve": [
-      "workload limit enforcement",
-      "atomic child assignment",
+      "active2 or memory-limit breach enforcement",
+      "forced termination or hard cancellation cleanup",
       "nested product helpers",
-      "forced termination",
-      "fixture I/O",
       "seal",
-      "Node/compiler identity",
+      "compiler/Node identity",
       "production claims",
-      "observer self-exit"
+      "observer self-exit",
+      "unconditional physical cleanup"
     ]
   },
   "budgets": {
@@ -359,23 +385,32 @@
     },
     "firstNative": {
       "originalCooperativeMs": 5000,
-      "children": 0,
+      "children": 1,
       "jobActiveProcesses": 1,
       "jobCommittedBytes": 536870912,
-      "affinity": "first allowed bit in one processor group; exact readback"
+      "affinity": "one allowed bit; exact J readback AND retained actual child affinity before resume"
     },
     "normalAcceptanceCooperativeMs": 30000,
     "stepBackstopMinutes": 1,
     "jobBackstopMinutes": 3,
     "futureFixedChild": {
       "granted": false,
-      "reachable": false,
+      "reachable": true,
       "launches": 1,
       "activeProcesses": 1,
       "jobCommittedBytes": 536870912,
       "logicalCpus": 1,
       "originalStopMs": 5000,
-      "noFinitePhysicalCleanupGuarantee": true
+      "noFinitePhysicalCleanupGuarantee": true,
+      "sourceOnlyReachability": true,
+      "policyRootDecisionPending": false,
+      "createResumeBeforeMs": 2000,
+      "normalWaitDeadlineMs": 3500,
+      "cancelWaitDeadlineMs": 4500,
+      "plannedNormalNativeCallsAtMost": 51,
+      "plannedCancellationNativeCallsAtMost": 54,
+      "fixedBufferRecords": 20,
+      "fixedBufferBytes": 69216
     },
     "futureCompile": {
       "granted": false,
@@ -418,18 +453,27 @@
     "platformTimeoutIsCleanupProof": false,
     "jobHandleSignalIsEmptyProof": false,
     "order": "retained child signaled -> birth/exit/I/O captured -> checked child/thread close -> retained-J complete PID-list/accounting zero -> checked J close",
-    "unresolved": "owned/nonterminal; stop; no rerun/replacement/completion waiver",
+    "unresolved": "ROOT RESOURCEBLOCK/NONTERMINAL/cap-charged; no dependent native work, replacements or campaign completion until original-host actual physical exit AND owned cleanup are externally proven; lost handles without existing reconciliation proof require user/external recovery and remain blocked; a fresh Actions run is not an original-host census",
     "bufferOwnership": "preinserted zero-pointer owner record, pointer adoption before zeroing; ownership clears only after tracked buffer release",
     "noJob": "no native J query; all slots empty => cleaned refusal; remaining slot => owned/nonterminal",
     "sealTemporaryOwnership": "Lease.TempScopes roots every token/lookup/file/access/security/hash temporary owner before acquisition; each scalar record retains buffers, descriptor output/capture and hash disposal obligations",
-    "sealNoRetry": "each scope cleanup and lease file-handle close executes one bounded pass; later calls preserve failed/unknown obligations without retry"
+    "sealNoRetry": "each scope cleanup and lease file-handle close executes one bounded pass; later calls preserve failed/unknown obligations without retry",
+    "fixedChildOwnership": "complete pre-rooted keeper with authoritative24-byte PI, six handle records and20 buffer records; no generic Clear-SecNativeBuffers on fixed records",
+    "fixedChildOneShot": "one cancellation tranche; independent guarded per-owner release; no failed/unknown close retry; PI/attribute dependencies retained while unknown",
+    "fixedChildHistory": "known success requires Total1 after checked process/thread release; proven no-create requires Total0; no NULL-J census",
+    "finalSnapshots": "at most3 complete list/accounting snapshots; at most2 managed10ms sleeps only for valid nonzero/inconsistent snapshots; malformed/API/unknown/impossible-history refuses without retry",
+    "fixedChildOutputAuthority": "raw PI capture is distinct from actionable ownership; only recorded CreateReturned=true may promote valid nonzero process/thread outputs to owned; FALSE/contradictory or unknown results stay opaque/unknown and charged, with authoritative PI/dependencies retained; no per-process terminate/wait/exit/close on opaque values; independently owned J may receive one bounded stop request; FALSE+complete allzeroPI may prove no-create",
+    "fixedChildKnownLateRelease": "ROOT-ADOPTED SOURCE POLICY: dispatch remains inside original window; positively known complete history/reference/census/attribute/handle/buffer closure may retire leases/possible-child charge after a late successful return, but internal status is refused-cleaned and reason original-native-window if no prior reason; original operation still fails all original acceptance gates; unresolved/failed/missing evidence remains UNKNOWN/NONTERMINAL/ROOT RESOURCEBLOCK/cap-charged; no extra post-deadline call or reset"
   },
   "sourceGates": [
-    "fresh identical-byte A and B reviews",
-    "separate synthesis",
-    "root adjudication and source freeze",
+    "fresh identical-byte A and B source reviews",
+    "separate source synthesis",
+    "owner and root exact-source adjudication",
+    "ROOT-selected G5 source-policy alignment verified before publication",
+    "ROOT-adopted S2 source-policy alignment verified before publication",
+    "ROOT reads the exact freshly reviewed source proposal",
     "root publication decision",
-    "separate root native-empty grant"
+    "separate root ONE fixed-child grant"
   ],
   "campaignAccounting": {
     "settledMetadataJobs": 10,
@@ -480,6 +524,75 @@
     "budgetCheckBeforePassingReportAndOutput": true,
     "syntaxRuntimeGuarantee": false,
     "hostOutputSinkSuccessGuaranteed": false,
-    "preludeCheckAfterDefinitionsBeforeNative": true
+    "preludeCheckAfterDefinitionsBeforeNative": true,
+    "fixedChildTelemetry": "bounded booleans/enums/counts/provenance only; no raw PID/TID/birth/handle/pointer/path/error; unknown create output reports unknown children",
+    "custody": "normal report records retained keeper custody AT REPORT while O is alive only; observer exit is supervisor-owned/unobserved; no self-certified post-death handle access; fallback never fabricates custody/child/closure; pending unknown requires ROOT RESOURCEBLOCK until external original-host physical-exit AND owned-cleanup proof or required user/external recovery"
+  },
+  "acceptedEmptyJobContext": {
+    "run": "40961894343",
+    "publicationBase": "c0d7c3ec7c0e137461efc0651610ec4aca3c4396",
+    "reverifiedHere": false,
+    "childProof": false
+  },
+  "g5RootSourcePolicy": {
+    "policyRootDecisionPending": false,
+    "selected": true,
+    "sourcePreparationAdmitted": true,
+    "cleanupAfterUnresolvedObserverDeath": "UNKNOWN",
+    "rootAllocationAfterUnknown": "RESOURCEBLOCK_NONTERMINAL_AND_CAP_CHARGED",
+    "keeperAccessibleWhileObserverLive": true,
+    "keeperAccessibleAfterObserverDeath": false,
+    "handleAccessAfterObserverDeath": false,
+    "reportTransfersOwnership": false,
+    "noFinitePhysicalCleanupGuarantee": true,
+    "newPersistentWatcher": false,
+    "newController": false,
+    "extraNativeTimeWindow": false,
+    "alternativeCustodianOrFiniteTranche": "new scope requiring explicit source/budget/ownership review and grant; not implemented",
+    "selectedPolicy": "bounded-observer-exit-with-unresolved-root-charge",
+    "sourcePolicyOnly": true,
+    "sourcePolicyDecisionSha256": "91770b5cd9c6cc755c38c57e41917a49bfbba6d268c8859b4ce1aa5f1a4523fd",
+    "dependentNativeBlockedWhileUnknown": true,
+    "replacementsBlockedWhileUnknown": true,
+    "campaignCompletionBlockedWhileUnknown": true,
+    "chargeClearingRequires": "external original-host actual physical exit AND owned cleanup proof",
+    "lostCustodyWithoutExistingReconciliationProof": "required user/external recovery; remain blocked",
+    "freshActionsRunIsOriginalHostCensus": false,
+    "separateRootDecisionsRequired": [
+      "publication",
+      "ONE fixed-child native allocation"
+    ],
+    "successorOrRerunAllowedBeforeExternalProof": false,
+    "externalProofDoesNotAutomaticallyGrantNewNativeWork": true
+  },
+  "lateKnownReleaseRootSourcePolicy": {
+    "sourceOnly": true,
+    "rootAdoptionPending": false,
+    "adopted": true,
+    "separateFromG5": true,
+    "clarification": "fixed-child-source/owner-late-release-clarification.md",
+    "clarificationSha256": "d42a417d6626ce2a79bec5153305c47bb7c2b81f0883c04dbb05f5db126a865e",
+    "originalDesignerImmutableSha256": "b9769c0ab24a9caa97bd501815f538d06472728f51f0fcda6e84c33a2ae81209",
+    "knownCompleteLateClosureMayRetireResourceCharge": true,
+    "lateOperationCanPass": false,
+    "lateCompleteStatus": "refused-cleaned",
+    "lateCompleteReasonIfNone": "original-native-window",
+    "unknownOrMissingClosure": "retained-unknown-cleanupUNKNOWN-ROOT_RESOURCEBLOCK-rootNONTERMINAL-cap-charged",
+    "newActionAfterOriginalAdmissionFails": false,
+    "extraWindowOrRetry": false,
+    "sourcePolicyOnly": true,
+    "sourcePolicyDecisionSha256": "91770b5cd9c6cc755c38c57e41917a49bfbba6d268c8859b4ce1aa5f1a4523fd",
+    "freshSourceReviewAndRootReadRequiredBefore": [
+      "publication",
+      "native-child-grant"
+    ]
+  },
+  "rootSourcePolicyDecision": {
+    "sha256": "91770b5cd9c6cc755c38c57e41917a49bfbba6d268c8859b4ce1aa5f1a4523fd",
+    "scope": "SOURCE_POLICY_ONLY",
+    "g5Selected": true,
+    "s2Adopted": true,
+    "separatePublicationAndNativeGrantRequired": true,
+    "freshActualByteReviewsAndRootReadRequired": true
   }
 }
