@@ -195,6 +195,8 @@ function findUrlPathStarts(chars: readonly string[]): UrlPathStarts {
     return cursor;
   };
   const inheritedQuoteContinuationDelimiter = (start: number): number => {
+    // This fallback measures one uninterrupted run for one quote-end
+    // activation. The stop set keeps separate quote ends from sharing work.
     let cursor = start;
     while (chars[cursor] !== undefined) {
       const char = chars[cursor]!;
@@ -206,8 +208,7 @@ function findUrlPathStarts(chars: readonly string[]): UrlPathStarts {
         char === "/" ||
         char === "\\" ||
         char === "'" ||
-        char === '"' ||
-        (char === ":" && chars[cursor + 1] === "/" && chars[cursor + 2] === "/")
+        char === '"'
       ) {
         return -1;
       }
@@ -516,17 +517,31 @@ function findUrlPathStarts(chars: readonly string[]): UrlPathStarts {
       inheritedFileQuoteParentOwnerBracketDepth > 0
     ) {
       const continuationStart = skipInheritedQuoteInterposerRun(index + 1);
-      const continuationDelimiter = inheritedQuoteContinuationDelimiter(continuationStart);
-      if (continuationDelimiter >= 0) {
-        restoreInheritedQuoteHandoff(continuationDelimiter + 1);
+      let valueStart = continuationStart;
+      while (chars[valueStart] === "=") valueStart += 1;
+      const namedBackslashValue =
+        valueStart > continuationStart && chars[valueStart] === "\\";
+      // Preserve the established quote-equals mark independently of whether a
+      // later bounded continuation delimiter restores the enclosing owner.
+      if (namedBackslashValue) forcedPath[valueStart] = 1;
+      // Keep the existing zero-width-run/immediate-delimiter path first. The
+      // broader non-whitespace class is only its fallback.
+      if (chars[continuationStart] === "&" || chars[continuationStart] === "|") {
+        restoreInheritedQuoteHandoff(continuationStart + 1);
       } else {
-        let valueStart = continuationStart;
-        while (chars[valueStart] === "=") valueStart += 1;
-        if (
-          valueStart > continuationStart &&
-          (chars[valueStart] === "\\" || isForwardSlashDrivePathStart(valueStart))
-        ) {
-          restoreInheritedQuoteHandoff(valueStart, isForwardSlashDrivePathStart(valueStart));
+        const continuationDelimiter = inheritedQuoteContinuationDelimiter(continuationStart);
+        if (continuationDelimiter >= 0 && chars[continuationDelimiter + 1] !== "=") {
+          restoreInheritedQuoteHandoff(continuationDelimiter + 1);
+        } else if (valueStart > continuationStart) {
+          const forwardSlashDriveValue = isForwardSlashDrivePathStart(valueStart);
+          if (
+            chars[valueStart] === "/" ||
+            namedBackslashValue ||
+            isWindowsDrivePathStart(chars, valueStart) ||
+            forwardSlashDriveValue
+          ) {
+            restoreInheritedQuoteHandoff(valueStart, forwardSlashDriveValue);
+          }
         }
       }
     }

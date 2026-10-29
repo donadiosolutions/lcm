@@ -771,12 +771,12 @@ bundle and keep provider, credential, quarantine, and recovery sessions private.
   ownership; in both cases a Windows backslash-rooted value stays readable
   unless another path rule applies. A slash, bracket, quote, or backslash in
   the intervening run retains its existing boundary. One or more `=` characters
-  after the matching quote also redact an immediately adjacent Windows
-  backslash-rooted value or forward-slash drive value on the first pass. When
-  that redacted value is followed by a bracket, private values inside the
-  bracket are redacted on the same pass. Relative, public-URL, and plain values
-  after `=` stay readable, as do backslash-rooted values separated from `=` by
-  whitespace or one of the listed invisible characters. Within the same
+  after the matching quote also redact an immediately adjacent POSIX-rooted,
+  Windows backslash-rooted, or drive value on the first pass. When that redacted
+  value is followed by a bracket, private values inside the bracket are redacted
+  on the same pass. Relative, public-URL, and plain values after `=` stay
+  readable, as do backslash-rooted values separated from `=` by whitespace or
+  one of the listed invisible characters. Within the same
   uninterrupted wrapper after an immediate rooted handoff, immediate and later
   supported rooted, named Windows, and recognized private-root successors
   redact on the same pass. Bracketed components that follow a redacted successor

@@ -6152,6 +6152,74 @@ describe("sanitizeError", () => {
     });
 
     it.each([
+      ["POSIX value before a bracket", "=/Users/S/x" + bracket, "=<path>?key=<path>]]"],
+      ["backslash-drive value before a bracket", "=C:\\Users\\S\\x" + bracket, "=<path>?key=<path>]]"],
+      ["UNC value before a bracket", "=\\\\srv\\share" + bracket, "=<path>?key=<path>]]"],
+      ["lowercase forward drive before a bracket", "=c:/Users/S/x" + bracket, "=c:<path>?key=<path>]]"],
+      [
+        "backslash value before a parenthesised bracket",
+        "=\\Users\\S\\x([https://other?key=/home/C/s]",
+        "=<path>?key=<path>]",
+      ],
+      ["backslash value before another backslash value", "=\\Users\\S\\x&\\Users\\T\\y]", "=<path>&<path>]"],
+      ["backslash value before a pipe private relative", "=\\Users\\S\\x|later/home/alice]", "=<path>|later<path>]"],
+      ["drive value before an ampersand private relative", "=C:/Users/S/x&later/home/alice]", "=C:<path>&later<path>]"],
+      ["drive value before a pipe private relative", "=C:/Users/S/x|later/home/alice]", "=C:<path>|later<path>]"],
+      ["drive value before a backslash value", "=C:/Users/S/x&\\Users\\T\\y]", "=C:<path>&<path>]"],
+      ["plain value before a pipe backslash value", "=plain|\\Users\\T\\y]", "=plain|<path>]"],
+      ["plain value before an ampersand backslash value", "=plain&\\Users\\T\\y]", "=plain&<path>]"],
+      ["plain value before a pipe private relative", "=plain|later/home/alice]", "=plain|later<path>]"],
+      [
+        "backslash and private-relative values before a bracket",
+        "=\\Users\\S\\x&later/home/alice" + bracket,
+        "=<path>&later<path>?key=<path>]]",
+      ],
+      [
+        "plain and private-relative values before a bracket",
+        "=plain&later/home/alice" + bracket,
+        "=plain&later<path>?key=<path>]]",
+      ],
+      [
+        "plain and backslash values before a bracket",
+        "=plain|\\Users\\T\\y" + bracket,
+        "=plain|<path>?key=<path>]]",
+      ],
+      [
+        "backslash value before a private relative inside its bracket",
+        "=\\Users\\S\\x[https://inner?a=1&later/home/D/s]]",
+        "=<path>?a=1&later<path>]]",
+      ],
+      [
+        "backslash value before a POSIX value inside its bracket",
+        "=\\Users\\S\\x[https://inner?key=/var/data]]",
+        "=<path>?key=<path>]]",
+      ],
+      [
+        "backslash value before a backslash value inside its bracket",
+        "=\\Users\\S\\x[https://inner?key=\\Users\\D\\s]]",
+        "=<path>?key=<path>]]",
+      ],
+      ["backslash value with a bracket bridge", "=\\Users\\S\\x[x]&later/home/bob]", "=<path>&later<path>]"],
+      [
+        "backslash value followed by soft whitespace and a bracket",
+        "=\\Users\\S\\x\u00a0" + bracket,
+        "=<path>?key=<path>]]",
+      ],
+      [
+        "backslash value followed by U+200B and a bracket",
+        "=\\Users\\S\\x\u200b" + bracket,
+        "=<path>?key=<path>]]",
+      ],
+      [
+        "plain value with two private-relative successors",
+        "=plain&later/home/alice&later/home/bob]",
+        "=plain&later<path>&later<path>]",
+      ],
+    ] as const)("redacts the adopted %s on the first pass", (_name, suffix, expectedSuffix) => {
+      assertPasses(prefix + suffix, redactedPrefix + expectedSuffix);
+    });
+
+    it.each([
       ["private-root relative equals value", "=later/home/alice]", "=later/home/alice]"],
       ["forward-slash drive equals value", "=C:/Users/SECRET/x]", "=C:<path>]"],
       ["backslash equals value", "=\\Users\\SECRET\\x]", "=<path>]"],
@@ -6170,9 +6238,131 @@ describe("sanitizeError", () => {
         "=later/home/alice" + bracket,
       ],
       ["visible plain value before a bracket", "=plain" + bracket, "=plain" + bracket],
+      ["plain value before an ordinary relative", "=plain&later/var/data]", "=plain&later/var/data]"],
+      ["backslash value before an ordinary relative", "=\\Users\\S\\x&later/var/data]", "=<path>&later/var/data]"],
+      ["backslash value before plain text", "=\\Users\\S\\x&plain]", "=<path>&plain]"],
+      [
+        "backslash value before a space-separated bracket",
+        "=\\Users\\S\\x " + bracket,
+        "=<path> " + bracket,
+      ],
+      [
+        "space-separated backslash value before a bracket",
+        "= \\Users\\S\\x" + bracket,
+        "= \\Users\\S\\x" + bracket,
+      ],
+      [
+        "Users relative before a bracket",
+        "=Users/alice/x" + bracket,
+        "=Users/alice/x" + bracket,
+      ],
+      [
+        "public URL before a bracket",
+        "=https://public.test/x" + bracket,
+        "=https://public.test/x" + bracket,
+      ],
+      [
+        "backslash value before a visible private relative inside its bracket",
+        "=\\Users\\S\\x[https://inner?key=later/home/D/s]]",
+        "=<path>?key=later/home/D/s]]",
+      ],
+      [
+        "backslash value before a visible ordinary relative inside its bracket",
+        "=\\Users\\S\\x[https://inner?key=later/var/d]]",
+        "=<path>?key=later/var/d]]",
+      ],
+      [
+        "backslash value before visible plain text inside its bracket",
+        "=\\Users\\S\\x[https://inner?key=plain]]",
+        "=<path>?key=plain]]",
+      ],
+      [
+        "backslash value before a visible public URL inside its bracket",
+        "=\\Users\\S\\x[https://inner?key=https://pub.test/x]]",
+        "=<path>?key=https://pub.test/x]]",
+      ],
+      [
+        "backslash value before a POSIX successor",
+        "=\\Users\\S\\x&/Users/T/y]",
+        "=<path>&<path>]",
+      ],
+      [
+        "backslash value and bracket before an outside private relative",
+        "=\\Users\\S\\x" + bracket + "&later/home/z]",
+        "=<path>?key=<path>]]&later/home/z]",
+      ],
+      [
+        "backslash value before a parent close and independent bracket",
+        "=\\Users\\S\\x][https://inner?key=/home/C/s]",
+        "=<path>][https://inner?key=/home/C/s]",
+      ],
     ] as const)("keeps the %s byte-exact", (_name, suffix, expectedSuffix) => {
       assertPasses(prefix + suffix, redactedPrefix + expectedSuffix);
     });
+
+    it("redacts only the first of two adjacent bracket components", () => {
+      const input = prefix + "=\\Users\\S\\x" + bracket + bracket;
+      const expected = redactedPrefix + "=<path>?key=<path>]]" + bracket;
+      assertPasses(input, expected);
+    });
+
+    it.each([
+      [
+        "private-relative value before another private relative",
+        "=later/home/alice&later/home/bob]",
+        "=later/home/alice&later/home/bob]",
+        "=later/home/alice&later<path>]",
+      ],
+      [
+        "ordinary relative value before a private relative",
+        "=later/var/data&later/home/bob]",
+        "=later/var/data&later/home/bob]",
+        "=later/var/data&later<path>]",
+      ],
+      [
+        "private-relative value before a backslash value",
+        "=later/home/alice&\\Users\\T\\y]",
+        "=later/home/alice&\\Users\\T\\y]",
+        "=later/home/alice&<path>]",
+      ],
+      [", before a named backslash value", ",=\\Users\\S\\x]", ",=\\Users\\S\\x]", ",=<path>]"],
+      [
+        ", before a named backslash value and plain successor",
+        ",=\\Users\\S\\x&plain]",
+        ",=\\Users\\S\\x&plain]",
+        ",=<path>&plain]",
+      ],
+      ["U+00AD before a named backslash value", "\u00ad=\\Users\\S\\x]", "\u00ad=\\Users\\S\\x]", "\u00ad=<path>]"],
+      [
+        "U+00AD before a named backslash value and bracket",
+        "\u00ad=\\Users\\S\\x" + bracket,
+        "\u00ad=\\Users\\S\\x" + bracket,
+        "\u00ad=<path>?key=/home/C/s]]",
+        "\u00ad=<path>?key=<path>]]",
+      ],
+      [
+        "x before a named backslash value",
+        "x=\\Users\\S\\x&plain]",
+        "x=\\Users\\S\\x&plain]",
+        "x=<path>&plain]",
+      ],
+      [
+        "backslash interposer before a private relative",
+        "a\\Users\\S\\x|later/home/alice]",
+        "a\\Users\\S\\x|later/home/alice]",
+        "a\\Users\\S\\x|later<path>]",
+      ],
+    ] as const)(
+      "pins the adopted residual: %s",
+      (_name, suffix, firstSuffix, secondSuffix, thirdSuffix = secondSuffix) => {
+        assertPasses(
+          prefix + suffix,
+          redactedPrefix + firstSuffix,
+          redactedPrefix + secondSuffix,
+          redactedPrefix + thirdSuffix,
+        );
+      },
+    );
 
     it.each([
       ["glued", ""],
@@ -6197,6 +6387,9 @@ describe("sanitizeError", () => {
     const redactedPrefix = "file://h?x=['https://outer.test/x?next=file://<path>'";
     const bracket = "[https://inner?key=/home/C/s]]";
     const interposers = [
+      "\u0085",
+      "\u0000",
+      "\u007f",
       "\u00ad",
       "\u180e",
       "\u200e",
@@ -6220,6 +6413,10 @@ describe("sanitizeError", () => {
       "~",
       "\u00ad\u200b",
       "\u200b,",
+      "=",
+      "==",
+      "C:",
+      "C:,",
     ] as const;
     const assertPasses = (
       input: string,
@@ -6262,6 +6459,69 @@ describe("sanitizeError", () => {
       assertPasses(prefix + suffix, redactedPrefix + expectedSuffix);
     });
 
+    const successorTargets = interposers.flatMap((interposer) => [
+      [
+        JSON.stringify(interposer) + " before a rooted value and later private relative",
+        interposer + "|\\Users\\SECRET\\x&later/home/bob]",
+        interposer + "|<path>&later<path>]",
+      ],
+      [
+        JSON.stringify(interposer) + " before a private relative and bracket",
+        interposer + "|later/home/alice" + bracket,
+        interposer + "|later<path>?key=<path>]]",
+      ],
+      [
+        JSON.stringify(interposer) + " before an ampersand rooted value and bracket",
+        interposer + "&\\Users\\SECRET\\x" + bracket,
+        interposer + "&<path>?key=<path>]]",
+      ],
+      [
+        JSON.stringify(interposer) + " before a Users relative",
+        interposer + "|users/alice/x]",
+        interposer + "|users<path>]",
+      ],
+      [
+        JSON.stringify(interposer) + " before a home relative",
+        interposer + "|home/alice]",
+        interposer + "|home<path>]",
+      ],
+      [
+        JSON.stringify(interposer) + " before a root relative",
+        interposer + "|root/x]",
+        interposer + "|root<path>]",
+      ],
+      [
+        JSON.stringify(interposer) + " before a dotted home relative",
+        interposer + "|./home/x]",
+        interposer + "|.<path>]",
+      ],
+    ] as const);
+
+    it.each(successorTargets)("redacts adopted successor shape %s", (_name, suffix, expectedSuffix) => {
+      assertPasses(prefix + suffix, redactedPrefix + expectedSuffix);
+    });
+
+    it.each([
+      ["equals before an ampersand private relative", "=&later/home/alice]", "=&later<path>]"],
+      ["comma before two private relatives", ",|later/home/alice&later/home/bob]", ",|later<path>&later<path>]"],
+      ["comma before mixed successor kinds", ",&later/home/alice|\\Users\\B\\y]", ",&later<path>|<path>]"],
+      ["comma before two backslash roots", ",|\\Users\\SECRET\\x&\\Users\\B\\y]", ",|<path>&<path>]"],
+      ["x before two successor delimiters and a root", "x|y|\\Users\\S\\x]", "x|y|<path>]"],
+      ["x before two successor delimiters and a private relative", "x|y&later/home/alice]", "x|y&later<path>]"],
+      [
+        "comma before a backslash drive and bracket",
+        ",|C:\\Users\\S\\x" + bracket,
+        ",|<path>?key=<path>]]",
+      ],
+      [
+        "comma before a root and private relative inside its bracket",
+        ",|\\Users\\S\\x[https://inner?a=1&later/home/D/s]]",
+        ",|<path>?a=1&later<path>]]",
+      ],
+    ] as const)("redacts the adopted %s", (_name, suffix, expectedSuffix) => {
+      assertPasses(prefix + suffix, redactedPrefix + expectedSuffix);
+    });
+
     const controls = interposers.flatMap((interposer) => [
       [JSON.stringify(interposer) + " before a plain value", interposer + "|plain]", interposer + "|plain]"],
       [
@@ -6274,6 +6534,69 @@ describe("sanitizeError", () => {
         interposer + "|later/var/data]",
         interposer + "|later/var/data]",
       ],
+      [
+        JSON.stringify(interposer) + " before a forward-slash drive",
+        interposer + "|C:/Users/S/x]",
+        interposer + "|C:<path>]",
+      ],
+      [
+        JSON.stringify(interposer) + " before a backslash drive",
+        interposer + "|C:\\Users\\S\\x]",
+        interposer + "|<path>]",
+      ],
+      [
+        JSON.stringify(interposer) + " before a public URL",
+        interposer + "|https://public.test/Users/S/x]",
+        interposer + "|https://public.test/Users/S/x]",
+      ],
+      [
+        JSON.stringify(interposer) + " before an opaque URL",
+        interposer + "|mailto:u@public.test]",
+        interposer + "|mailto:u@public.test]",
+      ],
+      [JSON.stringify(interposer) + " before a tilde value", interposer + "|~/x]", interposer + "|~/x]"],
+      [
+        JSON.stringify(interposer) + " before a doubled-slash value",
+        interposer + "|//server/share/x]",
+        interposer + "|<path>]",
+      ],
+      [
+        JSON.stringify(interposer) + " before a nested file URL",
+        interposer + "|file:///Users/S/x]",
+        interposer + "|file://<path>]",
+      ],
+      [
+        JSON.stringify(interposer) + " before a named POSIX value",
+        interposer + "|plain=/Users/S/x]",
+        interposer + "|plain=<path>]",
+      ],
+      [
+        JSON.stringify(interposer) + " before a named drive value",
+        interposer + "|k=C:/Users/S/x]",
+        interposer + "|k=C:<path>]",
+      ],
+      [
+        JSON.stringify(interposer) + " before an ordinary relative and visible bracket",
+        interposer + "|later/var/data" + bracket,
+        interposer + "|later/var/data" + bracket,
+      ],
+      [
+        JSON.stringify(interposer) + " before plain text and visible bracket",
+        interposer + "|plain" + bracket,
+        interposer + "|plain" + bracket,
+      ],
+      [
+        JSON.stringify(interposer) + " before a closed rooted value and outside relative",
+        interposer + "|\\Users\\S\\x]&later/home/z]",
+        interposer + "|<path>]&later/home/z]",
+      ],
+      [
+        JSON.stringify(interposer) + " before a closed rooted value, whitespace, and relative",
+        interposer + "|\\Users\\S\\x] later/home/z]",
+        interposer + "|<path>] later/home/z]",
+      ],
+      [JSON.stringify(interposer) + " before an empty successor", interposer + "|", interposer + "|"],
+      [JSON.stringify(interposer) + " at end of input", interposer, interposer],
     ] as const);
 
     it.each(controls)("keeps %s byte-exact", (_name, suffix, expectedSuffix) => {
@@ -6287,6 +6610,12 @@ describe("sanitizeError", () => {
       ["ideographic space", "\u3000"],
       ["byte order mark", "\ufeff"],
       ["mixed soft-hyphen and space run", "\u00ad \u00ad"],
+      ["Ogham space mark", "\u1680"],
+      ["paragraph separator", "\u2029"],
+      ["medium mathematical space", "\u205f"],
+      ["vertical tab", "\u000b"],
+      ["U+200B followed by space", "\u200b "],
+      ["U+180E followed by space", "\u180e "],
     ] as const)("keeps %s as a whitespace boundary", (_name, whitespace) => {
       const suffix = whitespace + "|\\Users\\SECRET\\x]";
       assertPasses(prefix + suffix, redactedPrefix + suffix);
@@ -6306,6 +6635,11 @@ describe("sanitizeError", () => {
       assertPasses(prefix + suffix, redactedPrefix + suffix);
     });
 
+    it("keeps a closing bracket as a run stopper", () => {
+      const suffix = "x]|\\Users\\S\\x]";
+      assertPasses(prefix + suffix, redactedPrefix + suffix);
+    });
+
     it("keeps the established U+200B inherited handoff", () => {
       assertPasses(
         prefix + "\u200b|\\Users\\SECRET\\x]",
@@ -6318,11 +6652,86 @@ describe("sanitizeError", () => {
       ["apostrophe", "'"],
       ["double quote", "\""],
       ["backslash", "\\"],
+      ["slash-bearing text", "abc/def"],
+      ["short slash-bearing text", "a/b"],
+      ["embedded backslash", "a\\b"],
     ] as const)("pins the %s interposer residual", (_name, interposer) => {
       const input = prefix + interposer + "|\\Users\\SECRET\\x]";
       const first = redactedPrefix + interposer + "|\\Users\\SECRET\\x]";
       const fixed = redactedPrefix + interposer + "|<path>]";
       assertPasses(input, first, fixed, fixed);
+    });
+
+    it.each([
+      [
+        "slash",
+        "/|\\Users\\S\\x]",
+        "/|\\Users\\S\\x]",
+        "<path>",
+      ],
+      [
+        "public URL before ampersand root",
+        "http://p.test&\\Users\\S\\x]",
+        "http://p.test&\\Users\\S\\x]",
+        "http://p.test&<path>]",
+      ],
+      [
+        "comma and apostrophe",
+        ",'|\\Users\\S\\x]",
+        ",'|\\Users\\S\\x]",
+        ",'|<path>]",
+      ],
+      [
+        "two apostrophes",
+        "''|\\Users\\S\\x]",
+        "''|\\Users\\S\\x]",
+        "''|<path>]",
+      ],
+      [
+        "mixed-separator successor and bracket",
+        ",|later\\/home/a" + bracket,
+        ",|later\\<path>?key=/home/C/s]]",
+        ",|later\\<path>?key=<path>]]",
+      ],
+      [
+        "equals backslash successor and bracket",
+        ",|=\\Users\\x" + bracket,
+        ",|=\\Users\\x" + bracket,
+        ",|=<path>?key=/home/C/s]]",
+        ",|=<path>?key=<path>]]",
+      ],
+      [
+        "U+200B equals backslash successor and bracket",
+        "\u200b|=\\Users\\x" + bracket,
+        "\u200b|=<path>?key=/home/C/s]]",
+        "\u200b|=<path>?key=<path>]]",
+      ],
+    ] as const)(
+      "pins the adopted residual: %s",
+      (_name, suffix, firstSuffix, secondSuffix, thirdSuffix = secondSuffix) => {
+        assertPasses(
+          prefix + suffix,
+          redactedPrefix + firstSuffix,
+          redactedPrefix + secondSuffix,
+          redactedPrefix + thirdSuffix,
+        );
+      },
+    );
+
+    it.each([
+      ["long non-whitespace run", prefix + "x".repeat(200_000) + "|\\Users\\SECRET\\x]"],
+      [
+        "repeated inherited quote ends",
+        "file://h?x=[" + "'https://o.test/x?n=file:///U/a'x".repeat(Math.ceil(200_000 / 34)) + "|\\U\\x]",
+      ],
+    ] as const)("scans the 200k %s in linear time", (_name, input) => {
+      const started = performance.now();
+      const first = sanitizeError(input);
+      const elapsed = performance.now() - started;
+
+      expect(first).not.toContain("/U/a");
+      expect(sanitizeError(first)).toBe(first);
+      expect(elapsed).toBeLessThan(2_000);
     });
 
     it.each([
