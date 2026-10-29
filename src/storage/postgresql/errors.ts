@@ -46,6 +46,7 @@ const RETRYABLE_TRANSPORT_CODES = new Set([
 const RETRYABLE_DRIVER_MESSAGES = new Set([
   "Connection terminated due to connection timeout",
   "Connection terminated unexpectedly",
+  "Query read timeout",
   "timeout exceeded when trying to connect",
   "timeout expired",
 ]);

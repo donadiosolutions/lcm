@@ -70,6 +70,30 @@ export function parsePostgreSqlUrl(url: string): ParsedPostgreSqlUrl {
   return { host: normalizedHostname(parsed.hostname), port, user, password, database };
 }
 
+/**
+ * Largest delay Node.js timers honour; anything above it fires after 1 ms.
+ * A deadline clamped here (about 24.8 days) is an explicit limit.
+ */
+const MAX_TIMER_DELAY_MS = 2_147_483_647;
+
+/** Floor for the transport grace so the server's own 57014 error wins the race. */
+const MIN_QUERY_GRACE_MS = 5_000;
+
+/**
+ * Client-side deadline for a query that receives no response. The server ends
+ * any healthy statement within statementTimeoutMs, so the deadline adds a
+ * transport grace of at least five seconds. A text with several statements
+ * gets one statement budget per statement, because the server applies
+ * statement_timeout to each statement of a simple-query string separately.
+ */
+export function postgreSqlQueryDeadlineMs(
+  settings: Pick<PostgreSqlConnectionSettings, "connectionTimeoutMs" | "statementTimeoutMs">,
+  statements = 1,
+): number {
+  const grace = Math.max(settings.connectionTimeoutMs, MIN_QUERY_GRACE_MS);
+  return Math.min(settings.statementTimeoutMs * statements + grace, MAX_TIMER_DELAY_MS);
+}
+
 export function buildPostgreSqlClientConfig(
   settings: PostgreSqlConnectionSettings,
   options: { applicationName?: string; database?: string } = {},
@@ -105,6 +129,7 @@ export function buildPostgreSqlClientConfig(
     connectionTimeoutMillis: settings.connectionTimeoutMs,
     statement_timeout: settings.statementTimeoutMs,
     idle_in_transaction_session_timeout: settings.statementTimeoutMs,
+    query_timeout: postgreSqlQueryDeadlineMs(settings),
     keepAlive: true,
   } satisfies ClientConfig & {
     readonly replication: "false";

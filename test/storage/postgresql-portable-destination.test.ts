@@ -16,7 +16,7 @@ const boundaries = vi.hoisted(() => ({
   contentSizes: vi.fn(),
 }));
 vi.mock('../../src/storage/postgresql/runtime.js', () => ({ PostgreSqlRuntime: class { constructor() { return boundaries.runtime(); } } }));
-vi.mock('pg', () => ({ Client: class { constructor() { return boundaries.client(); } } }));
+vi.mock('pg', () => ({ Client: class { constructor(...args: unknown[]) { return boundaries.client(...args); } } }));
 vi.mock('../../src/storage/postgresql/client-config.js', () => ({ buildPostgreSqlClientConfig: boundaries.config }));
 vi.mock('../../src/storage/postgresql/runtime-readiness.js', () => ({ verifyPostgreSqlTransferSchema: boundaries.schema }));
 vi.mock('../../src/storage/postgresql/portable-mapping.js', async importOriginal => ({
@@ -525,6 +525,21 @@ describe('uncertain commits, cancellation and release', () => {
     await expect(writer.applyBatch(await batch(stream))).rejects.toEqual(new PortableTransferError('destination-failed'));
     db.beforeQuery = undefined;
     await expect(writer.readProgress(manifest.manifestSha256)).rejects.toEqual(new PortableTransferError('destination-failed')); expect(db.receipts).toEqual([]);
+  });
+  it('ends the connection and skips ROLLBACK when a query gets no response', async () => {
+    const { writer, stream, manifest } = await admitted(); db.endFailure = true;
+    db.beforeQuery = config => { if (config.text.includes('transaction_isolation')) throw new Error('Query read timeout'); };
+    const queries = db.queryLog.length;
+    await expect(writer.applyBatch(await batch(stream))).rejects.toEqual(new PortableTransferError('destination-failed'));
+    expect(db.clients[0]!.ended).toBe(true);
+    expect(db.queryLog.slice(queries)).not.toContain('ROLLBACK');
+    db.beforeQuery = undefined;
+    await expect(writer.readProgress(manifest.manifestSha256)).rejects.toEqual(new PortableTransferError('destination-failed'));
+  });
+  it('disables the client query deadline on the destination connection', async () => {
+    boundaries.config.mockReturnValue({ host: 'db.example', query_timeout: 70_000 });
+    await admitted();
+    expect(boundaries.client).toHaveBeenCalledWith({ host: 'db.example', query_timeout: 0 });
   });
   it('fails closed after an asynchronous client error', async () => {
     const { writer, manifest } = await admitted(); db.clients[0]!.emit('error', new Error('secret socket'));

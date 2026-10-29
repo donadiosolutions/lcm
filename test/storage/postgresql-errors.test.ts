@@ -33,6 +33,7 @@ describe("PostgreSQL error normalization", () => {
   it.each([
     "Connection terminated due to connection timeout",
     "Connection terminated unexpectedly",
+    "Query read timeout",
     "timeout exceeded when trying to connect",
     "timeout expired",
   ])("classifies pg driver failure %s as retryable without SQLSTATE", (message) => {
@@ -44,6 +45,7 @@ describe("PostgreSQL error normalization", () => {
     { code: "57P01", message: "private" },
     { code: "ECONNRESET", message: "private" },
     { message: "Connection terminated unexpectedly" },
+    { message: "Query read timeout" },
   ])("identifies connection-level failure %#", ({ code, message }) => {
     expect(isPostgreSqlConnectionError(Object.assign(new Error(message), { code }))).toBe(true);
   });
@@ -179,6 +181,10 @@ describe("PostgreSQL error normalization", () => {
     const tornConnection = normalizePostgreSqlError(new Error("Connection terminated unexpectedly"), context);
     expect(tornConnection).toMatchObject({ sqlState: null, retryable: true });
     expect(isPostgreSqlSnapshotTerminationError(tornConnection)).toBe(true);
+
+    const queryTimeout = normalizePostgreSqlError(new Error("Query read timeout"), context);
+    expect(queryTimeout).toMatchObject({ sqlState: null, retryable: true });
+    expect(isPostgreSqlSnapshotTerminationError(queryTimeout)).toBe(true);
 
     // A generic "not queryable" local rejection (what pg's Client.query
     // produces once _queryable is false, with no code and not in
