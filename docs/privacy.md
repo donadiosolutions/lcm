@@ -700,16 +700,17 @@ bundle and keep provider, credential, quarantine, and recovery sessions private.
   separator run that starts with `\`, also contains `/`, and then has another
   path word. The label and any preceding backslashes remain visible;
   backslash-only runs and runs without a following path word remain unchanged.
-  When the text after that slash is a backslash-drive path such as
-  `C:\Users\x`, the slash stays visible and redaction begins at the drive root.
-  A forward-slash drive such as `C:/Users/x` keeps its existing first-pass
-  boundary and converges under the established later-pass rules. An intervening
-  public-URL successor keeps a later mixed-separator successor on its existing
-  visibility boundary. Following bracketed text continues to use its existing
-  query and bracket redaction rules rather than inheriting new ownership from
-  this case.
-  If another successor intervenes before that bracket, the existing multi-pass
-  boundary is retained instead of claiming the mixed-separator successor early.
+  Within such an admitted successor, a later single-slash colon form is completed
+  on the same pass, including drive-shaped, numeric, and named forms. A later
+  recognized `file://` literal is completed on that pass as a separate redacted
+  component, including an uppercase scheme or a named authority. A following
+  mixed-separator successor uses the same rule when it is a forward-slash drive
+  or a recognized `file://` literal. Single-slash `file:/` text, backslash-drive,
+  and UNC successors keep their existing boundaries. Valid public-URL authorities
+  remain public, including paths that contain private-looking segments. Following
+  bracketed text continues to use its existing query and bracket redaction rules.
+  An intervening public URL still keeps a later mixed-separator successor on its
+  established visibility boundary.
 
   When a matching quote closes a nested public URL inside a bracketed file
   query, an immediate `&` or `|` successor is redacted only when it begins with

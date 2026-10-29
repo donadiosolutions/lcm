@@ -196,7 +196,46 @@ function findUrlPathStarts(chars: readonly string[]): UrlPathStarts {
   };
   const isForwardSlashDrivePathStart = (start: number): boolean =>
     /^[A-Za-z]$/u.test(chars[start] ?? "") && chars[start + 1] === ":" && chars[start + 2] === "/";
-  const backslashSlashSuccessorPathStart = (start: number): number => {
+  const claimedFileLiteralStarts = new Set<number>();
+  const completeBackslashSlashClaim = (pathStart: number): void => {
+    for (let cursor = pathStart + 1; cursor < chars.length; cursor += 1) {
+      const char = chars[cursor];
+      if (
+        char === "&" ||
+        char === "|" ||
+        char === "[" ||
+        char === "]" ||
+        WHITESPACE_PATTERN.test(char)
+      ) return;
+      if (isFileUrlLiteral(chars, cursor)) {
+        claimedFileLiteralStarts.add(cursor);
+        // Only this #1814 claimed-file completion writes marker 2. It stops
+        // the owning path scan, but the forced scan starting here consumes it.
+        nestedFileSchemeStarts[cursor] = 2;
+        forcedPath[cursor] = 1;
+        return;
+      }
+      if (char !== ":" || chars[cursor + 1] !== "/") continue;
+      let schemeStart = cursor - 1;
+      while (schemeStart >= pathStart && URL_SCHEME_CHARACTER_PATTERN.test(chars[schemeStart])) {
+        schemeStart -= 1;
+      }
+      schemeStart += 1;
+      const scheme = chars.slice(schemeStart, cursor).join("");
+      const validAuthorityScheme =
+        URL_SCHEME_START_PATTERN.test(scheme.charAt(0)) &&
+        [...scheme].every((schemeChar) => URL_SCHEME_CHARACTER_PATTERN.test(schemeChar));
+      if (chars[cursor + 2] === "/" && validAuthorityScheme) return;
+      if (scheme.toLowerCase() === FILE_SCHEME && chars[cursor + 2] !== "/") return;
+      if (!isPathWord(chars[skipSeparatorRun(cursor + 1)])) return;
+      nestedFileSchemeStarts[cursor] = 1;
+      forcedPath[cursor + 1] = 1;
+    }
+  };
+  const backslashSlashSuccessorPathStart = (
+    start: number,
+    completesClaimedComponent = false,
+  ): number => {
     if (!isPathWord(chars[start])) return -1;
     let cursor = start;
     while (isPathWord(chars[cursor])) cursor += 1;
@@ -217,16 +256,15 @@ function findUrlPathStarts(chars: readonly string[]): UrlPathStarts {
     if (
       chars[colonCursor] === ":" &&
       chars[colonCursor + 1] === "/" &&
-      (chars[colonCursor + 2] !== "/" || !validAuthorityScheme)
+      (chars[colonCursor + 2] !== "/" || !validAuthorityScheme) &&
+      !completesClaimedComponent
     ) {
       return -1;
     }
-    if (
-      isWindowsDrivePathStart(chars, cursor) ||
-      isForwardSlashDrivePathStart(cursor) ||
-      isFileUrlLiteral(chars, cursor) ||
-      backslashesAfterSlash >= 2
-    ) {
+    if (isWindowsDrivePathStart(chars, cursor) || backslashesAfterSlash >= 2) {
+      return -1;
+    }
+    if (isFileUrlLiteral(chars, cursor) && !completesClaimedComponent) {
       return -1;
     }
     return firstSlash >= 0 && isPathWord(chars[cursor]) ? firstSlash : -1;
@@ -788,13 +826,16 @@ function findUrlPathStarts(chars: readonly string[]): UrlPathStarts {
       quotedQueryPublicUrl = true;
       quotedQueryPublicUrlOwnQueryOrFragment = false;
     }
-    const nestedFileSchemeStart = isNestedFileUrlStart(chars, index)
+    const nestedFileSchemeStartCandidate = isNestedFileUrlStart(chars, index)
       ? index + 1
       : queryOrFragment &&
           !URL_SCHEME_START_PATTERN.test(char) &&
           isFileUrlLiteral(chars, index + 1)
         ? index + 1
         : -1;
+    const nestedFileSchemeStart = claimedFileLiteralStarts.has(nestedFileSchemeStartCandidate)
+      ? -1
+      : nestedFileSchemeStartCandidate;
     if ((separator >= 0 || restartedPathlessFile) && nestedFileSchemeStart >= 0) {
       const directNestedFileQuote = quoteCode(chars[nestedFileSchemeStart - 1]);
       const enclosingQuote = quoteFromCode(schemeQuote);
@@ -884,7 +925,7 @@ function findUrlPathStarts(chars: readonly string[]): UrlPathStarts {
         previousSuccessorIsPlain(index, activeNestedFileSchemeStart)) &&
       laterSuccessorBeforeBracket[index + 1] !== 1 &&
       !(pathlessFileQueryOwnerBracketDepth === 0 && queryBeforeBracket[index + 1] === 1)
-        ? backslashSlashSuccessorPathStart(index + 1)
+        ? backslashSlashSuccessorPathStart(index + 1, backslashSlashClaimActive)
         : -1;
     if (
       (activeNestedFileUrlParentOwnerBracketDepth > 0 || activeBackslashSlashPathStart >= 0) &&
@@ -941,7 +982,10 @@ function findUrlPathStarts(chars: readonly string[]): UrlPathStarts {
           true,
         );
       }
-      if (backslashSlashPathStart >= 0) forcedPath[backslashSlashPathStart] = 1;
+      if (backslashSlashPathStart >= 0) {
+        forcedPath[backslashSlashPathStart] = 1;
+        completeBackslashSlashClaim(backslashSlashPathStart);
+      }
       const keepsClaimAcrossOrdinaryRelative: boolean =
         backslashSlashClaimActive &&
         startsWordBearingSlashPath(chars, index + 1) &&
@@ -1600,7 +1644,11 @@ function scanAbsolutePath(
   let spanLocalUrlComponent = false;
   while (index < chars.length) {
     const char = chars[index];
-    if (quote === undefined && nestedFileSchemeStarts[index] === 1) break;
+    if (
+      quote === undefined &&
+      (nestedFileSchemeStarts[index] === 1 ||
+        (nestedFileSchemeStarts[index] === 2 && index !== start))
+    ) break;
     if (isPathWord(char)) {
       sawPathCharacter = true;
       sawNonSeparator = true;

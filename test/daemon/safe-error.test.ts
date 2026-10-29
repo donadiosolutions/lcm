@@ -5004,16 +5004,16 @@ describe("sanitizeError", () => {
         "file://h?x=[file://<path>&later\\<path>:<path>]",
       ],
       [
-        "claimed sibling before refused forward drive",
+        "claimed sibling completes a forward drive on pass 1",
         "file://h?x=[file:///Users/CHILD/x&later\\/home/a&later\\/C:/Users/x]",
-        "file://h?x=[file://<path>&later\\<path>&later\\/C:/Users/x]",
+        "file://h?x=[file://<path>&later\\<path>&later\\<path>:<path>]",
         "file://h?x=[file://<path>&later\\<path>&later\\<path>:<path>]",
         "file://h?x=[file://<path>&later\\<path>&later\\<path>:<path>]",
       ],
       [
-        "claimed sibling before refused file URL",
+        "claimed sibling completes a file URL on pass 1",
         "file://h?x=[file:///Users/CHILD/x&later\\/home/a&later\\/file:///Users/NEST/x]",
-        "file://h?x=[file://<path>&later\\<path>&later\\/file://<path>]",
+        "file://h?x=[file://<path>&later\\<path>&later\\<path><path>]",
         "file://h?x=[file://<path>&later\\<path>&later\\<path><path>]",
         "file://h?x=[file://<path>&later\\<path>&later\\<path><path>]",
       ],
@@ -6153,6 +6153,310 @@ describe("sanitizeError", () => {
       expect(first).toBe(expected);
       expect(sanitizeError(first)).toBe(first);
       expect(sanitizeError(sanitizeError(first))).toBe(first);
+    });
+  });
+
+  describe("Bug #1814", () => {
+    const targets: ReadonlyArray<readonly [name: string, input: string, expected: string]> = [
+      [
+        "deeper XY colon literal",
+        "file://h?x=[file:///Users/CHILD/x&later\\/home/XY:/Users/S/s]",
+        "file://h?x=[file://<path>&later\\<path>:<path>]",
+      ],
+      [
+        "deeper two-segment colon literal",
+        "file://h?x=[file:///Users/CHILD/x&later\\/ab/cd:/Users/S/s]",
+        "file://h?x=[file://<path>&later\\<path>:<path>]",
+      ],
+      [
+        "deeper numeric double-slash literal",
+        "file://h?x=[file:///Users/CHILD/x&later\\/home/1://Users/S/s]",
+        "file://h?x=[file://<path>&later\\<path>:<path>]",
+      ],
+      [
+        "deeper drive literal",
+        "file://h?x=[file:///Users/CHILD/x&later\\/home/C:/Users/S/s]",
+        "file://h?x=[file://<path>&later\\<path>:<path>]",
+      ],
+      [
+        "deeper mailto literal",
+        "file://h?x=[file:///Users/CHILD/x&later\\/home/mailto:/Users/S/s]",
+        "file://h?x=[file://<path>&later\\<path>:<path>]",
+      ],
+      [
+        "deeper XY literal after another path segment",
+        "file://h?x=[file:///Users/CHILD/x&later\\/home/a/XY:/Users/S/s]",
+        "file://h?x=[file://<path>&later\\<path>:<path>]",
+      ],
+      [
+        "deeper file literal",
+        "file://h?x=[file:///Users/CHILD/x&later\\/home/file:///Users/S/s]",
+        "file://h?x=[file://<path>&later\\<path><path>]",
+      ],
+      [
+        "deeper XY literal before a bracketed URL",
+        "file://h?x=[file:///Users/CHILD/x&later\\/home/a/XY:/Users/S/s([https://other?key=/Users/SECRET2/x]",
+        "file://h?x=[file://<path>&later\\<path>:<path>?key=<path>]",
+      ],
+      [
+        "later independently refused drive successor",
+        "file://h?x=[file:///Users/CHILD/x&later\\/home/a&later\\/C:/Users/x]",
+        "file://h?x=[file://<path>&later\\<path>&later\\<path>:<path>]",
+      ],
+      [
+        "later independently refused file successor",
+        "file://h?x=[file:///Users/CHILD/x&later\\/home/a&later\\/file:///Users/NEST/x]",
+        "file://h?x=[file://<path>&later\\<path>&later\\<path><path>]",
+      ],
+      [
+        "deeper HTTP single-slash literal",
+        "file://h?x=[file:///Users/CHILD/x&later\\/home/http:/x]",
+        "file://h?x=[file://<path>&later\\<path>:<path>]",
+      ],
+      [
+        "deeper short XY literal",
+        "file://h?x=[file:///Users/CHILD/x&later\\/home/XY:/x]",
+        "file://h?x=[file://<path>&later\\<path>:<path>]",
+      ],
+      [
+        "deeper XY literal with an ordinary suffix",
+        "file://h?x=[file:///Users/CHILD/x&later\\/home/XY:/a/b]",
+        "file://h?x=[file://<path>&later\\<path>:<path>]",
+      ],
+      [
+        "deeper XY literal after three path segments",
+        "file://h?x=[file:///Users/CHILD/x&later\\/home/a/b/c/XY:/Users/S/s]",
+        "file://h?x=[file://<path>&later\\<path>:<path>]",
+      ],
+      [
+        "deeper XY literal followed by an ordinary successor",
+        "file://h?x=[file:///Users/CHILD/x&later\\/home/XY:/Users/S/s&later/home/bob]",
+        "file://h?x=[file://<path>&later\\<path>:<path>&later<path>]",
+      ],
+      [
+        "deeper XY literal followed by a mixed successor",
+        "file://h?x=[file:///Users/CHILD/x&later\\/home/XY:/Users/S/s&later\\/home/bob]",
+        "file://h?x=[file://<path>&later\\<path>:<path>&later\\<path>]",
+      ],
+      [
+        "deeper XY literal followed by an owned bracket",
+        "file://h?x=[file:///Users/CHILD/x&later\\/home/XY:/Users/S/s[https://inner?key=/home/C/s]]",
+        "file://h?x=[file://<path>&later\\<path>:<path>?key=<path>]]",
+      ],
+      [
+        "deeper XY literal followed by an owned drive bracket",
+        "file://h?x=[file:///Users/CHILD/x&later\\/home/XY:/Users/S/s([https://other?key=C:/Users/K/x]",
+        "file://h?x=[file://<path>&later\\<path>:<path>?key=C:<path>]",
+      ],
+      [
+        "multi-segment XY literal followed by an owned drive bracket",
+        "file://h?x=[file:///Users/CHILD/x&later\\/home/a/XY:/Users/S/s([https://other?key=C:/Users/SECRET2/x]",
+        "file://h?x=[file://<path>&later\\<path>:<path>?key=C:<path>]",
+      ],
+      [
+        "deeper XY literal followed by a rooted query value",
+        "file://h?x=[file:///Users/CHILD/x&later\\/home/XY:/Users/S/s?k=/Users/K/y]",
+        "file://h?x=[file://<path>&later\\<path>:<path>?k=<path>]",
+      ],
+      [
+        "repeated deeper XY literal",
+        "file://h?x=[file:///Users/CHILD/x&later\\/home/XY:/Users/S/s&later\\/home/XY:/Users/T/t]",
+        "file://h?x=[file://<path>&later\\<path>:<path>&later\\<path>:<path>]",
+      ],
+      [
+        "family B XY literal",
+        "file://h?x=[file:///Users/CHILD/x&later\\/home/a&later\\/XY:/Users/S/s]",
+        "file://h?x=[file://<path>&later\\<path>&later\\<path>:<path>]",
+      ],
+      [
+        "family B drive followed by another mixed successor",
+        "file://h?x=[file:///Users/CHILD/x&later\\/home/a&later\\/C:/Users/x&later\\/home/b]",
+        "file://h?x=[file://<path>&later\\<path>&later\\<path>:<path>&later\\<path>]",
+      ],
+      [
+        "uppercase deeper file literal",
+        "file://h?x=[file:///Users/CHILD/x&later\\/home/FILE:///Users/S/s]",
+        "file://h?x=[file://<path>&later\\<path><path>]",
+      ],
+      [
+        "hosted deeper file literal",
+        "file://h?x=[file:///Users/CHILD/x&later\\/home/file://host/Users/S/s]",
+        "file://h?x=[file://<path>&later\\<path><path>]",
+      ],
+      [
+        "deeper file literal followed by an ordinary successor",
+        "file://h?x=[file:///Users/CHILD/x&later\\/home/file:///Users/S/s&later/home/bob]",
+        "file://h?x=[file://<path>&later\\<path><path>&later<path>]",
+      ],
+      [
+        "deeper colon literal followed by a file literal",
+        "file://h?x=[file:///Users/CHILD/x&later\\/home/XY:/Users/S/s/file:///Users/T/t]",
+        "file://h?x=[file://<path>&later\\<path>:<path><path>]",
+      ],
+      [
+        "deeper XY literal with a var root",
+        "file://h?x=[file:///Users/CHILD/x&later\\/home/XY:/var/data]",
+        "file://h?x=[file://<path>&later\\<path>:<path>]",
+      ],
+      [
+        "unclosed deeper XY literal before prose",
+        "file://h?x=[file:///Users/CHILD/x&later\\/home/XY:/Users/S/s ok",
+        "file://h?x=[file://<path>&later\\<path>:<path> ok",
+      ],
+      [
+        "glued independent copies",
+        "file://h?x=[file:///Users/CHILD/x&later\\/home/XY:/Users/S/s]file://h?x=[file:///Users/CHILD/x&later\\/home/XY:/Users/S/s]",
+        "file://h?x=[file://<path>&later\\<path>:<path>]file://h?x=[file://<path>&later\\<path>:<path>]",
+      ],
+      [
+        "second copy after an ampersand successor",
+        "file://h?x=[file:///Users/CHILD/x&later\\/home/XY:/Users/S/s&later\\/home/a/XY:/Users/T/t]",
+        "file://h?x=[file://<path>&later\\<path>:<path>&later\\<path>:<path>]",
+      ],
+      [
+        "newline-separated independent copies",
+        "file://h?x=[file:///Users/CHILD/x&later\\/home/XY:/Users/S/s]\nfile://h?x=[file:///Users/CHILD/x&later\\/home/a/XY:/Users/T/t]",
+        "file://h?x=[file://<path>&later\\<path>:<path>]\nfile://h?x=[file://<path>&later\\<path>:<path>]",
+      ],
+      [
+        "copies in sibling brackets",
+        "file://h?x=[file:///Users/CHILD/x&later\\/home/XY:/Users/S/s][file://h?x=[file:///Users/NEXT/x&later\\/home/a/XY:/Users/T/t]]",
+        "file://h?x=[file://<path>&later\\<path>:<path>][file://h?x=[file://<path>&later\\<path>:<path>]]",
+      ],
+    ];
+
+    it.each(targets)("completes the %s on the first pass", (_name, input, expected) => {
+      const first = sanitizeError(input);
+      const second = sanitizeError(first);
+      const third = sanitizeError(second);
+
+      expect(first).toBe(expected);
+      expect(second).toBe(expected);
+      expect(third).toBe(expected);
+    });
+
+    it.each([
+      [
+        "public URL",
+        "file://h?x=[file:///Users/CHILD/x&later\\/home/https://public.test/x]",
+        "file://h?x=[file://<path>&later\\<path>]",
+      ],
+      [
+        "private-looking public URL",
+        "file://h?x=[file:///Users/CHILD/x&later\\/home/https://public.test/Users/SECRET/x]",
+        "file://h?x=[file://<path>&later\\<path>]",
+      ],
+      [
+        "valid authority scheme",
+        "file://h?x=[file:///Users/CHILD/x&later\\/home/XY://Users/S/s]",
+        "file://h?x=[file://<path>&later\\<path>]",
+      ],
+      [
+        "backslash drive",
+        "file://h?x=[file:///Users/CHILD/x&later\\/C:\\Users\\x]",
+        "file://h?x=[file://<path>&later\\/<path>]",
+      ],
+      [
+        "deeper backslash drive",
+        "file://h?x=[file:///Users/CHILD/x&later\\/home/C:\\Users\\S\\s]",
+        "file://h?x=[file://<path>&later\\<path>]",
+      ],
+      [
+        "deeper plain colon value",
+        "file://h?x=[file:///Users/CHILD/x&later\\/home/XY:plain]",
+        "file://h?x=[file://<path>&later\\<path>:plain]",
+      ],
+      [
+        "deeper colon with an ordinary path",
+        "file://h?x=[file:///Users/CHILD/x&later\\/home/a:b/c]",
+        "file://h?x=[file://<path>&later\\<path>:b/c]",
+      ],
+      [
+        "deeper slash-only colon value",
+        "file://h?x=[file:///Users/CHILD/x&later\\/home/XY:/]",
+        "file://h?x=[file://<path>&later\\<path>:/]",
+      ],
+      [
+        "deeper colon before a backslash root",
+        "file://h?x=[file:///Users/CHILD/x&later\\/home/XY:\\Users\\S\\s]",
+        "file://h?x=[file://<path>&later\\<path>:\\Users\\S\\s]",
+      ],
+      [
+        "deeper single-slash file literal",
+        "file://h?x=[file:///Users/CHILD/x&later\\/home/file:/Users/S/s]",
+        "file://h?x=[file://<path>&later\\<path>]",
+      ],
+      [
+        "deeper public URL after another segment",
+        "file://h?x=[file:///Users/CHILD/x&later\\/home/a/https://public.test/Users/S/x]",
+        "file://h?x=[file://<path>&later\\<path>]",
+      ],
+      [
+        "pipe sibling forward drive",
+        "file://h?x=[file:///Users/CHILD/x&later\\/home/a|later\\/C:/Users/x]",
+        "file://h?x=[file://<path>&later\\<path>|later\\<path>:<path>]",
+      ],
+      [
+        "ordinary sibling before a forward drive",
+        "file://h?x=[file:///Users/CHILD/x&later\\/home/a&later/home/b&later\\/C:/Users/x]",
+        "file://h?x=[file://<path>&later\\<path>&later<path>&later\\<path>:<path>]",
+      ],
+      [
+        "deeper public mailto value",
+        "file://h?x=[file:///Users/CHILD/x&later\\/home/mailto:user@public.test]",
+        "file://h?x=[file://<path>&later\\<path>:user@public.test]",
+      ],
+      [
+        "PR-C-owned nested file child",
+        "file://h?x=[file:///Users/CHILD/x&later\\/home/alice/s[file:///b&C:/Users/c]]",
+        "file://h?x=[file://<path>&later\\<path>file://<path>&<path>]]",
+      ],
+    ] as const)("keeps the %s control byte-exact", (_name, input, expected) => {
+      const first = sanitizeError(input);
+      const second = sanitizeError(first);
+      const third = sanitizeError(second);
+
+      expect(first).toBe(expected);
+      expect(second).toBe(expected);
+      expect(third).toBe(expected);
+    });
+
+    it("keeps the first-segment colon literal on its base pass sequence", () => {
+      const input = "file://h?x=[file:///Users/CHILD/x&later\\/XY:/Users/S/s]";
+      const first = sanitizeError(input);
+      const second = sanitizeError(first);
+      const third = sanitizeError(second);
+
+      expect(first).toBe("file://h?x=[file://<path>&later\\/XY:/Users/S/s]");
+      expect(second).toBe("file://h?x=[file://<path>&later\\<path>:<path>]");
+      expect(third).toBe("file://h?x=[file://<path>&later\\<path>:<path>]");
+    });
+
+    it("keeps the first-segment file literal on its base pass sequence", () => {
+      const input = "file://h?x=[file:///Users/CHILD/x&later\\/file:///Users/S/s]";
+      const first = sanitizeError(input);
+      const second = sanitizeError(first);
+      const third = sanitizeError(second);
+
+      expect(first).toBe("file://h?x=[file://<path>&later\\/file://<path>]");
+      expect(second).toBe("file://h?x=[file://<path>&later\\<path><path>]");
+      expect(third).toBe("file://h?x=[file://<path>&later\\<path><path>]");
+    });
+
+    it("pins the drive value pending the PR-C prefix-preserving option", () => {
+      const input =
+        "file://h?x=[file:///Users/CHILD/x&later\\/home/C:/Users/S/s&k=C:/Users/K/y]";
+      const first = sanitizeError(input);
+      const second = sanitizeError(first);
+      const third = sanitizeError(second);
+
+      expect(first).toBe(
+        "file://h?x=[file://<path>&later\\<path>:<path>&k=C:/Users/K/y]",
+      );
+      expect(second).toBe(
+        "file://h?x=[file://<path>&later\\<path>:<path>&k=C:<path>]",
+      );
+      expect(third).toBe(second);
     });
   });
 
