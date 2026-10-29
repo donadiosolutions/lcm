@@ -179,6 +179,7 @@ function findUrlPathStarts(chars: readonly string[]): UrlPathStarts {
       options.softWhitespaceDrivePrefix ?? "none";
     postCloseFilePathComponentOpensQuery = false;
     postCloseFilePathOriginHasScheme = false;
+    postCloseFilePathStraightOwnerBracket = -2;
     postCloseFilePathTailEnd = measurePrivateSpanEnd(start, options.fileUrl, options.forced);
   };
   // A claim that activates inside a bracket an active tail already owns is
@@ -257,14 +258,21 @@ function findUrlPathStarts(chars: readonly string[]): UrlPathStarts {
   };
   const isHttpsUrlLiteral = (start: number): boolean =>
     chars.slice(start, start + 8).join("").toLowerCase() === "https://";
-  // The adopted bare-drive owner opens its bracket directly after its path,
-  // optionally through one parenthesis. Any other gap refuses the exception.
-  const bracketOpensImmediatelyAfterOwnerPath = (openIndex: number): boolean =>
-    isPathWord(chars[openIndex - 1]) ||
-    (chars[openIndex - 1] === "(" && isPathWord(chars[openIndex - 2]));
+  // A mixed owner or second mixed copy is straight when its private-root path
+  // is a run of path words and slashes that leads directly to a bracket,
+  // optionally through exactly one parenthesis. Returns that bracket or -1.
+  const straightOwnerBracketStart = (start: number): number => {
+    let cursor = start;
+    while (isPathWord(chars[cursor]) || chars[cursor] === "/" || chars[cursor] === "\\") {
+      cursor += 1;
+    }
+    if (chars[cursor] === "(") cursor += 1;
+    return chars[cursor] === "[" ? cursor : -1;
+  };
   const ownedBracketRegionIsEligible = (
     openIndex: number,
     drivePrefix: OwnedBracketDrivePrefix,
+    straightOwnerBracket: number,
   ): boolean => {
     const headerStart = openIndex + 1;
     if (!startsUrlSchemeLiteral(chars, headerStart)) return false;
@@ -292,10 +300,12 @@ function findUrlPathStarts(chars: readonly string[]): UrlPathStarts {
       return false;
     }
     const headerEnd = cursor;
+    // The adopted bare-drive owner is straight and opens exactly this bracket.
+    // Any other gap in the owner path refuses the exception.
     const admitsTerminalBareDrive =
       drivePrefix === "all" &&
       isHttpsUrlLiteral(headerStart) &&
-      bracketOpensImmediatelyAfterOwnerPath(openIndex);
+      straightOwnerBracket === openIndex;
     let sawDrive = false;
     while (chars[cursor] !== "]") {
       const delimiter = chars[cursor];
@@ -345,16 +355,6 @@ function findUrlPathStarts(chars: readonly string[]): UrlPathStarts {
       if (chars[cursor] === "(" || chars[cursor] === "[") return false;
     }
     return sawDrive;
-  };
-  // A second mixed copy is admitted only when its private-root successor path
-  // leads straight to the copy bracket, optionally through one parenthesis.
-  const successorOwnedBracketStart = (start: number): number => {
-    let cursor = start;
-    while (isPathWord(chars[cursor]) || chars[cursor] === "/" || chars[cursor] === "\\") {
-      cursor += 1;
-    }
-    if (chars[cursor] === "(") cursor += 1;
-    return chars[cursor] === "[" ? cursor : -1;
   };
   const backslashSlashSuccessorPathStart = (start: number): number => {
     if (!isPathWord(chars[start])) return -1;
@@ -576,6 +576,9 @@ function findUrlPathStarts(chars: readonly string[]): UrlPathStarts {
   // Whether the owner text before the selected bracket contains a URL scheme
   // literal; such an origin never requests the nested-file drive prefix.
   let postCloseFilePathOriginHasScheme = false;
+  // The bracket the owner's straight path leads to, measured once per tail
+  // activation on the first depth-zero opener (-2 = not measured, -1 = none).
+  let postCloseFilePathStraightOwnerBracket = -2;
   let inheritedFileQuoteParentOwnerBracketDepth = 0;
   let inheritedFileQuoteEnd = -1;
   let cachedEnclosingQuote = 0;
@@ -836,13 +839,22 @@ function findUrlPathStarts(chars: readonly string[]): UrlPathStarts {
       } else if (char === "[") {
         if (postCloseFilePathBracketDepth === 0) {
           postCloseFilePathComponentHasQuery = false;
+          if (postCloseFilePathStraightOwnerBracket === -2) {
+            postCloseFilePathStraightOwnerBracket = straightOwnerBracketStart(
+              postCloseFilePathTrackingStart,
+            );
+          }
           postCloseFilePathDrivePrefix =
             postCloseFilePathRequestedDrivePrefix !== "none" &&
             !(
               postCloseFilePathRequestedDrivePrefix === "nested-file" &&
               postCloseFilePathOriginHasScheme
             ) &&
-            ownedBracketRegionIsEligible(index, postCloseFilePathRequestedDrivePrefix)
+            ownedBracketRegionIsEligible(
+              index,
+              postCloseFilePathRequestedDrivePrefix,
+              postCloseFilePathStraightOwnerBracket,
+            )
               ? postCloseFilePathRequestedDrivePrefix
               : "none";
         }
@@ -872,14 +884,17 @@ function findUrlPathStarts(chars: readonly string[]): UrlPathStarts {
                 ? backslashSlashSuccessorPathStart(mixedSuccessorStart)
                 : -1;
             const mixedBracketStart =
-              mixedPathStart >= 0 ? successorOwnedBracketStart(mixedSuccessorStart) : -1;
+              mixedPathStart >= 0 ? straightOwnerBracketStart(mixedSuccessorStart) : -1;
+            // A second mixed copy is an independent copy only of a straight
+            // owner; a bent owner keeps the frozen pass sequence for its copy.
             const rearmedAtMixedSuccessor =
               mixedPathStart >= 0 &&
+              postCloseFilePathStraightOwnerBracket >= 0 &&
               immediateBackslashSlashSuccessorStartsPrivateRoot(mixedSuccessorStart) &&
               mixedBracketStart >= 0 &&
               (postCloseFilePathComponentOpensQuery ||
                 !isFileUrlLiteral(chars, mixedBracketStart + 1)) &&
-              ownedBracketRegionIsEligible(mixedBracketStart, "all");
+              ownedBracketRegionIsEligible(mixedBracketStart, "all", mixedBracketStart);
             if (rearmedAtMixedSuccessor) {
               forcedPath[mixedPathStart] = 1;
               armBracketTail(mixedPathStart, mixedSuccessorStart, {

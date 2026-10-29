@@ -745,9 +745,12 @@ bundle and keep provider, credential, quarantine, and recovery sessions private.
   already-owned rooted paths, and simple drives made only from slash-separated
   path-word segments. All drives in an admitted bracket are classified
   together. The bare form `?key=C:/]` is admitted only as the first and only
-  value of an `https://` bracket that a mixed-separator owner opens directly
-  after its path, optionally through one parenthesis; the letter and name may
-  vary in case. After a simple drive, one immediate rooted query continuation
+  value of an `https://` bracket whose mixed-separator owner path is a
+  straight run of path words and slashes from its start to the bracket,
+  optionally through exactly one parenthesis directly before it; a parenthesis
+  group or other gap anywhere earlier in the owner path refuses it, as does a
+  bracket that follows an admitted sibling. The letter and name may vary in
+  case. After a simple drive, one immediate rooted query continuation
   of the shape `([https://host?key=/rooted]` is admitted, where the host is a
   plain host name with an optional numeric port; any value, delimiter, or
   further scheme inside that authority refuses the bracket. This applies to
@@ -760,8 +763,9 @@ bundle and keep provider, credential, quarantine, and recovery sessions private.
   whitespace, unsupported nesting, and malformed path segments refuse the
   drive-prefix rule for the complete bracket. Refused brackets keep their
   established whole-drive behavior, including through descendant brackets.
-  An independent later mixed copy is admitted only when its own bracket matches
-  the same grammar, when its successor path leads straight to the copy bracket
+  An independent later mixed copy is admitted only after a straight owner, when
+  its own bracket matches the same grammar, when its successor path leads
+  straight to the copy bracket
   (optionally through one parenthesis), and, for a `file://` copy header, only
   when the preceding component opened with `?` or `#`; otherwise the copy
   keeps its established pass sequence. Space, tab, line feed, and carriage

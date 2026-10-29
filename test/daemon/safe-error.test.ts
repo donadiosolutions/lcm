@@ -6932,6 +6932,94 @@ describe("sanitizeError", () => {
     ] as const)("denies the nested-file drive prefix to an owner containing a scheme: %s", (_name, input, expected) => {
       assertStable(input, expected);
     });
+
+    it.each([
+      [
+        "parenthesis pair followed by a path word",
+        "file://h?x=[file:///Users/CHILD/x&later\\/home/alice/s()x[https://other?key=C:/]",
+        "file://h?x=[file://<path>&later\\<path>?key=<path>]",
+      ],
+      [
+        "parenthesis pair inside an earlier segment",
+        "file://h?x=[file:///Users/CHILD/x&later\\/home/a()b/s[https://other?key=C:/]",
+        "file://h?x=[file://<path>&later\\<path>?key=<path>]",
+      ],
+      [
+        "parenthesised text inside an earlier segment",
+        "file://h?x=[file:///Users/CHILD/x&later\\/home/a(b)c/s([https://other?KEY=d:/]",
+        "file://h?x=[file://<path>&later\\<path>?KEY=<path>]",
+      ],
+      [
+        "parenthesis pair as its own segment",
+        "file://h?x=[file:///Users/CHILD/x&later\\/Users/alice/s/()/x[HTTPS://o:80/p?key=Z:/]",
+        "file://h?x=[file://<path>&later\\<path>?key=<path>]",
+      ],
+      [
+        "bent owner followed by a straight second copy",
+        "file://h?x=[file:///Users/CHILD/x&later\\/home/alice/s()x[https://other?key=C:/]" +
+          "&later\\/home/bob/s([https://other?key=D:/]",
+        "file://h?x=[file://<path>&later\\<path>?key=<path>]&later\\<path>?key=D:/]",
+      ],
+      [
+        "parenthesis pair followed by a path word and a parenthesis",
+        "file://h?x=[file:///Users/CHILD/x&later\\/home/alice/s()x([https://other?key=C:/]",
+        "file://h?x=[file://<path>&later\\<path>?key=<path>]",
+      ],
+      [
+        "parenthesised word followed by a symbol path word",
+        "file://h?x=[file:///Users/CHILD/x&later\\/home/alice/s(x)@[https://other?KEY=c:/]",
+        "file://h?x=[file://<path>&later\\<path>?KEY=<path>]",
+      ],
+      [
+        "two parenthesis pairs followed by a path",
+        "file://h?x=[file:///Users/CHILD/x&later\\/home/alice/s()()x/y[HTTPS://o?key=C:/]",
+        "file://h?x=[file://<path>&later\\<path>?key=<path>]",
+      ],
+      [
+        "unbalanced parentheses in a root owner with a second copy",
+        "file://h?x=[file:///Users/CHILD/x&x\\/root/a(()C([https://o:80?key=C:/]" +
+          "&later\\/home/bob/s([https://other?key=D:/]",
+        "file://h?x=[file://<path>&x\\<path>?key=<path>]&later\\<path>?key=D:/]",
+      ],
+      [
+        "parenthesis pair after a file-literal owner",
+        "file://h?x=[file:///Users/CHILD/x&later\\/home/file:///Users/S/s()\u00fc[https://other?key=C:/]",
+        "file://h?x=[file://<path>&later\\<path>file://<path>?key=<path>]",
+      ],
+      [
+        "unclosed parenthesis followed by a path word",
+        "file://h?x=[file:///Users/CHILD/x&later\\/home/alice/s(x[https://other?key=C:/]",
+        "file://h?x=[file://<path>&later\\<path>?key=<path>]",
+      ],
+      [
+        "bent second copy after an admitted first component",
+        "file://h?x=[file:///Users/CHILD/x&later\\/home/alice/s([https://other?key=/Users/S0/x]" +
+          "&later\\/home/bob/s()x([https://other?key=D:/]",
+        "file://h?x=[file://<path>&later\\<path>?key=<path>]&later<path>?key=D:/]",
+      ],
+    ] as const)("refuses the bare drive when the owner path is not straight: %s", (_name, input, expected) => {
+      assertStable(input, expected);
+    });
+
+    it.each([
+      [
+        "Users owner",
+        "file://h?x=[file:///Users/CHILD/x&later\\/Users/alice/s([https://other?key=C:/]",
+        "file://h?x=[file://<path>&later\\<path>?key=C:<path>]",
+      ],
+      [
+        "root owner with a header port",
+        "file://h?x=[file:///Users/CHILD/x&x\\/root/a([https://o:80?key=C:/]",
+        "file://h?x=[file://<path>&x\\<path>?key=C:<path>]",
+      ],
+      [
+        "straight owner with bare sibling brackets",
+        "file://h?x=[file:///Users/CHILD/x&later\\/home/alice/s([https://o?key=C:/][https://o?key=D:/]",
+        "file://h?x=[file://<path>&later\\<path>?key=C:<path>][https://o?key=D:/]",
+      ],
+    ] as const)("keeps the bare drive for a straight owner: %s", (_name, input, expected) => {
+      assertStable(input, expected);
+    });
   });
 
 
