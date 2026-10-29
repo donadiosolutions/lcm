@@ -1,5 +1,5 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
-import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { ensureAuthToken, readAuthToken } from "../../../src/daemon/auth.js";
@@ -14,6 +14,11 @@ import { createStorageBackendFactory } from "../../../src/storage/factory.js";
 import { makeStagedPostgreSqlStorageFactory } from "./mock-storage-factory.js";
 
 const identity = { ownerId: "server-observation-tests", entrypoint: "/lcm-tests/observation-daemon.mjs" };
+const packageVersion = (
+  JSON.parse(readFileSync(new URL("../../../package.json", import.meta.url), "utf8")) as {
+    version: string;
+  }
+).version;
 const generation = "5bd49553-128b-4b3c-a8d7-383e134ebcd3";
 const runtimeDigest = "a".repeat(64);
 
@@ -71,7 +76,7 @@ describe("authenticated daemon identity observation", () => {
       status: "ok",
       observation: "identity-only",
       storage: { status: "unverified" },
-      version: expect.stringMatching(/^\d+\.\d+\.\d+$/),
+      version: packageVersion,
       storageBackend: "sqlite",
       uptime: expect.any(Number),
       pid: process.pid,
