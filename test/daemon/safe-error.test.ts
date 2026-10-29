@@ -1,4 +1,5 @@
 import { describe, it, expect, vi } from "vitest";
+import { readFileSync } from "node:fs";
 import { sanitizeError } from "../../src/daemon/safe-error.js";
 
 describe("sanitizeError", () => {
@@ -6106,6 +6107,23 @@ describe("sanitizeError", () => {
     const mixedPrefix =
       "file://h?x=[file:///Users/CHILD/x&later\\/home/alice/s([https://other?";
     const mixedExpected = "file://h?x=[file://<path>&later\\<path>?";
+    const round3Cases = JSON.parse(
+      readFileSync(new URL("../fixtures/safe-error-1817-round3.json", import.meta.url), "utf8"),
+    ) as Array<{
+      name: string;
+      input: string;
+      requiredPasses: readonly [string, string, string];
+    }>;
+
+    it.each(round3Cases)("pins the final component grammar: $name", ({ input, requiredPasses }) => {
+      const first = sanitizeError(input);
+      const second = sanitizeError(first);
+      const third = sanitizeError(second);
+
+      expect(first).toBe(requiredPasses[0]);
+      expect(second).toBe(requiredPasses[1]);
+      expect(third).toBe(requiredPasses[2]);
+    });
 
     it.each([
       ["upper-case C", "C:/Users/SECRET2/x", "C:<path>"],
@@ -6159,7 +6177,7 @@ describe("sanitizeError", () => {
       [
         "drive value before an inner bracket",
         mixedPrefix + "key=C:/Users/K/x[https://inner?key=/home/C/s]]",
-        mixedExpected + "key=C:<path>?key=<path>]]",
+        mixedExpected + "key=<path>?key=<path>]]",
       ],
       [
         "drive value before trailing text",
@@ -6416,7 +6434,7 @@ describe("sanitizeError", () => {
       [
         "named compound drive",
         mixedPrefix + "key=C:/C:/Users/K]",
-        mixedExpected + "key=C:<path>]",
+        mixedExpected + "key=<path>:<path>]",
       ],
       [
         "ampersand compound drive",
@@ -6479,7 +6497,17 @@ describe("sanitizeError", () => {
           "key=C:/Users/S1/x" +
           whitespace +
           "&k2=D:/Users/S2/y]",
-        mixedExpected + "key=C:<path>&k2=D:<path>]",
+        mixedExpected + "key=<path>&k2=<path>]",
+      );
+    });
+
+    it.each([
+      ["query suffix", "?q"],
+      ["space suffix", " x"],
+    ] as const)("keeps the no-path-word %s at the frozen spelling", (_name, suffix) => {
+      assertStable(
+        mixedPrefix + "key=C:/" + suffix + "]",
+        mixedExpected + "key=<path>" + suffix + "]",
       );
     });
 
@@ -6531,6 +6559,81 @@ describe("sanitizeError", () => {
         mixedPrefix + "key=C:/]&later\\/home/alice/s([https://other?key=C:/]",
         mixedExpected + "key=C:<path>]&later<path>?key=C:<path>]",
       );
+    });
+
+    it("keeps the one-level rooted-query continuation in an admitted file child", () => {
+      assertStable(
+        "file://h?x=[file:///Users/CHILD/x&/Users/alice/s" +
+          "[file:///b&C:/Users/c([https://i?key=/Users/I/s]]]",
+        "file://h?x=[file://<path>&<path>&C:<path>?key=<path>]]]",
+      );
+    });
+
+    it("refuses a mixed-owner request carried through soft whitespace", () => {
+      assertStable(
+        "file://h?x=[file:///Users/CHILD/x&later\\/home/alice/s\u00a0" +
+          "([https://other?key=C:/]",
+        "file://h?x=[file://<path>&later\\<path>?key=<path>]",
+      );
+    });
+
+    it("refuses a non-HTTPS nested continuation", () => {
+      assertStable(
+        "file://h?x=[file:///Users/CHILD/x&/Users/alice/s" +
+          "[file:///b&C:/Users/c([http://i?key=/Users/I/s]]]",
+        "file://h?x=[file://<path>&<path>&<path>?key=<path>]]]",
+      );
+    });
+
+    it("does not re-arm across another successor before the bracket", () => {
+      assertStable(
+        "file://h?x=[file:///Users/CHILD/x&later\\/home/alice/s" +
+          "([https://other?key=/Users/S0/x]&later\\/home/bob/s" +
+          "&plain[https://other?key=C:/Users/K/x]",
+        "file://h?x=[file://<path>&later\\<path>?key=<path>]" +
+          "&later<path>&plain[https://other?key=C:/Users/K/x]",
+      );
+    });
+
+    it.each([
+      [
+        "trailing separator in a drive path",
+        "file://h?x=[file:///Users/CHILD/x&later\\/home/alice/s" +
+          "([https://other?key=C:/Users/]",
+        "file://h?x=[file://<path>&later\\<path>?key=<path>]",
+      ],
+      [
+        "wrong nested continuation parameter",
+        "file://h?x=[file:///Users/CHILD/x&/Users/alice/s" +
+          "[file:///b&C:/Users/c([https://i?other=/Users/I/s]]]",
+        "file://h?x=[file://<path>&<path>&<path>?other=<path>]]]",
+      ],
+      [
+        "plain nested continuation value",
+        "file://h?x=[file:///Users/CHILD/x&/Users/alice/s" +
+          "[file:///b&C:/Users/c([https://i?key=plain]]]",
+        "file://h?x=[file://<path>&<path>&<path>?key=plain]]]",
+      ],
+      [
+        "rooted continuation with another parameter",
+        "file://h?x=[file:///Users/CHILD/x&/Users/alice/s" +
+          "[file:///b&C:/Users/c([https://i?key=/Users/I/s&other=plain]]]",
+        "file://h?x=[file://<path>&<path>&<path>?key=<path>&other=plain]]]",
+      ],
+      [
+        "empty query parameter name",
+        "file://h?x=[file:///Users/CHILD/x&later\\/home/alice/s" +
+          "([https://other?=C:/Users/K/x]",
+        "file://h?x=[file://<path>&later\\<path>?=<path>]",
+      ],
+      [
+        "second successor without a bracket",
+        "file://h?x=[file:///Users/CHILD/x&later\\/home/alice/s" +
+          "([https://other?key=/Users/S0/x]&later\\/home/bob/s",
+        "file://h?x=[file://<path>&later\\<path>?key=<path>]&later<path>",
+      ],
+    ] as const)("refuses the malformed positive-grammar neighbour: %s", (_name, input, expected) => {
+      assertStable(input, expected);
     });
   });
 

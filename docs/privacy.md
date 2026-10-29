@@ -734,18 +734,25 @@ bundle and keep provider, credential, quarantine, and recovery sessions private.
   `\\Users\x`, and mixed runs are covered, and when it is a drive path such as
   `C:/Users/x` or `c:/home/x`. A slash-only run with no path word after it is
   unchanged; a backslash-only run is redacted by the existing Windows-root rule.
-  A selected forward-slash drive value keeps its letter and colon when a named
-  query or fragment belongs to a bracket reached through a mixed-separator
-  private-root successor, including an independent later mixed successor. The
-  same spelling is retained for an eligible drive in an exact `file://` child
-  reached through a later rooted, private-relative, inherited later-successor,
-  restarted, or soft-whitespace tail; for example, `&C:/Users/x` becomes
-  `&C:<path>`. A bare ampersand drive, a `C://` value, and a drive after a public
-  URL in the same file component remain wholly redacted. Soft JavaScript
-  whitespace inside an already selected component keeps that selection, while
-  space, tab, line feed, and carriage return remain hard boundaries. Other
-  bracket shapes keep their established whole-drive behavior rather than
-  inheriting this drive-prefix rule.
+  A selected bracket can keep the letter and colon of a forward-slash drive
+  only when the whole bracket matches a conservative grammar. The bracket must
+  begin with a normal URL header, or with the exact `file://` child that
+  established its owner. Its values may contain plain path-word scalars,
+  already-owned rooted paths, and simple drives made only from slash-separated
+  path-word segments. All drives in an admitted bracket are classified
+  together. The exact terminal named form `?key=C:/]` is also admitted, as is
+  one immediate rooted query continuation after a simple drive. This applies to
+  mixed-separator owners and to exact file children reached through later
+  rooted, private-relative, inherited later-successor, restarted, or preserved
+  soft-whitespace tails; for example, `&C:/Users/x` becomes `&C:<path>`.
+  Public or file URL values, anonymous equals values, compounds, internal
+  whitespace, unsupported nesting, and malformed path segments refuse the
+  drive-prefix rule for the complete bracket. Refused brackets keep their
+  established whole-drive behavior, including through descendant brackets.
+  An independent later mixed copy is admitted only when its own bracket matches
+  the same grammar. Space, tab, line feed, and carriage return remain hard
+  boundaries, and whitespace never upgrades a tail that did not explicitly
+  request drive-prefix handling.
   An unmatched `]`, text outside a component after the span stopped, whitespace,
   and newlines end the composition; whitespace-separated prose, public URLs,
   and ordinary unspaced relative tails remain unchanged.
