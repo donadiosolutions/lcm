@@ -6635,6 +6635,303 @@ describe("sanitizeError", () => {
     ] as const)("refuses the malformed positive-grammar neighbour: %s", (_name, input, expected) => {
       assertStable(input, expected);
     });
+
+    const escalationCases = JSON.parse(
+      readFileSync(new URL("../fixtures/safe-error-1817-escalation.json", import.meta.url), "utf8"),
+    ) as Array<{
+      name: string;
+      input: string;
+      requiredPasses: readonly [string, string, string];
+    }>;
+
+    it.each(escalationCases)("pins the escalation acceptance row: $name", ({ input, requiredPasses }) => {
+      const first = sanitizeError(input);
+      const second = sanitizeError(first);
+      const third = sanitizeError(second);
+
+      expect(first).toBe(requiredPasses[0]);
+      expect(second).toBe(requiredPasses[1]);
+      expect(third).toBe(requiredPasses[2]);
+    });
+
+    const assertSequence = (input: string, passes: readonly [string, string, string]): void => {
+      const first = sanitizeError(input);
+      const second = sanitizeError(first);
+      const third = sanitizeError(second);
+
+      expect(first).toBe(passes[0]);
+      expect(second).toBe(passes[1]);
+      expect(third).toBe(passes[2]);
+    };
+
+    const continuationPrefix =
+      "file://h?x=[file:///Users/CHILD/x&later\\/home/alice/s([https://other?key=C:/Users/K/x([https://";
+    const continuationRefused =
+      "file://h?x=[file://<path>&later\\<path>?key=<path>?key=<path>]]";
+    const continuationAdmitted =
+      "file://h?x=[file://<path>&later\\<path>?key=C:<path>?key=<path>]]";
+
+    it.each([
+      ["host with dots and a port", "i.test:8443", continuationAdmitted],
+      ["upper-case host", "I", continuationAdmitted],
+      ["empty port", "i:", continuationRefused],
+      ["underscore in the host", "i_x", continuationRefused],
+      ["user information in the host", "u@i", continuationRefused],
+      ["path in the authority", "i/x", continuationRefused],
+    ] as const)("limits the continuation authority to a host token: %s", (_name, authority, expected) => {
+      assertStable(continuationPrefix + authority + "?key=/Users/I/s]]", expected);
+    });
+
+    it("refuses a continuation whose port runs to the end of the input", () => {
+      assertStable(
+        continuationPrefix + "i:8",
+        "file://h?x=[file://<path>&later\\<path>?key=<path>",
+      );
+    });
+
+    it.each([
+      [
+        "bare drive after an interposed value",
+        "file://h?x=[file:///Users/CHILD/x&later\\/home/alice/s" +
+          "([https://other?key=C:/Users/K/x([https://i&X:/?key=/Users/I/s]]",
+        "file://h?x=[file://<path>&later\\<path>?key=<path>&<path>?key=<path>]]",
+      ],
+      [
+        "double-slash drive after an interposed value",
+        "file://h?x=[file:///Users/CHILD/x&later\\/home/alice/s" +
+          "([https://other?key=C:/Users/K/x([https://i&X://s?key=/Users/I/s]]",
+        "file://h?x=[file://<path>&later\\<path>?key=<path>&<path>?key=<path>]]",
+      ],
+      [
+        "two interposed drives",
+        "file://h?x=[file:///Users/CHILD/x&later\\/home/alice/s" +
+          "([https://other?key=C:/Users/K/x([https://i&X:/Users/Q&Y:/?key=/Users/I/s]]",
+        "file://h?x=[file://<path>&later\\<path>?key=<path>&<path>&<path>?key=<path>]]",
+      ],
+      [
+        "interposed drive under a nested file child",
+        "file://h?x=[file:///Users/CHILD/x&/Users/alice/s" +
+          "[file:///b&C:/Users/K/x([https://i&X:/?key=/Users/I/s]]",
+        "file://h?x=[file://<path>&<path>&<path>&<path>?key=<path>]]",
+      ],
+      [
+        "interposed drive under a restarted wrapper",
+        "file://h?x=[a]\\b[file:///b&C:/Users/K/x([https://i&X://s?key=/Users/I/s]]",
+        "file://h?x=[a]<path>&<path>&<path>?key=<path>]]",
+      ],
+      [
+        "public URL inside the continuation authority",
+        "file://h?x=[file:///Users/CHILD/x&later\\/home/alice/s" +
+          "([https://other?key=C:/Users/K/x([https://i&https://pub/x?key=/Users/I/s]]",
+        "file://h?x=[file://<path>&later\\<path>?key=<path>&https://pub/x?key=<path>]]",
+      ],
+      [
+        "file URL inside the continuation authority",
+        "file://h?x=[file:///Users/CHILD/x&later\\/home/alice/s" +
+          "([https://other?key=C:/Users/K/x([https://i&file:///Users/Q?key=/Users/I/s]]",
+        "file://h?x=[file://<path>&later\\<path>?key=<path>&file://<path>?key=<path>]]",
+      ],
+      [
+        "parenthesis inside the continuation authority",
+        "file://h?x=[file:///Users/CHILD/x&later\\/home/alice/s" +
+          "([https://other?key=C:/Users/K/x([https://i(X:/Users/Q?key=/Users/I/s]]",
+        "file://h?x=[file://<path>&later\\<path>?key=<path>?key=<path>]]",
+      ],
+    ] as const)("refuses a continuation whose authority carries a value: %s", (_name, input, expected) => {
+      assertStable(input, expected);
+    });
+
+    it.each([
+      [
+        "nested file child of a rooted owner",
+        "file://h?x=[file:///Users/CHILD/x&/Users/alice/s[file:///b?key=C:/]]",
+        "file://h?x=[file://<path>&<path>?key=<path>]]",
+      ],
+      [
+        "nested file child of a private-relative owner",
+        "file://h?x=[file:///Users/CHILD/x&later/home/alice/s[file:///b?key=C:/]]",
+        "file://h?x=[file://<path>&later<path>?key=<path>]]",
+      ],
+      [
+        "nested file child of a restarted wrapper",
+        "file://h?x=[a]\\b[file:///b?key=C:/]",
+        "file://h?x=[a]<path>?key=<path>]",
+      ],
+      [
+        "file header after a mixed successor",
+        "file://h?x=[file:///Users/CHILD/x&later\\/home/alice/s([file:///b?key=C:/]",
+        "file://h?x=[file://<path>&later\\<path>file://<path>?key=<path>]",
+      ],
+      [
+        "genuine #1785 owner with a file header",
+        "file://h?x=[file:///Users/CHILD/x&later/home/alice/s([file:///b?key=C:/]",
+        "file://h?x=[file://<path>&later<path>?key=<path>]",
+      ],
+      [
+        "http header",
+        "file://h?x=[file:///Users/CHILD/x&later\\/home/alice/s([http://other?key=C:/]",
+        "file://h?x=[file://<path>&later\\<path>?key=<path>]",
+      ],
+      [
+        "bare drive after a fragment drive",
+        "file://h?x=[file:///Users/CHILD/x&later\\/home/alice/s([https://other#C:/x?key=C:/]",
+        "file://h?x=[file://<path>&later\\<path>#<path>?key=<path>]",
+      ],
+      [
+        "bare drive after a fragment root",
+        "file://h?x=[file:///Users/CHILD/x&later\\/home/alice/s([https://other#/x?key=C:/]",
+        "file://h?x=[file://<path>&later\\<path>#<path>?key=<path>]",
+      ],
+      [
+        "owner path followed by an empty parenthesis pair",
+        "file://h?x=[file:///Users/CHILD/x&later\\/home/alice/s()[https://other?key=C:/]",
+        "file://h?x=[file://<path>&later\\<path>?key=<path>]",
+      ],
+      [
+        "owner path followed by two parentheses",
+        "file://h?x=[file:///Users/CHILD/x&later\\/home/alice/s(([https://other?key=C:/]",
+        "file://h?x=[file://<path>&later\\<path>?key=<path>]",
+      ],
+    ] as const)("limits the bare drive exception to the adopted terminal shape: %s", (_name, input, expected) => {
+      assertStable(input, expected);
+    });
+
+    it.each([
+      [
+        "upper-case scheme",
+        "file://h?x=[file:///Users/CHILD/x&later\\/home/alice/s([HTTPS://other?key=C:/]",
+        "file://h?x=[file://<path>&later\\<path>?key=C:<path>]",
+      ],
+      [
+        "upper-case name",
+        mixedPrefix + "KEY=C:/]",
+        mixedExpected + "KEY=C:<path>]",
+      ],
+      [
+        "bracket without a parenthesis",
+        "file://h?x=[file:///Users/CHILD/x&later\\/home/alice/s[https://other?key=C:/]",
+        "file://h?x=[file://<path>&later\\<path>?key=C:<path>]",
+      ],
+    ] as const)("keeps the adopted bare drive variant: %s", (_name, input, expected) => {
+      assertStable(input, expected);
+    });
+
+    it.each([
+      [
+        "file copy after an ampersand drive value",
+        "file://h?x=[file:///Users/CHILD/x&later\\/home/alice/s([https://other&C:/Users/K/x]" +
+          "&later\\/home/bob/s([file:///b?key=M:/Users/K/x]",
+        [
+          "file://h?x=[file://<path>&later\\<path>&C:<path>]&later\\/home/bob/s([file://<path>?key=M:/Users/K/x]",
+          "file://h?x=[file://<path>&later\\<path>&C:<path>]&later\\<path><path>?key=M:<path>]",
+          "file://h?x=[file://<path>&later\\<path>&C:<path>]&later\\<path><path>?key=M:<path>]",
+        ],
+      ],
+      [
+        "upper-case file copy after a plain value",
+        "file://h?x=[file:///Users/CHILD/x&later\\/home/alice/s([https://other&plain]" +
+          "&later\\/home/bob/s([FILE:///b?key=M:/Users/K/x]",
+        [
+          "file://h?x=[file://<path>&later\\<path>&plain]&later\\/home/bob/s([FILE://<path>?key=M:/Users/K/x]",
+          "file://h?x=[file://<path>&later\\<path>&plain]&later\\<path><path>?key=M:<path>]",
+          "file://h?x=[file://<path>&later\\<path>&plain]&later\\<path><path>?key=M:<path>]",
+        ],
+      ],
+      [
+        "bare file copy after an ampersand drive value",
+        "file://h?x=[file:///Users/CHILD/x&later\\/home/alice/s([https://other&C:/Users/K/x]" +
+          "&later\\/Users/bob/s([file:///b?key=M:/]",
+        [
+          "file://h?x=[file://<path>&later\\<path>&C:<path>]&later\\/Users/bob/s([file://<path>?key=M:/]",
+          "file://h?x=[file://<path>&later\\<path>&C:<path>]&later\\<path><path>?key=M:/]",
+          "file://h?x=[file://<path>&later\\<path>&C:<path>]&later\\<path><path>?key=M:/]",
+        ],
+      ],
+      [
+        "file copy with an authority after a named plain value",
+        "file://h?x=[file:///Users/CHILD/x&later\\/home/alice/s[https://other&a=1]" +
+          "&later\\/root/bob/s([file:///Users/W/b&M:/a]",
+        [
+          "file://h?x=[file://<path>&later\\<path>&a=1]&later\\/root/bob/s([file://<path>&M:/a]",
+          "file://h?x=[file://<path>&later\\<path>&a=1]&later\\<path><path>&M:<path>]",
+          "file://h?x=[file://<path>&later\\<path>&a=1]&later\\<path><path>&M:<path>]",
+        ],
+      ],
+    ] as const)("omits the second-copy re-arm for a file header the frozen scanner links later: %s", (_name, input, passes) => {
+      assertSequence(input, passes);
+    });
+
+    it.each([
+      [
+        "header followed by a semicolon under a restarted wrapper",
+        "file://h?x=[a]\\b[file:///b;C://srv/x?key=C:/Users/K/x]",
+        "file://h?x=[a]<path>;C://srv/x?key=<path>]",
+      ],
+      [
+        "header followed by a parenthesis",
+        "file://h?x=[file:///Users/CHILD/x&later\\/home/alice/s([https://other(x?key=C:/Users/K/x]",
+        "file://h?x=[file://<path>&later\\<path>?key=<path>]",
+      ],
+      [
+        "header followed by a pipe",
+        "file://h?x=[file:///Users/CHILD/x&later\\/home/alice/s([https://other|x?key=C:/Users/K/x]",
+        "file://h?x=[file://<path>&later\\<path>|x?key=<path>]",
+      ],
+      [
+        "header containing a second scheme",
+        "file://h?x=[file:///Users/CHILD/x&later\\/home/alice/s([https://file://other?key=C:/]",
+        "file://h?x=[file://<path>&later\\<path>file://other?key=<path>]",
+      ],
+      [
+        "file header without a path before a fragment value",
+        "file://h?x=[file:///Users/CHILD/x&later\\/home/alice/s[file:///#b&C:/Users/c]]",
+        "file://h?x=[file://<path>&later\\<path>file:///#b&<path>]]",
+      ],
+      [
+        "header ending in a slash",
+        "file://h?x=[file:///Users/CHILD/x&later\\/home/alice/s([https://other/?key=C:/Users/K/x]",
+        "file://h?x=[file://<path>&later\\<path>?key=<path>]",
+      ],
+      [
+        "header with an empty authority",
+        "file://h?x=[file:///Users/CHILD/x&later\\/home/alice/s([https://?key=C:/Users/K/x]",
+        "file://h?x=[file://<path>&later\\<path>?key=<path>]",
+      ],
+      [
+        "header colon at the end of the input",
+        "file://h?x=[file:///Users/CHILD/x&later\\/home/alice/s([https://other:",
+        "file://h?x=[file://<path>&later\\<path>",
+      ],
+    ] as const)("refuses a header that does not end at a value delimiter: %s", (_name, input, expected) => {
+      assertStable(input, expected);
+    });
+
+    it("keeps a numeric port inside an admitted header", () => {
+      assertStable(
+        "file://h?x=[file:///Users/CHILD/x&later\\/home/alice/s([https://other:8443?key=C:/Users/K/x]",
+        "file://h?x=[file://<path>&later\\<path>?key=C:<path>]",
+      );
+    });
+
+    it.each([
+      [
+        "public URL inside a rooted owner",
+        "file://h?x=[file:///Users/CHILD/x&/https://Users/alice/s[file:///b&C:/Users/c]]",
+        "file://h?x=[file://<path>&<path>&<path>]]",
+      ],
+      [
+        "public URL inside a private-relative owner",
+        "file://h?x=[file:///Users/CHILD/x&later/home/https://alice/s[file:///b&C:/Users/c]]",
+        "file://h?x=[file://<path>&later<path>&<path>]]",
+      ],
+      [
+        "other scheme inside a rooted owner",
+        "file://h?x=[file:///Users/CHILD/x&/Users/alice/ftp://x/s[file:///b&C:/Users/c]]",
+        "file://h?x=[file://<path>&<path>&<path>]]",
+      ],
+    ] as const)("denies the nested-file drive prefix to an owner containing a scheme: %s", (_name, input, expected) => {
+      assertStable(input, expected);
+    });
   });
 
 

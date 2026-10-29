@@ -737,20 +737,35 @@ bundle and keep provider, credential, quarantine, and recovery sessions private.
   A selected bracket can keep the letter and colon of a forward-slash drive
   only when the whole bracket matches a conservative grammar. The bracket must
   begin with a normal URL header, or with the exact `file://` child that
-  established its owner. Its values may contain plain path-word scalars,
+  established its owner. The header itself is plain path-word text with its
+  scheme colon and slashes and must run straight into the first value
+  delimiter or the closing bracket; a comma, semicolon, bang, parenthesis, or
+  other punctuation after the header refuses the bracket. Its values may
+  contain plain path-word scalars,
   already-owned rooted paths, and simple drives made only from slash-separated
   path-word segments. All drives in an admitted bracket are classified
-  together. The exact terminal named form `?key=C:/]` is also admitted, as is
-  one immediate rooted query continuation after a simple drive. This applies to
+  together. The bare form `?key=C:/]` is admitted only as the first and only
+  value of an `https://` bracket that a mixed-separator owner opens directly
+  after its path, optionally through one parenthesis; the letter and name may
+  vary in case. After a simple drive, one immediate rooted query continuation
+  of the shape `([https://host?key=/rooted]` is admitted, where the host is a
+  plain host name with an optional numeric port; any value, delimiter, or
+  further scheme inside that authority refuses the bracket. This applies to
   mixed-separator owners and to exact file children reached through later
   rooted, private-relative, inherited later-successor, restarted, or preserved
   soft-whitespace tails; for example, `&C:/Users/x` becomes `&C:<path>`.
+  An exact file child whose owner text already contains a URL scheme, such as
+  `/https://Users/x/s[file:///b&C:/Users/c]`, does not take part.
   Public or file URL values, anonymous equals values, compounds, internal
   whitespace, unsupported nesting, and malformed path segments refuse the
   drive-prefix rule for the complete bracket. Refused brackets keep their
   established whole-drive behavior, including through descendant brackets.
   An independent later mixed copy is admitted only when its own bracket matches
-  the same grammar. Space, tab, line feed, and carriage return remain hard
+  the same grammar, when its successor path leads straight to the copy bracket
+  (optionally through one parenthesis), and, for a `file://` copy header, only
+  when the preceding component opened with `?` or `#`; otherwise the copy
+  keeps its established pass sequence. Space, tab, line feed, and carriage
+  return remain hard
   boundaries, and whitespace never upgrades a tail that did not explicitly
   request drive-prefix handling.
   An unmatched `]`, text outside a component after the span stopped, whitespace,

@@ -1,0 +1,232 @@
+[
+  {
+    "name": "A-bare",
+    "mode": "refuse",
+    "input": "file://h?x=[file:///Users/CHILD/x&later\\/home/alice/s([https://other?key=C:/Users/c([https://i&D:/?key=/x]]",
+    "requiredPasses": [
+      "file://h?x=[file://<path>&later\\<path>?key=<path>&<path>?key=<path>]]",
+      "file://h?x=[file://<path>&later\\<path>?key=<path>&<path>?key=<path>]]",
+      "file://h?x=[file://<path>&later\\<path>?key=<path>&<path>?key=<path>]]"
+    ]
+  },
+  {
+    "name": "A-double",
+    "mode": "refuse",
+    "input": "file://h?x=[file:///Users/CHILD/x&later\\/home/alice/s([https://other?key=C:/Users/c([https://i&D://z?key=/x]]",
+    "requiredPasses": [
+      "file://h?x=[file://<path>&later\\<path>?key=<path>&<path>?key=<path>]]",
+      "file://h?x=[file://<path>&later\\<path>?key=<path>&<path>?key=<path>]]",
+      "file://h?x=[file://<path>&later\\<path>?key=<path>&<path>?key=<path>]]"
+    ]
+  },
+  {
+    "name": "A-compound",
+    "mode": "refuse",
+    "input": "file://h?x=[file:///Users/CHILD/x&later\\/home/alice/s([https://other?key=C:/Users/c([https://i&C:/C:/x?key=/x]]",
+    "requiredPasses": [
+      "file://h?x=[file://<path>&later\\<path>?key=<path>&<path>:<path>?key=<path>]]",
+      "file://h?x=[file://<path>&later\\<path>?key=<path>&<path>:<path>?key=<path>]]",
+      "file://h?x=[file://<path>&later\\<path>?key=<path>&<path>:<path>?key=<path>]]"
+    ]
+  },
+  {
+    "name": "A-pathword",
+    "mode": "refuse",
+    "input": "file://h?x=[file:///Users/CHILD/x&later\\/home/alice/s([https://other?key=C:/Users/K/x([https://i&D:/Users/z?key=/Users/I/s]]",
+    "requiredPasses": [
+      "file://h?x=[file://<path>&later\\<path>?key=<path>&<path>?key=<path>]]",
+      "file://h?x=[file://<path>&later\\<path>?key=<path>&<path>?key=<path>]]",
+      "file://h?x=[file://<path>&later\\<path>?key=<path>&<path>?key=<path>]]"
+    ]
+  },
+  {
+    "name": "A-empty",
+    "mode": "refuse",
+    "input": "file://h?x=[file:///Users/CHILD/x&later\\/home/alice/s([https://other?key=C:/Users/K/x([https://?key=/x]]",
+    "requiredPasses": [
+      "file://h?x=[file://<path>&later\\<path>?key=<path>?key=<path>]]",
+      "file://h?x=[file://<path>&later\\<path>?key=<path>?key=<path>]]",
+      "file://h?x=[file://<path>&later\\<path>?key=<path>?key=<path>]]"
+    ]
+  },
+  {
+    "name": "A-good",
+    "mode": "target",
+    "input": "file://h?x=[file:///Users/CHILD/x&later\\/home/alice/s([https://other?key=C:/Users/K/x([https://i?key=/Users/I/s]]",
+    "requiredPasses": [
+      "file://h?x=[file://<path>&later\\<path>?key=C:<path>?key=<path>]]",
+      "file://h?x=[file://<path>&later\\<path>?key=C:<path>?key=<path>]]",
+      "file://h?x=[file://<path>&later\\<path>?key=C:<path>?key=<path>]]"
+    ]
+  },
+  {
+    "name": "B-file",
+    "mode": "refuse",
+    "input": "file://h?x=[file:///Users/CHILD/x&/Users/alice/s[file:///b?key=C:/]]",
+    "requiredPasses": [
+      "file://h?x=[file://<path>&<path>?key=<path>]]",
+      "file://h?x=[file://<path>&<path>?key=<path>]]",
+      "file://h?x=[file://<path>&<path>?key=<path>]]"
+    ]
+  },
+  {
+    "name": "B-mixed-file",
+    "mode": "refuse",
+    "input": "file://h?x=[file:///Users/CHILD/x&later\\/home/alice/s([file:///b?key=C:/]",
+    "requiredPasses": [
+      "file://h?x=[file://<path>&later\\<path>file://<path>?key=<path>]",
+      "file://h?x=[file://<path>&later\\<path>file://<path>?key=<path>]",
+      "file://h?x=[file://<path>&later\\<path>file://<path>?key=<path>]"
+    ]
+  },
+  {
+    "name": "B-prior-root",
+    "mode": "refuse",
+    "input": "file://h?x=[file:///Users/CHILD/x&later\\/home/alice/s([https://other&/Users/S0/x?key=C:/]",
+    "requiredPasses": [
+      "file://h?x=[file://<path>&later\\<path>&<path>?key=<path>]",
+      "file://h?x=[file://<path>&later\\<path>&<path>?key=<path>]",
+      "file://h?x=[file://<path>&later\\<path>&<path>?key=<path>]"
+    ]
+  },
+  {
+    "name": "B-prior-drive",
+    "mode": "refuse",
+    "input": "file://h?x=[file:///Users/CHILD/x&later\\/home/alice/s([https://other#C:/x?key=D:/]",
+    "requiredPasses": [
+      "file://h?x=[file://<path>&later\\<path>#<path>?key=<path>]",
+      "file://h?x=[file://<path>&later\\<path>#<path>?key=<path>]",
+      "file://h?x=[file://<path>&later\\<path>#<path>?key=<path>]"
+    ]
+  },
+  {
+    "name": "B-good",
+    "mode": "target",
+    "input": "file://h?x=[file:///Users/CHILD/x&later\\/home/alice/s([https://other?key=C:/]",
+    "requiredPasses": [
+      "file://h?x=[file://<path>&later\\<path>?key=C:<path>]",
+      "file://h?x=[file://<path>&later\\<path>?key=C:<path>]",
+      "file://h?x=[file://<path>&later\\<path>?key=C:<path>]"
+    ]
+  },
+  {
+    "name": "B-copy-good",
+    "mode": "target",
+    "input": "file://h?x=[file:///Users/CHILD/x&later\\/home/alice/s([https://other?key=C:/]&later\\/home/bob/s([https://other?key=D:/]",
+    "requiredPasses": [
+      "file://h?x=[file://<path>&later\\<path>?key=C:<path>]&later<path>?key=D:<path>]",
+      "file://h?x=[file://<path>&later\\<path>?key=C:<path>]&later<path>?key=D:<path>]",
+      "file://h?x=[file://<path>&later\\<path>?key=C:<path>]&later<path>?key=D:<path>]"
+    ]
+  },
+  {
+    "name": "C-file-host",
+    "mode": "copy-refuse",
+    "input": "file://h?x=[file:///Users/CHILD/x&later\\/home/alice/s([https://other&C:/Users/K/x]&later\\/home/bob/s[file://srv.corp/share&M:/Users/K/x]",
+    "requiredPasses": [
+      "file://h?x=[file://<path>&later\\<path>&C:<path>]&later\\/home/bob/s[file://srv.corp<path>&M:/Users/K/x]",
+      "file://h?x=[file://<path>&later\\<path>&C:<path>]&later\\<path><path>&M:<path>]",
+      "file://h?x=[file://<path>&later\\<path>&C:<path>]&later\\<path><path>&M:<path>]"
+    ]
+  },
+  {
+    "name": "C-file-plain",
+    "mode": "refuse",
+    "input": "file://h?x=[file:///Users/CHILD/x&later\\/home/alice/s([https://other&plain]&later\\/home/bob/s([file:///b?key=C:/Users/Q/y]",
+    "requiredPasses": [
+      "file://h?x=[file://<path>&later\\<path>&plain]&later\\/home/bob/s([file://<path>?key=C:/Users/Q/y]",
+      "file://h?x=[file://<path>&later\\<path>&plain]&later\\<path><path>?key=C:<path>]",
+      "file://h?x=[file://<path>&later\\<path>&plain]&later\\<path><path>?key=C:<path>]"
+    ]
+  },
+  {
+    "name": "C-interposed-file",
+    "mode": "refuse",
+    "input": "file://h?x=[file:///Users/CHILD/x&later\\/home/alice/s([https://other&C:/]&later\\/home/bob/file:///x([https://other?key=C:/Users/Q/y]",
+    "requiredPasses": [
+      "file://h?x=[file://<path>&later\\<path>&<path>]&later\\/home/bob/file://<path>?key=C:<path>]",
+      "file://h?x=[file://<path>&later\\<path>&<path>]&later\\<path><path>?key=C:<path>]",
+      "file://h?x=[file://<path>&later\\<path>&<path>]&later\\<path><path>?key=C:<path>]"
+    ]
+  },
+  {
+    "name": "C-preexisting-file",
+    "mode": "target",
+    "input": "file://h?x=[file:///Users/CHILD/x&later\\/home/alice/s([https://other?key=/Users/S0/x]&later\\/home/bob/s([file:///b?key=M:/Users/K/x]",
+    "requiredPasses": [
+      "file://h?x=[file://<path>&later\\<path>?key=<path>]&later<path>file://<path>?key=M:<path>]",
+      "file://h?x=[file://<path>&later\\<path>?key=<path>]&later<path>file://<path>?key=M:<path>]",
+      "file://h?x=[file://<path>&later\\<path>?key=<path>]&later<path>file://<path>?key=M:<path>]"
+    ]
+  },
+  {
+    "name": "D-comma",
+    "mode": "refuse",
+    "input": "file://h?x=[file:///Users/CHILD/x&/Users/alice/s[file:///b,https://pub.test/x?key=C:/Users/K/x]]",
+    "requiredPasses": [
+      "file://h?x=[file://<path>&<path>,https://pub.test/x?key=<path>]]",
+      "file://h?x=[file://<path>&<path>,https://pub.test/x?key=<path>]]",
+      "file://h?x=[file://<path>&<path>,https://pub.test/x?key=<path>]]"
+    ]
+  },
+  {
+    "name": "D-semicolon",
+    "mode": "refuse",
+    "input": "file://h?x=[file:///Users/CHILD/x&later\\/home/alice/s([https://other;C://srv/x&C:/Users/K/x]",
+    "requiredPasses": [
+      "file://h?x=[file://<path>&later\\<path>;C://srv/x&<path>]",
+      "file://h?x=[file://<path>&later\\<path>;C://srv/x&<path>]",
+      "file://h?x=[file://<path>&later\\<path>;C://srv/x&<path>]"
+    ]
+  },
+  {
+    "name": "D-bang",
+    "mode": "refuse",
+    "input": "file://h?x=[file:///Users/CHILD/x&later\\/home/alice/s([https://other!C://srv/x&C:/Users/K/x]",
+    "requiredPasses": [
+      "file://h?x=[file://<path>&later\\<path>!C://srv/x&<path>]",
+      "file://h?x=[file://<path>&later\\<path>!C://srv/x&<path>]",
+      "file://h?x=[file://<path>&later\\<path>!C://srv/x&<path>]"
+    ]
+  },
+  {
+    "name": "E-owner",
+    "mode": "refuse",
+    "input": "file://h?x=[file:///Users/CHILD/x&/https://Users/alice/s[file:///b&C:/Users/c([https://i?key=/Users/I/s]]]",
+    "requiredPasses": [
+      "file://h?x=[file://<path>&<path>https://Users/alice/s[file://<path>&<path>?key=<path>]]]",
+      "file://h?x=[file://<path>&<path>https://Users/alice/s[file://<path>&<path>?key=<path>]]]",
+      "file://h?x=[file://<path>&<path>https://Users/alice/s[file://<path>&<path>?key=<path>]]]"
+    ]
+  },
+  {
+    "name": "E-owner-flat",
+    "mode": "refuse",
+    "input": "file://h?x=[file:///Users/CHILD/x&/https://Users/alice/s[file:///b&C:/Users/c]]",
+    "requiredPasses": [
+      "file://h?x=[file://<path>&<path>&<path>]]",
+      "file://h?x=[file://<path>&<path>&<path>]]",
+      "file://h?x=[file://<path>&<path>&<path>]]"
+    ]
+  },
+  {
+    "name": "E-gap",
+    "mode": "refuse",
+    "input": "file://h?x=[file:///Users/CHILD/x&later\\/home/alice/s()[https://other?key=C:/]",
+    "requiredPasses": [
+      "file://h?x=[file://<path>&later\\<path>?key=<path>]",
+      "file://h?x=[file://<path>&later\\<path>?key=<path>]",
+      "file://h?x=[file://<path>&later\\<path>?key=<path>]"
+    ]
+  },
+  {
+    "name": "E-copy-gap",
+    "mode": "deferred-copy",
+    "input": "file://h?x=[file:///Users/CHILD/x&later\\/home/alice/s([https://other?key=C:/]&later\\/home/bob/s(x)([https://other?key=C:/]",
+    "requiredPasses": [
+      "file://h?x=[file://<path>&later\\<path>?key=C:<path>]&later<path>?key=C:/]",
+      "file://h?x=[file://<path>&later\\<path>?key=C:<path>]&later<path>?key=C:/]",
+      "file://h?x=[file://<path>&later\\<path>?key=C:<path>]&later<path>?key=C:/]"
+    ]
+  }
+]
