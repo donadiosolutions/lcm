@@ -5,6 +5,7 @@ import { join } from "node:path";
 import { runInNewContext } from "node:vm";
 import { load as loadYaml } from "js-yaml";
 import { describe, expect, it } from "vitest";
+import { evaluateAuthoredControls } from "../.github/scripts/external-admission-policy.mjs";
 
 interface WorkflowStep {
   if?: string;
@@ -66,6 +67,64 @@ interface EventFixture {
 
 const HEAD_SHA = "a".repeat(40);
 const REPOSITORY = "donadiosolutions/lcm";
+function immutableControlFixture(changed = false) {
+  const baseSha = "b".repeat(40);
+  const ancestorSha = "c".repeat(40);
+  const ancestorTreeSha = "d".repeat(40);
+  const headTreeSha = "e".repeat(40);
+  return {
+    repository: REPOSITORY, prNumber: "123", headSha: HEAD_SHA, baseRef: "main", baseSha,
+    compare: { base_commit: { sha: baseSha }, head_commit: { sha: HEAD_SHA }, merge_base_commit: { sha: ancestorSha } },
+    ancestorCommit: { sha: ancestorSha, tree: { sha: ancestorTreeSha } },
+    headCommit: { sha: HEAD_SHA, tree: { sha: headTreeSha } },
+    ancestorTree: { sha: ancestorTreeSha, truncated: false, tree: [] },
+    headTree: { sha: headTreeSha, truncated: false, tree: changed
+      ? [{ path: "package.json", mode: "100644", type: "blob", sha: "1".repeat(40) }] : [] },
+  };
+}
+const authoredControlDigest = evaluateAuthoredControls(immutableControlFixture(true)).digest;
+const immutableGhFixtures = `
+endpoint=""
+for argument in "$@"; do
+  if [[ "$argument" == repos/* ]]; then endpoint="$argument"; fi
+done
+if [[ "$endpoint" == repos/*/commits/*/statuses?* ]]; then
+  if [[ -n "\${CONTROL_STATUSES_FILE:-}" ]]; then cat "$CONTROL_STATUSES_FILE"; else printf '[]\\n'; fi
+  exit 0
+fi
+if [[ "$endpoint" == repos/*/compare/* ]]; then
+  ancestor="$(jq -r '.compare.merge_base_commit.sha' <<< "$IMMUTABLE_CONTROL_FIXTURE")"
+  if [[ -n "\${COMPARE_CALLS:-}" ]]; then
+    read -r call_count < "$COMPARE_CALLS"
+    call_count=$((call_count + 1))
+    printf '%s\\n' "$call_count" > "$COMPARE_CALLS"
+    ancestor="$(jq -r --argjson index "$((call_count - 1))" '.[$index] // .[-1]' <<< "$MERGE_BASE_SEQUENCE")"
+  fi
+  if [[ -n "\${IMMUTABLE_API_ERROR:-}" ]]; then
+    if [[ "$IMMUTABLE_API_ERROR" == transport ]]; then exit 70; fi
+    if [[ "$IMMUTABLE_API_ERROR" == malformed ]]; then printf '{bad'; exit 0; fi
+    if [[ "$IMMUTABLE_API_ERROR" == rate403 ]]; then
+      printf 'HTTP/2 403 Error\\nX-RateLimit-Remaining: 0\\n\\n{}\\n'
+      exit 1
+    fi
+    printf 'HTTP/2 %s Error\\nContent-Type: application/json\\n\\n{}\\n' "$IMMUTABLE_API_ERROR"
+    exit 1
+  fi
+  jq -c --arg ancestor "$ancestor" '.compare | .merge_base_commit.sha=$ancestor' <<< "$IMMUTABLE_CONTROL_FIXTURE"
+  exit 0
+fi
+if [[ "$endpoint" == repos/*/git/commits/* ]]; then
+  commit="\${endpoint##*/}"
+  jq -c --arg commit "$commit" 'if .headCommit.sha==$commit then .headCommit else .ancestorCommit | .sha=$commit end' <<< "$IMMUTABLE_CONTROL_FIXTURE"
+  exit 0
+fi
+if [[ "$endpoint" == repos/*/git/trees/* ]]; then
+  tree="\${endpoint##*/}"
+  tree="\${tree%%\\?*}"
+  jq -c --arg tree "$tree" 'if .headTree.sha==$tree then .headTree else .ancestorTree end' <<< "$IMMUTABLE_CONTROL_FIXTURE"
+  exit 0
+fi
+`;
 
 function makeEventFixture(
   name: string,
@@ -315,6 +374,7 @@ function runWithFailingAdmissionCommand(
   try {
     writeFileSync(ghPath, `#!/usr/bin/env bash
 set -euo pipefail
+${immutableGhFixtures}
 if [[ "$*" == *"/statuses/"* ]]; then
   printf '%s\\n' "$*" >> "$STATUS_LOG"
   exit 0
@@ -336,7 +396,7 @@ if [[ "$*" == *"/pulls/123"* ]]; then
   exit 0
 fi
 if [[ "$*" == *"/branches/"* ]]; then
-  printf '%s\\n' '{"protected":true}'
+  printf '%s\\n' '{"protected":true,"commit":{"sha":"bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"}}'
   exit 0
 fi
 if [[ "$*" == *"check-runs?filter=latest&per_page=100"* ]]; then
@@ -393,7 +453,7 @@ if [[ "$2" == "evaluate-pr" ]]; then
   printf '%s\\n' '{"eligible":true}'
   exit 0
 fi
-exit 99
+exec ${JSON.stringify(process.execPath)} "$@"
 `);
       chmodSync(nodePath, 0o755);
     }
@@ -409,10 +469,10 @@ if [[ -f "$JQ_CALL_LOG" ]]; then
 fi
 call_count=$((call_count + 1))
 printf '%s\\n' "$call_count" > "$JQ_CALL_LOG"
-if [[ "$FAIL_ADMISSION_COMMAND" == eligibility-jq && "$call_count" == 5 ]]; then
+if [[ "$FAIL_ADMISSION_COMMAND" == eligibility-jq && "$*" == *'.reason // empty'* ]]; then
   exit 73
 fi
-if [[ "$FAIL_ADMISSION_COMMAND" == validator-jq && "$call_count" == 10 ]]; then
+if [[ "$FAIL_ADMISSION_COMMAND" == validator-jq && "$*" == *'.operation'* ]]; then
   exit 72
 fi
 if [[ "$FAIL_ADMISSION_COMMAND" == checks-ready-jq && "$1" == "-r" && "$2" == ".ready" ]]; then
@@ -441,8 +501,10 @@ exec /usr/bin/jq "$@"
         ...process.env,
         EVENT_HEAD_SHA: headSha,
         EVENT_SOURCE: "repository_dispatch",
+        EVENT_ACTION: "external-admission-reconcile",
         EVENT_WORKFLOW_RUN_ID: "",
         FAIL_ADMISSION_COMMAND: command,
+        IMMUTABLE_CONTROL_FIXTURE: JSON.stringify(immutableControlFixture()),
         JQ_CALL_LOG: jqCallLogPath,
         PATH: `${directory}:${process.env.PATH ?? ""}`,
         REPOSITORY: "example/repository",
@@ -476,6 +538,7 @@ type AdmissionScenario =
   | "unprotected-maintenance"
   | "invalid-or-changed-base"
   | "transient-base"
+  | "rate-limited-base"
   | "mixed-deleted-base"
   | "duplicate-base-candidates";
 
@@ -513,6 +576,17 @@ function makeAdmissionPullRequest({
 function runAdmissionScenario(
   scenario: AdmissionScenario,
   eligibilityVariant: AdmissionEligibilityVariant = "wrong-base-repository",
+  control: {
+    operation?: "authorize" | "revoke";
+    senderId?: string;
+    digest?: string;
+    statuses?: Record<string, unknown>[];
+    mergeBases?: string[];
+    apiError?: string;
+    closed?: boolean;
+    ciFailure?: boolean;
+    readbackMissing?: boolean;
+  } = {},
 ) {
   const directory = mkdtempSync(join(tmpdir(), "external-admission-scenario-"));
   const ghPath = join(directory, "gh");
@@ -521,6 +595,8 @@ function runAdmissionScenario(
   const checkRunCallsPath = join(directory, "check-run-calls.log");
   const fileCallsPath = join(directory, "file-calls.log");
   const statusLogPath = join(directory, "statuses.log");
+  const controlStatusesPath = join(directory, "control-statuses.json");
+  const compareCallsPath = join(directory, "compare-calls.log");
   const headSha = "a".repeat(40);
   const ciRunId = "123";
   const ciCheckRun = {
@@ -686,6 +762,8 @@ function runAdmissionScenario(
     }
   } else if (scenario === "transient-base") {
     branchProtectionSequence = ["503"];
+  } else if (scenario === "rate-limited-base") {
+    branchProtectionSequence = ["rate403"];
   } else if (scenario === "mixed-deleted-base") {
     associatedPullRequests = [
       makeAdmissionPullRequest({ number: 122, baseRef: "maintenance/1.4.x" }),
@@ -702,10 +780,13 @@ function runAdmissionScenario(
     pullRequest = makeAdmissionPullRequest({ number: 123, baseRef: "main" });
     branchProtectionSequence = ["true"];
   }
+  if (control.closed) pullRequest = { ...pullRequest, state: "closed" };
+  if (control.ciFailure) ciCheckRun.conclusion = "failure";
 
   try {
     writeFileSync(ghPath, `#!/usr/bin/env bash
 set -euo pipefail
+${immutableGhFixtures}
 endpoint=""
 for argument in "$@"; do
   if [[ "$argument" == repos/* ]]; then endpoint="$argument"; fi
@@ -713,13 +794,26 @@ done
 if [[ "$endpoint" == repos/*/statuses/* ]]; then
   state=""
   description=""
+  context=""
+  target_url=""
   for argument in "$@"; do
     case "$argument" in
       state=*) state="\${argument#state=}" ;;
       description=*) description="\${argument#description=}" ;;
+      context=*) context="\${argument#context=}" ;;
+      target_url=*) target_url="\${argument#target_url=}" ;;
     esac
   done
   printf '%s\t%s\n' "$state" "$description" >> "$STATUS_LOG"
+  if [[ "$CONTROL_READBACK_MISSING" != true ]]; then
+    next_id="$(jq '[.[].id,0] | max + 1' "$CONTROL_STATUSES_FILE")"
+    record="$(jq -cn --argjson id "$next_id" --arg state "$state" --arg context "$context" \
+      --arg description "$description" --arg target_url "$target_url" \
+      --arg url "https://example.test/api/v3/repos/$REPOSITORY/statuses/$EVENT_HEAD_SHA" \
+      '{id:$id,state:$state,context:$context,description:$description,target_url:$target_url,url:$url,creator:{id:41898282,login:"github-actions[bot]"}}')"
+    jq --argjson record "$record" '[$record] + .' "$CONTROL_STATUSES_FILE" > "$CONTROL_STATUSES_FILE.next"
+    mv "$CONTROL_STATUSES_FILE.next" "$CONTROL_STATUSES_FILE"
+  fi
   exit 0
 fi
 if [[ "$endpoint" == repos/*/commits/*/pulls?per_page=100 ]]; then
@@ -763,7 +857,11 @@ fi
     printf 'HTTP/2 503 Service Unavailable\nContent-Type: application/json\n\n{"message":"Service Unavailable"}\n'
     exit 1
   fi
-  printf '{"protected":%s}\n' "\${protection[index]}"
+  if [[ "\${protection[index]}" == rate403 ]]; then
+    printf 'HTTP/2 403 Forbidden\nX-RateLimit-Remaining: 0\n\n{"message":"Forbidden"}\n'
+    exit 1
+  fi
+  printf '{"protected":%s,"commit":{"sha":"bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"}}\n' "\${protection[index]}"
   exit 0
 fi
 if [[ "$endpoint" == *"check-runs?filter=latest&per_page=100" ]]; then
@@ -788,6 +886,8 @@ exit 99
     writeFileSync(checkRunCallsPath, "0\n");
     writeFileSync(fileCallsPath, "0\n");
     writeFileSync(statusLogPath, "");
+    writeFileSync(controlStatusesPath, JSON.stringify(control.statuses ?? []));
+    writeFileSync(compareCallsPath, "0\n");
 
     const result = spawnSync("bash", [evaluatorPath], {
       encoding: "utf8",
@@ -804,8 +904,18 @@ exit 99
           checkRunSnapshots.map((snapshot) => [{ check_runs: snapshot }]),
         ),
         CI_RUNS_JSON: JSON.stringify(ciRuns),
+        CONTROL_STATUSES_FILE: controlStatusesPath,
+        COMPARE_CALLS: compareCallsPath,
+        MERGE_BASE_SEQUENCE: JSON.stringify(control.mergeBases ?? ["c".repeat(40)]),
+        IMMUTABLE_CONTROL_FIXTURE: JSON.stringify(immutableControlFixture(scenario === "sensitive-looking-paths")),
+        CONTROL_READBACK_MISSING: String(control.readbackMissing ?? false),
+        IMMUTABLE_API_ERROR: control.apiError ?? "",
         EVENT_HEAD_SHA: headSha,
         EVENT_SOURCE: eventSource,
+        EVENT_ACTION: control.operation ? `external-admission-control-${control.operation}` : "external-admission-reconcile",
+        EVENT_SENDER_ID: control.senderId ?? "1458878",
+        EVENT_PR_NUMBER: control.operation ? "123" : "",
+        EVENT_CONTROL_DIGEST: control.digest ?? "",
         EVENT_CHECK_RUN_ACTION: eventCheckRunAction,
         EVENT_CHECK_RUN_ID: eventCheckRunId,
         EVENT_WORKFLOW_RUN_ACTION: eventWorkflowRunAction,
@@ -815,7 +925,7 @@ exit 99
         PATH: `${directory}:${process.env.PATH ?? ""}`,
         PULL_REQUEST_JSON: JSON.stringify(pullRequest),
         REPOSITORY,
-        RUN_URL: "https://example.test/run/1",
+        RUN_URL: `https://example.test/${REPOSITORY}/actions/runs/42`,
         SERVER_URL: "https://example.test",
         STATUS_LOG: statusLogPath,
       },
@@ -826,6 +936,9 @@ exit 99
       branchCalls: Number(readFileSync(branchCallsPath, "utf8").trim()),
       branchRequests: readFileSync(branchRequestsPath, "utf8").trim().split("\n").filter(Boolean),
       fileCalls: Number(readFileSync(fileCallsPath, "utf8").trim()),
+      controlStatuses: JSON.parse(readFileSync(controlStatusesPath, "utf8")) as Record<string, unknown>[],
+      compareCalls: Number(readFileSync(compareCallsPath, "utf8").trim()),
+      checkRunCalls: Number(readFileSync(checkRunCallsPath, "utf8").trim()),
     };
   } finally {
     rmSync(directory, { force: true, recursive: true });
@@ -917,12 +1030,98 @@ describe("external admission workflow", () => {
       .toBe(true);
   });
 
-  it("admits sensitive-looking paths with CI and DCO alone without listing files", () => {
+  it("holds authored package controls for exact-digest authorization without listing mutable PR files", () => {
     const { result, statuses, fileCalls } = runAdmissionScenario("sensitive-looking-paths");
     expect(result.status, `${result.stdout}\n${result.stderr}`).toBe(0);
-    expect(statuses.at(-1)?.split("\t", 1)[0]).toBe("success");
-    expect(statuses.at(-1)).toContain("CI and DCO passed");
+    expect(statuses.at(-1)?.split("\t", 1)[0]).toBe("pending");
+    expect(statuses.at(-1)).toContain("authored-control authorization");
     expect(fileCalls).toBe(0);
+    expect(result.stdout).toContain(`: ${authoredControlDigest} (changed=true)`);
+  });
+
+  it.each([false, true])("authorizes the exact recomputed digest while preserving CI failure=%s", (ciFailure) => {
+      const authorized = runAdmissionScenario("sensitive-looking-paths", undefined, {
+        operation: "authorize", digest: authoredControlDigest, ciFailure,
+      });
+      const evidence = `${authorized.result.stdout}\n${authorized.result.stderr}`;
+      expect(authorized.result.status, evidence).toBe(ciFailure ? 2 : 0);
+      expect(authorized.controlStatuses.some((record) => record.context === "external-admission-control-authorized"
+        && record.state === "success" && record.description === `controls-v1:${authoredControlDigest}`
+        && record.url === `https://example.test/api/v3/repos/${REPOSITORY}/statuses/${HEAD_SHA}`), evidence).toBe(true);
+      expect(authorized.statuses.at(-1)?.split("\t", 1)[0], evidence).toBe(ciFailure ? "failure" : "success");
+      expect(authorized.fileCalls).toBe(0);
+  });
+
+  it("recovers authored controls using the sticky authenticated exact PR/head/digest receipt", () => {
+    const receipt = { id: 1, context: "external-admission-control-authorized", state: "success",
+      description: `controls-v1:${authoredControlDigest}`, creator: { id: 41898282, login: "github-actions[bot]" },
+      url: `https://example.test/api/v3/repos/${REPOSITORY}/statuses/${HEAD_SHA}`,
+      target_url: `https://example.test/${REPOSITORY}/actions/runs/41` };
+    const sticky = runAdmissionScenario("sensitive-looking-paths", undefined, { statuses: [receipt] });
+    expect(sticky.result.status, sticky.result.stderr).toBe(0);
+    expect(sticky.statuses.at(-1)?.split("\t", 1)[0], sticky.result.stderr).toBe("success");
+    expect(sticky.fileCalls).toBe(0);
+  });
+
+  it("rejects wrong dispatch senders and digest challenges without publishing authorization", () => {
+    for (const control of [{ operation: "authorize", digest: "f".repeat(64), senderId: "42" },
+      { operation: "authorize", digest: "f".repeat(64) }, { operation: "revoke", senderId: "42" }] as const) {
+      const denied = runAdmissionScenario("sensitive-looking-paths", undefined, control);
+      expect(denied.controlStatuses.some((record) => record.context === "external-admission-control-authorized"
+        || record.context === "external-admission-control-revoked")).toBe(false);
+      expect(denied.statuses.at(-1)?.split("\t", 1)[0]).toBe("failure");
+    }
+  });
+
+  it("revokes a closed exact PR/head before eligibility, controls and CI, then refuses delayed authorize and recovery", () => {
+    const revoked = runAdmissionScenario("protected-main", undefined, { operation: "revoke", closed: true, ciFailure: true });
+    const evidence = `${revoked.result.stdout}\n${revoked.result.stderr}`;
+    expect(revoked.result.status, evidence).toBe(0);
+    expect(revoked.result.stdout).toContain("read back");
+    expect(revoked.branchCalls).toBe(0);
+    expect(revoked.compareCalls).toBe(0);
+    expect(revoked.checkRunCalls).toBe(0);
+    expect(revoked.controlStatuses.some((record) => record.context === "external-admission-control-revoked"
+      && record.state === "failure")).toBe(true);
+    const laterReceipt = { ...revoked.controlStatuses[0], id: 100,
+      context: "external-admission-control-authorized", state: "success", description: `controls-v1:${"f".repeat(64)}` };
+    const history = [laterReceipt, ...revoked.controlStatuses];
+    for (const scenario of ["protected-main", "sensitive-looking-paths"] as const) {
+      for (const operation of [undefined, "authorize"] as const) {
+        const delayed = runAdmissionScenario(scenario, undefined, { operation, digest: "f".repeat(64), statuses: history });
+        expect(delayed.result.status, delayed.result.stderr).toBe(0);
+        expect(delayed.statuses.at(-1)).toContain("permanently revoked");
+        expect(delayed.compareCalls).toBe(0);
+        expect(delayed.checkRunCalls).toBe(0);
+      }
+    }
+  });
+
+  it("keeps an uncertain revoke readback failed and instructs the operator to keep the PR closed", () => {
+    const uncertain = runAdmissionScenario("protected-main", undefined, { operation: "revoke", closed: true, readbackMissing: true });
+    expect(uncertain.result.status).not.toBe(0);
+    expect(uncertain.result.stderr).toContain("keep the PR closed");
+    expect(uncertain.statuses.at(-1)?.split("\t", 1)[0]).toBe("failure");
+  });
+
+  it.each([1, 2])("keeps authored ancestor drift at snapshot %s pending", (index) => {
+    const bases = Array.from({ length: 3 }, (_, position) => (position >= index ? "f" : "c").repeat(40));
+    const drift = runAdmissionScenario("protected-main", undefined, { mergeBases: bases });
+    expect(drift.result.status, `${drift.result.stdout}\n${drift.result.stderr}`).toBe(0);
+    expect(drift.statuses.at(-1)?.split("\t", 1)[0]).toBe("pending");
+    expect(drift.statuses.at(-1)).toContain("evidence changed");
+  });
+
+  it.each(["404", "403", "429", "500", "503", "rate403", "transport", "malformed"])("classifies immutable API error %s without treating it as an empty safe tree", (apiError) => {
+    const unavailable = runAdmissionScenario("protected-main", undefined, { apiError });
+    if (apiError === "malformed") {
+      expect(unavailable.result.status, unavailable.result.stderr).not.toBe(0);
+      expect(unavailable.result.stderr).toContain("parse error");
+    } else {
+      expect(unavailable.result.status, unavailable.result.stderr).toBe(0);
+    }
+    expect(unavailable.statuses.at(-1)?.split("\t", 1)[0]).toBe(["404", "403", "malformed"].includes(apiError) ? "failure" : "pending");
+    expect(unavailable.checkRunCalls).toBe(0);
   });
 
   it("terminalizes an unprotected maintenance/1.4.x pull request", () => {
@@ -975,6 +1174,15 @@ describe("external admission workflow", () => {
     expect(statuses.some((status) => status.startsWith("success\t"))).toBe(false);
   });
 
+  it("keeps a capital-L X-RateLimit-Remaining branch response pending", () => {
+    const { result, statuses, checkRunCalls } = runAdmissionScenario("rate-limited-base");
+    expect(result.status, `${result.stdout}\n${result.stderr}`).toBe(0);
+    expect(statuses.at(-1)?.split("\t", 1)[0]).toBe("pending");
+    expect(statuses.at(-1)).toContain("Base branch protection is temporarily unavailable");
+    expect(statuses.some((status) => status.startsWith("success\t"))).toBe(false);
+    expect(checkRunCalls).toBe(0);
+  });
+
   it("ignores a deleted historical base when one valid PR remains", () => {
     const { result, statuses, branchRequests } = runAdmissionScenario("mixed-deleted-base");
     const evidence = `${result.stdout}\n${result.stderr}\n${statuses.join("\n")}\n${branchRequests.join("\n")}`;
@@ -994,7 +1202,7 @@ describe("external admission workflow", () => {
   it("uses DCO, trusted CI, and default-branch reconciliation with least privilege", () => {
     expect(workflow.on).toEqual({
       check_run: { types: ["created", "rerequested", "completed"] },
-      repository_dispatch: { types: ["external-admission-reconcile"] },
+      repository_dispatch: { types: ["external-admission-reconcile", "external-admission-control-authorize", "external-admission-control-revoke"] },
       workflow_run: {
         workflows: ["CI"],
         types: ["requested", "in_progress", "completed"],
@@ -1118,7 +1326,7 @@ describe("external admission workflow", () => {
 
   it("isolates rejected workflow runs from exact-SHA concurrency", () => {
     const group = workflow.concurrency.group;
-    expect(workflow.concurrency["cancel-in-progress"]).toBe(true);
+    expect(workflow.concurrency["cancel-in-progress"]).toBe(false);
     for (const condition of [
       "github.event.workflow_run.name == 'CI'",
       "github.event.workflow_run.event == 'pull_request'",
@@ -1164,7 +1372,7 @@ describe("external admission workflow", () => {
     expect(evaluator).toContain("dcoCheckRunId");
     expect(evaluator).toContain("ciRunId");
     expect(evaluator).toContain(
-      "'{ciCheckRunId:$ciCheckRunId,dcoCheckRunId:$dcoCheckRunId,ciRunId:$ciRunId}'",
+      "'{ciCheckRunId:$ciCheckRunId,dcoCheckRunId:$dcoCheckRunId,ciRunId:$ciRunId,controls:$controls,authorization:$authorization}'",
     );
     expect(evaluator).toContain('validate_required_snapshot "Initial" initial_admission_fingerprint');
     expect(evaluator).toContain('validate_required_snapshot "Current" current_admission_fingerprint');
@@ -1178,7 +1386,7 @@ describe("external admission workflow", () => {
     expect(evaluator).not.toContain("evaluate-dependabot-pr");
     expect(evaluator).not.toContain("evaluate-dependabot-commits");
     expect(evaluator).not.toContain("evaluate-sensitive-admission");
-    expect(evaluator).not.toContain("/git/trees/");
+    expect(evaluator).toContain("/git/trees/");
     expect(evaluator).not.toContain("/reviews");
   });
 
@@ -1186,7 +1394,7 @@ describe("external admission workflow", () => {
     expect(evaluator).not.toContain("validate_or_exit");
     for (const phase of ["Initial", "Current", "Final"]) {
       expect(evaluator).toMatch(new RegExp(
-        `^validate_required_snapshot "${phase}" [a-z_]+$`,
+        `^validate_required_snapshot "${phase}" [a-z_]+ "\\$[a-z_]+"$`,
         "mu",
       ));
       expect(evaluator).not.toMatch(new RegExp(
