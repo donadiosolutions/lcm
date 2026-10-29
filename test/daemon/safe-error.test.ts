@@ -1,4 +1,5 @@
 import { describe, it, expect, vi } from "vitest";
+import { readFileSync } from "node:fs";
 import { sanitizeError } from "../../src/daemon/safe-error.js";
 
 describe("sanitizeError", () => {
@@ -5253,9 +5254,9 @@ describe("sanitizeError", () => {
         "file://h?x=[file://<path>&later\\<path>?key=<path>]",
       ],
       [
-        "drive query value uses X1",
+        "drive query value keeps its letter in a bracket owned through the mixed successor (#1817)",
         mixedSuccessorPrefix + "([https://other?key=C:/Users/SECRET2/x]",
-        "file://h?x=[file://<path>&later\\<path>?key=<path>]",
+        "file://h?x=[file://<path>&later\\<path>?key=C:<path>]",
       ],
       [
         "colon-single-slash query value",
@@ -6089,6 +6090,935 @@ describe("sanitizeError", () => {
       expect(first).toBe(expected);
       expect(second).toBe(expected);
       expect(third).toBe(expected);
+    });
+  });
+
+  describe("Bug #1817", () => {
+    const assertStable = (input: string, expected: string): void => {
+      const first = sanitizeError(input);
+      const second = sanitizeError(first);
+      const third = sanitizeError(second);
+
+      expect(first).toBe(expected);
+      expect(second).toBe(expected);
+      expect(third).toBe(expected);
+    };
+
+    const mixedPrefix =
+      "file://h?x=[file:///Users/CHILD/x&later\\/home/alice/s([https://other?";
+    const mixedExpected = "file://h?x=[file://<path>&later\\<path>?";
+    const round3Cases = JSON.parse(
+      readFileSync(new URL("../fixtures/safe-error-1817-round3.json", import.meta.url), "utf8"),
+    ) as Array<{
+      name: string;
+      input: string;
+      requiredPasses: readonly [string, string, string];
+    }>;
+
+    it.each(round3Cases)("pins the final component grammar: $name", ({ input, requiredPasses }) => {
+      const first = sanitizeError(input);
+      const second = sanitizeError(first);
+      const third = sanitizeError(second);
+
+      expect(first).toBe(requiredPasses[0]);
+      expect(second).toBe(requiredPasses[1]);
+      expect(third).toBe(requiredPasses[2]);
+    });
+
+    it.each([
+      ["upper-case C", "C:/Users/SECRET2/x", "C:<path>"],
+      ["lower-case c", "c:/Users/SECRET2/x", "c:<path>"],
+      ["upper-case D", "D:/Users/SECRET2/x", "D:<path>"],
+    ] as const)("keeps the %s drive letter in a mixed-successor bracket", (_name, value, expected) => {
+      assertStable(mixedPrefix + "key=" + value + "]", mixedExpected + "key=" + expected + "]");
+    });
+
+    it("keeps an independent second drive value", () => {
+      assertStable(
+        mixedPrefix + "key=/Users/SECRET2/x&k2=C:/Users/B/y]",
+        mixedExpected + "key=<path>&k2=C:<path>]",
+      );
+    });
+
+    it.each([
+      [
+        "two named drive values",
+        mixedPrefix + "key=C:/Users/S2/x&k2=D:/Users/B/y]",
+        mixedExpected + "key=C:<path>&k2=D:<path>]",
+      ],
+      [
+        "non-Users drive root",
+        mixedPrefix + "key=C:/var/data]",
+        mixedExpected + "key=C:<path>]",
+      ],
+      [
+        "drive value without an opening parenthesis",
+        "file://h?x=[file:///Users/CHILD/x&later\\/home/alice/s" +
+          "[https://other?key=C:/Users/K/x]",
+        "file://h?x=[file://<path>&later\\<path>?key=C:<path>]",
+      ],
+      [
+        "backslash continuation after the private-root segment",
+        "file://h?x=[file:///Users/CHILD/x&later\\/home\\alice/s" +
+          "([https://other?key=C:/Users/K/x]",
+        "file://h?x=[file://<path>&later\\<path>?key=C:<path>]",
+      ],
+      [
+        "drive fragment value",
+        "file://h?x=[file:///Users/CHILD/x&later\\/home/alice/s" +
+          "([https://other#C:/Users/K/x]",
+        "file://h?x=[file://<path>&later\\<path>#C:<path>]",
+      ],
+      [
+        "drive root without a path word",
+        mixedPrefix + "key=C:/]",
+        mixedExpected + "key=C:<path>]",
+      ],
+      [
+        "drive value before an inner bracket",
+        mixedPrefix + "key=C:/Users/K/x[https://inner?key=/home/C/s]]",
+        mixedExpected + "key=<path>?key=<path>]]",
+      ],
+      [
+        "drive value before trailing text",
+        mixedPrefix + "key=C:/Users/K/x] tail",
+        mixedExpected + "key=C:<path>] tail",
+      ],
+      [
+        "second mixed-successor copy",
+        mixedPrefix + "key=C:/Users/K/x]&later\\/home/bob/s" +
+          "([https://other?key=C:/Users/K/x]",
+        mixedExpected + "key=C:<path>]&later<path>?key=C:<path>]",
+      ],
+    ] as const)("keeps the drive spelling for the neighbour: %s", (_name, input, expected) => {
+      assertStable(input, expected);
+    });
+
+    it.each([
+      [
+        "rooted active-child owner",
+        "file://h?x=[file:///Users/CHILD/x&/Users/alice/s[file:///b&C:/Users/c]]",
+        "file://h?x=[file://<path>&<path>&C:<path>]]",
+      ],
+      [
+        "private-relative active-child owner",
+        "file://h?x=[file:///Users/CHILD/x&later/home/alice/s[file:///b&C:/Users/c]]",
+        "file://h?x=[file://<path>&later<path>&C:<path>]]",
+      ],
+      [
+        "later inherited successor owner",
+        "file://h?x=['https://outer.test/x?next=file:///Users/a/private.db'|" +
+          "\\Users\\CANARY\\x&second/Users/B/x[file:///b&C:/Users/c]]",
+        "file://h?x=['https://outer.test/x?next=file://<path>'|" +
+          "<path>&second<path>&C:<path>]]",
+      ],
+      [
+        "restarted wrapper owner",
+        "file://h?x=[a]\\b[file:///b&C:/Users/c]",
+        "file://h?x=[a]<path>&C:<path>]",
+      ],
+      [
+        "soft-whitespace owner",
+        "file://h?x=[file://host?key=/public]\\Users\\FIRST\\x\u00a0" +
+          "[file:///b&C:/Users/c]",
+        "file://h?x=[file://host?key=<path>]<path>&C:<path>]",
+      ],
+    ] as const)("keeps the independent drive spelling for a %s", (_name, input, expected) => {
+      assertStable(input, expected);
+    });
+
+    it.each([
+      [
+        "two drives in one nested file child",
+        "file://h?x=[file:///Users/CHILD/x&/Users/alice/s" +
+          "[file:///b&C:/Users/c&D:/Users/d]]",
+        "file://h?x=[file://<path>&<path>&C:<path>&D:<path>]]",
+      ],
+      [
+        "mixed successor before a nested file child",
+        "file://h?x=[file:///Users/CHILD/x&later\\/home/alice/s" +
+          "[file:///b&C:/Users/c]]",
+        "file://h?x=[file://<path>&later\\<path>file://<path>&C:<path>]]",
+      ],
+      [
+        "mixed successor containing a file literal",
+        "file://h?x=[file:///Users/CHILD/x&later\\/home/file:///Users/S/s" +
+          "([https://other?key=C:/Users/S2/x]",
+        "file://h?x=[file://<path>&later\\<path>file://<path>?key=C:<path>]",
+      ],
+    ] as const)("keeps the intersection target: %s", (_name, input, expected) => {
+      assertStable(input, expected);
+    });
+
+    it.each([
+      [
+        "repeated target after a hard separator",
+        mixedPrefix + "key=C:/Users/SECRET2/x]\n" + mixedPrefix + "key=C:/Users/SECRET2/x]",
+        mixedExpected + "key=C:<path>]\n" + mixedExpected + "key=C:<path>]",
+      ],
+      [
+        "target in a sibling bracket",
+        "file://h?x=[file:///Users/CHILD/x&later/home/alice/s" +
+          "[file:///b&C:/Users/c][file:///d&D:/Users/e]]",
+        "file://h?x=[file://<path>&later<path>&C:<path>]" +
+          "[file://<path>&D:<path>]]",
+      ],
+      [
+        "target before a second successor",
+        "file://h?x=[file:///Users/CHILD/x&later/home/alice/s" +
+          "[file:///b&C:/Users/c]&again/file:///d&D:/Users/e]",
+        "file://h?x=[file://<path>&later<path>&C:<path>]" +
+          "&again/file://<path>&D:<path>]",
+      ],
+    ] as const)("keeps an independent copy: %s", (_name, input, expected) => {
+      assertStable(input, expected);
+    });
+
+    it.each([
+      [
+        "genuine #1785 active-child drive",
+        "file://h?x=[file:///Users/CHILD/x&later/home/alice/s" +
+          "([https://other?key=C:/Users/SECRET2/x]",
+        "file://h?x=[file://<path>&later<path>?key=<path>]",
+      ],
+      [
+        "genuine #1785 soft-whitespace drive",
+        "file://h?x=[file://host?key=/public]\\Users\\FIRST\\x\u00a0" +
+          "([https://other?key=C:/Users/SECOND/s]",
+        "file://h?x=[file://host?key=<path>]<path>?key=<path>]",
+      ],
+      [
+        "genuine #1785 restarted-wrapper drive",
+        "file://h?x=[a]\\b[https://other?key=C:/Users/S/s]",
+        "file://h?x=[a]<path>?key=<path>]",
+      ],
+      [
+        "rooted mixed-successor integration",
+        mixedPrefix + "key=/Users/SECRET2/x]",
+        mixedExpected + "key=<path>]",
+      ],
+      [
+        "colon mixed-successor integration",
+        mixedPrefix + "key=XY:/Users/SECRET2/x]",
+        mixedExpected + "key=XY:<path>]",
+      ],
+      [
+        "queryless mixed-successor integration",
+        "file://h?x=[file:///Users/CHILD/x&later\\/home/alice/s" +
+          "[https://host]:x[https://other?key=/Users/SECRET2/x]",
+        "file://h?x=[file://<path>&later\\<path>?key=<path>]",
+      ],
+      [
+        "backslash drive in a mixed-successor bracket",
+        mixedPrefix + "key=C:\\Users\\K\\x]",
+        mixedExpected + "key=<path>]",
+      ],
+      [
+        "UNC value in a mixed-successor bracket",
+        mixedPrefix + "key=\\\\srv\\share]",
+        mixedExpected + "key=<path>]",
+      ],
+      [
+        "drive-relative value in a mixed-successor bracket",
+        mixedPrefix + "key=C:x]",
+        mixedExpected + "key=C:x]",
+      ],
+      [
+        "backslash drive in a nested file child",
+        "file://h?x=[file:///Users/CHILD/x&/Users/alice/s" +
+          "[file:///b&C:\\Users\\c]]",
+        "file://h?x=[file://<path>&<path>&<path>]]",
+      ],
+      [
+        "backslash root in a nested file child",
+        "file://h?x=[file:///Users/CHILD/x&/Users/alice/s" +
+          "[file:///b&\\Users\\c]]",
+        "file://h?x=[file://<path>&<path>&<path>]]",
+      ],
+      [
+        "immediate inherited owner keeps its drive spelling",
+        "file://h?x=['https://outer.test/x?next=file:///Users/a/private.db'|" +
+          "\\Users\\CANARY\\x[file:///b&C:/Users/c]]",
+        "file://h?x=['https://outer.test/x?next=file://<path>'|<path>&<path>]]",
+      ],
+      [
+        "zero-width inherited owner keeps its drive spelling",
+        "file://h?x=['https://outer.test/x?next=file:///Users/a/private.db'\u200b|" +
+          "\\Users\\CANARY\\x([https://inner?key=C:/Users/D/s]]",
+        "file://h?x=['https://outer.test/x?next=file://<path>'\u200b|" +
+          "<path>?key=<path>]]",
+      ],
+    ] as const)("preserves the control: %s", (_name, input, expected) => {
+      assertStable(input, expected);
+    });
+
+    it.each([
+      [
+        "mixed ampersand bare drive",
+        "file://h?x=[file:///Users/CHILD/x&later\\/home/alice/s" +
+          "([https://other&C:/]",
+        "file://h?x=[file://<path>&later\\<path>&<path>]",
+      ],
+      [
+        "mixed ampersand query-delimited bare drive",
+        "file://h?x=[file:///Users/CHILD/x&later\\/home/alice/s" +
+          "([https://other&C:/?q]",
+        "file://h?x=[file://<path>&later\\<path>&<path>?q]",
+      ],
+      [
+        "mixed ampersand space-delimited bare drive",
+        "file://h?x=[file:///Users/CHILD/x&later\\/home/alice/s" +
+          "([https://other&C:/ x]",
+        "file://h?x=[file://<path>&later\\<path>&<path> x]",
+      ],
+      [
+        "mixed query authority-like drive",
+        mixedPrefix + "key=C://srv/x]",
+        mixedExpected + "key=<path>]",
+      ],
+      [
+        "rooted nested-file bare drive",
+        "file://h?x=[file:///Users/CHILD/x&/Users/alice/s[file:///b&C:/]]",
+        "file://h?x=[file://<path>&<path>&<path>]]",
+      ],
+      [
+        "rooted nested-file query-delimited bare drive",
+        "file://h?x=[file:///Users/CHILD/x&/Users/alice/s[file:///b&C:/?q]]",
+        "file://h?x=[file://<path>&<path>&<path>?q]]",
+      ],
+      [
+        "rooted nested-file space-delimited bare drive",
+        "file://h?x=[file:///Users/CHILD/x&/Users/alice/s[file:///b&C:/ x]]",
+        "file://h?x=[file://<path>&<path>&<path> x]]",
+      ],
+      [
+        "rooted nested-file authority-like drive",
+        "file://h?x=[file:///Users/CHILD/x&/Users/alice/s[file:///b&C://srv/x]]",
+        "file://h?x=[file://<path>&<path>&<path>]]",
+      ],
+      [
+        "genuine #1785 nested-file bare drive",
+        "file://h?x=[file:///Users/CHILD/x&later/home/alice/s([file:///b&C:/]]",
+        "file://h?x=[file://<path>&later<path>&<path>]]",
+      ],
+      [
+        "later inherited nested-file bare drive",
+        "file://h?x=['https://outer.test/x?next=file:///Users/a/private.db'|" +
+          "\\Users\\CANARY\\x&second/Users/B/x[file:///b&C:/]]",
+        "file://h?x=['https://outer.test/x?next=file://<path>'|" +
+          "<path>&second<path>&<path>]]",
+      ],
+      [
+        "restarted nested-file bare drive",
+        "file://h?x=[a]\\b[file:///b&C:/]",
+        "file://h?x=[a]<path>&<path>]",
+      ],
+      [
+        "soft-owner nested-file bare drive",
+        "file://h?x=[file://host?key=/public]\\Users\\FIRST\\x\u00a0" +
+          "[file:///b&C:/]",
+        "file://h?x=[file://host?key=<path>]<path>&<path>]",
+      ],
+      [
+        "drive after a public URL in one file component",
+        "file://h?x=[file:///Users/CHILD/x&later\\/home/alice/s" +
+          "[file:///b&https://pub.test/x&D:/Users/d]",
+        "file://h?x=[file://<path>&later\\<path>file://<path>" +
+          "&https://pub.test/x&<path>]",
+      ],
+    ] as const)("keeps the complete frozen-base sequence for %s", (_name, input, expected) => {
+      assertStable(input, expected);
+    });
+
+    it.each([
+      [
+        "named compound drive",
+        mixedPrefix + "key=C:/C:/Users/K]",
+        mixedExpected + "key=<path>:<path>]",
+      ],
+      [
+        "ampersand compound drive",
+        "file://h?x=[file:///Users/CHILD/x&later\\/home/alice/s" +
+          "([https://other&C:/C:/Users/K]",
+        "file://h?x=[file://<path>&later\\<path>&<path>:<path>]",
+      ],
+      [
+        "nested-file compound drive",
+        "file://h?x=[file:///Users/CHILD/x&/Users/alice/s" +
+          "[file:///b&C:/C:/Users/K]]",
+        "file://h?x=[file://<path>&<path>&<path>:<path>]]",
+      ],
+      [
+        "named drive before a file literal",
+        mixedPrefix + "key=C:/file:///Users/K]",
+        mixedExpected + "key=<path>file://<path>]",
+      ],
+      [
+        "ampersand drive before a file literal",
+        "file://h?x=[file:///Users/CHILD/x&later\\/home/alice/s" +
+          "([https://other&C:/file:///Users/K]",
+        "file://h?x=[file://<path>&later\\<path>&<path>file://<path>]",
+      ],
+      [
+        "nested-file drive before a file literal",
+        "file://h?x=[file:///Users/CHILD/x&/Users/alice/s" +
+          "[file:///b&C:/file:///Users/K]]",
+        "file://h?x=[file://<path>&<path>&<path>]]",
+      ],
+    ] as const)("uses a complete historical spelling for %s", (_name, input, expected) => {
+      assertStable(input, expected);
+    });
+
+    it.each([
+      ["vertical tab", "\u000b"],
+      ["form feed", "\u000c"],
+      ["no-break space", "\u00a0"],
+      ["Ogham space mark", "\u1680"],
+      ["en quad", "\u2000"],
+      ["em quad", "\u2001"],
+      ["en space", "\u2002"],
+      ["em space", "\u2003"],
+      ["three-per-em space", "\u2004"],
+      ["four-per-em space", "\u2005"],
+      ["six-per-em space", "\u2006"],
+      ["figure space", "\u2007"],
+      ["punctuation space", "\u2008"],
+      ["thin space", "\u2009"],
+      ["hair space", "\u200a"],
+      ["line separator", "\u2028"],
+      ["paragraph separator", "\u2029"],
+      ["narrow no-break space", "\u202f"],
+      ["medium mathematical space", "\u205f"],
+      ["ideographic space", "\u3000"],
+      ["byte order mark", "\ufeff"],
+    ] as const)("keeps all selected drive values through %s", (_name, whitespace) => {
+      assertStable(
+        mixedPrefix +
+          "key=C:/Users/S1/x" +
+          whitespace +
+          "&k2=D:/Users/S2/y]",
+        mixedExpected + "key=<path>&k2=<path>]",
+      );
+    });
+
+    it.each([
+      ["query suffix", "?q"],
+      ["space suffix", " x"],
+    ] as const)("keeps the no-path-word %s at the frozen spelling", (_name, suffix) => {
+      assertStable(
+        mixedPrefix + "key=C:/" + suffix + "]",
+        mixedExpected + "key=<path>" + suffix + "]",
+      );
+    });
+
+    it.each([
+      ["later var", "later\\/var/alice/s"],
+      ["later homes", "later\\/homes/alice/s"],
+      ["later nested home", "later\\/a/home/alice/s"],
+      ["later x", "later\\/x/s"],
+      ["later opt", "later\\/opt/app/s"],
+    ] as const)("pins the narrow mixed residual: %s", (_name, successor) => {
+      assertStable(
+        "file://h?x=[file:///Users/CHILD/x&" +
+          successor +
+          "([https://other?key=C:/Users/K/x]",
+        "file://h?x=[file://<path>&later\\<path>?key=<path>]",
+      );
+    });
+
+    it.each([
+      [
+        "file sibling then plain bracket",
+        "file://h?x=[file:///Users/CHILD/x&/Users/alice/s" +
+          "[file:///b][y&C:/Users/K/x]",
+        "file://h?x=[file://<path>&<path>&<path>]",
+      ],
+      [
+        "single-slash file text",
+        "file://h?x=[file:///Users/CHILD/x&/Users/alice/s" +
+          "[file:/b&C:/Users/K/x]",
+        "file://h?x=[file://<path>&<path>&<path>]",
+      ],
+      [
+        "deeper plain bracket in file child",
+        "file://h?x=[file:///Users/CHILD/x&/Users/alice/s" +
+          "[file:///b[x&C:/Users/K/x]]",
+        "file://h?x=[file://<path>&<path>&<path>]]",
+      ],
+      [
+        "plain component",
+        "file://h?x=[file:///Users/CHILD/x&/Users/alice/s[x&C:/Users/K/x]",
+        "file://h?x=[file://<path>&<path>&<path>]",
+      ],
+    ] as const)("pins the narrow nested-file residual: %s", (_name, input, expected) => {
+      assertStable(input, expected);
+    });
+
+    it("keeps the adopted bare-drive target in an independent mixed copy", () => {
+      assertStable(
+        mixedPrefix + "key=C:/]&later\\/home/alice/s([https://other?key=C:/]",
+        mixedExpected + "key=C:<path>]&later<path>?key=C:<path>]",
+      );
+    });
+
+    it("keeps the one-level rooted-query continuation in an admitted file child", () => {
+      assertStable(
+        "file://h?x=[file:///Users/CHILD/x&/Users/alice/s" +
+          "[file:///b&C:/Users/c([https://i?key=/Users/I/s]]]",
+        "file://h?x=[file://<path>&<path>&C:<path>?key=<path>]]]",
+      );
+    });
+
+    it("refuses a mixed-owner request carried through soft whitespace", () => {
+      assertStable(
+        "file://h?x=[file:///Users/CHILD/x&later\\/home/alice/s\u00a0" +
+          "([https://other?key=C:/]",
+        "file://h?x=[file://<path>&later\\<path>?key=<path>]",
+      );
+    });
+
+    it("refuses a non-HTTPS nested continuation", () => {
+      assertStable(
+        "file://h?x=[file:///Users/CHILD/x&/Users/alice/s" +
+          "[file:///b&C:/Users/c([http://i?key=/Users/I/s]]]",
+        "file://h?x=[file://<path>&<path>&<path>?key=<path>]]]",
+      );
+    });
+
+    it("does not re-arm across another successor before the bracket", () => {
+      assertStable(
+        "file://h?x=[file:///Users/CHILD/x&later\\/home/alice/s" +
+          "([https://other?key=/Users/S0/x]&later\\/home/bob/s" +
+          "&plain[https://other?key=C:/Users/K/x]",
+        "file://h?x=[file://<path>&later\\<path>?key=<path>]" +
+          "&later<path>&plain[https://other?key=C:/Users/K/x]",
+      );
+    });
+
+    it.each([
+      [
+        "trailing separator in a drive path",
+        "file://h?x=[file:///Users/CHILD/x&later\\/home/alice/s" +
+          "([https://other?key=C:/Users/]",
+        "file://h?x=[file://<path>&later\\<path>?key=<path>]",
+      ],
+      [
+        "wrong nested continuation parameter",
+        "file://h?x=[file:///Users/CHILD/x&/Users/alice/s" +
+          "[file:///b&C:/Users/c([https://i?other=/Users/I/s]]]",
+        "file://h?x=[file://<path>&<path>&<path>?other=<path>]]]",
+      ],
+      [
+        "plain nested continuation value",
+        "file://h?x=[file:///Users/CHILD/x&/Users/alice/s" +
+          "[file:///b&C:/Users/c([https://i?key=plain]]]",
+        "file://h?x=[file://<path>&<path>&<path>?key=plain]]]",
+      ],
+      [
+        "rooted continuation with another parameter",
+        "file://h?x=[file:///Users/CHILD/x&/Users/alice/s" +
+          "[file:///b&C:/Users/c([https://i?key=/Users/I/s&other=plain]]]",
+        "file://h?x=[file://<path>&<path>&<path>?key=<path>&other=plain]]]",
+      ],
+      [
+        "empty query parameter name",
+        "file://h?x=[file:///Users/CHILD/x&later\\/home/alice/s" +
+          "([https://other?=C:/Users/K/x]",
+        "file://h?x=[file://<path>&later\\<path>?=<path>]",
+      ],
+      [
+        "second successor without a bracket",
+        "file://h?x=[file:///Users/CHILD/x&later\\/home/alice/s" +
+          "([https://other?key=/Users/S0/x]&later\\/home/bob/s",
+        "file://h?x=[file://<path>&later\\<path>?key=<path>]&later<path>",
+      ],
+    ] as const)("refuses the malformed positive-grammar neighbour: %s", (_name, input, expected) => {
+      assertStable(input, expected);
+    });
+
+    const escalationCases = JSON.parse(
+      readFileSync(new URL("../fixtures/safe-error-1817-escalation.json", import.meta.url), "utf8"),
+    ) as Array<{
+      name: string;
+      input: string;
+      requiredPasses: readonly [string, string, string];
+    }>;
+
+    it.each(escalationCases)("pins the escalation acceptance row: $name", ({ input, requiredPasses }) => {
+      const first = sanitizeError(input);
+      const second = sanitizeError(first);
+      const third = sanitizeError(second);
+
+      expect(first).toBe(requiredPasses[0]);
+      expect(second).toBe(requiredPasses[1]);
+      expect(third).toBe(requiredPasses[2]);
+    });
+
+    const assertSequence = (input: string, passes: readonly [string, string, string]): void => {
+      const first = sanitizeError(input);
+      const second = sanitizeError(first);
+      const third = sanitizeError(second);
+
+      expect(first).toBe(passes[0]);
+      expect(second).toBe(passes[1]);
+      expect(third).toBe(passes[2]);
+    };
+
+    const continuationPrefix =
+      "file://h?x=[file:///Users/CHILD/x&later\\/home/alice/s([https://other?key=C:/Users/K/x([https://";
+    const continuationRefused =
+      "file://h?x=[file://<path>&later\\<path>?key=<path>?key=<path>]]";
+    const continuationAdmitted =
+      "file://h?x=[file://<path>&later\\<path>?key=C:<path>?key=<path>]]";
+
+    it.each([
+      ["host with dots and a port", "i.test:8443", continuationAdmitted],
+      ["upper-case host", "I", continuationAdmitted],
+      ["empty port", "i:", continuationRefused],
+      ["underscore in the host", "i_x", continuationRefused],
+      ["user information in the host", "u@i", continuationRefused],
+      ["path in the authority", "i/x", continuationRefused],
+    ] as const)("limits the continuation authority to a host token: %s", (_name, authority, expected) => {
+      assertStable(continuationPrefix + authority + "?key=/Users/I/s]]", expected);
+    });
+
+    it("refuses a continuation whose port runs to the end of the input", () => {
+      assertStable(
+        continuationPrefix + "i:8",
+        "file://h?x=[file://<path>&later\\<path>?key=<path>",
+      );
+    });
+
+    it.each([
+      [
+        "bare drive after an interposed value",
+        "file://h?x=[file:///Users/CHILD/x&later\\/home/alice/s" +
+          "([https://other?key=C:/Users/K/x([https://i&X:/?key=/Users/I/s]]",
+        "file://h?x=[file://<path>&later\\<path>?key=<path>&<path>?key=<path>]]",
+      ],
+      [
+        "double-slash drive after an interposed value",
+        "file://h?x=[file:///Users/CHILD/x&later\\/home/alice/s" +
+          "([https://other?key=C:/Users/K/x([https://i&X://s?key=/Users/I/s]]",
+        "file://h?x=[file://<path>&later\\<path>?key=<path>&<path>?key=<path>]]",
+      ],
+      [
+        "two interposed drives",
+        "file://h?x=[file:///Users/CHILD/x&later\\/home/alice/s" +
+          "([https://other?key=C:/Users/K/x([https://i&X:/Users/Q&Y:/?key=/Users/I/s]]",
+        "file://h?x=[file://<path>&later\\<path>?key=<path>&<path>&<path>?key=<path>]]",
+      ],
+      [
+        "interposed drive under a nested file child",
+        "file://h?x=[file:///Users/CHILD/x&/Users/alice/s" +
+          "[file:///b&C:/Users/K/x([https://i&X:/?key=/Users/I/s]]",
+        "file://h?x=[file://<path>&<path>&<path>&<path>?key=<path>]]",
+      ],
+      [
+        "interposed drive under a restarted wrapper",
+        "file://h?x=[a]\\b[file:///b&C:/Users/K/x([https://i&X://s?key=/Users/I/s]]",
+        "file://h?x=[a]<path>&<path>&<path>?key=<path>]]",
+      ],
+      [
+        "public URL inside the continuation authority",
+        "file://h?x=[file:///Users/CHILD/x&later\\/home/alice/s" +
+          "([https://other?key=C:/Users/K/x([https://i&https://pub/x?key=/Users/I/s]]",
+        "file://h?x=[file://<path>&later\\<path>?key=<path>&https://pub/x?key=<path>]]",
+      ],
+      [
+        "file URL inside the continuation authority",
+        "file://h?x=[file:///Users/CHILD/x&later\\/home/alice/s" +
+          "([https://other?key=C:/Users/K/x([https://i&file:///Users/Q?key=/Users/I/s]]",
+        "file://h?x=[file://<path>&later\\<path>?key=<path>&file://<path>?key=<path>]]",
+      ],
+      [
+        "parenthesis inside the continuation authority",
+        "file://h?x=[file:///Users/CHILD/x&later\\/home/alice/s" +
+          "([https://other?key=C:/Users/K/x([https://i(X:/Users/Q?key=/Users/I/s]]",
+        "file://h?x=[file://<path>&later\\<path>?key=<path>?key=<path>]]",
+      ],
+    ] as const)("refuses a continuation whose authority carries a value: %s", (_name, input, expected) => {
+      assertStable(input, expected);
+    });
+
+    it.each([
+      [
+        "nested file child of a rooted owner",
+        "file://h?x=[file:///Users/CHILD/x&/Users/alice/s[file:///b?key=C:/]]",
+        "file://h?x=[file://<path>&<path>?key=<path>]]",
+      ],
+      [
+        "nested file child of a private-relative owner",
+        "file://h?x=[file:///Users/CHILD/x&later/home/alice/s[file:///b?key=C:/]]",
+        "file://h?x=[file://<path>&later<path>?key=<path>]]",
+      ],
+      [
+        "nested file child of a restarted wrapper",
+        "file://h?x=[a]\\b[file:///b?key=C:/]",
+        "file://h?x=[a]<path>?key=<path>]",
+      ],
+      [
+        "file header after a mixed successor",
+        "file://h?x=[file:///Users/CHILD/x&later\\/home/alice/s([file:///b?key=C:/]",
+        "file://h?x=[file://<path>&later\\<path>file://<path>?key=<path>]",
+      ],
+      [
+        "genuine #1785 owner with a file header",
+        "file://h?x=[file:///Users/CHILD/x&later/home/alice/s([file:///b?key=C:/]",
+        "file://h?x=[file://<path>&later<path>?key=<path>]",
+      ],
+      [
+        "http header",
+        "file://h?x=[file:///Users/CHILD/x&later\\/home/alice/s([http://other?key=C:/]",
+        "file://h?x=[file://<path>&later\\<path>?key=<path>]",
+      ],
+      [
+        "bare drive after a fragment drive",
+        "file://h?x=[file:///Users/CHILD/x&later\\/home/alice/s([https://other#C:/x?key=C:/]",
+        "file://h?x=[file://<path>&later\\<path>#<path>?key=<path>]",
+      ],
+      [
+        "bare drive after a fragment root",
+        "file://h?x=[file:///Users/CHILD/x&later\\/home/alice/s([https://other#/x?key=C:/]",
+        "file://h?x=[file://<path>&later\\<path>#<path>?key=<path>]",
+      ],
+      [
+        "owner path followed by an empty parenthesis pair",
+        "file://h?x=[file:///Users/CHILD/x&later\\/home/alice/s()[https://other?key=C:/]",
+        "file://h?x=[file://<path>&later\\<path>?key=<path>]",
+      ],
+      [
+        "owner path followed by two parentheses",
+        "file://h?x=[file:///Users/CHILD/x&later\\/home/alice/s(([https://other?key=C:/]",
+        "file://h?x=[file://<path>&later\\<path>?key=<path>]",
+      ],
+    ] as const)("limits the bare drive exception to the adopted terminal shape: %s", (_name, input, expected) => {
+      assertStable(input, expected);
+    });
+
+    it.each([
+      [
+        "upper-case scheme",
+        "file://h?x=[file:///Users/CHILD/x&later\\/home/alice/s([HTTPS://other?key=C:/]",
+        "file://h?x=[file://<path>&later\\<path>?key=C:<path>]",
+      ],
+      [
+        "upper-case name",
+        mixedPrefix + "KEY=C:/]",
+        mixedExpected + "KEY=C:<path>]",
+      ],
+      [
+        "bracket without a parenthesis",
+        "file://h?x=[file:///Users/CHILD/x&later\\/home/alice/s[https://other?key=C:/]",
+        "file://h?x=[file://<path>&later\\<path>?key=C:<path>]",
+      ],
+    ] as const)("keeps the adopted bare drive variant: %s", (_name, input, expected) => {
+      assertStable(input, expected);
+    });
+
+    it.each([
+      [
+        "file copy after an ampersand drive value",
+        "file://h?x=[file:///Users/CHILD/x&later\\/home/alice/s([https://other&C:/Users/K/x]" +
+          "&later\\/home/bob/s([file:///b?key=M:/Users/K/x]",
+        [
+          "file://h?x=[file://<path>&later\\<path>&C:<path>]&later\\/home/bob/s([file://<path>?key=M:/Users/K/x]",
+          "file://h?x=[file://<path>&later\\<path>&C:<path>]&later\\<path><path>?key=M:<path>]",
+          "file://h?x=[file://<path>&later\\<path>&C:<path>]&later\\<path><path>?key=M:<path>]",
+        ],
+      ],
+      [
+        "upper-case file copy after a plain value",
+        "file://h?x=[file:///Users/CHILD/x&later\\/home/alice/s([https://other&plain]" +
+          "&later\\/home/bob/s([FILE:///b?key=M:/Users/K/x]",
+        [
+          "file://h?x=[file://<path>&later\\<path>&plain]&later\\/home/bob/s([FILE://<path>?key=M:/Users/K/x]",
+          "file://h?x=[file://<path>&later\\<path>&plain]&later\\<path><path>?key=M:<path>]",
+          "file://h?x=[file://<path>&later\\<path>&plain]&later\\<path><path>?key=M:<path>]",
+        ],
+      ],
+      [
+        "bare file copy after an ampersand drive value",
+        "file://h?x=[file:///Users/CHILD/x&later\\/home/alice/s([https://other&C:/Users/K/x]" +
+          "&later\\/Users/bob/s([file:///b?key=M:/]",
+        [
+          "file://h?x=[file://<path>&later\\<path>&C:<path>]&later\\/Users/bob/s([file://<path>?key=M:/]",
+          "file://h?x=[file://<path>&later\\<path>&C:<path>]&later\\<path><path>?key=M:/]",
+          "file://h?x=[file://<path>&later\\<path>&C:<path>]&later\\<path><path>?key=M:/]",
+        ],
+      ],
+      [
+        "file copy with an authority after a named plain value",
+        "file://h?x=[file:///Users/CHILD/x&later\\/home/alice/s[https://other&a=1]" +
+          "&later\\/root/bob/s([file:///Users/W/b&M:/a]",
+        [
+          "file://h?x=[file://<path>&later\\<path>&a=1]&later\\/root/bob/s([file://<path>&M:/a]",
+          "file://h?x=[file://<path>&later\\<path>&a=1]&later\\<path><path>&M:<path>]",
+          "file://h?x=[file://<path>&later\\<path>&a=1]&later\\<path><path>&M:<path>]",
+        ],
+      ],
+    ] as const)("omits the second-copy re-arm for a file header the frozen scanner links later: %s", (_name, input, passes) => {
+      assertSequence(input, passes);
+    });
+
+    it.each([
+      [
+        "header followed by a semicolon under a restarted wrapper",
+        "file://h?x=[a]\\b[file:///b;C://srv/x?key=C:/Users/K/x]",
+        "file://h?x=[a]<path>;C://srv/x?key=<path>]",
+      ],
+      [
+        "header followed by a parenthesis",
+        "file://h?x=[file:///Users/CHILD/x&later\\/home/alice/s([https://other(x?key=C:/Users/K/x]",
+        "file://h?x=[file://<path>&later\\<path>?key=<path>]",
+      ],
+      [
+        "header followed by a pipe",
+        "file://h?x=[file:///Users/CHILD/x&later\\/home/alice/s([https://other|x?key=C:/Users/K/x]",
+        "file://h?x=[file://<path>&later\\<path>|x?key=<path>]",
+      ],
+      [
+        "header containing a second scheme",
+        "file://h?x=[file:///Users/CHILD/x&later\\/home/alice/s([https://file://other?key=C:/]",
+        "file://h?x=[file://<path>&later\\<path>file://other?key=<path>]",
+      ],
+      [
+        "file header without a path before a fragment value",
+        "file://h?x=[file:///Users/CHILD/x&later\\/home/alice/s[file:///#b&C:/Users/c]]",
+        "file://h?x=[file://<path>&later\\<path>file:///#b&<path>]]",
+      ],
+      [
+        "header ending in a slash",
+        "file://h?x=[file:///Users/CHILD/x&later\\/home/alice/s([https://other/?key=C:/Users/K/x]",
+        "file://h?x=[file://<path>&later\\<path>?key=<path>]",
+      ],
+      [
+        "header with an empty authority",
+        "file://h?x=[file:///Users/CHILD/x&later\\/home/alice/s([https://?key=C:/Users/K/x]",
+        "file://h?x=[file://<path>&later\\<path>?key=<path>]",
+      ],
+      [
+        "header colon at the end of the input",
+        "file://h?x=[file:///Users/CHILD/x&later\\/home/alice/s([https://other:",
+        "file://h?x=[file://<path>&later\\<path>",
+      ],
+    ] as const)("refuses a header that does not end at a value delimiter: %s", (_name, input, expected) => {
+      assertStable(input, expected);
+    });
+
+    it("keeps a numeric port inside an admitted header", () => {
+      assertStable(
+        "file://h?x=[file:///Users/CHILD/x&later\\/home/alice/s([https://other:8443?key=C:/Users/K/x]",
+        "file://h?x=[file://<path>&later\\<path>?key=C:<path>]",
+      );
+    });
+
+    it.each([
+      [
+        "public URL inside a rooted owner",
+        "file://h?x=[file:///Users/CHILD/x&/https://Users/alice/s[file:///b&C:/Users/c]]",
+        "file://h?x=[file://<path>&<path>&<path>]]",
+      ],
+      [
+        "public URL inside a private-relative owner",
+        "file://h?x=[file:///Users/CHILD/x&later/home/https://alice/s[file:///b&C:/Users/c]]",
+        "file://h?x=[file://<path>&later<path>&<path>]]",
+      ],
+      [
+        "other scheme inside a rooted owner",
+        "file://h?x=[file:///Users/CHILD/x&/Users/alice/ftp://x/s[file:///b&C:/Users/c]]",
+        "file://h?x=[file://<path>&<path>&<path>]]",
+      ],
+    ] as const)("denies the nested-file drive prefix to an owner containing a scheme: %s", (_name, input, expected) => {
+      assertStable(input, expected);
+    });
+
+    it.each([
+      [
+        "parenthesis pair followed by a path word",
+        "file://h?x=[file:///Users/CHILD/x&later\\/home/alice/s()x[https://other?key=C:/]",
+        "file://h?x=[file://<path>&later\\<path>?key=<path>]",
+      ],
+      [
+        "parenthesis pair inside an earlier segment",
+        "file://h?x=[file:///Users/CHILD/x&later\\/home/a()b/s[https://other?key=C:/]",
+        "file://h?x=[file://<path>&later\\<path>?key=<path>]",
+      ],
+      [
+        "parenthesised text inside an earlier segment",
+        "file://h?x=[file:///Users/CHILD/x&later\\/home/a(b)c/s([https://other?KEY=d:/]",
+        "file://h?x=[file://<path>&later\\<path>?KEY=<path>]",
+      ],
+      [
+        "parenthesis pair as its own segment",
+        "file://h?x=[file:///Users/CHILD/x&later\\/Users/alice/s/()/x[HTTPS://o:80/p?key=Z:/]",
+        "file://h?x=[file://<path>&later\\<path>?key=<path>]",
+      ],
+      [
+        "bent owner followed by a straight second copy",
+        "file://h?x=[file:///Users/CHILD/x&later\\/home/alice/s()x[https://other?key=C:/]" +
+          "&later\\/home/bob/s([https://other?key=D:/]",
+        "file://h?x=[file://<path>&later\\<path>?key=<path>]&later\\<path>?key=D:/]",
+      ],
+      [
+        "parenthesis pair followed by a path word and a parenthesis",
+        "file://h?x=[file:///Users/CHILD/x&later\\/home/alice/s()x([https://other?key=C:/]",
+        "file://h?x=[file://<path>&later\\<path>?key=<path>]",
+      ],
+      [
+        "parenthesised word followed by a symbol path word",
+        "file://h?x=[file:///Users/CHILD/x&later\\/home/alice/s(x)@[https://other?KEY=c:/]",
+        "file://h?x=[file://<path>&later\\<path>?KEY=<path>]",
+      ],
+      [
+        "two parenthesis pairs followed by a path",
+        "file://h?x=[file:///Users/CHILD/x&later\\/home/alice/s()()x/y[HTTPS://o?key=C:/]",
+        "file://h?x=[file://<path>&later\\<path>?key=<path>]",
+      ],
+      [
+        "unbalanced parentheses in a root owner with a second copy",
+        "file://h?x=[file:///Users/CHILD/x&x\\/root/a(()C([https://o:80?key=C:/]" +
+          "&later\\/home/bob/s([https://other?key=D:/]",
+        "file://h?x=[file://<path>&x\\<path>?key=<path>]&later\\<path>?key=D:/]",
+      ],
+      [
+        "parenthesis pair after a file-literal owner",
+        "file://h?x=[file:///Users/CHILD/x&later\\/home/file:///Users/S/s()\u00fc[https://other?key=C:/]",
+        "file://h?x=[file://<path>&later\\<path>file://<path>?key=<path>]",
+      ],
+      [
+        "unclosed parenthesis followed by a path word",
+        "file://h?x=[file:///Users/CHILD/x&later\\/home/alice/s(x[https://other?key=C:/]",
+        "file://h?x=[file://<path>&later\\<path>?key=<path>]",
+      ],
+      [
+        "bent second copy after an admitted first component",
+        "file://h?x=[file:///Users/CHILD/x&later\\/home/alice/s([https://other?key=/Users/S0/x]" +
+          "&later\\/home/bob/s()x([https://other?key=D:/]",
+        "file://h?x=[file://<path>&later\\<path>?key=<path>]&later<path>?key=D:/]",
+      ],
+    ] as const)("refuses the bare drive when the owner path is not straight: %s", (_name, input, expected) => {
+      assertStable(input, expected);
+    });
+
+    it.each([
+      [
+        "Users owner",
+        "file://h?x=[file:///Users/CHILD/x&later\\/Users/alice/s([https://other?key=C:/]",
+        "file://h?x=[file://<path>&later\\<path>?key=C:<path>]",
+      ],
+      [
+        "root owner with a header port",
+        "file://h?x=[file:///Users/CHILD/x&x\\/root/a([https://o:80?key=C:/]",
+        "file://h?x=[file://<path>&x\\<path>?key=C:<path>]",
+      ],
+      [
+        "straight owner with bare sibling brackets",
+        "file://h?x=[file:///Users/CHILD/x&later\\/home/alice/s([https://o?key=C:/][https://o?key=D:/]",
+        "file://h?x=[file://<path>&later\\<path>?key=C:<path>][https://o?key=D:/]",
+      ],
+    ] as const)("keeps the bare drive for a straight owner: %s", (_name, input, expected) => {
+      assertStable(input, expected);
     });
   });
 
