@@ -96,7 +96,7 @@ function Invoke-Actor($identity, $role) {
   try {
     $arguments = '"' + $actor + '" ' + $role + ' ' + $runId
     $process = Start-Process -FilePath $node -ArgumentList $arguments -Credential $identity.Credential `
-      -LoadUserProfile -WindowStyle Hidden -PassThru -RedirectStandardOutput $stdout -RedirectStandardError $stderr
+      -LoadUserProfile -UseNewEnvironment -WindowStyle Hidden -PassThru -RedirectStandardOutput $stdout -RedirectStandardError $stderr
     $observation.stage = 'wait'
     if (-not $process.WaitForExit(120000)) {
       & $taskkill /PID $process.Id /T /F | Out-Null
