@@ -774,7 +774,13 @@ bundle and keep provider, credential, quarantine, and recovery sessions private.
   installed only after the complete prospective component has been validated
   and contains a supported rooted or recognized `Users`, `home`, or `root`
   relative successor. A neutral plain token can precede that real successor,
-  but does not establish ownership by itself.
+  but does not establish ownership by itself. Neither the extended handoff nor
+  the quote-`=` ownership below is installed when the matching quote closes
+  inside a bracket that an earlier immediate or invisible-character handoff
+  already owns, or when an unbalanced `[` inside the quoted URL separates the
+  nested `file:` scheme from its closing quote; those shapes keep their
+  earlier behavior, including the earlier owner's redaction of later sibling
+  components.
 
   One or more `=` characters after the matching quote redact an immediately
   adjacent complete POSIX root, Windows backslash root, or simple drive origin

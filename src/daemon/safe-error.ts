@@ -625,6 +625,7 @@ function findUrlPathStarts(chars: readonly string[]): UrlPathStarts {
   let postCloseFilePathOwnsBackslashQuery = true;
   let inheritedFileQuoteParentOwnerBracketDepth = 0;
   let inheritedFileQuoteEnd = -1;
+  let inheritedFileQuoteSchemeStart = -1;
   let cachedEnclosingQuote = 0;
   let cachedEnclosingQuoteBoundary = -1;
   let siblingWrapperStart = -1;
@@ -648,6 +649,7 @@ function findUrlPathStarts(chars: readonly string[]): UrlPathStarts {
     armClaimedBracketTail(successorStart, true);
     inheritedFileQuoteParentOwnerBracketDepth = 0;
     inheritedFileQuoteEnd = -1;
+    inheritedFileQuoteSchemeStart = -1;
   };
 
   for (let index = 0; index < chars.length; index += 1) {
@@ -721,6 +723,15 @@ function findUrlPathStarts(chars: readonly string[]): UrlPathStarts {
     ) {
       const quoteClosedInsideOwnedBracket =
         postCloseFilePathActive && postCloseFilePathBracketDepth > 0;
+      // Every new (non-immediate) arm is refused when an existing tail already
+      // owns the bracket the quote closes in, or when an unbalanced bracket
+      // inside the quoted URL makes the bracket enclosing the closing quote
+      // differ from the one enclosing the nested file scheme. In both cases
+      // the measured region would not belong to the scanner's real owner, so
+      // the shape keeps its existing behavior.
+      const refuseNewArms =
+        quoteClosedInsideOwnedBracket ||
+        enclosingBracketOpen[inheritedFileQuoteSchemeStart] !== enclosingBracketOpen[index];
       const continuationStart = skipInheritedQuoteInterposerRun(index + 1);
       let valueStart = continuationStart;
       while (chars[valueStart] === "=") valueStart += 1;
@@ -733,7 +744,7 @@ function findUrlPathStarts(chars: readonly string[]): UrlPathStarts {
       // broader non-whitespace class is only its fallback.
       if (chars[continuationStart] === "&" || chars[continuationStart] === "|") {
         restoreInheritedQuoteHandoff(continuationStart + 1);
-      } else {
+      } else if (!refuseNewArms) {
         const continuationDelimiter = inheritedContinuationDelimiter[continuationStart]!;
         if (continuationDelimiter >= 0 && chars[continuationDelimiter + 1] !== "=") {
           const admission = measureInheritedTailAdmission(
@@ -744,6 +755,7 @@ function findUrlPathStarts(chars: readonly string[]): UrlPathStarts {
             applyInheritedTailAdmission(admission, inheritedFileQuoteParentOwnerBracketDepth);
             inheritedFileQuoteParentOwnerBracketDepth = 0;
             inheritedFileQuoteEnd = -1;
+            inheritedFileQuoteSchemeStart = -1;
           }
         } else if (valueStart > continuationStart) {
           const forwardSlashDriveValue = isForwardSlashDrivePathStart(valueStart);
@@ -761,15 +773,16 @@ function findUrlPathStarts(chars: readonly string[]): UrlPathStarts {
               initialAdmission,
             );
             if (admission !== undefined) {
-              if (forwardSlashDriveValue && !quoteClosedInsideOwnedBracket) {
+              if (forwardSlashDriveValue) {
                 const pathStart = valueStart + 2;
                 forcedPath[pathStart] = 1;
                 armBracketTail(pathStart, valueStart, false, true, true);
-              } else if (!forwardSlashDriveValue) {
+              } else {
                 applyInheritedTailAdmission(admission, inheritedFileQuoteParentOwnerBracketDepth);
               }
               inheritedFileQuoteParentOwnerBracketDepth = 0;
               inheritedFileQuoteEnd = -1;
+              inheritedFileQuoteSchemeStart = -1;
             }
           }
         }
@@ -777,6 +790,7 @@ function findUrlPathStarts(chars: readonly string[]): UrlPathStarts {
       if (inheritedFileQuoteEnd === index) {
         inheritedFileQuoteParentOwnerBracketDepth = 0;
         inheritedFileQuoteEnd = -1;
+        inheritedFileQuoteSchemeStart = -1;
       }
     }
     const closingPathlessFileQueryOwnerDepth =
@@ -1109,6 +1123,7 @@ function findUrlPathStarts(chars: readonly string[]): UrlPathStarts {
       if (inheritedNestedFileQuote !== 0 && pathlessFileQueryOwnerBracketDepth > 0) {
         inheritedFileQuoteParentOwnerBracketDepth = pathlessFileQueryOwnerBracketDepth;
         inheritedFileQuoteEnd = matchingEnclosingQuoteEnd;
+        inheritedFileQuoteSchemeStart = nestedFileSchemeStart;
       }
       activeNestedFileUrlParentOwnerBracketDepth = pathlessFileQueryOwnerBracketDepth;
       if (activeNestedFileUrlParentOwnerBracketDepth > 0) {

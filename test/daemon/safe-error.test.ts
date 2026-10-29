@@ -7065,6 +7065,155 @@ describe("sanitizeError", () => {
         expect(createHash("sha256").update(value).digest("hex")).toBe(expectedHash);
       }
     });
+
+    describe("escalation refusal guards", () => {
+      const assertStable = (input: string, expected: string): void => {
+        const first = sanitizeError(input);
+        const second = sanitizeError(first);
+        const third = sanitizeError(second);
+
+        expect(first).toBe(expected);
+        expect(second).toBe(expected);
+        expect(third).toBe(expected);
+      };
+
+      it.each([
+        [
+          "A-F1a",
+          "file://h?x=['https://outer.test/x?next=file:///Users/a/My Files/private.db'|\\Users\\ZQA\\x[https://i?key='https://o.test/x?next=file:///Users/ZQR/a'=\\Users\\ZQB\\x][https://j?key=/Users/ZQD/x]]",
+          "file://h?x=['https://outer.test/x?next=file://<path>'|<path>?key='https://o.test/x?next=file://<path>'=<path>][https://j?key=<path>]]",
+        ],
+        [
+          "A-F1b",
+          "file://h?x=['https://outer.test/x?next=file:///Users/a/My Files/private.db'|\\Users\\ZQA\\x[https://i?key='https://o.test/x?next=file:///Users/ZQR/a',|\\Users\\ZQB\\x][https://j?key=C:/Users/ZQD/x]]",
+          "file://h?x=['https://outer.test/x?next=file://<path>'|<path>?key='https://o.test/x?next=file://<path>',|<path>][https://j?key=<path>]]",
+        ],
+        [
+          "A-F1c",
+          "file://h?x=['https://outer.test/x?next=file:///Users/a/My Files/private.db'\u200b|\\Users\\ZQA\\x[file:///b&'https://o.test/x?next=file:///Users/ZQR/a'x&later/home/ZQB][https://j?key=\\Users\\ZQD\\x]]",
+          "file://h?x=['https://outer.test/x?next=file://<path>'\u200b|<path>&'https://o.test/x?next=file://<path>'x&later<path>][https://j?key=<path>]]",
+        ],
+        [
+          "A-F1d",
+          "file://h?x=['https://outer.test/x?next=file:///Users/a/My Files/private.db'&/Users/ZQA/x[https://i?key='https://o.test/x?next=file:///Users/ZQR/a'=/Users/ZQB/x][file:///b&C:/Users/ZQD/x]]",
+          "file://h?x=['https://outer.test/x?next=file://<path>'&<path>?key='https://o.test/x?next=file://<path>'=<path>][file://<path>&<path>]]",
+        ],
+        [
+          "A-F1e",
+          "file://h?x=[file:///Users/CHILD/x|\\Users\\ZQA\\x[https://i?key='https://o.test/x?next=file:///Users/ZQR/a'==\\Users\\ZQB\\x][https://j?key=/Users/ZQD/x]]",
+          "file://h?x=[file://<path>|<path>?key='https://o.test/x?next=file://<path>'==<path>][https://j?key=<path>]]",
+        ],
+        [
+          "A-F2a",
+          "file://h?x=['https://outer.test/x?next=file:///Users/a/b[c'=\\Users\\ZQA\\x]&later/home/ZQD]",
+          "file://h?x=['https://outer.test/x?next=file://<path>'=<path>]&later<path>]",
+        ],
+        [
+          "A-F2b",
+          "file://h?x=['https://outer.test/x?next=file:///Users/a/b[c',|\\Users\\ZQA\\x]&\\Users\\ZQD\\x]",
+          "file://h?x=['https://outer.test/x?next=file://<path>',|<path>]&<path>]",
+        ],
+        [
+          "A-F2c",
+          "file://h?x=['https://outer.test/x?next=file:///Users/a/b[c'=\\Users\\ZQA\\x[https://i?key=/home/ZQC/s]]&later/home/ZQD]",
+          "file://h?x=['https://outer.test/x?next=file://<path>'=<path>?key=<path>]]&later<path>]",
+        ],
+        [
+          "B-P1-1a",
+          "file://h?x=['https://o.test/x?next=file:///Users/ZQP/a'|\\Users\\ZQA\\x[https://i?key='https://o.test/x?next=file:///Users/ZQR/a'=\\Users\\ZQB\\x][https://j?key=/Users/ZQE/x]]",
+          "file://h?x=['https://o.test/x?next=file://<path>'|<path>?key='https://o.test/x?next=file://<path>'=<path>][https://j?key=<path>]]",
+        ],
+        [
+          "B-P1-1b",
+          "file://h?x=['https://o.test/x?next=file:///Users/ZQP/a'|\\Users\\ZQA\\x[https://i?key='https://o.test/x?next=file:///Users/ZQR/a',|\\Users\\ZQB\\x][https://j?key=C:/Users/ZQE/x]]",
+          "file://h?x=['https://o.test/x?next=file://<path>'|<path>?key='https://o.test/x?next=file://<path>',|<path>][https://j?key=<path>]]",
+        ],
+        [
+          "B-P1-1c",
+          "file://h?x=['https://o.test/x?next=file:///Users/ZQP/a'\u200b|\\Users\\ZQA\\x[https://i?key='https://o.test/x?next=file:///Users/ZQR/a'x&later/home/ZQB][file:///b&[https://o?key=/Users/ZQE/x]]]",
+          "file://h?x=['https://o.test/x?next=file://<path>'\u200b|<path>?key='https://o.test/x?next=file://<path>'x&later<path>][file://<path>&[https://o?key=<path>]]]",
+        ],
+        [
+          "B-P1-1d",
+          "file://h?x=['https://o.test/x?next=file:///Users/ZQP/a'&/Users/ZQA/x[https://i?key='https://o.test/x?next=file:///Users/ZQR/a'=/Users/ZQB/x][https://j?key=\\Users\\ZQE\\x]]",
+          "file://h?x=['https://o.test/x?next=file://<path>'&<path>?key='https://o.test/x?next=file://<path>'=<path>][https://j?key=<path>]]",
+        ],
+        [
+          "B-P1-1e",
+          "file://h?x=['https://o.test/x?next=file:///Users/ZQP/a'|later/home/ZQA[https://i?key=/home/ZQC/s&k='https://o.test/x?next=file:///Users/ZQR/a'==\\Users\\ZQB\\x][https://j?key=C:/Users/ZQE/x]]",
+          "file://h?x=['https://o.test/x?next=file://<path>'|later<path>?key=<path>&k='https://o.test/x?next=file://<path>'==<path>][https://j?key=<path>]]",
+        ],
+        [
+          "B-P1-2a",
+          "file://h?x=['https://outer.test/x?next=file:///Users/ZQP/p.db?v=[1'=\\Users\\ZQA\\x]|later/home/ZQE",
+          "file://h?x=['https://outer.test/x?next=file://<path>'=<path>]|later<path>",
+        ],
+        [
+          "B-P1-2b",
+          "file://h?x=['https://outer.test/x?next=file:///Users/ZQP[/p.db'=\\Users\\ZQA\\x]&k=\\Users\\ZQE\\x",
+          "file://h?x=['https://outer.test/x?next=file://<path>'=<path>]&k=<path>",
+        ],
+        [
+          "B-P1-2c",
+          "file://h?x=['https://outer.test/x?next=file:///Users/ZQP[/p.db'\u00ad|\\Users\\ZQA\\x[https://i?key=\\Users\\ZQC\\s]]&k=\\Users\\ZQE\\x",
+          "file://h?x=['https://outer.test/x?next=file://<path>'\u00ad|<path>?key=<path>]]&k=<path>",
+        ],
+        [
+          "B-P1-2d",
+          "file://h?x=['https://outer.test/x?next=file:///Users/ZQP[/p.db'\u200b=\\Users\\ZQA\\x[https://i?key=/home/ZQC/s]]'https://o.test/x?next=file:///Users/ZQR/a'=\\Users\\ZQF\\x[https://j?key=/home/ZQG/s]",
+          "file://h?x=['https://outer.test/x?next=file://<path>'\u200b=<path>?key=<path>]]'https://o.test/x?next=file://<path>'=<path>?key=<path>]",
+        ],
+        [
+          "B-P1-2e",
+          "file://h?x=['https://outer.test/x?next=file:///Users/ZQP/p.db#[x'=plain&later/home/ZQA]|later/home/ZQE]",
+          "file://h?x=['https://outer.test/x?next=file://<path>'=plain&later<path>]|later<path>]",
+        ],
+      ] as const)("refuses the new arm on synthesis row %s and keeps the oracle fixed point", (_id, input, expected) => {
+        assertStable(input, expected);
+      });
+
+      it.each([
+        [
+          "A-F1-ctl-fwd",
+          "file://h?x=['https://outer.test/x?next=file:///Users/a/My Files/private.db'|\\Users\\ZQA\\x[https://i?key='https://o.test/x?next=file:///Users/ZQR/a'=C:/Users/ZQB/x][https://j?key=/Users/ZQD/x]]",
+          "file://h?x=['https://outer.test/x?next=file://<path>'|<path>?key='https://o.test/x?next=file://<path>'=<path>][https://j?key=<path>]]",
+        ],
+        [
+          "A-F2d",
+          "file://h?x=['https://outer.test/x?next=file:///Users/a/b[c]d'x&later/home/ZQA]&\\Users\\ZQD\\x]",
+          "file://h?x=['https://outer.test/x?next=file://<path>'x&later<path>]&\\Users\\ZQD\\x]",
+        ],
+        [
+          "B-P1-2f",
+          "file://h?x=['https://outer.test/x?next=file:///Users/ZQP/p[1.db',|\\Users\\ZQA\\x]&k=/Users/ZQE/x",
+          "file://h?x=['https://outer.test/x?next=file://<path>',|<path>]&k=<path>",
+        ],
+        [
+          "B-ctl-imm-unbalanced",
+          "file://h?x=['https://outer.test/x?next=file:///Users/ZQP[/p.db'|\\Users\\ZQA\\x]&k=\\Users\\ZQE\\x",
+          "file://h?x=['https://outer.test/x?next=file://<path>'|<path>]&k=\\Users\\ZQE\\x",
+        ],
+        [
+          "B-ctl-inner-immediate",
+          "file://h?x=['https://o.test/x?next=file:///Users/ZQP/a'|\\Users\\ZQA\\x[https://i?key='https://o.test/x?next=file:///Users/ZQR/a'|\\Users\\ZQB\\x][https://j?key=/Users/ZQE/x]]",
+          "file://h?x=['https://o.test/x?next=file://<path>'|<path>?key='https://o.test/x?next=file://<path>'|<path>][https://j?key=/Users/ZQE/x]]",
+        ],
+        [
+          "B-ctl-inner-drive-guarded",
+          "file://h?x=['https://o.test/x?next=file:///Users/ZQP/a'|\\Users\\ZQA\\x[https://i?key='https://o.test/x?next=file:///Users/ZQR/a'=C:/Users/ZQB/x][https://j?key=/Users/ZQE/x]]",
+          "file://h?x=['https://o.test/x?next=file://<path>'|<path>?key='https://o.test/x?next=file://<path>'=<path>][https://j?key=<path>]]",
+        ],
+      ] as const)("keeps synthesis control %s byte-identical to the oracle", (_id, input, expected) => {
+        assertStable(input, expected);
+      });
+
+      it("keeps the bracket-noise quote row A-F4d exactly at the oracle", () => {
+        assertStable(
+          "file://h?x=['https://outer.test/x?next=file:///Users/a/b[c',|\\Users\\ZQA\\x[https://i?key=/home/ZQC/s]]&/https://pub.test/x?y=/Users/ZQD/x]",
+          "file://h?x=['https://outer.test/x?next=file://<path>',|<path>?key=<path>]]&<path>https://pub.test/x?y=/Users/ZQD/x]",
+        );
+      });
+    });
   });
 
 
