@@ -620,7 +620,14 @@ by the maximum number of simultaneously running LCM daemon processes; do not
 treat it as a host-wide total. `connectionTimeoutMs` bounds pool acquisition and
 new connections, and `idleTimeoutMs` retires unused pooled clients.
 `statementTimeoutMs` bounds one query's execution time on every pooled
-connection. It is deliberately separate from `snapshotIdleTimeoutMs`, which
+connection. The client also abandons a query that gets no response (for
+example after a network partition) after `statementTimeoutMs` plus a grace of
+`max(connectionTimeoutMs, 5000)` (70 seconds with the defaults, so a shorter
+caller deadline still fires first): it fails with a retryable storage error
+and the connection is destroyed. A migration request holding several
+statements gets one `statementTimeoutMs` per statement, and an event-loop
+stall longer than the deadline can also trip it. `statementTimeoutMs` is
+deliberately separate from `snapshotIdleTimeoutMs`, which
 bounds only the longest idle gap inside a portable transfer's long-lived
 read-only snapshot transaction (`SET LOCAL`-scoped, reverted on
 commit/rollback): PostgreSQL resets that timer on every statement the

@@ -3048,3 +3048,129 @@ describe("PostgreSQL runtime asynchronous failure on a checked-out client", () =
     expect(f.release).toHaveBeenCalledWith(false);
   });
 });
+
+describe("PostgreSQL runtime query read timeout", () => {
+  const timeoutError = (): Error => new Error("Query read timeout");
+  const statementSeparators = (count: number): string => `${"SELECT 1; ".repeat(count)}SELECT 1`;
+
+  it("destroys the client and returns a retryable error when a direct query gets no response", async () => {
+    const f = fixtures(() => { throw timeoutError(); });
+    const error = await f.runtime.query({ text: "SELECT 1" }, { domain: "factory", operation: "directTimeout" })
+      .catch((caught: unknown) => caught);
+    expect(error).toBeInstanceOf(PostgreSqlStorageOperationError);
+    expect(error).toMatchObject({
+      code: "STORAGE_OPERATION_FAILED",
+      operation: "directTimeout",
+      retryable: true,
+      sqlState: null,
+    });
+    expect(JSON.stringify(error)).not.toContain("Query read timeout");
+    expect(f.release).toHaveBeenCalledWith(true);
+  });
+
+  it("destroys the client when a cancellable query gets no response", async () => {
+    const controller = new AbortController();
+    let target: QueryWithCallback | undefined;
+    const f = fixtures((input) => {
+      if (typeof input === "object" && input !== null && "text" in input && !("callback" in input)) {
+        return result([{ pid: 7 }]);
+      }
+      target = input as QueryWithCallback;
+      return target;
+    });
+    const pending = f.runtime.query({ text: "SELECT 1" }, {
+      domain: "factory", operation: "signalledTimeout", signal: controller.signal,
+    });
+    await vi.waitFor(() => expect(target).toBeDefined());
+    target?.callback(timeoutError());
+    await expect(pending).rejects.toMatchObject({ operation: "signalledTimeout", retryable: true });
+    expect(f.cancelQuery).not.toHaveBeenCalled();
+    expect(f.release).toHaveBeenCalledWith(true);
+  });
+
+  it("destroys the client without ROLLBACK when BEGIN gets no response", async () => {
+    const f = fixtures((input) => {
+      if (input === "BEGIN") throw timeoutError();
+      return result([]);
+    });
+    const callback = vi.fn(async () => undefined);
+    await expect(f.runtime.transaction(callback, { domain: "transaction", operation: "beginTimeout" }))
+      .rejects.toMatchObject({ operation: "beginTimeout", retryable: true });
+    expect(callback).not.toHaveBeenCalled();
+    expect(f.query).not.toHaveBeenCalledWith("ROLLBACK");
+    expect(f.release).toHaveBeenCalledWith(true);
+  });
+
+  it("destroys the client without ROLLBACK when SAVEPOINT gets no response", async () => {
+    const f = fixtures((input) => {
+      if (input === "SAVEPOINT lcm_runtime_repository_1") throw timeoutError();
+      return result([]);
+    });
+    await expect(f.runtime.transaction(async (transaction) => {
+      const scoped = transaction as PostgreSqlTransactionScopeExecutor;
+      return scoped.savepoint(async () => "unreachable", { domain: "conversations", operation: "savepointTimeout" });
+    }, { domain: "transaction", operation: "outerSavepointTimeout" })).rejects.toMatchObject({ retryable: true });
+    expect(f.query).not.toHaveBeenCalledWith("ROLLBACK");
+    expect(f.query).not.toHaveBeenCalledWith("ROLLBACK TO SAVEPOINT lcm_runtime_repository_1");
+    expect(f.release).toHaveBeenCalledWith(true);
+  });
+
+  it("reports an unknown commit outcome without ROLLBACK when COMMIT gets no response", async () => {
+    const f = fixtures((input) => {
+      if (input === "COMMIT") throw timeoutError();
+      return result([]);
+    });
+    await expect(f.runtime.transaction(async () => "pending", {
+      domain: "transaction", operation: "commitTimeout",
+    })).rejects.toBeInstanceOf(PostgreSqlCommitOutcomeUnknownError);
+    expect(f.query).not.toHaveBeenCalledWith("ROLLBACK");
+    expect(f.release).toHaveBeenCalledWith(true);
+  });
+
+  it("leaves single statements on the connection-level deadline", async () => {
+    const f = fixtures();
+    await f.runtime.query({ text: "SELECT 1" }, { domain: "factory", operation: "single" });
+    expect(f.query).toHaveBeenCalledWith({ text: "SELECT 1" });
+    expect(f.query.mock.calls.every(([input]) => !(typeof input === "object" && input !== null && "query_timeout" in input)))
+      .toBe(true);
+  });
+
+  it("extends the deadline of a multi-statement text by one statement budget per statement", async () => {
+    const f = fixtures();
+    const text = statementSeparators(2);
+    await f.runtime.query({ text, values: [] }, { domain: "factory", operation: "multi" });
+    expect(f.query).toHaveBeenCalledWith({ text, values: [], query_timeout: 300 * 3 + 5000 });
+  });
+
+  it("clamps the multi-statement deadline to the largest timer delay", async () => {
+    const f = fixtures();
+    const runtime = new PostgreSqlRuntime({ ...SETTINGS, statementTimeoutMs: 3_600_000 }, f.dependencies);
+    const text = statementSeparators(1000);
+    await runtime.query({ text }, { domain: "factory", operation: "clamped" });
+    expect(f.query).toHaveBeenCalledWith({ text, query_timeout: 2_147_483_647 });
+  });
+
+  it.each([
+    ["a single statement", "SELECT 1", undefined],
+    ["a multi-statement text", statementSeparators(3), 300 * 4 + 5000],
+  ])("sets the deadline of a cancellable query for %s", async (_label, text, expected) => {
+    const controller = new AbortController();
+    let target: QueryWithCallback | undefined;
+    const f = fixtures((input) => {
+      if (typeof input === "object" && input !== null && "text" in input && !("callback" in input)) {
+        return result([{ pid: 9 }]);
+      }
+      target = input as QueryWithCallback;
+      return target;
+    });
+    const pending = f.runtime.query({ text }, {
+      domain: "factory", operation: "signalledDeadline", signal: controller.signal,
+    });
+    await vi.waitFor(() => expect(target).toBeDefined());
+    expect((target as { query_timeout?: number }).query_timeout).toBe(expected);
+    target?.callback(null, result([]));
+    await pending;
+    expect(f.release).toHaveBeenCalledWith(false);
+  });
+});
+

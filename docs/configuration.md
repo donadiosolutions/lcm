@@ -637,6 +637,16 @@ timeout settings in `~/.lcm/config.json`:
 | `statementTimeoutMs` | `60000` | `1`-`3600000` |
 | `snapshotIdleTimeoutMs` | `300000` | `1`-`3600000` |
 
+A query that receives no response from the server (for example after a network
+partition) is abandoned by the client after `statementTimeoutMs` plus a
+transport grace of `connectionTimeoutMs` (at least 5 seconds). It then fails
+with a retryable storage error and its connection is discarded. With the
+defaults this is 70 seconds, so a caller whose own deadline is shorter (for
+example a 60 second per-request deadline) still times out first; lower
+`statementTimeoutMs` to detect a dead connection sooner. A migration script
+that sends several statements in one request gets one `statementTimeoutMs`
+per statement. An event-loop stall longer than the deadline can also trip it.
+
 `snapshotIdleTimeoutMs` bounds only the read-only, repeatable-read snapshot
 transaction that a portable transfer holds open for the lifetime of its source
 handle (`idle_in_transaction_session_timeout`, set with `SET LOCAL` semantics
