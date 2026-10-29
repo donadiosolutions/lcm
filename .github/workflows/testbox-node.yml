@@ -1,31 +1,28 @@
-name: SEC-DAEMON-PEER runtime metadata only
+name: SEC-DAEMON-PEER empty native job capability
 
-# Replacement for registration 397854550 on the isolated ref only; never merge.
-# No selector or future capsule/native/acquisition mode is reachable.
+# Registration397854550; isolated ref only, never merge. SOURCE ONLY, no grant.
 on:
   workflow_dispatch:
     inputs:
       expected_sha:
-        description: Exact NEW reviewed isolated-ref commit SHA
+        description: Exact NEW root-reviewed isolated-ref commit SHA
         required: true
         type: string
       confirmation:
-        description: Enter METADATA_RUNTIME_PIN_20261029
+        description: Enter NATIVE_EMPTY_JOB_CAPABILITY_20261029
         required: true
         type: string
-
 permissions: {}
 concurrency:
   group: sec-daemon-peer-metadata-preflight-20261029
   cancel-in-progress: false
-
 jobs:
-  metadata:
-    if: github.event_name == 'workflow_dispatch' && github.repository == 'donadiosolutions/lcm' && github.ref == 'refs/heads/security/daemon-peer-metadata-preflight-20261029' && github.sha == inputs.expected_sha && github.workflow_sha == inputs.expected_sha && inputs.confirmation == 'METADATA_RUNTIME_PIN_20261029'
+  native_empty_job:
+    if: github.event_name == 'workflow_dispatch' && github.repository == 'donadiosolutions/lcm' && github.ref == 'refs/heads/security/daemon-peer-metadata-preflight-20261029' && github.sha == inputs.expected_sha && github.workflow_sha == inputs.expected_sha && github.workflow_ref == 'donadiosolutions/lcm/.github/workflows/testbox-node.yml@refs/heads/security/daemon-peer-metadata-preflight-20261029' && inputs.expected_sha != '8deab738ceff4f2de0093e6f5cf5788a41081e95' && inputs.confirmation == 'NATIVE_EMPTY_JOB_CAPABILITY_20261029'
     runs-on: windows-2025
     timeout-minutes: 3
     steps:
-      - name: Observe bounded provided runtime metadata
+      - name: Fixed zero-child native capability only
         shell: pwsh
         timeout-minutes: 1
         env:
@@ -34,256 +31,559 @@ jobs:
           PREFLIGHT_WORKFLOW_SHA: ${{ github.workflow_sha }}
           PREFLIGHT_WORKFLOW_REF: ${{ github.workflow_ref }}
         run: |
-          # Review-only metadata reader; dispatch requires separate Root admission.
-          # No child, native calls, dynamic types, import, acquisition or closure claim.
-          # Earliest ConstrainedLanguage-safe comparison: no method, constructor or
-          # serializer precedes it. Do not alter the session's language policy.
-          # RestrictedLanguage/NoLanguage may reject scripts or member access before
-          # either branch; executable script start is a precondition, not catchable here.
-          if ($ExecutionContext.SessionState.LanguageMode -eq 'ConstrainedLanguage') {
-            '{"schema":"sec-daemon-peer-runtime-pin-v1","status":"refused","reason":"language-mode","observationComplete":false,"closureComplete":false,"pin":"unproved","languageMode":"ConstrainedLanguage","ffiProbed":false,"nativeProbed":false,"jobCapsuleImplemented":"unproved","jobCapsuleEnforced":"unproved","sealedArtifactAncestry":"unproved","nodeAcquisition":"unproved","nodeRuntimePin":"unproved","nativeIdentity":"unproved","physicalAllocationBound":"unproved","counterSemantics":"logical-counters-refusal-may-retain-reservations-not-physical-io","cleanup":"unproved"}'
+          # PRIVATE REVIEW CANDIDATE. This is a native capability phase after source/runtime gates.
+          # Provided Windows+runner supervisor+pwsh/.NET are adopted TCB, not closed runtime.
+          if($ExecutionContext.SessionState.LanguageMode -ne 'FullLanguage') {
+            '{"schema":"sec-daemon-peer-native-empty-v1","status":"refused","reason":"language-mode","nativeAttempted":false}'
             exit 1
           }
-          if ($ExecutionContext.SessionState.LanguageMode -ne 'FullLanguage') {
-            '{"schema":"sec-daemon-peer-runtime-pin-v1","status":"refused","reason":"language-mode","observationComplete":false,"closureComplete":false,"pin":"unproved","languageMode":"unsupported","ffiProbed":false,"nativeProbed":false,"jobCapsuleImplemented":"unproved","jobCapsuleEnforced":"unproved","sealedArtifactAncestry":"unproved","nodeAcquisition":"unproved","nodeRuntimePin":"unproved","nativeIdentity":"unproved","physicalAllocationBound":"unproved","counterSemantics":"logical-counters-refusal-may-retain-reservations-not-physical-io","cleanup":"unproved"}'
-            exit 1
-          }
-          # FullLanguage bootstrap failures cannot depend on report/timer/UTF8 existence.
+          # Core-only defaults precede fallible bootstrap; early language literal stays first.
+          $stage='bootstrap';$exitCode=1
           try {
-            $ErrorActionPreference = 'Stop'
-            $ProgressPreference = 'SilentlyContinue'
-            $timer = [Diagnostics.Stopwatch]::StartNew()
-            $utf8 = [Text.UTF8Encoding]::new($false)
-            $root = 'C:\Program Files\PowerShell\7'
-            $caps = [ordered]@{ files = 128; loadedAssemblies = 128; unionRows = 128; fileBytes = 67108864; accountedBytes = 268435456; readCalls = 32768; readSize = 65536; fileMetadataCalls = 256; streamLengthCalls = 256; versionReads = 128; openCalls = 128; hashCreations = 128; assemblySnapshots = 1; assemblyRowsInspected = 128; assemblyPropertyReads = 384; milliseconds = 20000; jsonBytes = 1048576 }
-            $counts = [ordered]@{ listedFiles = 0; loadedAssemblies = 0; dynamicAssemblyRows = 0; locationlessAssemblyRows = 0; unionRows = 0; hashedFiles = 0; missingFiles = 0; readCalls = 0; readBytes = [long]0; metadataBytes = [long]0; accountedBytes = [long]0; fileMetadataCalls = 0; streamLengthCalls = 0; versionReads = 0; openCalls = 0; hashCreations = 0; assemblySnapshots = 0; assemblyRowsInspected = 0; assemblyPropertyReads = 0 }
-            $rows = [Collections.Generic.List[object]]::new()
-            $map = [Collections.Generic.Dictionary[string,object]]::new([StringComparer]::OrdinalIgnoreCase)
-            $report = [ordered]@{
-              schema = 'sec-daemon-peer-runtime-pin-v1'; status = 'refused'; reason = 'gate'; observationComplete = $false
-              closureComplete = $false; pin = 'unproved'; ffiProbed = $false; nativeProbed = $false
-              jobCapsuleImplemented = 'unproved'; jobCapsuleEnforced = 'unproved'; sealedArtifactAncestry = 'unproved'
-              nodeAcquisition = 'unproved'; nodeRuntimePin = 'unproved'; nativeIdentity = 'unproved'; cleanup = 'unproved'
-              osIoDeadline = 'cooperative-only-stalled-os-io-not-bounded'; physicalAllocationBound = 'unproved'
-              assemblySnapshotAllocation = 'materialized-before-count-guard'; lazyDependencies = 'unproved'
-              runtimeAncestrySeal = 'unproved'; dependencyManifests = 'hashed-only-not-parsed'; dependencyEntriesParsed = 0
-              producerSha = 'unproved'; workflowSha = 'unproved'; imageOS = 'unproved'; imageVersion = 'unproved'; osVersion = 'unproved'
-              processRole = 'unproved'; psVersion = 'unproved'; clrVersion = 'unproved'; frameworkVersion = 'unproved'
-              languageMode = 'unproved'; dynamicCodeSupported = 'unproved'; dynamicCodeEmissionWorks = 'unproved'; pointerBytes = 0; architecture = 'unproved'
-              counterSemantics = 'logical-counters-refusal-may-retain-reservations-not-physical-io'
-              caps = $caps; counts = $counts; files = $rows; elapsedMilliseconds = 0
-            }
-          } catch {
-            '{"schema":"sec-daemon-peer-runtime-pin-v1","status":"refused","reason":"bootstrap","observationComplete":false,"closureComplete":false,"pin":"unproved","languageMode":"FullLanguage","ffiProbed":false,"nativeProbed":false,"jobCapsuleImplemented":"unproved","jobCapsuleEnforced":"unproved","sealedArtifactAncestry":"unproved","nodeAcquisition":"unproved","nodeRuntimePin":"unproved","nativeIdentity":"unproved","physicalAllocationBound":"unproved","counterSemantics":"logical-counters-refusal-may-retain-reservations-not-physical-io","cleanup":"unproved"}'
-            exit 1
-          }
-          function Budget {
-            if ($timer.ElapsedMilliseconds -ge 20000) { throw 'elapsed' }
-          }
-          # Operation counters are logical pre-call reservations/attempts, not a count
-          # of transitive getter calls, internal operations, CPU time or physical I/O.
-          function Count([string]$Name) {
-            Budget
-            if ($counts[$Name] -ge $caps[$Name]) { throw 'operations' }
-            $counts[$Name]++
-          }
-          # REFUSED byte counters may retain unused reservation slack if a read throws
-          # or an elapsed check preempts its refund. Never interpret them as actual I/O.
-          function Charge([long]$Amount, [string]$Kind) {
-            Budget
-            if ($Amount -lt 0 -or $Amount -gt (268435456 - $counts.accountedBytes)) { throw 'bytes' }
-            $counts.accountedBytes += $Amount
-            $counts[$Kind] += $Amount
-          }
-          function PublicLeaf([string]$Path) {
-            Budget
-            if ([string]::IsNullOrEmpty($Path) -or $Path.Length -gt 512) { throw 'path' }
-            $full = [IO.Path]::GetFullPath($Path)
-            if (-not $full.StartsWith($root + '\', [StringComparison]::OrdinalIgnoreCase)) { throw 'unexpected-location' }
-            $leaf = $full.Substring($root.Length + 1)
-            if ($leaf.Length -gt 128 -or $leaf -cnotmatch '^[A-Za-z0-9_.-]+$' -or $leaf -cin @('.', '..')) { throw 'unexpected-location' }
-            return $leaf
-          }
-          function NewRow([string]$Leaf, [string]$Role, [bool]$Listed, [bool]$Required) {
-            Budget
-            if ($rows.Count -ge 128) { throw 'union-limit' }
-            $row = [ordered]@{ publicRelativePath = 'pshome/' + $Leaf; role = $Role; listed = $Listed; loaded = $false; required = $Required; status = 'unobserved'; hashed = $false; bytes = $null; sha256 = $null; fileVersion = $null; assemblyVersion = $null }
-            [void]$rows.Add($row)
-            $map.Add($Leaf, $row)
-            $counts.unionRows++
-            return $row
-          }
-          function UnboundAssembly([string]$Role) {
-            Budget
-            if ($rows.Count -ge 128) { throw 'union-limit' }
-            # Runtime-created/locationless metadata is not a filesystem member or proof
-            # that emission works. No assembly name/private location is output or loaded.
-            [void]$rows.Add([ordered]@{ publicRelativePath = $null; role = $Role; listed = $false; loaded = $true; required = $false; status = 'unbound-location'; hashed = $false; bytes = $null; sha256 = $null; fileVersion = $null; assemblyVersion = $null })
-            $counts.unionRows++
-          }
-          function Metadata([string]$Path) {
-            Count 'fileMetadataCalls'
-            # A conservative logical metadata allowance, not physical I/O/allocation proof.
-            Charge 4096 'metadataBytes'
-            $item = [IO.FileInfo]::new($Path)
-            $item.Refresh()
-            Budget
-            return $item
-          }
-          function HashCandidate([string]$Leaf, $Row) {
-            $path = $root + '\' + $Leaf
-            $before = Metadata $path
-            if (-not $before.Exists) {
-              $Row.status = 'missing'; $counts.missingFiles++
-              if ($Row.required -or $Row.loaded) { throw 'required-missing' }
-              return
-            }
-            if (($before.Attributes -band ([IO.FileAttributes]::Directory -bor [IO.FileAttributes]::ReparsePoint -bor [IO.FileAttributes]::Device)) -ne 0) { throw 'file-kind' }
-            $length = [long]$before.Length
-            $stamp = $before.LastWriteTimeUtc.Ticks
-            $attributes = $before.Attributes
-            if ($length -lt 0 -or $length -gt 67108864) { throw 'file-size' }
-            $stream = $null; $hash = $null; $total = [long]0
+          $ErrorActionPreference='Stop';$ProgressPreference='SilentlyContinue'
+          $overall=[Diagnostics.Stopwatch]::StartNew()
+          $stage='dispatch'
+          if($env:GITHUB_EVENT_NAME -cne 'workflow_dispatch' -or $env:GITHUB_REPOSITORY -cne 'donadiosolutions/lcm' -or
+             $env:GITHUB_REF -cne 'refs/heads/security/daemon-peer-metadata-preflight-20261029' -or
+             $env:PREFLIGHT_EXPECTED_SHA -cnotmatch '^[0-9a-f]{40}$' -or
+             $env:PREFLIGHT_EXPECTED_SHA -ceq '8deab738ceff4f2de0093e6f5cf5788a41081e95' -or
+             $env:GITHUB_SHA -cne $env:PREFLIGHT_EXPECTED_SHA -or
+             $env:PREFLIGHT_WORKFLOW_SHA -cne $env:PREFLIGHT_EXPECTED_SHA -or
+             $env:PREFLIGHT_WORKFLOW_REF -cne 'donadiosolutions/lcm/.github/workflows/testbox-node.yml@refs/heads/security/daemon-peer-metadata-preflight-20261029' -or
+             $env:PREFLIGHT_CONFIRMATION -cne 'NATIVE_EMPTY_JOB_CAPABILITY_20261029') { throw 'dispatch-gate' }
+          $stage='runtime'
+          if(-not $IsWindows -or $env:RUNNER_OS -cne 'Windows' -or $env:RUNNER_ARCH -cne 'X64' -or $env:ImageOS -cne 'win25-vs2026' -or $env:ImageVersion -cne '20261021.278.1' -or
+             [Environment]::OSVersion.Version.ToString() -cne '10.0.26100.0' -or
+             $PSHOME -cne 'C:\Program Files\PowerShell\7' -or [Environment]::ProcessPath -cne 'C:\Program Files\PowerShell\7\pwsh.exe' -or
+             $PSVersionTable.PSVersion.ToString() -cne '7.6.7' -or [Environment]::Version.ToString() -cne '10.0.13' -or
+             [Runtime.InteropServices.RuntimeInformation]::FrameworkDescription -cne '.NET 10.0.13' -or
+             [Runtime.InteropServices.RuntimeInformation]::ProcessArchitecture.ToString() -cne 'X64' -or [IntPtr]::Size -ne 8 -or
+             -not [Runtime.CompilerServices.RuntimeFeature]::IsDynamicCodeSupported -or
+             $env:SystemRoot -cne 'C:\Windows' -or $env:WINDIR -cne 'C:\Windows') { throw 'runtime-image-or-mode-drift' }
+          $stage='runtime-pin'
+          # Literal30 hashes only. Unhashed/lazy OS/runtime dependencies stay in adopted TCB.
+          $pinsJson=@'
+          [{"publicRelativePath":"pshome/pwsh.exe","role":"process-image","bytes":301360,"sha256":"fa2c8bb1e35cdd62ad15cd06a1d8f2c5961e9725a9bfa1e7cfd2c322f49e9619","fileVersion":"7.6.7.500","assemblyVersion":null},{"publicRelativePath":"pshome/pwsh.dll","role":"powershell-entry","bytes":157464,"sha256":"a583a3721feebc4f9552a02358bc81bbdd41e2e18bb3f424226f2b1e0bf07deb","fileVersion":"7.6.7.500","assemblyVersion":"7.6.0.500"},{"publicRelativePath":"pshome/System.Management.Automation.dll","role":"powershell-engine","bytes":19666744,"sha256":"70701f20afbbf4e763924c2bdd0c0e9a20eec35a0e4eff439e0ccf77f20d6b26","fileVersion":"7.6.7.500","assemblyVersion":"7.6.0.500"},{"publicRelativePath":"pshome/coreclr.dll","role":"clr-native-runtime","bytes":4613456,"sha256":"fefc3efc0a96bd40874bb6e91028b9d1a907db37e1facf5e337fc63986b7dea2","fileVersion":"10.0.1326.46716","assemblyVersion":null},{"publicRelativePath":"pshome/System.Private.CoreLib.dll","role":"clr-core-library","bytes":16033576,"sha256":"8dfc31dfb4783a981179036f492d2690303e6e6571c7f260901b1b9ebc9e64ae","fileVersion":"10.0.1326.46716","assemblyVersion":"10.0.0.0"},{"publicRelativePath":"pshome/hostfxr.dll","role":"runtime-host","bytes":379688,"sha256":"777e1c2032cf56dd5cae35b7194ba4ca1e95addb1a7316d9ce4e1d8f4648e980","fileVersion":"10.0.1326.46716","assemblyVersion":null},{"publicRelativePath":"pshome/hostpolicy.dll","role":"runtime-host-policy","bytes":378664,"sha256":"185b3630bafb120ed9a697d581e9bccecca385b2989937cf75bf2dbb0d63c435","fileVersion":"10.0.1326.46716","assemblyVersion":null},{"publicRelativePath":"pshome/pwsh.deps.json","role":"dependency-manifest","bytes":99499,"sha256":"a01883aeeb2217aeb1d7ec944d649376104e7a874ca4ea71e7f36448c1519dc2","fileVersion":"0.0.0.0","assemblyVersion":null},{"publicRelativePath":"pshome/pwsh.runtimeconfig.json","role":"runtime-configuration","bytes":790,"sha256":"8a6363fba1f89c0688e3594ef4fe7b9036126f04957c5fe56858cba020b76b33","fileVersion":"0.0.0.0","assemblyVersion":null},{"publicRelativePath":"pshome/System.Runtime.dll","role":"runtime-facade","bytes":44880,"sha256":"c4da0c1560b0544637fd686a520fa04d62cdcb50979d59526b0b720e91a6096d","fileVersion":"10.0.1326.46716","assemblyVersion":"10.0.0.0"},{"publicRelativePath":"pshome/System.Runtime.InteropServices.dll","role":"interop-metadata","bytes":112424,"sha256":"46acf58a1eeaaf93184664fb000f983f142de97216b73ca7356458a5fd088e1e","fileVersion":"10.0.1326.46716","assemblyVersion":"10.0.0.0"},{"publicRelativePath":"pshome/System.Runtime.CompilerServices.Unsafe.dll","role":"runtime-helper","bytes":15144,"sha256":"e757b9ed064137268e7cbc1d06a672c47f20d3649f05fc4357fab7bc67205871","fileVersion":"10.0.1326.46716","assemblyVersion":null},{"publicRelativePath":"pshome/System.Reflection.Emit.dll","role":"emit-candidate","bytes":309072,"sha256":"c73a09e836ecb95eba3974a75a0c365ac414d3610a7c6bfe9f2c7d1f1c1d3abd","fileVersion":"10.0.1326.46716","assemblyVersion":null},{"publicRelativePath":"pshome/System.Reflection.Emit.ILGeneration.dll","role":"emit-il-candidate","bytes":15656,"sha256":"8fb6b6c5c4f57356beb2d54f003929bbe6e544f4825f647e16bce60482d4d5d1","fileVersion":"10.0.1326.46716","assemblyVersion":"10.0.0.0"},{"publicRelativePath":"pshome/System.Reflection.Emit.Lightweight.dll","role":"emit-lightweight-candidate","bytes":15656,"sha256":"243ca3af5366ff11e8debddda8d4d8ada2a7b32eaebea6d405885fc3ad25d0a6","fileVersion":"10.0.1326.46716","assemblyVersion":"10.0.0.0"},{"publicRelativePath":"pshome/System.Reflection.Primitives.dll","role":"reflection-metadata","bytes":15656,"sha256":"f22fb791c511cbf9fb8948f209180d871d75d2c0038e6d46c9c31be05cf7fd4c","fileVersion":"10.0.1326.46716","assemblyVersion":"10.0.0.0"},{"publicRelativePath":"pshome/System.IO.FileSystem.AccessControl.dll","role":"filesystem-security-candidate","bytes":104232,"sha256":"f4a99e35120265aa6dcab682fb583f4357c9ff9b434fc1cb6c31d20b20c2f197","fileVersion":"10.0.1326.46716","assemblyVersion":"10.0.0.0"},{"publicRelativePath":"pshome/System.Security.AccessControl.dll","role":"security-candidate","bytes":227152,"sha256":"a6d6bcfc6d4f9b943b3e6c483d3c75c0781e456ea823a68c43243aa7062e1cf8","fileVersion":"10.0.1326.46716","assemblyVersion":"10.0.0.0"},{"publicRelativePath":"pshome/System.IO.Compression.dll","role":"gzip-candidate","bytes":419624,"sha256":"9183872e401e908a22fb40311e414882e87b2cb2d8852fc6588fda608433c928","fileVersion":"10.0.1326.46716","assemblyVersion":null},{"publicRelativePath":"pshome/System.IO.Compression.FileSystem.dll","role":"compression-facade","bytes":15184,"sha256":"bb8457e8af51e7762fe036d0a93a69ba318d7dbbbec84ab56e050e8e488f1926","fileVersion":"10.0.1326.46716","assemblyVersion":null},{"publicRelativePath":"pshome/System.Formats.Tar.dll","role":"tar-candidate","bytes":288552,"sha256":"ae21341f883b6d08f3d3a109a84378655e9ae1dcaf2750392f88c1001e273af4","fileVersion":"10.0.1326.46716","assemblyVersion":null},{"publicRelativePath":"pshome/System.Security.Cryptography.dll","role":"hashing-runtime","bytes":2549544,"sha256":"628b24ca9bd80ec9712bc258b75d4d6098d6760eb2580a8fc92af7396b458f3b","fileVersion":"10.0.1326.46716","assemblyVersion":"10.0.0.0"},{"publicRelativePath":"pshome/System.Security.Cryptography.Primitives.dll","role":"hashing-facade","bytes":15656,"sha256":"544c8dc1bf23b906a9cc79e4101495a63ef4eeb9b3b14115bd15f2043d5a5bfb","fileVersion":"10.0.1326.46716","assemblyVersion":null},{"publicRelativePath":"pshome/System.Net.Http.dll","role":"http-candidate","bytes":1746728,"sha256":"125ef3b11314553008f5746a3de9f0260c57414a06c22c016ddb45d894e7d102","fileVersion":"10.0.1326.46716","assemblyVersion":null},{"publicRelativePath":"pshome/System.Diagnostics.FileVersionInfo.dll","role":"version-resource-reader","bytes":46928,"sha256":"ea7fb743af87e11aefb7db777043c210dbcd45c09bfe6387d892e94b50aa8c90","fileVersion":"10.0.1326.46716","assemblyVersion":"10.0.0.0"},{"publicRelativePath":"pshome/System.Text.Json.dll","role":"json-runtime-candidate","bytes":1890128,"sha256":"83ef4b51a5f3a208659da10829b13900c1b64736e2b15c9207fda6528be543c5","fileVersion":"10.0.1326.46716","assemblyVersion":null},{"publicRelativePath":"pshome/Newtonsoft.Json.dll","role":"powershell-json-candidate","bytes":1824560,"sha256":"570bcb67920bf95ed9a184189b9fc42ca94131b1cb49e7f147e65586dbd1ed78","fileVersion":"13.0.4.30916","assemblyVersion":"13.0.0.0"},{"publicRelativePath":"pshome/System.Collections.dll","role":"collections-runtime","bytes":296744,"sha256":"c72d0e86c0a8d9f635e92b198f4dc23340c9118adb8122fcfd2097e5aa51a083","fileVersion":"10.0.1326.46716","assemblyVersion":"10.0.0.0"},{"publicRelativePath":"pshome/System.Console.dll","role":"console-runtime","bytes":169808,"sha256":"ee649785683c94523e4e15b7d905a99312ad00615d02f47ff9e1fd436524ef03","fileVersion":"10.0.1326.46716","assemblyVersion":"10.0.0.0"},{"publicRelativePath":"pshome/System.IO.FileSystem.dll","role":"filesystem-facade","bytes":15696,"sha256":"beed30f8d821275277a73d7aa5bf026809c43943329f73831aba99f075139d5c","fileVersion":"10.0.1326.46716","assemblyVersion":null}]
+          '@
+          $pins=ConvertFrom-Json -InputObject $pinsJson
+          if($pins.Count -ne 30) { throw 'pins-count' }
+          $logicalBytes=[Int64]0;$readCalls=0;$hashed=0;$buf=[byte[]]::new(65536)
+          foreach($pin in $pins) {
+            if($overall.ElapsedMilliseconds -ge 20000 -or $pin.publicRelativePath -cnotmatch '^pshome/[A-Za-z0-9.]+$') { throw 'prelude-budget-or-path' }
+            $path='C:\Program Files\PowerShell\7\'+$pin.publicRelativePath.Substring(7)
+            $info=[IO.FileInfo]::new($path);$info.Refresh()
+            if(-not $info.Exists -or ($info.Attributes -band [IO.FileAttributes]::ReparsePoint) -ne 0 -or
+               ($info.Attributes -band [IO.FileAttributes]::Directory) -ne 0 -or $info.Length -ne $pin.bytes -or
+               $info.Length -lt 0 -or $info.Length -gt 67108864) { throw 'runtime-file-shape-drift' }
+            $stamp=$info.LastWriteTimeUtc.Ticks;$attributes=$info.Attributes
+            $logicalBytes+=$info.Length
+            if($logicalBytes -gt 268435456) { throw 'runtime-logical-byte-cap' }
+            $stream=$null;$hash=$null
             try {
-              Count 'hashCreations'
-              $hash = [Security.Cryptography.IncrementalHash]::CreateHash([Security.Cryptography.HashAlgorithmName]::SHA256)
-              Budget
-              Count 'openCalls'
-              # Read sharing only. This is a temporary observation handle, not a seal lease.
-              $stream = [IO.File]::Open($path, [IO.FileMode]::Open, [IO.FileAccess]::Read, [IO.FileShare]::Read)
-              Budget
-              Count 'streamLengthCalls'
-              $openedLength = $stream.Length
-              Budget
-              if ($openedLength -ne $length) { throw 'changed' }
-              $buffer = [byte[]]::new(65536)
-              while ($total -lt $length) {
-                Count 'readCalls'
-                $request = [int][Math]::Min(65536, $length - $total)
-                Charge $request 'readBytes'
-                $read = $stream.Read($buffer, 0, $request)
-                Budget
-                if ($read -le 0 -or $read -gt $request) { throw 'short-file' }
-                # A completed read refunds known unused request bytes. A refusal before
-                # these lines conservatively retains the reservation; each attempt counts.
-                $counts.readBytes -= $request - $read
-                $counts.accountedBytes -= $request - $read
-                $total += $read
-                $hash.AppendData($buffer, 0, $read)
-                Budget
+              $stream=[IO.FileStream]::new($path,[IO.FileMode]::Open,[IO.FileAccess]::Read,[IO.FileShare]::Read,65536,[IO.FileOptions]::SequentialScan)
+              if($stream.Length -ne $pin.bytes) { throw 'runtime-stream-length-drift' }
+              $hash=[Security.Cryptography.IncrementalHash]::CreateHash([Security.Cryptography.HashAlgorithmName]::SHA256)
+              $actual=[Int64]0;$eof=$false
+              for($i=0;$i -lt 1025;$i++) {
+                if($overall.ElapsedMilliseconds -ge 20000 -or $readCalls -ge 4096) { throw 'runtime-read-budget' }
+                $readCalls++;$n=$stream.Read($buf,0,65536)
+                if($overall.ElapsedMilliseconds -ge 20000) { throw 'runtime-read-deadline' }
+                if($n -eq 0) { $eof=$true;break }
+                $actual+=$n;$logicalBytes+=$n
+                if($actual -gt $pin.bytes -or $logicalBytes -gt 268435456) { throw 'runtime-byte-drift' }
+                $hash.AppendData($buf,0,$n)
               }
-              Count 'streamLengthCalls'
-              $openedLength = $stream.Length
-              Budget
-              if ($openedLength -ne $length -or $total -ne $length) { throw 'changed' }
-              Count 'versionReads'
-              # Charge the whole known file conservatively for the version-resource API.
-              Charge $length 'metadataBytes'
-              $version = [Diagnostics.FileVersionInfo]::GetVersionInfo($path)
-              Budget
-              $numericVersion = '{0}.{1}.{2}.{3}' -f $version.FileMajorPart, $version.FileMinorPart, $version.FileBuildPart, $version.FilePrivatePart
-              if ($numericVersion.Length -gt 64 -or $numericVersion -cnotmatch '^[0-9.]+$') { throw 'version' }
-              $after = Metadata $path
-              if (-not $after.Exists -or $after.Length -ne $length -or $after.LastWriteTimeUtc.Ticks -ne $stamp -or $after.Attributes -ne $attributes) { throw 'changed' }
-              $Row.sha256 = [Convert]::ToHexString($hash.GetHashAndReset()).ToLowerInvariant()
-              $Row.bytes = $length; $Row.fileVersion = $numericVersion; $Row.hashed = $true; $Row.status = 'hashed-observation'
-              $counts.hashedFiles++
-              Budget
-            } finally {
-              # Disposal may itself stall. No hard cleanup deadline or seal is claimed.
-              if ($null -ne $stream) { $stream.Dispose() }
-              if ($null -ne $hash) { $hash.Dispose() }
+              if(-not $eof -or $actual -ne $pin.bytes -or $stream.Length -ne $pin.bytes -or
+                 [Convert]::ToHexString($hash.GetHashAndReset()).ToLowerInvariant() -cne $pin.sha256) { throw 'runtime-hash-drift' }
+            } finally { if($null -ne $hash){$hash.Dispose()};if($null -ne $stream){$stream.Dispose()} }
+            if($overall.ElapsedMilliseconds -ge 20000) { throw 'runtime-prelude-deadline' }
+            $version=[Diagnostics.FileVersionInfo]::GetVersionInfo($path)
+            $numericVersion='{0}.{1}.{2}.{3}' -f $version.FileMajorPart,$version.FileMinorPart,$version.FileBuildPart,$version.FilePrivatePart
+            if($numericVersion -cne $pin.fileVersion) { throw 'runtime-file-version-drift' }
+            if($null -ne $pin.assemblyVersion) {
+              $logicalBytes+=$pin.bytes
+              if($logicalBytes -gt 268435456 -or $overall.ElapsedMilliseconds -ge 20000) { throw 'runtime-assembly-budget' }
+              if([Reflection.AssemblyName]::GetAssemblyName($path).Version.ToString() -cne $pin.assemblyVersion) { throw 'runtime-assembly-version-drift' }
             }
+            $after=[IO.FileInfo]::new($path);$after.Refresh()
+            if(-not $after.Exists -or $after.Length -ne $pin.bytes -or $after.LastWriteTimeUtc.Ticks -ne $stamp -or $after.Attributes -ne $attributes) { throw 'runtime-file-changed' }
+            $hashed++
           }
-          try {
-            if ($env:GITHUB_EVENT_NAME -cne 'workflow_dispatch' -or $env:GITHUB_REPOSITORY -cne 'donadiosolutions/lcm' -or $env:GITHUB_REF -cne 'refs/heads/security/daemon-peer-metadata-preflight-20261029' -or $env:GITHUB_SHA -cnotmatch '^[0-9a-f]{40}$' -or $env:GITHUB_SHA -ceq 'd9b7f186be6eddfd0bcfbb01c52c73830d6c7c5b' -or $env:PREFLIGHT_EXPECTED_SHA -cne $env:GITHUB_SHA -or $env:PREFLIGHT_WORKFLOW_SHA -cne $env:GITHUB_SHA -or $env:PREFLIGHT_WORKFLOW_REF -cne 'donadiosolutions/lcm/.github/workflows/testbox-node.yml@refs/heads/security/daemon-peer-metadata-preflight-20261029' -or $env:PREFLIGHT_CONFIRMATION -cne 'METADATA_RUNTIME_PIN_20261029') { throw 'gate' }
-            $report.producerSha = $env:GITHUB_SHA; $report.workflowSha = $env:PREFLIGHT_WORKFLOW_SHA
-            if ($env:RUNNER_OS -cne 'Windows' -or $env:RUNNER_ARCH -cne 'X64' -or $env:ImageOS -cne 'win25-vs2026' -or $env:ImageVersion -cne '20261021.278.1' -or [Environment]::OSVersion.Version.ToString() -cne '10.0.26100.0') { throw 'image' }
-            $report.imageOS = 'win25-vs2026'; $report.imageVersion = '20261021.278.1'; $report.osVersion = '10.0.26100.0'
-            if (-not $PSHOME.Equals($root, [StringComparison]::OrdinalIgnoreCase) -or [IntPtr]::Size -ne 8 -or [Runtime.InteropServices.RuntimeInformation]::ProcessArchitecture.ToString() -cne 'X64' -or -not [Environment]::ProcessPath.Equals(($root + '\pwsh.exe'), [StringComparison]::OrdinalIgnoreCase)) { throw 'runtime-location' }
-            $report.processRole = 'pshome/pwsh.exe'; $report.pointerBytes = 8; $report.architecture = 'X64'
-            $language = $ExecutionContext.SessionState.LanguageMode.ToString()
-            if ($language -cnotin @('FullLanguage', 'ConstrainedLanguage', 'RestrictedLanguage', 'NoLanguage')) { throw 'language' }
-            $report.languageMode = $language
-            if ($language -cne 'FullLanguage') { throw 'language' }
-            $ps = $PSVersionTable.PSVersion.ToString(); $clr = [Environment]::Version.ToString(); $framework = [Runtime.InteropServices.RuntimeInformation]::FrameworkDescription
-            if ($ps.Length -gt 64 -or $ps -cnotmatch '^[0-9A-Za-z.+-]+$' -or $clr.Length -gt 64 -or $clr -cnotmatch '^[0-9.]+$' -or $framework.Length -gt 64 -or $framework -cnotmatch '^\.NET [0-9A-Za-z.+-]+$') { throw 'version' }
-            $report.psVersion = $ps; $report.clrVersion = $clr; $report.frameworkVersion = $framework
-            $report.dynamicCodeSupported = [Runtime.CompilerServices.RuntimeFeature]::IsDynamicCodeSupported
-            # Fixed depth-zero candidates only. Optional absence remains an explicit gap.
-            $candidates = @(
-              @('pwsh.exe', 'process-image', $true), @('pwsh.dll', 'powershell-entry', $true),
-              @('System.Management.Automation.dll', 'powershell-engine', $true), @('coreclr.dll', 'clr-native-runtime', $true),
-              @('System.Private.CoreLib.dll', 'clr-core-library', $true), @('hostfxr.dll', 'runtime-host', $false),
-              @('hostpolicy.dll', 'runtime-host-policy', $false), @('pwsh.deps.json', 'dependency-manifest', $false),
-              @('pwsh.runtimeconfig.json', 'runtime-configuration', $false), @('System.Runtime.dll', 'runtime-facade', $false),
-              @('System.Runtime.InteropServices.dll', 'interop-metadata', $false), @('System.Runtime.CompilerServices.Unsafe.dll', 'runtime-helper', $false),
-              @('System.Reflection.Emit.dll', 'emit-candidate', $false), @('System.Reflection.Emit.ILGeneration.dll', 'emit-il-candidate', $false),
-              @('System.Reflection.Emit.Lightweight.dll', 'emit-lightweight-candidate', $false), @('System.Reflection.Primitives.dll', 'reflection-metadata', $false),
-              @('System.IO.FileSystem.AccessControl.dll', 'filesystem-security-candidate', $false), @('System.Security.AccessControl.dll', 'security-candidate', $false),
-              @('System.IO.Compression.dll', 'gzip-candidate', $false), @('System.IO.Compression.FileSystem.dll', 'compression-facade', $false),
-              @('System.Formats.Tar.dll', 'tar-candidate', $false), @('System.Security.Cryptography.dll', 'hashing-runtime', $false),
-              @('System.Security.Cryptography.Primitives.dll', 'hashing-facade', $false), @('System.Net.Http.dll', 'http-candidate', $false),
-              @('System.Diagnostics.FileVersionInfo.dll', 'version-resource-reader', $false), @('System.Text.Json.dll', 'json-runtime-candidate', $false),
-              @('Newtonsoft.Json.dll', 'powershell-json-candidate', $false), @('System.Collections.dll', 'collections-runtime', $false),
-              @('System.Console.dll', 'console-runtime', $false), @('System.IO.FileSystem.dll', 'filesystem-facade', $false)
-            )
-            if ($candidates.Count -gt 128) { throw 'files' }
-            foreach ($candidate in $candidates) {
-              [void](NewRow $candidate[0] $candidate[1] $true $candidate[2]); $counts.listedFiles++
-            }
-            Count 'assemblySnapshots'
-            # GetAssemblies materializes before the count guard; allocation is unproved.
-            $assemblies = [AppDomain]::CurrentDomain.GetAssemblies()
-            Budget
-            if ($assemblies.Length -gt 128) { throw 'assembly-limit' }
-            $counts.loadedAssemblies = $assemblies.Length
-            foreach ($assembly in $assemblies) {
-              Count 'assemblyRowsInspected'
-              Count 'assemblyPropertyReads'
-              if ($assembly.IsDynamic) {
-                UnboundAssembly 'dynamic-assembly'
-                $counts.dynamicAssemblyRows++
-                continue
+          if($hashed -ne 30 -or $overall.ElapsedMilliseconds -ge 20000) { throw 'runtime-prelude-incomplete' }
+          # No additional file discovery, runtime installation, SDK/compiler hash forest or
+          # exhaustive managed/OS closure is performed. This is a drift check, not a seal.
+          $stage='source'
+          $canonical=@'
+          # PRIVATE SOURCE ONLY. Function definitions: no import-time Emit/native call.
+          function New-SecDaemonNativeApi {
+              if(-not $IsWindows -or [IntPtr]::Size -ne 8 -or
+                  [Runtime.InteropServices.RuntimeInformation]::ProcessArchitecture.ToString() -cne 'X64' -or
+                  $ExecutionContext.SessionState.LanguageMode.ToString() -cne 'FullLanguage' -or
+                  -not [Runtime.CompilerServices.RuntimeFeature]::IsDynamicCodeSupported) { throw 'ffi-platform-refused' }
+              $a=[Reflection.Emit.AssemblyBuilder]::DefineDynamicAssembly(
+                  [Reflection.AssemblyName]::new('SecDaemonOutsideObserver'),[Reflection.Emit.AssemblyBuilderAccess]::Run)
+              $t=$a.DefineDynamicModule('Fixed').DefineType('SecDaemonFixedNative',
+                  [Reflection.TypeAttributes]::Public -bor [Reflection.TypeAttributes]::Abstract -bor [Reflection.TypeAttributes]::Sealed)
+              $P=[IntPtr];$U=[UInt32];$I=[Int32];$Z=[UIntPtr];$V=[void];$S=[string]
+              # Closed literal surface. No caller-selected DLL/API/signature/opcode resolver.
+              # Int32 represents native BOOL; raw owned pointers represent output buffers.
+              $rows=@(
+                  @('kernel32','CreateJobObjectW',$P,@($P,$S),$true),
+                  @('kernel32','SetInformationJobObject',$I,@($P,$I,$P,$U),$true),
+                  @('kernel32','QueryInformationJobObject',$I,@($P,$I,$P,$U,$P),$true),
+                  @('kernel32','IsProcessInJob',$I,@($P,$P,$P),$true),
+                  @('kernel32','GetHandleInformation',$I,@($P,$P),$true),
+                  @('kernel32','GetProcessAffinityMask',$I,@($P,$P,$P),$true),
+                  @('kernel32','GetActiveProcessorGroupCount',[UInt16],@(),$false),
+                  @('kernel32','CloseHandle',$I,@($P),$true),
+                  @('kernel32','CreateProcessW',$I,@($S,$P,$P,$P,$I,$U,$P,$S,$P,$P),$true),
+                  @('kernel32','InitializeProcThreadAttributeList',$I,@($P,$U,$U,$P),$true),
+                  @('kernel32','UpdateProcThreadAttribute',$I,@($P,$U,$Z,$P,$Z,$P,$P),$true),
+                  @('kernel32','DeleteProcThreadAttributeList',$V,@($P),$false),
+                  @('kernel32','ResumeThread',$U,@($P),$true),
+                  @('kernel32','GetProcessId',$U,@($P),$true),
+                  @('kernel32','GetProcessTimes',$I,@($P,$P,$P,$P,$P),$true),
+                  @('kernel32','GetExitCodeProcess',$I,@($P,$P),$true),
+                  @('kernel32','WaitForSingleObject',$U,@($P,$U),$true),
+                  @('kernel32','TerminateProcess',$I,@($P,$U),$true),
+                  @('kernel32','TerminateJobObject',$I,@($P,$U),$true),
+                  @('kernel32','CreateFileW',$P,@($S,$U,$U,$P,$U,$U,$P),$true),
+                  @('kernel32','GetFileType',$U,@($P),$true),
+                  @('kernel32','GetFileInformationByHandleEx',$I,@($P,$I,$P,$U),$true),
+                  @('kernel32','ReadFile',$I,@($P,$P,$U,$P,$P),$true),
+                  @('kernel32','LocalFree',$P,@($P),$false),
+                  @('advapi32','GetSecurityInfo',$U,@($P,$I,$U,$P,$P,$P,$P,$P),$false),
+                  @('advapi32','IsValidSecurityDescriptor',$I,@($P),$false),
+                  @('advapi32','GetSecurityDescriptorLength',$U,@($P),$false),
+                  @('advapi32','IsValidAcl',$I,@($P),$false),
+                  @('advapi32','AccessCheck',$I,@($P,$P,$U,$P,$P,$P,$P,$P),$true),
+                  @('advapi32','GetTokenInformation',$I,@($P,$I,$P,$U,$P),$true),
+                  @('advapi32','LookupPrivilegeValueW',$I,@($S,$S,$P),$true)
+              )
+              $ctor=[Runtime.InteropServices.DllImportAttribute].GetConstructor([Type[]]@([string]))
+              $fields=[Reflection.FieldInfo[]]@(
+                  [Runtime.InteropServices.DllImportAttribute].GetField('EntryPoint'),
+                  [Runtime.InteropServices.DllImportAttribute].GetField('ExactSpelling'),
+                  [Runtime.InteropServices.DllImportAttribute].GetField('SetLastError'),
+                  [Runtime.InteropServices.DllImportAttribute].GetField('CallingConvention'),
+                  [Runtime.InteropServices.DllImportAttribute].GetField('CharSet'),
+                  [Runtime.InteropServices.DllImportAttribute].GetField('PreserveSig'))
+              foreach($r in $rows) {
+                  $dll='C:\Windows\System32\'+$r[0]+'.dll'
+                  $m=$t.DefinePInvokeMethod($r[1],$dll,$r[1],
+                      [Reflection.MethodAttributes]::Public -bor [Reflection.MethodAttributes]::Static -bor [Reflection.MethodAttributes]::PinvokeImpl,
+                      [Reflection.CallingConventions]::Standard,$r[2],[Type[]]$r[3],
+                      [Runtime.InteropServices.CallingConvention]::Winapi,[Runtime.InteropServices.CharSet]::Unicode)
+                  # DllImport is a pseudo attribute; verify its baked result before any call.
+                  $ca=[Reflection.Emit.CustomAttributeBuilder]::new($ctor,[object[]]@($dll),$fields,
+                      [object[]]@($r[1],$true,[bool]$r[4],[Runtime.InteropServices.CallingConvention]::Winapi,
+                          [Runtime.InteropServices.CharSet]::Unicode,$true))
+                  $m.SetCustomAttribute($ca)
+                  $m.SetImplementationFlags($m.GetMethodImplementationFlags() -bor [Reflection.MethodImplAttributes]::PreserveSig)
               }
-              Count 'assemblyPropertyReads'
-              $location = $assembly.Location
-              Budget
-              if ([string]::IsNullOrEmpty($location)) {
-                UnboundAssembly 'locationless-assembly'
-                $counts.locationlessAssemblyRows++
-                continue
+              $n=$t.CreateType()
+              foreach($r in $rows) {
+                  $di=$n.GetMethod($r[1]).GetCustomAttributes([Runtime.InteropServices.DllImportAttribute],$false)
+                  if($di.Count -ne 1 -or $di[0].Value -cne ('C:\Windows\System32\'+$r[0]+'.dll') -or
+                      $di[0].EntryPoint -cne $r[1] -or -not $di[0].ExactSpelling -or
+                      $di[0].SetLastError -ne [bool]$r[4] -or -not $di[0].PreserveSig -or
+                      $di[0].CallingConvention -ne [Runtime.InteropServices.CallingConvention]::Winapi -or
+                      $di[0].CharSet -ne [Runtime.InteropServices.CharSet]::Unicode) { throw 'ffi-metadata-refused' }
               }
-              # Refuse private/unlisted-root locations BEFORE any output; never emit them.
-              $leaf = PublicLeaf $location
-              if (-not $map.ContainsKey($leaf)) { [void](NewRow $leaf 'loaded-unlisted' $false $false) }
-              $row = $map[$leaf]
-              if ($row.loaded) { throw 'duplicate-loaded-location' }
-              $row.loaded = $true; $row.status = 'loaded-unhashed'
-              Count 'assemblyPropertyReads'
-              $assemblyVersion = $assembly.GetName().Version.ToString()
-              Budget
-              if ($assemblyVersion.Length -gt 64 -or $assemblyVersion -cnotmatch '^[0-9.]+$') { throw 'version' }
-              $row.assemblyVersion = $assemblyVersion
-            }
-            foreach ($candidate in $candidates) { HashCandidate $candidate[0] $map[$candidate[0]] }
-            Budget
-            $report.observationComplete = $true; $report.status = 'metadata-observed'; $report.reason = 'declared-candidates-only'
+              return $n
+          }
+          function New-SecNativeBuffer {
+              param([Collections.Generic.List[object]]$Owned,[int]$Bytes)
+              if($Bytes -lt 1 -or $Bytes -gt 1048576 -or $Owned.Count -ge 32) { throw 'buffer-cap' }
+              $sum=[Int64]$Bytes
+              foreach($b in $Owned) { $sum+=$b.Bytes }
+              if($sum -ge 1048576) { throw 'aggregate-buffer-cap' }
+              # Reserve all fallible managed owner construction/list growth BEFORE acquire.
+              $record=[pscustomobject]@{Pointer=[IntPtr]::Zero;Bytes=$Bytes}
+              if($Owned.Capacity -lt $Owned.Count+1) { $Owned.Capacity=$Owned.Count+1 }
+              $Owned.Add($record)
+              # Allocation failure leaves an owned zero slot with no native obligation.
+              $record.Pointer=[Runtime.InteropServices.Marshal]::AllocHGlobal($Bytes)
+              [Runtime.InteropServices.Marshal]::Copy([byte[]]::new($Bytes),0,$record.Pointer,$Bytes)
+              return $record.Pointer
+          }
+          function Clear-SecNativeBuffers {
+              param([Collections.Generic.List[object]]$Owned)
+              for($i=$Owned.Count-1;$i -ge 0;$i--) {
+                  if($Owned[$i].Pointer -ne [IntPtr]::Zero) {
+                      [Runtime.InteropServices.Marshal]::FreeHGlobal($Owned[$i].Pointer)
+                      $Owned[$i].Pointer=[IntPtr]::Zero
+                  }
+                  $Owned.RemoveAt($i)
+              }
+          }
+          # X64 layout inferences, not executed ABI proof:
+          # EXTENDED_LIMIT144 flags16/active40/affinity48/jobCommit120.
+          # ACCOUNTING48 lifetimeProcesses36/active40/terminated44. PID_LIST8+8*N IDs8.
+          # STARTUPINFOEX112 cb0/flags60/stdin80/stdout88/stderr96/attributes104.
+          # PROCESS_INFORMATION24 process0/thread8/pid16/tid20.
+          # SECURITY_ATTRIBUTES24 length0/sd8/inherit16. FILE_ID_INFO24 volume0/id128bits8.
+          # STANDARD_INFO24 eof8/links16/deletePending BOOLEAN20/directory BOOLEAN21.
+          # BASIC_INFO40 attrs32; ATTRIBUTE_TAG_INFO8 attrs0/tag4; GENERIC_MAPPING16.
+
+          # PRIVATE SOURCE ONLY. Outside observer O never joins tested job J.
+          # O is provided pwsh/.NET TCB; the provided supervisor owns O's final exit.
+          function New-SecCapsuleState {
+              param([Type]$Native)
+              return [pscustomobject]@{
+                  Native=$Native;Job=[IntPtr]::Zero;Process=[IntPtr]::Zero;Thread=[IntPtr]::Zero
+                  Nul=[IntPtr[]]::new(3);Buffers=[Collections.Generic.List[object]]::new()
+                  Status='unstarted';Reason='none';ObserverOutside='unknown';JobZero='unknown'
+                  LimitsConfigured='unknown';EmissionVerified='unknown'
+                  ChildSignaled='unknown';ChildExit='unknown';IoQuiescent='unknown';ChildPid=0
+                  ChildBirth='unknown';TotalProcesses='unknown';Affinity=[UInt64]0
+                  NativeCalls=0;Clock=[Diagnostics.Stopwatch]::StartNew();DeadlineMs=5000
+                  CleanupOwned=$true;ObserverExit='supervisor-owned-unobserved'
+              }
+          }
+          function Assert-SecNativeWindow {
+              param($State)
+              $State.NativeCalls++
+              if($State.NativeCalls -gt 128 -or $State.Clock.ElapsedMilliseconds -ge $State.DeadlineMs) { throw 'original-native-window' }
+          }
+          function Assert-SecOutside {
+              param($State)
+              if($State.Job -eq [IntPtr]::Zero) { throw 'explicit-job-required' }
+              $n=$State.Native;$m=New-SecNativeBuffer $State.Buffers 4
+              Assert-SecNativeWindow $State
+              if($n::IsProcessInJob([IntPtr]::new(-1),$State.Job,$m) -eq 0 -or
+                  [Runtime.InteropServices.Marshal]::ReadInt32($m) -ne 0) { throw 'observer-not-outside' }
+              $State.ObserverOutside=$true
+          }
+          function Get-SecJobCensus {
+              param($State)
+              if($State.Job -eq [IntPtr]::Zero) { throw 'explicit-job-required' }
+              $n=$State.Native
+              # Fixed complete capacity, no ERROR_MORE_DATA/truncation retry or event assumption.
+              $list=New-SecNativeBuffer $State.Buffers 1032
+              $a=New-SecNativeBuffer $State.Buffers 48;$len=New-SecNativeBuffer $State.Buffers 4
+              Assert-SecNativeWindow $State
+              if($n::QueryInformationJobObject($State.Job,3,$list,1032,$len) -eq 0) { throw 'census-list-failed' }
+              $assigned=[Runtime.InteropServices.Marshal]::ReadInt32($list,0)
+              $returned=[Runtime.InteropServices.Marshal]::ReadInt32($list,4)
+              $bytes=[Runtime.InteropServices.Marshal]::ReadInt32($len)
+              if($assigned -lt 0 -or $assigned -gt 128 -or $returned -ne $assigned -or
+                  $bytes -lt (8+8*$returned) -or $bytes -gt 1032) { throw 'census-list-incomplete' }
+              $ids=[UInt64[]]::new($returned)
+              for($i=0;$i -lt $returned;$i++) { $ids[$i]=[UInt64][Runtime.InteropServices.Marshal]::ReadInt64($list,8+8*$i) }
+              Assert-SecNativeWindow $State
+              if($n::QueryInformationJobObject($State.Job,1,$a,48,$len) -eq 0 -or
+                  [Runtime.InteropServices.Marshal]::ReadInt32($len) -ne 48) { throw 'census-accounting-failed' }
+              $total=[Runtime.InteropServices.Marshal]::ReadInt32($a,36)
+              $active=[Runtime.InteropServices.Marshal]::ReadInt32($a,40)
+              if($active -ne $returned -or $total -lt $active -or $total -gt 1) { throw 'census-count-or-churn' }
+              $State.TotalProcesses=$total
+              return [pscustomobject]@{Ids=$ids;Active=$active;Total=$total}
+          }
+          function Open-SecConfiguredJob {
+              param($State)
+              $n=$State.Native
+              Assert-SecNativeWindow $State
+              $State.Job=$n::CreateJobObjectW([IntPtr]::Zero,$null)
+              if($State.Job -eq [IntPtr]::Zero) { throw 'job-create-failed' }
+              $flags=New-SecNativeBuffer $State.Buffers 4
+              Assert-SecNativeWindow $State
+              if($n::GetHandleInformation($State.Job,$flags) -eq 0 -or
+                  ([Runtime.InteropServices.Marshal]::ReadInt32($flags) -band 1) -ne 0) { throw 'job-inheritable' }
+              Assert-SecOutside $State
+              Assert-SecNativeWindow $State
+              if($n::GetActiveProcessorGroupCount() -ne 1) { throw 'processor-groups-refused' }
+              $pm=New-SecNativeBuffer $State.Buffers 8;$sm=New-SecNativeBuffer $State.Buffers 8
+              Assert-SecNativeWindow $State
+              if($n::GetProcessAffinityMask([IntPtr]::new(-1),$pm,$sm) -eq 0) { throw 'affinity-query-failed' }
+              $mask=[BitConverter]::ToUInt64([BitConverter]::GetBytes([Runtime.InteropServices.Marshal]::ReadInt64($pm)),0)
+              $system=[BitConverter]::ToUInt64([BitConverter]::GetBytes([Runtime.InteropServices.Marshal]::ReadInt64($sm)),0)
+              if($mask -eq 0 -or ($mask -band $system) -ne $mask) { throw 'affinity-ambiguous' }
+              $bit=[UInt64]1
+              for($i=0;$i -lt 64;$i++) {
+                  if(($mask -band $bit) -ne 0) { break }
+                  if($i -eq 63) { throw 'affinity-empty' }
+                  $bit=$bit -shl 1
+              }
+              $State.Affinity=$bit
+              $limits=New-SecNativeBuffer $State.Buffers 144
+              # KILL_ON_JOB_CLOSE0x2000|ACTIVE_PROCESS8|JOB_MEMORY0x200|AFFINITY0x10.
+              # No breakaway; job COMMIT is not RSS. CPU rate10000 is not one CPU.
+              [Runtime.InteropServices.Marshal]::WriteInt32($limits,16,0x2218)
+              [Runtime.InteropServices.Marshal]::WriteInt32($limits,40,1)
+              [Runtime.InteropServices.Marshal]::WriteInt64($limits,48,[BitConverter]::ToInt64([BitConverter]::GetBytes($bit),0))
+              [Runtime.InteropServices.Marshal]::WriteInt64($limits,120,536870912)
+              Assert-SecNativeWindow $State
+              if($n::SetInformationJobObject($State.Job,9,$limits,144) -eq 0) { throw 'job-limits-failed' }
+              $back=New-SecNativeBuffer $State.Buffers 144;$len=New-SecNativeBuffer $State.Buffers 4
+              Assert-SecNativeWindow $State
+              if($n::QueryInformationJobObject($State.Job,9,$back,144,$len) -eq 0 -or
+                  [Runtime.InteropServices.Marshal]::ReadInt32($len) -ne 144 -or
+                  [Runtime.InteropServices.Marshal]::ReadInt32($back,16) -ne 0x2218 -or
+                  [Runtime.InteropServices.Marshal]::ReadInt32($back,40) -ne 1 -or
+                  [Runtime.InteropServices.Marshal]::ReadInt64($back,48) -ne [Runtime.InteropServices.Marshal]::ReadInt64($limits,48) -or
+                  [Runtime.InteropServices.Marshal]::ReadInt64($back,120) -ne 536870912) { throw 'job-readback-failed' }
+              $State.LimitsConfigured=$true
+              $c=Get-SecJobCensus $State
+              if($c.Active -ne 0 -or $c.Total -ne 0) { throw 'new-job-not-empty' }
+          }
+          function Close-SecCapsuleHandle {
+              param($State,[ValidateSet('Job','Process','Thread')]$Slot)
+              if($State.$Slot -eq [IntPtr]::Zero) { return $true }
+              $State.NativeCalls++
+              if($State.NativeCalls -gt 128) { $State.Reason='cleanup-call-cap';return $false }
+              $n=$State.Native
+              if($n::CloseHandle($State.$Slot) -eq 0) { $State.Reason='handle-close-failed';return $false }
+              $State.$Slot=[IntPtr]::Zero
+              return $true
+          }
+          function Invoke-SecEmptyJobCapability {
+              # Sole first-carrier entrypoint. Clock begins BEFORE Emit. ZERO children.
+              $s=New-SecCapsuleState $null;$jobCloseAttempted=$false
+              $script:OwnedCapsuleState=$s # Preserve the ledger if invocation/finalization throws.
+              try {
+                  $s.Native=New-SecDaemonNativeApi;$s.EmissionVerified=$true
+                  Open-SecConfiguredJob $s
+                  Assert-SecOutside $s
+                  $c=Get-SecJobCensus $s
+                  if($c.Active -ne 0 -or $c.Total -ne 0) { throw 'empty-final-census' }
+                  $s.JobZero=$true;$s.IoQuiescent=$true # No child/I/O task ever created.
+                  $jobCloseAttempted=$true
+                  if(-not (Close-SecCapsuleHandle $s Job)) { throw 'job-close-failed' }
+                  if($s.Clock.ElapsedMilliseconds -ge 5000) { throw 'original-native-window' }
+                  $s.Status='empty-job-observed' # Ownership clears only after buffer disposal below.
+              } catch {
+                  $s.Reason='native-capability-refused';$s.Status='refused'
+                  if($s.Job -ne [IntPtr]::Zero -and -not $jobCloseAttempted) {
+                      $jobCloseAttempted=$true
+                      $closed=Close-SecCapsuleHandle $s Job
+                  }
+                  if($s.Job -ne [IntPtr]::Zero) {
+                      # No retries after failed CloseHandle: preserve unresolved native lease.
+                      $s.Status='cleanup-pending'
+                  }
+              } finally {
+                  try { Clear-SecNativeBuffers $s.Buffers }
+                  catch { $s.Status='cleanup-pending';$s.Reason='buffer-release-failed' }
+              }
+              $s.CleanupOwned=($s.Job -ne [IntPtr]::Zero -or $s.Buffers.Count -ne 0)
+              if($s.CleanupOwned) { $s.Status='cleanup-pending' }
+              return $s
+          }
+
+          function Invoke-SecFutureFixedChild {
+              # UNREACHABLE from carrier; no caller-controlled executable/argv/environment.
+              # The concrete launch is source-only until this lock is changed under fresh
+              # A/B/synthesis/root grant. No public JSON handle or grant-token interface.
+              throw 'future-fixed-child-source-locked'
+          }
+          function Invoke-SecFutureFixedChildCore {
+              # NO CALLSITE. Future fixed-role source, no grant. Caller must be the reviewed
+              # trusted controller after a fresh runtime witness; cannot be actor input.
+              param([Type]$Native)
+              $s=New-SecCapsuleState $Native;$n=$s.Native
+              $attrs=[IntPtr]::Zero;$attrsInitialized=$false
+              try {
+                  Open-SecConfiguredJob $s
+                  $sa=New-SecNativeBuffer $s.Buffers 24
+                  [Runtime.InteropServices.Marshal]::WriteInt32($sa,0,24)
+                  [Runtime.InteropServices.Marshal]::WriteInt32($sa,16,1)
+                  for($i=0;$i -lt 3;$i++) {
+                      Assert-SecNativeWindow $s
+                      $access=if($i -eq 0){[UInt32]2147483648}else{[UInt32]1073741824}
+                      $s.Nul[$i]=$n::CreateFileW('NUL',$access,3,$sa,3,0,[IntPtr]::Zero)
+                      if($s.Nul[$i] -eq [IntPtr]::new(-1)) { $s.Nul[$i]=[IntPtr]::Zero;throw 'nul-open-failed' }
+                  }
+                  $size=New-SecNativeBuffer $s.Buffers 8
+                  Assert-SecNativeWindow $s
+                  $sizing=$n::InitializeProcThreadAttributeList([IntPtr]::Zero,2,0,$size)
+                  $last=[Runtime.InteropServices.Marshal]::GetLastPInvokeError()
+                  $bytes=[Runtime.InteropServices.Marshal]::ReadInt64($size)
+                  if($sizing -ne 0 -or $last -ne 122 -or $bytes -lt 1 -or $bytes -gt 65536) { throw 'attribute-sizing-failed' }
+                  $attrs=New-SecNativeBuffer $s.Buffers ([int]$bytes)
+                  Assert-SecNativeWindow $s
+                  if($n::InitializeProcThreadAttributeList($attrs,2,0,$size) -eq 0) { throw 'attribute-init-failed' }
+                  $attrsInitialized=$true
+                  $hl=New-SecNativeBuffer $s.Buffers 24;$jl=New-SecNativeBuffer $s.Buffers 8
+                  for($i=0;$i -lt 3;$i++) { [Runtime.InteropServices.Marshal]::WriteIntPtr($hl,8*$i,$s.Nul[$i]) }
+                  [Runtime.InteropServices.Marshal]::WriteIntPtr($jl,$s.Job)
+                  Assert-SecNativeWindow $s
+                  if($n::UpdateProcThreadAttribute($attrs,0,[UIntPtr]::new(0x20002),$hl,[UIntPtr]::new(24),[IntPtr]::Zero,[IntPtr]::Zero) -eq 0) { throw 'handle-list-failed' }
+                  Assert-SecNativeWindow $s
+                  if($n::UpdateProcThreadAttribute($attrs,0,[UIntPtr]::new(0x2000D),$jl,[UIntPtr]::new(8),[IntPtr]::Zero,[IntPtr]::Zero) -eq 0) { throw 'atomic-job-list-failed' }
+                  $si=New-SecNativeBuffer $s.Buffers 112;$pi=New-SecNativeBuffer $s.Buffers 24
+                  [Runtime.InteropServices.Marshal]::WriteInt32($si,0,112)
+                  [Runtime.InteropServices.Marshal]::WriteInt32($si,60,0x100)
+                  for($i=0;$i -lt 3;$i++) { [Runtime.InteropServices.Marshal]::WriteIntPtr($si,80+8*$i,$s.Nul[$i]) }
+                  [Runtime.InteropServices.Marshal]::WriteIntPtr($si,104,$attrs)
+                  $text='"C:\Program Files\PowerShell\7\pwsh.exe" -NoLogo -NoProfile -NonInteractive -Command "exit 0"'+[char]0
+                  $bytes=[Text.Encoding]::Unicode.GetBytes($text)
+                  $cmd=New-SecNativeBuffer $s.Buffers $bytes.Length
+                  [Runtime.InteropServices.Marshal]::Copy($bytes,0,$cmd,$bytes.Length)
+                  $text='SystemRoot=C:\Windows'+[char]0+'WINDIR=C:\Windows'+[char]0+[char]0
+                  $bytes=[Text.Encoding]::Unicode.GetBytes($text)
+                  $envBlock=New-SecNativeBuffer $s.Buffers $bytes.Length
+                  [Runtime.InteropServices.Marshal]::Copy($bytes,0,$envBlock,$bytes.Length)
+                  Assert-SecOutside $s
+                  Assert-SecNativeWindow $s
+                  # SUSPENDED4|UNICODE_ENV0x400|EXTENDED0x80000|NO_WINDOW0x8000000.
+                  # HANDLE_LIST requires bInheritHandles=TRUE; J remains noninheritable.
+                  $ok=$n::CreateProcessW('C:\Program Files\PowerShell\7\pwsh.exe',$cmd,[IntPtr]::Zero,[IntPtr]::Zero,
+                      1,0x08080404,$envBlock,'C:\Program Files\PowerShell\7',$si,$pi)
+                  if($ok -eq 0) { throw 'create-process-failed' }
+                  $s.Process=[Runtime.InteropServices.Marshal]::ReadIntPtr($pi,0)
+                  $s.Thread=[Runtime.InteropServices.Marshal]::ReadIntPtr($pi,8)
+                  $s.ChildPid=[UInt32][Runtime.InteropServices.Marshal]::ReadInt32($pi,16)
+                  $birth=New-SecNativeBuffer $s.Buffers 32
+                  Assert-SecNativeWindow $s
+                  if($n::GetProcessTimes($s.Process,$birth,[IntPtr]::Add($birth,8),[IntPtr]::Add($birth,16),[IntPtr]::Add($birth,24)) -eq 0) { throw 'birth-query-failed' }
+                  $s.ChildBirth=[Runtime.InteropServices.Marshal]::ReadInt64($birth,0).ToString('X16')
+                  Assert-SecNativeWindow $s
+                  if($n::GetProcessId($s.Process) -ne $s.ChildPid) { throw 'pid-binding-failed' }
+                  $member=New-SecNativeBuffer $s.Buffers 4
+                  Assert-SecNativeWindow $s
+                  if($n::IsProcessInJob($s.Process,$s.Job,$member) -eq 0 -or
+                      [Runtime.InteropServices.Marshal]::ReadInt32($member) -ne 1) { throw 'membership-failed' }
+                  $c=Get-SecJobCensus $s
+                  if($c.Active -ne 1 -or $c.Total -ne 1 -or $c.Ids[0] -ne $s.ChildPid) { throw 'pre-resume-census-failed' }
+                  Assert-SecOutside $s
+                  Assert-SecNativeWindow $s
+                  if($n::ResumeThread($s.Thread) -ne 1) { throw 'resume-count-failed' }
+                  $left=[Math]::Max(0,4000-$s.Clock.ElapsedMilliseconds)
+                  $s.NativeCalls++;$wait=$n::WaitForSingleObject($s.Process,[UInt32]$left)
+                  if($wait -ne 0) { throw 'child-wait-failed-or-timeout' }
+                  $s.ChildSignaled=$true
+                  $exit=New-SecNativeBuffer $s.Buffers 4
+                  Assert-SecNativeWindow $s
+                  if($n::GetExitCodeProcess($s.Process,$exit) -eq 0) { throw 'exit-query-failed' }
+                  $s.ChildExit=[Runtime.InteropServices.Marshal]::ReadInt32($exit)
+                  if($s.ChildExit -ne 0) { throw 'child-nonzero-exit' }
+                  $s.IoQuiescent=$true # Synchronous NUL only, no pending capture/overlapped I/O.
+                  $s.Status='child-signaled'
+              } catch { $s.Status='cleanup-pending';$s.Reason='fixed-child-refused' }
+              finally {
+                  if($attrsInitialized) { $s.NativeCalls++;$n::DeleteProcThreadAttributeList($attrs) }
+                  # Attribute value buffers/handles remain alive through DeleteAttributeList.
+                  for($i=0;$i -lt 3;$i++) {
+                      if($s.Nul[$i] -ne [IntPtr]::Zero) {
+                          $s.NativeCalls++
+                          if($n::CloseHandle($s.Nul[$i]) -ne 0) { $s.Nul[$i]=[IntPtr]::Zero }
+                          else { $s.Status='cleanup-pending';$s.Reason='nul-close-failed' }
+                      }
+                  }
+                  if($s.Process -ne [IntPtr]::Zero -and $s.ChildSignaled -ne $true) {
+                      if($s.Job -ne [IntPtr]::Zero) { $s.NativeCalls++;$stopJob=$n::TerminateJobObject($s.Job,1) }
+                      $s.NativeCalls++;$stopChild=$n::TerminateProcess($s.Process,1)
+                      $left=[Math]::Max(0,5000-$s.Clock.ElapsedMilliseconds)
+                      $s.NativeCalls++;$w=$n::WaitForSingleObject($s.Process,[UInt32]$left)
+                      if($w -eq 0) {
+                          $s.ChildSignaled=$true;$s.IoQuiescent=$true
+                          $x=New-SecNativeBuffer $s.Buffers 4
+                          $s.NativeCalls++
+                          if($n::GetExitCodeProcess($s.Process,$x) -ne 0) { $s.ChildExit=[Runtime.InteropServices.Marshal]::ReadInt32($x) }
+                      }
+                  }
+                  if($s.Job -eq [IntPtr]::Zero) {
+                      # Acquisition refusal: no NULL membership/census, including inherited
+                      # platform-job semantics. Only genuinely empty ownership can clear.
+                      $empty=($s.Process -eq [IntPtr]::Zero -and $s.Thread -eq [IntPtr]::Zero -and
+                          $s.Nul[0] -eq [IntPtr]::Zero -and $s.Nul[1] -eq [IntPtr]::Zero -and $s.Nul[2] -eq [IntPtr]::Zero)
+                      if($empty) { $s.Status='refused-cleaned' }
+                      else { $s.Status='cleanup-pending';$s.CleanupOwned=$true }
+                  } elseif($s.Process -eq [IntPtr]::Zero -or ($s.ChildSignaled -eq $true -and $s.ChildExit -ne 'unknown' -and $s.IoQuiescent -eq $true)) {
+                      # Release process/thread references BEFORE J active-zero query.
+                      $tc=Close-SecCapsuleHandle $s Thread;$pc=Close-SecCapsuleHandle $s Process
+                      if($tc -and $pc) {
+                          try {
+                              Assert-SecOutside $s
+                              $c=Get-SecJobCensus $s
+                              if($c.Active -eq 0 -and $c.Ids.Count -eq 0 -and $c.Total -le 1) {
+                                  $s.JobZero=$true
+                                  $nulClosed=($s.Nul[0] -eq [IntPtr]::Zero -and $s.Nul[1] -eq [IntPtr]::Zero -and $s.Nul[2] -eq [IntPtr]::Zero)
+                                  if($nulClosed -and (Close-SecCapsuleHandle $s Job)) {
+                                      $s.CleanupOwned=$false
+                                      $s.Status=if($s.Reason -eq 'none'){'fixed-child-observed'}else{'refused-cleaned'}
+                                  }
+                              }
+                          } catch { $s.Status='cleanup-pending';$s.Reason='final-census-unknown' }
+                      }
+                  }
+                  try { Clear-SecNativeBuffers $s.Buffers }
+                  catch { $s.Status='cleanup-pending';$s.Reason='buffer-release-failed' }
+                  $s.CleanupOwned=($s.Job -ne [IntPtr]::Zero -or $s.Process -ne [IntPtr]::Zero -or
+                      $s.Thread -ne [IntPtr]::Zero -or $s.Nul[0] -ne [IntPtr]::Zero -or
+                      $s.Nul[1] -ne [IntPtr]::Zero -or $s.Nul[2] -ne [IntPtr]::Zero -or $s.Buffers.Count -ne 0)
+                  # Any remaining native handles stay in returned owner state. No rerun.
+                  # No deadline/termination/last-J-close/platform completion certifies exit.
+                  # A future caller must preserve this state and stop; no finite abandonment
+                  # path or automatic supervisor success is implemented here.
+              }
+              if($s.CleanupOwned) { $s.Status='cleanup-pending' }
+              return $s
+          }
+          '@
+          $canonical=$canonical.Replace("`r`n","`n")
+          $sourceSha=[Convert]::ToHexString([Security.Cryptography.SHA256]::HashData([Text.Encoding]::UTF8.GetBytes($canonical))).ToLowerInvariant()
+          if($sourceSha -cne 'f4f2156b1b0fcf19a26e91cdcbeeb9660495a50f229597d32b47a766fb085fc9' -or $overall.ElapsedMilliseconds -ge 20000) { throw 'canonical-source-drift' }
+          # Source-hash/mode/image/runtime gates all precede parsing definitions/Emit/native.
+          . ([scriptblock]::Create($canonical))
+          $preludeElapsed=$overall.ElapsedMilliseconds
+          if($preludeElapsed -ge 20000) { $stage='budget';throw 'original-prelude-budget-refused' }
+          $stage='native'
+          $state=Invoke-SecEmptyJobCapability
+          # Invoke publishes its ledger before native work; never replace/drop it in catch.
+          $state=$script:OwnedCapsuleState
+          $stage='report'
+          $nativeElapsed=$state.Clock.ElapsedMilliseconds
+          $totalElapsed=$overall.ElapsedMilliseconds
+          $withinNative=($nativeElapsed -lt 5000)
+          $withinTotal=($totalElapsed -lt 30000)
+          $withinOriginalBudget=($preludeElapsed -lt 20000 -and $withinNative -and $withinTotal)
+          $operationPassed=($state.Status -ceq 'empty-job-observed' -and -not $state.CleanupOwned -and $withinOriginalBudget)
+          $resultStatus=$state.Status;$resultReason=$state.Reason
+          if($state.Status -ceq 'empty-job-observed' -and -not $withinOriginalBudget) {
+            $resultStatus='refused';$resultReason='original-budget-refused'
+          }
+          $report=[ordered]@{
+            schema='sec-daemon-peer-native-empty-v1';phase='native-empty-job-capability';stage='result'
+            sourceSha256=$sourceSha;workflowSha=$env:PREFLIGHT_EXPECTED_SHA;runtimeHashedFiles=$hashed
+            runtimeClosure=$false;providedHarnessTcb=$true;childrenLaunched=0
+            status=$resultStatus;reason=$resultReason;nativeCallReservations=$state.NativeCalls;ffiMetadataVerified=$state.EmissionVerified
+            observerOutsideJ=$state.ObserverOutside;jobZero=$state.JobZero;ioQuiescent=$state.IoQuiescent
+            ownedLeasesClosed=(-not $state.CleanupOwned);observerExit='provided-supervisor-owned-unobserved'
+            elapsedPreludeMs=$preludeElapsed;elapsedNativeMs=$nativeElapsed;elapsedTotalMs=$totalElapsed;withinOriginalBudget=$withinOriginalBudget
+            requestedCommitBytes=536870912;requestedActiveLimit=1;limitReadbackObserved=$state.LimitsConfigured;affinity=$state.Affinity.ToString('X16')
+            workloadEnforcement='unknown';atomicChildAssignment='unprobed';seal='unprobed'
+            wholeCapsulePhysicalCleanup='unproved';operationPassed=$operationPassed
+          }
+          $json=ConvertTo-Json -InputObject $report -Compress
+          if([Text.Encoding]::UTF8.GetByteCount($json) -gt 16384) { throw 'result-size' }
+          # Serialization/size checking must not turn an expired acceptance into a printed
+          # success. This final cooperative check is BEFORE output; no post-JSON rethrow.
+          if($operationPassed -and ($state.Clock.ElapsedMilliseconds -ge 5000 -or $overall.ElapsedMilliseconds -ge 30000)) {
+            $stage='budget';throw 'original-budget-refused'
+          }
+          $exitCode=if($operationPassed){0}else{1}
+          Write-Output $json
           } catch {
-            $allowed = @('gate', 'elapsed', 'operations', 'bytes', 'path', 'unexpected-location', 'union-limit', 'required-missing', 'file-kind', 'file-size', 'changed', 'short-file', 'version', 'image', 'runtime-location', 'language', 'files', 'assembly-limit', 'duplicate-loaded-location')
-            $report.reason = if ($_.Exception.Message -cin $allowed) { $_.Exception.Message } else { 'metadata-read-refused' }
-            $report.observationComplete = $false; $report.status = 'refused'
+            # Fixed enums only. Do not inspect/format the exception, stack, source or path.
+            # This projection needs neither an initialized timer/report nor a serializer.
+            # Any existing script:OwnedCapsuleState remains rooted, including buffer/handle
+            # slots. Unknown cleanup stays nonterminal in Root's ledger; no successor/rerun.
+            $controlledStage=switch($stage) {
+              'dispatch' {'dispatch'}
+              'runtime' {'runtime'}
+              'runtime-pin' {'runtime-pin'}
+              'source' {'source'}
+              'native' {'native'}
+              'report' {'report'}
+              'budget' {'budget'}
+              default {'bootstrap'}
+            }
+            $controlledReason=if($controlledStage -ceq 'budget'){'original-budget-refused'}else{'operational-refused'}
+            $fallback='{"schema":"sec-daemon-peer-native-empty-v1","phase":"native-empty-job-capability","status":"refused","stage":"'+$controlledStage+'","reason":"'+$controlledReason+'","operationPassed":false,"nativeAttempted":"unknown","childrenLaunched":0,"ownedLeasesClosed":"unknown","jobZero":"unknown","ioQuiescent":"unknown","observerExit":"provided-supervisor-owned-unobserved","cleanupState":"unknown-root-reconcile","stateLedger":"preserved-if-created"}'
+            # A broken output sink is also refusal; never rethrow it into host diagnostics.
+            try { Write-Output $fallback } catch { }
+            $exitCode=1
           }
-          try {
-            if ($timer.ElapsedMilliseconds -ge 20000) { $report.observationComplete = $false; $report.status = 'refused'; $report.reason = 'elapsed' }
-            $report.elapsedMilliseconds = $timer.ElapsedMilliseconds
-            # Serialization may load lazy managed dependencies; this is never closure proof.
-            $json = ConvertTo-Json -InputObject $report -Depth 8 -Compress
-            if ($timer.ElapsedMilliseconds -ge 20000) { throw 'elapsed' }
-            if ($utf8.GetByteCount($json) -gt 1048576) { throw 'json-limit' }
-            Write-Output $json
-          } catch {
-            Write-Output '{"schema":"sec-daemon-peer-runtime-pin-v1","status":"refused","reason":"serialization-or-deadline","counterSemantics":"logical-counters-refusal-may-retain-reservations-not-physical-io","observationComplete":false,"closureComplete":false,"pin":"unproved","ffiProbed":false,"nativeProbed":false,"jobCapsuleImplemented":"unproved","jobCapsuleEnforced":"unproved","sealedArtifactAncestry":"unproved","nodeAcquisition":"unproved","nodeRuntimePin":"unproved","nativeIdentity":"unproved","physicalAllocationBound":"unproved","cleanup":"unproved"}'
-            exit 1
-          }
-          if (-not $report.observationComplete) { exit 1 }
+          exit $exitCode

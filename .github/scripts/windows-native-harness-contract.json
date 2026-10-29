@@ -1,0 +1,485 @@
+{
+  "schema": "sec-daemon-peer-outside-observer-contract-v1",
+  "campaign": "lcm-security-20261027-AUvm2L56",
+  "disposition": "PRIVATE_SOURCE_ONLY_NOT_EXECUTED_NOT_GRANTED",
+  "rootTcbChoice": {
+    "trusted": [
+      "Windows OS System32 native runtime",
+      "GitHub runner supervisor and observer lifecycle",
+      "provided PowerShell/.NET and lazy dependencies"
+    ],
+    "closedReproducibleRuntime": false,
+    "supersedes": "old coordinator-self-member and unidentified outside-observer F1 gate",
+    "observerInTestedJob": false,
+    "observerSelfExitCertified": false
+  },
+  "evidence": {
+    "metadataRun": "40921411950",
+    "controlledMetadataSha256": "2fc893e213844277093cad4484733cb282bfefd13216f140e155599f11fc717c",
+    "runtimePinCandidatesSha256": "63b614304b7cb00c7dd5e97170d70d370542bbf63d72757bfaa7bf5378702827",
+    "metadataParent": "8deab738ceff4f2de0093e6f5cf5788a41081e95",
+    "nativeR3Head": "1473bb28a58edfea92d918c397fb748d495e298c",
+    "nativeR3Tree": "7694b5860b64f738e46459b3e0965b24988a7712",
+    "indexBytesSha256": "209c111e1550f71fa84e0e97eec174c761cf421e0d6b497efe979392724d50a1",
+    "descriptorCorrectionPrivateUnapplied": "4bc1effc1f6375d37a7b69f30ef2e6b5cbcb4665"
+  },
+  "runtime": {
+    "imageOS": "win25-vs2026",
+    "imageVersion": "20261021.278.1",
+    "osVersion": "10.0.26100.0",
+    "psVersion": "7.6.7",
+    "clrVersion": "10.0.13",
+    "frameworkVersion": ".NET 10.0.13",
+    "languageMode": "FullLanguage",
+    "pointerBytes": 8,
+    "architecture": "X64",
+    "dynamicCodeSupported": true
+  },
+  "runtimeLocations": {
+    "PSHOME": "C:\\Program Files\\PowerShell\\7",
+    "processPath": "C:\\Program Files\\PowerShell\\7\\pwsh.exe",
+    "system32": "C:\\Windows\\System32"
+  },
+  "runtimePins": [
+    {
+      "publicRelativePath": "pshome/pwsh.exe",
+      "role": "process-image",
+      "bytes": 301360,
+      "sha256": "fa2c8bb1e35cdd62ad15cd06a1d8f2c5961e9725a9bfa1e7cfd2c322f49e9619",
+      "fileVersion": "7.6.7.500",
+      "assemblyVersion": null
+    },
+    {
+      "publicRelativePath": "pshome/pwsh.dll",
+      "role": "powershell-entry",
+      "bytes": 157464,
+      "sha256": "a583a3721feebc4f9552a02358bc81bbdd41e2e18bb3f424226f2b1e0bf07deb",
+      "fileVersion": "7.6.7.500",
+      "assemblyVersion": "7.6.0.500"
+    },
+    {
+      "publicRelativePath": "pshome/System.Management.Automation.dll",
+      "role": "powershell-engine",
+      "bytes": 19666744,
+      "sha256": "70701f20afbbf4e763924c2bdd0c0e9a20eec35a0e4eff439e0ccf77f20d6b26",
+      "fileVersion": "7.6.7.500",
+      "assemblyVersion": "7.6.0.500"
+    },
+    {
+      "publicRelativePath": "pshome/coreclr.dll",
+      "role": "clr-native-runtime",
+      "bytes": 4613456,
+      "sha256": "fefc3efc0a96bd40874bb6e91028b9d1a907db37e1facf5e337fc63986b7dea2",
+      "fileVersion": "10.0.1326.46716",
+      "assemblyVersion": null
+    },
+    {
+      "publicRelativePath": "pshome/System.Private.CoreLib.dll",
+      "role": "clr-core-library",
+      "bytes": 16033576,
+      "sha256": "8dfc31dfb4783a981179036f492d2690303e6e6571c7f260901b1b9ebc9e64ae",
+      "fileVersion": "10.0.1326.46716",
+      "assemblyVersion": "10.0.0.0"
+    },
+    {
+      "publicRelativePath": "pshome/hostfxr.dll",
+      "role": "runtime-host",
+      "bytes": 379688,
+      "sha256": "777e1c2032cf56dd5cae35b7194ba4ca1e95addb1a7316d9ce4e1d8f4648e980",
+      "fileVersion": "10.0.1326.46716",
+      "assemblyVersion": null
+    },
+    {
+      "publicRelativePath": "pshome/hostpolicy.dll",
+      "role": "runtime-host-policy",
+      "bytes": 378664,
+      "sha256": "185b3630bafb120ed9a697d581e9bccecca385b2989937cf75bf2dbb0d63c435",
+      "fileVersion": "10.0.1326.46716",
+      "assemblyVersion": null
+    },
+    {
+      "publicRelativePath": "pshome/pwsh.deps.json",
+      "role": "dependency-manifest",
+      "bytes": 99499,
+      "sha256": "a01883aeeb2217aeb1d7ec944d649376104e7a874ca4ea71e7f36448c1519dc2",
+      "fileVersion": "0.0.0.0",
+      "assemblyVersion": null
+    },
+    {
+      "publicRelativePath": "pshome/pwsh.runtimeconfig.json",
+      "role": "runtime-configuration",
+      "bytes": 790,
+      "sha256": "8a6363fba1f89c0688e3594ef4fe7b9036126f04957c5fe56858cba020b76b33",
+      "fileVersion": "0.0.0.0",
+      "assemblyVersion": null
+    },
+    {
+      "publicRelativePath": "pshome/System.Runtime.dll",
+      "role": "runtime-facade",
+      "bytes": 44880,
+      "sha256": "c4da0c1560b0544637fd686a520fa04d62cdcb50979d59526b0b720e91a6096d",
+      "fileVersion": "10.0.1326.46716",
+      "assemblyVersion": "10.0.0.0"
+    },
+    {
+      "publicRelativePath": "pshome/System.Runtime.InteropServices.dll",
+      "role": "interop-metadata",
+      "bytes": 112424,
+      "sha256": "46acf58a1eeaaf93184664fb000f983f142de97216b73ca7356458a5fd088e1e",
+      "fileVersion": "10.0.1326.46716",
+      "assemblyVersion": "10.0.0.0"
+    },
+    {
+      "publicRelativePath": "pshome/System.Runtime.CompilerServices.Unsafe.dll",
+      "role": "runtime-helper",
+      "bytes": 15144,
+      "sha256": "e757b9ed064137268e7cbc1d06a672c47f20d3649f05fc4357fab7bc67205871",
+      "fileVersion": "10.0.1326.46716",
+      "assemblyVersion": null
+    },
+    {
+      "publicRelativePath": "pshome/System.Reflection.Emit.dll",
+      "role": "emit-candidate",
+      "bytes": 309072,
+      "sha256": "c73a09e836ecb95eba3974a75a0c365ac414d3610a7c6bfe9f2c7d1f1c1d3abd",
+      "fileVersion": "10.0.1326.46716",
+      "assemblyVersion": null
+    },
+    {
+      "publicRelativePath": "pshome/System.Reflection.Emit.ILGeneration.dll",
+      "role": "emit-il-candidate",
+      "bytes": 15656,
+      "sha256": "8fb6b6c5c4f57356beb2d54f003929bbe6e544f4825f647e16bce60482d4d5d1",
+      "fileVersion": "10.0.1326.46716",
+      "assemblyVersion": "10.0.0.0"
+    },
+    {
+      "publicRelativePath": "pshome/System.Reflection.Emit.Lightweight.dll",
+      "role": "emit-lightweight-candidate",
+      "bytes": 15656,
+      "sha256": "243ca3af5366ff11e8debddda8d4d8ada2a7b32eaebea6d405885fc3ad25d0a6",
+      "fileVersion": "10.0.1326.46716",
+      "assemblyVersion": "10.0.0.0"
+    },
+    {
+      "publicRelativePath": "pshome/System.Reflection.Primitives.dll",
+      "role": "reflection-metadata",
+      "bytes": 15656,
+      "sha256": "f22fb791c511cbf9fb8948f209180d871d75d2c0038e6d46c9c31be05cf7fd4c",
+      "fileVersion": "10.0.1326.46716",
+      "assemblyVersion": "10.0.0.0"
+    },
+    {
+      "publicRelativePath": "pshome/System.IO.FileSystem.AccessControl.dll",
+      "role": "filesystem-security-candidate",
+      "bytes": 104232,
+      "sha256": "f4a99e35120265aa6dcab682fb583f4357c9ff9b434fc1cb6c31d20b20c2f197",
+      "fileVersion": "10.0.1326.46716",
+      "assemblyVersion": "10.0.0.0"
+    },
+    {
+      "publicRelativePath": "pshome/System.Security.AccessControl.dll",
+      "role": "security-candidate",
+      "bytes": 227152,
+      "sha256": "a6d6bcfc6d4f9b943b3e6c483d3c75c0781e456ea823a68c43243aa7062e1cf8",
+      "fileVersion": "10.0.1326.46716",
+      "assemblyVersion": "10.0.0.0"
+    },
+    {
+      "publicRelativePath": "pshome/System.IO.Compression.dll",
+      "role": "gzip-candidate",
+      "bytes": 419624,
+      "sha256": "9183872e401e908a22fb40311e414882e87b2cb2d8852fc6588fda608433c928",
+      "fileVersion": "10.0.1326.46716",
+      "assemblyVersion": null
+    },
+    {
+      "publicRelativePath": "pshome/System.IO.Compression.FileSystem.dll",
+      "role": "compression-facade",
+      "bytes": 15184,
+      "sha256": "bb8457e8af51e7762fe036d0a93a69ba318d7dbbbec84ab56e050e8e488f1926",
+      "fileVersion": "10.0.1326.46716",
+      "assemblyVersion": null
+    },
+    {
+      "publicRelativePath": "pshome/System.Formats.Tar.dll",
+      "role": "tar-candidate",
+      "bytes": 288552,
+      "sha256": "ae21341f883b6d08f3d3a109a84378655e9ae1dcaf2750392f88c1001e273af4",
+      "fileVersion": "10.0.1326.46716",
+      "assemblyVersion": null
+    },
+    {
+      "publicRelativePath": "pshome/System.Security.Cryptography.dll",
+      "role": "hashing-runtime",
+      "bytes": 2549544,
+      "sha256": "628b24ca9bd80ec9712bc258b75d4d6098d6760eb2580a8fc92af7396b458f3b",
+      "fileVersion": "10.0.1326.46716",
+      "assemblyVersion": "10.0.0.0"
+    },
+    {
+      "publicRelativePath": "pshome/System.Security.Cryptography.Primitives.dll",
+      "role": "hashing-facade",
+      "bytes": 15656,
+      "sha256": "544c8dc1bf23b906a9cc79e4101495a63ef4eeb9b3b14115bd15f2043d5a5bfb",
+      "fileVersion": "10.0.1326.46716",
+      "assemblyVersion": null
+    },
+    {
+      "publicRelativePath": "pshome/System.Net.Http.dll",
+      "role": "http-candidate",
+      "bytes": 1746728,
+      "sha256": "125ef3b11314553008f5746a3de9f0260c57414a06c22c016ddb45d894e7d102",
+      "fileVersion": "10.0.1326.46716",
+      "assemblyVersion": null
+    },
+    {
+      "publicRelativePath": "pshome/System.Diagnostics.FileVersionInfo.dll",
+      "role": "version-resource-reader",
+      "bytes": 46928,
+      "sha256": "ea7fb743af87e11aefb7db777043c210dbcd45c09bfe6387d892e94b50aa8c90",
+      "fileVersion": "10.0.1326.46716",
+      "assemblyVersion": "10.0.0.0"
+    },
+    {
+      "publicRelativePath": "pshome/System.Text.Json.dll",
+      "role": "json-runtime-candidate",
+      "bytes": 1890128,
+      "sha256": "83ef4b51a5f3a208659da10829b13900c1b64736e2b15c9207fda6528be543c5",
+      "fileVersion": "10.0.1326.46716",
+      "assemblyVersion": null
+    },
+    {
+      "publicRelativePath": "pshome/Newtonsoft.Json.dll",
+      "role": "powershell-json-candidate",
+      "bytes": 1824560,
+      "sha256": "570bcb67920bf95ed9a184189b9fc42ca94131b1cb49e7f147e65586dbd1ed78",
+      "fileVersion": "13.0.4.30916",
+      "assemblyVersion": "13.0.0.0"
+    },
+    {
+      "publicRelativePath": "pshome/System.Collections.dll",
+      "role": "collections-runtime",
+      "bytes": 296744,
+      "sha256": "c72d0e86c0a8d9f635e92b198f4dc23340c9118adb8122fcfd2097e5aa51a083",
+      "fileVersion": "10.0.1326.46716",
+      "assemblyVersion": "10.0.0.0"
+    },
+    {
+      "publicRelativePath": "pshome/System.Console.dll",
+      "role": "console-runtime",
+      "bytes": 169808,
+      "sha256": "ee649785683c94523e4e15b7d905a99312ad00615d02f47ff9e1fd436524ef03",
+      "fileVersion": "10.0.1326.46716",
+      "assemblyVersion": "10.0.0.0"
+    },
+    {
+      "publicRelativePath": "pshome/System.IO.FileSystem.dll",
+      "role": "filesystem-facade",
+      "bytes": 15696,
+      "sha256": "beed30f8d821275277a73d7aa5bf026809c43943329f73831aba99f075139d5c",
+      "fileVersion": "10.0.1326.46716",
+      "assemblyVersion": null
+    }
+  ],
+  "snapshotContext": {
+    "hashedFiles": 30,
+    "hashedBytes": 51770265,
+    "loadedManagedRows": 62,
+    "unionRows": 77,
+    "unhashedRows": 46,
+    "dynamicRows": 1,
+    "closureRequired": false,
+    "ffiOrEmitPreviouslyObserved": false
+  },
+  "dispatch": {
+    "registration": "397854550",
+    "repository": "donadiosolutions/lcm",
+    "ref": "refs/heads/security/daemon-peer-metadata-preflight-20261029",
+    "workflowPath": ".github/workflows/testbox-node.yml",
+    "expectedShaExternallyBoundAtDispatch": true,
+    "expectedShaRule": "40 lowercase hex == GITHUB_SHA == github.workflow_sha; reject metadataParent",
+    "confirmation": "NATIVE_EMPTY_JOB_CAPABILITY_20261029",
+    "rootFreshReviewAndGrantRequired": true
+  },
+  "canonicalComposition": {
+    "encoding": "UTF-8 without BOM",
+    "newlines": "LF",
+    "rule": "ffi.rstrip(LF) + LF + LF + capsule.rstrip(LF); no final LF",
+    "sha256": "f4f2156b1b0fcf19a26e91cdcbeeb9660495a50f229597d32b47a766fb085fc9",
+    "inlineSourceIsLiteral": true,
+    "noCheckout": true
+  },
+  "reachable": {
+    "entrypoint": "Invoke-SecEmptyJobCapability",
+    "children": 0,
+    "nativeClassification": "Emit/PInvoke/Job Object capability probe, never metadata-only",
+    "claimsIfObserved": [
+      "outside-J witness",
+      "configured extended limit class readback",
+      "complete empty census",
+      "checked owned job close"
+    ],
+    "doesNotProve": [
+      "workload limit enforcement",
+      "atomic child assignment",
+      "nested product helpers",
+      "forced termination",
+      "fixture I/O",
+      "seal",
+      "Node/compiler identity",
+      "production claims",
+      "observer self-exit"
+    ]
+  },
+  "budgets": {
+    "observer": {
+      "providedProcesses": 1,
+      "extraWorkers": 0,
+      "nativeBuffers": 32,
+      "aggregateNativeBufferBytesExclusive": 1048576,
+      "recordRows": 128,
+      "nativeCalls": 128,
+      "observerHardCpuMemoryBound": false,
+      "lifetimeOwner": "trusted provided GitHub supervisor",
+      "fixedApiCount": 31,
+      "nativeCallsSemantics": "logical reservations/attempts, not physical transitive calls"
+    },
+    "runtimePrelude": {
+      "cooperativeMs": 20000,
+      "knownFiles": 30,
+      "maxFileBytes": 67108864,
+      "logicalBytes": 268435456,
+      "readCalls": 4096,
+      "readSize": 65536,
+      "versionReads": 30,
+      "assemblyVersionReadsAtMost": 30,
+      "versionSemantics": "numeric FileMajorPart.FileMinorPart.FileBuildPart.FilePrivatePart, matching settled metadata",
+      "logicalByteSemantics": "known-length version resource charge + stream reads + whole known length for each expected assembly-version read; no physical I/O/allocation proof"
+    },
+    "firstNative": {
+      "originalCooperativeMs": 5000,
+      "children": 0,
+      "jobActiveProcesses": 1,
+      "jobCommittedBytes": 536870912,
+      "affinity": "first allowed bit in one processor group; exact readback"
+    },
+    "normalAcceptanceCooperativeMs": 30000,
+    "stepBackstopMinutes": 1,
+    "jobBackstopMinutes": 3,
+    "futureFixedChild": {
+      "granted": false,
+      "reachable": false,
+      "launches": 1,
+      "activeProcesses": 1,
+      "jobCommittedBytes": 536870912,
+      "logicalCpus": 1,
+      "originalStopMs": 5000,
+      "noFinitePhysicalCleanupGuarantee": true
+    },
+    "futureCompile": {
+      "granted": false,
+      "reachable": false,
+      "logicalCpus": 1,
+      "jobCommittedBytes": 1073741824,
+      "workloadProcesses": 6,
+      "originalMs": 180000
+    },
+    "futureSmoke": {
+      "granted": false,
+      "reachable": false,
+      "logicalCpus": 1,
+      "jobCommittedBytes": 536870912,
+      "workloadProcesses": 8,
+      "originalMs": 15000
+    },
+    "futureSeal": {
+      "granted": false,
+      "reachable": false,
+      "selectedFiles": 16,
+      "retainedHandles": 80,
+      "depth": 64,
+      "descriptorBytes": 1048576,
+      "aces": 4096,
+      "binaryBytes": 33554432,
+      "manifestBytes": 65536,
+      "hashBytes": 134217728,
+      "readCalls": 4096,
+      "readSize": 65536,
+      "cooperativeMs": 20000,
+      "hashBytesSemantics": "accepted content appended to hash, not all physical/requested/returned I/O; malformed EOF refuses; separate read-call/request-size caps unchanged",
+      "temporaryScopeRecords": 32,
+      "nativeBuffers": 32,
+      "aggregateNativeBufferBytesExclusive": 1048576,
+      "bufferCapSemantics": "existing HGlobal32/<1MiB caps enforced across all registered temporary collections; zero-pointer reservations charged until retired; returned GetSecurityInfo descriptor keeps separate existing1MiB inspection cap, not physical allocation proof"
+    }
+  },
+  "cleanup": {
+    "platformTimeoutIsCleanupProof": false,
+    "jobHandleSignalIsEmptyProof": false,
+    "order": "retained child signaled -> birth/exit/I/O captured -> checked child/thread close -> retained-J complete PID-list/accounting zero -> checked J close",
+    "unresolved": "owned/nonterminal; stop; no rerun/replacement/completion waiver",
+    "bufferOwnership": "preinserted zero-pointer owner record, pointer adoption before zeroing; ownership clears only after tracked buffer release",
+    "noJob": "no native J query; all slots empty => cleaned refusal; remaining slot => owned/nonterminal",
+    "sealTemporaryOwnership": "Lease.TempScopes roots every token/lookup/file/access/security/hash temporary owner before acquisition; each scalar record retains buffers, descriptor output/capture and hash disposal obligations",
+    "sealNoRetry": "each scope cleanup and lease file-handle close executes one bounded pass; later calls preserve failed/unknown obligations without retry"
+  },
+  "sourceGates": [
+    "fresh identical-byte A and B reviews",
+    "separate synthesis",
+    "root adjudication and source freeze",
+    "root publication decision",
+    "separate root native-empty grant"
+  ],
+  "campaignAccounting": {
+    "settledMetadataJobs": 10,
+    "newJobs": 0,
+    "productionRounds": 0,
+    "openClaims": 7
+  },
+  "futureSealSupportedTokenPolicy": {
+    "profile": "SeChangeNotify-only-v1",
+    "privilegeIdentity": "LookupPrivilegeValueW(null, literal SeChangeNotifyPrivilege)",
+    "otherPresentPrivileges": "refuse, even disabled",
+    "ordinaryActorCompatibility": "unknown",
+    "tokensAvailable": false,
+    "sealActuallyValidated": false,
+    "requiredExternalEvidence": [
+      "actual two token handles and matching full token policies",
+      "independent authenticated manifest and source/binary/harness entries",
+      "trusted setup releases writable handles/mappings before actors begin",
+      "immutable DOS namespace and root/ancestry across later loads",
+      "sharing compatibility and runtime seal observation unproved"
+    ],
+    "ancestorPolicy": "unchanged conservative directory create-right denial throughout retained ancestry; ordinary topology eligibility unproved"
+  },
+  "sourceReviewCorrections": {
+    "review": "review1",
+    "adjudicationSha256": "52e8753c7541150a9b10452f7dfc95e7f4cec0439317ac3e594a79aa3d184a32",
+    "synthesisSha256": "48cfce08d48cff232db458424f193f61f77cacb71628d9f14b15f882745b64de",
+    "S1": "managed record/capacity/zero slot precedes unmanaged acquire; tracked release and zero-slot cleanup; seal handle slot reserved before CreateFileW",
+    "B1": "reject NULL explicit-J helpers before allocations/calls; no-job/no-handle cleaned refusal; any remaining slot stays owned",
+    "S2": "outer operational try/catch, fixed stage/reason bounded fallback, no raw diagnostics or post-JSON normal-refusal rethrow; budgets checked before passing report/output; script ownership ledger retained",
+    "review2B2": {
+      "ownerAdjudicationSha256": "9706c00678055a37313213b676edd7b4b2586bce73e490a7fb0d7c938de3483d",
+      "synthesisSha256": "92cc8235b6f7ade16dcde8060a15291cbe30def7379c85e85c4db5893a7d69da",
+      "scope": "dormant seal ownership lifecycle only; current zero-child carrier unchanged",
+      "registry": "scalar scope wrappers registered in retained Lease before acquisitions; empty Lists never returned as ownership wrappers",
+      "descriptor": "preexisting registered output cell/obligation; immediate pointer capture before result/inspection; preserve authoritative storage until capture known; distinct records never overwrite pending descriptors",
+      "cleanup": "one independent descriptor/hash/buffer pass per scope; one file-handle close pass per lease; no automatic failed-release retry; unknown records remain owned/nonterminal",
+      "closure": "all handles and registered buffer/output-cell/descriptor/hash obligations proven empty, registry retired only after complete release, no cleanup-unknown flag"
+    }
+  },
+  "reporting": {
+    "ordinaryOperationalErrors": "controlled fixed enum/literal fallback plus explicit nonzero exit",
+    "catchNeedsInitializedTimerOrReport": false,
+    "catchFabricatesCleanup": false,
+    "nativeBudgetMs": 5000,
+    "preludeBudgetMs": 20000,
+    "overallNormalAcceptanceMs": 30000,
+    "budgetCheckBeforePassingReportAndOutput": true,
+    "syntaxRuntimeGuarantee": false,
+    "hostOutputSinkSuccessGuaranteed": false,
+    "preludeCheckAfterDefinitionsBeforeNative": true
+  }
+}
