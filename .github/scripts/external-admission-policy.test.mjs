@@ -191,10 +191,44 @@ test("permanent head-global tombstones dominate all later authorization, changed
   assert.equal(statusDecision([tombstone], { headSha: BASE_SHA, changed: false }).ready, true);
   assert.equal(statusDecision([controlStatus(2, { url: `https://api.github.com/repos/${REPOSITORY}/statuses/${BASE_SHA}` }), tombstone],
     { headSha: BASE_SHA }).ready, true);
-  assert.equal(statusDecision([controlStatus(1, { ...tombstone, creator: { id: 42 } })], { changed: false }).revoked, false);
+  assert.equal(statusDecision([controlStatus(1, { ...tombstone, creator: { id: 42, login: "foreign-writer" } })], { changed: false }).revoked, false);
   assert.equal(statusDecision([controlStatus(1)]).ready, true);
   assert.equal(evaluateAdmissionChecks({ checkRuns: [check(CHECK_IDENTITIES.ci, { conclusion: "failure" }),
     check(CHECK_IDENTITIES.dco)], headSha: HEAD_SHA, repository: REPOSITORY }).ready, false);
+});
+
+test("rejects malformed relevant creator identities before trusting or ignoring control history", () => {
+  const malformedCreators = [undefined, null, [], "github-actions[bot]", 41898282, true, {},
+    { login: "github-actions[bot]" }, { id: null, login: "github-actions[bot]" },
+    ...["41898282", 0, -1, 1.5, Number.MAX_SAFE_INTEGER + 1, NaN, Infinity]
+      .map((id) => ({ id, login: "github-actions[bot]" })),
+    { id: 41898282 }, ...[null, "", 42, false, [], {}].map((login) => ({ id: 41898282, login }))];
+  for (const context of [CONTROL_CONTEXT, REVOCATION_CONTEXT]) {
+    for (const creator of malformedCreators) {
+      const malformed = controlStatus(2, { context, state: "failure", creator });
+      if (creator === undefined) delete malformed.creator;
+      assert.throws(() => statusDecision([malformed], { changed: false }), /malformed relevant status creator/u);
+      assert.throws(() => statusDecision([malformed, controlStatus(1)], { changed: true }), /malformed relevant status creator/u);
+    }
+  }
+});
+
+test("keeps well-formed foreign identities and nullable provenance untrusted without treating them as malformed", () => {
+  for (const context of [CONTROL_CONTEXT, REVOCATION_CONTEXT]) {
+    for (const overrides of [{ creator: { id: 42, login: "foreign-writer" } },
+      { target_url: null }, { target_url: undefined },
+      { url: `https://api.github.com/repos/${REPOSITORY}/statuses/${BASE_SHA}` },
+      { url: `https://api.github.com/repos/other/repository/statuses/${HEAD_SHA}` }]) {
+      const untrusted = controlStatus(2, { context, state: context === REVOCATION_CONTEXT ? "failure" : "success", ...overrides });
+      const ordinary = statusDecision([untrusted], { changed: false });
+      assert.equal(ordinary.revoked, false);
+      assert.equal(ordinary.ready, true);
+      const changed = statusDecision([untrusted, controlStatus(1)], { changed: true });
+      assert.equal(changed.revoked, false);
+      assert.equal(changed.ready, context === REVOCATION_CONTEXT);
+    }
+  }
+  assert.equal(statusDecision([controlStatus(1, { context: "unrelated", creator: undefined })], { changed: false }).ready, true);
 });
 
 test("policy command transport binds immutable snapshot records without command-line tree payloads", () => {

@@ -1104,6 +1104,18 @@ describe("external admission workflow", () => {
     expect(uncertain.statuses.at(-1)?.split("\t", 1)[0]).toBe("failure");
   });
 
+  it("fails ordinary admission before CI when relevant revocation creator metadata is malformed", () => {
+    const malformed = { id: 1, context: "external-admission-control-revoked", state: "failure",
+      url: `https://example.test/api/v3/repos/${REPOSITORY}/statuses/${HEAD_SHA}`,
+      target_url: `https://example.test/${REPOSITORY}/actions/runs/41` };
+    const rejected = runAdmissionScenario("protected-main", undefined, { statuses: [malformed] });
+    expect(rejected.result.status, rejected.result.stderr).not.toBe(0);
+    expect(rejected.result.stderr).toContain("External admission policy rejected its input.");
+    expect(rejected.statuses.at(-1)?.split("\t", 1)[0]).toBe("failure");
+    expect(rejected.statuses.some((status) => status.startsWith("success\t"))).toBe(false);
+    expect(rejected.checkRunCalls).toBe(0);
+  });
+
   it.each([1, 2])("keeps authored ancestor drift at snapshot %s pending", (index) => {
     const bases = Array.from({ length: 3 }, (_, position) => (position >= index ? "f" : "c").repeat(40));
     const drift = runAdmissionScenario("protected-main", undefined, { mergeBases: bases });

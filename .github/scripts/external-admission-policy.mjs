@@ -192,6 +192,14 @@ export function evaluateControlStatuses({ pages, repository, headSha, serverUrl 
     previousId = BigInt(id);
   }
   const relevant = statuses.filter((status) => status.context === CONTROL_CONTEXT || status.context === REVOCATION_CONTEXT);
+  for (const status of relevant) {
+    const creator = status.creator;
+    if (creator === null || typeof creator !== "object" || Array.isArray(creator)
+      || typeof creator.id !== "number" || !Number.isSafeInteger(creator.id) || creator.id <= 0
+      || typeof creator.login !== "string" || creator.login.length === 0) {
+      throw new TypeError("malformed relevant status creator");
+    }
+  }
   const identity = { repository, headSha, serverUrl };
   const tombstone = relevant.filter((status) => status.context === REVOCATION_CONTEXT
       && trustedStatus(status, identity) && status.state === "failure")
