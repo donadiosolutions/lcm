@@ -1,3 +1,4 @@
+import { createHash } from "node:crypto";
 import { describe, it, expect, vi } from "vitest";
 import { sanitizeError } from "../../src/daemon/safe-error.js";
 
@@ -6089,6 +6090,1129 @@ describe("sanitizeError", () => {
       expect(first).toBe(expected);
       expect(second).toBe(expected);
       expect(third).toBe(expected);
+    });
+  });
+
+  describe("Bug #1803", () => {
+    const prefix = "file://h?x=['https://outer.test/x?next=file:///Users/a/My Files/private.db'";
+    const redactedPrefix = "file://h?x=['https://outer.test/x?next=file://<path>'";
+    const bracket = "[https://inner?key=/home/C/s]]";
+    const assertPasses = (
+      input: string,
+      expectedFirst: string,
+      expectedSecond = expectedFirst,
+      expectedThird = expectedSecond,
+    ): void => {
+      const first = sanitizeError(input);
+      const second = sanitizeError(first);
+      const third = sanitizeError(second);
+
+      expect(first).toBe(expectedFirst);
+      expect(second).toBe(expectedSecond);
+      expect(third).toBe(expectedThird);
+    };
+
+    it.each([
+      [
+        "equals backslash value with a bracket",
+        prefix + "=\\Users\\SECRET\\x" + bracket,
+        redactedPrefix + "=<path>?key=<path>]]",
+      ],
+      [
+        "repeated equals backslash value with a bracket",
+        prefix + "==\\Users\\SECRET\\x" + bracket,
+        redactedPrefix + "==<path>?key=<path>]]",
+      ],
+      [
+        "invisible run before an equals backslash value with a bracket",
+        prefix + "\u200b=\\Users\\SECRET\\x" + bracket,
+        redactedPrefix + "\u200b=<path>?key=<path>]]",
+      ],
+      [
+        "equals backslash value before a later private-root successor",
+        prefix + "=\\Users\\x&later/home/alice]",
+        redactedPrefix + "=<path>&later<path>]",
+      ],
+      [
+        "equals plain value before a later private-root successor",
+        prefix + "=plain&later/home/alice]",
+        redactedPrefix + "=plain&later<path>]",
+      ],
+    ] as const)("redacts the %s on the first pass", (_name, input, expected) => {
+      assertPasses(input, expected);
+    });
+
+    it.each([
+      ["direct", ""],
+      ["after U+200B", "\u200b"],
+    ] as const)("redacts the drive-origin bracket %s on the first pass", (_name, interposer) => {
+      assertPasses(
+        prefix + interposer + "=C:/Users/SECRET/x" + bracket,
+        redactedPrefix + interposer + "=C:<path>?key=<path>]]",
+        redactedPrefix + interposer + "=C:<path>?key=<path>]]",
+        redactedPrefix + interposer + "=C:<path>?key=<path>]]",
+      );
+    });
+
+    it.each([
+      [
+        "lowercase drive before a bracket",
+        "=c:/Users/S/x" + bracket,
+        "=c:<path>?key=/home/C/s]]",
+        "=c:<path>?key=<path>]]",
+      ],
+      [
+        "drive before an ampersand private relative",
+        "=C:/Users/S/x&later/home/alice]",
+        "=C:<path>&later/home/alice]",
+        "=C:<path>&later<path>]",
+      ],
+      [
+        "drive before a pipe private relative",
+        "=C:/Users/S/x|later/home/alice]",
+        "=C:<path>|later/home/alice]",
+        "=C:<path>|later<path>]",
+      ],
+      [
+        "drive before a backslash value",
+        "=C:/Users/S/x&\\Users\\T\\y]",
+        "=C:<path>&\\Users\\T\\y]",
+        "=C:<path>&<path>]",
+      ],
+    ] as const)("redacts the drive-origin successor on the first pass for the %s", (_name, suffix, _first, fixed) => {
+      assertPasses(
+        prefix + suffix,
+        redactedPrefix + fixed,
+        redactedPrefix + fixed,
+        redactedPrefix + fixed,
+      );
+    });
+
+    it.each([
+      ["POSIX value before a bracket", "=/Users/S/x" + bracket, "=<path>?key=<path>]]"],
+      ["backslash-drive value before a bracket", "=C:\\Users\\S\\x" + bracket, "=<path>?key=<path>]]"],
+      ["UNC value before a bracket", "=\\\\srv\\share" + bracket, "=<path>?key=<path>]]"],
+      [
+        "backslash value before a parenthesised bracket",
+        "=\\Users\\S\\x([https://other?key=/home/C/s]",
+        "=<path>?key=<path>]",
+      ],
+      ["backslash value before another backslash value", "=\\Users\\S\\x&\\Users\\T\\y]", "=<path>&<path>]"],
+      ["backslash value before a pipe private relative", "=\\Users\\S\\x|later/home/alice]", "=<path>|later<path>]"],
+      ["plain value before a pipe backslash value", "=plain|\\Users\\T\\y]", "=plain|<path>]"],
+      ["plain value before an ampersand backslash value", "=plain&\\Users\\T\\y]", "=plain&<path>]"],
+      ["plain value before a pipe private relative", "=plain|later/home/alice]", "=plain|later<path>]"],
+      [
+        "backslash and private-relative values before a bracket",
+        "=\\Users\\S\\x&later/home/alice" + bracket,
+        "=<path>&later<path>?key=<path>]]",
+      ],
+      [
+        "plain and private-relative values before a bracket",
+        "=plain&later/home/alice" + bracket,
+        "=plain&later<path>?key=<path>]]",
+      ],
+      [
+        "plain and backslash values before a bracket",
+        "=plain|\\Users\\T\\y" + bracket,
+        "=plain|<path>?key=<path>]]",
+      ],
+      [
+        "backslash value before a private relative inside its bracket",
+        "=\\Users\\S\\x[https://inner?a=1&later/home/D/s]]",
+        "=<path>?a=1&later<path>]]",
+      ],
+      [
+        "backslash value before a POSIX value inside its bracket",
+        "=\\Users\\S\\x[https://inner?key=/var/data]]",
+        "=<path>?key=<path>]]",
+      ],
+      [
+        "backslash value before a backslash value inside its bracket",
+        "=\\Users\\S\\x[https://inner?key=\\Users\\D\\s]]",
+        "=<path>?key=<path>]]",
+      ],
+      [
+        "backslash value followed by soft whitespace and a bracket",
+        "=\\Users\\S\\x\u00a0" + bracket,
+        "=<path>?key=<path>]]",
+      ],
+      [
+        "backslash value followed by U+200B and a bracket",
+        "=\\Users\\S\\x\u200b" + bracket,
+        "=<path>?key=<path>]]",
+      ],
+      [
+        "plain value with two private-relative successors",
+        "=plain&later/home/alice&later/home/bob]",
+        "=plain&later<path>&later<path>]",
+      ],
+    ] as const)("redacts the adopted %s on the first pass", (_name, suffix, expectedSuffix) => {
+      assertPasses(prefix + suffix, redactedPrefix + expectedSuffix);
+    });
+
+    it("keeps the base split for a bracket bridge with a later successor", () => {
+      assertPasses(
+        prefix + "=\\Users\\S\\x[x]&later/home/bob]",
+        redactedPrefix + "=<path>&later/home/bob]",
+        redactedPrefix + "=<path>&later<path>]",
+        redactedPrefix + "=<path>&later<path>]",
+      );
+    });
+
+    it.each([
+      ["private-root relative equals value", "=later/home/alice]", "=later/home/alice]"],
+      ["forward-slash drive equals value", "=C:/Users/SECRET/x]", "=C:<path>]"],
+      ["backslash equals value", "=\\Users\\SECRET\\x]", "=<path>]"],
+      ["Users relative equals value", "=Users/alice/x]", "=Users/alice/x]"],
+      ["plain equals value", "=plain]", "=plain]"],
+      ["public URL equals value", "=https://public.test/x]", "=https://public.test/x]"],
+      ["space before equals", " =/Users/SECRET/x", " =<path>"],
+      ["backslash-drive equals value", "=C:\\Users\\SECRET\\x]", "=<path>]"],
+      ["UNC equals value", "=\\\\server\\share]", "=<path>]"],
+      ["invisible run before a backslash value", "\u200b\\Users\\SECRET\\x]", "\u200b\\Users\\SECRET\\x]"],
+      ["space and invisible run before a backslash value", " \u200b\\Users\\SECRET\\x]", " \u200b\\Users\\SECRET\\x]"],
+      ["ordinary later successor", "=later/var/data&x=plain]", "=later/var/data&x=plain]"],
+      [
+        "visible private-relative value before a bracket",
+        "=later/home/alice" + bracket,
+        "=later/home/alice" + bracket,
+      ],
+      ["visible plain value before a bracket", "=plain" + bracket, "=plain" + bracket],
+      ["plain value before an ordinary relative", "=plain&later/var/data]", "=plain&later/var/data]"],
+      ["backslash value before an ordinary relative", "=\\Users\\S\\x&later/var/data]", "=<path>&later/var/data]"],
+      ["backslash value before plain text", "=\\Users\\S\\x&plain]", "=<path>&plain]"],
+      [
+        "backslash value before a space-separated bracket",
+        "=\\Users\\S\\x " + bracket,
+        "=<path> " + bracket,
+      ],
+      [
+        "space-separated backslash value before a bracket",
+        "= \\Users\\S\\x" + bracket,
+        "= \\Users\\S\\x" + bracket,
+      ],
+      [
+        "Users relative before a bracket",
+        "=Users/alice/x" + bracket,
+        "=Users/alice/x" + bracket,
+      ],
+      [
+        "public URL before a bracket",
+        "=https://public.test/x" + bracket,
+        "=https://public.test/x" + bracket,
+      ],
+      [
+        "backslash value before a visible private relative inside its bracket",
+        "=\\Users\\S\\x[https://inner?key=later/home/D/s]]",
+        "=<path>?key=later/home/D/s]]",
+      ],
+      [
+        "backslash value before a visible ordinary relative inside its bracket",
+        "=\\Users\\S\\x[https://inner?key=later/var/d]]",
+        "=<path>?key=later/var/d]]",
+      ],
+      [
+        "backslash value before visible plain text inside its bracket",
+        "=\\Users\\S\\x[https://inner?key=plain]]",
+        "=<path>?key=plain]]",
+      ],
+      [
+        "backslash value before a visible public URL inside its bracket",
+        "=\\Users\\S\\x[https://inner?key=https://pub.test/x]]",
+        "=<path>?key=https://pub.test/x]]",
+      ],
+      [
+        "backslash value before a POSIX successor",
+        "=\\Users\\S\\x&/Users/T/y]",
+        "=<path>&<path>]",
+      ],
+      [
+        "backslash value and bracket before an outside private relative",
+        "=\\Users\\S\\x" + bracket + "&later/home/z]",
+        "=<path>?key=<path>]]&later/home/z]",
+      ],
+      [
+        "backslash value before a parent close and independent bracket",
+        "=\\Users\\S\\x][https://inner?key=/home/C/s]",
+        "=<path>][https://inner?key=/home/C/s]",
+      ],
+    ] as const)("keeps the %s byte-exact", (_name, suffix, expectedSuffix) => {
+      assertPasses(prefix + suffix, redactedPrefix + expectedSuffix);
+    });
+
+    it("redacts only the first of two adjacent bracket components", () => {
+      const input = prefix + "=\\Users\\S\\x" + bracket + bracket;
+      const expected = redactedPrefix + "=<path>?key=<path>]]" + bracket;
+      assertPasses(input, expected);
+    });
+
+    it.each([
+      [
+        "private-relative value before another private relative",
+        "=later/home/alice&later/home/bob]",
+        "=later/home/alice&later/home/bob]",
+        "=later/home/alice&later<path>]",
+      ],
+      [
+        "ordinary relative value before a private relative",
+        "=later/var/data&later/home/bob]",
+        "=later/var/data&later/home/bob]",
+        "=later/var/data&later<path>]",
+      ],
+      [
+        "private-relative value before a backslash value",
+        "=later/home/alice&\\Users\\T\\y]",
+        "=later/home/alice&\\Users\\T\\y]",
+        "=later/home/alice&<path>]",
+      ],
+      [", before a named backslash value", ",=\\Users\\S\\x]", ",=\\Users\\S\\x]", ",=<path>]"],
+      [
+        ", before a named backslash value and plain successor",
+        ",=\\Users\\S\\x&plain]",
+        ",=\\Users\\S\\x&plain]",
+        ",=<path>&plain]",
+      ],
+      ["U+00AD before a named backslash value", "\u00ad=\\Users\\S\\x]", "\u00ad=\\Users\\S\\x]", "\u00ad=<path>]"],
+      [
+        "U+00AD before a named backslash value and bracket",
+        "\u00ad=\\Users\\S\\x" + bracket,
+        "\u00ad=\\Users\\S\\x" + bracket,
+        "\u00ad=<path>?key=/home/C/s]]",
+        "\u00ad=<path>?key=<path>]]",
+      ],
+      [
+        "x before a named backslash value",
+        "x=\\Users\\S\\x&plain]",
+        "x=\\Users\\S\\x&plain]",
+        "x=<path>&plain]",
+      ],
+      [
+        "backslash interposer before a private relative",
+        "a\\Users\\S\\x|later/home/alice]",
+        "a\\Users\\S\\x|later/home/alice]",
+        "a\\Users\\S\\x|later<path>]",
+      ],
+    ] as const)(
+      "pins the adopted residual: %s",
+      (_name, suffix, firstSuffix, secondSuffix, thirdSuffix = secondSuffix) => {
+        assertPasses(
+          prefix + suffix,
+          redactedPrefix + firstSuffix,
+          redactedPrefix + secondSuffix,
+          redactedPrefix + thirdSuffix,
+        );
+      },
+    );
+
+    it.each([
+      ["glued", ""],
+      ["ampersand-separated", "&"],
+    ] as const)("redacts %s independent target copies on the first pass", (_name, separator) => {
+      const input = prefix + "=\\Users\\SECRET\\x" + bracket;
+      const expected = redactedPrefix + "=<path>?key=<path>]]";
+
+      assertPasses(input + separator + input, expected + separator + expected);
+    });
+
+    it("redacts target copies inside independent sibling wrappers", () => {
+      const input = prefix + "=\\Users\\SECRET\\x" + bracket;
+      const expected = redactedPrefix + "=<path>?key=<path>]]";
+
+      assertPasses("[" + input + "][" + input + "]", "[" + expected + "][" + expected + "]");
+    });
+
+    it.each([
+      [
+        "uppercase drive query value",
+        "=\\Users\\S\\x[https://inner?key=C:/Users/K/x]]",
+        "=<path>?key=C:/Users/K/x]]",
+        "=<path>?key=C:<path>]]",
+      ],
+      [
+        "lowercase drive query value",
+        "=\\Users\\S\\x[https://inner?key=c:/Users/K/x]]",
+        "=<path>?key=c:/Users/K/x]]",
+        "=<path>?key=c:<path>]]",
+      ],
+      [
+        "second drive query value",
+        "=\\Users\\S\\x[https://inner?key=/Users/A/x&k2=D:/Users/B/y]]",
+        "=<path>?key=/Users/A/x&k2=D:/Users/B/y]]",
+        "=<path>?key=<path>&k2=D:<path>]]",
+      ],
+      [
+        "two drive query values",
+        "=\\Users\\S\\x[https://inner?key=C:/Users/K/x&k2=D:/Users/B/y]]",
+        "=<path>?key=C:/Users/K/x&k2=D:/Users/B/y]]",
+        "=<path>?key=C:<path>&k2=D:<path>]]",
+      ],
+      [
+        "drive after a public URL",
+        "=\\Users\\S\\x[https://inner?key=https://pub.test/x&k2=C:/Users/K/x]]",
+        "=<path>?key=https://pub.test/x&k2=C:/Users/K/x]]",
+        "=<path>?key=https://pub.test/x&k2=C:/Users/K/x]]",
+      ],
+      [
+        "drive inside a nested file child",
+        "=\\Users\\S\\x[file:///b&C:/Users/c]]",
+        "=<path>&C:/Users/c]]",
+        "=<path>&C:<path>]]",
+      ],
+      [
+        "bare drive value",
+        "=\\Users\\S\\x[https://inner?key=C:/]]",
+        "=<path>?key=C:/]]",
+        "=<path>?key=C:/]]",
+      ],
+      [
+        "doubled-slash drive value",
+        "=\\Users\\S\\x[https://inner?key=C://x]]",
+        "=<path>?key=C://x]]",
+        "=<path>?key=C://x]]",
+      ],
+      [
+        "compound drive value",
+        "=\\Users\\S\\x[https://inner?key=C:/C:/Users/K/x]]",
+        "=<path>?key=C:/C:/Users/K/x]]",
+        "=<path>?key=C:<path>:<path>]]",
+      ],
+      [
+        "file literal after a drive prefix",
+        "=\\Users\\S\\x[https://inner?key=C:/file:///Users/K/x]]",
+        "=<path>?key=C:/file://<path>]]",
+        "=<path>?key=C:<path><path>]]",
+      ],
+    ] as const)(
+      "keeps the base drive pass sequence for the %s",
+      (_name, suffix, firstSuffix, fixedSuffix) => {
+        assertPasses(
+          prefix + suffix,
+          redactedPrefix + firstSuffix,
+          redactedPrefix + fixedSuffix,
+          redactedPrefix + fixedSuffix,
+        );
+      },
+    );
+
+    it("keeps independent drive-query copies on their base pass sequence", () => {
+      const firstInput = prefix + "=\\Users\\S\\x[https://inner?key=C:/Users/K/x]]";
+      const secondInput = prefix + "=\\Users\\S\\x[https://inner?key=D:/Users/B/y]]";
+      const firstPass = redactedPrefix + "=<path>?key=C:/Users/K/x]]";
+      const secondPass = redactedPrefix + "=<path>?key=D:/Users/B/y]]";
+      const firstFixed = redactedPrefix + "=<path>?key=C:<path>]]";
+      const secondFixed = redactedPrefix + "=<path>?key=D:<path>]]";
+
+      assertPasses(
+        firstInput + " & " + secondInput,
+        firstPass + " & " + secondPass,
+        firstFixed + " & " + secondFixed,
+        firstFixed + " & " + secondFixed,
+      );
+    });
+  });
+
+  describe("Bug #1804", () => {
+    const prefix = "file://h?x=['https://outer.test/x?next=file:///Users/a/My Files/private.db'";
+    const redactedPrefix = "file://h?x=['https://outer.test/x?next=file://<path>'";
+    const bracket = "[https://inner?key=/home/C/s]]";
+    const interposers = [
+      "\u0085",
+      "\u0000",
+      "\u007f",
+      "\u00ad",
+      "\u180e",
+      "\u200e",
+      "\u200f",
+      "\u202a",
+      "\u2066",
+      "\u034f",
+      "\ufe0f",
+      ",",
+      ":",
+      "!",
+      "x",
+      "..",
+      "ab",
+      "a.b",
+      "?q",
+      "#f",
+      "=x",
+      "x=",
+      "%20",
+      "~",
+      "\u00ad\u200b",
+      "\u200b,",
+      "=",
+      "==",
+      "C:",
+      "C:,",
+    ] as const;
+    const assertPasses = (
+      input: string,
+      expectedFirst: string,
+      expectedSecond = expectedFirst,
+      expectedThird = expectedSecond,
+    ): void => {
+      const first = sanitizeError(input);
+      const second = sanitizeError(first);
+      const third = sanitizeError(second);
+
+      expect(first).toBe(expectedFirst);
+      expect(second).toBe(expectedSecond);
+      expect(third).toBe(expectedThird);
+    };
+    const targets = interposers.flatMap((interposer) => [
+      [
+        JSON.stringify(interposer) + " before pipe and backslash root",
+        interposer + "|\\Users\\SECRET\\x]",
+        interposer + "|<path>]",
+      ],
+      [
+        JSON.stringify(interposer) + " before ampersand and backslash root",
+        interposer + "&\\Users\\SECRET\\x]",
+        interposer + "&<path>]",
+      ],
+      [
+        JSON.stringify(interposer) + " before private-root relative successor",
+        interposer + "|later/home/alice]",
+        interposer + "|later<path>]",
+      ],
+      [
+        JSON.stringify(interposer) + " before a backslash root and bracket",
+        interposer + "|\\Users\\SECRET\\x" + bracket,
+        interposer + "|<path>?key=<path>]]",
+      ],
+    ] as const);
+
+    it.each(targets)("redacts %s on the first pass", (_name, suffix, expectedSuffix) => {
+      assertPasses(prefix + suffix, redactedPrefix + expectedSuffix);
+    });
+
+    const successorTargets = interposers.flatMap((interposer) => [
+      [
+        JSON.stringify(interposer) + " before a rooted value and later private relative",
+        interposer + "|\\Users\\SECRET\\x&later/home/bob]",
+        interposer + "|<path>&later<path>]",
+      ],
+      [
+        JSON.stringify(interposer) + " before a private relative and bracket",
+        interposer + "|later/home/alice" + bracket,
+        interposer + "|later<path>?key=<path>]]",
+      ],
+      [
+        JSON.stringify(interposer) + " before an ampersand rooted value and bracket",
+        interposer + "&\\Users\\SECRET\\x" + bracket,
+        interposer + "&<path>?key=<path>]]",
+      ],
+      [
+        JSON.stringify(interposer) + " before a Users relative",
+        interposer + "|users/alice/x]",
+        interposer + "|users<path>]",
+      ],
+      [
+        JSON.stringify(interposer) + " before a home relative",
+        interposer + "|home/alice]",
+        interposer + "|home<path>]",
+      ],
+      [
+        JSON.stringify(interposer) + " before a root relative",
+        interposer + "|root/x]",
+        interposer + "|root<path>]",
+      ],
+      [
+        JSON.stringify(interposer) + " before a dotted home relative",
+        interposer + "|./home/x]",
+        interposer + "|.<path>]",
+      ],
+    ] as const);
+
+    it.each(successorTargets)("redacts adopted successor shape %s", (_name, suffix, expectedSuffix) => {
+      assertPasses(prefix + suffix, redactedPrefix + expectedSuffix);
+    });
+
+    it.each([
+      ["equals before an ampersand private relative", "=&later/home/alice]", "=&later<path>]"],
+      ["comma before two private relatives", ",|later/home/alice&later/home/bob]", ",|later<path>&later<path>]"],
+      ["comma before mixed successor kinds", ",&later/home/alice|\\Users\\B\\y]", ",&later<path>|<path>]"],
+      ["comma before two backslash roots", ",|\\Users\\SECRET\\x&\\Users\\B\\y]", ",|<path>&<path>]"],
+      ["x before two successor delimiters and a root", "x|y|\\Users\\S\\x]", "x|y|<path>]"],
+      ["x before two successor delimiters and a private relative", "x|y&later/home/alice]", "x|y&later<path>]"],
+      [
+        "comma before a backslash drive and bracket",
+        ",|C:\\Users\\S\\x" + bracket,
+        ",|<path>?key=<path>]]",
+      ],
+      [
+        "comma before a root and private relative inside its bracket",
+        ",|\\Users\\S\\x[https://inner?a=1&later/home/D/s]]",
+        ",|<path>?a=1&later<path>]]",
+      ],
+    ] as const)("redacts the adopted %s", (_name, suffix, expectedSuffix) => {
+      assertPasses(prefix + suffix, redactedPrefix + expectedSuffix);
+    });
+
+    const controls = interposers.flatMap((interposer) => [
+      [JSON.stringify(interposer) + " before a plain value", interposer + "|plain]", interposer + "|plain]"],
+      [
+        JSON.stringify(interposer) + " before an already-redacted POSIX value",
+        interposer + "|/Users/SECRET/x]",
+        interposer + "|<path>]",
+      ],
+      [
+        JSON.stringify(interposer) + " before an ordinary relative value",
+        interposer + "|later/var/data]",
+        interposer + "|later/var/data]",
+      ],
+      [
+        JSON.stringify(interposer) + " before a forward-slash drive",
+        interposer + "|C:/Users/S/x]",
+        interposer + "|C:<path>]",
+      ],
+      [
+        JSON.stringify(interposer) + " before a backslash drive",
+        interposer + "|C:\\Users\\S\\x]",
+        interposer + "|<path>]",
+      ],
+      [
+        JSON.stringify(interposer) + " before a public URL",
+        interposer + "|https://public.test/Users/S/x]",
+        interposer + "|https://public.test/Users/S/x]",
+      ],
+      [
+        JSON.stringify(interposer) + " before an opaque URL",
+        interposer + "|mailto:u@public.test]",
+        interposer + "|mailto:u@public.test]",
+      ],
+      [JSON.stringify(interposer) + " before a tilde value", interposer + "|~/x]", interposer + "|~/x]"],
+      [
+        JSON.stringify(interposer) + " before a doubled-slash value",
+        interposer + "|//server/share/x]",
+        interposer + "|<path>]",
+      ],
+      [
+        JSON.stringify(interposer) + " before a nested file URL",
+        interposer + "|file:///Users/S/x]",
+        interposer + "|file://<path>]",
+      ],
+      [
+        JSON.stringify(interposer) + " before a named POSIX value",
+        interposer + "|plain=/Users/S/x]",
+        interposer + "|plain=<path>]",
+      ],
+      [
+        JSON.stringify(interposer) + " before a named drive value",
+        interposer + "|k=C:/Users/S/x]",
+        interposer + "|k=C:<path>]",
+      ],
+      [
+        JSON.stringify(interposer) + " before an ordinary relative and visible bracket",
+        interposer + "|later/var/data" + bracket,
+        interposer + "|later/var/data" + bracket,
+      ],
+      [
+        JSON.stringify(interposer) + " before plain text and visible bracket",
+        interposer + "|plain" + bracket,
+        interposer + "|plain" + bracket,
+      ],
+      [
+        JSON.stringify(interposer) + " before a closed rooted value and outside relative",
+        interposer + "|\\Users\\S\\x]&later/home/z]",
+        interposer + "|<path>]&later/home/z]",
+      ],
+      [
+        JSON.stringify(interposer) + " before a closed rooted value, whitespace, and relative",
+        interposer + "|\\Users\\S\\x] later/home/z]",
+        interposer + "|<path>] later/home/z]",
+      ],
+      [JSON.stringify(interposer) + " before an empty successor", interposer + "|", interposer + "|"],
+      [JSON.stringify(interposer) + " at end of input", interposer, interposer],
+    ] as const);
+
+    it.each(controls)("keeps %s byte-exact", (_name, suffix, expectedSuffix) => {
+      assertPasses(prefix + suffix, redactedPrefix + expectedSuffix);
+    });
+
+    it.each([
+      ["space", " "],
+      ["tab", "\t"],
+      ["non-breaking space", "\u00a0"],
+      ["ideographic space", "\u3000"],
+      ["byte order mark", "\ufeff"],
+      ["mixed soft-hyphen and space run", "\u00ad \u00ad"],
+      ["Ogham space mark", "\u1680"],
+      ["paragraph separator", "\u2029"],
+      ["medium mathematical space", "\u205f"],
+      ["vertical tab", "\u000b"],
+      ["U+200B followed by space", "\u200b "],
+      ["U+180E followed by space", "\u180e "],
+    ] as const)("keeps %s as a whitespace boundary", (_name, whitespace) => {
+      const suffix = whitespace + "|\\Users\\SECRET\\x]";
+      assertPasses(prefix + suffix, redactedPrefix + suffix);
+    });
+
+    it("keeps the slash interposer on its established pass sequence", () => {
+      assertPasses(
+        prefix + "/|\\Users\\SECRET\\x]",
+        redactedPrefix + "/|\\Users\\SECRET\\x]",
+        redactedPrefix + "<path>",
+        redactedPrefix + "<path>",
+      );
+    });
+
+    it("keeps a public URL interposer visible", () => {
+      const suffix = "http://p.test|later/home/alice]";
+      assertPasses(prefix + suffix, redactedPrefix + suffix);
+    });
+
+    it("keeps a closing bracket as a run stopper", () => {
+      const suffix = "x]|\\Users\\S\\x]";
+      assertPasses(prefix + suffix, redactedPrefix + suffix);
+    });
+
+    it("keeps the established U+200B inherited handoff", () => {
+      assertPasses(
+        prefix + "\u200b|\\Users\\SECRET\\x]",
+        redactedPrefix + "\u200b|<path>]",
+      );
+    });
+
+    it.each([
+      ["bracket", "[x]"],
+      ["apostrophe", "'"],
+      ["double quote", "\""],
+      ["backslash", "\\"],
+      ["slash-bearing text", "abc/def"],
+      ["short slash-bearing text", "a/b"],
+      ["embedded backslash", "a\\b"],
+    ] as const)("pins the %s interposer residual", (_name, interposer) => {
+      const input = prefix + interposer + "|\\Users\\SECRET\\x]";
+      const first = redactedPrefix + interposer + "|\\Users\\SECRET\\x]";
+      const fixed = redactedPrefix + interposer + "|<path>]";
+      assertPasses(input, first, fixed, fixed);
+    });
+
+    it.each([
+      [
+        "slash",
+        "/|\\Users\\S\\x]",
+        "/|\\Users\\S\\x]",
+        "<path>",
+      ],
+      [
+        "public URL before ampersand root",
+        "http://p.test&\\Users\\S\\x]",
+        "http://p.test&\\Users\\S\\x]",
+        "http://p.test&<path>]",
+      ],
+      [
+        "comma and apostrophe",
+        ",'|\\Users\\S\\x]",
+        ",'|\\Users\\S\\x]",
+        ",'|<path>]",
+      ],
+      [
+        "two apostrophes",
+        "''|\\Users\\S\\x]",
+        "''|\\Users\\S\\x]",
+        "''|<path>]",
+      ],
+      [
+        "mixed-separator successor and bracket",
+        ",|later\\/home/a" + bracket,
+        ",|later\\<path>?key=/home/C/s]]",
+        ",|later\\<path>?key=<path>]]",
+      ],
+      [
+        "equals backslash successor and bracket",
+        ",|=\\Users\\x" + bracket,
+        ",|=\\Users\\x" + bracket,
+        ",|=<path>?key=/home/C/s]]",
+        ",|=<path>?key=<path>]]",
+      ],
+      [
+        "U+200B equals backslash successor and bracket",
+        "\u200b|=\\Users\\x" + bracket,
+        "\u200b|=<path>?key=/home/C/s]]",
+        "\u200b|=<path>?key=<path>]]",
+      ],
+    ] as const)(
+      "pins the adopted residual: %s",
+      (_name, suffix, firstSuffix, secondSuffix, thirdSuffix = secondSuffix) => {
+        assertPasses(
+          prefix + suffix,
+          redactedPrefix + firstSuffix,
+          redactedPrefix + secondSuffix,
+          redactedPrefix + thirdSuffix,
+        );
+      },
+    );
+
+    it.each([
+      ["long non-whitespace run", prefix + "x".repeat(200_000) + "|\\Users\\SECRET\\x]"],
+      [
+        "repeated inherited quote ends",
+        "file://h?x=[" + "'https://o.test/x?n=file:///U/a'x".repeat(Math.ceil(200_000 / 34)) + "|\\U\\x]",
+      ],
+    ] as const)("scans the 200k %s in linear time", (_name, input) => {
+      const started = performance.now();
+      const first = sanitizeError(input);
+      const elapsed = performance.now() - started;
+
+      expect(first).not.toContain("/U/a");
+      expect(sanitizeError(first)).toBe(first);
+      expect(elapsed).toBeLessThan(2_000);
+    });
+
+    it.each([
+      ["glued", ""],
+      ["ampersand-separated", "&"],
+    ] as const)("redacts %s independent target copies on the first pass", (_name, separator) => {
+      const input = prefix + "\u00ad|\\Users\\SECRET\\x]";
+      const expected = redactedPrefix + "\u00ad|<path>]";
+
+      assertPasses(input + separator + input, expected + separator + expected);
+    });
+
+    it("redacts target copies inside independent sibling wrappers", () => {
+      const input = prefix + "\u00ad|\\Users\\SECRET\\x]";
+      const expected = redactedPrefix + "\u00ad|<path>]";
+
+      assertPasses("[" + input + "][" + input + "]", "[" + expected + "][" + expected + "]");
+    });
+
+    it.each([
+      [
+        "uppercase drive query value",
+        ",|\\Users\\S\\x[https://inner?key=C:/Users/K/x]]",
+        ",|\\Users\\S\\x[https://inner?key=C:/Users/K/x]]",
+        ",|<path>?key=C:/Users/K/x]]",
+        ",|<path>?key=C:<path>]]",
+      ],
+      [
+        "lowercase drive query value",
+        ",|later/home/S/x[https://inner?key=c:/Users/K/x]]",
+        ",|later/home/S/x[https://inner?key=c:/Users/K/x]]",
+        ",|later<path>?key=c:/Users/K/x]]",
+        ",|later<path>?key=c:<path>]]",
+      ],
+      [
+        "second drive query value",
+        ",|/Users/S/x[https://inner?key=/Users/A/x&k2=D:/Users/B/y]]",
+        ",|<path>?key=/Users/A/x&k2=D:/Users/B/y]]",
+        ",|<path>?key=<path>&k2=D:<path>]]",
+      ],
+      [
+        "drive after a public URL",
+        ",|\\Users\\S\\x[https://inner?key=https://pub.test/x&k2=C:/Users/K/x]]",
+        ",|\\Users\\S\\x[https://inner?key=https://pub.test/x&k2=C:/Users/K/x]]",
+        ",|<path>?key=https://pub.test/x&k2=C:/Users/K/x]]",
+        ",|<path>?key=https://pub.test/x&k2=C:/Users/K/x]]",
+      ],
+      [
+        "drive inside a nested file child",
+        ",|\\Users\\S\\x[file:///b&C:/Users/c]]",
+        ",|\\Users\\S\\x[file://<path>&C:/Users/c]]",
+        ",|<path><path>&C:<path>]]",
+      ],
+      [
+        "bare drive value",
+        ",|\\Users\\S\\x[https://inner?key=C:/]]",
+        ",|\\Users\\S\\x[https://inner?key=C:/]]",
+        ",|<path>?key=C:/]]",
+        ",|<path>?key=C:/]]",
+      ],
+      [
+        "doubled-slash drive value",
+        ",|\\Users\\S\\x[https://inner?key=C://x]]",
+        ",|\\Users\\S\\x[https://inner?key=C://x]]",
+        ",|<path>?key=C://x]]",
+        ",|<path>?key=C://x]]",
+      ],
+      [
+        "compound drive value",
+        ",|\\Users\\S\\x[https://inner?key=C:/C:/Users/K/x]]",
+        ",|\\Users\\S\\x[https://inner?key=C:/C:/Users/K/x]]",
+        ",|<path>?key=C:/C:/Users/K/x]]",
+        ",|<path>?key=C:<path>:<path>]]",
+      ],
+    ] as const)(
+      "redacts the origin but keeps the base drive pass sequence for the %s",
+      (_name, suffix, firstSuffix, secondSuffix, thirdSuffix = secondSuffix) => {
+        assertPasses(
+          prefix + suffix,
+          redactedPrefix + firstSuffix,
+          redactedPrefix + secondSuffix,
+          redactedPrefix + thirdSuffix,
+        );
+      },
+    );
+
+    it.each([
+      ["E1", ",|[file:///b&[https://o?key=/Users/ZQC/x]]", ",|[file://<path>&[https://o?key=<path>]]", ",|[file://<path>&[https://o?key=<path>]]", ",|[file://<path>&[https://o?key=<path>]]"],
+      ["E2", ",|/https://pub.test/x?y=/Users/ZQD/x]", ",|<path>?y=/Users/ZQD/x]", ",|<path>?y=<path>]", ",|<path>?y=<path>]"],
+      ["E3", "=/Users/ZQB/x[file:///b&[https://o?key=home/ZQC/x]]", "=<path>&[https://o?key=home<path>]]", "=<path>&[https://o?key=home<path>]]", "=<path>&[https://o?key=home<path>]]"],
+      ["E4", "=/Users/ZQB/x[file:///b&[https://o?key=/home/ZQC/x]]", "=<path>&[https://o?key=<path>]]", "=<path>&[https://o?key=<path>]]", "=<path>&[https://o?key=<path>]]"],
+      ["E5", "=plain&[file:///b&([https://o?key=/Users/ZQC/x]", "=plain&[file://<path>&([https://o?key=<path>]", "=plain&[file://<path>&([https://o?key=<path>]", "=plain&[file://<path>&([https://o?key=<path>]"],
+      ["E6", "=/https://pub.test/x?y=/Users/ZQC/x]", "=<path>?y=/Users/ZQC/x]", "=<path>?y=<path>]", "=<path>?y=<path>]"],
+      ["N1", ",|\\Users\\SA\\x[file:///b&/home/TA/s]]", ",|\\Users\\SA\\x[file://<path>&<path>]]", ",|<path><path>&<path>]]", ",|<path><path>&<path>]]"],
+      ["N2", ",|\\Users\\ZQB\\x[file:///b]]", ",|\\Users\\ZQB\\x[file://<path>]]", ",|<path><path>]]", ",|<path><path>]]"],
+      ["W1", ",|\\Users\\SA\\x\u00a0/home/TA/s]", ",|\\Users\\SA\\x\u00a0<path>]", ",|<path><path>]", ",|<path><path>]"],
+      ["W2", "=\\Users\\ZQB\\x\u00a0[https://inner?key=C:/Users/ZQD/x]]", "=<path>?key=C:/Users/ZQD/x]]", "=<path>?key=C:<path>]]", "=<path>?key=C:<path>]]"],
+      ["W3", "=\\Users\\ZQB\\x\u00a0[https://inner?key=C:/file:///Users/ZQD/x]]", "=<path>?key=C:/file://<path>]]", "=<path>?key=C:<path><path>]]", "=<path>?key=C:<path><path>]]"],
+      ["W4", "=\\Users\\SP\\x[https://inner?key=/home/S1/s\u00a0/home/SA/s]]", "=<path>?key=/home/S1/s\u00a0<path>]]", "=<path>?key=<path><path>]]", "=<path>?key=<path><path>]]"],
+      ["P1", "=\\Users\\SP\\x[https://inner?key=https://pub.test/p&k4=/home/SA/s]]", "=<path>?key=https://pub.test/p&k4=/home/SA/s]]", "=<path>?key=https://pub.test/p&k4=/home/SA/s]]", "=<path>?key=https://pub.test/p&k4=/home/SA/s]]"],
+      ["B1", "=/]", "=/]", "=/]", "=/]"],
+      ["B2", "=//]", "=//]", "=//]", "=//]"],
+      ["B3", "=/&k=c:/ZQE]", "=/&k=c:<path>]", "=/&k=c:<path>]", "=/&k=c:<path>]"],
+      ["D1", "=C:/Users/SECRET/x[https://inner?key=/home/C/s]]", "=C:<path>?key=<path>]]", "=C:<path>?key=<path>]]", "=C:<path>?key=<path>]]"],
+      ["D2", "\u200b=C:/Users/SECRET/x[https://inner?key=/home/C/s]]", "\u200b=C:<path>?key=<path>]]", "\u200b=C:<path>?key=<path>]]", "\u200b=C:<path>?key=<path>]]"],
+      ["D3", "=\\Users\\S\\x[https://inner?key=C:/Users/K/x]]", "=<path>?key=C:/Users/K/x]]", "=<path>?key=C:<path>]]", "=<path>?key=C:<path>]]"],
+      ["D4", ",|\\Users\\S\\x&later/home/SQ&k=K:/Users/x]", ",|\\Users\\S\\x&later/home/SQ&k=K:<path>]", ",|<path>&later<path>&k=K:<path>]", ",|<path>&later<path>&k=K:<path>]"],
+      ["T1", "=\\Users\\SECRET\\x[https://inner?key=/home/C/s]]", "=<path>?key=<path>]]", "=<path>?key=<path>]]", "=<path>?key=<path>]]"],
+      ["T2", ",|\\Users\\SECRET\\x[https://inner?key=/home/C/s]]", ",|<path>?key=<path>]]", ",|<path>?key=<path>]]", ",|<path>?key=<path>]]"],
+      ["T3", "=plain&later/home/alice]", "=plain&later<path>]", "=plain&later<path>]", "=plain&later<path>]"],
+      ["C1", "|[file:///b&[https://o?key=/Users/ZQC/x]]", "|[file://<path>&[https://o?key=/Users/ZQC/x]]", "|[file://<path>&[https://o?key=/Users/ZQC/x]]", "|[file://<path>&[https://o?key=/Users/ZQC/x]]"],
+      ["C2", "\u200b|/https://pub.test/x?y=/Users/ZQC/x]", "\u200b|<path>https://pub.test/x?y=/Users/ZQC/x]", "\u200b|<path>https://pub.test/x?y=/Users/ZQC/x]", "\u200b|<path>https://pub.test/x?y=/Users/ZQC/x]"],
+      ["C3", " \u00ad|\\Users\\S\\x]", " \u00ad|\\Users\\S\\x]", " \u00ad|\\Users\\S\\x]", " \u00ad|\\Users\\S\\x]"],
+      ["R2 trailing separator", "=/Users/]", "=<path>]", "=<path>]", "=<path>]"],
+      ["R2 soft boundary backslash value", "=\\Users\\S\\x\u00a0[https://inner?key=\\Users\\D\\x]]", "=<path>?key=\\Users\\D\\x]]", "=<path>?key=<path>]]", "=<path>?key=<path>]]"],
+      ["R2 soft boundary parenthesised bracket", "=\\Users\\S\\x\u00a0([https://inner?key=/home/D/x]", "=<path>?key=<path>]", "=<path>?key=<path>]", "=<path>?key=<path>]"],
+      ["R2 unmatched bracket", ",|\\Users\\S\\x[https://inner?key=/home/C/s", ",|\\Users\\S\\x[https://inner?key=/home/C/s", ",|<path>?key=/home/C/s", ",|<path>?key=<path>"],
+    ] as const)("pins round-2 synthesis row %s", (_id, inputSuffix, firstSuffix, secondSuffix, thirdSuffix) => {
+      const first = sanitizeError(prefix + inputSuffix);
+      const second = sanitizeError(first);
+      const third = sanitizeError(second);
+
+      expect(first).toBe(redactedPrefix + firstSuffix);
+      expect(second).toBe(redactedPrefix + secondSuffix);
+      expect(third).toBe(redactedPrefix + thirdSuffix);
+    });
+
+    it.each([
+      ["S1", "=\\Users\\ZQA\\x[x]&[file:///b&[https://o?key=/Users/ZQE/x]]]", "=<path>&[file://<path>&[https://o?key=<path>]]]", "=<path>&[file://<path>&[https://o?key=<path>]]]", "=<path>&[file://<path>&[https://o?key=<path>]]]"],
+      ["S2", ",|\\Users\\ZQA\\x[https://i?key=/home/ZQC/s]&[file:///b&[https://o?key=/Users/ZQE/x]]]", ",|\\Users\\ZQA\\x[https://i?key=/home/ZQC/s]&[file://<path>&[https://o?key=<path>]]]", ",|<path>?key=/home/ZQC/s]&[file://<path>&[https://o?key=<path>]]]", ",|<path>?key=<path>]&[file://<path>&[https://o?key=<path>]]]"],
+      ["S3", "=\\Users\\ZQA\\x[https://i?key=/home/ZQC/s]&/https://pub.test/x?y=C:/Users/ZQE/x]", "=<path>?key=/home/ZQC/s]&<path>?y=C:/Users/ZQE/x]", "=<path>?key=<path>]&<path>?y=C:<path>]", "=<path>?key=<path>]&<path>?y=C:<path>]"],
+      ["S4", "=/Users/ZQV/x[https://inner?key=plain]&later/home/ZQU]", "=<path>?key=plain]&later/home/ZQU]", "=<path>?key=plain]&later/home/ZQU]", "=<path>?key=plain]&later/home/ZQU]"],
+      ["S5", "=\\Users\\ZQA\\x[x][https://j?key=C:/Users/ZQE/x]]", "=<path>?key=C:/Users/ZQE/x]]", "=<path>?key=C:<path>]]", "=<path>?key=C:<path>]]"],
+      ["S6", "=\\Users\\ZQA\\x[https://i?key=/home/ZQC/s][https://j?key=/Users/ZQE/x]]", "=<path>?key=/home/ZQC/s][https://j?key=/Users/ZQE/x]]", "=<path>?key=<path>][https://j?key=/Users/ZQE/x]]", "=<path>?key=<path>][https://j?key=/Users/ZQE/x]]"],
+      ["S7", "=C:/]", "=C:/]", "=C:/]", "=C:/]"],
+      ["S8", "=C://ZQA/x]", "=C://ZQA/x]", "=C://ZQA/x]", "=C://ZQA/x]"],
+      ["S9", "=C:///ZQA[https://i?key=/home/ZQC/s]]", "=C:///ZQA[https://i?key=/home/ZQC/s]]", "=C:///ZQA[https://i?key=/home/ZQC/s]]", "=C:///ZQA[https://i?key=/home/ZQC/s]]"],
+      ["S10", "=C://ZQA/x[https://i?key=/home/ZQC/s]&k=\\Users\\ZQE\\x]", "=C://ZQA/x[https://i?key=/home/ZQC/s]&k=\\Users\\ZQE\\x]", "=C://ZQA/x[https://i?key=/home/ZQC/s]&k=<path>]", "=C://ZQA/x[https://i?key=/home/ZQC/s]&k=<path>]"],
+      ["S11", "=C://ZQA/x&k=/Users/ZQE/x]", "=C://ZQA/x&k=/Users/ZQE/x]", "=C://ZQA/x&k=/Users/ZQE/x]", "=C://ZQA/x&k=/Users/ZQE/x]"],
+      ["S13", ",|\\Users\\ZQA\\x(/Users/ZQE/x)]", ",|\\Users\\ZQA\\x(<path>)]", ",|<path><path>)]", ",|<path><path>)]"],
+      ["S14", "=\\Users\\ZQA\\x[https://i#\\Users\\ZQE\\x]]", "=<path>#\\Users\\ZQE\\x]]", "=<path>#\\Users\\ZQE\\x]]", "=<path>#\\Users\\ZQE\\x]]"],
+      ["S15", ",|/Users/ZQA/x[https://i#\\Users\\ZQE\\x]]", ",|<path>#\\Users\\ZQE\\x]]", ",|<path>#\\Users\\ZQE\\x]]", ",|<path>#\\Users\\ZQE\\x]]"],
+      ["strict drive dangling separator", "=C:/Users/]", "=C:<path>]", "=C:<path>]", "=C:<path>]"],
+      ["strict drive terminal value", "=C:/Users/x", "=C:<path>", "=C:<path>", "=C:<path>"],
+    ] as const)("pins final-round synthesis row %s", (_id, inputSuffix, firstSuffix, secondSuffix, thirdSuffix) => {
+      const first = sanitizeError(prefix + inputSuffix);
+      const second = sanitizeError(first);
+      const third = sanitizeError(second);
+
+      expect(first).toBe(redactedPrefix + firstSuffix);
+      expect(second).toBe(redactedPrefix + secondSuffix);
+      expect(third).toBe(redactedPrefix + thirdSuffix);
+    });
+
+    it("pins final-round synthesis row S12", () => {
+      const input = "file://h?x=['https://o.test/x?next=file:///Users/ZQP/a'|\\Users\\ZQA\\x[https://i?key='https://o.test/x?next=file:///Users/ZQR/a'=C:/Users/ZQB/x]]";
+      const expected = "file://h?x=['https://o.test/x?next=file://<path>'|<path>?key='https://o.test/x?next=file://<path>'=<path>]]";
+      const first = sanitizeError(input);
+      const second = sanitizeError(first);
+      const third = sanitizeError(second);
+
+      expect(first).toBe(expected);
+      expect(second).toBe(expected);
+      expect(third).toBe(expected);
+    });
+
+    it.each([
+      [
+        "fallback200k",
+        "file://h?x=[" + "'https://o.test/x?next=file:///U/a',|v".repeat(5200) + "]",
+        208_013,
+        "c024dc35c125ec3d29e87a32bc8dc1722927774a087454b9baa9e92f8f603917",
+      ],
+      [
+        "eqPosix200k",
+        "file://h?x=[" + "'https://o.test/x?next=file:///U/a'=/U/v".repeat(5000) + "]",
+        220_013,
+        "95f18a3141abec73b4e16f103533842c9b5d7a1e7b3545ee38179c9145737a08",
+      ],
+      [
+        "eqBackslash200k",
+        "file://h?x=[" + "'https://o.test/x?next=file:///U/a'=\\U\\v".repeat(5000) + "]",
+        220_013,
+        "95f18a3141abec73b4e16f103533842c9b5d7a1e7b3545ee38179c9145737a08",
+      ],
+      [
+        "longR",
+        prefix + "x".repeat(200_000) + "|\\Users\\S\\x]",
+        200_061,
+        "679daaef1c2c504dd9691c3e2cffb0dde22a7c287237b16bcc2e33fe5c7f9793",
+      ],
+    ] as const)("matches the frozen oracle for %s in linear time", (_name, input, expectedLength, expectedHash) => {
+      let value = input;
+      for (let pass = 0; pass < 3; pass += 1) {
+        const started = performance.now();
+        value = sanitizeError(value);
+        const elapsed = performance.now() - started;
+
+        expect(elapsed).toBeLessThan(2_000);
+        expect(value).toHaveLength(expectedLength);
+        expect(createHash("sha256").update(value).digest("hex")).toBe(expectedHash);
+      }
+    });
+
+    describe("escalation refusal guards", () => {
+      const assertStable = (input: string, expected: string): void => {
+        const first = sanitizeError(input);
+        const second = sanitizeError(first);
+        const third = sanitizeError(second);
+
+        expect(first).toBe(expected);
+        expect(second).toBe(expected);
+        expect(third).toBe(expected);
+      };
+
+      it.each([
+        [
+          "A-F1a",
+          "file://h?x=['https://outer.test/x?next=file:///Users/a/My Files/private.db'|\\Users\\ZQA\\x[https://i?key='https://o.test/x?next=file:///Users/ZQR/a'=\\Users\\ZQB\\x][https://j?key=/Users/ZQD/x]]",
+          "file://h?x=['https://outer.test/x?next=file://<path>'|<path>?key='https://o.test/x?next=file://<path>'=<path>][https://j?key=<path>]]",
+        ],
+        [
+          "A-F1b",
+          "file://h?x=['https://outer.test/x?next=file:///Users/a/My Files/private.db'|\\Users\\ZQA\\x[https://i?key='https://o.test/x?next=file:///Users/ZQR/a',|\\Users\\ZQB\\x][https://j?key=C:/Users/ZQD/x]]",
+          "file://h?x=['https://outer.test/x?next=file://<path>'|<path>?key='https://o.test/x?next=file://<path>',|<path>][https://j?key=<path>]]",
+        ],
+        [
+          "A-F1c",
+          "file://h?x=['https://outer.test/x?next=file:///Users/a/My Files/private.db'\u200b|\\Users\\ZQA\\x[file:///b&'https://o.test/x?next=file:///Users/ZQR/a'x&later/home/ZQB][https://j?key=\\Users\\ZQD\\x]]",
+          "file://h?x=['https://outer.test/x?next=file://<path>'\u200b|<path>&'https://o.test/x?next=file://<path>'x&later<path>][https://j?key=<path>]]",
+        ],
+        [
+          "A-F1d",
+          "file://h?x=['https://outer.test/x?next=file:///Users/a/My Files/private.db'&/Users/ZQA/x[https://i?key='https://o.test/x?next=file:///Users/ZQR/a'=/Users/ZQB/x][file:///b&C:/Users/ZQD/x]]",
+          "file://h?x=['https://outer.test/x?next=file://<path>'&<path>?key='https://o.test/x?next=file://<path>'=<path>][file://<path>&<path>]]",
+        ],
+        [
+          "A-F1e",
+          "file://h?x=[file:///Users/CHILD/x|\\Users\\ZQA\\x[https://i?key='https://o.test/x?next=file:///Users/ZQR/a'==\\Users\\ZQB\\x][https://j?key=/Users/ZQD/x]]",
+          "file://h?x=[file://<path>|<path>?key='https://o.test/x?next=file://<path>'==<path>][https://j?key=<path>]]",
+        ],
+        [
+          "A-F2a",
+          "file://h?x=['https://outer.test/x?next=file:///Users/a/b[c'=\\Users\\ZQA\\x]&later/home/ZQD]",
+          "file://h?x=['https://outer.test/x?next=file://<path>'=<path>]&later<path>]",
+        ],
+        [
+          "A-F2b",
+          "file://h?x=['https://outer.test/x?next=file:///Users/a/b[c',|\\Users\\ZQA\\x]&\\Users\\ZQD\\x]",
+          "file://h?x=['https://outer.test/x?next=file://<path>',|<path>]&<path>]",
+        ],
+        [
+          "A-F2c",
+          "file://h?x=['https://outer.test/x?next=file:///Users/a/b[c'=\\Users\\ZQA\\x[https://i?key=/home/ZQC/s]]&later/home/ZQD]",
+          "file://h?x=['https://outer.test/x?next=file://<path>'=<path>?key=<path>]]&later<path>]",
+        ],
+        [
+          "B-P1-1a",
+          "file://h?x=['https://o.test/x?next=file:///Users/ZQP/a'|\\Users\\ZQA\\x[https://i?key='https://o.test/x?next=file:///Users/ZQR/a'=\\Users\\ZQB\\x][https://j?key=/Users/ZQE/x]]",
+          "file://h?x=['https://o.test/x?next=file://<path>'|<path>?key='https://o.test/x?next=file://<path>'=<path>][https://j?key=<path>]]",
+        ],
+        [
+          "B-P1-1b",
+          "file://h?x=['https://o.test/x?next=file:///Users/ZQP/a'|\\Users\\ZQA\\x[https://i?key='https://o.test/x?next=file:///Users/ZQR/a',|\\Users\\ZQB\\x][https://j?key=C:/Users/ZQE/x]]",
+          "file://h?x=['https://o.test/x?next=file://<path>'|<path>?key='https://o.test/x?next=file://<path>',|<path>][https://j?key=<path>]]",
+        ],
+        [
+          "B-P1-1c",
+          "file://h?x=['https://o.test/x?next=file:///Users/ZQP/a'\u200b|\\Users\\ZQA\\x[https://i?key='https://o.test/x?next=file:///Users/ZQR/a'x&later/home/ZQB][file:///b&[https://o?key=/Users/ZQE/x]]]",
+          "file://h?x=['https://o.test/x?next=file://<path>'\u200b|<path>?key='https://o.test/x?next=file://<path>'x&later<path>][file://<path>&[https://o?key=<path>]]]",
+        ],
+        [
+          "B-P1-1d",
+          "file://h?x=['https://o.test/x?next=file:///Users/ZQP/a'&/Users/ZQA/x[https://i?key='https://o.test/x?next=file:///Users/ZQR/a'=/Users/ZQB/x][https://j?key=\\Users\\ZQE\\x]]",
+          "file://h?x=['https://o.test/x?next=file://<path>'&<path>?key='https://o.test/x?next=file://<path>'=<path>][https://j?key=<path>]]",
+        ],
+        [
+          "B-P1-1e",
+          "file://h?x=['https://o.test/x?next=file:///Users/ZQP/a'|later/home/ZQA[https://i?key=/home/ZQC/s&k='https://o.test/x?next=file:///Users/ZQR/a'==\\Users\\ZQB\\x][https://j?key=C:/Users/ZQE/x]]",
+          "file://h?x=['https://o.test/x?next=file://<path>'|later<path>?key=<path>&k='https://o.test/x?next=file://<path>'==<path>][https://j?key=<path>]]",
+        ],
+        [
+          "B-P1-2a",
+          "file://h?x=['https://outer.test/x?next=file:///Users/ZQP/p.db?v=[1'=\\Users\\ZQA\\x]|later/home/ZQE",
+          "file://h?x=['https://outer.test/x?next=file://<path>'=<path>]|later<path>",
+        ],
+        [
+          "B-P1-2b",
+          "file://h?x=['https://outer.test/x?next=file:///Users/ZQP[/p.db'=\\Users\\ZQA\\x]&k=\\Users\\ZQE\\x",
+          "file://h?x=['https://outer.test/x?next=file://<path>'=<path>]&k=<path>",
+        ],
+        [
+          "B-P1-2c",
+          "file://h?x=['https://outer.test/x?next=file:///Users/ZQP[/p.db'\u00ad|\\Users\\ZQA\\x[https://i?key=\\Users\\ZQC\\s]]&k=\\Users\\ZQE\\x",
+          "file://h?x=['https://outer.test/x?next=file://<path>'\u00ad|<path>?key=<path>]]&k=<path>",
+        ],
+        [
+          "B-P1-2d",
+          "file://h?x=['https://outer.test/x?next=file:///Users/ZQP[/p.db'\u200b=\\Users\\ZQA\\x[https://i?key=/home/ZQC/s]]'https://o.test/x?next=file:///Users/ZQR/a'=\\Users\\ZQF\\x[https://j?key=/home/ZQG/s]",
+          "file://h?x=['https://outer.test/x?next=file://<path>'\u200b=<path>?key=<path>]]'https://o.test/x?next=file://<path>'=<path>?key=<path>]",
+        ],
+        [
+          "B-P1-2e",
+          "file://h?x=['https://outer.test/x?next=file:///Users/ZQP/p.db#[x'=plain&later/home/ZQA]|later/home/ZQE]",
+          "file://h?x=['https://outer.test/x?next=file://<path>'=plain&later<path>]|later<path>]",
+        ],
+      ] as const)("refuses the new arm on synthesis row %s and keeps the oracle fixed point", (_id, input, expected) => {
+        assertStable(input, expected);
+      });
+
+      it.each([
+        [
+          "A-F1-ctl-fwd",
+          "file://h?x=['https://outer.test/x?next=file:///Users/a/My Files/private.db'|\\Users\\ZQA\\x[https://i?key='https://o.test/x?next=file:///Users/ZQR/a'=C:/Users/ZQB/x][https://j?key=/Users/ZQD/x]]",
+          "file://h?x=['https://outer.test/x?next=file://<path>'|<path>?key='https://o.test/x?next=file://<path>'=<path>][https://j?key=<path>]]",
+        ],
+        [
+          "A-F2d",
+          "file://h?x=['https://outer.test/x?next=file:///Users/a/b[c]d'x&later/home/ZQA]&\\Users\\ZQD\\x]",
+          "file://h?x=['https://outer.test/x?next=file://<path>'x&later<path>]&\\Users\\ZQD\\x]",
+        ],
+        [
+          "B-P1-2f",
+          "file://h?x=['https://outer.test/x?next=file:///Users/ZQP/p[1.db',|\\Users\\ZQA\\x]&k=/Users/ZQE/x",
+          "file://h?x=['https://outer.test/x?next=file://<path>',|<path>]&k=<path>",
+        ],
+        [
+          "B-ctl-imm-unbalanced",
+          "file://h?x=['https://outer.test/x?next=file:///Users/ZQP[/p.db'|\\Users\\ZQA\\x]&k=\\Users\\ZQE\\x",
+          "file://h?x=['https://outer.test/x?next=file://<path>'|<path>]&k=\\Users\\ZQE\\x",
+        ],
+        [
+          "B-ctl-inner-immediate",
+          "file://h?x=['https://o.test/x?next=file:///Users/ZQP/a'|\\Users\\ZQA\\x[https://i?key='https://o.test/x?next=file:///Users/ZQR/a'|\\Users\\ZQB\\x][https://j?key=/Users/ZQE/x]]",
+          "file://h?x=['https://o.test/x?next=file://<path>'|<path>?key='https://o.test/x?next=file://<path>'|<path>][https://j?key=/Users/ZQE/x]]",
+        ],
+        [
+          "B-ctl-inner-drive-guarded",
+          "file://h?x=['https://o.test/x?next=file:///Users/ZQP/a'|\\Users\\ZQA\\x[https://i?key='https://o.test/x?next=file:///Users/ZQR/a'=C:/Users/ZQB/x][https://j?key=/Users/ZQE/x]]",
+          "file://h?x=['https://o.test/x?next=file://<path>'|<path>?key='https://o.test/x?next=file://<path>'=<path>][https://j?key=<path>]]",
+        ],
+      ] as const)("keeps synthesis control %s byte-identical to the oracle", (_id, input, expected) => {
+        assertStable(input, expected);
+      });
+
+      it("keeps the bracket-noise quote row A-F4d exactly at the oracle", () => {
+        assertStable(
+          "file://h?x=['https://outer.test/x?next=file:///Users/a/b[c',|\\Users\\ZQA\\x[https://i?key=/home/ZQC/s]]&/https://pub.test/x?y=/Users/ZQD/x]",
+          "file://h?x=['https://outer.test/x?next=file://<path>',|<path>?key=<path>]]&<path>https://pub.test/x?y=/Users/ZQD/x]",
+        );
+      });
     });
   });
 

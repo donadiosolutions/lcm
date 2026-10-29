@@ -764,24 +764,45 @@ bundle and keep provider, credential, quarantine, and recovery sessions private.
   space-bearing private path and any suffix inside the quote on the first pass,
   while preserving text after the close. An immediately quoted child keeps its
   own quote. Inside a bracketed file query, the matching quote restores the
-  enclosing owner when `&` or `|` immediately follows it, including when the
-  quote and delimiter are separated only by a run of U+200B, U+200C, U+200D,
-  or U+2060. Whitespace, including U+FEFF, before the delimiter prevents that
+  enclosing owner when `&` or `|` follows it through an uninterrupted bounded
+  run of non-whitespace characters. This includes U+200B, U+200C, U+200D, and
+  U+2060. Whitespace, including U+FEFF, before the delimiter prevents that
   handoff, and whitespace between the delimiter and the successor resets
   ownership; in both cases a Windows backslash-rooted value stays readable
-  unless another path rule applies. One or more `=` characters after the
-  matching quote also redact an immediately adjacent Windows backslash-rooted
-  value on the first pass. Relative, public-URL, and plain values after `=`
-  stay readable, as do backslash-rooted values separated from `=` by whitespace
-  or one of the listed invisible characters. Within the same uninterrupted
-  wrapper after an immediate rooted handoff, immediate and later supported
-  rooted, named Windows, and recognized private-root successors redact on the
-  same pass. Bracketed components that follow a redacted successor follow the
-  tail rules above, and inside them a private-root relative value after `&` or
-  `|` is also redacted on the first pass. Ordinary relative and public-URL
-  successors remain readable. Unquoted URLs, embedded URLs whose scheme did
-  not begin at the quote, unmatched quotes, and newlines retain their existing
-  boundaries.
+  unless another path rule applies. A slash, bracket, quote, or backslash in
+  the intervening run retains its existing boundary. The extended handoff is
+  installed only after the complete prospective component has been validated
+  and contains a supported rooted or recognized `Users`, `home`, or `root`
+  relative successor. A neutral plain token can precede that real successor,
+  but does not establish ownership by itself. Neither the extended handoff nor
+  the quote-`=` ownership below is installed when the matching quote closes
+  inside a bracket that an earlier immediate or invisible-character handoff
+  already owns, or when an unbalanced `[` inside the quoted URL separates the
+  nested `file:` scheme from its closing quote; those shapes keep their
+  earlier behavior, including the earlier owner's redaction of later sibling
+  components.
+
+  One or more `=` characters after the matching quote redact an immediately
+  adjacent complete POSIX root, Windows backslash root, or simple drive origin
+  on the first pass when the following component also has that simple grammar.
+  A bare separator, a slash-prefixed URL, a public or file URL value, a nested
+  file child, unknown nested brackets, compound path syntax, internal
+  whitespace, or a later drive refuses the new ownership before any scanner
+  state changes. Those refused shapes keep their earlier multi-pass spelling.
+  A successor beginning with `=` after an `&` or `|` is likewise left on its
+  existing boundary. A narrow drive-free soft-whitespace boundary immediately
+  before an otherwise simple bracket is supported; whitespace inside a selected
+  value or path is not.
+
+  Relative, public-URL, and plain values directly after `=` stay readable, as
+  do backslash-rooted values separated from `=` by whitespace or one of the
+  listed invisible characters. Within the same uninterrupted wrapper after an
+  admitted rooted handoff, supported rooted, named Windows, and recognized
+  private-root successors redact on the same pass. Ordinary relative and
+  public-URL successors remain readable. The older immediate and listed
+  zero-width handoffs retain their established behavior. Unquoted URLs,
+  embedded URLs whose scheme did not begin at the quote, unmatched quotes, and
+  newlines retain their existing boundaries.
 
   Root-relative Windows values after opaque wrapper text remain conservatively
   redacted. LCM does not expose such private-looking values merely because URL
