@@ -1,5 +1,5 @@
 import { EventEmitter } from "node:events";
-import { chmodSync, mkdtempSync, readFileSync, writeFileSync } from "node:fs";
+import { chmodSync, mkdtempSync, readdirSync, readFileSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { describe, expect, it, vi } from "vitest";
@@ -10,7 +10,7 @@ import {
   runManagedCertification,
   runDigitalOceanLifecycle,
 } from "../../scripts/certification-digitalocean.mjs";
-import { MACHINE_DATABASE_CLEARANCE_SCRIPT, machineDatabaseClearanceArgs, runManagedMachinePair } from "../../scripts/certification-harness.mjs";
+import { DATABASE_IDENTITY_SQL, MACHINE_DATABASE_CLEARANCE_SCRIPT, collectDatabaseReadiness, machineDatabaseClearanceArgs, runManagedMachinePair } from "../../scripts/certification-harness.mjs";
 import { waitForControl } from "./machine-agent.mjs";
 
 const json = (value: unknown, status = 200) => new Response(JSON.stringify(value), {
@@ -433,13 +433,33 @@ describe("certification DigitalOcean lifecycle", () => {
     expect(signalEmitter.listenerCount("SIGTERM")).toBe(0);
   });
 
-  it("runs managed setup controls through real file waits before workload readiness", async () => {
+  it("runs managed setup controls through real file waits and records a server port that differs from the advertised one", async () => {
     const root = mkdtempSync(join(tmpdir(), "lcm-cert-managed-pair-"));
     const evidenceDirectory = join(root, "evidence");
     const calls: string[][] = [];
     const events: string[] = [];
     const fakeAgents: Promise<void>[] = [];
     const setupMaxSeconds = 2;
+    // DigitalOcean advertises port 25060 while the server reports 5432 for itself. The
+    // clearance probe and both readiness checks run the real identity predicate against it.
+    const serverIdentity = {
+      server_version_num: 180004, server_address: "10.10.0.5", server_port: 5432, database_name: "lcm_cert_run12345",
+      role_name: "lcm_cert_runtime_run12345", rolsuper: false, rolcreaterole: false, rolcreatedb: false,
+    };
+    const migrations = readdirSync(new URL("../../src/storage/postgresql/migrations", import.meta.url)).filter((name) => name.endsWith(".sql")).length;
+    const serverClient = () => ({
+      connect: async () => undefined,
+      end: async () => undefined,
+      query: async (text: string) => {
+        if (text === DATABASE_IDENTITY_SQL) return { rows: [serverIdentity] };
+        if (text.includes("pg_extension")) return { rows: ["pg_stat_statements", "pg_trgm", "pgcrypto", "unaccent"].map((name) => ({ name, schema: "public" })) };
+        if (text.includes("schema_migrations")) return { rows: [{ count: migrations }] };
+        if (text === "SHOW max_connections") return { rows: [{ max_connections: "25" }] };
+        if (text === "SHOW superuser_reserved_connections") return { rows: [{ superuser_reserved_connections: "3" }] };
+        if (text.includes("lcm.machines")) return { rows: [{ machines: 2, projects: 1, conversations: 1, passive_events: 0 }] };
+        throw new Error("permission denied for function pg_control_system");
+      },
+    });
     const writeControl = (machine: "a" | "b", file: string) => writeFileSync(
       join(evidenceDirectory, `machine-${machine}`, file), `${JSON.stringify({ machine, at: new Date().toISOString() })}\n`,
       { mode: 0o600, flag: "wx" },
@@ -483,13 +503,7 @@ describe("certification DigitalOcean lifecycle", () => {
       // Only the runtime-role clearance probe reaches the run's database from inside a
       // machine; any other command there uses the env file's revoked transfer URL.
       if (args[1] === "exec" && args.at(-1) === MACHINE_DATABASE_CLEARANCE_SCRIPT) {
-        return {
-          stdout: JSON.stringify({
-            server_version_num: 180004, server_address: "10.10.0.5", server_port: 25060, database_name: "lcm_cert_run12345",
-            role_name: "lcm_cert_runtime_run12345", rolsuper: false, rolcreaterole: false, rolcreatedb: false,
-          }),
-          stderr: "",
-        };
+        return { stdout: JSON.stringify(serverIdentity), stderr: "" };
       }
       if (args.includes("-e")) {
         const configuredMax = args[2].includes("machine-b") ? 3 : 2;
@@ -529,7 +543,7 @@ describe("certification DigitalOcean lifecycle", () => {
       waitForDrain: async () => undefined,
       waitForExit: async () => undefined,
       prepareDatabase: async () => ({ transferName: "lcm_cert_transfer_run", transferUrl: "postgresql://transfer:secret@db.example:25060/lcm_cert_run12345" }),
-      collectReadiness: async () => ({ serverVersionNum: 180000, residualEmpty: false, role: { superuser: false, createRole: false, createDb: false } }),
+      collectReadiness: (options: Record<string, unknown>) => collectDatabaseReadiness({ ...options, clientFactory: serverClient }),
       collectResidualState: async () => ({ observedAt: new Date().toISOString(), residual: { machines: 0, projects: 0, conversations: 0, passive_events: 0 }, residualEmpty: true }),
       collectSetupSessionClosure: async () => ({ observedAt: new Date().toISOString(), roles: { migrator: 0, transfer: 0 }, totalConnections: 0, setupSessionsClosed: true }),
       grantRuntime: async () => { events.push("grant-runtime"); return { granted: true }; },
@@ -572,6 +586,8 @@ describe("certification DigitalOcean lifecycle", () => {
     expect(phaseDelay).toHaveBeenCalledWith(expect.any(Array), 150_000);
     const readiness = JSON.parse(readFileSync(join(evidenceDirectory, "database-readiness.json"), "utf8"));
     expect(readiness).toMatchObject({
+      serverPort: 5432,
+      providerPort: 25060,
       residualEmpty: false,
       poolByMachine: { a: { configuredMax: 2 }, b: { configuredMax: 3 } },
       setupSessionsClosed: true,

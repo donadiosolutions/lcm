@@ -744,8 +744,12 @@ describe("certification fault clearance probes", () => {
     expect(run.clearances).toHaveLength(4);
   });
 
-  it("aborts before clearing the partition when machine A reaches another database", async () => {
-    const run = await runLocalFaultPath({ profile: "full", identity: { database_name: "lcm_harness_other" } });
+  // The local lane controls both ends, so its server port must still be 5432.
+  it.each([
+    ["another database", { database_name: "lcm_harness_other" }],
+    ["another server port", { server_port: 15432 }],
+  ])("aborts before clearing the partition when machine A reaches %s", async (_label, identity) => {
+    const run = await runLocalFaultPath({ profile: "full", identity });
     expect(String(run.error)).toContain("database clearance failed");
     expect(run.clearances).toHaveLength(1);
     expect(existsSync(join(run.evidenceDirectory, "machine-a", "partition-cleared.json"))).toBe(false);

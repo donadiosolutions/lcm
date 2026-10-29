@@ -23,7 +23,7 @@ function snapshotFiles(root: string, directory = root, files = new Map<string, B
 
 type FaultLayout = "faults" | "partition-a" | "none";
 type MaintenanceFailure = "compact" | "snapshot" | "mixed";
-type Variant = { clockRetry?: "recovered" | "exhausted" | "miscounted"; observerRows?: number; withFaults?: boolean; observerGap?: boolean; observerSiblingsPresent?: boolean; extraObserverRow?: Record<string, unknown>; clockBreach?: boolean; clockGap?: boolean; duplicateMapping?: boolean; drainFail?: boolean; capacityPeak?: number; recoveryFail?: boolean; partitionFirstSuccessSeconds?: number; restartBFirstSuccessSeconds?: number; restartBNoSuccess?: boolean; noRecoverySuccess?: boolean; catchUpFail?: boolean; catchUpAtSeconds?: number; missingCatchUpTimestamp?: boolean; readinessInvalid?: boolean; residualOccupied?: boolean; poolConfigMismatch?: boolean; setupSessionOpen?: boolean; phaseEarly?: boolean; profile?: "smoke" | "full"; lane?: "local" | "managed"; faultLayout?: FaultLayout; maintenanceFailure?: MaintenanceFailure; smokeFailure?: boolean; smokeSlow?: boolean; executionHost?: Record<string, unknown> };
+type Variant = { serverPort?: number; providerPort?: number | null; clockRetry?: "recovered" | "exhausted" | "miscounted"; observerRows?: number; withFaults?: boolean; observerGap?: boolean; observerSiblingsPresent?: boolean; extraObserverRow?: Record<string, unknown>; clockBreach?: boolean; clockGap?: boolean; duplicateMapping?: boolean; drainFail?: boolean; capacityPeak?: number; recoveryFail?: boolean; partitionFirstSuccessSeconds?: number; restartBFirstSuccessSeconds?: number; restartBNoSuccess?: boolean; noRecoverySuccess?: boolean; catchUpFail?: boolean; catchUpAtSeconds?: number; missingCatchUpTimestamp?: boolean; readinessInvalid?: boolean; residualOccupied?: boolean; poolConfigMismatch?: boolean; setupSessionOpen?: boolean; phaseEarly?: boolean; profile?: "smoke" | "full"; lane?: "local" | "managed"; faultLayout?: FaultLayout; maintenanceFailure?: MaintenanceFailure; smokeFailure?: boolean; smokeSlow?: boolean; executionHost?: Record<string, unknown> };
 
 // Every scheduled compact, every scheduled snapshot, or every other one of each.
 function maintenanceFails(mode: MaintenanceFailure | undefined, op: string, index: number): boolean {
@@ -89,8 +89,8 @@ function rawFixture(options: Variant = {}) {
   writeJson(join(root, "pre-activation-residual.json"), preActivationResidual);
   writeJson(join(root, "setup-session-closure.json"), setupSessionClosure);
   writeJson(join(root, "database-readiness.json"), {
-    serverVersionNum: options.readinessInvalid ? 170006 : 180004, serverPort: lane === "local" ? 5432 : 25060,
-    ...(lane === "managed" ? { providerPort: 25060 } : {}),
+    serverVersionNum: options.readinessInvalid ? 170006 : 180004, serverPort: options.serverPort ?? (lane === "local" ? 5432 : 25060),
+    ...(lane === "managed" && options.providerPort !== null ? { providerPort: options.providerPort ?? 25060 } : {}),
     databaseName: lane === "local" ? "lcm_harness_run12345" : "lcm_cert_run12345", roleName: runtimeRole,
     role: { superuser: false, createRole: false, createDb: false }, residualEmpty: false,
     maxConnections: 100, reservedConnections: 3,
@@ -279,6 +279,20 @@ describe("certification raw evidence pipeline", () => {
     const gate = assemble(rawFixture({ residualOccupied: true })).gate;
     expect(gate.slos.find((slo: any) => slo.id === "readiness")?.verdict).toBe("fail");
   });
+
+  it("accepts a managed server port that differs from the advertised port and publishes both", () => {
+    const fixture = rawFixture({ lane: "managed", serverPort: 5432 });
+    const gate = assemble(fixture).gate;
+    expect(gate.slos.find((slo: any) => slo.id === "readiness")?.verdict).toBe("pass");
+    const witness = JSON.parse(readFileSync(join(fixture.output, "readiness-witness.ndjson"), "utf8"));
+    expect(witness.databaseReadiness).toMatchObject({ serverPort: 5432, providerPort: 25060 });
+  });
+
+  it("still fails readiness without a managed advertised port or with a local server port other than 5432", () => {
+    for (const variant of [{ lane: "managed" as const, providerPort: null }, { lane: "local" as const, serverPort: 15432 }]) {
+      expect(assemble(rawFixture(variant)).gate.slos.find((slo: any) => slo.id === "readiness")?.verdict).toBe("fail");
+    }
+  }, 15_000);
 
   it("fails capacity when measured pool configuration differs from the contract", () => {
     const gate = assemble(rawFixture({ poolConfigMismatch: true })).gate;

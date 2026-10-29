@@ -599,12 +599,15 @@ export async function runManagedMachinePair(input, dependencies = {}) {
           caFile,
           expectedOwner: input.privateConnection.migratorName,
         });
+        // DigitalOcean advertises the public connection.port, which need not equal the port the
+        // server reports for itself (inet_server_port), for example behind a proxy. The managed
+        // lane therefore records both, as serverPort and providerPort, instead of requiring
+        // them to match.
         databaseReadiness = await (dependencies.collectReadiness ?? collectDatabaseReadiness)({
           url: input.privateConnection.runtimeUrl,
           ca: input.privateConnection.ca,
           expectedMajor: 18,
           expectedDatabase: input.privateConnection.databaseName,
-          expectedPort: input.cluster.port,
           expectedRole: input.privateConnection.runtimeName,
           expectedMigrationCount: readdirSync(join(dependencies.sourceRoot ?? repositoryRoot, "src", "storage", "postgresql", "migrations")).filter((name) => name.endsWith(".sql")).length,
           requireResidualEmpty: false,
@@ -696,10 +699,11 @@ export async function runManagedMachinePair(input, dependencies = {}) {
       const appliedAt = new Date().toISOString();
       await Promise.race([monitorDelay([names.machineA, names.machineB], 60_000), aborted(input.signal)]);
       await run(["network", "connect", network, names.machineA]);
+      // As at setup, the managed lane does not compare the server's own port with the
+      // advertised one.
       const runtimeIdentity = {
         expectedMajor: 18,
         expectedDatabase: input.privateConnection.databaseName,
-        expectedPort: input.cluster.port,
         expectedRole: input.privateConnection.runtimeName,
       };
       await waitForMachineDatabaseClearance({

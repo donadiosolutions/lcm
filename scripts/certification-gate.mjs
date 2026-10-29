@@ -335,7 +335,9 @@ export function buildEvidenceManifest({ evidenceDirectory, contract, persist = t
     && databaseReadiness.roleName === expectedRole
     && Number.isInteger(databaseReadiness.serverPort) && databaseReadiness.serverPort > 0
     && (run.lane !== "local" || databaseReadiness.serverPort === 5432)
-    && (run.lane !== "managed" || databaseReadiness.providerPort === databaseReadiness.serverPort)
+    // The managed server's own port need not equal the advertised one, so the gate requires
+    // the advertised port to be recorded, not to match.
+    && (run.lane !== "managed" || (Number.isInteger(databaseReadiness.providerPort) && databaseReadiness.providerPort > 0))
     && actualExtensions.length === expectedExtensions.length
     && expectedExtensions.every((name) => actualExtensions.includes(`${name}:public`))
     && Number.isInteger(databaseReadiness.migrations) && databaseReadiness.migrations > 0

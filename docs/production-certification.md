@@ -67,6 +67,10 @@ and CA read from the machine's environment file, so no credential appears in a
 command line. Second, a host-side readiness check must confirm the same identity.
 The in-machine check retries once per second within the fault phase's bound,
 because PostgreSQL accepts connections only shortly after it restarts.
+On the managed lane, these checks and the setup readiness check do not compare the
+port, because the port the server reports for itself can differ from the port
+DigitalOcean advertises; `database-readiness.json` records both, as `serverPort`
+and `providerPort`.
 
 For both profiles, the coordinator starts warmup only after both machines are
 ready, waits for both warmup-complete witnesses, and then publishes one shared
