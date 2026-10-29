@@ -21,15 +21,17 @@ recovered by fetching or pushing, not recreating them.
 independent version. Version-only edits leave `pnpm-lock.yaml` unchanged and stage
 only `package.json` and `CHANGELOG.md`; the release changelog block must exist.
 Build/check with pnpm; npm retains packing (`npm pack --ignore-scripts`) and trusted
-publication. Stable releases update `latest` to the highest stable version; beta
-releases update `beta`. Changesets' internal channel label on the open version PR
-preserves manual beta/stable intent across main pushes until that PR merges/closes.
+publication. Stable releases update `latest` to the highest stable version;
+alpha and beta releases update their matching npm dist-tags. Changesets' internal
+channel label on the open version PR preserves manual alpha/beta/stable intent
+across main pushes until that PR merges/closes.
 
 ## Preflight
 
 Require merged feature PRs, authenticated `gh`, an available signing key/agent and
-trusted local signature verification. Choose canonical `MAJOR.MINOR.PATCH` or
-`MAJOR.MINOR.PATCH-beta.N` above the corresponding npm dist-tag; other prereleases
+trusted local signature verification. Choose canonical `MAJOR.MINOR.PATCH`,
+`MAJOR.MINOR.PATCH-alpha.N`, or `MAJOR.MINOR.PATCH-beta.N` above the corresponding
+npm dist-tag; other prereleases
 and build metadata are unsupported. The helper rejects stale/published versions
 before repository/tag mutation.
 
@@ -45,9 +47,9 @@ not this helper's unpublished-version path.
 Run at repository root:
 
 ```bash
-bash .agents/skills/lcm-release/scripts/release.sh 0.5.0-beta.0
+bash .agents/skills/lcm-release/scripts/release.sh 0.5.0-alpha.0
 # Resume only after verifying earlier steps really completed:
-bash .agents/skills/lcm-release/scripts/release.sh 0.5.0-beta.0 --from-step 8
+bash .agents/skills/lcm-release/scripts/release.sh 0.5.0-alpha.0 --from-step 8
 ```
 
 | Step | Operation |

@@ -79,7 +79,7 @@ const publishTarballSource = readFileSync(
   "utf8",
 );
 const changesetSource = readFileSync(
-  new URL("../.changeset/calm-betas-draft.md", import.meta.url),
+  new URL("../.changeset/bright-alpha-preview.md", import.meta.url),
   "utf8",
 );
 const versionWorkflow = loadYaml(versionSource) as VersionWorkflow;
@@ -89,9 +89,9 @@ const highlightsSchema = JSON.parse(
 );
 
 describe("release workflows", () => {
-  it("uses an ordered, main-based Changesets workflow with explicit beta transitions", () => {
+  it("uses an ordered, main-based Changesets workflow with explicit prerelease transitions", () => {
     expect(versionWorkflow.on.push.branches).toEqual(["main"]);
-    expect(versionWorkflow.on.workflow_dispatch.inputs.channel.options).toEqual(["beta", "stable"]);
+    expect(versionWorkflow.on.workflow_dispatch.inputs.channel.options).toEqual(["alpha", "beta", "stable"]);
     expect(versionWorkflow.permissions).toEqual({});
     expect(versionWorkflow.concurrency).toEqual({
       group: "version-packages-main",
@@ -134,6 +134,7 @@ describe("release workflows", () => {
     expect(channel?.with?.script).toContain('base: "main"');
     expect(channel?.with?.script).toContain('head: `${context.repo.owner}:changeset-release/main`');
     expect(channel?.with?.script).toContain("if (pulls.length > 1)");
+    expect(channel?.with?.script).toContain('"release-channel:alpha"');
     expect(channel?.with?.script).toContain('"release-channel:beta"');
     expect(channel?.with?.script).toContain('"release-channel:stable"');
     expect(channel?.with?.script).toContain("if (persisted.size > 1)");
@@ -160,6 +161,7 @@ describe("release workflows", () => {
       RELEASE_CHANNEL: "${{ steps.channel.outputs.channel }}",
     });
     expect(releasePolicyLabels?.with?.script).toContain('"no-release-notes"');
+    expect(releasePolicyLabels?.with?.script).toContain('"release-channel:alpha"');
     expect(releasePolicyLabels?.with?.script).toContain('"release-channel:beta"');
     expect(releasePolicyLabels?.with?.script).toContain('"release-channel:stable"');
     expect(releasePolicyLabels?.with?.script).toContain("github.rest.issues.getLabel");
@@ -361,8 +363,8 @@ describe("release workflows", () => {
     }
   });
 
-  it("publishes beta and stable versions to explicit npm dist-tags", () => {
-    expect(publishSource).toContain("tag=beta");
+  it("publishes prerelease and stable versions to explicit npm dist-tags", () => {
+    expect(publishSource).toContain('tag="$RELEASE_CHANNEL"');
     expect(publishSource).toContain("tag=latest");
     expect(publishTarballSource).toContain('"--access"');
     expect(publishTarballSource).toContain('"public"');
@@ -739,7 +741,7 @@ exec "$FIXTURE_NODE" "$@"
         GITHUB_OUTPUT: output,
         RELEASE_TAG: `v${version}`,
         RELEASE_DRAFT: "false",
-        RELEASE_PRERELEASE: String(version.includes("-beta.")),
+        RELEASE_PRERELEASE: String(version.includes("-alpha.") || version.includes("-beta.")),
       },
     });
     return {
@@ -760,13 +762,13 @@ describe.each(metadataValidationSteps)("$name metadata admission", (step) => {
     expect(script.match(/require\([^)]*\)/gu)).toEqual(["require('node:fs')"]);
   });
 
-  it.each(["1.2.3", "1.3.0-beta.0"])("accepts inert %s metadata after ancestry", (version) => {
+  it.each(["1.2.3", "1.3.0-alpha.0"])("accepts inert %s metadata after ancestry", (version) => {
     const result = runMetadataValidation(step, { version });
     expect(result.status, result.stderr).toBe(0);
     expect(result.calls).toEqual(["git fetch --no-tags origin main", "git merge-base --is-ancestor HEAD origin/main", "node"]);
     if (step.id === "release") {
       expect(result.output).toContain(`version=${version}\n`);
-      expect(result.output).toContain(`is_beta=${version.includes("-beta.")}\n`);
+      expect(result.output).toContain(`is_prerelease=${version.includes("-alpha.") || version.includes("-beta.")}\n`);
     }
   });
 

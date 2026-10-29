@@ -1,5 +1,5 @@
 const RELEASE_TAG_PATTERN =
-  /^v(0|[1-9]\d*)\.(0|[1-9]\d*)\.(0|[1-9]\d*)(?:-beta\.(0|[1-9]\d*))?$/u;
+  /^v(0|[1-9]\d*)\.(0|[1-9]\d*)\.(0|[1-9]\d*)(?:-(alpha|beta)\.(0|[1-9]\d*))?$/u;
 
 function assertSafeComponent(value, label) {
   const parsed = Number(value);
@@ -14,14 +14,17 @@ export function parseReleaseTag(tag) {
   const match = RELEASE_TAG_PATTERN.exec(tag);
   if (!match) {
     throw new Error(
-      `Unsupported release tag ${JSON.stringify(tag)}; expected vMAJOR.MINOR.PATCH or vMAJOR.MINOR.PATCH-beta.N`,
+      `Unsupported release tag ${JSON.stringify(tag)}; expected vMAJOR.MINOR.PATCH, vMAJOR.MINOR.PATCH-alpha.N, or vMAJOR.MINOR.PATCH-beta.N`,
     );
   }
 
   const major = assertSafeComponent(match[1], "major version");
   const minor = assertSafeComponent(match[2], "minor version");
   const patch = assertSafeComponent(match[3], "patch version");
-  const beta = match[4] === undefined ? undefined : assertSafeComponent(match[4], "beta number");
+  const channel = match[4];
+  const prerelease = match[5] === undefined ? undefined : assertSafeComponent(match[5], `${channel} number`);
+  const beta = channel === "beta" ? prerelease : undefined;
+  const alpha = channel === "alpha" ? prerelease : undefined;
   return Object.freeze({
     tag,
     version: tag.slice(1),
@@ -29,7 +32,11 @@ export function parseReleaseTag(tag) {
     minor,
     patch,
     beta,
-    isBeta: beta !== undefined,
+    alpha,
+    channel: channel ?? "stable",
+    prerelease,
+    isPrerelease: prerelease !== undefined,
+    isBeta: channel === "beta",
     series: `${major}.${minor}`,
   });
 }

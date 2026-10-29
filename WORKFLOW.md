@@ -41,7 +41,7 @@ maintenance fix branches        → maintenance/<major>.<minor>.x
 ## Release flow
 
 1. User-facing changes targeting `main` include the appropriate `.changeset/*.md` entry.
-2. `changesets/action` creates or updates the version PR; manual `channel=beta` and `channel=stable` dispatches enter or exit beta mode.
-3. After the version PR merges, create and push its exact signed annotated `vX.Y.Z` or `vX.Y.Z-beta.N` tag. Never move or overwrite a conflicting release tag.
+2. `changesets/action` creates or updates the version PR; manual `channel=alpha`, `channel=beta`, and `channel=stable` dispatches enter or exit prerelease mode.
+3. After the version PR merges, create and push its exact signed annotated stable, `vX.Y.Z-alpha.N`, or `vX.Y.Z-beta.N` tag. Never move or overwrite a conflicting release tag.
 4. The tag-triggered `publish.yml` validation creates a draft GitHub release. A maintainer reviews and publishes the draft manually.
-5. npm publication happens only from the `release: published` path: beta releases update `beta`; stable releases update `latest`.
+5. npm publication happens only from the `release: published` path: alpha and beta releases update their matching dist-tags; stable releases update `latest`.

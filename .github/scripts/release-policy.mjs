@@ -33,10 +33,12 @@ export function compareReleaseVersions(left, right) {
   for (const key of ["major", "minor", "patch"]) {
     if (a[key] !== b[key]) return a[key] < b[key] ? -1 : 1;
   }
-  if (a.beta === undefined && b.beta === undefined) return 0;
-  if (a.beta === undefined) return 1;
-  if (b.beta === undefined) return -1;
-  return Math.sign(a.beta - b.beta);
+  if (a.channel === "stable" && b.channel === "stable") return 0;
+  if (a.channel === "stable") return 1;
+  if (b.channel === "stable") return -1;
+  const rank = { alpha: 0, beta: 1 };
+  if (a.channel !== b.channel) return rank[a.channel] - rank[b.channel];
+  return Math.sign(a.prerelease - b.prerelease);
 }
 
 function publishedTimestamp(release) {
@@ -73,10 +75,11 @@ export function selectPreviousRelease(targetTag, releases, options) {
     );
 
   const sameSeries = eligible.filter(({ parsed }) => parsed.series === target.series);
-  const stable = eligible.filter(({ parsed }) => !parsed.isBeta);
-  const chosen = target.isBeta
-    ? sameSeries[0] ?? stable[0]
-    : sameSeries.find(({ parsed }) => !parsed.isBeta) ?? stable[0];
+  const stable = eligible.filter(({ parsed }) => !parsed.isPrerelease);
+  const sameChannel = sameSeries.find(({ parsed }) => parsed.channel === target.channel);
+  const chosen = target.isPrerelease
+    ? sameChannel ?? stable[0]
+    : sameSeries.find(({ parsed }) => !parsed.isPrerelease) ?? stable[0];
   if (!chosen) {
     throw new Error(`No eligible published release precedes ${targetTag}`);
   }

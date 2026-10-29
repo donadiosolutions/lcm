@@ -46,7 +46,7 @@ const pr = (number, labels = [], overrides = {}) => ({
   ...overrides,
 });
 
-test("parses only canonical stable and beta tags", () => {
+test("parses only canonical stable and prerelease tags", () => {
   assert.deepEqual(parseReleaseTag("v1.5.0-beta.2"), {
     tag: "v1.5.0-beta.2",
     version: "1.5.0-beta.2",
@@ -54,19 +54,26 @@ test("parses only canonical stable and beta tags", () => {
     minor: 5,
     patch: 0,
     beta: 2,
+    alpha: undefined,
+    channel: "beta",
+    prerelease: 2,
+    isPrerelease: true,
     isBeta: true,
     series: "1.5",
   });
   assert.equal(parseReleaseTag("v1.5.0").isBeta, false);
-  for (const tag of ["1.5.0", "v1.5.0-alpha.1", "v1.5.0-rc.1", "v1.5.0-beta.01", "v01.5.0", "v1.5.0+build"]) {
+  assert.equal(parseReleaseTag("v1.5.0-alpha.1").channel, "alpha");
+  for (const tag of ["1.5.0", "v1.5.0-rc.1", "v1.5.0-alpha.01", "v1.5.0-beta.01", "v01.5.0", "v1.5.0+build"]) {
     assert.throws(() => parseReleaseTag(tag), /Unsupported release tag/u);
   }
   assert.throws(() => parseReleaseTag(`v${Number.MAX_SAFE_INTEGER + 1}.0.0`), /safe integer/u);
 });
 
-test("orders beta releases before their stable version", () => {
+test("orders prerelease channels before stable versions", () => {
   assert.equal(compareReleaseVersions("1.5.0-beta.1", "1.5.0-beta.2"), -1);
   assert.equal(compareReleaseVersions("1.5.0-beta.2", "1.5.0"), -1);
+  assert.equal(compareReleaseVersions("1.5.0-alpha.2", "1.5.0-beta.0"), -1);
+  assert.equal(compareReleaseVersions("1.5.0-beta.0", "1.5.0-alpha.2"), 1);
   assert.equal(compareReleaseVersions("1.5.1-beta.0", "1.5.0"), 1);
   assert.equal(compareReleaseVersions("1.5.0", "1.5.0"), 0);
 });
@@ -219,6 +226,7 @@ test("falls back to the latest stable for the first beta in a series", () => {
 
 test("stable releases ignore intervening betas and use the last stable", () => {
   const releases = [
+    { tag_name: "v1.5.0-alpha.3", draft: false, published_at: "2026-07-04T00:00:00Z" },
     { tag_name: "v1.5.0-beta.2", draft: false, published_at: "2026-07-03T00:00:00Z" },
     { tag_name: "v1.5.0-beta.1", draft: false, published_at: "2026-07-02T00:00:00Z" },
     { tag_name: "v1.4.1", draft: false, published_at: "2026-07-01T00:00:00Z" },

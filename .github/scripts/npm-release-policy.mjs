@@ -90,10 +90,12 @@ function compareReleaseVersions(left, right) {
   for (const key of ["major", "minor", "patch"]) {
     if (a[key] !== b[key]) return a[key] < b[key] ? -1 : 1;
   }
-  if (a.beta === undefined && b.beta === undefined) return 0;
-  if (a.beta === undefined) return 1;
-  if (b.beta === undefined) return -1;
-  return Math.sign(a.beta - b.beta);
+  if (a.channel === "stable" && b.channel === "stable") return 0;
+  if (a.channel === "stable") return 1;
+  if (b.channel === "stable") return -1;
+  const rank = { alpha: 0, beta: 1 };
+  if (a.channel !== b.channel) return rank[a.channel] - rank[b.channel];
+  return Math.sign(a.prerelease - b.prerelease);
 }
 
 function defaultRunNpm(args) {
@@ -142,14 +144,14 @@ function parseJsonResult(result, label, fallback) {
 
 export function assertReleaseCanAdvanceDistTag({ version, distTags = {}, alreadyPublished = false }) {
   const target = parseReleaseTag(`v${version}`);
-  const boundaries = target.isBeta
+  const boundaries = target.isPrerelease
     ? [
-        ["beta", true],
-        ["latest", false],
+        [target.channel, target.channel],
+        ["latest", "stable"],
       ]
-    : [["latest", false]];
+    : [["latest", "stable"]];
 
-  for (const [tagName, expectedBeta] of boundaries) {
+  for (const [tagName, expectedChannel] of boundaries) {
     const current = distTags[tagName];
     if (current === undefined) continue;
     if (typeof current !== "string") {
@@ -162,9 +164,9 @@ export function assertReleaseCanAdvanceDistTag({ version, distTags = {}, already
     } catch {
       throw new Error(`npm ${tagName} points to an unsupported version`);
     }
-    if (parsedCurrent.isBeta !== expectedBeta) {
+    if (parsedCurrent.channel !== expectedChannel) {
       throw new Error(
-        `npm ${tagName} must point to a canonical ${expectedBeta ? "beta" : "stable"} version`,
+        `npm ${tagName} must point to a canonical ${expectedChannel} version`,
       );
     }
 
@@ -181,7 +183,7 @@ function highestStableVersion(versions) {
   const stable = values.flatMap((version) => {
     try {
       const parsed = parseReleaseTag(`v${version}`);
-      return parsed.isBeta ? [] : [parsed.version];
+      return parsed.isPrerelease ? [] : [parsed.version];
     } catch {
       return [];
     }
@@ -236,7 +238,9 @@ function assertCompleteNpmSnapshot({ version, packageName, published, versions, 
   const target = parseReleaseTag(`v${version}`);
   const publishedVersions = canonicalPublishedVersions(versions, packageName);
   const latest = canonicalDistTag(distTags, "latest");
-  const beta = canonicalDistTag(distTags, "beta");
+  const channelTag = target.isPrerelease
+    ? canonicalDistTag(distTags, target.channel)
+    : undefined;
   const incomplete = [];
 
   if (!published.found) incomplete.push("exact version is not visible");
@@ -246,9 +250,9 @@ function assertCompleteNpmSnapshot({ version, packageName, published, versions, 
   if (!publishedVersions.includes(version)) incomplete.push("version list is not updated");
 
   const highestStable = highestStableVersion(publishedVersions);
-  if (latest?.isBeta) throw new Error("npm latest must point to a canonical stable version");
+  if (latest?.isPrerelease) throw new Error("npm latest must point to a canonical stable version");
   if (!highestStable) {
-    if (!target.isBeta) incomplete.push("stable version list is not visible");
+    if (!target.isPrerelease) incomplete.push("stable version list is not visible");
     else if (latest) incomplete.push("version list is missing the latest release");
   } else if (!latest) {
     incomplete.push("latest dist-tag is not visible");
@@ -258,14 +262,16 @@ function assertCompleteNpmSnapshot({ version, packageName, published, versions, 
     else if (latestComparison > 0) incomplete.push("version list is missing the latest release");
   }
 
-  if (target.isBeta) {
-    if (!beta) incomplete.push("beta dist-tag is not visible");
+  if (target.isPrerelease) {
+    if (!channelTag) incomplete.push(`${target.channel} dist-tag is not visible`);
     else {
-      if (!beta.isBeta) throw new Error("npm beta must point to a canonical beta version");
-      const betaComparison = compareReleaseVersions(beta.version, version);
-      if (betaComparison < 0) incomplete.push("beta dist-tag is older than the release");
-      else if (betaComparison > 0) {
-        throw new Error("npm beta points to a newer release than the published version");
+      if (channelTag.channel !== target.channel) {
+        throw new Error(`npm ${target.channel} must point to a canonical ${target.channel} version`);
+      }
+      const channelComparison = compareReleaseVersions(channelTag.version, version);
+      if (channelComparison < 0) incomplete.push(`${target.channel} dist-tag is older than the release`);
+      else if (channelComparison > 0) {
+        throw new Error(`npm ${target.channel} points to a newer release than the published version`);
       }
     }
   } else if (latest) {
@@ -293,7 +299,7 @@ export function assertNpmDistTags({ version, versions, distTags }) {
   }
 
   const highestStable = highestStableVersion(publishedVersions);
-  if (!highestStable && !target.isBeta) {
+  if (!highestStable && !target.isPrerelease) {
     throw new Error("npm has no stable release for the latest dist-tag");
   }
   if (!highestStable && distTags.latest !== undefined) {
@@ -302,9 +308,9 @@ export function assertNpmDistTags({ version, versions, distTags }) {
   if (highestStable && distTags.latest !== highestStable) {
     throw new Error("npm latest must point to the highest published stable version");
   }
-  if (target.isBeta) {
-    if (distTags.beta !== version) {
-      throw new Error("npm beta must point to the published beta release version");
+  if (target.isPrerelease) {
+    if (distTags[target.channel] !== version) {
+      throw new Error(`npm ${target.channel} must point to the published ${target.channel} release version`);
     }
   } else if (distTags.latest !== version) {
     throw new Error(`npm latest must point to stable release ${version}`);
