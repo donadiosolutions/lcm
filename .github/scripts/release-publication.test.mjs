@@ -53,7 +53,7 @@ test("rejects ambiguous artifacts, non-files, invalid tags, and npm failures", (
   symlinkSync(join(root, "one.tgz"), join(root, "ignored-link.tgz"));
   assert.throws(
     () => publishNpmTarball({ artifactDirectory: root, tag: "next" }),
-    /tag must be beta or latest/u,
+    /tag must be alpha, beta, or latest/u,
   );
   writeFileSync(join(root, "two.tgz"), "two");
   assert.throws(

@@ -25,7 +25,9 @@ export function publishNpmTarball({
   tag,
   runNpm = defaultRunNpm,
 }) {
-  if (tag !== "beta" && tag !== "latest") throw new Error("npm publish tag must be beta or latest");
+  if (tag !== "alpha" && tag !== "beta" && tag !== "latest") {
+    throw new Error("npm publish tag must be alpha, beta, or latest");
+  }
   const directory = resolve(artifactDirectory);
   const tarballs = collectTarballs(directory);
   if (tarballs.length !== 1) {
@@ -56,7 +58,7 @@ const invokedPath = process.argv[1] ? resolve(process.argv[1]) : "";
 if (invokedPath === fileURLToPath(import.meta.url)) {
   const [artifactDirectory, tag] = process.argv.slice(2);
   if (!artifactDirectory || !tag) {
-    throw new Error("Usage: publish-npm-tarball.mjs ARTIFACT_DIRECTORY beta|latest");
+    throw new Error("Usage: publish-npm-tarball.mjs ARTIFACT_DIRECTORY alpha|beta|latest");
   }
   publishNpmTarball({ artifactDirectory, tag });
 }

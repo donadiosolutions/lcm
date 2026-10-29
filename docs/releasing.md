@@ -1,13 +1,20 @@
-# Stable and beta releases
+# Stable, alpha, and beta releases
 
-LCM publishes stable and beta versions through GitHub Actions. The supported
+LCM publishes stable, alpha, and beta versions through GitHub Actions. The supported
 version forms are:
 
 - Stable: `1.5.0`, with Git tag `v1.5.0`
+- Alpha: `1.5.0-alpha.0`, with Git tag `v1.5.0-alpha.0`
 - Beta: `1.5.0-beta.0`, with Git tag `v1.5.0-beta.0`
 
-Alpha, release-candidate, custom prerelease, build-metadata, and leading-zero
-versions are rejected.
+Release candidates, custom prereleases, build metadata, and leading-zero
+versions are rejected. For the same major, minor, and patch, stable sorts after
+beta, and beta sorts after alpha.
+
+Install the stable release with `npm install -g @donadiosolutions/lcm`. Preview
+channels can be installed explicitly with
+`npm install -g @donadiosolutions/lcm@alpha` or
+`npm install -g @donadiosolutions/lcm@beta`.
 
 ## Build toolchain and historical tags
 
@@ -33,15 +40,24 @@ pnpm prerequisites, bootstrap, installation, tests, build, and pack.
 Changesets remains the source of package versions and changelog entries. Normal
 stable version PRs are created automatically after Changesets reach `main`.
 
-To begin a beta series, run the **Version Packages** workflow manually with the
-`beta` channel and merge its version PR. The first version uses `beta.0`;
-subsequent Changesets increment it automatically. To produce the stable version,
-run the same workflow with the `stable` channel and merge the updated version
-PR. A stable transition is accepted only while beta mode is active.
+To begin an alpha or beta series from a stable package version, run
+**Version Packages** manually with the matching channel and merge its version
+PR. Changesets starts at `.0` for that channel; later Changesets increment the
+active prerelease suffix automatically. To produce a stable
+version, run the workflow with `stable` and merge the updated version PR. A
+channel cannot switch directly between alpha and beta: finish the active series
+with `stable` first, then start the other channel.
+
+The manual release helper does not create `.changeset/pre.json` or start managed
+alpha mode. If that state is absent, automatic Changesets versioning continues
+with a stable version; an existing channel label on the open version PR still
+controls its manual intent. Use **Version Packages** with `channel=alpha` to
+start a managed alpha series. When a package is already in prerelease mode,
+Changesets continues its committed channel and suffix.
 
 A manual channel choice is persisted on the open `changeset-release/main`
-version PR as exactly one internal `release-channel:beta` or
-`release-channel:stable` label. Later pushes to `main` reuse that label when the
+version PR as exactly one internal `release-channel:alpha`,
+`release-channel:beta`, or `release-channel:stable` label. Later pushes to `main` reuse that label when the
 Changesets action updates the same PR, so unrelated changes cannot reset the
 manual choice to automatic mode. Multiple open version PRs or conflicting
 channel labels fail closed. When the version PR merges or closes, the lookup no
@@ -93,23 +109,25 @@ exact version, missing version-list membership, or a valid older expected
 dist-tag. Malformed metadata, conflicting/newer tags, authorization failures,
 and unexpected npm process results fail immediately.
 
-Beta packages publish to the `beta` npm dist-tag. Stable packages publish to
+Alpha and beta packages publish to their matching npm dist-tags. Stable packages publish to
 `latest`, and the workflow verifies that `latest` remains the highest stable
-version. Publishing a beta therefore never changes what users receive from an
+version. Publishing a prerelease therefore never changes what users receive from an
 unqualified `npm install @donadiosolutions/lcm`.
 
-Before publishing a beta, the workflow requires it to advance both the current
-`beta` dist-tag and the stable `latest` boundary. This prevents a beta for an
-older or already-stable version from moving the prerelease channel backward.
-Malformed `beta` or `latest` values fail closed. Registry reads have a 60-second
+Before publishing a prerelease, the workflow requires it to advance its own
+channel dist-tag and the stable `latest` boundary. Alpha and beta ordering is
+independent; malformed relevant channel or `latest` values fail closed.
+Registry reads have a 60-second
 process timeout and terminate the npm subprocess with `SIGTERM` when exceeded.
 
 ## Release-note ranges
 
-Beta notes compare with the latest published release in the same `MAJOR.MINOR`
-series. The first beta in a new series falls back to the latest stable release.
+Alpha and beta notes compare with the latest published release in the same
+channel and `MAJOR.MINOR` series. The first release in a channel or series falls
+back to the latest stable release. Thus the first beta after alpha includes all
+changes since stable. The first alpha in a new series also falls back to stable.
 Stable notes always compare with the latest stable release, so the final release
-contains every change already previewed across its betas. Draft releases are
+contains every change already previewed across alpha or beta releases. Draft releases are
 ignored until they are manually published.
 
 Every included commit must map to an exact merged pull request. A normal
@@ -148,7 +166,7 @@ behind an earlier failed run for another tag until a later tag-bound run
 succeeds, its release is withdrawn to draft, or its published GitHub Release
 has the exact package version in npm. A republished restored draft ignores its
 own tag's earlier failed attempt. Version-package runs use a
-separate native FIFO queue and block behind any failed manual beta/stable
+separate native FIFO queue and block behind any failed manual alpha/beta/stable
 transition until that transition run succeeds on retry, preventing later
 automatic work from silently overtaking it.
 

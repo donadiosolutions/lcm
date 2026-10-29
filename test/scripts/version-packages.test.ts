@@ -15,12 +15,17 @@ import {
 describe("version-packages", () => {
   it("accepts only the supported release channels", () => {
     expect(validateReleaseChannel("auto")).toBe("auto");
+    expect(validateReleaseChannel("alpha")).toBe("alpha");
     expect(validateReleaseChannel("beta")).toBe("beta");
     expect(validateReleaseChannel("stable")).toBe("stable");
-    expect(() => validateReleaseChannel("alpha")).toThrow("expected auto, beta, or stable");
+    expect(() => validateReleaseChannel("rc")).toThrow("expected auto, alpha, beta, or stable");
   });
 
-  it("accepts only beta prerelease states with known modes", () => {
+  it("accepts only alpha or beta prerelease states with known modes", () => {
+    expect(validatePrereleaseState({ mode: "pre", tag: "alpha" })).toEqual({
+      mode: "pre",
+      tag: "alpha",
+    });
     expect(validatePrereleaseState({ mode: "pre", tag: "beta" })).toEqual({
       mode: "pre",
       tag: "beta",
@@ -31,8 +36,8 @@ describe("version-packages", () => {
     });
     expect(() => validatePrereleaseState(null)).toThrow("JSON object");
     expect(() => validatePrereleaseState([])).toThrow("JSON object");
-    expect(() => validatePrereleaseState({ mode: "pre", tag: "alpha" })).toThrow(
-      "only beta is allowed",
+    expect(() => validatePrereleaseState({ mode: "pre", tag: "rc" })).toThrow(
+      "only alpha or beta is allowed",
     );
     expect(() => validatePrereleaseState({ mode: "other", tag: "beta" })).toThrow(
       "expected pre or exit",
@@ -58,7 +63,7 @@ describe("version-packages", () => {
   it("plans native beta entry, continuation, and stable exit", () => {
     expect(planPrereleaseTransition("auto", undefined)).toEqual([]);
     expect(planPrereleaseTransition("auto", { mode: "pre", tag: "beta" })).toEqual([]);
-    expect(planPrereleaseTransition("beta", undefined)).toEqual(["pre", "enter", "beta"]);
+    expect(planPrereleaseTransition("alpha", undefined)).toEqual(["pre", "enter", "alpha"]);
     expect(planPrereleaseTransition("beta", { mode: "pre", tag: "beta" })).toEqual([]);
     expect(planPrereleaseTransition("stable", { mode: "pre", tag: "beta" })).toEqual([
       "pre",
@@ -74,12 +79,15 @@ describe("version-packages", () => {
     expect(() => planPrereleaseTransition("stable", undefined)).toThrow(
       "prerelease mode is not active",
     );
+    expect(() => planPrereleaseTransition("beta", { mode: "pre", tag: "alpha" })).toThrow(
+      "finish the stable release first",
+    );
   });
 
   it("runs the planned transition before versioning without a lockfile rewrite", () => {
     const execute = vi.fn();
     runVersionPackages({
-      channel: "beta",
+      channel: "alpha",
       cwd: "/repo",
       execute,
       exists: () => false,
@@ -90,7 +98,7 @@ describe("version-packages", () => {
       "/repo/node_modules/@changesets/cli/bin.js",
       "pre",
       "enter",
-      "beta",
+      "alpha",
     ]);
     expect(execute.mock.calls[1][1]).toEqual([
       "/repo/node_modules/@changesets/cli/bin.js",
