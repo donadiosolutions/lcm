@@ -646,6 +646,10 @@ example a 60 second per-request deadline) still times out first; lower
 `statementTimeoutMs` to detect a dead connection sooner. A migration script
 that sends several statements in one request gets one `statementTimeoutMs`
 per statement. An event-loop stall longer than the deadline can also trip it.
+The deadline also covers sending query parameters and receiving results, so a
+very large payload over a slow link can hit it; raise `statementTimeoutMs` for
+such links. The portable transfer destination connection is exempt, so large
+record uploads are not cut short.
 
 `snapshotIdleTimeoutMs` bounds only the read-only, repeatable-read snapshot
 transaction that a portable transfer holds open for the lifetime of its source

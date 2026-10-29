@@ -322,6 +322,7 @@ describe("PostgreSQL 18 runtime", () => {
           port: relayPort,
         }),
       });
+      let watchdog: NodeJS.Timeout | undefined;
       try {
         const warm = await runtime.query<{ pid: number }>({ text: "SELECT pg_backend_pid() AS pid" }, {
           domain: "factory", operation: "warmRelay",
@@ -329,9 +330,14 @@ describe("PostgreSQL 18 runtime", () => {
         forwarding = false;
         const deadline = postgreSqlQueryDeadlineMs(connectionSettings);
         const started = Date.now();
-        await expect(runtime.query({ text: "SELECT 1" }, {
+        // A deadline regression leaves the query pending; the watchdog turns that into a
+        // failed assertion so the cleanup below still runs.
+        const expired = new Promise<never>((_resolve, reject) => {
+          watchdog = setTimeout(() => { reject(new Error("query deadline watchdog expired")); }, 15_000);
+        });
+        await expect(Promise.race([runtime.query({ text: "SELECT 1" }, {
           domain: "factory", operation: "blackHole",
-        })).rejects.toMatchObject({
+        }), expired])).rejects.toMatchObject({
           code: "STORAGE_OPERATION_FAILED",
           backend: "postgresql",
           operation: "blackHole",
@@ -347,6 +353,7 @@ describe("PostgreSQL 18 runtime", () => {
         });
         expect(fresh.rows[0].pid).not.toBe(warm.rows[0].pid);
       } finally {
+        clearTimeout(watchdog);
         for (const socket of sockets) socket.destroy();
         await new Promise<void>((resolve) => { relay.close(() => { resolve(); }); });
         await runtime.close();

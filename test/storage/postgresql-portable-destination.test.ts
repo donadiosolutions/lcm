@@ -16,7 +16,7 @@ const boundaries = vi.hoisted(() => ({
   contentSizes: vi.fn(),
 }));
 vi.mock('../../src/storage/postgresql/runtime.js', () => ({ PostgreSqlRuntime: class { constructor() { return boundaries.runtime(); } } }));
-vi.mock('pg', () => ({ Client: class { constructor() { return boundaries.client(); } } }));
+vi.mock('pg', () => ({ Client: class { constructor(...args: unknown[]) { return boundaries.client(...args); } } }));
 vi.mock('../../src/storage/postgresql/client-config.js', () => ({ buildPostgreSqlClientConfig: boundaries.config }));
 vi.mock('../../src/storage/postgresql/runtime-readiness.js', () => ({ verifyPostgreSqlTransferSchema: boundaries.schema }));
 vi.mock('../../src/storage/postgresql/portable-mapping.js', async importOriginal => ({
@@ -535,6 +535,11 @@ describe('uncertain commits, cancellation and release', () => {
     expect(db.queryLog.slice(queries)).not.toContain('ROLLBACK');
     db.beforeQuery = undefined;
     await expect(writer.readProgress(manifest.manifestSha256)).rejects.toEqual(new PortableTransferError('destination-failed'));
+  });
+  it('disables the client query deadline on the destination connection', async () => {
+    boundaries.config.mockReturnValue({ host: 'db.example', query_timeout: 70_000 });
+    await admitted();
+    expect(boundaries.client).toHaveBeenCalledWith({ host: 'db.example', query_timeout: 0 });
   });
   it('fails closed after an asynchronous client error', async () => {
     const { writer, manifest } = await admitted(); db.clients[0]!.emit('error', new Error('secret socket'));

@@ -204,7 +204,8 @@ async function assertEmpty(state:DestinationState,signal?:AbortSignal,executor:P
 }
 async function connect(state:DestinationState,signal?:AbortSignal):Promise<void> {
   abort(signal);
-  const client=new Client(buildPostgreSqlClientConfig(state.input.settings));
+  // query_timeout 0 (connection level) disables the client deadline: node-pg starts it before the request is sent, so a healthy large record upload could trip it.
+  const client=new Client({...buildPostgreSqlClientConfig(state.input.settings),query_timeout:0});
   client.on('error',()=>{state.broken=true;});
   state.client=client;
   await client.connect();

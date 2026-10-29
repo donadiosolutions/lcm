@@ -626,7 +626,11 @@ example after a network partition) after `statementTimeoutMs` plus a grace of
 caller deadline still fires first): it fails with a retryable storage error
 and the connection is destroyed. A migration request holding several
 statements gets one `statementTimeoutMs` per statement, and an event-loop
-stall longer than the deadline can also trip it. `statementTimeoutMs` is
+stall longer than the deadline can also trip it. The deadline also covers
+sending query parameters and receiving results, so a very large payload over
+a slow link can hit it (raise `statementTimeoutMs` for such links); the
+portable transfer destination connection is exempt so large record uploads
+are not cut short. `statementTimeoutMs` is
 deliberately separate from `snapshotIdleTimeoutMs`, which
 bounds only the longest idle gap inside a portable transfer's long-lived
 read-only snapshot transaction (`SET LOCAL`-scoped, reverted on

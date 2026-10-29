@@ -3173,4 +3173,3 @@ describe("PostgreSQL runtime query read timeout", () => {
     expect(f.release).toHaveBeenCalledWith(false);
   });
 });
-
