@@ -232,6 +232,7 @@ function findUrlPathStarts(chars: readonly string[]): UrlPathStarts {
   const nextPublicValue = new Int32Array(chars.length + 1).fill(chars.length);
   const nextOpenBracket = new Int32Array(chars.length + 1).fill(chars.length);
   const nextBackslash = new Int32Array(chars.length + 1).fill(chars.length);
+  const nextFragmentBackslash = new Int32Array(chars.length + 1).fill(chars.length);
   const softBoundaryEnd = new Int32Array(chars.length + 1);
   softBoundaryEnd[chars.length] = chars.length;
   const inheritedContinuationDelimiter = new Int32Array(chars.length + 1).fill(-1);
@@ -254,6 +255,9 @@ function findUrlPathStarts(chars: readonly string[]): UrlPathStarts {
       : nextPublicValue[cursor + 1]!;
     nextOpenBracket[cursor] = char === "[" ? cursor : nextOpenBracket[cursor + 1]!;
     nextBackslash[cursor] = char === "\\" ? cursor : nextBackslash[cursor + 1]!;
+    nextFragmentBackslash[cursor] = char === "#" && chars[cursor + 1] === "\\"
+      ? cursor
+      : nextFragmentBackslash[cursor + 1]!;
     const softBoundary = whitespace || "\u200b\u200c\u200d\u2060".includes(char);
     softBoundaryEnd[cursor] = softBoundary ? softBoundaryEnd[cursor + 1]! : cursor;
 
@@ -456,6 +460,17 @@ function findUrlPathStarts(chars: readonly string[]): UrlPathStarts {
       if (!isPathWord(chars[cursor])) return -1;
     }
   };
+  const simpleForwardDriveOriginEnd = (start: number): number => {
+    if (!isForwardSlashDrivePathStart(start) || chars[start + 3] === "/") return -1;
+    let cursor = start + 3;
+    if (!isPathWord(chars[cursor])) return -1;
+    while (true) {
+      while (isPathWord(chars[cursor])) cursor += 1;
+      if (chars[cursor] !== "/" && chars[cursor] !== "\\") return cursor;
+      cursor += 1;
+      if (!isPathWord(chars[cursor])) return -1;
+    }
+  };
   const simplePrivateRelativePath = (start: number): { forcedStart: number; end: number } | undefined => {
     const forcedStart = returnedParentPrivateRootPathStart(start);
     if (forcedStart < 0) return undefined;
@@ -464,17 +479,11 @@ function findUrlPathStarts(chars: readonly string[]): UrlPathStarts {
     return { forcedStart, end: cursor };
   };
   const prospectiveRegionEnd = (start: number, ownerBracketOpen: number): number => {
-    let regionEnd = chars.length;
     if (ownerBracketOpen >= 0) {
       const close = matchingBracketClose[ownerBracketOpen];
-      if (close >= start) regionEnd = close + 1;
+      if (close >= start) return close + 1;
     }
-    const componentOpen = nextOpenBracket[start]!;
-    if (componentOpen < regionEnd) {
-      const componentClose = matchingBracketClose[componentOpen];
-      if (componentClose >= componentOpen) regionEnd = componentClose + 1;
-    }
-    return regionEnd;
+    return chars.length;
   };
   const isSimpleBracketContinuation = (
     start: number,
@@ -482,8 +491,11 @@ function findUrlPathStarts(chars: readonly string[]): UrlPathStarts {
     crossedSoftBoundary: boolean,
   ): boolean => {
     let bracketStart = start;
-    if (chars[bracketStart] === "(") bracketStart += 1;
-    if (chars[bracketStart] !== "[") return chars[bracketStart] !== "[";
+    if (chars[bracketStart] === "(") {
+      if (chars[bracketStart + 1] !== "[") return false;
+      bracketStart += 1;
+    }
+    if (chars[bracketStart] !== "[") return chars[bracketStart] === "]" || bracketStart >= regionEnd;
     const close = matchingBracketClose[bracketStart];
     if (close < 0) return false;
     const firstUnsupported = Math.min(
@@ -494,7 +506,10 @@ function findUrlPathStarts(chars: readonly string[]): UrlPathStarts {
     );
     if (firstUnsupported < close) return false;
     if (crossedSoftBoundary && nextBackslash[bracketStart + 1]! < close) return false;
-    return true;
+    if (nextFragmentBackslash[bracketStart + 1]! < close) return false;
+    let cursor = close + 1;
+    while (cursor < regionEnd && chars[cursor] === "]") cursor += 1;
+    return cursor >= regionEnd;
   };
   const measureInheritedTailAdmission = (
     successorStart: number,
@@ -704,6 +719,8 @@ function findUrlPathStarts(chars: readonly string[]): UrlPathStarts {
       index === inheritedFileQuoteEnd &&
       inheritedFileQuoteParentOwnerBracketDepth > 0
     ) {
+      const quoteClosedInsideOwnedBracket =
+        postCloseFilePathActive && postCloseFilePathBracketDepth > 0;
       const continuationStart = skipInheritedQuoteInterposerRun(index + 1);
       let valueStart = continuationStart;
       while (chars[valueStart] === "=") valueStart += 1;
@@ -730,11 +747,9 @@ function findUrlPathStarts(chars: readonly string[]): UrlPathStarts {
           }
         } else if (valueStart > continuationStart) {
           const forwardSlashDriveValue = isForwardSlashDrivePathStart(valueStart);
-          let originEnd = simpleRootedPathEnd(valueStart);
-          if (forwardSlashDriveValue) {
-            originEnd = valueStart + 3;
-            while (isPathWord(chars[originEnd]) || chars[originEnd] === "/") originEnd += 1;
-          }
+          const originEnd = forwardSlashDriveValue
+            ? simpleForwardDriveOriginEnd(valueStart)
+            : simpleRootedPathEnd(valueStart);
           if (originEnd >= 0) {
             const initialAdmission = {
               forcedStart: forwardSlashDriveValue ? valueStart + 2 : valueStart,
@@ -746,11 +761,11 @@ function findUrlPathStarts(chars: readonly string[]): UrlPathStarts {
               initialAdmission,
             );
             if (admission !== undefined) {
-              if (forwardSlashDriveValue) {
+              if (forwardSlashDriveValue && !quoteClosedInsideOwnedBracket) {
                 const pathStart = valueStart + 2;
                 forcedPath[pathStart] = 1;
                 armBracketTail(pathStart, valueStart, false, true, true);
-              } else {
+              } else if (!forwardSlashDriveValue) {
                 applyInheritedTailAdmission(admission, inheritedFileQuoteParentOwnerBracketDepth);
               }
               inheritedFileQuoteParentOwnerBracketDepth = 0;

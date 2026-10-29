@@ -6232,7 +6232,6 @@ describe("sanitizeError", () => {
         "=\\Users\\S\\x[https://inner?key=\\Users\\D\\s]]",
         "=<path>?key=<path>]]",
       ],
-      ["backslash value with a bracket bridge", "=\\Users\\S\\x[x]&later/home/bob]", "=<path>&later<path>]"],
       [
         "backslash value followed by soft whitespace and a bracket",
         "=\\Users\\S\\x\u00a0" + bracket,
@@ -6250,6 +6249,15 @@ describe("sanitizeError", () => {
       ],
     ] as const)("redacts the adopted %s on the first pass", (_name, suffix, expectedSuffix) => {
       assertPasses(prefix + suffix, redactedPrefix + expectedSuffix);
+    });
+
+    it("keeps the base split for a bracket bridge with a later successor", () => {
+      assertPasses(
+        prefix + "=\\Users\\S\\x[x]&later/home/bob]",
+        redactedPrefix + "=<path>&later/home/bob]",
+        redactedPrefix + "=<path>&later<path>]",
+        redactedPrefix + "=<path>&later<path>]",
+      );
     });
 
     it.each([
@@ -6979,6 +6987,45 @@ describe("sanitizeError", () => {
       expect(first).toBe(redactedPrefix + firstSuffix);
       expect(second).toBe(redactedPrefix + secondSuffix);
       expect(third).toBe(redactedPrefix + thirdSuffix);
+    });
+
+    it.each([
+      ["S1", "=\\Users\\ZQA\\x[x]&[file:///b&[https://o?key=/Users/ZQE/x]]]", "=<path>&[file://<path>&[https://o?key=<path>]]]", "=<path>&[file://<path>&[https://o?key=<path>]]]", "=<path>&[file://<path>&[https://o?key=<path>]]]"],
+      ["S2", ",|\\Users\\ZQA\\x[https://i?key=/home/ZQC/s]&[file:///b&[https://o?key=/Users/ZQE/x]]]", ",|\\Users\\ZQA\\x[https://i?key=/home/ZQC/s]&[file://<path>&[https://o?key=<path>]]]", ",|<path>?key=/home/ZQC/s]&[file://<path>&[https://o?key=<path>]]]", ",|<path>?key=<path>]&[file://<path>&[https://o?key=<path>]]]"],
+      ["S3", "=\\Users\\ZQA\\x[https://i?key=/home/ZQC/s]&/https://pub.test/x?y=C:/Users/ZQE/x]", "=<path>?key=/home/ZQC/s]&<path>?y=C:/Users/ZQE/x]", "=<path>?key=<path>]&<path>?y=C:<path>]", "=<path>?key=<path>]&<path>?y=C:<path>]"],
+      ["S4", "=/Users/ZQV/x[https://inner?key=plain]&later/home/ZQU]", "=<path>?key=plain]&later/home/ZQU]", "=<path>?key=plain]&later/home/ZQU]", "=<path>?key=plain]&later/home/ZQU]"],
+      ["S5", "=\\Users\\ZQA\\x[x][https://j?key=C:/Users/ZQE/x]]", "=<path>?key=C:/Users/ZQE/x]]", "=<path>?key=C:<path>]]", "=<path>?key=C:<path>]]"],
+      ["S6", "=\\Users\\ZQA\\x[https://i?key=/home/ZQC/s][https://j?key=/Users/ZQE/x]]", "=<path>?key=/home/ZQC/s][https://j?key=/Users/ZQE/x]]", "=<path>?key=<path>][https://j?key=/Users/ZQE/x]]", "=<path>?key=<path>][https://j?key=/Users/ZQE/x]]"],
+      ["S7", "=C:/]", "=C:/]", "=C:/]", "=C:/]"],
+      ["S8", "=C://ZQA/x]", "=C://ZQA/x]", "=C://ZQA/x]", "=C://ZQA/x]"],
+      ["S9", "=C:///ZQA[https://i?key=/home/ZQC/s]]", "=C:///ZQA[https://i?key=/home/ZQC/s]]", "=C:///ZQA[https://i?key=/home/ZQC/s]]", "=C:///ZQA[https://i?key=/home/ZQC/s]]"],
+      ["S10", "=C://ZQA/x[https://i?key=/home/ZQC/s]&k=\\Users\\ZQE\\x]", "=C://ZQA/x[https://i?key=/home/ZQC/s]&k=\\Users\\ZQE\\x]", "=C://ZQA/x[https://i?key=/home/ZQC/s]&k=<path>]", "=C://ZQA/x[https://i?key=/home/ZQC/s]&k=<path>]"],
+      ["S11", "=C://ZQA/x&k=/Users/ZQE/x]", "=C://ZQA/x&k=/Users/ZQE/x]", "=C://ZQA/x&k=/Users/ZQE/x]", "=C://ZQA/x&k=/Users/ZQE/x]"],
+      ["S13", ",|\\Users\\ZQA\\x(/Users/ZQE/x)]", ",|\\Users\\ZQA\\x(<path>)]", ",|<path><path>)]", ",|<path><path>)]"],
+      ["S14", "=\\Users\\ZQA\\x[https://i#\\Users\\ZQE\\x]]", "=<path>#\\Users\\ZQE\\x]]", "=<path>#\\Users\\ZQE\\x]]", "=<path>#\\Users\\ZQE\\x]]"],
+      ["S15", ",|/Users/ZQA/x[https://i#\\Users\\ZQE\\x]]", ",|<path>#\\Users\\ZQE\\x]]", ",|<path>#\\Users\\ZQE\\x]]", ",|<path>#\\Users\\ZQE\\x]]"],
+      ["strict drive dangling separator", "=C:/Users/]", "=C:<path>]", "=C:<path>]", "=C:<path>]"],
+      ["strict drive terminal value", "=C:/Users/x", "=C:<path>", "=C:<path>", "=C:<path>"],
+    ] as const)("pins final-round synthesis row %s", (_id, inputSuffix, firstSuffix, secondSuffix, thirdSuffix) => {
+      const first = sanitizeError(prefix + inputSuffix);
+      const second = sanitizeError(first);
+      const third = sanitizeError(second);
+
+      expect(first).toBe(redactedPrefix + firstSuffix);
+      expect(second).toBe(redactedPrefix + secondSuffix);
+      expect(third).toBe(redactedPrefix + thirdSuffix);
+    });
+
+    it("pins final-round synthesis row S12", () => {
+      const input = "file://h?x=['https://o.test/x?next=file:///Users/ZQP/a'|\\Users\\ZQA\\x[https://i?key='https://o.test/x?next=file:///Users/ZQR/a'=C:/Users/ZQB/x]]";
+      const expected = "file://h?x=['https://o.test/x?next=file://<path>'|<path>?key='https://o.test/x?next=file://<path>'=<path>]]";
+      const first = sanitizeError(input);
+      const second = sanitizeError(first);
+      const third = sanitizeError(second);
+
+      expect(first).toBe(expected);
+      expect(second).toBe(expected);
+      expect(third).toBe(expected);
     });
 
     it.each([
