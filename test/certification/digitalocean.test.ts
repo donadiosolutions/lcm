@@ -81,6 +81,38 @@ describe("certification DigitalOcean lifecycle", () => {
     expect(request).toHaveBeenCalledTimes(2);
   });
 
+  // The real API answers a tag that matches no cluster with HTTP 200 and
+  // {"databases": null}, without links or meta.
+  it.each([
+    ["null", { databases: null }],
+    ["missing", {}],
+  ])("reads a 200 page whose database list is %s as an empty tag", async (_name, body) => {
+    const request = vi.fn(async () => ({ status: 200, body }));
+    await expect(listByTag({ request } as any, "lcm-cert")).resolves.toEqual([]);
+    expect(request).toHaveBeenCalledTimes(1);
+    expect(request).toHaveBeenCalledWith("GET", "/v2/databases?tag_name=lcm-cert&per_page=200");
+  });
+
+  it.each([
+    ["databases as an object", 200, { databases: {} }],
+    ["databases as a string", 200, { databases: "x" }],
+    ["databases as a number", 200, { databases: 0 }],
+    ["databases as a boolean", 200, { databases: false }],
+    ["a string body", 200, "x"],
+    ["an array body", 200, []],
+    ["a null body", 200, null],
+    ["no list on HTTP 204", 204, {}],
+  ])("still rejects a page with %s", async (_name, status, body) => {
+    const request = vi.fn(async () => ({ status, body }));
+    await expect(listByTag({ request } as any, "lcm-cert")).rejects.toThrow("DigitalOcean database list is malformed");
+  });
+
+  it("still validates the pagination link of an empty page", async () => {
+    const request = vi.fn(async () => ({ status: 200, body: { databases: null, links: { pages: { next: "https://evil.example/v2/databases?page=2" } } } }));
+    await expect(listByTag({ request } as any, "lcm-cert")).rejects.toThrow("pagination escaped the fixed API origin");
+    expect(request).toHaveBeenCalledTimes(1);
+  });
+
   it("creates, firewalls, allowlists evidence and destroys the exact owned cluster", async () => {
     const requests: Array<{ method: string; path: string; body?: any }> = [];
     const secrets: string[] = [];
@@ -124,6 +156,76 @@ describe("certification DigitalOcean lifecycle", () => {
       useCluster: vi.fn(),
     })).rejects.toThrow("family tag");
     expect(fetch).toHaveBeenCalledOnce();
+  });
+
+  // A complete lifecycle whose family-tag list is answered by familyList, before and
+  // after the owned cluster is deleted.
+  function familyTagLifecycle(familyList: (deleted: boolean) => unknown) {
+    const requests: string[] = [];
+    let deleted = false;
+    const fetch = vi.fn(async (url: string, init: RequestInit) => {
+      const parsed = new URL(url);
+      const body = init.body ? JSON.parse(String(init.body)) : undefined;
+      requests.push(`${init.method} ${parsed.pathname}${parsed.search}`);
+      if (init.method === "GET" && parsed.searchParams.get("tag_name") === "lcm-cert") return json(familyList(deleted));
+      if (init.method === "POST" && parsed.pathname === "/v2/databases") return json({ database: { id: "cluster-1", name: body.name, tags: body.tags, status: "online", host: "db.example", port: 25060, user: "doadmin", password: "pw" } }, 201);
+      if (init.method === "GET" && parsed.pathname === "/v2/databases/cluster-1") return deleted ? json({}, 404) : json({ database: { id: "cluster-1", name: "lcm-cert-run12345", tags: ["lcm-cert", "lcm-cert-run-run12345"], status: "online", host: "db.example", port: 25060 } });
+      if (init.method === "PUT") return json({});
+      if (init.method === "GET" && parsed.pathname.endsWith("/firewall")) return json({ rules: [{ type: "ip_addr", value: "203.0.113.8" }] });
+      if (init.method === "GET" && parsed.pathname.endsWith("/ca")) return json({ ca: { certificate: "-----BEGIN CERTIFICATE-----\nca\n-----END CERTIFICATE-----" } });
+      if (init.method === "POST" && parsed.pathname.endsWith("/dbs")) return json({ db: { name: body.name } }, 201);
+      if (init.method === "POST" && parsed.pathname.endsWith("/users")) return json({ user: { name: body.name, password: "pw" } }, 201);
+      if (init.method === "DELETE") { deleted = true; return new Response(null, { status: 204 }); }
+      throw new Error(`${init.method} ${url}`);
+    });
+    const client = createDigitalOceanClient({ token: "token", registerSecret: vi.fn(), fetch: fetch as any });
+    const directory = mkdtempSync(join(tmpdir(), "lcm-cert-do-family-tag-"));
+    return {
+      requests,
+      run: () => runDigitalOceanLifecycle({ client, runId: "run12345", trustedIpv4: "203.0.113.8", receiptPath: join(directory, "receipt"), useCluster: async () => ({}) }),
+    };
+  }
+  const familyRequest = "GET /v2/databases?tag_name=lcm-cert&per_page=200";
+
+  it.each([
+    ["null", { databases: null }],
+    ["missing", {}],
+  ])("creates after an empty family preflight and confirms cleanup by an empty family tag when the list is %s", async (_name, emptyList) => {
+    const lifecycle = familyTagLifecycle(() => emptyList);
+    const result = await lifecycle.run();
+    expect(lifecycle.requests.slice(0, 2)).toEqual([familyRequest, "POST /v2/databases"]);
+    expect(lifecycle.requests.filter((request) => request === familyRequest)).toHaveLength(2);
+    expect(lifecycle.requests.lastIndexOf(familyRequest)).toBeGreaterThan(lifecycle.requests.indexOf("DELETE /v2/databases/cluster-1"));
+    expect(result.cleanup).toMatchObject({ destroyedId: "cluster-1", confirmed404: true, emptyFamilyTag: true });
+  });
+
+  it("refuses a malformed family list before create and after delete", async () => {
+    const preflight = familyTagLifecycle(() => ({ databases: {} }));
+    await expect(preflight.run()).rejects.toThrow("DigitalOcean database list is malformed");
+    expect(preflight.requests).toEqual([familyRequest]);
+    const teardown = familyTagLifecycle((deleted) => (deleted ? { databases: "x" } : { databases: null }));
+    await expect(teardown.run()).rejects.toMatchObject({
+      message: expect.stringContaining("DigitalOcean cleanup failed for cluster cluster-1"),
+      cause: expect.objectContaining({ message: "DigitalOcean database list is malformed" }),
+      providerCleanup: expect.objectContaining({ emptyFamilyTag: false }),
+    });
+  });
+
+  it("surfaces the original create error when reconciliation finds no cluster under the run tag", async () => {
+    const requests: string[] = [];
+    const fetch = vi.fn(async (url: string, init: RequestInit) => {
+      const parsed = new URL(url);
+      requests.push(`${init.method} ${parsed.pathname}${parsed.search}`);
+      if (init.method === "POST") throw new TypeError("connection lost");
+      if (init.method === "GET" && parsed.searchParams.has("tag_name")) return json({ databases: null });
+      throw new Error(`${init.method} ${url}`);
+    });
+    const client = createDigitalOceanClient({ token: "token", registerSecret: vi.fn(), fetch: fetch as any });
+    const directory = mkdtempSync(join(tmpdir(), "lcm-cert-do-reconcile-empty-"));
+    await expect(runDigitalOceanLifecycle({
+      client, runId: "run12345", trustedIpv4: "203.0.113.8", receiptPath: join(directory, "receipt"), useCluster: vi.fn(),
+    })).rejects.toThrow("connection lost");
+    expect(requests).toEqual([familyRequest, "POST /v2/databases", "GET /v2/databases?tag_name=lcm-cert-run-run12345&per_page=200"]);
   });
 
   it("reconciles one ambiguous create by exact name and run tag without retrying POST", async () => {

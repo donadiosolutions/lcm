@@ -182,8 +182,13 @@ export async function listByTag(client, tag) {
   let path = `/v2/databases?tag_name=${encodeURIComponent(tag)}&per_page=200`;
   for (let page = 0; path !== undefined && page < 100; page += 1) {
     const response = await client.request("GET", path);
-    if (!Array.isArray(response.body.databases)) throw new Error("DigitalOcean database list is malformed");
-    databases.push(...response.body.databases);
+    const body = response.body;
+    if (body === null || typeof body !== "object" || Array.isArray(body)) throw new Error("DigitalOcean database list is malformed");
+    // DigitalOcean answers a tag that matches no cluster with HTTP 200 and {"databases": null},
+    // without links or meta. A missing key reads the same; any other non-array is malformed.
+    const listed = response.status === 200 ? (body.databases ?? []) : body.databases;
+    if (!Array.isArray(listed)) throw new Error("DigitalOcean database list is malformed");
+    databases.push(...listed);
     const next = response.body.links?.pages?.next;
     if (next === undefined || next === null || next === "") { path = undefined; continue; }
     const parsed = new URL(next, API_ORIGIN);
