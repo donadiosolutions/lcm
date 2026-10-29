@@ -174,6 +174,8 @@ function findUrlPathStarts(chars: readonly string[]): UrlPathStarts {
     postCloseFilePathOwnsBackslashQuery = options.ownsBackslashQuery ?? true;
     postCloseFilePathDrivePrefix = drivePrefix;
     postCloseFilePathFileUrlComponentDepth = 0;
+    postCloseFilePathFileUrlComponentHasPublicUrl = false;
+    postCloseFilePathDrivePrefixRefused = false;
     postCloseFilePathTailEnd = measurePrivateSpanEnd(start, options.fileUrl, options.forced);
   };
   // A claim that activates inside a bracket an active tail already owns is
@@ -205,13 +207,36 @@ function findUrlPathStarts(chars: readonly string[]): UrlPathStarts {
   };
   const isForwardSlashDrivePathStart = (start: number): boolean =>
     /^[A-Za-z]$/u.test(chars[start] ?? "") && chars[start + 1] === ":" && chars[start + 2] === "/";
-  const ownedBracketValuePathStart = (start: number): number =>
-    isForwardSlashDrivePathStart(start) &&
-    (postCloseFilePathDrivePrefix === "all" ||
-      (postCloseFilePathDrivePrefix === "nested-file" &&
-        postCloseFilePathFileUrlComponentDepth === postCloseFilePathBracketDepth))
-      ? start + 2
-      : start;
+  const ownedBracketValuePathStart = (start: number): number => {
+    if (!isForwardSlashDrivePathStart(start)) return start;
+    const suffixStart = start + 3;
+    if (chars[suffixStart] === "/" || isFileUrlLiteral(chars, suffixStart)) return start;
+    const namedValue = chars[start - 1] === "=" || chars[start - 1] === "#";
+    const compoundDrive = isForwardSlashDrivePathStart(suffixStart);
+    const pathWord = isPathWord(chars[suffixStart]);
+    const followsPublicUrlInFileComponent =
+      postCloseFilePathFileUrlComponentDepth === postCloseFilePathBracketDepth &&
+      postCloseFilePathFileUrlComponentHasPublicUrl;
+    const insideFileComponent =
+      postCloseFilePathFileUrlComponentDepth === postCloseFilePathBracketDepth;
+    const preservesAll =
+      postCloseFilePathDrivePrefix === "all" &&
+      !insideFileComponent &&
+      !followsPublicUrlInFileComponent &&
+      (namedValue || (pathWord && !compoundDrive));
+    const preservesNestedFile =
+      postCloseFilePathDrivePrefix !== "none" &&
+      insideFileComponent &&
+      !followsPublicUrlInFileComponent &&
+      pathWord &&
+      !compoundDrive;
+    const preservesDrivePrefix =
+      !postCloseFilePathDrivePrefixRefused && (preservesAll || preservesNestedFile);
+    if (!preservesDrivePrefix && postCloseFilePathDrivePrefix !== "none") {
+      postCloseFilePathDrivePrefixRefused = true;
+    }
+    return preservesDrivePrefix ? start + 2 : start;
+  };
   const backslashSlashSuccessorPathStart = (start: number): number => {
     if (!isPathWord(chars[start])) return -1;
     let cursor = start;
@@ -424,6 +449,8 @@ function findUrlPathStarts(chars: readonly string[]): UrlPathStarts {
   let postCloseFilePathOwnsBackslashQuery = true;
   let postCloseFilePathDrivePrefix: OwnedBracketDrivePrefix = "none";
   let postCloseFilePathFileUrlComponentDepth = 0;
+  let postCloseFilePathFileUrlComponentHasPublicUrl = false;
+  let postCloseFilePathDrivePrefixRefused = false;
   let inheritedFileQuoteParentOwnerBracketDepth = 0;
   let inheritedFileQuoteEnd = -1;
   let cachedEnclosingQuote = 0;
@@ -493,10 +520,17 @@ function findUrlPathStarts(chars: readonly string[]): UrlPathStarts {
         postCloseFilePathOwnsBackslashQuery = true;
         postCloseFilePathDrivePrefix = "none";
         postCloseFilePathFileUrlComponentDepth = 0;
+        postCloseFilePathFileUrlComponentHasPublicUrl = false;
+        postCloseFilePathDrivePrefixRefused = false;
       } else {
         postCloseFilePathOwnsAdjacentComponents = false;
         postCloseFilePathOwnsBackslashQuery = false;
-        postCloseFilePathDrivePrefix = "nested-file";
+        if (
+          postCloseFilePathDrivePrefix === "none" ||
+          postCloseFilePathBracketDepth === 0
+        ) {
+          postCloseFilePathDrivePrefix = "nested-file";
+        }
       }
       backslashSlashClaimActive = false;
       activeNestedFileSchemeStart = -1;
@@ -616,6 +650,16 @@ function findUrlPathStarts(chars: readonly string[]): UrlPathStarts {
     if (postCloseFilePathActive && index >= postCloseFilePathTrackingStart) {
       if (
         postCloseFilePathBracketDepth > 0 &&
+        postCloseFilePathFileUrlComponentDepth === postCloseFilePathBracketDepth &&
+        (char === "&" || char === "|") &&
+        startsUrlSchemeLiteral(chars, index + 1) &&
+        !isFileUrlLiteral(chars, index + 1)
+      ) {
+        postCloseFilePathFileUrlComponentHasPublicUrl = true;
+        postCloseFilePathDrivePrefixRefused = true;
+      }
+      if (
+        postCloseFilePathBracketDepth > 0 &&
         !postCloseFilePathComponentHasQuery &&
         (char === "?" || char === "#" || char === "&" || char === "=")
       ) {
@@ -663,15 +707,19 @@ function findUrlPathStarts(chars: readonly string[]): UrlPathStarts {
       } else if (char === "[") {
         if (postCloseFilePathBracketDepth === 0) {
           postCloseFilePathComponentHasQuery = false;
+          postCloseFilePathDrivePrefixRefused = false;
         }
         postCloseFilePathBracketDepth += 1;
         if (isFileUrlLiteral(chars, index + 1)) {
           postCloseFilePathFileUrlComponentDepth = postCloseFilePathBracketDepth;
+          postCloseFilePathFileUrlComponentHasPublicUrl = false;
+          postCloseFilePathDrivePrefixRefused = false;
         }
       } else if (char === "]" && postCloseFilePathBracketDepth > 0) {
         postCloseFilePathBracketDepth -= 1;
         if (postCloseFilePathFileUrlComponentDepth > postCloseFilePathBracketDepth) {
           postCloseFilePathFileUrlComponentDepth = 0;
+          postCloseFilePathFileUrlComponentHasPublicUrl = false;
         }
         if (postCloseFilePathBracketDepth === 0) {
           const next = chars[index + 1];
@@ -716,6 +764,8 @@ function findUrlPathStarts(chars: readonly string[]): UrlPathStarts {
               postCloseFilePathOwnsBackslashQuery = true;
               postCloseFilePathDrivePrefix = "none";
               postCloseFilePathFileUrlComponentDepth = 0;
+              postCloseFilePathFileUrlComponentHasPublicUrl = false;
+              postCloseFilePathDrivePrefixRefused = false;
             }
           }
         }
@@ -755,6 +805,8 @@ function findUrlPathStarts(chars: readonly string[]): UrlPathStarts {
         postCloseFilePathOwnsBackslashQuery = true;
         postCloseFilePathDrivePrefix = "none";
         postCloseFilePathFileUrlComponentDepth = 0;
+        postCloseFilePathFileUrlComponentHasPublicUrl = false;
+        postCloseFilePathDrivePrefixRefused = false;
       }
     }
     if (

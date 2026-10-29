@@ -6333,6 +6333,205 @@ describe("sanitizeError", () => {
     ] as const)("preserves the control: %s", (_name, input, expected) => {
       assertStable(input, expected);
     });
+
+    it.each([
+      [
+        "mixed ampersand bare drive",
+        "file://h?x=[file:///Users/CHILD/x&later\\/home/alice/s" +
+          "([https://other&C:/]",
+        "file://h?x=[file://<path>&later\\<path>&<path>]",
+      ],
+      [
+        "mixed ampersand query-delimited bare drive",
+        "file://h?x=[file:///Users/CHILD/x&later\\/home/alice/s" +
+          "([https://other&C:/?q]",
+        "file://h?x=[file://<path>&later\\<path>&<path>?q]",
+      ],
+      [
+        "mixed ampersand space-delimited bare drive",
+        "file://h?x=[file:///Users/CHILD/x&later\\/home/alice/s" +
+          "([https://other&C:/ x]",
+        "file://h?x=[file://<path>&later\\<path>&<path> x]",
+      ],
+      [
+        "mixed query authority-like drive",
+        mixedPrefix + "key=C://srv/x]",
+        mixedExpected + "key=<path>]",
+      ],
+      [
+        "rooted nested-file bare drive",
+        "file://h?x=[file:///Users/CHILD/x&/Users/alice/s[file:///b&C:/]]",
+        "file://h?x=[file://<path>&<path>&<path>]]",
+      ],
+      [
+        "rooted nested-file query-delimited bare drive",
+        "file://h?x=[file:///Users/CHILD/x&/Users/alice/s[file:///b&C:/?q]]",
+        "file://h?x=[file://<path>&<path>&<path>?q]]",
+      ],
+      [
+        "rooted nested-file space-delimited bare drive",
+        "file://h?x=[file:///Users/CHILD/x&/Users/alice/s[file:///b&C:/ x]]",
+        "file://h?x=[file://<path>&<path>&<path> x]]",
+      ],
+      [
+        "rooted nested-file authority-like drive",
+        "file://h?x=[file:///Users/CHILD/x&/Users/alice/s[file:///b&C://srv/x]]",
+        "file://h?x=[file://<path>&<path>&<path>]]",
+      ],
+      [
+        "genuine #1785 nested-file bare drive",
+        "file://h?x=[file:///Users/CHILD/x&later/home/alice/s([file:///b&C:/]]",
+        "file://h?x=[file://<path>&later<path>&<path>]]",
+      ],
+      [
+        "later inherited nested-file bare drive",
+        "file://h?x=['https://outer.test/x?next=file:///Users/a/private.db'|" +
+          "\\Users\\CANARY\\x&second/Users/B/x[file:///b&C:/]]",
+        "file://h?x=['https://outer.test/x?next=file://<path>'|" +
+          "<path>&second<path>&<path>]]",
+      ],
+      [
+        "restarted nested-file bare drive",
+        "file://h?x=[a]\\b[file:///b&C:/]",
+        "file://h?x=[a]<path>&<path>]",
+      ],
+      [
+        "soft-owner nested-file bare drive",
+        "file://h?x=[file://host?key=/public]\\Users\\FIRST\\x\u00a0" +
+          "[file:///b&C:/]",
+        "file://h?x=[file://host?key=<path>]<path>&<path>]",
+      ],
+      [
+        "drive after a public URL in one file component",
+        "file://h?x=[file:///Users/CHILD/x&later\\/home/alice/s" +
+          "[file:///b&https://pub.test/x&D:/Users/d]",
+        "file://h?x=[file://<path>&later\\<path>file://<path>" +
+          "&https://pub.test/x&<path>]",
+      ],
+    ] as const)("keeps the complete frozen-base sequence for %s", (_name, input, expected) => {
+      assertStable(input, expected);
+    });
+
+    it.each([
+      [
+        "named compound drive",
+        mixedPrefix + "key=C:/C:/Users/K]",
+        mixedExpected + "key=C:<path>]",
+      ],
+      [
+        "ampersand compound drive",
+        "file://h?x=[file:///Users/CHILD/x&later\\/home/alice/s" +
+          "([https://other&C:/C:/Users/K]",
+        "file://h?x=[file://<path>&later\\<path>&<path>:<path>]",
+      ],
+      [
+        "nested-file compound drive",
+        "file://h?x=[file:///Users/CHILD/x&/Users/alice/s" +
+          "[file:///b&C:/C:/Users/K]]",
+        "file://h?x=[file://<path>&<path>&<path>:<path>]]",
+      ],
+      [
+        "named drive before a file literal",
+        mixedPrefix + "key=C:/file:///Users/K]",
+        mixedExpected + "key=<path>file://<path>]",
+      ],
+      [
+        "ampersand drive before a file literal",
+        "file://h?x=[file:///Users/CHILD/x&later\\/home/alice/s" +
+          "([https://other&C:/file:///Users/K]",
+        "file://h?x=[file://<path>&later\\<path>&<path>file://<path>]",
+      ],
+      [
+        "nested-file drive before a file literal",
+        "file://h?x=[file:///Users/CHILD/x&/Users/alice/s" +
+          "[file:///b&C:/file:///Users/K]]",
+        "file://h?x=[file://<path>&<path>&<path>]]",
+      ],
+    ] as const)("uses a complete historical spelling for %s", (_name, input, expected) => {
+      assertStable(input, expected);
+    });
+
+    it.each([
+      ["vertical tab", "\u000b"],
+      ["form feed", "\u000c"],
+      ["no-break space", "\u00a0"],
+      ["Ogham space mark", "\u1680"],
+      ["en quad", "\u2000"],
+      ["em quad", "\u2001"],
+      ["en space", "\u2002"],
+      ["em space", "\u2003"],
+      ["three-per-em space", "\u2004"],
+      ["four-per-em space", "\u2005"],
+      ["six-per-em space", "\u2006"],
+      ["figure space", "\u2007"],
+      ["punctuation space", "\u2008"],
+      ["thin space", "\u2009"],
+      ["hair space", "\u200a"],
+      ["line separator", "\u2028"],
+      ["paragraph separator", "\u2029"],
+      ["narrow no-break space", "\u202f"],
+      ["medium mathematical space", "\u205f"],
+      ["ideographic space", "\u3000"],
+      ["byte order mark", "\ufeff"],
+    ] as const)("keeps all selected drive values through %s", (_name, whitespace) => {
+      assertStable(
+        mixedPrefix +
+          "key=C:/Users/S1/x" +
+          whitespace +
+          "&k2=D:/Users/S2/y]",
+        mixedExpected + "key=C:<path>&k2=D:<path>]",
+      );
+    });
+
+    it.each([
+      ["later var", "later\\/var/alice/s"],
+      ["later homes", "later\\/homes/alice/s"],
+      ["later nested home", "later\\/a/home/alice/s"],
+      ["later x", "later\\/x/s"],
+      ["later opt", "later\\/opt/app/s"],
+    ] as const)("pins the narrow mixed residual: %s", (_name, successor) => {
+      assertStable(
+        "file://h?x=[file:///Users/CHILD/x&" +
+          successor +
+          "([https://other?key=C:/Users/K/x]",
+        "file://h?x=[file://<path>&later\\<path>?key=<path>]",
+      );
+    });
+
+    it.each([
+      [
+        "file sibling then plain bracket",
+        "file://h?x=[file:///Users/CHILD/x&/Users/alice/s" +
+          "[file:///b][y&C:/Users/K/x]",
+        "file://h?x=[file://<path>&<path>&<path>]",
+      ],
+      [
+        "single-slash file text",
+        "file://h?x=[file:///Users/CHILD/x&/Users/alice/s" +
+          "[file:/b&C:/Users/K/x]",
+        "file://h?x=[file://<path>&<path>&<path>]",
+      ],
+      [
+        "deeper plain bracket in file child",
+        "file://h?x=[file:///Users/CHILD/x&/Users/alice/s" +
+          "[file:///b[x&C:/Users/K/x]]",
+        "file://h?x=[file://<path>&<path>&<path>]]",
+      ],
+      [
+        "plain component",
+        "file://h?x=[file:///Users/CHILD/x&/Users/alice/s[x&C:/Users/K/x]",
+        "file://h?x=[file://<path>&<path>&<path>]",
+      ],
+    ] as const)("pins the narrow nested-file residual: %s", (_name, input, expected) => {
+      assertStable(input, expected);
+    });
+
+    it("keeps the adopted bare-drive target in an independent mixed copy", () => {
+      assertStable(
+        mixedPrefix + "key=C:/]&later\\/home/alice/s([https://other?key=C:/]",
+        mixedExpected + "key=C:<path>]&later<path>?key=C:<path>]",
+      );
+    });
   });
 
 

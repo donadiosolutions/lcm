@@ -734,12 +734,18 @@ bundle and keep provider, credential, quarantine, and recovery sessions private.
   `\\Users\x`, and mixed runs are covered, and when it is a drive path such as
   `C:/Users/x` or `c:/home/x`. A slash-only run with no path word after it is
   unchanged; a backslash-only run is redacted by the existing Windows-root rule.
-  A forward-slash drive value keeps its letter and colon when this bracket was
-  already reached through a mixed-separator private-root successor. The same
-  spelling is retained for a drive successor of an exact `file://` child that
-  begins a component inside a later rooted, restarted, or soft-whitespace tail;
-  for example, `&C:/Users/x` becomes `&C:<path>`. A drive value in an ordinary
-  newly owned bracket still becomes `<path>` in full.
+  A selected forward-slash drive value keeps its letter and colon when a named
+  query or fragment belongs to a bracket reached through a mixed-separator
+  private-root successor, including an independent later mixed successor. The
+  same spelling is retained for an eligible drive in an exact `file://` child
+  reached through a later rooted, private-relative, inherited later-successor,
+  restarted, or soft-whitespace tail; for example, `&C:/Users/x` becomes
+  `&C:<path>`. A bare ampersand drive, a `C://` value, and a drive after a public
+  URL in the same file component remain wholly redacted. Soft JavaScript
+  whitespace inside an already selected component keeps that selection, while
+  space, tab, line feed, and carriage return remain hard boundaries. Other
+  bracket shapes keep their established whole-drive behavior rather than
+  inheriting this drive-prefix rule.
   An unmatched `]`, text outside a component after the span stopped, whitespace,
   and newlines end the composition; whitespace-separated prose, public URLs,
   and ordinary unspaced relative tails remain unchanged.
