@@ -1,0 +1,56 @@
+{
+  "schema": "sec-daemon-peer-native-preparation-gaps-v1",
+  "status": "static-gaps-only",
+  "closureComplete": false,
+  "selectedCandidates": {
+    "files": 2570,
+    "bytes": 218990663,
+    "sha256": "bbd9a25454d249457cef348387b759072d237f027cf1d9885c975babcdae72e3",
+    "libraries": 9,
+    "sdkFiles": 2561,
+    "notAtomicSameHostSnapshot": true
+  },
+  "historicalGroups": {
+    "files": 437,
+    "binFiles": 84,
+    "binBytes": 126253854,
+    "binGroupSha256": "debd5efeb58f5875274fb393ff90bc86aa24aab224f8ac17cfec18b7554bdae1",
+    "includeFiles": 353,
+    "includeBytes": 15466836,
+    "includeGroupSha256": "4787700d7bb4d9b7be2fca1483d94f40d11f758b5a1c50f5a47f8c46816fa9fc",
+    "actualPerFileRows": "missing",
+    "partialLibraryPrefix": "not-reusable"
+  },
+  "candidateArithmeticOnly": {
+    "filesBeforeNodeRuntimeOs": 3007,
+    "bytesBeforeNodeRuntimeOs": 360711353,
+    "copyPlusIndependentReadBytesBeforeNodeRuntimeOs": 721422706,
+    "filesWithFourHeadersOneImportLibrary": 3012
+  },
+  "F1": {
+    "status": "OPEN",
+    "concreteFinalObserver": "unidentified-unpinned-unadopted",
+    "coordinatorSelfExitCertification": false,
+    "killOnCloseMustRemain": true,
+    "coordinatorMustStayAccounted": true,
+    "persistentWatcherAllowed": false,
+    "rootCensusImplemented": false
+  },
+  "openGates": [
+    "explicit OS/loader/runtime TCB scope choice",
+    "provided-runtime identity/closure and bootstrap boundary",
+    "F1 concrete finite final owner before executable capsule source",
+    "native limits/nested-job/readback/cumulative-spawn/terminal proof",
+    "authenticated Node artifact acquisition and actual extracted per-file hashes",
+    "Node consumer executable pin",
+    "full compiler/default-library/header/DLL/dynamic-input closure",
+    "sealed exact bytes/ancestry and effective rights for both actual actors",
+    "preledgered scratch slot and exact handle-relative cleanup before mutating fixtures",
+    "separate compile, PE, seal, consumer, positive/security/fault/timing admissions"
+  ],
+  "campaign": {
+    "metadataJobsSpent": 9,
+    "productionRounds": 0,
+    "openCloudClaims": 7
+  }
+}

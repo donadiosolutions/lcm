@@ -1,30 +1,18 @@
-name: SEC-DAEMON-PEER fixed-selector metadata
+name: SEC-DAEMON-PEER runtime metadata only
 
-# Replace only this registered carrier on the isolated ref; never merge it.
+# Replacement for registration 397854550 on the isolated ref only; never merge.
+# No selector or future capsule/native/acquisition mode is reachable.
 on:
   workflow_dispatch:
     inputs:
       expected_sha:
-        description: Exact reviewed isolated-ref commit SHA
+        description: Exact NEW reviewed isolated-ref commit SHA
         required: true
         type: string
       confirmation:
-        description: Enter METADATA_FIXED_SELECTOR_20261029
+        description: Enter METADATA_RUNTIME_PIN_20261029
         required: true
         type: string
-      selector:
-        description: One separately admitted finite metadata allocation
-        required: true
-        type: choice
-        options:
-          - M4
-          - L5
-          - H-UCRT
-          - H-SHARED
-          - H-UM-0
-          - H-UM-1
-          - H-UM-2
-          - H-UM-3
 
 permissions: {}
 concurrency:
@@ -33,365 +21,269 @@ concurrency:
 
 jobs:
   metadata:
+    if: github.event_name == 'workflow_dispatch' && github.repository == 'donadiosolutions/lcm' && github.ref == 'refs/heads/security/daemon-peer-metadata-preflight-20261029' && github.sha == inputs.expected_sha && github.workflow_sha == inputs.expected_sha && inputs.confirmation == 'METADATA_RUNTIME_PIN_20261029'
     runs-on: windows-2025
     timeout-minutes: 3
     steps:
-      - name: Read one bounded fixed selector
+      - name: Observe bounded provided runtime metadata
         shell: pwsh
         timeout-minutes: 1
         env:
           PREFLIGHT_EXPECTED_SHA: ${{ inputs.expected_sha }}
           PREFLIGHT_CONFIRMATION: ${{ inputs.confirmation }}
-          PREFLIGHT_SELECTOR: ${{ inputs.selector }}
           PREFLIGHT_WORKFLOW_SHA: ${{ github.workflow_sha }}
           PREFLIGHT_WORKFLOW_REF: ${{ github.workflow_ref }}
         run: |
-          $ErrorActionPreference = 'Stop'
-          $ProgressPreference = 'SilentlyContinue'
-          $timer = [Diagnostics.Stopwatch]::StartNew()
-          $utf8 = [Text.UTF8Encoding]::new($false)
-          $vs = 'C:\Program Files\Microsoft Visual Studio\18\Enterprise'
-          $msvc = $vs + '\VC\Tools\MSVC\14.51.36231'
-          $sdk = 'C:\Program Files (x86)\Windows Kits\10'
-          $sdkInclude = $sdk + '\Include\10.0.26100.0'
-          $sdkLib = $sdk + '\Lib\10.0.26100.0'
-          $trusted = @('S-1-5-18', 'S-1-5-32-544', 'S-1-5-80-956008885-3418522649-1831038044-1853292631-2271478464')
-          $selectors = @('M4', 'L5', 'H-UCRT', 'H-SHARED', 'H-UM-0', 'H-UM-1', 'H-UM-2', 'H-UM-3')
-          $counts = [ordered]@{ entryEnumerationCalls = 0; returnedEntries = 0; directoryEnumerators = 0; getEnumeratorCalls = 0; enumeratorDisposeAllowances = 0; enumeratorDisposals = 0; directoriesQueued = 0; directoriesVisited = 0; itemMetadataCalls = 0; aclCalls = 0; aclRuleInspections = 0; hashFiles = 0; streamLengthCalls = 0; readCalls = 0; readBytes = [long]0; metadataBytes = [long]0; accountedBytes = [long]0; versionReads = 0; identityChecks = 0; selectedFiles = 0 }
-          $caps = [ordered]@{ selectedFiles = 0; entries = 0; bytes = [long]0; itemMetadataCalls = 0; aclCalls = 0; aclRuleInspections = 0; hashFiles = 0; streamLengthCalls = 0; readCalls = 0; entryEnumerationCalls = 0; directories = 1024; depth = 12; identityChecks = 2; versionReads = 2; fileBytes = 67108864; milliseconds = 20000; jsonBytes = 1048576 }
-          $report = [ordered]@{
-            schema = 'sec-daemon-peer-fixed-selector-v1'
-            status = 'refused'; reason = 'gate'; selector = 'unadmitted'; selectorComplete = $false
-            closureComplete = $false; pin = 'unproved'; toolchainClosure = 'unproved'
-            jobCapsuleImplemented = 'unproved'; jobCapsuleEnforced = 'unproved'
-            sealedArtifactAncestry = 'unproved'; nativeIdentity = 'unproved'; nodeInputs = 'unacquired'
-            cleanup = 'unproved'; osIoDeadline = 'cooperative-only-stalled-os-io-not-bounded'
-            producerSha = 'unproved'; workflowSha = 'unproved'
-            imageOS = 'unproved'; imageVersion = 'unproved'; osVersion = 'unproved'
-            msvcDirectoryVersion = 'unproved'; sdkDirectoryVersion = 'unproved'
-            currentFullBinRevalidated = $false; currentMSVCIncludeRevalidated = $false
-            historical = [ordered]@{
-              status = 'historical-unrevalidated-not-live-pins'; runId = '40861445516'
-              producerSha = '939c5f31cced928b912c5dd82eed040ec1493330'
-              binFiles = 84; binBytes = 126253854; binSha256 = 'debd5efeb58f5875274fb393ff90bc86aa24aab224f8ac17cfec18b7554bdae1'
-              includeFiles = 353; includeBytes = 15466836; includeSha256 = '4787700d7bb4d9b7be2fca1483d94f40d11f758b5a1c50f5a47f8c46816fa9fc'
-              partialLibrary = 'not-reused-not-a-cursor'
-            }
-            caps = $caps; counts = $counts
-            identities = [Collections.Generic.List[object]]::new()
-            acl = [Collections.Generic.List[object]]::new()
-            files = [Collections.Generic.List[object]]::new()
-            selectorSha256 = 'unproved'; digestOrder = 'ordinal-public-relative-path-sha256-bytes-lf-v1'
-            elapsedMilliseconds = 0
+          # Review-only metadata reader; dispatch requires separate Root admission.
+          # No child, native calls, dynamic types, import, acquisition or closure claim.
+          # Earliest ConstrainedLanguage-safe comparison: no method, constructor or
+          # serializer precedes it. Do not alter the session's language policy.
+          # RestrictedLanguage/NoLanguage may reject scripts or member access before
+          # either branch; executable script start is a precondition, not catchable here.
+          if ($ExecutionContext.SessionState.LanguageMode -eq 'ConstrainedLanguage') {
+            '{"schema":"sec-daemon-peer-runtime-pin-v1","status":"refused","reason":"language-mode","observationComplete":false,"closureComplete":false,"pin":"unproved","languageMode":"ConstrainedLanguage","ffiProbed":false,"nativeProbed":false,"jobCapsuleImplemented":"unproved","jobCapsuleEnforced":"unproved","sealedArtifactAncestry":"unproved","nodeAcquisition":"unproved","nodeRuntimePin":"unproved","nativeIdentity":"unproved","physicalAllocationBound":"unproved","counterSemantics":"logical-counters-refusal-may-retain-reservations-not-physical-io","cleanup":"unproved"}'
+            exit 1
           }
-          $manifest = [Collections.Generic.SortedDictionary[string,object]]::new([StringComparer]::Ordinal)
-          $normalized = [Collections.Generic.HashSet[string]]::new([StringComparer]::OrdinalIgnoreCase)
+          if ($ExecutionContext.SessionState.LanguageMode -ne 'FullLanguage') {
+            '{"schema":"sec-daemon-peer-runtime-pin-v1","status":"refused","reason":"language-mode","observationComplete":false,"closureComplete":false,"pin":"unproved","languageMode":"unsupported","ffiProbed":false,"nativeProbed":false,"jobCapsuleImplemented":"unproved","jobCapsuleEnforced":"unproved","sealedArtifactAncestry":"unproved","nodeAcquisition":"unproved","nodeRuntimePin":"unproved","nativeIdentity":"unproved","physicalAllocationBound":"unproved","counterSemantics":"logical-counters-refusal-may-retain-reservations-not-physical-io","cleanup":"unproved"}'
+            exit 1
+          }
+          # FullLanguage bootstrap failures cannot depend on report/timer/UTF8 existence.
+          try {
+            $ErrorActionPreference = 'Stop'
+            $ProgressPreference = 'SilentlyContinue'
+            $timer = [Diagnostics.Stopwatch]::StartNew()
+            $utf8 = [Text.UTF8Encoding]::new($false)
+            $root = 'C:\Program Files\PowerShell\7'
+            $caps = [ordered]@{ files = 128; loadedAssemblies = 128; unionRows = 128; fileBytes = 67108864; accountedBytes = 268435456; readCalls = 32768; readSize = 65536; fileMetadataCalls = 256; streamLengthCalls = 256; versionReads = 128; openCalls = 128; hashCreations = 128; assemblySnapshots = 1; assemblyRowsInspected = 128; assemblyPropertyReads = 384; milliseconds = 20000; jsonBytes = 1048576 }
+            $counts = [ordered]@{ listedFiles = 0; loadedAssemblies = 0; dynamicAssemblyRows = 0; locationlessAssemblyRows = 0; unionRows = 0; hashedFiles = 0; missingFiles = 0; readCalls = 0; readBytes = [long]0; metadataBytes = [long]0; accountedBytes = [long]0; fileMetadataCalls = 0; streamLengthCalls = 0; versionReads = 0; openCalls = 0; hashCreations = 0; assemblySnapshots = 0; assemblyRowsInspected = 0; assemblyPropertyReads = 0 }
+            $rows = [Collections.Generic.List[object]]::new()
+            $map = [Collections.Generic.Dictionary[string,object]]::new([StringComparer]::OrdinalIgnoreCase)
+            $report = [ordered]@{
+              schema = 'sec-daemon-peer-runtime-pin-v1'; status = 'refused'; reason = 'gate'; observationComplete = $false
+              closureComplete = $false; pin = 'unproved'; ffiProbed = $false; nativeProbed = $false
+              jobCapsuleImplemented = 'unproved'; jobCapsuleEnforced = 'unproved'; sealedArtifactAncestry = 'unproved'
+              nodeAcquisition = 'unproved'; nodeRuntimePin = 'unproved'; nativeIdentity = 'unproved'; cleanup = 'unproved'
+              osIoDeadline = 'cooperative-only-stalled-os-io-not-bounded'; physicalAllocationBound = 'unproved'
+              assemblySnapshotAllocation = 'materialized-before-count-guard'; lazyDependencies = 'unproved'
+              runtimeAncestrySeal = 'unproved'; dependencyManifests = 'hashed-only-not-parsed'; dependencyEntriesParsed = 0
+              producerSha = 'unproved'; workflowSha = 'unproved'; imageOS = 'unproved'; imageVersion = 'unproved'; osVersion = 'unproved'
+              processRole = 'unproved'; psVersion = 'unproved'; clrVersion = 'unproved'; frameworkVersion = 'unproved'
+              languageMode = 'unproved'; dynamicCodeSupported = 'unproved'; dynamicCodeEmissionWorks = 'unproved'; pointerBytes = 0; architecture = 'unproved'
+              counterSemantics = 'logical-counters-refusal-may-retain-reservations-not-physical-io'
+              caps = $caps; counts = $counts; files = $rows; elapsedMilliseconds = 0
+            }
+          } catch {
+            '{"schema":"sec-daemon-peer-runtime-pin-v1","status":"refused","reason":"bootstrap","observationComplete":false,"closureComplete":false,"pin":"unproved","languageMode":"FullLanguage","ffiProbed":false,"nativeProbed":false,"jobCapsuleImplemented":"unproved","jobCapsuleEnforced":"unproved","sealedArtifactAncestry":"unproved","nodeAcquisition":"unproved","nodeRuntimePin":"unproved","nativeIdentity":"unproved","physicalAllocationBound":"unproved","counterSemantics":"logical-counters-refusal-may-retain-reservations-not-physical-io","cleanup":"unproved"}'
+            exit 1
+          }
           function Budget {
             if ($timer.ElapsedMilliseconds -ge 20000) { throw 'elapsed' }
           }
-          function Count([string]$Name, [int]$Limit) {
+          # Operation counters are logical pre-call reservations/attempts, not a count
+          # of transitive getter calls, internal operations, CPU time or physical I/O.
+          function Count([string]$Name) {
             Budget
-            if ($counts[$Name] -ge $Limit) { throw 'operations' }
+            if ($counts[$Name] -ge $caps[$Name]) { throw 'operations' }
             $counts[$Name]++
           }
+          # REFUSED byte counters may retain unused reservation slack if a read throws
+          # or an elapsed check preempts its refund. Never interpret them as actual I/O.
           function Charge([long]$Amount, [string]$Kind) {
             Budget
-            if ($Amount -lt 0 -or $Amount -gt ($caps.bytes - $counts.accountedBytes)) { throw 'bytes' }
+            if ($Amount -lt 0 -or $Amount -gt (268435456 - $counts.accountedBytes)) { throw 'bytes' }
             $counts.accountedBytes += $Amount
             $counts[$Kind] += $Amount
           }
-          function Public([string]$Path) {
-            $full = [IO.Path]::GetFullPath($Path)
-            if ($full.Length -gt 512) { throw 'path' }
-            foreach ($root in @($msvc, $sdk)) {
-              if ($full.Equals($root, [StringComparison]::OrdinalIgnoreCase) -or $full.StartsWith($root + '\', [StringComparison]::OrdinalIgnoreCase)) { return $full }
-            }
-            throw 'path'
-          }
-          function Item([string]$Path) {
-            Count 'itemMetadataCalls' $caps.itemMetadataCalls
-            $item = Get-Item -LiteralPath $Path -Force -ErrorAction Stop
+          function PublicLeaf([string]$Path) {
             Budget
-            if (($item.Attributes -band [IO.FileAttributes]::ReparsePoint) -ne 0) { throw 'reparse' }
+            if ([string]::IsNullOrEmpty($Path) -or $Path.Length -gt 512) { throw 'path' }
+            $full = [IO.Path]::GetFullPath($Path)
+            if (-not $full.StartsWith($root + '\', [StringComparison]::OrdinalIgnoreCase)) { throw 'unexpected-location' }
+            $leaf = $full.Substring($root.Length + 1)
+            if ($leaf.Length -gt 128 -or $leaf -cnotmatch '^[A-Za-z0-9_.-]+$' -or $leaf -cin @('.', '..')) { throw 'unexpected-location' }
+            return $leaf
+          }
+          function NewRow([string]$Leaf, [string]$Role, [bool]$Listed, [bool]$Required) {
+            Budget
+            if ($rows.Count -ge 128) { throw 'union-limit' }
+            $row = [ordered]@{ publicRelativePath = 'pshome/' + $Leaf; role = $Role; listed = $Listed; loaded = $false; required = $Required; status = 'unobserved'; hashed = $false; bytes = $null; sha256 = $null; fileVersion = $null; assemblyVersion = $null }
+            [void]$rows.Add($row)
+            $map.Add($Leaf, $row)
+            $counts.unionRows++
+            return $row
+          }
+          function UnboundAssembly([string]$Role) {
+            Budget
+            if ($rows.Count -ge 128) { throw 'union-limit' }
+            # Runtime-created/locationless metadata is not a filesystem member or proof
+            # that emission works. No assembly name/private location is output or loaded.
+            [void]$rows.Add([ordered]@{ publicRelativePath = $null; role = $Role; listed = $false; loaded = $true; required = $false; status = 'unbound-location'; hashed = $false; bytes = $null; sha256 = $null; fileVersion = $null; assemblyVersion = $null })
+            $counts.unionRows++
+          }
+          function Metadata([string]$Path) {
+            Count 'fileMetadataCalls'
+            # A conservative logical metadata allowance, not physical I/O/allocation proof.
+            Charge 4096 'metadataBytes'
+            $item = [IO.FileInfo]::new($Path)
+            $item.Refresh()
+            Budget
             return $item
           }
-          function ValidName([string]$Name) {
-            if ($Name.Length -eq 0 -or $Name.Length -gt 160 -or $Name -cnotmatch '^[A-Za-z0-9_.()+ -]+$' -or $Name -cin @('.', '..') -or $Name -match '[. ]$' -or $Name -match '^(CON|PRN|AUX|NUL|COM[1-9]|LPT[1-9])(\.|$)') { throw 'path' }
-          }
-          function Acl([string]$Path, [string]$Label, [string]$Role) {
-            if ($Role -cnotin @('selected', 'ancestor')) { throw 'acl' }
-            Count 'aclCalls' $caps.aclCalls
-            # Reserve before Get-Acl; retain the reservation if the read refuses.
-            Charge 65536 'metadataBytes'
-            $acl = Get-Acl -LiteralPath $Path -ErrorAction Stop
-            Budget
-            $owner = $acl.GetOwner([Security.Principal.SecurityIdentifier]).Value
-            $ownerClass = switch ($owner) {
-              'S-1-5-18' { 'system' }
-              'S-1-5-32-544' { 'administrators' }
-              'S-1-5-80-956008885-3418522649-1831038044-1853292631-2271478464' { 'trusted-installer' }
-              default { 'other' }
+          function HashCandidate([string]$Leaf, $Row) {
+            $path = $root + '\' + $Leaf
+            $before = Metadata $path
+            if (-not $before.Exists) {
+              $Row.status = 'missing'; $counts.missingFiles++
+              if ($Row.required -or $Row.loaded) { throw 'required-missing' }
+              return
             }
-            $safe = $trusted -contains $owner
-            $rules = $acl.GetAccessRules($true, $true, [Security.Principal.SecurityIdentifier])
-            if ($rules.Count -eq 0 -or $rules.Count -gt 128) { throw 'acl' }
-            $write = [Security.AccessControl.FileSystemRights]::Write -bor [Security.AccessControl.FileSystemRights]::Delete -bor [Security.AccessControl.FileSystemRights]::DeleteSubdirectoriesAndFiles -bor [Security.AccessControl.FileSystemRights]::ChangePermissions -bor [Security.AccessControl.FileSystemRights]::TakeOwnership
-            if ($Role -ceq 'ancestor') {
-              $create = [Security.AccessControl.FileSystemRights]::CreateFiles -bor [Security.AccessControl.FileSystemRights]::CreateDirectories
-              $write = $write -band (-bnot $create)
-            }
-            foreach ($rule in $rules) {
-              Count 'aclRuleInspections' $caps.aclRuleInspections
-              if (($rule.PropagationFlags -band [Security.AccessControl.PropagationFlags]::InheritOnly) -ne 0) { continue }
-              if ($rule.AccessControlType -eq [Security.AccessControl.AccessControlType]::Allow -and $trusted -notcontains $rule.IdentityReference.Value) {
-                $unknown = ($rule.FileSystemRights -band (-bnot [Security.AccessControl.FileSystemRights]::FullControl)) -ne 0
-                if ($unknown -or ($rule.FileSystemRights -band $write) -ne 0) { $safe = $false }
-              }
-            }
-            $sddl = $acl.GetSecurityDescriptorSddlForm([Security.AccessControl.AccessControlSections]::Access -bor [Security.AccessControl.AccessControlSections]::Owner -bor [Security.AccessControl.AccessControlSections]::Group)
-            if ($sddl.Length -gt 16384) { throw 'acl' }
-            $data = $utf8.GetBytes($sddl)
-            if ($data.Length -gt 16384) { throw 'acl' }
-            $counts.metadataBytes -= 65536 - $data.Length
-            $counts.accountedBytes -= 65536 - $data.Length
-            return [ordered]@{ label = $Label; role = $Role; protected = $acl.AreAccessRulesProtected; trustedAcl = $safe; ownerClass = $ownerClass; sha256 = [Convert]::ToHexString([Security.Cryptography.SHA256]::HashData($data)).ToLowerInvariant() }
-          }
-          function Ancestry([string]$Path, [string]$Label) {
-            $cursor = Public $Path
-            for ($depth = 0; $depth -lt 16; $depth++) {
-              $item = Item $cursor
-              if (-not $item.PSIsContainer) { throw 'path' }
-              $role = if ($depth -eq 0) { 'selected' } else { 'ancestor' }
-              $row = Acl $cursor $Label $role
-              [void]$report.acl.Add($row)
-              if (-not $row.trustedAcl) { throw 'mutable' }
-              $parent = [IO.Directory]::GetParent($cursor)
-              if ($null -eq $parent) { return }
-              $cursor = $parent.FullName
-            }
-            throw 'depth'
-          }
-          function ReadFile([string]$Path, [string]$Relative, [string]$ExpectedHash, [string]$ExpectedVersion, [long]$ExpectedLength) {
-            if ($Relative.Length -gt 240 -or $Relative -cnotmatch '^[A-Za-z0-9_.()+ /-]+$') { throw 'path' }
-            $before = Item (Public $Path)
-            if ($before.PSIsContainer -or $before.Length -gt 67108864) { throw 'file-size' }
-            ValidName $before.Name
-            $identity = $ExpectedHash.Length -ne 0
-            if ($identity) {
-              Count 'identityChecks' 2
-              if ($before.Length -ne $ExpectedLength) { throw 'drift' }
-            }
-            $aclBefore = Acl $Path 'file' 'selected'
-            if (-not $aclBefore.trustedAcl) { throw 'mutable' }
-            if ($before.Length -gt ($caps.bytes - $counts.accountedBytes)) { throw 'bytes' }
-            Count 'hashFiles' $caps.hashFiles
-            $hash = [Security.Cryptography.IncrementalHash]::CreateHash([Security.Cryptography.HashAlgorithmName]::SHA256)
-            $stream = $null
-            $total = [long]0
-            $version = 'not-applicable'
+            if (($before.Attributes -band ([IO.FileAttributes]::Directory -bor [IO.FileAttributes]::ReparsePoint -bor [IO.FileAttributes]::Device)) -ne 0) { throw 'file-kind' }
+            $length = [long]$before.Length
+            $stamp = $before.LastWriteTimeUtc.Ticks
+            $attributes = $before.Attributes
+            if ($length -lt 0 -or $length -gt 67108864) { throw 'file-size' }
+            $stream = $null; $hash = $null; $total = [long]0
             try {
+              Count 'hashCreations'
+              $hash = [Security.Cryptography.IncrementalHash]::CreateHash([Security.Cryptography.HashAlgorithmName]::SHA256)
               Budget
-              $stream = [IO.File]::Open($Path, [IO.FileMode]::Open, [IO.FileAccess]::Read, [IO.FileShare]::Read)
+              Count 'openCalls'
+              # Read sharing only. This is a temporary observation handle, not a seal lease.
+              $stream = [IO.File]::Open($path, [IO.FileMode]::Open, [IO.FileAccess]::Read, [IO.FileShare]::Read)
               Budget
-              Count 'streamLengthCalls' $caps.streamLengthCalls
+              Count 'streamLengthCalls'
               $openedLength = $stream.Length
               Budget
-              if ($openedLength -ne $before.Length) { throw 'changed' }
+              if ($openedLength -ne $length) { throw 'changed' }
               $buffer = [byte[]]::new(65536)
-              while ($total -lt $before.Length) {
-                Count 'readCalls' $caps.readCalls
-                $remaining = $caps.bytes - $counts.accountedBytes
-                if ($remaining -le 0) { throw 'bytes' }
-                $request = [int][Math]::Min([Math]::Min($buffer.Length, $remaining), ($before.Length - $total))
-                # Reserve the entire request before this potentially blocking read.
+              while ($total -lt $length) {
+                Count 'readCalls'
+                $request = [int][Math]::Min(65536, $length - $total)
                 Charge $request 'readBytes'
                 $read = $stream.Read($buffer, 0, $request)
+                Budget
+                if ($read -le 0 -or $read -gt $request) { throw 'short-file' }
+                # A completed read refunds known unused request bytes. A refusal before
+                # these lines conservatively retains the reservation; each attempt counts.
                 $counts.readBytes -= $request - $read
                 $counts.accountedBytes -= $request - $read
-                Budget
-                if ($read -eq 0) { break }
                 $total += $read
-                if ($total -gt 67108864 -or $total -gt $before.Length) { throw 'file-size' }
-                Budget
                 $hash.AppendData($buffer, 0, $read)
+                Budget
               }
-              Count 'streamLengthCalls' $caps.streamLengthCalls
+              Count 'streamLengthCalls'
               $openedLength = $stream.Length
               Budget
-              if ($openedLength -ne $before.Length -or $total -ne $before.Length) { throw 'changed' }
-              if ($identity) {
-                Count 'versionReads' 2
-                Charge $before.Length 'metadataBytes'
-                $version = [Diagnostics.FileVersionInfo]::GetVersionInfo($Path).FileVersion
-                Budget
-                if ($version -cne $ExpectedVersion) { throw 'drift' }
-              }
-              $after = Item $Path
-              $aclAfter = Acl $Path 'file' 'selected'
-              if ($total -ne $before.Length -or $before.Length -ne $after.Length -or $before.LastWriteTimeUtc -ne $after.LastWriteTimeUtc -or $before.Attributes -ne $after.Attributes -or $aclBefore.sha256 -cne $aclAfter.sha256 -or -not $aclAfter.trustedAcl) { throw 'changed' }
-              $digest = [Convert]::ToHexString($hash.GetHashAndReset()).ToLowerInvariant()
-              if ($identity -and $digest -cne $ExpectedHash) { throw 'drift' }
-              $actual = $Relative.Substring(0, $Relative.LastIndexOf('/') + 1) + $before.Name
-              return [ordered]@{ publicRelativePath = $actual; sha256 = $digest; bytes = $total; version = $version }
+              if ($openedLength -ne $length -or $total -ne $length) { throw 'changed' }
+              Count 'versionReads'
+              # Charge the whole known file conservatively for the version-resource API.
+              Charge $length 'metadataBytes'
+              $version = [Diagnostics.FileVersionInfo]::GetVersionInfo($path)
+              Budget
+              $numericVersion = '{0}.{1}.{2}.{3}' -f $version.FileMajorPart, $version.FileMinorPart, $version.FileBuildPart, $version.FilePrivatePart
+              if ($numericVersion.Length -gt 64 -or $numericVersion -cnotmatch '^[0-9.]+$') { throw 'version' }
+              $after = Metadata $path
+              if (-not $after.Exists -or $after.Length -ne $length -or $after.LastWriteTimeUtc.Ticks -ne $stamp -or $after.Attributes -ne $attributes) { throw 'changed' }
+              $Row.sha256 = [Convert]::ToHexString($hash.GetHashAndReset()).ToLowerInvariant()
+              $Row.bytes = $length; $Row.fileVersion = $numericVersion; $Row.hashed = $true; $Row.status = 'hashed-observation'
+              $counts.hashedFiles++
+              Budget
             } finally {
+              # Disposal may itself stall. No hard cleanup deadline or seal is claimed.
               if ($null -ne $stream) { $stream.Dispose() }
-              $hash.Dispose()
-            }
-          }
-          function Record([string]$Path, [string]$Relative) {
-            Count 'selectedFiles' $caps.selectedFiles
-            $row = ReadFile $Path $Relative '' '' -1
-            if (-not $normalized.Add($row.publicRelativePath)) { throw 'duplicate' }
-            $manifest.Add($row.publicRelativePath, $row)
-          }
-          function Bucket([string]$Relative) {
-            if ($report.selector -cnotmatch '^H-UM-[0-3]$') { return $true }
-            $first = $Relative.Substring(0, 1).ToLowerInvariant()
-            $bucket = if ($first -cmatch '^[0-9a-f_.]$') { 0 } elseif ($first -cmatch '^[g-l]$') { 1 } elseif ($first -cmatch '^[m-r]$') { 2 } elseif ($first -cmatch '^[s-z]$') { 3 } else { throw 'unknown' }
-            return $report.selector -ceq ('H-UM-' + $bucket)
-          }
-          function Headers([string]$Path, [string]$Label) {
-            $base = Public $Path
-            Ancestry $base $Label
-            $queue = [Collections.Generic.Queue[object]]::new()
-            $seen = [Collections.Generic.HashSet[string]]::new([StringComparer]::OrdinalIgnoreCase)
-            Count 'directoriesQueued' 1024
-            $queue.Enqueue(@($base, 0, ''))
-            $options = [IO.EnumerationOptions]::new()
-            $options.AttributesToSkip = [IO.FileAttributes]0
-            $options.IgnoreInaccessible = $false
-            $options.RecurseSubdirectories = $false
-            $options.ReturnSpecialDirectories = $false
-            $options.MatchType = [IO.MatchType]::Simple
-            while ($queue.Count -gt 0) {
-              Count 'directoriesVisited' 1024
-              $directory = $queue.Dequeue()
-              if ($directory[1] -gt 12) { throw 'depth' }
-              # Root was checked by Ancestry; each selected descendant is checked once.
-              if ($directory[1] -gt 0) {
-                $dirItem = Item (Public $directory[0])
-                if (-not $dirItem.PSIsContainer) { throw 'path' }
-                $dirAcl = Acl $directory[0] 'header-directory' 'selected'
-                if (-not $dirAcl.trustedAcl) { throw 'mutable' }
-              }
-              Count 'directoryEnumerators' 1024
-              Count 'getEnumeratorCalls' 1024
-              Count 'enumeratorDisposeAllowances' 1024
-              $enumerator = $null
-              try {
-                # Pre-reserved ownership pair: no throwing time check between them.
-                $enumerator = ([IO.DirectoryInfo]::new($directory[0])).EnumerateFileSystemInfos('*', $options).GetEnumerator()
-                Budget
-                while ($true) {
-                  # Refuse at the entry ceiling before attempting another MoveNext.
-                  if ($counts.returnedEntries -ge $caps.entries) { throw 'entries' }
-                  Count 'entryEnumerationCalls' $caps.entryEnumerationCalls
-                  if (-not $enumerator.MoveNext()) { Budget; break }
-                  $counts.returnedEntries++
-                  Budget
-                  if ($counts.returnedEntries -ge $caps.entries) { throw 'entries' }
-                  $entry = $enumerator.Current
-                  $name = $entry.Name
-                  ValidName $name
-                  $relative = if ($directory[2].Length -eq 0) { $name } else { $directory[2] + '/' + $name }
-                  if ($relative.Length -gt 200 -or -not $seen.Add($relative)) { throw 'path' }
-                  # Attributes supplied by the enumerator are cached metadata only.
-                  $attributes = $entry.Attributes
-                  if (($attributes -band [IO.FileAttributes]::ReparsePoint) -ne 0) { throw 'reparse' }
-                  if ([int]$attributes -eq -1 -or ($attributes -band [IO.FileAttributes]::Device) -ne 0) { throw 'unknown' }
-                  if (-not (Bucket $relative)) { continue }
-                  $selected = Public ($directory[0] + '\' + $name)
-                  if (-not $selected.StartsWith($base + '\', [StringComparison]::OrdinalIgnoreCase)) { throw 'path' }
-                  if (($attributes -band [IO.FileAttributes]::Directory) -ne 0) {
-                    if ($directory[1] -ge 12) { throw 'depth' }
-                    Count 'directoriesQueued' 1024
-                    $queue.Enqueue(@($selected, ($directory[1] + 1), $relative))
-                  } else {
-                    # No file ACL/size/Get-Item/version/hash work occurs off-bucket.
-                    Record $selected ($Label + '/' + $relative)
-                  }
-                }
-              } finally {
-                if ($null -ne $enumerator) {
-                  $counts.enumeratorDisposals++
-                  $enumerator.Dispose()
-                }
-              }
+              if ($null -ne $hash) { $hash.Dispose() }
             }
           }
           try {
-            if ($env:GITHUB_EVENT_NAME -cne 'workflow_dispatch' -or $env:GITHUB_REPOSITORY -cne 'donadiosolutions/lcm' -or $env:GITHUB_REF -cne 'refs/heads/security/daemon-peer-metadata-preflight-20261029' -or $env:GITHUB_SHA -cnotmatch '^[0-9a-f]{40}$' -or $env:PREFLIGHT_EXPECTED_SHA -cne $env:GITHUB_SHA -or $env:PREFLIGHT_WORKFLOW_SHA -cne $env:GITHUB_SHA -or $env:PREFLIGHT_WORKFLOW_REF -cne 'donadiosolutions/lcm/.github/workflows/testbox-node.yml@refs/heads/security/daemon-peer-metadata-preflight-20261029' -or $env:PREFLIGHT_CONFIRMATION -cne 'METADATA_FIXED_SELECTOR_20261029' -or $env:PREFLIGHT_SELECTOR -cnotin $selectors) { throw 'gate' }
-            $report.selector = $env:PREFLIGHT_SELECTOR
-            $report.producerSha = $env:GITHUB_SHA
-            $report.workflowSha = $env:PREFLIGHT_WORKFLOW_SHA
-            switch -CaseSensitive ($report.selector) {
-              'M4' { $caps.selectedFiles = 4; $caps.entries = 128; $caps.bytes = 134217728 }
-              'L5' { $caps.selectedFiles = 5; $caps.entries = 128; $caps.bytes = 100663296 }
-              'H-UCRT' { $caps.selectedFiles = 1024; $caps.entries = 4096; $caps.bytes = 67108864 }
-              'H-SHARED' { $caps.selectedFiles = 2048; $caps.entries = 4096; $caps.bytes = 67108864 }
-              default { $caps.selectedFiles = 2048; $caps.entries = 8192; $caps.bytes = 67108864 }
-            }
-            $caps.itemMetadataCalls = 2 * ($caps.selectedFiles + 2) + 1024 + 64
-            $caps.aclCalls = $caps.itemMetadataCalls
-            $caps.aclRuleInspections = 128 * $caps.aclCalls
-            $caps.hashFiles = $caps.selectedFiles + 2
-            $caps.streamLengthCalls = 2 * $caps.hashFiles
-            $caps.readCalls = [int][Math]::Ceiling($caps.bytes / 65536.0) + 4096
-            $caps.entryEnumerationCalls = $caps.entries + 1024
-            if ($env:RUNNER_OS -cne 'Windows' -or $env:RUNNER_ARCH -cne 'X64' -or $env:ImageOS -cne 'win25-vs2026' -or $env:ImageVersion -cne '20261021.278.1' -or [Environment]::OSVersion.Version.ToString() -cne '10.0.26100.0') { throw 'drift' }
+            if ($env:GITHUB_EVENT_NAME -cne 'workflow_dispatch' -or $env:GITHUB_REPOSITORY -cne 'donadiosolutions/lcm' -or $env:GITHUB_REF -cne 'refs/heads/security/daemon-peer-metadata-preflight-20261029' -or $env:GITHUB_SHA -cnotmatch '^[0-9a-f]{40}$' -or $env:GITHUB_SHA -ceq 'd9b7f186be6eddfd0bcfbb01c52c73830d6c7c5b' -or $env:PREFLIGHT_EXPECTED_SHA -cne $env:GITHUB_SHA -or $env:PREFLIGHT_WORKFLOW_SHA -cne $env:GITHUB_SHA -or $env:PREFLIGHT_WORKFLOW_REF -cne 'donadiosolutions/lcm/.github/workflows/testbox-node.yml@refs/heads/security/daemon-peer-metadata-preflight-20261029' -or $env:PREFLIGHT_CONFIRMATION -cne 'METADATA_RUNTIME_PIN_20261029') { throw 'gate' }
+            $report.producerSha = $env:GITHUB_SHA; $report.workflowSha = $env:PREFLIGHT_WORKFLOW_SHA
+            if ($env:RUNNER_OS -cne 'Windows' -or $env:RUNNER_ARCH -cne 'X64' -or $env:ImageOS -cne 'win25-vs2026' -or $env:ImageVersion -cne '20261021.278.1' -or [Environment]::OSVersion.Version.ToString() -cne '10.0.26100.0') { throw 'image' }
             $report.imageOS = 'win25-vs2026'; $report.imageVersion = '20261021.278.1'; $report.osVersion = '10.0.26100.0'
-            $bin = $msvc + '\bin\Hostx64\x64'
-            Ancestry $bin 'compiler-bin'
-            Ancestry $sdkInclude 'sdk-directory'
-            $report.msvcDirectoryVersion = '14.51.36231'; $report.sdkDirectoryVersion = '10.0.26100.0'
-            # Only two key identities: this does not revalidate bin/DLL closure.
-            [void]$report.identities.Add((ReadFile ($bin + '\cl.exe') 'msvc-hostx64-x64/cl.exe' 'b0a1818ebae6da7f18230a84e76ce839212584ac4c2ab55b97a0d5268085da57' '19.51.36260.0' 893288))
-            [void]$report.identities.Add((ReadFile ($bin + '\link.exe') 'msvc-hostx64-x64/link.exe' 'a8c42e25c91ca2453e1110540ac08f0fc12d7539454a11b9af8baeecb469837d' '14.51.36260.0' 3701088))
-            switch -CaseSensitive ($report.selector) {
-              'M4' {
-                $root = $msvc + '\lib\x64'
-                Ancestry $root 'msvc-library-root'
-                foreach ($name in @('libcmt.lib', 'libcpmt.lib', 'libvcruntime.lib', 'oldnames.lib')) { Record ($root + '\' + $name) ('msvc-lib-x64/' + $name) }
-              }
-              'L5' {
-                $ucrt = $sdkLib + '\ucrt\x64'; $um = $sdkLib + '\um\x64'
-                Ancestry $ucrt 'sdk-ucrt-library-root'; Ancestry $um 'sdk-um-library-root'
-                Record ($ucrt + '\libucrt.lib') 'sdk-lib-ucrt-x64/libucrt.lib'
-                foreach ($name in @('kernel32.lib', 'advapi32.lib', 'userenv.lib', 'bcrypt.lib')) { Record ($um + '\' + $name) ('sdk-lib-um-x64/' + $name) }
-              }
-              'H-UCRT' { Headers ($sdkInclude + '\ucrt') 'sdk-include-ucrt' }
-              'H-SHARED' { Headers ($sdkInclude + '\shared') 'sdk-include-shared' }
-              default { Headers ($sdkInclude + '\um') 'sdk-include-um' }
+            if (-not $PSHOME.Equals($root, [StringComparison]::OrdinalIgnoreCase) -or [IntPtr]::Size -ne 8 -or [Runtime.InteropServices.RuntimeInformation]::ProcessArchitecture.ToString() -cne 'X64' -or -not [Environment]::ProcessPath.Equals(($root + '\pwsh.exe'), [StringComparison]::OrdinalIgnoreCase)) { throw 'runtime-location' }
+            $report.processRole = 'pshome/pwsh.exe'; $report.pointerBytes = 8; $report.architecture = 'X64'
+            $language = $ExecutionContext.SessionState.LanguageMode.ToString()
+            if ($language -cnotin @('FullLanguage', 'ConstrainedLanguage', 'RestrictedLanguage', 'NoLanguage')) { throw 'language' }
+            $report.languageMode = $language
+            if ($language -cne 'FullLanguage') { throw 'language' }
+            $ps = $PSVersionTable.PSVersion.ToString(); $clr = [Environment]::Version.ToString(); $framework = [Runtime.InteropServices.RuntimeInformation]::FrameworkDescription
+            if ($ps.Length -gt 64 -or $ps -cnotmatch '^[0-9A-Za-z.+-]+$' -or $clr.Length -gt 64 -or $clr -cnotmatch '^[0-9.]+$' -or $framework.Length -gt 64 -or $framework -cnotmatch '^\.NET [0-9A-Za-z.+-]+$') { throw 'version' }
+            $report.psVersion = $ps; $report.clrVersion = $clr; $report.frameworkVersion = $framework
+            $report.dynamicCodeSupported = [Runtime.CompilerServices.RuntimeFeature]::IsDynamicCodeSupported
+            # Fixed depth-zero candidates only. Optional absence remains an explicit gap.
+            $candidates = @(
+              @('pwsh.exe', 'process-image', $true), @('pwsh.dll', 'powershell-entry', $true),
+              @('System.Management.Automation.dll', 'powershell-engine', $true), @('coreclr.dll', 'clr-native-runtime', $true),
+              @('System.Private.CoreLib.dll', 'clr-core-library', $true), @('hostfxr.dll', 'runtime-host', $false),
+              @('hostpolicy.dll', 'runtime-host-policy', $false), @('pwsh.deps.json', 'dependency-manifest', $false),
+              @('pwsh.runtimeconfig.json', 'runtime-configuration', $false), @('System.Runtime.dll', 'runtime-facade', $false),
+              @('System.Runtime.InteropServices.dll', 'interop-metadata', $false), @('System.Runtime.CompilerServices.Unsafe.dll', 'runtime-helper', $false),
+              @('System.Reflection.Emit.dll', 'emit-candidate', $false), @('System.Reflection.Emit.ILGeneration.dll', 'emit-il-candidate', $false),
+              @('System.Reflection.Emit.Lightweight.dll', 'emit-lightweight-candidate', $false), @('System.Reflection.Primitives.dll', 'reflection-metadata', $false),
+              @('System.IO.FileSystem.AccessControl.dll', 'filesystem-security-candidate', $false), @('System.Security.AccessControl.dll', 'security-candidate', $false),
+              @('System.IO.Compression.dll', 'gzip-candidate', $false), @('System.IO.Compression.FileSystem.dll', 'compression-facade', $false),
+              @('System.Formats.Tar.dll', 'tar-candidate', $false), @('System.Security.Cryptography.dll', 'hashing-runtime', $false),
+              @('System.Security.Cryptography.Primitives.dll', 'hashing-facade', $false), @('System.Net.Http.dll', 'http-candidate', $false),
+              @('System.Diagnostics.FileVersionInfo.dll', 'version-resource-reader', $false), @('System.Text.Json.dll', 'json-runtime-candidate', $false),
+              @('Newtonsoft.Json.dll', 'powershell-json-candidate', $false), @('System.Collections.dll', 'collections-runtime', $false),
+              @('System.Console.dll', 'console-runtime', $false), @('System.IO.FileSystem.dll', 'filesystem-facade', $false)
+            )
+            if ($candidates.Count -gt 128) { throw 'files' }
+            foreach ($candidate in $candidates) {
+              [void](NewRow $candidate[0] $candidate[1] $true $candidate[2]); $counts.listedFiles++
             }
+            Count 'assemblySnapshots'
+            # GetAssemblies materializes before the count guard; allocation is unproved.
+            $assemblies = [AppDomain]::CurrentDomain.GetAssemblies()
             Budget
-            if ($report.selector -cin @('M4', 'L5') -and $manifest.Count -ne $caps.selectedFiles) { throw 'missing' }
-            $aggregate = [Security.Cryptography.IncrementalHash]::CreateHash([Security.Cryptography.HashAlgorithmName]::SHA256)
-            try {
-              foreach ($row in $manifest.Values) {
-                Budget
-                $line = $row.publicRelativePath + "`t" + $row.sha256 + "`t" + $row.bytes.ToString([Globalization.CultureInfo]::InvariantCulture) + "`n"
-                $aggregate.AppendData($utf8.GetBytes($line))
+            if ($assemblies.Length -gt 128) { throw 'assembly-limit' }
+            $counts.loadedAssemblies = $assemblies.Length
+            foreach ($assembly in $assemblies) {
+              Count 'assemblyRowsInspected'
+              Count 'assemblyPropertyReads'
+              if ($assembly.IsDynamic) {
+                UnboundAssembly 'dynamic-assembly'
+                $counts.dynamicAssemblyRows++
+                continue
               }
-              $report.selectorSha256 = [Convert]::ToHexString($aggregate.GetHashAndReset()).ToLowerInvariant()
-            } finally { $aggregate.Dispose() }
+              Count 'assemblyPropertyReads'
+              $location = $assembly.Location
+              Budget
+              if ([string]::IsNullOrEmpty($location)) {
+                UnboundAssembly 'locationless-assembly'
+                $counts.locationlessAssemblyRows++
+                continue
+              }
+              # Refuse private/unlisted-root locations BEFORE any output; never emit them.
+              $leaf = PublicLeaf $location
+              if (-not $map.ContainsKey($leaf)) { [void](NewRow $leaf 'loaded-unlisted' $false $false) }
+              $row = $map[$leaf]
+              if ($row.loaded) { throw 'duplicate-loaded-location' }
+              $row.loaded = $true; $row.status = 'loaded-unhashed'
+              Count 'assemblyPropertyReads'
+              $assemblyVersion = $assembly.GetName().Version.ToString()
+              Budget
+              if ($assemblyVersion.Length -gt 64 -or $assemblyVersion -cnotmatch '^[0-9.]+$') { throw 'version' }
+              $row.assemblyVersion = $assemblyVersion
+            }
+            foreach ($candidate in $candidates) { HashCandidate $candidate[0] $map[$candidate[0]] }
             Budget
-            $report.selectorComplete = $true; $report.status = 'metadata-observed'; $report.reason = 'declared-selector-only'
+            $report.observationComplete = $true; $report.status = 'metadata-observed'; $report.reason = 'declared-candidates-only'
           } catch {
-            $allowed = @('gate', 'elapsed', 'operations', 'entries', 'bytes', 'path', 'reparse', 'acl', 'mutable', 'depth', 'file-size', 'drift', 'changed', 'duplicate', 'unknown', 'missing')
+            $allowed = @('gate', 'elapsed', 'operations', 'bytes', 'path', 'unexpected-location', 'union-limit', 'required-missing', 'file-kind', 'file-size', 'changed', 'short-file', 'version', 'image', 'runtime-location', 'language', 'files', 'assembly-limit', 'duplicate-loaded-location')
             $report.reason = if ($_.Exception.Message -cin $allowed) { $_.Exception.Message } else { 'metadata-read-refused' }
-            $report.selectorSha256 = 'unproved'
+            $report.observationComplete = $false; $report.status = 'refused'
           }
-          foreach ($row in $manifest.Values) { [void]$report.files.Add($row) }
-          $report.elapsedMilliseconds = $timer.ElapsedMilliseconds
-          $json = ConvertTo-Json -InputObject $report -Depth 8 -Compress
-          if ($timer.ElapsedMilliseconds -ge 20000) {
-            $report.status = 'refused'; $report.reason = 'elapsed'; $report.selectorComplete = $false; $report.selectorSha256 = 'unproved'
+          try {
+            if ($timer.ElapsedMilliseconds -ge 20000) { $report.observationComplete = $false; $report.status = 'refused'; $report.reason = 'elapsed' }
             $report.elapsedMilliseconds = $timer.ElapsedMilliseconds
+            # Serialization may load lazy managed dependencies; this is never closure proof.
             $json = ConvertTo-Json -InputObject $report -Depth 8 -Compress
-          }
-          if ($utf8.GetByteCount($json) -gt 1048576) {
-            Write-Output '{"schema":"sec-daemon-peer-fixed-selector-v1","status":"refused","reason":"json-limit","selectorComplete":false,"closureComplete":false,"pin":"unproved","toolchainClosure":"unproved","jobCapsuleImplemented":"unproved","jobCapsuleEnforced":"unproved","sealedArtifactAncestry":"unproved","nativeIdentity":"unproved","nodeInputs":"unacquired","cleanup":"unproved"}'
+            if ($timer.ElapsedMilliseconds -ge 20000) { throw 'elapsed' }
+            if ($utf8.GetByteCount($json) -gt 1048576) { throw 'json-limit' }
+            Write-Output $json
+          } catch {
+            Write-Output '{"schema":"sec-daemon-peer-runtime-pin-v1","status":"refused","reason":"serialization-or-deadline","counterSemantics":"logical-counters-refusal-may-retain-reservations-not-physical-io","observationComplete":false,"closureComplete":false,"pin":"unproved","ffiProbed":false,"nativeProbed":false,"jobCapsuleImplemented":"unproved","jobCapsuleEnforced":"unproved","sealedArtifactAncestry":"unproved","nodeAcquisition":"unproved","nodeRuntimePin":"unproved","nativeIdentity":"unproved","physicalAllocationBound":"unproved","cleanup":"unproved"}'
             exit 1
           }
-          Write-Output $json
-          if (-not $report.selectorComplete) { exit 1 }
+          if (-not $report.observationComplete) { exit 1 }

@@ -1,0 +1,150 @@
+{
+  "schema": "sec-daemon-peer-node-input-contract-v1",
+  "status": "static-contract-only",
+  "validBuildManifest": false,
+  "version": "25.4.0",
+  "closureComplete": false,
+  "authentication": {
+    "status": "retained-signature-established-not-artifact-acquisition",
+    "verificationRef": "windows-native-plan/signature-metadata/verification.json",
+    "gpgvExitCode": 0,
+    "signerFingerprint": "890C08DB8579162FEE0DF9DB8BEAB4DFCF555EF4",
+    "readmeSha256": "c00a8455cd6face02ee0e5c603cf70a8b1e9bbf23384490461f6830076076ce8",
+    "publicKeyAsciiSha256": "0ac77d630a1a6c2bdf61857532bbee7179850de36c4a7d10bc0b67d10ddb69dd",
+    "keyringSha256": "0588109b0d61564adf97da94bdfcf40cfc884f158370a3e482f0a8484ac99ce6",
+    "signatureSha256": "9f57f6ca18ce8b8abe1416e9c327eb4b11a65ef51b949acb5c9feb42b36b47d1",
+    "checksumManifestSha256": "bc7fa555c7b59b3ef2da19c6fea78b6b1b33047a555728321ad7ea9600178131",
+    "rootMustBindRetainedBundleAndContractDigest": true
+  },
+  "artifacts": [
+    {
+      "role": "headers",
+      "url": "https://nodejs.org/dist/v25.4.0/node-v25.4.0-headers.tar.gz",
+      "sha256": "b79d50770ed78a2282673fb18745dba6a0ed5fac0f4ee06d0d3e9ff343a7b884",
+      "state": "unacquired",
+      "actualBytes": null
+    },
+    {
+      "role": "import-library-x64",
+      "url": "https://nodejs.org/dist/v25.4.0/win-x64/node.lib",
+      "sha256": "e1c02915c1020765f2373e792022936c6ebace7f8449657a60c1b01ed1a9a1da",
+      "state": "unacquired",
+      "actualBytes": null
+    },
+    {
+      "role": "import-library-arm64",
+      "url": "https://nodejs.org/dist/v25.4.0/win-arm64/node.lib",
+      "sha256": "313755ba5970fbe0b2af34583654bbc0f4c5121dc5e5b06e12deee958f6a5d24",
+      "state": "unacquired",
+      "actualBytes": null
+    }
+  ],
+  "headerSourceCommit": "92a75854d7049e7f039ca2e6cc5b4a378d532bc5",
+  "headers": [
+    {
+      "member": "node-v25.4.0/include/node/node_api.h",
+      "destinationBasename": "node_api.h",
+      "sourceUrl": "https://github.com/nodejs/node/blob/92a75854d7049e7f039ca2e6cc5b4a378d532bc5/src/node_api.h",
+      "nodeOwnedEdges": [
+        "js_native_api.h",
+        "node_api_types.h"
+      ],
+      "toolchainOwnedConditionalEdges": [],
+      "archiveExtractedSha256": null,
+      "archiveExtractedBytes": null,
+      "state": "unacquired"
+    },
+    {
+      "member": "node-v25.4.0/include/node/node_api_types.h",
+      "destinationBasename": "node_api_types.h",
+      "sourceUrl": "https://github.com/nodejs/node/blob/92a75854d7049e7f039ca2e6cc5b4a378d532bc5/src/node_api_types.h",
+      "nodeOwnedEdges": [
+        "js_native_api_types.h"
+      ],
+      "toolchainOwnedConditionalEdges": [],
+      "archiveExtractedSha256": null,
+      "archiveExtractedBytes": null,
+      "state": "unacquired"
+    },
+    {
+      "member": "node-v25.4.0/include/node/js_native_api.h",
+      "destinationBasename": "js_native_api.h",
+      "sourceUrl": "https://github.com/nodejs/node/blob/92a75854d7049e7f039ca2e6cc5b4a378d532bc5/src/js_native_api.h",
+      "nodeOwnedEdges": [
+        "js_native_api_types.h"
+      ],
+      "toolchainOwnedConditionalEdges": [
+        "stdbool.h (unconditional include for C and C++17)",
+        "stddef.h"
+      ],
+      "archiveExtractedSha256": null,
+      "archiveExtractedBytes": null,
+      "state": "unacquired"
+    },
+    {
+      "member": "node-v25.4.0/include/node/js_native_api_types.h",
+      "destinationBasename": "js_native_api_types.h",
+      "sourceUrl": "https://github.com/nodejs/node/blob/92a75854d7049e7f039ca2e6cc5b4a378d532bc5/src/js_native_api_types.h",
+      "nodeOwnedEdges": [],
+      "toolchainOwnedConditionalEdges": [
+        "stddef.h",
+        "stdint.h"
+      ],
+      "archiveExtractedSha256": null,
+      "archiveExtractedBytes": null,
+      "state": "unacquired"
+    }
+  ],
+  "preprocessorContract": {
+    "platform": "_WIN32",
+    "language": "C++17",
+    "napiVersion": 8,
+    "experimental": false,
+    "foreignNapiExtern": "refuse",
+    "bridgeOnlyFlag": "/DBUILDING_NODE_EXTENSION=1",
+    "nodeApiLines4to13": "BUILDING_NODE_EXTENSION plus absent NAPI_EXTERN selects __declspec(dllimport) on Windows before js_native_api.h",
+    "fallbackJsNativeApiLines10to20": "without definition NAPI_EXTERN defaults __declspec(dllexport) on Windows",
+    "moduleEntryExport": "separate NAPI_MODULE_EXPORT remains __declspec(dllexport)",
+    "evidence": "symbolic public-source contract; no executed preprocessor or linker diagnosis",
+    "actualConditionalClosure": "unproved"
+  },
+  "futureProposedCapsNotAdmission": {
+    "requests": 3,
+    "redirects": 0,
+    "retries": 0,
+    "artifactBytes": 33554432,
+    "aggregateDownloadBytes": 100663296,
+    "transferCooperativeMilliseconds": 30000,
+    "preparationCooperativeMilliseconds": 120000,
+    "expandedBytes": 268435456,
+    "entries": 8192,
+    "memberBytes": 16777216,
+    "nameAsciiBytes": 240,
+    "componentBytes": 160,
+    "depth": 12,
+    "extractedFiles": 4,
+    "extractedFileBytes": 262144,
+    "extractedBytes": 1048576,
+    "readCalls": 65536,
+    "bufferBytes": 65536
+  },
+  "futureSourceRequirements": [
+    "Root separate acquisition admission and capsule/cleanup ownership",
+    "Bind retained auth bundle and exact contract digest before transfer",
+    "Acquire selected architecture only; arm64 digest is not arm64 toolchain evidence",
+    "Exclusive owned part file; stream and hash; SHA verified before parsing or promotion",
+    "Zero automatic decompression, redirects, retries, range resumes, alternate hosts or package tools",
+    "Strict bounded gzip/tar parser source and compatibility review before execution",
+    "Refuse links, devices, FIFOs, sparse, unknown extensions, PAX/GNU indirection, concatenation and trailing nonpadding data",
+    "Validate every member including skipped names: fixed root, no absolute/drive/UNC/NT/ADS/backslash/control/dot/reserved/trailing-dot-space paths, duplicate/case/normalization collisions or reparse traversal",
+    "Write only four exact unmodified exclusive basenames under independently owned ancestry; bounded skip of all other payload",
+    "Retain actual per-file bytes/hash only after authenticated extraction; null is not a build pin",
+    "Any physical I/O/close/cleanup uncertainty remains charged nonterminal; no partial promotion or reusable stage",
+    "Root must choose explicit OS/loader/runtime TCB boundary; all transitive C/STL/Windows inputs remain separate"
+  ],
+  "consumerRuntime": {
+    "nodeExeSha256": null,
+    "status": "missing-separate-future-input"
+  },
+  "implementation": "none; no acquisition/parser/seal/capsule executable source in this contract"
+}

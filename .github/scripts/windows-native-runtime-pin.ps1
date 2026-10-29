@@ -1,0 +1,253 @@
+# Review-only metadata reader; dispatch requires separate Root admission.
+# No child, native calls, dynamic types, import, acquisition or closure claim.
+# Earliest ConstrainedLanguage-safe comparison: no method, constructor or
+# serializer precedes it. Do not alter the session's language policy.
+# RestrictedLanguage/NoLanguage may reject scripts or member access before
+# either branch; executable script start is a precondition, not catchable here.
+if ($ExecutionContext.SessionState.LanguageMode -eq 'ConstrainedLanguage') {
+  '{"schema":"sec-daemon-peer-runtime-pin-v1","status":"refused","reason":"language-mode","observationComplete":false,"closureComplete":false,"pin":"unproved","languageMode":"ConstrainedLanguage","ffiProbed":false,"nativeProbed":false,"jobCapsuleImplemented":"unproved","jobCapsuleEnforced":"unproved","sealedArtifactAncestry":"unproved","nodeAcquisition":"unproved","nodeRuntimePin":"unproved","nativeIdentity":"unproved","physicalAllocationBound":"unproved","counterSemantics":"logical-counters-refusal-may-retain-reservations-not-physical-io","cleanup":"unproved"}'
+  exit 1
+}
+if ($ExecutionContext.SessionState.LanguageMode -ne 'FullLanguage') {
+  '{"schema":"sec-daemon-peer-runtime-pin-v1","status":"refused","reason":"language-mode","observationComplete":false,"closureComplete":false,"pin":"unproved","languageMode":"unsupported","ffiProbed":false,"nativeProbed":false,"jobCapsuleImplemented":"unproved","jobCapsuleEnforced":"unproved","sealedArtifactAncestry":"unproved","nodeAcquisition":"unproved","nodeRuntimePin":"unproved","nativeIdentity":"unproved","physicalAllocationBound":"unproved","counterSemantics":"logical-counters-refusal-may-retain-reservations-not-physical-io","cleanup":"unproved"}'
+  exit 1
+}
+# FullLanguage bootstrap failures cannot depend on report/timer/UTF8 existence.
+try {
+  $ErrorActionPreference = 'Stop'
+  $ProgressPreference = 'SilentlyContinue'
+  $timer = [Diagnostics.Stopwatch]::StartNew()
+  $utf8 = [Text.UTF8Encoding]::new($false)
+  $root = 'C:\Program Files\PowerShell\7'
+  $caps = [ordered]@{ files = 128; loadedAssemblies = 128; unionRows = 128; fileBytes = 67108864; accountedBytes = 268435456; readCalls = 32768; readSize = 65536; fileMetadataCalls = 256; streamLengthCalls = 256; versionReads = 128; openCalls = 128; hashCreations = 128; assemblySnapshots = 1; assemblyRowsInspected = 128; assemblyPropertyReads = 384; milliseconds = 20000; jsonBytes = 1048576 }
+  $counts = [ordered]@{ listedFiles = 0; loadedAssemblies = 0; dynamicAssemblyRows = 0; locationlessAssemblyRows = 0; unionRows = 0; hashedFiles = 0; missingFiles = 0; readCalls = 0; readBytes = [long]0; metadataBytes = [long]0; accountedBytes = [long]0; fileMetadataCalls = 0; streamLengthCalls = 0; versionReads = 0; openCalls = 0; hashCreations = 0; assemblySnapshots = 0; assemblyRowsInspected = 0; assemblyPropertyReads = 0 }
+  $rows = [Collections.Generic.List[object]]::new()
+  $map = [Collections.Generic.Dictionary[string,object]]::new([StringComparer]::OrdinalIgnoreCase)
+  $report = [ordered]@{
+    schema = 'sec-daemon-peer-runtime-pin-v1'; status = 'refused'; reason = 'gate'; observationComplete = $false
+    closureComplete = $false; pin = 'unproved'; ffiProbed = $false; nativeProbed = $false
+    jobCapsuleImplemented = 'unproved'; jobCapsuleEnforced = 'unproved'; sealedArtifactAncestry = 'unproved'
+    nodeAcquisition = 'unproved'; nodeRuntimePin = 'unproved'; nativeIdentity = 'unproved'; cleanup = 'unproved'
+    osIoDeadline = 'cooperative-only-stalled-os-io-not-bounded'; physicalAllocationBound = 'unproved'
+    assemblySnapshotAllocation = 'materialized-before-count-guard'; lazyDependencies = 'unproved'
+    runtimeAncestrySeal = 'unproved'; dependencyManifests = 'hashed-only-not-parsed'; dependencyEntriesParsed = 0
+    producerSha = 'unproved'; workflowSha = 'unproved'; imageOS = 'unproved'; imageVersion = 'unproved'; osVersion = 'unproved'
+    processRole = 'unproved'; psVersion = 'unproved'; clrVersion = 'unproved'; frameworkVersion = 'unproved'
+    languageMode = 'unproved'; dynamicCodeSupported = 'unproved'; dynamicCodeEmissionWorks = 'unproved'; pointerBytes = 0; architecture = 'unproved'
+    counterSemantics = 'logical-counters-refusal-may-retain-reservations-not-physical-io'
+    caps = $caps; counts = $counts; files = $rows; elapsedMilliseconds = 0
+  }
+} catch {
+  '{"schema":"sec-daemon-peer-runtime-pin-v1","status":"refused","reason":"bootstrap","observationComplete":false,"closureComplete":false,"pin":"unproved","languageMode":"FullLanguage","ffiProbed":false,"nativeProbed":false,"jobCapsuleImplemented":"unproved","jobCapsuleEnforced":"unproved","sealedArtifactAncestry":"unproved","nodeAcquisition":"unproved","nodeRuntimePin":"unproved","nativeIdentity":"unproved","physicalAllocationBound":"unproved","counterSemantics":"logical-counters-refusal-may-retain-reservations-not-physical-io","cleanup":"unproved"}'
+  exit 1
+}
+function Budget {
+  if ($timer.ElapsedMilliseconds -ge 20000) { throw 'elapsed' }
+}
+# Operation counters are logical pre-call reservations/attempts, not a count
+# of transitive getter calls, internal operations, CPU time or physical I/O.
+function Count([string]$Name) {
+  Budget
+  if ($counts[$Name] -ge $caps[$Name]) { throw 'operations' }
+  $counts[$Name]++
+}
+# REFUSED byte counters may retain unused reservation slack if a read throws
+# or an elapsed check preempts its refund. Never interpret them as actual I/O.
+function Charge([long]$Amount, [string]$Kind) {
+  Budget
+  if ($Amount -lt 0 -or $Amount -gt (268435456 - $counts.accountedBytes)) { throw 'bytes' }
+  $counts.accountedBytes += $Amount
+  $counts[$Kind] += $Amount
+}
+function PublicLeaf([string]$Path) {
+  Budget
+  if ([string]::IsNullOrEmpty($Path) -or $Path.Length -gt 512) { throw 'path' }
+  $full = [IO.Path]::GetFullPath($Path)
+  if (-not $full.StartsWith($root + '\', [StringComparison]::OrdinalIgnoreCase)) { throw 'unexpected-location' }
+  $leaf = $full.Substring($root.Length + 1)
+  if ($leaf.Length -gt 128 -or $leaf -cnotmatch '^[A-Za-z0-9_.-]+$' -or $leaf -cin @('.', '..')) { throw 'unexpected-location' }
+  return $leaf
+}
+function NewRow([string]$Leaf, [string]$Role, [bool]$Listed, [bool]$Required) {
+  Budget
+  if ($rows.Count -ge 128) { throw 'union-limit' }
+  $row = [ordered]@{ publicRelativePath = 'pshome/' + $Leaf; role = $Role; listed = $Listed; loaded = $false; required = $Required; status = 'unobserved'; hashed = $false; bytes = $null; sha256 = $null; fileVersion = $null; assemblyVersion = $null }
+  [void]$rows.Add($row)
+  $map.Add($Leaf, $row)
+  $counts.unionRows++
+  return $row
+}
+function UnboundAssembly([string]$Role) {
+  Budget
+  if ($rows.Count -ge 128) { throw 'union-limit' }
+  # Runtime-created/locationless metadata is not a filesystem member or proof
+  # that emission works. No assembly name/private location is output or loaded.
+  [void]$rows.Add([ordered]@{ publicRelativePath = $null; role = $Role; listed = $false; loaded = $true; required = $false; status = 'unbound-location'; hashed = $false; bytes = $null; sha256 = $null; fileVersion = $null; assemblyVersion = $null })
+  $counts.unionRows++
+}
+function Metadata([string]$Path) {
+  Count 'fileMetadataCalls'
+  # A conservative logical metadata allowance, not physical I/O/allocation proof.
+  Charge 4096 'metadataBytes'
+  $item = [IO.FileInfo]::new($Path)
+  $item.Refresh()
+  Budget
+  return $item
+}
+function HashCandidate([string]$Leaf, $Row) {
+  $path = $root + '\' + $Leaf
+  $before = Metadata $path
+  if (-not $before.Exists) {
+    $Row.status = 'missing'; $counts.missingFiles++
+    if ($Row.required -or $Row.loaded) { throw 'required-missing' }
+    return
+  }
+  if (($before.Attributes -band ([IO.FileAttributes]::Directory -bor [IO.FileAttributes]::ReparsePoint -bor [IO.FileAttributes]::Device)) -ne 0) { throw 'file-kind' }
+  $length = [long]$before.Length
+  $stamp = $before.LastWriteTimeUtc.Ticks
+  $attributes = $before.Attributes
+  if ($length -lt 0 -or $length -gt 67108864) { throw 'file-size' }
+  $stream = $null; $hash = $null; $total = [long]0
+  try {
+    Count 'hashCreations'
+    $hash = [Security.Cryptography.IncrementalHash]::CreateHash([Security.Cryptography.HashAlgorithmName]::SHA256)
+    Budget
+    Count 'openCalls'
+    # Read sharing only. This is a temporary observation handle, not a seal lease.
+    $stream = [IO.File]::Open($path, [IO.FileMode]::Open, [IO.FileAccess]::Read, [IO.FileShare]::Read)
+    Budget
+    Count 'streamLengthCalls'
+    $openedLength = $stream.Length
+    Budget
+    if ($openedLength -ne $length) { throw 'changed' }
+    $buffer = [byte[]]::new(65536)
+    while ($total -lt $length) {
+      Count 'readCalls'
+      $request = [int][Math]::Min(65536, $length - $total)
+      Charge $request 'readBytes'
+      $read = $stream.Read($buffer, 0, $request)
+      Budget
+      if ($read -le 0 -or $read -gt $request) { throw 'short-file' }
+      # A completed read refunds known unused request bytes. A refusal before
+      # these lines conservatively retains the reservation; each attempt counts.
+      $counts.readBytes -= $request - $read
+      $counts.accountedBytes -= $request - $read
+      $total += $read
+      $hash.AppendData($buffer, 0, $read)
+      Budget
+    }
+    Count 'streamLengthCalls'
+    $openedLength = $stream.Length
+    Budget
+    if ($openedLength -ne $length -or $total -ne $length) { throw 'changed' }
+    Count 'versionReads'
+    # Charge the whole known file conservatively for the version-resource API.
+    Charge $length 'metadataBytes'
+    $version = [Diagnostics.FileVersionInfo]::GetVersionInfo($path)
+    Budget
+    $numericVersion = '{0}.{1}.{2}.{3}' -f $version.FileMajorPart, $version.FileMinorPart, $version.FileBuildPart, $version.FilePrivatePart
+    if ($numericVersion.Length -gt 64 -or $numericVersion -cnotmatch '^[0-9.]+$') { throw 'version' }
+    $after = Metadata $path
+    if (-not $after.Exists -or $after.Length -ne $length -or $after.LastWriteTimeUtc.Ticks -ne $stamp -or $after.Attributes -ne $attributes) { throw 'changed' }
+    $Row.sha256 = [Convert]::ToHexString($hash.GetHashAndReset()).ToLowerInvariant()
+    $Row.bytes = $length; $Row.fileVersion = $numericVersion; $Row.hashed = $true; $Row.status = 'hashed-observation'
+    $counts.hashedFiles++
+    Budget
+  } finally {
+    # Disposal may itself stall. No hard cleanup deadline or seal is claimed.
+    if ($null -ne $stream) { $stream.Dispose() }
+    if ($null -ne $hash) { $hash.Dispose() }
+  }
+}
+try {
+  if ($env:GITHUB_EVENT_NAME -cne 'workflow_dispatch' -or $env:GITHUB_REPOSITORY -cne 'donadiosolutions/lcm' -or $env:GITHUB_REF -cne 'refs/heads/security/daemon-peer-metadata-preflight-20261029' -or $env:GITHUB_SHA -cnotmatch '^[0-9a-f]{40}$' -or $env:GITHUB_SHA -ceq 'd9b7f186be6eddfd0bcfbb01c52c73830d6c7c5b' -or $env:PREFLIGHT_EXPECTED_SHA -cne $env:GITHUB_SHA -or $env:PREFLIGHT_WORKFLOW_SHA -cne $env:GITHUB_SHA -or $env:PREFLIGHT_WORKFLOW_REF -cne 'donadiosolutions/lcm/.github/workflows/testbox-node.yml@refs/heads/security/daemon-peer-metadata-preflight-20261029' -or $env:PREFLIGHT_CONFIRMATION -cne 'METADATA_RUNTIME_PIN_20261029') { throw 'gate' }
+  $report.producerSha = $env:GITHUB_SHA; $report.workflowSha = $env:PREFLIGHT_WORKFLOW_SHA
+  if ($env:RUNNER_OS -cne 'Windows' -or $env:RUNNER_ARCH -cne 'X64' -or $env:ImageOS -cne 'win25-vs2026' -or $env:ImageVersion -cne '20261021.278.1' -or [Environment]::OSVersion.Version.ToString() -cne '10.0.26100.0') { throw 'image' }
+  $report.imageOS = 'win25-vs2026'; $report.imageVersion = '20261021.278.1'; $report.osVersion = '10.0.26100.0'
+  if (-not $PSHOME.Equals($root, [StringComparison]::OrdinalIgnoreCase) -or [IntPtr]::Size -ne 8 -or [Runtime.InteropServices.RuntimeInformation]::ProcessArchitecture.ToString() -cne 'X64' -or -not [Environment]::ProcessPath.Equals(($root + '\pwsh.exe'), [StringComparison]::OrdinalIgnoreCase)) { throw 'runtime-location' }
+  $report.processRole = 'pshome/pwsh.exe'; $report.pointerBytes = 8; $report.architecture = 'X64'
+  $language = $ExecutionContext.SessionState.LanguageMode.ToString()
+  if ($language -cnotin @('FullLanguage', 'ConstrainedLanguage', 'RestrictedLanguage', 'NoLanguage')) { throw 'language' }
+  $report.languageMode = $language
+  if ($language -cne 'FullLanguage') { throw 'language' }
+  $ps = $PSVersionTable.PSVersion.ToString(); $clr = [Environment]::Version.ToString(); $framework = [Runtime.InteropServices.RuntimeInformation]::FrameworkDescription
+  if ($ps.Length -gt 64 -or $ps -cnotmatch '^[0-9A-Za-z.+-]+$' -or $clr.Length -gt 64 -or $clr -cnotmatch '^[0-9.]+$' -or $framework.Length -gt 64 -or $framework -cnotmatch '^\.NET [0-9A-Za-z.+-]+$') { throw 'version' }
+  $report.psVersion = $ps; $report.clrVersion = $clr; $report.frameworkVersion = $framework
+  $report.dynamicCodeSupported = [Runtime.CompilerServices.RuntimeFeature]::IsDynamicCodeSupported
+  # Fixed depth-zero candidates only. Optional absence remains an explicit gap.
+  $candidates = @(
+    @('pwsh.exe', 'process-image', $true), @('pwsh.dll', 'powershell-entry', $true),
+    @('System.Management.Automation.dll', 'powershell-engine', $true), @('coreclr.dll', 'clr-native-runtime', $true),
+    @('System.Private.CoreLib.dll', 'clr-core-library', $true), @('hostfxr.dll', 'runtime-host', $false),
+    @('hostpolicy.dll', 'runtime-host-policy', $false), @('pwsh.deps.json', 'dependency-manifest', $false),
+    @('pwsh.runtimeconfig.json', 'runtime-configuration', $false), @('System.Runtime.dll', 'runtime-facade', $false),
+    @('System.Runtime.InteropServices.dll', 'interop-metadata', $false), @('System.Runtime.CompilerServices.Unsafe.dll', 'runtime-helper', $false),
+    @('System.Reflection.Emit.dll', 'emit-candidate', $false), @('System.Reflection.Emit.ILGeneration.dll', 'emit-il-candidate', $false),
+    @('System.Reflection.Emit.Lightweight.dll', 'emit-lightweight-candidate', $false), @('System.Reflection.Primitives.dll', 'reflection-metadata', $false),
+    @('System.IO.FileSystem.AccessControl.dll', 'filesystem-security-candidate', $false), @('System.Security.AccessControl.dll', 'security-candidate', $false),
+    @('System.IO.Compression.dll', 'gzip-candidate', $false), @('System.IO.Compression.FileSystem.dll', 'compression-facade', $false),
+    @('System.Formats.Tar.dll', 'tar-candidate', $false), @('System.Security.Cryptography.dll', 'hashing-runtime', $false),
+    @('System.Security.Cryptography.Primitives.dll', 'hashing-facade', $false), @('System.Net.Http.dll', 'http-candidate', $false),
+    @('System.Diagnostics.FileVersionInfo.dll', 'version-resource-reader', $false), @('System.Text.Json.dll', 'json-runtime-candidate', $false),
+    @('Newtonsoft.Json.dll', 'powershell-json-candidate', $false), @('System.Collections.dll', 'collections-runtime', $false),
+    @('System.Console.dll', 'console-runtime', $false), @('System.IO.FileSystem.dll', 'filesystem-facade', $false)
+  )
+  if ($candidates.Count -gt 128) { throw 'files' }
+  foreach ($candidate in $candidates) {
+    [void](NewRow $candidate[0] $candidate[1] $true $candidate[2]); $counts.listedFiles++
+  }
+  Count 'assemblySnapshots'
+  # GetAssemblies materializes before the count guard; allocation is unproved.
+  $assemblies = [AppDomain]::CurrentDomain.GetAssemblies()
+  Budget
+  if ($assemblies.Length -gt 128) { throw 'assembly-limit' }
+  $counts.loadedAssemblies = $assemblies.Length
+  foreach ($assembly in $assemblies) {
+    Count 'assemblyRowsInspected'
+    Count 'assemblyPropertyReads'
+    if ($assembly.IsDynamic) {
+      UnboundAssembly 'dynamic-assembly'
+      $counts.dynamicAssemblyRows++
+      continue
+    }
+    Count 'assemblyPropertyReads'
+    $location = $assembly.Location
+    Budget
+    if ([string]::IsNullOrEmpty($location)) {
+      UnboundAssembly 'locationless-assembly'
+      $counts.locationlessAssemblyRows++
+      continue
+    }
+    # Refuse private/unlisted-root locations BEFORE any output; never emit them.
+    $leaf = PublicLeaf $location
+    if (-not $map.ContainsKey($leaf)) { [void](NewRow $leaf 'loaded-unlisted' $false $false) }
+    $row = $map[$leaf]
+    if ($row.loaded) { throw 'duplicate-loaded-location' }
+    $row.loaded = $true; $row.status = 'loaded-unhashed'
+    Count 'assemblyPropertyReads'
+    $assemblyVersion = $assembly.GetName().Version.ToString()
+    Budget
+    if ($assemblyVersion.Length -gt 64 -or $assemblyVersion -cnotmatch '^[0-9.]+$') { throw 'version' }
+    $row.assemblyVersion = $assemblyVersion
+  }
+  foreach ($candidate in $candidates) { HashCandidate $candidate[0] $map[$candidate[0]] }
+  Budget
+  $report.observationComplete = $true; $report.status = 'metadata-observed'; $report.reason = 'declared-candidates-only'
+} catch {
+  $allowed = @('gate', 'elapsed', 'operations', 'bytes', 'path', 'unexpected-location', 'union-limit', 'required-missing', 'file-kind', 'file-size', 'changed', 'short-file', 'version', 'image', 'runtime-location', 'language', 'files', 'assembly-limit', 'duplicate-loaded-location')
+  $report.reason = if ($_.Exception.Message -cin $allowed) { $_.Exception.Message } else { 'metadata-read-refused' }
+  $report.observationComplete = $false; $report.status = 'refused'
+}
+try {
+  if ($timer.ElapsedMilliseconds -ge 20000) { $report.observationComplete = $false; $report.status = 'refused'; $report.reason = 'elapsed' }
+  $report.elapsedMilliseconds = $timer.ElapsedMilliseconds
+  # Serialization may load lazy managed dependencies; this is never closure proof.
+  $json = ConvertTo-Json -InputObject $report -Depth 8 -Compress
+  if ($timer.ElapsedMilliseconds -ge 20000) { throw 'elapsed' }
+  if ($utf8.GetByteCount($json) -gt 1048576) { throw 'json-limit' }
+  Write-Output $json
+} catch {
+  Write-Output '{"schema":"sec-daemon-peer-runtime-pin-v1","status":"refused","reason":"serialization-or-deadline","counterSemantics":"logical-counters-refusal-may-retain-reservations-not-physical-io","observationComplete":false,"closureComplete":false,"pin":"unproved","ffiProbed":false,"nativeProbed":false,"jobCapsuleImplemented":"unproved","jobCapsuleEnforced":"unproved","sealedArtifactAncestry":"unproved","nodeAcquisition":"unproved","nodeRuntimePin":"unproved","nativeIdentity":"unproved","physicalAllocationBound":"unproved","cleanup":"unproved"}'
+  exit 1
+}
+if (-not $report.observationComplete) { exit 1 }
