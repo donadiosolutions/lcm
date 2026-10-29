@@ -774,7 +774,10 @@ bundle and keep provider, credential, quarantine, and recovery sessions private.
   after the matching quote also redact an immediately adjacent POSIX-rooted,
   Windows backslash-rooted, or drive value on the first pass. When that redacted
   value is followed by a bracket, private values inside the bracket are redacted
-  on the same pass. Relative, public-URL, and plain values after `=` stay
+  on the same pass. A drive-shaped value in a component reached only through
+  this new handoff keeps its earlier multi-pass classification instead of being
+  collapsed to a drive-less marker; this includes nested file children and
+  later named values. Relative, public-URL, and plain values after `=` stay
   readable, as do backslash-rooted values separated from `=` by whitespace or
   one of the listed invisible characters. Within the same
   uninterrupted wrapper after an immediate rooted handoff, immediate and later

@@ -6128,16 +6128,6 @@ describe("sanitizeError", () => {
         redactedPrefix + "\u200b=<path>?key=<path>]]",
       ],
       [
-        "equals forward-slash drive value with a bracket",
-        prefix + "=C:/Users/SECRET/x" + bracket,
-        redactedPrefix + "=C:<path>?key=<path>]]",
-      ],
-      [
-        "invisible run before an equals forward-slash drive value with a bracket",
-        prefix + "\u200b=C:/Users/SECRET/x" + bracket,
-        redactedPrefix + "\u200b=C:<path>?key=<path>]]",
-      ],
-      [
         "equals backslash value before a later private-root successor",
         prefix + "=\\Users\\x&later/home/alice]",
         redactedPrefix + "=<path>&later<path>]",
@@ -6152,10 +6142,55 @@ describe("sanitizeError", () => {
     });
 
     it.each([
+      ["direct", ""],
+      ["after U+200B", "\u200b"],
+    ] as const)("keeps the base drive-origin bracket sequence %s", (_name, interposer) => {
+      assertPasses(
+        prefix + interposer + "=C:/Users/SECRET/x" + bracket,
+        redactedPrefix + interposer + "=C:<path>?key=/home/C/s]]",
+        redactedPrefix + interposer + "=C:<path>?key=<path>]]",
+        redactedPrefix + interposer + "=C:<path>?key=<path>]]",
+      );
+    });
+
+    it.each([
+      [
+        "lowercase drive before a bracket",
+        "=c:/Users/S/x" + bracket,
+        "=c:<path>?key=/home/C/s]]",
+        "=c:<path>?key=<path>]]",
+      ],
+      [
+        "drive before an ampersand private relative",
+        "=C:/Users/S/x&later/home/alice]",
+        "=C:<path>&later/home/alice]",
+        "=C:<path>&later<path>]",
+      ],
+      [
+        "drive before a pipe private relative",
+        "=C:/Users/S/x|later/home/alice]",
+        "=C:<path>|later/home/alice]",
+        "=C:<path>|later<path>]",
+      ],
+      [
+        "drive before a backslash value",
+        "=C:/Users/S/x&\\Users\\T\\y]",
+        "=C:<path>&\\Users\\T\\y]",
+        "=C:<path>&<path>]",
+      ],
+    ] as const)("keeps the base drive-origin successor sequence for the %s", (_name, suffix, first, fixed) => {
+      assertPasses(
+        prefix + suffix,
+        redactedPrefix + first,
+        redactedPrefix + fixed,
+        redactedPrefix + fixed,
+      );
+    });
+
+    it.each([
       ["POSIX value before a bracket", "=/Users/S/x" + bracket, "=<path>?key=<path>]]"],
       ["backslash-drive value before a bracket", "=C:\\Users\\S\\x" + bracket, "=<path>?key=<path>]]"],
       ["UNC value before a bracket", "=\\\\srv\\share" + bracket, "=<path>?key=<path>]]"],
-      ["lowercase forward drive before a bracket", "=c:/Users/S/x" + bracket, "=c:<path>?key=<path>]]"],
       [
         "backslash value before a parenthesised bracket",
         "=\\Users\\S\\x([https://other?key=/home/C/s]",
@@ -6163,9 +6198,6 @@ describe("sanitizeError", () => {
       ],
       ["backslash value before another backslash value", "=\\Users\\S\\x&\\Users\\T\\y]", "=<path>&<path>]"],
       ["backslash value before a pipe private relative", "=\\Users\\S\\x|later/home/alice]", "=<path>|later<path>]"],
-      ["drive value before an ampersand private relative", "=C:/Users/S/x&later/home/alice]", "=C:<path>&later<path>]"],
-      ["drive value before a pipe private relative", "=C:/Users/S/x|later/home/alice]", "=C:<path>|later<path>]"],
-      ["drive value before a backslash value", "=C:/Users/S/x&\\Users\\T\\y]", "=C:<path>&<path>]"],
       ["plain value before a pipe backslash value", "=plain|\\Users\\T\\y]", "=plain|<path>]"],
       ["plain value before an ampersand backslash value", "=plain&\\Users\\T\\y]", "=plain&<path>]"],
       ["plain value before a pipe private relative", "=plain|later/home/alice]", "=plain|later<path>]"],
@@ -6379,6 +6411,95 @@ describe("sanitizeError", () => {
       const expected = redactedPrefix + "=<path>?key=<path>]]";
 
       assertPasses("[" + input + "][" + input + "]", "[" + expected + "][" + expected + "]");
+    });
+
+    it.each([
+      [
+        "uppercase drive query value",
+        "=\\Users\\S\\x[https://inner?key=C:/Users/K/x]]",
+        "=<path>?key=C:/Users/K/x]]",
+        "=<path>?key=C:<path>]]",
+      ],
+      [
+        "lowercase drive query value",
+        "=\\Users\\S\\x[https://inner?key=c:/Users/K/x]]",
+        "=<path>?key=c:/Users/K/x]]",
+        "=<path>?key=c:<path>]]",
+      ],
+      [
+        "second drive query value",
+        "=\\Users\\S\\x[https://inner?key=/Users/A/x&k2=D:/Users/B/y]]",
+        "=<path>?key=/Users/A/x&k2=D:/Users/B/y]]",
+        "=<path>?key=<path>&k2=D:<path>]]",
+      ],
+      [
+        "two drive query values",
+        "=\\Users\\S\\x[https://inner?key=C:/Users/K/x&k2=D:/Users/B/y]]",
+        "=<path>?key=C:/Users/K/x&k2=D:/Users/B/y]]",
+        "=<path>?key=C:<path>&k2=D:<path>]]",
+      ],
+      [
+        "drive after a public URL",
+        "=\\Users\\S\\x[https://inner?key=https://pub.test/x&k2=C:/Users/K/x]]",
+        "=<path>?key=https://pub.test/x&k2=C:/Users/K/x]]",
+        "=<path>?key=https://pub.test/x&k2=C:/Users/K/x]]",
+      ],
+      [
+        "drive inside a nested file child",
+        "=\\Users\\S\\x[file:///b&C:/Users/c]]",
+        "=<path>&C:/Users/c]]",
+        "=<path>&C:<path>]]",
+      ],
+      [
+        "bare drive value",
+        "=\\Users\\S\\x[https://inner?key=C:/]]",
+        "=<path>?key=C:/]]",
+        "=<path>?key=C:/]]",
+      ],
+      [
+        "doubled-slash drive value",
+        "=\\Users\\S\\x[https://inner?key=C://x]]",
+        "=<path>?key=C://x]]",
+        "=<path>?key=C://x]]",
+      ],
+      [
+        "compound drive value",
+        "=\\Users\\S\\x[https://inner?key=C:/C:/Users/K/x]]",
+        "=<path>?key=C:/C:/Users/K/x]]",
+        "=<path>?key=C:<path>:<path>]]",
+      ],
+      [
+        "file literal after a drive prefix",
+        "=\\Users\\S\\x[https://inner?key=C:/file:///Users/K/x]]",
+        "=<path>?key=C:/file://<path>]]",
+        "=<path>?key=C:<path><path>]]",
+      ],
+    ] as const)(
+      "keeps the base drive pass sequence for the %s",
+      (_name, suffix, firstSuffix, fixedSuffix) => {
+        assertPasses(
+          prefix + suffix,
+          redactedPrefix + firstSuffix,
+          redactedPrefix + fixedSuffix,
+          redactedPrefix + fixedSuffix,
+        );
+      },
+    );
+
+    it("keeps independent drive-query copies on their base pass sequence", () => {
+      const firstInput = prefix + "=\\Users\\S\\x[https://inner?key=C:/Users/K/x]]";
+      const secondInput = prefix + "=\\Users\\S\\x[https://inner?key=D:/Users/B/y]]";
+      const firstPass = redactedPrefix + "=<path>?key=C:/Users/K/x]]";
+      const secondPass = redactedPrefix + "=<path>?key=D:/Users/B/y]]";
+      const firstFixed = redactedPrefix + "=<path>?key=C:<path>]]";
+      const secondFixed = redactedPrefix + "=<path>?key=D:<path>]]";
+
+      assertPasses(
+        firstInput + " & " + secondInput,
+        firstPass + " & " + secondPass,
+        firstFixed + " & " + secondFixed,
+        firstFixed + " & " + secondFixed,
+      );
     });
   });
 
@@ -6750,6 +6871,73 @@ describe("sanitizeError", () => {
 
       assertPasses("[" + input + "][" + input + "]", "[" + expected + "][" + expected + "]");
     });
+
+    it.each([
+      [
+        "uppercase drive query value",
+        ",|\\Users\\S\\x[https://inner?key=C:/Users/K/x]]",
+        ",|\\Users\\S\\x[https://inner?key=C:/Users/K/x]]",
+        ",|<path>?key=C:/Users/K/x]]",
+        ",|<path>?key=C:<path>]]",
+      ],
+      [
+        "lowercase drive query value",
+        ",|later/home/S/x[https://inner?key=c:/Users/K/x]]",
+        ",|later/home/S/x[https://inner?key=c:/Users/K/x]]",
+        ",|later<path>?key=c:/Users/K/x]]",
+        ",|later<path>?key=c:<path>]]",
+      ],
+      [
+        "second drive query value",
+        ",|/Users/S/x[https://inner?key=/Users/A/x&k2=D:/Users/B/y]]",
+        ",|<path>?key=/Users/A/x&k2=D:/Users/B/y]]",
+        ",|<path>?key=<path>&k2=D:<path>]]",
+      ],
+      [
+        "drive after a public URL",
+        ",|\\Users\\S\\x[https://inner?key=https://pub.test/x&k2=C:/Users/K/x]]",
+        ",|\\Users\\S\\x[https://inner?key=https://pub.test/x&k2=C:/Users/K/x]]",
+        ",|<path>?key=https://pub.test/x&k2=C:/Users/K/x]]",
+        ",|<path>?key=https://pub.test/x&k2=C:/Users/K/x]]",
+      ],
+      [
+        "drive inside a nested file child",
+        ",|\\Users\\S\\x[file:///b&C:/Users/c]]",
+        ",|\\Users\\S\\x[file://<path>&C:/Users/c]]",
+        ",|<path><path>&C:<path>]]",
+      ],
+      [
+        "bare drive value",
+        ",|\\Users\\S\\x[https://inner?key=C:/]]",
+        ",|\\Users\\S\\x[https://inner?key=C:/]]",
+        ",|<path>?key=C:/]]",
+        ",|<path>?key=C:/]]",
+      ],
+      [
+        "doubled-slash drive value",
+        ",|\\Users\\S\\x[https://inner?key=C://x]]",
+        ",|\\Users\\S\\x[https://inner?key=C://x]]",
+        ",|<path>?key=C://x]]",
+        ",|<path>?key=C://x]]",
+      ],
+      [
+        "compound drive value",
+        ",|\\Users\\S\\x[https://inner?key=C:/C:/Users/K/x]]",
+        ",|\\Users\\S\\x[https://inner?key=C:/C:/Users/K/x]]",
+        ",|<path>?key=C:/C:/Users/K/x]]",
+        ",|<path>?key=C:<path>:<path>]]",
+      ],
+    ] as const)(
+      "redacts the origin but keeps the base drive pass sequence for the %s",
+      (_name, suffix, firstSuffix, secondSuffix, thirdSuffix = secondSuffix) => {
+        assertPasses(
+          prefix + suffix,
+          redactedPrefix + firstSuffix,
+          redactedPrefix + secondSuffix,
+          redactedPrefix + thirdSuffix,
+        );
+      },
+    );
   });
 
 

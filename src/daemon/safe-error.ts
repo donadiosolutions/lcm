@@ -218,6 +218,28 @@ function findUrlPathStarts(chars: readonly string[]): UrlPathStarts {
   };
   const isForwardSlashDrivePathStart = (start: number): boolean =>
     /^[A-Za-z]$/u.test(chars[start] ?? "") && chars[start + 1] === ":" && chars[start + 2] === "/";
+  const inheritedClaimContainsForwardSlashDrive = (
+    start: number,
+    ownerBracketDepth: number,
+  ): boolean => {
+    let depth = ownerBracketDepth;
+    for (let cursor = start; cursor < chars.length; cursor += 1) {
+      const char = chars[cursor]!;
+      if (WHITESPACE_PATTERN.test(char)) return false;
+      if (
+        isForwardSlashDrivePathStart(cursor) &&
+        !isPathWord(chars[cursor - 1])
+      ) {
+        return true;
+      }
+      if (char === "[") depth += 1;
+      else if (char === "]") {
+        depth -= 1;
+        if (depth < ownerBracketDepth) return false;
+      }
+    }
+    return false;
+  };
   const backslashSlashSuccessorPathStart = (start: number): number => {
     if (!isPathWord(chars[start])) return -1;
     let cursor = start;
@@ -429,20 +451,25 @@ function findUrlPathStarts(chars: readonly string[]): UrlPathStarts {
   let activeNestedFileSchemeStart = -1;
   const restoreInheritedQuoteHandoff = (
     successorStart: number,
-    forwardSlashDriveValue = false,
+    refusesForwardSlashDrive = false,
   ): void => {
+    if (
+      refusesForwardSlashDrive &&
+      inheritedClaimContainsForwardSlashDrive(
+        successorStart,
+        inheritedFileQuoteParentOwnerBracketDepth,
+      )
+    ) {
+      inheritedFileQuoteParentOwnerBracketDepth = 0;
+      inheritedFileQuoteEnd = -1;
+      return;
+    }
     pathlessFileQueryOwnerBracketDepth = inheritedFileQuoteParentOwnerBracketDepth;
     nestedFileUrlParentOwnerBracketDepths.add(inheritedFileQuoteParentOwnerBracketDepth);
     restartedNestedFileUrlParentOwnerBracketDepths.delete(inheritedFileQuoteParentOwnerBracketDepth);
     repeatedPipeHandoffWrapperDepths.add(inheritedFileQuoteParentOwnerBracketDepth);
     inheritedQuoteTailWrapperDepths.add(inheritedFileQuoteParentOwnerBracketDepth);
-    if (forwardSlashDriveValue) {
-      const pathStart = successorStart + 2;
-      forcedPath[pathStart] = 1;
-      armBracketTail(pathStart, successorStart, false, true, true);
-    } else {
-      armClaimedBracketTail(successorStart, true);
-    }
+    armClaimedBracketTail(successorStart, true);
     inheritedFileQuoteParentOwnerBracketDepth = 0;
     inheritedFileQuoteEnd = -1;
   };
@@ -531,7 +558,7 @@ function findUrlPathStarts(chars: readonly string[]): UrlPathStarts {
       } else {
         const continuationDelimiter = inheritedQuoteContinuationDelimiter(continuationStart);
         if (continuationDelimiter >= 0 && chars[continuationDelimiter + 1] !== "=") {
-          restoreInheritedQuoteHandoff(continuationDelimiter + 1);
+          restoreInheritedQuoteHandoff(continuationDelimiter + 1, true);
         } else if (valueStart > continuationStart) {
           const forwardSlashDriveValue = isForwardSlashDrivePathStart(valueStart);
           if (
@@ -540,7 +567,7 @@ function findUrlPathStarts(chars: readonly string[]): UrlPathStarts {
             isWindowsDrivePathStart(chars, valueStart) ||
             forwardSlashDriveValue
           ) {
-            restoreInheritedQuoteHandoff(valueStart, forwardSlashDriveValue);
+            restoreInheritedQuoteHandoff(valueStart, true);
           }
         }
       }
