@@ -1,0 +1,7 @@
+references: ["#1814"]
+rationale: >-
+  #1814 makes sanitizeError complete deeper colon and file URL literals inside
+  an admitted mixed-separator successor on the first pass while preserving
+  existing public URL, backslash-drive, and UNC boundaries.
+pins:
+  - ["src/daemon/safe-error.ts", "unit-daemon-core"]

@@ -210,9 +210,9 @@
     "name": "R2-6-file-owner",
     "input": "file://h?x=[file:///Users/CHILD/x&later\\/home/file:///Users/S/s([https://other?key=C:/Users/S2/x]",
     "requiredPasses": [
-      "file://h?x=[file://<path>&later\\<path>file://<path>?key=C:<path>]",
-      "file://h?x=[file://<path>&later\\<path>file://<path>?key=C:<path>]",
-      "file://h?x=[file://<path>&later\\<path>file://<path>?key=C:<path>]"
+      "file://h?x=[file://<path>&later\\<path><path>?key=C:<path>]",
+      "file://h?x=[file://<path>&later\\<path><path>?key=C:<path>]",
+      "file://h?x=[file://<path>&later\\<path><path>?key=C:<path>]"
     ]
   },
   {

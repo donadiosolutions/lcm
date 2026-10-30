@@ -702,14 +702,42 @@ bundle and keep provider, credential, quarantine, and recovery sessions private.
   backslash-only runs and runs without a following path word remain unchanged.
   When the text after that slash is a backslash-drive path such as
   `C:\Users\x`, the slash stays visible and redaction begins at the drive root.
-  A forward-slash drive such as `C:/Users/x` keeps its existing first-pass
-  boundary and converges under the established later-pass rules. An intervening
-  public-URL successor keeps a later mixed-separator successor on its existing
-  visibility boundary. Following bracketed text continues to use its existing
-  query and bracket redaction rules rather than inheriting new ownership from
-  this case.
-  If another successor intervenes before that bracket, the existing multi-pass
-  boundary is retained instead of claiming the mixed-separator successor early.
+  Within such an admitted successor, a later straight, word-bearing
+  single-slash colon form is completed on the same pass, including
+  drive-shaped, numeric, and named forms, so that `later\/home/XY:/Users/S/s`
+  becomes `later\<path>:<path>` at once. A later recognized `file://` literal
+  is completed as a separate redacted component only at a segment boundary,
+  with a non-empty rooted path, and when its complete continuation is
+  supported, so that `later\/home/file:///Users/S/s` becomes
+  `later\<path><path>`; uppercase schemes and plain named authorities follow the
+  same rule. Both completions require the nested `file://` literal that owns the
+  successor to have an empty or plain-host authority followed by a slash.
+  A completion only adds redaction inside the admitted component: every
+  claim, restart, and state reset of the established rules is unchanged, so
+  the text before and after a completed component, including every later
+  `&` or `|` successor, keeps exactly the pass sequence it already had unless
+  that successor is itself completed by the same rule. A later
+  mixed-separator successor that begins with a forward-slash drive or a file
+  literal is therefore still reached on the established later pass.
+  A quote, query or fragment after a file literal, unsupported punctuation, a
+  token ending in `file:/`, an empty, bare, drive-led, or authority-only file
+  literal, or an unsupported nested child keeps the established pass sequence.
+  Within one admitted component, a completed colon may also complete one
+  immediately following `[file:///` child whose values are ampersand-delimited
+  simple paths, drives, or words and whose close is the doubled `]]`; a child
+  with a query or fragment value, a bracketed continuation, or another close
+  keeps the established sequence. A complete simple direct or named drive
+  value such as `&name=C:/Users/a` may be completed with that component, but bare
+  drives, compound drive values, embedded file literals, and values with
+  unsupported suffixes keep the established sequence. A following flat HTTPS
+  bracket is completed only when its complete rooted or simple-drive value and
+  close are supported and the close is followed by `]`, whitespace, or the end
+  of the text; with a further `&` or `|` successor the component keeps the
+  established sequence. Single-slash `file:/` text, backslash-drive, and UNC
+  successors are unchanged. Valid public-URL authorities remain public,
+  including paths that contain private-looking segments. An intervening
+  public URL still keeps a later mixed-separator successor on its established
+  visibility boundary.
 
   When a matching quote closes a nested public URL inside a bracketed file
   query, an immediate `&` or `|` successor is redacted only when it begins with
