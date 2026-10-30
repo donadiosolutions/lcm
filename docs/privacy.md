@@ -715,9 +715,10 @@ bundle and keep provider, credential, quarantine, and recovery sessions private.
   A completion only adds redaction inside the admitted component: every
   claim, restart, and state reset of the established rules is unchanged, so
   the text before and after a completed component, including every later
-  `&` or `|` successor, keeps exactly the pass sequence it already had. A
-  later mixed-separator successor that begins with a forward-slash drive or a
-  file literal is therefore still reached on the established later pass.
+  `&` or `|` successor, keeps exactly the pass sequence it already had unless
+  that successor is itself completed by the same rule. A later
+  mixed-separator successor that begins with a forward-slash drive or a file
+  literal is therefore still reached on the established later pass.
   A quote, query or fragment after a file literal, unsupported punctuation, a
   token ending in `file:/`, an empty, bare, drive-led, or authority-only file
   literal, or an unsupported nested child keeps the established pass sequence.
@@ -728,7 +729,11 @@ bundle and keep provider, credential, quarantine, and recovery sessions private.
   keeps the established sequence. A complete simple direct or named drive
   value such as `&name=C:/Users/a` may be completed with that component, but bare
   drives, compound drive values, embedded file literals, and values with
-  unsupported suffixes keep the established sequence. 0 Single-slash `file:/` text, backslash-drive, and UNC
+  unsupported suffixes keep the established sequence. A following flat HTTPS
+  bracket is completed only when its complete rooted or simple-drive value and
+  close are supported and the close is followed by `]`, whitespace, or the end
+  of the text; with a further `&` or `|` successor the component keeps the
+  established sequence. Single-slash `file:/` text, backslash-drive, and UNC
   successors are unchanged. Valid public-URL authorities remain public,
   including paths that contain private-looking segments. An intervening
   public URL still keeps a later mixed-separator successor on its established
