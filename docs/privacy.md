@@ -709,12 +709,16 @@ bundle and keep provider, credential, quarantine, and recovery sessions private.
   decisions for one component are applied together. A quote, query or fragment
   after a file literal, unsupported punctuation, an empty or authority-only file
   literal, or an unsupported nested child keeps the established pass sequence.
-  After a private-root claim, a following mixed-separator successor may complete
-  a supported forward-slash drive, single-slash colon form, or exact `file:///`
-  literal; hosted file successors and authority-like `C://` text keep their
-  existing boundaries. A completed colon may also complete one immediately
-  following eligible file child, including its admitted drive values. Ambiguous
-  child-plus-successor and multi-hop copies keep their established behavior.
+  Later mixed-separator successors keep their established multi-pass sequence;
+  they are not pulled into an earlier private-root claim. Within one admitted
+  component, a completed colon may also complete one immediately following
+  eligible file child, including its admitted drive values. A complete simple
+  direct or named drive value such as `&name=C:/Users/a` may be completed with
+  that component, but bare drives, compound drive values, embedded file literals,
+  and values with unsupported suffixes keep the established sequence. A following
+  flat HTTPS bracket is completed only when its complete rooted or simple-drive
+  value and close are supported. Ambiguous child-plus-successor, adjacent-bracket,
+  and multi-hop copies keep their established behavior.
   Single-slash `file:/` text, backslash-drive, and UNC successors are unchanged.
   Valid public-URL authorities remain public, including paths that contain
   private-looking segments. An intervening public URL still keeps a later

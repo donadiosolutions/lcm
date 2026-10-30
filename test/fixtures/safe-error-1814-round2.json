@@ -30,7 +30,7 @@
     "id": "T4",
     "input": "file://h?x=[file:///Users/CHILD/x&later\\/home/a&later\\/C:/Users/x]",
     "required": [
-      "file://h?x=[file://<path>&later\\<path>&later\\<path>:<path>]",
+      "file://h?x=[file://<path>&later\\<path>&later\\/C:/Users/x]",
       "file://h?x=[file://<path>&later\\<path>&later\\<path>:<path>]",
       "file://h?x=[file://<path>&later\\<path>&later\\<path>:<path>]"
     ]
@@ -39,7 +39,7 @@
     "id": "T5",
     "input": "file://h?x=[file:///Users/CHILD/x&later\\/home/a&later\\/file:///Users/NEST/x]",
     "required": [
-      "file://h?x=[file://<path>&later\\<path>&later\\<path><path>]",
+      "file://h?x=[file://<path>&later\\<path>&later\\/file://<path>]",
       "file://h?x=[file://<path>&later\\<path>&later\\<path><path>]",
       "file://h?x=[file://<path>&later\\<path>&later\\<path><path>]"
     ]
@@ -267,6 +267,213 @@
       "file://h?x=[file://<path>&later\\<path>:/Users/S/s(x)[file://<path>&later<path>]]",
       "file://h?x=[file://<path>&later\\<path>:<path><path>&later<path>]]",
       "file://h?x=[file://<path>&later\\<path>:<path><path>&later<path>]]"
+    ]
+  },
+  {
+    "id": "X1",
+    "input": "file://h?x=[file:///Users/CHILD/x&later\\/home/a&later\\/C:/Users/S&later\\/home/file:///?k=C:/Users/ZQB/y]",
+    "required": [
+      "file://h?x=[file://<path>&later\\<path>&later\\/C:/Users/S&later\\/home/file:///?k=C:/Users/ZQB/y]",
+      "file://h?x=[file://<path>&later\\<path>&later\\<path>:<path>&later\\<path>?k=C:/Users/ZQB/y]",
+      "file://h?x=[file://<path>&later\\<path>&later\\<path>:<path>&later\\<path>?k=C:<path>]"
+    ]
+  },
+  {
+    "id": "X2",
+    "input": "file://h?x=[file:///Users/CHILD/x&later\\/home/a&later\\/C:/Users/S&later\\/home/file://host&C:/Users/ZQB/y]",
+    "required": [
+      "file://h?x=[file://<path>&later\\<path>&later\\/C:/Users/S&later\\/home/file://host&C:<path>]",
+      "file://h?x=[file://<path>&later\\<path>&later\\<path>:<path>&later\\<path>&C:<path>]",
+      "file://h?x=[file://<path>&later\\<path>&later\\<path>:<path>&later\\<path>&C:<path>]"
+    ]
+  },
+  {
+    "id": "X3",
+    "input": "file://h?x=[file:///Users/CHILD/x&later\\/home/a&later\\/C:/Users/S&later\\/home/file://]",
+    "required": [
+      "file://h?x=[file://<path>&later\\<path>&later\\/C:/Users/S&later\\/home/file://]",
+      "file://h?x=[file://<path>&later\\<path>&later\\<path>:<path>&later\\<path>]",
+      "file://h?x=[file://<path>&later\\<path>&later\\<path>:<path>&later\\<path>]"
+    ]
+  },
+  {
+    "id": "X4",
+    "input": "file://h?x=[file:///Users/CHILD/x&later\\/home/a&later\\/XY:/a&later\\/var/file://h:8/Users/ZQB]",
+    "required": [
+      "file://h?x=[file://<path>&later\\<path>&later\\/XY:/a&later\\/var/file://h:8<path>]",
+      "file://h?x=[file://<path>&later\\<path>&later\\<path>:<path>&later\\<path><path>]",
+      "file://h?x=[file://<path>&later\\<path>&later\\<path>:<path>&later\\<path><path>]"
+    ]
+  },
+  {
+    "id": "X5",
+    "input": "file://h?x=[file:///Users/CHILD/x&later\\/home/a&later\\/C:/Users/x&later\\/home/file:///Users/T?x=/Users/ZQB]",
+    "required": [
+      "file://h?x=[file://<path>&later\\<path>&later\\/C:/Users/x&later\\/home/file://<path>?x=<path>]",
+      "file://h?x=[file://<path>&later\\<path>&later\\<path>:<path>&later\\<path><path>?x=<path>]",
+      "file://h?x=[file://<path>&later\\<path>&later\\<path>:<path>&later\\<path><path>?x=<path>]"
+    ]
+  },
+  {
+    "id": "X6",
+    "input": "file://h?x=[file:///Users/CHILD/x&later\\/home/file:///Users/T/t&later\\/C:/Users/S&later\\/home/file://]",
+    "required": [
+      "file://h?x=[file://<path>&later\\<path><path>&later\\/C:/Users/S&later\\/home/file://]",
+      "file://h?x=[file://<path>&later\\<path><path>&later\\<path>:<path>&later\\<path>]",
+      "file://h?x=[file://<path>&later\\<path><path>&later\\<path>:<path>&later\\<path>]"
+    ]
+  },
+  {
+    "id": "Abr1",
+    "input": "file://h?x=[file:///Users/CHILD/x&later\\/home/XY:/Users/ZA/s([x][file://secretq/b&later/home/ZC]]",
+    "required": [
+      "file://h?x=[file://<path>&later\\<path>:/Users/ZA/s([x][file://secretq<path>&later<path>]]",
+      "file://h?x=[file://<path>&later\\<path>:<path><path>&later<path>]]",
+      "file://h?x=[file://<path>&later\\<path>:<path><path>&later<path>]]"
+    ]
+  },
+  {
+    "id": "Abr2",
+    "input": "file://h?x=[file:///Users/CHILD/x&later\\/home/XY:/Users/ZA/s([x][file:///b&C:/Users/ZC]]",
+    "required": [
+      "file://h?x=[file://<path>&later\\<path>:/Users/ZA/s([x][file://<path>&C:/Users/ZC]]",
+      "file://h?x=[file://<path>&later\\<path>:<path><path>&C:<path>]]",
+      "file://h?x=[file://<path>&later\\<path>:<path><path>&C:<path>]]"
+    ]
+  },
+  {
+    "id": "Ag1",
+    "input": "file://h?x=[file:///Users/CHILD/x&later\\/home/a&later\\/-file:///Users/ZA]",
+    "required": [
+      "file://h?x=[file://<path>&later\\<path>&later\\/-file://<path>]",
+      "file://h?x=[file://<path>&later\\<path>&later\\<path><path>]",
+      "file://h?x=[file://<path>&later\\<path>&later\\<path><path>]"
+    ]
+  },
+  {
+    "id": "Ag2",
+    "input": "file://h?x=[file:///Users/CHILD/x&later\\/home/a&later\\/-FILE:///Users/ZA]",
+    "required": [
+      "file://h?x=[file://<path>&later\\<path>&later\\/-FILE://<path>]",
+      "file://h?x=[file://<path>&later\\<path>&later\\<path><path>]",
+      "file://h?x=[file://<path>&later\\<path>&later\\<path><path>]"
+    ]
+  },
+  {
+    "id": "Ag3",
+    "input": "file://h?x=[file:///Users/CHILD/x&later\\/home/-file:///Users/ZA]",
+    "required": [
+      "file://h?x=[file://<path>&later\\<path>file://<path>]",
+      "file://h?x=[file://<path>&later\\<path>file://<path>]",
+      "file://h?x=[file://<path>&later\\<path>file://<path>]"
+    ]
+  },
+  {
+    "id": "Ag4",
+    "input": "file://h?x=[file:///Users/CHILD/x&later\\/home/a&later\\/-https://pub.test/x]",
+    "required": [
+      "file://h?x=[file://<path>&later\\<path>&later\\/-https://pub.test/x]",
+      "file://h?x=[file://<path>&later\\<path>&later\\<path>]",
+      "file://h?x=[file://<path>&later\\<path>&later\\<path>]"
+    ]
+  },
+  {
+    "id": "Y1",
+    "input": "file://h?x=[file:///Users/CHILD/x&later\\/home/XY:/Users/S/s&C:/x/file:///y]",
+    "required": [
+      "file://h?x=[file://<path>&later\\<path>:/Users/S/s&C:/x/file://<path>]",
+      "file://h?x=[file://<path>&later\\<path>:<path>&C:<path><path>]",
+      "file://h?x=[file://<path>&later\\<path>:<path>&C:<path><path>]"
+    ]
+  },
+  {
+    "id": "Y2",
+    "input": "file://h?x=[file:///Users/CHILD/x&later\\/home/XY:/Users/S/s&C:/x/file:///Users/ZQB/y]",
+    "required": [
+      "file://h?x=[file://<path>&later\\<path>:/Users/S/s&C:/x/file://<path>]",
+      "file://h?x=[file://<path>&later\\<path>:<path>&C:<path><path>]",
+      "file://h?x=[file://<path>&later\\<path>:<path>&C:<path><path>]"
+    ]
+  },
+  {
+    "id": "Y3",
+    "input": "file://h?x=[file:///Users/CHILD/x&later\\/home/XY:/Users/S/s&k=C:/x/file://host/Users/ZQB]",
+    "required": [
+      "file://h?x=[file://<path>&later\\<path>:/Users/S/s&k=C:/x/file://host<path>]",
+      "file://h?x=[file://<path>&later\\<path>:<path>&k=C:<path><path>]",
+      "file://h?x=[file://<path>&later\\<path>:<path>&k=C:<path><path>]"
+    ]
+  },
+  {
+    "id": "Z1",
+    "input": "file://h?x=[file:///Users/CHILD/x&later\\/home/file:///C:/Users/T]",
+    "required": [
+      "file://h?x=[file://<path>&later\\<path>file://<path>]",
+      "file://h?x=[file://<path>&later\\<path>file://<path>]",
+      "file://h?x=[file://<path>&later\\<path>file://<path>]"
+    ]
+  },
+  {
+    "id": "Z2",
+    "input": "file://h?x=[file:///Users/CHILD/x&later\\/home/XY:/Users/S/s&k2=c:/x:/y]",
+    "required": [
+      "file://h?x=[file://<path>&later\\<path>:/Users/S/s&k2=c:/x:/y]",
+      "file://h?x=[file://<path>&later\\<path>:<path>&k2=c:<path>:<path>]",
+      "file://h?x=[file://<path>&later\\<path>:<path>&k2=c:<path>:<path>]"
+    ]
+  },
+  {
+    "id": "Z3",
+    "input": "file://h?x=[file:///Users/CHILD/x&later\\/var/C:/Users/S [/Users/K]]",
+    "required": [
+      "file://h?x=[file://<path>&later\\<path>:/Users/S [<path>]]",
+      "file://h?x=[file://<path>&later\\<path>:<path><path>]]",
+      "file://h?x=[file://<path>&later\\<path>:<path><path>]]"
+    ]
+  },
+  {
+    "id": "Z4",
+    "input": "file://h?x=[file:///Users/CHILD/x&a\\/ab/XY:/Users/S x[C:\\Users\\K]]",
+    "required": [
+      "file://h?x=[file://<path>&a\\<path>:/Users/S x[<path>]]",
+      "file://h?x=[file://<path>&a\\<path>:<path><path>]]",
+      "file://h?x=[file://<path>&a\\<path>:<path><path>]]"
+    ]
+  },
+  {
+    "id": "Z5",
+    "input": "file://h?x=[file:///Users/CHILD/x&later\\/home/XY:/Users/S/s&k=C:/x:/Users/ZQB]",
+    "required": [
+      "file://h?x=[file://<path>&later\\<path>:/Users/S/s&k=C:/x:/Users/ZQB]",
+      "file://h?x=[file://<path>&later\\<path>:<path>&k=C:<path>:<path>]",
+      "file://h?x=[file://<path>&later\\<path>:<path>&k=C:<path>:<path>]"
+    ]
+  },
+  {
+    "id": "R26-colon-drive",
+    "input": "file://h?x=[file:///Users/CHILD/x&later\\/home/XY:/Users/S/s([https://other?key=C:/Users/K/x]",
+    "required": [
+      "file://h?x=[file://<path>&later\\<path>:<path>?key=C:<path>]",
+      "file://h?x=[file://<path>&later\\<path>:<path>?key=C:<path>]",
+      "file://h?x=[file://<path>&later\\<path>:<path>?key=C:<path>]"
+    ]
+  },
+  {
+    "id": "R26-colon-deep-drive",
+    "input": "file://h?x=[file:///Users/CHILD/x&later\\/home/a/XY:/Users/S/s([https://other?key=C:/Users/SECRET2/x]",
+    "required": [
+      "file://h?x=[file://<path>&later\\<path>:<path>?key=C:<path>]",
+      "file://h?x=[file://<path>&later\\<path>:<path>?key=C:<path>]",
+      "file://h?x=[file://<path>&later\\<path>:<path>?key=C:<path>]"
+    ]
+  },
+  {
+    "id": "plan-colon-root",
+    "input": "file://h?x=[file:///Users/CHILD/x&later\\/home/a/XY:/Users/S/s([https://other?key=/Users/SECRET2/x]",
+    "required": [
+      "file://h?x=[file://<path>&later\\<path>:<path>?key=<path>]",
+      "file://h?x=[file://<path>&later\\<path>:<path>?key=<path>]",
+      "file://h?x=[file://<path>&later\\<path>:<path>?key=<path>]"
     ]
   }
 ]

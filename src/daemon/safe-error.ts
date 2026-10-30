@@ -362,6 +362,45 @@ function findUrlPathStarts(chars: readonly string[]): UrlPathStarts {
     nestedStops: Array<readonly [index: number, marker: 1 | 2]>;
     claimedFileStarts: number[];
   };
+  const fileLiteralPathStartsDrive = (start: number): boolean => {
+    let cursor = start + FILE_SCHEME.length + 3;
+    if (chars[cursor] !== "/") {
+      while (isContinuationHostCharacter(chars[cursor])) cursor += 1;
+    }
+    cursor += 1;
+    return (
+      /^[A-Za-z]$/u.test(chars[cursor]!) &&
+      chars[cursor + 1] === ":" &&
+      chars[cursor + 2] === "/"
+    );
+  };
+  const barrierFileCompletionPlan = (pathStart: number): MixedCompletionPlan | undefined => {
+    let cursor = pathStart + 1;
+    let segmentStart = true;
+    while (isPathWord(chars[cursor]) || chars[cursor] === "/") {
+      if (segmentStart && isFileUrlLiteral(chars, cursor)) {
+        const fileEnd = fileLiteralPathEnd(cursor);
+        if (fileEnd < 0 || fileLiteralPathStartsDrive(cursor)) return undefined;
+        const forcedStarts = [cursor];
+        if (chars[fileEnd] === "?" || chars[fileEnd] === "#") {
+          let valueStart = fileEnd + 1;
+          while (isPathWord(chars[valueStart])) valueStart += 1;
+          if (chars[valueStart] === "=") valueStart += 1;
+          if (chars[valueStart] === "/" && simpleRootedPathEnd(valueStart) >= 0) {
+            forcedStarts.push(valueStart);
+          }
+        }
+        return {
+          forcedStarts,
+          nestedStops: [[cursor, 2]],
+          claimedFileStarts: [cursor],
+        };
+      }
+      segmentStart = chars[cursor] === "/";
+      cursor += 1;
+    }
+    return undefined;
+  };
   const fileLiteralPathEnd = (start: number): number => {
     let cursor = start + FILE_SCHEME.length + 3;
     if (chars[cursor] !== "/") {
@@ -371,6 +410,59 @@ function findUrlPathStarts(chars: readonly string[]): UrlPathStarts {
     }
     cursor += 1;
     return isPathWord(chars[cursor]) ? simplePathEnd(cursor) : -1;
+  };
+  const hasUnsupportedFileLiteralAfter = (start: number): boolean => {
+    for (let cursor = start; cursor < chars.length; cursor += 1) {
+      if (WHITESPACE_PATTERN.test(chars[cursor])) return false;
+      if (isFileUrlLiteral(chars, cursor) && fileLiteralPathEnd(cursor) < 0) return true;
+    }
+    return false;
+  };
+  const isMixedCompletionBoundary = (index: number): boolean => {
+    const char = chars[index];
+    return (
+      char === undefined ||
+      char === "&" ||
+      char === "|" ||
+      char === "]" ||
+      char === " " ||
+      char === "\t" ||
+      char === "\n" ||
+      char === "\r"
+    );
+  };
+  const mixedCompletionPublicBracketEnd = (openIndex: number): number => {
+    const headerStart = openIndex + 1;
+    if (!isHttpsUrlLiteral(headerStart)) return -1;
+    let cursor = continuationAuthorityEnd(headerStart + 8);
+    if (cursor < 0) return -1;
+    if (chars[cursor] === "/") {
+      cursor = simpleRootedPathEnd(cursor);
+      if (cursor < 0) return -1;
+    }
+    let sawValue = false;
+    while (chars[cursor] !== "]") {
+      if (chars[cursor] !== "?" && chars[cursor] !== "#" && chars[cursor] !== "&") return -1;
+      cursor += 1;
+      const valueOrNameStart = cursor;
+      while (isPathWord(chars[cursor])) cursor += 1;
+      if (chars[cursor] === "=") {
+        if (cursor === valueOrNameStart) return -1;
+        cursor += 1;
+      } else {
+        cursor = valueOrNameStart;
+      }
+      let valueEnd = -1;
+      if (isForwardSlashDrivePathStart(cursor)) {
+        valueEnd = simpleDrivePathEnd(cursor);
+      } else if (chars[cursor] === "/") {
+        valueEnd = simpleRootedPathEnd(cursor);
+      }
+      if (valueEnd < 0 || (chars[valueEnd] !== "&" && chars[valueEnd] !== "]")) return -1;
+      sawValue = true;
+      cursor = valueEnd;
+    }
+    return sawValue && isMixedCompletionBoundary(cursor + 1) ? cursor + 1 : -1;
   };
   const analyzeMixedCompletion = (
     pathStart: number,
@@ -410,15 +502,16 @@ function findUrlPathStarts(chars: readonly string[]): UrlPathStarts {
         continue;
       }
       if (char === ":" && chars[cursor + 1] === "/") {
-        let schemeStart = cursor;
-        while (schemeStart > pathStart && URL_SCHEME_CHARACTER_PATTERN.test(chars[schemeStart - 1])) {
-          schemeStart -= 1;
-        }
-        const scheme = chars.slice(schemeStart, cursor).join("");
+        if (sawFile) return null;
+        let tokenStart = cursor;
+        while (tokenStart > pathStart && isPathWord(chars[tokenStart - 1])) tokenStart -= 1;
+        const scheme = chars.slice(tokenStart, cursor).join("");
+        if (!/^[A-Za-z\d]+$/u.test(scheme)) return null;
         const validAuthorityScheme =
           URL_SCHEME_START_PATTERN.test(scheme.charAt(0)) &&
           [...scheme].every((schemeChar) => URL_SCHEME_CHARACTER_PATTERN.test(schemeChar));
-        if (chars[cursor + 2] === "/" && validAuthorityScheme) return null;
+        const numericDoubleSlash = /^\d+$/u.test(scheme);
+        if (chars[cursor + 2] === "/" && !numericDoubleSlash) return null;
         if (scheme.toLowerCase() === FILE_SCHEME) return null;
         const rootedStart = skipSeparatorRun(cursor + 1);
         if (!isPathWord(chars[rootedStart])) return null;
@@ -457,39 +550,18 @@ function findUrlPathStarts(chars: readonly string[]): UrlPathStarts {
             }
             valueCursor += 1;
           }
-          return chars[valueCursor + 1] === "]" ? plan : null;
+          return chars[valueCursor + 1] === "]" && isMixedCompletionBoundary(valueCursor + 2)
+            ? plan
+            : null;
         }
         if (sawCompletion && isFileUrlLiteral(chars, fileStart)) return null;
-        if (sawCompletion && startsUrlSchemeLiteral(chars, fileStart)) return plan;
-        let bracketCursor = cursor + 1;
-        let depth = 1;
-        while (bracketCursor < chars.length && depth > 0) {
-          if (chars[bracketCursor] === "[") depth += 1;
-          else if (chars[bracketCursor] === "]") depth -= 1;
-          bracketCursor += 1;
-        }
-        if (
-          depth === 0 &&
-          chars[bracketCursor] === "[" &&
-          isFileUrlLiteral(chars, bracketCursor + 1)
-        ) {
-          return null;
-        }
-        if (
-          depth === 0 &&
-          chars[bracketCursor] !== undefined &&
-          chars[bracketCursor] !== "&" &&
-          chars[bracketCursor] !== "|" &&
-          chars[bracketCursor] !== "]" &&
-          !WHITESPACE_PATTERN.test(chars[bracketCursor])
-        ) {
-          return null;
-        }
+        if (sawCompletion && mixedCompletionPublicBracketEnd(cursor) >= 0) return plan;
         return sawCompletion ? null : undefined;
       }
       if (char === "(" && chars[cursor + 1] === "[") {
         if (isFileUrlLiteral(chars, cursor + 2)) return null;
-        return sawCompletion ? plan : undefined;
+        if (!sawCompletion) return undefined;
+        return mixedCompletionPublicBracketEnd(cursor + 1) >= 0 ? plan : null;
       }
       if (char === "&" || char === "|") {
         if (
@@ -510,15 +582,16 @@ function findUrlPathStarts(chars: readonly string[]): UrlPathStarts {
           }
           if (isForwardSlashDrivePathStart(valueStart)) {
             const driveEnd = simpleDrivePathEnd(valueStart);
-            if (driveEnd < 0) return null;
+            if (driveEnd < 0 || !isMixedCompletionBoundary(driveEnd)) return null;
             plan.forcedStarts.push(valueStart + 2);
           }
         }
         return sawCompletion ? plan : undefined;
       }
-      if (char === "]" || WHITESPACE_PATTERN.test(char)) {
+      if (char === "]" || char === " " || char === "\t" || char === "\n" || char === "\r") {
         return sawCompletion ? plan : undefined;
       }
+      if (WHITESPACE_PATTERN.test(char)) return null;
       if ((char === "?" || char === "#") && sawCompletion && !sawFile) {
         return plan;
       }
@@ -568,24 +641,29 @@ function findUrlPathStarts(chars: readonly string[]): UrlPathStarts {
     }
     return firstSlash >= 0 && isPathWord(chars[cursor]) ? firstSlash : -1;
   };
-  const familyBCompletionPathStart = (start: number): number => {
+  const mixedSuccessorHasFileLiteral = (start: number): boolean => {
+    let cursor = start;
+    while (
+      chars[cursor] !== undefined &&
+      chars[cursor] !== "&" &&
+      chars[cursor] !== "|" &&
+      chars[cursor] !== "]" &&
+      !WHITESPACE_PATTERN.test(chars[cursor])
+    ) {
+      if (isFileUrlLiteral(chars, cursor)) return true;
+      cursor += 1;
+    }
+    return false;
+  };
+  const mixedSeparatorPathStart = (start: number): number => {
     if (!isPathWord(chars[start])) return -1;
     let cursor = start;
     while (isPathWord(chars[cursor])) cursor += 1;
     if (chars[cursor] !== "\\") return -1;
-    let firstSlash = -1;
     while (chars[cursor] === "/" || chars[cursor] === "\\") {
-      if (firstSlash < 0 && chars[cursor] === "/") firstSlash = cursor;
+      if (chars[cursor] === "/") return cursor;
       cursor += 1;
     }
-    if (firstSlash < 0) return -1;
-    if (isForwardSlashDrivePathStart(cursor)) return firstSlash;
-    if (isFileUrlLiteral(chars, cursor)) {
-      return chars[cursor + FILE_SCHEME.length + 3] === "/" ? firstSlash : -1;
-    }
-    let colonCursor = cursor;
-    while (isPathWord(chars[colonCursor])) colonCursor += 1;
-    if (chars[colonCursor] === ":" && chars[colonCursor + 1] === "/") return firstSlash;
     return -1;
   };
   const immediateBackslashSlashSuccessorStartsPrivateRoot = (start: number): boolean => {
@@ -791,8 +869,8 @@ function findUrlPathStarts(chars: readonly string[]): UrlPathStarts {
   let quotedQueryPublicUrl = false;
   let quotedQueryPublicUrlOwnQueryOrFragment = false;
   let backslashSlashClaimActive = false;
-  let backslashSlashPrivateRootClaimActive = false;
-  let familyBCompletionBlocked = false;
+  let mixedCompletionApplied = false;
+  let mixedCompletionBarrier = false;
   let activeNestedFileSchemeStart = -1;
 
   for (let index = 0; index < chars.length; index += 1) {
@@ -864,8 +942,8 @@ function findUrlPathStarts(chars: readonly string[]): UrlPathStarts {
         }
       }
       backslashSlashClaimActive = false;
-      backslashSlashPrivateRootClaimActive = false;
-      familyBCompletionBlocked = false;
+      mixedCompletionApplied = false;
+      mixedCompletionBarrier = false;
       activeNestedFileSchemeStart = -1;
       siblingWrapperStart = -1;
       siblingWrapperOwnerBracketDepth = 0;
@@ -1335,8 +1413,8 @@ function findUrlPathStarts(chars: readonly string[]): UrlPathStarts {
       quotedQueryPublicUrl = false;
       quotedQueryPublicUrlOwnQueryOrFragment = false;
       backslashSlashClaimActive = false;
-      backslashSlashPrivateRootClaimActive = false;
-      familyBCompletionBlocked = false;
+      mixedCompletionApplied = false;
+      mixedCompletionBarrier = false;
       schemeLength = 0;
       fileSchemeLength = 0;
       schemeQuote = directNestedFileQuote || inheritedNestedFileQuote;
@@ -1354,13 +1432,6 @@ function findUrlPathStarts(chars: readonly string[]): UrlPathStarts {
     ) {
       forcedPath[index] = 1;
       continue;
-    }
-    if (
-      (char === "&" || char === "|") &&
-      startsUrlSchemeLiteral(chars, index + 1) &&
-      !isFileUrlLiteral(chars, index + 1)
-    ) {
-      familyBCompletionBlocked = true;
     }
     const considersBackslashSlashSuccessor: boolean =
       exactFileScheme &&
@@ -1381,32 +1452,67 @@ function findUrlPathStarts(chars: readonly string[]): UrlPathStarts {
       : -1;
     let activeBackslashSlashCompletion: MixedCompletionPlan | null | undefined;
     let activeBackslashSlashDrivePrefix: OwnedBracketDrivePrefix = "nested-file";
+    const hadMixedCompletionBarrier = mixedCompletionBarrier;
+    const currentMixedPathStart = considersBackslashSlashSuccessor
+      ? mixedSeparatorPathStart(index + 1)
+      : -1;
+    if (
+      mixedCompletionApplied &&
+      activeBackslashSlashPathStart < 0 &&
+      currentMixedPathStart >= 0 &&
+      mixedSuccessorHasFileLiteral(index + 1)
+    ) {
+      const barrierPlan =
+        barrierFileCompletionPlan(currentMixedPathStart);
+      if (barrierPlan !== undefined) {
+        activeBackslashSlashPathStart = currentMixedPathStart;
+        activeBackslashSlashCompletion = barrierPlan;
+      }
+    }
     if (activeBackslashSlashPathStart >= 0) {
       activeBackslashSlashDrivePrefix = immediateBackslashSlashSuccessorStartsPrivateRoot(index + 1)
         ? "all"
         : "nested-file";
-      activeBackslashSlashCompletion = familyBCompletionBlocked
-        ? undefined
+      if (
+        mixedCompletionApplied &&
+        mixedSuccessorHasFileLiteral(index + 1) &&
+        activeBackslashSlashCompletion === undefined
+      ) {
+        activeBackslashSlashCompletion = barrierFileCompletionPlan(activeBackslashSlashPathStart);
+      }
+      activeBackslashSlashCompletion ??= hadMixedCompletionBarrier
+        ? barrierFileCompletionPlan(activeBackslashSlashPathStart)
         : analyzeMixedCompletion(
             activeBackslashSlashPathStart,
             activeBackslashSlashDrivePrefix,
           );
-    } else if (
-      considersBackslashSlashSuccessor &&
-      backslashSlashPrivateRootClaimActive &&
-      !familyBCompletionBlocked
-    ) {
-      const familyBPathStart = familyBCompletionPathStart(index + 1);
-      if (familyBPathStart >= 0) {
-        const familyBPlan = analyzeMixedCompletion(familyBPathStart, "all");
-        if (familyBPlan !== null && familyBPlan !== undefined) {
-          activeBackslashSlashPathStart = familyBPathStart;
-          activeBackslashSlashCompletion = familyBPlan;
-          activeBackslashSlashDrivePrefix = "all";
-        }
-      }
     }
     if (
+      activeBackslashSlashCompletion !== null &&
+      activeBackslashSlashCompletion !== undefined &&
+      isHttpsUrlLiteral(0) &&
+      hasUnsupportedFileLiteralAfter(index + 1)
+    ) {
+      activeBackslashSlashCompletion = null;
+    }
+    if (
+      considersBackslashSlashSuccessor &&
+      mixedCompletionApplied &&
+      activeBackslashSlashPathStart < 0 &&
+      currentMixedPathStart >= 0
+    ) {
+      mixedCompletionBarrier = true;
+    }
+    const openedMixedCompletionBarrier = !hadMixedCompletionBarrier && mixedCompletionBarrier;
+    const blocksMixedSuccessor =
+      openedMixedCompletionBarrier ||
+      (hadMixedCompletionBarrier &&
+      isFileUrlLiteral(chars, 0) &&
+      currentMixedPathStart >= 0 &&
+      mixedSuccessorHasFileLiteral(index + 1) &&
+      activeBackslashSlashCompletion === undefined);
+    if (
+      !blocksMixedSuccessor &&
       (activeNestedFileUrlParentOwnerBracketDepth > 0 || activeBackslashSlashPathStart >= 0) &&
       exactFileScheme &&
       foundFilePath &&
@@ -1469,6 +1575,7 @@ function findUrlPathStarts(chars: readonly string[]): UrlPathStarts {
         forcedPath[backslashSlashPathStart] = 1;
         if (activeBackslashSlashCompletion !== null && activeBackslashSlashCompletion !== undefined) {
           applyMixedCompletion(activeBackslashSlashCompletion);
+          mixedCompletionApplied = true;
         }
       }
       const keepsClaimAcrossOrdinaryRelative: boolean =
@@ -1479,11 +1586,8 @@ function findUrlPathStarts(chars: readonly string[]): UrlPathStarts {
       backslashSlashClaimActive =
         backslashSlashPathStart >= 0 ||
         keepsClaimAcrossOrdinaryRelative;
-      backslashSlashPrivateRootClaimActive =
-        backslashSlashPathStart >= 0 &&
-        immediateBackslashSlashSuccessorStartsPrivateRoot(index + 1);
-      if (activeBackslashSlashCompletion === null) {
-        familyBCompletionBlocked = true;
+      if (activeBackslashSlashCompletion === null && mixedCompletionApplied) {
+        mixedCompletionBarrier = true;
       }
       if (returnsToParent) {
         separator = -1;
@@ -1498,6 +1602,7 @@ function findUrlPathStarts(chars: readonly string[]): UrlPathStarts {
       }
     }
     if (
+      !blocksMixedSuccessor &&
       nestedFileUrlParentOwnerBracketDepths.size > 0 &&
       !exactFileScheme &&
       separator < 0 &&
@@ -1565,7 +1670,6 @@ function findUrlPathStarts(chars: readonly string[]): UrlPathStarts {
         }
       }
       backslashSlashClaimActive = false;
-      backslashSlashPrivateRootClaimActive = false;
     }
     if (restartedPathlessFile && char === "[") {
       restartedPathlessBrackets += 1;
