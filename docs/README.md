@@ -73,7 +73,7 @@ operations. They are not required for normal LCM use.
   and Codex Security alerts, group shared causes, and verify remediation privately.
 - [External admission recovery](external-admission.md) — recover delayed
   protected-branch admission without bypassing exact-head policy.
-- [Stable and beta releases](releasing.md) — prepare versions and recover
+- [Stable, alpha, and beta releases](releasing.md) — prepare versions and recover
   immutable release publication safely.
 
 ### PostgreSQL implementation references

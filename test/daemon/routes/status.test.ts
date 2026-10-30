@@ -1,4 +1,4 @@
-import { mkdtempSync, rmSync, writeFileSync, mkdirSync } from "node:fs";
+import { mkdtempSync, readFileSync, rmSync, writeFileSync, mkdirSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join, dirname } from "node:path";
 import { afterEach, describe, expect, it, beforeEach } from "vitest";
@@ -12,6 +12,11 @@ import { PromotedStore } from "../../../src/db/promoted.js";
 import { projectDbPath, projectMetaPath, ensureProjectDir } from "../../../src/daemon/project.js";
 
 const tempDirs: string[] = [];
+const packageVersion = (
+  JSON.parse(readFileSync(new URL("../../../package.json", import.meta.url), "utf8")) as {
+    version: string;
+  }
+).version;
 
 afterEach(async () => {
   for (const dir of tempDirs.splice(0)) {
@@ -159,8 +164,7 @@ describe("POST /status", () => {
     expect(res.status).toBe(200);
     const data = (await res.json()) as any;
 
-    // Check version format (e.g., "0.1.0" or "0.0.0")
-    expect(data.daemon.version).toMatch(/^\d+\.\d+\.\d+$/);
+    expect(data.daemon.version).toBe(packageVersion);
 
     // Check uptime is a non-negative number in seconds
     expect(typeof data.daemon.uptime).toBe("number");

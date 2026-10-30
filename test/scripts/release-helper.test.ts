@@ -306,7 +306,7 @@ exit 0
         FAKE_REAL_SLEEP: String(options.realSleep ?? false),
         FAKE_RELEASE_DRAFT: String(options.releaseDraft ?? true),
         FAKE_RELEASE_PRERELEASE: String(
-          options.releasePrerelease ?? releaseVersion.includes("-beta."),
+          options.releasePrerelease ?? (releaseVersion.includes("-alpha.") || releaseVersion.includes("-beta.")),
         ),
         FAKE_RELEASE_TAG: options.releaseTag ?? releaseTag,
         FAKE_REPO_ROOT: root,
@@ -377,8 +377,8 @@ describe("manual release helper step 8", () => {
     expect(runListCall).not.toContain("|--branch|main|");
   });
 
-  it("accepts beta versions and verifies a draft GitHub prerelease", () => {
-    const betaVersion = "10.0.0-beta.0";
+  it("accepts alpha versions and verifies a draft GitHub prerelease", () => {
+    const betaVersion = "10.0.0-alpha.0";
     const betaTag = `v${betaVersion}`;
     const result = runRelease({ version: betaVersion });
 
@@ -389,16 +389,16 @@ describe("manual release helper step 8", () => {
 
   it.each([
     {
-      releaseVersion: "10.0.0-beta.0",
-      distTags: '{"latest":"9.9.9","beta":"10.0.0-beta.1"}',
+      releaseVersion: "10.0.0-alpha.0",
+      distTags: '{"latest":"9.9.9","alpha":"10.0.0-alpha.1"}',
     },
     {
       releaseVersion: "9.9.9",
       distTags: '{"latest":"10.0.0"}',
     },
     {
-      releaseVersion: "9.9.9-beta.0",
-      distTags: '{"latest":"9.9.9","beta":"9.9.8-beta.1"}',
+      releaseVersion: "9.9.9-alpha.0",
+      distTags: '{"latest":"9.9.9","alpha":"9.9.8-alpha.1"}',
     },
   ])(
     "rejects stale npm channel ordering before repository mutation for $releaseVersion",
@@ -668,7 +668,7 @@ describe("manual release helper step 8", () => {
     expect(result.stderr).toContain(`not found after 2s`);
   });
 
-  it.each(["1.2.3-alpha.1", "1.2.3-rc.1", "1.2.3+build.1"])(
+  it.each(["1.2.3-custom.1", "1.2.3-rc.1", "1.2.3+build.1"])(
     "rejects unsupported release version %s before repository access",
     (releaseVersion: string) => {
       const result = runRelease({ version: releaseVersion });
@@ -728,9 +728,9 @@ describe("manual release helper step 8", () => {
     expect(result.stderr).toContain(`GitHub release ${tag} is not a draft`);
   });
 
-  it("fails when the GitHub prerelease flag does not match the beta version", () => {
+  it("fails when the GitHub prerelease flag does not match the alpha version", () => {
     const result = runRelease({
-      version: "10.0.0-beta.0",
+      version: "10.0.0-alpha.0",
       releasePrerelease: false,
     });
 
@@ -748,7 +748,7 @@ describe("manual release helper step 8", () => {
 
 
 describe("manual release helper versioning and staging", () => {
-  it.each(["9.9.9", "10.0.0-beta.0"])("writes %s with Node and stages only versioned release files", (releaseVersion) => {
+  it.each(["9.9.9", "10.0.0-alpha.0"])("writes %s with Node and stages only versioned release files", (releaseVersion) => {
     const result = runRelease({ fromStep: 3, version: releaseVersion });
     expect(result.status).toBe(71); // Deliberate stop in the fake push tool.
     expect(result.stderr).toBe("");

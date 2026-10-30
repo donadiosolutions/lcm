@@ -7,6 +7,7 @@
  */
 
 import { beforeAll, afterAll, describe, expect, it } from "vitest";
+import { readFileSync } from "node:fs";
 import { createHarness, openProjectDb, type HarnessHandle } from "../harness.js";
 import { DaemonClient } from "../../../src/daemon/client.js";
 
@@ -15,6 +16,11 @@ let handle: HarnessHandle | null = null;
 // A real-looking OpenAI API key with 20+ alphanumeric chars after "sk-"
 // (no hyphens so it matches the built-in pattern: sk-[A-Za-z0-9]{20,})
 const FAKE_API_KEY = "sk-abcdefghijklmnopqrstuvwxyz1234567890";
+const packageVersion = (
+  JSON.parse(readFileSync(new URL("../../../package.json", import.meta.url), "utf8")) as {
+    version: string;
+  }
+).version;
 
 beforeAll(async () => {
   handle = await createHarness("mock");
@@ -110,6 +116,6 @@ describe("Flow 19: Status", { timeout: 60_000 }, () => {
 
     expect(result.project.messageCount).toBeGreaterThan(0);
     expect(result.daemon.version).toBeTruthy();
-    expect(result.daemon.version).toMatch(/^\d+\.\d+\.\d+$/);
+    expect(result.daemon.version).toBe(packageVersion);
   });
 });

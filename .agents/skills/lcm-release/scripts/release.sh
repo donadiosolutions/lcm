@@ -60,9 +60,9 @@ if [[ -z "$VERSION" ]]; then
 fi
 
 # Validate version is semver (fail fast, also guards node interpolation)
-SEMVER_REGEX='^(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)(-beta\.(0|[1-9][0-9]*))?$'
+SEMVER_REGEX='^(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)(-(alpha|beta)\.(0|[1-9][0-9]*))?$'
 if ! [[ "$VERSION" =~ $SEMVER_REGEX ]]; then
-  echo "Invalid version '$VERSION'. Expected a stable version like '0.4.2' or beta like '0.5.0-beta.0'; other prerelease and build metadata versions are not supported."
+  echo "Invalid version '$VERSION'. Expected a stable version like '0.4.2' or alpha/beta like '0.5.0-alpha.0'; other prerelease and build metadata versions are not supported."
   echo "Usage: $0 <version> [--from-step N]"
   exit 1
 fi
@@ -165,7 +165,7 @@ if [[ "${#ORIGIN_PUSH_URLS[@]}" -ne 1 ]] || ! is_canonical_origin "${ORIGIN_PUSH
   err "origin must have exactly one canonical push URL for $REPO (got: $ORIGIN_PUSH_URL_DISPLAY)."
 fi
 
-# Fail stale stable/beta releases before pulling, branching, committing, or tagging.
+# Fail stale stable/prerelease releases before pulling, branching, committing, or tagging.
 NPM_GUARD_OUTPUT=""
 if ! NPM_GUARD_OUTPUT=$(node .github/scripts/check-npm-release-state.mjs "$VERSION" 2>&1); then
   err "npm release ordering rejects $VERSION; no repository or tag mutation was attempted."
@@ -553,7 +553,7 @@ if run_step 8; then
   [[ "$RELEASE_IS_DRAFT" == "true" ]] || \
     err "GitHub release $TAG is not a draft; npm publication must require a manual draft-to-final transition."
   EXPECTED_PRERELEASE="false"
-  [[ "$VERSION" == *-beta.* ]] && EXPECTED_PRERELEASE="true"
+  [[ "$VERSION" == *-alpha.* || "$VERSION" == *-beta.* ]] && EXPECTED_PRERELEASE="true"
   [[ "$RELEASE_IS_PRERELEASE" == "$EXPECTED_PRERELEASE" ]] || \
     err "GitHub release $TAG prerelease flag is $RELEASE_IS_PRERELEASE, expected $EXPECTED_PRERELEASE."
   [[ "$RELEASE_TAG_NAME" == "$TAG" ]] || \

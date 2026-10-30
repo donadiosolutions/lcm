@@ -37,8 +37,11 @@ jobs:
         with:
           script: |
             const tag = process.env.RELEASE_TAG;
-            const match = /^v(0|[1-9]\d*)\.(0|[1-9]\d*)\.(0|[1-9]\d*)(?:-beta\.(0|[1-9]\d*))?$/.exec(tag);
+            const match = /^v(0|[1-9]\d*)\.(0|[1-9]\d*)\.(0|[1-9]\d*)(?:-(?:alpha|beta)\.(0|[1-9]\d*))?$/.exec(tag);
             if (!match) throw new Error(`Unsupported release tag ${tag}`);
+            if (![match[1], match[2], match[3], match[4]].filter(Boolean).every((part) => Number.isSafeInteger(Number(part)))) {
+              throw new Error(`Release tag ${tag} contains an unsafe numeric component`);
+            }
             const expectedRef = `refs/tags/${tag}`;
             const { data: ref } = await github.rest.git.getRef({
               ...context.repo,
@@ -95,8 +98,8 @@ jobs:
 
           version="$(node -p "JSON.parse(require('node:fs').readFileSync('package.json', 'utf8')).version")"
 
-          if [[ ! "$tag" =~ ^v(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)(-beta\.(0|[1-9][0-9]*))?$ ]]; then
-            echo "::error::Unsupported release tag '$tag'; expected vMAJOR.MINOR.PATCH or vMAJOR.MINOR.PATCH-beta.N"
+          if [[ ! "$tag" =~ ^v(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)(-(alpha|beta)\.(0|[1-9][0-9]*))?$ ]]; then
+            echo "::error::Unsupported release tag '$tag'; expected stable, alpha.N, or beta.N version"
             exit 1
           fi
           if [[ "$version" != "${tag#v}" ]]; then
@@ -125,11 +128,13 @@ jobs:
           {
             printf 'tag=%s\n' "$tag"
             printf 'version=%s\n' "$version"
-            if [[ "$version" == *-beta.* ]]; then
-              printf 'is_beta=true\n'
-            else
-              printf 'is_beta=false\n'
+            if [[ "$version" == *-alpha.* ]]; then channel=alpha
+            elif [[ "$version" == *-beta.* ]]; then channel=beta
+            else channel=stable
             fi
+            printf 'channel=%s\n' "$channel"
+            [[ "$channel" == stable ]] && prerelease=false || prerelease=true
+            printf 'is_prerelease=%s\n' "$prerelease"
           } >> "$GITHUB_OUTPUT"
 
       - name: Validate tagged pnpm inputs
@@ -274,7 +279,7 @@ jobs:
         uses: actions/github-script@3a2844b7e9c422d3c10d287c895573f7108da1b3 # v9.0.0
         env:
           HIGHLIGHTS_RESULT: ${{ steps.highlights.outputs.final-message }}
-          IS_BETA: ${{ steps.release.outputs.is_beta }}
+          IS_PRERELEASE: ${{ steps.release.outputs.is_prerelease }}
           RELEASE_TAG: ${{ steps.release.outputs.tag }}
         with:
           script: |
@@ -294,7 +299,7 @@ jobs:
               highlights,
               categorized: releaseData.categorized,
             });
-            const prerelease = process.env.IS_BETA === "true";
+            const prerelease = process.env.IS_PRERELEASE === "true";
 
             let existing;
             try {
@@ -343,7 +348,7 @@ jobs:
     outputs:
       artifact_name: ${{ steps.artifact.outputs.name }}
       commit: ${{ steps.tag.outputs.commit }}
-      is_beta: ${{ steps.release.outputs.is_beta }}
+      channel: ${{ steps.release.outputs.channel }}
       tag: ${{ steps.release.outputs.tag }}
       version: ${{ steps.release.outputs.version }}
     steps:
@@ -410,8 +415,11 @@ jobs:
         with:
           script: |
             const tag = process.env.RELEASE_TAG;
-            const match = /^v(0|[1-9]\d*)\.(0|[1-9]\d*)\.(0|[1-9]\d*)(?:-beta\.(0|[1-9]\d*))?$/.exec(tag);
+            const match = /^v(0|[1-9]\d*)\.(0|[1-9]\d*)\.(0|[1-9]\d*)(?:-(?:alpha|beta)\.(0|[1-9]\d*))?$/.exec(tag);
             if (!match) throw new Error(`Unsupported release tag ${tag}`);
+            if (![match[1], match[2], match[3], match[4]].filter(Boolean).every((part) => Number.isSafeInteger(Number(part)))) {
+              throw new Error(`Release tag ${tag} contains an unsafe numeric component`);
+            }
             const { data: release } = await github.rest.repos.getReleaseByTag({
               ...context.repo,
               tag,
@@ -441,7 +449,7 @@ jobs:
             core.setOutput("commit", annotatedTag.object.sha);
             core.setOutput("tag", tag);
             core.setOutput("version", tag.slice(1));
-            core.setOutput("is_beta", tag.includes("-beta."));
+            core.setOutput("channel", tag.includes("-alpha.") ? "alpha" : tag.includes("-beta.") ? "beta" : "stable");
 
       - name: Checkout verified release commit
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
@@ -478,7 +486,7 @@ jobs:
             echo "::error::release published event unexpectedly refers to a draft"
             exit 1
           fi
-          if [[ ! "$tag" =~ ^v(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)(-beta\.(0|[1-9][0-9]*))?$ ]]; then
+          if [[ ! "$tag" =~ ^v(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)(-(alpha|beta)\.(0|[1-9][0-9]*))?$ ]]; then
             echo "::error::Unsupported release tag '$tag'"
             exit 1
           fi
@@ -487,9 +495,12 @@ jobs:
             exit 1
           fi
 
-          is_beta=false
-          [[ "$version" == *-beta.* ]] && is_beta=true
-          if [[ "$RELEASE_PRERELEASE" != "$is_beta" ]]; then
+          channel=stable
+          [[ "$version" == *-alpha.* ]] && channel=alpha
+          [[ "$version" == *-beta.* ]] && channel=beta
+          is_prerelease=false
+          [[ "$channel" != stable ]] && is_prerelease=true
+          if [[ "$RELEASE_PRERELEASE" != "$is_prerelease" ]]; then
             echo "::error::GitHub prerelease flag $RELEASE_PRERELEASE does not match $tag"
             exit 1
           fi
@@ -515,7 +526,8 @@ jobs:
           {
             printf 'tag=%s\n' "$tag"
             printf 'version=%s\n' "$version"
-            printf 'is_beta=%s\n' "$is_beta"
+            printf 'channel=%s\n' "$channel"
+            printf 'is_prerelease=%s\n' "$is_prerelease"
           } >> "$GITHUB_OUTPUT"
 
       - name: Validate tagged pnpm inputs
@@ -685,14 +697,11 @@ jobs:
       - name: Publish to npm
         if: ${{ steps.npm_guard.outputs.already_published != 'true' }}
         env:
-          IS_BETA: ${{ needs.preflight.outputs.is_beta }}
+          RELEASE_CHANNEL: ${{ needs.preflight.outputs.channel }}
         run: |
           set -Eeuo pipefail
-          if [[ "$IS_BETA" == "true" ]]; then
-            tag=beta
-          else
-            tag=latest
-          fi
+          tag="$RELEASE_CHANNEL"
+          [[ "$tag" == stable ]] && tag=latest
           node trusted/.github/scripts/publish-npm-tarball.mjs release-artifact "$tag"
 
       - name: Verify npm package and dist-tags
@@ -710,7 +719,7 @@ jobs:
       already_published: ${{ steps.npm.outputs.already_published }}
       artifact_name: ${{ steps.artifact.outputs.name }}
       commit: ${{ steps.tag.outputs.commit }}
-      is_beta: ${{ steps.tag.outputs.is_beta }}
+      channel: ${{ steps.tag.outputs.channel }}
       tag: ${{ steps.tag.outputs.tag }}
       version: ${{ steps.tag.outputs.version }}
     defaults:
@@ -768,7 +777,7 @@ jobs:
             if (release.draft || !release.published_at) {
               throw new Error(`Recovery requires an already-published GitHub release for ${tag}`);
             }
-            const expectedPrerelease = tag.includes("-beta.");
+            const expectedPrerelease = tag.includes("-alpha.") || tag.includes("-beta.");
             if (release.prerelease !== expectedPrerelease) {
               throw new Error(`Release prerelease state does not match ${tag}`);
             }
@@ -815,7 +824,8 @@ jobs:
               warning: (message) => core.warning(message),
             });
             core.setOutput("commit", annotatedTag.object.sha);
-            core.setOutput("is_beta", String(expectedPrerelease));
+            const channel = tag.includes("-alpha.") ? "alpha" : tag.includes("-beta.") ? "beta" : "stable";
+            core.setOutput("channel", channel);
             core.setOutput("tag", tag);
             core.setOutput("version", tag.slice(1));
 
@@ -1031,14 +1041,11 @@ jobs:
       - name: Publish to npm
         if: ${{ needs.recover-preflight.outputs.already_published != 'true' && steps.npm.outputs.already_published != 'true' }}
         env:
-          IS_BETA: ${{ needs.recover-preflight.outputs.is_beta }}
+          RELEASE_CHANNEL: ${{ needs.recover-preflight.outputs.channel }}
         run: |
           set -Eeuo pipefail
-          if [[ "$IS_BETA" == "true" ]]; then
-            tag=beta
-          else
-            tag=latest
-          fi
+          tag="$RELEASE_CHANNEL"
+          [[ "$tag" == stable ]] && tag=latest
           node trusted/.github/scripts/publish-npm-tarball.mjs release-artifact "$tag"
 
       - name: Verify npm package and dist-tags

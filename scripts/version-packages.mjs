@@ -3,12 +3,12 @@ import { spawnSync } from "node:child_process";
 import { resolve } from "node:path";
 import { pathToFileURL } from "node:url";
 
-const SUPPORTED_CHANNELS = new Set(["auto", "beta", "stable"]);
+const SUPPORTED_CHANNELS = new Set(["auto", "alpha", "beta", "stable"]);
 
 export function validateReleaseChannel(value) {
   if (!SUPPORTED_CHANNELS.has(value)) {
     throw new Error(
-      `Unsupported release channel ${JSON.stringify(value)}; expected auto, beta, or stable`,
+      `Unsupported release channel ${JSON.stringify(value)}; expected auto, alpha, beta, or stable`,
     );
   }
   return value;
@@ -18,9 +18,9 @@ export function validatePrereleaseState(value) {
   if (value === null || typeof value !== "object" || Array.isArray(value)) {
     throw new TypeError(".changeset/pre.json must contain a JSON object");
   }
-  if (value.tag !== "beta") {
+  if (value.tag !== "alpha" && value.tag !== "beta") {
     throw new Error(
-      `Unsupported Changesets prerelease tag ${JSON.stringify(value.tag)}; only beta is allowed`,
+      `Unsupported Changesets prerelease tag ${JSON.stringify(value.tag)}; only alpha or beta is allowed`,
     );
   }
   if (value.mode !== "pre" && value.mode !== "exit") {
@@ -54,16 +54,19 @@ export function planPrereleaseTransition(channel, state) {
 
   if (channel === "auto") return [];
 
-  if (channel === "beta") {
-    if (state === undefined) return ["pre", "enter", "beta"];
-    if (state.mode === "pre") return [];
-    throw new Error(
-      "Cannot re-enter beta while Changesets is exiting prerelease mode; finish the stable release first",
-    );
+  if (channel === "alpha" || channel === "beta") {
+    if (state === undefined) return ["pre", "enter", channel];
+    if (state.mode === "exit") {
+      throw new Error(`Cannot re-enter ${channel} while Changesets is exiting prerelease mode; finish the stable release first`);
+    }
+    if (state.tag !== channel) {
+      throw new Error(`Cannot switch from active ${state.tag} to ${channel}; finish the stable release first`);
+    }
+    return [];
   }
 
   if (state === undefined) {
-    throw new Error("Cannot exit beta because Changesets prerelease mode is not active");
+    throw new Error("Cannot exit prerelease mode because Changesets prerelease mode is not active");
   }
   if (state.mode === "exit") return [];
   return ["pre", "exit"];

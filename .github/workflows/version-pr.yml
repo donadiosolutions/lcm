@@ -7,10 +7,11 @@ on:
   workflow_dispatch:
     inputs:
       channel:
-        description: Enter beta prerelease mode or exit an active beta for a stable release.
+        description: Enter alpha or beta prerelease mode, or exit to a stable release.
         required: true
         type: choice
         options:
+          - alpha
           - beta
           - stable
 
@@ -64,6 +65,7 @@ jobs:
         with:
           script: |
             const channelLabels = new Map([
+              ["release-channel:alpha", "alpha"],
               ["release-channel:beta", "beta"],
               ["release-channel:stable", "stable"],
             ]);
@@ -72,7 +74,7 @@ jobs:
 
             if (eventName === "workflow_dispatch") {
               channel = process.env.REQUESTED_CHANNEL;
-              if (!["beta", "stable"].includes(channel)) {
+              if (!["alpha", "beta", "stable"].includes(channel)) {
                 throw new Error(`Manual version run has invalid channel ${JSON.stringify(channel)}`);
               }
             } else if (eventName === "push") {
@@ -164,7 +166,7 @@ jobs:
               throw new Error(`Invalid Changesets PR number: ${process.env.PR_NUMBER}`);
             }
             const channel = process.env.RELEASE_CHANNEL;
-            if (!["auto", "beta", "stable"].includes(channel)) {
+            if (!["auto", "alpha", "beta", "stable"].includes(channel)) {
               throw new Error(`Invalid resolved release channel ${JSON.stringify(channel)}`);
             }
 
@@ -174,6 +176,13 @@ jobs:
                 {
                   color: "ededed",
                   description: "Exclude this pull request from generated release notes",
+                },
+              ],
+              [
+                "release-channel:alpha",
+                {
+                  color: "c5def5",
+                  description: "Persist the alpha Changesets version-PR channel",
                 },
               ],
               [
@@ -218,15 +227,18 @@ jobs:
             });
 
             if (channel !== "auto") {
-              const opposite =
-                channel === "beta" ? "release-channel:stable" : "release-channel:beta";
-              try {
-                await github.rest.issues.removeLabel({
-                  ...context.repo,
-                  issue_number,
-                  name: opposite,
-                });
-              } catch (error) {
-                if (error.status !== 404) throw error;
+              const obsolete = ["alpha", "beta", "stable"]
+                .filter((candidate) => candidate !== channel)
+                .map((candidate) => `release-channel:${candidate}`);
+              for (const name of obsolete) {
+                try {
+                  await github.rest.issues.removeLabel({
+                    ...context.repo,
+                    issue_number,
+                    name,
+                  });
+                } catch (error) {
+                  if (error.status !== 404) throw error;
+                }
               }
             }

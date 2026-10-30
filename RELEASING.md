@@ -68,15 +68,15 @@ version PRs are labeled `no-release-notes` automatically.
 2. Prepare the version PR:
    - For a normal stable release, let the `Version Packages` workflow open or
      update it automatically.
-   - To start a beta series, manually run `Version Packages` with
-     `channel=beta`. Changesets enters beta mode and starts at `beta.0`.
-   - Further Changesets merged while beta mode is active update the version PR
-     to the next `beta.N` automatically.
-   - To finish a beta series, manually run `Version Packages` with
-     `channel=stable`. Changesets exits beta mode and replaces the prerelease
-     with the corresponding stable version.
+   - To start an alpha or beta series, manually run `Version Packages` with
+     `channel=alpha` or `channel=beta`. Changesets starts at `alpha.0` or
+     `beta.0`; later changesets advance that same channel automatically.
+   - To finish either series, run `Version Packages` with `channel=stable`.
+     Changesets exits prerelease mode and creates the corresponding stable
+     version. Switch between alpha and beta only after this stable exit.
    - A manual choice is stored on the open `changeset-release/main` PR as
-     `release-channel:beta` or `release-channel:stable`. Later `main` pushes
+     exactly one `release-channel:alpha`, `release-channel:beta`, or
+     `release-channel:stable` label. Later `main` pushes
      keep using that channel while Changesets updates the same PR. Multiple
      matching PRs or conflicting channel labels stop the workflow.
 3. Review the generated version PR, wait for every protected-branch check and
@@ -85,8 +85,8 @@ version PRs are labeled `no-release-notes` automatically.
    resulting merge commit and its release commits must remain ancestors of
    `main`.
 4. Create and push a signed annotated tag at that exact merge commit. Supported
-   forms are `vX.Y.Z` and `vX.Y.Z-beta.N`; alpha, RC, other prerelease labels,
-   build metadata, and numeric leading zeros are rejected.
+   forms are `vX.Y.Z`, `vX.Y.Z-alpha.N`, and `vX.Y.Z-beta.N`; RC, other
+   prerelease labels, build metadata, and numeric leading zeros are rejected.
 5. Let the tag-triggered `Publish Package` run type-check, run the complete
    coverage suite, build, generate Codex Highlights, and create the GitHub
    release as a draft. It does not publish npm.
@@ -101,7 +101,8 @@ version PRs are labeled `no-release-notes` automatically.
    runner-provided `gh` CLI, rechecks the release tag and npm ordering using
    trusted tools, and publishes it. One trusted helper requires exactly one
    regular `.tgz`, resolves its absolute filesystem path, and invokes npm
-   without a shell. Betas use `--tag beta`; stable releases use `--tag latest`.
+   without a shell. Alpha and beta releases use matching npm tags; stable
+   releases use `--tag latest`.
 
 ### Maintenance release provenance
 
@@ -136,11 +137,12 @@ missing exact version, missing list membership, or a valid older channel tag,
 is retried. Malformed, conflicting, authorization, and unexpected process
 results fail immediately.
 
-For beta notes, the previous published release in the same `MAJOR.MINOR` series
-is the comparison base, falling back to the latest stable release for the first
-beta in a series. Stable notes always compare with the latest published stable
-release, so a stable release following betas contains the complete change list
-since the prior stable release. Drafts never establish a comparison boundary.
+For alpha and beta notes, the previous published release in the same channel
+and `MAJOR.MINOR` series is the comparison base, falling back to the latest
+published stable release. This makes the first beta after alpha include all
+changes since stable. Stable notes compare with the latest published stable
+release, so they include the complete change list since the prior stable.
+Drafts never establish a comparison boundary.
 
 For an explicitly requested manual release created by the release helper, the
 helper also owns recovery of the tag step. The command below looks up the merged
@@ -163,9 +165,14 @@ GitHub prerelease flag, confirms npm is still unpublished, and stops so a
 maintainer can publish the draft manually.
 
 Before any pull, branch, commit, or tag mutation, the manual helper applies the
-same npm channel-ordering guard as the workflows. Manual helper versions may use stable `MAJOR.MINOR.PATCH` or beta
+same npm channel-ordering guard as the workflows. Manual helper versions may use
+stable `MAJOR.MINOR.PATCH`, alpha `MAJOR.MINOR.PATCH-alpha.N`, or beta
 `MAJOR.MINOR.PATCH-beta.N` form. Other prerelease identifiers and build metadata
-remain unsupported. The draft-run wait defaults to 900 seconds; override it with
+remain unsupported. A manual helper alpha release does not create
+`.changeset/pre.json` or activate managed Changesets prerelease mode. Automatic
+versioning follows committed prerelease state and any channel label already
+selected on the open version PR; use `Version Packages` to start a managed alpha
+series. The draft-run wait defaults to 900 seconds; override it with
 `PUBLISH_MAX_WAIT=<non-negative integer seconds>` when needed.
 
 When `CHANGELOG.md` is absent, the manual helper creates it with the
@@ -187,7 +194,8 @@ for GitHub-API version commits, `pull-requests: write` for the Changesets PR,
 failed-manual-transition guard.
 
 The version PR labeler creates the internal channel labels idempotently, keeps
-only the resolved beta or stable label, and also applies `no-release-notes`.
+only the resolved alpha, beta, or stable label, and also applies
+`no-release-notes`.
 After the PR merges or closes, normal pushes no longer find a persisted label;
 `auto` then follows the committed `.changeset/pre.json` state.
 
