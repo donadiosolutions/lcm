@@ -728,9 +728,7 @@ bundle and keep provider, credential, quarantine, and recovery sessions private.
   keeps the established sequence. A complete simple direct or named drive
   value such as `&name=C:/Users/a` may be completed with that component, but bare
   drives, compound drive values, embedded file literals, and values with
-  unsupported suffixes keep the established sequence. A following flat HTTPS
-  bracket is completed only when its complete rooted or simple-drive value and
-  close are supported. Single-slash `file:/` text, backslash-drive, and UNC
+  unsupported suffixes keep the established sequence. 0 Single-slash `file:/` text, backslash-drive, and UNC
   successors are unchanged. Valid public-URL authorities remain public,
   including paths that contain private-looking segments. An intervening
   public URL still keeps a later mixed-separator successor on its established

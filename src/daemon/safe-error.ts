@@ -427,6 +427,13 @@ function findUrlPathStarts(chars: readonly string[]): UrlPathStarts {
     }
     return sawValue && isMixedCompletionBoundary(cursor + 1) ? cursor + 1 : -1;
   };
+  // A completed component swallows the public bracket's opener, so its
+  // closer must also end the successor run: with a further & or | successor
+  // the stray closer would end the wrapper on the next pass.
+  const publicBracketEndsComponent = (openIndex: number): boolean => {
+    const end = mixedCompletionPublicBracketEnd(openIndex);
+    return end >= 0 && chars[end] !== "&" && chars[end] !== "|";
+  };
   const analyzeMixedCompletion = (
     ownerStart: number,
     pathStart: number,
@@ -532,13 +539,13 @@ function findUrlPathStarts(chars: readonly string[]): UrlPathStarts {
             : null;
         }
         if (sawCompletion && isFileUrlLiteral(chars, fileStart)) return null;
-        if (sawCompletion && mixedCompletionPublicBracketEnd(cursor) >= 0) return plan;
+        if (sawCompletion && publicBracketEndsComponent(cursor)) return plan;
         return sawCompletion ? null : undefined;
       }
       if (char === "(" && chars[cursor + 1] === "[") {
         if (isFileUrlLiteral(chars, cursor + 2)) return null;
         if (!sawCompletion) return undefined;
-        return mixedCompletionPublicBracketEnd(cursor + 1) >= 0 ? plan : null;
+        return publicBracketEndsComponent(cursor + 1) ? plan : null;
       }
       if (char === "&" || char === "|") {
         if (

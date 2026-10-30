@@ -7973,6 +7973,69 @@ describe("sanitizeError", () => {
           "file://h?x=[file://<path>&later\\<path><path>&later\\<path><path>]",
         ],
       ],
+      [
+        "public bracket completion before a bare file successor and a dropped drive",
+        "file://h?x=[file:///Users/CHILD/x&later\\/home/XY:/a([https://o?key=/U/x]&later\\/home/file:///&later\\/C:/Users/S&later\\/home/file://]",
+        [
+          "file://h?x=[file://<path>&later\\<path>:/a([https://o?key=<path>]&later<path>file:///&later\\/C:/Users/S&later\\/home/file://]",
+          "file://h?x=[file://<path>&later\\<path>:<path>?key=<path>]&later<path>file:///&later\\<path>:<path>&later\\<path>]",
+          "file://h?x=[file://<path>&later\\<path>:<path>?key=<path>]&later<path>file:///&later\\<path>:<path>&later\\<path>]",
+        ],
+      ],
+      [
+        "public drive bracket completion before a bare file successor and a named drive",
+        "file://h?x=[file:///Users/CHILD/x&later\\/home/XY:/a([https://o?key=C:/U/x]&later\\/home/file:///&k=C:/Users/ZQ&later\\/home/file://]",
+        [
+          "file://h?x=[file://<path>&later\\<path>:/a([https://o?key=C:<path>]&later<path>file:///&k=C:/Users/ZQ&later\\/home/file://]",
+          "file://h?x=[file://<path>&later\\<path>:<path>?key=C:<path>]&later<path>file:///&k=C:<path>&later\\<path>]",
+          "file://h?x=[file://<path>&later\\<path>:<path>?key=C:<path>]&later<path>file:///&k=C:<path>&later\\<path>]",
+        ],
+      ],
+      [
+        "public drive bracket completion before a bracketed file successor and a named drive",
+        "file://h?x=[file:///Users/CHILD/x&later\\/home/XY:/a([https://o?key=C:/U/x]&later\\/home/file://[/U&later\\/home/XY:/a&k=C:/Users/ZQ]",
+        [
+          "file://h?x=[file://<path>&later\\<path>:/a([https://o?key=C:<path>]&later<path>file://[<path>&later\\<path>:/a&k=C:/Users/ZQ]",
+          "file://h?x=[file://<path>&later\\<path>:<path>?key=C:<path>]&later<path>file://[<path>&later\\<path>:/a&k=C:<path>]",
+          "file://h?x=[file://<path>&later\\<path>:<path>?key=C:<path>]&later<path>file://[<path>&later\\<path>:/a&k=C:<path>]",
+        ],
+      ],
+      [
+        "prefixed unparenthesized public bracket completion before a bare file successor",
+        "Error: file://h?x=[file:///Users/CHILD/x&later\\/home/XY:/a[https://o?key=C:/U/x]&later\\/home/file:///&later\\/C:/Users/S&later\\/home/file://]",
+        [
+          "Error: file://h?x=[file://<path>&later\\<path>:/a[https://o?key=C:<path>]&later<path>file:///&later\\/C:/Users/S&later\\/home/file://]",
+          "Error: file://h?x=[file://<path>&later\\<path>:<path>?key=C:<path>]&later<path>file:///&later\\<path>:<path>&later\\<path>]",
+          "Error: file://h?x=[file://<path>&later\\<path>:<path>?key=C:<path>]&later<path>file:///&later\\<path>:<path>&later\\<path>]",
+        ],
+      ],
+      [
+        "public drive bracket completion before a bracketed file successor and a dropped drive",
+        "file://h?x=[file:///Users/CHILD/x&later\\/home/XY:/a([https://o?key=C:/U/x]&later\\/home/file://[/U&later\\/C:/Users/S&later\\/home/file://]",
+        [
+          "file://h?x=[file://<path>&later\\<path>:/a([https://o?key=C:<path>]&later<path>file://[<path>&later\\/C:/Users/S&later\\/home/file://]",
+          "file://h?x=[file://<path>&later\\<path>:<path>?key=C:<path>]&later<path>file://[<path>&later<path>&later\\<path>]",
+          "file://h?x=[file://<path>&later\\<path>:<path>?key=C:<path>]&later<path>file://[<path>&later<path>&later\\<path>]",
+        ],
+      ],
+      [
+        "public drive bracket completion before a bracketed file successor and a hosted file",
+        "file://h?x=[file:///Users/CHILD/x&later\\/home/XY:/a([https://o?key=C:/U/x]&later\\/home/file://[/U&k=C:/Users/ZQ&later\\/home/file://host/ZH]",
+        [
+          "file://h?x=[file://<path>&later\\<path>:/a([https://o?key=C:<path>]&later<path>file://[<path>&k=C:/Users/ZQ&later\\/home/file://host<path>]",
+          "file://h?x=[file://<path>&later\\<path>:<path>?key=C:<path>]&later<path>file://[<path>&k=C:<path>&later\\<path><path>]",
+          "file://h?x=[file://<path>&later\\<path>:<path>?key=C:<path>]&later<path>file://[<path>&k=C:<path>&later\\<path><path>]",
+        ],
+      ],
+      [
+        "public bracket completion before a pipe successor",
+        "file://h?x=[file:///Users/CHILD/x&later\\/home/XY:/a([https://o?key=/U/x]|later\\/home/file:///&later\\/C:/Users/S&later\\/home/file://]",
+        [
+          "file://h?x=[file://<path>&later\\<path>:/a([https://o?key=<path>]|later\\<path>&later\\<path>:<path>&later\\<path>]",
+          "file://h?x=[file://<path>&later\\<path>:<path>?key=<path>]|later\\<path>&later\\<path>:<path>&later\\<path>]",
+          "file://h?x=[file://<path>&later\\<path>:<path>?key=<path>]|later\\<path>&later\\<path>:<path>&later\\<path>]",
+        ],
+      ],
     ] as const)("keeps the escalation-round pass sequence: %s", (_name, input, expected) => {
       const first = sanitizeError(input);
       const second = sanitizeError(first);
