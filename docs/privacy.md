@@ -700,17 +700,25 @@ bundle and keep provider, credential, quarantine, and recovery sessions private.
   separator run that starts with `\`, also contains `/`, and then has another
   path word. The label and any preceding backslashes remain visible;
   backslash-only runs and runs without a following path word remain unchanged.
-  Within such an admitted successor, a later single-slash colon form is completed
-  on the same pass, including drive-shaped, numeric, and named forms. A later
-  recognized `file://` literal is completed on that pass as a separate redacted
-  component, including an uppercase scheme or a named authority. A following
-  mixed-separator successor uses the same rule when it is a forward-slash drive
-  or a recognized `file://` literal. Single-slash `file:/` text, backslash-drive,
-  and UNC successors keep their existing boundaries. Valid public-URL authorities
-  remain public, including paths that contain private-looking segments. Following
-  bracketed text continues to use its existing query and bracket redaction rules.
-  An intervening public URL still keeps a later mixed-separator successor on its
-  established visibility boundary.
+  Within such an admitted successor, a later straight, word-bearing
+  single-slash colon form is completed on the same pass, including
+  drive-shaped, numeric, and named forms. A later recognized `file://` literal
+  is completed as a separate redacted component only at a segment boundary,
+  with a non-empty rooted path, and when its complete continuation is supported;
+  uppercase schemes and named authorities follow the same rule. All completion
+  decisions for one component are applied together. A quote, query or fragment
+  after a file literal, unsupported punctuation, an empty or authority-only file
+  literal, or an unsupported nested child keeps the established pass sequence.
+  After a private-root claim, a following mixed-separator successor may complete
+  a supported forward-slash drive, single-slash colon form, or exact `file:///`
+  literal; hosted file successors and authority-like `C://` text keep their
+  existing boundaries. A completed colon may also complete one immediately
+  following eligible file child, including its admitted drive values. Ambiguous
+  child-plus-successor and multi-hop copies keep their established behavior.
+  Single-slash `file:/` text, backslash-drive, and UNC successors are unchanged.
+  Valid public-URL authorities remain public, including paths that contain
+  private-looking segments. An intervening public URL still keeps a later
+  mixed-separator successor on its established visibility boundary.
 
   When a matching quote closes a nested public URL inside a bracketed file
   query, an immediate `&` or `|` successor is redacted only when it begins with

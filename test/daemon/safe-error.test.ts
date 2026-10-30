@@ -7087,6 +7087,134 @@ describe("sanitizeError", () => {
   });
 
   describe("Bug #1814", () => {
+    const round2Cases = JSON.parse(
+      readFileSync(new URL("../fixtures/safe-error-1814-round2.json", import.meta.url), "utf8"),
+    ) as Array<{
+      id: string;
+      input: string;
+      required: readonly [string, string, string];
+    }>;
+
+    it.each(round2Cases)("pins the round-2 atomic completion row: $id", ({ input, required }) => {
+      const first = sanitizeError(input);
+      const second = sanitizeError(first);
+      const third = sanitizeError(second);
+
+      expect(first).toBe(required[0]);
+      expect(second).toBe(required[1]);
+      expect(third).toBe(required[2]);
+    });
+
+    it.each([
+      [
+        "adjacent file child after an ordinary bracket",
+        "file://h?x=[file:///Users/CHILD/x&later\\/home/XY:/Users/S/s[x][file:///b&/Users/ZC]]",
+        [
+          "file://h?x=[file://<path>&later\\<path>:/Users/S/s[x][file://<path>&<path>]]",
+          "file://h?x=[file://<path>&later\\<path>:<path><path>&<path>]]",
+          "file://h?x=[file://<path>&later\\<path>:<path><path>&<path>]]",
+        ],
+      ],
+      [
+        "public URL successor after a completed file target",
+        "file://h?x=[file:///Users/CHILD/x&later\\/home/file:///Users/S/s&https://pub.test/x&later\\/home/Z]",
+        [
+          "file://h?x=[file://<path>&later\\<path>file://<path>&https://pub.test/x&later\\/home/Z]",
+          "file://h?x=[file://<path>&later\\<path>file://<path>&https://pub.test/x&later\\/home/Z]",
+          "file://h?x=[file://<path>&later\\<path>file://<path>&https://pub.test/x&later\\/home/Z]",
+        ],
+      ],
+      [
+        "family-B plain successor",
+        "file://h?x=[file:///Users/CHILD/x&later\\/home/a&later\\/plain]",
+        [
+          "file://h?x=[file://<path>&later\\<path>&later\\<path>]",
+          "file://h?x=[file://<path>&later\\<path>&later\\<path>]",
+          "file://h?x=[file://<path>&later\\<path>&later\\<path>]",
+        ],
+      ],
+      [
+        "family-B backslash drive successor",
+        "file://h?x=[file:///Users/CHILD/x&later\\/home/a&later\\/C:\\Users\\x]",
+        [
+          "file://h?x=[file://<path>&later\\<path>&later\\/<path>]",
+          "file://h?x=[file://<path>&later\\<path>&later\\/<path>]",
+          "file://h?x=[file://<path>&later\\<path>&later\\/<path>]",
+        ],
+      ],
+      [
+        "nested ordinary brackets before a file child",
+        "file://h?x=[file:///Users/CHILD/x&later\\/home/XY:/Users/S/s[x[y]][file:///b&C:/Users/c]]",
+        [
+          "file://h?x=[file://<path>&later\\<path>:/Users/S/s[x[y]][file://<path>&C:/Users/c]]",
+          "file://h?x=[file://<path>&later\\<path>:<path><path>&C:<path>]]",
+          "file://h?x=[file://<path>&later\\<path>:<path><path>&C:<path>]]",
+        ],
+      ],
+      [
+        "family-B separator run without a slash",
+        "file://h?x=[file:///Users/CHILD/x&later\\/home/a&later\\C:/Users/x]",
+        [
+          "file://h?x=[file://<path>&later\\<path>&later\\C:/Users/x]",
+          "file://h?x=[file://<path>&later\\<path>&later\\C:<path>]",
+          "file://h?x=[file://<path>&later\\<path>&later\\C:<path>]",
+        ],
+      ],
+      [
+        "hosted family-B file successor",
+        "file://h?x=[file:///Users/CHILD/x&later\\/home/a&later\\/file://host/Users/x]",
+        [
+          "file://h?x=[file://<path>&later\\<path>&later\\/file://host<path>]",
+          "file://h?x=[file://<path>&later\\<path>&later\\<path><path>]",
+          "file://h?x=[file://<path>&later\\<path>&later\\<path><path>]",
+        ],
+      ],
+      [
+        "colon completion at end of input",
+        "file://h?x=[file:///Users/CHILD/x&later\\/home/XY:/Users/S/s",
+        [
+          "file://h?x=[file://<path>&later\\<path>:<path>",
+          "file://h?x=[file://<path>&later\\<path>:<path>",
+          "file://h?x=[file://<path>&later\\<path>:<path>",
+        ],
+      ],
+      [
+        "ordinary bracket before any completion syntax",
+        "file://h?x=[file:///Users/CHILD/x&later\\/home/a[x]]",
+        [
+          "file://h?x=[file://<path>&later\\<path>]",
+          "file://h?x=[file://<path>&later\\<path>]",
+          "file://h?x=[file://<path>&later\\<path>]",
+        ],
+      ],
+      [
+        "ordinary successor after a public-URL completion boundary",
+        "https://h?x=[file:///Users/CHILD/x&later\\/home/a&https://pub.test/x&later\\/home/Z]",
+        [
+          "https://h?x=[file://<path>&later\\<path>&https://pub.test/x&later\\<path>]",
+          "https://h?x=[file://<path>&later\\<path>&https://pub.test/x&later\\<path>]",
+          "https://h?x=[file://<path>&later\\<path>&https://pub.test/x&later\\<path>]",
+        ],
+      ],
+      [
+        "completed colon before a single ordinary bracket",
+        "file://h?x=[file:///Users/CHILD/x&later\\/home/XY:/Users/S/s[x]]",
+        [
+          "file://h?x=[file://<path>&later\\<path>:/Users/S/s[x]]",
+          "file://h?x=[file://<path>&later\\<path>:<path>]",
+          "file://h?x=[file://<path>&later\\<path>:<path>]",
+        ],
+      ],
+    ] as const)("preserves the round-2 refusal neighbour: %s", (_name, input, expected) => {
+      const first = sanitizeError(input);
+      const second = sanitizeError(first);
+      const third = sanitizeError(second);
+
+      expect(first).toBe(expected[0]);
+      expect(second).toBe(expected[1]);
+      expect(third).toBe(expected[2]);
+    });
+
     const targets: ReadonlyArray<readonly [name: string, input: string, expected: string]> = [
       [
         "deeper XY colon literal",
