@@ -211,7 +211,6 @@ function findUrlPathStarts(chars: readonly string[]): UrlPathStarts {
   };
   const isForwardSlashDrivePathStart = (start: number): boolean =>
     /^[A-Za-z]$/u.test(chars[start] ?? "") && chars[start + 1] === ":" && chars[start + 2] === "/";
-  const claimedFileLiteralStarts = new Set<number>();
   const ownedBracketValuePathStart = (start: number): number =>
     isForwardSlashDrivePathStart(start) && postCloseFilePathDrivePrefix !== "none"
       ? start + 2
@@ -357,66 +356,30 @@ function findUrlPathStarts(chars: readonly string[]): UrlPathStarts {
     }
     return sawDrive;
   };
+  // A mixed completion is a pure plan of output marks measured from the
+  // admitted successor. The classification loop never reads a plan: plans are
+  // applied after the loop, so every claim, restart, and state reset stays
+  // exactly as before and only the redaction scan sees the extra marks.
   type MixedCompletionPlan = {
     forcedStarts: number[];
     nestedStops: Array<readonly [index: number, marker: 1 | 2]>;
-    claimedFileStarts: number[];
   };
-  const fileLiteralPathStartsDrive = (start: number): boolean => {
-    let cursor = start + FILE_SCHEME.length + 3;
-    if (chars[cursor] !== "/") {
-      while (isContinuationHostCharacter(chars[cursor])) cursor += 1;
-    }
-    cursor += 1;
-    return (
-      /^[A-Za-z]$/u.test(chars[cursor]!) &&
-      chars[cursor + 1] === ":" &&
-      chars[cursor + 2] === "/"
-    );
-  };
-  const barrierFileCompletionPlan = (pathStart: number): MixedCompletionPlan | undefined => {
-    let cursor = pathStart + 1;
-    let segmentStart = true;
-    while (isPathWord(chars[cursor]) || chars[cursor] === "/") {
-      if (segmentStart && isFileUrlLiteral(chars, cursor)) {
-        const fileEnd = fileLiteralPathEnd(cursor);
-        if (fileEnd < 0 || fileLiteralPathStartsDrive(cursor)) return undefined;
-        const forcedStarts = [cursor];
-        if (chars[fileEnd] === "?" || chars[fileEnd] === "#") {
-          let valueStart = fileEnd + 1;
-          while (isPathWord(chars[valueStart])) valueStart += 1;
-          if (chars[valueStart] === "=") valueStart += 1;
-          if (chars[valueStart] === "/" && simpleRootedPathEnd(valueStart) >= 0) {
-            forcedStarts.push(valueStart);
-          }
-        }
-        return {
-          forcedStarts,
-          nestedStops: [[cursor, 2]],
-          claimedFileStarts: [cursor],
-        };
-      }
-      segmentStart = chars[cursor] === "/";
-      cursor += 1;
-    }
-    return undefined;
-  };
-  const fileLiteralPathEnd = (start: number): number => {
+  const mixedCompletionPlans: MixedCompletionPlan[] = [];
+  // A file literal is well formed when its authority is empty or a plain host
+  // token and a slash follows. Returns that slash or -1.
+  const fileLiteralPathStart = (start: number): number => {
     let cursor = start + FILE_SCHEME.length + 3;
     if (chars[cursor] !== "/") {
       const authorityStart = cursor;
       while (isContinuationHostCharacter(chars[cursor])) cursor += 1;
       if (cursor === authorityStart || chars[cursor] !== "/") return -1;
     }
-    cursor += 1;
-    return isPathWord(chars[cursor]) ? simplePathEnd(cursor) : -1;
+    return cursor;
   };
-  const hasUnsupportedFileLiteralAfter = (start: number): boolean => {
-    for (let cursor = start; cursor < chars.length; cursor += 1) {
-      if (WHITESPACE_PATTERN.test(chars[cursor])) return false;
-      if (isFileUrlLiteral(chars, cursor) && fileLiteralPathEnd(cursor) < 0) return true;
-    }
-    return false;
+  const fileLiteralPathEnd = (start: number): number => {
+    const pathStart = fileLiteralPathStart(start);
+    if (pathStart < 0) return -1;
+    return isPathWord(chars[pathStart + 1]) ? simplePathEnd(pathStart + 1) : -1;
   };
   const isMixedCompletionBoundary = (index: number): boolean => {
     const char = chars[index];
@@ -465,13 +428,16 @@ function findUrlPathStarts(chars: readonly string[]): UrlPathStarts {
     return sawValue && isMixedCompletionBoundary(cursor + 1) ? cursor + 1 : -1;
   };
   const analyzeMixedCompletion = (
+    ownerStart: number,
     pathStart: number,
     drivePrefix: OwnedBracketDrivePrefix,
   ): MixedCompletionPlan | null | undefined => {
+    // The owning nested file literal must itself be well formed: later passes
+    // rely on its shape once a claimed literal no longer restarts the scan.
+    if (!isFileUrlLiteral(chars, ownerStart) || fileLiteralPathStart(ownerStart) < 0) return null;
     const plan: MixedCompletionPlan = {
       forcedStarts: [],
       nestedStops: [],
-      claimedFileStarts: [],
     };
     let cursor = pathStart + 1;
     let segmentStart = true;
@@ -482,7 +448,6 @@ function findUrlPathStarts(chars: readonly string[]): UrlPathStarts {
       if (segmentStart && isFileUrlLiteral(chars, cursor)) {
         const fileEnd = fileLiteralPathEnd(cursor);
         if (fileEnd < 0) return null;
-        plan.claimedFileStarts.push(cursor);
         plan.nestedStops.push([cursor, 2]);
         plan.forcedStarts.push(cursor);
         sawCompletion = true;
@@ -513,6 +478,8 @@ function findUrlPathStarts(chars: readonly string[]): UrlPathStarts {
         const numericDoubleSlash = /^\d+$/u.test(scheme);
         if (chars[cursor + 2] === "/" && !numericDoubleSlash) return null;
         if (scheme.toLowerCase() === FILE_SCHEME) return null;
+        // A token ending in "file:/" is a single-slash file tail for the scan.
+        if (isSingleSlashFileUrlLiteral(chars, cursor - FILE_SCHEME.length)) return null;
         const rootedStart = skipSeparatorRun(cursor + 1);
         if (!isPathWord(chars[rootedStart])) return null;
         plan.nestedStops.push([cursor, 1]);
@@ -530,27 +497,37 @@ function findUrlPathStarts(chars: readonly string[]): UrlPathStarts {
           isFileUrlLiteral(chars, fileStart) &&
           chars[fileStart + FILE_SCHEME.length + 3] === "/";
         if (startsFileChild && ownedBracketRegionIsEligible(cursor, drivePrefix, cursor)) {
-          plan.claimedFileStarts.push(fileStart);
+          // The child is admitted only as one complete form: its rooted file
+          // path, then ampersand-delimited values (already validated by the
+          // eligibility check above) up to the child close and the owner
+          // close. Any other delimiter, continuation, or close refuses the
+          // whole completion; an invalid value end never reaches a close.
+          let valueCursor = fileLiteralPathEnd(fileStart);
+          if (valueCursor < 0) return null;
           plan.nestedStops.push([fileStart, 2]);
           plan.forcedStarts.push(fileStart);
-          let valueCursor = fileStart;
-          while (chars[valueCursor] !== "]") {
-            if (chars[valueCursor] === "&") {
-              const valueOrNameStart = valueCursor + 1;
-              let valueStart = valueOrNameStart;
-              while (isPathWord(chars[valueStart])) valueStart += 1;
-              if (chars[valueStart] === "=") {
-                valueStart += 1;
-              } else {
-                valueStart = valueOrNameStart;
-              }
-              if (isForwardSlashDrivePathStart(valueStart)) {
-                plan.forcedStarts.push(valueStart + 2);
-              }
+          while (chars[valueCursor] === "&") {
+            const valueOrNameStart = valueCursor + 1;
+            let valueStart = valueOrNameStart;
+            while (isPathWord(chars[valueStart])) valueStart += 1;
+            if (chars[valueStart] === "=") {
+              valueStart += 1;
+            } else {
+              valueStart = valueOrNameStart;
             }
-            valueCursor += 1;
+            if (isForwardSlashDrivePathStart(valueStart)) {
+              plan.forcedStarts.push(valueStart + 2);
+              valueCursor = simpleDrivePathEnd(valueStart);
+            } else if (chars[valueStart] === "/") {
+              valueCursor = simpleRootedPathEnd(valueStart);
+            } else {
+              valueCursor = valueStart;
+              while (isPathWord(chars[valueCursor])) valueCursor += 1;
+            }
           }
-          return chars[valueCursor + 1] === "]" && isMixedCompletionBoundary(valueCursor + 2)
+          return chars[valueCursor] === "]" &&
+            chars[valueCursor + 1] === "]" &&
+            isMixedCompletionBoundary(valueCursor + 2)
             ? plan
             : null;
         }
@@ -599,16 +576,7 @@ function findUrlPathStarts(chars: readonly string[]): UrlPathStarts {
     }
     return sawCompletion ? plan : undefined;
   };
-  const applyMixedCompletion = (plan: MixedCompletionPlan): void => {
-    // Marker 2 is written only by #1814's claimed-file-literal plan; no other
-    // sanitizer path may write it.
-    for (const [index, marker] of plan.nestedStops) nestedFileSchemeStarts[index] = marker;
-    for (const index of plan.claimedFileStarts) claimedFileLiteralStarts.add(index);
-    for (const index of plan.forcedStarts) forcedPath[index] = 1;
-  };
-  const backslashSlashSuccessorPathStart = (
-    start: number,
-  ): number => {
+  const backslashSlashSuccessorPathStart = (start: number): number => {
     if (!isPathWord(chars[start])) return -1;
     let cursor = start;
     while (isPathWord(chars[cursor])) cursor += 1;
@@ -633,38 +601,15 @@ function findUrlPathStarts(chars: readonly string[]): UrlPathStarts {
     ) {
       return -1;
     }
-    if (isWindowsDrivePathStart(chars, cursor) || backslashesAfterSlash >= 2) {
-      return -1;
-    }
-    if (isForwardSlashDrivePathStart(cursor) || isFileUrlLiteral(chars, cursor)) {
+    if (
+      isWindowsDrivePathStart(chars, cursor) ||
+      isForwardSlashDrivePathStart(cursor) ||
+      isFileUrlLiteral(chars, cursor) ||
+      backslashesAfterSlash >= 2
+    ) {
       return -1;
     }
     return firstSlash >= 0 && isPathWord(chars[cursor]) ? firstSlash : -1;
-  };
-  const mixedSuccessorHasFileLiteral = (start: number): boolean => {
-    let cursor = start;
-    while (
-      chars[cursor] !== undefined &&
-      chars[cursor] !== "&" &&
-      chars[cursor] !== "|" &&
-      chars[cursor] !== "]" &&
-      !WHITESPACE_PATTERN.test(chars[cursor])
-    ) {
-      if (isFileUrlLiteral(chars, cursor)) return true;
-      cursor += 1;
-    }
-    return false;
-  };
-  const mixedSeparatorPathStart = (start: number): number => {
-    if (!isPathWord(chars[start])) return -1;
-    let cursor = start;
-    while (isPathWord(chars[cursor])) cursor += 1;
-    if (chars[cursor] !== "\\") return -1;
-    while (chars[cursor] === "/" || chars[cursor] === "\\") {
-      if (chars[cursor] === "/") return cursor;
-      cursor += 1;
-    }
-    return -1;
   };
   const immediateBackslashSlashSuccessorStartsPrivateRoot = (start: number): boolean => {
     let cursor = start;
@@ -869,8 +814,6 @@ function findUrlPathStarts(chars: readonly string[]): UrlPathStarts {
   let quotedQueryPublicUrl = false;
   let quotedQueryPublicUrlOwnQueryOrFragment = false;
   let backslashSlashClaimActive = false;
-  let mixedCompletionApplied = false;
-  let mixedCompletionBarrier = false;
   let activeNestedFileSchemeStart = -1;
 
   for (let index = 0; index < chars.length; index += 1) {
@@ -942,8 +885,6 @@ function findUrlPathStarts(chars: readonly string[]): UrlPathStarts {
         }
       }
       backslashSlashClaimActive = false;
-      mixedCompletionApplied = false;
-      mixedCompletionBarrier = false;
       activeNestedFileSchemeStart = -1;
       siblingWrapperStart = -1;
       siblingWrapperOwnerBracketDepth = 0;
@@ -1346,16 +1287,13 @@ function findUrlPathStarts(chars: readonly string[]): UrlPathStarts {
       quotedQueryPublicUrl = true;
       quotedQueryPublicUrlOwnQueryOrFragment = false;
     }
-    const nestedFileSchemeStartCandidate = isNestedFileUrlStart(chars, index)
+    const nestedFileSchemeStart = isNestedFileUrlStart(chars, index)
       ? index + 1
       : queryOrFragment &&
           !URL_SCHEME_START_PATTERN.test(char) &&
           isFileUrlLiteral(chars, index + 1)
         ? index + 1
         : -1;
-    const nestedFileSchemeStart = claimedFileLiteralStarts.has(nestedFileSchemeStartCandidate)
-      ? -1
-      : nestedFileSchemeStartCandidate;
     if ((separator >= 0 || restartedPathlessFile) && nestedFileSchemeStart >= 0) {
       const directNestedFileQuote = quoteCode(chars[nestedFileSchemeStart - 1]);
       const enclosingQuote = quoteFromCode(schemeQuote);
@@ -1413,8 +1351,6 @@ function findUrlPathStarts(chars: readonly string[]): UrlPathStarts {
       quotedQueryPublicUrl = false;
       quotedQueryPublicUrlOwnQueryOrFragment = false;
       backslashSlashClaimActive = false;
-      mixedCompletionApplied = false;
-      mixedCompletionBarrier = false;
       schemeLength = 0;
       fileSchemeLength = 0;
       schemeQuote = directNestedFileQuote || inheritedNestedFileQuote;
@@ -1433,7 +1369,7 @@ function findUrlPathStarts(chars: readonly string[]): UrlPathStarts {
       forcedPath[index] = 1;
       continue;
     }
-    const considersBackslashSlashSuccessor: boolean =
+    const activeBackslashSlashPathStart: number =
       exactFileScheme &&
       foundFilePath &&
       char === "&" &&
@@ -1446,73 +1382,18 @@ function findUrlPathStarts(chars: readonly string[]): UrlPathStarts {
         backslashSlashClaimActive ||
         previousSuccessorIsPlain(index, activeNestedFileSchemeStart)) &&
       laterSuccessorBeforeBracket[index + 1] !== 1 &&
-      !(pathlessFileQueryOwnerBracketDepth === 0 && queryBeforeBracket[index + 1] === 1);
-    let activeBackslashSlashPathStart: number = considersBackslashSlashSuccessor
-      ? backslashSlashSuccessorPathStart(index + 1)
-      : -1;
-    let activeBackslashSlashCompletion: MixedCompletionPlan | null | undefined;
-    let activeBackslashSlashDrivePrefix: OwnedBracketDrivePrefix = "nested-file";
-    const hadMixedCompletionBarrier = mixedCompletionBarrier;
-    const currentMixedPathStart = considersBackslashSlashSuccessor
-      ? mixedSeparatorPathStart(index + 1)
-      : -1;
-    if (
-      mixedCompletionApplied &&
-      activeBackslashSlashPathStart < 0 &&
-      currentMixedPathStart >= 0 &&
-      mixedSuccessorHasFileLiteral(index + 1)
-    ) {
-      const barrierPlan =
-        barrierFileCompletionPlan(currentMixedPathStart);
-      if (barrierPlan !== undefined) {
-        activeBackslashSlashPathStart = currentMixedPathStart;
-        activeBackslashSlashCompletion = barrierPlan;
-      }
-    }
-    if (activeBackslashSlashPathStart >= 0) {
-      activeBackslashSlashDrivePrefix = immediateBackslashSlashSuccessorStartsPrivateRoot(index + 1)
-        ? "all"
-        : "nested-file";
-      if (
-        mixedCompletionApplied &&
-        mixedSuccessorHasFileLiteral(index + 1) &&
-        activeBackslashSlashCompletion === undefined
-      ) {
-        activeBackslashSlashCompletion = barrierFileCompletionPlan(activeBackslashSlashPathStart);
-      }
-      activeBackslashSlashCompletion ??= hadMixedCompletionBarrier
-        ? barrierFileCompletionPlan(activeBackslashSlashPathStart)
-        : analyzeMixedCompletion(
+      !(pathlessFileQueryOwnerBracketDepth === 0 && queryBeforeBracket[index + 1] === 1)
+        ? backslashSlashSuccessorPathStart(index + 1)
+        : -1;
+    const activeBackslashSlashCompletion =
+      activeBackslashSlashPathStart >= 0
+        ? analyzeMixedCompletion(
+            separator - 4,
             activeBackslashSlashPathStart,
-            activeBackslashSlashDrivePrefix,
-          );
-    }
+            immediateBackslashSlashSuccessorStartsPrivateRoot(index + 1) ? "all" : "nested-file",
+          )
+        : undefined;
     if (
-      activeBackslashSlashCompletion !== null &&
-      activeBackslashSlashCompletion !== undefined &&
-      isHttpsUrlLiteral(0) &&
-      hasUnsupportedFileLiteralAfter(index + 1)
-    ) {
-      activeBackslashSlashCompletion = null;
-    }
-    if (
-      considersBackslashSlashSuccessor &&
-      mixedCompletionApplied &&
-      activeBackslashSlashPathStart < 0 &&
-      currentMixedPathStart >= 0
-    ) {
-      mixedCompletionBarrier = true;
-    }
-    const openedMixedCompletionBarrier = !hadMixedCompletionBarrier && mixedCompletionBarrier;
-    const blocksMixedSuccessor =
-      openedMixedCompletionBarrier ||
-      (hadMixedCompletionBarrier &&
-      isFileUrlLiteral(chars, 0) &&
-      currentMixedPathStart >= 0 &&
-      mixedSuccessorHasFileLiteral(index + 1) &&
-      activeBackslashSlashCompletion === undefined);
-    if (
-      !blocksMixedSuccessor &&
       (activeNestedFileUrlParentOwnerBracketDepth > 0 || activeBackslashSlashPathStart >= 0) &&
       exactFileScheme &&
       foundFilePath &&
@@ -1549,14 +1430,15 @@ function findUrlPathStarts(chars: readonly string[]): UrlPathStarts {
                 isWindowsDrivePathStart(chars, index + 1))
             ? index + 1
             : -1;
-      const preservesMixedDrivePrefix =
-        backslashSlashPathStart >= 0 && activeBackslashSlashDrivePrefix === "all";
       if (activeChildClaimStart >= 0 && !absorbsClaimInsideOwnedBracketTail()) {
         const inheritedQuote = inheritedQuoteTailWrapperDepths.has(
           activeNestedFileUrlParentOwnerBracketDepth,
         );
         const ownsPrivateRelative = !queryOrFragment;
         const ownsRootedQuery = backslashSlashPathStart < 0;
+        const preservesMixedDrivePrefix =
+          backslashSlashPathStart >= 0 &&
+          immediateBackslashSlashSuccessorStartsPrivateRoot(index + 1);
         armBracketTail(
           activeChildClaimStart,
           index + 1,
@@ -1571,12 +1453,9 @@ function findUrlPathStarts(chars: readonly string[]): UrlPathStarts {
           },
         );
       }
-      if (backslashSlashPathStart >= 0) {
-        forcedPath[backslashSlashPathStart] = 1;
-        if (activeBackslashSlashCompletion !== null && activeBackslashSlashCompletion !== undefined) {
-          applyMixedCompletion(activeBackslashSlashCompletion);
-          mixedCompletionApplied = true;
-        }
+      if (backslashSlashPathStart >= 0) forcedPath[backslashSlashPathStart] = 1;
+      if (activeBackslashSlashCompletion !== null && activeBackslashSlashCompletion !== undefined) {
+        mixedCompletionPlans.push(activeBackslashSlashCompletion);
       }
       const keepsClaimAcrossOrdinaryRelative: boolean =
         backslashSlashClaimActive &&
@@ -1586,9 +1465,6 @@ function findUrlPathStarts(chars: readonly string[]): UrlPathStarts {
       backslashSlashClaimActive =
         backslashSlashPathStart >= 0 ||
         keepsClaimAcrossOrdinaryRelative;
-      if (activeBackslashSlashCompletion === null && mixedCompletionApplied) {
-        mixedCompletionBarrier = true;
-      }
       if (returnsToParent) {
         separator = -1;
         exactFileScheme = false;
@@ -1602,7 +1478,6 @@ function findUrlPathStarts(chars: readonly string[]): UrlPathStarts {
       }
     }
     if (
-      !blocksMixedSuccessor &&
       nestedFileUrlParentOwnerBracketDepths.size > 0 &&
       !exactFileScheme &&
       separator < 0 &&
@@ -2142,6 +2017,13 @@ function findUrlPathStarts(chars: readonly string[]): UrlPathStarts {
       fileSchemeLength = 0;
       schemeQuote = 0;
     }
+  }
+
+  // Marker 2 is written only here, for a #1814 claimed file literal, after
+  // the classification loop has finished; no other sanitizer path writes it.
+  for (const plan of mixedCompletionPlans) {
+    for (const [index, marker] of plan.nestedStops) nestedFileSchemeStarts[index] = marker;
+    for (const index of plan.forcedStarts) forcedPath[index] = 1;
   }
 
   return { authority, file, fileQuote, forcedPath, nestedFileSchemeStarts };

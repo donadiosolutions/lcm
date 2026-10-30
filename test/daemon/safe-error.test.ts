@@ -7299,7 +7299,7 @@ describe("sanitizeError", () => {
         "file target before a dropped drive and rooted file query",
         "file://h?x=[file:///Users/CHILD/x&later\\/home/file:///Users/T/t&later\\/C:/Users/S&later\\/home/file:///Users/U?q=/Users/Z]",
         [
-          "file://h?x=[file://<path>&later\\<path><path>&later\\/C:/Users/S&later\\<path><path>?q=<path>]",
+          "file://h?x=[file://<path>&later\\<path><path>&later\\/C:/Users/S&later\\/home/file://<path>?q=<path>]",
           "file://h?x=[file://<path>&later\\<path><path>&later\\<path>:<path>&later\\<path><path>?q=<path>]",
           "file://h?x=[file://<path>&later\\<path><path>&later\\<path>:<path>&later\\<path><path>?q=<path>]",
         ],
@@ -7308,7 +7308,7 @@ describe("sanitizeError", () => {
         "colon target before a dropped drive and rooted file fragment",
         "file://h?x=[file:///Users/CHILD/x&later\\/home/XY:/Users/S/s&later\\/C:/Users/S&later\\/home/file:///Users/U#f=/Users/Z]",
         [
-          "file://h?x=[file://<path>&later\\<path>:<path>&later\\/C:/Users/S&later\\<path><path>#f=<path>]",
+          "file://h?x=[file://<path>&later\\<path>:<path>&later\\/C:/Users/S&later\\/home/file://<path>#f=<path>]",
           "file://h?x=[file://<path>&later\\<path>:<path>&later\\<path>:<path>&later\\<path><path>#f=<path>]",
           "file://h?x=[file://<path>&later\\<path>:<path>&later\\<path>:<path>&later\\<path><path>#f=<path>]",
         ],
@@ -7317,7 +7317,7 @@ describe("sanitizeError", () => {
         "colon target before a dropped drive and direct rooted file query",
         "file://h?x=[file:///Users/CHILD/x&later\\/home/XY:/Users/S/s&later\\/C:/Users/S&later\\/file:///Users/U?q=/Users/Z]",
         [
-          "file://h?x=[file://<path>&later\\<path>:<path>&later\\/C:/Users/S&later\\<path><path>?q=<path>]",
+          "file://h?x=[file://<path>&later\\<path>:<path>&later\\/C:/Users/S&later\\/file://<path>?q=<path>]",
           "file://h?x=[file://<path>&later\\<path>:<path>&later\\<path>:<path>&later\\<path><path>?q=<path>]",
           "file://h?x=[file://<path>&later\\<path>:<path>&later\\<path>:<path>&later\\<path><path>?q=<path>]",
         ],
@@ -7326,7 +7326,7 @@ describe("sanitizeError", () => {
         "colon target before a dropped drive and direct rooted file",
         "file://h?x=[file:///Users/CHILD/x&later\\/home/XY:/Users/S/s&later\\/C:/Users/S&later\\/file:///Users/U]",
         [
-          "file://h?x=[file://<path>&later\\<path>:<path>&later\\/C:/Users/S&later\\<path><path>]",
+          "file://h?x=[file://<path>&later\\<path>:<path>&later\\/C:/Users/S&later\\/file://<path>]",
           "file://h?x=[file://<path>&later\\<path>:<path>&later\\<path>:<path>&later\\<path><path>]",
           "file://h?x=[file://<path>&later\\<path>:<path>&later\\<path>:<path>&later\\<path><path>]",
         ],
@@ -7335,7 +7335,7 @@ describe("sanitizeError", () => {
         "colon target before a dropped drive and unnamed rooted file query",
         "file://h?x=[file:///Users/CHILD/x&later\\/home/XY:/Users/S/s&later\\/C:/Users/S&later\\/file:///Users/U?/Users/Z]",
         [
-          "file://h?x=[file://<path>&later\\<path>:<path>&later\\/C:/Users/S&later\\<path><path>?<path>]",
+          "file://h?x=[file://<path>&later\\<path>:<path>&later\\/C:/Users/S&later\\/file://<path>?<path>]",
           "file://h?x=[file://<path>&later\\<path>:<path>&later\\<path>:<path>&later\\<path><path>?<path>]",
           "file://h?x=[file://<path>&later\\<path>:<path>&later\\<path>:<path>&later\\<path><path>?<path>]",
         ],
@@ -7344,7 +7344,7 @@ describe("sanitizeError", () => {
         "colon target before a dropped drive and plain file query",
         "file://h?x=[file:///Users/CHILD/x&later\\/home/XY:/Users/S/s&later\\/C:/Users/S&later\\/file:///Users/U?q=plain]",
         [
-          "file://h?x=[file://<path>&later\\<path>:<path>&later\\/C:/Users/S&later\\<path><path>?q=plain]",
+          "file://h?x=[file://<path>&later\\<path>:<path>&later\\/C:/Users/S&later\\/file://<path>?q=plain]",
           "file://h?x=[file://<path>&later\\<path>:<path>&later\\<path>:<path>&later\\<path><path>?q=plain]",
           "file://h?x=[file://<path>&later\\<path>:<path>&later\\<path>:<path>&later\\<path><path>?q=plain]",
         ],
@@ -7371,7 +7371,7 @@ describe("sanitizeError", () => {
         "colon target before a dropped drive and hosted non-drive colon file",
         "file://h?x=[file:///Users/CHILD/x&later\\/home/XY:/Users/S/s&later\\/C:/Users/S&later\\/file://host/C:x]",
         [
-          "file://h?x=[file://<path>&later\\<path>:<path>&later\\/C:/Users/S&later\\<path><path>:x]",
+          "file://h?x=[file://<path>&later\\<path>:<path>&later\\/C:/Users/S&later\\/file://host<path>:x]",
           "file://h?x=[file://<path>&later\\<path>:<path>&later\\<path>:<path>&later\\<path><path>:x]",
           "file://h?x=[file://<path>&later\\<path>:<path>&later\\<path>:<path>&later\\<path><path>:x]",
         ],
@@ -7380,7 +7380,7 @@ describe("sanitizeError", () => {
         "colon target before a dropped drive and single-letter file path segment",
         "file://h?x=[file:///Users/CHILD/x&later\\/home/XY:/Users/S/s&later\\/C:/Users/S&later\\/file:///C/x]",
         [
-          "file://h?x=[file://<path>&later\\<path>:<path>&later\\/C:/Users/S&later\\<path><path>]",
+          "file://h?x=[file://<path>&later\\<path>:<path>&later\\/C:/Users/S&later\\/file://<path>]",
           "file://h?x=[file://<path>&later\\<path>:<path>&later\\<path>:<path>&later\\<path><path>]",
           "file://h?x=[file://<path>&later\\<path>:<path>&later\\<path>:<path>&later\\<path><path>]",
         ],
@@ -7398,7 +7398,7 @@ describe("sanitizeError", () => {
         "HTTPS wrapper with a later authority-only file literal",
         "https://h?x=[file:///Users/CHILD/x&later\\/home/XY:/Users/S/s&later\\/home/file://host&k=later/home/Z]",
         [
-          "https://h?x=[file://<path>&later\\<path>:/Users/S/s&later\\<path>file://host&k=later<path>]",
+          "https://h?x=[file://<path>&later\\<path>:<path>&later\\<path>file://host&k=later<path>]",
           "https://h?x=[file://<path>&later\\<path>:<path>&later\\<path>file://host&k=later<path>]",
           "https://h?x=[file://<path>&later\\<path>:<path>&later\\<path>file://host&k=later<path>]",
         ],
@@ -7782,6 +7782,230 @@ describe("sanitizeError", () => {
       expect(second).toBe(first);
       expect(third).toBe(first);
     });
+
+    it.each([
+      [
+        "malformed owner authority before a colon target",
+        "file://h?x=[file://[/Users/CHILD/x&later\\/home/XY:/Users/S/s]",
+        [
+          "file://h?x=[file://[<path>&later\\<path>:/Users/S/s]",
+          "file://h?x=[file://[<path>&later\\<path>:/Users/S/s]",
+          "file://h?x=[file://[<path>&later\\<path>:/Users/S/s]",
+        ],
+      ],
+      [
+        "malformed owner authority before a file target and later successors",
+        "file://h?x=[file://[/Users/CHILD/x&later\\/home/file:///Users/T/t&later\\/C:/Users/S&later\\/home/file://]",
+        [
+          "file://h?x=[file://[<path>&later\\<path>file://<path>&later\\/C:/Users/S&later\\/home/file://]",
+          "file://h?x=[file://[<path>&later\\<path>file://<path>&later\\<path>:<path>&later\\<path>]",
+          "file://h?x=[file://[<path>&later\\<path>file://<path>&later\\<path>:<path>&later\\<path>]",
+        ],
+      ],
+      [
+        "single-slash file tail inside a colon token",
+        "file://h?x=[file:///Users/CHILD/x&later\\/home/afile:/~//Users/x]",
+        [
+          "file://h?x=[file://<path>&later\\<path>]",
+          "file://h?x=[file://<path>&later\\<path>]",
+          "file://h?x=[file://<path>&later\\<path>]",
+        ],
+      ],
+      [
+        "file child with an empty path segment",
+        "file://h?x=[file:///Users/CHILD/x&later\\/home/XY:/Users/S/s[file:////b&C:/Users/c]]",
+        [
+          "file://h?x=[file://<path>&later\\<path>:/Users/S/s[file://<path>&C:/Users/c]]",
+          "file://h?x=[file://<path>&later\\<path>:<path><path>&C:<path>]]",
+          "file://h?x=[file://<path>&later\\<path>:<path><path>&C:<path>]]",
+        ],
+      ],
+      [
+        "file child with a bare drive value",
+        "file://h?x=[file:///Users/CHILD/x&later\\/home/XY:/Users/S/s[file:///b&C:/]]",
+        [
+          "file://h?x=[file://<path>&later\\<path>:/Users/S/s[file://<path>&C:/]]",
+          "file://h?x=[file://<path>&later\\<path>:<path><path>&C:/]]",
+          "file://h?x=[file://<path>&later\\<path>:<path><path>&C:/]]",
+        ],
+      ],
+      [
+        "file child with a rooted value",
+        "file://h?x=[file:///Users/CHILD/x&later\\/home/XY:/Users/S/s[file:///b&/Users/ZC]]",
+        [
+          "file://h?x=[file://<path>&later\\<path>:/Users/S/s[file://<path>&<path>]]",
+          "file://h?x=[file://<path>&later\\<path>:<path><path>&<path>]]",
+          "file://h?x=[file://<path>&later\\<path>:<path><path>&<path>]]",
+        ],
+      ],
+      [
+        "file child with a drive and a rooted value",
+        "file://h?x=[file:///Users/CHILD/x&later\\/home/XY:/Users/S/s[file:///b&C:/Users/c&/Users/ZC]]",
+        [
+          "file://h?x=[file://<path>&later\\<path>:<path><path>&C:<path>&<path>]]",
+          "file://h?x=[file://<path>&later\\<path>:<path><path>&C:<path>&<path>]]",
+          "file://h?x=[file://<path>&later\\<path>:<path><path>&C:<path>&<path>]]",
+        ],
+      ],
+      [
+        "file child with an empty value",
+        "file://h?x=[file:///Users/CHILD/x&later\\/home/XY:/Users/S/s[file:///b&&C:/Users/c]]",
+        [
+          "file://h?x=[file://<path>&later\\<path>:/Users/S/s[file://<path>&&C:/Users/c]]",
+          "file://h?x=[file://<path>&later\\<path>:<path><path>&&C:<path>]]",
+          "file://h?x=[file://<path>&later\\<path>:<path><path>&&C:<path>]]",
+        ],
+      ],
+      [
+        "file child with a rooted-query continuation",
+        "file://h?x=[file:///Users/CHILD/x&later\\/home/XY:/Users/S/s[file:///b?key=C:/Users/ZQ([https://o?key=/Users/ZR]]&later\\/home/file://host/ZH]",
+        [
+          "file://h?x=[file://<path>&later\\<path>:/Users/S/s[file://<path>?key=C:/Users/ZQ([https://o?key=<path>]]&later\\<path>]",
+          "file://h?x=[file://<path>&later\\<path>:<path><path>?key=C:<path>?key=<path>]]&later\\<path>]",
+          "file://h?x=[file://<path>&later\\<path>:<path><path>?key=C:<path>?key=<path>]]&later\\<path>]",
+        ],
+      ],
+      [
+        "file child without the owner close",
+        "file://h?x=[file:///Users/CHILD/x&later\\/home/XY:/Users/S/s[file:///b&C:/Users/c]x",
+        [
+          "file://h?x=[file://<path>&later\\<path>:/Users/S/s[file://<path>&C:/Users/c]x",
+          "file://h?x=[file://<path>&later\\<path>:<path><path>&C:<path>]x",
+          "file://h?x=[file://<path>&later\\<path>:<path><path>&C:<path>]x",
+        ],
+      ],
+      [
+        "prefixed colon target before a dropped drive and a hosted file literal",
+        "Error: file://h?x=[file:///Users/CHILD/x&later\\/home/XY:/Users/ZA/s&later\\/C:/Users/ZB/t&later\\/home/ZS/file://secrethost]",
+        [
+          "Error: file://h?x=[file://<path>&later\\<path>:<path>&later\\/C:/Users/ZB/t&later\\/home/ZS/file://secrethost]",
+          "Error: file://h?x=[file://<path>&later\\<path>:<path>&later\\<path>:<path>&later\\<path>]",
+          "Error: file://h?x=[file://<path>&later\\<path>:<path>&later\\<path>:<path>&later\\<path>]",
+        ],
+      ],
+      [
+        "bracket-prefixed colon target before a dropped drive and a file literal with a port",
+        "[file://h?x=[file:///Users/CHILD/x&later\\/home/XY:/Users/S/s&later\\/C:/Users/S&later\\/home/file://h:8/Users/ZQ]",
+        [
+          "[file://h?x=[file://<path>&later\\<path>:<path>&later\\/C:/Users/S&later\\/home/file://h:8<path>]",
+          "[file://h?x=[file://<path>&later\\<path>:<path>&later\\<path>:<path>&later\\<path><path>]",
+          "[file://h?x=[file://<path>&later\\<path>:<path>&later\\<path>:<path>&later\\<path><path>]",
+        ],
+      ],
+      [
+        "newline-prefixed colon target before a dropped drive and a bare file literal",
+        "x\nfile://h?x=[file:///Users/CHILD/x&later\\/home/XY:/Users/S/s&later\\/C:/Users/S&later\\/home/file://]",
+        [
+          "x\nfile://h?x=[file://<path>&later\\<path>:<path>&later\\/C:/Users/S&later\\/home/file://]",
+          "x\nfile://h?x=[file://<path>&later\\<path>:<path>&later\\<path>:<path>&later\\<path>]",
+          "x\nfile://h?x=[file://<path>&later\\<path>:<path>&later\\<path>:<path>&later\\<path>]",
+        ],
+      ],
+      [
+        "HTTPS wrapper colon-file target before a plain successor and a glued file literal",
+        "https://h?x=[file:///Users/CHILD/x&later\\/home/XY:/Users/ZA/s/file:///Users/ZB/t&k=v&later\\/home/ZS/-file:///Users/ZT]",
+        [
+          "https://h?x=[file://<path>&later\\<path>:<path><path>&k=v&later\\/home/ZS/-file://<path>]",
+          "https://h?x=[file://<path>&later\\<path>:<path><path>&k=v&later\\<path><path>]",
+          "https://h?x=[file://<path>&later\\<path>:<path><path>&k=v&later\\<path><path>]",
+        ],
+      ],
+      [
+        "prefixed HTTPS wrapper file target before a drive and a hosted file literal",
+        "err: https://h?x=[file:///Users/CHILD/x&later\\/home/file:///Users/T&C:/Users/ZQ&later\\/home/file://host]",
+        [
+          "err: https://h?x=[file://<path>&later\\<path><path>&C:<path>&later\\/home/file://host]",
+          "err: https://h?x=[file://<path>&later\\<path><path>&C:<path>&later\\<path>]",
+          "err: https://h?x=[file://<path>&later\\<path><path>&C:<path>&later\\<path>]",
+        ],
+      ],
+      [
+        "prefixed HTTP wrapper file target before a drive and a hosted file literal",
+        "err: http://h?x=[file:///Users/CHILD/x&later\\/home/file:///Users/T&C:/Users/ZQ&later\\/home/file://host]",
+        [
+          "err: http://h?x=[file://<path>&later\\<path><path>&C:<path>&later\\/home/file://host]",
+          "err: http://h?x=[file://<path>&later\\<path><path>&C:<path>&later\\<path>]",
+          "err: http://h?x=[file://<path>&later\\<path><path>&C:<path>&later\\<path>]",
+        ],
+      ],
+      [
+        "HTTPS wrapper colon-file target before a dropped drive and a drive-led file",
+        "https://h?x=[file:///Users/CHILD/x&later\\/home/XY:/S/file:///T&later\\/C:/Users/S&later\\/home/file:///C:/U]",
+        [
+          "https://h?x=[file://<path>&later\\<path>:<path><path>&later\\/C:/Users/S&later\\/home/file://<path>]",
+          "https://h?x=[file://<path>&later\\<path>:<path><path>&later\\<path>:<path>&later\\<path><path>]",
+          "https://h?x=[file://<path>&later\\<path>:<path><path>&later\\<path>:<path>&later\\<path><path>]",
+        ],
+      ],
+      [
+        "file target before a dropped drive, a plain successor, and a bare file literal",
+        "file://h?x=[file:///Users/CHILD/x&later\\/home/file:///Users/T/t&later\\/C:/Users/S&plain&later\\/home/alice/file://]",
+        [
+          "file://h?x=[file://<path>&later\\<path><path>&later\\/C:/Users/S&plain&later\\<path>file://]",
+          "file://h?x=[file://<path>&later\\<path><path>&later\\<path>:<path>&plain&later\\<path>file://]",
+          "file://h?x=[file://<path>&later\\<path><path>&later\\<path>:<path>&plain&later\\<path>file://]",
+        ],
+      ],
+      [
+        "colon target before a dropped drive and a backslash drive successor",
+        "file://h?x=[file:///Users/CHILD/x&later\\/home/XY:/Users/S/s&later\\/C:/Users/S&later\\/home/C:\\Users\\ZQB]",
+        [
+          "file://h?x=[file://<path>&later\\<path>:<path>&later\\/C:/Users/S&later\\/home/<path>]",
+          "file://h?x=[file://<path>&later\\<path>:<path>&later\\<path>:<path>&later\\<path><path>]",
+          "file://h?x=[file://<path>&later\\<path>:<path>&later\\<path>:<path>&later\\<path><path>]",
+        ],
+      ],
+      [
+        "colon target before a direct file successor",
+        "file://h?x=[file:///Users/CHILD/x&later\\/home/XY:/Users/T/t&later\\/file:///Users/NEST/x]",
+        [
+          "file://h?x=[file://<path>&later\\<path>:<path>&later\\/file://<path>]",
+          "file://h?x=[file://<path>&later\\<path>:<path>&later\\<path><path>]",
+          "file://h?x=[file://<path>&later\\<path>:<path>&later\\<path><path>]",
+        ],
+      ],
+      [
+        "file target before a direct file successor",
+        "file://h?x=[file:///Users/CHILD/x&later\\/home/file:///Users/T/t&later\\/file:///Users/NEST/x]",
+        [
+          "file://h?x=[file://<path>&later\\<path><path>&later\\/file://<path>]",
+          "file://h?x=[file://<path>&later\\<path><path>&later\\<path><path>]",
+          "file://h?x=[file://<path>&later\\<path><path>&later\\<path><path>]",
+        ],
+      ],
+    ] as const)("keeps the escalation-round pass sequence: %s", (_name, input, expected) => {
+      const first = sanitizeError(input);
+      const second = sanitizeError(first);
+      const third = sanitizeError(second);
+
+      expect(first).toBe(expected[0]);
+      expect(second).toBe(expected[1]);
+      expect(third).toBe(expected[2]);
+    });
+
+    it.each([
+      ["https://h?x=[file:///Users/CHILD/x", "&later\\/home/XY:/a/b", 10000, "]"],
+      ["https://h?x=[file:///Users/CHILD/x", "&later\\/home/file:///a/b", 8000, "]"],
+      ["https://h?x=[file:///Users/CHILD/x", "&later\\/home/XY:/a/b", 10000, "&file://]"],
+      ["Error: file://h?x=[file:///Users/CHILD/x", "&later\\/home/file:///Users/T/t&later\\/C:/Users/S", 5000, "]"],
+    ] as const)(
+      "completes long prefixed mixed-successor chains in linear time: %s%s",
+      (prefix, unit, count, suffix) => {
+        const input = prefix + unit.repeat(count) + suffix;
+        expect(input.length).toBeGreaterThan(190000);
+
+        const started = performance.now();
+        const first = sanitizeError(input);
+        const second = sanitizeError(first);
+        const elapsed = performance.now() - started;
+
+        expect(first).not.toContain("/a/b");
+        expect(first).not.toContain("/Users/T/t");
+        expect(second).not.toContain("/C:/Users/S");
+        expect(sanitizeError(second)).toBe(second);
+        expect(elapsed).toBeLessThan(2000);
+      },
+    );
   });
 
   it("preserves the Bug #1336 root anchor after the pipe-handoff fix", () => {
