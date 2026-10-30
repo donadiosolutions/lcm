@@ -365,6 +365,9 @@ function findUrlPathStarts(chars: readonly string[]): UrlPathStarts {
     nestedStops: Array<readonly [index: number, marker: 1 | 2]>;
   };
   const mixedCompletionPlans: MixedCompletionPlan[] = [];
+  // The owning nested file literal is validated once per owner: its
+  // authority may be long and every successor of the same owner asks again.
+  const wellFormedOwnerLiterals = new Map<number, boolean>();
   // A file literal is well formed when its authority is empty or a plain host
   // token and a slash follows. Returns that slash or -1.
   const fileLiteralPathStart = (start: number): number => {
@@ -441,7 +444,13 @@ function findUrlPathStarts(chars: readonly string[]): UrlPathStarts {
   ): MixedCompletionPlan | null | undefined => {
     // The owning nested file literal must itself be well formed: later passes
     // rely on its shape once a claimed literal no longer restarts the scan.
-    if (!isFileUrlLiteral(chars, ownerStart) || fileLiteralPathStart(ownerStart) < 0) return null;
+    let ownerWellFormed = wellFormedOwnerLiterals.get(ownerStart);
+    if (ownerWellFormed === undefined) {
+      ownerWellFormed =
+        isFileUrlLiteral(chars, ownerStart) && fileLiteralPathStart(ownerStart) >= 0;
+      wellFormedOwnerLiterals.set(ownerStart, ownerWellFormed);
+    }
+    if (!ownerWellFormed) return null;
     const plan: MixedCompletionPlan = {
       forcedStarts: [],
       nestedStops: [],
@@ -479,9 +488,6 @@ function findUrlPathStarts(chars: readonly string[]): UrlPathStarts {
         while (tokenStart > pathStart && isPathWord(chars[tokenStart - 1])) tokenStart -= 1;
         const scheme = chars.slice(tokenStart, cursor).join("");
         if (!/^[A-Za-z\d]+$/u.test(scheme)) return null;
-        const validAuthorityScheme =
-          URL_SCHEME_START_PATTERN.test(scheme.charAt(0)) &&
-          [...scheme].every((schemeChar) => URL_SCHEME_CHARACTER_PATTERN.test(schemeChar));
         const numericDoubleSlash = /^\d+$/u.test(scheme);
         if (chars[cursor + 2] === "/" && !numericDoubleSlash) return null;
         if (scheme.toLowerCase() === FILE_SCHEME) return null;

@@ -8069,6 +8069,29 @@ describe("sanitizeError", () => {
         expect(elapsed).toBeLessThan(2000);
       },
     );
+
+    it.each([
+      ["plain host owner, colon successors", "h".repeat(48000), "/Users/CHILD/x", "&later\\/home/XY:/Users/S/s", 4800],
+      ["plain host owner, colon successors, doubled", "h".repeat(96000), "/Users/CHILD/x", "&later\\/home/XY:/Users/S/s", 9600],
+      ["plain host owner, file successors", "h".repeat(48000), "/Users/CHILD/x", "&later\\/home/file:///Users/S/s", 4800],
+      ["plain host owner, public bracket successors", "h".repeat(48000), "/Users/CHILD/x", "&later\\/home/XY:/a([https://o?key=/U/x]", 4000],
+      ["malformed owner authority, colon successors", "h".repeat(48000), "[/Users/CHILD/x", "&later\\/home/XY:/Users/S/s", 4800],
+    ] as const)(
+      "validates a long owner authority once for many successors: %s",
+      (_name, authority, ownerPath, unit, count) => {
+        const input = "file://h?x=[file://" + authority + ownerPath + unit.repeat(count) + "]";
+        expect(input.length).toBeGreaterThan(170000);
+
+        const started = performance.now();
+        const first = sanitizeError(input);
+        const second = sanitizeError(first);
+        const elapsed = performance.now() - started;
+
+        expect(first).not.toContain("/Users/CHILD/x");
+        expect(sanitizeError(second)).toBe(second);
+        expect(elapsed).toBeLessThan(2000);
+      },
+    );
   });
 
   it("preserves the Bug #1336 root anchor after the pipe-handoff fix", () => {
