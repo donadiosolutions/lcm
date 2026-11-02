@@ -586,6 +586,14 @@ function runAdmissionScenario(
     closed?: boolean;
     ciFailure?: boolean;
     readbackMissing?: boolean;
+    discovery?: {
+      associationPages?: unknown;
+      associationError?: boolean;
+      openPages?: unknown;
+      openSnapshots?: unknown[];
+      openError?: boolean;
+      pullRequest?: ReturnType<typeof makeAdmissionPullRequest>;
+    };
   } = {},
 ) {
   const directory = mkdtempSync(join(tmpdir(), "external-admission-scenario-"));
@@ -597,6 +605,7 @@ function runAdmissionScenario(
   const statusLogPath = join(directory, "statuses.log");
   const controlStatusesPath = join(directory, "control-statuses.json");
   const compareCallsPath = join(directory, "compare-calls.log");
+  const openPullRequestCallsPath = join(directory, "open-pr-calls.log");
   const headSha = "a".repeat(40);
   const ciRunId = "123";
   const ciCheckRun = {
@@ -781,6 +790,7 @@ function runAdmissionScenario(
     branchProtectionSequence = ["true"];
   }
   if (control.closed) pullRequest = { ...pullRequest, state: "closed" };
+  if (control.discovery?.pullRequest) pullRequest = control.discovery.pullRequest;
   if (control.ciFailure) ciCheckRun.conclusion = "failure";
 
   try {
@@ -818,6 +828,19 @@ if [[ "$endpoint" == repos/*/statuses/* ]]; then
 fi
 if [[ "$endpoint" == repos/*/commits/*/pulls?per_page=100 ]]; then
   printf '%s\n' "$ASSOCIATED_PRS_JSON"
+  if [[ "$ASSOCIATION_ERROR" == true ]]; then exit 76; fi
+  exit 0
+fi
+if [[ "$endpoint" == "repos/$REPOSITORY/pulls?state=open&per_page=100" ]]; then
+  read -r call_count < "$OPEN_PR_CALLS"
+  call_count=$((call_count + 1))
+  printf '%s\n' "$call_count" > "$OPEN_PR_CALLS"
+  if [[ "$OPEN_PR_SNAPSHOTS" != null ]]; then
+    jq -c --argjson index "$((call_count - 1))" '.[$index] // .[-1]' <<< "$OPEN_PR_SNAPSHOTS"
+  else
+    printf '%s\n' "$OPEN_PRS_JSON"
+  fi
+  if [[ "$OPEN_PR_ERROR" == true ]]; then exit 77; fi
   exit 0
 fi
 if [[ "$endpoint" == repos/*/pulls/123 ]]; then
@@ -888,12 +911,18 @@ exit 99
     writeFileSync(statusLogPath, "");
     writeFileSync(controlStatusesPath, JSON.stringify(control.statuses ?? []));
     writeFileSync(compareCallsPath, "0\n");
+    writeFileSync(openPullRequestCallsPath, "0\n");
 
     const result = spawnSync("bash", [evaluatorPath], {
       encoding: "utf8",
       env: {
         ...process.env,
-        ASSOCIATED_PRS_JSON: JSON.stringify(associatedPullRequests),
+        ASSOCIATED_PRS_JSON: JSON.stringify(control.discovery?.associationPages ?? associatedPullRequests),
+        ASSOCIATION_ERROR: String(control.discovery?.associationError ?? false),
+        OPEN_PR_CALLS: openPullRequestCallsPath,
+        OPEN_PRS_JSON: JSON.stringify(control.discovery?.openPages ?? [[]]),
+        OPEN_PR_SNAPSHOTS: JSON.stringify(control.discovery?.openSnapshots ?? null),
+        OPEN_PR_ERROR: String(control.discovery?.openError ?? false),
         BRANCH_CALLS: branchCallsPath,
         BRANCH_DELETED_SUFFIX: branchDeletedSuffix,
         BRANCH_LOOKUP_MUST_NOT_HAPPEN: String(branchLookupMustNotHappen),
@@ -939,6 +968,7 @@ exit 99
       controlStatuses: JSON.parse(readFileSync(controlStatusesPath, "utf8")) as Record<string, unknown>[],
       compareCalls: Number(readFileSync(compareCallsPath, "utf8").trim()),
       checkRunCalls: Number(readFileSync(checkRunCallsPath, "utf8").trim()),
+      openPullRequestCalls: Number(readFileSync(openPullRequestCallsPath, "utf8").trim()),
     };
   } finally {
     rmSync(directory, { force: true, recursive: true });
@@ -946,6 +976,91 @@ exit 99
 }
 
 describe("external admission workflow", () => {
+  const fork = (() => {
+    const pullRequest = makeAdmissionPullRequest({ headRepository: "bcdonadio/lcm" });
+    return { ...pullRequest, head: { ...pullRequest.head,
+      repo: { ...pullRequest.head.repo, id: 1443261225 } } };
+  })();
+
+  it("discovers an exact-head fork from paginated open PRs when commit associations are empty", () => {
+    const unrelated = makeAdmissionPullRequest({ number: 124, headSha: "b".repeat(40) });
+    const discovered = runAdmissionScenario("protected-main", undefined, { discovery: {
+      associationPages: [[]], openPages: [[unrelated], [fork]], pullRequest: fork,
+    } });
+    expect(discovered.result.status, discovered.result.stderr).toBe(0);
+    expect(discovered.statuses.at(-1)?.split("\t", 1)[0]).toBe("success");
+    expect(discovered.openPullRequestCalls).toBe(3);
+    expect(discovered.checkRunCalls).toBe(3);
+    expect(discovered.compareCalls).toBe(3);
+    expect(discovered.fileCalls).toBe(0);
+  });
+
+  it.each(["none", "multiple", "wrong-head", "draft", "wrong-repository", "unsupported-base", "closed"])(
+    "refuses empty associations with %s open-list eligibility", (variant) => {
+      const variants = {
+        none: [], multiple: [fork, { ...fork, number: 124 }],
+        "wrong-head": [{ ...fork, head: { ...fork.head, sha: "b".repeat(40) } }],
+        draft: [{ ...fork, draft: true }],
+        "wrong-repository": [{ ...fork, base: { ...fork.base, repo: { full_name: "other/repository" } } }],
+        "unsupported-base": [{ ...fork, base: { ...fork.base, ref: "release/unprotected" } }],
+        closed: [{ ...fork, state: "closed" }],
+      };
+      const refused = runAdmissionScenario("protected-main", undefined, { discovery: {
+        associationPages: [[]], openPages: [variants[variant as keyof typeof variants]], pullRequest: fork,
+      } });
+      expect(refused.result.status, refused.result.stderr).toBe(0);
+      expect(refused.statuses.at(-1)?.split("\t", 1)[0]).toBe("failure");
+      expect(refused.statuses.some((status) => status.startsWith("success\t"))).toBe(false);
+      expect(refused.checkRunCalls).toBe(0);
+    },
+  );
+
+  it.each([{}, [], [{ message: "API error" }], [[null]], [[{ head: null }]], [[{ head: { sha: 42 } }]]]
+    .map((openPages) => ({ openPages })))(
+    "fails closed on malformed open-PR pages %j", ({ openPages }) => {
+      const refused = runAdmissionScenario("protected-main", undefined, { discovery: {
+        associationPages: [[]], openPages,
+      } });
+      expect(refused.result.status, refused.result.stderr).not.toBe(0);
+      expect(refused.statuses.at(-1)?.split("\t", 1)[0]).toBe("failure");
+      expect(refused.checkRunCalls).toBe(0);
+    },
+  );
+
+  it("does not fall back after an association API failure or override nonempty ineligible associations", () => {
+    for (const discovery of [{ associationPages: [[]], associationError: true },
+      { associationPages: [[{ ...fork, draft: true }]] }]) {
+      const refused = runAdmissionScenario("protected-main", undefined, { discovery: {
+        ...discovery, openPages: [[fork]], pullRequest: fork,
+      } });
+      expect(refused.statuses.at(-1)?.split("\t", 1)[0]).toBe("failure");
+      expect(refused.openPullRequestCalls).toBe(0);
+      expect(refused.checkRunCalls).toBe(0);
+      if (discovery.associationError) expect(refused.result.status).toBe(76);
+    }
+  });
+
+  it("rejects partial fallback output when paginated transport fails", () => {
+    const refused = runAdmissionScenario("protected-main", undefined, { discovery: {
+      associationPages: [[]], openPages: [[fork]], openError: true, pullRequest: fork,
+    } });
+    expect(refused.result.status, refused.result.stderr).toBe(77);
+    expect(refused.statuses.at(-1)?.split("\t", 1)[0]).toBe("failure");
+    expect(refused.checkRunCalls).toBe(0);
+  });
+
+  it.each([1, 2])("refuses a fallback PR head change at snapshot %s", (index) => {
+    const snapshots = Array.from({ length: 3 }, (_, position) =>
+      [[position >= index ? { ...fork, head: { ...fork.head, sha: "b".repeat(40) } } : fork]]);
+    const changed = runAdmissionScenario("protected-main", undefined, { discovery: {
+      associationPages: [[]], openSnapshots: snapshots, pullRequest: fork,
+    } });
+    expect(changed.result.status, changed.result.stderr).toBe(0);
+    expect(changed.statuses.at(-1)?.split("\t", 1)[0]).toBe("failure");
+    expect(changed.statuses.some((status) => status.startsWith("success\t"))).toBe(false);
+    expect(changed.openPullRequestCalls).toBe(index + 1);
+  });
+
   it("uses the latest canonical CI run when a workflow event ID is stale", () => {
     const { result, statuses } = runAdmissionScenario("stale-workflow-run");
     expect(result.status, `${result.stdout}\n${result.stderr}\n${statuses.join("\n")}`).toBe(0);

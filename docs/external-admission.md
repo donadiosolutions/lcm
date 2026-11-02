@@ -23,6 +23,13 @@ Use repository-dispatch recovery only when an expected DCO or CI event was
 delayed or lost. Recovery re-evaluates current GitHub state; it does not bypass,
 replace, or manufacture any required check.
 
+If GitHub returns no pull requests associated with the head commit, admission
+also checks the repository's open pull requests for that exact head. This
+allows fork contributions to be discovered when GitHub omits their commit
+association. The same unique-PR eligibility and three-snapshot checks still
+apply. Missing or ambiguous candidates, API failures, and malformed responses
+cannot grant admission; recovery dispatches do not override those failures.
+
 ## Prerequisites and permissions
 
 - Authenticate GitHub CLI as a repository maintainer and confirm the target

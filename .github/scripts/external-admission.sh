@@ -333,10 +333,29 @@ post_admission_status() {
 }
 
 fetch_associated_pull_requests() {
-  gh api --paginate --slurp \
+  local associated
+  associated="$(gh api --paginate --slurp \
     -H "X-GitHub-Api-Version: 2022-11-28" \
     "repos/$REPOSITORY/commits/$HEAD_SHA/pulls?per_page=100" \
-    | jq -c 'flatten(1)'
+    | jq -c 'flatten(1)')" || return $?
+  if [[ "$associated" != '[]' ]]; then
+    printf '%s\n' "$associated"
+    return 0
+  fi
+
+  # GitHub can omit fork PRs from commit associations. Discover exact-head
+  # candidates in the base repository, then reuse normal unique eligibility.
+  gh api --paginate --slurp \
+    -H "X-GitHub-Api-Version: 2022-11-28" \
+    "repos/$REPOSITORY/pulls?state=open&per_page=100" \
+    | jq -ce --arg head "$HEAD_SHA" '
+      if type != "array" or length == 0 or any(.[]; type != "array")
+      then error("Invalid open pull request pages")
+      else [.[][] |
+        if type != "object" or (.head | type != "object") or (.head.sha | type != "string")
+        then error("Invalid open pull request") else . end |
+        select(.head.sha == $head)]
+      end'
 }
 
 fetch_pull_request() {
