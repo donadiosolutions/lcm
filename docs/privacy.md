@@ -791,13 +791,16 @@ bundle and keep provider, credential, quarantine, and recovery sessions private.
   whitespace, unsupported nesting, and malformed path segments refuse the
   drive-prefix rule for the complete bracket. Refused brackets keep their
   established whole-drive behavior, including through descendant brackets.
-  An independent later mixed copy is admitted only after a straight owner, when
-  its own bracket matches the same grammar, when its successor path leads
-  straight to the copy bracket
+  An independent later mixed copy is admitted only when the owner's path leads
+  straight to the first depth-zero bracket that follows it, when its own
+  bracket matches the same grammar, when its successor path leads straight to
+  the copy bracket
   (optionally through one parenthesis), and, for a `file://` copy header, only
   when the preceding component opened with `?` or `#`; otherwise the copy
-  keeps its established pass sequence. Space, tab, line feed, and carriage
-  return remain hard
+  keeps its established pass sequence. The owner's straightness is measured once,
+  at that first bracket, and the result applies to every later sibling bracket,
+  including when the earlier sibling was itself refused. Space, tab, line feed,
+  and carriage return remain hard
   boundaries, and whitespace never upgrades a tail that did not explicitly
   request drive-prefix handling.
   An unmatched `]`, text outside a component after the span stopped, whitespace,
@@ -910,6 +913,20 @@ bundle and keep provider, credential, quarantine, and recovery sessions private.
   URLs retain their conservative file-path classification through `?` and `#`,
   so a nested non-file URL in that quoted span may still be redacted as a path.
   There are no configuration options for this defense-in-depth behavior.
+- Sanitizing an error message is stable: sanitizing the result again changes
+  nothing. When hiding one path uncovers the start of another, for example a
+  successor after a quoted URL and a separator containing a slash, the first
+  call returns the text that the later passes of earlier releases produced, so
+  `file://h?x=['https://outer.test/x?next=file:///Users/a/My Files/private.db'abc/def|\Users\SECRET\x]`
+  hides the Windows value on the first call. Passes only replace text with
+  `<path>`, so repeating them never reveals text that an earlier pass hid.
+  Wherever this section says that a shape keeps its established pass sequence
+  or is reached on a later pass, the first call now returns the final result of
+  that sequence. LCM repeats the pass at most seven times so the cost stays
+  linear. A message built from a long chain of dependent shapes, such as
+  `/s://=` repeated more than six times, can need more passes than that; it
+  hides at least as much as the first pass of earlier releases, but sanitizing
+  its result again can hide more.
 - Hook project paths retain leading and trailing whitespace. Directories whose names differ only by that whitespace remain separate LCM projects.
 - Hook errors are attached to a project sidecar only when the reported working directory is an existing directory. Invalid paths are recorded in the bounded fallback log without creating project metadata.
 - Stats, status, pool diagnostics, and doctor use an allowlisted backend snapshot. They omit recalled-text previews (`topRecalled`), memory and transcript payloads, raw errors, SQL values, URLs, role names, CA paths, and arbitrary local paths. Verbose diagnostics retain the same boundary. Only observed numeric aggregates, safe identifiers, classified states, and fixed guidance are exposed. SQLite content is not modified; necessary WAL/SHM read coordination may occur. See [observational diagnostics](cli.md#observational-diagnostics). PostgreSQL telemetry follows the [telemetry and redaction contract](../src/storage/postgresql/reference/postgresql-telemetry.md).

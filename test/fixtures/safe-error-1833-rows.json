@@ -1,0 +1,412 @@
+[
+  {
+    "name": "residual-1",
+    "input": "file://h?x=[file:///Users/CHILD/x&later\\/var/alice/s([https://other?key=C:/Users/K/x]",
+    "expected": "file://h?x=[file://<path>&later\\<path>?key=<path>]"
+  },
+  {
+    "name": "residual-2",
+    "input": "file://h?x=[file:///Users/CHILD/x&later\\/homes/alice/s([https://other?key=C:/Users/K/x]",
+    "expected": "file://h?x=[file://<path>&later\\<path>?key=<path>]"
+  },
+  {
+    "name": "residual-3",
+    "input": "file://h?x=[file:///Users/CHILD/x&later\\/a/home/alice/s([https://other?key=C:/Users/K/x]",
+    "expected": "file://h?x=[file://<path>&later\\<path>?key=<path>]"
+  },
+  {
+    "name": "residual-4",
+    "input": "file://h?x=[file:///Users/CHILD/x&/Users/alice/s[file:///b[x&C:/Users/K/x]]",
+    "expected": "file://h?x=[file://<path>&<path>&<path>]]"
+  },
+  {
+    "name": "residual-5",
+    "input": "file://h?x=[file:///Users/CHILD/x&/Users/alice/s[file:///b][y&C:/Users/K/x]",
+    "expected": "file://h?x=[file://<path>&<path>&<path>]"
+  },
+  {
+    "name": "residual-6",
+    "input": "file://h?x=[file:///Users/CHILD/x&/Users/alice/s[file:/b&C:/Users/K/x]",
+    "expected": "file://h?x=[file://<path>&<path>&<path>]"
+  },
+  {
+    "name": "residual-7",
+    "input": "file://h?x=[file:///Users/CHILD/x&later\\/home/alice/s([https://other?key=C:/?q]",
+    "expected": "file://h?x=[file://<path>&later\\<path>?key=<path>?q]"
+  },
+  {
+    "name": "residual-8",
+    "input": "file://h?x=[file:///Users/CHILD/x&later\\/home/alice/s([https://other?key=C:/ x]",
+    "expected": "file://h?x=[file://<path>&later\\<path>?key=<path> x]"
+  },
+  {
+    "name": "residual-9",
+    "input": "file://h?x=[file:///Users/CHILD/x&later\\/home/alice/s([https://other?key=C:/Users/S1/x &k2=D:/Users/S2/y]",
+    "expected": "file://h?x=[file://<path>&later\\<path>?key=<path>&k2=<path>]"
+  },
+  {
+    "name": "residual-10",
+    "input": "file://h?x=[file:///Users/CHILD/x&later\\/home/alice/s([https://other?key=C:/Users/S1/x &k2=D:/Users/S2/y]",
+    "expected": "file://h?x=[file://<path>&later\\<path>?key=<path>&k2=<path>]"
+  },
+  {
+    "name": "residual-11",
+    "input": "file://h?x=[file:///Users/CHILD/x&later\\/home/alice/s([https://other?key=C:/Users/S1/x　&k2=D:/Users/S2/y]",
+    "expected": "file://h?x=[file://<path>&later\\<path>?key=<path>&k2=<path>]"
+  },
+  {
+    "name": "residual-12",
+    "input": "file://h?x=[file:///Users/CHILD/x&later\\/home/alice/s([https://other?key=C:/Users/S1/x﻿&k2=D:/Users/S2/y]",
+    "expected": "file://h?x=[file://<path>&later\\<path>?key=<path>&k2=<path>]"
+  },
+  {
+    "name": "residual-13",
+    "input": "file://h?x=[file:///Users/CHILD/x&later\\/home/alice/s([https://other?key=C:/Users/S1/x &k2=D:/Users/S2/y]",
+    "expected": "file://h?x=[file://<path>&later\\<path>?key=<path>&k2=<path>]"
+  },
+  {
+    "name": "residual-14",
+    "input": "file://h?x=[file:///Users/CHILD/x&later\\/home/alice/s([https://other?key=C:/Users/S1/x &k2=D:/Users/S2/y]",
+    "expected": "file://h?x=[file://<path>&later\\<path>?key=<path>&k2=<path>]"
+  },
+  {
+    "name": "residual-15",
+    "input": "file://h?x=[file:///Users/CHILD/x&later\\/home/alice/s([https://other?key=C:/C:/Users/K]",
+    "expected": "file://h?x=[file://<path>&later\\<path>?key=<path>:<path>]"
+  },
+  {
+    "name": "residual-16",
+    "input": "file://h?x=[file:///Users/CHILD/x&/Users/alice/s[x&C:/Users/K/x]",
+    "expected": "file://h?x=[file://<path>&<path>&<path>]"
+  },
+  {
+    "name": "residual-17",
+    "input": "file://h?x=[file:///Users/CHILD/x&later\\/home/alice/s([https://other?key=C:/Users/S1/x &k2=D:/Users/S2/y]",
+    "expected": "file://h?x=[file://<path>&later\\<path>?key=<path>&k2=<path>]"
+  },
+  {
+    "name": "residual-18",
+    "input": "file://h?x=[file:///Users/CHILD/x&later\\/home/alice/s([https://other?key=C:/Users/S1/x &k2=D:/Users/S2/y]",
+    "expected": "file://h?x=[file://<path>&later\\<path>?key=<path>&k2=<path>]"
+  },
+  {
+    "name": "residual-19",
+    "input": "file://h?x=[file:///Users/CHILD/x&later\\/home/alice/s([https://other?key=C:/Users/S1/x &k2=D:/Users/S2/y]",
+    "expected": "file://h?x=[file://<path>&later\\<path>?key=<path>&k2=<path>]"
+  },
+  {
+    "name": "residual-20",
+    "input": "file://h?x=[file:///Users/CHILD/x&later\\/home/alice/s([https://other?key=C:/Users/S1/x &k2=D:/Users/S2/y]",
+    "expected": "file://h?x=[file://<path>&later\\<path>?key=<path>&k2=<path>]"
+  },
+  {
+    "name": "residual-21",
+    "input": "file://h?x=[file:///Users/CHILD/x&later\\/home/alice/s([https://other?key=C:/Users/S1/x &k2=D:/Users/S2/y]",
+    "expected": "file://h?x=[file://<path>&later\\<path>?key=<path>&k2=<path>]"
+  },
+  {
+    "name": "residual-22",
+    "input": "file://h?x=[file:///Users/CHILD/x&later\\/home/alice/s([https://other?key=C:/Users/S1/x\u000b&k2=D:/Users/S2/y]",
+    "expected": "file://h?x=[file://<path>&later\\<path>?key=<path>&k2=<path>]"
+  },
+  {
+    "name": "residual-23",
+    "input": "file://h?x=[file:///Users/CHILD/x&later\\/home/alice/s([https://other?key=C:/Users/S1/x\f&k2=D:/Users/S2/y]",
+    "expected": "file://h?x=[file://<path>&later\\<path>?key=<path>&k2=<path>]"
+  },
+  {
+    "name": "residual-24",
+    "input": "file://h?x=[file:///Users/CHILD/x&later\\/home/alice/s([https://other?key=C:/Users/K/x&D:/]",
+    "expected": "file://h?x=[file://<path>&later\\<path>?key=<path>&<path>]"
+  },
+  {
+    "name": "residual-25",
+    "input": "file://h?x=[file:///Users/CHILD/x&later\\/home/alice/s([https://other?key=C:/Users/K/x[https://inner?key=/home/C/s]]",
+    "expected": "file://h?x=[file://<path>&later\\<path>?key=<path>?key=<path>]]"
+  },
+  {
+    "name": "residual-26",
+    "input": "file://h?x=[file:///Users/CHILD/x&later\\/home/alice/s([https://other?key=C:/Users/S1/x &k2=D:/Users/S2/y]",
+    "expected": "file://h?x=[file://<path>&later\\<path>?key=<path>&k2=<path>]"
+  },
+  {
+    "name": "residual-27",
+    "input": "file://h?x=[file:///Users/CHILD/x&later\\/home/alice/s([https://other?key=C:/Users/S1/x &k2=D:/Users/S2/y]",
+    "expected": "file://h?x=[file://<path>&later\\<path>?key=<path>&k2=<path>]"
+  },
+  {
+    "name": "residual-28",
+    "input": "file://h?x=[file:///Users/CHILD/x&later\\/home/alice/s([https://other?key=C:/Users/S1/x &k2=D:/Users/S2/y]",
+    "expected": "file://h?x=[file://<path>&later\\<path>?key=<path>&k2=<path>]"
+  },
+  {
+    "name": "residual-29",
+    "input": "file://h?x=[file:///Users/CHILD/x&later\\/home/alice/s([https://other?key=C:/Users/S1/x &k2=D:/Users/S2/y]",
+    "expected": "file://h?x=[file://<path>&later\\<path>?key=<path>&k2=<path>]"
+  },
+  {
+    "name": "residual-30",
+    "input": "file://h?x=[file:///Users/CHILD/x&later\\/home/alice/s([https://other?key=C:/Users/S1/x &k2=D:/Users/S2/y]",
+    "expected": "file://h?x=[file://<path>&later\\<path>?key=<path>&k2=<path>]"
+  },
+  {
+    "name": "residual-31",
+    "input": "file://h?x=[file:///Users/CHILD/x&later\\/home/alice/s([https://other?key=C:/Users/S1/x &k2=D:/Users/S2/y]",
+    "expected": "file://h?x=[file://<path>&later\\<path>?key=<path>&k2=<path>]"
+  },
+  {
+    "name": "residual-32",
+    "input": "file://h?x=[file:///Users/CHILD/x&later\\/home/alice/s([https://other?key=C:/Users/S1/x &k2=D:/Users/S2/y]",
+    "expected": "file://h?x=[file://<path>&later\\<path>?key=<path>&k2=<path>]"
+  },
+  {
+    "name": "residual-33",
+    "input": "file://h?x=[file:///Users/CHILD/x&later\\/home/alice/s([https://other?key=C:/Users/S1/x &k2=D:/Users/S2/y]",
+    "expected": "file://h?x=[file://<path>&later\\<path>?key=<path>&k2=<path>]"
+  },
+  {
+    "name": "residual-34",
+    "input": "file://h?x=[file:///Users/CHILD/x&later\\/x/s([https://other?key=C:/Users/K/x]",
+    "expected": "file://h?x=[file://<path>&later\\<path>?key=<path>]"
+  },
+  {
+    "name": "residual-35",
+    "input": "file://h?x=[file:///Users/CHILD/x&later\\/opt/app/s([https://other?key=C:/Users/K/x]",
+    "expected": "file://h?x=[file://<path>&later\\<path>?key=<path>]"
+  },
+  {
+    "name": "A-pathword",
+    "input": "file://h?x=[file:///Users/CHILD/x&later\\/home/alice/s([https://other?key=C:/Users/K/x([https://i&D:/Users/z?key=/Users/I/s]]",
+    "expected": "file://h?x=[file://<path>&later\\<path>?key=<path>&<path>?key=<path>]]"
+  },
+  {
+    "name": "A-empty",
+    "input": "file://h?x=[file:///Users/CHILD/x&later\\/home/alice/s([https://other?key=C:/Users/K/x([https://?key=/x]]",
+    "expected": "file://h?x=[file://<path>&later\\<path>?key=<path>?key=<path>]]"
+  },
+  {
+    "name": "B-prior-drive",
+    "input": "file://h?x=[file:///Users/CHILD/x&later\\/home/alice/s([https://other#C:/x?key=D:/]",
+    "expected": "file://h?x=[file://<path>&later\\<path>#<path>?key=<path>]"
+  },
+  {
+    "name": "E-owner-flat",
+    "input": "file://h?x=[file:///Users/CHILD/x&/https://Users/alice/s[file:///b&C:/Users/c]]",
+    "expected": "file://h?x=[file://<path>&<path>&<path>]]"
+  },
+  {
+    "name": "E-copy-gap",
+    "input": "file://h?x=[file:///Users/CHILD/x&later\\/home/alice/s([https://other?key=C:/]&later\\/home/bob/s(x)([https://other?key=C:/]",
+    "expected": "file://h?x=[file://<path>&later\\<path>?key=C:<path>]&later<path>?key=C:/]"
+  },
+  {
+    "name": "W1 owner",
+    "input": "file://h?x=[file:///Users/CHILD/x&later\\/home/alice/s/[https://other?key=C:/]",
+    "expected": "file://h?x=[file://<path>&later\\<path>?key=C:<path>]"
+  },
+  {
+    "name": "W2 owner",
+    "input": "file://h?x=[file:///Users/CHILD/x&later\\/home/alice/s\\([https://other?key=C:/]",
+    "expected": "file://h?x=[file://<path>&later\\<path>?key=C:<path>]"
+  },
+  {
+    "name": "W3 copy",
+    "input": "file://h?x=[file:///Users/CHILD/x&later\\/home/alice/s([https://other?key=C:/]&later\\/home/bob/s/[https://other?key=D:/]",
+    "expected": "file://h?x=[file://<path>&later\\<path>?key=C:<path>]&later<path>?key=D:<path>]"
+  },
+  {
+    "name": "W4 copy",
+    "input": "file://h?x=[file:///Users/CHILD/x&later\\/home/alice/s([https://other?key=C:/]&later\\/home/bob/s\\([https://other?key=D:/]",
+    "expected": "file://h?x=[file://<path>&later\\<path>?key=C:<path>]&later<path>?key=D:<path>]"
+  },
+  {
+    "name": "W5 both",
+    "input": "file://h?x=[file:///Users/CHILD/x&later\\/home/alice/s/[https://other?key=C:/]&later\\/home/bob/s/[https://other?key=D:/]",
+    "expected": "file://h?x=[file://<path>&later\\<path>?key=C:<path>]&later<path>?key=D:<path>]"
+  },
+  {
+    "name": "W6 copy, refused first",
+    "input": "file://h?x=[file:///Users/CHILD/x&later\\/home/alice/s([http://o?key=C:/]&later\\/home/bob/s/[https://other?key=D:/]",
+    "expected": "file://h?x=[file://<path>&later\\<path>?key=<path>]&later<path>?key=D:<path>]"
+  },
+  {
+    "name": "file-owner",
+    "input": "file://h?x=[file:///Users/CHILD/x&later\\/home/file:///Users/S/s([https://other?key=C:/]",
+    "expected": "file://h?x=[file://<path>&later\\<path>file://<path>?key=<path>]"
+  },
+  {
+    "name": "file-owner-no-paren",
+    "input": "file://h?x=[file:///Users/CHILD/x&later\\/home/file:///Users/S/s[https://other?key=C:/]",
+    "expected": "file://h?x=[file://<path>&later\\<path>file://<path>?key=<path>]"
+  },
+  {
+    "name": "file-owner-copy",
+    "input": "file://h?x=[file:///Users/CHILD/x&later\\/home/file:///Users/S/s([https://other?key=C:/]&later\\/home/bob/s([https://other?key=D:/]",
+    "expected": "file://h?x=[file://<path>&later\\<path>file://<path>?key=<path>]&later<path>?key=D:/]"
+  },
+  {
+    "name": "bent-one",
+    "input": "file://h?x=[file:///Users/CHILD/x&later\\/home/alice/s(x[https://other?key=C:/]",
+    "expected": "file://h?x=[file://<path>&later\\<path>?key=<path>]"
+  },
+  {
+    "name": "bent-two",
+    "input": "file://h?x=[file:///Users/CHILD/x&later\\/home/alice/s(x([https://other?key=C:/]",
+    "expected": "file://h?x=[file://<path>&later\\<path>?key=<path>]"
+  },
+  {
+    "name": "bent-copy",
+    "input": "file://h?x=[file:///Users/CHILD/x&later\\/home/alice/s(x[https://other&C:/Users/K/x]&later\\/home/bob/s([https://other?key=D:/]",
+    "expected": "file://h?x=[file://<path>&later\\<path>&C:<path>]&later\\<path>?key=D:<path>]"
+  },
+  {
+    "name": "sibling-copy",
+    "input": "file://h?x=[file:///Users/CHILD/x&later\\/home/alice/s[x][https://other?key=C:/]&later\\/home/bob/s([https://other?key=D:/]",
+    "expected": "file://h?x=[file://<path>&later\\<path>?key=<path>]&later<path>?key=D:<path>]"
+  },
+  {
+    "name": "empty-sibling-copy",
+    "input": "file://h?x=[file:///Users/CHILD/x&later\\/home/alice/s[]x[https://other?key=C:/]&later\\/home/bob/s([https://other?key=D:/]",
+    "expected": "file://h?x=[file://<path>&later\\<path>?key=<path>]&later<path>?key=D:<path>]"
+  },
+  {
+    "name": "copy-refused-key",
+    "input": "file://h?x=[file:///Users/CHILD/x&later\\/home/alice/s[https://other?k=C:/]&later\\/home/bob/s([https://other?key=D:/]",
+    "expected": "file://h?x=[file://<path>&later\\<path>?k=<path>]&later<path>?key=D:<path>]"
+  },
+  {
+    "name": "copy-refused-file",
+    "input": "file://h?x=[file:///Users/CHILD/x&later\\/home/alice/s[file:///b?key=CC:/]&later\\/home/bob/s([https://other?key=D:/]",
+    "expected": "file://h?x=[file://<path>&later\\<path>file://<path>?key=CC:/]&later\\<path>?key=D:<path>]"
+  },
+  {
+    "name": "copy-refused-space",
+    "input": "file://h?x=[file:///Users/CHILD/x&later\\/home/alice/s([https://other?key C:/]&later\\/home/bob/s([https://other?key=D:/]",
+    "expected": "file://h?x=[file://<path>&later\\<path>?key C:/]&later\\<path>?key=D:/]"
+  },
+  {
+    "name": "copy-refused-nbsp",
+    "input": "file://h?x=[file:///Users/CHILD/x&later\\/home/alice/s([https://other?key C:/]&later\\/home/bob/s([https://other?key=D:/]",
+    "expected": "file://h?x=[file://<path>&later\\<path>?key C:/]&later\\<path>?key=D:<path>]"
+  },
+  {
+    "name": "copy-refused-filekey",
+    "input": "file://h?x=[file:///Users/CHILD/x&later\\/home/alice/s([https://other?keyfile://C:/]&later\\/home/bob/s([https://other?key=D:/]",
+    "expected": "file://h?x=[file://<path>&later\\<path>?keyfile://C:/]&later<path>?key=D:<path>]"
+  },
+  {
+    "name": "copy-E-owner",
+    "input": "file://h?x=[file:///Users/CHILD/x&/https://Users/alice/s[file:///b&C:/Users/c]&later\\/home/bob/s([https://other?key=D:/Users/K/x]",
+    "expected": "file://h?x=[file://<path>&<path>https://Users/alice/s[file://<path>&<path>]&later\\/home/bob/s([https://other?key=D:/Users/K/x]"
+  },
+  {
+    "name": "header-https:///x",
+    "input": "file://h?x=[file:///Users/CHILD/x&later\\/home/alice/s([https:///x?key=C:/Users/K/x]",
+    "expected": "file://h?x=[file://<path>&later\\<path>?key=C:<path>]"
+  },
+  {
+    "name": "header-https://:80",
+    "input": "file://h?x=[file:///Users/CHILD/x&later\\/home/alice/s([https://:80?key=C:/Users/K/x]",
+    "expected": "file://h?x=[file://<path>&later\\<path>?key=C:<path>]"
+  },
+  {
+    "name": "header-https://o/C:9/x",
+    "input": "file://h?x=[file:///Users/CHILD/x&later\\/home/alice/s([https://o/C:9/x?key=C:/Users/K/x]",
+    "expected": "file://h?x=[file://<path>&later\\<path>?key=C:<path>]"
+  },
+  {
+    "name": "header-https://o/a:1/b",
+    "input": "file://h?x=[file:///Users/CHILD/x&later\\/home/alice/s([https://o/a:1/b?key=C:/Users/K/x]",
+    "expected": "file://h?x=[file://<path>&later\\<path>?key=C:<path>]"
+  },
+  {
+    "name": "header-file:///C:1/x",
+    "input": "file://h?x=[file:///Users/CHILD/x&later\\/home/alice/s([file:///C:1/x?key=C:/Users/K/x]",
+    "expected": "file://h?x=[file://<path>&later\\<path>file://<path>:1/x?key=C:<path>]"
+  },
+  {
+    "name": "header-file://C:80/x",
+    "input": "file://h?x=[file:///Users/CHILD/x&later\\/home/alice/s([file://C:80/x?key=C:/Users/K/x]",
+    "expected": "file://h?x=[file://<path>&later\\<path>file://C:80<path>?key=C:<path>]"
+  },
+  {
+    "name": "header-https://",
+    "input": "file://h?x=[file:///Users/CHILD/x&later\\/home/alice/s([https://?key=C:/Users/K/x]",
+    "expected": "file://h?x=[file://<path>&later\\<path>?key=<path>]"
+  },
+  {
+    "name": "header-https://o/",
+    "input": "file://h?x=[file:///Users/CHILD/x&later\\/home/alice/s([https://o/?key=C:/Users/K/x]",
+    "expected": "file://h?x=[file://<path>&later\\<path>?key=<path>]"
+  },
+  {
+    "name": "header-https://o/C:/x",
+    "input": "file://h?x=[file:///Users/CHILD/x&later\\/home/alice/s([https://o/C:/x?key=C:/Users/K/x]",
+    "expected": "file://h?x=[file://<path>&later\\<path>?key=<path>]"
+  },
+  {
+    "name": "continuation-i&https://pub/x",
+    "input": "file://h?x=[file:///Users/CHILD/x&later\\/home/alice/s([https://other?key=C:/Users/K/x([https://i&https://pub/x?key=/Users/I/s]]",
+    "expected": "file://h?x=[file://<path>&later\\<path>?key=<path>&https://pub/x?key=<path>]]"
+  },
+  {
+    "name": "continuation-i&file:///Users/Q",
+    "input": "file://h?x=[file:///Users/CHILD/x&later\\/home/alice/s([https://other?key=C:/Users/K/x([https://i&file:///Users/Q?key=/Users/I/s]]",
+    "expected": "file://h?x=[file://<path>&later\\<path>?key=<path>&file://<path>?key=<path>]]"
+  },
+  {
+    "name": "continuation-i(C:/Users/Q",
+    "input": "file://h?x=[file:///Users/CHILD/x&later\\/home/alice/s([https://other?key=C:/Users/K/x([https://i(C:/Users/Q?key=/Users/I/s]]",
+    "expected": "file://h?x=[file://<path>&later\\<path>?key=<path>?key=<path>]]"
+  },
+  {
+    "name": "continuation-i_name",
+    "input": "file://h?x=[file:///Users/CHILD/x&later\\/home/alice/s([https://other?key=C:/Users/K/x([https://i_name?key=/Users/I/s]]",
+    "expected": "file://h?x=[file://<path>&later\\<path>?key=<path>?key=<path>]]"
+  },
+  {
+    "name": "continuation-u@i",
+    "input": "file://h?x=[file:///Users/CHILD/x&later\\/home/alice/s([https://other?key=C:/Users/K/x([https://u@i?key=/Users/I/s]]",
+    "expected": "file://h?x=[file://<path>&later\\<path>?key=<path>?key=<path>]]"
+  },
+  {
+    "name": "continuation-i/p",
+    "input": "file://h?x=[file:///Users/CHILD/x&later\\/home/alice/s([https://other?key=C:/Users/K/x([https://i/p?key=/Users/I/s]]",
+    "expected": "file://h?x=[file://<path>&later\\<path>?key=<path>?key=<path>]]"
+  },
+  {
+    "name": "bare-http://o",
+    "input": "file://h?x=[file:///Users/CHILD/x&later\\/home/alice/s([http://o?key=C:/]",
+    "expected": "file://h?x=[file://<path>&later\\<path>?key=<path>]"
+  },
+  {
+    "name": "bare-ftp://o",
+    "input": "file://h?x=[file:///Users/CHILD/x&later\\/home/alice/s([ftp://o?key=C:/]",
+    "expected": "file://h?x=[file://<path>&later\\<path>?key=<path>]"
+  },
+  {
+    "name": "bare-double-paren",
+    "input": "file://h?x=[file:///Users/CHILD/x&later\\/home/alice/s(([https://other?key=C:/]",
+    "expected": "file://h?x=[file://<path>&later\\<path>?key=<path>]"
+  },
+  {
+    "name": "E-owner-copy-balanced-78",
+    "input": "file://h?x=[file:///Users/CHILD/x&/https://Users/alice/s[file:///b&C:/Users/c]&later\\/home/bob/s([https://other?key=D:/Users/K/x]",
+    "expected": "file://h?x=[file://<path>&<path>https://Users/alice/s[file://<path>&<path>]&later\\/home/bob/s([https://other?key=D:/Users/K/x]"
+  },
+  {
+    "name": "E-owner-copy-balanced-79",
+    "input": "file://h?x=[file:///Users/CHILD/x&/https://Users/alice/s[file:///b&C:/Users/c([https://i?key=/x]]&later\\/home/bob/s([https://other?key=D:/Users/K/x]",
+    "expected": "file://h?x=[file://<path>&<path>https://Users/alice/s[file://<path>&<path>?key=<path>]]&later\\<path>?key=D:<path>]"
+  },
+  {
+    "name": "E-owner-copy-balanced-80",
+    "input": "file://h?x=[file:///Users/CHILD/x&/https://Users/alice/s[file:///b&C:/Users/c]]&later\\/home/bob/s([https://other?key=D:/Users/K/x]",
+    "expected": "file://h?x=[file://<path>&<path>&<path>]]&later\\<path>?key=D:<path>]"
+  },
+  {
+    "name": "E-owner-copy-balanced-81",
+    "input": "file://h?x=[file:///Users/CHILD/x&/https://Users/alice/s[file:///b&C:/Users/c([https://i?key=/x]]]&later\\/home/bob/s([https://other?key=D:/Users/K/x]",
+    "expected": "file://h?x=[file://<path>&<path>https://Users/alice/s[file://<path>&<path>?key=<path>]]]&later\\<path>?key=D:<path>]"
+  }
+]
