@@ -283,6 +283,11 @@ function optionsFor(
     enforceUserManagerParent: true,
     _platform: fixture.seams.platform,
     _hermeticTestSeams: fixture.seams,
+    _admitDaemonPeerForTesting: mode => {
+      const pid = mode.kind === "replacement-manager" ? mode.managerPid
+        : Number(readFileSync(fixture.pidPath, "utf8"));
+      return Number.isSafeInteger(pid) && pid > 0 ? { pid, birth: `birth-${pid}` } : null;
+    },
     _supervisorOverride: fixture.supervisor,
     _monotonicNowOverride: () => 0,
     _listeningPortsOverride: () => [fixture.port],

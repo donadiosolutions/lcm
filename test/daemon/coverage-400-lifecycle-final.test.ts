@@ -1,4 +1,4 @@
-import { chmodSync, mkdirSync, mkdtempSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
+import { chmodSync, mkdirSync, mkdtempSync, readFileSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, describe, expect, it, vi } from "vitest";
@@ -51,7 +51,10 @@ function fixture(options: FixtureOptions = {}): Fixture {
   return { root: dir, stateDir, runtimeDir, credentialDir, procRoot, pidPath: join(stateDir, "daemon.pid"), tokenPath: join(stateDir, "daemon.token"), port: 43_201, seams };
 }
 function baseOptions(f: Fixture, extra: Partial<EnsureDaemonOptions> = {}): EnsureDaemonOptions {
-  return { port: f.port, pidFilePath: f.pidPath, spawnTimeoutMs: 100, expectedVersion: "1", expectedEntrypoint: "/entrypoint.mjs", expectedRuntimeDigest: RUNTIME_DIGEST, _hermeticTestSeams: f.seams, _skipSpawn: true, ...extra };
+  return { port: f.port, pidFilePath: f.pidPath, spawnTimeoutMs: 100, expectedVersion: "1", expectedEntrypoint: "/entrypoint.mjs", expectedRuntimeDigest: RUNTIME_DIGEST, _hermeticTestSeams: f.seams, _admitDaemonPeerForTesting: mode => {
+    const pid = mode.kind === "replacement-manager" ? mode.managerPid : Number(readFileSync(f.pidPath, "utf8"));
+    return Number.isSafeInteger(pid) && pid > 0 ? { pid, birth: `birth-${pid}` } : null;
+  }, _skipSpawn: true, ...extra };
 }
 function ensure(f: Fixture, extra: Partial<EnsureDaemonOptions> = {}) { return ensureDaemon(baseOptions(f, extra)); }
 function managedEnsure(f: Fixture, supervisor: Supervisor, extra: Partial<EnsureDaemonOptions> = {}) { return ensure(f, { enforceUserManagerParent: true, _supervisorOverride: supervisor, ...extra }); }

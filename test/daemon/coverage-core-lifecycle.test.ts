@@ -1,4 +1,4 @@
-import { mkdirSync, mkdtempSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
+import { mkdirSync, mkdtempSync, readFileSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import { afterEach, describe, expect, it, vi } from "vitest";
@@ -86,7 +86,11 @@ function withHermeticLifecycleSeams(options: EnsureDaemonOptions): EnsureDaemonO
     sleep: options._sleepOverride ?? (async () => undefined),
     realpath: options._realpathOverride ?? (path => path),
   };
-  return { ...options, _hermeticTestSeams: seams };
+  return { ...options, _hermeticTestSeams: seams, _admitDaemonPeerForTesting: options._admitDaemonPeerForTesting ?? (mode => {
+      const pid = mode.kind === "replacement-manager" ? mode.managerPid
+        : Number(readFileSync(options.pidFilePath, "utf8"));
+      return Number.isSafeInteger(pid) && pid > 0 ? { pid, birth: `birth-${pid}` } : null;
+    }) };
 }
 
 function ensureDaemon(options: EnsureDaemonOptions): ReturnType<typeof ensureDaemonProduction> {

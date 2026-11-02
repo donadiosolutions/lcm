@@ -8,6 +8,7 @@
 // never writes decisions, permission verdicts or input rewrites. Codex honors
 // additional context only as JSON on stdout.
 import { DaemonClient } from "../daemon/client.js";
+import { admitDaemonPeer, type DaemonPeerAdmissionCallback } from "../daemon/peer-admission.js";
 import { configPath as defaultConfigPath } from "../runtime-paths.js";
 import { loadStoredPreToolRecallSettings } from "../config-projection.js";
 import { buildMemoryContext } from "./memory-context.js";
@@ -225,7 +226,9 @@ function usableHints(rawHints: readonly unknown[], rawIds: unknown): { hints: st
   return { hints, ids };
 }
 
-async function runPreToolUse(stdin: string, deadlineMs: number): Promise<HookResult> {
+async function runPreToolUse(
+  stdin: string, deadlineMs: number, admitPeerForTesting?: DaemonPeerAdmissionCallback,
+): Promise<HookResult> {
   const input: unknown = JSON.parse(stdin);
   if (!isRecord(input)) return EMPTY;
   if (process.env.LCM_ENABLED === "false") return EMPTY;
@@ -244,7 +247,8 @@ async function runPreToolUse(stdin: string, deadlineMs: number): Promise<HookRes
   if (!settings.enabled) return EMPTY;
   assertHookPublicationFence();
 
-  const client = new DaemonClient("http://127.0.0.1:" + settings.daemonPort);
+  const client = new DaemonClient("http://127.0.0.1:" + settings.daemonPort, undefined,
+    admitPeerForTesting ?? ((port, deadline) => admitDaemonPeer({ port, deadline })));
   const controller = new AbortController();
   const timer = setTimeout(() => controller.abort(), deadlineMs);
   let response: PromptSearchResponse;
@@ -283,10 +287,14 @@ async function runPreToolUse(stdin: string, deadlineMs: number): Promise<HookRes
  */
 export async function handlePreToolUse(
   stdin: string,
-  deps: { deadlineMs?: number } = {},
+  deps: {
+    deadlineMs?: number;
+    /** @internal Deterministic recipient authority for hook tests. */
+    _admitPeerForTesting?: DaemonPeerAdmissionCallback;
+  } = {},
 ): Promise<HookResult> {
   try {
-    return await runPreToolUse(stdin, deps.deadlineMs ?? PRE_TOOL_DEADLINE_MS);
+    return await runPreToolUse(stdin, deps.deadlineMs ?? PRE_TOOL_DEADLINE_MS, deps._admitPeerForTesting);
   } catch (error) {
     if (isBackendPublicationJournalError(error) && !isBackendPublicationEvidenceMissing(error)) throw error;
     return EMPTY;

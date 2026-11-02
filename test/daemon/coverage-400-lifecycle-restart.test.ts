@@ -376,7 +376,13 @@ function hermetic(options: EnsureDaemonOptions, environment: NodeJS.ProcessEnv =
   };
   privateDirectory(seams.homeDir);
   for (const directory of [seams.runtimeDir, seams.credentialDir, seams.procRoot]) mkdirSync(directory, { recursive: true });
-  return { ...options, _hermeticTestSeams: seams };
+  return { ...options, _hermeticTestSeams: seams,
+    _admitDaemonPeerForTesting: options._admitDaemonPeerForTesting ?? (mode => {
+      const pid = mode.kind === "replacement-manager" ? mode.managerPid
+        : Number(readFileSync(options.pidFilePath, "utf8"));
+      return Number.isSafeInteger(pid) && pid > 0 ? { pid, birth: `birth-${pid}` } : null;
+    }),
+  };
 }
 
 function ensure(options: EnsureDaemonOptions): ReturnType<typeof ensureDaemonProduction> {

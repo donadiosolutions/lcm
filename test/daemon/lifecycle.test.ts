@@ -113,6 +113,11 @@ function withHermeticLifecycleSeams(
   return {
     ...options,
     _hermeticTestSeams: seams,
+    _admitDaemonPeerForTesting: options._admitDaemonPeerForTesting ?? (() => {
+      const raw = existsSync(options.pidFilePath) ? readFileSync(options.pidFilePath, "utf8") : undefined;
+      const pid = raw === undefined ? options._managedOperationManagerPid : Number(raw);
+      return pid !== undefined && Number.isSafeInteger(pid) && pid > 0 ? { pid, birth: "fixture-birth" } : null;
+    }),
     // PostgreSQL selection needs completed publication evidence that these fixtures do not create.
     ...(options.expectedStorageBackend === "postgresql" ? { _assertBackendPublication: () => undefined } : {}),
   };

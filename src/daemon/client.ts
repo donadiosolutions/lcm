@@ -1,5 +1,5 @@
 import { readAuthToken } from "./auth.js";
-import { join } from "node:path";
+import { dirname, resolve } from "node:path";
 import { homedir } from "node:os";
 import {
   daemonJsonRequest,
@@ -11,6 +11,24 @@ import { isAbortError, throwIfAborted } from "./cancellation.js";
 import { daemonTokenPath } from "../runtime-paths.js";
 import type { StorageBackend } from "./config.js";
 import { isStagedPostgreSqlHealth } from "./staged-postgresql.js";
+import {
+  admitDaemonPeer, awaitDaemonPeerAdmission, DaemonPeerRefusalError,
+  type DaemonPeerAdmission, type DaemonPeerAdmissionCallback,
+} from "./peer-admission.js";
+export { DaemonPeerRefusalError } from "./peer-admission.js";
+
+/** Re-prove local recipient authority before every request, including cached tokens. */
+export function verifiedLocalDaemonClient(
+  port: number,
+  tokenPath?: string,
+  homeDir: string = tokenPath === undefined ? homedir() : dirname(dirname(tokenPath)),
+): DaemonClient {
+  const canonical = daemonTokenPath(homeDir);
+  const path = tokenPath ?? canonical;
+  return new DaemonClient(`http://127.0.0.1:${port}`, path,
+    (targetPort, deadline) => resolve(path) === resolve(canonical)
+      ? admitDaemonPeer({ port: targetPort, homeDir, deadline }) : null);
+}
 
 export type DaemonHealth = {
   status: string;
@@ -60,6 +78,7 @@ export type DaemonObservationMismatchField = "version" | "storageBackend" | "ent
 export type DaemonObservationFailure = Readonly<
   | {
     reason:
+      | "peer-unverified"
       | "token-missing"
       | "connect-failed"
       | "headers-timeout"
@@ -88,6 +107,8 @@ export function failedObservation(failure: DaemonObservationFailure): DaemonObse
 /** Fixed sentence for a failure, without a trailing period. */
 export function describeDaemonObservationFailure(failure: DaemonObservationFailure): string {
   switch (failure.reason) {
+    case "peer-unverified":
+      return "the local daemon recipient could not be verified";
     case "token-missing":
       return "the daemon token is missing or empty";
     case "connect-failed":
@@ -228,8 +249,53 @@ export class DaemonClient {
   private tokenLoaded = false;
   private readonly port: number;
 
-  constructor(baseUrl: string, private tokenPath?: string) {
+  constructor(
+    baseUrl: string,
+    private tokenPath?: string,
+    private readonly admitPeer?: DaemonPeerAdmissionCallback,
+  ) {
     this.port = daemonPortFromLoopbackUrl(baseUrl);
+  }
+
+  private async withAdmission<T>(
+    options: DaemonRequestOptions | undefined,
+    send: (
+      peer: DaemonPeerAdmission | undefined,
+      request: DaemonRequestOptions | undefined,
+      assertCurrent: () => void,
+    ) => Promise<T>,
+  ): Promise<T> {
+    throwIfAborted(options?.signal);
+    if (this.admitPeer === undefined) return await send(undefined, options, () => throwIfAborted(options?.signal));
+    const deadline = performance.now() + (options?.timeoutMs ?? 2_000);
+    const controller = new AbortController();
+    const abort = (): void => controller.abort(options?.signal?.reason);
+    options?.signal?.addEventListener("abort", abort, { once: true });
+    const timer = setTimeout(() => controller.abort(), Math.max(0, deadline - performance.now()));
+    try {
+      const peer = await awaitDaemonPeerAdmission(this.admitPeer, this.port, deadline, controller.signal);
+      throwIfAborted(options?.signal);
+      const timeoutMs = Math.floor(deadline - performance.now());
+      if (timeoutMs <= 0 || controller.signal.aborted) throw new DaemonPeerRefusalError();
+      const assertCurrent = (): void => {
+        throwIfAborted(options?.signal);
+        if (controller.signal.aborted || performance.now() >= deadline) throw new DaemonPeerRefusalError();
+      };
+      assertCurrent();
+      return await send(peer, { ...options, timeoutMs, signal: controller.signal }, assertCurrent);
+    } catch (error) {
+      throwIfAborted(options?.signal);
+      if (controller.signal.aborted && !(error instanceof DaemonPeerRefusalError)) {
+        const phase = (error as { daemonPhase?: string } | null)?.daemonPhase;
+        throw Object.assign(new Error("Daemon request timed out"), {
+          daemonPhase: phase === "body-failed" ? "body-timeout" : "headers-timeout",
+        });
+      }
+      throw error;
+    } finally {
+      clearTimeout(timer);
+      options?.signal?.removeEventListener("abort", abort);
+    }
   }
 
   private getToken(): string | null {
@@ -244,27 +310,31 @@ export class DaemonClient {
 
   async health(options?: DaemonRequestOptions): Promise<DaemonHealth | null> {
     try {
-      throwIfAborted(options?.signal);
-      const token = this.getToken();
-      const headers: Record<string, string> = {};
-      if (token) {
-        headers.Authorization = `Bearer ${token}`;
-      }
-      const response = await daemonJsonResponse<DaemonHealthResponse>(this.port, "/health", {
-        method: "GET",
-        headers,
-        ...options,
+      return await this.withAdmission(options, async (peer, requestOptions, assertCurrent) => {
+        assertCurrent();
+        const token = this.getToken();
+        assertCurrent();
+        const headers: Record<string, string> = {};
+        if (token) {
+          headers.Authorization = `Bearer ${token}`;
+        }
+        const response = await daemonJsonResponse<DaemonHealthResponse>(this.port, "/health", {
+          method: "GET",
+          headers,
+          ...requestOptions,
+        });
+        const health = response.data;
+        if (peer !== undefined && health.pid !== peer.pid) return null;
+        if (
+          (response.statusCode < 200 || response.statusCode >= 300)
+          && !isStagedPostgreSqlHealth(response.statusCode, health)
+        ) {
+          return null;
+        }
+        const { storageBackend: _reported, ...rest } = health;
+        const storageBackend = inferredHealthStorageBackend(health);
+        return storageBackend === undefined ? rest : { ...rest, storageBackend };
       });
-      const health = response.data;
-      if (
-        (response.statusCode < 200 || response.statusCode >= 300)
-        && !isStagedPostgreSqlHealth(response.statusCode, health)
-      ) {
-        return null;
-      }
-      const { storageBackend: _reported, ...rest } = health;
-      const storageBackend = inferredHealthStorageBackend(health);
-      return storageBackend === undefined ? rest : { ...rest, storageBackend };
     } catch (error) {
       if (isAbortError(error)) throw error;
       return null;
@@ -280,55 +350,67 @@ export class DaemonClient {
     options?: DaemonRequestOptions,
   ): Promise<DaemonObservationResult> {
     try {
-      throwIfAborted(options?.signal);
-      const token = this.getToken();
-      if (!token) return failedObservation({ reason: "token-missing" });
-      const response = await daemonJsonResponse<unknown>(this.port, "/health/observe", {
-        method: "GET",
-        headers: { Authorization: `Bearer ${token}` },
-        ...options,
+      return await this.withAdmission(options, async (peer, requestOptions, assertCurrent) => {
+        assertCurrent();
+        const token = this.getToken();
+        assertCurrent();
+        if (!token) return failedObservation({ reason: "token-missing" });
+        const response = await daemonJsonResponse<unknown>(this.port, "/health/observe", {
+          method: "GET",
+          headers: { Authorization: `Bearer ${token}` },
+          ...requestOptions,
+        });
+        if (response.statusCode !== 200) {
+          return failedObservation({ reason: "http-status", statusCode: response.statusCode });
+        }
+        const observation = parseDaemonObservation(response.statusCode, response.data);
+        return observation === null || (peer !== undefined && observation.pid !== peer.pid)
+          ? failedObservation({ reason: "invalid-identity" })
+          : { kind: "observed", observation };
       });
-      if (response.statusCode !== 200) {
-        return failedObservation({ reason: "http-status", statusCode: response.statusCode });
-      }
-      const observation = parseDaemonObservation(response.statusCode, response.data);
-      return observation === null
-        ? failedObservation({ reason: "invalid-identity" })
-        : { kind: "observed", observation };
     } catch (error) {
       if (isAbortError(error)) throw error;
-      return failedObservation(classifyObservationError(error));
+      return failedObservation(error instanceof DaemonPeerRefusalError
+        ? { reason: "peer-unverified" } : classifyObservationError(error));
     }
   }
 
   async get<T = unknown>(path: string, options?: DaemonRequestOptions): Promise<T> {
     throwIfAborted(options?.signal);
     const route = normalizeDaemonPath(path);
-    const token = this.getToken();
-    const headers: Record<string, string> = {};
-    if (token) {
-      headers["Authorization"] = `Bearer ${token}`;
-    }
-    return await daemonJsonRequest<T>(this.port, route, {
-      method: "GET",
-      headers,
-      ...options,
+    return await this.withAdmission(options, async (_peer, requestOptions, assertCurrent) => {
+      assertCurrent();
+      const token = this.getToken();
+      assertCurrent();
+      const headers: Record<string, string> = {};
+      if (token) {
+        headers["Authorization"] = `Bearer ${token}`;
+      }
+      return await daemonJsonRequest<T>(this.port, route, {
+        method: "GET",
+        headers,
+        ...requestOptions,
+      });
     });
   }
 
   async post<T = unknown>(path: string, body: unknown, options?: DaemonRequestOptions): Promise<T> {
     throwIfAborted(options?.signal);
     const route = normalizeDaemonPath(path);
-    const token = this.getToken();
-    const headers: Record<string, string> = { "Content-Type": "application/json" };
-    if (token) {
-      headers["Authorization"] = `Bearer ${token}`;
-    }
-    return await daemonJsonRequest<T>(this.port, route, {
-      method: "POST",
-      headers,
-      body,
-      ...options,
+    return await this.withAdmission(options, async (_peer, requestOptions, assertCurrent) => {
+      assertCurrent();
+      const token = this.getToken();
+      assertCurrent();
+      const headers: Record<string, string> = { "Content-Type": "application/json" };
+      if (token) {
+        headers["Authorization"] = `Bearer ${token}`;
+      }
+      return await daemonJsonRequest<T>(this.port, route, {
+        method: "POST",
+        headers,
+        body,
+        ...requestOptions,
+      });
     });
   }
 

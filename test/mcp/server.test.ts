@@ -56,6 +56,7 @@ vi.mock("@modelcontextprotocol/sdk/server/stdio.js", () => ({
   }),
 }));
 vi.mock("../../src/daemon/client.js", () => ({
+  verifiedLocalDaemonClient: vi.fn(() => ({ post: localStatsMocks.post })),
   DaemonClient: vi.fn().mockImplementation(function () {
     return {
       post: localStatsMocks.post,

@@ -29,6 +29,7 @@ function deps(overrides: Partial<PublicationConvergenceDeps> = {}): PublicationC
   return {
     fetch: healthFetch(),
     readToken: () => "token",
+    admitPeer: () => ({ pid: 42, birth: "birth" }),
     readOwner: () => ({ version: 1, pid: 42, processStartTime: "birth", nonce: "a".repeat(32) }),
     processBirth: () => "birth",
     platform: "linux",
@@ -38,6 +39,39 @@ function deps(overrides: Partial<PublicationConvergenceDeps> = {}): PublicationC
 }
 
 describe("publication convergence", () => {
+  it.each([undefined, () => null])("refuses missing or denied recipient authority before token and fetch", async admitPeer => {
+    const readToken = vi.fn(() => "private-token");
+    const fetch = healthFetch();
+    await expect(capturePublicationIdentity({
+      port: 3737, expectedVersion: identity.version, expectedStorageBackend: identity.storageBackend,
+      expectedEntrypoint: identity.entrypoint, expectedRuntimeDigest: identity.runtimeDigest,
+      deps: deps({ admitPeer, readToken, fetch }),
+    })).resolves.toBeUndefined();
+    expect(readToken).not.toHaveBeenCalled();
+    expect(fetch).not.toHaveBeenCalled();
+  });
+
+  it("does not read or send after an admission callback resolves past the whole-exchange deadline", async () => {
+    vi.useFakeTimers();
+    try {
+      let resolve!: (peer: { pid: number; birth: string }) => void;
+      const readToken = vi.fn(() => "private-token");
+      const fetch = healthFetch();
+      const capture = capturePublicationIdentity({
+        port: 3737, expectedVersion: identity.version, expectedStorageBackend: identity.storageBackend,
+        expectedEntrypoint: identity.entrypoint, expectedRuntimeDigest: identity.runtimeDigest,
+        deps: deps({ readToken, fetch, admitPeer: () => new Promise(done => { resolve = done; }) }),
+      });
+      await vi.advanceTimersByTimeAsync(2_000);
+      await expect(capture).resolves.toBeUndefined();
+      resolve({ pid: 42, birth: "birth" });
+      await vi.advanceTimersByTimeAsync(0);
+      expect(readToken).not.toHaveBeenCalled();
+      expect(fetch).not.toHaveBeenCalled();
+    } finally {
+      vi.useRealTimers();
+    }
+  });
   const carriedOwner = { version: 1 as const, pid: 42, processStartTime: "birth", nonce: "a".repeat(32) };
   const carried = (
     path = "/tmp/lock",

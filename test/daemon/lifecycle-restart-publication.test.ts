@@ -3,6 +3,7 @@ import {
   mkdtempSync,
   mkdirSync,
   renameSync,
+  readFileSync,
   rmSync,
   symlinkSync,
   unlinkSync,
@@ -214,6 +215,11 @@ function options(
     expectedEntrypoint: "/opt/lcm.mjs",
     expectedRuntimeDigest: "b".repeat(64),
     _hermeticTestSeams: f.seams,
+    _admitDaemonPeerForTesting: mode => {
+      const pid = mode.kind === "replacement-manager" ? mode.managerPid
+        : Number(readFileSync(f.pidPath, "utf8"));
+      return Number.isSafeInteger(pid) && pid > 0 ? { pid, birth: `birth-${pid}` } : null;
+    },
     _isManagedProcessOverride: () => true,
     ...overrides,
   };

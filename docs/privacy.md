@@ -1043,3 +1043,30 @@ bundle and keep provider, credential, quarantine, and recovery sessions private.
 - Built-in patterns redact common secret formats automatically.
 - Add project-specific patterns with `lcm sensitive add`.
 - Delete your data with `lcm uninstall` or by removing `~/.lcm/`.
+
+## Local daemon recipient verification
+
+Read and store commands, pre-tool recall, MCP tool requests, installation,
+doctor observations, legacy daemon migration and publication retries verify the
+local daemon recipient before reading its token or sending authenticated data.
+Each request checks the private daemon PID file, the process owner and command,
+the exact configured `127.0.0.1` listener and a stable process birth identity.
+Managed replacement requests also recheck the service manager's exact scope and
+launch identity. A later request repeats these checks even when its client has
+already loaded a token.
+
+Missing, unsafe, ambiguous or expired evidence causes refusal. Pre-tool recall
+returns no hint and does not start a daemon. Diagnostic reads and doctor remain
+observational; use `lcm daemon status` to inspect the daemon and
+`lcm daemon restart` to request recovery. The existing request deadline includes
+recipient verification, response headers and the response body; retries do not
+renew the operation's deadline.
+
+These paths support Linux and macOS recipient verification. On Windows they
+currently refuse authenticated requests because equivalent process-owner and
+private-state evidence is not implemented. No token or request data is sent by
+the refused path. Windows integration has not been verified.
+
+The checks assume other code running as your OS user is trusted. The daemon uses
+ordinary loopback HTTP, so a narrow race remains between checking listener
+ownership and opening the connection if a port is rebound during that interval.

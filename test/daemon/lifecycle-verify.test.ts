@@ -39,6 +39,7 @@ describe("read-only running daemon verification", () => {
     expectedEntrypoint: ENTRYPOINT,
     expectedRuntimeDigest: DIGEST,
     budgetMs: 2000,
+    _admitDaemonPeerForTesting: () => ({ pid: process.pid, birth: "birth" }),
     ...extra,
   });
   const snapshot = (): string => JSON.stringify(readdirSync(dir).sort().map((name) => {
@@ -187,19 +188,20 @@ describe("read-only running daemon verification", () => {
     await expect(verifyRunningDaemon(options({ signal: controller.signal }))).resolves.toBeNull();
   });
 
-  it("only runs a platform listener fallback when its fixed one second timeout fits the budget", async () => {
-    const lsof = vi.fn(() => ({ status: 0, stdout: `p${process.pid}\nn127.0.0.1:${port}\n` }));
-    const darwin = (extra: Partial<VerifyRunningDaemonOptions>) => options({
-      _platform: "darwin",
-      _spawnSyncOverride: lsof as never,
-      ...extra,
-    });
-
-    await expect(verifyRunningDaemon(darwin({ budgetMs: 400 }))).resolves.toBeNull();
+  it("passes the original short budget to each recipient proof without a response-derived fallback", async () => {
+    const lsof = vi.fn();
+    const deadlines: number[] = [];
+    const started = performance.now();
+    await expect(verifyRunningDaemon(options({
+      budgetMs: 400, _platform: "darwin", _spawnSyncOverride: lsof as never,
+      _admitDaemonPeerForTesting: (_port, deadline) => {
+        deadlines.push(deadline);
+        return { pid: process.pid, birth: "birth" };
+      },
+    }))).resolves.toEqual({ port, token: TOKEN });
+    expect(deadlines.length).toBeGreaterThan(1);
+    expect(new Set(deadlines).size).toBe(1);
+    expect(deadlines[0]! - started).toBeLessThanOrEqual(401);
     expect(lsof).not.toHaveBeenCalled();
-
-    await expect(verifyRunningDaemon(darwin({ budgetMs: 5000 }))).resolves.toEqual({ port, token: TOKEN });
-    expect(lsof).toHaveBeenCalledOnce();
   });
 });
-

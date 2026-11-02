@@ -1,3 +1,4 @@
+import { admitDaemonPeer, awaitDaemonPeerAdmission } from "../daemon/peer-admission.js";
 import { renderBackendDiagnostics } from "../storage/diagnostic-renderer.js";
 import { existsSync, readFileSync, lstatSync } from "node:fs";
 import { homedir, platform } from "node:os";
@@ -177,12 +178,11 @@ function checkBackendPublicationAdmission(
 }
 
 async function readDaemonObservation(
-  fetchFn: typeof globalThis.fetch,
+  deps: DoctorDeps,
   port: number,
-  token: string | null,
   timeoutMs = DAEMON_OBSERVATION_DEADLINE_MS,
 ): Promise<DaemonObservationResult> {
-  if (token === null) return failedObservation({ reason: "token-missing" });
+  const expires = performance.now() + timeoutMs;
   const controller = new AbortController();
   // The deadline is absolute; which stage it interrupted decides the class.
   let responseStarted = false;
@@ -199,9 +199,23 @@ async function readDaemonObservation(
   try {
     return await Promise.race([
       (async (): Promise<DaemonObservationResult> => {
+        let peer;
+        try {
+          peer = await awaitDaemonPeerAdmission(
+            deps._admitDaemonPeerForTesting ?? ((targetPort, deadline) => admitDaemonPeer({
+              port: targetPort, deadline, homeDir: deps.homedir, _platform: deps.platform,
+            })), port, expires, controller.signal,
+          );
+        } catch {
+          return failedObservation({ reason: "peer-unverified" });
+        }
+        if (controller.signal.aborted || performance.now() >= expires) return deadlineFailure();
+        const token = readDoctorDaemonToken(deps);
+        if (token === null) return failedObservation({ reason: "token-missing" });
+        if (controller.signal.aborted || performance.now() >= expires) return deadlineFailure();
         let res: Response;
         try {
-          res = await fetchFn(`http://127.0.0.1:${port}/health/observe`, {
+          res = await deps.fetch(`http://127.0.0.1:${port}/health/observe`, {
             headers: { Authorization: `Bearer ${token}` },
             signal: controller.signal,
           });
@@ -222,7 +236,7 @@ async function readDaemonObservation(
           return controller.signal.aborted ? deadlineFailure() : failedObservation({ reason: "body-invalid" });
         }
         const observation = parseDaemonObservation(res.status, body);
-        return observation === null
+        return observation === null || observation.pid !== peer.pid
           ? failedObservation({ reason: "invalid-identity" })
           : { kind: "observed", observation };
       })(),
@@ -245,11 +259,7 @@ async function readDoctorAuthenticatedObservation(
   deps: DoctorDeps,
   port: number,
 ): Promise<DaemonObservationResult> {
-  return readDaemonObservation(
-    deps.fetch,
-    port,
-    readDoctorDaemonToken(deps),
-  );
+  return readDaemonObservation(deps, port);
 }
 
 type ExpectedDaemonIdentity = Readonly<{
@@ -259,7 +269,7 @@ type ExpectedDaemonIdentity = Readonly<{
   runtimeDigest: string;
 }>;
 
-/** The observed PID is the verified daemon's own, so it is never compared. */
+/** Response PID has already been bound to the locally admitted recipient. */
 function daemonObservationMismatchFields(
   observation: DaemonObservation,
   identity: ExpectedDaemonIdentity,
