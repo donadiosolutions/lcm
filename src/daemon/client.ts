@@ -50,7 +50,96 @@ export type DaemonObservation = {
   ownerId?: string;
 };
 
-/** Shared, transport-independent admission for diagnostic identity responses. */
+export type DaemonObservationMismatchField = "version" | "storageBackend" | "entrypoint" | "runtimeDigest";
+
+/**
+ * Why an authenticated identity observation did not produce a verified
+ * daemon. Carries only closed vocabulary, a numeric HTTP status and field
+ * names: never error text, headers, tokens or response bodies.
+ */
+export type DaemonObservationFailure = Readonly<
+  | {
+    reason:
+      | "token-missing"
+      | "connect-failed"
+      | "headers-timeout"
+      | "body-timeout"
+      | "body-invalid"
+      | "invalid-identity"
+      | "local-identity-unavailable"
+      | "config-changed";
+  }
+  | { reason: "http-status"; statusCode: number }
+  | { reason: "identity-mismatch"; fields: readonly DaemonObservationMismatchField[] }
+>;
+
+/**
+ * Outcome of an observation. The tag is assigned locally, so nothing a daemon
+ * sends can masquerade as a failure.
+ */
+export type DaemonObservationResult =
+  | Readonly<{ kind: "observed"; observation: DaemonObservation }>
+  | Readonly<{ kind: "failed"; failure: DaemonObservationFailure }>;
+
+export function failedObservation(failure: DaemonObservationFailure): DaemonObservationResult {
+  return { kind: "failed", failure };
+}
+
+/** Fixed sentence for a failure, without a trailing period. */
+export function describeDaemonObservationFailure(failure: DaemonObservationFailure): string {
+  switch (failure.reason) {
+    case "token-missing":
+      return "the daemon token is missing or empty";
+    case "connect-failed":
+      return "the connection to the daemon failed";
+    case "headers-timeout":
+      return "the daemon did not start responding before the deadline";
+    case "body-timeout":
+      return "the daemon started responding but did not finish before the deadline";
+    case "body-invalid":
+      return "the daemon response body could not be read as JSON";
+    case "http-status":
+      return `the daemon answered with HTTP ${failure.statusCode}`;
+    case "invalid-identity":
+      return "the daemon response is not a valid identity observation";
+    case "identity-mismatch":
+      return `the daemon identity differs from this installation (${failure.fields.join(", ")})`;
+    case "local-identity-unavailable":
+      return "this installation could not determine the identity to expect";
+    case "config-changed":
+      return "the configuration changed during the observation";
+  }
+}
+
+/** Carries a classified observation failure through refusal-only call paths. */
+export class DaemonObservationError extends Error {
+  constructor(readonly failure: DaemonObservationFailure) {
+    super(describeDaemonObservationFailure(failure));
+    this.name = "DaemonObservationError";
+  }
+}
+
+function classifyObservationError(error: unknown): DaemonObservationFailure {
+  const tagged = error as { daemonPhase?: unknown; daemonStatusCode?: unknown } | null | undefined;
+  switch (tagged?.daemonPhase) {
+    case "headers-timeout":
+      return { reason: "headers-timeout" };
+    case "body-timeout":
+      return { reason: "body-timeout" };
+    case "body-failed":
+      return typeof tagged?.daemonStatusCode === "number" && tagged.daemonStatusCode !== 200
+        ? { reason: "http-status", statusCode: tagged.daemonStatusCode }
+        : { reason: "body-invalid" };
+    default:
+      return { reason: "connect-failed" };
+  }
+}
+
+/**
+ * Shared, transport-independent admission for diagnostic identity responses.
+ * The result is a fresh object holding only the known fields, so unknown
+ * response properties never propagate.
+ */
 export function parseDaemonObservation(statusCode: number, value: unknown): DaemonObservation | null {
   if (statusCode !== 200 || typeof value !== "object" || value === null) return null;
   const identity = value as Partial<DaemonObservation>;
@@ -67,7 +156,19 @@ export function parseDaemonObservation(statusCode: number, value: unknown): Daem
     || (identity.runtimeDigest !== undefined && (typeof identity.runtimeDigest !== "string" || identity.runtimeDigest.length === 0))
     || (identity.ownerId !== undefined && (typeof identity.ownerId !== "string" || identity.ownerId.length === 0))
   ) return null;
-  return identity as DaemonObservation;
+  return {
+    status: "ok",
+    observation: "identity-only",
+    storage: { status: "unverified" },
+    version: identity.version,
+    storageBackend: identity.storageBackend,
+    uptime: identity.uptime!,
+    pid: identity.pid!,
+    entrypoint: identity.entrypoint,
+    daemonInstanceId: identity.daemonInstanceId,
+    ...(identity.runtimeDigest !== undefined ? { runtimeDigest: identity.runtimeDigest } : {}),
+    ...(identity.ownerId !== undefined ? { ownerId: identity.ownerId } : {}),
+  };
 }
 
 type DaemonHealthResponse = Omit<DaemonHealth, "storageBackend"> & {
@@ -171,19 +272,32 @@ export class DaemonClient {
   }
 
   async observe(options?: DaemonRequestOptions): Promise<DaemonObservation | null> {
+    const observed = await this.observeClassified(options);
+    return observed.kind === "observed" ? observed.observation : null;
+  }
+
+  async observeClassified(
+    options?: DaemonRequestOptions,
+  ): Promise<DaemonObservationResult> {
     try {
       throwIfAborted(options?.signal);
       const token = this.getToken();
-      if (!token) return null;
+      if (!token) return failedObservation({ reason: "token-missing" });
       const response = await daemonJsonResponse<unknown>(this.port, "/health/observe", {
         method: "GET",
         headers: { Authorization: `Bearer ${token}` },
         ...options,
       });
-      return parseDaemonObservation(response.statusCode, response.data);
+      if (response.statusCode !== 200) {
+        return failedObservation({ reason: "http-status", statusCode: response.statusCode });
+      }
+      const observation = parseDaemonObservation(response.statusCode, response.data);
+      return observation === null
+        ? failedObservation({ reason: "invalid-identity" })
+        : { kind: "observed", observation };
     } catch (error) {
       if (isAbortError(error)) throw error;
-      return null;
+      return failedObservation(classifyObservationError(error));
     }
   }
 

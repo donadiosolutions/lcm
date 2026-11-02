@@ -1,0 +1,11 @@
+references: ["#1827"]
+rationale: >-
+  #1827 classifies authenticated daemon observation failures for doctor and
+  status (client.ts taxonomy, http-url.ts phase tags, doctor.ts and lcm.ts
+  reporting); the change is confined to existing files, so each keeps its
+  established owner.
+pins:
+  - ["src/doctor/doctor.ts", "unit-diagnostics"]
+  - ["src/daemon/client.ts", "unit-daemon-core"]
+  - ["src/daemon/http-url.ts", "unit-daemon-core"]
+  - ["bin/lcm.ts", "unit-cli"]

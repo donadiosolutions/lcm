@@ -377,6 +377,22 @@ version or packaged runtime digest, mismatched identity, and unreadable
 credentials leave managed-daemon identity unverified. Run doctor from the installed `lcm.mjs`
 artifact; reinstall LCM if that artifact is unreadable or damaged.
 
+When the daemon check fails, doctor names the reason in one fixed sentence
+after "Daemon observation failed:". It never prints response bodies, headers,
+tokens, or transport error text. The reasons are:
+
+| Reason | Meaning | What to do |
+| --- | --- | --- |
+| `token-missing` | The daemon token file is missing, unreadable, or empty. | `lcm daemon restart` |
+| `connect-failed` | The loopback connection was refused or failed. | `lcm daemon restart` or `lcm doctor` |
+| `headers-timeout` | No response started within the two-second deadline. | `lcm daemon restart` or `lcm doctor` |
+| `body-timeout` | A response started but did not finish within the deadline. | `lcm daemon restart` or `lcm doctor` |
+| `body-invalid` | A 200 response body could not be read as JSON. | `lcm daemon restart` or `lcm doctor` |
+| `http-status` | The daemon answered with another HTTP status; the code is shown. For 401 and 403, the token does not match the running daemon. | `lcm daemon restart`; for 401 and 403, `lcm daemon restart` or `lcm doctor` |
+| `invalid-identity` | A 200 response is not a valid identity observation. | `lcm daemon restart` |
+| `identity-mismatch` | The daemon differs from this installation; the differing fields (`version`, `storageBackend`, `entrypoint`, `runtimeDigest`) are listed. | `lcm daemon restart` |
+| `local-identity-unavailable` | This installation has no readable version or packaged runtime digest to compare against. | Reinstall LCM |
+
 Doctor does not acquire publication mutation locks, wait for a lock holder to
 repair state, or retry lifecycle stages. Use `lcm daemon restart` for an
 explicit lifecycle repair, `lcm install` for Claude Code settings/hooks/managed
@@ -608,6 +624,16 @@ and the same backend diagnostic snapshot. If authenticated daemon identity is
 verified but its status request fails, the daemon remains reported as up and
 the command performs a fresh local diagnostic observation. The output identifies
 that fallback; backend readiness can change between the two observations.
+When the daemon identity could not be observed or verified, status JSON adds
+`observationFailure: { "reason": "...", "statusCode": 401, "fields": [...] }`
+(`statusCode` only for `http-status`, `fields` only for `identity-mismatch`)
+and text output prints `Daemon observation failed: <reason sentence>.`. The
+reasons are those above except `local-identity-unavailable`, which only doctor
+reports, plus `config-changed`, which only status reports, when the
+configuration changed while the daemon was observed. A missing expected version
+or runtime digest appears in status as an `identity-mismatch` field. The field
+is absent when the identity was verified and only the later status request
+failed. `lcm stats --pool` does not report these reasons.
 It omits the former `lastIngest`,
 `lastCompact`, and `lastPromote` fields: project metadata values are not part of
 the diagnostic allowlist. A missing or unreadable project has no numeric
@@ -647,7 +673,9 @@ managed lifecycle commands when active readiness or restart is needed.
 `lcm doctor` limits the complete daemon identity observation exchange to two seconds. The
 deadline covers both the HTTP response and parsing its JSON body, so an
 unresponsive or partially responding local daemon cannot hold up the remaining
-diagnostics.
+diagnostics. A timeout before the response starts and one after it starts are
+reported as different reasons. `lcm status` applies a two-second inactivity
+timeout to the same exchange and reports the same two reasons.
 
 Authenticated daemon health includes a startup-captured SHA-256 digest of the
 packaged `lcm.mjs` entrypoint. LCM reuses a running daemon only when its version,

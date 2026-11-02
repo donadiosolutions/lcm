@@ -9,7 +9,12 @@ import { Command, Option } from "commander";
 import { packageRootFor } from "../src/runtime-root.js";
 import {
   DaemonClient,
+  DaemonObservationError,
+  describeDaemonObservationFailure,
   type DaemonHealth,
+  type DaemonObservation,
+  type DaemonObservationFailure,
+  type DaemonObservationMismatchField,
   type DaemonRequestOptions,
   type InvocationControlRequest,
   type InvocationControlResponse,
@@ -2677,11 +2682,34 @@ async function createDaemonClientOrExit(): Promise<DaemonClient> {
   return (await createDaemonClientOrExitWithConfig()).client;
 }
 
+function daemonReadIdentityMismatchFields(
+  health: DaemonHealth | DaemonObservation,
+  expectedBackend: string,
+): DaemonObservationMismatchField[] {
+  const fields: DaemonObservationMismatchField[] = [];
+  if (typeof PKG_VERSION !== "string" || health.version !== PKG_VERSION) fields.push("version");
+  if (health.storageBackend !== expectedBackend) fields.push("storageBackend");
+  if (
+    typeof health.entrypoint !== "string"
+    || health.entrypoint.length === 0
+    || PACKAGED_RUNTIME_ENTRYPOINT === undefined
+    || !daemonEntrypointMatches(health.entrypoint, PACKAGED_RUNTIME_ENTRYPOINT, process.platform)
+  ) fields.push("entrypoint");
+  if (
+    typeof health.runtimeDigest !== "string"
+    || health.runtimeDigest.length === 0
+    || RUNTIME_DIGEST === undefined
+    || health.runtimeDigest !== RUNTIME_DIGEST
+  ) fields.push("runtimeDigest");
+  return fields;
+}
+
 async function createDaemonReadClientOrExit(
   preflightSeams?: RootBootstrapRetrySeams,
   options: DaemonClientOptions = {},
 ): Promise<DaemonClientWithConfig> {
   const configPath = defaultConfigPath();
+  let failure: DaemonObservationFailure | undefined;
   try {
     const first = readDaemonConfigSnapshot(configPath);
     const tokenPath = daemonTokenPath();
@@ -2690,42 +2718,42 @@ async function createDaemonReadClientOrExit(
     if (typeof token === "string" && token.length > 0) {
       const port = first.config.daemon.port;
       const client = new DaemonClient(`http://127.0.0.1:${port}`, tokenPath);
-      const health = options.diagnosticOnly
-        ? await client.observe({ timeoutMs: 2000 })
-        : await client.health();
-      if (
-        (health?.status === "ok" || health?.status === "healthy")
-        && typeof PKG_VERSION === "string"
-        && health.version === PKG_VERSION
-        && health.storageBackend === first.config.storage.backend
-        && typeof health.entrypoint === "string"
-        && health.entrypoint.length > 0
-        && PACKAGED_RUNTIME_ENTRYPOINT !== undefined
-        && daemonEntrypointMatches(
-          health.entrypoint,
-          PACKAGED_RUNTIME_ENTRYPOINT,
-          process.platform,
-        )
-        && typeof health.runtimeDigest === "string"
-        && health.runtimeDigest.length > 0
-        && RUNTIME_DIGEST !== undefined
-        && health.runtimeDigest === RUNTIME_DIGEST
-      ) {
-        const second = readDaemonConfigSnapshot(configPath);
-        if (
-          second.config.storage.backend === first.config.storage.backend
-          && daemonConfigSnapshotWitnessEqual(first.witness, second.witness)
-        ) {
-          return { client, config: second.config, health };
+      let health: DaemonHealth | DaemonObservation | null;
+      if (options.diagnosticOnly) {
+        const observed = await client.observeClassified({ timeoutMs: 2000 });
+        if (observed.kind === "failed") {
+          failure = observed.failure;
+          health = null;
+        } else health = observed.observation;
+      } else health = await client.health();
+      if (health !== null) {
+        const fields = daemonReadIdentityMismatchFields(health, first.config.storage.backend);
+        if ((health.status === "ok" || health.status === "healthy") && fields.length === 0) {
+          const second = readDaemonConfigSnapshot(configPath);
+          if (
+            second.config.storage.backend === first.config.storage.backend
+            && daemonConfigSnapshotWitnessEqual(first.witness, second.witness)
+          ) {
+            return { client, config: second.config, health };
+          }
+          failure = { reason: "config-changed" };
+        } else {
+          failure = fields.length > 0
+            ? { reason: "identity-mismatch", fields }
+            : { reason: "invalid-identity" };
         }
       }
-    }
+    } else failure = { reason: "token-missing" };
   } catch {
     // Diagnostics refuse any snapshot, token, observation, or witness failure.
     // Other callers retain the authenticated migration and lifecycle fallback.
   }
 
-  if (options.diagnosticOnly) throw new Error("Daemon identity could not be verified; run lcm daemon status.");
+  if (options.diagnosticOnly) {
+    throw failure === undefined
+      ? new Error("Daemon identity could not be verified; run lcm daemon status.")
+      : new DaemonObservationError(failure);
+  }
 
   if (options.rootBootstrapComplete !== true) {
     await migrateLegacyHomeWithRetry({
@@ -3655,6 +3683,7 @@ export async function runCli(
       const { renderBackendDiagnostics } = await import("../src/storage/diagnostic-renderer.js");
       let observedDaemon: { status: string; version?: string; uptime?: number; port?: number } = { status: "down" };
       let diagnosticSource: "daemon" | "local" = "local";
+      let observationFailure: DaemonObservationFailure | undefined;
       let statusData: {
         daemon: { status?: string; version?: string; uptime?: number; port?: number };
         project?: { messageCount: number; summaryCount: number; promotedCount: number };
@@ -3668,7 +3697,8 @@ export async function runCli(
         statusData = await client.post("/status", { cwd: process.cwd() }, { timeoutMs: 2000 });
         statusData.daemon.status = "up";
         diagnosticSource = "daemon";
-      } catch {
+      } catch (error) {
+        if (error instanceof DaemonObservationError) observationFailure = error.failure;
         try {
           const stats = await collectStats({ cwd: process.cwd() });
           statusData = { daemon: observedDaemon, backendDiagnostics: stats.backendDiagnostics,
@@ -3678,7 +3708,7 @@ export async function runCli(
             ? error.diagnostics : backendDiagnosticFailure(error) };
         }
       }
-      if (jsonFlag) stdout.write(JSON.stringify({ ...statusData, diagnosticSource }, null, 2) + "\n");
+      if (jsonFlag) stdout.write(JSON.stringify({ ...statusData, diagnosticSource, observationFailure }, null, 2) + "\n");
       else {
         console.log(`Daemon: ${statusData.daemon.status}`);
         console.log(diagnosticSource === "daemon"
@@ -3686,6 +3716,7 @@ export async function runCli(
           : observedDaemon.status === "up"
             ? "Diagnostics source: local observation after daemon status request failed."
             : "Diagnostics source: local observation.");
+        if (observationFailure) console.log(`Daemon observation failed: ${describeDaemonObservationFailure(observationFailure)}.`);
         if (statusData.daemon.version) console.log(`  Version: ${statusData.daemon.version}`);
         if (statusData.daemon.uptime !== undefined) console.log(`  Uptime: ${statusData.daemon.uptime}s`);
         if (statusData.daemon.port !== undefined) console.log(`  Port: ${statusData.daemon.port}`);
