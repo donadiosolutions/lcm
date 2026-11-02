@@ -20,6 +20,7 @@ import {
   type PassiveEventReplicationOptions,
 } from "../../src/daemon/passive-event-replication.js";
 import { BackendPublicationJournalError } from "../../src/storage/backend-publication.js";
+import { ScrubEngine } from "../../src/scrub.js";
 
 const PROJECT_ID = "0195d250-0000-7000-8000-000000000001";
 const MACHINE_ID = "0195d250-0000-7000-8000-000000000002";
@@ -335,6 +336,119 @@ const MACHINE_A = "0195d250-0000-7000-8000-00000000000a";
 const MACHINE_B = "0195d250-0000-7000-8000-00000000000b";
 
 describe("PassiveEventReplicationWorker", () => {
+  describe("outbound privacy admission", () => {
+    const marker = "Bearer synthetic-private-value";
+    const reason = "passive event requires redaction before replication";
+
+    it.each([
+      "data", "session_id", "category", "source_hook", "type", "created_at",
+      "event_uuid", "machine_id", "machine_sequence",
+      "seq", "priority", "prev_event_id",
+    ] as const)("quarantines retained sensitive %s before any payload transmission", async field => {
+      const event = localRow({ [field]: marker });
+      const before = { ...event };
+      const local = localRepository({ claimDeliveries: vi.fn().mockResolvedValue([event]) });
+      const remote = remoteRepository();
+      await expect(worker(local, remote).runOnce()).resolves.toMatchObject({ quarantined: 1, uploaded: 0 });
+      expect(local.markDeliveryQuarantined).toHaveBeenCalledWith(event.event_uuid, "worker:local", reason);
+      expect(remote.insertEvents).not.toHaveBeenCalled();
+      expect(remote.releaseFromOtherProjects).not.toHaveBeenCalled();
+      expect(event).toEqual(before);
+    });
+
+    it("counts privacy quarantine only when the local transition succeeds", async () => {
+      const local = localRepository({
+        claimDeliveries: vi.fn().mockResolvedValue([localRow({ data: marker })]),
+        markDeliveryQuarantined: vi.fn().mockResolvedValue(false),
+      });
+      const remote = remoteRepository();
+      await expect(worker(local, remote).runOnce()).resolves.toMatchObject({ quarantined: 0 });
+      expect(remote.insertEvents).not.toHaveBeenCalled();
+    });
+
+    it("refuses a retained non-text payload instead of transmitting encoded bytes", async () => {
+      const local = localRepository({ claimDeliveries: vi.fn().mockResolvedValue([
+        localRow({ data: new Uint8Array([65, 66]) as unknown as string }),
+      ]) });
+      const remote = remoteRepository();
+      await expect(worker(local, remote).runOnce()).resolves.toMatchObject({ quarantined: 1 });
+      expect(remote.insertEvents).not.toHaveBeenCalled();
+    });
+
+    it.each(["invalid", "throws"])("fails closed when the privacy policy %s", async mode => {
+      const scrubber = new ScrubEngine(mode === "invalid" ? ["("] : [], []);
+      if (mode === "throws") vi.spyOn(scrubber, "scrub").mockImplementation(() => { throw new Error(marker); });
+      const local = localRepository({ claimDeliveries: vi.fn().mockResolvedValue([localRow()]) });
+      const remote = remoteRepository();
+      await expect(worker(local, remote, { scrubber }).runOnce()).resolves.toMatchObject({ quarantined: 1 });
+      expect(local.markDeliveryQuarantined).toHaveBeenCalledWith(EVENT_ID, "worker:local", reason);
+      expect(remote.insertEvents).not.toHaveBeenCalled();
+    });
+
+    it("applies global and project patterns while preserving a safe envelope", async () => {
+      const safe = localRow();
+      const local = localRepository({ claimDeliveries: vi.fn().mockResolvedValue([
+        localRow({ event_uuid: "global-row", data: "company-private" }),
+        localRow({ event_uuid: "project-row", data: "project-private" }), safe,
+      ]) });
+      const remote = remoteRepository({ insertEvents: vi.fn().mockResolvedValue([remoteRecord()]) });
+      await expect(worker(local, remote, {
+        scrubber: new ScrubEngine(["company-private"], ["project-private"]),
+      }).runOnce()).resolves.toMatchObject({ quarantined: 2, uploaded: 1 });
+      expect(remote.insertEvents).toHaveBeenCalledWith([expect.objectContaining({
+        eventId: EVENT_ID, machineId: MACHINE_ID, machineSequence: 7n,
+        payload: expect.objectContaining({ data: "SQLite", previousEventId: null }),
+      })], undefined);
+      expect(local.markReplicated).toHaveBeenCalledWith(EVENT_ID, "worker:local", 41n);
+    });
+
+    it("does not send sensitive replicated rows during cross-project recovery", async () => {
+      const unsafe = localRow({ data: marker, delivery_state: "replicated", remote_inbox_id: "41" });
+      const safe = localRow({ event_uuid: "safe-row", delivery_state: "replicated", remote_inbox_id: "42" });
+      const local = localRepository({ listAwaitingRemote: vi.fn().mockResolvedValue([unsafe, safe]) });
+      const remote = remoteRepository({ releaseFromOtherProjects: vi.fn().mockResolvedValue([
+        { eventId: "safe-row", outcome: "applied", inboxId: 42n },
+      ]) });
+      const onError = vi.fn();
+      await expect(worker(local, remote, { onError }).runOnce()).resolves.toMatchObject({ acknowledged: 1 });
+      expect(remote.releaseFromOtherProjects).toHaveBeenCalledWith([
+        expect.objectContaining({ eventId: "safe-row", inboxId: 42n }),
+      ], expect.any(Object));
+      expect(local.markAcknowledged).toHaveBeenCalledWith("safe-row", 42n);
+      expect(local.markAcknowledged).not.toHaveBeenCalledWith(EVENT_ID, expect.anything());
+      expect(onError.mock.calls.map(([error]) => (error as Error).message)).toEqual([reason]);
+      expect(unsafe.data).toBe(marker);
+    });
+
+    it("leaves an entirely privacy-refused recovery batch locally recoverable", async () => {
+      const event = localRow({ data: marker, delivery_state: "replicated", remote_inbox_id: "41" });
+      const local = localRepository({ listAwaitingRemote: vi.fn().mockResolvedValue([event]) });
+      const remote = remoteRepository();
+      const onError = vi.fn();
+      await expect(worker(local, remote, { onError }).runOnce()).resolves.toMatchObject({ acknowledged: 0 });
+      expect(remote.releaseFromOtherProjects).not.toHaveBeenCalled();
+      expect(local.markAcknowledged).not.toHaveBeenCalled();
+      expect(local.requeueReplicated).not.toHaveBeenCalled();
+      expect(onError.mock.calls.map(([error]) => (error as Error).message)).toEqual([reason]);
+      expect(event).toMatchObject({ data: marker, delivery_state: "replicated", remote_inbox_id: "41" });
+    });
+
+    it("rechecks privacy before result-loss recovery transmits a retained payload", async () => {
+      const scrubber = new ScrubEngine([], []);
+      let changed = false;
+      vi.spyOn(scrubber, "scrub").mockImplementation(text => changed && text === "SQLite" ? "[REDACTED]" : text);
+      const local = localRepository({ claimDeliveries: vi.fn().mockResolvedValue([localRow()]) });
+      const remote = remoteRepository({ insertEvents: vi.fn(async () => {
+        changed = true;
+        throw new Error("uncertain insert");
+      }) });
+      await expect(worker(local, remote, { scrubber }).runOnce()).resolves.toMatchObject({ retried: 1 });
+      expect(remote.insertEvents).toHaveBeenCalledTimes(1);
+      expect(remote.releaseFromOtherProjects).not.toHaveBeenCalled();
+      expect(local.markDeliveryRetry).toHaveBeenCalledWith(EVENT_ID, "worker:local", reason, expect.any(String));
+    });
+  });
+
   it("runs the upload, fenced apply, acknowledgement, and exact prune handoff", async () => {
     const pending = localRow({ delivery_state: "claimed", delivery_owner: "worker:local" });
     const replicated = localRow({

@@ -392,6 +392,22 @@ imported, so it never opens a PostgreSQL connection and its behaviour is
 unchanged. Replication is still not started by a hook, and it remains separate
 from the selected `ProjectStorage` route.
 
+Before transmitting an event, replication checks every retained text field against
+the built-in credential patterns and the current global and project sensitive
+patterns. If redaction would change any field, the row is not uploaded. New
+uploads enter local quarantine with `passive event requires redaction before
+replication`; the original local text and event identifiers remain intact for
+recovery. Replication also refuses payload-bearing cross-project recovery for a
+previously replicated row that fails this check. Safe rows continue normally.
+
+Replication deliberately does not redact only the remote copy: a changed payload
+under the same event identity would break exact readback and recovery. Review
+privacy-quarantined events with `lcm events quarantine`; `lcm events replay`
+does not bypass the privacy check. Correct an erroneous sensitive-pattern rule
+before replaying, or retain the event locally when its original envelope cannot
+be transmitted safely. Invalid privacy patterns fail closed. This check does not
+remove copies that were already uploaded by an older version.
+
 Every project replicates in admitted phases rather than inside one admission
 held across the whole pass. The drain-lease acquisition runs under its own
 admission before the upload, then the upload runs under one admission, each
