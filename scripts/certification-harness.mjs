@@ -357,6 +357,13 @@ export async function runMachineActivationBarrier(input) {
   await input.startDaemonB();
 }
 
+// migration-start.json hands each machine the coordinator's own setup deadline; the agent
+// bounds every migration step by it (test/certification/machine-agent.mjs runMigrationStep),
+// so a slow step fails with a record before this side's wait for the phase expires.
+function migrationStartControl(setupDeadline) {
+  return `${JSON.stringify({ at: new Date().toISOString(), setupDeadlineAt: new Date(setupDeadline).toISOString() })}\n`;
+}
+
 function publishWarmupControl(evidenceDirectory, wallNow = Date.now) {
   const warmupStartAt = new Date(wallNow() + 2_000).toISOString();
   const control = { warmupStartAt };
@@ -556,12 +563,12 @@ export async function runManagedMachinePair(input, dependencies = {}) {
     await runMachineActivationBarrier({
       verifyA: async () => {
         await run(["container", "start", names.machineA]);
-        writeFileSync(join(input.evidenceDirectory, "machine-a", "migration-start.json"), `${JSON.stringify({ at: new Date().toISOString() })}\n`, { mode: 0o600, flag: "wx" });
+        writeFileSync(join(input.evidenceDirectory, "machine-a", "migration-start.json"), migrationStartControl(setupDeadline), { mode: 0o600, flag: "wx" });
         await waitForSetupFiles([join(input.evidenceDirectory, "machine-a", "verification-receipt.json")], [names.machineA]);
       },
       verifyB: async () => {
         await run(["container", "start", names.machineB]);
-        writeFileSync(join(input.evidenceDirectory, "machine-b", "migration-start.json"), `${JSON.stringify({ at: new Date().toISOString() })}\n`, { mode: 0o600, flag: "wx" });
+        writeFileSync(join(input.evidenceDirectory, "machine-b", "migration-start.json"), migrationStartControl(setupDeadline), { mode: 0o600, flag: "wx" });
         await waitForSetupFiles([join(input.evidenceDirectory, "machine-b", "verification-receipt.json")], [names.machineA, names.machineB]);
       },
       grantRuntime: async () => {
@@ -1390,12 +1397,12 @@ export async function runLocalCertification(options, dependencies = {}) {
         await runMachineActivationBarrier({
           verifyA: async () => {
             await runContainer(["container", "start", context.names.machineA]);
-            writeFileSync(join(options.evidenceDirectory, "machine-a", "migration-start.json"), `${JSON.stringify({ at: new Date().toISOString() })}\n`, { mode: 0o600, flag: "wx" });
+            writeFileSync(join(options.evidenceDirectory, "machine-a", "migration-start.json"), migrationStartControl(setupDeadline), { mode: 0o600, flag: "wx" });
             await waitForSetupFiles([join(options.evidenceDirectory, "machine-a", "verification-receipt.json")], [context.names.machineA]);
           },
           verifyB: async () => {
             await runContainer(["container", "start", context.names.machineB]);
-            writeFileSync(join(options.evidenceDirectory, "machine-b", "migration-start.json"), `${JSON.stringify({ at: new Date().toISOString() })}\n`, { mode: 0o600, flag: "wx" });
+            writeFileSync(join(options.evidenceDirectory, "machine-b", "migration-start.json"), migrationStartControl(setupDeadline), { mode: 0o600, flag: "wx" });
             await waitForSetupFiles([join(options.evidenceDirectory, "machine-b", "verification-receipt.json")], [context.names.machineA, context.names.machineB]);
           },
           grantRuntime: async () => {

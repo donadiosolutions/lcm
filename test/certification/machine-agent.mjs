@@ -880,6 +880,65 @@ export async function runPublicMigrationFlow(runStep, options = {}) {
   return steps;
 }
 
+// Migration steps share the coordinator's setup budget (the contract's
+// timeline.full.setupMaxSeconds, counted from the coordinator's setup start), which
+// migration-start.json carries as setupDeadlineAt. A step may run until that deadline less
+// MIGRATION_STEP_RECORD_MARGIN_MS, which leaves time to record a killed step and exit
+// before the coordinator's own wait for the phase expires; a step that would get less than
+// MIGRATION_STEP_MIN_TIMEOUT_MS is not started. A fixed per-step cap below the window
+// killed apply over a 150 ms link, where it needs about 437 s.
+export const MIGRATION_STEP_RECORD_MARGIN_MS = 15_000;
+export const MIGRATION_STEP_MIN_TIMEOUT_MS = 1_000;
+const MIGRATION_STDERR_TAIL_LIMIT = 2_000;
+
+export function setupDeadlineFromControl(control) {
+  const deadlineMs = typeof control?.setupDeadlineAt === "string" ? Date.parse(control.setupDeadlineAt) : Number.NaN;
+  if (!Number.isFinite(deadlineMs)) throw new Error("certification migration-start control has no valid setupDeadlineAt");
+  return deadlineMs;
+}
+
+// The whole stderr is redacted before the tail is cut, so the cut cannot split a secret.
+function redactedStderrTail(stderr, environment, secrets) {
+  const redacted = redactDiagnosticText(stderr, environment, Number.POSITIVE_INFINITY, secrets);
+  return redacted.length > MIGRATION_STDERR_TAIL_LIMIT
+    ? `[truncated ${redacted.length - MIGRATION_STDERR_TAIL_LIMIT} characters]...${redacted.slice(-MIGRATION_STDERR_TAIL_LIMIT)}`
+    : redacted;
+}
+
+// Runs one public migration step through exec(args, { timeoutMs }) and returns its JSON
+// envelope, a refusal's included. A step that fails without an envelope (killed at its
+// timeout, or exited without output) appends a private failures.ndjson record and throws a
+// message with the same fields; neither holds the command line or unredacted output.
+export async function runMigrationStep({ args, exec, setupDeadlineMs, failuresPath, machine, environment = {}, secrets, now = Date.now }) {
+  const step = args[0];
+  const startedMs = now();
+  const timeoutMs = Math.floor(setupDeadlineMs - MIGRATION_STEP_RECORD_MARGIN_MS - startedMs);
+  const fail = (fields, summary) => {
+    appendNdjson(failuresPath, { machine, op: "migration", step, phase: "setup", recordedAt: new Date().toISOString(), ...fields });
+    return new Error(`certification migration ${step} ${summary}: code=${fields.code} signal=${fields.signal} killed=${fields.killed} elapsedMs=${fields.elapsedMs} timeoutMs=${fields.timeoutMs} stderrTail=${JSON.stringify(fields.stderrTail)}`);
+  };
+  if (!(timeoutMs >= MIGRATION_STEP_MIN_TIMEOUT_MS)) {
+    throw fail({ errorClass: "SetupDeadlineExceeded", code: null, signal: null, killed: null, elapsedMs: 0, timeoutMs: Math.max(0, timeoutMs), stderrTail: "" }, "not started before the setup deadline");
+  }
+  let result;
+  try {
+    result = await exec(args, { timeoutMs });
+  } catch (error) {
+    if (typeof error?.stdout === "string" && error.stdout.length > 0) return JSON.parse(error.stdout);
+    const killed = typeof error?.killed === "boolean" ? error.killed : null;
+    throw fail({
+      errorClass: killed === true ? "MigrationStepKilled" : "MigrationStepFailed",
+      code: error?.code ?? null,
+      signal: error?.signal ?? null,
+      killed,
+      elapsedMs: Math.max(0, Math.round(now() - startedMs)),
+      timeoutMs,
+      stderrTail: redactedStderrTail(error?.stderr, environment, secrets),
+    }, "failed");
+  }
+  return JSON.parse(result.stdout);
+}
+
 export async function runMachineAgent(environment = process.env) {
   const evidenceDirectory = environment.LCM_CERT_EVIDENCE_DIR;
   const machine = process.argv[process.argv.indexOf("--machine") + 1];
@@ -931,18 +990,20 @@ export async function runMachineAgent(environment = process.env) {
       },
     },
   });
-  await waitForControl(join(evidenceDirectory, "migration-start.json"), {
+  const migrationStart = await waitForControl(join(evidenceDirectory, "migration-start.json"), {
     deadlineMs: Date.now() + contract.timeline.full.setupMaxSeconds * 1000,
   });
-  const migrationSteps = await runPublicMigrationFlow(async (args) => {
-    try {
-      const result = await execFileAsync(process.execPath, [lcm, "migration", ...args, "--json"], { cwd: project, env: environment, timeout: 120_000 });
-      return JSON.parse(result.stdout);
-    } catch (error) {
-      if (typeof error?.stdout !== "string" || error.stdout.length === 0) throw error;
-      return JSON.parse(error.stdout);
-    }
-  }, {
+  const setupDeadlineMs = setupDeadlineFromControl(migrationStart);
+  const migrationSecrets = collectDiagnosticSecrets(environment);
+  const migrationSteps = await runPublicMigrationFlow((args) => runMigrationStep({
+    args,
+    exec: (stepArgs, { timeoutMs }) => execFileAsync(process.execPath, [lcm, "migration", ...stepArgs, "--json"], { cwd: project, env: environment, timeout: timeoutMs }),
+    setupDeadlineMs,
+    failuresPath: join(evidenceDirectory, "failures.ndjson"),
+    machine,
+    environment,
+    secrets: migrationSecrets,
+  }), {
     beforeActivate: async (steps) => {
       writeFileSync(join(evidenceDirectory, "verification-receipt.json"), `${JSON.stringify({
         machine,

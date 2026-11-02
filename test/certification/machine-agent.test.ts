@@ -13,12 +13,16 @@ import {
   expectedHookPayload,
   isAcknowledgedRow,
   machineStoredConfig,
+  MIGRATION_STEP_MIN_TIMEOUT_MS,
+  MIGRATION_STEP_RECORD_MARGIN_MS,
   observeAcknowledgments,
   observeUntilStopped,
   probeLcmTlsRejection,
   readAcknowledgmentRows,
   redactDiagnosticText,
+  runMigrationStep,
   runPublicMigrationFlow,
+  setupDeadlineFromControl,
   startForegroundDaemon,
   verifyFinalDrain,
   verifyEmissionBudget,
@@ -172,6 +176,95 @@ describe("certification machine agent", () => {
       ["activate", "--generation", "generation-1", "--confirm-generation", "generation-1", "--confirm-backend", "postgresql"],
     ]);
     expect(result).toHaveLength(4);
+  });
+
+  // Managed attempt 5 lost apply to a fixed 120 s cap: over a 150 ms link apply needs about
+  // 437 s. Each step now gets what is left of the coordinator's setup window, less the
+  // margin in which a killed step is recorded before the coordinator stops waiting.
+  it("derives each migration step timeout from the remaining setup window", async () => {
+    const failuresPath = join(mkdtempSync(join(tmpdir(), "lcm-cert-migration-window-")), "failures.ndjson");
+    let clock = 1_000_000;
+    const setupDeadlineMs = clock + 600_000;
+    const timeouts: number[] = [];
+    const exec = vi.fn(async (_args: string[], { timeoutMs }: { timeoutMs: number }) => {
+      expect(timeoutMs).toBeLessThanOrEqual(setupDeadlineMs - clock);
+      timeouts.push(timeoutMs);
+      clock += 100_000;
+      return { stdout: JSON.stringify({ outcome: "ok", generation: "generation-1" }) };
+    });
+    const steps = await runPublicMigrationFlow((args) => runMigrationStep({ args, exec, setupDeadlineMs, failuresPath, machine: "a", now: () => clock }));
+
+    expect(steps.map((step) => step.name)).toEqual(["plan", "apply", "verify", "activate"]);
+    expect(timeouts).toEqual([0, 1, 2, 3].map((index) => 600_000 - MIGRATION_STEP_RECORD_MARGIN_MS - index * 100_000));
+    expect(existsSync(failuresPath)).toBe(false);
+  });
+
+  it("does not start a migration step that the setup deadline no longer leaves time for", async () => {
+    const failuresPath = join(mkdtempSync(join(tmpdir(), "lcm-cert-migration-deadline-")), "failures.ndjson");
+    const exec = vi.fn();
+    const timeoutMs = MIGRATION_STEP_MIN_TIMEOUT_MS - 1;
+    await expect(runMigrationStep({
+      args: ["activate", "--generation", "generation-1"], exec, failuresPath, machine: "b",
+      setupDeadlineMs: 5_000 + MIGRATION_STEP_RECORD_MARGIN_MS + timeoutMs, now: () => 5_000,
+    })).rejects.toThrow(`certification migration activate not started before the setup deadline: code=null signal=null killed=null elapsedMs=0 timeoutMs=${timeoutMs} stderrTail=""`);
+    expect(exec).not.toHaveBeenCalled();
+    expect(readFileSync(failuresPath, "utf8").trim().split("\n").map((line) => JSON.parse(line))).toEqual([expect.objectContaining({
+      machine: "b", op: "migration", step: "activate", phase: "setup", errorClass: "SetupDeadlineExceeded",
+      code: null, signal: null, killed: null, elapsedMs: 0, timeoutMs, stderrTail: "",
+    })]);
+  });
+
+  // A step that dies without an envelope must say how: killed at its timeout, or a plain
+  // exit. Both give execFile's identical "Command failed" message; only these fields differ.
+  it.each([
+    ["killed at its timeout", { code: null, signal: "SIGTERM", killed: true }, "MigrationStepKilled"],
+    ["exited without an envelope", { code: 1, signal: null, killed: false }, "MigrationStepFailed"],
+  ])("records a migration step %s with its exit fields and a redacted stderr tail", async (_label, fields, errorClass) => {
+    const failuresPath = join(mkdtempSync(join(tmpdir(), "lcm-cert-migration-failure-")), "failures.ndjson");
+    const transferUrl = "postgresql://lcm_cert_transfer:pw-secret-123@db.example:25060/defaultdb";
+    const preamble = "\nResolving migration preflight...\n";
+    // The last 2,000 characters of the unredacted text start inside the URL's password, so
+    // a tail cut before redaction would leak "ret-123@db.example".
+    const stderr = `${"x".repeat(500)}${transferUrl}${"y".repeat(2_000 - 34 - preamble.length)}${preamble}`;
+    let clock = 10_000;
+    const exec = vi.fn(async () => {
+      clock += 120_000;
+      throw Object.assign(new Error(`Command failed: node /opt/lcm/dist/lcm.mjs migration apply --confirm-generation generation-1 --json\n${stderr}`), { ...fields, stdout: "", stderr });
+    });
+    const failure = await runMigrationStep({
+      args: ["apply", "--confirm-generation", "generation-1"], exec, failuresPath, machine: "a",
+      setupDeadlineMs: 10_000 + 600_000, now: () => clock, environment: { LCM_POSTGRES_URL: transferUrl },
+    }).catch((error: unknown) => error as Error);
+
+    const [record, ...others] = readFileSync(failuresPath, "utf8").trim().split("\n").map((line) => JSON.parse(line));
+    expect(others).toEqual([]);
+    expect(record).toMatchObject({
+      machine: "a", op: "migration", step: "apply", phase: "setup", errorClass, ...fields,
+      elapsedMs: 120_000, timeoutMs: 600_000 - MIGRATION_STEP_RECORD_MARGIN_MS,
+    });
+    expect(record.stderrTail).toMatch(/^\[truncated \d+ characters\]\.\.\./u);
+    expect(record.stderrTail.endsWith(`[redacted:LCM_POSTGRES_URL]${"y".repeat(2_000 - 34 - preamble.length)}${preamble}`)).toBe(true);
+    expect(failure).toBeInstanceOf(Error);
+    expect(failure.message).toBe(`certification migration apply failed: code=${fields.code} signal=${fields.signal} killed=${fields.killed} elapsedMs=120000 timeoutMs=${600_000 - MIGRATION_STEP_RECORD_MARGIN_MS} stderrTail=${JSON.stringify(record.stderrTail)}`);
+    for (const text of [failure.message, JSON.stringify(record)]) {
+      expect(text).not.toMatch(/ret-123|db\.example|postgresql:\/\/|Command failed/u);
+    }
+  });
+
+  it("returns a failed step's JSON envelope instead of recording it", async () => {
+    const failuresPath = join(mkdtempSync(join(tmpdir(), "lcm-cert-migration-envelope-")), "failures.ndjson");
+    const envelope = { outcome: "refused", refusal: { reason: "migration-target-verification-failed" } };
+    const exec = vi.fn(async () => { throw Object.assign(new Error("Command failed"), { code: 1, signal: null, killed: false, stdout: JSON.stringify(envelope), stderr: "" }); });
+    await expect(runMigrationStep({ args: ["plan"], exec, failuresPath, machine: "a", setupDeadlineMs: Date.now() + 600_000 })).resolves.toEqual(envelope);
+    expect(existsSync(failuresPath)).toBe(false);
+  });
+
+  it("reads the coordinator's setup deadline from migration-start", () => {
+    expect(setupDeadlineFromControl({ at: "2026-11-02T20:28:09.529Z", setupDeadlineAt: "2026-11-02T20:38:09.221Z" }))
+      .toBe(Date.parse("2026-11-02T20:38:09.221Z"));
+    for (const control of [{ at: "2026-11-02T20:28:09.529Z" }, { setupDeadlineAt: "soon" }, { setupDeadlineAt: 1 }, null]) {
+      expect(() => setupDeadlineFromControl(control)).toThrow("no valid setupDeadlineAt");
+    }
   });
 
   it("records first-seen monotonic time and distinct inbox ids", () => {

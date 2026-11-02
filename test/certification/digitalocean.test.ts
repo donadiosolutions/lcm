@@ -596,6 +596,12 @@ describe("certification DigitalOcean lifecycle", () => {
     expect(JSON.parse(readFileSync(join(evidenceDirectory, "pre-activation-residual.json"), "utf8")).residualEmpty).toBe(true);
     expect(JSON.parse(readFileSync(join(evidenceDirectory, "setup-session-closure.json"), "utf8")).totalConnections).toBe(0);
     expect(events).toEqual(["verified-a", "verified-b", "grant-runtime", "activated-a", "activated-b", "revoke-transfer", "verify-runtime"]);
+    // Both machines get the coordinator's own setup deadline, which bounds their migration steps.
+    const setupStartedAt = Date.parse(JSON.parse(readFileSync(join(evidenceDirectory, "setup-evidence.json"), "utf8")).startedAt);
+    for (const machine of ["a", "b"]) {
+      expect(JSON.parse(readFileSync(join(evidenceDirectory, `machine-${machine}`, "migration-start.json"), "utf8")).setupDeadlineAt)
+        .toBe(new Date(setupStartedAt + setupMaxSeconds * 1000).toISOString());
+    }
     expect(readFileSync(join(evidenceDirectory, "machine-a", "runtime-ready.json"), "utf8")).toBeTruthy();
     expect(readFileSync(join(evidenceDirectory, "machine-b", "runtime-ready.json"), "utf8")).toBeTruthy();
     const phaseControl = JSON.parse(readFileSync(join(evidenceDirectory, "phase-control.json"), "utf8"));

@@ -90,6 +90,11 @@ The coordinator starts warmup only after both `ready.json` witnesses exist, wait
 for both `warmup-complete.json` witnesses, and publishes the shared steady-state
 T0. These setup steps and receipts must fit within the 600-second setup budget
 and are written to private setup evidence.
+Each machine's plan, apply, verify, and activate steps may run until 15 seconds
+before the setup deadline that `migration-start.json` carries as `setupDeadlineAt`,
+and a step that fails without a JSON envelope adds a record to the machine's
+private `failures.ndjson` with the step, elapsed time, exit code, signal, kill
+flag, and a bounded, redacted stderr tail.
 
 ## Prepare the staged package
 

@@ -763,6 +763,13 @@ describe("certification fault clearance probes", () => {
     expect(run.calls.some((args) => args[0] === "network" && args[1] === "disconnect")).toBe(false);
     expect(existsSync(join(run.evidenceDirectory, "faults.json"))).toBe(false);
     expect(run.environmentFiles.get(run.names.machineA)?.LCM_CERT_WITH_FAULTS).toBeUndefined();
+    // Both machines get the coordinator's own setup deadline, which bounds their migration steps.
+    const { contract } = loadCertificationContract(new URL("./contract-v3.json", import.meta.url));
+    const setupStartedAt = Date.parse(JSON.parse(readFileSync(join(run.evidenceDirectory, "setup-evidence.json"), "utf8")).startedAt);
+    for (const machine of ["a", "b"]) {
+      expect(JSON.parse(readFileSync(join(run.evidenceDirectory, `machine-${machine}`, "migration-start.json"), "utf8")).setupDeadlineAt)
+        .toBe(new Date(setupStartedAt + contract.timeline.full.setupMaxSeconds * 1000).toISOString());
+    }
   });
 });
 
