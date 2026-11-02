@@ -913,10 +913,11 @@ bundle and keep provider, credential, quarantine, and recovery sessions private.
   URLs retain their conservative file-path classification through `?` and `#`,
   so a nested non-file URL in that quoted span may still be redacted as a path.
   There are no configuration options for this defense-in-depth behavior.
-- Sanitizing an error message is stable: sanitizing the result again changes
-  nothing. When hiding one path uncovers the start of another, for example a
-  successor after a quoted URL and a separator containing a slash, the first
-  call returns the text that the later passes of earlier releases produced, so
+- Sanitizing an error message is stable when sanitized again, except for
+  unusually deep chains of nested redactions (described below). When hiding
+  one path uncovers the start of another, for example a successor after a
+  quoted URL and a separator containing a slash, the first call returns the
+  text that the later passes of earlier releases produced, so
   `file://h?x=['https://outer.test/x?next=file:///Users/a/My Files/private.db'abc/def|\Users\SECRET\x]`
   hides the Windows value on the first call. Passes only replace text with
   `<path>`, so repeating them never reveals text that an earlier pass hid.
