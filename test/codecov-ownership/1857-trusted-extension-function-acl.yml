@@ -1,0 +1,6 @@
+references: ["#1857"]
+rationale: >-
+  #1857 admits owner-granted PUBLIC execution for bootstrap-owned trusted
+  extension functions under the existing PostgreSQL schema component.
+pins:
+  - ["src/storage/postgresql/runtime-readiness.ts", "integration-postgresql-schema"]

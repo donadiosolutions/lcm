@@ -1062,6 +1062,13 @@ psql "$LCM_POSTGRES_ADMIN_URL" \
   --file src/storage/postgresql/reference/postgresql-runtime-transcript-grants.sql
 ```
 
+On managed providers, a non-superuser extension administrator may see
+`WARNING: no privileges were granted` for `public.digest`,
+`public.similarity`, or `public.similarity_op` because PostgreSQL retains those
+trusted-extension functions under the bootstrap owner. This warning is
+expected. Keep the owner-granted `PUBLIC EXECUTE` entries on those functions;
+explicit grants remain valid on hardened self-managed targets.
+
 The transcript grant permits immutable inserts, provenance reads, and bounded
 checkpoint updates only; it grants no payload update, deletion, truncation, or
 unrelated table access. Applying it makes the explicit native-transcript
@@ -1161,6 +1168,10 @@ user-systemd launch sends
 `LCM_POSTGRES_URL` through `LoadCredential`; the non-secret CA pathname is
 propagated as a normal environment value. `lcm config get storage --effective`
 shows the CA path and tuning values but replaces the URL with `[REDACTED]`.
+When `doadmin` applies the runtime scripts, PostgreSQL may report
+`WARNING: no privileges were granted` for `public.digest`,
+`public.similarity`, and `public.similarity_op`; keep their default
+owner-granted `PUBLIC EXECUTE` entries so readiness can verify effective access.
 
 The daemon only accepts credentials that systemd exposed through a canonical
 per-unit directory under `/run/credentials/`, the current user's
