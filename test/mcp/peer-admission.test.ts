@@ -12,7 +12,7 @@ const state = vi.hoisted(() => ({
 }));
 vi.mock("../../src/daemon/peer-admission.js", async importOriginal => ({
   ...await importOriginal<typeof import("../../src/daemon/peer-admission.js")>(),
-  admitDaemonPeer: state.peer,
+  admitCurrentDaemonPeer: state.peer,
 }));
 vi.mock("../../src/daemon/lifecycle.js", () => ({ ensureDaemon: vi.fn(async () => ({ connected: true })) }));
 vi.mock("../../src/daemon/config.js", () => ({ loadDaemonConfig: () => ({ daemon: { port: state.port }, storage: { backend: "sqlite" } }) }));

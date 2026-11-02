@@ -1,4 +1,4 @@
-import { admitDaemonPeer, awaitDaemonPeerAdmission } from "../daemon/peer-admission.js";
+import { admitCurrentDaemonPeer, awaitDaemonPeerAdmission } from "../daemon/peer-admission.js";
 import { renderBackendDiagnostics } from "../storage/diagnostic-renderer.js";
 import { existsSync, readFileSync, lstatSync } from "node:fs";
 import { homedir, platform } from "node:os";
@@ -202,7 +202,7 @@ async function readDaemonObservation(
         let peer;
         try {
           peer = await awaitDaemonPeerAdmission(
-            deps._admitDaemonPeerForTesting ?? ((targetPort, deadline) => admitDaemonPeer({
+            deps._admitDaemonPeerForTesting ?? ((targetPort, deadline) => admitCurrentDaemonPeer({
               port: targetPort, deadline, homeDir: deps.homedir, _platform: deps.platform,
             })), port, expires, controller.signal,
           );

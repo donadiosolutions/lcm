@@ -8,7 +8,7 @@
 // never writes decisions, permission verdicts or input rewrites. Codex honors
 // additional context only as JSON on stdout.
 import { DaemonClient } from "../daemon/client.js";
-import { admitDaemonPeer, type DaemonPeerAdmissionCallback } from "../daemon/peer-admission.js";
+import { admitCurrentDaemonPeer, type DaemonPeerAdmissionCallback } from "../daemon/peer-admission.js";
 import { configPath as defaultConfigPath } from "../runtime-paths.js";
 import { loadStoredPreToolRecallSettings } from "../config-projection.js";
 import { buildMemoryContext } from "./memory-context.js";
@@ -248,7 +248,7 @@ async function runPreToolUse(
   assertHookPublicationFence();
 
   const client = new DaemonClient("http://127.0.0.1:" + settings.daemonPort, undefined,
-    admitPeerForTesting ?? ((port, deadline) => admitDaemonPeer({ port, deadline })));
+    admitPeerForTesting ?? ((port, deadline) => admitCurrentDaemonPeer({ port, deadline })));
   const controller = new AbortController();
   const timer = setTimeout(() => controller.abort(), deadlineMs);
   let response: PromptSearchResponse;

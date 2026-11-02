@@ -1498,7 +1498,7 @@ function lifecyclePeerAdmitter(
     if (port !== opts.port || abortSignal?.aborted
       || now() >= deadline || dependencies.platform === "win32") return null;
     const operation = async (): Promise<DaemonPeerAdmission | null> => {
-      let manager: { pid: number; controlGroup?: string } | undefined;
+      let manager: { pid: number; controlGroup?: string; allowMissingPid?: boolean } | undefined;
       if (mode.kind === "replacement-manager") {
         if (mode.spec.port !== port
           || resolve(mode.spec.stateRoot) !== resolve(dirname(opts.pidFilePath))) return null;
@@ -1509,7 +1509,7 @@ function lifecyclePeerAdmitter(
           || observation.name !== mode.spec.name
           || observation.nonce !== mode.spec.nonce
           || observation.managerPid !== mode.managerPid) return null;
-        manager = { pid: mode.managerPid, controlGroup: observation.controlGroup };
+        manager = { pid: mode.managerPid, controlGroup: observation.controlGroup, allowMissingPid: true };
       }
       if (opts._admitDaemonPeerForTesting !== undefined
         && (opts._testScope !== undefined || opts._hermeticTestSeams !== undefined)) {

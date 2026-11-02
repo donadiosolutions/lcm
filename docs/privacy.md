@@ -1051,8 +1051,11 @@ doctor observations, legacy daemon migration and publication retries verify the
 local daemon recipient before reading its token or sending authenticated data.
 Each request checks the private daemon PID file, the process owner and command,
 the exact configured `127.0.0.1` listener and a stable process birth identity.
-Managed replacement requests also recheck the service manager's exact scope and
-launch identity. A later request repeats these checks even when its client has
+When Linux isolates the daemon's process-descriptor links, each request obtains
+fresh service-manager scope, launch, PID and cgroup evidence and compares the
+exact listener's kernel cgroup. Current recipients still require the private PID
+file. Managed replacement requests also recheck the service manager's exact
+scope and launch identity. A later request repeats these checks even when its client has
 already loaded a token.
 
 Missing, unsafe, ambiguous or expired evidence causes refusal. Pre-tool recall

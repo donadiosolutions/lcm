@@ -1,6 +1,6 @@
 import { createServer, type RequestListener, type Server } from "node:http";
 import type { AddressInfo } from "node:net";
-import { afterEach, describe, expect, it } from "vitest";
+import { afterEach, describe, expect, it, vi } from "vitest";
 import { daemonJsonResponse } from "../../src/daemon/http-url.js";
 
 describe("daemon response failure phases", () => {
@@ -31,6 +31,27 @@ describe("daemon response failure phases", () => {
     await new Promise<void>(resolve => server!.close(() => resolve()));
     server = undefined;
     expect(await failure(port)).toMatchObject({ daemonPhase: "request-failed", code: "ECONNREFUSED" });
+  });
+
+  it("preserves a caller assertion failure before writing and closes the request", async () => {
+    const received = vi.fn();
+    const port = await listen(received);
+    const refusal = new Error("caller deadline expired");
+    const assertCurrent = vi.fn()
+      .mockImplementationOnce(() => undefined)
+      .mockImplementationOnce(() => { throw refusal; });
+
+    await expect(daemonJsonResponse(port, "/store", {
+      method: "POST",
+      headers: { Authorization: "Bearer private-token" },
+      body: { query: "private query" },
+      _assertCurrent: assertCurrent,
+    })).rejects.toBe(refusal);
+    await new Promise<void>(resolve => setImmediate(resolve));
+
+    expect(assertCurrent).toHaveBeenCalledTimes(2);
+    expect(refusal).toHaveProperty("daemonPhase", "request-failed");
+    expect(received).not.toHaveBeenCalled();
   });
 
   it("keeps the inactivity timeout and tags whether headers had arrived", async () => {

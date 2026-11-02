@@ -106,10 +106,10 @@ describe("daemon peer admission", () => {
     const paths = fixture();
     rmSync(paths.pidPath);
     expect(admitDaemonPeer({ ...paths, port, deadline: deadline(), _processBirth: birth,
-      manager: { pid } })).toEqual({ pid, birth: "birth" });
+      manager: { pid, allowMissingPid: true } })).toEqual({ pid, birth: "birth" });
     writeFileSync(paths.pidPath, "9999", { mode: 0o600 });
     expect(admitDaemonPeer({ ...paths, port, deadline: deadline(), _processBirth: birth,
-      manager: { pid } })).toBeNull();
+      manager: { pid, allowMissingPid: true } })).toBeNull();
   });
 
   it("uses bounded numeric Darwin owner and listener witnesses", () => {
@@ -165,7 +165,7 @@ describe("daemon peer admission", () => {
       return "birth";
     });
     expect(admitDaemonPeer({ ...paths, port, deadline: deadline(), _processBirth: birth,
-      manager: { pid } })).toBeNull();
+      manager: { pid, allowMissingPid: true } })).toBeNull();
   });
 
   it("refuses malformed Darwin process-owner observations", () => {

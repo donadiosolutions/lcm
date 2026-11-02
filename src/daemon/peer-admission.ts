@@ -10,6 +10,10 @@ import {
   readBoundedRegularFileWithStat,
 } from "../security-files.js";
 import { processStartTime } from "../private-mutation-lock.js";
+import { createSupervisor, createSupervisorSpec, managedLaunchEnvironment } from "./supervisor.js";
+import { managedDaemonPathForStableLaunch } from "./managed-path.js";
+import { PACKAGED_RUNTIME_ENTRYPOINT } from "./version.js";
+import { packageExecutable } from "../runtime-root.js";
 import {
   findListeningTcpPorts,
   isLikelyLcmDaemonCommand,
@@ -69,8 +73,8 @@ export type DaemonPeerAdmissionOptions = Readonly<{
   homeDir?: string;
   pidFilePath?: string;
   now?: () => number;
-  /** A separately verified supervisor observation, only for a managed replacement. */
-  manager?: Readonly<{ pid: number; controlGroup?: string }>;
+  /** A separately verified, fresh supervisor observation. Missing PID is replacement-only. */
+  manager?: Readonly<{ pid: number; controlGroup?: string; allowMissingPid?: boolean }>;
   /** @internal Deterministic platform and process seams for focused tests. */
   _platform?: NodeJS.Platform;
   _procRoot?: string;
@@ -113,7 +117,7 @@ export function admitDaemonPeer(options: DaemonPeerAdmissionOptions): DaemonPeer
     try {
       first = readPid();
     } catch (error) {
-      if ((error as NodeJS.ErrnoException).code !== "ENOENT" || options.manager === undefined) return null;
+      if ((error as NodeJS.ErrnoException).code !== "ENOENT" || options.manager?.allowMissingPid !== true) return null;
       first = null;
     }
     const pid = first?.pid ?? options.manager?.pid;
@@ -160,7 +164,7 @@ export function admitDaemonPeer(options: DaemonPeerAdmissionOptions): DaemonPeer
     try {
       second = readPid();
     } catch (error) {
-      if ((error as NodeJS.ErrnoException).code !== "ENOENT" || options.manager === undefined) return null;
+      if ((error as NodeJS.ErrnoException).code !== "ENOENT" || options.manager?.allowMissingPid !== true) return null;
       second = null;
     }
     if (first === null && second !== null && second.pid !== pid) return null;
@@ -170,6 +174,105 @@ export function admitDaemonPeer(options: DaemonPeerAdmissionOptions): DaemonPeer
     if (remaining() <= 0 || birthProbe(pid, undefined, { timeoutMs: remaining() }) !== birth
       || remaining() <= 0) return null;
     return { pid, birth };
+  } catch {
+    return null;
+  } finally {
+    state?.close();
+  }
+}
+
+/**
+ * Current recipients normally prove their socket through process descriptors.
+ * A sibling user namespace may hide those links: re-observe the exact existing
+ * manager registration for each send, then bind its cgroup to the OS listener.
+ * This path never permits an absent PID file or mutates manager state.
+ */
+export async function admitCurrentDaemonPeer(
+  options: Omit<DaemonPeerAdmissionOptions, "manager"> & { signal?: AbortSignal },
+): Promise<DaemonPeerAdmission | null> {
+  const now = options.now ?? performance.now.bind(performance);
+  if (options.signal?.aborted || now() >= options.deadline) return null;
+  const direct = admitDaemonPeer(options);
+  if (direct !== null || (options._platform ?? process.platform) !== "linux") return direct;
+  const uid = options._uid ?? process.getuid?.();
+  if (uid === undefined || options.signal?.aborted || now() >= options.deadline) return null;
+  const homeDir = options.homeDir ?? homedir();
+  const stateRoot = lcmHomeDir(homeDir);
+  const pidPath = options.pidFilePath ?? daemonPidPath(homeDir);
+  if (resolve(pidPath) !== resolve(daemonPidPath(homeDir))) return null;
+  let state: ReturnType<typeof openPrivateDirectory> | undefined;
+  try {
+    state = openPrivateDirectory(stateRoot, { expectedUid: uid });
+    const file = readBoundedRegularFileWithStat(pidPath, {
+      allowedRoot: stateRoot, maxBytes: 64, expectedUid: uid,
+      allowedModes: OWNER_ONLY_FILE_MODES, requireSingleLink: true,
+    });
+    if (!/^[1-9][0-9]*$/u.test(file.content)) return null;
+    const pid = Number(file.content);
+    if (!Number.isSafeInteger(pid) || pid <= 0 || now() >= options.deadline) return null;
+    const birthProbe = options._processBirth ?? processStartTime;
+    const birth = birthProbe(pid, undefined, { timeoutMs: Math.floor(options.deadline - now()) });
+    if (birth === null || now() >= options.deadline) return null;
+    const entrypoint = PACKAGED_RUNTIME_ENTRYPOINT ?? packageExecutable(import.meta.url, 3);
+    const requested = createSupervisorSpec({
+      kind: "systemd-user", stateRoot, port: options.port, executable: process.execPath,
+      args: [entrypoint, "daemon", "start", "--foreground"], nonce: "peer-observation",
+    });
+    const environment = managedLaunchEnvironment(process.env);
+    const supervisor = createSupervisor("systemd-user", {
+      platform: "linux", uid, now, environment,
+      commandTimeoutMs: Math.min(1_000, Math.floor(options.deadline - now())),
+      run: (command, args, settings) => {
+        if (options.signal?.aborted || now() >= options.deadline) throw new DaemonPeerRefusalError();
+        const result = (options._spawnSync ?? spawnSync)(command, [...args], {
+          encoding: "utf8", shell: false, windowsHide: true, maxBuffer: 64 * 1024,
+          timeout: Math.min(settings.timeoutMs, Math.floor(options.deadline - now())), env: environment,
+        });
+        return { code: result.status, stdout: result.stdout, stderr: result.stderr,
+          timedOut: (result.error as NodeJS.ErrnoException | undefined)?.code === "ETIMEDOUT" };
+      },
+    });
+    const observed = await awaitDaemonPeerAdmission(async () => {
+      const first = await supervisor.probe(requested, { deadline: options.deadline });
+      if (options.signal?.aborted || now() >= options.deadline
+        || (first.kind !== "registered-running-valid" && first.kind !== "registered-stale-config")
+        || first.marker !== requested.marker || first.scopeDigest !== requested.scopeDigest
+        || first.stateRoot !== requested.stateRoot || first.name !== requested.name
+        || first.port !== options.port || first.managerPid !== pid
+        || first.nonce === undefined || first.executable === undefined || first.args === undefined) return null;
+      const args: unknown = JSON.parse(first.args);
+      if (!Array.isArray(args) || args.some(arg => typeof arg !== "string")
+        || !isLikelyLcmDaemonCommand([first.executable, ...args].join(" "))) return null;
+      const adopted = createSupervisorSpec({
+        kind: "systemd-user", stateRoot, port: options.port, nonce: first.nonce,
+        executable: first.executable, args,
+        ...(first.cwd ? { cwd: first.cwd } : {}),
+        ...(first.entrypoint ? { entrypoint: first.entrypoint } : {}),
+        ...(first.runtimeDigest ? { runtimeDigest: first.runtimeDigest } : {}),
+        ...(first.storageBackend ? { storageBackend: first.storageBackend } : {}),
+        ...(first.postgresCaFile ? { postgresCaFile: first.postgresCaFile } : {}),
+        credentialDirectory: first.credentialDirectory, credentialFiles: first.credentialFiles,
+        launchEnvironment: {
+          ...environment,
+          PATH: managedDaemonPathForStableLaunch(first.executable, args, requested.stateRoot),
+        },
+      });
+      const second = await supervisor.probe(adopted, { deadline: options.deadline });
+      if (options.signal?.aborted || now() >= options.deadline
+        || second.kind !== "registered-running-valid" || second.managerPid !== pid
+        || second.scopeDigest !== adopted.scopeDigest || second.name !== adopted.name
+        || second.nonce !== adopted.nonce || second.controlGroup === undefined
+        || first.controlGroup !== second.controlGroup) return null;
+      const peer = admitDaemonPeer({ ...options, manager: { pid, controlGroup: second.controlGroup } });
+      return peer?.birth === birth ? peer : null;
+    }, options.port, options.deadline, options.signal, now);
+    assertPrivateDirectory(state, stateRoot, state.witness, uid);
+    const after = readBoundedRegularFileWithStat(pidPath, {
+      allowedRoot: stateRoot, maxBytes: 64, expectedUid: uid,
+      allowedModes: OWNER_ONLY_FILE_MODES, requireSingleLink: true,
+    });
+    return options.signal?.aborted || now() >= options.deadline || after.dev !== file.dev
+      || after.ino !== file.ino || after.content !== file.content ? null : observed;
   } catch {
     return null;
   } finally {

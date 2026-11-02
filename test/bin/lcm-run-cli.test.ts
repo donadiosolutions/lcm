@@ -260,7 +260,7 @@ function fixtureObservationResult(value: unknown): unknown {
 }
 vi.mock("../../src/daemon/peer-admission.js", async importOriginal => ({
   ...await importOriginal<typeof import("../../src/daemon/peer-admission.js")>(),
-  admitDaemonPeer: vi.fn(() => ({ pid: 42, birth: "birth" })),
+  admitCurrentDaemonPeer: vi.fn(() => ({ pid: 42, birth: "birth" })),
 }));
 vi.mock("../../src/daemon/client.js", async importOriginal => {
   const actual = await importOriginal<typeof import("../../src/daemon/client.js")>();

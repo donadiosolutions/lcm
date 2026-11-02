@@ -21,7 +21,7 @@ import {
 } from "../src/daemon/config.js";
 import { daemonTokenPath } from "../src/runtime-paths.js";
 import { readAuthToken } from "../src/daemon/auth.js";
-import { admitDaemonPeer } from "../src/daemon/peer-admission.js";
+import { admitCurrentDaemonPeer } from "../src/daemon/peer-admission.js";
 import { resolveAgentTransport } from "../src/connectors/registry.js";
 import { renderGuidance } from "../src/connectors/template-service.js";
 import type { ConnectorTransport } from "../src/connectors/types.js";
@@ -387,7 +387,7 @@ export async function createInstallerPublicationConvergence(
           lockPath: join(homeDir, ".lcm.backend-publication.lock"),
           fetch: seams.fetch ?? globalThis.fetch,
           readToken: seams.readToken ?? (() => readAuthToken(daemonTokenPath(homeDir))),
-          admitPeer: seams.admitPeer ?? ((targetPort, deadline) => admitDaemonPeer({
+          admitPeer: seams.admitPeer ?? ((targetPort, deadline) => admitCurrentDaemonPeer({
             port: targetPort, deadline, homeDir,
           })),
         },
@@ -428,7 +428,7 @@ export async function createInstallerPublicationConvergence(
       lockPath: homeDir === undefined ? undefined : join(homeDir, ".lcm.backend-publication.lock"),
       fetch: seams.fetch ?? globalThis.fetch,
       readToken: seams.readToken ?? (() => homeDir === undefined ? null : readAuthToken(daemonTokenPath(homeDir))),
-      admitPeer: seams.admitPeer ?? (homeDir === undefined ? undefined : (targetPort, deadline) => admitDaemonPeer({
+      admitPeer: seams.admitPeer ?? (homeDir === undefined ? undefined : (targetPort, deadline) => admitCurrentDaemonPeer({
         port: targetPort, deadline, homeDir,
       })),
     },

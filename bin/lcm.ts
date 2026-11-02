@@ -1,5 +1,5 @@
 #!/usr/bin/env node
-import { admitDaemonPeer } from "../src/daemon/peer-admission.js";
+import { admitCurrentDaemonPeer } from "../src/daemon/peer-admission.js";
 import { randomUUID } from "node:crypto";
 import { lstatSync, realpathSync } from "node:fs";
 import { argv, exit, kill as processKill, stdin, stdout } from "node:process";
@@ -2675,7 +2675,7 @@ async function createDaemonClientOrExitWithConfig(): Promise<DaemonClientWithCon
 
   return {
     client: new DaemonClient(`http://127.0.0.1:${port}`, tokenPath,
-      (targetPort, deadline) => admitDaemonPeer({ port: targetPort, deadline })),
+      (targetPort, deadline) => admitCurrentDaemonPeer({ port: targetPort, deadline })),
     config,
   };
 }
@@ -2717,7 +2717,7 @@ async function createDaemonReadClientOrExit(
     const tokenPath = daemonTokenPath();
     const port = first.config.daemon.port;
     const fastDeadline = performance.now() + 2_000;
-    const peer = admitDaemonPeer({ port, deadline: fastDeadline });
+    const peer = await admitCurrentDaemonPeer({ port, deadline: fastDeadline });
     if (peer === null) failure = { reason: "peer-unverified" };
     else {
       const { readAuthToken } = await import("../src/daemon/auth.js");
@@ -2728,7 +2728,7 @@ async function createDaemonReadClientOrExit(
         throw new DaemonObservationError(failure);
       }
       const client = new DaemonClient(`http://127.0.0.1:${port}`, tokenPath,
-        (targetPort, deadline) => admitDaemonPeer({ port: targetPort, deadline }));
+        (targetPort, deadline) => admitCurrentDaemonPeer({ port: targetPort, deadline }));
       const timeoutMs = Math.floor(fastDeadline - performance.now());
       if (timeoutMs <= 0) throw new Error("Daemon verification deadline expired");
       let health: DaemonHealth | DaemonObservation | null;

@@ -12,7 +12,7 @@ import { daemonTokenPath } from "../runtime-paths.js";
 import type { StorageBackend } from "./config.js";
 import { isStagedPostgreSqlHealth } from "./staged-postgresql.js";
 import {
-  admitDaemonPeer, awaitDaemonPeerAdmission, DaemonPeerRefusalError,
+  admitCurrentDaemonPeer, awaitDaemonPeerAdmission, DaemonPeerRefusalError,
   type DaemonPeerAdmission, type DaemonPeerAdmissionCallback,
 } from "./peer-admission.js";
 export { DaemonPeerRefusalError } from "./peer-admission.js";
@@ -27,7 +27,7 @@ export function verifiedLocalDaemonClient(
   const path = tokenPath ?? canonical;
   return new DaemonClient(`http://127.0.0.1:${port}`, path,
     (targetPort, deadline) => resolve(path) === resolve(canonical)
-      ? admitDaemonPeer({ port: targetPort, homeDir, deadline }) : null);
+      ? admitCurrentDaemonPeer({ port: targetPort, homeDir, deadline }) : null);
 }
 
 export type DaemonHealth = {
@@ -322,6 +322,7 @@ export class DaemonClient {
           method: "GET",
           headers,
           ...requestOptions,
+          _assertCurrent: assertCurrent,
         });
         const health = response.data;
         if (peer !== undefined && health.pid !== peer.pid) return null;
@@ -359,6 +360,7 @@ export class DaemonClient {
           method: "GET",
           headers: { Authorization: `Bearer ${token}` },
           ...requestOptions,
+          _assertCurrent: assertCurrent,
         });
         if (response.statusCode !== 200) {
           return failedObservation({ reason: "http-status", statusCode: response.statusCode });
@@ -390,6 +392,7 @@ export class DaemonClient {
         method: "GET",
         headers,
         ...requestOptions,
+        _assertCurrent: assertCurrent,
       });
     });
   }
@@ -410,6 +413,7 @@ export class DaemonClient {
         headers,
         body,
         ...requestOptions,
+        _assertCurrent: assertCurrent,
       });
     });
   }

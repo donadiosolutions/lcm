@@ -1,17 +1,22 @@
-import { createServer, type Server } from "node:http";
+import { createServer, request, type Server } from "node:http";
 import { mkdtempSync, mkdirSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import type { AddressInfo } from "node:net";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
+vi.mock("node:http", async importOriginal => {
+  const http = await importOriginal<typeof import("node:http")>();
+  return { ...http, request: vi.fn(http.request) };
+});
+
 vi.mock("../../src/daemon/peer-admission.js", async importOriginal => ({
   ...await importOriginal<typeof import("../../src/daemon/peer-admission.js")>(),
-  admitDaemonPeer: vi.fn(() => ({ pid: 42, birth: "birth" })),
+  admitCurrentDaemonPeer: vi.fn(() => ({ pid: 42, birth: "birth" })),
 }));
 
 import { DaemonClient, DaemonPeerRefusalError, verifiedLocalDaemonClient } from "../../src/daemon/client.js";
-import { admitDaemonPeer } from "../../src/daemon/peer-admission.js";
+import { admitCurrentDaemonPeer } from "../../src/daemon/peer-admission.js";
 import * as auth from "../../src/daemon/auth.js";
 
 describe("verified local daemon client", () => {
@@ -21,7 +26,8 @@ describe("verified local daemon client", () => {
   let requests: Array<{ route: string; authorization: string | undefined; body: string }>;
 
   beforeEach(async () => {
-    vi.mocked(admitDaemonPeer).mockReset().mockReturnValue({ pid: 42, birth: "birth" });
+    vi.mocked(request).mockClear();
+    vi.mocked(admitCurrentDaemonPeer).mockReset().mockReturnValue({ pid: 42, birth: "birth" });
     homeDir = mkdtempSync(join(tmpdir(), "lcm-verified-client-"));
     mkdirSync(join(homeDir, ".lcm"), { mode: 0o700 });
     writeFileSync(join(homeDir, ".lcm", "daemon.token"), "test-token", { mode: 0o600 });
@@ -52,23 +58,23 @@ describe("verified local daemon client", () => {
   it("re-admits each cached-token POST and refuses a changed listener before payload", async () => {
     const client = verifiedLocalDaemonClient(port, join(homeDir, ".lcm", "daemon.token"), homeDir);
     await expect(client.post("/search", { query: "first" })).resolves.toMatchObject({ pid: 42 });
-    vi.mocked(admitDaemonPeer).mockReturnValueOnce(null);
+    vi.mocked(admitCurrentDaemonPeer).mockReturnValueOnce(null);
     await expect(client.post("/search", { query: "private second", cwd: "/secret" }))
       .rejects.toBeInstanceOf(DaemonPeerRefusalError);
     expect(requests).toEqual([{ route: "/search", authorization: "Bearer test-token", body: '{"query":"first"}' }]);
-    expect(admitDaemonPeer).toHaveBeenCalledTimes(2);
+    expect(admitCurrentDaemonPeer).toHaveBeenCalledTimes(2);
   });
 
   it("refuses mismatched token and home paths before any request", async () => {
     const client = verifiedLocalDaemonClient(port, join(homeDir, "foreign.token"), homeDir);
     await expect(client.post("/search", { query: "secret" })).rejects.toBeInstanceOf(DaemonPeerRefusalError);
-    expect(admitDaemonPeer).not.toHaveBeenCalled();
+    expect(admitCurrentDaemonPeer).not.toHaveBeenCalled();
     expect(requests).toEqual([]);
   });
 
   it("preserves closed peer refusal on health and observation", async () => {
     const client = verifiedLocalDaemonClient(port, undefined, homeDir);
-    vi.mocked(admitDaemonPeer).mockReturnValue(null);
+    vi.mocked(admitCurrentDaemonPeer).mockReturnValue(null);
     await expect(client.health()).resolves.toBeNull();
     await expect(client.observeClassified()).resolves.toEqual({ kind: "failed", failure: { reason: "peer-unverified" } });
     expect(requests).toEqual([]);
@@ -105,11 +111,11 @@ describe("verified local daemon client", () => {
     await expect(client.health()).resolves.toMatchObject({ pid: 42 });
     await expect(client.observeClassified()).resolves.toMatchObject({ kind: "observed", observation: { pid: 42 } });
     await expect(client.get("/stats")).resolves.toMatchObject({ pid: 42 });
-    expect(admitDaemonPeer).toHaveBeenCalledTimes(3);
+    expect(admitCurrentDaemonPeer).toHaveBeenCalledTimes(3);
   });
 
   it("binds health and observation response PID to the admitted process", async () => {
-    vi.mocked(admitDaemonPeer).mockReturnValue({ pid: 99, birth: "birth" });
+    vi.mocked(admitCurrentDaemonPeer).mockReturnValue({ pid: 99, birth: "birth" });
     const client = verifiedLocalDaemonClient(port, undefined, homeDir);
     await expect(client.health()).resolves.toBeNull();
     await expect(client.observeClassified()).resolves.toEqual({ kind: "failed", failure: { reason: "invalid-identity" } });
@@ -124,6 +130,28 @@ describe("verified local daemon client", () => {
     await expect(client.post("/store", { toJSON: serialize }, { timeoutMs: 50 }))
       .rejects.toBeInstanceOf(DaemonPeerRefusalError);
     expect(serialize).not.toHaveBeenCalled();
+    expect(requests).toEqual([]);
+  });
+
+  it("refuses before opening transport when serialization exhausts the original deadline", async () => {
+    let now = performance.now();
+    vi.spyOn(performance, "now").mockImplementation(() => now);
+    const serialize = vi.fn(() => {
+      now += 100;
+      return { query: "private query" };
+    });
+    const connection = vi.fn();
+    server.on("connection", connection);
+    const client = verifiedLocalDaemonClient(port, undefined, homeDir);
+
+    await expect(client.post("/store", { toJSON: serialize }, { timeoutMs: 50 }))
+      .rejects.toBeInstanceOf(DaemonPeerRefusalError);
+    await new Promise<void>(resolve => setImmediate(resolve));
+
+    expect(serialize).toHaveBeenCalledOnce();
+    expect(admitCurrentDaemonPeer).toHaveBeenCalledOnce();
+    expect(request).not.toHaveBeenCalled();
+    expect(connection).not.toHaveBeenCalled();
     expect(requests).toEqual([]);
   });
 });

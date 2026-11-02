@@ -9,6 +9,7 @@ pins:
   - ["bin/lcm.ts", "unit-cli"]
   - ["installer/install.ts", "unit-installation"]
   - ["src/daemon/client.ts", "unit-daemon-core"]
+  - ["src/daemon/http-url.ts", "unit-daemon-core"]
   - ["src/daemon/lifecycle.ts", "integration-service-managers"]
   - ["src/daemon/peer-admission.ts", "integration-service-managers"]
   - ["src/daemon/peer-attribution.ts", "integration-service-managers"]
