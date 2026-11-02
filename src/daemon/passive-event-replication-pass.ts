@@ -14,6 +14,7 @@ import {
 } from "../storage/backend-publication.js";
 import { safeLogError } from "../hooks/hook-errors.js";
 import type { PostgreSqlPassiveEventRepository } from "../storage/postgresql/passive-event-repository.js";
+import type { ScrubEngine } from "../scrub.js";
 
 /**
  * Applying a claimed passive event performs no additional remote work.
@@ -77,6 +78,7 @@ export interface PassiveEventReplicationModules {
   ) => { readonly remoteProjectId?: string | null } | null;
   readonly createRuntime: (settings: ResolvedPostgreSqlConfig["postgresql"]) => RuntimeLike;
   readonly createOutboxFactory: () => OutboxFactoryLike;
+  readonly loadScrubber: (cwd: string, globalPatterns: string[]) => Promise<ScrubEngine>;
   readonly createRepository: (
     runtime: RuntimeLike,
     projectId: string,
@@ -155,6 +157,12 @@ export function buildReplicationModules(
     resolveExistingProjectIdentity: imported.projectMap.resolveExistingProjectIdentity,
     createRuntime: settings => new imported.runtime.PostgreSqlRuntime(settings),
     createOutboxFactory: () => new imported.outbox.SQLiteLocalHookOutboxFactory(),
+    loadScrubber: async (cwd, globalPatterns) => {
+      const [{ ScrubEngine }, { projectDir }] = await Promise.all([
+        import("../scrub.js"), import("./project.js"),
+      ]);
+      return ScrubEngine.forProject(globalPatterns, projectDir(cwd));
+    },
     createRepository: (executor, projectId, machineId) =>
       new imported.repository.PostgreSqlPassiveEventRepository(
         executor as never,
@@ -277,6 +285,7 @@ export function createPassiveEventReplicationPass(
           loaded.ensureWorktreeProjectReconciled(cwd);
           const remoteProjectId = loaded.resolveProjectIdentity(cwd).remoteProjectId ?? null;
           if (remoteProjectId === null) return null;
+          const scrubber = await loaded.loadScrubber(cwd, config.security.sensitivePatterns);
 
           // Gate 4: refuse to claim a lease against unhealthy storage.
           runtime ??= loaded.createRuntime(storage.postgresql);
@@ -366,6 +375,7 @@ export function createPassiveEventReplicationPass(
             applyEvent: applyReplicatedPassiveEvent,
             onError: report,
             admitPhase,
+            scrubber,
           };
           const createWorker = options.createWorker ?? loaded.createWorker;
           const worker = createWorker(dependencies, options.processId);

@@ -3,6 +3,8 @@ import { chmodSync, existsSync, mkdirSync, mkdtempSync, rmSync, writeFileSync } 
 import { homedir, tmpdir } from "node:os";
 import { join } from "node:path";
 import { DatabaseSync } from "node:sqlite";
+import { ScrubEngine } from "../../src/scrub.js";
+import { projectPaths } from "../../src/daemon/project.js";
 import { loadDaemonConfig } from "../../src/daemon/config.js";
 import { readMachineIdentity } from "../../src/machine-identity.js";
 import {
@@ -112,6 +114,7 @@ function modules(overrides: Partial<Modules> = {}): { modules: Modules; runtime:
       resolveExistingProjectIdentity: vi.fn().mockReturnValue({ remoteProjectId: "project-uuid" }),
       createRuntime: vi.fn().mockReturnValue(runtime),
       createOutboxFactory: vi.fn().mockReturnValue(factory),
+      loadScrubber: vi.fn(async () => new ScrubEngine([], [])),
       createRepository: vi.fn().mockReturnValue({}),
       createWorker: (
         dependencies: PassiveEventReplicationDependencies,
@@ -194,6 +197,18 @@ describe("passive-event replication pass", () => {
     } finally {
       await factory.close();
     }
+  });
+
+  it("loads built-in, global and project privacy policy for outbound replication", async () => {
+    const cwd = mkdtempSync(join(homedir(), "replication-privacy-"));
+    onTestFinished(() => rmSync(cwd, { recursive: true, force: true }));
+    const project = projectPaths(cwd);
+    mkdirSync(project.dir, { recursive: true, mode: 0o700 });
+    writeFileSync(join(project.dir, "sensitive-patterns.txt"), "project-private\n", { mode: 0o600 });
+    const loaded = await loadReplicationModules();
+    const scrubber = await loaded.loadScrubber(cwd, ["company-private"]);
+    expect(scrubber.scrub("company-private project-private Bearer synthetic-private-value"))
+      .toBe("[REDACTED] [REDACTED] [REDACTED]");
   });
 
   it("skips a SQLite daemon without loading any PostgreSQL module", async () => {
@@ -1424,6 +1439,7 @@ describe("passive-event replication pass", () => {
     function sharedInbox(applying: ReadonlySet<string>) {
       const rows: InboxRow[] = [];
       const insertions: string[] = [];
+      const recoveries: Array<{ eventId: string; data: unknown }> = [];
       let nextInboxId = 100n;
       const record = (row: InboxRow) => ({
         ...row,
@@ -1498,8 +1514,9 @@ describe("passive-event replication pass", () => {
           }
           return deleted;
         },
-        releaseFromOtherProjects: async (keys: ReadonlyArray<{ machineId: string; eventId: string }>) =>
-          keys.map(key => {
+        releaseFromOtherProjects: async (keys: ReadonlyArray<{ machineId: string; eventId: string; payload?: { data?: unknown } }>) => {
+          recoveries.push(...keys.map(key => ({ eventId: key.eventId, data: key.payload?.data })));
+          return keys.map(key => {
             const row = find(key.machineId, key.eventId);
             if (row === undefined) return { eventId: key.eventId, outcome: "absent" as const };
             if (row.projectId === projectId) return { eventId: key.eventId, outcome: "bound" as const };
@@ -1508,12 +1525,13 @@ describe("passive-event replication pass", () => {
             return row.status === "applied"
               ? { eventId: key.eventId, outcome: "applied" as const, inboxId: row.inboxId }
               : { eventId: key.eventId, outcome: "released" as const };
-          }),
+          });
+        },
       });
-      return { rows, insertions, repositoryFor };
+      return { rows, insertions, recoveries, repositoryFor };
     }
 
-    async function relinkScenario(applying: ReadonlySet<string>) {
+    async function relinkScenario(applying: ReadonlySet<string>, batchSize = 100) {
       const directory = mkdtempSync(join(tmpdir(), "lcm-replication-relink-"));
       const sidecar = join(directory, "events.db");
       const factory = new SQLiteLocalHookOutboxFactory();
@@ -1532,6 +1550,7 @@ describe("passive-event replication pass", () => {
         createOutboxFactory: () => factory,
         createRepository: vi.fn((_runtime: unknown, projectId: string, machineId: string) =>
           inbox.repositoryFor(projectId, machineId)),
+        createWorker: (dependencies, processId) => new PassiveEventReplicationWorker(dependencies, { processId, batchSize }),
       });
       const onError = vi.fn();
       const pass = createPassiveEventReplicationPass(postgresConfig(), {
@@ -1572,6 +1591,41 @@ describe("passive-event replication pass", () => {
         insert,
         states,
         onError,
+        retainedRows: () => {
+          const raw = new DatabaseSync(sidecar, { readOnly: true });
+          try {
+            return raw.prepare("SELECT event_uuid, machine_id, machine_sequence, data, remote_inbox_id FROM events ORDER BY event_id").all();
+          } finally { raw.close(); }
+        },
+        seedReplicated: async () => {
+          const local = await factory.openExisting(sidecar);
+          if (local === null) throw new Error("missing fixture outbox");
+          try {
+            const rows = await local.claimDeliveries({ machineId: MACHINE, claimOwner: "fixture-seed", limit: 100, staleClaimMs: 60_000 });
+            for (const [index, row] of rows.entries()) {
+              const inboxId = BigInt(100 + index);
+              expect(await local.markReplicated(row.event_uuid, "fixture-seed", inboxId)).toBe(true);
+              inbox.rows.push({
+                inboxId, projectId: PROJECT_A, machineId: MACHINE, eventId: row.event_uuid,
+                eventVersion: row.event_version, machineSequence: BigInt(row.machine_sequence),
+                eventType: row.type,
+                payload: {
+                  sessionId: row.session_id, sessionSequence: row.seq,
+                  category: row.category, data: row.data, priority: row.priority,
+                  sourceHook: row.source_hook, previousEventId: row.prev_event_id,
+                  createdAt: row.created_at,
+                },
+                status: "applied",
+              });
+            }
+          } finally { await local.close(); }
+        },
+        replay: async (eventId: string) => {
+          const local = await factory.openExisting(sidecar);
+          if (local === null) throw new Error("missing fixture outbox");
+          try { return await local.replayQuarantined(eventId); }
+          finally { await local.close(); }
+        },
         run: () => pass.run("/proj", undefined, sidecar),
         relink: (project: string) => { state.project = project; },
         moveAfterChecks: (checks: number) => {
@@ -1594,6 +1648,50 @@ describe("passive-event replication pass", () => {
         },
       };
     }
+
+    it("keeps sensitive legacy text local without reaching the remote inbox", async () => {
+      const scenario = await relinkScenario(new Set([PROJECT_A]));
+      await scenario.insert("Bearer synthetic-private-value");
+      const retained = scenario.retainedRows();
+      await expect(scenario.run()).resolves.toMatchObject({ uploaded: 0, acknowledged: 0, quarantined: 1 });
+      expect(scenario.inbox.rows).toEqual([]);
+      expect(scenario.inbox.insertions).toEqual([]);
+      // Claiming a legacy unbound row still performs its normal machine binding.
+      expect(scenario.retainedRows()).toEqual(retained.map(row => ({ ...row, machine_id: MACHINE })));
+      expect(scenario.states()).toEqual([{ state: "quarantined", inbox: null, pruned: false }]);
+    });
+
+    it("recovers a safe applied tail after a privacy-refused replicated prefix larger than the batch", async () => {
+      const scenario = await relinkScenario(new Set(), 2);
+      for (let index = 0; index < 3; index++) await scenario.insert("Bearer synthetic-private-" + index);
+      await scenario.insert("safe applied tail");
+      await scenario.seedReplicated();
+      const retained = scenario.retainedRows();
+      const unsafe = retained.slice(0, 3);
+      const remoteUnsafe = scenario.inbox.rows.slice(0, 3)
+        .map(row => ({ ...row, payload: { ...row.payload } }));
+      scenario.relink(PROJECT_B);
+
+      await expect(scenario.run()).resolves.toMatchObject({ quarantined: 2, acknowledged: 0, pruned: 0 });
+      expect(scenario.inbox.recoveries).toEqual([]);
+      await expect(scenario.run()).resolves.toMatchObject({ quarantined: 1, acknowledged: 1, pruned: 1 });
+      expect(scenario.inbox.recoveries).toEqual([{ eventId: retained[3].event_uuid, data: "safe applied tail" }]);
+      expect(scenario.retainedRows().slice(0, 3)).toEqual(unsafe);
+      expect(scenario.states()).toEqual([
+        { state: "quarantined", inbox: "100", pruned: false },
+        { state: "quarantined", inbox: "101", pruned: false },
+        { state: "quarantined", inbox: "102", pruned: false },
+        { state: "acknowledged", inbox: "103", pruned: true },
+      ]);
+      expect(scenario.inbox.rows).toEqual(remoteUnsafe);
+
+      expect(await scenario.replay(String(unsafe[0].event_uuid))).toBe(true);
+      expect(scenario.states()[0]).toEqual({ state: "replicated", inbox: "100", pruned: false });
+      await expect(scenario.run()).resolves.toMatchObject({ quarantined: 1, uploaded: 0 });
+      expect(scenario.retainedRows().slice(0, 3)).toEqual(unsafe);
+      expect(scenario.inbox.recoveries).toHaveLength(1);
+      expect(scenario.inbox.rows).toEqual(remoteUnsafe);
+    });
 
     it("withdraws the rows from the old project and delivers them to the new one", async () => {
       // Only the new project's drain applies rows; the old one is abandoned.

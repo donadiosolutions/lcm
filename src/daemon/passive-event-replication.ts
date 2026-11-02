@@ -17,6 +17,9 @@ import type {
 } from "../storage/postgresql/coordination.js";
 import type { PostgreSqlQueryExecutor } from "../storage/postgresql/contracts.js";
 import { sanitizeHookErrorDiagnostic } from "../hooks/hook-error-diagnostic.js";
+import { ScrubEngine } from "../scrub.js";
+
+const PRIVACY_REFUSAL = "passive event requires redaction before replication";
 
 export const PASSIVE_EVENT_REPLICATION_DEFAULTS = {
   batchSize: 100,
@@ -68,6 +71,7 @@ export interface PassiveEventReplicationDependencies {
   readonly local: LocalHookOutboxRepository;
   readonly remote: PostgreSqlPassiveEventRepository;
   readonly admitPhase?: PassiveEventReplicationPhaseAdmission;
+  readonly scrubber?: ScrubEngine;
   readonly applyEvent: (
     executor: PostgreSqlQueryExecutor,
     event: PostgreSqlPassiveEventClaim,
@@ -178,6 +182,7 @@ function result(): PassiveEventReplicationResult {
 }
 
 export class PassiveEventReplicationWorker {
+  private readonly scrubber: ScrubEngine;
   private readonly options: Required<PassiveEventReplicationOptions>;
   private readonly now: () => number;
   private readonly random: (eventId: string, attempt: number) => number;
@@ -189,6 +194,7 @@ export class PassiveEventReplicationWorker {
   private stopped = false;
 
   constructor(private readonly dependencies: PassiveEventReplicationDependencies, options: PassiveEventReplicationOptions) {
+    this.scrubber = dependencies.scrubber ?? new ScrubEngine([], []);
     this.options = {
       processId: options.processId.trim(),
       batchSize: positiveInteger(
@@ -350,6 +356,25 @@ export class PassiveEventReplicationWorker {
     }
   }
 
+  private safeToTransmit(event: LocalHookEventRow): boolean {
+    if (this.scrubber.invalidPatterns.length > 0) return false;
+    try {
+      return [
+        event.event_uuid, event.machine_id, event.machine_sequence,
+        event.type, ...Object.values(eventPayload(event)),
+      ].every(value => value === null || typeof value === "number"
+        || (typeof value === "string" && this.scrubber.scrub(value) === value));
+    } catch {
+      return false;
+    }
+  }
+
+  private remoteInput(event: LocalHookEventRow): PostgreSqlPassiveEventInput {
+    // Rewriting only the remote copy would break retained-envelope readback.
+    if (!this.safeToTransmit(event)) throw new Error(PRIVACY_REFUSAL);
+    return remoteInput(event);
+  }
+
   private async uploadLocal(
     summary: {
       uploaded: number;
@@ -371,14 +396,16 @@ export class PassiveEventReplicationWorker {
     if (claimed.length === 0) return;
     const supported: LocalHookEventRow[] = [];
     for (const event of claimed) {
-      if (supportsEnvelopeVersion(event.event_version)) {
+      const supportedVersion = supportsEnvelopeVersion(event.event_version);
+      if (supportedVersion && this.safeToTransmit(event)) {
         supported.push(event);
         continue;
       }
       if (await this.dependencies.local.markDeliveryQuarantined(
         event.event_uuid,
         owner,
-        `unsupported local hook event envelope version ${String(event.event_version)}`,
+        supportedVersion ? PRIVACY_REFUSAL
+          : `unsupported local hook event envelope version ${String(event.event_version)}`,
       )) {
         summary.quarantined += 1;
       }
@@ -387,7 +414,7 @@ export class PassiveEventReplicationWorker {
     let batch: readonly LocalHookEventRow[] = supported;
     let remote: PostgreSqlPassiveEventRecord[];
     try {
-      remote = await this.dependencies.remote.insertEvents(batch.map(remoteInput), signal);
+      remote = await this.dependencies.remote.insertEvents(batch.map(event => this.remoteInput(event)), signal);
     } catch (insertError) {
       const settled = await this.settleFailedUpload(batch, owner, insertError, summary, signal);
       if (settled === null) return;
@@ -542,7 +569,7 @@ export class PassiveEventReplicationWorker {
     let outcomes: PostgreSqlPassiveEventReleaseResult[];
     try {
       outcomes = await this.dependencies.remote.releaseFromOtherProjects(
-        view.missing.map(remoteInput),
+        view.missing.map(event => this.remoteInput(event)),
         { staleClaimMs: this.options.staleClaimMs, signal },
       );
     } catch (releaseError) {
@@ -629,7 +656,7 @@ export class PassiveEventReplicationWorker {
     try {
       return {
         batch: retry,
-        remote: await this.dependencies.remote.insertEvents(retry.map(remoteInput), signal),
+        remote: await this.dependencies.remote.insertEvents(retry.map(event => this.remoteInput(event)), signal),
       };
     } catch (retryError) {
       let again: UploadReadback;
@@ -801,17 +828,27 @@ export class PassiveEventReplicationWorker {
     summary: { acknowledged: number; quarantined: number },
     signal?: AbortSignal,
   ): Promise<void> {
+    const safe: LocalHookEventRow[] = [];
+    for (const event of rows) {
+      if (this.safeToTransmit(event)) safe.push(event);
+      else {
+        // Remove the unsafe prefix from capped recovery reads, retaining its
+        // existing remote identity for an explicit replay.
+        if (await this.dependencies.local.markQuarantined(
+          event.event_uuid,
+          BigInt(event.remote_inbox_id!),
+          PRIVACY_REFUSAL,
+        )) summary.quarantined += 1;
+        await this.reportError(new Error(PRIVACY_REFUSAL));
+      }
+    }
+    if (safe.length === 0) return;
     let outcomes: PostgreSqlPassiveEventReleaseResult[];
     try {
       outcomes = await this.dependencies.remote.releaseFromOtherProjects(
-        rows.map((event) => ({
+        safe.map((event) => ({
           inboxId: BigInt(event.remote_inbox_id!),
-          machineId: event.machine_id!,
-          eventId: event.event_uuid,
-          eventVersion: event.event_version,
-          machineSequence: BigInt(event.machine_sequence),
-          eventType: event.type,
-          payload: eventPayload(event),
+          ...this.remoteInput(event),
         })),
         { staleClaimMs: this.options.staleClaimMs, signal },
       );
@@ -819,7 +856,7 @@ export class PassiveEventReplicationWorker {
       await this.reportError(error);
       return;
     }
-    const requested = new Map(rows.map((event) => [event.event_uuid, event]));
+    const requested = new Map(safe.map((event) => [event.event_uuid, event]));
     const mismatched: string[] = [];
     for (const outcome of outcomes) {
       // Only keys that were asked about are ever acted on.

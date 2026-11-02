@@ -1,0 +1,6 @@
+references:
+  - "#1864"
+rationale: Keep outbound privacy admission with the existing passive-event worker and daemon pass owners.
+pins:
+  - ["src/daemon/passive-event-replication.ts", "integration-postgresql-passive-events"]
+  - ["src/daemon/passive-event-replication-pass.ts", "unit-daemon-events"]
