@@ -1141,7 +1141,7 @@ block marks implemented. `canEmit` is the closed set of exit classes the command
     {
       "reason": "migration-target-verification-failed",
       "exitClass": "refused-precondition",
-      "remedy": "The PostgreSQL target was reached but failed TLS or migration-role verification. Fix the role grants or TLS configuration, then retry."
+      "remedy": "The PostgreSQL target was reached but failed TLS or migration-role verification. Evidence uses readiness-<reason>[:<check>], where the optional check names the failed readiness inspection. Fix the named role, schema, extension, or TLS condition, then retry."
     },
     {
       "reason": "migration-target-verification-unresolvable",

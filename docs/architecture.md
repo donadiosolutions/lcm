@@ -225,7 +225,12 @@ owner, and dependency provenance. Built-in comparison operators are checked
 with their null extension evidence and zero extension dependencies. Any
 missing, duplicate, redirected, foreign-owned, or dependency-drifted indirect
 edge fails closed as a sanitized extension-preflight error, without exposing
-catalog identities or connection details to callers.
+catalog identities or connection details to callers. Extension members must
+be owned by the extension owner, except that the bootstrap superuser may own
+members of a trusted extension installed by a non-superuser extension owner.
+That is PostgreSQL's native layout on managed providers such as DigitalOcean;
+the bootstrap role, non-superuser owner, and installed trusted version are all
+verified before this exception is accepted.
 Any additional valid,
 ready, and live index, non-internal trigger, supported constraint, generated
 column, or ordinary column attached to a managed table, any foreign key

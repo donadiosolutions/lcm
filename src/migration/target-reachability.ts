@@ -93,7 +93,9 @@ export async function verifyMigrationTargetReachability(input: Readonly<{
       return {
         status: "refuse",
         reason: "migration-target-verification-failed",
-        evidence: `readiness-${error.reason}`,
+        evidence: /^[A-Za-z]{1,64}$/u.test(error.operation)
+          ? `readiness-${error.reason}:${error.operation}`
+          : `readiness-${error.reason}`,
       };
     }
     // Connection refused, TLS handshake failure, DNS failure, timeout, or
