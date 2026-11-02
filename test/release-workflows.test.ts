@@ -516,8 +516,9 @@ describe("release workflows", () => {
     );
     expect(publish?.if).toContain("steps.npm_guard.outputs.already_published != 'true'");
     expect(publish?.run).toContain(
-      'node trusted/.github/scripts/publish-npm-tarball.mjs release-artifact "$tag"',
+      'node trusted/.github/scripts/publish-npm-tarball.mjs release-artifact "$tag" "$RELEASE_VERSION"',
     );
+    expect(publish?.env?.RELEASE_VERSION).toBe("${{ needs.preflight.outputs.version }}");
     expect(publishTarballSource).toContain("Expected exactly one regular npm tarball");
     expect(publishTarballSource).toContain('resolve(tarballs[0])');
     expect(publishTarballSource).toContain('spawnSync("npm"');
@@ -654,7 +655,10 @@ describe("release workflows", () => {
     );
     expect(recoveryPublishStep?.if).toContain("steps.npm.outputs.already_published != 'true'");
     expect(recoveryPublishStep?.run).toContain(
-      'node trusted/.github/scripts/publish-npm-tarball.mjs release-artifact "$tag"',
+      'node trusted/.github/scripts/publish-npm-tarball.mjs release-artifact "$tag" "$RELEASE_VERSION"',
+    );
+    expect(recoveryPublishStep?.env?.RELEASE_VERSION).toBe(
+      "${{ needs.recover-preflight.outputs.version }}",
     );
   });
 

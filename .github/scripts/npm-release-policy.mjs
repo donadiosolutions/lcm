@@ -3,7 +3,14 @@ import { parseReleaseTag } from "./release-tag-policy.mjs";
 
 export const PACKAGE_NAME = "@donadiosolutions/lcm";
 export const NPM_QUERY_TIMEOUT_MS = 60_000;
-export const NPM_VERIFY_DELAYS_MS = Object.freeze([2_000, 4_000, 8_000, 16_000]);
+export const NPM_VERIFY_DELAYS_MS = Object.freeze([
+  2_000,
+  4_000,
+  8_000,
+  16_000,
+  30_000,
+  ...Array.from({ length: 29 }, () => 60_000),
+]);
 
 const FAILURE_SCAN_LIMIT = 8_192;
 const FAILURE_LABEL_LIMIT = 160;

@@ -1685,7 +1685,16 @@ test("queries npm release state with E404-only missing-package handling", () => 
 });
 
 test("verifies published npm state without environment-sized JSON payloads", async () => {
-  assert.deepEqual(NPM_VERIFY_DELAYS_MS, [2_000, 4_000, 8_000, 16_000]);
+  assert.equal(Object.isFrozen(NPM_VERIFY_DELAYS_MS), true);
+  assert.deepEqual(NPM_VERIFY_DELAYS_MS.slice(0, 6), [2_000, 4_000, 8_000, 16_000, 30_000, 60_000]);
+  assert.equal(
+    NPM_VERIFY_DELAYS_MS.slice(5).every((delay) => delay === 60_000),
+    true,
+  );
+  assert.equal(
+    NPM_VERIFY_DELAYS_MS.reduce((total, delay) => total + delay, 0),
+    30 * 60_000,
+  );
   const success = [
     { status: 0, stdout: "1.5.0-beta.2\n", stderr: "" },
     { status: 0, stdout: '["1.4.1","1.5.0-beta.2"]', stderr: "" },
@@ -1806,6 +1815,32 @@ test("retries only complete but incompletely propagated npm snapshots", async ()
     /E401/u,
   );
   assert.equal(calls, 1);
+});
+
+test("waits through the complete publish-scanning window before reporting incomplete propagation", async () => {
+  const invisible = [
+    { status: 1, stdout: "", stderr: "npm error code E404" },
+    { status: 0, stdout: '["1.4.1"]', stderr: "" },
+    { status: 0, stdout: '{"latest":"1.4.1","beta":"1.5.0-beta.1"}', stderr: "" },
+  ];
+  const delays = [];
+  let snapshots = 0;
+  await assert.rejects(
+    () =>
+      verifyNpmRelease({
+        version: "1.5.0-beta.2",
+        runNpm: () => invisible[snapshots++ % 3],
+        sleep: async (delay) => delays.push(delay),
+      }),
+    /npm metadata propagation is incomplete/u,
+  );
+  assert.deepEqual(delays, NPM_VERIFY_DELAYS_MS);
+  assert.equal(delays.length, 34);
+  assert.equal(
+    delays.reduce((total, delay) => total + delay, 0),
+    1_800_000,
+  );
+  assert.equal(snapshots, 3 * (NPM_VERIFY_DELAYS_MS.length + 1));
 });
 
 test("sanitizes npm subprocess and unexpected registry failures", () => {

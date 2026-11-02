@@ -131,11 +131,17 @@ There can therefore be a short public window before that restoration
 completes. If npm was already published before a later step failed,
 republishing the restored draft is safe: the retry detects the existing
 immutable version, skips `npm publish`, and verifies its package version and
-dist-tags. Verification reads five complete registry snapshots, waiting 2, 4,
-8, and 16 seconds between attempts. Only incomplete propagation, such as a
-missing exact version, missing list membership, or a valid older channel tag,
-is retried. Malformed, conflicting, authorization, and unexpected process
-results fail immediately.
+dist-tags. npm scans a published package before it becomes visible, which
+usually takes about five minutes and can take longer, so verification reads
+complete registry snapshots for about 30 minutes: it waits 2, 4, 8, 16, and
+30 seconds, then 60 seconds between later attempts. Only incomplete
+propagation, such as a missing exact version, missing list membership, or a
+valid older channel tag, is retried. Malformed, conflicting, authorization,
+and unexpected process results fail immediately. A version still being
+scanned is invisible to the npm ordering guard, so a retry may run
+`npm publish` again; if npm answers E409 "Cannot publish over previously
+staged version" for that same version, the workflow treats the upload as
+done, skips the duplicate, and verifies.
 
 For alpha and beta notes, the previous published release in the same channel
 and `MAJOR.MINOR` series is the comparison base, falling back to the latest
