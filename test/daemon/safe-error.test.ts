@@ -8725,6 +8725,166 @@ describe("sanitizeError", () => {
     expect(elapsed).toBeLessThan(1000);
   });
 
+  describe("Bug #1831", () => {
+    const quotedPrefix =
+      "file://h?x=['https://outer.test/x?next=file:///Users/a/private.db'|";
+
+    it.each([
+      [
+        "nested file child after a pipe handoff",
+        quotedPrefix + "[file:///b&[https://o?key=/Users/ZQC/x]]",
+        "file://h?x=['https://outer.test/x?next=file://<path>'|" +
+          "[file://<path>&[https://o?key=<path>]]",
+      ],
+      [
+        "nested file child after an ampersand handoff",
+        "file://h?x=['https://outer.test/x?next=file:///Users/a/private.db'&" +
+          "[file:///b&[https://o?key=/Users/ZQC/x]]",
+        "file://h?x=['https://outer.test/x?next=file://<path>'&" +
+          "[file://<path>&[https://o?key=<path>]]",
+      ],
+      [
+        "sibling public bracket after an inherited quote tail",
+        "file://h?x=['https://outer.test/x?next=file:///Users/a/private.db'|" +
+          "\\Users\\ZQA\\x[https://i?key='https://o.test/x?next=file:///Users/ZQR/a'|" +
+          "\\Users\\ZQB\\x][https://j?key=/Users/ZQE/x]]",
+        "file://h?x=['https://outer.test/x?next=file://<path>'|<path>?key=" +
+          "'https://o.test/x?next=file://<path>'|<path>][https://j?key=<path>]]",
+      ],
+    ] as const)("redacts the inherited public-bracket query value for %s", (_name, input, expected) => {
+      const first = sanitizeError(input);
+
+      expect(first).toBe(expected);
+      expect(sanitizeError(first)).toBe(first);
+      expect(sanitizeError(sanitizeError(first))).toBe(first);
+    });
+
+    it.each([
+      ["query", "?", "/Users/A/x"],
+      ["fragment", "#", "/home/A/x"],
+    ] as const)("redacts an unnamed inherited public %s value", (_name, delimiter, value) => {
+      const input = quotedPrefix + `[file:///b&[https://o${delimiter}${value}]]`;
+      const expected =
+        "file://h?x=['https://outer.test/x?next=file://<path>'|" +
+        `[file://<path>&[https://o${delimiter}<path>]]`;
+      const first = sanitizeError(input);
+
+      expect(first).toBe(expected);
+      expect(sanitizeError(first)).toBe(first);
+      expect(sanitizeError(sanitizeError(first))).toBe(first);
+    });
+
+    it.each([
+      ["named", "key="],
+      ["unnamed", ""],
+    ] as const)("redacts a later %s ampersand query value", (_name, name) => {
+      const input = quotedPrefix + `[file:///b&[https://o?public=1&${name}/Users/A/x]]`;
+      const expected =
+        "file://h?x=['https://outer.test/x?next=file://<path>'|" +
+        `[file://<path>&[https://o?public=1&${name}<path>]]`;
+      const first = sanitizeError(input);
+
+      expect(first).toBe(expected);
+      expect(sanitizeError(first)).toBe(first);
+      expect(sanitizeError(sanitizeError(first))).toBe(first);
+    });
+
+    it.each(["&", "|"] as const)(
+      "redacts repeated inherited public-bracket copies after %s",
+      (separator) => {
+        const input =
+          quotedPrefix +
+          "[file:///b&[https://o?key=/Users/A/x]]" +
+          separator +
+          "[file:///c&[https://p?key=/Users/B/x]]]";
+        const expected =
+          "file://h?x=['https://outer.test/x?next=file://<path>'|" +
+          "[file://<path>&[https://o?key=<path>]]" +
+          separator +
+          "[file://<path>&[https://p?key=<path>]]]";
+        const first = sanitizeError(input);
+
+        expect(first).toBe(expected);
+        expect(sanitizeError(first)).toBe(first);
+        expect(sanitizeError(sanitizeError(first))).toBe(first);
+      },
+    );
+
+    it.each(["&", "|"] as const)(
+      "preserves an ended inherited public sibling bracket after %s",
+      (separator) => {
+        const input =
+          quotedPrefix +
+          "\\Users\\A\\x[https://i?key=/Users/B/x]" +
+          separator +
+          "[https://j?key=/Users/C/x]]";
+        const expected =
+          "file://h?x=['https://outer.test/x?next=file://<path>'|" +
+          "<path>?key=<path>]" +
+          separator +
+          "[https://j?key=/Users/C/x]]";
+        const first = sanitizeError(input);
+
+        expect(first).toBe(expected);
+        expect(sanitizeError(first)).toBe(first);
+        expect(sanitizeError(sanitizeError(first))).toBe(first);
+      },
+    );
+
+    it.each([
+      ["POSIX root", "/home/alice/x", "<path>"],
+      ["rooted Windows path", "\\Users\\ALICE\\x", "<path>"],
+      ["backslash drive", "C:\\Users\\ALICE\\x", "<path>"],
+      ["forward-slash drive", "C:/Users/ALICE/x", "<path>"],
+      ["UNC path", "\\\\server\\share\\x", "<path>"],
+      ["private-root relative path", "Users/ALICE/x", "Users<path>"],
+    ] as const)("redacts an inherited public query %s", (_name, value, redacted) => {
+      const input = quotedPrefix + `[file:///b&[https://o?key=${value}]]`;
+      const expected =
+        "file://h?x=['https://outer.test/x?next=file://<path>'|" +
+        `[file://<path>&[https://o?key=${redacted}]]`;
+      const first = sanitizeError(input);
+
+      expect(first).toBe(expected);
+      expect(sanitizeError(first)).toBe(first);
+      expect(sanitizeError(sanitizeError(first))).toBe(first);
+    });
+
+    it.each([
+      [
+        "a public URL value",
+        quotedPrefix + "[file:///b&[https://o?key=https://public.test/x]]",
+        "file://h?x=['https://outer.test/x?next=file://<path>'|" +
+          "[file://<path>&[https://o?key=https://public.test/x]]",
+      ],
+      [
+        "the same shape without the inherited quote",
+        "file://h?x=[https://outer.test/x?next=file:///Users/a/private.db|" +
+          "[file:///b&[https://o?key=/Users/A/x]]",
+        "file://h?x=[https://outer.test/x?next=file://<path>|" +
+          "[file://<path>&[https://o?key=/Users/A/x]]",
+      ],
+      [
+        "a public rooted value",
+        quotedPrefix + "[file:///b&[https://o?key=/public/path]]",
+        "file://h?x=['https://outer.test/x?next=file://<path>'|" +
+          "[file://<path>&[https://o?key=/public/path]]",
+      ],
+      [
+        "a public relative value",
+        quotedPrefix + "[file:///b&[https://o?key=public/path]]",
+        "file://h?x=['https://outer.test/x?next=file://<path>'|" +
+          "[file://<path>&[https://o?key=public/path]]",
+      ],
+    ] as const)("preserves %s", (_name, input, expected) => {
+      const first = sanitizeError(input);
+
+      expect(first).toBe(expected);
+      expect(sanitizeError(first)).toBe(first);
+      expect(sanitizeError(sanitizeError(first))).toBe(first);
+    });
+  });
+
   it("replaces SQLite constraint details with generic message", () => {
     const result = sanitizeError("SQLITE_CONSTRAINT: UNIQUE constraint failed: messages.conversation_id");
     expect(result).not.toContain("messages.conversation_id");

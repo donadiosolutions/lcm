@@ -845,8 +845,14 @@ bundle and keep provider, credential, quarantine, and recovery sessions private.
   same pass. Bracketed components that follow a redacted successor follow the
   tail rules above, and inside them a private-root relative value after `&` or
   `|` is also redacted on the first pass. Ordinary relative and public-URL
-  successors remain readable. Unquoted URLs, embedded URLs whose scheme did
-  not begin at the quote, unmatched quotes, and newlines retain their existing
+  successors remain readable. When the quote hands directly to a bracket, or a
+  nested quote hands off while that inherited bracket tail is still open,
+  recognized private filesystem values in a nested public URL query or fragment
+  are also redacted. This includes rooted POSIX and Windows paths, drive and UNC
+  paths, and private-root relative paths; ordinary rooted or relative URL values
+  and complete public URLs remain readable. Ownership still ends at the
+  enclosing wrapper close. Unquoted URLs, embedded URLs whose scheme did not
+  begin at the quote, unmatched quotes, and newlines retain their existing
   boundaries.
 
   Root-relative Windows values after opaque wrapper text remain conservatively

@@ -107,6 +107,7 @@ function findUrlPathStarts(chars: readonly string[]): UrlPathStarts {
   const nestedFileUrlParentOwnerBracketDepths = new Set<number>();
   const restartedNestedFileUrlParentOwnerBracketDepths = new Set<number>();
   const inheritedQuoteTailWrapperDepths = new Set<number>();
+  const inheritedPublicQueryOwnerWrapperDepths = new Set<number>();
   const activeChildTailWrapperDepths = new Set<number>();
   let schemeLength = 0;
   let fileSchemeLength = 0;
@@ -693,6 +694,21 @@ function findUrlPathStarts(chars: readonly string[]): UrlPathStarts {
     while (isPathWord(chars[cursor])) cursor += 1;
     return chars[cursor] === "=" ? cursor + 1 : -1;
   };
+  const inheritedPublicQueryPrivatePathStart = (delimiterIndex: number): number => {
+    const namedStart = namedValueStart(delimiterIndex + 1);
+    const valueStart = namedStart >= 0 ? namedStart : delimiterIndex + 1;
+    if (
+      isWindowsDrivePathStart(chars, valueStart) ||
+      isForwardSlashDrivePathStart(valueStart) ||
+      isUncPathStart(chars, valueStart)
+    ) {
+      return valueStart;
+    }
+    if (chars[valueStart] === "/" || chars[valueStart] === "\\") {
+      return immediateBackslashSlashSuccessorStartsPrivateRoot(valueStart) ? valueStart : -1;
+    }
+    return returnedParentPrivateRootPathStart(valueStart);
+  };
   const bridgedRootedPathStart = (start: number): number => {
     if (chars[start] !== "/") return -1;
     let cursor = start + 1;
@@ -863,6 +879,7 @@ function findUrlPathStarts(chars: readonly string[]): UrlPathStarts {
       nestedFileUrlParentOwnerBracketDepths.clear();
       restartedNestedFileUrlParentOwnerBracketDepths.clear();
       inheritedQuoteTailWrapperDepths.clear();
+      inheritedPublicQueryOwnerWrapperDepths.clear();
       activeChildTailWrapperDepths.clear();
       activeNestedFileUrlParentOwnerBracketDepth = 0;
       queryOrFragment = false;
@@ -920,6 +937,15 @@ function findUrlPathStarts(chars: readonly string[]): UrlPathStarts {
         repeatedPipeHandoffWrapperDepths.add(inheritedFileQuoteParentOwnerBracketDepth);
         inheritedQuoteTailWrapperDepths.add(inheritedFileQuoteParentOwnerBracketDepth);
         const successorStart = continuationStart + 1;
+        if (chars[successorStart] === "[" || postCloseFilePathBracketDepth > 0) {
+          // A direct bracket handoff, or a nested handoff while an inherited
+          // tail is still inside its bracket, keeps the enclosing wrapper as
+          // the owner. Subtracting the active tail depth prevents the inner
+          // close from ending that inherited region early.
+          inheritedPublicQueryOwnerWrapperDepths.add(
+            inheritedFileQuoteParentOwnerBracketDepth - postCloseFilePathBracketDepth,
+          );
+        }
         armClaimedBracketTail(successorStart, { inheritedQuote: true });
         inheritedFileQuoteParentOwnerBracketDepth = 0;
         inheritedFileQuoteEnd = -1;
@@ -973,6 +999,7 @@ function findUrlPathStarts(chars: readonly string[]): UrlPathStarts {
       nestedFileUrlParentOwnerBracketDepths.delete(closingPathlessFileQueryOwnerDepth);
       restartedNestedFileUrlParentOwnerBracketDepths.delete(closingPathlessFileQueryOwnerDepth);
       inheritedQuoteTailWrapperDepths.delete(closingPathlessFileQueryOwnerDepth);
+      inheritedPublicQueryOwnerWrapperDepths.delete(closingPathlessFileQueryOwnerDepth);
       activeChildTailWrapperDepths.delete(closingPathlessFileQueryOwnerDepth);
       if (closingPathlessFileQueryOwnerDepth === activeNestedFileUrlParentOwnerBracketDepth) {
         activeNestedFileUrlParentOwnerBracketDepth = 0;
@@ -1238,6 +1265,18 @@ function findUrlPathStarts(chars: readonly string[]): UrlPathStarts {
       pendingNestedUrlContinuation = false;
     } else if (restartedPathlessFile && char === "[") {
       fileTailBracketDepth = 1;
+    }
+    if (
+      separator >= 0 &&
+      (char === "?" || char === "#" || char === "&") &&
+      inheritedPublicQueryOwnerWrapperDepths.size > 0 &&
+      pathlessNestedPublicUrlActive
+    ) {
+      // Public URL query values remain public by default. An explicitly
+      // inherited wrapper owner only adds a mark for recognized private
+      // filesystem forms; it never changes the public URL classification.
+      const privatePathStart = inheritedPublicQueryPrivatePathStart(index);
+      if (privatePathStart >= 0) forcedPath[privatePathStart] = 1;
     }
     if (separator >= 0 && (char === "?" || char === "#")) {
       const startsQuotedQueryTail =
