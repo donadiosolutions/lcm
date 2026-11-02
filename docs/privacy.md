@@ -841,10 +841,12 @@ bundle and keep provider, credential, quarantine, and recovery sessions private.
   When this owned region contains a nested link, the link's scheme, authority,
   and path remain URL text. Its query and fragment, however, are classified like
   ordinary message text. An actual POSIX root, Windows drive, or UNC path is
-  therefore redacted regardless of parameter names, index notation, equals-sign
-  runs, component delimiters, empty or dot segments, zero-width prefixes, or
-  encoded characters after the initial root. Forward-slash drives keep their
-  letter and colon, as in `C:<path>`, and public-looking rooted values such as
+  therefore redacted without parsing surrounding parameter names, index
+  notation, equals-sign runs, component delimiters, empty or dot segments,
+  zero-width prefixes, or encoded characters after the initial root. A value
+  written like a link with its own path-word `scheme://` prefix is treated as a
+  link, just as it is in ordinary text. Forward-slash drives keep their letter
+  and colon, as in `C:<path>`, and public-looking rooted values such as
   `/public/x` are still filesystem-shaped and become `<path>`. A complete URL
   used as a value remains URL text, including its own path; its query and
   fragment follow the same ordinary-text rule recursively.
