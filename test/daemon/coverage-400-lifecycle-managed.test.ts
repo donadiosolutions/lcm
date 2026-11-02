@@ -2761,23 +2761,39 @@ describe("issue 400 managed start, cleanup, deadline, and process seams", () => 
 
   it("covers managed startup abort and health admission retry/timeout", async () => {
     const controller = new AbortController();
-    const aborted = createFixture({ fetch: sequenceFetch([new Error("offline")]) });
+    let abortNow = 0;
+    const unexpectedAbortRetry = vi.fn(async () => {
+      abortNow = 1_000;
+      throw new Error("managed startup retried before its expected abort");
+    });
+    const aborted = createFixture({
+      fetch: sequenceFetch([new Error("offline")]),
+      sleep: unexpectedAbortRetry,
+    });
     aborted.probe
       .mockImplementationOnce(async (spec: SupervisorSpec) => observation(spec, "absent"))
       .mockImplementationOnce(async (spec: SupervisorSpec) => {
         controller.abort();
         return observation(spec, "registered-running-valid", { managerPid: 4242 });
       });
-    await expect(ensureDaemon(optionsFor(aborted, { _abortSignal: controller.signal }))).resolves.toMatchObject({
+    await expect(ensureDaemon(optionsFor(aborted, {
+      _abortSignal: controller.signal,
+      _monotonicNowOverride: () => abortNow,
+    }))).resolves.toMatchObject({
       connected: false,
       spawned: true,
       warning: "daemon lifecycle was interrupted",
     });
+    expect(controller.signal.aborted).toBe(true);
+    expect(aborted.probe).toHaveBeenCalledTimes(2);
+    expect(aborted.seams.fetch).toHaveBeenCalledOnce();
+    expect(unexpectedAbortRetry).not.toHaveBeenCalled();
 
     let now = 0;
+    const deadlineSleep = vi.fn(async () => { now = 1_000; });
     const timeout = createFixture({
       fetch: sequenceFetch([new Error("offline"), response({ status: "wrong" }), new Error("offline")]),
-      sleep: async () => { now = 1_000; },
+      sleep: deadlineSleep,
     });
     timeout.probe
       .mockImplementationOnce(async (spec: SupervisorSpec) => observation(spec, "absent"))
@@ -2786,6 +2802,10 @@ describe("issue 400 managed start, cleanup, deadline, and process seams", () => 
       _skipHealthWait: false,
       _monotonicNowOverride: () => now,
     }))).resolves.toMatchObject({ refusalReason: "startup-failure", spawned: true });
+    expect(deadlineSleep).toHaveBeenCalledExactlyOnceWith(100);
+    expect(timeout.seams.fetch).toHaveBeenCalledTimes(2);
+    expect(timeout.probe).toHaveBeenCalledTimes(2);
+    expect(now).toBe(1_000);
   });
 
   it("preserves staged credentials when owned manager absence cleanup is refused", async () => {
