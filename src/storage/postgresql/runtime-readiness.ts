@@ -1198,6 +1198,7 @@ interface SchemaAclRow extends AclRow {
 interface FunctionAclRow extends AclRow {
   readonly function_identity: unknown;
   readonly extension_name: unknown;
+  readonly bootstrap_trusted_extension_member: unknown;
 }
 
 interface DefinitionRow extends QueryResultRow {
@@ -1524,34 +1525,41 @@ async function inspectServerReadiness(
   }
 }
 
+function bootstrapOwnedTrustedExtensionMemberSql(
+  memberOwnerExpression: string,
+  extensionAlias: string,
+): string {
+  return `(
+            ${memberOwnerExpression} OPERATOR(pg_catalog.=) 10::pg_catalog.oid
+            AND EXISTS (
+              SELECT 1
+              FROM pg_catalog.pg_roles AS bootstrap_owner
+              WHERE bootstrap_owner.oid OPERATOR(pg_catalog.=) 10::pg_catalog.oid
+                AND bootstrap_owner.rolsuper
+            )
+            AND EXISTS (
+              SELECT 1
+              FROM pg_catalog.pg_roles AS extension_owner
+              WHERE extension_owner.oid OPERATOR(pg_catalog.=) ${extensionAlias}.extowner
+                AND NOT extension_owner.rolsuper
+            )
+            AND EXISTS (
+              SELECT 1
+              FROM pg_catalog.pg_available_extension_versions AS available_version
+              WHERE available_version.name OPERATOR(pg_catalog.=) ${extensionAlias}.extname
+                AND available_version.version OPERATOR(pg_catalog.=) ${extensionAlias}.extversion
+                AND available_version.trusted
+            )
+          )`;
+}
+
 function extensionMemberOwnerAcceptedSql(
   memberOwnerExpression: string,
   extensionAlias: string,
 ): string {
   return `(
             ${memberOwnerExpression} OPERATOR(pg_catalog.=) ${extensionAlias}.extowner
-            OR (
-              ${memberOwnerExpression} OPERATOR(pg_catalog.=) 10::pg_catalog.oid
-              AND EXISTS (
-                SELECT 1
-                FROM pg_catalog.pg_roles AS bootstrap_owner
-                WHERE bootstrap_owner.oid OPERATOR(pg_catalog.=) 10::pg_catalog.oid
-                  AND bootstrap_owner.rolsuper
-              )
-              AND EXISTS (
-                SELECT 1
-                FROM pg_catalog.pg_roles AS extension_owner
-                WHERE extension_owner.oid OPERATOR(pg_catalog.=) ${extensionAlias}.extowner
-                  AND NOT extension_owner.rolsuper
-              )
-              AND EXISTS (
-                SELECT 1
-                FROM pg_catalog.pg_available_extension_versions AS available_version
-                WHERE available_version.name OPERATOR(pg_catalog.=) ${extensionAlias}.extname
-                  AND available_version.version OPERATOR(pg_catalog.=) ${extensionAlias}.extversion
-                  AND available_version.trusted
-              )
-            )
+            OR ${bootstrapOwnedTrustedExtensionMemberSql(memberOwnerExpression, extensionAlias)}
           )`;
 }
 
@@ -3126,7 +3134,17 @@ async function inspectFunctionAcl(
                         pg_catalog.to_regclass('pg_catalog.pg_proc')
                       AND dependency.objid OPERATOR(pg_catalog.=) procedure.oid
                       AND dependency.deptype OPERATOR(pg_catalog.=) 'e'
-                  ) AS extension_name
+                  ) AS extension_name,
+                  COALESCE((
+                    SELECT ${bootstrapOwnedTrustedExtensionMemberSql("procedure.proowner", "extension")}
+                    FROM pg_catalog.pg_depend AS dependency
+                    JOIN pg_catalog.pg_extension AS extension
+                      ON extension.oid OPERATOR(pg_catalog.=) dependency.refobjid
+                    WHERE dependency.classid OPERATOR(pg_catalog.=)
+                        pg_catalog.to_regclass('pg_catalog.pg_proc')
+                      AND dependency.objid OPERATOR(pg_catalog.=) procedure.oid
+                      AND dependency.deptype OPERATOR(pg_catalog.=) 'e'
+                  ), false) AS bootstrap_trusted_extension_member
            FROM pg_catalog.pg_proc AS procedure
            JOIN pg_catalog.pg_namespace AS namespace
              ON namespace.oid OPERATOR(pg_catalog.=) procedure.pronamespace
@@ -3184,6 +3202,7 @@ async function inspectFunctionAcl(
     }
   }
   const actual = new Set<string>();
+  const bootstrapTrustedExtensionMembers = new Map<string, boolean>();
   for (const row of result.rows) {
     if (
       typeof row.function_identity !== "string"
@@ -3192,6 +3211,11 @@ async function inspectFunctionAcl(
     ) {
       throw readinessError("acl-shape", "inspectFunctionAcl");
     }
+    bootstrapTrustedExtensionMembers.set(
+      row.function_identity,
+      (bootstrapTrustedExtensionMembers.get(row.function_identity) ?? true)
+        && row.bootstrap_trusted_extension_member === true,
+    );
     const identity = actualAclIdentity(
       { ...row, object_identity: row.function_identity },
       runtimeRole,
@@ -3203,9 +3227,23 @@ async function inspectFunctionAcl(
     }
     actual.add(["function", row.function_identity, identity.split("|").slice(2).join("|")].join("|"));
   }
+  const publicSubstitutions = new Map<string, string>();
+  for (const [functionIdentity, extension] of expectedExtensions) {
+    if (extension === null || bootstrapTrustedExtensionMembers.get(functionIdentity) !== true) continue;
+    const publicEntry = ["function", functionIdentity, "public", "owner", "EXECUTE", false].join("|");
+    for (const grantee of ["runtime", "peer"]) {
+      publicSubstitutions.set(
+        ["function", functionIdentity, grantee, "owner", "EXECUTE", false].join("|"),
+        publicEntry,
+      );
+    }
+  }
   if (
     [...actual].some((entry) => !allowed.has(entry))
-    || [...required].some((entry) => !actual.has(entry))
+    || [...required].some((entry) => (
+      !actual.has(entry)
+      && !actual.has(publicSubstitutions.get(entry) ?? "")
+    ))
   ) {
     throw readinessError("acl-shape", "inspectFunctionAcl");
   }

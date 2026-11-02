@@ -781,6 +781,11 @@ commits its own transaction. The readiness script grants exactly `SELECT` on
 application-table DML, ownership, sequence access, or migration authority.
 Those catalog and digest privileges are the minimum needed for the read-only
 verifier to inspect the complete ledger and fingerprint material.
+On managed providers, the `GRANT EXECUTE` statements for `public.digest`,
+`public.similarity`, and `public.similarity_op` may warn that no privileges were
+granted when the trusted extension's functions retain their bootstrap owner.
+Keep the owner-granted `PUBLIC EXECUTE` entries; explicit grants remain valid on
+hardened self-managed targets.
 
 Replace `lcm_runtime` with the deployment's runtime role. The script grants
 schema `USAGE` and table `SELECT` where identity readback requires it. Writes

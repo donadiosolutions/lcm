@@ -84,6 +84,9 @@ interface ReadyExecutorOptions {
   readonly omitLcmPublicDefault?: boolean;
   readonly omitPublicSchemaUsage?: boolean;
   readonly omitPublicFunctionExecute?: boolean;
+  readonly bootstrapTrustedExtensionMember?: unknown;
+  readonly omitPrimaryExtensionFunctionExecute?: boolean;
+  readonly omitPeerExtensionFunctionExecute?: boolean;
   readonly omitOptionalDirectGrants?: boolean;
   readonly partialOptionalDirectGrants?: boolean;
   readonly partialOptionalEffectiveGrants?: boolean;
@@ -933,17 +936,23 @@ function readyExecutor(fixtureOptions: ReadyExecutorOptions = {}): {
             : entry?.object.startsWith("public.similarity")
               ? "pg_trgm"
               : null;
+          const bootstrapFact = extension_name !== null
+            && fixtureOptions.bootstrapTrustedExtensionMember !== undefined
+            ? { bootstrap_trusted_extension_member: fixtureOptions.bootstrapTrustedExtensionMember }
+            : {};
           return [
-            { function_identity, object_identity: function_identity, extension_name, privilege_type: "EXECUTE", ...ownerRow },
+            { function_identity, object_identity: function_identity, extension_name, privilege_type: "EXECUTE", ...bootstrapFact, ...ownerRow },
             ...(entry === undefined ? [] : [
-              { function_identity, object_identity: function_identity, extension_name, privilege_type: "EXECUTE", ...runtimeRow },
+              ...(extension_name !== null && fixtureOptions.omitPrimaryExtensionFunctionExecute
+                ? []
+                : [{ function_identity, object_identity: function_identity, extension_name, privilege_type: "EXECUTE", ...bootstrapFact, ...runtimeRow }]),
               ...(entry.extension !== undefined && !fixtureOptions.omitPublicFunctionExecute
-                ? [{ function_identity, object_identity: function_identity, extension_name, privilege_type: "EXECUTE", ...publicRow }]
+                ? [{ function_identity, object_identity: function_identity, extension_name, privilege_type: "EXECUTE", ...bootstrapFact, ...publicRow }]
                 : []),
               ...(peerRow === null || !admittedPeer!.manifest.required.some((candidate) => (
                 candidate.kind === "function" && candidate.object === function_identity
-              )) ? [] : [
-                { function_identity, object_identity: function_identity, extension_name, privilege_type: "EXECUTE", ...peerRow },
+              )) || (extension_name !== null && fixtureOptions.omitPeerExtensionFunctionExecute) ? [] : [
+                { function_identity, object_identity: function_identity, extension_name, privilege_type: "EXECUTE", ...bootstrapFact, ...peerRow },
               ]),
             ]),
           ];
@@ -2690,6 +2699,263 @@ describe("PostgreSQL transfer readiness", () => {
       admittedPeer: { role: "lcm_test_ordinary" },
     })).resolves.toMatchObject({ runtimeRole: "lcm_test_runtime" });
   });
+
+  it("accepts owner-granted PUBLIC EXECUTE for qualifying bootstrap-owned trusted-extension functions", async () => {
+    const fake = readyExecutor({
+      bootstrapTrustedExtensionMember: true,
+      omitPrimaryExtensionFunctionExecute: true,
+    });
+
+    await expect(verifyPostgreSqlRuntimeSchema(fake.seam, {
+      expectedOwner: EXPECTED_OWNER,
+    })).resolves.toMatchObject({ runtimeRole: "lcm_test_runtime" });
+  });
+
+  it("rejects qualifying extension functions when both explicit and PUBLIC EXECUTE are missing", async () => {
+    const fake = readyExecutor({
+      bootstrapTrustedExtensionMember: true,
+      omitPrimaryExtensionFunctionExecute: true,
+      omitPublicFunctionExecute: true,
+    });
+
+    await expect(verifyPostgreSqlRuntimeSchema(fake.seam, {
+      expectedOwner: EXPECTED_OWNER,
+    })).rejects.toMatchObject({ reason: "acl-shape", operation: "inspectFunctionAcl" });
+  });
+
+  it("rejects an extra function grantee while qualifying extension functions rely on PUBLIC", async () => {
+    const fake = readyExecutor({
+      bootstrapTrustedExtensionMember: true,
+      omitPrimaryExtensionFunctionExecute: true,
+      operationOverrides: {
+        inspectFunctionAcl: mutateRows((rows) => {
+          rows.push({
+            function_identity: "public.digest(text, text)",
+            object_identity: "public.digest(text, text)",
+            extension_name: "pgcrypto",
+            bootstrap_trusted_extension_member: true,
+            privilege_type: "EXECUTE",
+            grantee_is_owner: false,
+            grantee_oid: "303",
+            grantee_name: "lcm_test_extra",
+            grantor_is_owner: true,
+            is_grantable: false,
+          });
+        }),
+      },
+    });
+
+    await expect(verifyPostgreSqlRuntimeSchema(fake.seam, {
+      expectedOwner: EXPECTED_OWNER,
+    })).rejects.toMatchObject({ reason: "acl-shape", operation: "inspectFunctionAcl" });
+  });
+
+  it.each([
+    ["a grantable explicit runtime entry", false, "101", "is_grantable", true],
+    ["a grantable PUBLIC entry", true, "0", "is_grantable", true],
+    ["a foreign-granted PUBLIC entry", true, "0", "grantor_is_owner", false],
+  ] as const)("rejects %s on a qualifying extension function", async (
+    _label,
+    omitPrimaryExtensionFunctionExecute,
+    granteeOid,
+    field,
+    value,
+  ) => {
+    const fake = readyExecutor({
+      bootstrapTrustedExtensionMember: true,
+      omitPrimaryExtensionFunctionExecute,
+      operationOverrides: {
+        inspectFunctionAcl: mutateRows((rows) => {
+          const row = rows.find((candidate) => (
+            candidate.function_identity === "public.digest(text, text)"
+            && candidate.grantee_oid === granteeOid
+          ));
+          if (row === undefined) throw new Error("extension function ACL row missing");
+          row[field] = value;
+        }),
+      },
+    });
+
+    await expect(verifyPostgreSqlRuntimeSchema(fake.seam, {
+      expectedOwner: EXPECTED_OWNER,
+    })).rejects.toMatchObject({ reason: "acl-shape", operation: "inspectFunctionAcl" });
+  });
+
+  it("keeps the explicit runtime grant requirement for non-extension functions", async () => {
+    const fake = readyExecutor({
+      bootstrapTrustedExtensionMember: true,
+      operationOverrides: {
+        inspectFunctionAcl: mutateRows((rows) => {
+          const remaining = rows.filter((row) => !(
+            row.function_identity === "lcm.normalize_search_text(text)"
+            && row.grantee_oid === "101"
+          ));
+          remaining.push({
+            function_identity: "lcm.normalize_search_text(text)",
+            object_identity: "lcm.normalize_search_text(text)",
+            extension_name: null,
+            privilege_type: "EXECUTE",
+            grantee_is_owner: false,
+            grantee_oid: "0",
+            grantee_name: null,
+            grantor_is_owner: true,
+            is_grantable: false,
+          });
+          rows.splice(0, rows.length, ...remaining);
+        }),
+      },
+    });
+
+    await expect(verifyPostgreSqlRuntimeSchema(fake.seam, {
+      expectedOwner: EXPECTED_OWNER,
+    })).rejects.toMatchObject({ reason: "acl-shape", operation: "inspectFunctionAcl" });
+  });
+
+  it.each([
+    ["false", false],
+    ["non-boolean", "true"],
+  ])("does not substitute PUBLIC when the trusted-extension fact is %s", async (
+    _label,
+    bootstrapTrustedExtensionMember,
+  ) => {
+    const fake = readyExecutor({
+      bootstrapTrustedExtensionMember,
+      omitPrimaryExtensionFunctionExecute: true,
+    });
+
+    await expect(verifyPostgreSqlRuntimeSchema(fake.seam, {
+      expectedOwner: EXPECTED_OWNER,
+    })).rejects.toMatchObject({ reason: "acl-shape", operation: "inspectFunctionAcl" });
+  });
+
+  it("does not substitute PUBLIC when catalog rows disagree on the trusted-extension fact", async () => {
+    const fake = readyExecutor({
+      bootstrapTrustedExtensionMember: true,
+      omitPrimaryExtensionFunctionExecute: true,
+      operationOverrides: {
+        inspectFunctionAcl: mutateRows((rows) => {
+          const row = rows.find((candidate) => (
+            candidate.function_identity === "public.digest(text, text)"
+          ));
+          if (row === undefined) throw new Error("extension function ACL row missing");
+          row.bootstrap_trusted_extension_member = false;
+        }),
+      },
+    });
+
+    await expect(verifyPostgreSqlRuntimeSchema(fake.seam, {
+      expectedOwner: EXPECTED_OWNER,
+    })).rejects.toMatchObject({ reason: "acl-shape", operation: "inspectFunctionAcl" });
+  });
+
+  it("still requires effective EXECUTE when qualifying functions rely on PUBLIC", async () => {
+    const fake = readyExecutor({
+      bootstrapTrustedExtensionMember: true,
+      omitPrimaryExtensionFunctionExecute: true,
+      operationOverrides: {
+        inspectEffectivePrivileges: mutateRows((rows) => {
+          const row = rows.find((candidate) => (
+            candidate.privilege_kind === "function"
+            && candidate.object_identity === "public.digest(text, text)"
+          ));
+          if (row === undefined) throw new Error("effective function privilege row missing");
+          row.effective = false;
+        }),
+      },
+    });
+
+    await expect(verifyPostgreSqlRuntimeSchema(fake.seam, {
+      expectedOwner: EXPECTED_OWNER,
+    })).rejects.toMatchObject({
+      reason: "effective-privilege",
+      operation: "inspectEffectivePrivileges",
+    });
+  });
+
+  it.each([
+    ["runtime", "primary", false, true, false],
+    ["runtime", "peer", false, false, true],
+    ["runtime", "both", false, true, true],
+    ["transfer", "primary", false, true, false],
+    ["transfer", "peer", false, false, true],
+    ["transfer", "both", false, true, true],
+    ["runtime", "primary", true, true, false],
+    ["runtime", "peer", true, false, true],
+    ["runtime", "both", true, true, true],
+    ["transfer", "primary", true, true, false],
+    ["transfer", "peer", true, false, true],
+    ["transfer", "both", true, true, true],
+  ] as const)(
+    "%s readiness with the %s explicit function grant missing and PUBLIC omitted=%s",
+    async (direction, _missing, omitPublic, omitPrimary, omitPeer) => {
+      const primaryManifest = direction === "runtime"
+        ? POSTGRESQL_RUNTIME_PRIVILEGE_MANIFEST
+        : POSTGRESQL_TRANSFER_PRIVILEGE_MANIFEST;
+      const peerManifest = direction === "runtime"
+        ? POSTGRESQL_TRANSFER_PRIVILEGE_MANIFEST
+        : POSTGRESQL_RUNTIME_PRIVILEGE_MANIFEST;
+      const peerRole = direction === "runtime" ? "lcm_test_transfer" : "lcm_test_ordinary";
+      const fake = readyExecutor({
+        manifest: primaryManifest,
+        admittedPeer: { role: peerRole, manifest: peerManifest },
+        bootstrapTrustedExtensionMember: true,
+        omitPrimaryExtensionFunctionExecute: omitPrimary,
+        omitPeerExtensionFunctionExecute: omitPeer,
+        omitPublicFunctionExecute: omitPublic,
+      });
+      const verification = direction === "runtime"
+        ? verifyPostgreSqlRuntimeSchema(fake.seam, {
+          expectedOwner: EXPECTED_OWNER,
+          admittedPeer: { role: peerRole },
+        })
+        : verifyPostgreSqlTransferSchema(fake.seam, {
+          expectedOwner: EXPECTED_OWNER,
+          admittedPeer: { role: peerRole },
+        });
+
+      if (omitPublic) {
+        await expect(verification).rejects.toMatchObject({
+          reason: "acl-shape",
+          operation: "inspectFunctionAcl",
+        });
+      } else {
+        await expect(verification).resolves.toMatchObject({ runtimeRole: "lcm_test_runtime" });
+      }
+    },
+  );
+
+  it.each(["runtime", "transfer"] as const)(
+    "does not substitute PUBLIC for a missing %s peer grant when the trusted-extension fact is false",
+    async (direction) => {
+      const primaryManifest = direction === "runtime"
+        ? POSTGRESQL_RUNTIME_PRIVILEGE_MANIFEST
+        : POSTGRESQL_TRANSFER_PRIVILEGE_MANIFEST;
+      const peerManifest = direction === "runtime"
+        ? POSTGRESQL_TRANSFER_PRIVILEGE_MANIFEST
+        : POSTGRESQL_RUNTIME_PRIVILEGE_MANIFEST;
+      const peerRole = direction === "runtime" ? "lcm_test_transfer" : "lcm_test_ordinary";
+      const fake = readyExecutor({
+        manifest: primaryManifest,
+        admittedPeer: { role: peerRole, manifest: peerManifest },
+        bootstrapTrustedExtensionMember: false,
+        omitPeerExtensionFunctionExecute: true,
+      });
+      const verification = direction === "runtime"
+        ? verifyPostgreSqlRuntimeSchema(fake.seam, {
+          expectedOwner: EXPECTED_OWNER,
+          admittedPeer: { role: peerRole },
+        })
+        : verifyPostgreSqlTransferSchema(fake.seam, {
+          expectedOwner: EXPECTED_OWNER,
+          admittedPeer: { role: peerRole },
+        });
+
+      await expect(verification).rejects.toMatchObject({
+        reason: "acl-shape",
+        operation: "inspectFunctionAcl",
+      });
+    },
+  );
 
   it("rejects a third grantee by OID before a sentinel-like role name can collide", async () => {
     const withThird = readyExecutor({

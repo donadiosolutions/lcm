@@ -231,6 +231,10 @@ members of a trusted extension installed by a non-superuser extension owner.
 That is PostgreSQL's native layout on managed providers such as DigitalOcean;
 the bootstrap role, non-superuser owner, and installed trusted version are all
 verified before this exception is accepted.
+Under those same verified conditions, an owner-granted, non-grantable `PUBLIC`
+`EXECUTE` entry may satisfy a missing explicit runtime or admitted-peer function
+grant. Foreign or grantable entries still refuse, and effective execution is
+checked separately.
 Any additional valid,
 ready, and live index, non-internal trigger, supported constraint, generated
 column, or ordinary column attached to a managed table, any foreign key
