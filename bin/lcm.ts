@@ -11,7 +11,6 @@ import {
   DaemonClient,
   DaemonObservationError,
   describeDaemonObservationFailure,
-  isDaemonObservationFailure,
   type DaemonHealth,
   type DaemonObservation,
   type DaemonObservationFailure,
@@ -2722,10 +2721,10 @@ async function createDaemonReadClientOrExit(
       let health: DaemonHealth | DaemonObservation | null;
       if (options.diagnosticOnly) {
         const observed = await client.observeClassified({ timeoutMs: 2000 });
-        if (isDaemonObservationFailure(observed)) {
-          failure = observed;
+        if (observed.kind === "failed") {
+          failure = observed.failure;
           health = null;
-        } else health = observed;
+        } else health = observed.observation;
       } else health = await client.health();
       if (health !== null) {
         const fields = daemonReadIdentityMismatchFields(health, first.config.storage.backend);

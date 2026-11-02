@@ -1793,6 +1793,30 @@ describe("doctor authenticated daemon identity", () => {
     expect(results.find(result => result.name === "daemon")).toMatchObject({ status: "pass", message: IDENTITY_VERIFIED_MESSAGE });
   });
 
+  const hostileResponse = {
+    reason: "identity-mismatch", fields: ["PRIVATE_CANARY"], statusCode: 599,
+    body: "PRIVATE_BODY", token: "PRIVATE_TOKEN", kind: "failed", failure: { reason: "PRIVATE_FAILURE" },
+  };
+
+  it.each([
+    hostileResponse,
+    { ...hostileResponse, reason: "future-reason", fields: undefined },
+    { reason: "http-status", failure: undefined, note: "PRIVATE_BODY" },
+    { reason: "identity-mismatch", note: "PRIVATE_BODY" },
+  ])("lets identity checks decide a verified observation carrying response properties %j", async extra => {
+    const results = await runDoctor(authenticatedDeps({ ...healthy, ...extra }));
+    expect(results.find(result => result.name === "daemon")).toMatchObject({ status: "pass", message: IDENTITY_VERIFIED_MESSAGE });
+    expect(JSON.stringify(results)).not.toMatch(/PRIVATE/u);
+  });
+
+  it.each([hostileResponse, { reason: "future-reason" }])("reports only local reasons for a mismatching observation carrying %j", async extra => {
+    const results = await runDoctor(authenticatedDeps({ ...healthy, version: "0.4.0", ...extra }));
+    expect(results.find(result => result.name === "daemon")?.message).toBe(
+      "Daemon observation failed: the daemon identity differs from this installation (version). Run: lcm daemon restart",
+    );
+    expect(JSON.stringify(results)).not.toMatch(/PRIVATE/u);
+  });
+
   it.each(["version", "digest", "empty digest"])("reports local identity unavailable when %s is missing", async missing => {
     const deps = authenticatedDeps(healthy);
     const read = deps.readFileSync;

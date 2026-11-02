@@ -1,5 +1,7 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { dirname, join } from "node:path";
+import { createServer } from "node:http";
+import type { AddressInfo } from "node:net";
 import { homedir, tmpdir } from "node:os";
 import { ConfigValidationError, type DaemonConfig } from "../../src/daemon/config.js";
 import { PrivateMutationLockContentionError } from "../../src/private-mutation-lock.js";
@@ -65,6 +67,7 @@ const state = vi.hoisted(() => ({
   portableResult: { exported: 1, imported: 1, skipped: 0, total: 1, dryRun: false },
   provider: "openai",
   authToken: "test-token" as string | null,
+  realObserve: false,
   entries: [] as Array<{ name: string; isDirectory: () => boolean }>,
   exists: true,
   readError: undefined as Error | undefined,
@@ -250,19 +253,31 @@ vi.mock("../../src/runtime-paths.js", async importOriginal => ({
   migrateLegacyHomeIfNeeded: state.migrateLegacyHome,
   projectsDir: () => `${state.runtimeHome}/projects`,
 }));
-vi.mock("../../src/daemon/client.js", async importOriginal => ({
-  ...(await importOriginal<typeof import("../../src/daemon/client.js")>()),
-  DaemonClient: class {
-    post = state.post;
-    get = state.get;
-    health = state.health;
-    observe = state.observe;
-    observeClassified = async (options?: unknown): Promise<unknown> => (await (state.observe as (o?: unknown) => Promise<unknown>)(options)) ?? { reason: "connect-failed" };
-    constructor() {
-      state.daemonClientInstances++;
-    }
-  },
-}));
+function fixtureObservationResult(value: unknown): unknown {
+  if (value === null) return { kind: "failed", failure: { reason: "connect-failed" } };
+  if (typeof value === "object" && "reason" in value) return { kind: "failed", failure: value };
+  return { kind: "observed", observation: value };
+}
+vi.mock("../../src/daemon/client.js", async importOriginal => {
+  const actual = await importOriginal<typeof import("../../src/daemon/client.js")>();
+  return {
+    ...actual,
+    DaemonClient: class {
+      post = state.post;
+      get = state.get;
+      health = state.health;
+      observe = state.observe;
+      private readonly real: InstanceType<typeof actual.DaemonClient> | undefined;
+      observeClassified = async (options?: unknown): Promise<unknown> => this.real !== undefined
+        ? await this.real.observeClassified(options as never)
+        : fixtureObservationResult(await (state.observe as (o?: unknown) => Promise<unknown>)(options));
+      constructor(baseUrl: string, tokenPath?: string) {
+        state.daemonClientInstances++;
+        this.real = state.realObserve ? new actual.DaemonClient(baseUrl, tokenPath) : undefined;
+      }
+    },
+  };
+});
 vi.mock("../../src/daemon/config.js", async importOriginal => ({
   ...(await importOriginal<typeof import("../../src/daemon/config.js")>()),
   loadDaemonConfig: state.loadConfig,
@@ -505,6 +520,7 @@ beforeEach(() => {
   }) : ({ ok: true, promoted: 1, processed: 1, skipped: 0, errors: 0, processedProjects: 1 }));
   state.get.mockReset().mockResolvedValue({ backendDiagnostics: state.diagnostics } as never);
   state.authToken = "test-token";
+  state.realObserve = false;
   state.installed = [];
   state.codexMcpInspection = { state: "absent" };
   state.storedCodexTransport = undefined;
@@ -1622,6 +1638,59 @@ describe("runCli daemon-backed and utility actions", () => {
       }
     }
 
+    describe("response properties are never failure metadata", () => {
+      const hostile = {
+        reason: "identity-mismatch", fields: ["PRIVATE_CANARY"], statusCode: 599,
+        body: "PRIVATE_BODY", token: "PRIVATE_TOKEN", failure: { reason: "PRIVATE_FAILURE" },
+      };
+
+      async function viaRealClient(payload: unknown, run: () => Promise<void>): Promise<void> {
+        const server = createServer((_request, response) => {
+          response.writeHead(200);
+          response.end(JSON.stringify(payload));
+        });
+        await new Promise<void>(resolve => server.listen(0, "127.0.0.1", resolve));
+        try {
+          await withRuntimeRoot(async root => {
+            const { port } = server.address() as AddressInfo;
+            actualFs.writeFileSync(join(root, ".lcm", "config.json"), JSON.stringify({ daemon: { port } }), { mode: 0o600 });
+            state.realObserve = true;
+            await run();
+          });
+        } finally {
+          server.closeAllConnections();
+          await new Promise<void>(resolve => server.close(() => resolve()));
+        }
+      }
+
+      it.each([hostile, { ...hostile, reason: "future-reason" }])("reports only local reasons for a mismatching observation carrying %j", async extra => {
+        await viaRealClient({ ...identity, version: "old", ...extra }, async () => {
+          const stdout = vi.spyOn(process.stdout, "write").mockImplementation(() => true);
+          const log = vi.spyOn(console, "log").mockImplementation(() => undefined);
+          expect(await invoke(["status", "--json"])).toBeUndefined();
+          expect(await invoke(["status"])).toBeUndefined();
+          const json = String(stdout.mock.calls.at(-1)?.[0]);
+          expect(JSON.parse(json)).toMatchObject({
+            diagnosticSource: "local", observationFailure: { reason: "identity-mismatch", fields: ["version"] },
+          });
+          expect(JSON.parse(json).observationFailure).toStrictEqual({ reason: "identity-mismatch", fields: ["version"] });
+          const lines = log.mock.calls.map(call => String(call[0]));
+          expect(lines).toContain("Daemon observation failed: the daemon identity differs from this installation (version).");
+          expect(json + lines.join("\n")).not.toMatch(/PRIVATE/u);
+        });
+      });
+
+      it("lets identity checks admit a matching observation carrying response properties", async () => {
+        await viaRealClient({ ...identity, ...hostile }, async () => {
+          const stdout = vi.spyOn(process.stdout, "write").mockImplementation(() => true);
+          expect(await invoke(["status", "--json"])).toBeUndefined();
+          const json = String(stdout.mock.calls.at(-1)?.[0]);
+          expect(JSON.parse(json)).toMatchObject({ diagnosticSource: "daemon", daemon: { status: "up" } });
+          expect(JSON.parse(json)).not.toHaveProperty("observationFailure");
+          expect(json).not.toMatch(/PRIVATE/u);
+        });
+      });
+    });
     it("prints a fixed sentence in text mode", async () => {
       state.observe.mockResolvedValue({ reason: "http-status", statusCode: 403, message: "PRIVATE" });
       const log = vi.spyOn(console, "log").mockImplementation(() => undefined);

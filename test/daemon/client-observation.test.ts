@@ -7,7 +7,6 @@ import {
   DaemonClient,
   DaemonObservationError,
   describeDaemonObservationFailure,
-  isDaemonObservationFailure,
   parseDaemonObservation,
   type DaemonObservationFailure,
 } from "../../src/daemon/client.js";
@@ -118,18 +117,16 @@ describe("process-only daemon identity observation", () => {
       expect(describeDaemonObservationFailure(failure)).toBe(sentence);
       const error = new DaemonObservationError(failure);
       expect(error).toMatchObject({ name: "DaemonObservationError", message: sentence, failure });
-      expect(isDaemonObservationFailure(failure)).toBe(true);
-      expect(isDaemonObservationFailure(observation as never)).toBe(false);
     });
 
     it("reports a missing token and an unreachable daemon", async () => {
       const fixture = await clientFor(() => undefined);
       expect(await new DaemonClient(`http://127.0.0.1:${fixture.address.port}`, join(homes[0]!, "missing")).observeClassified())
-        .toEqual({ reason: "token-missing" });
+        .toEqual({ kind: "failed", failure: { reason: "token-missing" } });
       server!.closeAllConnections();
       await new Promise<void>(resolve => server!.close(() => resolve()));
       server = undefined;
-      expect(await fixture.client.observeClassified()).toEqual({ reason: "connect-failed" });
+      expect(await fixture.client.observeClassified()).toEqual({ kind: "failed", failure: { reason: "connect-failed" } });
     });
 
     it("separates a stall before headers from a stall after headers", async () => {
@@ -140,19 +137,19 @@ describe("process-only daemon identity observation", () => {
           response.flushHeaders();
         }
       });
-      expect(await client.observeClassified({ timeoutMs: 50 })).toEqual({ reason: "headers-timeout" });
+      expect(await client.observeClassified({ timeoutMs: 50 })).toEqual({ kind: "failed", failure: { reason: "headers-timeout" } });
       mode = "headers";
-      expect(await client.observeClassified({ timeoutMs: 50 })).toEqual({ reason: "body-timeout" });
+      expect(await client.observeClassified({ timeoutMs: 50 })).toEqual({ kind: "failed", failure: { reason: "body-timeout" } });
     });
 
     it.each([
-      ["malformed JSON at 200", 200, "malformed", { reason: "body-invalid" }],
-      ["empty body at 200", 200, "", { reason: "invalid-identity" }],
-      ["valid JSON that is no identity", 200, "{}", { reason: "invalid-identity" }],
-      ["non-JSON 401", 401, "<html>PRIVATE</html>", { reason: "http-status", statusCode: 401 }],
-      ["empty 403", 403, "", { reason: "http-status", statusCode: 403 }],
-      ["non-JSON 503", 503, "unavailable", { reason: "http-status", statusCode: 503 }],
-      ["JSON 404", 404, JSON.stringify(observation), { reason: "http-status", statusCode: 404 }],
+      ["malformed JSON at 200", 200, "malformed", { kind: "failed", failure: { reason: "body-invalid" } }],
+      ["empty body at 200", 200, "", { kind: "failed", failure: { reason: "invalid-identity" } }],
+      ["valid JSON that is no identity", 200, "{}", { kind: "failed", failure: { reason: "invalid-identity" } }],
+      ["non-JSON 401", 401, "<html>PRIVATE</html>", { kind: "failed", failure: { reason: "http-status", statusCode: 401 } }],
+      ["empty 403", 403, "", { kind: "failed", failure: { reason: "http-status", statusCode: 403 } }],
+      ["non-JSON 503", 503, "unavailable", { kind: "failed", failure: { reason: "http-status", statusCode: 503 } }],
+      ["JSON 404", 404, JSON.stringify(observation), { kind: "failed", failure: { reason: "http-status", statusCode: 404 } }],
     ])("classifies %s", async (_name, status, body, expected) => {
       const { client } = await clientFor((_request, response) => {
         response.writeHead(status);
@@ -170,7 +167,7 @@ describe("process-only daemon identity observation", () => {
         response.write("{");
         setImmediate(() => request.socket.destroy());
       });
-      expect(await client.observeClassified({ timeoutMs: 2000 })).toEqual({ reason: "body-invalid" });
+      expect(await client.observeClassified({ timeoutMs: 2000 })).toEqual({ kind: "failed", failure: { reason: "body-invalid" } });
     });
 
     it("rethrows caller cancellation raised while a request is in flight", async () => {
@@ -179,6 +176,33 @@ describe("process-only daemon identity observation", () => {
       const pending = client.observeClassified({ signal: controller.signal });
       setTimeout(() => controller.abort(), 20);
       await expect(pending).rejects.toMatchObject({ name: "AbortError" });
+    });
+
+    const hostile = {
+      reason: "identity-mismatch", fields: ["PRIVATE_CANARY"], statusCode: 599,
+      body: "PRIVATE_BODY", token: "PRIVATE_TOKEN", kind: "failed", failure: { reason: "PRIVATE_FAILURE" },
+    };
+
+    it.each([
+      hostile,
+      { ...hostile, reason: "future-reason", fields: undefined },
+      { reason: "http-status", extra: "PRIVATE_BODY" },
+    ])("never lets response properties %j act as failure metadata", async extra => {
+      const { client } = await clientFor((_request, response) => {
+        response.writeHead(200);
+        response.end(JSON.stringify({ ...observation, storage: { status: "unverified", note: "PRIVATE_BODY" }, ...extra }));
+      });
+      const result = await client.observeClassified();
+      expect(result).toStrictEqual({ kind: "observed", observation });
+      expect(JSON.stringify(result)).not.toMatch(/PRIVATE/u);
+      expect(await client.observe()).toStrictEqual(observation);
+    });
+
+    it("copies only the known fields of an accepted observation", () => {
+      const nested = { status: "unverified", note: "PRIVATE_BODY" };
+      const parsed = parseDaemonObservation(200, { ...observation, ...hostile, storage: nested, ownerId: "owner" });
+      expect(parsed).toStrictEqual({ ...observation, ownerId: "owner" });
+      expect(parsed!.storage).not.toBe(nested);
     });
   });
 });

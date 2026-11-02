@@ -44,7 +44,7 @@ vi.mock("../../src/daemon/client.js", async importOriginal => ({
     }
 
     async observeClassified() {
-      return await this.observe();
+      return { kind: "observed", observation: await this.observe() };
     }
 
     async post(path: string) {

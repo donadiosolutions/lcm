@@ -388,7 +388,7 @@ tokens, or transport error text. The reasons are:
 | `headers-timeout` | No response started within the two-second deadline. | `lcm daemon restart` or `lcm doctor` |
 | `body-timeout` | A response started but did not finish within the deadline. | `lcm daemon restart` or `lcm doctor` |
 | `body-invalid` | A 200 response body could not be read as JSON. | `lcm daemon restart` or `lcm doctor` |
-| `http-status` | The daemon answered with another HTTP status; the code is shown. For 401 and 403, the token does not match the running daemon. | `lcm daemon restart` |
+| `http-status` | The daemon answered with another HTTP status; the code is shown. For 401 and 403, the token does not match the running daemon. | `lcm daemon restart`; for 401 and 403, `lcm daemon restart` or `lcm doctor` |
 | `invalid-identity` | A 200 response is not a valid identity observation. | `lcm daemon restart` |
 | `identity-mismatch` | The daemon differs from this installation; the differing fields (`version`, `storageBackend`, `entrypoint`, `runtimeDigest`) are listed. | `lcm daemon restart` |
 | `local-identity-unavailable` | This installation has no readable version or packaged runtime digest to compare against. | Reinstall LCM |
@@ -628,10 +628,12 @@ When the daemon identity could not be observed or verified, status JSON adds
 `observationFailure: { "reason": "...", "statusCode": 401, "fields": [...] }`
 (`statusCode` only for `http-status`, `fields` only for `identity-mismatch`)
 and text output prints `Daemon observation failed: <reason sentence>.`. The
-reasons are those above plus `config-changed`, reported when the configuration
-changed while the daemon was observed. The field is absent when the identity
-was verified and only the later status request failed. `lcm stats --pool` does
-not report these reasons.
+reasons are those above except `local-identity-unavailable`, which only doctor
+reports, plus `config-changed`, which only status reports, when the
+configuration changed while the daemon was observed. A missing expected version
+or runtime digest appears in status as an `identity-mismatch` field. The field
+is absent when the identity was verified and only the later status request
+failed. `lcm stats --pool` does not report these reasons.
 It omits the former `lastIngest`,
 `lastCompact`, and `lastPromote` fields: project metadata values are not part of
 the diagnostic allowlist. A missing or unreadable project has no numeric

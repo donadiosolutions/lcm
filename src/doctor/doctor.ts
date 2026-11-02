@@ -52,11 +52,12 @@ import {
 } from "../daemon/config.js";
 import {
   describeDaemonObservationFailure,
-  isDaemonObservationFailure,
+  failedObservation,
   parseDaemonObservation,
   type DaemonObservation,
   type DaemonObservationFailure,
   type DaemonObservationMismatchField,
+  type DaemonObservationResult,
 } from "../daemon/client.js";
 import {
   assertBackendPublicationConfigReadAccess,
@@ -180,16 +181,16 @@ async function readDaemonObservation(
   port: number,
   token: string | null,
   timeoutMs = DAEMON_OBSERVATION_DEADLINE_MS,
-): Promise<DaemonObservation | DaemonObservationFailure> {
-  if (token === null) return { reason: "token-missing" };
+): Promise<DaemonObservationResult> {
+  if (token === null) return failedObservation({ reason: "token-missing" });
   const controller = new AbortController();
   // The deadline is absolute; which stage it interrupted decides the class.
   let responseStarted = false;
-  const deadlineFailure = (): DaemonObservationFailure => ({
+  const deadlineFailure = (): DaemonObservationResult => failedObservation({
     reason: responseStarted ? "body-timeout" : "headers-timeout",
   });
   let timeout!: ReturnType<typeof setTimeout>;
-  const deadline = new Promise<DaemonObservationFailure>((resolve) => {
+  const deadline = new Promise<DaemonObservationResult>((resolve) => {
     timeout = setTimeout(() => {
       controller.abort();
       resolve(deadlineFailure());
@@ -197,7 +198,7 @@ async function readDaemonObservation(
   });
   try {
     return await Promise.race([
-      (async (): Promise<DaemonObservation | DaemonObservationFailure> => {
+      (async (): Promise<DaemonObservationResult> => {
         let res: Response;
         try {
           res = await fetchFn(`http://127.0.0.1:${port}/health/observe`, {
@@ -205,22 +206,25 @@ async function readDaemonObservation(
             signal: controller.signal,
           });
         } catch {
-          return controller.signal.aborted ? deadlineFailure() : { reason: "connect-failed" };
+          return controller.signal.aborted ? deadlineFailure() : failedObservation({ reason: "connect-failed" });
         }
         responseStarted = true;
         if (res.status !== 200) {
           // The body is not read: release the owned request so no response
           // work outlives this diagnostic.
           controller.abort();
-          return { reason: "http-status", statusCode: res.status };
+          return failedObservation({ reason: "http-status", statusCode: res.status });
         }
         let body: unknown;
         try {
           body = await res.json();
         } catch {
-          return controller.signal.aborted ? deadlineFailure() : { reason: "body-invalid" };
+          return controller.signal.aborted ? deadlineFailure() : failedObservation({ reason: "body-invalid" });
         }
-        return parseDaemonObservation(res.status, body) ?? { reason: "invalid-identity" };
+        const observation = parseDaemonObservation(res.status, body);
+        return observation === null
+          ? failedObservation({ reason: "invalid-identity" })
+          : { kind: "observed", observation };
       })(),
       deadline,
     ]);
@@ -240,7 +244,7 @@ function readDoctorDaemonToken(deps: DoctorDeps): string | null {
 async function readDoctorAuthenticatedObservation(
   deps: DoctorDeps,
   port: number,
-): Promise<DaemonObservation | DaemonObservationFailure> {
+): Promise<DaemonObservationResult> {
   return readDaemonObservation(
     deps.fetch,
     port,
@@ -270,14 +274,14 @@ function daemonObservationMismatchFields(
 }
 
 function verifyDaemonObservation(
-  observed: DaemonObservation | DaemonObservationFailure,
+  observed: DaemonObservationResult,
   identity: ExpectedDaemonIdentity | undefined,
   platform: NodeJS.Platform,
-): DaemonObservation | DaemonObservationFailure {
-  if (isDaemonObservationFailure(observed)) return observed;
-  if (identity === undefined) return { reason: "local-identity-unavailable" };
-  const fields = daemonObservationMismatchFields(observed, identity, platform);
-  return fields.length === 0 ? observed : { reason: "identity-mismatch", fields };
+): DaemonObservationResult {
+  if (observed.kind === "failed") return observed;
+  if (identity === undefined) return failedObservation({ reason: "local-identity-unavailable" });
+  const fields = daemonObservationMismatchFields(observed.observation, identity, platform);
+  return fields.length === 0 ? observed : failedObservation({ reason: "identity-mismatch", fields });
 }
 
 function daemonObservationFailureMessage(failure: DaemonObservationFailure): string {
@@ -876,12 +880,12 @@ export async function runDoctor(overrides?: Partial<DoctorDeps>, doctorOptions: 
         expectedDaemonIdentity(config, pkgVersion, runtimePath, expectedRuntimeDigest),
         deps.platform,
       );
-      if (isDaemonObservationFailure(verified)) {
+      if (verified.kind === "failed") {
         results.push({ name: "daemon", category: "Daemon", status: "fail",
-          message: daemonObservationFailureMessage(verified) });
+          message: daemonObservationFailureMessage(verified.failure) });
       } else {
         daemonIdentityVerified = true;
-        daemonPid = verified.pid;
+        daemonPid = verified.observation.pid;
         results.push({ name: "daemon", category: "Daemon", status: "pass",
           message: "Authenticated daemon version and runtime identity verified; active storage readiness was not probed" });
       }
