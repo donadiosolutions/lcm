@@ -694,9 +694,76 @@ function findUrlPathStarts(chars: readonly string[]): UrlPathStarts {
     while (isPathWord(chars[cursor])) cursor += 1;
     return chars[cursor] === "=" ? cursor + 1 : -1;
   };
+  const inheritedPublicQueryValueStart = (start: number): number => {
+    let cursor = start;
+    while (isPathWord(chars[cursor])) cursor += 1;
+    while (chars[cursor] === "[") {
+      cursor += 1;
+      while (isPathWord(chars[cursor])) cursor += 1;
+      if (chars[cursor] !== "]") return start;
+      cursor += 1;
+    }
+    if (chars[cursor] !== "=") return start;
+    while (chars[cursor] === "=") cursor += 1;
+    return cursor;
+  };
+  const inheritedPublicQueryComparisonSegment = (
+    start: number,
+  ): { value: string; next: number; hasDelimiter: boolean } => {
+    let cursor = start;
+    let value = "";
+    let delimiterLength = 0;
+    while (chars[cursor] !== undefined) {
+      const char = chars[cursor];
+      if (char === "/" || char === "\\") {
+        delimiterLength = 1;
+        break;
+      }
+      const encoded = chars.slice(cursor + 1, cursor + 3).join("");
+      if (char === "%" && /^[\dA-Fa-f]{2}$/u.test(encoded)) {
+        const decoded = String.fromCharCode(
+          Number.parseInt(encoded, 16),
+        );
+        if (decoded === "/" || decoded === "\\") {
+          delimiterLength = 3;
+          break;
+        }
+        value += decoded;
+        cursor += 3;
+        continue;
+      }
+      value += char;
+      cursor += 1;
+    }
+    return {
+      value: value.toLowerCase(),
+      next: cursor + delimiterLength,
+      hasDelimiter: delimiterLength > 0,
+    };
+  };
+  const inheritedPublicQueryStartsPrivateRoot = (start: number): boolean => {
+    let segment = inheritedPublicQueryComparisonSegment(start);
+    while (segment.value === "." && segment.hasDelimiter) {
+      segment = inheritedPublicQueryComparisonSegment(segment.next);
+    }
+    return (
+      (segment.value === "users" ||
+        segment.value === "home" ||
+        segment.value === "root") &&
+      segment.hasDelimiter &&
+      isPathWord(chars[segment.next])
+    );
+  };
   const inheritedPublicQueryPrivatePathStart = (delimiterIndex: number): number => {
-    const namedStart = namedValueStart(delimiterIndex + 1);
-    const valueStart = namedStart >= 0 ? namedStart : delimiterIndex + 1;
+    const valueStart = inheritedPublicQueryValueStart(delimiterIndex + 1);
+    if (
+      (chars[delimiterIndex] === ";" ||
+        chars[delimiterIndex] === "," ||
+        chars[delimiterIndex] === "|") &&
+      isForwardSlashDrivePathStart(valueStart)
+    ) {
+      return -1;
+    }
     if (
       isWindowsDrivePathStart(chars, valueStart) ||
       isForwardSlashDrivePathStart(valueStart) ||
@@ -705,7 +772,8 @@ function findUrlPathStarts(chars: readonly string[]): UrlPathStarts {
       return valueStart;
     }
     if (chars[valueStart] === "/" || chars[valueStart] === "\\") {
-      return immediateBackslashSlashSuccessorStartsPrivateRoot(valueStart) ? valueStart : -1;
+      const rootStart = skipSeparatorRun(valueStart);
+      return inheritedPublicQueryStartsPrivateRoot(rootStart) ? valueStart : -1;
     }
     return returnedParentPrivateRootPathStart(valueStart);
   };
@@ -937,7 +1005,8 @@ function findUrlPathStarts(chars: readonly string[]): UrlPathStarts {
         repeatedPipeHandoffWrapperDepths.add(inheritedFileQuoteParentOwnerBracketDepth);
         inheritedQuoteTailWrapperDepths.add(inheritedFileQuoteParentOwnerBracketDepth);
         const successorStart = continuationStart + 1;
-        if (chars[successorStart] === "[" || postCloseFilePathBracketDepth > 0) {
+        const bracketStart = skipInheritedQuoteInterposerRun(successorStart);
+        if (chars[bracketStart] === "[" || postCloseFilePathBracketDepth > 0) {
           // A direct bracket handoff, or a nested handoff while an inherited
           // tail is still inside its bracket, keeps the enclosing wrapper as
           // the owner. Subtracting the active tail depth prevents the inner
@@ -1268,7 +1337,12 @@ function findUrlPathStarts(chars: readonly string[]): UrlPathStarts {
     }
     if (
       separator >= 0 &&
-      (char === "?" || char === "#" || char === "&") &&
+      (char === "?" ||
+        char === "#" ||
+        char === "&" ||
+        char === ";" ||
+        char === "," ||
+        char === "|") &&
       inheritedPublicQueryOwnerWrapperDepths.size > 0 &&
       pathlessNestedPublicUrlActive
     ) {

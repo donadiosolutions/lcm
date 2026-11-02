@@ -832,10 +832,11 @@ bundle and keep provider, credential, quarantine, and recovery sessions private.
   own quote. Inside a bracketed file query, the matching quote restores the
   enclosing owner when `&` or `|` immediately follows it, including when the
   quote and delimiter are separated only by a run of U+200B, U+200C, U+200D,
-  or U+2060. Whitespace, including U+FEFF, before the delimiter prevents that
-  handoff, and whitespace between the delimiter and the successor resets
-  ownership; in both cases a Windows backslash-rooted value stays readable
-  unless another path rule applies. One or more `=` characters after the
+  or U+2060. The same invisible run may separate the delimiter from a directly
+  following bracket. Whitespace, including U+FEFF, before the delimiter
+  prevents that handoff, and whitespace between the delimiter and the successor
+  resets ownership; in both cases a Windows backslash-rooted value stays
+  readable unless another path rule applies. One or more `=` characters after the
   matching quote also redact an immediately adjacent Windows backslash-rooted
   value on the first pass. Relative, public-URL, and plain values after `=`
   stay readable, as do backslash-rooted values separated from `=` by whitespace
@@ -848,12 +849,18 @@ bundle and keep provider, credential, quarantine, and recovery sessions private.
   successors remain readable. When the quote hands directly to a bracket, or a
   nested quote hands off while that inherited bracket tail is still open,
   recognized private filesystem values in a nested public URL query or fragment
-  are also redacted. This includes rooted POSIX and Windows paths, drive and UNC
-  paths, and private-root relative paths; ordinary rooted or relative URL values
-  and complete public URLs remain readable. Ownership still ends at the
-  enclosing wrapper close. Unquoted URLs, embedded URLs whose scheme did not
-  begin at the quote, unmatched quotes, and newlines retain their existing
-  boundaries.
+  are also redacted after `?`, `#`, `&`, `;`, `,`, or `|`. A value may be
+  unnamed, or follow a path-word name with bracketed index suffixes and one or
+  more equals signs. Covered values include rooted POSIX and Windows paths,
+  drive and UNC paths, and private-root relative paths. For the first private
+  root segment and leading dot segments only, `%XX` bytes are compared in
+  decoded form and `./` segments are ignored; the output retains the original bytes.
+  A fully encoded leading separator, complete public URLs, and unrecognized
+  relative values remain readable. A rooted value after a value newly replaced
+  with `<path>` may be redacted when the result is sanitized again. Ownership
+  still ends at the enclosing wrapper close. Unquoted URLs, embedded URLs whose
+  scheme did not begin at the quote, unmatched quotes, and newlines retain their
+  existing boundaries.
 
   Root-relative Windows values after opaque wrapper text remain conservatively
   redacted. LCM does not expose such private-looking values merely because URL

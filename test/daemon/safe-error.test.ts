@@ -8726,8 +8726,28 @@ describe("sanitizeError", () => {
   });
 
   describe("Bug #1831", () => {
-    const quotedPrefix =
-      "file://h?x=['https://outer.test/x?next=file:///Users/a/private.db'|";
+    const quotedOwner =
+      "file://h?x=['https://outer.test/x?next=file:///Users/a/private.db'";
+    const quotedPrefix = quotedOwner + "|";
+    const redactedQuotedPrefix =
+      "file://h?x=['https://outer.test/x?next=file://<path>'|";
+    const inheritedPublicInput = (body: string): string =>
+      quotedPrefix + `[file:///b&[https://o${body}]]`;
+    const inheritedPublicExpected = (body: string): string =>
+      redactedQuotedPrefix + `[file://<path>&[https://o${body}]]`;
+    const expectThreePasses = (
+      input: string,
+      expected: string | readonly [string, string, string],
+    ): void => {
+      const passes = typeof expected === "string" ? [expected, expected, expected] : expected;
+      const first = sanitizeError(input);
+      const second = sanitizeError(first);
+      const third = sanitizeError(second);
+
+      expect(first).toBe(passes[0]);
+      expect(second).toBe(passes[1]);
+      expect(third).toBe(passes[2]);
+    };
 
     it.each([
       [
@@ -8787,6 +8807,204 @@ describe("sanitizeError", () => {
       expect(first).toBe(expected);
       expect(sanitizeError(first)).toBe(first);
       expect(sanitizeError(sanitizeError(first))).toBe(first);
+    });
+
+    it.each([
+      ["empty query name", "?=/Users/R2E/x", "?=<path>"],
+      ["empty fragment name", "#=/Users/R2F/x", "#=<path>"],
+      ["later empty name", "?p=1&=/Users/R2A/x", "?p=1&=<path>"],
+      ["empty bracket suffix", "?key[]=/Users/R2B/x", "?key[]=<path>"],
+      ["indexed suffix", "?key[0]=C:/Users/R2I/x", "?key[0]=<path>"],
+      ["repeated suffixes", "?key[][0]=/home/R2H/x", "?key[][0]=<path>"],
+      ["two equals", "?key==\\Users\\R2W\\x", "?key==<path>"],
+      ["three equals", "?key===Users/R2Q/x", "?key===Users<path>"],
+      ["later bracket suffix", "?p=1&key[]=/root/R2L/x", "?p=1&key[]=<path>"],
+    ] as const)("redacts a private value after %s", (_name, body, expectedBody) => {
+      expectThreePasses(inheritedPublicInput(body), inheritedPublicExpected(expectedBody));
+    });
+
+    it("redacts an indexed query value in the row-2 sibling", () => {
+      const input =
+        "file://h?x=['https://outer.test/x?next=file:///Users/a/private.db'|" +
+        "\\Users\\ZQA\\x[https://i?key='https://o.test/x?next=file:///Users/ZQR/a'|" +
+        "\\Users\\ZQB\\x][https://j?key[0]=/Users/ZQE/x]]";
+      const expected =
+        "file://h?x=['https://outer.test/x?next=file://<path>'|<path>?key=" +
+        "'https://o.test/x?next=file://<path>'|<path>][https://j?key[0]=<path>]]";
+
+      expectThreePasses(input, expected);
+    });
+
+    it.each([
+      ["semicolon named", "?p=1;key=Users/R2S/x", "?p=1;key=Users<path>"],
+      ["comma named", "?p=1,key=home/R2C/x", "?p=1,key=home<path>"],
+      ["pipe named", "?p=1|key=root/R2P/x", "?p=1|key=root<path>"],
+      ["fragment semicolon", "#p=1;key=Users/R2G/x", "#p=1;key=Users<path>"],
+      ["semicolon unnamed", "?p=1;\\Users\\R2W\\x", "?p=1;<path>"],
+      ["comma empty name", "?p=1,=/Users/R2N/x", "?p=1,=<path>"],
+      ["pipe bracket name", "?p=1|key[]=/Users/R2K/x", "?p=1|key[]=<path>"],
+    ] as const)("redacts a private value after a nested URL %s component", (_name, body, expectedBody) => {
+      expectThreePasses(inheritedPublicInput(body), inheritedPublicExpected(expectedBody));
+    });
+
+    it.each([
+      ["zero width space", "\u200b"],
+      ["zero width non-joiner", "\u200c"],
+      ["zero width joiner", "\u200d"],
+      ["word joiner", "\u2060"],
+      ["zero width run", "\u200b\u200c\u200d\u2060"],
+    ] as const)("inherits a direct bracket behind a %s", (_name, interposer) => {
+      const input =
+        quotedOwner + `|${interposer}[file:///b&[https://o?key=/Users/R2Z/x]]`;
+      const expected =
+        "file://h?x=['https://outer.test/x?next=file://<path>'|" +
+        `${interposer}[file://<path>&[https://o?key=<path>]]`;
+
+      expectThreePasses(input, expected);
+    });
+
+    it.each(["\u200b", "\u200c\u200d\u2060"] as const)(
+      "inherits a nested bracket behind the row-2 zero-width run %#",
+      (interposer) => {
+        const input =
+          quotedOwner +
+          "|\\Users\\ZQA\\x[https://i?key='https://o.test/x?next=file:///Users/ZQR/a'|" +
+          interposer +
+          "[file:///b&[https://j?key=/Users/ZQE/x]]]";
+        const expected =
+          "file://h?x=['https://outer.test/x?next=file://<path>'|<path>?key=" +
+          "'https://o.test/x?next=file://<path>'|" +
+          interposer +
+          "[file://<path>&[https://j?key=<path>]]]";
+
+        expectThreePasses(input, expected);
+      },
+    );
+
+    it.each([
+      ["encoded slash", "/Users%2FR2U/x"],
+      ["lowercase encoded slash", "/Users%2fR2L/x"],
+      ["encoded middle letter", "/Us%65rs/R2M/x"],
+      ["encoded first letter", "/%55sers/R2N/x"],
+      ["leading dot segment", "/./Users/R2D/x"],
+      ["repeated leading dot segments", "/././home/R2H/x"],
+      ["encoded leading dot segment", "/%2e/Users/R2ED/x"],
+      ["encoded dot and separator", "/%2E%2Froot/R2EDS/x"],
+    ] as const)("redacts a private root with %s", (_name, value) => {
+      expectThreePasses(
+        inheritedPublicInput(`?key=${value}`),
+        inheritedPublicExpected("?key=<path>"),
+      );
+    });
+
+    it("pins the accepted following rooted value at the current fixed point", () => {
+      const input = inheritedPublicInput(
+        "?key=/Users/R2PRIV/x&other=/public/R2PUB/x",
+      );
+      const first = inheritedPublicExpected(
+        "?key=<path>&other=/public/R2PUB/x",
+      );
+      const fixedPoint = inheritedPublicExpected("?key=<path>&other=<path>");
+
+      expectThreePasses(input, [first, fixedPoint, fixedPoint]);
+    });
+
+    it.each([
+      [
+        "fully encoded path",
+        inheritedPublicInput("?key=%2FUsers%2FR2O%2Fx"),
+        inheritedPublicExpected("?key=%2FUsers%2FR2O%2Fx"),
+      ],
+      [
+        "parenthesis before bracket",
+        quotedOwner + "|([file:///b&[https://o?key=/Users/R2PAR/x]])",
+        "file://h?x=['https://outer.test/x?next=file://<path>'|" +
+          "([file://<path>&[https://o?key=/Users/R2PAR/x]])",
+      ],
+      [
+        "doubled closing quote",
+        "file://h?x=['https://outer.test/x?next=file:///Users/a/private.db''|" +
+          "[file:///b&[https://o?key=/Users/R2DQ/x]]",
+        "file://h?x=['https://outer.test/x?next=file://<path>''|" +
+          "[file://<path>&[https://o?key=/Users/R2DQ/x]]",
+      ],
+      [
+        "internal path space",
+        inheritedPublicInput("?key=/Users/A/My R2SPACE/x"),
+        inheritedPublicExpected("?key=<path> R2SPACE/x"),
+      ],
+      [
+        "zero width inside private path",
+        inheritedPublicInput("?key=/Users\u200b/R2ZW/x"),
+        inheritedPublicExpected("?key=/Users\u200b/R2ZW/x"),
+      ],
+      [
+        "private-looking public URL path",
+        quotedPrefix + "[file:///b&[https://o/Users/R2URL/x?key=plain]]",
+        redactedQuotedPrefix + "[file://<path>&[https://o/Users/R2URL/x?key=plain]]",
+      ],
+      [
+        "optional colon spelling",
+        inheritedPublicInput("?key:/Users/R2COLON/x"),
+        inheritedPublicExpected("?key:/Users/R2COLON/x"),
+      ],
+      [
+        "unterminated bracket name",
+        inheritedPublicInput("?key[0=/Users/R2BADINDEX/x"),
+        inheritedPublicExpected("?key[0=/Users/R2BADINDEX/x"),
+      ],
+      [
+        "invalid first percent nibble",
+        inheritedPublicInput("?key=/Us%G5rs/R2BADHEX1/x"),
+        inheritedPublicExpected("?key=/Us%G5rs/R2BADHEX1/x"),
+      ],
+      [
+        "invalid second percent nibble",
+        inheritedPublicInput("?key=/Us%6Grs/R2BADHEX2/x"),
+        inheritedPublicExpected("?key=/Us%6Grs/R2BADHEX2/x"),
+      ],
+      [
+        "trailing percent",
+        inheritedPublicInput("?key=/Users%"),
+        inheritedPublicExpected("?key=/Users%"),
+      ],
+      [
+        "truncated percent escape",
+        inheritedPublicInput("?key=/Users%6"),
+        inheritedPublicExpected("?key=/Users%6"),
+      ],
+      [
+        "dot that is not a segment",
+        inheritedPublicInput("?key=/.Users/R2DOTWORD/x"),
+        inheritedPublicExpected("?key=/.Users/R2DOTWORD/x"),
+      ],
+      [
+        "private root without a separator",
+        inheritedPublicInput("?key=/Users"),
+        inheritedPublicExpected("?key=/Users"),
+      ],
+      [
+        "root separator without a value",
+        inheritedPublicInput("?key=/"),
+        inheritedPublicExpected("?key=/"),
+      ],
+      [
+        "encoded separator without a following path word",
+        inheritedPublicInput("?key=/Users%2F/x"),
+        inheritedPublicExpected("?key=/Users%2F/x"),
+      ],
+      [
+        "alternate delimiter forward drive spelling",
+        inheritedPublicInput("?p=1;key=C:/Users/R2DRIVE/x"),
+        inheritedPublicExpected("?p=1;key=C:<path>"),
+      ],
+      [
+        "backslash dot segment",
+        inheritedPublicInput("?key=/.\\Users\\R2DOTBACK\\x"),
+        inheritedPublicExpected("?key=<path>"),
+      ],
+    ] as const)("preserves the adjudicated control: %s", (_name, input, expected) => {
+      expectThreePasses(input, expected);
     });
 
     it.each(["&", "|"] as const)(
