@@ -17,6 +17,7 @@ import { basename, dirname, isAbsolute, join, resolve } from "node:path";
 import { runLcmMigrations } from "./db/migration.js";
 import { getLcmDbFeatures } from "./db/features.js";
 import {
+  EVENTS_SCHEMA_VERSION,
   EventsDb,
   isValidMissingCwdStateRow,
 } from "./hooks/events-db.js";
@@ -987,6 +988,42 @@ function legacyEventsSchemaVersion(db: DatabaseSync): number {
     throw new Error(`legacy events database has invalid schema_version: ${String(value)}`);
   }
   return value;
+}
+
+function preflightEventsSchemas(
+  sources: readonly WorktreeReconciliationSource[],
+  targetPath: string,
+): void {
+  let hasEvents = false;
+  for (const source of sources) {
+    if (!isRegularFile(source.eventsPath)) continue;
+    hasEvents = true;
+    const database = new DatabaseSync(source.eventsPath, { readOnly: true });
+    try {
+      const version = legacyEventsSchemaVersion(database);
+      if (version > MAX_RECONCILIABLE_EVENT_SCHEMA_VERSION) {
+        throw new Error(`unsupported legacy events database schema: ${String(version)}`);
+      }
+    } finally {
+      database.close();
+    }
+  }
+  if (!hasEvents) return;
+
+  // The merge initializes/migrates the target before importing any rows.
+  // Admit that resulting schema without creating or migrating the target.
+  let targetVersion = EVENTS_SCHEMA_VERSION;
+  if (isRegularFile(targetPath)) {
+    const database = new DatabaseSync(targetPath, { readOnly: true });
+    try {
+      targetVersion = Math.max(targetVersion, legacyEventsSchemaVersion(database));
+    } finally {
+      database.close();
+    }
+  }
+  if (targetVersion > MAX_RECONCILIABLE_EVENT_SCHEMA_VERSION) {
+    throw new Error(`unsupported target events database schema: ${String(targetVersion)}`);
+  }
 }
 
 type ReconciliableMissingCwdState = {
@@ -2962,6 +2999,9 @@ export function reconcileWorktrees(
           `worktree reconciliation source component disappeared before merge: ${source.hash}`,
         );
       }
+    }
+    if (journal.phase === "planned") {
+      preflightEventsSchemas(sources, projectEventsPath(targetHash, opts.homeDir));
     }
     writeAttemptJournal(journal);
 

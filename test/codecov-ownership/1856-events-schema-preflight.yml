@@ -1,0 +1,5 @@
+references:
+  - "#1856"
+rationale: Keep early event-schema admission in the existing project/worktree reconciliation owner.
+pins:
+  - ["src/worktree-reconciliation.ts", "unit-project-worktrees"]
