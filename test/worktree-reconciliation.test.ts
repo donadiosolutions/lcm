@@ -6949,6 +6949,36 @@ describe("worktree reconciliation", () => {
     expect(existsSync(fixture.sourceEvents)).toBe(true);
   });
 
+  it("rejects a source schema changed after the read-only preflight", () => {
+    const fixture = makeEventsReconciliation(home);
+    makeVersionedEvents(fixture.sourceEvents);
+    let changed = false;
+
+    expect(() => reconcileWorktrees(fixture.main, {
+      _observer: (event) => {
+        if (event !== "before-source-events-merge" || changed) return;
+        changed = true;
+        const source = new DatabaseSync(fixture.sourceEvents);
+        try { source.exec("UPDATE schema_version SET version = 6"); }
+        finally { source.close(); }
+      },
+    })).toThrow("unsupported legacy events database schema: 6");
+    expect(changed).toBe(true);
+
+    const source = new DatabaseSync(fixture.sourceEvents, { readOnly: true });
+    try {
+      expect(source.prepare("SELECT version FROM schema_version").get()).toEqual({ version: 6 });
+      expect(source.prepare("SELECT COUNT(*) AS count FROM events").get()).toEqual({ count: 1 });
+      expect(source.prepare("SELECT name FROM sqlite_schema WHERE name = 'worktree_reconciliation_fence'").all())
+        .toEqual([]);
+    } finally { source.close(); }
+    const target = new DatabaseSync(fixture.targetEvents, { readOnly: true });
+    try {
+      expect(target.prepare("SELECT COUNT(*) AS count FROM events").get()).toEqual({ count: 0 });
+    } finally { target.close(); }
+    expect(existsSync(join(home, ".lcm", "oldevents"))).toBe(false);
+  });
+
   it("merges schema-v5 missing-CWD evidence before retiring the source", () => {
     const fixture = makeEventsReconciliation(home);
     makeVersionedEvents(fixture.targetEvents);
