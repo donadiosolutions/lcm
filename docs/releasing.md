@@ -102,12 +102,18 @@ publish-job failure or cancellation restores the release to draft, although a
 short public window can occur first. If npm publication completed before a
 later failure, publishing the restored draft again remains safe: the workflow
 recognizes the existing immutable package version, skips a duplicate
-publication, and repeats the final package and dist-tag verification. The final
-verification takes five complete metadata snapshots with 2-, 4-, 8-, and
-16-second delays. It retries only incomplete registry propagation: a missing
-exact version, missing version-list membership, or a valid older expected
-dist-tag. Malformed metadata, conflicting/newer tags, authorization failures,
-and unexpected npm process results fail immediately.
+publication, and repeats the final package and dist-tag verification. npm scans
+a published package before it becomes visible, usually for about five minutes
+and sometimes longer, so the final verification takes complete metadata
+snapshots for about 30 minutes, with 2-, 4-, 8-, 16-, and 30-second delays
+followed by 60-second delays. It retries only incomplete registry propagation:
+a missing exact version, missing version-list membership, or a valid older
+expected dist-tag. Malformed metadata, conflicting/newer tags, authorization
+failures, and unexpected npm process results fail immediately. A version still
+being scanned is invisible to the npm ordering guard, so a retry can run
+`npm publish` again; when npm answers E409 "Cannot publish over previously
+staged version" for the same version, the helper treats the upload as done,
+skips the duplicate, and verifies. Any other E409 or publish error still fails.
 
 Alpha and beta packages publish to their matching npm dist-tags. Stable packages publish to
 `latest`, and the workflow verifies that `latest` remains the highest stable
