@@ -134,8 +134,10 @@ export function admitDaemonPeer(options: DaemonPeerAdmissionOptions): DaemonPeer
       const match = /^Uid:\s+([0-9]+)(?:\s|$)/mu.exec(status);
       processUid = match === null ? null : Number(match[1]);
     } else if (platform === "darwin") {
+      const ownerTimeoutMs = Math.min(1000, remaining());
+      if (!Number.isFinite(ownerTimeoutMs) || ownerTimeoutMs < 1) return null;
       const result = (options._spawnSync ?? spawnSync)("/bin/ps", ["-p", String(pid), "-o", "uid="], {
-        encoding: "utf8", timeout: Math.min(1000, remaining()), maxBuffer: 16 * 1024,
+        encoding: "utf8", timeout: ownerTimeoutMs, maxBuffer: 16 * 1024,
         shell: false, windowsHide: true,
       });
       const raw = typeof result.stdout === "string" ? result.stdout.trim() : "";

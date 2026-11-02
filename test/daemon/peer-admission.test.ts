@@ -190,6 +190,18 @@ describe("daemon peer admission", () => {
       _processBirth: birth, _platform: "darwin", _spawnSync: spawn as never })).toBeNull();
   });
 
+  it.each([99.5, Number.NaN])("refuses a fractional or nonfinite Darwin UID-probe allowance (%s)", finalNow => {
+    const paths = fixture();
+    let calls = 0;
+    const spawn = vi.fn();
+    expect(admitDaemonPeer({
+      ...paths, port, deadline: 100, now: () => ++calls < 5 ? 0 : finalNow,
+      _processBirth: birth, _platform: "darwin", _spawnSync: spawn as never,
+    })).toBeNull();
+    expect(calls).toBeGreaterThanOrEqual(5);
+    expect(spawn).not.toHaveBeenCalled();
+  });
+
   it("resolves the default private home and refuses platforms without owner proof", () => {
     const paths = fixture();
     vi.stubEnv("HOME", paths.homeDir);
