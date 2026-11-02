@@ -2385,8 +2385,22 @@ function sanitizeAbsolutePaths(message: string): string {
   return sanitized.join("");
 }
 
+// A redaction pass changes the text its successor scan sees, so one pass can
+// leave a span that only the next pass redacts. Every pass only replaces text
+// with placeholders, so repeating it never exposes anything an earlier pass
+// hid. The bound keeps the cost linear: a few passes, never one per
+// character. Shapes in the repository's corpus settle within three changing
+// passes; the bound leaves room for deeper compositions.
+const MAX_PASSES = 7;
+
 export function sanitizeError(message: string): string {
   // Replace SQLite internal details with a generic message
   if (/SQLITE_/.test(message)) return "database constraint error";
-  return sanitizeAbsolutePaths(message);
+  let sanitized = message;
+  for (let pass = 0; pass < MAX_PASSES; pass += 1) {
+    const next = sanitizeAbsolutePaths(sanitized);
+    if (next === sanitized) break;
+    sanitized = next;
+  }
+  return sanitized;
 }

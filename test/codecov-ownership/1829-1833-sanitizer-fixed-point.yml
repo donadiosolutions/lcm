@@ -1,0 +1,7 @@
+references: ["#1829", "#1833"]
+rationale: >-
+  #1829 and #1833 make sanitizeError repeat its redaction pass until the text
+  stops changing, so the first result is the fixed point of the earlier
+  multi-pass shapes.
+pins:
+  - ["src/daemon/safe-error.ts", "unit-daemon-core"]

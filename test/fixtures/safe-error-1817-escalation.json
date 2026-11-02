@@ -124,7 +124,7 @@
     "mode": "copy-refuse",
     "input": "file://h?x=[file:///Users/CHILD/x&later\\/home/alice/s([https://other&C:/Users/K/x]&later\\/home/bob/s[file://srv.corp/share&M:/Users/K/x]",
     "requiredPasses": [
-      "file://h?x=[file://<path>&later\\<path>&C:<path>]&later\\/home/bob/s[file://srv.corp<path>&M:/Users/K/x]",
+      "file://h?x=[file://<path>&later\\<path>&C:<path>]&later\\<path><path>&M:<path>]",
       "file://h?x=[file://<path>&later\\<path>&C:<path>]&later\\<path><path>&M:<path>]",
       "file://h?x=[file://<path>&later\\<path>&C:<path>]&later\\<path><path>&M:<path>]"
     ]
@@ -134,7 +134,7 @@
     "mode": "refuse",
     "input": "file://h?x=[file:///Users/CHILD/x&later\\/home/alice/s([https://other&plain]&later\\/home/bob/s([file:///b?key=C:/Users/Q/y]",
     "requiredPasses": [
-      "file://h?x=[file://<path>&later\\<path>&plain]&later\\/home/bob/s([file://<path>?key=C:/Users/Q/y]",
+      "file://h?x=[file://<path>&later\\<path>&plain]&later\\<path><path>?key=C:<path>]",
       "file://h?x=[file://<path>&later\\<path>&plain]&later\\<path><path>?key=C:<path>]",
       "file://h?x=[file://<path>&later\\<path>&plain]&later\\<path><path>?key=C:<path>]"
     ]
@@ -144,7 +144,7 @@
     "mode": "refuse",
     "input": "file://h?x=[file:///Users/CHILD/x&later\\/home/alice/s([https://other&C:/]&later\\/home/bob/file:///x([https://other?key=C:/Users/Q/y]",
     "requiredPasses": [
-      "file://h?x=[file://<path>&later\\<path>&<path>]&later\\/home/bob/file://<path>?key=C:<path>]",
+      "file://h?x=[file://<path>&later\\<path>&<path>]&later\\<path><path>?key=C:<path>]",
       "file://h?x=[file://<path>&later\\<path>&<path>]&later\\<path><path>?key=C:<path>]",
       "file://h?x=[file://<path>&later\\<path>&<path>]&later\\<path><path>?key=C:<path>]"
     ]
