@@ -60,6 +60,7 @@ afterEach(() => {
 });
 
 type Fixture = {
+  now: () => number;
   root: string;
   stateDir: string;
   pidPath: string;
@@ -169,6 +170,7 @@ function healthy(
 }
 
 function createFixture(options: FixtureOptions = {}): Fixture {
+  let elapsed = 0;
   const root = mkdtempSync(join(tmpdir(), "lcm-400-managed-"));
   roots.push(root);
   const stateDir = join(root, "state");
@@ -211,10 +213,18 @@ function createFixture(options: FixtureOptions = {}): Fixture {
     stopUnit: vi.fn(),
     killProcess: options.killProcess ?? vi.fn(),
     isProcessAlive: isAlive,
-    sleep: options.sleep ?? (async () => undefined),
+    sleep: async (milliseconds) => {
+      if (!Number.isFinite(milliseconds) || milliseconds <= 0) {
+        elapsed += 1;
+        throw new Error("fixture sleep must advance by a finite positive interval");
+      }
+      elapsed += milliseconds;
+      await options.sleep?.(milliseconds);
+    },
     realpath: options.realpath ?? ((path: string) => path),
   };
   return {
+    now: () => elapsed,
     root,
     stateDir,
     pidPath,
@@ -289,7 +299,7 @@ function optionsFor(
       return Number.isSafeInteger(pid) && pid > 0 ? { pid, birth: "birth" } : null;
     },
     _supervisorOverride: fixture.supervisor,
-    _monotonicNowOverride: () => 0,
+    _monotonicNowOverride: fixture.now,
     _listeningPortsOverride: () => [fixture.port],
     ...extra,
   };
@@ -1458,7 +1468,6 @@ describe("issue 400 managed ensure admission matrix", () => {
       const pending = ensureDaemon(optionsFor(fixture, {
         expectedRuntimeDigest: "a".repeat(64),
         _skipSpawn: false,
-        _monotonicNowOverride: () => 0,
         _processStartTimeForTesting: () => "birth",
         _readPrivateMutationLockOwnerForTesting: () => ({ version: 1, pid: 4242, processStartTime: "birth", nonce: "a".repeat(32) }),
         _assertBackendPublication: () => {
@@ -3035,6 +3044,9 @@ describe("issue 400 managed start, cleanup, deadline, and process seams", () => 
       pid: 4242,
     });
 
+    expect(busy.seams.fetch).toHaveBeenCalledOnce();
+    expect(busy.now()).toBe(0);
+
     const mismatch = createFixture({
       fetch: sequenceFetch([healthy(4242, "/tmp/lcm-daemon-entrypoint.mjs", { version: "2" })]),
       isAlive: () => true,
@@ -3046,6 +3058,9 @@ describe("issue 400 managed start, cleanup, deadline, and process seams", () => 
       _skipSpawn: true,
       _listeningPortsOverride: () => [mismatch.port],
     }))).resolves.toMatchObject({ connected: false });
+    expect(mismatch.seams.fetch).toHaveBeenCalledOnce();
+    expect(mismatch.seams.killProcess).not.toHaveBeenCalled();
+    expect(mismatch.now()).toBe(0);
   });
 
   it("admits a successful managed start after health, storage, and access checks", async () => {
@@ -3072,29 +3087,43 @@ describe("issue 400 managed start, cleanup, deadline, and process seams", () => 
       isAlive: () => true,
       fetch: sequenceFetch([new Error("pre-start offline"), healthy(4242), healthy(4242), response({}, 200)]),
     });
-    finalProbeFailure.probe
-      .mockImplementationOnce(async (spec: SupervisorSpec) => observation(spec, "absent"))
-      .mockImplementationOnce(async (spec: SupervisorSpec) => observation(spec, "registered-running-valid", { managerPid: 4242 }))
-      .mockRejectedValueOnce(new Error("post-admission probe failed"));
+    finalProbeFailure.probe.mockImplementation(async (spec: SupervisorSpec) => {
+      if (finalProbeFailure.start.mock.calls.length === 0) return observation(spec, "absent");
+      if (vi.mocked(finalProbeFailure.seams.fetch).mock.calls.some(([url]) => String(url).endsWith("/stats/pool"))) {
+        throw new Error("post-admission probe failed");
+      }
+      return observation(spec, "registered-running-valid", { managerPid: 4242 });
+    });
     writeFileSync(finalProbeFailure.tokenPath, "managed-token", { mode: 0o600 });
     await expect(ensureDaemon(optionsFor(finalProbeFailure, {
       _skipHealthWait: false,
-      _monotonicNowOverride: () => 0,
     }))).resolves.toMatchObject({ refusalReason: "ambiguous", spawned: true, pid: 4242 });
 
     const identityRace = createFixture({
       isAlive: () => true,
       fetch: sequenceFetch([new Error("pre-start offline"), healthy(4242), healthy(4242), response({}, 200)]),
     });
-    identityRace.probe
-      .mockImplementationOnce(async (spec: SupervisorSpec) => observation(spec, "absent"))
-      .mockImplementationOnce(async (spec: SupervisorSpec) => observation(spec, "registered-running-valid", { managerPid: 4242 }))
-      .mockImplementationOnce(async (spec: SupervisorSpec) => observation(spec, "registered-running-valid", { managerPid: 4242, scopeDigest: "foreign-after-auth" }));
+    identityRace.probe.mockImplementation(async (spec: SupervisorSpec) => {
+      if (identityRace.start.mock.calls.length === 0) return observation(spec, "absent");
+      const afterPool = vi.mocked(identityRace.seams.fetch).mock.calls.some(([url]) => String(url).endsWith("/stats/pool"));
+      return observation(spec, "registered-running-valid", {
+        managerPid: 4242, ...(afterPool ? { scopeDigest: "foreign-after-auth" } : {}),
+      });
+    });
     writeFileSync(identityRace.tokenPath, "managed-token", { mode: 0o600 });
     await expect(ensureDaemon(optionsFor(identityRace, {
       _skipHealthWait: false,
-      _monotonicNowOverride: () => 0,
     }))).resolves.toMatchObject({ refusalReason: "ambiguous", spawned: true, pid: 4242 });
+
+    for (const fixture of [finalProbeFailure, identityRace]) {
+      expect(fixture.start).toHaveBeenCalledOnce();
+      expect(fixture.seams.fetch).toHaveBeenCalledTimes(4);
+      expect(vi.mocked(fixture.seams.fetch).mock.calls[3]![0]).toBe(`http://127.0.0.1:${fixture.port}/stats/pool`);
+      expect(fixture.now()).toBe(0);
+      const admittedSpec = fixture.probe.mock.calls[0]![0] as SupervisorSpec;
+      expect(fixture.probe.mock.calls.every(([spec, operation]) => spec.nonce === admittedSpec.nonce
+        && spec.scopeDigest === admittedSpec.scopeDigest && operation.deadline === 100)).toBe(true);
+    }
 
     const rejectedAdmission = createFixture({
       isAlive: () => true,
@@ -3137,7 +3166,6 @@ describe("issue 400 managed start, cleanup, deadline, and process seams", () => 
     writeFileSync(cleanupFailure.tokenPath, "managed-token", { mode: 0o600 });
     await expect(ensureDaemon(optionsFor(cleanupFailure, {
       _skipHealthWait: false,
-      _monotonicNowOverride: () => 0,
     }))).resolves.toMatchObject({
       refusalReason: "startup-failure",
       spawned: true,
@@ -3234,17 +3262,18 @@ describe("issue 400 managed start, cleanup, deadline, and process seams", () => 
     });
     setRunningProbe(preAborted);
     writeFileSync(preAborted.tokenPath, "pre-abort-token", { mode: 0o600 });
-    const preAbortSignal = {
-      get aborted(): boolean {
-        return (new Error().stack ?? "").includes("runWithDeadline");
-      },
-      addEventListener: vi.fn(),
-      removeEventListener: vi.fn(),
-    } as unknown as AbortSignal;
-    await expect(ensureDaemon(optionsFor(preAborted, { _abortSignal: preAbortSignal }))).resolves.toMatchObject({
+    const prePoolController = new AbortController();
+    preAborted.probe.mockImplementation(async (spec: SupervisorSpec) => {
+      if (vi.mocked(preAborted.seams.fetch).mock.calls.length === 2) prePoolController.abort();
+      return observation(spec, "registered-running-valid", { managerPid: 4242 });
+    });
+    await expect(ensureDaemon(optionsFor(preAborted, { _abortSignal: prePoolController.signal }))).resolves.toMatchObject({
       connected: false,
       refusalReason: "response-auth-failure",
     });
+    expect(prePoolController.signal.aborted).toBe(true);
+    expect(preAborted.seams.fetch).toHaveBeenCalledTimes(2);
+    expect(vi.mocked(preAborted.seams.fetch).mock.calls.some(([url]) => String(url).endsWith("/stats/pool"))).toBe(false);
   });
 
   it("refuses construction failures and probe exceptions, including authorized cleanup no-ops", async () => {
@@ -3504,11 +3533,20 @@ describe("issue 400 lifecycle platform and diagnostic edge seams", () => {
     mkdirSync(join(replacement.seams.procRoot, "4343"), { recursive: true });
     writeFileSync(join(replacement.seams.procRoot, "4242", "cmdline"), "node\0lcm\0daemon\0start\0");
     writeFileSync(join(replacement.seams.procRoot, "4343", "cmdline"), "node\0lcm\0daemon\0start\0");
+    // The production SIGTERM grace uses 500ms, then one invalid replacement
+    // poll uses 300ms. Leave 50ms of that same budget for authenticated reuse.
+    const replacementTimers = vi.fn((callback: () => void, delay: number) => setTimeout(callback, delay));
     await expect(ensureDaemon(optionsFor(replacement, {
       enforceUserManagerParent: false,
       _skipSpawn: true,
+      spawnTimeoutMs: 850,
+      _setTimeoutOverride: replacementTimers,
       _listeningPortsOverride: () => [replacement.port],
     }))).resolves.toMatchObject({ connected: true, pid: 4343 });
+    expect(replacement.now()).toBe(800);
+    expect(replacement.seams.fetch).toHaveBeenCalledTimes(5);
+    expect(replacementTimers.mock.calls.every(([, delay]) => delay > 0 && delay <= 850)).toBe(true);
+    expect(replacementTimers.mock.calls.some(([, delay]) => delay === 50)).toBe(true);
 
     for (const cutoff of [4, 5, 6, 7, 8]) {
       let aliveOld = true;
