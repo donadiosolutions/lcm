@@ -8912,9 +8912,9 @@ describe("sanitizeError", () => {
       ["empty fragment name", "#=/Users/R2F/x", "#=<path>"],
       ["later empty name", "?p=1&=/Users/R2A/x", "?p=1&=<path>"],
       ["empty bracket suffix", "?key[]=/Users/R2B/x", "?key[]=<path>"],
-      ["indexed suffix", "?key[0]=C:/Users/R2I/x", "?key[0]=<path>"],
+      ["indexed suffix", "?key[0]=C:/Users/R2I/x", "?key[0]=C:<path>"],
       ["repeated suffixes", "?key[][0]=/home/R2H/x", "?key[][0]=<path>"],
-      ["two equals", "?key==\\Users\\R2W\\x", "?key==<path>"],
+      ["two equals", "?key==\\Users\\R2W\\x", "?key==\\Users\\R2W\\x"],
       ["three equals", "?key===Users/R2Q/x", "?key===Users<path>"],
       ["later bracket suffix", "?p=1&key[]=/root/R2L/x", "?p=1&key[]=<path>"],
     ] as const)("redacts a private value after %s", (_name, body, expectedBody) => {
@@ -8938,7 +8938,7 @@ describe("sanitizeError", () => {
       ["comma named", "?p=1,key=home/R2C/x", "?p=1,key=home<path>"],
       ["pipe named", "?p=1|key=root/R2P/x", "?p=1|key=root<path>"],
       ["fragment semicolon", "#p=1;key=Users/R2G/x", "#p=1;key=Users<path>"],
-      ["semicolon unnamed", "?p=1;\\Users\\R2W\\x", "?p=1;<path>"],
+      ["semicolon unnamed", "?p=1;\\Users\\R2W\\x", "?p=1;\\Users\\R2W\\x"],
       ["comma empty name", "?p=1,=/Users/R2N/x", "?p=1,=<path>"],
       ["pipe bracket name", "?p=1|key[]=/Users/R2K/x", "?p=1|key[]=<path>"],
     ] as const)("redacts a private value after a nested URL %s component", (_name, body, expectedBody) => {
@@ -8999,12 +8999,64 @@ describe("sanitizeError", () => {
       const input = inheritedPublicInput(
         "?key=/Users/R2PRIV/x&other=/public/R2PUB/x",
       );
-      const first = inheritedPublicExpected(
-        "?key=<path>&other=/public/R2PUB/x",
-      );
       const fixedPoint = inheritedPublicExpected("?key=<path>&other=<path>");
 
-      expectThreePasses(input, [first, fixedPoint, fixedPoint]);
+      expectThreePasses(input, fixedPoint);
+    });
+
+    it.each([
+      ["empty segment", "?key=/Users//R3EMPTY/x", "?key=<path>"],
+      ["repeated empty segments", "?key=/home///R3HOME/x", "?key=<path>"],
+      ["root empty segment", "#key=/root//R3ROOT", "#key=<path>"],
+      ["mixed separator run", "?key=/Users\\/R3MIX/x", "?key=<path>"],
+      ["dot then empty segment", "?key=/.//Users/R3DOT/x", "?key=<path>"],
+      ["encoded dot then empty segment", "?key=/%2e//Users/R3EDOT/x", "?key=<path>"],
+      ["empty segment after private root", "?key=/Users%2F/R3SEP/x", "?key=<path>"],
+      ["encoded leading separator", "?key=/%2f/Users/R3LEAD/x", "?key=<path>"],
+      ["double encoded separator", "?key=/Users%252FR3DOUBLE/x", "?key=<path>"],
+      ["double encoded dot", "?key=/%252e/Users/R3DDOT/x", "?key=<path>"],
+      ["nested quoted index", "?key['a']=/Users/R3QUOTE/x", "?key['a']=<path>"],
+      ["nested double quoted index", "?key[\"a\"]=/Users/R3DQUOTE/x", "?key[\"a\"]=<path>"],
+      ["nested bracket index", "?key[a[b]]=/Users/R3NEST/x", "?key[a[b]]=<path>"],
+      ["double bracket index", "?key[[0]]=/Users/R3DBRACKET/x", "?key[[0]]=<path>"],
+      ["slash index", "?key[a/b]=/Users/R3SLASH/x", "?key[a/b]=<path>"],
+      ["equals index", "?key[a=b]=/Users/R3EQUAL/x", "?key[a=b]=<path>"],
+      ["zero width value prefix", "?key=\u200b/Users/R3ZW/x", "?key=\u200b<path>"],
+      ["zero width relative prefix", "?key=\u200bUsers/R3ZWREL/x", "?key=\u200bUsers/R3ZWREL/x"],
+      ["public rooted value", "?key=/public/R3PUBLIC/x", "?key=<path>"],
+      ["public drive value", "?key=C:/public/R3DRIVE/x", "?key=C:<path>"],
+    ] as const)("applies plain-text classification to %s", (_name, body, expectedBody) => {
+      expectThreePasses(inheritedPublicInput(body), inheritedPublicExpected(expectedBody));
+    });
+
+    it.each([
+      ["encoded separator relative", "?key=Users%2FR3REL/x"],
+      ["encoded letter relative", "?key=Us%65rs/R3EREL/x"],
+      ["encoded first letter relative", "?key=%55sers/R3FREL/x"],
+      ["double encoded fully relative", "?key=%252FUsers%252FR3FULL"],
+      ["literal relative without a value", "?key=Users/"],
+    ] as const)("preserves the out-of-scope %s", (_name, body) => {
+      expectThreePasses(inheritedPublicInput(body), inheritedPublicExpected(body));
+    });
+
+    it("pins row 3 at the merged first-pass fixed point", () => {
+      const input =
+        "file://h?x=[file:///Users/CHILD/x|later\\/home/alice/s" +
+        "([https://other?key=/Users/K/x]";
+      const expected = "file://h?x=[file://<path>|later\\<path>?key=<path>]";
+
+      expectThreePasses(input, expected);
+    });
+
+    it("ends plain-text query ownership at the nested URL close", () => {
+      const input =
+        quotedPrefix +
+        "[file:///b&[https://o?key=public]];Users/R3TAIL/x]";
+      const expected =
+        redactedQuotedPrefix +
+        "[file://<path>&[https://o?key=public]];Users/R3TAIL/x]";
+
+      expectThreePasses(input, expected);
     });
 
     it.each([
@@ -9034,7 +9086,7 @@ describe("sanitizeError", () => {
       [
         "zero width inside private path",
         inheritedPublicInput("?key=/Users\u200b/R2ZW/x"),
-        inheritedPublicExpected("?key=/Users\u200b/R2ZW/x"),
+        inheritedPublicExpected("?key=<path>"),
       ],
       [
         "private-looking public URL path",
@@ -9044,42 +9096,42 @@ describe("sanitizeError", () => {
       [
         "optional colon spelling",
         inheritedPublicInput("?key:/Users/R2COLON/x"),
-        inheritedPublicExpected("?key:/Users/R2COLON/x"),
+        inheritedPublicExpected("?key:<path>"),
       ],
       [
         "unterminated bracket name",
         inheritedPublicInput("?key[0=/Users/R2BADINDEX/x"),
-        inheritedPublicExpected("?key[0=/Users/R2BADINDEX/x"),
+        inheritedPublicExpected("?key[0=<path>"),
       ],
       [
         "invalid first percent nibble",
         inheritedPublicInput("?key=/Us%G5rs/R2BADHEX1/x"),
-        inheritedPublicExpected("?key=/Us%G5rs/R2BADHEX1/x"),
+        inheritedPublicExpected("?key=<path>"),
       ],
       [
         "invalid second percent nibble",
         inheritedPublicInput("?key=/Us%6Grs/R2BADHEX2/x"),
-        inheritedPublicExpected("?key=/Us%6Grs/R2BADHEX2/x"),
+        inheritedPublicExpected("?key=<path>"),
       ],
       [
         "trailing percent",
         inheritedPublicInput("?key=/Users%"),
-        inheritedPublicExpected("?key=/Users%"),
+        inheritedPublicExpected("?key=<path>"),
       ],
       [
         "truncated percent escape",
         inheritedPublicInput("?key=/Users%6"),
-        inheritedPublicExpected("?key=/Users%6"),
+        inheritedPublicExpected("?key=<path>"),
       ],
       [
         "dot that is not a segment",
         inheritedPublicInput("?key=/.Users/R2DOTWORD/x"),
-        inheritedPublicExpected("?key=/.Users/R2DOTWORD/x"),
+        inheritedPublicExpected("?key=<path>"),
       ],
       [
         "private root without a separator",
         inheritedPublicInput("?key=/Users"),
-        inheritedPublicExpected("?key=/Users"),
+        inheritedPublicExpected("?key=<path>"),
       ],
       [
         "root separator without a value",
@@ -9089,7 +9141,7 @@ describe("sanitizeError", () => {
       [
         "encoded separator without a following path word",
         inheritedPublicInput("?key=/Users%2F/x"),
-        inheritedPublicExpected("?key=/Users%2F/x"),
+        inheritedPublicExpected("?key=<path>"),
       ],
       [
         "alternate delimiter forward drive spelling",
@@ -9149,9 +9201,9 @@ describe("sanitizeError", () => {
 
     it.each([
       ["POSIX root", "/home/alice/x", "<path>"],
-      ["rooted Windows path", "\\Users\\ALICE\\x", "<path>"],
+      ["rooted Windows path", "\\Users\\ALICE\\x", "\\Users\\ALICE\\x"],
       ["backslash drive", "C:\\Users\\ALICE\\x", "<path>"],
-      ["forward-slash drive", "C:/Users/ALICE/x", "<path>"],
+      ["forward-slash drive", "C:/Users/ALICE/x", "C:<path>"],
       ["UNC path", "\\\\server\\share\\x", "<path>"],
       ["private-root relative path", "Users/ALICE/x", "Users<path>"],
     ] as const)("redacts an inherited public query %s", (_name, value, redacted) => {
@@ -9184,7 +9236,7 @@ describe("sanitizeError", () => {
         "a public rooted value",
         quotedPrefix + "[file:///b&[https://o?key=/public/path]]",
         "file://h?x=['https://outer.test/x?next=file://<path>'|" +
-          "[file://<path>&[https://o?key=/public/path]]",
+          "[file://<path>&[https://o?key=<path>]]",
       ],
       [
         "a public relative value",

@@ -694,88 +694,15 @@ function findUrlPathStarts(chars: readonly string[]): UrlPathStarts {
     while (isPathWord(chars[cursor])) cursor += 1;
     return chars[cursor] === "=" ? cursor + 1 : -1;
   };
-  const inheritedPublicQueryValueStart = (start: number): number => {
+  const inheritedPublicQueryPrivateRelativePathStart = (start: number): number => {
+    if (!"?#&;,|=".includes(chars[start - 1]!)) return -1;
     let cursor = start;
     while (isPathWord(chars[cursor])) cursor += 1;
-    while (chars[cursor] === "[") {
-      cursor += 1;
-      while (isPathWord(chars[cursor])) cursor += 1;
-      if (chars[cursor] !== "]") return start;
-      cursor += 1;
-    }
-    if (chars[cursor] !== "=") return start;
-    while (chars[cursor] === "=") cursor += 1;
-    return cursor;
-  };
-  const inheritedPublicQueryComparisonSegment = (
-    start: number,
-  ): { value: string; next: number; hasDelimiter: boolean } => {
-    let cursor = start;
-    let value = "";
-    let delimiterLength = 0;
-    while (chars[cursor] !== undefined) {
-      const char = chars[cursor];
-      if (char === "/" || char === "\\") {
-        delimiterLength = 1;
-        break;
-      }
-      const encoded = chars.slice(cursor + 1, cursor + 3).join("");
-      if (char === "%" && /^[\dA-Fa-f]{2}$/u.test(encoded)) {
-        const decoded = String.fromCharCode(
-          Number.parseInt(encoded, 16),
-        );
-        if (decoded === "/" || decoded === "\\") {
-          delimiterLength = 3;
-          break;
-        }
-        value += decoded;
-        cursor += 3;
-        continue;
-      }
-      value += char;
-      cursor += 1;
-    }
-    return {
-      value: value.toLowerCase(),
-      next: cursor + delimiterLength,
-      hasDelimiter: delimiterLength > 0,
-    };
-  };
-  const inheritedPublicQueryStartsPrivateRoot = (start: number): boolean => {
-    let segment = inheritedPublicQueryComparisonSegment(start);
-    while (segment.value === "." && segment.hasDelimiter) {
-      segment = inheritedPublicQueryComparisonSegment(segment.next);
-    }
-    return (
-      (segment.value === "users" ||
-        segment.value === "home" ||
-        segment.value === "root") &&
-      segment.hasDelimiter &&
-      isPathWord(chars[segment.next])
-    );
-  };
-  const inheritedPublicQueryPrivatePathStart = (delimiterIndex: number): number => {
-    const valueStart = inheritedPublicQueryValueStart(delimiterIndex + 1);
-    if (
-      (chars[delimiterIndex] === ";" ||
-        chars[delimiterIndex] === "," ||
-        chars[delimiterIndex] === "|") &&
-      isForwardSlashDrivePathStart(valueStart)
-    ) {
-      return -1;
-    }
-    if (
-      isWindowsDrivePathStart(chars, valueStart) ||
-      isForwardSlashDrivePathStart(valueStart) ||
-      isUncPathStart(chars, valueStart)
-    ) {
-      return valueStart;
-    }
-    if (chars[valueStart] === "/" || chars[valueStart] === "\\") {
-      const rootStart = skipSeparatorRun(valueStart);
-      return inheritedPublicQueryStartsPrivateRoot(rootStart) ? valueStart : -1;
-    }
-    return returnedParentPrivateRootPathStart(valueStart);
+    const root = chars.slice(start, cursor).join("").toLowerCase();
+    if (root !== "users" && root !== "home" && root !== "root") return -1;
+    if (chars[cursor] !== "/" && chars[cursor] !== "\\") return -1;
+    const valueStart = skipSeparatorRun(cursor);
+    return isPathWord(chars[valueStart]) ? cursor : -1;
   };
   const bridgedRootedPathStart = (start: number): number => {
     if (chars[start] !== "/") return -1;
@@ -910,6 +837,7 @@ function findUrlPathStarts(chars: readonly string[]): UrlPathStarts {
   let slashPrefixedNestedPublicSchemeStart = -1;
   let quotedQueryPublicUrl = false;
   let quotedQueryPublicUrlOwnQueryOrFragment = false;
+  let inheritedPublicPlainTextRegionActive = false;
   let backslashSlashClaimActive = false;
   let activeNestedFileSchemeStart = -1;
 
@@ -949,6 +877,7 @@ function findUrlPathStarts(chars: readonly string[]): UrlPathStarts {
       inheritedQuoteTailWrapperDepths.clear();
       inheritedPublicQueryOwnerWrapperDepths.clear();
       activeChildTailWrapperDepths.clear();
+      inheritedPublicPlainTextRegionActive = false;
       activeNestedFileUrlParentOwnerBracketDepth = 0;
       queryOrFragment = false;
       nestedPublicUrlBracketDepth = 0;
@@ -1069,6 +998,9 @@ function findUrlPathStarts(chars: readonly string[]): UrlPathStarts {
       restartedNestedFileUrlParentOwnerBracketDepths.delete(closingPathlessFileQueryOwnerDepth);
       inheritedQuoteTailWrapperDepths.delete(closingPathlessFileQueryOwnerDepth);
       inheritedPublicQueryOwnerWrapperDepths.delete(closingPathlessFileQueryOwnerDepth);
+      if (inheritedPublicQueryOwnerWrapperDepths.size === 0) {
+        inheritedPublicPlainTextRegionActive = false;
+      }
       activeChildTailWrapperDepths.delete(closingPathlessFileQueryOwnerDepth);
       if (closingPathlessFileQueryOwnerDepth === activeNestedFileUrlParentOwnerBracketDepth) {
         activeNestedFileUrlParentOwnerBracketDepth = 0;
@@ -1335,22 +1267,13 @@ function findUrlPathStarts(chars: readonly string[]): UrlPathStarts {
     } else if (restartedPathlessFile && char === "[") {
       fileTailBracketDepth = 1;
     }
-    if (
-      separator >= 0 &&
-      (char === "?" ||
-        char === "#" ||
-        char === "&" ||
-        char === ";" ||
-        char === "," ||
-        char === "|") &&
+    const inheritedPublicQueryUsesPlainText =
       inheritedPublicQueryOwnerWrapperDepths.size > 0 &&
-      pathlessNestedPublicUrlActive
-    ) {
-      // Public URL query values remain public by default. An explicitly
-      // inherited wrapper owner only adds a mark for recognized private
-      // filesystem forms; it never changes the public URL classification.
-      const privatePathStart = inheritedPublicQueryPrivatePathStart(index);
-      if (privatePathStart >= 0) forcedPath[privatePathStart] = 1;
+      inheritedPublicPlainTextRegionActive &&
+      (queryOrFragment || separator < 0);
+    if (inheritedPublicQueryUsesPlainText) {
+      const privateRelativePathStart = inheritedPublicQueryPrivateRelativePathStart(index);
+      if (privateRelativePathStart >= 0) forcedPath[privateRelativePathStart] = 1;
     }
     if (separator >= 0 && (char === "?" || char === "#")) {
       const startsQuotedQueryTail =
@@ -1361,6 +1284,12 @@ function findUrlPathStarts(chars: readonly string[]): UrlPathStarts {
 
       queryOrFragment = true;
       queryOrFragmentStart = index;
+      if (
+        inheritedPublicQueryOwnerWrapperDepths.size > 0 &&
+        pathlessNestedPublicUrlActive
+      ) {
+        inheritedPublicPlainTextRegionActive = true;
+      }
       if (quotedQueryPublicUrl) quotedQueryPublicUrlOwnQueryOrFragment = true;
       if (slashPrefixedNestedPublicSchemeStart >= 0) {
         // Retain observable public URL syntax instead of reconstructing
@@ -1923,6 +1852,25 @@ function findUrlPathStarts(chars: readonly string[]): UrlPathStarts {
       slashPrefixedNestedPublicSchemeStart = -1;
       quotedQueryPublicUrl = false;
       quotedQueryPublicUrlOwnQueryOrFragment = false;
+      if (char === "]") inheritedPublicPlainTextRegionActive = false;
+      continue;
+    }
+    if (
+      inheritedPublicQueryUsesPlainText &&
+      queryOrFragment &&
+      isUrlSchemeColon(chars, index, queryOrFragmentStart + 1)
+    ) {
+      separator = index;
+      exactFileScheme = false;
+      foundFilePath = false;
+      filePathBracketDepth = 0;
+      schemeLength = 0;
+      fileSchemeLength = 0;
+      schemeQuote = 0;
+      queryOrFragment = false;
+      queryOrFragmentStart = -1;
+      authority[index + 1] = 1;
+      authority[index + 2] = 1;
       continue;
     }
     if (separator >= 0) {
@@ -1993,7 +1941,9 @@ function findUrlPathStarts(chars: readonly string[]): UrlPathStarts {
           continue;
         }
       }
-      if (char === "/" && !quotedPathEnded) authority[index] = 1;
+      if (char === "/" && !quotedPathEnded && !inheritedPublicQueryUsesPlainText) {
+        authority[index] = 1;
+      }
       if (
         exactFileScheme &&
         // After an outer path, only a backslash in its query or

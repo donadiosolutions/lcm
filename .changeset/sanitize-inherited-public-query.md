@@ -2,6 +2,6 @@
 "@donadiosolutions/lcm": patch
 ---
 
-Redact private filesystem values across indexed, encoded, and alternate-delimiter
-nested URL query spellings when a bracketed file query explicitly inherits
-ownership across an immediate quoted handoff.
+Treat a nested link's query and fragment as ordinary message text when a
+bracketed file query explicitly inherits ownership across a quoted handoff,
+redacting rooted filesystem paths without depending on parameter spelling.
