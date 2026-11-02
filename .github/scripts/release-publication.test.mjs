@@ -223,7 +223,7 @@ test("requires a canonical release version before running npm", () => {
     );
   }
 });
-+
+
 test("CLI uses the staged-upload shortcut only for the exact staged E409", () => {
   const script = fileURLToPath(new URL("./publish-npm-tarball.mjs", import.meta.url));
   const root = mkdtempSync(join(tmpdir(), "lcm-release-cli-"));
