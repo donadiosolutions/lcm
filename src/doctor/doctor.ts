@@ -51,8 +51,12 @@ import {
   type ResolvedStorageConfig,
 } from "../daemon/config.js";
 import {
+  describeDaemonObservationFailure,
+  isDaemonObservationFailure,
   parseDaemonObservation,
   type DaemonObservation,
+  type DaemonObservationFailure,
+  type DaemonObservationMismatchField,
 } from "../daemon/client.js";
 import {
   assertBackendPublicationConfigReadAccess,
@@ -176,24 +180,47 @@ async function readDaemonObservation(
   port: number,
   token: string | null,
   timeoutMs = DAEMON_OBSERVATION_DEADLINE_MS,
-): Promise<DaemonObservation | null> {
-  if (token === null) return null;
+): Promise<DaemonObservation | DaemonObservationFailure> {
+  if (token === null) return { reason: "token-missing" };
   const controller = new AbortController();
+  // The deadline is absolute; which stage it interrupted decides the class.
+  let responseStarted = false;
+  const deadlineFailure = (): DaemonObservationFailure => ({
+    reason: responseStarted ? "body-timeout" : "headers-timeout",
+  });
   let timeout!: ReturnType<typeof setTimeout>;
-  const deadline = new Promise<never>((_, reject) => {
+  const deadline = new Promise<DaemonObservationFailure>((resolve) => {
     timeout = setTimeout(() => {
       controller.abort();
-      reject(new Error("Daemon identity observation timed out"));
+      resolve(deadlineFailure());
     }, timeoutMs);
   });
   try {
     return await Promise.race([
-      (async () => {
-        const res = await fetchFn(`http://127.0.0.1:${port}/health/observe`, {
-          headers: { Authorization: `Bearer ${token}` },
-          signal: controller.signal,
-        });
-        return parseDaemonObservation(res.status, await res.json());
+      (async (): Promise<DaemonObservation | DaemonObservationFailure> => {
+        let res: Response;
+        try {
+          res = await fetchFn(`http://127.0.0.1:${port}/health/observe`, {
+            headers: { Authorization: `Bearer ${token}` },
+            signal: controller.signal,
+          });
+        } catch {
+          return controller.signal.aborted ? deadlineFailure() : { reason: "connect-failed" };
+        }
+        responseStarted = true;
+        if (res.status !== 200) {
+          // The body is not read: release the owned request so no response
+          // work outlives this diagnostic.
+          controller.abort();
+          return { reason: "http-status", statusCode: res.status };
+        }
+        let body: unknown;
+        try {
+          body = await res.json();
+        } catch {
+          return controller.signal.aborted ? deadlineFailure() : { reason: "body-invalid" };
+        }
+        return parseDaemonObservation(res.status, body) ?? { reason: "invalid-identity" };
       })(),
       deadline,
     ]);
@@ -213,7 +240,7 @@ function readDoctorDaemonToken(deps: DoctorDeps): string | null {
 async function readDoctorAuthenticatedObservation(
   deps: DoctorDeps,
   port: number,
-): Promise<DaemonObservation | null> {
+): Promise<DaemonObservation | DaemonObservationFailure> {
   return readDaemonObservation(
     deps.fetch,
     port,
@@ -222,47 +249,75 @@ async function readDoctorAuthenticatedObservation(
 }
 
 type ExpectedDaemonIdentity = Readonly<{
-  pid: number;
   version: string;
   storageBackend: "sqlite" | "postgresql";
   entrypoint: string;
   runtimeDigest: string;
 }>;
 
-function daemonObservationMatchesIdentity(
+/** The observed PID is the verified daemon's own, so it is never compared. */
+function daemonObservationMismatchFields(
   observation: DaemonObservation,
   identity: ExpectedDaemonIdentity,
   platform: NodeJS.Platform,
-): boolean {
-  return observation.pid === identity.pid
-    && observation.version === identity.version
-    && observation.storageBackend === identity.storageBackend
-    && daemonEntrypointMatches(observation.entrypoint, identity.entrypoint, platform)
-    && observation.runtimeDigest === identity.runtimeDigest;
+): DaemonObservationMismatchField[] {
+  const fields: DaemonObservationMismatchField[] = [];
+  if (observation.version !== identity.version) fields.push("version");
+  if (observation.storageBackend !== identity.storageBackend) fields.push("storageBackend");
+  if (!daemonEntrypointMatches(observation.entrypoint, identity.entrypoint, platform)) fields.push("entrypoint");
+  if (observation.runtimeDigest !== identity.runtimeDigest) fields.push("runtimeDigest");
+  return fields;
+}
+
+function verifyDaemonObservation(
+  observed: DaemonObservation | DaemonObservationFailure,
+  identity: ExpectedDaemonIdentity | undefined,
+  platform: NodeJS.Platform,
+): DaemonObservation | DaemonObservationFailure {
+  if (isDaemonObservationFailure(observed)) return observed;
+  if (identity === undefined) return { reason: "local-identity-unavailable" };
+  const fields = daemonObservationMismatchFields(observed, identity, platform);
+  return fields.length === 0 ? observed : { reason: "identity-mismatch", fields };
+}
+
+function daemonObservationFailureMessage(failure: DaemonObservationFailure): string {
+  const prefix = `Daemon observation failed: ${describeDaemonObservationFailure(failure)}.`;
+  switch (failure.reason) {
+    case "connect-failed":
+    case "headers-timeout":
+    case "body-timeout":
+    case "body-invalid":
+      return `${prefix} ${mapDaemonRefusalToRemediation("ambiguous").message}`;
+    case "http-status":
+      return failure.statusCode === 401 || failure.statusCode === 403
+        ? `${prefix} ${mapDaemonRefusalToRemediation("response-auth-failure").message}`
+        : `${prefix} Run: lcm daemon restart`;
+    case "local-identity-unavailable":
+      return `${prefix} Reinstall LCM, then run: lcm doctor`;
+    default:
+      return `${prefix} Run: lcm daemon restart`;
+  }
 }
 
 /**
- * Build the identity doctor requires from token-authenticated observation.
- * The PID comes from the observation; every remaining field is the identity
- * this installation expects. Active storage readiness is not probed. Peer
- * metadata cannot supply a missing local version or runtime digest.
+ * Build the identity doctor requires from token-authenticated observation:
+ * the identity this installation expects. Active storage readiness is not
+ * probed. Peer metadata cannot supply a missing local version or runtime
+ * digest.
  */
 function expectedDaemonIdentity(
-  observedPid: number | undefined,
   config: DoctorConfig,
   expectedVersion: string | undefined,
   expectedEntrypoint: string,
   expectedRuntimeDigest: string | undefined,
 ): ExpectedDaemonIdentity | undefined {
   if (
-    observedPid === undefined
-    || expectedVersion === undefined
+    expectedVersion === undefined
     || expectedVersion.trim() === ""
-    || expectedRuntimeDigest === undefined
+    || !expectedRuntimeDigest
     || (config.storageBackend !== "sqlite" && config.storageBackend !== "postgresql")
   ) return undefined;
   return {
-    pid: observedPid,
     version: expectedVersion,
     storageBackend: config.storageBackend,
     entrypoint: expectedEntrypoint,
@@ -816,24 +871,19 @@ export async function runDoctor(overrides?: Partial<DoctorDeps>, doctorOptions: 
     if (repairBlocked) {
       results.push({ name: "daemon", category: "Daemon", status: "skip", message: repairSkipMessage });
     } else {
-      try {
-        const observation = await readDoctorAuthenticatedObservation(deps, config.port);
-        const identity = expectedDaemonIdentity(
-          observation?.pid, config, pkgVersion, runtimePath, expectedRuntimeDigest,
-        );
-        if (observation !== null && identity !== undefined
-          && daemonObservationMatchesIdentity(observation, identity, deps.platform)) {
-          daemonIdentityVerified = true;
-          daemonPid = observation.pid;
-          results.push({ name: "daemon", category: "Daemon", status: "pass",
-            message: "Authenticated daemon version and runtime identity verified; active storage readiness was not probed" });
-        } else {
-          results.push({ name: "daemon", category: "Daemon", status: "fail",
-            message: "Daemon observation or installed runtime identity could not be authenticated. Run: lcm daemon restart" });
-        }
-      } catch {
+      const verified = verifyDaemonObservation(
+        await readDoctorAuthenticatedObservation(deps, config.port),
+        expectedDaemonIdentity(config, pkgVersion, runtimePath, expectedRuntimeDigest),
+        deps.platform,
+      );
+      if (isDaemonObservationFailure(verified)) {
         results.push({ name: "daemon", category: "Daemon", status: "fail",
-          message: `Daemon observation is unavailable or timed out. ${mapDaemonRefusalToRemediation("ambiguous").message}` });
+          message: daemonObservationFailureMessage(verified) });
+      } else {
+        daemonIdentityVerified = true;
+        daemonPid = verified.pid;
+        results.push({ name: "daemon", category: "Daemon", status: "pass",
+          message: "Authenticated daemon version and runtime identity verified; active storage readiness was not probed" });
       }
     }
 

@@ -20,7 +20,8 @@ vi.mock("../../src/daemon/version.js", async importOriginal => ({
   RUNTIME_DIGEST: "runtime",
 }));
 
-vi.mock("../../src/daemon/client.js", () => ({
+vi.mock("../../src/daemon/client.js", async importOriginal => ({
+  ...(await importOriginal<typeof import("../../src/daemon/client.js")>()),
   DaemonClient: class {
     async health() {
       state.afterHealth?.();
@@ -40,6 +41,10 @@ vi.mock("../../src/daemon/client.js", () => ({
         version: "test", storageBackend: state.backend, entrypoint: "/opt/lcm/lcm.mjs",
         runtimeDigest: "runtime", pid: 42, uptime: 0, daemonInstanceId: "generation",
       };
+    }
+
+    async observeClassified() {
+      return await this.observe();
     }
 
     async post(path: string) {

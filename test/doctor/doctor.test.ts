@@ -1193,7 +1193,7 @@ describe("runDoctor configuration validation", () => {
     process.env.LCM_POSTGRES_URL = "postgresql://user:password@db.example/lcm";
     process.env.LCM_POSTGRES_CA_FILE = caFile;
     process.env.LCM_POSTGRES_MIGRATION_ROLE = "lcm_test_migrator";
-    const fetch = vi.fn();
+    const fetch = vi.fn().mockRejectedValue(new TypeError("fetch failed"));
     try {
       for (const provider of ["auto", "openai"] as const) {
         const results = await runDoctor(minimalDeps({
@@ -1215,7 +1215,7 @@ describe("runDoctor configuration validation", () => {
         expect(configResult, configResult?.message).toMatchObject({ status: "pass" });
         expect(results.find((result) => result.name === "stack")?.message).toContain("Storage: postgresql");
         expect(results.find((result) => result.name === "daemon")).toMatchObject({ status: "fail" });
-        expect(results.find((result) => result.name === "daemon")?.message).toContain("unavailable");
+        expect(results.find((result) => result.name === "daemon")?.message).toContain("connection to the daemon failed");
       }
       expect(fetch).toHaveBeenCalledTimes(2);
       expect(ensureDaemon).not.toHaveBeenCalled();
@@ -1692,16 +1692,126 @@ describe("doctor authenticated daemon identity", () => {
 
   it.each([404, 503, 201])("refuses HTTP %i without retrying active health", async status => {
     const deps = authenticatedDeps(healthy);
-    deps.fetch = vi.fn().mockResolvedValue({ ok: status < 300, status, json: async () =>
+    const json = vi.fn(async () =>
       status === 503 ? { ...healthy, status: "unavailable", storageBackend: "postgresql",
-        storage: { status: "unavailable", error: { code: "STORAGE_INITIALIZATION_FAILED", backend: "postgresql", domain: "factory", operation: "health" } } } : healthy });
+        storage: { status: "unavailable", error: { code: "STORAGE_INITIALIZATION_FAILED", backend: "postgresql", domain: "factory", operation: "health" } } } : healthy);
+    deps.fetch = vi.fn().mockResolvedValue({ ok: status < 300, status, json });
     const results = await runDoctor(deps);
-    expect(results.find(result => result.name === "daemon")?.status).toBe("fail");
+    expect(results.find(result => result.name === "daemon")).toMatchObject({
+      status: "fail",
+      message: `Daemon observation failed: the daemon answered with HTTP ${status}. Run: lcm daemon restart`,
+    });
+    expect(json).not.toHaveBeenCalled();
     expect(deps.fetch).toHaveBeenCalledExactlyOnceWith("http://127.0.0.1:3737/health/observe", {
       headers: { Authorization: "Bearer doctor-token" }, signal: expect.any(AbortSignal),
     });
     expect(ensureDaemon).not.toHaveBeenCalled();
     expect(restartDaemon).not.toHaveBeenCalled();
+  });
+
+  it.each([401, 403])("reports HTTP %i as a token mismatch without reading its non-JSON body", async status => {
+    const deps = authenticatedDeps(healthy);
+    const json = vi.fn(async () => { throw new SyntaxError("Unexpected token < in PRIVATE_BODY"); });
+    let signal: AbortSignal | undefined;
+    deps.fetch = vi.fn().mockImplementation((_url, options) => {
+      signal = options.signal;
+      return Promise.resolve({ ok: false, status, json });
+    });
+    const message = (await runDoctor(deps)).find(result => result.name === "daemon")?.message;
+    expect(message).toBe(
+      `Daemon observation failed: the daemon answered with HTTP ${status}. lcm daemon unavailable (response-auth-failure); run 'lcm daemon restart' or 'lcm doctor'.`,
+    );
+    expect(json).not.toHaveBeenCalled();
+    expect(signal?.aborted).toBe(true);
+  });
+
+  it("cancels an unread non-200 response by aborting the owned request", async () => {
+    const deps = authenticatedDeps(healthy);
+    let cancelled = false;
+    deps.fetch = vi.fn().mockImplementation((_url, options) => new Promise(resolve => {
+      const response = { ok: false, status: 503, json: vi.fn() };
+      options.signal.addEventListener("abort", () => { cancelled = true; });
+      resolve(response);
+    }));
+    await runDoctor(deps);
+    expect(cancelled).toBe(true);
+  });
+
+  it("distinguishes a refused connection and never echoes the transport error", async () => {
+    const deps = authenticatedDeps(healthy);
+    deps.fetch = vi.fn().mockRejectedValue(Object.assign(new TypeError("fetch failed PRIVATE_CANARY"), {
+      cause: Object.assign(new Error("connect ECONNREFUSED 127.0.0.1:3737"), { code: "ECONNREFUSED" }),
+    }));
+    const message = (await runDoctor(deps)).find(result => result.name === "daemon")?.message;
+    expect(message).toBe(
+      "Daemon observation failed: the connection to the daemon failed. lcm daemon unavailable (ambiguous); run 'lcm daemon restart' or 'lcm doctor'.",
+    );
+    expect(message).not.toMatch(/PRIVATE_CANARY|ECONNREFUSED/u);
+  });
+
+  it("reports a missing token without contacting the daemon", async () => {
+    const deps = authenticatedDeps(healthy);
+    const read = deps.readFileSync;
+    deps.readFileSync = path => { if (path.endsWith("daemon.token")) throw new Error("missing"); return read(path, "utf8"); };
+    const message = (await runDoctor(deps)).find(result => result.name === "daemon")?.message;
+    expect(message).toBe("Daemon observation failed: the daemon token is missing or empty. Run: lcm daemon restart");
+    expect(deps.fetch).not.toHaveBeenCalled();
+  });
+
+  it("reports a 200 whose body is not JSON as an invalid body", async () => {
+    const deps = authenticatedDeps(healthy);
+    deps.fetch = vi.fn().mockResolvedValue({ ok: true, status: 200, json: async () => { throw new SyntaxError("PRIVATE_BODY"); } });
+    const message = (await runDoctor(deps)).find(result => result.name === "daemon")?.message;
+    expect(message).toContain("Daemon observation failed: the daemon response body could not be read as JSON.");
+    expect(message).toContain("run 'lcm daemon restart' or 'lcm doctor'");
+    expect(message).not.toContain("PRIVATE_BODY");
+  });
+
+  it("reports a 200 that is not an identity observation", async () => {
+    const results = await runDoctor(authenticatedDeps({ ...healthy, pid: -1 }));
+    expect(results.find(result => result.name === "daemon")?.message).toBe(
+      "Daemon observation failed: the daemon response is not a valid identity observation. Run: lcm daemon restart",
+    );
+  });
+
+  it.each([
+    [{ version: "0.4.0" }, "version"],
+    [{ storageBackend: "postgresql" }, "storageBackend"],
+    [{ entrypoint: "/private/other-runtime" }, "entrypoint"],
+    [{ runtimeDigest: "foreign-digest" }, "runtimeDigest"],
+    [{ runtimeDigest: undefined }, "runtimeDigest"],
+    [{ version: "0.4.0", runtimeDigest: "foreign-digest" }, "version, runtimeDigest"],
+  ])("names the mismatching identity fields for %j", async (override, fields) => {
+    const results = await runDoctor(authenticatedDeps({ ...healthy, ...override }));
+    expect(results.find(result => result.name === "daemon")?.message).toBe(
+      `Daemon observation failed: the daemon identity differs from this installation (${fields}). Run: lcm daemon restart`,
+    );
+  });
+
+  it("does not treat a different observed PID as a mismatch", async () => {
+    const results = await runDoctor(authenticatedDeps({ ...healthy, pid: 99_999 }));
+    expect(results.find(result => result.name === "daemon")).toMatchObject({ status: "pass", message: IDENTITY_VERIFIED_MESSAGE });
+  });
+
+  it.each(["version", "digest", "empty digest"])("reports local identity unavailable when %s is missing", async missing => {
+    const deps = authenticatedDeps(healthy);
+    const read = deps.readFileSync;
+    if (missing === "version") deps.readFileSync = path => path.endsWith("package.json") ? "{}" : read(path, "utf8");
+    else if (missing === "digest") deps._expectedRuntimeDigestForTesting = undefined;
+    else deps._expectedRuntimeDigestForTesting = "";
+    const results = await runDoctor(deps);
+    expect(results.find(result => result.name === "daemon")).toMatchObject({
+      status: "fail",
+      message: "Daemon observation failed: this installation could not determine the identity to expect. Reinstall LCM, then run: lcm doctor",
+    });
+  });
+
+  it("reports the observation failure class even when local identity is unavailable", async () => {
+    const deps = authenticatedDeps(healthy);
+    deps._expectedRuntimeDigestForTesting = undefined;
+    deps.fetch = vi.fn().mockRejectedValue(new TypeError("fetch failed"));
+    expect((await runDoctor(deps)).find(result => result.name === "daemon")?.message)
+      .toContain("the connection to the daemon failed");
   });
 
   it.each(["version", "digest"])("cannot trust peer identity when local %s is missing", async missing => {
@@ -1713,20 +1823,28 @@ describe("doctor authenticated daemon identity", () => {
     expect(results.find(r => r.name === "daemon")?.status).toBe("fail");
   });
 
-  it.each(["fetch", "body"])("bounds a stalled %s and aborts its signal", async stage => {
+  it.each([
+    ["fetch", false, "the daemon did not start responding before the deadline"],
+    ["body", false, "the daemon started responding but did not finish before the deadline"],
+    ["fetch", true, "the daemon did not start responding before the deadline"],
+    ["body", true, "the daemon started responding but did not finish before the deadline"],
+  ])("bounds a stalled %s (rejecting on abort: %s) and aborts its signal", async (stage, rejects, sentence) => {
     vi.useFakeTimers();
     const deps = authenticatedDeps(healthy);
     let signal: AbortSignal | undefined;
+    const stall = (): Promise<never> => new Promise((_resolve, reject) => {
+      if (rejects) signal!.addEventListener("abort", () => reject(new DOMException("aborted", "AbortError")));
+    });
     deps.fetch = vi.fn().mockImplementation((_url, options) => {
       signal = options.signal;
-      return stage === "fetch" ? new Promise(() => {})
-        : Promise.resolve({ ok: true, status: 200, json: () => new Promise(() => {}) });
+      return stage === "fetch" ? stall()
+        : Promise.resolve({ ok: true, status: 200, json: () => stall() });
     });
     const pending = runDoctor(deps);
     await vi.advanceTimersByTimeAsync(2000);
     const results = await pending;
     expect(signal?.aborted).toBe(true);
-    expect(results.find(r => r.name === "daemon")).toMatchObject({ status: "fail", message: expect.stringContaining("timed out") });
+    expect(results.find(r => r.name === "daemon")).toMatchObject({ status: "fail", message: expect.stringContaining(sentence) });
     const message = results.find(r => r.name === "daemon")?.message;
     expect(message).toContain("run 'lcm daemon restart' or 'lcm doctor'");
     expect(message).not.toMatch(/--detach|--foreground|\b(?:kill|pkill)\b/u);

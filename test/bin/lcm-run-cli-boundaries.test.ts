@@ -217,11 +217,14 @@ vi.mock("../../src/daemon/config.js", async importOriginal => ({
   ...(await importOriginal<typeof import("../../src/daemon/config.js")>()), loadDaemonConfig: state.loadConfig,
 }));
 vi.mock("../../src/daemon/lifecycle.js", () => ({ ensureDaemon: state.ensureDaemon, restartDaemon: state.restartDaemon }));
-vi.mock("../../src/daemon/client.js", () => ({ DaemonClient: class {
+vi.mock("../../src/daemon/client.js", async importOriginal => ({
+  ...(await importOriginal<typeof import("../../src/daemon/client.js")>()),
+  DaemonClient: class {
   post = state.post;
   get = state.get;
   health = state.health;
   observe = state.observe;
+  observeClassified = async (options?: unknown): Promise<unknown> => (await (state.observe as (o?: unknown) => Promise<unknown>)(options)) ?? { reason: "connect-failed" };
   startInvocation = state.startInvocation;
   heartbeatInvocation = state.heartbeatInvocation;
   cancelInvocation = state.cancelInvocation;

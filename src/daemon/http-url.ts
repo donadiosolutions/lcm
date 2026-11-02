@@ -93,6 +93,19 @@ export type DaemonJsonResponse<T> = {
   data: T;
 };
 
+/**
+ * Where a failed daemon exchange stopped, attached to its error as
+ * `daemonPhase`. A timeout is the existing inactivity timeout: it is a
+ * headers timeout until the response starts and a body timeout afterwards.
+ * `body-failed` covers an interrupted or unparsable body; a parse failure
+ * also carries `daemonStatusCode`.
+ */
+export type DaemonFailurePhase =
+  | "request-failed"
+  | "headers-timeout"
+  | "body-timeout"
+  | "body-failed";
+
 const DAEMON_TRANSPORT_ERROR_CODES = new Set([
   "ECONNABORTED",
   "ECONNREFUSED",
@@ -251,13 +264,16 @@ export async function daemonJsonResponse<T>(
       if (settled || response === undefined) return;
       settled = true;
       cleanup();
+      const statusCode = response.statusCode ?? 500;
       try {
-        const statusCode = response.statusCode ?? 500;
         const raw = Buffer.concat(responseData).toString("utf-8");
         const data = raw ? JSON.parse(raw) as T : undefined as T;
         resolve({ statusCode, data });
       } catch (error) {
-        reject(error);
+        reject(Object.assign(error as Error, {
+          daemonPhase: "body-failed" satisfies DaemonFailurePhase,
+          daemonStatusCode: statusCode,
+        }));
       }
     };
     const destroyRequestAfterSettlement = (): void => {
@@ -286,9 +302,13 @@ export async function daemonJsonResponse<T>(
       }
       signal?.removeEventListener("abort", onAbort);
     };
-    const settleFailure = (error: Error, destroyTransport = false): void => {
+    const settleFailure = (error: Error, destroyTransport = false, timedOut = false): void => {
       if (settled) return;
       settled = true;
+      const phase: DaemonFailurePhase = response === undefined
+        ? (timedOut ? "headers-timeout" : "request-failed")
+        : (timedOut ? "body-timeout" : "body-failed");
+      Object.assign(error, { daemonPhase: phase });
       if (destroyTransport) {
         // Destroy without an error argument: the explicit rejection below is
         // authoritative and this avoids a second uncaught socket error.
@@ -341,6 +361,7 @@ export async function daemonJsonResponse<T>(
         req.setTimeout(options.timeoutMs, () => {
           settleFailure(
             Object.assign(new Error("Daemon request timed out"), { code: "ETIMEDOUT" }),
+            true,
             true,
           );
         });
