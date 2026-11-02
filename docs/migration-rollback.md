@@ -130,9 +130,11 @@ directory. A retry finishes the write and continues when the leftover is the
 complete rollback witness of the activation being rolled back and reproduces
 from the activation's stored epoch and attempt. A partial, foreign or
 otherwise unprovable leftover is still refused as unresolvable and preserved;
-inspect it before retrying. An interruption while writing the rollback
-witness binding is not yet recovered automatically
-([#1821](https://github.com/donadiosolutions/lcm/issues/1821)).
+inspect it before retrying. A single rollback interrupted while writing its
+rollback witness binding is finished by a retry when the leftover binding
+names the rollback witness already stored for the activation being rolled
+back, at the rollback's current manifest revision. Any other leftover binding
+is refused as unresolvable and preserved.
 
 On a post-write rollback specifically, a retry after a crash **never
 resumes copying into the same partial generation**. It builds a brand-new

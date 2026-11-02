@@ -1,4 +1,4 @@
-import { afterEach, describe, expect, it } from "vitest";
+import { afterEach, describe, expect, it, vi } from "vitest";
 import { createRequire, syncBuiltinESMExports } from "node:module";
 import { randomBytes } from "node:crypto";
 import {
@@ -8,9 +8,11 @@ import {
   lstatSync,
   mkdirSync,
   mkdtempSync,
+  readdirSync,
   readFileSync,
   rmSync,
   statSync,
+  unlinkSync,
   symlinkSync,
   utimesSync,
   writeFileSync,
@@ -28,7 +30,9 @@ import {
   migrationWitnessBindingPath,
   generationScopedDirectory,
   readGenerationScopedFiles,
+  hasInterruptedWitnessBindingWrite,
   readGenerationScopedLoneScratches,
+  recoverInterruptedWitnessBindingWrite,
   recordMigrationSelectionBinding,
   recordMigrationWitnessBinding,
   resolveMigrationWitnessBindings,
@@ -2575,5 +2579,199 @@ describe("readGenerationScopedLoneScratches (#1808)", () => {
     list(homeDir);
     expect(readFileSync(scratch, "utf8")).toBe("one");
     expect(existsSync(join(directory, "rec-1.json"))).toBe(false);
+  });
+});
+
+describe("recoverInterruptedWitnessBindingWrite (#1821)", () => {
+  const HASH_C = "c".repeat(64);
+  const rollbackBinding = (overrides: Partial<MigrationWitnessBinding> = {}): MigrationWitnessBinding =>
+    witnessBinding({ kind: "rollback", witnessChecksumSha256: HASH_B, manifestRevision: 2, ...overrides });
+  const directoryOf = (homeDir: string): string => migrationGenerationBindingDirectory(homeDir, GENERATION_ID);
+  const generation = (homeDir: string) => ({ homeDir, generationId: GENERATION_ID });
+  const plant = (homeDir: string, name: string, content: string, mode = 0o600): string => {
+    mkdirSync(directoryOf(homeDir), { recursive: true, mode: 0o700 });
+    const path = join(directoryOf(homeDir), name);
+    writeFileSync(path, content, { mode });
+    chmodSync(path, mode);
+    return path;
+  };
+  const scratchOf = (checksum: string, suffix = "0123abcd"): string => ".witness-" + checksum + ".binding." + suffix + ".tmp";
+  /** A directory holding the activation selection and one lone scratch of the given content. */
+  const seeded = (content = captureCleanWitnessBytes(rollbackBinding()), name = scratchOf(HASH_B)) => {
+    const homeDir = home();
+    recordMigrationSelectionBinding({ homeDir, generationId: GENERATION_ID, binding: selectionBinding() });
+    const scratch = plant(homeDir, name, content);
+    return { homeDir, scratch };
+  };
+  const listing = (homeDir: string): readonly string[] => readdirSync(directoryOf(homeDir)).sort();
+  const recover = (homeDir: string, admit: (binding: MigrationWitnessBinding, resolution: unknown) => boolean, dependencies = {}) =>
+    recoverInterruptedWitnessBindingWrite({ ...generation(homeDir), admit: admit as never }, dependencies);
+
+  it("answers none without asking admit for an absent store, an empty directory or a published-only directory", () => {
+    const admit = vi.fn(() => true);
+    const absent = home();
+    expect(hasInterruptedWitnessBindingWrite(generation(absent))).toBe(false);
+    expect(recover(absent, admit)).toBe("none");
+    expect(existsSync(join(absent, ".lcm", "migration-generation-bindings"))).toBe(false);
+
+    const empty = home();
+    mkdirSync(directoryOf(empty), { recursive: true, mode: 0o700 });
+    expect(hasInterruptedWitnessBindingWrite(generation(empty))).toBe(false);
+    expect(recover(empty, admit)).toBe("none");
+    expect(listing(empty)).toEqual([]);
+
+    const published = home();
+    recordMigrationSelectionBinding({ homeDir: published, generationId: GENERATION_ID, binding: selectionBinding() });
+    recordMigrationWitnessBinding({ homeDir: published, generationId: GENERATION_ID, binding: witnessBinding() });
+    const before = listing(published);
+    expect(hasInterruptedWitnessBindingWrite(generation(published))).toBe(false);
+    expect(recover(published, admit)).toBe("none");
+    expect(listing(published)).toEqual(before);
+    expect(admit).not.toHaveBeenCalled();
+  });
+
+  it("validates the home directory and the generation id like the other exports", () => {
+    const admit = (): boolean => true;
+    expect(() => hasInterruptedWitnessBindingWrite({ homeDir: "", generationId: GENERATION_ID }))
+      .toThrow(MigrationBindingValidationError);
+    expect(() => hasInterruptedWitnessBindingWrite({ homeDir: home(), generationId: "" }))
+      .toThrow(MigrationBindingValidationError);
+    expect(() => recoverInterruptedWitnessBindingWrite({ homeDir: "", generationId: GENERATION_ID, admit }))
+      .toThrow(MigrationBindingValidationError);
+    expect(() => recoverInterruptedWitnessBindingWrite({ homeDir: home(), generationId: "", admit }))
+      .toThrow(MigrationBindingValidationError);
+  });
+
+  it("publishes the admitted rollback binding with its exact bytes, removes the scratch and resolves strictly", () => {
+    const binding = rollbackBinding();
+    const bytes = captureCleanWitnessBytes(binding);
+    const { homeDir, scratch } = seeded(bytes);
+    expect(hasInterruptedWitnessBindingWrite(generation(homeDir))).toBe(true);
+    expect(resolveMigrationWitnessBindings(generation(homeDir))).toMatchObject({ state: "unresolvable" });
+    const admit = vi.fn(() => true);
+
+    expect(recover(homeDir, admit)).toBe("recovered");
+
+    expect(admit).toHaveBeenCalledOnce();
+    expect(admit).toHaveBeenCalledWith(binding, { state: "resolved", witnesses: [], selections: [selectionBinding()] });
+    expect(existsSync(scratch)).toBe(false);
+    expect(readFileSync(migrationWitnessBindingPath(homeDir, GENERATION_ID, HASH_B), "utf8")).toBe(bytes);
+    expect(resolveMigrationWitnessBindings(generation(homeDir)))
+      .toEqual({ state: "resolved", witnesses: [binding], selections: [selectionBinding()] });
+    expect(hasInterruptedWitnessBindingWrite(generation(homeDir))).toBe(false);
+    expect(recover(homeDir, admit)).toBe("none");
+    expect(admit).toHaveBeenCalledOnce();
+  });
+
+  it("does not use a scratch as evidence of a binding when no final is published: the scan stays absent", () => {
+    const homeDir = home();
+    const scratch = plant(homeDir, scratchOf(HASH_B), captureCleanWitnessBytes(rollbackBinding()));
+    const admit = vi.fn(() => true);
+
+    expect(hasInterruptedWitnessBindingWrite(generation(homeDir))).toBe(true);
+    expect(recover(homeDir, admit)).toBe("none");
+
+    expect(admit).not.toHaveBeenCalled();
+    expect(listing(homeDir)).toEqual([scratchOf(HASH_B)]);
+    expect(existsSync(scratch)).toBe(true);
+  });
+
+  it("writes nothing when admit refuses, and lets an admit failure propagate unchanged", () => {
+    const { homeDir, scratch } = seeded();
+    const before = { names: listing(homeDir), bytes: readFileSync(scratch, "utf8") };
+
+    expect(recover(homeDir, () => false)).toBe("none");
+    expect(listing(homeDir)).toEqual(before.names);
+    expect(readFileSync(scratch, "utf8")).toBe(before.bytes);
+
+    const sentinel = new Error("admit failed");
+    expect(() => recover(homeDir, () => { throw sentinel; })).toThrow(sentinel);
+    expect(listing(homeDir)).toEqual(before.names);
+    expect(readFileSync(scratch, "utf8")).toBe(before.bytes);
+  });
+
+  it("recovers only a complete canonical rollback witness binding of this generation", () => {
+    const rollbackBytes = captureCleanWitnessBytes(rollbackBinding());
+    const cases: Array<readonly [string, string, string]> = [
+      ["a selection binding", ".selection-activation.binding.0123abcd.tmp", captureCleanSelectionBytes(selectionBinding())],
+      ["an activation witness binding", scratchOf(HASH_A), captureCleanWitnessBytes(witnessBinding())],
+      ["invalid JSON", scratchOf(HASH_B), "{"],
+      ["an invalid envelope", scratchOf(HASH_B), rollbackBytes.replace(GENERATION_ID, "another-generation")],
+      ["a file name that is not the binding's checksum", scratchOf(HASH_C), rollbackBytes],
+      ["bytes that are not canonical", scratchOf(HASH_B), rollbackBytes + " "],
+    ];
+    for (const [label, name, content] of cases) {
+      const { homeDir } = seeded(content, name);
+      const before = listing(homeDir);
+      const admit = vi.fn(() => true);
+      expect(recover(homeDir, admit), label).toBe("none");
+      expect(admit, label).not.toHaveBeenCalled();
+      expect(listing(homeDir), label).toEqual(before);
+      expect(readFileSync(join(directoryOf(homeDir), name), "utf8"), label).toBe(content);
+    }
+  });
+
+  it("answers none for two lone scratches, whether identical copies of one final or two distinct bindings", () => {
+    const bytes = captureCleanWitnessBytes(rollbackBinding());
+    const copies = seeded(bytes);
+    plant(copies.homeDir, scratchOf(HASH_B, "0123abce"), bytes);
+    const distinct = seeded(bytes);
+    plant(distinct.homeDir, scratchOf(HASH_C), captureCleanWitnessBytes(rollbackBinding({ witnessChecksumSha256: HASH_C })));
+    for (const { homeDir } of [copies, distinct]) {
+      const before = listing(homeDir);
+      const admit = vi.fn(() => true);
+      expect(recover(homeDir, admit)).toBe("none");
+      expect(admit).not.toHaveBeenCalled();
+      expect(listing(homeDir)).toEqual(before);
+    }
+  });
+
+  it("answers none when the whole directory does not authenticate, preserving every file", () => {
+    const bytes = captureCleanWitnessBytes(rollbackBinding());
+    const cases: Array<readonly [string, (homeDir: string) => void]> = [
+      ["an unknown entry", (homeDir) => { plant(homeDir, "unknown", "x"); }],
+      ["an invalid published final", (homeDir) => { plant(homeDir, "witness-" + HASH_C + ".binding", "{"); }],
+      ["a scratch of the wrong mode", (homeDir) => { plant(homeDir, scratchOf(HASH_C), bytes, 0o644); }],
+      ["a scratch with two links", (homeDir) => {
+        const path = plant(homeDir, scratchOf(HASH_C), bytes);
+        linkSync(path, join(home(), "alias"));
+      }],
+    ];
+    for (const [label, mutate] of cases) {
+      const { homeDir } = seeded(bytes);
+      mutate(homeDir);
+      const before = listing(homeDir);
+      const admit = vi.fn(() => true);
+      expect(recover(homeDir, admit), label).toBe("none");
+      expect(admit, label).not.toHaveBeenCalled();
+      expect(listing(homeDir), label).toEqual(before);
+    }
+  });
+
+  it("propagates a writer failure after admission, keeps the scratch, and a retry converges", () => {
+    const bytes = captureCleanWitnessBytes(rollbackBinding());
+    const { homeDir, scratch } = seeded(bytes);
+    const failure = new Error("disk full");
+
+    expect(() => recover(homeDir, () => true, { writeDurable: () => { throw failure; } })).toThrow(failure);
+    expect(readFileSync(scratch, "utf8")).toBe(bytes);
+    expect(existsSync(migrationWitnessBindingPath(homeDir, GENERATION_ID, HASH_B))).toBe(false);
+
+    expect(recover(homeDir, () => true)).toBe("recovered");
+    expect(existsSync(scratch)).toBe(false);
+    expect(resolveMigrationWitnessBindings(generation(homeDir))).toMatchObject({ state: "resolved" });
+    expect(recover(homeDir, () => true)).toBe("none");
+  });
+
+  it("answers none when the scratch is gone by the time recovery lists again", () => {
+    const { homeDir, scratch } = seeded();
+    expect(hasInterruptedWitnessBindingWrite(generation(homeDir))).toBe(true);
+    unlinkSync(scratch);
+    const admit = vi.fn(() => true);
+
+    expect(recover(homeDir, admit)).toBe("none");
+
+    expect(admit).not.toHaveBeenCalled();
+    expect(listing(homeDir)).toEqual(["selection-activation.binding"]);
   });
 });
