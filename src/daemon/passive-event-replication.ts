@@ -831,7 +831,16 @@ export class PassiveEventReplicationWorker {
     const safe: LocalHookEventRow[] = [];
     for (const event of rows) {
       if (this.safeToTransmit(event)) safe.push(event);
-      else await this.reportError(new Error(PRIVACY_REFUSAL));
+      else {
+        // Remove the unsafe prefix from capped recovery reads, retaining its
+        // existing remote identity for an explicit replay.
+        if (await this.dependencies.local.markQuarantined(
+          event.event_uuid,
+          BigInt(event.remote_inbox_id!),
+          PRIVACY_REFUSAL,
+        )) summary.quarantined += 1;
+        await this.reportError(new Error(PRIVACY_REFUSAL));
+      }
     }
     if (safe.length === 0) return;
     let outcomes: PostgreSqlPassiveEventReleaseResult[];

@@ -410,7 +410,7 @@ describe("PassiveEventReplicationWorker", () => {
         { eventId: "safe-row", outcome: "applied", inboxId: 42n },
       ]) });
       const onError = vi.fn();
-      await expect(worker(local, remote, { onError }).runOnce()).resolves.toMatchObject({ acknowledged: 1 });
+      await expect(worker(local, remote, { onError }).runOnce()).resolves.toMatchObject({ acknowledged: 1, quarantined: 1 });
       expect(remote.releaseFromOtherProjects).toHaveBeenCalledWith([
         expect.objectContaining({ eventId: "safe-row", inboxId: 42n }),
       ], expect.any(Object));
@@ -420,12 +420,18 @@ describe("PassiveEventReplicationWorker", () => {
       expect(unsafe.data).toBe(marker);
     });
 
-    it("leaves an entirely privacy-refused recovery batch locally recoverable", async () => {
+    it.each([true, false])("counts privacy-refused recovery quarantine only on a successful transition (%s)", async changed => {
       const event = localRow({ data: marker, delivery_state: "replicated", remote_inbox_id: "41" });
-      const local = localRepository({ listAwaitingRemote: vi.fn().mockResolvedValue([event]) });
+      const local = localRepository({
+        listAwaitingRemote: vi.fn().mockResolvedValue([event]),
+        markQuarantined: vi.fn().mockResolvedValue(changed),
+      });
       const remote = remoteRepository();
       const onError = vi.fn();
-      await expect(worker(local, remote, { onError }).runOnce()).resolves.toMatchObject({ acknowledged: 0 });
+      await expect(worker(local, remote, { onError }).runOnce()).resolves.toMatchObject({
+        acknowledged: 0, quarantined: changed ? 1 : 0,
+      });
+      expect(local.markQuarantined).toHaveBeenCalledWith(EVENT_ID, 41n, reason);
       expect(remote.releaseFromOtherProjects).not.toHaveBeenCalled();
       expect(local.markAcknowledged).not.toHaveBeenCalled();
       expect(local.requeueReplicated).not.toHaveBeenCalled();

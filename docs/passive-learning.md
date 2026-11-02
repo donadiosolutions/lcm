@@ -397,13 +397,15 @@ the built-in credential patterns and the current global and project sensitive
 patterns. If redaction would change any field, the row is not uploaded. New
 uploads enter local quarantine with `passive event requires redaction before
 replication`; the original local text and event identifiers remain intact for
-recovery. Replication also refuses payload-bearing cross-project recovery for a
-previously replicated row that fails this check. Safe rows continue normally.
+recovery. A previously replicated row that fails this check also enters local
+quarantine, retaining its remote inbox ID. This keeps an unsafe prefix from
+blocking later safe rows in the bounded recovery queue. Safe rows continue normally.
 
 Replication deliberately does not redact only the remote copy: a changed payload
 under the same event identity would break exact readback and recovery. Review
 privacy-quarantined events with `lcm events quarantine`; `lcm events replay`
-does not bypass the privacy check. Correct an erroneous sensitive-pattern rule
+does not bypass the privacy check. A row with a retained remote inbox ID resumes
+recovery rather than becoming a new upload. Correct an erroneous sensitive-pattern rule
 before replaying, or retain the event locally when its original envelope cannot
 be transmitted safely. Invalid privacy patterns fail closed. This check does not
 remove copies that were already uploaded by an older version.
