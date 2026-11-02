@@ -1,0 +1,9 @@
+references: ["#1822"]
+rationale: >-
+  #1822 validates a pooled PostgreSQL connection that has been idle for one
+  second or longer with a bounded SELECT 1 at checkout, so a connection that
+  died silently while idle is replaced within about two connection timeouts
+  instead of holding the request for the full query deadline. The change is
+  confined to the runtime acquisition path, which keeps its existing owner.
+pins:
+  - ["src/storage/postgresql/runtime.ts", "integration-postgresql-runtime"]

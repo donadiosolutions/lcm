@@ -463,6 +463,10 @@ knowing by name:
   `apply` decides this from the local project map before it creates a local project entry or a
   destination project, takes a hold or captures anything, so the refusal reports `applied: false`
   and leaves PostgreSQL, the project map and the SQLite history untouched; there is nothing to clean up.
+- `migration-target-verification-failed` (exit 2): evidence is
+  `readiness-<reason>[:<check>]`, where the optional check names the failed readiness inspection
+  (for example, `readiness-extension-preflight:inspectRequiredExtensionFunctions`). Fix the named
+  role, schema, extension or TLS condition, then retry.
 - `route-not-owner` (exit 2), `route-resume-required` (exit 6), `route-publication-in-flight` (exit 4),
   `route-operator-required` (exit 7),
   `route-unresolvable` / `route-foreign-publication` / `route-contradiction` (exit 5): the router

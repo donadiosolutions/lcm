@@ -77,7 +77,21 @@ describe("verifyMigrationTargetReachability: injected boundaries (real-PostgreSQ
         verifyTransferSchema: async () => { throw new PostgreSqlRuntimeReadinessError("runtime-role-policy", "test"); },
       },
     });
-    expect(result).toEqual({ status: "refuse", reason: "migration-target-verification-failed", evidence: "readiness-runtime-role-policy" });
+    expect(result).toEqual({ status: "refuse", reason: "migration-target-verification-failed", evidence: "readiness-runtime-role-policy:test" });
+  });
+
+  it("omits a readiness operation that is not a bounded alphabetic source name", async () => {
+    const { PostgreSqlRuntimeReadinessError } = await import("../../src/storage/postgresql/runtime-readiness.js");
+    const fakeRuntime = { close: vi.fn(async () => undefined) };
+    const result = await verifyMigrationTargetReachability({
+      settings: { url: "postgresql://unused/lcm", caFile: "/unused", poolMax: 1, connectionTimeoutMs: 100, idleTimeoutMs: 100, statementTimeoutMs: 100 },
+      expectedOwner: "lcm_test_migrator",
+      _operationsForTesting: {
+        createRuntime: () => fakeRuntime as never,
+        verifyTransferSchema: async () => { throw new PostgreSqlRuntimeReadinessError("extension-preflight", "not-safe"); },
+      },
+    });
+    expect(result).toEqual({ status: "refuse", reason: "migration-target-verification-failed", evidence: "readiness-extension-preflight" });
   });
 
   it("exercises the real default createRuntime/verifyTransferSchema wiring (no injection) against a genuinely unreachable address, landing on migration-target-verification-unresolvable via the verify-stage catch specifically -- a real, existing (if not cryptographically valid) CA file lets construction succeed so the failure is a real connection error, not a construction error (real PostgreSQL success/role-failure cases live in the .integration.ts counterpart, which the standard coverage gate does not run)", async () => {

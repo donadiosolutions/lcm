@@ -147,7 +147,7 @@
     "name": "F2-file",
     "input": "file://h?x=[file:///Users/CHILD/x&later\\/home/alice/s([https://other?key=/Users/S0/x]&later\\/home/bob/s([https://other?key=C:/file:///Users/K]",
     "requiredPasses": [
-      "file://h?x=[file://<path>&later\\<path>?key=<path>]&later<path>?key=C:/file://<path>]",
+      "file://h?x=[file://<path>&later\\<path>?key=<path>]&later<path>?key=C:<path><path>]",
       "file://h?x=[file://<path>&later\\<path>?key=<path>]&later<path>?key=C:<path><path>]",
       "file://h?x=[file://<path>&later\\<path>?key=<path>]&later<path>?key=C:<path><path>]"
     ]
@@ -165,7 +165,7 @@
     "name": "F3-compound",
     "input": "file://h?x=[file:///Users/CHILD/x&later\\/home/alice/s([https://other?key=/Users/S0/x]&later\\/home/bob/s([https://other&C:/C:/Users/K]",
     "requiredPasses": [
-      "file://h?x=[file://<path>&later\\<path>?key=<path>]&later<path>&C:/C:/Users/K]",
+      "file://h?x=[file://<path>&later\\<path>?key=<path>]&later<path>&C:<path>:<path>]",
       "file://h?x=[file://<path>&later\\<path>?key=<path>]&later<path>&C:<path>:<path>]",
       "file://h?x=[file://<path>&later\\<path>?key=<path>]&later<path>&C:<path>:<path>]"
     ]

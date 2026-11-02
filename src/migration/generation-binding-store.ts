@@ -1485,7 +1485,19 @@ export function resolveMigrationWitnessBindings(
 ): MigrationWitnessResolution {
   const homeDir = validateHomeDir(input.homeDir);
   const generationId = validateGenerationId(input.generationId);
-  const read = readGenerationScopedFiles(GENERATION_BINDING_STORE, { homeDir, generationId }, dependencies);
+  return resolveBindingsFrom(homeDir, generationId, dependencies, []);
+}
+
+/** The body of resolveMigrationWitnessBindings over validated input, with the
+ * records a caller is about to write passed to the scan as pending writes.
+ * The exported reader passes none and stays strict. */
+function resolveBindingsFrom(
+  homeDir: string,
+  generationId: string,
+  dependencies: ReadGenerationScopedFilesDependencies,
+  pending: readonly GenerationScopedPendingWrite[],
+): MigrationWitnessResolution {
+  const read = readGenerationScopedFiles(GENERATION_BINDING_STORE, { homeDir, generationId }, dependencies, pending);
   if (read.kind === "absent") return { state: "authoritatively-absent" };
   if (read.kind === "unresolvable") return { state: "unresolvable", reason: read.reason };
   const witnesses: MigrationWitnessBinding[] = [];
@@ -1517,4 +1529,74 @@ export function resolveMigrationWitnessBindings(
     witnesses: orderedByRevision(witnesses, (entry) => entry.witnessChecksumSha256),
     selections: orderedByRevision(selections, (entry) => entry.kind),
   };
+}
+/** True when the generation's binding directory holds a lone writer scratch
+ * file (final absent) that authenticates as one. Read-only; the cheap probe
+ * before recoverInterruptedWitnessBindingWrite. */
+export function hasInterruptedWitnessBindingWrite(
+  input: Readonly<{ homeDir: string; generationId: string }>,
+  dependencies: ReadGenerationScopedFilesDependencies = {},
+): boolean {
+  return readGenerationScopedLoneScratches(
+    GENERATION_BINDING_STORE,
+    { homeDir: validateHomeDir(input.homeDir), generationId: validateGenerationId(input.generationId) },
+    dependencies,
+  ).length > 0;
+}
+
+/**
+ * #1821. The strict readers refuse a generation whose binding directory holds
+ * a lone writer scratch, so a rollback interrupted inside the write of its
+ * rollback witness binding (before the final link) is refused on every retry,
+ * before the writer that would finish the write can run. This finishes
+ * exactly that write when the caller can prove it is the caller's own.
+ *
+ * Recovery needs exactly one lone scratch: the durable writer creates one
+ * temporary file per write and removes it on an in-process failure, and any
+ * lone scratch makes every later continuation refuse before it writes another
+ * binding, so a genuine interruption never leaves two. That scratch must be
+ * the complete canonical rollback witness binding of the generation, and the
+ * whole directory, read with the scratch as the pending write, must be
+ * resolved: any entry the listing skipped (an unknown name, an unauthenticated
+ * scratch, an invalid final) makes the full scan unresolvable and nothing is
+ * written. The store knows nothing about rollback artifacts or evidence; the
+ * caller's admit receives the parsed binding and the published-only
+ * resolution and decides whether the binding is its own. Anything else
+ * answers "none" and writes nothing; admit throwing propagates unchanged
+ * before any write.
+ *
+ * The binding is published through the ordinary witness writer, which
+ * reconciles against the final name and removes the byte-identical scratch.
+ * A writer error after admission (I/O, a race) propagates and leaves the
+ * scratch for the next attempt. Callers hold the append barrier so no live
+ * writer's scratch is mistaken for debris.
+ */
+export function recoverInterruptedWitnessBindingWrite(
+  input: Readonly<{
+    homeDir: string;
+    generationId: string;
+    admit: (
+      binding: MigrationWitnessBinding,
+      resolution: Extract<MigrationWitnessResolution, Readonly<{ state: "resolved" }>>,
+    ) => boolean;
+  }>,
+  dependencies: RecordMigrationWitnessBindingDependencies = {},
+): "recovered" | "none" {
+  const homeDir = validateHomeDir(input.homeDir);
+  const generationId = validateGenerationId(input.generationId);
+  const lone = readGenerationScopedLoneScratches(GENERATION_BINDING_STORE, { homeDir, generationId }, dependencies);
+  if (lone.length !== 1) return "none";
+  const scratch = lone[0]!;
+  let parsed: ParsedGenerationBindingFile;
+  try {
+    parsed = parseStoredGenerationBindingFile(scratch.fileName, scratch.content, generationId);
+  } catch {
+    return "none";
+  }
+  const binding = parsed.witness;
+  if (binding === undefined || binding.kind !== "rollback") return "none";
+  const resolution = resolveBindingsFrom(homeDir, generationId, dependencies, [scratch]);
+  if (resolution.state !== "resolved" || !input.admit(binding, resolution)) return "none";
+  recordMigrationWitnessBinding({ homeDir, generationId, binding }, dependencies);
+  return "recovered";
 }

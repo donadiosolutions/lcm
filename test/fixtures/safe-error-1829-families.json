@@ -1,0 +1,162 @@
+[
+  {
+    "name": "interposer slash-word then | windows tail",
+    "input": "file://h?x=['https://outer.test/x?next=file:///Users/a/My Files/private.db'abc/def|\\Users\\SECRET\\x]",
+    "expected": "file://h?x=['https://outer.test/x?next=file://<path>'abc/def|<path>]"
+  },
+  {
+    "name": "interposer slash-word then & windows tail",
+    "input": "file://h?x=['https://outer.test/x?next=file:///Users/a/My Files/private.db'abc/def&\\Users\\SECRET\\x]",
+    "expected": "file://h?x=['https://outer.test/x?next=file://<path>'abc/def&<path>]"
+  },
+  {
+    "name": "interposer bracket-x then | windows tail",
+    "input": "file://h?x=['https://outer.test/x?next=file:///Users/a/My Files/private.db'[x]|\\Users\\SECRET\\x]",
+    "expected": "file://h?x=['https://outer.test/x?next=file://<path>'[x]|<path>]"
+  },
+  {
+    "name": "interposer bracket-x then & windows tail",
+    "input": "file://h?x=['https://outer.test/x?next=file:///Users/a/My Files/private.db'[x]&\\Users\\SECRET\\x]",
+    "expected": "file://h?x=['https://outer.test/x?next=file://<path>'[x]&<path>]"
+  },
+  {
+    "name": "interposer public-url-amp then | windows tail",
+    "input": "file://h?x=['https://outer.test/x?next=file:///Users/a/My Files/private.db'http://p.test&|\\Users\\SECRET\\x]",
+    "expected": "file://h?x=['https://outer.test/x?next=file://<path>'http://p.test&|<path>]"
+  },
+  {
+    "name": "interposer public-url-amp then & windows tail",
+    "input": "file://h?x=['https://outer.test/x?next=file:///Users/a/My Files/private.db'http://p.test&&\\Users\\SECRET\\x]",
+    "expected": "file://h?x=['https://outer.test/x?next=file://<path>'http://p.test&&<path>]"
+  },
+  {
+    "name": "interposer backslash-word then | windows tail",
+    "input": "file://h?x=['https://outer.test/x?next=file:///Users/a/My Files/private.db'abc\\def|\\Users\\SECRET\\x]",
+    "expected": "file://h?x=['https://outer.test/x?next=file://<path>'abc\\def|<path>]"
+  },
+  {
+    "name": "interposer backslash-word then & windows tail",
+    "input": "file://h?x=['https://outer.test/x?next=file:///Users/a/My Files/private.db'abc\\def&\\Users\\SECRET\\x]",
+    "expected": "file://h?x=['https://outer.test/x?next=file://<path>'abc\\def&<path>]"
+  },
+  {
+    "name": "interposer apostrophe then | windows tail",
+    "input": "file://h?x=['https://outer.test/x?next=file:///Users/a/My Files/private.db'a'b|\\Users\\SECRET\\x]",
+    "expected": "file://h?x=['https://outer.test/x?next=file://<path>'a'b|<path>]"
+  },
+  {
+    "name": "interposer apostrophe then & windows tail",
+    "input": "file://h?x=['https://outer.test/x?next=file:///Users/a/My Files/private.db'a'b&\\Users\\SECRET\\x]",
+    "expected": "file://h?x=['https://outer.test/x?next=file://<path>'a'b&<path>]"
+  },
+  {
+    "name": "interposer double-quote then | windows tail",
+    "input": "file://h?x=['https://outer.test/x?next=file:///Users/a/My Files/private.db'a\"b|\\Users\\SECRET\\x]",
+    "expected": "file://h?x=['https://outer.test/x?next=file://<path>'a\"b|<path>]"
+  },
+  {
+    "name": "interposer double-quote then & windows tail",
+    "input": "file://h?x=['https://outer.test/x?next=file:///Users/a/My Files/private.db'a\"b&\\Users\\SECRET\\x]",
+    "expected": "file://h?x=['https://outer.test/x?next=file://<path>'a\"b&<path>]"
+  },
+  {
+    "name": "interposer https-url then | windows tail",
+    "input": "file://h?x=['https://outer.test/x?next=file:///Users/a/My Files/private.db'https://p.test/x|\\Users\\SECRET\\x]",
+    "expected": "file://h?x=['https://outer.test/x?next=file://<path>'https://p.test/x|<path>]"
+  },
+  {
+    "name": "interposer https-url then & windows tail",
+    "input": "file://h?x=['https://outer.test/x?next=file:///Users/a/My Files/private.db'https://p.test/x&\\Users\\SECRET\\x]",
+    "expected": "file://h?x=['https://outer.test/x?next=file://<path>'https://p.test/x&<path>]"
+  },
+  {
+    "name": "interposer slash-run then | windows tail",
+    "input": "file://h?x=['https://outer.test/x?next=file:///Users/a/My Files/private.db'a/b/c|\\Users\\SECRET\\x]",
+    "expected": "file://h?x=['https://outer.test/x?next=file://<path>'a/b/c|<path>]"
+  },
+  {
+    "name": "interposer slash-run then & windows tail",
+    "input": "file://h?x=['https://outer.test/x?next=file:///Users/a/My Files/private.db'a/b/c&\\Users\\SECRET\\x]",
+    "expected": "file://h?x=['https://outer.test/x?next=file://<path>'a/b/c&<path>]"
+  },
+  {
+    "name": "interposer dot then | windows tail",
+    "input": "file://h?x=['https://outer.test/x?next=file:///Users/a/My Files/private.db'a.b/c|\\Users\\SECRET\\x]",
+    "expected": "file://h?x=['https://outer.test/x?next=file://<path>'a.b/c|<path>]"
+  },
+  {
+    "name": "interposer dot then & windows tail",
+    "input": "file://h?x=['https://outer.test/x?next=file:///Users/a/My Files/private.db'a.b/c&\\Users\\SECRET\\x]",
+    "expected": "file://h?x=['https://outer.test/x?next=file://<path>'a.b/c&<path>]"
+  },
+  {
+    "name": "named value then later posix tail",
+    "input": "file://h?x=['https://outer.test/x?next=file:///Users/a/My Files/private.db'x=\\Users\\SECRET\\x|later/home/alice]",
+    "expected": "file://h?x=['https://outer.test/x?next=file://<path>'x=<path>|later<path>]"
+  },
+  {
+    "name": "named value then ampersand later tail",
+    "input": "file://h?x=['https://outer.test/x?next=file:///Users/a/My Files/private.db'x=\\Users\\SECRET\\x&later/home/alice]",
+    "expected": "file://h?x=['https://outer.test/x?next=file://<path>'x=<path>&later<path>]"
+  },
+  {
+    "name": "named value then two later tails",
+    "input": "file://h?x=['https://outer.test/x?next=file:///Users/a/My Files/private.db'x=\\Users\\SECRET\\x|later/home/alice&later/home/bob]",
+    "expected": "file://h?x=['https://outer.test/x?next=file://<path>'x=<path>|later<path>&later<path>]"
+  },
+  {
+    "name": "equals value then bracket with drive",
+    "input": "file://h?x=['https://outer.test/x?next=file:///Users/a/My Files/private.db'=\\Users\\S\\x[https://inner?key=C:/Users/K/x]]",
+    "expected": "file://h?x=['https://outer.test/x?next=file://<path>'=<path>?key=C:<path>]]"
+  },
+  {
+    "name": "equals value then bracket with lower drive",
+    "input": "file://h?x=['https://outer.test/x?next=file:///Users/a/My Files/private.db'=\\Users\\S\\x[https://inner?key=d:/Users/K/x]]",
+    "expected": "file://h?x=['https://outer.test/x?next=file://<path>'=<path>?key=d:<path>]]"
+  },
+  {
+    "name": "equals value then file child drive",
+    "input": "file://h?x=['https://outer.test/x?next=file:///Users/a/My Files/private.db'=\\Users\\S\\x[file:///b&C:/Users/c]]",
+    "expected": "file://h?x=['https://outer.test/x?next=file://<path>'=<path>&C:<path>]]"
+  },
+  {
+    "name": "equals value then second drive key",
+    "input": "file://h?x=['https://outer.test/x?next=file:///Users/a/My Files/private.db'=\\Users\\S\\x[https://inner?key=/Users/K/x&k2=C:/Users/K/x]]",
+    "expected": "file://h?x=['https://outer.test/x?next=file://<path>'=<path>?key=<path>&k2=C:<path>]]"
+  },
+  {
+    "name": "equals value then bare drive",
+    "input": "file://h?x=['https://outer.test/x?next=file:///Users/a/My Files/private.db'=\\Users\\S\\x[https://inner?C:/Users/K/x]]",
+    "expected": "file://h?x=['https://outer.test/x?next=file://<path>'=<path>?C:<path>]]"
+  },
+  {
+    "name": "equals value then compound drive",
+    "input": "file://h?x=['https://outer.test/x?next=file:///Users/a/My Files/private.db'=\\Users\\S\\x[https://inner?key=C:/Users/K/x,D:/Users/L/y]]",
+    "expected": "file://h?x=['https://outer.test/x?next=file://<path>'=<path>?key=C:<path>,D:<path>]]"
+  },
+  {
+    "name": "equals value then nested file child",
+    "input": "file://h?x=['https://outer.test/x?next=file:///Users/a/My Files/private.db'=\\Users\\S\\x[https://inner?key=C:/Users/K/x[file:///c&D:/Users/L]]]",
+    "expected": "file://h?x=['https://outer.test/x?next=file://<path>'=<path>?key=C:<path><path>&D:<path>]]]"
+  },
+  {
+    "name": "equals value then second quote unit",
+    "input": "file://h?x=['https://outer.test/x?next=file:///Users/a/My Files/private.db'=\\Users\\S\\x[https://inner?key=C:/Users/K/x]'https://o.test/x?next=file:///Users/b/c d.db']",
+    "expected": "file://h?x=['https://outer.test/x?next=file://<path>'=<path>?key=C:<path>]'https://o.test/x?next=file://<path>']"
+  },
+  {
+    "name": "equals value then parenthesis without bracket",
+    "input": "file://h?x=['https://outer.test/x?next=file:///Users/a/My Files/private.db'=\\Users\\S\\x(https://inner?key=C:/Users/K/x)]",
+    "expected": "file://h?x=['https://outer.test/x?next=file://<path>'=<path>?key=C:<path>)]"
+  },
+  {
+    "name": "forward drive origin double slash",
+    "input": "file://h?x=['https://outer.test/x?next=file:///Users/a/My Files/private.db'=//C:/Users/S/x[https://inner?key=C:/Users/K/x]]",
+    "expected": "file://h?x=['https://outer.test/x?next=file://<path>'=<path>:<path>?key=C:<path>]]"
+  },
+  {
+    "name": "forward drive origin bare",
+    "input": "file://h?x=['https://outer.test/x?next=file:///Users/a/My Files/private.db'=C:/Users/S/x[https://inner?key=C:/Users/K/x]]",
+    "expected": "file://h?x=['https://outer.test/x?next=file://<path>'=C:<path>?key=C:<path>]]"
+  }
+]

@@ -1524,6 +1524,37 @@ async function inspectServerReadiness(
   }
 }
 
+function extensionMemberOwnerAcceptedSql(
+  memberOwnerExpression: string,
+  extensionAlias: string,
+): string {
+  return `(
+            ${memberOwnerExpression} OPERATOR(pg_catalog.=) ${extensionAlias}.extowner
+            OR (
+              ${memberOwnerExpression} OPERATOR(pg_catalog.=) 10::pg_catalog.oid
+              AND EXISTS (
+                SELECT 1
+                FROM pg_catalog.pg_roles AS bootstrap_owner
+                WHERE bootstrap_owner.oid OPERATOR(pg_catalog.=) 10::pg_catalog.oid
+                  AND bootstrap_owner.rolsuper
+              )
+              AND EXISTS (
+                SELECT 1
+                FROM pg_catalog.pg_roles AS extension_owner
+                WHERE extension_owner.oid OPERATOR(pg_catalog.=) ${extensionAlias}.extowner
+                  AND NOT extension_owner.rolsuper
+              )
+              AND EXISTS (
+                SELECT 1
+                FROM pg_catalog.pg_available_extension_versions AS available_version
+                WHERE available_version.name OPERATOR(pg_catalog.=) ${extensionAlias}.extname
+                  AND available_version.version OPERATOR(pg_catalog.=) ${extensionAlias}.extversion
+                  AND available_version.trusted
+              )
+            )
+          )`;
+}
+
 async function inspectRequiredExtensionFunctions(
   executor: PostgreSqlQueryExecutor,
   signal: AbortSignal | undefined,
@@ -1547,7 +1578,7 @@ async function inspectRequiredExtensionFunctions(
                   ) AS function_identity,
                   extension.extname::pg_catalog.text AS extension_name,
                   CASE WHEN extension.oid IS NULL THEN NULL
-                    ELSE procedure.proowner OPERATOR(pg_catalog.=) extension.extowner
+                    ELSE ${extensionMemberOwnerAcceptedSql("procedure.proowner", "extension")}
                   END AS owner_matches_extension,
                   language.lanname::pg_catalog.text AS language_name,
                   procedure.probin,
@@ -1700,7 +1731,7 @@ async function inspectRequiredExtensionOperator(
                     NULL::pg_catalog.int4
                   )`)} AS result_type,
                   extension.extname::pg_catalog.text AS extension_name,
-                  catalog_operator.oprowner OPERATOR(pg_catalog.=) extension.extowner
+                  ${extensionMemberOwnerAcceptedSql("catalog_operator.oprowner", "extension")}
                     AS owner_matches_extension,
                   catalog_operator.oprcode OPERATOR(pg_catalog.=)
                     pg_catalog.to_regprocedure($1) AS implementation_matches,
@@ -1844,11 +1875,15 @@ async function inspectRequiredGinTrgmOperatorClass(
                     AS operator_class_extension,
                   operator_family_extension.extname::pg_catalog.text
                     AS operator_family_extension,
-                  operator_class.opcowner OPERATOR(pg_catalog.=)
-                    operator_class_extension.extowner
+                  ${extensionMemberOwnerAcceptedSql(
+                    "operator_class.opcowner",
+                    "operator_class_extension",
+                  )}
                     AS operator_class_owner_matches_extension,
-                  operator_family.opfowner OPERATOR(pg_catalog.=)
-                    operator_family_extension.extowner
+                  ${extensionMemberOwnerAcceptedSql(
+                    "operator_family.opfowner",
+                    "operator_family_extension",
+                  )}
                     AS operator_family_owner_matches_extension,
                   (
                     SELECT pg_catalog.count(*)::pg_catalog.int4
@@ -2099,8 +2134,10 @@ async function inspectRequiredGinTrgmOperators(
                   access_method.amname::pg_catalog.text AS access_method_name,
                   operator_extension.extname::pg_catalog.text AS extension_name,
                   CASE WHEN operator_extension.oid IS NULL THEN NULL
-                    ELSE catalog_operator.oprowner OPERATOR(pg_catalog.=)
-                      operator_extension.extowner
+                    ELSE ${extensionMemberOwnerAcceptedSql(
+                      "catalog_operator.oprowner",
+                      "operator_extension",
+                    )}
                   END AS owner_matches_extension,
                   (
                     SELECT pg_catalog.count(*)::pg_catalog.int4
@@ -2327,7 +2364,7 @@ async function inspectRequiredGinTrgmIndirectOperators(
                   referenced.oprcanmerge AS can_merge, referenced.oprcanhash AS can_hash,
                   CASE WHEN edges.reference_kind OPERATOR(pg_catalog.=) 'commutator' THEN referenced.oprcom OPERATOR(pg_catalog.=) edges.referring_oid ELSE referenced.oprnegate OPERATOR(pg_catalog.=) edges.referring_oid END AS reciprocal_matches,
                   extension.extname::pg_catalog.text AS extension_name,
-                  CASE WHEN extension.oid IS NULL THEN NULL ELSE referenced.oprowner OPERATOR(pg_catalog.=) extension.extowner END AS owner_matches_extension,
+                  CASE WHEN extension.oid IS NULL THEN NULL ELSE ${extensionMemberOwnerAcceptedSql("referenced.oprowner", "extension")} END AS owner_matches_extension,
                   (SELECT pg_catalog.count(*)::pg_catalog.int4 FROM pg_catalog.pg_depend AS d WHERE d.classid OPERATOR(pg_catalog.=) pg_catalog.to_regclass('pg_catalog.pg_operator') AND d.objid OPERATOR(pg_catalog.=) referenced.oid) AS dependency_count,
                   (SELECT pg_catalog.count(*)::pg_catalog.int4 FROM pg_catalog.pg_depend AS d WHERE d.classid OPERATOR(pg_catalog.=) pg_catalog.to_regclass('pg_catalog.pg_operator') AND d.objid OPERATOR(pg_catalog.=) referenced.oid AND d.refclassid OPERATOR(pg_catalog.=) pg_catalog.to_regclass('pg_catalog.pg_extension') AND d.refobjid OPERATOR(pg_catalog.=) extension.oid AND d.deptype OPERATOR(pg_catalog.=) 'e') AS extension_dependency_count,
                   (SELECT pg_catalog.count(*)::pg_catalog.int4 FROM pg_catalog.pg_depend AS d WHERE d.classid OPERATOR(pg_catalog.=) pg_catalog.to_regclass('pg_catalog.pg_operator') AND d.objid OPERATOR(pg_catalog.=) referenced.oid AND d.refclassid OPERATOR(pg_catalog.=) pg_catalog.to_regclass('pg_catalog.pg_proc') AND d.refobjid OPERATOR(pg_catalog.=) implementation.oid AND d.deptype OPERATOR(pg_catalog.=) 'n') AS implementation_dependency_count,

@@ -79,6 +79,7 @@ Changesets/version branch names. Review the resulting draft and publish manually
 | Invalid `PUBLISH_MAX_WAIT` | Use integer seconds 0–9223372036854775807; default 900 bounds draft-run discovery |
 | Draft exists but npm already has the version | Stop and audit bypassed manual publication; do not retag |
 | Published release restored to draft | Fix failed/cancelled publication and manually publish the restored draft again; existing npm versions are verified without republishing |
+| npm verification timed out or retry hit E409 "previously staged version" | Re-run the recovery: a staged upload for the same version is not re-uploaded and is verified through the ~30-minute window |
 | Earlier failed public release blocks later release | Complete the earlier event successfully or withdraw it to draft before retrying |
 | Earlier failure for the same republished tag | Expected retry history; same-tag failure is ignored while native FIFO concurrency still serializes different release runs |
 

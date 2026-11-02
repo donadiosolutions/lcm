@@ -45,9 +45,13 @@ import {
   recordMigrationActivationWitness,
 } from "../../src/migration/activation-evidence-store.js";
 import {
+  migrationGenerationBindingDirectory,
+  migrationWitnessBindingPath,
   recordMigrationSelectionBinding,
   recordMigrationWitnessBinding,
   resolveMigrationWitnessBindings,
+  type MigrationSelectionBinding,
+  type MigrationWitnessBinding,
 } from "../../src/migration/generation-binding-store.js";
 import { assertMigrationReplayAdmission } from "../../src/migration/maintenance.js";
 import {
@@ -1550,5 +1554,283 @@ describe("a rollback interrupted inside its rollback witness write (#1808)", () 
     } finally {
       vi.unstubAllEnvs();
     }
+  });
+});
+
+describe("a rollback interrupted inside its rollback witness binding write (#1821)", () => {
+  const unresolvable = expect.stringContaining("witness-resolution:unresolvable");
+  const artifactPath = (homeDir: string): string =>
+    join(homeDir, ".lcm", "migration-rollback-authority", deriveRollbackAuthorityArtifactId(GEN) + ".json");
+  const bindingEntries = (homeDir: string): string[] => readdirSync(migrationGenerationBindingDirectory(homeDir, GEN)).sort();
+  const evidenceEntries = (homeDir: string): string[] => readdirSync(migrationActivationEvidenceDirectory(homeDir, GEN)).sort();
+  const strictBindings = (homeDir: string) => resolveMigrationWitnessBindings({ homeDir, generationId: GEN });
+  const scratchName = (checksum: string): string => ".witness-" + checksum + ".binding.0123abcd.tmp";
+
+  /** The first run: the real writer, then the exact crash state before the final link (the final renamed to its mode-0600 scratch). */
+  const bindingCrash: NonNullable<RunMigrationRollbackDependencies["recordWitnessBinding"]> = (request) => {
+    recordMigrationWitnessBinding(request);
+    const published = migrationWitnessBindingPath(request.homeDir, request.generationId, request.binding.witnessChecksumSha256);
+    renameSync(published, join(migrationGenerationBindingDirectory(request.homeDir, request.generationId), scratchName(request.binding.witnessChecksumSha256)));
+    throw new Error("crash inside the binding write");
+  };
+  const interruptedRun = async (t: ReturnType<typeof setup>, extra: Partial<RunMigrationRollbackDependencies> = {}): Promise<string> => {
+    await expect(runMigrationRollback(t.input, t.dependencies(t.coordinator(), { recordWitnessBinding: bindingCrash, ...extra })))
+      .rejects.toThrow("crash inside the binding write");
+    const scratches = bindingEntries(t.homeDir).filter((name) => name.endsWith(".tmp"));
+    expect(scratches).toHaveLength(1);
+    expect(t.store.read(GEN)).toMatchObject({ phase: "rolling-back", pendingEffect: null });
+    return join(migrationGenerationBindingDirectory(t.homeDir, GEN), scratches[0]!);
+  };
+  /** Everything a refused recovery must leave as it found it. */
+  const snapshot = (t: ReturnType<typeof setup>, scratch: string) => ({
+    manifest: JSON.stringify(t.store.read(GEN)),
+    maintenance: JSON.stringify(readBackendMaintenanceJournal(t.homeDir)),
+    artifact: existsSync(artifactPath(t.homeDir)) ? readFileSync(artifactPath(t.homeDir), "utf8") : null,
+    evidence: evidenceEntries(t.homeDir),
+    bindings: bindingEntries(t.homeDir),
+    scratch: readFileSync(scratch, "utf8"),
+  });
+  /** Replaces the scratch by the canonical bytes (as a real writer produces them) of the same binding with the given changes. */
+  const rewriteScratch = (t: ReturnType<typeof setup>, scratch: string, change: Record<string, unknown>): string => {
+    const stored = JSON.parse(readFileSync(scratch, "utf8")) as { binding: MigrationWitnessBinding };
+    const binding = { ...stored.binding, ...change } as MigrationWitnessBinding;
+    const clean = tempHome();
+    recordMigrationWitnessBinding({ homeDir: clean, generationId: GEN, binding });
+    unlinkSync(scratch);
+    const path = join(migrationGenerationBindingDirectory(t.homeDir, GEN), scratchName(binding.witnessChecksumSha256));
+    writeFileSync(path, readFileSync(migrationWitnessBindingPath(clean, GEN, binding.witnessChecksumSha256), "utf8"), { mode: 0o600 });
+    return path;
+  };
+  const refusedContinuation = { name: "RollbackOrchestrationError", reason: "unexpected-state", message: unresolvable };
+  const rewriteMaintenance = (homeDir: string, mutate: (body: Record<string, unknown>) => void): void => {
+    const journalPath = backendPublicationJournalPath(homeDir);
+    const { checksumSha256: _checksum, ...journal } = JSON.parse(readFileSync(journalPath, "utf8"));
+    mutate(journal);
+    writeFileSync(journalPath, JSON.stringify({ ...journal, checksumSha256: backendPublicationCanonicalSha256(journal) }));
+  };
+  const replaceArtifact = (homeDir: string, change: Record<string, unknown>): void => {
+    const { checksumSha256: _checksum, ...artifact } = readRollbackAuthorityArtifact(homeDir, GEN)!;
+    unlinkSync(artifactPath(homeDir));
+    writeRollbackAuthorityArtifact(homeDir, { ...artifact, ...change });
+  };
+  const expectRefused = async (t: ReturnType<typeof setup>, scratch: string, rejection: unknown): Promise<void> => {
+    const before = snapshot(t, scratch);
+    await expect(runMigrationRollback(t.input, t.dependencies(t.coordinator()))).rejects.toMatchObject(rejection as object);
+    expect(snapshot(t, scratch)).toEqual(before);
+  };
+
+  it("fresh run: the retry finishes the interrupted binding write, completes the rollback and clears the scratch", async () => {
+    const t = setup();
+    const scratch = await interruptedRun(t);
+    expect(strictBindings(t.homeDir)).toMatchObject({ state: "unresolvable" });
+    const revision = t.store.read(GEN).revision;
+
+    const outcome = await runMigrationRollback(t.input, t.dependencies(t.coordinator()));
+
+    expect(outcome.manifest.phase).toBe("rolled-back");
+    expect(existsSync(scratch)).toBe(false);
+    expect(bindingEntries(t.homeDir).filter((name) => name.endsWith(".tmp"))).toEqual([]);
+    const resolved = strictBindings(t.homeDir);
+    expect(resolved).toMatchObject({ state: "resolved" });
+    expect(resolved.state === "resolved" && resolved.witnesses.filter((binding) => binding.kind === "rollback")).toMatchObject([
+      { manifestRevision: revision },
+    ]);
+    expect(readBackendMaintenanceJournal(t.homeDir)).toBeNull();
+    expect((await runMigrationRollback(t.input, t.dependencies(t.coordinator()))).manifest.phase).toBe("rolled-back");
+  });
+
+  it("an interruption during a continuation run converges the same way, and recovery reads the evidence before the strict bindings", async () => {
+    const t = setup();
+    await expect(runMigrationRollback(t.input, t.dependencies(t.coordinator(), {
+      recordActivationWitness: () => { throw new Error("crash before the witness write"); },
+    }))).rejects.toThrow("crash before the witness write");
+    expect(t.store.read(GEN)).toMatchObject({ phase: "rolling-back", pendingEffect: null });
+    const scratch = await interruptedRun(t);
+
+    const calls: string[] = [];
+    const outcome = await runMigrationRollback(t.input, t.dependencies(t.coordinator(), {
+      resolveActivationEvidence: (request) => { calls.push("evidence"); return readMigrationActivationEvidence(request); },
+      resolveWitnessBindings: (request) => { calls.push("bindings"); return resolveMigrationWitnessBindings(request); },
+    }));
+
+    expect(outcome.manifest.phase).toBe("rolled-back");
+    expect(calls[0]).toBe("evidence");
+    expect(existsSync(scratch)).toBe(false);
+    expect(strictBindings(t.homeDir)).toMatchObject({ state: "resolved" });
+  });
+
+  it("a continuation without a binding scratch reads no evidence before its first strict bindings read", async () => {
+    const t = setup();
+    await expect(runMigrationRollback(t.input, t.dependencies(t.coordinator(), {
+      recordActivationWitness: () => { throw new Error("crash before the witness write"); },
+    }))).rejects.toThrow("crash before the witness write");
+    const calls: string[] = [];
+
+    const outcome = await runMigrationRollback(t.input, t.dependencies(t.coordinator(), {
+      resolveActivationEvidence: (request) => { calls.push("evidence"); return readMigrationActivationEvidence(request); },
+      resolveWitnessBindings: (request) => { calls.push("bindings"); return resolveMigrationWitnessBindings(request); },
+    }));
+
+    expect(outcome.manifest.phase).toBe("rolled-back");
+    expect(calls[0]).toBe("bindings");
+  });
+
+  it("a different witness minted by the resumed readback gets its own binding next to the recovered one", async () => {
+    const t = setup();
+    const scratch = await interruptedRun(t);
+    const minted = JSON.parse(readFileSync(scratch, "utf8")).binding.witnessChecksumSha256 as string;
+    const earlier = storedRollbackWitness(t.homeDir, 1);
+    recordMigrationActivationWitness({ homeDir: t.homeDir, generationId: GEN, witness: earlier });
+    rewriteScratch(t, scratch, { witnessChecksumSha256: earlier.checksumSha256 });
+    expect(earlier.checksumSha256).not.toBe(minted);
+
+    const outcome = await runMigrationRollback(t.input, t.dependencies(t.coordinator()));
+
+    expect(outcome.manifest.phase).toBe("rolled-back");
+    const resolved = strictBindings(t.homeDir);
+    expect(resolved.state === "resolved" && resolved.witnesses.filter((binding) => binding.kind === "rollback")
+      .map((binding) => binding.witnessChecksumSha256).sort()).toEqual([earlier.checksumSha256, minted].sort());
+    expect(bindingEntries(t.homeDir).filter((name) => name.endsWith(".tmp"))).toEqual([]);
+  });
+
+  it("refuses and preserves everything when the leftover is for another revision, epoch, attempt or an unstored witness", async () => {
+    const cases: Array<readonly [string, (t: ReturnType<typeof setup>, scratch: string) => string]> = [
+      ["another revision", (t, scratch) => rewriteScratch(t, scratch, { manifestRevision: t.store.read(GEN).revision + 1 })],
+      ["another epoch", (t, scratch) => rewriteScratch(t, scratch, { epochId: "another-epoch" })],
+      ["another attempt", (t, scratch) => rewriteScratch(t, scratch, { attemptId: "another-attempt" })],
+      ["a checksum that is not a stored witness", (t, scratch) => rewriteScratch(t, scratch, { witnessChecksumSha256: "f".repeat(64) })],
+    ];
+    for (const [, change] of cases) {
+      const t = setup();
+      const scratch = change(t, await interruptedRun(t));
+      await expectRefused(t, scratch, refusedContinuation);
+    }
+  });
+
+  it("refuses and preserves everything when the stored witness it names is the activation witness", async () => {
+    const t = setup();
+    const scratch = await interruptedRun(t);
+    const activation = fixtureActivationScenario({
+      generationId: GEN, destinationIdentity, censusVector: baselineCensus, canonicalDeltaBaseline: baseline,
+    }).witness;
+    unlinkSync(migrationWitnessBindingPath(t.homeDir, GEN, activation.checksumSha256));
+    await expectRefused(t, rewriteScratch(t, scratch, { witnessChecksumSha256: activation.checksumSha256 }), refusedContinuation);
+  });
+
+  it("refuses and preserves everything when the bindings already hold a rollback selection", async () => {
+    const t = setup();
+    const scratch = await interruptedRun(t);
+    expect(strictBindings(t.homeDir).state).toBe("unresolvable");
+    // Only the leftover scratch makes the strict read unresolvable; the selection is added with the scratch set aside.
+    const aside = join(tempHome(), "aside");
+    renameSync(scratch, aside);
+    const [activation] = (strictBindings(t.homeDir) as { selections: MigrationSelectionBinding[] }).selections;
+    recordMigrationSelectionBinding({
+      homeDir: t.homeDir, generationId: GEN, binding: { ...activation!, kind: "rollback", manifestRevision: activation!.manifestRevision + 50 },
+    });
+    renameSync(aside, scratch);
+    await expectRefused(t, scratch, refusedContinuation);
+  });
+
+  it("keeps the existing refusals when the artifact is absent or names another activation, preserving the scratch", async () => {
+    const missing = setup();
+    const missingScratch = await interruptedRun(missing);
+    unlinkSync(artifactPath(missing.homeDir));
+    await expectRefused(missing, missingScratch, {
+      reason: "unexpected-state", message: expect.stringContaining("no durable rollback-authority artifact exists"),
+    });
+
+    const foreign = setup();
+    const foreignScratch = await interruptedRun(foreign);
+    replaceArtifact(foreign.homeDir, { epochId: "another-epoch" });
+    await expectRefused(foreign, foreignScratch, refusedContinuation);
+
+    const otherAttempt = setup();
+    const otherAttemptScratch = await interruptedRun(otherAttempt);
+    replaceArtifact(otherAttempt.homeDir, { attemptId: "another-attempt" });
+    await expectRefused(otherAttempt, otherAttemptScratch, refusedContinuation);
+  });
+
+  it("keeps the artifact reader's own refusal for a corrupt or version-1 artifact, publishing nothing", async () => {
+    const corrupt = setup();
+    const corruptScratch = await interruptedRun(corrupt);
+    chmodSync(artifactPath(corrupt.homeDir), 0o600);
+    const original = readFileSync(artifactPath(corrupt.homeDir), "utf8");
+    const tampered = original.replace(/"epochId":"[0-9a-f]/u, '"epochId":"g');
+    expect(tampered).not.toBe(original);
+    writeFileSync(artifactPath(corrupt.homeDir), tampered);
+    chmodSync(artifactPath(corrupt.homeDir), 0o400);
+    await expectRefused(corrupt, corruptScratch, { name: "MigrationProtocolError", message: expect.stringContaining("checksum") });
+
+    const legacy = setup();
+    const legacyScratch = await interruptedRun(legacy);
+    replaceArtifact(legacy.homeDir, { version: 1 });
+    await expectRefused(legacy, legacyScratch, { reason: "unexpected-state" });
+  });
+
+  it("leaves both leftovers and publishes nothing when an evidence scratch accompanies the binding scratch", async () => {
+    const t = setup();
+    const scratch = await interruptedRun(t);
+    const extra = plantEvidenceScratch(t.homeDir, storedRollbackWitness(t.homeDir, 1));
+    const before = { ...snapshot(t, scratch), extra: readFileSync(extra, "utf8") };
+
+    await expect(runMigrationRollback(t.input, t.dependencies(t.coordinator()))).rejects.toMatchObject(refusedContinuation);
+
+    expect({ ...snapshot(t, scratch), extra: readFileSync(extra, "utf8") }).toEqual(before);
+  });
+
+  it("fresh entry stays strict: a leftover binding that would qualify mid-rollback is refused and preserved", async () => {
+    const t = setup();
+    const witness = storedRollbackWitness(t.homeDir);
+    recordMigrationActivationWitness({ homeDir: t.homeDir, generationId: GEN, witness });
+    const scratch = join(migrationGenerationBindingDirectory(t.homeDir, GEN), scratchName(witness.checksumSha256));
+    const clean = tempHome();
+    const binding = { kind: "rollback", epochId: witness.epochId, attemptId: witness.attemptId, manifestRevision: t.store.read(GEN).revision, witnessChecksumSha256: witness.checksumSha256 } as const;
+    recordMigrationWitnessBinding({ homeDir: clean, generationId: GEN, binding });
+    writeFileSync(scratch, readFileSync(migrationWitnessBindingPath(clean, GEN, witness.checksumSha256), "utf8"), { mode: 0o600 });
+    const before = snapshot(t, scratch);
+
+    await expect(runMigrationRollback(t.input, t.dependencies(t.coordinator())))
+      .rejects.toMatchObject({ name: "RollbackOrchestrationError", reason: "not-eligible", message: unresolvable });
+
+    expect(snapshot(t, scratch)).toEqual(before);
+  });
+
+  it("a pending publish-rollback stays strict: a leftover binding that would qualify mid-rollback is refused and preserved", async () => {
+    vi.stubEnv("LCM_POSTGRES_URL", "postgresql://user:secret@example/db");
+    try {
+      const t = setup();
+      await expect(runMigrationRollback(t.input, t.dependencies(t.sharedLeaseCoordinator("prepared")))).rejects.toThrow("crash at prepared");
+      expect(t.pending()?.kind).toBe("publish-rollback");
+      await t.sharedLeaseCoordinator().abort();
+      const extra = storedRollbackWitness(t.homeDir, 1);
+      recordMigrationActivationWitness({ homeDir: t.homeDir, generationId: GEN, witness: extra });
+      const clean = tempHome();
+      const binding = { kind: "rollback", epochId: extra.epochId, attemptId: extra.attemptId, manifestRevision: t.store.read(GEN).revision, witnessChecksumSha256: extra.checksumSha256 } as const;
+      recordMigrationWitnessBinding({ homeDir: clean, generationId: GEN, binding });
+      const scratch = join(migrationGenerationBindingDirectory(t.homeDir, GEN), scratchName(extra.checksumSha256));
+      writeFileSync(scratch, readFileSync(migrationWitnessBindingPath(clean, GEN, extra.checksumSha256), "utf8"), { mode: 0o600 });
+      const before = snapshot(t, scratch);
+
+      await expect(runMigrationRollback(t.input, t.dependencies(t.sharedLeaseCoordinator()))).rejects.toMatchObject({
+        name: "MigrationBindingUnresolvableError", message: expect.stringContaining("is not an authenticated writer scratch file"),
+      });
+
+      expect(snapshot(t, scratch)).toEqual(before);
+    } finally {
+      vi.unstubAllEnvs();
+    }
+  });
+
+  it("a refusal of the short append barrier propagates before anything is recovered, leaving the scratch and the rollback state", async () => {
+    const t = setup();
+    const scratch = await interruptedRun(t);
+    rewriteMaintenance(t.homeDir, (journal) => { journal.phase = "maintenance-entering"; });
+    const before = snapshot(t, scratch);
+
+    await expect(runMigrationRollback(t.input, t.dependencies(t.coordinator())))
+      .rejects.toMatchObject({ message: expect.stringContaining("backend maintenance is not ready for local append") });
+
+    expect(snapshot(t, scratch)).toEqual(before);
   });
 });

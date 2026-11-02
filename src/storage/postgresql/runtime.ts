@@ -52,6 +52,8 @@ export interface PostgreSqlRuntimeDependencies {
   readonly acquireMutationGuard?: typeof acquirePostgreSqlProjectMutationGuard;
   /** Missing publication admission fails closed; the default always provides it. */
   readonly acquirePublicationLock?: typeof acquirePostgreSqlProjectPublicationLock;
+  /** Monotonic millisecond clock for idle-connection validation; defaults to performance.now. */
+  readonly now?: () => number;
 }
 
 export const POSTGRESQL_RUNTIME_DEFAULT_DEPENDENCIES: PostgreSqlRuntimeDependencies = {
@@ -68,6 +70,18 @@ const DEFAULT_POSTGRESQL_TRANSACTION_CONTEXT = {
 } as const satisfies PostgreSqlOperationContext;
 
 const savepointExecutionContext = new AsyncLocalStorage<object>();
+
+/**
+ * A pooled connection released this long ago or longer is probed with
+ * SELECT 1 at checkout. A reuse inside the window keeps the #1820 query
+ * deadline as its only bound, so a hot pool pays no extra round trip. Not
+ * configurable.
+ */
+const IDLE_VALIDATION_THRESHOLD_MS = 1_000;
+
+function defaultNow(): number {
+  return performance.now();
+}
 
 type HealthRow = {
   server_encoding: unknown;
@@ -320,12 +334,73 @@ async function ignoreCancellationFailure(cancellation: Promise<void>): Promise<v
   }
 }
 
+/** A pool checkout with the observer that records its asynchronous 'error' events. */
+interface Checkout {
+  readonly client: PoolClient;
+  readonly watch: CheckoutAsyncFailureWatch;
+}
+
+type ConnectOutcome =
+  | ({ readonly kind: "connected" } & Checkout)
+  | { readonly kind: "failed"; readonly error: unknown };
+
+type ProbeOutcome =
+  | { readonly ok: true }
+  | { readonly ok: false; readonly error: unknown };
+
+type AbortRace<T> =
+  | { readonly aborted: false; readonly value: T }
+  | { readonly aborted: true };
+
+/** The driver's own socket, reached through a narrow view of the client. */
+type ClientWithStream = { readonly connection: { readonly stream: { destroy(): void } } };
+
+async function raceAbort<T>(work: Promise<T>, signal: AbortSignal | undefined): Promise<AbortRace<T>> {
+  if (!signal) return { aborted: false, value: await work };
+  let observeAbort!: () => void;
+  const abortOutcome = new Promise<{ readonly aborted: true }>((resolve) => {
+    observeAbort = () => { resolve({ aborted: true }); };
+  });
+  signal.addEventListener("abort", observeAbort, { once: true });
+  if (signal.aborted) observeAbort();
+  try {
+    return await Promise.race([
+      work.then((value) => ({ aborted: false as const, value })),
+      abortOutcome,
+    ]);
+  } finally {
+    signal.removeEventListener("abort", observeAbort);
+  }
+}
+
+/**
+ * Makes the connection go away now. release(true) alone only starts a
+ * graceful end() on the client, which never completes when the peer has gone
+ * silent and would leak the socket, so the stream is destroyed first. The
+ * error observer stays attached through the destroy and the release, and is
+ * removed only once the client has left our hands.
+ */
+function discardCheckout({ client, watch }: Checkout): void {
+  try {
+    (client as unknown as ClientWithStream).connection.stream.destroy();
+    client.release(true);
+  } finally {
+    watch.detach();
+  }
+}
+
+function connectionLostError(): Error {
+  return new Error("Connection terminated unexpectedly");
+}
+
 export class PostgreSqlRuntime implements PostgreSqlQueryExecutor {
   private readonly clientConfig: ClientConfig;
   private readonly pool: Pool;
   private closed = false;
   private closePromise: Promise<void> | undefined;
   private poolFailed = false;
+  private readonly now: () => number;
+  private readonly releasedAt = new WeakMap<PoolClient, number>();
   private readonly snapshots = new Set<PostgreSqlSnapshotSession>();
 
   constructor(
@@ -339,6 +414,13 @@ export class PostgreSqlRuntime implements PostgreSqlQueryExecutor {
       idleTimeoutMillis: settings.idleTimeoutMs,
     });
     this.pool.on("error", () => { this.poolFailed = true; });
+    this.now = dependencies.now ?? defaultNow;
+    // A connection that returns healthy starts its idle clock; one released
+    // with an error is destroyed by the pool and has no clock to keep.
+    this.pool.on("release", (error: Error | undefined, client: PoolClient) => {
+      if (error) this.releasedAt.delete(client);
+      else this.releasedAt.set(client, this.now());
+    });
   }
 
   async query<R extends QueryResultRow = QueryResultRow, I extends unknown[] = unknown[]>(
@@ -1015,51 +1097,101 @@ export class PostgreSqlRuntime implements PostgreSqlQueryExecutor {
 
   private async acquire(context: PostgreSqlOperationContext & { signal?: AbortSignal }): Promise<PoolClient> {
     const signal = context.signal;
-    if (signal?.aborted) throw aborted(context);
-    if (!signal) return this.pool.connect();
-
-    type ConnectOutcome =
-      | { readonly kind: "connected"; readonly client: PoolClient }
-      | { readonly kind: "failed"; readonly error: unknown };
-    const connectOutcome: Promise<ConnectOutcome> = Promise.resolve()
-      .then(() => this.pool.connect())
-      .then(
-        (client) => ({ kind: "connected" as const, client }),
-        (error: unknown) => ({ kind: "failed" as const, error }),
-      );
-    let observeAbort!: () => void;
-    const abortOutcome = new Promise<{ readonly kind: "aborted" }>((resolve) => {
-      observeAbort = () => { resolve({ kind: "aborted" }); };
-    });
-    signal.addEventListener("abort", observeAbort, { once: true });
-    if (signal.aborted) observeAbort();
-
-    const outcome = await Promise.race([connectOutcome, abortOutcome]);
-    signal.removeEventListener("abort", observeAbort);
-    if (outcome.kind === "aborted") {
-      void connectOutcome.then((lateOutcome) => {
-        if (lateOutcome.kind !== "connected") return;
-        try {
-          lateOutcome.client.release(true);
-        } catch {
-          // The operation has already failed closed; a late client must never
-          // surface credentials or create an unhandled rejection.
-        }
-      });
-      throw aborted(context);
-    }
-    if (outcome.kind === "failed") {
-      if (signal.aborted) throw aborted(context);
-      throw outcome.error;
-    }
-    if (signal.aborted) {
-      try {
-        outcome.client.release(true);
-      } finally {
+    // A silently dead idle connection is found by a bounded SELECT 1 and
+    // replaced; each failed checkout removes one connection from the pool, so
+    // poolMax + 1 checkouts always reach a fresh connection.
+    let staleBefore = Number.NEGATIVE_INFINITY;
+    let probeTimedOut = false;
+    for (let checkouts = 0; checkouts <= this.settings.poolMax; checkouts += 1) {
+      if (signal?.aborted) throw aborted(context);
+      const connecting = this.connectObserved();
+      const connected = await raceAbort(connecting, signal);
+      if (connected.aborted) {
+        void connecting.then((lateOutcome) => {
+          if (lateOutcome.kind !== "connected") return;
+          try {
+            discardCheckout(lateOutcome);
+          } catch {
+            // The operation has already failed closed; a late client must never
+            // surface credentials or create an unhandled rejection.
+          }
+        });
         throw aborted(context);
       }
+      const outcome = connected.value;
+      if (outcome.kind === "failed") {
+        if (signal?.aborted) throw aborted(context);
+        throw outcome.error;
+      }
+      if (signal?.aborted) {
+        discardCheckout(outcome);
+        throw aborted(context);
+      }
+      const { client, watch } = outcome;
+      const releasedAt = this.releasedAt.get(client);
+      if (releasedAt === undefined) {
+        watch.detach();
+        return client;
+      }
+      if (releasedAt <= staleBefore) {
+        discardCheckout(outcome);
+        continue;
+      }
+      const probeStartedAt = this.now();
+      if (probeStartedAt - releasedAt < IDLE_VALIDATION_THRESHOLD_MS) {
+        watch.detach();
+        return client;
+      }
+      if (probeTimedOut) {
+        // One probe timeout per acquire: once it is spent, any other
+        // connection old enough to need a probe is discarded unprobed.
+        discardCheckout(outcome);
+        continue;
+      }
+      const probing = this.probeIdleClient(client);
+      const probed = await raceAbort(probing, signal);
+      if (probed.aborted) {
+        discardCheckout(outcome);
+        throw aborted(context);
+      }
+      const asyncFailure = watch.failed();
+      if (probed.value.ok && !asyncFailure) {
+        watch.detach();
+        return client;
+      }
+      discardCheckout(outcome);
+      const failure = probed.value.ok ? undefined : probed.value.error;
+      if (asyncFailure || (failure instanceof Error && failure.message === "Query read timeout")) {
+        // Every connection idle since before this probe began is as suspect as
+        // the one that just failed; connections released later are not.
+        if (!signal?.aborted) staleBefore = Math.max(staleBefore, probeStartedAt);
+        probeTimedOut = true;
+      } else if (!isPostgreSqlConnectionError(failure)) {
+        throw failure;
+      }
     }
-    return outcome.client;
+    throw connectionLostError();
+  }
+
+  /** Connects through the pool and observes the client's 'error' events from the moment it resolves. */
+  private connectObserved(): Promise<ConnectOutcome> {
+    return Promise.resolve()
+      .then(() => this.pool.connect())
+      .then(
+        (client) => ({ kind: "connected" as const, client, watch: watchCheckoutAsyncFailure(client) }),
+        (error: unknown) => ({ kind: "failed" as const, error }),
+      );
+  }
+
+  private probeIdleClient(client: PoolClient): Promise<ProbeOutcome> {
+    const probe: QueryConfig & { query_timeout: number } = {
+      text: "SELECT 1",
+      query_timeout: Math.max(1, this.settings.connectionTimeoutMs),
+    };
+    return client.query(probe).then(
+      () => ({ ok: true as const }),
+      (error: unknown) => ({ ok: false as const, error }),
+    );
   }
 
   private async queryClient<

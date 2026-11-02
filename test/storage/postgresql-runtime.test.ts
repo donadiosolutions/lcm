@@ -125,11 +125,12 @@ function fixtures(
   queryImplementation?: (input: unknown) => unknown,
   admission?: Partial<Pick<
     PostgreSqlRuntimeDependencies,
-    "acquireMutationGuard" | "acquirePublicationLock"
+    "acquireMutationGuard" | "acquirePublicationLock" | "now"
   >>,
 ) {
   let poolError: (() => void) | undefined;
-  const release = vi.fn();
+  let poolRelease: ((error: unknown, client: PoolClient) => void) | undefined;
+  const release = vi.fn((error?: unknown) => { poolRelease?.(error, poolClient); });
   const query = vi.fn((input: unknown) => {
     if (
       typeof input === "object"
@@ -141,13 +142,20 @@ function fixtures(
     }
     return queryImplementation?.(input) ?? result([]);
   });
-  const poolClient = Object.assign(new EventEmitter(), { query, release }) as unknown as PoolClient;
+  const poolClient = Object.assign(new EventEmitter(), {
+    query,
+    release,
+    connection: { stream: { destroy: vi.fn() } },
+  }) as unknown as PoolClient;
   const connect = vi.fn(async () => poolClient);
   const end = vi.fn(async () => undefined);
   const pool = {
     connect,
     end,
-    on: vi.fn((_event: string, listener: () => void) => { poolError = listener; }),
+    on: vi.fn((event: string, listener: never) => {
+      if (event === "error") poolError = listener;
+      if (event === "release") poolRelease = listener;
+    }),
   } as unknown as Pool;
   const cancelQuery = vi.fn(async () => result([{ cancelled: true }]));
   const cancelEnd = vi.fn(async () => undefined);
@@ -161,6 +169,8 @@ function fixtures(
     createPool: vi.fn(() => pool),
     createClient: vi.fn(() => cancelClient),
     buildConfig,
+    // A frozen clock keeps every ordinary fixture below the idle-validation threshold.
+    now: () => 0,
     acquireMutationGuard: vi.fn(async () => undefined),
     acquirePublicationLock: vi.fn(async () => undefined),
     ...admission,
@@ -3173,3 +3183,390 @@ describe("PostgreSQL runtime query read timeout", () => {
     expect(f.release).toHaveBeenCalledWith(false);
   });
 });
+
+describe("PostgreSQL runtime idle connection validation", () => {
+  const requested = { text: "SELECT requested" };
+  const probe = { text: "SELECT 1", query_timeout: 100 };
+
+  interface IdleClient {
+    readonly client: PoolClient;
+    readonly query: ReturnType<typeof vi.fn>;
+    readonly release: ReturnType<typeof vi.fn>;
+    readonly destroy: ReturnType<typeof vi.fn>;
+    readonly emitter: EventEmitter;
+  }
+
+  function harness(options: { readonly defaultClock?: boolean; readonly settings?: PostgreSqlConnectionSettings } = {}) {
+    let clock = 0;
+    let onRelease: ((error: unknown, client: PoolClient) => void) | undefined;
+    const queue: IdleClient[] = [];
+    const connect = vi.fn(async () => {
+      const next = queue.shift();
+      if (!next) throw new Error("no client queued");
+      return next.client;
+    });
+    const pool = {
+      connect,
+      end: vi.fn(async () => undefined),
+      on: vi.fn((event: string, listener: never) => { if (event === "release") onRelease = listener; }),
+    } as unknown as Pool;
+    const runtime = new PostgreSqlRuntime(options.settings ?? SETTINGS, {
+      createPool: () => pool,
+      createClient: () => ({}) as unknown as Client,
+      buildConfig: () => ({}),
+      ...(options.defaultClock ? {} : { now: () => clock }),
+    });
+    const api = {
+      runtime,
+      connect,
+      queue,
+      setClock: (value: number) => { clock = value; },
+      emitRelease: (idle: IdleClient, error?: unknown) => { onRelease?.(error, idle.client); },
+      client: (handler?: (input: unknown) => unknown): IdleClient => {
+        const emitter = new EventEmitter();
+        const destroy = vi.fn();
+        const query = vi.fn(async (input: unknown) => handler?.(input) ?? result([]));
+        const release = vi.fn((error?: unknown) => { onRelease?.(error, idle.client); });
+        const client = Object.assign(emitter, {
+          query,
+          release,
+          connection: { stream: { destroy } },
+        }) as unknown as PoolClient;
+        const idle: IdleClient = { client, query, release, destroy, emitter };
+        return idle;
+      },
+      request: (signal?: AbortSignal) => runtime.query(requested, {
+        domain: "factory", operation: "idleProbe", ...(signal === undefined ? {} : { signal }),
+      }),
+      /** Runs one ordinary query on the client at the given time so its release starts an idle clock. */
+      warm: async (idle: IdleClient, at: number) => {
+        clock = at;
+        queue.push(idle);
+        await api.request();
+        idle.query.mockClear();
+        idle.release.mockClear();
+      },
+    };
+    return api;
+  }
+
+  const isProbe = (input: unknown): boolean => (input as { text?: string }).text === "SELECT 1";
+  const timeoutFailure = (): Error => new Error("Query read timeout");
+
+  it("returns a fresh connection without a probe", async () => {
+    const h = harness();
+    const a = h.client();
+    h.queue.push(a);
+    await h.request();
+    expect(a.query.mock.calls).toEqual([[requested]]);
+  });
+
+  it("returns a connection reused below the threshold without a probe", async () => {
+    const h = harness();
+    const a = h.client();
+    await h.warm(a, 0);
+    h.setClock(999);
+    h.queue.push(a);
+    await h.request();
+    expect(a.query.mock.calls).toEqual([[requested]]);
+  });
+
+  it("probes a connection idle for exactly the threshold and reuses it on success", async () => {
+    const h = harness();
+    let observed = -1;
+    const a = h.client((input) => {
+      if (isProbe(input)) observed = a.emitter.listenerCount("error");
+      return undefined;
+    });
+    await h.warm(a, 0);
+    h.setClock(1_000);
+    h.queue.push(a);
+    await h.request();
+    expect(a.query.mock.calls).toEqual([[probe], [requested]]);
+    expect(observed).toBe(1);
+    expect(a.emitter.listenerCount("error")).toBe(0);
+    expect(a.destroy).not.toHaveBeenCalled();
+    expect(a.release).toHaveBeenCalledTimes(1);
+    expect(a.release).toHaveBeenCalledWith(false);
+  });
+
+  it("consults performance.now when no clock is injected", async () => {
+    let t = 0;
+    const now = vi.spyOn(performance, "now").mockImplementation(() => t);
+    try {
+      const h = harness({ defaultClock: true });
+      const a = h.client();
+      await h.warm(a, 0);
+      t = 5_000;
+      h.queue.push(a);
+      await h.request();
+      expect(a.query.mock.calls).toEqual([[probe], [requested]]);
+    } finally {
+      now.mockRestore();
+    }
+  });
+
+  it("destroys a connection whose probe times out and serves the request on a fresh one", async () => {
+    const h = harness();
+    const a = h.client((input) => { if (isProbe(input)) throw timeoutFailure(); return undefined; });
+    const b = h.client();
+    await h.warm(a, 0);
+    h.setClock(5_000);
+    h.queue.push(a, b);
+    await expect(h.request()).resolves.toMatchObject({ rows: [] });
+    expect(a.query.mock.calls).toEqual([[probe]]);
+    expect(a.destroy).toHaveBeenCalledTimes(1);
+    expect(a.release).toHaveBeenCalledTimes(1);
+    expect(a.release).toHaveBeenCalledWith(true);
+    expect(a.destroy.mock.invocationCallOrder[0]!).toBeLessThan(a.release.mock.invocationCallOrder[0]!);
+    expect(a.emitter.listenerCount("error")).toBe(0);
+    expect(b.query.mock.calls).toEqual([[requested]]);
+  });
+
+  it("recovers from a probe timeout while the request holds a live abort signal", async () => {
+    const h = harness();
+    const controller = new AbortController();
+    const a = h.client((input) => { if (isProbe(input)) throw timeoutFailure(); return undefined; });
+    // A cancellable request resolves its backend pid first, then submits a Query object.
+    const b = h.client((input) => {
+      if ((input as { text?: string }).text === "SELECT pg_backend_pid() AS pid") return result([{ pid: 7 }]);
+      (input as QueryWithCallback).callback(null, result([]));
+      return undefined;
+    });
+    await h.warm(a, 0);
+    h.setClock(5_000);
+    h.queue.push(a, b);
+    await expect(h.request(controller.signal)).resolves.toMatchObject({ rows: [] });
+    expect(a.destroy).toHaveBeenCalledTimes(1);
+    expect(a.query.mock.calls).toEqual([[probe]]);
+    expect(b.release).toHaveBeenCalledWith(false);
+  });
+
+  it("discards a stale idle sibling without probing it", async () => {
+    const h = harness();
+    const a = h.client((input) => { if (isProbe(input)) throw timeoutFailure(); return undefined; });
+    const b = h.client();
+    const c = h.client();
+    await h.warm(a, 0);
+    await h.warm(b, 0);
+    h.setClock(5_000);
+    h.queue.push(a, b, c);
+    await expect(h.request()).resolves.toMatchObject({ rows: [] });
+    expect(b.query).not.toHaveBeenCalled();
+    expect(b.destroy).toHaveBeenCalledTimes(1);
+    expect(b.release).toHaveBeenCalledWith(true);
+    expect(c.query.mock.calls).toEqual([[requested]]);
+  });
+
+  it("keeps a sibling released after the failed probe began", async () => {
+    const h = harness();
+    const b = h.client();
+    const a = h.client((input) => {
+      if (isProbe(input)) {
+        h.setClock(5_010);
+        h.emitRelease(b);
+        throw timeoutFailure();
+      }
+      return undefined;
+    });
+    await h.warm(a, 0);
+    h.setClock(5_000);
+    h.queue.push(a, b);
+    await expect(h.request()).resolves.toMatchObject({ rows: [] });
+    expect(b.query.mock.calls).toEqual([[requested]]);
+    expect(b.destroy).not.toHaveBeenCalled();
+  });
+
+  it("probes at most once per acquire when a sibling ages past the threshold during the probe", async () => {
+    const h = harness();
+    const b = h.client();
+    const c = h.client();
+    const a = h.client((input) => {
+      if (isProbe(input)) {
+        h.setClock(5_500);
+        h.emitRelease(b);
+        h.setClock(7_000);
+        throw timeoutFailure();
+      }
+      return undefined;
+    });
+    await h.warm(a, 0);
+    h.setClock(5_000);
+    h.queue.push(a, b, c);
+    await expect(h.request()).resolves.toMatchObject({ rows: [] });
+    expect(b.query).not.toHaveBeenCalled();
+    expect(b.destroy).toHaveBeenCalledTimes(1);
+    expect(b.release).toHaveBeenCalledWith(true);
+    expect(c.query.mock.calls).toEqual([[requested]]);
+  });
+
+  it("does not record a connection released with an error", async () => {
+    const h = harness();
+    const a = h.client();
+    await h.warm(a, 0);
+    h.emitRelease(a, new Error("destroyed"));
+    h.setClock(5_000);
+    h.queue.push(a);
+    await h.request();
+    expect(a.query.mock.calls).toEqual([[requested]]);
+  });
+
+  it("destroys only the failing connection on a connection error other than a timeout", async () => {
+    const h = harness();
+    const a = h.client((input) => {
+      if (isProbe(input)) throw new Error("Connection terminated unexpectedly");
+      return undefined;
+    });
+    const b = h.client();
+    await h.warm(a, 0);
+    await h.warm(b, 0);
+    h.setClock(5_000);
+    h.queue.push(a, b);
+    await expect(h.request()).resolves.toMatchObject({ rows: [] });
+    expect(a.destroy).toHaveBeenCalledTimes(1);
+    expect(a.release).toHaveBeenCalledWith(true);
+    expect(b.query.mock.calls).toEqual([[probe], [requested]]);
+    expect(b.destroy).not.toHaveBeenCalled();
+  });
+
+  it("replaces a connection whose probe rejects with a non-Error transport failure", async () => {
+    const h = harness();
+    const a = h.client((input) => {
+      if (isProbe(input)) throw { code: "ECONNRESET" };
+      return undefined;
+    });
+    const b = h.client();
+    await h.warm(a, 0);
+    h.setClock(5_000);
+    h.queue.push(a, b);
+    await expect(h.request()).resolves.toMatchObject({ rows: [] });
+    expect(a.destroy).toHaveBeenCalledTimes(1);
+    expect(b.query.mock.calls).toEqual([[requested]]);
+  });
+
+  it("surfaces a server error from the probe after destroying only that connection", async () => {
+    const h = harness();
+    const a = h.client((input) => {
+      if (isProbe(input)) throw Object.assign(new Error("canceling statement"), { code: "57014" });
+      return undefined;
+    });
+    const b = h.client();
+    await h.warm(a, 0);
+    await h.warm(b, 0);
+    h.setClock(5_000);
+    h.queue.push(a, b);
+    await expect(h.request()).rejects.toMatchObject({ sqlState: "57014", operation: "idleProbe" });
+    expect(a.destroy).toHaveBeenCalledTimes(1);
+    expect(a.release).toHaveBeenCalledWith(true);
+    expect(b.query).not.toHaveBeenCalled();
+    expect(b.destroy).not.toHaveBeenCalled();
+    expect(h.queue).toEqual([b]);
+  });
+
+  it.each([
+    ["resolves after", (a: IdleClient) => {
+      a.emitter.emit("error", Object.assign(new Error("terminating connection"), { code: "57P01" }));
+      return result([]);
+    }],
+    ["rejects after", (a: IdleClient) => {
+      a.emitter.emit("error", Object.assign(new Error("terminating connection"), { code: "57P01" }));
+      throw new Error("Connection terminated unexpectedly");
+    }],
+  ])("treats a probe that %s an asynchronous connection error as a failure", async (_label, onProbe) => {
+    const h = harness();
+    const a = h.client((input) => (isProbe(input) ? onProbe(a) : undefined));
+    const b = h.client();
+    const c = h.client();
+    await h.warm(a, 0);
+    await h.warm(b, 0);
+    h.setClock(5_000);
+    h.queue.push(a, b, c);
+    await expect(h.request()).resolves.toMatchObject({ rows: [] });
+    expect(a.destroy).toHaveBeenCalledTimes(1);
+    expect(b.query).not.toHaveBeenCalled();
+    expect(b.destroy).toHaveBeenCalledTimes(1);
+    expect(c.query.mock.calls).toEqual([[requested]]);
+  });
+
+  it("destroys a client whose probe is outstanding when the request aborts", async () => {
+    const h = harness();
+    const controller = new AbortController();
+    const a = h.client((input) => (isProbe(input) ? new Promise(() => undefined) : undefined));
+    const b = h.client();
+    await h.warm(a, 0);
+    await h.warm(b, 0);
+    h.setClock(5_000);
+    h.queue.push(a, b);
+    const pending = h.request(controller.signal);
+    await vi.waitFor(() => expect(a.query).toHaveBeenCalledWith(probe));
+    controller.abort();
+    await expect(pending).rejects.toMatchObject({ operation: "idleProbe", retryable: false });
+    expect(a.destroy).toHaveBeenCalledTimes(1);
+    expect(a.release).toHaveBeenCalledWith(true);
+    expect(h.queue).toEqual([b]);
+    // The abort did not condemn the sibling: the next request probes it.
+    await h.request();
+    expect(b.query.mock.calls).toEqual([[probe], [requested]]);
+    expect(b.destroy).not.toHaveBeenCalled();
+  });
+
+  it("stops without another checkout or a stale mark when the request aborts as a probe times out", async () => {
+    const h = harness();
+    let aborted = false;
+    const signal = {
+      get aborted() { return aborted; },
+      addEventListener: vi.fn(),
+      removeEventListener: vi.fn(),
+    } as unknown as AbortSignal;
+    const a = h.client((input) => {
+      if (isProbe(input)) {
+        // Flips after the acquisition has started waiting on the probe, and without an abort event.
+        return Promise.resolve().then(() => {
+          aborted = true;
+          throw timeoutFailure();
+        });
+      }
+      return undefined;
+    });
+    const b = h.client();
+    await h.warm(a, 0);
+    await h.warm(b, 0);
+    h.setClock(5_000);
+    h.queue.push(a, b);
+    await expect(h.request(signal)).rejects.toMatchObject({ operation: "idleProbe", retryable: false });
+    expect(a.destroy).toHaveBeenCalledTimes(1);
+    expect(h.queue).toEqual([b]);
+    aborted = false;
+    await h.request();
+    expect(b.query.mock.calls).toEqual([[probe], [requested]]);
+  });
+
+  it("fails with a retryable connection error when every checkout is stale", async () => {
+    const h = harness();
+    const a = h.client((input) => { if (isProbe(input)) throw timeoutFailure(); return undefined; });
+    const b = h.client();
+    const c = h.client();
+    await h.warm(a, 0);
+    await h.warm(b, 0);
+    await h.warm(c, 0);
+    h.setClock(5_000);
+    h.queue.push(a, b, c);
+    await expect(h.request()).rejects.toMatchObject({ retryable: true, operation: "idleProbe" });
+    for (const idle of [a, b, c]) expect(idle.destroy).toHaveBeenCalledTimes(1);
+    expect(b.query).not.toHaveBeenCalled();
+    expect(c.query).not.toHaveBeenCalled();
+  });
+
+  it("surfaces a connect failure that follows a destroyed connection", async () => {
+    const h = harness();
+    const a = h.client((input) => { if (isProbe(input)) throw timeoutFailure(); return undefined; });
+    await h.warm(a, 0);
+    h.setClock(5_000);
+    h.connect.mockImplementationOnce(async () => a.client);
+    h.connect.mockRejectedValueOnce(Object.assign(new Error("refused"), { code: "ECONNREFUSED" }));
+    await expect(h.request()).rejects.toMatchObject({ retryable: true, operation: "idleProbe", sqlState: null });
+    expect(a.destroy).toHaveBeenCalledTimes(1);
+    expect(h.connect).toHaveBeenCalledTimes(3);
+  });
+});
+

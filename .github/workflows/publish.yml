@@ -698,11 +698,12 @@ jobs:
         if: ${{ steps.npm_guard.outputs.already_published != 'true' }}
         env:
           RELEASE_CHANNEL: ${{ needs.preflight.outputs.channel }}
+          RELEASE_VERSION: ${{ needs.preflight.outputs.version }}
         run: |
           set -Eeuo pipefail
           tag="$RELEASE_CHANNEL"
           [[ "$tag" == stable ]] && tag=latest
-          node trusted/.github/scripts/publish-npm-tarball.mjs release-artifact "$tag"
+          node trusted/.github/scripts/publish-npm-tarball.mjs release-artifact "$tag" "$RELEASE_VERSION"
 
       - name: Verify npm package and dist-tags
         env:
@@ -1042,11 +1043,12 @@ jobs:
         if: ${{ needs.recover-preflight.outputs.already_published != 'true' && steps.npm.outputs.already_published != 'true' }}
         env:
           RELEASE_CHANNEL: ${{ needs.recover-preflight.outputs.channel }}
+          RELEASE_VERSION: ${{ needs.recover-preflight.outputs.version }}
         run: |
           set -Eeuo pipefail
           tag="$RELEASE_CHANNEL"
           [[ "$tag" == stable ]] && tag=latest
-          node trusted/.github/scripts/publish-npm-tarball.mjs release-artifact "$tag"
+          node trusted/.github/scripts/publish-npm-tarball.mjs release-artifact "$tag" "$RELEASE_VERSION"
 
       - name: Verify npm package and dist-tags
         env:

@@ -18,6 +18,49 @@ import {
 
 beforeAll(assertHarnessReady);
 
+interface RelayedConnection {
+  readonly downstream: Socket;
+  readonly upstream: Socket;
+}
+
+/**
+ * A TCP relay in front of the database whose replies can be dropped on demand.
+ * Dropping only the server-to-client direction while still delivering the
+ * client's bytes models a path that silently stops answering: writes succeed,
+ * nothing comes back, and the client sees neither a reset nor a close.
+ */
+async function startBlackHoleRelay(runtimeUrl: string) {
+  const target = new URL(runtimeUrl);
+  const sockets = new Set<Socket>();
+  const connections: RelayedConnection[] = [];
+  let forwarding = true;
+  const relay = createServer((downstream) => {
+    const upstream = connect({
+      host: target.hostname.replace(/^\[|\]$/gu, ""),
+      port: target.port === "" ? 5432 : Number(target.port),
+    });
+    sockets.add(downstream);
+    sockets.add(upstream);
+    connections.push({ downstream, upstream });
+    downstream.on("error", () => upstream.destroy());
+    upstream.on("error", () => downstream.destroy());
+    downstream.on("close", () => upstream.destroy());
+    upstream.on("close", () => downstream.destroy());
+    downstream.pipe(upstream);
+    upstream.on("data", (chunk: Buffer) => { if (forwarding) downstream.write(chunk); });
+  });
+  await new Promise<void>((resolve) => { relay.listen(0, "127.0.0.1", resolve); });
+  return {
+    port: (relay.address() as { port: number }).port,
+    connections,
+    setForwarding: (value: boolean) => { forwarding = value; },
+    close: async () => {
+      for (const socket of sockets) socket.destroy();
+      await new Promise<void>((resolve) => { relay.close(() => { resolve(); }); });
+    },
+  };
+}
+
 const REQUIRED_RUNTIME_GRANT_SCRIPTS = [
   "postgresql-runtime-readiness-grants.sql",
   "postgresql-runtime-identity-grants.sql",
@@ -288,25 +331,7 @@ describe("PostgreSQL 18 runtime", () => {
 
   it("abandons a query on a connection that stops answering and recovers on a fresh connection", async () => {
     await withPostgreSqlTestDatabase("query-read-timeout", async (database) => {
-      const target = new URL(database.runtimeUrl);
-      const sockets = new Set<Socket>();
-      let forwarding = true;
-      const relay = createServer((downstream) => {
-        const upstream = connect({
-          host: target.hostname.replace(/^\[|\]$/gu, ""),
-          port: target.port === "" ? 5432 : Number(target.port),
-        });
-        sockets.add(downstream);
-        sockets.add(upstream);
-        downstream.on("error", () => upstream.destroy());
-        upstream.on("error", () => downstream.destroy());
-        downstream.on("close", () => upstream.destroy());
-        upstream.on("close", () => downstream.destroy());
-        downstream.pipe(upstream);
-        upstream.on("data", (chunk: Buffer) => { if (forwarding) downstream.write(chunk); });
-      });
-      await new Promise<void>((resolve) => { relay.listen(0, "127.0.0.1", resolve); });
-      const relayPort = (relay.address() as { port: number }).port;
+      const relay = await startBlackHoleRelay(database.runtimeUrl);
       const connectionSettings = settings(database.runtimeUrl, {
         poolMax: 1,
         connectionTimeoutMs: 1_000,
@@ -316,10 +341,13 @@ describe("PostgreSQL 18 runtime", () => {
       // bound to the URL host, so TLS is unchanged.
       const runtime = new PostgreSqlRuntime(connectionSettings, {
         ...POSTGRESQL_RUNTIME_DEFAULT_DEPENDENCIES,
+        // A frozen clock keeps the warmed connection below the idle-validation
+        // threshold, so this case exercises the in-flight query deadline alone.
+        now: () => 0,
         buildConfig: (candidate) => ({
           ...POSTGRESQL_RUNTIME_DEFAULT_DEPENDENCIES.buildConfig(candidate),
           host: "127.0.0.1",
-          port: relayPort,
+          port: relay.port,
         }),
       });
       let watchdog: NodeJS.Timeout | undefined;
@@ -327,7 +355,7 @@ describe("PostgreSQL 18 runtime", () => {
         const warm = await runtime.query<{ pid: number }>({ text: "SELECT pg_backend_pid() AS pid" }, {
           domain: "factory", operation: "warmRelay",
         });
-        forwarding = false;
+        relay.setForwarding(false);
         const deadline = postgreSqlQueryDeadlineMs(connectionSettings);
         const started = Date.now();
         // A deadline regression leaves the query pending; the watchdog turns that into a
@@ -347,19 +375,99 @@ describe("PostgreSQL 18 runtime", () => {
         const elapsed = Date.now() - started;
         expect(elapsed).toBeGreaterThanOrEqual(deadline - 250);
         expect(elapsed).toBeLessThan(15_000);
-        forwarding = true;
+        relay.setForwarding(true);
         const fresh = await runtime.query<{ pid: number }>({ text: "SELECT pg_backend_pid() AS pid" }, {
           domain: "factory", operation: "afterBlackHole",
         });
         expect(fresh.rows[0].pid).not.toBe(warm.rows[0].pid);
       } finally {
         clearTimeout(watchdog);
-        for (const socket of sockets) socket.destroy();
-        await new Promise<void>((resolve) => { relay.close(() => { resolve(); }); });
+        await relay.close();
         await runtime.close();
       }
     });
   }, 30_000);
+
+  it("probes idle pooled connections that stopped answering and replaces them within two connection timeouts", async () => {
+    await withPostgreSqlTestDatabase("idle-probe", async (database) => {
+      const relay = await startBlackHoleRelay(database.runtimeUrl);
+      const connectionSettings = settings(database.runtimeUrl, {
+        poolMax: 2,
+        connectionTimeoutMs: 1_000,
+        // Far above the expected outcome, so the statement deadline cannot be what ends the request.
+        statementTimeoutMs: 30_000,
+        // Keep the pool from retiring the idle connections before the probe meets them.
+        idleTimeoutMs: 60_000,
+      });
+      const runtime = new PostgreSqlRuntime(connectionSettings, {
+        ...POSTGRESQL_RUNTIME_DEFAULT_DEPENDENCIES,
+        buildConfig: (candidate) => ({
+          ...POSTGRESQL_RUNTIME_DEFAULT_DEPENDENCIES.buildConfig(candidate),
+          host: "127.0.0.1",
+          port: relay.port,
+        }),
+      });
+      const admin = new PostgreSqlRuntime(settings(database.adminUrl));
+      let watchdog: NodeJS.Timeout | undefined;
+      try {
+        // Two overlapping queries force the pool to open, then idle, both slots.
+        const warmed = await Promise.all([0, 1].map(async (slot) => (
+          await runtime.query<{ pid: number }>({
+            text: "SELECT pg_backend_pid() AS pid, pg_sleep(0.3)",
+          }, { domain: "factory", operation: "warmSlot" + String(slot) })
+        ).rows[0].pid));
+        const warmedPids = new Set(warmed);
+        expect(warmedPids.size).toBe(2);
+        expect(relay.connections).toHaveLength(2);
+
+        // Longer than the one-second idle-validation threshold, shorter than any timeout.
+        await new Promise((resolve) => setTimeout(resolve, 1_500));
+        relay.setForwarding(false);
+        const started = Date.now();
+        // A regression leaves the request waiting on the 30 s statement deadline; the watchdog
+        // turns that into a failed assertion so the cleanup below still runs.
+        const expired = new Promise<never>((_resolve, reject) => {
+          watchdog = setTimeout(() => { reject(new Error("idle probe watchdog expired")); }, 15_000);
+        });
+        // The probe on the first idle connection times out, the second is discarded without a
+        // probe, and the replacement connection cannot be opened through the dead path either.
+        await expect(Promise.race([runtime.query({ text: "SELECT 1" }, {
+          domain: "factory", operation: "idleBlackHole",
+        }), expired])).rejects.toMatchObject({
+          code: "STORAGE_OPERATION_FAILED",
+          backend: "postgresql",
+          operation: "idleBlackHole",
+          retryable: true,
+          sqlState: null,
+        });
+        const elapsed = Date.now() - started;
+        expect(elapsed).toBeGreaterThanOrEqual(connectionSettings.connectionTimeoutMs - 250);
+        expect(elapsed).toBeLessThanOrEqual(2 * connectionSettings.connectionTimeoutMs + 1_500);
+
+        relay.setForwarding(true);
+        const fresh = await runtime.query<{ pid: number }>({ text: "SELECT pg_backend_pid() AS pid" }, {
+          domain: "factory", operation: "afterIdleBlackHole",
+        });
+        expect(warmedPids.has(fresh.rows[0].pid)).toBe(false);
+
+        // Both warmed connections were torn down, not merely abandoned: the client sockets
+        // are closed as seen by the relay, and the backends are gone from the server.
+        await expect.poll(
+          () => relay.connections.slice(0, 2).every(({ downstream, upstream }) => downstream.destroyed && upstream.destroyed),
+          { timeout: 5_000 },
+        ).toBe(true);
+        await expect.poll(async () => (await admin.query({
+          text: "SELECT pid FROM pg_stat_activity WHERE pid = ANY($1::int[])",
+          values: [warmed],
+        }, { domain: "factory", operation: "warmedBackendsGone" })).rowCount, { timeout: 5_000 }).toBe(0);
+      } finally {
+        clearTimeout(watchdog);
+        await relay.close();
+        await runtime.close();
+        await admin.close();
+      }
+    });
+  }, 45_000);
 
   it("fails an idle runtime transaction killed by the server with a handled storage error", async () => {
     await withPostgreSqlTestDatabase("transaction-idle-kill", async (database) => {
