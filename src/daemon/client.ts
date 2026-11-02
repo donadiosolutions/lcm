@@ -271,7 +271,9 @@ export class DaemonClient {
     const controller = new AbortController();
     const abort = (): void => controller.abort(options?.signal?.reason);
     options?.signal?.addEventListener("abort", abort, { once: true });
-    const timer = setTimeout(() => controller.abort(), Math.max(0, deadline - performance.now()));
+    const timer = options?.timeoutMs === undefined
+      ? undefined
+      : setTimeout(() => controller.abort(), Math.max(0, deadline - performance.now()));
     try {
       const peer = await awaitDaemonPeerAdmission(this.admitPeer, this.port, deadline, controller.signal);
       throwIfAborted(options?.signal);
@@ -282,7 +284,11 @@ export class DaemonClient {
         if (controller.signal.aborted || performance.now() >= deadline) throw new DaemonPeerRefusalError();
       };
       assertCurrent();
-      return await send(peer, { ...options, timeoutMs, signal: controller.signal }, assertCurrent);
+      return await send(peer, {
+        ...options,
+        ...(options?.timeoutMs === undefined ? {} : { timeoutMs }),
+        signal: controller.signal,
+      }, assertCurrent);
     } catch (error) {
       throwIfAborted(options?.signal);
       if (controller.signal.aborted && !(error instanceof DaemonPeerRefusalError)) {

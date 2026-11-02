@@ -1061,9 +1061,11 @@ already loaded a token.
 Missing, unsafe, ambiguous or expired evidence causes refusal. Pre-tool recall
 returns no hint and does not start a daemon. Diagnostic reads and doctor remain
 observational; use `lcm daemon status` to inspect the daemon and
-`lcm daemon restart` to request recovery. The existing request deadline includes
+`lcm daemon restart` to request recovery. An explicit request timeout includes
 recipient verification, response headers and the response body; retries do not
-renew the operation's deadline.
+renew it. Requests without a response timeout keep that behavior, while recipient
+verification, token reads and serialization remain subject to the two-second
+admission deadline.
 
 These paths support Linux and macOS recipient verification. On Windows they
 currently refuse authenticated requests because equivalent process-owner and

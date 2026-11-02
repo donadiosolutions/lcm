@@ -1,4 +1,4 @@
-import { createServer, request, type Server } from "node:http";
+import { createServer, request, type Server, type ServerResponse } from "node:http";
 import { mkdtempSync, mkdirSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -106,6 +106,96 @@ describe("verified local daemon client", () => {
     expect(requests).toEqual([]);
   });
 
+  it("keeps the default admission bounded when no response timeout was requested", async () => {
+    vi.useFakeTimers({ toFake: ["setTimeout", "clearTimeout"] });
+    try {
+      let resolve!: (peer: { pid: number; birth: string }) => void;
+      const readToken = vi.spyOn(auth, "readAuthToken");
+      const serialize = vi.fn();
+      const client = new DaemonClient(`http://127.0.0.1:${port}`, undefined,
+        () => new Promise(done => { resolve = done; }));
+      const refused = expect(client.post("/store", { toJSON: serialize }))
+        .rejects.toBeInstanceOf(DaemonPeerRefusalError);
+      await vi.advanceTimersByTimeAsync(2_000);
+      await refused;
+      resolve({ pid: 42, birth: "birth" });
+      await vi.advanceTimersByTimeAsync(0);
+      expect(readToken).not.toHaveBeenCalled();
+      expect(serialize).not.toHaveBeenCalled();
+      expect(request).not.toHaveBeenCalled();
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it("allows a response beyond two seconds when the caller omitted a timeout", async () => {
+    vi.useFakeTimers({ toFake: ["setTimeout", "clearTimeout"] });
+    try {
+      let received!: () => void;
+      const arrived = new Promise<void>(resolve => { received = resolve; });
+      server.removeAllListeners("request");
+      server.on("request", (incoming, response) => {
+        incoming.resume();
+        incoming.on("end", () => {
+          setTimeout(() => response.end('{"stored":true}'), 3_000);
+          received();
+        });
+      });
+      const client = verifiedLocalDaemonClient(port, undefined, homeDir);
+      const result = expect(client.post("/promote-events/all", {})).resolves.toEqual({ stored: true });
+      await arrived;
+      await vi.advanceTimersByTimeAsync(3_000);
+      await result;
+      expect(admitCurrentDaemonPeer).toHaveBeenCalledOnce();
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it("retains the explicit whole-response deadline", async () => {
+    vi.useFakeTimers({ toFake: ["setTimeout", "clearTimeout"] });
+    try {
+      let received!: (response: ServerResponse) => void;
+      const arrived = new Promise<ServerResponse>(resolve => { received = resolve; });
+      server.removeAllListeners("request");
+      server.on("request", (incoming, response) => {
+        incoming.resume();
+        incoming.on("end", () => received(response));
+      });
+      const client = verifiedLocalDaemonClient(port, undefined, homeDir);
+      const result = expect(client.post("/store", {}, { timeoutMs: 1_000 })).rejects.toThrow("timed out");
+      const response = await arrived;
+      await vi.advanceTimersByTimeAsync(1_000);
+      await result;
+      response.end('{"stored":true}');
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it("retains caller cancellation while an unbudgeted response is pending", async () => {
+    vi.useFakeTimers({ toFake: ["setTimeout", "clearTimeout"] });
+    try {
+      let received!: (response: ServerResponse) => void;
+      const arrived = new Promise<ServerResponse>(resolve => { received = resolve; });
+      server.removeAllListeners("request");
+      server.on("request", (incoming, response) => {
+        incoming.resume();
+        incoming.on("end", () => received(response));
+      });
+      const controller = new AbortController();
+      const client = verifiedLocalDaemonClient(port, undefined, homeDir);
+      const result = expect(client.post("/store", {}, { signal: controller.signal })).rejects.toMatchObject({ name: "AbortError" });
+      const response = await arrived;
+      await vi.advanceTimersByTimeAsync(3_000);
+      controller.abort();
+      await result;
+      response.end('{"stored":true}');
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
   it("preserves health, classified observation and GET for an admitted peer", async () => {
     const client = verifiedLocalDaemonClient(port, undefined, homeDir);
     await expect(client.health()).resolves.toMatchObject({ pid: 42 });
@@ -121,30 +211,30 @@ describe("verified local daemon client", () => {
     await expect(client.observeClassified()).resolves.toEqual({ kind: "failed", failure: { reason: "invalid-identity" } });
   });
 
-  it("checks elapsed time again after token I/O and before body serialization", async () => {
+  it.each([undefined, 50])("checks elapsed time after token I/O before serialization (timeout %s)", async timeoutMs => {
     let now = performance.now();
     vi.spyOn(performance, "now").mockImplementation(() => now);
-    vi.spyOn(auth, "readAuthToken").mockImplementation(() => { now += 100; return "token"; });
+    vi.spyOn(auth, "readAuthToken").mockImplementation(() => { now += 2_500; return "token"; });
     const serialize = vi.fn();
     const client = verifiedLocalDaemonClient(port, undefined, homeDir);
-    await expect(client.post("/store", { toJSON: serialize }, { timeoutMs: 50 }))
+    await expect(client.post("/store", { toJSON: serialize }, timeoutMs === undefined ? undefined : { timeoutMs }))
       .rejects.toBeInstanceOf(DaemonPeerRefusalError);
     expect(serialize).not.toHaveBeenCalled();
     expect(requests).toEqual([]);
   });
 
-  it("refuses before opening transport when serialization exhausts the original deadline", async () => {
+  it.each([undefined, 50])("refuses transport when serialization exhausts its original deadline (timeout %s)", async timeoutMs => {
     let now = performance.now();
     vi.spyOn(performance, "now").mockImplementation(() => now);
     const serialize = vi.fn(() => {
-      now += 100;
+      now += 2_500;
       return { query: "private query" };
     });
     const connection = vi.fn();
     server.on("connection", connection);
     const client = verifiedLocalDaemonClient(port, undefined, homeDir);
 
-    await expect(client.post("/store", { toJSON: serialize }, { timeoutMs: 50 }))
+    await expect(client.post("/store", { toJSON: serialize }, timeoutMs === undefined ? undefined : { timeoutMs }))
       .rejects.toBeInstanceOf(DaemonPeerRefusalError);
     await new Promise<void>(resolve => setImmediate(resolve));
 
