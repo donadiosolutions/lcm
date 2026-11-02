@@ -268,7 +268,7 @@ function isCanonicalSha(value) {
   return typeof value === "string" && /^[0-9a-f]{40}$/u.test(value);
 }
 
-function readMergeParents(runGit, commit, cwd, description) {
+function readCommitParents(runGit, commit, cwd, description) {
   const parentOutput = runGit(["show", "-s", "--format=%P", commit], cwd);
   if (typeof parentOutput !== "string") {
     throw new Error(`${description} merge parent identity is invalid`);
@@ -277,17 +277,21 @@ function readMergeParents(runGit, commit, cwd, description) {
     .split(/\s+/u)
     .filter(Boolean)
     .map(normalizeSha);
-  if (parents.length !== 2 || parents.some((parent) => !isCanonicalSha(parent))) {
+  if (parents.some((parent) => !isCanonicalSha(parent))) {
     throw new Error(`${description} merge parent identity is invalid`);
   }
   return parents;
 }
 
-export function assertExactPullRequestMerge(
-  pr,
-  commit,
-  { runGit = defaultRunGit, cwd = process.cwd(), requiredBase },
-) {
+function readMergeParents(runGit, commit, cwd, description) {
+  const parents = readCommitParents(runGit, commit, cwd, description);
+  if (parents.length !== 2) {
+    throw new Error(`${description} merge parent identity is invalid`);
+  }
+  return parents;
+}
+
+function assertExactMergeMetadata(pr, commit, requiredBase) {
   const sha = normalizeSha(commit);
   if (
     !isCanonicalSha(sha) ||
@@ -300,8 +304,9 @@ export function assertExactPullRequestMerge(
       `Pull request #${pr?.number ?? "unknown"} is not the exact ${requiredBase} merge for ${commit}`,
     );
   }
+}
 
-  const parents = readMergeParents(runGit, commit, cwd, `Pull request #${pr.number}`);
+function assertSecondParentIsHead(pr, parents) {
   const headSha = normalizeSha(pr.head?.sha);
   // GitHub base.sha identifies the associated base ref OID, not a guaranteed merge parent.
   // The exact PR metadata plus local two-parent topology supplies base provenance.
@@ -310,6 +315,61 @@ export function assertExactPullRequestMerge(
     parents[1] !== headSha
   ) {
     throw new Error(`Pull request #${pr.number} merge parent identity is invalid`);
+  }
+}
+
+export function assertExactPullRequestMerge(
+  pr,
+  commit,
+  { runGit = defaultRunGit, cwd = process.cwd(), requiredBase },
+) {
+  assertExactMergeMetadata(pr, commit, requiredBase);
+  const parents = readMergeParents(runGit, commit, cwd, `Pull request #${pr.number}`);
+  assertSecondParentIsHead(pr, parents);
+  return Object.freeze({ pr, parents: Object.freeze(parents) });
+}
+
+// Main merge of PR #593, which introduced two-parent merge authentication.
+// Squash merges at or before it predate that policy.
+export const LEGACY_SQUASH_MERGE_BOUNDARY = "91cbc485fc1282a9c2720bfbdbe37a08df76d20f";
+
+// Release-note variant for main PRs: two-parent merges are checked exactly as in
+// assertExactPullRequestMerge; a single-parent squash merge is accepted only from
+// exact GitHub metadata when it is an ancestor of the legacy boundary.
+export function assertReleaseNotePullRequestMerge(
+  pr,
+  commit,
+  {
+    runGit = defaultRunGit,
+    cwd = process.cwd(),
+    requiredBase,
+    isAncestor = defaultIsAncestor,
+    legacySquashMergeBoundary = LEGACY_SQUASH_MERGE_BOUNDARY,
+  },
+) {
+  assertExactMergeMetadata(pr, commit, requiredBase);
+  const description = `Pull request #${pr.number}`;
+  const parents = readCommitParents(runGit, commit, cwd, description);
+  if (parents.length === 2) {
+    assertSecondParentIsHead(pr, parents);
+    return Object.freeze({ pr, parents: Object.freeze(parents) });
+  }
+  if (parents.length !== 1) {
+    throw new Error(`${description} merge parent identity is invalid`);
+  }
+  let legacy;
+  try {
+    legacy = isAncestor(normalizeSha(commit), legacySquashMergeBoundary, cwd);
+  } catch (error) {
+    throw new Error(`${description} legacy squash ancestry evidence is invalid`, {
+      cause: error,
+    });
+  }
+  if (typeof legacy !== "boolean") {
+    throw new Error(`${description} legacy squash ancestry evidence is invalid`);
+  }
+  if (!legacy) {
+    throw new Error(`${description} merge parent identity is invalid`);
   }
   return Object.freeze({ pr, parents: Object.freeze(parents) });
 }
@@ -502,7 +562,11 @@ export async function collectReleasePullRequests({
   runGit = defaultRunGit,
   mainRef = "origin/main",
   isAncestor = defaultIsAncestor,
+  legacySquashMergeBoundary = LEGACY_SQUASH_MERGE_BOUNDARY,
 }) {
+  if (!isCanonicalSha(legacySquashMergeBoundary)) {
+    throw new TypeError("legacySquashMergeBoundary must be a canonical 40-hex SHA");
+  }
   const output = runGit(
     ["rev-list", "--first-parent", "--reverse", `${baseTag}..${targetTag}`],
     cwd,
@@ -576,11 +640,21 @@ export async function collectReleasePullRequests({
   for (const selection of uniqueSelections) {
     const pull_number = selection.pr.number;
     const { data: pr } = await github.rest.pulls.get({ owner, repo, pull_number });
-    assertExactPullRequestMerge(pr, selection.commit, {
-      runGit,
-      cwd,
-      requiredBase: selection.requiredBase,
-    });
+    if (selection.requiredBase === "main") {
+      assertReleaseNotePullRequestMerge(pr, selection.commit, {
+        runGit,
+        cwd,
+        requiredBase: selection.requiredBase,
+        isAncestor,
+        legacySquashMergeBoundary,
+      });
+    } else {
+      assertExactPullRequestMerge(pr, selection.commit, {
+        runGit,
+        cwd,
+        requiredBase: selection.requiredBase,
+      });
+    }
     const files = await github.paginate(github.rest.pulls.listFiles, {
       owner,
       repo,

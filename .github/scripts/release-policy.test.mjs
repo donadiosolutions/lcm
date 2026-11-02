@@ -2,6 +2,7 @@ import assert from "node:assert/strict";
 import test from "node:test";
 import { assertVerifiedReleaseTag } from "./release-tag-policy.mjs";
 import {
+  LEGACY_SQUASH_MERGE_BOUNDARY,
   NPM_QUERY_TIMEOUT_MS,
   NPM_VERIFY_DELAYS_MS,
   RELEASE_DRAFT_MARKER,
@@ -1104,6 +1105,174 @@ test("paginates every commit-to-PR association lookup", async () => {
     commit_sha: commit,
     per_page: 100,
   });
+});
+
+const LEGACY_COMMIT = "4c058106bb94f4e75bf8f3e67feb6bb2b349a414";
+const LEGACY_PARENT = "2893450cb8d22720ae621ee7aee855629087b878";
+
+function createLegacySquashFixture({
+  parentOutput = LEGACY_PARENT,
+  prOverrides = {},
+  isAncestor,
+  extra = {},
+} = {}) {
+  const associatedPullRequest = pr(220, [], {
+    base: { ref: "main" },
+    head: { ref: "feature/220", sha: "d".repeat(40) },
+    merge_commit_sha: LEGACY_COMMIT,
+    ...prOverrides,
+  });
+  const gitCalls = [];
+  const ancestorCalls = [];
+  const options = {
+    github: {
+      paginate: async (endpoint) => endpoint(),
+      rest: {
+        repos: { listPullRequestsAssociatedWithCommit: () => [associatedPullRequest] },
+        pulls: {
+          get: async () => ({ data: associatedPullRequest }),
+          listFiles: () => [],
+        },
+      },
+    },
+    owner: "donadiosolutions",
+    repo: "lcm",
+    baseTag: "v1.4.3",
+    targetTag: "v2.0.0-alpha.0",
+    cwd: "/workspace",
+    runGit: (args, cwd) => {
+      gitCalls.push({ args, cwd });
+      return args[0] === "show" ? parentOutput : LEGACY_COMMIT;
+    },
+    isAncestor: (...args) => {
+      ancestorCalls.push(args);
+      return isAncestor(...args);
+    },
+    ...extra,
+  };
+  return { options, associatedPullRequest, gitCalls, ancestorCalls };
+}
+
+test("collects a historical single-parent squash merge at or before the legacy boundary", async () => {
+  const fixture = createLegacySquashFixture({ isAncestor: () => true });
+
+  const entries = await collectReleasePullRequests(fixture.options);
+
+  assert.deepEqual(entries, [{ pr: fixture.associatedPullRequest, changesetContents: [] }]);
+  assert.deepEqual(fixture.ancestorCalls, [
+    [LEGACY_COMMIT, LEGACY_SQUASH_MERGE_BOUNDARY, "/workspace"],
+  ]);
+  assert.equal(LEGACY_SQUASH_MERGE_BOUNDARY, "91cbc485fc1282a9c2720bfbdbe37a08df76d20f");
+});
+
+test("rejects a single-parent squash merge that is not behind the legacy boundary", async () => {
+  const fixture = createLegacySquashFixture({ isAncestor: () => false });
+
+  await assert.rejects(
+    () => collectReleasePullRequests(fixture.options),
+    /Pull request #220 merge parent identity is invalid/u,
+  );
+  assert.equal(fixture.ancestorCalls.length, 1);
+});
+
+test("fails closed when legacy squash ancestry evidence is not a boolean or throws", async () => {
+  for (const result of [undefined, "true", 1, null]) {
+    const fixture = createLegacySquashFixture({ isAncestor: () => result });
+    await assert.rejects(
+      () => collectReleasePullRequests(fixture.options),
+      /legacy squash ancestry evidence is invalid/u,
+    );
+  }
+  const failure = new Error("fatal: Not a valid commit name");
+  const fixture = createLegacySquashFixture({
+    isAncestor: () => {
+      throw failure;
+    },
+  });
+  await assert.rejects(
+    () => collectReleasePullRequests(fixture.options),
+    (error) =>
+      /legacy squash ancestry evidence is invalid/u.test(error.message) && error.cause === failure,
+  );
+});
+
+test("still requires exact metadata for a historical single-parent squash merge", async () => {
+  for (const prOverrides of [
+    { merge_commit_sha: "e".repeat(40) },
+    { base: { ref: "release" } },
+    { merged_at: null },
+    { draft: true },
+  ]) {
+    const fixture = createLegacySquashFixture({ prOverrides, isAncestor: () => true });
+    await assert.rejects(() => collectReleasePullRequests(fixture.options));
+    assert.deepEqual(fixture.ancestorCalls, []);
+  }
+});
+
+test("rejects zero, three or malformed parents without consulting legacy ancestry", async () => {
+  const threeParents = [LEGACY_PARENT, "a".repeat(40), "b".repeat(40)].join(" ");
+  for (const parentOutput of ["", threeParents, "not-a-sha"]) {
+    const fixture = createLegacySquashFixture({ parentOutput, isAncestor: () => true });
+    await assert.rejects(
+      () => collectReleasePullRequests(fixture.options),
+      /Pull request #220 merge parent identity is invalid/u,
+    );
+    assert.deepEqual(fixture.ancestorCalls, []);
+  }
+});
+
+test("two-parent merges never consult legacy ancestry and still require the head as second parent", async () => {
+  const headSha = "d".repeat(40);
+  const accepted = createLegacySquashFixture({
+    parentOutput: [LEGACY_PARENT, headSha].join(" "),
+    isAncestor: () => true,
+  });
+  assert.deepEqual(await collectReleasePullRequests(accepted.options), [
+    { pr: accepted.associatedPullRequest, changesetContents: [] },
+  ]);
+  assert.deepEqual(accepted.ancestorCalls, []);
+  assert.equal(accepted.gitCalls.filter(({ args }) => args[0] === "show").length, 1);
+
+  const mismatched = createLegacySquashFixture({
+    parentOutput: [LEGACY_PARENT, "e".repeat(40)].join(" "),
+    isAncestor: () => true,
+  });
+  await assert.rejects(
+    () => collectReleasePullRequests(mismatched.options),
+    /Pull request #220 merge parent identity is invalid/u,
+  );
+  assert.deepEqual(mismatched.ancestorCalls, []);
+});
+
+test("assertExactPullRequestMerge keeps rejecting single-parent squash merges", () => {
+  const squash = pr(220, [], {
+    head: { ref: "feature/220", sha: "d".repeat(40) },
+    merge_commit_sha: LEGACY_COMMIT,
+  });
+  assert.throws(
+    () =>
+      assertExactPullRequestMerge(squash, LEGACY_COMMIT, {
+        runGit: () => LEGACY_PARENT,
+        requiredBase: "main",
+      }),
+    /Pull request #220 merge parent identity is invalid/u,
+  );
+});
+
+test("rejects a legacy squash boundary that is not a canonical SHA", async () => {
+  for (const legacySquashMergeBoundary of [
+    "91cbc485",
+    "g".repeat(40),
+    "91CBC485FC1282A9C2720BFBDBE37A08DF76D20F",
+    null,
+    42,
+  ]) {
+    const fixture = createLegacySquashFixture({
+      isAncestor: () => true,
+      extra: { legacySquashMergeBoundary },
+    });
+    await assert.rejects(() => collectReleasePullRequests(fixture.options), TypeError);
+  }
 });
 
 test("builds an injection-aware Highlights prompt and validates structured output", () => {
