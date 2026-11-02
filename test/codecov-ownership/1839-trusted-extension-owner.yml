@@ -1,0 +1,9 @@
+references: ["#1839"]
+rationale: >-
+  #1839 accepts PostgreSQL's bootstrap-owned trusted-extension members under
+  the existing PostgreSQL schema component and adds the failed readiness
+  inspection to migration cutover refusal evidence. Both production files
+  retain their existing component owners.
+pins:
+  - ["src/storage/postgresql/runtime-readiness.ts", "integration-postgresql-schema"]
+  - ["src/migration/target-reachability.ts", "unit-migration-cutover"]
