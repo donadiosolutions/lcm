@@ -216,7 +216,9 @@ describe("dedicated PostgreSQL snapshot session", () => {
     const rejected = expect(pending).rejects.toMatchObject({ code: "STORAGE_CLOSED" });
     await f.runtime.close();
     if (releaseFails) f.release.mockImplementationOnce(() => { throw new Error("private late release failure"); });
-    gate.resolve({ query: f.query, release: f.release } as unknown as PoolClient);
+    gate.resolve(Object.assign(new EventEmitter(), {
+      query: f.query, release: f.release, connection: { stream: { destroy: vi.fn() } },
+    }) as unknown as PoolClient);
     await rejected;
     expect(f.release).toHaveBeenCalledExactlyOnceWith(true);
   });
@@ -242,7 +244,9 @@ describe("dedicated PostgreSQL snapshot session", () => {
     const controller = new AbortController();
     f.connect.mockImplementationOnce(async () => {
       queueMicrotask(() => controller.abort());
-      return { query: f.query, release: f.release } as unknown as PoolClient;
+      return Object.assign(new EventEmitter(), {
+        query: f.query, release: f.release, connection: { stream: { destroy: vi.fn() } },
+      }) as unknown as PoolClient;
     });
     await expect(f.runtime.openReadOnlySnapshot({ projectId: "project", signal: controller.signal })).rejects.toMatchObject({ code: "STORAGE_OPERATION_FAILED" });
     expect(f.release).toHaveBeenCalledTimes(1);

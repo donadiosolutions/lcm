@@ -642,10 +642,26 @@ partition) is abandoned by the client after `statementTimeoutMs` plus a
 transport grace of `connectionTimeoutMs` (at least 5 seconds). It then fails
 with a retryable storage error and its connection is discarded. With the
 defaults this is 70 seconds, so a caller whose own deadline is shorter (for
-example a 60 second per-request deadline) still times out first; lower
-`statementTimeoutMs` to detect a dead connection sooner. A migration script
-that sends several statements in one request gets one `statementTimeoutMs`
-per statement. An event-loop stall longer than the deadline can also trip it.
+example a 60 second per-request deadline) still times out first.
+
+A pooled connection that has sat idle for one second or longer is checked with
+a `SELECT 1` of its own, bounded by `connectionTimeoutMs`, before a request uses
+it. A connection that died silently while idle (for example behind a firewall
+that dropped its state) is therefore discarded and replaced instead of holding
+the request for the full deadline above. Once one check has timed out, the
+other idle connections that would need a check are discarded without checking
+them, so a request pays for at most one timed-out check. A connection reused
+within one second of its last use is not checked. A request that checks out a
+connection idle for one second or longer that died silently fails or recovers
+within one probe timeout plus one connect timeout (about 2 x
+`connectionTimeoutMs`, 20 seconds by default), plus any pool-queue wait that
+already exists today. A query already in flight keeps the deadline above, so
+you do not need to lower `statementTimeoutMs` to find dead idle connections
+sooner.
+
+A migration script that sends several statements in one request gets one
+`statementTimeoutMs` per statement. An event-loop stall longer than the deadline
+can also trip it.
 The deadline also covers sending query parameters and receiving results, so a
 very large payload over a slow link can hit it; raise `statementTimeoutMs` for
 such links. The portable transfer destination connection is exempt, so large
