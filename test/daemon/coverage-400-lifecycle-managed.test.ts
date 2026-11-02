@@ -3403,6 +3403,7 @@ describe("issue 400 lifecycle platform and diagnostic edge seams", () => {
       runner: typeof import("node:child_process").spawnSync,
     ): Promise<unknown> => {
       let alive = true;
+      const killProcess = vi.fn(() => { alive = false; });
       const fetch = sequenceFetch([
         healthy(4242),
         healthy(4242),
@@ -3416,23 +3417,35 @@ describe("issue 400 lifecycle platform and diagnostic edge seams", () => {
         spawnSync: runner,
         fetch,
         isAlive: () => alive,
-        killProcess: () => { alive = false; },
+        killProcess,
       });
+      const ensureReplacement = vi.fn(async () => ({ connected: false, port: fixture.port, spawned: true }));
       writeFileSync(fixture.pidPath, "4242");
       ensureAuthToken(fixture.tokenPath);
-      return restartDaemon({
-        ...optionsFor(fixture, {
-        enforceUserManagerParent: false,
-        _platform: platform,
-        _windowsPowerShellPathOverride: powerShell,
-        _ensureDaemonOverride: async () => ({ connected: false, port: fixture.port, spawned: true }),
-        }),
-      });
+      try {
+        return await restartDaemon({
+          ...optionsFor(fixture, {
+            enforceUserManagerParent: false,
+            _platform: platform,
+            _windowsPowerShellPathOverride: powerShell,
+            _ensureDaemonOverride: ensureReplacement,
+          }),
+        });
+      } finally {
+        if (platform === "win32") {
+          expect(vi.mocked(fetch).mock.calls.every(([, init]) => !new Headers(init?.headers).has("Authorization"))).toBe(true);
+          expect(killProcess).not.toHaveBeenCalled();
+          expect(ensureReplacement).not.toHaveBeenCalled();
+          expect(readFileSync(fixture.pidPath, "utf8")).toBe("4242");
+        }
+      }
     };
     const darwin = createFixture({ platform: "darwin", spawnSync: vi.fn(() => ({ status: 0, stdout: "node lcm daemon start --foreground", stderr: "" })) as never });
     expect(darwin.seams.platform).toBe("darwin");
-    await runRestart("darwin", undefined, darwin.seams.spawnSync);
-    await runRestart("win32", "C:\\Windows\\System32\\WindowsPowerShell\\v1.0\\powershell.exe", vi.fn(() => ({ status: 0, stdout: "node lcm daemon start --foreground", stderr: "" })) as never);
+    await expect(runRestart("darwin", undefined, darwin.seams.spawnSync))
+      .resolves.toMatchObject({ restarted: true, stoppedPid: 4242 });
+    await expect(runRestart("win32", "C:\\Windows\\System32\\WindowsPowerShell\\v1.0\\powershell.exe", vi.fn(() => ({ status: 0, stdout: "node lcm daemon start --foreground", stderr: "" })) as never))
+      .rejects.toThrow("not a verified LCM daemon");
     await expect(runRestart("win32", null, vi.fn(() => ({ status: 0, stdout: "node lcm daemon start --foreground", stderr: "" })) as never))
       .rejects.toThrow("not a verified LCM daemon");
     await expect(runRestart("darwin", undefined, vi.fn(() => { throw new Error("ps unavailable"); }) as never))

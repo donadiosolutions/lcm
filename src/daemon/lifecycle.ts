@@ -6,7 +6,7 @@ import {
   resolveWindowsNetstatPath,
   resolveWindowsPowerShellPath,
 } from "./peer-attribution.js";
-import { admitDaemonPeer, awaitDaemonPeerAdmission, type DaemonPeerAdmission, type DaemonPeerAdmissionCallback } from "./peer-admission.js";
+import { admitCurrentDaemonPeer, admitDaemonPeer, awaitDaemonPeerAdmission, type DaemonPeerAdmission, type DaemonPeerAdmissionCallback } from "./peer-admission.js";
 import { randomBytes } from "node:crypto";
 import {
   closeSync,
@@ -1520,13 +1520,16 @@ function lifecyclePeerAdmitter(
         && (opts._testScope !== undefined || opts._hermeticTestSeams !== undefined)) {
         return await opts._admitDaemonPeerForTesting(mode, deadline);
       }
-      return admitDaemonPeer({
+      const peerOptions = {
         port, deadline, now, homeDir: publicationHomeForLifecycle(opts),
-        pidFilePath: opts.pidFilePath, manager,
+        pidFilePath: opts.pidFilePath,
         _platform: dependencies.platform, _procRoot: dependencies.procRoot,
         _spawnSync: dependencies.spawnSync, _uid: dependencies.uid,
         _processBirth: opts._processStartTimeForTesting,
-      });
+      };
+      return mode.kind === "current"
+        ? await admitCurrentDaemonPeer({ ...peerOptions, signal: abortSignal })
+        : admitDaemonPeer({ ...peerOptions, manager });
     };
     try {
       return await awaitDaemonPeerAdmission(operation, port, deadline, abortSignal, now);

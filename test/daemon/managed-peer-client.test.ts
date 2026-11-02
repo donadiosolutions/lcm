@@ -46,6 +46,9 @@ vi.mock("../../src/daemon/supervisor.js", async importOriginal => {
 
 import { verifiedLocalDaemonClient, DaemonPeerRefusalError } from "../../src/daemon/client.js";
 import { admitCurrentDaemonPeer } from "../../src/daemon/peer-admission.js";
+import * as peerAdmission from "../../src/daemon/peer-admission.js";
+import { restartDaemon, type RestartDaemonOptions } from "../../src/daemon/lifecycle.js";
+import { PrivateMutationLockContentionError, processStartTime } from "../../src/private-mutation-lock.js";
 import type { SupervisorSpec } from "../../src/daemon/supervisor.js";
 import { createSupervisorSpec, managedLaunchEnvironment, managedLaunchEnvironmentDigest } from "../../src/daemon/supervisor.js";
 import { managedDaemonPathForStableLaunch } from "../../src/daemon/managed-path.js";
@@ -107,6 +110,28 @@ describe("current guarded client in a Linux sibling user namespace", () => {
     vi.restoreAllMocks();
   });
 
+  function nativeManager(): { pid: number } {
+    state.nativeSupervisor = true;
+    const args = ["/opt/lcm.mjs", "daemon", "start", "--foreground"];
+    const environment = {
+      ...managedLaunchEnvironment(process.env),
+      PATH: managedDaemonPathForStableLaunch(process.execPath, args, join(homeDir, ".lcm")),
+    };
+    const spec = createSupervisorSpec({
+      kind: "systemd-user", stateRoot: join(homeDir, ".lcm"), port, nonce: "managed-launch",
+      executable: process.execPath, args, launchEnvironment: environment,
+    });
+    state.cgroup = `/user.slice/user-${process.getuid!()}.slice/user@${process.getuid!()}.service/app.slice/${spec.systemdUnit}`;
+    const digest = managedLaunchEnvironmentDigest(spec, "systemd-user", process.getuid!(), environment);
+    const manager = { pid: process.pid };
+    state.nativeRun.mockImplementation(() => ({ code: 0, stdout: [
+      "LoadState=loaded", "ActiveState=active", "SubState=running", `MainPID=${manager.pid}`,
+      `ControlGroup=${state.cgroup}`,
+      `Environment=LCM_SUPERVISOR_MARKER=${spec.marker} LCM_SUPERVISOR_SCOPE=${spec.scopeDigest} LCM_SUPERVISOR_STATE_ROOT=${spec.stateRoot} LCM_SUPERVISOR_PORT=${port} LCM_SUPERVISOR_NONCE=${spec.nonce} LCM_SUPERVISOR_EXECUTABLE=${spec.executable} LCM_SUPERVISOR_ARGS=${JSON.stringify(args)} LCM_SUPERVISOR_CWD= LCM_SUPERVISOR_ENV_DIGEST=${digest}`,
+    ].join("\n") }));
+    return manager;
+  }
+
   it("sends through the default factory with hidden fd links and freshly proved manager/cgroup authority", async () => {
     const client = verifiedLocalDaemonClient(port, undefined, homeDir);
     await expect(client.post("/store", { content: "first" })).resolves.toEqual({ stored: true });
@@ -125,34 +150,108 @@ describe("current guarded client in a Linux sibling user namespace", () => {
   });
 
   it("also admits through the real supervisor parser and environment identity, then rejects changed manager PID", async () => {
-    state.nativeSupervisor = true;
-    const args = ["/opt/lcm.mjs", "daemon", "start", "--foreground"];
-    const environment = {
-      ...managedLaunchEnvironment(process.env),
-      PATH: managedDaemonPathForStableLaunch(process.execPath, args, join(homeDir, ".lcm")),
-    };
-    const spec = createSupervisorSpec({
-      kind: "systemd-user", stateRoot: join(homeDir, ".lcm"), port, nonce: "managed-launch",
-      executable: process.execPath, args, launchEnvironment: environment,
-    });
-    state.cgroup = `/user.slice/user-${process.getuid!()}.slice/user@${process.getuid!()}.service/app.slice/${spec.systemdUnit}`;
-    const digest = managedLaunchEnvironmentDigest(spec, "systemd-user", process.getuid!(), environment);
-    let managerPid = process.pid;
-    state.nativeRun.mockImplementation(() => ({ code: 0, stdout: [
-      "LoadState=loaded", "ActiveState=active", "SubState=running", `MainPID=${managerPid}`,
-      `ControlGroup=${state.cgroup}`,
-      `Environment=LCM_SUPERVISOR_MARKER=${spec.marker} LCM_SUPERVISOR_SCOPE=${spec.scopeDigest} LCM_SUPERVISOR_STATE_ROOT=${spec.stateRoot} LCM_SUPERVISOR_PORT=${port} LCM_SUPERVISOR_NONCE=${spec.nonce} LCM_SUPERVISOR_EXECUTABLE=${spec.executable} LCM_SUPERVISOR_ARGS=${JSON.stringify(args)} LCM_SUPERVISOR_CWD= LCM_SUPERVISOR_ENV_DIGEST=${digest}`,
-    ].join("\n") }));
+    const manager = nativeManager();
     const client = verifiedLocalDaemonClient(port, undefined, homeDir);
     await expect(client.post("/store", { content: "native parser" })).resolves.toEqual({ stored: true });
     expect(state.nativeRun).toHaveBeenCalledTimes(2);
-    managerPid += 1;
+    manager.pid += 1;
     const serialize = vi.fn();
     const readToken = vi.spyOn(auth, "readAuthToken");
     await expect(client.post("/store", { toJSON: serialize })).rejects.toBeInstanceOf(DaemonPeerRefusalError);
     expect(readToken).not.toHaveBeenCalled();
     expect(serialize).not.toHaveBeenCalled();
     expect(requests).toHaveLength(1);
+  });
+
+  function currentPublicationScenario() {
+    const manager = nativeManager();
+    let now = 0;
+    const birth = processStartTime(process.pid);
+    if (birth === null) throw new Error("fixture process birth is unavailable");
+    const contention = new PrivateMutationLockContentionError("current daemon holds publication", {
+      contendedLock: {
+        path: join(homeDir, ".lcm.backend-publication.lock"),
+        owner: { version: 1, pid: process.pid, processStartTime: birth, nonce: "a".repeat(32) },
+      },
+    });
+    const admitted = new Error("publication convergence admitted before restart");
+    const validation = vi.fn(() => { throw admitted; });
+    const assertion = vi.fn(() => { if (assertion.mock.calls.length === 1) throw contention; });
+    const fetch = vi.fn(async (input: RequestInfo | URL, _init?: RequestInit) => new Response(JSON.stringify(
+      String(input).endsWith("/stats/pool") ? {} : {
+        status: "ok", version: "1.0.0", storageBackend: "sqlite", pid: process.pid,
+        entrypoint: "/opt/lcm.mjs", runtimeDigest: "a".repeat(64),
+      },
+    ), { status: 200 }));
+    const supervisor = {
+      probe: vi.fn(async (spec: SupervisorSpec) => ({ kind: "unavailable" as const, reason: "manager-unavailable" as const, name: spec.name })),
+      start: vi.fn(), stopAndStart: vi.fn(), stopAndAwaitAbsent: vi.fn(),
+    };
+    const controller = new AbortController();
+    const kill = vi.fn();
+    const options: RestartDaemonOptions = {
+      port, pidFilePath: join(homeDir, ".lcm", "daemon.pid"), spawnTimeoutMs: 2_000,
+      expectedVersion: "1.0.0", expectedStorageBackend: "sqlite", expectedEntrypoint: "/opt/lcm.mjs",
+      expectedRuntimeDigest: "a".repeat(64), enforceUserManagerParent: true,
+      _platform: "linux", _uid: process.getuid!(), _fetchOverride: fetch as typeof globalThis.fetch,
+      _monotonicNowOverride: () => now, _sleepOverride: async delay => { now += delay; },
+      _processStartTimeForTesting: processStartTime,
+      _assertBackendPublication: assertion, _supervisorOverride: supervisor,
+      _abortSignal: controller.signal, _killOverride: kill, validateBeforeRestart: validation,
+    };
+    return { options, manager, contention, admitted, validation, assertion, fetch, supervisor, kill,
+      now: () => now, expire: () => { now = 2_000; } };
+  }
+
+  it("converges current restart publication contention through fresh hidden-fd manager authority", async () => {
+    const scenario = currentPublicationScenario();
+    const proof = vi.spyOn(peerAdmission, "admitCurrentDaemonPeer");
+    const originalEntrypoint = process.argv[1];
+    process.argv[1] = "/opt/lcm-test-runner.mjs";
+    try {
+      await expect(restartDaemon(scenario.options)).rejects.toBe(scenario.admitted);
+    } finally {
+      process.argv[1] = originalEntrypoint;
+    }
+    expect(scenario.assertion).toHaveBeenCalledTimes(2);
+    expect(scenario.validation).toHaveBeenCalledOnce();
+    expect(scenario.now()).toBe(50);
+    expect(scenario.fetch).toHaveBeenCalledTimes(4);
+    expect(scenario.fetch.mock.calls.filter(([, init]) => new Headers(init?.headers).has("Authorization"))).toHaveLength(3);
+    expect(proof.mock.calls.length).toBeGreaterThanOrEqual(6);
+    expect(proof.mock.calls.every(([options]) => options.deadline === 2_000 && options.signal !== undefined)).toBe(true);
+    expect(state.nativeRun.mock.calls.length).toBeGreaterThanOrEqual(12);
+    expect(scenario.supervisor.probe).not.toHaveBeenCalled();
+    expect(scenario.supervisor.stopAndStart).not.toHaveBeenCalled();
+    expect(scenario.kill).not.toHaveBeenCalled();
+  });
+
+  it.each(["missing-pid", "manager-drift", "expired"] as const)("refuses current publication capture before token access on %s", async mode => {
+    const scenario = currentPublicationScenario();
+    if (mode === "missing-pid") unlinkSync(scenario.options.pidFilePath);
+    if (mode === "manager-drift") scenario.manager.pid += 1;
+    if (mode === "expired") {
+      const original = state.nativeRun.getMockImplementation()!;
+      state.nativeRun.mockImplementation(() => {
+        const value = original();
+        scenario.expire();
+        return value;
+      });
+    }
+    const tokenReads = vi.spyOn(securityFiles, "readBoundedRegularFileWithStat");
+    const originalEntrypoint = process.argv[1];
+    process.argv[1] = "/opt/lcm-test-runner.mjs";
+    try {
+      await expect(restartDaemon(scenario.options)).rejects.toBe(scenario.contention);
+    } finally {
+      process.argv[1] = originalEntrypoint;
+    }
+    expect(tokenReads.mock.calls.some(([path]) => String(path).endsWith("daemon.token"))).toBe(false);
+    expect(scenario.fetch.mock.calls.every(([, init]) => !new Headers(init?.headers).has("Authorization"))).toBe(true);
+    expect(scenario.validation).not.toHaveBeenCalled();
+    expect(scenario.supervisor.stopAndStart).not.toHaveBeenCalled();
+    expect(scenario.kill).not.toHaveBeenCalled();
+    if (mode === "missing-pid") expect(state.nativeRun).not.toHaveBeenCalled();
   });
 
   it("refuses a fresh manager cgroup that differs from the kernel listener before token and body", async () => {
