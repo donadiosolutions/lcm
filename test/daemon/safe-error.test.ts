@@ -9251,6 +9251,159 @@ describe("sanitizeError", () => {
       expect(sanitizeError(first)).toBe(first);
       expect(sanitizeError(sanitizeError(first))).toBe(first);
     });
+
+    it.each([
+      [
+        "a file URL with a host authority",
+        "file://server/Users/SECRET/x",
+        "file://server<path>",
+      ],
+      [
+        "an upper-case file URL with a host authority",
+        "FILE://server/Users/SECRET/x",
+        "FILE://server<path>",
+      ],
+      [
+        "a file URL with a host authority and a share path",
+        "file://server/share/S",
+        "file://server<path>",
+      ],
+      [
+        "a mixed-case file URL with a localhost authority",
+        "File://localhost/Users/S/x",
+        "File://localhost<path>",
+      ],
+      ["a file URL with an empty authority", "file:///Users/S/x", "file://<path>"],
+    ] as const)("redacts the path of %s inside the owned query", (_name, value, redacted) => {
+      expectThreePasses(
+        inheritedPublicInput("?key=" + value),
+        inheritedPublicExpected("?key=" + redacted),
+      );
+    });
+
+    it.each([
+      ["fIlE", "LOCALHOST", "/Users/ZQSEC/x", "fIlE://LOCALHOST<path>"],
+      ["file", "server:8080", "/Users/ZQSEC/x", "file://server:8080<path>"],
+      ["file", "user@server", "/share/ZQSH", "file://user@server<path>"],
+      ["file", "10.0.0.1", "/C:/Users/ZQDRV/x", "file://10.0.0.1<path>"],
+      ["file", "[::1]", "/Users/ZQSEC/x", "file://[::1]<path>"],
+      ["file", "server", "/public/ZQPUB/x", "file://server<path>"],
+      ["file", "server", "", "file://server"],
+      ["xfile", "server", "/Users/ZQSEC/x", "xfile://server/Users/ZQSEC/x"],
+      ["zqscheme", "server", "/Users/ZQSEC/x", "zqscheme://server/Users/ZQSEC/x"],
+      ["https", "server", "/Users/ZQSEC/x", "https://server/Users/ZQSEC/x"],
+      ["http", "server", "/public/ZQPUB/x", "http://server/public/ZQPUB/x"],
+    ] as const)(
+      "classifies the owned query value %s://%s%s by its exact scheme",
+      (scheme, authority, path, redacted) => {
+        expectThreePasses(
+          inheritedPublicInput(`?key=${scheme}://${authority}${path}`),
+          inheritedPublicExpected("?key=" + redacted),
+        );
+      },
+    );
+
+    it.each([
+      ["unnamed query", "?"],
+      ["fragment", "#"],
+      ["later ampersand component", "?public=1&k="],
+      ["semicolon component", "?public=1;k="],
+      ["nested link query", "?key=https://inner.test/i?k="],
+    ] as const)("redacts a file URL value in the owned %s", (_name, position) => {
+      expectThreePasses(
+        inheritedPublicInput(position + "file://server/Users/ZQSEC/x"),
+        inheritedPublicExpected(position + "file://server<path>"),
+      );
+    });
+
+    it("redacts a file URL value after an ampersand handoff", () => {
+      expectThreePasses(
+        quotedOwner + "&[file:///b&[https://o?key=FILE://server/Users/ZQSEC/x]]",
+        "file://h?x=['https://outer.test/x?next=file://<path>'&" +
+          "[file://<path>&[https://o?key=FILE://server<path>]]",
+      );
+    });
+
+    it.each([
+      ["query", "?key=file://server/Users/ZQSEC/x", "?key=file://server<path>"],
+      ["fragment", "#File://server/share/ZQSH", "#File://server<path>"],
+    ] as const)("redacts a file URL value in the row-2 sibling %s", (_name, component, redacted) => {
+      const siblingPrefix =
+        quotedPrefix +
+        "\\Users\\ZQA\\x[https://i?key='https://o.test/x?next=file:///Users/ZQR/a'|" +
+        "\\Users\\ZQB\\x][https://j";
+      const redactedSiblingPrefix =
+        redactedQuotedPrefix +
+        "<path>?key='https://o.test/x?next=file://<path>'|<path>][https://j";
+
+      expectThreePasses(siblingPrefix + component + "]]", redactedSiblingPrefix + redacted + "]]");
+    });
+
+    it.each([
+      ["single-quoted file URL", "'file://server/Users/ZQSEC/x'", "'file://server<path>'"],
+      ["double-quoted file URL", '"FILE://server/share/ZQSH"', '"FILE://server<path>"'],
+      [
+        "quoted file URL with a query",
+        "'file://server/Users/ZQSEC/x?n=https://pub.test/ZQPUBT/x'",
+        "'file://server<path>'",
+      ],
+      [
+        "quoted pathless file URL with a link query",
+        "'file://server?n=https://pub.test/ZQPUBT/x'",
+        "'file://server?n=https:<path>'",
+      ],
+      [
+        "quoted public link with a rooted query value",
+        "'https://server/Users/ZQSEC/x?n=/Users/ZQTAIL/y'",
+        "'https://server/Users/ZQSEC/x?n=<path>'",
+      ],
+    ] as const)("keeps the quote boundary of a %s value", (_name, value, redacted) => {
+      expectThreePasses(
+        inheritedPublicInput("?key=" + value),
+        inheritedPublicExpected("?key=" + redacted),
+      );
+    });
+
+    it.each([
+      ["rooted query value", "?n=/Users/ZQTAIL/y", "?n=<path>"],
+      ["rooted fragment value", "#/Users/ZQTAIL/y", "#<path>"],
+      ["backslash query value", "?n=\\Users\\ZQTAIL\\y", "?n=<path>"],
+      ["later rooted query value", "?a=1&n=/Users/ZQTAIL/y", "?a=1&n=<path>"],
+      [
+        "public link query value",
+        "?n=https://pub.test/ZQPUBT/x",
+        "?n=https://pub.test/ZQPUBT/x",
+      ],
+      [
+        "nested link rooted query value",
+        "?n=https://inner?k=/Users/ZQT/y",
+        "?n=https://inner?k=<path>",
+      ],
+    ] as const)("keeps file URL handling for the value's own %s", (_name, tail, redacted) => {
+      expectThreePasses(
+        inheritedPublicInput("?key=file://server/Users/ZQSEC/x" + tail),
+        inheritedPublicExpected("?key=file://server<path>" + redacted),
+      );
+    });
+
+    it("keeps file URL handling for a pathless value's own query", () => {
+      expectThreePasses(
+        inheritedPublicInput("?key=file://server?n=/Users/ZQTAIL/y"),
+        inheritedPublicExpected("?key=file://server?n=<path>"),
+      );
+    });
+
+    it.each([
+      ["rooted sibling", "&s=/Users/ZQSIB/x", "&s=<path>"],
+      ["private-relative sibling", "&s=Users/ZQREL/x", "&s=Users<path>"],
+      ["public rooted sibling", "&s=/public/ZQPS/x", "&s=<path>"],
+      ["rooted sibling after the link close", "]&s=/Users/ZQSIB/x", "]&s=<path>"],
+    ] as const)("redacts a %s after a file URL value", (_name, sibling, redacted) => {
+      expectThreePasses(
+        inheritedPublicInput("?key=file://server/Users/ZQSEC/x" + sibling),
+        inheritedPublicExpected("?key=file://server<path>" + redacted),
+      );
+    });
   });
 
   it("replaces SQLite constraint details with generic message", () => {

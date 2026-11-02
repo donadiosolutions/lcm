@@ -1267,9 +1267,12 @@ function findUrlPathStarts(chars: readonly string[]): UrlPathStarts {
     } else if (restartedPathlessFile && char === "[") {
       fileTailBracketDepth = 1;
     }
-    const inheritedPublicQueryUsesPlainText =
+    const inheritedPublicQueryUsesPlainText: boolean =
       inheritedPublicQueryOwnerWrapperDepths.size > 0 &&
       inheritedPublicPlainTextRegionActive &&
+      // A file URL value admitted inside the region keeps its own file URL
+      // handling for its whole extent, including its query and fragment.
+      !exactFileScheme &&
       (queryOrFragment || separator < 0);
     if (inheritedPublicQueryUsesPlainText) {
       const privateRelativePathStart = inheritedPublicQueryPrivateRelativePathStart(index);
@@ -1855,18 +1858,22 @@ function findUrlPathStarts(chars: readonly string[]): UrlPathStarts {
       if (char === "]") inheritedPublicPlainTextRegionActive = false;
       continue;
     }
-    if (
-      inheritedPublicQueryUsesPlainText &&
-      queryOrFragment &&
-      isUrlSchemeColon(chars, index, queryOrFragmentStart + 1)
-    ) {
+    const inheritedPublicQuerySchemeStart: number =
+      inheritedPublicQueryUsesPlainText && queryOrFragment
+        ? urlSchemeStart(chars, index, queryOrFragmentStart + 1)
+        : -1;
+    if (inheritedPublicQuerySchemeStart >= 0) {
       separator = index;
-      exactFileScheme = false;
+      // A complete URL value keeps its own scheme classification: an exact
+      // file scheme (any letter case) still owns the path after its authority.
+      exactFileScheme =
+        inheritedPublicQuerySchemeStart === index - FILE_SCHEME.length &&
+        isFileUrlLiteral(chars, inheritedPublicQuerySchemeStart);
       foundFilePath = false;
       filePathBracketDepth = 0;
       schemeLength = 0;
       fileSchemeLength = 0;
-      schemeQuote = 0;
+      schemeQuote = quoteCode(chars[inheritedPublicQuerySchemeStart - 1]);
       queryOrFragment = false;
       queryOrFragmentStart = -1;
       authority[index + 1] = 1;

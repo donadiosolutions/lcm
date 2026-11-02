@@ -848,7 +848,10 @@ bundle and keep provider, credential, quarantine, and recovery sessions private.
   link, just as it is in ordinary text. Forward-slash drives keep their letter
   and colon, as in `C:<path>`, and public-looking rooted values such as
   `/public/x` are still filesystem-shaped and become `<path>`. A complete URL
-  used as a value remains URL text, including its own path; its query and
+  used as a value remains URL text. A `file://` value, in any letter case and
+  with any authority, is redacted exactly as a file URL elsewhere: its path
+  after the authority becomes `<path>`, and its own query and fragment follow
+  the usual file URL rules. Other links keep their path; their query and
   fragment follow the same ordinary-text rule recursively.
 
   As an additional conservative rule, a literal `Users/`, `home/`, or `root/`
