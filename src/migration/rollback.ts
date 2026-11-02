@@ -129,8 +129,10 @@ import {
 } from "../storage/backend-publication-material.js";
 import {
   MigrationBindingUnresolvableError,
+  hasInterruptedWitnessBindingWrite,
   recordMigrationSelectionBinding,
   recordMigrationWitnessBinding,
+  recoverInterruptedWitnessBindingWrite,
   resolveMigrationWitnessBindings,
 } from "./generation-binding-store.js";
 import {
@@ -694,6 +696,81 @@ async function recoverInterruptedRollbackWitness(
       epochId: selection.epochId,
       attemptId: selection.attemptId,
       activationWitnessChecksumSha256: selection.witnessChecksumSha256,
+    });
+  });
+}
+
+/**
+ * #1821. A rollback interrupted inside the write of its own rollback witness
+ * binding (after its witness was stored, before the binding's final link)
+ * leaves only the writer scratch of that binding, and every strict binding
+ * read after it refuses the generation as unresolvable -- including the reads
+ * a continuation makes before the writer that would finish the write. Only a
+ * continuation (phase rolling-back, nothing pending) can hold such a scratch:
+ * the binding is written after prepare-rollback completes and before
+ * begin publish-rollback, and the manifest is not republished in between, so
+ * the binding's revision is the revision of the manifest the continuation
+ * reads. Fresh entries and the pending publish-rollback recoveries stay
+ * strict.
+ *
+ * Before those reads, finish that one write when it is provably this
+ * rollback's: the bindings hold no rollback selection and their last
+ * activation selection names the activation being rolled back, the durable
+ * rollback-authority artifact names the same epoch and attempt, the leftover
+ * is the canonical rollback binding of that pair at the continuation's
+ * manifest revision, and the strictly resolved evidence store holds the
+ * rollback witness it binds (the reader enforces that every stored witness
+ * reproduces from its epoch and attempt). The revision is compared with the
+ * snapshot the continuation already holds (current is read before any
+ * barrier); the short append barrier serializes discovery, proof and
+ * publication against cooperating publishers but does not freshen it. A later
+ * record of the same witness reuses the published final and its revision
+ * (first write wins).
+ *
+ * The recovered binding is not a selection: it names an already stored,
+ * reproducible rollback witness of the selected activation. Authority follows
+ * the last activation selection and consults witness bindings only to refuse
+ * bound-but-missing evidence, which the resolved evidence excludes; the other
+ * readers select by selections or by an activation-kind witness binding. The
+ * proof deliberately does not tie the binding to the checksum the next fenced
+ * readback will mint (that would recreate the cycle): a different witness
+ * minted later gets its own binding, as in the takeover-and-retry case the
+ * store supports. Anything unproven is left alone and the strict readers
+ * refuse it as before; the proof and publication run in one short append
+ * barrier, and barrier refusals propagate leaving the scratch and the
+ * rollback state as they were.
+ */
+async function recoverInterruptedRollbackWitnessBinding(
+  input: Readonly<RunMigrationRollbackInput>,
+  deps: Readonly<ResolvedRollbackDependencies>,
+  current: MigrationManifest,
+): Promise<void> {
+  const generation = { homeDir: input.homeDir, generationId: input.generationId };
+  if (!hasInterruptedWitnessBindingWrite(generation)) return;
+  await withBackendPublicationAppendBarrierAsync(input.homeDir, () => {
+    recoverInterruptedWitnessBindingWrite({
+      ...generation,
+      admit: (binding, resolution) => {
+        const activations = resolution.selections.filter((selection) => selection.kind === "activation");
+        const selection = activations[activations.length - 1];
+        const artifact = readRollbackAuthorityArtifact(input.homeDir, input.generationId);
+        if (
+          selection === undefined
+          || resolution.selections.length !== activations.length
+          || artifact === null
+          || artifact.epochId !== selection.epochId
+          || artifact.attemptId !== selection.attemptId
+          || binding.epochId !== selection.epochId
+          || binding.attemptId !== selection.attemptId
+          || binding.manifestRevision !== current.revision
+        ) return false;
+        const evidence = deps.resolveActivationEvidence(generation);
+        return evidence.state === "resolved" && evidence.witnesses.some((witness) =>
+          witness.checksumSha256 === binding.witnessChecksumSha256
+          && witness.kind === "rollback"
+          && witness.epochId === selection.epochId
+          && witness.attemptId === selection.attemptId);
+      },
     });
   });
 }
@@ -2169,6 +2246,7 @@ async function continueAfterPrepareRollback(
   current: MigrationManifest,
   now: () => Date,
 ): Promise<RunMigrationRollbackOutcome> {
+  await recoverInterruptedRollbackWitnessBinding(input, deps, current);
   await recoverInterruptedRollbackWitness(input, () => ({
     resolution: deps.resolveWitnessBindings({ homeDir: input.homeDir, generationId: input.generationId }),
     artifact: readRollbackAuthorityArtifact(input.homeDir, input.generationId),

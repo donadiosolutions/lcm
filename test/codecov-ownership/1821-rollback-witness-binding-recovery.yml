@@ -1,0 +1,9 @@
+references: ["#1821"]
+rationale: >-
+  #1821 lets a single rollback finish an interrupted write of its own rollback
+  witness binding. The change adds a recovery to the shared generation
+  binding store and calls it from the rollback continuation, both of which
+  stay in the migration cutover owner; no file is added, moved or re-owned.
+pins:
+  - ["src/migration/generation-binding-store.ts", "unit-migration-cutover"]
+  - ["src/migration/rollback.ts", "unit-migration-cutover"]
