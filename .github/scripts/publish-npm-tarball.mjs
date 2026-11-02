@@ -71,9 +71,9 @@ export function publishNpmTarball({
     tag,
   ]);
   if (result === null || typeof result !== "object") throw new Error("npm publish failed");
+  if (typeof result.stderr === "string" && result.stderr.length > 0) writeStderr(result.stderr);
   if (result.error) throw new Error("npm publish failed to start");
   if (result.signal) throw new Error("npm publish was terminated");
-  if (typeof result.stderr === "string" && result.stderr.length > 0) writeStderr(result.stderr);
   if (result.status !== 0 && isStagedVersionConflict(result.stderr, version)) {
     return { tarball, tag, staged: true };
   }

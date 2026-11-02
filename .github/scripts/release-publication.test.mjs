@@ -1,8 +1,17 @@
 import assert from "node:assert/strict";
 import { spawnSync } from "node:child_process";
-import { mkdtempSync, mkdirSync, symlinkSync, writeFileSync } from "node:fs";
+import {
+  chmodSync,
+  existsSync,
+  mkdtempSync,
+  mkdirSync,
+  readFileSync,
+  symlinkSync,
+  writeFileSync,
+} from "node:fs";
 import { tmpdir } from "node:os";
 import { basename, isAbsolute, join } from "node:path";
+import { fileURLToPath } from "node:url";
 import test from "node:test";
 import { publishNpmTarball } from "./publish-npm-tarball.mjs";
 
@@ -172,17 +181,31 @@ test("does not treat other npm conflicts as a staged upload", () => {
     );
     assert.deepEqual(forwarded, typeof stderr === "string" ? [stderr] : []);
   }
-  assert.throws(
-    () =>
-      publishNpmTarball({
-        artifactDirectory,
-        tag: "alpha",
-        version: "2.0.0-alpha.0",
-        runNpm: () => ({ signal: "SIGTERM", status: null, stderr: STAGED_STDERR }),
-        writeStderr: () => assert.fail("terminated npm output is not interpreted"),
-      }),
-    /was terminated/u,
-  );
+  for (const [result, expected] of [
+    [{ signal: "SIGTERM", status: null, stderr: STAGED_STDERR }, /was terminated/u],
+    [
+      { error: Object.assign(new Error("spawnSync npm ETIMEDOUT"), { code: "ETIMEDOUT" }), signal: "SIGTERM", status: null, stderr: STAGED_STDERR },
+      /failed to start/u,
+    ],
+    [
+      { error: Object.assign(new Error("spawnSync npm ENOBUFS"), { code: "ENOBUFS" }), status: 1, stderr: STAGED_STDERR },
+      /failed to start/u,
+    ],
+  ]) {
+    const forwarded = [];
+    assert.throws(
+      () =>
+        publishNpmTarball({
+          artifactDirectory,
+          tag: "alpha",
+          version: "2.0.0-alpha.0",
+          runNpm: () => result,
+          writeStderr: (chunk) => forwarded.push(chunk),
+        }),
+      expected,
+    );
+    assert.deepEqual(forwarded, [STAGED_STDERR]);
+  }
 });
 
 test("requires a canonical release version before running npm", () => {
@@ -199,4 +222,58 @@ test("requires a canonical release version before running npm", () => {
       /canonical release version/u,
     );
   }
+});
++
+test("CLI uses the staged-upload shortcut only for the exact staged E409", () => {
+  const script = fileURLToPath(new URL("./publish-npm-tarball.mjs", import.meta.url));
+  const root = mkdtempSync(join(tmpdir(), "lcm-release-cli-"));
+  const bin = join(root, "bin");
+  const log = join(root, "npm.log");
+  const stderrFile = join(root, "npm.stderr");
+  mkdirSync(bin);
+  writeFileSync(
+    join(bin, "npm"),
+    [
+      "#!/bin/sh",
+      'echo invoked >> "$FAKE_NPM_LOG"',
+      'while IFS= read -r line; do printf "%s\\n" "$line" >&2; done < "$FAKE_NPM_STDERR_FILE"',
+      'exit "$FAKE_NPM_STATUS"',
+      "",
+    ].join("\n"),
+  );
+  chmodSync(join(bin, "npm"), 0o755);
+  const artifacts = stagedFixture();
+  const run = (args, { stderr, status }) => {
+    writeFileSync(stderrFile, `${stderr}\n`);
+    return spawnSync(process.execPath, [script, ...args], {
+      encoding: "utf8",
+      shell: false,
+      timeout: 30_000,
+      env: {
+        PATH: bin,
+        FAKE_NPM_LOG: log,
+        FAKE_NPM_STDERR_FILE: stderrFile,
+        FAKE_NPM_STATUS: String(status),
+      },
+    });
+  };
+  const invocations = () => (existsSync(log) ? readFileSync(log, "utf8").split("\n").length - 1 : 0);
+
+  const staged = run([artifacts, "alpha", "2.0.0-alpha.0"], { stderr: STAGED_STDERR, status: 1 });
+  assert.equal(staged.status, 0, staged.stderr);
+  assert.match(staged.stdout, /^::notice::npm already staged 2\.0\.0-alpha\.0;/mu);
+  assert.match(staged.stderr, /Cannot publish over previously staged version "2\.0\.0-alpha\.0"/u);
+  assert.equal(invocations(), 1);
+
+  const other = run([artifacts, "alpha", "2.0.0-alpha.1"], { stderr: STAGED_STDERR, status: 1 });
+  assert.notEqual(other.status, 0);
+  assert.doesNotMatch(other.stdout, /::notice::/u);
+  assert.match(other.stderr, /npm publish failed/u);
+  assert.equal(invocations(), 2);
+
+  const missing = run([artifacts, "alpha"], { stderr: "unused", status: 0 });
+  assert.notEqual(missing.status, 0);
+  assert.match(missing.stderr, /Usage: publish-npm-tarball\.mjs/u);
+  assert.doesNotMatch(missing.stdout, /::notice::/u);
+  assert.equal(invocations(), 2);
 });
