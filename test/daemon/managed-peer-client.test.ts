@@ -285,4 +285,15 @@ describe("current guarded client in a Linux sibling user namespace", () => {
     })).resolves.toBeNull();
     expect(state.nativeRun).not.toHaveBeenCalled();
   });
+
+  it.each([99.5, Number.NaN])("does not launch a manager command with a fractional or nonfinite final allowance (%s)", async finalNow => {
+    state.nativeSupervisor = true;
+    let calls = 0;
+    await expect(admitCurrentDaemonPeer({
+      port, homeDir, deadline: 100, now: () => ++calls < 16 ? 0 : finalNow, _processBirth: () => "birth",
+    })).resolves.toBeNull();
+    expect(calls).toBeGreaterThanOrEqual(16);
+    expect(state.socket).not.toHaveBeenCalled();
+    expect(state.nativeRun).not.toHaveBeenCalled();
+  });
 });

@@ -223,10 +223,12 @@ export async function admitCurrentDaemonPeer(
       platform: "linux", uid, now, environment,
       commandTimeoutMs: Math.min(1_000, Math.floor(options.deadline - now())),
       run: (command, args, settings) => {
-        if (options.signal?.aborted || now() >= options.deadline) throw new DaemonPeerRefusalError();
+        const remainingMs = Math.floor(options.deadline - now());
+        const timeoutMs = Math.min(settings.timeoutMs, remainingMs);
+        if (options.signal?.aborted || !Number.isFinite(timeoutMs) || timeoutMs < 1) throw new DaemonPeerRefusalError();
         const result = (options._spawnSync ?? spawnSync)(command, [...args], {
           encoding: "utf8", shell: false, windowsHide: true, maxBuffer: 64 * 1024,
-          timeout: Math.min(settings.timeoutMs, Math.floor(options.deadline - now())), env: environment,
+          timeout: timeoutMs, env: environment,
         });
         return { code: result.status, stdout: result.stdout, stderr: result.stderr,
           timedOut: (result.error as NodeJS.ErrnoException | undefined)?.code === "ETIMEDOUT" };
