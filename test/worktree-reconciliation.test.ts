@@ -11460,4 +11460,176 @@ describe("worktree reconciliation", () => {
       },
     })).toThrow("legacy events path remained writable");
   }, FULL_SUITE_PROCESS_TEST_TIMEOUT_MS);
+  describe("event-schema preflight (#1856)", () => {
+    function setVersion(path: string, version = 6): void {
+      const db = new DatabaseSync(path);
+      try { db.prepare("UPDATE schema_version SET version = ?").run(version); }
+      finally { db.close(); }
+    }
+
+    function image(path: string): string | null {
+      if (!existsSync(path)) return null;
+      const db = new DatabaseSync(path, { readOnly: true });
+      try {
+        const query = (sql: string) => {
+          const statement = db.prepare(sql);
+          statement.setReadBigInts(true);
+          return statement.all();
+        };
+        const schema = query("SELECT type, name, tbl_name, rootpage, sql FROM sqlite_schema ORDER BY type, name");
+        const tables = query("SELECT name FROM sqlite_schema WHERE type = 'table' ORDER BY name");
+        return JSON.stringify([schema, tables.map(({ name }) => [
+          name, query('SELECT * FROM "' + String(name).replaceAll('"', '""') + '"'),
+        ])], (_key, value: unknown) => typeof value === "bigint" ? ["integer", value.toString()] : value);
+      } finally { db.close(); }
+    }
+
+    function data(paths: readonly string[]) {
+      closeLcmConnection();
+      return paths.map(image);
+    }
+
+    function eventPaths(fixture: ReturnType<typeof makeProjectReconciliation>) {
+      return {
+        source: join(home, ".lcm", "events", fixture.sourceHash + ".db"),
+        target: join(home, ".lcm", "events", fixture.targetHash + ".db"),
+        counter: join(home, ".lcm", "events", ".machine-sequence.sqlite"),
+      };
+    }
+
+    it("rejects Source6 before merging main or creating a Target", () => {
+      const fixture = makeProjectReconciliation(home);
+      const events = eventPaths(fixture);
+      makeDatabase(fixture.sourcePath, "preflight", "preserved", fixture.sourceHash);
+      makeEvents(events.source, "preflight");
+      setVersion(events.source);
+      const paths = [fixture.sourcePath, events.source, fixture.targetPath, events.target, events.counter];
+      const before = data(paths);
+      expect(() => reconcileWorktrees(fixture.main)).toThrow("unsupported legacy events database schema: 6");
+      expect(data(paths)).toEqual(before);
+      expect(existsSync(join(home, ".lcm", "oldprojects"))).toBe(false);
+      expect(existsSync(join(home, ".lcm", "oldevents"))).toBe(false);
+    });
+
+    it("previews Target6 then refuses mutation before migration or main merge", () => {
+      const fixture = makeProjectReconciliation(home);
+      const events = eventPaths(fixture);
+      makeDatabase(fixture.sourcePath, "preflight", "preserved", fixture.sourceHash);
+      makeEvents(events.source, "preflight");
+      makeVersionedEvents(events.target);
+      setVersion(events.target);
+      const paths = [fixture.sourcePath, events.source, fixture.targetPath, events.target, events.counter];
+      const before = data(paths);
+      expect(reconcileWorktrees(fixture.main, { dryRun: true }).status).toBe("planned");
+      expect(data(paths)).toEqual(before);
+      expect(listWorktreeReconciliationJournals()).toEqual([]);
+      const observer = vi.fn();
+      expect(() => reconcileWorktrees(fixture.main, { _observer: observer }))
+        .toThrow("unsupported target events database schema: 6");
+      expect(observer.mock.calls.map(([event]) => event)).toEqual([
+        "after-map-preflight", "after-journal-admission",
+      ]);
+      expect(data(paths)).toEqual(before);
+    });
+
+    it("admits every pending Source before applying an eligible prefix", () => {
+      const fixture = makeProjectReconciliation(home);
+      const events = eventPaths(fixture);
+      makeDatabase(fixture.sourcePath, "first", "preserved", fixture.sourceHash);
+      makeEvents(events.source, "first");
+      const linked = join(home, "linked-second");
+      git(fixture.main, "worktree", "add", "-qb", "linked-second", linked);
+      const hash = hashProjectPath(linked);
+      const otherEvents = join(home, ".lcm", "events", hash + ".db");
+      makeEvents(otherEvents, "second");
+      setVersion(otherEvents);
+      writePrivateFixtureFile(projectMapPath(), JSON.stringify({
+        ...listProjectMapEntries(), [hash]: { canonical: linked, aliases: [] },
+      }) + "\n");
+      clearProjectMapCache();
+      const paths = [fixture.sourcePath, events.source, otherEvents, fixture.targetPath, events.target, events.counter];
+      const before = data(paths);
+      expect(() => reconcileWorktrees(fixture.main)).toThrow("unsupported legacy events database schema: 6");
+      expect(data(paths)).toEqual(before);
+      expect(existsSync(join(home, ".lcm", "oldprojects"))).toBe(false);
+    });
+
+    it("leaves unrelated Target6 alone for project-only reconciliation", () => {
+      const fixture = makeProjectReconciliation(home);
+      const events = eventPaths(fixture);
+      makeDatabase(fixture.sourcePath, "project-only", "content", fixture.sourceHash);
+      makeVersionedEvents(events.target);
+      setVersion(events.target);
+      const before = image(events.target);
+      expect(reconcileWorktrees(fixture.main).status).toBe("completed");
+      expect(image(events.target)).toEqual(before);
+    });
+
+    it("leaves unrelated Target6 alone for patterns-only reconciliation", () => {
+      const fixture = makeProjectReconciliation(home);
+      const events = eventPaths(fixture);
+      makePrivateFixtureDirectory(fixture.sourceDir, { recursive: true });
+      writePrivateFixtureFile(join(fixture.sourceDir, "sensitive-patterns.txt"), "PREFLIGHT_PATTERN\n");
+      makeVersionedEvents(events.target);
+      setVersion(events.target);
+      const before = image(events.target);
+      expect(reconcileWorktrees(fixture.main).status).toBe("completed");
+      expect(readFileSync(join(fixture.targetDir, "sensitive-patterns.txt"), "utf8")).toBe("PREFLIGHT_PATTERN\n");
+      expect(image(events.target)).toEqual(before);
+    });
+
+    it("rechecks a completed journal when a new pending Source6 appears", () => {
+      const fixture = makeProjectReconciliation(home);
+      makeDatabase(fixture.sourcePath, "first", "content", fixture.sourceHash);
+      expect(reconcileWorktrees(fixture.main).status).toBe("completed");
+      const completedJournal = listWorktreeReconciliationJournals();
+      const linked = join(home, "linked-late");
+      git(fixture.main, "worktree", "add", "-qb", "linked-late", linked);
+      const hash = hashProjectPath(linked);
+      const otherEvents = join(home, ".lcm", "events", hash + ".db");
+      makeEvents(otherEvents, "late");
+      setVersion(otherEvents);
+      writePrivateFixtureFile(projectMapPath(), JSON.stringify({
+        ...listProjectMapEntries(), [hash]: { canonical: linked, aliases: [] },
+      }) + "\n");
+      clearProjectMapCache();
+      const paths = [fixture.targetPath, otherEvents];
+      const before = data(paths);
+      expect(() => reconcileWorktrees(fixture.main)).toThrow("unsupported legacy events database schema: 6");
+      expect(data(paths)).toEqual(before);
+      expect(listWorktreeReconciliationJournals()).toEqual(completedJournal);
+    });
+
+    it("preserves planned appearance priority and real merged recovery", () => {
+      const fixture = makeProjectReconciliation(home);
+      const events = eventPaths(fixture);
+      makeDatabase(fixture.sourcePath, "recovery", "content", fixture.sourceHash);
+      expect(() => reconcileWorktrees(fixture.main, {
+        _observer: (event) => { if (event === "before-source-main-merge") throw new Error("planned pause"); },
+      })).toThrow("planned pause");
+      makeEvents(events.source, "appeared");
+      setVersion(events.source);
+      expect(() => reconcileWorktrees(fixture.main)).toThrow("legacy eventsDb component appeared");
+      rmSync(events.source);
+      expect(() => reconcileWorktrees(fixture.main, {
+        _observer: (event) => { if (event === "after-merge-before-archive") throw new Error("merged pause"); },
+      })).toThrow("merged pause");
+      expect(listWorktreeReconciliationJournals()[0]).toMatchObject({ phase: "blocked", blockedFrom: "merged" });
+      expect(reconcileWorktrees(fixture.main).status).toBe("completed");
+    });
+
+    it("does not re-admit events for a completed journal with no pending Sources", () => {
+      const fixture = makeEventsReconciliation(home);
+      makeEvents(fixture.sourceEvents, "complete");
+      const observer = vi.fn();
+      expect(reconcileWorktrees(fixture.main, { _observer: observer }).status).toBe("completed");
+      expect(observer.mock.calls.some(([event]) => event === "after-target-events-migration")).toBe(true);
+      setVersion(fixture.targetEvents);
+      const before = image(fixture.targetEvents);
+      expect(reconcileWorktrees(fixture.main).status).toBe("completed");
+      expect(image(fixture.targetEvents)).toEqual(before);
+      expect(listWorktreeReconciliationJournals()[0].pendingSourceHashes).toEqual([]);
+    });
+  });
+
 });

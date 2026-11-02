@@ -265,6 +265,15 @@ Exact duplicates are retained once. Per-source merge markers make retries and
 later-discovered generations idempotent, so each source generation is applied
 exactly once.
 
+Before a real merge starts, LCM checks the event schema of every pending legacy
+store and the target schema, including the version that target initialization
+would produce. An unsupported schema blocks the attempt before project rows,
+event rows, source fences, sequence allocation, or archives are changed. The
+blocked journal records the reason. Read-only inspection can create or update
+SQLite coordination files (`-wal` and `-shm`); it does not migrate either database.
+A dry run still previews the plan without attempting a merge. Keep the refused
+stores intact and retry with an LCM version that supports their event schema.
+
 Legacy split SQLite stores containing active native transcript records, message
 links, or ingest checkpoints currently block reconciliation. LCM checks every
 source before changing either project database, and rechecks while holding the
