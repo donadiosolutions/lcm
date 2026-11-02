@@ -97,3 +97,11 @@ the repository it describes.
 The npm package includes the public guides listed individually in
 `package.json`'s `files` field. When adding a public guide, add its exact path
 there so it is available in installed packages.
+
+<!-- lcm-external-admission-canary-1825:start -->
+# External admission canary 1825
+
+Stage: ordinary
+
+Disposable verification marker for PR #1825. This branch must not be merged.
+<!-- lcm-external-admission-canary-1825:end -->
