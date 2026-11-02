@@ -175,6 +175,7 @@ describe("mocked lifecycle identity boundaries", () => {
         now: () => now,
         sleep: async (ms) => { now += ms; },
         readToken: () => "token",
+        admitPeer: () => ({ pid: process.pid, birth: "birth" }),
         readOwner: () => ({ version: 1, pid: process.pid, processStartTime: "birth", nonce: "a".repeat(32) }),
         processBirth: () => "birth",
         fetch: vi.fn(async () => ({ ok: true, json: async () => ({

@@ -314,6 +314,7 @@ describe("portable-knowledge — export", () => {
       deps: {
         now: (() => { let value = 0; return () => value; })(),
         sleep: async () => undefined,
+        admitPeer: (port) => port === 3737 ? { pid: 42, birth: "birth" } : null,
         readToken: () => "token",
         readOwner: () => ({ version: 1, pid: 42, processStartTime: "birth", nonce: "a".repeat(32) }),
         processBirth: () => "birth",
@@ -352,6 +353,7 @@ describe("portable-knowledge — export", () => {
       identity: { pid: 42, version: "test", storageBackend: "sqlite", entrypoint: "/daemon", runtimeDigest: "runtime" },
       deps: {
         now: () => now, sleep: async (delayMs: number) => { now += delayMs; },
+        admitPeer: (port) => port === 3737 ? { pid: 42, birth: "birth" } : null,
         readToken: () => "token",
         readOwner: () => ({ version: 1, pid: 42, processStartTime: "birth", nonce: "a".repeat(32) }),
         processBirth: () => "birth", lockPath: join(baseDir, "publication.lock"),
@@ -393,6 +395,7 @@ describe("portable-knowledge — export", () => {
       identity: { pid: 42, version: "test", storageBackend: "sqlite", entrypoint: "/daemon", runtimeDigest: "runtime" },
       deps: {
         now: () => now, sleep: async (delayMs: number) => { now += delayMs; },
+        admitPeer: (port) => port === 3737 ? { pid: 42, birth: "birth" } : null,
         readToken: () => "token",
         readOwner: () => ({ version: 1, pid: authenticated ? 42 : 99, processStartTime: "birth", nonce: "a".repeat(32) }),
         processBirth: () => "birth", lockPath: join(baseDir, "publication.lock"),

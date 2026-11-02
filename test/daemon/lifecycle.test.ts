@@ -1061,7 +1061,7 @@ describe("ensureDaemon", () => {
   });
 
   it.each(["darwin", "win32"] as const)(
-    "accepts a matching health-reported entrypoint on %s without procfs",
+    "requires supported peer attribution for a matching %s entrypoint without procfs",
     async (platform): Promise<void> => {
       const tempDir = mkdtempSync(join(tmpdir(), `lcm-lifecycle-${platform}-entrypoint-`));
       tempDirs.push(tempDir);
@@ -1071,7 +1071,7 @@ describe("ensureDaemon", () => {
         : "/opt/npm/lib/node_modules/@donadiosolutions/lcm/dist/lcm.mjs";
       writeFileSync(pidFile, "200");
       writeFileSync(join(tempDir, "daemon.token"), "local-token");
-      const fetchMock = vi.fn(async (url: string): Promise<Response> => {
+      const fetchMock = vi.fn(async (url: string, _init?: RequestInit): Promise<Response> => {
         if (url.endsWith("/health")) {
           return {
             ok: true,
@@ -1101,7 +1101,10 @@ describe("ensureDaemon", () => {
         _listeningPortsOverride: (): number[] => [19999],
       });
 
-      expect(result).toMatchObject({ connected: true, spawned: false, pid: 200 });
+      if (platform === "win32") {
+        expect(result).toMatchObject({ connected: false, spawned: false });
+        expect(fetchMock.mock.calls.every(([, init]) => !new Headers(init?.headers).has("Authorization"))).toBe(true);
+      } else expect(result).toMatchObject({ connected: true, spawned: false, pid: 200 });
     },
   );
 
@@ -1125,14 +1128,14 @@ describe("ensureDaemon", () => {
       canonical: "C:\\Users\\Alice\\AppData\\Roaming\\npm\\node_modules\\@donadiosolutions\\lcm\\dist\\lcm.mjs",
     },
   ])(
-    "reuses a $platform daemon when npm shim and runtime entrypoints resolve identically",
+    "requires supported peer attribution when $platform shim and runtime entrypoints resolve identically",
     async ({ platform, reported, expected, canonical }): Promise<void> => {
       const tempDir = mkdtempSync(join(tmpdir(), `lcm-lifecycle-${platform}-symlink-entrypoint-`));
       tempDirs.push(tempDir);
       const pidFile = join(tempDir, "daemon.pid");
       writeFileSync(pidFile, "200");
       writeFileSync(join(tempDir, "daemon.token"), "local-token");
-      const fetchMock = vi.fn(async (url: string): Promise<Response> => url.endsWith("/health")
+      const fetchMock = vi.fn(async (url: string, _init?: RequestInit): Promise<Response> => url.endsWith("/health")
         ? {
             ok: true,
             json: async () => ({
@@ -1165,9 +1168,14 @@ describe("ensureDaemon", () => {
         _listeningPortsOverride: (): number[] => [19999],
       });
 
-      expect(result).toMatchObject({ connected: true, spawned: false, pid: 200 });
-      expect(realpathMock).toHaveBeenCalledWith(reported);
-      expect(realpathMock).toHaveBeenCalledWith(expected);
+      if (platform === "win32") {
+        expect(result).toMatchObject({ connected: false, spawned: false });
+        expect(fetchMock.mock.calls.every(([, init]) => !new Headers(init?.headers).has("Authorization"))).toBe(true);
+      } else {
+        expect(result).toMatchObject({ connected: true, spawned: false, pid: 200 });
+        expect(realpathMock).toHaveBeenCalledWith(reported);
+        expect(realpathMock).toHaveBeenCalledWith(expected);
+      }
       expect(killMock).not.toHaveBeenCalled();
     },
   );
@@ -4302,7 +4310,8 @@ describe("restartDaemon", () => {
     });
 
     expect(result).toMatchObject({ connected: true, spawned: false, startMethod: "systemd-user", pid: 200 });
-    expect(probe).toHaveBeenCalledTimes(3);
+    expect(probe).toHaveBeenCalledTimes(6);
+    expect(probe.mock.calls.slice(1).every(([observedSpec]) => observedSpec.nonce === spec!.nonce)).toBe(true);
     expect(spec).toBeDefined();
     expect(supervisor.start).not.toHaveBeenCalled();
   });

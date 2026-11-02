@@ -11,6 +11,7 @@ import { projectDbPath } from "../../../src/daemon/project.js";
 import { closeLcmConnection, getLcmConnection } from "../../../src/db/connection.js";
 import { buildPreToolRecallQuery, handlePreToolUse } from "../../../src/hooks/pre-tool.js";
 import { configPath, lcmHomeDir } from "../../../src/runtime-paths.js";
+import { processStartTime } from "../../../src/private-mutation-lock.js";
 
 const tempDirs: string[] = [];
 
@@ -1118,6 +1119,9 @@ describe("POST /prompt-search recallMode pre-tool", () => {
       adjust: (config: ReturnType<typeof loadDaemonConfig>) => void,
       body: (run: (toolName: string, toolInput: unknown) => Promise<string>, port: number) => Promise<void>,
     ): Promise<void> {
+      const fixturePid = process.pid;
+      const fixtureBirth = processStartTime(fixturePid);
+      if (fixtureBirth === null) throw new Error("in-process daemon fixture birth is unavailable");
       const config = loadDaemonConfig("/nonexistent");
       config.daemon.port = 0;
       adjust(config);
@@ -1133,7 +1137,16 @@ describe("POST /prompt-search recallMode pre-tool", () => {
             hook_event_name: "PreToolUse",
             tool_name: toolName,
             tool_input: toolInput,
-          }));
+          }), {
+            // This listener belongs to the test process, whose command is a
+            // Vitest worker. Bind the existing seam to its actual live identity.
+            _admitPeerForTesting: (candidatePort, deadline, signal) => {
+              const remainingMs = Math.floor(deadline - performance.now());
+              if (signal?.aborted || remainingMs <= 0 || candidatePort !== daemon.address().port
+                || processStartTime(fixturePid, undefined, { timeoutMs: remainingMs }) !== fixtureBirth) return null;
+              return { pid: fixturePid, birth: fixtureBirth };
+            },
+          });
           expect(result.exitCode).toBe(0);
           return result.stdout;
         }, port);

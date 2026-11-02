@@ -20,6 +20,13 @@ vi.mock("../../src/daemon/version.js", async importOriginal => ({
   RUNTIME_DIGEST: "runtime",
 }));
 
+vi.mock("../../src/daemon/peer-admission.js", async importOriginal => ({
+  ...(await importOriginal<typeof import("../../src/daemon/peer-admission.js")>()),
+  // This synthetic client represents only the known fixture recipient.
+  admitCurrentDaemonPeer: async ({ port }: { port: number }) => port === 3737
+    ? { pid: 42, birth: "fixture-birth" } : null,
+}));
+
 vi.mock("../../src/daemon/client.js", async importOriginal => ({
   ...(await importOriginal<typeof import("../../src/daemon/client.js")>()),
   DaemonClient: class {
@@ -27,6 +34,7 @@ vi.mock("../../src/daemon/client.js", async importOriginal => ({
       state.afterHealth?.();
       return {
         status: "ok",
+        pid: 42,
         version: "test",
         storageBackend: state.backend,
         entrypoint: "/opt/lcm/lcm.mjs",

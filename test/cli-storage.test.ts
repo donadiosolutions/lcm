@@ -174,6 +174,7 @@ describe("CLI selected project storage", () => {
       port: 3737, identity,
       deps: {
         homeDir: home, now: () => now,
+        admitPeer: (port) => port === 3737 ? { pid: identity.pid, birth: "birth" } : null,
         readToken: () => "fixture-token",
         ...(syntheticOwner ? {
           readOwner: () => ({ version: 1 as const, pid: process.pid, processStartTime: "birth", nonce: "a".repeat(32) }),

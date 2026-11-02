@@ -298,6 +298,8 @@ describe("lcm events staged PostgreSQL operator commands", () => {
       deps: {
         now: () => now,
         sleep: async (delayMs: number) => { now += delayMs; },
+        admitPeer: (port, deadline, signal) => port === 3737 && now < deadline && !signal?.aborted
+          ? { pid: 42, birth: "birth" } : null,
         readToken: () => "token",
         readOwner: () => ({ version: 1, pid: 42, processStartTime: "birth", nonce: "a".repeat(32) }),
         processBirth: () => "birth",

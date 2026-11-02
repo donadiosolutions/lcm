@@ -1328,14 +1328,19 @@ async function checkDaemonDiagnostics(
   admitPeer: DaemonPeerAdmissionCallback,
   now: () => number = performance.now.bind(performance),
 ): Promise<HealthResponse | null> {
+  const initialDeadline = remainingDeadline();
+  if (initialDeadline === null || initialDeadline.abortSignal?.aborted) return null;
+  const deadline = initialDeadline.expiresAt ?? now() + initialDeadline.timeoutMs;
+  let peer: DaemonPeerAdmission;
   try {
-    const initialDeadline = remainingDeadline();
-    if (initialDeadline === null || initialDeadline.abortSignal?.aborted) return null;
-    const deadline = initialDeadline.expiresAt ?? now() + initialDeadline.timeoutMs;
-    const peer = await awaitDaemonPeerAdmission(admitPeer, port, deadline, initialDeadline.abortSignal, now);
-    if (peer === null || peer.pid !== publicHealth.pid) return null;
-    const token = readToken(tokenPath);
-    if (!token || now() >= deadline) return null;
+    peer = await awaitDaemonPeerAdmission(admitPeer, port, deadline, initialDeadline.abortSignal, now);
+  } catch {
+    return null;
+  }
+  if (peer.pid !== publicHealth.pid) return null;
+  const token = readToken(tokenPath);
+  if (!token || now() >= deadline) return null;
+  try {
     const sendPeer = await awaitDaemonPeerAdmission(admitPeer, port, deadline, initialDeadline.abortSignal, now);
     if (sendPeer.pid !== peer.pid || sendPeer.birth !== peer.birth) return null;
     const healthDeadline = remainingDeadline();
