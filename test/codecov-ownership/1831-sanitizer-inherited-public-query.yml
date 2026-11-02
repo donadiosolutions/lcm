@@ -1,0 +1,6 @@
+references: ["#1831"]
+rationale: >-
+  #1831 keeps nested public URL query values private when an immediate quoted
+  handoff makes the enclosing bracketed file-query wrapper their owner.
+pins:
+  - ["src/daemon/safe-error.ts", "unit-daemon-core"]

@@ -107,6 +107,7 @@ function findUrlPathStarts(chars: readonly string[]): UrlPathStarts {
   const nestedFileUrlParentOwnerBracketDepths = new Set<number>();
   const restartedNestedFileUrlParentOwnerBracketDepths = new Set<number>();
   const inheritedQuoteTailWrapperDepths = new Set<number>();
+  const inheritedPublicQueryOwnerWrapperDepths = new Set<number>();
   const activeChildTailWrapperDepths = new Set<number>();
   let schemeLength = 0;
   let fileSchemeLength = 0;
@@ -693,6 +694,16 @@ function findUrlPathStarts(chars: readonly string[]): UrlPathStarts {
     while (isPathWord(chars[cursor])) cursor += 1;
     return chars[cursor] === "=" ? cursor + 1 : -1;
   };
+  const inheritedPublicQueryPrivateRelativePathStart = (start: number): number => {
+    if (!"?#&;,|=".includes(chars[start - 1]!)) return -1;
+    let cursor = start;
+    while (isPathWord(chars[cursor])) cursor += 1;
+    const root = chars.slice(start, cursor).join("").toLowerCase();
+    if (root !== "users" && root !== "home" && root !== "root") return -1;
+    if (chars[cursor] !== "/" && chars[cursor] !== "\\") return -1;
+    const valueStart = skipSeparatorRun(cursor);
+    return isPathWord(chars[valueStart]) ? cursor : -1;
+  };
   const bridgedRootedPathStart = (start: number): number => {
     if (chars[start] !== "/") return -1;
     let cursor = start + 1;
@@ -826,6 +837,7 @@ function findUrlPathStarts(chars: readonly string[]): UrlPathStarts {
   let slashPrefixedNestedPublicSchemeStart = -1;
   let quotedQueryPublicUrl = false;
   let quotedQueryPublicUrlOwnQueryOrFragment = false;
+  let inheritedPublicPlainTextRegionActive = false;
   let backslashSlashClaimActive = false;
   let activeNestedFileSchemeStart = -1;
 
@@ -863,7 +875,9 @@ function findUrlPathStarts(chars: readonly string[]): UrlPathStarts {
       nestedFileUrlParentOwnerBracketDepths.clear();
       restartedNestedFileUrlParentOwnerBracketDepths.clear();
       inheritedQuoteTailWrapperDepths.clear();
+      inheritedPublicQueryOwnerWrapperDepths.clear();
       activeChildTailWrapperDepths.clear();
+      inheritedPublicPlainTextRegionActive = false;
       activeNestedFileUrlParentOwnerBracketDepth = 0;
       queryOrFragment = false;
       nestedPublicUrlBracketDepth = 0;
@@ -920,6 +934,16 @@ function findUrlPathStarts(chars: readonly string[]): UrlPathStarts {
         repeatedPipeHandoffWrapperDepths.add(inheritedFileQuoteParentOwnerBracketDepth);
         inheritedQuoteTailWrapperDepths.add(inheritedFileQuoteParentOwnerBracketDepth);
         const successorStart = continuationStart + 1;
+        const bracketStart = skipInheritedQuoteInterposerRun(successorStart);
+        if (chars[bracketStart] === "[" || postCloseFilePathBracketDepth > 0) {
+          // A direct bracket handoff, or a nested handoff while an inherited
+          // tail is still inside its bracket, keeps the enclosing wrapper as
+          // the owner. Subtracting the active tail depth prevents the inner
+          // close from ending that inherited region early.
+          inheritedPublicQueryOwnerWrapperDepths.add(
+            inheritedFileQuoteParentOwnerBracketDepth - postCloseFilePathBracketDepth,
+          );
+        }
         armClaimedBracketTail(successorStart, { inheritedQuote: true });
         inheritedFileQuoteParentOwnerBracketDepth = 0;
         inheritedFileQuoteEnd = -1;
@@ -973,6 +997,10 @@ function findUrlPathStarts(chars: readonly string[]): UrlPathStarts {
       nestedFileUrlParentOwnerBracketDepths.delete(closingPathlessFileQueryOwnerDepth);
       restartedNestedFileUrlParentOwnerBracketDepths.delete(closingPathlessFileQueryOwnerDepth);
       inheritedQuoteTailWrapperDepths.delete(closingPathlessFileQueryOwnerDepth);
+      inheritedPublicQueryOwnerWrapperDepths.delete(closingPathlessFileQueryOwnerDepth);
+      if (inheritedPublicQueryOwnerWrapperDepths.size === 0) {
+        inheritedPublicPlainTextRegionActive = false;
+      }
       activeChildTailWrapperDepths.delete(closingPathlessFileQueryOwnerDepth);
       if (closingPathlessFileQueryOwnerDepth === activeNestedFileUrlParentOwnerBracketDepth) {
         activeNestedFileUrlParentOwnerBracketDepth = 0;
@@ -1239,6 +1267,17 @@ function findUrlPathStarts(chars: readonly string[]): UrlPathStarts {
     } else if (restartedPathlessFile && char === "[") {
       fileTailBracketDepth = 1;
     }
+    const inheritedPublicQueryUsesPlainText: boolean =
+      inheritedPublicQueryOwnerWrapperDepths.size > 0 &&
+      inheritedPublicPlainTextRegionActive &&
+      // A file URL value admitted inside the region keeps its own file URL
+      // handling for its whole extent, including its query and fragment.
+      !exactFileScheme &&
+      (queryOrFragment || separator < 0);
+    if (inheritedPublicQueryUsesPlainText) {
+      const privateRelativePathStart = inheritedPublicQueryPrivateRelativePathStart(index);
+      if (privateRelativePathStart >= 0) forcedPath[privateRelativePathStart] = 1;
+    }
     if (separator >= 0 && (char === "?" || char === "#")) {
       const startsQuotedQueryTail =
         exactFileScheme &&
@@ -1248,6 +1287,12 @@ function findUrlPathStarts(chars: readonly string[]): UrlPathStarts {
 
       queryOrFragment = true;
       queryOrFragmentStart = index;
+      if (
+        inheritedPublicQueryOwnerWrapperDepths.size > 0 &&
+        pathlessNestedPublicUrlActive
+      ) {
+        inheritedPublicPlainTextRegionActive = true;
+      }
       if (quotedQueryPublicUrl) quotedQueryPublicUrlOwnQueryOrFragment = true;
       if (slashPrefixedNestedPublicSchemeStart >= 0) {
         // Retain observable public URL syntax instead of reconstructing
@@ -1810,6 +1855,29 @@ function findUrlPathStarts(chars: readonly string[]): UrlPathStarts {
       slashPrefixedNestedPublicSchemeStart = -1;
       quotedQueryPublicUrl = false;
       quotedQueryPublicUrlOwnQueryOrFragment = false;
+      if (char === "]") inheritedPublicPlainTextRegionActive = false;
+      continue;
+    }
+    const inheritedPublicQuerySchemeStart: number =
+      inheritedPublicQueryUsesPlainText && queryOrFragment
+        ? urlSchemeStart(chars, index, queryOrFragmentStart + 1)
+        : -1;
+    if (inheritedPublicQuerySchemeStart >= 0) {
+      separator = index;
+      // A complete URL value keeps its own scheme classification: an exact
+      // file scheme (any letter case) still owns the path after its authority.
+      exactFileScheme =
+        inheritedPublicQuerySchemeStart === index - FILE_SCHEME.length &&
+        isFileUrlLiteral(chars, inheritedPublicQuerySchemeStart);
+      foundFilePath = false;
+      filePathBracketDepth = 0;
+      schemeLength = 0;
+      fileSchemeLength = 0;
+      schemeQuote = quoteCode(chars[inheritedPublicQuerySchemeStart - 1]);
+      queryOrFragment = false;
+      queryOrFragmentStart = -1;
+      authority[index + 1] = 1;
+      authority[index + 2] = 1;
       continue;
     }
     if (separator >= 0) {
@@ -1880,7 +1948,9 @@ function findUrlPathStarts(chars: readonly string[]): UrlPathStarts {
           continue;
         }
       }
-      if (char === "/" && !quotedPathEnded) authority[index] = 1;
+      if (char === "/" && !quotedPathEnded && !inheritedPublicQueryUsesPlainText) {
+        authority[index] = 1;
+      }
       if (
         exactFileScheme &&
         // After an outer path, only a backslash in its query or

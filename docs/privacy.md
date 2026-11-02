@@ -833,24 +833,33 @@ bundle and keep provider, credential, quarantine, and recovery sessions private.
   space-bearing private path and any suffix inside the quote on the first pass,
   while preserving text after the close. An immediately quoted child keeps its
   own quote. Inside a bracketed file query, the matching quote restores the
-  enclosing owner when `&` or `|` immediately follows it, including when the
-  quote and delimiter are separated only by a run of U+200B, U+200C, U+200D,
-  or U+2060. Whitespace, including U+FEFF, before the delimiter prevents that
-  handoff, and whitespace between the delimiter and the successor resets
-  ownership; in both cases a Windows backslash-rooted value stays readable
-  unless another path rule applies. One or more `=` characters after the
-  matching quote also redact an immediately adjacent Windows backslash-rooted
-  value on the first pass. Relative, public-URL, and plain values after `=`
-  stay readable, as do backslash-rooted values separated from `=` by whitespace
-  or one of the listed invisible characters. Within the same uninterrupted
-  wrapper after an immediate rooted handoff, immediate and later supported
-  rooted, named Windows, and recognized private-root successors redact on the
-  same pass. Bracketed components that follow a redacted successor follow the
-  tail rules above, and inside them a private-root relative value after `&` or
-  `|` is also redacted on the first pass. Ordinary relative and public-URL
-  successors remain readable. Unquoted URLs, embedded URLs whose scheme did
-  not begin at the quote, unmatched quotes, and newlines retain their existing
-  boundaries.
+  enclosing owner when `&` or `|` immediately follows it. A run of U+200B,
+  U+200C, U+200D, or U+2060 may appear before the delimiter or between the
+  delimiter and a directly following bracket without changing that result.
+  Other interposers retain their established path classification.
+
+  When this owned region contains a nested link, the link's scheme, authority,
+  and path remain URL text. Its query and fragment, however, are classified like
+  ordinary message text. An actual POSIX root, Windows drive, or UNC path is
+  therefore redacted without parsing surrounding parameter names, index
+  notation, equals-sign runs, component delimiters, empty or dot segments,
+  zero-width prefixes, or encoded characters after the initial root. A value
+  written like a link with its own path-word `scheme://` prefix is treated as a
+  link, just as it is in ordinary text. Forward-slash drives keep their letter
+  and colon, as in `C:<path>`, and public-looking rooted values such as
+  `/public/x` are still filesystem-shaped and become `<path>`. A complete URL
+  used as a value remains URL text. A `file://` value, in any letter case and
+  with any authority, is redacted exactly as a file URL elsewhere: its path
+  after the authority becomes `<path>`, and its own query and fragment follow
+  the usual file URL rules. Other links keep their path; their query and
+  fragment follow the same ordinary-text rule recursively.
+
+  As an additional conservative rule, a literal `Users/`, `home/`, or `root/`
+  value is redacted from its separator while this owner is live. Encoded or
+  otherwise obscured relative spellings and fully encoded values have no literal
+  path root and remain readable. Ownership still ends with its enclosing wrapper
+  or the existing whitespace/reset boundaries. Unquoted URLs, unmatched quotes,
+  and newlines retain their existing behavior.
 
   Root-relative Windows values after opaque wrapper text remain conservatively
   redacted. LCM does not expose such private-looking values merely because URL
