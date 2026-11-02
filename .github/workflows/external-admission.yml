@@ -24,6 +24,8 @@ on:
   repository_dispatch:
     types:
       - external-admission-reconcile
+      - external-admission-control-authorize
+      - external-admission-control-revoke
 
 permissions:
   actions: read
@@ -34,9 +36,11 @@ permissions:
 
 concurrency:
   group: >-
-    external-admission-${{
+    external-admission-${{ github.repository }}-${{
       github.event_name == 'repository_dispatch' &&
-        github.event.action == 'external-admission-reconcile' &&
+        (github.event.action == 'external-admission-reconcile' ||
+          ((github.event.action == 'external-admission-control-authorize' ||
+            github.event.action == 'external-admission-control-revoke') && github.event.sender.id == 1458878)) &&
         github.event.client_payload.head_sha ||
       github.event_name == 'workflow_run' &&
         github.event.workflow_run.name == 'CI' &&
@@ -56,7 +60,10 @@ concurrency:
         format('check-run-{0}-{1}-{2}', github.event.check_run.head_sha,
           github.event.check_run.app.id, github.event.check_run.name)
     }}
-  cancel-in-progress: true
+  # GitHub concurrency keys are case-insensitive; hexadecimal H therefore has
+  # one group even when a dispatch uses uppercase. The evaluator lowercases H.
+  # This serializes running writers; GitHub does not promise FIFO delivery.
+  cancel-in-progress: false
 
 jobs:
   external-admission-evaluator:
@@ -66,7 +73,9 @@ jobs:
     # on GitHub's reserved queue refs must not create a legacy commit status.
     if: >-
       (github.event_name == 'repository_dispatch' &&
-        github.event.action == 'external-admission-reconcile' &&
+        (github.event.action == 'external-admission-reconcile' ||
+          ((github.event.action == 'external-admission-control-authorize' ||
+            github.event.action == 'external-admission-control-revoke') && github.event.sender.id == 1458878)) &&
         github.event.client_payload.head_sha != '') ||
       (github.event_name == 'workflow_run' &&
         github.event.workflow_run.name == 'CI' &&
@@ -92,7 +101,8 @@ jobs:
       - name: Revoke stale external admission
         env:
           EVENT_HEAD_SHA: >-
-            ${{ github.event_name == 'repository_dispatch' && github.event.client_payload.head_sha ||
+            ${{ github.event_name == 'repository_dispatch' && github.event.client_payload.head_sha != '' &&
+                github.event.client_payload.head_sha ||
                 github.event_name == 'workflow_run' && github.event.workflow_run.head_sha ||
                 github.event.check_run.head_sha }}
         run: |
@@ -131,10 +141,15 @@ jobs:
       - name: Evaluate external admission snapshot
         env:
           EVENT_HEAD_SHA: >-
-            ${{ github.event_name == 'repository_dispatch' && github.event.client_payload.head_sha ||
+            ${{ github.event_name == 'repository_dispatch' && github.event.client_payload.head_sha != '' &&
+                github.event.client_payload.head_sha ||
                 github.event_name == 'workflow_run' && github.event.workflow_run.head_sha ||
                 github.event.check_run.head_sha }}
           EVENT_SOURCE: ${{ github.event_name }}
+          EVENT_ACTION: ${{ github.event.action }}
+          EVENT_SENDER_ID: ${{ github.event.sender.id }}
+          EVENT_PR_NUMBER: ${{ github.event.client_payload.pr_number }}
+          EVENT_CONTROL_DIGEST: ${{ github.event.client_payload.control_digest }}
           EVENT_WORKFLOW_RUN_ACTION: >-
             ${{ github.event_name == 'workflow_run' && github.event.action || '' }}
           EVENT_WORKFLOW_RUN_ID: >-
