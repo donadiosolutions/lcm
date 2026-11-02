@@ -140,6 +140,12 @@ scopes such as `feat(cli):` are supported. All remaining PRs appear under
 Extra notes. The workflow fails instead of substituting commit hashes when a
 commit has no exact PR.
 
+A `main` pull request must be merged as a two-parent commit whose second
+parent is the PR head. Squash merges at or before commit `91cbc485` (the
+merge of PR #593, which introduced merge-parent authentication) predate that
+check and are accepted from exact GitHub merge metadata when the commit is an
+ancestor of that boundary. Later squash or rebase merges are rejected.
+
 ### Maintenance release provenance
 
 A maintenance release commit must be the exact merge commit of one merged PR

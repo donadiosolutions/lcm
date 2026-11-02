@@ -62,6 +62,12 @@ a breaking marker such as `feat!:` or `refactor(storage)!:`, appear under
 are supported. Every other included PR appears under **Extra notes**. Generated
 version PRs are labeled `no-release-notes` automatically.
 
+Release notes require each `main` PR to be merged as a two-parent commit whose
+second parent is the PR head. Squash merges at or before `91cbc485` (the merge
+of PR #593, which introduced merge-parent authentication) are accepted from
+exact GitHub merge metadata because they predate that check; later squash or
+rebase merges still fail.
+
 ## Release flow
 
 1. Merge releasable PRs to `main`.
