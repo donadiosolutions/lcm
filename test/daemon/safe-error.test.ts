@@ -56,6 +56,28 @@ describe("sanitizeError", () => {
     expect(sanitizeError(sanitized)).toBe(sanitized);
   });
 
+  const driveRootWhitespaceCases = [
+    "\\".repeat(2),
+    "\\".repeat(4),
+    "\\/",
+    "\\//\\",
+  ].flatMap((separators) => [" ", "\t"].map((padding) => [separators, padding] as const));
+
+  it.each(driveRootWhitespaceCases)("preserves prose after a separator-only drive root %#", (separators, padding) => {
+    const input = "root C:" + separators + padding + "and then retried";
+    const expected = "root <path>" + padding + "and then retried";
+    const sanitized = sanitizeError(input);
+    expect(sanitized).toBe(expected);
+    expect(sanitizeError(sanitized)).toBe(sanitized);
+  });
+
+  it.each(driveRootWhitespaceCases)("redacts a child after the same drive-root separators %#", (separators, padding) => {
+    const input = "open C:" + separators + "Client" + padding + "Files\\private.db";
+    const sanitized = sanitizeError(input);
+    expect(sanitized).toBe("open <path>");
+    expect(sanitizeError(sanitized)).toBe(sanitized);
+  });
+
   it("strips POSIX paths containing spaces", () => {
     const result = sanitizeError("ENOENT: no such file '/Users/a/My Files/x'");
     expect(result).toBe("ENOENT: no such file '<path>'");

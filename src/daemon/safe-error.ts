@@ -2226,6 +2226,11 @@ function scanAbsolutePath(
   continuePlainWhitespace = false,
 ): { end: number; sawNonSeparator: boolean } {
   let index = start;
+  let plainRootEnd = start + 1;
+  if (continuePlainWhitespace && driveColonIndex === start + 1) {
+    plainRootEnd = start + 3;
+    while (chars[plainRootEnd] === "/" || chars[plainRootEnd] === "\\") plainRootEnd += 1;
+  }
   let windowsContext = windows;
   let activeDriveColonIndex = driveColonIndex;
   let parentheses = 0;
@@ -2382,7 +2387,7 @@ function scanAbsolutePath(
       continuePlainWhitespace &&
       (char === " " || char === "\t") &&
       sawNonSeparator &&
-      index > start + (driveColonIndex === start + 1 ? 3 : 1)
+      index > plainRootEnd
     ) {
       let cursor = index + 1;
       while (chars[cursor] === " " || chars[cursor] === "\t") cursor += 1;

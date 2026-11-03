@@ -659,8 +659,9 @@ bundle and keep provider, credential, quarantine, and recovery sessions private.
   URL remains intact. A separate URL keeps its complete scheme, authority,
   wrappers, and existing path/query/fragment policy; a URL-shaped token inside
   an already open path bracket or parenthesis remains private path text.
-  Bare roots and messages without a recognized private path keep their prior
-  behavior. This policy also applies where a URL query classifies a value as
+  Bare separator runs and drive roots keep their prior behavior, as do messages
+  without a recognized private path. UNC server/share names are private path
+  content. This policy also applies where a URL query classifies a value as
   ordinary filesystem text; it does not change which values receive that
   classification. Removing ambiguous whitespace can expose an existing
   delimiter handoff on a later bounded pass, which can redact a separate path
