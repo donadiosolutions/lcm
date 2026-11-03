@@ -1,6 +1,6 @@
 import { createServer, type IncomingMessage, type Server, type ServerResponse } from "node:http";
 import type { AddressInfo } from "node:net";
-import { mkdirSync, rmSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, rmSync, writeFileSync } from "node:fs";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import * as configProjection from "../../src/config-projection.js";
 import {
@@ -11,7 +11,7 @@ import {
 } from "../../src/hooks/pre-tool.js";
 import * as publicationFence from "../../src/hooks/publication-fence.js";
 import { PrivateMutationLockContentionError } from "../../src/private-mutation-lock.js";
-import { configPath, lcmHomeDir } from "../../src/runtime-paths.js";
+import { configPath, daemonPidPath, lcmHomeDir } from "../../src/runtime-paths.js";
 import { BackendPublicationJournalError } from "../../src/storage/backend-publication.js";
 
 const bash = (command: unknown) => buildPreToolRecallQuery("Bash", { command });
@@ -211,6 +211,41 @@ describe("handlePreToolUse", () => {
       .toEqual({ exitCode: 0, stdout: "" });
     expect(readToken).not.toHaveBeenCalled();
     expect(requests).toEqual([]);
+  });
+
+  it("uses the default recipient guard to refuse a missing private PID before token access", async () => {
+    enable();
+    expect(existsSync(daemonPidPath())).toBe(false);
+    const readToken = vi.spyOn(await import("../../src/daemon/auth.js"), "readAuthToken");
+
+    expect(await handlePreToolUse(JSON.stringify(sessionPayload))).toEqual({ exitCode: 0, stdout: "" });
+
+    expect(readToken).not.toHaveBeenCalled();
+    expect(requests).toEqual([]);
+  });
+
+  it("cancels pending admission at the hook deadline and never sends after late proof", async () => {
+    enable();
+    const readToken = vi.spyOn(await import("../../src/daemon/auth.js"), "readAuthToken");
+    vi.useFakeTimers();
+    let resolvePeer!: (peer: { pid: number; birth: string }) => void;
+    const admitPeer = vi.fn(() => new Promise<{ pid: number; birth: string }>(resolve => { resolvePeer = resolve; }));
+    try {
+      const pending = handlePreToolUse(JSON.stringify(sessionPayload), {
+        deadlineMs: 150,
+        _admitPeerForTesting: admitPeer,
+      });
+      await vi.advanceTimersByTimeAsync(0);
+      expect(admitPeer).toHaveBeenCalledOnce();
+      await vi.advanceTimersByTimeAsync(150);
+      expect(await pending).toEqual({ exitCode: 0, stdout: "" });
+      resolvePeer({ pid: 42, birth: "birth" });
+      await vi.advanceTimersByTimeAsync(0);
+      expect(readToken).not.toHaveBeenCalled();
+      expect(requests).toEqual([]);
+    } finally {
+      vi.useRealTimers();
+    }
   });
   const parse = (stdout: string) => JSON.parse(stdout) as {
     hookSpecificOutput: { hookEventName: string; additionalContext: string };

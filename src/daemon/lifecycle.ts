@@ -205,6 +205,8 @@ type RequestDeadline = {
   abortSignal?: AbortSignal;
 };
 
+type DiagnosticRequestDeadline = RequestDeadline & { expiresAt: number };
+
 async function runCleanupStages(stages: readonly CleanupFn[]): Promise<void> {
   const errors: unknown[] = [];
   for (const stage of stages) {
@@ -1321,7 +1323,7 @@ async function checkDaemonDiagnostics(
   port: number,
   tokenPath: string,
   fetchFn: typeof globalThis.fetch,
-  remainingDeadline: () => RequestDeadline | null,
+  remainingDeadline: () => DiagnosticRequestDeadline | null,
   publicHealth: HealthResponse,
   expectedStorageBackend: StorageBackend,
   readToken: (path: string) => string | null,
@@ -1330,7 +1332,7 @@ async function checkDaemonDiagnostics(
 ): Promise<HealthResponse | null> {
   const initialDeadline = remainingDeadline();
   if (initialDeadline === null || initialDeadline.abortSignal?.aborted) return null;
-  const deadline = initialDeadline.expiresAt ?? now() + initialDeadline.timeoutMs;
+  const deadline = initialDeadline.expiresAt;
   let peer: DaemonPeerAdmission;
   try {
     peer = await awaitDaemonPeerAdmission(admitPeer, port, deadline, initialDeadline.abortSignal, now);
@@ -1575,7 +1577,7 @@ async function captureLifecyclePublicationEvidence(
   const now = opts._monotonicNowOverride ?? performance.now.bind(performance);
   const setTimeoutFn = opts._setTimeoutOverride ?? setTimeout;
   const clearTimeoutFn = opts._clearTimeoutOverride ?? clearTimeout;
-  const remainingDeadline = (): RequestDeadline | null => {
+  const remainingDeadline = (): DiagnosticRequestDeadline | null => {
     const timeoutMs = deadline - now();
     return timeoutMs <= 0
       ? null
@@ -2300,7 +2302,7 @@ async function ensureDaemonUnlocked(opts: EnsureDaemonOptions): Promise<EnsureDa
     };
   }
 
-  function remainingRequestDeadline(): RequestDeadline | null {
+  function remainingRequestDeadline(): DiagnosticRequestDeadline | null {
     const timeoutMs = deadline - monotonicNow();
     return timeoutMs <= 0
       ? null
@@ -2422,7 +2424,7 @@ async function ensureDaemonUnlocked(opts: EnsureDaemonOptions): Promise<EnsureDa
         opts.port,
         tokenPath,
         fetchFn,
-        (): RequestDeadline | null => {
+        (): DiagnosticRequestDeadline | null => {
           const timeoutMs = access.deadline - monotonicNow();
           return timeoutMs <= 0
             ? null
@@ -3946,7 +3948,7 @@ export async function verifyRunningDaemon(
   if (platform === "win32") return null;
   const deadline = performance.now() + opts.budgetMs;
   const remainingMs = (): number => deadline - performance.now();
-  const remainingDeadline = (): RequestDeadline | null => {
+  const remainingDeadline = (): DiagnosticRequestDeadline | null => {
     const timeoutMs = remainingMs();
     return timeoutMs <= 0
       ? null
@@ -4208,7 +4210,7 @@ async function restartDaemonUnlocked(
   const readOwnerProbe: typeof readPrivateMutationLockOwner = opts._readPrivateMutationLockOwnerForTesting
     ?? (testScope !== undefined || hermeticSeams !== undefined ? (() => null) : readPrivateMutationLockOwner);
   const managerKind = managedSupervisorKind(platform, opts.enforceUserManagerParent);
-  function remainingVerificationDeadline(): RequestDeadline | null {
+  function remainingVerificationDeadline(): DiagnosticRequestDeadline | null {
     const timeoutMs = verificationDeadline - monotonicNow();
     return timeoutMs <= 0
       ? null

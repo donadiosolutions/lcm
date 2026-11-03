@@ -2704,6 +2704,63 @@ describe("authenticated legacy generated systemd refusal matrix", () => {
     }
   });
 
+  it.each(["foreign process owner", "missing listener", "non-private PID"] as const)(
+    "refuses a real legacy peer with %s before token or authenticated requests",
+    async denial => {
+      const home = root("issue-1867-legacy-peer-refusal-");
+      const dir = join(home, ".lcm");
+      privateDirectory(dir);
+      const procRoot = join(home, "proc");
+      const uid = process.getuid?.() ?? 0;
+      const pidPath = writePid(dir, 4242);
+      const tokenPath = join(dir, "daemon.token");
+      writeFileSync(tokenPath, "legacy-token", { mode: 0o600 });
+      writeProc(procRoot, 4242, 1234, "node lcm daemon start --foreground",
+        denial === "foreign process owner" ? uid + 1 : uid);
+      if (denial === "missing listener") mkdirSync(join(procRoot, "4242", "fd"));
+      else writeProcListenerEvidence(procRoot, 4242, 19_999);
+      if (denial === "non-private PID") chmodSync(pidPath, 0o644);
+      legacyTokenFileFault.path = tokenPath;
+      legacyTokenFileFault.countOnly = true;
+      const supervisor = legacyMigrationSupervisor({ kind: "candidates", candidates: [legacyUnit()] });
+      const fetch = vi.fn(async (_input: RequestInfo | URL, _init?: RequestInit) => response(health(4242, { version: "1.4.1" })));
+      const ensureMock = vi.fn();
+      const kill = vi.fn();
+      const originalEntrypoint = process.argv[1];
+      process.argv[1] = "/tmp/lcm-production-entrypoint.js";
+      try {
+        await expect(restartDaemonProduction({
+          ...baseOptions(dir),
+          _skipSpawn: false,
+          expectedVersion: "1.4.2",
+          enforceUserManagerParent: true,
+          _procRoot: procRoot,
+          _uid: uid,
+          _processStartTimeForTesting: () => "birth-4242",
+          _isProcessAliveOverride: () => true,
+          _spawnSyncOverride: vi.fn(() => ({ status: 1, stdout: "", stderr: "no manager" })) as never,
+          _fetchOverride: fetch,
+          _supervisorOverride: supervisor.supervisor,
+          _ensureDaemonOverride: ensureMock,
+          _killOverride: kill,
+          _assertBackendPublication: () => undefined,
+        })).resolves.toMatchObject({
+          connected: false, restarted: false, refusalReason: "invalid-collision", pid: 4242,
+          warning: expect.stringContaining("peer could not be verified"),
+        });
+      } finally {
+        process.argv[1] = originalEntrypoint;
+      }
+      expect(fetch).toHaveBeenCalledOnce();
+      expect(fetch.mock.calls[0]?.[1]?.headers).toBeUndefined();
+      expect(legacyTokenFileFault.openCalls).toBe(0);
+      expect(supervisor.stopLegacySystemdUnit).not.toHaveBeenCalled();
+      expect(supervisor.start).not.toHaveBeenCalled();
+      expect(ensureMock).not.toHaveBeenCalled();
+      expect(kill).not.toHaveBeenCalled();
+    },
+  );
+
   it("refuses a multiply-linked legacy PID file before authentication", async () => {
     const dir = root("issue-600-legacy-hardlink-");
     const procRoot = join(dir, "proc");

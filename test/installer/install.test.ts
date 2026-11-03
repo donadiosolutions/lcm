@@ -2453,6 +2453,33 @@ describe("installer publication admission integration", () => {
     }
   });
 
+  it("uses default capture and retry recipient guards before any token or HTTP access", async () => {
+    const home = mkdtempSync(join(tmpdir(), "lcm-installer-default-peer-"));
+    const root = join(home, ".lcm");
+    const config = join(root, "config.json");
+    fsMkdirSync(root, { mode: 0o700 });
+    fsWriteFileSync(config, '{"daemon":{"port":3737}}', { mode: 0o600 });
+    const fetch = healthyFetch();
+    const readToken = vi.fn(() => "token");
+    try {
+      expect(fsExistsSync(join(root, "daemon.pid"))).toBe(false);
+      const convergence = await createInstallerPublicationConvergence(config, {
+        fetch,
+        readToken,
+        _expectedVersionForTesting: expectedVersion,
+        _expectedEntrypointForTesting: expectedEntrypoint,
+        _expectedRuntimeDigestForTesting: expectedRuntimeDigest,
+      });
+      expect(convergence.identity).toBeUndefined();
+      expect(convergence.deps.admitPeer).toBeTypeOf("function");
+      await expect(convergence.deps.admitPeer!(3737, performance.now() + 100)).resolves.toBeNull();
+      expect(readToken).not.toHaveBeenCalled();
+      expect(fetch).not.toHaveBeenCalled();
+    } finally {
+      fsRmSync(home, { recursive: true, force: true });
+    }
+  });
+
   it("rejects lock-free existing-config witness drift and admits PostgreSQL via its read seam", () => {
     const home = mkdtempSync(join(tmpdir(), "lcm-installer-lockfree-drift-"));
     const root = join(home, ".lcm");
