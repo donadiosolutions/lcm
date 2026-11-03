@@ -81,6 +81,13 @@ const child = (parent: unknown = "parent-thread", extra: Record<string, unknown>
 );
 
 describe("Codex child parent linkage on ingest", () => {
+  it.each(["a".repeat(1024), "é".repeat(512)])("links an immediate parent at the UTF-8 ceiling", async (parent) => {
+    await withWorld(async (world) => {
+      expect((await world.ingest(child(parent))).status).toBe(200);
+      expect(world.parents()).toEqual([{ session_id: "child-thread", parent_session_id: parent }]);
+    });
+  });
+
   it("records the immediate parent of a child with no inherited-history ordinal", async () => {
     await withWorld(async (world) => {
       expect((await world.ingest(child())).body).toMatchObject({ ingested: 1 });
@@ -115,6 +122,8 @@ describe("Codex child parent linkage on ingest", () => {
     ["an empty parent", child("")],
     ["a parent containing NUL", child("bad\u0000parent")],
     ["a non-string parent", child(7)],
+    ["an oversized ASCII parent", child("a".repeat(1025))],
+    ["an oversized UTF-8 parent", child("é".repeat(513))],
     ["a root rollout", lines(meta({}), message(undefined, "user", "child task"))],
     ["a first record that is not session_meta", lines(message(undefined, "user", "child task"), meta({ parent_thread_id: "p" }))],
   ])("leaves the column null for %s", async (_name, transcript) => {

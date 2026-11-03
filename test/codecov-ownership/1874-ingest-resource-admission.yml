@@ -1,0 +1,11 @@
+references: ["#1874"]
+rationale: >-
+  Native ingest resource admission keeps src/daemon/routes/ingest.ts and
+  src/daemon/routes/ingest-terminal.ts with unit-daemon-routes. The shared
+  native session-ID predicate and independent reader/backfill validation keep
+  src/storage/native-transcript-ingest.ts with unit-transcripts-import.
+  No production file is added, removed, moved or re-owned.
+pins:
+  - ["src/daemon/routes/ingest.ts", "unit-daemon-routes"]
+  - ["src/daemon/routes/ingest-terminal.ts", "unit-daemon-routes"]
+  - ["src/storage/native-transcript-ingest.ts", "unit-transcripts-import"]

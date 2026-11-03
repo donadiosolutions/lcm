@@ -599,7 +599,9 @@ A `SubagentStop` payload without a valid `agent_id` or without
   own rollout. A grandchild records its direct parent, never the root of the
   agent tree. The first recorded parent is kept and never overwritten or
   cleared. A root conversation, a conversation from another client, and a
-  rollout without `parent_thread_id` leave the column empty. The value is
+  rollout without `parent_thread_id` leave the column empty. Native `/ingest`
+  also omits empty, self-referential or NUL-containing parent IDs and those
+  longer than 1,024 UTF-8 bytes; it never truncates them. The value is
   filled when a rollout is ingested (a `SubagentStop` or `PreCompact`
   snapshot, or `lcm import --codex`), including for a conversation stored
   earlier; ingesting only a message list never fills it. LCM offers no command
@@ -708,13 +710,18 @@ token refuses it with 401. The route validates the body (`session_id`, an absolu
 existing `cwd`, a `transcript_path` that passes the ordinary transcript-path
 safety check and exists, `client: "codex"`), queues it and answers
 `202 {"accepted": true}` without waiting for publication or storage work.
+The session ID must be a nonempty string without NUL and at most 1,024 UTF-8
+bytes; invalid IDs receive 400 before entering the queue.
 Malformed or unsafe requests receive 400; a ninth distinct (`cwd`, `session_id`),
 or a different transcript for a key that already has one waiting, receives 503; so
 does a daemon that is shutting down. It trusts any holder of the daemon token, as
 the other routes do.
 
-The queue runs one ingest at a time with the ordinary `/ingest` handler. A request
-for a key that is already running is kept as one pending request and re-run after
+The queue runs one ingest at a time with the ordinary `/ingest` handler. A 202
+accepts an attempt, not a guarantee of capture: if another native ingest is active
+in this daemon, the attempt is reported as `blocked` and retired without an
+automatic retry. A later hook event or an explicit retry can submit it again.
+A request for a key that is already running is kept as one pending request and re-run after
 the current one finishes, so the newest transcript tail is read; repeated requests
 combine. Each accepted request has an absolute 30 second cancellation deadline
 counted from acceptance, and daemon shutdown cancels it; both are best-effort
@@ -790,6 +797,12 @@ a typed fence failure does not imply a nonzero exit code from every hook.
 
 ### Native ingest source changes and cancellation
 
+`/ingest` requires a nonempty string `session_id` without NUL and at most 1,024
+UTF-8 bytes, including for explicit `messages` requests. Invalid IDs receive
+HTTP 400 before project identity or transcript work. The native JSONL reader and
+backfill APIs enforce the same session-ID limit independently and reject invalid
+IDs with `invalid-input` before reading source bytes or calling repositories.
+
 When `/ingest` receives a native transcript path, parsed messages and native
 archival use the same open file snapshot. Each attempt prepares parsed messages
 and its scrubber before requesting backend publication admission. Once admitted,
@@ -797,6 +810,21 @@ LCM revalidates the snapshot before storing messages and preserves exact source
 and message link checks. If a fully read and validated source changes during ingestion, LCM
 makes one fresh attempt only when the original byte prefix remains identical;
 appended bytes are allowed. Shrink or rewrite of that prefix fails the request.
+
+Each native snapshot is limited to 64 MiB (67,108,864 source bytes). LCM checks
+the opened snapshot's size before reading it and counts streamed bytes before
+retaining each chunk. A larger snapshot fails as a whole with HTTP 413 and
+`{"error":"native transcript exceeds 64 MiB snapshot limit"}`; it is closed
+without storing that attempt's parsed messages or native records. LCM never
+truncates a snapshot to fit. If a later retry exceeds the limit, any earlier
+attempt's committed work remains intact.
+
+Only one native `/ingest` request may run in a daemon at a time, shared by HTTP,
+periodic scans and terminal attempts. Admission lasts through retries, storage
+and snapshot/quarantine cleanup. A competing native request receives HTTP 503
+with `{"error":"native ingest is busy; retry later"}` without waiting in a new
+queue; ordinary callers may retry later. Explicit `messages` requests do not
+consume this native slot.
 
 Mutation before the first complete validated snapshot is available also fails
 without an internal retry. A failure closing the source or quarantine after an
@@ -832,8 +860,11 @@ writable. Active storage work finishes before project resources close, including
 an already-running native snapshot and token query. Cancellation prevents another
 attempt and is not recorded as an ingest error. Ordinary storage, source, and
 linkage failures remain errors even if cancellation occurs at the same time.
-The snapshot is held in process memory, as with the previous whole-file parser;
-this is not a new total-size or execution-time limit.
+The snapshot is held in process memory, with buffers, decoded text and parsed
+messages potentially present together. The limits above bound source bytes and
+simultaneous native `/ingest` requests, not total process memory or execution
+time. Independent transcript readers, including `/compact`, are outside this
+native `/ingest` snapshot-size and concurrency policy.
 
 Previously retained ingest errors remain in diagnostic history. This repair does
 not remove historical errors or change their retention period.
