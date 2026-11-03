@@ -1,0 +1,473 @@
+{
+  "schemaVersion": 1,
+  "contract": {
+    "sha256": "ea6ccaaa77212c3c7486cdc85af03a985dde05eeef18096a4511163d0f490839",
+    "status": "approved",
+    "approval": {
+      "contractSha256": "ea6ccaaa77212c3c7486cdc85af03a985dde05eeef18096a4511163d0f490839",
+      "approvedBy": "bcdonadio (repository owner)",
+      "approvedAt": "2026-10-28T13:54:14Z",
+      "note": "recorded by root at receipt",
+      "approvalRef": "run-record epic-228-run-01a15242 entry 2026-10-28 13:54:14 UTC (user request_user_input answer in root chat)"
+    }
+  },
+  "startedAt": "2026-10-28T23:30:20.982Z",
+  "lane": "local",
+  "profile": "full",
+  "withFaults": false,
+  "provenance": {
+    "testedCommit": "bd89074f0661bf01eea7ead45c01ee019ea7f558",
+    "dirty": false,
+    "testedInputsSha256": "3a0d3756fbe34f2bad6367682ec2351704a3f8ebe05b89c5b324259e163af65b",
+    "testedInputsCount": 1857,
+    "lockfileSha256": "f259e605199d33c25f4e5899833a61896b2f04e1687876eb41401a23749a2427",
+    "cliSha256": "71478a20f66f6f7c4591ee0dc7e87185ad45581968a410270717390efe64f6d8",
+    "stagedPackageSha256": "678fb3a7d25ef9b2184770344cd18acd0c048ed9883ae929bfc7962a28d8cff0",
+    "contractSha256": "ea6ccaaa77212c3c7486cdc85af03a985dde05eeef18096a4511163d0f490839",
+    "approvalSha256": "adbb8cb0968c830299935ed9cbf69db11bd5e4744326b37d7132b955dc3363d5",
+    "node": "v25.4.0",
+    "executionHost": {
+      "capturedAt": "2026-10-28T23:30:23.751Z",
+      "osId": "ubuntu",
+      "osVersionId": "24.04",
+      "kernelRelease": "6.6.141",
+      "architecture": "x64",
+      "cpuModel": "AMD EPYC",
+      "logicalCpus": 8,
+      "totalMemoryBytes": 33229729792,
+      "containerEngine": "podman",
+      "containerEngineVersion": "5.8.4",
+      "hostnameSha256": "7b2ddfbac651b79f22d776902feb802fe2937e57dfe173c77322f0e2802ace32",
+      "runnerName": null,
+      "runnerOs": null,
+      "runnerArch": null,
+      "runnerSku": "blacksmith-8vcpu-ubuntu-2404"
+    },
+    "observerSettings": {
+      "pollSeconds": 1,
+      "busyTimeoutMs": 200,
+      "perQueryDeadlineMs": 250,
+      "maxPollGapSeconds": 2
+    }
+  },
+  "machines": [
+    {
+      "name": "a",
+      "machineId": "01a184d9-c358-77d2-9f18-bfc445e6601d",
+      "identityKeySha256": "049bc126179d4e0553d83db2793aaa398947c69f3778def690300bd667d51939"
+    },
+    {
+      "name": "b",
+      "machineId": "01a184d9-e96d-7bc3-af2d-53957b95ba71",
+      "identityKeySha256": "3837cd85660f4170be6353e902d54ff352612e4c34c0c71904aa56edead75f46"
+    }
+  ],
+  "faults": [
+    {
+      "id": "partition-a",
+      "kind": "partition-machine",
+      "target": "a",
+      "requestedAt": "2026-10-29T01:16:34.061Z",
+      "appliedAt": "2026-10-29T01:16:34.170Z",
+      "clearedAt": "2026-10-29T01:17:34.435Z",
+      "recoveredAt": "2026-10-29T01:19:31.628Z"
+    },
+    {
+      "id": "restart-database",
+      "kind": "restart-database",
+      "target": "database",
+      "requestedAt": "2026-10-29T01:19:31.628Z",
+      "appliedAt": "2026-10-29T01:19:31.903Z",
+      "clearedAt": "2026-10-29T01:19:32.228Z",
+      "recoveredAt": "2026-10-29T01:23:28.227Z"
+    }
+  ],
+  "slos": [
+    {
+      "id": "hook-command.p50",
+      "formula": "nearest-rank over successful steady samples",
+      "inputs": {
+        "count": 1200,
+        "sampleFile": "hook-command-samples.ndjson",
+        "sampleSha256": "3a7ce83a9026742eb6d6e06a1f8998d92e8b2adebf2dae4d91cc39f1cc83390a"
+      },
+      "threshold": 600,
+      "observed": 296.224492,
+      "verdict": "pass"
+    },
+    {
+      "id": "hook-command.p95",
+      "formula": "nearest-rank over successful steady samples",
+      "inputs": {
+        "count": 1200,
+        "sampleFile": "hook-command-samples.ndjson",
+        "sampleSha256": "3a7ce83a9026742eb6d6e06a1f8998d92e8b2adebf2dae4d91cc39f1cc83390a"
+      },
+      "threshold": 1500,
+      "observed": 728.641059,
+      "verdict": "pass"
+    },
+    {
+      "id": "hook-command.p99",
+      "formula": "nearest-rank over successful steady samples",
+      "inputs": {
+        "count": 1200,
+        "sampleFile": "hook-command-samples.ndjson",
+        "sampleSha256": "3a7ce83a9026742eb6d6e06a1f8998d92e8b2adebf2dae4d91cc39f1cc83390a"
+      },
+      "threshold": 2500,
+      "observed": 930.481244,
+      "verdict": "pass"
+    },
+    {
+      "id": "daemon-search.p50",
+      "formula": "nearest-rank over successful steady samples",
+      "inputs": {
+        "count": 2400,
+        "sampleFile": "daemon-search-samples.ndjson",
+        "sampleSha256": "2a622c99e1366b06434887d9c054fccf85e09984fda58108d71ab34b51a533c9"
+      },
+      "threshold": 100,
+      "observed": 15.576831,
+      "verdict": "pass"
+    },
+    {
+      "id": "daemon-search.p95",
+      "formula": "nearest-rank over successful steady samples",
+      "inputs": {
+        "count": 2400,
+        "sampleFile": "daemon-search-samples.ndjson",
+        "sampleSha256": "2a622c99e1366b06434887d9c054fccf85e09984fda58108d71ab34b51a533c9"
+      },
+      "threshold": 500,
+      "observed": 34.346574,
+      "verdict": "pass"
+    },
+    {
+      "id": "daemon-search.p99",
+      "formula": "nearest-rank over successful steady samples",
+      "inputs": {
+        "count": 2400,
+        "sampleFile": "daemon-search-samples.ndjson",
+        "sampleSha256": "2a622c99e1366b06434887d9c054fccf85e09984fda58108d71ab34b51a533c9"
+      },
+      "threshold": 1500,
+      "observed": 108.435496,
+      "verdict": "pass"
+    },
+    {
+      "id": "daemon-store.p50",
+      "formula": "nearest-rank over successful steady samples",
+      "inputs": {
+        "count": 1200,
+        "sampleFile": "daemon-store-samples.ndjson",
+        "sampleSha256": "9d973b273704faeb23435e31e8973be2e7782de6d9894b84c1401d91a776eb96"
+      },
+      "threshold": 100,
+      "observed": 50.284752,
+      "verdict": "pass"
+    },
+    {
+      "id": "daemon-store.p95",
+      "formula": "nearest-rank over successful steady samples",
+      "inputs": {
+        "count": 1200,
+        "sampleFile": "daemon-store-samples.ndjson",
+        "sampleSha256": "9d973b273704faeb23435e31e8973be2e7782de6d9894b84c1401d91a776eb96"
+      },
+      "threshold": 500,
+      "observed": 78.538033,
+      "verdict": "pass"
+    },
+    {
+      "id": "daemon-store.p99",
+      "formula": "nearest-rank over successful steady samples",
+      "inputs": {
+        "count": 1200,
+        "sampleFile": "daemon-store-samples.ndjson",
+        "sampleSha256": "9d973b273704faeb23435e31e8973be2e7782de6d9894b84c1401d91a776eb96"
+      },
+      "threshold": 1500,
+      "observed": 96.533049,
+      "verdict": "pass"
+    },
+    {
+      "id": "profile-certifying",
+      "formula": "full profile only",
+      "inputs": {
+        "count": 1,
+        "sampleFile": "run.json",
+        "sampleSha256": "0ffccf149b68ffeb77eedd8e5255ccb238d7b1363e6c4f28716057a81d2c5989"
+      },
+      "threshold": 1,
+      "observed": 1,
+      "verdict": "pass"
+    },
+    {
+      "id": "phase-barriers",
+      "formula": "both warmups complete before coordinator-issued shared steady T0",
+      "inputs": {
+        "count": 2,
+        "sampleFile": "phase-control.json",
+        "sampleSha256": "fc38c22c41ba75fb371123104da94dfc42e3b67ef8f9f806a4796adccf82ce02"
+      },
+      "threshold": 2,
+      "observed": 2,
+      "verdict": "pass"
+    },
+    {
+      "id": "scheduled-attempt-identity",
+      "formula": "exact expected machine/op/kind/session ID set in [T0,T0+steady)",
+      "inputs": {
+        "count": 5040,
+        "sampleFile": "steady-attempts.ndjson",
+        "sampleSha256": "ce875af0b50b13dea95bf6ba15d96ce38f983ef996341703295f1b64efaebf44"
+      },
+      "threshold": 0,
+      "observed": 0,
+      "verdict": "pass"
+    },
+    {
+      "id": "readiness",
+      "formula": "all database, role, TLS, machine and drain predicates",
+      "inputs": {
+        "count": 2,
+        "sampleFile": "readiness-witness.ndjson",
+        "sampleSha256": "69260715fa8443a37fc9fb06a4d7d5d6f97db374794186dc03e9aea3e276ef3b"
+      },
+      "threshold": 1,
+      "observed": 1,
+      "verdict": "pass"
+    },
+    {
+      "id": "final-drain",
+      "formula": "all expected oracle rows acknowledged and remotely pruned with zero backlog",
+      "inputs": {
+        "count": 2,
+        "sampleFile": "readiness-witness.ndjson",
+        "sampleSha256": "69260715fa8443a37fc9fb06a4d7d5d6f97db374794186dc03e9aea3e276ef3b"
+      },
+      "threshold": 0,
+      "observed": 0,
+      "verdict": "pass"
+    },
+    {
+      "id": "hook-command.user-prompt.p95",
+      "formula": "nearest-rank per hook kind",
+      "inputs": {
+        "count": 300,
+        "sampleFile": "hook-command-samples.ndjson",
+        "sampleSha256": "3a7ce83a9026742eb6d6e06a1f8998d92e8b2adebf2dae4d91cc39f1cc83390a"
+      },
+      "threshold": 1500,
+      "observed": 922.674938,
+      "verdict": "pass"
+    },
+    {
+      "id": "hook-command.post-tool.p95",
+      "formula": "nearest-rank per hook kind",
+      "inputs": {
+        "count": 900,
+        "sampleFile": "hook-command-samples.ndjson",
+        "sampleSha256": "3a7ce83a9026742eb6d6e06a1f8998d92e8b2adebf2dae4d91cc39f1cc83390a"
+      },
+      "threshold": 1500,
+      "observed": 397.06013,
+      "verdict": "pass"
+    },
+    {
+      "id": "hook-command.machine-a.p95",
+      "formula": "nearest-rank per machine",
+      "inputs": {
+        "count": 600,
+        "sampleFile": "hook-command-samples.ndjson",
+        "sampleSha256": "3a7ce83a9026742eb6d6e06a1f8998d92e8b2adebf2dae4d91cc39f1cc83390a"
+      },
+      "threshold": 1500,
+      "observed": 740.525388,
+      "verdict": "pass"
+    },
+    {
+      "id": "hook-command.machine-b.p95",
+      "formula": "nearest-rank per machine",
+      "inputs": {
+        "count": 600,
+        "sampleFile": "hook-command-samples.ndjson",
+        "sampleSha256": "3a7ce83a9026742eb6d6e06a1f8998d92e8b2adebf2dae4d91cc39f1cc83390a"
+      },
+      "threshold": 1500,
+      "observed": 717.609978,
+      "verdict": "pass"
+    },
+    {
+      "id": "non-injected-error-rate",
+      "formula": "failed, cancelled or missing attempts / complete expected steady schedule (hook, search, store, snapshot, compact)",
+      "inputs": {
+        "count": 5040,
+        "sampleFile": "steady-attempts.ndjson",
+        "sampleSha256": "ce875af0b50b13dea95bf6ba15d96ce38f983ef996341703295f1b64efaebf44"
+      },
+      "threshold": 0.001,
+      "observed": 0,
+      "verdict": "pass"
+    },
+    {
+      "id": "acknowledgment-lag.p99",
+      "formula": "nearest-rank",
+      "inputs": {
+        "count": 1200,
+        "sampleFile": "acknowledgment-lag-samples.ndjson",
+        "sampleSha256": "bc138eec1563e51a7b9df452b6d408dd096c212f7996edf45897f80a59516620"
+      },
+      "threshold": 660,
+      "observed": 299.148878015,
+      "verdict": "pass"
+    },
+    {
+      "id": "acknowledgment-lag.max",
+      "formula": "maximum",
+      "inputs": {
+        "count": 1200,
+        "sampleFile": "acknowledgment-lag-samples.ndjson",
+        "sampleSha256": "bc138eec1563e51a7b9df452b6d408dd096c212f7996edf45897f80a59516620"
+      },
+      "threshold": 900,
+      "observed": 300.089461253,
+      "verdict": "pass"
+    },
+    {
+      "id": "oracle-capture-bijection",
+      "formula": "one invocation to one unique event",
+      "inputs": {
+        "count": 1224,
+        "sampleFile": "oracle-events.ndjson",
+        "sampleSha256": "58de7e59ed72589c15a230ee8dc7bc0ad66ed7f76262df9494802b92dc3de93c"
+      },
+      "threshold": 0,
+      "observed": 0,
+      "verdict": "pass"
+    },
+    {
+      "id": "event-loss",
+      "formula": "captured events without terminal acknowledgment",
+      "inputs": {
+        "count": 1224,
+        "sampleFile": "oracle-events.ndjson",
+        "sampleSha256": "58de7e59ed72589c15a230ee8dc7bc0ad66ed7f76262df9494802b92dc3de93c"
+      },
+      "threshold": 0,
+      "observed": 0,
+      "verdict": "pass"
+    },
+    {
+      "id": "observed-duplicate-inbox-ids",
+      "formula": "event ids with more than one distinct acknowledged inbox id",
+      "inputs": {
+        "count": 1224,
+        "sampleFile": "oracle-events.ndjson",
+        "sampleSha256": "58de7e59ed72589c15a230ee8dc7bc0ad66ed7f76262df9494802b92dc3de93c"
+      },
+      "threshold": 0,
+      "observed": 0,
+      "verdict": "pass"
+    },
+    {
+      "id": "observer-completeness",
+      "formula": "all one-second polls present, bounded and identity-stable",
+      "inputs": {
+        "count": 14748,
+        "sampleFile": "observer-witness.ndjson",
+        "sampleSha256": "dcc91ae279cb6e1e24df84a645bb31706042a55c60c2acf7d67c9d92d16ec98f"
+      },
+      "threshold": 0,
+      "observed": 0,
+      "verdict": "pass"
+    },
+    {
+      "id": "clock-interval-radius",
+      "formula": "max((t1.wall-t0.wall)/2)",
+      "inputs": {
+        "count": 252,
+        "sampleFile": "clock-witness.json",
+        "sampleSha256": "a733c03f9310904c6c0a95067bcbb5973e18631d4bc7148ddc54fb542f2ac793"
+      },
+      "threshold": 250,
+      "observed": 134.5,
+      "verdict": "pass"
+    },
+    {
+      "id": "capacity",
+      "formula": "measured per-machine pools and setup-role closure plus attributed runtime peaks within configured total and usable budget",
+      "inputs": {
+        "count": 252,
+        "sampleFile": "clock-witness.json",
+        "sampleSha256": "a733c03f9310904c6c0a95067bcbb5973e18631d4bc7148ddc54fb542f2ac793"
+      },
+      "threshold": 19,
+      "observed": 5,
+      "verdict": "pass"
+    },
+    {
+      "id": "lane-fault-set",
+      "formula": "full profile or smoke with faults: exact contract lane fault IDs",
+      "inputs": {
+        "count": 2,
+        "sampleFile": "lane-fault-set.ndjson",
+        "sampleSha256": "27b6fd8ae57efa5d3135da3cb4bcc4cdbd7400d58540aed97cffc3ae6aa685a7"
+      },
+      "threshold": 2,
+      "observed": 2,
+      "verdict": "pass"
+    },
+    {
+      "id": "recovery.partition-a",
+      "formula": "first success, outage, 1-second-aligned per-kind 60-second window and acknowledgment catch-up",
+      "inputs": {
+        "count": 108,
+        "sampleFile": "faults.json",
+        "sampleSha256": "c462dd67255796b64568b73a1fa6c6d33c15ff8ebe9e9a69df328be24a2d2573"
+      },
+      "threshold": 180,
+      "observed": 120.265,
+      "verdict": "pass"
+    },
+    {
+      "id": "recovery.restart-database",
+      "formula": "first success, outage, 1-second-aligned per-kind 60-second window and acknowledgment catch-up",
+      "inputs": {
+        "count": 144,
+        "sampleFile": "faults.json",
+        "sampleSha256": "c462dd67255796b64568b73a1fa6c6d33c15ff8ebe9e9a69df328be24a2d2573"
+      },
+      "threshold": 240,
+      "observed": 60.325,
+      "verdict": "pass"
+    }
+  ],
+  "cleanup": {
+    "verdict": "pass",
+    "residualResources": 0,
+    "labeledContainers": 0,
+    "labeledNetworks": 0,
+    "labeledVolumes": 0,
+    "familyTaggedProviderClusters": 0,
+    "privateRootsAbsent": true,
+    "ownedProcessesExited": true,
+    "providerDestroyConfirmedWithinSeconds": 0
+  },
+  "diagnostics": {
+    "databaseGrowth": {
+      "beforeBytes": 3219456,
+      "afterBytes": 9019392,
+      "deltaBytes": 5799936
+    },
+    "submittedPrimaryBytes": 2529280,
+    "submittedEnvelopeBytes": 2757862,
+    "truncatedRows": 296,
+    "sweepWitnessSha256": [
+      "ed76cc7c20ce269ed68453fe32c59caa12b3b1698fbb9bd4894a42aeef13fd7c",
+      "40879c176185cea076944ad1a08f904956c54db57efe516d9404dadca6dae0a9"
+    ]
+  },
+  "verdict": "pass"
+}
