@@ -52,10 +52,14 @@ vi.mock("../src/config-projection.js", async () => {
 });
 vi.mock("../src/daemon/project.js", () => ({ projectDir: (cwd: string): string => cwd }));
 vi.mock("../src/generated-patterns.js", () => ({ GITLEAKS_PATTERNS: [] }));
-vi.mock("../src/runtime-paths.js", () => ({
-  configPath: (): string => "/isolated/config.json",
-  projectsDir: (): string => "/isolated/projects",
-}));
+vi.mock("../src/runtime-paths.js", async (): Promise<typeof import("../src/runtime-paths.js")> => {
+  const actual = await vi.importActual<typeof import("../src/runtime-paths.js")>("../src/runtime-paths.js");
+  return {
+    ...actual,
+    configPath: (): string => "/isolated/config.json",
+    projectsDir: (): string => "/isolated/projects",
+  };
+});
 vi.mock("../src/scrub.js", () => ({
   NATIVE_PATTERNS: [],
   readGitleaksSyncDate: mocks.readSyncDate,
