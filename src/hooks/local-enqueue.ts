@@ -3,7 +3,7 @@ import {
   SQLiteLocalHookOutboxFactory,
   type LocalHookEvent,
 } from "../storage/local-hook-outbox.js";
-import { lcmHomeDir } from "../runtime-paths.js";
+import { legacyHomeMigrationAdmissionDiagnostic, lcmHomeDir } from "../runtime-paths.js";
 import { dirname } from "node:path";
 import { PrivateMutationLockContentionError } from "../private-mutation-lock.js";
 import {
@@ -76,6 +76,7 @@ export async function appendLocalHookEvents(input: Readonly<{
   const rootHandle = openPrivateDirectory(rootPath);
   const rootWitness = rootHandle.witness;
   const factory = new SQLiteLocalHookOutboxFactory();
+  let admissionError: unknown;
   try {
     assertStableRoot(rootHandle, rootPath, rootWitness);
     try {
@@ -101,11 +102,21 @@ export async function appendLocalHookEvents(input: Readonly<{
       }
       throw error;
     }
+  } catch (error) {
+    if (legacyHomeMigrationAdmissionDiagnostic(error) !== undefined) admissionError = error;
+    throw error;
   } finally {
     try {
-      assertStableRoot(rootHandle, rootPath, rootWitness);
-    } finally {
-      rootHandle.close();
+      try {
+        assertStableRoot(rootHandle, rootPath, rootWitness);
+      } finally {
+        rootHandle.close();
+      }
+    } catch (cleanupError) {
+      if (admissionError !== undefined) {
+        throw new AggregateError([admissionError, cleanupError], "legacy migration refusal cleanup failed", { cause: admissionError });
+      }
+      throw cleanupError;
     }
   }
 }

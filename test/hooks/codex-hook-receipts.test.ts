@@ -9,6 +9,9 @@ import {
   runObservedCodexHook,
 } from "../../src/hooks/codex-hook-receipts.js";
 import { safeLogError } from "../../src/hooks/hook-errors.js";
+import { LegacyHomeMigrationPendingError, LegacyHomeMigrationJournalError } from "../../src/runtime-paths.js";
+import { writeAbortedTerminalPublicationJournal } from "../fixtures/terminal-publication-journal.js";
+import { backendPublicationCanonicalSha256, backendPublicationJournalPath } from "../../src/storage/backend-publication.js";
 
 const lcmHome = () => join(homedir(), ".lcm");
 const stateDir = () => join(lcmHome(), "state");
@@ -55,6 +58,20 @@ describe("Codex hook receipts", () => {
     expect(readCodexHookReceipts()).toEqual([record]);
   });
 
+  it("preserves ordinary receipt observation during unresolved backend publication", async () => {
+    writeAbortedTerminalPublicationJournal(homedir());
+    const path = backendPublicationJournalPath(homedir());
+    const { checksumSha256: _checksum, ...body } = JSON.parse(readFileSync(path, "utf8"));
+    body.phase = "prepared";
+    writeFileSync(path, JSON.stringify({ ...body, checksumSha256: backendPublicationCanonicalSha256(body) }));
+    try {
+      await expect(runObservedCodexHook(observe("post-tool"), ok)).resolves.toEqual({ exitCode: 0, stdout: "" });
+      expect(readRecord("PostToolUse")).toMatchObject({ outcome: "exit-0", exitCode: 0 });
+    } finally {
+      rmSync(join(lcmHome(), "backend-publication"), { recursive: true, force: true });
+    }
+  });
+
   it("attributes the event from the validated payload for shared commands and from the command otherwise", async () => {
     const payload = (name: unknown) => JSON.stringify({ hook_event_name: name });
     await runObservedCodexHook(observe("restore", payload("SubagentStart")), ok);
@@ -85,6 +102,30 @@ describe("Codex hook receipts", () => {
     const boom = new Error("boom");
     await expect(runObservedCodexHook(observe("post-tool"), async () => { throw boom; })).rejects.toBe(boom);
     expect(readRecord("PostToolUse")).toMatchObject({ outcome: "threw", exitCode: null });
+  });
+
+  it.each(["post-tool", "user-prompt"])("preserves the complete target on %s migration refusal with absent or stale receipts", async command => {
+    const snapshot = () => readdirSync(lcmHome(), { recursive: true }).sort().map(name => {
+      const path = join(lcmHome(), String(name));
+      const stat = lstatSync(path);
+      return [name, stat.mode, stat.isDirectory() ? null : readFileSync(path).toString("hex")];
+    });
+    for (const stale of [false, true]) {
+      if (stale) {
+        await runObservedCodexHook(observe(command), ok);
+        const event = command === "post-tool" ? "PostToolUse" : "UserPromptSubmit";
+        const receipt = readRecord(event);
+        writeFileSync(recordPath(event), JSON.stringify({ ...receipt, completedAt: 0 }), { mode: 0o600 });
+        utimesSync(recordPath(event), new Date(0), new Date(0));
+      }
+      const before = snapshot();
+      for (const { wrapped, type } of [false, true].flatMap(wrapped => ["pending", "invalid"].map(type => ({ wrapped, type })))) {
+        const pending = type === "pending" ? new LegacyHomeMigrationPendingError() : new LegacyHomeMigrationJournalError(new Error("parser details"));
+        const error = wrapped ? new AggregateError([pending], "cleanup", { cause: pending }) : pending;
+        await expect(runObservedCodexHook(observe(command), async () => { throw error; })).rejects.toBe(error);
+        expect(snapshot()).toEqual(before);
+      }
+    }
   });
 
   it("notes when the best-effort hook error channel was used, and resets per run", async () => {

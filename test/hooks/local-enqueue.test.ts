@@ -9,6 +9,8 @@ import { SQLiteLocalHookOutboxFactory } from "../../src/storage/local-hook-outbo
 import { writeAbortedTerminalPublicationJournal } from "../fixtures/terminal-publication-journal.js";
 import { backendPublicationJournalPath, backendPublicationCanonicalSha256 } from "../../src/storage/backend-publication.js";
 import * as securityFiles from "../../src/security-files.js";
+import * as backendPublication from "../../src/storage/backend-publication.js";
+import { legacyHomeMigrationAdmissionDiagnostic, LegacyHomeMigrationPendingError, LegacyHomeMigrationJournalError, LEGACY_HOME_MIGRATION_PENDING_DIAGNOSTIC, LEGACY_HOME_MIGRATION_JOURNAL_DIAGNOSTIC } from "../../src/runtime-paths.js";
 
 vi.mock("node:os", async (importOriginal) => {
   const actual = await importOriginal<typeof import("node:os")>();
@@ -42,6 +44,39 @@ describe("appendLocalHookEvents", () => {
     sessionId: "session-1",
     events: [{ type: "decision", category: "decision", data: "durable choice", priority: 1 }],
     sourceHook: "PostToolUse",
+  });
+
+  it.each(["witness", "close"].flatMap(kind => [false, true].flatMap(wrapped => ["pending", "invalid"].map(type => ({ kind, wrapped, type })))))
+  ("preserves $type refusal through root $kind cleanup failure (wrapped=$wrapped)", async ({ kind, wrapped, type }) => {
+    mkdirSync(join(home, ".lcm"), { mode: 0o700 });
+    const primary = type === "pending" ? new LegacyHomeMigrationPendingError() : new LegacyHomeMigrationJournalError(new Error("parser details"));
+    const refusal = wrapped ? new AggregateError([primary], "prior cleanup", { cause: primary }) : primary;
+    const cleanup = new Error("root cleanup failed");
+    const barrier = vi.spyOn(backendPublication, "withBackendPublicationAppendBarrierAsync").mockRejectedValueOnce(refusal);
+    const originalOpen = securityFiles.openPrivateDirectory;
+    const originalAssert = securityFiles.assertPrivateDirectory;
+    const open = vi.spyOn(securityFiles, "openPrivateDirectory").mockImplementationOnce(path => {
+      const handle = originalOpen(path);
+      return { ...handle, close: () => { handle.close(); if (kind === "close") throw cleanup; } };
+    });
+    let assertions = 0;
+    const assert = vi.spyOn(securityFiles, "assertPrivateDirectory").mockImplementation((...args) => {
+      assertions += 1;
+      if (kind === "witness" && assertions === 2) throw cleanup;
+      return originalAssert(...args);
+    });
+    try {
+      const caught = await appendLocalHookEvents(input()).catch(error => error);
+      expect(caught).toBeInstanceOf(AggregateError);
+      expect(caught.errors).toEqual([refusal, cleanup]);
+      expect(caught.cause).toBe(refusal);
+      expect(legacyHomeMigrationAdmissionDiagnostic(caught)).toBe(type === "pending" ? LEGACY_HOME_MIGRATION_PENDING_DIAGNOSTIC : LEGACY_HOME_MIGRATION_JOURNAL_DIAGNOSTIC);
+      expect(existsSync(eventsDbPath(cwd))).toBe(false);
+    } finally {
+      barrier.mockRestore();
+      open.mockRestore();
+      assert.mockRestore();
+    }
   });
 
   it.each(["prepared", "pre-journal"])("preserves public local enqueue during %s v2 publication", async (phase) => {

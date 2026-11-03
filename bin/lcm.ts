@@ -75,6 +75,7 @@ import {
 import {
   configPath as defaultConfigPath,
   BootstrapLockContentionError,
+  legacyHomeMigrationAdmissionDiagnostic,
   daemonPidPath,
   daemonTokenPath,
   lcmHomeDir,
@@ -4846,6 +4847,8 @@ export async function runCli(
 
 /** Static remedies never include a mutable error message, driver text, or cause. */
 function knownCliErrorDiagnostic(error: unknown): string | undefined {
+  const migrationDiagnostic = legacyHomeMigrationAdmissionDiagnostic(error);
+  if (migrationDiagnostic !== undefined) return migrationDiagnostic;
   if (error instanceof BackendPublicationJournalError) return BACKEND_PUBLICATION_ADMISSION_DIAGNOSTIC;
   if (error instanceof StorageIdentityConfigurationError) return UNBOUND_POSTGRESQL_PROJECT_MESSAGE;
   if (error instanceof TransportedUnboundProjectError) return UNBOUND_POSTGRESQL_PROJECT_MESSAGE;

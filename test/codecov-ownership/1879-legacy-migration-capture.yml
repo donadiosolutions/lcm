@@ -1,0 +1,16 @@
+references: ["#1879"]
+rationale: >-
+  #1879 preserves the exact legacy migration target until finalization.
+  runtime-paths keeps strict journal admission and pending-error recognition in
+  configuration-security. The shared append gate and its publication-lock
+  cleanup remain storage-abstractions owned. Local enqueue, hook propagation,
+  and Codex receipt suppression remain hooks owned; static operator guidance
+  remains CLI owned. No component classification changes.
+pins:
+  - ["src/runtime-paths.ts", "unit-configuration-security"]
+  - ["src/storage/backend-publication.ts", "unit-storage-abstractions"]
+  - ["src/hooks/local-enqueue.ts", "unit-hooks"]
+  - ["src/hooks/post-tool.ts", "unit-hooks"]
+  - ["src/hooks/user-prompt.ts", "unit-hooks"]
+  - ["src/hooks/codex-hook-receipts.ts", "unit-hooks"]
+  - ["bin/lcm.ts", "unit-cli"]
