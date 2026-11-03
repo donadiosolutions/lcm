@@ -1,0 +1,8 @@
+references: ["#1884"]
+rationale: >-
+  Keeps final terminal-retirement credential cleanup in the existing service
+  manager integration component. The first retry retains its inputs and final
+  cleanup still requires validated exact manager absence. No production file
+  was added, removed, moved or re-owned.
+pins:
+  - ["src/daemon/supervisor.ts", "integration-service-managers"]
