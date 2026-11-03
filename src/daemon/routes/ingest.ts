@@ -8,6 +8,7 @@ import {
   createExactNativeTranscriptMessageResolver,
   createFileNativeTranscriptSource,
   inheritedNativeSourceOrdinals,
+  isNativeTranscriptSessionId,
   runNativeTranscriptBackfill,
   NativeTranscriptSourceChangedError,
   type NativeTranscriptSourceSnapshot,
@@ -45,6 +46,12 @@ import { encodeTranscriptSlotMarker, type NativeTranscriptProvenanceRepository }
 import { createCommitCloseBarrier, storageRouteFailureResponse, withProjectStorage } from "./storage-lifecycle.js";
 import { isAbortError, throwIfAborted } from "../cancellation.js";
 import { BackendPublicationJournalError } from "../../storage/backend-publication.js";
+
+export const INGEST_NATIVE_MAX_SNAPSHOT_BYTES = 64 * 1024 * 1024;
+// HTTP, periodic scans and terminal queues construct distinct handlers.
+let nativeIngestActive = false;
+
+class NativeIngestSnapshotTooLargeError extends Error {}
 
 /** Which parse of a forked Codex subagent's rollout the stored conversation follows. */
 type SubagentHistory = "filtered" | "unfiltered" | "mismatch";
@@ -455,6 +462,10 @@ export function createIngestHandler(config: DaemonConfig, storageFactory?: Stora
       sendJson(res, 400, { error: "session_id and cwd are required" });
       return;
     }
+    if (!isNativeTranscriptSessionId(session_id)) {
+      sendJson(res, 400, { error: "invalid session_id" });
+      return;
+    }
 
     let cwd: string;
     try {
@@ -464,6 +475,7 @@ export function createIngestHandler(config: DaemonConfig, storageFactory?: Stora
       return;
     }
 
+    let ownsNativeIngest = false;
     try {
       throwIfAborted(context?.signal);
       // Preserve the route's early identity/configuration rejection while the
@@ -484,6 +496,14 @@ export function createIngestHandler(config: DaemonConfig, storageFactory?: Stora
       const resolved = resolveMessages(input, cwd);
       const resolvedMessages = resolved.messages;
       const importNative = resolved.nativePath;
+      if (importNative !== undefined) {
+        if (nativeIngestActive) {
+          sendJson(res, 503, { error: "native ingest is busy; retry later" });
+          return;
+        }
+        nativeIngestActive = true;
+        ownsNativeIngest = true;
+      }
       if (config.storage.backend === "sqlite" && resolvedMessages.length === 0 && importNative === undefined) {
         sendJson(res, 200, { ingested: 0, totalTokens: 0 });
         return;
@@ -624,6 +644,9 @@ export function createIngestHandler(config: DaemonConfig, storageFactory?: Stora
           if (importNative !== undefined) {
             snapshot = await createFileNativeTranscriptSource(dirname(importNative), basename(importNative)).openSnapshot();
             closeSnapshot = snapshot.close.bind(snapshot);
+            if (snapshot.metadata.sizeBytes > INGEST_NATIVE_MAX_SNAPSHOT_BYTES) {
+              throw new NativeIngestSnapshotTooLargeError();
+            }
             // The route owns cleanup, including failures before backfill.
             const bound = snapshot;
             snapshot = {
@@ -639,7 +662,14 @@ export function createIngestHandler(config: DaemonConfig, storageFactory?: Stora
               || await snapshot.digestPrefix(sourceWitness.byteLength) !== sourceWitness.sha256
             )) throw retryFailure;
             const chunks: Buffer[] = [];
-            for await (const chunk of snapshot.stream()) chunks.push(Buffer.from(chunk));
+            let byteLength = 0;
+            for await (const chunk of snapshot.stream()) {
+              byteLength += chunk.byteLength;
+              if (byteLength > INGEST_NATIVE_MAX_SNAPSHOT_BYTES) {
+                throw new NativeIngestSnapshotTooLargeError();
+              }
+              chunks.push(Buffer.from(chunk));
+            }
             await snapshot.assertUnchanged();
             const bytes = Buffer.concat(chunks);
             rolloutBytes = bytes;
@@ -665,8 +695,8 @@ export function createIngestHandler(config: DaemonConfig, storageFactory?: Stora
               // rollout whose own id is the child key may name one.
               const meta = readCodexSessionParent(raw);
               if (
-                meta !== undefined && meta.id === session_id && meta.parentThreadId !== ""
-                && meta.parentThreadId !== session_id && !meta.parentThreadId.includes("\0")
+                meta !== undefined && meta.id === session_id && isNativeTranscriptSessionId(meta.parentThreadId)
+                && meta.parentThreadId !== session_id
               ) parentSessionId = meta.parentThreadId;
             }
           }
@@ -875,6 +905,10 @@ export function createIngestHandler(config: DaemonConfig, storageFactory?: Stora
         ...(totalRedacted > 0 ? { redacted: totalRedacted, redactedCategories: redactionCategories } : {}),
       });
     } catch (err) {
+      if (err instanceof NativeIngestSnapshotTooLargeError) {
+        sendJson(res, 413, { error: "native transcript exceeds 64 MiB snapshot limit" });
+        return;
+      }
       if (isAbortError(err)) {
         if (!res.headersSent && !res.writableEnded && !res.destroyed && res.writable !== false) {
           sendJson(res, 499, { status: "cancelled", error: "ingest cancelled" });
@@ -895,6 +929,8 @@ export function createIngestHandler(config: DaemonConfig, storageFactory?: Stora
         return;
       }
       sendJson(res, 500, { error: "ingest failed", code: "INGEST_FAILED" });
+    } finally {
+      if (ownsNativeIngest) nativeIngestActive = false;
     }
   };
 }

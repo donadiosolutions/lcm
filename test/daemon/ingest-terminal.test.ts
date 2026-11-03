@@ -84,6 +84,25 @@ describe("terminal ingest queue", () => {
   });
   afterEach(() => rmSync(cwd, { recursive: true, force: true }));
 
+  it.each(["a".repeat(1025), "é".repeat(513), "bad\0id"])("refuses an invalid session key before retaining queue work", async (session_id) => {
+    const queue = make();
+    expect((await post(queue, request({ session_id }))).status).toBe(400);
+    expect(queue.busy()).toBe(false);
+    await queue.drained();
+    expect(calls).toHaveLength(0);
+    expect(publicationSignals).toHaveLength(0);
+    expect(drained).not.toHaveBeenCalled();
+  });
+
+  it.each(["a".repeat(1024), "é".repeat(512)])("accepts a session key at the UTF-8 byte ceiling", async (session_id) => {
+    const queue = make();
+    expect((await post(queue, request({ session_id }))).status).toBe(202);
+    await queue.drained();
+    expect(calls).toHaveLength(1);
+    expect(calls[0]!.body.session_id).toBe(session_id);
+    expect(outcomes).toEqual(["captured"]);
+  });
+
   it("answers 202 and ingests through the ordinary handler with an explicit body", async () => {
     const queue = make();
     const res = await post(queue, request({ event: "SessionEnd", messages: [{ ignored: true }] }));

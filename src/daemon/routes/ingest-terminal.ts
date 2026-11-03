@@ -6,6 +6,7 @@ import { isSafeTranscriptPath } from "../project.js";
 import { sendJson } from "../server.js";
 import type { RouteHandler, RoutePublicationAdmission } from "../server.js";
 import { validateCwd } from "../validate-cwd.js";
+import { isNativeTranscriptSessionId } from "../../storage/native-transcript-ingest.js";
 
 /** Distinct (cwd, session) pairs that may wait or run at the same time. */
 export const TERMINAL_INGEST_MAX_KEYS = 8;
@@ -81,7 +82,7 @@ function parseRequest(body: string): (TerminalIngestBody & { source: string }) |
   if (input === null || typeof input !== "object" || Array.isArray(input)) return undefined;
   const { session_id, cwd, transcript_path, client } = input as Record<string, unknown>;
   if (
-    typeof session_id !== "string" || session_id === ""
+    !isNativeTranscriptSessionId(session_id)
     || typeof cwd !== "string" || typeof transcript_path !== "string"
     || client !== "codex"
   ) return undefined;

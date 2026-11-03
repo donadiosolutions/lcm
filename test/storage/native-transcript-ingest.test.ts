@@ -312,6 +312,58 @@ function repository(
 }
 
 describe("native transcript scrub and JSONL reader", () => {
+  it.each(["a".repeat(1025), "é".repeat(513)])("rejects oversized native session keys before reader callbacks", async (nativeSessionId) => {
+    const iterate = vi.fn(() => byteChunks("{}\n"));
+    const scrubJson = vi.fn((value) => value);
+    const clock = vi.fn(() => new Date());
+    const onProgress = vi.fn();
+    await expect(collect({ [Symbol.asyncIterator]: iterate }, {
+      nativeSessionId, scrubber: { scrubberVersion: "test", scrubJson }, clock, onProgress,
+    })).rejects.toMatchObject({ code: "invalid-input" });
+    expect(iterate).not.toHaveBeenCalled();
+    expect(scrubJson).not.toHaveBeenCalled();
+    expect(clock).not.toHaveBeenCalled();
+    expect(onProgress).not.toHaveBeenCalled();
+  });
+
+  it.each(["a".repeat(1024), "é".repeat(512)])("retains exact session keys at the UTF-8 ceiling", async (nativeSessionId) => {
+    const outcomes = await collect(byteChunks('{}\n'), { nativeSessionId });
+    expect(outcomes).toHaveLength(1);
+    expect(outcomes[0]).toMatchObject({ kind: "record", nativeSessionId });
+  });
+
+  it.each(["a".repeat(1025), "é".repeat(513)])("independently rejects oversized backfill session keys before any callbacks", async (nativeSessionId) => {
+    const repo = repository();
+    const byteSource = source("{}\n");
+    const resolveExact = vi.fn(async () => null);
+    const quarantine = vi.fn();
+    const clock = vi.fn(() => new Date());
+    await expect(runNativeTranscriptBackfill({
+      nativeSessionId, repository: repo, source: byteSource, machineId: "machine",
+      format: CLAUDE_NATIVE_TRANSCRIPT_FORMAT, sourceLocator: "synthetic.jsonl", clock,
+      messageResolver: { resolveExact },
+      quarantine: { clientName: "claude-code", quarantine, get: vi.fn(), list: vi.fn(), close: vi.fn() },
+    })).rejects.toMatchObject({ code: "invalid-input" });
+    expect(byteSource.openSnapshot).not.toHaveBeenCalled();
+    expect(repo.getCheckpoint).not.toHaveBeenCalled();
+    expect(repo.ingestBatch).not.toHaveBeenCalled();
+    expect(resolveExact).not.toHaveBeenCalled();
+    expect(quarantine).not.toHaveBeenCalled();
+    expect(clock).not.toHaveBeenCalled();
+  });
+
+  it.each(["a".repeat(1024), "é".repeat(512)])("backfills a session at the UTF-8 byte ceiling", async (nativeSessionId) => {
+    const repo = repository();
+    await runNativeTranscriptBackfill({
+      nativeSessionId, repository: repo, source: source("{}\n"), machineId: "machine",
+      format: CLAUDE_NATIVE_TRANSCRIPT_FORMAT, sourceLocator: "synthetic.jsonl",
+      messageResolver: { resolveExact: vi.fn(async () => null) },
+      quarantine: { clientName: "claude-code", quarantine: vi.fn(), get: vi.fn(), list: vi.fn(), close: vi.fn() },
+    });
+    expect(repo.batches).toHaveLength(1);
+    expect(repo.batches[0]!.records[0]).toMatchObject({ nativeSessionId });
+  });
+
   it("exports the two versioned supported formats", () => {
     expect(SUPPORTED_NATIVE_TRANSCRIPT_FORMATS).toEqual([
       {
