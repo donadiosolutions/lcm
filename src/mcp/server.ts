@@ -68,7 +68,12 @@ function findBoundedDelimitedValueEnd(value: string, start: number, delimiter: s
         index += 1;
         continue;
       }
-      if (value[index + 1] !== "}") return index + 1;
+      if (value[index + 1] !== "}") {
+        // A close glued to more payload is malformed, not a safe value boundary.
+        // Match ordinary assignment separators and one terminal punctuation mark.
+        const suffix = value.slice(index + 1, index + 3);
+        return /^(?:[.!?])?(?:[\s,;]|$)/u.test(suffix) ? index + 1 : undefined;
+      }
       if (index + 1 > limit) return undefined;
       index += 2;
     } else if (character === delimiter) {

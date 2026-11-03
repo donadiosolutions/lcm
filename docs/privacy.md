@@ -473,7 +473,12 @@ ODBC-style brace-delimited values for password, token, API-key, authorization,
 and connection-user labels. Complete bounded assignments keep useful surrounding
 context. Malformed or oversized quoted or brace-delimited assignments fail
 closed: LCM keeps the label and redaction marker but discards the unparsed
-remainder so a credential suffix cannot appear in the diagnostic.
+remainder so a credential suffix cannot appear in the diagnostic. A closing brace
+must be followed by the end of the message, whitespace, a comma, or a semicolon.
+One terminal period, exclamation mark, or question mark may precede that boundary.
+Text attached directly to a closing brace, including punctuation attached to more
+text, makes the assignment malformed. Doubled closing braces remain escaped value
+content.
 
 The bundled Slack webhook (`hooks.slack.com`) and Sidekiq
 (`gems.contribsys.com` and `enterprise.contribsys.com`) service-hostname rules
