@@ -28,6 +28,7 @@ type DebugCandidate = {
 async function invoke(candidates: Candidate[], options: {
   query?: string; session?: string; minimum?: number; feedback?: RecallFeedback; feedbackById?: Map<string, RecallFeedback>;
   backend?: "sqlite" | "postgresql"; failure?: Error; debug?: boolean;
+  recallMode?: "pre-tool";
   restoration?: Partial<ReturnType<typeof loadDaemonConfig>["restoration"]>;
 } = {}) {
   const config = loadDaemonConfig("/does-not-exist");
@@ -48,23 +49,76 @@ async function invoke(candidates: Candidate[], options: {
     if (options.failure) throw options.failure;
     return { candidates };
   });
-  const factory = { ...makeMockStorageFactory({ openProject: async () => ({
+  const openProject = vi.fn(async () => ({
     lexicalSearch: { searchPromoted, searchPromotedForRecall }, recall: { getFeedback, logSurfacing }, close,
-  }) as unknown as ProjectStorage }), backend };
+  }) as unknown as ProjectStorage);
+  const factory = { ...makeMockStorageFactory({ openProject }), backend };
   let status = 0;
   let payload = "";
   const res = { writeHead: (code: number) => { status = code; }, end: (body: string) => { payload = body; } } as unknown as ServerResponse;
   await createPromptSearchHandler(config, factory)({} as never, res, JSON.stringify({
     query: options.query ?? "running swimming jumping walking", cwd: "/tmp", session_id: options.session,
     debug: options.debug ?? true,
+    recallMode: options.recallMode,
   }));
   const body = JSON.parse(payload) as { hints: string[]; ids?: string[]; debug?: { candidates: DebugCandidate[] } };
-  return { body, status, payload, getFeedback, logSurfacing, close, searchPromoted, searchPromotedForRecall };
+  return { body, status, payload, openProject, getFeedback, logSurfacing, close, searchPromoted, searchPromotedForRecall };
 }
 
 describe("prompt-search native evidence scoring", () => {
   beforeEach(() => { vi.useFakeTimers(); vi.setSystemTime(new Date(NOW)); });
   afterEach(() => { vi.useRealTimers(); vi.restoreAllMocks(); });
+
+  it.each(["sqlite", "postgresql"] as const)("refuses over-budget %s recall before opening storage", async (backend) => {
+    const cases = [
+      { query: "a".repeat(65_537) },
+      { query: "😀".repeat(16_385) },
+      { query: "run ".repeat(1_025) },
+      { query: Array.from({ length: 1_025 }, (_, index) => `word${index}`).join(" ") },
+      { query: "run", maximum: 201 },
+      { query: "run ".repeat(66), maximum: 200 },
+      { query: "run ".repeat(1_024), maximum: 13 },
+    ];
+    for (const { query, maximum } of cases) {
+      const output = await invoke([candidate()], {
+        backend, query, restoration: maximum === undefined ? {} : { promptSearchMaxResults: maximum },
+      });
+      expect(output.status).toBe(200);
+      expect(output.body).toEqual({ hints: [] });
+      expect(output.openProject).not.toHaveBeenCalled();
+      expect(output.searchPromotedForRecall).not.toHaveBeenCalled();
+      expect(output.getFeedback).not.toHaveBeenCalled();
+      expect(output.logSurfacing).not.toHaveBeenCalled();
+    }
+  });
+
+  it("preserves complete queries at the byte, occurrence, candidate and work boundaries", async () => {
+    const cases = [
+      { query: "a".repeat(65_536), maximum: 3, limit: 15 },
+      { query: "😀".repeat(16_384), maximum: 3, limit: 15 },
+      { query: "run ".repeat(1_024), maximum: 3, limit: 15 },
+      { query: "foo_bar ".repeat(1_024), maximum: 3, limit: 15 },
+      { query: "Running,runs ".repeat(512), maximum: 3, limit: 15 },
+      { query: "日本語 café", maximum: 3, limit: 15 },
+      { query: "run ".repeat(65), maximum: 200, limit: 1_000 },
+      { query: "run ".repeat(1_024), maximum: 12, limit: 60 },
+    ];
+    for (const { query, maximum, limit } of cases) {
+      const output = await invoke([], { query, restoration: { promptSearchMaxResults: maximum } });
+      expect(output.status).toBe(200);
+      expect(output.searchPromotedForRecall).toHaveBeenCalledWith(query, limit);
+      expect(output.close).toHaveBeenCalledOnce();
+    }
+  });
+
+  it.each(["sqlite", "postgresql"] as const)("uses the effective pre-tool candidate budget for %s", async (backend) => {
+    const query = "run ".repeat(1_024);
+    const output = await invoke([], {
+      backend, query, recallMode: "pre-tool", restoration: { promptSearchMaxResults: 201 },
+    });
+    expect(output.status).toBe(200);
+    expect(output.searchPromotedForRecall).toHaveBeenCalledWith(query, 10);
+  });
 
   it.each([-0.000001, -0.1, -3.621484, -1000, 1000])("ignores native rank %s and keeps it in debug", async (rank) => {
     const output = await invoke([candidate(4, 4, { rank })]);

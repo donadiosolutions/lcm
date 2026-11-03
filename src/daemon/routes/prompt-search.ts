@@ -18,6 +18,23 @@ import {
 
 const CANDIDATE_LIMIT_MULTIPLIER = 5;
 const MIN_CANDIDATE_LIMIT = 10;
+const MAX_QUERY_BYTES = 64 * 1024;
+const MAX_QUERY_WORDS = 1024;
+const MAX_CANDIDATE_LIMIT = 1000;
+const MAX_QUERY_CANDIDATE_PAIRS = 65_536;
+
+function isRecallQueryWithinBudget(query: string, candidateLimit: number): boolean {
+  if (Buffer.byteLength(query, "utf8") > MAX_QUERY_BYTES || candidateLimit > MAX_CANDIDATE_LIMIT) return false;
+
+  // Count occurrences before SQLite's selection and native evidence deduplication.
+  const words = query.matchAll(/\w+/g);
+  let wordCount = 0;
+  while (!words.next().done) {
+    wordCount += 1;
+    if (wordCount > MAX_QUERY_WORDS || wordCount * candidateLimit > MAX_QUERY_CANDIDATE_PAIRS) return false;
+  }
+  return true;
+}
 
 type RankedPromptSearchResult = SearchResult & {
   lexicalScore: number;
@@ -287,13 +304,20 @@ export function createPromptSearchHandler(config: DaemonConfig, storageFactory?:
       return;
     }
 
+    const configuredMaxResults = config.restoration.promptSearchMaxResults;
+    const maxResults = preTool ? Math.min(configuredMaxResults, PRE_TOOL_MAX_RESULTS) : configuredMaxResults;
+    const candidateLimit = Math.max(maxResults * CANDIDATE_LIMIT_MULTIPLIER, MIN_CANDIDATE_LIMIT);
+    // Disabled PostgreSQL recall still requires its existing identity/storage admission.
+    if (configuredMaxResults !== 0 && !isRecallQueryWithinBudget(query, candidateLimit)) {
+      sendJson(res, 200, { hints: [] });
+      return;
+    }
+
     try {
       const result = await withProjectStorage(
         { config, cwd: validatedCwd, factory: storageFactory, context, mode: "existing" },
         async (project) => {
-          const configuredMaxResults = config.restoration.promptSearchMaxResults;
           if (configuredMaxResults === 0) return { hints: [], ids: [] };
-          const maxResults = preTool ? Math.min(configuredMaxResults, PRE_TOOL_MAX_RESULTS) : configuredMaxResults;
 
           const minScore = config.restoration.promptSearchMinScore;
           const snippetLength = config.restoration.promptSnippetLength;
@@ -315,7 +339,6 @@ export function createPromptSearchHandler(config: DaemonConfig, storageFactory?:
           const stalePenalty = config.restoration.stalePenalty;
           const allowStaleOnStrongMatch = config.restoration.allowStaleOnStrongMatch;
 
-          const candidateLimit = Math.max(maxResults * CANDIDATE_LIMIT_MULTIPLIER, MIN_CANDIDATE_LIMIT);
           const { candidates } = await project.lexicalSearch.searchPromotedForRecall(query, candidateLimit);
           // Validate the complete evidence envelope before feedback reads or writes.
           for (const { evidence } of candidates) {

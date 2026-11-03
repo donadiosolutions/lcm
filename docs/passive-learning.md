@@ -69,8 +69,9 @@ extractor:
   `...`. An event whose complete selected data and tags exceed 8,192 code
   units is omitted instead of storing a partial value. This also applies to
   native decisions, dispatch labels, plan explanations, and extracted prompt
-  events. Oversized user prompts remain eligible for prompt search but create
-  no passive event. Sensitive-path rules still apply.
+  events. User prompts too large for passive events remain eligible for prompt
+  search within its [query admission limits](configuration.md), but create no
+  passive event. Sensitive-path rules still apply.
 - Status is read only from direct, top-level fields. `tool_output` wins over
   `tool_response` when it contains a valid status. Within either object, the
   precedence is `isError`, `is_error`, `exit_code`, then `exitCode`; boolean

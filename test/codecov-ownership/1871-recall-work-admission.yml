@@ -1,0 +1,8 @@
+references: ["#1871", "commit-473ffd5367448191886a506be1929041"]
+rationale: >-
+  Keeps prompt recall query admission in the existing daemon-routes component.
+  The route enforces query byte, word-occurrence, requested-candidate and evidence
+  pair budgets before enabled recall opens storage, addressing original finding
+  commit:473ffd5367448191886a506be1929041. No file was removed, moved or re-owned.
+pins:
+  - ["src/daemon/routes/prompt-search.ts", "unit-daemon-routes"]
