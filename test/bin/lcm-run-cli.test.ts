@@ -437,6 +437,22 @@ const {
 const actualFs = await vi.importActual<typeof import("node:fs")>("node:fs");
 const actualPeer = await vi.importActual<typeof import("../../src/daemon/peer-admission.js")>("../../src/daemon/peer-admission.js");
 const actualRuntimePaths = await vi.importActual<typeof import("../../src/runtime-paths.js")>("../../src/runtime-paths.js");
+
+it.each([false, true])("reports pending legacy migration statically with exit1 (wrapped=%s)", wrapped => {
+  const pending = new actualRuntimePaths.LegacyHomeMigrationPendingError();
+  pending.message = "mutable diagnostic must not be printed";
+  const error = wrapped ? new AggregateError([pending], "mutable cleanup", { cause: pending }) : pending;
+  const diagnostic = vi.spyOn(console, "error").mockImplementation(() => undefined);
+  const stdout = vi.spyOn(process.stdout, "write").mockImplementation(() => true);
+  try {
+    expect(() => handleCliError(error)).toThrow("exit:1");
+    expect(diagnostic).toHaveBeenCalledExactlyOnceWith(actualRuntimePaths.LEGACY_HOME_MIGRATION_PENDING_DIAGNOSTIC);
+    expect(stdout).not.toHaveBeenCalled();
+  } finally {
+    diagnostic.mockRestore();
+    stdout.mockRestore();
+  }
+});
 const { batchCompact } = await import("../../src/batch-compact.js");
 const { isDaemonTransportFailure } = await import("../../src/daemon/http-url.js");
 

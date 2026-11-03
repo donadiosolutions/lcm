@@ -1,4 +1,4 @@
-import { afterEach, describe, it, expect } from "vitest";
+import { afterEach, describe, it, expect, vi } from "vitest";
 import { createHash } from "node:crypto";
 import {
   chmodSync,
@@ -25,6 +25,9 @@ import {
   daemonPidPath,
   daemonTokenPath,
   legacyHomeMigrationAwaitsFinish,
+  assertLegacyHomeMigrationAllowsAppend,
+  isLegacyHomeMigrationPendingError,
+  LegacyHomeMigrationPendingError,
   legacyLcmHomeDir,
   lcmHomeDir,
   lcmPath,
@@ -34,8 +37,182 @@ import {
 } from "../src/runtime-paths.js";
 import { legacyLcmHomeDirname } from "../src/legacy-names.js";
 import { processStartTime as trustedProcessStartTime } from "../src/private-mutation-lock.js";
+import { appendLocalHookEvents } from "../src/hooks/local-enqueue.js";
+import { runObservedCodexHook } from "../src/hooks/codex-hook-receipts.js";
+import { handlePostToolUse } from "../src/hooks/post-tool.js";
+import {
+  withBackendPublicationAppendBarrier,
+  withBackendPublicationAppendBarrierAsync,
+  withBackendPublicationRetainedAppendAdmissionAsync,
+} from "../src/storage/backend-publication.js";
+import * as homeLockTopology from "../src/storage/home-lock-topology.js";
+import * as runtimePaths from "../src/runtime-paths.js";
 
 const homes: string[] = [];
+
+describe("legacy migration append admission", () => {
+  it.each(["published", "removing", "retaining"])("refuses every fresh append entry before touching a %s target", async phase => {
+    const home = makeHome();
+    const active = lcmHomeDir(home);
+    mkdirSync(active, { mode: 0o700 });
+    const witness = treeWitness(active);
+    migrationJournal(home, {
+      version: 2, phase, target: witness,
+      ...(phase === "retaining" ? { retained: witness } : {}),
+    });
+    const callback = vi.fn();
+    expect(() => withBackendPublicationAppendBarrier(home, callback)).toThrow(LegacyHomeMigrationPendingError);
+    await expect(withBackendPublicationAppendBarrierAsync(home, callback)).rejects.toBeInstanceOf(LegacyHomeMigrationPendingError);
+    await expect(withBackendPublicationRetainedAppendAdmissionAsync(home, callback)).rejects.toBeInstanceOf(LegacyHomeMigrationPendingError);
+    expect(callback).not.toHaveBeenCalled();
+    expect(treeWitness(active)).toEqual(witness);
+    expect(existsSync(join(active, ".local-hook-append.lock"))).toBe(false);
+  });
+
+  it.each([undefined, "planned", "copying", "retained"])("preserves append compatibility for %s legacy evidence", async phase => {
+    const home = makeHome();
+    const active = lcmHomeDir(home);
+    mkdirSync(active, { mode: 0o700 });
+    if (phase !== undefined) migrationJournal(home, {
+      version: 2, phase,
+      ...(phase === "retained" ? { target: treeWitness(active), retained: treeWitness(active) } : {}),
+    });
+    expect(() => assertLegacyHomeMigrationAllowsAppend(home)).not.toThrow();
+    expect(withBackendPublicationAppendBarrier(home, () => "sync")).toBe("sync");
+    await expect(withBackendPublicationAppendBarrierAsync(home, () => "async")).resolves.toBe("async");
+  });
+
+  it.each(["json", "checksum", "mode"])("strictly refuses %s legacy evidence before append", async kind => {
+    const home = makeHome();
+    const active = lcmHomeDir(home);
+    mkdirSync(active, { mode: 0o700 });
+    migrationJournal(home, { phase: "published", target: treeWitness(active), ...(kind === "checksum" ? { checksumSha256: "0".repeat(64) } : {}) });
+    const journalPath = join(home, ".lcm-legacy-migration.json");
+    if (kind === "json") writeFileSync(journalPath, "{");
+    if (kind === "mode") chmodSync(journalPath, 0o644);
+    const witness = treeWitness(active);
+    const callback = vi.fn();
+    expect(() => withBackendPublicationAppendBarrier(home, callback)).toThrow();
+    await expect(withBackendPublicationAppendBarrierAsync(home, callback)).rejects.toThrow();
+    expect(callback).not.toHaveBeenCalled();
+    expect(treeWitness(active)).toEqual(witness);
+  });
+
+  it("recognizes only bounded data causes without invoking accessors", () => {
+    const pending = new LegacyHomeMigrationPendingError();
+    expect(pending.retryRequired).toBe(true);
+    expect(pending.name).toBe("LegacyHomeMigrationPendingError");
+    expect(isLegacyHomeMigrationPendingError(pending)).toBe(true);
+    expect(isLegacyHomeMigrationPendingError(new AggregateError([pending], "cleanup", { cause: pending }))).toBe(true);
+    for (const value of [undefined, null, "pending", {}, new Error("ordinary"), { cause: pending }]) {
+      expect(isLegacyHomeMigrationPendingError(value)).toBe(false);
+    }
+    const cycle = new Error("cycle");
+    Object.defineProperty(cycle, "cause", { value: cycle });
+    expect(isLegacyHomeMigrationPendingError(cycle)).toBe(false);
+    let deep: Error = pending;
+    for (let depth = 0; depth < 16; depth += 1) deep = new Error("wrapper", { cause: deep });
+    expect(isLegacyHomeMigrationPendingError(deep)).toBe(false);
+    const getter = vi.fn(() => pending);
+    const accessor = Object.defineProperty(new Error("accessor"), "cause", { get: getter });
+    expect(isLegacyHomeMigrationPendingError(accessor)).toBe(false);
+    expect(getter).not.toHaveBeenCalled();
+  });
+
+  it.each(["sync", "async"].flatMap(mode => ["restore", "close"].flatMap(cleanup =>
+    ["pending", "ordinary", "success"].map(outcome => ({ mode, cleanup, outcome })),
+  )))("preserves $outcome behavior when $mode topology $cleanup fails", async ({ mode, cleanup: kind, outcome }) => {
+    const home = makeHome();
+    mkdirSync(lcmHomeDir(home), { mode: 0o700 });
+    if (outcome === "pending") migrationJournal(home, { phase: "published", target: treeWitness(lcmHomeDir(home)) });
+    const cleanup = new Error("topology cleanup failed");
+    const ordinary = new Error("ordinary callback failure");
+    const close = homeLockTopology.closeHomeLockTopology;
+    const restore = homeLockTopology.restoreHomeLockTopologyMode;
+    const closeSpy = vi.spyOn(homeLockTopology, "closeHomeLockTopology").mockImplementation(topology => {
+      close(topology);
+      if (kind === "close") throw cleanup;
+    });
+    let restores = 0;
+    const restoreSpy = vi.spyOn(homeLockTopology, "restoreHomeLockTopologyMode").mockImplementation(topology => {
+      restore(topology);
+      restores += 1;
+      if (kind === "restore" && restores === 2) throw cleanup;
+    });
+    const callback = vi.fn(() => { if (outcome === "ordinary") throw ordinary; });
+    try {
+      let caught: unknown;
+      try {
+        if (mode === "sync") withBackendPublicationAppendBarrier(home, callback);
+        else await withBackendPublicationAppendBarrierAsync(home, callback);
+      } catch (error) { caught = error; }
+      if (outcome === "pending") {
+        expect(caught).toBeInstanceOf(AggregateError);
+        expect(isLegacyHomeMigrationPendingError(caught)).toBe(true);
+        expect((caught as AggregateError).errors).toEqual([expect.any(LegacyHomeMigrationPendingError), cleanup]);
+        expect(callback).not.toHaveBeenCalled();
+      } else {
+        expect(caught).toBe(cleanup);
+        expect(callback).toHaveBeenCalledOnce();
+      }
+    } finally {
+      closeSpy.mockRestore();
+      restoreSpy.mockRestore();
+    }
+  });
+
+  it.each(["published", "removing", "retaining"])("preserves the %s witness until recovery, then captures an event", async phase => {
+    const home = makeHome();
+    const active = lcmHomeDir(home);
+    const legacy = legacyLcmHomeDir(home);
+    mkdirSync(active, { mode: 0o700 });
+    writeFileSync(join(active, "legacy-data"), "published", { mode: 0o600 });
+    const retained = migrationStagingPath(home);
+    if (phase === "retaining") {
+      mkdirSync(legacy, { mode: 0o700 });
+      writeFileSync(join(legacy, "legacy-data"), "published", { mode: 0o600 });
+      mkdirSync(retained, { mode: 0o700 });
+    }
+    migrationJournal(home, {
+      version: 2,
+      phase,
+      target: treeWitness(active),
+      ...(phase === "retaining" ? { source: treeWitness(legacy), retained: treeWitness(retained) } : {}),
+    });
+    const witness = treeWitness(active);
+    const journalPath = join(home, ".lcm-legacy-migration.json");
+    const journal = readFileSync(journalPath);
+    const previousHome = process.env.HOME;
+    process.env.HOME = home;
+    const originalGuard = runtimePaths.assertLegacyHomeMigrationAllowsAppend;
+    const guard = vi.spyOn(runtimePaths, "assertLegacyHomeMigrationAllowsAppend").mockImplementation(homeDir => {
+      expect(existsSync(join(home, ".lcm.backend-publication.lock"))).toBe(true);
+      expect(existsSync(join(active, ".local-hook-append.lock"))).toBe(false);
+      originalGuard(homeDir);
+    });
+    const append = () => appendLocalHookEvents({
+      cwd: home,
+      sessionId: "migration-session",
+      events: [{ type: "decision", category: "architecture", data: "Use SQLite", priority: 1 }],
+      sourceHook: "PostToolUse",
+    });
+    try {
+      await expect(append()).rejects.toThrow("legacy home migration is pending");
+      const stdin = JSON.stringify({ session_id: "migration-session", cwd: home, tool_name: "Bash", tool_input: { command: "pwd" }, tool_response: home });
+      await expect(runObservedCodexHook({ client: "codex", command: "post-tool", stdinText: stdin }, () => handlePostToolUse(stdin)))
+        .resolves.toEqual({ exitCode: 0, stdout: "" });
+      expect(treeWitness(active)).toEqual(witness);
+      expect(readFileSync(journalPath)).toEqual(journal);
+      expect(existsSync(join(active, ".local-hook-append.lock"))).toBe(false);
+      expect(migrateLegacyHomeIfNeeded(home).migrated).toBe(true);
+      await expect(append()).resolves.toEqual({ inserted: 1, pendingCount: 1 });
+    } finally {
+      guard.mockRestore();
+      if (previousHome === undefined) delete process.env.HOME;
+      else process.env.HOME = previousHome;
+    }
+  });
+});
 
 afterEach(() => {
   for (const home of homes.splice(0)) rmSync(home, { recursive: true, force: true });

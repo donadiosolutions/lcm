@@ -1,6 +1,7 @@
 // src/hooks/post-tool.ts
 import { extractPostToolEvents } from "./extractors.js";
 import { normalizePostToolInput } from "./post-tool-normalization.js";
+import { isLegacyHomeMigrationPendingError } from "../runtime-paths.js";
 import { safeLogError } from "./hook-errors.js";
 import { ensureProjectDir } from "../daemon/project.js";
 import { PrivateMutationLockContentionError } from "../private-mutation-lock.js";
@@ -91,6 +92,7 @@ export async function handlePostToolUse(
     // daemon's bounded background scan process them; never use a payload port
     // for a token-bearing request.
   } catch (error) {
+    if (isLegacyHomeMigrationPendingError(error)) throw error;
     if (error instanceof LocalHookDurabilityTimeoutError) throw error;
     if (isBackendPublicationJournalError(error)) {
       try {

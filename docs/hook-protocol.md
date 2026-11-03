@@ -45,6 +45,16 @@ compaction) when `LCM_ENABLED=false`; see
   bounded wait.
 - Malformed, tampered, or unresolved publication evidence still fails closed
   wherever a hook already rethrows it.
+- If an interrupted legacy-root migration has published its target but still
+  needs finalization (`published`, `removing`, or `retaining`), passive capture
+  refuses before changing that target. `post-tool` and capturing `user-prompt`
+  invocations exit nonzero and require a retry; the event has not been captured.
+  Finish migration with `lcm install` or session startup, then retry the hook.
+  The refusal writes neither a hook error log nor a Codex hook receipt, preserving
+  the migration's exact recovery evidence. Codex also skips its observation
+  receipt during these phases when a hook extracts no event; that hook keeps
+  its ordinary successful return. Ordinary unresolved backend
+  publication still permits local capture under its existing admission rules.
 
 ## Local passive-event durability
 

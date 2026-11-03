@@ -8,6 +8,7 @@ import {
 } from "node:fs";
 import { homedir } from "node:os";
 import { basename, dirname, join, resolve } from "node:path";
+import { assertLegacyHomeMigrationAllowsAppend, isLegacyHomeMigrationPendingError } from "../runtime-paths.js";
 import {
   PrivateMutationLockContentionError,
   PrivateMutationPermit,
@@ -1027,6 +1028,7 @@ function withBackendPublicationLock<T>(
   callback: () => T,
 ): T {
   const topology = withUnsafeStorageMapping(() => openHomeLockTopology(homeDir));
+  let pendingError: unknown;
   try {
     return withPrivateMutationLock(
       backendPublicationLockPath(homeDir),
@@ -1039,11 +1041,21 @@ function withBackendPublicationLock<T>(
         return result;
       },
     );
+  } catch (error) {
+    if (isLegacyHomeMigrationPendingError(error)) pendingError = error;
+    throw error;
   } finally {
     try {
-      withUnsafeStorageMapping(() => restoreHomeLockTopologyMode(topology));
-    } finally {
-      withUnsafeStorageMapping(() => closeHomeLockTopology(topology));
+      try {
+        withUnsafeStorageMapping(() => restoreHomeLockTopologyMode(topology));
+      } finally {
+        withUnsafeStorageMapping(() => closeHomeLockTopology(topology));
+      }
+    } catch (cleanupError) {
+      if (pendingError !== undefined) {
+        throw new AggregateError([pendingError, cleanupError], "legacy migration refusal cleanup failed", { cause: pendingError });
+      }
+      throw cleanupError;
     }
   }
 }
@@ -1053,6 +1065,7 @@ async function withBackendPublicationLockAsync<T>(
   callback: () => Promise<T>,
 ): Promise<T> {
   const topology = withUnsafeStorageMapping(() => openHomeLockTopology(homeDir));
+  let pendingError: unknown;
   try {
     return await withPrivateMutationLockAsync(
       backendPublicationLockPath(homeDir),
@@ -1065,11 +1078,21 @@ async function withBackendPublicationLockAsync<T>(
         return result;
       },
     );
+  } catch (error) {
+    if (isLegacyHomeMigrationPendingError(error)) pendingError = error;
+    throw error;
   } finally {
     try {
-      withUnsafeStorageMapping(() => restoreHomeLockTopologyMode(topology));
-    } finally {
-      withUnsafeStorageMapping(() => closeHomeLockTopology(topology));
+      try {
+        withUnsafeStorageMapping(() => restoreHomeLockTopologyMode(topology));
+      } finally {
+        withUnsafeStorageMapping(() => closeHomeLockTopology(topology));
+      }
+    } catch (cleanupError) {
+      if (pendingError !== undefined) {
+        throw new AggregateError([pendingError, cleanupError], "legacy migration refusal cleanup failed", { cause: pendingError });
+      }
+      throw cleanupError;
     }
   }
 }
@@ -2828,6 +2851,7 @@ export function withBackendPublicationAppendBarrier<T>(
     return requireSynchronousResult(callback(contextualToken), contextualToken);
   }
   return withBackendPublicationConsumerLock(homeDir, (token) => {
+    assertLegacyHomeMigrationAllowsAppend(homeDir);
     const maintenance = withBackendPublicationDirectoryRead(
       homeDir,
       (directoryHandle) => readMaintenanceJournalFromDirectory(homeDir, directoryHandle),
@@ -2891,6 +2915,7 @@ async function runAppendAdmissionAttempt<T>(
   const acquire = (): Promise<T> => withBackendPublicationConsumerLockAsync(
     homeDir,
     async (token) => {
+      assertLegacyHomeMigrationAllowsAppend(homeDir);
       const maintenance = withBackendPublicationDirectoryRead(
         homeDir,
         (directoryHandle) => readMaintenanceJournalFromDirectory(homeDir, directoryHandle),

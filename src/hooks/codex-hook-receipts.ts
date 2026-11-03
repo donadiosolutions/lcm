@@ -3,7 +3,8 @@
 // Codex persists no hook run history; this record is an observation for doctor, never proof.
 import { mkdirSync } from "node:fs";
 import { join } from "node:path";
-import { lcmHomeDir } from "../runtime-paths.js";
+import { assertLegacyHomeMigrationAllowsAppend, isLegacyHomeMigrationPendingError, lcmHomeDir } from "../runtime-paths.js";
+import { withBackendPublicationConsumerLock } from "../storage/backend-publication.js";
 import {
   OWNER_ONLY_FILE_MODES,
   atomicWritePrivateFile,
@@ -115,20 +116,23 @@ function persist(receipt: CodexHookReceipt): void {
   const root = openPrivateDirectoryIfExists(lcmHomeDir());
   if (root === undefined) return;
   root.close();
-  const stateDir = join(lcmHomeDir(), "state");
-  ensureDirectory(stateDir);
-  const stateHandle = openPrivateDirectory(stateDir);
-  try {
-    ensureDirectory(dir);
-    const parent = openPrivateDirectory(dir);
+  withBackendPublicationConsumerLock(undefined, () => {
+    assertLegacyHomeMigrationAllowsAppend();
+    const stateDir = join(lcmHomeDir(), "state");
+    ensureDirectory(stateDir);
+    const stateHandle = openPrivateDirectory(stateDir);
     try {
-      atomicWritePrivateFile(join(dir, receipt.event + ".json"), JSON.stringify(receipt) + "\n", {}, parent);
+      ensureDirectory(dir);
+      const parent = openPrivateDirectory(dir);
+      try {
+        atomicWritePrivateFile(join(dir, receipt.event + ".json"), JSON.stringify(receipt) + "\n", {}, parent);
+      } finally {
+        parent.close();
+      }
     } finally {
-      parent.close();
+      stateHandle.close();
     }
-  } finally {
-    stateHandle.close();
-  }
+  }, { allowUnresolved: true });
 }
 
 /**
@@ -149,6 +153,7 @@ export async function runObservedCodexHook<T extends { readonly exitCode: number
   try {
     result = await run();
   } catch (error) {
+    if (isLegacyHomeMigrationPendingError(error)) throw error;
     thrown = { error };
   }
   try {

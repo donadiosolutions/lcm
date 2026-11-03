@@ -16,6 +16,8 @@ import * as hookConfig from "../../src/hooks/config.js";
 import { BackendPublicationJournalError } from "../../src/storage/backend-publication.js";
 import { PrivateMutationLockContentionError } from "../../src/private-mutation-lock.js";
 import * as backendPublication from "../../src/storage/backend-publication.js";
+import { LegacyHomeMigrationPendingError } from "../../src/runtime-paths.js";
+import { runObservedCodexHook } from "../../src/hooks/codex-hook-receipts.js";
 
 const FIXED_PUBLICATION_ADMISSION_DIAGNOSTIC =
   "lcm: backend publication admission blocked; preserve the evidence, run 'lcm doctor', and resolve the authenticated publication before retrying.";
@@ -112,6 +114,25 @@ describe("handlePostToolUse", () => {
     const result = await handlePostToolUse(stdin);
     expect(result.exitCode).toBe(0);
     expect(result.stdout).toBe("");
+  });
+
+  it.each([false, true])("propagates pending migration without logging or project writes (wrapped=%s)", async wrapped => {
+    const pending = new LegacyHomeMigrationPendingError();
+    const error = wrapped ? new AggregateError([pending, new Error("cleanup")], "cleanup", { cause: pending }) : pending;
+    const append = vi.spyOn(localEnqueue, "appendLocalHookEvents").mockRejectedValueOnce(error);
+    const log = vi.spyOn(hookErrors, "safeLogError").mockResolvedValue(undefined);
+    const project = vi.spyOn(projectModule, "ensureProjectDir");
+    const stdin = JSON.stringify({ session_id: "test-session", cwd: dir, tool_name: "AskUserQuestion", tool_input: { question: "Use SQLite?" }, tool_response: "yes" });
+    try {
+      await expect(runObservedCodexHook({ client: "codex", command: "post-tool", stdinText: stdin }, () => handlePostToolUse(stdin))).rejects.toBe(error);
+      expect(log).not.toHaveBeenCalled();
+      expect(project).not.toHaveBeenCalled();
+      expect(existsSync(join(homeDir, ".lcm", "state"))).toBe(false);
+    } finally {
+      append.mockRestore();
+      log.mockRestore();
+      project.mockRestore();
+    }
   });
 
   it("enqueues before selected project metadata and returns a diagnostic after refusal", async () => {

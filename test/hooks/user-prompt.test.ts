@@ -12,6 +12,9 @@ import * as hookConfig from "../../src/hooks/config.js";
 import * as autoHeal from "../../src/hooks/auto-heal.js";
 import * as eventScrubbing from "../../src/hooks/event-scrubbing.js";
 import * as daemonNotice from "../../src/hooks/daemon-notice.js";
+import * as hookErrors from "../../src/hooks/hook-errors.js";
+import { LegacyHomeMigrationPendingError } from "../../src/runtime-paths.js";
+import { runObservedCodexHook } from "../../src/hooks/codex-hook-receipts.js";
 import {
   BackendPublicationAppendBarrierTimeoutError,
   BackendPublicationJournalError,
@@ -106,6 +109,27 @@ describe("handleUserPromptSubmit", () => {
   afterEach(() => {
     if (originalClaudeProjectDir === undefined) delete process.env.CLAUDE_PROJECT_DIR;
     else process.env.CLAUDE_PROJECT_DIR = originalClaudeProjectDir;
+  });
+
+  it.each([false, true])("propagates pending migration without logging, repair, or selected consumers (wrapped=%s)", async wrapped => {
+    const pending = new LegacyHomeMigrationPendingError();
+    const error = wrapped ? new AggregateError([pending, new Error("cleanup")], "cleanup", { cause: pending }) : pending;
+    const append = vi.spyOn(localEnqueue, "appendLocalHookEvents").mockRejectedValueOnce(error);
+    const log = vi.spyOn(hookErrors, "safeLogError").mockResolvedValue(undefined);
+    const repair = vi.spyOn(autoHeal, "validateAndFixHooks").mockImplementation(() => {});
+    mockExtractUserPromptEvents.mockReturnValueOnce([{ type: "decision", category: "decision", data: "choice", priority: 1 }]);
+    const stdin = JSON.stringify({ prompt: "we decided to use SQLite", cwd: homedir(), session_id: "s1" });
+    try {
+      await expect(runObservedCodexHook({ client: "codex", command: "user-prompt", stdinText: stdin }, () => handleUserPromptSubmit(stdin))).rejects.toBe(error);
+      expect(log).not.toHaveBeenCalled();
+      expect(repair).not.toHaveBeenCalled();
+      expect(mockEnsureProjectDir).not.toHaveBeenCalled();
+      expect(mockEnsureDaemon).not.toHaveBeenCalled();
+    } finally {
+      append.mockRestore();
+      log.mockRestore();
+      repair.mockRestore();
+    }
   });
 
   it("emits context plus exactly one compact feedback block for multiple actual ids", async () => {

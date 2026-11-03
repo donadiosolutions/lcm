@@ -78,6 +78,28 @@ export type RuntimeHomeBootstrap = RuntimeHomeMigration & {
 /** Raised only when a validated bootstrap lock has a definitively live owner. */
 export class BootstrapLockContentionError extends Error {}
 
+export const LEGACY_HOME_MIGRATION_PENDING_DIAGNOSTIC =
+  "LCM legacy home migration is pending. Finish migration with `lcm install` or session startup, then retry the hook; this event was not captured.";
+
+export class LegacyHomeMigrationPendingError extends Error {
+  readonly retryRequired = true;
+
+  constructor() {
+    super(LEGACY_HOME_MIGRATION_PENDING_DIAGNOSTIC);
+    this.name = "LegacyHomeMigrationPendingError";
+  }
+}
+
+/** Recognize the refusal through bounded, data-only cleanup causes. */
+export function isLegacyHomeMigrationPendingError(error: unknown): boolean {
+  let current = error;
+  for (let depth = 0; depth < 16 && current instanceof Error; depth += 1) {
+    if (current instanceof LegacyHomeMigrationPendingError) return true;
+    current = Object.getOwnPropertyDescriptor(current, "cause")?.value;
+  }
+  return false;
+}
+
 type BigIntFileStat = Readonly<{
   isDirectory: () => boolean;
   isFile: () => boolean;
@@ -918,6 +940,15 @@ function readMigrationJournal(homeDir: string): MigrationJournal | null {
   } catch (error) {
     if (isMissing(error)) return null;
     throw error;
+  }
+}
+
+/** Called under publication admission, before any mutation of the target tree. */
+export function assertLegacyHomeMigrationAllowsAppend(homeDir: string = homedir()): void {
+  const journal = readMigrationJournal(homeDir);
+  if (journal !== null
+    && (journal.phase === "published" || journal.phase === "removing" || journal.phase === "retaining")) {
+    throw new LegacyHomeMigrationPendingError();
   }
 }
 
