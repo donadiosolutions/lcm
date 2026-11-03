@@ -2223,8 +2223,14 @@ function scanAbsolutePath(
   allowPathDriveContinuation: boolean,
   nestedFileSchemeStarts: Uint8Array,
   quote?: string,
+  continuePlainWhitespace = false,
 ): { end: number; sawNonSeparator: boolean } {
   let index = start;
+  let plainRootEnd = start + 1;
+  if (continuePlainWhitespace && driveColonIndex === start + 1) {
+    plainRootEnd = start + 3;
+    while (chars[plainRootEnd] === "/" || chars[plainRootEnd] === "\\") plainRootEnd += 1;
+  }
   let windowsContext = windows;
   let activeDriveColonIndex = driveColonIndex;
   let parentheses = 0;
@@ -2377,6 +2383,26 @@ function scanAbsolutePath(
       index += 1;
       continue;
     }
+    if (
+      continuePlainWhitespace &&
+      (char === " " || char === "\t") &&
+      sawNonSeparator &&
+      index > plainRootEnd
+    ) {
+      let cursor = index + 1;
+      while (chars[cursor] === " " || chars[cursor] === "\t") cursor += 1;
+      if (cursor === chars.length || chars[cursor] === "\n" || chars[cursor] === "\r") break;
+      // A URL inside an already owned path wrapper is still private path text.
+      if (parentheses === 0 && brackets === 0) {
+        let schemeStart = cursor;
+        while (chars[schemeStart] === "(" || chars[schemeStart] === "[") schemeStart += 1;
+        if (startsUrlSchemeLiteral(chars, schemeStart)) break;
+      }
+      // Spaces cannot distinguish a filename from prose. Let the existing
+      // depth and delimiter branches decide what follows the consumed padding.
+      index = cursor;
+      continue;
+    }
     if (char === " " || char === "\t" || char === "\n" || char === "\r" || PATH_DELIMITERS.has(char)) break;
     sawNonSeparator = true;
     index += 1;
@@ -2437,6 +2463,7 @@ function sanitizeAbsolutePaths(message: string): string {
       forcedPath || fileUrl,
       urlPathStarts.nestedFileSchemeStarts,
       quote,
+      !forcedPath && !fileUrl && quote === undefined,
     );
     if (
       !forcedPath &&

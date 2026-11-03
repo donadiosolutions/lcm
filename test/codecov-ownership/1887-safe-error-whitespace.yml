@@ -1,0 +1,7 @@
+references: ["#1887"]
+rationale: >-
+  Corrects horizontal whitespace continuation in src/daemon/safe-error.ts while
+  retaining its existing unit-daemon-core owner. No production file is added,
+  removed, moved or re-owned and the component map remains unchanged.
+pins:
+  - ["src/daemon/safe-error.ts", "unit-daemon-core"]

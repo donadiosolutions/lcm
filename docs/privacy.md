@@ -645,8 +645,29 @@ bundle and keep provider, credential, quarantine, and recovery sessions private.
   top-level error strings again before serialization. They retain their legacy
   HTTP `200` status and null-result response shape. SQLite details become a
   `database constraint error`. Host-local POSIX, Windows, and UNC paths become
-  `<path>`; quoted paths may contain spaces, while unquoted paths stop at
-  whitespace so arbitrary trailing prose remains intact. Inside an already
+  `<path>`. Quoted paths may contain spaces and preserve text after their
+  closing quote. Inside a recognized non-root unquoted filesystem path, ASCII
+  spaces and tabs do not distinguish a filename from prose: the sanitizer
+  removes the remaining ambiguous text in the same `<path>` span until an
+  existing punctuation boundary, a line break, the end of the message, or an
+  independent complete `scheme://` URL. For example,
+  `open /Users/alice/Client Files/private.db` becomes `open <path>`, and
+  `/var/lib/lcm and then retried later.` becomes `<path>`. Diagnostic detail
+  after an unquoted path can therefore disappear. Padding before punctuation
+  can disappear too: `/tmp/x => EACCES` becomes `<path>=> EACCES`.
+  Whitespace before a line break, the end of the message, or an independent
+  URL remains intact. A separate URL keeps its complete scheme, authority,
+  wrappers, and existing path/query/fragment policy; a URL-shaped token inside
+  an already open path bracket or parenthesis remains private path text.
+  Bare separator runs and drive roots keep their prior behavior, as do messages
+  without a recognized private path. UNC server/share names are private path
+  content. This policy also applies where a URL query classifies a value as
+  ordinary filesystem text; it does not change which values receive that
+  classification. Removing ambiguous whitespace can expose an existing
+  delimiter handoff on a later bounded pass, which can redact a separate path
+  after that delimiter. File URLs and forced URL-owned spans retain their
+  separate whitespace rules below. These are syntax boundaries, not an inference
+  of every possible filename spelling. Inside an already
   recognized path, a drive-shaped doubled-colon segment ending in a backslash
   is also redacted, including in slash-prefixed Windows drives. A URL-shaped
   scheme token immediately after that backslash retains the existing URL
@@ -986,8 +1007,10 @@ bundle and keep provider, credential, quarantine, and recovery sessions private.
   or when its scheme text is glued to an earlier path-word run. It does not
   treat an arbitrary colon as a path continuation, cross a recognized nested
   exact `file://` boundary, or change a separate ordinary public URL. The span
-  ends at whitespace
-  or the first unbalanced `)` or `]`, `#`, `&`, `=`, `|`, `,`, `;`, `!`, `?`,
+  follows the plain-filesystem whitespace policy above; file and forced
+  URL-owned spans retain their whitespace boundaries. It otherwise ends at
+  a line break or the first unbalanced `)` or `]`, `#`, `&`, `=`, `|`, `,`, `;`,
+  `!`, `?`,
   `}`, apostrophe, double quote, `<`, or `>`. The marker therefore stops before
   a suffix such as `?a=b`. This includes slash-prefixed URLs inside or after
   brackets, and the result is stable on repeated sanitation. Ordinary
