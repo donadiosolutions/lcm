@@ -5,8 +5,8 @@ import { sanitizeError } from "./safe-error.js";
 export class MissingCwdError extends Error {
   readonly code = "CWD_NOT_FOUND" as const;
 
-  constructor(cwd: string) {
-    super(sanitizeError(`cwd does not exist: ${cwd}`));
+  constructor(_cwd: string) {
+    super("cwd does not exist: <path>");
     this.name = "MissingCwdError";
   }
 }

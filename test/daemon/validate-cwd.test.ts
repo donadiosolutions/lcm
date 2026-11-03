@@ -35,6 +35,25 @@ describe("validateCwd", () => {
     expect(() => validateCwd("/nonexistent/path/that/does/not/exist")).toThrow();
   });
 
+  it.each([
+    "missing-project",
+    "My Files/and then/project",
+    "quoted 'project\"/tail",
+    "line\nbreak/project",
+    "SQLITE_CONSTRAINT: missing table/project",
+  ])("keeps the missing-cwd diagnostic fixed for %j", (relativePath) => {
+    const tempDir = mkdtempSync(join(tmpdir(), "lcm-validate-cwd-diagnostic-"));
+    tempDirs.push(tempDir);
+    const missing = join(tempDir, relativePath);
+
+    expect(() => validateCwd(missing)).toThrow(MissingCwdError);
+    expect(() => validateCwd(missing)).toThrow(expect.objectContaining({
+      name: "MissingCwdError",
+      code: "CWD_NOT_FOUND",
+      message: "cwd does not exist: <path>",
+    }));
+  });
+
   it("permits a normalized missing path only for recovery-aware callers", () => {
     const tempDir = mkdtempSync(join(tmpdir(), "lcm-validate-cwd-missing-"));
     tempDirs.push(tempDir);

@@ -1,0 +1,7 @@
+references: ["#1875"]
+rationale: >-
+  Keeps missing working-directory diagnostics in daemon-core ownership while
+  replacing path interpolation with a fixed message. Validation, typed recovery,
+  and the shared sanitizer retain their existing behavior and ownership.
+pins:
+  - ["src/daemon/validate-cwd.ts", "unit-daemon-core"]
