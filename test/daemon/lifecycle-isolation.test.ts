@@ -285,7 +285,11 @@ function withHermeticLifecycleSeams(
     sleep: options._sleepOverride ?? (async () => undefined),
     realpath: options._realpathOverride ?? (path => path),
   };
-  return { ...options, _hermeticTestSeams: seams };
+  return { ...options, _hermeticTestSeams: seams, _admitDaemonPeerForTesting: options._admitDaemonPeerForTesting ?? (mode => {
+      const pid = mode.kind === "replacement-manager" ? mode.managerPid
+        : Number(readFileSync(options.pidFilePath, "utf8"));
+      return Number.isSafeInteger(pid) && pid > 0 ? { pid, birth: `birth-${pid}` } : null;
+    }) };
 }
 
 describe("daemon lifecycle test-scope validation", () => {
@@ -1349,18 +1353,34 @@ describe("daemon lifecycle test-scope validation", () => {
           ? { ok: true, status: 200, json: async () => health }
           : { ok: true, status: 200, json: async () => ({}) }
       ));
-      const connectedRoot = join(fixture.root, "connected");
-      mkdirSync(connectedRoot);
-      const connectedPidPath = join(connectedRoot, "daemon.pid");
-      writeFileSync(connectedPidPath, "8686");
-      ensureAuthToken(join(connectedRoot, "daemon.token"));
+      const productionPeer = (name: string, pid: number, port: number) => {
+        const home = join(fixture.root, name);
+        const state = join(home, ".lcm");
+        const procRoot = join(home, "proc");
+        const uid = process.getuid?.() ?? 0;
+        mkdirSync(state, { recursive: true, mode: 0o700 });
+        mkdirSync(join(procRoot, String(pid), "fd"), { recursive: true });
+        mkdirSync(join(procRoot, "net"));
+        writeFileSync(join(state, "daemon.pid"), String(pid), { mode: 0o600 });
+        writeFileSync(join(procRoot, String(pid), "status"), `Uid:\t${uid}\t${uid}\t${uid}\t${uid}\nPPid:\t1\n`);
+        writeFileSync(join(procRoot, String(pid), "cmdline"), "node\0lcm\0daemon\0start\0");
+        symlinkSync(`socket:[${pid}]`, join(procRoot, String(pid), "fd", "3"));
+        writeFileSync(join(procRoot, "net", "tcp"), `sl local_address rem_address st tx_queue tr tm->when retrnsmt uid timeout inode\n0: 0100007F:${port.toString(16)} 00000000:0000 0A 0:0 0:0 0 ${uid} 0 ${pid} 1\n`);
+        ensureAuthToken(join(state, "daemon.token"));
+        return { pidPath: join(state, "daemon.pid"), procRoot, uid };
+      };
+      const connected = productionPeer("connected", 8686, 37_351);
+      const connectedPidPath = connected.pidPath;
       await expect(ensureDaemon({
         port: 37_351,
         pidFilePath: connectedPidPath,
         spawnTimeoutMs: 10,
         expectedVersion: "1",
         expectedEntrypoint: fixture.scope.entrypoint,
-        _platform: "darwin",
+        _platform: "linux",
+        _procRoot: connected.procRoot,
+        _uid: connected.uid,
+        _processStartTimeForTesting: () => "birth-8686",
         _fetchOverride: fetchHealthy as never,
         _isProcessAliveOverride: () => true,
         _listeningPortsOverride: () => [37_351],
@@ -1371,11 +1391,8 @@ describe("daemon lifecycle test-scope validation", () => {
         spawned: false,
       });
 
-      const restartRoot = join(fixture.root, "restart");
-      mkdirSync(restartRoot);
-      const restartPidPath = join(restartRoot, "daemon.pid");
-      writeFileSync(restartPidPath, "8787");
-      ensureAuthToken(join(restartRoot, "daemon.token"));
+      const restarting = productionPeer("restart", 8787, 37_352);
+      const restartPidPath = restarting.pidPath;
       let alive = true;
       const kill = vi.fn(() => {
         alive = false;
@@ -1398,7 +1415,10 @@ describe("daemon lifecycle test-scope validation", () => {
         spawnTimeoutMs: 10,
         expectedVersion: "1",
         expectedEntrypoint: fixture.scope.entrypoint,
-        _platform: "darwin",
+        _platform: "linux",
+        _procRoot: restarting.procRoot,
+        _uid: restarting.uid,
+        _processStartTimeForTesting: () => "birth-8787",
         _fetchOverride: fetchRestart as never,
         _spawnSyncOverride: processIdentity as never,
         _isProcessAliveOverride: () => alive,
@@ -2307,6 +2327,9 @@ describe("run-owned lifecycle resources", () => {
     await expect(restartDaemon({
       ...scopedOptions(fixture),
       _testScope: scope,
+      _admitDaemonPeerForTesting: (_mode, deadline) => performance.now() < deadline
+        && readFileSync(fixture.pidPath, "utf8") === "7373" && fixture.isAlive(7373)
+        ? { pid: 7373, birth: "birth-7373" } : null,
       _platform: "darwin",
       enforceUserManagerParent: false,
       _listeningPortsOverride: () => [48_321],

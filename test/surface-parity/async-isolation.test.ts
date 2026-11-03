@@ -1,7 +1,60 @@
 import assert from "node:assert/strict";
+import { createHash } from "node:crypto";
 import { expect, it, vi } from "vitest";
 import { failure } from "../postgresql/fixtures/surface-parity-failure.mjs";
 import { drainFailureId, isolateAsyncBoundary } from "./async-isolation.mjs";
+
+it("retains a trusted prepared source label and classifies generic errors without raw content", () => {
+  const error = new Error("PRIVATE_CANARY stderr SELECT secret FROM private");
+  error.stack = `${error.message}\n at validate (file:///PRIVATE_CANARY/prepared-projects.mjs:123:9)`;
+  const result = failure(error, "import-collisions:delta");
+  expect(result.id).toBe("import-collisions:delta:Error:err:pp123");
+  expect(result.digest).toBe(createHash("sha256").update(error.message).digest("hex"));
+  expect(Object.keys(result)).toEqual(["id", "digest"]);
+  expect(JSON.stringify(result)).not.toMatch(/PRIVATE_CANARY|SELECT|stderr|file:|private/u);
+});
+
+it.each([[false, true, "01"], [true, false, "10"]] as const)("projects only genuine boolean assertion operands %#", (actual, expected, bits) => {
+  const error = new assert.AssertionError({ actual, expected, operator: "strictEqual", message: "PRIVATE_CANARY body SQL" });
+  error.stack = `${error.message}\n at validate (file:///PRIVATE_CANARY/prepared-projects.mjs:124:9)`;
+  const result = failure(error, "import-collisions:delta");
+  expect(result.id).toBe(`import-collisions:delta:assertion:a-seq:pp124:b${bits}`);
+  expect(JSON.stringify(result)).not.toMatch(/PRIVATE_CANARY|body|SQL|file:/u);
+});
+
+it("omits unknown operators, nonboolean operands and untrusted source frames", () => {
+  const error = new assert.AssertionError({ actual: 123456, expected: 654321, operator: "PRIVATE_CANARY", message: "PRIVATE_CANARY SQL" });
+  error.stack = `${error.message}\n at validate (file:///PRIVATE_CANARY/untrusted.mjs:777:9)`;
+  const result = failure(error, "import-collisions:delta");
+  expect(result.id).toBe("import-collisions:delta:assertion:a-other");
+  expect(JSON.stringify(result)).not.toMatch(/PRIVATE_CANARY|123456|654321|777|untrusted|SQL/u);
+  const forged = { name: "AssertionError", code: "ERR_ASSERTION", operator: "strictEqual", actual: true, expected: false,
+    message: "PRIVATE_CANARY", stack: " at validate (file:///PRIVATE_CANARY/prepared-projects.mjs:1:1)" };
+  expect(failure(forged, "import-collisions:delta").id).toBe("import-collisions:delta:assertion:err:pp1");
+});
+
+it.each(["0", "-1", "1.5", "100001", "9007199254740992"])("refuses an invalid trusted source line %s", line => {
+  const error = new Error("PRIVATE_CANARY");
+  error.stack = ` at validate (file:///PRIVATE_CANARY/prepared-projects.mjs:${line}:9)`;
+  expect(failure(error, "import-collisions:delta").id).toBe("import-collisions:delta:Error:err");
+});
+
+it("reserves bounded diagnostic space and preserves the existing failure schema and digest preference", () => {
+  const error = new Error(`surface-prepared:${"x".repeat(300)}`);
+  error.stack = " at validate (file:///PRIVATE_CANARY/prepared-journals.mjs:100000:9)";
+  const result = failure(error, "import-collisions:delta");
+  expect(result.id).toHaveLength(110);
+  expect(result.id).toMatch(/^import-collisions:delta:/u);
+  expect(result.id.endsWith(":err:pj100000")).toBe(true);
+  expect(result.id).toMatch(/^[a-zA-Z0-9_.:-]{1,110}$/u);
+  expect(Object.keys(result)).toEqual(["id", "digest"]);
+  const captured = Object.assign(new Error("PRIVATE_CANARY"), {
+    surfaceEvidence: { stdoutErrorDigest: "a".repeat(64), stderrDigest: "b".repeat(64) },
+  });
+  expect(failure(captured).digest).toBe("a".repeat(64));
+  const code = Object.assign(new Error("PRIVATE_CANARY"), { code: "EACCES" });
+  expect(failure(code).id).toBe("surface-worker:EACCES:err");
+});
 
 function fixture() {
   const calls: string[] = [];

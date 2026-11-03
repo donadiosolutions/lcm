@@ -12,9 +12,10 @@ const TOKEN = "process-test-token";
 const FIXTURE = `
 import { createServer } from "node:http";
 import { appendFileSync } from "node:fs";
-const { MODE, POST_MODE, TOKEN, ENTRYPOINT, DIGEST, VERSION, OUT } = process.env;
+const { MODE, POST_MODE, TOKEN, ENTRYPOINT, DIGEST, VERSION, OUT, AUTH_OUT } = process.env;
 const server = createServer((req, res) => {
   const authorized = req.headers.authorization === "Bearer " + TOKEN;
+  if (req.headers.authorization !== undefined) appendFileSync(AUTH_OUT, req.url + "\\n");
   const reply = (status, body) => { res.writeHead(status, { "Content-Type": "application/json" }); res.end(JSON.stringify(body)); };
   if (req.url === "/health") {
     if (MODE === "hang-health") return;
@@ -139,11 +140,17 @@ describe.skipIf(process.platform !== "linux")("packaged lcm session-snapshot --t
   async function startFixture(
     home: string,
     env: Record<string, string>,
-  ): Promise<{ port: number; out: string }> {
+    daemonCommand = true,
+  ): Promise<{ port: number; out: string; authenticatedOut: string }> {
     const out = join(home, "fixture-requests.jsonl");
+    const authenticatedOut = join(home, "fixture-authenticated-requests.txt");
     writeFileSync(out, "");
-    const child = spawn(process.execPath, [fixturePath], {
-      env: { PATH: "/usr/bin:/bin", TOKEN, ENTRYPOINT: runtime, DIGEST: digest, VERSION: version, OUT: out, ...env },
+    writeFileSync(authenticatedOut, "");
+    // The listener is a real daemon fixture: expose its role in the actual OS
+    // command line while retaining real PID, UID, birth and socket attribution.
+    const child = spawn(process.execPath, [fixturePath, ...(daemonCommand ? ["daemon", "start"] : [])], {
+      env: { PATH: "/usr/bin:/bin", TOKEN, ENTRYPOINT: runtime, DIGEST: digest, VERSION: version,
+        OUT: out, AUTH_OUT: authenticatedOut, ...env },
       stdio: ["ignore", "pipe", "inherit"],
     });
     children.push(child);
@@ -152,7 +159,7 @@ describe.skipIf(process.platform !== "linux")("packaged lcm session-snapshot --t
       child.stdout!.once("data", (chunk) => done(Number(String(chunk).trim())));
     });
     writeFileSync(join(home, ".lcm", "daemon.pid"), String(child.pid), { mode: 0o600 });
-    return { port, out };
+    return { port, out, authenticatedOut };
   }
 
   async function run(
@@ -237,6 +244,21 @@ describe.skipIf(process.platform !== "linux")("packaged lcm session-snapshot --t
       expectSilentSuccess(result);
       expect(logged(log).map(({ hook, error }) => [hook, error])).toEqual([["SessionEnd", "unconfirmed"]]);
       expect(result.nodeMs).toBeGreaterThan(1000);
+    });
+  });
+
+  it("sends no bearer or transcript to a listener without a daemon command", async () => {
+    const { home, transcript, log } = makeHome(0);
+    const fixture = await startFixture(home, { MODE: "daemon" }, false);
+    writeFileSync(join(home, ".lcm", "config.json"), JSON.stringify({ daemon: { port: fixture.port } }), { mode: 0o600 });
+
+    const result = await run(home, { stdin: payload(home, transcript) });
+
+    diagnose(home, result, () => {
+      expectSilentSuccess(result);
+      expect(logged(log).map(({ error }) => error)).toEqual(["daemon-unavailable"]);
+      expect(readFileSync(fixture.authenticatedOut, "utf-8")).toBe("");
+      expect(readFileSync(fixture.out, "utf-8")).toBe("");
     });
   });
 

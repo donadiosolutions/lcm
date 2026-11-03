@@ -2111,6 +2111,7 @@ describe("installer publication admission integration", () => {
 
   function healthyFactorySeams(fetch: typeof globalThis.fetch) {
     return {
+      admitPeer: () => ({ pid: process.pid, birth: "birth" }),
       fetch,
       readToken: () => "token",
       _expectedVersionForTesting: expectedVersion,
@@ -2437,6 +2438,7 @@ describe("installer publication admission integration", () => {
     try {
       const canonical = await createInstallerPublicationConvergence(canonicalConfig, {
         fetch: health,
+        admitPeer: () => ({ pid: process.pid, birth: "birth" }),
         _expectedVersionForTesting: expectedVersion,
         _expectedEntrypointForTesting: expectedEntrypoint,
         _expectedRuntimeDigestForTesting: expectedRuntimeDigest,
@@ -2710,6 +2712,7 @@ describe("installer publication admission integration", () => {
         now: () => now,
         sleep: async (ms) => { sleeps.push(ms); now += ms; },
         readToken: () => "token",
+        admitPeer: () => ({ pid: process.pid, birth: "birth" }),
         readOwner: () => ({ version: 1, pid: process.pid, processStartTime: "birth", nonce: "a".repeat(32) }),
         processBirth: () => "birth",
         fetch: vi.fn(async () => ({

@@ -200,8 +200,18 @@ describe("handlePreToolUse", () => {
     };
   };
   const run = (overrides: Record<string, unknown> = {}, deps?: { deadlineMs?: number }) => (
-    handlePreToolUse(JSON.stringify({ ...sessionPayload, ...overrides }), deps)
+    handlePreToolUse(JSON.stringify({ ...sessionPayload, ...overrides }), {
+      _admitPeerForTesting: () => ({ pid: 42, birth: "birth" }), ...deps,
+    })
   );
+  it("refuses peer denial before loading the token or sending query, cwd or session", async () => {
+    enable();
+    const readToken = vi.spyOn(await import("../../src/daemon/auth.js"), "readAuthToken");
+    expect(await handlePreToolUse(JSON.stringify(sessionPayload), { _admitPeerForTesting: () => null }))
+      .toEqual({ exitCode: 0, stdout: "" });
+    expect(readToken).not.toHaveBeenCalled();
+    expect(requests).toEqual([]);
+  });
   const parse = (stdout: string) => JSON.parse(stdout) as {
     hookSpecificOutput: { hookEventName: string; additionalContext: string };
   };

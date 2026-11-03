@@ -1,3 +1,4 @@
+import { awaitDaemonPeerAdmission, type DaemonPeerAdmissionCallback } from "../daemon/peer-admission.js";
 import { join, resolve } from "node:path";
 import { daemonEntrypointMatches } from "../daemon/lifecycle-scope.js";
 import { isStagedPostgreSqlHealth } from "../daemon/staged-postgresql.js";
@@ -29,6 +30,7 @@ export type PublicationConvergenceDeps = Readonly<{
   sleep?: (delayMs: number) => Promise<void>;
   fetch?: typeof globalThis.fetch;
   readToken?: () => string | null;
+  admitPeer?: DaemonPeerAdmissionCallback;
   readOwner?: typeof readPrivateMutationLockOwner;
   processBirth?: typeof processStartTime;
   platform?: NodeJS.Platform;
@@ -88,10 +90,11 @@ async function authenticatedHealth(
   timeoutMs: number,
 ): Promise<PublicationDaemonHealth | null> {
   const controller = new AbortController();
+  const now = deps.now ?? performance.now.bind(performance);
+  const deadline = now() + timeoutMs;
   let timer: ReturnType<typeof setTimeout> | undefined;
   try {
-    const token = deps.readToken?.() ?? null;
-    if (token === null || deps.fetch === undefined) return null;
+    if (deps.admitPeer === undefined || deps.fetch === undefined || timeoutMs <= 0) return null;
     const timeout = new Promise<never>((_, reject) => {
       timer = setTimeout(() => {
         controller.abort();
@@ -100,12 +103,16 @@ async function authenticatedHealth(
     });
     const response = await Promise.race([
       (async () => {
+        const peer = await awaitDaemonPeerAdmission(deps.admitPeer, port, deadline, controller.signal, now);
+        if (controller.signal.aborted || now() >= deadline) return null;
+        const token = deps.readToken?.() ?? null;
+        if (token === null || controller.signal.aborted || now() >= deadline) return null;
         const result = await deps.fetch!(`http://127.0.0.1:${port}/health`, {
           headers: { Authorization: `Bearer ${token}` },
           signal: controller.signal,
         });
         const health = await result.json() as PublicationDaemonHealth | null;
-        if (health === null || typeof health !== "object") return null;
+        if (health === null || typeof health !== "object" || health.pid !== peer.pid) return null;
         return (result.ok && health.status === "ok")
           || isStagedPostgreSqlHealth(result.status, health)
           ? health : null;

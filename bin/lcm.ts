@@ -1,4 +1,5 @@
 #!/usr/bin/env node
+import { admitCurrentDaemonPeer } from "../src/daemon/peer-admission.js";
 import { randomUUID } from "node:crypto";
 import { lstatSync, realpathSync } from "node:fs";
 import { argv, exit, kill as processKill, stdin, stdout } from "node:process";
@@ -2673,7 +2674,8 @@ async function createDaemonClientOrExitWithConfig(): Promise<DaemonClientWithCon
   clearDaemonRemediationMarker();
 
   return {
-    client: new DaemonClient(`http://127.0.0.1:${port}`, tokenPath),
+    client: new DaemonClient(`http://127.0.0.1:${port}`, tokenPath,
+      (targetPort, deadline) => admitCurrentDaemonPeer({ port: targetPort, deadline })),
     config,
   };
 }
@@ -2713,19 +2715,30 @@ async function createDaemonReadClientOrExit(
   try {
     const first = readDaemonConfigSnapshot(configPath);
     const tokenPath = daemonTokenPath();
-    const { readAuthToken } = await import("../src/daemon/auth.js");
-    const token = readAuthToken(tokenPath);
-    if (typeof token === "string" && token.length > 0) {
-      const port = first.config.daemon.port;
-      const client = new DaemonClient(`http://127.0.0.1:${port}`, tokenPath);
+    const port = first.config.daemon.port;
+    const fastDeadline = performance.now() + 2_000;
+    const peer = await admitCurrentDaemonPeer({ port, deadline: fastDeadline });
+    if (peer === null) failure = { reason: "peer-unverified" };
+    else {
+      const { readAuthToken } = await import("../src/daemon/auth.js");
+      if (performance.now() >= fastDeadline) throw new Error("Daemon verification deadline expired");
+      const token = readAuthToken(tokenPath);
+      if (typeof token !== "string" || token.length === 0) {
+        failure = { reason: "token-missing" };
+        throw new DaemonObservationError(failure);
+      }
+      const client = new DaemonClient(`http://127.0.0.1:${port}`, tokenPath,
+        (targetPort, deadline) => admitCurrentDaemonPeer({ port: targetPort, deadline }));
+      const timeoutMs = Math.floor(fastDeadline - performance.now());
+      if (timeoutMs <= 0) throw new Error("Daemon verification deadline expired");
       let health: DaemonHealth | DaemonObservation | null;
       if (options.diagnosticOnly) {
-        const observed = await client.observeClassified({ timeoutMs: 2000 });
+        const observed = await client.observeClassified({ timeoutMs });
         if (observed.kind === "failed") {
           failure = observed.failure;
           health = null;
         } else health = observed.observation;
-      } else health = await client.health();
+      } else health = await client.health({ timeoutMs });
       if (health !== null) {
         const fields = daemonReadIdentityMismatchFields(health, first.config.storage.backend);
         if ((health.status === "ok" || health.status === "healthy") && fields.length === 0) {
@@ -2743,7 +2756,7 @@ async function createDaemonReadClientOrExit(
             : { reason: "invalid-identity" };
         }
       }
-    } else failure = { reason: "token-missing" };
+    }
   } catch {
     // Diagnostics refuse any snapshot, token, observation, or witness failure.
     // Other callers retain the authenticated migration and lifecycle fallback.

@@ -61,6 +61,7 @@ vi.mock("../src/daemon/config.js", () => ({
 }));
 vi.mock("../src/daemon/client.js", () => ({
   DaemonClient: vi.fn().mockImplementation(function () { return { post: mocks.post }; }),
+  verifiedLocalDaemonClient: vi.fn(() => ({ post: mocks.post })),
 }));
 vi.mock("../src/daemon/version.js", () => ({ PKG_VERSION: "coverage-version" }));
 vi.mock("../src/runtime-paths.js", () => ({

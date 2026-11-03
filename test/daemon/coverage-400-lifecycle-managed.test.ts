@@ -60,6 +60,7 @@ afterEach(() => {
 });
 
 type Fixture = {
+  now: () => number;
   root: string;
   stateDir: string;
   pidPath: string;
@@ -169,6 +170,7 @@ function healthy(
 }
 
 function createFixture(options: FixtureOptions = {}): Fixture {
+  let elapsed = 0;
   const root = mkdtempSync(join(tmpdir(), "lcm-400-managed-"));
   roots.push(root);
   const stateDir = join(root, "state");
@@ -211,10 +213,18 @@ function createFixture(options: FixtureOptions = {}): Fixture {
     stopUnit: vi.fn(),
     killProcess: options.killProcess ?? vi.fn(),
     isProcessAlive: isAlive,
-    sleep: options.sleep ?? (async () => undefined),
+    sleep: async (milliseconds) => {
+      if (!Number.isFinite(milliseconds) || milliseconds <= 0) {
+        elapsed += 1;
+        throw new Error("fixture sleep must advance by a finite positive interval");
+      }
+      elapsed += milliseconds;
+      await options.sleep?.(milliseconds);
+    },
     realpath: options.realpath ?? ((path: string) => path),
   };
   return {
+    now: () => elapsed,
     root,
     stateDir,
     pidPath,
@@ -283,8 +293,13 @@ function optionsFor(
     enforceUserManagerParent: true,
     _platform: fixture.seams.platform,
     _hermeticTestSeams: fixture.seams,
+    _admitDaemonPeerForTesting: mode => {
+      const pid = mode.kind === "replacement-manager" ? mode.managerPid
+        : Number(readFileSync(fixture.pidPath, "utf8"));
+      return Number.isSafeInteger(pid) && pid > 0 ? { pid, birth: "birth" } : null;
+    },
     _supervisorOverride: fixture.supervisor,
-    _monotonicNowOverride: () => 0,
+    _monotonicNowOverride: fixture.now,
     _listeningPortsOverride: () => [fixture.port],
     ...extra,
   };
@@ -759,6 +774,7 @@ describe("issue 400 lifecycle managed preparation and utility boundaries", () =>
       enforceUserManagerParent: false,
       _platform: "linux",
       _testScope: scope,
+      _admitDaemonPeerForTesting: () => ({ pid: 4242, birth: "birth" }),
       _supervisorOverride: supervisor,
       _listeningPortsOverride: () => {
         rmSync(fixture.tokenPath, { force: true });
@@ -976,15 +992,10 @@ describe("issue 400 managed ensure admission matrix", () => {
   });
 
   it("skips an after-sample when abort lands during managed diagnostics", async () => {
-    let aborted = false;
-    const signal = {
-      get aborted() { return aborted; },
-      addEventListener: vi.fn(),
-      removeEventListener: vi.fn(),
-    } as unknown as AbortSignal;
+    const controller = new AbortController();
     const accessResponse = {
       get ok() {
-        aborted = true;
+        controller.abort();
         return true;
       },
       status: 200,
@@ -1007,11 +1018,12 @@ describe("issue 400 managed ensure admission matrix", () => {
 
     const result = await ensureDaemon(optionsFor(fixture, {
       expectedRuntimeDigest: "a".repeat(64),
-      _abortSignal: signal,
+      _abortSignal: controller.signal,
       _processStartTimeForTesting: processBirth,
     }));
 
-    expect(result).toMatchObject({ connected: true, spawned: true, pid: 4242 });
+    expect(controller.signal.aborted).toBe(true);
+    expect(result.connected).toBe(false);
     expect(processBirth).toHaveBeenCalledOnce();
   });
 
@@ -1456,7 +1468,6 @@ describe("issue 400 managed ensure admission matrix", () => {
       const pending = ensureDaemon(optionsFor(fixture, {
         expectedRuntimeDigest: "a".repeat(64),
         _skipSpawn: false,
-        _monotonicNowOverride: () => 0,
         _processStartTimeForTesting: () => "birth",
         _readPrivateMutationLockOwnerForTesting: () => ({ version: 1, pid: 4242, processStartTime: "birth", nonce: "a".repeat(32) }),
         _assertBackendPublication: () => {
@@ -1945,7 +1956,14 @@ describe("issue 400 managed ensure admission matrix", () => {
       _supervisorNonceOverride: () => "new-launch-nonce",
     }));
     expect(adoptionResult).toMatchObject({ connected: true, spawned: false, pid: 4242 });
-    expect(calls).toBe(4);
+    // Candidate, adopted registration, endpoint, before-token, before-auth-health,
+    // before-pool, and post-authentication final probe share the original budget.
+    expect(calls).toBe(7);
+    expect(fixture.probe.mock.calls.slice(1).every(([spec]) => spec.nonce === "existing-launch-nonce")).toBe(true);
+    const candidate = fixture.probe.mock.calls[0]![0] as SupervisorSpec;
+    expect(candidate.nonce).toBe("new-launch-nonce");
+    expect(fixture.probe.mock.calls.every(([spec, options]) => spec.scopeDigest === candidate.scopeDigest
+      && spec.stateRoot === fixture.stateDir && spec.port === fixture.port && options.deadline === 100)).toBe(true);
   });
 
   it("adopts the same running manager across independent fresh candidate nonces", async () => {
@@ -1978,8 +1996,8 @@ describe("issue 400 managed ensure admission matrix", () => {
     expect(first).toMatchObject({ connected: true, spawned: false, pid: 4242 });
     expect(second).toMatchObject({ connected: true, spawned: false, pid: 4242 });
     expect(fixture.probe.mock.calls.map(([spec]) => (spec as SupervisorSpec).nonce)).toEqual([
-      "fresh-candidate-one", priorNonce, priorNonce, priorNonce,
-      "fresh-candidate-two", priorNonce, priorNonce, priorNonce,
+      "fresh-candidate-one", ...Array<string>(6).fill(priorNonce),
+      "fresh-candidate-two", ...Array<string>(6).fill(priorNonce),
     ]);
     expect(fixture.start).not.toHaveBeenCalled();
     expect(fixture.stopAndStart).not.toHaveBeenCalled();
@@ -2019,7 +2037,7 @@ describe("issue 400 managed ensure admission matrix", () => {
 
     expect(result).toMatchObject({ connected: true, spawned: false, startMethod: method, pid: 4242 });
     expect(observed[0]?.credentialDirectory).toBeUndefined();
-    expect(observed).toHaveLength(4);
+    expect(observed).toHaveLength(7);
     expect(observed.slice(1).every(spec => spec.nonce === persistedNonce && spec.credentialDirectory === credentialDirectory && spec.credentialFiles?.[0]?.path === credentialFile)).toBe(true);
     expect(observed[1]).toMatchObject({
       nonce: persistedNonce,
@@ -2409,7 +2427,11 @@ describe("issue 400 managed ensure admission matrix", () => {
       isAlive: (pid) => pid === 5252,
       sleep,
     });
-    replacement.probe.mockImplementation(async (spec: SupervisorSpec) => observation(spec, "registered-running-valid", { managerPid: 5252 }));
+    const replacementProbeFetches: number[] = [];
+    replacement.probe.mockImplementation(async (spec: SupervisorSpec) => {
+      replacementProbeFetches.push(vi.mocked(replacement.seams.fetch).mock.calls.length);
+      return observation(spec, "registered-running-valid", { managerPid: 5252 });
+    });
     writeFileSync(replacement.tokenPath, "replacement-token", { mode: 0o600 });
 
     const replacementResult = await ensureDaemon(optionsFor(replacement, {
@@ -2422,8 +2444,14 @@ describe("issue 400 managed ensure admission matrix", () => {
     expect(replacementResult).toMatchObject({ connected: true, pid: 5252 });
     expect(sleep).toHaveBeenCalledOnce();
     expect(replacement.stopAndAwaitAbsent).not.toHaveBeenCalled();
-    expect(replacement.probe.mock.calls).toHaveLength(4);
-    expect(replacement.probe.mock.calls.every(([spec]) => (spec as SupervisorSpec).nonce === "replacement-nonce")).toBe(true);
+    // Candidate, startup retry, endpoint, before-token, before-auth-health,
+    // before-pool, and final probe after pool. This source-runtime fixture has
+    // no packaged digest, so the optional publication pin capture is ineligible.
+    expect(replacementProbeFetches).toEqual([0, 1, 2, 2, 2, 3, 4]);
+    const replacementSpec = replacement.probe.mock.calls[0]![0] as SupervisorSpec;
+    expect(replacement.probe.mock.calls.every(([spec, options]) => spec.nonce === "replacement-nonce"
+      && spec.scopeDigest === replacementSpec.scopeDigest && spec.stateRoot === replacement.stateDir
+      && spec.port === replacement.port && options.deadline === 100)).toBe(true);
 
     let driftProbeCalls = 0;
     const drift = createFixture({
@@ -2547,7 +2575,7 @@ describe("issue 400 managed ensure admission matrix", () => {
     let admissionProbes = 0;
     afterAuthentication.probe.mockImplementation(async (spec: SupervisorSpec) => {
       admissionProbes += 1;
-      return admissionProbes === 3
+      return vi.mocked(afterAuthentication.seams.fetch).mock.calls.length === 3
         ? observation(spec, "registered-running-valid", { managerPid: 4242, scopeDigest: "foreign-after-auth" })
         : observation(spec, "registered-running-valid", { managerPid: 4242 });
     });
@@ -2555,7 +2583,15 @@ describe("issue 400 managed ensure admission matrix", () => {
     writeFileSync(afterAuthentication.tokenPath, "managed-token", { mode: 0o600 });
     const afterAuthenticationResult = await ensureDaemon(optionsFor(afterAuthentication));
     expect(afterAuthenticationResult).toMatchObject({ refusalReason: "ambiguous" });
-    expect(admissionProbes).toBe(3);
+    // No nonce adoption: candidate, endpoint, three pre-bearer checks, then final.
+    expect(admissionProbes).toBe(6);
+    expect(afterAuthentication.seams.fetch).toHaveBeenCalledTimes(3);
+    expect(vi.mocked(afterAuthentication.seams.fetch).mock.calls[2]![0])
+      .toBe(`http://127.0.0.1:${afterAuthentication.port}/stats/pool`);
+    const authenticatedSpec = afterAuthentication.probe.mock.calls[0]![0] as SupervisorSpec;
+    expect(afterAuthentication.probe.mock.calls.every(([spec, options]) => spec.nonce === authenticatedSpec.nonce
+      && spec.scopeDigest === authenticatedSpec.scopeDigest && spec.stateRoot === afterAuthentication.stateDir
+      && options.deadline === 100)).toBe(true);
   });
 
   it("covers authenticated manager final-probe failure and null daemon admission", async () => {
@@ -2563,16 +2599,24 @@ describe("issue 400 managed ensure admission matrix", () => {
       isAlive: () => true,
       fetch: sequenceFetch([healthy(4242), healthy(4242), response({}, 200)]),
     });
-    finalProbeFailure.probe
-      .mockImplementationOnce(async (spec: SupervisorSpec) => observation(spec, "registered-running-valid", { managerPid: 4242 }))
-      .mockImplementationOnce(async (spec: SupervisorSpec) => observation(spec, "registered-running-valid", { managerPid: 4242 }))
-      .mockRejectedValueOnce(new Error("final manager probe failed"));
+    finalProbeFailure.probe.mockImplementation(async (spec: SupervisorSpec) => {
+      if (vi.mocked(finalProbeFailure.seams.fetch).mock.calls.length === 3) throw new Error("final manager probe failed");
+      return observation(spec, "registered-running-valid", { managerPid: 4242 });
+    });
     writeFileSync(finalProbeFailure.pidPath, "4242");
     writeFileSync(finalProbeFailure.tokenPath, "managed-token", { mode: 0o600 });
     await expect(ensureDaemon(optionsFor(finalProbeFailure))).resolves.toMatchObject({
       refusalReason: "ambiguous",
       pid: 4242,
     });
+    expect(finalProbeFailure.probe).toHaveBeenCalledTimes(6);
+    expect(finalProbeFailure.seams.fetch).toHaveBeenCalledTimes(3);
+    expect(vi.mocked(finalProbeFailure.seams.fetch).mock.calls[2]![0])
+      .toBe(`http://127.0.0.1:${finalProbeFailure.port}/stats/pool`);
+    const finalSpec = finalProbeFailure.probe.mock.calls[0]![0] as SupervisorSpec;
+    expect(finalProbeFailure.probe.mock.calls.every(([spec, options]) => spec.nonce === finalSpec.nonce
+      && spec.scopeDigest === finalSpec.scopeDigest && spec.stateRoot === finalProbeFailure.stateDir
+      && options.deadline === 100)).toBe(true);
 
     const nullAdmission = createFixture({
       isAlive: () => true,
@@ -2726,23 +2770,39 @@ describe("issue 400 managed start, cleanup, deadline, and process seams", () => 
 
   it("covers managed startup abort and health admission retry/timeout", async () => {
     const controller = new AbortController();
-    const aborted = createFixture({ fetch: sequenceFetch([new Error("offline")]) });
+    let abortNow = 0;
+    const unexpectedAbortRetry = vi.fn(async () => {
+      abortNow = 1_000;
+      throw new Error("managed startup retried before its expected abort");
+    });
+    const aborted = createFixture({
+      fetch: sequenceFetch([new Error("offline")]),
+      sleep: unexpectedAbortRetry,
+    });
     aborted.probe
       .mockImplementationOnce(async (spec: SupervisorSpec) => observation(spec, "absent"))
       .mockImplementationOnce(async (spec: SupervisorSpec) => {
         controller.abort();
         return observation(spec, "registered-running-valid", { managerPid: 4242 });
       });
-    await expect(ensureDaemon(optionsFor(aborted, { _abortSignal: controller.signal }))).resolves.toMatchObject({
+    await expect(ensureDaemon(optionsFor(aborted, {
+      _abortSignal: controller.signal,
+      _monotonicNowOverride: () => abortNow,
+    }))).resolves.toMatchObject({
       connected: false,
       spawned: true,
       warning: "daemon lifecycle was interrupted",
     });
+    expect(controller.signal.aborted).toBe(true);
+    expect(aborted.probe).toHaveBeenCalledTimes(2);
+    expect(aborted.seams.fetch).toHaveBeenCalledOnce();
+    expect(unexpectedAbortRetry).not.toHaveBeenCalled();
 
     let now = 0;
+    const deadlineSleep = vi.fn(async () => { now = 1_000; });
     const timeout = createFixture({
       fetch: sequenceFetch([new Error("offline"), response({ status: "wrong" }), new Error("offline")]),
-      sleep: async () => { now = 1_000; },
+      sleep: deadlineSleep,
     });
     timeout.probe
       .mockImplementationOnce(async (spec: SupervisorSpec) => observation(spec, "absent"))
@@ -2751,6 +2811,10 @@ describe("issue 400 managed start, cleanup, deadline, and process seams", () => 
       _skipHealthWait: false,
       _monotonicNowOverride: () => now,
     }))).resolves.toMatchObject({ refusalReason: "startup-failure", spawned: true });
+    expect(deadlineSleep).toHaveBeenCalledExactlyOnceWith(100);
+    expect(timeout.seams.fetch).toHaveBeenCalledTimes(2);
+    expect(timeout.probe).toHaveBeenCalledTimes(2);
+    expect(now).toBe(1_000);
   });
 
   it("preserves staged credentials when owned manager absence cleanup is refused", async () => {
@@ -2980,6 +3044,9 @@ describe("issue 400 managed start, cleanup, deadline, and process seams", () => 
       pid: 4242,
     });
 
+    expect(busy.seams.fetch).toHaveBeenCalledOnce();
+    expect(busy.now()).toBe(0);
+
     const mismatch = createFixture({
       fetch: sequenceFetch([healthy(4242, "/tmp/lcm-daemon-entrypoint.mjs", { version: "2" })]),
       isAlive: () => true,
@@ -2991,6 +3058,9 @@ describe("issue 400 managed start, cleanup, deadline, and process seams", () => 
       _skipSpawn: true,
       _listeningPortsOverride: () => [mismatch.port],
     }))).resolves.toMatchObject({ connected: false });
+    expect(mismatch.seams.fetch).toHaveBeenCalledOnce();
+    expect(mismatch.seams.killProcess).not.toHaveBeenCalled();
+    expect(mismatch.now()).toBe(0);
   });
 
   it("admits a successful managed start after health, storage, and access checks", async () => {
@@ -3017,29 +3087,43 @@ describe("issue 400 managed start, cleanup, deadline, and process seams", () => 
       isAlive: () => true,
       fetch: sequenceFetch([new Error("pre-start offline"), healthy(4242), healthy(4242), response({}, 200)]),
     });
-    finalProbeFailure.probe
-      .mockImplementationOnce(async (spec: SupervisorSpec) => observation(spec, "absent"))
-      .mockImplementationOnce(async (spec: SupervisorSpec) => observation(spec, "registered-running-valid", { managerPid: 4242 }))
-      .mockRejectedValueOnce(new Error("post-admission probe failed"));
+    finalProbeFailure.probe.mockImplementation(async (spec: SupervisorSpec) => {
+      if (finalProbeFailure.start.mock.calls.length === 0) return observation(spec, "absent");
+      if (vi.mocked(finalProbeFailure.seams.fetch).mock.calls.some(([url]) => String(url).endsWith("/stats/pool"))) {
+        throw new Error("post-admission probe failed");
+      }
+      return observation(spec, "registered-running-valid", { managerPid: 4242 });
+    });
     writeFileSync(finalProbeFailure.tokenPath, "managed-token", { mode: 0o600 });
     await expect(ensureDaemon(optionsFor(finalProbeFailure, {
       _skipHealthWait: false,
-      _monotonicNowOverride: () => 0,
     }))).resolves.toMatchObject({ refusalReason: "ambiguous", spawned: true, pid: 4242 });
 
     const identityRace = createFixture({
       isAlive: () => true,
       fetch: sequenceFetch([new Error("pre-start offline"), healthy(4242), healthy(4242), response({}, 200)]),
     });
-    identityRace.probe
-      .mockImplementationOnce(async (spec: SupervisorSpec) => observation(spec, "absent"))
-      .mockImplementationOnce(async (spec: SupervisorSpec) => observation(spec, "registered-running-valid", { managerPid: 4242 }))
-      .mockImplementationOnce(async (spec: SupervisorSpec) => observation(spec, "registered-running-valid", { managerPid: 4242, scopeDigest: "foreign-after-auth" }));
+    identityRace.probe.mockImplementation(async (spec: SupervisorSpec) => {
+      if (identityRace.start.mock.calls.length === 0) return observation(spec, "absent");
+      const afterPool = vi.mocked(identityRace.seams.fetch).mock.calls.some(([url]) => String(url).endsWith("/stats/pool"));
+      return observation(spec, "registered-running-valid", {
+        managerPid: 4242, ...(afterPool ? { scopeDigest: "foreign-after-auth" } : {}),
+      });
+    });
     writeFileSync(identityRace.tokenPath, "managed-token", { mode: 0o600 });
     await expect(ensureDaemon(optionsFor(identityRace, {
       _skipHealthWait: false,
-      _monotonicNowOverride: () => 0,
     }))).resolves.toMatchObject({ refusalReason: "ambiguous", spawned: true, pid: 4242 });
+
+    for (const fixture of [finalProbeFailure, identityRace]) {
+      expect(fixture.start).toHaveBeenCalledOnce();
+      expect(fixture.seams.fetch).toHaveBeenCalledTimes(4);
+      expect(vi.mocked(fixture.seams.fetch).mock.calls[3]![0]).toBe(`http://127.0.0.1:${fixture.port}/stats/pool`);
+      expect(fixture.now()).toBe(0);
+      const admittedSpec = fixture.probe.mock.calls[0]![0] as SupervisorSpec;
+      expect(fixture.probe.mock.calls.every(([spec, operation]) => spec.nonce === admittedSpec.nonce
+        && spec.scopeDigest === admittedSpec.scopeDigest && operation.deadline === 100)).toBe(true);
+    }
 
     const rejectedAdmission = createFixture({
       isAlive: () => true,
@@ -3082,7 +3166,6 @@ describe("issue 400 managed start, cleanup, deadline, and process seams", () => 
     writeFileSync(cleanupFailure.tokenPath, "managed-token", { mode: 0o600 });
     await expect(ensureDaemon(optionsFor(cleanupFailure, {
       _skipHealthWait: false,
-      _monotonicNowOverride: () => 0,
     }))).resolves.toMatchObject({
       refusalReason: "startup-failure",
       spawned: true,
@@ -3179,17 +3262,18 @@ describe("issue 400 managed start, cleanup, deadline, and process seams", () => 
     });
     setRunningProbe(preAborted);
     writeFileSync(preAborted.tokenPath, "pre-abort-token", { mode: 0o600 });
-    const preAbortSignal = {
-      get aborted(): boolean {
-        return (new Error().stack ?? "").includes("runWithDeadline");
-      },
-      addEventListener: vi.fn(),
-      removeEventListener: vi.fn(),
-    } as unknown as AbortSignal;
-    await expect(ensureDaemon(optionsFor(preAborted, { _abortSignal: preAbortSignal }))).resolves.toMatchObject({
+    const prePoolController = new AbortController();
+    preAborted.probe.mockImplementation(async (spec: SupervisorSpec) => {
+      if (vi.mocked(preAborted.seams.fetch).mock.calls.length === 2) prePoolController.abort();
+      return observation(spec, "registered-running-valid", { managerPid: 4242 });
+    });
+    await expect(ensureDaemon(optionsFor(preAborted, { _abortSignal: prePoolController.signal }))).resolves.toMatchObject({
       connected: false,
       refusalReason: "response-auth-failure",
     });
+    expect(prePoolController.signal.aborted).toBe(true);
+    expect(preAborted.seams.fetch).toHaveBeenCalledTimes(2);
+    expect(vi.mocked(preAborted.seams.fetch).mock.calls.some(([url]) => String(url).endsWith("/stats/pool"))).toBe(false);
   });
 
   it("refuses construction failures and probe exceptions, including authorized cleanup no-ops", async () => {
@@ -3319,6 +3403,7 @@ describe("issue 400 lifecycle platform and diagnostic edge seams", () => {
       runner: typeof import("node:child_process").spawnSync,
     ): Promise<unknown> => {
       let alive = true;
+      const killProcess = vi.fn(() => { alive = false; });
       const fetch = sequenceFetch([
         healthy(4242),
         healthy(4242),
@@ -3332,23 +3417,35 @@ describe("issue 400 lifecycle platform and diagnostic edge seams", () => {
         spawnSync: runner,
         fetch,
         isAlive: () => alive,
-        killProcess: () => { alive = false; },
+        killProcess,
       });
+      const ensureReplacement = vi.fn(async () => ({ connected: false, port: fixture.port, spawned: true }));
       writeFileSync(fixture.pidPath, "4242");
       ensureAuthToken(fixture.tokenPath);
-      return restartDaemon({
-        ...optionsFor(fixture, {
-        enforceUserManagerParent: false,
-        _platform: platform,
-        _windowsPowerShellPathOverride: powerShell,
-        _ensureDaemonOverride: async () => ({ connected: false, port: fixture.port, spawned: true }),
-        }),
-      });
+      try {
+        return await restartDaemon({
+          ...optionsFor(fixture, {
+            enforceUserManagerParent: false,
+            _platform: platform,
+            _windowsPowerShellPathOverride: powerShell,
+            _ensureDaemonOverride: ensureReplacement,
+          }),
+        });
+      } finally {
+        if (platform === "win32") {
+          expect(vi.mocked(fetch).mock.calls.every(([, init]) => !new Headers(init?.headers).has("Authorization"))).toBe(true);
+          expect(killProcess).not.toHaveBeenCalled();
+          expect(ensureReplacement).not.toHaveBeenCalled();
+          expect(readFileSync(fixture.pidPath, "utf8")).toBe("4242");
+        }
+      }
     };
     const darwin = createFixture({ platform: "darwin", spawnSync: vi.fn(() => ({ status: 0, stdout: "node lcm daemon start --foreground", stderr: "" })) as never });
     expect(darwin.seams.platform).toBe("darwin");
-    await runRestart("darwin", undefined, darwin.seams.spawnSync);
-    await runRestart("win32", "C:\\Windows\\System32\\WindowsPowerShell\\v1.0\\powershell.exe", vi.fn(() => ({ status: 0, stdout: "node lcm daemon start --foreground", stderr: "" })) as never);
+    await expect(runRestart("darwin", undefined, darwin.seams.spawnSync))
+      .resolves.toMatchObject({ restarted: true, stoppedPid: 4242 });
+    await expect(runRestart("win32", "C:\\Windows\\System32\\WindowsPowerShell\\v1.0\\powershell.exe", vi.fn(() => ({ status: 0, stdout: "node lcm daemon start --foreground", stderr: "" })) as never))
+      .rejects.toThrow("not a verified LCM daemon");
     await expect(runRestart("win32", null, vi.fn(() => ({ status: 0, stdout: "node lcm daemon start --foreground", stderr: "" })) as never))
       .rejects.toThrow("not a verified LCM daemon");
     await expect(runRestart("darwin", undefined, vi.fn(() => { throw new Error("ps unavailable"); }) as never))
@@ -3449,11 +3546,20 @@ describe("issue 400 lifecycle platform and diagnostic edge seams", () => {
     mkdirSync(join(replacement.seams.procRoot, "4343"), { recursive: true });
     writeFileSync(join(replacement.seams.procRoot, "4242", "cmdline"), "node\0lcm\0daemon\0start\0");
     writeFileSync(join(replacement.seams.procRoot, "4343", "cmdline"), "node\0lcm\0daemon\0start\0");
+    // The production SIGTERM grace uses 500ms, then one invalid replacement
+    // poll uses 300ms. Leave 50ms of that same budget for authenticated reuse.
+    const replacementTimers = vi.fn((callback: () => void, delay: number) => setTimeout(callback, delay));
     await expect(ensureDaemon(optionsFor(replacement, {
       enforceUserManagerParent: false,
       _skipSpawn: true,
+      spawnTimeoutMs: 850,
+      _setTimeoutOverride: replacementTimers,
       _listeningPortsOverride: () => [replacement.port],
     }))).resolves.toMatchObject({ connected: true, pid: 4343 });
+    expect(replacement.now()).toBe(800);
+    expect(replacement.seams.fetch).toHaveBeenCalledTimes(5);
+    expect(replacementTimers.mock.calls.every(([, delay]) => delay > 0 && delay <= 850)).toBe(true);
+    expect(replacementTimers.mock.calls.some(([, delay]) => delay === 50)).toBe(true);
 
     for (const cutoff of [4, 5, 6, 7, 8]) {
       let aliveOld = true;

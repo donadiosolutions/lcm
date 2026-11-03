@@ -111,6 +111,7 @@ type DoctorOverrides = Partial<DoctorDeps> & {
 function minimalDeps(overrides: DoctorOverrides = {}): DoctorDeps {
   const { _assertBackendPublication, ...rest } = overrides;
   const base = {
+    _admitDaemonPeerForTesting: () => ({ pid: 4242, birth: "birth" }),
     collectBackendSnapshot: doctorConfigSeams("{}").collectBackendSnapshot,
     existsSync: () => true,
     readFileSync: (path: string) => {
@@ -1676,6 +1677,41 @@ describe("doctor authenticated daemon identity", () => {
   }
   const healthy = DAEMON_OBSERVATION;
 
+  it("refuses an unverified recipient before reading a token or observing HTTP", async () => {
+    const deps = authenticatedDeps(healthy);
+    deps._admitDaemonPeerForTesting = () => null;
+    const read = deps.readFileSync;
+    const tokenReads = vi.fn();
+    deps.readFileSync = (path, encoding) => {
+      if (path.endsWith("daemon.token")) tokenReads();
+      return read(path, encoding);
+    };
+    const results = await runDoctor(deps);
+    expect(results.find(result => result.name === "daemon")).toMatchObject({ status: "fail" });
+    expect(tokenReads).not.toHaveBeenCalled();
+    expect(deps.fetch).not.toHaveBeenCalled();
+  });
+
+  it("bounds a late admission by the original two second observation deadline", async () => {
+    vi.useFakeTimers();
+    const deps = authenticatedDeps(healthy);
+    let resolve!: (peer: { pid: number; birth: string }) => void;
+    deps._admitDaemonPeerForTesting = () => new Promise(done => { resolve = done; });
+    const read = deps.readFileSync;
+    const tokenReads = vi.fn();
+    deps.readFileSync = (path, encoding) => {
+      if (path.endsWith("daemon.token")) tokenReads();
+      return read(path, encoding);
+    };
+    const run = runDoctor(deps);
+    await vi.advanceTimersByTimeAsync(2_000);
+    expect((await run).find(result => result.name === "daemon")).toMatchObject({ status: "fail" });
+    resolve({ pid: 4242, birth: "birth" });
+    await vi.advanceTimersByTimeAsync(0);
+    expect(tokenReads).not.toHaveBeenCalled();
+    expect(deps.fetch).not.toHaveBeenCalled();
+  });
+
   it.each([
     ["version", undefined], ["version", "0.4.0"], ["runtimeDigest", undefined],
     ["runtimeDigest", "foreign-digest"], ["entrypoint", "/private/other-runtime"],
@@ -1788,9 +1824,9 @@ describe("doctor authenticated daemon identity", () => {
     );
   });
 
-  it("does not treat a different observed PID as a mismatch", async () => {
+  it("rejects a response PID different from the admitted OS recipient", async () => {
     const results = await runDoctor(authenticatedDeps({ ...healthy, pid: 99_999 }));
-    expect(results.find(result => result.name === "daemon")).toMatchObject({ status: "pass", message: IDENTITY_VERIFIED_MESSAGE });
+    expect(results.find(result => result.name === "daemon")).toMatchObject({ status: "fail" });
   });
 
   const hostileResponse = {

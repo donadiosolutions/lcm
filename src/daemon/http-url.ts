@@ -86,6 +86,8 @@ export type DaemonJsonRequestOptions = {
   body?: unknown;
   timeoutMs?: number;
   signal?: AbortSignal;
+  /** @internal Recheck the caller's original admission deadline before sending. */
+  _assertCurrent?: () => void;
 };
 
 export type DaemonJsonResponse<T> = {
@@ -334,6 +336,7 @@ export async function daemonJsonResponse<T>(
       return;
     }
     try {
+      options._assertCurrent?.();
       req = request({
         hostname: "127.0.0.1",
         port,
@@ -366,10 +369,14 @@ export async function daemonJsonResponse<T>(
           );
         });
       }
+      options._assertCurrent?.();
       if (json !== undefined) req.write(json);
       req.end();
     } catch (error) {
-      settleFailure(error instanceof Error ? error : new Error("Daemon request failed"));
+      settleFailure(
+        error instanceof Error ? error : new Error("Daemon request failed"),
+        options._assertCurrent !== undefined,
+      );
     }
   });
 }

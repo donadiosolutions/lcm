@@ -1,5 +1,5 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
-import { closeSync, openSync, writeSync } from "node:fs";
+import { closeSync, readFileSync, openSync, writeSync } from "node:fs";
 import {
   mkdir,
   mkdtemp,
@@ -141,7 +141,11 @@ function ensureDaemon(options: EnsureDaemonOptions): ReturnType<typeof ensureDae
     sleep: options._sleepOverride ?? (async () => undefined),
     realpath: options._realpathOverride ?? (path => path),
   };
-  return ensureDaemonProduction({ ...options, _hermeticTestSeams: seams });
+  return ensureDaemonProduction({ ...options, _hermeticTestSeams: seams, _admitDaemonPeerForTesting: options._admitDaemonPeerForTesting ?? (mode => {
+      const pid = mode.kind === "replacement-manager" ? mode.managerPid
+        : Number(readFileSync(options.pidFilePath, "utf8"));
+      return Number.isSafeInteger(pid) && pid > 0 ? { pid, birth: `birth-${pid}` } : null;
+    }) });
 }
 
 describe("mocked lifecycle identity boundaries", () => {
@@ -171,6 +175,7 @@ describe("mocked lifecycle identity boundaries", () => {
         now: () => now,
         sleep: async (ms) => { now += ms; },
         readToken: () => "token",
+        admitPeer: () => ({ pid: process.pid, birth: "birth" }),
         readOwner: () => ({ version: 1, pid: process.pid, processStartTime: "birth", nonce: "a".repeat(32) }),
         processBirth: () => "birth",
         fetch: vi.fn(async () => ({ ok: true, json: async () => ({

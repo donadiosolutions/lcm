@@ -15,6 +15,7 @@ const state = vi.hoisted(() => ({
   post: vi.fn(async () => ({ processed: 1, promoted: 1 })),
   get: vi.fn(async () => ({ totalConnections: 1, activeConnections: 0, idleConnections: 1, connections: [] })),
   health: vi.fn(async () => true),
+  admitPeer: vi.fn<import("../../src/daemon/peer-admission.js").DaemonPeerAdmissionCallback>(() => null),
   observe: vi.fn(async () => null),
   startInvocation: vi.fn(async (target: unknown) => ({ ...target as object, state: "active", activeCount: 0, workCount: 0, commitCount: 0, leaseExpiresAt: null })),
   heartbeatInvocation: vi.fn(async (target: unknown) => ({ ...target as object, state: "active", activeCount: 0, workCount: 0, commitCount: 0, leaseExpiresAt: null })),
@@ -237,6 +238,10 @@ vi.mock("../../src/daemon/client.js", async importOriginal => ({
 } }));
 vi.mock("../../src/daemon/server.js", () => ({ createDaemon: state.createDaemon }));
 vi.mock("../../src/daemon/auth.js", () => ({ ensureAuthToken: vi.fn(), readAuthToken: state.readAuthToken }));
+vi.mock("../../src/daemon/peer-admission.js", async importOriginal => ({
+  ...(await importOriginal<typeof import("../../src/daemon/peer-admission.js")>()),
+  admitCurrentDaemonPeer: (options: { port: number; deadline: number }) => state.admitPeer(options.port, options.deadline),
+}));
 vi.mock("../../src/llm/process-utils.js", async importOriginal => ({
   ...(await importOriginal<typeof import("../../src/llm/process-utils.js")>()),
   readProviderProcessWitnesses: vi.fn(() => {
@@ -409,6 +414,7 @@ beforeEach(() => {
   state.importPatch = { lastResult: { ok: true } };
   state.rendererOptions = undefined;
   state.health.mockResolvedValue(true);
+  state.admitPeer.mockReset().mockReturnValue(null);
   state.observe.mockReset().mockResolvedValue(null);
   state.startInvocation.mockClear();
   state.heartbeatInvocation.mockClear();
@@ -761,8 +767,10 @@ describe("runCli identity boundaries", () => {
 
 describe("runCli lifecycle and connector boundaries", () => {
   it("does not bootstrap the root before an authenticated healthy daemon read", async () => {
+    state.admitPeer.mockImplementation(port => port === 3737 ? { pid: 42, birth: "fixture-birth" } : null);
     state.health.mockResolvedValue({
       status: "ok",
+      pid: 42,
       version: "1.4.2",
       storageBackend: "sqlite",
       entrypoint: "/daemon",

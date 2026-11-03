@@ -9,6 +9,8 @@ export interface CheckResult {
 }
 
 export interface DoctorDeps {
+  /** @internal Deterministic recipient authority for diagnostic tests. */
+  _admitDaemonPeerForTesting?: import("../daemon/peer-admission.js").DaemonPeerAdmissionCallback;
   collectBackendSnapshot: (homeDir: string) => Promise<BackendDiagnosticSnapshot>;
   existsSync: (path: string) => boolean;
   readFileSync: (path: string, encoding: string) => string;

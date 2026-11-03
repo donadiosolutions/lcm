@@ -52,6 +52,7 @@ function makeDeps(options: {
   settingsText?: string;
   pkg?: unknown;
   observations?: Array<unknown>;
+  peerPid?: number;
   exists?: (path: string) => boolean;
   readError?: (path: string) => unknown;
   writeError?: unknown;
@@ -96,6 +97,9 @@ function makeDeps(options: {
     platform: "linux",
     cwd: DOCTOR_CWD,
     managedDaemonPath: options.managedDaemonPath,
+    // Independent fixture authority; never infer admission from observation JSON.
+    _admitDaemonPeerForTesting: (port) => port === 3737
+      ? { pid: options.peerPid ?? 4242, birth: "doctor-fixture-birth" } : null,
     _expectedRuntimeDigestForTesting: "doctor-fixture-digest",
     ...configSeams,
   };
@@ -310,6 +314,7 @@ describe("doctor service coverage", () => {
     const results = await runDoctor(makeDeps({
       config: { llm: { provider: "codex-process" } },
       procEnviron: "PATH=/health-pid/bin:/usr/bin\0",
+      peerPid: 4343,
       readPaths,
       observations: [
         identityObservation({ pid: 4343 }),

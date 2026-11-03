@@ -338,10 +338,10 @@ function writePid(rootPath: string, pid: number): string {
   return path;
 }
 
-function writeProc(rootPath: string, pid: number, parentPid = 1, command = "node lcm daemon start --foreground"): void {
+function writeProc(rootPath: string, pid: number, parentPid = 1, command = "node lcm daemon start --foreground", uid = 1000): void {
   const dir = join(rootPath, String(pid));
   mkdirSync(dir, { recursive: true });
-  writeFileSync(join(dir, "status"), `Name:\tnode\nUid:\t1000\t1000\t1000\t1000\nPPid:\t${parentPid}\n`);
+  writeFileSync(join(dir, "status"), `Name:\tnode\nUid:\t${uid}\t${uid}\t${uid}\t${uid}\nPPid:\t${parentPid}\n`);
   writeFileSync(join(dir, "cmdline"), command.replaceAll(" ", "\0"));
 }
 
@@ -376,7 +376,13 @@ function hermetic(options: EnsureDaemonOptions, environment: NodeJS.ProcessEnv =
   };
   privateDirectory(seams.homeDir);
   for (const directory of [seams.runtimeDir, seams.credentialDir, seams.procRoot]) mkdirSync(directory, { recursive: true });
-  return { ...options, _hermeticTestSeams: seams };
+  return { ...options, _hermeticTestSeams: seams,
+    _admitDaemonPeerForTesting: options._admitDaemonPeerForTesting ?? (mode => {
+      const pid = mode.kind === "replacement-manager" ? mode.managerPid
+        : Number(readFileSync(options.pidFilePath, "utf8"));
+      return Number.isSafeInteger(pid) && pid > 0 ? { pid, birth: `birth-${pid}` } : null;
+    }),
+  };
 }
 
 function ensure(options: EnsureDaemonOptions): ReturnType<typeof ensureDaemonProduction> {
@@ -640,7 +646,6 @@ async function runLegacyFixture(config: LegacyFixtureConfig = {}): Promise<{
   supervisor.discoverLegacySystemdUnits.mockImplementation(async () => {
     if (config.discoveryThrows) throw new Error("legacy discovery failed");
     const result = discoveries[Math.min(discoveryIndex++, discoveries.length - 1)]!;
-    if (config.mutatePidBeforeSecondDiscovery && discoveryIndex === 1) writeFileSync(pidPath, "9999", { mode: 0o600 });
     return result;
   });
   if (config.startBehavior === "throw") supervisor.start.mockRejectedValue(new Error("stable start failed"));
@@ -650,7 +655,15 @@ async function runLegacyFixture(config: LegacyFixtureConfig = {}): Promise<{
     ? null
     : config.authenticatedHealth ?? publicHealth;
   const fetch = vi.fn(async (url: string, init?: RequestInit): Promise<Response> => {
-    if (url.endsWith("/stats/pool")) return response({ totalConnections: 0 }, config.accessStatus ?? 200);
+    if (url.endsWith("/stats/pool")) {
+      if (config.mutatePidBeforeSecondDiscovery) {
+        // Replace only after successful diagnostics, before exact pre-stop PID
+        // validation and its second discovery; admission must first see 4242.
+        renameSync(pidPath, `${pidPath}.authenticated`);
+        writeFileSync(pidPath, "9999", { mode: 0o600 });
+      }
+      return response({ totalConnections: 0 }, config.accessStatus ?? 200);
+    }
     if (!init?.headers && config.publicNoResponse === true) throw new Error("legacy daemon offline");
     const body = init?.headers ? authenticatedHealth : publicHealth;
     return body === null ? response({ status: "warming" }, config.publicStatus ?? 200) : response(body, config.publicStatus ?? 200);
@@ -1860,14 +1873,24 @@ describe("managed restart refusal and repair coverage", () => {
       _monotonicNowOverride: clock,
     }));
 
-    const changed = managedSupervisor((spec, call) => call === 1
+    let diagnosticsCompleted = false;
+    const changed = managedSupervisor((spec) => !diagnosticsCompleted
       ? { kind: "registered-running-valid", managerPid: 200, scopeDigest: spec.scopeDigest, nonce: spec.nonce, name: spec.name }
       : { kind: "ambiguous", reason: "state-conflict", name: spec.name });
     const changedDir = root();
     writePid(changedDir, 200);
     writeFileSync(join(changedDir, "daemon.token"), "token", { mode: 0o600 });
-    const refused = await restart({ ...baseOptions(changedDir), enforceUserManagerParent: true, _isProcessAliveOverride: () => true, _listeningPortsOverride: () => [19_999], _fetchOverride: diagnosticsFetch(health(200), health(200)), _supervisorOverride: changed.supervisor });
+    const changedFetch = vi.fn(async (url: string) => {
+      if (url.endsWith("/stats/pool")) {
+        diagnosticsCompleted = true;
+        return response({ totalConnections: 0 });
+      }
+      return response(health(200));
+    }) as unknown as FetchOverride;
+    const refused = await restart({ ...baseOptions(changedDir), enforceUserManagerParent: true, _isProcessAliveOverride: () => true, _listeningPortsOverride: () => [19_999], _fetchOverride: changedFetch, _supervisorOverride: changed.supervisor });
     expect(refused.refusalReason).toBe("ambiguous");
+    expect(diagnosticsCompleted).toBe(true);
+    expect(changed.stopAndStart).not.toHaveBeenCalled();
   });
 
   it("floors exhausted managed restart admission budgets to zero", async () => {
@@ -2638,12 +2661,16 @@ describe("authenticated legacy generated systemd refusal matrix", () => {
   });
 
   it("refuses a remaining legacy PID path without a scoped test-state seam", async () => {
-    const dir = root("issue-600-legacy-unscoped-cleanup-");
+    const home = root("issue-600-legacy-unscoped-cleanup-");
+    const dir = join(home, ".lcm");
+    privateDirectory(dir);
+    const uid = process.getuid?.() ?? 0;
     const procRoot = join(dir, "proc");
     mkdirSync(procRoot, { recursive: true });
     const pidPath = writePid(dir, 4242);
     writeFileSync(join(dir, "daemon.token"), "legacy-token", { mode: 0o600 });
-    writeProc(procRoot, 4242, 1234, "node lcm daemon start --foreground");
+    writeProc(procRoot, 4242, 1234, "node lcm daemon start --foreground", uid);
+    writeProcListenerEvidence(procRoot, 4242, 19_999);
     let alive = true;
     const candidate = legacyUnit();
     const supervisor = legacyMigrationSupervisor(
@@ -2660,6 +2687,8 @@ describe("authenticated legacy generated systemd refusal matrix", () => {
         expectedVersion: "1.4.2",
         enforceUserManagerParent: true,
         _procRoot: procRoot,
+        _uid: uid,
+        _processStartTimeForTesting: () => "birth-4242",
         _isProcessAliveOverride: () => alive,
         _listeningPortsOverride: () => [19_999],
         _fetchOverride: diagnosticsFetch(health(4242, { version: "1.4.1" })),

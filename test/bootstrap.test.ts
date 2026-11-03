@@ -111,6 +111,7 @@ describe("ensureCore", () => {
       deps: {
         now: () => now,
         sleep: async (ms) => { now += ms; },
+        admitPeer: (port) => port === 3737 ? { pid: process.pid, birth: "birth" } : null,
         readToken: () => "token",
         readOwner: () => ({ version: 1, pid: process.pid, processStartTime: "birth", nonce: "a".repeat(32) }),
         processBirth: () => "birth",

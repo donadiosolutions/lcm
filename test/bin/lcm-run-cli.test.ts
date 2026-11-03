@@ -258,6 +258,10 @@ function fixtureObservationResult(value: unknown): unknown {
   if (typeof value === "object" && "reason" in value) return { kind: "failed", failure: value };
   return { kind: "observed", observation: value };
 }
+vi.mock("../../src/daemon/peer-admission.js", async importOriginal => ({
+  ...await importOriginal<typeof import("../../src/daemon/peer-admission.js")>(),
+  admitCurrentDaemonPeer: vi.fn(() => ({ pid: 42, birth: "birth" })),
+}));
 vi.mock("../../src/daemon/client.js", async importOriginal => {
   const actual = await importOriginal<typeof import("../../src/daemon/client.js")>();
   return {
@@ -441,6 +445,7 @@ function makeTestConvergence(
       now: () => now,
       sleep: async (delayMs: number) => { now += delayMs; },
       readToken: () => "token",
+      admitPeer: () => ({ pid: 42, birth: "birth" }),
       readOwner,
       processBirth: () => "birth",
       lockPath: "/tmp/publication.lock",
@@ -591,6 +596,7 @@ describe("runCli registration and help dispatch", () => {
       identity: { pid: 42, version: "1.4.2", storageBackend: "sqlite", entrypoint: "/daemon", runtimeDigest: "runtime" },
       deps: {
         readToken: () => "token",
+      admitPeer: () => ({ pid: 42, birth: "birth" }),
         readOwner: () => ({ version: 1, pid: 42, processStartTime: "birth", nonce: "a".repeat(32) }),
         processBirth: () => "birth",
         lockPath: "/tmp/publication.lock",
@@ -646,6 +652,7 @@ describe("runCli registration and help dispatch", () => {
       deps: {
         sleep: async () => undefined,
         readToken: () => "token",
+      admitPeer: () => ({ pid: 42, birth: "birth" }),
         readOwner: () => ({ version: 1, pid: 42, processStartTime: "birth", nonce: "a".repeat(32) }),
         processBirth: () => "birth",
         lockPath: "/tmp/publication.lock",
@@ -678,6 +685,7 @@ describe("runCli registration and help dispatch", () => {
         now: () => now,
         sleep: async () => { sleeps += 1; now = sleeps === 1 ? 1_990 : 2_000; },
         readToken: () => "token",
+      admitPeer: () => ({ pid: 42, birth: "birth" }),
         readOwner: () => ({ version: 1, pid: 42, processStartTime: "birth", nonce: "a".repeat(32) }),
         processBirth: () => "birth",
         lockPath: "/tmp/publication.lock",
@@ -1530,7 +1538,8 @@ describe("runCli daemon-backed and utility actions", () => {
     });
     const stdout = vi.spyOn(process.stdout, "write").mockImplementation(() => true);
     expect(await invoke(args)).toBeUndefined();
-    expect(state.observe).toHaveBeenCalledExactlyOnceWith({ timeoutMs: 2000 });
+    expect(state.observe).toHaveBeenCalledExactlyOnceWith({ timeoutMs: expect.any(Number) });
+    expect((state.observe.mock.calls[0]?.[0] as { timeoutMs: number }).timeoutMs).toBeLessThanOrEqual(2000);
     expect(state.health).not.toHaveBeenCalled();
     expect(state.ensureDaemon).not.toHaveBeenCalled();
     expect(state.restartDaemon).not.toHaveBeenCalled();

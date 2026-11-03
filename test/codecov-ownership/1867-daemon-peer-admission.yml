@@ -1,0 +1,20 @@
+references: ["#1867"]
+rationale: >-
+  Keeps local recipient process, private PID, listener and birth admission with
+  service-manager lifecycle ownership, including the extracted existing platform
+  attribution. The CLI, installer, diagnostics, hooks, MCP and publication callers
+  retain their current owners while admitting the recipient before credentials
+  and payloads. No production paths were removed or re-owned.
+pins:
+  - ["bin/lcm.ts", "unit-cli"]
+  - ["installer/install.ts", "unit-installation"]
+  - ["src/daemon/client.ts", "unit-daemon-core"]
+  - ["src/daemon/http-url.ts", "unit-daemon-core"]
+  - ["src/daemon/lifecycle.ts", "integration-service-managers"]
+  - ["src/daemon/peer-admission.ts", "integration-service-managers"]
+  - ["src/daemon/peer-attribution.ts", "integration-service-managers"]
+  - ["src/doctor/doctor.ts", "unit-diagnostics"]
+  - ["src/doctor/types.ts", "unit-diagnostics"]
+  - ["src/hooks/pre-tool.ts", "unit-hooks"]
+  - ["src/mcp/server.ts", "unit-mcp"]
+  - ["src/storage/publication-convergence.ts", "unit-storage-abstractions"]

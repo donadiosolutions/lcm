@@ -3,6 +3,7 @@ import {
   mkdtempSync,
   mkdirSync,
   renameSync,
+  readFileSync,
   rmSync,
   symlinkSync,
   unlinkSync,
@@ -214,6 +215,11 @@ function options(
     expectedEntrypoint: "/opt/lcm.mjs",
     expectedRuntimeDigest: "b".repeat(64),
     _hermeticTestSeams: f.seams,
+    _admitDaemonPeerForTesting: mode => {
+      const pid = mode.kind === "replacement-manager" ? mode.managerPid
+        : Number(readFileSync(f.pidPath, "utf8"));
+      return Number.isSafeInteger(pid) && pid > 0 ? { pid, birth: `birth-${pid}` } : null;
+    },
     _isManagedProcessOverride: () => true,
     ...overrides,
   };
@@ -1878,6 +1884,14 @@ describe("restart publication assertion convergence", () => {
     const pidPath = join(stateDir, "daemon.pid");
     writeFileSync(pidPath, "111", { mode: 0o600 });
     writeFileSync(join(stateDir, "daemon.token"), "production-token", { mode: 0o600 });
+    const procRoot = join(root, "proc");
+    const uid = process.getuid?.() ?? 0;
+    mkdirSync(join(procRoot, "111", "fd"), { recursive: true });
+    mkdirSync(join(procRoot, "net"));
+    writeFileSync(join(procRoot, "111", "status"), `Uid:\t${uid}\t${uid}\t${uid}\t${uid}\nPPid:\t1\n`);
+    writeFileSync(join(procRoot, "111", "cmdline"), "node\0lcm\0daemon\0start\0");
+    symlinkSync("socket:[111]", join(procRoot, "111", "fd", "3"));
+    writeFileSync(join(procRoot, "net", "tcp"), `sl local_address rem_address st tx_queue tr tm->when retrnsmt uid timeout inode\n0: 0100007F:${(43_950).toString(16)} 00000000:0000 0A 0:0 0:0 0 ${uid} 0 111 1\n`);
     const fetch = vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
       if (String(input).endsWith("/stats/pool")) return response({ totalConnections: 0 });
       return response(init?.headers === undefined
@@ -1894,6 +1908,9 @@ describe("restart publication assertion convergence", () => {
         spawnTimeoutMs: 100,
         expectedEntrypoint: "/opt/lcm.mjs",
         _fetchOverride: fetch,
+        _platform: "linux",
+        _uid: uid,
+        _procRoot: procRoot,
         _isProcessAliveOverride: () => true,
         _processStartTimeForTesting: () => "birth-111",
         _readPrivateMutationLockOwnerForTesting: () => ({
@@ -1985,7 +2002,7 @@ describe("restart publication assertion convergence", () => {
     expect(boundedReadCalls[0]?.options.expectedUid).toBe(0);
   });
 
-  it("retains production capture compatibility when process.getuid is unavailable", async () => {
+  it("refuses before bearer access when process.getuid is unavailable", async () => {
     const root = mkdtempSync(join(tmpdir(), "lcm-950-no-getuid-"));
     roots.push(root);
     const stateDir = join(root, ".lcm");
@@ -2021,7 +2038,9 @@ describe("restart publication assertion convergence", () => {
       process.argv[1] = originalEntrypoint;
     }
 
-    expect(fetch).toHaveBeenCalledTimes(3);
+    expect(fetch).toHaveBeenCalledOnce();
+    expect(fetch.mock.calls[0]?.[1]?.headers).toBeUndefined();
+    expect(boundedReadCalls.some(call => call.path.endsWith("daemon.token"))).toBe(false);
     expect(boundedReadCalls).not.toHaveLength(0);
     expect(boundedReadCalls.every(call => call.options.expectedUid === undefined)).toBe(true);
   });
@@ -2856,7 +2875,7 @@ describe("restart publication assertion convergence", () => {
       name: spec.name,
       scopeDigest: spec.scopeDigest,
       nonce: spec.nonce,
-      managerPid: 111,
+      managerPid: phase === "current" ? 111 : 222,
     }));
     const stopAndStart = vi.fn(async (spec: SupervisorSpec) => {
       phase = "replacement";
