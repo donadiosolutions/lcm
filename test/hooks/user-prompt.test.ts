@@ -13,7 +13,7 @@ import * as autoHeal from "../../src/hooks/auto-heal.js";
 import * as eventScrubbing from "../../src/hooks/event-scrubbing.js";
 import * as daemonNotice from "../../src/hooks/daemon-notice.js";
 import * as hookErrors from "../../src/hooks/hook-errors.js";
-import { LegacyHomeMigrationPendingError } from "../../src/runtime-paths.js";
+import { LegacyHomeMigrationPendingError, LegacyHomeMigrationJournalError } from "../../src/runtime-paths.js";
 import { runObservedCodexHook } from "../../src/hooks/codex-hook-receipts.js";
 import {
   BackendPublicationAppendBarrierTimeoutError,
@@ -111,8 +111,9 @@ describe("handleUserPromptSubmit", () => {
     else process.env.CLAUDE_PROJECT_DIR = originalClaudeProjectDir;
   });
 
-  it.each([false, true])("propagates pending migration without logging, repair, or selected consumers (wrapped=%s)", async wrapped => {
-    const pending = new LegacyHomeMigrationPendingError();
+  it.each([false, true].flatMap(wrapped => ["pending", "invalid"].map(type => ({ wrapped, type }))))
+  ("propagates $type migration refusal without logging, repair, or selected consumers (wrapped=$wrapped)", async ({ wrapped, type }) => {
+    const pending = type === "pending" ? new LegacyHomeMigrationPendingError() : new LegacyHomeMigrationJournalError(new Error("parser details"));
     const error = wrapped ? new AggregateError([pending, new Error("cleanup")], "cleanup", { cause: pending }) : pending;
     const append = vi.spyOn(localEnqueue, "appendLocalHookEvents").mockRejectedValueOnce(error);
     const log = vi.spyOn(hookErrors, "safeLogError").mockResolvedValue(undefined);

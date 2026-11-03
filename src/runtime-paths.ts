@@ -80,6 +80,8 @@ export class BootstrapLockContentionError extends Error {}
 
 export const LEGACY_HOME_MIGRATION_PENDING_DIAGNOSTIC =
   "LCM legacy home migration is pending. Finish migration with `lcm install` or session startup, then retry the hook; this event was not captured.";
+export const LEGACY_HOME_MIGRATION_JOURNAL_DIAGNOSTIC =
+  "LCM legacy home migration evidence could not be authenticated. Preserve the journal and state; run `lcm doctor` and resolve the migration evidence before retrying the hook; this event was not captured.";
 
 export class LegacyHomeMigrationPendingError extends Error {
   readonly retryRequired = true;
@@ -90,14 +92,24 @@ export class LegacyHomeMigrationPendingError extends Error {
   }
 }
 
-/** Recognize the refusal through bounded, data-only cleanup causes. */
-export function isLegacyHomeMigrationPendingError(error: unknown): boolean {
+export class LegacyHomeMigrationJournalError extends Error {
+  readonly retryRequired = true;
+
+  constructor(cause: unknown) {
+    super(LEGACY_HOME_MIGRATION_JOURNAL_DIAGNOSTIC, { cause });
+    this.name = "LegacyHomeMigrationJournalError";
+  }
+}
+
+/** Select a static admission diagnostic through bounded, data-only cleanup causes. */
+export function legacyHomeMigrationAdmissionDiagnostic(error: unknown): string | undefined {
   let current = error;
   for (let depth = 0; depth < 16 && current instanceof Error; depth += 1) {
-    if (current instanceof LegacyHomeMigrationPendingError) return true;
+    if (current instanceof LegacyHomeMigrationPendingError) return LEGACY_HOME_MIGRATION_PENDING_DIAGNOSTIC;
+    if (current instanceof LegacyHomeMigrationJournalError) return LEGACY_HOME_MIGRATION_JOURNAL_DIAGNOSTIC;
     current = Object.getOwnPropertyDescriptor(current, "cause")?.value;
   }
-  return false;
+  return undefined;
 }
 
 type BigIntFileStat = Readonly<{
@@ -945,7 +957,12 @@ function readMigrationJournal(homeDir: string): MigrationJournal | null {
 
 /** Called under publication admission, before any mutation of the target tree. */
 export function assertLegacyHomeMigrationAllowsAppend(homeDir: string = homedir()): void {
-  const journal = readMigrationJournal(homeDir);
+  let journal: MigrationJournal | null;
+  try {
+    journal = readMigrationJournal(homeDir);
+  } catch (cause) {
+    throw new LegacyHomeMigrationJournalError(cause);
+  }
   if (journal !== null
     && (journal.phase === "published" || journal.phase === "removing" || journal.phase === "retaining")) {
     throw new LegacyHomeMigrationPendingError();

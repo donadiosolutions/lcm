@@ -10,7 +10,7 @@ import {
   memoryFeedbackInstruction,
 } from "./memory-context.js";
 import type { ConnectorTransport } from "../connectors/types.js";
-import { configPath as defaultConfigPath, daemonPidPath, isLegacyHomeMigrationPendingError, lcmHomeDir } from "../runtime-paths.js";
+import { configPath as defaultConfigPath, daemonPidPath, legacyHomeMigrationAdmissionDiagnostic, lcmHomeDir } from "../runtime-paths.js";
 import { firePromoteEventsNotifyRequest } from "./session-end.js";
 import {
   clearDaemonNotice,
@@ -169,7 +169,7 @@ export async function handleUserPromptSubmit(
         ensureProjectDir(cwd);
       }
     } catch (e) {
-      if (isLegacyHomeMigrationPendingError(e)) throw e;
+      if (legacyHomeMigrationAdmissionDiagnostic(e) !== undefined) throw e;
       if (e instanceof LocalHookDurabilityTimeoutError) throw e;
       if (isBackendPublicationJournalError(e)) {
         if (isBackendPublicationEvidenceMissing(e)) return emptyHookResponse();
@@ -289,7 +289,7 @@ export async function handleUserPromptSubmit(
     const context = buildMemoryContextWithFeedback(hints, ids, selectedTransport);
     return context ? { exitCode: 0, stdout: context } : emptyHookResponse();
   } catch (error) {
-    if (isLegacyHomeMigrationPendingError(error)) throw error;
+    if (legacyHomeMigrationAdmissionDiagnostic(error) !== undefined) throw error;
     if (error instanceof LocalHookDurabilityTimeoutError) throw error;
     if (isBackendPublicationJournalError(error)) {
       if (isBackendPublicationEvidenceMissing(error)) return emptyHookResponse();

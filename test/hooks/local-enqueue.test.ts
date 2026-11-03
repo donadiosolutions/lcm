@@ -10,7 +10,7 @@ import { writeAbortedTerminalPublicationJournal } from "../fixtures/terminal-pub
 import { backendPublicationJournalPath, backendPublicationCanonicalSha256 } from "../../src/storage/backend-publication.js";
 import * as securityFiles from "../../src/security-files.js";
 import * as backendPublication from "../../src/storage/backend-publication.js";
-import { isLegacyHomeMigrationPendingError, LegacyHomeMigrationPendingError } from "../../src/runtime-paths.js";
+import { legacyHomeMigrationAdmissionDiagnostic, LegacyHomeMigrationPendingError, LegacyHomeMigrationJournalError, LEGACY_HOME_MIGRATION_PENDING_DIAGNOSTIC, LEGACY_HOME_MIGRATION_JOURNAL_DIAGNOSTIC } from "../../src/runtime-paths.js";
 
 vi.mock("node:os", async (importOriginal) => {
   const actual = await importOriginal<typeof import("node:os")>();
@@ -46,11 +46,13 @@ describe("appendLocalHookEvents", () => {
     sourceHook: "PostToolUse",
   });
 
-  it.each(["witness", "close"])("preserves pending refusal through root %s cleanup failure", async kind => {
+  it.each(["witness", "close"].flatMap(kind => [false, true].flatMap(wrapped => ["pending", "invalid"].map(type => ({ kind, wrapped, type })))))
+  ("preserves $type refusal through root $kind cleanup failure (wrapped=$wrapped)", async ({ kind, wrapped, type }) => {
     mkdirSync(join(home, ".lcm"), { mode: 0o700 });
-    const pending = new LegacyHomeMigrationPendingError();
+    const primary = type === "pending" ? new LegacyHomeMigrationPendingError() : new LegacyHomeMigrationJournalError(new Error("parser details"));
+    const refusal = wrapped ? new AggregateError([primary], "prior cleanup", { cause: primary }) : primary;
     const cleanup = new Error("root cleanup failed");
-    const barrier = vi.spyOn(backendPublication, "withBackendPublicationAppendBarrierAsync").mockRejectedValueOnce(pending);
+    const barrier = vi.spyOn(backendPublication, "withBackendPublicationAppendBarrierAsync").mockRejectedValueOnce(refusal);
     const originalOpen = securityFiles.openPrivateDirectory;
     const originalAssert = securityFiles.assertPrivateDirectory;
     const open = vi.spyOn(securityFiles, "openPrivateDirectory").mockImplementationOnce(path => {
@@ -66,9 +68,9 @@ describe("appendLocalHookEvents", () => {
     try {
       const caught = await appendLocalHookEvents(input()).catch(error => error);
       expect(caught).toBeInstanceOf(AggregateError);
-      expect(caught.errors).toEqual([pending, cleanup]);
-      expect(caught.cause).toBe(pending);
-      expect(isLegacyHomeMigrationPendingError(caught)).toBe(true);
+      expect(caught.errors).toEqual([refusal, cleanup]);
+      expect(caught.cause).toBe(refusal);
+      expect(legacyHomeMigrationAdmissionDiagnostic(caught)).toBe(type === "pending" ? LEGACY_HOME_MIGRATION_PENDING_DIAGNOSTIC : LEGACY_HOME_MIGRATION_JOURNAL_DIAGNOSTIC);
       expect(existsSync(eventsDbPath(cwd))).toBe(false);
     } finally {
       barrier.mockRestore();

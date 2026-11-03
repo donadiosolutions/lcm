@@ -16,7 +16,7 @@ import * as hookConfig from "../../src/hooks/config.js";
 import { BackendPublicationJournalError } from "../../src/storage/backend-publication.js";
 import { PrivateMutationLockContentionError } from "../../src/private-mutation-lock.js";
 import * as backendPublication from "../../src/storage/backend-publication.js";
-import { LegacyHomeMigrationPendingError } from "../../src/runtime-paths.js";
+import { LegacyHomeMigrationPendingError, LegacyHomeMigrationJournalError } from "../../src/runtime-paths.js";
 import { runObservedCodexHook } from "../../src/hooks/codex-hook-receipts.js";
 
 const FIXED_PUBLICATION_ADMISSION_DIAGNOSTIC =
@@ -116,8 +116,9 @@ describe("handlePostToolUse", () => {
     expect(result.stdout).toBe("");
   });
 
-  it.each([false, true])("propagates pending migration without logging or project writes (wrapped=%s)", async wrapped => {
-    const pending = new LegacyHomeMigrationPendingError();
+  it.each([false, true].flatMap(wrapped => ["pending", "invalid"].map(type => ({ wrapped, type }))))
+  ("propagates $type migration refusal without logging or project writes (wrapped=$wrapped)", async ({ wrapped, type }) => {
+    const pending = type === "pending" ? new LegacyHomeMigrationPendingError() : new LegacyHomeMigrationJournalError(new Error("parser details"));
     const error = wrapped ? new AggregateError([pending, new Error("cleanup")], "cleanup", { cause: pending }) : pending;
     const append = vi.spyOn(localEnqueue, "appendLocalHookEvents").mockRejectedValueOnce(error);
     const log = vi.spyOn(hookErrors, "safeLogError").mockResolvedValue(undefined);

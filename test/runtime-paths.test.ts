@@ -26,7 +26,10 @@ import {
   daemonTokenPath,
   legacyHomeMigrationAwaitsFinish,
   assertLegacyHomeMigrationAllowsAppend,
-  isLegacyHomeMigrationPendingError,
+  legacyHomeMigrationAdmissionDiagnostic,
+  LEGACY_HOME_MIGRATION_PENDING_DIAGNOSTIC,
+  LEGACY_HOME_MIGRATION_JOURNAL_DIAGNOSTIC,
+  LegacyHomeMigrationJournalError,
   LegacyHomeMigrationPendingError,
   legacyLcmHomeDir,
   lcmHomeDir,
@@ -40,6 +43,12 @@ import { processStartTime as trustedProcessStartTime } from "../src/private-muta
 import { appendLocalHookEvents } from "../src/hooks/local-enqueue.js";
 import { runObservedCodexHook } from "../src/hooks/codex-hook-receipts.js";
 import { handlePostToolUse } from "../src/hooks/post-tool.js";
+import { handleUserPromptSubmit } from "../src/hooks/user-prompt.js";
+import * as hookErrors from "../src/hooks/hook-errors.js";
+import * as daemonLifecycle from "../src/daemon/lifecycle.js";
+import { extractUserPromptEvents } from "../src/hooks/extractors.js";
+import * as autoHeal from "../src/hooks/auto-heal.js";
+import * as projectModule from "../src/daemon/project.js";
 import {
   withBackendPublicationAppendBarrier,
   withBackendPublicationAppendBarrierAsync,
@@ -51,6 +60,71 @@ import * as runtimePaths from "../src/runtime-paths.js";
 const homes: string[] = [];
 
 describe("legacy migration append admission", () => {
+  it.each(["post-tool", "user-prompt"].flatMap(command => ["json", "checksum", "mode"].map(kind => ({ command, kind }))))(
+    "propagates $kind legacy evidence failure through full $command capture without writes",
+    async ({ command, kind }) => {
+      const home = makeHome();
+      const active = lcmHomeDir(home);
+      mkdirSync(active, { mode: 0o700 });
+      writeFileSync(join(active, "legacy-data"), "published", { mode: 0o600 });
+      migrationJournal(home, { phase: "published", target: treeWitness(active), ...(kind === "checksum" ? { checksumSha256: "0".repeat(64) } : {}) });
+      const journalPath = join(home, ".lcm-legacy-migration.json");
+      if (kind === "json") writeFileSync(journalPath, "{");
+      if (kind === "mode") chmodSync(journalPath, 0o644);
+      const journal = readFileSync(journalPath);
+      const journalMode = lstatSync(journalPath).mode;
+      const witness = treeWitness(active);
+      const previousHome = process.env.HOME;
+      process.env.HOME = home;
+      const log = vi.spyOn(hookErrors, "safeLogError");
+      const repair = vi.spyOn(autoHeal, "validateAndFixHooks");
+      const project = vi.spyOn(projectModule, "ensureProjectDir");
+      const daemon = vi.spyOn(daemonLifecycle, "ensureDaemon").mockResolvedValue({ connected: false, spawned: false, port: 3737 });
+      const stdin = JSON.stringify({
+        client: "codex", session_id: "migration-session", cwd: home,
+        prompt: "Always use SQLite for storage", tool_name: "AskUserQuestion",
+        tool_input: { question: "Use SQLite?" }, tool_response: "yes",
+      });
+      try {
+        expect(extractUserPromptEvents(JSON.parse(stdin).prompt)).toHaveLength(1);
+        const outcome = await runObservedCodexHook({ client: "codex", command, stdinText: stdin }, () => command === "post-tool"
+          ? handlePostToolUse(stdin)
+          : handleUserPromptSubmit(stdin, undefined, 3737, { backend: "sqlite" }, "cli"))
+          .catch(error => error);
+        expect.soft(outcome).toBeInstanceOf(LegacyHomeMigrationJournalError);
+        expect.soft(outcome).toMatchObject({ retryRequired: true });
+        expect.soft(outcome.message).toBe(LEGACY_HOME_MIGRATION_JOURNAL_DIAGNOSTIC);
+        expect.soft(outcome.cause).toBeInstanceOf(Error);
+        const noEventStdin = JSON.stringify({ client: "codex", session_id: "migration-session", cwd: home, tool_name: "Bash", tool_input: { command: "pwd" }, tool_response: home });
+        await expect(runObservedCodexHook({ client: "codex", command: "post-tool", stdinText: noEventStdin }, () => handlePostToolUse(noEventStdin)))
+          .resolves.toEqual({ exitCode: 0, stdout: "" });
+        expect.soft(log).not.toHaveBeenCalled();
+        expect.soft(repair).not.toHaveBeenCalled();
+        expect.soft(project).not.toHaveBeenCalled();
+        expect.soft(daemon).not.toHaveBeenCalled();
+        expect.soft(treeWitness(active)).toEqual(witness);
+        expect.soft(readFileSync(journalPath)).toEqual(journal);
+        expect.soft(lstatSync(journalPath).mode).toBe(journalMode);
+        expect.soft(existsSync(join(active, "events"))).toBe(false);
+        expect.soft(existsSync(join(active, "state", "codex-hooks"))).toBe(false);
+        expect.soft(existsSync(join(active, ".local-hook-append.lock"))).toBe(false);
+        migrationJournal(home, { phase: "published", target: witness });
+        expect(migrateLegacyHomeIfNeeded(home).migrated).toBe(true);
+        await expect(appendLocalHookEvents({
+          cwd: home, sessionId: "migration-session", sourceHook: command,
+          events: [{ type: "decision", category: "decision", data: "Use SQLite", priority: 1 }],
+        })).resolves.toEqual({ inserted: 1, pendingCount: 1 });
+      } finally {
+        log.mockRestore();
+        repair.mockRestore();
+        project.mockRestore();
+        daemon.mockRestore();
+        if (previousHome === undefined) delete process.env.HOME;
+        else process.env.HOME = previousHome;
+      }
+    },
+  );
+
   it.each(["published", "removing", "retaining"])("refuses every fresh append entry before touching a %s target", async phase => {
     const home = makeHome();
     const active = lcmHomeDir(home);
@@ -92,39 +166,47 @@ describe("legacy migration append admission", () => {
     if (kind === "mode") chmodSync(journalPath, 0o644);
     const witness = treeWitness(active);
     const callback = vi.fn();
-    expect(() => withBackendPublicationAppendBarrier(home, callback)).toThrow();
-    await expect(withBackendPublicationAppendBarrierAsync(home, callback)).rejects.toThrow();
+    expect(() => withBackendPublicationAppendBarrier(home, callback)).toThrow(LegacyHomeMigrationJournalError);
+    await expect(withBackendPublicationAppendBarrierAsync(home, callback)).rejects.toBeInstanceOf(LegacyHomeMigrationJournalError);
     expect(callback).not.toHaveBeenCalled();
     expect(treeWitness(active)).toEqual(witness);
   });
 
   it("recognizes only bounded data causes without invoking accessors", () => {
     const pending = new LegacyHomeMigrationPendingError();
-    expect(pending.retryRequired).toBe(true);
-    expect(pending.name).toBe("LegacyHomeMigrationPendingError");
-    expect(isLegacyHomeMigrationPendingError(pending)).toBe(true);
-    expect(isLegacyHomeMigrationPendingError(new AggregateError([pending], "cleanup", { cause: pending }))).toBe(true);
-    for (const value of [undefined, null, "pending", {}, new Error("ordinary"), { cause: pending }]) {
-      expect(isLegacyHomeMigrationPendingError(value)).toBe(false);
+    const cause = new Error("mutable parser details");
+    const invalid = new LegacyHomeMigrationJournalError(cause);
+    expect(invalid.name).toBe("LegacyHomeMigrationJournalError");
+    expect(invalid.cause).toBe(cause);
+    for (const refusal of [pending, invalid]) {
+      const diagnostic = refusal === pending ? LEGACY_HOME_MIGRATION_PENDING_DIAGNOSTIC : LEGACY_HOME_MIGRATION_JOURNAL_DIAGNOSTIC;
+      expect(refusal.retryRequired).toBe(true);
+      expect(legacyHomeMigrationAdmissionDiagnostic(refusal)).toBe(diagnostic);
+      expect(legacyHomeMigrationAdmissionDiagnostic(new AggregateError([refusal], "cleanup", { cause: refusal }))).toBe(diagnostic);
+      for (const value of [undefined, null, "pending", {}, new Error("ordinary"), { cause: refusal }]) {
+        expect(legacyHomeMigrationAdmissionDiagnostic(value)).toBeUndefined();
+      }
+      let deep: Error = refusal;
+      for (let depth = 0; depth < 15; depth += 1) deep = new Error("wrapper", { cause: deep });
+      expect(legacyHomeMigrationAdmissionDiagnostic(deep)).toBe(diagnostic);
+      expect(legacyHomeMigrationAdmissionDiagnostic(new Error("wrapper", { cause: deep }))).toBeUndefined();
+      const getter = vi.fn(() => refusal);
+      const accessor = Object.defineProperty(new Error("accessor"), "cause", { get: getter });
+      expect(legacyHomeMigrationAdmissionDiagnostic(accessor)).toBeUndefined();
+      expect(getter).not.toHaveBeenCalled();
     }
     const cycle = new Error("cycle");
     Object.defineProperty(cycle, "cause", { value: cycle });
-    expect(isLegacyHomeMigrationPendingError(cycle)).toBe(false);
-    let deep: Error = pending;
-    for (let depth = 0; depth < 16; depth += 1) deep = new Error("wrapper", { cause: deep });
-    expect(isLegacyHomeMigrationPendingError(deep)).toBe(false);
-    const getter = vi.fn(() => pending);
-    const accessor = Object.defineProperty(new Error("accessor"), "cause", { get: getter });
-    expect(isLegacyHomeMigrationPendingError(accessor)).toBe(false);
-    expect(getter).not.toHaveBeenCalled();
+    expect(legacyHomeMigrationAdmissionDiagnostic(cycle)).toBeUndefined();
   });
 
   it.each(["sync", "async"].flatMap(mode => ["restore", "close"].flatMap(cleanup =>
-    ["pending", "ordinary", "success"].map(outcome => ({ mode, cleanup, outcome })),
+    ["pending", "invalid", "ordinary", "success"].map(outcome => ({ mode, cleanup, outcome })),
   )))("preserves $outcome behavior when $mode topology $cleanup fails", async ({ mode, cleanup: kind, outcome }) => {
     const home = makeHome();
     mkdirSync(lcmHomeDir(home), { mode: 0o700 });
     if (outcome === "pending") migrationJournal(home, { phase: "published", target: treeWitness(lcmHomeDir(home)) });
+    if (outcome === "invalid") writeFileSync(join(home, ".lcm-legacy-migration.json"), "{", { mode: 0o600 });
     const cleanup = new Error("topology cleanup failed");
     const ordinary = new Error("ordinary callback failure");
     const close = homeLockTopology.closeHomeLockTopology;
@@ -146,10 +228,10 @@ describe("legacy migration append admission", () => {
         if (mode === "sync") withBackendPublicationAppendBarrier(home, callback);
         else await withBackendPublicationAppendBarrierAsync(home, callback);
       } catch (error) { caught = error; }
-      if (outcome === "pending") {
+      if (outcome === "pending" || outcome === "invalid") {
         expect(caught).toBeInstanceOf(AggregateError);
-        expect(isLegacyHomeMigrationPendingError(caught)).toBe(true);
-        expect((caught as AggregateError).errors).toEqual([expect.any(LegacyHomeMigrationPendingError), cleanup]);
+        expect(legacyHomeMigrationAdmissionDiagnostic(caught)).toBe(outcome === "pending" ? LEGACY_HOME_MIGRATION_PENDING_DIAGNOSTIC : LEGACY_HOME_MIGRATION_JOURNAL_DIAGNOSTIC);
+        expect((caught as AggregateError).errors).toEqual([expect.any(outcome === "pending" ? LegacyHomeMigrationPendingError : LegacyHomeMigrationJournalError), cleanup]);
         expect(callback).not.toHaveBeenCalled();
       } else {
         expect(caught).toBe(cleanup);

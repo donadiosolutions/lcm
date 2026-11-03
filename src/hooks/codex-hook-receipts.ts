@@ -3,7 +3,7 @@
 // Codex persists no hook run history; this record is an observation for doctor, never proof.
 import { mkdirSync } from "node:fs";
 import { join } from "node:path";
-import { assertLegacyHomeMigrationAllowsAppend, isLegacyHomeMigrationPendingError, lcmHomeDir } from "../runtime-paths.js";
+import { assertLegacyHomeMigrationAllowsAppend, legacyHomeMigrationAdmissionDiagnostic, lcmHomeDir } from "../runtime-paths.js";
 import { withBackendPublicationConsumerLock } from "../storage/backend-publication.js";
 import {
   OWNER_ONLY_FILE_MODES,
@@ -153,7 +153,7 @@ export async function runObservedCodexHook<T extends { readonly exitCode: number
   try {
     result = await run();
   } catch (error) {
-    if (isLegacyHomeMigrationPendingError(error)) throw error;
+    if (legacyHomeMigrationAdmissionDiagnostic(error) !== undefined) throw error;
     thrown = { error };
   }
   try {

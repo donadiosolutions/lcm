@@ -55,6 +55,13 @@ compaction) when `LCM_ENABLED=false`; see
   receipt during these phases when a hook extracts no event; that hook keeps
   its ordinary successful return. Ordinary unresolved backend
   publication still permits local capture under its existing admission rules.
+- Unreadable, malformed, or unsafe legacy migration evidence also refuses
+  passive capture with a nonzero, retry-required outcome before any hook log,
+  outbox, project, repair, daemon, or Codex receipt write. The event has not been
+  captured. Preserve the migration journal and state, run `lcm doctor`, and
+  resolve the evidence before retrying. This refusal does not attempt migration
+  or repair. A no-event hook still keeps its original result while skipping a
+  receipt whose legacy evidence cannot be authenticated.
 
 ## Local passive-event durability
 

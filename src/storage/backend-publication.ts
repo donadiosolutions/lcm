@@ -8,7 +8,7 @@ import {
 } from "node:fs";
 import { homedir } from "node:os";
 import { basename, dirname, join, resolve } from "node:path";
-import { assertLegacyHomeMigrationAllowsAppend, isLegacyHomeMigrationPendingError } from "../runtime-paths.js";
+import { assertLegacyHomeMigrationAllowsAppend, legacyHomeMigrationAdmissionDiagnostic } from "../runtime-paths.js";
 import {
   PrivateMutationLockContentionError,
   PrivateMutationPermit,
@@ -1028,7 +1028,7 @@ function withBackendPublicationLock<T>(
   callback: () => T,
 ): T {
   const topology = withUnsafeStorageMapping(() => openHomeLockTopology(homeDir));
-  let pendingError: unknown;
+  let admissionError: unknown;
   try {
     return withPrivateMutationLock(
       backendPublicationLockPath(homeDir),
@@ -1042,7 +1042,7 @@ function withBackendPublicationLock<T>(
       },
     );
   } catch (error) {
-    if (isLegacyHomeMigrationPendingError(error)) pendingError = error;
+    if (legacyHomeMigrationAdmissionDiagnostic(error) !== undefined) admissionError = error;
     throw error;
   } finally {
     try {
@@ -1052,8 +1052,8 @@ function withBackendPublicationLock<T>(
         withUnsafeStorageMapping(() => closeHomeLockTopology(topology));
       }
     } catch (cleanupError) {
-      if (pendingError !== undefined) {
-        throw new AggregateError([pendingError, cleanupError], "legacy migration refusal cleanup failed", { cause: pendingError });
+      if (admissionError !== undefined) {
+        throw new AggregateError([admissionError, cleanupError], "legacy migration refusal cleanup failed", { cause: admissionError });
       }
       throw cleanupError;
     }
@@ -1065,7 +1065,7 @@ async function withBackendPublicationLockAsync<T>(
   callback: () => Promise<T>,
 ): Promise<T> {
   const topology = withUnsafeStorageMapping(() => openHomeLockTopology(homeDir));
-  let pendingError: unknown;
+  let admissionError: unknown;
   try {
     return await withPrivateMutationLockAsync(
       backendPublicationLockPath(homeDir),
@@ -1079,7 +1079,7 @@ async function withBackendPublicationLockAsync<T>(
       },
     );
   } catch (error) {
-    if (isLegacyHomeMigrationPendingError(error)) pendingError = error;
+    if (legacyHomeMigrationAdmissionDiagnostic(error) !== undefined) admissionError = error;
     throw error;
   } finally {
     try {
@@ -1089,8 +1089,8 @@ async function withBackendPublicationLockAsync<T>(
         withUnsafeStorageMapping(() => closeHomeLockTopology(topology));
       }
     } catch (cleanupError) {
-      if (pendingError !== undefined) {
-        throw new AggregateError([pendingError, cleanupError], "legacy migration refusal cleanup failed", { cause: pendingError });
+      if (admissionError !== undefined) {
+        throw new AggregateError([admissionError, cleanupError], "legacy migration refusal cleanup failed", { cause: admissionError });
       }
       throw cleanupError;
     }

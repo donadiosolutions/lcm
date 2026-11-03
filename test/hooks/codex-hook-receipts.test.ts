@@ -9,7 +9,7 @@ import {
   runObservedCodexHook,
 } from "../../src/hooks/codex-hook-receipts.js";
 import { safeLogError } from "../../src/hooks/hook-errors.js";
-import { LegacyHomeMigrationPendingError } from "../../src/runtime-paths.js";
+import { LegacyHomeMigrationPendingError, LegacyHomeMigrationJournalError } from "../../src/runtime-paths.js";
 import { writeAbortedTerminalPublicationJournal } from "../fixtures/terminal-publication-journal.js";
 import { backendPublicationCanonicalSha256, backendPublicationJournalPath } from "../../src/storage/backend-publication.js";
 
@@ -119,8 +119,8 @@ describe("Codex hook receipts", () => {
         utimesSync(recordPath(event), new Date(0), new Date(0));
       }
       const before = snapshot();
-      for (const wrapped of [false, true]) {
-        const pending = new LegacyHomeMigrationPendingError();
+      for (const { wrapped, type } of [false, true].flatMap(wrapped => ["pending", "invalid"].map(type => ({ wrapped, type })))) {
+        const pending = type === "pending" ? new LegacyHomeMigrationPendingError() : new LegacyHomeMigrationJournalError(new Error("parser details"));
         const error = wrapped ? new AggregateError([pending], "cleanup", { cause: pending }) : pending;
         await expect(runObservedCodexHook(observe(command), async () => { throw error; })).rejects.toBe(error);
         expect(snapshot()).toEqual(before);

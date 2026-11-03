@@ -438,15 +438,18 @@ const actualFs = await vi.importActual<typeof import("node:fs")>("node:fs");
 const actualPeer = await vi.importActual<typeof import("../../src/daemon/peer-admission.js")>("../../src/daemon/peer-admission.js");
 const actualRuntimePaths = await vi.importActual<typeof import("../../src/runtime-paths.js")>("../../src/runtime-paths.js");
 
-it.each([false, true])("reports pending legacy migration statically with exit1 (wrapped=%s)", wrapped => {
-  const pending = new actualRuntimePaths.LegacyHomeMigrationPendingError();
+it.each([false, true].flatMap(wrapped => ["pending", "invalid"].map(type => ({ wrapped, type }))))
+("reports $type legacy migration statically with exit1 (wrapped=$wrapped)", ({ wrapped, type }) => {
+  const pending = type === "pending" ? new actualRuntimePaths.LegacyHomeMigrationPendingError()
+    : new actualRuntimePaths.LegacyHomeMigrationJournalError(new Error("mutable parser cause"));
   pending.message = "mutable diagnostic must not be printed";
   const error = wrapped ? new AggregateError([pending], "mutable cleanup", { cause: pending }) : pending;
   const diagnostic = vi.spyOn(console, "error").mockImplementation(() => undefined);
   const stdout = vi.spyOn(process.stdout, "write").mockImplementation(() => true);
   try {
     expect(() => handleCliError(error)).toThrow("exit:1");
-    expect(diagnostic).toHaveBeenCalledExactlyOnceWith(actualRuntimePaths.LEGACY_HOME_MIGRATION_PENDING_DIAGNOSTIC);
+    expect(diagnostic).toHaveBeenCalledExactlyOnceWith(type === "pending"
+      ? actualRuntimePaths.LEGACY_HOME_MIGRATION_PENDING_DIAGNOSTIC : actualRuntimePaths.LEGACY_HOME_MIGRATION_JOURNAL_DIAGNOSTIC);
     expect(stdout).not.toHaveBeenCalled();
   } finally {
     diagnostic.mockRestore();
