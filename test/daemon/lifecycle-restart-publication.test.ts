@@ -22,7 +22,7 @@ import {
   createDaemonLifecycleTestScope,
   type DaemonLifecycleHermeticTestSeams,
 } from "../../src/daemon/lifecycle-scope.js";
-import type { Supervisor, SupervisorObservation, SupervisorSpec } from "../../src/daemon/supervisor.js";
+import { createSupervisorSpec, type Supervisor, type SupervisorObservation, type SupervisorSpec } from "../../src/daemon/supervisor.js";
 import { PrivateMutationLockContentionError } from "../../src/private-mutation-lock.js";
 
 const publicationFsFault = vi.hoisted(() => ({
@@ -1930,6 +1930,236 @@ describe("restart publication assertion convergence", () => {
     expect(boundedReadCalls.every(call => call.options.expectedUid === process.getuid?.())).toBe(true);
   });
 
+  it("refuses a manager scope reached through a different configured state-root pathname before bearer access", async () => {
+    const f = fixture();
+    writeFileSync(f.pidPath, "111", { mode: 0o600 });
+    writeFileSync(f.tokenPath, "current-token", { mode: 0o600 });
+    const aliasHome = join(f.root, "alias-home");
+    mkdirSync(aliasHome);
+    symlinkSync(f.seams.stateDir, join(aliasHome, ".lcm"));
+    const fetch = vi.fn(async () => response(health(111, "1.0.0", "sqlite")));
+    const probe = vi.fn(async (spec: SupervisorSpec): Promise<SupervisorObservation> => ({
+      kind: "registered-running-valid", name: spec.name, scopeDigest: spec.scopeDigest,
+      nonce: spec.nonce, managerPid: 111,
+    }));
+    const supervisor: Supervisor = {
+      probe, start: vi.fn(), stopAndStart: vi.fn(), stopAndAwaitAbsent: vi.fn(),
+    };
+    const originalEntrypoint = process.argv[1];
+    process.argv[1] = "/opt/test-runner.mjs";
+    try {
+      await expect(restartDaemon({
+        port: 43_950,
+        pidFilePath: join(aliasHome, ".lcm", "daemon.pid"),
+        spawnTimeoutMs: 100,
+        expectedVersion: "1.0.0",
+        expectedEntrypoint: "/opt/lcm.mjs",
+        enforceUserManagerParent: true,
+        _platform: "linux",
+        _supervisorOverride: supervisor,
+        _fetchOverride: fetch,
+        _isProcessAliveOverride: () => true,
+        _listeningPortsOverride: () => [43_950],
+        _assertBackendPublication: () => undefined,
+      })).resolves.toMatchObject({ connected: false, restarted: false, refusalReason: "response-auth-failure" });
+    } finally {
+      process.argv[1] = originalEntrypoint;
+    }
+    expect(probe).toHaveBeenCalledOnce();
+    expect(probe.mock.calls[0]?.[0].stateRoot).toBe(f.seams.stateDir);
+    expect(fetch).toHaveBeenCalledOnce();
+    expect(boundedReadCalls.some(call => call.path.endsWith("daemon.token"))).toBe(false);
+    expect(supervisor.stopAndStart).not.toHaveBeenCalled();
+    expect(supervisor.start).not.toHaveBeenCalled();
+  });
+
+  it.each(["port", "state root"] as const)("refuses a replacement handoff bound to a different %s before token access", async mismatch => {
+    const f = fixture();
+    writeFileSync(f.pidPath, "111", { mode: 0o600 });
+    writeFileSync(f.tokenPath, "current-token", { mode: 0o600 });
+    publicationFsFault.tokenPath = f.tokenPath;
+    const otherState = join(f.root, "other-state");
+    mkdirSync(otherState, { mode: 0o700 });
+    const handedOffSpec = createSupervisorSpec({
+      kind: "systemd-user",
+      stateRoot: mismatch === "state root" ? otherState : f.seams.stateDir,
+      port: mismatch === "port" ? 43_951 : 43_950,
+      executable: process.execPath,
+      args: ["/opt/lcm.mjs", "daemon", "start", "--foreground"],
+    });
+    const supervisor: Supervisor = {
+      probe: vi.fn(), start: vi.fn(), stopAndStart: vi.fn(), stopAndAwaitAbsent: vi.fn(),
+    };
+    f.seams.fetch = vi.fn(async () => response(health(111, "2.0.0", "sqlite"))) as never;
+
+    await expect(ensureDaemon(options(f, {
+      _skipSpawn: true,
+      _managedOperationAuthorized: true,
+      _managedOperationManagerPid: 111,
+      _managedOperationSpec: handedOffSpec,
+      _managedOperationSupervisor: supervisor,
+      _listeningPortsOverride: () => [43_950],
+      _assertBackendPublication: () => undefined,
+    }))).resolves.toMatchObject({ connected: false, spawned: false });
+
+    expect(f.seams.fetch).toHaveBeenCalledOnce();
+    expect(publicationFsFault.tokenOpens).toBe(0);
+    expect(supervisor.probe).not.toHaveBeenCalled();
+    expect(f.seams.spawn).not.toHaveBeenCalled();
+    expect(f.seams.killProcess).not.toHaveBeenCalled();
+  });
+
+  it.each(["ensure", "restart"] as const)("refuses an unknown supervisor provider state during %s without token access or mutation", async operation => {
+    const f = fixture();
+    writeFileSync(f.pidPath, "111", { mode: 0o600 });
+    writeFileSync(f.tokenPath, "current-token", { mode: 0o600 });
+    publicationFsFault.tokenPath = f.tokenPath;
+    const supervisor: Supervisor = {
+      probe: vi.fn(async (spec: SupervisorSpec) => ({ kind: "unknown-provider-state", name: spec.name }) as never),
+      start: vi.fn(), stopAndStart: vi.fn(), stopAndAwaitAbsent: vi.fn(),
+    };
+    f.seams.fetch = vi.fn(async () => response(health(111, "2.0.0", "sqlite"))) as never;
+    const invoke = operation === "ensure" ? ensureDaemon : restartDaemon;
+    await expect(invoke(options(f, {
+      enforceUserManagerParent: true,
+      _skipSpawn: true,
+      _supervisorOverride: supervisor,
+      _listeningPortsOverride: () => [43_950],
+      _assertBackendPublication: () => undefined,
+    }))).resolves.toMatchObject({ connected: false, spawned: false });
+
+    expect(f.seams.fetch).toHaveBeenCalledOnce();
+    expect(publicationFsFault.tokenOpens).toBe(0);
+    expect(supervisor.start).not.toHaveBeenCalled();
+    expect(supervisor.stopAndStart).not.toHaveBeenCalled();
+    expect(f.seams.spawn).not.toHaveBeenCalled();
+    expect(f.seams.killProcess).not.toHaveBeenCalled();
+  });
+
+  it("uses real private peer evidence for a replacement-owned publication capture", async () => {
+    const f = fixture();
+    const procRoot = f.seams.procRoot;
+    const uid = f.seams.uid;
+    mkdirSync(join(procRoot, "222", "fd"), { recursive: true });
+    mkdirSync(join(procRoot, "net"));
+    writeFileSync(join(procRoot, "222", "status"), `Uid:\t${uid}\t${uid}\t${uid}\t${uid}\nPPid:\t1\n`);
+    writeFileSync(join(procRoot, "222", "cmdline"), "node\0lcm\0daemon\0start\0");
+    symlinkSync("socket:[222]", join(procRoot, "222", "fd", "3"));
+    writeFileSync(join(procRoot, "net", "tcp"), `sl local_address rem_address st tx_queue tr tm->when retrnsmt uid timeout inode\n0: 0100007F:${(43_950).toString(16)} 00000000:0000 0A 0:0 0:0 0 ${uid} 0 222 1\n`);
+    f.seams.fetch = vi.fn(async (input: RequestInfo | URL) => String(input).endsWith("/stats/pool")
+      ? response({ totalConnections: 0 })
+      : response(health(222, "2.0.0", "sqlite", "/opt/lcm.mjs", "b".repeat(64)))) as never;
+    const ensure = vi.fn(async (ensureOptions: EnsureDaemonOptions) => {
+      writeFileSync(f.pidPath, "222", { mode: 0o600 });
+      writeFileSync(f.tokenPath, "replacement-token", { mode: 0o600 });
+      return { connected: true, port: ensureOptions.port, spawned: true, pid: 222 };
+    });
+    let assertions = 0;
+    const contention = new PrivateMutationLockContentionError("replacement publication remains busy");
+    await expect(restartDaemon(options(f, {
+      _admitDaemonPeerForTesting: undefined,
+      _ensureDaemonOverride: ensure,
+      _processStartTimeForTesting: () => "birth-222",
+      _readPrivateMutationLockOwnerForTesting: () => null,
+      _assertBackendPublication: () => { if (++assertions > 1) throw contention; },
+    }))).rejects.toBe(contention);
+    expect(ensure).toHaveBeenCalledOnce();
+    expect(f.seams.fetch).toHaveBeenCalledTimes(3);
+  });
+
+  it("preserves contention when interruption follows the capture liveness check", async () => {
+    const f = fixture();
+    writeFileSync(f.pidPath, "111", { mode: 0o600 });
+    writeFileSync(f.tokenPath, "current-token", { mode: 0o600 });
+    const controller = new AbortController();
+    f.seams.isProcessAlive = vi.fn(() => { controller.abort(); return true; });
+    const processBirth = vi.fn(() => "birth-111");
+    const contention = new PrivateMutationLockContentionError("interrupted capture");
+    await expect(restartDaemon(options(f, {
+      _abortSignal: controller.signal,
+      _processStartTimeForTesting: processBirth,
+      _assertBackendPublication: () => { throw contention; },
+    }))).rejects.toBe(contention);
+    expect(processBirth).not.toHaveBeenCalled();
+    expect(f.seams.fetch).not.toHaveBeenCalled();
+  });
+
+  it("honors interruption before the pool request subscribes to its abort signal", async () => {
+    const f = fixture();
+    writeFileSync(f.pidPath, "111", { mode: 0o600 });
+    writeFileSync(f.tokenPath, "current-token", { mode: 0o600 });
+    const controller = new AbortController();
+    let authenticatedHealthRead = false;
+    let abortedPoolAttempts = 0;
+    f.seams.fetch = vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
+      if (String(input).endsWith("/stats/pool")) {
+        expect(init?.signal?.aborted).toBe(true);
+        abortedPoolAttempts += 1;
+        throw new Error("request was interrupted before transport");
+      }
+      return {
+        ok: true,
+        status: 200,
+        json: async () => {
+          if (init?.headers !== undefined) authenticatedHealthRead = true;
+          return health(111, "1.0.0", "sqlite", "/opt/lcm.mjs", "a".repeat(64));
+        },
+      } as Response;
+    }) as never;
+    const contention = new PrivateMutationLockContentionError("interrupted access admission");
+    await expect(restartDaemon(options(f, {
+      _abortSignal: controller.signal,
+      _processStartTimeForTesting: () => "birth-111",
+      _setTimeoutOverride: (callback, delayMs) => {
+        const timer = setTimeout(callback, delayMs);
+        if (authenticatedHealthRead) controller.abort();
+        return timer;
+      },
+      _assertBackendPublication: () => { throw contention; },
+    }))).rejects.toBe(contention);
+    expect(abortedPoolAttempts).toBe(1);
+    expect(f.seams.killProcess).not.toHaveBeenCalled();
+  });
+
+  it.each(["recipient birth drift", "birth drift before token", "interruption before fetch"] as const)(
+    "does not reuse captured publication authority after %s",
+    async drift => {
+      const f = fixture();
+      writeFileSync(f.pidPath, "111", { mode: 0o600 });
+      writeFileSync(f.tokenPath, "current-token", { mode: 0o600 });
+      const controller = new AbortController();
+      let retryStarted = false;
+      let retryRecipientProved = false;
+      f.seams.fetch = vi.fn(async (input: RequestInfo | URL) => String(input).endsWith("/stats/pool")
+        ? response({ totalConnections: 0 })
+        : response(health(111, "1.0.0", "sqlite", "/opt/lcm.mjs", "a".repeat(64)))) as never;
+      publicationFsFault.tokenPath = f.tokenPath;
+      const contention = new PrivateMutationLockContentionError("captured daemon still holds publication");
+      await expect(restartDaemon(options(f, {
+        _abortSignal: controller.signal,
+        _admitDaemonPeerForTesting: () => {
+          if (retryStarted) retryRecipientProved = true;
+          return { pid: 111, birth: retryStarted && drift === "recipient birth drift" ? "new-birth" : "birth-111" };
+        },
+        _processStartTimeForTesting: () => {
+          if (retryRecipientProved && drift === "birth drift before token") return "new-birth";
+          if (retryRecipientProved && drift === "interruption before fetch") controller.abort();
+          return "birth-111";
+        },
+        _readPrivateMutationLockOwnerForTesting: () => {
+          retryStarted = true;
+          return { version: 1, pid: 111, processStartTime: "birth-111", nonce: "a".repeat(32) };
+        },
+        _assertBackendPublication: () => { throw contention; },
+      }))).rejects.toBe(contention);
+      expect(retryStarted).toBe(true);
+      expect(retryRecipientProved).toBe(true);
+      expect(f.seams.fetch).toHaveBeenCalledTimes(3);
+      if (drift !== "interruption before fetch") expect(publicationFsFault.tokenOpens).toBe(3);
+      expect(f.seams.killProcess).not.toHaveBeenCalled();
+    },
+  );
+
   it.each([
     ["PID", "pid", 0],
     ["token", "token", 1],
@@ -2200,6 +2430,33 @@ describe("restart publication assertion convergence", () => {
     }))).rejects.toBe(contention);
 
     expect(f.seams.fetch).toHaveBeenCalledOnce();
+  });
+
+  it("preserves contention when a pinned token disappears before authenticated diagnostics", async () => {
+    const f = fixture();
+    writeFileSync(f.pidPath, "111", { mode: 0o600 });
+    writeFileSync(f.tokenPath, "current-token", { mode: 0o600 });
+    publicationFsFault.tokenPath = f.tokenPath;
+    f.seams.fetch = vi.fn(async () => response(health(111, "1.0.0", "sqlite"))) as never;
+    let tokenRemoved = false;
+    const contention = new PrivateMutationLockContentionError("pinned token disappeared");
+
+    await expect(restartDaemon(options(f, {
+      _processStartTimeForTesting: () => "birth-111",
+      _admitDaemonPeerForTesting: () => {
+        if (publicationFsFault.tokenOpens > 0 && !tokenRemoved) {
+          unlinkSync(f.tokenPath);
+          tokenRemoved = true;
+        }
+        return { pid: 111, birth: "birth-111" };
+      },
+      _assertBackendPublication: () => { throw contention; },
+    }))).rejects.toBe(contention);
+
+    expect(tokenRemoved).toBe(true);
+    expect(() => readFileSync(f.tokenPath)).toThrow();
+    expect(f.seams.fetch).toHaveBeenCalledOnce();
+    expect(f.seams.killProcess).not.toHaveBeenCalled();
   });
 
   it("does not probe process birth after PID revalidation observes abort", async () => {

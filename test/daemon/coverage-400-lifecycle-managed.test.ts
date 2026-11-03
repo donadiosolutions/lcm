@@ -894,6 +894,58 @@ describe("issue 400 managed ensure admission matrix", () => {
     expect(authenticated).toHaveBeenCalledOnce();
   });
 
+  it("refuses an admitted child's token witness after caller cancellation", async () => {
+    const controller = new AbortController();
+    const birth = vi.fn(() => "birth");
+    const tokenAfterCancellation: Array<string | null> = [];
+    const fixture = createFixture({
+      platform: "freebsd", isAlive: () => true, spawn: detachedSpawn(),
+      fetch: sequenceFetch([
+        new Error("pre-start offline"),
+        healthy(4242, "/tmp/lcm-daemon-entrypoint.mjs", { runtimeDigest: "a".repeat(64) }),
+        healthy(4242, "/tmp/lcm-daemon-entrypoint.mjs", { runtimeDigest: "a".repeat(64) }),
+        response({}, 200),
+      ]),
+    });
+    const result = await ensureDaemon(optionsFor(fixture, {
+      enforceUserManagerParent: false, _platform: "freebsd", _skipSpawn: false,
+      expectedRuntimeDigest: "a".repeat(64), _processStartTimeForTesting: birth,
+      _abortSignal: controller.signal,
+      _onAuthenticatedDaemonResult: evidence => {
+        expect(evidence.result.connected).toBe(true);
+        controller.abort();
+        const before = birth.mock.calls.length;
+        tokenAfterCancellation.push(evidence.readToken());
+        expect(birth).toHaveBeenCalledTimes(before);
+      },
+    }));
+    expect(tokenAfterCancellation).toEqual([null]);
+    expect(result).toMatchObject({ connected: false, warning: "daemon lifecycle was interrupted" });
+  });
+
+  it("declines readiness when the PID changes after the final managed listener proof", async () => {
+    const fixture = createFixture({ isAlive: () => true, fetch: sequenceFetch([
+      new Error("pre-start offline"), healthy(4242), healthy(4242), response({}, 200),
+    ]) });
+    fixture.probe.mockImplementation(async (spec: SupervisorSpec) => observation(spec,
+      fixture.start.mock.calls.length === 0 ? "absent" : "registered-running-valid", { managerPid: 4242 }));
+    writeFileSync(fixture.tokenPath, "managed-token", { mode: 0o600 });
+    let finalListenerChecks = 0;
+    const result = await ensureDaemon(optionsFor(fixture, {
+      _listeningPortsOverride: () => {
+        if (vi.mocked(fixture.seams.fetch).mock.calls.length === 4 && ++finalListenerChecks === 1) {
+          writeFileSync(fixture.pidPath, "4343");
+        }
+        return [fixture.port];
+      },
+    }));
+    expect(finalListenerChecks).toBe(1);
+    expect(result).toMatchObject({ connected: false, spawned: true, refusalReason: "startup-failure" });
+    expect(fixture.seams.fetch).toHaveBeenCalledTimes(4);
+    expect(fixture.now()).toBe(100);
+    expect(readFileSync(fixture.pidPath, "utf8")).toBe("4343");
+  });
+
   it.each([
     ["expired", 0, false, 2],
     ["whose quarter floors to zero", 3.5, true, 4],

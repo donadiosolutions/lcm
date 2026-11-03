@@ -1,10 +1,11 @@
 import { createServer, type IncomingMessage, type Server, type ServerResponse } from "node:http";
-import { mkdtempSync, readdirSync, readFileSync, rmSync, statSync, writeFileSync } from "node:fs";
+import { mkdirSync, mkdtempSync, readdirSync, readFileSync, rmSync, statSync, symlinkSync, writeFileSync } from "node:fs";
 import type { AddressInfo } from "node:net";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { verifyRunningDaemon, type VerifyRunningDaemonOptions } from "../../src/daemon/lifecycle.js";
+import * as auth from "../../src/daemon/auth.js";
 
 const TOKEN = "verify-token";
 const ENTRYPOINT = "/opt/lcm/dist/lcm.mjs";
@@ -107,6 +108,45 @@ describe("read-only running daemon verification", () => {
     expect(fetchSpy).toHaveBeenCalled();
   });
 
+  it.each([false, true])("uses default OS admission and refuses a foreign process owner: %s", async foreignOwner => {
+    const stateDir = join(dir, ".lcm");
+    const procRoot = join(dir, "proc");
+    const uid = process.getuid?.() ?? 0;
+    mkdirSync(stateDir, { mode: 0o700 });
+    mkdirSync(join(procRoot, String(process.pid), "fd"), { recursive: true });
+    mkdirSync(join(procRoot, "net"));
+    const privatePidPath = join(stateDir, "daemon.pid");
+    writeFileSync(privatePidPath, String(process.pid), { mode: 0o600 });
+    writeFileSync(join(stateDir, "daemon.token"), TOKEN, { mode: 0o600 });
+    writeFileSync(join(procRoot, String(process.pid), "status"), `Uid:\t${foreignOwner ? uid + 1 : uid}\nPPid:\t1\n`);
+    writeFileSync(join(procRoot, String(process.pid), "cmdline"), "node\0lcm\0daemon\0start\0");
+    symlinkSync("socket:[424242]", join(procRoot, String(process.pid), "fd", "3"));
+    writeFileSync(join(procRoot, "net", "tcp"), `sl local_address rem_address st tx_queue tr tm->when retrnsmt uid timeout inode\n0: 0100007F:${port.toString(16)} 00000000:0000 0A 0:0 0:0 0 ${uid} 0 424242 1\n`);
+    const readToken = vi.spyOn(auth, "readAuthToken");
+    const fetchSpy = vi.fn(globalThis.fetch);
+
+    const result = await verifyRunningDaemon(options({
+      pidFilePath: privatePidPath,
+      _admitDaemonPeerForTesting: undefined,
+      _platform: "linux",
+      _procRoot: procRoot,
+      _fetchOverride: fetchSpy,
+    }));
+
+    if (foreignOwner) {
+      expect(result).toBeNull();
+      expect(readToken).not.toHaveBeenCalled();
+      expect(fetchSpy).not.toHaveBeenCalled();
+    } else {
+      // Process birth comes from the actual live server process; no admission
+      // callback or process-birth replacement supplies this proof.
+      expect(result).toEqual({ port, token: TOKEN });
+      expect(readToken).toHaveBeenCalledOnce();
+      expect(fetchSpy.mock.calls.map(([url]) => new URL(String(url)).pathname))
+        .toEqual(["/health", "/health", "/stats/pool"]);
+    }
+  });
+
   it.each([
     ["a missing expected version", { expectedVersion: undefined }],
     ["an empty expected version", { expectedVersion: "" }],
@@ -148,6 +188,120 @@ describe("read-only running daemon verification", () => {
     await expect(verifyRunningDaemon(options())).resolves.toBeNull();
     behavior.publicHealth = () => identity({ status: "starting" });
     await expect(verifyRunningDaemon(options())).resolves.toBeNull();
+  });
+
+  it("refuses unsupported Windows before token access or recipient admission", async () => {
+    const readToken = vi.spyOn(auth, "readAuthToken");
+    const admitPeer = vi.fn(() => ({ pid: process.pid, birth: "birth" }));
+    await expect(verifyRunningDaemon(options({
+      _platform: "win32", _admitDaemonPeerForTesting: admitPeer,
+    }))).resolves.toBeNull();
+    expect(admitPeer).not.toHaveBeenCalled();
+    expect(readToken).not.toHaveBeenCalled();
+  });
+
+  it("refuses an admitted PID that differs from the private PID file before reading the token", async () => {
+    const readToken = vi.spyOn(auth, "readAuthToken");
+    await expect(verifyRunningDaemon(options({
+      _admitDaemonPeerForTesting: () => ({ pid: process.pid + 1, birth: "foreign-birth" }),
+    }))).resolves.toBeNull();
+    expect(readToken).not.toHaveBeenCalled();
+  });
+
+  it("does not start HTTP when the remaining budget expires after token I/O", async () => {
+    const started = performance.now();
+    const clock = vi.spyOn(performance, "now").mockReturnValue(started);
+    vi.spyOn(auth, "readAuthToken").mockImplementation(() => {
+      clock.mockReturnValueOnce(started + 49).mockReturnValue(started + 50);
+      return TOKEN;
+    });
+    const fetchSpy = vi.fn(globalThis.fetch);
+    await expect(verifyRunningDaemon(options({ budgetMs: 50, _fetchOverride: fetchSpy })))
+      .resolves.toBeNull();
+    expect(fetchSpy).not.toHaveBeenCalled();
+  });
+
+  it.each(["authenticated health", "pool access"] as const)("refuses when the original deadline expires after recipient proof before %s", async phase => {
+    const actualNow = performance.now.bind(performance);
+    const clock = vi.spyOn(performance, "now").mockImplementation(actualNow);
+    let publicHealthSeen = false;
+    let authenticatedHealthSeen = false;
+    behavior.publicHealth = () => { publicHealthSeen = true; return identity(); };
+    behavior.authenticatedHealth = () => {
+      authenticatedHealthSeen = true;
+      return identity({ entrypoint: ENTRYPOINT, runtimeDigest: DIGEST });
+    };
+    const targetProof = phase === "authenticated health" ? 3 : 4;
+    let proofs = 0;
+    const deadlines: number[] = [];
+    const fetchSpy = vi.fn(globalThis.fetch);
+
+    await expect(verifyRunningDaemon(options({
+      _fetchOverride: fetchSpy,
+      _admitDaemonPeerForTesting: (_port, deadline) => {
+        deadlines.push(deadline);
+        if (++proofs === targetProof) {
+          expect(publicHealthSeen).toBe(true);
+          expect(authenticatedHealthSeen).toBe(phase === "pool access");
+          // The proof itself completes inside the budget; the next HTTP phase
+          // observes elapsed time at the caller's unchanged absolute deadline.
+          clock.mockReturnValueOnce(deadline - 0.5).mockReturnValue(deadline);
+        }
+        return { pid: process.pid, birth: "birth" };
+      },
+    }))).resolves.toBeNull();
+
+    expect(proofs).toBe(targetProof);
+    expect(new Set(deadlines).size).toBe(1);
+    expect(fetchSpy.mock.calls.map(([url]) => new URL(String(url)).pathname))
+      .toEqual(phase === "authenticated health" ? ["/health"] : ["/health", "/health"]);
+  });
+
+  it("does not authenticate a peer whose PID changes after public health", async () => {
+    let publicHealthSeen = false;
+    behavior.publicHealth = () => { publicHealthSeen = true; return identity(); };
+    const fetchSpy = vi.fn(globalThis.fetch);
+    await expect(verifyRunningDaemon(options({
+      _fetchOverride: fetchSpy,
+      _admitDaemonPeerForTesting: () => ({
+        pid: publicHealthSeen ? process.pid + 1 : process.pid, birth: "birth",
+      }),
+    }))).resolves.toBeNull();
+    expect(fetchSpy).toHaveBeenCalledOnce();
+    expect(fetchSpy.mock.calls[0]?.[1]?.headers).toBeUndefined();
+  });
+
+  it("refuses process-birth drift between token admission and authenticated health", async () => {
+    let publicHealthSeen = false;
+    let authenticatedRecipientProved = false;
+    behavior.publicHealth = () => { publicHealthSeen = true; return identity(); };
+    const fetchSpy = vi.fn(globalThis.fetch);
+    await expect(verifyRunningDaemon(options({
+      _fetchOverride: fetchSpy,
+      _admitDaemonPeerForTesting: () => {
+        const birth = authenticatedRecipientProved ? "reused-pid-birth" : "birth";
+        if (publicHealthSeen) authenticatedRecipientProved = true;
+        return { pid: process.pid, birth };
+      },
+    }))).resolves.toBeNull();
+    expect(fetchSpy).toHaveBeenCalledOnce();
+    expect(fetchSpy.mock.calls[0]?.[1]?.headers).toBeUndefined();
+  });
+
+  it("refuses process-birth drift after authenticated health before pool access", async () => {
+    let authenticatedHealthSeen = false;
+    behavior.authenticatedHealth = () => {
+      authenticatedHealthSeen = true;
+      return identity({ entrypoint: ENTRYPOINT, runtimeDigest: DIGEST });
+    };
+    const fetchSpy = vi.fn(globalThis.fetch);
+    await expect(verifyRunningDaemon(options({
+      _fetchOverride: fetchSpy,
+      _admitDaemonPeerForTesting: () => ({
+        pid: process.pid, birth: authenticatedHealthSeen ? "reused-pid-birth" : "birth",
+      }),
+    }))).resolves.toBeNull();
+    expect(fetchSpy.mock.calls.map(([url]) => new URL(String(url)).pathname)).toEqual(["/health", "/health"]);
   });
 
   it("refuses when the authenticated health disagrees with the public identity", async () => {

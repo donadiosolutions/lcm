@@ -1712,6 +1712,43 @@ describe("doctor authenticated daemon identity", () => {
     expect(deps.fetch).not.toHaveBeenCalled();
   });
 
+  it.each(["after-admission", "after-token"] as const)("refuses expiry %s before observing HTTP", async stage => {
+    const deps = authenticatedDeps(healthy);
+    const realNow = performance.now.bind(performance);
+    const clock = vi.spyOn(performance, "now").mockImplementation(realNow);
+    let deadline = 0;
+    deps._admitDaemonPeerForTesting = (_port, expires) => {
+      deadline = expires;
+      if (stage === "after-admission") {
+        // The helper's final validation fits; the caller's next check expires.
+        clock.mockReturnValue(expires).mockReturnValueOnce(expires - 0.5);
+      }
+      return { pid: 4242, birth: "birth" };
+    };
+    const read = deps.readFileSync;
+    const tokenReads = vi.fn();
+    deps.readFileSync = (path, encoding) => {
+      if (path.endsWith("daemon.token")) {
+        tokenReads();
+        if (stage === "after-token") clock.mockReturnValue(deadline);
+      }
+      return read(path, encoding);
+    };
+    try {
+      const results = await runDoctor(deps);
+      expect(results.find(result => result.name === "daemon")).toMatchObject({
+        status: "fail",
+        message: expect.stringContaining("the daemon did not start responding before the deadline"),
+      });
+      expect(tokenReads).toHaveBeenCalledTimes(stage === "after-token" ? 1 : 0);
+      expect(deps.fetch).not.toHaveBeenCalled();
+      expect(ensureDaemon).not.toHaveBeenCalled();
+      expect(restartDaemon).not.toHaveBeenCalled();
+    } finally {
+      clock.mockRestore();
+    }
+  });
+
   it.each([
     ["version", undefined], ["version", "0.4.0"], ["runtimeDigest", undefined],
     ["runtimeDigest", "foreign-digest"], ["entrypoint", "/private/other-runtime"],

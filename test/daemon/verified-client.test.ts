@@ -72,6 +72,29 @@ describe("verified local daemon client", () => {
     expect(requests).toEqual([]);
   });
 
+  it("derives its private home from an explicit token path when home is omitted", async () => {
+    const client = verifiedLocalDaemonClient(port, join(homeDir, ".lcm", "daemon.token"));
+    await expect(client.get("/stats")).resolves.toMatchObject({ pid: 42 });
+    expect(admitCurrentDaemonPeer).toHaveBeenCalledWith(expect.objectContaining({ port, homeDir }));
+    expect(requests[0]?.authorization).toBe("Bearer test-token");
+  });
+
+  it("refuses a positive sub-millisecond remainder after completed admission", async () => {
+    let now = 0;
+    vi.spyOn(performance, "now").mockImplementation(() => now);
+    const readToken = vi.spyOn(auth, "readAuthToken");
+    const serialize = vi.fn();
+    const client = new DaemonClient(`http://127.0.0.1:${port}`, undefined, (_port, deadline) => {
+      now = deadline - 0.5;
+      return { pid: 42, birth: "birth" };
+    });
+    await expect(client.post("/store", { toJSON: serialize })).rejects.toBeInstanceOf(DaemonPeerRefusalError);
+    expect(readToken).not.toHaveBeenCalled();
+    expect(serialize).not.toHaveBeenCalled();
+    expect(request).not.toHaveBeenCalled();
+    expect(requests).toEqual([]);
+  });
+
   it("preserves closed peer refusal on health and observation", async () => {
     const client = verifiedLocalDaemonClient(port, undefined, homeDir);
     vi.mocked(admitCurrentDaemonPeer).mockReturnValue(null);

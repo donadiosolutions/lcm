@@ -12,6 +12,7 @@ import { StorageBackendUnavailableError } from "../../src/storage/backend.js";
 import { BackendPublicationJournalError } from "../../src/storage/backend-publication.js";
 import { createPublicationConvergence } from "../../src/storage/publication-convergence.js";
 import { readBoundedRegularFile } from "../../src/security-files.js";
+import { admitCurrentDaemonPeer } from "../../src/daemon/peer-admission.js";
 
 const FIXED_PUBLICATION_ADMISSION_DIAGNOSTIC =
   "lcm: backend publication admission blocked; preserve the evidence, run 'lcm doctor', and resolve the authenticated publication before retrying.";
@@ -68,6 +69,8 @@ const state = vi.hoisted(() => ({
   provider: "openai",
   authToken: "test-token" as string | null,
   realObserve: false,
+  realRequests: false,
+  nativePeer: false,
   entries: [] as Array<{ name: string; isDirectory: () => boolean }>,
   exists: true,
   readError: undefined as Error | undefined,
@@ -156,6 +159,7 @@ vi.mock("node:fs", async importOriginal => {
   const actual = await importOriginal<typeof import("node:fs")>();
   const isPrivateFixturePath = (path: unknown): boolean => {
     if (typeof path !== "string") return false;
+    if (state.nativePeer && (path.startsWith(`/proc/${process.pid}/`) || path === "/proc/net/tcp" || path === "/proc/net/tcp6")) return true;
     return state.privateFsRoots.some(root => path === root || path.startsWith(`${root}/`));
   };
   const assertPrivatePidPath = (path: unknown): void => {
@@ -173,6 +177,7 @@ vi.mock("node:fs", async importOriginal => {
   return {
     ...actual,
     readFileSync: vi.fn((path: unknown, ...args: unknown[]) => {
+      if (state.nativePeer && path === `/proc/${process.pid}/cmdline`) return "node\0/opt/lcm.mjs\0daemon\0start\0";
       if (isPrivateFixturePath(path)) {
         return Reflect.apply(actual.readFileSync, actual, [path, ...args]);
       }
@@ -275,9 +280,14 @@ vi.mock("../../src/daemon/client.js", async importOriginal => {
       observeClassified = async (options?: unknown): Promise<unknown> => this.real !== undefined
         ? await this.real.observeClassified(options as never)
         : fixtureObservationResult(await (state.observe as (o?: unknown) => Promise<unknown>)(options));
-      constructor(baseUrl: string, tokenPath?: string) {
+      constructor(baseUrl: string, tokenPath?: string, admitPeer?: ConstructorParameters<typeof actual.DaemonClient>[2]) {
         state.daemonClientInstances++;
-        this.real = state.realObserve ? new actual.DaemonClient(baseUrl, tokenPath) : undefined;
+        this.real = state.realObserve || state.realRequests ? new actual.DaemonClient(baseUrl, tokenPath, admitPeer) : undefined;
+        if (state.realRequests && this.real !== undefined) {
+          this.post = this.real.post.bind(this.real) as typeof state.post;
+          this.get = this.real.get.bind(this.real) as typeof state.get;
+          this.health = this.real.health.bind(this.real) as typeof state.health;
+        }
       }
     },
   };
@@ -425,6 +435,7 @@ const {
   withHookOverrides, writeCliError, writeCliOutput,
 } = await import("../../bin/lcm.js");
 const actualFs = await vi.importActual<typeof import("node:fs")>("node:fs");
+const actualPeer = await vi.importActual<typeof import("../../src/daemon/peer-admission.js")>("../../src/daemon/peer-admission.js");
 const actualRuntimePaths = await vi.importActual<typeof import("../../src/runtime-paths.js")>("../../src/runtime-paths.js");
 const { batchCompact } = await import("../../src/batch-compact.js");
 const { isDaemonTransportFailure } = await import("../../src/daemon/http-url.js");
@@ -526,6 +537,11 @@ beforeEach(() => {
   state.get.mockReset().mockResolvedValue({ backendDiagnostics: state.diagnostics } as never);
   state.authToken = "test-token";
   state.realObserve = false;
+  state.realRequests = false;
+  state.nativePeer = false;
+  vi.mocked(admitCurrentDaemonPeer).mockReset().mockImplementation(async options => state.nativePeer
+    ? await actualPeer.admitCurrentDaemonPeer(options) : { pid: 42, birth: "birth" });
+  state.readAuthToken.mockReset().mockImplementation(() => state.authToken);
   state.installed = [];
   state.codexMcpInspection = { state: "absent" };
   state.storedCodexTransport = undefined;
@@ -1821,6 +1837,88 @@ describe("runCli daemon-backed and utility actions", () => {
       state.runtimeTokenPath = previousRuntime.token;
       actualFs.rmSync(root, { recursive: true, force: true });
     }
+  });
+
+  async function withDefaultAdmissionEndpoint(run: (root: string, routes: string[]) => Promise<void>): Promise<void> {
+    const routes: string[] = [];
+    const server = createServer((request, response) => {
+      request.resume();
+      request.on("end", () => {
+        routes.push(request.url ?? "");
+        response.end(JSON.stringify({ results: [] }));
+      });
+    });
+    await new Promise<void>(resolve => server.listen(0, "127.0.0.1", resolve));
+    const { port } = server.address() as AddressInfo;
+    const { root } = configureCanonicalRestartFixture(JSON.stringify({ daemon: { port } }));
+    state.daemonPort = port;
+    state.nativePeer = true;
+    state.realRequests = true;
+    actualFs.writeFileSync(state.runtimeTokenPath, "test-token", { mode: 0o600 });
+    try { await run(root, routes); }
+    finally {
+      server.closeAllConnections();
+      await new Promise<void>(resolve => server.close(() => resolve()));
+    }
+  }
+
+  it.each([false, true])("uses default fallback recipient admission after ensure (PID published %s)", async publishesPid => {
+    await withDefaultAdmissionEndpoint(async (_root, routes) => {
+      state.ensureDaemon.mockImplementationOnce(async () => {
+        if (publishesPid) actualFs.writeFileSync(state.runtimePidPath, String(process.pid), { mode: 0o600 });
+        return { connected: true, spawned: false, restartedForParent: false, pid: process.pid };
+      });
+      const error = await invoke(["search", "fixture query"], { migrate: vi.fn(), sleep: vi.fn(async () => undefined) });
+      expect(state.ensureDaemon).toHaveBeenCalledOnce();
+      expect(admitCurrentDaemonPeer).toHaveBeenCalledTimes(2);
+      expect(state.post).not.toHaveBeenCalled();
+      if (publishesPid) {
+        expect(error).toBeUndefined();
+        expect(routes).toEqual(["/search"]);
+        expect(state.readAuthToken).toHaveBeenCalledOnce();
+      } else {
+        expect(error).toBeDefined();
+        expect(routes).toEqual([]);
+        expect(state.readAuthToken).not.toHaveBeenCalled();
+      }
+    });
+  });
+
+  it("rechecks the default fast-read recipient after a PID replacement before observation", async () => {
+    await withDefaultAdmissionEndpoint(async (_root, routes) => {
+      actualFs.writeFileSync(state.runtimePidPath, String(process.pid), { mode: 0o600 });
+      state.realObserve = true;
+      state.readAuthToken.mockImplementationOnce(() => {
+        actualFs.unlinkSync(state.runtimePidPath);
+        return "test-token";
+      });
+      expect(await invoke(["status", "--json"])).toBeUndefined();
+      expect(admitCurrentDaemonPeer).toHaveBeenCalledTimes(2);
+      expect(state.readAuthToken).toHaveBeenCalledOnce();
+      expect(state.ensureDaemon).not.toHaveBeenCalled();
+      expect(routes).toEqual([]);
+    });
+  });
+
+  it.each(["before-token", "after-token"] as const)("refuses a fast read whose original deadline expires %s", async stage => {
+    configureCanonicalRestartFixture(JSON.stringify({ daemon: { port: 3737 } }));
+    let now = 0;
+    let deadline = 0;
+    vi.spyOn(performance, "now").mockImplementation(() => now);
+    vi.mocked(admitCurrentDaemonPeer).mockImplementationOnce(async options => {
+      deadline = options.deadline;
+      if (stage === "before-token") now = deadline;
+      return { pid: 42, birth: "birth" };
+    });
+    if (stage === "after-token") state.readAuthToken.mockImplementationOnce(() => {
+      now = deadline - 0.5;
+      return "test-token";
+    });
+    expect(await invoke(["status", "--json"])).toBeUndefined();
+    expect(state.readAuthToken).toHaveBeenCalledTimes(stage === "before-token" ? 0 : 1);
+    expect(state.health).not.toHaveBeenCalled();
+    expect(state.observe).not.toHaveBeenCalled();
+    expect(state.ensureDaemon).not.toHaveBeenCalled();
   });
 
   it("falls back to one authenticated migration when the read fast path cannot authorize", async () => {

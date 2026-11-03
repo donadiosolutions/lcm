@@ -1,0 +1,8 @@
+references: ["#1867"]
+rationale: >-
+  Makes the private diagnostic deadline contract require the absolute expiry
+  already supplied by all five producers. This removes an unreachable renewal
+  fallback without changing valid caller timing or recipient authority. Lifecycle
+  remains in the existing service-manager component; no taxonomy change.
+pins:
+  - ["src/daemon/lifecycle.ts", "integration-service-managers"]
