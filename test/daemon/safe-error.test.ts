@@ -8,6 +8,54 @@ describe("sanitizeError", () => {
     expect(result).not.toContain("/Users/pedro");
   });
 
+  it.each([
+    ["original POSIX whitespace", "open /Users/alice/Client Files/private/db.sqlite", "open <path>"],
+    ["short spaced path", "/a f", "<path>"],
+    ["original Windows whitespace", "open C:\\Users\\alice\\Client Files\\private\\db.sqlite", "open <path>"],
+    ["UNC whitespace", "open \\\\server\\Client Files\\private\\db.sqlite", "open <path>"],
+    ["original Windows stopword", "ENOENT: C:\\Documents and Settings\\Alice\\private.db", "ENOENT: <path>"],
+    ["doubled Windows separators", "ENOENT: C:\\\\Documents and Settings\\\\Alice\\\\private.db", "ENOENT: <path>"],
+    ["original POSIX stopword", "open /srv/Research and Development/Alice/private.db", "open <path>"],
+    ["original bare POSIX stopword", "/srv/Research and Development/Alice/private.db", "<path>"],
+    ["UNC stopword", "open \\\\server\\Research and Development\\Alice\\private.db", "open <path>"],
+    ["tab continuation", "open /srv/Research\tbefore\tDevelopment/Alice/private.db", "open <path>"],
+    ["other stopwords", "open /srv/Research with Development/Alice/private.db", "open <path>"],
+    ["matched bracket", "open /tmp/name[private \t]suffix/private.db", "open <path>"],
+    ["path-owned bracket URI", "open /srv/Client[with https://example.test/path]Files/private.db", "open <path>"],
+    ["path-owned parenthesis URI", "open /srv/Client(with https://example.test/path)Files/private.db", "open <path>"],
+    ["path-owned nested URI", "open /srv/Client[(with [https://example.test/path])]Files/private.db", "open <path>"],
+    ["nested brackets", "open /tmp/name[[private \t]suffix \t]tail/private.db", "open <path>"],
+    ["matched parenthesis", "open /tmp/name(private \t)suffix/private.db", "open <path>"],
+    ["nested parentheses", "open /tmp/name((private \t)suffix \t)tail/private.db", "open <path>"],
+    ["unmatched bracket padding", "open /tmp/x \t]outside", "open <path>]outside"],
+    ["unmatched parenthesis padding", "open /tmp/x \t)outside", "open <path>)outside"],
+    ["punctuation padding", "open /tmp/x \t=> EACCES", "open <path>=> EACCES"],
+    ["quote padding", "open /tmp/x \t'outside'", "open <path>'outside'"],
+    ["line feed", "open /tmp/x private.db \t\noutside", "open <path> \t\noutside"],
+    ["carriage return", "open C:\\tmp\\x private.db \t\r\noutside", "open <path> \t\r\noutside"],
+    ["end padding", "open /tmp/x private.db \t", "open <path> \t"],
+    ["bare POSIX root", "root / and then retried", "root / and then retried"],
+    ["bare repeated POSIX root", "root // and then retried", "root // and then retried"],
+    ["bare Windows root", "root C:\\ and then retried", "root C:\\ and then retried"],
+    ["bare UNC root", "root \\\\ and then retried", "root <path> and then retried"],
+    ["nonpath prose", "operation failed and then retried later.", "operation failed and then retried later."],
+    ["quoted prose", "open '/tmp/Client Files/private.db' and then retried", "open '<path>' and then retried"],
+    ["double quoted prose", 'open "C:\\Client Files\\private.db" and then retried', 'open "<path>" and then retried'],
+    ["independent URL", "open /tmp/x see https://example.test/x?q=public#ok", "open <path> https://example.test/x?q=public#ok"],
+    ["independent URL scheme alphabet", "open /tmp/x \ta+1.-://example.test/x", "open <path> \ta+1.-://example.test/x"],
+    ["wrapped URL", "open /tmp/x see ([https://example.test/x])", "open <path> ([https://example.test/x])"],
+    ["IPv6 URL", "open C:\\tmp\\x see [https://[::1]/x]", "open <path> [https://[::1]/x]"],
+    ["independent URL public query policy", "open /tmp/x see https://example.test/x?next=/Users/alice/Client Files/private.db", "open <path> https://example.test/x?next=/Users/alice/Client Files/private.db"],
+    ["file URL unchanged", "file:///Users/alice/Client Files/private.db", "file://<path> Files/private.db"],
+    ["independent file URL policy", "open /tmp/x file:///Users/alice/Client Files/private.db", "open <path> file://<path> Files/private.db"],
+    ["forced URL span unchanged", "file://remote.invalid[/Users/alice/private.db later", "file://remote.invalid[<path> later"],
+    ["glued URI", "open /tmp/xhttps://example.test/private.db", "open <path>"],
+  ] as const)("redacts ambiguous unquoted whitespace: %s", (_name, input, expected) => {
+    const sanitized = sanitizeError(input);
+    expect(sanitized).toBe(expected);
+    expect(sanitizeError(sanitized)).toBe(sanitized);
+  });
+
   it("strips POSIX paths containing spaces", () => {
     const result = sanitizeError("ENOENT: no such file '/Users/a/My Files/x'");
     expect(result).toBe("ENOENT: no such file '<path>'");
@@ -30,29 +78,29 @@ describe("sanitizeError", () => {
   });
 
   it.each([
-    ["open /home/bcdonadio/.lcm/memory.db => EACCES", "open <path> => EACCES"],
+    ["open /home/bcdonadio/.lcm/memory.db => EACCES", "open <path>=> EACCES"],
     ["/Users/pedro/secret.db#fragment", "<path>#fragment"],
     ["path=/Users/pedro/secret.db&retry=1", "path=<path>&retry=1"],
-    ["glob /Users/pedro/secret* did not match", "glob <path> did not match"],
+    ["glob /Users/pedro/secret* did not match", "glob <path>"],
     ["/Users/pedro/secret.db=1", "<path>=1"],
     ["/Users/pedro/secret.db|retry", "<path>|retry"],
     ["ENOENT /Users/pedro/secret.db\n    at Object.open (/Users/pedro/app.js:1:1)", "ENOENT <path>\n    at Object.open (<path>:1:1)"],
-    ["failed at /var/lib/lcm and then retried later.", "failed at <path> and then retried later."],
-    ["failed at /tmp/x see https://example.test/x", "failed at <path> see https://example.test/x"],
-    ["failed at C:\\tmp\\x see https://example.test/x", "failed at <path> see https://example.test/x"],
+    ["failed at /var/lib/lcm and then retried later.", "failed at <path>"],
+    ["failed at /tmp/x see https://example.test/x", "failed at <path> https://example.test/x"],
+    ["failed at C:\\tmp\\x see https://example.test/x", "failed at <path> https://example.test/x"],
     ["file:///Users/pedro/secret.db", "file://<path>"],
     ["/Users/José/file", "<path>"],
     ["\\\\server\\share\\file", "<path>"],
     ["/tmp/file(copy).db", "<path>"],
     ["open '/tmp/file (copy).db'", "open '<path>'"],
     ["C:\\Users\\a\\secret.db#fragment", "<path>#fragment"],
-    ["C:\\Users\\a\\secret.db\t=> denied", "<path>\t=> denied"],
-    ["open /var/lib/lcm during startup", "open <path> during startup"],
-    ["open /var/lib/lcm when opening", "open <path> when opening"],
-    ["open /var/lib/lcm is missing", "open <path> is missing"],
-    ["open /var/lib/lcm was locked", "open <path> was locked"],
-    ["open /var/lib/lcm failed", "open <path> failed"],
-    ["open //home/alice/private.db failed", "open <path> failed"],
+    ["C:\\Users\\a\\secret.db\t=> denied", "<path>=> denied"],
+    ["open /var/lib/lcm during startup", "open <path>"],
+    ["open /var/lib/lcm when opening", "open <path>"],
+    ["open /var/lib/lcm is missing", "open <path>"],
+    ["open /var/lib/lcm was locked", "open <path>"],
+    ["open /var/lib/lcm failed", "open <path>"],
+    ["open //home/alice/private.db failed", "open <path>"],
     ["root /", "root /"],
     ["root //", "root //"],
     ["open '/Users/a/My Files/x' during startup", "open '<path>' during startup"],
@@ -67,7 +115,7 @@ describe("sanitizeError", () => {
       "failed for https://example.test/x,<path>",
     ],
     ["/tmp/file[1].txt", "<path>"],
-    ["open /tmp/💥payload failed", "open <path> failed"],
+    ["open /tmp/💥payload failed", "open <path>"],
     ["open '/tmp/file\nfailed", "open '<path>\nfailed"],
   ] as const)("sanitizes adversarial path form %#", (input, expected) => {
     expect(sanitizeError(input)).toBe(expected);
@@ -2294,7 +2342,7 @@ describe("sanitizeError", () => {
       "'file://h'['/private']?a/Users/alice&file://two.invalid/Users/b",
       "'file://h'['<path>']?a<path>&file://two.invalid<path>",
     ],
-    ["/Users/a/https://e.test/p | https://public.test/x", "<path> | https://public.test/x"],
+    ["/Users/a/https://e.test/p | https://public.test/x", "<path>| https://public.test/x"],
     ["'/Users/a/https://e.test/p'", "'<path>'"],
     ["/Users/a/file://nested.invalid/p", "<path>"],
     ["/Users/a/file:/nested/p", "<path>"],
@@ -2587,7 +2635,7 @@ describe("sanitizeError", () => {
     ],
     [
       "'file://host' /Users/canary/private.db then see https://example.test/x",
-      "'file://host' <path> then see https://example.test/x",
+      "'file://host' <path> https://example.test/x",
     ],
     [
       '"file://host"/Users/canary/private.db then see https://example.test/x',
@@ -4400,7 +4448,7 @@ describe("sanitizeError", () => {
       [
         "item 7 prose path",
         "error C:\\tmp\\private[https://public.test/x]secret.db failed",
-        "error <path> failed",
+        "error <path>",
       ],
       [
         "item 8 drive wrapper",
@@ -8246,11 +8294,11 @@ describe("sanitizeError", () => {
     expect(sanitizeError(sanitizeError(first))).toBe(first);
   });
 
-  it("clears the query-only nested-file pipe/ampersand handoff at whitespace", () => {
+  it("redacts plain query whitespace before a later nested-file handoff", () => {
     const input =
       "file://h?x=[https://e.test/t&file://host?key=/public whitespace|\\Users\\SECRET\\x]";
     const expected =
-      "file://h?x=[https://e.test/t&file://host?key=<path> whitespace|\\Users\\SECRET\\x]";
+      "file://h?x=[https://e.test/t&file://host?key=<path>|<path>]";
     const first = sanitizeError(input);
 
     expect(first).toBe(expected);
@@ -9079,9 +9127,9 @@ describe("sanitizeError", () => {
           "[file://<path>&[https://o?key=/Users/R2DQ/x]]",
       ],
       [
-        "internal path space",
+        "plain query internal path space",
         inheritedPublicInput("?key=/Users/A/My R2SPACE/x"),
-        inheritedPublicExpected("?key=<path> R2SPACE/x"),
+        inheritedPublicExpected("?key=<path>"),
       ],
       [
         "zero width inside private path",
