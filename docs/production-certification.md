@@ -213,9 +213,12 @@ pnpm run test:certification:gate -- \
   --output-dir /absolute/private/lcm-certification/gate
 ```
 
-The published result is the local-lane `full` run in
+The published result is the local-lane `full` run of commit `bd89074f` in
 [production-certification-gate.md](production-certification-gate.md) and
-`production-certification-gate.json`; the managed lane has no published result yet.
+`production-certification-gate.json`. It covers that commit only. An earlier
+local `full` run under contract v3 aborted with no verdict because of a harness
+defect that was fixed before this run. The managed lane has no published result
+yet, so certification under the contract is not complete.
 
 The gate writer rechecks the execution-time repository digest with the same
 provenance calculation, reuses the cutover rehearsal schema validator, always
