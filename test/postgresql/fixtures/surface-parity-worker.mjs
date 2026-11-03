@@ -317,8 +317,13 @@ async function quiesceReadState() {
 async function closeMcp() {
   const current = mcpClient;
   mcpClient = undefined;
-  await current?.close();
-  await transport?.close();
+  try {
+    await current?.close();
+    await transport?.close();
+  } catch (error) {
+    if (error instanceof Error) error.surfaceMcpStage = 'close';
+    throw error;
+  }
   transport = undefined;
 }
 async function startDirect() {
@@ -385,10 +390,18 @@ async function startBaseline(reusePort, { mcp = true } = {}) {
   });
   mcpErrorBytes = 0;
   mcpClient = new Client({ name: 'surface-parity', version: '1.0.0' });
-  const connecting = mcpClient.connect(transport);
-  transport.stderr?.on('data', bytes => { mcpErrorBytes += bytes.length; });
-  await bounded(connecting, 15000, 'mcp-startup');
-  const tools = (await mcpClient.listTools()).tools;
+  let stage = 'connect';
+  let tools;
+  try {
+    const connecting = mcpClient.connect(transport);
+    transport.stderr?.on('data', bytes => { mcpErrorBytes += bytes.length; });
+    await bounded(connecting, 15000, 'mcp-startup');
+    stage = 'list';
+    tools = (await mcpClient.listTools()).tools;
+  } catch (error) {
+    if (error instanceof Error) error.surfaceMcpStage = stage;
+    throw error;
+  }
   const afterMcp = await context.client.observe();
   assert.equal(afterMcp?.pid, baseline.pid, 'surface-worker:baseline-process-replaced');
   assert.equal(afterMcp?.daemonInstanceId, context.daemonInstanceId, 'surface-worker:baseline-generation-replaced');

@@ -1,14 +1,74 @@
 import assert from "node:assert/strict";
 import { createHash } from "node:crypto";
+import { ErrorCode, McpError } from "@modelcontextprotocol/sdk/types.js";
 import { expect, it, vi } from "vitest";
 import { failure } from "../postgresql/fixtures/surface-parity-failure.mjs";
 import { drainFailureId, isolateAsyncBoundary } from "./async-isolation.mjs";
+
+it("retains real MCP connection and one-level network cause categories without private content", () => {
+  const cause = Object.assign(new TypeError("PRIVATE_CANARY cause"), {
+    code: "ECONNRESET", cause: Object.assign(new Error("PRIVATE_CANARY nested"), { code: "EPIPE" }),
+  });
+  const error = Object.assign(new McpError(ErrorCode.ConnectionClosed, "PRIVATE_CANARY message", { payload: "PRIVATE_CANARY" }), {
+    cause, surfaceMcpStage: "connect", surfacePreparedField: "metadata",
+    surfaceEvidence: { stdoutErrorDigest: "a".repeat(64), stderrDigest: "b".repeat(64) },
+  });
+  error.stack = "PRIVATE_CANARY stack\n at connect (file:///PRIVATE_CANARY/surface-parity-worker.mjs:390:9)";
+  const result = failure(error, "import-collisions");
+  expect(result.id).toContain(":e-McpError:c-mcp-closed:cause-TypeError-reset:mcp-connect");
+  expect(result.id).toContain(":wk390");
+  expect(result.id).toContain(":metadata");
+  expect(result.digest).toBe("a".repeat(64));
+  expect(Object.keys(result)).toEqual(["id", "digest"]);
+  expect(result.id).toMatch(/^[a-zA-Z0-9_.:-]{1,110}$/u);
+  expect(JSON.stringify(result)).not.toMatch(/PRIVATE_CANARY|payload|message|nested|EPIPE|file:/u);
+});
+
+it.each([
+  [ErrorCode.RequestTimeout, "mcp-timeout"], ["ECONNREFUSED", "refused"],
+  ["ECONNRESET", "reset"], ["EPIPE", "pipe"], ["ETIMEDOUT", "timeout"],
+  ["ENOTFOUND", "dns"], ["EAI_AGAIN", "dns-again"],
+  ["ERR_STREAM_DESTROYED", "stream-destroyed"], ["ERR_STREAM_PREMATURE_CLOSE", "stream-close"],
+  ["ERR_SOCKET_CLOSED", "socket-closed"], ["ABORT_ERR", "aborted"],
+])("retains fixed transport code %s", (code, label) => {
+  const error = Object.assign(new Error("PRIVATE_CANARY"), { code });
+  expect(failure(error).id).toContain(`:c-${label}`);
+  expect(failure(error).digest).toBe(createHash("sha256").update(error.message).digest("hex"));
+});
+
+it.each(["connect", "list", "close"])("reserves class, code, cause and %s stage within the existing ID budget", stage => {
+  const error = Object.assign(new McpError(ErrorCode.ConnectionClosed, `surface-worker:${"x".repeat(300)}`), {
+    surfaceMcpStage: stage, surfacePreparedField: "metadata",
+    cause: Object.assign(new SyntaxError("PRIVATE_CANARY"), { code: "ERR_STREAM_DESTROYED" }),
+  });
+  error.message = `surface-worker:${"x".repeat(300)}`;
+  error.stack = " at connect (file:///PRIVATE_CANARY/surface-parity-worker.mjs:100000:9)";
+  const result = failure(error, "import-collisions:call12-before");
+  expect(result.id).toHaveLength(110);
+  expect(result.id).toContain(":err:wk100000");
+  expect(result.id).toContain(`:e-McpError:c-mcp-closed:cause-SyntaxError-stream-destroyed:mcp-${stage}`);
+  expect(result.id).toMatch(/^[a-zA-Z0-9_.:-]{1,110}$/u);
+  expect(result.digest).toBe(createHash("sha256").update(error.message).digest("hex"));
+});
+
+it("omits unknown class, code, cause, stage and payload values", () => {
+  const error = Object.assign(new Error("PRIVATE_CANARY message"), {
+    name: "PRIVATE_CANARY", code: "PRIVATE_CANARY", surfaceMcpStage: "PRIVATE_CANARY",
+    payload: "PRIVATE_CANARY", cause: { name: "PRIVATE_CANARY", code: "PRIVATE_CANARY", message: "PRIVATE_CANARY" },
+    surfaceEvidence: { stderrDigest: "b".repeat(64) },
+  });
+  error.stack = "PRIVATE_CANARY stack";
+  const result = failure(error);
+  expect(result.id).toBe("surface-worker:Error:err:e-Error");
+  expect(result.digest).toBe("b".repeat(64));
+  expect(JSON.stringify(result)).not.toContain("PRIVATE_CANARY");
+});
 
 it("retains a trusted prepared source label and classifies generic errors without raw content", () => {
   const error = new Error("PRIVATE_CANARY stderr SELECT secret FROM private");
   error.stack = `${error.message}\n at validate (file:///PRIVATE_CANARY/prepared-projects.mjs:123:9)`;
   const result = failure(error, "import-collisions:delta");
-  expect(result.id).toBe("import-collisions:delta:Error:err:pp123");
+  expect(result.id).toBe("import-collisions:delta:Error:err:pp123:e-Error");
   expect(result.digest).toBe(createHash("sha256").update(error.message).digest("hex"));
   expect(Object.keys(result)).toEqual(["id", "digest"]);
   expect(JSON.stringify(result)).not.toMatch(/PRIVATE_CANARY|SELECT|stderr|file:|private/u);
@@ -36,7 +96,7 @@ it("omits unknown operators, nonboolean operands and untrusted source frames", (
 it.each(["0", "-1", "1.5", "100001", "9007199254740992"])("refuses an invalid trusted source line %s", line => {
   const error = new Error("PRIVATE_CANARY");
   error.stack = ` at validate (file:///PRIVATE_CANARY/prepared-projects.mjs:${line}:9)`;
-  expect(failure(error, "import-collisions:delta").id).toBe("import-collisions:delta:Error:err");
+  expect(failure(error, "import-collisions:delta").id).toBe("import-collisions:delta:Error:err:e-Error");
 });
 
 it("reserves bounded diagnostic space and preserves the existing failure schema and digest preference", () => {
@@ -45,7 +105,7 @@ it("reserves bounded diagnostic space and preserves the existing failure schema 
   const result = failure(error, "import-collisions:delta");
   expect(result.id).toHaveLength(110);
   expect(result.id).toMatch(/^import-collisions:delta:/u);
-  expect(result.id.endsWith(":err:pj100000")).toBe(true);
+  expect(result.id.endsWith(":err:pj100000:e-Error")).toBe(true);
   expect(result.id).toMatch(/^[a-zA-Z0-9_.:-]{1,110}$/u);
   expect(Object.keys(result)).toEqual(["id", "digest"]);
   const captured = Object.assign(new Error("PRIVATE_CANARY"), {
@@ -53,7 +113,7 @@ it("reserves bounded diagnostic space and preserves the existing failure schema 
   });
   expect(failure(captured).digest).toBe("a".repeat(64));
   const code = Object.assign(new Error("PRIVATE_CANARY"), { code: "EACCES" });
-  expect(failure(code).id).toBe("surface-worker:EACCES:err");
+  expect(failure(code).id).toBe("surface-worker:EACCES:err:e-Error:c-denied");
 });
 
 function fixture() {
