@@ -190,15 +190,15 @@ describe("prompt-search route coverage", () => {
     expect(await call(JSON.stringify({ query: "q", cwd: "/tmp" }))).toEqual({ hints: [] });
   });
 
-  it("honors the disabled prompt-search limit before opening storage", async () => {
+  it.each(["q", "a".repeat(65_537)])("honors the disabled prompt-search limit before opening storage", async (query) => {
     expect(await call(
-      JSON.stringify({ query: "q", cwd: "/tmp" }),
+      JSON.stringify({ query, cwd: "/tmp" }),
       (value) => { value.restoration.promptSearchMaxResults = 0; },
     )).toEqual({ hints: [], ids: [] });
     expect(state.closed).toEqual([]);
   });
 
-  it("admits PostgreSQL storage before returning a disabled empty result", async () => {
+  it.each(["q", "a".repeat(65_537)])("admits PostgreSQL storage before returning a disabled empty result", async (query) => {
     const projectClose = vi.fn(async () => undefined);
     const project = {
       lexicalSearch: { searchPromotedForRecall: vi.fn(async () => ({ candidates: [] })) },
@@ -214,7 +214,7 @@ describe("prompt-search route coverage", () => {
     });
 
     expect(await call(
-      JSON.stringify({ query: "q", cwd: "/tmp" }),
+      JSON.stringify({ query, cwd: "/tmp" }),
       (value) => {
         value.storage = {
           backend: "postgresql",
@@ -239,10 +239,10 @@ describe("prompt-search route coverage", () => {
     expect(state.closed).toEqual([]);
   });
 
-  it("keeps the disabled PostgreSQL response shape when the project is absent", async () => {
+  it.each(["q", "a".repeat(65_537)])("keeps the disabled PostgreSQL response shape when the project is absent", async (query) => {
     state.exists = false;
     expect(await call(
-      JSON.stringify({ query: "q", cwd: "/tmp" }),
+      JSON.stringify({ query, cwd: "/tmp" }),
       (value) => {
         value.storage = {
           backend: "postgresql",
@@ -257,6 +257,27 @@ describe("prompt-search route coverage", () => {
         value.restoration.promptSearchMaxResults = 0;
       },
     )).toEqual({ hints: [], ids: [] });
+  });
+
+  it("retains disabled PostgreSQL admission failures for an oversized query", async () => {
+    const failure = new StorageOperationError("STORAGE_OPERATION_FAILED", "postgresql", "/tmp", "project", "open");
+    state.connectionError = failure;
+    expect(await call(
+      JSON.stringify({ query: "a".repeat(65_537), cwd: "/tmp" }),
+      (value) => {
+        value.storage = {
+          backend: "postgresql",
+          postgresql: {
+            url: "postgresql://user:secret@db.example/lcm",
+            poolMax: 5,
+            connectionTimeoutMs: 10_000,
+            idleTimeoutMs: 30_000,
+            statementTimeoutMs: 60_000,
+          },
+        };
+        value.restoration.promptSearchMaxResults = 0;
+      },
+    )).toEqual(failure.toJSON());
   });
 
   it("closes an opened database after an internal failure", async () => {

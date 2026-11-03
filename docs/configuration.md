@@ -403,10 +403,29 @@ with no positive native matches scores zero.
 
 Recall adds evidence only for the existing selected candidates; it does not widen
 scope or change native order or limits. The candidate window is
-`max(5 * promptSearchMaxResults, 10)` (15 by default). SQLite processes all distinct
-query units and selected IDs in batches of at most 256, without truncating longer
-queries. Work grows with both the distinct query units and selected candidates;
-larger candidate windows and longer prompts require more matching work.
+`max(5 * promptSearchMaxResults, 10)` (15 by default); pre-tool recall first limits
+the effective maximum results to two. Before enabled recall opens project storage
+or performs native tokenization, the complete query must fit these fixed limits:
+
+- 64 KiB of decoded UTF-8 query text.
+- 1,024 ASCII word occurrences (`A-Z`, `a-z`, digits and underscores), including
+  repeated words and stem aliases.
+- A requested candidate window of at most 1,000.
+- At most 65,536 word-occurrence/candidate pairs.
+
+An over-budget query returns HTTP 200 with empty hints, including when debugging
+is requested. It produces no partial recall, truncation, diagnostic logging or
+surfacing feedback. Admitted queries retain their complete original text. These
+limits apply to both backends; ASCII admission words are not PostgreSQL's native
+Unicode lexeme count. Disabled recall retains its existing behavior, including
+PostgreSQL identity and storage admission.
+
+SQLite processes admitted distinct query units and selected IDs in batches of at
+most 256, with at most four evidence queries. The default candidate window permits
+all 1,024 word occurrences and at most 15,360 word-occurrence/candidate pairs.
+These limits bound query-driven amplification; candidate selection still depends
+on stored content and corpus size, including matching-row materialization without
+FTS.
 PostgreSQL uses one statement snapshot for selected contents and evidence under
 its existing statement timeout. Incomplete evidence produces no partial hints:
 SQLite retains its best-effort HTTP 200 response with empty hints and no new
