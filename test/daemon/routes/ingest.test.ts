@@ -27,6 +27,33 @@ describe("POST /ingest", () => {
     }
   });
 
+  it("returns a fixed missing-cwd diagnostic through the HTTP response", async () => {
+    const tempDir = mkdtempSync(join(tmpdir(), "lcm-ingest-missing-cwd-"));
+    tempDirs.push(tempDir);
+    daemon = await createDaemon(loadDaemonConfig("/nonexistent", { daemon: { port: 0 } }));
+
+    for (const relativePath of [
+      "missing-project",
+      "My Files/and then/project",
+      "quoted 'project\"/tail",
+      "line\nbreak/project",
+      "SQLITE_CONSTRAINT: missing table/project",
+    ]) {
+      const response = await fetch(`http://127.0.0.1:${daemon.address().port}/ingest`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          session_id: "missing-cwd",
+          cwd: join(tempDir, relativePath),
+          messages: [],
+        }),
+      });
+
+      expect(response.status).toBe(400);
+      expect(await response.json()).toEqual({ error: "cwd does not exist: <path>" });
+    }
+  });
+
   it("archives scrubbed native records and exact links even when parsed messages were already imported", async () => {
     const cwd = mkdtempSync(join(tmpdir(), "lcm-native-ingest-"));
     tempDirs.push(cwd);

@@ -632,6 +632,14 @@ For PostgreSQL incidents, use the [least-privilege incident diagnostics
 runbook](incident-diagnostics.md) to create the explicitly allowlisted evidence
 bundle and keep provider, credential, quarantine, and recovery sessions private.
 
+- Missing working directories use the fixed `MissingCwdError` message
+  `cwd does not exist: <path>`. The supplied directory is never inserted into
+  this diagnostic, including names with spaces, quotes, newlines, or text that
+  resembles a SQLite error. Daemon routes such as `/ingest` return this message
+  with their existing HTTP `400` response. Recovery-aware callers can still
+  process queued state for an unavailable directory. This producer rule is
+  separate from the generic error sanitizer's whitespace policy below and has
+  no configuration option.
 - The `/describe` and `/expand` compatibility handlers sanitize fallback error
   messages before handing them to the daemon response layer, which sanitizes
   top-level error strings again before serialization. They retain their legacy
