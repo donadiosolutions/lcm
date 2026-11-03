@@ -460,6 +460,42 @@ describe("handleDaemonRequest", () => {
     });
 
     it.each([
+      ["empty value", "{}alpha"],
+      ["nonempty value", "{alpha}bravo"],
+      ["escaped brace prefix", "{alpha}}bravo}charlie"],
+      ["later closing brace", "{alpha}bravo}"],
+      ["punctuation-bearing suffix", "{alpha}.bravo"],
+      ["exclamation-bearing suffix", "{alpha}!bravo"],
+      ["question-bearing suffix", "{alpha}?bravo"],
+      ["repeated punctuation", "{alpha}.. bravo"],
+    ])("fails closed for an adjacent brace suffix after %s", (_label, payloadAndTail) => {
+      const rendered = safeMcpError(new Error(`auth failed: Password=${payloadAndTail}; trailing detail`));
+
+      expect(rendered).toBe("lcm error: auth failed: Password=<redacted>");
+      expect(rendered).not.toMatch(/alpha|bravo|charlie|trailing detail/iu);
+    });
+
+    it.each([
+      ["end of input", "", ""],
+      ["space", " ", "retry later"],
+      ["tab", "\t", "retry later"],
+      ["newline", "\n", "retry later"],
+      ["comma", ",", " retry later"],
+      ["semicolon", ";", " retry later"],
+      ["terminal period", ".", ""],
+      ["terminal exclamation", "!", ""],
+      ["terminal question", "?", ""],
+      ["period before space", ". ", "retry later"],
+      ["exclamation before comma", "!,", " retry later"],
+      ["question before semicolon", "?;", " retry later"],
+    ])("preserves the %s boundary after a brace value", (_label, boundary, tail) => {
+      const rendered = safeMcpError(new Error(`auth failed: Password={alpha}${boundary}${tail}`));
+      const expectedTail = `${boundary}${tail}`.replace(/\s/gu, " ");
+
+      expect(rendered).toBe(`lcm error: auth failed: Password=<redacted>${expectedTail}`);
+    });
+
+    it.each([
       ["PassWord", "PassWord"],
       ["PASSWD", "PASSWD"],
       ["pwd", "pwd"],
@@ -477,11 +513,13 @@ describe("handleDaemonRequest", () => {
     ])("redacts complete and malformed brace assignments for %s", (label, renderedLabel) => {
       const complete = safeMcpError(new Error(`auth failed: ${label}={alpha;bravo,charlie}; retry later`));
       const malformed = safeMcpError(new Error(`auth failed: ${label}={alpha;bravo,charlie; trailing detail`));
+      const adjacent = safeMcpError(new Error(`auth failed: ${label}={}alpha; trailing detail`));
 
       expect(complete).toBe(`lcm error: auth failed: ${renderedLabel}=<redacted>; retry later`);
       expect(complete).not.toMatch(/alpha|bravo|charlie/iu);
       expect(malformed).toBe(`lcm error: auth failed: ${renderedLabel}=<redacted>`);
       expect(malformed).not.toMatch(/alpha|bravo|charlie|trailing detail/iu);
+      expect(adjacent).toBe(`lcm error: auth failed: ${renderedLabel}=<redacted>`);
     });
 
     it("preserves context after brace payloads at the UTF-16 scan limit", () => {

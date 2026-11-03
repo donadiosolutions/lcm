@@ -1,0 +1,6 @@
+references: ["PR #1449"]
+rationale: >-
+  This correction to PR #1449 validates closing brace boundaries in MCP error
+  redaction; src/mcp/server.ts keeps its existing MCP component owner.
+pins:
+  - ["src/mcp/server.ts", "unit-mcp"]
