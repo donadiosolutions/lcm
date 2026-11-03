@@ -37,6 +37,7 @@ import {
   createCiRunnerContainerArgs,
   createDatabaseContainerArgs,
   createHarnessCleanupOperations,
+  createInNetworkEnvironment,
   createOwnerIdentity,
   createProcessLifecycle,
   createRunNames,
@@ -1066,6 +1067,8 @@ describe("PostgreSQL harness utilities", () => {
       volume: `lcm-pg-data-${"a".repeat(20)}`,
       restore: `lcm-pg-restore-${"a".repeat(20)}`,
       runner: `lcm-pg-runner-${"a".repeat(20)}`,
+      machineA: `lcm-pg-machine-a-${"a".repeat(20)}`,
+      machineB: `lcm-pg-machine-b-${"a".repeat(20)}`,
       alias: `lcm-pg-${"a".repeat(20)}.test`,
       wrongAlias: `lcm-pg-wrong-${"a".repeat(20)}.test`,
       controlDatabase: `lcm_harness_${"a".repeat(20)}`,
@@ -1874,6 +1877,8 @@ describe("PostgreSQL harness utilities", () => {
     const records = new Map([
       [`container:${names.restore}`, ownershipLabels(runId, "restore", owner)],
       [`container:${names.runner}`, ownershipLabels(runId, "runner", owner)],
+      [`container:${names.machineA}`, ownershipLabels(runId, "machine-a", owner)],
+      [`container:${names.machineB}`, ownershipLabels(runId, "machine-b", owner)],
       [`container:${names.container}`, ownershipLabels(runId, "database", owner)],
       [`volume:${names.volume}`, ownershipLabels(runId, "data", owner)],
       [`network:${names.network}`, ownershipLabels(runId, "network", owner)],
@@ -1928,6 +1933,8 @@ describe("PostgreSQL harness utilities", () => {
     expect(removals).toEqual([
       `container:${names.restore}`,
       `container:${names.runner}`,
+      `container:${names.machineA}`,
+      `container:${names.machineB}`,
       `container:${names.container}`,
       `volume:${names.volume}`,
       `network:${names.network}`,
@@ -2066,17 +2073,22 @@ describe("PostgreSQL harness utilities", () => {
     ]));
   });
 
-  it.each(["restore", "runner"] as const)(
+  it.each([
+    ["restore", "restore", "a"],
+    ["runner", "runner", "b"],
+    ["machine-a", "machineA", "6"],
+    ["machine-b", "machineB", "7"],
+  ] as const)(
     "preserves an entire stale run when a missing %s worker appears live during the stability barrier",
-    async (workerKind) => {
-      const runId = workerKind === "restore" ? "a".repeat(32) : "b".repeat(32);
+    async (workerKind, workerKey, runCharacter) => {
+      const runId = runCharacter.repeat(32);
       const names = createRunNames(runId);
       const owner = {
-        pid: workerKind === "restore" ? 102 : 103,
-        birth: `linux:12345678-1234-1234-1234-123456789abc:${workerKind === "restore" ? 1020 : 1030}`,
+        pid: 102,
+        birth: "linux:12345678-1234-1234-1234-123456789abc:1020",
         scope: testOwnerScope,
       };
-      const workerName = names[workerKind];
+      const workerName = names[workerKey];
       const records = new Map([
         [`container:${names.container}`, ownershipLabels(runId, "database", owner)],
         [`volume:${names.volume}`, ownershipLabels(runId, "data", owner)],
@@ -2216,14 +2228,18 @@ describe("PostgreSQL harness utilities", () => {
     })).resolves.toBeDefined();
 
     expect(delay).toHaveBeenCalledOnce();
-    expect(events.slice(0, 5)).toEqual([
+    expect(events.slice(0, 9)).toEqual([
       `missing:${names.restore}`,
       `missing:${names.runner}`,
+      `missing:${names.machineA}`,
+      `missing:${names.machineB}`,
       `delay:${ORPHAN_WORKER_STABILITY_DELAY_MS}`,
       `missing:${names.restore}`,
       `missing:${names.runner}`,
+      `missing:${names.machineA}`,
+      `missing:${names.machineB}`,
     ]);
-    expect(events[5]).toBe(`remove:container:${names.container}`);
+    expect(events[9]).toBe(`remove:container:${names.container}`);
   });
 
   it("aborts a stale run when worker state becomes uncertain before reclamation", async () => {
@@ -2944,6 +2960,34 @@ describe("PostgreSQL harness utilities", () => {
     expect(source).toMatch(/createDatabaseContainerArgs\(\{[^}]*\bstagedScripts,/u);
   });
 
+  it("adds certification machine names without changing the existing five resources", () => {
+    const names = createRunNames("a".repeat(32));
+    expect(names).toMatchObject({
+      container: "lcm-pg-aaaaaaaaaaaaaaaaaaaa",
+      network: "lcm-pg-net-aaaaaaaaaaaaaaaaaaaa",
+      volume: "lcm-pg-data-aaaaaaaaaaaaaaaaaaaa",
+      restore: "lcm-pg-restore-aaaaaaaaaaaaaaaaaaaa",
+      runner: "lcm-pg-runner-aaaaaaaaaaaaaaaaaaaa",
+      machineA: "lcm-pg-machine-a-aaaaaaaaaaaaaaaaaaaa",
+      machineB: "lcm-pg-machine-b-aaaaaaaaaaaaaaaaaaaa",
+    });
+  });
+
+  it("derives alias-only PostgreSQL URLs for machine containers", () => {
+    const names = createRunNames("b".repeat(32));
+    const environment = {
+      LCM_TEST_POSTGRES_ADMIN_URL: "postgresql://admin:a%20b@127.0.0.1:49152/db?sslmode=verify-full",
+      LCM_TEST_POSTGRES_RUNTIME_URL: "postgresql://runtime:secret@127.0.0.1:49152/db?sslmode=verify-full",
+      OTHER: "unchanged",
+    };
+    expect(createInNetworkEnvironment(environment, names)).toEqual({
+      ...environment,
+      LCM_TEST_POSTGRES_ADMIN_URL: `postgresql://admin:a%20b@${names.alias}:5432/db?sslmode=verify-full`,
+      LCM_TEST_POSTGRES_RUNTIME_URL: `postgresql://runtime:secret@${names.alias}:5432/db?sslmode=verify-full`,
+      LCM_TEST_POSTGRES_WRONG_HOST: names.wrongAlias,
+    });
+  });
+
   it("stages byte-identical, readable init scripts in the run directory", () => {
     const directory = mkdtempSync(join(tmpdir(), "lcm-postgresql-staged-scripts-"));
     try {
@@ -2974,6 +3018,7 @@ describe("PostgreSQL harness utilities", () => {
       runId: "a".repeat(32),
       directory: "/private/harness",
       sentinelReady: true,
+      includeMachines: true,
     }, {
       removeResource: (type: string, name: string) => { events.push(`remove:${type}:${name}`); },
       verifySentinel: () => { events.push("verify:sentinel"); },
@@ -2983,6 +3028,8 @@ describe("PostgreSQL harness utilities", () => {
     expect(events).toEqual([
       `remove:container:${names.restore}`,
       `remove:container:${names.runner}`,
+      `remove:container:${names.machineA}`,
+      `remove:container:${names.machineB}`,
       "verify:sentinel",
       `remove:container:${names.container}`,
       `remove:volume:${names.volume}`,
@@ -3399,6 +3446,19 @@ describe("PostgreSQL harness utilities", () => {
         redactor.end(),
       ].join("");
       expect(output).toBe("login [REDACTED] ok postgresql://[REDACTED] tail\n");
+    });
+
+    it("preserves JSON syntax while redacting a credential URL", () => {
+      const redactor = createStreamRedactor([])!;
+      const input = `${JSON.stringify([{
+        Config: { Env: ["LCM_POSTGRES_URL=postgresql://user:password@host/db"] },
+      }], null, 2)}\n`;
+      const output = redactor.write(input) + redactor.end();
+
+      expect(JSON.parse(output)[0].Config.Env).toEqual([
+        "LCM_POSTGRES_URL=postgresql://[REDACTED]",
+      ]);
+      expect(output).not.toContain("user:password");
     });
 
     it("decodes multibyte characters split across chunks", () => {

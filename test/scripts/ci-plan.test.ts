@@ -96,6 +96,14 @@ describe("CI plan classification", () => {
     expect(graphInvisibleTests("test/postgresql/surface-parity.integration.ts")).toEqual(["test/surface-parity/worker-admission.test.ts"]);
     expect(graphInvisibleTests("test/postgresql/other.integration.ts")).toEqual([]);
     expect(graphInvisibleTests("test/codecov-ownership/1403-unbound-enumeration.yml")).toEqual(["test/codecov-config.test.ts"]);
+    const certificationTests = [
+      "test/certification/contract.test.ts", "test/certification/evidence.test.ts", "test/certification/gate.test.ts",
+      "test/certification/harness.test.ts", "test/certification/machine-agent.test.ts", "test/certification/round2-acceptance.test.ts",
+    ];
+    for (const file of ["contract-v3.json", "contract-v3.approval.json", "contract-v2.json", "contract-v2.approval.json", "evidence-schema.json"]) {
+      expect(graphInvisibleTests(`test/certification/${file}`)).toEqual(certificationTests);
+    }
+    expect(graphInvisibleTests("test/certification/contract-v4.json")).toEqual([]);
     expect(graphInvisibleTests("src/memory/other.ts")).toEqual([]);
     expect(graphInvisibleTests("package.json")).toEqual([]);
     expect(graphInvisibleTests("docs-old/x.md")).toEqual([]);
@@ -393,6 +401,9 @@ describe("graph-invisible input table completeness", () => {
     "extracted-sources": [/new URL\("(?:\.{1,2}\/)*postgresql\/[^"]+\.ts"/u],
     // Ownership fragments read from disk by the Codecov contract test.
     "codecov-ownership": [/join\(projectRoot, "test", "codecov-ownership"\)/u],
+    "certification-contracts": [
+      /new URL\("\.\/(?:contract-v[23]|evidence-schema)\.json"/u,
+    ],
   };
 
   function* testFiles(directory: string): Generator<string> {

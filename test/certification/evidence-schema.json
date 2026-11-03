@@ -1,0 +1,175 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://donadiosolutions.com/lcm/certification-evidence-v1.schema.json",
+  "type": "object",
+  "required": ["schemaVersion", "contract", "startedAt", "lane", "profile", "withFaults", "provenance", "machines", "faults", "slos", "cleanup", "diagnostics", "verdict"],
+  "additionalProperties": false,
+  "properties": {
+    "schemaVersion": { "const": 1 },
+    "contract": {
+      "type": "object",
+      "required": ["sha256", "status", "approval"],
+      "additionalProperties": false,
+      "properties": {
+        "sha256": { "type": "string", "pattern": "^[0-9a-f]{64}$" },
+        "status": { "const": "approved" },
+        "approval": {
+          "type": "object",
+          "required": ["contractSha256", "approvedAt", "note", "approvalRef", "approvedBy"],
+          "additionalProperties": false,
+          "properties": {
+            "contractSha256": { "type": "string", "pattern": "^[0-9a-f]{64}$" },
+            "approvedAt": { "type": "string", "minLength": 20 },
+            "note": { "type": "string", "minLength": 1 },
+            "approvalRef": { "type": "string", "minLength": 1 },
+            "approvedBy": { "type": "string", "minLength": 1 },
+            "priceSource": { "type": "string", "minLength": 1 }
+          }
+        }
+      }
+    },
+    "startedAt": { "type": "string", "minLength": 20 },
+    "lane": { "enum": ["local", "managed"] },
+    "profile": { "enum": ["smoke", "full"] },
+    "withFaults": { "type": "boolean" },
+    "provenance": {
+      "type": "object",
+      "required": ["testedCommit", "dirty", "testedInputsSha256", "testedInputsCount", "lockfileSha256", "cliSha256", "stagedPackageSha256", "contractSha256", "approvalSha256", "node", "executionHost", "observerSettings"],
+      "additionalProperties": false,
+      "properties": {
+        "testedCommit": { "type": "string", "pattern": "^[0-9a-f]{40}$" },
+        "dirty": { "type": "boolean" },
+        "testedInputsSha256": { "type": "string", "pattern": "^[0-9a-f]{64}$" },
+        "testedInputsCount": { "type": "integer", "minimum": 1 },
+        "lockfileSha256": { "type": "string", "pattern": "^[0-9a-f]{64}$" },
+        "cliSha256": { "type": "string", "pattern": "^[0-9a-f]{64}$" },
+        "stagedPackageSha256": { "type": "string", "pattern": "^[0-9a-f]{64}$" },
+        "contractSha256": { "type": "string", "pattern": "^[0-9a-f]{64}$" },
+        "approvalSha256": { "type": "string", "pattern": "^[0-9a-f]{64}$" },
+        "node": { "type": "string", "minLength": 1 },
+        "executionHost": {
+          "type": "object",
+          "required": ["capturedAt", "osId", "osVersionId", "kernelRelease", "architecture", "cpuModel", "logicalCpus", "totalMemoryBytes", "containerEngine", "containerEngineVersion", "hostnameSha256", "runnerName", "runnerOs", "runnerArch", "runnerSku"],
+          "additionalProperties": false,
+          "properties": {
+            "capturedAt": { "type": "string", "minLength": 20 },
+            "osId": { "type": ["string", "null"], "maxLength": 128 },
+            "osVersionId": { "type": ["string", "null"], "maxLength": 128 },
+            "kernelRelease": { "type": ["string", "null"], "maxLength": 128 },
+            "architecture": { "type": ["string", "null"], "maxLength": 128 },
+            "cpuModel": { "type": ["string", "null"], "maxLength": 128 },
+            "logicalCpus": { "type": "integer", "minimum": 1 },
+            "totalMemoryBytes": { "type": "integer", "minimum": 1 },
+            "containerEngine": { "type": "string", "minLength": 1, "maxLength": 128 },
+            "containerEngineVersion": { "type": ["string", "null"], "maxLength": 128 },
+            "hostnameSha256": { "type": "string", "pattern": "^[0-9a-f]{64}$" },
+            "runnerName": { "type": ["string", "null"], "maxLength": 128 },
+            "runnerOs": { "type": ["string", "null"], "maxLength": 128 },
+            "runnerArch": { "type": ["string", "null"], "maxLength": 128 },
+            "runnerSku": { "type": ["string", "null"], "pattern": "^[A-Za-z0-9][A-Za-z0-9._:/-]{0,127}$" }
+          }
+        },
+        "observerSettings": {
+          "type": "object",
+          "required": ["pollSeconds", "busyTimeoutMs", "perQueryDeadlineMs", "maxPollGapSeconds"],
+          "additionalProperties": false,
+          "properties": {
+            "pollSeconds": { "type": "integer", "minimum": 1 },
+            "busyTimeoutMs": { "type": "integer", "minimum": 1 },
+            "perQueryDeadlineMs": { "type": "integer", "minimum": 1 },
+            "maxPollGapSeconds": { "type": "integer", "minimum": 1 }
+          }
+        }
+      }
+    },
+    "machines": { "type": "array", "minItems": 2, "maxItems": 2, "items": { "$ref": "#/$defs/machine" } },
+    "faults": { "type": "array", "items": { "$ref": "#/$defs/fault" } },
+    "slos": { "type": "array", "minItems": 1, "items": { "$ref": "#/$defs/slo" } },
+    "cleanup": {
+      "type": "object",
+      "required": ["verdict", "residualResources", "labeledContainers", "labeledNetworks", "labeledVolumes", "familyTaggedProviderClusters", "privateRootsAbsent", "ownedProcessesExited", "providerDestroyConfirmedWithinSeconds"],
+      "additionalProperties": false,
+      "properties": {
+        "verdict": { "enum": ["pass", "fail", "incomplete"] },
+        "residualResources": { "type": "integer", "minimum": 0 },
+        "labeledContainers": { "type": "integer", "minimum": 0 },
+        "labeledNetworks": { "type": "integer", "minimum": 0 },
+        "labeledVolumes": { "type": "integer", "minimum": 0 },
+        "familyTaggedProviderClusters": { "type": "integer", "minimum": 0 },
+        "privateRootsAbsent": { "type": "boolean" },
+        "ownedProcessesExited": { "type": "boolean" },
+        "providerDestroyConfirmedWithinSeconds": { "type": "number", "minimum": 0 }
+      }
+    },
+    "diagnostics": {
+      "type": "object",
+      "required": ["databaseGrowth", "submittedPrimaryBytes", "submittedEnvelopeBytes", "truncatedRows", "sweepWitnessSha256"],
+      "additionalProperties": false,
+      "properties": {
+        "databaseGrowth": {
+          "type": "object",
+          "required": ["beforeBytes", "afterBytes", "deltaBytes"],
+          "additionalProperties": false,
+          "properties": {
+            "beforeBytes": { "type": "integer", "minimum": 0 },
+            "afterBytes": { "type": "integer", "minimum": 0 },
+            "deltaBytes": { "type": "integer" }
+          }
+        },
+        "submittedPrimaryBytes": { "type": "integer", "minimum": 0 },
+        "submittedEnvelopeBytes": { "type": "integer", "minimum": 0 },
+        "truncatedRows": { "type": "integer", "minimum": 0 },
+        "sweepWitnessSha256": { "type": "array", "minItems": 2, "maxItems": 2, "items": { "type": "string", "pattern": "^[0-9a-f]{64}$" } }
+      }
+    },
+    "verdict": { "enum": ["pass", "fail", "incomplete"] }
+  },
+  "$defs": {
+    "machine": {
+      "type": "object",
+      "required": ["name", "machineId", "identityKeySha256"],
+      "additionalProperties": false,
+      "properties": {
+        "name": { "enum": ["a", "b"] },
+        "machineId": { "type": "string", "pattern": "^[0-9a-f-]{36}$" },
+        "identityKeySha256": { "type": "string", "pattern": "^[0-9a-f]{64}$" }
+      }
+    },
+    "fault": {
+      "type": "object",
+      "required": ["id", "kind", "target", "requestedAt", "appliedAt", "clearedAt", "recoveredAt"],
+      "additionalProperties": false,
+      "properties": {
+        "id": { "type": "string", "minLength": 1 },
+        "kind": { "enum": ["partition-machine", "restart-database"] },
+        "target": { "type": "string", "minLength": 1 },
+        "requestedAt": { "type": "string", "minLength": 20 },
+        "appliedAt": { "type": "string", "minLength": 20 },
+        "clearedAt": { "type": "string", "minLength": 20 },
+        "recoveredAt": { "type": "string", "minLength": 20 }
+      }
+    },
+    "slo": {
+      "type": "object",
+      "required": ["id", "formula", "inputs", "threshold", "observed", "verdict"],
+      "additionalProperties": false,
+      "properties": {
+        "id": { "type": "string", "minLength": 1 },
+        "formula": { "type": "string", "minLength": 1 },
+        "inputs": {
+          "type": "object",
+          "required": ["count", "sampleFile", "sampleSha256"],
+          "additionalProperties": false,
+          "properties": {
+            "count": { "type": "integer", "minimum": 0 },
+            "sampleFile": { "type": "string", "pattern": "^[A-Za-z0-9_.-]+$" },
+            "sampleSha256": { "type": "string", "pattern": "^[0-9a-f]{64}$" }
+          }
+        },
+        "threshold": { "type": "number" },
+        "observed": { "type": "number" },
+        "verdict": { "enum": ["pass", "fail", "incomplete"] }
+      }
+    }
+  }
+}

@@ -1,0 +1,289 @@
+{
+  "$comment": "Contract v3 DRAFT for user approval. Only change from approved v2 (sha256 6dc8cef4...): workload.primaryTextBytesCycle largest size 8192 -> 6144, because main PR #1780 now drops hook events whose data+tags exceed 8192 characters (the 8192-byte post-tool fixture produced 8202). No certification evidence collected under v1 or v2.",
+  "id": "lcm-production-certification",
+  "version": 3,
+  "draftRevision": 1,
+  "status": "draft",
+  "approval": {
+    "approvedBy": null,
+    "approvedAt": null,
+    "approvalRef": null,
+    "priceSource": "DigitalOcean pricing, verified 2026-09-30 (root estimate 2026-10-26)"
+  },
+  "lanes": {
+    "local": {
+      "database": "postgres:18.4-bookworm pinned digest",
+      "serverVersionNum": 180004,
+      "machines": 2,
+      "machineKind": "rootless-podman-container",
+      "containerLimits": {
+        "cpus": 1,
+        "memoryMiB": 1024,
+        "pids": 256,
+        "uid": "fixed non-root"
+      },
+      "faults": [
+        "partition-machine-a",
+        "restart-database"
+      ]
+    },
+    "managed": {
+      "provider": "digitalocean",
+      "engine": "pg",
+      "version": "18",
+      "edition": "standard",
+      "nodes": 1,
+      "sizeSlug": "db-s-1vcpu-2gb",
+      "region": "nyc3",
+      "modeledHourlyUsd": 0.04531,
+      "modeledSpendCeilingUsd": 5,
+      "absoluteDeadlineSeconds": 21600,
+      "stopNewWorkAtSeconds": 20700,
+      "cleanupReserveSeconds": 900,
+      "documentedAvailableBackendConnections": 47,
+      "familyTag": "lcm-cert",
+      "runTagPattern": "lcm-cert-run-<runId>",
+      "serializedRuns": true,
+      "faults": [
+        "partition-machine-a"
+      ]
+    }
+  },
+  "configuration": {
+    "client": "codex",
+    "agentId": null,
+    "hooks.disableAutoCompact": true,
+    "hooks.snapshotIntervalSec": 1,
+    "summarizer.mock": true,
+    "poolMax": 2,
+    "sessionIds": "cert-<runId>-<a|b>-s<0..3>",
+    "retentionOverrides": "none; fresh homes"
+  },
+  "timeline": {
+    "full": {
+      "setupMaxSeconds": 600,
+      "secondDaemonStartOffsetSeconds": 150,
+      "readyBeforeWarmup": true,
+      "warmupSeconds": 120,
+      "steadySeconds": 6000,
+      "pendingSettleMaxSeconds": 60,
+      "partitionPhaseMaxSeconds": 1080,
+      "restartPhaseMaxSeconds": 1140,
+      "finalDrainSeconds": 900,
+      "cleanupReserveSeconds": 900,
+      "localDeadlineSeconds": 10800
+    },
+    "smoke": {
+      "certifying": false,
+      "warmupSeconds": 20,
+      "steadySeconds": 120,
+      "finalDrainSeconds": 660,
+      "faults": [],
+      "wholeRunDeadlineSeconds": 1800,
+      "note": "exploratory; not a percentile gate"
+    },
+    "membership": "scheduled time in half-open [T0, T0+steadySeconds); T0 fixed only after both machines ready and warmup done; faults never overlap steady or each other's recovery"
+  },
+  "workload": {
+    "seed": 629001,
+    "generator": "deterministic schedule; no PRNG",
+    "machines": 2,
+    "sharedProjects": 1,
+    "sessionsPerMachine": 4,
+    "schedulePerMachine": {
+      "hook": "T0+1+10j, j=0..599; kind [user-prompt,post-tool,post-tool,post-tool][j mod 4]; session s(j mod 4)",
+      "search": "T0+2+5j, j=0..1199 (daemon route)",
+      "store": "T0+4+10j, j=0..599 (daemon route)",
+      "sessionSnapshot": "T0+30+60k, k=0..99; session s0; hook_event_name Stop; owned pinned Codex transcript fixture",
+      "compact": "T0+55+300k, k=0..19; session s0; explicit /compact operation; the only compaction source"
+    },
+    "primaryTextBytesCycle": [
+      256,
+      1024,
+      1024,
+      6144
+    ],
+    "primaryTextLength": "cycle[floor(j/4) mod 4]; ASCII; JSON envelope bytes recorded separately; stored truncation (DATA_SOFT_CAP) recorded, not counted as input change",
+    "fixtures": {
+      "userPrompt": "\"Always prefer deterministic records. \" + lowercase x padding to N bytes; extracts exactly one decision event",
+      "postTool": "tool_name TaskCreate, tool_input {subject: \"fixture \" + x padding to N bytes, status: \"created\"}, tool_response \"ok\"; extracts exactly one task_create event; synthetic compatibility fixture, not native Codex tool proof",
+      "cardinalityCheck": "unit tests for all 8 kind/length combinations; runtime asserts exactly one new row per invocation"
+    },
+    "emission": {
+      "sources": [
+        "user-prompt",
+        "post-tool"
+      ],
+      "expectedAuxiliaryRows": 0,
+      "maxRowsPerMachinePerRolling300s": 30,
+      "violation": "fail",
+      "productionSettings": "batch 100 and 300 s sweep unchanged; drain lease is per machine; sweep timestamps recorded, no collision gate"
+    },
+    "admission": {
+      "maxActiveOperationsPerMachine": 4,
+      "maxTransientCliPerMachine": 1,
+      "maxQueuedArrivalsPerMachine": 64,
+      "overflow": "fail",
+      "operationDeadlineSeconds": 60
+    },
+    "expectedPooledSteadyAttemptsPerLane": {
+      "hookInvocations": 1200,
+      "userPrompt": 300,
+      "postTool": 900,
+      "daemonSearch": 2400,
+      "daemonStore": 1200
+    },
+    "expectedPerMachine": {
+      "hookInvocations": 600,
+      "daemonSearch": 1200,
+      "daemonStore": 600
+    }
+  },
+  "oracle": {
+    "invocationLedger": "persist invocation id/kind/session/expected count before each serialized hook; capture exactly one new matching row (uuid, machine sequence, source/type/session, scrubbed payload hash) within 2 s after exit; persisted outside SQLite immediately; rows from failed commands reconciled",
+    "captureTimeoutSeconds": 2,
+    "captureFailure": "workload failure / incomplete, never zero loss",
+    "observer": {
+      "pollSeconds": 1,
+      "access": "direct read-only SQLite (WAL siblings intact); no repository wrapper, no publication lock, no long transaction, no checkpoint/migration",
+      "perQueryDeadlineMs": 250,
+      "maxPollGapSeconds": 2,
+      "pollGapResult": "lag population incomplete",
+      "identityCheck": "file and parent identity; replacement => incomplete",
+      "postgresqlConnections": 0
+    },
+    "acknowledgedPredicate": "delivery_state='acknowledged' AND remote_inbox_id IS NOT NULL AND acknowledged_at IS NOT NULL",
+    "lagClock": "observer first-seen monotonic minus hook success monotonic; max(0, ...) with raw ordering retained"
+  },
+  "thresholds": {
+    "hookCommandMs": {
+      "definition": "public CLI process start to exit wall time (monotonic); schedule delay reported separately",
+      "pooled": {
+        "p50": 600,
+        "p95": 1500,
+        "p99": 2500
+      },
+      "perKindPooledP95": 1500,
+      "perMachineP95": 1500,
+      "minSuccessesForSubgates": 200,
+      "basis": "recalibrated from non-certifying smoke-44/45/47 observations (p50 428-441 ms, p95 ~1011 ms) with margin; approval-selected policy limits"
+    },
+    "daemonSearchMs": {
+      "local": {
+        "p50": 100,
+        "p95": 500,
+        "p99": 1500
+      },
+      "managed": {
+        "p50": 300,
+        "p95": 1500,
+        "p99": 4000
+      }
+    },
+    "daemonStoreMs": {
+      "local": {
+        "p50": 100,
+        "p95": 500,
+        "p99": 1500
+      },
+      "managed": {
+        "p50": 300,
+        "p95": 1500,
+        "p99": 4000
+      }
+    },
+    "acknowledgmentLagSeconds": {
+      "population": "successful steady oracle entries",
+      "p99": 660,
+      "max": 900,
+      "note": "conservative upper bound; exact applied_at not claimed"
+    },
+    "errors": {
+      "nonInjectedErrorRateMax": 0.001,
+      "missingScheduledAttempt": "fail"
+    },
+    "loss": {
+      "rule": "every successful invocation maps to exactly one oracle event and every oracle event is acknowledged by end of final drain; missing input row and missing ack reported separately",
+      "max": 0
+    },
+    "duplicates": {
+      "gated": "zero event ids observed with more than one distinct acknowledged inbox id",
+      "nonClaim": "historical duplicate logical effects / exactly-once (owned by #631)"
+    },
+    "finalDrain": {
+      "seconds": 900,
+      "rule": "every oracle event acknowledged and remote_pruned_at non-null; zero nonterminal or awaiting-prune rows; physical deletion not required"
+    },
+    "recovery": {
+      "classification": "harness self-check; not #631/#632/#633 certification",
+      "windowRule": "sliding [u,u+60s) with u >= clearedAt, evaluated every 1 s once all constituent scheduled operations are terminal; search and store separately; successes >= ceil(0.9*n), n>0; scheduled-time denominators; timeouts are failures; an unaffected machine never masks an affected one",
+      "partition": {
+        "subject": "machine A",
+        "appliedAt": "network disconnect completed",
+        "reconnectAt": "appliedAt+60 s",
+        "clearedAt": "network restoration verified to same endpoint",
+        "firstSuccessAfterClearedSeconds": 30,
+        "rtoSeconds": 180
+      },
+      "restartDatabase": {
+        "subject": "both machines",
+        "appliedAt": "database stop completed",
+        "clearedAt": "fresh SQL/TLS connection to the same owned database verified",
+        "maxOutageSeconds": 120,
+        "firstSuccessAfterClearedSeconds": 30,
+        "rtoSeconds": 240
+      },
+      "acknowledgmentCatchUpAfterClearedSeconds": 900,
+      "faultWorkload": "deterministic rates continue, tagged fault workload; excluded from steady populations; included in loss reconciliation"
+    },
+    "capacity": {
+      "poolMaxPerRuntime": 2,
+      "configuredPerMachine": "2 persistent daemon runtimes + <=1 transient runtime = 6, cap 8",
+      "coordinatorMax": 3,
+      "totalMax": 19,
+      "managedUsableBudget": 23,
+      "setupSessionsClosedBeforeWorkload": true,
+      "evidence": "simultaneous-instance maxima enforced; sampled pg_stat_activity peaks (role + client address) as corroboration; record max_connections and reserved slots"
+    },
+    "clock": {
+      "method": "bracket t0/server/t1 at start, every 60 s, end",
+      "maxIntervalRadiusMs": 250,
+      "breach": "fail",
+      "missing": "incomplete",
+      "localNote": "shared host clock; no independent-clock claim; no gated metric subtracts machine and database clocks"
+    },
+    "cleanup": {
+      "labeledContainers": 0,
+      "labeledNetworks": 0,
+      "labeledVolumes": 0,
+      "familyTaggedProviderClusters": 0,
+      "providerDestroyConfirmedWithinSeconds": 900,
+      "privateRootsAbsent": true,
+      "ownedProcessesExited": true
+    }
+  },
+  "diagnosticsNotGated": {
+    "databaseGrowth": "after-minus-before total bytes of lcm schema relations over steady, with submitted bytes",
+    "perKindHookDistributions": true,
+    "sweepTimestamps": true,
+    "scheduleDelay": true,
+    "rawEvidenceRetention": "operator policy: private 90 days"
+  },
+  "calculations": {
+    "percentile": "nearest-rank: ascending successful samples at index ceil(q*n)-1",
+    "minimumSamples": {
+      "p50": 20,
+      "p95": 200,
+      "p99": 1000,
+      "below": "incomplete"
+    },
+    "population": "pooled across both machines within one lane run; never across lanes or repetitions",
+    "errorRate": "nonInjected failed attempts / scheduled steady attempts",
+    "verdict": "pass only if every gated item passes on every lane run; a definite breach => fail (takes precedence); otherwise any missing/insufficient evidence => incomplete"
+  },
+  "repetitions": {
+    "local": 1,
+    "managed": 1,
+    "rationale": "bounded baseline observation; not a provider reliability certification"
+  }
+}

@@ -90,6 +90,18 @@ export const GRAPH_INVISIBLE_INPUTS = Object.freeze([
     pattern: /^test\/codecov-ownership\//u,
     tests: Object.freeze(["test/codecov-config.test.ts"]),
   }),
+  Object.freeze({
+    name: "certification-contracts",
+    pattern: /^test\/certification\/(?:contract-v[23](?:\.approval)?|evidence-schema)\.json$/u,
+    tests: Object.freeze([
+      "test/certification/contract.test.ts",
+      "test/certification/evidence.test.ts",
+      "test/certification/gate.test.ts",
+      "test/certification/harness.test.ts",
+      "test/certification/machine-agent.test.ts",
+      "test/certification/round2-acceptance.test.ts",
+    ]),
+  }),
 ]);
 
 // The PostgreSQL conformance harness exercises the packed CLI and daemon in a

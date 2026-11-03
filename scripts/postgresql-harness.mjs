@@ -441,6 +441,8 @@ export function createRunNames(runId) {
     volume: `lcm-pg-data-${short}`,
     restore: `lcm-pg-restore-${short}`,
     runner: `lcm-pg-runner-${short}`,
+    machineA: `lcm-pg-machine-a-${short}`,
+    machineB: `lcm-pg-machine-b-${short}`,
     alias: `lcm-pg-${short}.test`,
     wrongAlias: `lcm-pg-wrong-${short}.test`,
     controlDatabase: `lcm_harness_${short}`,
@@ -450,6 +452,8 @@ export function createRunNames(runId) {
 const resourceSpecs = [
   { type: "container", key: "restore", kind: "restore" },
   { type: "container", key: "runner", kind: "runner" },
+  { type: "container", key: "machineA", kind: "machine-a" },
+  { type: "container", key: "machineB", kind: "machine-b" },
   { type: "container", key: "container", kind: "database" },
   { type: "volume", key: "volume", kind: "data" },
   { type: "network", key: "network", kind: "network" },
@@ -607,7 +611,7 @@ export function sanitizeHarnessText(value, secrets) {
     if (secret) sanitized = sanitized.split(secret).join("[REDACTED]");
   }
   return sanitized
-    .replace(/postgresql:\/\/[^\s]+/giu, "postgresql://[REDACTED]")
+    .replace(/postgresql:\/\/[^\s"'\\]+/giu, "postgresql://[REDACTED]")
     .replace(/-----BEGIN [^-]+-----[\s\S]*?-----END [^-]+-----/gu, "[REDACTED PEM]");
 }
 
@@ -665,7 +669,7 @@ export function createStreamRedactor(secrets) {
     const scanned = scanPemMarkers(redacted, depth);
     depth = scanned.depth;
     if (startedInPem && scanned.output === "") return undefined;
-    return scanned.output.replace(/postgresql:\/\/[^\s]+/giu, "postgresql://[REDACTED]");
+    return scanned.output.replace(/postgresql:\/\/[^\s"'\\]+/giu, "postgresql://[REDACTED]");
   };
   // Scans text that is being dropped, so markers may span writes and have a
   // label of any length. A BEGIN keyword opens a block at once, whether or not
@@ -1323,7 +1327,19 @@ async function listLabeledResources(dockerRunner = docker) {
 }
 
 function shortRunPrefixFromName(name) {
-  return name.match(/^lcm-pg-(?:net-|data-|restore-|runner-)?([0-9a-f]{20})$/u)?.[1];
+  return name.match(/^lcm-pg-(?:net-|data-|restore-|runner-|machine-[ab]-)?([0-9a-f]{20})$/u)?.[1];
+}
+
+export function createInNetworkEnvironment(environment, names) {
+  const result = { ...environment, LCM_TEST_POSTGRES_WRONG_HOST: names.wrongAlias };
+  for (const [key, value] of Object.entries(environment)) {
+    if (!key.startsWith("LCM_TEST_POSTGRES_") || !key.endsWith("_URL")) continue;
+    const url = new URL(value);
+    url.hostname = names.alias;
+    url.port = "5432";
+    result[key] = url.toString();
+  }
+  return result;
 }
 
 export function harnessDirectoryFromRecord(record, dependencies = {}) {
@@ -1574,7 +1590,7 @@ export async function discoverHarnessRuns(dependencies = {}) {
       run.classification = classifyOwnerIdentity(run.owner, dependencies);
       if (run.classification === "stale") {
         const activeWorker = run.resources.some(
-          (resource) => (resource.kind === "runner" || resource.kind === "restore") && resource.running,
+          (resource) => ["runner", "restore", "machine-a", "machine-b"].includes(resource.kind) && resource.running,
         );
         if (activeWorker) {
           run.classification = "live";
@@ -1606,6 +1622,8 @@ async function inspectReclaimableWorkers(run, names, dockerRunner) {
   for (const [kind, name] of [
     ["restore", names.restore],
     ["runner", names.runner],
+    ["machine-a", names.machineA],
+    ["machine-b", names.machineB],
   ]) {
     const expectedLabels = ownershipLabels(run.runId, kind, run.owner);
     let record;
@@ -1822,7 +1840,7 @@ export function sanitizedHarnessErrorDetails(error, secrets) {
 }
 
 export async function cleanupHarnessResources(context, dependencies = {}) {
-  const { names, runId, directory, sentinelReady, owner } = context;
+  const { names, runId, directory, sentinelReady, owner, includeMachines = false } = context;
   const dockerRunner = dependencies.dockerRunner ?? docker;
   const removeResource = dependencies.removeResource
     ?? ((type, name) => {
@@ -1853,6 +1871,10 @@ export async function cleanupHarnessResources(context, dependencies = {}) {
 
     await attempt(() => removeResource("container", names.restore));
     await attempt(() => removeResource("container", names.runner));
+    if (includeMachines) {
+      await attempt(() => removeResource("container", names.machineA));
+      await attempt(() => removeResource("container", names.machineB));
+    }
     let containerOwned = !sentinelReady;
     if (sentinelReady) {
       try {
@@ -2142,6 +2164,7 @@ export async function runHarness(options = {}) {
       get sentinelReady() {
         return sentinelReady;
       },
+      includeMachines: options.certificationMachines === true,
       owner,
     },
     {
@@ -2252,7 +2275,18 @@ export async function runHarness(options = {}) {
       LCM_TEST_POSTGRES_WRONG_HOST: ci ? names.wrongAlias : "localhost",
     };
     try {
-      if (options.runTests) await options.runTests({ runId, names, directory, parent, environment }, ci);
+      if (options.runTests) await options.runTests({
+        runId,
+        names,
+        directory,
+        parent,
+        environment,
+        owner,
+        containerCli: engine.cli,
+        processRunner: setupProcess,
+        secrets,
+        inNetworkEnvironment: createInNetworkEnvironment(environment, names),
+      }, ci);
       else await runTests(
         {
           runId,
