@@ -380,6 +380,15 @@ tell abandoned debris apart from a concurrent sibling launch's staged
 credentials, so deleting on suspicion could strip secrets from a launch that
 is about to succeed.
 
+If a systemd or launchd submission immediately exits, LCM retains the staged
+inputs while retiring the exact registration for one bounded retry. If that
+retry also exits, LCM attempts validated cleanup of only that launch's
+credential directory after proving the exact registration absent, including
+when it disappears before the final stop. Sibling launch directories remain
+untouched. Failed stop or absence checks, live registrations, and ambiguous
+manager evidence preserve the inputs; failed directory validation or removal
+can also leave them in place. The start still reports its original failure.
+
 Inspect before removing anything, and only ever remove a directory you have
 positively identified as inactive. `lcm doctor` reports whether the daemon
 is up or down; it never reports whether the daemon is idle. Doctor output is

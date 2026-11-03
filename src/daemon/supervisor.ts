@@ -3038,10 +3038,10 @@ export function createSupervisor(
             // nonce, so retire it through the manager and prove absence before
             // deleting its one-launch credentials or private launch plist.
             try {
-              // Preserve this launch's staged credentials while retiring the
-              // exact failed registration. They have not been admitted yet
-              // and are required by the one bounded retry below.
-              await stopAndAwaitAbsentInternal(spec, false, undefined, false, cleanupDeadline);
+              // Retain staged inputs for the first retirement's bounded retry.
+              // On the final retirement, enable validated exact-directory
+              // cleanup only after the helper proves manager absence.
+              await stopAndAwaitAbsentInternal(spec, false, undefined, terminalRecreated, cleanupDeadline);
               retiredExactTerminal = true;
             } catch {
               // Preserve terminal evidence when stop/absence cannot be proven.

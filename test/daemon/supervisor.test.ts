@@ -2349,6 +2349,112 @@ describe("systemd-user supervisor", () => {
   });
 });
 
+describe.each(["systemd-user", "launchd-user"] as const)("%s final terminal retirement", (kind) => {
+  it.each([
+    ["absence after stop", true],
+    ["absence on helper entry", true],
+    ["stop failure", false],
+    ["ambiguous helper observation", false],
+    ["unavailable helper observation", false],
+    ["changed nonce", false],
+    ["live registration through deadline", false],
+  ] as const)("preserves retry inputs and cleans only with %s", async (outcome, cleaned) => {
+    const root = makeRoot();
+    const directory = createManagedCredentialDirectory(root, "nonce-001");
+    const file = writeManagedCredentialFiles(directory, { OPENAI_API_KEY: "synthetic-input" })[0]!;
+    const sibling = createManagedCredentialDirectory(root, "sibling-launch");
+    const siblingFile = writeManagedCredentialFiles(sibling, { OPENAI_API_KEY: "synthetic-sibling" })[0]!;
+    const spec = makeSpec(kind, root, {
+      credentialDirectory: directory,
+      credentialFiles: [{ name: "OPENAI_API_KEY", path: file }],
+      stopTimeoutMs: 50,
+    });
+    const systemd = kind === "systemd-user";
+    const manager = systemd ? "systemctl" : "launchctl";
+    const probeArgs = systemd
+      ? ["--user", "show", "--no-pager", "--property=LoadState,ActiveState,SubState,MainPID,ControlGroup,Environment,ExecMainStartTimestamp,FragmentPath", spec.systemdUnit]
+      : ["print", `gui/501/${spec.launchdLabel}`];
+    const stopArgs = systemd ? ["--user", "stop", spec.systemdUnit] : ["bootout", `gui/501/${spec.launchdLabel}`];
+    const plist = join(root, `daemon.${spec.shortDigest}.${spec.nonce}.plist`);
+    const startCommand = systemd ? "systemd-run" : "launchctl";
+    const startArgs = systemd
+      ? expect.arrayContaining(["--user", `--unit=${spec.systemdUnit}`])
+      : ["bootstrap", "gui/501", plist];
+    const absent = systemd
+      ? { code: 1, stderr: "Unit is not-found" }
+      : { code: 113, stderr: "Could not find service" };
+    const terminalText = (value: SupervisorSpec) => systemd
+      ? managerText(value, "inactive")
+      : launchdPrintText(value, "not running");
+    const terminal = { code: 0, stdout: terminalText(spec) };
+    const steps: Array<{ command: string; args: unknown; result: SupervisorCommandResult }> = [];
+    const probe = (result: SupervisorCommandResult) => steps.push({ command: manager, args: probeArgs, result });
+    const stop = (result: SupervisorCommandResult = { code: 0 }) => {
+      steps.push({ command: manager, args: stopArgs, result });
+      if (systemd && result.code === 0) {
+        steps.push({ command: manager, args: ["--user", "reset-failed", spec.systemdUnit], result: { code: 0 } });
+      }
+    };
+    // First exact terminal retirement must keep the inputs for one recreation.
+    probe(absent);
+    steps.push({ command: startCommand, args: startArgs, result: { code: 0 } });
+    probe(terminal);
+    probe(terminal);
+    probe(terminal);
+    stop();
+    probe(absent);
+    // The replacement also exits; there must never be a third submission.
+    probe(absent);
+    steps.push({ command: startCommand, args: startArgs, result: { code: 0 } });
+    probe(terminal);
+    probe(terminal);
+    if (outcome === "absence on helper entry") {
+      probe(absent);
+    } else if (outcome === "ambiguous helper observation") {
+      probe({ code: 0, stdout: systemd ? "LoadState=loaded\nActiveState=mystery" : "state = mystery" });
+    } else if (outcome === "unavailable helper observation") {
+      probe({ code: 127, stderr: "command not found" });
+    } else if (outcome === "changed nonce") {
+      probe({ code: 0, stdout: terminalText({ ...spec, nonce: "other-launch" }) });
+    } else {
+      probe(terminal);
+      stop(outcome === "stop failure" ? { code: 1, stderr: "permission denied" } : { code: 0 });
+      probe(outcome === "live registration through deadline"
+        ? { code: 0, stdout: systemd ? managerText(spec, "active", 777) : launchdPrintText(spec, "running", 777) }
+        : absent);
+    }
+    const calls: Array<{ command: string; args: readonly string[] }> = [];
+    const retainedAtSubmission: boolean[] = [];
+    let clock = 0;
+    const supervisor = createSupervisor(kind, {
+      platform: systemd ? "linux" : "darwin",
+      uid: systemd ? process.getuid!() : 501,
+      now: () => clock,
+      sleep: async (delay) => { clock += delay; },
+      run: async (command, args) => {
+        const step = steps[calls.length];
+        calls.push({ command, args });
+        if (command === startCommand && (systemd || args[0] === "bootstrap")) {
+          retainedAtSubmission.push(existsSync(directory) && existsSync(file));
+        }
+        if (step === undefined) throw new Error("unexpected manager command after finite script");
+        return step.result;
+      },
+    });
+    await expect(supervisor.start(spec)).rejects.toMatchObject({
+      name: "SupervisorCommandError",
+      reason: "ambiguous-state",
+    });
+    expect(calls).toEqual(steps.map(({ command, args }) => ({ command, args })));
+    expect(retainedAtSubmission).toEqual([true, true]);
+    expect(existsSync(directory)).toBe(!cleaned);
+    expect(existsSync(file)).toBe(!cleaned);
+    expect(existsSync(sibling)).toBe(true);
+    expect(existsSync(siblingFile)).toBe(true);
+    if (!systemd) expect(existsSync(plist)).toBe(!cleaned);
+  });
+});
+
 describe("launchd-user supervisor", () => {
   it("accepts the sparse legacy launchd temporary assignment shape during absence-only repair", async () => {
     const root = makeRoot();
