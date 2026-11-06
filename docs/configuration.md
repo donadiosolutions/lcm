@@ -686,6 +686,22 @@ very large payload over a slow link can hit it; raise `statementTimeoutMs` for
 such links. The portable transfer destination connection is exempt, so large
 record uploads are not cut short.
 
+To cancel a running statement, LCM needs the process ID of the server backend
+that runs it. It reads that ID at most once per transaction: in the round trip
+that starts the transaction, as it does for every project-scoped transaction
+and every read-only snapshot that a migration step or portable transfer holds
+open, or else at the transaction's first statement that can be cancelled. Later
+cancellable statements in the transaction, including those inside savepoints,
+reuse the ID instead of each spending a round trip to look it up, which matters
+most when the database is far away. A cancellable statement outside a
+transaction still looks the ID up each time. None of this needs configuration.
+Reusing the ID requires each transaction to run on one server backend from
+start to finish, which holds for a direct connection, session pooling, and any
+pooler that pins one server connection per transaction. Copying records into a
+PostgreSQL destination, as `lcm migration apply` and portable transfers do,
+still needs a direct connection or session pooling, because the destination
+holds a session-level advisory lock.
+
 `snapshotIdleTimeoutMs` bounds only the read-only, repeatable-read snapshot
 transaction that a portable transfer holds open for the lifetime of its source
 handle (`idle_in_transaction_session_timeout`, set with `SET LOCAL` semantics

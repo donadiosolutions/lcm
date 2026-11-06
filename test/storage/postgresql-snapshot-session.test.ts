@@ -557,6 +557,10 @@ describe("dedicated PostgreSQL snapshot session", () => {
     ["a single result", () => result([{ pid: 1234 }])],
     ["three results", () => [result(), result([{ pid: 1234 }]), result()]],
     ["no PID row", () => [result(), result()]],
+    ["a null second result", () => [result(), null]],
+    ["an undefined second result", () => [result(), undefined]],
+    ["a second result without rows", () => [result(), {}]],
+    ["a second result with null rows", () => [result(), { rows: null }]],
   ])("destroys without registering anything when the opener returns %s", async (_label, answer) => {
     const transport = handTransport(answer);
     await expect(PostgreSqlSnapshotSession.open(transport.transport, { projectId: "project", snapshotIdleTimeoutMs: 1_000 }))

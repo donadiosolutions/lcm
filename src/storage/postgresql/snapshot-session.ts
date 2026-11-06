@@ -42,11 +42,14 @@ export function validBackendPid(value: unknown): number | undefined {
 /**
  * The PID read by a fused `BEGIN ...; SELECT pg_catalog.pg_backend_pid() AS pid`
  * simple query, whose driver result is exactly two results with the PID row
- * in the second. Any other shape is undefined, so the caller fails closed.
+ * in the second. Any other shape, however malformed, is undefined rather than
+ * a thrown error, so the caller fails closed.
  */
 export function fusedBackendPid(results: unknown): number | undefined {
-  return Array.isArray(results) && results.length === 2
-    ? validBackendPid((results[1] as QueryResult<{ pid?: unknown }>).rows[0]?.pid)
+  if (!Array.isArray(results) || results.length !== 2) return undefined;
+  const rows: unknown = (results[1] as { readonly rows?: unknown } | null | undefined)?.rows;
+  return Array.isArray(rows)
+    ? validBackendPid((rows[0] as { readonly pid?: unknown } | null | undefined)?.pid)
     : undefined;
 }
 
