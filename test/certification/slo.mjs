@@ -1,6 +1,7 @@
 import { createHash } from "node:crypto";
 import { closeSync, mkdirSync, openSync, readFileSync, writeFileSync, writeSync } from "node:fs";
 import { join } from "node:path";
+import { CANARY_CORPUS, scanHashedInventory, scanSurface } from "./observability.mjs";
 
 export function nearestRank(values, quantile) {
   if (!Array.isArray(values) || values.length === 0) throw new Error("percentile population must not be empty");
@@ -156,7 +157,16 @@ export function writeCertificationGate(gate, outputDirectory, sampleFiles = {}, 
     `Cleanup: **${gate.cleanup.verdict}** (${gate.cleanup.residualResources} residual resources)`,
     "",
   ].join("\n");
-  writeFileSync(json, `${JSON.stringify(gate, null, 2)}\n`, { encoding: "utf8", mode: 0o600 });
-  writeFileSync(markdown, body, { encoding: "utf8", mode: 0o600 });
+  const jsonBytes = Buffer.from(`${JSON.stringify(gate, null, 2)}\n`);
+  const markdownBytes = Buffer.from(body);
+  if (options.privacyManifests) {
+    for (const [name, bytes] of [["json", jsonBytes], ["markdown", markdownBytes]]) {
+      const hashed = scanHashedInventory(bytes, options.privacyManifests);
+      const canaries = scanSurface(bytes, [], CANARY_CORPUS);
+      if (hashed.hits > 0 || canaries.canaryHits > 0) throw new Error(`certification public ${name} contains a private identity, credential, or canary`);
+    }
+  }
+  writeFileSync(json, jsonBytes, { mode: 0o600 });
+  writeFileSync(markdown, markdownBytes, { mode: 0o600 });
   return { json, markdown };
 }

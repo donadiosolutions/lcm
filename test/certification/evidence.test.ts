@@ -4,6 +4,7 @@ import { join } from "node:path";
 import { describe, expect, it } from "vitest";
 import { validateEvidence } from "../postgresql/cutover-rehearsal/check-evidence.js";
 import { assembleCertificationGate, writeCertificationGate } from "./slo.mjs";
+import { createInventoryManifest } from "./observability.mjs";
 
 describe("certification evidence", () => {
   it("assembles an allowlisted gate that conforms to the committed schema", () => {
@@ -88,5 +89,12 @@ describe("certification evidence", () => {
     expect(paths.json).toBe(join(output, "observability-certification-gate.json"));
     expect(paths.markdown).toBe(join(output, "observability-certification-gate.md"));
     expect(readFileSync(paths.markdown, "utf8")).toContain("# Observability certification gate");
+
+    const leaking = structuredClone(gate);
+    leaking.contract.approval.note = "private-role";
+    const manifest = createInventoryManifest([{ category: "runtime-role", sourceClass: "test", scanMode: "all-forms", value: "private-role" }], "a");
+    expect(() => writeCertificationGate(leaking, mkdtempSync(join(tmpdir(), "lcm-cert-gate-leak-")), {}, {
+      outputName: "observability-certification-gate", privacyManifests: [manifest],
+    })).toThrow("private identity");
   });
 });

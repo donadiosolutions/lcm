@@ -1075,6 +1075,7 @@ describe("PostgreSQL runtime schema and grant readiness", () => {
     expect(fake.queries).toHaveLength(21);
     expect(contract.observability.calibration.successfulPathWireStatementCeiling).toBe(48 + 2 * fake.queries.length);
     expect(contract.observability.calibration.idleConnectionValidationAllowancePerAcquiredConnection).toBe(1);
+    expect(contract.observability.calibration.idleConnectionValidationAllowanceMode).toBe("measured-in-smoke");
     expect(contract.observability.calibration.measuredCallsPerProbeCeiling).toBe(48 + 2 * fake.queries.length + 1);
   });
 

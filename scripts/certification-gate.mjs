@@ -9,7 +9,7 @@ import { observabilityApplicability } from "../test/certification/observability.
 import { assembleCertificationGate, errorRate, evaluatePercentiles, nearestRank, writeCertificationGate } from "../test/certification/slo.mjs";
 import { createDeterministicSchedule, createFaultSchedule } from "../test/certification/schedule.mjs";
 import { observerReadSettings } from "../test/certification/sqlite-observer-worker.mjs";
-import { EXECUTION_HOST_IDENTITY_FIELDS, captureExecutionProvenance, recoveryWindowSearch } from "./certification-harness.mjs";
+import { EXECUTION_HOST_IDENTITY_FIELDS, captureExecutionProvenance, reconstructObservabilitySummary, recoveryWindowSearch } from "./certification-harness.mjs";
 
 function json(path) { return JSON.parse(readFileSync(path, "utf8")); }
 
@@ -307,25 +307,46 @@ export function buildEvidenceManifest({ evidenceDirectory, contract, persist = t
       const path = join(evidenceDirectory, `machine-${machine}`, "contract-receipt.json");
       return existsSync(path) ? json(path) : undefined;
     });
-    const propagationPass = run.contractVersion === 4 && receipts.every((receipt) => receipt?.version === 4
-      && receipt.sha256 === run.contractSha256 && receipt.approvalSha256 === run.approvalSha256);
+    const propagationPass = run.contractVersion === 4 && receipts.every((receipt, index) => {
+      const machine = ['a', 'b'][index];
+      const manifestPath = join(evidenceDirectory, `machine-${machine}`, "secret-inventory-manifest.json");
+      return receipt?.version === 4 && receipt.sha256 === run.contractSha256
+        && receipt.approvalSha256 === run.approvalSha256 && existsSync(manifestPath)
+        && receipt.inventoryManifestSha256 === createHash("sha256").update(readFileSync(manifestPath)).digest("hex");
+    });
     generatedSamples["contract-propagation.json"] = Buffer.from(`${JSON.stringify({ runVersion: run.contractVersion, receipts })}\n`);
     slos.push({
       id: "contract-propagation",
       formula: "coordinator and both agents record the selected v4 version and identical hash",
       inputs: { count: receipts.filter(Boolean).length, sampleFile: "contract-propagation.json" },
       threshold: 2,
-      observed: receipts.filter((receipt) => receipt?.version === 4 && receipt.sha256 === run.contractSha256 && receipt.approvalSha256 === run.approvalSha256).length,
+      observed: propagationPass ? 2 : 0,
       verdict: receipts.some(Boolean) && !propagationPass ? "fail" : propagationPass ? "pass" : "incomplete",
     });
   }
   if (applicability.applicable) {
     const summaryPath = join(evidenceDirectory, "observability-summary.json");
-    const summary = existsSync(summaryPath) ? json(summaryPath) : undefined;
-    generatedSamples["observability-summary.json"] = Buffer.from(`${JSON.stringify(summary ?? { missing: true })}\n`);
-    for (const item of observabilityGateItems(summary)) {
-      slos.push({ ...item, inputs: { count: summary?.items?.length ?? 0, sampleFile: "observability-summary.json" } });
+    const supplied = existsSync(summaryPath) ? json(summaryPath) : undefined;
+    const faultsForReconstruction = existsSync(join(evidenceDirectory, "faults.json")) ? json(join(evidenceDirectory, "faults.json")) : [];
+    const reconstructed = reconstructObservabilitySummary({
+      evidenceDirectory,
+      contract,
+      contractSha256: run.contractSha256,
+      runId: run.runId,
+      faults: faultsForReconstruction,
+      persist: false,
+    });
+    const bound = supplied !== undefined && supplied.contract?.sha256 === run.contractSha256
+      && JSON.stringify(supplied) === JSON.stringify(reconstructed);
+    generatedSamples["observability-summary.json"] = Buffer.from(`${JSON.stringify(reconstructed)}\n`);
+    for (const item of observabilityGateItems(reconstructed)) {
+      slos.push({ ...item, inputs: { count: reconstructed.items.length, sampleFile: "observability-summary.json" } });
     }
+    slos.push({
+      id: "observability-summary-binding", formula: "private summary equals gate reconstruction for selected contract and run",
+      inputs: { count: supplied?.items?.length ?? 0, sampleFile: "observability-summary.json" },
+      threshold: 1, observed: bound ? 1 : 0, verdict: supplied === undefined ? "incomplete" : bound ? "pass" : "fail",
+    });
   }
   slos.push({ id: "profile-certifying", formula: "full profile only", inputs: { count: 1, sampleFile: "run.json" }, threshold: 1, observed: run.profile === "full" ? 1 : 0, verdict: run.profile === "full" ? "pass" : "incomplete" });
   slos.push({ id: "phase-barriers", formula: "both warmups complete before coordinator-issued shared steady T0", inputs: { count: 2, sampleFile: "phase-control.json" }, threshold: 2, observed: phaseBarriersPass ? 2 : 0, verdict: phaseBarriersPass ? "pass" : "fail" });
@@ -526,8 +547,12 @@ export function buildEvidenceManifest({ evidenceDirectory, contract, persist = t
   const expectedFaultIds = (run.profile === "full" || withFaults ? contract.lanes[run.lane].faults : [])
     .map((fault) => fault === "partition-machine-a" ? "partition-a" : fault).sort();
   const actualFaultIds = faults.map((fault) => fault.id).sort();
-  const faultSetVerdict = run.profile === "smoke" && !withFaults && faults.length === 0 ? "incomplete"
-    : JSON.stringify(expectedFaultIds) === JSON.stringify(actualFaultIds) ? "pass" : "fail";
+  const unexpectedFaultIds = actualFaultIds.filter((id) => !expectedFaultIds.includes(id));
+  const missingFaultIds = expectedFaultIds.filter((id) => !actualFaultIds.includes(id));
+  const faultSetVerdict = contract.version === 4
+    ? unexpectedFaultIds.length > 0 ? "fail" : missingFaultIds.length > 0 ? "incomplete" : "pass"
+    : run.profile === "smoke" && !withFaults && faults.length === 0 ? "incomplete"
+      : JSON.stringify(expectedFaultIds) === JSON.stringify(actualFaultIds) ? "pass" : "fail";
   const faultSetFile = sampleFile("lane-fault-set.ndjson", faults);
   slos.push({ id: "lane-fault-set", formula: "full profile or smoke with faults: exact contract lane fault IDs", inputs: { count: faults.length, sampleFile: faultSetFile }, threshold: expectedFaultIds.length, observed: faults.length, verdict: faultSetVerdict });
   for (const fault of faults.filter((entry) => ["partition-a", "restart-database"].includes(entry.id))) {
@@ -679,11 +704,16 @@ export function assembleGateFromEvidence(input, dependencies = {}) {
   const errors = validateEvidence(schema, gate);
   if (errors.length > 0) throw new Error(`certification gate evidence is invalid:\n${errors.join("\n")}`);
   const outputName = input.outputName ?? (loaded.contract.version === 4 ? "observability-certification-gate" : undefined);
+  const privacyManifests = loaded.contract.version === 4 ? [
+    ...['a', 'b'].map((machine) => json(join(input.evidenceDirectory, `machine-${machine}`, "secret-inventory-manifest.json"))),
+    json(join(input.evidenceDirectory, "coordinator-inventory-manifest.json")),
+  ] : undefined;
   return {
     gate,
     paths: writeCertificationGate(gate, input.outputDirectory, sampleFiles, {
       ...(outputName === undefined ? {} : { outputName }),
       ...(loaded.contract.version === 4 ? { title: "Observability certification gate" } : {}),
+      ...(privacyManifests === undefined ? {} : { privacyManifests }),
     }),
   };
 }

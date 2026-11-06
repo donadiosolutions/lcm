@@ -4,11 +4,12 @@ import { tmpdir } from "node:os";
 import { delimiter, join } from "node:path";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { OBSERVABILITY_GATE_ITEMS, assembleGateFromEvidence, buildEvidenceManifest, createSampleBuilder, forEachNdjsonRow, observabilityGateItems, parseGateArguments, readObserverWitness } from "../../scripts/certification-gate.mjs";
-import { captureExecutionHost, captureExecutionProvenance } from "../../scripts/certification-harness.mjs";
+import { captureExecutionHost, captureExecutionProvenance, reconstructObservabilitySummary } from "../../scripts/certification-harness.mjs";
 import { createGitCheckoutFixture } from "./git-checkout-fixture.js";
 import { createDeterministicSchedule, createFaultSchedule } from "./schedule.mjs";
 import { sampleSha256, writeSampleFile } from "./slo.mjs";
 import { observerReadSettings } from "./sqlite-observer-worker.mjs";
+import { RUNTIME_HEALTH_ACTIONS } from "../../src/storage/runtime-health.js";
 
 function writeJson(path: string, value: unknown): void { writeFileSync(path, `${JSON.stringify(value)}\n`); }
 function writeNdjson(path: string, values: unknown[]): void { writeFileSync(path, values.map((value) => `${JSON.stringify(value)}\n`).join("")); }
@@ -40,6 +41,46 @@ describe("v4 observability gate items", () => {
     expect(items.find((item) => item.id === "telemetry.cardinality")?.verdict).toBe("fail");
     expect(items.find((item) => item.id === "privacy.canary-leaks")?.verdict).toBe("pass");
     expect(items.find((item) => item.id === "probe-completeness")?.verdict).toBe("incomplete");
+  });
+
+  it("reconstructs mixed-phase private records instead of trusting a forged summary verdict", () => {
+    const root = mkdtempSync(join(tmpdir(), "lcm-cert-v4-reconstruct-"));
+    for (const machine of ["a", "b"]) mkdirSync(join(root, `machine-${machine}`));
+    const contract = JSON.parse(readFileSync(new URL("./contract-v4.json", import.meta.url), "utf8"));
+    const contractSha256 = createHash("sha256").update(readFileSync(new URL("./contract-v4.json", import.meta.url))).digest("hex");
+    const steadyT0At = "2026-11-05T00:00:00.000Z";
+    writeJson(join(root, "run.json"), { profile: "smoke", lane: "local", runId: "run", contractSha256 });
+    writeJson(join(root, "phase-control.json"), { steadyT0At, warmupStartAt: steadyT0At });
+    const healthyTelemetry = {
+      statements: { status: "observed", observedAt: 1, scope: "aggregate", omitted: {}, operations: [] },
+      pool: { status: "observed", observedAt: 1, health: "healthy", omitted: [], remediation: "No action required.", saturationRatio: 0 },
+      migration: { status: "observed", observedAt: 1, health: "healthy", omitted: [], remediation: "No action required.", historyStatus: "current", appliedCount: 1, expectedCount: 1 },
+      extensions: { status: "observed", observedAt: 1, health: "healthy", omitted: [], remediation: "No action required.", entries: ["pg_stat_statements", "pg_trgm", "pgcrypto", "unaccent"].map((name) => ({ name, status: "current", installedVersion: "1", defaultVersion: "1" })) },
+      queue: { status: "observed", observedAt: 1, health: "healthy", omitted: [], remediation: "No action required.", inboxClaimed: 0 },
+    };
+    const timeout = {
+      id: "timeout-a-probe-0", machine: "a", phase: "timeout", sequence: 0,
+      startedAtMs: 100, completedAtMs: 101, durationMs: 1, rawSha256: "a".repeat(64),
+      cardinality: { verdict: "pass" }, snapshot: {
+        classification: "timeout", pool: { status: "ready", origin: "daemon", failed: false },
+        telemetry: { ...healthyTelemetry,
+          migration: { status: "timeout", observedAt: 100, health: "unavailable", omitted: [], remediation: RUNTIME_HEALTH_ACTIONS.unavailable },
+          extensions: { status: "timeout", observedAt: 100, health: "unavailable", omitted: [], remediation: "wrong", entries: [] },
+          queue: { status: "timeout", observedAt: 100, health: "unavailable", omitted: [], remediation: RUNTIME_HEALTH_ACTIONS.unavailable },
+          statements: { status: "timeout", observedAt: 100, scope: "aggregate", omitted: {} },
+        },
+      },
+    };
+    writeNdjson(join(root, "machine-a", "probes.ndjson"), [timeout]);
+    writeNdjson(join(root, "machine-b", "probes.ndjson"), []);
+    writeNdjson(join(root, "machine-a", "samples.ndjson"), []);
+    writeNdjson(join(root, "machine-b", "samples.ndjson"), []);
+    const fault = { id: "timeout", kind: "timeout", target: "a,b", requestedAt: "2026-11-05T00:00:00.000Z", appliedAt: new Date(100).toISOString(), clearedAt: new Date(200).toISOString(), recoveredAt: new Date(300).toISOString() };
+    const reconstructed = reconstructObservabilitySummary({ evidenceDirectory: root, contract, contractSha256, runId: "run", faults: [fault], persist: false });
+    expect(observabilityGateItems(reconstructed).find((item) => item.id === "alert.timeout")?.verdict).toBe("fail");
+    const forged = structuredClone(reconstructed);
+    forged.items.find((item: { id: string }) => item.id === "alert.timeout").verdict = "pass";
+    expect(JSON.stringify(forged)).not.toBe(JSON.stringify(reconstructed));
   });
 });
 

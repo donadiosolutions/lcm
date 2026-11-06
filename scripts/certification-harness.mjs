@@ -7,11 +7,11 @@ import { arch as osArch, cpus as osCpus, hostname as osHostname, release as osRe
 import { basename, isAbsolute, join, relative, resolve } from "node:path";
 import { fileURLToPath, pathToFileURL } from "node:url";
 import { NODE_IMAGE, POSTGRES_IMAGE } from "./postgresql-images.mjs";
-import { certificationDeadlineSeconds, loadCertificationContract } from "../test/certification/contract.mjs";
+import { assertCertificationRunPolicy, certificationDeadlineSeconds, loadCertificationContract } from "../test/certification/contract.mjs";
 import { publishPostgreSqlBackend } from "../test/certification/backend-publication.mjs";
-import { createDeterministicSchedule, createObservabilityWorkloadSchedule } from "../test/certification/schedule.mjs";
+import { createDeterministicSchedule, createFaultSchedule, createObservabilityWorkloadSchedule, observabilityPhaseWorkloadSeconds } from "../test/certification/schedule.mjs";
 import { createCanaryWorkload } from "../test/certification/canary-corpus.mjs";
-import { buildObservabilitySummary, createProbeSchedule, evaluateCalibrationPairs, evaluateConnectionEvidence, scanSurface } from "../test/certification/observability.mjs";
+import { REQUIRED_MACHINE_INVENTORY_CATEGORIES, buildObservabilitySummary, createInventoryManifest, createProbeSchedule, evaluateBarrierSequence, evaluateCalibrationPairs, evaluatePhaseProbeEvidence, evaluatePhaseWorkload, evaluateProbePopulation, healthySnapshot, scanSurface } from "../test/certification/observability.mjs";
 import { observerReadSettings } from "../test/certification/sqlite-observer-worker.mjs";
 import { createOwnerIdentity, createProcessLifecycle, createRunNames, ownershipLabels, removeOwnedResource, runHarness, runSanitizedProcess } from "./postgresql-harness.mjs";
 
@@ -1236,6 +1236,7 @@ export async function collectCalibrationEvidence({
     for (let second = 0; second <= totalSeconds; second += 1) {
       const target = startAtMs + second * 1000;
       if (target > now()) await delay(target - now());
+      const sampleStartedAtMs = now();
       const connections = (await client.query(`SELECT COALESCE(client_addr::text, 'local') AS client_address,
         pg_catalog.count(*)::integer AS connections
         FROM pg_catalog.pg_stat_activity
@@ -1246,7 +1247,7 @@ export async function collectCalibrationEvidence({
         const label = labelsByAddress.get(row.client_address) ?? "unknown";
         counts[label] += Number(row.connections);
       }
-      const sample = { second, connectionCounts: counts, boundary: boundarySeconds.has(second) };
+      const sample = { second, scheduledAtMs: target, sampleStartedAtMs, connectionCounts: counts, boundary: boundarySeconds.has(second) };
       if (sample.boundary) {
         const cpu = {};
         for (const [label, name] of Object.entries(containerNames)) {
@@ -1264,20 +1265,34 @@ export async function collectCalibrationEvidence({
             WHERE datname OPERATOR(pg_catalog.=) pg_catalog.current_database()) AS xact_rollback
           FROM public.pg_stat_statements(false) AS stat
           JOIN pg_catalog.pg_roles AS role ON role.oid OPERATOR(pg_catalog.=) stat.userid
-          WHERE role.rolname OPERATOR(pg_catalog.=) $1`, [runtimeRole])).rows[0];
+          WHERE role.rolname OPERATOR(pg_catalog.=) $1
+            AND stat.dbid OPERATOR(pg_catalog.=) (
+              SELECT oid FROM pg_catalog.pg_database
+              WHERE datname OPERATOR(pg_catalog.=) pg_catalog.current_database()
+            )`, [runtimeRole])).rows[0];
         Object.assign(sample, { cpuUsageUsec: cpu, statements });
       }
+      sample.observedAtMs = now();
       samples.push(sample);
     }
   } finally {
     await client.end().catch(() => undefined);
   }
+  return { startAt, samples, quotas, addressLabels: { a: Boolean(inspect.a), b: Boolean(inspect.b) } };
+}
+
+export function finalizeCalibrationEvidence(raw, probes, contract) {
+  const { startAt, samples, quotas, addressLabels } = raw;
+  const definition = contract.observability.calibration;
+  const windowSeconds = definition.baselineWindowSeconds + definition.probeWindowSeconds;
+  const startAtMs = Date.parse(startAt);
   const pairs = [];
+  const statementPairs = [];
   for (let pair = 0; pair < definition.pairs; pair += 1) {
     const first = samples.find((sample) => sample.second === pair * windowSeconds);
     const middle = samples.find((sample) => sample.second === pair * windowSeconds + definition.baselineWindowSeconds);
     const last = samples.find((sample) => sample.second === (pair + 1) * windowSeconds);
-    const contaminated = !first || !middle || !last
+    const commonContamination = !first || !middle || !last
       || first.statements.stats_reset !== middle.statements.stats_reset || middle.statements.stats_reset !== last.statements.stats_reset
       || first.statements.dealloc !== middle.statements.dealloc || middle.statements.dealloc !== last.statements.dealloc
       || middle.statements.calls < first.statements.calls || last.statements.calls < middle.statements.calls
@@ -1285,55 +1300,95 @@ export async function collectCalibrationEvidence({
       || middle.statements.xact_rollback < first.statements.xact_rollback || last.statements.xact_rollback < middle.statements.xact_rollback
       || (middle.statements.calls - first.statements.calls) / definition.baselineWindowSeconds > definition.idleRuntimeRoleCallsPerSecondCeiling;
     for (const label of ["a", "b", "database"]) {
+      const qualifying = probes.filter((probe) => probe.phase === `calibration-${pair + 1}`
+        && (label === "database" || probe.machine === label) && probe.transportFailure !== true && probe.snapshot
+        && probe.startedAtMs >= middle?.observedAtMs && probe.completedAtMs <= last?.observedAtMs);
       pairs.push({
         pair,
         label,
         baselineDelta: middle?.cpuUsageUsec[label] - first?.cpuUsageUsec[label],
-        baselineElapsedMs: definition.baselineWindowSeconds * 1000,
+        baselineElapsedMs: middle?.observedAtMs - first?.observedAtMs,
         probeDelta: last?.cpuUsageUsec[label] - middle?.cpuUsageUsec[label],
-        probeElapsedMs: definition.probeWindowSeconds * 1000,
-        probeCount: definition.probesPerMachinePerWindow * (label === "database" ? 2 : 1),
-        ...(contaminated ? { rejected: "counter-reset-deallocation-or-decrease" } : {}),
+        probeElapsedMs: last?.observedAtMs - middle?.observedAtMs,
+        probeCount: qualifying.length,
+        ...(commonContamination || qualifying.length !== definition.probesPerMachinePerWindow * (label === "database" ? 2 : 1)
+          ? { rejected: "counter-contamination-or-probe-count" } : {}),
       });
     }
-  }
-  const budget = definition.cpuNoisePercentCeiling;
-  const machine = ["a", "b"].map((label) => evaluateCalibrationPairs(pairs.filter((pair) => pair.label === label), { approvedCeiling: definition.machineCpuPercentCeiling * 150_000, approvedNoiseCeiling: budget * 150_000 }));
-  const database = evaluateCalibrationPairs(pairs.filter((pair) => pair.label === "database"), {
-    approvedCeiling: definition.databaseCpuPercentCeiling * 150_000 * quotas.database.cpus,
-    approvedNoiseCeiling: budget * 150_000 * quotas.database.cpus,
-  });
-  const statementPairs = [];
-  for (let pair = 0; pair < definition.pairs; pair += 1) {
-    const first = samples.find((sample) => sample.second === pair * windowSeconds);
-    const middle = samples.find((sample) => sample.second === pair * windowSeconds + definition.baselineWindowSeconds);
-    const last = samples.find((sample) => sample.second === (pair + 1) * windowSeconds);
+    const combinedProbes = probes.filter((probe) => probe.phase === `calibration-${pair + 1}` && probe.transportFailure !== true && probe.snapshot
+      && probe.startedAtMs >= middle?.observedAtMs && probe.completedAtMs <= last?.observedAtMs);
     statementPairs.push({
       pair,
       baselineDelta: middle?.statements.calls - first?.statements.calls,
-      baselineElapsedMs: definition.baselineWindowSeconds * 1000,
+      baselineElapsedMs: middle?.observedAtMs - first?.observedAtMs,
       probeDelta: last?.statements.calls - middle?.statements.calls,
-      probeElapsedMs: definition.probeWindowSeconds * 1000,
-      probeCount: definition.probesPerMachinePerWindow * 2,
-      ...(!first || !middle || !last || first.statements.stats_reset !== last.statements.stats_reset
-        || first.statements.dealloc !== last.statements.dealloc ? { rejected: "counter-reset-or-deallocation" } : {}),
+      probeElapsedMs: last?.observedAtMs - middle?.observedAtMs,
+      probeCount: combinedProbes.length,
+      ...(commonContamination || combinedProbes.length !== definition.probesPerMachinePerWindow * 2
+        ? { rejected: "counter-contamination-or-probe-count" } : {}),
     });
   }
+  const budget = definition.cpuNoisePercentCeiling;
+  const machine = ["a", "b"].map((label) => evaluateCalibrationPairs(pairs.filter((pair) => pair.label === label), { approvedCeiling: definition.machineCpuPercentCeiling * 150_000, approvedNoiseCeiling: budget * 150_000 }));
+  const databasePairs = pairs.filter((pair) => pair.label === "database" && pair.rejected === undefined).map((pair) => {
+    const incrementalUsec = pair.probeDelta - pair.baselineDelta * (pair.probeElapsedMs / pair.baselineElapsedMs);
+    const measuredPercent = 100 * (incrementalUsec / 1_000_000) / ((pair.probeElapsedMs / 1000) * quotas.database.cpus);
+    const baselinePercent = 100 * (pair.baselineDelta / 1_000_000) / ((pair.baselineElapsedMs / 1000) * quotas.database.cpus);
+    return { ...pair, incrementalUsec, measuredPercent, baselinePercent };
+  });
+  const databaseMaximum = databasePairs.length === 0 ? null : Math.max(...databasePairs.map((pair) => pair.measuredPercent));
+  const databaseNoise = databasePairs.length === 0 ? null : Math.max(...databasePairs.map((pair) => pair.baselinePercent)) - Math.min(...databasePairs.map((pair) => pair.baselinePercent));
+  const database = {
+    verdict: databasePairs.length < definition.minimumValidPairs ? "incomplete"
+      : databaseMaximum <= definition.databaseCpuPercentCeiling && databaseNoise <= definition.cpuNoisePercentCeiling ? "pass"
+        : databaseMaximum > definition.databaseCpuPercentCeiling && databaseMaximum > databaseNoise ? "fail" : "incomplete",
+    validPairs: databasePairs.length,
+    measuredMaximum: databaseMaximum,
+    noiseAllowance: databaseNoise,
+    definition: "incremental database CPU-seconds over each combined two-machine probe interval divided by elapsed interval seconds and recorded database CPU quota",
+  };
   const statements = evaluateCalibrationPairs(statementPairs, {
     approvedCeiling: definition.measuredCallsPerProbeCeiling,
     approvedNoiseCeiling: definition.measuredCallsPerProbeCeiling,
   });
-  const connectionSamples = samples.map((sample) => sample.connectionCounts.a + sample.connectionCounts.b);
-  const connections = evaluateConnectionEvidence({
-    baseline: connectionSamples[0],
-    probeSamples: connectionSamples,
-    tailSamples: connectionSamples.slice(-6),
-    sampledIncrementCeiling: definition.sampledConnectionIncrementCeiling,
-    structuralMaximum: 3,
-    activeIntervals: definition.pairs * 2,
-    sampledActiveIntervals: definition.pairs * 2,
+  const perMachineConnections = ["a", "b"].map((machineLabel) => {
+    const probeRecords = probes.filter((probe) => probe.machine === machineLabel && String(probe.phase).startsWith("calibration-") && probe.transportFailure !== true && probe.snapshot);
+    let coveredIntervals = 0;
+    let complete = true;
+    let residualBreach = false;
+    const increments = [];
+    for (let pair = 1; pair <= definition.pairs; pair += 1) {
+      const pairProbes = probeRecords.filter((probe) => probe.phase === `calibration-${pair}`);
+      const pairStart = startAtMs + (pair - 1) * windowSeconds * 1000;
+      const baseline = samples.filter((sample) => sample.observedAtMs >= pairStart
+        && sample.observedAtMs < pairStart + definition.baselineWindowSeconds * 1000);
+      const active = samples.filter((sample) => pairProbes.some((probe) => sample.observedAtMs >= probe.startedAtMs && sample.observedAtMs <= probe.completedAtMs));
+      coveredIntervals += pairProbes.filter((probe) => active.some((sample) => sample.observedAtMs >= probe.startedAtMs && sample.observedAtMs <= probe.completedAtMs)).length;
+      if (baseline.length === 0 || active.length === 0 || pairProbes.length === 0) { complete = false; continue; }
+      const baselineMaximum = Math.max(...baseline.map((sample) => sample.connectionCounts[machineLabel]));
+      const activeMaximum = Math.max(...active.map((sample) => sample.connectionCounts[machineLabel]));
+      increments.push(Math.max(0, activeMaximum - baselineMaximum));
+      const last = Math.max(...pairProbes.map((probe) => probe.completedAtMs));
+      const tail = samples.filter((sample) => sample.observedAtMs >= last && sample.observedAtMs <= last + definition.sampledConnectionResidualSeconds * 1000);
+      if (tail.length === 0) complete = false;
+      else if (tail.at(-1).connectionCounts[machineLabel] > baselineMaximum) residualBreach = true;
+    }
+    const sampledIncrement = Math.max(0, ...increments);
+    const unknown = samples.some((sample) => sample.connectionCounts.unknown > 0);
+    const definiteFailure = sampledIncrement > definition.sampledConnectionIncrementCeiling || residualBreach;
+    const verdict = definiteFailure ? "fail"
+      : !complete || unknown || coveredIntervals !== probeRecords.length || probeRecords.length === 0 ? "incomplete" : "pass";
+    return { machine: machineLabel, verdict, sampledIncrement, residualBreach, structuralMaximum: 3,
+      activeIntervals: probeRecords.length, sampledActiveIntervals: coveredIntervals, zeroIncrementNotZeroCost: sampledIncrement === 0 };
   });
-  return { startAt, samples, pairs, statementPairs, machine, database, statements, connections, quotas, addressLabels: { a: Boolean(inspect.a), b: Boolean(inspect.b) } };
+  const connections = {
+    verdict: perMachineConnections.some((entry) => entry.verdict === "fail") ? "fail"
+      : perMachineConnections.some((entry) => entry.verdict === "incomplete") ? "incomplete" : "pass",
+    sampledIncrement: Math.max(0, ...perMachineConnections.map((entry) => entry.sampledIncrement ?? 0)),
+    machines: perMachineConnections,
+  };
+  connections.zeroIncrementNotZeroCost = connections.sampledIncrement === 0;
+  return { startAt, samples, pairs, statementPairs, machine, database, statements, connections, quotas, addressLabels };
 }
 
 function walkFiles(root, directory = root, files = []) {
@@ -1370,6 +1425,8 @@ export function stageBuiltPackage({
   cpSync(machineAgentPath, join(destination, "certification", "machine-agent.mjs"), { errorOnExist: true });
   cpSync(new URL("../test/certification/schedule.mjs", import.meta.url), join(destination, "certification", "schedule.mjs"), { errorOnExist: true });
   cpSync(new URL("../test/certification/contract.mjs", import.meta.url), join(destination, "certification", "contract.mjs"), { errorOnExist: true });
+  cpSync(new URL("../test/certification/observability.mjs", import.meta.url), join(destination, "certification", "observability.mjs"), { errorOnExist: true });
+  cpSync(new URL("../test/certification/canary-corpus.mjs", import.meta.url), join(destination, "certification", "canary-corpus.mjs"), { errorOnExist: true });
   cpSync(contractPath, join(destination, "certification", basename(contractPath)), { errorOnExist: true });
   if (existsSync(approvalPath)) cpSync(approvalPath, join(destination, "certification", basename(approvalPath)), { errorOnExist: true });
   cpSync(new URL("../test/certification/backend-publication.mjs", import.meta.url), join(destination, "certification", "backend-publication.mjs"), { errorOnExist: true });
@@ -1400,37 +1457,57 @@ async function createPostgreSqlFaultMutation(phase, { adminUrl, caFile, processR
   if (phase === "canary") return { clear: async () => undefined };
   const loaded = await import("pg");
   const Client = loaded.Client ?? loaded.default?.Client;
-  const client = new Client({ connectionString: adminUrl, ssl: { ca: readFileSync(caFile, "utf8"), rejectUnauthorized: true } });
-  await client.connect();
+  const client = new Client({
+    connectionString: adminUrl,
+    ssl: { ca: readFileSync(caFile, "utf8"), rejectUnauthorized: true },
+    connectionTimeoutMillis: 30_000,
+    statement_timeout: 60_000,
+    query_timeout: 60_000,
+  });
+  try {
+    await client.connect();
+    await client.query("SET lock_timeout = '5s'");
+    await client.query("SET statement_timeout = '60s'");
+  } catch (error) {
+    await client.end().catch(() => undefined);
+    throw error;
+  }
+  let finished = false;
   const finish = async (sql) => {
+    if (finished) return;
+    finished = true;
     try { if (sql) await client.query(sql); }
-    finally { await client.end(); }
+    finally { await client.end().catch(() => undefined); }
   };
-  if (phase === "saturation") {
-    await client.query("BEGIN");
-    await client.query("LOCK TABLE lcm.promoted_memories IN ACCESS EXCLUSIVE MODE");
-    return { clear: () => finish("COMMIT") };
+  try {
+    if (phase === "saturation") {
+      await client.query("BEGIN");
+      await client.query("LOCK TABLE lcm.promoted_memories IN ACCESS EXCLUSIVE MODE");
+      return { clear: () => finish("COMMIT") };
+    }
+    if (phase === "timeout") {
+      await client.query("BEGIN");
+      await client.query("LOCK TABLE lcm.schema_migrations IN ACCESS EXCLUSIVE MODE");
+      return { clear: () => finish("COMMIT") };
+    }
+    if (phase === "stats-reset") {
+      await client.query("SELECT public.pg_stat_statements_reset()");
+      await finish();
+      return { clear: async () => undefined };
+    }
+    if (phase === "permission-loss") {
+      await client.query("REVOKE EXECUTE ON FUNCTION public.pg_stat_statements(boolean) FROM PUBLIC");
+      return { clear: () => finish("GRANT EXECUTE ON FUNCTION public.pg_stat_statements(boolean) TO PUBLIC") };
+    }
+    if (phase === "extension-loss") {
+      await client.query("DROP EXTENSION pg_stat_statements");
+      return { clear: () => finish("CREATE EXTENSION pg_stat_statements WITH SCHEMA public") };
+    }
+    throw new Error(`unsupported certification observability phase ${phase}`);
+  } catch (error) {
+    await finish().catch(() => undefined);
+    throw error;
   }
-  if (phase === "timeout") {
-    await client.query("BEGIN");
-    await client.query("LOCK TABLE lcm.schema_migrations IN ACCESS EXCLUSIVE MODE");
-    return { clear: () => finish("COMMIT") };
-  }
-  if (phase === "stats-reset") {
-    await client.query("SELECT public.pg_stat_statements_reset()");
-    await client.end();
-    return { clear: async () => undefined };
-  }
-  if (phase === "permission-loss") {
-    await client.query("REVOKE EXECUTE ON FUNCTION public.pg_stat_statements(boolean) FROM PUBLIC");
-    return { clear: () => finish("GRANT EXECUTE ON FUNCTION public.pg_stat_statements(boolean) TO PUBLIC") };
-  }
-  if (phase === "extension-loss") {
-    await client.query("DROP EXTENSION pg_stat_statements");
-    return { clear: () => finish("CREATE EXTENSION pg_stat_statements WITH SCHEMA public") };
-  }
-  await client.end();
-  throw new Error(`unsupported certification observability phase ${phase}`);
 }
 
 export async function runV4ObservabilityPhases({
@@ -1447,51 +1524,78 @@ export async function runV4ObservabilityPhases({
   mutation = createPostgreSqlFaultMutation,
 }) {
   const faults = [];
+  const barriers = [];
   const phases = ["saturation", "timeout", "stats-reset", "permission-loss", "extension-loss", "queue-backlog", "canary"];
   for (const phase of phases) {
-    const preparedAt = new Date().toISOString();
-    for (const machine of ['a', 'b']) writeFileSync(
-      join(evidenceDirectory, `machine-${machine}`, `${phase}-prepare.json`),
-      `${JSON.stringify({ preparedAt })}\n`, { mode: 0o600, flag: "wx" },
-    );
-    await waitForFiles(['a', 'b'].map((machine) => join(evidenceDirectory, `machine-${machine}`, `${phase}-ready.json`)), machineNames, 120_000);
-    const requestedAt = new Date().toISOString();
-    const active = await mutation(phase, { adminUrl, caFile, processRunner, containerCli, network, machineB });
-    const appliedAt = new Date().toISOString();
+    let active;
+    let activeCleared = false;
+    let requestedAt;
+    let appliedAt;
+    let clearedAt;
     const detectionMachines = phase === "saturation" || phase === "queue-backlog" ? ['b'] : ['a', 'b'];
-    for (const machine of ['a', 'b']) writeFileSync(
-      join(evidenceDirectory, `machine-${machine}`, `${phase}-control.json`),
-      `${JSON.stringify({ appliedAt, expectDetection: detectionMachines.includes(machine) })}\n`, { mode: 0o600, flag: "wx" },
-    );
-    const detectionPaths = detectionMachines.map((machine) => join(evidenceDirectory, `machine-${machine}`, `${phase}-detected.json`));
-    if (phase === "queue-backlog") {
-      await waitForFiles([join(evidenceDirectory, "machine-b", "queue-backlog-aged.json")], machineNames, contract.timeline.full.backlogHoldMaxSeconds * 1000);
-      await active.clear();
-      await waitForFiles(detectionPaths, machineNames, contract.observability.clearanceSeconds.backlog * 1000);
-    } else {
-      const holdKey = phase === "saturation" ? "saturationLock" : phase === "permission-loss" ? "permissionLoss" : phase === "extension-loss" ? "extensionLoss" : phase;
-      await waitForFiles(detectionPaths, machineNames, (contract.observability.faultHoldMaximumSeconds[holdKey] ?? 60) * 1000);
-      await active.clear();
+    const publishCleared = () => {
+      if (clearedAt !== undefined) return;
+      clearedAt = new Date().toISOString();
+      for (const machine of ['a', 'b']) writeFileSync(
+        join(evidenceDirectory, `machine-${machine}`, `${phase}-cleared.json`),
+        `${JSON.stringify({ clearedAt })}\n`, { mode: 0o600, flag: "wx" },
+      );
+    };
+    try {
+      const preparedAt = new Date().toISOString();
+      for (const machine of ['a', 'b']) writeFileSync(
+        join(evidenceDirectory, `machine-${machine}`, `${phase}-prepare.json`),
+        `${JSON.stringify({ preparedAt })}\n`, { mode: 0o600, flag: "wx" },
+      );
+      await waitForFiles(['a', 'b'].map((machine) => join(evidenceDirectory, `machine-${machine}`, `${phase}-ready.json`)), machineNames, 120_000);
+      requestedAt = new Date().toISOString();
+      active = await mutation(phase, { adminUrl, caFile, processRunner, containerCli, network, machineB });
+      appliedAt = new Date().toISOString();
+      for (const machine of ['a', 'b']) writeFileSync(
+        join(evidenceDirectory, `machine-${machine}`, `${phase}-control.json`),
+        `${JSON.stringify({ appliedAt, expectDetection: detectionMachines.includes(machine) })}\n`, { mode: 0o600, flag: "wx" },
+      );
+      const detectionPaths = detectionMachines.map((machine) => join(evidenceDirectory, `machine-${machine}`, `${phase}-detected.json`));
+      if (phase === "queue-backlog") {
+        await waitForFiles([join(evidenceDirectory, "machine-b", "queue-backlog-aged.json")], machineNames, contract.timeline.full.backlogHoldMaxSeconds * 1000);
+        await active.clear(); activeCleared = true; publishCleared();
+        await waitForFiles(detectionPaths, machineNames, contract.observability.clearanceSeconds.backlog * 1000);
+      } else {
+        const holdKey = phase === "saturation" ? "saturationLock" : phase === "permission-loss" ? "permissionLoss" : phase === "extension-loss" ? "extensionLoss" : phase === "stats-reset" ? "statsReset" : phase;
+        await waitForFiles(detectionPaths, machineNames, (contract.observability.faultHoldMaximumSeconds[holdKey] ?? 60) * 1000);
+        await active.clear(); activeCleared = true; publishCleared();
+      }
+      const completionSeconds = phase === "queue-backlog" ? contract.timeline.full.backlogRecoverySeconds
+        : phase === "canary" ? contract.timeline.full.canaryPhaseMaxSeconds + 120 : 120;
+      await waitForFiles(
+        ['a', 'b'].flatMap((machine) => [join(evidenceDirectory, `machine-${machine}`, `${phase}-clearance.json`), join(evidenceDirectory, `machine-${machine}`, `${phase}-complete.json`)]),
+        machineNames,
+        completionSeconds * 1000,
+      );
+      barriers.push({ step: phase, verdict: "pass" });
+      faults.push({ id: phase, kind: phase, target: detectionMachines.join(","), requestedAt, appliedAt, clearedAt, recoveredAt: new Date().toISOString() });
+    } catch (error) {
+      barriers.push({ step: phase, verdict: "barrier-timeout", errorClass: error?.name ?? "Error" });
+      if (active && !activeCleared) {
+        try { await active.clear(); activeCleared = true; }
+        catch (clearError) { barriers.push({ step: `${phase}-cleanup`, verdict: "fail", errorClass: clearError?.name ?? "Error" }); }
+      }
+      if (appliedAt !== undefined) {
+        publishCleared();
+        faults.push({ id: phase, kind: phase, target: detectionMachines.join(","), requestedAt, appliedAt, clearedAt, recoveredAt: new Date().toISOString() });
+      }
+      for (const machine of ['a', 'b']) writeFileSync(
+        join(evidenceDirectory, `machine-${machine}`, "observability-stop.json"),
+        `${JSON.stringify({ stoppedAfter: phase, at: new Date().toISOString() })}\n`, { mode: 0o600, flag: "wx" },
+      );
+      for (const skipped of phases.slice(phases.indexOf(phase) + 1)) barriers.push({ step: skipped, verdict: "incomplete", reason: "skipped-after-barrier-timeout" });
+      break;
+    } finally {
+      if (active && !activeCleared) await active.clear().catch(() => undefined);
+      writeFileSync(join(evidenceDirectory, "observability-barriers.json"), `${JSON.stringify(barriers, null, 2)}\n`, { mode: 0o600 });
     }
-    const clearedAt = new Date().toISOString();
-    for (const machine of ['a', 'b']) writeFileSync(
-      join(evidenceDirectory, `machine-${machine}`, `${phase}-cleared.json`),
-      `${JSON.stringify({ clearedAt })}\n`, { mode: 0o600, flag: "wx" },
-    );
-    const completionSeconds = phase === "queue-backlog" ? contract.timeline.full.backlogRecoverySeconds
-      : phase === "canary" ? contract.timeline.full.canaryPhaseMaxSeconds + 120
-        : 120;
-    await waitForFiles(
-      ['a', 'b'].flatMap((machine) => [
-        join(evidenceDirectory, `machine-${machine}`, `${phase}-clearance.json`),
-        join(evidenceDirectory, `machine-${machine}`, `${phase}-complete.json`),
-      ]),
-      machineNames,
-      completionSeconds * 1000,
-    );
-    faults.push({ id: phase, kind: phase, target: detectionMachines.join(","), requestedAt, appliedAt, clearedAt, recoveredAt: new Date().toISOString() });
   }
-  return faults;
+  return { faults, barriers };
 }
 
 export function verifyDistinctMachineIdentities(homes) {
@@ -1535,50 +1639,152 @@ function ndjsonFromFile(path) {
   return readFileSync(path, "utf8").split("\n").filter(Boolean).map((line) => JSON.parse(line));
 }
 
-function writeObservabilitySummary({ evidenceDirectory, contract, contractSha256, runId, faults, coordinatorInventory = [] }) {
+export function reconstructObservabilitySummary({ evidenceDirectory, contract, contractSha256, runId, faults, coordinatorInventory = [], persist = true }) {
   const probes = ['a', 'b'].flatMap((machine) => ndjsonFromFile(join(evidenceDirectory, `machine-${machine}`, "probes.ndjson")));
+  const run = jsonFromFile(join(evidenceDirectory, "run.json"));
   const control = jsonFromFile(join(evidenceDirectory, "phase-control.json"));
   const steadyStartMs = Date.parse(control.steadyT0At);
-  const expectedSteady = ['a', 'b'].flatMap((machine) => createProbeSchedule({
+  const expectedProbeIds = ['a', 'b'].flatMap((machine) => createProbeSchedule({
     phase: "steady", machine, appliedAtMs: steadyStartMs,
-    holdMaximumMs: contract.timeline.full.steadySeconds * 1000,
+    holdMaximumMs: contract.timeline[run.profile].steadySeconds * 1000,
     cadenceMs: contract.observability.probe.steadyCadenceSeconds * 1000,
     timeoutMs: contract.observability.probe.transportTimeoutMs,
-  }).map((probe) => ({ ...probe, expected: true })));
+  }).map((probe) => probe.id));
+  for (const machine of ['a', 'b']) {
+    for (let pair = 1; pair <= contract.observability.calibration.pairs; pair += 1) {
+      for (let sequence = 0; sequence < contract.observability.calibration.probesPerMachinePerWindow; sequence += 1) {
+        expectedProbeIds.push(`calibration-${pair}-${machine}-probe-${sequence}`);
+      }
+    }
+    for (const phase of ["partition-a", "restart-database", "saturation", "timeout", "stats-reset", "permission-loss", "extension-loss", "queue-backlog", "canary"]) {
+      expectedProbeIds.push(`${phase}-${machine}-baseline`);
+      const phaseRecords = probes.filter((probe) => probe.phase === phase && probe.machine === machine && Number.isInteger(probe.sequence) && probe.sequence >= 0);
+      const maximumSequence = phaseRecords.length === 0 ? 0 : Math.max(...phaseRecords.map((probe) => probe.sequence));
+      for (let sequence = 0; sequence <= maximumSequence; sequence += 1) expectedProbeIds.push(`${phase}-${machine}-probe-${sequence}`);
+    }
+  }
+  const gapRecords = probes.map((probe) => ({ ...probe }));
+  const saturationDetectionPath = join(evidenceDirectory, "machine-b", "saturation-detected.json");
+  if (existsSync(saturationDetectionPath)) {
+    const witness = jsonFromFile(saturationDetectionPath);
+    const next = gapRecords.filter((probe) => probe.phase === "saturation" && probe.machine === "b" && probe.sequence > Number(String(witness.id).split("-").at(-1)))
+      .sort((left, right) => left.sequence - right.sequence)[0];
+    if (next) next.gapReset = true;
+  }
+  const phaseWindows = Object.fromEntries(faults.flatMap((fault) => ['a', 'b'].map((machine) => [
+    `${fault.id}:${machine}`,
+    { startMs: Date.parse(fault.appliedAt), endMs: Date.parse(fault.clearedAt) },
+  ])));
+  const probeCompleteness = evaluateProbePopulation({
+    expectedIds: expectedProbeIds,
+    records: gapRecords,
+    maximumStartGapMs: contract.observability.probe.maximumFaultStartGapSeconds * 1000,
+    phaseWindows,
+  });
+  const bindingFailures = probes.filter((probe) => probe.runId !== runId || probe.contractSha256 !== contractSha256);
+  if (bindingFailures.length > 0) {
+    probeCompleteness.verdict = "fail";
+    probeCompleteness.bindingFailures = bindingFailures.map((probe) => probe.id);
+  }
+  const rawIntegrityFailures = probes.filter((probe) => probe.transportFailure !== true).filter((probe) => {
+    const path = join(evidenceDirectory, `machine-${probe.machine}`, "raw-probes", `${probe.id}.json`);
+    if (!existsSync(path)) return true;
+    const bytes = readFileSync(path);
+    return bytes.length !== probe.rawBytes || createHash("sha256").update(bytes).digest("hex") !== probe.rawSha256;
+  });
+  if (rawIntegrityFailures.length > 0) {
+    probeCompleteness.verdict = "fail";
+    probeCompleteness.rawIntegrityFailures = rawIntegrityFailures.map((probe) => probe.id);
+  }
+  const phaseDurations = Object.fromEntries(["saturation", "timeout", "stats-reset", "permission-loss", "extension-loss", "queue-backlog", "canary"]
+    .map((phase) => [phase, observabilityPhaseWorkloadSeconds(contract, phase)]));
+  const allSamples = ['a', 'b'].flatMap((machine) => ndjsonFromFile(join(evidenceDirectory, `machine-${machine}`, "samples.ndjson")));
   const phaseResults = {
     steady: {
-      alert: probes.some((probe) => probe.phase === "steady"),
+      alert: probes.some((probe) => probe.phase === "steady")
+        && probes.filter((probe) => probe.phase === "steady").every((probe) => probe.transportFailure !== true && healthySnapshot(probe.snapshot)),
       detectionSeconds: 0,
       clearanceSeconds: 0,
-      correctness: probes.filter((probe) => probe.phase === "steady").every((probe) => probe.snapshot?.classification === "healthy"),
+      correctness: probes.filter((probe) => probe.phase === "steady").every((probe) => probe.transportFailure !== true && healthySnapshot(probe.snapshot)),
     },
   };
   for (const fault of faults) {
     const phase = fault.id;
-    const detected = ['a', 'b'].flatMap((machine) => {
-      const path = join(evidenceDirectory, `machine-${machine}`, `${phase}-detected.json`);
-      return existsSync(path) ? [jsonFromFile(path)] : [];
+    const phaseProbeRecords = probes.filter((probe) => probe.phase === phase);
+    const baseline = Object.fromEntries(['a', 'b'].map((machine) => [machine, probes.find((probe) => probe.phase === `${phase}-baseline` && probe.machine === machine)]));
+    const backlogWitnessPath = join(evidenceDirectory, "machine-b", "queue-backlog-aged.json");
+    const backlogDetectionPath = join(evidenceDirectory, "machine-b", "queue-backlog-detected.json");
+    const evaluated = evaluatePhaseProbeEvidence({
+      phase,
+      probes: phaseProbeRecords,
+      fault,
+      baseline,
+      backlogWitness: existsSync(backlogWitnessPath) ? jsonFromFile(backlogWitnessPath) : undefined,
+      backlogDetection: existsSync(backlogDetectionPath) ? jsonFromFile(backlogDetectionPath).backlogRow : undefined,
     });
-    const cleared = ['a', 'b'].flatMap((machine) => {
-      const path = join(evidenceDirectory, `machine-${machine}`, `${phase}-clearance.json`);
-      return existsSync(path) ? [jsonFromFile(path)] : [];
-    });
-    const samples = ['a', 'b'].flatMap((machine) => ndjsonFromFile(join(evidenceDirectory, `machine-${machine}`, "samples.ndjson")))
-      .filter((sample) => sample.phase === phase);
-    const unexpectedFailures = samples.filter((sample) => sample.outcome !== "success"
-      && !(phase === "queue-backlog" && Date.parse(sample.wallEndedAt) <= Date.parse(fault.clearedAt)));
+    const samplePhase = phase === "partition-a" ? "partition-recovery" : phase === "restart-database" ? "restart-recovery" : phase;
+    const samples = allSamples.filter((sample) => sample.phase === samplePhase);
+    const perMachineWorkload = Object.hasOwn(phaseDurations, phase) ? ['a', 'b'].map((machine) => {
+      let expected;
+      if (phase === "canary") {
+        const workload = createCanaryWorkload(runId, machine);
+        expected = [...workload.hooks, ...workload.stores, ...workload.searches].map((entry) => entry.id);
+      } else {
+        expected = createObservabilityWorkloadSchedule({ machine, runId, phase, durationSeconds: phaseDurations[phase], includeHooks: phase === "queue-backlog" }).map((entry) => entry.id);
+        if (phase === "saturation" && machine === "b") expected.push(...[0, 1, 2].map((index) => `${runId}-saturation-b-blocking-store-${index}`));
+      }
+      const endMs = phase === "stats-reset" ? Date.parse(fault.appliedAt) + 30_000
+        : phase === "canary" ? Date.parse(fault.appliedAt) + contract.timeline.full.canaryPhaseMaxSeconds * 1000
+          : Date.parse(fault.clearedAt);
+      const selected = samples.filter((sample) => sample.machine === machine).map((sample) => ({
+        ...sample,
+        ...(phase === "queue-backlog" && sample.outcome !== "success" && Date.parse(sample.wallEndedAt) <= Date.parse(fault.clearedAt)
+          ? { intentionalFailure: true } : {}),
+      }));
+      return evaluatePhaseWorkload({
+        expectedIds: expected,
+        attempts: selected,
+        machine,
+        appliedAtMs: Date.parse(fault.appliedAt),
+        clearedAtMs: endMs,
+        minimumSearches: phase === "queue-backlog" ? 0 : 2,
+        minimumStores: phase === "queue-backlog" ? 0 : 1,
+      });
+    }) : [];
+    const workloadVerdict = perMachineWorkload.some((entry) => entry.verdict === "fail") ? "fail"
+      : perMachineWorkload.some((entry) => entry.verdict === "incomplete") ? "incomplete"
+        : perMachineWorkload.length > 0 ? "pass" : "incomplete";
+    let inheritedCorrectness;
+    if (phase === "partition-a" || phase === "restart-database") {
+      const recoveryPhase = phase === "partition-a" ? "partition-recovery" : "restart-recovery";
+      const durationSeconds = phase === "partition-a"
+        ? contract.thresholds.recovery.partition.rtoSeconds : contract.thresholds.recovery.restartDatabase.rtoSeconds;
+      const expected = ['a', 'b'].flatMap((machine) => createFaultSchedule({ machine, runId, phase: recoveryPhase, durationSeconds })).map((entry) => entry.id);
+      const observed = samples.map((sample) => sample.id);
+      const missing = expected.filter((id) => !observed.includes(id));
+      const extra = observed.filter((id) => !expected.includes(id));
+      const duplicates = observed.filter((id, index) => observed.indexOf(id) !== index);
+      inheritedCorrectness = extra.length > 0 || duplicates.length > 0 ? false : missing.length > 0 ? undefined : true;
+    }
     const backlogCatchUp = phase === "queue-backlog" ? ['a', 'b'].map((machine) => {
       const path = join(evidenceDirectory, `machine-${machine}`, "queue-backlog-catch-up.json");
       return existsSync(path) ? jsonFromFile(path) : undefined;
     }) : [];
     phaseResults[phase] = {
-      alert: detected.length > 0,
-      detectionSeconds: detected.length === 0 ? undefined : Math.max(...detected.map((entry) => (entry.completedAtMs - Date.parse(fault.appliedAt)) / 1000)),
-      clearanceSeconds: cleared.length === 0 ? undefined : Math.max(...cleared.map((entry) => (entry.completedAtMs - Date.parse(fault.clearedAt)) / 1000)),
-      correctness: samples.length > 0 && unexpectedFailures.length === 0,
-      recovery: cleared.length === 2 && unexpectedFailures.length === 0
+      alert: evaluated.alert,
+      detectionSeconds: evaluated.detectionSeconds,
+      clearanceSeconds: evaluated.clearanceSeconds,
+      correctness: inheritedCorrectness ?? (workloadVerdict === "pass" ? true : workloadVerdict === "fail" ? false : undefined),
+      recovery: evaluated.recovery === true && (inheritedCorrectness ?? workloadVerdict === "pass")
         && (phase !== "queue-backlog" || backlogCatchUp.every((entry) => entry?.verdict === "pass" && entry.remaining === 0)),
     };
+  }
+  const barriersPath = join(evidenceDirectory, "observability-barriers.json");
+  if (existsSync(barriersPath)) {
+    const barrierStates = evaluateBarrierSequence(jsonFromFile(barriersPath));
+    for (const state of barrierStates) {
+      if (state.verdict === "incomplete" && phaseResults[state.step] === undefined) phaseResults[state.step] = {};
+    }
   }
   const canaryWitnesses = ['a', 'b'].flatMap((machine) => {
     const path = join(evidenceDirectory, `machine-${machine}`, "canary-witnesses.json");
@@ -1594,42 +1800,53 @@ function writeObservabilitySummary({ evidenceDirectory, contract, contractSha256
     const path = join(evidenceDirectory, `machine-${machine}`, "privacy-surfaces.json");
     return existsSync(path) ? jsonFromFile(path).surfaces ?? [] : [];
   });
-  const coordinatorScans = ["run.json", "faults.json", "calibration-evidence.json"]
-    .filter((name) => existsSync(join(evidenceDirectory, name)))
-    .map((name) => scanSurface(readFileSync(join(evidenceDirectory, name)), coordinatorInventory, []));
-  const scans = [...probeScans, ...cliScans, ...privateScans, ...coordinatorScans];
+  const failureScans = ['a', 'b'].flatMap((machine) => ndjsonFromFile(join(evidenceDirectory, `machine-${machine}`, "failure-privacy.ndjson")));
+  const coordinatorPrivacyPath = join(evidenceDirectory, "coordinator-privacy.json");
+  let coordinatorScans;
+  if (existsSync(coordinatorPrivacyPath)) coordinatorScans = jsonFromFile(coordinatorPrivacyPath).surfaces;
+  else {
+    coordinatorScans = ["run.json", "faults.json", "calibration-evidence.json"]
+      .filter((name) => existsSync(join(evidenceDirectory, name)))
+      .map((name) => ({ name, ...scanSurface(readFileSync(join(evidenceDirectory, name)), coordinatorInventory, []) }));
+    if (persist) writeFileSync(coordinatorPrivacyPath, `${JSON.stringify({ surfaces: coordinatorScans })}\n`, { mode: 0o600, flag: "wx" });
+  }
+  const scans = [...probeScans, ...cliScans, ...privateScans, ...failureScans, ...coordinatorScans];
   const secretCategories = new Set(scans.flatMap((scan) => Object.keys(scan.categoryHits ?? {})));
+  const machineManifests = ['a', 'b'].map((machine) => {
+    const path = join(evidenceDirectory, `machine-${machine}`, "secret-inventory-manifest.json");
+    const receiptPath = join(evidenceDirectory, `machine-${machine}`, "contract-receipt.json");
+    if (!existsSync(path) || !existsSync(receiptPath)) return undefined;
+    const bytes = readFileSync(path);
+    const receipt = jsonFromFile(receiptPath);
+    return { manifest: JSON.parse(bytes.toString("utf8")), validHash: receipt.inventoryManifestSha256 === createHash("sha256").update(bytes).digest("hex") };
+  });
+  const coordinatorManifestPath = join(evidenceDirectory, "coordinator-inventory-manifest.json");
+  const coordinatorManifest = existsSync(coordinatorManifestPath) ? jsonFromFile(coordinatorManifestPath) : undefined;
+  const machineInventoryComplete = machineManifests.every((entry, index) => entry?.validHash === true
+    && entry.manifest.owner === ['a', 'b'][index]
+    && Array.isArray(entry.manifest.entries)
+    && REQUIRED_MACHINE_INVENTORY_CATEGORIES.every((category) => entry.manifest.entries.some((item) => item.category === category))
+    && Number.isSafeInteger(entry.manifest.caBody?.count) && entry.manifest.caBody.count > 0
+    && /^[0-9a-f]{64}$/u.test(entry.manifest.caBody.sha256)
+    && entry.manifest.entries.filter((item) => item.category.startsWith("ca-body-line-")).length === entry.manifest.caBody.count);
+  const coordinatorInventoryComplete = coordinatorManifest?.owner === "coordinator"
+    && Array.isArray(coordinatorManifest.entries)
+    && ["admin-url", "admin-password", "admin-role", "transfer-role"].every((category) => coordinatorManifest.entries.some((entry) => entry.category === category));
+  const daemonCoverage = ['a', 'b'].map((machine) => {
+    const path = join(evidenceDirectory, `machine-${machine}`, "daemon-output-coverage.json");
+    return existsSync(path) ? jsonFromFile(path) : undefined;
+  });
+  const surfacesComplete = machineManifests.every(Boolean) && coordinatorManifest !== undefined
+    && ['a', 'b'].every((machine) => existsSync(join(evidenceDirectory, `machine-${machine}`, "failure-privacy.ndjson")))
+    && canaryWitnesses.length === 2 && privateScans.length > 0 && probeScans.length > 0
+    && daemonCoverage.every((entry) => entry?.verdict === "pass" && entry.scannedBytes === entry.totalBytes);
   const privacy = {
     canaryHits: scans.reduce((sum, scan) => sum + (scan.canaryHits ?? 0), 0),
     secretHits: scans.reduce((sum, scan) => sum + (scan.secretHits ?? 0), 0),
     secretCategories: secretCategories.size,
-    inventoryComplete: secretCategories.size >= 14,
+    inventoryComplete: machineInventoryComplete && coordinatorInventoryComplete,
+    surfacesComplete,
   };
-  const phaseDurations = {
-    saturation: 30, timeout: 30, "stats-reset": 30, "permission-loss": 60,
-    "extension-loss": 60, "queue-backlog": contract.timeline.full.backlogHoldMaxSeconds,
-    canary: contract.timeline.full.canaryPhaseMaxSeconds,
-  };
-  const expectedIds = [];
-  for (const [phase, durationSeconds] of Object.entries(phaseDurations)) {
-    for (const machine of ['a', 'b']) {
-      if (phase === "canary") {
-        const workload = createCanaryWorkload(runId, machine);
-        expectedIds.push(...workload.hooks, ...workload.stores, ...workload.searches);
-      } else {
-        expectedIds.push(...createObservabilityWorkloadSchedule({ machine, runId, phase, durationSeconds, includeHooks: phase === "queue-backlog" }));
-      }
-    }
-    if (phase === "saturation") expectedIds.push(...[0, 1, 2].map((index) => ({ id: `${runId}-saturation-b-blocking-store-${index}` })));
-  }
-  const attempts = ['a', 'b'].flatMap((machine) => ndjsonFromFile(join(evidenceDirectory, `machine-${machine}`, "samples.ndjson")))
-    .filter((sample) => Object.hasOwn(phaseDurations, sample.phase))
-    .map((sample) => {
-      const fault = faults.find((entry) => entry.id === sample.phase);
-      const intentionalFailure = sample.phase === "queue-backlog" && sample.outcome !== "success"
-        && fault && Date.parse(sample.wallEndedAt) <= Date.parse(fault.clearedAt);
-      return { ...sample, overlapped: true, ...(intentionalFailure ? { intentionalFailure: true } : {}) };
-    });
   const calibrationPath = join(evidenceDirectory, "calibration-evidence.json");
   const calibrationEvidence = existsSync(calibrationPath) ? jsonFromFile(calibrationPath) : undefined;
   const combinedVerdict = (values) => values.includes("fail") ? "fail" : values.includes("incomplete") ? "incomplete" : "pass";
@@ -1642,8 +1859,9 @@ function writeObservabilitySummary({ evidenceDirectory, contract, contractSha256
     },
     databaseCpu: {
       verdict: calibrationEvidence.database.verdict,
-      measuredMaximum: (calibrationEvidence.database.measuredMaximum ?? 0) / (150_000 * calibrationEvidence.quotas.database.cpus),
+      measuredMaximum: calibrationEvidence.database.measuredMaximum ?? 0,
       ceiling: contract.observability.calibration.databaseCpuPercentCeiling,
+      definition: calibrationEvidence.database.definition,
     },
     statements: {
       verdict: calibrationEvidence.statements.verdict,
@@ -1653,9 +1871,10 @@ function writeObservabilitySummary({ evidenceDirectory, contract, contractSha256
   } : undefined;
   const summary = buildObservabilitySummary({
     contractSha256,
-    probes: [...expectedSteady, ...probes],
+    runId,
+    probes,
+    probeCompleteness,
     phaseResults,
-    workload: { expectedIds: expectedIds.map((entry) => entry.id), attempts },
     canary,
     privacy,
     calibration,
@@ -1667,7 +1886,7 @@ function writeObservabilitySummary({ evidenceDirectory, contract, contractSha256
   });
   const summaryScan = scanSurface(Buffer.from(JSON.stringify(summary)), coordinatorInventory, []);
   if (summaryScan.secretHits !== 0) throw new Error("public observability summary contains a coordinator identity or credential");
-  writeFileSync(join(evidenceDirectory, "observability-summary.json"), `${JSON.stringify(summary, null, 2)}\n`, { mode: 0o600, flag: "wx" });
+  if (persist) writeFileSync(join(evidenceDirectory, "observability-summary.json"), `${JSON.stringify(summary, null, 2)}\n`, { mode: 0o600, flag: "wx" });
   return summary;
 }
 
@@ -1695,6 +1914,7 @@ export function prepareEvidenceDirectory(path, metadata) {
 
 export async function runLocalCertification(options, dependencies = {}) {
   const contract = options.contract ?? loadCertificationContract(new URL("../test/certification/contract-v3.json", import.meta.url), { requireApproved: false }).contract;
+  assertCertificationRunPolicy({ contract, approval: options.approval }, { ...options, lane: "local" });
   const selectedContractPath = options.contractPath ?? fileURLToPath(new URL("../test/certification/contract-v3.json", import.meta.url));
   const selectedApprovalPath = options.approvalPath ?? fileURLToPath(new URL("../test/certification/contract-v3.approval.json", import.meta.url));
   if ((dependencies.environment ?? process.env).LCM_TEST_CONTAINER_CLI !== "podman") {
@@ -1960,7 +2180,10 @@ export async function runLocalCertification(options, dependencies = {}) {
             [context.names.machineA, context.names.machineB],
             contract.timeline.full.calibrationSeconds * 1000 + 120_000,
           );
-          const [calibration] = await Promise.all([calibrationEvidence, calibrationAgents]);
+          const [rawCalibration] = await Promise.all([calibrationEvidence, calibrationAgents]);
+          const calibrationProbes = ['a', 'b'].flatMap((machine) => ndjsonFromFile(join(options.evidenceDirectory, `machine-${machine}`, "probes.ndjson")))
+            .filter((probe) => String(probe.phase).startsWith("calibration-"));
+          const calibration = finalizeCalibrationEvidence(rawCalibration, calibrationProbes, contract);
           writeFileSync(join(options.evidenceDirectory, "calibration-evidence.json"), `${JSON.stringify(calibration, null, 2)}\n`, { mode: 0o600, flag: "wx" });
         }
         const warmupControl = publishWarmupControl(options.evidenceDirectory, dependencies.wallNow);
@@ -1997,6 +2220,18 @@ export async function runLocalCertification(options, dependencies = {}) {
             expectedPort: 5432,
             expectedRole: "lcm_test_runtime",
           };
+          if (contract.version === 4) {
+            const preparedAt = new Date().toISOString();
+            for (const machine of ['a', 'b']) writeFileSync(
+              join(options.evidenceDirectory, `machine-${machine}`, "partition-a-prepare.json"),
+              `${JSON.stringify({ preparedAt })}\n`, { mode: 0o600, flag: "wx" },
+            );
+            await waitForFiles(
+              ['a', 'b'].map((machine) => join(options.evidenceDirectory, `machine-${machine}`, "partition-a-ready.json")),
+              [context.names.machineA, context.names.machineB],
+              120_000,
+            );
+          }
           // Every fault phase uses the full profile's bound, including in a fault smoke.
           const clearMachineA = (phase) => waitForMachineDatabaseClearance({
             name: context.names.machineA, run: runContainer, expected: runtimeIdentity,
@@ -2034,6 +2269,18 @@ export async function runLocalCertification(options, dependencies = {}) {
           );
           const partitionRecoveredAt = new Date().toISOString();
           const restartRequestedAt = new Date().toISOString();
+          if (contract.version === 4) {
+            const preparedAt = new Date().toISOString();
+            for (const machine of ['a', 'b']) writeFileSync(
+              join(options.evidenceDirectory, `machine-${machine}`, "restart-database-prepare.json"),
+              `${JSON.stringify({ preparedAt })}\n`, { mode: 0o600, flag: "wx" },
+            );
+            await waitForFiles(
+              ['a', 'b'].map((machine) => join(options.evidenceDirectory, `machine-${machine}`, "restart-database-ready.json")),
+              [context.names.machineA, context.names.machineB],
+              120_000,
+            );
+          }
           await context.processRunner(context.containerCli, ["container", "stop", "--time", "120", context.names.container], { redactSecrets: context.secrets });
           const restartAppliedAt = new Date().toISOString();
           if (contract.version === 4) for (const machine of ['a', 'b']) writeFileSync(
@@ -2068,7 +2315,7 @@ export async function runLocalCertification(options, dependencies = {}) {
             { id: "restart-database", kind: "restart-database", target: "database", requestedAt: restartRequestedAt, appliedAt: restartAppliedAt, clearedAt: restartClearedAt, recoveredAt: restartRecoveredAt },
           ];
           if (contract.version === 4) {
-            observedFaults.push(...await runV4ObservabilityPhases({
+            const observabilityRun = await runV4ObservabilityPhases({
               contract,
               evidenceDirectory: options.evidenceDirectory,
               machineNames: [context.names.machineA, context.names.machineB],
@@ -2079,7 +2326,8 @@ export async function runLocalCertification(options, dependencies = {}) {
               network: context.names.network,
               machineB: context.names.machineB,
               waitForFiles,
-            }));
+            });
+            observedFaults.push(...observabilityRun.faults);
           }
           runFaults = observedFaults;
           writeFileSync(join(options.evidenceDirectory, "faults.json"), `${JSON.stringify(observedFaults, null, 2)}\n`, { mode: 0o600, flag: "wx" });
@@ -2099,18 +2347,20 @@ export async function runLocalCertification(options, dependencies = {}) {
           await context.processRunner(context.containerCli, ["container", "wait", name], { redactSecrets: context.secrets });
         }
         if (contract.version === 4) {
-          writeObservabilitySummary({
+          const coordinatorInventory = [
+            ["admin-url", context.environment.LCM_TEST_POSTGRES_ADMIN_URL],
+            ["admin-password", decodeURIComponent(new URL(context.environment.LCM_TEST_POSTGRES_ADMIN_URL).password)],
+            ["admin-role", decodeURIComponent(new URL(context.environment.LCM_TEST_POSTGRES_ADMIN_URL).username)],
+            ["transfer-role", databasePreparation.transferName],
+          ].map(([category, value]) => ({ category, value, sourceClass: "coordinator", scanMode: value.length >= 8 ? "all-forms" : "boundary-token" }));
+          writeFileSync(join(options.evidenceDirectory, "coordinator-inventory-manifest.json"), `${JSON.stringify(createInventoryManifest(coordinatorInventory, "coordinator"), null, 2)}\n`, { mode: 0o600, flag: "wx" });
+          reconstructObservabilitySummary({
             evidenceDirectory: options.evidenceDirectory,
             contract,
             contractSha256: options.contractSha256,
             runId: context.runId,
             faults: runFaults,
-            coordinatorInventory: [
-              ["admin-url", context.environment.LCM_TEST_POSTGRES_ADMIN_URL],
-              ["admin-password", decodeURIComponent(new URL(context.environment.LCM_TEST_POSTGRES_ADMIN_URL).password)],
-              ["admin-role", decodeURIComponent(new URL(context.environment.LCM_TEST_POSTGRES_ADMIN_URL).username)],
-              ["transfer-role", databasePreparation.transferName],
-            ].map(([category, value]) => ({ category, value, sourceClass: "coordinator", scanMode: value.length >= 8 ? "all-forms" : "boundary-token" })),
+            coordinatorInventory,
           });
         }
         return { stage, machines: machineRoots };
@@ -2139,10 +2389,10 @@ export async function runLocalCertification(options, dependencies = {}) {
 
 export async function main(argv = process.argv.slice(2)) {
   const options = parseCertificationArguments(argv);
-  const loaded = loadCertificationContract(options.contractPath, { requireApproved: false });
-  if (options.profile === "full" && loaded.approval === undefined) {
-    throw new Error("certification full profile requires a matching approval record");
-  }
+  const loaded = assertCertificationRunPolicy(
+    loadCertificationContract(options.contractPath, { requireApproved: false }),
+    options,
+  );
   options.contract = loaded.contract;
   options.contractSha256 = loaded.sha256;
   options.contractStatus = loaded.status;

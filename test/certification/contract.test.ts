@@ -4,6 +4,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { describe, expect, it } from "vitest";
 import {
+  assertCertificationRunPolicy,
   certificationDeadlineSeconds,
   expectedSteadyAttempts,
   loadCertificationContract,
@@ -74,6 +75,46 @@ describe("certification contract", () => {
     candidate.timeline.smoke.faultObservabilityDeadlineSeconds += 1;
     writeFileSync(path, `${JSON.stringify(candidate)}\n`);
     expect(() => loadCertificationContract(path, { requireApproved: false })).toThrow("fault observability smoke timeline");
+  });
+
+  it("loads a hash-approved non-provisional v4 contract with resized empirical budgets", () => {
+    const directory = mkdtempSync(join(tmpdir(), "lcm-cert-contract-v4-final-"));
+    const candidate = JSON.parse(readFileSync(v4ContractPath, "utf8"));
+    candidate.timeline.full.observabilityAllocationsProvisional = false;
+    candidate.observability.calibration.budgetCeilingsProvisional = false;
+    candidate.observability.calibration.machineCpuPercentCeiling = 3;
+    candidate.observability.calibration.databaseCpuPercentCeiling = 4;
+    candidate.observability.calibration.cpuNoisePercentCeiling = 1;
+    candidate.observability.calibration.idleRuntimeRoleCallsPerSecondCeiling = 2;
+    candidate.observability.calibration.sampledConnectionIncrementCeiling = 1;
+    const path = join(directory, "contract-v4.json");
+    writeFileSync(path, `${JSON.stringify(candidate)}\n`);
+    const sha256 = createHash("sha256").update(readFileSync(path)).digest("hex");
+    writeFileSync(join(directory, "contract-v4.approval.json"), `${JSON.stringify({
+      contractSha256: sha256, approvedBy: "owner", approvedAt: "2026-11-05T00:00:00Z",
+      note: "approved after smoke", approvalRef: "issue-640",
+    })}\n`);
+    const loaded = loadCertificationContract(path);
+    expect(loaded).toMatchObject({ status: "approved", contract: { version: 4 } });
+    expect(() => assertCertificationRunPolicy(loaded, { lane: "local", profile: "full" })).not.toThrow();
+  });
+
+  it("requires approval for v3 smoke and faults for v4 local smoke", () => {
+    const directory = mkdtempSync(join(tmpdir(), "lcm-cert-contract-v3-unapproved-"));
+    const v3Path = join(directory, "contract-v3.json");
+    writeFileSync(v3Path, readFileSync(contractPath));
+    const v3 = loadCertificationContract(v3Path, { requireApproved: false });
+    const v4 = loadCertificationContract(v4ContractPath, { requireApproved: false });
+    expect(() => assertCertificationRunPolicy(v3, { lane: "local", profile: "smoke" })).toThrow("approval");
+    expect(() => assertCertificationRunPolicy(v4, { lane: "local", profile: "smoke" })).toThrow("--with-faults");
+    expect(() => assertCertificationRunPolicy(v4, { lane: "local", profile: "smoke", withFaults: true })).not.toThrow();
+  });
+
+  it("refuses a full v4 run while approved empirical budgets remain provisional", () => {
+    const provisional = loadCertificationContract(v4ContractPath, { requireApproved: false });
+    expect(() => assertCertificationRunPolicy({ ...provisional, approval: { contractSha256: provisional.sha256 } }, {
+      lane: "local", profile: "full",
+    })).toThrow("non-provisional");
   });
 
   it("refuses the superseded v2 contract kept as history, even with its matching approval", () => {

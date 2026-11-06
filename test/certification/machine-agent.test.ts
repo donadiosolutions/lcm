@@ -81,6 +81,21 @@ describe("observability probes", () => {
     verify.close();
   });
 
+  it("matches collector precedence by rejecting an invalid pending timestamp induction", async () => {
+    const root = mkdtempSync(join(tmpdir(), "lcm-cert-backlog-invalid-"));
+    const path = join(root, "events.db");
+    const database = new DatabaseSync(path);
+    database.exec(`CREATE TABLE events (
+      event_id INTEGER PRIMARY KEY, event_uuid TEXT NOT NULL UNIQUE,
+      delivery_state TEXT NOT NULL, created_at TEXT NOT NULL,
+      delivery_next_attempt_at TEXT NOT NULL, delivery_updated_at TEXT NOT NULL
+    )`);
+    database.prepare("INSERT INTO events VALUES (?, ?, ?, ?, ?, ?)").run(1, "valid", "pending", "2026-11-05 00:00:00", "2026-11-05 00:00:00", "2026-11-05 00:00:00");
+    database.prepare("INSERT INTO events VALUES (?, ?, ?, ?, ?, ?)").run(2, "invalid", "retry", "invalid", "2026-11-05 00:00:00", "2026-11-05 00:00:00");
+    database.close();
+    await expect(deferOldestPendingDelivery(path, { nowMs: Date.parse("2026-11-05T00:20:00Z") })).rejects.toThrow("not naturally aged");
+  });
+
   it("scans bounded daemon, failure and log outputs without publishing their text", () => {
     const root = mkdtempSync(join(tmpdir(), "lcm-cert-private-scan-"));
     const home = join(root, "home");
@@ -98,21 +113,22 @@ describe("observability probes", () => {
   it("scans and validates exact raw response bytes before parsing", async () => {
     const evidenceDirectory = mkdtempSync(join(tmpdir(), "lcm-cert-probe-"));
     const body = Buffer.from(JSON.stringify({ backendDiagnostics: { telemetry: {
-      statements: { status: "observed", observedAt: 1, scope: "aggregate", operations: [] },
+      statements: { status: "observed", observedAt: 1, scope: "aggregate", omitted: {}, operations: [] },
       pool: { status: "observed", observedAt: 1, health: "healthy", omitted: [], remediation: "No action required.", saturationRatio: 0 },
       migration: { status: "observed", observedAt: 1, health: "healthy", omitted: [], remediation: "No action required.", historyStatus: "current", appliedCount: 1, expectedCount: 1 },
       extensions: { status: "observed", observedAt: 1, health: "healthy", omitted: [], remediation: "No action required.", entries: [
-        { name: "pg_stat_statements" }, { name: "pg_trgm" }, { name: "pgcrypto" }, { name: "unaccent" },
+        ...["pg_stat_statements", "pg_trgm", "pgcrypto", "unaccent"].map((name) => ({ name, status: "current", installedVersion: "1", defaultVersion: "1" })),
       ] },
       queue: { status: "observed", observedAt: 1, health: "healthy", omitted: [], remediation: "No action required.", inboxClaimed: 0 },
     } } }));
     const record = await runRawStatusProbe({
       id: "steady-a-probe-0", machine: "a", phase: "steady", sequence: 0,
+      runId: "run", contractSha256: "a".repeat(64),
       cwd: "/project", token: "token", evidenceDirectory, operationIds: [],
       fetch: async () => ({ status: 200, arrayBuffer: async () => body }) as any,
       now: (() => { let value = 100; return () => value += 10; })(),
     });
-    expect(record).toMatchObject({ rawBytes: body.length, cardinality: { verdict: "pass" }, durationMs: 10 });
+    expect(record).toMatchObject({ runId: "run", contractSha256: "a".repeat(64), rawBytes: body.length, cardinality: { verdict: "pass" }, durationMs: 10 });
     expect(readFileSync(join(evidenceDirectory, "raw-probes", "steady-a-probe-0.json"))).toEqual(body);
     expect(JSON.parse(readFileSync(join(evidenceDirectory, "probes.ndjson"), "utf8")).rawSha256).toBe(createHash("sha256").update(body).digest("hex"));
   });
@@ -582,6 +598,7 @@ it("masks short derived credentials at any length while keeping the whole-value 
     const samples = await executeDeterministicSchedule({
       schedule: [{ id: "compact-0", machine: "a", op: "compact", offsetSeconds: 0, phase: "steady", sessionId: "s0" }],
       entrypoint, cwd: evidenceDirectory, environment, evidenceDirectory, scheduleStartWallMs,
+      privacyInventory: [{ category: "runtime-password", value: "pw-secret-123", sourceClass: "test", scanMode: "all-forms" }],
     });
     expect(samples).toEqual([expect.objectContaining({ id: "compact-0", outcome: "failed", errorClass: "CliExit", exitCode: 3 })]);
     const sample = samples[0] as Record<string, unknown>;
@@ -601,6 +618,9 @@ it("masks short derived credentials at any length while keeping the whole-value 
       message: "LCM command failed with 3", stdout: "partial output",
       processStartWallMs: sample.processStartWallMs, processExitWallMs: sample.processExitWallMs,
     })]);
+    const privacy = readFileSync(join(evidenceDirectory, "failure-privacy.ndjson"), "utf8").trim().split("\n").map((line) => JSON.parse(line));
+    expect(privacy).toEqual([expect.objectContaining({ id: "compact-0", secretHits: expect.any(Number) })]);
+    expect(privacy[0].secretHits).toBeGreaterThan(0);
     expect(failures[0].stderr).toContain("compact refused: marker-stderr [redacted:LCM_POSTGRES_URL]");
     expect(failures[0].stderr).not.toContain("pw-secret-123");
   });

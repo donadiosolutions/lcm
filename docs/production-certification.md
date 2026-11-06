@@ -89,7 +89,7 @@ evidence records that narrower guarantee. Secret values never enter public
 evidence. Private raw directories use mode 0700, files use mode 0600, and the
 retention period remains 90 days.
 
-Raw telemetry is validated before projection. The validator requires the five
+Raw telemetry is validated before any public output. The validator requires the five
 closed families, packaged operation and extension catalogs, allowed fields,
 statuses and reasons, unique operations, and the scalar ceilings in the approved
 contract. The public gate contains only counts, hashes, verdicts, applicability,
@@ -105,6 +105,12 @@ provisional until the non-certifying smoke is reviewed and the final contract is
 approved. A one-second connection sample is a sampled maximum, not an
 instantaneous peak; structural runtime/cancellation bounds and the unchanged v3
 capacity gate remain separate.
+Database CPU percentage is the baseline-subtracted database CPU time over each
+probe window at the combined two-machine rate (two probes per 15 seconds), divided
+by the actual elapsed window and recorded database CPU quota.
+The source-derived successful snapshot path is fixed at 90 wire statements. A
+conditional idle-connection validation remains a separate measured-in-smoke
+allowance; it is not silently added to that successful-path count.
 
 V4 observability is applicable only to the local lane. A managed v4 run evaluates
 exactly the inherited v3 item set and records observability as not applicable,
@@ -116,6 +122,9 @@ provider-failover claim.
 warmup, 120-second steady phase, and 660-second drain with no faults. It must not
 be reported as a production percentile result. `full` runs the frozen 6000-second
 steady schedule, fault phases, recovery checks, and final 900-second drain.
+This no-fault smoke is a v3 profile. A local v4 smoke without `--with-faults` is
+rejected because v4 calibration and observability phases are one coordinated
+8,520-second smoke rather than an extension of the 1,800-second profile.
 
 A local smoke run can also inject the lane's two faults with `--with-faults`. This
 fault smoke runs the smoke workload, then the machine-A partition and the database
@@ -218,6 +227,11 @@ The harness creates and labels the database, network, volume, and two machine
 containers under one run identity. The enclosing PostgreSQL harness owns
 machine-container teardown and verifies that all owned resources and private roots
 are gone after the test exits.
+The local package command starts a separate watchdog parent. It derives the
+selected profile deadline from the chosen contract, sends TERM at that deadline,
+and sends KILL after a 60-second grace if the owned harness process group has not
+exited. This is independent of the harness event loop and replaces the former
+fixed 10,800-second wrapper without weakening the finite local bound.
 
 ## Run the managed lane
 

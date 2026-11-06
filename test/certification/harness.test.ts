@@ -1,7 +1,9 @@
 import { createHash } from "node:crypto";
+import { EventEmitter } from "node:events";
 import { existsSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import { pathToFileURL } from "node:url";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import {
   DATABASE_IDENTITY_SQL,
@@ -15,6 +17,7 @@ import {
   collectResidualState,
   collectSetupSessionClosure,
   createDeterministicSchedule,
+  finalizeCalibrationEvidence,
   machineDatabaseClearanceArgs,
   parseCertificationArguments,
   prepareEvidenceDirectory,
@@ -31,6 +34,7 @@ import {
   waitForMachineDatabaseClearance,
 } from "../../scripts/certification-harness.mjs";
 import { createRunNames } from "../../scripts/postgresql-harness.mjs";
+import { certificationWatchdogDeadline, parseWatchdogArguments, runCertificationWatchdog } from "../../scripts/certification-watchdog.mjs";
 import { loadCertificationContract } from "./contract.mjs";
 import { createGitCheckoutFixture } from "./git-checkout-fixture.js";
 import { waitForControl } from "./machine-agent.mjs";
@@ -100,7 +104,7 @@ describe("certification harness", () => {
   it("exposes manual certification scripts without a build or postbuild", () => {
     const packageJson = JSON.parse(readFileSync(new URL("../../package.json", import.meta.url), "utf8"));
     expect(packageJson.scripts["test:certification:local"]).toBe(
-      "LCM_TEST_CONTAINER_CLI=podman node scripts/certification-harness.mjs --lane local --contract test/certification/contract-v3.json",
+      "LCM_TEST_CONTAINER_CLI=podman node scripts/certification-watchdog.mjs --lane local --contract test/certification/contract-v3.json",
     );
     expect(packageJson.scripts["test:certification:managed"]).toBe(
       "node scripts/certification-harness.mjs --lane managed --contract test/certification/contract-v3.json",
@@ -387,6 +391,85 @@ describe("certification harness", () => {
     expect(loadCertificationContract(join(v4Certification, "contract-v4.json"))).toMatchObject({ status: "approved", sha256: v4Sha256, contract: { version: 4 } });
   });
 
+  it("stages the complete recursive relative-import closure for the real agent", async () => {
+    const root = mkdtempSync(join(tmpdir(), "lcm-cert-stage-closure-source-"));
+    const target = mkdtempSync(join(tmpdir(), "lcm-cert-stage-closure-target-"));
+    mkdirSync(join(root, "dist", "src", "prompts"), { recursive: true });
+    mkdirSync(join(root, "dist", "src", "connectors", "templates"), { recursive: true });
+    mkdirSync(join(root, "dist", "src", "storage", "postgresql", "migrations"), { recursive: true });
+    for (const path of ["dist/lcm.mjs", "dist/src/prompts/default.yaml", "dist/src/connectors/templates/config.json", "dist/src/storage/postgresql/migrations/0001.sql"]) writeFileSync(join(root, path), path);
+    writeFileSync(join(root, "package.json"), JSON.stringify({ name: "@donadiosolutions/lcm", version: "1.2.3" }));
+    stageBuiltPackage({ sourceRoot: root, destination: target, machineAgentPath: new URL("./machine-agent.mjs", import.meta.url) });
+    const certification = join(target, "certification");
+    for (const name of readdirSync(certification).filter((entry) => entry.endsWith(".mjs"))) {
+      const source = readFileSync(join(certification, name), "utf8");
+      for (const match of source.matchAll(/from\s+["'](\.\/.+?)["']/gu)) {
+        expect(existsSync(join(certification, match[1]!)), `${name} -> ${match[1]}`).toBe(true);
+      }
+    }
+    await expect(import(`${pathToFileURL(join(certification, "machine-agent.mjs")).href}?closure=${Date.now()}`)).resolves.toBeDefined();
+  });
+
+  it("derives the external TERM to KILL watchdog from the selected contract", () => {
+    const v3 = loadCertificationContract(new URL("./contract-v3.json", import.meta.url)).contract;
+    const v4 = loadCertificationContract(new URL("./contract-v4.json", import.meta.url), { requireApproved: false }).contract;
+    expect(certificationWatchdogDeadline(v3, { profile: "smoke" })).toEqual({ terminateSeconds: 1800, killSeconds: 1860 });
+    expect(certificationWatchdogDeadline(v3, { profile: "smoke", withFaults: true })).toEqual({ terminateSeconds: 4020, killSeconds: 4080 });
+    expect(certificationWatchdogDeadline(v4, { profile: "smoke", withFaults: true })).toEqual({ terminateSeconds: 8520, killSeconds: 8580 });
+    expect(certificationWatchdogDeadline(v4, { profile: "full" })).toEqual({ terminateSeconds: 15300, killSeconds: 15360 });
+    expect(parseWatchdogArguments(["--lane", "local", "--profile", "smoke", "--with-faults", "--evidence-dir", "/tmp/e", "--contract", "test/certification/contract-v4.json"]).contractPath)
+      .toBe(join(process.cwd(), "test/certification/contract-v4.json"));
+  });
+
+  it("keeps watchdog ownership outside the harness and escalates TERM to KILL", async () => {
+    vi.useFakeTimers();
+    try {
+      const child = Object.assign(new EventEmitter(), { pid: 1234, kill: vi.fn() });
+      const signals: string[] = [];
+      const result = runCertificationWatchdog([
+        "--lane", "local", "--profile", "smoke", "--evidence-dir", "/tmp/e",
+        "--contract", new URL("./contract-v3.json", import.meta.url).pathname,
+      ], {
+        spawnProcess: () => child,
+        signalGroup: (_child: unknown, signal: string) => { signals.push(signal); },
+      });
+      const rejected = expect(result).rejects.toThrow("SIGKILL");
+      await vi.advanceTimersByTimeAsync(1_800_000);
+      expect(signals).toEqual(["SIGTERM"]);
+      await vi.advanceTimersByTimeAsync(60_000);
+      expect(signals).toEqual(["SIGTERM", "SIGKILL"]);
+      child.emit("exit", null, "SIGKILL");
+      await rejected;
+    } finally { vi.useRealTimers(); }
+  });
+
+  it("keeps KILL escalation after the harness leader exits while its group remains", async () => {
+    vi.useFakeTimers();
+    try {
+      const child = Object.assign(new EventEmitter(), { pid: 1234, kill: vi.fn() });
+      let alive = true;
+      const signals: string[] = [];
+      const result = runCertificationWatchdog([
+        "--lane", "local", "--profile", "smoke", "--evidence-dir", "/tmp/e",
+        "--contract", new URL("./contract-v3.json", import.meta.url).pathname,
+      ], {
+        spawnProcess: () => child,
+        groupAlive: () => alive,
+        signalGroup: (_child: unknown, signal: string) => {
+          signals.push(signal);
+          if (signal === "SIGTERM") child.emit("exit", null, "SIGTERM");
+          if (signal === "SIGKILL") alive = false;
+        },
+      });
+      const rejected = expect(result).rejects.toThrow("SIGTERM");
+      await vi.advanceTimersByTimeAsync(1_800_000);
+      expect(signals).toEqual(["SIGTERM"]);
+      await vi.advanceTimersByTimeAsync(60_000);
+      expect(signals).toEqual(["SIGTERM", "SIGKILL"]);
+      await rejected;
+    } finally { vi.useRealTimers(); }
+  });
+
   it("creates the exact full schedule and records fault transitions", () => {
     const schedule = createDeterministicSchedule({ profile: "full", machine: "a", runId: "run" });
     expect(schedule.filter((entry: any) => entry.op === "hook")).toHaveLength(600);
@@ -406,7 +489,7 @@ describe("certification harness", () => {
     for (const machine of ["a", "b"]) mkdirSync(join(evidenceDirectory, `machine-${machine}`));
     const { contract } = loadCertificationContract(new URL("./contract-v4.json", import.meta.url), { requireApproved: false });
     const order: string[] = [];
-    const faults = await runV4ObservabilityPhases({
+    const result = await runV4ObservabilityPhases({
       contract,
       evidenceDirectory,
       machineNames: ["machine-a", "machine-b"],
@@ -422,11 +505,32 @@ describe("certification harness", () => {
         return { clear: async () => { order.push(`clear:${phase}`); } };
       },
     });
-    expect(faults.map((fault) => fault.id)).toEqual(["saturation", "timeout", "stats-reset", "permission-loss", "extension-loss", "queue-backlog", "canary"]);
-    for (const phase of faults.map((fault) => fault.id)) {
+    expect(result.faults.map((fault) => fault.id)).toEqual(["saturation", "timeout", "stats-reset", "permission-loss", "extension-loss", "queue-backlog", "canary"]);
+    expect(result.barriers.every((barrier) => barrier.verdict === "pass")).toBe(true);
+    for (const phase of result.faults.map((fault) => fault.id)) {
       expect(order.indexOf(`apply:${phase}`)).toBeGreaterThan(order.findIndex((entry) => entry.includes(`${phase}-ready.json`)));
       expect(order.indexOf(`clear:${phase}`)).toBeGreaterThan(order.indexOf(`apply:${phase}`));
     }
+  });
+
+  it("clears an active mutation, records the failed barrier, and signals later phases to stop", async () => {
+    const evidenceDirectory = mkdtempSync(join(tmpdir(), "lcm-cert-v4-barrier-failure-"));
+    for (const machine of ["a", "b"]) mkdirSync(join(evidenceDirectory, `machine-${machine}`));
+    const { contract } = loadCertificationContract(new URL("./contract-v4.json", import.meta.url), { requireApproved: false });
+    let waits = 0;
+    let clears = 0;
+    const result = await runV4ObservabilityPhases({
+      contract, evidenceDirectory, machineNames: ["machine-a", "machine-b"],
+      adminUrl: "postgresql://admin@db/lcm", caFile: "/ca", processRunner: async () => undefined,
+      containerCli: "podman", network: "network", machineB: "machine-b",
+      waitForFiles: async () => { waits += 1; if (waits === 2) throw new Error("detection timeout"); },
+      mutation: async () => ({ clear: async () => { clears += 1; } }),
+    });
+    expect(clears).toBe(1);
+    expect(result.barriers[0]).toEqual(expect.objectContaining({ step: "saturation", verdict: "barrier-timeout" }));
+    expect(result.barriers.slice(1).every((barrier) => barrier.verdict === "incomplete")).toBe(true);
+    expect(result.faults).toHaveLength(1);
+    for (const machine of ["a", "b"]) expect(existsSync(join(evidenceDirectory, `machine-${machine}`, "observability-stop.json"))).toBe(true);
   });
 
   it("collects bounded calibration windows and counts-only connection labels", async () => {
@@ -451,7 +555,7 @@ describe("certification harness", () => {
         return { rows: [{ calls, total_exec_time: 0, total_plan_time: 0, stats_reset: 1, dealloc: 0, xact_commit: calls, xact_rollback: 0 }] };
       },
     };
-    const evidence = await collectCalibrationEvidence({
+    const raw = await collectCalibrationEvidence({
       contract,
       startAt: new Date(0).toISOString(),
       machineNames: { a: "machine-a", b: "machine-b" },
@@ -470,10 +574,20 @@ describe("certification harness", () => {
       now: () => clock,
       delay: async (milliseconds: number) => { clock += milliseconds; },
     });
+    const probes = [1, 2, 3, 4].flatMap((pair) => ["a", "b"].map((machine) => ({
+      id: `calibration-${pair}-${machine}-probe-0`, phase: `calibration-${pair}`, machine,
+      startedAtMs: (pair * 2 - 1) * 1000, completedAtMs: pair * 2 * 1000,
+      snapshot: { classification: "healthy" },
+    })));
+    const evidence = finalizeCalibrationEvidence(raw, probes, contract);
     expect(evidence.samples).toHaveLength(9);
     expect(evidence.addressLabels).toEqual({ a: true, b: true });
     expect(evidence.pairs).toHaveLength(12);
     expect(evidence.connections).toMatchObject({ verdict: "pass", sampledIncrement: 0, zeroIncrementNotZeroCost: true });
+    const spilled = probes.map((probe, index) => index === 0 ? { ...probe, completedAtMs: 3_000 } : probe);
+    const rejected = finalizeCalibrationEvidence(raw, spilled, contract);
+    expect(rejected.pairs.find((pair: { pair: number; label: string }) => pair.pair === 0 && pair.label === "a")?.rejected)
+      .toBe("counter-contamination-or-probe-count");
   });
 
   it("proves the two private homes contain distinct machine identities", () => {

@@ -45,6 +45,13 @@ export function createObservabilityWorkloadSchedule({
     throw new Error("invalid observability workload schedule");
   }
   const schedule = createFaultSchedule({ machine, runId, phase, durationSeconds });
+  if (["saturation", "timeout", "stats-reset", "permission-loss", "extension-loss"].includes(phase)) {
+    schedule.push(
+      { id: `${runId}-${phase}-${machine}-overlap-search-0`, machine, op: "search", phase, offsetSeconds: 0 },
+      { id: `${runId}-${phase}-${machine}-overlap-search-1`, machine, op: "search", phase, offsetSeconds: 0 },
+      { id: `${runId}-${phase}-${machine}-overlap-store-0`, machine, op: "store", phase, offsetSeconds: 0 },
+    );
+  }
   if (includeHooks) {
     for (let offsetSeconds = 1, index = 0; offsetSeconds < durationSeconds; offsetSeconds += 10, index += 1) {
       schedule.push({
@@ -60,4 +67,16 @@ export function createObservabilityWorkloadSchedule({
     }
   }
   return schedule.sort((left, right) => left.offsetSeconds - right.offsetSeconds || left.id.localeCompare(right.id));
+}
+
+export function observabilityPhaseWorkloadSeconds(contract, phase) {
+  const holdKey = phase === "saturation" ? "saturationWitness"
+    : phase === "permission-loss" ? "permissionLoss"
+      : phase === "extension-loss" ? "extensionLoss"
+        : phase === "stats-reset" ? "statsReset" : phase;
+  const hold = phase === "queue-backlog" ? contract.timeline.full.backlogHoldMaxSeconds
+    : phase === "canary" ? contract.timeline.full.canaryPhaseMaxSeconds
+      : contract.observability.faultHoldMaximumSeconds[holdKey];
+  if (!Number.isSafeInteger(hold) || hold <= 0) throw new Error(`invalid observability phase duration ${phase}`);
+  return Math.max(30, hold);
 }

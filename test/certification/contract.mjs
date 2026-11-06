@@ -183,11 +183,19 @@ function assertContract(contract) {
       || calibration.baselineWindowSeconds !== 180 || calibration.probeWindowSeconds !== 180
       || calibration.probeCadenceSeconds !== 15 || calibration.probesPerMachinePerWindow !== 12
       || calibration.successfulPathWireStatementCeiling !== 90
-      || calibration.idleConnectionValidationAllowancePerAcquiredConnection !== 1
-      || calibration.measuredCallsPerProbeCeiling !== 91
-      || calibration.budgetCeilingsProvisional !== true
-      || contract.timeline.full.observabilityAllocationsProvisional !== true) {
-      throw new Error("certification contract v4 provisional calibration is invalid");
+      || !Number.isSafeInteger(calibration.idleConnectionValidationAllowancePerAcquiredConnection)
+      || calibration.idleConnectionValidationAllowancePerAcquiredConnection < 0
+      || calibration.idleConnectionValidationAllowanceMode !== "measured-in-smoke"
+      || typeof calibration.databaseCpuPercentDefinition !== "string" || calibration.databaseCpuPercentDefinition.length === 0
+      || calibration.measuredCallsPerProbeCeiling !== calibration.successfulPathWireStatementCeiling
+        + calibration.idleConnectionValidationAllowancePerAcquiredConnection
+      || typeof calibration.budgetCeilingsProvisional !== "boolean"
+      || typeof contract.timeline.full.observabilityAllocationsProvisional !== "boolean"
+      || [calibration.machineCpuPercentCeiling, calibration.databaseCpuPercentCeiling,
+        calibration.cpuNoisePercentCeiling, calibration.idleRuntimeRoleCallsPerSecondCeiling,
+        calibration.sampledConnectionIncrementCeiling, calibration.sampledConnectionResidualSeconds]
+        .some((value) => typeof value !== "number" || !Number.isFinite(value) || value <= 0)) {
+      throw new Error("certification contract v4 calibration is invalid");
     }
     if (observability.cardinality?.maximumOperations !== 64
       || observability.cardinality?.metricKeysPerOperation !== 22
@@ -199,6 +207,24 @@ function assertContract(contract) {
     }
   }
   return contract;
+}
+
+export function assertCertificationRunPolicy(loaded, options) {
+  const contract = loaded.contract;
+  const v4DraftSmoke = contract.version === 4 && options.lane === "local"
+    && options.profile === "smoke" && options.withFaults === true;
+  if (contract.version === 4 && options.lane === "local" && options.profile === "smoke" && options.withFaults !== true) {
+    throw new Error("certification contract v4 local smoke requires --with-faults");
+  }
+  if (loaded.approval === undefined && !v4DraftSmoke) {
+    throw new Error("certification run requires a matching approval record");
+  }
+  if (contract.version === 4 && options.profile === "full"
+    && (contract.timeline.full.observabilityAllocationsProvisional !== false
+      || contract.observability.calibration.budgetCeilingsProvisional !== false)) {
+    throw new Error("certification v4 full profile requires resolved non-provisional budgets");
+  }
+  return loaded;
 }
 
 export function certificationDeadlineSeconds(contract, { profile, withFaults = false } = {}) {

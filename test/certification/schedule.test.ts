@@ -7,8 +7,9 @@ describe("observability workload schedules", () => {
     (phase) => {
       for (const machine of ["a", "b"]) {
         const schedule = createObservabilityWorkloadSchedule({ machine, runId: "run", phase, durationSeconds: 30 });
-        expect(schedule.filter((entry) => entry.op === "search")).toHaveLength(6);
-        expect(schedule.filter((entry) => entry.op === "store")).toHaveLength(3);
+        const added = phase === "canary" ? 0 : 1;
+        expect(schedule.filter((entry) => entry.op === "search")).toHaveLength(6 + added * 2);
+        expect(schedule.filter((entry) => entry.op === "store")).toHaveLength(3 + added);
         expect(new Set(schedule.map((entry) => entry.id)).size).toBe(schedule.length);
         expect(schedule.every((entry) => entry.machine === machine && entry.phase === phase && entry.offsetSeconds < 30)).toBe(true);
       }

@@ -128,6 +128,7 @@
     },
     "faultHoldMaximumSeconds": {
       "timeout": 30,
+      "statsReset": 30,
       "permissionLoss": 60,
       "extensionLoss": 60,
       "saturationWitness": 20,
@@ -185,12 +186,14 @@
       "budgetCeilingsProvisional": true,
       "machineCpuPercentCeiling": 2,
       "databaseCpuPercentCeiling": 2,
+      "databaseCpuPercentDefinition": "baseline-subtracted incremental database CPU-seconds over each probe window at the combined two-machine rate (2 probes per 15 seconds), divided by actual elapsed window seconds and recorded database CPU quota",
       "cpuNoisePercentCeiling": 2,
       "idleRuntimeRoleCallsPerSecondCeiling": 1,
       "sampledConnectionIncrementCeiling": 2,
       "sampledConnectionResidualSeconds": 5,
       "successfulPathWireStatementCeiling": 90,
       "idleConnectionValidationAllowancePerAcquiredConnection": 1,
+      "idleConnectionValidationAllowanceMode": "measured-in-smoke",
       "measuredCallsPerProbeCeiling": 91,
       "successfulPathWireStatementDerivation": "45 successful application queries x 2 wire statements for signalled PID preflight plus query. Outside runtime schema readiness: health 4, migration 1, metrics 2, queue 1, statements context 1 + mapping probes 14 + counter read 1 = 24 application queries / 48 wire statements. verifyPostgreSqlRuntimeSchema reaches 21 executor.query sites: server readiness; role policy; extension catalog; pg_stat_statements probe; content collation; extension functions; extension operator; GIN operator class; direct GIN operators; indirect GIN operators; GIN support functions; search configuration; migration history; ownership; schema definitions; identity functions; schema ACL; relation ACL; column ACL; function ACL; effective privileges = 21 application queries / 42 wire statements. Total 90. A conditional idle-connection SELECT 1 is excluded and bounded separately at one per acquired connection. Provisional until smoke confirms pg_stat_statements accounting."
     },
