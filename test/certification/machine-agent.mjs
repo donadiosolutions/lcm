@@ -12,7 +12,7 @@ import { connect as tlsConnect } from "node:tls";
 import { createDeterministicSchedule, createFaultSchedule, createObservabilityWorkloadSchedule, observabilityPhaseWorkloadSeconds } from "./schedule.mjs";
 import { assertCertificationRunPolicy, loadCertificationContract } from "./contract.mjs";
 import { observerReadSettings } from "./sqlite-observer-worker.mjs";
-import { CANARY_CORPUS, buildSecretInventory, createInventoryManifest, createProbeSchedule, evaluateSaturationWitness, evaluateTimeoutShape, healthySnapshot, scanSurface, validateTelemetryCardinality } from "./observability.mjs";
+import { CANARY_CORPUS, buildSecretInventory, createInventoryManifest, createProbeSchedule, evaluateSaturationWitness, evaluateTimeoutShape, healthySnapshot, maskInventoryValues, scanSurface, validateTelemetryCardinality } from "./observability.mjs";
 import { createCanaryWorkload } from "./canary-corpus.mjs";
 
 const execFileAsync = promisify(execFile);
@@ -458,7 +458,17 @@ export function scanBoundedPrivateOutputs({ home, evidenceDirectory, daemonOutpu
     for (const name of readdirSync(logs).sort()) {
       const path = join(logs, name);
       const status = statSync(path);
-      if (status.isFile()) add(`logs/${name}`, readFileSync(path));
+      if (!status.isFile()) continue;
+      const bytes = readFileSync(path);
+      add(`logs/${name}`, bytes);
+      // A masked private copy of LCM's hook-error fallback log shows which hook logged and why
+      // without its paths or credentials. It is kept only when the masked bytes scan clean.
+      if (name === "events.log") {
+        const masked = maskInventoryValues(bytes, inventory);
+        if (scanSurface(masked, inventory, []).secretHits === 0) {
+          writeFileSync(join(evidenceDirectory, "events.log.masked"), masked, { mode: 0o600, flag: "wx" });
+        }
+      }
     }
   }
   const summary = {

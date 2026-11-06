@@ -450,7 +450,10 @@ describe("observability certification helpers", () => {
       run: { sha256: "b".repeat(64) },
       applicability: { applicable: true, reason: null },
       items: [{ id: "privacy.canary-leaks", formula: "hit count", threshold: 0, observed: 0, verdict: "pass" }],
-      privateArtifacts: { rawProbeBodies: 1, probeRecords: 1, canarySurfaces: 7, secretCategories: 14, retentionDays: 90, directoryMode: "0700", fileMode: "0600" },
+      privateArtifacts: {
+        rawProbeBodies: 1, probeRecords: 1, canarySurfaces: 7, secretCategories: 14,
+        allowedSurfaceHits: { "logs/events.log": { "project-path": 4, "home-path": 2 } }, retentionDays: 90, directoryMode: "0700", fileMode: "0600",
+      },
     };
     expect(validateEvidence(schema, summary)).toEqual([]);
     expect(JSON.stringify(summary)).not.toContain("incident-message-content-canary");

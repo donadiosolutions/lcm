@@ -1,5 +1,5 @@
 import { createHash } from "node:crypto";
-import { existsSync, mkdirSync, mkdtempSync, readFileSync, renameSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, renameSync, statSync, writeFileSync } from "node:fs";
 import { EventEmitter } from "node:events";
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
@@ -36,7 +36,7 @@ import {
   verifyTlsNegativeProbe,
   waitForAcknowledgmentCatchUp,
 } from "./machine-agent.mjs";
-import { OBSERVABILITY_ACTIONS, evaluatePhaseProbeEvidence } from "./observability.mjs";
+import { OBSERVABILITY_ACTIONS, evaluatePhaseProbeEvidence, scanSurface } from "./observability.mjs";
 import { createCanaryWorkload } from "./canary-corpus.mjs";
 import { OBSERVER_BUSY_TIMEOUT_MS, observerReadSettings } from "./sqlite-observer-worker.mjs";
 import { extractPostToolEvents, extractUserPromptEvents } from "../../src/hooks/extractors.js";
@@ -323,6 +323,45 @@ describe("observability probes", () => {
     expect(summary).toMatchObject({ canaryHits: expect.any(Number), secretHits: 0 });
     expect(summary.canaryHits).toBeGreaterThan(0);
     expect(JSON.stringify(summary)).not.toContain("incident-message-content-canary");
+  });
+
+  // Smoke 5 found the project path in both machines' events.log, LCM's hook-error fallback log,
+  // and kept no copy of it. The agent now keeps a masked private copy: every inventory value
+  // becomes its category token, so the hook and its error stay readable.
+  it("keeps a masked private copy of the hook-error fallback log", () => {
+    const root = mkdtempSync(join(tmpdir(), "lcm-cert-masked-log-"));
+    const home = join(root, "home");
+    const evidenceDirectory = join(root, "evidence");
+    mkdirSync(join(home, ".lcm", "logs"), { recursive: true });
+    mkdirSync(evidenceDirectory);
+    const inventory = [
+      { category: "project-path", value: "/home/lcm-parent/home/project", sourceClass: "agent-runtime", scanMode: "all-forms" },
+      { category: "home-path", value: "/home/lcm-parent/home", sourceClass: "agent-runtime", scanMode: "all-forms" },
+      { category: "runtime-password", value: "runtime-password-a-0123", sourceClass: "runtime-url", scanMode: "all-forms" },
+      { category: "runtime-role", value: "lcm_rt", sourceClass: "runtime-url", scanMode: "boundary-token" },
+    ];
+    const entry = (hook: string, error: string) => ({ ts: "2026-11-06T14:30:00.000Z", hook, error, session_id: "cert-run-a", cwd: "/home/lcm-parent/home/project" });
+    writeFileSync(join(home, ".lcm", "logs", "events.log"), [
+      entry("UserPromptSubmit", "backend publication mutation is already in progress"),
+      entry("PostToolUse", "role lcm_rt rejected runtime-password-a-0123"),
+    ].map((value) => `${JSON.stringify(value)}\n`).join(""));
+    const summary = scanBoundedPrivateOutputs({ home, evidenceDirectory, daemonOutput: Buffer.from("safe streams"), inventory });
+    const maskedPath = join(evidenceDirectory, "events.log.masked");
+    const masked = readFileSync(maskedPath, "utf8");
+    expect({
+      hits: summary.surfaces.find((surface: { name: string }) => surface.name === "logs/events.log")?.categoryHits,
+      mode: statSync(maskedPath).mode & 0o777,
+      masked: masked.trim().split("\n").map((value) => JSON.parse(value)),
+      rescan: scanSurface(Buffer.from(masked), inventory, []).secretHits,
+    }).toEqual({
+      hits: { "project-path": 2, "home-path": 1, "runtime-password": 1, "runtime-role": 1 },
+      mode: 0o600,
+      masked: [
+        { ...entry("UserPromptSubmit", "backend publication mutation is already in progress"), cwd: "<project-path>" },
+        { ...entry("PostToolUse", "role <runtime-role> rejected <runtime-password>"), cwd: "<project-path>" },
+      ],
+      rescan: 0,
+    });
   });
 
   it("scans and validates exact raw response bytes before parsing", async () => {

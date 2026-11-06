@@ -96,6 +96,30 @@ describe("certification contract", () => {
     }
   });
 
+  // The fallback log's two path categories are the only private-surface allowance; a wider or
+  // missing allowance is refused.
+  it("pins the v4 private-surface category allowance", () => {
+    const directory = mkdtempSync(join(tmpdir(), "lcm-cert-contract-v4-allowance-"));
+    const path = join(directory, "contract-v4.json");
+    const load = (allowances: unknown) => {
+      const candidate = JSON.parse(readFileSync(v4ContractPath, "utf8"));
+      if (allowances === undefined) delete candidate.observability.privacy.privateSurfaceCategoryAllowances;
+      else candidate.observability.privacy.privateSurfaceCategoryAllowances = allowances;
+      writeFileSync(path, `${JSON.stringify(candidate)}\n`);
+      return () => loadCertificationContract(path, { requireApproved: false });
+    };
+    expect(loadCertificationContract(v4ContractPath, { requireApproved: false }).contract.observability.privacy
+      .privateSurfaceCategoryAllowances).toEqual({ "logs/events.log": ["project-path", "home-path"] });
+    for (const allowances of [
+      undefined,
+      { "logs/events.log": ["project-path", "home-path", "runtime-password"] },
+      { "logs/events.log": ["project-path", "home-path"], "failures.ndjson": ["project-path"] },
+      { "logs/daemon.log": ["project-path", "home-path"] },
+    ]) {
+      expect(load(allowances)).toThrow("certification contract v4 privacy is invalid");
+    }
+  });
+
   it("loads a hash-approved non-provisional v4 contract with resized empirical budgets", () => {
     const directory = mkdtempSync(join(tmpdir(), "lcm-cert-contract-v4-final-"));
     const candidate = JSON.parse(readFileSync(v4ContractPath, "utf8"));

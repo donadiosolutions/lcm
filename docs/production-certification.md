@@ -152,11 +152,29 @@ Coordinator leak surfaces are the coordinator's run records: `run.json`,
 `faults.json`, `calibration-evidence.json`, `cleanup.json`,
 `execution-provenance.json`, `phase-control.json` and
 `observability-barriers.json`. Its private harness bookkeeping files,
-`setup-evidence.json`, `database-readiness.json` and
-`setup-session-closure.json`, deliberately record role names as the setup-closure
-witness, are never published, and are not LCM output, so they are SHA-256 hashed
-for provenance and not scanned. The observability summary and the public gate
-outputs are scanned before they are written.
+`setup-evidence.json`, `database-readiness.json` and `setup-session-closure.json`,
+deliberately record role names as the setup-closure witness, are never published,
+and are not LCM output, so they are SHA-256 hashed for provenance and not scanned.
+The observability summary and the public gate outputs are scanned before they are
+written. The two lists are documentary: they record the scope that this revision's
+harness implements, and neither the loader nor the reconstruction reads them.
+
+One private machine surface carries two inventory categories by design. LCM's
+bounded hook-error fallback log, `logs/events.log` under the private LCM home,
+records the reporting hook's working directory whenever it does not write the
+error to the project sidecar (`src/hooks/hook-errors.ts:162-173`), and
+`docs/privacy.md:1065` documents that invalid working directories are recorded in
+that log. The certification project directory is `$HOME/project`, so a recorded
+working directory matches `project-path` and `home-path`. On that surface only,
+`privateSurfaceCategoryAllowances` allows those two categories, and the loader
+accepts no other value. Their hits are recorded separately as counts in the
+summary's `privateArtifacts.allowedSurfaceHits` and are not counted as leaks.
+Every other category and every canary stays zero-required on that surface, and
+every other surface is unchanged. When the agent scans that log, it also writes a
+masked private copy, `events.log.masked`, with mode 0600 to its evidence
+directory. Every inventory value in the copy is replaced by its category token, so
+a reviewer can see which hook logged and why without seeing the paths; the copy is
+kept only when its masked bytes scan clean.
 
 Raw telemetry is validated before any public output. The validator requires the five
 closed families, packaged operation and extension catalogs, allowed fields,
@@ -168,12 +186,12 @@ and remediation comparisons. Exact remediation text is pinned to the product's
 Calibration uses four interleaved 180-second baseline/probe pairs at the actual
 15-second production cadence. It records signed, elapsed-time-normalized deltas,
 rejects reset, deallocation-change, counter-decrease, and excess-idle-rate
-windows, and requires at least three valid pairs. CPU, statement,
-sampled-connection, idle-call-rate, and noise ceilings in the draft are
-provisional until the non-certifying smoke is reviewed and the final contract is
-approved. A one-second connection sample is a sampled maximum, not an
-instantaneous peak; structural runtime/cancellation bounds and the unchanged v3
-capacity gate remain separate.
+windows, and requires at least three valid pairs for each CPU item and three
+retained pairs for the statement item. CPU, statement, sampled-connection,
+idle-call-rate, and noise ceilings in the draft are provisional until the
+non-certifying smoke is reviewed and the final contract is approved. A one-second
+connection sample is a sampled maximum, not an instantaneous peak; structural
+runtime/cancellation bounds and the unchanged v3 capacity gate remain separate.
 The connections result records coverage, the number of probe intervals that caught
 a sample, without requiring every interval to be caught. It is incomplete when a
 machine has no sampled active interval, a connection address is unknown, or a pass
@@ -192,15 +210,23 @@ successful-path count. The successful-path statement count is code-derived and
 pinned by the fake-executor readiness test. `overhead.statements-per-snapshot`
 requires that static count (`successfulPathWireStatementCount`) to be at most
 `successfulPathWireStatementCeiling`. A valid pair whose integer baseline call
-count differs from the median baseline count is dropped and recorded, because a
-baseline burst is not probe cost; at least `minimumValidPairs` pairs must remain,
-otherwise the item is incomplete. Every retained pair's signed per-probe cost must
-be within `successfulPathWireStatementTolerance` of the static count; a retained
-pair outside it fails the item, and that failure takes precedence over too few
-pairs. The tolerance is a measurement allowance: one extra call across a window's
-24 probes adds 0.0417 per probe, the largest observed elapsed-time error is about
-0.0019, and 0.01 is under half a call. A change to the window size or probe count
-requires revisiting it.
+count differs from the median baseline count is dropped and recorded; at least
+`minimumValidPairs` pairs must remain, otherwise the item is incomplete. The
+median selects one representative idle population, and the rule assumes that the
+probe windows carry the same idle traffic: a run whose idle traffic changes
+between windows can fail or be incomplete, and the rule does not identify a burst
+by its cause. Every retained pair's signed per-probe cost must be within
+`successfulPathWireStatementTolerance` of the static count; a retained pair
+outside it fails the item, and that failure takes precedence over too few pairs.
+The tolerance is a measurement allowance: one extra call across a window's 24
+probes adds 0.0417 per probe, and 0.01 is under half of that. It detects one extra
+call only while a pair's probe and baseline windows last nearly the same time,
+which the rule does not bound. With 57 idle calls in each window, as in smokes 3
+to 5, whose retained pairs differed by at most 146 ms (deviation at most 0.0019),
+a lawful run fails from about 0.76 s of difference, and one extra call passes when
+the probe window runs about 2.4 to 3.9 s longer; both thresholds shrink as the
+idle count grows. A change to the window size or probe count requires revisiting
+the tolerance.
 
 V4 observability is applicable only to the local lane. A managed v4 run evaluates
 exactly the inherited v3 item set and records observability as not applicable,

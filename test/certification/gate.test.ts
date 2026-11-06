@@ -37,9 +37,11 @@ type RetainedReceipt = { id: string; secretHits: number; canaryHits: number; cat
 // setup bookkeeping and barrier-record bytes, and `fresh` writes the coordinator files so that
 // reconstruction scans and persists them instead of reading a persisted scan. `legacyScan`
 // persists a scan from before setup-session-closure.json was classified, with that file on disk.
+// `logs` writes files into a machine's private LCM log directory before the agent scans it. The
+// project and home paths are the certification machines' own, the project under the home.
 async function retainedPrivacyEvidence(
   leak?: { machine: "a" | "b"; id: string; text: string },
-  coordinator: { bookkeeping?: string; barriers?: string; fresh?: boolean; legacyScan?: boolean } = {},
+  coordinator: { bookkeeping?: string; barriers?: string; fresh?: boolean; legacyScan?: boolean; logs?: (machine: "a" | "b") => Record<string, string> } = {},
 ) {
   const root = mkdtempSync(join(tmpdir(), "lcm-cert-v4-retained-privacy-"));
   const contractBytes = readFileSync(new URL("./contract-v4.json", import.meta.url));
@@ -68,8 +70,8 @@ async function retainedPrivacyEvidence(
       caBodyLines,
       caFile: `/certs/ca-${machine}.pem`,
       daemonToken: `daemon-token-${machine}-0123456789abcdef`,
-      projectPath: `/work/project-${machine}`,
-      homePath: home,
+      projectPath: "/home/lcm-parent/home/project",
+      homePath: "/home/lcm-parent/home",
       containerHostname: `machine-${machine}-host`,
     });
     const manifest = Buffer.from(`${JSON.stringify(createInventoryManifest(inventory, machine), null, 2)}\n`);
@@ -88,6 +90,10 @@ async function retainedPrivacyEvidence(
       appendFileSync(join(directory, "retained-output-privacy.ndjson"), `${JSON.stringify({ id, sha256: createHash("sha256").update(bytes).digest("hex"), ...scanSurface(bytes, inventory, CANARY_CORPUS) })}\n`);
     }
     const daemonOutput = "daemon listening\n";
+    for (const [name, content] of Object.entries(coordinator.logs?.(machine) ?? {})) {
+      mkdirSync(join(home, ".lcm", "logs"), { recursive: true });
+      writeFileSync(join(home, ".lcm", "logs", name), content);
+    }
     scanBoundedPrivateOutputs({ home, evidenceDirectory: directory, daemonOutput, inventory });
     writeJson(join(directory, "daemon-output-coverage.json"), { totalBytes: daemonOutput.length, scannedBytes: daemonOutput.length, truncated: false, verdict: "pass", secretHits: 0, canaryHits: 0 });
     const workload = createCanaryWorkload("run", machine);
@@ -129,7 +135,7 @@ async function retainedPrivacyEvidence(
     .trim().split("\n").map((line) => JSON.parse(line)).find((entry: RetainedReceipt) => entry.id === id);
   const privacy = Object.fromEntries(observabilityGateItems(summary).filter((item) => item.id.startsWith("privacy."))
     .map((item) => [item.id, { verdict: item.verdict, observed: item.observed }]));
-  return { privacy, receipt, root };
+  return { privacy, receipt, root, summary };
 }
 
 describe("v4 observability gate items", () => {
@@ -282,6 +288,35 @@ describe("v4 observability gate items", () => {
       coordinatorInventory: [{ category: "admin-password", value: contractSha256, sourceClass: "coordinator", scanMode: "all-forms" }],
     })).toThrow("public observability summary contains a coordinator identity or credential");
     expect(existsSync(join(clean.root, "observability-summary.json"))).toBe(false);
+  });
+
+  // Smoke 5: each machine's events.log, LCM's hook-error fallback log, recorded the hook's
+  // working directory $HOME/project: project-path 2 (the raw path and its 24-character prefix)
+  // and home-path 1 (the home path inside it). The v4 DRAFT allows those two categories on that
+  // surface only and counts them separately; credentials and canaries there still leak.
+  it("allows the fallback log's path categories, counts them separately and still fails other hits", async () => {
+    const line = (hook: string, error: string) => `${JSON.stringify({ ts: "2026-11-06T14:30:00.000Z", hook, error, session_id: "cert-run", cwd: "/home/lcm-parent/home/project" })}\n`;
+    const smoke5 = await retainedPrivacyEvidence(undefined, { logs: () => ({ "events.log": line("UserPromptSubmit", "backend publication mutation is already in progress") }) });
+    const credentials = await retainedPrivacyEvidence(undefined, { logs: (machine) => ({
+      "events.log": line("PostToolUse", machine === "a" ? "rejected runtime-password-a-0123" : "rejected daemon-token-b-0123456789abcdef"),
+    }) });
+    const canary = await retainedPrivacyEvidence(undefined, { logs: () => ({ "events.log": line("PostToolUse", `stored ${CONTRACT_CANARIES.memory}`) }) });
+    const otherLog = await retainedPrivacyEvidence(undefined, { logs: () => ({ "daemon.log": line("daemon", "started") }) });
+    const otherSurface = await retainedPrivacyEvidence({ machine: "a", id: "migration-apply", text: '{"outcome":"applied","cwd":"/home/lcm-parent/home/project"}' });
+    const shape = (evidence: { privacy: Record<string, { verdict: string; observed: number }>; summary: any }) => [
+      evidence.privacy["privacy.secret-leaks"], evidence.privacy["privacy.canary-leaks"].verdict, evidence.summary.privateArtifacts.allowedSurfaceHits,
+    ];
+    const paths = { "logs/events.log": { "project-path": 4, "home-path": 2 } };
+    expect({
+      smoke5: shape(smoke5), credentials: shape(credentials), canary: shape(canary), otherLog: shape(otherLog), otherSurface: shape(otherSurface),
+    }).toEqual({
+      smoke5: [{ verdict: "pass", observed: 0 }, "pass", paths],
+      // runtime-password 1 on machine A; daemon-token 2 on machine B (the token and its prefix).
+      credentials: [{ verdict: "fail", observed: 3 }, "pass", paths],
+      canary: [{ verdict: "pass", observed: 0 }, "fail", paths],
+      otherLog: [{ verdict: "fail", observed: 6 }, "pass", {}],
+      otherSurface: [{ verdict: "fail", observed: 3 }, "pass", {}],
+    });
   });
 });
 

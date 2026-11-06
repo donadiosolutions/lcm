@@ -1885,7 +1885,24 @@ export function reconstructObservabilitySummary({ evidenceDirectory, contract, c
     const path = join(evidenceDirectory, `machine-${machine}`, "privacy-surfaces.json");
     return existsSync(path) ? jsonFromFile(path) : undefined;
   });
-  const privateScans = privateSurfaceFiles.flatMap((entry) => entry?.surfaces ?? []);
+  // On a private machine surface named in the selected contract's
+  // privateSurfaceCategoryAllowances, LCM records the listed inventory categories by design (the
+  // hook-error fallback log records the hook's working directory). Their hits are counted
+  // separately and not as leaks; every other category and every canary is unchanged. Category
+  // counts that do not reconcile with the surface total all stay leaks.
+  const allowances = contract.observability?.privacy?.privateSurfaceCategoryAllowances ?? {};
+  const allowedSurfaceHits = {};
+  const privateScans = privateSurfaceFiles.flatMap((entry) => entry?.surfaces ?? []).map((surface) => {
+    const allowed = Object.hasOwn(allowances, surface.name) && Array.isArray(allowances[surface.name]) ? allowances[surface.name] : [];
+    const hits = allowed.map((category) => surface.categoryHits?.[category] ?? 0);
+    const allowedTotal = hits.reduce((sum, value) => sum + value, 0);
+    if (allowedTotal === 0 || !hits.every((value) => Number.isSafeInteger(value) && value >= 0) || !(allowedTotal <= surface.secretHits)) return surface;
+    allowedSurfaceHits[surface.name] ??= {};
+    for (const [index, category] of allowed.entries()) {
+      allowedSurfaceHits[surface.name][category] = (allowedSurfaceHits[surface.name][category] ?? 0) + hits[index];
+    }
+    return { ...surface, secretHits: surface.secretHits - allowedTotal };
+  });
   const failureScans = ['a', 'b'].flatMap((machine) => ndjsonFromFile(join(evidenceDirectory, `machine-${machine}`, "failure-privacy.ndjson")));
   const failureRecords = ['a', 'b'].flatMap((machine) => ndjsonFromFile(join(evidenceDirectory, `machine-${machine}`, "failures.ndjson")));
   const retainedReceipts = ['a', 'b'].map((machine) => ndjsonFromFile(join(evidenceDirectory, `machine-${machine}`, "retained-output-privacy.ndjson")));
@@ -1974,6 +1991,7 @@ export function reconstructObservabilitySummary({ evidenceDirectory, contract, c
     canaryHits: scans.reduce((sum, scan) => sum + (scan.canaryHits ?? 0), 0),
     secretHits: scans.reduce((sum, scan) => sum + (scan.secretHits ?? 0), 0),
     secretCategories: secretCategories.size,
+    allowedSurfaceHits,
     inventoryComplete: machineInventoryComplete && coordinatorInventoryComplete,
     surfacesComplete,
   };

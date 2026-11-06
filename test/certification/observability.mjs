@@ -164,6 +164,22 @@ export function scanSurface(bytes, inventory = [], canaries = CANARY_CORPUS) {
   return { bytes: buffer.length, categoryHits, secretHits, canaryHits };
 }
 
+// Replaces every inventory value, in each form that scanSurface detects, with its category
+// token. Longer forms go first, so a value containing another one (the project path under the
+// home path) becomes a single token.
+export function maskInventoryValues(bytes, inventory = []) {
+  let text = (Buffer.isBuffer(bytes) ? bytes : Buffer.from(String(bytes), "utf8")).toString("utf8");
+  const forms = inventory.flatMap((entry) => (entry.scanMode === "boundary-token" ? [entry.value] : encodedScanForms(entry.value))
+    .map((form) => ({ form, token: `<${entry.category}>`, boundary: entry.scanMode === "boundary-token" })))
+    .sort((left, right) => right.form.length - left.form.length);
+  for (const { form, token, boundary } of forms) {
+    text = boundary
+      ? text.replace(new RegExp(`(?<![\\p{L}\\p{N}_])${escapeRegex(form)}(?![\\p{L}\\p{N}_])`, "gu"), token)
+      : text.split(form).join(token);
+  }
+  return Buffer.from(text, "utf8");
+}
+
 const FAMILY_KEYS = Object.freeze({
   statements: new Set(["status", "observedAt", "scope", "statementsDeallocTotal", "statementsStatsReset", "blockSize", "omitted", "operations"]),
   pool: new Set(["status", "observedAt", "health", "omitted", "remediation", "saturationRatio"]),
@@ -783,6 +799,7 @@ export function buildObservabilitySummary({ contractSha256, runId, contract, pro
       probeRecords: probes.length,
       canarySurfaces: canary?.observed?.cli ?? 0,
       secretCategories: privacy?.secretCategories ?? 0,
+      allowedSurfaceHits: privacy?.allowedSurfaceHits ?? {},
       retentionDays: 90,
       directoryMode: "0700",
       fileMode: "0600",
