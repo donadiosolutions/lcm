@@ -1240,7 +1240,7 @@ export async function collectCalibrationEvidence({
       if (target > now()) await delay(target - now());
       if (second > 0 && second % windowSeconds === 0) await beforeProbeWindowEnd(second / windowSeconds);
       const sampleStartedAtMs = now();
-      const connections = (await client.query(`SELECT COALESCE(client_addr::text, 'local') AS client_address,
+      const connections = (await client.query(`SELECT COALESCE(pg_catalog.host(client_addr), 'local') AS client_address,
         pg_catalog.count(*)::integer AS connections
         FROM pg_catalog.pg_stat_activity
         WHERE usename OPERATOR(pg_catalog.=) $1
@@ -1260,7 +1260,7 @@ export async function collectCalibrationEvidence({
           COALESCE(pg_catalog.sum(stat.calls), 0)::pg_catalog.float8 AS calls,
           COALESCE(pg_catalog.sum(stat.total_exec_time), 0)::pg_catalog.float8 AS total_exec_time,
           COALESCE(pg_catalog.sum(stat.total_plan_time), 0)::pg_catalog.float8 AS total_plan_time,
-          (SELECT pg_catalog.extract(epoch FROM stats_reset)::pg_catalog.float8 FROM public.pg_stat_statements_info) AS stats_reset,
+          (SELECT EXTRACT(epoch FROM stats_reset)::pg_catalog.float8 FROM public.pg_stat_statements_info) AS stats_reset,
           (SELECT dealloc::pg_catalog.float8 FROM public.pg_stat_statements_info) AS dealloc,
           (SELECT xact_commit::pg_catalog.float8 FROM pg_catalog.pg_stat_database
             WHERE datname OPERATOR(pg_catalog.=) pg_catalog.current_database()) AS xact_commit,
