@@ -5,7 +5,10 @@ import { delimiter, join } from "node:path";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { OBSERVABILITY_GATE_ITEMS, assembleGateFromEvidence, buildEvidenceManifest, createSampleBuilder, forEachNdjsonRow, observabilityGateItems, parseGateArguments, readObserverWitness } from "../../scripts/certification-gate.mjs";
 import { captureExecutionHost, captureExecutionProvenance, reconstructObservabilitySummary } from "../../scripts/certification-harness.mjs";
+import { CANARY_CORPUS, CONTRACT_CANARIES, createCanaryWorkload } from "./canary-corpus.mjs";
 import { createGitCheckoutFixture } from "./git-checkout-fixture.js";
+import { runMigrationStep, scanBoundedPrivateOutputs } from "./machine-agent.mjs";
+import { buildSecretInventory, createInventoryManifest, scanSurface } from "./observability.mjs";
 import { createDeterministicSchedule, createFaultSchedule } from "./schedule.mjs";
 import { sampleSha256, writeSampleFile } from "./slo.mjs";
 import { observerReadSettings } from "./sqlite-observer-worker.mjs";
@@ -25,6 +28,89 @@ function snapshotFiles(root: string, directory = root, files = new Map<string, B
 type FaultLayout = "faults" | "partition-a" | "none";
 type MaintenanceFailure = "compact" | "snapshot" | "mixed";
 type Variant = { contractVersion?: 3 | 4; serverPort?: number; providerPort?: number | null; clockRetry?: "recovered" | "exhausted" | "miscounted"; observerRows?: number; withFaults?: boolean; observerGap?: boolean; observerSiblingsPresent?: boolean; extraObserverRow?: Record<string, unknown>; clockBreach?: boolean; clockGap?: boolean; duplicateMapping?: boolean; drainFail?: boolean; capacityPeak?: number; recoveryFail?: boolean; partitionFirstSuccessSeconds?: number; restartBFirstSuccessSeconds?: number; restartBNoSuccess?: boolean; noRecoverySuccess?: boolean; catchUpFail?: boolean; catchUpAtSeconds?: number; missingCatchUpTimestamp?: boolean; readinessInvalid?: boolean; residualOccupied?: boolean; poolConfigMismatch?: boolean; setupSessionOpen?: boolean; phaseEarly?: boolean; profile?: "smoke" | "full"; lane?: "local" | "managed"; faultLayout?: FaultLayout; maintenanceFailure?: MaintenanceFailure; smokeFailure?: boolean; smokeSlow?: boolean; executionHost?: Record<string, unknown> };
+
+type RetainedReceipt = { id: string; secretHits: number; canaryHits: number; categoryHits: Record<string, number> };
+
+// A complete v4 privacy evidence set with zero hits on every surface, written by the
+// real inventory, scanners and migration receipt writer. `leak` replaces one retained
+// CLI output (migration, identity or doctor) with the given text.
+async function retainedPrivacyEvidence(leak?: { machine: "a" | "b"; id: string; text: string }) {
+  const root = mkdtempSync(join(tmpdir(), "lcm-cert-v4-retained-privacy-"));
+  const contractBytes = readFileSync(new URL("./contract-v4.json", import.meta.url));
+  const contract = JSON.parse(contractBytes.toString("utf8"));
+  const contractSha256 = createHash("sha256").update(contractBytes).digest("hex");
+  const steadyT0At = "2026-11-05T00:00:00.000Z";
+  writeJson(join(root, "run.json"), { profile: "smoke", lane: "local", runId: "run", contractSha256 });
+  writeJson(join(root, "phase-control.json"), { steadyT0At, warmupStartAt: steadyT0At });
+  const output = (machine: string, id: string) => leak?.machine === machine && leak.id === id ? leak.text : `{"outcome":"ok","id":"${id}"}`;
+  const caBodyLines = ["MIIBfixtureCertificateBodyLineOne", "MIIBfixtureCertificateBodyLineTwo"];
+  for (const machine of ["a", "b"] as const) {
+    const directory = join(root, `machine-${machine}`);
+    const home = join(root, `home-${machine}`);
+    mkdirSync(directory);
+    mkdirSync(home);
+    const password = `runtime-password-${machine}-0123`;
+    const inventory = buildSecretInventory({
+      runtimeUrl: `postgresql://lcm_runtime_${machine}:${password}@database-${machine}.invalid:5432/lcm_cert_${machine}`,
+      runtimePassword: password,
+      runtimeRole: `lcm_runtime_${machine}`,
+      migrationRole: `lcm_migration_${machine}`,
+      databaseName: `lcm_cert_${machine}`,
+      databaseHost: `database-${machine}.invalid`,
+      databaseAddress: machine === "a" ? "10.88.0.11" : "10.88.0.12",
+      caPem: `-----BEGIN CERTIFICATE-----\n${caBodyLines.join("\n")}\n-----END CERTIFICATE-----\n`,
+      caBodyLines,
+      caFile: `/certs/ca-${machine}.pem`,
+      daemonToken: `daemon-token-${machine}-0123456789abcdef`,
+      projectPath: `/work/project-${machine}`,
+      homePath: home,
+      containerHostname: `machine-${machine}-host`,
+    });
+    const manifest = Buffer.from(`${JSON.stringify(createInventoryManifest(inventory, machine), null, 2)}\n`);
+    writeFileSync(join(directory, "secret-inventory-manifest.json"), manifest);
+    writeJson(join(directory, "contract-receipt.json"), { version: 4, sha256: contractSha256, inventoryManifestSha256: createHash("sha256").update(manifest).digest("hex") });
+    writeFileSync(join(directory, "failure-privacy.ndjson"), "");
+    for (const step of ["plan", "apply", "verify", "activate"]) {
+      await runMigrationStep({
+        args: [step], exec: async () => ({ stdout: output(machine, `migration-${step}`), stderr: "" }),
+        setupDeadlineMs: 600_000, now: () => 0, failuresPath: join(directory, "failures.ndjson"), machine, privacyInventory: inventory,
+      });
+    }
+    // The agent records these three receipts inline in this exact shape.
+    for (const id of ["identity", "readiness-doctor", "final-doctor"]) {
+      const bytes = Buffer.from(output(machine, id));
+      appendFileSync(join(directory, "retained-output-privacy.ndjson"), `${JSON.stringify({ id, sha256: createHash("sha256").update(bytes).digest("hex"), ...scanSurface(bytes, inventory, CANARY_CORPUS) })}\n`);
+    }
+    const daemonOutput = "daemon listening\n";
+    scanBoundedPrivateOutputs({ home, evidenceDirectory: directory, daemonOutput, inventory });
+    writeJson(join(directory, "daemon-output-coverage.json"), { totalBytes: daemonOutput.length, scannedBytes: daemonOutput.length, truncated: false, verdict: "pass", secretHits: 0, canaryHits: 0 });
+    const workload = createCanaryWorkload("run", machine);
+    const counts = { hooks: workload.hooks.length, stores: workload.stores.length, searches: workload.searches.length, utility: 1, cli: workload.cli.length };
+    writeJson(join(directory, "canary-witnesses.json"), {
+      expected: counts, observed: counts, utilityOutcome: "success",
+      cli: workload.cli.map((surface) => ({ id: surface.id, surface: surface.surface, outcome: "success", scan: scanSurface(Buffer.from(`${surface.surface} ok\n`), inventory, CANARY_CORPUS) })),
+    });
+  }
+  const coordinatorInventory = [
+    ["admin-url", "postgresql://lcm_admin:admin-password-0123@database.invalid:5432/postgres"],
+    ["admin-password", "admin-password-0123"],
+    ["admin-role", "lcm_admin"],
+    ["transfer-role", "lcm_cert_transfer"],
+  ].map(([category, value]) => ({ category, value, sourceClass: "coordinator", scanMode: "all-forms" }));
+  writeJson(join(root, "coordinator-inventory-manifest.json"), createInventoryManifest(coordinatorInventory, "coordinator"));
+  const coordinatorSurfaces = ["run.json", "faults.json", "calibration-evidence.json", "cleanup.json", "execution-provenance.json",
+    "phase-control.json", "setup-evidence.json", "database-readiness.json", "observability-barriers.json"];
+  writeJson(join(root, "coordinator-privacy.json"), { surfaces: coordinatorSurfaces.map((name) => {
+    const bytes = Buffer.from(`{"surface":"${name}"}\n`);
+    return { name, sha256: createHash("sha256").update(bytes).digest("hex"), ...scanSurface(bytes, coordinatorInventory, CANARY_CORPUS) };
+  }) });
+  const summary = reconstructObservabilitySummary({ evidenceDirectory: root, contract, contractSha256, runId: "run", faults: [], persist: false });
+  const receipt = (machine: "a" | "b", id: string): RetainedReceipt => readFileSync(join(root, `machine-${machine}`, "retained-output-privacy.ndjson"), "utf8")
+    .trim().split("\n").map((line) => JSON.parse(line)).find((entry: RetainedReceipt) => entry.id === id);
+  const privacy = Object.fromEntries(observabilityGateItems(summary).filter((item) => item.id.startsWith("privacy."))
+    .map((item) => [item.id, { verdict: item.verdict, observed: item.observed }]));
+  return { privacy, receipt };
+}
 
 describe("v4 observability gate items", () => {
   it("makes every missing local item incomplete rather than vacuously passing", () => {
@@ -100,6 +186,34 @@ describe("v4 observability gate items", () => {
     writeNdjson(join(root, "machine-a", "probes.ndjson"), [timeout, terminal, extra]);
     const surplus = reconstructObservabilitySummary({ evidenceDirectory: root, contract, contractSha256, runId: "run", faults: [fault], persist: false });
     expect(observabilityGateItems(surplus).find((item) => item.id === "probe-completeness")?.verdict).toBe("fail");
+  });
+
+  it("passes both privacy items for complete evidence with clean retained CLI outputs", async () => {
+    const clean = await retainedPrivacyEvidence();
+    expect(clean.privacy).toEqual({
+      "privacy.canary-leaks": { verdict: "pass", observed: 0 },
+      "privacy.secret-leaks": { verdict: "pass", observed: 0 },
+    });
+  });
+
+  it("fails secret leaks when only a retained migration output carries a credential", async () => {
+    const secret = await retainedPrivacyEvidence({ machine: "a", id: "migration-apply", text: '{"outcome":"applied","detail":"runtime-password-a-0123"}' });
+    expect(secret.receipt("a", "migration-apply")).toMatchObject({ secretHits: 1, canaryHits: 0, categoryHits: expect.objectContaining({ "runtime-password": 1 }) });
+    expect(secret.privacy).toEqual({
+      "privacy.canary-leaks": { verdict: "pass", observed: 0 },
+      "privacy.secret-leaks": { verdict: "fail", observed: 1 },
+    });
+  });
+
+  it("fails canary leaks when only a retained doctor output carries a canary", async () => {
+    const canary = await retainedPrivacyEvidence({ machine: "b", id: "final-doctor", text: `doctor note: ${CONTRACT_CANARIES.memory}\n` });
+    const receipt = canary.receipt("b", "final-doctor");
+    expect(receipt).toMatchObject({ secretHits: 0 });
+    expect(receipt.canaryHits).toBeGreaterThan(0);
+    expect(canary.privacy).toEqual({
+      "privacy.canary-leaks": { verdict: "fail", observed: receipt.canaryHits },
+      "privacy.secret-leaks": { verdict: "pass", observed: 0 },
+    });
   });
 });
 

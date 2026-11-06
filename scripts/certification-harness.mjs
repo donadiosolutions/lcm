@@ -1865,7 +1865,7 @@ export function reconstructObservabilitySummary({ evidenceDirectory, contract, c
       });
     if (persist) writeFileSync(coordinatorPrivacyPath, `${JSON.stringify({ surfaces: coordinatorScans })}\n`, { mode: 0o600, flag: "wx" });
   }
-  const scans = [...probeScans, ...cliScans, ...privateScans, ...failureScans, ...coordinatorScans];
+  const scans = [...probeScans, ...cliScans, ...privateScans, ...failureScans, ...coordinatorScans, ...retainedReceipts.flat()];
   const secretCategories = new Set(scans.flatMap((scan) => Object.keys(scan.categoryHits ?? {})));
   const machineManifests = ['a', 'b'].map((machine) => {
     const path = join(evidenceDirectory, `machine-${machine}`, "secret-inventory-manifest.json");
