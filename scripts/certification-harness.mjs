@@ -1491,13 +1491,22 @@ async function createPostgreSqlFaultMutation(phase, { adminUrl, caFile, processR
     throw error;
   }
   let finished = false;
-  const finish = async (sql) => {
-    if (finished) return;
-    try {
-      if (sql) await client.query(sql);
-      finished = true;
-    }
-    finally { await client.end().catch(() => undefined); }
+  let finishing;
+  // Concurrent callers (the safety timer and clear) share the restore already running;
+  // after a failed restore the next call tries again.
+  const finish = (sql) => {
+    if (finished) return Promise.resolve();
+    finishing ??= (async () => {
+      try {
+        if (sql) await client.query(sql);
+        finished = true;
+      }
+      finally { await client.end().catch(() => undefined); }
+    })().catch((error) => {
+      finishing = undefined;
+      throw error;
+    });
+    return finishing;
   };
   try {
     if (phase === "saturation") {

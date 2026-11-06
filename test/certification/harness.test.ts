@@ -41,9 +41,18 @@ import { waitForControl } from "./machine-agent.mjs";
 
 // Scripted failures for the mocked PostgreSQL client: each connect fails while
 // connectFailures is positive, as a connection refused during a database restart does.
-const pgScript = vi.hoisted(() => ({ connectFailures: 0, connects: 0 }));
+// When statementLogs is set, each client logs its statements and end() there, and a
+// ROLLBACK stays pending for rollbackMs.
+const pgScript = vi.hoisted(() => ({ connectFailures: 0, connects: 0, statementLogs: undefined as string[][] | undefined, rollbackMs: 0 }));
 vi.mock("pg", () => ({
   Client: class {
+    log: string[] | undefined;
+    constructor() {
+      if (pgScript.statementLogs) {
+        this.log = [];
+        pgScript.statementLogs.push(this.log);
+      }
+    }
     on() { return this; }
     async connect() {
       pgScript.connects += 1;
@@ -53,11 +62,13 @@ vi.mock("pg", () => ({
       }
     }
     async query(text: string) {
+      this.log?.push(text);
+      if (text === "ROLLBACK" && pgScript.rollbackMs > 0) await new Promise((resolve) => setTimeout(resolve, pgScript.rollbackMs));
       return text.includes("clock_timestamp")
         ? { rows: [{ now: "2026-10-26T10:00:00.000Z" }] }
         : { rows: [] };
     }
-    async end() {}
+    async end() { this.log?.push("end"); }
   },
 }));
 
@@ -556,6 +567,41 @@ describe("certification harness", () => {
       expect.objectContaining({ step: "saturation", verdict: "barrier-timeout" }),
       expect.objectContaining({ step: "saturation-cleanup", verdict: "fail" }),
     ]));
+  });
+
+  it("shares the saturation restore already running when clear arrives during the safety rollback", async () => {
+    await import("pg");
+    const evidenceDirectory = mkdtempSync(join(tmpdir(), "lcm-cert-v4-restore-race-"));
+    for (const machine of ["a", "b"]) mkdirSync(join(evidenceDirectory, `machine-${machine}`));
+    const caFile = join(evidenceDirectory, "ca.pem");
+    writeFileSync(caFile, "ca\n");
+    const { contract } = loadCertificationContract(new URL("./contract-v4.json", import.meta.url), { requireApproved: false });
+    pgScript.statementLogs = [];
+    pgScript.rollbackMs = 10_000;
+    vi.useFakeTimers();
+    try {
+      const running = runV4ObservabilityPhases({
+        contract, evidenceDirectory, machineNames: ["machine-a", "machine-b"],
+        adminUrl: "postgresql://admin@db/lcm", caFile, processRunner: async () => undefined,
+        containerCli: "podman", network: "network", machineB: "machine-b",
+        // Detection outlasts the 40-second safety timer, so clear() arrives while the
+        // timer's ROLLBACK is still running.
+        waitForFiles: async (paths: string[]) => {
+          if (paths.some((path) => path.endsWith("saturation-detected.json"))) await new Promise((resolve) => setTimeout(resolve, 45_000));
+        },
+      });
+      await vi.advanceTimersByTimeAsync(60_000);
+      const result = await running;
+      expect(result.barriers[0]).toEqual({ step: "saturation", verdict: "pass" });
+      expect(pgScript.statementLogs[0]).toEqual([
+        "SET lock_timeout = '5s'", "SET statement_timeout = '60s'", "BEGIN",
+        "LOCK TABLE lcm.promoted_memories IN ACCESS EXCLUSIVE MODE", "ROLLBACK", "end",
+      ]);
+    } finally {
+      vi.useRealTimers();
+      pgScript.statementLogs = undefined;
+      pgScript.rollbackMs = 0;
+    }
   });
 
   it("collects bounded calibration windows and counts-only connection labels", async () => {

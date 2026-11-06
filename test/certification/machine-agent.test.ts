@@ -11,6 +11,7 @@ import {
   deferOldestPendingDelivery,
   captureDoctorEvidence,
   collectDiagnosticSecrets,
+  executeControlledObservabilityPhase,
   executeProbeSchedule,
   executeDeterministicSchedule,
   expectedHookPayload,
@@ -34,10 +35,74 @@ import {
   verifyTlsNegativeProbe,
   waitForAcknowledgmentCatchUp,
 } from "./machine-agent.mjs";
+import { evaluatePhaseProbeEvidence } from "./observability.mjs";
 import { OBSERVER_BUSY_TIMEOUT_MS, observerReadSettings } from "./sqlite-observer-worker.mjs";
 import { extractPostToolEvents, extractUserPromptEvents } from "../../src/hooks/extractors.js";
 import { normalizePostToolInput } from "../../src/hooks/post-tool-normalization.js";
 import { scrubExtractedEvents } from "../../src/hooks/event-scrubbing.js";
+
+type PhaseProbe = { id: string; machine: string; phase: string; sequence: number; startedAtMs: number; completedAtMs: number; transportFailure?: boolean; snapshot?: unknown };
+
+const HEALTHY_SNAPSHOT = {
+  classification: "healthy",
+  pool: { status: "ready", origin: "daemon", failed: false },
+  telemetry: {
+    statements: { status: "observed" },
+    ...Object.fromEntries(["pool", "migration", "extensions", "queue"].map((family) => [family, { status: "observed", health: "healthy", remediation: "No action required." }])),
+  },
+};
+
+// Runs the real controlled-phase loop on a virtual clock set well in the real past, so the
+// real-time workload and catch-up read finish at once. The coordinator's clear lands while
+// probe `straddle` is in flight, after that probe started.
+async function runStraddledPhase({ phase, machine, straddle, respond, prepareHome }: {
+  phase: string;
+  machine: "a" | "b";
+  straddle: number;
+  respond: (sequence: number, startedAtMs: number) => { transportFailure?: boolean; snapshot?: unknown };
+  prepareHome?: (home: string, appliedAtMs: number) => void;
+}) {
+  const root = mkdtempSync(join(tmpdir(), `lcm-cert-${phase}-straddle-`));
+  const evidenceDirectory = join(root, "evidence");
+  const home = join(root, "home");
+  mkdirSync(evidenceDirectory);
+  mkdirSync(home);
+  const daemonTokenPath = join(root, "daemon.token");
+  writeFileSync(daemonTokenPath, "token\n");
+  const appliedAtMs = Date.now() - 3_000_000;
+  const appliedAt = new Date(appliedAtMs).toISOString();
+  prepareHome?.(home, appliedAtMs);
+  writeFileSync(join(evidenceDirectory, `${phase}-prepare.json`), `${JSON.stringify({ preparedAt: appliedAt })}\n`);
+  writeFileSync(join(evidenceDirectory, `${phase}-control.json`), `${JSON.stringify({ appliedAt, expectDetection: true })}\n`);
+  // The backlog step starts at its deferral instant, so only the probe loop waits.
+  let clock = phase === "queue-backlog" ? appliedAtMs + 960_000 : appliedAtMs;
+  let clearedAt = "";
+  let baseline: PhaseProbe | undefined;
+  const result = await executeControlledObservabilityPhase({
+    phase, machine, runId: "run", contract: JSON.parse(readFileSync(new URL("./contract-v4.json", import.meta.url), "utf8")),
+    contractSha256: "0".repeat(64), entrypoint: join(root, "lcm.mjs"), cwd: root, environment: { HOME: home },
+    daemonClient: { post: async () => ({}) }, evidenceDirectory, daemonTokenPath, inventory: [],
+    now: () => clock,
+    wait: async (milliseconds: number) => { clock += milliseconds; },
+    probe: async (request: { id: string; machine: string; phase: string; sequence: number }) => {
+      const startedAtMs = clock;
+      clock += 500;
+      if (request.sequence === straddle) {
+        clearedAt = new Date(clock).toISOString();
+        writeFileSync(join(evidenceDirectory, `${phase}-cleared.json`), `${JSON.stringify({ clearedAt })}\n`);
+      }
+      clock += 500;
+      const record: PhaseProbe = {
+        id: request.id, machine: request.machine, phase: request.phase, sequence: request.sequence, startedAtMs, completedAtMs: clock,
+        ...(request.sequence < 0 ? { snapshot: HEALTHY_SNAPSHOT } : respond(request.sequence, startedAtMs)),
+      };
+      if (request.sequence < 0) baseline = record;
+      return record;
+    },
+  });
+  const readJson = (name: string) => JSON.parse(readFileSync(join(evidenceDirectory, name), "utf8"));
+  return { records: result.records as PhaseProbe[], baseline, readJson, fault: { appliedAt, clearedAt } };
+}
 
 describe("observability probes", () => {
   it("keeps probes single-flight even when scheduled starts are already late", async () => {
@@ -94,6 +159,54 @@ describe("observability probes", () => {
     database.prepare("INSERT INTO events VALUES (?, ?, ?, ?, ?, ?)").run(2, "invalid", "retry", "invalid", "2026-11-05 00:00:00", "2026-11-05 00:00:00");
     database.close();
     await expect(deferOldestPendingDelivery(path, { nowMs: Date.parse("2026-11-05T00:20:00Z") })).rejects.toThrow("not naturally aged");
+  });
+
+  it("records controlled-phase clearance only from a probe that started after clearedAt", async () => {
+    const { records, baseline, readJson, fault } = await runStraddledPhase({
+      phase: "timeout", machine: "a", straddle: 1,
+      // Probe 0 sees the held lock; probe 1 straddles the release and returns healthy.
+      respond: (sequence) => ({ snapshot: sequence === 0 ? { ...HEALTHY_SNAPSHOT, classification: "timeout" } : HEALTHY_SNAPSHOT }),
+    });
+    expect(records.find((record) => record.sequence === 1)?.startedAtMs).toBeLessThan(Date.parse(fault.clearedAt));
+    const evaluated = evaluatePhaseProbeEvidence({ phase: "timeout", probes: records, fault, baseline: { a: baseline } });
+    expect({ clearance: readJson("timeout-clearance.json").id, evaluated: evaluated.clearanceIds?.a })
+      .toEqual({ clearance: "timeout-a-probe-2", evaluated: "timeout-a-probe-2" });
+  });
+
+  it("binds backlog detection to the first matching probe that started after clearedAt", async () => {
+    let createdAtMs = 0;
+    const backlog = (startedAtMs: number) => ({ ...HEALTHY_SNAPSHOT, telemetry: { ...HEALTHY_SNAPSHOT.telemetry, queue: {
+      status: "observed", health: "degraded", remediation: "Check daemon delivery with `lcm events status`, then run `lcm doctor`.",
+      outboxOldestPendingAgeSeconds: Math.floor((startedAtMs - createdAtMs) / 1000), inboxClaimed: 0, inboxQuarantined: 0,
+    } } });
+    const { records, baseline, readJson, fault } = await runStraddledPhase({
+      phase: "queue-backlog", machine: "b", straddle: 3,
+      prepareHome: (home, appliedAtMs) => {
+        const createdAt = new Date(appliedAtMs).toISOString().replace("T", " ").slice(0, 19);
+        createdAtMs = Date.parse(`${createdAt.replace(" ", "T")}Z`);
+        mkdirSync(join(home, ".lcm", "events"), { recursive: true });
+        const database = new DatabaseSync(join(home, ".lcm", "events", "events.db"));
+        database.exec(`CREATE TABLE events (
+          event_id INTEGER PRIMARY KEY, event_uuid TEXT NOT NULL UNIQUE, machine_sequence INTEGER, session_id TEXT,
+          type TEXT, source_hook TEXT, data TEXT, delivery_state TEXT NOT NULL, remote_inbox_id TEXT,
+          acknowledged_at TEXT, remote_pruned_at TEXT, created_at TEXT NOT NULL,
+          delivery_next_attempt_at TEXT NOT NULL, delivery_updated_at TEXT NOT NULL
+        )`);
+        database.prepare("INSERT INTO events (event_id, event_uuid, delivery_state, created_at, delivery_next_attempt_at, delivery_updated_at) VALUES (1, 'aged', 'pending', ?, ?, ?)")
+          .run(createdAt, createdAt, createdAt);
+        database.close();
+      },
+      // Partitioned probes fail transport; probe 3 straddles the reconnect and already shows
+      // the aged backlog; probe 4 is the first body that started after clearedAt.
+      respond: (sequence, startedAtMs) => sequence < 3 ? { transportFailure: true }
+        : sequence < 5 ? { snapshot: backlog(startedAtMs) } : { snapshot: HEALTHY_SNAPSHOT },
+    });
+    const detected = readJson("queue-backlog-detected.json");
+    const evaluated = evaluatePhaseProbeEvidence({
+      phase: "queue-backlog", probes: records, fault, baseline: { b: baseline },
+      backlogWitness: readJson("queue-backlog-aged.json"), backlogDetection: { ...detected.backlogRow, id: detected.id },
+    });
+    expect({ detection: detected.id, alert: evaluated.alert }).toEqual({ detection: "queue-backlog-b-probe-4", alert: true });
   });
 
   it("scans bounded daemon, failure and log outputs without publishing their text", () => {

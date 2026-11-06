@@ -1022,6 +1022,7 @@ export async function executeControlledObservabilityPhase({
   const records = [];
   let detected;
   let cleared;
+  let clearedAtMs;
   let backlogWitness;
   let saturationWaitingEstablished = false;
   for (let sequence = 0; now() < appliedAtMs + holdMaximumSeconds * 1000 + 30_000; sequence += 1) {
@@ -1036,12 +1037,17 @@ export async function executeControlledObservabilityPhase({
       operationIds: contract.observability.cardinality.operationIds,
     });
     records.push(record);
+    const clearedPath = join(evidenceDirectory, `${phase}-cleared.json`);
+    if (clearedAtMs === undefined && existsSync(clearedPath)) clearedAtMs = Date.parse(JSON.parse(readFileSync(clearedPath, "utf8")).clearedAt);
+    // Only a probe that started at or after clearedAt can observe the cleared state.
+    const startedAfterClear = clearedAtMs !== undefined && record.startedAtMs >= clearedAtMs;
     if (phase === "saturation" && record.snapshot?.pool?.waiting > 0) saturationWaitingEstablished = true;
     if (phase === "queue-backlog" && !existsSync(join(evidenceDirectory, "queue-backlog-outage-detected.json"))
       && (record.transportFailure === true || ["timeout", "unavailable"].includes(record.snapshot?.classification))) {
       writeFileSync(join(evidenceDirectory, "queue-backlog-outage-detected.json"), `${JSON.stringify({ machine, id: record.id, completedAtMs: record.completedAtMs })}\n`, { mode: 0o600, flag: "wx" });
     }
-    if (control.expectDetection !== false && !detected && probeMatchesPhase(phase, record, { baseline })) {
+    if (control.expectDetection !== false && !detected && (phase !== "queue-backlog" || startedAfterClear)
+      && probeMatchesPhase(phase, record, { baseline })) {
       if (phase === "queue-backlog" && machine === "b") {
         backlogWitness = await backlogDeferral;
         const databasePath = findEventsDatabase(environment.HOME);
@@ -1057,7 +1063,7 @@ export async function executeControlledObservabilityPhase({
         });
       }
     }
-    if (existsSync(join(evidenceDirectory, `${phase}-cleared.json`)) && healthyProbe(record)) {
+    if (startedAfterClear && healthyProbe(record)) {
       cleared = { machine, id: record.id, completedAtMs: record.completedAtMs };
       writeFileSync(join(evidenceDirectory, `${phase}-clearance.json`), `${JSON.stringify(cleared)}\n`, { mode: 0o600, flag: "wx" });
       break;
