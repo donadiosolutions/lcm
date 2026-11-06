@@ -183,6 +183,7 @@ function assertContract(contract) {
       || calibration.baselineWindowSeconds !== 180 || calibration.probeWindowSeconds !== 180
       || calibration.probeCadenceSeconds !== 15 || calibration.probesPerMachinePerWindow !== 12
       || calibration.successfulPathWireStatementCeiling !== 90
+      || !Number.isSafeInteger(calibration.successfulPathWireStatementCount) || calibration.successfulPathWireStatementCount <= 0
       || calibration.idleConnectionValidationAllowancePerAcquiredConnection !== null
       || calibration.idleConnectionValidationAllowanceMode !== "unmeasured-pending-smoke"
       || typeof calibration.databaseCpuPercentDefinition !== "string" || calibration.databaseCpuPercentDefinition.length === 0

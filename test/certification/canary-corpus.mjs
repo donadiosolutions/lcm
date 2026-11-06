@@ -41,6 +41,14 @@ export const CANARY_CLI_SURFACES = Object.freeze([
   ["events-status", ["events", "status"]],
 ]);
 
+// lcm doctor prints its checks and then exits 1 when any check fails (bin/lcm.ts:3810-3814).
+// In the certification machines its summarizer checks fail by design, because no claude or
+// codex CLI is on the daemon PATH, so exit 1 after printed output still enters the surface.
+export const CANARY_CLI_REPORTING_EXIT_CODES = Object.freeze({
+  doctor: Object.freeze([1]),
+  "doctor-verbose": Object.freeze([1]),
+});
+
 export function createCanaryWorkload(runId, machine) {
   return {
     hooks: CANARY_CORPUS.flatMap((canary, index) => [
@@ -54,6 +62,8 @@ export function createCanaryWorkload(runId, machine) {
     })),
     searches: CANARY_CORPUS.map((canary, index) => ({ id: `${runId}-canary-${machine}-search-${index}`, query: canary })),
     utility: { id: `${runId}-canary-${machine}-utility`, sql: `SET application_name = '${CONTRACT_CANARIES.applicationName}'` },
-    cli: CANARY_CLI_SURFACES.map(([surface, args]) => ({ id: `${runId}-canary-${machine}-cli-${surface}`, surface, args })),
+    cli: CANARY_CLI_SURFACES.map(([surface, args]) => ({
+      id: `${runId}-canary-${machine}-cli-${surface}`, surface, args, reportingExitCodes: CANARY_CLI_REPORTING_EXIT_CODES[surface] ?? [],
+    })),
   };
 }

@@ -521,6 +521,22 @@ export function evaluateCalibrationPairs(pairs, { approvedCeiling, approvedNoise
   return { verdict, validPairs: valid.length, rejectedPairs: pairs.length - valid.length, signedCosts: costs, measuredMaximum, noiseAllowance };
 }
 
+// The successful-path statement count is code-derived, and the fake-executor readiness test
+// pins it, so a measured value is not compared with a ceiling that equals that exact count.
+// The item passes when the static count is within the ceiling and every valid pair's measured
+// per-probe calls are within the baseline noise allowance of it; otherwise it fails. Fewer valid
+// pairs than the contract minimum, or no static count, is incomplete.
+export function evaluateStatementOverhead(measurement, { staticCount, ceiling, minimumValidPairs }) {
+  const costs = Array.isArray(measurement?.signedCosts) ? measurement.signedCosts : [];
+  if (!Number.isSafeInteger(staticCount) || !(measurement?.validPairs >= minimumValidPairs)
+    || costs.length !== measurement.validPairs || !Number.isFinite(measurement.noiseAllowance)) {
+    return { ...measurement, verdict: "incomplete", staticCount, ceiling };
+  }
+  const maximumDeviation = Math.max(...costs.map((cost) => Math.abs(cost - staticCount)));
+  const verdict = staticCount <= ceiling && maximumDeviation <= measurement.noiseAllowance ? "pass" : "fail";
+  return { ...measurement, verdict, staticCount, ceiling, maximumDeviation };
+}
+
 export function evaluateConnectionEvidence({
   baseline,
   probeSamples,
@@ -721,7 +737,8 @@ export function buildObservabilitySummary({ contractSha256, runId, contract, pro
   for (const [id, value] of [["overhead.machine-cpu", calibration?.machineCpu], ["overhead.database-cpu", calibration?.databaseCpu]]) {
     items.push(summaryItem(id, value?.verdict ?? "incomplete", value?.measuredMaximum ?? 0, value?.ceiling ?? 0));
   }
-  items.push(summaryItem("overhead.statements-per-snapshot", calibration?.statements?.verdict ?? "incomplete", calibration?.statements?.observed ?? 0, calibration?.statements?.ceiling ?? 0));
+  items.push(summaryItem("overhead.statements-per-snapshot", calibration?.statements?.verdict ?? "incomplete", calibration?.statements?.observed ?? 0, calibration?.statements?.ceiling ?? 0,
+    "static successful-path count <= ceiling, and |measured per-probe calls - static count| <= baseline noise allowance"));
   items.push(summaryItem("overhead.connections", connections?.verdict ?? "incomplete", connections?.observed ?? 0, connections?.ceiling ?? 0));
   const latencies = steady.map((probe) => probe.durationMs).filter(Number.isFinite).sort((left, right) => left - right);
   const p95 = latencies.length === 0 ? 0 : latencies[Math.ceil(latencies.length * 0.95) - 1];

@@ -117,11 +117,10 @@ saturation action, within the 20-second witness bound; the lock is released by i
 Machine B records one terminal outcome, `witness`, `wrong-telemetry` or
 `no-waiting`, and the coordinator clears on it, so later steps still run.
 `no-waiting` leaves saturation incomplete and records the pool alert as
-unreachable through the public routes in that run; `wrong-telemetry` fails. Every
-blocked search completes, or fails no later than the 10-second saturation
-clearance after `clearedAt`; such a failure is intentional when the search started
-before `clearedAt`. Both machines then show the cleared state with the healthy
-action within that 10-second clearance.
+unreachable through the public routes in that run; `wrong-telemetry` fails. Any
+failed saturation search that started before `clearedAt` and ended by
+`clearedAt` + 10 seconds is an intentional failure. Both machines show the cleared
+state with the healthy action within the 10-second saturation clearance.
 
 Under the relation lock, a store blocks inside the daemon's publication queue: its
 dedup check runs `searchPromoted` under the 5-second search cap, the store answers
@@ -139,7 +138,24 @@ and substantial 24-character prefixes where output can be truncated. Values
 shorter than eight characters are scanned only as boundary-delimited tokens; the
 evidence records that narrower guarantee. Secret values never enter public
 evidence. Private raw directories use mode 0700, files use mode 0600, and the
-retention period remains 90 days.
+retention period remains 90 days. Each canary prompt starts with the user-prompt
+fixture's decision phrase, because the product records a prompt only as a user
+decision, so every canary hook stores exactly one row. The product scrubs hook
+text before it stores the row; its native PEM key-header pattern stores the
+client-key canary with the header replaced by `[REDACTED]`, and the capture oracle
+expects that text. `lcm doctor` exits 1 after printing its checks when any check
+fails, and its summarizer checks fail in the certification machines because no
+`claude` or `codex` CLI is on the daemon PATH. A doctor surface that exits 1 after
+printing counts as entered, and every CLI witness records its exit code.
+
+Coordinator leak surfaces are the coordinator's run records: `run.json`,
+`faults.json`, `calibration-evidence.json`, `cleanup.json`,
+`execution-provenance.json`, `phase-control.json` and
+`observability-barriers.json`. `setup-evidence.json` and `database-readiness.json`
+list role names by design, as the setup-closure witness. They are private harness
+bookkeeping that is never published and is not LCM output, so they are hashed for
+provenance and not scanned. The observability summary and the public gate outputs
+are still scanned before they are written.
 
 Raw telemetry is validated before any public output. The validator requires the five
 closed families, packaged operation and extension catalogs, allowed fields,
@@ -171,7 +187,15 @@ by the actual elapsed window and recorded database CPU quota.
 The source-derived successful snapshot path is fixed at 90 wire statements. A
 conditional idle-connection validation remains a separate quantity; it is
 unmeasured before the smoke and is not added to the gated 90-statement
-successful-path count.
+successful-path count. The successful-path statement count is code-derived and
+pinned by the fake-executor readiness test. `overhead.statements-per-snapshot`
+passes when that static count (`successfulPathWireStatementCount`) is at most
+`successfulPathWireStatementCeiling` and every valid pair's measured per-probe
+calls are within the pairs' baseline noise allowance of it,
+`|measured - static count| <= noise allowance`; otherwise it fails. Fewer than
+`minimumValidPairs` valid pairs is incomplete. A measured value is not compared
+with a ceiling equal to the exact count, because baseline noise moves it to either
+side.
 
 V4 observability is applicable only to the local lane. A managed v4 run evaluates
 exactly the inherited v3 item set and records observability as not applicable,
@@ -185,7 +209,7 @@ be reported as a production percentile result. `full` runs the frozen 6000-secon
 steady schedule, fault phases, recovery checks, and final 900-second drain.
 This no-fault smoke is a v3 profile. A local v4 smoke without `--with-faults` is
 rejected because v4 calibration and observability phases are one coordinated
-8,520-second smoke rather than an extension of the 1,800-second profile.
+8,820-second smoke rather than an extension of the 1,800-second profile.
 
 A local smoke run can also inject the lane's two faults with `--with-faults`. This
 fault smoke runs the smoke workload, then the machine-A partition and the database
@@ -271,8 +295,8 @@ LCM_TEST_CONTAINER_CLI=podman \
 ```
 
 For the v4 draft, supply the path explicitly after the script's v3 default (the
-last `--contract` value wins). The provisional local full deadline is 15,300
-seconds and the provisional fault-plus-observability smoke deadline is 8,520
+last `--contract` value wins). The provisional local full deadline is 15,600
+seconds and the provisional fault-plus-observability smoke deadline is 8,820
 seconds. Both are exact sums checked by the loader and will be resized from smoke
 evidence before approval:
 

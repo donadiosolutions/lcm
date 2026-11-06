@@ -57,9 +57,9 @@ describe("certification contract", () => {
     expect(v4.contract.version).toBe(4);
     expect(v4.status).toBe("draft");
     expect(v4.approval).toBeUndefined();
-    expect(v4.contract.timeline.full.localDeadlineSeconds).toBe(15_300);
-    expect(certificationDeadlineSeconds(v4.contract, { profile: "full" })).toBe(15_300);
-    expect(certificationDeadlineSeconds(v4.contract, { profile: "smoke", withFaults: true })).toBe(8_520);
+    expect(v4.contract.timeline.full.localDeadlineSeconds).toBe(15_600);
+    expect(certificationDeadlineSeconds(v4.contract, { profile: "full" })).toBe(15_600);
+    expect(certificationDeadlineSeconds(v4.contract, { profile: "smoke", withFaults: true })).toBe(8_820);
     expect(certificationDeadlineSeconds(v4.contract, { profile: "smoke" })).toBe(1_800);
   });
 

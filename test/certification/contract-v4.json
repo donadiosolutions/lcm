@@ -91,11 +91,11 @@
       "extensionLossPhaseMaxSeconds": 180,
       "backlogHoldMaxSeconds": 1080,
       "backlogRecoverySeconds": 930,
-      "canaryPhaseMaxSeconds": 300,
+      "canaryPhaseMaxSeconds": 600,
       "observabilityAllocationsProvisional": true,
       "finalDrainSeconds": 900,
       "cleanupReserveSeconds": 900,
-      "localDeadlineSeconds": 15300
+      "localDeadlineSeconds": 15600
     },
     "smoke": {
       "certifying": false,
@@ -104,7 +104,7 @@
       "finalDrainSeconds": 660,
       "faults": [],
       "wholeRunDeadlineSeconds": 1800,
-      "faultObservabilityDeadlineSeconds": 8520,
+      "faultObservabilityDeadlineSeconds": 8820,
       "note": "exploratory; not a percentile gate"
     },
     "membership": "scheduled time in half-open [T0, T0+steadySeconds); T0 fixed only after both machines ready and warmup done; faults never overlap steady or each other's recovery"
@@ -156,7 +156,7 @@
       "workload": "Both machines send searches only, with no store or other mutating request, because a mutating request takes the daemon's publication queue and every later read then queues behind it.",
       "witness": "The status probe reads the pool counters before its own 2-second diagnostic deadline, and probes run every second, so probes made while searches wait can show `waiting > 0`. The witness is the first machine-B body with daemon origin, a saturation ratio of at least 1, `waiting > 0`, `failed` false and the exact saturation action, within the 20-second witness bound; the lock is released by its 40-second ceiling at the latest.",
       "outcome": "Machine B records one terminal outcome, `witness`, `wrong-telemetry` or `no-waiting`, and the coordinator clears on it, so later steps still run. `no-waiting` leaves saturation incomplete and records the pool alert as unreachable through the public routes in that run; `wrong-telemetry` fails.",
-      "recovery": "Every blocked search completes, or fails no later than the 10-second saturation clearance after `clearedAt`; such a failure is intentional when the search started before `clearedAt`. Both machines then show the cleared state with the healthy action within that 10-second clearance.",
+      "recovery": "Any failed saturation search that started before `clearedAt` and ended by `clearedAt` + 10 seconds is an intentional failure. Both machines show the cleared state with the healthy action within the 10-second saturation clearance.",
       "admission": "Under the relation lock, a store blocks inside the daemon's publication queue: its dedup check runs `searchPromoted` under the 5-second search cap, the store answers HTTP 503 after about 5 seconds, and later stores wait their turn. A read whose project open finds the publication lock held waits at most 4 seconds (`READ_ADMISSION_WAIT_MS`) and answers HTTP 503. Without a mutating request, reads open lock-free and run their queries outside the queue, so concurrent promoted-layer searches can fill the pool."
     },
     "cardinality": {
@@ -201,10 +201,12 @@
       "idleRuntimeRoleCallsPerSecondCeiling": 1,
       "sampledConnectionIncrementCeiling": 2,
       "sampledConnectionResidualSeconds": 5,
+      "successfulPathWireStatementCount": 90,
       "successfulPathWireStatementCeiling": 90,
       "idleConnectionValidationAllowancePerAcquiredConnection": null,
       "idleConnectionValidationAllowanceMode": "unmeasured-pending-smoke",
-      "successfulPathWireStatementDerivation": "45 successful application queries x 2 wire statements for signalled PID preflight plus query. Outside runtime schema readiness: health 4, migration 1, metrics 2, queue 1, statements context 1 + mapping probes 14 + counter read 1 = 24 application queries / 48 wire statements. verifyPostgreSqlRuntimeSchema reaches 21 executor.query sites: server readiness; role policy; extension catalog; pg_stat_statements probe; content collation; extension functions; extension operator; GIN operator class; direct GIN operators; indirect GIN operators; GIN support functions; search configuration; migration history; ownership; schema definitions; identity functions; schema ACL; relation ACL; column ACL; function ACL; effective privileges = 21 application queries / 42 wire statements. Total 90. A conditional idle-connection SELECT 1 is excluded and bounded separately at one per acquired connection. Provisional until smoke confirms pg_stat_statements accounting."
+      "successfulPathWireStatementDerivation": "45 successful application queries x 2 wire statements for signalled PID preflight plus query. Outside runtime schema readiness: health 4, migration 1, metrics 2, queue 1, statements context 1 + mapping probes 14 + counter read 1 = 24 application queries / 48 wire statements. verifyPostgreSqlRuntimeSchema reaches 21 executor.query sites: server readiness; role policy; extension catalog; pg_stat_statements probe; content collation; extension functions; extension operator; GIN operator class; direct GIN operators; indirect GIN operators; GIN support functions; search configuration; migration history; ownership; schema definitions; identity functions; schema ACL; relation ACL; column ACL; function ACL; effective privileges = 21 application queries / 42 wire statements. Total 90. A conditional idle-connection SELECT 1 is excluded and bounded separately at one per acquired connection. Provisional until smoke confirms pg_stat_statements accounting.",
+      "successfulPathWireStatementRule": "The successful-path statement count is code-derived and pinned by the fake-executor readiness test. `overhead.statements-per-snapshot` passes when that static count (`successfulPathWireStatementCount`) is at most `successfulPathWireStatementCeiling` and every valid pair's measured per-probe calls are within the pairs' baseline noise allowance of it, `|measured - static count| <= noise allowance`; otherwise it fails. Fewer than `minimumValidPairs` valid pairs is incomplete. A measured value is not compared with a ceiling equal to the exact count, because baseline noise moves it to either side."
     },
     "workload": {
       "minimumSuccessfulSearchesPerMachine": 2,

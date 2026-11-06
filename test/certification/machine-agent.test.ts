@@ -7,6 +7,7 @@ import { DatabaseSync } from "node:sqlite";
 import { describe, expect, it, vi } from "vitest";
 import {
   createAdmissionController,
+  createCanaryHookFixture,
   createHookFixture,
   deferOldestPendingDelivery,
   captureDoctorEvidence,
@@ -36,6 +37,7 @@ import {
   waitForAcknowledgmentCatchUp,
 } from "./machine-agent.mjs";
 import { OBSERVABILITY_ACTIONS, evaluatePhaseProbeEvidence } from "./observability.mjs";
+import { createCanaryWorkload } from "./canary-corpus.mjs";
 import { OBSERVER_BUSY_TIMEOUT_MS, observerReadSettings } from "./sqlite-observer-worker.mjs";
 import { extractPostToolEvents, extractUserPromptEvents } from "../../src/hooks/extractors.js";
 import { normalizePostToolInput } from "../../src/hooks/post-tool-normalization.js";
@@ -390,6 +392,68 @@ describe("certification machine agent", () => {
       expect(admitted[0]?.data).toBe(expectedHookPayload(kind, fixture));
     },
   );
+
+  // Smoke 4: every canary prompt failed capture, because a bare canary carries no decision
+  // phrase, and post-tool-17 (the client-key canary) failed because the product stores its
+  // PEM header as [REDACTED]. The product's own extraction and scrubbing must store each
+  // canary hook as one row whose text is the capture oracle's expected payload.
+  it("stores every canary hook as exactly one scrubbed row that the capture oracle expects", async () => {
+    const cwd = mkdtempSync(join(tmpdir(), "lcm-cert-canary-admission-"));
+    const mismatches: string[] = [];
+    const stored: Record<string, string | undefined> = {};
+    for (const entry of createCanaryWorkload("run", "a").hooks) {
+      const fixture = createCanaryHookFixture({ kind: entry.kind, canary: entry.canary, sessionId: "s0", cwd });
+      const extracted = entry.kind === "user-prompt"
+        ? extractUserPromptEvents(fixture.prompt)
+        : extractPostToolEvents(normalizePostToolInput(fixture));
+      const admitted = await scrubExtractedEvents(extracted, cwd, []);
+      const expectedType = entry.kind === "user-prompt" ? "user_decision" : "task_create";
+      if (extracted.length !== 1 || extracted[0]?.type !== expectedType || admitted.length !== 1
+        || admitted[0]?.data !== expectedHookPayload(entry.kind, fixture)) mismatches.push(entry.id);
+      if (entry.id.endsWith("-17")) stored[entry.kind] = admitted[0]?.data;
+    }
+    expect({ mismatches, stored }).toEqual({
+      mismatches: [],
+      stored: {
+        "user-prompt": "Always prefer deterministic records. [REDACTED]incident-client-key-canary",
+        "post-tool": "[REDACTED]incident-client-key-canary → created",
+      },
+    });
+  });
+
+  // Smoke 4: lcm doctor printed its checks and exited 1, because the machines' summarizer
+  // checks fail by design (bin/lcm.ts:3810-3814), and the canary witness counted both doctor
+  // surfaces as failed. A surface that reports through a declared exit code is entered.
+  it("enters doctor surfaces that exit 1 after printing their checks and records each exit code", async () => {
+    const { runCanaryCliSurfaces } = await import("./machine-agent.mjs");
+    const cliExit = (code: number | null, stdout: string, extra: Record<string, unknown> = {}) => Object.assign(
+      new Error(`LCM command failed with ${code}`), { code, signal: null, stdout, stderr: "", errorClass: "CliExit", ...extra });
+    const run = async (fail: (args: string[]) => Error | undefined) => (await runCanaryCliSurfaces({
+      surfaces: createCanaryWorkload("run", "a").cli, entrypoint: "lcm.mjs", cwd: "/project", environment: {}, inventory: [],
+      exec: async (_entrypoint: string, args: string[]) => {
+        const error = fail(args);
+        if (error) throw error;
+        return { code: 0, signal: null, stdout: `${args.join(" ")} ok\n`, stderr: "" };
+      },
+    })).map((entry: { surface: string; outcome: string; exitCode: number | null; scan: { bytes: number } }) => [entry.surface, entry.outcome, entry.exitCode, entry.scan.bytes > 1]);
+    expect(await run((args) => args[0] === "doctor" ? cliExit(1, "13 passed · 2 failed\n") : undefined)).toEqual([
+      ["status", "success", 0, true], ["status-json", "success", 0, true], ["doctor", "entered", 1, true],
+      ["doctor-verbose", "entered", 1, true], ["stats", "success", 0, true], ["stats-pool", "success", 0, true],
+      ["events-status", "success", 0, true],
+    ]);
+    // An undeclared code, a timeout, a nonzero exit on another surface, or exit 1 without
+    // printed output stays failed.
+    expect(await run((args) => args[0] === "doctor" && args[1] === "--verbose"
+      ? cliExit(null, "", { signal: "SIGTERM", errorClass: "OperationDeadlineExceeded" })
+      : args[0] === "doctor" ? cliExit(2, "unexpected\n")
+        : args[0] === "stats" && args[1] === undefined ? cliExit(1, "stats failed\n")
+          : args[0] === "status" && args[1] === undefined ? cliExit(1, "") : undefined)).toEqual([
+      ["status", "failed", 1, false], ["status-json", "success", 0, true], ["doctor", "failed", 2, true],
+      ["doctor-verbose", "failed", null, false], ["stats", "failed", 1, true], ["stats-pool", "success", 0, true],
+      ["events-status", "success", 0, true],
+    ]);
+    expect((await run((args) => args[0] === "doctor" && args[1] === undefined ? cliExit(1, "") : undefined))[2]).toEqual(["doctor", "failed", 1, false]);
+  });
 
   it("recognizes only terminal acknowledged rows", () => {
     expect(isAcknowledgedRow({ delivery_state: "acknowledged", remote_inbox_id: "i", acknowledged_at: "now" })).toBe(true);

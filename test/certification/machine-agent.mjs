@@ -22,9 +22,12 @@ function padded(prefix, bytes) {
   if (!Number.isSafeInteger(bytes) || bytes < prefixBytes) throw new Error("fixture byte count is too small");
   return prefix + "x".repeat(bytes - prefixBytes);
 }
+// The product records a prompt only as a user decision, which needs a decision phrase
+// (src/hooks/extractors.ts:412-431); every user-prompt fixture starts with this one.
+const USER_PROMPT_DECISION_PHRASE = "Always prefer deterministic records. ";
 export function createHookFixture({ kind, bytes, sessionId, cwd }) {
   if (kind === "user-prompt") {
-    return { prompt: padded("Always prefer deterministic records. ", bytes), session_id: sessionId, cwd, client: "codex" };
+    return { prompt: padded(USER_PROMPT_DECISION_PHRASE, bytes), session_id: sessionId, cwd, client: "codex" };
   }
   if (kind === "post-tool") {
     return {
@@ -40,7 +43,7 @@ export function createHookFixture({ kind, bytes, sessionId, cwd }) {
 }
 
 export function createCanaryHookFixture({ kind, canary, sessionId, cwd }) {
-  if (kind === "user-prompt") return { prompt: canary, session_id: sessionId, cwd, client: "codex" };
+  if (kind === "user-prompt") return { prompt: USER_PROMPT_DECISION_PHRASE + canary, session_id: sessionId, cwd, client: "codex" };
   if (kind === "post-tool") return {
     tool_name: "TaskCreate",
     tool_input: { subject: canary, status: "created" },
@@ -53,10 +56,13 @@ export function createCanaryHookFixture({ kind, canary, sessionId, cwd }) {
 }
 
 // The stored event text the capture oracle expects for a hook fixture: the prompt,
-// or the TaskCreate "subject → status" line, capped at the product's 2,000-character
-// DATA_SOFT_CAP with a trailing "...".
+// or the TaskCreate "subject → status" line, scrubbed and then capped at the product's
+// 2,000-character DATA_SOFT_CAP with a trailing "..." (src/hooks/event-scrubbing.ts:128-134).
+// Of the scrub patterns, only the native PEM key header (src/scrub.ts:47) matches a fixture:
+// the product stores the client-key canary with its header replaced by [REDACTED].
 export function expectedHookPayload(kind, fixture) {
-  const data = kind === "user-prompt" ? fixture.prompt : `${fixture.tool_input.subject} → ${fixture.tool_input.status}`;
+  const data = (kind === "user-prompt" ? fixture.prompt : `${fixture.tool_input.subject} → ${fixture.tool_input.status}`)
+    .replace(/-----BEGIN .* KEY-----/gu, "[REDACTED]");
   return data.length > 2000 ? `${data.slice(0, 2000)}...` : data;
 }
 
@@ -855,6 +861,31 @@ export async function executeDeterministicSchedule({
   return Promise.all(operations);
 }
 
+// A canary CLI surface is entered when its process exits normally and its output is captured
+// and scanned. Exit 0 always enters. A surface may also declare the nonzero codes it uses to
+// report findings after printing them; a timeout, a signal, a spawn failure or any other exit
+// code stays failed. Every record carries the exit code.
+export async function runCanaryCliSurfaces({ surfaces, entrypoint, cwd, environment, inventory, exec = runCli }) {
+  const cli = [];
+  for (const surface of surfaces) {
+    let result;
+    let error;
+    try { result = await exec(entrypoint, surface.args, { cwd, env: environment, timeoutMs: 60_000 }); }
+    catch (caught) { error = caught; }
+    const output = result ?? error;
+    const bytes = Buffer.from(`${output?.stdout ?? ""}\n${output?.stderr ?? ""}`);
+    const exitCode = result !== undefined ? 0
+      : error?.errorClass === "CliExit" && Number.isSafeInteger(error.code) ? error.code : null;
+    const reported = result === undefined && exitCode !== null && (surface.reportingExitCodes ?? []).includes(exitCode)
+      && String(error.stdout ?? "").length > 0;
+    cli.push({
+      id: surface.id, surface: surface.surface, outcome: result !== undefined ? "success" : reported ? "entered" : "failed",
+      exitCode, scan: scanSurface(bytes, inventory, CANARY_CORPUS),
+    });
+  }
+  return cli;
+}
+
 export async function executeCanaryWorkload({
   runId,
   machine,
@@ -898,17 +929,7 @@ export async function executeCanaryWorkload({
   });
   let utilityOutcome = "success";
   try { await utility(workload.utility); } catch { utilityOutcome = "failed"; }
-  const cli = [];
-  for (const surface of workload.cli) {
-    try {
-      const result = await exec(entrypoint, surface.args, { cwd, env: environment, timeoutMs: 60_000 });
-      const bytes = Buffer.from(`${result.stdout ?? ""}\n${result.stderr ?? ""}`);
-      cli.push({ id: surface.id, surface: surface.surface, outcome: "success", scan: scanSurface(bytes, inventory, CANARY_CORPUS) });
-    } catch (error) {
-      const bytes = Buffer.from(`${error?.stdout ?? ""}\n${error?.stderr ?? ""}`);
-      cli.push({ id: surface.id, surface: surface.surface, outcome: "failed", scan: scanSurface(bytes, inventory, CANARY_CORPUS) });
-    }
-  }
+  const cli = await runCanaryCliSurfaces({ surfaces: workload.cli, entrypoint, cwd, environment, inventory, exec });
   const witness = {
     expected: { hooks: workload.hooks.length, stores: workload.stores.length, searches: workload.searches.length, utility: 1, cli: workload.cli.length },
     observed: {
@@ -916,7 +937,7 @@ export async function executeCanaryWorkload({
       stores: attempts.filter((entry) => entry.op === "store" && entry.outcome === "success").length,
       searches: attempts.filter((entry) => entry.op === "search" && entry.outcome === "success").length,
       utility: utilityOutcome === "success" ? 1 : 0,
-      cli: cli.filter((entry) => entry.outcome === "success").length,
+      cli: cli.filter((entry) => entry.outcome !== "failed").length,
     },
     utilityOutcome,
     cli,

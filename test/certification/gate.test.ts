@@ -33,8 +33,13 @@ type RetainedReceipt = { id: string; secretHits: number; canaryHits: number; cat
 
 // A complete v4 privacy evidence set with zero hits on every surface, written by the
 // real inventory, scanners and migration receipt writer. `leak` replaces one retained
-// CLI output (migration, identity or doctor) with the given text.
-async function retainedPrivacyEvidence(leak?: { machine: "a" | "b"; id: string; text: string }) {
+// CLI output (migration, identity or doctor) with the given text. `coordinator` sets the
+// setup bookkeeping and barrier-record bytes, and `fresh` writes the coordinator files so that
+// reconstruction scans and persists them instead of reading a persisted scan.
+async function retainedPrivacyEvidence(
+  leak?: { machine: "a" | "b"; id: string; text: string },
+  coordinator: { bookkeeping?: string; barriers?: string; fresh?: boolean } = {},
+) {
   const root = mkdtempSync(join(tmpdir(), "lcm-cert-v4-retained-privacy-"));
   const contractBytes = readFileSync(new URL("./contract-v4.json", import.meta.url));
   const contract = JSON.parse(contractBytes.toString("utf8"));
@@ -100,16 +105,28 @@ async function retainedPrivacyEvidence(leak?: { machine: "a" | "b"; id: string; 
   writeJson(join(root, "coordinator-inventory-manifest.json"), createInventoryManifest(coordinatorInventory, "coordinator"));
   const coordinatorSurfaces = ["run.json", "faults.json", "calibration-evidence.json", "cleanup.json", "execution-provenance.json",
     "phase-control.json", "setup-evidence.json", "database-readiness.json", "observability-barriers.json"];
-  writeJson(join(root, "coordinator-privacy.json"), { surfaces: coordinatorSurfaces.map((name) => {
-    const bytes = Buffer.from(`{"surface":"${name}"}\n`);
-    return { name, sha256: createHash("sha256").update(bytes).digest("hex"), ...scanSurface(bytes, coordinatorInventory, CANARY_CORPUS) };
-  }) });
-  const summary = reconstructObservabilitySummary({ evidenceDirectory: root, contract, contractSha256, runId: "run", faults: [], persist: false });
+  const surfaceBytes = (name: string) => Buffer.from(
+    coordinator.bookkeeping !== undefined && ["setup-evidence.json", "database-readiness.json"].includes(name) ? coordinator.bookkeeping
+      : name === "observability-barriers.json" ? coordinator.barriers ?? '[{"step":"canary","verdict":"pass"}]\n'
+        : `{"surface":"${name}"}\n`);
+  if (coordinator.fresh) {
+    writeJson(join(root, "calibration-evidence.json"), { machine: [], database: { verdict: "incomplete" }, statements: { verdict: "incomplete" }, connections: { verdict: "incomplete" } });
+    for (const name of coordinatorSurfaces) if (!existsSync(join(root, name))) writeFileSync(join(root, name), surfaceBytes(name));
+  } else {
+    writeJson(join(root, "coordinator-privacy.json"), { surfaces: coordinatorSurfaces.map((name) => {
+      const bytes = surfaceBytes(name);
+      return { name, sha256: createHash("sha256").update(bytes).digest("hex"), ...scanSurface(bytes, coordinatorInventory, CANARY_CORPUS) };
+    }) });
+  }
+  const summary = reconstructObservabilitySummary({
+    evidenceDirectory: root, contract, contractSha256, runId: "run", faults: [],
+    ...(coordinator.fresh ? { persist: true, coordinatorInventory } : { persist: false }),
+  });
   const receipt = (machine: "a" | "b", id: string): RetainedReceipt => readFileSync(join(root, `machine-${machine}`, "retained-output-privacy.ndjson"), "utf8")
     .trim().split("\n").map((line) => JSON.parse(line)).find((entry: RetainedReceipt) => entry.id === id);
   const privacy = Object.fromEntries(observabilityGateItems(summary).filter((item) => item.id.startsWith("privacy."))
     .map((item) => [item.id, { verdict: item.verdict, observed: item.observed }]));
-  return { privacy, receipt };
+  return { privacy, receipt, root };
 }
 
 describe("v4 observability gate items", () => {
@@ -214,6 +231,30 @@ describe("v4 observability gate items", () => {
       "privacy.canary-leaks": { verdict: "fail", observed: receipt.canaryHits },
       "privacy.secret-leaks": { verdict: "pass", observed: 0 },
     });
+  });
+
+  // Smoke 4: setup-evidence.json and database-readiness.json list the transfer role by design
+  // (the setup-closure witness) and failed privacy.secret-leaks with 4 hits. The coordinator
+  // hashes them for provenance and keeps scanning its run records.
+  it("hashes the coordinator's setup bookkeeping for provenance and scans only its run records", async () => {
+    const bookkeeping = '{"setupRoles":{"transfer":"lcm_cert_transfer"}}\n';
+    const persisted = await retainedPrivacyEvidence(undefined, { bookkeeping });
+    const fresh = await retainedPrivacyEvidence(undefined, { bookkeeping, fresh: true });
+    const written = JSON.parse(readFileSync(join(fresh.root, "coordinator-privacy.json"), "utf8"));
+    const bookkeepingSha256 = createHash("sha256").update(bookkeeping).digest("hex");
+    expect({
+      persisted: persisted.privacy["privacy.secret-leaks"],
+      fresh: fresh.privacy["privacy.secret-leaks"],
+      surfaces: written.surfaces.map((entry: { name: string }) => entry.name).sort(),
+      provenance: written.provenance,
+    }).toEqual({
+      persisted: { verdict: "pass", observed: 0 },
+      fresh: { verdict: "pass", observed: 0 },
+      surfaces: ["calibration-evidence.json", "cleanup.json", "execution-provenance.json", "faults.json", "observability-barriers.json", "phase-control.json", "run.json"],
+      provenance: [{ name: "setup-evidence.json", sha256: bookkeepingSha256 }, { name: "database-readiness.json", sha256: bookkeepingSha256 }],
+    });
+    const leaked = await retainedPrivacyEvidence(undefined, { bookkeeping, barriers: '[{"step":"canary","verdict":"pass","note":"lcm_cert_transfer"}]\n', fresh: true });
+    expect(leaked.privacy["privacy.secret-leaks"].verdict).toBe("fail");
   });
 });
 

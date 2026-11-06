@@ -22,6 +22,7 @@ import {
   parseCertificationArguments,
   prepareEvidenceDirectory,
   prepareManagedDatabase,
+  reconstructObservabilitySummary,
   recordFaultStep,
   runLocalCertification,
   runMachineActivationBarrier,
@@ -426,8 +427,8 @@ describe("certification harness", () => {
     const v4 = loadCertificationContract(new URL("./contract-v4.json", import.meta.url), { requireApproved: false }).contract;
     expect(certificationWatchdogDeadline(v3, { profile: "smoke" })).toEqual({ terminateSeconds: 1800, killSeconds: 1860 });
     expect(certificationWatchdogDeadline(v3, { profile: "smoke", withFaults: true })).toEqual({ terminateSeconds: 4020, killSeconds: 4080 });
-    expect(certificationWatchdogDeadline(v4, { profile: "smoke", withFaults: true })).toEqual({ terminateSeconds: 8520, killSeconds: 8580 });
-    expect(certificationWatchdogDeadline(v4, { profile: "full" })).toEqual({ terminateSeconds: 15300, killSeconds: 15360 });
+    expect(certificationWatchdogDeadline(v4, { profile: "smoke", withFaults: true })).toEqual({ terminateSeconds: 8820, killSeconds: 8880 });
+    expect(certificationWatchdogDeadline(v4, { profile: "full" })).toEqual({ terminateSeconds: 15600, killSeconds: 15660 });
     expect(parseWatchdogArguments(["--lane", "local", "--profile", "smoke", "--with-faults", "--evidence-dir", "/tmp/e", "--contract", "test/certification/contract-v4.json"]).contractPath)
       .toBe(join(process.cwd(), "test/certification/contract-v4.json"));
   });
@@ -706,6 +707,85 @@ describe("certification harness", () => {
       verdict: evidence.connections.verdict,
       machines: evidence.connections.machines.map((entry: any) => [entry.machine, entry.verdict, entry.sampledActiveIntervals, entry.activeIntervals, entry.sampledIncrement, entry.residualBreach]),
     }).toEqual({ verdict: "pass", machines: [["a", "pass", 2, 48, 1, false], ["b", "pass", 3, 48, 1, false]] });
+  });
+
+  // Smoke 4: the code-derived successful path is exactly 90 statements, so baseline noise put
+  // the measured maximum at 90.00016 and "measured <= 90" failed. Here pair 3's baseline holds
+  // 45 extra idle calls (1.875 per probe, smoke 4's noise) and pair 1's probe window one extra.
+  it("passes statement overhead when the static count fits the ceiling and every pair agrees within the noise", () => {
+    const { contract } = loadCertificationContract(new URL("./contract-v4.json", import.meta.url), { requireApproved: false });
+    const definition = contract.observability.calibration;
+    const windowSeconds = definition.baselineWindowSeconds + definition.probeWindowSeconds;
+    const startAtMs = Date.parse("2026-11-06T10:54:00.000Z");
+    const probes = ["a", "b"].flatMap((machine) => Array.from({ length: definition.pairs }, (_, index) => index + 1).flatMap((pair) =>
+      Array.from({ length: definition.probesPerMachinePerWindow }, (_, sequence) => {
+        const startedAtMs = startAtMs + ((pair - 1) * windowSeconds + definition.baselineWindowSeconds) * 1000 + sequence * 15_000 + (machine === "a" ? 300 : 550);
+        return { id: `calibration-${pair}-${machine}-probe-${sequence}`, phase: `calibration-${pair}`, machine, startedAtMs, completedAtMs: startedAtMs + 250, snapshot: { classification: "healthy" } };
+      })));
+    // Cumulative runtime-role calls step at each window boundary: the window's idle calls, plus
+    // 90 statements for each of the 24 probes in a probe window.
+    const statements = (selected: any, probeWindowIdle: number[], probeRecords = probes) => {
+      const baselineIdle = [30, 30, 75, 30];
+      const boundaries = new Map<number, number>([[0, 0]]);
+      let calls = 0;
+      for (let pair = 0; pair < definition.pairs; pair += 1) {
+        calls += baselineIdle[pair];
+        boundaries.set(pair * windowSeconds + definition.baselineWindowSeconds, calls);
+        calls += probeWindowIdle[pair] + 24 * 90;
+        boundaries.set((pair + 1) * windowSeconds, calls);
+      }
+      let current = 0;
+      const samples = Array.from({ length: definition.pairs * windowSeconds + 1 }, (_, second) => {
+        current = boundaries.get(second) ?? current;
+        return {
+          second, observedAtMs: startAtMs + second * 1000, cpuUsageUsec: { a: 0, b: 0, database: 0 },
+          statements: { calls: current, stats_reset: 1, dealloc: 0, xact_commit: 0, xact_rollback: 0 },
+          connectionCounts: { a: 1, b: 1, unknown: 0 },
+        };
+      });
+      return finalizeCalibrationEvidence(
+        { startAt: new Date(startAtMs).toISOString(), samples, quotas: { database: { cpus: 1 } }, addressLabels: { a: true, b: true } },
+        probeRecords, selected,
+        { stagedPackageSha256: "a".repeat(64), configuredPoolEvidence: { configuredPoolMax: 2, poolByMachine: { a: { configuredMax: 2 }, b: { configuredMax: 2 } } } },
+      ).statements;
+    };
+    const smoke4 = statements(contract, [31, 30, 30, 30]);
+    const aboveCeiling = structuredClone(contract);
+    aboveCeiling.observability.calibration.successfulPathWireStatementCount = 91;
+    expect({
+      smoke4: [smoke4.verdict, smoke4.measuredMaximum > 90, smoke4.maximumDeviation, smoke4.noiseAllowance],
+      outsideNoise: statements(contract, [120, 30, 30, 30]).verdict,
+      aboveCeiling: statements(aboveCeiling, [31, 30, 30, 30]).verdict,
+      twoPairs: statements(contract, [31, 30, 30, 30], probes.filter((probe) => ["calibration-1", "calibration-2"].includes(probe.phase))).verdict,
+    }).toEqual({ smoke4: ["pass", true, 1.875, 1.875], outsideNoise: "fail", aboveCeiling: "fail", twoPairs: "incomplete" });
+  });
+
+  // Smoke 4's calibration evidence was finalized under the old rule and persisted "fail";
+  // reconstruction applies the selected contract's rule to the persisted measurement.
+  it("judges a persisted statement measurement by the selected contract's rule", () => {
+    const loaded = loadCertificationContract(new URL("./contract-v4.json", import.meta.url), { requireApproved: false });
+    const smoke4 = {
+      verdict: "fail", validPairs: 4, rejectedPairs: 0, measuredMaximum: 90.00015832541708, noiseAllowance: 1.8752527777325336,
+      signedCosts: [90.00015832541708, 89.99972291666667, 88.12490554768453, 89.9980736218132],
+    };
+    const item = (statements: Record<string, unknown>, contract = loaded.contract) => {
+      const root = mkdtempSync(join(tmpdir(), "lcm-cert-statement-rule-"));
+      writeFileSync(join(root, "run.json"), JSON.stringify({ lane: "local", profile: "smoke", withFaults: true, contractSha256: loaded.sha256, contractVersion: 4, runId: "run" }));
+      writeFileSync(join(root, "phase-control.json"), JSON.stringify({ steadyT0At: "2026-11-06T10:54:00.000Z" }));
+      writeFileSync(join(root, "calibration-evidence.json"), JSON.stringify({ machine: [], database: { verdict: "incomplete" }, statements, connections: { verdict: "incomplete" } }));
+      for (const machine of ["a", "b"]) mkdirSync(join(root, `machine-${machine}`));
+      const summary = reconstructObservabilitySummary({ evidenceDirectory: root, contract, contractSha256: loaded.sha256, runId: "run", faults: [], persist: false });
+      const found = summary.items.find((entry: { id: string }) => entry.id === "overhead.statements-per-snapshot");
+      return [found.verdict, found.observed, found.threshold];
+    };
+    const aboveCeiling = structuredClone(loaded.contract);
+    aboveCeiling.observability.calibration.successfulPathWireStatementCount = 91;
+    expect({
+      smoke4: item(smoke4),
+      outsideNoise: item({ ...smoke4, signedCosts: [92, 89.99972291666667, 88.12490554768453, 89.9980736218132], measuredMaximum: 92 })[0],
+      aboveCeiling: item(smoke4, aboveCeiling)[0],
+      twoPairs: item({ ...smoke4, validPairs: 2, signedCosts: smoke4.signedCosts.slice(0, 2) })[0],
+    }).toEqual({ smoke4: ["pass", 90.00015832541708, 90], outsideNoise: "fail", aboveCeiling: "fail", twoPairs: "incomplete" });
   });
 
   it("proves the two private homes contain distinct machine identities", () => {

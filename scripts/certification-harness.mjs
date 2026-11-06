@@ -11,7 +11,7 @@ import { assertCertificationRunPolicy, certificationDeadlineSeconds, loadCertifi
 import { publishPostgreSqlBackend } from "../test/certification/backend-publication.mjs";
 import { createDeterministicSchedule, createFaultSchedule, createObservabilityWorkloadSchedule, observabilityPhaseWorkloadSeconds } from "../test/certification/schedule.mjs";
 import { CANARY_CORPUS, createCanaryWorkload } from "../test/certification/canary-corpus.mjs";
-import { REQUIRED_MACHINE_INVENTORY_CATEGORIES, buildObservabilitySummary, createInventoryManifest, createProbeSchedule, evaluateBarrierSequence, evaluateCalibrationPairs, evaluatePhaseProbeEvidence, evaluatePhaseWorkload, evaluateProbePopulation, healthySnapshot, scanSurface } from "../test/certification/observability.mjs";
+import { REQUIRED_MACHINE_INVENTORY_CATEGORIES, buildObservabilitySummary, createInventoryManifest, createProbeSchedule, evaluateBarrierSequence, evaluateCalibrationPairs, evaluatePhaseProbeEvidence, evaluatePhaseWorkload, evaluateProbePopulation, evaluateStatementOverhead, healthySnapshot, scanSurface } from "../test/certification/observability.mjs";
 import { observerReadSettings } from "../test/certification/sqlite-observer-worker.mjs";
 import { createOwnerIdentity, createProcessLifecycle, createRunNames, ownershipLabels, removeOwnedResource, runHarness, runSanitizedProcess } from "./postgresql-harness.mjs";
 
@@ -1353,10 +1353,15 @@ export function finalizeCalibrationEvidence(raw, probes, contract, { stagedPacka
     noiseAllowance: databaseNoise,
     definition: "incremental database CPU-seconds over each combined two-machine probe interval divided by elapsed interval seconds and recorded database CPU quota",
   };
-  const statements = evaluateCalibrationPairs(statementPairs, {
+  const statementRule = {
+    staticCount: definition.successfulPathWireStatementCount,
+    ceiling: definition.successfulPathWireStatementCeiling,
+    minimumValidPairs: definition.minimumValidPairs,
+  };
+  const statements = evaluateStatementOverhead(evaluateCalibrationPairs(statementPairs, {
     approvedCeiling: definition.successfulPathWireStatementCeiling,
     approvedNoiseCeiling: definition.successfulPathWireStatementCeiling,
-  });
+  }), statementRule);
   const perMachineConnections = ["a", "b"].map((machineLabel) => {
     const probeRecords = probes.filter((probe) => probe.machine === machineLabel && String(probe.phase).startsWith("calibration-") && probe.transportFailure !== true && probe.snapshot);
     let coveredIntervals = 0;
@@ -1881,20 +1886,31 @@ export function reconstructObservabilitySummary({ evidenceDirectory, contract, c
   const retainedReceipts = ['a', 'b'].map((machine) => ndjsonFromFile(join(evidenceDirectory, `machine-${machine}`, "retained-output-privacy.ndjson")));
   const coordinatorPrivacyPath = join(evidenceDirectory, "coordinator-privacy.json");
   const coordinatorPrivacyPersisted = existsSync(coordinatorPrivacyPath);
+  // Coordinator leak surfaces are its run records. setup-evidence.json and database-readiness.json
+  // are private harness bookkeeping that lists role names by design (the #629 setup-closure
+  // witness); they are never published and are not LCM output, so they are hashed for
+  // provenance and not scanned. A scan persisted before this rule is read the same way.
+  const coordinatorBookkeeping = ["setup-evidence.json", "database-readiness.json"];
   let coordinatorScans;
-  if (coordinatorPrivacyPersisted) coordinatorScans = jsonFromFile(coordinatorPrivacyPath).surfaces;
-  else {
+  let coordinatorProvenance;
+  if (coordinatorPrivacyPersisted) {
+    const persisted = jsonFromFile(coordinatorPrivacyPath);
+    coordinatorScans = persisted.surfaces.filter((entry) => !coordinatorBookkeeping.includes(entry.name));
+    coordinatorProvenance = persisted.provenance
+      ?? persisted.surfaces.filter((entry) => coordinatorBookkeeping.includes(entry.name)).map(({ name, sha256 }) => ({ name, sha256 }));
+  } else {
     coordinatorScans = [
       "run.json", "faults.json", "calibration-evidence.json", "cleanup.json",
-      "execution-provenance.json", "phase-control.json", "setup-evidence.json",
-      "database-readiness.json", "observability-barriers.json", "fault-partition-a.json",
+      "execution-provenance.json", "phase-control.json", "observability-barriers.json", "fault-partition-a.json",
     ]
       .filter((name) => existsSync(join(evidenceDirectory, name)))
       .map((name) => {
         const bytes = readFileSync(join(evidenceDirectory, name));
         return { name, sha256: createHash("sha256").update(bytes).digest("hex"), ...scanSurface(bytes, coordinatorInventory, CANARY_CORPUS) };
       });
-    if (persist) writeFileSync(coordinatorPrivacyPath, `${JSON.stringify({ surfaces: coordinatorScans })}\n`, { mode: 0o600, flag: "wx" });
+    coordinatorProvenance = coordinatorBookkeeping.filter((name) => existsSync(join(evidenceDirectory, name)))
+      .map((name) => ({ name, sha256: createHash("sha256").update(readFileSync(join(evidenceDirectory, name))).digest("hex") }));
+    if (persist) writeFileSync(coordinatorPrivacyPath, `${JSON.stringify({ surfaces: coordinatorScans, provenance: coordinatorProvenance })}\n`, { mode: 0o600, flag: "wx" });
   }
   const scans = [...probeScans, ...cliScans, ...privateScans, ...failureScans, ...coordinatorScans, ...retainedReceipts.flat()];
   const secretCategories = new Set(scans.flatMap((scan) => Object.keys(scan.categoryHits ?? {})));
@@ -1933,10 +1949,12 @@ export function reconstructObservabilitySummary({ evidenceDirectory, contract, c
   const cliCoverageComplete = canaryWitnesses.length === 2 && canaryWitnesses.every((witness) => witness.cli?.length === witness.expected?.cli
     && witness.cli.every((entry) => entry.scan && typeof entry.scan.bytes === "number"));
   const expectedCoordinatorSurfaces = ["run.json", "faults.json", "calibration-evidence.json", "cleanup.json",
-    "execution-provenance.json", "phase-control.json", "setup-evidence.json", "database-readiness.json", "observability-barriers.json"];
+    "execution-provenance.json", "phase-control.json", "observability-barriers.json"];
   const coordinatorCoverageComplete = JSON.stringify(coordinatorScans.map((entry) => entry.name).sort())
     === JSON.stringify(expectedCoordinatorSurfaces.slice().sort())
-    && coordinatorScans.every((entry) => /^[0-9a-f]{64}$/u.test(entry.sha256));
+    && coordinatorScans.every((entry) => /^[0-9a-f]{64}$/u.test(entry.sha256))
+    && JSON.stringify(coordinatorProvenance.map((entry) => entry.name).sort()) === JSON.stringify(coordinatorBookkeeping.slice().sort())
+    && coordinatorProvenance.every((entry) => /^[0-9a-f]{64}$/u.test(entry.sha256));
   const surfacesComplete = machineManifests.every(Boolean) && coordinatorManifest !== undefined
     && ['a', 'b'].every((machine) => existsSync(join(evidenceDirectory, `machine-${machine}`, "failure-privacy.ndjson")))
     && privateSurfaceFiles.every(Boolean) && retainedCoverageComplete && failureCoverageComplete
@@ -1967,7 +1985,13 @@ export function reconstructObservabilitySummary({ evidenceDirectory, contract, c
       definition: calibrationEvidence.database.definition,
     },
     statements: {
-      verdict: calibrationEvidence.statements.verdict,
+      // The rule is applied to the persisted measurement, so evidence finalized under an
+      // earlier rule is judged by the selected contract's rule.
+      verdict: evaluateStatementOverhead(calibrationEvidence.statements, {
+        staticCount: contract.observability.calibration.successfulPathWireStatementCount,
+        ceiling: contract.observability.calibration.successfulPathWireStatementCeiling,
+        minimumValidPairs: contract.observability.calibration.minimumValidPairs,
+      }).verdict,
       observed: calibrationEvidence.statements.measuredMaximum ?? 0,
       ceiling: contract.observability.calibration.successfulPathWireStatementCeiling,
     },
