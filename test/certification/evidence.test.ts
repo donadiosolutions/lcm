@@ -48,5 +48,45 @@ describe("certification evidence", () => {
     const paths = writeCertificationGate(gate, output);
     expect(JSON.parse(readFileSync(paths.json, "utf8"))).toEqual(gate);
     expect(readFileSync(paths.markdown, "utf8")).toContain("hook.p50 | pass | 10 | 400");
+    expect(paths.json).toBe(join(output, "production-certification-gate.json"));
+    expect(gate.contract).not.toHaveProperty("version");
+    expect(gate).not.toHaveProperty("applicability");
+  });
+
+  it("writes v4 observability output under its reserved names and records applicability", () => {
+    const directory = mkdtempSync(join(tmpdir(), "lcm-cert-evidence-v4-"));
+    writeFileSync(join(directory, "samples.ndjson"), `${JSON.stringify({ durationMs: 10 })}\n`);
+    const base = {
+      evidenceDirectory: directory,
+      contractSha256: "a".repeat(64), contractStatus: "approved", contractVersion: 4,
+      approval: { contractSha256: "a".repeat(64), approvedAt: "2026-11-05T10:00:00.000Z", note: "recorded", approvalRef: "issue-640", approvedBy: "maintainer" },
+      startedAt: "2026-11-05T10:01:00.000Z", lane: "local", profile: "full",
+      applicability: { observability: { applicable: true, reason: null } },
+      provenance: {
+        testedCommit: "d".repeat(40), dirty: false, testedInputsSha256: "e".repeat(64), testedInputsCount: 1,
+        lockfileSha256: "f".repeat(64), cliSha256: "1".repeat(64), stagedPackageSha256: "2".repeat(64),
+        contractSha256: "a".repeat(64), approvalSha256: "5".repeat(64), node: process.version,
+        executionHost: { capturedAt: "2026-11-05T10:00:59.000Z", osId: "ubuntu", osVersionId: "24.04", kernelRelease: "6", architecture: "x64", cpuModel: "CPU", logicalCpus: 8, totalMemoryBytes: 1, containerEngine: "podman", containerEngineVersion: "5", hostnameSha256: "7".repeat(64), runnerName: null, runnerOs: null, runnerArch: null, runnerSku: null },
+        observerSettings: { pollSeconds: 1, busyTimeoutMs: 200, perQueryDeadlineMs: 250, maxPollGapSeconds: 2 },
+      },
+      machines: [
+        { name: "a", machineId: "018f0000-0000-7000-8000-000000000001", identityKeySha256: "b".repeat(64) },
+        { name: "b", machineId: "018f0000-0000-7000-8000-000000000002", identityKeySha256: "c".repeat(64) },
+      ],
+      faults: [], cleanup: { verdict: "pass", residualResources: 0, labeledContainers: 0, labeledNetworks: 0, labeledVolumes: 0, familyTaggedProviderClusters: 0, privateRootsAbsent: true, ownedProcessesExited: true, providerDestroyConfirmedWithinSeconds: 0 },
+      diagnostics: { databaseGrowth: { beforeBytes: 0, afterBytes: 0, deltaBytes: 0 }, submittedPrimaryBytes: 0, submittedEnvelopeBytes: 0, truncatedRows: 0, sweepWitnessSha256: ["3".repeat(64), "4".repeat(64)] },
+      slos: [{ id: "telemetry.steady-healthy", formula: "closed predicate", inputs: { count: 1, sampleFile: "samples.ndjson" }, threshold: 1, observed: 1, verdict: "pass" }],
+    };
+    const gate = assembleCertificationGate(base);
+    const schema = JSON.parse(readFileSync(new URL("./evidence-schema.json", import.meta.url), "utf8"));
+    expect(validateEvidence(schema, gate)).toEqual([]);
+    expect(gate.contract.version).toBe(4);
+    expect(gate.applicability.observability.applicable).toBe(true);
+
+    const output = mkdtempSync(join(tmpdir(), "lcm-cert-gate-v4-"));
+    const paths = writeCertificationGate(gate, output, {}, { outputName: "observability-certification-gate", title: "Observability certification gate" });
+    expect(paths.json).toBe(join(output, "observability-certification-gate.json"));
+    expect(paths.markdown).toBe(join(output, "observability-certification-gate.md"));
+    expect(readFileSync(paths.markdown, "utf8")).toContain("# Observability certification gate");
   });
 });

@@ -3,7 +3,7 @@ import { appendFileSync, existsSync, mkdirSync, mkdtempSync, readFileSync, readd
 import { tmpdir } from "node:os";
 import { delimiter, join } from "node:path";
 import { afterEach, describe, expect, it, vi } from "vitest";
-import { assembleGateFromEvidence, buildEvidenceManifest, createSampleBuilder, forEachNdjsonRow, parseGateArguments, readObserverWitness } from "../../scripts/certification-gate.mjs";
+import { OBSERVABILITY_GATE_ITEMS, assembleGateFromEvidence, buildEvidenceManifest, createSampleBuilder, forEachNdjsonRow, observabilityGateItems, parseGateArguments, readObserverWitness } from "../../scripts/certification-gate.mjs";
 import { captureExecutionHost, captureExecutionProvenance } from "../../scripts/certification-harness.mjs";
 import { createGitCheckoutFixture } from "./git-checkout-fixture.js";
 import { createDeterministicSchedule, createFaultSchedule } from "./schedule.mjs";
@@ -24,6 +24,24 @@ function snapshotFiles(root: string, directory = root, files = new Map<string, B
 type FaultLayout = "faults" | "partition-a" | "none";
 type MaintenanceFailure = "compact" | "snapshot" | "mixed";
 type Variant = { serverPort?: number; providerPort?: number | null; clockRetry?: "recovered" | "exhausted" | "miscounted"; observerRows?: number; withFaults?: boolean; observerGap?: boolean; observerSiblingsPresent?: boolean; extraObserverRow?: Record<string, unknown>; clockBreach?: boolean; clockGap?: boolean; duplicateMapping?: boolean; drainFail?: boolean; capacityPeak?: number; recoveryFail?: boolean; partitionFirstSuccessSeconds?: number; restartBFirstSuccessSeconds?: number; restartBNoSuccess?: boolean; noRecoverySuccess?: boolean; catchUpFail?: boolean; catchUpAtSeconds?: number; missingCatchUpTimestamp?: boolean; readinessInvalid?: boolean; residualOccupied?: boolean; poolConfigMismatch?: boolean; setupSessionOpen?: boolean; phaseEarly?: boolean; profile?: "smoke" | "full"; lane?: "local" | "managed"; faultLayout?: FaultLayout; maintenanceFailure?: MaintenanceFailure; smokeFailure?: boolean; smokeSlow?: boolean; executionHost?: Record<string, unknown> };
+
+describe("v4 observability gate items", () => {
+  it("makes every missing local item incomplete rather than vacuously passing", () => {
+    const items = observabilityGateItems(undefined);
+    expect(items.map((item) => item.id)).toEqual(OBSERVABILITY_GATE_ITEMS);
+    expect(items.every((item) => item.verdict === "incomplete")).toBe(true);
+  });
+
+  it("preserves definite failures and fills dropped records as incomplete", () => {
+    const items = observabilityGateItems({ items: [
+      { id: "telemetry.cardinality", verdict: "fail", threshold: 0, observed: 1 },
+      { id: "privacy.canary-leaks", verdict: "pass", threshold: 0, observed: 0 },
+    ] });
+    expect(items.find((item) => item.id === "telemetry.cardinality")?.verdict).toBe("fail");
+    expect(items.find((item) => item.id === "privacy.canary-leaks")?.verdict).toBe("pass");
+    expect(items.find((item) => item.id === "probe-completeness")?.verdict).toBe("incomplete");
+  });
+});
 
 // Every scheduled compact, every scheduled snapshot, or every other one of each.
 function maintenanceFails(mode: MaintenanceFailure | undefined, op: string, index: number): boolean {
@@ -796,7 +814,7 @@ describe("gate contract version", () => {
     expect(() => assembleGateFromEvidence({
       repositoryRoot: fixture.root, evidenceDirectory: fixture.root,
       contractPath: new URL("./contract-v2.json", import.meta.url).pathname, outputDirectory: fixture.output,
-    }, { captureProvenance: () => fixture.provenance })).toThrow("version 3 is required");
+    }, { captureProvenance: () => fixture.provenance })).toThrow("version 3 or 4 is required");
     expect(existsSync(fixture.output)).toBe(false);
     expect(snapshotFiles(fixture.root)).toEqual(before);
   });

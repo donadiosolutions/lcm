@@ -10,6 +10,7 @@ import { renderBackendDiagnostics } from "../../src/storage/diagnostic-renderer.
 import { collectBackendDiagnostics } from "../../src/storage/diagnostics.js";
 import { buildPostgreSqlClientConfig } from "../../src/storage/postgresql/client-config.js";
 import { PostgreSqlRuntime } from "../../src/storage/postgresql/runtime.js";
+import { CONTRACT_CANARIES, REGRESSION_CANARIES } from "../certification/canary-corpus.mjs";
 import {
   assertHarnessReady,
   settings,
@@ -21,33 +22,8 @@ beforeAll(assertHarnessReady);
 
 const context = { domain: "factory", operation: "incidentRunbookFixture" } as const;
 
-const regressionSeeds = [
-  "file://host.invalid?q=(file://host.invalid/Users/canary/private.db",
-  "file://host.invalid?q=[a=b]file://host.invalid/Users/canary/private.db",
-  "file://host.invalid?next=1file://host.invalid/Users/canary/private.db",
-  "file://outer.invalid?q=prefix-file://host.invalid/Users/canary/private.db",
-  "file://outer.invalid#q=prefix-file://host.invalid/Users/canary/private.db",
-  'file://host"name/Users/canary/private.db',
-  "file://host'name/Users/canary/private.db",
-] as const;
-
-const contractCanaries = {
-  message: "incident-message-content-canary",
-  summary: "incident-summary-content-canary",
-  memory: "incident-memory-content-canary",
-  tag: "incident-tag-content-canary",
-  prompt: "incident-subtask-prompt-canary",
-  inference: "incident-inference-content-canary",
-  sqlParameter: "incident-sql-parameter-canary",
-  utilityLiteral: "incident-utility-literal-canary",
-  projectPath: "/private/incident-project-path-canary",
-  urlPassword: "postgresql://runtime:incident-url-password-canary@host.invalid/lcm",
-  clientKey: "-----BEGIN PRIVATE KEY-----incident-client-key-canary",
-  caPem: "-----BEGIN CERTIFICATE-----\nINCIDENT_CA_BODY_CANARY\n-----END CERTIFICATE-----",
-  caBody: "INCIDENT_CA_BODY_CANARY",
-  providerKeys: "sk-incident-provider sk-ant-incident-provider ghp_incident_provider",
-  applicationName: "incident-app-canary",
-} as const;
+const regressionSeeds = REGRESSION_CANARIES;
+const contractCanaries = CONTRACT_CANARIES;
 
 function readRunbookSql(id: "session-context" | "recovery-state"): string {
   const source = readFileSync(join(process.cwd(), "docs/incident-diagnostics.md"), "utf8");

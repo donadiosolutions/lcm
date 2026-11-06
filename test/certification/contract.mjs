@@ -43,6 +43,16 @@ function valueAt(root, path) {
   return path.split(".").reduce((value, key) => value?.[key], root);
 }
 
+const V4_PHASE_FIELDS = Object.freeze([
+  "calibrationSeconds", "saturationPhaseMaxSeconds", "timeoutPhaseMaxSeconds",
+  "statsResetPhaseMaxSeconds", "permissionLossPhaseMaxSeconds", "extensionLossPhaseMaxSeconds",
+  "backlogHoldMaxSeconds", "backlogRecoverySeconds", "canaryPhaseMaxSeconds",
+]);
+
+function observabilityAllocationSeconds(full) {
+  return V4_PHASE_FIELDS.reduce((total, field) => total + positiveInteger(full[field], field), 0);
+}
+
 function assertShape(contract) {
   for (const path of [
     "approval", "lanes", "lanes.local", "lanes.managed", "configuration",
@@ -66,13 +76,23 @@ function assertShape(contract) {
     throw new Error("invalid certification contract two-machine shape");
   }
   const full = contract.timeline.full;
-  const allocated = full.setupMaxSeconds + full.warmupSeconds + full.steadySeconds
+  const inherited = full.setupMaxSeconds + full.warmupSeconds + full.steadySeconds
     + full.pendingSettleMaxSeconds + full.partitionPhaseMaxSeconds + full.restartPhaseMaxSeconds
     + full.finalDrainSeconds + full.cleanupReserveSeconds;
+  const observability = contract.version === 4 ? observabilityAllocationSeconds(full) : 0;
+  const allocated = inherited + observability;
   if (allocated !== full.localDeadlineSeconds) throw new Error("certification contract full timeline does not equal its deadline");
   if (contract.timeline.smoke.warmupSeconds + contract.timeline.smoke.steadySeconds
     + contract.timeline.smoke.finalDrainSeconds >= contract.timeline.smoke.wholeRunDeadlineSeconds) {
     throw new Error("certification contract smoke timeline leaves no setup and cleanup reserve");
+  }
+  if (contract.version === 4) {
+    const smoke = contract.timeline.smoke;
+    const smokeAllocated = smoke.wholeRunDeadlineSeconds + full.partitionPhaseMaxSeconds
+      + full.restartPhaseMaxSeconds + observability;
+    if (smokeAllocated !== smoke.faultObservabilityDeadlineSeconds) {
+      throw new Error("certification contract fault observability smoke timeline does not equal its deadline");
+    }
   }
 }
 
@@ -93,10 +113,10 @@ export function expectedSteadyAttempts(contract) {
 }
 
 function assertContract(contract) {
-  // Only contract version 3 can certify; superseded versions stay in the tree as
-  // history and are refused here, before any evidence collection or gate assembly.
-  if (contract?.id !== "lcm-production-certification" || contract?.version !== 3) {
-    throw new Error("invalid certification contract identity: version 3 is required");
+  // Versions 3 and 4 remain independently selectable. Superseded v2 stays in the
+  // tree as history and is refused before evidence collection or gate assembly.
+  if (contract?.id !== "lcm-production-certification" || ![3, 4].includes(contract?.version)) {
+    throw new Error("invalid certification contract identity: version 3 or 4 is required");
   }
   if (!['draft', 'approved'].includes(contract.status)) throw new Error("invalid certification contract status");
   assertShape(contract);
@@ -152,7 +172,43 @@ function assertContract(contract) {
   if (contract.status === "draft" && Object.values(contract.approval).slice(0, 3).some((value) => value !== null)) {
     throw new Error("draft certification contract contains approval evidence");
   }
+  if (contract.version === 4) {
+    const observability = contract.observability;
+    if (!observability || observability.applicability?.local !== "required"
+      || !String(observability.applicability?.managed).startsWith("not-applicable")) {
+      throw new Error("certification contract v4 applicability is invalid");
+    }
+    const calibration = observability.calibration;
+    if (calibration?.pairs !== 4 || calibration.minimumValidPairs !== 3
+      || calibration.baselineWindowSeconds !== 180 || calibration.probeWindowSeconds !== 180
+      || calibration.probeCadenceSeconds !== 15 || calibration.probesPerMachinePerWindow !== 12
+      || calibration.successfulPathWireStatementCeiling !== 90
+      || calibration.idleConnectionValidationAllowancePerAcquiredConnection !== 1
+      || calibration.measuredCallsPerProbeCeiling !== 91
+      || calibration.budgetCeilingsProvisional !== true
+      || contract.timeline.full.observabilityAllocationsProvisional !== true) {
+      throw new Error("certification contract v4 provisional calibration is invalid");
+    }
+    if (observability.cardinality?.maximumOperations !== 64
+      || observability.cardinality?.metricKeysPerOperation !== 22
+      || observability.cardinality?.statementsMaximumScalars !== 1411
+      || !Array.isArray(observability.cardinality?.operationIds)
+      || observability.cardinality.operationIds.length !== observability.cardinality.currentOperations
+      || new Set(observability.cardinality.operationIds).size !== observability.cardinality.operationIds.length) {
+      throw new Error("certification contract v4 cardinality is invalid");
+    }
+  }
   return contract;
+}
+
+export function certificationDeadlineSeconds(contract, { profile, withFaults = false } = {}) {
+  if (profile === "full") return contract.timeline.full.localDeadlineSeconds;
+  if (profile !== "smoke") throw new Error("invalid certification profile");
+  if (!withFaults) return contract.timeline.smoke.wholeRunDeadlineSeconds;
+  return contract.version === 4
+    ? contract.timeline.smoke.faultObservabilityDeadlineSeconds
+    : contract.timeline.smoke.wholeRunDeadlineSeconds
+      + contract.timeline.full.partitionPhaseMaxSeconds + contract.timeline.full.restartPhaseMaxSeconds;
 }
 
 export function loadCertificationContract(path, options = {}) {
@@ -169,7 +225,9 @@ export function loadCertificationContract(path, options = {}) {
   }
   return {
     contract,
+    contractPath,
     sha256,
+    approvalPath,
     approval: loadedApproval?.approval,
     approvalSha256: loadedApproval?.sha256,
     status: loadedApproval === undefined ? "draft" : "approved",

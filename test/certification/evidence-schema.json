@@ -11,6 +11,7 @@
       "required": ["sha256", "status", "approval"],
       "additionalProperties": false,
       "properties": {
+        "version": { "const": 4 },
         "sha256": { "type": "string", "pattern": "^[0-9a-f]{64}$" },
         "status": { "const": "approved" },
         "approval": {
@@ -101,6 +102,23 @@
         "providerDestroyConfirmedWithinSeconds": { "type": "number", "minimum": 0 }
       }
     },
+    "applicability": {
+      "type": "object",
+      "required": ["observability"],
+      "additionalProperties": false,
+      "properties": {
+        "observability": {
+          "type": "object",
+          "required": ["applicable", "reason"],
+          "additionalProperties": false,
+          "properties": {
+            "applicable": { "type": "boolean" },
+            "reason": { "type": ["string", "null"] },
+            "residuals": { "type": "array", "items": { "type": "string", "minLength": 1 }, "uniqueItems": true }
+          }
+        }
+      }
+    },
     "diagnostics": {
       "type": "object",
       "required": ["databaseGrowth", "submittedPrimaryBytes", "submittedEnvelopeBytes", "truncatedRows", "sweepWitnessSha256"],
@@ -141,7 +159,7 @@
       "additionalProperties": false,
       "properties": {
         "id": { "type": "string", "minLength": 1 },
-        "kind": { "enum": ["partition-machine", "restart-database"] },
+        "kind": { "enum": ["partition-machine", "restart-database", "saturation", "timeout", "stats-reset", "permission-loss", "extension-loss", "queue-backlog", "canary"] },
         "target": { "type": "string", "minLength": 1 },
         "requestedAt": { "type": "string", "minLength": 20 },
         "appliedAt": { "type": "string", "minLength": 20 },

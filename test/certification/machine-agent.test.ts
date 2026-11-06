@@ -1,3 +1,4 @@
+import { createHash } from "node:crypto";
 import { existsSync, mkdirSync, mkdtempSync, readFileSync, renameSync, writeFileSync } from "node:fs";
 import { EventEmitter } from "node:events";
 import { tmpdir } from "node:os";
@@ -7,8 +8,10 @@ import { describe, expect, it, vi } from "vitest";
 import {
   createAdmissionController,
   createHookFixture,
+  deferOldestPendingDelivery,
   captureDoctorEvidence,
   collectDiagnosticSecrets,
+  executeProbeSchedule,
   executeDeterministicSchedule,
   expectedHookPayload,
   isAcknowledgedRow,
@@ -20,6 +23,8 @@ import {
   probeLcmTlsRejection,
   readAcknowledgmentRows,
   redactDiagnosticText,
+  runRawStatusProbe,
+  scanBoundedPrivateOutputs,
   runMigrationStep,
   runPublicMigrationFlow,
   setupDeadlineFromControl,
@@ -33,6 +38,85 @@ import { OBSERVER_BUSY_TIMEOUT_MS, observerReadSettings } from "./sqlite-observe
 import { extractPostToolEvents, extractUserPromptEvents } from "../../src/hooks/extractors.js";
 import { normalizePostToolInput } from "../../src/hooks/post-tool-normalization.js";
 import { scrubExtractedEvents } from "../../src/hooks/event-scrubbing.js";
+
+describe("observability probes", () => {
+  it("keeps probes single-flight even when scheduled starts are already late", async () => {
+    let active = 0;
+    let maximum = 0;
+    const records = await executeProbeSchedule({
+      schedule: [0, 1, 2].map((sequence) => ({ id: `p-${sequence}`, startAtMs: sequence, sequence })),
+      now: () => 10,
+      wait: async () => undefined,
+      probe: async (entry: { id: string }) => {
+        active += 1;
+        maximum = Math.max(maximum, active);
+        await Promise.resolve();
+        active -= 1;
+        return entry.id;
+      },
+    });
+    expect(records).toEqual(["p-0", "p-1", "p-2"]);
+    expect(maximum).toBe(1);
+  });
+
+  it("defers only the actual oldest naturally aged pending row", async () => {
+    const root = mkdtempSync(join(tmpdir(), "lcm-cert-backlog-"));
+    const path = join(root, "events.db");
+    const database = new DatabaseSync(path);
+    database.exec(`CREATE TABLE events (
+      event_id INTEGER PRIMARY KEY, event_uuid TEXT NOT NULL UNIQUE,
+      delivery_state TEXT NOT NULL, created_at TEXT NOT NULL,
+      delivery_next_attempt_at TEXT NOT NULL, delivery_updated_at TEXT NOT NULL
+    )`);
+    database.prepare("INSERT INTO events VALUES (?, ?, ?, ?, ?, ?)").run(1, "oldest", "pending", "2026-11-05 00:00:00", "2026-11-05 00:00:00", "2026-11-05 00:00:00");
+    database.prepare("INSERT INTO events VALUES (?, ?, ?, ?, ?, ?)").run(2, "newer", "retry", "2026-11-05 00:01:00", "2026-11-05 00:01:00", "2026-11-05 00:01:00");
+    database.close();
+
+    const witness = await deferOldestPendingDelivery(path, {
+      nowMs: Date.parse("2026-11-05T00:16:01.000Z"), minimumAgeSeconds: 900, deferSeconds: 90,
+    });
+    expect(witness).toMatchObject({ ageSeconds: 961, claim: "controlled-delivery-scheduling", before: { event_uuid: "oldest", created_at: "2026-11-05 00:00:00" }, after: { event_uuid: "oldest", delivery_state: "pending" } });
+    const verify = new DatabaseSync(path, { readOnly: true });
+    expect(verify.prepare("SELECT delivery_next_attempt_at FROM events WHERE event_id = 2").get()).toEqual({ delivery_next_attempt_at: "2026-11-05 00:01:00" });
+    verify.close();
+  });
+
+  it("scans bounded daemon, failure and log outputs without publishing their text", () => {
+    const root = mkdtempSync(join(tmpdir(), "lcm-cert-private-scan-"));
+    const home = join(root, "home");
+    const evidenceDirectory = join(root, "evidence");
+    mkdirSync(join(home, ".lcm", "logs"), { recursive: true });
+    mkdirSync(evidenceDirectory);
+    writeFileSync(join(home, ".lcm", "logs", "daemon.log"), "safe log");
+    writeFileSync(join(evidenceDirectory, "failures.ndjson"), "incident-message-content-canary");
+    const summary = scanBoundedPrivateOutputs({ home, evidenceDirectory, daemonOutput: Buffer.from("safe streams"), inventory: [] });
+    expect(summary).toMatchObject({ canaryHits: expect.any(Number), secretHits: 0 });
+    expect(summary.canaryHits).toBeGreaterThan(0);
+    expect(JSON.stringify(summary)).not.toContain("incident-message-content-canary");
+  });
+
+  it("scans and validates exact raw response bytes before parsing", async () => {
+    const evidenceDirectory = mkdtempSync(join(tmpdir(), "lcm-cert-probe-"));
+    const body = Buffer.from(JSON.stringify({ backendDiagnostics: { telemetry: {
+      statements: { status: "observed", observedAt: 1, scope: "aggregate", operations: [] },
+      pool: { status: "observed", observedAt: 1, health: "healthy", omitted: [], remediation: "No action required.", saturationRatio: 0 },
+      migration: { status: "observed", observedAt: 1, health: "healthy", omitted: [], remediation: "No action required.", historyStatus: "current", appliedCount: 1, expectedCount: 1 },
+      extensions: { status: "observed", observedAt: 1, health: "healthy", omitted: [], remediation: "No action required.", entries: [
+        { name: "pg_stat_statements" }, { name: "pg_trgm" }, { name: "pgcrypto" }, { name: "unaccent" },
+      ] },
+      queue: { status: "observed", observedAt: 1, health: "healthy", omitted: [], remediation: "No action required.", inboxClaimed: 0 },
+    } } }));
+    const record = await runRawStatusProbe({
+      id: "steady-a-probe-0", machine: "a", phase: "steady", sequence: 0,
+      cwd: "/project", token: "token", evidenceDirectory, operationIds: [],
+      fetch: async () => ({ status: 200, arrayBuffer: async () => body }) as any,
+      now: (() => { let value = 100; return () => value += 10; })(),
+    });
+    expect(record).toMatchObject({ rawBytes: body.length, cardinality: { verdict: "pass" }, durationMs: 10 });
+    expect(readFileSync(join(evidenceDirectory, "raw-probes", "steady-a-probe-0.json"))).toEqual(body);
+    expect(JSON.parse(readFileSync(join(evidenceDirectory, "probes.ndjson"), "utf8")).rawSha256).toBe(createHash("sha256").update(body).digest("hex"));
+  });
+});
 
 // The workload's primary-text cycle, read from the approved contract file itself so
 // that any cycle edit is exercised against the product's capture admission below.

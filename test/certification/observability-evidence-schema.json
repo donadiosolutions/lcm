@@ -1,0 +1,58 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://donadiosolutions.com/lcm/observability-certification-evidence-v1.schema.json",
+  "type": "object",
+  "required": ["schemaVersion", "contract", "applicability", "items", "privateArtifacts"],
+  "additionalProperties": false,
+  "properties": {
+    "schemaVersion": { "const": 1 },
+    "contract": {
+      "type": "object",
+      "required": ["version", "sha256"],
+      "additionalProperties": false,
+      "properties": {
+        "version": { "const": 4 },
+        "sha256": { "type": "string", "pattern": "^[0-9a-f]{64}$" }
+      }
+    },
+    "applicability": {
+      "type": "object",
+      "required": ["applicable", "reason"],
+      "additionalProperties": false,
+      "properties": {
+        "applicable": { "type": "boolean" },
+        "reason": { "type": ["string", "null"] },
+        "residuals": { "type": "array", "items": { "type": "string", "minLength": 1 }, "uniqueItems": true }
+      }
+    },
+    "items": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "required": ["id", "formula", "threshold", "observed", "verdict"],
+        "additionalProperties": false,
+        "properties": {
+          "id": { "type": "string", "minLength": 1 },
+          "formula": { "type": "string", "minLength": 1 },
+          "threshold": { "type": "number" },
+          "observed": { "type": "number" },
+          "verdict": { "enum": ["pass", "fail", "incomplete"] }
+        }
+      }
+    },
+    "privateArtifacts": {
+      "type": "object",
+      "required": ["rawProbeBodies", "probeRecords", "canarySurfaces", "secretCategories", "retentionDays", "directoryMode", "fileMode"],
+      "additionalProperties": false,
+      "properties": {
+        "rawProbeBodies": { "type": "integer", "minimum": 0 },
+        "probeRecords": { "type": "integer", "minimum": 0 },
+        "canarySurfaces": { "type": "integer", "minimum": 0 },
+        "secretCategories": { "type": "integer", "minimum": 0 },
+        "retentionDays": { "const": 90 },
+        "directoryMode": { "const": "0700" },
+        "fileMode": { "const": "0600" }
+      }
+    }
+  }
+}

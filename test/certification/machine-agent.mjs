@@ -1,5 +1,6 @@
 #!/usr/bin/env node
 import { execFile, spawn } from "node:child_process";
+import { lookup } from "node:dns/promises";
 import { appendFileSync, existsSync, mkdirSync, readFileSync, readdirSync, statSync, writeFileSync } from "node:fs";
 import { dirname, join } from "node:path";
 import { pathToFileURL } from "node:url";
@@ -8,9 +9,11 @@ import { setTimeout as sleep } from "node:timers/promises";
 import { Worker } from "node:worker_threads";
 import { createHash } from "node:crypto";
 import { connect as tlsConnect } from "node:tls";
-import { createDeterministicSchedule, createFaultSchedule } from "./schedule.mjs";
+import { createDeterministicSchedule, createFaultSchedule, createObservabilityWorkloadSchedule } from "./schedule.mjs";
 import { loadCertificationContract } from "./contract.mjs";
 import { observerReadSettings } from "./sqlite-observer-worker.mjs";
+import { CANARY_CORPUS, buildSecretInventory, createProbeSchedule, scanSurface, validateTelemetryCardinality } from "./observability.mjs";
+import { createCanaryWorkload } from "./canary-corpus.mjs";
 
 const execFileAsync = promisify(execFile);
 
@@ -34,6 +37,19 @@ export function createHookFixture({ kind, bytes, sessionId, cwd }) {
     };
   }
   throw new Error("unsupported hook fixture kind");
+}
+
+export function createCanaryHookFixture({ kind, canary, sessionId, cwd }) {
+  if (kind === "user-prompt") return { prompt: canary, session_id: sessionId, cwd, client: "codex" };
+  if (kind === "post-tool") return {
+    tool_name: "TaskCreate",
+    tool_input: { subject: canary, status: "created" },
+    tool_response: canary,
+    session_id: sessionId,
+    cwd,
+    client: "codex",
+  };
+  throw new Error("unsupported canary hook fixture kind");
 }
 
 // The stored event text the capture oracle expects for a hook fixture: the prompt,
@@ -315,6 +331,186 @@ export function createOperationFailureRecord(entry, error, errorClass, environme
   };
 }
 
+const PROBE_BODY_MAX_BYTES = 1024 * 1024;
+
+export async function runRawStatusProbe({
+  id,
+  machine,
+  phase,
+  sequence,
+  cwd,
+  token,
+  timeoutMs = 5_000,
+  evidenceDirectory,
+  inventory = [],
+  canaries = [],
+  operationIds,
+  fetch: fetchImpl = globalThis.fetch,
+  now = Date.now,
+}) {
+  if (!/^[a-z0-9][a-z0-9-]{0,127}$/u.test(id)) throw new Error("invalid certification probe identity");
+  const startedAtMs = now();
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), timeoutMs);
+  try {
+    const response = await fetchImpl("http://127.0.0.1:3737/status", {
+      method: "POST",
+      headers: { authorization: `Bearer ${token}`, "content-type": "application/json" },
+      body: JSON.stringify({ cwd }),
+      signal: controller.signal,
+    });
+    const bytes = Buffer.from(await response.arrayBuffer());
+    if (bytes.length > PROBE_BODY_MAX_BYTES) throw new Error("certification probe body exceeds its private evidence bound");
+    const rawDirectory = join(evidenceDirectory, "raw-probes");
+    mkdirSync(rawDirectory, { recursive: true, mode: 0o700 });
+    const rawPath = join(rawDirectory, `${id}.json`);
+    writeFileSync(rawPath, bytes, { mode: 0o600, flag: "wx" });
+    const scan = scanSurface(bytes, inventory, canaries);
+    let body;
+    try { body = JSON.parse(bytes.toString("utf8")); }
+    catch { throw new Error("certification probe returned invalid JSON"); }
+    const cardinality = validateTelemetryCardinality(body?.backendDiagnostics?.telemetry, {
+      operationIds,
+      maximumOperations: 64,
+    });
+    const completedAtMs = now();
+    const record = {
+      id, machine, phase, sequence, startedAtMs, completedAtMs,
+      durationMs: Math.max(0, completedAtMs - startedAtMs),
+      status: response.status,
+      rawSha256: createHash("sha256").update(bytes).digest("hex"),
+      rawBytes: bytes.length,
+      scan,
+      cardinality,
+      snapshot: body?.backendDiagnostics,
+    };
+    appendNdjson(join(evidenceDirectory, "probes.ndjson"), record);
+    return record;
+  } catch (error) {
+    const completedAtMs = now();
+    const record = {
+      id, machine, phase, sequence, startedAtMs, completedAtMs,
+      durationMs: Math.max(0, completedAtMs - startedAtMs),
+      transportFailure: true,
+      errorClass: error?.name ?? "Error",
+    };
+    appendNdjson(join(evidenceDirectory, "probes.ndjson"), record);
+    return record;
+  } finally {
+    clearTimeout(timer);
+  }
+}
+
+export async function executeProbeSchedule({ schedule, probe, wait = sleep, now = Date.now }) {
+  const records = [];
+  for (const entry of schedule) {
+    const remaining = entry.startAtMs - now();
+    if (remaining > 0) await wait(remaining);
+    records.push(await probe(entry));
+  }
+  return records;
+}
+
+export async function createMachineSecretInventory(environment, { daemonTokenPath, project, readFile = (path) => readFileSync(path, "utf8"), resolveHost = lookup }) {
+  const runtime = new URL(environment.LCM_POSTGRES_RUNTIME_URL);
+  const caPem = readFile(environment.LCM_POSTGRES_CA_FILE);
+  const caBodyLines = caPem.split(/\r?\n/u).filter((line) => line.length > 0 && !line.startsWith("-----"));
+  return buildSecretInventory({
+    runtimeUrl: environment.LCM_POSTGRES_RUNTIME_URL,
+    runtimePassword: decodeURIComponent(runtime.password),
+    runtimeRole: decodeURIComponent(runtime.username),
+    migrationRole: environment.LCM_CERT_MIGRATION_ROLE,
+    databaseName: decodeURIComponent(runtime.pathname.slice(1)),
+    databaseHost: runtime.hostname,
+    databaseAddress: environment.LCM_CERT_DATABASE_ADDRESS ?? (await resolveHost(runtime.hostname, { family: 4 })).address,
+    caPem,
+    caBodyLines,
+    caFile: environment.LCM_POSTGRES_CA_FILE,
+    daemonToken: readFile(daemonTokenPath).trim(),
+    projectPath: project,
+    homePath: environment.HOME,
+    containerHostname: environment.HOSTNAME,
+  });
+}
+
+export function scanBoundedPrivateOutputs({ home, evidenceDirectory, daemonOutput, inventory, maximumFileBytes = 1024 * 1024, maximumTotalBytes = 10 * 1024 * 1024 }) {
+  const surfaces = [];
+  const add = (name, bytes) => {
+    if (bytes.length > maximumFileBytes) throw new Error(`certification privacy surface ${name} exceeds its bound`);
+    if (surfaces.reduce((sum, surface) => sum + surface.bytes, 0) + bytes.length > maximumTotalBytes) {
+      throw new Error("certification privacy surfaces exceed their aggregate bound");
+    }
+    surfaces.push({ name, ...scanSurface(bytes, inventory, CANARY_CORPUS) });
+  };
+  add("daemon-stdout-stderr", Buffer.from(daemonOutput));
+  const failures = join(evidenceDirectory, "failures.ndjson");
+  if (existsSync(failures)) add("failures.ndjson", readFileSync(failures));
+  const logs = join(home, ".lcm", "logs");
+  if (existsSync(logs)) {
+    for (const name of readdirSync(logs).sort()) {
+      const path = join(logs, name);
+      const status = statSync(path);
+      if (status.isFile()) add(`logs/${name}`, readFileSync(path));
+    }
+  }
+  const summary = {
+    surfaces: surfaces.map(({ name, bytes, secretHits, canaryHits, categoryHits }) => ({ name, bytes, secretHits, canaryHits, categoryHits })),
+    secretHits: surfaces.reduce((sum, surface) => sum + surface.secretHits, 0),
+    canaryHits: surfaces.reduce((sum, surface) => sum + surface.canaryHits, 0),
+  };
+  writeFileSync(join(evidenceDirectory, "privacy-surfaces.json"), `${JSON.stringify(summary)}\n`, { mode: 0o600, flag: "wx" });
+  return summary;
+}
+
+export async function deferOldestPendingDelivery(databasePath, {
+  nowMs = Date.now(),
+  minimumAgeSeconds = 900,
+  deferSeconds = 90,
+} = {}) {
+  const { DatabaseSync } = await import("node:sqlite");
+  const database = new DatabaseSync(databasePath, { timeout: 1_000 });
+  try {
+    database.exec("BEGIN IMMEDIATE");
+    const row = database.prepare(`
+      SELECT event_id, event_uuid, delivery_state, created_at, delivery_next_attempt_at
+      FROM events
+      WHERE delivery_state IN ('pending', 'retry')
+      ORDER BY created_at, event_id
+      LIMIT 1
+    `).get();
+    if (!row) throw new Error("certification backlog deferral found no pending or retry row");
+    const createdAtMs = Date.parse(`${String(row.created_at).replace(" ", "T")}Z`);
+    const ageSeconds = Math.floor((nowMs - createdAtMs) / 1_000);
+    if (!Number.isFinite(createdAtMs) || ageSeconds <= minimumAgeSeconds) {
+      throw new Error("certification backlog deferral row is not naturally aged");
+    }
+    const deferredUntil = new Date(nowMs + deferSeconds * 1_000).toISOString();
+    const result = database.prepare(`
+      UPDATE events
+      SET delivery_next_attempt_at = datetime(?)
+      WHERE event_id = ? AND event_uuid = ? AND delivery_state IN ('pending', 'retry')
+    `).run(deferredUntil, row.event_id, row.event_uuid);
+    if (result.changes !== 1) throw new Error("certification backlog deferral lost row ownership");
+    const after = database.prepare(`
+      SELECT event_id, event_uuid, delivery_state, created_at, delivery_next_attempt_at
+      FROM events WHERE event_id = ?
+    `).get(row.event_id);
+    database.exec("COMMIT");
+    return {
+      before: row,
+      after,
+      ageSeconds,
+      deferredUntil,
+      claim: "controlled-delivery-scheduling",
+    };
+  } catch (error) {
+    try { database.exec("ROLLBACK"); } catch {}
+    throw error;
+  } finally {
+    database.close();
+  }
+}
+
 async function probeRawTlsRejection(url, caFile) {
   const endpoint = new URL(url);
   return new Promise((resolve, reject) => {
@@ -491,8 +687,10 @@ export async function executeDeterministicSchedule({
     };
     try {
       if (entry.op === "hook") {
-        const fixture = createHookFixture({ kind: entry.kind, bytes: entry.primaryTextBytes, sessionId: entry.sessionId, cwd });
-        submittedPrimaryBytes = entry.primaryTextBytes;
+        const fixture = entry.canary === undefined
+          ? createHookFixture({ kind: entry.kind, bytes: entry.primaryTextBytes, sessionId: entry.sessionId, cwd })
+          : createCanaryHookFixture({ kind: entry.kind, canary: entry.canary, sessionId: entry.sessionId, cwd });
+        submittedPrimaryBytes = entry.canary === undefined ? entry.primaryTextBytes : Buffer.byteLength(entry.canary);
         submittedEnvelopeBytes = Buffer.byteLength(JSON.stringify(fixture));
         storedTruncated = entry.primaryTextBytes > 2000;
         appendNdjson(ledgerPath, { invocationId: entry.id, kind: entry.kind, sessionId: entry.sessionId, expectedCount: 1, scheduledWallMs });
@@ -540,12 +738,12 @@ export async function executeDeterministicSchedule({
       } else if (entry.op === "search") {
         if (daemonClient) {
           await timedDaemonCall(() => runWithDeadline(remainingOperationMs(), fatalAbort.signal, (options) =>
-            daemonClient.post("/search", { cwd, query: "deterministic certification record", limit: 5, layers: [], tags: [] }, options)));
+            daemonClient.post("/search", { cwd, query: entry.query ?? "deterministic certification record", limit: 5, layers: [], tags: [] }, options)));
         } else commandTiming = await transientCli.run(() => runCli(entrypoint, ["search", "deterministic certification record"], { cwd, env: environment, timeoutMs: Math.max(1, remainingOperationMs()) }));
       } else if (entry.op === "store") {
         if (daemonClient) {
           await timedDaemonCall(() => runWithDeadline(remainingOperationMs(), fatalAbort.signal, (options) =>
-            daemonClient.post("/store", { cwd, text: `certification record ${entry.id}`, tags: ["type:solution", "scope:project"], metadata: {} }, options)));
+            daemonClient.post("/store", { cwd, text: entry.text ?? `certification record ${entry.id}`, tags: entry.tags ?? ["type:solution", "scope:project"], metadata: {} }, options)));
         } else commandTiming = await transientCli.run(() => runCli(entrypoint, ["store", `certification record ${entry.id}`, "--tag", "type:solution", "--tag", "scope:project"], { cwd, env: environment, timeoutMs: Math.max(1, remainingOperationMs()) }));
       } else if (entry.op === "snapshot") {
         appendFileSync(environment.LCM_CERT_TRANSCRIPT_PATH, `${JSON.stringify({
@@ -606,6 +804,7 @@ export async function executeDeterministicSchedule({
         ? Number(BigInt(commandTiming.processExitNs) - BigInt(commandTiming.processStartNs)) / 1e6
         : endedAt - startedAt,
       outcome,
+      ...(entry.intentionalFailure === true ? { intentionalFailure: true } : {}),
       ...(submittedPrimaryBytes === undefined ? {} : { submittedPrimaryBytes, submittedEnvelopeBytes, storedTruncated }),
       ...(errorClass ? { errorClass } : {}),
       ...(exitCode === undefined ? {} : { exitCode }),
@@ -627,6 +826,267 @@ export async function executeDeterministicSchedule({
     }
   });
   return Promise.all(operations);
+}
+
+export async function executeCanaryWorkload({
+  runId,
+  machine,
+  entrypoint,
+  cwd,
+  environment,
+  daemonClient,
+  evidenceDirectory,
+  daemonTokenPath,
+  inventory,
+  runUtility,
+  exec = runCli,
+}) {
+  const workload = createCanaryWorkload(runId, machine);
+  const sessionId = `cert-${runId}-${machine}-observability`;
+  const schedule = [
+    ...workload.hooks.map((entry) => ({ ...entry, machine, op: "hook", sessionId, primaryTextBytes: Buffer.byteLength(entry.canary), phase: "canary", offsetSeconds: 0 })),
+    ...workload.stores.map((entry) => ({ ...entry, machine, op: "store", phase: "canary", offsetSeconds: 0 })),
+    ...workload.searches.map((entry) => ({ ...entry, machine, op: "search", phase: "canary", offsetSeconds: 0 })),
+  ].map((entry, index) => ({ ...entry, offsetSeconds: index * 3 }));
+  const attempts = await executeDeterministicSchedule({
+    schedule,
+    entrypoint,
+    cwd,
+    environment,
+    daemonClient,
+    evidenceDirectory,
+    daemonTokenPath,
+    deadlineAbortsSchedule: false,
+  });
+  const utility = runUtility ?? (async () => {
+    const loaded = await import("pg");
+    const Client = loaded.Client ?? loaded.default?.Client;
+    const client = new Client({
+      connectionString: environment.LCM_POSTGRES_URL,
+      ssl: { ca: readFileSync(environment.LCM_POSTGRES_CA_FILE, "utf8"), rejectUnauthorized: true },
+    });
+    try { await client.connect(); await client.query(workload.utility.sql); }
+    finally { await client.end().catch(() => undefined); }
+  });
+  let utilityOutcome = "success";
+  try { await utility(workload.utility); } catch { utilityOutcome = "failed"; }
+  const cli = [];
+  for (const surface of workload.cli) {
+    try {
+      const result = await exec(entrypoint, surface.args, { cwd, env: environment, timeoutMs: 60_000 });
+      const bytes = Buffer.from(`${result.stdout ?? ""}\n${result.stderr ?? ""}`);
+      cli.push({ id: surface.id, surface: surface.surface, outcome: "success", scan: scanSurface(bytes, inventory, CANARY_CORPUS) });
+    } catch (error) {
+      const bytes = Buffer.from(`${error?.stdout ?? ""}\n${error?.stderr ?? ""}`);
+      cli.push({ id: surface.id, surface: surface.surface, outcome: "failed", scan: scanSurface(bytes, inventory, CANARY_CORPUS) });
+    }
+  }
+  const witness = {
+    expected: { hooks: workload.hooks.length, stores: workload.stores.length, searches: workload.searches.length, utility: 1, cli: workload.cli.length },
+    observed: {
+      hooks: attempts.filter((entry) => entry.op === "hook" && entry.outcome === "success").length,
+      stores: attempts.filter((entry) => entry.op === "store" && entry.outcome === "success").length,
+      searches: attempts.filter((entry) => entry.op === "search" && entry.outcome === "success").length,
+      utility: utilityOutcome === "success" ? 1 : 0,
+      cli: cli.filter((entry) => entry.outcome === "success").length,
+    },
+    utilityOutcome,
+    cli,
+  };
+  writeFileSync(join(evidenceDirectory, "canary-witnesses.json"), `${JSON.stringify(witness)}\n`, { mode: 0o600, flag: "wx" });
+  return witness;
+}
+
+export function probeMatchesPhase(phase, record) {
+  const snapshot = record?.snapshot;
+  const telemetry = snapshot?.telemetry;
+  if (phase === "saturation") {
+    return telemetry?.pool?.saturationRatio >= 1 && telemetry.pool.remediation?.includes("Reduce concurrent database load")
+      && snapshot?.pool?.origin === "daemon" && snapshot.pool.waiting > 0 && snapshot.pool.failed === false;
+  }
+  if (phase === "timeout") return snapshot?.classification === "timeout" && telemetry?.migration?.status === "timeout";
+  if (phase === "stats-reset") return telemetry?.statements?.status === "reset";
+  if (phase === "permission-loss") return telemetry?.statements?.status === "permission-denied";
+  if (phase === "extension-loss") return snapshot?.classification === "unavailable"
+    && telemetry?.extensions?.health === "degraded" && telemetry?.statements?.status === "unavailable";
+  if (phase === "queue-backlog") return telemetry?.queue?.health === "degraded"
+    && telemetry?.queue?.remediation === "Check daemon delivery with `lcm events status`, then run `lcm doctor`.";
+  if (phase === "canary") return healthyProbe(record);
+  return false;
+}
+
+export function healthyProbe(record) {
+  const snapshot = record?.snapshot;
+  const telemetry = snapshot?.telemetry;
+  return snapshot?.classification === "healthy"
+    && ["pool", "migration", "extensions", "queue"].every((family) => telemetry?.[family]?.health === "healthy"
+      && telemetry[family].remediation === "No action required.")
+    && telemetry?.statements?.status === "observed";
+}
+
+export async function executeControlledObservabilityPhase({
+  phase,
+  machine,
+  runId,
+  contract,
+  entrypoint,
+  cwd,
+  environment,
+  daemonClient,
+  evidenceDirectory,
+  daemonTokenPath,
+  inventory,
+  probe = runRawStatusProbe,
+  now = Date.now,
+  wait = sleep,
+}) {
+  const prepare = await waitForControl(join(evidenceDirectory, `${phase}-prepare.json`), {
+    deadlineMs: now() + contract.timeline.full.localDeadlineSeconds * 1000,
+    now,
+    delay: wait,
+  });
+  const baseline = await probe({
+    id: `${phase}-${machine}-baseline`, machine, phase: `${phase}-baseline`, sequence: -1,
+    cwd, token: readFileSync(daemonTokenPath, "utf8").trim(), timeoutMs: contract.observability.probe.transportTimeoutMs,
+    evidenceDirectory, inventory, canaries: CANARY_CORPUS,
+    operationIds: contract.observability.cardinality.operationIds,
+  });
+  if (!healthyProbe(baseline)) throw new Error(`certification ${phase} baseline barrier failed`);
+  writeFileSync(join(evidenceDirectory, `${phase}-ready.json`), `${JSON.stringify({ machine, preparedAt: prepare.preparedAt, baselineId: baseline.id })}\n`, { mode: 0o600, flag: "wx" });
+  const control = await waitForControl(join(evidenceDirectory, `${phase}-control.json`), {
+    deadlineMs: now() + contract.timeline.full.localDeadlineSeconds * 1000,
+    now,
+    delay: wait,
+  });
+  const appliedAtMs = Date.parse(control.appliedAt);
+  const holdKey = phase === "saturation" ? "saturationWitness"
+    : phase === "permission-loss" ? "permissionLoss"
+      : phase === "extension-loss" ? "extensionLoss"
+        : phase === "stats-reset" ? "timeout" : phase;
+  const holdMaximumSeconds = phase === "queue-backlog" ? contract.timeline.full.backlogHoldMaxSeconds
+    : phase === "canary" ? contract.timeline.full.canaryPhaseMaxSeconds
+      : contract.observability.faultHoldMaximumSeconds[holdKey] ?? 60;
+  const durationSeconds = Math.max(30, holdMaximumSeconds);
+  const schedule = createObservabilityWorkloadSchedule({
+    machine, runId, phase, durationSeconds, includeHooks: phase === "queue-backlog" || phase === "canary",
+  });
+  if (phase === "saturation" && machine === "b") {
+    schedule.unshift(...[0, 1, 2].map((index) => ({
+      id: `${runId}-saturation-${machine}-blocking-store-${index}`,
+      machine,
+      op: "store",
+      phase,
+      offsetSeconds: 0,
+    })));
+  }
+  let backlogDeferral;
+  if (phase === "queue-backlog" && machine === "b") {
+    backlogDeferral = (async () => {
+      const target = appliedAtMs + 960_000;
+      if (target > now()) await wait(target - now());
+      const databasePath = findEventsDatabase(environment.HOME);
+      if (!databasePath) throw new Error("certification backlog events database is missing");
+      const witness = await deferOldestPendingDelivery(databasePath, { nowMs: now(), minimumAgeSeconds: 900, deferSeconds: 90 });
+      writeFileSync(join(evidenceDirectory, "queue-backlog-aged.json"), `${JSON.stringify(witness)}\n`, { mode: 0o600, flag: "wx" });
+      return witness;
+    })();
+  }
+  const workload = phase === "canary"
+    ? executeCanaryWorkload({ runId, machine, entrypoint, cwd, environment, daemonClient, evidenceDirectory, daemonTokenPath, inventory })
+    : executeDeterministicSchedule({ schedule, scheduleStartWallMs: appliedAtMs, entrypoint, cwd, environment, daemonClient, evidenceDirectory, daemonTokenPath, deadlineAbortsSchedule: false });
+  const cadenceMs = (phase === "saturation" ? contract.observability.probe.saturationCadenceSeconds : contract.observability.probe.faultCadenceSeconds) * 1000;
+  const records = [];
+  let detected;
+  let cleared;
+  for (let sequence = 0; now() < appliedAtMs + holdMaximumSeconds * 1000 + 30_000; sequence += 1) {
+    const target = appliedAtMs + sequence * cadenceMs;
+    if (target > now()) await wait(target - now());
+    const record = await probe({
+      id: `${phase}-${machine}-probe-${sequence}`, machine, phase, sequence,
+      cwd, token: readFileSync(daemonTokenPath, "utf8").trim(), timeoutMs: contract.observability.probe.transportTimeoutMs,
+      evidenceDirectory, inventory, canaries: CANARY_CORPUS,
+      operationIds: contract.observability.cardinality.operationIds,
+    });
+    records.push(record);
+    if (control.expectDetection !== false && !detected && probeMatchesPhase(phase, record)) {
+      detected = { machine, id: record.id, completedAtMs: record.completedAtMs };
+      writeFileSync(join(evidenceDirectory, `${phase}-detected.json`), `${JSON.stringify(detected)}\n`, { mode: 0o600, flag: "wx" });
+    }
+    if (existsSync(join(evidenceDirectory, `${phase}-cleared.json`)) && healthyProbe(record)) {
+      cleared = { machine, id: record.id, completedAtMs: record.completedAtMs };
+      writeFileSync(join(evidenceDirectory, `${phase}-clearance.json`), `${JSON.stringify(cleared)}\n`, { mode: 0o600, flag: "wx" });
+      break;
+    }
+  }
+  const attempts = await workload;
+  if (backlogDeferral) await backlogDeferral;
+  let backlogCatchUp;
+  if (phase === "queue-backlog") {
+    const clearance = await waitForControl(join(evidenceDirectory, "queue-backlog-cleared.json"), {
+      deadlineMs: now() + contract.timeline.full.backlogRecoverySeconds * 1000,
+      now,
+      delay: wait,
+    });
+    backlogCatchUp = await waitForAcknowledgmentCatchUp(
+      environment.HOME,
+      evidenceDirectory,
+      "queue-backlog",
+      clearance.clearedAt,
+      contract.thresholds.recovery.acknowledgmentCatchUpAfterClearedSeconds,
+    );
+  }
+  writeFileSync(join(evidenceDirectory, `${phase}-complete.json`), `${JSON.stringify({ machine, detected, cleared, attempts: Array.isArray(attempts) ? attempts.length : attempts.observed })}\n`, { mode: 0o600, flag: "wx" });
+  return { records, detected, cleared, attempts, backlogCatchUp };
+}
+
+export async function executeRecoveryProbePhase({
+  phase,
+  machine,
+  contract,
+  cwd,
+  evidenceDirectory,
+  daemonTokenPath,
+  inventory,
+  probe = runRawStatusProbe,
+}) {
+  const applied = await waitForControl(join(evidenceDirectory, `${phase}-applied.json`), {
+    deadlineMs: Date.now() + contract.timeline.full.localDeadlineSeconds * 1000,
+  });
+  const appliedAtMs = Date.parse(applied.appliedAt);
+  const maximumOutage = phase === "restart-database" ? contract.thresholds.recovery.restartDatabase.maxOutageSeconds : 60;
+  const firstSuccess = phase === "restart-database"
+    ? contract.thresholds.recovery.restartDatabase.firstSuccessAfterClearedSeconds
+    : contract.thresholds.recovery.partition.firstSuccessAfterClearedSeconds;
+  const schedule = createProbeSchedule({
+    phase,
+    machine,
+    appliedAtMs,
+    holdMaximumMs: (maximumOutage + firstSuccess) * 1000,
+    cadenceMs: contract.observability.probe.faultCadenceSeconds * 1000,
+    timeoutMs: contract.observability.probe.transportTimeoutMs,
+  });
+  const records = await executeProbeSchedule({
+    schedule,
+    probe: (entry) => probe({
+      ...entry,
+      cwd,
+      token: readFileSync(daemonTokenPath, "utf8").trim(),
+      evidenceDirectory,
+      inventory,
+      canaries: CANARY_CORPUS,
+      operationIds: contract.observability.cardinality.operationIds,
+    }),
+  });
+  const cleared = await waitForControl(join(evidenceDirectory, `${phase}-cleared.json`), {
+    deadlineMs: Date.now() + contract.timeline.full.localDeadlineSeconds * 1000,
+  });
+  const clearedAtMs = Date.parse(cleared.clearedAt);
+  const failure = records.find((record) => record.startedAtMs >= appliedAtMs
+    && (record.transportFailure === true || ["timeout", "unavailable"].includes(record.snapshot?.classification)));
+  const success = records.find((record) => record.startedAtMs >= clearedAtMs && healthyProbe(record));
+  if (failure) writeFileSync(join(evidenceDirectory, `${phase}-detected.json`), `${JSON.stringify({ machine, id: failure.id, completedAtMs: failure.completedAtMs })}\n`, { mode: 0o600, flag: "wx" });
+  if (success) writeFileSync(join(evidenceDirectory, `${phase}-clearance.json`), `${JSON.stringify({ machine, id: success.id, completedAtMs: success.completedAtMs })}\n`, { mode: 0o600, flag: "wx" });
+  return { records, failure, success };
 }
 
 // Polls the local events database every settings.pollSeconds with a read bounded by
@@ -811,6 +1271,9 @@ export async function startForegroundDaemon({
         let stopping;
         return {
           assertRunning,
+          capturedOutput() {
+            return Buffer.concat([Buffer.concat(stdout), Buffer.from("\n"), Buffer.concat(stderr)]);
+          },
           stop() {
             stopping ??= (async () => {
               if (exitState) return;
@@ -944,7 +1407,10 @@ export async function runMachineAgent(environment = process.env) {
   const machine = process.argv[process.argv.indexOf("--machine") + 1];
   if (!evidenceDirectory || !['a', 'b'].includes(machine)) throw new Error("missing machine-agent configuration");
   mkdirSync(evidenceDirectory, { recursive: true, mode: 0o700 });
-  const { contract } = loadCertificationContract(new URL("./contract-v3.json", import.meta.url));
+  if (!environment.LCM_CERT_CONTRACT_PATH) throw new Error("missing machine-agent contract path");
+  const { contract, sha256: contractSha256, approvalSha256 } = loadCertificationContract(environment.LCM_CERT_CONTRACT_PATH, {
+    requireApproved: environment.LCM_CERT_PROFILE === "full",
+  });
   const observerSettings = observerReadSettings(contract);
   const lcm = "/opt/lcm/dist/lcm.mjs";
   const name = `cert-${environment.LCM_CERT_RUN_ID}-${machine}`;
@@ -1045,8 +1511,12 @@ export async function runMachineAgent(environment = process.env) {
     },
   });
   const daemonClient = new DaemonClient("http://127.0.0.1:3737", daemonTokenPath);
+  const probeInventory = contract.version === 4
+    ? await createMachineSecretInventory(environment, { daemonTokenPath, project })
+    : [];
   try {
   writeFileSync(join(evidenceDirectory, "daemon-started.json"), `${JSON.stringify({ machine, at: new Date().toISOString() })}\n`, { mode: 0o600, flag: "wx" });
+  writeFileSync(join(evidenceDirectory, "contract-receipt.json"), `${JSON.stringify({ version: contract.version, sha256: contractSha256, approvalSha256 })}\n`, { mode: 0o600, flag: "wx" });
   const doctor = await captureDoctorEvidence(() => execFileAsync(process.execPath, [lcm, "doctor", "--verbose"], { cwd: project, env: environment, timeout: 60_000 }));
   await runWithDeadline(60_000, undefined, (options) =>
     daemonClient.post("/store", { cwd: project, text: "certification readiness", tags: ["type:solution", "scope:project"], metadata: {} }, options));
@@ -1068,6 +1538,39 @@ export async function runMachineAgent(environment = process.env) {
   try {
     const profile = environment.LCM_CERT_PROFILE;
     const timeline = contract.timeline[profile];
+    if (contract.version === 4 && environment.LCM_CERT_LANE === "local") {
+      const calibration = await waitForControl(join(evidenceDirectory, "calibration-control.json"), {
+        deadlineMs: Date.now() + contract.timeline.full.setupMaxSeconds * 1000,
+      });
+      const startAtMs = Date.parse(calibration.startAt);
+      const schedule = [];
+      const definition = contract.observability.calibration;
+      for (let pair = 0; pair < definition.pairs; pair += 1) {
+        const probeStart = startAtMs + pair * (definition.baselineWindowSeconds + definition.probeWindowSeconds) * 1000
+          + definition.baselineWindowSeconds * 1000;
+        schedule.push(...createProbeSchedule({
+          phase: `calibration-${pair + 1}`,
+          machine,
+          appliedAtMs: probeStart,
+          holdMaximumMs: definition.probeWindowSeconds * 1000,
+          cadenceMs: definition.probeCadenceSeconds * 1000,
+          timeoutMs: contract.observability.probe.transportTimeoutMs,
+        }));
+      }
+      const records = await executeProbeSchedule({
+        schedule,
+        probe: (entry) => runRawStatusProbe({
+          ...entry,
+          cwd: project,
+          token: readFileSync(daemonTokenPath, "utf8").trim(),
+          evidenceDirectory,
+          inventory: probeInventory,
+          canaries: CANARY_CORPUS,
+          operationIds: contract.observability.cardinality.operationIds,
+        }),
+      });
+      writeFileSync(join(evidenceDirectory, "calibration-complete.json"), `${JSON.stringify({ machine, startAt: calibration.startAt, probes: records.length })}\n`, { mode: 0o600, flag: "wx" });
+    }
     const warmupControl = await waitForControl(join(evidenceDirectory, "warmup-control.json"), {
       deadlineMs: Date.now() + contract.timeline.full.setupMaxSeconds * 1000,
     });
@@ -1090,7 +1593,28 @@ export async function runMachineAgent(environment = process.env) {
     const control = await waitForControl(join(evidenceDirectory, "phase-control.json"), {
       deadlineMs: Date.now() + 120_000,
     });
-    await executeDeterministicSchedule({ schedule, scheduleStartWallMs: Date.parse(control.steadyT0At), entrypoint: lcm, cwd: project, environment, daemonClient, evidenceDirectory, daemonTokenPath });
+    const steadyStartMs = Date.parse(control.steadyT0At);
+    const workload = executeDeterministicSchedule({ schedule, scheduleStartWallMs: steadyStartMs, entrypoint: lcm, cwd: project, environment, daemonClient, evidenceDirectory, daemonTokenPath });
+    const probes = contract.version === 4 && environment.LCM_CERT_LANE === "local"
+      ? executeProbeSchedule({
+        schedule: createProbeSchedule({
+          phase: "steady", machine, appliedAtMs: steadyStartMs,
+          holdMaximumMs: timeline.steadySeconds * 1000,
+          cadenceMs: contract.observability.probe.steadyCadenceSeconds * 1000,
+          timeoutMs: contract.observability.probe.transportTimeoutMs,
+        }),
+        probe: (entry) => runRawStatusProbe({
+          ...entry,
+          cwd: project,
+          token: readFileSync(daemonTokenPath, "utf8").trim(),
+          evidenceDirectory,
+          inventory: probeInventory,
+          canaries: CANARY_CORPUS,
+          operationIds: contract.observability.cardinality.operationIds,
+        }),
+      })
+      : Promise.resolve([]);
+    await Promise.all([workload, probes]);
     writeFileSync(join(evidenceDirectory, "steady-complete.json"), `${JSON.stringify({ machine, at: new Date().toISOString(), steadyT0At: control.steadyT0At })}\n`, { mode: 0o600, flag: "wx" });
     const settleUntil = Date.parse(control.steadyT0At) + timeline.steadySeconds * 1000 + (timeline.pendingSettleMaxSeconds ?? 0) * 1000;
     if (Date.now() < settleUntil) await new Promise((resolve) => setTimeout(resolve, settleUntil - Date.now()));
@@ -1103,7 +1627,11 @@ export async function runMachineAgent(environment = process.env) {
         machine, runId: environment.LCM_CERT_RUN_ID, phase: "partition-recovery",
         durationSeconds: contract.thresholds.recovery.partition.rtoSeconds,
       });
-      await executeDeterministicSchedule({ schedule: partitionSchedule, entrypoint: lcm, cwd: project, environment, daemonClient, evidenceDirectory, daemonTokenPath, deadlineAbortsSchedule: false });
+      const partitionWorkload = executeDeterministicSchedule({ schedule: partitionSchedule, entrypoint: lcm, cwd: project, environment, daemonClient, evidenceDirectory, daemonTokenPath, deadlineAbortsSchedule: false });
+      const partitionProbes = contract.version === 4 && environment.LCM_CERT_LANE === "local"
+        ? executeRecoveryProbePhase({ phase: "partition-a", machine, contract, cwd: project, evidenceDirectory, daemonTokenPath, inventory: probeInventory })
+        : Promise.resolve();
+      await Promise.all([partitionWorkload, partitionProbes]);
       const partitionClearance = await waitForControl(join(evidenceDirectory, "partition-cleared.json"), {
         deadlineMs: Date.now() + contract.timeline.full.partitionPhaseMaxSeconds * 1000,
       });
@@ -1119,7 +1647,11 @@ export async function runMachineAgent(environment = process.env) {
           machine, runId: environment.LCM_CERT_RUN_ID, phase: "restart-recovery",
           durationSeconds: contract.thresholds.recovery.restartDatabase.rtoSeconds,
         });
-        await executeDeterministicSchedule({ schedule: restartSchedule, entrypoint: lcm, cwd: project, environment, daemonClient, evidenceDirectory, daemonTokenPath, deadlineAbortsSchedule: false });
+        const restartWorkload = executeDeterministicSchedule({ schedule: restartSchedule, entrypoint: lcm, cwd: project, environment, daemonClient, evidenceDirectory, daemonTokenPath, deadlineAbortsSchedule: false });
+        const restartProbes = contract.version === 4
+          ? executeRecoveryProbePhase({ phase: "restart-database", machine, contract, cwd: project, evidenceDirectory, daemonTokenPath, inventory: probeInventory })
+          : Promise.resolve();
+        await Promise.all([restartWorkload, restartProbes]);
         const restartClearance = await waitForControl(join(evidenceDirectory, "restart-cleared.json"), {
           deadlineMs: Date.now() + contract.timeline.full.restartPhaseMaxSeconds * 1000,
         });
@@ -1129,6 +1661,34 @@ export async function runMachineAgent(environment = process.env) {
         );
         if (restartCatchUp.verdict !== "pass") throw new Error("restart acknowledgment catch-up failed");
         writeFileSync(join(evidenceDirectory, "restart-recovered.json"), `${JSON.stringify({ machine, at: new Date().toISOString() })}\n`, { mode: 0o600, flag: "wx" });
+      }
+    }
+    if (contract.version === 4 && environment.LCM_CERT_LANE === "local") {
+      for (const phase of ["saturation", "timeout", "stats-reset", "permission-loss", "extension-loss", "queue-backlog", "canary"]) {
+        const result = await executeControlledObservabilityPhase({
+          phase,
+          machine,
+          runId: environment.LCM_CERT_RUN_ID,
+          contract,
+          entrypoint: lcm,
+          cwd: project,
+          environment,
+          daemonClient,
+          evidenceDirectory,
+          daemonTokenPath,
+          inventory: probeInventory,
+        });
+        expectedEvents += phase === "canary"
+          ? result.attempts.expected.hooks
+          : result.attempts.filter((attempt) => attempt.op === "hook").length;
+        if (phase === "canary") {
+          scanBoundedPrivateOutputs({
+            home: environment.HOME,
+            evidenceDirectory,
+            daemonOutput: daemon.capturedOutput(),
+            inventory: probeInventory,
+          });
+        }
       }
     }
     const drainSeconds = environment.LCM_CERT_PROFILE === "full" ? 900 : 660;

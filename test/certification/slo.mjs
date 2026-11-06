@@ -98,7 +98,10 @@ export function assembleCertificationGate(input) {
     : input.cleanup.verdict === "incomplete" || slos.some((slo) => slo.verdict === "incomplete") ? "incomplete" : "pass";
   return {
     schemaVersion: 1,
-    contract: { sha256: input.contractSha256, status: input.contractStatus, approval: input.approval },
+    contract: {
+      sha256: input.contractSha256, status: input.contractStatus, approval: input.approval,
+      ...(input.contractVersion === 4 ? { version: 4 } : {}),
+    },
     startedAt: input.startedAt,
     lane: input.lane,
     profile: input.profile,
@@ -109,22 +112,25 @@ export function assembleCertificationGate(input) {
     slos,
     cleanup: input.cleanup,
     diagnostics: input.diagnostics,
+    ...(input.contractVersion === 4 ? { applicability: input.applicability } : {}),
     verdict,
   };
 }
 
-export function writeCertificationGate(gate, outputDirectory, sampleFiles = {}) {
+export function writeCertificationGate(gate, outputDirectory, sampleFiles = {}, options = {}) {
   mkdirSync(outputDirectory, { recursive: true });
   for (const [name, sample] of Object.entries(sampleFiles)) writeSampleFile(join(outputDirectory, name), sample);
-  const json = join(outputDirectory, "production-certification-gate.json");
-  const markdown = join(outputDirectory, "production-certification-gate.md");
+  const outputName = options.outputName ?? "production-certification-gate";
+  if (!/^[a-z0-9]+(?:-[a-z0-9]+)*$/u.test(outputName)) throw new Error("invalid certification gate output name");
+  const json = join(outputDirectory, `${outputName}.json`);
+  const markdown = join(outputDirectory, `${outputName}.md`);
   const rows = gate.slos.map((slo) => `${slo.id} | ${slo.verdict} | ${slo.observed} | ${slo.threshold}`);
   const host = gate.provenance?.executionHost ?? {};
   const observer = gate.provenance?.observerSettings ?? {};
   const show = (value) => value === null || value === undefined ? "n/a" : String(value);
   const memoryGiB = Number.isFinite(host.totalMemoryBytes) ? `${(host.totalMemoryBytes / 1024 ** 3).toFixed(1)} GiB` : "n/a";
   const body = [
-    "# Production certification gate",
+    `# ${options.title ?? "Production certification gate"}`,
     "",
     `Overall verdict: **${gate.verdict}**`,
     "",

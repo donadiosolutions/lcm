@@ -11,15 +11,18 @@ import {
   captureExecutionHost,
   captureExecutionProvenance,
   collectDatabaseReadiness,
+  collectCalibrationEvidence,
   collectResidualState,
   collectSetupSessionClosure,
   createDeterministicSchedule,
   machineDatabaseClearanceArgs,
   parseCertificationArguments,
+  prepareEvidenceDirectory,
   prepareManagedDatabase,
   recordFaultStep,
   runLocalCertification,
   runMachineActivationBarrier,
+  runV4ObservabilityPhases,
   stageBuiltPackage,
   startClockMonitor,
   validateRunnerSku,
@@ -97,10 +100,10 @@ describe("certification harness", () => {
   it("exposes manual certification scripts without a build or postbuild", () => {
     const packageJson = JSON.parse(readFileSync(new URL("../../package.json", import.meta.url), "utf8"));
     expect(packageJson.scripts["test:certification:local"]).toBe(
-      "LCM_TEST_CONTAINER_CLI=podman timeout -k 60 10800 node scripts/certification-harness.mjs --lane local",
+      "LCM_TEST_CONTAINER_CLI=podman node scripts/certification-harness.mjs --lane local --contract test/certification/contract-v3.json",
     );
     expect(packageJson.scripts["test:certification:managed"]).toBe(
-      "node scripts/certification-harness.mjs --lane managed",
+      "node scripts/certification-harness.mjs --lane managed --contract test/certification/contract-v3.json",
     );
     expect(packageJson.scripts["test:certification:gate"]).toBe(
       "node --experimental-strip-types scripts/certification-gate.mjs",
@@ -109,26 +112,41 @@ describe("certification harness", () => {
     expect(packageJson.scripts["test:certification:managed"]).not.toContain("build");
   });
 
-  it("accepts only explicit lane, profile and evidence directory values", () => {
-    expect(parseCertificationArguments(["--lane", "local", "--profile", "smoke", "--evidence-dir", "/private/evidence"])).toEqual({
-      lane: "local", profile: "smoke", evidenceDirectory: "/private/evidence",
+  it("accepts only explicit lane, profile, evidence directory and contract values", () => {
+    expect(parseCertificationArguments(["--lane", "local", "--profile", "smoke", "--evidence-dir", "/private/evidence", "--contract", "test/certification/contract-v3.json"])).toEqual({
+      lane: "local", profile: "smoke", evidenceDirectory: "/private/evidence", contractPath: join(process.cwd(), "test/certification/contract-v3.json"),
     });
-    expect(parseCertificationArguments(["--lane", "local", "--", "--profile", "smoke", "--evidence-dir", "/private/evidence"])).toEqual({
-      lane: "local", profile: "smoke", evidenceDirectory: "/private/evidence",
+    expect(parseCertificationArguments(["--lane", "local", "--", "--profile", "smoke", "--evidence-dir", "/private/evidence", "--contract", "test/certification/contract-v3.json"])).toEqual({
+      lane: "local", profile: "smoke", evidenceDirectory: "/private/evidence", contractPath: join(process.cwd(), "test/certification/contract-v3.json"),
     });
-    expect(() => parseCertificationArguments(["--lane", "other", "--profile", "smoke", "--evidence-dir", "/tmp/e"])).toThrow("lane");
-    expect(() => parseCertificationArguments(["--lane", "local", "--profile", "smoke", "--evidence-dir", "relative"])).toThrow("absolute");
+    expect(() => parseCertificationArguments(["--lane", "other", "--profile", "smoke", "--evidence-dir", "/tmp/e", "--contract", "x"])).toThrow("lane");
+    expect(() => parseCertificationArguments(["--lane", "local", "--profile", "smoke", "--evidence-dir", "relative", "--contract", "x"])).toThrow("absolute");
+    expect(() => parseCertificationArguments(["--lane", "local", "--profile", "smoke", "--evidence-dir", "/tmp/e"])).toThrow("contract path must be explicit");
   });
 
   it("accepts the valueless --with-faults option only for a local smoke run", () => {
-    const expected = { lane: "local", profile: "smoke", evidenceDirectory: "/private/evidence", withFaults: true };
-    expect(parseCertificationArguments(["--lane", "local", "--", "--profile", "smoke", "--with-faults", "--evidence-dir", "/private/evidence"])).toEqual(expected);
-    expect(parseCertificationArguments(["--lane", "local", "--with-faults", "--profile", "smoke", "--evidence-dir", "/private/evidence"])).toEqual(expected);
+    const expected = { lane: "local", profile: "smoke", evidenceDirectory: "/private/evidence", contractPath: join(process.cwd(), "contract.json"), withFaults: true };
+    expect(parseCertificationArguments(["--lane", "local", "--", "--profile", "smoke", "--with-faults", "--evidence-dir", "/private/evidence", "--contract", "contract.json"])).toEqual(expected);
+    expect(parseCertificationArguments(["--lane", "local", "--with-faults", "--profile", "smoke", "--evidence-dir", "/private/evidence", "--contract", "contract.json"])).toEqual(expected);
     for (const [lane, profile] of [["local", "full"], ["managed", "smoke"], ["managed", "full"]]) {
-      expect(() => parseCertificationArguments(["--lane", lane, "--profile", profile, "--with-faults", "--evidence-dir", "/private/evidence"]))
+      expect(() => parseCertificationArguments(["--lane", lane, "--profile", profile, "--with-faults", "--evidence-dir", "/private/evidence", "--contract", "contract.json"]))
         .toThrow("--with-faults requires the local lane and the smoke profile");
     }
     expect(() => parseCertificationArguments(["--lane", "local", "--profile", "smoke", "--evidence-dir"])).toThrow("invalid certification arguments");
+  });
+
+  it("allows only a non-certifying v4 smoke to precede approval", () => {
+    const root = mkdtempSync(join(tmpdir(), "lcm-cert-v4-draft-smoke-"));
+    const evidence = join(root, "evidence");
+    expect(() => prepareEvidenceDirectory(evidence, {
+      lane: "local", profile: "smoke", contractVersion: 4, contractSha256: "a".repeat(64),
+      startedAt: "2026-11-05T00:00:00.000Z",
+    })).not.toThrow();
+    expect(JSON.parse(readFileSync(join(evidence, "run.json"), "utf8"))).not.toHaveProperty("approval");
+    expect(() => prepareEvidenceDirectory(join(root, "full"), {
+      lane: "local", profile: "full", contractVersion: 4, contractSha256: "a".repeat(64),
+      startedAt: "2026-11-05T00:00:00.000Z",
+    })).toThrow("approval receipt");
   });
 
   it("records a dirty exploratory smoke but rejects dirty certifying provenance", () => {
@@ -345,6 +363,28 @@ describe("certification harness", () => {
     expect(createHash("sha256").update(readFileSync(join(certification, "contract-v3.json"))).digest("hex")).toBe(approvedContractSha256);
     expect(JSON.parse(readFileSync(join(certification, "contract-v3.approval.json"), "utf8"))).toMatchObject({ contractSha256: approvedContractSha256 });
     expect(loadCertificationContract(join(certification, "contract-v3.json"))).toMatchObject({ status: "approved", sha256: approvedContractSha256, contract: { version: 3 } });
+
+    const v4Target = mkdtempSync(join(tmpdir(), "lcm-cert-stage-v4-target-"));
+    const v4Contract = new URL("./contract-v4.json", import.meta.url);
+    const v4Sha256 = createHash("sha256").update(readFileSync(v4Contract)).digest("hex");
+    const v4Approval = join(root, "contract-v4.approval.json");
+    writeFileSync(v4Approval, `${JSON.stringify({
+      contractSha256: v4Sha256,
+      approvedBy: "test",
+      approvedAt: "2026-11-05T00:00:00.000Z",
+      note: "test receipt",
+      approvalRef: "test",
+    })}\n`);
+    stageBuiltPackage({
+      sourceRoot: root,
+      destination: v4Target,
+      machineAgentPath: join(root, "test-agent.mjs"),
+      contractPath: v4Contract.pathname,
+      approvalPath: v4Approval,
+    });
+    const v4Certification = join(v4Target, "certification");
+    expect(readdirSync(v4Certification).filter((name) => name.startsWith("contract-v")).sort()).toEqual(["contract-v4.approval.json", "contract-v4.json"]);
+    expect(loadCertificationContract(join(v4Certification, "contract-v4.json"))).toMatchObject({ status: "approved", sha256: v4Sha256, contract: { version: 4 } });
   });
 
   it("creates the exact full schedule and records fault transitions", () => {
@@ -359,6 +399,81 @@ describe("certification harness", () => {
     expect(recordFaultStep({ id: "partition-a", kind: "partition-machine", target: "a" }, {
       requestedAt: "r", appliedAt: "a", clearedAt: "c", recoveredAt: "z",
     })).toEqual({ id: "partition-a", kind: "partition-machine", target: "a", requestedAt: "r", appliedAt: "a", clearedAt: "c", recoveredAt: "z" });
+  });
+
+  it("coordinates every v4 phase through prepare, detection, clear and completion barriers", async () => {
+    const evidenceDirectory = mkdtempSync(join(tmpdir(), "lcm-cert-v4-phases-"));
+    for (const machine of ["a", "b"]) mkdirSync(join(evidenceDirectory, `machine-${machine}`));
+    const { contract } = loadCertificationContract(new URL("./contract-v4.json", import.meta.url), { requireApproved: false });
+    const order: string[] = [];
+    const faults = await runV4ObservabilityPhases({
+      contract,
+      evidenceDirectory,
+      machineNames: ["machine-a", "machine-b"],
+      adminUrl: "postgresql://admin@db/lcm",
+      caFile: "/ca",
+      processRunner: async () => undefined,
+      containerCli: "podman",
+      network: "network",
+      machineB: "machine-b",
+      waitForFiles: async (paths: string[]) => { order.push(`wait:${paths.map((path) => path.split("/").at(-1)).join(",")}`); },
+      mutation: async (phase: string) => {
+        order.push(`apply:${phase}`);
+        return { clear: async () => { order.push(`clear:${phase}`); } };
+      },
+    });
+    expect(faults.map((fault) => fault.id)).toEqual(["saturation", "timeout", "stats-reset", "permission-loss", "extension-loss", "queue-backlog", "canary"]);
+    for (const phase of faults.map((fault) => fault.id)) {
+      expect(order.indexOf(`apply:${phase}`)).toBeGreaterThan(order.findIndex((entry) => entry.includes(`${phase}-ready.json`)));
+      expect(order.indexOf(`clear:${phase}`)).toBeGreaterThan(order.indexOf(`apply:${phase}`));
+    }
+  });
+
+  it("collects bounded calibration windows and counts-only connection labels", async () => {
+    const { contract } = loadCertificationContract(new URL("./contract-v4.json", import.meta.url), { requireApproved: false });
+    contract.observability.calibration = {
+      ...contract.observability.calibration,
+      pairs: 4, baselineWindowSeconds: 1, probeWindowSeconds: 1,
+      probesPerMachinePerWindow: 1,
+    };
+    let clock = 0;
+    let cpu = 0;
+    let calls = 0;
+    const client = {
+      connect: async () => undefined,
+      end: async () => undefined,
+      query: async (sql: string) => {
+        if (sql.includes("pg_stat_activity")) return { rows: [
+          { client_address: "10.0.0.2", connections: 1 },
+          { client_address: "10.0.0.3", connections: 1 },
+        ] };
+        calls += 10;
+        return { rows: [{ calls, total_exec_time: 0, total_plan_time: 0, stats_reset: 1, dealloc: 0, xact_commit: calls, xact_rollback: 0 }] };
+      },
+    };
+    const evidence = await collectCalibrationEvidence({
+      contract,
+      startAt: new Date(0).toISOString(),
+      machineNames: { a: "machine-a", b: "machine-b" },
+      databaseContainer: "database",
+      run: async (args: string[]) => {
+        if (args[1] === "inspect") {
+          const address = args[2] === "machine-a" ? "10.0.0.2" : "10.0.0.3";
+          return { stdout: JSON.stringify([{ NetworkSettings: { Networks: { test: { IPAddress: address } } } }]) };
+        }
+        if (args.at(-1) === "/sys/fs/cgroup/cpu.max") return { stdout: "100000 100000\n" };
+        cpu += 100_000;
+        return { stdout: `usage_usec ${cpu}\n` };
+      },
+      adminUrl: "postgresql://admin@db/lcm", caFile: "/unused", runtimeRole: "runtime",
+      clientFactory: () => client,
+      now: () => clock,
+      delay: async (milliseconds: number) => { clock += milliseconds; },
+    });
+    expect(evidence.samples).toHaveLength(9);
+    expect(evidence.addressLabels).toEqual({ a: true, b: true });
+    expect(evidence.pairs).toHaveLength(12);
+    expect(evidence.connections).toMatchObject({ verdict: "pass", sampledIncrement: 0, zeroIncrementNotZeroCost: true });
   });
 
   it("proves the two private homes contain distinct machine identities", () => {

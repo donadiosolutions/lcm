@@ -5,7 +5,7 @@ LCM machine identities against PostgreSQL 18. It records the exact contract,
 machine identities, scheduled attempts, operation samples, fault steps, cleanup
 witnesses, and SLO calculations needed to reproduce a gate decision.
 
-The committed contract (`test/certification/contract-v3.json`, version 3) remains
+The approved baseline contract (`test/certification/contract-v3.json`, version 3) remains
 byte-for-byte in `draft` status. Approval lives in
 `test/certification/contract-v3.approval.json`, which names the approved contract
 SHA-256, approver, approval time, and approval reference. The harness refuses to
@@ -16,9 +16,14 @@ only change lowers the largest primary-text size from 8,192 to 6,144 bytes, beca
 hook capture drops an event whose text and tags exceed 8,192 characters and the
 8,192-byte `TaskCreate` fixture produced 8,202. It keeps the v2 hook-command limits
 (pooled p50/p95/p99 600/1500/2500 ms, per-kind and per-machine p95 1500 ms).
-`contract-v2.json` and its approval record stay in the tree as history only: the
-contract loader used by the harness, the machine agents, and the gate refuses any
-version other than 3. No certification evidence was collected under v1 or v2.
+`contract-v2.json` and its approval record stay in the tree as history only. The
+contract loader used by the harness, machine agents, and gate accepts versions 3
+and 4 and refuses older versions. The selected path flows unchanged through the
+coordinator, staged package, agents, evidence provenance, and gate. Version 3
+retains its approved bytes and behavior. Version 4 is a superset that adds the
+local observability exercise described below; its committed draft cannot collect
+certifying evidence until a separate approval file binds the final bytes. No
+certification evidence was collected under v1 or v2.
 
 ## What the two machines mean
 
@@ -46,6 +51,66 @@ cluster. It records the exact observed patch version and provider endpoint, runs
 the shared readiness and workload checks, and injects only the machine-A network
 partition. Provider restart, failover, credential rotation, backup, PITR, reverse
 migration, and observability drills belong to their separate certification issues.
+
+## Observability certification in contract v4
+
+Contract v4 keeps the v3 workload, SLOs, recovery checks, and capacity limits. On
+the local lane it adds authenticated, single-flight `/status` probes and ordered
+steps for calibration, steady telemetry, machine partition, database restart,
+pool saturation, diagnostic timeout, statement-statistics reset, permission
+loss, extension loss, an aged local delivery queue, and privacy canaries. Every
+probe has a phase, machine, and sequence identity. Completed responses have a
+separate bound from transport failures, which are permitted only during declared
+outage windows.
+
+Reset-producing steps fence collection: the agent stops scheduling probes, waits
+for the in-flight probe to finish, records a healthy baseline, applies the
+mutation, and resumes one probe at a time. The first successful statements read
+must report the new epoch as reset, followed by an observed read. Each later step
+starts only after both machines reach the exact healthy barrier. A known breach
+remains failed if a later barrier times out; only skipped later evidence is
+incomplete.
+
+The backlog step deliberately distinguishes product behavior from harness
+control. Machine B captures hooks while partitioned and lets the actual oldest
+pending or retry row age naturally past 900 seconds. The private harness then
+updates only that row's next-attempt timestamp, leaving its creation time and
+state unchanged, so the first post-reconnect probe can observe the aged row. This
+certifies the age metric, alert, and recovery under controlled delivery
+scheduling. It does not certify natural retry backoff during a partition.
+
+The privacy corpus is shared with the PostgreSQL incident-runbook fixture and is
+sent through hook, store, tag, search, utility-statement, and supported CLI
+surfaces. Agents scan exact raw probe bytes before parsing, plus bounded daemon
+and CLI output. Scans cover raw, JSON-escaped, URL-encoded, base64, and hex forms,
+and substantial 24-character prefixes where output can be truncated. Values
+shorter than eight characters are scanned only as boundary-delimited tokens; the
+evidence records that narrower guarantee. Secret values never enter public
+evidence. Private raw directories use mode 0700, files use mode 0600, and the
+retention period remains 90 days.
+
+Raw telemetry is validated before projection. The validator requires the five
+closed families, packaged operation and extension catalogs, allowed fields,
+statuses and reasons, unique operations, and the scalar ceilings in the approved
+contract. The public gate contains only counts, hashes, verdicts, applicability,
+and remediation comparisons. Exact remediation text is pinned to the product's
+`RUNTIME_HEALTH_ACTIONS` constants.
+
+Calibration uses four interleaved 180-second baseline/probe pairs at the actual
+15-second production cadence. It records signed, elapsed-time-normalized deltas,
+rejects reset, deallocation-change, counter-decrease, and excess-idle-rate
+windows, and requires at least three valid pairs. CPU, statement,
+sampled-connection, idle-call-rate, and noise ceilings in the draft are
+provisional until the non-certifying smoke is reviewed and the final contract is
+approved. A one-second connection sample is a sampled maximum, not an
+instantaneous peak; structural runtime/cancellation bounds and the unchanged v3
+capacity gate remain separate.
+
+V4 observability is applicable only to the local lane. A managed v4 run evaluates
+exactly the inherited v3 item set and records observability as not applicable,
+with residuals for provider failover, provider privilege semantics, provider
+round-trip overhead, and independent clocks and hardware. Local restart is not a
+provider-failover claim.
 
 `smoke` is a bounded, non-certifying readiness exercise. It uses a 20-second
 warmup, 120-second steady phase, and 660-second drain with no faults. It must not
@@ -135,6 +200,20 @@ LCM_TEST_CONTAINER_CLI=podman \
   --evidence-dir /absolute/private/lcm-certification/fault-smoke
 ```
 
+For the v4 draft, supply the path explicitly after the script's v3 default (the
+last `--contract` value wins). The provisional local full deadline is 15,300
+seconds and the provisional fault-plus-observability smoke deadline is 8,520
+seconds. Both are exact sums checked by the loader and will be resized from smoke
+evidence before approval:
+
+```bash
+LCM_TEST_CONTAINER_CLI=podman \
+  pnpm run test:certification:local -- \
+  --contract "$PWD/test/certification/contract-v4.json" \
+  --profile smoke --with-faults \
+  --evidence-dir /absolute/private/lcm-certification/observability-smoke
+```
+
 The harness creates and labels the database, network, volume, and two machine
 containers under one run identity. The enclosing PostgreSQL harness owns
 machine-container teardown and verifies that all owned resources and private roots
@@ -212,6 +291,11 @@ pnpm run test:certification:gate -- \
   --contract "$PWD/test/certification/contract-v3.json" \
   --output-dir /absolute/private/lcm-certification/gate
 ```
+
+For approved v4 evidence, the same command derives the separate
+`observability-certification-gate.json` and `.md` names. Those public files are
+created only by the later evidence commit after the certifying run; this draft
+does not create or package placeholder results.
 
 The published result is the local-lane `full` run of commit `bd89074f` in
 [production-certification-gate.md](production-certification-gate.md) and

@@ -1,3 +1,4 @@
+import { readFileSync } from "node:fs";
 import type { QueryResult, QueryResultRow } from "pg";
 import { describe, expect, it, vi } from "vitest";
 
@@ -1055,6 +1056,27 @@ describe("PostgreSQL runtime schema and grant readiness", () => {
     "inspectFunctionAcl",
     "inspectSchemaDefinitions",
   ] as const;
+
+  it("pins the successful runtime-readiness query count used by certification contract v4", async () => {
+    const fake = readyExecutor();
+    await expect(verifyPostgreSqlRuntimeSchema(fake.seam, { expectedOwner: EXPECTED_OWNER })).resolves.toBeDefined();
+    expect(fake.queries.map(({ options }) => options.operation)).toEqual([
+      "inspectServerReadiness", "inspectRuntimeRolePolicy",
+      "runtimeReadinessExtensions", "runtimeReadinessExtensions:probePgStatStatements",
+      "runtimeReadinessContentCollation", "inspectRequiredExtensionFunctions",
+      "inspectRequiredExtensionOperator", "inspectRequiredGinTrgmOperatorClass",
+      "inspectRequiredGinTrgmOperators", "inspectRequiredGinTrgmIndirectOperators",
+      "inspectRequiredGinTrgmSupportFunctions", "runtimeReadinessSearchConfiguration",
+      "readMigrations", "inspectSchemaOwnership", "inspectSchemaDefinitions",
+      "inspectIdentityFunctions", "inspectSchemaAcl", "inspectRelationAcl",
+      "inspectColumnAcl", "inspectFunctionAcl", "inspectEffectivePrivileges",
+    ]);
+    const contract = JSON.parse(readFileSync(new URL("../certification/contract-v4.json", import.meta.url), "utf8"));
+    expect(fake.queries).toHaveLength(21);
+    expect(contract.observability.calibration.successfulPathWireStatementCeiling).toBe(48 + 2 * fake.queries.length);
+    expect(contract.observability.calibration.idleConnectionValidationAllowancePerAcquiredConnection).toBe(1);
+    expect(contract.observability.calibration.measuredCallsPerProbeCeiling).toBe(48 + 2 * fake.queries.length + 1);
+  });
 
   it("pins and semantically consumes deparser settings in every sensitive query", async () => {
     const fake = readyExecutor();

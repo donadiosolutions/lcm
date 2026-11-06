@@ -4,12 +4,14 @@ import { execFileSync } from "node:child_process";
 import { cpSync, existsSync, lstatSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, rmSync, writeFileSync } from "node:fs";
 import { lookup } from "node:dns/promises";
 import { arch as osArch, cpus as osCpus, hostname as osHostname, release as osRelease, totalmem as osTotalmem, tmpdir } from "node:os";
-import { isAbsolute, join, relative } from "node:path";
+import { basename, isAbsolute, join, relative, resolve } from "node:path";
 import { fileURLToPath, pathToFileURL } from "node:url";
 import { NODE_IMAGE, POSTGRES_IMAGE } from "./postgresql-images.mjs";
-import { loadCertificationContract } from "../test/certification/contract.mjs";
+import { certificationDeadlineSeconds, loadCertificationContract } from "../test/certification/contract.mjs";
 import { publishPostgreSqlBackend } from "../test/certification/backend-publication.mjs";
-import { createDeterministicSchedule } from "../test/certification/schedule.mjs";
+import { createDeterministicSchedule, createObservabilityWorkloadSchedule } from "../test/certification/schedule.mjs";
+import { createCanaryWorkload } from "../test/certification/canary-corpus.mjs";
+import { buildObservabilitySummary, createProbeSchedule, evaluateCalibrationPairs, evaluateConnectionEvidence, scanSurface } from "../test/certification/observability.mjs";
 import { observerReadSettings } from "../test/certification/sqlite-observer-worker.mjs";
 import { createOwnerIdentity, createProcessLifecycle, createRunNames, ownershipLabels, removeOwnedResource, runHarness, runSanitizedProcess } from "./postgresql-harness.mjs";
 
@@ -108,7 +110,10 @@ export function captureExecutionProvenance(root, contractSha256, stagedPackageSh
   }
   const git = (...args) => execFileSync("git", ["-C", root, ...args], { encoding: "utf8", maxBuffer: 64 * 1024 * 1024 });
   const paths = git("ls-files", "-z").split("\0").filter(Boolean)
-    .filter((path) => !["docs/production-certification-gate.json", "docs/production-certification-gate.md"].includes(path)).sort();
+    .filter((path) => ![
+      "docs/production-certification-gate.json", "docs/production-certification-gate.md",
+      "docs/observability-certification-gate.json", "docs/observability-certification-gate.md",
+    ].includes(path)).sort();
   const inputs = createHash("sha256");
   for (const path of paths) { inputs.update(path); inputs.update("\0"); inputs.update(readFileSync(join(root, path))); inputs.update("\0"); }
   const executionHost = options.executionHost ?? captureExecutionHost({ environment: options.environment, containerCli: options.containerCli });
@@ -253,14 +258,16 @@ export function parseCertificationArguments(argv) {
   const lane = values.get("--lane");
   const profile = values.get("--profile");
   const evidenceDirectory = values.get("--evidence-dir");
+  const contractValue = values.get("--contract");
   if (!['local', 'managed'].includes(lane)) throw new Error("certification lane must be local or managed");
   if (!['smoke', 'full'].includes(profile)) throw new Error("certification profile must be smoke or full");
   if (!evidenceDirectory || !isAbsolute(evidenceDirectory)) throw new Error("certification evidence directory must be absolute");
+  if (!contractValue) throw new Error("certification contract path must be explicit");
   // A non-certifying fault smoke: the smoke workload plus the local lane's contract faults.
   if (withFaults && (lane !== "local" || profile !== "smoke")) {
     throw new Error("certification --with-faults requires the local lane and the smoke profile");
   }
-  return { lane, profile, evidenceDirectory, ...(withFaults ? { withFaults: true } : {}) };
+  return { lane, profile, evidenceDirectory, contractPath: resolve(contractValue), ...(withFaults ? { withFaults: true } : {}) };
 }
 export function buildMachineContainerArgs(input) {
   if (!['a', 'b'].includes(input.machine)) throw new Error("invalid certification machine");
@@ -416,6 +423,8 @@ process.stdout.write(JSON.stringify(stats.backendDiagnostics));`;
 
 export async function runManagedMachinePair(input, dependencies = {}) {
   const contract = input.contract ?? loadCertificationContract(new URL("../test/certification/contract-v3.json", import.meta.url), { requireApproved: false }).contract;
+  const selectedContractPath = input.contractPath ?? fileURLToPath(new URL("../test/certification/contract-v3.json", import.meta.url));
+  const selectedApprovalPath = input.approvalPath ?? fileURLToPath(new URL("../test/certification/contract-v3.approval.json", import.meta.url));
   const containerCli = dependencies.containerCli ?? "podman";
   const lifecycle = dependencies.processLifecycle ?? createProcessLifecycle();
   const processRunner = dependencies.processRunner
@@ -447,6 +456,8 @@ export async function runManagedMachinePair(input, dependencies = {}) {
       sourceRoot: dependencies.sourceRoot ?? repositoryRoot,
       destination: join(runRoot, "package"),
       machineAgentPath: new URL("../test/certification/machine-agent.mjs", import.meta.url),
+      contractPath: selectedContractPath,
+      approvalPath: selectedApprovalPath,
     });
     const executionProvenance = (dependencies.captureExecutionProvenance ?? captureExecutionProvenance)(
       dependencies.sourceRoot ?? repositoryRoot, input.contractSha256, stage.sha256, input.approvalSha256,
@@ -536,6 +547,9 @@ export async function runManagedMachinePair(input, dependencies = {}) {
         LCM_CERT_PROFILE: input.profile,
         LCM_CERT_LANE: "managed",
         LCM_CERT_RUN_ID: input.runId,
+        LCM_CERT_CONTRACT_PATH: `/opt/lcm/certification/${basename(selectedContractPath)}`,
+        LCM_CERT_DATABASE_ADDRESS: endpointAddress,
+        HOSTNAME: `lcm-cert-${machine}`,
       });
       const labels = ownershipLabels(ownershipRunId, `machine-${machine}`, owner);
       created.push(name);
@@ -1164,6 +1178,164 @@ export async function startClockMonitor({
   };
 }
 
+function cpuUsageUsec(text) {
+  const match = /^usage_usec\s+(\d+)$/mu.exec(text);
+  const value = match ? Number(match[1]) : Number.NaN;
+  if (!Number.isSafeInteger(value) || value < 0) throw new Error("invalid calibration cpu.stat usage_usec");
+  return value;
+}
+
+function cpuQuota(text) {
+  const [quota, period] = text.trim().split(/\s+/u);
+  if (quota === "max") return { cpus: 1, source: "declared-one-cpu-denominator" };
+  const cpus = Number(quota) / Number(period);
+  if (!Number.isFinite(cpus) || cpus <= 0) throw new Error("invalid calibration cpu.max quota");
+  return { cpus, source: "cgroup-cpu.max" };
+}
+
+export async function collectCalibrationEvidence({
+  contract,
+  startAt,
+  machineNames,
+  databaseContainer,
+  run,
+  adminUrl,
+  caFile,
+  runtimeRole,
+  clientFactory,
+  delay = (milliseconds) => new Promise((resolve) => setTimeout(resolve, milliseconds)),
+  now = Date.now,
+}) {
+  const definition = contract.observability.calibration;
+  const loaded = await import("pg");
+  const Client = loaded.Client ?? loaded.default?.Client;
+  const client = clientFactory?.() ?? new Client({ connectionString: adminUrl, ssl: { ca: readFileSync(caFile, "utf8"), rejectUnauthorized: true } });
+  await client.connect();
+  const containerNames = { ...machineNames, database: databaseContainer };
+  const inspect = {};
+  for (const [label, name] of Object.entries(machineNames)) {
+    const result = await run(["container", "inspect", name]);
+    const networks = JSON.parse(result.stdout)?.[0]?.NetworkSettings?.Networks ?? {};
+    inspect[label] = Object.values(networks).map((entry) => entry?.IPAddress).find(Boolean);
+  }
+  const labelsByAddress = new Map(Object.entries(inspect).map(([label, address]) => [address, label]));
+  const samples = [];
+  const quotas = {};
+  for (const [label, name] of Object.entries(containerNames)) {
+    quotas[label] = cpuQuota((await run(["container", "exec", name, "cat", "/sys/fs/cgroup/cpu.max"])).stdout);
+  }
+  const startAtMs = Date.parse(startAt);
+  const windowSeconds = definition.baselineWindowSeconds + definition.probeWindowSeconds;
+  const totalSeconds = definition.pairs * windowSeconds;
+  const boundarySeconds = new Set(Array.from({ length: definition.pairs }, (_, pair) => [
+    pair * windowSeconds,
+    pair * windowSeconds + definition.baselineWindowSeconds,
+    (pair + 1) * windowSeconds,
+  ]).flat());
+  try {
+    for (let second = 0; second <= totalSeconds; second += 1) {
+      const target = startAtMs + second * 1000;
+      if (target > now()) await delay(target - now());
+      const connections = (await client.query(`SELECT COALESCE(client_addr::text, 'local') AS client_address,
+        pg_catalog.count(*)::integer AS connections
+        FROM pg_catalog.pg_stat_activity
+        WHERE usename OPERATOR(pg_catalog.=) $1
+        GROUP BY client_addr ORDER BY client_addr`, [runtimeRole])).rows;
+      const counts = { a: 0, b: 0, unknown: 0 };
+      for (const row of connections) {
+        const label = labelsByAddress.get(row.client_address) ?? "unknown";
+        counts[label] += Number(row.connections);
+      }
+      const sample = { second, connectionCounts: counts, boundary: boundarySeconds.has(second) };
+      if (sample.boundary) {
+        const cpu = {};
+        for (const [label, name] of Object.entries(containerNames)) {
+          cpu[label] = cpuUsageUsec((await run(["container", "exec", name, "cat", "/sys/fs/cgroup/cpu.stat"])).stdout);
+        }
+        const statements = (await client.query(`SELECT
+          COALESCE(pg_catalog.sum(stat.calls), 0)::pg_catalog.float8 AS calls,
+          COALESCE(pg_catalog.sum(stat.total_exec_time), 0)::pg_catalog.float8 AS total_exec_time,
+          COALESCE(pg_catalog.sum(stat.total_plan_time), 0)::pg_catalog.float8 AS total_plan_time,
+          (SELECT pg_catalog.extract(epoch FROM stats_reset)::pg_catalog.float8 FROM public.pg_stat_statements_info) AS stats_reset,
+          (SELECT dealloc::pg_catalog.float8 FROM public.pg_stat_statements_info) AS dealloc,
+          (SELECT xact_commit::pg_catalog.float8 FROM pg_catalog.pg_stat_database
+            WHERE datname OPERATOR(pg_catalog.=) pg_catalog.current_database()) AS xact_commit,
+          (SELECT xact_rollback::pg_catalog.float8 FROM pg_catalog.pg_stat_database
+            WHERE datname OPERATOR(pg_catalog.=) pg_catalog.current_database()) AS xact_rollback
+          FROM public.pg_stat_statements(false) AS stat
+          JOIN pg_catalog.pg_roles AS role ON role.oid OPERATOR(pg_catalog.=) stat.userid
+          WHERE role.rolname OPERATOR(pg_catalog.=) $1`, [runtimeRole])).rows[0];
+        Object.assign(sample, { cpuUsageUsec: cpu, statements });
+      }
+      samples.push(sample);
+    }
+  } finally {
+    await client.end().catch(() => undefined);
+  }
+  const pairs = [];
+  for (let pair = 0; pair < definition.pairs; pair += 1) {
+    const first = samples.find((sample) => sample.second === pair * windowSeconds);
+    const middle = samples.find((sample) => sample.second === pair * windowSeconds + definition.baselineWindowSeconds);
+    const last = samples.find((sample) => sample.second === (pair + 1) * windowSeconds);
+    const contaminated = !first || !middle || !last
+      || first.statements.stats_reset !== middle.statements.stats_reset || middle.statements.stats_reset !== last.statements.stats_reset
+      || first.statements.dealloc !== middle.statements.dealloc || middle.statements.dealloc !== last.statements.dealloc
+      || middle.statements.calls < first.statements.calls || last.statements.calls < middle.statements.calls
+      || middle.statements.xact_commit < first.statements.xact_commit || last.statements.xact_commit < middle.statements.xact_commit
+      || middle.statements.xact_rollback < first.statements.xact_rollback || last.statements.xact_rollback < middle.statements.xact_rollback
+      || (middle.statements.calls - first.statements.calls) / definition.baselineWindowSeconds > definition.idleRuntimeRoleCallsPerSecondCeiling;
+    for (const label of ["a", "b", "database"]) {
+      pairs.push({
+        pair,
+        label,
+        baselineDelta: middle?.cpuUsageUsec[label] - first?.cpuUsageUsec[label],
+        baselineElapsedMs: definition.baselineWindowSeconds * 1000,
+        probeDelta: last?.cpuUsageUsec[label] - middle?.cpuUsageUsec[label],
+        probeElapsedMs: definition.probeWindowSeconds * 1000,
+        probeCount: definition.probesPerMachinePerWindow * (label === "database" ? 2 : 1),
+        ...(contaminated ? { rejected: "counter-reset-deallocation-or-decrease" } : {}),
+      });
+    }
+  }
+  const budget = definition.cpuNoisePercentCeiling;
+  const machine = ["a", "b"].map((label) => evaluateCalibrationPairs(pairs.filter((pair) => pair.label === label), { approvedCeiling: definition.machineCpuPercentCeiling * 150_000, approvedNoiseCeiling: budget * 150_000 }));
+  const database = evaluateCalibrationPairs(pairs.filter((pair) => pair.label === "database"), {
+    approvedCeiling: definition.databaseCpuPercentCeiling * 150_000 * quotas.database.cpus,
+    approvedNoiseCeiling: budget * 150_000 * quotas.database.cpus,
+  });
+  const statementPairs = [];
+  for (let pair = 0; pair < definition.pairs; pair += 1) {
+    const first = samples.find((sample) => sample.second === pair * windowSeconds);
+    const middle = samples.find((sample) => sample.second === pair * windowSeconds + definition.baselineWindowSeconds);
+    const last = samples.find((sample) => sample.second === (pair + 1) * windowSeconds);
+    statementPairs.push({
+      pair,
+      baselineDelta: middle?.statements.calls - first?.statements.calls,
+      baselineElapsedMs: definition.baselineWindowSeconds * 1000,
+      probeDelta: last?.statements.calls - middle?.statements.calls,
+      probeElapsedMs: definition.probeWindowSeconds * 1000,
+      probeCount: definition.probesPerMachinePerWindow * 2,
+      ...(!first || !middle || !last || first.statements.stats_reset !== last.statements.stats_reset
+        || first.statements.dealloc !== last.statements.dealloc ? { rejected: "counter-reset-or-deallocation" } : {}),
+    });
+  }
+  const statements = evaluateCalibrationPairs(statementPairs, {
+    approvedCeiling: definition.measuredCallsPerProbeCeiling,
+    approvedNoiseCeiling: definition.measuredCallsPerProbeCeiling,
+  });
+  const connectionSamples = samples.map((sample) => sample.connectionCounts.a + sample.connectionCounts.b);
+  const connections = evaluateConnectionEvidence({
+    baseline: connectionSamples[0],
+    probeSamples: connectionSamples,
+    tailSamples: connectionSamples.slice(-6),
+    sampledIncrementCeiling: definition.sampledConnectionIncrementCeiling,
+    structuralMaximum: 3,
+    activeIntervals: definition.pairs * 2,
+    sampledActiveIntervals: definition.pairs * 2,
+  });
+  return { startAt, samples, pairs, statementPairs, machine, database, statements, connections, quotas, addressLabels: { a: Boolean(inspect.a), b: Boolean(inspect.b) } };
+}
+
 function walkFiles(root, directory = root, files = []) {
   for (const name of readdirSync(directory).sort()) {
     const path = join(directory, name);
@@ -1176,7 +1348,13 @@ function walkFiles(root, directory = root, files = []) {
   return files;
 }
 
-export function stageBuiltPackage({ sourceRoot, destination, machineAgentPath }) {
+export function stageBuiltPackage({
+  sourceRoot,
+  destination,
+  machineAgentPath,
+  contractPath = fileURLToPath(new URL("../test/certification/contract-v3.json", import.meta.url)),
+  approvalPath = fileURLToPath(new URL("../test/certification/contract-v3.approval.json", import.meta.url)),
+}) {
   const required = [
     "dist/lcm.mjs",
     "dist/src/prompts",
@@ -1192,8 +1370,8 @@ export function stageBuiltPackage({ sourceRoot, destination, machineAgentPath })
   cpSync(machineAgentPath, join(destination, "certification", "machine-agent.mjs"), { errorOnExist: true });
   cpSync(new URL("../test/certification/schedule.mjs", import.meta.url), join(destination, "certification", "schedule.mjs"), { errorOnExist: true });
   cpSync(new URL("../test/certification/contract.mjs", import.meta.url), join(destination, "certification", "contract.mjs"), { errorOnExist: true });
-  cpSync(new URL("../test/certification/contract-v3.json", import.meta.url), join(destination, "certification", "contract-v3.json"), { errorOnExist: true });
-  cpSync(new URL("../test/certification/contract-v3.approval.json", import.meta.url), join(destination, "certification", "contract-v3.approval.json"), { errorOnExist: true });
+  cpSync(contractPath, join(destination, "certification", basename(contractPath)), { errorOnExist: true });
+  if (existsSync(approvalPath)) cpSync(approvalPath, join(destination, "certification", basename(approvalPath)), { errorOnExist: true });
   cpSync(new URL("../test/certification/backend-publication.mjs", import.meta.url), join(destination, "certification", "backend-publication.mjs"), { errorOnExist: true });
   cpSync(new URL("../test/certification/sqlite-observer-worker.mjs", import.meta.url), join(destination, "certification", "sqlite-observer-worker.mjs"), { errorOnExist: true });
   const hash = createHash("sha256");
@@ -1212,6 +1390,108 @@ export function recordFaultStep(identity, timestamps) {
     if (typeof timestamps[field] !== "string" || timestamps[field].length === 0) throw new Error(`fault step missing ${field}`);
   }
   return { ...identity, ...timestamps };
+}
+
+async function createPostgreSqlFaultMutation(phase, { adminUrl, caFile, processRunner, containerCli, network, machineB }) {
+  if (phase === "queue-backlog") {
+    await processRunner(containerCli, ["network", "disconnect", network, machineB]);
+    return { clear: () => processRunner(containerCli, ["network", "connect", network, machineB]) };
+  }
+  if (phase === "canary") return { clear: async () => undefined };
+  const loaded = await import("pg");
+  const Client = loaded.Client ?? loaded.default?.Client;
+  const client = new Client({ connectionString: adminUrl, ssl: { ca: readFileSync(caFile, "utf8"), rejectUnauthorized: true } });
+  await client.connect();
+  const finish = async (sql) => {
+    try { if (sql) await client.query(sql); }
+    finally { await client.end(); }
+  };
+  if (phase === "saturation") {
+    await client.query("BEGIN");
+    await client.query("LOCK TABLE lcm.promoted_memories IN ACCESS EXCLUSIVE MODE");
+    return { clear: () => finish("COMMIT") };
+  }
+  if (phase === "timeout") {
+    await client.query("BEGIN");
+    await client.query("LOCK TABLE lcm.schema_migrations IN ACCESS EXCLUSIVE MODE");
+    return { clear: () => finish("COMMIT") };
+  }
+  if (phase === "stats-reset") {
+    await client.query("SELECT public.pg_stat_statements_reset()");
+    await client.end();
+    return { clear: async () => undefined };
+  }
+  if (phase === "permission-loss") {
+    await client.query("REVOKE EXECUTE ON FUNCTION public.pg_stat_statements(boolean) FROM PUBLIC");
+    return { clear: () => finish("GRANT EXECUTE ON FUNCTION public.pg_stat_statements(boolean) TO PUBLIC") };
+  }
+  if (phase === "extension-loss") {
+    await client.query("DROP EXTENSION pg_stat_statements");
+    return { clear: () => finish("CREATE EXTENSION pg_stat_statements WITH SCHEMA public") };
+  }
+  await client.end();
+  throw new Error(`unsupported certification observability phase ${phase}`);
+}
+
+export async function runV4ObservabilityPhases({
+  contract,
+  evidenceDirectory,
+  machineNames,
+  adminUrl,
+  caFile,
+  processRunner,
+  containerCli,
+  network,
+  machineB,
+  waitForFiles,
+  mutation = createPostgreSqlFaultMutation,
+}) {
+  const faults = [];
+  const phases = ["saturation", "timeout", "stats-reset", "permission-loss", "extension-loss", "queue-backlog", "canary"];
+  for (const phase of phases) {
+    const preparedAt = new Date().toISOString();
+    for (const machine of ['a', 'b']) writeFileSync(
+      join(evidenceDirectory, `machine-${machine}`, `${phase}-prepare.json`),
+      `${JSON.stringify({ preparedAt })}\n`, { mode: 0o600, flag: "wx" },
+    );
+    await waitForFiles(['a', 'b'].map((machine) => join(evidenceDirectory, `machine-${machine}`, `${phase}-ready.json`)), machineNames, 120_000);
+    const requestedAt = new Date().toISOString();
+    const active = await mutation(phase, { adminUrl, caFile, processRunner, containerCli, network, machineB });
+    const appliedAt = new Date().toISOString();
+    const detectionMachines = phase === "saturation" || phase === "queue-backlog" ? ['b'] : ['a', 'b'];
+    for (const machine of ['a', 'b']) writeFileSync(
+      join(evidenceDirectory, `machine-${machine}`, `${phase}-control.json`),
+      `${JSON.stringify({ appliedAt, expectDetection: detectionMachines.includes(machine) })}\n`, { mode: 0o600, flag: "wx" },
+    );
+    const detectionPaths = detectionMachines.map((machine) => join(evidenceDirectory, `machine-${machine}`, `${phase}-detected.json`));
+    if (phase === "queue-backlog") {
+      await waitForFiles([join(evidenceDirectory, "machine-b", "queue-backlog-aged.json")], machineNames, contract.timeline.full.backlogHoldMaxSeconds * 1000);
+      await active.clear();
+      await waitForFiles(detectionPaths, machineNames, contract.observability.clearanceSeconds.backlog * 1000);
+    } else {
+      const holdKey = phase === "saturation" ? "saturationLock" : phase === "permission-loss" ? "permissionLoss" : phase === "extension-loss" ? "extensionLoss" : phase;
+      await waitForFiles(detectionPaths, machineNames, (contract.observability.faultHoldMaximumSeconds[holdKey] ?? 60) * 1000);
+      await active.clear();
+    }
+    const clearedAt = new Date().toISOString();
+    for (const machine of ['a', 'b']) writeFileSync(
+      join(evidenceDirectory, `machine-${machine}`, `${phase}-cleared.json`),
+      `${JSON.stringify({ clearedAt })}\n`, { mode: 0o600, flag: "wx" },
+    );
+    const completionSeconds = phase === "queue-backlog" ? contract.timeline.full.backlogRecoverySeconds
+      : phase === "canary" ? contract.timeline.full.canaryPhaseMaxSeconds + 120
+        : 120;
+    await waitForFiles(
+      ['a', 'b'].flatMap((machine) => [
+        join(evidenceDirectory, `machine-${machine}`, `${phase}-clearance.json`),
+        join(evidenceDirectory, `machine-${machine}`, `${phase}-complete.json`),
+      ]),
+      machineNames,
+      completionSeconds * 1000,
+    );
+    faults.push({ id: phase, kind: phase, target: detectionMachines.join(","), requestedAt, appliedAt, clearedAt, recoveredAt: new Date().toISOString() });
+  }
+  return faults;
 }
 
 export function verifyDistinctMachineIdentities(homes) {
@@ -1250,16 +1530,158 @@ function jsonFromFile(path) {
   return JSON.parse(readFileSync(path, "utf8"));
 }
 
+function ndjsonFromFile(path) {
+  if (!existsSync(path)) return [];
+  return readFileSync(path, "utf8").split("\n").filter(Boolean).map((line) => JSON.parse(line));
+}
+
+function writeObservabilitySummary({ evidenceDirectory, contract, contractSha256, runId, faults, coordinatorInventory = [] }) {
+  const probes = ['a', 'b'].flatMap((machine) => ndjsonFromFile(join(evidenceDirectory, `machine-${machine}`, "probes.ndjson")));
+  const control = jsonFromFile(join(evidenceDirectory, "phase-control.json"));
+  const steadyStartMs = Date.parse(control.steadyT0At);
+  const expectedSteady = ['a', 'b'].flatMap((machine) => createProbeSchedule({
+    phase: "steady", machine, appliedAtMs: steadyStartMs,
+    holdMaximumMs: contract.timeline.full.steadySeconds * 1000,
+    cadenceMs: contract.observability.probe.steadyCadenceSeconds * 1000,
+    timeoutMs: contract.observability.probe.transportTimeoutMs,
+  }).map((probe) => ({ ...probe, expected: true })));
+  const phaseResults = {
+    steady: {
+      alert: probes.some((probe) => probe.phase === "steady"),
+      detectionSeconds: 0,
+      clearanceSeconds: 0,
+      correctness: probes.filter((probe) => probe.phase === "steady").every((probe) => probe.snapshot?.classification === "healthy"),
+    },
+  };
+  for (const fault of faults) {
+    const phase = fault.id;
+    const detected = ['a', 'b'].flatMap((machine) => {
+      const path = join(evidenceDirectory, `machine-${machine}`, `${phase}-detected.json`);
+      return existsSync(path) ? [jsonFromFile(path)] : [];
+    });
+    const cleared = ['a', 'b'].flatMap((machine) => {
+      const path = join(evidenceDirectory, `machine-${machine}`, `${phase}-clearance.json`);
+      return existsSync(path) ? [jsonFromFile(path)] : [];
+    });
+    const samples = ['a', 'b'].flatMap((machine) => ndjsonFromFile(join(evidenceDirectory, `machine-${machine}`, "samples.ndjson")))
+      .filter((sample) => sample.phase === phase);
+    const unexpectedFailures = samples.filter((sample) => sample.outcome !== "success"
+      && !(phase === "queue-backlog" && Date.parse(sample.wallEndedAt) <= Date.parse(fault.clearedAt)));
+    const backlogCatchUp = phase === "queue-backlog" ? ['a', 'b'].map((machine) => {
+      const path = join(evidenceDirectory, `machine-${machine}`, "queue-backlog-catch-up.json");
+      return existsSync(path) ? jsonFromFile(path) : undefined;
+    }) : [];
+    phaseResults[phase] = {
+      alert: detected.length > 0,
+      detectionSeconds: detected.length === 0 ? undefined : Math.max(...detected.map((entry) => (entry.completedAtMs - Date.parse(fault.appliedAt)) / 1000)),
+      clearanceSeconds: cleared.length === 0 ? undefined : Math.max(...cleared.map((entry) => (entry.completedAtMs - Date.parse(fault.clearedAt)) / 1000)),
+      correctness: samples.length > 0 && unexpectedFailures.length === 0,
+      recovery: cleared.length === 2 && unexpectedFailures.length === 0
+        && (phase !== "queue-backlog" || backlogCatchUp.every((entry) => entry?.verdict === "pass" && entry.remaining === 0)),
+    };
+  }
+  const canaryWitnesses = ['a', 'b'].flatMap((machine) => {
+    const path = join(evidenceDirectory, `machine-${machine}`, "canary-witnesses.json");
+    return existsSync(path) ? [jsonFromFile(path)] : [];
+  });
+  const canary = canaryWitnesses.length === 0 ? undefined : {
+    expected: Object.fromEntries(Object.keys(canaryWitnesses[0].expected).map((key) => [key, canaryWitnesses.reduce((sum, witness) => sum + witness.expected[key], 0)])),
+    observed: Object.fromEntries(Object.keys(canaryWitnesses[0].observed).map((key) => [key, canaryWitnesses.reduce((sum, witness) => sum + witness.observed[key], 0)])),
+  };
+  const probeScans = probes.map((probe) => probe.scan).filter(Boolean);
+  const cliScans = canaryWitnesses.flatMap((witness) => witness.cli ?? []).map((entry) => entry.scan).filter(Boolean);
+  const privateScans = ['a', 'b'].flatMap((machine) => {
+    const path = join(evidenceDirectory, `machine-${machine}`, "privacy-surfaces.json");
+    return existsSync(path) ? jsonFromFile(path).surfaces ?? [] : [];
+  });
+  const coordinatorScans = ["run.json", "faults.json", "calibration-evidence.json"]
+    .filter((name) => existsSync(join(evidenceDirectory, name)))
+    .map((name) => scanSurface(readFileSync(join(evidenceDirectory, name)), coordinatorInventory, []));
+  const scans = [...probeScans, ...cliScans, ...privateScans, ...coordinatorScans];
+  const secretCategories = new Set(scans.flatMap((scan) => Object.keys(scan.categoryHits ?? {})));
+  const privacy = {
+    canaryHits: scans.reduce((sum, scan) => sum + (scan.canaryHits ?? 0), 0),
+    secretHits: scans.reduce((sum, scan) => sum + (scan.secretHits ?? 0), 0),
+    secretCategories: secretCategories.size,
+    inventoryComplete: secretCategories.size >= 14,
+  };
+  const phaseDurations = {
+    saturation: 30, timeout: 30, "stats-reset": 30, "permission-loss": 60,
+    "extension-loss": 60, "queue-backlog": contract.timeline.full.backlogHoldMaxSeconds,
+    canary: contract.timeline.full.canaryPhaseMaxSeconds,
+  };
+  const expectedIds = [];
+  for (const [phase, durationSeconds] of Object.entries(phaseDurations)) {
+    for (const machine of ['a', 'b']) {
+      if (phase === "canary") {
+        const workload = createCanaryWorkload(runId, machine);
+        expectedIds.push(...workload.hooks, ...workload.stores, ...workload.searches);
+      } else {
+        expectedIds.push(...createObservabilityWorkloadSchedule({ machine, runId, phase, durationSeconds, includeHooks: phase === "queue-backlog" }));
+      }
+    }
+    if (phase === "saturation") expectedIds.push(...[0, 1, 2].map((index) => ({ id: `${runId}-saturation-b-blocking-store-${index}` })));
+  }
+  const attempts = ['a', 'b'].flatMap((machine) => ndjsonFromFile(join(evidenceDirectory, `machine-${machine}`, "samples.ndjson")))
+    .filter((sample) => Object.hasOwn(phaseDurations, sample.phase))
+    .map((sample) => {
+      const fault = faults.find((entry) => entry.id === sample.phase);
+      const intentionalFailure = sample.phase === "queue-backlog" && sample.outcome !== "success"
+        && fault && Date.parse(sample.wallEndedAt) <= Date.parse(fault.clearedAt);
+      return { ...sample, overlapped: true, ...(intentionalFailure ? { intentionalFailure: true } : {}) };
+    });
+  const calibrationPath = join(evidenceDirectory, "calibration-evidence.json");
+  const calibrationEvidence = existsSync(calibrationPath) ? jsonFromFile(calibrationPath) : undefined;
+  const combinedVerdict = (values) => values.includes("fail") ? "fail" : values.includes("incomplete") ? "incomplete" : "pass";
+  const machineCalibration = calibrationEvidence?.machine;
+  const calibration = calibrationEvidence ? {
+    machineCpu: {
+      verdict: combinedVerdict(machineCalibration.map((entry) => entry.verdict)),
+      measuredMaximum: Math.max(...machineCalibration.map((entry) => entry.measuredMaximum ?? 0)) / 150_000,
+      ceiling: contract.observability.calibration.machineCpuPercentCeiling,
+    },
+    databaseCpu: {
+      verdict: calibrationEvidence.database.verdict,
+      measuredMaximum: (calibrationEvidence.database.measuredMaximum ?? 0) / (150_000 * calibrationEvidence.quotas.database.cpus),
+      ceiling: contract.observability.calibration.databaseCpuPercentCeiling,
+    },
+    statements: {
+      verdict: calibrationEvidence.statements.verdict,
+      observed: calibrationEvidence.statements.measuredMaximum ?? 0,
+      ceiling: contract.observability.calibration.measuredCallsPerProbeCeiling,
+    },
+  } : undefined;
+  const summary = buildObservabilitySummary({
+    contractSha256,
+    probes: [...expectedSteady, ...probes],
+    phaseResults,
+    workload: { expectedIds: expectedIds.map((entry) => entry.id), attempts },
+    canary,
+    privacy,
+    calibration,
+    connections: calibrationEvidence ? {
+      ...calibrationEvidence.connections,
+      observed: calibrationEvidence.connections.sampledIncrement ?? 0,
+      ceiling: contract.observability.calibration.sampledConnectionIncrementCeiling,
+    } : undefined,
+  });
+  const summaryScan = scanSurface(Buffer.from(JSON.stringify(summary)), coordinatorInventory, []);
+  if (summaryScan.secretHits !== 0) throw new Error("public observability summary contains a coordinator identity or credential");
+  writeFileSync(join(evidenceDirectory, "observability-summary.json"), `${JSON.stringify(summary, null, 2)}\n`, { mode: 0o600, flag: "wx" });
+  return summary;
+}
+
 export function prepareEvidenceDirectory(path, metadata) {
-  if (!metadata.approval || !/^[0-9a-f]{64}$/u.test(metadata.approvalSha256 ?? "")) {
+  const certifying = metadata.profile === "full" || metadata.contractVersion !== 4;
+  if (certifying && (!metadata.approval || !/^[0-9a-f]{64}$/u.test(metadata.approvalSha256 ?? ""))) {
     throw new Error("certification evidence collection requires an approval receipt");
   }
-  const approvedAt = Date.parse(metadata.approval.approvedAt);
+  const approvedAt = metadata.approval ? Date.parse(metadata.approval.approvedAt) : Number.NaN;
   const startedAt = Date.parse(metadata.startedAt);
-  if (!Number.isFinite(approvedAt) || !Number.isFinite(startedAt) || approvedAt > startedAt) {
+  if (!Number.isFinite(startedAt) || metadata.approval && (!Number.isFinite(approvedAt) || approvedAt > startedAt)) {
     throw new Error("contract approval must precede evidence collection");
   }
-  if (metadata.approval.contractSha256 !== metadata.contractSha256) {
+  if (metadata.approval && metadata.approval.contractSha256 !== metadata.contractSha256) {
     throw new Error("evidence metadata approval hash does not match the contract");
   }
   const fromRepository = relative(repositoryRoot, path);
@@ -1273,6 +1695,8 @@ export function prepareEvidenceDirectory(path, metadata) {
 
 export async function runLocalCertification(options, dependencies = {}) {
   const contract = options.contract ?? loadCertificationContract(new URL("../test/certification/contract-v3.json", import.meta.url), { requireApproved: false }).contract;
+  const selectedContractPath = options.contractPath ?? fileURLToPath(new URL("../test/certification/contract-v3.json", import.meta.url));
+  const selectedApprovalPath = options.approvalPath ?? fileURLToPath(new URL("../test/certification/contract-v3.approval.json", import.meta.url));
   if ((dependencies.environment ?? process.env).LCM_TEST_CONTAINER_CLI !== "podman") {
     throw new Error("local certification requires LCM_TEST_CONTAINER_CLI=podman");
   }
@@ -1281,6 +1705,7 @@ export async function runLocalCertification(options, dependencies = {}) {
     profile: options.profile,
     ...(options.withFaults === true ? { withFaults: true } : {}),
     contractSha256: options.contractSha256,
+    contractVersion: contract.version,
     approval: options.approval,
     approvalSha256: options.approvalSha256,
     startedAt: new Date().toISOString(),
@@ -1300,6 +1725,8 @@ export async function runLocalCertification(options, dependencies = {}) {
         sourceRoot: dependencies.sourceRoot ?? repositoryRoot,
         destination: join(context.directory, "package"),
         machineAgentPath: new URL("../test/certification/machine-agent.mjs", import.meta.url),
+        contractPath: selectedContractPath,
+        approvalPath: selectedApprovalPath,
       });
       const executionProvenance = (dependencies.captureExecutionProvenance ?? captureExecutionProvenance)(
         dependencies.sourceRoot ?? repositoryRoot, options.contractSha256, stage.sha256, options.approvalSha256,
@@ -1360,6 +1787,8 @@ export async function runLocalCertification(options, dependencies = {}) {
             ...(options.withFaults === true ? { LCM_CERT_WITH_FAULTS: "1" } : {}),
             LCM_CERT_LANE: "local",
             LCM_CERT_RUN_ID: context.runId,
+            LCM_CERT_CONTRACT_PATH: `/opt/lcm/certification/${basename(selectedContractPath)}`,
+            HOSTNAME: `lcm-cert-${machine}`,
           });
           const name = machine === 'a' ? context.names.machineA : context.names.machineB;
           const kind = `machine-${machine}`;
@@ -1504,6 +1933,36 @@ export async function runLocalCertification(options, dependencies = {}) {
           ca: readFileSync(context.environment.LCM_TEST_POSTGRES_CA_FILE, "utf8"),
           evidenceDirectory: options.evidenceDirectory,
         });
+        if (contract.version === 4) {
+          const calibrationStartAt = new Date(Date.now() + 10_000).toISOString();
+          writeFileSync(join(options.evidenceDirectory, "calibration-plan.json"), `${JSON.stringify({
+            startAt: calibrationStartAt,
+            ...contract.observability.calibration,
+            provisional: true,
+          }, null, 2)}\n`, { mode: 0o600, flag: "wx" });
+          for (const machine of ['a', 'b']) writeFileSync(
+            join(options.evidenceDirectory, `machine-${machine}`, "calibration-control.json"),
+            `${JSON.stringify({ startAt: calibrationStartAt })}\n`, { mode: 0o600, flag: "wx" },
+          );
+          const calibrationEvidence = (dependencies.collectCalibrationEvidence ?? collectCalibrationEvidence)({
+            contract,
+            startAt: calibrationStartAt,
+            machineNames: { a: context.names.machineA, b: context.names.machineB },
+            databaseContainer: context.names.container,
+            run: runContainer,
+            adminUrl: context.environment.LCM_TEST_POSTGRES_ADMIN_URL,
+            caFile: context.environment.LCM_TEST_POSTGRES_CA_FILE,
+            runtimeRole: "lcm_test_runtime",
+            delay: dependencies.delay,
+          });
+          const calibrationAgents = waitForFiles(
+            ['a', 'b'].map((machine) => join(options.evidenceDirectory, `machine-${machine}`, "calibration-complete.json")),
+            [context.names.machineA, context.names.machineB],
+            contract.timeline.full.calibrationSeconds * 1000 + 120_000,
+          );
+          const [calibration] = await Promise.all([calibrationEvidence, calibrationAgents]);
+          writeFileSync(join(options.evidenceDirectory, "calibration-evidence.json"), `${JSON.stringify(calibration, null, 2)}\n`, { mode: 0o600, flag: "wx" });
+        }
         const warmupControl = publishWarmupControl(options.evidenceDirectory, dependencies.wallNow);
         await waitForFiles(
           ['a', 'b'].map((machine) => join(options.evidenceDirectory, `machine-${machine}`, "warmup-complete.json")),
@@ -1525,6 +1984,7 @@ export async function runLocalCertification(options, dependencies = {}) {
           ca: readFileSync(context.environment.LCM_TEST_POSTGRES_CA_FILE, "utf8"),
         });
         writeFileSync(join(options.evidenceDirectory, "database-growth.json"), `${JSON.stringify({ beforeBytes: growthBefore, afterBytes: growthAfter, deltaBytes: growthAfter - growthBefore })}\n`, { mode: 0o600, flag: "wx" });
+        let runFaults = [];
         if (faultsEnabled) {
           await waitForFiles(
             ['a', 'b'].map((machine) => join(options.evidenceDirectory, `machine-${machine}`, "fault-ready.json")),
@@ -1545,6 +2005,10 @@ export async function runLocalCertification(options, dependencies = {}) {
           const partitionRequestedAt = new Date().toISOString();
           await context.processRunner(context.containerCli, ["network", "disconnect", context.names.network, context.names.machineA], { redactSecrets: context.secrets });
           const partitionAppliedAt = new Date().toISOString();
+          if (contract.version === 4) for (const machine of ['a', 'b']) writeFileSync(
+            join(options.evidenceDirectory, `machine-${machine}`, "partition-a-applied.json"),
+            `${JSON.stringify({ appliedAt: partitionAppliedAt })}\n`, { mode: 0o600, flag: "wx" },
+          );
           await monitorDelay([context.names.machineA, context.names.machineB], 60_000);
           await context.processRunner(context.containerCli, ["network", "connect", context.names.network, context.names.machineA], { redactSecrets: context.secrets });
           await clearMachineA("partition");
@@ -1559,6 +2023,10 @@ export async function runLocalCertification(options, dependencies = {}) {
             join(options.evidenceDirectory, `machine-${machine}`, "partition-cleared.json"),
             `${JSON.stringify({ clearedAt: partitionClearedAt })}\n`, { mode: 0o600, flag: "wx" },
           );
+          if (contract.version === 4) for (const machine of ['a', 'b']) writeFileSync(
+            join(options.evidenceDirectory, `machine-${machine}`, "partition-a-cleared.json"),
+            `${JSON.stringify({ clearedAt: partitionClearedAt })}\n`, { mode: 0o600, flag: "wx" },
+          );
           await waitForFiles(
             ['a', 'b'].map((machine) => join(options.evidenceDirectory, `machine-${machine}`, "restart-ready.json")),
             [context.names.machineA, context.names.machineB],
@@ -1568,6 +2036,10 @@ export async function runLocalCertification(options, dependencies = {}) {
           const restartRequestedAt = new Date().toISOString();
           await context.processRunner(context.containerCli, ["container", "stop", "--time", "120", context.names.container], { redactSecrets: context.secrets });
           const restartAppliedAt = new Date().toISOString();
+          if (contract.version === 4) for (const machine of ['a', 'b']) writeFileSync(
+            join(options.evidenceDirectory, `machine-${machine}`, "restart-database-applied.json"),
+            `${JSON.stringify({ appliedAt: restartAppliedAt })}\n`, { mode: 0o600, flag: "wx" },
+          );
           await context.processRunner(context.containerCli, ["container", "start", context.names.container], { redactSecrets: context.secrets });
           await clearMachineA("restart");
           await (dependencies.collectReadiness ?? collectDatabaseReadiness)({
@@ -1581,16 +2053,36 @@ export async function runLocalCertification(options, dependencies = {}) {
             join(options.evidenceDirectory, `machine-${machine}`, "restart-cleared.json"),
             `${JSON.stringify({ clearedAt: restartClearedAt })}\n`, { mode: 0o600, flag: "wx" },
           );
+          if (contract.version === 4) for (const machine of ['a', 'b']) writeFileSync(
+            join(options.evidenceDirectory, `machine-${machine}`, "restart-database-cleared.json"),
+            `${JSON.stringify({ clearedAt: restartClearedAt })}\n`, { mode: 0o600, flag: "wx" },
+          );
           await waitForFiles(
             ['a', 'b'].map((machine) => join(options.evidenceDirectory, `machine-${machine}`, "restart-recovered.json")),
             [context.names.machineA, context.names.machineB],
             phaseDeadlineMs(contract, "full", "restart"),
           );
           const restartRecoveredAt = new Date().toISOString();
-          writeFileSync(join(options.evidenceDirectory, "faults.json"), `${JSON.stringify([
+          const observedFaults = [
             { id: "partition-a", kind: "partition-machine", target: "a", requestedAt: partitionRequestedAt, appliedAt: partitionAppliedAt, clearedAt: partitionClearedAt, recoveredAt: partitionRecoveredAt },
             { id: "restart-database", kind: "restart-database", target: "database", requestedAt: restartRequestedAt, appliedAt: restartAppliedAt, clearedAt: restartClearedAt, recoveredAt: restartRecoveredAt },
-          ], null, 2)}\n`, { mode: 0o600, flag: "wx" });
+          ];
+          if (contract.version === 4) {
+            observedFaults.push(...await runV4ObservabilityPhases({
+              contract,
+              evidenceDirectory: options.evidenceDirectory,
+              machineNames: [context.names.machineA, context.names.machineB],
+              adminUrl: context.environment.LCM_TEST_POSTGRES_ADMIN_URL,
+              caFile: context.environment.LCM_TEST_POSTGRES_CA_FILE,
+              processRunner: context.processRunner,
+              containerCli: context.containerCli,
+              network: context.names.network,
+              machineB: context.names.machineB,
+              waitForFiles,
+            }));
+          }
+          runFaults = observedFaults;
+          writeFileSync(join(options.evidenceDirectory, "faults.json"), `${JSON.stringify(observedFaults, null, 2)}\n`, { mode: 0o600, flag: "wx" });
         }
         await waitForFiles(
           ['a', 'b'].map((machine) => join(options.evidenceDirectory, `machine-${machine}`, "drain.json")),
@@ -1605,6 +2097,21 @@ export async function runLocalCertification(options, dependencies = {}) {
         );
         for (const name of created) {
           await context.processRunner(context.containerCli, ["container", "wait", name], { redactSecrets: context.secrets });
+        }
+        if (contract.version === 4) {
+          writeObservabilitySummary({
+            evidenceDirectory: options.evidenceDirectory,
+            contract,
+            contractSha256: options.contractSha256,
+            runId: context.runId,
+            faults: runFaults,
+            coordinatorInventory: [
+              ["admin-url", context.environment.LCM_TEST_POSTGRES_ADMIN_URL],
+              ["admin-password", decodeURIComponent(new URL(context.environment.LCM_TEST_POSTGRES_ADMIN_URL).password)],
+              ["admin-role", decodeURIComponent(new URL(context.environment.LCM_TEST_POSTGRES_ADMIN_URL).username)],
+              ["transfer-role", databasePreparation.transferName],
+            ].map(([category, value]) => ({ category, value, sourceClass: "coordinator", scanMode: value.length >= 8 ? "all-forms" : "boundary-token" })),
+          });
         }
         return { stage, machines: machineRoots };
       } finally {
@@ -1632,18 +2139,18 @@ export async function runLocalCertification(options, dependencies = {}) {
 
 export async function main(argv = process.argv.slice(2)) {
   const options = parseCertificationArguments(argv);
-  const loaded = loadCertificationContract(new URL("../test/certification/contract-v3.json", import.meta.url));
+  const loaded = loadCertificationContract(options.contractPath, { requireApproved: false });
+  if (options.profile === "full" && loaded.approval === undefined) {
+    throw new Error("certification full profile requires a matching approval record");
+  }
   options.contract = loaded.contract;
   options.contractSha256 = loaded.sha256;
   options.contractStatus = loaded.status;
   options.approval = loaded.approval;
   options.approvalSha256 = loaded.approvalSha256;
+  options.approvalPath = loaded.approvalPath;
   if (options.lane === "local") {
-    // A fault smoke adds the full profile's partition and restart phase bounds to the
-    // smoke deadline.
-    const { partitionPhaseMaxSeconds, restartPhaseMaxSeconds } = loaded.contract.timeline.full;
-    const deadlineSeconds = options.profile === "full" ? 10_800
-      : 1_800 + (options.withFaults === true ? partitionPhaseMaxSeconds + restartPhaseMaxSeconds : 0);
+    const deadlineSeconds = certificationDeadlineSeconds(loaded.contract, options);
     const deadline = setTimeout(() => process.kill(process.pid, "SIGTERM"), deadlineSeconds * 1000);
     deadline.unref?.();
     try { return await runLocalCertification(options); }

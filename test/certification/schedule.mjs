@@ -32,3 +32,32 @@ export function createFaultSchedule({ machine, runId, phase, durationSeconds }) 
   }
   return schedule.sort((left, right) => left.offsetSeconds - right.offsetSeconds || left.id.localeCompare(right.id));
 }
+
+export function createObservabilityWorkloadSchedule({
+  machine,
+  runId,
+  phase,
+  durationSeconds,
+  includeHooks = false,
+}) {
+  if (!['a', 'b'].includes(machine) || typeof phase !== "string" || phase.length === 0
+    || !Number.isSafeInteger(durationSeconds) || durationSeconds <= 0) {
+    throw new Error("invalid observability workload schedule");
+  }
+  const schedule = createFaultSchedule({ machine, runId, phase, durationSeconds });
+  if (includeHooks) {
+    for (let offsetSeconds = 1, index = 0; offsetSeconds < durationSeconds; offsetSeconds += 10, index += 1) {
+      schedule.push({
+        id: `${runId}-${phase}-${machine}-hook-${index}`,
+        machine,
+        op: "hook",
+        kind: index % 2 === 0 ? "user-prompt" : "post-tool",
+        sessionId: `cert-${runId}-${machine}-observability`,
+        primaryTextBytes: 256,
+        phase,
+        offsetSeconds,
+      });
+    }
+  }
+  return schedule.sort((left, right) => left.offsetSeconds - right.offsetSeconds || left.id.localeCompare(right.id));
+}
