@@ -489,6 +489,7 @@ describe("certification harness", () => {
     for (const machine of ["a", "b"]) mkdirSync(join(evidenceDirectory, `machine-${machine}`));
     const { contract } = loadCertificationContract(new URL("./contract-v4.json", import.meta.url), { requireApproved: false });
     const order: string[] = [];
+    const waitTimeouts: Array<{ names: string; timeoutMs: number }> = [];
     const result = await runV4ObservabilityPhases({
       contract,
       evidenceDirectory,
@@ -499,7 +500,11 @@ describe("certification harness", () => {
       containerCli: "podman",
       network: "network",
       machineB: "machine-b",
-      waitForFiles: async (paths: string[]) => { order.push(`wait:${paths.map((path) => path.split("/").at(-1)).join(",")}`); },
+      waitForFiles: async (paths: string[], _machines: string[], timeoutMs: number) => {
+        const names = paths.map((path) => path.split("/").at(-1)).join(",");
+        order.push(`wait:${names}`);
+        waitTimeouts.push({ names, timeoutMs });
+      },
       mutation: async (phase: string) => {
         order.push(`apply:${phase}`);
         return { clear: async () => { order.push(`clear:${phase}`); } };
@@ -511,6 +516,7 @@ describe("certification harness", () => {
       expect(order.indexOf(`apply:${phase}`)).toBeGreaterThan(order.findIndex((entry) => entry.includes(`${phase}-ready.json`)));
       expect(order.indexOf(`clear:${phase}`)).toBeGreaterThan(order.indexOf(`apply:${phase}`));
     }
+    expect(waitTimeouts.find((entry) => entry.names === "saturation-detected.json")?.timeoutMs).toBe(20_000);
   });
 
   it("clears an active mutation, records the failed barrier, and signals later phases to stop", async () => {
@@ -533,6 +539,25 @@ describe("certification harness", () => {
     for (const machine of ["a", "b"]) expect(existsSync(join(evidenceDirectory, `machine-${machine}`, "observability-stop.json"))).toBe(true);
   });
 
+  it("reports a restore failure instead of marking the mutation finished", async () => {
+    const evidenceDirectory = mkdtempSync(join(tmpdir(), "lcm-cert-v4-restore-failure-"));
+    for (const machine of ["a", "b"]) mkdirSync(join(evidenceDirectory, `machine-${machine}`));
+    const { contract } = loadCertificationContract(new URL("./contract-v4.json", import.meta.url), { requireApproved: false });
+    let clears = 0;
+    const result = await runV4ObservabilityPhases({
+      contract, evidenceDirectory, machineNames: ["machine-a", "machine-b"],
+      adminUrl: "postgresql://admin@db/lcm", caFile: "/ca", processRunner: async () => undefined,
+      containerCli: "podman", network: "network", machineB: "machine-b",
+      waitForFiles: async () => undefined,
+      mutation: async () => ({ clear: async () => { clears += 1; throw new Error("restore failed"); } }),
+    });
+    expect(clears).toBeGreaterThanOrEqual(2);
+    expect(result.barriers).toEqual(expect.arrayContaining([
+      expect.objectContaining({ step: "saturation", verdict: "barrier-timeout" }),
+      expect.objectContaining({ step: "saturation-cleanup", verdict: "fail" }),
+    ]));
+  });
+
   it("collects bounded calibration windows and counts-only connection labels", async () => {
     const { contract } = loadCertificationContract(new URL("./contract-v4.json", import.meta.url), { requireApproved: false });
     contract.observability.calibration = {
@@ -543,6 +568,7 @@ describe("certification harness", () => {
     let clock = 0;
     let cpu = 0;
     let calls = 0;
+    const boundaries: string[] = [];
     const client = {
       connect: async () => undefined,
       end: async () => undefined,
@@ -573,21 +599,30 @@ describe("certification harness", () => {
       clientFactory: () => client,
       now: () => clock,
       delay: async (milliseconds: number) => { clock += milliseconds; },
+      onProbeWindowStart: async (pair: number) => { boundaries.push(`start-${pair}`); },
+      beforeProbeWindowEnd: async (pair: number) => { boundaries.push(`end-${pair}`); },
     });
     const probes = [1, 2, 3, 4].flatMap((pair) => ["a", "b"].map((machine) => ({
       id: `calibration-${pair}-${machine}-probe-0`, phase: `calibration-${pair}`, machine,
       startedAtMs: (pair * 2 - 1) * 1000, completedAtMs: pair * 2 * 1000,
       snapshot: { classification: "healthy" },
     })));
-    const evidence = finalizeCalibrationEvidence(raw, probes, contract);
+    const configuredPoolEvidence = { configuredPoolMax: 2, poolByMachine: { a: { configuredMax: 2 }, b: { configuredMax: 2 } } };
+    const evidence = finalizeCalibrationEvidence(raw, probes, contract, { stagedPackageSha256: "a".repeat(64), configuredPoolEvidence });
     expect(evidence.samples).toHaveLength(9);
     expect(evidence.addressLabels).toEqual({ a: true, b: true });
     expect(evidence.pairs).toHaveLength(12);
     expect(evidence.connections).toMatchObject({ verdict: "pass", sampledIncrement: 0, zeroIncrementNotZeroCost: true });
+    expect(boundaries).toEqual(["start-1", "end-1", "start-2", "end-2", "start-3", "end-3", "start-4", "end-4"]);
     const spilled = probes.map((probe, index) => index === 0 ? { ...probe, completedAtMs: 3_000 } : probe);
-    const rejected = finalizeCalibrationEvidence(raw, spilled, contract);
+    const rejected = finalizeCalibrationEvidence(raw, spilled, contract, { stagedPackageSha256: "a".repeat(64), configuredPoolEvidence });
     expect(rejected.pairs.find((pair: { pair: number; label: string }) => pair.pair === 0 && pair.label === "a")?.rejected)
       .toBe("counter-contamination-or-probe-count");
+    const structurallyTooLarge = structuredClone(contract);
+    structurallyTooLarge.configuration.poolMax = 3;
+    const tooLargeEvidence = { configuredPoolMax: 3, poolByMachine: { a: { configuredMax: 3 }, b: { configuredMax: 3 } } };
+    expect(finalizeCalibrationEvidence(raw, probes, structurallyTooLarge, { stagedPackageSha256: "a".repeat(64), configuredPoolEvidence: tooLargeEvidence }).connections.verdict).toBe("fail");
+    expect(finalizeCalibrationEvidence(raw, probes, contract, { stagedPackageSha256: "a".repeat(64), configuredPoolEvidence: { configuredPoolMax: 2, poolByMachine: { a: { configuredMax: 2 }, b: { configuredMax: 3 } } } }).connections.verdict).toBe("incomplete");
   });
 
   it("proves the two private homes contain distinct machine identities", () => {

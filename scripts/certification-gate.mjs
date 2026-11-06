@@ -1,6 +1,6 @@
 #!/usr/bin/env node
 import { createHash } from "node:crypto";
-import { closeSync, existsSync, openSync, readFileSync, readSync, writeFileSync } from "node:fs";
+import { closeSync, existsSync, mkdirSync, openSync, readFileSync, readSync, writeFileSync } from "node:fs";
 import { join, resolve } from "node:path";
 import { pathToFileURL } from "node:url";
 import { validateEvidence } from "../test/postgresql/cutover-rehearsal/check-evidence.ts";
@@ -201,6 +201,7 @@ export const OBSERVABILITY_GATE_ITEMS = Object.freeze([
   ...["steady", "partition-a", "restart-database", "saturation", "timeout", "stats-reset", "permission-loss", "extension-loss", "queue-backlog", "canary"]
     .flatMap((step) => [`alert.${step}`, `detection.${step}`, `clearance.${step}`, `correctness.${step}`]),
   "recovery.saturation", "recovery.queue-backlog", "canary-witnesses", "privacy.canary-leaks",
+  "first-success.queue-backlog",
   "privacy.secret-leaks", "overhead.machine-cpu", "overhead.database-cpu",
   "overhead.statements-per-snapshot", "overhead.connections", "steady-probe-latency.p95",
   "steady-probe-latency.max",
@@ -704,10 +705,23 @@ export function assembleGateFromEvidence(input, dependencies = {}) {
   const errors = validateEvidence(schema, gate);
   if (errors.length > 0) throw new Error(`certification gate evidence is invalid:\n${errors.join("\n")}`);
   const outputName = input.outputName ?? (loaded.contract.version === 4 ? "observability-certification-gate" : undefined);
-  const privacyManifests = loaded.contract.version === 4 ? [
-    ...['a', 'b'].map((machine) => json(join(input.evidenceDirectory, `machine-${machine}`, "secret-inventory-manifest.json"))),
-    json(join(input.evidenceDirectory, "coordinator-inventory-manifest.json")),
-  ] : undefined;
+  const privacyManifestPaths = loaded.contract.version === 4 ? [
+    ...['a', 'b'].map((machine) => join(input.evidenceDirectory, `machine-${machine}`, "secret-inventory-manifest.json")),
+    join(input.evidenceDirectory, "coordinator-inventory-manifest.json"),
+  ] : [];
+  const missingPrivacyManifests = privacyManifestPaths.filter((path) => !existsSync(path));
+  const privacyManifests = missingPrivacyManifests.length === 0 && privacyManifestPaths.length > 0
+    ? privacyManifestPaths.map(json) : undefined;
+  if (loaded.contract.version === 4 && missingPrivacyManifests.length > 0) {
+    mkdirSync(input.outputDirectory, { recursive: true });
+    const diagnostic = join(input.outputDirectory, "observability-certification-gate.private.json");
+    writeFileSync(diagnostic, `${JSON.stringify({
+      publicationRefused: "missing-private-inventory-manifests",
+      missingCount: missingPrivacyManifests.length,
+      gate,
+    }, null, 2)}\n`, { mode: 0o600 });
+    return { gate, paths: undefined, publicationRefused: true, diagnostic };
+  }
   return {
     gate,
     paths: writeCertificationGate(gate, input.outputDirectory, sampleFiles, {
@@ -737,7 +751,10 @@ export function parseGateArguments(argv) {
 if (process.argv[1] && import.meta.url === pathToFileURL(process.argv[1]).href) {
   try {
     const result = assembleGateFromEvidence(parseGateArguments(process.argv.slice(2)));
-    process.stdout.write(`${result.paths.json}\n${result.paths.markdown}\n`);
+    if (result.publicationRefused) {
+      process.stderr.write(`Certification gate publication refused; private diagnostic: ${result.diagnostic}\n`);
+      process.exitCode = 2;
+    } else process.stdout.write(`${result.paths.json}\n${result.paths.markdown}\n`);
   } catch (error) {
     process.stderr.write(`Certification gate failed: ${error.message}\n`);
     process.exitCode = 1;

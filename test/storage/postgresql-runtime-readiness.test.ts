@@ -1074,9 +1074,8 @@ describe("PostgreSQL runtime schema and grant readiness", () => {
     const contract = JSON.parse(readFileSync(new URL("../certification/contract-v4.json", import.meta.url), "utf8"));
     expect(fake.queries).toHaveLength(21);
     expect(contract.observability.calibration.successfulPathWireStatementCeiling).toBe(48 + 2 * fake.queries.length);
-    expect(contract.observability.calibration.idleConnectionValidationAllowancePerAcquiredConnection).toBe(1);
-    expect(contract.observability.calibration.idleConnectionValidationAllowanceMode).toBe("measured-in-smoke");
-    expect(contract.observability.calibration.measuredCallsPerProbeCeiling).toBe(48 + 2 * fake.queries.length + 1);
+    expect(contract.observability.calibration.idleConnectionValidationAllowancePerAcquiredConnection).toBeNull();
+    expect(contract.observability.calibration.idleConnectionValidationAllowanceMode).toBe("unmeasured-pending-smoke");
   });
 
   it("pins and semantically consumes deparser settings in every sensitive query", async () => {

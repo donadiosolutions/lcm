@@ -199,6 +199,14 @@ export function validateTelemetryCardinality(telemetry, { operationIds, maximumO
     }
     if (!TELEMETRY_STATUSES.has(value.status)) reasons.push(`${family}.status is invalid`);
     if (value.health !== undefined && !TELEMETRY_HEALTHS.has(value.health)) reasons.push(`${family}.health is invalid`);
+    if (family !== "statements") {
+      if (!Array.isArray(value.omitted)) reasons.push(`${family}.omitted is not an array`);
+      if (value.status === "not-applicable") {
+        if (value.health !== undefined || value.remediation !== undefined) reasons.push(`${family} not-applicable shape is invalid`);
+      } else if (!TELEMETRY_HEALTHS.has(value.health) || typeof value.remediation !== "string" || value.remediation.length === 0) {
+        reasons.push(`${family} applicable shape is missing health or remediation`);
+      }
+    } else if (value.omitted !== undefined && !object(value.omitted)) reasons.push("statements.omitted is not an object");
     if (typeof value.observedAt !== "number" || !Number.isFinite(value.observedAt)) reasons.push(`${family}.observedAt is invalid`);
     validateOmitted(value.omitted, family, reasons, family === "statements"
       ? new Set(["statementsDeallocTotal", "statementsStatsReset", "blockSize"]) : TELEMETRY_VALUE_FIELDS[family]);
@@ -207,13 +215,23 @@ export function validateTelemetryCardinality(telemetry, { operationIds, maximumO
       const requiredFields = [...TELEMETRY_VALUE_FIELDS[family]];
       if (value.health !== "unavailable" || value.remediation !== OBSERVABILITY_ACTIONS.unavailable
         || omissions.length !== requiredFields.length
-        || !requiredFields.every((field) => omissions.some((entry) => entry.field === field && entry.reason === value.status))) {
+        || !requiredFields.every((field) => omissions.some((entry) => entry.field === field && entry.reason === value.status))
+        || requiredFields.some((field) => family === "extensions" ? value.entries.length > 0 : Object.hasOwn(value, field))) {
         reasons.push(`${family} failure filler is invalid`);
+      }
+    } else if (family !== "statements" && value.status !== "not-applicable") {
+      const omissions = Array.isArray(value.omitted) ? value.omitted : [];
+      for (const field of TELEMETRY_VALUE_FIELDS[family]) {
+        const present = family === "extensions"
+          ? Array.isArray(value.entries) && value.entries.some((entry) => entry?.name === field)
+          : Object.hasOwn(value, field);
+        const omitted = omissions.some((entry) => entry?.field === field);
+        if (present === omitted) reasons.push(`${family}.${field} must be present or omitted exclusively`);
       }
     }
   }
   if (telemetry?.statements?.scope !== "aggregate") reasons.push("statements.scope is invalid");
-  if (!MIGRATION_HISTORY_STATUSES.has(telemetry?.migration?.historyStatus)) reasons.push("migration.historyStatus is invalid");
+  if (telemetry?.migration?.status !== "not-applicable" && !MIGRATION_HISTORY_STATUSES.has(telemetry?.migration?.historyStatus)) reasons.push("migration.historyStatus is invalid");
   const operations = telemetry?.statements?.operations;
   if (operations !== undefined && !Array.isArray(operations)) reasons.push("statements.operations is not an array");
   if (["observed", "partial", "reset"].includes(telemetry?.statements?.status) && !Array.isArray(operations)) {
@@ -244,7 +262,7 @@ export function validateTelemetryCardinality(telemetry, { operationIds, maximumO
     }
   }
   const entries = telemetry?.extensions?.entries;
-  if (!Array.isArray(entries)) reasons.push("extensions.entries is missing");
+  if (telemetry?.extensions?.status !== "not-applicable" && !Array.isArray(entries)) reasons.push("extensions.entries is missing");
   if (Array.isArray(entries)) {
     const failureFiller = FAILURE_STATUSES.has(telemetry.extensions.status)
       && telemetry.extensions.health === "unavailable"
@@ -331,10 +349,11 @@ export function createProbeSchedule({ phase, machine, appliedAtMs, holdMaximumMs
 export function evaluateSaturationWitness(observations) {
   const induced = observations.filter((observation) => observation?.pool?.waiting > 0);
   if (induced.length === 0) return { verdict: "incomplete", reason: "waiting was never established" };
-  const pass = induced.some((observation) => observation.pool.origin === "daemon" && observation.pool.status === "ready"
+  const observation = induced[0];
+  const pass = observation.pool.origin === "daemon" && observation.pool.status === "ready"
     && observation.telemetry?.pool?.status === "observed" && observation.telemetry.pool.health === "degraded"
     && observation.telemetry.pool.saturationRatio >= 1 && observation.pool.failed === false
-    && observation.telemetry.pool.remediation === OBSERVABILITY_ACTIONS.poolSaturated);
+    && observation.telemetry.pool.remediation === OBSERVABILITY_ACTIONS.poolSaturated;
   return { verdict: pass ? "pass" : "fail", reason: pass ? null : "established saturation had incorrect telemetry" };
 }
 
@@ -357,15 +376,18 @@ export function evaluatePhaseProbeEvidence({ phase, probes, fault, baseline, bac
   const afterApply = probes.filter((probe) => probe.startedAtMs >= appliedAtMs);
   const healthyAfterClear = probes.filter((probe) => probe.startedAtMs >= clearedAtMs && healthySnapshot(probe.snapshot));
   const result = { alert: undefined, detectionSeconds: undefined, clearanceSeconds: undefined, recovery: undefined };
-  let positiveBacklog;
+  const forbiddenTransport = !["partition-a", "restart-database", "queue-backlog"].includes(phase)
+    && probes.some((probe) => probe.transportFailure === true);
   const detected = (record) => {
     result.alert = true;
     result.detectionSeconds = (record.completedAtMs - appliedAtMs) / 1000;
   };
   const matchesByMachine = (predicate, machines = ["a", "b"]) => machines.map((machine) => afterApply.find((probe) => probe.machine === machine && predicate(probe)));
   if (phase === "saturation") {
-    const state = evaluateSaturationWitness(afterApply.map((probe) => probe.snapshot));
-    const match = afterApply.find((probe) => evaluateSaturationWitness([probe.snapshot]).verdict === "pass");
+    const bProbes = afterApply.filter((probe) => probe.machine === "b").sort((left, right) => left.sequence - right.sequence);
+    const state = evaluateSaturationWitness(bProbes.map((probe) => probe.snapshot));
+    const firstWaiting = bProbes.find((probe) => probe.snapshot?.pool?.waiting > 0);
+    const match = state.verdict === "pass" ? firstWaiting : undefined;
     if (match) detected(match); else result.alert = state.verdict === "fail" ? false : undefined;
   } else if (phase === "timeout") {
     const matches = matchesByMachine((probe) => evaluateTimeoutShape(probe.snapshot).verdict === "pass");
@@ -402,35 +424,41 @@ export function evaluatePhaseProbeEvidence({ phase, probes, fault, baseline, bac
   } else if (phase === "queue-backlog") {
     const outage = afterApply.find((probe) => probe.transportFailure === true || ["timeout", "unavailable"].includes(probe.snapshot?.classification));
     if (outage) result.detectionSeconds = (outage.completedAtMs - appliedAtMs) / 1000;
-    const positive = probes.find((probe) => probe.startedAtMs >= clearedAtMs
-      && probe.snapshot?.telemetry?.queue?.health === "degraded"
-      && probe.snapshot.telemetry.queue.remediation === OBSERVABILITY_ACTIONS.backlog
-      && probe.snapshot.telemetry.queue.inboxQuarantined === 0);
+    const firstSuccessful = probes.filter((probe) => probe.machine === "b" && probe.startedAtMs >= clearedAtMs
+      && probe.transportFailure !== true && probe.snapshot).sort((left, right) => left.sequence - right.sequence)[0];
+    if (firstSuccessful) result.firstSuccessSeconds = (firstSuccessful.completedAtMs - clearedAtMs) / 1000;
+    const positive = firstSuccessful?.snapshot?.telemetry?.queue?.health === "degraded"
+      && firstSuccessful.snapshot.telemetry.queue.remediation === OBSERVABILITY_ACTIONS.backlog
+      && firstSuccessful.snapshot.telemetry.queue.inboxQuarantined === 0 ? firstSuccessful : undefined;
     if (positive && backlogWitness?.before?.created_at && backlogDetection?.delivery_state
       && ["pending", "retry"].includes(backlogDetection.delivery_state)
-      && backlogDetection.event_uuid === backlogWitness.before.event_uuid) {
+      && backlogDetection.event_uuid === backlogWitness.before.event_uuid && backlogDetection.id === positive.id) {
       const createdAtMs = Date.parse(`${String(backlogWitness.before.created_at).replace(" ", "T")}Z`);
       const bracket = backlogAgeBracket({ createdAtMs, requestStartMs: positive.startedAtMs, responseEndMs: positive.completedAtMs });
       const age = positive.snapshot.telemetry.queue.outboxOldestPendingAgeSeconds;
       result.alert = Number.isInteger(age) && age >= bracket.minimum && age <= bracket.maximum;
-      if (result.alert) positiveBacklog = positive;
-    } else result.alert = positive ? false : undefined;
+    } else result.alert = firstSuccessful ? false : undefined;
   } else if (phase === "partition-a") {
     const affected = afterApply.filter((probe) => probe.machine === "a");
-    const failure = affected.find((probe) => probe.transportFailure === true || ["timeout", "unavailable"].includes(probe.snapshot?.classification));
+    const failure = affected.find((probe) => probe.transportFailure === true || (["timeout", "unavailable"].includes(probe.snapshot?.classification)
+      && probe.snapshot?.pool?.origin === "daemon" && probe.snapshot.pool.status === "ready"
+      && ["migration", "extensions", "queue"].every((family) => ["timeout", "unavailable"].includes(probe.snapshot.telemetry?.[family]?.status))));
     const bDuring = afterApply.filter((probe) => probe.machine === "b" && probe.startedAtMs <= clearedAtMs);
     const bHealthy = bDuring.length > 0 && bDuring.every((probe) => healthySnapshot(probe.snapshot));
     if (failure) { detected(failure); result.alert = bHealthy; } else result.alert = affected.length > 0 ? false : undefined;
   } else if (phase === "canary") {
     result.alert = afterApply.length > 0 && afterApply.every((probe) => healthySnapshot(probe.snapshot));
-    result.detectionSeconds = result.alert ? 0 : undefined;
+    const first = afterApply.sort((left, right) => left.startedAtMs - right.startedAtMs)[0];
+    result.detectionSeconds = result.alert && first ? (first.completedAtMs - appliedAtMs) / 1000 : undefined;
   }
+  if (forbiddenTransport) result.alert = false;
   const healthyClearanceByMachine = ["a", "b"].map((machine) => {
     const record = healthyAfterClear.find((probe) => probe.machine === machine);
+    if (record) (result.clearanceIds ??= {})[machine] = record.id;
     return record ? (record.completedAtMs - clearedAtMs) / 1000 : Number.POSITIVE_INFINITY;
   });
   if (healthyAfterClear.length > 0) result.clearanceSeconds = Math.max(...healthyClearanceByMachine);
-  if (phase === "queue-backlog" && positiveBacklog) result.clearanceSeconds = (positiveBacklog.completedAtMs - clearedAtMs) / 1000;
+  if (phase === "queue-backlog") result.healthyClearanceSeconds = Math.max(...healthyClearanceByMachine);
   result.recovery = phase === "queue-backlog" ? healthyClearanceByMachine.every(Number.isFinite) : Number.isFinite(result.clearanceSeconds);
   return result;
 }
@@ -604,34 +632,44 @@ function boundedVerdict(value, maximum) {
   return !Number.isFinite(value) ? "incomplete" : value <= maximum ? "pass" : "fail";
 }
 
-export function buildObservabilitySummary({ contractSha256, runId, probes = [], probeCompleteness, phaseResults = {}, canary, privacy, calibration, connections } = {}) {
+export function buildObservabilitySummary({ contractSha256, runId, contract, probes = [], probeCompleteness, phaseResults = {}, canary, privacy, calibration, connections } = {}) {
   const items = [];
   const expectedProbeIds = probes.filter((probe) => probe.expected === true).map((probe) => probe.id);
   const actualProbes = probes.filter((probe) => probe.expected !== true);
   const completeness = probeCompleteness ?? evaluateProbePopulation({ expectedIds: expectedProbeIds, records: actualProbes, maximumStartGapMs: 7_500 });
   items.push(summaryItem("probe-completeness", completeness.verdict, completeness.actual ?? actualProbes.length, completeness.expected ?? expectedProbeIds.length, "expected probe multiplicities and bounded start gaps"));
   const completed = actualProbes.filter((probe) => probe.transportFailure !== true && probe.snapshot);
+  const steadyAll = actualProbes.filter((probe) => probe.phase === "steady");
   const steady = completed.filter((probe) => probe.phase === "steady");
-  const steadyHealthy = steady.length > 0 && steady.every((probe) => probe.snapshot.classification === "healthy");
-  items.push(summaryItem("telemetry.steady-healthy", steady.length === 0 ? "incomplete" : booleanVerdict(steadyHealthy), steadyHealthy ? 1 : 0));
-  const freshnessBreach = completed.some((probe) => probe.durationMs > 2_500
+  const steadyHealthy = steadyAll.length > 0 && steadyAll.every((probe) => probe.transportFailure !== true && healthySnapshot(probe.snapshot));
+  items.push(summaryItem("telemetry.steady-healthy", steadyAll.length === 0 ? "incomplete" : booleanVerdict(steadyHealthy), steadyHealthy ? 1 : 0));
+  const completedResponseMaximum = contract?.observability?.probe?.completedResponseMaxMs ?? 2_500;
+  const forbiddenTransportFailures = actualProbes.filter((probe) => probe.transportFailure === true
+    && !["partition-a", "restart-database", "queue-backlog"].includes(probe.phase));
+  const freshnessBreach = forbiddenTransportFailures.length > 0 || completed.some((probe) => probe.durationMs > completedResponseMaximum
     || !Number.isFinite(probe.startedAtMs) || !Number.isFinite(probe.completedAtMs)
     || Object.values(probe.snapshot.telemetry ?? {}).some((family) => typeof family?.observedAt !== "number"
       || !Number.isFinite(family.observedAt) || family.observedAt < probe.startedAtMs || family.observedAt > probe.completedAtMs));
-  items.push(summaryItem("telemetry.freshness", completed.length === 0 ? "incomplete" : freshnessBreach ? "fail" : "pass", freshnessBreach ? 1 : 0, 0));
-  const cardinalityFailures = completed.filter((probe) => probe.cardinality?.verdict !== "pass").length;
-  items.push(summaryItem("telemetry.cardinality", completed.length === 0 ? "incomplete" : cardinalityFailures > 0 ? "fail" : "pass", cardinalityFailures, 0));
+  items.push(summaryItem("telemetry.freshness", completed.length === 0 && forbiddenTransportFailures.length === 0 ? "incomplete" : freshnessBreach ? "fail" : "pass", freshnessBreach ? 1 : 0, 0));
+  const cardinalityFailures = completed.filter((probe) => probe.cardinality?.verdict !== "pass").length + forbiddenTransportFailures.length;
+  items.push(summaryItem("telemetry.cardinality", completed.length === 0 && forbiddenTransportFailures.length === 0 ? "incomplete" : cardinalityFailures > 0 ? "fail" : "pass", cardinalityFailures, 0));
   for (const step of OBSERVABILITY_STEPS) {
     const result = phaseResults[step];
     items.push(summaryItem(`alert.${step}`, booleanVerdict(result?.alert)));
-    const detectionMaximum = step === "steady" ? 10 : 10;
+    const detectionMaximum = contract?.observability?.probe?.detectionMaxSeconds ?? 10;
     items.push(summaryItem(`detection.${step}`, boundedVerdict(result?.detectionSeconds, detectionMaximum), Number.isFinite(result?.detectionSeconds) ? result.detectionSeconds : 0, detectionMaximum, "appliedAt to qualifying response completion"));
-    const clearanceMaximum = ["partition-a", "restart-database", "queue-backlog"].includes(step) ? 30 : 10;
+    const clearanceKey = step === "partition-a" ? "partition" : step === "restart-database" ? "restart"
+      : step === "permission-loss" ? "permissionLoss" : step === "extension-loss" ? "extensionLoss"
+        : step === "stats-reset" ? "statsReset" : step === "queue-backlog" ? "backlogHealthy" : step;
+    const clearanceMaximum = contract?.observability?.clearanceSeconds?.[clearanceKey] ?? 10;
     items.push(summaryItem(`clearance.${step}`, boundedVerdict(result?.clearanceSeconds, clearanceMaximum), Number.isFinite(result?.clearanceSeconds) ? result.clearanceSeconds : 0, clearanceMaximum));
     items.push(summaryItem(`correctness.${step}`, booleanVerdict(result?.correctness)));
   }
   items.push(summaryItem("recovery.saturation", booleanVerdict(phaseResults.saturation?.recovery)));
   items.push(summaryItem("recovery.queue-backlog", booleanVerdict(phaseResults["queue-backlog"]?.recovery)));
+  const backlogFirstSuccess = phaseResults["queue-backlog"]?.firstSuccessSeconds;
+  const backlogFirstSuccessMaximum = contract?.observability?.clearanceSeconds?.backlog ?? 30;
+  items.push(summaryItem("first-success.queue-backlog", boundedVerdict(backlogFirstSuccess, backlogFirstSuccessMaximum), Number.isFinite(backlogFirstSuccess) ? backlogFirstSuccess : 0, backlogFirstSuccessMaximum));
   const canaryWitnesses = canary && JSON.stringify(canary.expected) === JSON.stringify(canary.observed);
   items.push(summaryItem("canary-witnesses", canary === undefined ? "incomplete" : booleanVerdict(canaryWitnesses)));
   const canaryHits = privacy?.canaryHits;
@@ -650,8 +688,11 @@ export function buildObservabilitySummary({ contractSha256, runId, probes = [], 
   const latencies = steady.map((probe) => probe.durationMs).filter(Number.isFinite).sort((left, right) => left - right);
   const p95 = latencies.length === 0 ? 0 : latencies[Math.ceil(latencies.length * 0.95) - 1];
   const maximum = latencies.length === 0 ? 0 : Math.max(...latencies);
-  items.push(summaryItem("steady-probe-latency.p95", latencies.length < 200 ? "incomplete" : p95 <= 2_000 ? "pass" : "fail", p95, 2_000));
-  items.push(summaryItem("steady-probe-latency.max", latencies.length === 0 ? "incomplete" : maximum <= 2_500 ? "pass" : "fail", maximum, 2_500));
+  const p95Maximum = contract?.observability?.probe?.steadyP95MaxMs ?? 2_000;
+  const p95Minimum = contract?.observability?.probe?.steadyP95MinimumSamples ?? 200;
+  const steadyMaximum = contract?.observability?.probe?.steadyMaximumMs ?? 2_500;
+  items.push(summaryItem("steady-probe-latency.p95", latencies.length < p95Minimum ? "incomplete" : p95 <= p95Maximum ? "pass" : "fail", p95, p95Maximum));
+  items.push(summaryItem("steady-probe-latency.max", latencies.length === 0 ? "incomplete" : maximum <= steadyMaximum ? "pass" : "fail", maximum, steadyMaximum));
   return {
     schemaVersion: 1,
     contract: { version: 4, sha256: contractSha256 },

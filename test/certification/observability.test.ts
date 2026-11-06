@@ -157,6 +157,19 @@ describe("observability certification helpers", () => {
     malformed.extensions.entries[0].status = "invented";
     malformed.statements.scope = "selected";
     expect(validateTelemetryCardinality(malformed, { operationIds: ["conversations.getMessages"], maximumOperations: 64 }).verdict).toBe("fail");
+    const missingRequired = validTelemetry() as any;
+    delete missingRequired.pool.health;
+    delete missingRequired.migration.remediation;
+    missingRequired.queue.omitted = {};
+    expect(validateTelemetryCardinality(missingRequired, { operationIds: ["conversations.getMessages"], maximumOperations: 64 }).verdict).toBe("fail");
+    const unaccounted = validTelemetry() as any;
+    delete unaccounted.queue.replayLagSeconds;
+    expect(validateTelemetryCardinality(unaccounted, { operationIds: ["conversations.getMessages"], maximumOperations: 64 }).reasons)
+      .toContain("queue.replayLagSeconds must be present or omitted exclusively");
+    const contradictory = validTelemetry() as any;
+    contradictory.queue.omitted = [{ field: "replayLagSeconds", reason: "no-entry" }];
+    expect(validateTelemetryCardinality(contradictory, { operationIds: ["conversations.getMessages"], maximumOperations: 64 }).reasons)
+      .toContain("queue.replayLagSeconds must be present or omitted exclusively");
   });
 
   it("accepts both legal timeout shapes and rejects a non-timeout classification", () => {
@@ -210,6 +223,10 @@ describe("observability certification helpers", () => {
     expect(evaluateSaturationWitness([{ pool: { origin: "daemon", status: "ready", waiting: 1, failed: false }, telemetry: { pool: { status: "observed", health: "degraded", saturationRatio: 1, remediation: RUNTIME_HEALTH_ACTIONS.poolSaturated } } }]).verdict).toBe("pass");
     expect(evaluateSaturationWitness([{ pool: { origin: "daemon", status: "ready", waiting: 0, failed: false }, telemetry: { pool: { status: "observed", health: "healthy", saturationRatio: 1, remediation: RUNTIME_HEALTH_ACTIONS.healthy } } }]).verdict).toBe("incomplete");
     expect(evaluateSaturationWitness([{ pool: { origin: "daemon", status: "ready", waiting: 1, failed: false }, telemetry: { pool: { status: "observed", health: "healthy", saturationRatio: 1, remediation: RUNTIME_HEALTH_ACTIONS.healthy } } }]).verdict).toBe("fail");
+    expect(evaluateSaturationWitness([
+      { pool: { origin: "daemon", status: "ready", waiting: 1, failed: false }, telemetry: { pool: { status: "observed", health: "healthy", saturationRatio: 1, remediation: RUNTIME_HEALTH_ACTIONS.healthy } } },
+      { pool: { origin: "daemon", status: "ready", waiting: 1, failed: false }, telemetry: { pool: { status: "observed", health: "degraded", saturationRatio: 1, remediation: RUNTIME_HEALTH_ACTIONS.poolSaturated } } },
+    ]).verdict).toBe("fail");
   });
 
   it("brackets backlog age using request and response times", () => {
@@ -221,22 +238,30 @@ describe("observability certification helpers", () => {
     const appliedAt = Date.parse("2026-11-05T00:00:00Z");
     const clearedAt = appliedAt + 960_000;
     const probes = [
-      { machine: "b", startedAtMs: appliedAt, completedAtMs: appliedAt + 5_000, transportFailure: true },
-      { machine: "a", startedAtMs: clearedAt, completedAtMs: clearedAt + 1_000, snapshot: { ...healthySnapshotFixture(), telemetry: validTelemetry() } },
-      { machine: "b", startedAtMs: clearedAt, completedAtMs: clearedAt + 5_000, snapshot: {
+      { id: "queue-backlog-b-probe-0", machine: "b", sequence: 0, startedAtMs: appliedAt, completedAtMs: appliedAt + 5_000, transportFailure: true },
+      { id: "queue-backlog-a-probe-0", machine: "a", sequence: 0, startedAtMs: clearedAt, completedAtMs: clearedAt + 1_000, snapshot: { ...healthySnapshotFixture(), telemetry: validTelemetry() } },
+      { id: "queue-backlog-b-probe-1", machine: "b", sequence: 1, startedAtMs: clearedAt, completedAtMs: clearedAt + 5_000, snapshot: {
         ...healthySnapshotFixture(), classification: "degraded", telemetry: {
           ...validTelemetry(), queue: { ...healthyFamily({ health: "degraded", remediation: RUNTIME_HEALTH_ACTIONS.backlog, outboxOldestPendingAgeSeconds: 965, inboxQuarantined: 0 }) },
         },
       } },
-      { machine: "b", startedAtMs: clearedAt + 6_000, completedAtMs: clearedAt + 7_000, snapshot: { ...healthySnapshotFixture(), telemetry: validTelemetry() } },
+      { id: "queue-backlog-b-probe-2", machine: "b", sequence: 2, startedAtMs: clearedAt + 6_000, completedAtMs: clearedAt + 7_000, snapshot: { ...healthySnapshotFixture(), telemetry: validTelemetry() } },
     ];
     const result = evaluatePhaseProbeEvidence({
       phase: "queue-backlog", probes,
       fault: { appliedAt: new Date(appliedAt).toISOString(), clearedAt: new Date(clearedAt).toISOString() },
       backlogWitness: { before: { event_uuid: "row", created_at: created } },
-      backlogDetection: { event_uuid: "row", delivery_state: "pending" },
+      backlogDetection: { id: "queue-backlog-b-probe-1", event_uuid: "row", delivery_state: "pending" },
     });
-    expect(result).toMatchObject({ alert: true, detectionSeconds: 5, clearanceSeconds: 5, recovery: true });
+    expect(result).toMatchObject({ alert: true, detectionSeconds: 5, firstSuccessSeconds: 5, healthyClearanceSeconds: 7, recovery: true });
+    const wrongFirst = structuredClone(probes);
+    wrongFirst.splice(2, 0, { id: "queue-backlog-b-probe-first", machine: "b", sequence: 1, startedAtMs: clearedAt, completedAtMs: clearedAt + 2_000, snapshot: { ...healthySnapshotFixture(), telemetry: validTelemetry() } });
+    expect(evaluatePhaseProbeEvidence({
+      phase: "queue-backlog", probes: wrongFirst,
+      fault: { appliedAt: new Date(appliedAt).toISOString(), clearedAt: new Date(clearedAt).toISOString() },
+      backlogWitness: { before: { event_uuid: "row", created_at: created } },
+      backlogDetection: { id: "queue-backlog-b-probe-1", event_uuid: "row", delivery_state: "pending" },
+    }).alert).toBe(false);
   });
 
   it("fails exact phase predicates for wrong actions and non-advanced reset epochs", () => {
@@ -401,6 +426,25 @@ describe("observability certification helpers", () => {
       const summary = buildObservabilitySummary({ contractSha256: "a".repeat(64), probes: [expected, probe(telemetry)] });
       expect(summary.items.find((item) => item.id === "telemetry.freshness")?.verdict).toBe("fail");
     }
+  });
+
+  it("fails healthy-phase transport and reads evaluator bounds from the selected contract", () => {
+    const contract = JSON.parse(readFileSync(new URL("./contract-v4.json", import.meta.url), "utf8"));
+    contract.observability.probe.detectionMaxSeconds = 7;
+    contract.observability.clearanceSeconds.timeout = 6;
+    contract.observability.probe.steadyMaximumMs = 15;
+    const summary = buildObservabilitySummary({
+      contractSha256: "a".repeat(64), runId: "run", contract,
+      probes: [{ id: "steady-a-probe-0", machine: "a", phase: "steady", sequence: 0,
+        startedAtMs: 0, completedAtMs: 5, durationMs: 5, transportFailure: true }],
+      probeCompleteness: { verdict: "pass", expected: 1, actual: 1 },
+      phaseResults: { timeout: { alert: true, detectionSeconds: 8, clearanceSeconds: 7 } },
+    });
+    expect(summary.items.find((item) => item.id === "telemetry.steady-healthy")?.verdict).toBe("fail");
+    expect(summary.items.find((item) => item.id === "telemetry.freshness")?.verdict).toBe("fail");
+    expect(summary.items.find((item) => item.id === "detection.timeout")).toMatchObject({ threshold: 7, verdict: "fail" });
+    expect(summary.items.find((item) => item.id === "clearance.timeout")).toMatchObject({ threshold: 6, verdict: "fail" });
+    expect(summary.items.find((item) => item.id === "steady-probe-latency.max")?.threshold).toBe(15);
   });
 
   it("keeps a known secret leak failed even when inventory coverage is incomplete", () => {

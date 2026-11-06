@@ -10,7 +10,7 @@ import { NODE_IMAGE, POSTGRES_IMAGE } from "./postgresql-images.mjs";
 import { assertCertificationRunPolicy, certificationDeadlineSeconds, loadCertificationContract } from "../test/certification/contract.mjs";
 import { publishPostgreSqlBackend } from "../test/certification/backend-publication.mjs";
 import { createDeterministicSchedule, createFaultSchedule, createObservabilityWorkloadSchedule, observabilityPhaseWorkloadSeconds } from "../test/certification/schedule.mjs";
-import { createCanaryWorkload } from "../test/certification/canary-corpus.mjs";
+import { CANARY_CORPUS, createCanaryWorkload } from "../test/certification/canary-corpus.mjs";
 import { REQUIRED_MACHINE_INVENTORY_CATEGORIES, buildObservabilitySummary, createInventoryManifest, createProbeSchedule, evaluateBarrierSequence, evaluateCalibrationPairs, evaluatePhaseProbeEvidence, evaluatePhaseWorkload, evaluateProbePopulation, healthySnapshot, scanSurface } from "../test/certification/observability.mjs";
 import { observerReadSettings } from "../test/certification/sqlite-observer-worker.mjs";
 import { createOwnerIdentity, createProcessLifecycle, createRunNames, ownershipLabels, removeOwnedResource, runHarness, runSanitizedProcess } from "./postgresql-harness.mjs";
@@ -1203,6 +1203,8 @@ export async function collectCalibrationEvidence({
   caFile,
   runtimeRole,
   clientFactory,
+  onProbeWindowStart = async () => undefined,
+  beforeProbeWindowEnd = async () => undefined,
   delay = (milliseconds) => new Promise((resolve) => setTimeout(resolve, milliseconds)),
   now = Date.now,
 }) {
@@ -1236,6 +1238,7 @@ export async function collectCalibrationEvidence({
     for (let second = 0; second <= totalSeconds; second += 1) {
       const target = startAtMs + second * 1000;
       if (target > now()) await delay(target - now());
+      if (second > 0 && second % windowSeconds === 0) await beforeProbeWindowEnd(second / windowSeconds);
       const sampleStartedAtMs = now();
       const connections = (await client.query(`SELECT COALESCE(client_addr::text, 'local') AS client_address,
         pg_catalog.count(*)::integer AS connections
@@ -1274,6 +1277,9 @@ export async function collectCalibrationEvidence({
       }
       sample.observedAtMs = now();
       samples.push(sample);
+      if (second % windowSeconds === definition.baselineWindowSeconds) {
+        await onProbeWindowStart(Math.floor(second / windowSeconds) + 1, sample);
+      }
     }
   } finally {
     await client.end().catch(() => undefined);
@@ -1281,7 +1287,7 @@ export async function collectCalibrationEvidence({
   return { startAt, samples, quotas, addressLabels: { a: Boolean(inspect.a), b: Boolean(inspect.b) } };
 }
 
-export function finalizeCalibrationEvidence(raw, probes, contract) {
+export function finalizeCalibrationEvidence(raw, probes, contract, { stagedPackageSha256, configuredPoolEvidence } = {}) {
   const { startAt, samples, quotas, addressLabels } = raw;
   const definition = contract.observability.calibration;
   const windowSeconds = definition.baselineWindowSeconds + definition.probeWindowSeconds;
@@ -1298,7 +1304,7 @@ export function finalizeCalibrationEvidence(raw, probes, contract) {
       || middle.statements.calls < first.statements.calls || last.statements.calls < middle.statements.calls
       || middle.statements.xact_commit < first.statements.xact_commit || last.statements.xact_commit < middle.statements.xact_commit
       || middle.statements.xact_rollback < first.statements.xact_rollback || last.statements.xact_rollback < middle.statements.xact_rollback
-      || (middle.statements.calls - first.statements.calls) / definition.baselineWindowSeconds > definition.idleRuntimeRoleCallsPerSecondCeiling;
+      || (middle.statements.calls - first.statements.calls) / ((middle.observedAtMs - first.observedAtMs) / 1000) > definition.idleRuntimeRoleCallsPerSecondCeiling;
     for (const label of ["a", "b", "database"]) {
       const qualifying = probes.filter((probe) => probe.phase === `calibration-${pair + 1}`
         && (label === "database" || probe.machine === label) && probe.transportFailure !== true && probe.snapshot
@@ -1348,8 +1354,8 @@ export function finalizeCalibrationEvidence(raw, probes, contract) {
     definition: "incremental database CPU-seconds over each combined two-machine probe interval divided by elapsed interval seconds and recorded database CPU quota",
   };
   const statements = evaluateCalibrationPairs(statementPairs, {
-    approvedCeiling: definition.measuredCallsPerProbeCeiling,
-    approvedNoiseCeiling: definition.measuredCallsPerProbeCeiling,
+    approvedCeiling: definition.successfulPathWireStatementCeiling,
+    approvedNoiseCeiling: definition.successfulPathWireStatementCeiling,
   });
   const perMachineConnections = ["a", "b"].map((machineLabel) => {
     const probeRecords = probes.filter((probe) => probe.machine === machineLabel && String(probe.phase).startsWith("calibration-") && probe.transportFailure !== true && probe.snapshot);
@@ -1375,10 +1381,22 @@ export function finalizeCalibrationEvidence(raw, probes, contract) {
     }
     const sampledIncrement = Math.max(0, ...increments);
     const unknown = samples.some((sample) => sample.connectionCounts.unknown > 0);
-    const definiteFailure = sampledIncrement > definition.sampledConnectionIncrementCeiling || residualBreach;
+    const machineProbes = probeRecords.slice().sort((left, right) => left.startedAtMs - right.startedAtMs);
+    const singleFlight = machineProbes.every((probe, index) => index === 0 || probe.startedAtMs >= machineProbes[index - 1].completedAtMs);
+    const observedPoolMaxima = [configuredPoolEvidence?.configuredPoolMax,
+      configuredPoolEvidence?.poolByMachine?.a?.configuredMax,
+      configuredPoolEvidence?.poolByMachine?.b?.configuredMax];
+    const observedPoolMax = observedPoolMaxima.every((value) => value === contract.configuration.poolMax)
+      ? contract.configuration.poolMax : undefined;
+    const structuralMaximum = observedPoolMax === undefined ? Number.NaN : observedPoolMax + 1;
+    const structuralComplete = Number.isSafeInteger(contract.configuration.poolMax) && contract.configuration.poolMax > 0
+      && observedPoolMax !== undefined && singleFlight && /^[0-9a-f]{64}$/u.test(stagedPackageSha256 ?? "");
+    const definiteFailure = sampledIncrement > definition.sampledConnectionIncrementCeiling || residualBreach || structuralMaximum > 3;
     const verdict = definiteFailure ? "fail"
-      : !complete || unknown || coveredIntervals !== probeRecords.length || probeRecords.length === 0 ? "incomplete" : "pass";
-    return { machine: machineLabel, verdict, sampledIncrement, residualBreach, structuralMaximum: 3,
+      : !complete || unknown || coveredIntervals !== probeRecords.length || probeRecords.length === 0 || !structuralComplete ? "incomplete" : "pass";
+    return { machine: machineLabel, verdict, sampledIncrement, residualBreach, structuralMaximum,
+      structural: { configuredPoolMax: observedPoolMax, pinnedPoolMax: contract.configuration.poolMax,
+        cancellationAllowance: 1, singleFlight, stagedPackageSha256 },
       activeIntervals: probeRecords.length, sampledActiveIntervals: coveredIntervals, zeroIncrementNotZeroCost: sampledIncrement === 0 };
   });
   const connections = {
@@ -1475,15 +1493,18 @@ async function createPostgreSqlFaultMutation(phase, { adminUrl, caFile, processR
   let finished = false;
   const finish = async (sql) => {
     if (finished) return;
-    finished = true;
-    try { if (sql) await client.query(sql); }
+    try {
+      if (sql) await client.query(sql);
+      finished = true;
+    }
     finally { await client.end().catch(() => undefined); }
   };
   try {
     if (phase === "saturation") {
       await client.query("BEGIN");
       await client.query("LOCK TABLE lcm.promoted_memories IN ACCESS EXCLUSIVE MODE");
-      return { clear: () => finish("COMMIT") };
+      const safety = setTimeout(() => finish("ROLLBACK").catch(() => undefined), 40_000);
+      return { clear: async () => { clearTimeout(safety); await finish("COMMIT"); } };
     }
     if (phase === "timeout") {
       await client.query("BEGIN");
@@ -1561,7 +1582,7 @@ export async function runV4ObservabilityPhases({
         await active.clear(); activeCleared = true; publishCleared();
         await waitForFiles(detectionPaths, machineNames, contract.observability.clearanceSeconds.backlog * 1000);
       } else {
-        const holdKey = phase === "saturation" ? "saturationLock" : phase === "permission-loss" ? "permissionLoss" : phase === "extension-loss" ? "extensionLoss" : phase === "stats-reset" ? "statsReset" : phase;
+        const holdKey = phase === "saturation" ? "saturationWitness" : phase === "permission-loss" ? "permissionLoss" : phase === "extension-loss" ? "extensionLoss" : phase === "stats-reset" ? "statsReset" : phase;
         await waitForFiles(detectionPaths, machineNames, (contract.observability.faultHoldMaximumSeconds[holdKey] ?? 60) * 1000);
         await active.clear(); activeCleared = true; publishCleared();
       }
@@ -1658,9 +1679,11 @@ export function reconstructObservabilitySummary({ evidenceDirectory, contract, c
     }
     for (const phase of ["partition-a", "restart-database", "saturation", "timeout", "stats-reset", "permission-loss", "extension-loss", "queue-backlog", "canary"]) {
       expectedProbeIds.push(`${phase}-${machine}-baseline`);
-      const phaseRecords = probes.filter((probe) => probe.phase === phase && probe.machine === machine && Number.isInteger(probe.sequence) && probe.sequence >= 0);
-      const maximumSequence = phaseRecords.length === 0 ? 0 : Math.max(...phaseRecords.map((probe) => probe.sequence));
-      for (let sequence = 0; sequence <= maximumSequence; sequence += 1) expectedProbeIds.push(`${phase}-${machine}-probe-${sequence}`);
+      const clearancePath = join(evidenceDirectory, `machine-${machine}`, `${phase}-clearance.json`);
+      const terminalId = existsSync(clearancePath) ? jsonFromFile(clearancePath).id : undefined;
+      const terminalSequence = typeof terminalId === "string" && /^.+-probe-\d+$/u.test(terminalId)
+        ? Number(terminalId.split("-").at(-1)) : 0;
+      for (let sequence = 0; sequence <= terminalSequence; sequence += 1) expectedProbeIds.push(`${phase}-${machine}-probe-${sequence}`);
     }
   }
   const gapRecords = probes.map((probe) => ({ ...probe }));
@@ -1699,13 +1722,17 @@ export function reconstructObservabilitySummary({ evidenceDirectory, contract, c
   const phaseDurations = Object.fromEntries(["saturation", "timeout", "stats-reset", "permission-loss", "extension-loss", "queue-backlog", "canary"]
     .map((phase) => [phase, observabilityPhaseWorkloadSeconds(contract, phase)]));
   const allSamples = ['a', 'b'].flatMap((machine) => ndjsonFromFile(join(evidenceDirectory, `machine-${machine}`, "samples.ndjson")));
+  const steadyProbes = probes.filter((probe) => probe.phase === "steady");
+  const firstSteadyByMachine = ['a', 'b'].map((machine) => steadyProbes.filter((probe) => probe.machine === machine)
+    .sort((left, right) => left.sequence - right.sequence)[0]);
+  const steadyFirstHealthySeconds = firstSteadyByMachine.every((probe) => probe && healthySnapshot(probe.snapshot))
+    ? Math.max(...firstSteadyByMachine.map((probe) => (probe.completedAtMs - steadyStartMs) / 1000)) : undefined;
   const phaseResults = {
     steady: {
-      alert: probes.some((probe) => probe.phase === "steady")
-        && probes.filter((probe) => probe.phase === "steady").every((probe) => probe.transportFailure !== true && healthySnapshot(probe.snapshot)),
-      detectionSeconds: 0,
-      clearanceSeconds: 0,
-      correctness: probes.filter((probe) => probe.phase === "steady").every((probe) => probe.transportFailure !== true && healthySnapshot(probe.snapshot)),
+      alert: steadyProbes.length > 0 && steadyProbes.every((probe) => probe.transportFailure !== true && healthySnapshot(probe.snapshot)),
+      detectionSeconds: steadyFirstHealthySeconds,
+      clearanceSeconds: steadyFirstHealthySeconds,
+      correctness: steadyProbes.every((probe) => probe.transportFailure !== true && healthySnapshot(probe.snapshot)),
     },
   };
   for (const fault of faults) {
@@ -1720,8 +1747,17 @@ export function reconstructObservabilitySummary({ evidenceDirectory, contract, c
       fault,
       baseline,
       backlogWitness: existsSync(backlogWitnessPath) ? jsonFromFile(backlogWitnessPath) : undefined,
-      backlogDetection: existsSync(backlogDetectionPath) ? jsonFromFile(backlogDetectionPath).backlogRow : undefined,
+      backlogDetection: existsSync(backlogDetectionPath) ? (() => {
+        const detection = jsonFromFile(backlogDetectionPath);
+        return detection.backlogRow ? { ...detection.backlogRow, id: detection.id } : undefined;
+      })() : undefined,
     });
+    const clearanceBindings = ['a', 'b'].map((machine) => {
+      const path = join(evidenceDirectory, `machine-${machine}`, `${phase}-clearance.json`);
+      return existsSync(path) ? jsonFromFile(path).id === evaluated.clearanceIds?.[machine] : undefined;
+    });
+    const clearanceControlBound = clearanceBindings.some((value) => value === false) ? false
+      : clearanceBindings.every((value) => value === true) ? true : undefined;
     const samplePhase = phase === "partition-a" ? "partition-recovery" : phase === "restart-database" ? "restart-recovery" : phase;
     const samples = allSamples.filter((sample) => sample.phase === samplePhase);
     const perMachineWorkload = Object.hasOwn(phaseDurations, phase) ? ['a', 'b'].map((machine) => {
@@ -1770,13 +1806,21 @@ export function reconstructObservabilitySummary({ evidenceDirectory, contract, c
       const path = join(evidenceDirectory, `machine-${machine}`, "queue-backlog-catch-up.json");
       return existsSync(path) ? jsonFromFile(path) : undefined;
     }) : [];
+    const backlogCatchUpVerdict = phase !== "queue-backlog" ? true
+      : backlogCatchUp.some((entry) => entry === undefined) ? undefined
+        : backlogCatchUp.some((entry) => entry.verdict === "fail" || entry.remaining > 0) ? false
+          : backlogCatchUp.every((entry) => entry.verdict === "pass" && entry.remaining === 0) ? true : undefined;
+    const baseCorrectness = inheritedCorrectness ?? (workloadVerdict === "pass" ? true : workloadVerdict === "fail" ? false : undefined);
+    const correctness = clearanceControlBound === false ? false : clearanceControlBound === undefined ? undefined : baseCorrectness;
+    const recovery = evaluated.recovery === false || correctness === false || backlogCatchUpVerdict === false ? false
+      : evaluated.recovery === undefined || correctness === undefined || backlogCatchUpVerdict === undefined ? undefined : true;
     phaseResults[phase] = {
       alert: evaluated.alert,
       detectionSeconds: evaluated.detectionSeconds,
-      clearanceSeconds: evaluated.clearanceSeconds,
-      correctness: inheritedCorrectness ?? (workloadVerdict === "pass" ? true : workloadVerdict === "fail" ? false : undefined),
-      recovery: evaluated.recovery === true && (inheritedCorrectness ?? workloadVerdict === "pass")
-        && (phase !== "queue-backlog" || backlogCatchUp.every((entry) => entry?.verdict === "pass" && entry.remaining === 0)),
+      clearanceSeconds: phase === "queue-backlog" ? evaluated.healthyClearanceSeconds : evaluated.clearanceSeconds,
+      firstSuccessSeconds: evaluated.firstSuccessSeconds,
+      correctness,
+      recovery,
     };
   }
   const barriersPath = join(evidenceDirectory, "observability-barriers.json");
@@ -1796,18 +1840,29 @@ export function reconstructObservabilitySummary({ evidenceDirectory, contract, c
   };
   const probeScans = probes.map((probe) => probe.scan).filter(Boolean);
   const cliScans = canaryWitnesses.flatMap((witness) => witness.cli ?? []).map((entry) => entry.scan).filter(Boolean);
-  const privateScans = ['a', 'b'].flatMap((machine) => {
+  const privateSurfaceFiles = ['a', 'b'].map((machine) => {
     const path = join(evidenceDirectory, `machine-${machine}`, "privacy-surfaces.json");
-    return existsSync(path) ? jsonFromFile(path).surfaces ?? [] : [];
+    return existsSync(path) ? jsonFromFile(path) : undefined;
   });
+  const privateScans = privateSurfaceFiles.flatMap((entry) => entry?.surfaces ?? []);
   const failureScans = ['a', 'b'].flatMap((machine) => ndjsonFromFile(join(evidenceDirectory, `machine-${machine}`, "failure-privacy.ndjson")));
+  const failureRecords = ['a', 'b'].flatMap((machine) => ndjsonFromFile(join(evidenceDirectory, `machine-${machine}`, "failures.ndjson")));
+  const retainedReceipts = ['a', 'b'].map((machine) => ndjsonFromFile(join(evidenceDirectory, `machine-${machine}`, "retained-output-privacy.ndjson")));
   const coordinatorPrivacyPath = join(evidenceDirectory, "coordinator-privacy.json");
+  const coordinatorPrivacyPersisted = existsSync(coordinatorPrivacyPath);
   let coordinatorScans;
-  if (existsSync(coordinatorPrivacyPath)) coordinatorScans = jsonFromFile(coordinatorPrivacyPath).surfaces;
+  if (coordinatorPrivacyPersisted) coordinatorScans = jsonFromFile(coordinatorPrivacyPath).surfaces;
   else {
-    coordinatorScans = ["run.json", "faults.json", "calibration-evidence.json"]
+    coordinatorScans = [
+      "run.json", "faults.json", "calibration-evidence.json", "cleanup.json",
+      "execution-provenance.json", "phase-control.json", "setup-evidence.json",
+      "database-readiness.json", "observability-barriers.json", "fault-partition-a.json",
+    ]
       .filter((name) => existsSync(join(evidenceDirectory, name)))
-      .map((name) => ({ name, ...scanSurface(readFileSync(join(evidenceDirectory, name)), coordinatorInventory, []) }));
+      .map((name) => {
+        const bytes = readFileSync(join(evidenceDirectory, name));
+        return { name, sha256: createHash("sha256").update(bytes).digest("hex"), ...scanSurface(bytes, coordinatorInventory, CANARY_CORPUS) };
+      });
     if (persist) writeFileSync(coordinatorPrivacyPath, `${JSON.stringify({ surfaces: coordinatorScans })}\n`, { mode: 0o600, flag: "wx" });
   }
   const scans = [...probeScans, ...cliScans, ...privateScans, ...failureScans, ...coordinatorScans];
@@ -1836,9 +1891,26 @@ export function reconstructObservabilitySummary({ evidenceDirectory, contract, c
     const path = join(evidenceDirectory, `machine-${machine}`, "daemon-output-coverage.json");
     return existsSync(path) ? jsonFromFile(path) : undefined;
   });
+  const requiredRetainedIds = ["migration-plan", "migration-apply", "migration-verify", "migration-activate", "identity", "readiness-doctor", "final-doctor"];
+  const retainedCoverageComplete = retainedReceipts.every((receipts) => JSON.stringify(receipts.map((receipt) => receipt.id).sort())
+    === JSON.stringify(requiredRetainedIds.slice().sort()) && receipts.every((receipt) => /^[0-9a-f]{64}$/u.test(receipt.sha256)));
+  const failureCoverageComplete = JSON.stringify(failureRecords.map((record) => record.id).sort())
+    === JSON.stringify(failureScans.map((scan) => scan.id).sort());
+  const nonTransportProbes = probes.filter((probe) => probe.transportFailure !== true);
+  const probeCoverageComplete = probeScans.length === nonTransportProbes.length
+    && nonTransportProbes.every((probe) => probe.scan && /^[0-9a-f]{64}$/u.test(probe.rawSha256));
+  const cliCoverageComplete = canaryWitnesses.length === 2 && canaryWitnesses.every((witness) => witness.cli?.length === witness.expected?.cli
+    && witness.cli.every((entry) => entry.scan && typeof entry.scan.bytes === "number"));
+  const expectedCoordinatorSurfaces = ["run.json", "faults.json", "calibration-evidence.json", "cleanup.json",
+    "execution-provenance.json", "phase-control.json", "setup-evidence.json", "database-readiness.json", "observability-barriers.json"];
+  const coordinatorCoverageComplete = JSON.stringify(coordinatorScans.map((entry) => entry.name).sort())
+    === JSON.stringify(expectedCoordinatorSurfaces.slice().sort())
+    && coordinatorScans.every((entry) => /^[0-9a-f]{64}$/u.test(entry.sha256));
   const surfacesComplete = machineManifests.every(Boolean) && coordinatorManifest !== undefined
     && ['a', 'b'].every((machine) => existsSync(join(evidenceDirectory, `machine-${machine}`, "failure-privacy.ndjson")))
-    && canaryWitnesses.length === 2 && privateScans.length > 0 && probeScans.length > 0
+    && privateSurfaceFiles.every(Boolean) && retainedCoverageComplete && failureCoverageComplete
+    && probeCoverageComplete && cliCoverageComplete && coordinatorCoverageComplete
+    && (coordinatorPrivacyPersisted || persist && coordinatorInventory.length > 0)
     && daemonCoverage.every((entry) => entry?.verdict === "pass" && entry.scannedBytes === entry.totalBytes);
   const privacy = {
     canaryHits: scans.reduce((sum, scan) => sum + (scan.canaryHits ?? 0), 0),
@@ -1866,12 +1938,13 @@ export function reconstructObservabilitySummary({ evidenceDirectory, contract, c
     statements: {
       verdict: calibrationEvidence.statements.verdict,
       observed: calibrationEvidence.statements.measuredMaximum ?? 0,
-      ceiling: contract.observability.calibration.measuredCallsPerProbeCeiling,
+      ceiling: contract.observability.calibration.successfulPathWireStatementCeiling,
     },
   } : undefined;
   const summary = buildObservabilitySummary({
     contractSha256,
     runId,
+    contract,
     probes,
     probeCompleteness,
     phaseResults,
@@ -2174,6 +2247,21 @@ export async function runLocalCertification(options, dependencies = {}) {
             caFile: context.environment.LCM_TEST_POSTGRES_CA_FILE,
             runtimeRole: "lcm_test_runtime",
             delay: dependencies.delay,
+            onProbeWindowStart: async (pair, sample) => {
+              const startAt = new Date(sample.observedAtMs).toISOString();
+              for (const machine of ['a', 'b']) writeFileSync(
+                join(options.evidenceDirectory, `machine-${machine}`, `calibration-pair-${pair}-start.json`),
+                `${JSON.stringify({ pair, startAt, counterBoundaryObservedAtMs: sample.observedAtMs })}\n`,
+                { mode: 0o600, flag: "wx" },
+              );
+            },
+            beforeProbeWindowEnd: async (pair) => {
+              await waitForFiles(
+                ['a', 'b'].map((machine) => join(options.evidenceDirectory, `machine-${machine}`, `calibration-pair-${pair}-complete.json`)),
+                [context.names.machineA, context.names.machineB],
+                contract.observability.calibration.probeWindowSeconds * 1000 + 120_000,
+              );
+            },
           });
           const calibrationAgents = waitForFiles(
             ['a', 'b'].map((machine) => join(options.evidenceDirectory, `machine-${machine}`, "calibration-complete.json")),
@@ -2183,7 +2271,10 @@ export async function runLocalCertification(options, dependencies = {}) {
           const [rawCalibration] = await Promise.all([calibrationEvidence, calibrationAgents]);
           const calibrationProbes = ['a', 'b'].flatMap((machine) => ndjsonFromFile(join(options.evidenceDirectory, `machine-${machine}`, "probes.ndjson")))
             .filter((probe) => String(probe.phase).startsWith("calibration-"));
-          const calibration = finalizeCalibrationEvidence(rawCalibration, calibrationProbes, contract);
+          const calibration = finalizeCalibrationEvidence(rawCalibration, calibrationProbes, contract, {
+            stagedPackageSha256: executionProvenance.stagedPackageSha256,
+            configuredPoolEvidence: databaseReadiness,
+          });
           writeFileSync(join(options.evidenceDirectory, "calibration-evidence.json"), `${JSON.stringify(calibration, null, 2)}\n`, { mode: 0o600, flag: "wx" });
         }
         const warmupControl = publishWarmupControl(options.evidenceDirectory, dependencies.wallNow);
@@ -2354,14 +2445,7 @@ export async function runLocalCertification(options, dependencies = {}) {
             ["transfer-role", databasePreparation.transferName],
           ].map(([category, value]) => ({ category, value, sourceClass: "coordinator", scanMode: value.length >= 8 ? "all-forms" : "boundary-token" }));
           writeFileSync(join(options.evidenceDirectory, "coordinator-inventory-manifest.json"), `${JSON.stringify(createInventoryManifest(coordinatorInventory, "coordinator"), null, 2)}\n`, { mode: 0o600, flag: "wx" });
-          reconstructObservabilitySummary({
-            evidenceDirectory: options.evidenceDirectory,
-            contract,
-            contractSha256: options.contractSha256,
-            runId: context.runId,
-            faults: runFaults,
-            coordinatorInventory,
-          });
+          return { stage, machines: machineRoots, observability: { coordinatorInventory, runId: context.runId, faults: runFaults } };
         }
         return { stage, machines: machineRoots };
       } finally {
@@ -2384,6 +2468,14 @@ export async function runLocalCertification(options, dependencies = {}) {
     labeledVolumes: 0, familyTaggedProviderClusters: 0, privateRootsAbsent: true,
     ownedProcessesExited: true, providerDestroyConfirmedWithinSeconds: 0,
   })}\n`, { mode: 0o600, flag: "wx" });
+  if (contract.version === 4) reconstructObservabilitySummary({
+    evidenceDirectory: options.evidenceDirectory,
+    contract,
+    contractSha256: options.contractSha256,
+    runId: result.observability.runId,
+    faults: result.observability.faults,
+    coordinatorInventory: result.observability.coordinatorInventory,
+  });
   return result;
 }
 

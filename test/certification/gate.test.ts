@@ -24,7 +24,7 @@ function snapshotFiles(root: string, directory = root, files = new Map<string, B
 
 type FaultLayout = "faults" | "partition-a" | "none";
 type MaintenanceFailure = "compact" | "snapshot" | "mixed";
-type Variant = { serverPort?: number; providerPort?: number | null; clockRetry?: "recovered" | "exhausted" | "miscounted"; observerRows?: number; withFaults?: boolean; observerGap?: boolean; observerSiblingsPresent?: boolean; extraObserverRow?: Record<string, unknown>; clockBreach?: boolean; clockGap?: boolean; duplicateMapping?: boolean; drainFail?: boolean; capacityPeak?: number; recoveryFail?: boolean; partitionFirstSuccessSeconds?: number; restartBFirstSuccessSeconds?: number; restartBNoSuccess?: boolean; noRecoverySuccess?: boolean; catchUpFail?: boolean; catchUpAtSeconds?: number; missingCatchUpTimestamp?: boolean; readinessInvalid?: boolean; residualOccupied?: boolean; poolConfigMismatch?: boolean; setupSessionOpen?: boolean; phaseEarly?: boolean; profile?: "smoke" | "full"; lane?: "local" | "managed"; faultLayout?: FaultLayout; maintenanceFailure?: MaintenanceFailure; smokeFailure?: boolean; smokeSlow?: boolean; executionHost?: Record<string, unknown> };
+type Variant = { contractVersion?: 3 | 4; serverPort?: number; providerPort?: number | null; clockRetry?: "recovered" | "exhausted" | "miscounted"; observerRows?: number; withFaults?: boolean; observerGap?: boolean; observerSiblingsPresent?: boolean; extraObserverRow?: Record<string, unknown>; clockBreach?: boolean; clockGap?: boolean; duplicateMapping?: boolean; drainFail?: boolean; capacityPeak?: number; recoveryFail?: boolean; partitionFirstSuccessSeconds?: number; restartBFirstSuccessSeconds?: number; restartBNoSuccess?: boolean; noRecoverySuccess?: boolean; catchUpFail?: boolean; catchUpAtSeconds?: number; missingCatchUpTimestamp?: boolean; readinessInvalid?: boolean; residualOccupied?: boolean; poolConfigMismatch?: boolean; setupSessionOpen?: boolean; phaseEarly?: boolean; profile?: "smoke" | "full"; lane?: "local" | "managed"; faultLayout?: FaultLayout; maintenanceFailure?: MaintenanceFailure; smokeFailure?: boolean; smokeSlow?: boolean; executionHost?: Record<string, unknown> };
 
 describe("v4 observability gate items", () => {
   it("makes every missing local item incomplete rather than vacuously passing", () => {
@@ -60,7 +60,8 @@ describe("v4 observability gate items", () => {
     };
     const timeout = {
       id: "timeout-a-probe-0", machine: "a", phase: "timeout", sequence: 0,
-      startedAtMs: 100, completedAtMs: 101, durationMs: 1, rawSha256: "a".repeat(64),
+      runId: "run", contractSha256,
+      startedAtMs: 100, completedAtMs: 101, durationMs: 1,
       cardinality: { verdict: "pass" }, snapshot: {
         classification: "timeout", pool: { status: "ready", origin: "daemon", failed: false },
         telemetry: { ...healthyTelemetry,
@@ -71,6 +72,10 @@ describe("v4 observability gate items", () => {
         },
       },
     };
+    const raw = Buffer.from(JSON.stringify({ backendDiagnostics: timeout.snapshot }));
+    Object.assign(timeout, { rawSha256: createHash("sha256").update(raw).digest("hex"), rawBytes: raw.length });
+    mkdirSync(join(root, "machine-a", "raw-probes"));
+    writeFileSync(join(root, "machine-a", "raw-probes", `${timeout.id}.json`), raw);
     writeNdjson(join(root, "machine-a", "probes.ndjson"), [timeout]);
     writeNdjson(join(root, "machine-b", "probes.ndjson"), []);
     writeNdjson(join(root, "machine-a", "samples.ndjson"), []);
@@ -78,9 +83,23 @@ describe("v4 observability gate items", () => {
     const fault = { id: "timeout", kind: "timeout", target: "a,b", requestedAt: "2026-11-05T00:00:00.000Z", appliedAt: new Date(100).toISOString(), clearedAt: new Date(200).toISOString(), recoveredAt: new Date(300).toISOString() };
     const reconstructed = reconstructObservabilitySummary({ evidenceDirectory: root, contract, contractSha256, runId: "run", faults: [fault], persist: false });
     expect(observabilityGateItems(reconstructed).find((item) => item.id === "alert.timeout")?.verdict).toBe("fail");
+    expect(observabilityGateItems(reconstructed).find((item) => item.id === "probe-completeness")?.verdict).toBe("incomplete");
     const forged = structuredClone(reconstructed);
     forged.items.find((item: { id: string }) => item.id === "alert.timeout").verdict = "pass";
     expect(JSON.stringify(forged)).not.toBe(JSON.stringify(reconstructed));
+    const terminal = { ...timeout, id: "timeout-a-probe-1", sequence: 1, startedAtMs: 201, completedAtMs: 202,
+      snapshot: { classification: "healthy", pool: { status: "ready", origin: "daemon", failed: false }, telemetry: healthyTelemetry } };
+    const terminalRaw = Buffer.from(JSON.stringify({ backendDiagnostics: terminal.snapshot }));
+    Object.assign(terminal, { rawSha256: createHash("sha256").update(terminalRaw).digest("hex"), rawBytes: terminalRaw.length });
+    writeFileSync(join(root, "machine-a", "raw-probes", `${terminal.id}.json`), terminalRaw);
+    writeJson(join(root, "machine-a", "timeout-clearance.json"), { id: terminal.id, completedAtMs: terminal.completedAtMs });
+    const extra = { ...terminal, id: "timeout-a-probe-2", sequence: 2, startedAtMs: 203, completedAtMs: 204 };
+    const extraRaw = Buffer.from(JSON.stringify({ backendDiagnostics: extra.snapshot }));
+    Object.assign(extra, { rawSha256: createHash("sha256").update(extraRaw).digest("hex"), rawBytes: extraRaw.length });
+    writeFileSync(join(root, "machine-a", "raw-probes", `${extra.id}.json`), extraRaw);
+    writeNdjson(join(root, "machine-a", "probes.ndjson"), [timeout, terminal, extra]);
+    const surplus = reconstructObservabilitySummary({ evidenceDirectory: root, contract, contractSha256, runId: "run", faults: [fault], persist: false });
+    expect(observabilityGateItems(surplus).find((item) => item.id === "probe-completeness")?.verdict).toBe("fail");
   });
 });
 
@@ -96,7 +115,7 @@ function maintenanceFails(mode: MaintenanceFailure | undefined, op: string, inde
 function rawFixture(options: Variant = {}) {
   const root = mkdtempSync(join(tmpdir(), "lcm-cert-raw-gate-"));
   const output = join(mkdtempSync(join(tmpdir(), "lcm-cert-raw-gate-output-")), "gate");
-  const contract = JSON.parse(readFileSync(new URL("./contract-v3.json", import.meta.url), "utf8"));
+  const contract = JSON.parse(readFileSync(new URL(options.contractVersion === 4 ? "./contract-v4.json" : "./contract-v3.json", import.meta.url), "utf8"));
   const contractText = `${JSON.stringify(contract)}\n`;
   const contractPath = join(root, "contract.json");
   writeFileSync(contractPath, contractText);
@@ -127,7 +146,7 @@ function rawFixture(options: Variant = {}) {
   const faultLayout: FaultLayout = options.faultLayout ?? (profile === "full" ? (lane === "managed" ? "partition-a" : "faults") : "none");
   const runtimeRole = lane === "local" ? "lcm_test_runtime" : "lcm_cert_runtime_run12345";
   const t0 = Date.parse("2026-10-26T10:10:00.000Z");
-  writeJson(join(root, "run.json"), { lane, profile, ...(options.withFaults ? { withFaults: true } : {}), runId: "run12345", contractSha256, approval, approvalSha256, startedAt: "2026-10-26T10:01:00.000Z" });
+  writeJson(join(root, "run.json"), { lane, profile, ...(options.withFaults ? { withFaults: true } : {}), runId: "run12345", contractSha256, ...(contract.version === 4 ? { contractVersion: 4 } : {}), approval, approvalSha256, startedAt: "2026-10-26T10:01:00.000Z" });
   writeJson(join(root, "phase-control.json"), { warmupStartAt: options.phaseEarly ? "2026-10-26T10:09:00.000Z" : "2026-10-26T10:08:00.000Z", steadyT0At: new Date(t0).toISOString() });
   writeJson(join(root, "execution-provenance.json"), provenance);
   writeJson(join(root, "machine-identities.json"), {
@@ -327,6 +346,32 @@ describe("certification raw evidence pipeline", () => {
     });
     expect(result.gate.slos.some((slo: any) => slo.id === "forged")).toBe(false);
     expect(JSON.parse(readFileSync(result.paths.json, "utf8"))).toEqual(result.gate);
+  });
+
+  it("reproduces the historical v3 gate bytes for the frozen evidence fixture", () => {
+    const result = assemble(rawFixture());
+    expect({
+      json: createHash("sha256").update(readFileSync(result.paths.json)).digest("hex"),
+      markdown: createHash("sha256").update(readFileSync(result.paths.markdown)).digest("hex"),
+    }).toEqual({
+      json: "6ba9b71a10efc9933720e6a33bdb59968dd5dfaa81dbc3767c124283f3805c83",
+      markdown: "eebc5bbaf2d108532387877190658a022d76ae97437cd42fb7c043e669b7b9e1",
+    });
+  });
+
+  it("real gate assembly rejects a forged v4 observability summary", () => {
+    const fixture = rawFixture({ contractVersion: 4, profile: "smoke", withFaults: true });
+    writeJson(join(fixture.root, "observability-summary.json"), {
+      schemaVersion: 1,
+      contract: { version: 4, sha256: fixture.contractSha256 },
+      run: { sha256: "0".repeat(64) }, applicability: { applicable: true, reason: null },
+      items: [{ id: "alert.timeout", formula: "forged", threshold: 1, observed: 1, verdict: "pass" }],
+      privateArtifacts: { rawProbeBodies: 0, probeRecords: 0, canarySurfaces: 0, secretCategories: 0, retentionDays: 90, directoryMode: "0700", fileMode: "0600" },
+    });
+    const result = assemble(fixture);
+    expect(result.publicationRefused).toBe(true);
+    expect(result.gate.slos.find((slo: { id: string }) => slo.id === "observability-summary-binding")?.verdict).toBe("fail");
+    expect(result.diagnostic).toContain("private.json");
   });
 
   it("uses the separate pre-activation empty witness instead of post-activation residual state", () => {

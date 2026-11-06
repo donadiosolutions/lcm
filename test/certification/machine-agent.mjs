@@ -464,6 +464,15 @@ export function scanBoundedPrivateOutputs({ home, evidenceDirectory, daemonOutpu
   return summary;
 }
 
+function recordRetainedOutputPrivacy(evidenceDirectory, id, bytes, inventory) {
+  const buffer = Buffer.isBuffer(bytes) ? bytes : Buffer.from(String(bytes ?? ""), "utf8");
+  appendNdjson(join(evidenceDirectory, "retained-output-privacy.ndjson"), {
+    id,
+    sha256: createHash("sha256").update(buffer).digest("hex"),
+    ...scanSurface(buffer, inventory, CANARY_CORPUS),
+  });
+}
+
 export async function deferOldestPendingDelivery(databasePath, {
   nowMs = Date.now(),
   minimumAgeSeconds = 900,
@@ -980,7 +989,8 @@ export async function executeControlledObservabilityPhase({
   if (!control) return { records: [baseline], detected: undefined, cleared: undefined, attempts: [], skipped: true };
   const appliedAtMs = Date.parse(control.appliedAt);
   const durationSeconds = observabilityPhaseWorkloadSeconds(contract, phase);
-  const holdMaximumSeconds = durationSeconds;
+  const holdMaximumSeconds = phase === "saturation"
+    ? contract.observability.faultHoldMaximumSeconds.saturationWitness : durationSeconds;
   const schedule = createObservabilityWorkloadSchedule({
     machine, runId, phase, durationSeconds, includeHooks: phase === "queue-backlog" || phase === "canary",
   });
@@ -1013,7 +1023,9 @@ export async function executeControlledObservabilityPhase({
   let detected;
   let cleared;
   let backlogWitness;
+  let saturationWaitingEstablished = false;
   for (let sequence = 0; now() < appliedAtMs + holdMaximumSeconds * 1000 + 30_000; sequence += 1) {
+    if (phase === "saturation" && !detected && now() >= appliedAtMs + holdMaximumSeconds * 1000) break;
     const target = appliedAtMs + sequence * cadenceMs;
     if (target > now()) await wait(target - now());
     const record = await probe({
@@ -1024,6 +1036,7 @@ export async function executeControlledObservabilityPhase({
       operationIds: contract.observability.cardinality.operationIds,
     });
     records.push(record);
+    if (phase === "saturation" && record.snapshot?.pool?.waiting > 0) saturationWaitingEstablished = true;
     if (phase === "queue-backlog" && !existsSync(join(evidenceDirectory, "queue-backlog-outage-detected.json"))
       && (record.transportFailure === true || ["timeout", "unavailable"].includes(record.snapshot?.classification))) {
       writeFileSync(join(evidenceDirectory, "queue-backlog-outage-detected.json"), `${JSON.stringify({ machine, id: record.id, completedAtMs: record.completedAtMs })}\n`, { mode: 0o600, flag: "wx" });
@@ -1050,6 +1063,11 @@ export async function executeControlledObservabilityPhase({
       break;
     }
   }
+  if (phase === "saturation") writeFileSync(
+    join(evidenceDirectory, "saturation-induction.json"),
+    `${JSON.stringify({ machine, waitingEstablished: saturationWaitingEstablished, witnessId: detected?.id ?? null })}\n`,
+    { mode: 0o600, flag: "wx" },
+  );
   const attempts = await workload;
   if (backlogDeferral) await backlogDeferral;
   let backlogCatchUp;
@@ -1434,7 +1452,7 @@ function redactedStderrTail(stderr, environment, secrets) {
 // envelope, a refusal's included. A step that fails without an envelope (killed at its
 // timeout, or exited without output) appends a private failures.ndjson record and throws a
 // message with the same fields; neither holds the command line or unredacted output.
-export async function runMigrationStep({ args, exec, setupDeadlineMs, failuresPath, machine, environment = {}, secrets, now = Date.now }) {
+export async function runMigrationStep({ args, exec, setupDeadlineMs, failuresPath, machine, environment = {}, secrets, privacyInventory = [], now = Date.now }) {
   const step = args[0];
   const startedMs = now();
   const timeoutMs = Math.floor(setupDeadlineMs - MIGRATION_STEP_RECORD_MARGIN_MS - startedMs);
@@ -1449,6 +1467,7 @@ export async function runMigrationStep({ args, exec, setupDeadlineMs, failuresPa
   try {
     result = await exec(args, { timeoutMs });
   } catch (error) {
+    recordRetainedOutputPrivacy(dirname(failuresPath), `migration-${step}`, `${error?.stdout ?? ""}\n${error?.stderr ?? ""}`, privacyInventory);
     if (typeof error?.stdout === "string" && error.stdout.length > 0) return JSON.parse(error.stdout);
     const killed = typeof error?.killed === "boolean" ? error.killed : null;
     throw fail({
@@ -1461,6 +1480,7 @@ export async function runMigrationStep({ args, exec, setupDeadlineMs, failuresPa
       stderrTail: redactedStderrTail(error?.stderr, environment, secrets),
     }, "failed");
   }
+  recordRetainedOutputPrivacy(dirname(failuresPath), `migration-${step}`, `${result.stdout ?? ""}\n${result.stderr ?? ""}`, privacyInventory);
   return JSON.parse(result.stdout);
 }
 
@@ -1529,6 +1549,9 @@ export async function runMachineAgent(environment = process.env) {
   });
   const setupDeadlineMs = setupDeadlineFromControl(migrationStart);
   const migrationSecrets = collectDiagnosticSecrets(environment);
+  const migrationPrivacyInventory = [...migrationSecrets].map(([value, category]) => ({
+    category, value, sourceClass: "migration-environment", scanMode: value.length >= 8 ? "all-forms" : "boundary-token",
+  }));
   const migrationSteps = await runPublicMigrationFlow((args) => runMigrationStep({
     args,
     exec: (stepArgs, { timeoutMs }) => execFileAsync(process.execPath, [lcm, "migration", ...stepArgs, "--json"], { cwd: project, env: environment, timeout: timeoutMs }),
@@ -1537,6 +1560,7 @@ export async function runMachineAgent(environment = process.env) {
     machine,
     environment,
     secrets: migrationSecrets,
+    privacyInventory: migrationPrivacyInventory,
   }), {
     beforeActivate: async (steps) => {
       writeFileSync(join(evidenceDirectory, "verification-receipt.json"), `${JSON.stringify({
@@ -1587,12 +1611,14 @@ export async function runMachineAgent(environment = process.env) {
     const inventoryBytes = Buffer.from(`${JSON.stringify(createInventoryManifest(probeInventory, machine), null, 2)}\n`);
     writeFileSync(join(evidenceDirectory, "secret-inventory-manifest.json"), inventoryBytes, { mode: 0o600, flag: "wx" });
     inventoryManifestSha256 = createHash("sha256").update(inventoryBytes).digest("hex");
+    recordRetainedOutputPrivacy(evidenceDirectory, "identity", identity.stdout, probeInventory);
   }
   if (contract.version === 4) writeFileSync(join(evidenceDirectory, "failure-privacy.ndjson"), "", { mode: 0o600, flag: "wx" });
   try {
   writeFileSync(join(evidenceDirectory, "daemon-started.json"), `${JSON.stringify({ machine, at: new Date().toISOString() })}\n`, { mode: 0o600, flag: "wx" });
   writeFileSync(join(evidenceDirectory, "contract-receipt.json"), `${JSON.stringify({ version: contract.version, sha256: contractSha256, approvalSha256, inventoryManifestSha256 })}\n`, { mode: 0o600, flag: "wx" });
   const doctor = await captureDoctorEvidence(() => execFileAsync(process.execPath, [lcm, "doctor", "--verbose"], { cwd: project, env: environment, timeout: 60_000 }));
+  if (contract.version === 4) recordRetainedOutputPrivacy(evidenceDirectory, "readiness-doctor", doctor.stdout, probeInventory);
   await runWithDeadline(60_000, undefined, (options) =>
     daemonClient.post("/store", { cwd: project, text: "certification readiness", tags: ["type:solution", "scope:project"], metadata: {} }, options));
   await runWithDeadline(60_000, undefined, (options) =>
@@ -1617,36 +1643,43 @@ export async function runMachineAgent(environment = process.env) {
       const calibration = await waitForControl(join(evidenceDirectory, "calibration-control.json"), {
         deadlineMs: Date.now() + contract.timeline.full.setupMaxSeconds * 1000,
       });
-      const startAtMs = Date.parse(calibration.startAt);
-      const schedule = [];
       const definition = contract.observability.calibration;
+      let probeCount = 0;
       for (let pair = 0; pair < definition.pairs; pair += 1) {
-        const probeStart = startAtMs + pair * (definition.baselineWindowSeconds + definition.probeWindowSeconds) * 1000
-          + definition.baselineWindowSeconds * 1000;
-        schedule.push(...createProbeSchedule({
-          phase: `calibration-${pair + 1}`,
+        const pairNumber = pair + 1;
+        const boundary = await waitForControl(join(evidenceDirectory, `calibration-pair-${pairNumber}-start.json`), {
+          deadlineMs: Date.now() + contract.timeline.full.calibrationSeconds * 1000,
+        });
+        const schedule = createProbeSchedule({
+          phase: `calibration-${pairNumber}`,
           machine,
-          appliedAtMs: probeStart,
+          appliedAtMs: Date.parse(boundary.startAt),
           holdMaximumMs: definition.probeWindowSeconds * 1000,
           cadenceMs: definition.probeCadenceSeconds * 1000,
           timeoutMs: contract.observability.probe.transportTimeoutMs,
-        }));
+        });
+        const records = await executeProbeSchedule({
+          schedule,
+          probe: (entry) => runRawStatusProbe({
+            ...entry,
+            runId: environment.LCM_CERT_RUN_ID,
+            contractSha256,
+            cwd: project,
+            token: readFileSync(daemonTokenPath, "utf8").trim(),
+            evidenceDirectory,
+            inventory: probeInventory,
+            canaries: CANARY_CORPUS,
+            operationIds: contract.observability.cardinality.operationIds,
+          }),
+        });
+        probeCount += records.length;
+        writeFileSync(join(evidenceDirectory, `calibration-pair-${pairNumber}-complete.json`), `${JSON.stringify({
+          machine, pair: pairNumber, probes: records.length,
+          firstStartedAtMs: records[0]?.startedAtMs,
+          lastCompletedAtMs: records.at(-1)?.completedAtMs,
+        })}\n`, { mode: 0o600, flag: "wx" });
       }
-      const records = await executeProbeSchedule({
-        schedule,
-        probe: (entry) => runRawStatusProbe({
-          ...entry,
-          runId: environment.LCM_CERT_RUN_ID,
-          contractSha256,
-          cwd: project,
-          token: readFileSync(daemonTokenPath, "utf8").trim(),
-          evidenceDirectory,
-          inventory: probeInventory,
-          canaries: CANARY_CORPUS,
-          operationIds: contract.observability.cardinality.operationIds,
-        }),
-      });
-      writeFileSync(join(evidenceDirectory, "calibration-complete.json"), `${JSON.stringify({ machine, startAt: calibration.startAt, probes: records.length })}\n`, { mode: 0o600, flag: "wx" });
+      writeFileSync(join(evidenceDirectory, "calibration-complete.json"), `${JSON.stringify({ machine, startAt: calibration.startAt, probes: probeCount })}\n`, { mode: 0o600, flag: "wx" });
     }
     const warmupControl = await waitForControl(join(evidenceDirectory, "warmup-control.json"), {
       deadlineMs: Date.now() + contract.timeline.full.setupMaxSeconds * 1000,
@@ -1795,32 +1828,35 @@ export async function runMachineAgent(environment = process.env) {
   writeFileSync(join(evidenceDirectory, "drain.json"), `${JSON.stringify(drain)}\n`, { mode: 0o600, flag: "wx" });
   if (drainError) throw drainError;
   const finalDoctor = await captureDoctorEvidence(() => execFileAsync(process.execPath, [lcm, "doctor", "--verbose"], { cwd: project, env: environment, timeout: 60_000 }));
+  if (contract.version === 4) recordRetainedOutputPrivacy(evidenceDirectory, "final-doctor", finalDoctor.stdout, probeInventory);
   writeFileSync(join(evidenceDirectory, "final-diagnostics.json"), `${JSON.stringify({
     doctorSha256: createHash("sha256").update(finalDoctor.stdout).digest("hex"),
     doctor: finalDoctor.stdout,
     doctorExitCode: finalDoctor.exitCode,
     sweepTimestamps,
   })}\n`, { mode: 0o600, flag: "wx" });
-  if (contract.version === 4) {
-    const daemonPrivacy = daemon.privacyOutput();
-    const privacy = scanBoundedPrivateOutputs({
-      home: environment.HOME,
-      evidenceDirectory,
-      daemonOutput: daemonPrivacy.bytes,
-      inventory: probeInventory,
-    });
-    writeFileSync(join(evidenceDirectory, "daemon-output-coverage.json"), `${JSON.stringify({
-      totalBytes: daemonPrivacy.totalBytes,
-      scannedBytes: daemonPrivacy.bytes.length,
-      truncated: daemonPrivacy.truncated,
-      verdict: daemonPrivacy.truncated ? "incomplete" : "pass",
-      secretHits: privacy.secretHits,
-      canaryHits: privacy.canaryHits,
-    })}\n`, { mode: 0o600, flag: "wx" });
-  }
   await waitForControl(join(evidenceDirectory, "clock-finished.json"), { deadlineMs: Date.now() + 120_000 });
   } finally {
-    await daemon.stop();
+    try { await daemon.stop(); }
+    finally {
+      if (contract.version === 4) {
+        const daemonPrivacy = daemon.privacyOutput();
+        const privacy = scanBoundedPrivateOutputs({
+          home: environment.HOME,
+          evidenceDirectory,
+          daemonOutput: daemonPrivacy.bytes,
+          inventory: probeInventory,
+        });
+        writeFileSync(join(evidenceDirectory, "daemon-output-coverage.json"), `${JSON.stringify({
+          totalBytes: daemonPrivacy.totalBytes,
+          scannedBytes: daemonPrivacy.bytes.length,
+          truncated: daemonPrivacy.truncated,
+          verdict: daemonPrivacy.truncated ? "incomplete" : "pass",
+          secretHits: privacy.secretHits,
+          canaryHits: privacy.canaryHits,
+        })}\n`, { mode: 0o600, flag: "wx" });
+      }
+    }
   }
 }
 

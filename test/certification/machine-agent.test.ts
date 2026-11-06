@@ -2,7 +2,7 @@ import { createHash } from "node:crypto";
 import { existsSync, mkdirSync, mkdtempSync, readFileSync, renameSync, writeFileSync } from "node:fs";
 import { EventEmitter } from "node:events";
 import { tmpdir } from "node:os";
-import { join } from "node:path";
+import { dirname, join } from "node:path";
 import { DatabaseSync } from "node:sqlite";
 import { describe, expect, it, vi } from "vitest";
 import {
@@ -119,7 +119,7 @@ describe("observability probes", () => {
       extensions: { status: "observed", observedAt: 1, health: "healthy", omitted: [], remediation: "No action required.", entries: [
         ...["pg_stat_statements", "pg_trgm", "pgcrypto", "unaccent"].map((name) => ({ name, status: "current", installedVersion: "1", defaultVersion: "1" })),
       ] },
-      queue: { status: "observed", observedAt: 1, health: "healthy", omitted: [], remediation: "No action required.", inboxClaimed: 0 },
+      queue: { status: "observed", observedAt: 1, health: "healthy", omitted: [], remediation: "No action required.", inboxClaimed: 0, inboxQuarantined: 0, replayLagSeconds: 0, outboxOldestPendingAgeSeconds: 0 },
     } } }));
     const record = await runRawStatusProbe({
       id: "steady-a-probe-0", machine: "a", phase: "steady", sequence: 0,
@@ -334,6 +334,7 @@ describe("certification machine agent", () => {
     const failure = await runMigrationStep({
       args: ["apply", "--confirm-generation", "generation-1"], exec, failuresPath, machine: "a",
       setupDeadlineMs: 10_000 + 600_000, now: () => clock, environment: { LCM_POSTGRES_URL: transferUrl },
+      privacyInventory: [{ category: "transfer-url", value: transferUrl, sourceClass: "test", scanMode: "all-forms" }],
     }).catch((error: unknown) => error as Error);
 
     const [record, ...others] = readFileSync(failuresPath, "utf8").trim().split("\n").map((line) => JSON.parse(line));
@@ -349,6 +350,9 @@ describe("certification machine agent", () => {
     for (const text of [failure.message, JSON.stringify(record)]) {
       expect(text).not.toMatch(/ret-123|db\.example|postgresql:\/\/|Command failed/u);
     }
+    const privacy = readFileSync(join(dirname(failuresPath), "retained-output-privacy.ndjson"), "utf8").trim().split("\n").map((line) => JSON.parse(line));
+    expect(privacy).toEqual([expect.objectContaining({ id: "migration-apply", secretHits: expect.any(Number) })]);
+    expect(privacy[0].secretHits).toBeGreaterThan(0);
   });
 
   it("returns a failed step's JSON envelope instead of recording it", async () => {

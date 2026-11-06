@@ -109,8 +109,9 @@ Database CPU percentage is the baseline-subtracted database CPU time over each
 probe window at the combined two-machine rate (two probes per 15 seconds), divided
 by the actual elapsed window and recorded database CPU quota.
 The source-derived successful snapshot path is fixed at 90 wire statements. A
-conditional idle-connection validation remains a separate measured-in-smoke
-allowance; it is not silently added to that successful-path count.
+conditional idle-connection validation remains a separate quantity; it is
+unmeasured before the smoke and is not added to the gated 90-statement
+successful-path count.
 
 V4 observability is applicable only to the local lane. A managed v4 run evaluates
 exactly the inherited v3 item set and records observability as not applicable,
