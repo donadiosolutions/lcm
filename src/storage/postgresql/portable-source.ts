@@ -25,7 +25,7 @@ import { PortableTransferError } from "../portable-transfer.js";
 import { createPortableIndex, type PortableIndex } from "../portable-index.js";
 import {
   decodeCanonicalRow, listCanonicalHeaders, listConversationMessageHeaders,
-  canonicalBatchItemBytes, readCanonicalContentRows, readCanonicalRow,
+  canonicalBatchItemBytes, readCanonicalContentRows, readCanonicalDomainOccupancy, readCanonicalRow,
 } from "./portable-mapping.js";
 
 type Snapshot = PostgreSqlQueryExecutor & {
@@ -134,14 +134,15 @@ function assertIdentity(identity: StorageIdentityContext): void {
       || typeof identity.selectedPath !== "string" || !isAbsolute(identity.selectedPath)
       || /[\0-\x1f\x7f]/u.test(identity.selectedPath)) invalid();
 }
-async function registeredIdentity(executor: PostgreSqlQueryExecutor, identity: StorageIdentityContext,
-  normalizedPath: string, signal?: AbortSignal): Promise<void> {
-  abort(signal);
-  const result = await executor.query({text: `SELECT EXISTS (
+const REGISTERED_IDENTITY_SQL = `EXISTS (
     SELECT 1 FROM lcm.projects p JOIN lcm.project_aliases a ON a.project_id = p.project_id
     JOIN lcm.machines m ON m.machine_id = a.machine_id
     WHERE p.project_id = $1::uuid AND m.machine_id = $2::uuid
-      AND a.path = $3 AND a.normalized_path = $4) AS admitted`,
+      AND a.path = $3 AND a.normalized_path = $4) AS admitted`;
+async function registeredIdentity(executor: PostgreSqlQueryExecutor, identity: StorageIdentityContext,
+  normalizedPath: string, signal?: AbortSignal): Promise<void> {
+  abort(signal);
+  const result = await executor.query({text: `SELECT ${REGISTERED_IDENTITY_SQL}`,
   values: [identity.id, identity.machineId, identity.selectedPath, normalizedPath]},
   {domain:"identity",operation:"portableRegisteredIdentity",signal});
   if (result.rows.length !== 1 || result.rows[0].admitted !== true) invalid();
@@ -162,16 +163,28 @@ export async function readPostgreSqlPortableWitness(executor: PostgreSqlQueryExe
   return sha256(canonicalJson({databaseName:row.database_name,databaseOid:row.database_oid,
     serverAddress:row.server_address,serverPort:row.server_port,projectId}));
 }
-async function snapshotState(session: Snapshot, signal?: AbortSignal): Promise<string> {
+/**
+ * One snapshot authentication check: the registered-identity proof and the
+ * live session state in one statement (#1869). The identity proof is an
+ * MVCC read fixed by the snapshot; the pid, TLS, isolation and timestamp are
+ * live values read at statement time, as before. Refusals keep their order:
+ * an unadmitted identity, then any state mismatch, are source-invalid.
+ */
+async function snapshotAuthentication(session: Snapshot, identity: StorageIdentityContext,
+  normalizedPath: string, signal?: AbortSignal): Promise<string> {
   abort(signal);
-  const result = await session.query({text: `SELECT pg_backend_pid() AS backend_pid,
+  const result = await session.query({text: `SELECT ${REGISTERED_IDENTITY_SQL},
+    pg_backend_pid() AS backend_pid,
     COALESCE((SELECT ssl FROM pg_catalog.pg_stat_ssl WHERE pid = pg_backend_pid()), false) AS tls,
     current_setting('transaction_isolation') AS isolation,
     current_setting('transaction_read_only') AS read_only,
-    to_char(transaction_timestamp() AT TIME ZONE 'UTC', 'YYYY-MM-DD"T"HH24:MI:SS.US"Z"') AS captured_at`},
+    to_char(transaction_timestamp() AT TIME ZONE 'UTC', 'YYYY-MM-DD"T"HH24:MI:SS.US"Z"') AS captured_at`,
+  values: [identity.id, identity.machineId, identity.selectedPath, normalizedPath]},
   {domain:"factory",operation:"portableSnapshotState",signal});
   const row=result.rows[0];
-  if (result.rows.length !== 1 || !row || row.backend_pid !== session.identity.backendPid
+  if (result.rows.length !== 1 || row.admitted !== true) invalid();
+  abort(signal);
+  if (row.backend_pid !== session.identity.backendPid
     || row.tls !== true || row.isolation !== "repeatable read" || row.read_only !== "on"
     || typeof row.captured_at !== "string" || !/^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}\.\d{6}Z$/u.test(row.captured_at)) invalid();
   abort(signal);
@@ -248,8 +261,7 @@ export async function createPostgreSqlPortableSource(options: PostgreSqlPortable
     // A borrowed session's admission belongs to the caller that opened it; the
     // borrowing caller re-runs it inside the snapshot (verify-generation.ts).
     if (verify !== undefined) await verify(session,{expectedOwner:options.expectedOwner,signal:options.signal});
-    await registeredIdentity(session,expectedIdentity,normalizedPath,options.signal);
-    const capturedAt=await snapshotState(session,options.signal);
+    const capturedAt=await snapshotAuthentication(session,expectedIdentity,normalizedPath,options.signal);
     const sourceWitnessSha256=await readPostgreSqlPortableWitness(session,expectedIdentity.id,options.signal);
     const sourceIdentitySha256=sha256(canonicalJson(["lcm-postgresql-snapshot-v1",sourceWitnessSha256,session.identity]));
     index=createPortableIndex({scratchParent:options.scratchParent,signal:options.signal});
@@ -317,7 +329,8 @@ async function buildSource(input: BuildInput): Promise<PortableRecordSource> {
     let first=true;
     while (true) {
       abort(signal); abort(options.signal);
-      const headers=await listConversationMessageHeaders(session,expectedIdentity.id,String(row.conversation_id),cursor,PORTABLE_LIMITS.maxBatchRecords,signal);
+      const page=await listConversationMessageHeaders(session,expectedIdentity.id,String(row.conversation_id),cursor,PORTABLE_LIMITS.maxBatchRecords,signal);
+      const headers=page.headers;
       if (headers.length === 0) break;
       if (headers.length > PORTABLE_LIMITS.maxBatchRecords) invalid();
       for (const chunk of splitByBytes(headers)) {
@@ -341,6 +354,8 @@ async function buildSource(input: BuildInput): Promise<PortableRecordSource> {
           first=false;
         }
       }
+      // The page's own sentinel proves no message follows; no terminator read.
+      if (!page.more) break;
     }
     yield `],"sessionId":${canonicalJson(value.sessionId)},"title":${canonicalJson(value.title)},"updatedAt":${canonicalJson(value.updatedAt)}}]`;
   };
@@ -355,8 +370,8 @@ async function buildSource(input: BuildInput): Promise<PortableRecordSource> {
       // A page may hold fewer headers than the record bound while rows remain:
       // listCanonicalHeaders also cuts a page by aggregate locator bytes (#1388).
       // Resuming after the last returned locator therefore skips nothing.
-      const headers=await listCanonicalHeaders(session,expectedIdentity.id,domain,after,PORTABLE_LIMITS.maxBatchRecords,options.signal);
-      if (headers.length === 0) break;
+      const page=await listCanonicalHeaders(session,expectedIdentity.id,domain,after,PORTABLE_LIMITS.maxBatchRecords,options.signal);
+      const headers=page.headers;
       if (headers.length > PORTABLE_LIMITS.maxBatchRecords) invalid();
       let previous: string | null=after;
       for (const header of headers) {
@@ -365,15 +380,26 @@ async function buildSource(input: BuildInput): Promise<PortableRecordSource> {
         previous=header.locator;
       }
       await visitPage(headers);
+      // The page's own sentinel proves no row follows; no terminator read.
+      if (!page.more) break;
       after=previous;
     }
+  };
+  // One key-only presence statement in this snapshot (#1869): an empty domain
+  // skips header paging entirely, while every occupied domain pages exactly
+  // as before. Each value is checked when its domain is reached.
+  const occupancy=await readCanonicalDomainOccupancy(session,expectedIdentity.id,PORTABLE_RECORD_DOMAIN_ORDER,false,options.signal);
+  const occupied=(domain: PortableDomain): boolean => {
+    const value=occupancy.get(domain);
+    if (typeof value !== "boolean") invalid();
+    return value;
   };
 
   // Conversations are read one byte-bounded chunk per batched read. Each row
   // is taken from its chunk Map before its closure is walked, so a consumed
   // conversation is not retained while its messages stream; the prepass peaks
   // at the remaining chunk rows plus one message chunk.
-  await eachHeaderPage("conversations",async(headers) => {
+  if (occupied("conversations")) await eachHeaderPage("conversations",async(headers) => {
     for (const chunk of splitByBytes(headers)) {
       abort(options.signal);
       const rows=await readCanonicalContentRows(session,expectedIdentity.id,"conversations",chunk.map(header=>header.locator),options.signal);
@@ -434,7 +460,7 @@ async function buildSource(input: BuildInput): Promise<PortableRecordSource> {
     // One batched read per byte-bounded chunk of each header page (#1388).
     // Chunks are finished in order, and rows are consumed in header order, so
     // occurrence allocation and index ordinals match the per-record walk.
-    await eachHeaderPage(domain,async(headers) => {
+    if (occupied(domain)) await eachHeaderPage(domain,async(headers) => {
       for (const chunk of splitByBytes(headers)) {
         abort(options.signal);
         const rows=await readCanonicalContentRows(session,expectedIdentity.id,domain,chunk.map(header=>header.locator),options.signal);
@@ -532,8 +558,7 @@ async function buildSource(input: BuildInput): Promise<PortableRecordSource> {
   };
   const authenticate=async(signal?:AbortSignal) => {
     stable();abort(signal);abort(options.signal);
-    await registeredIdentity(session,expectedIdentity,normalizedPath,signal);
-    if (await snapshotState(session,signal) !== input.capturedAt) throw new PortableStreamError("source-changed");
+    if (await snapshotAuthentication(session,expectedIdentity,normalizedPath,signal) !== input.capturedAt) throw new PortableStreamError("source-changed");
     stable();abort(signal);abort(options.signal);
   };
   const enqueue=<T>(work:()=>Promise<T>):Promise<T> => {

@@ -52,10 +52,41 @@ import {
   loadPostgreSqlSchemaSnapshots,
 } from "../../src/storage/postgresql/migrations.js";
 import { REQUIRED_POSTGRESQL_EXTENSIONS } from "../../src/storage/postgresql/extensions.js";
+import { PostgreSqlStorageOperationError } from "../../src/storage/postgresql/errors.js";
 import { POSTGRESQL_SEARCH_CONFIGURATION_SHA256 } from "../../src/storage/postgresql/search-configuration.js";
 
 function result<R extends QueryResultRow>(rows: R[]): QueryResult<R> {
   return { command: "SELECT", rowCount: rows.length, oid: 0, fields: [], rows };
+}
+
+/** One json_agg part of a fused readiness statement (#1869), as queryReadinessFragments writes it. */
+const FUSED_FRAGMENT = /\(SELECT COALESCE\(pg_catalog\.json_agg\(fragment_row(?: ORDER BY [^)]*)?\), '\[\]'::pg_catalog\.json\) FROM \(([\s\S]*?)\) AS fragment_row\) AS f(\d+)/gu;
+
+/**
+ * Splits a fused readiness statement back into the statements it fuses: each
+ * part's own SQL, placeholder numbering and binds, under the operation the
+ * statement's "+"-joined operation names for it. Undefined for any other
+ * statement.
+ */
+function fusedReadinessFragments(
+  config: { readonly text: string; readonly values?: readonly unknown[] },
+  operation: string,
+): ReadinessFragmentConfig[] | undefined {
+  if (!config.text.startsWith("SELECT (SELECT COALESCE(pg_catalog.json_agg(fragment_row")) return undefined;
+  const operations = operation.split("+");
+  const values = config.values ?? [];
+  let offset = 0;
+  return [...config.text.matchAll(FUSED_FRAGMENT)].map((match, index) => {
+    const placeholders = [...match[1]!.matchAll(/\$([1-9][0-9]*)/gu)].map((placeholder) => Number(placeholder[1]));
+    const count = placeholders.length === 0 ? 0 : Math.max(...placeholders) - offset;
+    const fragment = {
+      operation: operations[index]!,
+      text: match[1]!.replace(/\$([1-9][0-9]*)/gu, (_placeholder, number: string) => `$${Number(number) - offset}`),
+      values: values.slice(offset, offset + count),
+    };
+    offset += count;
+    return fragment;
+  });
 }
 
 function executor(): {
@@ -100,6 +131,8 @@ type ReadyExecutorOverride =
   | ReadyExecutorBaseResult
   | { readonly error: unknown }
   | ((base: ReadyExecutorBaseResult) => ReadyExecutorBaseResult | readonly QueryResultRow[]);
+/** One part of a fused readiness statement, as fusedReadinessFragments recovers it. */
+type ReadinessFragmentConfig = Readonly<{ operation: string; text: string; values: readonly unknown[] }>;
 
 function trustedFunctionRow(input: {
   readonly functionIdentity: string;
@@ -630,10 +663,14 @@ function replaceRows(
 
 function readyExecutor(fixtureOptions: ReadyExecutorOptions = {}): {
   readonly seam: PostgreSqlQueryExecutor;
+  /** Each logical read: a whole statement, or one part of a fused statement. */
   readonly queries: readonly { config: unknown; options: PostgreSqlQueryOptions }[];
+  /** Each statement the executor received. */
+  readonly statements: readonly { config: unknown; options: PostgreSqlQueryOptions }[];
 } {
   const manifest = fixtureOptions.manifest ?? POSTGRESQL_RUNTIME_PRIVILEGE_MANIFEST;
   const queries: { config: unknown; options: PostgreSqlQueryOptions }[] = [];
+  const statements: { config: unknown; options: PostgreSqlQueryOptions }[] = [];
   const migrations = loadPostgreSqlMigrations();
   const snapshot = loadPostgreSqlSchemaSnapshots().at(-1)!;
   const expectations = getPostgreSqlSchemaSnapshotExpectations(snapshot);
@@ -684,11 +721,10 @@ function readyExecutor(fixtureOptions: ReadyExecutorOptions = {}): {
     grantor_is_owner: true,
     is_grantable: false,
   };
-  const query = vi.fn(async (
+  const answer = async (
     config: unknown,
     queryOptions: PostgreSqlQueryOptions,
   ): Promise<QueryResult<QueryResultRow>> => {
-    queries.push({ config, options: queryOptions });
     const operation = queryOptions.operation;
     const applyOverride = (base: ReadyExecutorBaseResult): ReadyExecutorBaseResult => {
       const override = fixtureOptions.operationOverrides?.[operation];
@@ -1009,8 +1045,66 @@ function readyExecutor(fixtureOptions: ReadyExecutorOptions = {}): {
       return applyOverride(result(fixtureOptions.incompleteEffectivePrivileges ? rows.slice(0, -1) : rows));
     }
     return applyOverride(result([]));
+  };
+  // A fused readiness statement (#1869) is answered part by part, each part
+  // as its own statement was, and fails as a whole when any part fails.
+  const query = vi.fn(async (
+    config: unknown,
+    queryOptions: PostgreSqlQueryOptions,
+  ): Promise<QueryResult<QueryResultRow>> => {
+    statements.push({ config, options: queryOptions });
+    const fragments = fusedReadinessFragments(config as { text: string; values?: readonly unknown[] }, queryOptions.operation);
+    if (fragments === undefined) {
+      queries.push({ config, options: queryOptions });
+      return answer(config, queryOptions);
+    }
+    const row: QueryResultRow = {};
+    for (const [index, fragment] of fragments.entries()) {
+      const fragmentConfig = { text: fragment.text, values: fragment.values };
+      const fragmentOptions = { ...queryOptions, operation: fragment.operation };
+      queries.push({ config: fragmentConfig, options: fragmentOptions });
+      // json_agg carries an oid column as text, unlike the driver's number.
+      row[`f${index}`] = (await answer(fragmentConfig, fragmentOptions)).rows.map((fragmentRow) => (
+        typeof fragmentRow.referenced_operator_oid === "number"
+          ? { ...fragmentRow, referenced_operator_oid: String(fragmentRow.referenced_operator_oid) }
+          : fragmentRow
+      ));
+    }
+    return result([row]);
   });
-  return { seam: { query }, queries };
+  return { seam: { query }, queries, statements };
+}
+
+// The statements one readiness check sends (#1869), each named by its
+// fragments' operations in order.
+const R1_SERVER = "inspectServerReadiness";
+const R2_ROLES = "inspectRuntimeRolePolicy+runtimeReadinessExtensions";
+const R2_ROLES_WITH_PEER = "inspectRuntimeRolePolicy+inspectAdmittedPeerRolePolicy+runtimeReadinessExtensions";
+const R3_CATALOG = [
+  "runtimeReadinessExtensions:probePgStatStatements",
+  "runtimeReadinessContentCollation",
+  "inspectRequiredExtensionFunctions",
+  "inspectRequiredExtensionOperator",
+  "inspectRequiredGinTrgmOperatorClass",
+  "inspectRequiredGinTrgmOperators",
+  "inspectRequiredGinTrgmIndirectOperators",
+  "inspectRequiredGinTrgmSupportFunctions",
+].join("+");
+const R4_SEARCH = "runtimeReadinessSearchConfiguration";
+const R5_SCHEMA = [
+  "readMigrations",
+  "inspectSchemaOwnership",
+  "inspectSchemaDefinitions",
+  "inspectIdentityFunctions",
+  "inspectSchemaAcl",
+  "inspectRelationAcl",
+  "inspectColumnAcl",
+  "inspectFunctionAcl",
+].join("+");
+const R6_EFFECTIVE = "inspectEffectivePrivileges";
+
+function statementOperations(fake: ReturnType<typeof readyExecutor>): readonly string[] {
+  return fake.statements.map(({ options }) => options.operation);
 }
 
 const EXPECTED_OWNER = "lcm_test_migrator";
@@ -1153,14 +1247,7 @@ describe("PostgreSQL runtime schema and grant readiness", () => {
 
       const failure = await expectReadinessFailure(fake, "extension-preflight");
       expect(failure.operation).toBe("inspectRequiredExtensionFunctions");
-      expect(fake.queries.map(({ options }) => options.operation)).toEqual([
-        "inspectServerReadiness",
-        "inspectRuntimeRolePolicy",
-        "runtimeReadinessExtensions",
-        "runtimeReadinessExtensions:probePgStatStatements",
-        "runtimeReadinessContentCollation",
-        "inspectRequiredExtensionFunctions",
-      ]);
+      expect(statementOperations(fake)).toEqual([R1_SERVER, R2_ROLES, R3_CATALOG]);
     },
   );
 
@@ -1314,15 +1401,7 @@ describe("PostgreSQL runtime schema and grant readiness", () => {
 
     const failure = await expectReadinessFailure(fake, "extension-preflight");
     expect(failure.operation).toBe("inspectRequiredExtensionOperator");
-    expect(fake.queries.map(({ options }) => options.operation)).toEqual([
-      "inspectServerReadiness",
-      "inspectRuntimeRolePolicy",
-      "runtimeReadinessExtensions",
-      "runtimeReadinessExtensions:probePgStatStatements",
-      "runtimeReadinessContentCollation",
-      "inspectRequiredExtensionFunctions",
-      "inspectRequiredExtensionOperator",
-    ]);
+    expect(statementOperations(fake)).toEqual([R1_SERVER, R2_ROLES, R3_CATALOG]);
   });
 
   it.each([
@@ -1373,16 +1452,7 @@ describe("PostgreSQL runtime schema and grant readiness", () => {
 
     const failure = await expectReadinessFailure(fake, "extension-preflight");
     expect(failure.operation).toBe("inspectRequiredGinTrgmOperatorClass");
-    expect(fake.queries.map(({ options }) => options.operation)).toEqual([
-      "inspectServerReadiness",
-      "inspectRuntimeRolePolicy",
-      "runtimeReadinessExtensions",
-      "runtimeReadinessExtensions:probePgStatStatements",
-      "runtimeReadinessContentCollation",
-      "inspectRequiredExtensionFunctions",
-      "inspectRequiredExtensionOperator",
-      "inspectRequiredGinTrgmOperatorClass",
-    ]);
+    expect(statementOperations(fake)).toEqual([R1_SERVER, R2_ROLES, R3_CATALOG]);
   });
 
   it.each(REQUIRED_GIN_TRGM_OPERATOR_ROWS.map(({ strategy_number }) => [strategy_number]))(
@@ -1476,7 +1546,7 @@ describe("PostgreSQL runtime schema and grant readiness", () => {
 
     const failure = await expectReadinessFailure(fake, "extension-preflight");
     expect(failure.operation).toBe("inspectRequiredGinTrgmOperators");
-    expect(fake.queries.at(-1)?.options.operation).toBe("inspectRequiredGinTrgmOperators");
+    expect(statementOperations(fake)).toEqual([R1_SERVER, R2_ROLES, R3_CATALOG]);
   });
 
   it("authenticates every indirect gin_trgm operator edge before support functions", async () => {
@@ -1521,7 +1591,9 @@ describe("PostgreSQL runtime schema and grant readiness", () => {
     ["strategy number", "strategy_number", "7"],
     ["referring identity", "referring_operator_identity", "public.#(text, text)"],
     ["reference kind", "reference_kind", "other"],
-    ["referenced oid", "referenced_operator_oid", "7001"],
+    // The fused read decodes only an oid's canonical decimal text.
+    ["referenced oid", "referenced_operator_oid", "7001x"],
+    ["non-positive referenced oid", "referenced_operator_oid", 0],
     ["referenced identity", "referenced_operator_identity", "public.#(text, text)"],
     ["operator kind", "operator_kind", "l"],
     ["left type", "left_type", "bytea"],
@@ -1577,7 +1649,7 @@ describe("PostgreSQL runtime schema and grant readiness", () => {
 
     const failure = await expectReadinessFailure(fake, "extension-preflight");
     expect(failure.operation).toBe("inspectRequiredGinTrgmIndirectOperators");
-    expect(fake.queries.at(-1)?.options.operation).toBe("inspectRequiredGinTrgmIndirectOperators");
+    expect(statementOperations(fake)).toEqual([R1_SERVER, R2_ROLES, R3_CATALOG]);
   });
 
   it.each(REQUIRED_GIN_TRGM_SUPPORT_ROWS.map(({ support_number }) => [support_number]))(
@@ -1668,13 +1740,7 @@ describe("PostgreSQL runtime schema and grant readiness", () => {
     // runs immediately after required-extension readiness succeeds,
     // and stops there rather than reaching the deeper trusted-function
     // or search-configuration checks that follow it.
-    expect(fake.queries.map(({ options }) => options.operation)).toEqual([
-      "inspectServerReadiness",
-      "inspectRuntimeRolePolicy",
-      "runtimeReadinessExtensions",
-      "runtimeReadinessExtensions:probePgStatStatements",
-      "runtimeReadinessContentCollation",
-    ]);
+    expect(statementOperations(fake)).toEqual([R1_SERVER, R2_ROLES, R3_CATALOG]);
   });
 
   it("does not run the content-collation check before required extensions are ready", async () => {
@@ -1749,10 +1815,7 @@ describe("PostgreSQL runtime schema and grant readiness", () => {
 
       const failure = await expectReadinessFailure(fake, "runtime-role-policy");
       expect(failure.operation).toBe("inspectRuntimeRolePolicy");
-      expect(fake.queries.map(({ options }) => options.operation)).toEqual([
-        "inspectServerReadiness",
-        "inspectRuntimeRolePolicy",
-      ]);
+      expect(statementOperations(fake)).toEqual([R1_SERVER, R2_ROLES]);
     },
   );
 
@@ -1774,10 +1837,7 @@ describe("PostgreSQL runtime schema and grant readiness", () => {
 
       const failure = await expectReadinessFailure(fake, "runtime-role-policy");
       expect(failure.operation).toBe("inspectRuntimeRolePolicy");
-      expect(fake.queries.map(({ options }) => options.operation)).toEqual([
-        "inspectServerReadiness",
-        "inspectRuntimeRolePolicy",
-      ]);
+      expect(statementOperations(fake)).toEqual([R1_SERVER, R2_ROLES]);
     },
   );
 
@@ -1818,10 +1878,7 @@ describe("PostgreSQL runtime schema and grant readiness", () => {
   ] as const)("rejects database-owner authority evidence: %s before domain work", async (_label, override) => {
     const fake = readyExecutor({ operationOverrides: { inspectRuntimeRolePolicy: override } });
     await expectReadinessFailure(fake, "runtime-role-policy");
-    expect(fake.queries.map(({ options }) => options.operation)).toEqual([
-      "inspectServerReadiness",
-      "inspectRuntimeRolePolicy",
-    ]);
+    expect(statementOperations(fake)).toEqual([R1_SERVER, R2_ROLES]);
   });
 
   it.each([
@@ -3524,5 +3581,144 @@ describe("PostgreSQL transfer readiness", () => {
         expectedOwner: EXPECTED_OWNER,
       })).rejects.toMatchObject({ reason: "acl-shape" });
     });
+  });
+});
+
+
+describe("fused readiness statements (#1869)", () => {
+  const PEER = { role: "lcm_test_transfer", manifest: POSTGRESQL_TRANSFER_PRIVILEGE_MANIFEST } as const;
+  const notPreloaded = () => new PostgreSqlStorageOperationError(
+    "STORAGE_OPERATION_FAILED", { domain: "factory", operation: "fused" }, "55000", false,
+  );
+  const verify = (fake: ReturnType<typeof readyExecutor>, withPeer = false) => verifyPostgreSqlRuntimeSchema(fake.seam, {
+    expectedOwner: EXPECTED_OWNER,
+    ...(withPeer ? { admittedPeer: { role: PEER.role } } : {}),
+  });
+
+  it("sends the twenty-two checks as six single bound statements whose binds partition across their parts", async () => {
+    const fake = readyExecutor();
+    await expect(verify(fake)).resolves.toBeDefined();
+    expect(statementOperations(fake)).toEqual([R1_SERVER, R2_ROLES, R3_CATALOG, R4_SEARCH, R5_SCHEMA, R6_EFFECTIVE]);
+    for (const { config, options } of fake.statements) {
+      const { text, values = [] } = config as { text: string; values?: readonly unknown[] };
+      expect(text, options.operation).not.toContain(";");
+      const parts = fusedReadinessFragments({ text, values }, options.operation);
+      if (parts === undefined) continue;
+      expect(parts.map(({ operation }) => operation).join("+")).toBe(options.operation);
+      // Every bind is referenced by exactly the part it was renumbered for.
+      expect(parts.flatMap((part) => part.values)).toEqual(values);
+    }
+    const values = (operation: string) => (fake.queries.find(({ options }) => options.operation === operation)
+      ?.config as { values?: readonly unknown[] } | undefined)?.values;
+    expect(values("inspectRuntimeRolePolicy")).toEqual([EXPECTED_OWNER]);
+    expect(values("runtimeReadinessExtensions")).toEqual([REQUIRED_POSTGRESQL_EXTENSIONS]);
+    expect(values("readMigrations")).toEqual([]);
+    expect(values("inspectSchemaAcl")).toEqual([["lcm", "public"]]);
+  });
+
+  it("keeps the peer read peer_role-driven and compares it with CURRENT_USER inside the role statement", async () => {
+    const fake = readyExecutor({ admittedPeer: PEER });
+    await expect(verify(fake, true)).resolves.toBeDefined();
+    expect(statementOperations(fake)).toEqual([R1_SERVER, R2_ROLES_WITH_PEER, R3_CATALOG, R4_SEARCH, R5_SCHEMA, R6_EFFECTIVE]);
+    const peer = fake.queries.find(({ options }) => options.operation === "inspectAdmittedPeerRolePolicy")!
+      .config as { text: string; values: readonly unknown[] };
+    expect(peer.values).toEqual([PEER.role, EXPECTED_OWNER]);
+    expect(peer.text).toContain("peer_role.peer_name OPERATOR(pg_catalog.=) CURRENT_USER::pg_catalog.text");
+    expect(peer.text).not.toContain("$3");
+  });
+
+  it.each([
+    ["the runtime role before its peer", {
+      inspectRuntimeRolePolicy: mutateFirstField("superuser", true),
+      inspectAdmittedPeerRolePolicy: mutateFirstField("superuser", true),
+    }, ["runtime-role-policy", "inspectRuntimeRolePolicy"], 2],
+    ["the peer before the extensions", {
+      inspectAdmittedPeerRolePolicy: mutateFirstField("superuser", true),
+      runtimeReadinessExtensions: mutateFirstField("installed_version", "2.0"),
+    }, ["runtime-role-policy", "inspectAdmittedPeerRolePolicy"], 2],
+    ["the content collation before the trusted functions", {
+      runtimeReadinessContentCollation: [{ collation_name: "public.some_named_collation", collation_is_deterministic: false }],
+      inspectRequiredExtensionFunctions: [],
+    }, ["content-collation-preflight", "runtimeReadinessContentCollation"], 3],
+    ["the trusted functions before the support functions", {
+      inspectRequiredExtensionFunctions: [],
+      inspectRequiredGinTrgmSupportFunctions: [],
+    }, ["extension-preflight", "inspectRequiredExtensionFunctions"], 3],
+    ["the ledger before ownership", {
+      readMigrations: mutateRows((rows) => rows.pop()),
+      inspectSchemaOwnership: [],
+    }, ["migration-ledger", "readMigrations"], 5],
+    ["ownership before the definitions", {
+      inspectSchemaOwnership: [],
+      inspectSchemaDefinitions: [],
+    }, ["schema-ownership", "inspectSchemaOwnership"], 5],
+    ["the definitions before the function ACL", {
+      inspectSchemaDefinitions: [],
+      inspectFunctionAcl: [],
+    }, ["schema-fingerprint", "inspectSchemaDefinitions"], 5],
+  ] as const)("reports %s when both fail", async (_label, operationOverrides, [reason, operation], sent) => {
+    const fake = readyExecutor({ admittedPeer: PEER, operationOverrides });
+    await expect(verify(fake, true)).rejects.toMatchObject({ reason, operation });
+    expect(statementOperations(fake)).toEqual(
+      [R1_SERVER, R2_ROLES_WITH_PEER, R3_CATALOG, R4_SEARCH, R5_SCHEMA, R6_EFFECTIVE].slice(0, sent),
+    );
+  });
+
+  it("refuses a nondeterministic content collation without sending the schema statement, even with an unreadable ledger", async () => {
+    const fake = readyExecutor({ operationOverrides: {
+      runtimeReadinessContentCollation: [{ collation_name: "public.some_named_collation", collation_is_deterministic: false }],
+      readMigrations: { error: new Error("relation lcm.schema_migrations does not exist") },
+    } });
+    await expect(verify(fake)).rejects.toMatchObject({ reason: "content-collation-preflight", operation: "runtimeReadinessContentCollation" });
+    expect(statementOperations(fake)).toEqual([R1_SERVER, R2_ROLES, R3_CATALOG]);
+  });
+
+  it("maps an execution error of a fused statement as the separate statement mapped it", async () => {
+    const fake = readyExecutor({ operationOverrides: { readMigrations: { error: new Error("permission denied for table schema_migrations") } } });
+    await expect(verify(fake)).rejects.toMatchObject({ reason: "server-preflight", operation: "verifyRuntimeReadiness" });
+    expect(statementOperations(fake)).toEqual([R1_SERVER, R2_ROLES, R3_CATALOG, R4_SEARCH, R5_SCHEMA]);
+  });
+
+  it.each([
+    ["no row", []],
+    ["a missing part", [{}]],
+    ["a part that is not a list", [{ f0: "[]", f1: [] }]],
+  ] as const)("refuses a fused result with %s as a server preflight failure", async (_label, rows) => {
+    const fake = readyExecutor();
+    const seam: PostgreSqlQueryExecutor = {
+      query: (async (config: unknown, options: PostgreSqlQueryOptions) => (
+        options.operation === R2_ROLES ? result([...rows] as QueryResultRow[]) : fake.seam.query(config as never, options)
+      )) as never,
+    };
+    await expect(verifyPostgreSqlRuntimeSchema(seam, { expectedOwner: EXPECTED_OWNER }))
+      .rejects.toMatchObject({ reason: "server-preflight", operation: "verifyRuntimeReadiness" });
+  });
+
+  it("refuses an unpreloaded pg_stat_statements reported by the catalog statement's probe", async () => {
+    const fake = readyExecutor({ operationOverrides: { "runtimeReadinessExtensions:probePgStatStatements": { error: notPreloaded() } } });
+    await expect(verify(fake)).rejects.toMatchObject({ reason: "extension-preflight", operation: "runtimeReadinessExtensions" });
+    expect(statementOperations(fake)).toEqual([R1_SERVER, R2_ROLES, R3_CATALOG]);
+  });
+
+  it("maps any other failure of the catalog statement as the separate probe mapped it", async () => {
+    const fake = readyExecutor({ operationOverrides: { "runtimeReadinessExtensions:probePgStatStatements": { error: new Error("connection reset") } } });
+    await expect(verify(fake)).rejects.toMatchObject({ reason: "server-preflight", operation: "verifyRuntimeReadiness" });
+  });
+
+  it("still probes alone where the probe ran before when another extension already refuses", async () => {
+    const fake = readyExecutor({ operationOverrides: {
+      runtimeReadinessExtensions: mutateRows((rows) => { rows.find(({ name }) => name === "pgcrypto")!.installed_version = "2.0"; }),
+      "runtimeReadinessExtensions:probePgStatStatements": { error: notPreloaded() },
+    } });
+    await expect(verify(fake)).rejects.toMatchObject({ reason: "extension-preflight", operation: "runtimeReadinessExtensions" });
+    expect(statementOperations(fake)).toEqual([R1_SERVER, R2_ROLES, "runtimeReadinessExtensions:probePgStatStatements"]);
+  });
+
+  it("does not probe a pg_stat_statements the catalog already refuses", async () => {
+    const fake = readyExecutor({ operationOverrides: {
+      runtimeReadinessExtensions: mutateRows((rows) => { rows.find(({ name }) => name === "pg_stat_statements")!.installed_version = null; }),
+    } });
+    await expect(verify(fake)).rejects.toMatchObject({ reason: "extension-preflight", operation: "runtimeReadinessExtensions" });
+    expect(statementOperations(fake)).toEqual([R1_SERVER, R2_ROLES]);
   });
 });

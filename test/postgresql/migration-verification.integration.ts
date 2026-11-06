@@ -20,11 +20,13 @@ import {
   reconcileDependencyEdges,
   runSearchSelfMatchProbe,
   readSequenceSelfConsistencyMismatches,
-  readSequenceStoredState,
   SEQUENCE_BACKED_IDENTITY_COLUMN,
   verifyMigrationGeneration,
+  inspectMigrationVerification,
 } from "../../src/migration/verify-generation.js";
-import { migrationCopyTargetGeneration } from "../../src/migration/copy-source.js";
+import { migrationCopyTargetGeneration, openMigrationCopySource } from "../../src/migration/copy-source.js";
+import { PostgreSqlRuntimeReadinessError, verifyPostgreSqlTransferSchema } from "../../src/storage/postgresql/runtime-readiness.js";
+import { migrationWitnessSha256 } from "../../src/migration/activation-witness.js";
 import { inspectSqliteMigrationCopy, runSqliteMigrationCopy } from "../../src/migration/batch-copy.js";
 import { beginMigrationEffect, completeMigrationEffect, createMigrationManifest } from "../../src/migration/protocol.js";
 import { MigrationManifestStore } from "../../src/migration/manifest-store.js";
@@ -250,7 +252,7 @@ it("a real authenticated SQLite copy verifies eligible, with a genuine search se
       }
 
       const scratchParent = mkdtempSync(join(tmpdir(), "lcm-verify-e2e-scratch-"));
-      const verified = await verifyMigrationGeneration({
+      const verifyInput = {
         generationId: copyInput.generationId,
         targetGenerationId: migrationCopyTargetGeneration(copyInput.generationId),
         homeDir: home, expectedIdentity, destinationSettings: settings(db.runtimeUrl),
@@ -269,7 +271,49 @@ it("a real authenticated SQLite copy verifies eligible, with a genuine search se
           receiptSetSha256: "a".repeat(64), epochChecksumSha256: "a".repeat(64),
         },
         sampleParameters: { version: 1, strideOrdinal: 97, sampleCount: 32, seedBasisSha256: "a".repeat(64) },
-      });
+      };
+
+      // #1869 T-W1: the in-window transfer admission is a fresh read on the
+      // snapshot session. A required column privilege revoked after every
+      // pre-window check, just before the snapshot opens, refuses inside the
+      // window with the reason a direct admission reports, never a pass
+      // carried over from before.
+      const administrator = new PostgreSqlRuntime(settings(db.adminUrl));
+      const revoke = "REVOKE INSERT (created_at) ON TABLE lcm.messages FROM lcm_test_runtime";
+      let admissions = 0;
+      let observer: { pid: number; witnessPid: number } | undefined;
+      try {
+        const refusal = await inspectMigrationVerification({ ...verifyInput, scratchParent: mkdtempSync(join(tmpdir(), "lcm-verify-e2e-window-")) }, {
+          openSource: (input) => openMigrationCopySource(input),
+          createRuntime: (connection) => {
+            const runtime = new PostgreSqlRuntime(connection);
+            const open = runtime.openReadOnlySnapshot.bind(runtime);
+            runtime.openReadOnlySnapshot = async (options) => {
+              await administrator.query({ text: revoke }, { domain: "factory", operation: "revokeInWindowColumnPrivilege" });
+              return open(options);
+            };
+            return runtime;
+          },
+          verifyTransferSchema: async (executor, options) => {
+            admissions += 1;
+            if (admissions === 2) {
+              const pid = await executor.query<{ pid: number }>({ text: "SELECT pg_catalog.pg_backend_pid() AS pid" }, { domain: "factory", operation: "observeInWindowAdmission" });
+              observer = { pid: pid.rows[0]!.pid, witnessPid: (executor as unknown as { identity: { backendPid: number } }).identity.backendPid };
+            }
+            return verifyPostgreSqlTransferSchema(executor, options);
+          },
+        }).then(() => undefined, (error: unknown) => error);
+        const direct = await verifyPostgreSqlTransferSchema(db.runtime, { expectedOwner: "lcm_test_migrator" }).then(() => undefined, (error: unknown) => error);
+        expect(direct).toBeInstanceOf(PostgreSqlRuntimeReadinessError);
+        expect(refusal).toMatchObject({ reason: (direct as PostgreSqlRuntimeReadinessError).reason, operation: (direct as PostgreSqlRuntimeReadinessError).operation });
+        expect(admissions).toBe(2);
+        expect(observer!.pid).toBe(observer!.witnessPid);
+      } finally {
+        await administrator.query({ text: "GRANT INSERT (created_at) ON TABLE lcm.messages TO lcm_test_runtime" }, { domain: "factory", operation: "restoreInWindowColumnPrivilege" });
+        await administrator.close();
+      }
+
+      const verified = await verifyMigrationGeneration(verifyInput);
 
       expect(verified.report.body.publicProbeCoverage).toContainEqual({ probe: "public-search", ran: true });
       expect(verified.report.mismatches).toEqual([]);
@@ -586,46 +630,41 @@ it("establishes the on-disk sequence state from a fresh read-only snapshot sessi
   await withPostgreSqlTestDatabase("migration-verification-sequence-state-empirical", async (db) => {
     const seeded = await seedPortablePostgreSql(db.migrator, { identityOnly: true });
     await grantPortablePostgreSql(db);
-
-    // Phase A: never-called. Nothing has ever invoked nextval() on this
-    // sequence, so pg_sequences.last_value is genuinely NULL and the next
-    // allocation must be read from start_value, not last_value.
-    const neverCalledRuntime = new PostgreSqlRuntime(settings(db.runtimeUrl));
-    try {
-      const session = await neverCalledRuntime.openReadOnlySnapshot({ projectId: seeded.expectedIdentity.id });
+    const projectId = seeded.expectedIdentity.id;
+    const sequence = "pg_catalog.pg_get_serial_sequence('lcm.conversations', 'conversation_id')";
+    // The sequence read classifies the stored state of a table with a row
+    // (#1869): its markers tell a violated bound, which a never-called
+    // sequence produces when its start value collides, apart from a
+    // privilege refusal, and a called sequence at the copied maximum holds.
+    const conversationsMarkers = async (): Promise<string[]> => {
+      const runtime = new PostgreSqlRuntime(settings(db.runtimeUrl));
       try {
-        const state = await readSequenceStoredState(session, "lcm.conversations", "conversation_id");
-        expect(state).toEqual({ kind: "never-called", startValue: 1n });
-      } finally {
-        await session.close();
-      }
-    } finally {
-      await neverCalledRuntime.close();
-    }
-
-    // Phase B: called. An ordinary insert without OVERRIDING SYSTEM VALUE
-    // lets GENERATED BY DEFAULT AS IDENTITY invoke nextval() for real, so
-    // a fresh session afterwards must read a real, non-NULL last_value.
-    await db.migrator.query({
-      text: "INSERT INTO lcm.conversations (project_id, session_id) VALUES ($1, 'sequence-state-called-probe')",
-      values: [seeded.expectedIdentity.id],
-    }, { domain: "factory", operation: "seedCalledSequenceProbe" });
-    const calledRuntime = new PostgreSqlRuntime(settings(db.runtimeUrl));
-    try {
-      const session = await calledRuntime.openReadOnlySnapshot({ projectId: seeded.expectedIdentity.id });
-      try {
-        const state = await readSequenceStoredState(session, "lcm.conversations", "conversation_id");
-        expect(state.kind).toBe("called");
-        if (state.kind === "called") {
-          expect(state.lastValue).toBeGreaterThanOrEqual(1n);
-          expect(state.incrementBy).toBe(1n);
+        const session = await runtime.openReadOnlySnapshot({ projectId });
+        try {
+          return (await readSequenceSelfConsistencyMismatches(session, projectId))
+            .filter((mismatch) => mismatch.domain === "conversations").map((mismatch) => mismatch.identitySha256);
+        } finally {
+          await session.close();
         }
       } finally {
-        await session.close();
+        await runtime.close();
       }
-    } finally {
-      await calledRuntime.close();
-    }
+    };
+
+    // Phase A: never-called. A row inserted with OVERRIDING SYSTEM VALUE
+    // never invokes nextval(), so pg_sequences.last_value is genuinely NULL
+    // and the next allocation must be read from start_value, which collides
+    // with the row.
+    await db.migrator.query({
+      text: "INSERT INTO lcm.conversations (conversation_id, project_id, session_id) OVERRIDING SYSTEM VALUE VALUES (1, $1, 'sequence-state-never-called-probe')",
+      values: [projectId],
+    }, { domain: "factory", operation: "seedNeverCalledSequenceProbe" });
+    expect(await conversationsMarkers()).toEqual([migrationWitnessSha256(["sequence-self-consistency-violation-v1", "conversations"])]);
+
+    // Phase B: called. A real nextval() call records a non-NULL last_value at
+    // the copied maximum, which a fresh session reads through the view.
+    await db.migrator.query({ text: "SELECT pg_catalog.nextval(" + sequence + ")" }, { domain: "factory", operation: "seedCalledSequenceProbe" });
+    expect(await conversationsMarkers()).toEqual([]);
 
     // Phase C: privilege-restricted. Revoking USAGE on this one identity
     // sequence -- a test-database-scoped revoke, never the shared
@@ -639,18 +678,7 @@ it("establishes the on-disk sequence state from a fresh read-only snapshot sessi
     } finally {
       await administrator.close();
     }
-    const restrictedRuntime = new PostgreSqlRuntime(settings(db.runtimeUrl));
-    try {
-      const session = await restrictedRuntime.openReadOnlySnapshot({ projectId: seeded.expectedIdentity.id });
-      try {
-        const state = await readSequenceStoredState(session, "lcm.conversations", "conversation_id");
-        expect(state).toEqual({ kind: "privilege-denied" });
-      } finally {
-        await session.close();
-      }
-    } finally {
-      await restrictedRuntime.close();
-    }
+    expect(await conversationsMarkers()).toEqual([migrationWitnessSha256(["sequence-self-consistency-privilege-denied-v1", "conversations"])]);
   });
 }, 60000);
 

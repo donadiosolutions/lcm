@@ -44,26 +44,37 @@ describe("PostgreSQL portable native mapping", () => {
     await expect(mapping.listCanonicalHeaders(db,projectId,"messages",null,501)).rejects.toThrow();
   });
   it("counts canonical rows database-side over the scope the header stream pages", async () => {
-    const {db, query} = executor([{count:"0"}]);
+    // The header pages share this executor, so the row also carries their sentinel.
+    const {db, query} = executor([{...Object.fromEntries(PORTABLE_RECORD_DOMAIN_ORDER.map((_domain, index) => [`d${index}`,"0"])),more:false}]);
     const signal = new AbortController().signal;
-    for (const domain of PORTABLE_RECORD_DOMAIN_ORDER) {
-      expect(await mapping.countCanonicalRows(db,projectId,domain,signal)).toBe(0);
+    const counts = await mapping.countCanonicalRows(db,projectId,PORTABLE_RECORD_DOMAIN_ORDER,signal);
+    // One statement counts every domain.
+    expect(query).toHaveBeenCalledTimes(1);
+    const count = (query.mock.calls[0] as unknown as [{text:string;values:unknown[]}])[0];
+    expect(count.text).not.toMatch(/octet_length|row_to_json|LIMIT|ORDER BY/);
+    expect(count.values).toEqual([projectId]);
+    const scans = count.text.replace(/^SELECT /u,"").split(/\) AS d\d+(?:, |$)/u).filter(Boolean)
+      .map(part => part.replace("(SELECT COUNT(*)::text FROM ",""));
+    expect(scans).toHaveLength(PORTABLE_RECORD_DOMAIN_ORDER.length);
+    for (const [index, domain] of PORTABLE_RECORD_DOMAIN_ORDER.entries()) {
+      expect(counts.get(domain)!()).toBe(0);
       await mapping.listCanonicalHeaders(db,projectId,domain,null,1);
-      const [count, headers] = query.mock.calls.slice(-2).map(call => (call as unknown as [{text:string;values:unknown[]}])[0]);
-      expect(headers!.text).toContain(count!.text.slice(count!.text.indexOf(" FROM ")));
-      expect(count!.text).toMatch(/^SELECT COUNT\(\*\)::text AS count FROM /);
-      expect(count!.text).not.toMatch(/octet_length|row_to_json|LIMIT|ORDER BY/);
-      expect(count!.values).toEqual([projectId]);
+      const headers = (query.mock.calls.at(-1) as unknown as [{text:string}])[0];
+      // Each count covers exactly the rows its domain's header pages walk.
+      expect(headers.text).toContain(`FROM ${scans[index]!} AND`);
     }
     const options = (query.mock.calls[0] as unknown as [unknown, {operation:string;domain:string;projectId:string;signal:AbortSignal}])[1];
     expect(options).toEqual({domain:"transaction",operation:"portable-count",projectId,signal});
   });
   it("parses counts exactly and refuses non-canonical results", async () => {
-    expect(await mapping.countCanonicalRows(executor([{count:"12"}]).db,projectId,"messages")).toBe(12);
-    for (const rows of [[], [{}], [{count:7}], [{count:""}], [{count:"-1"}], [{count:"01"}], [{count:"1.5"}], [{count:"9007199254740993"}]])
-      await expect(mapping.countCanonicalRows(executor(rows).db,projectId,"messages")).rejects.toMatchObject({code:"record-unrepresentable"});
+    expect((await mapping.countCanonicalRows(executor([{d0:"12"}]).db,projectId,["messages"])).get("messages")!()).toBe(12);
+    for (const rows of [[], [{}], [{d0:7}], [{d0:""}], [{d0:"-1"}], [{d0:"01"}], [{d0:"1.5"}], [{d0:"9007199254740993"}]]) {
+      // The statement succeeds; the malformed count refuses when its domain is evaluated.
+      const counts = await mapping.countCanonicalRows(executor(rows).db,projectId,["messages"]);
+      expect(() => counts.get("messages")!()).toThrow(expect.objectContaining({code:"record-unrepresentable"}));
+    }
     const db = {query: vi.fn(async () => { throw new Error("driver"); })} as unknown as PostgreSqlQueryExecutor;
-    await expect(mapping.countCanonicalRows(db,projectId,"messages")).rejects.toThrow("driver");
+    await expect(mapping.countCanonicalRows(db,projectId,["messages"])).rejects.toThrow("driver");
   });
   it("refuses nonrepresentable memory UUID and empty content before SQL", async () => {
     const {db, query} = executor([]);
@@ -188,10 +199,11 @@ it("refuses cross-conversation relations during disk preflight", async()=>{
 });
 
 it("bounds scoped header and payload queries for every native family including joined text", async()=>{
-  const {db,query}=executor([{test:"payload"}]);
+  const query=vi.fn(async (_config:{text:string},options:{operation:string}) => ({rows:options.operation==="portable-headers"?[]:[{test:"payload"}]}));
+  const db={query} as unknown as PostgreSqlQueryExecutor;
   for(const domain of PORTABLE_RECORD_DOMAIN_ORDER) {
     const locator=JSON.stringify(mapping.mappingForDomain(domain).keys.map(()=>"key"));
-    await mapping.listCanonicalHeaders(db,projectId,domain,locator,500);
+    expect(await mapping.listCanonicalHeaders(db,projectId,domain,locator,500)).toEqual({headers:[],more:false});
     expect(await mapping.readCanonicalRow(db,projectId,domain,locator)).toEqual({test:"payload"});
   }
   expect(query.mock.calls.map(call=>call[0].text).join("\n")).toContain("m.identity_key AS machine_identity_key");
@@ -388,8 +400,8 @@ it("accepts a registered machine linked to the project by repeated alias evidenc
 });
 
 it("suppresses oversized locator output in SQL while returning the measured row length",async()=>{
-  const {db,query}=executor([{locator:"",byteLength:"150994945"}]);
-  expect(await mapping.listCanonicalHeaders(db,projectId,"native-transcript-checkpoints",null,1)).toEqual([{locator:"",byteLength:"150994945"}]);
+  const {db,query}=executor([{locator:"",byteLength:"150994945",more:false}]);
+  expect(await mapping.listCanonicalHeaders(db,projectId,"native-transcript-checkpoints",null,1)).toEqual({headers:[{locator:"",byteLength:"150994945"}],more:false});
   expect(query.mock.calls[0][0].text).toContain("SELECT CASE WHEN");
   expect(query.mock.calls[0][0].text).toContain("<= $4::bigint THEN json_build_array(");
   expect(query.mock.calls[0][0].text).toContain("ELSE '' END AS locator");
@@ -412,13 +424,67 @@ it("bounds a multi-row header page by aggregate locator bytes in SQL while alway
   // budget; an oversized row still projects '' and adds nothing to the sum.
   expect(text).toContain("row_number() OVER page_order AS page_row");
   expect(text).toContain("sum(octet_length(CASE WHEN sized.byte_length <= $4::bigint THEN json_build_array(sized.machine_id::text, sized.normalized_path::text)::text ELSE '' END)) OVER page_order AS page_bytes");
-  expect(text).toContain("WHERE page.page_row = 1 OR page.page_bytes <= $4::bigint ORDER BY page.page_row");
+  expect(text).toContain("WHERE page.page_row = 1 OR page.page_bytes <= $4::bigint)");
+  expect(text).toContain("FROM kept ORDER BY kept.page_row");
   // The projected row size is measured once per scanned row, inside the limited scan.
   expect(text.split("row_to_json(portable_row)")).toHaveLength(2);
   expect(text).toContain("AS byte_length FROM lcm.project_aliases r JOIN lcm.machines m ON m.machine_id = r.machine_id WHERE (r.project_id = $1::uuid)");
   // The conversation closure keeps its one-row reads without the aggregate window.
   await mapping.listConversationMessageHeaders(db,projectId,"1",null,1);
   expect(query.mock.calls[1][0].text).not.toContain("OVER");
+});
+
+it("decides in the page statement whether a row follows the last kept header, by key alone (#1869)",async()=>{
+  const {db,query}=executor([]);
+  expect(await mapping.listCanonicalHeaders(db,projectId,"project-aliases",null,500)).toEqual({headers:[],more:false});
+  const {text}=query.mock.calls[0][0];
+  // The sentinel compares keys after the last kept row (byte-cut pages
+  // included) and never sizes, projects or counts the row it finds.
+  const sentinel=text.slice(text.indexOf("EXISTS"));
+  expect(sentinel).toContain('> (SELECT last.page_key FROM kept AS last ORDER BY last.page_row DESC LIMIT 1) COLLATE "C") AS more');
+  expect(sentinel).toContain("FROM lcm.project_aliases r JOIN lcm.machines m ON m.machine_id = r.machine_id WHERE (r.project_id = $1::uuid)");
+  expect(sentinel).not.toMatch(/row_to_json|octet_length|COUNT/u);
+  for (const more of [true,false]) {
+    const page=await mapping.listCanonicalHeaders(executor([{locator:'["a"]',byteLength:"1",more},{locator:'["b"]',byteLength:"1",more}]).db,projectId,"project",null,2);
+    expect(page).toEqual({headers:[{locator:'["a"]',byteLength:"1"},{locator:'["b"]',byteLength:"1"}],more});
+  }
+  await expect(mapping.listCanonicalHeaders(executor([{locator:'["a"]',byteLength:"1",more:"yes"}]).db,projectId,"project",null,1))
+    .rejects.toMatchObject({code:"record-unrepresentable"});
+  await mapping.listConversationMessageHeaders(db,projectId,"1","7",500);
+  const closure=query.mock.calls[1][0].text;
+  expect(closure).toContain("r.seq>(SELECT pg_catalog.max(last.page_seq) FROM page AS last)) AS more");
+  expect(closure.slice(closure.indexOf("EXISTS"))).not.toMatch(/row_to_json|octet_length/u);
+  expect(await mapping.listConversationMessageHeaders(executor([{locator:'["1"]',byteLength:"1",seq:"8",more:true}]).db,projectId,"1","7",1))
+    .toEqual({headers:[{locator:'["1"]',byteLength:"1",seq:"8"}],more:true});
+});
+
+it("reads every domain's occupancy in one statement, sized or by key alone, and returns the raw values (#1869)",async()=>{
+  const domains=["conversations","passive-events"] as const;
+  const sized=executor([{d0:true,d1:"raw"}]);
+  const occupancy=await mapping.readCanonicalDomainOccupancy(sized.db,projectId,domains,true);
+  expect([...occupancy]).toEqual([["conversations",true],["passive-events","raw"]]);
+  const [sizedConfig,sizedOptions]=sized.query.mock.calls[0] as unknown as [{text:string;values:unknown[]},{operation:string}];
+  expect(sizedOptions.operation).toBe("portable-occupancy");
+  expect(sizedConfig.values).toEqual([projectId]);
+  // The sized form is the first-row read listCanonicalHeaders(limit 1) makes.
+  expect(sizedConfig.text.split("row_to_json(portable_row)")).toHaveLength(3);
+  expect(sizedConfig.text).toContain("LIMIT 1) sized) IS NOT NULL AS d1");
+  const keyed=executor([]);
+  expect([...await mapping.readCanonicalDomainOccupancy(keyed.db,projectId,domains,false)]).toEqual([["conversations",undefined],["passive-events",undefined]]);
+  const keyedText=(keyed.query.mock.calls[0] as unknown as [{text:string}])[0].text;
+  expect(keyedText).toBe("SELECT EXISTS (SELECT 1 FROM lcm.conversations r WHERE (r.project_id = $1::uuid)) AS d0, EXISTS (SELECT 1 FROM lcm.passive_event_inbox r JOIN lcm.machines m ON m.machine_id = r.machine_id WHERE (r.project_id = $1::uuid)) AS d1");
+});
+
+it("finds the first occupied domain in order with each sized read inside its own CASE branch (#1869)",async()=>{
+  const domains=["conversations","messages","passive-events"] as const;
+  const {db,query}=executor([{occupied:"messages"}]);
+  expect(await mapping.findOccupiedCanonicalDomain(db,projectId,domains)).toBe("messages");
+  const [config,options]=query.mock.calls[0] as unknown as [{text:string;values:unknown[]},{operation:string}];
+  expect(options.operation).toBe("portable-occupied");
+  expect(config.values).toEqual([projectId]);
+  expect(config.text).toMatch(/^SELECT CASE WHEN \(SELECT sized\.byte_length FROM .+ THEN 'conversations' WHEN .+ THEN 'messages' WHEN .+ THEN 'passive-events' ELSE NULL END AS occupied$/su);
+  expect(config.text.split("WHEN (SELECT sized.byte_length")).toHaveLength(4);
+  expect(await mapping.findOccupiedCanonicalDomain(executor([]).db,projectId,domains)).toBeUndefined();
 });
 
 it("rejects IDs already owned by another project before any native insertion",async()=>{

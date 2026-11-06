@@ -11,17 +11,18 @@ import {
   type PortableBatch, type PortableCheckpoint, type PortableDomain,
   type PortableManifest, type PortableRecordStream,
 } from '../portable-record-stream.js';
+import { PortableStreamError } from '../portable-record.js';
 import {
   PortableTransferError, normalizePortableTransferError, validatePortableTransferBatch,
   type PortableRecordWriter, type PortablePreflight,
   type PortableDestinationProgress, type PortableDestinationVerification,
 } from '../portable-transfer.js';
-import { createPortableIndex, type PortableIndex } from '../portable-index.js';
+import { createPortableIndex, type PortableIndex, type PortableIndexEntry } from '../portable-index.js';
 import type { PostgreSqlConnectionSettings, PostgreSqlQueryExecutor, PostgreSqlQueryOptions } from './contracts.js';
 import { buildPostgreSqlClientConfig } from './client-config.js';
 import { isPostgreSqlConnectionError } from './errors.js';
 import { verifyPostgreSqlTransferSchema } from './runtime-readiness.js';
-import { assertPostgreSqlRecordCapability, countCanonicalRows, insertCanonicalRecord, listCanonicalHeaders, readCanonicalRow, readCanonicalContentRows, readCanonicalContentSizes, canonicalBatchItemBytes, canonicalRowContentSha256, assertPostgreSqlExistingConstraints, listPostgreSqlRecordUniqueKeys, validatePostgreSqlRecordRelations } from './portable-mapping.js';
+import { assertPostgreSqlRecordCapability, canonicalRowSql, countCanonicalRows, findOccupiedCanonicalDomain, insertCanonicalRecord, listCanonicalHeaders, readCanonicalDomainOccupancy, readCanonicalRow, readCanonicalContentRows, readCanonicalContentSizes, canonicalBatchItemBytes, canonicalRowContentSha256, assertPostgreSqlExistingConstraints, listPostgreSqlRecordUniqueKeys, validatePostgreSqlRecordRelations } from './portable-mapping.js';
 import { createPostgreSqlPortableSource, readPostgreSqlPortableWitness } from './portable-source.js';
 import { acquirePostgreSqlProjectPublicationLock } from './publication-guard.js';
 
@@ -78,6 +79,7 @@ const completions = new WeakMap<PortableDestinationVerification,{state:Destinati
  */
 export const PORTABLE_INITIAL_CHECKPOINT_SHA256 = sha256('lcm-portable-initial-v1');
 export const IDENTITY_DOMAINS = ['machines','project','project-aliases'] as const;
+const NON_IDENTITY_DOMAINS = PORTABLE_RECORD_DOMAIN_ORDER.filter(domain=>!(IDENTITY_DOMAINS as readonly string[]).includes(domain));
 /**
  * Digest recorded by migration 0008 for transfer_identities rows written
  * before the column existed. Those rows predate the write-time capture, so no
@@ -144,63 +146,161 @@ async function runRow(state:{input:Pick<PostgreSqlPortableDestinationInput,"expe
   if(result.rows.length>1) fail('destination-conflict');
   return result.rows[0];
 }
-async function readIdentityFingerprint(state:{input:Pick<PostgreSqlPortableDestinationInput,"expectedIdentity">;executor:PostgreSqlQueryExecutor},signal?:AbortSignal,executor:PostgreSqlQueryExecutor=state.executor):Promise<string> {
-  const binding=await executor.query({text:`SELECT p.project_id::text FROM lcm.projects p JOIN lcm.project_aliases a ON a.project_id=p.project_id JOIN lcm.machines m ON m.machine_id=a.machine_id WHERE p.project_id=$1 AND a.machine_id=$2 AND a.path=$3 AND a.normalized_path=$4`,values:[state.input.expectedIdentity.id,state.input.expectedIdentity.machineId,state.input.expectedIdentity.selectedPath,normalizeProjectPath(state.input.expectedIdentity.selectedPath!)]},options(state,signal));
-  if(binding.rows.length!==1) fail('destination-conflict');
-  const digest=createHash('sha256');
-  // Identity rows are small, but read individually and bound their SQL framing
-  // before decoding so an enormous alias cannot allocate an unbounded array.
-  for(const domain of ['project','project-aliases'] as const){
-    let after:string|null=null;
-    for(;;){
-      const headers=await listCanonicalHeaders(executor,state.input.expectedIdentity.id,domain,after,1,signal);
-      if(headers.length===0) break;
-      const header=headers[0]!;
-      if(BigInt(header.byteLength)>BigInt(PORTABLE_LIMITS.maxBatchBytes))fail('unsupported-capability');
-      const row=await readCanonicalRow(executor,state.input.expectedIdentity.id,domain,header.locator,signal);
-      if(!row)fail('destination-conflict');
-      digest.update(canonicalJson([domain,row]));
-      after=header.locator;
+/** Fingerprinted identity domains in digest order; a row's ordinal indexes this list. */
+const FINGERPRINT_DOMAINS = ['project','project-aliases','machines'] as const;
+type IdentityStatement = Readonly<{binding:boolean;after:unknown;rows:boolean;sourceKeys:readonly (string|null)[]|null}>;
+type IdentityStatementRow = {binding_count?:unknown;fingerprint?:unknown;fingerprint_after?:unknown;fingerprint_more?:unknown;source?:unknown};
+/**
+ * One identity statement (#1869): the binding proof, a page of fingerprint
+ * rows, and source-machine matches for a page of manifest machine entries,
+ * each part only when requested. Fingerprint rows are the project row, the
+ * alias rows and the machine rows in (domain, C-collated key) order, each as
+ * the exact row the per-row reads returned (readCanonicalRow's projection for
+ * project and aliases, {machine_id, identity_key} for machines). A row over
+ * its per-record limit comes back as a NULL payload. One octet budget covers
+ * the whole returned payload and the first row is always kept, so a page ends
+ * early only when the budget or the 500-row cap is reached. Rows are ordered,
+ * cut and tested for a following row by key alone: only the rows of the page
+ * are re-read, by tuple id in the same snapshot, for their payload, so the
+ * row after the page (the sentinel) is never projected or sized. The
+ * statement reads only: every lock the caller relies on was taken by an
+ * earlier statement.
+ */
+function identityStatement(identity:StorageIdentityContext,part:IdentityStatement):QueryConfig {
+  const values:unknown[]=[];
+  const param=(value:unknown,type:string):string=>{values.push(value);return '$'+values.length+'::'+type;};
+  // The project id is $1, the scope canonicalRowSql's fragments use; a
+  // source-only statement binds no project.
+  const project=part.binding||part.rows?param(identity.id,'uuid'):'';
+  const ctes:string[]=[];
+  const columns:string[]=[];
+  if(part.sourceKeys!==null){
+    ctes.push('source_match AS (SELECT k.position::int AS position, m.machine_id::text AS machine_id, m.identity_key FROM pg_catalog.unnest('+param(part.sourceKeys,'text[]')+') WITH ORDINALITY AS k(identity_key, position) CROSS JOIN LATERAL (SELECT machine_id, identity_key FROM lcm.machines WHERE identity_key = k.identity_key LIMIT 2) AS m)',
+      "source_json AS (SELECT COALESCE(pg_catalog.json_agg(pg_catalog.json_build_array(position, machine_id, identity_key) ORDER BY position, machine_id), '[]'::json) AS source FROM source_match)");
+  }
+  if(part.binding){
+    columns.push('(SELECT pg_catalog.count(*)::int FROM (SELECT 1 FROM lcm.projects p JOIN lcm.project_aliases a ON a.project_id=p.project_id JOIN lcm.machines m ON m.machine_id=a.machine_id WHERE p.project_id='+project+' AND a.machine_id='+param(identity.machineId,'uuid')+' AND a.path='+param(identity.selectedPath,'text')+' AND a.normalized_path='+param(normalizeProjectPath(identity.selectedPath!),'text')+' LIMIT 2) AS binding) AS binding_count');
+  }
+  if(part.rows){
+    const budget=param(String(PORTABLE_LIMITS.maxBatchBytes),'bigint');
+    const records=param(PORTABLE_LIMITS.maxBatchRecords,'int');
+    const projectRows=canonicalRowSql('project');
+    const aliasRows=canonicalRowSql('project-aliases');
+    const payload=(sql:{payload:string;scan:string}):string=>'(SELECT CASE WHEN pg_catalog.octet_length(p.payload) <= '+budget+' THEN p.payload END FROM (SELECT '+sql.payload+' AS payload FROM '+sql.scan+' AND r.ctid = l.tid) AS p)';
+    const after=Array.isArray(part.after)?part.after:null;
+    const cursor=after===null?'true':'(c.ordinal > '+param(after[0],'int')+' OR (c.ordinal = '+param(after[0],'int')+' AND c.key > '+param(after[1],'text[]')+' COLLATE "C"))';
+    // Keys and tuple ids only, at most one row past the page: that row is
+    // the sentinel, counted but never projected.
+    ctes.push('limited AS (SELECT o.ordinal, o.key, o.tid, pg_catalog.row_number() OVER (ORDER BY o.ordinal, o.key COLLATE "C") AS page_row FROM (SELECT c.ordinal, c.key, c.tid FROM (SELECT 0 AS ordinal, '+projectRows.key+' AS key, r.ctid AS tid FROM '+projectRows.scan+' UNION ALL SELECT 1, '+aliasRows.key+', r.ctid FROM '+aliasRows.scan+' UNION ALL SELECT 2, ARRAY[r.machine_id::text COLLATE "C"], r.ctid FROM lcm.machines r WHERE r.machine_id = '+param(identity.machineId,'uuid')+' OR EXISTS (SELECT 1 FROM lcm.project_aliases a WHERE a.project_id = '+project+' AND a.machine_id = r.machine_id)) AS c WHERE '+cursor+' ORDER BY c.ordinal, c.key COLLATE "C" LIMIT '+records+' + 1) AS o)',
+      'sized AS (SELECT s.ordinal, s.key, s.element, s.page_row, pg_catalog.sum(pg_catalog.octet_length(s.element::text)) OVER (ORDER BY s.page_row ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW) AS page_bytes FROM (SELECT l.ordinal, l.key, l.page_row, pg_catalog.json_build_array(l.ordinal, CASE l.ordinal WHEN 0 THEN '+payload(projectRows)+' WHEN 1 THEN '+payload(aliasRows)+' ELSE (SELECT CASE WHEN pg_catalog.octet_length(r.identity_key) <= '+param(PORTABLE_LIMITS.maxControlBytes,'bigint')+" THEN pg_catalog.json_build_object('machine_id', r.machine_id::text, 'identity_key', r.identity_key)::text END FROM lcm.machines r WHERE r.ctid = l.tid) END) AS element FROM limited AS l WHERE l.page_row <= "+records+') AS s)',
+      'kept AS (SELECT ordinal, key, element, page_row FROM sized WHERE page_row = 1 OR page_bytes + '+(part.sourceKeys===null?'0':'(SELECT pg_catalog.octet_length(source::text) FROM source_json)')+' <= '+budget+')',
+      'last_kept AS (SELECT ordinal, key FROM kept ORDER BY page_row DESC LIMIT 1)');
+    columns.push("(SELECT COALESCE(pg_catalog.json_agg(element ORDER BY page_row), '[]'::json) FROM kept) AS fingerprint",
+      '(SELECT pg_catalog.json_build_array(ordinal, key) FROM last_kept) AS fingerprint_after',
+      // kept is a prefix of limited, so any row of limited it lacks follows the page.
+      '(SELECT pg_catalog.count(*) FROM limited) > (SELECT pg_catalog.count(*) FROM kept) AS fingerprint_more');
+  }
+  if(part.sourceKeys!==null)columns.push('(SELECT source FROM source_json) AS source');
+  // Every statement reads rows or source entries, so it always has CTEs.
+  return {text:'WITH '+ctes.join(', ')+' SELECT '+columns.join(', '),values};
+}
+async function queryIdentityStatement(state:{input:Pick<PostgreSqlPortableDestinationInput,"expectedIdentity">},executor:PostgreSqlQueryExecutor,part:IdentityStatement,signal?:AbortSignal):Promise<IdentityStatementRow> {
+  const result=await executor.query<IdentityStatementRow>(identityStatement(state.input.expectedIdentity,part),options(state,signal));
+  return result.rows[0]??fail('destination-conflict');
+}
+/** Manifest machine entries in ordinal order, one bounded index page per call; a page never spans two indexes. */
+function sourceMachinePages(indexes:readonly PortableIndex[],signal?:AbortSignal):()=>readonly PortableIndexEntry[] {
+  let position=0;
+  let afterOrdinal=-1;
+  return ()=>{
+    for(;position<indexes.length;position++,afterOrdinal=-1){
+      const entries=indexes[position]!.entries('machines',{afterOrdinal,limit:PORTABLE_LIMITS.maxBatchRecords,maxBytes:PORTABLE_LIMITS.maxControlBytes,signal});
+      if(entries.length){afterOrdinal=entries[entries.length-1]!.ordinal;return entries;}
     }
-  }
-  let machineAfter='';
-  for(;;){
-    const result=await executor.query({text:`SELECT machine_id::text,CASE WHEN octet_length(identity_key)<=$2 THEN identity_key END AS identity_key FROM lcm.machines WHERE (machine_id=$3::uuid OR EXISTS (SELECT 1 FROM lcm.project_aliases a WHERE a.project_id=$4::uuid AND a.machine_id=lcm.machines.machine_id)) AND machine_id::text COLLATE \"C\">$1 COLLATE \"C\" ORDER BY machine_id::text COLLATE \"C\" LIMIT 1`,values:[machineAfter,PORTABLE_LIMITS.maxControlBytes,state.input.expectedIdentity.machineId,state.input.expectedIdentity.id]},options(state,signal));
-    if(!result.rows.length)break;
-    const row=result.rows[0]!;if(typeof row.identity_key!=='string')fail('unsupported-capability');digest.update(canonicalJson(['machines',row]));machineAfter=String(row.machine_id);
-  }
-  return digest.digest('hex');
+    return [];
+  };
+}
+type SourcePage = {entries:readonly PortableIndexEntry[]} | {error:unknown};
+function readSourcePage(next:()=>readonly PortableIndexEntry[]):SourcePage {
+  // An index failure is reported where the per-entry walk reached it: after
+  // the fingerprint and every earlier entry.
+  try{return {entries:next()};}catch(error){return {error};}
+}
+function sourceKeys(entries:readonly PortableIndexEntry[]):(string|null)[] {
+  return entries.map(entry=>typeof entry.order[0]==='string'?entry.order[0]:null);
 }
 /** Source machine membership is fixed by the admitted manifest, not target rows. */
-async function assertSourceMachines(state:DestinationState,index:PortableIndex,signal?:AbortSignal,executor:PostgreSqlQueryExecutor=state.executor):Promise<void> {
-  let afterOrdinal=-1;
-  for(;;){
+function assertSourceMachinePage(entries:readonly PortableIndexEntry[],source:unknown,signal?:AbortSignal):void {
+  if(!Array.isArray(source))fail('destination-conflict');
+  const matches=new Map<number,unknown[][]>();
+  for(const match of source){
+    if(!Array.isArray(match)||match.length!==3||!Number.isSafeInteger(match[0])||match[0]<1||match[0]>entries.length)fail('destination-conflict');
+    matches.set(match[0],[...(matches.get(match[0])??[]),match]);
+  }
+  entries.forEach((entry,index)=>{
     abort(signal);
-    const entry=index.entries('machines',{afterOrdinal,limit:1,maxBytes:PORTABLE_LIMITS.maxControlBytes,signal})[0];
-    if(!entry)return;
     const identityKey=entry.order[0];
     if(typeof identityKey!=='string')fail('destination-conflict');
-    const found=await executor.query<{machine_id:string;identity_key:string}>({
-      text:'SELECT machine_id::text,identity_key FROM lcm.machines WHERE identity_key=$1 LIMIT 2',
-      values:[identityKey],
-    },options(state,signal));
-    const machine=found.rows[0];
-    if(found.rows.length!==1 || !machine || typeof machine.machine_id!=='string' || machine.identity_key!==identityKey)fail('destination-conflict');
-    const actual=createPortableRecord({domain:'machines',ordinal:entry.ordinal,context:null,value:{identityKey:machine.identity_key,machineId:machine.machine_id}});
+    const found=matches.get(index+1)??[];
+    const [,machineId,machineIdentityKey]=found[0]??[];
+    if(found.length!==1 || typeof machineId!=='string' || machineIdentityKey!==identityKey)fail('destination-conflict');
+    const actual=createPortableRecord({domain:'machines',ordinal:entry.ordinal,context:null,value:{identityKey:machineIdentityKey,machineId}});
     if(actual.recordSha256!==entry.recordSha256)fail('destination-conflict');
-    afterOrdinal=entry.ordinal;
+  });
+}
+/**
+ * The identity fingerprint, and when checking an admitted run, its comparison
+ * and the source-machine proof for every given index, in the order the
+ * per-row reads evaluated them: binding, fingerprint rows (a NULL payload is
+ * unsupported-capability), digest, then each manifest machine entry. The
+ * first statement carries every part; another follows only for a further
+ * fingerprint page or source page, and each keeps its own continuation.
+ */
+async function readIdentityFingerprint(state:{input:Pick<PostgreSqlPortableDestinationInput,"expectedIdentity">;executor:PostgreSqlQueryExecutor},signal?:AbortSignal,executor:PostgreSqlQueryExecutor=state.executor,check?:Readonly<{expected:string;indexes:readonly PortableIndex[]}>):Promise<string> {
+  const nextSource=sourceMachinePages(check?.indexes??[],signal);
+  let sourcePage=readSourcePage(nextSource);
+  let source:unknown=undefined;
+  const digest=createHash('sha256');
+  let after:unknown=null;
+  for(let first=true;;first=false){
+    const sourceRequest=first&&'entries' in sourcePage&&sourcePage.entries.length?sourceKeys(sourcePage.entries):null;
+    const page=await queryIdentityStatement(state,executor,{binding:first,after,rows:true,sourceKeys:sourceRequest},signal);
+    if(first){
+      if(page.binding_count!==1) fail('destination-conflict');
+      source=page.source;
+    }
+    if(!Array.isArray(page.fingerprint)||typeof page.fingerprint_more!=='boolean'||(page.fingerprint_more&&!page.fingerprint.length))fail('destination-conflict');
+    for(const element of page.fingerprint){
+      const domain=Array.isArray(element)?FINGERPRINT_DOMAINS[element[0] as 0|1|2]:undefined;
+      if(domain===undefined)fail('destination-conflict');
+      if(typeof element[1]!=='string')fail('unsupported-capability');
+      digest.update(canonicalJson([domain,JSON.parse(element[1])]));
+    }
+    if(!page.fingerprint_more)break;
+    after=page.fingerprint_after;
+  }
+  const fingerprint=digest.digest('hex');
+  if(check===undefined)return fingerprint;
+  if(fingerprint!==check.expected)fail('destination-conflict');
+  for(;;){
+    abort(signal);
+    if('error' in sourcePage)throw sourcePage.error;
+    if(!sourcePage.entries.length)return fingerprint;
+    source??=(await queryIdentityStatement(state,executor,{binding:false,after:null,rows:false,sourceKeys:sourceKeys(sourcePage.entries)},signal)).source;
+    assertSourceMachinePage(sourcePage.entries,source,signal);
+    sourcePage=readSourcePage(nextSource);
+    source=undefined;
   }
 }
-async function assertIdentity(state:DestinationState,signal?:AbortSignal,executor:PostgreSqlQueryExecutor=state.executor):Promise<void> {
+async function assertIdentity(state:DestinationState,signal?:AbortSignal,executor:PostgreSqlQueryExecutor=state.executor,indexes:readonly PortableIndex[]=state.index?[state.index]:[]):Promise<void> {
   abort(signal);
   if(state.closed || state.expectedIdentityBytes!==canonicalJson(state.expectedInput)) fail('destination-conflict');
-  if(await readIdentityFingerprint(state,signal,executor)!==state.identityFingerprint) fail('destination-conflict');
-  if(state.index)await assertSourceMachines(state,state.index,signal,executor);
+  await readIdentityFingerprint(state,signal,executor,{expected:state.identityFingerprint,indexes});
 }
 async function assertEmpty(state:DestinationState,signal?:AbortSignal,executor:PostgreSqlQueryExecutor=state.executor):Promise<void> {
-  for(const domain of PORTABLE_RECORD_DOMAIN_ORDER.filter(domain=>!(IDENTITY_DOMAINS as readonly string[]).includes(domain))){
-    if((await listCanonicalHeaders(executor,state.input.expectedIdentity.id,domain,null,1,signal)).length) fail('destination-conflict');
-  }
+  // One ordered statement: the first occupied domain refuses, as the
+  // per-domain loop did, and later domains are never read.
+  if(await findOccupiedCanonicalDomain(executor,state.input.expectedIdentity.id,NON_IDENTITY_DOMAINS,signal)!==null) fail('destination-conflict');
 }
 async function connect(state:DestinationState,signal?:AbortSignal):Promise<void> {
   abort(signal);
@@ -294,14 +394,21 @@ async function preflight(state:DestinationState,manifestInput:PortableManifest,s
       index.finalizeDomain(domain);
       if(domain==='project'||domain==='project-aliases'){
         let actualCount=0;let cursor:string|null=null;
-        for(;;){const headers=await listCanonicalHeaders(state.executor,state.input.expectedIdentity.id,domain,cursor,1,signal);if(!headers.length)break;actualCount++;cursor=headers[0]!.locator;}
+        // Full header pages with their sentinel; an oversized row ('' locator)
+        // refuses exactly as resuming after it did in the row-by-row walk.
+        for(;;){
+          const page=await listCanonicalHeaders(state.executor,state.input.expectedIdentity.id,domain,cursor,PORTABLE_LIMITS.maxBatchRecords,signal);
+          if(page.headers.some(header=>header.locator===''))throw new PortableStreamError('record-unrepresentable');
+          actualCount+=page.headers.length;
+          if(!page.more)break;
+          cursor=page.headers[page.headers.length-1]!.locator;
+        }
         if(actualCount!==count) fail('destination-conflict');
       }
     }
     index.verifyDependencies();
     index.verifyScopesAndAcyclic();
-    await assertIdentity(state,signal);
-    await assertSourceMachines(state,index,signal);
+    await assertIdentity(state,signal,state.executor,[...(state.index?[state.index]:[]),index]);
     const token=Object.freeze({manifestSha256:manifest.manifestSha256,destinationWitnessSha256:state.witness});
     preflights.set(token,{state,index,manifestBytes:Buffer.from(serializePortableManifest(manifest)).toString('base64')});
     state.index?.close();state.index=index;
@@ -499,9 +606,11 @@ async function canonicalVerification(state:DestinationState,manifest:PortableMan
  * this run did not write. Identity domains are excluded on purpose: their ledger
  * rows are admission-time lookups rather than writes, and machines are
  * project-linked rather than project-owned, so a ledger tally is meaningless for
- * them. The live tally issues two database-side counts per tallied domain: the
- * ledger tally and the live canonical count, the latter over the same scope
- * predicate as the verification stream (countCanonicalRows). It runs only on the
+ * them. The live canonical counts of every tallied domain come from one
+ * statement over the same scope predicates as the verification stream
+ * (countCanonicalRows, #1869); the publication lock excludes writers, so they
+ * equal per-domain reads. Each domain is then checked in order exactly as
+ * before: its ledger tally, then its live count, then the comparison. It runs only on the
  * active-to-completed transition, not on post-commit readback, where a legitimate
  * writer may already have added rows. A surplus refuses as
  * destination-unexpected-rows, distinct from verification-failed (content
@@ -510,12 +619,13 @@ async function canonicalVerification(state:DestinationState,manifest:PortableMan
  * the run's set.
  */
 async function assertNoForeignCanonicalRows(executor:PostgreSqlQueryExecutor,state:DestinationState,signal?:AbortSignal):Promise<void>{
-  for(const domain of PORTABLE_RECORD_DOMAIN_ORDER.filter(domain=>!(IDENTITY_DOMAINS as readonly string[]).includes(domain))){
+  const counts=await countCanonicalRows(executor,state.input.expectedIdentity.id,NON_IDENTITY_DOMAINS,signal);
+  for(const domain of NON_IDENTITY_DOMAINS){
     const ledger=await executor.query<{count:string}>({text:'SELECT COUNT(*) AS count FROM lcm.transfer_identities WHERE run_id=$1 AND domain=$2',values:[state.input.runId,domain]},options(state,signal));
     const tally=ledger.rows[0]?.count;
     const expected=typeof tally==='string'?Number(tally):NaN;
     if(!Number.isSafeInteger(expected))fail('destination-uncertain');
-    const live=await countCanonicalRows(executor,state.input.expectedIdentity.id,domain,signal);
+    const live=counts.get(domain)!();
     if(live>expected)fail('destination-unexpected-rows');
     if(live<expected)fail('verification-failed');
   }
@@ -730,10 +840,9 @@ export async function probePostgreSqlPortableDestination(input:Pick<PostgreSqlPo
       const destinationWitnessSha256=await readPostgreSqlPortableWitness(executor,input.expectedIdentity.id,input.signal);
       const systemIdentifier=await readSystemIdentifier(input.expectedIdentity.id,executor,input.signal);
       const identityFingerprintSha256=await readIdentityFingerprint(state,input.signal);
-      let nonIdentityDomainsEmpty=true;
-      for(const domain of PORTABLE_RECORD_DOMAIN_ORDER.filter(domain=>!(IDENTITY_DOMAINS as readonly string[]).includes(domain))){
-        if((await listCanonicalHeaders(executor,input.expectedIdentity.id,domain,null,1,input.signal)).length)nonIdentityDomainsEmpty=false;
-      }
+      // Every domain's sized first-row read, in one statement, as the loop read them all.
+      const occupancy=await readCanonicalDomainOccupancy(executor,input.expectedIdentity.id,NON_IDENTITY_DOMAINS,true,input.signal);
+      const nonIdentityDomainsEmpty=NON_IDENTITY_DOMAINS.every(domain=>occupancy.get(domain)===false);
       const row=await runRow(state,executor,false,input.signal);
       if(row&&(!/^[A-Za-z0-9_-]{1,128}$/u.test(row.run_id)||!/^[A-Za-z0-9_-]{1,128}$/u.test(row.target_generation)
         || !/^[a-f0-9]{64}$/u.test(row.manifest_sha256)||row.project_sha256!==identityFingerprintSha256

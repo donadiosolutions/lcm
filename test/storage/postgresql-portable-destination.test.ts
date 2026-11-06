@@ -13,7 +13,7 @@ import { createGeneration, createFixtureSource, postgresGeneration, MACHINE_A_UU
 const boundaries = vi.hoisted(() => ({
   runtime: vi.fn(), client: vi.fn(), config: vi.fn(), schema: vi.fn(), witness: vi.fn(),
   headers: vi.fn(), count: vi.fn(), row: vi.fn(), insert: vi.fn(), capability: vi.fn(), source: vi.fn(), contentRows: vi.fn(),
-  contentSizes: vi.fn(),
+  contentSizes: vi.fn(), occupancy: vi.fn(), occupied: vi.fn(),
 }));
 vi.mock('../../src/storage/postgresql/runtime.js', () => ({ PostgreSqlRuntime: class { constructor() { return boundaries.runtime(); } } }));
 vi.mock('pg', () => ({ Client: class { constructor(...args: unknown[]) { return boundaries.client(...args); } } }));
@@ -24,6 +24,7 @@ vi.mock('../../src/storage/postgresql/portable-mapping.js', async importOriginal
   listCanonicalHeaders: boundaries.headers, countCanonicalRows: boundaries.count, readCanonicalRow: boundaries.row,
   insertCanonicalRecord: boundaries.insert, assertPostgreSqlRecordCapability: boundaries.capability,
   readCanonicalContentRows: boundaries.contentRows, readCanonicalContentSizes: boundaries.contentSizes,
+  readCanonicalDomainOccupancy: boundaries.occupancy, findOccupiedCanonicalDomain: boundaries.occupied,
 }));
 vi.mock('../../src/storage/postgresql/portable-source.js', () => ({
   readPostgreSqlPortableWitness: boundaries.witness, createPostgreSqlPortableSource: boundaries.source,
@@ -56,7 +57,17 @@ class Database {
   isolation: Row[] = [{ isolation: 'read committed', readonly: 'off' }];
   cas = true;
   ledgerTallyFailure = false;
+  /** Answers an unreadable ledger tally for only these domains. */
+  ledgerTallyFailureDomains?: ReadonlySet<string>;
   extraRuns = false;
+  /** Answers the first identity row of this domain ordinal (project 0, aliases 1, machines 2) as over its per-record limit. */
+  oversizedIdentity?: number;
+  /** Cuts identity fingerprint pages after this many rows instead of the statement's row cap. */
+  identityPageSize?: number;
+  /** Replaces the whole identity statement row. */
+  identityRows?: Row[];
+  /** Replaces the source-machine part of the identity statement. */
+  identitySource?: unknown;
   commitFailure: 'before' | 'after' | undefined;
   rollbackFailure = false;
   endFailure = false;
@@ -67,6 +78,48 @@ class Database {
   }
   restore(saved: Saved): void {
     this.run = saved.run; this.receipts = saved.receipts; this.identities = saved.identities; this.identityLedger = saved.identityLedger; this.records = saved.records;
+  }
+  /**
+   * The fused identity statement (#1869): the binding count, a fingerprint
+   * page of [ordinal, payload] elements in (domain, key) order with its
+   * continuation, and source-machine matches for the requested identity keys.
+   */
+  identityStatement(text: string, values: readonly unknown[]): Row {
+    const param = (pattern: RegExp): unknown => {
+      const match = pattern.exec(text);
+      return match === null ? undefined : values[Number(match[1]) - 1];
+    };
+    const row: Row = {};
+    if (text.includes('AS binding_count')) row.binding_count = Math.min(this.binding.length, 2);
+    if (text.includes('AS fingerprint_more')) {
+      const machineId = param(/r\.machine_id = \$(\d+)::uuid OR EXISTS/u);
+      const aliases = this.records.get('project-aliases') ?? [];
+      const ordinal = (record: PortableRecord) => [String(record.ordinal).padStart(8, '0')];
+      const candidates: (readonly [number, string[], string | null])[] = [
+        ...(this.records.get('project') ?? []).map(record => [0, ordinal(record), JSON.stringify(record.value)] as const),
+        ...aliases.map(record => [1, ordinal(record), JSON.stringify(record.value)] as const),
+        ...this.machines
+          .filter(machine => machine.machine_id === machineId || aliases.some(alias => (alias.value as unknown as Row).machineIdentityKey === machine.identity_key))
+          .sort((left, right) => String(left.machine_id) < String(right.machine_id) ? -1 : 1)
+          .map(machine => [2, [String(machine.machine_id)], typeof machine.identity_key === 'string'
+            ? JSON.stringify({ machine_id: machine.machine_id, identity_key: machine.identity_key }) : null] as const),
+      ];
+      const afterOrdinal = param(/c\.ordinal > \$(\d+)::int/u);
+      const afterKey = param(/c\.key > \$(\d+)::text\[\]/u) as string[] | undefined;
+      const following = afterOrdinal === undefined ? candidates : candidates.filter(([domain, key]) => (
+        domain > Number(afterOrdinal) || (domain === Number(afterOrdinal) && key[0]! > afterKey![0]!)));
+      const kept = following.slice(0, this.identityPageSize ?? Number(param(/LIMIT \$(\d+)::int \+ 1/u)));
+      row.fingerprint = kept.map(([domain, , payload], index) => [domain,
+        domain === this.oversizedIdentity && kept.findIndex(([candidate]) => candidate === domain) === index ? null : payload]);
+      row.fingerprint_after = kept.length === 0 ? null : [kept.at(-1)![0], kept.at(-1)![1]];
+      row.fingerprint_more = following.length > kept.length;
+    }
+    if (text.includes('source_match AS')) {
+      const keys = param(/unnest\(\$(\d+)::text\[\]\)/u) as readonly (string | null)[];
+      row.source = this.identitySource ?? keys.flatMap((key, index) => (this.sourceMachineRows ?? this.machines.filter(machine => machine.identity_key === key))
+        .slice(0, 2).map(machine => [index + 1, machine?.machine_id, machine?.identity_key]));
+    }
+    return row;
   }
   async query(config: QueryConfig): Promise<{ rows: Row[]; rowCount: number }> {
     const text = config.text;
@@ -96,6 +149,7 @@ class Database {
       if (text.includes('FROM lcm.passive_event_inbox r')) return result([{ conflict: foreign.some(row => row.table === 'passive_event_inbox' && row.identity_key === values[1] && (row.event_id === values[2] || row.machine_sequence === values[3])) }]);
     }
     if (text.includes("current_setting('server_version_num')")) return result(this.safety);
+    if (text.includes('AS fingerprint_more') || text.includes('source_match AS')) return result(this.identityRows ?? [this.identityStatement(text, values)]);
     if (text.includes('pg_control_system()')) return result(this.systemIdentifier);
     if (text.includes('pg_try_advisory_lock')) return result([{ held: this.lock }]);
     // Completion fences the project against canonical writers before reading.
@@ -121,7 +175,7 @@ class Database {
       return result(rows.sort((a, b) => b.next_ordinal - a.next_ordinal).slice(0, 1));
     }
     if (text.startsWith('SELECT COUNT(*) AS count FROM lcm.transfer_identities')) {
-      if (this.ledgerTallyFailure) return result([{ count: 7 }]);
+      if (this.ledgerTallyFailure || this.ledgerTallyFailureDomains?.has(String(values[1]))) return result([{ count: 7 }]);
       const prefix = `${values[1]}:`;
       let tallied = 0;
       for (const key of this.identities.keys()) if (key.startsWith(prefix)) tallied++;
@@ -214,8 +268,17 @@ beforeEach(() => {
   boundaries.config.mockReturnValue({});
   boundaries.schema.mockResolvedValue(undefined);
   boundaries.witness.mockResolvedValue('f'.repeat(64));
-  boundaries.headers.mockImplementation(async (_executor, _project, domain: PortableDomain, after: string | null) => (db.records.get(domain) ?? []).filter(row => after === null || String(row.ordinal).padStart(8, '0') > after).slice(0, 1).map(row => ({ locator: String(row.ordinal).padStart(8, '0'), byteLength: '128' })));
-  boundaries.count.mockImplementation(async (_executor, _project, domain: PortableDomain) => (db.records.get(domain) ?? []).length);
+  boundaries.headers.mockImplementation(async (_executor, _project, domain: PortableDomain, after: string | null, limit: number) => {
+    const following = (db.records.get(domain) ?? []).filter(row => after === null || String(row.ordinal).padStart(8, '0') > after);
+    return { headers: following.slice(0, limit).map(row => ({ locator: String(row.ordinal).padStart(8, '0'), byteLength: '128' })), more: following.length > limit };
+  });
+  // Counts are read when the statement runs; each is validated when its domain is reached.
+  boundaries.count.mockImplementation(async (_executor, _project, domains: readonly PortableDomain[]) => new Map(
+    domains.map(domain => { const count = (db.records.get(domain) ?? []).length; return [domain, () => count]; })));
+  boundaries.occupancy.mockImplementation(async (_executor, _project, domains: readonly PortableDomain[]) => new Map(
+    domains.map(domain => [domain, (db.records.get(domain) ?? []).length > 0])));
+  boundaries.occupied.mockImplementation(async (_executor, _project, domains: readonly PortableDomain[]) => (
+    domains.find(domain => (db.records.get(domain) ?? []).length > 0) ?? null));
   boundaries.row.mockImplementation(async (_executor, _project, domain: PortableDomain, locator: string) => {
     if (boundaries.row.mock.calls.length > 10000) throw new Error('fake header runaway');
     const records = db.records.get(domain) ?? [];
@@ -330,13 +393,46 @@ describe('PostgreSQL portable destination authority', () => {
   it('refuses missing registered identity binding', async () => {
     db.binding = []; await expect(open()).rejects.toMatchObject({ code: 'destination-conflict' }); expectNoRun();
   });
-  it('refuses oversized identity rows before decoding them', async () => {
-    boundaries.headers.mockResolvedValue([{ locator: '0', byteLength: String(PORTABLE_LIMITS.maxBatchBytes + 1) }]);
+  it.each([['project', 0], ['alias', 1], ['machine', 2]] as const)('refuses an oversized identity %s row before decoding it', async (_label, ordinal) => {
+    db.oversizedIdentity = ordinal;
     await expect(open()).rejects.toMatchObject({ code: 'unsupported-capability' }); expectNoRun();
   });
-  it('refuses identity rows deleted after their header was read', async () => {
-    boundaries.row.mockResolvedValue(undefined);
+  it('refuses a missing binding before an oversized identity row', async () => {
+    db.binding = []; db.oversizedIdentity = 0;
     await expect(open()).rejects.toMatchObject({ code: 'destination-conflict' }); expectNoRun();
+  });
+  // One statement reads every identity row in one snapshot, so a row can no
+  // longer vanish between its header and its read (#1869); a malformed
+  // statement result refuses instead.
+  it.each([
+    ['no row', []],
+    ['a malformed fingerprint', [{ binding_count: 1, fingerprint: null, fingerprint_more: false }]],
+    ['a malformed continuation flag', [{ binding_count: 1, fingerprint: [], fingerprint_more: 'no' }]],
+    ['a continuation after no rows', [{ binding_count: 1, fingerprint: [], fingerprint_more: true }]],
+    ['an unknown fingerprint domain', [{ binding_count: 1, fingerprint: [[3, '{}']], fingerprint_more: false }]],
+    ['a fingerprint element that is not a pair', [{ binding_count: 1, fingerprint: ['{}'], fingerprint_more: false }]],
+  ])('refuses an identity statement result with %s', async (_name, rows) => {
+    db.identityRows = rows as Row[];
+    await expect(open()).rejects.toMatchObject({ code: 'destination-conflict' }); expectNoRun();
+  });
+  it('reads the identity fingerprint across continuation pages with the same digest', async () => {
+    const { writer, stream, manifest } = await admitted();
+    db.identityPageSize = 1;
+    const first = await batch(stream);
+    await expect(writer.applyBatch(first)).resolves.toEqual(first.checkpoint);
+    expect(db.queryLog.filter(text => text.includes('AS fingerprint_more')).length).toBeGreaterThan(1);
+    await expect(writer.readProgress(manifest.manifestSha256)).resolves.toMatchObject({ manifestSha256: manifest.manifestSha256 });
+  });
+  it.each([
+    ['a non-array result', 'x'],
+    ['a non-array match', ['x']],
+    ['a short match', [[1, MACHINE_A_UUID]]],
+    ['a non-integer position', [[1.5, MACHINE_A_UUID, 'installation:0b7715']]],
+    ['a position before the page', [[0, MACHINE_A_UUID, 'installation:0b7715']]],
+    ['a position past the page', [[99, MACHINE_A_UUID, 'installation:0b7715']]],
+  ])('refuses source-machine evidence with %s', async (_name, source) => {
+    const { writer, stream } = await admitted(); const saved = db.snapshot(); db.identitySource = source;
+    await expect(writer.applyBatch(await batch(stream))).rejects.toMatchObject({ code: 'destination-conflict' }); expect(db.snapshot()).toEqual(saved);
   });
   it('refuses a machine whose identity key exceeds the SQL bound', async () => {
     db.machines[0]!.identity_key = null;
@@ -395,14 +491,28 @@ describe('complete preflight and durable admission', () => {
   });
   it('requires exact registered alias cardinality', async () => {
     const writer = await open(); const stream = await source();
-    boundaries.headers.mockImplementation(async (_e, _p, domain: PortableDomain, after: string | null) => {
-      const records = db.records.get(domain) ?? [];
-      const row = records.filter(r => after === null || String(r.ordinal).padStart(8, '0') > after)[0];
-      if (row) return [{ locator: String(row.ordinal).padStart(8, '0'), byteLength: '128' }];
-      return domain === 'project-aliases' && after !== 'extra' ? [{ locator: 'extra', byteLength: '128' }] : [];
+    const headers = boundaries.headers.getMockImplementation()!;
+    boundaries.headers.mockImplementation(async (...args) => {
+      const page = await headers(...args);
+      return args[2] === 'project-aliases' ? { headers: [...page.headers, { locator: 'extra', byteLength: '128' }], more: false } : page;
     });
-    boundaries.row.mockImplementation(async (_e, _p, domain: PortableDomain, locator: string) => locator === 'extra' ? {} : db.records.get(domain)?.[Number(locator)]?.value);
     await expect(writer.preflight(stream.describe(), stream)).rejects.toMatchObject({ code: 'destination-conflict' }); expectNoRun();
+  });
+  it('counts registered aliases across header pages', async () => {
+    const writer = await open(); const stream = await source();
+    const headers = boundaries.headers.getMockImplementation()!;
+    boundaries.headers.mockImplementation(async (executor, project, domain, after) => headers(executor, project, domain, after, 1));
+    await expect(writer.preflight(stream.describe(), stream)).resolves.toBeDefined();
+    expect(boundaries.headers.mock.calls.filter(call => call[2] === 'project-aliases').length).toBeGreaterThan(1);
+  });
+  it('refuses an oversized registered alias as unrepresentable, as the row-by-row walk did', async () => {
+    const writer = await open(); const stream = await source();
+    const headers = boundaries.headers.getMockImplementation()!;
+    boundaries.headers.mockImplementation(async (...args) => {
+      const page = await headers(...args);
+      return args[2] === 'project-aliases' ? { headers: [{ locator: '', byteLength: String(PORTABLE_LIMITS.maxBatchBytes + 1) }], more: false } : page;
+    });
+    await expect(writer.preflight(stream.describe(), stream)).rejects.toMatchObject({ code: 'unsupported-capability' }); expectNoRun();
   });
   it('does not let identity preflight resolve payload dependencies', async () => {
     boundaries.insert.mockImplementation(async (_e, _p, _r, resolve) => resolve('machines', 'forged'));
@@ -858,6 +968,17 @@ describe('source-machine evidence integrity', () => {
     const { writer, stream } = await admitted(); const saved = db.snapshot(); db.sourceMachineRows = [undefined] as never;
     await expect(writer.applyBatch(await batch(stream))).rejects.toMatchObject({ code: 'destination-conflict' }); expect(db.snapshot()).toEqual(saved);
   });
+  it.each([
+    ['the index failure', false, 'source-failed'],
+    // A drifted fingerprint is refused first, before the failing index is reached.
+    ['a drifted fingerprint before it', true, 'destination-conflict'],
+  ] as const)('reports a source-index failure only after the identity fingerprint: %s', async (_label, drift, code) => {
+    const { writer, stream } = await admitted(); const first = await batch(stream); const saved = db.snapshot();
+    vi.spyOn(PortableIndex.prototype, 'entries').mockImplementationOnce(() => { throw new PortableTransferError('source-failed'); });
+    if (drift) db.machines[0]!.identity_key = 'changed';
+    await expect(writer.applyBatch(first)).rejects.toMatchObject({ code });
+    if (!drift) expect(db.snapshot()).toEqual(saved);
+  });
 });
 
 it('admits and proves receipts entirely through the supplied transaction', async () => {
@@ -1300,6 +1421,25 @@ it('refuses an unreadable ledger tally without trusting it',async()=>{
  await db.query({text:'BEGIN'});
  db.ledgerTallyFailure=true;
  await expect(api.completePortableDestinationInTransaction(executor,writer,verified)).rejects.toMatchObject({code:'destination-uncertain'});
+ expect(db.run?.state).toBe('active');
+ await db.query({text:'ROLLBACK'});
+});
+it.each([
+ ['conversations','messages','destination-unexpected-rows'],
+ ['messages','conversations','destination-uncertain'],
+] as const)('reads every live count once yet refuses a surplus in %s and a failed tally in %s in domain order (#1869)',async(surplus,tally,code)=>{
+ const api=await import('../../src/storage/postgresql/portable-destination.js');
+ const {writer,stream,manifest}=await admitted();await transferAll(writer,stream);
+ const verified=await api.verifyPortableDestinationComplete(writer,manifest);
+ const executor={transactionScope:'active' as const,query:db.query.bind(db) as never};
+ await db.query({text:'BEGIN'});
+ // One statement reads the live counts of every tallied domain up front;
+ // the domains are still checked in order, so the earlier domain decides.
+ db.records.get(surplus)!.push({ordinal:999999} as never);
+ db.ledgerTallyFailureDomains=new Set([tally]);
+ boundaries.count.mockClear();
+ await expect(api.completePortableDestinationInTransaction(executor,writer,verified)).rejects.toMatchObject({code});
+ expect(boundaries.count).toHaveBeenCalledTimes(1);
  expect(db.run?.state).toBe('active');
  await db.query({text:'ROLLBACK'});
 });

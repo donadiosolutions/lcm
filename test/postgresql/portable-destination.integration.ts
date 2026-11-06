@@ -570,7 +570,8 @@ describe('PostgreSQL canonical source header pages',()=>{
       const expected=['a','b','c','d','e'].map(letter=>`["${machineId}", "codex", "${letter}${'x'.repeat(1023)}"]`);
       // At the production bound the five ~1 KiB locators form one page in C order.
       const full=await listCanonicalHeaders(recording,projectId,'native-transcript-checkpoints',null,500);
-      expect(full.map(header=>header.locator)).toEqual(expected);
+      expect(full.headers.map(header=>header.locator)).toEqual(expected);
+      expect(full.more).toBe(false);
       expect(captured).toHaveLength(1);
       expect(captured[0]!.values).toEqual([projectId,null,500,String(PORTABLE_LIMITS.maxBatchBytes)]);
       // Every locator key column is a btree primary-key member, so PostgreSQL
@@ -580,21 +581,26 @@ describe('PostgreSQL canonical source header pages',()=>{
       // scan then exceeds the running sum, while a single row always fits.
       const budget=Buffer.byteLength(expected[0]!)+Buffer.byteLength(expected[1]!);
       const sql=captured[0]!.text;
-      const run=async(after:string|null,bound:number)=>(await db.migrator.query<{locator:string;byteLength:string}>({text:sql,values:[projectId,after===null?null:JSON.parse(after),500,String(bound)]},context)).rows;
+      const run=async(after:string|null,bound:number)=>(await db.migrator.query<{locator:string;byteLength:string;more:boolean}>({text:sql,values:[projectId,after===null?null:JSON.parse(after),500,String(bound)]},context)).rows;
       const pages:string[][]=[];
+      const sentinels:boolean[]=[];
       for(let after:string|null=null;;){
         const rows=await run(after,budget);
         if(rows.length===0)break;
         pages.push(rows.map(row=>row.locator));
+        sentinels.push(rows.at(-1)!.more);
         after=rows.at(-1)!.locator;
       }
       expect(pages).toEqual([[expected[0],expected[1]],[expected[2],expected[3]],[expected[4]]]);
+      // A byte-cut page still reports the rows after its last kept header
+      // (#1869), so the walk ends on the last page without an empty one.
+      expect(sentinels).toEqual([true,true,false]);
       // Below every row's own size the single-row semantics are unchanged: the
       // locator is suppressed, the real size still travels, and the empty
       // locators add nothing to the running sum, so no row is hidden.
       const suppressed=await run(null,1);
       expect(suppressed.map(row=>row.locator)).toEqual(['','','','','']);
-      expect(suppressed.map(row=>row.byteLength)).toEqual(full.map(header=>header.byteLength));
+      expect(suppressed.map(row=>row.byteLength)).toEqual(full.headers.map(header=>header.byteLength));
       expect(suppressed.every(row=>BigInt(row.byteLength)>1n)).toBe(true);
       expect(await run(null,budget).then(rows=>rows.length)).toBe(2);
     });

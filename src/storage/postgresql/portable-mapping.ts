@@ -96,7 +96,31 @@ function sizeExpression(domain:PortableDomain,mapping:Mapping):string {
   // fields must not turn a representable record into an oversized singleton.
   return `(SELECT octet_length(row_to_json(portable_row)::text)::bigint FROM (SELECT ${projection(domain,mapping)}) portable_row)`;
 }
+/**
+ * SQL fragments for one domain's canonical rows, scoped by $1 (the project
+ * id), for statements that fuse several domain reads: the FROM/JOIN/scope
+ * listCanonicalHeaders pages, its C-collated key, the exact projection
+ * readCanonicalRow returns as JSON text, and its size measure.
+ */
+export function canonicalRowSql(domain:PortableDomain):Readonly<{scan:string;key:string;keys:string;payload:string;size:string}> {
+  const mapping = mappingForDomain(domain);
+  return {
+    scan:`${mapping.table} r${mapping.joins ?? ""} WHERE (${scope(domain)})`,
+    key:keyExpression(mapping),
+    keys:mapping.keys.map((key) => `r.${key}::text AS ${key}`).join(", "),
+    payload:`(SELECT row_to_json(portable_row)::text FROM (SELECT ${mapping.selectColumns}) portable_row)`,
+    size:sizeExpression(domain,mapping),
+  };
+}
 export interface CanonicalHeader { readonly locator:string; readonly byteLength:string; }
+/** One header page plus whether any row follows its last header, decided by the same statement. */
+export interface CanonicalHeaderPage<H extends CanonicalHeader = CanonicalHeader> { readonly headers:H[]; readonly more:boolean; }
+function pageMore(rows:readonly {more?:unknown}[]):boolean {
+  if (rows.length === 0) return false;
+  const more = rows[rows.length-1]!.more;
+  if (typeof more !== "boolean") fail();
+  return more;
+}
 /**
  * Lists up to `limit` headers after `after` in C-collated key order. Each
  * locator is bounded individually (an oversized row projects '' plus its real
@@ -110,37 +134,80 @@ export interface CanonicalHeader { readonly locator:string; readonly byteLength:
  * repeats nothing. The LIMIT sits below the window: the scan stops after
  * `limit` rows exactly as before, the size expression is evaluated once per
  * scanned row, and the window and cut only ever see those rows.
+ *
+ * `more` reports whether any row follows the last returned header, byte-cut
+ * pages included, so a caller stops without reading an empty terminator page
+ * (#1869). It is a key-only EXISTS over the same scope in the same statement:
+ * the following row is never sized or projected, so it adds no error source,
+ * and a malformed following row still raises when the next page reads it.
  */
-export async function listCanonicalHeaders(executor:PostgreSqlQueryExecutor,projectId:string,domain:PortableDomain,after:string|null,limit:number,signal?:AbortSignal):Promise<CanonicalHeader[]> {
+export async function listCanonicalHeaders(executor:PostgreSqlQueryExecutor,projectId:string,domain:PortableDomain,after:string|null,limit:number,signal?:AbortSignal):Promise<CanonicalHeaderPage> {
   if (!Number.isSafeInteger(limit) || limit < 1 || limit > 500) throw new PortableStreamError("invalid-limit");
   const mapping = mappingForDomain(domain);
   const keys = after === null ? null : parseLocator(after,mapping.keys.length);
   const locator = `CASE WHEN sized.byte_length <= $4::bigint THEN ${locatorExpression(mapping,"sized")} ELSE '' END`;
-  const result = await executor.query<{locator:string;byteLength:string}>({text:`SELECT page.locator, page."byteLength" FROM (SELECT ${locator} AS locator, sized.byte_length::text AS "byteLength", row_number() OVER page_order AS page_row, sum(octet_length(${locator})) OVER page_order AS page_bytes FROM (SELECT ${mapping.keys.map((key) => `r.${key}::text AS ${key}`).join(", ")}, ${sizeExpression(domain,mapping)} AS byte_length FROM ${mapping.table} r${mapping.joins ?? ""} WHERE (${scope(domain)}) AND ($2::text[] IS NULL OR ${keyExpression(mapping)} > $2::text[] COLLATE "C") ORDER BY ${keyExpression(mapping)} COLLATE "C" LIMIT $3) sized WINDOW page_order AS (ORDER BY ${keyExpression(mapping,"sized")} COLLATE "C" ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW)) page WHERE page.page_row = 1 OR page.page_bytes <= $4::bigint ORDER BY page.page_row`,values:[projectId,keys,limit,String(PORTABLE_LIMITS.maxBatchBytes)]},{domain:"transaction",operation:"portable-headers",projectId,signal});
-  return result.rows;
+  const result = await executor.query<{locator:string;byteLength:string;more:boolean}>({text:`WITH kept AS (SELECT page.locator, page."byteLength", page.page_key, page.page_row FROM (SELECT ${locator} AS locator, sized.byte_length::text AS "byteLength", ${keyExpression(mapping,"sized")} AS page_key, row_number() OVER page_order AS page_row, sum(octet_length(${locator})) OVER page_order AS page_bytes FROM (SELECT ${mapping.keys.map((key) => `r.${key}::text AS ${key}`).join(", ")}, ${sizeExpression(domain,mapping)} AS byte_length FROM ${mapping.table} r${mapping.joins ?? ""} WHERE (${scope(domain)}) AND ($2::text[] IS NULL OR ${keyExpression(mapping)} > $2::text[] COLLATE "C") ORDER BY ${keyExpression(mapping)} COLLATE "C" LIMIT $3) sized WINDOW page_order AS (ORDER BY ${keyExpression(mapping,"sized")} COLLATE "C" ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW)) page WHERE page.page_row = 1 OR page.page_bytes <= $4::bigint) SELECT kept.locator, kept."byteLength", EXISTS (SELECT 1 FROM ${mapping.table} r${mapping.joins ?? ""} WHERE (${scope(domain)}) AND ${keyExpression(mapping)} > (SELECT last.page_key FROM kept AS last ORDER BY last.page_row DESC LIMIT 1) COLLATE "C") AS more FROM kept ORDER BY kept.page_row`,values:[projectId,keys,limit,String(PORTABLE_LIMITS.maxBatchBytes)]},{domain:"transaction",operation:"portable-headers",projectId,signal});
+  return {headers:result.rows.map(({locator,byteLength}) => ({locator,byteLength})),more:pageMore(result.rows)};
 }
-/** Database-side row count over the exact scope that listCanonicalHeaders pages, oversized rows included. */
-export async function countCanonicalRows(executor:PostgreSqlQueryExecutor,projectId:string,domain:PortableDomain,signal?:AbortSignal):Promise<number> {
-  const mapping = mappingForDomain(domain);
-  const result = await executor.query<{count:string}>({text:`SELECT COUNT(*)::text AS count FROM ${mapping.table} r${mapping.joins ?? ""} WHERE (${scope(domain)})`,values:[projectId]},{domain:"transaction",operation:"portable-count",projectId,signal});
-  const count = result.rows[0]?.count;
-  const parsed = typeof count === "string" && /^(0|[1-9][0-9]*)$/.test(count) ? Number(count) : Number.NaN;
-  if (!Number.isSafeInteger(parsed)) fail();
-  return parsed;
+/**
+ * Database-side row counts over the exact scopes that listCanonicalHeaders
+ * pages, oversized rows included, for every named domain in one statement.
+ * Each count is validated when its thunk is called, so a caller keeps its
+ * own per-domain evaluation order.
+ */
+export async function countCanonicalRows(executor:PostgreSqlQueryExecutor,projectId:string,domains:readonly PortableDomain[],signal?:AbortSignal):Promise<ReadonlyMap<PortableDomain,()=>number>> {
+  const result = await executor.query<Record<string,unknown>>({text:`SELECT ${domains.map((domain,index) => `(SELECT COUNT(*)::text FROM ${canonicalRowSql(domain).scan}) AS d${index}`).join(", ")}`,values:[projectId]},{domain:"transaction",operation:"portable-count",projectId,signal});
+  const row = result.rows[0];
+  return new Map(domains.map((domain,index) => [domain,() => {
+    const count = row?.[`d${index}`];
+    const parsed = typeof count === "string" && /^(0|[1-9][0-9]*)$/.test(count) ? Number(count) : Number.NaN;
+    if (!Number.isSafeInteger(parsed)) fail();
+    return parsed;
+  }]));
+}
+/** The sized first-row read listCanonicalHeaders(limit 1) performs, as a scalar subquery: its byte length, or NULL for an empty domain. */
+function firstRowSize(domain:PortableDomain):string {
+  const sql = canonicalRowSql(domain);
+  return `(SELECT sized.byte_length FROM (SELECT ${sql.keys}, ${sql.size} AS byte_length FROM ${sql.scan} ORDER BY ${sql.key} COLLATE "C" LIMIT 1) sized)`;
+}
+/**
+ * Per-domain occupancy for every named domain in one statement. With `sized`
+ * each domain's sized first-row read is evaluated, as listCanonicalHeaders
+ * (limit 1) does, with no evaluation order claimed between domains; without
+ * it, a key-only EXISTS that never projects a row. Values are returned raw
+ * for the caller to validate.
+ */
+export async function readCanonicalDomainOccupancy(executor:PostgreSqlQueryExecutor,projectId:string,domains:readonly PortableDomain[],sized:boolean,signal?:AbortSignal):Promise<ReadonlyMap<PortableDomain,unknown>> {
+  const result = await executor.query<Record<string,unknown>>({text:`SELECT ${domains.map((domain,index) => `${sized ? `${firstRowSize(domain)} IS NOT NULL` : `EXISTS (SELECT 1 FROM ${canonicalRowSql(domain).scan})`} AS d${index}`).join(", ")}`,values:[projectId]},{domain:"transaction",operation:"portable-occupancy",projectId,signal});
+  const row = result.rows[0];
+  return new Map(domains.map((domain,index) => [domain,row?.[`d${index}`]]));
+}
+/**
+ * The first named domain, in order, whose sized first-row read finds a row,
+ * or null when every domain is empty, in one statement. Each domain's read
+ * sits in its own CASE branch, so the first occupied domain decides and the
+ * reads of later domains are never evaluated; a raising read therefore raises
+ * only when every earlier domain is empty, as the per-domain loop did. The
+ * raw value is returned for the caller to validate.
+ */
+export async function findOccupiedCanonicalDomain(executor:PostgreSqlQueryExecutor,projectId:string,domains:readonly PortableDomain[],signal?:AbortSignal):Promise<unknown> {
+  const result = await executor.query<{occupied:unknown}>({text:`SELECT CASE ${domains.map((domain) => `WHEN ${firstRowSize(domain)} IS NOT NULL THEN '${domain}'`).join(" ")} ELSE NULL END AS occupied`,values:[projectId]},{domain:"transaction",operation:"portable-occupied",projectId,signal});
+  return result.rows[0]?.occupied;
 }
 /**
  * Message closure traversal uses numeric seq, independently of opaque locator
  * order. Callers read pages of up to PORTABLE_LIMITS.maxBatchRecords headers.
  * A messages locator is a single bigint key, so the per-row bound plus that
  * record limit already caps a page; the aggregate locator bound of
- * listCanonicalHeaders is not needed.
+ * listCanonicalHeaders is not needed. `more` is the same key-only sentinel as
+ * in listCanonicalHeaders.
  */
-export async function listConversationMessageHeaders(executor:PostgreSqlQueryExecutor,projectId:string,conversationId:string,afterSeq:string|null,limit:number,signal?:AbortSignal):Promise<(CanonicalHeader & {readonly seq:string})[]> {
+export async function listConversationMessageHeaders(executor:PostgreSqlQueryExecutor,projectId:string,conversationId:string,afterSeq:string|null,limit:number,signal?:AbortSignal):Promise<CanonicalHeaderPage<CanonicalHeader & {readonly seq:string}>> {
   if (!Number.isSafeInteger(limit) || limit < 1 || limit > 500) throw new PortableStreamError("invalid-limit");
   const domain = "messages";
   const mapping = mappings.messages;
-  const result = await executor.query<{locator:string;byteLength:string;seq:string}>({text:`SELECT CASE WHEN ${sizeExpression(domain,mapping)} <= $5::bigint THEN ${locatorExpression(mappings.messages)} ELSE '' END AS locator, ${sizeExpression(domain,mapping)}::text AS "byteLength", r.seq::text AS seq FROM lcm.messages r${mapping.joins ?? ""} WHERE r.project_id=$1::uuid AND r.conversation_id=$2::bigint AND ($3::bigint IS NULL OR r.seq>$3::bigint) ORDER BY r.seq LIMIT $4`,values:[projectId,conversationId,afterSeq,limit,String(PORTABLE_LIMITS.maxBatchBytes)]},{domain:"transaction",operation:"portable-message-closure",projectId,signal});
-  return result.rows;
+  const result = await executor.query<{locator:string;byteLength:string;seq:string;more:boolean}>({text:`WITH page AS (SELECT CASE WHEN ${sizeExpression(domain,mapping)} <= $5::bigint THEN ${locatorExpression(mappings.messages)} ELSE '' END AS locator, ${sizeExpression(domain,mapping)}::text AS "byteLength", r.seq::text AS seq, r.seq AS page_seq FROM lcm.messages r${mapping.joins ?? ""} WHERE r.project_id=$1::uuid AND r.conversation_id=$2::bigint AND ($3::bigint IS NULL OR r.seq>$3::bigint) ORDER BY r.seq LIMIT $4) SELECT page.locator, page."byteLength", page.seq, EXISTS (SELECT 1 FROM lcm.messages r WHERE r.project_id=$1::uuid AND r.conversation_id=$2::bigint AND r.seq>(SELECT pg_catalog.max(last.page_seq) FROM page AS last)) AS more FROM page ORDER BY page.page_seq`,values:[projectId,conversationId,afterSeq,limit,String(PORTABLE_LIMITS.maxBatchBytes)]},{domain:"transaction",operation:"portable-message-closure",projectId,signal});
+  return {headers:result.rows.map(({locator,byteLength,seq}) => ({locator,byteLength,seq})),more:pageMore(result.rows)};
 }
 export async function readCanonicalRow(executor:PostgreSqlQueryExecutor,projectId:string,domain:PortableDomain,locator:string,signal?:AbortSignal):Promise<Row|null> {
   const mapping = mappingForDomain(domain);

@@ -884,8 +884,10 @@ export class PostgreSqlContentCollationPreflightError extends StorageOperationEr
 }
 
 /**
- * Fails closed when lcm.promoted_memories.content carries a
- * nondeterministic collation. Reads pg_attribute/pg_collation live on
+ * The content-collation check, read by this SQL and evaluated by
+ * assertPromotedMemoriesContentCollationRows: it fails closed when
+ * lcm.promoted_memories.content carries a nondeterministic collation.
+ * It reads pg_attribute/pg_collation live on
  * every call rather than comparing against a recorded baseline, so a
  * collation later dropped and recreated under the same qualified name
  * (which changes its OID and determinism but not its display name) is
@@ -894,13 +896,7 @@ export class PostgreSqlContentCollationPreflightError extends StorageOperationEr
  * column does not exist yet, since migration 0002 has not necessarily
  * run.
  */
-export async function assertPromotedMemoriesContentCollationReady(
-  executor: PostgreSqlQueryExecutor,
-  options: { readonly operation?: string; readonly signal?: AbortSignal } = {},
-): Promise<void> {
-  const operation = options.operation ?? "preflightContentCollation";
-  const contentCollationResult = await executor.query<ContentCollationRow>({
-    text: `SELECT
+export const PROMOTED_MEMORIES_CONTENT_COLLATION_SQL = `SELECT
              pg_catalog.concat_ws(
                '.', collation_namespace.nspname, collation_metadata.collname
              ) AS collation_name,
@@ -919,9 +915,11 @@ export async function assertPromotedMemoriesContentCollationReady(
                collation_metadata.collnamespace
            WHERE namespace.nspname OPERATOR(pg_catalog.=) 'lcm'
              AND relation.relname OPERATOR(pg_catalog.=) 'promoted_memories'
-             AND attribute.attname OPERATOR(pg_catalog.=) 'content'`,
-  }, { domain: "factory", operation, signal: options.signal });
-  const contentCollationRow = contentCollationResult.rows[0];
+             AND attribute.attname OPERATOR(pg_catalog.=) 'content'`;
+
+/** Evaluates the rows of PROMOTED_MEMORIES_CONTENT_COLLATION_SQL. */
+export function assertPromotedMemoriesContentCollationRows(rows: readonly Partial<ContentCollationRow>[]): void {
+  const contentCollationRow = rows[0];
   if (contentCollationRow) {
     const collationIsDeterministic = sanitizeBoolean(
       contentCollationRow.collation_is_deterministic,
@@ -936,6 +934,17 @@ export async function assertPromotedMemoriesContentCollationReady(
       );
     }
   }
+}
+
+export async function assertPromotedMemoriesContentCollationReady(
+  executor: PostgreSqlQueryExecutor,
+  options: { readonly operation?: string; readonly signal?: AbortSignal } = {},
+): Promise<void> {
+  const operation = options.operation ?? "preflightContentCollation";
+  const contentCollationResult = await executor.query<ContentCollationRow>({
+    text: PROMOTED_MEMORIES_CONTENT_COLLATION_SQL,
+  }, { domain: "factory", operation, signal: options.signal });
+  assertPromotedMemoriesContentCollationRows(contentCollationResult.rows);
 }
 
 export class PostgreSqlSchemaOwnershipPreflightError extends StorageOperationError {

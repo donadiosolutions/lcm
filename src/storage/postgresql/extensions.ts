@@ -34,12 +34,8 @@ type PgStatStatementsProbeRow = QueryResultRow & {
   stats_reset: Date | string | null;
 };
 
-async function inspectRequiredPostgreSqlExtensionCatalog(
-  executor: PostgreSqlQueryExecutor,
-  options: { readonly operation: string; readonly signal?: AbortSignal },
-): Promise<Map<string, ExtensionRow>> {
-  const result = await executor.query<ExtensionRow, [readonly RequiredExtensionName[]]>({
-    text: `WITH required(name) AS (
+/** The required-extension catalog read; its one bind is REQUIRED_POSTGRESQL_EXTENSIONS. */
+export const REQUIRED_POSTGRESQL_EXTENSION_CATALOG_SQL = `WITH required(name) AS (
              SELECT pg_catalog.unnest($1::text[])
            )
            SELECT required.name,
@@ -58,7 +54,14 @@ async function inspectRequiredPostgreSqlExtensionCatalog(
              ON installed_version.name OPERATOR(pg_catalog.=) required.name
             AND installed_version.version OPERATOR(pg_catalog.=) installed.extversion
             AND installed_version.installed
-           ORDER BY required.name`,
+           ORDER BY required.name`;
+
+async function inspectRequiredPostgreSqlExtensionCatalog(
+  executor: PostgreSqlQueryExecutor,
+  options: { readonly operation: string; readonly signal?: AbortSignal },
+): Promise<Map<string, ExtensionRow>> {
+  const result = await executor.query<ExtensionRow, [readonly RequiredExtensionName[]]>({
+    text: REQUIRED_POSTGRESQL_EXTENSION_CATALOG_SQL,
     values: [REQUIRED_POSTGRESQL_EXTENSIONS],
   }, {
     domain: "factory",
@@ -145,13 +148,21 @@ function extensionStatus(
   };
 }
 
-async function probePgStatStatements(
+/** The pg_stat_statements preload probe: it raises 55000 when the library is not preloaded. */
+export const PG_STAT_STATEMENTS_PROBE_SQL = "SELECT stats_reset FROM public.pg_stat_statements_info";
+
+/** True for the probe's not-preloaded failure, which is an extension status rather than an error. */
+export function isPgStatStatementsNotPreloaded(error: unknown): boolean {
+  return error instanceof PostgreSqlStorageOperationError && error.sqlState === "55000";
+}
+
+export async function probePgStatStatements(
   executor: PostgreSqlQueryExecutor,
   options: { readonly operation?: string; readonly signal?: AbortSignal },
 ): Promise<boolean> {
   try {
     await executor.query<PgStatStatementsProbeRow>({
-      text: "SELECT stats_reset FROM public.pg_stat_statements_info",
+      text: PG_STAT_STATEMENTS_PROBE_SQL,
     }, {
       domain: "factory",
       operation: options.operation ?? "probePgStatStatements",
@@ -159,7 +170,7 @@ async function probePgStatStatements(
     });
     return true;
   } catch (error) {
-    if (error instanceof PostgreSqlStorageOperationError && error.sqlState === "55000") {
+    if (isPgStatStatementsNotPreloaded(error)) {
       return false;
     }
     throw error;
@@ -195,6 +206,35 @@ export class PostgreSqlExtensionPreflightError extends StorageOperationError {
   }
 }
 
+/**
+ * Evaluates catalog rows. `shouldProbe` says whether the preload probe runs at
+ * all; `probeDecides` says that every other required extension is already
+ * current, so the probe result alone decides readiness.
+ */
+export function requiredPostgreSqlExtensionCatalog(
+  catalogRows: readonly Partial<ExtensionRow>[],
+): Readonly<{
+  shouldProbe: boolean;
+  probeDecides: boolean;
+  statuses(preloaded: boolean | null): readonly PostgreSqlExtensionStatus[];
+}> {
+  const rows = new Map(catalogRows.map((row) => [row.name, row as ExtensionRow]));
+  const pgStatStatements = rows.get("pg_stat_statements");
+  const shouldProbe = pgStatStatements !== undefined
+    && pgStatStatements.default_version !== null
+    && pgStatStatements?.installed_version !== null
+    && pgStatStatements.installed_version === pgStatStatements.default_version
+    && pgStatStatements.installed_schema === REQUIRED_POSTGRESQL_EXTENSION_SCHEMAS.pg_stat_statements;
+  const statuses = (preloaded: boolean | null) => REQUIRED_POSTGRESQL_EXTENSIONS.map((name) => (
+    extensionStatus(name, rows.get(name), name === "pg_stat_statements" ? preloaded : null)
+  ));
+  return {
+    shouldProbe,
+    probeDecides: shouldProbe && statuses(true).every((extension) => extension.status === "current"),
+    statuses,
+  };
+}
+
 export async function inspectRequiredPostgreSqlExtensions(
   executor: PostgreSqlQueryExecutor,
   options: { readonly operation?: string; readonly signal?: AbortSignal } = {},
@@ -203,13 +243,8 @@ export async function inspectRequiredPostgreSqlExtensions(
     operation: options.operation ?? "inspectRequiredExtensions",
     signal: options.signal,
   });
-  const pgStatStatements = rows.get("pg_stat_statements");
-  const shouldProbe = pgStatStatements !== undefined
-    && pgStatStatements.default_version !== null
-    && pgStatStatements?.installed_version !== null
-    && pgStatStatements.installed_version === pgStatStatements.default_version
-    && pgStatStatements.installed_schema === REQUIRED_POSTGRESQL_EXTENSION_SCHEMAS.pg_stat_statements;
-  const preloaded = shouldProbe
+  const catalog = requiredPostgreSqlExtensionCatalog([...rows.values()]);
+  const preloaded = catalog.shouldProbe
     ? await probePgStatStatements(executor, {
       operation: options.operation === undefined
         ? undefined
@@ -217,9 +252,7 @@ export async function inspectRequiredPostgreSqlExtensions(
       signal: options.signal,
     })
     : null;
-  return REQUIRED_POSTGRESQL_EXTENSIONS.map((name) => (
-    extensionStatus(name, rows.get(name), name === "pg_stat_statements" ? preloaded : null)
-  ));
+  return catalog.statuses(preloaded);
 }
 
 export async function assertRequiredPostgreSqlExtensionCatalogReady(

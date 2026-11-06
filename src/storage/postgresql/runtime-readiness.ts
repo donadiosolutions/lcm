@@ -5,7 +5,12 @@ import type {
   PostgreSqlQueryOptions,
 } from "./contracts.js";
 import {
-  assertRequiredPostgreSqlExtensionsReady,
+  isPgStatStatementsNotPreloaded,
+  PG_STAT_STATEMENTS_PROBE_SQL,
+  probePgStatStatements,
+  REQUIRED_POSTGRESQL_EXTENSION_CATALOG_SQL,
+  REQUIRED_POSTGRESQL_EXTENSIONS,
+  requiredPostgreSqlExtensionCatalog,
   PostgreSqlExtensionPreflightError,
 } from "./extensions.js";
 import {
@@ -16,8 +21,9 @@ import {
   validatePostgreSqlMigrations,
   validatePostgreSqlSchemaSnapshotRegistry,
   type PostgreSqlSchemaSnapshot,
-  assertPromotedMemoriesContentCollationReady,
+  assertPromotedMemoriesContentCollationRows,
   PostgreSqlContentCollationPreflightError,
+  PROMOTED_MEMORIES_CONTENT_COLLATION_SQL,
 } from "./migrations.js";
 import {
   assertPostgreSqlSearchConfigurationReady,
@@ -1268,6 +1274,54 @@ function readinessOptions(
   return { domain: READINESS_DOMAIN, operation, ...(signal === undefined ? {} : { signal }) };
 }
 
+/** One readiness read: its SQL, its binds and the operation that names its refusal. */
+interface ReadinessFragment {
+  readonly operation: string;
+  readonly text: string;
+  readonly values: readonly unknown[];
+  /** The fragment's own ORDER BY restated over fragment_row: json_agg does not promise to keep a subquery's order. */
+  readonly order?: string;
+  /** Restores the driver's value for a column JSON cannot carry unchanged. */
+  readonly decode?: (row: QueryResultRow) => QueryResultRow;
+}
+
+/**
+ * Several readiness reads as one extended-protocol statement (#1869). Each
+ * fragment's unchanged SQL becomes one json_agg scalar subquery, with its
+ * placeholders renumbered after the binds of the fragments before it, and its
+ * rows decode to the values its own statement returned: fragment columns are
+ * text, booleans, integers of at most 32 bits, or arrays of those, and a
+ * fragment with another column type restores it in decode. Each deparser
+ * fragment keeps its own guarded settings CTE, and a fragment keeps its own
+ * ORDER BY. The statement's operation names its fragments' operations, in
+ * order, joined by "+". Results are evaluated by the caller, in order.
+ */
+async function queryReadinessFragments(
+  executor: PostgreSqlQueryExecutor,
+  fragments: readonly ReadinessFragment[],
+  signal: AbortSignal | undefined,
+): Promise<readonly (readonly QueryResultRow[])[]> {
+  const values: unknown[] = [];
+  const columns = fragments.map((fragment, index) => {
+    const offset = values.length;
+    values.push(...fragment.values);
+    const text = fragment.text.replace(
+      /\$([1-9][0-9]*)/gu,
+      (_placeholder, number: string) => `$${Number(number) + offset}`,
+    );
+    const order = fragment.order === undefined ? "" : ` ORDER BY ${fragment.order}`;
+    return `(SELECT COALESCE(pg_catalog.json_agg(fragment_row${order}), '[]'::pg_catalog.json) FROM (${text}) AS fragment_row) AS f${index}`;
+  });
+  const result = await executor.query({ text: `SELECT ${columns.join(", ")}`, values },
+    readinessOptions(fragments.map(({ operation }) => operation).join("+"), signal));
+  const row = result.rows[0];
+  return fragments.map((fragment, index) => {
+    const rows: unknown = row?.[`f${index}`];
+    if (!Array.isArray(rows)) throw readinessError("server-preflight", "verifyRuntimeReadiness");
+    return fragment.decode === undefined ? rows : rows.map(fragment.decode);
+  });
+}
+
 function assertExpectedOwner(expectedOwner: unknown): asserts expectedOwner is string {
   if (!isRoleName(expectedOwner)) throw readinessError("invalid-expected-owner", "validateExpectedOwner");
 }
@@ -1280,12 +1334,9 @@ function assertAdmittedPeer(
   }
 }
 
-async function inspectRolePolicy(
-  executor: PostgreSqlQueryExecutor,
-  expectedOwner: string,
-  signal: AbortSignal | undefined,
-): Promise<RoleIdentity> {
-  const result = await executor.query<RolePolicyRow, [string]>({
+function rolePolicyFragment(expectedOwner: string): ReadinessFragment {
+  return {
+    operation: "inspectRuntimeRolePolicy",
     text: `WITH RECURSIVE expected_owner AS (
              SELECT role.oid
              FROM pg_catalog.pg_roles AS role
@@ -1374,12 +1425,18 @@ async function inspectRolePolicy(
            CROSS JOIN expected_owner_evidence
            CROSS JOIN database_owner_evidence`,
     values: [expectedOwner],
-  }, readinessOptions("inspectRuntimeRolePolicy", signal));
-  const row = result.rows[0];
+  };
+}
+
+function evaluateRolePolicy(
+  rows: readonly RolePolicyRow[],
+  expectedOwner: string,
+): RoleIdentity {
+  const row = rows[0];
   const runtimeRole = row?.current_user_name;
   const runtimeRoleOid = row?.current_user_oid;
   if (
-    result.rows.length !== 1
+    rows.length !== 1
     || !row
     || !isRoleName(runtimeRole)
     || !isOidText(runtimeRoleOid)
@@ -1413,14 +1470,17 @@ async function inspectRolePolicy(
   return { role: runtimeRole, oid: runtimeRoleOid };
 }
 
-async function inspectAdmittedPeerRolePolicy(
-  executor: PostgreSqlQueryExecutor,
+/**
+ * The peer read keeps its peer_role-driven shape: a missing peer returns no
+ * row and makes no per-peer privilege call. Its runtime-role comparison uses
+ * CURRENT_USER, the role the runtime role policy, evaluated first, proves.
+ */
+function admittedPeerRolePolicyFragment(
   admittedPeer: PostgreSqlAdmittedPeer,
   expectedOwner: string,
-  runtimeRole: RoleIdentity,
-  signal: AbortSignal | undefined,
-): Promise<RoleIdentity> {
-  const result = await executor.query<AdmittedPeerRolePolicyRow, [string, string, string]>({
+): ReadinessFragment {
+  return {
+    operation: "inspectAdmittedPeerRolePolicy",
     text: `WITH peer_role AS (
              SELECT role.oid,
                     role.rolname::pg_catalog.text AS peer_name,
@@ -1461,13 +1521,21 @@ async function inspectAdmittedPeerRolePolicy(
                    WHERE membership.roleid OPERATOR(pg_catalog.=) peer_role.oid)
                     AS has_members_count,
                   peer_role.peer_name OPERATOR(pg_catalog.=) $2 AS expected_owner_match,
-                  peer_role.peer_name OPERATOR(pg_catalog.=) $3 AS current_role_match
+                  peer_role.peer_name OPERATOR(pg_catalog.=) CURRENT_USER::pg_catalog.text
+                    AS current_role_match
            FROM peer_role`,
-    values: [admittedPeer.role, expectedOwner, runtimeRole.role],
-  }, readinessOptions("inspectAdmittedPeerRolePolicy", signal));
-  const row = result.rows[0];
+    values: [admittedPeer.role, expectedOwner],
+  };
+}
+
+function evaluateAdmittedPeerRolePolicy(
+  rows: readonly AdmittedPeerRolePolicyRow[],
+  admittedPeer: PostgreSqlAdmittedPeer,
+  runtimeRole: RoleIdentity,
+): RoleIdentity {
+  const row = rows[0];
   if (
-    result.rows.length !== 1
+    rows.length !== 1
     || !row
     || row.peer_name !== admittedPeer.role
     || !isRoleName(row.peer_name)
@@ -1563,16 +1631,15 @@ function extensionMemberOwnerAcceptedSql(
           )`;
 }
 
-async function inspectRequiredExtensionFunctions(
-  executor: PostgreSqlQueryExecutor,
-  signal: AbortSignal | undefined,
-): Promise<void> {
-  const expectedByIdentity = new Map<string, RequiredFunctionImplementation>(
-    REQUIRED_TRUSTED_FUNCTION_IMPLEMENTATIONS.map((implementation) => (
-      [implementation.functionIdentity, implementation] as const
-    )),
-  );
-  const result = await executor.query<RequiredExtensionFunctionRow, [readonly string[]]>({
+const REQUIRED_EXTENSION_FUNCTIONS_BY_IDENTITY = new Map<string, RequiredFunctionImplementation>(
+  REQUIRED_TRUSTED_FUNCTION_IMPLEMENTATIONS.map((implementation) => (
+    [implementation.functionIdentity, implementation] as const
+  )),
+);
+
+function requiredExtensionFunctionsFragment(): ReadinessFragment {
+  return {
+    operation: "inspectRequiredExtensionFunctions",
     text: `WITH ${runtimeDeparserSettingsSql()}
            SELECT pg_catalog.concat(
                     namespace.nspname,
@@ -1678,10 +1745,14 @@ async function inspectRequiredExtensionFunctions(
                     )}, ')'
                  ) OPERATOR(pg_catalog.=) ANY ($1::pg_catalog.text[])
            ORDER BY function_identity`,
-    values: [[...expectedByIdentity.keys()]],
-  }, readinessOptions("inspectRequiredExtensionFunctions", signal));
+    values: [[...REQUIRED_EXTENSION_FUNCTIONS_BY_IDENTITY.keys()]],
+  };
+}
+
+function evaluateRequiredExtensionFunctions(rows: readonly RequiredExtensionFunctionRow[]): void {
+  const expectedByIdentity = REQUIRED_EXTENSION_FUNCTIONS_BY_IDENTITY;
   const observed = new Set<string>();
-  for (const row of result.rows) {
+  for (const row of rows) {
     if (typeof row.function_identity !== "string") {
       throw readinessError("extension-preflight", "inspectRequiredExtensionFunctions");
     }
@@ -1717,11 +1788,9 @@ async function inspectRequiredExtensionFunctions(
   }
 }
 
-async function inspectRequiredExtensionOperator(
-  executor: PostgreSqlQueryExecutor,
-  signal: AbortSignal | undefined,
-): Promise<void> {
-  const result = await executor.query<RequiredExtensionOperatorRow, [string, string, string, string]>({
+function requiredExtensionOperatorFragment(): ReadinessFragment {
+  return {
+    operation: "inspectRequiredExtensionOperator",
     text: `WITH ${runtimeDeparserSettingsSql()}
            SELECT namespace.nspname::pg_catalog.text AS schema_name,
                   catalog_operator.oprname::pg_catalog.text AS operator_name,
@@ -1829,10 +1898,13 @@ async function inspectRequiredExtensionOperator(
       "pg_catalog.matchingjoinsel(internal,oid,internal,smallint,internal)",
       "pg_trgm",
     ],
-  }, readinessOptions("inspectRequiredExtensionOperator", signal));
-  const row = result.rows[0];
+  };
+}
+
+function evaluateRequiredExtensionOperator(rows: readonly RequiredExtensionOperatorRow[]): void {
+  const row = rows[0];
   if (
-    result.rows.length !== 1
+    rows.length !== 1
     || row?.schema_name !== "public"
     || row.operator_name !== "%"
     || row.operator_kind !== "b"
@@ -1857,11 +1929,9 @@ async function inspectRequiredExtensionOperator(
   }
 }
 
-async function inspectRequiredGinTrgmOperatorClass(
-  executor: PostgreSqlQueryExecutor,
-  signal: AbortSignal | undefined,
-): Promise<void> {
-  const result = await executor.query<RequiredGinTrgmOperatorClassRow>({
+function requiredGinTrgmOperatorClassFragment(): ReadinessFragment {
+  return {
+    operation: "inspectRequiredGinTrgmOperatorClass",
     text: `WITH ${runtimeDeparserSettingsSql()}
            SELECT operator_class_namespace.nspname::pg_catalog.text
                     AS operator_class_schema,
@@ -2017,10 +2087,14 @@ async function inspectRequiredGinTrgmOperatorClass(
            WHERE operator_class_namespace.nspname OPERATOR(pg_catalog.=) 'public'
              AND operator_class.opcname OPERATOR(pg_catalog.=) 'gin_trgm_ops'
              AND access_method.amname OPERATOR(pg_catalog.=) 'gin'`,
-  }, readinessOptions("inspectRequiredGinTrgmOperatorClass", signal));
-  const row = result.rows[0];
+    values: [],
+  };
+}
+
+function evaluateRequiredGinTrgmOperatorClass(rows: readonly RequiredGinTrgmOperatorClassRow[]): void {
+  const row = rows[0];
   if (
-    result.rows.length !== 1
+    rows.length !== 1
     || row?.operator_class_schema !== "public"
     || row.operator_class_name !== "gin_trgm_ops"
     || row.operator_family_schema !== "public"
@@ -2089,11 +2163,9 @@ function guardedRuntimeDeparserSql(expression: string): string {
           END`;
 }
 
-async function inspectRequiredGinTrgmOperators(
-  executor: PostgreSqlQueryExecutor,
-  signal: AbortSignal | undefined,
-): Promise<void> {
-  const result = await executor.query<RequiredGinTrgmOperatorRow>({
+function requiredGinTrgmOperatorsFragment(): ReadinessFragment {
+  return {
+    operation: "inspectRequiredGinTrgmOperators",
     text: `WITH ${runtimeDeparserSettingsSql()}
            SELECT mapping.amopstrategy AS strategy_number,
                   mapping.amoppurpose::pg_catalog.text AS purpose,
@@ -2280,14 +2352,18 @@ async function inspectRequiredGinTrgmOperators(
              AND operator_family.opfname OPERATOR(pg_catalog.=) 'gin_trgm_ops'
              AND access_method.amname OPERATOR(pg_catalog.=) 'gin'
            ORDER BY mapping.amopstrategy`,
-  }, readinessOptions("inspectRequiredGinTrgmOperators", signal));
+    values: [],
+  };
+}
+
+function evaluateRequiredGinTrgmOperators(rows: readonly RequiredGinTrgmOperatorRow[]): void {
   const expectedByStrategy = new Map<number, RequiredGinTrgmOperatorMapping>(
     REQUIRED_GIN_TRGM_OPERATOR_MAPPINGS.map((mapping) => (
       [mapping.strategyNumber, mapping] as const
     )),
   );
   const observed = new Set<number>();
-  for (const row of result.rows) {
+  for (const row of rows) {
     if (typeof row.strategy_number !== "number") {
       throw readinessError("extension-preflight", "inspectRequiredGinTrgmOperators");
     }
@@ -2330,11 +2406,9 @@ async function inspectRequiredGinTrgmOperators(
   }
 }
 
-async function inspectRequiredGinTrgmIndirectOperators(
-  executor: PostgreSqlQueryExecutor,
-  signal: AbortSignal | undefined,
-): Promise<void> {
-  const result = await executor.query<RequiredGinTrgmIndirectOperatorRow>({
+function requiredGinTrgmIndirectOperatorsFragment(): ReadinessFragment {
+  return {
+    operation: "inspectRequiredGinTrgmIndirectOperators",
     text: `WITH ${runtimeDeparserSettingsSql()},
            scoped AS (
              SELECT mapping.amopstrategy AS strategy_number,
@@ -2395,12 +2469,25 @@ async function inspectRequiredGinTrgmIndirectOperators(
            CROSS JOIN runtime_deparser_settings AS settings
            WHERE NOT EXISTS (SELECT 1 FROM scoped AS direct WHERE direct.referring_oid OPERATOR(pg_catalog.=) edges.referenced_oid)
            ORDER BY edges.strategy_number, edges.reference_kind`,
-  }, readinessOptions("inspectRequiredGinTrgmIndirectOperators", signal));
+    values: [],
+    // JSON carries an oid column as its decimal text; the driver parsed it
+    // into a number. Anything else is left for the evaluator to refuse.
+    decode: (row) => ({
+      ...row,
+      referenced_operator_oid: typeof row.referenced_operator_oid === "string"
+        && /^(0|[1-9][0-9]*)$/u.test(row.referenced_operator_oid)
+        ? Number(row.referenced_operator_oid)
+        : row.referenced_operator_oid,
+    }),
+  };
+}
+
+function evaluateRequiredGinTrgmIndirectOperators(rows: readonly RequiredGinTrgmIndirectOperatorRow[]): void {
   const expected = new Map(REQUIRED_GIN_TRGM_INDIRECT_OPERATORS.map((mapping) => [
     `${mapping.strategyNumber}:${mapping.referenceKind}`, mapping,
   ]));
   const observed = new Set<string>();
-  for (const row of result.rows) {
+  for (const row of rows) {
     if (typeof row.strategy_number !== "number" || !Number.isSafeInteger(row.strategy_number) || typeof row.reference_kind !== "string") throw readinessError("extension-preflight", "inspectRequiredGinTrgmIndirectOperators");
     const key = `${row.strategy_number}:${row.reference_kind}`;
     const mapping = expected.get(key);
@@ -2413,11 +2500,9 @@ async function inspectRequiredGinTrgmIndirectOperators(
   if (observed.size !== expected.size) throw readinessError("extension-preflight", "inspectRequiredGinTrgmIndirectOperators");
 }
 
-async function inspectRequiredGinTrgmSupportFunctions(
-  executor: PostgreSqlQueryExecutor,
-  signal: AbortSignal | undefined,
-): Promise<void> {
-  const result = await executor.query<RequiredGinTrgmSupportRow>({
+function requiredGinTrgmSupportFunctionsFragment(): ReadinessFragment {
+  return {
+    operation: "inspectRequiredGinTrgmSupportFunctions",
     text: `WITH ${runtimeDeparserSettingsSql()}
            SELECT mapping.amprocnum AS support_number,
                   ${guardedRuntimeDeparserSql(`pg_catalog.format_type(
@@ -2514,14 +2599,18 @@ async function inspectRequiredGinTrgmSupportFunctions(
              AND operator_class.opcname OPERATOR(pg_catalog.=) 'gin_trgm_ops'
              AND access_method.amname OPERATOR(pg_catalog.=) 'gin'
            ORDER BY mapping.amprocnum`,
-  }, readinessOptions("inspectRequiredGinTrgmSupportFunctions", signal));
+    values: [],
+  };
+}
+
+function evaluateRequiredGinTrgmSupportFunctions(rows: readonly RequiredGinTrgmSupportRow[]): void {
   const expectedBySupportNumber = new Map<number, RequiredGinTrgmSupportFunction>(
     REQUIRED_GIN_TRGM_SUPPORT_FUNCTIONS.map((mapping) => (
       [mapping.supportNumber, mapping] as const
     )),
   );
   const observed = new Set<number>();
-  for (const row of result.rows) {
+  for (const row of rows) {
     if (typeof row.support_number !== "number") {
       throw readinessError("extension-preflight", "inspectRequiredGinTrgmSupportFunctions");
     }
@@ -2660,17 +2749,19 @@ function managedCatalogQuery(): string {
            GROUP BY expected_owner.oid`;
 }
 
-async function inspectOwnership(
-  executor: PostgreSqlQueryExecutor,
-  expectedOwner: string,
-  snapshot: PostgreSqlSchemaSnapshot,
-  signal: AbortSignal | undefined,
-): Promise<{ readonly managedObjectCount: number }> {
-  const result = await executor.query<OwnershipRow, [string, readonly string[]]>({
+function ownershipFragment(expectedOwner: string, snapshot: PostgreSqlSchemaSnapshot): ReadinessFragment {
+  return {
+    operation: "inspectSchemaOwnership",
     text: managedCatalogQuery(),
     values: [expectedOwner, snapshot.managedObjectIdentities],
-  }, readinessOptions("inspectSchemaOwnership", signal));
-  const row = result.rows[0];
+  };
+}
+
+function evaluateOwnership(
+  rows: readonly OwnershipRow[],
+  snapshot: PostgreSqlSchemaSnapshot,
+): { readonly managedObjectCount: number } {
+  const row = rows[0];
   if (
     !row
     || row.expected_owner_exists !== true
@@ -2691,21 +2782,25 @@ async function inspectOwnership(
   return { managedObjectCount: row.actual_object_count };
 }
 
-async function inspectMigrationHistory(
-  executor: PostgreSqlQueryExecutor,
+/** Rows are compared by position, so the fused read orders them again by id. */
+const MIGRATION_HISTORY_FRAGMENT: ReadinessFragment = Object.freeze({
+  operation: "readMigrations",
+  text: "SELECT id, checksum_sha256 FROM lcm.schema_migrations ORDER BY id",
+  values: [],
+  order: "fragment_row.id",
+});
+
+function evaluateMigrationHistory(
+  rows: readonly MigrationRow[],
   migrations: ReturnType<typeof loadPostgreSqlMigrations>,
-  signal: AbortSignal | undefined,
-): Promise<readonly string[]> {
-  const result = await executor.query<MigrationRow>({
-    text: "SELECT id, checksum_sha256 FROM lcm.schema_migrations ORDER BY id",
-  }, readinessOptions("readMigrations", signal));
-  if (result.rows.length !== migrations.length) {
+): readonly string[] {
+  if (rows.length !== migrations.length) {
     throw readinessError("migration-ledger", "readMigrations");
   }
   const ids: string[] = [];
   for (let index = 0; index < migrations.length; index += 1) {
     const expected = migrations[index];
-    const actual = result.rows[index];
+    const actual = rows[index];
     if (
       !expected
       || typeof actual?.id !== "string"
@@ -2775,14 +2870,9 @@ function actualAclIdentity(
   return [kind, row.object_identity, grantee, grantor, row.privilege_type, row.is_grantable].join("|");
 }
 
-async function inspectSchemaAcl(
-  executor: PostgreSqlQueryExecutor,
-  manifest: PostgreSqlRuntimePrivilegeManifest,
-  runtimeRole: RoleIdentity,
-  admittedPeer: AdmittedPeerContext | undefined,
-  signal: AbortSignal | undefined,
-): Promise<void> {
-  const result = await executor.query<SchemaAclRow, [readonly string[]]>({
+function schemaAclFragment(): ReadinessFragment {
+  return {
+    operation: "inspectSchemaAcl",
     text: `WITH target AS (
              SELECT pg_catalog.unnest($1::pg_catalog.text[]) AS schema_name
            ),
@@ -2812,7 +2902,16 @@ async function inspectSchemaAcl(
              ON grantee.oid OPERATOR(pg_catalog.=) privilege.grantee
            ORDER BY metadata.schema_name, privilege.privilege_type`,
     values: [["lcm", "public"]],
-  }, readinessOptions("inspectSchemaAcl", signal));
+    order: "fragment_row.schema_name, fragment_row.privilege_type",
+  };
+}
+
+function evaluateSchemaAcl(
+  rows: readonly SchemaAclRow[],
+  manifest: PostgreSqlRuntimePrivilegeManifest,
+  runtimeRole: RoleIdentity,
+  admittedPeer: AdmittedPeerContext | undefined,
+): void {
   const entries = [
     ...manifest.required,
     ...manifest.optional,
@@ -2832,7 +2931,7 @@ async function inspectSchemaAcl(
   for (const entry of required) allowed.add(entry);
   allowed.add(["schema", "public", "public", "owner", "USAGE", false].join("|"));
   const actual = new Set<string>();
-  for (const row of result.rows) {
+  for (const row of rows) {
     const schemaName = row.schema_name;
     const identity = actualAclIdentity(
       { ...row, object_identity: schemaName },
@@ -2853,15 +2952,9 @@ async function inspectSchemaAcl(
   }
 }
 
-async function inspectRelationAcl(
-  executor: PostgreSqlQueryExecutor,
-  manifest: PostgreSqlRuntimePrivilegeManifest,
-  runtimeRole: RoleIdentity,
-  admittedPeer: AdmittedPeerContext | undefined,
-  snapshot: PostgreSqlSchemaSnapshot,
-  signal: AbortSignal | undefined,
-): Promise<OptionalPrivilegeObservations> {
-  const result = await executor.query<AclRow, [readonly string[]]>({
+function relationAclFragment(snapshot: PostgreSqlSchemaSnapshot): ReadinessFragment {
+  return {
+    operation: "inspectRelationAcl",
     text: `SELECT pg_catalog.concat(
                     CASE relation.relkind WHEN 'r' THEN 'table|' WHEN 'S' THEN 'sequence|' END,
                     relation.relname
@@ -2895,7 +2988,17 @@ async function inspectRelationAcl(
              ) OPERATOR(pg_catalog.=) ANY ($1::pg_catalog.text[])
            ORDER BY object_identity, privilege.privilege_type`,
     values: [snapshot.relationAclIdentities],
-  }, readinessOptions("inspectRelationAcl", signal));
+    order: "fragment_row.object_identity, fragment_row.privilege_type",
+  };
+}
+
+function evaluateRelationAcl(
+  rows: readonly AclRow[],
+  manifest: PostgreSqlRuntimePrivilegeManifest,
+  runtimeRole: RoleIdentity,
+  admittedPeer: AdmittedPeerContext | undefined,
+  snapshot: PostgreSqlSchemaSnapshot,
+): OptionalPrivilegeObservations {
   const ownerIdentities = new Set<string>();
   for (const object of snapshot.relationAclIdentities) {
     const relationKind = object.startsWith("table|") ? "table" : "sequence";
@@ -2955,7 +3058,7 @@ async function inspectRelationAcl(
     ...peerOptionalIdentities.values(),
   ]);
   const actual = new Set<string>();
-  for (const row of result.rows) {
+  for (const row of rows) {
     const identity = actualAclIdentity(row, runtimeRole, "relation", admittedPeer);
     if (identity === null) throw readinessError("acl-shape", "inspectRelationAcl");
     actual.add(identity);
@@ -2980,15 +3083,9 @@ async function inspectRelationAcl(
   };
 }
 
-async function inspectColumnAcl(
-  executor: PostgreSqlQueryExecutor,
-  manifest: PostgreSqlRuntimePrivilegeManifest,
-  runtimeRole: RoleIdentity,
-  admittedPeer: AdmittedPeerContext | undefined,
-  snapshot: PostgreSqlSchemaSnapshot,
-  signal: AbortSignal | undefined,
-): Promise<OptionalPrivilegeObservations> {
-  const result = await executor.query<AclRow, [readonly string[]]>({
+function columnAclFragment(snapshot: PostgreSqlSchemaSnapshot): ReadinessFragment {
+  return {
+    operation: "inspectColumnAcl",
     text: `SELECT pg_catalog.concat('lcm.', relation.relname, '|', attribute.attname)
                     AS object_identity,
                   privilege.grantee OPERATOR(pg_catalog.=) relation.relowner
@@ -3015,7 +3112,16 @@ async function inspectColumnAcl(
                OPERATOR(pg_catalog.=) ANY ($1::pg_catalog.text[])
            ORDER BY object_identity, privilege.privilege_type`,
     values: [snapshot.tableIdentities.map((table) => `table|${table}`)],
-  }, readinessOptions("inspectColumnAcl", signal));
+    order: "fragment_row.object_identity, fragment_row.privilege_type",
+  };
+}
+
+function evaluateColumnAcl(
+  rows: readonly AclRow[],
+  manifest: PostgreSqlRuntimePrivilegeManifest,
+  runtimeRole: RoleIdentity,
+  admittedPeer: AdmittedPeerContext | undefined,
+): OptionalPrivilegeObservations {
   const requiredIdentities = new Map<string, string>();
   const presentRequiredIdentities: string[] = [];
   for (const entry of manifest.required) {
@@ -3057,7 +3163,7 @@ async function inspectColumnAcl(
     ...peerOptionalIdentities.values(),
   ]);
   const actual = new Set<string>();
-  for (const row of result.rows) {
+  for (const row of rows) {
     const identity = actualAclIdentity(row, runtimeRole, "column", admittedPeer);
     if (identity === null) throw readinessError("acl-shape", "inspectColumnAcl");
     actual.add(identity);
@@ -3083,15 +3189,12 @@ async function inspectColumnAcl(
   };
 }
 
-async function inspectFunctionAcl(
-  executor: PostgreSqlQueryExecutor,
+function functionAclIdentities(
   manifest: PostgreSqlRuntimePrivilegeManifest,
-  runtimeRole: RoleIdentity,
   admittedPeer: AdmittedPeerContext | undefined,
   snapshot: PostgreSqlSchemaSnapshot,
-  signal: AbortSignal | undefined,
-): Promise<void> {
-  const functionIdentities = [
+): readonly string[] {
+  return [
     ...snapshot.managedObjectIdentities
       .filter((identity) => identity.startsWith("function|"))
       .map((identity) => {
@@ -3105,7 +3208,15 @@ async function inspectFunctionAcl(
       .filter(({ kind }) => kind === "function")
       .map(({ object }) => object),
   ];
-  const result = await executor.query<FunctionAclRow, [readonly string[]]>({
+}
+
+function functionAclFragment(
+  manifest: PostgreSqlRuntimePrivilegeManifest,
+  admittedPeer: AdmittedPeerContext | undefined,
+  snapshot: PostgreSqlSchemaSnapshot,
+): ReadinessFragment {
+  return {
+    operation: "inspectFunctionAcl",
     text: `WITH ${runtimeDeparserSettingsSql()}
            SELECT pg_catalog.concat(
                     namespace.nspname,
@@ -3164,8 +3275,19 @@ async function inspectFunctionAcl(
                     )}, ')'
                  ) OPERATOR(pg_catalog.=) ANY ($1::pg_catalog.text[])
            ORDER BY function_identity, privilege.privilege_type`,
-    values: [functionIdentities],
-  }, readinessOptions("inspectFunctionAcl", signal));
+    values: [functionAclIdentities(manifest, admittedPeer, snapshot)],
+    order: "fragment_row.function_identity, fragment_row.privilege_type",
+  };
+}
+
+function evaluateFunctionAcl(
+  rows: readonly FunctionAclRow[],
+  manifest: PostgreSqlRuntimePrivilegeManifest,
+  runtimeRole: RoleIdentity,
+  admittedPeer: AdmittedPeerContext | undefined,
+  snapshot: PostgreSqlSchemaSnapshot,
+): void {
+  const functionIdentities = functionAclIdentities(manifest, admittedPeer, snapshot);
   const entries = [
     ...manifest.required,
     ...manifest.optional,
@@ -3203,7 +3325,7 @@ async function inspectFunctionAcl(
   }
   const actual = new Set<string>();
   const bootstrapTrustedExtensionMembers = new Map<string, boolean>();
-  for (const row of result.rows) {
+  for (const row of rows) {
     if (
       typeof row.function_identity !== "string"
       || (typeof row.extension_name !== "string" && row.extension_name !== null)
@@ -3254,7 +3376,7 @@ function definitionQuery(
   runtimeRole: RoleIdentity,
   manifest: PostgreSqlRuntimePrivilegeManifest,
   admittedPeer: AdmittedPeerContext | undefined,
-): QueryConfig<unknown[]> {
+): Readonly<{ text: string; values: unknown[] }> {
   const expectations = getPostgreSqlSchemaSnapshotExpectations(snapshot);
   const relationSanctions = manifest.required
     .concat(manifest.optional)
@@ -3897,19 +4019,18 @@ function definitionQuery(
   };
 }
 
-async function inspectDefinitions(
-  executor: PostgreSqlQueryExecutor,
+function definitionsFragment(
   manifest: PostgreSqlRuntimePrivilegeManifest,
   runtimeRole: RoleIdentity,
   admittedPeer: AdmittedPeerContext | undefined,
   snapshot: PostgreSqlSchemaSnapshot,
-  signal: AbortSignal | undefined,
-): Promise<number> {
-  const result = await executor.query<DefinitionRow, unknown[]>(
-    definitionQuery(snapshot, runtimeRole, manifest, admittedPeer),
-    readinessOptions("inspectSchemaDefinitions", signal),
-  );
-  const row = result.rows[0];
+): ReadinessFragment {
+  const query = definitionQuery(snapshot, runtimeRole, manifest, admittedPeer);
+  return { operation: "inspectSchemaDefinitions", text: query.text, values: query.values };
+}
+
+function evaluateDefinitions(rows: readonly DefinitionRow[], snapshot: PostgreSqlSchemaSnapshot): number {
+  const row = rows[0];
   const expectations = getPostgreSqlSchemaSnapshotExpectations(snapshot);
   if (
     !row
@@ -3930,7 +4051,12 @@ async function inspectDefinitions(
   ) {
     throw readinessError("schema-fingerprint", "inspectSchemaDefinitions");
   }
-  const identity = await executor.query<IdentityFunctionRow, [readonly string[], readonly string[]]>({
+  return expectations.definitionObjectCount;
+}
+
+function identityFunctionsFragment(snapshot: PostgreSqlSchemaSnapshot): ReadinessFragment {
+  return {
+    operation: "inspectIdentityFunctions",
     text: `WITH expected_functions(function_name, prosrc_sha256) AS (
              SELECT * FROM ROWS FROM (
                pg_catalog.unnest($1::pg_catalog.text[]),
@@ -3999,8 +4125,11 @@ async function inspectDefinitions(
       snapshot.identityFunctions.map(({ name }) => name),
       snapshot.identityFunctions.map(({ sha256 }) => sha256),
     ],
-  }, readinessOptions("inspectIdentityFunctions", signal));
-  const identityRow = identity.rows[0];
+  };
+}
+
+function evaluateIdentityFunctions(rows: readonly IdentityFunctionRow[], snapshot: PostgreSqlSchemaSnapshot): void {
+  const identityRow = rows[0];
   if (
     !identityRow
     || identityRow.expected_function_count !== snapshot.identityFunctions.length
@@ -4009,7 +4138,6 @@ async function inspectDefinitions(
   ) {
     throw readinessError("schema-fingerprint", "inspectIdentityFunctions");
   }
-  return expectations.definitionObjectCount;
 }
 
 function allPrivilegeEntries(
@@ -4275,6 +4403,48 @@ function optionalPrivilegesPresent(
   return observed.size > 0;
 }
 
+const EXTENSION_CATALOG_OPERATION = "runtimeReadinessExtensions";
+
+/**
+ * The pg_stat_statements probe and the catalog checks of statement R3 that
+ * follow the extension check, in their old order. The probe may raise 55000
+ * by design, so it leads the statement; every later fragment cannot raise once
+ * the extensions are current.
+ */
+function catalogFragments(): readonly ReadinessFragment[] {
+  return [
+    { operation: "runtimeReadinessContentCollation", text: PROMOTED_MEMORIES_CONTENT_COLLATION_SQL, values: [] },
+    requiredExtensionFunctionsFragment(),
+    requiredExtensionOperatorFragment(),
+    requiredGinTrgmOperatorClassFragment(),
+    requiredGinTrgmOperatorsFragment(),
+    requiredGinTrgmIndirectOperatorsFragment(),
+    requiredGinTrgmSupportFunctionsFragment(),
+  ];
+}
+
+/**
+ * Twenty-two catalog checks in six statements (#1869), evaluated in the old
+ * order with unchanged evaluators, so the first failure and its (reason,
+ * operation) are unchanged:
+ *
+ * - R1: server readiness, alone; R2 parses has_parameter_privilege (PG15+).
+ * - R2: runtime role policy, admitted peer policy, extension catalog.
+ * - R3: when only the pg_stat_statements probe can still fail the extension
+ *   check, the probe followed by the content collation, required extension
+ *   function, operator and gin_trgm checks; otherwise the probe runs alone as
+ *   before and the extension check refuses.
+ * - R4: search configuration, alone: its digest() call needs the overload the
+ *   R3 function check proves.
+ * - R5: the migration ledger, then ownership, definitions, identity
+ *   functions and the schema, relation, column and function ACLs, all for the
+ *   bundled latest snapshot, the only one the ledger check admits.
+ * - R6: effective privileges, alone: name-based privilege calls raise on
+ *   missing objects.
+ *
+ * Only a statement's first fragment can raise. Any SQL error, including a
+ * missing or unreadable ledger, maps through the catch below as before.
+ */
 async function verifyPostgreSqlSchema(
   executor: PostgreSqlQueryExecutor,
   manifest: PostgreSqlRuntimePrivilegeManifest,
@@ -4289,16 +4459,17 @@ async function verifyPostgreSqlSchema(
     validatePostgreSqlMigrations(migrations);
     validatePostgreSqlSchemaSnapshotRegistry(migrations, snapshots);
     await inspectServerReadiness(executor, signal);
-    const runtimeRole = await inspectRolePolicy(executor, options.expectedOwner, signal);
+    const roles = await queryReadinessFragments(executor, [
+      rolePolicyFragment(options.expectedOwner),
+      ...(options.admittedPeer === undefined
+        ? []
+        : [admittedPeerRolePolicyFragment(options.admittedPeer, options.expectedOwner)]),
+      { operation: EXTENSION_CATALOG_OPERATION, text: REQUIRED_POSTGRESQL_EXTENSION_CATALOG_SQL, values: [REQUIRED_POSTGRESQL_EXTENSIONS] },
+    ], signal);
+    const runtimeRole = evaluateRolePolicy(roles[0] as RolePolicyRow[], options.expectedOwner);
     const admittedPeerIdentity = options.admittedPeer === undefined
       ? undefined
-      : await inspectAdmittedPeerRolePolicy(
-        executor,
-        options.admittedPeer,
-        options.expectedOwner,
-        runtimeRole,
-        signal,
-      );
+      : evaluateAdmittedPeerRolePolicy(roles[1] as AdmittedPeerRolePolicyRow[], options.admittedPeer, runtimeRole);
     const admittedPeer: AdmittedPeerContext | undefined = admittedPeerIdentity === undefined
       ? undefined
       : {
@@ -4307,10 +4478,26 @@ async function verifyPostgreSqlSchema(
           ? POSTGRESQL_TRANSFER_PRIVILEGE_MANIFEST
           : POSTGRESQL_RUNTIME_PRIVILEGE_MANIFEST,
       };
-    await assertRequiredPostgreSqlExtensionsReady(executor, {
-      operation: "runtimeReadinessExtensions",
-      signal,
-    });
+    const extensions = requiredPostgreSqlExtensionCatalog(roles[roles.length - 1]!);
+    if (!extensions.probeDecides) {
+      // Some extension other than pg_stat_statements, or pg_stat_statements
+      // itself, is not current, so the extension check refuses whatever the
+      // probe says; the probe still runs where it ran before.
+      const preloaded = extensions.shouldProbe
+        ? await probePgStatStatements(executor, { operation: `${EXTENSION_CATALOG_OPERATION}:probePgStatStatements`, signal })
+        : null;
+      throw new PostgreSqlExtensionPreflightError(extensions.statuses(preloaded), EXTENSION_CATALOG_OPERATION);
+    }
+    let catalog: readonly (readonly QueryResultRow[])[];
+    try {
+      catalog = (await queryReadinessFragments(executor, [
+        { operation: `${EXTENSION_CATALOG_OPERATION}:probePgStatStatements`, text: PG_STAT_STATEMENTS_PROBE_SQL, values: [] },
+        ...catalogFragments(),
+      ], signal)).slice(1);
+    } catch (error) {
+      if (!isPgStatStatementsNotPreloaded(error)) throw error;
+      throw new PostgreSqlExtensionPreflightError(extensions.statuses(false), EXTENSION_CATALOG_OPERATION);
+    }
     // Same-position rationale as the migration-time preflight: content
     // collation is a managed-table-specific precondition that runs
     // after required-extension readiness (pgcrypto backs the digest()
@@ -4323,50 +4510,53 @@ async function verifyPostgreSqlSchema(
     // qualified name as nondeterministic: the name in a stored
     // fingerprint would still match, but this check does not rely on
     // a stored fingerprint at all.
-    await assertPromotedMemoriesContentCollationReady(executor, {
-      operation: "runtimeReadinessContentCollation",
-      signal,
-    });
-    await inspectRequiredExtensionFunctions(executor, signal);
-    await inspectRequiredExtensionOperator(executor, signal);
-    await inspectRequiredGinTrgmOperatorClass(executor, signal);
-    await inspectRequiredGinTrgmOperators(executor, signal);
-    await inspectRequiredGinTrgmIndirectOperators(executor, signal);
-    await inspectRequiredGinTrgmSupportFunctions(executor, signal);
+    assertPromotedMemoriesContentCollationRows(catalog[0]!);
+    evaluateRequiredExtensionFunctions(catalog[1] as RequiredExtensionFunctionRow[]);
+    evaluateRequiredExtensionOperator(catalog[2] as RequiredExtensionOperatorRow[]);
+    evaluateRequiredGinTrgmOperatorClass(catalog[3] as RequiredGinTrgmOperatorClassRow[]);
+    evaluateRequiredGinTrgmOperators(catalog[4] as RequiredGinTrgmOperatorRow[]);
+    evaluateRequiredGinTrgmIndirectOperators(catalog[5] as RequiredGinTrgmIndirectOperatorRow[]);
+    evaluateRequiredGinTrgmSupportFunctions(catalog[6] as RequiredGinTrgmSupportRow[]);
     await assertPostgreSqlSearchConfigurationReady(executor, {
       operation: "runtimeReadinessSearchConfiguration",
       signal,
     });
-    const currentMigrationIds = await inspectMigrationHistory(executor, migrations, signal);
+    // The ledger check admits only the exact bundled migrations, so the
+    // snapshot it selects is the bundled latest one, known before reading.
+    const latest = selectLatestPostgreSqlSchemaSnapshot(migrations.map(({ id }) => id), snapshots);
+    const schema = await queryReadinessFragments(executor, [
+      MIGRATION_HISTORY_FRAGMENT,
+      ...(latest === null ? [] : [
+        ownershipFragment(options.expectedOwner, latest),
+        definitionsFragment(manifest, runtimeRole, admittedPeer, latest),
+        identityFunctionsFragment(latest),
+        schemaAclFragment(),
+        relationAclFragment(latest),
+        columnAclFragment(latest),
+        functionAclFragment(manifest, admittedPeer, latest),
+      ]),
+    ], signal);
+    const currentMigrationIds = evaluateMigrationHistory(schema[0] as MigrationRow[], migrations);
     const snapshot = selectLatestPostgreSqlSchemaSnapshot(currentMigrationIds, snapshots);
     if (snapshot === null) {
       throw readinessError("migration-ledger", "readMigrations");
     }
-    const ownership = await inspectOwnership(executor, options.expectedOwner, snapshot, signal);
-    const definitionObjectCount = await inspectDefinitions(
-      executor,
+    const ownership = evaluateOwnership(schema[1] as OwnershipRow[], snapshot);
+    const definitionObjectCount = evaluateDefinitions(schema[2] as DefinitionRow[], snapshot);
+    evaluateIdentityFunctions(schema[3] as IdentityFunctionRow[], snapshot);
+    evaluateSchemaAcl(schema[4] as SchemaAclRow[], manifest, runtimeRole, admittedPeer);
+    const relationOptionalPrivileges = evaluateRelationAcl(
+      schema[5] as AclRow[],
       manifest,
       runtimeRole,
       admittedPeer,
       snapshot,
-      signal,
     );
-    await inspectSchemaAcl(executor, manifest, runtimeRole, admittedPeer, signal);
-    const relationOptionalPrivileges = await inspectRelationAcl(
-      executor,
+    const columnOptionalPrivileges = evaluateColumnAcl(
+      schema[6] as AclRow[],
       manifest,
       runtimeRole,
       admittedPeer,
-      snapshot,
-      signal,
-    );
-    const columnOptionalPrivileges = await inspectColumnAcl(
-      executor,
-      manifest,
-      runtimeRole,
-      admittedPeer,
-      snapshot,
-      signal,
     );
     const runtimeObserved = new Set([
       ...relationOptionalPrivileges.runtime,
@@ -4379,7 +4569,7 @@ async function verifyPostgreSqlSchema(
         ...columnOptionalPrivileges.peer,
       ]));
     }
-    await inspectFunctionAcl(executor, manifest, runtimeRole, admittedPeer, snapshot, signal);
+    evaluateFunctionAcl(schema[7] as FunctionAclRow[], manifest, runtimeRole, admittedPeer, snapshot);
     await inspectEffectivePrivileges(
       executor,
       manifest,
