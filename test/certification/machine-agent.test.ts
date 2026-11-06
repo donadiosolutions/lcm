@@ -35,7 +35,7 @@ import {
   verifyTlsNegativeProbe,
   waitForAcknowledgmentCatchUp,
 } from "./machine-agent.mjs";
-import { evaluatePhaseProbeEvidence } from "./observability.mjs";
+import { OBSERVABILITY_ACTIONS, evaluatePhaseProbeEvidence } from "./observability.mjs";
 import { OBSERVER_BUSY_TIMEOUT_MS, observerReadSettings } from "./sqlite-observer-worker.mjs";
 import { extractPostToolEvents, extractUserPromptEvents } from "../../src/hooks/extractors.js";
 import { normalizePostToolInput } from "../../src/hooks/post-tool-normalization.js";
@@ -55,12 +55,13 @@ const HEALTHY_SNAPSHOT = {
 // Runs the real controlled-phase loop on a virtual clock set well in the real past, so the
 // real-time workload and catch-up read finish at once. The coordinator's clear lands while
 // probe `straddle` is in flight, after that probe started.
-async function runStraddledPhase({ phase, machine, straddle, respond, prepareHome }: {
+async function runStraddledPhase({ phase, machine, straddle, respond, prepareHome, expectDetection = true }: {
   phase: string;
   machine: "a" | "b";
   straddle: number;
   respond: (sequence: number, startedAtMs: number, clearedAtMs: number | undefined) => { transportFailure?: boolean; snapshot?: unknown };
   prepareHome?: (home: string, appliedAtMs: number) => void;
+  expectDetection?: boolean;
 }) {
   const root = mkdtempSync(join(tmpdir(), `lcm-cert-${phase}-straddle-`));
   const evidenceDirectory = join(root, "evidence");
@@ -73,7 +74,7 @@ async function runStraddledPhase({ phase, machine, straddle, respond, prepareHom
   const appliedAt = new Date(appliedAtMs).toISOString();
   prepareHome?.(home, appliedAtMs);
   writeFileSync(join(evidenceDirectory, `${phase}-prepare.json`), `${JSON.stringify({ preparedAt: appliedAt })}\n`);
-  writeFileSync(join(evidenceDirectory, `${phase}-control.json`), `${JSON.stringify({ appliedAt, expectDetection: true })}\n`);
+  writeFileSync(join(evidenceDirectory, `${phase}-control.json`), `${JSON.stringify({ appliedAt, expectDetection })}\n`);
   // The backlog step starts at its deferral instant, so only the probe loop waits.
   let clock = phase === "queue-backlog" ? appliedAtMs + 960_000 : appliedAtMs;
   let clearedAt = "";
@@ -101,7 +102,8 @@ async function runStraddledPhase({ phase, machine, straddle, respond, prepareHom
     },
   });
   const readJson = (name: string) => JSON.parse(readFileSync(join(evidenceDirectory, name), "utf8"));
-  return { records: result.records as PhaseProbe[], baseline, readJson, fault: { appliedAt, clearedAt }, cleared: result.cleared as { id: string } | undefined };
+  const readIfPresent = (name: string) => existsSync(join(evidenceDirectory, name)) ? readJson(name) : undefined;
+  return { records: result.records as PhaseProbe[], baseline, readJson, readIfPresent, fault: { appliedAt, clearedAt }, cleared: result.cleared as { id: string } | undefined };
 }
 
 describe("observability probes", () => {
@@ -251,6 +253,59 @@ describe("observability probes", () => {
     }).toEqual({
       clearance: "queue-backlog-b-probe-201", evaluated: "queue-backlog-b-probe-201", healthyClearanceSeconds: 201.5,
       recovery: true, alert: true,
+    });
+  });
+
+  // Under the saturation lock each body times out with no waiting request, as in smoke 3;
+  // a probe that started after the clear is healthy.
+  const lockedOrHealthy = (startedAtMs: number, clearedAtMs: number | undefined) => clearedAtMs !== undefined && startedAtMs >= clearedAtMs
+    ? HEALTHY_SNAPSHOT : { ...HEALTHY_SNAPSHOT, classification: "timeout", pool: { ...HEALTHY_SNAPSHOT.pool, waiting: 0 } };
+
+  it("ends a saturation search that never sees waiting as no-waiting and keeps both machines probing to clearance", async () => {
+    const respond = (_sequence: number, startedAtMs: number, clearedAtMs: number | undefined) => ({ snapshot: lockedOrHealthy(startedAtMs, clearedAtMs) });
+    // Probes 0-19 search for a witness and the 20-second bound passes before probe 20. The
+    // coordinator clears after B's outcome, while a later probe is in flight.
+    const b = await runStraddledPhase({ phase: "saturation", machine: "b", straddle: 20, respond });
+    const a = await runStraddledPhase({ phase: "saturation", machine: "a", straddle: 22, respond, expectDetection: false });
+    const clearedAtMs = Date.parse(b.fault.clearedAt);
+    const machineA = { id: "saturation-a-probe-0", machine: "a", phase: "saturation", sequence: 0, startedAtMs: clearedAtMs, completedAtMs: clearedAtMs + 1_000, snapshot: HEALTHY_SNAPSHOT };
+    const evaluated = evaluatePhaseProbeEvidence({ phase: "saturation", probes: [machineA, ...b.records], fault: b.fault, baseline: { b: b.baseline } });
+    expect({
+      outcome: b.readIfPresent("saturation-outcome.json"), witness: b.readIfPresent("saturation-detected.json"),
+      clearanceB: b.cleared?.id, outcomeA: a.readIfPresent("saturation-outcome.json"), clearanceA: a.cleared?.id,
+      alert: evaluated.alert, recovery: evaluated.recovery,
+    }).toEqual({
+      outcome: { machine: "b", outcome: "no-waiting", id: null }, witness: undefined,
+      clearanceB: "saturation-b-probe-21", outcomeA: undefined, clearanceA: "saturation-a-probe-23",
+      alert: undefined, recovery: true,
+    });
+  });
+
+  it.each([
+    ["witness", 2, "saturation-b-probe-3", true],
+    ["wrong-telemetry", 4, "saturation-b-probe-5", false],
+  ] as const)("ends the saturation search at the first waiting body as %s", async (outcome, straddle, clearance, alert) => {
+    const saturated = { ...HEALTHY_SNAPSHOT, pool: { ...HEALTHY_SNAPSHOT.pool, waiting: 1 }, telemetry: { ...HEALTHY_SNAPSHOT.telemetry,
+      pool: { status: "observed", health: "degraded", saturationRatio: 1, remediation: OBSERVABILITY_ACTIONS.poolSaturated } } };
+    const wrong = { ...saturated, telemetry: { ...HEALTHY_SNAPSHOT.telemetry,
+      pool: { status: "observed", health: "healthy", saturationRatio: 0.5, remediation: OBSERVABILITY_ACTIONS.healthy } } };
+    // Probe 2 is the first body with a waiting request. Later locked bodies all qualify, so a
+    // wrong first body must not give way to a later witness. A witness's clear lands inside
+    // probe 2, so the agent's wait for it after the witness returns at once.
+    const { records, baseline, readIfPresent, fault, cleared } = await runStraddledPhase({
+      phase: "saturation", machine: "b", straddle,
+      respond: (sequence, startedAtMs, clearedAtMs) => ({
+        snapshot: sequence < 2 || (clearedAtMs !== undefined && startedAtMs >= clearedAtMs) ? lockedOrHealthy(startedAtMs, clearedAtMs)
+          : sequence === 2 && outcome === "wrong-telemetry" ? wrong : saturated,
+      }),
+    });
+    const evaluated = evaluatePhaseProbeEvidence({ phase: "saturation", probes: records, fault, baseline: { b: baseline } });
+    expect({
+      outcome: readIfPresent("saturation-outcome.json"), witness: readIfPresent("saturation-detected.json")?.id,
+      clearance: cleared?.id, alert: evaluated.alert,
+    }).toEqual({
+      outcome: { machine: "b", outcome, id: "saturation-b-probe-2" }, witness: outcome === "witness" ? "saturation-b-probe-2" : undefined,
+      clearance, alert,
     });
   });
 

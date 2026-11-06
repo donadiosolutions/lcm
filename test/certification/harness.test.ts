@@ -527,7 +527,9 @@ describe("certification harness", () => {
       expect(order.indexOf(`apply:${phase}`)).toBeGreaterThan(order.findIndex((entry) => entry.includes(`${phase}-ready.json`)));
       expect(order.indexOf(`clear:${phase}`)).toBeGreaterThan(order.indexOf(`apply:${phase}`));
     }
-    expect(waitTimeouts.find((entry) => entry.names === "saturation-detected.json")?.timeoutMs).toBe(20_000);
+    // The 20 s witness bound plus one probe started by then and one poll, below the 40 s lock.
+    expect(waitTimeouts.find((entry) => entry.names === "saturation-outcome.json")?.timeoutMs).toBe(27_000);
+    expect(waitTimeouts.some((entry) => entry.names === "saturation-detected.json")).toBe(false);
   });
 
   it("clears an active mutation, records the failed barrier, and signals later phases to stop", async () => {
@@ -584,10 +586,10 @@ describe("certification harness", () => {
         contract, evidenceDirectory, machineNames: ["machine-a", "machine-b"],
         adminUrl: "postgresql://admin@db/lcm", caFile, processRunner: async () => undefined,
         containerCli: "podman", network: "network", machineB: "machine-b",
-        // Detection outlasts the 40-second safety timer, so clear() arrives while the
+        // The outcome wait outlasts the 40-second safety timer, so clear() arrives while the
         // timer's ROLLBACK is still running.
         waitForFiles: async (paths: string[]) => {
-          if (paths.some((path) => path.endsWith("saturation-detected.json"))) await new Promise((resolve) => setTimeout(resolve, 45_000));
+          if (paths.some((path) => path.endsWith("saturation-outcome.json"))) await new Promise((resolve) => setTimeout(resolve, 45_000));
         },
       });
       await vi.advanceTimersByTimeAsync(60_000);
@@ -878,14 +880,20 @@ describe("certification fault clearance probes", () => {
   // with: the clearance probe connects with the file's LCM_POSTGRES_RUNTIME_URL, and any other
   // command (such as `lcm doctor`) connects with its LCM_POSTGRES_URL, the transfer role that
   // setup revoked, and fails the way certifying run 1 did.
-  async function runLocalFaultPath(variant: { profile: "full" | "smoke"; withFaults?: boolean; clearanceFailures?: number; identity?: Record<string, unknown> }) {
+  // With version 4 the fake agents also answer calibration and every observability barrier.
+  async function runLocalFaultPath(variant: {
+    profile: "full" | "smoke"; withFaults?: boolean; clearanceFailures?: number; identity?: Record<string, unknown>;
+    version?: 4; saturation?: "witness" | "no-waiting";
+  }) {
     const root = mkdtempSync(join(tmpdir(), "lcm-cert-local-faults-"));
     const evidenceDirectory = join(root, "evidence");
     const harnessDirectory = join(root, "harness");
     mkdirSync(harnessDirectory);
     const caFile = join(root, "ca.crt");
     writeFileSync(caFile, "certificate", { mode: 0o600 });
-    const { contract } = loadCertificationContract(new URL("./contract-v3.json", import.meta.url));
+    const { contract } = variant.version === 4
+      ? loadCertificationContract(new URL("./contract-v4.json", import.meta.url), { requireApproved: false })
+      : loadCertificationContract(new URL("./contract-v3.json", import.meta.url));
     const names = createRunNames("a".repeat(32));
     const hostUrl = (role: string) => `postgresql://${role}:${role}-secret@127.0.0.1:15432/${names.controlDatabase}`;
     const networkUrl = (role: string) => `postgresql://${role}:${role}-secret@${names.alias}:5432/${names.controlDatabase}`;
@@ -900,10 +908,41 @@ describe("certification fault clearance probes", () => {
       if (agentsStopped) throw new Error("fake agent stopped");
       await fastDelay();
     };
+    // Answers each v4 observability barrier with the files the real agent writes. Machine B
+    // ends saturation with its terminal outcome; only a witness also writes the detection file.
+    const fakeObservabilityPhases = async (
+      machine: "a" | "b", directory: string,
+      wait: (file: string) => Promise<{ expectDetection?: boolean }>, write: (file: string, record?: unknown) => void,
+    ) => {
+      for (const phase of ["saturation", "timeout", "stats-reset", "permission-loss", "extension-loss", "queue-backlog", "canary"]) {
+        // Like the real agent, stop at the coordinator's signal after a failed barrier.
+        const deadline = Date.now() + 60_000;
+        while (!existsSync(join(directory, `${phase}-prepare.json`))) {
+          if (existsSync(join(directory, "observability-stop.json"))) return;
+          if (Date.now() >= deadline) throw new Error(`fake agent ${machine} missed ${phase}-prepare.json`);
+          await agentDelay();
+        }
+        write(`${phase}-ready.json`);
+        const control = await wait(`${phase}-control.json`);
+        if (phase === "queue-backlog") {
+          if (machine === "b") write("queue-backlog-aged.json");
+        } else if (phase !== "saturation") write(`${phase}-detected.json`);
+        else if (control.expectDetection) {
+          const witness = variant.saturation !== "no-waiting";
+          if (witness) write("saturation-detected.json", { machine, id: "saturation-b-probe-0" });
+          write("saturation-outcome.json", { machine, outcome: witness ? "witness" : "no-waiting", id: witness ? "saturation-b-probe-0" : null });
+        }
+        await wait(`${phase}-cleared.json`);
+        if (phase === "queue-backlog" && machine === "b") write("queue-backlog-detected.json");
+        write(`${phase}-clearance.json`);
+        write(`${phase}-complete.json`);
+      }
+    };
     const fakeAgent = async (machine: "a" | "b") => {
       const directory = join(evidenceDirectory, `machine-${machine}`);
-      const wait = (file: string) => waitForControl(join(directory, file), { deadlineMs: Date.now() + 10_000, delay: agentDelay });
-      const write = (file: string) => writeFileSync(join(directory, file), `${JSON.stringify({ machine, at: new Date().toISOString() })}\n`, { mode: 0o600, flag: "wx" });
+      // A v4 agent may wait out a coordinator's 20-second saturation hold.
+      const wait = (file: string) => waitForControl(join(directory, file), { deadlineMs: Date.now() + (variant.version === 4 ? 60_000 : 10_000), delay: agentDelay });
+      const write = (file: string, record: unknown = { machine, at: new Date().toISOString() }) => writeFileSync(join(directory, file), `${JSON.stringify(record)}\n`, { mode: 0o600, flag: "wx" });
       await wait("migration-start.json");
       write("verification-receipt.json");
       await wait("activation-start.json");
@@ -916,17 +955,30 @@ describe("certification fault clearance probes", () => {
         machineId: `018f0000-0000-7000-8000-00000000000${machine === "a" ? 1 : 2}`, identityKey: `machine:${machine.repeat(64)}`,
       }));
       write("ready.json");
+      if (variant.version === 4) {
+        await wait("calibration-control.json");
+        write("calibration-complete.json");
+      }
       await wait("warmup-control.json");
       write("warmup-complete.json");
       await wait("phase-control.json");
       write("steady-complete.json");
       write("fault-ready.json");
       if (faults) {
+        if (variant.version === 4) {
+          await wait("partition-a-prepare.json");
+          write("partition-a-ready.json");
+        }
         await wait("partition-cleared.json");
         write("partition-recovered.json");
         write("restart-ready.json");
+        if (variant.version === 4) {
+          await wait("restart-database-prepare.json");
+          write("restart-database-ready.json");
+        }
         await wait("restart-cleared.json");
         write("restart-recovered.json");
+        if (variant.version === 4) await fakeObservabilityPhases(machine, directory, wait, write);
       }
       write("drain.json");
       await wait("clock-finished.json");
@@ -969,26 +1021,29 @@ describe("certification fault clearance probes", () => {
         contract, contractSha256: "a".repeat(64), approval, approvalSha256: "b".repeat(64),
       }, {
         environment: { LCM_TEST_CONTAINER_CLI: "podman" },
-        runHarness: async ({ runTests }: any) => runTests({
-          runId: "a".repeat(32),
-          names,
-          directory: harnessDirectory,
-          environment: {
-            LCM_TEST_POSTGRES_ADMIN_URL: hostUrl("lcm_harness_admin"),
-            LCM_TEST_POSTGRES_MIGRATOR_URL: hostUrl("lcm_test_migrator"),
-            LCM_TEST_POSTGRES_RUNTIME_URL: hostUrl("lcm_test_runtime"),
-            LCM_TEST_POSTGRES_CA_FILE: caFile,
-            LCM_TEST_POSTGRES_WRONG_CA_FILE: caFile,
-          },
-          inNetworkEnvironment: {
-            LCM_TEST_POSTGRES_ADMIN_URL: networkUrl("lcm_harness_admin"),
-            LCM_TEST_POSTGRES_RUNTIME_URL: networkUrl("lcm_test_runtime"),
-          },
-          owner: { pid: 1, birth: "birth", scope: "scope" },
-          containerCli: "podman",
-          processRunner,
-          secrets: ["lcm_harness_admin-secret", "lcm_test_migrator-secret", "lcm_test_runtime-secret", `${transferRole}-secret`],
-        }),
+        // Like the real runHarness, the wrapper awaits runTests and resolves to undefined.
+        runHarness: async ({ runTests }: any) => {
+          await runTests({
+            runId: "a".repeat(32),
+            names,
+            directory: harnessDirectory,
+            environment: {
+              LCM_TEST_POSTGRES_ADMIN_URL: hostUrl("lcm_harness_admin"),
+              LCM_TEST_POSTGRES_MIGRATOR_URL: hostUrl("lcm_test_migrator"),
+              LCM_TEST_POSTGRES_RUNTIME_URL: hostUrl("lcm_test_runtime"),
+              LCM_TEST_POSTGRES_CA_FILE: caFile,
+              LCM_TEST_POSTGRES_WRONG_CA_FILE: caFile,
+            },
+            inNetworkEnvironment: {
+              LCM_TEST_POSTGRES_ADMIN_URL: networkUrl("lcm_harness_admin"),
+              LCM_TEST_POSTGRES_RUNTIME_URL: networkUrl("lcm_test_runtime"),
+            },
+            owner: { pid: 1, birth: "birth", scope: "scope" },
+            containerCli: "podman",
+            processRunner,
+            secrets: ["lcm_harness_admin-secret", "lcm_test_migrator-secret", "lcm_test_runtime-secret", `${transferRole}-secret`],
+          });
+        },
         stagePackage: () => ({ root: join(root, "package"), sha256: "b".repeat(64) }),
         captureExecutionProvenance: () => ({ dirty: false }),
         prepareDatabase: async () => ({ transferName: transferRole, transferUrl: hostUrl(transferRole) }),
@@ -999,6 +1054,8 @@ describe("certification fault clearance probes", () => {
         collectReadiness,
         collectSetupSessionClosure: async () => ({ observedAt: new Date().toISOString(), roles: { migrator: 0, transfer: 0 }, totalConnections: 0, setupSessionsClosed: true }),
         startClockMonitor: async () => ({ stop: async () => [] }),
+        // Only v4 calibrates; its counters are not under test here.
+        collectCalibrationEvidence: async ({ startAt }: { startAt: string }) => ({ startAt, samples: [], quotas: { database: { cpus: 1 } }, addressLabels: { a: true, b: true } }),
         collectRelationBytes: async () => 0,
         monitorMachineDelay: async () => undefined,
         delay: fastDelay,
@@ -1053,6 +1110,29 @@ describe("certification fault clearance probes", () => {
     expect(run.error).toBeUndefined();
     expect(run.clearances).toHaveLength(4);
   });
+
+  it("reconstructs the v4 observability summary after a passing cleanup though runHarness returns nothing", async () => {
+    const run = await runLocalFaultPath({ profile: "smoke", withFaults: true, version: 4 });
+    expect(run.error).toBeUndefined();
+    expect(JSON.parse(readFileSync(join(run.evidenceDirectory, "cleanup.json"), "utf8")).verdict).toBe("pass");
+    expect(JSON.parse(readFileSync(join(run.evidenceDirectory, "observability-summary.json"), "utf8"))).toMatchObject({
+      contract: { version: 4, sha256: "a".repeat(64) },
+      run: { sha256: createHash("sha256").update("a".repeat(32)).digest("hex") },
+    });
+  }, 30_000);
+
+  // Smoke 3: no B body ever showed a waiting request, so no witness exists. Saturation is then
+  // incomplete, and the run must still clear the lock and run every later step.
+  it("runs every later observability step when saturation waiting is never established", async () => {
+    const run = await runLocalFaultPath({ profile: "smoke", withFaults: true, version: 4, saturation: "no-waiting" });
+    expect(run.error).toBeUndefined();
+    const steps = ["saturation", "timeout", "stats-reset", "permission-loss", "extension-loss", "queue-backlog", "canary"];
+    expect(JSON.parse(readFileSync(join(run.evidenceDirectory, "observability-barriers.json"), "utf8")))
+      .toEqual(steps.map((step) => ({ step, verdict: "pass" })));
+    expect(JSON.parse(readFileSync(join(run.evidenceDirectory, "faults.json"), "utf8")).map((fault: { id: string }) => fault.id))
+      .toEqual(["partition-a", "restart-database", ...steps]);
+    expect(existsSync(join(run.evidenceDirectory, "machine-b", "saturation-detected.json"))).toBe(false);
+  }, 60_000);
 
   // The local lane controls both ends, so its server port must still be 5432.
   it.each([

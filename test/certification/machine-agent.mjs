@@ -1025,13 +1025,22 @@ export async function executeControlledObservabilityPhase({
   let clearedAtMs;
   let backlogWitness;
   let saturationWaitingEstablished = false;
+  // R3-3: B's first body with a waiting request ends the witness search as witness or
+  // wrong-telemetry, and the 20-second bound ends it as no-waiting. The coordinator clears
+  // on this one terminal record while both machines keep probing for the cleared state.
+  let saturationOutcome;
+  const recordSaturationOutcome = (outcome, id) => {
+    saturationOutcome = { machine, outcome, id };
+    writeFileSync(join(evidenceDirectory, "saturation-outcome.json"), `${JSON.stringify(saturationOutcome)}\n`, { mode: 0o600, flag: "wx" });
+  };
   // After the backlog reconnect, probing continues one at a time until the first healthy
   // post-clear probe or the contract's healthy-clearance allowance after clearedAt.
   const probingEndsAtMs = () => (phase === "queue-backlog" && Number.isFinite(clearedAtMs)
     ? clearedAtMs + contract.observability.clearanceSeconds.backlogHealthy * 1000
     : appliedAtMs + holdMaximumSeconds * 1000 + 30_000);
   for (let sequence = 0; now() < probingEndsAtMs(); sequence += 1) {
-    if (phase === "saturation" && !detected && now() >= appliedAtMs + holdMaximumSeconds * 1000) break;
+    if (phase === "saturation" && control.expectDetection !== false && !saturationOutcome
+      && now() >= appliedAtMs + holdMaximumSeconds * 1000) recordSaturationOutcome("no-waiting", null);
     const target = appliedAtMs + sequence * cadenceMs;
     if (target > now()) await wait(target - now());
     const record = await probe({
@@ -1051,7 +1060,7 @@ export async function executeControlledObservabilityPhase({
       && (record.transportFailure === true || ["timeout", "unavailable"].includes(record.snapshot?.classification))) {
       writeFileSync(join(evidenceDirectory, "queue-backlog-outage-detected.json"), `${JSON.stringify({ machine, id: record.id, completedAtMs: record.completedAtMs })}\n`, { mode: 0o600, flag: "wx" });
     }
-    if (control.expectDetection !== false && !detected && (phase !== "queue-backlog" || startedAfterClear)
+    if (control.expectDetection !== false && !detected && !saturationOutcome && (phase !== "queue-backlog" || startedAfterClear)
       && probeMatchesPhase(phase, record, { baseline })) {
       if (phase === "queue-backlog" && machine === "b") {
         backlogWitness = await backlogDeferral;
@@ -1061,13 +1070,15 @@ export async function executeControlledObservabilityPhase({
       } else detected = { machine, id: record.id, completedAtMs: record.completedAtMs };
       writeFileSync(join(evidenceDirectory, `${phase}-detected.json`), `${JSON.stringify(detected)}\n`, { mode: 0o600, flag: "wx" });
       if (phase === "saturation") {
+        recordSaturationOutcome("witness", record.id);
         await waitForControl(join(evidenceDirectory, "saturation-cleared.json"), {
           deadlineMs: now() + contract.observability.clearanceSeconds.saturation * 1000,
           now,
           delay: wait,
         });
       }
-    }
+    } else if (phase === "saturation" && control.expectDetection !== false && !saturationOutcome
+      && record.snapshot?.pool?.waiting > 0) recordSaturationOutcome("wrong-telemetry", record.id);
     if (startedAfterClear && healthyProbe(record)) {
       cleared = { machine, id: record.id, completedAtMs: record.completedAtMs };
       writeFileSync(join(evidenceDirectory, `${phase}-clearance.json`), `${JSON.stringify(cleared)}\n`, { mode: 0o600, flag: "wx" });

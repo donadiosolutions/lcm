@@ -1590,8 +1590,16 @@ export async function runV4ObservabilityPhases({
         await waitForFiles([join(evidenceDirectory, "machine-b", "queue-backlog-aged.json")], machineNames, contract.timeline.full.backlogHoldMaxSeconds * 1000);
         await active.clear(); activeCleared = true; publishCleared();
         await waitForFiles(detectionPaths, machineNames, contract.observability.clearanceSeconds.backlog * 1000);
+      } else if (phase === "saturation") {
+        // B ends its 20-second witness search with one terminal outcome: witness, no-waiting or
+        // wrong-telemetry. Allow the probe it may have started by the bound and one poll; the
+        // lock stays below its 40-second ceiling.
+        await waitForFiles([join(evidenceDirectory, "machine-b", "saturation-outcome.json")], machineNames,
+          (contract.observability.faultHoldMaximumSeconds.saturationWitness + contract.observability.probe.saturationCadenceSeconds) * 1000
+            + contract.observability.probe.transportTimeoutMs + 1_000);
+        await active.clear(); activeCleared = true; publishCleared();
       } else {
-        const holdKey = phase === "saturation" ? "saturationWitness" : phase === "permission-loss" ? "permissionLoss" : phase === "extension-loss" ? "extensionLoss" : phase === "stats-reset" ? "statsReset" : phase;
+        const holdKey = phase === "permission-loss" ? "permissionLoss" : phase === "extension-loss" ? "extensionLoss" : phase === "stats-reset" ? "statsReset" : phase;
         await waitForFiles(detectionPaths, machineNames, (contract.observability.faultHoldMaximumSeconds[holdKey] ?? 60) * 1000);
         await active.clear(); activeCleared = true; publishCleared();
       }
@@ -2017,6 +2025,8 @@ export async function runLocalCertification(options, dependencies = {}) {
   const faultsEnabled = options.profile === "full" || options.withFaults === true;
   const executeHarness = dependencies.runHarness ?? runHarness;
   let result;
+  // runHarness resolves without the runTests value, so the v4 reconstruction inputs are kept here.
+  let observability;
   try {
     result = await executeHarness({
     certificationMachines: true,
@@ -2454,7 +2464,8 @@ export async function runLocalCertification(options, dependencies = {}) {
             ["transfer-role", databasePreparation.transferName],
           ].map(([category, value]) => ({ category, value, sourceClass: "coordinator", scanMode: value.length >= 8 ? "all-forms" : "boundary-token" }));
           writeFileSync(join(options.evidenceDirectory, "coordinator-inventory-manifest.json"), `${JSON.stringify(createInventoryManifest(coordinatorInventory, "coordinator"), null, 2)}\n`, { mode: 0o600, flag: "wx" });
-          return { stage, machines: machineRoots, observability: { coordinatorInventory, runId: context.runId, faults: runFaults } };
+          observability = { coordinatorInventory, runId: context.runId, faults: runFaults };
+          return { stage, machines: machineRoots, observability };
         }
         return { stage, machines: machineRoots };
       } finally {
@@ -2481,9 +2492,9 @@ export async function runLocalCertification(options, dependencies = {}) {
     evidenceDirectory: options.evidenceDirectory,
     contract,
     contractSha256: options.contractSha256,
-    runId: result.observability.runId,
-    faults: result.observability.faults,
-    coordinatorInventory: result.observability.coordinatorInventory,
+    runId: observability.runId,
+    faults: observability.faults,
+    coordinatorInventory: observability.coordinatorInventory,
   });
   return result;
 }
