@@ -60,15 +60,17 @@ interface StepCounts {
 }
 
 /**
- * This fixture's counts after #1869 slice 1. On origin/main 7790f1f3 the
- * same steps needed plan 34 turns and 22 dispatches, apply 2821 and 2773,
- * verify 496 and 472, and activate 413 and 383, over the same connections.
+ * This fixture's counts after #1869 slice 2. After slice 1 (f436832f) the
+ * same steps needed plan 34 turns and 22 dispatches, apply 2565 and 2517,
+ * verify 319 and 295 over 4 connections, and activate 274 and 244. On
+ * origin/main 7790f1f3, before slice 1, they needed plan 34 and 22, apply
+ * 2821 and 2773, verify 496 and 472, and activate 413 and 383.
  */
 const MEASURED: Readonly<Record<Step, Readonly<{ turns: number; dispatches: number; connections: number }>>> = {
-  plan: { turns: 34, dispatches: 22, connections: 2 },
-  apply: { turns: 2565, dispatches: 2517, connections: 8 },
-  verify: { turns: 319, dispatches: 295, connections: 4 },
-  activate: { turns: 274, dispatches: 244, connections: 5 },
+  plan: { turns: 19, dispatches: 7, connections: 2 },
+  apply: { turns: 1588, dispatches: 1540, connections: 8 },
+  verify: { turns: 165, dispatches: 147, connections: 3 },
+  activate: { turns: 158, dispatches: 128, connections: 5 },
 };
 
 function isIdleValidationProbe(config: unknown): boolean {
