@@ -11,7 +11,7 @@ import { assertCertificationRunPolicy, certificationDeadlineSeconds, loadCertifi
 import { publishPostgreSqlBackend } from "../test/certification/backend-publication.mjs";
 import { createDeterministicSchedule, createFaultSchedule, createObservabilityWorkloadSchedule, observabilityPhaseWorkloadSeconds } from "../test/certification/schedule.mjs";
 import { CANARY_CORPUS, createCanaryWorkload } from "../test/certification/canary-corpus.mjs";
-import { REQUIRED_MACHINE_INVENTORY_CATEGORIES, buildObservabilitySummary, createInventoryManifest, createProbeSchedule, evaluateBarrierSequence, evaluateCalibrationPairs, evaluatePhaseProbeEvidence, evaluatePhaseWorkload, evaluateProbePopulation, evaluateStatementOverhead, healthySnapshot, scanSurface } from "../test/certification/observability.mjs";
+import { REQUIRED_MACHINE_INVENTORY_CATEGORIES, buildObservabilitySummary, createInventoryManifest, createProbeSchedule, evaluateBarrierSequence, evaluateCalibrationPairs, evaluatePhaseProbeEvidence, evaluatePhaseWorkload, evaluateProbePopulation, evaluateStatementOverhead, fieldScopeResidualHits, healthySnapshot, scanSurface } from "../test/certification/observability.mjs";
 import { observerReadSettings } from "../test/certification/sqlite-observer-worker.mjs";
 import { createOwnerIdentity, createProcessLifecycle, createRunNames, ownershipLabels, removeOwnedResource, runHarness, runSanitizedProcess } from "./postgresql-harness.mjs";
 
@@ -1885,23 +1885,38 @@ export function reconstructObservabilitySummary({ evidenceDirectory, contract, c
     const path = join(evidenceDirectory, `machine-${machine}`, "privacy-surfaces.json");
     return existsSync(path) ? jsonFromFile(path) : undefined;
   });
-  // On a private machine surface named in the selected contract's
-  // privateSurfaceCategoryAllowances, LCM records the listed inventory categories by design (the
-  // hook-error fallback log records the hook's working directory). Their hits are counted
-  // separately and not as leaks; every other category and every canary is unchanged. Category
-  // counts that do not reconcile with the surface total all stay leaks.
+  // A private machine surface named in the selected contract's privateSurfaceCategoryAllowances
+  // may carry the listed path categories only in the allowed field (the hook-error fallback log's
+  // top-level cwd). Only a valid field-scope witness earns the allowance: raw minus residual hits,
+  // counted separately. A surface whose witness is missing or invalid gets no subtraction, and its
+  // path hits leave the item incomplete. Every other category and every canary is judged on the
+  // raw scan, and raw counts that do not reconcile with the surface total all stay leaks.
   const allowances = contract.observability?.privacy?.privateSurfaceCategoryAllowances ?? {};
   const allowedSurfaceHits = {};
+  const fieldScopeWitnesses = {};
+  let undeterminedSecretHits = 0;
+  let invalidFieldScope = false;
   const privateScans = privateSurfaceFiles.flatMap((entry) => entry?.surfaces ?? []).map((surface) => {
-    const allowed = Object.hasOwn(allowances, surface.name) && Array.isArray(allowances[surface.name]) ? allowances[surface.name] : [];
-    const hits = allowed.map((category) => surface.categoryHits?.[category] ?? 0);
-    const allowedTotal = hits.reduce((sum, value) => sum + value, 0);
-    if (allowedTotal === 0 || !hits.every((value) => Number.isSafeInteger(value) && value >= 0) || !(allowedTotal <= surface.secretHits)) return surface;
-    allowedSurfaceHits[surface.name] ??= {};
-    for (const [index, category] of allowed.entries()) {
-      allowedSurfaceHits[surface.name][category] = (allowedSurfaceHits[surface.name][category] ?? 0) + hits[index];
+    const allowance = Object.hasOwn(allowances, surface.name) ? allowances[surface.name] : undefined;
+    if (!Array.isArray(allowance?.categories)) return surface;
+    const raw = allowance.categories.map((category) => surface.categoryHits?.[category] ?? 0);
+    const rawTotal = raw.reduce((sum, value) => sum + value, 0);
+    const separable = raw.every((value) => Number.isSafeInteger(value) && value >= 0) && rawTotal <= surface.secretHits;
+    const residual = separable ? fieldScopeResidualHits(surface, allowance) : undefined;
+    const status = residual !== undefined ? "valid" : separable && surface.fieldScope === undefined ? "missing" : "invalid";
+    (fieldScopeWitnesses[surface.name] ??= { valid: 0, missing: 0, invalid: 0 })[status] += 1;
+    if (residual === undefined) {
+      if (status === "invalid") invalidFieldScope = true;
+      if (separable) undeterminedSecretHits += rawTotal;
+      return surface;
     }
-    return { ...surface, secretHits: surface.secretHits - allowedTotal };
+    for (const [index, category] of allowance.categories.entries()) {
+      const allowed = raw[index] - residual[index];
+      if (allowed === 0) continue;
+      allowedSurfaceHits[surface.name] ??= {};
+      allowedSurfaceHits[surface.name][category] = (allowedSurfaceHits[surface.name][category] ?? 0) + allowed;
+    }
+    return { ...surface, secretHits: surface.secretHits - rawTotal + residual.reduce((sum, value) => sum + value, 0) };
   });
   const failureScans = ['a', 'b'].flatMap((machine) => ndjsonFromFile(join(evidenceDirectory, `machine-${machine}`, "failure-privacy.ndjson")));
   const failureRecords = ['a', 'b'].flatMap((machine) => ndjsonFromFile(join(evidenceDirectory, `machine-${machine}`, "failures.ndjson")));
@@ -1992,6 +2007,9 @@ export function reconstructObservabilitySummary({ evidenceDirectory, contract, c
     secretHits: scans.reduce((sum, scan) => sum + (scan.secretHits ?? 0), 0),
     secretCategories: secretCategories.size,
     allowedSurfaceHits,
+    fieldScopeWitnesses,
+    undeterminedSecretHits,
+    fieldScopeComplete: !invalidFieldScope && undeterminedSecretHits === 0,
     inventoryComplete: machineInventoryComplete && coordinatorInventoryComplete,
     surfacesComplete,
   };
@@ -2318,7 +2336,7 @@ export async function runLocalCertification(options, dependencies = {}) {
           writeFileSync(join(options.evidenceDirectory, "calibration-plan.json"), `${JSON.stringify({
             startAt: calibrationStartAt,
             ...contract.observability.calibration,
-            provisional: true,
+            provisional: contract.observability.calibration.budgetCeilingsProvisional,
           }, null, 2)}\n`, { mode: 0o600, flag: "wx" });
           for (const machine of ['a', 'b']) writeFileSync(
             join(options.evidenceDirectory, `machine-${machine}`, "calibration-control.json"),

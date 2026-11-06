@@ -12,7 +12,7 @@ import { connect as tlsConnect } from "node:tls";
 import { createDeterministicSchedule, createFaultSchedule, createObservabilityWorkloadSchedule, observabilityPhaseWorkloadSeconds } from "./schedule.mjs";
 import { assertCertificationRunPolicy, loadCertificationContract } from "./contract.mjs";
 import { observerReadSettings } from "./sqlite-observer-worker.mjs";
-import { CANARY_CORPUS, buildSecretInventory, createInventoryManifest, createProbeSchedule, evaluateSaturationWitness, evaluateTimeoutShape, healthySnapshot, maskInventoryValues, scanSurface, validateTelemetryCardinality } from "./observability.mjs";
+import { CANARY_CORPUS, EVENTS_LOG_FIELD_SCOPE, buildSecretInventory, createInventoryManifest, createProbeSchedule, evaluateSaturationWitness, evaluateTimeoutShape, eventsLogResidual, healthySnapshot, maskInventoryValues, scanSurface, validateTelemetryCardinality } from "./observability.mjs";
 import { createCanaryWorkload } from "./canary-corpus.mjs";
 
 const execFileAsync = promisify(execFile);
@@ -441,6 +441,21 @@ export async function createMachineSecretInventory(environment, { daemonTokenPat
   });
 }
 
+// A masked private copy of LCM's hook-error fallback log shows which hook logged and why without
+// its paths or credentials. It is written only when the masked bytes carry no inventory value and
+// no canary; a skip, or a failure while writing, is recorded instead of failing the privacy scan.
+function writeMaskedEventsLog(bytes, inventory, evidenceDirectory) {
+  try {
+    const masked = maskInventoryValues(bytes, inventory);
+    const rescan = scanSurface(masked, inventory, CANARY_CORPUS);
+    if (rescan.secretHits !== 0 || rescan.canaryHits !== 0) return "skipped-hits";
+    writeFileSync(join(evidenceDirectory, "events.log.masked"), masked, { mode: 0o600, flag: "wx" });
+    return "written";
+  } catch {
+    return "skipped-error";
+  }
+}
+
 export function scanBoundedPrivateOutputs({ home, evidenceDirectory, daemonOutput, inventory, maximumFileBytes = 1024 * 1024, maximumTotalBytes = 10 * 1024 * 1024 }) {
   const surfaces = [];
   const add = (name, bytes) => {
@@ -461,18 +476,32 @@ export function scanBoundedPrivateOutputs({ home, evidenceDirectory, daemonOutpu
       if (!status.isFile()) continue;
       const bytes = readFileSync(path);
       add(`logs/${name}`, bytes);
-      // A masked private copy of LCM's hook-error fallback log shows which hook logged and why
-      // without its paths or credentials. It is kept only when the masked bytes scan clean.
       if (name === "events.log") {
-        const masked = maskInventoryValues(bytes, inventory);
-        if (scanSurface(masked, inventory, []).secretHits === 0) {
-          writeFileSync(join(evidenceDirectory, "events.log.masked"), masked, { mode: 0o600, flag: "wx" });
-        }
+        // The raw scan above stays the verdict for every category and canary. The field-scope
+        // witness records the path categories' hits once each line's top-level string cwd, the
+        // one field where LCM writes the working directory, is removed.
+        const surface = surfaces.at(-1);
+        const scope = EVENTS_LOG_FIELD_SCOPE;
+        const { residual, lines } = eventsLogResidual(bytes);
+        const residualScan = scanSurface(residual, inventory.filter((entry) => scope.categories.includes(entry.category)), []);
+        surface.fieldScope = {
+          rule: scope.witnessRule,
+          field: scope.field,
+          categories: [...scope.categories],
+          rawCategoryHits: Object.fromEntries(scope.categories.map((category) => [category, surface.categoryHits[category] ?? 0])),
+          residualCategoryHits: Object.fromEntries(scope.categories.map((category) => [category, residualScan.categoryHits[category] ?? 0])),
+          lines,
+        };
+        surface.maskedCopy = writeMaskedEventsLog(bytes, inventory, evidenceDirectory);
       }
     }
   }
   const summary = {
-    surfaces: surfaces.map(({ name, bytes, secretHits, canaryHits, categoryHits }) => ({ name, bytes, secretHits, canaryHits, categoryHits })),
+    surfaces: surfaces.map(({ name, bytes, secretHits, canaryHits, categoryHits, fieldScope, maskedCopy }) => ({
+      name, bytes, secretHits, canaryHits, categoryHits,
+      ...(fieldScope === undefined ? {} : { fieldScope }),
+      ...(maskedCopy === undefined ? {} : { maskedCopy }),
+    })),
     secretHits: surfaces.reduce((sum, surface) => sum + surface.secretHits, 0),
     canaryHits: surfaces.reduce((sum, surface) => sum + surface.canaryHits, 0),
   };

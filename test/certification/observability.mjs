@@ -180,6 +180,81 @@ export function maskInventoryValues(bytes, inventory = []) {
   return Buffer.from(text, "utf8");
 }
 
+// LCM's hook-error fallback log records the reporting hook's working directory in one place: the
+// top-level cwd field of each NDJSON line (src/hooks/hook-errors.ts:172). The private-surface
+// allowance covers that field only, and this witness rule proves it.
+export const EVENTS_LOG_FIELD_SCOPE = Object.freeze({
+  surface: "logs/events.log",
+  field: "cwd",
+  categories: Object.freeze(["project-path", "home-path"]),
+  witnessRule: "events-log-top-level-cwd-v1",
+});
+
+const NEWLINE = Buffer.from("\n", "utf8");
+
+// Removes the top-level string cwd from each line that parses to a plain object and re-serializes
+// to exactly its own bytes, so a line with duplicate keys or other spellings keeps every byte.
+// Every other line, malformed or not, stays raw, and line boundaries are kept.
+export function eventsLogResidual(bytes) {
+  const buffer = Buffer.isBuffer(bytes) ? bytes : Buffer.from(String(bytes), "utf8");
+  const trailingNewline = buffer.length > 0 && buffer[buffer.length - 1] === 0x0a;
+  const body = trailingNewline ? buffer.subarray(0, -1) : buffer;
+  const lines = [];
+  if (buffer.length > 0) {
+    let start = 0;
+    let end = body.indexOf(0x0a);
+    while (end !== -1) {
+      lines.push(body.subarray(start, end));
+      start = end + 1;
+      end = body.indexOf(0x0a, start);
+    }
+    lines.push(body.subarray(start));
+  }
+  const accounting = { total: lines.length, parsed: 0, cwdStripped: 0, rawKept: 0 };
+  const residual = lines.map((line) => {
+    let value;
+    try {
+      value = JSON.parse(line.toString("utf8"));
+    } catch {
+      accounting.rawKept += 1;
+      return line;
+    }
+    accounting.parsed += 1;
+    if (value === null || typeof value !== "object" || Array.isArray(value) || !Object.hasOwn(value, "cwd")
+      || typeof value.cwd !== "string" || !Buffer.from(JSON.stringify(value), "utf8").equals(line)) {
+      accounting.rawKept += 1;
+      return line;
+    }
+    const rest = { ...value };
+    delete rest.cwd;
+    accounting.cwdStripped += 1;
+    return Buffer.from(JSON.stringify(rest), "utf8");
+  });
+  const separated = residual.flatMap((line, index) => (index === 0 ? [line] : [NEWLINE, line]));
+  return { residual: Buffer.concat(trailingNewline ? [...separated, NEWLINE] : separated), lines: accounting };
+}
+
+// A field-scope witness earns the allowance only when it names the selected contract's rule, field
+// and categories, reconciles its raw counts with the surface's raw scan, keeps residual counts
+// within them, and accounts for every line. Returns the residual hits per category, or undefined.
+export function fieldScopeResidualHits(surface, allowance) {
+  const witness = surface?.fieldScope;
+  const count = (value) => Number.isSafeInteger(value) && value >= 0;
+  const lines = witness?.lines;
+  if (witness === null || typeof witness !== "object" || witness.rule !== allowance.witnessRule
+    || witness.field !== allowance.field || JSON.stringify(witness.categories) !== JSON.stringify(allowance.categories)
+    || ![lines?.total, lines?.parsed, lines?.cwdStripped, lines?.rawKept].every(count)
+    || lines.cwdStripped + lines.rawKept !== lines.total || lines.cwdStripped > lines.parsed || lines.parsed > lines.total) {
+    return undefined;
+  }
+  const residual = allowance.categories.map((category) => witness.residualCategoryHits?.[category]);
+  const reconciled = allowance.categories.every((category, index) => {
+    const raw = witness.rawCategoryHits?.[category];
+    return count(raw) && raw === (surface.categoryHits?.[category] ?? 0) && count(residual[index]) && residual[index] <= raw;
+  });
+  return reconciled ? residual : undefined;
+}
+
 const FAMILY_KEYS = Object.freeze({
   statements: new Set(["status", "observedAt", "scope", "statementsDeallocTotal", "statementsStatsReset", "blockSize", "omitted", "operations"]),
   pool: new Set(["status", "observedAt", "health", "omitted", "remediation", "saturationRatio"]),
@@ -771,8 +846,12 @@ export function buildObservabilitySummary({ contractSha256, runId, contract, pro
     : !Number.isFinite(canaryHits) || privacy?.surfacesComplete !== true ? "incomplete" : "pass";
   items.push(summaryItem("privacy.canary-leaks", canaryVerdict, canaryHits ?? 0, 0));
   const secretHits = privacy?.secretHits;
-  const secretVerdict = Number.isFinite(secretHits) && secretHits > 0 ? "fail"
-    : !Number.isFinite(secretHits) || privacy?.inventoryComplete !== true || privacy?.surfacesComplete !== true ? "incomplete" : "pass";
+  // Path hits on an allowance surface without a valid field-scope witness cannot be judged: they
+  // stay in the count and leave the item incomplete. Any other hit fails it.
+  const undeterminedHits = privacy?.undeterminedSecretHits ?? 0;
+  const secretVerdict = Number.isFinite(secretHits) && secretHits - undeterminedHits > 0 ? "fail"
+    : !Number.isFinite(secretHits) || privacy?.fieldScopeComplete === false
+      || privacy?.inventoryComplete !== true || privacy?.surfacesComplete !== true ? "incomplete" : "pass";
   items.push(summaryItem("privacy.secret-leaks", secretVerdict, secretHits ?? 0, 0));
   for (const [id, value] of [["overhead.machine-cpu", calibration?.machineCpu], ["overhead.database-cpu", calibration?.databaseCpu]]) {
     items.push(summaryItem(id, value?.verdict ?? "incomplete", value?.measuredMaximum ?? 0, value?.ceiling ?? 0));
@@ -800,6 +879,7 @@ export function buildObservabilitySummary({ contractSha256, runId, contract, pro
       canarySurfaces: canary?.observed?.cli ?? 0,
       secretCategories: privacy?.secretCategories ?? 0,
       allowedSurfaceHits: privacy?.allowedSurfaceHits ?? {},
+      fieldScopeWitnesses: privacy?.fieldScopeWitnesses ?? {},
       retentionDays: 90,
       directoryMode: "0700",
       fileMode: "0600",

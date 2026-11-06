@@ -12,6 +12,8 @@ import { buildSecretInventory, createInventoryManifest, scanSurface } from "./ob
 import { createDeterministicSchedule, createFaultSchedule } from "./schedule.mjs";
 import { sampleSha256, writeSampleFile } from "./slo.mjs";
 import { observerReadSettings } from "./sqlite-observer-worker.mjs";
+import { _resetCircuitBreaker, _setLogPathForTesting, safeLogError } from "../../src/hooks/hook-errors.js";
+import { SQLiteLocalHookOutboxFactory } from "../../src/storage/local-hook-outbox.js";
 import { RUNTIME_HEALTH_ACTIONS } from "../../src/storage/runtime-health.js";
 
 function writeJson(path: string, value: unknown): void { writeFileSync(path, `${JSON.stringify(value)}\n`); }
@@ -31,6 +33,36 @@ type Variant = { contractVersion?: 3 | 4; serverPort?: number; providerPort?: nu
 
 type RetainedReceipt = { id: string; secretHits: number; canaryHits: number; categoryHits: Record<string, number> };
 
+// A certification machine's home and its project directory, $HOME/project, created so that
+// LCM's hook-error logger sees an existing working directory.
+function certificationPaths(): { home: string; project: string } {
+  const home = join(mkdtempSync(join(tmpdir(), "lcm-cert-field-scope-")), "home");
+  const project = join(home, "project");
+  mkdirSync(project, { recursive: true });
+  return { home, project };
+}
+
+// The bytes that LCM's own hook-error logger, safeLogError, writes to its fallback log when the
+// project sidecar fails: each error with a working directory first reaches the sidecar layer, whose
+// open is forced to fail, and then the flat-file layer (src/hooks/hook-errors.ts:162-173).
+async function productEventsLog(errors: Array<{ hook: string; message: string; cwd?: string }>): Promise<string> {
+  const logPath = join(mkdtempSync(join(tmpdir(), "lcm-cert-events-log-")), "events.log");
+  const open = vi.spyOn(SQLiteLocalHookOutboxFactory.prototype, "open").mockRejectedValue(new Error("sidecar unavailable"));
+  _setLogPathForTesting(logPath);
+  try {
+    for (const { hook, message, cwd } of errors) {
+      _resetCircuitBreaker();
+      await safeLogError(hook, new Error(message), { cwd, sessionId: "cert-run" });
+    }
+    expect(open).toHaveBeenCalledTimes(errors.filter((error) => error.cwd !== undefined).length);
+    return readFileSync(logPath, "utf8");
+  } finally {
+    open.mockRestore();
+    _setLogPathForTesting(undefined);
+    _resetCircuitBreaker();
+  }
+}
+
 // A complete v4 privacy evidence set with zero hits on every surface, written by the
 // real inventory, scanners and migration receipt writer. `leak` replaces one retained
 // CLI output (migration, identity or doctor) with the given text. `coordinator` sets the
@@ -38,10 +70,16 @@ type RetainedReceipt = { id: string; secretHits: number; canaryHits: number; cat
 // reconstruction scans and persists them instead of reading a persisted scan. `legacyScan`
 // persists a scan from before setup-session-closure.json was classified, with that file on disk.
 // `logs` writes files into a machine's private LCM log directory before the agent scans it. The
-// project and home paths are the certification machines' own, the project under the home.
+// project and home paths are the certification machines' own, the project under the home;
+// `paths` replaces them with existing directories. `witness` rewrites each machine's events.log
+// field-scope witness before reconstruction, and returning undefined removes it, as in evidence
+// from before the field-scope rule.
 async function retainedPrivacyEvidence(
   leak?: { machine: "a" | "b"; id: string; text: string },
-  coordinator: { bookkeeping?: string; barriers?: string; fresh?: boolean; legacyScan?: boolean; logs?: (machine: "a" | "b") => Record<string, string> } = {},
+  coordinator: {
+    bookkeeping?: string; barriers?: string; fresh?: boolean; legacyScan?: boolean; logs?: (machine: "a" | "b") => Record<string, string>;
+    paths?: { home: string; project: string }; witness?: (fieldScope: Record<string, any>) => Record<string, any> | undefined;
+  } = {},
 ) {
   const root = mkdtempSync(join(tmpdir(), "lcm-cert-v4-retained-privacy-"));
   const contractBytes = readFileSync(new URL("./contract-v4.json", import.meta.url));
@@ -70,8 +108,8 @@ async function retainedPrivacyEvidence(
       caBodyLines,
       caFile: `/certs/ca-${machine}.pem`,
       daemonToken: `daemon-token-${machine}-0123456789abcdef`,
-      projectPath: "/home/lcm-parent/home/project",
-      homePath: "/home/lcm-parent/home",
+      projectPath: coordinator.paths?.project ?? "/home/lcm-parent/home/project",
+      homePath: coordinator.paths?.home ?? "/home/lcm-parent/home",
       containerHostname: `machine-${machine}-host`,
     });
     const manifest = Buffer.from(`${JSON.stringify(createInventoryManifest(inventory, machine), null, 2)}\n`);
@@ -95,6 +133,16 @@ async function retainedPrivacyEvidence(
       writeFileSync(join(home, ".lcm", "logs", name), content);
     }
     scanBoundedPrivateOutputs({ home, evidenceDirectory: directory, daemonOutput, inventory });
+    if (coordinator.witness !== undefined) {
+      const surfacesPath = join(directory, "privacy-surfaces.json");
+      const scan = JSON.parse(readFileSync(surfacesPath, "utf8"));
+      for (const surface of scan.surfaces.filter((entry: { name: string }) => entry.name === "logs/events.log")) {
+        const witness = coordinator.witness(surface.fieldScope);
+        if (witness === undefined) delete surface.fieldScope;
+        else surface.fieldScope = witness;
+      }
+      writeFileSync(surfacesPath, `${JSON.stringify(scan)}\n`);
+    }
     writeJson(join(directory, "daemon-output-coverage.json"), { totalBytes: daemonOutput.length, scannedBytes: daemonOutput.length, truncated: false, verdict: "pass", secretHits: 0, canaryHits: 0 });
     const workload = createCanaryWorkload("run", machine);
     const counts = { hooks: workload.hooks.length, stores: workload.stores.length, searches: workload.searches.length, utility: 1, cli: workload.cli.length };
@@ -291,32 +339,96 @@ describe("v4 observability gate items", () => {
   });
 
   // Smoke 5: each machine's events.log, LCM's hook-error fallback log, recorded the hook's
-  // working directory $HOME/project: project-path 2 (the raw path and its 24-character prefix)
-  // and home-path 1 (the home path inside it). The v4 DRAFT allows those two categories on that
-  // surface only and counts them separately; credentials and canaries there still leak.
+  // working directory $HOME/project in each line's cwd field. The v4 contract allows the
+  // project-path and home-path categories on that surface only, in that field, and counts them
+  // separately; credentials and canaries there still leak. Each line is the product's own, and
+  // its cwd matches project-path 2 (the path and its 24-character prefix) and home-path 2 (the
+  // home path and the same prefix) on each machine.
   it("allows the fallback log's path categories, counts them separately and still fails other hits", async () => {
-    const line = (hook: string, error: string) => `${JSON.stringify({ ts: "2026-11-06T14:30:00.000Z", hook, error, session_id: "cert-run", cwd: "/home/lcm-parent/home/project" })}\n`;
-    const smoke5 = await retainedPrivacyEvidence(undefined, { logs: () => ({ "events.log": line("UserPromptSubmit", "backend publication mutation is already in progress") }) });
-    const credentials = await retainedPrivacyEvidence(undefined, { logs: (machine) => ({
-      "events.log": line("PostToolUse", machine === "a" ? "rejected runtime-password-a-0123" : "rejected daemon-token-b-0123456789abcdef"),
-    }) });
-    const canary = await retainedPrivacyEvidence(undefined, { logs: () => ({ "events.log": line("PostToolUse", `stored ${CONTRACT_CANARIES.memory}`) }) });
-    const otherLog = await retainedPrivacyEvidence(undefined, { logs: () => ({ "daemon.log": line("daemon", "started") }) });
-    const otherSurface = await retainedPrivacyEvidence({ machine: "a", id: "migration-apply", text: '{"outcome":"applied","cwd":"/home/lcm-parent/home/project"}' });
+    const paths = certificationPaths();
+    const log = (hook: string, message: string) => productEventsLog([{ hook, message, cwd: paths.project }]);
+    const smoke5Log = await log("UserPromptSubmit", "backend publication mutation is already in progress");
+    const credentialLogs = { a: await log("PostToolUse", "rejected runtime-password-a-0123"), b: await log("PostToolUse", "rejected daemon-token-b-0123456789abcdef") };
+    const canaryLog = await log("PostToolUse", `stored ${CONTRACT_CANARIES.memory}`);
+    const smoke5 = await retainedPrivacyEvidence(undefined, { paths, logs: () => ({ "events.log": smoke5Log }) });
+    const credentials = await retainedPrivacyEvidence(undefined, { paths, logs: (machine) => ({ "events.log": credentialLogs[machine] }) });
+    const canary = await retainedPrivacyEvidence(undefined, { paths, logs: () => ({ "events.log": canaryLog }) });
+    const otherLog = await retainedPrivacyEvidence(undefined, { paths, logs: () => ({ "daemon.log": smoke5Log }) });
+    const otherSurface = await retainedPrivacyEvidence({ machine: "a", id: "migration-apply", text: JSON.stringify({ outcome: "applied", cwd: paths.project }) }, { paths });
     const shape = (evidence: { privacy: Record<string, { verdict: string; observed: number }>; summary: any }) => [
       evidence.privacy["privacy.secret-leaks"], evidence.privacy["privacy.canary-leaks"].verdict, evidence.summary.privateArtifacts.allowedSurfaceHits,
     ];
-    const paths = { "logs/events.log": { "project-path": 4, "home-path": 2 } };
+    const allowed = { "logs/events.log": { "project-path": 4, "home-path": 4 } };
     expect({
       smoke5: shape(smoke5), credentials: shape(credentials), canary: shape(canary), otherLog: shape(otherLog), otherSurface: shape(otherSurface),
     }).toEqual({
-      smoke5: [{ verdict: "pass", observed: 0 }, "pass", paths],
+      smoke5: [{ verdict: "pass", observed: 0 }, "pass", allowed],
       // runtime-password 1 on machine A; daemon-token 2 on machine B (the token and its prefix).
-      credentials: [{ verdict: "fail", observed: 3 }, "pass", paths],
-      canary: [{ verdict: "pass", observed: 0 }, "fail", paths],
-      otherLog: [{ verdict: "fail", observed: 6 }, "pass", {}],
-      otherSurface: [{ verdict: "fail", observed: 3 }, "pass", {}],
+      credentials: [{ verdict: "fail", observed: 3 }, "pass", allowed],
+      canary: [{ verdict: "pass", observed: 0 }, "fail", allowed],
+      otherLog: [{ verdict: "fail", observed: 8 }, "pass", {}],
+      otherSurface: [{ verdict: "fail", observed: 4 }, "pass", {}],
     });
+  });
+
+  // Round 11: the file-wide allowance subtracted every path hit in the log, so a path in a line's
+  // error text passed. The allowance now covers only the top-level cwd field, proven per surface by
+  // the agent's field-scope witness. The lines are the product's own: its sanitizer turns a raw
+  // path in the error into <path> and redacts URL query values, but the percent-encoded path and
+  // its 24-character prefix survive verbatim. The truncated and duplicate-key lines are a product
+  // line cut short or given a second cwd key. Per machine, a cwd-only line holds 2 hits of each
+  // path category, and an encoded path in the error adds 2 more of each (1 for its prefix alone).
+  it("allows the two path categories only in the fallback log's cwd field, from a valid witness", async () => {
+    const paths = certificationPaths();
+    const encoded = encodeURIComponent(paths.project);
+    const log = (message: string) => productEventsLog([{ hook: "PostToolUse", message, cwd: paths.project }]);
+    const cwdOnly = await log("backend publication mutation is already in progress");
+    const inError = await log(`publication fence rejected ${encoded}`);
+    const prefixInError = await log(`publication fence rejected ${encoded.slice(0, 24)}`);
+    const withoutCwd = await productEventsLog([{ hook: "UserPromptSubmit", message: "backend publication mutation is already in progress" }]);
+    const truncated = `${cwdOnly.trimEnd().slice(0, -2)}\n`;
+    const duplicate = cwdOnly.replace("{", `{"cwd":${JSON.stringify(paths.project)},`);
+    expect([cwdOnly, inError, prefixInError].map((bytes) => JSON.parse(bytes))).toMatchObject([
+      { hook: "PostToolUse", error: "backend publication mutation is already in progress", session_id: "cert-run", cwd: paths.project },
+      { error: `publication fence rejected ${encoded}`, cwd: paths.project },
+      { error: `publication fence rejected ${encoded.slice(0, 24)}`, cwd: paths.project },
+    ]);
+    const evidence = (bytes: string, witness?: (fieldScope: Record<string, any>) => Record<string, any> | undefined) =>
+      retainedPrivacyEvidence(undefined, { paths, logs: () => ({ "events.log": bytes }), ...(witness === undefined ? {} : { witness }) });
+    const cases = {
+      cwdOnly: await evidence(cwdOnly),
+      inError: await evidence(inError),
+      prefixInError: await evidence(prefixInError),
+      truncated: await evidence(truncated),
+      duplicate: await evidence(duplicate),
+      mixed: await evidence(cwdOnly + withoutCwd + truncated + duplicate),
+      legacy: await evidence(cwdOnly, () => undefined),
+      wrongRule: await evidence(cwdOnly, (scope) => ({ ...scope, rule: "events-log-top-level-cwd-v0" })),
+      unaccounted: await evidence(cwdOnly, (scope) => ({ ...scope, lines: { total: 1, parsed: 1, cwdStripped: 1, rawKept: 1 } })),
+    };
+    const hits = (count: number) => ({ "project-path": count, "home-path": count });
+    const valid = { valid: 2, missing: 0, invalid: 0 };
+    const invalid = { valid: 0, missing: 0, invalid: 2 };
+    expect(Object.fromEntries(Object.entries(cases).map(([name, { privacy, summary }]) => [name, [
+      privacy["privacy.secret-leaks"], summary.privateArtifacts.allowedSurfaceHits, summary.privateArtifacts.fieldScopeWitnesses?.["logs/events.log"],
+    ]]))).toEqual({
+      cwdOnly: [{ verdict: "pass", observed: 0 }, { "logs/events.log": hits(4) }, valid],
+      inError: [{ verdict: "fail", observed: 8 }, { "logs/events.log": hits(4) }, valid],
+      prefixInError: [{ verdict: "fail", observed: 4 }, { "logs/events.log": hits(4) }, valid],
+      truncated: [{ verdict: "fail", observed: 8 }, {}, valid],
+      duplicate: [{ verdict: "fail", observed: 8 }, {}, valid],
+      mixed: [{ verdict: "fail", observed: 8 }, {}, valid],
+      legacy: [{ verdict: "incomplete", observed: 8 }, {}, { valid: 0, missing: 2, invalid: 0 }],
+      wrongRule: [{ verdict: "incomplete", observed: 8 }, {}, invalid],
+      unaccounted: [{ verdict: "incomplete", observed: 8 }, {}, invalid],
+    });
+    const witness = (root: string) => JSON.parse(readFileSync(join(root, "machine-a", "privacy-surfaces.json"), "utf8"))
+      .surfaces.find((surface: { name: string }) => surface.name === "logs/events.log").fieldScope;
+    const scope = { rule: "events-log-top-level-cwd-v1", field: "cwd", categories: ["project-path", "home-path"] };
+    expect([witness(cases.cwdOnly.root), witness(cases.mixed.root)]).toEqual([
+      { ...scope, rawCategoryHits: hits(2), residualCategoryHits: hits(0), lines: { total: 1, parsed: 1, cwdStripped: 1, rawKept: 0 } },
+      { ...scope, rawCategoryHits: hits(2), residualCategoryHits: hits(2), lines: { total: 4, parsed: 3, cwdStripped: 1, rawKept: 3 } },
+    ]);
   });
 });
 

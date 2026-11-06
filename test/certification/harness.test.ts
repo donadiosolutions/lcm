@@ -165,6 +165,22 @@ describe("certification harness", () => {
     })).toThrow("approval receipt");
   });
 
+  it("refuses full evidence under the approved v4 contract that starts before its approval", () => {
+    const root = mkdtempSync(join(tmpdir(), "lcm-cert-v4-approved-full-"));
+    const loaded = loadCertificationContract(new URL("./contract-v4.json", import.meta.url));
+    const metadata = (startedAt: string) => ({
+      lane: "local", profile: "full", contractVersion: 4, contractSha256: loaded.sha256,
+      approval: loaded.approval, approvalSha256: loaded.approvalSha256, startedAt,
+    });
+    expect(loaded.approval?.approvedAt).toBe("2026-11-06T16:31:07Z");
+    expect(() => prepareEvidenceDirectory(join(root, "early"), metadata("2026-11-06T16:31:06.999Z")))
+      .toThrow("contract approval must precede evidence collection");
+    expect(existsSync(join(root, "early"))).toBe(false);
+    prepareEvidenceDirectory(join(root, "approved"), metadata("2026-11-06T16:31:07.000Z"));
+    expect(JSON.parse(readFileSync(join(root, "approved", "run.json"), "utf8")))
+      .toMatchObject({ profile: "full", contractSha256: loaded.sha256, approval: loaded.approval });
+  });
+
   it("records a dirty exploratory smoke but rejects dirty certifying provenance", () => {
     const provenance = { dirty: true, testedCommit: "a".repeat(40) };
 

@@ -37,7 +37,7 @@ import {
   waitForAcknowledgmentCatchUp,
 } from "./machine-agent.mjs";
 import { OBSERVABILITY_ACTIONS, evaluatePhaseProbeEvidence, scanSurface } from "./observability.mjs";
-import { createCanaryWorkload } from "./canary-corpus.mjs";
+import { CONTRACT_CANARIES, createCanaryWorkload } from "./canary-corpus.mjs";
 import { OBSERVER_BUSY_TIMEOUT_MS, observerReadSettings } from "./sqlite-observer-worker.mjs";
 import { extractPostToolEvents, extractUserPromptEvents } from "../../src/hooks/extractors.js";
 import { normalizePostToolInput } from "../../src/hooks/post-tool-normalization.js";
@@ -362,6 +362,45 @@ describe("observability probes", () => {
       ],
       rescan: 0,
     });
+  });
+
+  // Scans one fallback-log line, optionally with a masked copy already in the evidence directory,
+  // and reports the masked-copy outcome returned and persisted in privacy-surfaces.json.
+  const scanFallbackLog = (error: string, existingCopy?: string) => {
+    const root = mkdtempSync(join(tmpdir(), "lcm-cert-masked-skip-"));
+    const home = join(root, "home");
+    const evidenceDirectory = join(root, "evidence");
+    mkdirSync(join(home, ".lcm", "logs"), { recursive: true });
+    mkdirSync(evidenceDirectory);
+    const cwd = "/home/lcm-parent/home/project";
+    writeFileSync(join(home, ".lcm", "logs", "events.log"), `${JSON.stringify({ ts: "2026-11-06T14:30:00.000Z", hook: "PostToolUse", error, session_id: "cert-run-a", cwd })}\n`);
+    if (existingCopy !== undefined) writeFileSync(join(evidenceDirectory, "events.log.masked"), existingCopy);
+    const summary = scanBoundedPrivateOutputs({ home, evidenceDirectory, daemonOutput: Buffer.from("safe streams"), inventory: [
+      { category: "project-path", value: cwd, sourceClass: "agent-runtime", scanMode: "all-forms" },
+    ] });
+    const persisted = JSON.parse(readFileSync(join(evidenceDirectory, "privacy-surfaces.json"), "utf8"));
+    const events = (surfaces: Array<{ name: string }>) => surfaces.find((surface) => surface.name === "logs/events.log") as Record<string, any>;
+    const copyPath = join(evidenceDirectory, "events.log.masked");
+    return {
+      maskedCopy: events(summary.surfaces).maskedCopy,
+      persisted: events(persisted.surfaces).maskedCopy,
+      canaryHits: events(persisted.surfaces).canaryHits > 0,
+      copy: existsSync(copyPath) ? readFileSync(copyPath, "utf8") : undefined,
+    };
+  };
+
+  // The masked copy is written only when a rescan with the inventory and the full canary corpus
+  // finds nothing; masking does not remove a canary, so a canary-bearing log keeps no copy.
+  it("keeps no masked copy of a fallback log that still carries a canary", () => {
+    expect(scanFallbackLog(`stored ${CONTRACT_CANARIES.memory}`))
+      .toEqual({ maskedCopy: "skipped-hits", persisted: "skipped-hits", canaryHits: true, copy: undefined });
+  });
+
+  // A masked copy that cannot be written is recorded as skipped, and the privacy scan is still
+  // written; an existing copy makes the exclusive write fail.
+  it("records a masked copy that cannot be written and still writes the privacy scan", () => {
+    expect(scanFallbackLog("backend publication mutation is already in progress", "earlier copy\n"))
+      .toEqual({ maskedCopy: "skipped-error", persisted: "skipped-error", canaryHits: false, copy: "earlier copy\n" });
   });
 
   it("scans and validates exact raw response bytes before parsing", async () => {

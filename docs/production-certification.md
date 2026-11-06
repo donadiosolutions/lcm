@@ -21,9 +21,11 @@ contract loader used by the harness, machine agents, and gate accepts versions 3
 and 4 and refuses older versions. The selected path flows unchanged through the
 coordinator, staged package, agents, evidence provenance, and gate. Version 3
 retains its approved bytes and behavior. Version 4 is a superset that adds the
-local observability exercise described below; its committed draft cannot collect
-certifying evidence until a separate approval file binds the final bytes. No
-certification evidence was collected under v1 or v2.
+local observability exercise described below. Like v3, its bytes stay in `draft`
+status: its approval lives in `test/certification/contract-v4.approval.json`,
+which binds the approved contract SHA-256, and certifying v4 evidence must start
+at or after that approval time. No certification evidence was collected under v1
+or v2.
 
 ## What the two machines mean
 
@@ -159,22 +161,40 @@ The observability summary and the public gate outputs are scanned before they ar
 written. The two lists are documentary: they record the scope that this revision's
 harness implements, and neither the loader nor the reconstruction reads them.
 
-One private machine surface carries two inventory categories by design. LCM's
-bounded hook-error fallback log, `logs/events.log` under the private LCM home,
-records the reporting hook's working directory whenever it does not write the
-error to the project sidecar (`src/hooks/hook-errors.ts:162-173`), and
-`docs/privacy.md:1065` documents that invalid working directories are recorded in
-that log. The certification project directory is `$HOME/project`, so a recorded
-working directory matches `project-path` and `home-path`. On that surface only,
-`privateSurfaceCategoryAllowances` allows those two categories, and the loader
-accepts no other value. Their hits are recorded separately as counts in the
-summary's `privateArtifacts.allowedSurfaceHits` and are not counted as leaks.
-Every other category and every canary stays zero-required on that surface, and
-every other surface is unchanged. When the agent scans that log, it also writes a
-masked private copy, `events.log.masked`, with mode 0600 to its evidence
-directory. Every inventory value in the copy is replaced by its category token, so
-a reviewer can see which hook logged and why without seeing the paths; the copy is
-kept only when its masked bytes scan clean.
+LCM's bounded hook-error fallback log, `logs/events.log` under the private LCM
+home, writes the reporting hook's working directory by design in one place: the
+raw top-level `cwd` field of each NDJSON line (`src/hooks/hook-errors.ts:172`),
+and `docs/privacy.md:1065` documents that invalid working directories are recorded
+in that log. The certification project directory is `$HOME/project`, so that field
+matches `project-path` and `home-path`. On that surface only,
+`privateSurfaceCategoryAllowances` allows those two categories in that field, and
+the loader accepts no other value. The agent keeps the raw scan of the surface for
+every category and every canary, and also scans a residual copy for the two path
+categories: each line that is a JSON object with exactly one top-level string
+`cwd`, and that re-serializes to exactly its own bytes, loses only that field,
+while malformed, non-object, non-string-cwd and duplicate-key lines stay raw.
+Residual hits of the two categories are leaks. The agent records a field-scope
+witness for the surface in `privacy-surfaces.json`: the rule version
+(`events-log-top-level-cwd-v1`), the raw and residual counts of the two
+categories, and the line counts (total, parsed, cwd-stripped and raw-kept).
+Reconstruction grants the allowance only from a witness that names this rule,
+reconciles with the raw scan and accounts for every line; raw minus residual hits
+are then recorded as counts in the summary's `privateArtifacts.allowedSurfaceHits`
+and are not counted as leaks. A surface whose witness is missing, as in evidence
+from before this rule, or invalid gets no subtraction: its path hits stay in the
+count and leave `privacy.secret-leaks` incomplete unless another hit fails it, and
+`privateArtifacts.fieldScopeWitnesses` counts the valid, missing and invalid
+witnesses. Public output carries only these counts. Every other category and every
+canary stays zero-required on that surface, and every other surface is unchanged.
+This rule narrows the approved one, which allowed the two path categories anywhere
+in that log: they are now allowed only in the `cwd` field. When the agent scans
+that log, it also writes a masked private copy, `events.log.masked`, with mode
+0600 to its evidence directory. Every inventory value in the copy is replaced by
+its category token, so a reviewer can see which hook logged and why without seeing
+the paths. The copy is written only when a rescan with the inventory and the full
+canary corpus finds no hit; otherwise, or if writing fails, the surface's
+`maskedCopy` field in `privacy-surfaces.json` records the skip, and the privacy
+scan is still written.
 
 Raw telemetry is validated before any public output. The validator requires the five
 closed families, packaged operation and extension catalogs, allowed fields,
@@ -187,11 +207,12 @@ Calibration uses four interleaved 180-second baseline/probe pairs at the actual
 15-second production cadence. It records signed, elapsed-time-normalized deltas,
 rejects reset, deallocation-change, counter-decrease, and excess-idle-rate
 windows, and requires at least three valid pairs for each CPU item and three
-retained pairs for the statement item. CPU, statement, sampled-connection,
-idle-call-rate, and noise ceilings in the draft are provisional until the
-non-certifying smoke is reviewed and the final contract is approved. A one-second
-connection sample is a sampled maximum, not an instantaneous peak; structural
-runtime/cancellation bounds and the unchanged v3 capacity gate remain separate.
+retained pairs for the statement item. The approved ceilings, set from smokes 3 to
+5, are 2% of one CPU per machine, 3% of one CPU for the database, a 2% noise
+ceiling, one idle runtime-role call per second, and a sampled connection increment
+of 2; the statement rule follows below. A one-second connection sample is a
+sampled maximum, not an instantaneous peak; structural runtime/cancellation bounds
+and the unchanged v3 capacity gate remain separate.
 The connections result records coverage, the number of probe intervals that caught
 a sample, without requiring every interval to be caught. It is incomplete when a
 machine has no sampled active interval, a connection address is unknown, or a pass
@@ -325,11 +346,10 @@ LCM_TEST_CONTAINER_CLI=podman \
   --evidence-dir /absolute/private/lcm-certification/fault-smoke
 ```
 
-For the v4 draft, supply the path explicitly after the script's v3 default (the
-last `--contract` value wins). The provisional local full deadline is 15,600
-seconds and the provisional fault-plus-observability smoke deadline is 8,820
-seconds. Both are exact sums checked by the loader and will be resized from smoke
-evidence before approval:
+For v4, supply the path explicitly after the script's v3 default (the last
+`--contract` value wins). The approved local full deadline is 15,600 seconds and
+the fault-plus-observability smoke deadline is 8,820 seconds; both are exact sums
+checked by the loader:
 
 ```bash
 LCM_TEST_CONTAINER_CLI=podman \

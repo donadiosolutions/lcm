@@ -50,7 +50,7 @@
     },
     "privateArtifacts": {
       "type": "object",
-      "required": ["rawProbeBodies", "probeRecords", "canarySurfaces", "secretCategories", "allowedSurfaceHits", "retentionDays", "directoryMode", "fileMode"],
+      "required": ["rawProbeBodies", "probeRecords", "canarySurfaces", "secretCategories", "allowedSurfaceHits", "fieldScopeWitnesses", "retentionDays", "directoryMode", "fileMode"],
       "additionalProperties": false,
       "properties": {
         "rawProbeBodies": { "type": "integer", "minimum": 0 },
@@ -60,6 +60,19 @@
         "allowedSurfaceHits": {
           "type": "object",
           "additionalProperties": { "type": "object", "additionalProperties": { "type": "integer", "minimum": 0 } }
+        },
+        "fieldScopeWitnesses": {
+          "type": "object",
+          "additionalProperties": {
+            "type": "object",
+            "required": ["valid", "missing", "invalid"],
+            "additionalProperties": false,
+            "properties": {
+              "valid": { "type": "integer", "minimum": 0 },
+              "missing": { "type": "integer", "minimum": 0 },
+              "invalid": { "type": "integer", "minimum": 0 }
+            }
+          }
         },
         "retentionDays": { "const": 90 },
         "directoryMode": { "const": "0700" },

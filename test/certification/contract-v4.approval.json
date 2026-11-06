@@ -1,0 +1,7 @@
+{
+  "contractSha256": "cba17a7393f1cb04488a554b82fc2d374b3efc3c21d896546f59d91343b6f74a",
+  "approvedBy": "bcdonadio (repository owner)",
+  "approvedAt": "2026-11-06T16:31:07Z",
+  "note": "recorded by root at receipt",
+  "approvalRef": "run-record epic-228-run-01a15242 entry 2026-11-06 16:31:07 UTC (user request_user_input answer in root chat: approve v4 with the events.log scope rule and the 3% database CPU ceiling; delta 3 narrowing recorded as within the approval)"
+}

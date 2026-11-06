@@ -206,10 +206,11 @@ function assertContract(contract) {
       || new Set(observability.cardinality.operationIds).size !== observability.cardinality.operationIds.length) {
       throw new Error("certification contract v4 cardinality is invalid");
     }
-    // The only private-surface allowance is the two path categories that LCM's hook-error
-    // fallback log records by design; any other allowance would hide a leak.
+    // The only private-surface allowance is the two path categories in the top-level cwd field of
+    // LCM's hook-error fallback log, proven by the agent's field-scope witness; any other
+    // allowance would hide a leak.
     if (JSON.stringify(observability.privacy?.privateSurfaceCategoryAllowances)
-      !== JSON.stringify({ "logs/events.log": ["project-path", "home-path"] })) {
+      !== JSON.stringify({ "logs/events.log": { field: "cwd", categories: ["project-path", "home-path"], witnessRule: "events-log-top-level-cwd-v1" } })) {
       throw new Error("certification contract v4 privacy is invalid");
     }
   }

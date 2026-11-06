@@ -24,6 +24,7 @@ import {
   evaluateSaturationWitness,
   evaluateTimeoutShape,
   evaluateWorkloadCompleteness,
+  eventsLogResidual,
   observabilityApplicability,
   scanSurface,
   scanHashedInventory,
@@ -452,11 +453,24 @@ describe("observability certification helpers", () => {
       items: [{ id: "privacy.canary-leaks", formula: "hit count", threshold: 0, observed: 0, verdict: "pass" }],
       privateArtifacts: {
         rawProbeBodies: 1, probeRecords: 1, canarySurfaces: 7, secretCategories: 14,
-        allowedSurfaceHits: { "logs/events.log": { "project-path": 4, "home-path": 2 } }, retentionDays: 90, directoryMode: "0700", fileMode: "0600",
+        allowedSurfaceHits: { "logs/events.log": { "project-path": 4, "home-path": 2 } },
+        fieldScopeWitnesses: { "logs/events.log": { valid: 2, missing: 0, invalid: 0 } }, retentionDays: 90, directoryMode: "0700", fileMode: "0600",
       },
     };
     expect(validateEvidence(schema, summary)).toEqual([]);
     expect(JSON.stringify(summary)).not.toContain("incident-message-content-canary");
+  });
+
+  // Only a JSON object with one top-level string cwd, re-serializing to exactly its own bytes,
+  // loses that field; every other line, including shapes the product never writes, stays raw.
+  it("removes only an unambiguous top-level string cwd from each fallback-log line", () => {
+    const lines = ['{"hook":"Stop","cwd":"/p"}', '[{"cwd":"/p"}]', '"/p"', '{"cwd":7}', '{"hook": "Stop", "cwd": "/p"}',
+      '{"cwd":"/p","cwd":"/p"}', '{"hook":"Stop","cwd":"/p"', "", '{"hook":"Stop"}'];
+    const { residual, lines: accounting } = eventsLogResidual(Buffer.from(`${lines.join("\n")}\n`));
+    expect({ residual: residual.toString("utf8"), accounting }).toEqual({
+      residual: `${['{"hook":"Stop"}', ...lines.slice(1)].join("\n")}\n`,
+      accounting: { total: 9, parsed: 7, cwdStripped: 1, rawKept: 8 },
+    });
   });
 
   it("builds all gate rows without turning missing evidence into a pass", () => {

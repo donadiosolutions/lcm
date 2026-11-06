@@ -16,6 +16,7 @@ const approvedContractSha256 = "ea6ccaaa77212c3c7486cdc85af03a985dde05eeef18096a
 const supersededContractPath = new URL("./contract-v2.json", import.meta.url);
 const supersededContractSha256 = "6dc8cef4c170c851bbc4c9626ee4a31c3d5cf7a7f4b41bb4e4852c88759222e4";
 const v4ContractPath = new URL("./contract-v4.json", import.meta.url);
+const v4ApprovedContractSha256 = "cba17a7393f1cb04488a554b82fc2d374b3efc3c21d896546f59d91343b6f74a";
 
 describe("certification contract", () => {
   it("loads the draft for planning and derives the frozen full schedule counts", () => {
@@ -49,18 +50,34 @@ describe("certification contract", () => {
     });
   });
 
-  it("loads the unapproved v4 draft without changing the approved v3 bytes", () => {
+  it("loads v4 and its deadlines without changing the approved v3 bytes", () => {
     const v3 = loadCertificationContract(contractPath);
     const v4 = loadCertificationContract(v4ContractPath, { requireApproved: false });
 
     expect(v3.sha256).toBe(approvedContractSha256);
     expect(v4.contract.version).toBe(4);
-    expect(v4.status).toBe("draft");
-    expect(v4.approval).toBeUndefined();
+    expect(v4.contract.status).toBe("draft");
     expect(v4.contract.timeline.full.localDeadlineSeconds).toBe(15_600);
     expect(certificationDeadlineSeconds(v4.contract, { profile: "full" })).toBe(15_600);
     expect(certificationDeadlineSeconds(v4.contract, { profile: "smoke", withFaults: true })).toBe(8_820);
     expect(certificationDeadlineSeconds(v4.contract, { profile: "smoke" })).toBe(1_800);
+  });
+
+  // Like v3, the approved v4 bytes stay in draft status; the external record binds their hash.
+  it("binds v4 evidence collection to its approval record and allows the full profile", () => {
+    const loaded = loadCertificationContract(v4ContractPath);
+
+    expect(loaded.contract).toMatchObject({ version: 4, status: "draft", draftRevision: 1 });
+    expect(loaded.status).toBe("approved");
+    expect(loaded.sha256).toBe(v4ApprovedContractSha256);
+    expect(loaded.approval).toEqual({
+      contractSha256: v4ApprovedContractSha256,
+      approvedBy: "bcdonadio (repository owner)",
+      approvedAt: "2026-11-06T16:31:07Z",
+      note: "recorded by root at receipt",
+      approvalRef: "run-record epic-228-run-01a15242 entry 2026-11-06 16:31:07 UTC (user request_user_input answer in root chat: approve v4 with the events.log scope rule and the 3% database CPU ceiling; delta 3 narrowing recorded as within the approval)",
+    });
+    expect(() => assertCertificationRunPolicy(loaded, { lane: "local", profile: "full" })).not.toThrow();
   });
 
   it("validates both v4 deadline sums", () => {
@@ -96,8 +113,9 @@ describe("certification contract", () => {
     }
   });
 
-  // The fallback log's two path categories are the only private-surface allowance; a wider or
-  // missing allowance is refused.
+  // The fallback log's two path categories in its cwd field are the only private-surface
+  // allowance; the file-wide list form, another field, rule, category or surface, or a missing
+  // allowance is refused.
   it("pins the v4 private-surface category allowance", () => {
     const directory = mkdtempSync(join(tmpdir(), "lcm-cert-contract-v4-allowance-"));
     const path = join(directory, "contract-v4.json");
@@ -108,13 +126,17 @@ describe("certification contract", () => {
       writeFileSync(path, `${JSON.stringify(candidate)}\n`);
       return () => loadCertificationContract(path, { requireApproved: false });
     };
+    const allowance = { field: "cwd", categories: ["project-path", "home-path"], witnessRule: "events-log-top-level-cwd-v1" };
     expect(loadCertificationContract(v4ContractPath, { requireApproved: false }).contract.observability.privacy
-      .privateSurfaceCategoryAllowances).toEqual({ "logs/events.log": ["project-path", "home-path"] });
+      .privateSurfaceCategoryAllowances).toEqual({ "logs/events.log": allowance });
     for (const allowances of [
       undefined,
-      { "logs/events.log": ["project-path", "home-path", "runtime-password"] },
-      { "logs/events.log": ["project-path", "home-path"], "failures.ndjson": ["project-path"] },
-      { "logs/daemon.log": ["project-path", "home-path"] },
+      { "logs/events.log": ["project-path", "home-path"] },
+      { "logs/events.log": { ...allowance, field: "error" } },
+      { "logs/events.log": { ...allowance, witnessRule: "events-log-top-level-cwd-v0" } },
+      { "logs/events.log": { ...allowance, categories: ["project-path", "home-path", "runtime-password"] } },
+      { "logs/events.log": allowance, "failures.ndjson": allowance },
+      { "logs/daemon.log": allowance },
     ]) {
       expect(load(allowances)).toThrow("certification contract v4 privacy is invalid");
     }
@@ -154,10 +176,18 @@ describe("certification contract", () => {
   });
 
   it("refuses a full v4 run while approved empirical budgets remain provisional", () => {
-    const provisional = loadCertificationContract(v4ContractPath, { requireApproved: false });
-    expect(() => assertCertificationRunPolicy({ ...provisional, approval: { contractSha256: provisional.sha256 } }, {
-      lane: "local", profile: "full",
-    })).toThrow("non-provisional");
+    const directory = mkdtempSync(join(tmpdir(), "lcm-cert-contract-v4-provisional-"));
+    const path = join(directory, "contract-v4.json");
+    for (const flag of ["allocations", "ceilings"]) {
+      const candidate = JSON.parse(readFileSync(v4ContractPath, "utf8"));
+      if (flag === "allocations") candidate.timeline.full.observabilityAllocationsProvisional = true;
+      else candidate.observability.calibration.budgetCeilingsProvisional = true;
+      writeFileSync(path, `${JSON.stringify(candidate)}\n`);
+      const provisional = loadCertificationContract(path, { requireApproved: false });
+      expect(() => assertCertificationRunPolicy({ ...provisional, approval: { contractSha256: provisional.sha256 } }, {
+        lane: "local", profile: "full",
+      })).toThrow("non-provisional");
+    }
   });
 
   it("refuses the superseded v2 contract kept as history, even with its matching approval", () => {
