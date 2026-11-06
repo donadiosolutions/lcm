@@ -29,7 +29,7 @@ function snapshotFiles(root: string, directory = root, files = new Map<string, B
 
 type FaultLayout = "faults" | "partition-a" | "none";
 type MaintenanceFailure = "compact" | "snapshot" | "mixed";
-type Variant = { contractVersion?: 3 | 4; serverPort?: number; providerPort?: number | null; clockRetry?: "recovered" | "exhausted" | "miscounted"; observerRows?: number; withFaults?: boolean; observerGap?: boolean; observerSiblingsPresent?: boolean; extraObserverRow?: Record<string, unknown>; clockBreach?: boolean; clockGap?: boolean; duplicateMapping?: boolean; drainFail?: boolean; capacityPeak?: number; recoveryFail?: boolean; partitionFirstSuccessSeconds?: number; restartBFirstSuccessSeconds?: number; restartBNoSuccess?: boolean; noRecoverySuccess?: boolean; catchUpFail?: boolean; catchUpAtSeconds?: number; missingCatchUpTimestamp?: boolean; readinessInvalid?: boolean; residualOccupied?: boolean; poolConfigMismatch?: boolean; setupSessionOpen?: boolean; phaseEarly?: boolean; profile?: "smoke" | "full"; lane?: "local" | "managed"; faultLayout?: FaultLayout; maintenanceFailure?: MaintenanceFailure; smokeFailure?: boolean; smokeSlow?: boolean; executionHost?: Record<string, unknown> };
+type Variant = { contractVersion?: 3 | 4; serverPort?: number; providerPort?: number | null; clockRetry?: "recovered" | "exhausted" | "miscounted"; observerRows?: number; withFaults?: boolean; observerGap?: boolean; observerSiblingsPresent?: boolean; extraObserverRow?: Record<string, unknown>; clockBreach?: boolean; clockGap?: boolean; duplicateMapping?: boolean; drainFail?: boolean; capacityPeak?: number; recoveryFail?: boolean; partitionFirstSuccessSeconds?: number; restartBFirstSuccessSeconds?: number; restartBNoSuccess?: boolean; noRecoverySuccess?: boolean; catchUpFail?: boolean; catchUpAtSeconds?: number; missingCatchUpTimestamp?: boolean; readinessInvalid?: boolean; residualOccupied?: boolean; poolConfigMismatch?: boolean; setupSessionOpen?: boolean; phaseEarly?: boolean; profile?: "smoke" | "full"; lane?: "local" | "managed"; faultLayout?: FaultLayout; maintenanceFailure?: MaintenanceFailure; smokeFailure?: boolean; smokeSlow?: boolean; executionHost?: Record<string, unknown>; sharedAddress?: boolean; clientAddress?: string; runtimeConnections?: number; rowCount?: unknown; suppliedTotal?: unknown; closureInconsistent?: boolean; omit?: "closure" | "poolByMachine" | "poolRowB" | "maxConnections" | "reservedConnections" | "clocks" };
 
 type RetainedReceipt = { id: string; secretHits: number; canaryHits: number; categoryHits: Record<string, number> };
 
@@ -494,18 +494,18 @@ function rawFixture(options: Variant = {}) {
     setupSessionsClosed: !options.setupSessionOpen,
   };
   writeJson(join(root, "pre-activation-residual.json"), preActivationResidual);
-  writeJson(join(root, "setup-session-closure.json"), setupSessionClosure);
+  if (options.omit !== "closure") writeJson(join(root, "setup-session-closure.json"), options.closureInconsistent ? { ...setupSessionClosure, observedAt: "2026-10-26T10:10:01.000Z" } : setupSessionClosure);
   writeJson(join(root, "database-readiness.json"), {
     serverVersionNum: options.readinessInvalid ? 170006 : 180004, serverPort: options.serverPort ?? (lane === "local" ? 5432 : 25060),
     ...(lane === "managed" && options.providerPort !== null ? { providerPort: options.providerPort ?? 25060 } : {}),
     databaseName: lane === "local" ? "lcm_harness_run12345" : "lcm_cert_run12345", roleName: runtimeRole,
     role: { superuser: false, createRole: false, createDb: false }, residualEmpty: false,
-    maxConnections: 100, reservedConnections: 3,
+    ...(options.omit === "maxConnections" ? {} : { maxConnections: 100 }), ...(options.omit === "reservedConnections" ? {} : { reservedConnections: 3 }),
     configuredPoolMax: options.poolConfigMismatch ? undefined : 2,
-    poolByMachine: {
+    ...(options.omit === "poolByMachine" ? {} : { poolByMachine: {
       a: { observedAt: "2026-10-26T10:09:00.000Z", configuredMax: 2 },
-      b: { observedAt: "2026-10-26T10:10:00.000Z", configuredMax: options.poolConfigMismatch ? 3 : 2 },
-    },
+      ...(options.omit === "poolRowB" ? {} : { b: { observedAt: "2026-10-26T10:10:00.000Z", configuredMax: options.poolConfigMismatch ? 3 : 2 } }),
+    } }),
     setupSessionsClosed: !options.setupSessionOpen, setupSessionClosure,
     extensions: ["pg_stat_statements", "pg_trgm", "pgcrypto", "unaccent"].map((name) => ({ name, schema: "public" })),
     migrations: 9, expectedMigrations: 9, systemIdentifier: "123456789",
@@ -527,8 +527,12 @@ function rawFixture(options: Variant = {}) {
       t0: { wallMs, monotonicNs: String(1_000_000_000n + BigInt(minute) * 60_000_000_000n) },
       serverTime: new Date(wallMs + 10).toISOString(),
       t1: { wallMs: wallMs + (options.clockBreach && index === 0 ? 600 : 20), monotonicNs: String(1_020_000_000n + BigInt(minute) * 60_000_000_000n) },
-      databaseConnections: index === 0 ? options.capacityPeak ?? 8 : 8,
-      connections: [{ role_name: runtimeRole, client_address: machine === "a" ? "10.0.0.2" : "10.0.0.3", connections: index === 0 ? options.capacityPeak ?? 8 : 8 }],
+      databaseConnections: options.suppliedTotal !== undefined ? options.suppliedTotal : options.runtimeConnections ?? (index === 0 ? options.capacityPeak ?? 8 : 8),
+      connections: [{
+        role_name: runtimeRole,
+        client_address: options.clientAddress ?? (options.sharedAddress ? "192.0.2.10" : machine === "a" ? "10.0.0.2" : "10.0.0.3"),
+        connections: options.rowCount !== undefined ? options.rowCount : options.runtimeConnections ?? (index === 0 ? options.capacityPeak ?? 8 : 8),
+      }],
     };
   })).flat();
   if (options.clockGap) {
@@ -556,7 +560,7 @@ function rawFixture(options: Variant = {}) {
         failedAttempts: (options.clockRetry === "miscounted" ? [1] : [1, 2]).map(failed),
       };
   }
-  writeJson(join(root, "clock-witness.json"), clocks);
+  writeJson(join(root, "clock-witness.json"), options.omit === "clocks" ? [] : clocks);
   const partitionApplied = t0 + 6_060_000;
   const partitionCleared = partitionApplied + 60_500;
   const restartApplied = partitionApplied + 400_000;
@@ -683,7 +687,8 @@ describe("certification raw evidence pipeline", () => {
       json: createHash("sha256").update(readFileSync(result.paths.json)).digest("hex"),
       markdown: createHash("sha256").update(readFileSync(result.paths.markdown)).digest("hex"),
     }).toEqual({
-      json: "6ba9b71a10efc9933720e6a33bdb59968dd5dfaa81dbc3767c124283f3805c83",
+      // #1888 replaced the capacity formula, the only change in these bytes since 6ba9b71a.
+      json: "1f97b6bb9cdedd7333faa2c8e6eb8555649b546f6ce7425802e6c6b775f0ed98",
       markdown: "eebc5bbaf2d108532387877190658a022d76ae97437cd42fb7c043e669b7b9e1",
     });
   });
@@ -755,6 +760,46 @@ describe("certification raw evidence pipeline", () => {
     const gate = assemble(rawFixture({ setupSessionOpen: true })).gate;
     expect(gate.slos.find((slo: any) => slo.id === "capacity")?.verdict).toBe("fail");
   });
+
+  const capacitySlo = (variant: Variant) => assemble(rawFixture(variant)).gate.slos.find((slo: any) => slo.id === "capacity");
+
+  it("pins the capacity formula", () => {
+    expect(capacitySlo({ profile: "smoke" })?.formula).toBe("each machine's measured daemon pool configuration maximum and setup-role closure, plus the database-wide sampled connection peak (recomputed from grouped rows) within configured total and usable budget; role and client-address groups are corroboration only");
+  });
+
+  it.each<[string, Variant, "pass" | "fail" | "incomplete", number]>([
+    ["default fixture", { profile: "smoke" }, "pass", 8],
+    ["shared address, 8, local", { profile: "smoke", sharedAddress: true, runtimeConnections: 8 }, "pass", 8],
+    ["shared address, 12, local", { profile: "smoke", sharedAddress: true, runtimeConnections: 12 }, "pass", 12],
+    ["shared address, 8, managed full", { lane: "managed", profile: "full", sharedAddress: true, runtimeConnections: 8 }, "pass", 8],
+    ["shared address, 12, managed", { lane: "managed", profile: "smoke", sharedAddress: true, runtimeConnections: 12 }, "pass", 12],
+    ["distinct addresses, 12", { profile: "smoke", runtimeConnections: 12 }, "pass", 12],
+    ["local client address group, 12", { profile: "smoke", clientAddress: "local", runtimeConnections: 12 }, "pass", 12],
+    ["shared total 19, local", { profile: "smoke", sharedAddress: true, runtimeConnections: 19 }, "pass", 19],
+    ["shared total 19, managed", { lane: "managed", profile: "smoke", sharedAddress: true, runtimeConnections: 19 }, "pass", 19],
+    ["shared total 20, local", { profile: "smoke", sharedAddress: true, runtimeConnections: 20 }, "fail", 20],
+    ["shared total 20, managed", { lane: "managed", profile: "smoke", sharedAddress: true, runtimeConnections: 20 }, "fail", 20],
+    ["single sample peak 20", { profile: "smoke", capacityPeak: 20 }, "fail", 20],
+    ["pool configuration mismatch", { profile: "smoke", poolConfigMismatch: true }, "fail", 8],
+    ["open setup sessions", { profile: "smoke", setupSessionOpen: true }, "fail", 8],
+    ["inconsistent closure witness", { profile: "smoke", closureInconsistent: true }, "fail", 8],
+    ["rows sum 30 hidden by supplied total 5", { profile: "smoke", rowCount: 30, suppliedTotal: 5 }, "fail", 30],
+    ["mismatch below the limit", { profile: "smoke", rowCount: 6, suppliedTotal: 5 }, "incomplete", 6],
+    ["negative row count", { profile: "smoke", rowCount: -1 }, "incomplete", 8],
+    ["fractional row count", { profile: "smoke", rowCount: 1.5 }, "incomplete", 8],
+    ["non-finite row count", { profile: "smoke", rowCount: null }, "incomplete", 8],
+    ["non-finite supplied total", { profile: "smoke", suppliedTotal: null }, "incomplete", 8],
+    ["negative supplied total", { profile: "smoke", suppliedTotal: -1 }, "incomplete", 8],
+    ["missing closure file", { profile: "smoke", omit: "closure" }, "incomplete", 8],
+    ["missing poolByMachine", { profile: "smoke", omit: "poolByMachine" }, "incomplete", 8],
+    ["missing machine pool row", { profile: "smoke", omit: "poolRowB" }, "incomplete", 8],
+    ["missing maxConnections", { profile: "smoke", omit: "maxConnections" }, "incomplete", 8],
+    ["missing reservedConnections", { profile: "smoke", omit: "reservedConnections" }, "incomplete", 8],
+    ["empty clocks", { profile: "smoke", omit: "clocks" }, "incomplete", 0],
+    ["exhausted clock retry", { profile: "smoke", clockRetry: "exhausted" }, "incomplete", 8],
+  ])("scores capacity for %s", (_name, variant, verdict, observed) => {
+    expect(capacitySlo(variant)).toMatchObject({ verdict, observed, threshold: 19 });
+  }, 30_000);
 
   it("keeps a definite clock breach above missing observer evidence", () => {
     expect(assemble(rawFixture({ clockBreach: true, observerGap: true })).gate.verdict).toBe("fail");

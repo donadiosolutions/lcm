@@ -27,6 +27,33 @@ const SNAPSHOT_IDLE_TIMEOUT_SQL = [
 ].join("\n");
 
 /**
+ * Opens the snapshot and reads its backend identity witness in one
+ * value-free simple query. The repeatable-read snapshot starts at the PID
+ * select, before the parameterized idle-timeout set_config, where the
+ * runtime's per-query cancellation probe used to start it.
+ */
+const SNAPSHOT_OPEN_SQL = "BEGIN ISOLATION LEVEL REPEATABLE READ READ ONLY; SELECT pg_catalog.pg_backend_pid() AS pid";
+
+/** A backend PID that pg_cancel_backend may target: a positive safe integer, else undefined. */
+export function validBackendPid(value: unknown): number | undefined {
+  return Number.isSafeInteger(value) && (value as number) > 0 ? value as number : undefined;
+}
+
+/**
+ * The PID read by a fused `BEGIN ...; SELECT pg_catalog.pg_backend_pid() AS pid`
+ * simple query, whose driver result is exactly two results with the PID row
+ * in the second. Any other shape, however malformed, is undefined rather than
+ * a thrown error, so the caller fails closed.
+ */
+export function fusedBackendPid(results: unknown): number | undefined {
+  if (!Array.isArray(results) || results.length !== 2) return undefined;
+  const rows: unknown = (results[1] as { readonly rows?: unknown } | null | undefined)?.rows;
+  return Array.isArray(rows)
+    ? validBackendPid((rows[0] as { readonly pid?: unknown } | null | undefined)?.pid)
+    : undefined;
+}
+
+/**
  * The snapshot-open seam is reachable through the public
  * {@link PostgreSqlRuntime} API without daemon config validation, so the
  * value is integer-validated here too. Zero is rejected: zero disables the
@@ -71,6 +98,14 @@ export interface PostgreSqlSnapshotIdentity {
 
 /** Internal connection transport supplied by the admitted PostgreSQL runtime. */
 export interface PostgreSqlSnapshotTransport extends PostgreSqlQueryExecutor {
+  /**
+   * Sends the session's fixed, value-free opener on the checked-out client as
+   * one raw simple query, without a cancellation probe or any deadline but
+   * the connection's own, and resolves the driver's unvalidated result.
+   */
+  begin(text: string): Promise<unknown>;
+  /** Makes a validated PID the cancellation identity of every later {@link query}, which then never probes. */
+  registerBackendPid(pid: number): void;
   rollback(): Promise<void>;
   release(destroy: boolean): void;
   /**
@@ -137,7 +172,7 @@ export class PostgreSqlSnapshotSession implements PostgreSqlQueryExecutor {
       const snapshotIdleTimeoutMs = resolveSnapshotIdleTimeoutMs(
         options.snapshotIdleTimeoutMs, options.projectId,
       );
-      await session.query({ text: "BEGIN ISOLATION LEVEL REPEATABLE READ READ ONLY" }, session.context);
+      const pid = await session.begin();
       // SET LOCAL revert semantics via set_config(..., true): the relaxed
       // idle bound applies only to this snapshot transaction and reverts on
       // COMMIT/ROLLBACK, so the pooled client is never left with it. The
@@ -150,13 +185,6 @@ export class PostgreSqlSnapshotSession implements PostgreSqlQueryExecutor {
         text: SNAPSHOT_IDLE_TIMEOUT_SQL,
         values: [snapshotIdleTimeoutMs + "ms"],
       }, session.context);
-      const result = await session.query<{ pid: number }>({
-        text: "SELECT pg_catalog.pg_backend_pid() AS pid",
-      }, session.context);
-      const pid = result.rows[0]?.pid;
-      if (!Number.isSafeInteger(pid) || pid <= 0) {
-        throw new Error("invalid snapshot backend identity");
-      }
       session.snapshotIdentity = Object.freeze({
         sessionId: randomUUID(), backendPid: pid, projectId: options.projectId,
       });
@@ -198,21 +226,56 @@ export class PostgreSqlSnapshotSession implements PostgreSqlQueryExecutor {
     return normalized;
   }
 
+  /**
+   * Opens the transaction and reads its identity witness in one exchange,
+   * queued like {@link query}. The witness becomes the cancellation PID of
+   * every later query. The raw opener cannot be cancelled, so an abort seen
+   * when it returns, or an unusable PID, destroys the connection instead of
+   * registering anything.
+   */
+  private begin(): Promise<number> {
+    this.assertOpen();
+    return this.enqueue(this.cancellation.signal, this.context, async () => {
+      const results = await this.transport.begin(SNAPSHOT_OPEN_SQL);
+      if (this.cancellation.signal.aborted) {
+        this.destroy = true;
+        throw new Error("snapshot open aborted");
+      }
+      const pid = fusedBackendPid(results);
+      if (pid === undefined) {
+        this.destroy = true;
+        throw new Error("invalid snapshot backend identity");
+      }
+      this.transport.registerBackendPid(pid);
+      return pid;
+    });
+  }
+
   async query<R extends QueryResultRow = QueryResultRow, I extends unknown[] = unknown[]>(
     config: QueryConfig<I>,
     options: PostgreSqlQueryOptions,
   ): Promise<QueryResult<R>> {
     this.assertOpen();
-    const effectiveOptions = {
-      ...options,
-      signal: options.signal
-        ? AbortSignal.any([options.signal, this.cancellation.signal])
-        : this.cancellation.signal,
-    };
+    const signal = options.signal
+      ? AbortSignal.any([options.signal, this.cancellation.signal])
+      : this.cancellation.signal;
+    return this.enqueue(
+      signal,
+      { ...options, projectId: this.options.projectId },
+      () => this.transport.query<R, I>(config, { ...options, signal }),
+    );
+  }
+
+  /** Runs one operation after every earlier one and fails the session closed when it throws. */
+  private enqueue<T>(
+    signal: AbortSignal,
+    context: PostgreSqlQueryOptions,
+    operation: () => Promise<T>,
+  ): Promise<T> {
     const execute = this.queue.then(async () => {
       this.assertOpen();
       try {
-        return await this.transport.query<R, I>(config, effectiveOptions);
+        return await operation();
       } catch (error) {
         // Normalize first so a captured async diagnostic (see
         // capturedSqlState / normalize) can participate in the destroy
@@ -224,12 +287,12 @@ export class PostgreSqlSnapshotSession implements PostgreSqlQueryExecutor {
         // raw-driver-shape check (transport codes, connection-loss
         // messages) that a normalized StorageOperationError can never
         // match, so normalizing first would only ever make it return false.
-        const normalized = this.normalize(error, { ...options, projectId: this.options.projectId });
+        const normalized = this.normalize(error, context);
         // A 25P03 idle-in-transaction kill (or any connection-termination
         // failure) marks the backend dead immediately, so finishClose skips
         // ROLLBACK on the FATAL-dead session and releases with destroy=true
         // instead of attempting a doomed rollback.
-        this.destroy ||= effectiveOptions.signal.aborted
+        this.destroy ||= signal.aborted
           || isPostgreSqlConnectionError(error)
           || isPostgreSqlSnapshotTerminationError(normalized);
         // Do not await close inside the queue it must drain.
