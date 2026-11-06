@@ -1,0 +1,12 @@
+references: ["#1869"]
+rationale: >-
+  #1869 reduces PostgreSQL round trips per transaction. A moded or admitted
+  transaction opens with one fused BEGIN that also reads its backend PID,
+  and every signalled query in it cancels that PID instead of probing for
+  one first; a modeless transaction reads the PID once, at its first
+  signalled query. A read-only snapshot opens with one fused BEGIN whose
+  identity witness becomes its cancellation PID. Both files keep their
+  existing runtime owner.
+pins:
+  - ["src/storage/postgresql/runtime.ts", "integration-postgresql-runtime"]
+  - ["src/storage/postgresql/snapshot-session.ts", "integration-postgresql-runtime"]
