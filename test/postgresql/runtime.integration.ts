@@ -15,6 +15,7 @@ import {
   settings,
   withPostgreSqlTestDatabase,
 } from "./harness.js";
+import { postgreSqlUrlTarget, startRoundTripRelay } from "./round-trip-relay.js";
 
 beforeAll(assertHarnessReady);
 
@@ -515,4 +516,98 @@ describe("PostgreSQL 18 runtime", () => {
       }
     });
   });
+});
+
+describe("PostgreSQL 18 runtime transaction exchanges", () => {
+  /** A runtime whose one connection runs through a counting relay, with idle validation frozen off. */
+  async function relayedRuntime(database: PostgreSqlTestDatabase) {
+    const relay = await startRoundTripRelay(postgreSqlUrlTarget(database.runtimeUrl));
+    const runtime = new PostgreSqlRuntime(settings(database.runtimeUrl, { poolMax: 1 }), {
+      ...POSTGRESQL_RUNTIME_DEFAULT_DEPENDENCIES,
+      now: () => 0,
+      buildConfig: (candidate) => ({
+        ...POSTGRESQL_RUNTIME_DEFAULT_DEPENDENCIES.buildConfig(candidate),
+        host: "127.0.0.1",
+        port: relay.port,
+      }),
+    });
+    const exchanges = async (operation: () => Promise<unknown>): Promise<number> => {
+      const before = relay.counts().turns;
+      await operation();
+      return relay.counts().turns - before;
+    };
+    return { relay, runtime, exchanges };
+  }
+
+  it("opens a moded transaction and reads its PID in one exchange and never probes again", async () => {
+    // A repeatable-read database default proves the fused opener applies its own isolation.
+    await withPostgreSqlTestDatabase("transaction-exchanges", async (database) => {
+      const { relay, runtime, exchanges } = await relayedRuntime(database);
+      try {
+        await runtime.query({ text: "SELECT 1" }, { domain: "factory", operation: "warm" });
+        const signalled = { domain: "factory", operation: "signalled", signal: new AbortController().signal } as const;
+        const settingsText = "SELECT pg_catalog.current_setting('transaction_isolation') AS isolation,"
+          + " pg_catalog.current_setting('transaction_read_only') AS read_only";
+        const moded = await exchanges(() => runtime.transaction(async (transaction) => {
+          await expect(transaction.query({ text: settingsText }, signalled))
+            .resolves.toMatchObject({ rows: [{ isolation: "read committed", read_only: "off" }] });
+          await transaction.query({ text: "SELECT 2" }, signalled);
+        }, { domain: "transaction", operation: "moded", transactionMode: "read-committed-read-write" }));
+        // The fused opener, two signalled queries and COMMIT.
+        expect(moded).toBe(4);
+        const modeless = await exchanges(() => runtime.transaction(async (transaction) => {
+          await expect(transaction.query({ text: settingsText }, { domain: "factory", operation: "unsignalled" }))
+            .resolves.toMatchObject({ rows: [{ isolation: "repeatable read" }] });
+          await transaction.query({ text: "SELECT 2" }, signalled);
+          await transaction.query({ text: "SELECT 3" }, signalled);
+        }, { domain: "transaction", operation: "modeless" }));
+        // BEGIN, the unsignalled query, one PID probe, two signalled queries and COMMIT.
+        expect(modeless).toBe(6);
+        expect(relay.counts().connections).toBe(1);
+      } finally {
+        await runtime.close();
+        await relay.close();
+      }
+    }, { defaultTransactionIsolation: "REPEATABLE READ" });
+  });
+
+  it.each([
+    ["moded", { transactionMode: "read-committed-read-write" as const }],
+    ["modeless", {}],
+  ])("cancels a %s transaction's query on its own backend through the transaction PID", async (_label, mode) => {
+    await withPostgreSqlTestDatabase("transaction-cancel-pid", async (database) => {
+      const runtime = new PostgreSqlRuntime(settings(database.runtimeUrl, { poolMax: 1, statementTimeoutMs: 20_000 }));
+      const admin = new PostgreSqlRuntime(settings(database.adminUrl));
+      const controller = new AbortController();
+      let backendPid = 0;
+      try {
+        const outcome = await runtime.transaction(async (transaction) => {
+          backendPid = (await transaction.query<{ pid: number }>({
+            text: "SELECT pg_catalog.pg_backend_pid() AS pid",
+          }, { domain: "factory", operation: "cancelTarget", signal: controller.signal })).rows[0]!.pid;
+          const sleeping = transaction.query({ text: "SELECT pg_catalog.pg_sleep(20)" }, {
+            domain: "factory", operation: "cancelSleep", signal: controller.signal,
+          });
+          await expect.poll(async () => (await admin.query<{ wait_event: string | null }>({
+            text: "SELECT wait_event FROM pg_catalog.pg_stat_activity WHERE pid = $1",
+            values: [backendPid],
+          }, { domain: "factory", operation: "cancelObserve" })).rows[0]?.wait_event, { timeout: 5_000, interval: 10 }).toBe("PgSleep");
+          controller.abort();
+          return sleeping;
+        }, { domain: "transaction", operation: "cancelRoot", ...mode }).catch((caught: unknown) => caught);
+        expect(outcome).toMatchObject({ code: "STORAGE_OPERATION_FAILED", operation: "cancelSleep", retryable: false });
+        // pg_cancel_backend reached this transaction's backend: a wrong PID would leave it sleeping.
+        await expect.poll(async () => (await admin.query<{ active: number }>({
+          text: "SELECT pg_catalog.count(*)::int AS active FROM pg_catalog.pg_stat_activity WHERE pid = $1 AND state = 'active'",
+          values: [backendPid],
+        }, { domain: "factory", operation: "cancelSettled" })).rows[0]!.active, { timeout: 5_000, interval: 25 }).toBe(0);
+        await expect(runtime.query<{ value: number }>({ text: "SELECT 1 AS value" }, {
+          domain: "factory", operation: "afterTransactionCancel",
+        })).resolves.toMatchObject({ rows: [{ value: 1 }] });
+      } finally {
+        await runtime.close();
+        await admin.close();
+      }
+    });
+  }, 45_000);
 });

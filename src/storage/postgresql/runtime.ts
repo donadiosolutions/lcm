@@ -11,7 +11,12 @@ import type {
   PostgreSqlTransactionOptions,
   PostgreSqlTransactionScopeExecutor,
 } from "./contracts.js";
-import { PostgreSqlSnapshotSession, type PostgreSqlSnapshotOptions } from "./snapshot-session.js";
+import {
+  fusedBackendPid,
+  PostgreSqlSnapshotSession,
+  validBackendPid,
+  type PostgreSqlSnapshotOptions,
+} from "./snapshot-session.js";
 import { buildPostgreSqlClientConfig, postgreSqlQueryDeadlineMs } from "./client-config.js";
 import {
   isPostgreSqlConnectionError,
@@ -93,6 +98,34 @@ type HealthRow = {
 
 type BackendPidRow = { pid: number };
 type CancelRow = { cancelled: boolean };
+
+/**
+ * The cancellation identity of one pinned backend, a transaction's or a
+ * snapshot's. Signalled queries cancel this PID instead of probing for one;
+ * the first probe of a transaction opened without it fills it in.
+ */
+interface BackendIdentity {
+  pid: number | undefined;
+}
+
+/**
+ * A backend PID that is not a positive safe integer. pg_cancel_backend must
+ * never target it, so the query does not run and the connection that
+ * reported it is discarded. It is not a connection error.
+ */
+class InvalidBackendPidError extends Error {
+  constructor() {
+    super("invalid backend identity");
+  }
+}
+
+/**
+ * Opens a moded or admitted transaction and reads its backend PID in one
+ * value-free simple query. The isolation clause is exactly SET TRANSACTION
+ * ISOLATION LEVEL READ COMMITTED, READ WRITE.
+ */
+const READ_COMMITTED_TRANSACTION_OPEN_SQL =
+  "BEGIN ISOLATION LEVEL READ COMMITTED READ WRITE; SELECT pg_catalog.pg_backend_pid() AS pid";
 
 function sanitizeServerMajorVersion(value: unknown): number | null {
   return typeof value === "number" && Number.isSafeInteger(value) && value >= 0
@@ -194,7 +227,7 @@ function transactionSetupSql(
   ) {
     throw transactionScopeError(options);
   }
-  return "SET TRANSACTION ISOLATION LEVEL READ COMMITTED, READ WRITE";
+  return READ_COMMITTED_TRANSACTION_OPEN_SQL;
 }
 
 function snapshotTransactionOptions(
@@ -332,6 +365,15 @@ async function ignoreCancellationFailure(cancellation: Promise<void>): Promise<v
   } catch {
     // The target connection is destroyed by the caller after abort.
   }
+}
+
+/** Reads and validates the PID of a backend whose identity is not known yet, recording it for reuse. */
+async function probeBackendPid(client: PoolClient, identity: BackendIdentity | undefined): Promise<number> {
+  const result = await client.query<BackendPidRow>({ text: "SELECT pg_backend_pid() AS pid" });
+  const pid = validBackendPid(result.rows[0]?.pid);
+  if (pid === undefined) throw new InvalidBackendPidError();
+  if (identity !== undefined) identity.pid = pid;
+  return pid;
 }
 
 /** A pool checkout with the observer that records its asynchronous 'error' events. */
@@ -491,12 +533,17 @@ export class PostgreSqlRuntime implements PostgreSqlQueryExecutor {
     let forwardAsyncFailure!: (sqlState: string | null) => void;
     const onClientAsyncFailure = (error: unknown): void => { forwardAsyncFailure(sanitizeSqlState(error)); };
     client.on("error", onClientAsyncFailure);
+    // The session registers its identity witness here once its raw opener
+    // returns, so no snapshot query ever probes for a PID.
+    const identity: BackendIdentity = { pid: undefined };
     session = await PostgreSqlSnapshotSession.open({
       query: <R extends QueryResultRow = QueryResultRow, I extends unknown[] = unknown[]>(
         config: QueryConfig<I>, queryOptions: PostgreSqlQueryOptions,
       ) => this.queryClient<R, I>(
-        client, config, snapshotScopedQueryOptions(queryOptions, admitted, options.projectId),
+        client, config, snapshotScopedQueryOptions(queryOptions, admitted, options.projectId), identity,
       ),
+      begin: (text) => client.query(text),
+      registerBackendPid: (pid) => { identity.pid = pid; },
       rollback: async () => { await client.query("ROLLBACK"); },
       release: (destroy) => {
         client.removeListener("error", onClientAsyncFailure);
@@ -546,7 +593,9 @@ export class PostgreSqlRuntime implements PostgreSqlQueryExecutor {
       this.poolFailed = false;
       return result;
     } catch (error) {
-      destroy = options.signal?.aborted === true || isPostgreSqlConnectionError(error);
+      destroy = options.signal?.aborted === true
+        || isPostgreSqlConnectionError(error)
+        || error instanceof InvalidBackendPidError;
       const normalized = normalizePostgreSqlError(error, options);
       throw watch?.reattach(normalized, options) ?? normalized;
     } finally {
@@ -599,6 +648,7 @@ export class PostgreSqlRuntime implements PostgreSqlQueryExecutor {
     let watch: CheckoutAsyncFailureWatch | undefined;
     let destroy = false;
     let commitAttempted = false;
+    const identity: BackendIdentity = { pid: undefined };
     try {
       client = await this.acquire(options);
       watch = watchCheckoutAsyncFailure(client);
@@ -606,13 +656,25 @@ export class PostgreSqlRuntime implements PostgreSqlQueryExecutor {
         destroy = true;
         throw aborted(options);
       }
-      await client.query("BEGIN");
-      if (setupSql !== undefined) {
-        await client.query({ text: setupSql });
-      }
+      // A moded or admitted transaction reads its backend PID in the same
+      // exchange as BEGIN; a modeless one keeps plain BEGIN and reads the PID
+      // at its first signalled query, where the per-query probe first ran.
+      // Every signalled query then cancels that one PID, which needs one
+      // server backend for the whole transaction: a direct connection, session
+      // pooling, or any proxy that pins one server per transaction. Portable
+      // migration already holds a session-level advisory lock, so it is not
+      // transaction-pooler compatible today; this adds no pinning assumption.
+      const opened: unknown = await client.query(setupSql ?? "BEGIN");
       if (options.signal?.aborted) {
         destroy = true;
         throw aborted(options);
+      }
+      if (setupSql !== undefined) {
+        identity.pid = fusedBackendPid(opened);
+        if (identity.pid === undefined) {
+          destroy = true;
+          throw new InvalidBackendPidError();
+        }
       }
       let acceptingQueries = true;
       let transactionFailed = false;
@@ -637,6 +699,7 @@ export class PostgreSqlRuntime implements PostgreSqlQueryExecutor {
           || failureOptions.signal?.aborted === true
           || options.signal?.aborted === true
           || connectionFailure
+          || error instanceof InvalidBackendPidError
         ) {
           destroy = true;
         }
@@ -656,7 +719,7 @@ export class PostgreSqlRuntime implements PostgreSqlQueryExecutor {
           const combinedSignal = combineAbortSignals(queryOptions.signal, options.signal);
           const effectiveOptions = { ...queryOptions, signal: combinedSignal.signal };
           try {
-            return await this.queryClient<R, I>(client!, config, effectiveOptions);
+            return await this.queryClient<R, I>(client!, config, effectiveOptions, identity);
           } catch (error) {
             throw recordFatalFailure(error, effectiveOptions);
           } finally {
@@ -721,7 +784,7 @@ export class PostgreSqlRuntime implements PostgreSqlQueryExecutor {
             const combinedSignal = combineAbortSignals(scopedQueryOptions.signal, options.signal);
             const effectiveOptions = { ...scopedQueryOptions, signal: combinedSignal.signal };
             try {
-              return await this.queryClient<R, I>(client!, config, effectiveOptions);
+              return await this.queryClient<R, I>(client!, config, effectiveOptions, identity);
             } catch (error) {
               throw recordFatalFailure(error, effectiveOptions);
             } finally {
@@ -802,10 +865,12 @@ export class PostgreSqlRuntime implements PostgreSqlQueryExecutor {
                         client!,
                         config,
                         effectiveOptions,
+                        identity,
                       );
                     } catch (error) {
                       const connectionFailure =
                         isPostgreSqlConnectionError(error);
+                      const identityFailure = error instanceof InvalidBackendPidError;
                       const queryAborted =
                         effectiveOptions.signal?.aborted === true;
                       const normalized = watch!.reattach(
@@ -815,12 +880,12 @@ export class PostgreSqlRuntime implements PostgreSqlQueryExecutor {
                       savepointFailed = true;
                       savepointFailure ??= normalized;
                       savepointFailureRecoverable =
-                        !queryAborted && !connectionFailure && !watch!.failed();
+                        !queryAborted && !connectionFailure && !identityFailure && !watch!.failed();
                       if (!savepointFailureRecoverable) {
                         recordFatalFailure(
                           normalized,
                           effectiveOptions,
-                          queryAborted || connectionFailure,
+                          queryAborted || connectionFailure || identityFailure,
                         );
                       }
                       throw normalized;
@@ -1201,6 +1266,7 @@ export class PostgreSqlRuntime implements PostgreSqlQueryExecutor {
     client: PoolClient,
     config: QueryConfig<I>,
     options: PostgreSqlQueryOptions,
+    identity?: BackendIdentity,
   ): Promise<QueryResult<R>> {
     const signal = options.signal;
     // A text with several statements gets a deadline that never undercuts the
@@ -1215,8 +1281,7 @@ export class PostgreSqlRuntime implements PostgreSqlQueryExecutor {
       return client.query<R, I>(bounded);
     }
     if (signal.aborted) throw aborted(options);
-    const pidResult = await client.query<BackendPidRow>({ text: "SELECT pg_backend_pid() AS pid" });
-    const pid = pidResult.rows[0].pid;
+    const pid = identity?.pid ?? await probeBackendPid(client, identity);
     if (signal.aborted) throw aborted(options);
 
     type QueryOutcome = { error: Error | null; result?: QueryResult<R> };

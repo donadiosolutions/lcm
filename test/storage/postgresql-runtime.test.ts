@@ -36,6 +36,15 @@ function result<R extends QueryResultRow>(rows: R[]): QueryResult<R> {
   return { command: "SELECT", rowCount: rows.length, oid: 0, fields: [], rows };
 }
 
+const READ_COMMITTED_OPEN = "BEGIN ISOLATION LEVEL READ COMMITTED READ WRITE; SELECT pg_catalog.pg_backend_pid() AS pid";
+const PID_PROBE = { text: "SELECT pg_backend_pid() AS pid" };
+/** The PID every fixture transaction's fused opener reports unless a test overrides it. */
+const TRANSACTION_PID = 4242;
+
+function opened(pid: unknown = TRANSACTION_PID): QueryResult<QueryResultRow>[] {
+  return [{ ...result([]), command: "BEGIN" }, result([{ pid }])];
+}
+
 const SETTINGS: PostgreSqlConnectionSettings = {
   url: "postgresql://user:password@db.example/lcm",
   caFile: "/secure/ca.pem",
@@ -132,14 +141,7 @@ function fixtures(
   let poolRelease: ((error: unknown, client: PoolClient) => void) | undefined;
   const release = vi.fn((error?: unknown) => { poolRelease?.(error, poolClient); });
   const query = vi.fn((input: unknown) => {
-    if (
-      typeof input === "object"
-      && input !== null
-      && "text" in input
-      && input.text === "SET TRANSACTION ISOLATION LEVEL READ COMMITTED, READ WRITE"
-    ) {
-      return result([]);
-    }
+    if (input === READ_COMMITTED_OPEN) return opened();
     return queryImplementation?.(input) ?? result([]);
   });
   const poolClient = Object.assign(new EventEmitter(), {
@@ -365,8 +367,7 @@ describe("PostgreSQL runtime", () => {
     expect(admitted).toEqual(["project-a", "project-b"]);
     expect(callback).toHaveBeenCalledOnce();
     expect(f.query.mock.calls.map(([input]) => input)).toEqual([
-      "BEGIN",
-      { text: "SET TRANSACTION ISOLATION LEVEL READ COMMITTED, READ WRITE" },
+      READ_COMMITTED_OPEN,
       { text: "GUARD project-a" },
       { text: "GUARD project-b" },
       { text: "BUSINESS" },
@@ -389,8 +390,7 @@ describe("PostgreSQL runtime", () => {
     });
 
     expect(f.query.mock.calls.map(([input]) => input)).toEqual([
-      "BEGIN",
-      { text: "SET TRANSACTION ISOLATION LEVEL READ COMMITTED, READ WRITE" },
+      READ_COMMITTED_OPEN,
       { text: "PROJECTLESS RAW QUERY" },
       "COMMIT",
     ]);
@@ -644,8 +644,7 @@ describe("PostgreSQL runtime", () => {
       operation: "health",
     })).resolves.toMatchObject({ rows: [{ value: 1 }] });
     expect(f.query.mock.calls.map(([input]) => input)).toEqual([
-      "BEGIN",
-      { text: "SET TRANSACTION ISOLATION LEVEL READ COMMITTED, READ WRITE" },
+      READ_COMMITTED_OPEN,
       { text: "GUARD" },
       { text: "SELECT scoped" },
       "COMMIT",
@@ -712,8 +711,7 @@ describe("PostgreSQL runtime", () => {
       return selected.rows[0].value;
     }, { projectId: "project", domain: "transaction", operation: "commit" })).resolves.toBe(2);
     expect(f.query.mock.calls.map(([input]) => input)).toEqual([
-      "BEGIN",
-      { text: "SET TRANSACTION ISOLATION LEVEL READ COMMITTED, READ WRITE" },
+      READ_COMMITTED_OPEN,
       { text: "SELECT 2 AS value" },
       "COMMIT",
     ]);
@@ -1342,9 +1340,10 @@ describe("PostgreSQL runtime", () => {
   });
 
   it("destroys an aborted transaction after BEGIN without invoking its callback", async () => {
-    let finishBegin!: (value: QueryResult<QueryResultRow>) => void;
-    const beginResult = new Promise<QueryResult<QueryResultRow>>((resolve) => { finishBegin = resolve; });
-    const f = fixtures((input) => input === "BEGIN" ? beginResult : result([]));
+    let finishBegin!: (value: QueryResult<QueryResultRow>[]) => void;
+    const beginResult = new Promise<QueryResult<QueryResultRow>[]>((resolve) => { finishBegin = resolve; });
+    const f = fixtures();
+    f.query.mockImplementationOnce(() => beginResult);
     const controller = new AbortController();
     const callback = vi.fn(async () => "must not run");
     const pending = f.runtime.transaction(callback, {
@@ -1355,9 +1354,9 @@ describe("PostgreSQL runtime", () => {
       signal: controller.signal,
     });
 
-    await vi.waitFor(() => expect(f.query).toHaveBeenCalledWith("BEGIN"));
+    await vi.waitFor(() => expect(f.query).toHaveBeenCalledWith(READ_COMMITTED_OPEN));
     controller.abort();
-    finishBegin(result([]));
+    finishBegin(opened());
 
     const error = await pending.catch((caught: unknown) => caught);
     expectCancellation(error, {
@@ -1367,8 +1366,10 @@ describe("PostgreSQL runtime", () => {
       machineId: "machine-abort",
     });
     expect(callback).not.toHaveBeenCalled();
-    expect(f.query).not.toHaveBeenCalledWith("ROLLBACK");
-    expect(f.query).not.toHaveBeenCalledWith("COMMIT");
+    // The raw opener cannot be cancelled: the abort destroys the connection
+    // after it returns, without a probe, a cancel, ROLLBACK or COMMIT.
+    expect(f.query.mock.calls.map(([input]) => input)).toEqual([READ_COMMITTED_OPEN]);
+    expect(f.dependencies.createClient).not.toHaveBeenCalled();
     expect(f.release).toHaveBeenCalledWith(true);
   });
 
@@ -1450,8 +1451,7 @@ describe("PostgreSQL runtime", () => {
     finishQuery(result([]));
     await expect(pending).resolves.toBe("committed");
     expect(f.query.mock.calls.map(([input]) => input)).toEqual([
-      "BEGIN",
-      { text: "SET TRANSACTION ISOLATION LEVEL READ COMMITTED, READ WRITE" },
+      READ_COMMITTED_OPEN,
       { text: "UPDATE values_table SET value = 2" },
       "COMMIT",
     ]);
@@ -1712,8 +1712,7 @@ describe("PostgreSQL runtime", () => {
       retained = transaction;
     }, { projectId: "outer-project", domain: "transaction", operation: "retain" });
     expect(f.query.mock.calls.map(([input]) => input)).toEqual([
-      "BEGIN",
-      { text: "SET TRANSACTION ISOLATION LEVEL READ COMMITTED, READ WRITE" },
+      READ_COMMITTED_OPEN,
       "COMMIT",
     ]);
 
@@ -1732,8 +1731,7 @@ describe("PostgreSQL runtime", () => {
       projectId: "outer-project",
     });
     expect(f.query.mock.calls.map(([input]) => input)).toEqual([
-      "BEGIN",
-      { text: "SET TRANSACTION ISOLATION LEVEL READ COMMITTED, READ WRITE" },
+      READ_COMMITTED_OPEN,
       "COMMIT",
     ]);
   });
@@ -2696,6 +2694,234 @@ describe("PostgreSQL runtime", () => {
       machineId: "machine-cancel-failure",
     });
     expect(f.release).toHaveBeenCalledWith(true);
+  });
+});
+
+describe("PostgreSQL runtime transaction cancellation identity", () => {
+  const CANCEL = "SELECT pg_cancel_backend($1) AS cancelled";
+  const isProbe = (input: unknown): boolean => (input as { text?: unknown } | null)?.text === PID_PROBE.text;
+  const isCallbackQuery = (input: unknown): input is QueryWithCallback => (
+    typeof input === "object" && input !== null && "callback" in input
+  );
+  /** The text of every statement the checked-out client received, in order. */
+  const dispatched = (query: ReturnType<typeof vi.fn>): unknown[] => query.mock.calls.map(([input]) => (
+    typeof input === "string" ? input : (input as { text: string }).text
+  ));
+  const signal = (): AbortSignal => new AbortController().signal;
+  const SLOW = "SELECT pg_sleep(10)";
+
+  /** Completes every query at once except SLOW, which the test settles after it cancels it. */
+  function identityFixtures(options: {
+    readonly probePid?: number;
+    readonly failures?: Readonly<Record<string, Error>>;
+    readonly admission?: Parameters<typeof fixtures>[1];
+  } = {}) {
+    let held: QueryWithCallback | undefined;
+    const f = fixtures((input) => {
+      if (isProbe(input)) return result([{ pid: options.probePid ?? 5150 }]);
+      if (!isCallbackQuery(input)) return result([]);
+      const text = (input as { text?: string }).text ?? "";
+      if (text === SLOW) {
+        held = input;
+        return input;
+      }
+      const failure = options.failures?.[text];
+      if (failure) input.callback(failure);
+      else input.callback(null, result([{ value: 1 }]));
+      return input;
+    }, options.admission);
+    return {
+      ...f,
+      /** Waits for SLOW, aborts it and finishes it the way PostgreSQL does after pg_cancel_backend. */
+      cancelSlow: async (controller: AbortController) => {
+        await vi.waitFor(() => expect(held).toBeDefined());
+        controller.abort();
+        await vi.waitFor(() => expect(f.cancelQuery).toHaveBeenCalled());
+        held!.callback(Object.assign(new Error("canceling statement due to user request"), { code: "57014" }));
+      },
+    };
+  }
+
+  it("cancels a signalled query in a moded transaction with the PID its fused opener read", async () => {
+    const f = identityFixtures();
+    f.query.mockImplementationOnce(() => opened(9001));
+    const controller = new AbortController();
+    const error = await f.runtime.transaction(async (transaction) => {
+      await transaction.query({ text: "SELECT before" }, { domain: "factory", operation: "before", signal: signal() });
+      const slow = transaction.query({ text: SLOW }, { domain: "factory", operation: "slow", signal: controller.signal });
+      await f.cancelSlow(controller);
+      return slow;
+    }, { projectId: "project", domain: "transaction", operation: "modedCancel" }).catch((caught: unknown) => caught);
+    expect(error).toMatchObject({ code: "STORAGE_OPERATION_FAILED", operation: "slow", retryable: false, sqlState: null });
+    expect(f.cancelQuery).toHaveBeenCalledExactlyOnceWith({ text: CANCEL, values: [9001] });
+    expect(dispatched(f.query)).toEqual([READ_COMMITTED_OPEN, "SELECT before", SLOW]);
+    expect(f.release).toHaveBeenCalledExactlyOnceWith(true);
+  });
+
+  it("cancels an admission query with the transaction PID", async () => {
+    const acquireMutationGuard = vi.fn(async (
+      executor: PostgreSqlQueryExecutor,
+      _projectId: string,
+      options: PostgreSqlQueryOptions,
+    ) => {
+      await executor.query({ text: SLOW }, options);
+    });
+    const f = identityFixtures({ admission: { acquireMutationGuard } });
+    const controller = new AbortController();
+    const callback = vi.fn(async () => "must not run");
+    const pending = f.runtime.transaction(callback, {
+      projectId: "project", domain: "transaction", operation: "admissionCancel", signal: controller.signal,
+    });
+    await f.cancelSlow(controller);
+    await expect(pending).rejects.toMatchObject({ operation: "admissionCancel", retryable: false, sqlState: null });
+    expect(callback).not.toHaveBeenCalled();
+    expect(f.cancelQuery).toHaveBeenCalledExactlyOnceWith({ text: CANCEL, values: [TRANSACTION_PID] });
+    expect(dispatched(f.query)).toEqual([READ_COMMITTED_OPEN, SLOW]);
+    expect(f.release).toHaveBeenCalledExactlyOnceWith(true);
+  });
+
+  it.each([
+    ["a single result", () => result([])],
+    ["one result", () => [result([])]],
+    ["three results", () => [...opened(), result([])]],
+    ["no PID row", () => [opened()[0], result([])]],
+    ["a null second result", () => [opened()[0], null]],
+    ["an undefined second result", () => [opened()[0], undefined]],
+    ["a second result without rows", () => [opened()[0], {}]],
+    ["a second result with null rows", () => [opened()[0], { rows: null }]],
+    ["a zero PID", () => opened(0)],
+    ["a negative PID", () => opened(-1)],
+    ["a fractional PID", () => opened(1.5)],
+    ["a string PID", () => opened(String(TRANSACTION_PID))],
+    ["an unsafe PID", () => opened(Number.MAX_SAFE_INTEGER + 1)],
+  ])("fails closed without ROLLBACK when the fused opener returns %s", async (_label, answer) => {
+    const f = fixtures();
+    f.query.mockImplementationOnce(answer);
+    const callback = vi.fn(async () => "must not run");
+    const error = await f.runtime.transaction(callback, {
+      projectId: "project", domain: "transaction", operation: "invalidOpenerPid",
+    }).catch((caught: unknown) => caught);
+    expect(error).toMatchObject({
+      code: "STORAGE_OPERATION_FAILED", projectId: "project", operation: "invalidOpenerPid", retryable: false, sqlState: null,
+    });
+    expect(callback).not.toHaveBeenCalled();
+    expect(dispatched(f.query)).toEqual([READ_COMMITTED_OPEN]);
+    expect(f.release).toHaveBeenCalledExactlyOnceWith(true);
+  });
+
+  it.each([
+    ["its BEGIN", "25006"],
+    ["its PID select after BEGIN", "XX000"],
+  ])("rolls back and keeps the SQLSTATE when %s fails in the fused opener", async (_label, code) => {
+    const f = fixtures();
+    f.query.mockImplementationOnce(() => Promise.reject(Object.assign(new Error("private opener failure"), { code })));
+    const callback = vi.fn(async () => "must not run");
+    const error = await f.runtime.transaction(callback, {
+      projectId: "project", domain: "transaction", operation: "openerFailure",
+    }).catch((caught: unknown) => caught);
+    expect(error).toMatchObject({ code: "STORAGE_OPERATION_FAILED", operation: "openerFailure", retryable: false, sqlState: code });
+    expect(JSON.stringify(error)).not.toContain("private");
+    expect(callback).not.toHaveBeenCalled();
+    expect(dispatched(f.query)).toEqual([READ_COMMITTED_OPEN, "ROLLBACK"]);
+    expect(f.release).toHaveBeenCalledExactlyOnceWith(false);
+  });
+
+  it("probes a modeless transaction's PID once, at its first signalled query, and cancels with it", async () => {
+    const f = identityFixtures({ probePid: 5150 });
+    const controller = new AbortController();
+    const error = await f.runtime.transaction(async (transaction) => {
+      await transaction.query({ text: "SELECT unsignalled" }, { domain: "factory", operation: "unsignalled" });
+      expect(dispatched(f.query)).toEqual(["BEGIN", "SELECT unsignalled"]);
+      await transaction.query({ text: "SELECT first" }, { domain: "factory", operation: "first", signal: signal() });
+      await transaction.query({ text: "SELECT second" }, { domain: "factory", operation: "second", signal: signal() });
+      await transaction.savepoint(
+        (savepoint) => savepoint.query({ text: "SELECT inside" }, { domain: "factory", operation: "inside", signal: signal() }),
+        { domain: "factory", operation: "savepoint" },
+      );
+      const slow = transaction.query({ text: SLOW }, { domain: "factory", operation: "slow", signal: controller.signal });
+      await f.cancelSlow(controller);
+      return slow;
+    }, { domain: "transaction", operation: "modeless" }).catch((caught: unknown) => caught);
+    expect(error).toMatchObject({ operation: "slow", retryable: false, sqlState: null });
+    expect(dispatched(f.query)).toEqual([
+      "BEGIN",
+      "SELECT unsignalled",
+      PID_PROBE.text,
+      "SELECT first",
+      "SELECT second",
+      "SAVEPOINT lcm_runtime_repository_1",
+      "SELECT inside",
+      "RELEASE SAVEPOINT lcm_runtime_repository_1",
+      SLOW,
+    ]);
+    expect(f.cancelQuery).toHaveBeenCalledExactlyOnceWith({ text: CANCEL, values: [5150] });
+    expect(f.release).toHaveBeenCalledExactlyOnceWith(true);
+  });
+
+  it.each([
+    ["moded", { projectId: "project" }, TRANSACTION_PID, [READ_COMMITTED_OPEN, "SAVEPOINT lcm_runtime_repository_1", "INSERT duplicate"]],
+    ["modeless", {}, 5150, ["BEGIN", "SAVEPOINT lcm_runtime_repository_1", PID_PROBE.text, "INSERT duplicate"]],
+  ] as const)("keeps a %s transaction's PID across a recoverable savepoint failure", async (_label, scope, pid, opening) => {
+    const f = identityFixtures({
+      probePid: 5150,
+      failures: { "INSERT duplicate": Object.assign(new Error("private duplicate"), { code: "23505" }) },
+    });
+    const controller = new AbortController();
+    const error = await f.runtime.transaction(async (transaction) => {
+      await expect(transaction.savepoint(
+        (savepoint) => savepoint.query({ text: "INSERT duplicate" }, { domain: "factory", operation: "duplicate", signal: signal() }),
+        { domain: "factory", operation: "savepoint" },
+      )).rejects.toMatchObject({ operation: "duplicate", sqlState: "23505" });
+      await expect(transaction.query({ text: "SELECT after" }, { domain: "factory", operation: "after", signal: signal() }))
+        .resolves.toMatchObject({ rows: [{ value: 1 }] });
+      const slow = transaction.query({ text: SLOW }, { domain: "factory", operation: "slow", signal: controller.signal });
+      await f.cancelSlow(controller);
+      return slow;
+    }, { ...scope, domain: "transaction", operation: "savepointReuse" }).catch((caught: unknown) => caught);
+    expect(error).toMatchObject({ operation: "slow", retryable: false, sqlState: null });
+    expect(dispatched(f.query)).toEqual([
+      ...opening,
+      "ROLLBACK TO SAVEPOINT lcm_runtime_repository_1",
+      "RELEASE SAVEPOINT lcm_runtime_repository_1",
+      "SELECT after",
+      SLOW,
+    ]);
+    expect(f.cancelQuery).toHaveBeenCalledExactlyOnceWith({ text: CANCEL, values: [pid] });
+  });
+
+  it.each([
+    ["a missing row", []],
+    ["a zero PID", [{ pid: 0 }]],
+  ])("fails a modeless transaction closed without ROLLBACK when its lazy probe returns %s", async (_label, rows) => {
+    const f = fixtures((input) => isProbe(input) ? result(rows) : result([]));
+    const error = await f.runtime.transaction(
+      (transaction) => transaction.query({ text: "SELECT signalled" }, { domain: "factory", operation: "lazyInvalid", signal: signal() }),
+      { domain: "transaction", operation: "lazyInvalidRoot" },
+    ).catch((caught: unknown) => caught);
+    expect(error).toMatchObject({ code: "STORAGE_OPERATION_FAILED", operation: "lazyInvalid", retryable: false, sqlState: null });
+    expect(dispatched(f.query)).toEqual(["BEGIN", PID_PROBE.text]);
+    expect(f.release).toHaveBeenCalledExactlyOnceWith(true);
+  });
+
+  it("treats an unusable PID probed inside a savepoint as fatal to the whole transaction", async () => {
+    const f = fixtures((input) => isProbe(input) ? result([{ pid: -1 }]) : result([]));
+    const error = await f.runtime.transaction((transaction) => transaction.savepoint(
+      (savepoint) => savepoint.query({ text: "SELECT signalled" }, { domain: "factory", operation: "savepointInvalid", signal: signal() }),
+      { domain: "factory", operation: "savepoint" },
+    ), { domain: "transaction", operation: "savepointInvalidRoot" }).catch((caught: unknown) => caught);
+    expect(error).toMatchObject({ code: "STORAGE_OPERATION_FAILED", operation: "savepointInvalid", retryable: false, sqlState: null });
+    expect(dispatched(f.query)).toEqual(["BEGIN", "SAVEPOINT lcm_runtime_repository_1", PID_PROBE.text]);
+    expect(f.release).toHaveBeenCalledExactlyOnceWith(true);
+  });
+
+  it("discards a direct-query connection whose probe returns an unusable PID", async () => {
+    const f = fixtures((input) => isProbe(input) ? result([{ pid: String(TRANSACTION_PID) }]) : result([]));
+    const error = await f.runtime.query({ text: "SELECT signalled" }, {
+      domain: "factory", operation: "directInvalid", signal: signal(),
+    }).catch((caught: unknown) => caught);
+    expect(error).toMatchObject({ code: "STORAGE_OPERATION_FAILED", operation: "directInvalid", retryable: false, sqlState: null });
+    expect(dispatched(f.query)).toEqual([PID_PROBE.text]);
+    expect(f.release).toHaveBeenCalledExactlyOnceWith(true);
   });
 });
 

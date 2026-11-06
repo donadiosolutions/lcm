@@ -1,6 +1,6 @@
 import { createHash } from "node:crypto";
 import { beforeAll, describe, expect, it } from "vitest";
-import { PostgreSqlRuntime } from "../../src/storage/postgresql/runtime.js";
+import { PostgreSqlRuntime, POSTGRESQL_RUNTIME_DEFAULT_DEPENDENCIES } from "../../src/storage/postgresql/runtime.js";
 import { DEFAULT_SNAPSHOT_IDLE_TIMEOUT_MS } from "../../src/storage/postgresql/snapshot-session.js";
 import {
   assertHarnessReady,
@@ -8,6 +8,7 @@ import {
   type PostgreSqlTestDatabase,
   withPostgreSqlTestDatabase,
 } from "./harness.js";
+import { postgreSqlUrlTarget, startRoundTripRelay } from "./round-trip-relay.js";
 
 beforeAll(assertHarnessReady);
 
@@ -79,6 +80,41 @@ describe("PostgreSQL 18 portable snapshot session", () => {
       }
       await expect(database.runtime.query({ text: "SHOW transaction_isolation" }, context))
         .resolves.toMatchObject({ rows: [{ transaction_isolation: "read committed" }] });
+    });
+  });
+
+  it("opens in two exchanges and runs each read in one, without a PID probe", async () => {
+    await withPostgreSqlTestDatabase("snapshot-exchanges", async (database) => {
+      const projectId = await createFixture(database);
+      const relay = await startRoundTripRelay(postgreSqlUrlTarget(database.runtimeUrl));
+      const runtime = new PostgreSqlRuntime(settings(database.runtimeUrl, { poolMax: 1 }), {
+        ...POSTGRESQL_RUNTIME_DEFAULT_DEPENDENCIES,
+        // A frozen clock keeps the warmed connection below the idle-validation threshold.
+        now: () => 0,
+        buildConfig: (candidate) => ({
+          ...POSTGRESQL_RUNTIME_DEFAULT_DEPENDENCIES.buildConfig(candidate),
+          host: "127.0.0.1",
+          port: relay.port,
+        }),
+      });
+      const exchanges = async (operation: () => Promise<unknown>): Promise<number> => {
+        const before = relay.counts().turns;
+        await operation();
+        return relay.counts().turns - before;
+      };
+      try {
+        await runtime.query({ text: "SELECT 1" }, context);
+        let session!: Awaited<ReturnType<typeof runtime.openReadOnlySnapshot>>;
+        // The fused opener with its identity witness, then the parameterized idle-timeout set_config.
+        expect(await exchanges(async () => { session = await runtime.openReadOnlySnapshot({ projectId }); })).toBe(2);
+        // Every read carries the session's cancellation signal and still needs no PID probe.
+        expect(await exchanges(() => session.query(readValue(projectId), { ...context, projectId }))).toBe(1);
+        expect(await exchanges(() => session.close())).toBe(1);
+        expect(relay.counts().connections).toBe(1);
+      } finally {
+        await runtime.close();
+        await relay.close();
+      }
     });
   });
 

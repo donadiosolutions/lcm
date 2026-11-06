@@ -6,10 +6,13 @@ import {
   DEFAULT_SNAPSHOT_IDLE_TIMEOUT_MS,
   PostgreSqlSnapshotSession,
   type PostgreSqlSnapshotOptions,
+  type PostgreSqlSnapshotTransport,
 } from "../../src/storage/postgresql/snapshot-session.js";
 import type { PostgreSqlConnectionSettings, PostgreSqlQueryOptions } from "../../src/storage/postgresql/contracts.js";
 
 const options = { domain: "transaction", operation: "snapshot", projectId: "project" } as const;
+const SNAPSHOT_OPEN = "BEGIN ISOLATION LEVEL REPEATABLE READ READ ONLY; SELECT pg_catalog.pg_backend_pid() AS pid";
+const PID_PROBE = "SELECT pg_backend_pid() AS pid";
 function result(rows: QueryResultRow[] = []): QueryResult<QueryResultRow> {
   return { command: "SELECT", rowCount: rows.length, oid: 0, fields: [], rows };
 }
@@ -36,11 +39,15 @@ function fixture(
     const values = typeof input === "object" ? input.values : undefined;
     statements.push(text);
     configs.push({ text, values });
-    const execute = text.includes("pg_backend_pid") ? Promise.resolve(result([{ pid: backendPid }])) : handler(text);
+    // The handler still decides when and whether the fused opener succeeds;
+    // its success carries the BEGIN result and the backend's PID row.
+    const execute = text === SNAPSHOT_OPEN
+      ? handler(text).then((): unknown => [result(), result([{ pid: backendPid }])])
+      : text === PID_PROBE ? Promise.resolve(result([{ pid: backendPid }])) : handler(text);
     if (typeof input === "object" && input.callback) {
       const callback = input.callback;
       active = { callback };
-      void execute.then((value) => callback(null, value), (error: Error) => callback(error));
+      void execute.then((value) => callback(null, value as QueryResult<QueryResultRow>), (error: Error) => callback(error));
       return input;
     }
     return execute;
@@ -81,7 +88,13 @@ describe("dedicated PostgreSQL snapshot session", () => {
     await session.query({ text: "SELECT first" }, options);
     await session.query({ text: "SELECT second" }, options);
     expect(f.connect).toHaveBeenCalledTimes(1);
-    expect(f.statements).toContain("BEGIN ISOLATION LEVEL REPEATABLE READ READ ONLY");
+    // Two exchanges open the snapshot and no query ever probes for a PID.
+    expect(f.statements).toEqual([
+      SNAPSHOT_OPEN,
+      expect.stringContaining("idle_in_transaction_session_timeout"),
+      "SELECT first",
+      "SELECT second",
+    ]);
     expect(f.release).not.toHaveBeenCalled();
     await Promise.all([session.close(), session.close()]);
     expect(f.statements.filter((text) => text === "ROLLBACK")).toHaveLength(1);
@@ -253,11 +266,12 @@ describe("dedicated PostgreSQL snapshot session", () => {
     await f.runtime.close();
   });
 
-  it("rejects invalid backend identity and releases the transaction", async () => {
-    const f = fixture(undefined, -1);
-    await expect(f.runtime.openReadOnlySnapshot({ projectId: "project" })).rejects.toMatchObject({ code: "STORAGE_OPERATION_FAILED" });
-    expect(f.statements).toContain("ROLLBACK");
-    expect(f.release).toHaveBeenCalledExactlyOnceWith(false);
+  it.each([-1, 0, 1.5, "1234", null])("rejects backend identity %s and destroys the connection without ROLLBACK", async (pid) => {
+    const f = fixture(undefined, pid);
+    await expect(f.runtime.openReadOnlySnapshot({ projectId: "project" }))
+      .rejects.toMatchObject({ code: "STORAGE_OPERATION_FAILED", sqlState: null, retryable: false });
+    expect(f.statements).toEqual([SNAPSHOT_OPEN]);
+    expect(f.release).toHaveBeenCalledExactlyOnceWith(true);
     await f.runtime.close();
   });
 
@@ -306,12 +320,16 @@ describe("dedicated PostgreSQL snapshot session", () => {
 
   it("releases transport without BEGIN when session construction is pre-aborted", async () => {
     const f = fixture();
+    const registerBackendPid = vi.fn();
     await expect(PostgreSqlSnapshotSession.open({
       query: f.query as never,
+      begin: f.query as never,
+      registerBackendPid,
       rollback: async () => undefined,
       release: f.release,
     }, { projectId: "project", signal: AbortSignal.abort() })).rejects.toMatchObject({ code: "STORAGE_CLOSED" });
     expect(f.query).not.toHaveBeenCalled();
+    expect(registerBackendPid).not.toHaveBeenCalled();
     expect(f.release).toHaveBeenCalledExactlyOnceWith(false);
     await f.runtime.close();
   });
@@ -356,16 +374,9 @@ describe("dedicated PostgreSQL snapshot session", () => {
     expect(setConfigCalls[0]!.text).toContain("$1::pg_catalog.text");
     expect(setConfigCalls[0]!.text).toContain("true");
     expect(setConfigCalls[0]!.text).not.toContain(`${DEFAULT_SNAPSHOT_IDLE_TIMEOUT_MS}`);
-    // set_config runs after BEGIN and before the backend-identity query.
-    const beginIndex = f.statements.indexOf("BEGIN ISOLATION LEVEL REPEATABLE READ READ ONLY");
-    const setConfigIndex = f.statements.findIndex((text) => text.includes("idle_in_transaction_session_timeout"));
-    // The exact identity-query text (distinct from queryClient's internal,
-    // per-call cancellation-tracking "SELECT pg_backend_pid() AS pid" probe,
-    // which lacks the pg_catalog. prefix and precedes every real query).
-    const pidIndex = f.statements.indexOf("SELECT pg_catalog.pg_backend_pid() AS pid");
-    expect(beginIndex).toBeGreaterThanOrEqual(0);
-    expect(setConfigIndex).toBeGreaterThan(beginIndex);
-    expect(pidIndex).toBeGreaterThan(setConfigIndex);
+    // set_config runs right after the fused opener, which already read the
+    // backend identity witness; no cancellation probe precedes either.
+    expect(f.statements).toEqual([SNAPSHOT_OPEN, setConfigCalls[0]!.text]);
     await session.close();
     await f.runtime.close();
   });
@@ -386,7 +397,7 @@ describe("dedicated PostgreSQL snapshot session", () => {
       const f = fixture(undefined, 1234, { snapshotIdleTimeoutMs: invalid });
       await expect(f.runtime.openReadOnlySnapshot({ projectId: "project" }))
         .rejects.toMatchObject({ code: "STORAGE_INITIALIZATION_FAILED" });
-      expect(f.statements).not.toContain("BEGIN ISOLATION LEVEL REPEATABLE READ READ ONLY");
+      expect(f.statements).not.toContain(SNAPSHOT_OPEN);
       expect(f.statements.some((text) => text.includes("idle_in_transaction_session_timeout"))).toBe(false);
       await f.runtime.close();
     },
@@ -406,12 +417,14 @@ describe("dedicated PostgreSQL snapshot session", () => {
     });
     await expect(f.runtime.openReadOnlySnapshot({ projectId: "project" }))
       .rejects.toMatchObject({ code: "STORAGE_OPERATION_FAILED" });
-    expect(f.statements).toContain("BEGIN ISOLATION LEVEL REPEATABLE READ READ ONLY");
-    expect(f.statements.some((text) => text.includes("idle_in_transaction_session_timeout"))).toBe(true);
-    // The real identity query never runs; only queryClient's internal,
-    // per-call cancellation-tracking probe (a different, shorter statement
-    // lacking the pg_catalog. prefix) precedes BEGIN and set_config.
-    expect(f.statements).not.toContain("SELECT pg_catalog.pg_backend_pid() AS pid");
+    // The opener already read the witness, so set_config is the only other
+    // statement before the rollback, and nothing probes for a PID.
+    expect(f.statements).toEqual([
+      SNAPSHOT_OPEN,
+      expect.stringContaining("idle_in_transaction_session_timeout"),
+      "ROLLBACK",
+    ]);
+    expect(f.release).toHaveBeenCalledExactlyOnceWith(false);
     await f.runtime.close();
   });
 
@@ -512,6 +525,142 @@ describe("dedicated PostgreSQL snapshot session", () => {
     expect(f.clientEvents.listenerCount("error")).toBe(1);
     await session.close();
     expect(f.clientEvents.listenerCount("error")).toBe(0);
+    await f.runtime.close();
+  });
+
+  function handTransport(answer: () => unknown) {
+    const mocks = {
+      begin: vi.fn(async (_text: string) => answer()),
+      registerBackendPid: vi.fn((_pid: number) => undefined),
+      query: vi.fn(async (_config: { text: string }, _options: PostgreSqlQueryOptions) => result()),
+      rollback: vi.fn(async () => undefined),
+      release: vi.fn((_destroy: boolean) => undefined),
+    };
+    return { ...mocks, transport: mocks as unknown as PostgreSqlSnapshotTransport };
+  }
+
+  it("registers the witness PID before the idle-timeout set_config runs", async () => {
+    const order: string[] = [];
+    const transport = handTransport(() => [result(), result([{ pid: 777 }])]);
+    transport.begin.mockImplementation(async (text) => { order.push(text); return [result(), result([{ pid: 777 }])]; });
+    transport.registerBackendPid.mockImplementation((pid) => { order.push("register " + String(pid)); });
+    transport.query.mockImplementation(async (config) => { order.push(config.text); return result(); });
+    const session = await PostgreSqlSnapshotSession.open(transport.transport, { projectId: "project", snapshotIdleTimeoutMs: 1_000 });
+    expect(session.identity.backendPid).toBe(777);
+    expect(order).toEqual([SNAPSHOT_OPEN, "register 777", expect.stringContaining("idle_in_transaction_session_timeout")]);
+    await session.close();
+    expect(transport.rollback).toHaveBeenCalledOnce();
+    expect(transport.release).toHaveBeenCalledExactlyOnceWith(false);
+  });
+
+  it.each([
+    ["a single result", () => result([{ pid: 1234 }])],
+    ["three results", () => [result(), result([{ pid: 1234 }]), result()]],
+    ["no PID row", () => [result(), result()]],
+    ["a null second result", () => [result(), null]],
+    ["an undefined second result", () => [result(), undefined]],
+    ["a second result without rows", () => [result(), {}]],
+    ["a second result with null rows", () => [result(), { rows: null }]],
+  ])("destroys without registering anything when the opener returns %s", async (_label, answer) => {
+    const transport = handTransport(answer);
+    await expect(PostgreSqlSnapshotSession.open(transport.transport, { projectId: "project", snapshotIdleTimeoutMs: 1_000 }))
+      .rejects.toMatchObject({ code: "STORAGE_OPERATION_FAILED", projectId: "project", sqlState: null, retryable: false });
+    expect(transport.registerBackendPid).not.toHaveBeenCalled();
+    expect(transport.query).not.toHaveBeenCalled();
+    expect(transport.rollback).not.toHaveBeenCalled();
+    expect(transport.release).toHaveBeenCalledExactlyOnceWith(true);
+  });
+
+  it("destroys without set_config, PID registration or ROLLBACK when the open aborts while its raw opener is in flight", async () => {
+    const opener = deferred<unknown>();
+    const transport = handTransport(() => opener.promise);
+    const controller = new AbortController();
+    const pending = PostgreSqlSnapshotSession.open(transport.transport, {
+      projectId: "project", signal: controller.signal, snapshotIdleTimeoutMs: 1_000,
+    });
+    await vi.waitFor(() => expect(transport.begin).toHaveBeenCalledOnce());
+    controller.abort();
+    // The response still succeeds: the raw opener is never cancelled.
+    opener.resolve([result(), result([{ pid: 1234 }])]);
+    await expect(pending).rejects.toMatchObject({ code: "STORAGE_OPERATION_FAILED", projectId: "project", sqlState: null });
+    expect(transport.begin).toHaveBeenCalledExactlyOnceWith(SNAPSHOT_OPEN);
+    expect(transport.registerBackendPid).not.toHaveBeenCalled();
+    expect(transport.query).not.toHaveBeenCalled();
+    expect(transport.rollback).not.toHaveBeenCalled();
+    expect(transport.release).toHaveBeenCalledExactlyOnceWith(true);
+  });
+
+  it("destroys a runtime source whose open aborts while its opener is in flight, without cancelling it", async () => {
+    const opener = deferred<QueryResult<QueryResultRow>>();
+    const started = deferred<void>();
+    const f = fixture(async (text) => {
+      if (text === SNAPSHOT_OPEN) { started.resolve(); return opener.promise; }
+      return result();
+    });
+    const controller = new AbortController();
+    const pending = f.runtime.openReadOnlySnapshot({ projectId: "project", signal: controller.signal });
+    const rejected = expect(pending).rejects.toMatchObject({ code: "STORAGE_OPERATION_FAILED", sqlState: null });
+    await started.promise;
+    controller.abort();
+    opener.resolve(result());
+    await rejected;
+    expect(f.statements).toEqual([SNAPSHOT_OPEN]);
+    expect(f.cancel).not.toHaveBeenCalled();
+    expect(f.release).toHaveBeenCalledExactlyOnceWith(true);
+    expect(f.clientEvents.listenerCount("error")).toBe(0);
+    await f.runtime.close();
+  });
+
+  it("keeps the SQLSTATE of a failed fused opener and rolls back", async () => {
+    const f = fixture(async (text) => {
+      if (text === SNAPSHOT_OPEN) throw Object.assign(new Error("private opener failure"), { code: "XX000" });
+      return result();
+    });
+    const error = await f.runtime.openReadOnlySnapshot({ projectId: "project" }).catch((caught: unknown) => caught);
+    expect(error).toMatchObject({ code: "STORAGE_OPERATION_FAILED", sqlState: "XX000", retryable: false });
+    expect(JSON.stringify(error)).not.toContain("private");
+    expect(f.statements).toEqual([SNAPSHOT_OPEN, "ROLLBACK"]);
+    expect(f.release).toHaveBeenCalledExactlyOnceWith(false);
+    await f.runtime.close();
+  });
+
+  it("observes an asynchronous connection failure while the opener is in flight and destroys without ROLLBACK", async () => {
+    const opener = deferred<QueryResult<QueryResultRow>>();
+    const started = deferred<void>();
+    const f = fixture(async (text) => {
+      if (text === SNAPSHOT_OPEN) { started.resolve(); return opener.promise; }
+      return result();
+    });
+    const pending = f.runtime.openReadOnlySnapshot({ projectId: "project" });
+    const rejected = expect(pending).rejects.toMatchObject({ sqlState: "57P01", retryable: true });
+    await started.promise;
+    f.emitClientError(Object.assign(new Error("terminating connection due to administrator command"), { code: "57P01" }));
+    opener.reject(new Error("Client has encountered a connection error and is not queryable"));
+    await rejected;
+    expect(f.statements).toEqual([SNAPSHOT_OPEN]);
+    expect(f.release).toHaveBeenCalledExactlyOnceWith(true);
+    expect(f.clientEvents.listenerCount("error")).toBe(0);
+    await f.runtime.close();
+  });
+
+  it("cancels a snapshot read with the witness PID and never probes for one", async () => {
+    const started = deferred<void>();
+    const f = fixture(async (text) => {
+      if (text === "SELECT blocked") { started.resolve(); return new Promise(() => undefined); }
+      return result();
+    }, 4321);
+    const session = await f.runtime.openReadOnlySnapshot({ projectId: "project" });
+    expect(session.identity.backendPid).toBe(4321);
+    const controller = new AbortController();
+    const pending = session.query({ text: "SELECT blocked" }, { ...options, signal: controller.signal });
+    const rejected = expect(pending).rejects.toMatchObject({ code: "STORAGE_OPERATION_FAILED" });
+    await started.promise;
+    controller.abort();
+    await rejected;
+    await session.close();
+    expect(f.cancel).toHaveBeenCalledExactlyOnceWith({ text: "SELECT pg_cancel_backend($1) AS cancelled", values: [4321] });
+    expect(f.statements).not.toContain(PID_PROBE);
+    expect(f.release).toHaveBeenCalledExactlyOnceWith(true);
     await f.runtime.close();
   });
 
