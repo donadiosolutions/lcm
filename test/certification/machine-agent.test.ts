@@ -59,7 +59,7 @@ async function runStraddledPhase({ phase, machine, straddle, respond, prepareHom
   phase: string;
   machine: "a" | "b";
   straddle: number;
-  respond: (sequence: number, startedAtMs: number) => { transportFailure?: boolean; snapshot?: unknown };
+  respond: (sequence: number, startedAtMs: number, clearedAtMs: number | undefined) => { transportFailure?: boolean; snapshot?: unknown };
   prepareHome?: (home: string, appliedAtMs: number) => void;
 }) {
   const root = mkdtempSync(join(tmpdir(), `lcm-cert-${phase}-straddle-`));
@@ -94,14 +94,14 @@ async function runStraddledPhase({ phase, machine, straddle, respond, prepareHom
       clock += 500;
       const record: PhaseProbe = {
         id: request.id, machine: request.machine, phase: request.phase, sequence: request.sequence, startedAtMs, completedAtMs: clock,
-        ...(request.sequence < 0 ? { snapshot: HEALTHY_SNAPSHOT } : respond(request.sequence, startedAtMs)),
+        ...(request.sequence < 0 ? { snapshot: HEALTHY_SNAPSHOT } : respond(request.sequence, startedAtMs, clearedAt === "" ? undefined : Date.parse(clearedAt))),
       };
       if (request.sequence < 0) baseline = record;
       return record;
     },
   });
   const readJson = (name: string) => JSON.parse(readFileSync(join(evidenceDirectory, name), "utf8"));
-  return { records: result.records as PhaseProbe[], baseline, readJson, fault: { appliedAt, clearedAt } };
+  return { records: result.records as PhaseProbe[], baseline, readJson, fault: { appliedAt, clearedAt }, cleared: result.cleared as { id: string } | undefined };
 }
 
 describe("observability probes", () => {
@@ -207,6 +207,51 @@ describe("observability probes", () => {
       backlogWitness: readJson("queue-backlog-aged.json"), backlogDetection: { ...detected.backlogRow, id: detected.id },
     });
     expect({ detection: detected.id, alert: evaluated.alert }).toEqual({ detection: "queue-backlog-b-probe-4", alert: true });
+  });
+
+  it("keeps backlog probing after clearedAt until a healthy probe within the healthy-clearance allowance", async () => {
+    let createdAtMs = 0;
+    const backlog = (startedAtMs: number) => ({ ...HEALTHY_SNAPSHOT, telemetry: { ...HEALTHY_SNAPSHOT.telemetry, queue: {
+      status: "observed", health: "degraded", remediation: "Check daemon delivery with `lcm events status`, then run `lcm doctor`.",
+      outboxOldestPendingAgeSeconds: Math.floor((startedAtMs - createdAtMs) / 1000), inboxClaimed: 0, inboxQuarantined: 0,
+    } } });
+    const { records, baseline, readJson, fault, cleared } = await runStraddledPhase({
+      phase: "queue-backlog", machine: "b", straddle: 0,
+      prepareHome: (home, appliedAtMs) => {
+        const createdAt = new Date(appliedAtMs).toISOString().replace("T", " ").slice(0, 19);
+        createdAtMs = Date.parse(`${createdAt.replace(" ", "T")}Z`);
+        mkdirSync(join(home, ".lcm", "events"), { recursive: true });
+        const database = new DatabaseSync(join(home, ".lcm", "events", "events.db"));
+        database.exec(`CREATE TABLE events (
+          event_id INTEGER PRIMARY KEY, event_uuid TEXT NOT NULL UNIQUE, machine_sequence INTEGER, session_id TEXT,
+          type TEXT, source_hook TEXT, data TEXT, delivery_state TEXT NOT NULL, remote_inbox_id TEXT,
+          acknowledged_at TEXT, remote_pruned_at TEXT, created_at TEXT NOT NULL,
+          delivery_next_attempt_at TEXT NOT NULL, delivery_updated_at TEXT NOT NULL
+        )`);
+        database.prepare("INSERT INTO events (event_id, event_uuid, delivery_state, created_at, delivery_next_attempt_at, delivery_updated_at) VALUES (1, 'aged', 'pending', ?, ?, ?)")
+          .run(createdAt, createdAt, createdAt);
+        database.close();
+      },
+      // A lawful but slow drain: the queue stays degraded after the reconnect and first
+      // reports healthy 200 seconds after clearedAt, well inside the 930-second allowance.
+      respond: (_sequence, startedAtMs, clearedAtMs) => clearedAtMs === undefined || startedAtMs < clearedAtMs ? { transportFailure: true }
+        : startedAtMs < clearedAtMs + 200_000 ? { snapshot: backlog(startedAtMs) } : { snapshot: HEALTHY_SNAPSHOT },
+    });
+    const clearedAtMs = Date.parse(fault.clearedAt);
+    // Machine A is not partitioned: its first post-clear probe is healthy.
+    const machineA = { id: "queue-backlog-a-probe-0", machine: "a", phase: "queue-backlog", sequence: 0, startedAtMs: clearedAtMs, completedAtMs: clearedAtMs + 1_000, snapshot: HEALTHY_SNAPSHOT };
+    const detected = readJson("queue-backlog-detected.json");
+    const evaluated = evaluatePhaseProbeEvidence({
+      phase: "queue-backlog", probes: [machineA, ...records], fault, baseline: { b: baseline },
+      backlogWitness: readJson("queue-backlog-aged.json"), backlogDetection: { ...detected.backlogRow, id: detected.id },
+    });
+    expect({
+      clearance: cleared?.id, evaluated: evaluated.clearanceIds?.b, healthyClearanceSeconds: evaluated.healthyClearanceSeconds,
+      recovery: evaluated.recovery, alert: evaluated.alert,
+    }).toEqual({
+      clearance: "queue-backlog-b-probe-201", evaluated: "queue-backlog-b-probe-201", healthyClearanceSeconds: 201.5,
+      recovery: true, alert: true,
+    });
   });
 
   it("scans bounded daemon, failure and log outputs without publishing their text", () => {

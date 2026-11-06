@@ -1025,7 +1025,12 @@ export async function executeControlledObservabilityPhase({
   let clearedAtMs;
   let backlogWitness;
   let saturationWaitingEstablished = false;
-  for (let sequence = 0; now() < appliedAtMs + holdMaximumSeconds * 1000 + 30_000; sequence += 1) {
+  // After the backlog reconnect, probing continues one at a time until the first healthy
+  // post-clear probe or the contract's healthy-clearance allowance after clearedAt.
+  const probingEndsAtMs = () => (phase === "queue-backlog" && Number.isFinite(clearedAtMs)
+    ? clearedAtMs + contract.observability.clearanceSeconds.backlogHealthy * 1000
+    : appliedAtMs + holdMaximumSeconds * 1000 + 30_000);
+  for (let sequence = 0; now() < probingEndsAtMs(); sequence += 1) {
     if (phase === "saturation" && !detected && now() >= appliedAtMs + holdMaximumSeconds * 1000) break;
     const target = appliedAtMs + sequence * cadenceMs;
     if (target > now()) await wait(target - now());
