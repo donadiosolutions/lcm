@@ -243,6 +243,15 @@ bracket is never retried. `clock-witness.json` records every attempt, and the ga
 scores the last one: a sample that succeeded after retries counts, and a sample whose
 attempts all failed leaves the clock and capacity results incomplete.
 
+The capacity result enforces each machine's measured daemon pool configuration
+maximum, setup-session closure, and the database-wide sampled peak against the
+contract total and, on the managed lane, the usable budget. Each sample's total is
+recomputed from its grouped rows: a mismatch or an invalid count leaves capacity
+incomplete. Groups by role and client address are recorded as corroboration only.
+When machines or coordinator probes share an egress address (for example behind NAT
+on a managed database), the groups cannot establish which machine owns a session, so
+the gate neither requires distinct addresses nor caps a single group.
+
 Execution provenance also carries an execution-host witness captured once at run
 start by both lanes: OS release ID and version, kernel release, architecture, CPU
 model and logical CPU count, total memory, container engine name and version, and
