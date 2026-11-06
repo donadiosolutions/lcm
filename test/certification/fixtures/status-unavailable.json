@@ -1,0 +1,135 @@
+{
+  "daemon": {
+    "version": "2.0.0-alpha.0",
+    "uptime": 1758,
+    "port": 3737
+  },
+  "backendDiagnostics": {
+    "backend": "postgresql",
+    "classification": "unavailable",
+    "publication": "ready",
+    "tls": "unavailable",
+    "schema": "unverified",
+    "extensions": "unverified",
+    "search": "unverified",
+    "pool": {
+      "origin": "daemon",
+      "status": "ready",
+      "configuredMax": 2,
+      "total": 1,
+      "idle": 0,
+      "waiting": 0,
+      "failed": false
+    },
+    "project": {
+      "scope": "selected",
+      "status": "unavailable"
+    },
+    "identity": {
+      "status": "ready",
+      "machineId": "01a1afca-b92f-7663-bed8-1beef8111c9d"
+    },
+    "outbox": {
+      "status": "unverified"
+    },
+    "telemetry": {
+      "pool": {
+        "status": "observed",
+        "observedAt": 1793952451344,
+        "health": "healthy",
+        "omitted": [],
+        "remediation": "No action required.",
+        "saturationRatio": 0.5
+      },
+      "migration": {
+        "status": "unavailable",
+        "observedAt": 1793952451348,
+        "health": "unavailable",
+        "remediation": "Run `lcm doctor` and review the storage configuration.",
+        "omitted": [
+          {
+            "field": "appliedCount",
+            "reason": "unavailable"
+          },
+          {
+            "field": "expectedCount",
+            "reason": "unavailable"
+          }
+        ],
+        "historyStatus": "unavailable"
+      },
+      "extensions": {
+        "status": "unavailable",
+        "observedAt": 1793952451348,
+        "health": "unavailable",
+        "remediation": "Run `lcm doctor` and review the storage configuration.",
+        "omitted": [
+          {
+            "field": "pg_stat_statements",
+            "reason": "unavailable"
+          },
+          {
+            "field": "pg_trgm",
+            "reason": "unavailable"
+          },
+          {
+            "field": "pgcrypto",
+            "reason": "unavailable"
+          },
+          {
+            "field": "unaccent",
+            "reason": "unavailable"
+          }
+        ],
+        "entries": []
+      },
+      "queue": {
+        "status": "unavailable",
+        "observedAt": 1793952451348,
+        "health": "unavailable",
+        "remediation": "Run `lcm doctor` and review the storage configuration.",
+        "omitted": [
+          {
+            "field": "outboxOldestPendingAgeSeconds",
+            "reason": "unavailable"
+          },
+          {
+            "field": "inboxClaimed",
+            "reason": "unavailable"
+          },
+          {
+            "field": "inboxQuarantined",
+            "reason": "unavailable"
+          },
+          {
+            "field": "replayLagSeconds",
+            "reason": "unavailable"
+          }
+        ]
+      },
+      "statements": {
+        "status": "unavailable",
+        "observedAt": 1793952451344,
+        "scope": "aggregate"
+      }
+    },
+    "remediation": "Run `lcm doctor` and review the storage configuration."
+  },
+  "passiveEvents": {
+    "halted": false,
+    "haltedReason": null,
+    "haltedMessage": null,
+    "replication": {
+      "enabled": true,
+      "lastPassAt": "2026-11-06T08:03:12.958Z",
+      "passes": 6,
+      "projects": 6,
+      "uploaded": 0,
+      "applied": 0,
+      "acknowledged": 0,
+      "pruned": 0,
+      "retried": 0,
+      "quarantined": 0
+    }
+  }
+}

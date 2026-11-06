@@ -65,11 +65,30 @@ outage windows.
 
 Reset-producing steps fence collection: the agent stops scheduling probes, waits
 for the in-flight probe to finish, records a healthy baseline, applies the
-mutation, and resumes one probe at a time. The first successful statements read
-must report the new epoch as reset, followed by an observed read. Each later step
-starts only after both machines reach the exact healthy barrier. A known breach
-remains failed if a later barrier times out; only skipped later evidence is
-incomplete.
+mutation, and resumes one probe at a time. In the statistics-reset step the first
+successful statements read must report the new epoch as reset, followed by an
+observed read. Each later step starts only after both machines reach the exact
+healthy barrier. A known breach remains failed if a later barrier times out; only
+skipped later evidence is incomplete.
+
+Restart identification uses the product's own signal: after a database restart the
+statements family reports `reset` because the postmaster start time changed, even
+when `pg_stat_statements` keeps its `stats_reset` epoch. On each machine, no probe
+may straddle `appliedAt`. The first successful statements read (status `reset`,
+`partial` or `observed`) that starts at or after `appliedAt` must be `reset`; its
+epoch is not compared. The next read must be `observed`; the pair is mandatory.
+Any probe that started inside [`appliedAt`, `clearedAt`) before the reset read
+must be a failure (a transport failure, or a `timeout` or `unavailable`
+classification). If none did, the evidence records no outage observed and
+detection is measured from `appliedAt` to the reset read. The statistics-reset
+step keeps the epoch-advance rule, and restart clearance and correctness are
+unchanged.
+
+Both machines' partition probes are anchored to `clearedAt`. The coordinator
+clears the partition only after the 60-second hold, the reconnect and the database
+check, so probing continues past `appliedAt` + 60 seconds until the first healthy
+probe that starts at or after `clearedAt`, bounded by the 30-second first-success
+allowance after the clear and by the 1,080-second phase allocation.
 
 The backlog step deliberately distinguishes product behavior from harness
 control. Machine B captures hooks while partitioned and lets the actual oldest
@@ -78,6 +97,39 @@ updates only that row's next-attempt timestamp, leaving its creation time and
 state unchanged, so the first post-reconnect probe can observe the aged row. This
 certifies the age metric, alert, and recovery under controlled delivery
 scheduling. It does not certify natural retry backoff during a partition.
+
+The saturation step induces pool saturation through public read routes. The
+coordinator holds `LOCK TABLE lcm.promoted_memories IN ACCESS EXCLUSIVE MODE` in
+one admin transaction. Machine B sends `POST /search` requests with
+`layers: ["promoted"]`, four at once (the agent's admission cap) and two more
+every 5 seconds through 15 seconds. Each blocked search holds a pool connection
+until the product's 5-second search statement cap, so with `poolMax` 2 two
+searches hold both connections and the others wait for one. Both machines send
+searches only, with no store or other mutating request, because a mutating request
+takes the daemon's publication queue and every later read then queues behind it.
+The status probe reads the pool counters before its own 2-second diagnostic
+deadline, and probes run every second, so probes made while searches wait can show
+`waiting > 0`. The witness is the first machine-B body with daemon origin, a
+saturation ratio of at least 1, `waiting > 0`, `failed` false and the exact
+saturation action, within the 20-second witness bound; the lock is released by its
+40-second ceiling at the latest.
+
+Machine B records one terminal outcome, `witness`, `wrong-telemetry` or
+`no-waiting`, and the coordinator clears on it, so later steps still run.
+`no-waiting` leaves saturation incomplete and records the pool alert as
+unreachable through the public routes in that run; `wrong-telemetry` fails. Every
+blocked search completes, or fails no later than the 10-second saturation
+clearance after `clearedAt`; such a failure is intentional when the search started
+before `clearedAt`. Both machines then show the cleared state with the healthy
+action within that 10-second clearance.
+
+Under the relation lock, a store blocks inside the daemon's publication queue: its
+dedup check runs `searchPromoted` under the 5-second search cap, the store answers
+HTTP 503 after about 5 seconds, and later stores wait their turn. A read whose
+project open finds the publication lock held waits at most 4 seconds
+(`READ_ADMISSION_WAIT_MS`) and answers HTTP 503. Without a mutating request, reads
+open lock-free and run their queries outside the queue, so concurrent
+promoted-layer searches can fill the pool.
 
 The privacy corpus is shared with the PostgreSQL incident-runbook fixture and is
 sent through hook, store, tag, search, utility-statement, and supported CLI
@@ -105,6 +157,14 @@ provisional until the non-certifying smoke is reviewed and the final contract is
 approved. A one-second connection sample is a sampled maximum, not an
 instantaneous peak; structural runtime/cancellation bounds and the unchanged v3
 capacity gate remain separate.
+The connections result records coverage, the number of probe intervals that caught
+a sample, without requiring every interval to be caught. It is incomplete when a
+machine has no sampled active interval, a connection address is unknown, or a pass
+condition cannot be checked. It passes when the sampled increment stays within the
+ceiling, the residual returns to the baseline within 5 seconds, and the structural
+bound holds, and it fails on a proven breach. The sampler stays at one sample per
+second because a faster sampler would add database CPU to the calibration it
+measures.
 Database CPU percentage is the baseline-subtracted database CPU time over each
 probe window at the combined two-machine rate (two probes per 15 seconds), divided
 by the actual elapsed window and recorded database CPU quota.

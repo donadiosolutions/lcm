@@ -765,7 +765,7 @@ export async function executeDeterministicSchedule({
       } else if (entry.op === "search") {
         if (daemonClient) {
           await timedDaemonCall(() => runWithDeadline(remainingOperationMs(), fatalAbort.signal, (options) =>
-            daemonClient.post("/search", { cwd, query: entry.query ?? "deterministic certification record", limit: 5, layers: [], tags: [] }, options)));
+            daemonClient.post("/search", { cwd, query: entry.query ?? "deterministic certification record", limit: 5, layers: entry.layers ?? [], tags: [] }, options)));
         } else commandTiming = await transientCli.run(() => runCli(entrypoint, ["search", "deterministic certification record"], { cwd, env: environment, timeoutMs: Math.max(1, remainingOperationMs()) }));
       } else if (entry.op === "store") {
         if (daemonClient) {
@@ -994,15 +994,6 @@ export async function executeControlledObservabilityPhase({
   const schedule = createObservabilityWorkloadSchedule({
     machine, runId, phase, durationSeconds, includeHooks: phase === "queue-backlog" || phase === "canary",
   });
-  if (phase === "saturation" && machine === "b") {
-    schedule.unshift(...[0, 1, 2].map((index) => ({
-      id: `${runId}-saturation-${machine}-blocking-store-${index}`,
-      machine,
-      op: "store",
-      phase,
-      offsetSeconds: 0,
-    })));
-  }
   let backlogDeferral;
   if (phase === "queue-backlog" && machine === "b") {
     backlogDeferral = (async () => {
@@ -1145,7 +1136,10 @@ export async function executeRecoveryProbePhase({
     delay: wait,
   });
   const appliedAtMs = Date.parse(applied.appliedAt);
-  const maximumOutage = phase === "restart-database" ? contract.thresholds.recovery.restartDatabase.maxOutageSeconds : 60;
+  const maximumOutage = contract.thresholds.recovery.restartDatabase.maxOutageSeconds;
+  // The coordinator reconnects machine A only after its 60-second hold, so partition probing
+  // is anchored to clearedAt: before the clear it is bounded only by the phase allocation.
+  const partitionEndMs = appliedAtMs + contract.timeline.full.partitionPhaseMaxSeconds * 1000;
   const firstSuccess = phase === "restart-database"
     ? contract.thresholds.recovery.restartDatabase.firstSuccessAfterClearedSeconds
     : contract.thresholds.recovery.partition.firstSuccessAfterClearedSeconds;
@@ -1173,7 +1167,10 @@ export async function executeRecoveryProbePhase({
     const clearedPath = join(evidenceDirectory, `${phase}-cleared.json`);
     if (clearedAtMs === undefined && existsSync(clearedPath)) clearedAtMs = Date.parse(JSON.parse(readFileSync(clearedPath, "utf8")).clearedAt);
     if (clearedAtMs !== undefined && record.startedAtMs >= clearedAtMs && healthyProbe(record)) { success = record; break; }
-    const deadline = clearedAtMs === undefined ? appliedAtMs + maximumOutage * 1000 : clearedAtMs + firstSuccess * 1000;
+    const afterClearMs = clearedAtMs === undefined ? undefined : clearedAtMs + firstSuccess * 1000;
+    const deadline = phase === "restart-database"
+      ? afterClearMs ?? appliedAtMs + maximumOutage * 1000
+      : Math.min(afterClearMs ?? partitionEndMs, partitionEndMs);
     if (now() >= deadline) break;
   }
   if (failure) writeFileSync(join(evidenceDirectory, `${phase}-detected.json`), `${JSON.stringify({ machine, id: failure.id, completedAtMs: failure.completedAtMs })}\n`, { mode: 0o600, flag: "wx" });

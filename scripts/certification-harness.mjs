@@ -1360,7 +1360,7 @@ export function finalizeCalibrationEvidence(raw, probes, contract, { stagedPacka
   const perMachineConnections = ["a", "b"].map((machineLabel) => {
     const probeRecords = probes.filter((probe) => probe.machine === machineLabel && String(probe.phase).startsWith("calibration-") && probe.transportFailure !== true && probe.snapshot);
     let coveredIntervals = 0;
-    let complete = true;
+    let measured = true;
     let residualBreach = false;
     const increments = [];
     for (let pair = 1; pair <= definition.pairs; pair += 1) {
@@ -1370,13 +1370,15 @@ export function finalizeCalibrationEvidence(raw, probes, contract, { stagedPacka
         && sample.observedAtMs < pairStart + definition.baselineWindowSeconds * 1000);
       const active = samples.filter((sample) => pairProbes.some((probe) => sample.observedAtMs >= probe.startedAtMs && sample.observedAtMs <= probe.completedAtMs));
       coveredIntervals += pairProbes.filter((probe) => active.some((sample) => sample.observedAtMs >= probe.startedAtMs && sample.observedAtMs <= probe.completedAtMs)).length;
-      if (baseline.length === 0 || active.length === 0 || pairProbes.length === 0) { complete = false; continue; }
+      // R3-10: coverage is recorded, not required. A one-second sampler catches only some
+      // short probe intervals; a pair whose intervals caught no sample adds no increment,
+      // and its residual is still checked.
+      if (baseline.length === 0 || pairProbes.length === 0) { measured = false; continue; }
       const baselineMaximum = Math.max(...baseline.map((sample) => sample.connectionCounts[machineLabel]));
-      const activeMaximum = Math.max(...active.map((sample) => sample.connectionCounts[machineLabel]));
-      increments.push(Math.max(0, activeMaximum - baselineMaximum));
+      if (active.length > 0) increments.push(Math.max(0, Math.max(...active.map((sample) => sample.connectionCounts[machineLabel])) - baselineMaximum));
       const last = Math.max(...pairProbes.map((probe) => probe.completedAtMs));
       const tail = samples.filter((sample) => sample.observedAtMs >= last && sample.observedAtMs <= last + definition.sampledConnectionResidualSeconds * 1000);
-      if (tail.length === 0) complete = false;
+      if (tail.length === 0) measured = false;
       else if (tail.at(-1).connectionCounts[machineLabel] > baselineMaximum) residualBreach = true;
     }
     const sampledIncrement = Math.max(0, ...increments);
@@ -1392,8 +1394,10 @@ export function finalizeCalibrationEvidence(raw, probes, contract, { stagedPacka
     const structuralComplete = Number.isSafeInteger(contract.configuration.poolMax) && contract.configuration.poolMax > 0
       && observedPoolMax !== undefined && singleFlight && /^[0-9a-f]{64}$/u.test(stagedPackageSha256 ?? "");
     const definiteFailure = sampledIncrement > definition.sampledConnectionIncrementCeiling || residualBreach || structuralMaximum > 3;
+    // Incomplete only without any sampled active interval, with unknown addresses, or when a
+    // pass condition (a baseline and a residual tail per pair, the structural bound) is unproven.
     const verdict = definiteFailure ? "fail"
-      : !complete || unknown || coveredIntervals !== probeRecords.length || probeRecords.length === 0 || !structuralComplete ? "incomplete" : "pass";
+      : coveredIntervals === 0 || unknown || !measured || !structuralComplete ? "incomplete" : "pass";
     return { machine: machineLabel, verdict, sampledIncrement, residualBreach, structuralMaximum,
       structural: { configuredPoolMax: observedPoolMax, pinnedPoolMax: contract.configuration.poolMax,
         cancellationAllowance: 1, singleFlight, stagedPackageSha256 },
@@ -1784,14 +1788,20 @@ export function reconstructObservabilitySummary({ evidenceDirectory, contract, c
         expected = [...workload.hooks, ...workload.stores, ...workload.searches].map((entry) => entry.id);
       } else {
         expected = createObservabilityWorkloadSchedule({ machine, runId, phase, durationSeconds: phaseDurations[phase], includeHooks: phase === "queue-backlog" }).map((entry) => entry.id);
-        if (phase === "saturation" && machine === "b") expected.push(...[0, 1, 2].map((index) => `${runId}-saturation-b-blocking-store-${index}`));
       }
       const endMs = phase === "stats-reset" ? Date.parse(fault.appliedAt) + 30_000
         : phase === "canary" ? Date.parse(fault.appliedAt) + contract.timeline.full.canaryPhaseMaxSeconds * 1000
           : Date.parse(fault.clearedAt);
+      // A saturation search blocked by the lock completes after the clear or fails at its
+      // bounded search cap; a failure is intentional when the search started before the clear
+      // and ended within the saturation clearance window after it.
+      const saturationFailureEndMs = Date.parse(fault.clearedAt) + contract.observability.clearanceSeconds.saturation * 1000;
       const selected = samples.filter((sample) => sample.machine === machine).map((sample) => ({
         ...sample,
         ...(phase === "queue-backlog" && sample.outcome !== "success" && Date.parse(sample.wallEndedAt) <= Date.parse(fault.clearedAt)
+          ? { intentionalFailure: true } : {}),
+        ...(phase === "saturation" && sample.op === "search" && sample.outcome !== "success"
+          && Date.parse(sample.wallStartedAt) < Date.parse(fault.clearedAt) && Date.parse(sample.wallEndedAt) <= saturationFailureEndMs
           ? { intentionalFailure: true } : {}),
       }));
       return evaluatePhaseWorkload({
@@ -1801,7 +1811,7 @@ export function reconstructObservabilitySummary({ evidenceDirectory, contract, c
         appliedAtMs: Date.parse(fault.appliedAt),
         clearedAtMs: endMs,
         minimumSearches: phase === "queue-backlog" ? 0 : 2,
-        minimumStores: phase === "queue-backlog" ? 0 : 1,
+        minimumStores: phase === "queue-backlog" || phase === "saturation" ? 0 : 1,
       });
     }) : [];
     const workloadVerdict = perMachineWorkload.some((entry) => entry.verdict === "fail") ? "fail"
@@ -1829,11 +1839,15 @@ export function reconstructObservabilitySummary({ evidenceDirectory, contract, c
           : backlogCatchUp.every((entry) => entry.verdict === "pass" && entry.remaining === 0) ? true : undefined;
     const baseCorrectness = inheritedCorrectness ?? (workloadVerdict === "pass" ? true : workloadVerdict === "fail" ? false : undefined);
     const correctness = clearanceControlBound === false ? false : clearanceControlBound === undefined ? undefined : baseCorrectness;
-    const recovery = evaluated.recovery === false || correctness === false || backlogCatchUpVerdict === false ? false
-      : evaluated.recovery === undefined || correctness === undefined || backlogCatchUpVerdict === undefined ? undefined : true;
+    // Saturation recovery also needs the cleared, healthy state within its 10-second clearance.
+    const probeRecovery = phase === "saturation" && evaluated.recovery === true
+      ? evaluated.clearanceSeconds <= contract.observability.clearanceSeconds.saturation : evaluated.recovery;
+    const recovery = probeRecovery === false || correctness === false || backlogCatchUpVerdict === false ? false
+      : probeRecovery === undefined || correctness === undefined || backlogCatchUpVerdict === undefined ? undefined : true;
     phaseResults[phase] = {
       alert: evaluated.alert,
       detectionSeconds: evaluated.detectionSeconds,
+      ...(evaluated.detectionFormula === undefined ? {} : { detectionFormula: evaluated.detectionFormula }),
       clearanceSeconds: phase === "queue-backlog" ? evaluated.healthyClearanceSeconds : evaluated.clearanceSeconds,
       firstSuccessSeconds: evaluated.firstSuccessSeconds,
       correctness,

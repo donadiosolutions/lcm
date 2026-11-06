@@ -44,13 +44,26 @@ export function createObservabilityWorkloadSchedule({
     || !Number.isSafeInteger(durationSeconds) || durationSeconds <= 0) {
     throw new Error("invalid observability workload schedule");
   }
-  const schedule = createFaultSchedule({ machine, runId, phase, durationSeconds });
+  // The saturation step sends no store: a store takes the daemon's publication queue, and
+  // under the relation lock every later request then queues behind it.
+  const searchesOnly = phase === "saturation";
+  const schedule = createFaultSchedule({ machine, runId, phase, durationSeconds })
+    .filter((entry) => !searchesOnly || entry.op === "search");
   if (["saturation", "timeout", "stats-reset", "permission-loss", "extension-loss"].includes(phase)) {
     schedule.push(
       { id: `${runId}-${phase}-${machine}-overlap-search-0`, machine, op: "search", phase, offsetSeconds: 0 },
       { id: `${runId}-${phase}-${machine}-overlap-search-1`, machine, op: "search", phase, offsetSeconds: 0 },
-      { id: `${runId}-${phase}-${machine}-overlap-store-0`, machine, op: "store", phase, offsetSeconds: 0 },
+      ...(searchesOnly ? [] : [{ id: `${runId}-${phase}-${machine}-overlap-store-0`, machine, op: "store", phase, offsetSeconds: 0 }]),
     );
+  }
+  // Saturation induction on machine B: promoted-layer searches read the locked relation, so
+  // two hold the daemon's two pool connections until their 5-second search statement cap
+  // and the rest wait for a connection. Four start at once (the agent's admission cap) and
+  // two more follow every 5 seconds through the 20-second witness bound.
+  if (phase === "saturation" && machine === "b") {
+    [0, 0, 0, 0, 5, 5, 10, 10, 15, 15].forEach((offsetSeconds, index) => schedule.push({
+      id: `${runId}-saturation-b-induction-search-${index}`, machine, op: "search", phase, offsetSeconds, layers: ["promoted"],
+    }));
   }
   if (includeHooks) {
     for (let offsetSeconds = 1, index = 0; offsetSeconds < durationSeconds; offsetSeconds += 10, index += 1) {

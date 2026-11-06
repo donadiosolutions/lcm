@@ -338,6 +338,34 @@ export function evaluateFencedReset({ baselineEpoch, appliedAtMs, observations }
   return { verdict: pass ? "pass" : "fail", reason: pass ? null : "reset then observed sequence is missing" };
 }
 
+const SUCCESSFUL_STATEMENT_READS = new Set(["reset", "partial", "observed"]);
+
+// Restart identification uses the product's own signal. After a database restart the
+// statements family reports `reset` because the postmaster start time changed, even when
+// pg_stat_statements keeps its stats_reset epoch, so the epoch is not compared here. On one
+// machine: no probe may straddle appliedAt; the first successful statements read that
+// starts at or after appliedAt must be `reset` and the next read `observed`; and any
+// probe that started inside [appliedAt, clearedAt) before the reset read must be a failure.
+// Without such a failure, no outage was observed and detection is measured to the reset read.
+export function evaluateRestartIdentification({ probes, appliedAtMs, clearedAtMs }) {
+  if (probes.some((probe) => probe.startedAtMs < appliedAtMs && probe.completedAtMs >= appliedAtMs)) {
+    return { verdict: "fail", reason: "a probe straddled appliedAt" };
+  }
+  const ordered = probes.filter((probe) => probe.startedAtMs >= appliedAtMs).sort((left, right) => left.startedAtMs - right.startedAtMs);
+  if (ordered.length === 0) return { verdict: "incomplete", reason: "no probe started at or after appliedAt" };
+  const resetIndex = ordered.findIndex((probe) => SUCCESSFUL_STATEMENT_READS.has(probe.snapshot?.telemetry?.statements?.status));
+  if (resetIndex < 0) return { verdict: "fail", reason: "no successful statements read after appliedAt" };
+  const reset = ordered[resetIndex];
+  if (reset.snapshot.telemetry.statements.status !== "reset") return { verdict: "fail", reason: "the first successful statements read was not reset" };
+  const outage = (probe) => probe.transportFailure === true || ["timeout", "unavailable"].includes(probe.snapshot?.classification);
+  const inWindow = ordered.slice(0, resetIndex).filter((probe) => probe.startedAtMs < clearedAtMs);
+  if (inWindow.some((probe) => !outage(probe))) return { verdict: "fail", reason: "an in-window probe before the reset read was not a failure" };
+  const next = ordered.slice(resetIndex + 1).find((probe) => probe.snapshot?.telemetry?.statements);
+  if (next?.snapshot.telemetry.statements.status !== "observed") return { verdict: "fail", reason: "the read after the reset was not observed" };
+  const failure = inWindow[0];
+  return { verdict: "pass", reason: null, outageObserved: failure !== undefined, detection: failure ?? reset };
+}
+
 export function createProbeSchedule({ phase, machine, appliedAtMs, holdMaximumMs, cadenceMs, timeoutMs = 5_000 }) {
   const schedule = [];
   for (let sequence = 0, startAtMs = appliedAtMs; startAtMs < appliedAtMs + holdMaximumMs; sequence += 1, startAtMs += cadenceMs) {
@@ -393,7 +421,7 @@ export function evaluatePhaseProbeEvidence({ phase, probes, fault, baseline, bac
     const matches = matchesByMachine((probe) => evaluateTimeoutShape(probe.snapshot).verdict === "pass");
     if (matches.every(Boolean)) { result.alert = true; result.detectionSeconds = Math.max(...matches.map((match) => (match.completedAtMs - appliedAtMs) / 1000)); }
     else result.alert = afterApply.length > 0 ? false : undefined;
-  } else if (phase === "stats-reset" || phase === "restart-database") {
+  } else if (phase === "stats-reset") {
     const resets = ["a", "b"].map((machine) => {
       const observations = afterApply.filter((probe) => probe.machine === machine && probe.snapshot?.telemetry?.statements)
         .map((probe) => ({ startedAtMs: probe.startedAtMs, completedAtMs: probe.completedAtMs,
@@ -401,13 +429,20 @@ export function evaluatePhaseProbeEvidence({ phase, probes, fault, baseline, bac
       return { observations, result: evaluateFencedReset({ baselineEpoch: baseline?.[machine]?.snapshot?.telemetry?.statements?.statementsStatsReset, appliedAtMs, observations }) };
     });
     const resetPass = resets.every((entry) => entry.result.verdict === "pass");
-    const outages = phase === "restart-database" ? matchesByMachine((probe) => probe.transportFailure === true
-      || ["timeout", "unavailable"].includes(probe.snapshot?.classification)) : [];
-    result.alert = resetPass && (phase !== "restart-database" || outages.every(Boolean))
-      ? true : resets.some((entry) => entry.observations.length > 0) ? false : undefined;
+    result.alert = resetPass ? true : resets.some((entry) => entry.observations.length > 0) ? false : undefined;
     const first = afterApply.filter((probe) => probe.snapshot?.telemetry?.statements?.status === "reset");
-    const detection = phase === "restart-database" ? outages.filter(Boolean) : first;
-    if (detection.length > 0) result.detectionSeconds = Math.max(...detection.map((probe) => (probe.completedAtMs - appliedAtMs) / 1000));
+    if (first.length > 0) result.detectionSeconds = Math.max(...first.map((probe) => (probe.completedAtMs - appliedAtMs) / 1000));
+  } else if (phase === "restart-database") {
+    const restarts = ["a", "b"].map((machine) => evaluateRestartIdentification({
+      probes: probes.filter((probe) => probe.machine === machine), appliedAtMs, clearedAtMs,
+    }));
+    result.alert = restarts.every((entry) => entry.verdict === "pass") ? true
+      : restarts.some((entry) => entry.verdict === "fail") ? false : undefined;
+    if (result.alert) {
+      result.detectionSeconds = Math.max(...restarts.map((entry) => (entry.detection.completedAtMs - appliedAtMs) / 1000));
+      const unobserved = ["a", "b"].filter((_machine, index) => !restarts[index].outageObserved);
+      result.detectionFormula = `appliedAt to the first in-window failure, or to the reset read where no outage was observed (no outage observed: ${unobserved.length === 0 ? "none" : unobserved.join(", ")})`;
+    }
   } else if (phase === "permission-loss") {
     const matches = matchesByMachine((probe) => probe.snapshot?.classification === baseline?.[probe.machine]?.snapshot?.classification
       && probe.snapshot?.telemetry?.statements?.status === "permission-denied"
@@ -496,10 +531,12 @@ export function evaluateConnectionEvidence({
   activeIntervals,
   sampledActiveIntervals,
 }) {
-  const complete = Number.isFinite(baseline) && Array.isArray(probeSamples) && probeSamples.length > 0
-    && Array.isArray(tailSamples) && tailSamples.length > 0
-    && activeIntervals > 0 && sampledActiveIntervals === activeIntervals;
-  if (!complete) return { verdict: "incomplete", zeroIncrementNotZeroCost: true };
+  // R3-10: coverage is recorded, not required. A one-second sampler catches only some
+  // short probe intervals, so one sampled active interval is enough to measure.
+  const coverage = { activeIntervals, sampledActiveIntervals };
+  const measured = Number.isFinite(baseline) && Array.isArray(probeSamples) && probeSamples.length > 0
+    && Array.isArray(tailSamples) && tailSamples.length > 0 && sampledActiveIntervals > 0;
+  if (!measured) return { verdict: "incomplete", zeroIncrementNotZeroCost: true, ...coverage };
   const sampledMaximum = Math.max(...probeSamples);
   const sampledIncrement = Math.max(0, sampledMaximum - baseline);
   const residual = tailSamples.at(-1) - baseline;
@@ -511,6 +548,7 @@ export function evaluateConnectionEvidence({
     residual,
     structuralMaximum,
     zeroIncrementNotZeroCost: sampledIncrement === 0,
+    ...coverage,
   };
 }
 
@@ -657,7 +695,7 @@ export function buildObservabilitySummary({ contractSha256, runId, contract, pro
     const result = phaseResults[step];
     items.push(summaryItem(`alert.${step}`, booleanVerdict(result?.alert)));
     const detectionMaximum = contract?.observability?.probe?.detectionMaxSeconds ?? 10;
-    items.push(summaryItem(`detection.${step}`, boundedVerdict(result?.detectionSeconds, detectionMaximum), Number.isFinite(result?.detectionSeconds) ? result.detectionSeconds : 0, detectionMaximum, "appliedAt to qualifying response completion"));
+    items.push(summaryItem(`detection.${step}`, boundedVerdict(result?.detectionSeconds, detectionMaximum), Number.isFinite(result?.detectionSeconds) ? result.detectionSeconds : 0, detectionMaximum, result?.detectionFormula ?? "appliedAt to qualifying response completion"));
     const clearanceKey = step === "partition-a" ? "partition" : step === "restart-database" ? "restart"
       : step === "permission-loss" ? "permissionLoss" : step === "extension-loss" ? "extensionLoss"
         : step === "stats-reset" ? "statsReset" : step === "queue-backlog" ? "backlogHealthy" : step;

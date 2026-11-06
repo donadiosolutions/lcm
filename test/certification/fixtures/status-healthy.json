@@ -1,0 +1,540 @@
+{
+  "daemon": {
+    "version": "2.0.0-alpha.0",
+    "uptime": 2187,
+    "port": 3737
+  },
+  "backendDiagnostics": {
+    "backend": "postgresql",
+    "classification": "healthy",
+    "publication": "ready",
+    "tls": "ready",
+    "schema": "ready",
+    "extensions": "ready",
+    "search": "ready",
+    "pool": {
+      "origin": "daemon",
+      "status": "ready",
+      "configuredMax": 2,
+      "total": 0,
+      "idle": 0,
+      "waiting": 0,
+      "failed": false
+    },
+    "project": {
+      "scope": "selected",
+      "status": "ready",
+      "projectId": "01a1afca-f1a1-7edb-b93b-b2cf6195dc30",
+      "localProjectId": "35cc0093eb84fac9b2c2950a86d1cb49edc9d5c307091b82bf05b894a851ab39"
+    },
+    "identity": {
+      "status": "ready",
+      "machineId": "01a1afca-ed17-7fc8-9151-34f7c0f1fba3"
+    },
+    "outbox": {
+      "status": "ready",
+      "captured": 14,
+      "unprocessed": 0,
+      "errors": 0,
+      "deliveryPending": 0,
+      "deliveryClaimed": 0,
+      "deliveryRetry": 0,
+      "deliveryReplicated": 0,
+      "deliveryAcknowledged": 14,
+      "deliveryAwaitingRemotePrune": 0,
+      "deliveryQuarantined": 0
+    },
+    "telemetry": {
+      "pool": {
+        "status": "observed",
+        "observedAt": 1793953033907,
+        "health": "healthy",
+        "omitted": [],
+        "remediation": "No action required.",
+        "saturationRatio": 0
+      },
+      "migration": {
+        "status": "observed",
+        "observedAt": 1793953033935,
+        "health": "healthy",
+        "omitted": [],
+        "historyStatus": "current",
+        "expectedCount": 9,
+        "remediation": "No action required.",
+        "appliedCount": 9
+      },
+      "extensions": {
+        "status": "observed",
+        "observedAt": 1793953033933,
+        "health": "healthy",
+        "omitted": [],
+        "entries": [
+          {
+            "name": "pg_stat_statements",
+            "status": "current",
+            "installedVersion": "1.12",
+            "defaultVersion": "1.12"
+          },
+          {
+            "name": "pg_trgm",
+            "status": "current",
+            "installedVersion": "1.6",
+            "defaultVersion": "1.6"
+          },
+          {
+            "name": "pgcrypto",
+            "status": "current",
+            "installedVersion": "1.4",
+            "defaultVersion": "1.4"
+          },
+          {
+            "name": "unaccent",
+            "status": "current",
+            "installedVersion": "1.1",
+            "defaultVersion": "1.1"
+          }
+        ],
+        "remediation": "No action required."
+      },
+      "queue": {
+        "status": "observed",
+        "observedAt": 1793953034116,
+        "health": "healthy",
+        "omitted": [
+          {
+            "field": "outboxOldestPendingAgeSeconds",
+            "reason": "no-entry"
+          },
+          {
+            "field": "replayLagSeconds",
+            "reason": "no-entry"
+          }
+        ],
+        "inboxClaimed": 0,
+        "inboxQuarantined": 0,
+        "remediation": "No action required."
+      },
+      "statements": {
+        "status": "observed",
+        "observedAt": 1793953034128,
+        "scope": "aggregate",
+        "statementsDeallocTotal": 0,
+        "statementsStatsReset": "2026-11-06T07:37:35.383308Z",
+        "blockSize": 8192,
+        "operations": [
+          {
+            "operation": "conversations.getConversationBySessionId",
+            "values": {},
+            "omitted": {
+              "queryCallsTotal": "no-entry",
+              "queryRowsTotal": "no-entry",
+              "queryExecTimeTotalMs": "no-entry",
+              "queryExecTimeMinMs": "no-entry",
+              "queryExecTimeMaxMs": "no-entry",
+              "queryExecTimeMeanMs": "no-entry",
+              "queryExecTimeStddevMs": "no-entry",
+              "queryPlanTimeTotalMs": "no-entry",
+              "querySharedBlksHitTotal": "no-entry",
+              "querySharedBlksReadTotal": "no-entry",
+              "querySharedBlksDirtiedTotal": "no-entry",
+              "querySharedBlksWrittenTotal": "no-entry",
+              "queryLocalBlksHitTotal": "no-entry",
+              "queryLocalBlksReadTotal": "no-entry",
+              "queryLocalBlksDirtiedTotal": "no-entry",
+              "queryLocalBlksWrittenTotal": "no-entry",
+              "queryTempBlksReadTotal": "no-entry",
+              "queryTempBlksWrittenTotal": "no-entry",
+              "querySharedBlkReadTimeMs": "no-entry",
+              "querySharedBlkWriteTimeMs": "no-entry",
+              "queryWalRecordsTotal": "no-entry",
+              "queryWalBytesTotal": "no-entry"
+            }
+          },
+          {
+            "operation": "conversations.lockConversationForAppend",
+            "values": {},
+            "omitted": {
+              "queryCallsTotal": "no-entry",
+              "queryRowsTotal": "no-entry",
+              "queryExecTimeTotalMs": "no-entry",
+              "queryExecTimeMinMs": "no-entry",
+              "queryExecTimeMaxMs": "no-entry",
+              "queryExecTimeMeanMs": "no-entry",
+              "queryExecTimeStddevMs": "no-entry",
+              "queryPlanTimeTotalMs": "no-entry",
+              "querySharedBlksHitTotal": "no-entry",
+              "querySharedBlksReadTotal": "no-entry",
+              "querySharedBlksDirtiedTotal": "no-entry",
+              "querySharedBlksWrittenTotal": "no-entry",
+              "queryLocalBlksHitTotal": "no-entry",
+              "queryLocalBlksReadTotal": "no-entry",
+              "queryLocalBlksDirtiedTotal": "no-entry",
+              "queryLocalBlksWrittenTotal": "no-entry",
+              "queryTempBlksReadTotal": "no-entry",
+              "queryTempBlksWrittenTotal": "no-entry",
+              "querySharedBlkReadTimeMs": "no-entry",
+              "querySharedBlkWriteTimeMs": "no-entry",
+              "queryWalRecordsTotal": "no-entry",
+              "queryWalBytesTotal": "no-entry"
+            }
+          },
+          {
+            "operation": "conversations.getMaxSeqForAppend",
+            "values": {},
+            "omitted": {
+              "queryCallsTotal": "no-entry",
+              "queryRowsTotal": "no-entry",
+              "queryExecTimeTotalMs": "no-entry",
+              "queryExecTimeMinMs": "no-entry",
+              "queryExecTimeMaxMs": "no-entry",
+              "queryExecTimeMeanMs": "no-entry",
+              "queryExecTimeStddevMs": "no-entry",
+              "queryPlanTimeTotalMs": "no-entry",
+              "querySharedBlksHitTotal": "no-entry",
+              "querySharedBlksReadTotal": "no-entry",
+              "querySharedBlksDirtiedTotal": "no-entry",
+              "querySharedBlksWrittenTotal": "no-entry",
+              "queryLocalBlksHitTotal": "no-entry",
+              "queryLocalBlksReadTotal": "no-entry",
+              "queryLocalBlksDirtiedTotal": "no-entry",
+              "queryLocalBlksWrittenTotal": "no-entry",
+              "queryTempBlksReadTotal": "no-entry",
+              "queryTempBlksWrittenTotal": "no-entry",
+              "querySharedBlkReadTimeMs": "no-entry",
+              "querySharedBlkWriteTimeMs": "no-entry",
+              "queryWalRecordsTotal": "no-entry",
+              "queryWalBytesTotal": "no-entry"
+            }
+          },
+          {
+            "operation": "conversations.getMaxSeq",
+            "values": {},
+            "omitted": {
+              "queryCallsTotal": "no-entry",
+              "queryRowsTotal": "no-entry",
+              "queryExecTimeTotalMs": "no-entry",
+              "queryExecTimeMinMs": "no-entry",
+              "queryExecTimeMaxMs": "no-entry",
+              "queryExecTimeMeanMs": "no-entry",
+              "queryExecTimeStddevMs": "no-entry",
+              "queryPlanTimeTotalMs": "no-entry",
+              "querySharedBlksHitTotal": "no-entry",
+              "querySharedBlksReadTotal": "no-entry",
+              "querySharedBlksDirtiedTotal": "no-entry",
+              "querySharedBlksWrittenTotal": "no-entry",
+              "queryLocalBlksHitTotal": "no-entry",
+              "queryLocalBlksReadTotal": "no-entry",
+              "queryLocalBlksDirtiedTotal": "no-entry",
+              "queryLocalBlksWrittenTotal": "no-entry",
+              "queryTempBlksReadTotal": "no-entry",
+              "queryTempBlksWrittenTotal": "no-entry",
+              "querySharedBlkReadTimeMs": "no-entry",
+              "querySharedBlkWriteTimeMs": "no-entry",
+              "queryWalRecordsTotal": "no-entry",
+              "queryWalBytesTotal": "no-entry"
+            }
+          },
+          {
+            "operation": "conversations.getMessages",
+            "values": {},
+            "omitted": {
+              "queryCallsTotal": "no-entry",
+              "queryRowsTotal": "no-entry",
+              "queryExecTimeTotalMs": "no-entry",
+              "queryExecTimeMinMs": "no-entry",
+              "queryExecTimeMaxMs": "no-entry",
+              "queryExecTimeMeanMs": "no-entry",
+              "queryExecTimeStddevMs": "no-entry",
+              "queryPlanTimeTotalMs": "no-entry",
+              "querySharedBlksHitTotal": "no-entry",
+              "querySharedBlksReadTotal": "no-entry",
+              "querySharedBlksDirtiedTotal": "no-entry",
+              "querySharedBlksWrittenTotal": "no-entry",
+              "queryLocalBlksHitTotal": "no-entry",
+              "queryLocalBlksReadTotal": "no-entry",
+              "queryLocalBlksDirtiedTotal": "no-entry",
+              "queryLocalBlksWrittenTotal": "no-entry",
+              "queryTempBlksReadTotal": "no-entry",
+              "queryTempBlksWrittenTotal": "no-entry",
+              "querySharedBlkReadTimeMs": "no-entry",
+              "querySharedBlkWriteTimeMs": "no-entry",
+              "queryWalRecordsTotal": "no-entry",
+              "queryWalBytesTotal": "no-entry"
+            }
+          },
+          {
+            "operation": "conversations.getLastMessage",
+            "values": {},
+            "omitted": {
+              "queryCallsTotal": "no-entry",
+              "queryRowsTotal": "no-entry",
+              "queryExecTimeTotalMs": "no-entry",
+              "queryExecTimeMinMs": "no-entry",
+              "queryExecTimeMaxMs": "no-entry",
+              "queryExecTimeMeanMs": "no-entry",
+              "queryExecTimeStddevMs": "no-entry",
+              "queryPlanTimeTotalMs": "no-entry",
+              "querySharedBlksHitTotal": "no-entry",
+              "querySharedBlksReadTotal": "no-entry",
+              "querySharedBlksDirtiedTotal": "no-entry",
+              "querySharedBlksWrittenTotal": "no-entry",
+              "queryLocalBlksHitTotal": "no-entry",
+              "queryLocalBlksReadTotal": "no-entry",
+              "queryLocalBlksDirtiedTotal": "no-entry",
+              "queryLocalBlksWrittenTotal": "no-entry",
+              "queryTempBlksReadTotal": "no-entry",
+              "queryTempBlksWrittenTotal": "no-entry",
+              "querySharedBlkReadTimeMs": "no-entry",
+              "querySharedBlkWriteTimeMs": "no-entry",
+              "queryWalRecordsTotal": "no-entry",
+              "queryWalBytesTotal": "no-entry"
+            }
+          },
+          {
+            "operation": "conversations.getMessageCount",
+            "values": {},
+            "omitted": {
+              "queryCallsTotal": "no-entry",
+              "queryRowsTotal": "no-entry",
+              "queryExecTimeTotalMs": "no-entry",
+              "queryExecTimeMinMs": "no-entry",
+              "queryExecTimeMaxMs": "no-entry",
+              "queryExecTimeMeanMs": "no-entry",
+              "queryExecTimeStddevMs": "no-entry",
+              "queryPlanTimeTotalMs": "no-entry",
+              "querySharedBlksHitTotal": "no-entry",
+              "querySharedBlksReadTotal": "no-entry",
+              "querySharedBlksDirtiedTotal": "no-entry",
+              "querySharedBlksWrittenTotal": "no-entry",
+              "queryLocalBlksHitTotal": "no-entry",
+              "queryLocalBlksReadTotal": "no-entry",
+              "queryLocalBlksDirtiedTotal": "no-entry",
+              "queryLocalBlksWrittenTotal": "no-entry",
+              "queryTempBlksReadTotal": "no-entry",
+              "queryTempBlksWrittenTotal": "no-entry",
+              "querySharedBlkReadTimeMs": "no-entry",
+              "querySharedBlkWriteTimeMs": "no-entry",
+              "queryWalRecordsTotal": "no-entry",
+              "queryWalBytesTotal": "no-entry"
+            }
+          },
+          {
+            "operation": "conversations.markConversationBootstrapped",
+            "values": {},
+            "omitted": {
+              "queryCallsTotal": "no-entry",
+              "queryRowsTotal": "no-entry",
+              "queryExecTimeTotalMs": "no-entry",
+              "queryExecTimeMinMs": "no-entry",
+              "queryExecTimeMaxMs": "no-entry",
+              "queryExecTimeMeanMs": "no-entry",
+              "queryExecTimeStddevMs": "no-entry",
+              "queryPlanTimeTotalMs": "no-entry",
+              "querySharedBlksHitTotal": "no-entry",
+              "querySharedBlksReadTotal": "no-entry",
+              "querySharedBlksDirtiedTotal": "no-entry",
+              "querySharedBlksWrittenTotal": "no-entry",
+              "queryLocalBlksHitTotal": "no-entry",
+              "queryLocalBlksReadTotal": "no-entry",
+              "queryLocalBlksDirtiedTotal": "no-entry",
+              "queryLocalBlksWrittenTotal": "no-entry",
+              "queryTempBlksReadTotal": "no-entry",
+              "queryTempBlksWrittenTotal": "no-entry",
+              "querySharedBlkReadTimeMs": "no-entry",
+              "querySharedBlkWriteTimeMs": "no-entry",
+              "queryWalRecordsTotal": "no-entry",
+              "queryWalBytesTotal": "no-entry"
+            }
+          },
+          {
+            "operation": "conversations.listConversations",
+            "values": {
+              "queryCallsTotal": 2,
+              "queryRowsTotal": 0,
+              "querySharedBlksHitTotal": 16,
+              "querySharedBlksReadTotal": 0,
+              "querySharedBlksDirtiedTotal": 0,
+              "querySharedBlksWrittenTotal": 0,
+              "queryLocalBlksHitTotal": 0,
+              "queryLocalBlksReadTotal": 0,
+              "queryLocalBlksDirtiedTotal": 0,
+              "queryLocalBlksWrittenTotal": 0,
+              "queryTempBlksReadTotal": 0,
+              "queryTempBlksWrittenTotal": 0,
+              "queryWalRecordsTotal": 0,
+              "queryWalBytesTotal": 0,
+              "queryExecTimeTotalMs": 0.030509,
+              "queryExecTimeMeanMs": 0.0152545,
+              "queryExecTimeStddevMs": 0.00005649999999999969,
+              "queryExecTimeMinMs": 0.015198,
+              "queryExecTimeMaxMs": 0.015311
+            },
+            "omitted": {
+              "queryPlanTimeTotalMs": "disabled-setting",
+              "querySharedBlkReadTimeMs": "disabled-setting",
+              "querySharedBlkWriteTimeMs": "disabled-setting"
+            }
+          },
+          {
+            "operation": "summaries.getSummary",
+            "values": {},
+            "omitted": {
+              "queryCallsTotal": "no-entry",
+              "queryRowsTotal": "no-entry",
+              "queryExecTimeTotalMs": "no-entry",
+              "queryExecTimeMinMs": "no-entry",
+              "queryExecTimeMaxMs": "no-entry",
+              "queryExecTimeMeanMs": "no-entry",
+              "queryExecTimeStddevMs": "no-entry",
+              "queryPlanTimeTotalMs": "no-entry",
+              "querySharedBlksHitTotal": "no-entry",
+              "querySharedBlksReadTotal": "no-entry",
+              "querySharedBlksDirtiedTotal": "no-entry",
+              "querySharedBlksWrittenTotal": "no-entry",
+              "queryLocalBlksHitTotal": "no-entry",
+              "queryLocalBlksReadTotal": "no-entry",
+              "queryLocalBlksDirtiedTotal": "no-entry",
+              "queryLocalBlksWrittenTotal": "no-entry",
+              "queryTempBlksReadTotal": "no-entry",
+              "queryTempBlksWrittenTotal": "no-entry",
+              "querySharedBlkReadTimeMs": "no-entry",
+              "querySharedBlkWriteTimeMs": "no-entry",
+              "queryWalRecordsTotal": "no-entry",
+              "queryWalBytesTotal": "no-entry"
+            }
+          },
+          {
+            "operation": "context.getContextItems",
+            "values": {},
+            "omitted": {
+              "queryCallsTotal": "no-entry",
+              "queryRowsTotal": "no-entry",
+              "queryExecTimeTotalMs": "no-entry",
+              "queryExecTimeMinMs": "no-entry",
+              "queryExecTimeMaxMs": "no-entry",
+              "queryExecTimeMeanMs": "no-entry",
+              "queryExecTimeStddevMs": "no-entry",
+              "queryPlanTimeTotalMs": "no-entry",
+              "querySharedBlksHitTotal": "no-entry",
+              "querySharedBlksReadTotal": "no-entry",
+              "querySharedBlksDirtiedTotal": "no-entry",
+              "querySharedBlksWrittenTotal": "no-entry",
+              "queryLocalBlksHitTotal": "no-entry",
+              "queryLocalBlksReadTotal": "no-entry",
+              "queryLocalBlksDirtiedTotal": "no-entry",
+              "queryLocalBlksWrittenTotal": "no-entry",
+              "queryTempBlksReadTotal": "no-entry",
+              "queryTempBlksWrittenTotal": "no-entry",
+              "querySharedBlkReadTimeMs": "no-entry",
+              "querySharedBlkWriteTimeMs": "no-entry",
+              "queryWalRecordsTotal": "no-entry",
+              "queryWalBytesTotal": "no-entry"
+            }
+          },
+          {
+            "operation": "context.getContextTokenCount",
+            "values": {},
+            "omitted": {
+              "queryCallsTotal": "no-entry",
+              "queryRowsTotal": "no-entry",
+              "queryExecTimeTotalMs": "no-entry",
+              "queryExecTimeMinMs": "no-entry",
+              "queryExecTimeMaxMs": "no-entry",
+              "queryExecTimeMeanMs": "no-entry",
+              "queryExecTimeStddevMs": "no-entry",
+              "queryPlanTimeTotalMs": "no-entry",
+              "querySharedBlksHitTotal": "no-entry",
+              "querySharedBlksReadTotal": "no-entry",
+              "querySharedBlksDirtiedTotal": "no-entry",
+              "querySharedBlksWrittenTotal": "no-entry",
+              "queryLocalBlksHitTotal": "no-entry",
+              "queryLocalBlksReadTotal": "no-entry",
+              "queryLocalBlksDirtiedTotal": "no-entry",
+              "queryLocalBlksWrittenTotal": "no-entry",
+              "queryTempBlksReadTotal": "no-entry",
+              "queryTempBlksWrittenTotal": "no-entry",
+              "querySharedBlkReadTimeMs": "no-entry",
+              "querySharedBlkWriteTimeMs": "no-entry",
+              "queryWalRecordsTotal": "no-entry",
+              "queryWalBytesTotal": "no-entry"
+            }
+          },
+          {
+            "operation": "promoted-memory.getById",
+            "values": {},
+            "omitted": {
+              "queryCallsTotal": "no-entry",
+              "queryRowsTotal": "no-entry",
+              "queryExecTimeTotalMs": "no-entry",
+              "queryExecTimeMinMs": "no-entry",
+              "queryExecTimeMaxMs": "no-entry",
+              "queryExecTimeMeanMs": "no-entry",
+              "queryExecTimeStddevMs": "no-entry",
+              "queryPlanTimeTotalMs": "no-entry",
+              "querySharedBlksHitTotal": "no-entry",
+              "querySharedBlksReadTotal": "no-entry",
+              "querySharedBlksDirtiedTotal": "no-entry",
+              "querySharedBlksWrittenTotal": "no-entry",
+              "queryLocalBlksHitTotal": "no-entry",
+              "queryLocalBlksReadTotal": "no-entry",
+              "queryLocalBlksDirtiedTotal": "no-entry",
+              "queryLocalBlksWrittenTotal": "no-entry",
+              "queryTempBlksReadTotal": "no-entry",
+              "queryTempBlksWrittenTotal": "no-entry",
+              "querySharedBlkReadTimeMs": "no-entry",
+              "querySharedBlkWriteTimeMs": "no-entry",
+              "queryWalRecordsTotal": "no-entry",
+              "queryWalBytesTotal": "no-entry"
+            }
+          }
+        ]
+      }
+    },
+    "remediation": "No action required.",
+    "metrics": {
+      "projects": 1,
+      "conversations": 0,
+      "compactedConversations": 0,
+      "messages": 0,
+      "summaries": 0,
+      "maxDepth": 0,
+      "rawTokens": 0,
+      "summaryTokens": 0,
+      "ratio": 0,
+      "promotedCount": 61,
+      "redactionCounts": {
+        "builtIn": 0,
+        "global": 0,
+        "project": 0,
+        "total": 0
+      },
+      "recallStats": {
+        "memoriesSurfaced": 2,
+        "memoriesActedUpon": 0,
+        "recallPrecision": 0
+      }
+    }
+  },
+  "passiveEvents": {
+    "halted": false,
+    "haltedReason": null,
+    "haltedMessage": null,
+    "replication": {
+      "enabled": true,
+      "lastPassAt": "2026-11-06T08:15:46.321Z",
+      "passes": 8,
+      "projects": 8,
+      "uploaded": 14,
+      "applied": 14,
+      "acknowledged": 14,
+      "pruned": 14,
+      "retried": 0,
+      "quarantined": 0
+    }
+  },
+  "project": {
+    "messageCount": 0,
+    "summaryCount": 0,
+    "promotedCount": 61
+  }
+}

@@ -207,6 +207,55 @@ describe("observability certification helpers", () => {
     ] }).verdict).toBe("fail");
   });
 
+  describe("restart identification", () => {
+    // Smoke 3: the database stop completed at 08:13:17.553 and the coordinator recorded the
+    // clear at 08:13:19.147. Each machine's probe 0 started inside that window, after the
+    // database was back, and read `reset` with the unchanged stats_reset epoch; probe 1,
+    // after the clear, read `observed`.
+    const appliedAtMs = Date.parse("2026-11-06T08:13:17.553Z");
+    const fault = { appliedAt: "2026-11-06T08:13:17.553Z", clearedAt: "2026-11-06T08:13:19.147Z" };
+    const epoch = "2026-11-06T07:37:35.383308Z";
+    const read = (machine: string, sequence: number, startedAt: string, completedAt: string, classification: string, status?: string) => ({
+      id: `restart-database-${machine}-probe-${sequence}`, machine, phase: "restart-database", sequence,
+      startedAtMs: Date.parse(startedAt), completedAtMs: Date.parse(completedAt),
+      snapshot: { classification, ...(status === undefined ? {} : { telemetry: { statements: { status, statementsStatsReset: epoch } } }) },
+    });
+    const smoke3 = [
+      read("a", 0, "2026-11-06T08:13:18.165Z", "2026-11-06T08:13:18.420Z", "degraded", "reset"),
+      read("a", 1, "2026-11-06T08:13:22.552Z", "2026-11-06T08:13:22.795Z", "healthy", "observed"),
+      read("b", 0, "2026-11-06T08:13:18.067Z", "2026-11-06T08:13:18.341Z", "degraded", "reset"),
+      read("b", 1, "2026-11-06T08:13:22.553Z", "2026-11-06T08:13:22.793Z", "healthy", "observed"),
+    ];
+    const baseline = Object.fromEntries(["a", "b"].map((machine) => [machine, { snapshot: { telemetry: { statements: { status: "observed", statementsStatsReset: epoch } } } }]));
+    const identify = (probes: unknown[]) => evaluatePhaseProbeEvidence({ phase: "restart-database", probes, fault, baseline });
+
+    it("identifies the smoke-3 restart from the reset read although stats_reset did not advance", () => {
+      expect(identify(smoke3)).toMatchObject({
+        alert: true, detectionSeconds: (Date.parse("2026-11-06T08:13:18.420Z") - appliedAtMs) / 1000,
+        detectionFormula: expect.stringContaining("no outage observed: a, b"),
+      });
+    });
+
+    it("measures detection to an in-window failure when a probe observed the outage", () => {
+      const outage = [read("a", 0, "2026-11-06T08:13:17.600Z", "2026-11-06T08:13:17.700Z", "unavailable"), ...smoke3.map((probe) => probe.machine === "a"
+        ? { ...probe, sequence: probe.sequence + 1, id: `restart-database-a-probe-${probe.sequence + 1}` } : probe)];
+      expect(identify(outage)).toMatchObject({
+        alert: true, detectionSeconds: (Date.parse("2026-11-06T08:13:18.341Z") - appliedAtMs) / 1000,
+        detectionFormula: expect.stringContaining("no outage observed: b"),
+      });
+    });
+
+    it.each([
+      ["has no reset read", smoke3.map((probe) => probe.sequence === 0 && probe.machine === "a" ? read("a", 0, "2026-11-06T08:13:18.165Z", "2026-11-06T08:13:18.420Z", "healthy", "observed") : probe)],
+      ["has a probe that straddles appliedAt", [read("a", 9, "2026-11-06T08:13:17.400Z", "2026-11-06T08:13:17.700Z", "healthy", "observed"), ...smoke3]],
+      ["reads observed inside the window before the reset", [read("a", 0, "2026-11-06T08:13:17.700Z", "2026-11-06T08:13:17.900Z", "healthy", "observed"), ...smoke3.map((probe) => probe.machine === "a"
+        ? { ...probe, sequence: probe.sequence + 1, id: `restart-database-a-probe-${probe.sequence + 1}` } : probe)]],
+      ["lacks the observed read after the reset", smoke3.filter((probe) => !(probe.machine === "b" && probe.sequence === 1))],
+    ])("fails when a machine %s", (_label, probes) => {
+      expect(identify(probes)).toMatchObject({ alert: false, detectionSeconds: undefined });
+    });
+  });
+
   it("builds bounded single-flight schedules with a qualifying post-acknowledgment start", () => {
     expect(createProbeSchedule({ phase: "timeout", machine: "a", appliedAtMs: 1_000, holdMaximumMs: 30_000, cadenceMs: 5_000 }))
       .toEqual([
@@ -310,6 +359,9 @@ describe("observability certification helpers", () => {
     expect(evaluateConnectionEvidence({ baseline: 2, probeSamples: [2], tailSamples: [2], sampledIncrementCeiling: 1, structuralMaximum: 3, activeIntervals: 1, sampledActiveIntervals: 1 })).toMatchObject({ verdict: "pass", zeroIncrementNotZeroCost: true });
     expect(evaluateConnectionEvidence({ baseline: 2, probeSamples: [4], tailSamples: [3], sampledIncrementCeiling: 1, structuralMaximum: 4, activeIntervals: 1, sampledActiveIntervals: 1 }).verdict).toBe("fail");
     expect(evaluateConnectionEvidence({ baseline: 2, probeSamples: [], tailSamples: [], sampledIncrementCeiling: 1, structuralMaximum: 3, activeIntervals: 1, sampledActiveIntervals: 0 }).verdict).toBe("incomplete");
+    // Coverage is recorded, not required: two sampled intervals out of 48 still measure.
+    expect(evaluateConnectionEvidence({ baseline: 1, probeSamples: [2, 2], tailSamples: [1], sampledIncrementCeiling: 2, structuralMaximum: 3, activeIntervals: 48, sampledActiveIntervals: 2 }))
+      .toMatchObject({ verdict: "pass", sampledIncrement: 1, activeIntervals: 48, sampledActiveIntervals: 2 });
   });
 
   it("fails extra, dropped and zero-attempt workload identities without vacuous success", () => {

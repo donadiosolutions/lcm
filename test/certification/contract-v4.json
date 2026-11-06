@@ -150,6 +150,15 @@
       "deferralMinimumSeconds": 90,
       "claim": "certifies the aged-queue metric, alert and recovery under controlled delivery scheduling; does not certify natural retry backoff under a partition"
     },
+    "restartIdentification": "Restart identification uses the product's own signal: after a database restart the statements family reports `reset` because the postmaster start time changed, even when `pg_stat_statements` keeps its `stats_reset` epoch. On each machine, no probe may straddle `appliedAt`. The first successful statements read (status `reset`, `partial` or `observed`) that starts at or after `appliedAt` must be `reset`; its epoch is not compared. The next read must be `observed`; the pair is mandatory. Any probe that started inside [`appliedAt`, `clearedAt`) before the reset read must be a failure (a transport failure, or a `timeout` or `unavailable` classification). If none did, the evidence records no outage observed and detection is measured from `appliedAt` to the reset read. The statistics-reset step keeps the epoch-advance rule, and restart clearance and correctness are unchanged.",
+    "saturation": {
+      "induction": "The coordinator holds `LOCK TABLE lcm.promoted_memories IN ACCESS EXCLUSIVE MODE` in one admin transaction. Machine B sends `POST /search` requests with `layers: [\"promoted\"]`, four at once (the agent's admission cap) and two more every 5 seconds through 15 seconds. Each blocked search holds a pool connection until the product's 5-second search statement cap, so with `poolMax` 2 two searches hold both connections and the others wait for one.",
+      "workload": "Both machines send searches only, with no store or other mutating request, because a mutating request takes the daemon's publication queue and every later read then queues behind it.",
+      "witness": "The status probe reads the pool counters before its own 2-second diagnostic deadline, and probes run every second, so probes made while searches wait can show `waiting > 0`. The witness is the first machine-B body with daemon origin, a saturation ratio of at least 1, `waiting > 0`, `failed` false and the exact saturation action, within the 20-second witness bound; the lock is released by its 40-second ceiling at the latest.",
+      "outcome": "Machine B records one terminal outcome, `witness`, `wrong-telemetry` or `no-waiting`, and the coordinator clears on it, so later steps still run. `no-waiting` leaves saturation incomplete and records the pool alert as unreachable through the public routes in that run; `wrong-telemetry` fails.",
+      "recovery": "Every blocked search completes, or fails no later than the 10-second saturation clearance after `clearedAt`; such a failure is intentional when the search started before `clearedAt`. Both machines then show the cleared state with the healthy action within that 10-second clearance.",
+      "admission": "Under the relation lock, a store blocks inside the daemon's publication queue: its dedup check runs `searchPromoted` under the 5-second search cap, the store answers HTTP 503 after about 5 seconds, and later stores wait their turn. A read whose project open finds the publication lock held waits at most 4 seconds (`READ_ADMISSION_WAIT_MS`) and answers HTTP 503. Without a mutating request, reads open lock-free and run their queries outside the queue, so concurrent promoted-layer searches can fill the pool."
+    },
     "cardinality": {
       "families": ["statements", "pool", "migration", "extensions", "queue"],
       "maximumOperations": 64,
@@ -200,7 +209,8 @@
     "workload": {
       "minimumSuccessfulSearchesPerMachine": 2,
       "minimumSuccessfulStoresPerMachine": 1,
-      "identityRule": "expected and actual attempt identities are equal; zero unexpected failures"
+      "identityRule": "expected and actual attempt identities are equal; zero unexpected failures",
+      "saturationRule": "The saturation step sends searches only on both machines, so its minimum successful stores is 0; machine B's promoted-layer induction searches are expected identities, and a search that started before `clearedAt` and failed no later than the saturation clearance after it is an intentional failure."
     },
     "privacy": {
       "prefixMinimumCharacters": 24,

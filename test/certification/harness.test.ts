@@ -673,6 +673,41 @@ describe("certification harness", () => {
     expect(finalizeCalibrationEvidence(raw, probes, contract, { stagedPackageSha256: "a".repeat(64), configuredPoolEvidence: { configuredPoolMax: 2, poolByMachine: { a: { configuredMax: 2 }, b: { configuredMax: 3 } } } }).connections.verdict).toBe("incomplete");
   });
 
+  // Smoke 3: one-second samples fell inside only 2 of machine A's 48 calibration probe
+  // intervals and 3 of machine B's. R3-10 records that coverage instead of requiring it.
+  it("passes sampled connections with smoke-3 coverage when increment, residual and structure hold", () => {
+    const { contract } = loadCertificationContract(new URL("./contract-v4.json", import.meta.url), { requireApproved: false });
+    const definition = contract.observability.calibration;
+    const windowSeconds = definition.baselineWindowSeconds + definition.probeWindowSeconds;
+    const startAtMs = Date.parse("2026-11-06T07:40:52.000Z");
+    const covered: Record<string, string[]> = { a: ["2:3", "4:7"], b: ["1:0", "2:5", "3:11"] };
+    // Probes last 250 ms between whole-second samples; a covered probe spans one sample.
+    const probes = ["a", "b"].flatMap((machine) => Array.from({ length: definition.pairs }, (_, index) => index + 1).flatMap((pair) =>
+      Array.from({ length: definition.probesPerMachinePerWindow }, (_, sequence) => {
+        const windowStartMs = startAtMs + ((pair - 1) * windowSeconds + definition.baselineWindowSeconds) * 1000;
+        const startedAtMs = windowStartMs + sequence * 15_000 + (covered[machine].includes(`${pair}:${sequence}`) ? 900 : machine === "a" ? 300 : 550);
+        return { id: `calibration-${pair}-${machine}-probe-${sequence}`, phase: `calibration-${pair}`, machine, startedAtMs, completedAtMs: startedAtMs + 250, snapshot: { classification: "healthy" } };
+      })));
+    const samples = Array.from({ length: definition.pairs * windowSeconds + 1 }, (_, second) => {
+      const observedAtMs = startAtMs + second * 1000;
+      const busy = (machine: string) => probes.some((probe) => probe.machine === machine && observedAtMs >= probe.startedAtMs && observedAtMs <= probe.completedAtMs);
+      return {
+        second, observedAtMs, cpuUsageUsec: { a: 0, b: 0, database: 0 },
+        statements: { calls: 0, stats_reset: 1, dealloc: 0, xact_commit: 0, xact_rollback: 0 },
+        connectionCounts: { a: busy("a") ? 2 : 1, b: busy("b") ? 2 : 1, unknown: 0 },
+      };
+    });
+    const evidence = finalizeCalibrationEvidence(
+      { startAt: new Date(startAtMs).toISOString(), samples, quotas: { database: { cpus: 1 } }, addressLabels: { a: true, b: true } },
+      probes, contract,
+      { stagedPackageSha256: "a".repeat(64), configuredPoolEvidence: { configuredPoolMax: 2, poolByMachine: { a: { configuredMax: 2 }, b: { configuredMax: 2 } } } },
+    );
+    expect({
+      verdict: evidence.connections.verdict,
+      machines: evidence.connections.machines.map((entry: any) => [entry.machine, entry.verdict, entry.sampledActiveIntervals, entry.activeIntervals, entry.sampledIncrement, entry.residualBreach]),
+    }).toEqual({ verdict: "pass", machines: [["a", "pass", 2, 48, 1, false], ["b", "pass", 3, 48, 1, false]] });
+  });
+
   it("proves the two private homes contain distinct machine identities", () => {
     const root = mkdtempSync(join(tmpdir(), "lcm-cert-identities-"));
     const homes = { a: join(root, "a"), b: join(root, "b") };

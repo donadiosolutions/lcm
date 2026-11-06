@@ -2,7 +2,7 @@ import { describe, expect, it } from "vitest";
 import { createObservabilityWorkloadSchedule } from "./schedule.mjs";
 
 describe("observability workload schedules", () => {
-  it.each(["saturation", "timeout", "stats-reset", "permission-loss", "extension-loss", "canary"])(
+  it.each(["timeout", "stats-reset", "permission-loss", "extension-loss", "canary"])(
     "creates a finite identity-complete %s workload on each machine",
     (phase) => {
       for (const machine of ["a", "b"]) {
@@ -15,6 +15,21 @@ describe("observability workload schedules", () => {
       }
     },
   );
+
+  it("sends only searches in the saturation step, with promoted-layer inductions on machine B", () => {
+    for (const machine of ["a", "b"]) {
+      const schedule = createObservabilityWorkloadSchedule({ machine, runId: "run", phase: "saturation", durationSeconds: 30 });
+      const promoted = schedule.filter((entry) => JSON.stringify(entry.layers) === JSON.stringify(["promoted"]));
+      expect({
+        stores: schedule.filter((entry) => entry.op !== "search").length,
+        plain: schedule.filter((entry) => entry.layers === undefined).length,
+        promotedOffsets: promoted.map((entry) => entry.offsetSeconds).sort((left, right) => left - right),
+        unique: new Set(schedule.map((entry) => entry.id)).size === schedule.length,
+      }).toEqual({
+        stores: 0, plain: 8, promotedOffsets: machine === "b" ? [0, 0, 0, 0, 5, 5, 10, 10, 15, 15] : [], unique: true,
+      });
+    }
+  });
 
   it("adds bounded hook witnesses only for phases that request them", () => {
     const without = createObservabilityWorkloadSchedule({ machine: "b", runId: "run", phase: "queue-backlog", durationSeconds: 30 });
