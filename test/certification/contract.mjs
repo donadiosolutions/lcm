@@ -184,6 +184,9 @@ function assertContract(contract) {
       || calibration.probeCadenceSeconds !== 15 || calibration.probesPerMachinePerWindow !== 12
       || calibration.successfulPathWireStatementCeiling !== 90
       || !Number.isSafeInteger(calibration.successfulPathWireStatementCount) || calibration.successfulPathWireStatementCount <= 0
+      // One extra call in a window adds 1 / 24 per probe; a tolerance of half that or more could hide it.
+      || typeof calibration.successfulPathWireStatementTolerance !== "number" || !(calibration.successfulPathWireStatementTolerance > 0)
+      || calibration.successfulPathWireStatementTolerance >= 0.5 / (calibration.probesPerMachinePerWindow * 2)
       || calibration.idleConnectionValidationAllowancePerAcquiredConnection !== null
       || calibration.idleConnectionValidationAllowanceMode !== "unmeasured-pending-smoke"
       || typeof calibration.databaseCpuPercentDefinition !== "string" || calibration.databaseCpuPercentDefinition.length === 0

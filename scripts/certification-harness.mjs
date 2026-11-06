@@ -1356,12 +1356,17 @@ export function finalizeCalibrationEvidence(raw, probes, contract, { stagedPacka
   const statementRule = {
     staticCount: definition.successfulPathWireStatementCount,
     ceiling: definition.successfulPathWireStatementCeiling,
+    tolerance: definition.successfulPathWireStatementTolerance,
     minimumValidPairs: definition.minimumValidPairs,
   };
-  const statements = evaluateStatementOverhead(evaluateCalibrationPairs(statementPairs, {
-    approvedCeiling: definition.successfulPathWireStatementCeiling,
-    approvedNoiseCeiling: definition.successfulPathWireStatementCeiling,
-  }), statementRule);
+  // The rule reads the raw pairs; the baseline spread is recorded as a diagnostic only.
+  const statements = {
+    ...evaluateStatementOverhead(statementPairs, statementRule),
+    baselineNoiseAllowance: evaluateCalibrationPairs(statementPairs, {
+      approvedCeiling: definition.successfulPathWireStatementCeiling,
+      approvedNoiseCeiling: definition.successfulPathWireStatementCeiling,
+    }).noiseAllowance,
+  };
   const perMachineConnections = ["a", "b"].map((machineLabel) => {
     const probeRecords = probes.filter((probe) => probe.machine === machineLabel && String(probe.phase).startsWith("calibration-") && probe.transportFailure !== true && probe.snapshot);
     let coveredIntervals = 0;
@@ -1886,18 +1891,22 @@ export function reconstructObservabilitySummary({ evidenceDirectory, contract, c
   const retainedReceipts = ['a', 'b'].map((machine) => ndjsonFromFile(join(evidenceDirectory, `machine-${machine}`, "retained-output-privacy.ndjson")));
   const coordinatorPrivacyPath = join(evidenceDirectory, "coordinator-privacy.json");
   const coordinatorPrivacyPersisted = existsSync(coordinatorPrivacyPath);
-  // Coordinator leak surfaces are its run records. setup-evidence.json and database-readiness.json
-  // are private harness bookkeeping that lists role names by design (the #629 setup-closure
-  // witness); they are never published and are not LCM output, so they are hashed for
-  // provenance and not scanned. A scan persisted before this rule is read the same way.
-  const coordinatorBookkeeping = ["setup-evidence.json", "database-readiness.json"];
+  // Coordinator leak surfaces are its run records. setup-evidence.json, database-readiness.json
+  // and setup-session-closure.json are private harness bookkeeping that lists role names by
+  // design (the #629 setup-closure witness); they are never published and are not LCM output,
+  // so they are hashed for provenance and not scanned. A scan persisted before this rule is
+  // read the same way, and a bookkeeping file it did not hash is hashed from disk.
+  const coordinatorBookkeeping = ["setup-evidence.json", "database-readiness.json", "setup-session-closure.json"];
   let coordinatorScans;
   let coordinatorProvenance;
   if (coordinatorPrivacyPersisted) {
     const persisted = jsonFromFile(coordinatorPrivacyPath);
     coordinatorScans = persisted.surfaces.filter((entry) => !coordinatorBookkeeping.includes(entry.name));
-    coordinatorProvenance = persisted.provenance
+    const persistedProvenance = persisted.provenance
       ?? persisted.surfaces.filter((entry) => coordinatorBookkeeping.includes(entry.name)).map(({ name, sha256 }) => ({ name, sha256 }));
+    coordinatorProvenance = [...persistedProvenance, ...coordinatorBookkeeping
+      .filter((name) => !persistedProvenance.some((entry) => entry.name === name) && existsSync(join(evidenceDirectory, name)))
+      .map((name) => ({ name, sha256: createHash("sha256").update(readFileSync(join(evidenceDirectory, name))).digest("hex") }))];
   } else {
     coordinatorScans = [
       "run.json", "faults.json", "calibration-evidence.json", "cleanup.json",
@@ -1972,6 +1981,15 @@ export function reconstructObservabilitySummary({ evidenceDirectory, contract, c
   const calibrationEvidence = existsSync(calibrationPath) ? jsonFromFile(calibrationPath) : undefined;
   const combinedVerdict = (values) => values.includes("fail") ? "fail" : values.includes("incomplete") ? "incomplete" : "pass";
   const machineCalibration = calibrationEvidence?.machine;
+  // The statement rule reads the persisted raw pairs, so a recorded spread, cost or verdict
+  // cannot change it, and evidence finalized under an earlier rule is judged by the selected
+  // contract's rule.
+  const statementOverhead = calibrationEvidence ? evaluateStatementOverhead(calibrationEvidence.statementPairs, {
+    staticCount: contract.observability.calibration.successfulPathWireStatementCount,
+    ceiling: contract.observability.calibration.successfulPathWireStatementCeiling,
+    tolerance: contract.observability.calibration.successfulPathWireStatementTolerance,
+    minimumValidPairs: contract.observability.calibration.minimumValidPairs,
+  }) : undefined;
   const calibration = calibrationEvidence ? {
     machineCpu: {
       verdict: combinedVerdict(machineCalibration.map((entry) => entry.verdict)),
@@ -1985,14 +2003,8 @@ export function reconstructObservabilitySummary({ evidenceDirectory, contract, c
       definition: calibrationEvidence.database.definition,
     },
     statements: {
-      // The rule is applied to the persisted measurement, so evidence finalized under an
-      // earlier rule is judged by the selected contract's rule.
-      verdict: evaluateStatementOverhead(calibrationEvidence.statements, {
-        staticCount: contract.observability.calibration.successfulPathWireStatementCount,
-        ceiling: contract.observability.calibration.successfulPathWireStatementCeiling,
-        minimumValidPairs: contract.observability.calibration.minimumValidPairs,
-      }).verdict,
-      observed: calibrationEvidence.statements.measuredMaximum ?? 0,
+      verdict: statementOverhead.verdict,
+      observed: statementOverhead.measuredMaximum ?? 0,
       ceiling: contract.observability.calibration.successfulPathWireStatementCeiling,
     },
   } : undefined;

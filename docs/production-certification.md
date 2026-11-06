@@ -151,11 +151,12 @@ printing counts as entered, and every CLI witness records its exit code.
 Coordinator leak surfaces are the coordinator's run records: `run.json`,
 `faults.json`, `calibration-evidence.json`, `cleanup.json`,
 `execution-provenance.json`, `phase-control.json` and
-`observability-barriers.json`. `setup-evidence.json` and `database-readiness.json`
-list role names by design, as the setup-closure witness. They are private harness
-bookkeeping that is never published and is not LCM output, so they are hashed for
-provenance and not scanned. The observability summary and the public gate outputs
-are still scanned before they are written.
+`observability-barriers.json`. Its private harness bookkeeping files,
+`setup-evidence.json`, `database-readiness.json` and
+`setup-session-closure.json`, deliberately record role names as the setup-closure
+witness, are never published, and are not LCM output, so they are SHA-256 hashed
+for provenance and not scanned. The observability summary and the public gate
+outputs are scanned before they are written.
 
 Raw telemetry is validated before any public output. The validator requires the five
 closed families, packaged operation and extension catalogs, allowed fields,
@@ -189,13 +190,17 @@ conditional idle-connection validation remains a separate quantity; it is
 unmeasured before the smoke and is not added to the gated 90-statement
 successful-path count. The successful-path statement count is code-derived and
 pinned by the fake-executor readiness test. `overhead.statements-per-snapshot`
-passes when that static count (`successfulPathWireStatementCount`) is at most
-`successfulPathWireStatementCeiling` and every valid pair's measured per-probe
-calls are within the pairs' baseline noise allowance of it,
-`|measured - static count| <= noise allowance`; otherwise it fails. Fewer than
-`minimumValidPairs` valid pairs is incomplete. A measured value is not compared
-with a ceiling equal to the exact count, because baseline noise moves it to either
-side.
+requires that static count (`successfulPathWireStatementCount`) to be at most
+`successfulPathWireStatementCeiling`. A valid pair whose integer baseline call
+count differs from the median baseline count is dropped and recorded, because a
+baseline burst is not probe cost; at least `minimumValidPairs` pairs must remain,
+otherwise the item is incomplete. Every retained pair's signed per-probe cost must
+be within `successfulPathWireStatementTolerance` of the static count; a retained
+pair outside it fails the item, and that failure takes precedence over too few
+pairs. The tolerance is a measurement allowance: one extra call across a window's
+24 probes adds 0.0417 per probe, the largest observed elapsed-time error is about
+0.0019, and 0.01 is under half a call. A change to the window size or probe count
+requires revisiting it.
 
 V4 observability is applicable only to the local lane. A managed v4 run evaluates
 exactly the inherited v3 item set and records observability as not applicable,

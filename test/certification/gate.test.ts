@@ -35,10 +35,11 @@ type RetainedReceipt = { id: string; secretHits: number; canaryHits: number; cat
 // real inventory, scanners and migration receipt writer. `leak` replaces one retained
 // CLI output (migration, identity or doctor) with the given text. `coordinator` sets the
 // setup bookkeeping and barrier-record bytes, and `fresh` writes the coordinator files so that
-// reconstruction scans and persists them instead of reading a persisted scan.
+// reconstruction scans and persists them instead of reading a persisted scan. `legacyScan`
+// persists a scan from before setup-session-closure.json was classified, with that file on disk.
 async function retainedPrivacyEvidence(
   leak?: { machine: "a" | "b"; id: string; text: string },
-  coordinator: { bookkeeping?: string; barriers?: string; fresh?: boolean } = {},
+  coordinator: { bookkeeping?: string; barriers?: string; fresh?: boolean; legacyScan?: boolean } = {},
 ) {
   const root = mkdtempSync(join(tmpdir(), "lcm-cert-v4-retained-privacy-"));
   const contractBytes = readFileSync(new URL("./contract-v4.json", import.meta.url));
@@ -104,16 +105,18 @@ async function retainedPrivacyEvidence(
   ].map(([category, value]) => ({ category, value, sourceClass: "coordinator", scanMode: "all-forms" }));
   writeJson(join(root, "coordinator-inventory-manifest.json"), createInventoryManifest(coordinatorInventory, "coordinator"));
   const coordinatorSurfaces = ["run.json", "faults.json", "calibration-evidence.json", "cleanup.json", "execution-provenance.json",
-    "phase-control.json", "setup-evidence.json", "database-readiness.json", "observability-barriers.json"];
+    "phase-control.json", "setup-evidence.json", "database-readiness.json", "setup-session-closure.json", "observability-barriers.json"];
   const surfaceBytes = (name: string) => Buffer.from(
-    coordinator.bookkeeping !== undefined && ["setup-evidence.json", "database-readiness.json"].includes(name) ? coordinator.bookkeeping
+    coordinator.bookkeeping !== undefined && ["setup-evidence.json", "database-readiness.json", "setup-session-closure.json"].includes(name) ? coordinator.bookkeeping
       : name === "observability-barriers.json" ? coordinator.barriers ?? '[{"step":"canary","verdict":"pass"}]\n'
         : `{"surface":"${name}"}\n`);
   if (coordinator.fresh) {
     writeJson(join(root, "calibration-evidence.json"), { machine: [], database: { verdict: "incomplete" }, statements: { verdict: "incomplete" }, connections: { verdict: "incomplete" } });
     for (const name of coordinatorSurfaces) if (!existsSync(join(root, name))) writeFileSync(join(root, name), surfaceBytes(name));
   } else {
-    writeJson(join(root, "coordinator-privacy.json"), { surfaces: coordinatorSurfaces.map((name) => {
+    if (coordinator.legacyScan) writeFileSync(join(root, "setup-session-closure.json"), surfaceBytes("setup-session-closure.json"));
+    const persistedSurfaces = coordinatorSurfaces.filter((name) => !(coordinator.legacyScan && name === "setup-session-closure.json"));
+    writeJson(join(root, "coordinator-privacy.json"), { surfaces: persistedSurfaces.map((name) => {
       const bytes = surfaceBytes(name);
       return { name, sha256: createHash("sha256").update(bytes).digest("hex"), ...scanSurface(bytes, coordinatorInventory, CANARY_CORPUS) };
     }) });
@@ -234,27 +237,51 @@ describe("v4 observability gate items", () => {
   });
 
   // Smoke 4: setup-evidence.json and database-readiness.json list the transfer role by design
-  // (the setup-closure witness) and failed privacy.secret-leaks with 4 hits. The coordinator
-  // hashes them for provenance and keeps scanning its run records.
+  // (the setup-closure witness) and failed privacy.secret-leaks with 4 hits; setup-session-closure.json
+  // holds the same witness. The coordinator hashes the three for provenance and scans only its run
+  // records, exactly the lists that the v4 DRAFT binds. Smoke 4's persisted scan predates the
+  // third file, so reconstruction hashes it from disk.
   it("hashes the coordinator's setup bookkeeping for provenance and scans only its run records", async () => {
     const bookkeeping = '{"setupRoles":{"transfer":"lcm_cert_transfer"}}\n';
+    const scope = JSON.parse(readFileSync(new URL("./contract-v4.json", import.meta.url), "utf8")).observability.privacy;
     const persisted = await retainedPrivacyEvidence(undefined, { bookkeeping });
+    const legacy = await retainedPrivacyEvidence(undefined, { bookkeeping, legacyScan: true });
     const fresh = await retainedPrivacyEvidence(undefined, { bookkeeping, fresh: true });
     const written = JSON.parse(readFileSync(join(fresh.root, "coordinator-privacy.json"), "utf8"));
     const bookkeepingSha256 = createHash("sha256").update(bookkeeping).digest("hex");
     expect({
+      scope: [scope.coordinatorLeakSurfaces, scope.coordinatorProvenanceOnly],
       persisted: persisted.privacy["privacy.secret-leaks"],
+      legacy: legacy.privacy["privacy.secret-leaks"],
       fresh: fresh.privacy["privacy.secret-leaks"],
-      surfaces: written.surfaces.map((entry: { name: string }) => entry.name).sort(),
+      surfaces: written.surfaces.map((entry: { name: string }) => entry.name),
       provenance: written.provenance,
     }).toEqual({
+      scope: [
+        ["run.json", "faults.json", "calibration-evidence.json", "cleanup.json", "execution-provenance.json", "phase-control.json", "observability-barriers.json"],
+        ["setup-evidence.json", "database-readiness.json", "setup-session-closure.json"],
+      ],
       persisted: { verdict: "pass", observed: 0 },
+      legacy: { verdict: "pass", observed: 0 },
       fresh: { verdict: "pass", observed: 0 },
-      surfaces: ["calibration-evidence.json", "cleanup.json", "execution-provenance.json", "faults.json", "observability-barriers.json", "phase-control.json", "run.json"],
-      provenance: [{ name: "setup-evidence.json", sha256: bookkeepingSha256 }, { name: "database-readiness.json", sha256: bookkeepingSha256 }],
+      surfaces: scope.coordinatorLeakSurfaces,
+      provenance: scope.coordinatorProvenanceOnly.map((name: string) => ({ name, sha256: bookkeepingSha256 })),
     });
     const leaked = await retainedPrivacyEvidence(undefined, { bookkeeping, barriers: '[{"step":"canary","verdict":"pass","note":"lcm_cert_transfer"}]\n', fresh: true });
     expect(leaked.privacy["privacy.secret-leaks"].verdict).toBe("fail");
+  });
+
+  // The summary's only evidence-derived text is the contract digest. Planted as a coordinator
+  // credential, it stops reconstruction before the summary is written.
+  it("still scans the observability summary against the coordinator inventory", async () => {
+    const clean = await retainedPrivacyEvidence();
+    const contractBytes = readFileSync(new URL("./contract-v4.json", import.meta.url));
+    const contractSha256 = createHash("sha256").update(contractBytes).digest("hex");
+    expect(() => reconstructObservabilitySummary({
+      evidenceDirectory: clean.root, contract: JSON.parse(contractBytes.toString("utf8")), contractSha256, runId: "run", faults: [], persist: true,
+      coordinatorInventory: [{ category: "admin-password", value: contractSha256, sourceClass: "coordinator", scanMode: "all-forms" }],
+    })).toThrow("public observability summary contains a coordinator identity or credential");
+    expect(existsSync(join(clean.root, "observability-summary.json"))).toBe(false);
   });
 });
 
@@ -527,6 +554,25 @@ describe("certification raw evidence pipeline", () => {
     expect(result.publicationRefused).toBe(true);
     expect(result.gate.slos.find((slo: { id: string }) => slo.id === "observability-summary-binding")?.verdict).toBe("fail");
     expect(result.diagnostic).toContain("private.json");
+  });
+
+  // Excluding the setup bookkeeping from the coordinator leak surfaces leaves the public gate
+  // outputs scanned against the coordinator inventory: a coordinator role carried into the gate,
+  // here through the recorded execution-host witness, refuses publication.
+  it("still scans the public gate outputs against the coordinator inventory", () => {
+    const publish = (cpuModel: string) => {
+      const fixture = rawFixture({ contractVersion: 4, profile: "smoke", withFaults: true, executionHost: { cpuModel } });
+      for (const machine of ["a", "b"]) {
+        mkdirSync(join(fixture.root, `machine-${machine}`), { recursive: true });
+        writeJson(join(fixture.root, `machine-${machine}`, "secret-inventory-manifest.json"), createInventoryManifest(
+          [{ category: "runtime-role", value: `lcm_runtime_${machine}`, sourceClass: "machine", scanMode: "all-forms" }], machine));
+      }
+      writeJson(join(fixture.root, "coordinator-inventory-manifest.json"), createInventoryManifest(
+        [{ category: "transfer-role", value: "lcm_cert_transfer", sourceClass: "coordinator", scanMode: "all-forms" }], "coordinator"));
+      return () => assemble(fixture);
+    };
+    expect(publish("AMD EPYC 9R14")().paths?.json).toMatch(/observability-certification-gate\.json$/u);
+    expect(publish("lcm_cert_transfer")).toThrow("certification public json contains a private identity, credential, or canary");
   });
 
   it("uses the separate pre-activation empty witness instead of post-activation residual state", () => {

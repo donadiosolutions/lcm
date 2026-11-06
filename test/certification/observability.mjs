@@ -522,19 +522,43 @@ export function evaluateCalibrationPairs(pairs, { approvedCeiling, approvedNoise
 }
 
 // The successful-path statement count is code-derived, and the fake-executor readiness test
-// pins it, so a measured value is not compared with a ceiling that equals that exact count.
-// The item passes when the static count is within the ceiling and every valid pair's measured
-// per-probe calls are within the baseline noise allowance of it; otherwise it fails. Fewer valid
-// pairs than the contract minimum, or no static count, is incomplete.
-export function evaluateStatementOverhead(measurement, { staticCount, ceiling, minimumValidPairs }) {
-  const costs = Array.isArray(measurement?.signedCosts) ? measurement.signedCosts : [];
-  if (!Number.isSafeInteger(staticCount) || !(measurement?.validPairs >= minimumValidPairs)
-    || costs.length !== measurement.validPairs || !Number.isFinite(measurement.noiseAllowance)) {
-    return { ...measurement, verdict: "incomplete", staticCount, ceiling };
-  }
-  const maximumDeviation = Math.max(...costs.map((cost) => Math.abs(cost - staticCount)));
-  const verdict = staticCount <= ceiling && maximumDeviation <= measurement.noiseAllowance ? "pass" : "fail";
-  return { ...measurement, verdict, staticCount, ceiling, maximumDeviation };
+// pins it. Every probe window repeats that exact path, so each pair's measured per-probe cost
+// must be within a declared tolerance of it. A baseline burst is not probe cost: a valid pair
+// whose integer baseline call count differs from the median baseline count is dropped and
+// recorded. The item fails when the static count exceeds the ceiling or a retained pair is
+// outside the tolerance, and is otherwise incomplete with fewer retained pairs than the
+// contract minimum. It reads only raw pairs, so no recorded spread or verdict can change it.
+export function evaluateStatementOverhead(pairs, { staticCount, ceiling, tolerance, minimumValidPairs }) {
+  const all = Array.isArray(pairs) ? pairs : [];
+  const valid = all.filter((pair) => pair.rejected === undefined
+    && pair.baselineElapsedMs > 0 && pair.probeElapsedMs > 0 && pair.probeCount > 0
+    && Number.isSafeInteger(pair.baselineDelta) && Number.isSafeInteger(pair.probeDelta));
+  const counts = valid.map((pair) => pair.baselineDelta).sort((left, right) => left - right);
+  const middle = Math.floor(counts.length / 2);
+  const medianBaselineCalls = counts.length === 0 ? null
+    : counts.length % 2 === 1 ? counts[middle] : (counts[middle - 1] + counts[middle]) / 2;
+  const retained = valid.filter((pair) => pair.baselineDelta === medianBaselineCalls);
+  const signedCosts = retained.map((pair) => (
+    pair.probeDelta - pair.baselineDelta * (pair.probeElapsedMs / pair.baselineElapsedMs)
+  ) / pair.probeCount);
+  const deviations = signedCosts.map((cost) => Math.abs(cost - staticCount));
+  const verdict = !Number.isSafeInteger(staticCount) || !(tolerance > 0) ? "incomplete"
+    : staticCount > ceiling || deviations.some((deviation) => deviation > tolerance) ? "fail"
+      : retained.length < minimumValidPairs ? "incomplete" : "pass";
+  return {
+    verdict,
+    validPairs: valid.length,
+    rejectedPairs: all.length - valid.length,
+    medianBaselineCalls,
+    retainedPairs: retained.map((pair) => pair.pair),
+    droppedPairs: valid.filter((pair) => pair.baselineDelta !== medianBaselineCalls).map((pair) => ({ pair: pair.pair, baselineCalls: pair.baselineDelta })),
+    signedCosts,
+    measuredMaximum: signedCosts.length === 0 ? null : Math.max(...signedCosts),
+    maximumDeviation: deviations.length === 0 ? null : Math.max(...deviations),
+    staticCount,
+    ceiling,
+    tolerance,
+  };
 }
 
 export function evaluateConnectionEvidence({
@@ -738,7 +762,7 @@ export function buildObservabilitySummary({ contractSha256, runId, contract, pro
     items.push(summaryItem(id, value?.verdict ?? "incomplete", value?.measuredMaximum ?? 0, value?.ceiling ?? 0));
   }
   items.push(summaryItem("overhead.statements-per-snapshot", calibration?.statements?.verdict ?? "incomplete", calibration?.statements?.observed ?? 0, calibration?.statements?.ceiling ?? 0,
-    "static successful-path count <= ceiling, and |measured per-probe calls - static count| <= baseline noise allowance"));
+    "static successful-path count <= ceiling; pairs with the median integer baseline count are retained (at least the minimum); every retained |per-probe cost - static count| <= tolerance"));
   items.push(summaryItem("overhead.connections", connections?.verdict ?? "incomplete", connections?.observed ?? 0, connections?.ceiling ?? 0));
   const latencies = steady.map((probe) => probe.durationMs).filter(Number.isFinite).sort((left, right) => left - right);
   const p95 = latencies.length === 0 ? 0 : latencies[Math.ceil(latencies.length * 0.95) - 1];

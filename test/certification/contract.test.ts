@@ -77,6 +77,25 @@ describe("certification contract", () => {
     expect(() => loadCertificationContract(path, { requireApproved: false })).toThrow("fault observability smoke timeline");
   });
 
+  // One extra call in a 24-probe window adds 0.0417 per probe, so the tolerance must stay below
+  // half of that (0.0208).
+  it("requires a v4 statement tolerance below half of one extra call per probe", () => {
+    const directory = mkdtempSync(join(tmpdir(), "lcm-cert-contract-v4-tolerance-"));
+    const path = join(directory, "contract-v4.json");
+    const load = (tolerance: unknown) => {
+      const candidate = JSON.parse(readFileSync(v4ContractPath, "utf8"));
+      if (tolerance === undefined) delete candidate.observability.calibration.successfulPathWireStatementTolerance;
+      else candidate.observability.calibration.successfulPathWireStatementTolerance = tolerance;
+      writeFileSync(path, `${JSON.stringify(candidate)}\n`);
+      return () => loadCertificationContract(path, { requireApproved: false });
+    };
+    expect(loadCertificationContract(v4ContractPath, { requireApproved: false })
+      .contract.observability.calibration.successfulPathWireStatementTolerance).toBe(0.01);
+    for (const tolerance of [undefined, 0, "0.01", 0.5 / 24]) {
+      expect(load(tolerance)).toThrow("certification contract v4 calibration is invalid");
+    }
+  });
+
   it("loads a hash-approved non-provisional v4 contract with resized empirical budgets", () => {
     const directory = mkdtempSync(join(tmpdir(), "lcm-cert-contract-v4-final-"));
     const candidate = JSON.parse(readFileSync(v4ContractPath, "utf8"));

@@ -202,11 +202,12 @@
       "sampledConnectionIncrementCeiling": 2,
       "sampledConnectionResidualSeconds": 5,
       "successfulPathWireStatementCount": 90,
+      "successfulPathWireStatementTolerance": 0.01,
       "successfulPathWireStatementCeiling": 90,
       "idleConnectionValidationAllowancePerAcquiredConnection": null,
       "idleConnectionValidationAllowanceMode": "unmeasured-pending-smoke",
       "successfulPathWireStatementDerivation": "45 successful application queries x 2 wire statements for signalled PID preflight plus query. Outside runtime schema readiness: health 4, migration 1, metrics 2, queue 1, statements context 1 + mapping probes 14 + counter read 1 = 24 application queries / 48 wire statements. verifyPostgreSqlRuntimeSchema reaches 21 executor.query sites: server readiness; role policy; extension catalog; pg_stat_statements probe; content collation; extension functions; extension operator; GIN operator class; direct GIN operators; indirect GIN operators; GIN support functions; search configuration; migration history; ownership; schema definitions; identity functions; schema ACL; relation ACL; column ACL; function ACL; effective privileges = 21 application queries / 42 wire statements. Total 90. A conditional idle-connection SELECT 1 is excluded and bounded separately at one per acquired connection. Provisional until smoke confirms pg_stat_statements accounting.",
-      "successfulPathWireStatementRule": "The successful-path statement count is code-derived and pinned by the fake-executor readiness test. `overhead.statements-per-snapshot` passes when that static count (`successfulPathWireStatementCount`) is at most `successfulPathWireStatementCeiling` and every valid pair's measured per-probe calls are within the pairs' baseline noise allowance of it, `|measured - static count| <= noise allowance`; otherwise it fails. Fewer than `minimumValidPairs` valid pairs is incomplete. A measured value is not compared with a ceiling equal to the exact count, because baseline noise moves it to either side."
+      "successfulPathWireStatementRule": "The successful-path statement count is code-derived and pinned by the fake-executor readiness test. `overhead.statements-per-snapshot` requires that static count (`successfulPathWireStatementCount`) to be at most `successfulPathWireStatementCeiling`. A valid pair whose integer baseline call count differs from the median baseline count is dropped and recorded, because a baseline burst is not probe cost; at least `minimumValidPairs` pairs must remain, otherwise the item is incomplete. Every retained pair's signed per-probe cost must be within `successfulPathWireStatementTolerance` of the static count; a retained pair outside it fails the item, and that failure takes precedence over too few pairs. The tolerance is a measurement allowance: one extra call across a window's 24 probes adds 0.0417 per probe, the largest observed elapsed-time error is about 0.0019, and 0.01 is under half a call. A change to the window size or probe count requires revisiting it."
     },
     "workload": {
       "minimumSuccessfulSearchesPerMachine": 2,
@@ -220,7 +221,10 @@
       "rawDirectoryMode": "0700",
       "rawFileMode": "0600",
       "shortValueRule": "values shorter than 8 characters are scanned only as boundary-delimited tokens",
-      "publicEvidence": "counts, verdicts and hashes only"
+      "publicEvidence": "counts, verdicts and hashes only",
+      "coordinatorLeakSurfaces": ["run.json", "faults.json", "calibration-evidence.json", "cleanup.json", "execution-provenance.json", "phase-control.json", "observability-barriers.json"],
+      "coordinatorProvenanceOnly": ["setup-evidence.json", "database-readiness.json", "setup-session-closure.json"],
+      "coordinatorScopeRule": "Coordinator leak surfaces are the coordinator's run records: `run.json`, `faults.json`, `calibration-evidence.json`, `cleanup.json`, `execution-provenance.json`, `phase-control.json` and `observability-barriers.json`. Its private harness bookkeeping files, `setup-evidence.json`, `database-readiness.json` and `setup-session-closure.json`, deliberately record role names as the setup-closure witness, are never published, and are not LCM output, so they are SHA-256 hashed for provenance and not scanned. The observability summary and the public gate outputs are scanned before they are written."
     },
     "actions": {
       "healthy": "No action required.",

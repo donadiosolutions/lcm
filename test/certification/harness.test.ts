@@ -709,10 +709,10 @@ describe("certification harness", () => {
     }).toEqual({ verdict: "pass", machines: [["a", "pass", 2, 48, 1, false], ["b", "pass", 3, 48, 1, false]] });
   });
 
-  // Smoke 4: the code-derived successful path is exactly 90 statements, so baseline noise put
-  // the measured maximum at 90.00016 and "measured <= 90" failed. Here pair 3's baseline holds
-  // 45 extra idle calls (1.875 per probe, smoke 4's noise) and pair 1's probe window one extra.
-  it("passes statement overhead when the static count fits the ceiling and every pair agrees within the noise", () => {
+  // Smokes 3 and 4 recorded the same integer calls: 57 idle calls in three baseline windows, 102
+  // (a 45-call burst) in the third, and 2217 in every probe window (57 idle + 24 probes x 90). The
+  // burst pair is dropped by the median baseline count; the rest cost exactly 90 per probe.
+  it("drops a baseline burst by the median baseline count and holds every retained pair to the tolerance", () => {
     const { contract } = loadCertificationContract(new URL("./contract-v4.json", import.meta.url), { requireApproved: false });
     const definition = contract.observability.calibration;
     const windowSeconds = definition.baselineWindowSeconds + definition.probeWindowSeconds;
@@ -724,8 +724,7 @@ describe("certification harness", () => {
       })));
     // Cumulative runtime-role calls step at each window boundary: the window's idle calls, plus
     // 90 statements for each of the 24 probes in a probe window.
-    const statements = (selected: any, probeWindowIdle: number[], probeRecords = probes) => {
-      const baselineIdle = [30, 30, 75, 30];
+    const statements = (selected: any, baselineIdle: number[], probeWindowIdle: number[], probeRecords = probes) => {
       const boundaries = new Map<number, number>([[0, 0]]);
       let calls = 0;
       for (let pair = 0; pair < definition.pairs; pair += 1) {
@@ -749,30 +748,60 @@ describe("certification harness", () => {
         { stagedPackageSha256: "a".repeat(64), configuredPoolEvidence: { configuredPoolMax: 2, poolByMachine: { a: { configuredMax: 2 }, b: { configuredMax: 2 } } } },
       ).statements;
     };
-    const smoke4 = statements(contract, [31, 30, 30, 30]);
+    const lawful = statements(contract, [57, 57, 102, 57], [57, 57, 57, 57]);
     const aboveCeiling = structuredClone(contract);
     aboveCeiling.observability.calibration.successfulPathWireStatementCount = 91;
     expect({
-      smoke4: [smoke4.verdict, smoke4.measuredMaximum > 90, smoke4.maximumDeviation, smoke4.noiseAllowance],
-      outsideNoise: statements(contract, [120, 30, 30, 30]).verdict,
-      aboveCeiling: statements(aboveCeiling, [31, 30, 30, 30]).verdict,
-      twoPairs: statements(contract, [31, 30, 30, 30], probes.filter((probe) => ["calibration-1", "calibration-2"].includes(probe.phase))).verdict,
-    }).toEqual({ smoke4: ["pass", true, 1.875, 1.875], outsideNoise: "fail", aboveCeiling: "fail", twoPairs: "incomplete" });
+      lawful: [lawful.verdict, lawful.medianBaselineCalls, lawful.retainedPairs, lawful.droppedPairs,
+        lawful.measuredMaximum, lawful.maximumDeviation, lawful.baselineNoiseAllowance],
+      oneExtraCall: statements(contract, [57, 57, 102, 57], [58, 57, 57, 57]).verdict,
+      twoRetained: statements(contract, [30, 57, 57, 102], [57, 57, 57, 57]).verdict,
+      twoValid: statements(contract, [57, 57, 102, 57], [57, 57, 57, 57], probes.filter((probe) => ["calibration-1", "calibration-2"].includes(probe.phase))).verdict,
+      aboveCeiling: statements(aboveCeiling, [57, 57, 102, 57], [57, 57, 57, 57]).verdict,
+    }).toEqual({
+      lawful: ["pass", 57, [0, 1, 3], [{ pair: 2, baselineCalls: 102 }], 90, 0, 1.875],
+      oneExtraCall: "fail", twoRetained: "incomplete", twoValid: "incomplete", aboveCeiling: "fail",
+    });
   });
 
-  // Smoke 4's calibration evidence was finalized under the old rule and persisted "fail";
-  // reconstruction applies the selected contract's rule to the persisted measurement.
-  it("judges a persisted statement measurement by the selected contract's rule", () => {
+  // Smokes 3 and 4 persisted their raw pairs with an aggregate judged by an earlier rule (smoke 3
+  // "pass", smoke 4 "fail"). Reconstruction judges only the raw pairs by the selected contract's
+  // rule, so neither a recorded verdict nor a recorded noise allowance changes the item.
+  it("judges persisted raw statement pairs by the selected contract's rule", () => {
     const loaded = loadCertificationContract(new URL("./contract-v4.json", import.meta.url), { requireApproved: false });
-    const smoke4 = {
-      verdict: "fail", validPairs: 4, rejectedPairs: 0, measuredMaximum: 90.00015832541708, noiseAllowance: 1.8752527777325336,
-      signedCosts: [90.00015832541708, 89.99972291666667, 88.12490554768453, 89.9980736218132],
+    const raw = (rows: number[][]) => rows.map(([pair, baselineDelta, baselineElapsedMs, probeDelta, probeElapsedMs]) => ({
+      pair, baselineDelta, baselineElapsedMs, probeDelta, probeElapsedMs, probeCount: 24,
+    }));
+    const smoke3 = {
+      statementPairs: raw([[0, 57, 179_999, 2217, 180_011], [1, 57, 179_992, 2217, 180_002], [2, 102, 179_986, 2217, 179_993], [3, 57, 180_018, 2217, 180_065]]),
+      statements: {
+        verdict: "pass", validPairs: 4, rejectedPairs: 0, measuredMaximum: 89.9998680496911, noiseAllowance: 1.8750333403248134,
+        signedCosts: [89.99984166578703, 89.9998680496911, 88.12483470936628, 89.9993799231188],
+      },
     };
-    const item = (statements: Record<string, unknown>, contract = loaded.contract) => {
+    const smoke4 = {
+      statementPairs: raw([[0, 57, 180_009, 2217, 179_997], [1, 57, 180_000, 2217, 180_021], [2, 102, 179_985, 2217, 179_989], [3, 57, 180_001, 2217, 180_147]]),
+      statements: {
+        verdict: "fail", validPairs: 4, rejectedPairs: 0, measuredMaximum: 90.00015832541708, noiseAllowance: 1.8752527777325336,
+        signedCosts: [90.00015832541708, 89.99972291666667, 88.12490554768453, 89.9980736218132],
+      },
+    };
+    // A 45-call burst in a retained pair's probe window, with a forged aggregate that would pass it.
+    const forged = {
+      statementPairs: smoke4.statementPairs.map((pair) => pair.pair === 1 ? { ...pair, probeDelta: 2262 } : pair),
+      statements: { ...smoke4.statements, verdict: "pass", measuredMaximum: 91.87472291666667, noiseAllowance: 10,
+        signedCosts: [90.00015832541708, 91.87472291666667, 88.12490554768453, 89.9980736218132] },
+    };
+    // The fourth pair, rejected for its probe count, leaves two pairs with the median baseline count.
+    const twoRetained = {
+      ...smoke4,
+      statementPairs: smoke4.statementPairs.map((pair) => pair.pair === 3 ? { ...pair, probeCount: 23, rejected: "counter-contamination-or-probe-count" } : pair),
+    };
+    const item = (evidence: Record<string, unknown>, contract = loaded.contract) => {
       const root = mkdtempSync(join(tmpdir(), "lcm-cert-statement-rule-"));
       writeFileSync(join(root, "run.json"), JSON.stringify({ lane: "local", profile: "smoke", withFaults: true, contractSha256: loaded.sha256, contractVersion: 4, runId: "run" }));
       writeFileSync(join(root, "phase-control.json"), JSON.stringify({ steadyT0At: "2026-11-06T10:54:00.000Z" }));
-      writeFileSync(join(root, "calibration-evidence.json"), JSON.stringify({ machine: [], database: { verdict: "incomplete" }, statements, connections: { verdict: "incomplete" } }));
+      writeFileSync(join(root, "calibration-evidence.json"), JSON.stringify({ machine: [], database: { verdict: "incomplete" }, ...evidence, connections: { verdict: "incomplete" } }));
       for (const machine of ["a", "b"]) mkdirSync(join(root, `machine-${machine}`));
       const summary = reconstructObservabilitySummary({ evidenceDirectory: root, contract, contractSha256: loaded.sha256, runId: "run", faults: [], persist: false });
       const found = summary.items.find((entry: { id: string }) => entry.id === "overhead.statements-per-snapshot");
@@ -781,11 +810,15 @@ describe("certification harness", () => {
     const aboveCeiling = structuredClone(loaded.contract);
     aboveCeiling.observability.calibration.successfulPathWireStatementCount = 91;
     expect({
+      smoke3: item(smoke3),
       smoke4: item(smoke4),
-      outsideNoise: item({ ...smoke4, signedCosts: [92, 89.99972291666667, 88.12490554768453, 89.9980736218132], measuredMaximum: 92 })[0],
+      forged: item(forged)[0],
+      twoRetained: item(twoRetained)[0],
       aboveCeiling: item(smoke4, aboveCeiling)[0],
-      twoPairs: item({ ...smoke4, validPairs: 2, signedCosts: smoke4.signedCosts.slice(0, 2) })[0],
-    }).toEqual({ smoke4: ["pass", 90.00015832541708, 90], outsideNoise: "fail", aboveCeiling: "fail", twoPairs: "incomplete" });
+    }).toEqual({
+      smoke3: ["pass", 89.9998680496911, 90], smoke4: ["pass", 90.00015832541708, 90],
+      forged: "fail", twoRetained: "incomplete", aboveCeiling: "fail",
+    });
   });
 
   it("proves the two private homes contain distinct machine identities", () => {
