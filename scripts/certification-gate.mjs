@@ -451,20 +451,24 @@ export function buildEvidenceManifest({ evidenceDirectory, contract, persist = t
     threshold: contract.thresholds.clock.maxIntervalRadiusMs, observed: clockRadius,
     verdict: clockState,
   });
-  const connectionPeak = Math.max(0, ...clocks.map((entry) => Number(entry.databaseConnections)).filter(Number.isFinite));
-  const connectionGroups = clocks.flatMap((entry) => entry.connections ?? []);
-  const runtimeGroups = connectionGroups.filter((entry) => entry.role_name === databaseReadiness.roleName);
-  const runtimeAddresses = new Set(runtimeGroups.map((entry) => entry.client_address).filter((value) => value && value !== "local"));
-  const perAddressWithinCap = runtimeGroups.every((entry) => Number(entry.connections) <= 8);
+  // Each sample's database-wide total must equal the sum of its grouped rows. Role
+  // and client-address groups are corroboration only: behind shared egress they
+  // cannot attribute a session to a machine.
+  const isCount = (value) => Number.isSafeInteger(value) && value >= 0;
+  const rowTotal = (entry) => Array.isArray(entry.connections) && entry.connections.every((row) => isCount(row?.connections))
+    ? entry.connections.reduce((sum, row) => sum + row.connections, 0) : undefined;
+  const connectionPeak = Math.max(0, ...clocks.flatMap((entry) => [rowTotal(entry), isCount(entry.databaseConnections) ? entry.databaseConnections : undefined])
+    .filter((value) => value !== undefined));
   const capacityMissing = clocks.length === 0 || clocks.some((entry) => !Array.isArray(entry.connections))
+    || clocks.some((entry) => rowTotal(entry) === undefined || !isCount(entry.databaseConnections) || entry.databaseConnections !== rowTotal(entry))
     || !Number.isFinite(databaseReadiness.maxConnections) || !Number.isFinite(databaseReadiness.reservedConnections)
-    || !poolEvidencePresent || !closureWitnessPresent || !closureConsistent || runtimeAddresses.size < 2;
+    || !poolEvidencePresent || !closureWitnessPresent || !closureConsistent;
   const capacityLimit = Math.min(contract.thresholds.capacity.totalMax, run.lane === "managed" ? contract.thresholds.capacity.managedUsableBudget : contract.thresholds.capacity.totalMax);
   const capacityFail = (poolEvidencePresent && !poolConfigMatches)
     || (closureWitnessPresent && closureConsistent && !setupSessionsClosed)
     || (closureWitnessPresent && !closureConsistent)
-    || connectionPeak > capacityLimit || !perAddressWithinCap;
-  slos.push({ id: "capacity", formula: "measured per-machine pools and setup-role closure plus attributed runtime peaks within configured total and usable budget", inputs: { count: clocks.length, sampleFile: "clock-witness.json" }, threshold: capacityLimit, observed: connectionPeak, verdict: capacityFail ? "fail" : capacityMissing ? "incomplete" : "pass" });
+    || connectionPeak > capacityLimit;
+  slos.push({ id: "capacity", formula: "each machine's measured daemon pool configuration maximum and setup-role closure, plus the database-wide sampled connection peak (recomputed from grouped rows) within configured total and usable budget; role and client-address groups are corroboration only", inputs: { count: clocks.length, sampleFile: "clock-witness.json" }, threshold: capacityLimit, observed: connectionPeak, verdict: capacityFail ? "fail" : capacityMissing ? "incomplete" : "pass" });
   const faults = existsSync(join(evidenceDirectory, "faults.json"))
     ? json(join(evidenceDirectory, "faults.json"))
     : existsSync(join(evidenceDirectory, "fault-partition-a.json")) ? [json(join(evidenceDirectory, "fault-partition-a.json"))] : [];
