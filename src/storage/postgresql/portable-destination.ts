@@ -263,7 +263,7 @@ async function readIdentityFingerprint(state:{input:Pick<PostgreSqlPortableDesti
   const digest=createHash('sha256');
   let after:unknown=null;
   for(let first=true;;first=false){
-    const sourceRequest=first&&'entries' in sourcePage&&sourcePage.entries.length?sourceKeys(sourcePage.entries):null;
+    const sourceRequest=first&&('entries' in sourcePage)&&sourcePage.entries.length?sourceKeys(sourcePage.entries):null;
     const page=await queryIdentityStatement(state,executor,{binding:first,after,rows:true,sourceKeys:sourceRequest},signal);
     if(first){
       if(page.binding_count!==1) fail('destination-conflict');
